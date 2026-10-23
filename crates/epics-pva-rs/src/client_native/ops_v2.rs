@@ -30,7 +30,7 @@ use tracing::debug;
 
 use crate::codec::PvaCodec;
 use crate::error::{PvaError, PvaResult};
-use crate::proto::{BitSet, ByteOrder, Command, PvaHeader, QosFlags, ReadExt, WriteExt};
+use crate::proto::{BitSet, ByteOrder, Command, PvaHeader, QosFlags, WriteExt};
 use crate::pv_request::{build_pv_request_fields, build_pv_request_value_only};
 use crate::pvdata::encode::{
     default_value_for, encode_pv_field, encode_pv_field_with_bitset, encode_type_desc,
@@ -404,7 +404,7 @@ impl Drop for IoidGuard {
 
 // ── GET ────────────────────────────────────────────────────────────────
 
-/// A GET / PUT_GET reply plus the leaves the SERVER marked in it.
+/// A GET reply plus the leaves the SERVER marked in it.
 ///
 /// A PVA data reply is `changed | value`: the server frames only the
 /// leaves it assigned (`to_wire_valid`, `serverget.cpp:104`), and the
@@ -909,9 +909,6 @@ pub async fn op_put_raw(
 /// staged a value (`ioc/pvalink_channel.cpp:127-184`), under a pvRequest
 /// carrying `record._options.process = "true"`
 /// (`ioc/pvalink_channel.cpp:257-263`).
-///
-/// Use this, not [`op_process`], on any path whose peer may be a pvxs
-/// server.
 pub async fn op_put_empty(
     channel: &Arc<Channel>,
     pv_req: &[u8],
@@ -1522,28 +1519,29 @@ async fn op_put_value_field_with_request_attempt(
     result
 }
 
-/// Resolve the effective leaf path for a typed field-targeted PUT.
-/// If the field at `field_path` is an NT-style structure that has a
-/// `value` sub-field, returns `<field_path>.value`; otherwise returns
-/// `field_path` unchanged. Mirrors pvxs `linkBuildPut:138-143`.
-fn effective_typed_put_path(intro: &FieldDesc, field_path: &str) -> String {
+/// Resolve the effective leaf path for a typed field-targeted PUT, as pvxs
+/// `linkBuildPut` does (`pvalink_channel.cpp:138-154`): a structure with a
+/// `value` sub-field drills into it, and an `enum_t` there drills into its
+/// `index`.
+pub fn effective_typed_put_path(intro: &FieldDesc, field_path: &str) -> String {
     let parts: Vec<&str> = field_path.split('.').filter(|s| !s.is_empty()).collect();
-    let mut cursor = intro;
-    for seg in &parts {
-        match cursor {
-            FieldDesc::Structure { fields, .. } => match fields.iter().find(|(n, _)| n == seg) {
-                Some((_, child)) => cursor = child,
-                None => return field_path.to_string(),
-            },
-            _ => return field_path.to_string(),
-        }
+    let Some(mut target) = field_desc_at_path(intro, &parts) else {
+        return field_path.to_string();
+    };
+    let mut drill: Vec<&str> = Vec::new();
+    if let Some(value) = field_desc_at_path(target, &["value"]) {
+        drill.push("value");
+        target = value;
     }
-    if let FieldDesc::Structure { fields, .. } = cursor {
-        if fields.iter().any(|(n, _)| n == "value") {
-            return format!("{field_path}.value");
-        }
+    if matches!(target, FieldDesc::Structure { struct_id, .. } if struct_id == "enum_t")
+        && field_desc_at_path(target, &["index"]).is_some()
+    {
+        drill.push("index");
     }
-    field_path.to_string()
+    if drill.is_empty() {
+        return field_path.to_string();
+    }
+    parts.into_iter().chain(drill).collect::<Vec<_>>().join(".")
 }
 
 /// Like [`build_put_value_for_path`] but places a pre-built typed
@@ -2221,6 +2219,24 @@ impl PutOp {
     /// one-call multi-field PUTs use, so both produce identical wire deltas.
     pub async fn commit_fields_typed(self, assignments: &[(String, PutLeaf)]) -> PvaResult<()> {
         let (value, changed) = build_field_delta(&self.intro, assignments)?;
+        self.commit(&value, &changed).await
+    }
+
+    /// [`Self::commit`] of the readback with `assignments` applied on top:
+    /// every leaf the readback marked goes back, plus each assigned leaf.
+    /// pvxs's `build()` put hands the `GetOPut` readback to the builder as
+    /// the prototype (`clientget.cpp:286-291`), so its marks ride the PUT.
+    /// With no readback the prototype default stands in, as for
+    /// [`Self::commit_fields_typed`].
+    pub async fn commit_fields_onto_present(
+        mut self,
+        assignments: &[(String, PutLeaf)],
+    ) -> PvaResult<()> {
+        let (base, marked) = self
+            .present
+            .take()
+            .unwrap_or_else(|| (default_value_for(&self.intro), BitSet::new()));
+        let (value, changed) = assign_fields(&self.intro, base, marked, assignments)?;
         self.commit(&value, &changed).await
     }
 }
@@ -3734,7 +3750,7 @@ enum MonitorEnd {
 /// [`Self::invalid`] does, and it closes the circuit first — that is what
 /// makes the pvxs `bev.reset()` rule (`clientmon.cpp:601-605`) hold for the
 /// MONITOR loops the way [`decode_op_or_reset`] already holds it for
-/// GET/PUT/RPC/PUT_GET/GET_FIELD/PROCESS.
+/// GET/PUT/RPC/GET_FIELD.
 struct MonitorTeardown<'a> {
     server: &'a ServerConn,
     ioid: u32,
@@ -4285,1186 +4301,6 @@ async fn op_rpc_attempt(
     result
 }
 
-// ── PUT_GET (cmd 12) ────────────────────────────────────────────────────
-
-/// PVA `PUT_GET` (cmd 12) — atomic put-then-get round trip.
-///
-/// Puts `value_str` to the channel's `.value` field, then receives the
-/// (possibly post-processed) value back, all in one operation. The
-/// wire lifecycle mirrors the GET / PUT ops:
-///
-/// 1. INIT (`subcmd 0x08`): send the pvRequest; server replies with
-///    `status + putIF + getIF` (two type descriptors).
-/// 2. PUT-GET (`subcmd 0x00`): send `put bitset + put value`; server
-///    applies the put then replies `status + get bitset + get value`.
-/// 3. DESTROY (`subcmd 0x10`): release the op.
-///
-/// pvxs leaves `handle_PUT_GET` empty; the Rust server implements the
-/// full operation (see `server_native::tcp::handle_put_get`).
-pub async fn op_put_get(
-    channel: &Arc<Channel>,
-    value_str: &str,
-    op_timeout: Duration,
-) -> PvaResult<(FieldDesc, PvField)> {
-    // Default putGet (data subcmd 0x00): write `value_str`, then read back.
-    op_put_get_data(channel, 0x00, None, PutGetPut::Str(value_str), op_timeout)
-        .await
-        .map(|r| (r.desc, r.value))
-}
-
-/// Atomic `PUT_GET` (cmd 12) writing a typed [`PvField`] with the default
-/// `field(value)` pvRequest — the typed-value counterpart of
-/// [`op_put_get`] (which parses a string). Returns the get-leg
-/// `(FieldDesc, PvField)` readback.
-pub async fn op_put_get_value(
-    channel: &Arc<Channel>,
-    value: &PvField,
-    op_timeout: Duration,
-) -> PvaResult<(FieldDesc, PvField)> {
-    op_put_get_data(channel, 0x00, None, PutGetPut::Typed(value), op_timeout)
-        .await
-        .map(|r| (r.desc, r.value))
-}
-
-/// [`op_put_get_value`] keeping the readback's marked leaves. See
-/// [`MarkedRead`].
-pub async fn op_put_get_value_marked(
-    channel: &Arc<Channel>,
-    value: &PvField,
-    op_timeout: Duration,
-) -> PvaResult<MarkedRead> {
-    op_put_get_data(channel, 0x00, None, PutGetPut::Typed(value), op_timeout).await
-}
-
-/// Atomic `PUT_GET` (cmd 12) carrying a caller-supplied pvRequest and a
-/// typed [`PvField`]. INIT sends `pv_req` bytes (e.g. a PVA gateway's
-/// preserved downstream `ChannelContext.pv_request`, carrying
-/// `record._options.process`/`block`) instead of the default
-/// `field(value)` selector; the put leg encodes the typed `value`.
-/// Returns the get-leg `(FieldDesc, PvField)` readback.
-///
-/// pva2pva `p2pApp/channel.cpp:129-138`: `GWChannel::createChannelPutGet`
-/// forwards the original pvRequest verbatim to the upstream channel and
-/// returns its readback — one upstream operation, not a local put plus a
-/// separately-read cached get.
-pub async fn op_put_get_value_raw(
-    channel: &Arc<Channel>,
-    pv_req: &[u8],
-    value: &PvField,
-    op_timeout: Duration,
-) -> PvaResult<(FieldDesc, PvField)> {
-    op_put_get_value_raw_marked(channel, pv_req, value, op_timeout)
-        .await
-        .map(|r| (r.desc, r.value))
-}
-
-/// [`op_put_get_value_raw`] keeping the readback's marked leaves. See
-/// [`MarkedRead`].
-pub async fn op_put_get_value_raw_marked(
-    channel: &Arc<Channel>,
-    pv_req: &[u8],
-    value: &PvField,
-    op_timeout: Duration,
-) -> PvaResult<MarkedRead> {
-    op_put_get_data(
-        channel,
-        0x00,
-        Some(pv_req),
-        PutGetPut::Typed(value),
-        op_timeout,
-    )
-    .await
-}
-
-/// EPICS ChannelPutGet `getGet` (`QOS_GET`, 0x40): read the current
-/// get-side data with no put. INITs a PUT_GET op, sends a payload-less
-/// getGet data frame, and returns the readback (pvAccess
-/// `clientContextImpl.cpp:1100`, `:1138-1152`).
-pub async fn op_get_get(
-    channel: &Arc<Channel>,
-    op_timeout: Duration,
-) -> PvaResult<(FieldDesc, PvField)> {
-    op_put_get_data(channel, QosFlags::GET, None, PutGetPut::None, op_timeout)
-        .await
-        .map(|r| (r.desc, r.value))
-}
-
-/// EPICS ChannelPutGet `getPut` (`QOS_GET_PUT`, 0x80): read the current
-/// put-side data with no put (pvAccess `clientContextImpl.cpp:1156-1170`).
-pub async fn op_get_put(
-    channel: &Arc<Channel>,
-    op_timeout: Duration,
-) -> PvaResult<(FieldDesc, PvField)> {
-    op_put_get_data(
-        channel,
-        QosFlags::GET_PUT,
-        None,
-        PutGetPut::None,
-        op_timeout,
-    )
-    .await
-    .map(|r| (r.desc, r.value))
-}
-
-/// [`op_get_get`] carrying a caller-supplied pvRequest. The INIT pvRequest
-/// can carry a `getField(...)` selector so the readback projects the get-leg
-/// structure (pvDatabaseCPP `ChannelPutGetLocal`,
-/// modules/pvDatabase/src/pvAccess/channelLocal.cpp); without one the server
-/// falls back to the common `field` selection. The default
-/// [`op_get_get`] sends only the value-only selector and so cannot express a
-/// distinct get-leg.
-pub async fn op_get_get_with_request(
-    channel: &Arc<Channel>,
-    pv_req: &[u8],
-    op_timeout: Duration,
-) -> PvaResult<(FieldDesc, PvField)> {
-    op_put_get_data(
-        channel,
-        QosFlags::GET,
-        Some(pv_req),
-        PutGetPut::None,
-        op_timeout,
-    )
-    .await
-    .map(|r| (r.desc, r.value))
-}
-
-/// [`op_get_put`] carrying a caller-supplied pvRequest. The INIT pvRequest
-/// can carry a `putField(...)` selector so the readback projects the put-leg
-/// structure (pvDatabaseCPP `ChannelPutGetLocal::getPut`,
-/// modules/pvDatabase/src/pvAccess/channelLocal.cpp); without one the server
-/// falls back to the common `field` selection.
-pub async fn op_get_put_with_request(
-    channel: &Arc<Channel>,
-    pv_req: &[u8],
-    op_timeout: Duration,
-) -> PvaResult<(FieldDesc, PvField)> {
-    op_put_get_data(
-        channel,
-        QosFlags::GET_PUT,
-        Some(pv_req),
-        PutGetPut::None,
-        op_timeout,
-    )
-    .await
-    .map(|r| (r.desc, r.value))
-}
-
-/// The put leg of a [`op_put_get_data`] round trip. The read-only
-/// getGet/getPut subcommands carry no payload (`None`); the default
-/// putGet writes a string-parsed value (`Str`); the typed putGet (gateway
-/// forward / typed clients) writes a pre-built [`PvField`] (`Typed`). One
-/// enum so every PUT_GET variant shares the single INIT/data/destroy
-/// lifecycle below and cannot drift apart.
-#[derive(Clone, Copy)]
-enum PutGetPut<'a> {
-    None,
-    Str(&'a str),
-    Typed(&'a PvField),
-}
-
-/// Shared PUT_GET data-phase driver: INIT (with `req` bytes when the
-/// caller supplies a pvRequest, else the default `field(value)`
-/// selector), then a single data frame whose subcommand selects putGet
-/// (`Str`/`Typed` → put BitSet + value) or the read-only getGet/getPut
-/// (`None` → no payload, pvAccess `clientContextImpl.cpp:1100-1112`), then
-/// decode the readback. Factored so every subcommand and value form shares
-/// one INIT/destroy lifecycle and cannot drift apart.
-async fn op_put_get_data(
-    channel: &Arc<Channel>,
-    data_subcmd: u8,
-    req: Option<&[u8]>,
-    put: PutGetPut<'_>,
-    op_timeout: Duration,
-) -> PvaResult<MarkedRead> {
-    requeue_on_disconnect(channel, op_timeout, |budget| {
-        op_put_get_data_attempt(channel, data_subcmd, req, put, budget)
-    })
-    .await
-}
-
-/// One attempt of [`op_put_get_data`]; [`requeue_on_disconnect`] runs it
-/// again from the top when the channel is lost mid-op.
-async fn op_put_get_data_attempt(
-    channel: &Arc<Channel>,
-    data_subcmd: u8,
-    req: Option<&[u8]>,
-    put: PutGetPut<'_>,
-    op_timeout: Duration,
-) -> PvaResult<MarkedRead> {
-    let (server, sid) = ensure_active_with_op_timeout(channel, op_timeout).await?;
-    let order = server.byte_order();
-    let big_endian = matches!(order, ByteOrder::Big);
-    let codec = PvaCodec { big_endian };
-    let ioid = alloc_ioid();
-
-    // INIT pvRequest: the caller's bytes (preserved downstream request)
-    // when supplied, else the default value-only `field(value)` selector.
-    let default_req;
-    let pv_req: &[u8] = match req {
-        Some(b) => b,
-        None => {
-            default_req = build_pv_request_value_only(big_endian);
-            &default_req
-        }
-    };
-    let mut stream = server.register_ioid_stream(sid, ioid, Command::PutGet.code());
-    let mut ioid_guard = IoidGuard::new(server.clone(), ioid);
-    // Op-local type cache. PUT_GET and ChannelArray run their INIT and DATA
-    // legs on one task in wire order, so this cache resolves any within-op
-    // 0xFD/0xFE markers without a shared connection cache. PUT_GET's DATA
-    // value is additionally reader-flattened (its layout is unambiguous), so
-    // here it stays empty; ChannelArray's ambiguous DATA layout keeps it as
-    // the op's resolver — see `flatten_type_cache_markers`.
-    let mut cache = crate::pvdata::encode::TypeCache::new();
-
-    // INIT — `sid + ioid + 0x08 + pvRequest`.
-    let mut init = Vec::with_capacity(9 + pv_req.len());
-    init.put_u32(sid, order);
-    init.put_u32(ioid, order);
-    init.put_u8(QosFlags::INIT);
-    init.extend_from_slice(pv_req);
-    let init_h = PvaHeader::application(false, order, Command::PutGet.code(), init.len() as u32);
-    let mut init_frame = Vec::with_capacity(8 + init.len());
-    init_h.write_into(&mut init_frame);
-    init_frame.extend_from_slice(&init);
-    server.send_for_channel(sid, init_frame).await?;
-
-    let init_resp = await_frame(&mut stream, op_timeout).await?;
-    // pvAccessCPP keeps two client containers after INIT (`m_putData` from
-    // putIF, `m_getData` from getIF, clientContextImpl.cpp:1036-1040): the
-    // put leg is built/serialized against putIF, the get-side readback is
-    // decoded against getIF, and `getPut` reads put-side data back through
-    // putIF (:1156-1170). Using one descriptor for both breaks against a
-    // server whose put and get structures differ.
-    let (put_if, get_if) = match decode_put_get_init(&init_resp, &mut cache) {
-        Ok(Ok(descs)) => descs,
-        Ok(Err(status)) => {
-            server.unregister_ioid(ioid);
-            return Err(PvaError::RemoteError(status));
-        }
-        Err(e) => {
-            // Command/subcommand mismatch or truncated INIT body is fatal.
-            server.close();
-            return Err(e);
-        }
-    };
-    ioid_guard.arm_destroy(sid);
-
-    // Data — `sid + ioid + subcmd [+ put bitset + put value]`. putGet
-    // (`Some`) carries a payload built against the PUT descriptor;
-    // getGet/getPut (`None`) send none.
-    let mut data = Vec::new();
-    data.put_u32(sid, order);
-    data.put_u32(ioid, order);
-    data.put_u8(data_subcmd);
-    // putGet carries a put payload (string-parsed or typed) built against
-    // the PUT descriptor; getGet/getPut (`None`) send none.
-    let put_value = match put {
-        PutGetPut::None => None,
-        PutGetPut::Str(value_str) => Some(build_put_value(&put_if, value_str)?),
-        PutGetPut::Typed(value) => Some(coerce_typed_put_value(&put_if, value)?),
-    };
-    if let Some(value) = put_value {
-        let mut changed = BitSet::new();
-        if let Some(bit) = put_if.bit_for_path("value") {
-            changed.set(bit);
-        } else {
-            changed.set(0);
-        }
-        changed.write_into(order, &mut data);
-        // pvxs `from_wire_valid` decodes a BitSet delta — only the fields
-        // whose bit is set. Encode consistently against the PUT descriptor.
-        encode_pv_field_with_bitset(&value, &put_if, &changed, 0, order, &mut data);
-    }
-    let data_h = PvaHeader::application(false, order, Command::PutGet.code(), data.len() as u32);
-    let mut data_frame = Vec::with_capacity(8 + data.len());
-    data_h.write_into(&mut data_frame);
-    data_frame.extend_from_slice(&data);
-    server.send_for_channel(sid, data_frame).await?;
-
-    let resp_frame = await_frame(&mut stream, op_timeout).await?;
-    // getPut (`QOS_GET_PUT`) reads the PUT-side data, so decode and return
-    // the PUT descriptor; putGet and getGet read GET-side data → getIF.
-    let is_get_put = data_subcmd & QosFlags::GET_PUT != 0;
-    let result = {
-        let resp_desc = if is_get_put { &put_if } else { &get_if };
-        match decode_put_get_data(&resp_frame, resp_desc, &mut cache) {
-            Ok(Ok(decoded)) => Ok(decoded),
-            Ok(Err(status)) => Err(PvaError::RemoteError(status)),
-            Err(e) => {
-                // Command mismatch or truncated data body is fatal.
-                server.close();
-                Err(e)
-            }
-        }
-    };
-
-    ioid_guard.disarm();
-    let destroy = codec.build_destroy_request(sid, ioid);
-    let _ = server.send_for_channel(sid, destroy).await;
-    server.unregister_ioid(ioid);
-    let resp_desc = if is_get_put { put_if } else { get_if };
-    result.map(|(changed, value)| {
-        let marked = reply_marks(&resp_desc, &changed);
-        MarkedRead {
-            desc: resp_desc,
-            value,
-            marked,
-        }
-    })
-}
-
-/// Decode a `PUT_GET` INIT response: `ioid + subcmd + status + putIF +
-/// getIF`. On success returns BOTH leg descriptors as `(put_if, get_if)`.
-///
-/// pvAccessCPP keeps the two as separate client containers (`m_putData` /
-/// `m_getData`, clientContextImpl.cpp:1036-1040): the put leg is built and
-/// serialized against `putIF`, the get-side readback is deserialized
-/// against `getIF`, and a `getPut` reads the put-side data back through
-/// `putIF`. Returning only `getIF` (and using it for the put leg too) is
-/// the descriptor-selection bug this fixes — it breaks against a server
-/// whose put and get structures differ.
-///
-/// The two-level result separates connection-fatal faults from per-op
-/// failures: an outer `Err` (command/subcommand mismatch, truncated body)
-/// is a protocol violation pvxs answers with `bev.reset()`
-/// (clientget.cpp:456-493); an inner `Ok(Err(status))` is a non-success
-/// INIT — a per-operation error the caller surfaces without resetting.
-fn decode_put_get_init(
-    frame: &super::decode::Frame,
-    type_cache: &mut crate::pvdata::encode::TypeCache,
-) -> PvaResult<Result<(FieldDesc, FieldDesc), crate::proto::Status>> {
-    if frame.header.command != Command::PutGet.code() {
-        return Err(PvaError::Protocol(format!(
-            "expected PUT_GET INIT, got command {}",
-            frame.header.command
-        )));
-    }
-    let order = frame.order();
-    let mut cur = frame.cursor();
-    let _ioid = cur
-        .get_u32(order)
-        .map_err(|e| PvaError::Decode(e.to_string()))?;
-    let subcmd = cur.get_u8().map_err(|e| PvaError::Decode(e.to_string()))?;
-    if subcmd & QosFlags::INIT == 0 {
-        return Err(PvaError::Protocol(format!(
-            "expected PUT_GET INIT subcmd, got 0x{subcmd:02x}"
-        )));
-    }
-    let status = crate::proto::Status::decode(&mut cur, order)
-        .map_err(|e| PvaError::Decode(e.to_string()))?;
-    if !status.is_success() {
-        return Ok(Err(status));
-    }
-    // putIF then getIF. Both are decoded (advancing the cursor +
-    // populating the type cache) and BOTH are returned: the put leg uses
-    // putIF, the get-side readback uses getIF, and getPut reads put-side
-    // data back through putIF (pvAccessCPP m_putData / m_getData).
-    let put_if = crate::pvdata::encode::decode_type_desc_cached(&mut cur, order, type_cache)
-        .map_err(|e| PvaError::Decode(e.to_string()))?;
-    let get_if = crate::pvdata::encode::decode_type_desc_cached(&mut cur, order, type_cache)
-        .map_err(|e| PvaError::Decode(e.to_string()))?;
-    Ok(Ok((put_if, get_if)))
-}
-
-/// Decode a `PUT_GET` data response: `ioid + subcmd + status + get
-/// bitset + get value`.
-///
-/// Same two-level result as [`decode_put_get_init`]: an outer `Err`
-/// (command mismatch, truncated body) is connection-fatal; an inner
-/// `Ok(Err(status))` is a non-success per-op result.
-fn decode_put_get_data(
-    frame: &super::decode::Frame,
-    intro: &FieldDesc,
-    type_cache: &mut crate::pvdata::encode::TypeCache,
-) -> PvaResult<Result<(BitSet, PvField), crate::proto::Status>> {
-    if frame.header.command != Command::PutGet.code() {
-        return Err(PvaError::Protocol(format!(
-            "expected PUT_GET data, got command {}",
-            frame.header.command
-        )));
-    }
-    let order = frame.order();
-    let mut cur = frame.cursor();
-    let _ioid = cur
-        .get_u32(order)
-        .map_err(|e| PvaError::Decode(e.to_string()))?;
-    let _subcmd = cur.get_u8().map_err(|e| PvaError::Decode(e.to_string()))?;
-    let status = crate::proto::Status::decode(&mut cur, order)
-        .map_err(|e| PvaError::Decode(e.to_string()))?;
-    if !status.is_success() {
-        return Ok(Err(status));
-    }
-    let changed = BitSet::decode(&mut cur, order).map_err(|e| PvaError::Decode(e.to_string()))?;
-    let value = crate::pvdata::encode::decode_pv_field_with_bitset_cached(
-        intro, &changed, 0, &mut cur, order, type_cache,
-    )
-    .map_err(|e| PvaError::Decode(e.to_string()))?;
-    Ok(Ok((changed, value)))
-}
-
-// ── ARRAY (cmd 14) — ChannelArray windowed-array operation ──────────────
-
-/// One ChannelArray data-phase sub-request, mirroring the QOS-bit selection
-/// in pvAccessCPP `clientContextImpl.cpp:1580-1612`.
-#[derive(Clone, Copy)]
-enum ArrayReq<'a> {
-    /// `getArray` (`QOS_GET`): read the `[offset, count, stride]` slice.
-    Get {
-        offset: u32,
-        count: u32,
-        stride: u32,
-    },
-    /// `putArray` (subcmd 0): splice `value` at `offset`/`stride`.
-    Put {
-        offset: u32,
-        stride: u32,
-        value: &'a PvField,
-    },
-    /// `setLength` (`QOS_GET_PUT`): resize to `length`.
-    SetLength { length: u32 },
-    /// `getLength` (`QOS_PROCESS`): query the element count.
-    GetLength,
-}
-
-/// The decoded body of a ChannelArray sub-op reply.
-enum ArrayResp {
-    /// `getArray`: the sliced array value.
-    Value(PvField),
-    /// `getLength`: the element count.
-    Length(u32),
-    /// `putArray` / `setLength`: status-only success.
-    Empty,
-}
-
-/// Shared ChannelArray driver: INIT (binding the array field via a
-/// `field(value)` pvRequest), one sub-op data frame, decode the reply, then
-/// DESTROY_REQUEST. Factored so every sub-op shares one INIT/destroy
-/// lifecycle and cannot drift apart (mirrors [`op_put_get_data`]).
-///
-/// Wire format — pvAccessCPP `clientContextImpl.cpp:1567-1666` (send) and
-/// `responseHandlers.cpp:2347-2393` (server reply):
-/// - INIT reply: `ioid + subcmd + status + array introspection`.
-/// - getArray: data `offset + count + stride`; reply `status + array value`.
-/// - putArray: data `offset + stride + array value`; reply `status`.
-/// - setLength: data `length`; reply `status`.
-/// - getLength: data (none); reply `status + length`.
-async fn op_array_data(
-    channel: &Arc<Channel>,
-    pv_request: Option<&PvField>,
-    req: ArrayReq<'_>,
-    op_timeout: Duration,
-) -> PvaResult<(FieldDesc, ArrayResp)> {
-    requeue_on_disconnect(channel, op_timeout, |budget| {
-        op_array_data_attempt(channel, pv_request, req, budget)
-    })
-    .await
-}
-
-/// One attempt of [`op_array_data`]; [`requeue_on_disconnect`] runs it
-/// again from the top when the channel is lost mid-op.
-async fn op_array_data_attempt(
-    channel: &Arc<Channel>,
-    pv_request: Option<&PvField>,
-    req: ArrayReq<'_>,
-    op_timeout: Duration,
-) -> PvaResult<(FieldDesc, ArrayResp)> {
-    let (server, sid) = ensure_active_with_op_timeout(channel, op_timeout).await?;
-    let order = server.byte_order();
-    let big_endian = matches!(order, ByteOrder::Big);
-    let codec = PvaCodec { big_endian };
-    let ioid = alloc_ioid();
-
-    // INIT pvRequest: forward the caller's verbatim (the gateway's
-    // preserved downstream ARRAY pvRequest, which selects the bound array
-    // field) or the default `field(value)` selection when none was supplied
-    // (pvAccessCPP `clientContextImpl.cpp:1567` sends the create-time
-    // pvRequest on the QOS_INIT frame).
-    let pv_req = match pv_request {
-        Some(req) => encode_pv_request_value(req, order),
-        None => build_pv_request_value_only(big_endian),
-    };
-    let mut stream = server.register_ioid_stream(sid, ioid, Command::Array.code());
-    let mut ioid_guard = IoidGuard::new(server.clone(), ioid);
-    // Op-local type cache. PUT_GET and ChannelArray run their INIT and DATA
-    // legs on one task in wire order, so this cache resolves any within-op
-    // 0xFD/0xFE markers without a shared connection cache. PUT_GET's DATA
-    // value is additionally reader-flattened (its layout is unambiguous), so
-    // here it stays empty; ChannelArray's ambiguous DATA layout keeps it as
-    // the op's resolver — see `flatten_type_cache_markers`.
-    let mut cache = crate::pvdata::encode::TypeCache::new();
-
-    // INIT — `sid + ioid + 0x08 + pvRequest`.
-    let mut init = Vec::with_capacity(9 + pv_req.len());
-    init.put_u32(sid, order);
-    init.put_u32(ioid, order);
-    init.put_u8(QosFlags::INIT);
-    init.extend_from_slice(&pv_req);
-    let init_h = PvaHeader::application(false, order, Command::Array.code(), init.len() as u32);
-    let mut init_frame = Vec::with_capacity(8 + init.len());
-    init_h.write_into(&mut init_frame);
-    init_frame.extend_from_slice(&init);
-    server.send_for_channel(sid, init_frame).await?;
-
-    let init_resp = await_frame(&mut stream, op_timeout).await?;
-    let array_desc = match decode_array_init(&init_resp, &mut cache) {
-        Ok(Ok(desc)) => desc,
-        Ok(Err(status)) => {
-            server.unregister_ioid(ioid);
-            return Err(PvaError::RemoteError(status));
-        }
-        Err(e) => {
-            server.close();
-            return Err(e);
-        }
-    };
-    ioid_guard.arm_destroy(sid);
-
-    // Data frame — `sid + ioid + subcmd [+ params]`.
-    let (data_subcmd, body): (u8, Vec<u8>) = match &req {
-        ArrayReq::Get {
-            offset,
-            count,
-            stride,
-        } => {
-            let mut b = Vec::new();
-            crate::proto::encode_size_into(*offset, order, &mut b);
-            crate::proto::encode_size_into(*count, order, &mut b);
-            crate::proto::encode_size_into(*stride, order, &mut b);
-            (QosFlags::GET, b)
-        }
-        ArrayReq::Put {
-            offset,
-            stride,
-            value,
-        } => {
-            let mut b = Vec::new();
-            crate::proto::encode_size_into(*offset, order, &mut b);
-            crate::proto::encode_size_into(*stride, order, &mut b);
-            encode_pv_field(value, &array_desc, order, &mut b);
-            (0x00, b)
-        }
-        ArrayReq::SetLength { length } => {
-            let mut b = Vec::new();
-            crate::proto::encode_size_into(*length, order, &mut b);
-            (QosFlags::GET_PUT, b)
-        }
-        ArrayReq::GetLength => (QosFlags::PROCESS, Vec::new()),
-    };
-    let mut data = Vec::with_capacity(9 + body.len());
-    data.put_u32(sid, order);
-    data.put_u32(ioid, order);
-    data.put_u8(data_subcmd);
-    data.extend_from_slice(&body);
-    let data_h = PvaHeader::application(false, order, Command::Array.code(), data.len() as u32);
-    let mut data_frame = Vec::with_capacity(8 + data.len());
-    data_h.write_into(&mut data_frame);
-    data_frame.extend_from_slice(&data);
-    server.send_for_channel(sid, data_frame).await?;
-
-    let resp_frame = await_frame(&mut stream, op_timeout).await?;
-    let result = match decode_array_data(&resp_frame, &req, &array_desc, &mut cache) {
-        Ok(Ok(resp)) => Ok(resp),
-        Ok(Err(status)) => Err(PvaError::RemoteError(status)),
-        Err(e) => {
-            server.close();
-            Err(e)
-        }
-    };
-
-    ioid_guard.disarm();
-    let destroy = codec.build_destroy_request(sid, ioid);
-    let _ = server.send_for_channel(sid, destroy).await;
-    server.unregister_ioid(ioid);
-    result.map(|resp| (array_desc, resp))
-}
-
-/// Decode a ChannelArray INIT reply: `ioid + subcmd + status + array
-/// introspection`. Two-level result (see [`decode_put_get_init`]): outer
-/// `Err` is connection-fatal, inner `Ok(Err(status))` a per-op failure.
-fn decode_array_init(
-    frame: &super::decode::Frame,
-    type_cache: &mut crate::pvdata::encode::TypeCache,
-) -> PvaResult<Result<FieldDesc, crate::proto::Status>> {
-    if frame.header.command != Command::Array.code() {
-        return Err(PvaError::Protocol(format!(
-            "expected ARRAY INIT, got command {}",
-            frame.header.command
-        )));
-    }
-    let order = frame.order();
-    let mut cur = frame.cursor();
-    let _ioid = cur
-        .get_u32(order)
-        .map_err(|e| PvaError::Decode(e.to_string()))?;
-    let subcmd = cur.get_u8().map_err(|e| PvaError::Decode(e.to_string()))?;
-    if subcmd & QosFlags::INIT == 0 {
-        return Err(PvaError::Protocol(format!(
-            "expected ARRAY INIT subcmd, got 0x{subcmd:02x}"
-        )));
-    }
-    let status = crate::proto::Status::decode(&mut cur, order)
-        .map_err(|e| PvaError::Decode(e.to_string()))?;
-    if !status.is_success() {
-        return Ok(Err(status));
-    }
-    let array_desc = crate::pvdata::encode::decode_type_desc_cached(&mut cur, order, type_cache)
-        .map_err(|e| PvaError::Decode(e.to_string()))?;
-    Ok(Ok(array_desc))
-}
-
-/// Decode a ChannelArray data reply. The trailing body depends on the
-/// sub-op: getArray → array value; getLength → size; put/setLength → none.
-fn decode_array_data(
-    frame: &super::decode::Frame,
-    req: &ArrayReq<'_>,
-    array_desc: &FieldDesc,
-    type_cache: &mut crate::pvdata::encode::TypeCache,
-) -> PvaResult<Result<ArrayResp, crate::proto::Status>> {
-    if frame.header.command != Command::Array.code() {
-        return Err(PvaError::Protocol(format!(
-            "expected ARRAY data, got command {}",
-            frame.header.command
-        )));
-    }
-    let order = frame.order();
-    let mut cur = frame.cursor();
-    let _ioid = cur
-        .get_u32(order)
-        .map_err(|e| PvaError::Decode(e.to_string()))?;
-    let _subcmd = cur.get_u8().map_err(|e| PvaError::Decode(e.to_string()))?;
-    let status = crate::proto::Status::decode(&mut cur, order)
-        .map_err(|e| PvaError::Decode(e.to_string()))?;
-    if !status.is_success() {
-        return Ok(Err(status));
-    }
-    let resp = match req {
-        ArrayReq::Get { .. } => {
-            let value = crate::pvdata::encode::decode_pv_field_cached(
-                array_desc, &mut cur, order, type_cache,
-            )
-            .map_err(|e| PvaError::Decode(e.to_string()))?;
-            ArrayResp::Value(value)
-        }
-        ArrayReq::GetLength => {
-            let n = crate::proto::decode_size(&mut cur, order)
-                .map_err(|e| PvaError::Decode(e.to_string()))?
-                .ok_or_else(|| PvaError::Decode("ARRAY getLength: null size marker".into()))?;
-            ArrayResp::Length(n)
-        }
-        ArrayReq::Put { .. } | ArrayReq::SetLength { .. } => ArrayResp::Empty,
-    };
-    Ok(Ok(resp))
-}
-
-/// ChannelArray `getArray` (cmd 14, `QOS_GET`): read the
-/// `[offset, count, stride]` slice of the channel's array field. `count == 0`
-/// reads to the end (pvAccessCPP `clientContextImpl.cpp:1669-1704`). Returns
-/// the array `(FieldDesc, PvField)`.
-pub async fn op_array_get(
-    channel: &Arc<Channel>,
-    offset: u32,
-    count: u32,
-    stride: u32,
-    op_timeout: Duration,
-) -> PvaResult<(FieldDesc, PvField)> {
-    let (desc, resp) = op_array_data(
-        channel,
-        None,
-        ArrayReq::Get {
-            offset,
-            count,
-            stride,
-        },
-        op_timeout,
-    )
-    .await?;
-    match resp {
-        ArrayResp::Value(v) => Ok((desc, v)),
-        _ => Err(PvaError::Protocol(
-            "ARRAY getArray: unexpected reply body".into(),
-        )),
-    }
-}
-
-/// ChannelArray `putArray` (cmd 14, subcmd 0): splice `value` into the
-/// channel's array field at `offset` with `stride` (pvAccessCPP
-/// `clientContextImpl.cpp:1706-1748`).
-pub async fn op_array_put(
-    channel: &Arc<Channel>,
-    value: &PvField,
-    offset: u32,
-    stride: u32,
-    op_timeout: Duration,
-) -> PvaResult<()> {
-    op_array_data(
-        channel,
-        None,
-        ArrayReq::Put {
-            offset,
-            stride,
-            value,
-        },
-        op_timeout,
-    )
-    .await
-    .map(|_| ())
-}
-
-/// ChannelArray `setLength` (cmd 14, `QOS_GET_PUT`): resize the channel's
-/// array field (pvAccessCPP `clientContextImpl.cpp:1750-1782`).
-pub async fn op_array_set_length(
-    channel: &Arc<Channel>,
-    length: u32,
-    op_timeout: Duration,
-) -> PvaResult<()> {
-    op_array_data(channel, None, ArrayReq::SetLength { length }, op_timeout)
-        .await
-        .map(|_| ())
-}
-
-/// ChannelArray `getLength` (cmd 14, `QOS_PROCESS`): query the current
-/// element count of the channel's array field (pvAccessCPP
-/// `clientContextImpl.cpp:1784-1810`).
-pub async fn op_array_get_length(channel: &Arc<Channel>, op_timeout: Duration) -> PvaResult<u32> {
-    let (_desc, resp) = op_array_data(channel, None, ArrayReq::GetLength, op_timeout).await?;
-    match resp {
-        ArrayResp::Length(n) => Ok(n),
-        _ => Err(PvaError::Protocol(
-            "ARRAY getLength: unexpected reply body".into(),
-        )),
-    }
-}
-
-// ── ARRAY request-carrying variants (gateway pvRequest forwarding) ──────
-//
-// A PVA-to-PVA gateway must forward the downstream's ARRAY INIT pvRequest
-// to the upstream IOC verbatim (pva2pva `GWChannel::createChannelArray`
-// forwards `pvRequest` unchanged, `channel.cpp:227-232`) so the upstream
-// resolves the same bound array field the downstream selected. These mirror
-// the default-pvRequest functions above but thread the caller's pvRequest
-// into the INIT frame via [`op_array_data`].
-
-/// ChannelArray INIT-only probe: open the array op with `pv_request` (or the
-/// default `field(value)` when `None`), read back the bound array field's
-/// introspection, then DESTROY without a data sub-op. The gateway uses this
-/// to answer a downstream ARRAY INIT — pvAccessCPP's INIT reply carries the
-/// array introspection (`responseHandlers.cpp:2347-2360`), which the gateway
-/// must resolve from the upstream rather than fabricate.
-pub async fn op_array_describe(
-    channel: &Arc<Channel>,
-    pv_request: Option<&PvField>,
-    op_timeout: Duration,
-) -> PvaResult<FieldDesc> {
-    requeue_on_disconnect(channel, op_timeout, |budget| {
-        op_array_describe_attempt(channel, pv_request, budget)
-    })
-    .await
-}
-
-/// One attempt of [`op_array_describe`]; [`requeue_on_disconnect`] runs it
-/// again from the top when the channel is lost mid-op.
-async fn op_array_describe_attempt(
-    channel: &Arc<Channel>,
-    pv_request: Option<&PvField>,
-    op_timeout: Duration,
-) -> PvaResult<FieldDesc> {
-    let (server, sid) = ensure_active_with_op_timeout(channel, op_timeout).await?;
-    let order = server.byte_order();
-    let big_endian = matches!(order, ByteOrder::Big);
-    let codec = PvaCodec { big_endian };
-    let ioid = alloc_ioid();
-
-    let pv_req = match pv_request {
-        Some(req) => encode_pv_request_value(req, order),
-        None => build_pv_request_value_only(big_endian),
-    };
-    let mut stream = server.register_ioid_stream(sid, ioid, Command::Array.code());
-    let mut ioid_guard = IoidGuard::new(server.clone(), ioid);
-    // Op-local type cache (ChannelArray): INIT and DATA run on one task in
-    // wire order. The reader does not flatten ARRAY DATA (its layout is
-    // sub-op dependent), so this op-local cache resolves its within-op
-    // markers.
-    let mut cache = crate::pvdata::encode::TypeCache::new();
-
-    let mut init = Vec::with_capacity(9 + pv_req.len());
-    init.put_u32(sid, order);
-    init.put_u32(ioid, order);
-    init.put_u8(QosFlags::INIT);
-    init.extend_from_slice(&pv_req);
-    let init_h = PvaHeader::application(false, order, Command::Array.code(), init.len() as u32);
-    let mut init_frame = Vec::with_capacity(8 + init.len());
-    init_h.write_into(&mut init_frame);
-    init_frame.extend_from_slice(&init);
-    server.send_for_channel(sid, init_frame).await?;
-
-    let init_resp = await_frame(&mut stream, op_timeout).await?;
-    let array_desc = match decode_array_init(&init_resp, &mut cache) {
-        Ok(Ok(desc)) => desc,
-        Ok(Err(status)) => {
-            server.unregister_ioid(ioid);
-            return Err(PvaError::RemoteError(status));
-        }
-        Err(e) => {
-            server.close();
-            return Err(e);
-        }
-    };
-    // INIT succeeded → the op is registered upstream; arm the destroy so the
-    // guard tears it down on the (immediate) drop below.
-    ioid_guard.arm_destroy(sid);
-    ioid_guard.disarm();
-    let destroy = codec.build_destroy_request(sid, ioid);
-    let _ = server.send_for_channel(sid, destroy).await;
-    server.unregister_ioid(ioid);
-    Ok(array_desc)
-}
-
-/// [`op_array_get`] carrying a preserved INIT `pv_request`.
-pub async fn op_array_get_with_request(
-    channel: &Arc<Channel>,
-    pv_request: &PvField,
-    offset: u32,
-    count: u32,
-    stride: u32,
-    op_timeout: Duration,
-) -> PvaResult<(FieldDesc, PvField)> {
-    let (desc, resp) = op_array_data(
-        channel,
-        Some(pv_request),
-        ArrayReq::Get {
-            offset,
-            count,
-            stride,
-        },
-        op_timeout,
-    )
-    .await?;
-    match resp {
-        ArrayResp::Value(v) => Ok((desc, v)),
-        _ => Err(PvaError::Protocol(
-            "ARRAY getArray: unexpected reply body".into(),
-        )),
-    }
-}
-
-/// [`op_array_put`] carrying a preserved INIT `pv_request`.
-pub async fn op_array_put_with_request(
-    channel: &Arc<Channel>,
-    pv_request: &PvField,
-    value: &PvField,
-    offset: u32,
-    stride: u32,
-    op_timeout: Duration,
-) -> PvaResult<()> {
-    op_array_data(
-        channel,
-        Some(pv_request),
-        ArrayReq::Put {
-            offset,
-            stride,
-            value,
-        },
-        op_timeout,
-    )
-    .await
-    .map(|_| ())
-}
-
-/// [`op_array_set_length`] carrying a preserved INIT `pv_request`.
-pub async fn op_array_set_length_with_request(
-    channel: &Arc<Channel>,
-    pv_request: &PvField,
-    length: u32,
-    op_timeout: Duration,
-) -> PvaResult<()> {
-    op_array_data(
-        channel,
-        Some(pv_request),
-        ArrayReq::SetLength { length },
-        op_timeout,
-    )
-    .await
-    .map(|_| ())
-}
-
-/// [`op_array_get_length`] carrying a preserved INIT `pv_request`.
-pub async fn op_array_get_length_with_request(
-    channel: &Arc<Channel>,
-    pv_request: &PvField,
-    op_timeout: Duration,
-) -> PvaResult<u32> {
-    let (_desc, resp) =
-        op_array_data(channel, Some(pv_request), ArrayReq::GetLength, op_timeout).await?;
-    match resp {
-        ArrayResp::Length(n) => Ok(n),
-        _ => Err(PvaError::Protocol(
-            "ARRAY getLength: unexpected reply body".into(),
-        )),
-    }
-}
-
-// ── PROCESS (cmd 16) ────────────────────────────────────────────────────
-
-/// Build a PROCESS INIT frame (`sid + ioid + 0x08 + pvRequest`) carrying
-/// the caller-supplied `pv_req` bytes verbatim. Factored out so the
-/// caller's request can be verified at the wire level (regression).
-fn build_process_init(sid: u32, ioid: u32, pv_req: &[u8], order: ByteOrder) -> Vec<u8> {
-    let mut init = Vec::with_capacity(9 + pv_req.len());
-    init.put_u32(sid, order);
-    init.put_u32(ioid, order);
-    init.put_u8(QosFlags::INIT);
-    init.extend_from_slice(pv_req);
-    let init_h = PvaHeader::application(false, order, Command::Process.code(), init.len() as u32);
-    let mut init_frame = Vec::with_capacity(8 + init.len());
-    init_h.write_into(&mut init_frame);
-    init_frame.extend_from_slice(&init);
-    init_frame
-}
-
-/// PVA `PROCESS` (cmd 16) — trigger record processing without
-/// transferring a value.
-///
-/// Wire lifecycle:
-/// 1. INIT (`subcmd 0x08`): send the pvRequest; server replies
-///    `status` (no introspection — there is no value type).
-/// 2. PROCESS (`subcmd 0x00`): no payload; server runs the processing
-///    hook and replies `status`.
-/// 3. DESTROY (`subcmd 0x10`): release the op.
-///
-/// The empty default request — `[`sentinel_all_fields`]` — matches EPICS
-/// base pvaClient `createProcess("")` (pvaClientChannel.cpp:316-333), whose
-/// parsed empty pvRequest is serialized into PROCESS INIT
-/// (clientContextImpl.cpp:528-536) and handed to the provider's
-/// `createChannelProcess` (responseHandlers.cpp:2556-2561). Use
-/// [`op_process_with_request`] to send a provider-specific request.
-pub async fn op_process(channel: &Arc<Channel>, op_timeout: Duration) -> PvaResult<()> {
-    op_process_with_request(channel, sentinel_all_fields(), op_timeout).await
-}
-
-/// `op_process` variant that sends a caller-supplied PROCESS pvRequest
-/// (e.g. `record[block=true]` or a provider-specific option set) instead of
-/// the empty default. pvAccess serializes this request on PROCESS INIT and
-/// the provider can inspect it during `createChannelProcess`
-/// (responseHandlers.cpp:2504-2511). Mirrors pvaClient
-/// `PvaClientChannel::createProcess(pvRequest)` (pvaClientProcess.cpp:198-200).
-pub async fn op_process_with_request(
-    channel: &Arc<Channel>,
-    pv_req: &[u8],
-    op_timeout: Duration,
-) -> PvaResult<()> {
-    requeue_on_disconnect(channel, op_timeout, |budget| {
-        op_process_with_request_attempt(channel, pv_req, budget)
-    })
-    .await
-}
-
-/// One attempt of [`op_process_with_request`]; [`requeue_on_disconnect`] runs it
-/// again from the top when the channel is lost mid-op.
-async fn op_process_with_request_attempt(
-    channel: &Arc<Channel>,
-    pv_req: &[u8],
-    op_timeout: Duration,
-) -> PvaResult<()> {
-    let (server, sid) = ensure_active_with_op_timeout(channel, op_timeout).await?;
-    let order = server.byte_order();
-    let big_endian = matches!(order, ByteOrder::Big);
-    let codec = PvaCodec { big_endian };
-    let ioid = alloc_ioid();
-
-    let mut stream = server.register_ioid_stream(sid, ioid, Command::Process.code());
-    let mut ioid_guard = IoidGuard::new(server.clone(), ioid);
-
-    // INIT — `sid + ioid + 0x08 + pvRequest`.
-    let init_frame = build_process_init(sid, ioid, pv_req, order);
-    server.send_for_channel(sid, init_frame).await?;
-
-    let init_resp = await_frame(&mut stream, op_timeout).await?;
-    let init_status = match decode_process_status(&init_resp, true) {
-        Ok(s) => s,
-        Err(e) => {
-            // Decode fault / command mismatch / wrong phase on the INIT
-            // reply is fatal.
-            server.close();
-            return Err(e);
-        }
-    };
-    if !init_status.is_success() {
-        server.unregister_ioid(ioid);
-        return Err(PvaError::Protocol(format!(
-            "PROCESS INIT failed: {init_status:?}"
-        )));
-    }
-    ioid_guard.arm_destroy(sid);
-
-    // PROCESS data — `sid + ioid + 0x00`, no payload.
-    let mut data = Vec::with_capacity(9);
-    data.put_u32(sid, order);
-    data.put_u32(ioid, order);
-    data.put_u8(0x00);
-    let data_h = PvaHeader::application(false, order, Command::Process.code(), data.len() as u32);
-    let mut data_frame = Vec::with_capacity(8 + data.len());
-    data_h.write_into(&mut data_frame);
-    data_frame.extend_from_slice(&data);
-    server.send_for_channel(sid, data_frame).await?;
-
-    let resp_frame = await_frame(&mut stream, op_timeout).await?;
-    let result = match decode_process_status(&resp_frame, false) {
-        Ok(s) if s.is_success() => Ok(()),
-        Ok(s) => Err(PvaError::Protocol(format!("PROCESS failed: {s:?}"))),
-        Err(e) => {
-            // Decode fault / command mismatch on the done reply is fatal.
-            server.close();
-            Err(e)
-        }
-    };
-
-    ioid_guard.disarm();
-    let destroy = codec.build_destroy_request(sid, ioid);
-    let _ = server.send_for_channel(sid, destroy).await;
-    server.unregister_ioid(ioid);
-    result
-}
-
-/// [`op_process_with_request`] variant taking the PROCESS pvRequest as a
-/// decoded [`PvField`] value. It is serialized (`type + full value`, as
-/// pvxs `serverget.cpp` decodes INIT pvRequests) in the connection's
-/// negotiated byte order, so the caller need not pre-encode it in the
-/// right endianness. A PVA-to-PVA gateway uses this to forward a
-/// downstream PROCESS create-time pvRequest upstream
-/// (`ChannelContext.pv_request` → pva2pva createChannelProcess).
-pub async fn op_process_with_request_value(
-    channel: &Arc<Channel>,
-    pv_request: &PvField,
-    op_timeout: Duration,
-) -> PvaResult<()> {
-    requeue_on_disconnect(channel, op_timeout, |budget| {
-        op_process_with_request_value_attempt(channel, pv_request, budget)
-    })
-    .await
-}
-
-/// One attempt of [`op_process_with_request_value`]; [`requeue_on_disconnect`] runs it
-/// again from the top when the channel is lost mid-op.
-async fn op_process_with_request_value_attempt(
-    channel: &Arc<Channel>,
-    pv_request: &PvField,
-    op_timeout: Duration,
-) -> PvaResult<()> {
-    let (server, sid) = ensure_active_with_op_timeout(channel, op_timeout).await?;
-    let order = server.byte_order();
-    let big_endian = matches!(order, ByteOrder::Big);
-    let codec = PvaCodec { big_endian };
-    let ioid = alloc_ioid();
-
-    let mut stream = server.register_ioid_stream(sid, ioid, Command::Process.code());
-    let mut ioid_guard = IoidGuard::new(server.clone(), ioid);
-
-    // INIT — `sid + ioid + 0x08 + pvRequest`, the pvRequest encoded
-    // (`type + full value`) in the connection's byte order.
-    let desc = pv_request.descriptor();
-    let mut pv_req = Vec::new();
-    encode_type_desc(&desc, order, &mut pv_req);
-    encode_pv_field(pv_request, &desc, order, &mut pv_req);
-    let init_frame = build_process_init(sid, ioid, &pv_req, order);
-    server.send_for_channel(sid, init_frame).await?;
-
-    let init_resp = await_frame(&mut stream, op_timeout).await?;
-    let init_status = match decode_process_status(&init_resp, true) {
-        Ok(s) => s,
-        Err(e) => {
-            // Decode fault / command mismatch / wrong phase on the INIT
-            // reply is fatal.
-            server.close();
-            return Err(e);
-        }
-    };
-    if !init_status.is_success() {
-        server.unregister_ioid(ioid);
-        return Err(PvaError::Protocol(format!(
-            "PROCESS INIT failed: {init_status:?}"
-        )));
-    }
-    ioid_guard.arm_destroy(sid);
-
-    // PROCESS data — `sid + ioid + 0x00`, no payload.
-    let mut data = Vec::with_capacity(9);
-    data.put_u32(sid, order);
-    data.put_u32(ioid, order);
-    data.put_u8(0x00);
-    let data_h = PvaHeader::application(false, order, Command::Process.code(), data.len() as u32);
-    let mut data_frame = Vec::with_capacity(8 + data.len());
-    data_h.write_into(&mut data_frame);
-    data_frame.extend_from_slice(&data);
-    server.send_for_channel(sid, data_frame).await?;
-
-    let resp_frame = await_frame(&mut stream, op_timeout).await?;
-    let result = match decode_process_status(&resp_frame, false) {
-        Ok(s) if s.is_success() => Ok(()),
-        Ok(s) => Err(PvaError::Protocol(format!("PROCESS failed: {s:?}"))),
-        Err(e) => {
-            server.close();
-            Err(e)
-        }
-    };
-
-    ioid_guard.disarm();
-    let destroy = codec.build_destroy_request(sid, ioid);
-    let _ = server.send_for_channel(sid, destroy).await;
-    server.unregister_ioid(ioid);
-    result
-}
-
-/// Decode a `PROCESS` response: `ioid + subcmd + status`, enforcing the
-/// expected wire phase. Returns the decoded `Status` for the matching
-/// phase.
-///
-/// `expect_init` selects the phase. pvAccess `BaseRequestImpl::response()`
-/// routes purely on `qos & QOS_INIT` (clientContextImpl.cpp:315-342): an
-/// INIT-bit reply runs `initResponse()` (channelProcessConnect) and a
-/// non-INIT reply runs `normalResponse()` (processDone), and
-/// `ChannelProcessRequestImpl::process()` refuses to send the data request
-/// until a successful INIT set `m_initialized`. Both PROCESS phases carry
-/// an identical status-only body, so the subcmd is the *only* phase
-/// discriminator: dropping it let a peer pass off a normal response as the
-/// INIT-ack, or an INIT-ack as process completion. The INIT reply must
-/// therefore carry `QOS_INIT` and the process-done reply must not.
-///
-/// An `Err` from this decoder is always connection-fatal — a command
-/// mismatch, a wrong-phase subcmd, or a truncated body is a protocol
-/// violation that pvxs answers with `bev.reset()` (clientget.cpp:456-493).
-/// A non-success `Status` *for the correct phase* decodes to `Ok`: it is a
-/// per-operation result, NOT a fault, so the caller surfaces it without
-/// resetting the circuit.
-fn decode_process_status(
-    frame: &super::decode::Frame,
-    expect_init: bool,
-) -> PvaResult<crate::proto::Status> {
-    if frame.header.command != Command::Process.code() {
-        return Err(PvaError::Protocol(format!(
-            "expected PROCESS response, got command {}",
-            frame.header.command
-        )));
-    }
-    let order = frame.order();
-    let mut cur = frame.cursor();
-    let _ioid = cur
-        .get_u32(order)
-        .map_err(|e| PvaError::Decode(e.to_string()))?;
-    let subcmd = cur.get_u8().map_err(|e| PvaError::Decode(e.to_string()))?;
-    let is_init = subcmd & QosFlags::INIT != 0;
-    if is_init != expect_init {
-        return Err(PvaError::Protocol(format!(
-            "PROCESS response phase mismatch: expected {}, got subcmd {subcmd:#04x}",
-            if expect_init { "INIT" } else { "process-done" },
-        )));
-    }
-    let status = crate::proto::Status::decode(&mut cur, order)
-        .map_err(|e| PvaError::Decode(e.to_string()))?;
-    Ok(status)
-}
-
 // ── Helpers ────────────────────────────────────────────────────────────
 
 /// Await one frame for an op's IOID.
@@ -5829,8 +4665,22 @@ fn build_field_delta(
     intro: &FieldDesc,
     assignments: &[(String, PutLeaf)],
 ) -> PvaResult<(PvField, BitSet)> {
-    let mut value = crate::pvdata::encode::default_value_for(intro);
-    let mut changed = BitSet::new();
+    assign_fields(
+        intro,
+        crate::pvdata::encode::default_value_for(intro),
+        BitSet::new(),
+        assignments,
+    )
+}
+
+/// Apply `assignments` onto `value`, adding each assigned leaf's bit to
+/// `changed`.
+fn assign_fields(
+    intro: &FieldDesc,
+    mut value: PvField,
+    mut changed: BitSet,
+    assignments: &[(String, PutLeaf)],
+) -> PvaResult<(PvField, BitSet)> {
     for (path, leaf) in assignments {
         let parts: Vec<&str> = path.split('.').filter(|s| !s.is_empty()).collect();
         let bit = intro.bit_for_path(path).ok_or_else(|| {
@@ -6202,7 +5052,9 @@ fn build_put_from_args(
                 if value_is_string {
                     bare.push(tok.clone());
                 } else {
-                    eprintln!("{fname} : Warning: no such field. Ignoring it.");
+                    epics_libcom_rs::stderr_println!(
+                        "{fname} : Warning: no such field. Ignoring it."
+                    );
                 }
             }
         }
@@ -6487,43 +5339,6 @@ mod tests {
     use crate::pvdata::encode::{decode_pv_field, encode_pv_field};
     use std::io::Cursor;
 
-    /// The PROCESS INIT frame must carry the
-    /// caller-supplied pvRequest verbatim (after the 9-byte
-    /// `sid + ioid + subcmd` prefix), not a hard-coded `field(value)`
-    /// request. Mirrors pvAccess serializing the stored PROCESS pvRequest
-    /// on INIT (clientContextImpl.cpp:528-536).
-    #[test]
-    fn process_init_embeds_caller_pv_request() {
-        let order = ByteOrder::Little;
-        let sid = 0x11223344u32;
-        let ioid = 0x55667788u32;
-        // A distinctive caller request the value-only default never produces.
-        let pv_req: &[u8] = &[
-            0xFD, 0x09, 0x00, 0x80, 0x01, 0x07, b'r', b'e', b'c', b'o', b'r', b'd', 0x00,
-        ];
-
-        let frame = build_process_init(sid, ioid, pv_req, order);
-        // header (8) + sid (4) + ioid (4) + subcmd (1) = 17-byte prefix.
-        let body = &frame[8..];
-        let mut cur = Cursor::new(body);
-        assert_eq!(cur.get_u32(order).unwrap(), sid);
-        assert_eq!(cur.get_u32(order).unwrap(), ioid);
-        assert_eq!(cur.get_u8().unwrap(), QosFlags::INIT);
-        assert_eq!(
-            &body[9..],
-            pv_req,
-            "PROCESS INIT must contain caller request"
-        );
-
-        // And it must differ from the empty/value-only defaults — i.e. the
-        // request is genuinely caller-controlled, not ignored.
-        let default_frame = build_process_init(sid, ioid, sentinel_all_fields(), order);
-        assert_ne!(frame, default_frame);
-        let value_only = build_pv_request_value_only(false);
-        let value_only_frame = build_process_init(sid, ioid, &value_only, order);
-        assert_ne!(frame, value_only_frame);
-    }
-
     /// Monitor `-F delta` must mark only the leaves the server flagged
     /// changed in *this* update. `changed_bitset_to_marked_paths` resolves
     /// the decoded changed `BitSet` to the dotted leaf paths
@@ -6690,7 +5505,8 @@ mod tests {
                 fields: vec![(
                     "value".to_string(),
                     FieldDesc::ScalarArray(ScalarType::Double),
-                )],
+                )]
+                .into(),
             }
         }
         fn tok(args: &[&str]) -> Vec<String> {
@@ -6756,13 +5572,14 @@ mod tests {
                 fields: vec![(
                     "value".to_string(),
                     FieldDesc::ScalarArray(ScalarType::Double),
-                )],
+                )]
+                .into(),
             }
         }
         fn nt_scalar() -> FieldDesc {
             FieldDesc::Structure {
                 struct_id: "epics:nt/NTScalar:1.0".to_string(),
-                fields: vec![("value".to_string(), FieldDesc::Scalar(ScalarType::Double))],
+                fields: vec![("value".to_string(), FieldDesc::Scalar(ScalarType::Double))].into(),
             }
         }
         fn value_array(v: &PvField) -> Vec<f64> {
@@ -6848,10 +5665,12 @@ mod tests {
                             fields: vec![
                                 ("severity".to_string(), FieldDesc::Scalar(ScalarType::Int)),
                                 ("status".to_string(), FieldDesc::Scalar(ScalarType::Int)),
-                            ],
+                            ]
+                            .into(),
                         },
                     ),
-                ],
+                ]
+                .into(),
             }
         }
         fn t(args: &[&str]) -> Vec<String> {
@@ -6984,10 +5803,12 @@ mod tests {
                             fields: vec![
                                 ("severity".to_string(), FieldDesc::Scalar(ScalarType::Int)),
                                 ("status".to_string(), FieldDesc::Scalar(ScalarType::Int)),
-                            ],
+                            ]
+                            .into(),
                         },
                     ),
-                ],
+                ]
+                .into(),
             }
         }
         /// `{ value: <T>[], alarm: { severity: int, status: int } }`.
@@ -7003,10 +5824,12 @@ mod tests {
                             fields: vec![
                                 ("severity".to_string(), FieldDesc::Scalar(ScalarType::Int)),
                                 ("status".to_string(), FieldDesc::Scalar(ScalarType::Int)),
-                            ],
+                            ]
+                            .into(),
                         },
                     ),
-                ],
+                ]
+                .into(),
             }
         }
         fn t(args: &[&str]) -> Vec<String> {
@@ -7170,7 +5993,8 @@ mod tests {
                                     "choices".to_string(),
                                     FieldDesc::ScalarArray(ScalarType::String),
                                 ),
-                            ],
+                            ]
+                            .into(),
                         },
                     ),
                     (
@@ -7180,12 +6004,28 @@ mod tests {
                             fields: vec![(
                                 "severity".to_string(),
                                 FieldDesc::Scalar(ScalarType::Int),
-                            )],
+                            )]
+                            .into(),
                         },
                     ),
-                ],
+                ]
+                .into(),
             }
         }
+        /// pvxs `linkBuildPut` (`pvalink_channel.cpp:138-154`): the link's
+        /// field drills into `value`, and an `enum_t` there into `index`.
+        #[test]
+        fn a_typed_put_to_an_enum_lands_on_the_index() {
+            let desc = nt_enum();
+            assert_eq!(effective_typed_put_path(&desc, ""), "value.index");
+            assert_eq!(effective_typed_put_path(&desc, "value"), "value.index");
+            assert_eq!(
+                effective_typed_put_path(&desc, "alarm.severity"),
+                "alarm.severity"
+            );
+            assert_eq!(effective_typed_put_path(&desc, "nosuch"), "nosuch");
+        }
+
         /// A get-first snapshot whose `value.choices` are the given labels.
         fn previous_with_choices(choices: &[&str]) -> PvField {
             let mut enum_v = PvStructure::new("enum_t");
@@ -7363,7 +6203,8 @@ mod tests {
                         FieldDesc::ScalarArray(ScalarType::Double),
                     ),
                     ("gain".to_string(), FieldDesc::Scalar(ScalarType::Int)),
-                ],
+                ]
+                .into(),
             }
         }
 
@@ -7603,7 +6444,8 @@ mod tests {
             fields: vec![
                 ("value".into(), FieldDesc::Scalar(ScalarType::Int)),
                 ("flag".into(), FieldDesc::Scalar(ScalarType::Boolean)),
-            ],
+            ]
+            .into(),
         };
         let v = build_put_value(&desc, "10; 20; 30").unwrap();
         match &v {
@@ -7631,11 +6473,12 @@ mod tests {
                     "meta".into(),
                     FieldDesc::Structure {
                         struct_id: "m_t".into(),
-                        fields: vec![("tag".into(), FieldDesc::Scalar(ScalarType::String))],
+                        fields: vec![("tag".into(), FieldDesc::Scalar(ScalarType::String))].into(),
                     },
                 ),
                 ("n".into(), FieldDesc::Scalar(ScalarType::Int)),
-            ],
+            ]
+            .into(),
         };
         let v = build_put_value(&desc, "5; 6").unwrap();
         match &v {
@@ -7659,7 +6502,7 @@ mod tests {
     fn put_structure_array_empty() {
         let desc = FieldDesc::StructureArray {
             struct_id: "elem_t".into(),
-            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Int))],
+            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Int))].into(),
         };
         let v = build_put_value(&desc, "").unwrap();
         assert!(matches!(&v, PvField::StructureArray(items) if items.is_empty()));
@@ -7729,10 +6572,12 @@ mod tests {
                     "alarm".into(),
                     FieldDesc::Structure {
                         struct_id: "alarm_t".into(),
-                        fields: vec![("severity".into(), FieldDesc::Scalar(ScalarType::Int))],
+                        fields: vec![("severity".into(), FieldDesc::Scalar(ScalarType::Int))]
+                            .into(),
                     },
                 ),
-            ],
+            ]
+            .into(),
         };
         let v = build_put_value(&desc, "intValue=99").unwrap();
         match &v {
@@ -7773,7 +6618,8 @@ mod tests {
                             ("severity".into(), FieldDesc::Scalar(ScalarType::Int)),
                             ("status".into(), FieldDesc::Scalar(ScalarType::Int)),
                             ("message".into(), FieldDesc::Scalar(ScalarType::String)),
-                        ],
+                        ]
+                        .into(),
                     },
                 ),
                 (
@@ -7786,10 +6632,12 @@ mod tests {
                                 FieldDesc::Scalar(ScalarType::Long),
                             ),
                             ("nanoseconds".into(), FieldDesc::Scalar(ScalarType::Int)),
-                        ],
+                        ]
+                        .into(),
                     },
                 ),
-            ],
+            ]
+            .into(),
         };
         let value = build_put_value(&desc, "42.5").unwrap();
 
@@ -8404,309 +7252,6 @@ mod tests {
         match recv_monitor_init(&state, &rx).await {
             MonitorInit::Reply(_) => {}
             _ => panic!("the no-handle path must still deliver the reply"),
-        }
-    }
-
-    // ── op-response decode-fault → circuit close regressions ─────────────
-    //
-    // pvxs resets the circuit (`bev.reset()`, clientget.cpp:456-493) on a
-    // malformed op-response body or a command/subcommand mismatch, but
-    // delivers a non-success Status to the operation without resetting.
-    // The PUT_GET/PROCESS decoders carry that distinction structurally: an
-    // outer `Err` is connection-fatal (the caller closes the `ServerConn`);
-    // a non-success Status is a per-op result, NOT an `Err`. These tests
-    // lock that split so a later edit cannot fold the two meanings back
-    // together (which is what left the circuit reusable after a bad frame).
-
-    fn scalar_int_struct() -> FieldDesc {
-        FieldDesc::Structure {
-            struct_id: "epics:nt/NTScalar:1.0".into(),
-            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Int))],
-        }
-    }
-
-    /// PUT_GET INIT: `ioid + subcmd + status [+ putIF + getIF]`.
-    fn put_get_init_frame(
-        order: ByteOrder,
-        status: crate::proto::Status,
-        with_types: bool,
-    ) -> Frame {
-        let mut payload = Vec::new();
-        payload.put_u32(7, order);
-        payload.put_u8(QosFlags::INIT);
-        status.write_into(order, &mut payload);
-        if with_types {
-            let desc = scalar_int_struct();
-            encode_type_desc(&desc, order, &mut payload); // putIF
-            encode_type_desc(&desc, order, &mut payload); // getIF
-        }
-        let header =
-            PvaHeader::application(true, order, Command::PutGet.code(), payload.len() as u32);
-        Frame { header, payload }
-    }
-
-    #[test]
-    fn put_get_init_non_success_status_is_per_op_not_fatal() {
-        let frame = put_get_init_frame(
-            ByteOrder::Little,
-            crate::proto::Status::error("denied"),
-            false,
-        );
-        let mut cache = crate::pvdata::encode::TypeCache::new();
-        match decode_put_get_init(&frame, &mut cache) {
-            Ok(Err(s)) => assert!(!s.is_success(), "expected the carried non-success status"),
-            other => panic!("non-success INIT must be per-op Ok(Err(status)), got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn put_get_init_success_decodes_both_introspections() {
-        let frame = put_get_init_frame(ByteOrder::Little, crate::proto::Status::ok(), true);
-        let mut cache = crate::pvdata::encode::TypeCache::new();
-        match decode_put_get_init(&frame, &mut cache) {
-            Ok(Ok((put_if, get_if))) => {
-                assert!(matches!(put_if, FieldDesc::Structure { .. }));
-                assert!(matches!(get_if, FieldDesc::Structure { .. }));
-            }
-            other => panic!("successful INIT must yield Ok(Ok((putIF, getIF))), got {other:?}"),
-        }
-    }
-
-    fn scalar_string_struct() -> FieldDesc {
-        FieldDesc::Structure {
-            struct_id: "epics:nt/NTScalar:1.0".into(),
-            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::String))],
-        }
-    }
-
-    /// PUT_GET INIT with DISTINCT putIF (String value) and getIF (Int
-    /// value): the decoder must return BOTH descriptors, not silently
-    /// discard putIF. pvAccessCPP keeps `m_putData` (putIF) separate from
-    /// `m_getData` (getIF); building the put leg or decoding a `getPut`
-    /// against getIF would corrupt the wire layout when the structures
-    /// differ (clientContextImpl.cpp:1036-1040).
-    #[test]
-    fn put_get_init_returns_distinct_put_and_get_descriptors() {
-        let put = scalar_string_struct();
-        let get = scalar_int_struct();
-        let mut payload = Vec::new();
-        payload.put_u32(7, ByteOrder::Little);
-        payload.put_u8(QosFlags::INIT);
-        crate::proto::Status::ok().write_into(ByteOrder::Little, &mut payload);
-        encode_type_desc(&put, ByteOrder::Little, &mut payload); // putIF
-        encode_type_desc(&get, ByteOrder::Little, &mut payload); // getIF
-        let header = PvaHeader::application(
-            true,
-            ByteOrder::Little,
-            Command::PutGet.code(),
-            payload.len() as u32,
-        );
-        let frame = Frame { header, payload };
-        let mut cache = crate::pvdata::encode::TypeCache::new();
-        let (put_if, get_if) = match decode_put_get_init(&frame, &mut cache) {
-            Ok(Ok(descs)) => descs,
-            other => panic!("distinct INIT must decode to (putIF, getIF), got {other:?}"),
-        };
-        // putIF's value leaf is String; getIF's value leaf is Int — the two
-        // must be carried separately.
-        let put_value_ty = match &put_if {
-            FieldDesc::Structure { fields, .. } => {
-                fields.iter().find(|(n, _)| n == "value").map(|(_, d)| d)
-            }
-            _ => None,
-        };
-        let get_value_ty = match &get_if {
-            FieldDesc::Structure { fields, .. } => {
-                fields.iter().find(|(n, _)| n == "value").map(|(_, d)| d)
-            }
-            _ => None,
-        };
-        assert!(
-            matches!(put_value_ty, Some(FieldDesc::Scalar(ScalarType::String))),
-            "putIF value leaf must be String, got {put_value_ty:?}"
-        );
-        assert!(
-            matches!(get_value_ty, Some(FieldDesc::Scalar(ScalarType::Int))),
-            "getIF value leaf must be Int, got {get_value_ty:?}"
-        );
-    }
-
-    #[test]
-    fn put_get_init_truncated_status_is_fatal_err() {
-        // ioid + subcmd only — the Status decode runs off the end.
-        let mut frame = put_get_init_frame(ByteOrder::Little, crate::proto::Status::ok(), false);
-        frame.payload.truncate(5); // u32 ioid + u8 subcmd, no status
-        frame.header.payload_length = frame.payload.len() as u32;
-        let mut cache = crate::pvdata::encode::TypeCache::new();
-        assert!(
-            decode_put_get_init(&frame, &mut cache).is_err(),
-            "a truncated INIT body must be a connection-fatal Err, not Ok"
-        );
-    }
-
-    #[test]
-    fn put_get_init_wrong_command_is_fatal_err() {
-        let mut frame = put_get_init_frame(ByteOrder::Little, crate::proto::Status::ok(), true);
-        frame.header.command = Command::Get.code(); // command mismatch
-        let mut cache = crate::pvdata::encode::TypeCache::new();
-        assert!(
-            decode_put_get_init(&frame, &mut cache).is_err(),
-            "a command mismatch must be a connection-fatal Err"
-        );
-    }
-
-    /// PUT_GET data: `ioid + subcmd + status [+ get bitset + get value]`.
-    fn put_get_data_frame(
-        order: ByteOrder,
-        status: crate::proto::Status,
-        with_value: bool,
-    ) -> Frame {
-        let mut payload = Vec::new();
-        payload.put_u32(7, order);
-        payload.put_u8(0x00);
-        status.write_into(order, &mut payload);
-        if with_value {
-            let desc = scalar_int_struct();
-            let mut changed = BitSet::new();
-            changed.set(desc.bit_for_path("value").unwrap());
-            changed.write_into(order, &mut payload);
-            let value = build_put_value(&desc, "11").unwrap();
-            encode_pv_field_with_bitset(&value, &desc, &changed, 0, order, &mut payload);
-        }
-        let header =
-            PvaHeader::application(true, order, Command::PutGet.code(), payload.len() as u32);
-        Frame { header, payload }
-    }
-
-    #[test]
-    fn put_get_data_non_success_status_is_per_op_not_fatal() {
-        let frame = put_get_data_frame(
-            ByteOrder::Little,
-            crate::proto::Status::error("nope"),
-            false,
-        );
-        let desc = scalar_int_struct();
-        let mut cache = crate::pvdata::encode::TypeCache::new();
-        match decode_put_get_data(&frame, &desc, &mut cache) {
-            Ok(Err(s)) => assert!(!s.is_success()),
-            other => panic!("non-success data must be per-op Ok(Err(status)), got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn put_get_data_truncated_value_is_fatal_err() {
-        // ok status but the bitset/value never arrive.
-        let frame = put_get_data_frame(ByteOrder::Little, crate::proto::Status::ok(), false);
-        let desc = scalar_int_struct();
-        let mut cache = crate::pvdata::encode::TypeCache::new();
-        assert!(
-            decode_put_get_data(&frame, &desc, &mut cache).is_err(),
-            "a truncated successful data body must be a connection-fatal Err"
-        );
-    }
-
-    /// PROCESS response: `ioid + subcmd + status`.
-    fn process_frame(
-        order: ByteOrder,
-        subcmd: u8,
-        status: crate::proto::Status,
-        full: bool,
-    ) -> Frame {
-        let mut payload = Vec::new();
-        payload.put_u32(7, order);
-        payload.put_u8(subcmd);
-        if full {
-            status.write_into(order, &mut payload);
-        }
-        let header =
-            PvaHeader::application(true, order, Command::Process.code(), payload.len() as u32);
-        Frame { header, payload }
-    }
-
-    #[test]
-    fn process_non_success_status_is_per_op_not_fatal() {
-        // Process-done phase (subcmd 0x00) with a non-success status is a
-        // per-op result, not a connection fault.
-        let frame = process_frame(
-            ByteOrder::Little,
-            0x00,
-            crate::proto::Status::error("busy"),
-            true,
-        );
-        match decode_process_status(&frame, false) {
-            Ok(s) => assert!(
-                !s.is_success(),
-                "non-success PROCESS status is data, not Err"
-            ),
-            Err(e) => panic!("non-success PROCESS must decode to Ok(status), got Err({e:?})"),
-        }
-    }
-
-    #[test]
-    fn process_truncated_is_fatal_err() {
-        let frame = process_frame(ByteOrder::Little, 0x00, crate::proto::Status::ok(), false);
-        assert!(
-            decode_process_status(&frame, false).is_err(),
-            "a truncated PROCESS body must be a connection-fatal Err"
-        );
-    }
-
-    #[test]
-    fn process_wrong_command_is_fatal_err() {
-        let mut frame = process_frame(ByteOrder::Little, 0x00, crate::proto::Status::ok(), true);
-        frame.header.command = Command::Get.code();
-        assert!(
-            decode_process_status(&frame, false).is_err(),
-            "a command mismatch must be a connection-fatal Err"
-        );
-    }
-
-    #[test]
-    fn process_init_phase_rejects_normal_subcmd() {
-        // A normal (subcmd 0x00) reply to the INIT request is a phase
-        // swap. pvAccess routes INIT vs done purely on QOS_INIT
-        // (clientContextImpl.cpp:315): a normal response where INIT was
-        // expected must be a connection-fatal Err, not a successful
-        // create.
-        let frame = process_frame(ByteOrder::Little, 0x00, crate::proto::Status::ok(), true);
-        assert!(
-            decode_process_status(&frame, true).is_err(),
-            "a normal-phase reply where INIT was expected must be fatal"
-        );
-    }
-
-    #[test]
-    fn process_done_phase_rejects_init_subcmd() {
-        // An INIT-bit (0x08) reply to the process request must not be
-        // reported as process completion.
-        let frame = process_frame(
-            ByteOrder::Little,
-            QosFlags::INIT,
-            crate::proto::Status::ok(),
-            true,
-        );
-        assert!(
-            decode_process_status(&frame, false).is_err(),
-            "an INIT-phase reply where process-done was expected must be fatal"
-        );
-    }
-
-    #[test]
-    fn process_init_phase_accepts_init_subcmd() {
-        // The matching INIT
-        // phase (subcmd 0x08) decodes to Ok(success).
-        let frame = process_frame(
-            ByteOrder::Little,
-            QosFlags::INIT,
-            crate::proto::Status::ok(),
-            true,
-        );
-        match decode_process_status(&frame, true) {
-            Ok(s) => assert!(
-                s.is_success(),
-                "matching INIT phase must be a success status"
-            ),
-            Err(e) => panic!("matching INIT phase must decode Ok, got Err({e:?})"),
         }
     }
 

@@ -31,24 +31,24 @@ cargo build --release -p mqtt-ioc --features ioc
 
 ### Logging
 
-The binary installs a `tracing_subscriber` controlled by `RUST_LOG`
-(default: `info`):
+Driver diagnostics are asyn trace lines on port `MQTT1`, printed as C's
+`drvMqtt` prints them. `ASYN_TRACE_ERROR` is on by default:
 
-```bash
-# Default — reconnects (info) and errors (error) only
-./target/release/mqtt-ioc examples/mqtt-ioc/ioc/st.cmd
+- `MqttDriver::onDisconnectCb: Connection lost. Reconnecting... (<error>)` —
+  the `rumqttc` error tells a real network failure from a recoverable state
+  error.
+- `MqttDriver::onFailCb: MQTT Operation error: 'Error: <error>'` — each failed
+  reconnect attempt, subscribe or publish.
+- `MqttDriver::onConnectCb: Reconnected.` — a reconnect after a loss.
+- `MqttDriver::onMessageCb: ...` — an inbound payload a record could not take.
+- `MqttDriver::<x>Write: Failed to set value for topic ...` — a failed write.
 
-# Also show Connected PV recovery path (Publish/PingResp restoring Connected=1)
-RUST_LOG=info,mqtt_rs=debug ./target/release/mqtt-ioc examples/mqtt-ioc/ioc/st.cmd
-```
+Connect, subscribe and publish lines are `ASYN_TRACEIO_DRIVER`; turn them on
+at the shell with `asynSetTraceMask("MQTT1", 0, "ERROR|DRIVER")`.
 
-Useful lines to watch for:
-
-- `MQTT connection error: <variant>` — the `rumqttc` `ConnectionError`
-  variant is what tells you whether a disconnect was a real network
-  failure vs. a recoverable state error.
-- `MQTT connected, subscribing to N topics` — logged on every fresh
-  ConnAck (initial connect and every reconnect).
+The binary also installs a `tracing_subscriber` controlled by `RUST_LOG`
+(default `info`); `RUST_LOG=info,mqtt_rs=debug` adds the Connected PV
+recovery path (Publish/PingResp restoring Connected=1).
 
 ## Z2M Builder Example
 

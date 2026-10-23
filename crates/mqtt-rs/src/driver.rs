@@ -2,9 +2,11 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use asyn_rs::error::{AsynError, AsynResult};
+use asyn_rs::error::{AsynError, AsynResult, AsynStatus};
 use asyn_rs::param::ParamType;
+use asyn_rs::port::InterfaceMask;
 use asyn_rs::port::{DrvUserInfo, DrvUserRequest, PortDriver, PortDriverBase, PortFlags};
+use asyn_rs::trace::TraceMask;
 use asyn_rs::user::AsynUser;
 use tokio::sync::{Notify, mpsc};
 
@@ -144,7 +146,7 @@ impl Drop for MqttDriver {
             // is the report that the broker was NOT told, and it happens on the
             // way out of a process whose `tracing` subscriber may already be
             // gone.
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => eprintln!(
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => epics_libcom_rs::stderr_println!(
                 "mqtt: port '{}' did not get its DISCONNECT out within \
                  {TEARDOWN_TIMEOUT:?}; the broker was not told",
                 self.base.port_name
@@ -165,6 +167,23 @@ impl MqttDriver {
     /// grammar cannot express (the Z2M builders' `normalize_on_off`). These are
     /// **not** created here; they are stored as an overlay that on-demand
     /// creation consults. Generic MQTT passes an empty vector.
+    /// drvMqtt's `Autoparam::DriverOpts()` masks (autoparamDriver.h:166-175):
+    /// interrupts on every value interface, Common and DrvUser on top.
+    const INTERRUPT_MASK: InterfaceMask = InterfaceMask::INT32
+        .or(InterfaceMask::INT64)
+        .or(InterfaceMask::UINT32_DIGITAL)
+        .or(InterfaceMask::FLOAT64)
+        .or(InterfaceMask::OCTET)
+        .or(InterfaceMask::INT8_ARRAY)
+        .or(InterfaceMask::INT16_ARRAY)
+        .or(InterfaceMask::INT32_ARRAY)
+        .or(InterfaceMask::INT64_ARRAY)
+        .or(InterfaceMask::FLOAT32_ARRAY)
+        .or(InterfaceMask::FLOAT64_ARRAY);
+    const INTERFACE_MASK: InterfaceMask = InterfaceMask::COMMON
+        .or(InterfaceMask::DRV_USER)
+        .or(Self::INTERRUPT_MASK);
+
     pub fn new(
         port_name: &str,
         config: &MqttConfig,
@@ -182,7 +201,13 @@ impl MqttDriver {
             can_block: false,
             ..PortFlags::default()
         };
-        let mut base = PortDriverBase::new(port_name, 1, flags);
+        let mut base = PortDriverBase::new(
+            port_name,
+            1,
+            flags,
+            Self::INTERFACE_MASK,
+            Self::INTERRUPT_MASK,
+        );
 
         // Create connection status param (0=disconnected, 1=connected)
         let connected_param = base
@@ -308,6 +333,85 @@ impl MqttDriver {
         let payload = encode_payload(value, addr).into_bytes();
         self.publish_bytes(reason, payload)
     }
+
+    /// `write_octet`'s publish, apart so [`Self::traced`] sees every failure.
+    fn publish_octet(&self, reason: usize, raw: &[u8]) -> AsynResult<()> {
+        let format = self
+            .reason_to_addr
+            .get(reason)
+            .and_then(|a| a.as_ref())
+            .ok_or_else(|| AsynError::ParamNotFound(format!("reason {reason}")))?
+            .format;
+        match format {
+            // FLAT publishes the raw octet bytes verbatim — they need not be
+            // valid UTF-8, and C does no re-encoding. Earlier the path forced
+            // them through String::from_utf8_lossy, corrupting a binary /
+            // waveform-CHAR write to U+FFFD on the wire (MQ39).
+            PayloadFormat::Flat => self.publish_bytes(reason, raw.to_vec()),
+            // JSON octet write is unimplemented in C (stringWrite throws
+            // logic_error, drvMqtt.cpp:720-722) and a JSON string value must be
+            // UTF-8 anyway, so this path keeps the String encoding.
+            PayloadFormat::Json => {
+                let s = String::from_utf8_lossy(raw).into_owned();
+                self.publish_value(reason, &DecodedValue::String(s))
+            }
+        }
+    }
+
+    /// `write_uint32_digital`'s merge and publish.
+    ///
+    /// C parity (MQ51): MqttDriver::digitalWrite (drvMqtt.cpp:600-639) is
+    /// publish-only and merges a partial-mask write against the *current
+    /// cached value* — which is populated solely by inbound broker messages,
+    /// since a write never commits the cache (setAutoInterrupts(false), see
+    /// `write_int32`). It reads getUIntDigitalParam(idx, &cur, 0xFFFFFFFF) and,
+    /// if that value was never received (asynParamUndefined), throws "Masked
+    /// write attempted on uninitialized value" rather than overwriting the
+    /// unknown bits with an assumed zero. A full-mask write supplies every bit,
+    /// so it needs no prior value. The merge reads but never writes the cache,
+    /// and nothing is posted — the readback is the broker echo. The read
+    /// precedes the publish, so (as in C) the uninitialized error surfaces
+    /// before the connection gate inside `publish_value`.
+    fn publish_digital(&self, user: &AsynUser, value: u32, mask: u32) -> AsynResult<()> {
+        let full_val = if mask == 0xFFFF_FFFF {
+            value
+        } else {
+            // Surfaces ParamUndefined as an error (C asynParamUndefined); the
+            // merge must not assume zero for the unknown bits.
+            let current = self.base.get_uint32_param(user.reason, user.addr)?;
+            // C: auxVal |= (value & mask); auxVal &= (value | ~mask)
+            //  ≡ (current & ~mask) | (value & mask) (drvMqtt.cpp:620-621).
+            (current & !mask) | (value & mask)
+        };
+        self.publish_value(user.reason, &DecodedValue::UInt32(full_val))
+    }
+
+    /// The `ASYN_TRACE_ERROR` line each C `*Write` handler prints from its
+    /// `catch` before returning `asynError` (drvMqtt.cpp:592-594 and the four
+    /// like it). Without it the console carried only the device support's
+    /// line, which names no topic and no cause.
+    fn traced<T>(&self, reason: usize, function: &str, r: AsynResult<T>) -> AsynResult<T> {
+        if let Err(e) = &r {
+            // C prints `exc.what()`, the bare cause.
+            let why: &dyn std::fmt::Display = match e {
+                AsynError::Status { message, .. } => message,
+                other => other,
+            };
+            let topic = self
+                .reason_to_addr
+                .get(reason)
+                .and_then(|a| a.as_ref())
+                .map_or("", |a| a.topic.as_str());
+            self.base.trace_print(
+                TraceMask::ERROR,
+                format_args!(
+                    "MqttDriver::{function}: Failed to set value for topic '{topic}': {why}. asynStatus: {})\n",
+                    AsynStatus::Error as i32
+                ),
+            );
+        }
+        r
+    }
 }
 
 impl PortDriver for MqttDriver {
@@ -333,11 +437,18 @@ impl PortDriver for MqttDriver {
         let parsed = match TopicAddress::parse(drv_info) {
             Ok(addr) => addr,
             Err(_) => {
-                let reason = self
-                    .base()
-                    .params
-                    .find_param(drv_info)
-                    .ok_or_else(|| AsynError::ParamNotFound(drv_info.to_string()))?;
+                let base = self.base();
+                let Some(reason) = base.params.find_param(drv_info) else {
+                    // Autoparam/autoparamDriver.cpp:167-171.
+                    base.trace_print(
+                        asyn_rs::trace::TraceMask::ERROR,
+                        format_args!(
+                            "Autoparam::Driver: port={} could not parse '{drv_info}'\n",
+                            base.port_name
+                        ),
+                    );
+                    return Err(AsynError::ParamNotFound(drv_info.to_string()));
+                };
                 return Ok(DrvUserInfo::from_reason(reason));
             }
         };
@@ -377,13 +488,15 @@ impl PortDriver for MqttDriver {
         // is false (autoparamDriver.cpp:1033-1036,437-442): the base class skips
         // setParam + callParamCallbacks. The cache + I/O Intr readback come only
         // from the broker echo (onMessageCb), never from the write itself.
-        self.publish_value(user.reason, &DecodedValue::Int32(value))
+        let r = self.publish_value(user.reason, &DecodedValue::Int32(value));
+        self.traced(user.reason, "integerWrite", r)
     }
 
     fn write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {
         // C parity (MQ51): floatWrite (drvMqtt.cpp:642-658) is publish-only — see
         // `write_int32`. No cache commit, no post; readback is broker-echo-only.
-        self.publish_value(user.reason, &DecodedValue::Float64(value))
+        let r = self.publish_value(user.reason, &DecodedValue::Float64(value));
+        self.traced(user.reason, "floatWrite", r)
     }
 
     fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
@@ -400,28 +513,8 @@ impl PortDriver for MqttDriver {
         // buffer. (Contrast modbus, whose writeOctet derives *nActual from what
         // fit the register buffer, drvModbusAsyn.cpp:1548-1552.)
         let nbytes = data.len();
-        // Copy the format (Copy enum) so the immutable reason_to_addr borrow is
-        // dropped before the mutable cache store below.
-        let format = self
-            .reason_to_addr
-            .get(user.reason)
-            .and_then(|a| a.as_ref())
-            .ok_or_else(|| AsynError::ParamNotFound(format!("reason {}", user.reason)))?
-            .format;
-        match format {
-            // FLAT publishes the raw octet bytes verbatim — they need not be
-            // valid UTF-8, and C does no re-encoding. Earlier the path forced
-            // them through String::from_utf8_lossy, corrupting a binary /
-            // waveform-CHAR write to U+FFFD on the wire (MQ39).
-            PayloadFormat::Flat => self.publish_bytes(user.reason, raw.to_vec())?,
-            // JSON octet write is unimplemented in C (stringWrite throws
-            // logic_error, drvMqtt.cpp:720-722) and a JSON string value must be
-            // UTF-8 anyway, so this path keeps the String encoding.
-            PayloadFormat::Json => {
-                let s = String::from_utf8_lossy(raw).into_owned();
-                self.publish_value(user.reason, &DecodedValue::String(s))?;
-            }
-        }
+        let r = self.publish_octet(user.reason, raw);
+        self.traced(user.reason, "stringWrite", r)?;
         // C parity (MQ51): stringWrite (drvMqtt.cpp:700-733) is publish-only —
         // setAutoInterrupts(false) means a successful write neither commits the
         // param cache nor posts; the octet readback comes only from the broker
@@ -435,29 +528,8 @@ impl PortDriver for MqttDriver {
         value: u32,
         mask: u32,
     ) -> AsynResult<()> {
-        // C parity (MQ51): MqttDriver::digitalWrite (drvMqtt.cpp:600-639) is
-        // publish-only and merges a partial-mask write against the *current
-        // cached value* — which is populated solely by inbound broker messages,
-        // since a write never commits the cache (setAutoInterrupts(false), see
-        // `write_int32`). It reads getUIntDigitalParam(idx, &cur, 0xFFFFFFFF) and,
-        // if that value was never received (asynParamUndefined), throws "Masked
-        // write attempted on uninitialized value" rather than overwriting the
-        // unknown bits with an assumed zero. A full-mask write supplies every bit,
-        // so it needs no prior value. The merge reads but never writes the cache,
-        // and nothing is posted — the readback is the broker echo. The read
-        // precedes the publish, so (as in C) the uninitialized error surfaces
-        // before the connection gate inside `publish_value`.
-        let full_val = if mask == 0xFFFF_FFFF {
-            value
-        } else {
-            // Surfaces ParamUndefined as an error (C asynParamUndefined); the
-            // merge must not assume zero for the unknown bits.
-            let current = self.base.params.get_uint32_strict(user.reason, user.addr)?;
-            // C: auxVal |= (value & mask); auxVal &= (value | ~mask)
-            //  ≡ (current & ~mask) | (value & mask) (drvMqtt.cpp:620-621).
-            (current & !mask) | (value & mask)
-        };
-        self.publish_value(user.reason, &DecodedValue::UInt32(full_val))
+        let r = self.publish_digital(user, value, mask);
+        self.traced(user.reason, "digitalWrite", r)
     }
 
     fn write_int32_array(&mut self, user: &AsynUser, data: &[i32]) -> AsynResult<()> {
@@ -465,7 +537,8 @@ impl PortDriver for MqttDriver {
         // when shouldProcessInterrupts holds, which is false under drvMqtt's
         // setAutoInterrupts(false); the mqtt array write is publish-only. See
         // `write_int32`. No cache commit, no post.
-        self.publish_value(user.reason, &DecodedValue::Int32Array(data.to_vec()))
+        let r = self.publish_value(user.reason, &DecodedValue::Int32Array(data.to_vec()));
+        self.traced(user.reason, "arrayWrite", r)
     }
 
     fn read_int32_array(&mut self, user: &AsynUser, buf: &mut [i32]) -> AsynResult<usize> {
@@ -477,7 +550,8 @@ impl PortDriver for MqttDriver {
 
     fn write_float64_array(&mut self, user: &AsynUser, data: &[f64]) -> AsynResult<()> {
         // C parity (MQ51): publish-only — see `write_int32_array`.
-        self.publish_value(user.reason, &DecodedValue::Float64Array(data.to_vec()))
+        let r = self.publish_value(user.reason, &DecodedValue::Float64Array(data.to_vec()));
+        self.traced(user.reason, "arrayWrite", r)
     }
 
     fn read_float64_array(&mut self, user: &AsynUser, buf: &mut [f64]) -> AsynResult<usize> {
@@ -508,6 +582,50 @@ mod tests {
                 .expect("on-demand create");
         }
         (driver, rx)
+    }
+
+    /// A failed write prints C's `ASYN_TRACE_ERROR` line (drvMqtt.cpp:592-594)
+    /// on the port's trace file; only device support's line used to reach the
+    /// console.
+    #[test]
+    fn a_failed_write_prints_c_s_trace_error_line() {
+        use asyn_rs::runtime::{RuntimeConfig, create_port_runtime_unclaimed};
+        use asyn_rs::services::PortServices;
+        use asyn_rs::trace::TraceFile;
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let connected = Arc::new(AtomicBool::new(false));
+        let mut driver =
+            MqttDriver::new("MQTRACE", &MqttConfig::default(), Vec::new(), tx, connected);
+        let reason = driver
+            .drv_user_create(&DrvUserRequest::new("FLAT:INT dev/set", 0))
+            .unwrap()
+            .reason;
+        let services = PortServices::new();
+        let trace = services.trace().clone();
+        let (runtime, _actor) = create_port_runtime_unclaimed(
+            driver,
+            RuntimeConfig {
+                services,
+                ..RuntimeConfig::default()
+            },
+        )
+        .unwrap();
+        let path = std::env::temp_dir().join(format!("mqtrace-{}.log", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        trace.set_trace_file(Some("MQTRACE"), TraceFile::File(Arc::new(Mutex::new(file))));
+
+        let r = runtime.port_handle().write_int32_blocking(reason, 0, 7);
+        assert!(r.is_err());
+        let log = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            log.contains(
+                "MqttDriver::integerWrite: Failed to set value for topic 'dev/set': \
+                 MQTT client not connected. asynStatus: 3)"
+            ),
+            "{log}"
+        );
     }
 
     /// C parity: a publish while the broker is down throws "MQTT client not
@@ -634,6 +752,47 @@ mod tests {
     }
 
     #[test]
+    fn an_unparsable_drvinfo_prints_could_not_parse() {
+        use asyn_rs::runtime::{RuntimeConfig, create_port_runtime_unclaimed};
+        use asyn_rs::services::PortServices;
+        use asyn_rs::trace::TraceFile;
+
+        let (driver, _rx) = make_driver(&[]);
+        let port = driver.base.port_name.clone();
+        let path =
+            std::env::temp_dir().join(format!("mqtt_drvuser_trace_{}.trace", std::process::id()));
+        let services = PortServices::new();
+        services.trace().set_trace_file(
+            Some(&port),
+            TraceFile::File(Arc::new(Mutex::new(std::fs::File::create(&path).unwrap()))),
+        );
+        let (runtime, _jh) = create_port_runtime_unclaimed(
+            driver,
+            RuntimeConfig {
+                services,
+                ..RuntimeConfig::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            runtime
+                .port_handle()
+                .drv_user_create_blocking(&DrvUserRequest::new("not a topic address", 0))
+                .is_err()
+        );
+        runtime.shutdown();
+
+        let logged = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            logged.contains(&format!(
+                "Autoparam::Driver: port={port} could not parse 'not a topic address'\n"
+            )),
+            "{logged}"
+        );
+    }
+
+    #[test]
     fn on_demand_create_applies_overlay_config() {
         // A Z2M `/set` control pre-registers `normalize_on_off` through the
         // overlay; the record link carries only the bare drvInfo (the grammar
@@ -751,7 +910,7 @@ mod tests {
         assert_eq!(req.topic, "test/str_topic");
         assert_eq!(req.payload, b"hi");
     }
-    /// `*nbytesTransfered` for an embedded-NUL octet write.
+    /// `*nbytesTransferred` for an embedded-NUL octet write.
     ///
     /// C, at the declared autoparam pin (`v2.1.0`, `2159559`,
     /// `/home/stevek/work/epics-modules/autoparamDriver`):
@@ -776,7 +935,7 @@ mod tests {
     /// Both halves are asserted here because they move independently: the count
     /// is the caller's buffer, the payload stops at the NUL.
     #[test]
-    fn write_octet_reports_c_s_full_nbytes_transfered() {
+    fn write_octet_reports_c_s_full_nbytes_transferred() {
         let (mut driver, mut rx) = make_driver(&["FLAT:STRING test/str_topic"]);
         let reason = driver
             .drv_user_create(&DrvUserRequest::new("FLAT:STRING test/str_topic", 0))
@@ -864,8 +1023,7 @@ mod tests {
         // full-mask *write* does not, so the merge below reads this value only.
         driver
             .base
-            .params
-            .set_uint32(reason, 0, 0x00f0, 0xffff_ffff, 0)
+            .set_uint32_param(reason, 0, 0x00f0, 0xffff_ffff, 0)
             .unwrap();
 
         // Partial mask now merges into the inbound 0x00f0:
@@ -927,7 +1085,7 @@ mod tests {
         assert_eq!(rx.try_recv().unwrap().payload, b"42");
         assert!(
             matches!(
-                driver.base.params.get_int32_strict(reason, 0),
+                driver.base.get_int32_param(reason, 0),
                 Err(AsynError::ParamUndefined(_))
             ),
             "a successful scalar write must not commit the param cache"
@@ -946,5 +1104,19 @@ mod tests {
         let topic_map = topic_map.lock().unwrap();
         assert_eq!(topic_map["test/shared"].len(), 2);
         assert_eq!(topic_map["test/other"].len(), 1);
+    }
+
+    /// drvMqtt takes `Autoparam::DriverOpts()`'s masks unchanged
+    /// (autoparamDriver.h:166-175): no Option, Enum or GenericPointer.
+    #[test]
+    fn the_port_registers_autoparam_driver_s_interfaces() {
+        let (driver, _rx) = make_driver(&[]);
+        assert_eq!(
+            (
+                driver.base().interface_mask().bits(),
+                driver.base().interrupt_mask().bits()
+            ),
+            (0xcffb, 0xcff8)
+        );
     }
 }

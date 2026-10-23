@@ -6,48 +6,31 @@
 //! signed by the same CA, and the client presents one. The
 //! pvxs flag is `EPICS_PVA_TLS_OPTIONS=client_cert=require`.
 //!
-//! SKIPs if the TLS-enabled pvxs build is not present.
+//! Fails if the TLS-enabled pvxs build is not present.
 
 #![cfg(tokio_backend)]
 
+use super::interop_helpers::{PvxsOutput, pvxs_command};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
-fn env_key() -> &'static str {
-    if cfg!(target_os = "macos") {
-        "DYLD_LIBRARY_PATH"
-    } else {
-        "LD_LIBRARY_PATH"
-    }
-}
-
-fn locate_tls_binary(name: &str) -> Option<PathBuf> {
-    super::interop_helpers::pvxs_tls_home().and_then(|r| {
-        let p = r
-            .join("bin")
-            .join(super::interop_helpers::pvxs_arch())
-            .join(name);
-        p.is_file().then_some(p)
-    })
-}
-
-fn tls_lib_dir() -> Option<PathBuf> {
+fn locate_tls_binary(name: &str) -> PathBuf {
     super::interop_helpers::pvxs_tls_home()
-        .map(|r| r.join("lib").join(super::interop_helpers::pvxs_arch()))
+        .and_then(|r| {
+            let p = r
+                .join("bin")
+                .join(super::interop_helpers::pvxs_arch())
+                .join(name);
+            p.is_file().then_some(p)
+        })
+        .unwrap_or_else(|| panic!("no TLS-enabled pvxs `{name}` (set PVXS_TLS_HOME; see batch 12)"))
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn interop_tls_mtls_pvxget_with_client_cert_to_rust_server() {
-    let Some(pvxget) = locate_tls_binary("pvxget") else {
-        eprintln!("SKIP: no TLS-enabled pvxs (set PVXS_TLS_HOME; see batch 12)");
-        return;
-    };
-    let Some(lib) = tls_lib_dir() else {
-        eprintln!("SKIP: pvxs-tls lib dir missing");
-        return;
-    };
+    let pvxget = locate_tls_binary("pvxget");
 
     // CA + leaf (used by both server and client cert chains).
     let mut ca_params = rcgen::CertificateParams::new(Vec::new()).expect("ca params");
@@ -103,10 +86,7 @@ async fn interop_tls_mtls_pvxget_with_client_cert_to_rust_server() {
             "openssl pkcs12 -export failed: {}",
             String::from_utf8_lossy(&o.stderr)
         ),
-        Err(e) => {
-            eprintln!("SKIP: openssl cli: {e}");
-            return;
-        }
+        Err(e) => panic!("openssl cli not available: {e}"),
     }
 
     // Rust server: TLS + require client cert (the mtls part).
@@ -143,7 +123,7 @@ async fn interop_tls_mtls_pvxget_with_client_cert_to_rust_server() {
     pv.open(
         FieldDesc::Structure {
             struct_id: "epics:nt/NTScalar:1.0".into(),
-            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Int))],
+            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Int))].into(),
         },
         PvField::Structure(PvStructure {
             struct_id: "epics:nt/NTScalar:1.0".into(),
@@ -156,12 +136,6 @@ async fn interop_tls_mtls_pvxget_with_client_cert_to_rust_server() {
 
     let cfg = PvaServerConfig {
         tcp_port: 0,
-        udp_port: {
-            let s = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-            let p = s.local_addr().unwrap().port();
-            drop(s);
-            p
-        },
         tls: Some(Arc::new(tls_cfg)),
         ..PvaServerConfig::isolated()
     };
@@ -173,9 +147,8 @@ async fn interop_tls_mtls_pvxget_with_client_cert_to_rust_server() {
 
     let pvxget_p = pvxget.clone();
     let cert_path = p12_path.clone();
-    let lib_os = lib.into_os_string();
     let out = tokio::task::spawn_blocking(move || {
-        std::process::Command::new(&pvxget_p)
+        pvxs_command(&pvxget_p)
             .arg("-w")
             .arg("3")
             .arg("MTLS:PV")
@@ -186,10 +159,9 @@ async fn interop_tls_mtls_pvxget_with_client_cert_to_rust_server() {
             .env("EPICS_PVA_NAME_SERVERS", "")
             .env("EPICS_PVA_TLS_KEYCHAIN", cert_path.display().to_string())
             .env("EPICS_PVA_TLS_OPTIONS", "")
-            .env(env_key(), lib_os)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .output()
+            .pvxs_output()
             .expect("pvxget exec")
     })
     .await

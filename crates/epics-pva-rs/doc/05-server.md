@@ -40,7 +40,7 @@ unrelated emit sites.
 
 ```rust
 pub trait ChannelSource: Send + Sync + 'static {
-    async fn list_pvs(&self) -> Vec<String>;
+    fn list_pvs(&self) -> Vec<String>;
     async fn has_pv(&self, name: &str) -> bool;
     async fn get_introspection(&self, name: &str) -> Option<FieldDesc>;
     async fn get_value(&self, name: &str) -> Option<PvField>;
@@ -155,8 +155,10 @@ Per-monitor-subscriber spawn structure:
 ```
 
 `PvaServerConfig::monitor_queue_depth` (default 4) is the squash
-threshold; `monitor_high_watermark` (default 64) is the warning
-trigger surfaced via `tracing::warn`.
+threshold. Each op's deepest queue and squash count (pvxs `maxQueue`,
+`nSquash`) are in its channel's `ChannelReport::monitors`; nothing is
+logged. Each connection's writer task runs on the server's `PVASTX`
+executor (pvxs `PVXTCP`), apart from the `PVASTASK` monitor tasks.
 
 ## Auth + connection validation
 

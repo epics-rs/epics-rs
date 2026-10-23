@@ -11,6 +11,15 @@
 //! cargo run -p dbd-codegen -- --check    # fail on drift (CI)
 //! ```
 //!
+//! A crate outside this workspace that declares its own record types (an IOC
+//! driver repository) names its `.dbd` directory and output file, relative to
+//! the directory the tool is run from:
+//!
+//! ```text
+//! cargo run --manifest-path <epics-rs>/Cargo.toml -p dbd-codegen -- \
+//!     --write --external <dbd_dir> <out_file>
+//! ```
+//!
 //! The generator is offline: it reads the `.dbd` files **vendored into the
 //! repository**, and its output is checked in, so neither the build nor CI
 //! depends on an EPICS installation.
@@ -18,6 +27,11 @@
 //! It serves several crates, not just `epics-base-rs` — see [`targets`]. Each
 //! target owns a vendored `.dbd` directory and gets a table generated into
 //! itself, under the same drift gate.
+
+#![expect(
+    clippy::disallowed_macros,
+    reason = "single-threaded offline generator: no second writer to interleave with"
+)]
 
 mod breaktable;
 mod emit;
@@ -28,14 +42,26 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use targets::{BASE, TARGETS, Target};
+use targets::{BASE, EXTERNAL_BASE_PATH, TARGETS, Target};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let check = args.iter().any(|a| a == "--check");
     let write = args.iter().any(|a| a == "--write");
-    if check == write {
-        eprintln!("usage: dbd-codegen (--write | --check)");
+    let external = match args.iter().position(|a| a == "--external") {
+        None => None,
+        Some(i) => match (args.get(i + 1), args.get(i + 2)) {
+            (Some(dbd_dir), Some(out_file)) => Some(Target {
+                dbd_dir: String::leak(dbd_dir.clone()),
+                out_file: String::leak(out_file.clone()),
+                bpt_out_file: None,
+                base_path: EXTERNAL_BASE_PATH,
+            }),
+            _ => None,
+        },
+    };
+    if check == write || args.iter().any(|a| a == "--external") && external.is_none() {
+        eprintln!("usage: dbd-codegen (--write | --check) [--external <dbd_dir> <out_file>]");
         return ExitCode::from(2);
     }
 
@@ -47,7 +73,10 @@ fn main() -> ExitCode {
         }
     };
 
-    let outputs = match generate_all(&root) {
+    let outputs = match external.map_or_else(
+        || generate_all(&root),
+        |target| generate_external(&root, &target),
+    ) {
         Ok(o) => o,
         Err(e) => {
             eprintln!("dbd-codegen: {e}");
@@ -95,7 +124,7 @@ fn generate_all(root: &Path) -> Result<Vec<(PathBuf, String)>, String> {
     // There is ONE `dbCommon` declaration in the port, and it is base's: a
     // downstream `.dbd` that says `include "dbCommon.dbd"` means base's.
     let common = parse::parse_db_common(&root.join(BASE.dbd_dir).join("dbCommon.dbd"))?;
-    let base_menus = base_menu_paths(root, &common)?;
+    let base_menus = base_menu_paths(root, &common, "epics_base_rs")?;
 
     let mut outputs = Vec::new();
     for target in TARGETS {
@@ -118,6 +147,19 @@ fn generate_all(root: &Path) -> Result<Vec<(PathBuf, String)>, String> {
     Ok(outputs)
 }
 
+/// One out-of-workspace target, generated against this workspace's base
+/// exactly as an in-workspace downstream target is. Its paths are relative to
+/// the current directory, not the workspace root.
+fn generate_external(root: &Path, target: &Target) -> Result<Vec<(PathBuf, String)>, String> {
+    let common = parse::parse_db_common(&root.join(BASE.dbd_dir).join("dbCommon.dbd"))?;
+    let base_menus = base_menu_paths(root, &common, target.base_path)?;
+    let cwd = std::env::current_dir().map_err(|e| format!("current directory: {e}"))?;
+    Ok(vec![(
+        cwd.join(target.out_file),
+        generate(&cwd, target, &common, &base_menus)?,
+    )])
+}
+
 /// The shared menus, as the paths a *downstream* generated module names them by.
 ///
 /// `motorRecord.dbd` declares `menu(motorDIR)` itself but references
@@ -129,6 +171,7 @@ fn generate_all(root: &Path) -> Result<Vec<(PathBuf, String)>, String> {
 fn base_menu_paths(
     root: &Path,
     common: &[parse::Field],
+    base_path: &str,
 ) -> Result<BTreeMap<String, String>, String> {
     let base = parse_dir(&root.join(BASE.dbd_dir), common)?;
     Ok(base
@@ -138,10 +181,7 @@ fn base_menu_paths(
             (
                 name.clone(),
                 format!(
-                    "{}::server::record::dbd_generated::{}",
-                    // Every downstream target names base the same way; the
-                    // const path is the same for all of them.
-                    "epics_base_rs",
+                    "{base_path}::server::record::dbd_generated::{}",
                     emit::menu_const(name)
                 ),
             )
@@ -217,10 +257,8 @@ struct Parsed {
     menus: BTreeMap<String, parse::Menu>,
     records: Vec<parse::RecordType>,
     devices: Vec<parse::Device>,
-    /// Record type names in DBD **load** order — the order C's
-    /// `pdbbase->recordTypeList` holds, which `buildScanLists` walks
-    /// record-type-major (`dbScan.c:1054-1076`). Distinct from `records`,
-    /// which is sorted by name so the generated table has a stable shape.
+    /// Record type names in the order C's `pdbbase->recordTypeList` holds,
+    /// which `buildScanLists` walks record-type-major (`dbScan.c:1054-1076`).
     order: Vec<String>,
     /// Every `variable()` declaration, from every `.dbd` in the directory.
     variables: Vec<parse::Variable>,
@@ -245,16 +283,8 @@ fn parse_dir(dbd_dir: &Path, common: &[parse::Field]) -> Result<Parsed, String> 
         order: Vec::new(),
         variables: Vec::new(),
     };
-    let mut by_file: Vec<(String, Vec<String>)> = Vec::new();
     for path in &paths {
         let dbd = parse::parse_file(path, common)?;
-        by_file.push((
-            path.file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or_default()
-                .to_string(),
-            dbd.records.iter().map(|r| r.name.clone()).collect(),
-        ));
         out.devices.extend(dbd.devices);
         out.variables.extend(dbd.variables);
         for (name, menu) in dbd.menus {
@@ -275,53 +305,24 @@ fn parse_dir(dbd_dir: &Path, common: &[parse::Field]) -> Result<Parsed, String> 
         out.records.extend(dbd.records);
     }
     out.records.sort_by(|a, b| a.name.cmp(&b.name));
-    out.order = load_order(dbd_dir, &by_file);
+    out.order = record_type_list_order(&out.records);
     Ok(out)
 }
 
-/// Record types in the order a C IOC would have loaded their declarations.
+/// Record types in the order a C IOC's `recordTypeList` holds them.
 ///
-/// The order comes from `stdRecords.dbd`, which is base's own generated include
-/// list and is vendored beside the `.dbd` files it names — so it is base's
-/// answer, not a list maintained here. A record type declared by a `.dbd` that
-/// list does not name (the synApps and asyn types this port also vendors, and
-/// every downstream target, which has no such list at all) sorts after all of
-/// them, in the walk's own filename order. That mirrors where those types sit
-/// in C — a module's `.dbd` is included after `base.dbd`, so its record types
-/// join `recordTypeList` behind base's — but their order *among themselves* is
-/// the application's include order in C, which the port has no source for.
-fn load_order(dbd_dir: &Path, by_file: &[(String, Vec<String>)]) -> Vec<String> {
-    let mut order: Vec<String> = Vec::new();
-    let push = |names: &[String], order: &mut Vec<String>| {
-        for n in names {
-            if !order.contains(n) {
-                order.push(n.clone());
-            }
-        }
-    };
-    if let Ok(src) = std::fs::read_to_string(dbd_dir.join("stdRecords.dbd")) {
-        for include in dbd_includes(&src) {
-            if let Some((_, names)) = by_file.iter().find(|(f, _)| *f == include) {
-                push(names, &mut order);
-            }
-        }
-    }
-    for (_, names) in by_file {
-        push(names, &mut order);
-    }
+/// `dbRecordtypeHead` appends each type as its declaration loads
+/// (`dbLexRoutines.c:810`), and an IOC loads its expanded `.dbd`, whose
+/// record types `dbdExpand.pl` writes name-sorted across base and every module
+/// (`DBD/Output.pm:61`):
+/// softIoc.dbd opens `aSub, aai, aao, ai`, and an IOC built with std puts
+/// `epid` between `dfanout` and `event`. So the order is `strcmp` over every
+/// declared name.
+fn record_type_list_order(records: &[parse::RecordType]) -> Vec<String> {
+    let mut order: Vec<String> = records.iter().map(|r| r.name.clone()).collect();
+    order.sort();
+    order.dedup();
     order
-}
-
-/// The quoted arguments of a `.dbd`'s top-level `include` lines, in order.
-fn dbd_includes(src: &str) -> Vec<String> {
-    src.lines()
-        .filter_map(|line| line.trim().strip_prefix("include"))
-        .filter_map(|rest| {
-            let inner = rest.trim().strip_prefix('"')?;
-            let end = inner.find('"')?;
-            Some(inner[..end].to_string())
-        })
-        .collect()
 }
 
 /// The `cvt_dbaddr.types` of one target, or an empty map when it has none.
@@ -358,9 +359,7 @@ fn generate(
     };
     let internal = own().filter(|f| emit::is_dropped_internal(f)).count();
     let emitted = own().filter(|f| !emit::is_dropped_internal(f)).count();
-    let dbaddr = own()
-        .filter(|f| f.special.as_deref() == Some("SPC_DBADDR"))
-        .count();
+    let dbaddr = own().filter(|f| f.special == parse::SPC_DBADDR).count();
     eprintln!(
         "dbd-codegen: {}: {} record types, {emitted} own fields emitted \
          ({dbaddr} typed from cvt_dbaddr.types), {internal} DBF_NOACCESS internals \
@@ -376,8 +375,6 @@ fn generate(
         devices: &parsed.devices,
         records: &parsed.records,
         // The scan lists are base's, and so is the one table that orders them.
-        // A downstream target's record types are unknown to it by construction
-        // — the same way C's `recordTypeList` holds them behind base's.
         order: if target.is_base() { &parsed.order } else { &[] },
         variables: &parsed.variables,
         // `dbCommon` is modelled once, by base, and emitted once, into base's
@@ -385,6 +382,7 @@ fn generate(
         common: if target.is_base() { common } else { &[] },
         cvt: &cvt,
         dbd_dir: target.dbd_dir,
+        out_file: target.out_file,
         base_path: target.base_path,
         external_menus,
     })?;

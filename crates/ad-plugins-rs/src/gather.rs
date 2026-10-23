@@ -1,3 +1,4 @@
+use asyn_rs::port::InterfaceMask;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -40,6 +41,12 @@ impl GatherProcessor {
 }
 
 impl NDPluginProcess for GatherProcessor {
+    const ASYN_FLAGS: asyn_rs::port::PortFlags = ad_core_rs::plugin::runtime::ASYN_MULTIDEVICE;
+    // NDPluginGather.cpp:46-47, the same mask for both.
+    const INTERFACE_MASK: InterfaceMask = InterfaceMask::INT32
+        .or(InterfaceMask::FLOAT64)
+        .or(InterfaceMask::GENERIC_POINTER);
+    const INTERRUPT_MASK: InterfaceMask = Self::INTERFACE_MASK;
     fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
         self.count.fetch_add(1, Ordering::Relaxed);
         ProcessResult::forward(array, vec![])
@@ -50,6 +57,11 @@ impl NDPluginProcess for GatherProcessor {
     }
 
     fn num_array_sources(&self) -> usize {
+        self.max_ports
+    }
+
+    /// maxPorts (NDPluginGather.cpp:45).
+    fn max_addr(&self) -> usize {
         self.max_ports
     }
 }
@@ -75,6 +87,22 @@ mod tests {
         assert!(Arc::ptr_eq(&result1.output_arrays[0], &arr1) && result1.output_arrays.len() == 1);
         assert!(Arc::ptr_eq(&result2.output_arrays[0], &arr2) && result2.output_arrays.len() == 1);
         assert_eq!(proc.total_received(), 2);
+    }
+
+    /// NDPluginGather.cpp:45 passes maxPorts whoever builds the plugin.
+    #[test]
+    fn a_gather_port_has_one_address_per_port() {
+        let (handle, _jh) = ad_core_rs::plugin::runtime::create_plugin_runtime(
+            &asyn_rs::asyn_record::claim_port("GATHER_ADDR").unwrap(),
+            GatherProcessor::new(3),
+            1_000_000,
+            1,
+            0,
+            "",
+            Arc::new(ad_core_rs::plugin::wiring::WiringRegistry::new()),
+            ad_core_rs::plugin::runtime::DEFAULT_PLUGIN_THREADS,
+        );
+        assert_eq!(handle.port_runtime().port_handle().max_addr(), 3);
     }
 
     #[test]

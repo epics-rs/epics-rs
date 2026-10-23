@@ -1,4 +1,4 @@
-use std::time::{SystemTime, UNIX_EPOCH};
+use epics_base_rs::types::WallTime;
 
 use epics_base_rs::error::CaResult;
 use epics_base_rs::server::device_support::{DeviceReadOutcome, DeviceSupport, DeviceUdf};
@@ -21,17 +21,17 @@ const EPICS_EPOCH_OFFSET: u64 = 631152000;
 /// a date. Saturating pinned it to `0` — C's *uninitialized* value — so a
 /// running IOC whose RTC never started answered `<undefined>` where C answers
 /// a date, and the `ai` path read `0.0` where C reads ~4.29e9.
-fn epics_time_parts(ts: SystemTime) -> (u32, u32) {
+fn epics_time_parts(ts: WallTime) -> (u32, u32) {
     // C's uninitialized `epicsTimeStamp` is the literal `{0, 0}`; this port
     // carries it as `UNIX_EPOCH`, and the `secPastEpoch == 0 && nsec == 0`
     // test below is C's own check for it (`epicsTime.cpp:176`). A sentinel,
     // not a boundary of the conversion.
-    if ts == UNIX_EPOCH {
+    if ts == WallTime::UNIX_EPOCH {
         return (0, 0);
     }
-    // `unwrap_or_default` collapses a pre-1970 stamp to the Unix epoch; that
-    // is this port's own limit and predates the wrap below.
-    let dur = ts.duration_since(UNIX_EPOCH).unwrap_or_default();
+    // A `WallTime` holds no pre-1970 stamp; that is this port's own limit
+    // and predates the wrap below.
+    let dur = ts.since_unix_epoch();
     (
         dur.as_secs().wrapping_sub(EPICS_EPOCH_OFFSET) as u32,
         dur.subsec_nanos(),
@@ -61,7 +61,7 @@ pub struct TimeOfDayStringDeviceSupport {
     /// wall clock. `read()` resolves the same way via
     /// [`get_time_stamp`]`(tse, time)`.
     tse: i16,
-    time: SystemTime,
+    time: WallTime,
 }
 
 impl Default for TimeOfDayStringDeviceSupport {
@@ -69,7 +69,7 @@ impl Default for TimeOfDayStringDeviceSupport {
         Self {
             phas: 0,
             tse: 0,
-            time: SystemTime::UNIX_EPOCH,
+            time: WallTime::UNIX_EPOCH,
         }
     }
 }
@@ -114,7 +114,7 @@ impl DeviceSupport for TimeOfDayStringDeviceSupport {
         } else {
             // C formats with a trailing `.%09f` then truncates at the last
             // '.', so the result is whole-second resolution either way.
-            let local: DateTime<Local> = DateTime::<Local>::from(ts);
+            let local: DateTime<Local> = DateTime::<Local>::from(std::time::SystemTime::from(ts));
             if phas != 0 {
                 local.format("%m/%d/%y %H:%M:%S").to_string()
             } else {
@@ -150,7 +150,7 @@ pub struct SecPastEpochDeviceSupport {
     /// wall clock. `read()` resolves the same way via
     /// [`get_time_stamp`]`(tse, time)`.
     tse: i16,
-    time: SystemTime,
+    time: WallTime,
 }
 
 impl Default for SecPastEpochDeviceSupport {
@@ -158,7 +158,7 @@ impl Default for SecPastEpochDeviceSupport {
         Self {
             phas: 0,
             tse: 0,
-            time: SystemTime::UNIX_EPOCH,
+            time: WallTime::UNIX_EPOCH,
         }
     }
 }
@@ -178,6 +178,12 @@ impl DeviceSupport for SecPastEpochDeviceSupport {
         self.phas = ctx.phas;
         self.tse = ctx.tse;
         self.time = ctx.time;
+    }
+
+    // C `devTimeOfDay.c:93` fills `special_linconv` with `no_op`; having the
+    // slot is what makes the record move EOFF to EGUL on a LINEAR put.
+    fn has_special_linconv(&self) -> bool {
+        true
     }
 
     fn read(&mut self, record: &mut dyn Record) -> CaResult<DeviceReadOutcome> {
@@ -221,32 +227,38 @@ mod tests {
     use epics_base_rs::server::records::stringin::StringinRecord;
     use std::time::Duration;
 
-    fn ctx_with_phas(phas: i16) -> ProcessContext<'static> {
+    fn ctx_with_phas(phas: i16) -> ProcessContext {
         ProcessContext {
-            udf: false,
+            udf: 0,
             udfs: epics_base_rs::server::record::AlarmSeverity::Invalid,
             nsev: epics_base_rs::server::record::AlarmSeverity::NoAlarm,
             phas,
             tse: 0,
-            time: SystemTime::UNIX_EPOCH,
-            dtyp: "",
+            time: WallTime::UNIX_EPOCH,
+            soft: None,
             callback_priority: epics_base_rs::runtime::task::CallbackPriority::Low,
+            scan: epics_base_rs::server::record::ScanType::Passive,
+            proc_field: 0,
+            tpro: 0,
         }
     }
 
     /// A `ProcessContext` carrying an explicit device-time stamp with
     /// `tse = -2` (`epicsTimeEventDeviceTime`), so `read()` resolves the
     /// stamp to exactly `time` via `get_time_stamp(-2, time)`.
-    fn ctx_device_time(phas: i16, time: SystemTime) -> ProcessContext<'static> {
+    fn ctx_device_time(phas: i16, time: WallTime) -> ProcessContext {
         ProcessContext {
-            udf: false,
+            udf: 0,
             udfs: epics_base_rs::server::record::AlarmSeverity::Invalid,
             nsev: epics_base_rs::server::record::AlarmSeverity::NoAlarm,
             phas,
             tse: -2,
             time,
-            dtyp: "",
+            soft: None,
             callback_priority: epics_base_rs::runtime::task::CallbackPriority::Low,
+            scan: epics_base_rs::server::record::ScanType::Passive,
+            proc_field: 0,
+            tpro: 0,
         }
     }
 
@@ -327,7 +339,7 @@ mod tests {
     fn time_of_day_epoch_zero_is_undefined() {
         let mut dev = TimeOfDayStringDeviceSupport::new();
         let mut rec = StringinRecord::new("");
-        dev.set_process_context(&ctx_device_time(0, SystemTime::UNIX_EPOCH));
+        dev.set_process_context(&ctx_device_time(0, WallTime::UNIX_EPOCH));
         dev.read(&mut rec).unwrap();
         let val = match rec.get_field("VAL") {
             Some(EpicsValue::String(s)) => s.as_str_lossy().into_owned(),
@@ -343,7 +355,7 @@ mod tests {
     fn time_of_day_epics_epoch_is_undefined() {
         let mut dev = TimeOfDayStringDeviceSupport::new();
         let mut rec = StringinRecord::new("");
-        let epics_epoch = SystemTime::UNIX_EPOCH + Duration::from_secs(EPICS_EPOCH_OFFSET);
+        let epics_epoch = WallTime::UNIX_EPOCH + Duration::from_secs(EPICS_EPOCH_OFFSET);
         dev.set_process_context(&ctx_device_time(0, epics_epoch));
         dev.read(&mut rec).unwrap();
         let val = match rec.get_field("VAL") {
@@ -362,7 +374,7 @@ mod tests {
     fn time_of_day_pre_1990_clock_is_a_date_not_the_undefined_sentinel() {
         let mut dev = TimeOfDayStringDeviceSupport::new();
         let mut rec = StringinRecord::new("");
-        let before = SystemTime::UNIX_EPOCH + Duration::from_secs(EPICS_EPOCH_OFFSET - 1);
+        let before = WallTime::UNIX_EPOCH + Duration::from_secs(EPICS_EPOCH_OFFSET - 1);
         dev.set_process_context(&ctx_device_time(0, before));
         dev.read(&mut rec).unwrap();
         let val = match rec.get_field("VAL") {
@@ -375,16 +387,15 @@ mod tests {
     /// The wrap itself, read straight off the conversion.
     #[test]
     fn epics_time_parts_wraps_both_ends_and_keeps_the_unset_sentinel() {
-        assert_eq!(epics_time_parts(SystemTime::UNIX_EPOCH), (0, 0));
-        let at = SystemTime::UNIX_EPOCH + Duration::from_secs(EPICS_EPOCH_OFFSET);
+        assert_eq!(epics_time_parts(WallTime::UNIX_EPOCH), (0, 0));
+        let at = WallTime::UNIX_EPOCH + Duration::from_secs(EPICS_EPOCH_OFFSET);
         assert_eq!(epics_time_parts(at).0, 0);
-        let before = SystemTime::UNIX_EPOCH + Duration::from_secs(EPICS_EPOCH_OFFSET - 1);
+        let before = WallTime::UNIX_EPOCH + Duration::from_secs(EPICS_EPOCH_OFFSET - 1);
         assert_eq!(epics_time_parts(before).0, u32::MAX);
-        let last =
-            SystemTime::UNIX_EPOCH + Duration::from_secs(EPICS_EPOCH_OFFSET + u32::MAX as u64);
+        let last = WallTime::UNIX_EPOCH + Duration::from_secs(EPICS_EPOCH_OFFSET + u32::MAX as u64);
         assert_eq!(epics_time_parts(last).0, u32::MAX);
         let past =
-            SystemTime::UNIX_EPOCH + Duration::from_secs(EPICS_EPOCH_OFFSET + u32::MAX as u64 + 1);
+            WallTime::UNIX_EPOCH + Duration::from_secs(EPICS_EPOCH_OFFSET + u32::MAX as u64 + 1);
         assert_eq!(epics_time_parts(past).0, 0);
     }
 
@@ -396,7 +407,7 @@ mod tests {
     fn time_of_day_resolves_device_time_not_wall_clock() {
         let mut dev = TimeOfDayStringDeviceSupport::new();
         let mut rec = StringinRecord::new("");
-        let device_time = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000_000);
+        let device_time = WallTime::UNIX_EPOCH + Duration::from_secs(1_000_000_000);
         dev.set_process_context(&ctx_device_time(0, device_time));
         dev.read(&mut rec).unwrap();
         let val = match rec.get_field("VAL") {
@@ -417,7 +428,7 @@ mod tests {
     fn sec_past_epoch_epoch_zero_is_zero() {
         let mut dev = SecPastEpochDeviceSupport::new();
         let mut rec = epics_base_rs::server::records::ai::AiRecord::new(0.0);
-        dev.set_process_context(&ctx_device_time(0, SystemTime::UNIX_EPOCH));
+        dev.set_process_context(&ctx_device_time(0, WallTime::UNIX_EPOCH));
         dev.read(&mut rec).unwrap();
         let val = match rec.get_field("VAL") {
             Some(EpicsValue::Double(v)) => v,
@@ -432,7 +443,7 @@ mod tests {
     /// added (`devTimeOfDay.c:148`).
     #[test]
     fn sec_past_epoch_resolves_device_time_with_fraction() {
-        let device_time = SystemTime::UNIX_EPOCH
+        let device_time = WallTime::UNIX_EPOCH
             + Duration::from_secs(1_000_000_000)
             + Duration::from_nanos(500_000_000);
         let expected_secs = (1_000_000_000u64 - EPICS_EPOCH_OFFSET) as f64;

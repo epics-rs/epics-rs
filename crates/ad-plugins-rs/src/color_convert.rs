@@ -1,3 +1,4 @@
+use asyn_rs::port::InterfaceMask;
 use std::borrow::Cow;
 use std::sync::Arc;
 
@@ -993,6 +994,7 @@ pub struct ColorConvertProcessor {
     config: Mutex<ColorConvertConfig>,
     color_mode_out_idx: Option<usize>,
     false_color_idx: Option<usize>,
+    attributes: Option<ad_core_rs::plugin::runtime::PluginAttributes>,
 }
 
 impl ColorConvertProcessor {
@@ -1001,19 +1003,40 @@ impl ColorConvertProcessor {
             config: Mutex::new(config),
             color_mode_out_idx: None,
             false_color_idx: None,
+            attributes: None,
         }
+    }
+
+    /// C `getAttributes(pArrayOut->pAttributeList)` (NDPluginColorConvert.cpp:543).
+    fn plugin_attributes(&self) -> Option<ad_core_rs::attributes::NDAttributeList> {
+        self.attributes.as_ref()?.evaluate(&[])
     }
 }
 
 impl NDPluginProcess for ColorConvertProcessor {
+    const ASYN_FLAGS: asyn_rs::port::PortFlags = ad_core_rs::plugin::runtime::ASYN_NONE;
+    // NDPluginColorConvert.cpp:649-650, the same mask for both.
+    const INTERFACE_MASK: InterfaceMask = InterfaceMask::GENERIC_POINTER;
+    const INTERRUPT_MASK: InterfaceMask = Self::INTERFACE_MASK;
+    /// NDPluginColorConvert.cpp:548.
+    const READ_ATTRIBUTES: bool = false;
+
+    fn bind_attributes(&mut self, attributes: ad_core_rs::plugin::runtime::PluginAttributes) {
+        self.attributes = Some(attributes);
+    }
+
     fn register_params(
         &mut self,
         base: &mut asyn_rs::port::PortDriverBase,
     ) -> asyn_rs::error::AsynResult<()> {
         use asyn_rs::param::ParamType;
-        base.create_param("COLOR_MODE_OUT", ParamType::Int32)?;
+        let color_mode_out = base.create_param("COLOR_MODE_OUT", ParamType::Int32)?;
         base.create_param("FALSE_COLOR", ParamType::Int32)?;
-        self.color_mode_out_idx = base.find_param("COLOR_MODE_OUT");
+        // The param reads the mode the processor converts to; the IOC builds
+        // Mono, as NDPluginColorConvert.cpp:661 seeds it.
+        let target = self.config.lock().target_mode;
+        base.set_int32_param(color_mode_out, 0, target as i32)?;
+        self.color_mode_out_idx = Some(color_mode_out);
         self.false_color_idx = base.find_param("FALSE_COLOR");
         Ok(())
     }
@@ -1042,12 +1065,22 @@ impl NDPluginProcess for ColorConvertProcessor {
             (config.target_mode, config.false_color, config.bayer_pattern)
         };
 
-        // C:584 — `if (!pArrayOut) pArrayOut = this->pNDArrayPool->copy(pArray, NULL, 1);`
+        // C:540 — `if (!pArrayOut) pArrayOut = this->pNDArrayPool->copy(pArray, NULL, 1);`
         // Every arm that does not convert (same mode, unsupported pair, or a shape the
         // arm rejects, e.g. Mono with `ndims != 2` at :84) leaves `pArrayOut` NULL and
-        // the untouched input is forwarded — with its own ColorMode, since
-        // `changedColorMode` stayed 0 (:589). A frame is never dropped.
-        let passthrough = || ProcessResult::forward(array, vec![]);
+        // a pool copy of the input goes on — with its own ColorMode, since
+        // `changedColorMode` stayed 0 (:545) — carrying the plugin's attribute set.
+        // A frame is never dropped: where C dereferences a failed copy, the input
+        // itself goes on.
+        let passthrough = || match pool.alloc_copy(array) {
+            Ok(mut copy) => {
+                if let Some(attributes) = self.plugin_attributes() {
+                    copy.attributes.copy_from(&attributes);
+                }
+                ProcessResult::arrays(vec![Arc::new(copy)])
+            }
+            Err(_) => ProcessResult::forward(array, vec![]),
+        };
 
         if src_mode == target {
             return passthrough();
@@ -1141,6 +1174,9 @@ impl NDPluginProcess for ColorConvertProcessor {
                     NDColorMode::YUV422 => 6,
                     NDColorMode::YUV411 => 7,
                 };
+                if let Some(attributes) = self.plugin_attributes() {
+                    out.attributes.copy_from(&attributes);
+                }
                 use ad_core_rs::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
                 out.attributes.add(NDAttribute::new_static(
                     "ColorMode",
@@ -1157,6 +1193,11 @@ impl NDPluginProcess for ColorConvertProcessor {
     fn plugin_type(&self) -> &str {
         "NDPluginColorConvert"
     }
+
+    /// NDPluginColorConvert.cpp:665
+    fn array_callbacks_seed(&self) -> Option<bool> {
+        Some(true)
+    }
 }
 
 #[cfg(test)]
@@ -1166,6 +1207,24 @@ mod tests {
 
     fn pool() -> Arc<NDArrayPool> {
         NDArrayPool::new(0)
+    }
+
+    /// NDPluginDriver.cpp:217-227 posts the input's ColorMode and NDimensions,
+    /// not the converted output's.
+    #[test]
+    fn the_rbvs_describe_the_input_not_the_conversion() {
+        let input = NDArray::new(
+            vec![NDDimension::new(4), NDDimension::new(4)],
+            NDDataType::UInt8,
+        );
+        let processor = ColorConvertProcessor::new(ColorConvertConfig {
+            target_mode: NDColorMode::RGB1,
+            bayer_pattern: NDBayerPattern::RGGB,
+            false_color: 0,
+        });
+        let got = crate::test_util::begin_params("CC_BEGIN", processor, &input);
+        assert_eq!(got.color_mode, NDColorMode::Mono as i32);
+        assert_eq!(got.n_dimensions, 2);
     }
 
     /// Both halves of the timestamp pair travel to the output.
@@ -1385,15 +1444,8 @@ mod tests {
     #[cfg(feature = "simd")]
     #[test]
     fn demosaic_kernels_match_the_c_pixel_arithmetic_on_every_level() {
-        use fearless_simd::{Level, dispatch};
-        let top = ad_core_rs::simd::level();
-        let mut levels = vec![top, Level::baseline()];
-        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        {
-            levels.extend(top.as_avx2().map(Level::Avx2));
-            levels.extend(top.as_sse4_2().map(Level::Sse4_2));
-            levels.extend(top.as_sse2().map(Level::Sse2));
-        }
+        use fearless_simd::dispatch;
+        let levels = ad_core_rs::simd::levels();
         let (w, h) = (301, 4);
         let vals: Vec<u32> = (0..w * h).map(|i| (i * 7919 + 13) as u32 % 65536).collect();
         for pattern in [
@@ -1509,6 +1561,35 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn test_register_params_seeds_the_processor_color_mode_out() {
+        // NDPluginColorConvert.cpp:661 seeds ColorModeOut; FalseColor stays
+        // undefined.
+        use asyn_rs::port::InterfaceMask;
+        use asyn_rs::port::{PortDriverBase, PortFlags};
+        for target_mode in [NDColorMode::Mono, NDColorMode::RGB1] {
+            let mut base = PortDriverBase::new(
+                "CC_INIT",
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_INTERRUPTS,
+            );
+            let mut proc = ColorConvertProcessor::new(ColorConvertConfig {
+                target_mode,
+                bayer_pattern: NDBayerPattern::RGGB,
+                false_color: 0,
+            });
+            proc.register_params(&mut base).unwrap();
+            let reason = |name: &str| base.find_param(name).unwrap();
+            assert_eq!(
+                base.get_int32_param(reason("COLOR_MODE_OUT"), 0).unwrap(),
+                target_mode as i32
+            );
+            assert!(base.get_int32_param(reason("FALSE_COLOR"), 0).is_err());
         }
     }
 
@@ -1791,6 +1872,43 @@ mod tests {
         }
     }
 
+    /// C `getAttributes(pArrayOut->pAttributeList)` (NDPluginColorConvert.cpp
+    /// :540-545): the plugin's set reaches a converted and an unconverted
+    /// output, and on a converted one its own ColorMode is added after it.
+    #[test]
+    fn the_plugin_attributes_file_reaches_both_outputs() {
+        use crate::test_util::{publish, with_attributes_file};
+        use ad_core_rs::attributes::NDAttrValue;
+        let xml = r#"<Attributes>
+            <Attribute name="Site" type="CONST" source="BL7"/>
+            <Attribute name="ColorMode" type="CONST" source="9"/>
+        </Attributes>"#;
+        let input = NDArray::new(
+            vec![NDDimension::new(4), NDDimension::new(4)],
+            NDDataType::UInt8,
+        );
+        let value = |a: &NDArray, name: &str| a.attributes.get(name).map(|a| a.value.clone());
+        for (port, target, color_mode) in [
+            ("CC_ATTR_RGB", NDColorMode::RGB1, NDAttrValue::Int32(2)),
+            (
+                "CC_ATTR_SAME",
+                NDColorMode::Mono,
+                NDAttrValue::String("9".into()),
+            ),
+        ] {
+            let proc = ColorConvertProcessor::new(ColorConvertConfig {
+                target_mode: target,
+                bayer_pattern: NDBayerPattern::RGGB,
+                false_color: 0,
+            });
+            let (handle, mut rx, _jh) = with_attributes_file(port, proc, xml);
+            publish(&handle, &input);
+            let out = rx.blocking_recv().unwrap();
+            assert_eq!(value(&out, "Site"), Some(NDAttrValue::String("BL7".into())));
+            assert_eq!(value(&out, "ColorMode"), Some(color_mode));
+        }
+    }
+
     #[test]
     fn test_same_mode_passthrough() {
         let config = ColorConvertConfig {
@@ -1815,11 +1933,17 @@ mod tests {
 
         let arr = Arc::new(arr);
         let result = proc.process_array(&arr, &pool);
-        assert!(
-            Arc::ptr_eq(&result.output_arrays[0], &arr),
-            "same mode forwards the input itself"
-        );
         assert_eq!(result.output_arrays.len(), 1);
+        // C copies the unconverted input into its own pool (:540), which is
+        // the buffer an AC0 plugin keeps cached.
+        let out = &result.output_arrays[0];
+        assert!(!Arc::ptr_eq(out, &arr));
+        assert_eq!(out.pool_id(), pool.id());
+        assert_eq!(out.unique_id, 42);
+        let NDDataBuffer::U8(v) = &out.data else {
+            panic!("expected U8 buffer");
+        };
+        assert_eq!(v.as_slice(), (0..16).collect::<Vec<u8>>().as_slice());
     }
 
     fn set_color_mode_attr(arr: &mut NDArray, mode: NDColorMode) {

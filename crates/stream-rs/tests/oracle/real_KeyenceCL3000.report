@@ -1,0 +1,240 @@
+rec0: KeyenceCL3000.proto emission_ctrl(1,2,3,4,5,6,7,8,9) P
+emission_ctrl {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+  @Mismatch {
+    in "%(1:errorString)s";
+  }
+
+    out "LC,%i";
+    in "LC";
+}
+rec1: KeyenceCL3000.proto setMode(1,2,3,4,5,6,7,8,9) P
+setMode {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+  @Mismatch {
+    in "%(1:errorString)s";
+  }
+
+    out "%s";
+    in "%(1:mode_RBV)s";
+}
+rec2: KeyenceCL3000.proto autoZero(1,2,3,4,5,6,7,8,9) P
+autoZero {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+  @Mismatch {
+    in "%(2:1:errorString)s";
+  }
+
+    out "ZS,%i,1";
+    in "ZS";
+}
+rec3: KeyenceCL3000.proto setOffset(1,2,3,4,5,6,7,8,9) P
+setOffset {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+  @Mismatch {
+    in "%(2:1:errorString)s";
+  }
+
+    out "SW,OF,1,%+08.4f";
+    in "SW,OF";
+}
+rec4: KeyenceCL3000.proto setOffsetStr(1,2,3,4,5,6,7,8,9) P
+setOffsetStr {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+  @Mismatch {
+    in "%(2:1:errorString)s";
+  }
+
+    out "SW,OF,1,%s";
+    in "SW,OF";
+}
+rec5: KeyenceCL3000.proto getOffset(1,2,3,4,5,6,7,8,9) P
+getOffset {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+  @Mismatch {
+    in "%(2:1:errorString)s";
+  }
+
+    out "SR,OF,1";
+    in "SR,OF,1,%f";
+}
+rec6: KeyenceCL3000.proto setScaling(1,2,3,4,5,6,7,8,9) P
+setScaling {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+  @Mismatch {
+    in "%(2:1:errorString)s";
+  }
+
+    out "SW,SC,1,+00.0000,+00.0000,+01.0000,%+08.4f";
+    in "SW,SC";
+}
+rec7: KeyenceCL3000.proto setScalingStr(1,2,3,4,5,6,7,8,9) P
+setScalingStr {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+  @Mismatch {
+    in "%(2:1:errorString)s";
+  }
+
+    out "SW,SC,1,%s";
+    in "SW,SC";
+}
+rec8: KeyenceCL3000.proto getScaling(1,2,3,4,5,6,7,8,9) P
+getScaling {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+  @Mismatch {
+    in "%(2:1:errorString)s";
+  }
+
+    out "SR,SC,1";
+    in "SR,SC,1,%*f,%*f,%*f,%f";
+}
+rec9: KeyenceCL3000.proto getMeas(1,2,3,4,5,6,7,8,9) P
+getMeas {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+  @Mismatch {
+    in "%(2:1:errorString)s";
+  }
+
+    out "MS,%(2:1:measType)i,1";
+    in "MS,%(2:1:measString)s";
+}
+rec10: KeyenceCL3000.proto sendCmd(1,2,3,4,5,6,7,8,9) P
+sendCmd {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "%s";
+    in "%(2:1:replyString)s";
+}
+rec11: KeyenceCL3000.proto startAuto(1,2,3,4,5,6,7,8,9) P
+startAuto {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "NS,%(2:1:measType),1";
+}
+rec12: KeyenceCL3000.proto stopAuto(1,2,3,4,5,6,7,8,9) P
+stopAuto {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+  @Mismatch {
+    in "%(2:1:errorString)s";
+  }
+
+    out "NT";
+    in "NT";
+}

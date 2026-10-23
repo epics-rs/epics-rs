@@ -15,10 +15,11 @@ use std::time::Duration;
 
 use asyn_rs::asyn_record::{get_port, register_port};
 use asyn_rs::param::ParamType;
+use asyn_rs::port::InterfaceMask;
 use asyn_rs::port::{PortDriver, PortDriverBase, PortFlags};
 use asyn_rs::port_handle::PortHandle;
 use asyn_rs::runtime::config::RuntimeConfig;
-use asyn_rs::runtime::port::create_port_runtime;
+use asyn_rs::runtime::port::create_port_runtime_unclaimed;
 
 /// Blocking I/O below must fail, never hang, if this regresses.
 const WATCHDOG: Duration = Duration::from_secs(10);
@@ -48,7 +49,13 @@ struct TestPort {
 
 impl TestPort {
     fn new(name: &str) -> Self {
-        let mut base = PortDriverBase::new(name, 1, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            name,
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
+        );
         base.create_param("VAL", ParamType::Int32).unwrap();
         Self { base }
     }
@@ -66,9 +73,15 @@ impl PortDriver for TestPort {
 /// Exactly what an out-of-tree `drvAsynXxxPortConfigure` does: create the port,
 /// publish it, return. The `PortRuntimeHandle` dies with the closure.
 fn configure_port_like_iocsh(name: &str) {
-    let (runtime, _join) = create_port_runtime(TestPort::new(name), RuntimeConfig::default())
-        .expect("the port runtime thread must start");
-    register_port(name, runtime.port_handle().clone()).expect("port name is free");
+    let (runtime, _join) =
+        create_port_runtime_unclaimed(TestPort::new(name), RuntimeConfig::default())
+            .expect("the port runtime thread must start");
+    register_port(
+        name,
+        runtime.port_handle().clone(),
+        &asyn_rs::registry::open_owner(),
+    )
+    .expect("port name is free");
     // `runtime` (and the actor thread's JoinHandle) drop here — the only thing
     // still reaching this port is the registry's PortHandle.
 }
@@ -98,13 +111,17 @@ fn registered_port_survives_drop_of_its_runtime_handle() {
 /// runtime handle must not be a shutdown, but calling `shutdown_and_wait` must.
 #[test]
 fn explicit_shutdown_still_stops_a_registered_port() {
-    let (runtime, _join) = create_port_runtime(
+    let (runtime, _join) = create_port_runtime_unclaimed(
         TestPort::new("explicit_shutdown_reg"),
         RuntimeConfig::default(),
     )
     .expect("the port runtime thread must start");
-    register_port("explicit_shutdown_reg", runtime.port_handle().clone())
-        .expect("port name is free");
+    register_port(
+        "explicit_shutdown_reg",
+        runtime.port_handle().clone(),
+        &asyn_rs::registry::open_owner(),
+    )
+    .expect("port name is free");
     let registry_handle: PortHandle = get_port("explicit_shutdown_reg").unwrap().handle.clone();
 
     // Alive before.
@@ -126,7 +143,7 @@ fn explicit_shutdown_still_stops_a_registered_port() {
 #[test]
 fn unreachable_port_stops_its_actor_thread() {
     let (runtime, join) =
-        create_port_runtime(TestPort::new("unreachable"), RuntimeConfig::default())
+        create_port_runtime_unclaimed(TestPort::new("unreachable"), RuntimeConfig::default())
             .expect("the port runtime thread must start");
     // No registry entry, no surviving PortHandle clone.
     drop(runtime);

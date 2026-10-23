@@ -6,8 +6,9 @@ use criterion::{Criterion, criterion_group, criterion_main};
 
 use asyn_rs::interrupt::{InterruptManager, InterruptValue};
 use asyn_rs::param::{ParamType, ParamValue};
+use asyn_rs::port::InterfaceMask;
 use asyn_rs::port::{PortDriver, PortDriverBase, PortFlags};
-use asyn_rs::runtime::{RuntimeConfig, create_port_runtime};
+use asyn_rs::runtime::{RuntimeConfig, create_port_runtime_unclaimed};
 use asyn_rs::sync_io::SyncIOHandle;
 
 // -- Minimal test driver for benchmarking --
@@ -18,7 +19,13 @@ struct BenchPort {
 
 impl BenchPort {
     fn new(name: &str) -> Self {
-        let mut base = PortDriverBase::new(name, 1, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            name,
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
+        );
         base.create_param("INT_VAL", ParamType::Int32).unwrap();
         base.create_param("F64_VAL", ParamType::Float64).unwrap();
         base.create_param("OCT_VAL", ParamType::Octet).unwrap();
@@ -38,8 +45,9 @@ impl PortDriver for BenchPort {
 // -- Helpers --
 
 fn make_sync_io(name: &str) -> SyncIOHandle {
-    let (handle, _jh) = create_port_runtime(BenchPort::new(name), RuntimeConfig::default())
-        .expect("the port runtime thread must start");
+    let (handle, _jh) =
+        create_port_runtime_unclaimed(BenchPort::new(name), RuntimeConfig::default())
+            .expect("the port runtime thread must start");
     SyncIOHandle::from_handle(handle.port_handle().clone(), 0, Duration::from_secs(1))
 }
 
@@ -73,7 +81,7 @@ fn bench_actor_octet_roundtrip(c: &mut Criterion) {
     c.bench_function("actor_octet_roundtrip", |b| {
         b.iter(|| {
             sio.write_octet(2, data).unwrap();
-            let _ = sio.read_octet(2, 64).unwrap();
+            sio.read_octet(2, 64).into_parts().1.unwrap();
         });
     });
 }
@@ -100,8 +108,8 @@ fn bench_concurrent_32_producers(c: &mut Criterion) {
 }
 
 fn bench_interrupt_event_throughput(c: &mut Criterion) {
-    let im = InterruptManager::new(4096);
-    let _rx = im.subscribe_async();
+    let im = InterruptManager::new();
+    let _rx = im.subscribe_async(256, 4096);
 
     c.bench_function("interrupt_event_throughput", |b| {
         b.iter(|| {

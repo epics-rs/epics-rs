@@ -60,12 +60,17 @@ async fn ss(db: &PvDatabase) -> i16 {
 }
 
 /// `scanOnce` is queued, not inline (C hands the record to the scan-once
-/// thread, which must first take the `dbScanLock` the putter holds).
-async fn settle() {
-    for _ in 0..20 {
-        tokio::task::yield_now().await;
+/// thread, which must first take the `dbScanLock` the putter holds): SS once
+/// it counts, or what it reads after 10 s.
+async fn counting(db: &PvDatabase) -> i16 {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let ss = ss(db).await;
+        if ss == SCALER_STATE_COUNTING || std::time::Instant::now() >= deadline {
+            return ss;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
-    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
 }
 
 #[tokio::test]
@@ -76,10 +81,9 @@ async fn r11_c11_cnt_put_on_a_non_passive_scaler_scans_once() {
     db.put_record_field_from_ca("SCAL", "CNT", EpicsValue::Short(1))
         .await
         .unwrap();
-    settle().await;
 
     assert_eq!(
-        ss(&db).await,
+        counting(&db).await,
         SCALER_STATE_COUNTING,
         "C:655 `if (pscal->scan) scanOnce()` — the count must start on the put, \
          not a scan period later"
@@ -95,10 +99,9 @@ async fn r11_c11_passive_scaler_is_processed_once_by_the_put_itself() {
     db.put_record_field_from_ca("SCAL", "CNT", EpicsValue::Short(1))
         .await
         .unwrap();
-    settle().await;
 
     assert_eq!(
-        ss(&db).await,
+        counting(&db).await,
         SCALER_STATE_COUNTING,
         "the pp(TRUE) put processed it"
     );
@@ -129,10 +132,9 @@ async fn r11_c11_cont_put_on_a_non_passive_scaler_scans_once() {
     db.put_record_field_from_ca("SCAL", "CONT", EpicsValue::Short(1))
         .await
         .unwrap();
-    settle().await;
 
     assert_eq!(
-        ss(&db).await,
+        counting(&db).await,
         SCALER_STATE_COUNTING,
         "C:667 `if (pscal->scan) scanOnce()` — auto-count must start on the \
          CONT put, not a scan period later"

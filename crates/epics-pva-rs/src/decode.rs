@@ -117,6 +117,76 @@ pub fn try_parse_frame_role(buf: &[u8], role: PeerRole) -> PvaResult<Option<(Fra
     Ok(Some((Frame { header, payload }, needed)))
 }
 
+/// One circuit's segment reassembly, the state pvxs `ConnBase::bevRead`
+/// keeps per connection (`expectSeg`/`segCmd`/`segBuf`, conn.cpp:228-244).
+/// Every circuit's read loop owns one and feeds it each application frame,
+/// so no circuit dispatches a segment as if it were a whole message.
+#[derive(Default)]
+pub(crate) struct SegmentAssembler {
+    buf: Vec<u8>,
+    cmd: u8,
+    flags: HeaderFlags,
+    expect: bool,
+}
+
+impl SegmentAssembler {
+    /// `Ok(Some)` is a whole message (segment bits clear) to dispatch,
+    /// `Ok(None)` waits for the next segment, and `Err` must close the
+    /// circuit. `cap` bounds the reassembled size; `None` is pvxs's uncapped
+    /// receive.
+    pub(crate) fn push(&mut self, frame: Frame, cap: Option<usize>) -> PvaResult<Option<Frame>> {
+        let seg = frame.header.flags.0 & HeaderFlags::SEGMENT_MASK;
+        let continuation = seg & HeaderFlags::SEGMENT_LAST != 0;
+        if continuation ^ self.expect || (continuation && frame.header.command != self.cmd) {
+            return Err(PvaError::Protocol(format!(
+                "PVA segmentation violation: expect_seg={} continuation={} cmd 0x{:02x} vs saved 0x{:02x}",
+                self.expect, continuation, frame.header.command, self.cmd
+            )));
+        }
+        // On the whole message, not the frame: a frame already complete in
+        // the read buffer skips the reader's header peek, and each segment
+        // can be under the cap while their sum is not. `buf` is empty
+        // unless a message is in progress.
+        if let Some(cap) = cap {
+            if self.buf.len().saturating_add(frame.payload.len()) > cap {
+                return Err(PvaError::Protocol(format!(
+                    "segmented PVA message exceeds max_message_size ({} > {})",
+                    self.buf.len() + frame.payload.len(),
+                    cap
+                )));
+            }
+        }
+        if seg == 0 {
+            return Ok(Some(frame));
+        }
+        if seg == HeaderFlags::SEGMENT_FIRST {
+            self.expect = true;
+            self.cmd = frame.header.command;
+            self.flags = HeaderFlags(frame.header.flags.0 & !HeaderFlags::SEGMENT_MASK);
+            self.buf.clear();
+        }
+        crate::peer_buf::try_extend(
+            &mut self.buf,
+            &frame.payload,
+            "the segment-reassembly buffer",
+        )?;
+        if seg != HeaderFlags::SEGMENT_LAST {
+            return Ok(None);
+        }
+        self.expect = false;
+        let payload = std::mem::take(&mut self.buf);
+        Ok(Some(Frame {
+            header: PvaHeader {
+                version: frame.header.version,
+                flags: self.flags,
+                command: self.cmd,
+                payload_length: payload.len() as u32,
+            },
+            payload,
+        }))
+    }
+}
+
 // ─── Search response ──────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -333,12 +403,12 @@ pub struct OpDataResponse {
     /// — the server sets bits for fields it coalesced/squashed because
     /// the client fell behind. Non-empty ⟹ a server-side squash
     /// occurred (pvxs `clientmon.cpp:549-558` sets `servSquash` when any
-    /// word is non-zero). Always empty for GET/PUT_GET/RPC, which carry
+    /// word is non-zero). Always empty for GET/PUT/RPC, which carry
     /// no overrun on the wire.
     pub overrun: BitSet,
     /// Response type descriptor — only populated for RPC, where the wire
     /// format carries its own type independent of any INIT-time
-    /// introspection. `None` for GET/MONITOR/PUT_GET (the caller already
+    /// introspection. `None` for GET/PUT/MONITOR (the caller already
     /// has the type from INIT).
     pub response_desc: Option<FieldDesc>,
 }
@@ -432,7 +502,7 @@ pub(crate) fn monitor_finish_body(
 }
 
 /// Offset of the `changed BitSet | value | [overrun]` region of an op DATA
-/// payload, or `None` when the frame carries no value body. GET/PUT/PUT_GET
+/// payload, or `None` when the frame carries no value body. GET/PUT
 /// put a `Status` before it (and a PUT without GetBack has no body at all),
 /// MONITOR DATA starts it right after `ioid + subcmd`, and a MONITOR FINISH
 /// defers to [`monitor_finish_body`].
@@ -611,7 +681,7 @@ pub fn decode_op_response_cached(
         PvaError::Protocol("data response without prior introspection".to_string())
     })?;
 
-    // GET data response and PUT_GET (PUT with subcmd & 0x40) begin with a
+    // GET data response and PUT readback (subcmd & 0x40) begin with a
     // Status; MONITOR data does not — except a FINISH-carried update, whose
     // (success) Status was consumed above by `monitor_finish_body`.
     let status = if let Some(s) = finish_status {
@@ -663,8 +733,8 @@ pub fn decode_op_response_cached(
 // ─── Type-cache marker flattening (reader-task owned) ───────────────────
 
 /// Resolve 0xFD/0xFE type-cache markers in an inbound op-response frame —
-/// both in the leading FieldDesc region (INIT introspection, PUT_GET
-/// putIF/getIF, GET_FIELD type, RPC data type) AND inside `any`
+/// both in the leading FieldDesc region (INIT introspection,
+/// GET_FIELD type, RPC data type) AND inside `any`
 /// (Variant / VariantArray) value payloads of DATA frames — rewriting the
 /// payload to carry self-contained inline descriptors.
 ///
@@ -690,15 +760,6 @@ pub fn decode_op_response_cached(
 /// The introspection entry is dropped on MONITOR FINISH here, and on any
 /// op's teardown via
 /// `ServerConn::unregister_ioid`.
-///
-/// ChannelArray (`Command::Array`) is intentionally NOT handled here: its
-/// DATA frame layout is sub-op dependent (getArray value vs getLength size
-/// vs empty) and cannot be determined from the frame alone, so its INIT and
-/// DATA legs resolve markers against an op-local cache in
-/// `op_array_data`. That op runs both legs
-/// on one task in wire order, so the op-local cache is correctly ordered;
-/// the narrow consequence is that an Array value may not resolve a slot a
-/// *different* op defined on the same connection.
 ///
 /// On any parse difficulty the frame payload is left untouched — the per-op
 /// decoder will then surface a precise error rather than this masking it.
@@ -770,26 +831,6 @@ pub fn flatten_type_cache_markers(
             // the frame; flatten it, then walk the fully-present value.
             flatten_rpc_data_value(frame, order, cache);
         }
-        Command::PutGet => {
-            let Some(subcmd) = peek_u8(&frame.payload, 4) else {
-                return;
-            };
-            if subcmd & 0x10 != 0 {
-                introspection.remove(&ioid);
-                return;
-            }
-            if subcmd & 0x08 != 0 {
-                // INIT: putIF + getIF. Capture getIF — the DATA value type.
-                if let Some(descs) = rewrite_after_status(frame, order, cache, 5, 2) {
-                    if let Some(get_if) = descs.into_iter().nth(1) {
-                        introspection.insert(ioid, get_if);
-                    }
-                }
-                return;
-            }
-            // DATA: ioid+subcmd+status+getChanged+getValue → flatten value.
-            flatten_op_data_value(frame, order, cache, cmd, subcmd, ioid, introspection);
-        }
         _ => {}
     }
 }
@@ -849,7 +890,7 @@ fn rewrite_after_status(
 }
 
 /// Flatten 0xFD/0xFE markers embedded in `any` payloads of a
-/// GET/PUT/MONITOR/PUT_GET DATA value, in place. `cmd`/`subcmd` select the
+/// GET/PUT/MONITOR DATA value, in place. `cmd`/`subcmd` select the
 /// frame layout (via [`op_data_body_start`], which also answers for a MONITOR
 /// FINISH that carries a trailing update); the value type is the introspection
 /// captured from the op's INIT. On any difficulty — including a frame with no
@@ -1087,7 +1128,7 @@ mod tests {
         let order = ByteOrder::Little;
         let intro = FieldDesc::Structure {
             struct_id: "epics:nt/NTScalar:1.0".into(),
-            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))],
+            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))].into(),
         };
         let mut intro_bytes = Vec::new();
         crate::pvdata::encode::encode_type_desc(&intro, order, &mut intro_bytes);
@@ -1243,10 +1284,12 @@ mod tests {
                     "alarm".into(),
                     FieldDesc::Structure {
                         struct_id: "alarm_t".into(),
-                        fields: vec![("severity".into(), FieldDesc::Scalar(ScalarType::Int))],
+                        fields: vec![("severity".into(), FieldDesc::Scalar(ScalarType::Int))]
+                            .into(),
                     },
                 ),
-            ],
+            ]
+            .into(),
         };
 
         // Frame A (ioid 1): server's first emission — carries 0xFD define.
@@ -1327,7 +1370,7 @@ mod tests {
         // GET introspection: a structure with one `any` (Variant) leaf.
         let intro = FieldDesc::Structure {
             struct_id: "x".into(),
-            fields: vec![("v".into(), FieldDesc::Variant)],
+            fields: vec![("v".into(), FieldDesc::Variant)].into(),
         };
 
         // GET DATA frame: ioid + subcmd(0x00) + changed bitset (bit 0 marks
@@ -1403,7 +1446,7 @@ mod tests {
         // GET introspection: a structure with one `any` (Variant) leaf.
         let intro = FieldDesc::Structure {
             struct_id: "x".into(),
-            fields: vec![("v".into(), FieldDesc::Variant)],
+            fields: vec![("v".into(), FieldDesc::Variant)].into(),
         };
 
         // Reader-owned state, threaded across frames in strict wire order.
@@ -1494,11 +1537,11 @@ mod tests {
         let order = ByteOrder::Little;
         let intro_a = FieldDesc::Structure {
             struct_id: "a".into(),
-            fields: vec![("v".into(), FieldDesc::Variant)],
+            fields: vec![("v".into(), FieldDesc::Variant)].into(),
         };
         let intro_b = FieldDesc::Structure {
             struct_id: "b".into(),
-            fields: vec![("u".into(), FieldDesc::Variant)],
+            fields: vec![("u".into(), FieldDesc::Variant)].into(),
         };
 
         let mut reader_cache = crate::pvdata::encode::TypeCache::new();
@@ -1592,7 +1635,7 @@ mod tests {
         let order = ByteOrder::Little;
         let intro = FieldDesc::Structure {
             struct_id: "epics:nt/NTScalar:1.0".into(),
-            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))],
+            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))].into(),
         };
 
         let build = |overrun: &BitSet| -> Frame {
@@ -1643,7 +1686,7 @@ mod tests {
         let order = ByteOrder::Little;
         let intro = FieldDesc::Structure {
             struct_id: "epics:nt/NTScalar:1.0".into(),
-            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))],
+            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))].into(),
         };
         let mut payload = Vec::new();
         payload.put_u32(7, order); // ioid
@@ -1695,7 +1738,7 @@ mod tests {
         let order = ByteOrder::Little;
         let intro = FieldDesc::Structure {
             struct_id: "epics:nt/NTScalar:1.0".into(),
-            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))],
+            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))].into(),
         };
 
         let mut payload = Vec::new();
@@ -1792,7 +1835,7 @@ mod tests {
         let order = ByteOrder::Little;
         let intro = FieldDesc::Structure {
             struct_id: "epics:nt/NTScalar:1.0".into(),
-            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))],
+            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))].into(),
         };
         let mut s = PvStructure::new("epics:nt/NTScalar:1.0");
         s.fields
@@ -1910,7 +1953,7 @@ mod tests {
         let order = ByteOrder::Little;
         let intro = FieldDesc::Structure {
             struct_id: "s".into(),
-            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))],
+            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))].into(),
         };
         // Inline (marker-free) encoding — the wire form a server emits
         // with the type cache disabled.
@@ -1974,10 +2017,12 @@ mod tests {
                     "alarm".into(),
                     FieldDesc::Structure {
                         struct_id: "alarm_t".into(),
-                        fields: vec![("severity".into(), FieldDesc::Scalar(ScalarType::Int))],
+                        fields: vec![("severity".into(), FieldDesc::Scalar(ScalarType::Int))]
+                            .into(),
                     },
                 ),
-            ],
+            ]
+            .into(),
         };
 
         // Frame A (ioid 1): server's first emission — carries 0xFD define.
@@ -2050,7 +2095,7 @@ mod tests {
         let order = ByteOrder::Little;
         let intro = FieldDesc::Structure {
             struct_id: "s".into(),
-            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))],
+            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))].into(),
         };
         let mut payload = Vec::new();
         payload.put_u32(7, order); // ioid

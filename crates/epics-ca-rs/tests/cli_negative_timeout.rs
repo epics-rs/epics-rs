@@ -73,10 +73,11 @@ async fn server_with_ao(pv: &'static str, val: f64) -> u16 {
 #[serial]
 async fn a_negative_wait_fails_the_connect_even_when_the_pv_is_there() {
     let port = server_with_ao("TST:AO", 1.5).await;
+    let bound = fact_budget::FACT_BUDGET.as_secs().to_string();
 
     // The PV exists and answers — a positive wait reads it.
-    let (out, _, code) = caget(port, &["-w", "1", "TST:AO"]).await;
-    assert_eq!(code, 0);
+    let (out, err, code) = caget(port, &["-w", &bound, "TST:AO"]).await;
+    assert_eq!(code, 0, "stderr {err:?}");
     assert!(out.contains("1.5"), "baseline read: {out:?}");
 
     // The SAME PV, with an already-expired deadline: C never waits.
@@ -91,8 +92,8 @@ async fn a_negative_wait_fails_the_connect_even_when_the_pv_is_there() {
 
     // A later, POSITIVE `-w` wins the getopt race and the read succeeds again
     // (R13-17): the expired state is a value, not a latch.
-    let (out, _, code) = caget(port, &["-w", "-1", "-w", "1", "TST:AO"]).await;
-    assert_eq!(code, 0, "the last -w wins");
+    let (out, err, code) = caget(port, &["-w", "-1", "-w", &bound, "TST:AO"]).await;
+    assert_eq!(code, 0, "the last -w wins; stderr {err:?}");
     assert!(out.contains("1.5"));
 }
 

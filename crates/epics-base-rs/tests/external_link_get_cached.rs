@@ -29,7 +29,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use epics_base_rs::server::database::{LinkSet, PvDatabase};
+use epics_base_rs::server::database::{LinkRef, LinkSet, PvDatabase};
 use epics_base_rs::server::records::ai::AiRecord;
 use epics_base_rs::types::EpicsValue;
 
@@ -70,26 +70,44 @@ impl LazyLset {
 
 #[async_trait::async_trait]
 impl LinkSet for LazyLset {
-    fn is_connected(&self, name: &str) -> bool {
-        self.cache.lock().contains_key(name)
+    fn is_connected(&self, link: LinkRef<'_>) -> bool {
+        let name = link.name;
+        self.cache
+            .lock()
+            .contains_key(std::str::from_utf8(name).unwrap())
     }
 
     /// The network read. Opens on demand — exactly what the record path must
     /// no longer call.
-    async fn get_value(&self, name: &str) -> Option<EpicsValue> {
+    async fn get_value(&self, link: LinkRef<'_>) -> Option<EpicsValue> {
+        let name = link.name;
         self.network_reads.fetch_add(1, Ordering::SeqCst);
-        self.connect_link(name).await;
-        self.cache.lock().get(name).cloned()
+        self.connect_link(link, None).await;
+        self.cache
+            .lock()
+            .get(std::str::from_utf8(name).unwrap())
+            .cloned()
     }
 
-    fn get_cached_value(&self, name: &str) -> Option<EpicsValue> {
-        self.cache.lock().get(name).cloned()
+    fn get_cached_value(&self, link: LinkRef<'_>) -> Option<EpicsValue> {
+        let name = link.name;
+        self.cache
+            .lock()
+            .get(std::str::from_utf8(name).unwrap())
+            .cloned()
     }
 
-    async fn connect_link(&self, name: &str) {
+    async fn connect_link(
+        &self,
+        link: LinkRef<'_>,
+        _: Option<epics_base_rs::server::database::CaLinkInit>,
+    ) {
+        let name = link.name;
         self.opens.fetch_add(1, Ordering::SeqCst);
         if let Some(v) = self.on_open.clone() {
-            self.cache.lock().insert(name.to_string(), v);
+            self.cache
+                .lock()
+                .insert(String::from_utf8_lossy(name).into_owned(), v);
         }
     }
 }
@@ -98,10 +116,11 @@ async fn add_ai_with_inp(db: &PvDatabase, name: &str, inp: &str) {
     db.add_record(name, Box::new(AiRecord::new(0.0)))
         .await
         .unwrap();
+    db.put_pv_no_process(format!("{name}.INP"), EpicsValue::String(inp.into()))
+        .await
+        .unwrap();
     let rec = db.get_record(name).expect("just added");
     let mut inst = rec.write();
-    inst.put_common_field("INP", EpicsValue::String(inp.into()))
-        .unwrap();
     inst.common.udf = 0;
 }
 
@@ -109,6 +128,7 @@ async fn process(db: &PvDatabase, name: &str) {
     let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links(name, &mut visited)
         .await
+        .or_else(epics_base_rs::error::CaError::unless_process_status)
         .unwrap();
 }
 
@@ -127,6 +147,8 @@ async fn a_cache_miss_stages_the_open_instead_of_opening_inline() {
     let opens = Arc::new(AtomicUsize::new(0));
     let reads = Arc::new(AtomicUsize::new(0));
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     db.register_link_set(
         "ca",
         Arc::new(LazyLset::new(
@@ -168,6 +190,8 @@ async fn a_warm_cache_is_read_without_opening_or_network() {
     let opens = Arc::new(AtomicUsize::new(0));
     let reads = Arc::new(AtomicUsize::new(0));
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     db.register_link_set(
         "ca",
         Arc::new(LazyLset::new(
@@ -177,6 +201,7 @@ async fn a_warm_cache_is_read_without_opening_or_network() {
         )),
     )
     .await;
+    db.process_cp_links_on_connect().await;
 
     add_ai_with_inp(&db, "AI_WARM", "ca://REMOTE:IN").await;
     process(&db, "AI_WARM").await; // stages the open
@@ -209,6 +234,8 @@ async fn a_permanently_cold_link_is_opened_once_not_once_per_scan() {
     let opens = Arc::new(AtomicUsize::new(0));
     let reads = Arc::new(AtomicUsize::new(0));
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     // `on_open: None` — the open runs but the cache stays empty.
     db.register_link_set("ca", Arc::new(LazyLset::new(None, &opens, &reads)))
         .await;
@@ -234,6 +261,8 @@ async fn distinct_links_are_each_opened_once() {
     let opens = Arc::new(AtomicUsize::new(0));
     let reads = Arc::new(AtomicUsize::new(0));
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     db.register_link_set(
         "ca",
         Arc::new(LazyLset::new(Some(EpicsValue::Double(1.0)), &opens, &reads)),

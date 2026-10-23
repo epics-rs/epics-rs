@@ -69,7 +69,8 @@
 //! subscriptions than `MONITOR_CREDIT` would exhaust the pool with an empty
 //! queue and nothing left to drain to release it.
 
-use crate::server::frame::{FramePool, PooledFrame};
+use crate::protocol::CaHeader;
+use crate::server::frame::{FrameBuf, FramePool, PooledFrame};
 use epics_base_rs::runtime::sync::mpsc;
 use std::sync::Arc;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -132,21 +133,20 @@ impl Credit {
 ///   confirmation frame is queued, and every monitor frame is enqueued inside
 ///   [`deliver`](MonitorGate::deliver). Nothing else may write a monitor frame
 ///   for a gated subscription.
-#[derive(Clone)]
 pub(crate) struct MonitorGate {
     /// `true` until the subscription is cancelled. A mutex and not an
     /// `AtomicBool` because the flag alone cannot order anything: a producer
     /// that loaded `true` and was then descheduled would still enqueue after
     /// the confirmation. Held across the enqueue (async) or the socket write
     /// (blocking driver) so the decision and the byte hand-off are one step.
-    live: Arc<parking_lot::Mutex<bool>>,
+    live: parking_lot::Mutex<bool>,
 }
 
 impl MonitorGate {
     /// A live gate for a newly registered subscription.
     pub(crate) fn open() -> Self {
         MonitorGate {
-            live: Arc::new(parking_lot::Mutex::new(true)),
+            live: parking_lot::Mutex::new(true),
         }
     }
 
@@ -276,6 +276,50 @@ impl Outbox {
             // rather than dropping a client's update if that ever changes.
             Err(_) => Credit::none(),
         }
+    }
+}
+
+/// Where a frame builder hands the frame it sealed: a connection's [`Outbox`],
+/// or the blocking driver's event thread staging it straight into the
+/// client's send buffer (`tcp::run_event_task`).
+pub(crate) trait FrameSink {
+    /// Build one frame where it goes: `build` encodes the payload and returns
+    /// the header, or `None` to drop the frame. `hdr_len` is the header
+    /// [`header_len`](crate::server::frame::header_len) expects and `len_hint`
+    /// the whole frame's expected size.
+    fn frame_with(
+        &self,
+        hdr_len: usize,
+        len_hint: usize,
+        credit: Credit,
+        build: impl FnOnce(&mut FrameBuf) -> Option<CaHeader>,
+    );
+    /// Hand over one complete frame, spending `credit`.
+    fn push_with(&self, frame: impl Into<PooledFrame>, credit: Credit);
+    /// Hand over one complete frame.
+    fn push(&self, frame: impl Into<PooledFrame>) {
+        self.push_with(frame, Credit::none());
+    }
+}
+
+impl FrameSink for Outbox {
+    fn frame_with(
+        &self,
+        _hdr_len: usize,
+        len_hint: usize,
+        credit: Credit,
+        build: impl FnOnce(&mut FrameBuf) -> Option<CaHeader>,
+    ) {
+        let mut frame = FrameBuf::acquire(&self.pool, len_hint);
+        // Abort-safety: the sealed frame goes over in one synchronous push,
+        // so a producer aborted at an await point is cut at a frame boundary.
+        if let Some(hdr) = build(&mut frame) {
+            self.push_with(frame.seal(&hdr), credit);
+        }
+    }
+
+    fn push_with(&self, frame: impl Into<PooledFrame>, credit: Credit) {
+        Outbox::push_with(self, frame, credit);
     }
 }
 

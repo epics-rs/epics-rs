@@ -3,8 +3,6 @@
 //! Provides `HscDriver` (the port driver with parameter cache and poll loop),
 //! `SimHsc` (in-memory simulation without serial I/O), and `HscHolder`
 //! (IOC startup command registration).
-//!
-//! Reuses all protocol/math from [`crate::snl::xiahsc`] and [`crate::snl::xia_slit`].
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -12,13 +10,47 @@ use std::time::{Duration, Instant};
 
 use asyn_rs::error::AsynResult;
 use asyn_rs::param::ParamType;
+use asyn_rs::port::InterfaceMask;
 use asyn_rs::port::{PortDriverBase, PortFlags};
 use asyn_rs::user::AsynUser;
 
-use crate::snl::xiahsc::{
-    blades_from_height_center, blades_from_width_center, h_center_from_blades, height_from_blades,
-    v_center_from_blades, width_from_blades,
-};
+// ---------------------------------------------------------------------------
+// Slit geometry calculations (pure functions)
+// ---------------------------------------------------------------------------
+
+/// Compute slit width from left and right blade positions.
+pub fn width_from_blades(left: f64, right: f64) -> f64 {
+    left + right
+}
+
+/// Compute horizontal center from left and right blade positions.
+pub fn h_center_from_blades(left: f64, right: f64) -> f64 {
+    (right - left) / 2.0
+}
+
+/// Compute slit height from top and bottom blade positions.
+pub fn height_from_blades(top: f64, bottom: f64) -> f64 {
+    top + bottom
+}
+
+/// Compute vertical center from top and bottom blade positions.
+pub fn v_center_from_blades(top: f64, bottom: f64) -> f64 {
+    (top - bottom) / 2.0
+}
+
+/// Compute left and right blade positions from width and horizontal center.
+pub fn blades_from_width_center(width: f64, h_center: f64) -> (f64, f64) {
+    let left = width / 2.0 - h_center;
+    let right = width / 2.0 + h_center;
+    (left, right)
+}
+
+/// Compute top and bottom blade positions from height and vertical center.
+pub fn blades_from_height_center(height: f64, v_center: f64) -> (f64, f64) {
+    let top = height / 2.0 + v_center;
+    let bottom = height / 2.0 - v_center;
+    (top, bottom)
+}
 
 // ---------------------------------------------------------------------------
 // Parameter indices
@@ -244,7 +276,15 @@ impl HscDriver {
             can_block: false,
             destructible: true,
         };
-        let mut base = PortDriverBase::new(port_name, 1, flags);
+        let mut base = PortDriverBase::new(
+            port_name,
+            1,
+            flags,
+            // rs-only simulation port: optics has no C driver for it
+            // (xiahsc.st talks to the serial port itself).
+            InterfaceMask::INT32 | InterfaceMask::FLOAT64 | InterfaceMask::DRV_USER,
+            InterfaceMask::INT32 | InterfaceMask::FLOAT64,
+        );
         let params = HscParams::create(&mut base)?;
 
         // Initialize all params to 0
@@ -377,8 +417,7 @@ impl asyn_rs::port::PortDriver for HscDriver {
         self.base().check_ready()?;
         let reason = user.reason;
         self.base_mut()
-            .params
-            .set_float64(reason, user.addr, value)?;
+            .set_float64_param(reason, user.addr, value)?;
         self.handle_float64_write(reason, value)?;
         self.base_mut().call_param_callbacks(user.addr)
     }
@@ -386,7 +425,7 @@ impl asyn_rs::port::PortDriver for HscDriver {
     fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
         self.base().check_ready()?;
         let reason = user.reason;
-        self.base_mut().params.set_int32(reason, user.addr, value)?;
+        self.base_mut().set_int32_param(reason, user.addr, value)?;
 
         if reason == self.params.poll {
             // `poll` publishes the readbacks and fires the callbacks itself.
@@ -460,7 +499,7 @@ impl HscPollLoop {
                         Some(HscPollCommand::Shutdown) | None => return,
                     }
                 }
-                _ = tokio::time::sleep(self.poll_interval) => {
+                _ = epics_base_rs::runtime::task::sleep(self.poll_interval) => {
                     if self.port.is_closed() {
                         return;
                     }
@@ -524,7 +563,7 @@ impl HscHolder {
             "simHscCreate(port, [pollMs]) - Create a simulated HSC-1 slit controller",
             move |args: &[ArgValue], ctx: &CommandContext| {
                 let port = match &args[0] {
-                    ArgValue::String(s) => s.clone(),
+                    ArgValue::String(s) => s.to_str()?.to_owned(),
                     _ => return Err("port must be a string".into()),
                 };
                 let poll_ms = match &args[1] {
@@ -533,6 +572,8 @@ impl HscHolder {
                     _ => return Err("pollMs must be an integer".into()),
                 };
 
+                let claim = asyn_rs::asyn_record::claim_port(&port)
+                    .map_err(|e| format!("failed to register HSC port: {e}"))?;
                 let sim = Arc::new(Mutex::new(SimHsc::new()));
                 let driver = match HscDriver::new(&port, sim) {
                     Ok(d) => d,
@@ -541,6 +582,7 @@ impl HscHolder {
                 let poll_reason = driver.params.poll;
 
                 let (runtime, _actor) = match asyn_rs::runtime::port::create_port_runtime(
+                    &claim,
                     driver,
                     asyn_rs::runtime::config::RuntimeConfig::default(),
                 ) {
@@ -548,7 +590,8 @@ impl HscHolder {
                     Err(e) => return Err(format!("failed to start HSC port: {e}")),
                 };
                 let port_handle = runtime.port_handle().clone();
-                if let Err(e) = asyn_rs::asyn_record::register_port(&port, port_handle.clone()) {
+                let owner = ctx.db().scan_control().interrupt_gate();
+                if let Err(e) = claim.publish(port_handle.clone(), owner) {
                     runtime.shutdown();
                     return Err(format!("failed to register HSC port: {e}"));
                 }
@@ -598,6 +641,27 @@ impl Default for HscHolder {
 mod tests {
     use super::*;
     use asyn_rs::port::PortDriver;
+
+    /// The driver as registration leaves it: its port starts down and the
+    /// registration connect brings it up (asynManager.c:523, :2133-2137).
+    fn registered(port_name: &str, sim: Arc<Mutex<SimHsc>>) -> HscDriver {
+        let mut driver = HscDriver::new(port_name, sim).unwrap();
+        driver.connect(&AsynUser::default()).unwrap();
+        driver
+    }
+
+    /// The port serves Int32 and Float64 params and names them through
+    /// drvUser; PortDriverBase adds Common as asynPortDriver does.
+    #[test]
+    fn test_port_masks_are_the_interfaces_it_serves() {
+        let driver = HscDriver::new("HSC_MASKS", Arc::new(Mutex::new(SimHsc::new()))).unwrap();
+        let served = InterfaceMask::INT32 | InterfaceMask::FLOAT64;
+        assert_eq!(driver.base().interrupt_mask(), served);
+        assert_eq!(
+            driver.base().interface_mask(),
+            served | InterfaceMask::DRV_USER | InterfaceMask::COMMON
+        );
+    }
 
     #[test]
     fn test_sim_hsc_initial_state() {
@@ -688,7 +752,7 @@ mod tests {
             s.right.position = 1.5;
         }
 
-        let mut driver = HscDriver::new("test_hsc", sim).unwrap();
+        let mut driver = registered("test_hsc", sim);
         driver.poll().unwrap();
 
         let p = driver.params();
@@ -710,7 +774,7 @@ mod tests {
     #[test]
     fn test_hsc_driver_write_h_gap() {
         let sim = Arc::new(Mutex::new(SimHsc::new()));
-        let mut driver = HscDriver::new("test_hsc_gap", sim.clone()).unwrap();
+        let mut driver = registered("test_hsc_gap", sim.clone());
 
         // Write H_CENTER first, then H_GAP
         let p = driver.params;
@@ -731,7 +795,7 @@ mod tests {
     #[test]
     fn test_hsc_driver_write_individual_blades() {
         let sim = Arc::new(Mutex::new(SimHsc::new()));
-        let mut driver = HscDriver::new("test_hsc_blades", sim.clone()).unwrap();
+        let mut driver = registered("test_hsc_blades", sim.clone());
 
         let p = driver.params;
         // Pre-set the target params so individual blade writes pick them up
@@ -755,7 +819,7 @@ mod tests {
     #[test]
     fn test_hsc_driver_write_power_level() {
         let sim = Arc::new(Mutex::new(SimHsc::new()));
-        let mut driver = HscDriver::new("test_hsc_pwr", sim.clone()).unwrap();
+        let mut driver = registered("test_hsc_pwr", sim.clone());
 
         let p = driver.params;
         let mut user = AsynUser::new(p.power_level);
@@ -768,7 +832,7 @@ mod tests {
     #[test]
     fn test_hsc_driver_busy_flag() {
         let sim = Arc::new(Mutex::new(SimHsc::new()));
-        let mut driver = HscDriver::new("test_hsc_busy", sim.clone()).unwrap();
+        let mut driver = registered("test_hsc_busy", sim.clone());
 
         // Initially not moving
         driver.poll().unwrap();
@@ -806,5 +870,45 @@ mod tests {
         blade.update();
         assert!(blade.position < 10.0);
         assert!(blade.moving);
+    }
+
+    // -- Slit geometry tests --
+
+    #[test]
+    fn width_from_blades_symmetric() {
+        assert!((width_from_blades(2.5, 2.5) - 5.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn h_center_from_blades_centered() {
+        assert!((h_center_from_blades(2.5, 2.5) - 0.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn h_center_from_blades_offset() {
+        // left=1, right=3 => center = (3-1)/2 = 1.0
+        assert!((h_center_from_blades(1.0, 3.0) - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn blades_from_width_center_roundtrip() {
+        let left = 1.5;
+        let right = 3.5;
+        let w = width_from_blades(left, right);
+        let c = h_center_from_blades(left, right);
+        let (l2, r2) = blades_from_width_center(w, c);
+        assert!((l2 - left).abs() < 1e-9);
+        assert!((r2 - right).abs() < 1e-9);
+    }
+
+    #[test]
+    fn height_and_v_center_roundtrip() {
+        let top = 4.0;
+        let bottom = 2.0;
+        let h = height_from_blades(top, bottom);
+        let c = v_center_from_blades(top, bottom);
+        let (t2, b2) = blades_from_height_center(h, c);
+        assert!((t2 - top).abs() < 1e-9);
+        assert!((b2 - bottom).abs() < 1e-9);
     }
 }

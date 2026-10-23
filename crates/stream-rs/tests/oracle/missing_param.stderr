@@ -1,0 +1,4 @@
+_main_ missing_param.proto line 2: Missing value for parameter $1
+_main_ missing_param.proto line 2: in command 'out'
+_main_ missing_param.proto line 1: in protocol 'p'
+_main_ while compiling protocol 'p' for 'rec0'

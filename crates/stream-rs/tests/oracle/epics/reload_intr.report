@@ -1,0 +1,17 @@
+rec: l.proto i P
+active command=in flags=0x200104 AsyncMode AcceptInput
+i {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    in "V=%d";
+}
+

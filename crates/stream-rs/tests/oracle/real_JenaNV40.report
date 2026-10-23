@@ -1,0 +1,77 @@
+rec0: JenaNV40.proto readError(1,2,3,4,5,6,7,8,9) P
+readError {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "err";
+    in "err,%s";
+}
+rec1: JenaNV40.proto writeValue(1,2,3,4,5,6,7,8,9) P
+writeValue {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "wr,%0.2f";
+}
+rec2: JenaNV40.proto readValue(1,2,3,4,5,6,7,8,9) P
+readValue {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "rd";
+    in "rd,%f";
+}
+rec3: JenaNV40.proto closedLoop(1,2,3,4,5,6,7,8,9) P
+closedLoop {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "%{ol|cl}";
+}
+rec4: JenaNV40.proto remoteControl(1,2,3,4,5,6,7,8,9) P
+remoteControl {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "%{i0|i1}";
+}

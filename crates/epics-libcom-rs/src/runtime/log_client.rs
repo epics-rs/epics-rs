@@ -4,7 +4,7 @@
 //! A site runs one `iocLogServer` and every IOC forwards its `errlog` stream
 //! to it over TCP. The client is nothing more than an errlog listener with a
 //! socket: [`ioc_log_init`] registers one with
-//! [`crate::runtime::log::errlog_add_listener`], and from then on every
+//! [`crate::runtime::log::errlog_add_listener_bytes`], and from then on every
 //! message the errlog worker drains is appended to a 16 KiB buffer and pushed
 //! to the server by a reconnecting background thread.
 //!
@@ -14,7 +14,7 @@
 //! missing or out-of-range environment variable.
 
 use std::io::Write;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
+use std::net::{IpAddr, SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::Duration;
@@ -91,7 +91,7 @@ impl LogClient {
                 left = MSG_BUF_SIZE - state.msg_buf.len();
             }
             if left == 0 {
-                eprintln!("log client: messages to \"{}\" are lost", self.name);
+                crate::stderr_println!("log client: messages to \"{}\" are lost", self.name);
                 break;
             }
             let take = left.min(rest.len());
@@ -103,12 +103,12 @@ impl LogClient {
     /// C `logClientSend` (`logClient.c:202-221`) — the prefix, then the
     /// message, under one lock so the two cannot interleave with another
     /// thread's pair.
-    fn send(&self, message: &str) {
+    fn send(&self, message: &[u8]) {
         let mut state = self.state.lock().expect("log client");
         if let Some(prefix) = PREFIX.lock().expect("log client prefix").as_deref() {
             self.send_chunk(&mut state, prefix.as_bytes());
         }
-        self.send_chunk(&mut state, message.as_bytes());
+        self.send_chunk(&mut state, message);
     }
 
     /// C `logClientFlush` (`logClient.c:222-273`): push what is buffered and
@@ -123,7 +123,7 @@ impl LogClient {
                 state.msg_buf.clear();
             }
             Err(e) => {
-                eprintln!(
+                crate::stderr_println!(
                     "log client: lost contact with log server at '{}'\n because \"{e}\"",
                     self.name
                 );
@@ -143,7 +143,7 @@ impl LogClient {
                 let _ = sock.set_nodelay(true);
                 state.sock = Some(sock);
                 state.connect_count += 1;
-                eprintln!("log client: connected to log server at '{}'", self.name);
+                crate::stderr_println!("log client: connected to log server at '{}'", self.name);
             }
             Err(_) => {
                 // C prints its connect failure only once per distinct errno
@@ -184,33 +184,30 @@ fn restart_thread(client: Arc<LogClient>) {
 /// C `getConfig` (`iocLog.c:37-66`) — both variables, both diagnostics.
 fn get_config() -> Result<SocketAddr, IocLogError> {
     let Some(port) = EPICS_IOC_LOG_PORT.long() else {
-        eprintln!(
+        crate::stderr_println!(
             "iocLog: EPICS environment variable \"{}\" undefined",
             EPICS_IOC_LOG_PORT.name()
         );
         return Err(IocLogError::NoServerConfigured);
     };
-    if !(0..=i64::from(u16::MAX)).contains(&port) {
-        eprintln!(
+    let Ok(port) = u16::try_from(port) else {
+        crate::stderr_println!(
             "iocLog: EPICS environment variable \"{}\" out of range",
             EPICS_IOC_LOG_PORT.name()
         );
         return Err(IocLogError::NoServerConfigured);
-    }
-    // C `envGetInetAddrConfigParam` fails on an unset or unparsable value, and
-    // `EPICS_IOC_LOG_INET`'s compiled default is empty — so an IOC that was
+    };
+    // `EPICS_IOC_LOG_INET`'s compiled default is empty, so an IOC that was
     // never told where its log server is reports the variable undefined rather
     // than connecting somewhere.
-    let inet = EPICS_IOC_LOG_INET.get().unwrap_or_default();
-    let Ok(addr) = inet.trim().parse::<Ipv4Addr>() else {
-        eprintln!(
+    let Some(addr) = EPICS_IOC_LOG_INET.inet_addr() else {
+        crate::stderr_println!(
             "iocLog: EPICS environment variable \"{}\" undefined",
             EPICS_IOC_LOG_INET.name()
         );
         return Err(IocLogError::NoServerConfigured);
     };
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    Ok(SocketAddr::new(IpAddr::V4(addr), port as u16))
+    Ok(SocketAddr::new(IpAddr::V4(addr), port))
 }
 
 /// C `iocLogInit` (`iocLog.c:121-142`).
@@ -256,7 +253,7 @@ pub fn ioc_log_init() -> Result<(), IocLogError> {
     )
     .is_err()
     {
-        eprintln!("log client: unable to start reconnection thread");
+        crate::stderr_println!("log client: unable to start reconnection thread");
         return Err(IocLogError::NoServerConfigured);
     }
 
@@ -264,7 +261,7 @@ pub fn ioc_log_init() -> Result<(), IocLogError> {
     // every message, not once at init, so `setIocLogDisable 1` silences a
     // client that is already running.
     let sender = Arc::clone(&client);
-    crate::runtime::log::errlog_add_listener(move |message| {
+    crate::runtime::log::errlog_add_listener_bytes(move |message| {
         if !IOC_LOG_DISABLE.load(Ordering::Relaxed) {
             sender.send(message);
         }
@@ -318,53 +315,57 @@ pub fn ioc_log_flush() {
     }
 }
 
-/// C `iocLogShow`/`logClientShow` (`iocLog.c:145-152`, `logClient.c:513-545`).
-/// Returns the lines rather than printing them, so the iocsh command can send
-/// them through its own redirected output.
+/// C `iocLogShow` (`iocLog.c:145-152`). Returns the bytes C's `printf`s
+/// write rather than printing them, so the iocsh command can write them to its
+/// console.
 #[must_use]
-pub fn ioc_log_show(level: u32) -> Vec<String> {
-    let Some(client) = CLIENT.get() else {
-        return Vec::new();
-    };
-    let state = client.state.lock().expect("log client");
-    let mut out = Vec::new();
-    if state.sock.is_some() {
-        out.push(format!(
-            "log client: connected to log server at '{}'",
-            client.name
-        ));
-    } else {
-        out.push(format!(
-            "log client: disconnected from log server at '{}'",
-            client.name
-        ));
-    }
-    if let Some(prefix) = PREFIX.lock().expect("log client prefix").as_deref() {
-        out.push(format!("log client: prefix is \"{prefix}\""));
-    }
-    if level > 0 {
-        out.push(format!(
-            "log client: sock {}, connect cycles = {}",
+pub fn ioc_log_show(level: u32) -> Vec<u8> {
+    CLIENT
+        .get()
+        .map_or_else(Vec::new, |client| client.show(level))
+}
+
+impl LogClient {
+    /// C `logClientShow` (`logClient.c:513-545`). The buffer goes out as
+    /// `"%.*s"` writes it: its own bytes, with no newline added.
+    fn show(&self, level: u32) -> Vec<u8> {
+        let state = self.state.lock().expect("log client");
+        let mut out = Vec::new();
+        let _ = writeln!(
+            out,
+            "log client: {} log server at '{}'",
             if state.sock.is_some() {
-                "OK"
+                "connected to"
             } else {
-                "INVALID"
+                "disconnected from"
             },
-            state.connect_count
-        ));
-    }
-    if level > 1 {
-        out.push(format!(
-            "log client: {} bytes in buffer",
-            state.msg_buf.len()
-        ));
-        if !state.msg_buf.is_empty() {
-            out.push("-------------------------".to_string());
-            out.push(String::from_utf8_lossy(&state.msg_buf).into_owned());
-            out.push("-------------------------".to_string());
+            self.name
+        );
+        if let Some(prefix) = PREFIX.lock().expect("log client prefix").as_deref() {
+            let _ = writeln!(out, "log client: prefix is \"{prefix}\"");
         }
+        if level > 0 {
+            let _ = writeln!(
+                out,
+                "log client: sock {}, connect cycles = {}",
+                if state.sock.is_some() {
+                    "OK"
+                } else {
+                    "INVALID"
+                },
+                state.connect_count
+            );
+        }
+        if level > 1 {
+            let _ = writeln!(out, "log client: {} bytes in buffer", state.msg_buf.len());
+            if !state.msg_buf.is_empty() {
+                out.extend_from_slice(b"-------------------------\n");
+                out.extend_from_slice(&state.msg_buf);
+                out.extend_from_slice(b"-------------------------\n");
+            }
+        }
+        out
     }
-    out
 }
 
 #[cfg(test)]
@@ -407,6 +408,32 @@ mod tests {
         assert_eq!(get_config(), Err(IocLogError::NoServerConfigured));
         unsafe {
             std::env::remove_var("EPICS_IOC_LOG_PORT");
+        }
+    }
+
+    /// `envGetInetAddrConfigParam` reads the server through `aToIPAddr` and
+    /// keeps only its address (`envSubr.c:257-262`).
+    #[test]
+    #[serial(ioc_log)]
+    fn the_inet_is_read_as_c_a_to_ip_addr() {
+        for (inet, want) in [
+            ("010.0.0.1", "10.0.0.1:7004"),
+            ("1.2.3.4:5", "1.2.3.4:7004"),
+            ("16909060", "1.2.3.4:7004"),
+            ("localhost", "127.0.0.1:7004"),
+        ] {
+            unsafe {
+                std::env::set_var("EPICS_IOC_LOG_INET", inet);
+                std::env::remove_var("EPICS_IOC_LOG_PORT");
+            }
+            assert_eq!(
+                get_config().map(|a| a.to_string()),
+                Ok(want.to_string()),
+                "{inet}"
+            );
+        }
+        unsafe {
+            std::env::remove_var("EPICS_IOC_LOG_INET");
         }
     }
 
@@ -508,6 +535,82 @@ mod tests {
                     std::env::remove_var("EPICS_IOC_LOG_PORT");
                 }
             },
+        );
+    }
+
+    /// C hands `logClientSend` the errlog record as the bytes it is
+    /// (`iocLog.c:79-84`, `logClient.c:202-221`), so a device byte that is not
+    /// UTF-8 — an asyn trace of a reply, asynManager.c:3175 — reaches the log
+    /// server as itself, not as U+FFFD.
+    #[test]
+    #[serial(ioc_log)]
+    fn a_non_utf8_byte_reaches_the_log_server_unchanged() {
+        with_a_process_of_its_own(
+            "runtime::log_client::tests::a_non_utf8_byte_reaches_the_log_server_unchanged",
+            || {
+                let server = TcpListener::bind("127.0.0.1:0").expect("log server");
+                let port = server.local_addr().expect("addr").port();
+                unsafe {
+                    std::env::set_var("EPICS_IOC_LOG_INET", "127.0.0.1");
+                    std::env::set_var("EPICS_IOC_LOG_PORT", port.to_string());
+                }
+                *PREFIX.lock().expect("prefix") = None;
+                set_ioc_log_disable(false);
+                ioc_log_init().expect("the client must start");
+                let mut peer = accept_within(&server, Duration::from_secs(10));
+                peer.set_read_timeout(Some(Duration::from_millis(100)))
+                    .expect("read timeout");
+
+                crate::runtime::log::errlog_printf_bytes(&[b"rd a\xffb\n"]);
+                crate::runtime::log::errlog_flush();
+
+                let mut got = Vec::new();
+                let mut buf = [0u8; 64];
+                for _ in 0..50 {
+                    ioc_log_flush();
+                    match peer.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => got.extend_from_slice(&buf[..n]),
+                        Err(_) if got.ends_with(b"\n") => break,
+                        Err(_) => {}
+                    }
+                }
+                assert_eq!(got, b"rd a\xffb\n");
+                unsafe {
+                    std::env::remove_var("EPICS_IOC_LOG_INET");
+                    std::env::remove_var("EPICS_IOC_LOG_PORT");
+                }
+            },
+        );
+    }
+
+    /// C `logClientShow` at level 2 prints the buffer with `"%.*s"` between
+    /// two rules (logClient.c:539-543): its bytes as they are, and no newline
+    /// of its own after a message that already ends in one.
+    #[test]
+    #[serial(ioc_log)]
+    fn the_level_2_show_prints_the_buffer_as_c_does() {
+        *PREFIX.lock().expect("prefix") = None;
+        let addr: SocketAddr = "127.0.0.1:7004".parse().expect("addr");
+        let client = LogClient {
+            addr,
+            name: addr.to_string(),
+            state: Mutex::new(LogClientState {
+                sock: None,
+                msg_buf: b"rd a\xffb\n".to_vec(),
+                connect_count: 0,
+                shutdown: false,
+            }),
+            wake: Condvar::new(),
+        };
+        assert_eq!(
+            client.show(2),
+            b"log client: disconnected from log server at '127.0.0.1:7004'\n\
+              log client: sock INVALID, connect cycles = 0\n\
+              log client: 7 bytes in buffer\n\
+              -------------------------\n\
+              rd a\xffb\n\
+              -------------------------\n"
         );
     }
 

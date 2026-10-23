@@ -347,7 +347,7 @@ mod tests {
         use epics_base_rs::server::records::histogram::HistogramRecord;
 
         let mut hist = HistogramRecord::new(2, 0.0, 10.0);
-        hist.val[0] = 3_000_000_000; // above i32::MAX — the bin that used to go negative
+        hist.val.make_mut()[0] = 3_000_000_000; // above i32::MAX — the bin that used to go negative
         let val = hist.get_field("VAL").expect("histogram serves VAL");
 
         assert_eq!(

@@ -17,13 +17,18 @@
 //! evaluator. Both granted WRITE on every truthy non-unity result, which is a
 //! privilege escalation on both the CA and PVA paths. The evaluator now lives
 //! only in `AccessSecurityConfig::compute_rules`, the way C keeps it only in
-//! `asComputeAsg`, and both callers pass resolved values into it.
+//! `asComputeAsg`, and both callers read the results it publishes.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
+use epics_base_rs::runtime::task::sleep;
 use epics_base_rs::server::access_security::{
-    AccessGate, AccessLevel, AsgAslResolver, AsgInputs, InpResolver, new_acf_cell, parse_acf,
+    AccessGate, AccessLevel, AcfCell, AsgAslResolver, new_acf_cell_watching, parse_acf,
 };
+use epics_base_rs::server::database::PvDatabase;
+use epics_base_rs::server::records::ai::AiRecord;
+use epics_base_rs::types::EpicsValue;
 
 /// `CALC("A")` makes the rule's result the INP value itself, so each case
 /// names the exact number C's band sees.
@@ -46,15 +51,32 @@ const CASES: &[(f64, bool)] = &[
     (-1.0, false),
 ];
 
+/// `gate:mode` at `value`, once the `INP*` watcher has delivered it.
+async fn mode_at(value: f64) -> (Arc<PvDatabase>, AcfCell) {
+    let db = Arc::new(PvDatabase::new());
+    db.add_record("gate:mode", Box::new(AiRecord::new(value)))
+        .await
+        .unwrap();
+    // Processed, so it is not UDF.
+    db.put_record_field_from_ca("gate:mode", "VAL", EpicsValue::Double(value))
+        .await
+        .unwrap();
+    let cell = new_acf_cell_watching(Some(parse_acf(ACF).unwrap()), &db);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while cell.load_full().unwrap().asg[b"OPS".as_slice()].inp_bad() != 0 {
+        assert!(Instant::now() < deadline, "gate:mode never delivered");
+        sleep(Duration::from_millis(10)).await;
+    }
+    (db, cell)
+}
+
 /// The async gate — the path `epics-pva-rs` and QSRV take.
 #[epics_macros_rs::epics_test]
 async fn calc_gated_rule_grants_only_inside_the_band() {
-    let cell = new_acf_cell(Some(parse_acf(ACF).unwrap()));
     let asg: AsgAslResolver = Arc::new(|_name| Box::pin(async { ("OPS".to_string(), 0u8) }));
-
     for &(value, expected) in CASES {
-        let inp: InpResolver = Arc::new(move |_link: String| Box::pin(async move { Some(value) }));
-        let gate = AccessGate::required(cell.clone(), asg.clone()).with_inp_resolver(inp);
+        let (_db, cell) = mode_at(value).await;
+        let gate = AccessGate::required(cell, asg.clone());
         assert_eq!(
             gate.check("x", "h", "u", "ca", "").await.allows_write(),
             expected,
@@ -64,15 +86,14 @@ async fn calc_gated_rule_grants_only_inside_the_band() {
     }
 }
 
-/// The synchronous entry the CA server calls with its own resolved values —
-/// the second copy of the evaluator used to live behind this one.
-#[test]
-fn compute_for_name_applies_the_band_to_caller_supplied_inputs() {
-    let cfg = parse_acf(ACF).unwrap();
+/// The synchronous entry the CA server calls — the second copy of the
+/// evaluator used to live behind this one.
+#[epics_macros_rs::epics_test]
+async fn compute_for_name_applies_the_band() {
     for &(value, expected) in CASES {
-        let mut inputs = AsgInputs::default();
-        inputs.record(0, Some(value));
-        let (level, _trap) = cfg.compute_for_name("OPS", "h", "u", &[], 0, "ca", "", Some(&inputs));
+        let (_db, cell) = mode_at(value).await;
+        let cfg = cell.load_full().unwrap();
+        let (level, _trap) = cfg.compute_for_name("OPS", "h", "u", &[], 0, "ca", "");
         assert_eq!(
             level == AccessLevel::ReadWrite,
             expected,
@@ -85,10 +106,9 @@ fn compute_for_name_applies_the_band_to_caller_supplied_inputs() {
 /// refuses the write.
 #[epics_macros_rs::epics_test]
 async fn a_truthy_non_unity_calc_does_not_grant_write() {
-    let cell = new_acf_cell(Some(parse_acf(ACF).unwrap()));
+    let (_db, cell) = mode_at(2.0).await;
     let asg: AsgAslResolver = Arc::new(|_name| Box::pin(async { ("OPS".to_string(), 0u8) }));
-    let inp: InpResolver = Arc::new(|_link: String| Box::pin(async { Some(2.0) }));
-    let gate = AccessGate::required(cell, asg).with_inp_resolver(inp);
+    let gate = AccessGate::required(cell, asg);
     let checked = gate.check("x", "h", "u", "ca", "").await;
     assert!(
         !checked.allows_write(),

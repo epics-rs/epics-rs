@@ -1,0 +1,2 @@
+record(calc,"SRC"){field(CALC,"1") field(FLNK,"T")}
+record(calcout,"T"){field(CALC,"1") field(ODLY,"0.1")}

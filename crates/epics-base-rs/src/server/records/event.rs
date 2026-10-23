@@ -1,6 +1,11 @@
 use crate::error::{CaError, CaResult};
+use crate::server::record::{CycleCell, CycleRead};
 use crate::server::record::{MENU_YES_NO, Record};
 use crate::types::{EpicsValue, PvString};
+use std::sync::Arc;
+
+/// `eventRecord.dbd` `field(VAL,DBF_STRING) size(40)`.
+const MAX_STRING_SIZE: usize = 40;
 
 /// `event` record — software-event source.
 ///
@@ -21,13 +26,16 @@ use crate::types::{EpicsValue, PvString};
 /// written).
 pub struct EventRecord {
     /// Event name to post. DBF_STRING in C (was a numeric subscript
-    /// pre-EPICS-7; a numeric string still works for back-compat).
-    pub val: String,
+    /// pre-EPICS-7; a numeric string still works for back-compat). Bytes, as
+    /// C's `char[40]` is. Written only by [`Self::set_val_text`].
+    val: PvString,
+    /// C `epvt`: [`EventHandle::of`] VAL, settled with every VAL write.
+    epvt: Option<EventHandle>,
     /// SIMM is `DBF_MENU menu(menuYesNo)` (eventRecord.dbd.pod:152-156):
     /// the two-choice NO/YES simulation menu, served as DBR_ENUM.
     pub simm: i16,
-    pub siml: String,
-    pub siol: String,
+    pub siml: PvString,
+    pub siol: PvString,
     /// SVAL is `DBF_STRING` (eventRecord.dbd.pod:143-145) — the BUFFER C's
     /// `readValue` reads SIOL into (`dbGetLink(&prec->siol, DBR_STRING,
     /// &prec->sval)`, eventRecord.c:185) before publishing `val = sval`.
@@ -46,10 +54,11 @@ pub struct EventRecord {
 impl Default for EventRecord {
     fn default() -> Self {
         Self {
-            val: String::new(),
+            val: PvString::new(),
+            epvt: None,
             simm: 0,
-            siml: String::new(),
-            siol: String::new(),
+            siml: PvString::new(),
+            siol: PvString::new(),
             sval: PvString::new(),
             sims: 0,
             // C `field(SDLY,DBF_DOUBLE) { initial("-1.0") }` — negative means
@@ -62,17 +71,50 @@ impl Default for EventRecord {
 impl EventRecord {
     /// Construct an event record that posts event name `val`.
     pub fn new(val: impl Into<String>) -> Self {
-        Self {
-            val: val.into(),
-            ..Default::default()
-        }
+        let mut rec = Self::default();
+        rec.set_val_text(PvString::from(val.into()));
+        rec
+    }
+
+    /// C `special(VAL)` and `devEventSoft` `read_event`: VAL and its handle
+    /// move together, so the cycle posts without re-reading the name.
+    fn set_val_text(&mut self, val: PvString) {
+        self.epvt = EventHandle::of(&val);
+        self.val = val;
     }
 }
 
-fn put_string(slot: &mut String, value: EpicsValue, field: &str) -> CaResult<()> {
+/// C `EVENTPVT` (`eventNameToHandle`, `dbScan.c:469`): the event a name
+/// posts, `None` for the names C maps to no event (empty, `"0"`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventHandle(Arc<[u8]>);
+
+impl EventHandle {
+    fn of(name: &PvString) -> Option<Self> {
+        crate::server::database::scan_index::EventName::of(name.as_bytes())
+            .map(|event| Self(event.to_bytes().into()))
+    }
+
+    /// The normalised name `post_event_named` routes by.
+    pub fn name(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+fn put_pv_string(slot: &mut PvString, value: EpicsValue, field: &str) -> CaResult<()> {
     match value {
         EpicsValue::String(v) => {
-            *slot = v.as_str_lossy().into_owned();
+            *slot = v;
+            Ok(())
+        }
+        _ => Err(CaError::TypeMismatch(field.to_string())),
+    }
+}
+
+fn put_string(slot: &mut PvString, value: EpicsValue, field: &str) -> CaResult<()> {
+    match value {
+        EpicsValue::String(v) => {
+            *slot = v;
             Ok(())
         }
         _ => Err(CaError::TypeMismatch(field.to_string())),
@@ -100,8 +142,55 @@ fn put_double(slot: &mut f64, value: EpicsValue, field: &str) -> CaResult<()> {
 }
 
 impl Record for EventRecord {
+    crate::slot_map!(crate::server::record::dbd_generated::slots::event;
+        fields:;
+        custom: VAL, SIOL, SVAL, SIML, SIMM, SIMS, SDLY;
+        spill: INP, OLDSIMM, SSCN, SIMPVT);
+
+    fn acts_before_process(&self) -> bool {
+        false
+    }
+
+    fn cycle_hooks(&self) -> crate::server::record::CycleHooks {
+        crate::server::record::CycleHooks::NONE
+    }
+
+    /// `monitor()` posts VAL alone (`eventRecord.c:157-165`).
+    fn process_posted_fields(&self) -> Option<crate::server::record::DeclaredFields> {
+        Some(
+            &const {
+                crate::server::record::declared_set(
+                    crate::server::record::dbd_generated::EVENT_FIELDS,
+                    ["VAL"],
+                )
+            },
+        )
+    }
+
+    fn has_array_monitor_post(&self) -> bool {
+        false
+    }
+
     fn record_type(&self) -> &'static str {
         "event"
+    }
+
+    /// devEventSoft.c returns `dbGetLink`'s status.
+    fn process_status_rule(&self) -> crate::server::record::ProcessStatusRule {
+        crate::server::record::ProcessStatusRule::io(crate::server::record::SoftStatus {
+            plain: true,
+            raw: false,
+            async_: false,
+        })
+    }
+
+    /// `devEventSoft.c:56` reads INP as `DBR_STRING`; C ships no other soft
+    /// event dset.
+    fn soft_input_request(
+        &self,
+        _soft: crate::server::device_support::SoftDtyp,
+    ) -> crate::server::record::InputLinkRequest {
+        crate::server::record::InputLinkRequest::As(crate::server::record::LinkReadAs::String)
     }
 
     /// C `eventRecord.c::process` never clears UDF: the record's one
@@ -152,6 +241,18 @@ impl Record for EventRecord {
         &["VAL"]
     }
 
+    /// event has no MDEL: the deadband parsed a numeric name ("1") and posted
+    /// VAL only when it moved, where C's post above is unconditional.
+    fn uses_monitor_deadband(&self) -> bool {
+        false
+    }
+
+    /// The default's answer for a string VAL, without cloning it every cycle:
+    /// no event name is undefined (`devEventSoft.c:84` sets `udf = FALSE`).
+    fn value_is_undefined(&self) -> bool {
+        false
+    }
+
     /// `SIMM` is `menu(menuYesNo)`, served as DBR_ENUM with the NO/YES labels.
     fn menu_field_choices(&self, field: &str) -> Option<&'static [&'static str]> {
         match field {
@@ -160,12 +261,78 @@ impl Record for EventRecord {
         }
     }
 
+    fn link_text_ref(&self, link_field: &str) -> Option<&[u8]> {
+        match link_field {
+            "SIML" => Some(self.siml.as_bytes()),
+            "SIOL" => Some(self.siol.as_bytes()),
+            _ => None,
+        }
+    }
+
+    fn simm_cells(&self) -> Option<crate::server::record::SimmCells> {
+        Some(crate::server::record::SimmCells {
+            simm: self.simm,
+            sims: self.sims,
+            sdly: self.sdly,
+        })
+    }
+
+    fn cycle_cell(&self, cell: CycleCell) -> CycleRead {
+        match cell {
+            CycleCell::Val => CycleRead::ByName,
+            _ => CycleRead::Absent,
+        }
+    }
+
+    fn val(&self) -> Option<EpicsValue> {
+        Some(EpicsValue::String(self.val.clone()))
+    }
+
+    fn software_event(&self) -> Option<&EventHandle> {
+        self.epvt.as_ref()
+    }
+
+    /// INP (`devEventSoft.c:56`) and SIOL (`eventRecord.c:185`) are both
+    /// `dbGetLink(.., DBR_STRING, .., 0, 0)`; the native read built the same
+    /// text through the generic VAL put.
+    fn input_link_request(&self, link_field: &str) -> crate::server::record::InputLinkRequest {
+        use crate::server::record::{InputLinkRequest, LinkReadAs};
+        InputLinkRequest::As(match link_field {
+            "INP" | "SIOL" => LinkReadAs::String,
+            _ => LinkReadAs::Native,
+        })
+    }
+
+    /// `devEventSoft.c::read_event` (76-80): the `DBR_STRING` read replaces
+    /// VAL only when it differs (`strcmp` then `strcpy`). The read is already
+    /// VAL's own type, so it skips the generic put's field-shape lookups.
+    fn soft_input_read(
+        &mut self,
+        value: Option<EpicsValue>,
+        _dpvt: &mut crate::server::device_support::Dpvt,
+    ) -> CaResult<()> {
+        match value {
+            Some(EpicsValue::String(mut s)) => {
+                if s.as_bytes() != self.val.as_bytes() {
+                    if s.len() >= MAX_STRING_SIZE {
+                        s = PvString::from_bytes(&s.as_bytes()[..MAX_STRING_SIZE - 1]);
+                    }
+                    self.set_val_text(s);
+                }
+                Ok(())
+            }
+            Some(other) => self.set_val(other),
+            None => Ok(()),
+        }
+    }
+
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
-            "VAL" => Some(EpicsValue::String(self.val.clone().into())),
+            "VAL" => Some(EpicsValue::String(self.val.clone())),
             "SIMM" => Some(EpicsValue::Short(self.simm)),
             "SIML" => Some(EpicsValue::String(self.siml.clone().into())),
             "SIOL" => Some(EpicsValue::String(self.siol.clone().into())),
+            "SVAL" => Some(EpicsValue::String(self.sval.clone())),
             "SIMS" => Some(EpicsValue::Short(self.sims)),
             "SDLY" => Some(EpicsValue::Double(self.sdly)),
             _ => None,
@@ -177,12 +344,17 @@ impl Record for EventRecord {
     fn put_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
         self.validate_put(name, &value)?;
         match name {
-            "VAL" => put_string(&mut self.val, value, name)?,
+            "VAL" => {
+                let mut val = PvString::new();
+                put_pv_string(&mut val, value, name)?;
+                self.set_val_text(val);
+            }
             "SIML" => put_string(&mut self.siml, value, name)?,
             "SIOL" => put_string(&mut self.siol, value, name)?,
             "SIMM" => put_short(&mut self.simm, value, name)?,
             "SIMS" => put_short(&mut self.sims, value, name)?,
             "SDLY" => put_double(&mut self.sdly, value, name)?,
+            "SVAL" => put_pv_string(&mut self.sval, value, name)?,
             _ => return Err(CaError::FieldNotFound(name.to_string())),
         }
         self.on_put(name);
@@ -202,9 +374,35 @@ mod tests {
         let mut rec = EventRecord::default();
         rec.put_field("SIMM", EpicsValue::Short(1)).unwrap();
         assert_eq!(rec.menu_field_choices("SIMM"), Some(&["NO", "YES"][..]));
-        let inst = RecordInstance::new("EV:SIMM".into(), rec);
+        let inst = RecordInstance::new("EV:SIMM", rec);
         let snap = inst.snapshot_for_field("SIMM").unwrap();
         assert_eq!(snap.value, EpicsValue::Enum(1));
         assert_eq!(snap.enums.as_ref().unwrap().strings, vec!["NO", "YES"]);
+    }
+
+    /// Every VAL writer moves the handle with it: a load/put, the soft INP
+    /// read, and the names `eventNameToHandle` maps to no event.
+    #[test]
+    fn every_val_write_settles_software_event() {
+        let name = |r: &EventRecord| r.software_event().map(|e| e.name().to_owned());
+        let mut rec = EventRecord::new(" 5.0 ");
+        assert_eq!(name(&rec).as_deref(), Some(&b"5"[..]));
+        rec.put_field("VAL", EpicsValue::String("shutter".into()))
+            .unwrap();
+        assert_eq!(name(&rec).as_deref(), Some(&b"shutter"[..]));
+        rec.soft_input_read(
+            Some(EpicsValue::String("0".into())),
+            &mut Default::default(),
+        )
+        .unwrap();
+        assert_eq!(name(&rec), None);
+        rec.soft_input_read(
+            Some(EpicsValue::String("7".into())),
+            &mut Default::default(),
+        )
+        .unwrap();
+        assert_eq!(name(&rec).as_deref(), Some(&b"7"[..]));
+        rec.put_field("VAL", EpicsValue::String("".into())).unwrap();
+        assert_eq!(name(&rec), None);
     }
 }

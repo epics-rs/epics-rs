@@ -1,0 +1,363 @@
+rec0: teled_h.proto ping(1,2,3,4,5,6,7,8,9) P
+ping {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "\x0d1R %0<nsum>";
+    in "R %0<nsum>";
+}
+rec1: teled_h.proto getModel(1,2,3,4,5,6,7,8,9) P
+getModel {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "1R008IDENTIFY%0<nsum>";
+    in "R0\?\?%#s";
+}
+rec2: teled_h.proto getUnit(1,2,3,4,5,6,7,8,9) P
+getUnit {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "1R006UNITS%0<nsum>";
+    in "R0\?\?%#s";
+}
+rec3: teled_h.proto getMode(1,2,3,4,5,6,7,8,9) P
+getMode {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "1R004MODE%0<nsum>";
+    in "R0\?\?%#s";
+}
+rec4: teled_h.proto getID(1,2,3,4,5,6,7,8,9) P
+getID {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "1R008IDENTIFY%0<nsum>";
+    in "R0\?\?%#s";
+}
+rec5: teled_h.proto setRem(1,2,3,4,5,6,7,8,9) P
+setRem {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "1R006REMOTE%0<nsum>";
+    in "R %0<nsum>";
+}
+rec6: teled_h.proto setLoc(1,2,3,4,5,6,7,8,9) P
+setLoc {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "1R005LOCAL%0<nsum>";
+    in "R %0<nsum>";
+}
+rec7: teled_h.proto setRun(1,2,3,4,5,6,7,8,9) P
+setRun {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "6R003RUNF0";
+    in "R %0<nsum>";
+}
+rec8: teled_h.proto setStop(1,2,3,4,5,6,7,8,9) P
+setStop {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "1R005STOP2%0<nsum>";
+    in "R %0<nsum>";
+}
+rec9: teled_h.proto getVol(1,2,3,4,5,6,7,8,9) P
+getVol {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "1R004VOL2%0<nsum>";
+    in "R0\?\?VOL\?=%s";
+}
+rec10: teled_h.proto getSetPress(1,2,3,4,5,6,7,8,9) P
+getSetPress {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "1R009SETPRESS2%0<nsum>";
+    in "R0\?\?PRESS\?=%s";
+}
+rec11: teled_h.proto setPress(1,2,3,4,5,6,7,8,9) P
+setPress {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+  @Init {
+    out "1R009SETPRESS2%0<nsum>";
+    in "R0\?\?PRESS\?=%s";
+  }
+
+    out "1R00FPRESS2=%08.4f%0<nsum>";
+    in "R %0<nsum>";
+}
+rec12: teled_h.proto getPress(1,2,3,4,5,6,7,8,9) P
+getPress {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "1R006PRESS2%0<nsum>";
+    in "R0\?\?PRESS\?=%s";
+}
+rec13: teled_h.proto getFlow(1,2,3,4,5,6,7,8,9) P
+getFlow {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "1R005FLOW2%0<nsum>";
+    in "R0\?\?FLOW\?=%s";
+}
+rec14: teled_h.proto getMFlow(1,2,3,4,5,6,7,8,9) P
+getMFlow {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "1R006MFLOW2%0<nsum>";
+    in "R0\?\?FLOW2=%s";
+}
+rec15: teled_h.proto setMFlow(1,2,3,4,5,6,7,8,9) P
+setMFlow {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+  @Init {
+    out "1R006MFLOW2%0<nsum>";
+    in "R0\?\?FLOW2=%s";
+  }
+
+    out "1R00FMFLOW2=%08.4f%0<nsum>";
+    in "R %0<nsum>";
+}
+rec16: teled_h.proto getStatus(1,2,3,4,5,6,7,8,9) P
+getStatus {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "1R007STATUS2%0<nsum>";
+    in "R0\?\?STATUS=%#s";
+}
+rec17: teled_h.proto sendCmd(1,2,3,4,5,6,7,8,9) P
+sendCmd {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "1R0%s%0<nsum>";
+    in "\?\?\?\?%#s";
+}
+rec18: teled_h.proto setRefill(1,2,3,4,5,6,7,8,9) P
+setRefill {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "1R006REFILL%0<nsum>";
+    in "R %0<nsum>";
+}
+rec19: teled_h.proto getRefillLimit(1,2,3,4,5,6,7,8,9) P
+getRefillLimit {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "1R007RLIMIT2%0<nsum>";
+    in "R0\?\?%*s\_%f";
+}
+rec20: teled_h.proto setRefillRate(1,2,3,4,5,6,7,8,9) P
+setRefillRate {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+  @Init {
+    out "1R007RLIMIT2%0<nsum>";
+    in "R0\?\?%*s\_%f";
+  }
+
+    out "1R009REFILL=%08.4f%0<nsum>";
+    in "R %0<nsum>";
+}
+rec21: teled_h.proto setDigital(1,2,3,4,5,6,7,8,9) P
+setDigital {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "1R008DIGITAL=%{HHHHHHHH|LHHHHHHH|HLHHHHHH|LLHHHHHH}%0<nsum>";
+}

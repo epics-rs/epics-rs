@@ -27,7 +27,7 @@
 //! * `lsi` / `lso` / `printf` — C's `cvt_dbaddr` sets `no_elements = 1` and
 //!   `field_type = DBF_STRING` (`lsiRecord.c:141-143`): a long string is ONE
 //!   string element on the channel, not a capacity. The CA server already
-//!   serves that through `Record::long_string_fields`.
+//!   serves that through `FieldDesc::long_string`.
 //! * `sCalcout` — `no_elements = STRING_SIZE`, a constant, with no
 //!   `get_array_info` to disagree with it.
 
@@ -54,7 +54,7 @@ fn asub_channels_announce_nox_and_novx() {
     // not.
     rec.put_field("VALA", EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0].into()))
         .unwrap();
-    assert_eq!(rec.get_field("NEVA"), Some(EpicsValue::Long(3)));
+    assert_eq!(rec.get_field("NEVA"), Some(EpicsValue::ULong(3)));
     assert_eq!(
         rec.field_native_count("VALA"),
         Some(10),
@@ -64,7 +64,7 @@ fn asub_channels_announce_nox_and_novx() {
     // An input link delivers 2 elements into an 8-wide cell.
     rec.put_field("A", EpicsValue::DoubleArray(vec![4.0, 5.0].into()))
         .unwrap();
-    assert_eq!(rec.get_field("NEA"), Some(EpicsValue::Long(2)));
+    assert_eq!(rec.get_field("NEA"), Some(EpicsValue::ULong(2)));
     assert_eq!(rec.field_native_count("A"), Some(8));
 
     // The count fields and the scalars are not SPC_DBADDR channels.

@@ -91,11 +91,23 @@ async fn main() {
     // here, before any operation (tools/get.cpp:47-70).
     epics_pva_rs::log::install_cli_logging(args.debug);
 
-    // pvxs `-v` prints the effective client config once, before any
-    // operation (tools/get.cpp:99-100). It is a diagnostic, not an
-    // output-format switch — the value formatter stays under `-M`.
+    // Build the client with the parsed `-w` as the operation timeout,
+    // applied once at construction so every op path uses the same owner.
+    // pvxs `pvxget` waits for completion with `done.wait(timeout)`
+    // (tools/get.cpp:72,132), and `epicsEvent::wait(0)` is `tryWait()` —
+    // an immediate poll (epicsEvent.h:101-107). Route `-w` through
+    // `wait_timeout_duration` so `-w 0` maps to an immediate (zero)
+    // timeout rather than the generic `timeout_duration` 5 s clamp.
+    let client = PvaClient::builder()
+        .timeout(epics_pva_rs::cli::wait_timeout_duration(args.timeout))
+        .build();
+
+    // pvxs `-v` prints the context's effective config once, before any
+    // operation and before the pvRequest is parsed (tools/get.cpp:100-110).
+    // It is a diagnostic, not an output-format switch — the value
+    // formatter stays under `-M`.
     if args.verbose > 0 {
-        cli::print_effective_config();
+        cli::print_effective_config(&client);
     }
 
     // Parse the pvRequest once with the strict pvxs grammar, so the
@@ -117,23 +129,16 @@ async fn main() {
             match PvRequestExpr::parse_pvxs_compat(trimmed) {
                 Ok(req) => Some(req),
                 Err(e) => {
-                    eprintln!("error: invalid pvRequest {:?}: {e}", args.request);
+                    epics_libcom_rs::stderr_println!(
+                        "error: invalid pvRequest {:?}: {e}",
+                        args.request
+                    );
                     std::process::exit(1);
                 }
             }
         }
     };
 
-    // Build the client with the parsed `-w` as the operation timeout,
-    // applied once at construction so every op path uses the same owner.
-    // pvxs `pvxget` waits for completion with `done.wait(timeout)`
-    // (tools/get.cpp:72,132), and `epicsEvent::wait(0)` is `tryWait()` —
-    // an immediate poll (epicsEvent.h:101-107). Route `-w` through
-    // `wait_timeout_duration` so `-w 0` maps to an immediate (zero)
-    // timeout rather than the generic `timeout_duration` 5 s clamp.
-    let client = PvaClient::builder()
-        .timeout(epics_pva_rs::cli::wait_timeout_duration(args.timeout))
-        .build();
     let mode = args.mode.as_str();
 
     // Start a GET for every PV before awaiting any, then print each PV's
@@ -149,6 +154,7 @@ async fn main() {
     // stays self-identifying — exactly as pvxs prints `argv[n]` first.
     let names: Vec<&str> = args.pv_names.iter().map(String::as_str).collect();
     let mut failed = false;
+    let mut outstanding = 0usize;
     client
         .pvget_many_full_streaming(&names, request.as_ref(), |idx, result| {
             let pv_name = &args.pv_names[idx];
@@ -192,13 +198,20 @@ async fn main() {
                     };
                     print!("{output}");
                 }
+                // pvxs prints no line per PV for a timeout, only the count
+                // (tools/get.cpp:136-138).
+                Err(epics_pva_rs::error::PvaError::Timeout) => outstanding += 1,
                 Err(e) => {
-                    eprintln!("{pv_name}: {e}");
+                    epics_libcom_rs::stderr_println!("{pv_name}: {e}");
                     failed = true;
                 }
             }
         })
         .await;
+    if outstanding > 0 {
+        epics_libcom_rs::stderr_println!("Timeout with {outstanding} outstanding");
+        std::process::exit(1);
+    }
     if failed {
         std::process::exit(1);
     }

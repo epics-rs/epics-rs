@@ -1,0 +1,57 @@
+########################################################################
+# Protocol file for the XIA PFCU 4 filter controller
+#
+# Author: M. Wyman (APS)
+# Date: March 2023
+########################################################################
+
+Terminator = CR;
+ExtraInput = Ignore;
+timeout = 2000;
+ReadTimeout = 500;
+
+setMode {
+  out "!PFCU\$1 {4|2}";
+  in  "\%PFCU\$1 OK Shutter Mode %{Disabled|Enabled} DONE\;";
+}
+
+stateRead {
+  in  "\%PFCU\$1 OK %(\$2filter1_RBV)1s%(\$2filter2_RBV)1s%(\$2filter3_RBV)1s%(\$2filter4_RBV)1s DONE\;";
+}
+
+setState {
+  out "!PFCU\$1 W %4.4s";
+  stateRead;
+#  stateRead(\$1, \$2);
+#  in  "\%PFCU\$1 OK %(\$2filter1_RBV)1.1s%(\$2filter2_RBV)1.1s%(\$2filter3_RBV)1.1s%(\$2filter4_RBV)1.1s DONE\;";
+}
+
+getState {
+  out "!PFCU\$1 P";
+  stateRead;
+#  stateRead(\$1, \$2);
+#  in  "\%PFCU\$1 OK %(\$2filter1_RBV)1.1s%(\$2filter2_RBV)1.1s%(\$2filter3_RBV)1.1s%(\$2filter4_RBV)1.1s DONE\;";
+}
+
+
+setControl {
+  out "!PFCU\$1 {L|U}";
+  in  "\%PFCU\$1 OK %{Locked|Unlocked} DONE\;";
+}
+
+sysReport {
+	out "!PFCU\$1 S";
+	in "\%PFCU\$1 OK %100c";
+}
+
+fault {
+  out "!PFCU\$1 F";
+  stateRead;
+#  stateRead(\$1, \$2);
+}
+
+clear {
+  out "!PFCU\$1 Z";
+  stateRead;
+#  stateRead(\$1, \$2);
+}

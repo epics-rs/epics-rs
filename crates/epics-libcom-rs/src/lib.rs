@@ -18,6 +18,9 @@
 //! * [`net`] — the EPICS protocols' shared socket layer: per-NIC async UDP,
 //!   interface enumeration, loopback multicast. Host-only; the wire constants
 //!   beside it compile for every target, RTEMS included.
+//! * [`cfmt`] — [`CFloat`](cfmt::CFloat), C `printf`'s `%f` / `%e` / `%g`
+//!   over a double, glibc's `nan` / `-nan` / `inf` spellings included, and
+//!   glibc's printf one conversion at a time.
 //! * [`walltime`] — [`WallTime`](walltime::WallTime), the wall-clock instant
 //!   `runtime::time` returns. It lived in `epics_base_rs::types` and moved down
 //!   with its producer; `epics-base-rs` re-exports it at `types::WallTime`.
@@ -77,6 +80,10 @@
 //! Citations into non-EPICS sources (libc, RTEMS, `rtems-libbsd`, VxWorks,
 //! vendored third-party) are outside this table and carry no pin.
 
+#![cfg_attr(
+    test,
+    allow(clippy::disallowed_macros, reason = "tests may keep eprintln!")
+)]
 // The three `epics-base-rs` crate-level allows this code was written under and
 // still needs — `collapsible_if` and `manual_range_contains` in `runtime`,
 // `io_other_error` in `net`. Narrowed to those three rather than inherited
@@ -108,6 +115,7 @@ compile_error!(
 // `epics-base-rs`'s alias for the same macro.
 extern crate self as epics_libcom_rs;
 
+pub mod cfmt;
 pub mod net;
 pub mod runtime;
 pub mod shared_array;

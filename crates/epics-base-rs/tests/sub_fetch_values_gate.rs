@@ -30,7 +30,7 @@
 use std::sync::Arc;
 
 use epics_base_rs::server::database::PvDatabase;
-use epics_base_rs::server::record::{Record, SubroutineFn};
+use epics_base_rs::server::record::{Record, Subroutine, SubroutineFn};
 use epics_base_rs::server::records::ai::AiRecord;
 use epics_base_rs::server::records::asub_record::ASubRecord;
 use epics_base_rs::server::records::sub_record::SubRecord;
@@ -59,26 +59,28 @@ async fn sub_db(inpb: &str) -> PvDatabase {
     // SNAM before the add: C applies every `field()` line and only then runs
     // `init_record`, which parks PACT for good when SNAM is empty
     // (subRecord.c:119-123).
+    // The links too: a link field written after the add bypasses the link
+    // its slot opened.
     let mut seed = SubRecord::default();
     seed.put_field("SNAM", EpicsValue::String("sum_a_c".into()))
+        .unwrap();
+    seed.put_field("INPA", EpicsValue::String("SRCA".into()))
+        .unwrap();
+    if !inpb.is_empty() {
+        seed.put_field("INPB", EpicsValue::String(inpb.into()))
+            .unwrap();
+    }
+    seed.put_field("INPC", EpicsValue::String("SRCC".into()))
         .unwrap();
     db.add_record("SUB", Box::new(seed)).await.unwrap();
 
     let arc = db.get_record("SUB").unwrap();
     let mut inst = arc.write();
     let r = &mut inst.record;
-    r.put_field("INPA", EpicsValue::String("SRCA".into()))
-        .unwrap();
-    if !inpb.is_empty() {
-        r.put_field("INPB", EpicsValue::String(inpb.into()))
-            .unwrap();
-    }
-    r.put_field("INPC", EpicsValue::String("SRCC".into()))
-        .unwrap();
     // Stale "previous cycle" values the C gate must preserve.
     r.put_field("C", EpicsValue::Double(99.0)).unwrap();
     r.put_field("VAL", EpicsValue::Double(-1.0)).unwrap();
-    inst.subroutine = Some(Arc::new(sum_a_c()));
+    inst.subroutine = Some(Arc::new(Subroutine::Plain(sum_a_c())));
     drop(inst);
     db
 }
@@ -90,7 +92,10 @@ async fn r9_69_failed_inpn_read_skips_the_subroutine_and_freezes_val() {
     let db = sub_db("NOSUCHPV").await;
 
     let mut v = epics_base_rs::server::database::ProcStack::new();
-    db.process_record_with_links("SUB", &mut v).await.unwrap();
+    db.process_record_with_links("SUB", &mut v)
+        .await
+        .or_else(epics_base_rs::error::CaError::unless_process_status)
+        .unwrap();
 
     let arc = db.get_record("SUB").unwrap();
     let inst = arc.read();
@@ -141,9 +146,12 @@ async fn r9_69_asub_failed_inpn_read_skips_the_subroutine() {
     db.add_record("SRCA", Box::new(AiRecord::new(10.0)))
         .await
         .unwrap();
-    db.add_record("ASUB", Box::new(ASubRecord::default()))
-        .await
+    let mut seed = ASubRecord::default();
+    seed.put_field("INPA", EpicsValue::String("SRCA".into()))
         .unwrap();
+    seed.put_field("INPB", EpicsValue::String("NOSUCHPV".into()))
+        .unwrap();
+    db.add_record("ASUB", Box::new(seed)).await.unwrap();
 
     {
         let arc = db.get_record("ASUB").unwrap();
@@ -151,15 +159,11 @@ async fn r9_69_asub_failed_inpn_read_skips_the_subroutine() {
         let r = &mut inst.record;
         r.put_field("SNAM", EpicsValue::String("ran".into()))
             .unwrap();
-        r.put_field("INPA", EpicsValue::String("SRCA".into()))
-            .unwrap();
-        r.put_field("INPB", EpicsValue::String("NOSUCHPV".into()))
-            .unwrap();
         r.put_field("VAL", EpicsValue::Double(-1.0)).unwrap();
         // Returns 7: had the subroutine run, the framework would publish the
         // status as aSub's VAL (C `aSubRecord.c:224` `prec->val = status`).
         let sub_fn: SubroutineFn = Box::new(|_rec: &mut dyn Record| Ok(7));
-        inst.subroutine = Some(Arc::new(sub_fn));
+        inst.subroutine = Some(Arc::new(Subroutine::Plain(sub_fn)));
     }
 
     let mut v = epics_base_rs::server::database::ProcStack::new();

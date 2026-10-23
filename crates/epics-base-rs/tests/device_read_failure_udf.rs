@@ -52,6 +52,7 @@ use epics_base_rs::server::record::{AlarmSeverity, Record};
 use epics_base_rs::types::{DbFieldType, EpicsValue};
 
 use epics_base_rs::error::CaResult;
+use epics_base_rs::server::record::{DbLinkType, DevSup, Dset};
 
 const REC: &str = "TEST:AVG";
 
@@ -114,6 +115,15 @@ impl DeviceSupport for ScriptedDevice {
     }
 }
 
+/// The `device()` line a C IOC's `.dbd` would carry for `scriptedRead`: a
+/// `.db` may name only a device-menu choice.
+static SCRIPTED_ROW: DevSup = DevSup {
+    name: "devScripted",
+    choice: "scriptedRead",
+    link_type: DbLinkType::Constant,
+    dset: Dset::new(6, &[3], false),
+};
+
 /// One record of `record_type` whose device support replays `script`, freshly
 /// built so UDF starts at 1 — the state `iocInit` leaves behind and the state
 /// asyn's empty-average arm re-asserts.
@@ -127,14 +137,17 @@ async fn build(
     let db =
         format!(r#"record({record_type}, "{REC}") {{ field(DTYP, "scriptedRead") {fields} }}"#);
     let (database, _) = IocBuilder::new()
-        .register_dynamic_device_support(move |ctx: &DeviceSupportContext| {
-            (ctx.dtyp == "scriptedRead").then(|| {
-                Box::new(ScriptedDevice {
-                    script: Arc::clone(&script),
-                    sourced: sourced.clone(),
-                }) as Box<dyn DeviceSupport>
-            })
-        })
+        .register_dynamic_device_support(
+            &[(record_type, std::slice::from_ref(&SCRIPTED_ROW))],
+            move |ctx: &DeviceSupportContext| {
+                (ctx.dtyp == "scriptedRead").then(|| {
+                    Box::new(ScriptedDevice {
+                        script: Arc::clone(&script),
+                        sourced: sourced.clone(),
+                    }) as Box<dyn DeviceSupport>
+                })
+            },
+        )
         .db_string(&db, &HashMap::new())
         .unwrap()
         .build()
@@ -158,6 +171,7 @@ async fn process(db: &Arc<PvDatabase>) {
     let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links(REC, &mut visited)
         .await
+        .or_else(epics_base_rs::error::CaError::unless_process_status)
         .unwrap();
 }
 

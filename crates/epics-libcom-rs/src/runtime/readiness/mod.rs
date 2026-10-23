@@ -137,9 +137,8 @@ enum ActiveBackend {
 impl ActiveBackend {
     /// Choose, open, and say which — on RTEMS, where there is a choice.
     ///
-    /// The line is an `eprintln!` from the construction path for the same
-    /// reason [`report_lock_protocol`](crate::runtime::sync::report_lock_protocol)
-    /// is one: the RTEMS target has no iocsh to ask afterwards, and a
+    /// The line is an `eprintln!` from the construction path because the
+    /// RTEMS target has no iocsh to ask afterwards, and a
     /// diagnostic that reports which guarantee the process got must not
     /// itself depend on a `tracing` subscriber being installed and unfiltered.
     /// It is printed after the backend opened, so it never names one that
@@ -157,7 +156,7 @@ impl ActiveBackend {
         } else {
             (Self::Select(select::SelectBackend::new()?), "select")
         };
-        eprintln!("epics-rs: readiness poller {poller}: {name} backend ({why})");
+        crate::stderr_println!("epics-rs: readiness poller {poller}: {name} backend ({why})");
         Ok(backend)
     }
 
@@ -222,13 +221,13 @@ unsafe extern "C" {
 /// [`ActiveBackend::new`] prints names the rule that was actually applied.
 #[cfg(target_os = "rtems")]
 fn rtems_kqueue_usable() -> (bool, String) {
-    if let Some(raw) = super::env::get("EPICS_RTEMS_KQUEUE") {
+    if let Some(raw) = super::env::get_lossy("EPICS_RTEMS_KQUEUE") {
         if let Some(forced) = parse_override(&raw) {
             return (forced, format!("EPICS_RTEMS_KQUEUE={}", raw.trim()));
         }
         // Not a third answer (see `parse_override`), but the operator set
         // something and is owed the reason it did nothing.
-        eprintln!(
+        crate::stderr_println!(
             "epics-rs: EPICS_RTEMS_KQUEUE={} is neither 1/yes/true nor 0/no/false; \
              the RTEMS version rule decides",
             raw.trim()
@@ -707,7 +706,9 @@ fn poll_loop(inner: &Arc<Inner>) {
                 // `eprintln!` for the reason `ActiveBackend::new` uses it: a
                 // poller dying is a diagnostic that must not depend on a
                 // `tracing` subscriber being installed.
-                eprintln!("epics-rs: readiness poller cannot wait, shutting down: {e}");
+                crate::stderr_println!(
+                    "epics-rs: readiness poller cannot wait, shutting down: {e}"
+                );
                 break;
             }
         }

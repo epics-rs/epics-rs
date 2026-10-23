@@ -13,7 +13,10 @@
 //! VAL) and as `pvxput` refusing the drive with "Unable to assign string[]
 //! with String".
 
-use epics_base_rs::server::record::{FieldDeclaration, Record};
+use epics_base_rs::server::database::char_view::{DollarView, plain_re_view, pvxs_form_string};
+use epics_base_rs::server::database::filters::FilterChain;
+use epics_base_rs::server::database::is_value_field;
+use epics_base_rs::server::record::{FieldDeclaration, Record, RecordInstance};
 use epics_base_rs::types::{DbFieldType, EpicsValue, PvString};
 
 /// The shape a channel serves, from its element count alone.
@@ -39,16 +42,6 @@ pub enum ChannelShape {
 /// answer for a plain scalar field (one) and for a `SPC_DBADDR` field whose
 /// record declares no `cvt_dbaddr` capacity (`histogram` VAL, whose buffer is
 /// always `NELM` long).
-/// Whether `field_upper` is one of the record's long-string fields
-/// (`lsi`/`lso` VAL+OVAL, `printf` VAL), matched as
-/// [`Record::long_string_fields`] specifies.
-fn is_long_string(record: &dyn Record, field_upper: &str) -> bool {
-    record
-        .long_string_fields()
-        .iter()
-        .any(|f| f.eq_ignore_ascii_case(field_upper))
-}
-
 pub fn channel_final_elements(
     record: &dyn Record,
     field_upper: &str,
@@ -60,28 +53,40 @@ pub fn channel_final_elements(
 }
 
 impl ChannelShape {
-    /// Classify the channel bound to `record.field_upper`. `resolved` is the
-    /// value that channel serves (`client_field_value`, i.e. already
-    /// projected onto the field's declared type).
-    pub fn of_channel(
-        record: &dyn Record,
-        field_upper: &str,
-        resolved: Option<&EpicsValue>,
-    ) -> Self {
-        // A long-string field is never a scalar channel. C's `cvt_dbaddr`
-        // gives it `no_elements = SIZV` (`lsiRecord.c:127-134`), never 1, and
-        // pvxs reaches its long-string arms (`putLongString`,
-        // `iocsource.cpp:602-603`) precisely BECAUSE the channel is not
-        // scalar-shaped. This port models that storage as a `String` — count
-        // 1 — so the count is not what can answer here; the declaration is.
-        if is_long_string(record, field_upper) {
-            return ChannelShape::Array;
-        }
-        if channel_final_elements(record, field_upper, resolved) == 1 {
+    /// The shape of a channel whose filter chain leaves `final_elements`.
+    pub fn of_count(final_elements: usize) -> Self {
+        if final_elements == 1 {
             ChannelShape::Scalar
         } else {
             ChannelShape::Array
         }
+    }
+
+    /// Classify the channel bound to `record.field_upper` through its filter
+    /// chain `filters`, whose `arr` reshapes the count as its
+    /// `channel_report` does. `resolved` is the value that channel serves
+    /// (`client_field_value`, i.e. already projected onto the field's
+    /// declared type).
+    pub fn of_channel(
+        record: &dyn Record,
+        field_upper: &str,
+        resolved: Option<&EpicsValue>,
+        filters: &FilterChain,
+    ) -> Self {
+        // A long-string field is never a scalar channel. C's `cvt_dbaddr`
+        // gives it `no_elements = 1`, but pvxs reshapes a `DBF_STRING` wider
+        // than `MAX_STRING_SIZE` into a `SIZV`-element `DBF_CHAR` channel
+        // (`ioc/channel.cpp:58-67`) and reaches its long-string arms
+        // (`putLongString`, `iocsource.cpp:602-603`) BECAUSE of that, so the
+        // count is not what can answer here; the declaration is.
+        if record.field_is_long_string(field_upper) {
+            return ChannelShape::Array;
+        }
+        Self::of_count(filters.final_element_count(channel_final_elements(
+            record,
+            field_upper,
+            resolved,
+        ) as usize))
     }
 
     /// [`Self::of_channel`] for a live record, resolving the field's value
@@ -96,14 +101,18 @@ impl ChannelShape {
     pub fn of_record_channel(
         instance: &epics_base_rs::server::record::RecordInstance,
         field_upper: &str,
+        filters: &FilterChain,
     ) -> Self {
+        if instance.record.field_is_long_string(field_upper) {
+            return ChannelShape::Array;
+        }
         match instance.record.field_native_count(field_upper) {
-            Some(1) => ChannelShape::Scalar,
-            Some(_) => ChannelShape::Array,
+            Some(n) => Self::of_count(filters.final_element_count(n as usize)),
             None => Self::of_channel(
                 &*instance.record,
                 field_upper,
                 instance.client_field_value(field_upper).as_ref(),
+                filters,
             ),
         }
     }
@@ -166,5 +175,90 @@ impl ChannelShape {
         if let Some(v) = self.collapsed(&snap.value) {
             snap.value = v;
         }
+    }
+}
+
+/// pvxs `getChannelValueType` (`ioc/iocsource.cpp:619-643`) for a record
+/// channel without `$`: the one answer its read, its descriptor and its put
+/// take, in both servers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelValue {
+    /// `fromDbrType(final_field_type)` in this shape.
+    Shaped(ChannelShape),
+    /// `TypeCode::String`, `final_field_type == DBR_CHAR && isArray &&
+    /// format == "String"` (`:633`): read through its char address as the
+    /// buffer's text (`:124-136`), a string put is `putLongString`
+    /// (`:601-603`).
+    Text(DollarView),
+    /// A long string with no room past `MAX_STRING_SIZE + 1`, which pvxs
+    /// leaves `DBF_STRING` (`ioc/channel.cpp:58-60`): the buffer read to its
+    /// NUL.
+    LongStringField,
+}
+
+impl ChannelValue {
+    /// Of the channel on `field_upper` through `filters`, `resolved` being
+    /// the value it serves (`client_field_value`).
+    pub fn of_channel(
+        instance: &RecordInstance,
+        field_upper: &str,
+        resolved: Option<&EpicsValue>,
+        filters: &FilterChain,
+    ) -> Self {
+        Self::decide(instance, field_upper, resolved, filters, || {
+            channel_final_elements(&*instance.record, field_upper, resolved)
+        })
+    }
+
+    /// [`Self::of_channel`] for a live record, which resolves the value only
+    /// for a VAL tagged `Q:form`, whose element type it asks, or for a count
+    /// the declaration does not give ([`ChannelShape::of_record_channel`]).
+    pub fn of_record_channel(
+        instance: &RecordInstance,
+        field_upper: &str,
+        filters: &FilterChain,
+    ) -> Self {
+        let resolved = (is_value_field(field_upper)
+            && instance.get_info("Q:form") == Some("String"))
+        .then(|| instance.client_field_value(field_upper))
+        .flatten();
+        Self::decide(instance, field_upper, resolved.as_ref(), filters, || {
+            instance
+                .record
+                .field_native_count(field_upper)
+                .unwrap_or_else(|| {
+                    let value = instance.client_field_value(field_upper);
+                    channel_final_elements(&*instance.record, field_upper, value.as_ref())
+                })
+        })
+    }
+
+    fn decide(
+        instance: &RecordInstance,
+        field_upper: &str,
+        resolved: Option<&EpicsValue>,
+        filters: &FilterChain,
+        field_elements: impl FnOnce() -> u32,
+    ) -> Self {
+        let view = plain_re_view(instance, field_upper);
+        // Still `DBR_STRING`, whatever its `Q:form`.
+        if view.is_none() && instance.record.field_is_long_string(field_upper) {
+            return Self::LongStringField;
+        }
+        let final_elements = filters.final_element_count(match &view {
+            Some(v) => v.no_elements,
+            None => field_elements() as usize,
+        });
+        let shape = ChannelShape::of_count(final_elements);
+        // `DBR_CHAR`: the reshaped chars, or a `DBF_CHAR` field — the signed
+        // one, as pvxs tests.
+        let chars = view.is_some() || matches!(resolved, Some(EpicsValue::CharArray(_)));
+        if chars
+            && shape.is_array()
+            && pvxs_form_string(instance, field_upper, view.as_ref(), false)
+        {
+            return Self::Text(DollarView::of_text_channel(view.as_ref(), final_elements));
+        }
+        Self::Shaped(shape)
     }
 }

@@ -64,7 +64,7 @@ async fn server_with_double_waveform(
     point_client_at(port);
     let client = CaClient::new().await.expect("client");
     let ch = client.create_channel(pv);
-    ch.wait_connected(budget::FACT_BUDGET)
+    ch.wait_connected(fact_budget::FACT_BUDGET)
         .await
         .expect("connect");
     ch.put(&EpicsValue::DoubleArray(seed.into()))
@@ -96,7 +96,7 @@ async fn server_with_bi(
     point_client_at(port);
     let client = CaClient::new().await.expect("client");
     let ch = client.create_channel(pv);
-    ch.wait_connected(budget::FACT_BUDGET)
+    ch.wait_connected(fact_budget::FACT_BUDGET)
         .await
         .expect("connect");
     (client, ch)
@@ -137,7 +137,7 @@ async fn enum_native_readback_is_numeric_index() {
 
     // The native GET is the plain library API building block.
     let (dbf, value) = ch
-        .get_with_timeout(budget::FACT_BUDGET)
+        .get_with_timeout(fact_budget::FACT_BUDGET)
         .await
         .expect("native get");
     assert_eq!(dbf, DbFieldType::Enum, "native field type is ENUM");
@@ -182,7 +182,7 @@ async fn enum_monitor_as_string_delivers_label() {
         .subscribe_with_mask_enum_as_string(0.0, epics_ca_rs::protocol::DBE_VALUE, true)
         .await
         .expect("subscribe enum-as-string");
-    let snap = tokio::time::timeout(budget::FACT_BUDGET, mon.recv())
+    let snap = tokio::time::timeout(fact_budget::FACT_BUDGET, mon.recv())
         .await
         .expect("monitor event within timeout")
         .expect("monitor stream open")
@@ -207,7 +207,7 @@ async fn enum_monitor_native_delivers_index() {
         .subscribe_with_mask(0.0, epics_ca_rs::protocol::DBE_VALUE)
         .await
         .expect("subscribe native");
-    let snap = tokio::time::timeout(budget::FACT_BUDGET, mon.recv())
+    let snap = tokio::time::timeout(fact_budget::FACT_BUDGET, mon.recv())
         .await
         .expect("monitor event within timeout")
         .expect("monitor stream open")
@@ -243,7 +243,7 @@ async fn enum_monitor_numeric_delivers_index() {
         )
         .await
         .expect("subscribe enum-as-number");
-    let snap = tokio::time::timeout(budget::FACT_BUDGET, mon.recv())
+    let snap = tokio::time::timeout(fact_budget::FACT_BUDGET, mon.recv())
         .await
         .expect("monitor event within timeout")
         .expect("monitor stream open")
@@ -328,7 +328,7 @@ async fn long_string_autosize_returns_40_nul_padded() {
     let client = CaClient::new().await.expect("client");
     // The `$` suffix requests the VAL field as a DBR_CHAR array.
     let ch = client.create_channel("R55:LS:AUTO.VAL$");
-    ch.wait_connected(budget::FACT_BUDGET)
+    ch.wait_connected(fact_budget::FACT_BUDGET)
         .await
         .expect("connect to long-string channel");
 
@@ -379,11 +379,13 @@ async fn long_string_count_clamp_trims_char_array() {
     point_client_at(port);
     let client = CaClient::new().await.expect("client");
     let ch = client.create_channel("R55:LS:CLAMP.VAL$");
-    ch.wait_connected(budget::FACT_BUDGET)
+    ch.wait_connected(fact_budget::FACT_BUDGET)
         .await
         .expect("connect to long-string channel");
 
-    // count=3 must trim the 40-element char array to 3 bytes "hel".
+    // count=3 reads "he" and its NUL: `dbGet` writes the NUL at
+    // `nRequest - 1` for a DBF_STRING field (`dbAccess.c:1040-1044`);
+    // softIoc R7.0.10 answers `caget -d DBR_CHAR -# 3 SI.VAL$` with 104 101 0.
     let snap = ch
         .get_with_dbr_type(DBR_CHAR, 3)
         .await
@@ -401,10 +403,7 @@ async fn long_string_count_clamp_trims_char_array() {
         "`caget -# 3 PV.VAL$` must return 3 bytes; got {}",
         bytes.len()
     );
-    assert_eq!(
-        bytes, b"hel",
-        "trimmed content must be first 3 chars of string"
-    );
+    assert_eq!(bytes, b"he\0", "the NUL lands at element nRequest - 1");
 }
 
 /// A long-string *record* field accessed plainly (no `$`) must advertise
@@ -416,21 +415,25 @@ async fn long_string_count_clamp_trims_char_array() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn printf_val_native_type_is_scalar_dbr_string() {
-    let mut rec = PrintfRecord::default();
-    rec.val = "log: 42".to_string();
     let server = CaServer::builder()
         .port(0)
-        .record("R3C2:PF:VAL", rec)
+        .record("R3C2:PF:VAL", PrintfRecord::default())
         .build()
         .await
         .expect("build CA server");
+    // VAL is the formatted FMT, written by a process after init_record.
+    let db = server.database().clone();
+    db.put_pv("R3C2:PF:VAL.FMT", EpicsValue::String("log: 42".into()))
+        .await
+        .unwrap();
+    db.process_record("R3C2:PF:VAL").await.unwrap();
     let port = server.udp_port();
     let _h = tokio::spawn(async move { server.run().await });
 
     point_client_at(port);
     let client = CaClient::new().await.expect("client");
     let ch = client.create_channel("R3C2:PF:VAL");
-    ch.wait_connected(budget::FACT_BUDGET)
+    ch.wait_connected(fact_budget::FACT_BUDGET)
         .await
         .expect("connect to printf VAL channel");
 
@@ -459,7 +462,7 @@ async fn printf_val_native_type_is_scalar_dbr_string() {
 
 /// lsi/lso VAL & OVAL share the same long-string carrier and the same C
 /// `cvt_dbaddr` scalar-DBF_STRING presentation (lsiRecord.c:141-143).
-/// The CA boundary keys on the record's `long_string_fields()`, so the
+/// The CA boundary keys on the field.s `FieldDesc::long_string`, so the
 /// whole family — not just printf — reports native DBF_STRING/1. An
 /// over-40-char value clips to the 40-byte DBR_STRING slot exactly as C
 /// does (the full value is reachable only via the `$` modifier).
@@ -470,17 +473,26 @@ async fn lsi_val_native_type_is_scalar_dbr_string_and_clips() {
     let long = "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHI";
     let server = CaServer::builder()
         .port(0)
-        .record("R3C2:LSI:VAL", LsiRecord::new(long))
+        .record("R3C2:LSI:VAL", LsiRecord::new(""))
         .build()
         .await
         .expect("build CA server");
+    // After init_record, which empties VAL as C's calloc does.
+    server
+        .database()
+        .put_pv(
+            "R3C2:LSI:VAL",
+            EpicsValue::CharArray(long.as_bytes().into()),
+        )
+        .await
+        .unwrap();
     let port = server.udp_port();
     let _h = tokio::spawn(async move { server.run().await });
 
     point_client_at(port);
     let client = CaClient::new().await.expect("client");
     let ch = client.create_channel("R3C2:LSI:VAL");
-    ch.wait_connected(budget::FACT_BUDGET)
+    ch.wait_connected(fact_budget::FACT_BUDGET)
         .await
         .expect("connect to lsi VAL channel");
 
@@ -504,7 +516,7 @@ async fn lsi_val_native_type_is_scalar_dbr_string_and_clips() {
         ref other => panic!("expected scalar String, got {other:?}"),
     };
     assert!(
-        long.starts_with(&s) && s.len() <= 39,
+        !s.is_empty() && long.starts_with(&s) && s.len() <= 39,
         "lsi VAL plain read must clip to the <=39-char DBR_STRING slot; got {s:?}"
     );
 }
@@ -538,7 +550,7 @@ async fn a_dbr_type_past_the_protocol_bound_never_leaves_the_client() {
     );
     assert!(
         matches!(
-            ch.put_as_dbr_with_timeout(over, &EpicsValue::Short(1), budget::FACT_BUDGET).await,
+            ch.put_as_dbr_with_timeout(over, &EpicsValue::Short(1), fact_budget::FACT_BUDGET).await,
             Err(CaError::UnsupportedType(t)) if t == over
         ),
         "a scalar put-callback past the protocol bound is refused locally"
@@ -559,6 +571,3 @@ async fn a_dbr_type_past_the_protocol_bound_never_leaves_the_client() {
         .expect("the circuit survives a refused request");
     assert_eq!(snap.value, EpicsValue::String("On".into()));
 }
-
-#[path = "common/budget.rs"]
-mod budget;

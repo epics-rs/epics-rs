@@ -7,6 +7,7 @@
 // itself, which the backend does not remove.
 #![allow(clippy::needless_range_loop)]
 
+use asyn_rs::port::InterfaceMask;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -14,6 +15,7 @@ use ad_core_rs::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
 use ad_core_rs::driver::ad_driver::ADDriverBase;
 use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDataType, NDDimension};
 use ad_core_rs::ndarray_pool::NDArrayPool;
+use ad_core_rs::plugin::runtime::ASYN_CANBLOCK;
 use ad_core_rs::plugin::runtime::{NDPluginProcess, PluginRuntimeHandle};
 use ad_core_rs::plugin::wiring::WiringRegistry;
 use ad_plugins_rs::stats::create_stats_runtime;
@@ -44,9 +46,15 @@ fn wait_until(what: &str, mut cond: impl FnMut() -> bool) {
 fn test_driver_to_stats_pipeline() {
     let pool = ad_core_rs::ndarray_pool::NDArrayPool::new(10_000_000);
     let wiring = Arc::new(WiringRegistry::new());
-    let ts_registry = ad_plugins_rs::time_series::TsReceiverRegistry::new();
-    let (stats_handle, stats_data, _params, _jh) =
-        create_stats_runtime("STATS1", pool.clone(), 10, "SIM1", wiring, &ts_registry);
+    let (stats_handle, stats_data, _params, _jh) = create_stats_runtime(
+        &asyn_rs::asyn_record::claim_port("STATS1").unwrap(),
+        pool.max_memory(),
+        10,
+        0,
+        "SIM1",
+        wiring,
+        ad_core_rs::plugin::runtime::DEFAULT_PLUGIN_THREADS,
+    );
 
     // Plugins default to disabled — enable for test
     stats_handle
@@ -56,7 +64,20 @@ fn test_driver_to_stats_pipeline() {
         .unwrap();
     params_applied(&stats_handle);
 
-    let mut driver = ADDriverBase::new("SIM1", 64, 64, 10_000_000).unwrap();
+    let mut driver = ADDriverBase::new(
+        "SIM1",
+        1,
+        10_000_000,
+        ASYN_CANBLOCK,
+        InterfaceMask::UNMIGRATED_SUBCLASS,
+        InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
+    )
+    .unwrap();
+    // The ArrayCallbacks record's PINI; the driver leaves it undefined.
+    driver
+        .port_base
+        .set_int32_param(driver.params.base.array_callbacks, 0, 1)
+        .unwrap();
     driver.connect_downstream(stats_handle.array_sender().clone());
 
     let mut arr = driver
@@ -73,7 +94,7 @@ fn test_driver_to_stats_pipeline() {
         }
     }
 
-    let to_publish = driver.prepare_array(Arc::new(arr)).unwrap().unwrap();
+    let to_publish = driver.prepare_array(arr).unwrap().unwrap();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -93,8 +114,15 @@ fn test_driver_to_stats_pipeline() {
 fn test_driver_to_std_arrays_pipeline() {
     let pool = ad_core_rs::ndarray_pool::NDArrayPool::new(10_000_000);
     let wiring = Arc::new(WiringRegistry::new());
-    let (image_handle, image_data, _jh) =
-        create_std_arrays_runtime("IMAGE1", pool.clone(), "SIM1", wiring);
+    let (image_handle, image_data, _jh) = create_std_arrays_runtime(
+        &asyn_rs::asyn_record::claim_port("IMAGE1").unwrap(),
+        pool.max_memory(),
+        1,
+        0,
+        "SIM1",
+        wiring,
+        ad_core_rs::plugin::runtime::DEFAULT_PLUGIN_THREADS,
+    );
 
     // Plugins default to disabled — enable for test
     image_handle
@@ -104,7 +132,20 @@ fn test_driver_to_std_arrays_pipeline() {
         .unwrap();
     params_applied(&image_handle);
 
-    let mut driver = ADDriverBase::new("SIM1", 32, 32, 10_000_000).unwrap();
+    let mut driver = ADDriverBase::new(
+        "SIM1",
+        1,
+        10_000_000,
+        ASYN_CANBLOCK,
+        InterfaceMask::UNMIGRATED_SUBCLASS,
+        InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
+    )
+    .unwrap();
+    // The ArrayCallbacks record's PINI; the driver leaves it undefined.
+    driver
+        .port_base
+        .set_int32_param(driver.params.base.array_callbacks, 0, 1)
+        .unwrap();
     driver.connect_downstream(image_handle.array_sender().clone());
 
     let arr = driver
@@ -116,7 +157,7 @@ fn test_driver_to_std_arrays_pipeline() {
         .unwrap();
 
     let id = arr.unique_id;
-    let to_publish = driver.prepare_array(Arc::new(arr)).unwrap().unwrap();
+    let to_publish = driver.prepare_array(arr).unwrap().unwrap();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -187,6 +228,9 @@ fn test_rewire_ndarray_port_at_runtime() {
         last_id: Arc<parking_lot::Mutex<i32>>,
     }
     impl NDPluginProcess for TrackingProcessor {
+        const ASYN_FLAGS: asyn_rs::port::PortFlags = ad_core_rs::plugin::runtime::ASYN_CANBLOCK;
+        const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+        const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS;
         fn process_array(
             &self,
             array: &Arc<ad_core_rs::ndarray::NDArray>,
@@ -205,10 +249,19 @@ fn test_rewire_ndarray_port_at_runtime() {
         last_id: last_id.clone(),
     };
 
-    let (handle, _jh) = create_plugin_runtime("STATS1", proc, pool, 10, "SIM1", wiring.clone());
+    let (handle, _jh) = create_plugin_runtime(
+        &asyn_rs::asyn_record::claim_port("STATS1").unwrap(),
+        proc,
+        pool.max_memory(),
+        10,
+        0,
+        "SIM1",
+        wiring.clone(),
+        ad_core_rs::plugin::runtime::DEFAULT_PLUGIN_THREADS,
+    );
 
     // Wire STATS1 → SIM1
-    wiring.rewire(handle.array_sender(), "", "SIM1").unwrap();
+    wiring.subscribe(handle.array_sender(), "SIM1", 0).unwrap();
 
     // Enable callbacks
     handle
@@ -221,7 +274,13 @@ fn test_rewire_ndarray_port_at_runtime() {
     // Send array from SIM1
     let mut arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
     arr.unique_id = 100;
-    rt.block_on(sim_publisher.publish(Arc::new(arr)));
+    rt.block_on(
+        sim_publisher.publish(
+            ad_core_rs::ndarray_pool::DriverPool::standalone(0)
+                .alloc_copy(&arr)
+                .unwrap(),
+        ),
+    );
     wait_until("STATS1 to receive array from SIM1", || {
         *last_id.lock() == 100
     });
@@ -244,7 +303,13 @@ fn test_rewire_ndarray_port_at_runtime() {
     // STATS1's sender and delivery is impossible — no wait needed.
     let mut arr2 = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
     arr2.unique_id = 200;
-    rt.block_on(sim_publisher.publish(Arc::new(arr2)));
+    rt.block_on(
+        sim_publisher.publish(
+            ad_core_rs::ndarray_pool::DriverPool::standalone(0)
+                .alloc_copy(&arr2)
+                .unwrap(),
+        ),
+    );
     assert_eq!(
         *last_id.lock(),
         100,
@@ -254,7 +319,13 @@ fn test_rewire_ndarray_port_at_runtime() {
     // Send array from ROI1 — should reach STATS1
     let mut arr3 = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
     arr3.unique_id = 300;
-    rt.block_on(roi_publisher.publish(Arc::new(arr3)));
+    rt.block_on(
+        roi_publisher.publish(
+            ad_core_rs::ndarray_pool::DriverPool::standalone(0)
+                .alloc_copy(&arr3)
+                .unwrap(),
+        ),
+    );
     wait_until("STATS1 to receive from ROI1 after rewire", || {
         *last_id.lock() == 300
     });
@@ -300,16 +371,18 @@ fn test_rewire_through_real_roi_plugin() {
         auto_size: false,
     };
     let (roi_handle, _roi_jh) = create_plugin_runtime(
-        "ROI1",
+        &asyn_rs::asyn_record::claim_port("ROI1").unwrap(),
         ROIProcessor::new(roi_config),
-        pool.clone(),
+        pool.max_memory(),
         10,
+        0,
         "SIM1",
         wiring.clone(),
+        ad_core_rs::plugin::runtime::DEFAULT_PLUGIN_THREADS,
     );
     wiring.register_output("ROI1", roi_handle.array_output().clone());
     wiring
-        .rewire(roi_handle.array_sender(), "", "SIM1")
+        .subscribe(roi_handle.array_sender(), "SIM1", 0)
         .unwrap();
 
     // Enable ROI1
@@ -325,6 +398,9 @@ fn test_rewire_through_real_roi_plugin() {
         last_id: Arc<parking_lot::Mutex<i32>>,
     }
     impl NDPluginProcess for TrackingProcessor {
+        const ASYN_FLAGS: asyn_rs::port::PortFlags = ad_core_rs::plugin::runtime::ASYN_CANBLOCK;
+        const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+        const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS;
         fn process_array(
             &self,
             array: &Arc<ad_core_rs::ndarray::NDArray>,
@@ -343,11 +419,19 @@ fn test_rewire_through_real_roi_plugin() {
         last_id: last_id.clone(),
     };
 
-    let (stats_handle, _stats_jh) =
-        create_plugin_runtime("STATS1", proc, pool.clone(), 10, "SIM1", wiring.clone());
+    let (stats_handle, _stats_jh) = create_plugin_runtime(
+        &asyn_rs::asyn_record::claim_port("STATS1").unwrap(),
+        proc,
+        pool.max_memory(),
+        10,
+        0,
+        "SIM1",
+        wiring.clone(),
+        ad_core_rs::plugin::runtime::DEFAULT_PLUGIN_THREADS,
+    );
     wiring.register_output("STATS1", stats_handle.array_output().clone());
     wiring
-        .rewire(stats_handle.array_sender(), "", "SIM1")
+        .subscribe(stats_handle.array_sender(), "SIM1", 0)
         .unwrap();
 
     // Enable STATS1
@@ -364,7 +448,13 @@ fn test_rewire_through_real_roi_plugin() {
         NDDataType::UInt8,
     );
     arr.unique_id = 100;
-    rt.block_on(sim_publisher.publish(Arc::new(arr)));
+    rt.block_on(
+        sim_publisher.publish(
+            ad_core_rs::ndarray_pool::DriverPool::standalone(0)
+                .alloc_copy(&arr)
+                .unwrap(),
+        ),
+    );
     wait_until("STATS1 to get the array from SIM1", || {
         *last_id.lock() == 100
     });
@@ -390,7 +480,13 @@ fn test_rewire_through_real_roi_plugin() {
         NDDataType::UInt8,
     );
     arr2.unique_id = 200;
-    rt.block_on(sim_publisher.publish(Arc::new(arr2)));
+    rt.block_on(
+        sim_publisher.publish(
+            ad_core_rs::ndarray_pool::DriverPool::standalone(0)
+                .alloc_copy(&arr2)
+                .unwrap(),
+        ),
+    );
     wait_until("STATS1 to receive the new array through ROI1", || {
         *last_id.lock() != 100
     });
@@ -415,11 +511,18 @@ fn test_roi_param_change_enables_output() {
     let sim_publisher = ArrayPublisher::new(sim_output.clone());
 
     // Create ROI1 with DEFAULT config (size=0) — like the real IOC
-    let (roi_handle, roi_params, _roi_jh) =
-        ad_plugins_rs::roi::create_roi_runtime("ROI1", pool.clone(), 10, "SIM1", wiring.clone());
+    let (roi_handle, roi_params, _roi_jh) = ad_plugins_rs::roi::create_roi_runtime(
+        &asyn_rs::asyn_record::claim_port("ROI1").unwrap(),
+        pool.max_memory(),
+        10,
+        0,
+        "SIM1",
+        wiring.clone(),
+        ad_core_rs::plugin::runtime::DEFAULT_PLUGIN_THREADS,
+    );
     wiring.register_output("ROI1", roi_handle.array_output().clone());
     wiring
-        .rewire(roi_handle.array_sender(), "", "SIM1")
+        .subscribe(roi_handle.array_sender(), "SIM1", 0)
         .unwrap();
 
     // Enable ROI1
@@ -435,6 +538,9 @@ fn test_roi_param_change_enables_output() {
         last_id: Arc<parking_lot::Mutex<i32>>,
     }
     impl NDPluginProcess for TrackingProcessor {
+        const ASYN_FLAGS: asyn_rs::port::PortFlags = ad_core_rs::plugin::runtime::ASYN_CANBLOCK;
+        const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+        const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS;
         fn process_array(
             &self,
             array: &Arc<ad_core_rs::ndarray::NDArray>,
@@ -452,11 +558,19 @@ fn test_roi_param_change_enables_output() {
     let proc = TrackingProcessor {
         last_id: last_id.clone(),
     };
-    let (stats_handle, _jh) =
-        create_plugin_runtime("STATS1", proc, pool.clone(), 10, "ROI1", wiring.clone());
+    let (stats_handle, _jh) = create_plugin_runtime(
+        &asyn_rs::asyn_record::claim_port("STATS1").unwrap(),
+        proc,
+        pool.max_memory(),
+        10,
+        0,
+        "ROI1",
+        wiring.clone(),
+        ad_core_rs::plugin::runtime::DEFAULT_PLUGIN_THREADS,
+    );
     wiring.register_output("STATS1", stats_handle.array_output().clone());
     wiring
-        .rewire(stats_handle.array_sender(), "", "ROI1")
+        .subscribe(stats_handle.array_sender(), "ROI1", 0)
         .unwrap();
     stats_handle
         .port_runtime()
@@ -473,7 +587,13 @@ fn test_roi_param_change_enables_output() {
         NDDataType::UInt8,
     );
     arr.unique_id = 100;
-    rt.block_on(sim_publisher.publish(Arc::new(arr)));
+    rt.block_on(
+        sim_publisher.publish(
+            ad_core_rs::ndarray_pool::DriverPool::standalone(0)
+                .alloc_copy(&arr)
+                .unwrap(),
+        ),
+    );
     // ROI size=0 clamps to a 1-pixel ROI (C++ MAX(size,1)) and still emits.
     wait_until("STATS1 to receive the 1-pixel ROI output", || {
         *last_id.lock() == 100
@@ -495,7 +615,13 @@ fn test_roi_param_change_enables_output() {
         NDDataType::UInt8,
     );
     arr2.unique_id = 200;
-    rt.block_on(sim_publisher.publish(Arc::new(arr2)));
+    rt.block_on(
+        sim_publisher.publish(
+            ad_core_rs::ndarray_pool::DriverPool::standalone(0)
+                .alloc_copy(&arr2)
+                .unwrap(),
+        ),
+    );
     wait_until("STATS1 to receive after ROI size set to 8x8", || {
         *last_id.lock() == 200
     });
@@ -594,11 +720,11 @@ fn test_process_then_file_tiff_pipeline() {
     tiff_proc.ctrl.lock().file_base.set_mode(NDFileMode::Single);
 
     // Use the writer directly for this test
-    use ad_core_rs::plugin::file_base::NDFileWriter;
+    use ad_core_rs::plugin::file_base::{NDFileOpenMode, NDFileWriter};
     use ad_plugins_rs::file_tiff::TiffWriter;
     let mut writer = TiffWriter::new();
     writer
-        .open_file(&path, NDFileMode::Single, &proc_result.output_arrays[0])
+        .open_file(&path, NDFileOpenMode::WRITE, &proc_result.output_arrays[0])
         .unwrap();
     writer.write_file(&proc_result.output_arrays[0]).unwrap();
     writer.close_file().unwrap();
@@ -618,7 +744,7 @@ fn test_circular_buff_trigger_flow() {
     let proc = CircularBuffProcessor::new(
         2, // pre_count
         1, // post_count
-        TriggerCondition::External,
+        TriggerCondition::default(),
         100, // max_buffers (C maxBuffers_)
     );
     // C NDCircBuffControl = 1: the plugin records nothing until acquisition is
@@ -649,10 +775,14 @@ fn test_circular_buff_trigger_flow() {
     let result = proc.process_array(&Arc::new(arr4), &pool);
 
     // Should have captured: 2 pre + 1 post = 3 frames
-    assert_eq!(result.output_arrays.len(), 3);
-    assert_eq!(result.output_arrays[0].unique_id, 2);
-    assert_eq!(result.output_arrays[1].unique_id, 3);
-    assert_eq!(result.output_arrays[2].unique_id, 4);
+    // posted at address 0 as C's doCallbacksGenericPointer does.
+    let ids: Vec<_> = result
+        .addressed
+        .iter()
+        .map(|(addr, a)| (*addr, a.unique_id))
+        .collect();
+    assert_eq!(ids, vec![(0, 2), (0, 3), (0, 4)]);
+    assert!(result.output_arrays.is_empty());
 }
 
 #[test]
@@ -679,7 +809,8 @@ fn test_attribute_plugin_value_extraction() {
     use ad_plugins_rs::attribute::AttributeProcessor;
 
     let pool = NDArrayPool::new(1_000_000);
-    let proc = AttributeProcessor::new("exposure", 8);
+    let proc = AttributeProcessor::new(8);
+    proc.set_attr_name("exposure");
 
     let mut arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
     arr.attributes.add(NDAttribute::new_static(
@@ -735,12 +866,18 @@ fn test_pos_plugin_position_attachment() {
 }
 
 #[test]
-fn test_process_and_publish_writes_array_size_params() {
-    // Verify that process_and_publish writes ArraySizeX/Y/Z params correctly.
+fn test_std_arrays_leaves_the_array_sizes_unset() {
     let pool = NDArrayPool::new(1_000_000);
     let wiring = Arc::new(WiringRegistry::new());
-    let (image_handle, image_data, _jh) =
-        create_std_arrays_runtime("IMG_SZ", pool.clone(), "DRV1", wiring);
+    let (image_handle, image_data, _jh) = create_std_arrays_runtime(
+        &asyn_rs::asyn_record::claim_port("IMG_SZ").unwrap(),
+        pool.max_memory(),
+        1,
+        0,
+        "DRV1",
+        wiring,
+        ad_core_rs::plugin::runtime::DEFAULT_PLUGIN_THREADS,
+    );
 
     // Enable callbacks
     let ph = image_handle.port_runtime().port_handle();
@@ -749,8 +886,20 @@ fn test_process_and_publish_writes_array_size_params() {
     params_applied(&image_handle);
 
     // Connect and send a 64x48 array
-    let mut driver =
-        ad_core_rs::driver::ad_driver::ADDriverBase::new("DRV1", 64, 48, 1_000_000).unwrap();
+    let mut driver = ad_core_rs::driver::ad_driver::ADDriverBase::new(
+        "DRV1",
+        1,
+        1_000_000,
+        ASYN_CANBLOCK,
+        InterfaceMask::UNMIGRATED_SUBCLASS,
+        InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
+    )
+    .unwrap();
+    // The ArrayCallbacks record's PINI; the driver leaves it undefined.
+    driver
+        .port_base
+        .set_int32_param(driver.params.base.array_callbacks, 0, 1)
+        .unwrap();
     driver.connect_downstream(image_handle.array_sender().clone());
 
     let mut arr = NDArray::new(
@@ -758,7 +907,10 @@ fn test_process_and_publish_writes_array_size_params() {
         NDDataType::UInt8,
     );
     arr.unique_id = 42;
-    let to_publish = driver.prepare_array(Arc::new(arr)).unwrap().unwrap();
+    let to_publish = driver
+        .prepare_array(driver.pool.alloc_copy(&arr).unwrap())
+        .unwrap()
+        .unwrap();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -796,15 +948,9 @@ fn test_process_and_publish_writes_array_size_params() {
         .read_int32_blocking(image_handle.ndarray_params.unique_id, 0)
         .unwrap();
 
-    assert_eq!(size_x, 64, "ArraySizeX should be 64");
-    assert_eq!(size_y, 48, "ArraySizeY should be 48");
-    // C parity: NDArray::getInfo leaves colorSize at 0 for a 2-D array (no
-    // color dimension), so ArraySizeZ_RBV is 0 for 2D mono.
-    assert_eq!(
-        size_z, 0,
-        "ArraySizeZ should be 0 for 2D mono (no color dim)"
-    );
-    assert_eq!(array_size, 64 * 48, "ArraySize should be total bytes");
+    // C StdArrays never sets the sizes; they keep the constructor's 0
+    // (asynNDArrayDriver.cpp:967-970). Only ROI, ROIStat and Transform do.
+    assert_eq!([size_x, size_y, size_z, array_size], [0; 4]);
     assert_eq!(counter, 1, "ArrayCounter should be 1");
     assert_eq!(unique_id, 42, "UniqueId should be 42");
 }

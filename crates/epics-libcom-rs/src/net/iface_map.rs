@@ -1,7 +1,7 @@
 //! IPv4 network interface enumeration with periodic refresh.
 //!
-//! Wraps the `if-addrs` crate (cross-platform) into an
-//! [`IfaceMap`] keyed by `ifindex`. Built once at startup and
+//! The up interfaces of [`super::iface_v4::enumerate`] (`GetAdaptersAddresses`
+//! on Windows) as an [`IfaceMap`] keyed by `ifindex`. Built once at startup and
 //! refreshable on demand — multi-NIC environments where interfaces
 //! come and go (USB Ethernet, hot-plug iface) need a fresh snapshot
 //! per search burst, but the cost is small.
@@ -28,19 +28,40 @@ pub struct IfaceInfo {
     pub ip: Ipv4Addr,
     /// IPv4 netmask.
     pub netmask: Ipv4Addr,
-    /// Subnet broadcast address (when reported by the OS), e.g.
-    /// `10.0.0.255`. `None` for point-to-point links.
+    /// `ifa_broadaddr` as the OS reported it, e.g. `10.0.0.255`: where C
+    /// and pvxs send to reach this NIC's segment. `None` for point-to-point
+    /// links. Not necessarily a local address — see [`Self::rx_broadcast`].
     pub broadcast: Option<Ipv4Addr>,
-    /// `true` when the interface carries the OS `IFF_UP` flag **and**
-    /// is not loopback — the eligibility test for SEARCH/beacon
-    /// fanout. C parity: `osiSockDiscoverBroadcastAddresses`
-    /// (`osdNetIfConf.c:170-181`) skips `!(IFF_UP)` and `IFF_LOOPBACK`
-    /// interfaces. On Linux (where the crate links `libc`) this
-    /// consults the live kernel flags via `getifaddrs`; on other
-    /// targets it falls back to `!is_loopback()` because the
-    /// platform's enumerator already excludes operationally-down
-    /// adapters.
+    /// `true` when the interface is not loopback — the eligibility test for
+    /// SEARCH/beacon fanout, C `osiSockDiscoverBroadcastAddresses`
+    /// (`osdNetIfConf.c:170-181`). The `IFF_UP` half holds for every entry:
+    /// a down interface is not enumerated.
     pub up_non_loopback: bool,
+}
+
+impl IfaceInfo {
+    /// The local address this NIC's subnet broadcasts arrive at, which a
+    /// socket can bind to receive them.
+    ///
+    /// Not [`Self::broadcast`] on Linux: with `IFF_BROADCAST` set, glibc
+    /// fills `ifa_broadaddr` with the peer of a `peer` address, or with the
+    /// NIC's own address when no `brd` was given, and binding either fails.
+    /// The kernel installs a local broadcast route for `prefix | ~mask` on
+    /// every prefix shorter than /31 (`fib_add_ifaddr`), so that is the
+    /// address there.
+    pub fn rx_broadcast(&self) -> Option<Ipv4Addr> {
+        if self.ip.is_loopback() {
+            return None;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let mask = u32::from(self.netmask);
+            (mask != 0 && mask.leading_ones() < 31)
+                .then(|| Ipv4Addr::from(u32::from(self.ip) | !mask))
+        }
+        #[cfg(not(target_os = "linux"))]
+        self.broadcast.filter(|b| !b.is_unspecified())
+    }
 }
 
 /// Refreshable cache of IPv4 interfaces.
@@ -228,103 +249,193 @@ fn subnet_contains(ip: Ipv4Addr, mask: Ipv4Addr, candidate: Ipv4Addr) -> bool {
     net == cnet && u32::from(mask) != 0
 }
 
-/// Per-interface-name OS flag snapshot used to compute
-/// `up_non_loopback`. C parity: the `IFF_UP` / `IFF_LOOPBACK` checks in
-/// `osiSockDiscoverBroadcastAddresses` (`osdNetIfConf.c:170-181`).
-#[cfg(target_os = "linux")]
-fn interface_up_flags() -> std::collections::HashMap<String, bool> {
-    use std::collections::HashMap;
-    use std::ffi::CStr;
-
-    let mut map: HashMap<String, bool> = HashMap::new();
-    // SAFETY: standard getifaddrs / freeifaddrs pairing; the pointer is
-    // only dereferenced while non-null and freed exactly once.
-    unsafe {
-        let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
-        if libc::getifaddrs(&mut head) != 0 || head.is_null() {
-            return map;
-        }
-        let mut cur = head;
-        while !cur.is_null() {
-            let ifa = &*cur;
-            if !ifa.ifa_name.is_null() {
-                if let Ok(name) = CStr::from_ptr(ifa.ifa_name).to_str() {
-                    // C: skip interfaces without IFF_UP, skip IFF_LOOPBACK.
-                    let flags = ifa.ifa_flags as libc::c_int;
-                    let up = (flags & libc::IFF_UP) != 0;
-                    let loopback = (flags & libc::IFF_LOOPBACK) != 0;
-                    let eligible = up && !loopback;
-                    // An interface can have several addresses; if any
-                    // entry reports it up+non-loopback, keep that.
-                    map.entry(name.to_string())
-                        .and_modify(|e| *e |= eligible)
-                        .or_insert(eligible);
-                }
-            }
-            cur = ifa.ifa_next;
-        }
-        libc::freeifaddrs(head);
-    }
-    map
+/// The up IPv4 interfaces, from the one walker every target enumerates
+/// through ([`super::iface_v4::enumerate`]), which drops a down NIC.
+#[cfg(unix)]
+fn enumerate_v4() -> io::Result<Vec<IfaceInfo>> {
+    Ok(super::iface_v4::enumerate()?
+        .into_iter()
+        .map(|i| IfaceInfo {
+            index: std::ffi::CString::new(i.name.as_str())
+                // SAFETY: a NUL-terminated string that outlives the call.
+                .map_or(0, |name| unsafe { libc::if_nametoindex(name.as_ptr()) }),
+            up_non_loopback: !i.is_loopback() && !i.ip.is_loopback(),
+            broadcast: i.dest.filter(|_| i.is_broadcast()),
+            netmask: i.netmask.unwrap_or(Ipv4Addr::UNSPECIFIED),
+            ip: i.ip,
+            name: i.name,
+        })
+        .collect())
 }
 
+/// Windows: the up adapters of pvxs's `IfaceMap::_refresh` walk, which
+/// carries the index the unix path asks `if_nametoindex` for.
+#[cfg(not(unix))]
 fn enumerate_v4() -> io::Result<Vec<IfaceInfo>> {
-    let list = if_addrs::get_if_addrs()?;
-    // C parity: on Linux consult the live kernel `IFF_UP`/`IFF_LOOPBACK`
-    // flags via `getifaddrs` so an administratively-down interface that
-    // still has an IPv4 address configured is not reported as a fanout
-    // target. (Linux-only because `getifaddrs`/`SIOCGIFFLAGS` is the Linux
-    // path — the crate itself links `libc` on every unix.)
-    #[cfg(target_os = "linux")]
-    let up_flags = interface_up_flags();
-
-    let mut out = Vec::with_capacity(list.len());
-    for iface in list {
-        let if_addrs::IfAddr::V4(v4) = &iface.addr else {
+    let mut out = Vec::new();
+    for a in super::win_adapters::up_adapter_addrs()? {
+        let std::net::IpAddr::V4(ip) = a.ip else {
             continue;
         };
-        // `if-addrs` 0.13+ surfaces the kernel ifindex on every
-        // platform we target. `None` means the OS didn't report one
-        // (rare, but treat as 0 sentinel — the per-NIC fanout
-        // backend keys on the bound IP, not the index, so this is
-        // benign).
-        let index = iface.index.unwrap_or(0);
-
-        // C `osiSockDiscoverBroadcastAddresses`: an interface is a
-        // fanout target only when it is `IFF_UP` and not loopback.
-        #[cfg(target_os = "linux")]
-        let up_non_loopback = match up_flags.get(&iface.name) {
-            // Kernel flags known — honour them (and never treat
-            // loopback as a fanout target even if a stale flag map
-            // somehow disagrees).
-            Some(&eligible) => eligible && !iface.is_loopback(),
-            // Interface absent from the getifaddrs snapshot (raced a
-            // hot-unplug, or getifaddrs failed) — fall back to the
-            // loopback test rather than dropping the interface.
-            None => !iface.is_loopback(),
-        };
-        // Non-Linux (macOS / Windows / *BSD): the crate does not link
-        // `libc` here, and the platform enumerator already excludes
-        // operationally-down adapters, so the loopback test is the
-        // best portable approximation.
-        #[cfg(not(target_os = "linux"))]
-        let up_non_loopback = !iface.is_loopback();
-
         out.push(IfaceInfo {
-            index,
-            name: iface.name.clone(),
-            ip: v4.ip,
-            netmask: v4.netmask,
-            broadcast: v4.broadcast,
-            up_non_loopback,
+            index: a.index,
+            netmask: a.netmask_v4(),
+            broadcast: a.broadcast_v4(),
+            up_non_loopback: !a.loopback && !ip.is_loopback(),
+            name: a.name,
+            ip,
         });
     }
     Ok(out)
 }
 
+/// One interface of pvxs `IfaceMap::all_external()`, with what a multicast
+/// join on it takes: `index_of(name)` for v6 and `address_of(name)` for v4
+/// (`config.cpp:97-117`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalIface {
+    /// Interface name.
+    pub name: String,
+    /// Kernel interface index, 0 when the OS reported none.
+    pub index: u32,
+    /// The lowest IPv4 address, `address_of`'s first in pvxs's address
+    /// order; `None` on a v6-only interface, whose v4 join takes
+    /// `INADDR_ANY`.
+    pub v4: Option<Ipv4Addr>,
+    /// The lowest IPv6 address, which pvxs's `address_of` returns for a
+    /// v6-only interface.
+    pub v6: Option<std::net::Ipv6Addr>,
+}
+
+/// pvxs `IfaceMap::all_external()` (`evhelper.cpp:898-905`): every up
+/// interface with an IPv4 or IPv6 address, loopback included, in name
+/// order (`osdSockExt.cpp:259-315`). Walks `getifaddrs` itself on unix so
+/// that an interface with only an `fe80::` address is kept.
+pub fn all_external() -> io::Result<Vec<ExternalIface>> {
+    let mut by_name = std::collections::BTreeMap::<String, ExternalIface>::new();
+    let mut add = |name: &str, index: u32, ip: std::net::IpAddr| {
+        let entry = by_name
+            .entry(name.to_string())
+            .or_insert_with(|| ExternalIface {
+                name: name.to_string(),
+                index,
+                v4: None,
+                v6: None,
+            });
+        match ip {
+            std::net::IpAddr::V4(ip) => entry.v4 = Some(entry.v4.map_or(ip, |cur| cur.min(ip))),
+            std::net::IpAddr::V6(ip) => entry.v6 = Some(entry.v6.map_or(ip, |cur| cur.min(ip))),
+        }
+    };
+    #[cfg(unix)]
+    // SAFETY: standard getifaddrs / freeifaddrs pairing; every pointer is
+    // dereferenced only while non-null, and the list is freed exactly once.
+    unsafe {
+        use std::ffi::CStr;
+        let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
+        if libc::getifaddrs(&mut head) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut cur = head;
+        while !cur.is_null() {
+            let ifa = &*cur;
+            cur = ifa.ifa_next;
+            if ifa.ifa_addr.is_null() || ifa.ifa_name.is_null() {
+                continue;
+            }
+            let family = libc::c_int::from((*ifa.ifa_addr).sa_family);
+            if family != libc::AF_INET && family != libc::AF_INET6 {
+                continue;
+            }
+            if (ifa.ifa_flags as libc::c_int & libc::IFF_UP) == 0 {
+                continue;
+            }
+            let index = libc::if_nametoindex(ifa.ifa_name);
+            let Ok(name) = CStr::from_ptr(ifa.ifa_name).to_str() else {
+                continue;
+            };
+            if index == 0 || name.is_empty() {
+                continue;
+            }
+            let ip = if family == libc::AF_INET {
+                let sin = &*(ifa.ifa_addr as *const libc::sockaddr_in);
+                Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr)).into()
+            } else {
+                let sin6 = &*(ifa.ifa_addr as *const libc::sockaddr_in6);
+                std::net::Ipv6Addr::from(sin6.sin6_addr.s6_addr).into()
+            };
+            add(name, index, ip);
+        }
+        libc::freeifaddrs(head);
+    }
+    #[cfg(not(unix))]
+    for a in super::win_adapters::up_adapter_addrs()? {
+        add(&a.name, a.index, a.ip);
+    }
+    Ok(by_name.into_values().collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    fn nic(ip: [u8; 4], prefix: u32, broadcast: Option<[u8; 4]>) -> IfaceInfo {
+        IfaceInfo {
+            index: 2,
+            name: "d0".to_string(),
+            ip: ip.into(),
+            netmask: Ipv4Addr::from(u32::MAX.checked_shl(32 - prefix).unwrap_or(0)),
+            broadcast: broadcast.map(Ipv4Addr::from),
+            up_non_loopback: true,
+        }
+    }
+
+    /// One case per `ifa_broadaddr` shape `getifaddrs` gives an
+    /// `IFF_BROADCAST` NIC on Linux, as `ip addr add` configured it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn rx_broadcast_is_the_kernel_local_broadcast() {
+        let cases = [
+            // `brd +`
+            (
+                nic([10, 6, 0, 1], 24, Some([10, 6, 0, 255])),
+                Some([10, 6, 0, 255]),
+            ),
+            // no `brd`: glibc reports the NIC's own address
+            (
+                nic([10, 7, 0, 1], 24, Some([10, 7, 0, 1])),
+                Some([10, 7, 0, 255]),
+            ),
+            // `peer 10.8.0.2`: the peer, and no subnet broadcast at /32
+            (nic([10, 8, 0, 1], 32, Some([10, 8, 0, 2])), None),
+            // `peer 10.5.0.2/24`: the peer, and the kernel's /24 broadcast
+            (
+                nic([10, 5, 0, 1], 24, Some([10, 5, 0, 2])),
+                Some([10, 5, 0, 255]),
+            ),
+            // /31 has no broadcast (RFC 3021)
+            (nic([10, 4, 0, 0], 31, Some([10, 4, 0, 1])), None),
+            (nic([10, 3, 0, 1], 0, Some([255, 255, 255, 255])), None),
+            (nic([127, 0, 0, 1], 8, None), None),
+        ];
+        for (info, want) in cases {
+            assert_eq!(info.rx_broadcast(), want.map(Ipv4Addr::from), "{info:?}");
+        }
+    }
+
+    /// pvxs's set: loopback is in it, with its v4 address and an index, and
+    /// the names are in order, each once.
+    #[test]
+    fn all_external_includes_loopback_in_name_order() {
+        let all = all_external().expect("getifaddrs must succeed on the host");
+        let lo = all
+            .iter()
+            .find(|i| i.v4 == Some(Ipv4Addr::LOCALHOST))
+            .unwrap_or_else(|| panic!("loopback missing: {all:?}"));
+        assert_ne!(lo.index, 0, "{lo:?}");
+        assert!(all.windows(2).all(|w| w[0].name < w[1].name), "{all:?}");
+    }
 
     #[test]
     fn enumerate_returns_loopback_at_minimum() {
@@ -380,24 +491,6 @@ mod tests {
                 "up_non_loopback() must not surface loopback: {iface:?}"
             );
         }
-    }
-
-    /// M5 C-parity: on Linux the live `IFF_UP` kernel flag is consulted.
-    /// The loopback interface is `IFF_UP` but `IFF_LOOPBACK`, so the
-    /// flag map reports it as ineligible.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn interface_up_flags_marks_loopback_ineligible() {
-        let flags = interface_up_flags();
-        // `lo`/`lo0` is up but loopback -> ineligible. Accept either
-        // name; the machine must have at least one loopback entry.
-        let lo_ineligible = flags
-            .iter()
-            .any(|(name, &eligible)| (name == "lo" || name == "lo0") && !eligible);
-        assert!(
-            lo_ineligible || flags.is_empty(),
-            "loopback must be flagged ineligible in the IFF_UP map: {flags:?}"
-        );
     }
 
     #[test]

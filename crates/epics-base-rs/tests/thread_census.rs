@@ -14,14 +14,15 @@
 //! differ, and the floors got *tighter* — each is now this half's exact site
 //! count rather than a slack share of the combined one.
 //!
-//! The subject is `server/ioc_app.rs` and `server/scan.rs`: the two files in
-//! this crate that create threads.
+//! The subject is `server/scan.rs`, the one file in this crate that creates
+//! threads, and `server/ioc_app.rs`, which hands its iocsh bodies to libcom's
+//! one `_main_` thread instead of creating its own.
 //!
 //! # Why the `Builder` sweeps became a ban
 //!
-//! All four of this crate's thread sites are threads the IOC cannot correctly
-//! run without — the scan owner, the seven `scan-%g` rates, and the two iocsh
-//! boot-script runners — and all four now go through
+//! All of this crate's thread sites are threads the IOC cannot correctly run
+//! without — the scan owner and the seven `scan-%g` rates — and all of them go
+//! through
 //! `runtime::task::MandatoryThread`, whose constructor takes the name, the band
 //! and the stack class. That is the same "enforced by its signature" argument
 //! the sweeps already made for `spawn_dedicated_thread`: a caller cannot omit
@@ -81,10 +82,9 @@ fn code_lines(src: &'static str) -> impl Iterator<Item = (usize, &'static str)> 
 /// `std::thread::spawn`, which cannot express a stack size at all and so was
 /// invisible to the old `Builder`-chain sweep. (The bare `thread::spawn` sites
 /// elsewhere in the workspace — `ca::repeater`, `ca::calink`,
-/// `ca::server::ca_server`, `pva::server::pva_server`, `bridge::pvalink` — are
-/// distinct: none is a mandatory IOC thread. They are the interactive iocsh
-/// REPL, the best-effort in-process CA repeater fallback, and per-command
-/// helpers that are joined on the next line.)
+/// `bridge::pvalink` — are distinct: none is a mandatory IOC thread. They are
+/// the best-effort in-process CA repeater fallback, and per-command helpers
+/// that are joined on the next line.)
 ///
 /// Fails today, on Linux, with no cross toolchain.
 #[test]
@@ -115,7 +115,7 @@ fn this_crate_creates_no_thread_outside_the_runtime_owners() {
 /// having quietly stopped creating threads.
 ///
 /// The floor is this crate's exact site count: `scan.rs` creates the scan owner
-/// and the periodic rates, `ioc_app.rs` the two iocsh boot-script runners.
+/// and the periodic rates.
 #[test]
 fn every_thread_in_this_crate_goes_through_mandatory_thread() {
     let mut owned = Vec::new();
@@ -127,8 +127,8 @@ fn every_thread_in_this_crate_goes_through_mandatory_thread() {
         }
     }
     assert!(
-        owned.len() >= 4,
-        "expected this crate's four mandatory-thread sites, found {} ({owned:?}) — \
+        owned.len() >= 3,
+        "expected this crate's three mandatory-thread sites, found {} ({owned:?}) — \
          did a file move? update this guard's file list",
         owned.len()
     );

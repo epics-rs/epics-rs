@@ -43,31 +43,31 @@ const SLOW: Duration = Duration::from_millis(1000);
 struct TwoSpeedSource;
 
 impl ChannelSource for TwoSpeedSource {
-    async fn list_pvs(&self) -> Vec<String> {
+    fn list_pvs(&self) -> Vec<epics_base_rs::types::RecordName> {
         vec!["fast".into(), "slow".into()]
     }
-    async fn has_pv(&self, name: &str) -> bool {
-        name == "fast" || name == "slow"
+    async fn has_pv(&self, name: &[u8]) -> bool {
+        name == b"fast" || name == b"slow"
     }
-    async fn get_introspection(&self, name: &str) -> Option<FieldDesc> {
-        if name == "slow" {
+    async fn get_introspection(&self, name: &[u8]) -> Option<FieldDesc> {
+        if name == b"slow" {
             tokio::time::sleep(SLOW).await;
         }
         Some(FieldDesc::Scalar(ScalarType::Double))
     }
-    async fn get_value(&self, name: &str) -> Option<PvField> {
-        let v = if name == "slow" { 2.0 } else { 1.0 };
+    async fn get_value(&self, name: &[u8]) -> Option<PvField> {
+        let v = if name == b"slow" { 2.0 } else { 1.0 };
         Some(PvField::Scalar(ScalarValue::Double(v)))
     }
-    async fn put_value(&self, _name: &str, _value: PvField) -> Result<(), OpError> {
+    async fn put_value(&self, _name: &[u8], _value: PvField) -> Result<(), OpError> {
         Ok(())
     }
-    async fn is_writable(&self, _name: &str) -> bool {
+    async fn is_writable(&self, _name: &[u8]) -> bool {
         false
     }
     async fn subscribe(
         &self,
-        _name: &str,
+        _name: &[u8],
     ) -> Option<epics_pva_rs::server_native::MonitorStream<PvField>> {
         None
     }

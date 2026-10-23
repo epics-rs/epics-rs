@@ -7,12 +7,12 @@ epicsEnvSet("BEAM_PERIOD",    "4.0")
 epicsEnvSet("BEAM_UPDATE_MS", "100")
 
 # ===== Simulated Motors =====
-# simMotorCreate(port, lowLimit, highLimit, pollMs)
-simMotorCreate("ph_mtr", -100, 100, 100)
-simMotorCreate("edge_mtr", -100, 100, 100)
-simMotorCreate("slit_mtr", -100, 100, 100)
-simMotorCreate("dot_mtrx", -500, 500, 100)
-simMotorCreate("dot_mtry", -500, 500, 100)
+# simMotorCreate(port, lowLimit, highLimit, pollMs), limits in steps
+simMotorCreate("ph_mtr", -100000, 100000, 100)
+simMotorCreate("edge_mtr", -100000, 100000, 100)
+simMotorCreate("slit_mtr", -100000, 100000, 100)
+simMotorCreate("dot_mtrx", -500000, 500000, 100)
+simMotorCreate("dot_mtry", -500000, 500000, 100)
 
 # ===== Kohzu DCM (Double Crystal Monochromator) =====
 # Y/Z hard travel must cover the +-250 soft limits set below: Z needs
@@ -20,9 +20,9 @@ simMotorCreate("dot_mtry", -500, 500, 100)
 # narrower simulated range the motor slams into the simulator's limit switch
 # mid-move and kohzuCtl aborts the whole move and drops to Manual mode
 # ("Z Motor hit a limit switch!").
-simMotorCreate("dcm_theta", -10, 90, 100)
-simMotorCreate("dcm_y", -250, 250, 100)
-simMotorCreate("dcm_z", -250, 250, 100)
+simMotorCreate("dcm_theta", -10000, 90000, 100)
+simMotorCreate("dcm_y", -250000, 250000, 100)
+simMotorCreate("dcm_z", -250000, 250000, 100)
 
 # ===== Simulated HSC-1 Slit Controller =====
 simHscCreate("HSC1", 100)
@@ -108,7 +108,10 @@ epicsEnvSet("EPICS_DB_INCLUDE_PATH", "$(MINI_BEAMLINE)/db:$(ADCORE)/db")
 dbLoadRecords("$(MINI_BEAMLINE)/db/moving_dot.template", "P=$(PREFIX),R=cam1:,IOC=mini:,PORT=DOT")
 
 # Load standard areaDetector plugins for MovingDot
-< $(ADCORE)/ioc/commonPlugins.cmd
+# image1, which commonPlugins.cmd leaves to the st.cmd as C's does
+NDStdArraysConfigure("IMAGE1", $(QSIZE), 0, "$(PORT)", 0)
+dbLoadRecords("NDStdArrays.template", "P=$(PREFIX),R=image1:,PORT=IMAGE1,NDARRAY_PORT=$(PORT),TYPE=$(TYPE=Int8),FTVL=$(FTVL=UCHAR),NELEMENTS=$(NELEMENTS)")
+< $(ADCORE)/iocBoot/commonPlugins.cmd
 
 # Restore top-level prefix
 epicsEnvSet("PREFIX", "mini:")
@@ -126,3 +129,5 @@ set_pass0_restoreFile("moving_dot_settings.req", "P=mini:dot:,R=cam1:")
 set_pass1_restoreFile("moving_dot_settings.req", "P=mini:dot:,R=cam1:")
 create_monitor_set("mini_positions.req", 5)
 create_monitor_set("moving_dot_settings.req", 5, "P=mini:dot:,R=cam1:")
+
+iocInit()

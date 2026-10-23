@@ -1,0 +1,3 @@
+Usage: streamReinit "portname", [addr]
+asynManager:connectDevice port Z not found
+P addr -1 asynManager:exceptionDisconnect but not connected

@@ -79,22 +79,19 @@ async fn a_line_without_a_separator_is_reported() {
     );
 }
 
-/// Boundary: an `@array@` line whose braces do not close. The marker
-/// settles what the line is, so it is a malformed array line — not a
-/// scalar whose value happens to start with `@array@`.
+/// Boundary: an `@array@` line whose braces do not close is an entry, as
+/// C's is: its restore reads on through the lines after it to the `}`
+/// (`SR_array_restore`, dbrestore.c:477-602; `autosave_array_read_on`).
 #[epics_macros_rs::epics_test]
-async fn a_truncated_array_line_is_reported_not_misparsed() {
+async fn a_truncated_array_line_is_an_entry() {
     let dir = tempfile::tempdir().unwrap();
     let path = write_sav(dir.path(), "SR:STR @array@ { \"a\" \"b\"\n").await;
 
     let contents = read_save_file(&path).await.unwrap().unwrap();
 
-    assert!(
-        contents.entries.is_empty(),
-        "a broken array line must not become a scalar entry: {:?}",
-        contents.entries
-    );
-    assert_eq!(contents.malformed.len(), 1);
+    assert_eq!(contents.entries.len(), 1, "{:?}", contents.malformed);
+    assert_eq!(contents.entries[0].value, "@array@ { \"a\" \"b\"");
+    assert!(contents.malformed.is_empty());
 }
 
 /// The reason the buckets exist: a restore over a partially written

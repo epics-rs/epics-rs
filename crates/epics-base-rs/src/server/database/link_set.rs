@@ -9,8 +9,7 @@
 //!
 //! At runtime [`super::PvDatabase`] holds a registry keyed by URL
 //! scheme (`"pva"`, `"ca"`); each entry is an `Arc<dyn LinkSet>`.
-//! Record-link reads dispatch through the matching lset before
-//! falling back to the legacy `ExternalPvResolver` closure.
+//! Record-link reads dispatch through the matching lset and no other.
 //!
 //! The trait is **split by thread**, mirroring the C `dbCa` split
 //! between the record-processing thread and the `dbCaTask`
@@ -23,8 +22,8 @@
 //!   the wire (`dbCa.c:419-506`). Their signature is what enforces
 //!   that: a `fn` cannot await, so it cannot suspend the record thread.
 //! * **Async methods** ([`LinkSet::get_value`],
-//!   [`LinkSet::connect_link`], [`LinkSet::put_value`],
-//!   [`LinkSet::flush_puts`]) are the `dbCaTask` half. They run on the
+//!   [`LinkSet::connect_link`], [`LinkSet::put_value`]) are the
+//!   `dbCaTask` half. They run on the
 //!   database's link work owner, never on a record-processing thread,
 //!   and MAY block on the network.
 //!
@@ -38,15 +37,41 @@
 //! struct MyLset { /* ... */ }
 //! #[epics_base_rs::async_trait]
 //! impl LinkSet for MyLset {
-//!     fn is_connected(&self, name: &str) -> bool { /* cached */ }
-//!     fn get_cached_value(&self, name: &str) -> Option<EpicsValue> { /* cached */ }
-//!     async fn get_value(&self, name: &str) -> Option<EpicsValue> { /* may do I/O */ }
+//!     fn is_connected(&self, link: LinkRef<'_>) -> bool { /* cached */ }
+//!     fn get_cached_value(&self, link: LinkRef<'_>) -> Option<EpicsValue> { /* cached */ }
+//!     async fn get_value(&self, link: LinkRef<'_>) -> Option<EpicsValue> { /* may do I/O */ }
 //!     /* etc. */
 //! }
 //! db.register_link_set("pva", Arc::new(MyLset { ... })).await;
 //! ```
 
 use std::sync::Arc;
+
+/// An external forward link's `scanForward`, opened once by
+/// [`LinkSet::forward_handle`] and held by the link's parse.
+///
+/// Runs on the record-processing thread with the record held: it MUST NOT
+/// block, allocate or resolve a name. pvxs `pvaScanForward`
+/// (`pvxs/ioc/pvalink_lset.cpp:672-688`): a forward is never deferred and
+/// carries no value; a non-retry link that is not connected triggers
+/// nothing and returns [`LinkForwardRefused`], which the caller raises as
+/// LINK/INVALID "Disconn" (`:677-680`).
+pub trait LinkForward: Send + Sync {
+    fn scan_forward(&self) -> Result<(), LinkForwardRefused>;
+}
+
+/// The forward was not staged; the source record takes LINK/INVALID.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LinkForwardRefused;
+
+/// [`LinkSet::forward_handle`]'s default.
+struct NoForward;
+
+impl LinkForward for NoForward {
+    fn scan_forward(&self) -> Result<(), LinkForwardRefused> {
+        Ok(())
+    }
+}
 
 use crate::types::EpicsValue;
 
@@ -102,6 +127,95 @@ pub enum LinkPutOp {
     /// put-notify / blocking-put chain. Maps to pvxs `pvaPutValueAsync`
     /// (`wait=true`, `record._options.block`) / C `dbPutLinkAsync`.
     Async,
+}
+
+/// How an [`LinkPutOp::Async`] put's completion reached the link owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkPutDone {
+    /// Through the target's completion callback.
+    Callback,
+    /// On the put's own call: the target processed nothing, so C's
+    /// `processNotifyCommon` ran `callDone` inline on `dbCaTask`
+    /// (`dbNotify.c:243-270`).
+    Inline,
+    /// Never: the put callback could not be issued, and C's `dbCaTask` only
+    /// logs a failed `ca_array_put_callback`, leaving `newOutNative` set
+    /// and never calling `putComplete` (`dbCa.c:1233-1247`).
+    NotIssued,
+}
+
+/// C `dbCaTask`'s report of a put `ca_array_put` did not issue
+/// (`dbCa.c:1240-1243`): the status's `ca_message`, then `printLinks`. A put
+/// callback that completes with a failure prints nothing (`putComplete`,
+/// `dbCa.c:1056-1072`).
+pub fn report_put_not_issued(status: u32, holder: Option<&[u8]>, pvname: &[u8]) {
+    crate::runtime::log::errlog_vprintf(format_args!(
+        "dbCaTask ca_array_put {}\n",
+        crate::error::eca::eca_message(status)
+    ));
+    if let Some(holder) = holder {
+        crate::runtime::log::errlog_vprintf(format_args!(
+            "{} has DB CA link to {}\n",
+            String::from_utf8_lossy(holder),
+            String::from_utf8_lossy(pvname)
+        ));
+    }
+}
+
+/// C `dbCaPutLinkCallback`'s conversion into `pputNative` (`dbCa.c:572-590`):
+/// the scalar put row when one element goes to a one-element channel, the
+/// array row otherwise, clamped to the channel's `nelements`. A string that
+/// is not a number of a numeric `native` type is `Err`, the status
+/// `dbPutLink` turns into the link alarm, where C still sends the stale
+/// buffer; that write is not copied. `name` labels the error.
+pub fn link_put_convert(
+    name: &[u8],
+    value: EpicsValue,
+    native: crate::types::DbFieldType,
+    nelements: u32,
+) -> Result<EpicsValue, String> {
+    use crate::types::c_parse::{self, Converted, NumericField};
+    let nelements = nelements as usize;
+    // A string put to a DBR_ENUM channel goes as one DBR_STRING, cut by
+    // `cvt_st_st`, for the server to resolve (`dbCa.c:561-575`,
+    // `dbFastLinkConv.c:74-88`).
+    if native == crate::types::DbFieldType::Enum {
+        let first = match &value {
+            EpicsValue::String(s) => Some(s.as_bytes()),
+            EpicsValue::StringArray(a) => a.first().map(|s| s.as_bytes()),
+            _ => None,
+        };
+        if let Some(bytes) = first {
+            // `strncpy` into MAX_STRING_SIZE (40) less the NUL.
+            let bytes = &bytes[..bytes.len().min(39)];
+            let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+            return Ok(EpicsValue::String(crate::types::PvString::from_bytes(
+                &bytes[..end],
+            )));
+        }
+    }
+    if let Some(row) = NumericField::of(native) {
+        let texts = match &value {
+            EpicsValue::String(s) => std::slice::from_ref(s),
+            EpicsValue::StringArray(a) => &a[..a.len().min(nelements)],
+            _ => &[],
+        };
+        let field = || String::from_utf8_lossy(name);
+        let converted = match texts {
+            [] => None,
+            [one] if nelements == 1 => {
+                Some(c_parse::put_string(&field(), row, &one.as_str_lossy()))
+            }
+            many => Some(c_parse::put_string_elements(&field(), row, many)),
+        };
+        // `Unchanged` keeps C's old buffer, which this port does not hold.
+        if let Some(Converted::Stored(v)) = converted.transpose().map_err(|e| e.to_string())? {
+            return Ok(v);
+        }
+    }
+    let mut value = value.into_type(native);
+    value.truncate(nelements);
+    Ok(value)
 }
 
 /// Whether an external OUT link will accept a staged write right now —
@@ -165,7 +279,7 @@ pub struct LinkDiagnostics {
     /// unreadable to a record.
     pub connected: bool,
     /// C `ca_host_name(pca->chid)` — the server's name with its port.
-    pub host: String,
+    pub host: Vec<u8>,
     /// C `ca_read_access(pca->chid)`.
     pub read_access: bool,
     /// C `ca_write_access(pca->chid)`.
@@ -228,22 +342,11 @@ pub struct LinkDiagnostics {
 #[derive(Clone, Copy)]
 pub struct LinkBacking<'a>(Backing<'a>);
 
-/// The answers a poster's resolve can carry. `Resolved` and `Declined`
-/// used to be the same value — an empty `HashMap` — and that is what left a
-/// window open: a subscriber arriving between the resolve's read lock and the
-/// post's write lock was handed the record's own C seed where the link's
-/// metadata belongs, because nothing downstream could tell "the link answered
-/// nothing" from "nobody had asked, so we never looked".
-///
-/// `Empty` is `Resolved` with nothing in it, as its own value: the resolve
-/// that had no link to walk — every record with no link-backed metadata,
-/// every cycle — answers it without constructing a map to be empty in.
+/// What one build resolved: nothing, or what its links answered.
 #[derive(Clone, Copy)]
 enum Backing<'a> {
     Unresolved,
     Resolved(&'a std::collections::HashMap<String, LinkMetadata>),
-    Empty,
-    Declined,
 }
 
 impl<'a> LinkBacking<'a> {
@@ -257,25 +360,10 @@ impl<'a> LinkBacking<'a> {
         Self(Backing::Unresolved)
     }
 
-    /// The resolve DECLINED to run: this record had no subscriber when the
-    /// cycle asked, so nothing would have read the answer. A post that finds
-    /// a subscriber anyway — one that arrived in the window between that read
-    /// lock and this write lock — must NOT serve a link-backed field from it;
-    /// [`RecordInstance::make_monitor_snapshot`](crate::server::record::RecordInstance::make_monitor_snapshot)
-    /// is where that refusal lives.
-    pub(crate) const fn declined() -> Self {
-        Self(Backing::Declined)
-    }
-
     /// What the links this record's metadata is backed by resolved to, keyed
     /// by link field (`INPA`, `INPB`, ...), resolved with no record lock held.
     pub const fn resolved(resolved: &'a std::collections::HashMap<String, LinkMetadata>) -> Self {
         Self(Backing::Resolved(resolved))
-    }
-
-    /// A resolve that ran and had no link to walk — see [`PostBacking::empty`].
-    pub(crate) const fn empty() -> Self {
-        Self(Backing::Empty)
     }
 
     /// The metadata behind one link field. The *predicate* — whether this
@@ -285,83 +373,9 @@ impl<'a> LinkBacking<'a> {
     pub(crate) fn metadata(&self, link_field: &str) -> Option<&'a LinkMetadata> {
         match self.0 {
             Backing::Resolved(m) => m.get(link_field),
-            Backing::Empty | Backing::Unresolved | Backing::Declined => None,
+            Backing::Unresolved => None,
         }
     }
-
-    /// True for [`Self::none`] — the caller resolved nothing. Distinct from a
-    /// resolve that came back empty, and the difference is what the monitor
-    /// poster's `debug_assert` reads: a link-backed field posted through an
-    /// unresolved backing is a poster that skipped its resolve, whereas the
-    /// same field posted through an empty resolve is a link that genuinely
-    /// answered nothing and correctly serves its C seed.
-    pub(crate) const fn is_unresolved(&self) -> bool {
-        matches!(self.0, Backing::Unresolved)
-    }
-
-    /// See [`Self::declined`].
-    pub(crate) const fn is_declined(&self) -> bool {
-        matches!(self.0, Backing::Declined)
-    }
-}
-
-/// What a poster's resolve produced —
-/// `PvDatabase::resolve_link_backed_metadata_for_posts`.
-///
-/// Owns the map so the borrowed [`LinkBacking`] can be taken from it at the
-/// post, and — the reason it exists rather than a bare `HashMap` — carries the
-/// gated door's DECLINE, which a `HashMap` has no room for. A caller cannot
-/// flatten the two: the only way to a `LinkBacking` from here is
-/// [`Self::as_link_backing`], which keeps whichever one it was.
-pub enum PostBacking {
-    /// The resolve ran and walked its links; this is what they answered.
-    Resolved(std::collections::HashMap<String, LinkMetadata>),
-    /// The resolve ran and had no link to walk: no link field was set, or the
-    /// record backs no metadata with one. An answer, not a decline.
-    Empty,
-    /// The resolve declined — see `LinkBacking::declined`.
-    Declined,
-}
-
-impl PostBacking {
-    /// The resolve ran; this is its answer, empty or not.
-    pub(crate) const fn resolved(map: std::collections::HashMap<String, LinkMetadata>) -> Self {
-        Self::Resolved(map)
-    }
-
-    /// See [`Self::Empty`].
-    pub(crate) const fn empty() -> Self {
-        Self::Empty
-    }
-
-    /// The resolve declined — see [`LinkBacking::declined`].
-    pub(crate) const fn declined() -> Self {
-        Self::Declined
-    }
-
-    /// The borrowed view every poster hands to the record.
-    pub fn as_link_backing(&self) -> LinkBacking<'_> {
-        match self {
-            Self::Resolved(map) => LinkBacking::resolved(map),
-            Self::Empty => LinkBacking::empty(),
-            Self::Declined => LinkBacking::declined(),
-        }
-    }
-}
-
-/// The first half of a poster's resolve — what
-/// [`PvDatabase::plan_link_backed_metadata_for_posts`](crate::server::database::PvDatabase::plan_link_backed_metadata_for_posts)
-/// learned under the record's own lock, for
-/// [`PvDatabase::resolve_link_backed_metadata_plan`](crate::server::database::PvDatabase::resolve_link_backed_metadata_plan)
-/// to walk with none held. The two answers a [`PostBacking`] can give without
-/// a walk are settled here; only `Links` locks another record.
-pub(crate) enum MetadataPlan {
-    /// See [`PostBacking::Empty`].
-    Empty,
-    /// See [`PostBacking::Declined`].
-    Declined,
-    /// The set links whose targets carry the metadata, by link field.
-    Links(Vec<(String, std::sync::Arc<crate::server::record::ParsedLink>)>),
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -424,8 +438,107 @@ pub struct RemoteAlarm {
     pub status: i32,
     /// Remote `alarm.message`. Empty when the remote carried none or
     /// the severity is `NO_ALARM` (pvxs clears `snap_message` unless
-    /// `snap_severity != 0` — `pvxs/ioc/pvalink_lset.cpp:418-422`).
-    pub message: String,
+    /// `snap_severity != 0` — `pvxs/ioc/pvalink_lset.cpp:418-422`). Shared
+    /// with the lset's cache, as [`LinkSet::alarm_message`].
+    pub message: Arc<str>,
+}
+
+/// The record field a link lives in — C's `plink->precord` and
+/// `dbLinkFieldName(plink)`, which pvxs `pvaOpenLink` keeps on its `pvaLink`
+/// to scan the holder on a monitor event (`pvalink_lset.cpp:91-92`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LinkHolder<'a> {
+    pub record: &'a [u8],
+    pub field: &'a str,
+    class: Option<crate::types::DbfLinkClass>,
+}
+
+impl<'a> LinkHolder<'a> {
+    /// `record`'s `field`, of a `record_type` record.
+    pub fn new(record_type: &str, record: &'a [u8], field: &'a str) -> Self {
+        Self {
+            record,
+            field,
+            class: crate::types::dbf_link_class(record_type, field),
+        }
+    }
+
+    /// The field's declared link class — what pvxs keeps as
+    /// `pvaLink::type` (`getLinkType`, `pvalink_lset.cpp:52-62`). `None` for
+    /// a field the type does not declare as a link.
+    pub fn class(&self) -> Option<crate::types::DbfLinkClass> {
+        self.class
+    }
+}
+
+/// Which link an lset call is for: one per installed parse, shared by its
+/// clones and never reused, so a relink is a new link even to the same name —
+/// C allocates a new `caLink` for it (`dbCa.c:389-414`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct LinkSerial(u64);
+
+impl LinkSerial {
+    /// A serial no other link has.
+    pub fn new() -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        Self(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    }
+}
+
+/// A fresh serial, like [`Self::new`]: a defaulted latch is a new link.
+impl Default for LinkSerial {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The link an lset call is for — C's `plink`, which every `lset` entry
+/// takes: the name the lset is addressed with (`pv_link.pvname`, scheme
+/// stripped, not necessarily UTF-8) and which link it is. An lset that keeps
+/// a channel per link, as dbCa does, keys it by [`Self::serial`]; one that
+/// shares a channel per name, as pvxs does, by `name`.
+#[derive(Clone, Copy, Debug)]
+pub struct LinkRef<'a> {
+    pub name: &'a [u8],
+    link: &'a crate::server::record::OpenLatch,
+}
+
+impl<'a> LinkRef<'a> {
+    pub fn new(name: &'a [u8], link: &'a crate::server::record::OpenLatch) -> Self {
+        Self { name, link }
+    }
+
+    pub fn serial(&self) -> LinkSerial {
+        self.link.serial()
+    }
+
+    /// The database removed the link ([`LinkSet::remove_link`]): an lset
+    /// that keeps a channel per link checks this under the lock it inserts
+    /// the channel under, so an open that was in flight across the removal
+    /// leaves nothing behind (`dbCaTask` services `CA_CLEAR_CHANNEL` ahead
+    /// of every other action, `dbCa.c:1200`).
+    pub fn is_removed(&self) -> bool {
+        self.link.is_removed()
+    }
+
+    /// A CP or CPP link ([`OpenLatch::processes_holder`](crate::server::record::OpenLatch::processes_holder)).
+    pub fn processes_holder(&self) -> bool {
+        self.link.processes_holder()
+    }
+
+    /// A `DBF_INLINK` ([`OpenLatch::is_input`](crate::server::record::OpenLatch::is_input)).
+    pub fn is_input(&self) -> bool {
+        self.link.is_input()
+    }
+}
+
+/// What an lset's [`LinkSet::open_link`] left the link with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LinkOpen {
+    /// The lset serves the link.
+    Lset,
+    /// The lset set `plink->lset = NULL` (`pvalink_lset.cpp:70-75`).
+    NoLset,
 }
 
 impl RemoteAlarm {
@@ -433,7 +546,7 @@ impl RemoteAlarm {
     /// exactly as pvxs `pvaGetAlarmMsg` (`pvxs/ioc/pvalink_lset.cpp:554`):
     /// `LINK_ALARM` when the remote severity is non-`NO_ALARM`, else
     /// `NO_ALARM`. status and severity cannot disagree by construction.
-    pub fn from_severity_message(severity: i32, message: String) -> Self {
+    pub fn from_severity_message(severity: i32, message: Arc<str>) -> Self {
         let status = if severity != 0 {
             crate::server::recgbl::alarm_status::LINK_ALARM as i32
         } else {
@@ -453,6 +566,10 @@ impl RemoteAlarm {
 /// mutability for any cached state. None / false is the
 /// "unavailable" sentinel — the database falls back to a generic
 /// LINK/INVALID alarm when an lset returns None.
+///
+/// A link `name` is the bytes of the link's PV name, as C hands
+/// `pv_link.pvname` to `dbCaAddLink`: a CA link may name a record that is
+/// not UTF-8.
 #[async_trait::async_trait]
 pub trait LinkSet: Send + Sync {
     /// True iff a fresh value is available for `name` without
@@ -461,10 +578,10 @@ pub trait LinkSet: Send + Sync {
     ///
     /// Synchronous: asked on the record-processing thread inside the
     /// record's advisory write gate. MUST NOT perform I/O.
-    fn is_connected(&self, name: &str) -> bool;
+    fn is_connected(&self, link: LinkRef<'_>) -> bool;
 
     /// True iff `name` has completed every post-connect init action
-    /// iocInit's external-link wait holds for — C `testInitReady`
+    /// `dbCaRun`'s wait holds for — C `testInitReady`
     /// (`dbCa.c:835-845` at `ef4829829`, epics-base #856 "dbCa: iocInit
     /// wait for all conditions" — post-`R7.0.10` and in no tag, so this
     /// is the one citation here that is not pin-relative): connected with
@@ -476,8 +593,8 @@ pub trait LinkSet: Send + Sync {
     /// Synchronous and non-blocking like `is_connected`; polled only by
     /// the iocInit wait. Default: `is_connected` — right for an lset
     /// with no post-connect init actions.
-    fn init_ready(&self, name: &str) -> bool {
-        self.is_connected(name)
+    fn init_ready(&self, link: LinkRef<'_>) -> bool {
+        self.is_connected(link)
     }
 
     /// Read the current value of `name`. Returns None when the
@@ -487,7 +604,7 @@ pub trait LinkSet: Send + Sync {
     /// MAY perform I/O (open the channel, issue a one-shot GET). It is
     /// therefore called only from the database's link work owner task —
     /// the record-processing path uses [`Self::get_cached_value`].
-    async fn get_value(&self, name: &str) -> Option<EpicsValue>;
+    async fn get_value(&self, link: LinkRef<'_>) -> Option<EpicsValue>;
 
     /// Read `name` from cached, monitor-fed state ONLY — the
     /// record-processing read. C `dbCaGetLink` (`dbCa.c:419-506`) copies
@@ -508,9 +625,54 @@ pub trait LinkSet: Send + Sync {
     /// open on the link work owner ([`Self::connect_link`]), which is
     /// what warms the cache for the next cycle. An lset that CAN answer
     /// from memory MUST override, or its links never read.
-    fn get_cached_value(&self, name: &str) -> Option<EpicsValue> {
-        let _ = name;
+    fn get_cached_value(&self, link: LinkRef<'_>) -> Option<EpicsValue> {
+        let _ = link;
         None
+    }
+
+    /// Whether this lset's `getValue` raised `"<field> Disconn"` on the
+    /// reading record when its read of `name` failed, as pvalink's
+    /// `pvaGetValue` does on a link that is not valid
+    /// (`pvalink_lset.cpp:263-268`) — before `dbGetLink`'s `setLinkAlarm`,
+    /// whose equal severity then leaves the message alone (`recGbl.c:242`).
+    /// Asked only after a failed read; MUST NOT perform I/O.
+    ///
+    /// Default `false`: `dbCaGetLink` raises nothing itself
+    /// (`dbCa.c:459-463`).
+    fn get_failure_disconn(&self, link: LinkRef<'_>) -> bool {
+        let _ = link;
+        false
+    }
+
+    /// C `lset->openLink` (`dbLink.c:194-199`, from `dbJLinkInit`,
+    /// `dbJLink.c:459`): where the lset settles what `name` is, asked of a
+    /// link naming this lset's scheme (`pva://`, `{pva:…}`), once per
+    /// link at iocInit (`doResolveLinks`, ahead of `init_record` pass 1,
+    /// `iocInit.c:576-577`) and once per put of the link, under the put's
+    /// hold where `dbPutFieldLink` runs `dbAddLink` (`dbAccess.c:1208`).
+    /// Synchronous and MUST NOT perform I/O; it may allocate and post to
+    /// errlog, as pvalink's open does (`pvalink_lset.cpp:64-75`).
+    /// [`LinkOpen::NoLset`] leaves the link [`ParsedLink::Removed`], which
+    /// every path treats as C treats `plink->lset == NULL` (`dbLink.c:224`,
+    /// `:336`, `:440`, `:479`). A local-PV test answers through
+    /// [`PvDatabase::has_name_no_resolve`](super::PvDatabase::has_name_no_resolve).
+    ///
+    /// [`ParsedLink::Removed`]: crate::server::record::ParsedLink::Removed
+    fn open_link(&self, holder: LinkHolder<'_>, link: LinkRef<'_>) -> LinkOpen {
+        let _ = (holder, link);
+        LinkOpen::Lset
+    }
+
+    /// C `lset->removeLink` (`dbLink.c:202-213`), from `dbPutFieldLink`'s
+    /// `dbRemoveLink` (`dbAccess.c:1167`) and `doCloseLinks`: `holder` no
+    /// longer carries `link`, which [`Self::open_link`] opened for it — or, for
+    /// a `ca` link, which `dbCaAddLink` added with no open, and which
+    /// `dbCaRemoveLink` clears (`dbCa.c:431-446`). Asked under the put's hold,
+    /// once the put has replaced or removed the link, before the open of
+    /// whatever replaced it; `link` already reads as removed. MUST NOT perform
+    /// I/O.
+    fn remove_link(&self, holder: LinkHolder<'_>, link: LinkRef<'_>) {
+        let _ = (holder, link);
     }
 
     /// Open (subscribe / connect) `name` so later
@@ -534,11 +696,37 @@ pub trait LinkSet: Send + Sync {
     /// runtime as a reason to open the channel synchronously on the
     /// caller — there is no caller thread that may block that way.
     ///
+    /// `init` is set for a local CA link opened before `dbCaRun`, which
+    /// waits until every clone of it drops: an lset that serves the link
+    /// from a local channel holds it until the first event's process has
+    /// run (C `CA_INIT_READY`, `dbCa.c:1323-1330`).
+    ///
     /// Default: drive the lset's own lazy open by reading through
     /// [`Self::get_value`] and discarding the result — correct for every
     /// existing lset, and it runs off the record-processing thread.
-    async fn connect_link(&self, name: &str) {
-        let _ = self.get_value(name).await;
+    async fn connect_link(&self, link: LinkRef<'_>, init: Option<super::CaLinkInit>) {
+        drop(init);
+        let _ = self.get_value(link).await;
+    }
+
+    /// The CP/CPP edge of `link` is published, perhaps after the link
+    /// opened: from here its events process its holder (`dbCa.c:958-962`).
+    /// An lset whose link runs an [`super::ExternalCpProcess`] calls its
+    /// [`super::ExternalCpProcess::join`]. A link not found here must not
+    /// have started its worker yet, or a pass between the start and the
+    /// publish misses its edge with no join to follow. MUST NOT perform I/O.
+    ///
+    /// Default: nothing — an lset with no `ExternalCpProcess`.
+    fn join_cp_link(&self, link: LinkRef<'_>) {
+        let _ = link;
+    }
+
+    /// The CA client a `ca` network half runs its links on, for the
+    /// channels a record opens itself ([`super::CaClientContext`]).
+    ///
+    /// Default: none.
+    fn ca_client_service(&self) -> Option<Arc<dyn super::CaClientService>> {
+        None
     }
 
     /// Non-blocking admission gate for an OUT-link write, asked on the
@@ -558,12 +746,22 @@ pub trait LinkSet: Send + Sync {
     /// one; so MUST an lset whose OUT links live in a different cache than
     /// its INP links (pvalink keys its registry on direction), or every OUT
     /// write to a perfectly healthy channel is refused.
-    fn put_admission(&self, name: &str) -> PutAdmission {
-        if self.is_connected(name) {
+    fn put_admission(&self, link: LinkRef<'_>) -> PutAdmission {
+        if self.is_connected(link) {
             PutAdmission::Connected
         } else {
             PutAdmission::Refused
         }
+    }
+
+    /// The native type and element count a put to `name` is converted to
+    /// on the record thread, C `pca->dbrType` / `pca->nelements`
+    /// (`dbCa.c:572-590`), from cached state like [`Self::put_admission`].
+    /// `None`: the link is down, or the lset converts in
+    /// [`Self::put_value`] itself (the default).
+    fn put_native(&self, link: LinkRef<'_>) -> Option<(crate::types::DbFieldType, u32)> {
+        let _ = link;
+        None
     }
 
     /// Write `value` to `name` with the delivery semantics named by
@@ -584,55 +782,56 @@ pub trait LinkSet: Send + Sync {
     /// method: the write is refused at `PvDatabase::external_put_gate` with
     /// nothing staged, C's shape for a put it cannot deliver
     /// (`db/dbCa.c:529-532` (`dbCaPutLinkCallback`); R7.0.10).
-    async fn put_value(&self, name: &str, value: EpicsValue, op: LinkPutOp) -> Result<(), String> {
-        let _ = (name, value, op);
+    async fn put_value(
+        &self,
+        link: LinkRef<'_>,
+        value: EpicsValue,
+        op: LinkPutOp,
+    ) -> Result<(), String> {
+        let _ = (link, value, op);
         Err("link set is read-only".into())
     }
 
-    /// Fire `name`'s forward link (FLNK): trigger the remote target to
-    /// process, transferring no value.
+    /// [`Self::put_value`], saying how its completion arrived, refused or
+    /// not. Default: [`LinkPutDone::Callback`], which only a local CA target
+    /// can refute.
     ///
-    /// The lset counterpart of C `dbScanFwdLink` → `lset->scanForward`
-    /// (`dbLink.c:475`), realised by the pvalink lset as `pvaScanForward`
-    /// (`pvxs/ioc/pvalink_lset.cpp:672-688`). A forward link is never
-    /// deferred ("FWD_LINK is never deferred, and always results in a
-    /// Put") and carries no staged value: it forces the remote record to
-    /// process when the source record fires its FLNK.
-    ///
-    /// The lset applies the same non-retry validity gate pvxs does
-    /// (`pvxs/ioc/pvalink_lset.cpp:677`): on a non-retry link that is not currently
-    /// connected it performs NO trigger and returns `Err`, so the caller
-    /// raises LINK/INVALID on the owning record — pvxs calls
-    /// `recGblSetSevrMsg(LINK_ALARM, INVALID_ALARM, "Disconn")` there.
-    ///
-    /// Default impl: `Ok(())` no-op. A read-only or DB-local lset
-    /// forwards nothing through this hook — a DB FLNK target is processed
-    /// directly by the database's `scanOnce` path (the DB lset's
-    /// `scanForward`), not through an external link set.
-    fn scan_forward(&self, name: &str) -> Result<(), String> {
-        let _ = name;
-        Ok(())
+    /// `holder` names the record the link is in, C `plink->precord`, for
+    /// the lset's own failure report ([`report_put_not_issued`]); `None` for
+    /// a put no record made.
+    async fn put_value_done(
+        &self,
+        link: LinkRef<'_>,
+        holder: Option<&[u8]>,
+        value: EpicsValue,
+        op: LinkPutOp,
+    ) -> (LinkPutDone, Result<(), String>) {
+        let _ = holder;
+        (LinkPutDone::Callback, self.put_value(link, value, op).await)
     }
 
-    /// Flush any OUT-link writes the lset has queued but not yet sent —
-    /// the production drain trigger for an async OUT channel owner.
+    /// Open `name` as a forward link: the handle its `scanForward` runs
+    /// through, C `lset->openLink` at `dbInitLink`/`dbAddLink` time, so a
+    /// dispatch resolves nothing (`dbLink.c:475`, `scanForward(plink)`).
     ///
-    /// Two queued states this drains: a write deferred for sibling
-    /// coalescing, and a write that failed mid-disconnect and is held
-    /// for replay once the upstream reconnects (`retry`). The database
-    /// calls this after every external OUT-link write so the
-    /// "retry on connect" path has a production caller from record
-    /// processing — not only test code. Default no-op: a synchronous
-    /// lset (DB links, a read-only lset) queues nothing.
-    ///
-    /// Mirrors the role of pvxs's shared `pvaLinkChannel::put()` being
-    /// driven from record processing rather than left to manual calls
-    /// (`pvxs/ioc/pvalink_lset.cpp:653`, `pvxs/ioc/pvalink_channel.cpp:220-280`).
-    async fn flush_puts(&self) {}
+    /// Called off the cycle path only, by the database's binding owner
+    /// (`PvDatabase::bind_external_forward`). Default: a handle that
+    /// forwards nothing — a read-only or DB-local lset has no
+    /// `scanForward`.
+    fn forward_handle(&self, link: LinkRef<'_>) -> Box<dyn LinkForward> {
+        let _ = link;
+        Box::new(NoForward)
+    }
 
     /// Most recent alarm message string from the upstream PV, when
     /// available. None means no alarm or no cache.
-    fn alarm_message(&self, _name: &str) -> Option<String> {
+    ///
+    /// The lset hands out the text it cached when the remote value arrived:
+    /// an alarmed link's every cycle stores it into the record's `namsg`
+    /// (`recGblSetSevrMsg`, `pvalink_lset.cpp:432-434`), and a shared text
+    /// makes that store a pointer compare. A new text is allocated once per
+    /// change of the remote message, never per call.
+    fn alarm_message(&self, _link: LinkRef<'_>) -> Option<Arc<str>> {
         None
     }
 
@@ -649,7 +848,7 @@ pub trait LinkSet: Send + Sync {
     /// gated and the record processing loop propagates it verbatim
     /// as a maximize-severity contribution. Mirrors pvxs
     /// `pvxs/ioc/pvalink_lset.cpp` `pvaGetAlarm` feeding `recGblSetSevr`.
-    fn alarm_severity(&self, _name: &str) -> Option<i32> {
+    fn alarm_severity(&self, _link: LinkRef<'_>) -> Option<i32> {
         None
     }
 
@@ -665,7 +864,7 @@ pub trait LinkSet: Send + Sync {
     /// behaviour for every non-`MSS` modifier and for lsets that leave
     /// this default. Mirrors `pvxs/ioc/pvalink_lset.cpp` `pvaGetAlarm`
     /// surfacing the remote `alarm.status` to `recGblSetSevrMsg`.
-    fn alarm_status(&self, _name: &str) -> Option<i32> {
+    fn alarm_status(&self, _link: LinkRef<'_>) -> Option<i32> {
         None
     }
 
@@ -689,16 +888,25 @@ pub trait LinkSet: Send + Sync {
     /// `None` means the lset cannot report a snapshot: no cache, the
     /// link is not connected (pvxs `CHECK_VALID` — `pvxs/ioc/pvalink_lset.cpp:548`),
     /// or the link set does not track remote alarms. Default: none.
-    fn remote_alarm(&self, _name: &str) -> Option<RemoteAlarm> {
+    fn remote_alarm(&self, _link: LinkRef<'_>) -> Option<RemoteAlarm> {
         None
     }
 
-    /// `(seconds_past_epoch, nanoseconds, userTag)` from the upstream
-    /// PV's timestamp slot, when available. The `userTag` is the remote
+    /// C `lset->getTimeStampTag`: `(seconds_past_epoch, nanoseconds,
+    /// userTag)` of the link's source. The `userTag` is the remote
     /// `timeStamp.userTag` widened to the 64-bit `epicsUTag` tag without
     /// sign extension, or `0` when the source carries none (CA links, or
-    /// a PVA source whose timeStamp omits the field).
-    fn time_stamp(&self, _name: &str) -> Option<(i64, i32, u64)> {
+    /// a PVA source whose timeStamp omits the field). `None` is C's non-zero
+    /// return.
+    fn time_stamp(&self, _link: LinkRef<'_>) -> Option<(i64, i32, u64)> {
+        None
+    }
+
+    /// The stamp this lset's `getValue` writes into the reading record's
+    /// `TIME` and `UTAG`, in [`Self::time_stamp`]'s shape. Only pvalink's
+    /// `time=true` writes one, on a failed read as well
+    /// (`pvalink_lset.cpp:268-272`, `:438-442`); `None` leaves them alone.
+    fn read_time_stamp(&self, _link: LinkRef<'_>) -> Option<(i64, i32, u64)> {
         None
     }
 
@@ -719,7 +927,7 @@ pub trait LinkSet: Send + Sync {
     /// piece of metadata — the record then keeps its local default,
     /// matching the C getters that leave the caller's buffer
     /// untouched on a missing sub-field. Default impl: no metadata.
-    fn link_metadata(&self, _name: &str) -> Option<LinkMetadata> {
+    fn link_metadata(&self, _link: LinkRef<'_>) -> Option<LinkMetadata> {
         None
     }
 
@@ -727,7 +935,7 @@ pub trait LinkSet: Send + Sync {
     /// actively tracking). Used by `dbpvxr` to dump per-record
     /// link state without forcing the caller to know the full
     /// name list up-front.
-    fn link_names(&self) -> Vec<String> {
+    fn link_names(&self) -> Vec<crate::types::RecordName> {
         Vec::new()
     }
 
@@ -745,8 +953,21 @@ pub trait LinkSet: Send + Sync {
     /// Default: `None`, i.e. "this lset has no per-link report state".
     /// Such an lset's links are invisible to `dbcar`, which is right — C's
     /// `dbcar` walks `plink->type == CA_LINK` and no other link flavour.
-    async fn link_diagnostics(&self, _name: &str) -> Option<LinkDiagnostics> {
+    async fn link_diagnostics(&self, _link: LinkRef<'_>) -> Option<LinkDiagnostics> {
         None
+    }
+
+    /// The lines `dbjlr` prints for `link`, held in a field of `class`, at
+    /// `indent` spaces: C `dbJLinkReport` calling the link's jlif `report`
+    /// (`dbJLink.c:468-471`). Default: none, as for a jlif with no `report`.
+    fn report(
+        &self,
+        _link: LinkRef<'_>,
+        _class: Option<crate::types::DbfLinkClass>,
+        _level: i32,
+        _indent: usize,
+    ) -> Vec<String> {
+        Vec::new()
     }
 }
 
@@ -779,7 +1000,11 @@ impl LinkSetRegistry {
     /// Look up the lset for `scheme`. Returns `None` when nothing is
     /// registered under that scheme.
     pub fn get(&self, scheme: &str) -> Option<DynLinkSet> {
-        self.inner.get(scheme).cloned()
+        self.get_ref(scheme).cloned()
+    }
+
+    pub(crate) fn get_ref(&self, scheme: &str) -> Option<&DynLinkSet> {
+        self.inner.get(scheme)
     }
 
     /// Names of every registered scheme (`["pva", "ca", ...]`).
@@ -801,17 +1026,62 @@ impl LinkSetRegistry {
 mod tests {
     use super::*;
 
+    /// Boundaries of `dbCaPutLinkCallback`'s two conversion rows: the scalar
+    /// row (one element to a one-element channel) takes the empty string as
+    /// 0, the array row refuses it, and a refused element refuses the put.
+    #[test]
+    fn link_put_convert_picks_cs_row_by_count() {
+        use crate::types::{DbFieldType as T, PvString};
+        let conv = |v, t, n| link_put_convert(b"RMT", v, t, n);
+        let s = |t: &str| EpicsValue::String(t.into());
+        let strings =
+            |ts: &[&str]| EpicsValue::StringArray(ts.iter().map(|&t| PvString::from(t)).collect());
+        assert!(conv(s("abc"), T::Double, 1).is_err());
+        assert_eq!(conv(s("0x10"), T::Long, 1), Ok(EpicsValue::Long(16)));
+        assert_eq!(conv(s(""), T::Double, 1), Ok(EpicsValue::Double(0.0)));
+        assert!(conv(s(""), T::Double, 3).is_err());
+        assert!(conv(strings(&["1", "x"]), T::Long, 2).is_err());
+        // Clamped before converting: the element past `nelements` is not read.
+        assert_eq!(
+            conv(strings(&["1", "2", "x"]), T::Long, 2),
+            Ok(EpicsValue::LongArray(vec![1, 2].into()))
+        );
+        assert_eq!(conv(s("abc"), T::String, 1), Ok(s("abc")));
+        assert_eq!(
+            conv(EpicsValue::Double(2.5), T::Long, 1),
+            Ok(EpicsValue::Long(2))
+        );
+    }
+
+    /// Boundary: a string to an enum channel stays one string, the first
+    /// element of an array, cut to 39 bytes as `cvt_st_st` cuts it.
+    #[test]
+    fn link_put_convert_sends_a_string_to_an_enum_channel_as_one_string() {
+        use crate::types::{DbFieldType as T, PvString};
+        let conv = |v| link_put_convert(b"RMT", v, T::Enum, 1);
+        let s = |t: &str| EpicsValue::String(t.into());
+        assert_eq!(conv(s("two")), Ok(s("two")));
+        assert_eq!(
+            conv(EpicsValue::StringArray(
+                ["one", "two"].iter().map(|&t| PvString::from(t)).collect()
+            )),
+            Ok(s("one"))
+        );
+        assert_eq!(conv(s(&"x".repeat(45))), Ok(s(&"x".repeat(39))));
+        assert_eq!(conv(EpicsValue::Long(2)), Ok(EpicsValue::Enum(2)));
+    }
+
     struct StubLset;
     #[async_trait::async_trait]
     impl LinkSet for StubLset {
-        fn is_connected(&self, _: &str) -> bool {
+        fn is_connected(&self, _: LinkRef<'_>) -> bool {
             true
         }
-        fn get_cached_value(&self, _: &str) -> Option<EpicsValue> {
+        fn get_cached_value(&self, _: LinkRef<'_>) -> Option<EpicsValue> {
             Some(EpicsValue::Long(42))
         }
-        async fn get_value(&self, name: &str) -> Option<EpicsValue> {
-            self.get_cached_value(name)
+        async fn get_value(&self, link: LinkRef<'_>) -> Option<EpicsValue> {
+            self.get_cached_value(link)
         }
     }
 
@@ -822,8 +1092,10 @@ mod tests {
         reg.register("pva", Arc::new(StubLset));
         assert_eq!(reg.len(), 1);
         let lset = reg.get("pva").expect("registered");
-        assert!(lset.is_connected("anything"));
-        assert_eq!(lset.get_value("anything").await, Some(EpicsValue::Long(42)));
+        let open = crate::server::record::OpenLatch::default();
+        let link = LinkRef::new(b"anything", &open);
+        assert!(lset.is_connected(link));
+        assert_eq!(lset.get_value(link).await, Some(EpicsValue::Long(42)));
     }
 
     #[test]
@@ -832,49 +1104,25 @@ mod tests {
         assert!(reg.get("missing").is_none());
     }
 
-    /// The window the poster gate opens, and why `Declined` is not an empty
-    /// map. The gate is asked under a read lock the link walk then releases;
-    /// a subscriber can attach before the post takes the write lock. Driven
-    /// by hand here — the interleaving is not reproducible on demand, but a
-    /// declined backing is exactly the state it leaves behind, so the post's
-    /// behaviour on one is the whole of the fix.
-    ///
-    /// C closes this by lock discipline: `db_add_event` takes `dbScanLock`
-    /// on the record's lock set, which `dbProcess` holds across the cycle,
-    /// so a monitor attaching mid-cycle joins after it and first hears from
-    /// the NEXT process. Refusing reproduces that outcome.
+    /// A subscriber that attaches after a put reads the record and before it
+    /// posts receives the post, link-backed field or not: C's
+    /// `db_post_events` posts to whoever is attached when it runs, and a post
+    /// carries no metadata a later reader could find missing.
     #[epics_macros_rs::epics_test]
-    async fn a_late_subscriber_is_refused_rather_than_served_the_records_own_seed() {
+    async fn a_late_subscriber_receives_the_post() {
         use crate::server::recgbl::EventMask;
         use crate::types::DbFieldType;
 
         let db = crate::server::database::PvDatabase::new();
-        // PREC 1 / `mm` deliberately unlike the calc's own PREC 7 / `V`, so
-        // serving the record instead of the link would be visible.
-        let mut src = crate::server::records::ai::AiRecord::new(1.0);
-        src.egu = "mm".into();
-        src.prec = 1;
+        let src = crate::server::records::ai::AiRecord::new(1.0);
         db.add_record("SRC", Box::new(src)).await.unwrap();
         let mut calc = crate::server::records::calc::CalcRecord::default();
-        calc.egu = "V".into();
-        calc.prec = 7;
         calc.set_inp_link(0, "SRC");
         calc.calc = "A+1".into();
         db.add_record("CALC", Box::new(calc)).await.unwrap();
         db.ioc_init().await;
 
         let rec = db.get_record("CALC").expect("record exists");
-
-        // Nobody subscribed: the gate declines. An empty map here would be
-        // indistinguishable from "walked the links and found nothing", which
-        // is what let the seed through.
-        let backing = db.resolve_link_backed_metadata_for_posts(&rec);
-        assert!(
-            backing.as_link_backing().is_declined(),
-            "with no subscribers the poster door declines rather than resolving"
-        );
-
-        // The subscribers arrive inside the window.
         let full = (EventMask::VALUE | EventMask::LOG).bits();
         let mut a_rx = rec
             .write()
@@ -885,19 +1133,12 @@ mod tests {
             .add_subscriber("VAL", 2, DbFieldType::Double, full)
             .expect("VAL subscriber");
 
-        // The post the cycle goes on to make, with the backing it is holding.
         rec.write()
-            .notify_field_with_origin("A", EventMask::VALUE, 0, backing.as_link_backing());
+            .notify_field_with_origin("A", EventMask::VALUE, 0);
         rec.write()
-            .notify_field_with_origin("VAL", EventMask::VALUE, 0, backing.as_link_backing());
+            .notify_field_with_origin("VAL", EventMask::VALUE, 0);
 
-        assert!(
-            a_rx.try_recv().is_err(),
-            "A is link-backed and nothing was resolved: the event is refused,              not sent carrying CALC's own PREC 7 where SRC's PREC 1 belongs"
-        );
-        assert!(
-            val_rx.try_recv().is_ok(),
-            "VAL is not link-backed: a declined backing costs it nothing"
-        );
+        assert!(a_rx.try_recv().is_ok(), "A is link-backed and still posts");
+        assert!(val_rx.try_recv().is_ok(), "VAL posts");
     }
 }

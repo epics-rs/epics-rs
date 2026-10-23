@@ -1,0 +1,235 @@
+error: `self.0` is a `f64` formatted with Rust's float spelling
+  --> $DIR/main.rs:19:9
+   |
+LL |         self.0.fmt(f)
+   |         ^^^^^^^^^^^^^
+   |
+   = help: format `CFloat(..)` (`.g()` for %g) as the C text does, or allow the argument in dylint.toml with the C reason
+   = note: `#[deny(raw_float_format)]` on by default
+
+error: `self.0` is a `f64` formatted with Rust's float spelling
+  --> $DIR/main.rs:27:27
+   |
+LL |         fmt::Display::fmt(&self.0, f)?;
+   |                           ^^^^^^^
+   |
+   = help: format `CFloat(..)` (`.g()` for %g) as the C text does, or allow the argument in dylint.toml with the C reason
+
+error: `self.1` is a `f32` formatted with Rust's float spelling
+  --> $DIR/main.rs:28:37
+   |
+LL |         <f32 as fmt::LowerExp>::fmt(&self.1, f)
+   |                                     ^^^^^^^
+   |
+   = help: format `CFloat(..)` (`.g()` for %g) as the C text does, or allow the argument in dylint.toml with the C reason
+
+error: `x` is a `f64` formatted with Rust's float spelling
+  --> $DIR/main.rs:81:27
+   |
+LL |     let _ = format!("{}", x);
+   |                           ^
+   |
+   = help: format `CFloat(..)` (`.g()` for %g) as the C text does, or allow the argument in dylint.toml with the C reason
+
+error: `x` is a `f64` formatted with Rust's float spelling
+  --> $DIR/main.rs:82:23
+   |
+LL |     let _ = format!("{x}");
+   |                       ^
+   |
+   = help: format `CFloat(..)` (`.g()` for %g) as the C text does, or allow the argument in dylint.toml with the C reason
+
+error: `y` is a `f32` formatted with Rust's float spelling
+  --> $DIR/main.rs:83:29
+   |
+LL |     let _ = format!("{:?}", y);
+   |                             ^
+   |
+   = help: format `CFloat(..)` (`.g()` for %g) as the C text does, or allow the argument in dylint.toml with the C reason
+
+error: `x` is a `f64` formatted with Rust's float spelling
+  --> $DIR/main.rs:84:34
+   |
+LL |     let _ = format!("{:e} {:E}", x, x);
+   |                                  ^
+   |
+   = help: format `CFloat(..)` (`.g()` for %g) as the C text does, or allow the argument in dylint.toml with the C reason
+
+error: `x` is a `f64` formatted with Rust's float spelling
+  --> $DIR/main.rs:84:37
+   |
+LL |     let _ = format!("{:e} {:E}", x, x);
+   |                                     ^
+   |
+   = help: format `CFloat(..)` (`.g()` for %g) as the C text does, or allow the argument in dylint.toml with the C reason
+
+error: `r` is a `f64` formatted with Rust's float spelling
+  --> $DIR/main.rs:85:30
+   |
+LL |     let _ = format!("{:.3}", r);
+   |                              ^
+   |
+   = help: format `CFloat(..)` (`.g()` for %g) as the C text does, or allow the argument in dylint.toml with the C reason
+
+error: `x * 2.0` is a `f64` formatted with Rust's float spelling
+  --> $DIR/main.rs:86:20
+   |
+LL |     println!("{}", x * 2.0);
+   |                    ^^^^^^^
+   |
+   = help: format `CFloat(..)` (`.g()` for %g) as the C text does, or allow the argument in dylint.toml with the C reason
+
+error: `Some(x)` is a `std::option::Option<f64>` formatted with Rust's float spelling
+  --> $DIR/main.rs:88:39
+   |
+LL |     let _ = format!("{} {:?}", 3_i32, Some(x));
+   |                                       ^^^^^^^
+   |
+   = help: format `CFloat(..)` (`.g()` for %g) as the C text does, or allow the argument in dylint.toml with the C reason
+
+error: `x` is a `f64` formatted with Rust's float spelling
+  --> $DIR/main.rs:89:13
+   |
+LL |     let _ = x.to_string();
+   |             ^^^^^^^^^^^^^
+   |
+   = help: format `CFloat(..)` (`.g()` for %g) as the C text does, or allow the argument in dylint.toml with the C reason
+
+error: `render` is a `f64` formatted with Rust's float spelling
+  --> $DIR/main.rs:91:13
+   |
+LL |     let _ = render(&[x]);
+   |             ^^^^^^^^^^^^
+   |
+   = help: format `CFloat(..)` (`.g()` for %g) as the C text does, or allow the argument in dylint.toml with the C reason
+
+error: `ToString::to_string` is a `f32` formatted with Rust's float spelling
+  --> $DIR/main.rs:93:28
+   |
+LL |     let _ = [y].iter().map(ToString::to_string).count();
+   |                            ^^^^^^^^^^^^^^^^^^^
+   |
+   = help: format `CFloat(..)` (`.g()` for %g) as the C text does, or allow the argument in dylint.toml with the C reason
+
+error: `Box::new(x)` is a `std::boxed::Box<f64>` formatted with Rust's float spelling
+  --> $DIR/main.rs:94:27
+   |
+LL |     let _ = format!("{}", Box::new(x));
+   |                           ^^^^^^^^^^^
+   |
+   = help: format `CFloat(..)` (`.g()` for %g) as the C text does, or allow the argument in dylint.toml with the C reason
+
+error: `Rc::new(x)` is a `std::rc::Rc<f64>` formatted with Rust's float spelling
+  --> $DIR/main.rs:95:30
+   |
+LL |     let _ = format!("{} {}", Rc::new(x), Arc::new(&y));
+   |                              ^^^^^^^^^^
+   |
+   = help: format `CFloat(..)` (`.g()` for %g) as the C text does, or allow the argument in dylint.toml with the C reason
+
+error: `Arc::new(&y)` is a `std::sync::Arc<&f32>` formatted with Rust's float spelling
+  --> $DIR/main.rs:95:42
+   |
+LL |     let _ = format!("{} {}", Rc::new(x), Arc::new(&y));
+   |                                          ^^^^^^^^^^^^
+   |
+   = help: format `CFloat(..)` (`.g()` for %g) as the C text does, or allow the argument in dylint.toml with the C reason
+
+error: `Box::new(x)` is a `std::boxed::Box<f64>` formatted with Rust's float spelling
+  --> $DIR/main.rs:97:13
+   |
+LL |     let _ = Box::new(x).to_string();
+   |             ^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: format `CFloat(..)` (`.g()` for %g) as the C text does, or allow the argument in dylint.toml with the C reason
+
+error: `Arc::new(y)` is a `std::sync::Arc<f32>` formatted with Rust's float spelling
+  --> $DIR/main.rs:98:13
+   |
+LL |     let _ = Arc::new(y).to_string();
+   |             ^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: format `CFloat(..)` (`.g()` for %g) as the C text does, or allow the argument in dylint.toml with the C reason
+
+error: `vec![x]` is a `std::vec::Vec<f64>` formatted with Rust's float spelling
+  --> $DIR/main.rs:99:29
+   |
+LL |     let _ = format!("{:?}", vec![x]);
+   |                             ^^^^^^^
+   |
+   = help: format `CFloat(..)` (`.g()` for %g) as the C text does, or allow the argument in dylint.toml with the C reason
+
+error: `(1_u8, y)` is a `(u8, f32)` formatted with Rust's float spelling
+  --> $DIR/main.rs:100:29
+   |
+LL |     let _ = format!("{:?}", (1_u8, y));
+   |                             ^^^^^^^^^
+   |
+   = help: format `CFloat(..)` (`.g()` for %g) as the C text does, or allow the argument in dylint.toml with the C reason
+
+error: `[x; 2]` is a `[f64; 2]` formatted with Rust's float spelling
+  --> $DIR/main.rs:101:29
+   |
+LL |     let _ = format!("{:?}", [x; 2]);
+   |                             ^^^^^^
+   |
+   = help: format `CFloat(..)` (`.g()` for %g) as the C text does, or allow the argument in dylint.toml with the C reason
+
+error: `[r][..]` is a `[&f64]` formatted with Rust's float spelling
+  --> $DIR/main.rs:102:29
+   |
+LL |     let _ = format!("{:?}", &[r][..]);
+   |                             ^^^^^^^^
+   |
+   = help: format `CFloat(..)` (`.g()` for %g) as the C text does, or allow the argument in dylint.toml with the C reason
+
+error: `Some(&r)` is a `std::option::Option<&&f64>` formatted with Rust's float spelling
+  --> $DIR/main.rs:103:29
+   |
+LL |     let _ = format!("{:?}", Some(&r));
+   |                             ^^^^^^^^
+   |
+   = help: format `CFloat(..)` (`.g()` for %g) as the C text does, or allow the argument in dylint.toml with the C reason
+
+error: `BTreeMap::from([(1_u8, x)])` is a `std::collections::BTreeMap<u8, f64>` formatted with Rust's float spelling
+  --> $DIR/main.rs:104:29
+   |
+LL |     let _ = format!("{:?}", BTreeMap::from([(1_u8, x)]));
+   |                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: format `CFloat(..)` (`.g()` for %g) as the C text does, or allow the argument in dylint.toml with the C reason
+
+error: `vec![y]` is a `std::vec::Vec<f32>` formatted with Rust's float spelling
+  --> $DIR/main.rs:114:18
+   |
+LL |     let _ = show(vec![y]);
+   |                  ^^^^^^^
+   |
+   = help: format `CFloat(..)` (`.g()` for %g) as the C text does, or allow the argument in dylint.toml with the C reason
+
+error: `Ok::<(), Vec<f64>>(())` is a `std::vec::Vec<f64>` formatted with Rust's float spelling
+  --> $DIR/main.rs:115:5
+   |
+LL |     Ok::<(), Vec<f64>>(()).unwrap();
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: format `CFloat(..)` (`.g()` for %g) as the C text does, or allow the argument in dylint.toml with the C reason
+
+error: `x` is a `f64` formatted with Rust's float spelling
+  --> $DIR/main.rs:116:32
+   |
+LL |     let _: &dyn fmt::Display = &x;
+   |                                ^^
+   |
+   = help: format `CFloat(..)` (`.g()` for %g) as the C text does, or allow the argument in dylint.toml with the C reason
+
+error: `Box::new(Some(y))` is a `std::option::Option<f32>` formatted with Rust's float spelling
+  --> $DIR/main.rs:117:34
+   |
+LL |     let _: Box<dyn fmt::Debug> = Box::new(Some(y));
+   |                                  ^^^^^^^^^^^^^^^^^
+   |
+   = help: format `CFloat(..)` (`.g()` for %g) as the C text does, or allow the argument in dylint.toml with the C reason
+
+error: aborting due to 29 previous errors
+

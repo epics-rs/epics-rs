@@ -23,7 +23,17 @@ record(longout, "$(P)address") {
 }
 record(bo,        "$(P)current:low")
 record(bo,        "$(P)current:ok")
-record(bo,        "$(P)error")
+# C defect: a bo, and sncqxbpm.st writes ERROR_COMM_ERROR (2) into it,
+# which a client read as Illegal_Value.
+record(mbbo, "$(P)error") {
+	field(DESC, "error code")
+	field(ZRVL, "0")
+	field(ONVL, "1")
+	field(TWVL, "2")
+	field(ZRST, "no error")
+	field(ONST, "unknown")
+	field(TWST, "comm error")
+}
 record(stringout, "$(P)errMsg")
 record(longout,   "$(P)debug")
 record(ao, "$(P)pos:x") {

@@ -1,0 +1,15 @@
+Terminator = CR LF;
+wl { out "B%d"; }
+wu { out "B%u"; }
+we { out "B%{OFF|ON}"; }
+ws { out "B%s"; }
+wd { out "B%f"; }
+il { out "W%d"; @init { out "I"; in "%d"; } }
+iu { out "W%u"; @init { out "I"; in "%u"; } }
+ie { out "W%d"; @init { out "I"; in "%{OFF|ON}"; } }
+is { out "W%d"; @init { out "I"; in "%s"; } }
+id { out "W%d"; @init { out "I"; in "%f"; } }
+rl { out "W%d"; in "%d"; }
+rs { out "W%d"; in "%s"; }
+ii { in "V=%d"; }
+ir { out "W%d"; @init { out "I%d"; in "%d"; } }

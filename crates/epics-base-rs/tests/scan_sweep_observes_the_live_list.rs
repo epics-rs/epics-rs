@@ -128,6 +128,8 @@ async fn probe(
 #[epics_macros_rs::epics_test]
 async fn a_record_removed_ahead_of_the_cursor_does_not_process() {
     let db = Arc::new(PvDatabase::new());
+    // No `iocRun` over this database: the running transition is its own.
+    db.scan_control().run();
     let mutator = probe(
         &db,
         "M",
@@ -158,6 +160,8 @@ async fn a_record_removed_ahead_of_the_cursor_does_not_process() {
 #[epics_macros_rs::epics_test]
 async fn a_record_moved_to_another_list_does_not_process_on_this_one() {
     let db = Arc::new(PvDatabase::new());
+    // No `iocRun` over this database: the running transition is its own.
+    db.scan_control().run();
     let mutator = probe(
         &db,
         "M",
@@ -185,6 +189,8 @@ async fn a_record_moved_to_another_list_does_not_process_on_this_one() {
 #[epics_macros_rs::epics_test]
 async fn a_record_removed_behind_the_cursor_still_processed_once() {
     let db = Arc::new(PvDatabase::new());
+    // No `iocRun` over this database: the running transition is its own.
+    db.scan_control().run();
     let victim = probe(&db, "V", 0, None).await;
     let mutator = probe(
         &db,
@@ -226,6 +232,8 @@ async fn a_record_removed_behind_the_cursor_still_processed_once() {
 #[epics_macros_rs::epics_test]
 async fn a_record_removed_at_the_cursor_does_not_stall_the_sweep() {
     let db = Arc::new(PvDatabase::new());
+    // No `iocRun` over this database: the running transition is its own.
+    db.scan_control().run();
     let head = probe(&db, "H", 0, None).await;
     let mutator = probe(&db, "M", 1, None).await;
     let tail = probe(&db, "T", 2, None).await;
@@ -244,11 +252,11 @@ async fn a_record_removed_at_the_cursor_does_not_stall_the_sweep() {
     )
     .await
     .unwrap();
-    db.get_record("M")
-        .unwrap()
-        .write()
-        .put_common_field("FLNK", EpicsValue::String("K".into()))
+    db.put_pv_no_process("M.FLNK", EpicsValue::String("K".into()))
+        .await
         .unwrap();
+    // The forward links bind at iocInit, as C's do.
+    db.ioc_init().await;
 
     db.post_event().await;
 
@@ -275,6 +283,8 @@ async fn a_record_removed_at_the_cursor_does_not_stall_the_sweep() {
 #[epics_macros_rs::epics_test]
 async fn a_record_re_keyed_ahead_of_the_cursor_is_still_processed() {
     let db = Arc::new(PvDatabase::new());
+    // No `iocRun` over this database: the running transition is its own.
+    db.scan_control().run();
     let mutator = probe(
         &db,
         "M",
@@ -302,6 +312,8 @@ async fn a_record_re_keyed_ahead_of_the_cursor_is_still_processed() {
 #[epics_macros_rs::epics_test]
 async fn a_record_re_keyed_behind_the_cursor_does_not_process() {
     let db = Arc::new(PvDatabase::new());
+    // No `iocRun` over this database: the running transition is its own.
+    db.scan_control().run();
     let mutator = probe(
         &db,
         "M",
@@ -329,6 +341,8 @@ async fn a_record_re_keyed_behind_the_cursor_does_not_process() {
 #[epics_macros_rs::epics_test]
 async fn an_untouched_list_hands_out_every_record_exactly_once() {
     let db = Arc::new(PvDatabase::new());
+    // No `iocRun` over this database: the running transition is its own.
+    db.scan_control().run();
     let a = probe(&db, "A", 2, None).await;
     let b = probe(&db, "B", 0, None).await;
     let c = probe(&db, "C", 1, None).await;

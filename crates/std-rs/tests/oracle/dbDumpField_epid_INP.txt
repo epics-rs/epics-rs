@@ -1,0 +1,18 @@
+recordtype(epid) 
+    INP
+	         prompt: Controlled Value Loc
+	          extra: 
+	      indRecordType: 51
+	        special: 0 
+	     field_type: DBF_INLINK
+	process_passive: 0
+	       property: 0
+	           base: 0
+	    promptgroup: 40 - Input
+	       interest: 1
+	       as_level: 1
+	        initial: 
+	           size: 80
+	         offset: 784
+Attribute: name RTYP value epid
+Attribute: name VERS value none specified

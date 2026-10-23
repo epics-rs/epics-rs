@@ -9,7 +9,7 @@ pub mod error;
 pub mod in_process;
 pub mod tracker;
 
-pub use client::{ConnectionState, RuntimeClient};
+pub use client::{ConnectionState, EventReceiver, RuntimeClient};
 pub use error::TransportError;
 pub use in_process::InProcessClient;
 pub use tracker::RequestTracker;

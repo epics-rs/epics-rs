@@ -49,9 +49,11 @@
 //! the broadcast port, NOT TCP name servers), `autoaddrlist` toggles
 //! per-NIC directed-broadcast expansion, `serverport` is the default
 //! connect port, and `bcastport` is the UDP SEARCH / beacon port. The
-//! server section's `interface` is likewise an address *list*
-//! (`EPICS_PVAS_INTF_ADDR_LIST`, `gwmain.cpp:164`), binding every listed
-//! NIC.
+//! server section's `interface` becomes `EPICS_PVAS_INTF_ADDR_LIST`
+//! (`gwmain.cpp:164`). pva2pva's pvAccessCPP reads that as one IPv4 address
+//! (`configuration.cpp:84-99`, `serverContext.cpp:122-128`, `TODO multiple
+//! addresses`); taking a pvxs-style list that binds every entry is an rs
+//! extension.
 
 // On `exec_backend` this program's `main` refuses instead of running, so
 // everything below it is unreachable in that configuration by construction.
@@ -60,7 +62,7 @@
 #![cfg_attr(exec_backend, allow(dead_code, unused_imports))]
 
 use std::fs;
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -352,39 +354,30 @@ fn validate(cfg: &GatewayConfigFile) -> Result<(), String> {
     Ok(())
 }
 
-/// Parse a server `interface` field — an EPICS-style whitespace-separated
-/// address list (`EPICS_PVAS_INTF_ADDR_LIST`, gwmain.cpp:164). Each token is
-/// a bare IP literal; the list binds the PVA server's TCP/UDP responders to
-/// those interfaces. Empty / blank input yields an empty list (the caller
-/// defaults that to the all-NIC wildcard bind). Hostname resolution is not
-/// applied here — the env-driven path
-/// (`epics_pva_rs::config::server_intf_addr_list`) owns DNS resolution; this
-/// matches the prior single-`interface` parser's numeric-literal fidelity.
-fn parse_interface_list(list: &str) -> Result<Vec<IpAddr>, String> {
-    let mut out = Vec::new();
-    for tok in list.split_whitespace() {
-        match tok.parse::<IpAddr>() {
-            Ok(ip) => out.push(ip),
-            Err(_) => return Err(format!("invalid interface '{tok}'")),
-        }
-    }
-    Ok(out)
-}
-
-/// Resolve a parsed interface list into the `(bind_ip, interfaces)` pair the
-/// [`PvaServerConfig`] runtime consumes. A wildcard entry (or no entry)
-/// collapses to the all-NIC bind — empty `interfaces` so the runtime's
-/// all-NIC TCP/UDP default applies (runtime.rs `tcp_bind_addresses` /
-/// `bind_on_interfaces`), carrying the wildcard's family as `bind_ip`. An
-/// explicit, wildcard-free list binds exactly those NICs.
-fn resolve_server_bind(intf_ips: Vec<IpAddr>) -> (IpAddr, Vec<IpAddr>) {
-    if let Some(wildcard) = intf_ips.iter().find(|ip| ip.is_unspecified()) {
-        (*wildcard, Vec::new())
-    } else if let Some(first) = intf_ips.first().copied() {
-        (first, intf_ips)
-    } else {
-        (IpAddr::V4(Ipv4Addr::UNSPECIFIED), Vec::new())
-    }
+/// The downstream server config for one `servers` entry. `interface` is
+/// `EPICS_PVAS_INTF_ADDR_LIST` (`gwmain.cpp:164`): a single IPv4 address in
+/// pva2pva's pvAccessCPP (`serverContext.cpp:122-128`), a list here as an rs
+/// extension, resolved, sorted and refused exactly as the env list is.
+fn downstream_config(s: &ServerSpec) -> Result<PvaServerConfig, String> {
+    let interfaces =
+        epics_pva_rs::config::resolve_server_intf_addr_list(&s.interface, s.serverport)
+            .map_err(|e| format!("server '{}': {e}", s.name))?
+            .unwrap_or_default();
+    // server addrlist × bcastport → beacon destinations
+    // (EPICS_PVAS_BEACON_ADDR_LIST; gwmain.cpp:160-166 configure_server).
+    // Use the endpoint-preserving parser so a multicast beacon target's
+    // `,ttl@iface` modifiers (pvxs SockEndpoint grammar) reach the UDP
+    // send path. Malformed tokens are dropped with a debug log — pvxs
+    // parity: a bad beacon address never aborts server startup.
+    let beacon = epics_pva_rs::config::parse_endpoints_with_port(&s.addrlist, s.bcastport);
+    Ok(PvaServerConfig {
+        tcp_port: s.serverport,
+        udp_port: s.bcastport,
+        interfaces,
+        beacon_destinations: beacon,
+        auto_beacon: s.autoaddrlist,
+        ..PvaServerConfig::default()
+    })
 }
 
 /// Build (but do not run) the multi-tenant gateway described by `cfg`.
@@ -427,31 +420,7 @@ fn build_gateway(
     }
 
     for s in &cfg.servers {
-        // gwmain.cpp:164 configure_server maps the server `interface` onto
-        // EPICS_PVAS_INTF_ADDR_LIST — an address *list*, binding the PVA
-        // server's TCP/UDP responders to every listed NIC, not a single
-        // interface. The server_native runtime already binds a Vec of
-        // interfaces (runtime.rs tcp_bind_addresses / udp_interfaces); parse
-        // the list and feed it through.
-        let intf_ips =
-            parse_interface_list(&s.interface).map_err(|e| format!("server '{}': {e}", s.name))?;
-        let (bind_ip, interfaces) = resolve_server_bind(intf_ips);
-        // server addrlist × bcastport → beacon destinations
-        // (EPICS_PVAS_BEACON_ADDR_LIST; gwmain.cpp:160-166 configure_server).
-        // Use the endpoint-preserving parser so a multicast beacon target's
-        // `,ttl@iface` modifiers (pvxs SockEndpoint grammar) reach the UDP
-        // send path. Malformed tokens are dropped with a debug log — pvxs
-        // parity: a bad beacon address never aborts server startup.
-        let beacon = epics_pva_rs::config::parse_endpoints_with_port(&s.addrlist, s.bcastport);
-        let server_config = PvaServerConfig {
-            tcp_port: s.serverport,
-            udp_port: s.bcastport,
-            bind_ip,
-            interfaces,
-            beacon_destinations: beacon,
-            auto_beacon: s.autoaddrlist,
-            ..PvaServerConfig::default()
-        };
+        let server_config = downstream_config(s)?;
         let upstream_refs: Vec<&str> = s.clients.iter().map(String::as_str).collect();
         let control_prefix = s.control_prefix.as_ref().filter(|p| !p.is_empty()).cloned();
         let control_acf = s.control_acf.as_ref().filter(|p| !p.is_empty()).cloned();
@@ -492,7 +461,7 @@ async fn run_from_config(
     let text = match fs::read_to_string(path) {
         Ok(t) => t,
         Err(e) => {
-            eprintln!(
+            epics_base_rs::stderr_println!(
                 "pva-gateway-rs: cannot read config '{}': {e}",
                 path.display()
             );
@@ -502,19 +471,19 @@ async fn run_from_config(
     let cfg = match parse_config(&text) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("pva-gateway-rs: {e}");
+            epics_base_rs::stderr_println!("pva-gateway-rs: {e}");
             return ExitCode::FAILURE;
         }
     };
     if cfg.version == 0 {
-        eprintln!("Warning: config file missing \"version\" key. Assuming 1");
+        epics_base_rs::stderr_println!("Warning: config file missing \"version\" key. Assuming 1");
     }
     if let Err(e) = validate(&cfg) {
-        eprintln!("pva-gateway-rs: {e}");
+        epics_base_rs::stderr_println!("pva-gateway-rs: {e}");
         return ExitCode::FAILURE;
     }
     if check_only {
-        eprintln!("Config file OK");
+        epics_base_rs::stderr_println!("Config file OK");
         return ExitCode::SUCCESS;
     }
 
@@ -530,17 +499,17 @@ async fn run_from_config(
     ) {
         Ok(g) => g,
         Err(e) => {
-            eprintln!("pva-gateway-rs: failed to start: {e}");
+            epics_base_rs::stderr_println!("pva-gateway-rs: failed to start: {e}");
             return ExitCode::FAILURE;
         }
     };
-    eprintln!(
+    epics_base_rs::stderr_println!(
         "pva-gateway-rs: {} upstream client(s), {} downstream server(s) (Ctrl-C to stop)",
         gw.upstream_count(),
         gw.downstream_count()
     );
     if let Err(e) = tokio::signal::ctrl_c().await {
-        eprintln!("pva-gateway-rs: signal wait failed: {e}");
+        epics_base_rs::stderr_println!("pva-gateway-rs: signal wait failed: {e}");
     }
     gw.stop_all();
     ExitCode::SUCCESS
@@ -659,7 +628,7 @@ async fn main() -> ExitCode {
         .await;
     }
     if args.check_config {
-        eprintln!("pva-gateway-rs: --check-config requires a <CONFIG> file");
+        epics_base_rs::stderr_println!("pva-gateway-rs: --check-config requires a <CONFIG> file");
         return ExitCode::FAILURE;
     }
 
@@ -671,7 +640,7 @@ async fn main() -> ExitCode {
     let gateway = match PvaGateway::start(&reactor, cfg) {
         Ok(g) => g,
         Err(e) => {
-            eprintln!("pva-gateway-rs: failed to start: {e}");
+            epics_base_rs::stderr_println!("pva-gateway-rs: failed to start: {e}");
             return ExitCode::FAILURE;
         }
     };
@@ -683,15 +652,16 @@ async fn main() -> ExitCode {
     }
 
     let report = gateway.report();
-    eprintln!(
+    epics_base_rs::stderr_println!(
         "pva-gateway-rs listening tcp/{} udp/{} (Ctrl-C to stop)",
-        report.tcp_port, report.udp_port
+        report.tcp_port,
+        report.udp_port
     );
 
     match gateway.run().await {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("pva-gateway-rs: stopped with error: {e}");
+            epics_base_rs::stderr_println!("pva-gateway-rs: stopped with error: {e}");
             ExitCode::FAILURE
         }
     }
@@ -702,18 +672,18 @@ async fn main() -> ExitCode {
 /// half exists. Nothing replaces it: an RTEMS image runs an IOC, not a gateway.
 #[cfg(exec_backend)]
 fn main() -> ExitCode {
-    eprintln!(
+    epics_base_rs::runtime::task::refuse_backend(
         "pva-gateway-rs: this build selects the reactor-free execution backend \
          (EPICS_RS_BUILD_EXEC_BACKEND=thread), and both the upstream PVA client \
          and the downstream PVA server need a tokio reactor. Unset that variable \
-         and rebuild to run the gateway."
-    );
-    ExitCode::FAILURE
+         and rebuild to run the gateway.",
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::SocketAddr;
 
     // The loopback.conf shipped with pva2pva — the canonical example.
     const LOOPBACK: &str = r#"{
@@ -937,47 +907,56 @@ mod tests {
         );
     }
 
+    /// The gateway's interface list goes through the env list's resolver:
+    /// `192.0.2.1 127.0.0.1` sorts to 127.0.0.1 first, so the unassigned
+    /// 192.0.2.1 is a later interface and fails `after fallback`, as on the
+    /// env path and in softIocPVX 1.5.3. Bare entries keep port 0 for
+    /// `serverport` to fill at bind.
     #[test]
-    fn server_interface_parses_multiple_addresses() {
-        // gwmain.cpp:164 configure_server: a server `interface` is
-        // EPICS_PVAS_INTF_ADDR_LIST — an address LIST, binding every listed
-        // NIC, not a single interface.
-        let ifaces = parse_interface_list("127.0.0.1 192.0.2.5").expect("parse");
+    fn downstream_config_sorts_the_interface_list() {
+        let config = |interface: &str| {
+            let cfg = parse_config(&format!(
+                r#"{{"version":1,"clients":[],"servers":[
+                    {{"name":"s","interface":"{interface}","serverport":5393}}]}}"#
+            ))
+            .expect("parse");
+            downstream_config(&cfg.servers[0])
+        };
+        let ep = |s: &str| epics_pva_rs::config::Endpoint::parse(s, 0).unwrap();
         assert_eq!(
-            ifaces,
-            vec![
-                "127.0.0.1".parse::<IpAddr>().unwrap(),
-                "192.0.2.5".parse::<IpAddr>().unwrap(),
-            ]
+            config("192.0.2.1 127.0.0.1").unwrap().interfaces,
+            vec![ep("127.0.0.1"), ep("192.0.2.1")]
         );
-        assert!(parse_interface_list("").unwrap().is_empty());
-        assert!(parse_interface_list("   ").unwrap().is_empty());
-        assert!(parse_interface_list("not-an-ip").is_err());
+        assert_eq!(
+            config("localhost 127.0.0.1:5393 224.0.2.3,5@lo")
+                .unwrap()
+                .interfaces,
+            vec![ep("127.0.0.1"), ep("224.0.2.3,5@lo")]
+        );
+        assert!(config("").unwrap().interfaces.is_empty());
+        assert!(config("no-such-nic.invalid").is_err());
     }
 
+    /// A wildcard entry does not swallow the list: `127.0.0.1 0.0.0.0:7000`
+    /// reaches the runtime whole, which binds the wildcard last as it does
+    /// for that `EPICS_PVAS_INTF_ADDR_LIST` (and fails, as softIocPVX 1.5.3
+    /// does).
     #[test]
-    fn server_bind_resolution_collapses_wildcard_and_keeps_explicit_list() {
-        // An explicit, wildcard-free list binds exactly those NICs.
-        let two = vec![
-            "127.0.0.1".parse::<IpAddr>().unwrap(),
-            "192.0.2.5".parse::<IpAddr>().unwrap(),
-        ];
-        let (bind_ip, interfaces) = resolve_server_bind(two.clone());
-        assert_eq!(bind_ip, two[0]);
-        assert_eq!(interfaces, two);
-
-        // A wildcard entry collapses to the all-NIC bind: empty interface
-        // set (so the runtime binds every NIC) carrying the wildcard family.
-        // Passing [0.0.0.0] through as a literal interface would instead hit
-        // bind_on_interfaces([0.0.0.0]) rather than the all-NIC default.
-        let (bind_ip, interfaces) = resolve_server_bind(vec!["0.0.0.0".parse::<IpAddr>().unwrap()]);
-        assert!(bind_ip.is_unspecified());
-        assert!(interfaces.is_empty());
-
-        // No interface given → all-NIC wildcard bind.
-        let (bind_ip, interfaces) = resolve_server_bind(Vec::new());
-        assert_eq!(bind_ip, IpAddr::V4(Ipv4Addr::UNSPECIFIED));
-        assert!(interfaces.is_empty());
+    fn downstream_config_keeps_every_interface_entry() {
+        let cfg = parse_config(
+            r#"{"version":1,"clients":[],"servers":[
+                {"name":"s","interface":"127.0.0.1 0.0.0.0:7000","serverport":5385}]}"#,
+        )
+        .expect("parse");
+        let config = downstream_config(&cfg.servers[0]).expect("config");
+        assert_eq!(
+            config.interfaces,
+            vec![
+                "0.0.0.0:7000".parse::<SocketAddr>().unwrap().into(),
+                "127.0.0.1:0".parse::<SocketAddr>().unwrap().into(),
+            ]
+        );
+        assert_eq!(config.tcp_port, 5385);
     }
 
     #[test]

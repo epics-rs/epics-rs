@@ -47,12 +47,14 @@ pub mod timer_sleep;
 use std::time::Duration;
 
 pub use callback_executor::{
-    Callback, CallbackError, CallbackHandle, CallbackPool, CallbackPriority, CallbackQueueStats,
-    DEFAULT_QUEUE_SIZE, DEFAULT_THREADS_PER_PRIORITY, DedicatedExecutor, NUM_CALLBACK_PRIORITIES,
+    Callback, CallbackBody, CallbackCell, CallbackError, CallbackHandle, CallbackPool,
+    CallbackPriority, CallbackQueueStats, DEFAULT_QUEUE_SIZE, DEFAULT_THREADS_PER_PRIORITY,
+    DedicatedExecutor, NUM_CALLBACK_PRIORITIES,
 };
 pub use delayed_timer::{DelayedTimer, TimerHandle};
 pub use future_exec::{
-    AbortHandle, DEFAULT_SPAWN_PRIORITY, JoinError, JoinFuture, spawn_blocking_on, spawn_future,
+    AbortHandle, DEFAULT_SPAWN_PRIORITY, JoinError, JoinFuture, OnBand, spawn_blocking_offloaded,
+    spawn_blocking_on, spawn_future,
 };
 pub use timer_sleep::{Sleep, TimerInterval};
 
@@ -75,9 +77,10 @@ pub struct BackgroundExecutor {
 }
 
 impl BackgroundExecutor {
-    /// Start all three facilities with their C-default sizing.
+    /// Start all three facilities with their C-default sizing, the
+    /// callback bands at C `cbInit` until [`CallbackPool::init`].
     pub fn new() -> Self {
-        let callbacks = CallbackPool::new();
+        let callbacks = CallbackPool::new_uninitialized();
         let timer = DelayedTimer::new(callbacks.handle());
         let scan_once = ScanOnceQueue::new();
         BackgroundExecutor {
@@ -145,8 +148,8 @@ impl BackgroundHandle {
     }
 
     /// Enqueue a one-shot record-process tail — C `scanOnce` (`dbScan.c:660`).
-    pub fn scan_once(&self, cb: OnceCallback) -> Result<(), ScanOnceOverflow> {
-        self.scan_once.scan_once(cb)
+    pub fn scan_once(&self, name: &str, cb: OnceCallback) -> Result<(), ScanOnceOverflow> {
+        self.scan_once.scan_once(name, cb)
     }
 
     /// The callback-submission handle alone.
@@ -175,6 +178,7 @@ mod tests {
     #[test]
     fn executor_routes_all_three_facilities() {
         let exec = BackgroundExecutor::new();
+        exec.callbacks().init();
         let h = exec.handle();
 
         let (tx, rx) = mpsc::channel();
@@ -185,7 +189,7 @@ mod tests {
         )
         .unwrap();
         let tx_once = tx.clone();
-        h.scan_once(Box::new(move || tx_once.send("once").unwrap()))
+        h.scan_once("REC", Box::new(move || tx_once.send("once").unwrap()))
             .unwrap();
         h.callback_delayed(
             Duration::from_millis(20),

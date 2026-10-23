@@ -106,7 +106,7 @@ async fn watch(db: &PvDatabase, rec: &str, field: &str) -> EventReader {
 fn drain(rx: &mut EventReader) -> Vec<f64> {
     let mut out = Vec::new();
     while let Ok(ev) = rx.try_recv() {
-        if let Some(v) = ev.snapshot.value.to_f64() {
+        if let Some(v) = ev.value().as_value().cloned().unwrap().to_f64() {
             out.push(v);
         }
     }

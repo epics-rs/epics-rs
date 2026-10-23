@@ -138,7 +138,7 @@ When unset and `EPICS_CAS_AUTO_BEACON_ADDR_LIST=YES` (the default),
 the beacon emitter falls back to:
 
 1. `EPICS_CA_ADDR_LIST` (if set)
-2. Auto-discovered per-NIC broadcasts via `if-addrs`
+2. Auto-discovered per-NIC broadcasts via `iface_v4`
 3. `255.255.255.255` as last resort
 
 ### `EPICS_CAS_AUTO_BEACON_ADDR_LIST` (libca)
@@ -275,10 +275,12 @@ for facility tooling.
 
 ### `EPICS_CAS_DRAIN_GRACE_SECS` (rust-only)
 
-Seconds to keep existing CA connections alive after drain is
-triggered (SIGTERM or POST /drain). After this elapses the process
-exits cleanly. Default: 30. Set to bracket your Kubernetes
-`terminationGracePeriodSeconds`.
+Opt-in SIGTERM drain. When set, a SIGTERM stops new CA connections
+and keeps the existing ones for this many seconds; the process then
+runs its exit callbacks and ends killed by SIGTERM. Unset (the
+default), SIGTERM ends the IOC at once, as it does a C IOC. A value
+that does not parse means 30. POST /drain only stops new connections.
+Set to bracket your Kubernetes `terminationGracePeriodSeconds`.
 
 ### `EPICS_CAS_TLS_MODE` (rust-only)
 

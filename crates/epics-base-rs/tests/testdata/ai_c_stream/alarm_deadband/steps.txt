@@ -1,0 +1,18 @@
+monitor X X@l X.SEVR X.STAT
+caput SRC.VAL 0.5
+caput SRC.VAL 1.2
+caput SRC.VAL 2.0
+caput SRC.VAL 4.0
+caput SRC.VAL 6
+caput SRC.VAL 12
+caput SRC.VAL 10.5
+caput SRC.VAL 9.5
+caput SRC.VAL 8.9
+caput SRC.VAL 4.5
+caput SRC.VAL 3
+caput SRC.VAL -6
+caput SRC.VAL -11
+caput SRC.VAL -9.5
+caput SRC.VAL -8.9
+caput SRC.VAL -4.5
+caput SRC.VAL 0

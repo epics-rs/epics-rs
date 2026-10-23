@@ -1,0 +1,808 @@
+rec0: Omega_DP41.proto readUnfiltered(1,2,3,4,5,6,7,8,9) P
+readUnfiltered {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "*X01";
+    in "X01%f";
+}
+rec1: Omega_DP41.proto readFiltered(1,2,3,4,5,6,7,8,9) P
+readFiltered {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "*X04";
+    in "X04%f";
+}
+rec2: Omega_DP41.proto readPeak(1,2,3,4,5,6,7,8,9) P
+readPeak {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "*X02";
+    in "X02%f";
+}
+rec3: Omega_DP41.proto readValley(1,2,3,4,5,6,7,8,9) P
+readValley {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "*X03";
+    in "X03%f";
+}
+rec4: Omega_DP41.proto readSetpointStatus(1,2,3,4,5,6,7,8,9) P
+readSetpointStatus {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "*U01";
+    in "U01%(AA)1c";
+}
+rec5: Omega_DP41.proto readPeakValleyStatus(1,2,3,4,5,6,7,8,9) P
+readPeakValleyStatus {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "*U02";
+    in "U02%x";
+}
+rec6: Omega_DP41.proto readMicrocodeRevision(1,2,3,4,5,6,7,8,9) P
+readMicrocodeRevision {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "*U03";
+    in "U03%x";
+}
+rec7: Omega_DP41.proto readLockout1(1,2,3,4,5,6,7,8,9) P
+readLockout1 {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "*R01";
+    in "R01%x";
+}
+rec8: Omega_DP41.proto readLockout2(1,2,3,4,5,6,7,8,9) P
+readLockout2 {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "*R02";
+    in "R02%x";
+}
+rec9: Omega_DP41.proto readLockout3(1,2,3,4,5,6,7,8,9) P
+readLockout3 {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "*R03";
+    in "R03%x";
+}
+rec10: Omega_DP41.proto readLockout4(1,2,3,4,5,6,7,8,9) P
+readLockout4 {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "*R04";
+    in "R04%x";
+}
+rec11: Omega_DP41.proto readInputType(1,2,3,4,5,6,7,8,9) P
+readInputType {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "*R05";
+    in "R05%x";
+}
+rec12: Omega_DP41.proto readReadConfig(1,2,3,4,5,6,7,8,9) P
+readReadConfig {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "*R07";
+    in "R07%x";
+}
+rec13: Omega_DP41.proto readReadScale(1,2,3,4,5,6,7,8,9) P
+readReadScale {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "*R08";
+    in "R08%x";
+}
+rec14: Omega_DP41.proto readReadOffset(1,2,3,4,5,6,7,8,9) P
+readReadOffset {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "*R09";
+    in "R09%x";
+}
+rec15: Omega_DP41.proto readInputConfig(1,2,3,4,5,6,7,8,9) P
+readInputConfig {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "*R0A";
+    in "R0A%x";
+}
+rec16: Omega_DP41.proto readInputScale(1,2,3,4,5,6,7,8,9) P
+readInputScale {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "*R0B";
+    in "R0B%x";
+}
+rec17: Omega_DP41.proto readDecimalPoint(1,2,3,4,5,6,7,8,9) P
+readDecimalPoint {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "*R0C";
+    in "R0C%x";
+}
+rec18: Omega_DP41.proto readFilter(1,2,3,4,5,6,7,8,9) P
+readFilter {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "*R0E";
+    in "R0E%x";
+}
+rec19: Omega_DP41.proto readSPConfig(1,2,3,4,5,6,7,8,9) P
+readSPConfig {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "*R10";
+    in "R10%x";
+}
+rec20: Omega_DP41.proto readALConfig(1,2,3,4,5,6,7,8,9) P
+readALConfig {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "*R11";
+    in "R11%x";
+}
+rec21: Omega_DP41.proto readALFunction(1,2,3,4,5,6,7,8,9) P
+readALFunction {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "*R12";
+    in "R12%x";
+}
+rec22: Omega_DP41.proto readALReading(1,2,3,4,5,6,7,8,9) P
+readALReading {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "*R13";
+    in "R13%x";
+}
+rec23: Omega_DP41.proto readSPHyteresis(1,2,3,4,5,6,7,8,9) P
+readSPHyteresis {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "*R14";
+    in "R14%x";
+}
+rec24: Omega_DP41.proto readALHyteresis(1,2,3,4,5,6,7,8,9) P
+readALHyteresis {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "*R15";
+    in "R15%x";
+}
+rec25: Omega_DP41.proto readOutputConfig(1,2,3,4,5,6,7,8,9) P
+readOutputConfig {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "*R16";
+    in "R16%x";
+}
+rec26: Omega_DP41.proto readOutputScale(1,2,3,4,5,6,7,8,9) P
+readOutputScale {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "*R17";
+    in "R17%x";
+}
+rec27: Omega_DP41.proto readSerialConfig(1,2,3,4,5,6,7,8,9) P
+readSerialConfig {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "*R18";
+    in "R18%x";
+}
+rec28: Omega_DP41.proto readAddress(1,2,3,4,5,6,7,8,9) P
+readAddress {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "*R1A";
+    in "R1A%x";
+}
+rec29: Omega_DP41.proto readDataFormat(1,2,3,4,5,6,7,8,9) P
+readDataFormat {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "*R1B";
+    in "R1B%x";
+}
+rec30: Omega_DP41.proto readBusFormat(1,2,3,4,5,6,7,8,9) P
+readBusFormat {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "*R1C";
+    in "R1C%x";
+}
+rec31: Omega_DP41.proto readSerialCount(1,2,3,4,5,6,7,8,9) P
+readSerialCount {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "*R1D";
+    in "R1D%x";
+}
+rec32: Omega_DP41.proto readSerialRecog(1,2,3,4,5,6,7,8,9) P
+readSerialRecog {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "*R1E";
+    in "R1E%x";
+}
+rec33: Omega_DP41.proto readSerialUnit(1,2,3,4,5,6,7,8,9) P
+readSerialUnit {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "*R1F";
+    in "R1F%x";
+}
+rec34: Omega_DP41.proto readSerialDelay(1,2,3,4,5,6,7,8,9) P
+readSerialDelay {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "*R20";
+    in "R20%x";
+}
+rec35: Omega_DP41.proto readSP1Value(1,2,3,4,5,6,7,8,9) P
+readSP1Value {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "*R21";
+    in "R21%x";
+}
+rec36: Omega_DP41.proto readSP2Value(1,2,3,4,5,6,7,8,9) P
+readSP2Value {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "*R22";
+    in "R22%x";
+}
+rec37: Omega_DP41.proto readSP3Value(1,2,3,4,5,6,7,8,9) P
+readSP3Value {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "*R23";
+    in "R23%x";
+}
+rec38: Omega_DP41.proto readSP4Value(1,2,3,4,5,6,7,8,9) P
+readSP4Value {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "*R24";
+    in "R24%x";
+}
+rec39: Omega_DP41.proto readInputOffset(1,2,3,4,5,6,7,8,9) P
+readInputOffset {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "*R25";
+    in "R25%x";
+}
+rec40: Omega_DP41.proto readOutputOffset(1,2,3,4,5,6,7,8,9) P
+readOutputOffset {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "*R26";
+    in "R26%x";
+}
+rec41: Omega_DP41.proto resetLatchedAlarms(1,2,3,4,5,6,7,8,9) P
+resetLatchedAlarms {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "*Z01";
+    in "Z01";
+}
+rec42: Omega_DP41.proto resetAveragingFilter(1,2,3,4,5,6,7,8,9) P
+resetAveragingFilter {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "*Z02";
+    in "Z02";
+}
+rec43: Omega_DP41.proto resetSoft(1,2,3,4,5,6,7,8,9) P
+resetSoft {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "*Z03";
+    in "Z03";
+}
+rec44: Omega_DP41.proto resetHard(1,2,3,4,5,6,7,8,9) P
+resetHard {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "*Z04";
+    in "Z04";
+}
+rec45: Omega_DP41.proto resetPeakValley(1,2,3,4,5,6,7,8,9) P
+resetPeakValley {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "*Z05";
+    in "Z05";
+}
+rec46: Omega_DP41.proto writeSP1Value(1,2,3,4,5,6,7,8,9) P
+writeSP1Value {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "*W21%6.6X";
+    in "W21";
+    out "*P21%6.6X";
+    in "P21";
+}
+rec47: Omega_DP41.proto writeSP2Value(1,2,3,4,5,6,7,8,9) P
+writeSP2Value {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "*W22%6.6X";
+    in "W22";
+    out "*P22%6.6X";
+    in "P22";
+}
+rec48: Omega_DP41.proto writeSP3Value(1,2,3,4,5,6,7,8,9) P
+writeSP3Value {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "*W23%6.6X";
+    in "W23";
+    out "*P23%6.6X";
+    in "P23";
+}
+rec49: Omega_DP41.proto writeSP4Value(1,2,3,4,5,6,7,8,9) P
+writeSP4Value {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "*W24%6.6X";
+    in "W24";
+    out "*P24%6.6X";
+    in "P24";
+}

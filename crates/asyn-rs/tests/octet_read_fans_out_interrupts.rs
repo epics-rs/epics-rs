@@ -1,10 +1,10 @@
 //! R18-59: an octet read on a stream port fans out to the octet interrupt users.
 //!
 //! C `asynOctetBase::readIt` (asynOctetBase.c:224-238) calls
-//! `callInterruptUsers(pasynUser, pasynPvt, data, nbytesTransfered, eomReason)`
+//! `callInterruptUsers(pasynUser, pasynPvt, data, nbytesTransferred, eomReason)`
 //! after every successful read, when the port enabled `interruptProcess` — which
 //! both stream drivers do (`pasynOctetBase->initialize(..., 1)`,
-//! drvAsynIPPort.c:1055 and drvAsynSerialPort.c:1125-1126). It is what makes a
+//! drvAsynIPPort.c:1109 and drvAsynSerialPort.c:1125-1126). It is what makes a
 //! `stringin`/`waveform` with `SCAN="I/O Intr"` on a serial or IP port process:
 //! the driver read is the interrupt.
 //!
@@ -17,7 +17,7 @@ use asyn_rs::drivers::ip_port::DrvAsynIPPort;
 use asyn_rs::interfaces::InterfaceType;
 use asyn_rs::interrupt::InterruptFilter;
 use asyn_rs::param::ParamValue;
-use asyn_rs::runtime::{RuntimeConfig, create_port_runtime};
+use asyn_rs::runtime::{RuntimeConfig, create_port_runtime_unclaimed};
 use asyn_rs::sync_io::SyncIOHandle;
 
 /// A device that answers one line. The record on the other end is scanned
@@ -35,27 +35,33 @@ fn a_stream_port_read_notifies_the_octet_interrupt_users() {
     });
 
     let driver = DrvAsynIPPort::new("R1859", &format!("127.0.0.1:{port}")).unwrap();
-    let (rt, _jh) = create_port_runtime(driver, RuntimeConfig::default())
+    let (rt, _jh) = create_port_runtime_unclaimed(driver, RuntimeConfig::default())
         .expect("the port runtime thread must start");
 
     let seen: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
     let sink = seen.clone();
-    let _sub = rt.port_handle().interrupts().register_sync_callback(
-        InterruptFilter {
-            reason: None,
-            addr: Some(0),
-            uint32_mask: None,
-            iface: Some(InterfaceType::Octet),
-        },
-        move |iv| {
-            if let ParamValue::Octet(s) = &iv.value {
-                sink.lock().unwrap().push(s.clone());
-            }
-        },
-    );
+    let _sub = rt
+        .port_handle()
+        .interrupts()
+        .register_sync_callback(
+            InterruptFilter {
+                reason: None,
+                addr: Some(0),
+                uint32_mask: None,
+                iface: Some(InterfaceType::Octet),
+                ..Default::default()
+            },
+            move |iv| {
+                if let ParamValue::Octet(s) = &iv.value {
+                    sink.lock().unwrap().push(s.to_vec());
+                }
+            },
+        )
+        .unwrap();
 
     let io = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(2));
-    let data = io.read_octet(0, 32).expect("read failed");
+    let (data, status) = io.read_octet(0, 32).into_parts();
+    status.expect("read failed");
     assert_eq!(data, b"READBACK-1");
 
     let got = seen.lock().unwrap().clone();

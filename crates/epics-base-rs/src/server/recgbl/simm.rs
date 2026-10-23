@@ -89,22 +89,37 @@ impl SimMode {
 /// (`swaitRecord.c:407-422` is a plain `if (simm == menuYesNoNO) … else …`):
 /// every non-NO value simulates. It says so via
 /// [`Record::rejects_illegal_sim_mode`](crate::server::record::Record::rejects_illegal_sim_mode).
+#[inline]
 pub fn resolve_sim_mode(record: &dyn crate::server::record::Record) -> SimMode {
-    let simm = record
-        .get_field("SIMM")
-        .and_then(|v| v.to_f64())
-        .unwrap_or(0.0) as i16;
-    // The record's own SIMM menu decides which indices are legal. Every record
-    // that declares SIMM declares its menu; a record with no SIMM never reaches
-    // here (the caller's entry gate), so the fallback is inert.
-    let choices = record
-        .menu_field_choices("SIMM")
-        .map(|c| c.len())
-        .unwrap_or(0);
+    let simm = match record.simm_cells() {
+        Some(cells) => cells.simm,
+        None => record
+            .get_field("SIMM")
+            .and_then(|v| v.to_f64())
+            .unwrap_or(0.0) as i16,
+    };
+    resolve_sim_mode_at(simm, record)
+}
+
+/// [`resolve_sim_mode`] for a caller that already holds SIMM.
+#[inline(always)]
+pub fn resolve_sim_mode_at(simm: i16, record: &dyn crate::server::record::Record) -> SimMode {
+    // The record's own SIMM menu decides which indices are legal, and only
+    // index 2 asks — NO and YES are legal in both menus, so the steady cycle
+    // does not look the menu up. Every record that declares SIMM declares its
+    // menu; a record with no SIMM never reaches here (the caller's entry
+    // gate), so the fallback is inert.
     match simm {
         0 => SimMode::No,
         1 => SimMode::Yes,
-        2 if choices >= 3 => SimMode::Raw,
+        2 if record
+            .menu_field_choices("SIMM")
+            .map(|c| c.len())
+            .unwrap_or(0)
+            >= 3 =>
+        {
+            SimMode::Raw
+        }
         // swait's `else` arm: anything that is not NO simulates.
         _ if !record.rejects_illegal_sim_mode() => SimMode::Yes,
         _ => SimMode::Illegal,
@@ -158,26 +173,35 @@ impl LinkFetch {
     }
 }
 
-/// C `dbConstLoadScalar` (`dbConstLink.c:152-175`): the value a CONSTANT link
-/// hands its record ONCE, at `init_record`, through `dbLoadLink`. An empty
-/// constant returns `S_db_badField` — i.e. nothing is stored, the field keeps
-/// its dbd `initial()` — which is the `None` here.
-pub fn constant_load_value(link: &crate::server::record::ParsedLink) -> Option<EpicsValue> {
-    match link {
-        crate::server::record::ParsedLink::Constant(_) => link.constant_value(),
-        _ => None,
-    }
-}
-
-/// Whether a link is a C CONSTANT link — `dbLinkIsConstant` (`dbLink.c:220`).
+/// C `dbLinkIsConstant` (`dbLink.c:220-225`): `!plset || plset->isConstant`.
 /// An unset link is constant (its `lset` is `dbConst_lset` with a NULL string),
 /// which is why `recGblInitSimm`'s `if (dbLinkIsConstant(psiml))` covers the
-/// unset case too.
+/// unset case too, and so is a removed one, which has no `lset` at all.
 pub fn is_constant(link: &crate::server::record::ParsedLink) -> bool {
+    use crate::server::record::ParsedLink;
     matches!(
         link,
-        crate::server::record::ParsedLink::None | crate::server::record::ParsedLink::Constant(_)
+        ParsedLink::None | ParsedLink::Constant(_) | ParsedLink::Removed(_)
     )
+}
+
+/// Whether the link's `lset` is `dbConst_lset`, so a read of it is
+/// `dbConstGetValue`: status 0, nothing stored (`dbConstLink.c:234-248`).
+/// [`is_constant`] less a removed link, whose read `dbTryGetLink` fails with
+/// `S_db_noLSET` (`dbLink.c:310-311`) — the gate for skipping a read rather
+/// than for C's `dbLinkIsConstant` tests.
+pub fn has_const_lset(link: &crate::server::record::ParsedLink) -> bool {
+    use crate::server::record::ParsedLink;
+    matches!(link, ParsedLink::None | ParsedLink::Constant(_))
+}
+
+/// Whether the link has no `lset`, so `dbTryGetLink` fails with
+/// `S_db_noLSET` (`dbLink.c:310-311`) and `dbGetLink` answers a silent -1
+/// (`dbLink.c:336-337`): a removed link, and a hardware link, which
+/// `dbInitLink` leaves without one (`dbLink.c:112-113`).
+pub fn has_no_lset(link: &crate::server::record::ParsedLink) -> bool {
+    use crate::server::record::ParsedLink;
+    matches!(link, ParsedLink::Removed(_) | ParsedLink::Hw(_))
 }
 
 /// The record types whose C `.dbd` declares `field(SSCN)` + `field(OLDSIMM)`
@@ -228,6 +252,25 @@ pub fn record_type_has_sscn(record_type: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// A removed link: `dbLinkIsConstant` true and `dbLinkIsDefined` false
+    /// (`dbLink.c:215-225`), no `dbConst_lset` to read, and `plink->type` what
+    /// the lset's remove left — `PV_LINK` for a DB link (`dbDbLink.c:132`).
+    #[test]
+    fn a_removed_link_is_constant_with_no_const_lset_and_keeps_its_type() {
+        use crate::server::record::{DbLinkType, ParsedLink};
+        let removed = ParsedLink::Removed(DbLinkType::PvLink);
+        assert!(is_constant(&removed));
+        assert!(!has_const_lset(&removed));
+        assert_eq!(removed.db_link_type(), DbLinkType::PvLink);
+        assert_eq!(
+            removed.link_type_after_init("MX NPP NMS", crate::server::record::LinkFieldType::In),
+            DbLinkType::PvLink
+        );
+        for live in [ParsedLink::None, crate::server::record::parse_link_v2("5")] {
+            assert!(is_constant(&live) && has_const_lset(&live), "{live:?}");
+        }
+    }
+
     #[test]
     fn only_the_21_c_records_with_field_sscn_swap_scan() {
         // The C population (`rg -l 'field\(SSCN' modules/database/src/std/rec/`).
@@ -270,7 +313,7 @@ mod tests {
     fn constant_and_unset_links_are_both_constant() {
         use crate::server::record::ParsedLink;
         assert!(is_constant(&ParsedLink::None));
-        assert!(is_constant(&ParsedLink::Constant("42".into())));
+        assert!(is_constant(&ParsedLink::constant("42")));
         assert!(!is_constant(&crate::server::record::parse_link_v2(
             "SOME:PV"
         )));

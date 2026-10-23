@@ -1,0 +1,15 @@
+_main_ Missing converter character
+_main_ iSeries.proto line 8: in format string: "%2"
+_main_ iSeries.proto line 8: in command 'in'
+_main_ iSeries.proto line 7: in protocol 'rgcmd'
+_main_ while compiling protocol 'RGCmd(1,2,3,4,5,6,7,8,9)' for 'rec0'
+_main_ Missing converter character
+_main_ iSeries.proto line 12: in format string: "%2"
+_main_ iSeries.proto line 12: in command 'in'
+_main_ iSeries.proto line 11: in protocol 'rcmd'
+_main_ while compiling protocol 'RCmd(1,2,3,4,5,6,7,8,9)' for 'rec1'
+_main_ Missing converter character
+_main_ iSeries.proto line 28: in format string: "%02"
+_main_ iSeries.proto line 28: in command 'out'
+_main_ iSeries.proto line 27: in protocol 'wcmd'
+_main_ while compiling protocol 'WCmd(1,2,3,4,5,6,7,8,9)' for 'rec5'

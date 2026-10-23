@@ -1,8 +1,8 @@
-//! `field_metadata_override` outranks the record-level metadata cache.
+//! `field_metadata_override` outranks the record-level metadata.
 //!
 //! `finish_field_snapshot` layers three suppliers onto one served field, in
-//! this order: the record-level cache (`record_instance.rs:1970-1973`, the
-//! VAL metadata built by `populate_display_info` / `populate_control_info`),
+//! this order: the record-level metadata (`FieldMetaSource::build_metadata`,
+//! the VAL metadata built by `populate_display_info` / `populate_control_info`),
 //! then `route_field_metadata` (`:1978`), then
 //! `apply_field_metadata_override` (`:1983`). The last one wins every slot
 //! it supplies.
@@ -13,7 +13,7 @@
 //! `field_metadata_override`: deleting either arm leaves all 135 served
 //! motor windows byte-identical, because the override overwrites the
 //! record-level pair on every field. Those arms are kept deliberately —
-//! dropping them would leave the record-level cache serving motor the
+//! dropping them would leave the record-level metadata serving motor the
 //! operator range, a wrong value masked only by the layer above it — but
 //! "masked by the layer above" is a claim about ORDER, and an unpinned
 //! order is one refactor away from being false.

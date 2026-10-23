@@ -1,18 +1,18 @@
+use asyn_rs::port::InterfaceMask;
 use std::collections::BTreeMap;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use ad_core_rs::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
+use ad_core_rs::attributes::{NDAttrSource, NDAttrValue, NDAttribute, NDAttributeList};
 use ad_core_rs::color::NDColorMode;
 use ad_core_rs::error::{ADError, ADResult};
 use ad_core_rs::ndarray::{NDArray, NDDataType, NDDimension};
 use ad_core_rs::ndarray_pool::NDArrayPool;
-use ad_core_rs::plugin::file_base::{NDFileMode, NDFileWriter};
-use ad_core_rs::plugin::file_controller::FilePluginController;
-use ad_core_rs::plugin::runtime::{
-    NDPluginProcess, ParamChangeResult, PluginParamSnapshot, ProcessResult,
-};
+use ad_core_rs::plugin::file_base::{NDFileOpenMode, NDFileWriter};
+use ad_core_rs::plugin::file_controller::{FileControl, FilePluginController};
+use ad_core_rs::plugin::runtime::{NDPluginProcess, PluginAttributes, ProcessResult};
+use epics_libcom_rs::cfmt::CFloat;
 use parking_lot::Mutex;
 
 // TIFF tag numbers. 256-339 are the baseline tags C sets through TIFFSetField
@@ -149,8 +149,8 @@ fn attribute_tag_string(attr: &NDAttribute) -> String {
         NDAttrValue::UInt32(v) => format!("{}", v),
         NDAttrValue::UInt64(v) => format!("{}", v),
         // C++ uses "%f" which is 6 fractional digits.
-        NDAttrValue::Float32(v) => format!("{:.6}", v),
-        NDAttrValue::Float64(v) => format!("{:.6}", v),
+        NDAttrValue::Float32(v) => format!("{:.6}", CFloat(f64::from(*v))),
+        NDAttrValue::Float64(v) => format!("{:.6}", CFloat(*v)),
         NDAttrValue::String(s) => s.clone(),
         NDAttrValue::Undefined => String::new(),
     };
@@ -160,11 +160,16 @@ fn attribute_tag_string(attr: &NDAttribute) -> String {
 /// TIFF file writer using the `tiff` crate for proper encoding/decoding.
 pub struct TiffWriter {
     current_path: Option<PathBuf>,
+    /// The plugin's own set, C `getAttributes` in `openFile` and `readFile`.
+    plugin_attributes: NDAttributeList,
 }
 
 impl TiffWriter {
     pub fn new() -> Self {
-        Self { current_path: None }
+        Self {
+            current_path: None,
+            plugin_attributes: NDAttributeList::new(),
+        }
     }
 
     /// C's `openFile` structure switch (NDFileTIFF.cpp:180-224). Note the two
@@ -290,7 +295,12 @@ impl TiffWriter {
     /// YResolution / ResolutionUnit, which C never sets. The tag set below is
     /// exactly C's `TIFFSetField` calls plus the baseline structural tags libtiff
     /// itself writes (Compression, StripOffsets, StripByteCounts).
-    fn encode(array: &NDArray, layout: &TiffLayout) -> ADResult<Vec<u8>> {
+    /// `attributes` is C's `pFileAttributes`, every tag below reads it.
+    fn encode(
+        array: &NDArray,
+        attributes: &NDAttributeList,
+        layout: &TiffLayout,
+    ) -> ADResult<Vec<u8>> {
         let raw = array.data.as_u8_slice();
         let (sample_format, bits_per_sample) = Self::sample_format_and_bits(array.data.data_type());
         let bytes_per_sample = usize::from(bits_per_sample) / 8;
@@ -339,20 +349,18 @@ impl TiffWriter {
         ];
 
         // Standard tags derived from well-known attributes (NDFileTIFF.cpp:244-267).
-        let model = array
-            .attributes
+        let model = attributes
             .get("Model")
             .map(|a| a.value.as_string())
             .unwrap_or_else(|| "Unknown".to_string());
-        let make = array
-            .attributes
+        let make = attributes
             .get("Manufacturer")
             .map(|a| a.value.as_string())
             .unwrap_or_else(|| "Unknown".to_string());
         entries.push(IfdEntry::ascii(TAG_MODEL, &model));
         entries.push(IfdEntry::ascii(TAG_MAKE, &make));
         entries.push(IfdEntry::ascii(TAG_SOFTWARE, "EPICS areaDetector"));
-        if let Some(desc) = array.attributes.get("TIFFImageDescription") {
+        if let Some(desc) = attributes.get("TIFFImageDescription") {
             entries.push(IfdEntry::ascii(
                 TAG_IMAGE_DESCRIPTION,
                 &desc.value.as_string(),
@@ -366,7 +374,7 @@ impl TiffWriter {
         entries.push(IfdEntry::long(TIFFTAG_EPICSTSNSEC, &[array.timestamp.nsec]));
 
         // NDArray attributes as ASCII tags from 65010 (:277-355).
-        for (i, attr) in array.attributes.iter().enumerate() {
+        for (i, attr) in attributes.iter().enumerate() {
             let Some(tag) = TIFFTAG_FIRST_ATTRIBUTE.checked_add(i as u16) else {
                 break; // C stops at TIFFTAG_LAST_ATTRIBUTE (65535).
             };
@@ -418,7 +426,13 @@ impl TiffWriter {
 }
 
 impl NDFileWriter for TiffWriter {
-    fn open_file(&mut self, path: &Path, _mode: NDFileMode, _array: &NDArray) -> ADResult<()> {
+    fn open_file(&mut self, path: &Path, mode: NDFileOpenMode, _array: &NDArray) -> ADResult<()> {
+        // C reads but does not append (NDFileTIFF.cpp:102).
+        if mode.contains(NDFileOpenMode::APPEND) {
+            return Err(ADError::UnsupportedConversion(
+                "NDFileTIFF cannot append".into(),
+            ));
+        }
         self.current_path = Some(path.to_path_buf());
         Ok(())
     }
@@ -429,7 +443,11 @@ impl NDFileWriter for TiffWriter {
             .as_ref()
             .ok_or_else(|| ADError::UnsupportedConversion("no file open".into()))?;
         let layout = Self::layout(array)?;
-        let bytes = Self::encode(array, &layout)?;
+        // C `openFile`: the plugin's set, then the frame's on top
+        // (NDFileTIFF.cpp:240-242).
+        let mut attributes = self.plugin_attributes.clone();
+        attributes.copy_from(&array.attributes);
+        let bytes = Self::encode(array, &attributes, &layout)?;
         std::fs::write(path, bytes)?;
         Ok(())
     }
@@ -440,7 +458,7 @@ impl NDFileWriter for TiffWriter {
             .as_ref()
             .ok_or_else(|| ADError::UnsupportedConversion("no file open".into()))?;
         let bytes = std::fs::read(path)?;
-        decode(&bytes)
+        decode(&bytes, self.plugin_attributes.clone())
     }
 
     fn close_file(&mut self) -> ADResult<()> {
@@ -450,6 +468,10 @@ impl NDFileWriter for TiffWriter {
 
     fn supports_multiple_arrays(&self) -> bool {
         false
+    }
+
+    fn set_plugin_attributes(&mut self, attributes: NDAttributeList) {
+        self.plugin_attributes = attributes;
     }
 }
 
@@ -462,7 +484,9 @@ impl NDFileWriter for TiffWriter {
 /// even when written from an RGB2 array, because the strips are read in index
 /// order and that order is plane R, plane G, plane B. Anything else is an error.
 /// Strips are concatenated in index order into the array buffer (:513-524).
-fn decode(bytes: &[u8]) -> ADResult<NDArray> {
+/// The image starts from `attributes`, the plugin's set C `readFile` gets
+/// ahead of ColorMode (NDFileTIFF.cpp:540-543).
+fn decode(bytes: &[u8], attributes: NDAttributeList) -> ADResult<NDArray> {
     let err = |m: &str| ADError::UnsupportedConversion(format!("TIFF decode error: {m}"));
 
     let read_u16 = |off: usize| -> ADResult<u16> {
@@ -591,6 +615,7 @@ fn decode(bytes: &[u8]) -> ADResult<NDArray> {
     let mut array = NDArray::new(dims, data_type);
     array.data = crate::codec::buffer_from_bytes(&raw, data_type)
         .ok_or_else(|| err("strip data is not a whole number of samples"))?;
+    array.attributes = attributes;
     TiffWriter::attach_color_mode(&mut array, color_mode);
     Ok(array)
 }
@@ -598,12 +623,14 @@ fn decode(bytes: &[u8]) -> ADResult<NDArray> {
 /// TIFF file processor wrapping `FilePluginController<TiffWriter>`.
 pub struct TiffFileProcessor {
     pub ctrl: Mutex<FilePluginController<TiffWriter>>,
+    attributes: Option<PluginAttributes>,
 }
 
 impl TiffFileProcessor {
     pub fn new() -> Self {
         Self {
             ctrl: Mutex::new(FilePluginController::new(TiffWriter::new())),
+            attributes: None,
         }
     }
 }
@@ -615,8 +642,53 @@ impl Default for TiffFileProcessor {
 }
 
 impl NDPluginProcess for TiffFileProcessor {
+    const ASYN_FLAGS: asyn_rs::port::PortFlags = ad_core_rs::plugin::runtime::ASYN_CANBLOCK;
+    // NDFileTIFF.cpp:614, the same mask for both.
+    const INTERFACE_MASK: InterfaceMask = InterfaceMask::GENERIC_POINTER;
+    const INTERRUPT_MASK: InterfaceMask = Self::INTERFACE_MASK;
+
+    fn posts_before_write(&self, reason: usize, value: i32) -> bool {
+        self.ctrl.lock().posts_before_write(reason, value)
+    }
+
+    fn processing_required(&self, array: &NDArray) -> bool {
+        self.ctrl.lock().processing_required(array)
+    }
+
+    /// C NDPluginFile::writeInt32 (NDPluginFile.cpp:799-870).
+    fn validate_int32(
+        &self,
+        reason: usize,
+        _addr: i32,
+        value: i32,
+        verdict: ad_core_rs::plugin::runtime::WriteVerdict<i32>,
+        params: &mut ad_core_rs::plugin::runtime::WritePort<'_>,
+    ) -> ad_core_rs::plugin::runtime::WriteOutcome<i32> {
+        let mut ctrl = self.ctrl.lock();
+        ctrl.write_int32(reason, value, verdict, params)
+    }
+
+    /// C NDPluginFile::writeOctet: the setting is stored inside the write.
+    fn validate_octet(
+        &self,
+        reason: usize,
+        _addr: i32,
+        _value: &str,
+        verdict: ad_core_rs::plugin::runtime::WriteVerdict<String>,
+        _params: &asyn_rs::port::PortDriverBase,
+    ) -> ad_core_rs::plugin::runtime::WriteOutcome<String> {
+        self.ctrl.lock().write_octet(reason, verdict)
+    }
     fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
-        self.ctrl.lock().process_array(array)
+        // Made before the controller lock: its reads wait on the actor,
+        // which takes that lock in its writes.
+        let mut post = ad_core_rs::plugin::runtime::PortPost::of(self.attributes.as_ref());
+        let mut ctrl = self.ctrl.lock();
+        ctrl.process_array(array, &mut post)
+    }
+
+    fn bind_attributes(&mut self, attributes: PluginAttributes) {
+        self.attributes = Some(attributes);
     }
 
     fn plugin_type(&self) -> &str {
@@ -625,8 +697,8 @@ impl NDPluginProcess for TiffFileProcessor {
 
     /// C `NDPluginFile.cpp:948` (base of every file writer) sets
     /// `NDArrayCallbacks = 0`: file plugins write to disk, not downstream.
-    fn does_array_callbacks(&self) -> bool {
-        false
+    fn array_callbacks_seed(&self) -> Option<bool> {
+        Some(false)
     }
 
     fn register_params(
@@ -635,23 +707,38 @@ impl NDPluginProcess for TiffFileProcessor {
     ) -> asyn_rs::error::AsynResult<()> {
         self.ctrl.lock().register_params(base)
     }
-
-    fn on_param_change(&self, reason: usize, params: &PluginParamSnapshot) -> ParamChangeResult {
-        self.ctrl.lock().on_param_change(reason, params)
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use ad_core_rs::ndarray::NDDataBuffer;
+    use ad_core_rs::plugin::file_base::NDFileMode;
     // The tests verify the bytes this module writes with an INDEPENDENT TIFF
     // decoder (the `tiff` crate), not with our own reader.
     use ad_core_rs::params::ndarray_driver::NDArrayDriverParams;
-    use ad_core_rs::plugin::runtime::{ParamChangeValue, ParamUpdate, PluginParamSnapshot};
+    use ad_core_rs::plugin::runtime::WriteVerdict;
+    use asyn_rs::port::InterfaceMask;
     use asyn_rs::port::{PortDriverBase, PortFlags};
     use std::sync::atomic::{AtomicU32, Ordering};
     use tiff::decoder::Decoder;
+
+    /// C++'s `%f` spells a NaN `nan`, and `-nan` when its sign bit is set.
+    #[test]
+    fn a_float_attribute_tag_prints_a_nan_as_c_does() {
+        let tag = |value| {
+            attribute_tag_string(&NDAttribute::new_static(
+                "A",
+                "",
+                NDAttrSource::Driver,
+                value,
+            ))
+        };
+        assert_eq!(tag(NDAttrValue::Float64(f64::NAN)), "A:nan");
+        assert_eq!(tag(NDAttrValue::Float64(-f64::NAN)), "A:-nan");
+        assert_eq!(tag(NDAttrValue::Float32(f32::NAN)), "A:nan");
+        assert_eq!(tag(NDAttrValue::Float32(-f32::NAN)), "A:-nan");
+    }
     use tiff::tags::Tag;
 
     static TEST_COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -664,6 +751,678 @@ mod tests {
             prefix,
             n
         ))
+    }
+
+    /// C `openFile` reads Model, Manufacturer and the 65010 tags from
+    /// `pFileAttributes`: the plugin's own set with the frame's on top
+    /// (NDFileTIFF.cpp:240-242).
+    /// A frame for another plugin returns before beginProcessCallbacks
+    /// (NDPluginFile.cpp:724-725), so none of its fields is set.
+    #[test]
+    fn a_frame_for_another_plugin_sets_no_begin_field() {
+        use ad_core_rs::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
+        let (handle, _rx, _jh) = crate::test_util::running("TIFF_DEST", TiffFileProcessor::new());
+        let port = handle.port_runtime().port_handle();
+        let p = &handle.ndarray_params;
+        let before = [p.unique_id, p.n_dimensions, p.array_counter]
+            .map(|r| port.read_int32_blocking(r, 0).ok());
+        let mut array = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
+        array.unique_id = 7;
+        array.attributes.add(NDAttribute::new_static(
+            "FilePluginDestination",
+            "",
+            NDAttrSource::Driver,
+            NDAttrValue::String("OTHER".into()),
+        ));
+        crate::test_util::publish(&handle, &array);
+        assert!(handle.wait_params_applied(std::time::Duration::from_secs(10)));
+        let after = [p.unique_id, p.n_dimensions, p.array_counter]
+            .map(|r| port.read_int32_blocking(r, 0).ok());
+        assert_eq!(after, before);
+    }
+
+    /// A frame addressed to this plugin's own port name is processed
+    /// (NDPluginFile.cpp:646), whatever the case.
+    #[test]
+    fn a_frame_for_this_port_is_processed() {
+        use ad_core_rs::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
+        let (handle, _rx, _jh) = crate::test_util::running("TIFF_MINE", TiffFileProcessor::new());
+        let mut array = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
+        array.unique_id = 7;
+        array.attributes.add(NDAttribute::new_static(
+            "FilePluginDestination",
+            "",
+            NDAttrSource::Driver,
+            NDAttrValue::String("tiff_mine".into()),
+        ));
+        crate::test_util::publish(&handle, &array);
+        assert!(handle.wait_params_applied(std::time::Duration::from_secs(10)));
+        let port = handle.port_runtime().port_handle();
+        assert_eq!(
+            port.read_int32_blocking(handle.ndarray_params.unique_id, 0)
+                .ok(),
+            Some(7)
+        );
+    }
+
+    #[test]
+    fn the_file_carries_the_plugin_attributes_under_the_frame() {
+        use crate::test_util::{auto_save_to, publish, wait_saved, with_attributes_file};
+        let xml = r#"<Attributes>
+            <Attribute name="Model" type="CONST" source="PluginModel"/>
+            <Attribute name="Manufacturer" type="CONST" source="PluginMake"/>
+            <Attribute name="ColorMode" type="CONST" source="5" datatype="INT"/>
+        </Attributes>"#;
+        let (handle, mut rx, _jh) =
+            with_attributes_file("TIFF_ATTRS", TiffFileProcessor::new(), xml);
+        let path = temp_path("plugin_attrs");
+        auto_save_to(&handle, &path);
+        let mut arr = NDArray::new(
+            vec![NDDimension::new(4), NDDimension::new(4)],
+            NDDataType::UInt8,
+        );
+        arr.attributes.add(NDAttribute::new_static(
+            "Manufacturer",
+            "",
+            NDAttrSource::Driver,
+            NDAttrValue::String("FrameMake".into()),
+        ));
+        publish(&handle, &arr);
+        wait_saved(&handle, 1);
+        let mut decoder = Decoder::new(std::fs::File::open(&path).unwrap()).unwrap();
+        let tag = |d: &mut Decoder<std::fs::File>, t| d.get_tag(t).unwrap().into_string().unwrap();
+        assert_eq!(tag(&mut decoder, Tag::Model), "PluginModel");
+        assert_eq!(tag(&mut decoder, Tag::Make), "FrameMake");
+
+        // C `readFile` gets the set onto the image, then adds ColorMode
+        // (NDFileTIFF.cpp:540-543); `readFileBase`'s `endProcessCallbacks`
+        // gets the set again, over it (NDPluginFile.cpp:193).
+        let port = handle.port_runtime().port_handle();
+        port.write_int32_blocking(handle.ndarray_params.array_callbacks, 0, 1)
+            .unwrap();
+        let reason = port
+            .drv_user_create_blocking(&asyn_rs::port::DrvUserRequest::new("READ_FILE", 0))
+            .unwrap()
+            .reason;
+        port.write_int32_blocking(reason, 0, 1).unwrap();
+        let image = rx.blocking_recv().unwrap();
+        let value = |name: &str| image.attributes.get(name).map(|a| a.value.clone());
+        assert_eq!(
+            value("Model"),
+            Some(NDAttrValue::String("PluginModel".into()))
+        );
+        assert_eq!(value("ColorMode"), Some(NDAttrValue::String("5".into())));
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// C hands a saved frame on and counts it (NDPluginFile.cpp:252, :749);
+    /// WriteFile hands the same frame on again without counting it, since
+    /// writeFileBase runs no beginProcessCallbacks (:801-820).
+    #[test]
+    fn a_written_frame_goes_downstream() {
+        use crate::test_util::{auto_save_to, publish, running, wait_saved};
+        let (handle, mut rx, _jh) = running("TIFF_ON", TiffFileProcessor::new());
+        let port = handle.port_runtime().port_handle();
+        let p = &handle.ndarray_params;
+        port.write_int32_blocking(p.array_callbacks, 0, 1).unwrap();
+        let path = temp_path("handed_on");
+        auto_save_to(&handle, &path);
+        let mut arr = NDArray::new(
+            vec![NDDimension::new(4), NDDimension::new(4)],
+            NDDataType::UInt8,
+        );
+        arr.unique_id = 3;
+        publish(&handle, &arr);
+        wait_saved(&handle, 1);
+        assert_eq!(rx.blocking_recv().unwrap().unique_id, 3);
+        port.write_int32_blocking(p.write_file, 0, 1).unwrap();
+        assert_eq!(rx.blocking_recv().unwrap().unique_id, 3);
+        assert!(handle.wait_params_applied(std::time::Duration::from_secs(10)));
+        assert_eq!(port.read_int32_blocking(p.array_counter, 0).unwrap(), 1);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// What a monitor on NumCaptured and a blocking downstream plugin see,
+    /// in the one order they see it.
+    #[derive(Debug, PartialEq)]
+    enum Seen {
+        NumCaptured(i32),
+        Frame(i32),
+    }
+
+    /// Logs each frame it is handed, standing in for a downstream plugin.
+    struct Downstream(Arc<parking_lot::Mutex<Vec<Seen>>>);
+
+    impl NDPluginProcess for Downstream {
+        const ASYN_FLAGS: PortFlags = ad_core_rs::plugin::runtime::ASYN_CANBLOCK;
+        const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+        const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+        fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
+            self.0.lock().push(Seen::Frame(array.unique_id));
+            ProcessResult::sink(vec![])
+        }
+        fn plugin_type(&self) -> &str {
+            "Downstream"
+        }
+    }
+
+    /// A 3-frame capture into a TIFF plugin whose output feeds a
+    /// BlockingCallbacks downstream, flushed by AutoSave or by WriteFile:
+    /// what a NumCaptured monitor and the downstream saw, in one sequence.
+    /// `hold` keeps the port's actor in the NumCaptured=3 callback until the
+    /// downstream has frame 1, as a loaded box can.
+    fn capture_flush_log(port: &str, write_file: bool, hold: bool) -> Vec<Seen> {
+        use crate::test_util::{auto_save_to, publish, registered, running, wait_saved};
+        use std::time::Duration;
+        let log = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let down_name = format!("{port}_DS");
+        let (down, _down_rx, _down_jh) = running(&down_name, Downstream(log.clone()));
+        let down_port = down.port_runtime().port_handle();
+        down_port
+            .write_int32_blocking(down.plugin_params.blocking_callbacks, 0, 1)
+            .unwrap();
+        assert!(down.wait_params_applied(Duration::from_secs(10)));
+
+        let (handle, _rx, _jh) = registered(port, TiffFileProcessor::new());
+        ad_core_rs::plugin::runtime::wire_downstream(&handle, down.array_sender().clone());
+        let up = handle.port_runtime().port_handle();
+        let p = &handle.ndarray_params;
+        up.write_int32_blocking(p.array_callbacks, 0, 1).unwrap();
+        let path = temp_path(port);
+        auto_save_to(&handle, &path);
+        // doCapture needs an array's dimensions first (NDPluginFile.cpp:464).
+        publish(
+            &handle,
+            &NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8),
+        );
+        wait_saved(&handle, 1);
+        up.write_int32_blocking(p.auto_save, 0, i32::from(!write_file))
+            .unwrap();
+        up.write_int32_blocking(p.file_write_mode, 0, NDFileMode::Capture as i32)
+            .unwrap();
+        up.write_int32_blocking(p.num_capture, 0, 3).unwrap();
+        up.write_int32_blocking(p.capture, 0, 1).unwrap();
+        assert!(handle.wait_params_applied(Duration::from_secs(10)));
+
+        let posts = log.clone();
+        let _monitor = up
+            .interrupts()
+            .register_sync_callback(
+                asyn_rs::interrupt::InterruptFilter {
+                    reason: Some(p.num_captured),
+                    ..Default::default()
+                },
+                move |iv| {
+                    if let asyn_rs::param::ParamValue::Int32(v) = iv.value {
+                        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                        while hold
+                            && v == 3
+                            && !posts.lock().contains(&Seen::Frame(1))
+                            && std::time::Instant::now() < deadline
+                        {
+                            std::thread::yield_now();
+                        }
+                        posts.lock().push(Seen::NumCaptured(v));
+                    }
+                },
+            )
+            .unwrap();
+        for id in 1..=3 {
+            let mut arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
+            arr.unique_id = id;
+            publish(&handle, &arr);
+            wait_saved(&handle, id + 1);
+        }
+        if write_file {
+            up.write_int32_blocking(p.write_file, 0, 1).unwrap();
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !log.lock().ends_with(&[Seen::NumCaptured(0)]) {
+            assert!(std::time::Instant::now() < deadline, "{:?}", log.lock());
+            std::thread::yield_now();
+        }
+        std::fs::remove_file(&path).ok();
+        std::mem::take(&mut *log.lock())
+    }
+
+    /// Whether the flush after the last buffered frame handed frames 1-3 on
+    /// in order, each before the NumCaptured posted for it. The count's order
+    /// against the next frame is not asserted: in C a record only gets a
+    /// scanIoRequest from the callback (devAsynInt32.c:575), so a PV has none.
+    /// That includes the 3 the last buffered frame posts, so it only marks
+    /// where the flush's counts start, not where its frames do.
+    fn hands_on_before_each_post(log: &[Seen]) -> bool {
+        let Some(start) = log.iter().position(|s| *s == Seen::NumCaptured(3)) else {
+            return false;
+        };
+        let flush = &log[start + 1..];
+        let at = |seen: Seen| log.iter().position(|s| *s == seen);
+        let posted = |n: i32| {
+            flush
+                .iter()
+                .position(|s| *s == Seen::NumCaptured(n))
+                .map(|i| start + 1 + i)
+        };
+        let frames: Vec<_> = log
+            .iter()
+            .filter(|s| matches!(s, Seen::Frame(k) if *k > 0))
+            .collect();
+        let counts: Vec<_> = flush
+            .iter()
+            .filter(|s| matches!(s, Seen::NumCaptured(_)))
+            .collect();
+        frames == [&Seen::Frame(1), &Seen::Frame(2), &Seen::Frame(3)]
+            && counts
+                == [
+                    &Seen::NumCaptured(2),
+                    &Seen::NumCaptured(1),
+                    &Seen::NumCaptured(0),
+                ]
+            && (1..=3).all(|k| at(Seen::Frame(k)) < posted(3 - k))
+    }
+
+    /// C's capture loop writes frame N, hands it to endProcessCallbacks,
+    /// then posts NumCaptured for it (NDPluginFile.cpp:296-321): a blocking
+    /// downstream has frame N before a monitor sees N's count.
+    #[test]
+    fn an_autosave_flush_hands_each_frame_on_before_its_post() {
+        let log = capture_flush_log("TIFF_FLUSH_ORDER", false, false);
+        assert!(hands_on_before_each_post(&log), "{log:?}");
+    }
+
+    /// The flush's frame 1 can reach the downstream before the monitor sees
+    /// the 3 posted ahead of it: the frame callback's posts queue on the
+    /// port's actor while the frames are handed on from the callback's thread.
+    #[test]
+    fn a_late_count_before_the_flush_keeps_the_order() {
+        let log = capture_flush_log("TIFF_FLUSH_LATE", false, true);
+        let three = log.iter().position(|s| *s == Seen::NumCaptured(3));
+        let one = log.iter().position(|s| *s == Seen::Frame(1));
+        assert!(one < three, "not held: {log:?}");
+        assert!(hands_on_before_each_post(&log), "{log:?}");
+    }
+
+    /// WriteFile runs the same loop on the port thread, so a blocking
+    /// downstream makes the write wait for it as C's port thread does, and
+    /// the write still returns (NDPluginFile.cpp:296-321, :801-820).
+    #[test]
+    fn a_write_file_flush_waits_on_a_blocking_downstream_in_order() {
+        let log = capture_flush_log("TIFF_WRITE_ORDER", true, false);
+        assert!(hands_on_before_each_post(&log), "{log:?}");
+    }
+
+    /// C evaluates an AutoSave frame's attributes on the frame's thread
+    /// (NDPluginFile.cpp:252), so a WriteFile arriving while the frame is
+    /// written waits for it and returns. `path` is a FIFO, which holds each
+    /// write until it is read.
+    // The hold is a POSIX FIFO; Windows has no blocking open to stand in for
+    // it, and the locking under test does not depend on the OS.
+    #[cfg(unix)]
+    #[test]
+    fn a_write_file_during_a_single_mode_write_returns() {
+        use crate::test_util::{frame, gated, publish, wait_saved, write_file_returns};
+        use std::io::Read;
+        use std::time::Duration;
+        let path = temp_path("single_write_file");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        let (keep, handle, _gate, entered) =
+            gated("TIFF_SINGLE_WF", TiffFileProcessor::new(), &path);
+        let (permit, permits) = std::sync::mpsc::channel::<()>();
+        let (read, reads) = std::sync::mpsc::channel();
+        let fifo = path.clone();
+        std::thread::spawn(move || {
+            for () in permits {
+                let mut bytes = Vec::new();
+                let mut file = std::fs::File::open(&fifo).unwrap();
+                file.read_to_end(&mut bytes).unwrap();
+                let _ = read.send(bytes.len());
+            }
+        });
+        permit.send(()).unwrap();
+        publish(&handle, &frame(1));
+        wait_saved(&handle, 1);
+        assert_eq!(entered.recv_timeout(Duration::from_secs(10)), Ok(1));
+        assert!(reads.recv_timeout(Duration::from_secs(10)).is_ok());
+
+        // Frame 2's write waits on the FIFO with the writer held.
+        publish(&handle, &frame(2));
+        std::thread::sleep(Duration::from_millis(300));
+        let returned = write_file_returns(&handle, || {
+            std::thread::sleep(Duration::from_millis(300));
+            permit.send(()).unwrap();
+            permit.send(()).unwrap();
+        });
+        if !returned {
+            // The port is deadlocked; its threads cannot be joined.
+            std::mem::forget((keep, handle, permit));
+            std::fs::remove_file(&path).ok();
+            panic!("WriteFile during a Single-mode write never returned");
+        }
+        wait_saved(&handle, 2);
+        assert_eq!(entered.recv_timeout(Duration::from_secs(10)), Ok(2));
+        assert_eq!(entered.recv_timeout(Duration::from_secs(10)), Ok(2));
+        drop(permit);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// C's flush counts ArrayCounter up after each frame it hands on
+    /// (NDPluginFile.cpp:301-319), and the next frame's `getAttributes`
+    /// reads the count posted before it.
+    #[test]
+    fn a_flushed_frame_reads_the_counter_posted_before_it() {
+        use crate::test_util::{auto_save_to, frame, publish, wait_saved, with_attributes_file};
+        use ad_core_rs::attributes::NDAttrValue;
+        let xml = r#"<Attributes>
+            <Attribute name="Counter" type="PARAM" source="ARRAY_COUNTER" datatype="INT"/>
+        </Attributes>"#;
+        let (handle, mut rx, _jh) =
+            with_attributes_file("TIFF_FLUSH_COUNTER", TiffFileProcessor::new(), xml);
+        let path = temp_path("flush_counter");
+        auto_save_to(&handle, &path);
+        let port = handle.port_runtime().port_handle();
+        let p = &handle.ndarray_params;
+        port.write_int32_blocking(p.array_callbacks, 0, 1).unwrap();
+        publish(&handle, &frame(0));
+        wait_saved(&handle, 1);
+        port.write_int32_blocking(p.file_write_mode, 0, NDFileMode::Capture as i32)
+            .unwrap();
+        port.write_int32_blocking(p.num_capture, 0, 2).unwrap();
+        port.write_int32_blocking(p.capture, 0, 1).unwrap();
+        assert!(handle.wait_params_applied(std::time::Duration::from_secs(10)));
+        publish(&handle, &frame(1));
+        publish(&handle, &frame(2));
+        let counters: Vec<_> = (0..3)
+            .map(|_| {
+                let a = rx.blocking_recv().unwrap();
+                let counter = a.attributes.get("Counter").map(|c| c.value.clone());
+                (a.unique_id, counter)
+            })
+            .collect();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(
+            counters,
+            vec![
+                (0, Some(NDAttrValue::Int32(1))),
+                (1, Some(NDAttrValue::Int32(3))),
+                (2, Some(NDAttrValue::Int32(4))),
+            ]
+        );
+    }
+
+    /// C `openFile`'s `getAttributes` runs after `createFileName` set
+    /// FullFileName and moved FileNumber past it (NDPluginFile.cpp:43-52).
+    #[test]
+    fn the_file_attributes_read_the_name_being_written() {
+        use crate::test_util::{auto_save_to, publish, wait_saved, with_attributes_file};
+        let xml = r#"<Attributes>
+            <Attribute name="Model" type="PARAM" source="FULL_FILE_NAME" datatype="STRING"/>
+            <Attribute name="Number" type="PARAM" source="FILE_NUMBER" datatype="INT"/>
+        </Attributes>"#;
+        let (handle, _rx, _jh) = with_attributes_file("TIFF_NAME", TiffFileProcessor::new(), xml);
+        let path = temp_path("name_being_written");
+        auto_save_to(&handle, &path);
+        let port = handle.port_runtime().port_handle();
+        let p = &handle.ndarray_params;
+        port.submit_blocking(
+            asyn_rs::request::RequestOp::OctetWrite {
+                data: b"%s%s_%d".to_vec(),
+            },
+            asyn_rs::user::AsynUser::new(p.file_template),
+        )
+        .unwrap();
+        port.write_int32_blocking(p.file_number, 0, 3).unwrap();
+        port.write_int32_blocking(p.auto_increment, 0, 1).unwrap();
+        assert!(handle.wait_params_applied(std::time::Duration::from_secs(10)));
+        publish(
+            &handle,
+            &NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8),
+        );
+        wait_saved(&handle, 1);
+        let written = format!("{}_3", path.display());
+        let mut decoder = Decoder::new(std::fs::File::open(&written).unwrap()).unwrap();
+        let model = decoder.get_tag(Tag::Model).unwrap().into_string().unwrap();
+        let number = (65010..65020)
+            .filter_map(|t| decoder.get_tag(Tag::Unknown(t)).ok())
+            .filter_map(|v| v.into_string().ok())
+            .find(|v| v.starts_with("Number:"));
+        std::fs::remove_file(&written).ok();
+        assert_eq!(model, written);
+        assert_eq!(number.as_deref(), Some("Number:4"));
+    }
+
+    /// C hands the written frame on at NDPluginFile.cpp:252, after
+    /// openFileBase set FullFileName (:52) and createFileName moved
+    /// FileNumber, so its getAttributes (NDPluginDriver.cpp:290) reads them.
+    #[test]
+    fn a_handed_on_frame_reads_the_name_just_written() {
+        use crate::test_util::{auto_save_to, publish, wait_saved, with_attributes_file};
+        use ad_core_rs::attributes::NDAttrValue;
+        let xml = r#"<Attributes>
+            <Attribute name="Name" type="PARAM" source="FULL_FILE_NAME" datatype="STRING"/>
+            <Attribute name="Number" type="PARAM" source="FILE_NUMBER" datatype="INT"/>
+        </Attributes>"#;
+        let (handle, mut rx, _jh) =
+            with_attributes_file("TIFF_HANDED_NAME", TiffFileProcessor::new(), xml);
+        let path = temp_path("handed_name");
+        auto_save_to(&handle, &path);
+        let port = handle.port_runtime().port_handle();
+        let p = &handle.ndarray_params;
+        port.submit_blocking(
+            asyn_rs::request::RequestOp::OctetWrite {
+                data: b"%s%s_%d".to_vec(),
+            },
+            asyn_rs::user::AsynUser::new(p.file_template),
+        )
+        .unwrap();
+        port.write_int32_blocking(p.file_number, 0, 3).unwrap();
+        port.write_int32_blocking(p.auto_increment, 0, 1).unwrap();
+        port.write_int32_blocking(p.array_callbacks, 0, 1).unwrap();
+        assert!(handle.wait_params_applied(std::time::Duration::from_secs(10)));
+        publish(
+            &handle,
+            &NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8),
+        );
+        wait_saved(&handle, 1);
+        let a = rx.blocking_recv().unwrap();
+        let written = format!("{}_3", path.display());
+        std::fs::remove_file(&written).ok();
+        let name = a.attributes.get("Name").map(|c| c.value.clone());
+        let number = a.attributes.get("Number").map(|c| c.value.clone());
+        assert_eq!(
+            (name, number),
+            (
+                Some(NDAttrValue::String(written)),
+                Some(NDAttrValue::Int32(4))
+            )
+        );
+    }
+
+    /// The capture flush opens each TIFF (NDPluginFile.cpp:292),
+    /// setting FullFileName, before handing it on (:301).
+    #[test]
+    fn a_flushed_frame_reads_its_own_file_name() {
+        use crate::test_util::{auto_save_to, frame, publish, with_attributes_file};
+        use ad_core_rs::attributes::NDAttrValue;
+        let xml = r#"<Attributes>
+            <Attribute name="Name" type="PARAM" source="FULL_FILE_NAME" datatype="STRING"/>
+            <Attribute name="Number" type="PARAM" source="FILE_NUMBER" datatype="INT"/>
+        </Attributes>"#;
+        let (handle, mut rx, _jh) =
+            with_attributes_file("TIFF_FLUSHED_NAME", TiffFileProcessor::new(), xml);
+        let path = temp_path("flushed_name");
+        auto_save_to(&handle, &path);
+        let port = handle.port_runtime().port_handle();
+        let p = &handle.ndarray_params;
+        port.submit_blocking(
+            asyn_rs::request::RequestOp::OctetWrite {
+                data: b"%s%s_%d".to_vec(),
+            },
+            asyn_rs::user::AsynUser::new(p.file_template),
+        )
+        .unwrap();
+        port.write_int32_blocking(p.file_number, 0, 3).unwrap();
+        port.write_int32_blocking(p.auto_increment, 0, 1).unwrap();
+        port.write_int32_blocking(p.array_callbacks, 0, 1).unwrap();
+        port.write_int32_blocking(p.auto_save, 0, 0).unwrap();
+        assert!(handle.wait_params_applied(std::time::Duration::from_secs(10)));
+        // The frame capture registers; it must be done before Capture is set.
+        publish(&handle, &frame(7));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while port.read_int32_blocking(p.unique_id, 0).ok() != Some(7) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "frame 7 not processed"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        port.write_int32_blocking(p.auto_save, 0, 1).unwrap();
+        port.write_int32_blocking(p.file_write_mode, 0, NDFileMode::Capture as i32)
+            .unwrap();
+        port.write_int32_blocking(p.num_capture, 0, 2).unwrap();
+        port.write_int32_blocking(p.capture, 0, 1).unwrap();
+        assert!(handle.wait_params_applied(std::time::Duration::from_secs(10)));
+        publish(&handle, &frame(1));
+        publish(&handle, &frame(2));
+        let got: Vec<_> = (0..2)
+            .map(|_| {
+                let a = rx.blocking_recv().unwrap();
+                (
+                    a.unique_id,
+                    a.attributes.get("Name").map(|c| c.value.clone()),
+                    a.attributes.get("Number").map(|c| c.value.clone()),
+                )
+            })
+            .collect();
+        for n in 3..5 {
+            std::fs::remove_file(format!("{}_{n}", path.display())).ok();
+        }
+        let name = |n| Some(NDAttrValue::String(format!("{}_{n}", path.display())));
+        assert_eq!(
+            got,
+            vec![
+                (1, name(3), Some(NDAttrValue::Int32(4))),
+                (2, name(4), Some(NDAttrValue::Int32(5))),
+            ]
+        );
+    }
+
+    /// C sets NumCaptured to 1 before a Single open (NDPluginFile.cpp:244),
+    /// so the file's and the handed-on frame's attributes read it, and the
+    /// write posts it (:265).
+    #[test]
+    fn a_single_write_reads_and_posts_one_captured() {
+        use crate::test_util::{auto_save_to, publish, wait_saved, with_attributes_file};
+        use ad_core_rs::attributes::NDAttrValue;
+        let xml = r#"<Attributes>
+            <Attribute name="Captured" type="PARAM" source="NUM_CAPTURED" datatype="INT"/>
+        </Attributes>"#;
+        let (handle, mut rx, _jh) =
+            with_attributes_file("TIFF_SINGLE_CAPTURED", TiffFileProcessor::new(), xml);
+        let path = temp_path("single_captured");
+        auto_save_to(&handle, &path);
+        let port = handle.port_runtime().port_handle();
+        let p = &handle.ndarray_params;
+        port.submit_blocking(
+            asyn_rs::request::RequestOp::OctetWrite {
+                data: b"%s%s_%d".to_vec(),
+            },
+            asyn_rs::user::AsynUser::new(p.file_template),
+        )
+        .unwrap();
+        port.write_int32_blocking(p.file_number, 0, 3).unwrap();
+        port.write_int32_blocking(p.array_callbacks, 0, 1).unwrap();
+        assert!(handle.wait_params_applied(std::time::Duration::from_secs(10)));
+        publish(
+            &handle,
+            &NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8),
+        );
+        wait_saved(&handle, 1);
+        let handed_on = rx.blocking_recv().unwrap();
+        let written = format!("{}_3", path.display());
+        let mut decoder = Decoder::new(std::fs::File::open(&written).unwrap()).unwrap();
+        let tag = (65010..65020)
+            .filter_map(|t| decoder.get_tag(Tag::Unknown(t)).ok())
+            .filter_map(|v| v.into_string().ok())
+            .find(|v| v.starts_with("Captured:"));
+        std::fs::remove_file(&written).ok();
+        assert_eq!(
+            (
+                tag.as_deref(),
+                handed_on
+                    .attributes
+                    .get("Captured")
+                    .map(|c| c.value.clone()),
+                port.read_int32_blocking(p.num_captured, 0).ok(),
+            ),
+            (Some("Captured:1"), Some(NDAttrValue::Int32(1)), Some(1))
+        );
+    }
+
+    /// C `readFileBase` counts the image it read and gets the set onto it
+    /// after that (NDPluginFile.cpp:187-193).
+    #[test]
+    fn a_read_image_gets_the_set_after_it_is_counted() {
+        use crate::test_util::{auto_save_to, publish, wait_saved, with_attributes_file};
+        let xml = r#"<Attributes>
+            <Attribute name="Counter" type="PARAM" source="ARRAY_COUNTER" datatype="INT"/>
+        </Attributes>"#;
+        let (handle, mut rx, _jh) =
+            with_attributes_file("TIFF_READ_COUNT", TiffFileProcessor::new(), xml);
+        let path = temp_path("read_count");
+        auto_save_to(&handle, &path);
+        publish(
+            &handle,
+            &NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8),
+        );
+        wait_saved(&handle, 1);
+        let port = handle.port_runtime().port_handle();
+        port.write_int32_blocking(handle.ndarray_params.array_callbacks, 0, 1)
+            .unwrap();
+        let reason = port
+            .drv_user_create_blocking(&asyn_rs::port::DrvUserRequest::new("READ_FILE", 0))
+            .unwrap()
+            .reason;
+        port.write_int32_blocking(reason, 0, 1).unwrap();
+        let image = rx.blocking_recv().unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(
+            image.attributes.get("Counter").map(|a| a.value.clone()),
+            Some(NDAttrValue::Int32(2))
+        );
+    }
+
+    /// A setting write while a file write holds the writer returns at once:
+    /// staging the plugin's attribute set must not take the writer lock.
+    #[test]
+    fn a_setting_write_during_a_busy_write_returns_at_once() {
+        let mut base = PortDriverBase::new(
+            "TIFFBUSY",
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
+        );
+        let _nd_params = NDArrayDriverParams::create(&mut base).unwrap();
+        let mut proc = TiffFileProcessor::new();
+        proc.register_params(&mut base).unwrap();
+        let auto_increment = base.find_param("AUTO_INCREMENT").unwrap();
+        let writer = Arc::clone(&proc.ctrl.lock().writer);
+        assert!(
+            crate::test_util::returns_while_busy(&writer, || {
+                proc.validate_int32(
+                    auto_increment,
+                    0,
+                    1,
+                    WriteVerdict::Accept(1),
+                    &mut ad_core_rs::plugin::runtime::WritePort::new(&mut base),
+                );
+            }),
+            "the setting write waited for the file write"
+        );
     }
 
     /// R8-75: a 3-D array whose ColorMode attribute is absent is an error in C.
@@ -691,7 +1450,7 @@ mod tests {
         let path = temp_path("tiff_3d_no_colormode");
         let mut writer = TiffWriter::new();
         writer
-            .open_file(&path, NDFileMode::Single, &arr)
+            .open_file(&path, NDFileOpenMode::WRITE, &arr)
             .expect("open");
         let err = writer.write_file(&Arc::new(arr)).unwrap_err();
         assert!(
@@ -720,7 +1479,7 @@ mod tests {
         let path = temp_path("tiff_3d_rgb1");
         let mut writer = TiffWriter::new();
         writer
-            .open_file(&path, NDFileMode::Single, &arr)
+            .open_file(&path, NDFileOpenMode::WRITE, &arr)
             .expect("open");
         writer
             .write_file(&Arc::new(arr))
@@ -745,7 +1504,9 @@ mod tests {
             }
         }
 
-        writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
+        writer
+            .open_file(&path, NDFileOpenMode::WRITE, &arr)
+            .unwrap();
         writer.write_file(&Arc::new(arr)).unwrap();
         writer.close_file().unwrap();
 
@@ -769,7 +1530,9 @@ mod tests {
             NDDataType::UInt16,
         );
 
-        writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
+        writer
+            .open_file(&path, NDFileOpenMode::WRITE, &arr)
+            .unwrap();
         writer.write_file(&Arc::new(arr)).unwrap();
         writer.close_file().unwrap();
 
@@ -794,7 +1557,9 @@ mod tests {
             }
         }
 
-        writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
+        writer
+            .open_file(&path, NDFileOpenMode::WRITE, &arr)
+            .unwrap();
         writer.write_file(&Arc::new(arr.clone())).unwrap();
 
         let read_back = writer.read_file().unwrap();
@@ -823,7 +1588,9 @@ mod tests {
             }
         }
 
-        writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
+        writer
+            .open_file(&path, NDFileOpenMode::WRITE, &arr)
+            .unwrap();
         writer.write_file(&Arc::new(arr.clone())).unwrap();
 
         let read_back = writer.read_file().unwrap();
@@ -838,7 +1605,7 @@ mod tests {
     }
 
     #[test]
-    fn test_on_param_change_read_file_emits_array_and_resets_busy() {
+    fn a_read_file_write_publishes_the_array_and_resets_busy() {
         let path = temp_path("tiff_read_param");
         let mut writer = TiffWriter::new();
 
@@ -853,11 +1620,19 @@ mod tests {
             }
         }
 
-        writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
+        writer
+            .open_file(&path, NDFileOpenMode::WRITE, &arr)
+            .unwrap();
         writer.write_file(&Arc::new(arr)).unwrap();
         writer.close_file().unwrap();
 
-        let mut base = PortDriverBase::new("TIFFTEST", 1, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            "TIFFTEST",
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
+        );
         let _nd_params = NDArrayDriverParams::create(&mut base).unwrap();
 
         let mut proc = TiffFileProcessor::new();
@@ -868,54 +1643,33 @@ mod tests {
         let reason_template = base.find_param("FILE_TEMPLATE").unwrap();
         let reason_read = base.find_param("READ_FILE").unwrap();
 
-        let _ = proc.on_param_change(
+        let octet = |reason, v: String| {
+            proc.validate_octet(reason, 0, &v, WriteVerdict::Accept(v.clone()), &base);
+        };
+        // As the port's FilePath write leaves it: with checkPath's separator.
+        octet(
             reason_path,
-            &PluginParamSnapshot {
-                enable_callbacks: true,
-                reason: reason_path,
-                addr: 0,
-                value: ParamChangeValue::Octet(
-                    path.parent().unwrap().to_str().unwrap().to_string(),
-                ),
-            },
+            format!("{}/", path.parent().unwrap().to_str().unwrap()),
         );
-        let _ = proc.on_param_change(
+        octet(
             reason_name,
-            &PluginParamSnapshot {
-                enable_callbacks: true,
-                reason: reason_name,
-                addr: 0,
-                value: ParamChangeValue::Octet(
-                    path.file_name().unwrap().to_str().unwrap().to_string(),
-                ),
-            },
+            path.file_name().unwrap().to_str().unwrap().to_string(),
         );
-        let _ = proc.on_param_change(
-            reason_template,
-            &PluginParamSnapshot {
-                enable_callbacks: true,
-                reason: reason_template,
-                addr: 0,
-                value: ParamChangeValue::Octet("%s%s".into()),
-            },
-        );
+        octet(reason_template, "%s%s".into());
 
-        let result = proc.on_param_change(
+        let out = proc.validate_int32(
             reason_read,
-            &PluginParamSnapshot {
-                enable_callbacks: true,
-                reason: reason_read,
-                addr: 0,
-                value: ParamChangeValue::Int32(1),
-            },
+            0,
+            1,
+            WriteVerdict::Accept(1),
+            &mut ad_core_rs::plugin::runtime::WritePort::new(&mut base),
         );
 
-        assert_eq!(result.output_arrays.len(), 1);
-        assert!(result.param_updates.iter().any(|u| matches!(
-            u,
-            ParamUpdate::Int32 { reason, value: 0, .. } if *reason == reason_read
-        )));
-        match &result.output_arrays[0].data {
+        assert_eq!(out.verdict, WriteVerdict::Accept(0));
+        let ad_core_rs::plugin::runtime::Published::Read(read) = &out.publish else {
+            panic!("ReadFile publishes its array: {:?}", out.publish);
+        };
+        match &read.data {
             NDDataBuffer::U8(v) => assert_eq!(v.len(), 12),
             other => panic!("unexpected data buffer: {other:?}"),
         }
@@ -937,7 +1691,9 @@ mod tests {
         arr.timestamp.sec = 1_000_000;
         arr.timestamp.nsec = 500;
 
-        writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
+        writer
+            .open_file(&path, NDFileOpenMode::WRITE, &arr)
+            .unwrap();
         writer.write_file(&Arc::new(arr)).unwrap();
         writer.close_file().unwrap();
 
@@ -990,7 +1746,9 @@ mod tests {
             NDAttrValue::String("test frame".into()),
         ));
 
-        writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
+        writer
+            .open_file(&path, NDFileOpenMode::WRITE, &arr)
+            .unwrap();
         writer.write_file(&Arc::new(arr)).unwrap();
         writer.close_file().unwrap();
 
@@ -1031,7 +1789,7 @@ mod tests {
 
         let path = temp_path("tiff_attr_fmt");
         let mut writer = TiffWriter::new();
-        writer.open_file(&path, NDFileMode::Single, &a).unwrap();
+        writer.open_file(&path, NDFileOpenMode::WRITE, &a).unwrap();
         writer.write_file(&Arc::new(a)).unwrap();
         writer.close_file().unwrap();
 
@@ -1067,7 +1825,9 @@ mod tests {
             }
         }
 
-        writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
+        writer
+            .open_file(&path, NDFileOpenMode::WRITE, &arr)
+            .unwrap();
         // Previously a hard error; must now succeed.
         writer.write_file(&Arc::new(arr)).unwrap();
         writer.close_file().unwrap();
@@ -1149,7 +1909,9 @@ mod tests {
     fn write_tiff(prefix: &str, array: &NDArray) -> PathBuf {
         let path = temp_path(prefix);
         let mut writer = TiffWriter::new();
-        writer.open_file(&path, NDFileMode::Single, array).unwrap();
+        writer
+            .open_file(&path, NDFileOpenMode::WRITE, array)
+            .unwrap();
         writer.write_file(&Arc::new(array.clone())).unwrap();
         writer.close_file().unwrap();
         path
@@ -1289,7 +2051,7 @@ mod tests {
         writer
             .open_file(
                 &path,
-                NDFileMode::Single,
+                NDFileOpenMode::WRITE,
                 &NDArray::new(vec![], NDDataType::UInt8),
             )
             .unwrap();

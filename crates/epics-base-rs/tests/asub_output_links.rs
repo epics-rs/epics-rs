@@ -24,20 +24,20 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use epics_base_rs::server::database::PvDatabase;
-use epics_base_rs::server::record::{Record, SubroutineFn};
+use epics_base_rs::server::record::{Record, Subroutine};
 use epics_base_rs::server::records::ai::AiRecord;
 use epics_base_rs::server::records::asub_record::ASubRecord;
 use epics_base_rs::server::records::stringout::StringoutRecord;
 use epics_base_rs::types::EpicsValue;
 
 /// A subroutine that writes `vals` into VALA.., then returns `status`.
-fn sub_writing(vals: Vec<(&'static str, f64)>, status: i64) -> Arc<SubroutineFn> {
-    Arc::new(Box::new(move |rec: &mut dyn Record| {
+fn sub_writing(vals: Vec<(&'static str, f64)>, status: i64) -> Arc<Subroutine> {
+    Arc::new(Subroutine::Plain(Box::new(move |rec: &mut dyn Record| {
         for (field, v) in &vals {
             rec.put_field(field, EpicsValue::Double(*v))?;
         }
         Ok(status)
-    }) as SubroutineFn)
+    })))
 }
 
 async fn process(db: &PvDatabase, rec: &str) {
@@ -63,7 +63,7 @@ async fn asub_db(status: i64) -> PvDatabase {
             .unwrap();
     }
 
-    let mut registry: HashMap<String, Arc<SubroutineFn>> = HashMap::new();
+    let mut registry: HashMap<String, Arc<Subroutine>> = HashMap::new();
     registry.insert(
         "writer".into(),
         sub_writing(vec![("VALA", 11.0), ("VALB", 22.0), ("VALU", 99.0)], status),
@@ -145,13 +145,9 @@ async fn r9_78_failed_do_sub_pushes_nothing() {
 #[epics_macros_rs::epics_test]
 async fn r9_78_failed_input_fetch_pushes_nothing() {
     let db = asub_db(0).await;
-    {
-        let inst = db.get_record("ASUB").unwrap();
-        let mut g = inst.write();
-        g.record
-            .put_field("INPA", EpicsValue::String("NOSUCHREC".into()))
-            .unwrap();
-    }
+    db.put_pv_no_process("ASUB.INPA", EpicsValue::String("NOSUCHREC".into()))
+        .await
+        .unwrap();
 
     process(&db, "ASUB").await;
 
@@ -202,13 +198,13 @@ async fn r9_78_string_output_pushes_through_out_link() {
         .await
         .unwrap();
 
-    let mut registry: HashMap<String, Arc<SubroutineFn>> = HashMap::new();
+    let mut registry: HashMap<String, Arc<Subroutine>> = HashMap::new();
     registry.insert(
         "swriter".into(),
-        Arc::new(Box::new(|rec: &mut dyn Record| {
+        Arc::new(Subroutine::Plain(Box::new(|rec: &mut dyn Record| {
             rec.put_field("VALB", EpicsValue::String("armed".into()))?;
             Ok(0i64)
-        }) as SubroutineFn),
+        }))),
     );
     db.install_subroutine_registry(registry).await;
     db.add_record("NAME_HOLDER2", Box::new(StringoutRecord::new("swriter")))

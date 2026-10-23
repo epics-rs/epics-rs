@@ -50,7 +50,7 @@
 //! `rpc_checked` evaluates the control ACF against the peer's
 //! `(host, account, method, roles)`.
 
-// RTEMS-EXEC-MODEL-ALLOW(16): checked to pass on the exec backend under
+// RTEMS-EXEC-MODEL-ALLOW(15): checked to pass on the exec backend under
 // `EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p epics-bridge-rs
 // --features pva-gateway` (the gateway's spawns/timers ride the runtime::task
 // seam; 739 run, 739 passed on this tree). The default exec-backend gate omits
@@ -59,6 +59,7 @@
 use std::sync::Arc;
 
 use epics_base_rs::server::access_security::{AccessGate, AccessSecurityConfig, AsgAslResolver};
+use epics_base_rs::types::RecordName;
 use epics_pva_rs::nt::NTScalar;
 use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, RpcReply, ScalarType, ScalarValue};
 use epics_pva_rs::server::native_source::AcfCell;
@@ -278,7 +279,8 @@ impl ControlSource {
             fields: vec![
                 ("value".into(), FieldDesc::Scalar(ScalarType::Long)),
                 ("message".into(), FieldDesc::Scalar(ScalarType::String)),
-            ],
+            ]
+            .into(),
         }
     }
 
@@ -298,16 +300,16 @@ impl ControlSource {
     }
 
     /// True iff `name` is one of the read-only diagnostic PVs.
-    fn is_diag(&self, name: &str) -> bool {
-        self.diag_pv_names().iter().any(|n| n == name)
+    fn is_diag(&self, name: &[u8]) -> bool {
+        self.diag_pv_names().iter().any(|n| n.as_bytes() == name)
     }
 
     /// True iff `name` is one of the writable control RPC PVs.
-    fn is_control(&self, name: &str) -> bool {
-        self.control_pv_names().iter().any(|n| n == name)
+    fn is_control(&self, name: &[u8]) -> bool {
+        self.control_pv_names().iter().any(|n| n.as_bytes() == name)
     }
 
-    fn matches(&self, name: &str) -> bool {
+    fn matches(&self, name: &[u8]) -> bool {
         self.is_diag(name) || self.is_control(name)
     }
 
@@ -345,11 +347,11 @@ impl ControlSource {
     /// (already confirmed to be a control PV by the caller).
     async fn run_control_rpc(
         &self,
-        name: &str,
+        name: &RecordName,
         request_value: &PvField,
     ) -> Result<(FieldDesc, PvField), String> {
         let names = self.control_pv_names();
-        if name == names[0] {
+        if *name == names[0] {
             // <prefix>:flush — drop every cached upstream entry across
             // the shared cache AND all per-credential caches, for EVERY
             // upstream tenant of this downstream (not just the first).
@@ -366,7 +368,7 @@ impl ControlSource {
                 Self::control_reply_desc(),
                 Self::control_reply(removed, format!("flushed {removed} cache entries")),
             ))
-        } else if name == names[1] {
+        } else if *name == names[1] {
             // <prefix>:drop — drop one entry by name.
             let target = Self::rpc_string_arg(request_value, "pv").ok_or_else(|| {
                 "drop RPC requires a string 'pv' argument naming the cache entry".to_string()
@@ -433,17 +435,17 @@ impl ControlSource {
 }
 
 impl ChannelSource for ControlSource {
-    async fn list_pvs(&self) -> Vec<String> {
-        let mut out = self.diag_pv_names().to_vec();
-        out.extend(self.control_pv_names());
+    fn list_pvs(&self) -> Vec<RecordName> {
+        let mut out: Vec<RecordName> = self.diag_pv_names().into_iter().map(Into::into).collect();
+        out.extend(self.control_pv_names().into_iter().map(Into::into));
         out
     }
 
-    async fn has_pv(&self, name: &str) -> bool {
+    async fn has_pv(&self, name: &[u8]) -> bool {
         self.matches(name)
     }
 
-    async fn get_introspection(&self, name: &str) -> Option<FieldDesc> {
+    async fn get_introspection(&self, name: &[u8]) -> Option<FieldDesc> {
         if self.is_control(name) {
             // Control PVs serve their RPC-reply shape for GET-INIT so
             // a client that introspects before calling sees the
@@ -453,14 +455,14 @@ impl ChannelSource for ControlSource {
         if !self.is_diag(name) {
             return None;
         }
-        if name.ends_with(":report") {
+        if name.ends_with(b":report") {
             Some(Self::nt_scalar_string_desc())
         } else {
             Some(Self::nt_scalar_long_desc())
         }
     }
 
-    async fn get_value(&self, name: &str) -> Option<PvField> {
+    async fn get_value(&self, name: &[u8]) -> Option<PvField> {
         if self.is_control(name) {
             // Control PVs are RPC targets; a plain GET reports the
             // last-known operation shape with a hint message rather
@@ -489,9 +491,9 @@ impl ChannelSource for ControlSource {
             live_subs += src.live_subscribers() as i64;
         }
 
-        if name.ends_with(":cacheSize") {
+        if name.ends_with(b":cacheSize") {
             Some(Self::nt_scalar_long(cache_size))
-        } else if name.ends_with(":upstreamCount") {
+        } else if name.ends_with(b":upstreamCount") {
             // Distinct from cacheSize: the count of upstream cache layers
             // (shared + per-credential, summed over tenants), NOT the
             // channel count. pva2pva reports these separately
@@ -499,9 +501,9 @@ impl ChannelSource for ControlSource {
             // so an operator could not tell "many channels, one upstream"
             // from "many credentialed upstreams".
             Some(Self::nt_scalar_long(upstream_count))
-        } else if name.ends_with(":liveSubscribers") {
+        } else if name.ends_with(b":liveSubscribers") {
             Some(Self::nt_scalar_long(live_subs))
-        } else if name.ends_with(":report") {
+        } else if name.ends_with(b":report") {
             let report = self
                 .build_report(cache_size, upstream_count, live_subs)
                 .await;
@@ -511,7 +513,7 @@ impl ChannelSource for ControlSource {
         }
     }
 
-    async fn is_writable(&self, _name: &str) -> bool {
+    async fn is_writable(&self, _name: &[u8]) -> bool {
         // No PV here accepts PUT. The diagnostic PVs are read-only;
         // the control PVs are RPC targets. An attempt to PUT any of
         // them surfaces `is_writable=false` and the server rejects it
@@ -519,38 +521,16 @@ impl ChannelSource for ControlSource {
         false
     }
 
-    async fn put_value(&self, name: &str, _value: PvField) -> Result<(), OpError> {
+    async fn put_value(&self, name: &[u8], _value: PvField) -> Result<(), OpError> {
         // Wrong access method / read-only property — operational, not an
         // authorization denial (Failed bucket).
         if self.is_control(name) {
             Err(OpError::failed(format!(
-                "control PV '{name}' is invoked via RPC (pvcall), not PUT"
+                "control PV '{}' is invoked via RPC (pvcall), not PUT",
+                String::from_utf8_lossy(name)
             )))
         } else {
             Err(OpError::failed("control PVs are read-only"))
-        }
-    }
-
-    /// Reject PROCESS. The `ChannelSource` default `process` returns
-    /// `Ok(())` — for this source that would silently swallow a PVA
-    /// PROCESS (`caput -c` / `pvcall .PROC`) and falsely report
-    /// success. Neither the diagnostic PVs (read-only) nor the
-    /// control PVs (RPC targets) have processing semantics, so a
-    /// PROCESS is refused the same way `put_value` refuses a PUT.
-    /// `process_checked`'s default delegates here after its WRITE
-    /// gate, so this one override covers both entry points.
-    async fn process(&self, name: &str) -> Result<(), OpError> {
-        // All operational (wrong method / read-only / not found) — Failed.
-        if self.is_control(name) {
-            Err(OpError::failed(format!(
-                "control PV '{name}' is invoked via RPC (pvcall), not PROCESS"
-            )))
-        } else if self.is_diag(name) {
-            Err(OpError::failed(format!(
-                "'{name}' is a read-only diagnostic PV — PROCESS not supported"
-            )))
-        } else {
-            Err(OpError::failed(format!("unknown control PV '{name}'")))
         }
     }
 
@@ -560,7 +540,7 @@ impl ChannelSource for ControlSource {
     /// which threads `ChannelContext`, can pass the credential check.
     async fn rpc(
         &self,
-        name: &str,
+        name: &[u8],
         _request_desc: FieldDesc,
         _request_value: PvField,
     ) -> Result<RpcReply, OpError> {
@@ -568,15 +548,20 @@ impl ChannelSource for ControlSource {
             // No ctx — no credentials to check. Refusing a mutation for
             // lack of authentication is an authorization decision (Denied).
             Err(OpError::denied(format!(
-                "control RPC '{name}' requires an authenticated request"
+                "control RPC '{}' requires an authenticated request",
+                String::from_utf8_lossy(name)
             )))
         } else if self.is_diag(name) {
             // Wrong target kind / not found — operational (Failed).
             Err(OpError::failed(format!(
-                "'{name}' is a read-only diagnostic PV, not an RPC"
+                "'{}' is a read-only diagnostic PV, not an RPC",
+                String::from_utf8_lossy(name)
             )))
         } else {
-            Err(OpError::failed(format!("unknown control PV '{name}'")))
+            Err(OpError::failed(format!(
+                "unknown control PV '{}'",
+                String::from_utf8_lossy(name)
+            )))
         }
     }
 
@@ -590,7 +575,7 @@ impl ChannelSource for ControlSource {
         request_value: PvField,
         ctx: ChannelContext,
     ) -> Result<RpcReply, OpError> {
-        let name = checked.pv_name().to_string();
+        let name = checked.pv_name().clone();
         if !self.is_control(&name) {
             // Diagnostic PVs and unknown names fall back to the
             // ctx-less path's error messages.
@@ -644,7 +629,7 @@ impl ChannelSource for ControlSource {
             .map_err(OpError::failed)
     }
 
-    async fn subscribe(&self, name: &str) -> Option<MonitorStream<PvField>> {
+    async fn subscribe(&self, name: &[u8]) -> Option<MonitorStream<PvField>> {
         // Control PVs are RPC targets — a monitor against one would
         // never see an event. Only diagnostic PVs get a live channel.
         if !self.is_diag(name) {
@@ -660,7 +645,7 @@ impl ChannelSource for ControlSource {
         // dropped (downstream client unsubscribed).
         let (tx, rx) = mpsc::channel::<PvField>(4);
         let me = self.clone();
-        let pv_name = name.to_string();
+        let pv_name = name.to_vec();
         self.reactor.spawn(async move {
             let mut tick =
                 epics_base_rs::runtime::task::interval(std::time::Duration::from_secs(1));
@@ -785,14 +770,6 @@ mod tests {
             .await
     }
 
-    /// MINOR regression: `ControlSource` must reject a PVA PROCESS.
-    /// The `ChannelSource` default `process` returns `Ok(())`, which
-    /// would silently swallow a `caput -c` / `pvcall .PROC` and
-    /// falsely report success. Neither the diagnostic PVs nor the
-    /// control PVs have processing semantics — PROCESS is refused the
-    /// same way `put_value` refuses a PUT. `process_checked`'s default
-    /// delegates to `process` after its WRITE gate, so the single
-    /// `process` override covers both entry points.
     /// Control diagnostics and cache admin
     /// must span EVERY upstream tenant of a multi-tenant downstream,
     /// not just the first. Only the SECOND tenant's cache is populated
@@ -810,11 +787,11 @@ mod tests {
 
         let empty_req = || FieldDesc::Structure {
             struct_id: String::new(),
-            fields: vec![],
+            fields: vec![].into(),
         };
 
         // cacheSize must aggregate the non-first tenant's two entries.
-        let v = ctrl.get_value("gw:cacheSize").await.expect("cacheSize");
+        let v = ctrl.get_value(b"gw:cacheSize").await.expect("cacheSize");
         assert_eq!(
             reply_value(&v),
             2,
@@ -857,7 +834,7 @@ mod tests {
             "flush must reach the non-first tenant"
         );
 
-        let v = ctrl.get_value("gw:cacheSize").await.expect("cacheSize");
+        let v = ctrl.get_value(b"gw:cacheSize").await.expect("cacheSize");
         assert_eq!(reply_value(&v), 0, "drop + flush must empty all tenants");
     }
 
@@ -877,10 +854,10 @@ mod tests {
         s1.cache().insert_test_entry("B:PV1").await;
         let ctrl = ControlSource::new("gw", s0).with_source(s1);
 
-        let cache_size = reply_value(&ctrl.get_value("gw:cacheSize").await.expect("cacheSize"));
+        let cache_size = reply_value(&ctrl.get_value(b"gw:cacheSize").await.expect("cacheSize"));
         let upstream = reply_value(
             &ctrl
-                .get_value("gw:upstreamCount")
+                .get_value(b"gw:upstreamCount")
                 .await
                 .expect("upstreamCount"),
         );
@@ -894,7 +871,7 @@ mod tests {
             "upstreamCount must not alias cacheSize"
         );
 
-        let report = reply_string(&ctrl.get_value("gw:report").await.expect("report"));
+        let report = reply_string(&ctrl.get_value(b"gw:report").await.expect("report"));
         // Header carries the distinct counters and tenant count.
         assert!(report.contains("cacheSize=3"), "report header: {report}");
         assert!(
@@ -921,43 +898,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn control_process_is_rejected() {
-        let gw = make_source();
-        let ctrl = ControlSource::new("gw", gw);
-
-        // Control PV (RPC target).
-        let err = ctrl
-            .process("gw:flush")
-            .await
-            .expect_err("PROCESS of a control PV must be rejected");
-        assert!(
-            err.message.contains("not PROCESS"),
-            "control PV reason: {err:?}"
-        );
-
-        // Diagnostic PV (read-only).
-        let err = ctrl
-            .process("gw:cacheSize")
-            .await
-            .expect_err("PROCESS of a diagnostic PV must be rejected");
-        assert!(
-            err.message.contains("PROCESS not supported"),
-            "diag PV reason: {err:?}"
-        );
-
-        // process_checked (WRITE-granted token) still rejects because
-        // the default delegates to the overridden `process`.
-        let err = ctrl
-            .process_checked(checked("gw:flush").await, ctx("ops", "ca"))
-            .await
-            .expect_err("process_checked must reject even with a WRITE token");
-        assert!(
-            err.message.contains("not PROCESS"),
-            "process_checked reason: {err:?}"
-        );
-    }
-
-    #[tokio::test]
     async fn control_rpc_denied_when_no_control_acf() {
         let gw = make_source();
         // No control ACF configured ⇒ writable surface closed-by-default.
@@ -967,7 +907,7 @@ mod tests {
                 checked("gw:flush").await,
                 FieldDesc::Structure {
                     struct_id: String::new(),
-                    fields: vec![],
+                    fields: vec![].into(),
                 },
                 PvField::Structure(PvStructure::new("")),
                 ctx("ops", "ca"),
@@ -997,10 +937,10 @@ mod tests {
         let ctrl = ControlSource::new("gw", gw).with_control_acf(allow_all_acf());
         let res = ctrl
             .rpc(
-                "gw:flush",
+                b"gw:flush",
                 FieldDesc::Structure {
                     struct_id: String::new(),
-                    fields: vec![],
+                    fields: vec![].into(),
                 },
                 PvField::Structure(PvStructure::new("")),
             )
@@ -1024,7 +964,7 @@ mod tests {
                 checked("gw:flush").await,
                 FieldDesc::Structure {
                     struct_id: String::new(),
-                    fields: vec![],
+                    fields: vec![].into(),
                 },
                 PvField::Structure(PvStructure::new("")),
                 ctx("ops", "ca"),
@@ -1048,7 +988,7 @@ mod tests {
                 checked("gw:flush").await,
                 FieldDesc::Structure {
                     struct_id: String::new(),
-                    fields: vec![],
+                    fields: vec![].into(),
                 },
                 PvField::Structure(PvStructure::new("")),
                 ctx("intruder", "ca"),
@@ -1066,7 +1006,7 @@ mod tests {
                 checked("gw:drop").await,
                 FieldDesc::Structure {
                     struct_id: String::new(),
-                    fields: vec![],
+                    fields: vec![].into(),
                 },
                 PvField::Structure(PvStructure::new("")),
                 ctx("ops", "ca"),
@@ -1085,7 +1025,7 @@ mod tests {
                 checked("gw:drop").await,
                 FieldDesc::Structure {
                     struct_id: String::new(),
-                    fields: vec![],
+                    fields: vec![].into(),
                 },
                 nturi_with_arg("pv", "NO:SUCH:PV"),
                 ctx("ops", "ca"),
@@ -1108,7 +1048,7 @@ mod tests {
                 checked("gw:reload").await,
                 FieldDesc::Structure {
                     struct_id: String::new(),
-                    fields: vec![],
+                    fields: vec![].into(),
                 },
                 PvField::Structure(PvStructure::new("")),
                 ctx("ops", "ca"),
@@ -1135,7 +1075,7 @@ mod tests {
                 checked("gw:reload").await,
                 FieldDesc::Structure {
                     struct_id: String::new(),
-                    fields: vec![],
+                    fields: vec![].into(),
                 },
                 nturi_with_arg("path", path.to_str().unwrap()),
                 ctx("ops", "ca"),
@@ -1162,7 +1102,7 @@ mod tests {
                 checked("gw:reload").await,
                 FieldDesc::Structure {
                     struct_id: String::new(),
-                    fields: vec![],
+                    fields: vec![].into(),
                 },
                 PvField::Structure(PvStructure::new("")),
                 ctx("ops", "ca"),
@@ -1184,7 +1124,7 @@ mod tests {
                 checked("gw:reload").await,
                 FieldDesc::Structure {
                     struct_id: String::new(),
-                    fields: vec![],
+                    fields: vec![].into(),
                 },
                 nturi_with_arg("path", path.to_str().unwrap()),
                 ctx("ops", "ca"),
@@ -1198,17 +1138,17 @@ mod tests {
     async fn diagnostic_pvs_remain_read_only() {
         let gw = make_source();
         let ctrl = ControlSource::new("gw", gw);
-        assert!(ctrl.has_pv("gw:cacheSize").await);
-        assert!(ctrl.has_pv("gw:report").await);
-        assert!(!ctrl.is_writable("gw:cacheSize").await);
+        assert!(ctrl.has_pv(b"gw:cacheSize").await);
+        assert!(ctrl.has_pv(b"gw:report").await);
+        assert!(!ctrl.is_writable(b"gw:cacheSize").await);
         // get_value still works on the diagnostic PVs.
-        assert!(ctrl.get_value("gw:cacheSize").await.is_some());
+        assert!(ctrl.get_value(b"gw:cacheSize").await.is_some());
         // list_pvs exposes both diagnostic and control PVs.
-        let names = ctrl.list_pvs().await;
-        assert!(names.contains(&"gw:cacheSize".to_string()));
-        assert!(names.contains(&"gw:flush".to_string()));
-        assert!(names.contains(&"gw:drop".to_string()));
-        assert!(names.contains(&"gw:reload".to_string()));
+        let names = ctrl.list_pvs();
+        assert!(names.contains(&RecordName::from("gw:cacheSize")));
+        assert!(names.contains(&RecordName::from("gw:flush")));
+        assert!(names.contains(&RecordName::from("gw:drop")));
+        assert!(names.contains(&RecordName::from("gw:reload")));
     }
 
     /// Member names of a structure descriptor, in declaration order.
@@ -1238,7 +1178,7 @@ mod tests {
 
         // Long counter diagnostics (cacheSize, upstreamCount, liveSubscribers).
         let long_desc = ctrl
-            .get_introspection("gw:cacheSize")
+            .get_introspection(b"gw:cacheSize")
             .await
             .expect("cacheSize introspection");
         assert_eq!(desc_struct_id(&long_desc), "epics:nt/NTScalar:1.0");
@@ -1255,7 +1195,7 @@ mod tests {
 
         // String diagnostic (report).
         let string_desc = ctrl
-            .get_introspection("gw:report")
+            .get_introspection(b"gw:report")
             .await
             .expect("report introspection");
         assert_eq!(desc_struct_id(&string_desc), "epics:nt/NTScalar:1.0");
@@ -1266,7 +1206,7 @@ mod tests {
         // The served value must match the descriptor: alarm + timeStamp
         // sub-structures present, not just `value`.
         let PvField::Structure(s) = ctrl
-            .get_value("gw:cacheSize")
+            .get_value(b"gw:cacheSize")
             .await
             .expect("cacheSize value")
         else {
@@ -1290,7 +1230,7 @@ mod tests {
         let gw = make_source();
         let ctrl = ControlSource::new("gw", gw);
         let desc = ctrl
-            .get_introspection("gw:flush")
+            .get_introspection(b"gw:flush")
             .await
             .expect("control PV introspection");
         assert_eq!(
@@ -1303,7 +1243,10 @@ mod tests {
             vec!["value".to_string(), "message".to_string()],
         );
         // The served GET value carries the same empty-ID shape.
-        let PvField::Structure(s) = ctrl.get_value("gw:flush").await.expect("control GET value")
+        let PvField::Structure(s) = ctrl
+            .get_value(b"gw:flush")
+            .await
+            .expect("control GET value")
         else {
             panic!("control value must be a structure");
         };

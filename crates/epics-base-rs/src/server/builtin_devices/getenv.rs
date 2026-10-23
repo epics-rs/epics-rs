@@ -30,10 +30,13 @@
 //! `ctx.inp` at construction — not registered as a context-free static factory.
 
 use crate::error::{CaError, CaResult};
-use crate::server::device_support::{DeviceInitOutcome, DeviceReadOutcome, DeviceSupport};
+use crate::server::device_support::{
+    DeviceAlarm, DeviceInitOutcome, DeviceReadOutcome, DeviceSupport, DeviceUdf,
+};
 use crate::server::recgbl::alarm_status;
 use crate::server::record::{AlarmSeverity, ProcessContext, Record};
-use crate::types::EpicsValue;
+use crate::server::records::lsi::LsiRecord;
+use crate::types::{EpicsValue, PvString};
 
 /// Reads the environment variable named by the INST_IO `INP` on every record
 /// process. The variable name is resolved once from `ctx.inp` at construction.
@@ -46,10 +49,9 @@ pub struct GetenvDeviceSupport {
     /// process context before each read so a user-set UDFS is honored; defaults
     /// to INVALID (the dbCommon UDFS default) until the first context push.
     udfs: AlarmSeverity,
-    /// Alarm surfaced via [`last_alarm`](DeviceSupport::last_alarm) this cycle:
-    /// `Some((UDF_ALARM, udfs))` while the env var is unset, `None` once it
-    /// resolves. The framework applies it via `rec_gbl_set_sevr`.
-    unset_alarm: Option<(u16, u16)>,
+    /// The env var was unset at the last read, so
+    /// [`last_alarm`](DeviceSupport::last_alarm) raises UDF_ALARM at `udfs`.
+    unset: bool,
 }
 
 impl GetenvDeviceSupport {
@@ -59,7 +61,7 @@ impl GetenvDeviceSupport {
         Self {
             var: Self::resolve_var_name(inp).to_string(),
             udfs: AlarmSeverity::Invalid,
-            unset_alarm: None,
+            unset: false,
         }
     }
 
@@ -91,53 +93,37 @@ impl DeviceSupport for GetenvDeviceSupport {
                 "DTYP=getenv: unsupported record type '{rtype}' (use stringin or lsi)"
             )));
         }
-        Ok(DeviceInitOutcome::Live)
+        Ok(DeviceInitOutcome::ok())
     }
 
     fn read(&mut self, record: &mut dyn Record) -> CaResult<DeviceReadOutcome> {
         let val = if self.var.is_empty() {
             None
         } else {
-            std::env::var(&self.var).ok()
+            crate::runtime::env::get(&self.var)
         };
-        match val {
-            Some(s) => {
-                // C set path (read_lsi devEnviron.c:56-61 / read_stringin
-                // :109-112): copy value into VAL, udf=FALSE. Clear our pending
-                // unset alarm so `last_alarm()` stops raising it once the var
-                // reappears.
-                self.unset_alarm = None;
-                record.put_field("VAL", EpicsValue::String(s.into()))?;
-                Ok(DeviceReadOutcome::ok())
-            }
-            None => {
-                // C unset path (read_lsi devEnviron.c:62-67 / read_stringin
-                // :114-118): `val[0]=0; udf=TRUE; recGblSetSevrMsg(prec,
-                // UDF_ALARM, prec->udfs, "No such ENV"); return 0` (read_lsi also
-                // sets len=1). Clear the stale value (a var set then later unset
-                // must not keep showing the old value) and surface UDF_ALARM at
-                // `udfs` through `last_alarm()` — the device→framework alarm
-                // channel the processing loop applies via `rec_gbl_set_sevr`
-                // (the same recGblSetSevr merge C uses, processing.rs) — instead
-                // of returning Err, which would raise READ_ALARM (wrong STAT) and
-                // log to stderr every cycle (C is silent). This matches C's STAT
-                // (UDF_ALARM) and severity (`prec->udfs`, captured in
-                // set_process_context).
-                //
-                // Residual divergences vs C (narrow, deferred — not the alarm):
-                //   - the `udf` field itself reads 0, not C's TRUE: base-rs
-                //     derives `udf` from `value_is_undefined()`, and a string —
-                //     including the empty string written here — is defined
-                //     (record_trait.rs `Some(_) => false`); the *alarm* is raised
-                //     directly, but the raw UDF field has no device→udf channel.
-                //   - AMSG "No such ENV" is not carried (`last_alarm()` is
-                //     (status, severity) only), and lsi LEN is not modeled (C
-                //     sets it to strlen(val) on the set path, 1 on unset).
-                self.unset_alarm = Some((alarm_status::UDF_ALARM, self.udfs as u16));
-                record.put_field("VAL", EpicsValue::String(String::new().into()))?;
-                Ok(DeviceReadOutcome::ok())
-            }
+        // C `read_lsi` / `read_stringin` (devEnviron.c:52-67, :105-118) write
+        // VAL and `prec->udf` and return 0; the unset branch also raises
+        // UDF_ALARM at `udfs` with "No such ENV", which `last_alarm()` carries.
+        self.unset = val.is_none();
+        let udf = if self.unset {
+            DeviceUdf::Undefined
+        } else {
+            DeviceUdf::Defined
+        };
+        match record
+            .as_any_mut()
+            .and_then(|a| a.downcast_mut::<LsiRecord>())
+        {
+            Some(lsi) => lsi.read_environ(val.as_deref().map(std::ffi::OsStr::as_encoded_bytes)),
+            None => record.put_field(
+                "VAL",
+                EpicsValue::String(PvString::from_bytes(
+                    val.unwrap_or_default().into_encoded_bytes(),
+                )),
+            )?,
         }
+        Ok(DeviceReadOutcome::converted(udf))
     }
 
     fn set_process_context(&mut self, ctx: &ProcessContext) {
@@ -147,8 +133,12 @@ impl DeviceSupport for GetenvDeviceSupport {
         self.udfs = ctx.udfs;
     }
 
-    fn last_alarm(&self) -> Option<(u16, u16)> {
-        self.unset_alarm
+    fn last_alarm(&self) -> Option<DeviceAlarm<'_>> {
+        self.unset.then_some(DeviceAlarm {
+            stat: alarm_status::UDF_ALARM,
+            sevr: self.udfs as u16,
+            msg: "No such ENV",
+        })
     }
 
     fn write(&mut self, _record: &mut dyn Record) -> CaResult<()> {
@@ -187,6 +177,24 @@ mod tests {
         assert_eq!(GetenvDeviceSupport::new("  PATH  ").var, "PATH");
         assert!(GetenvDeviceSupport::new("@").var.is_empty());
         assert_eq!(GetenvDeviceSupport::new("@PATH").dtyp(), "getenv");
+    }
+
+    /// C `read_stringin` copies `getenv`'s bytes into VAL unchecked.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial(epics_env)]
+    fn a_non_utf8_value_reaches_val_byte_for_byte() {
+        use crate::server::records::stringin::StringinRecord;
+        use std::os::unix::ffi::OsStrExt;
+        let key = "EPICS_RS_TEST_DEVENVIRON_BYTES";
+        // SAFETY: single-threaded under the `epics_env` serial group.
+        unsafe { std::env::set_var(key, std::ffi::OsStr::from_bytes(b"a\xffb")) };
+        let mut dev = GetenvDeviceSupport::new(&format!("@{key}"));
+        let mut rec = StringinRecord::new("");
+        dev.read(&mut rec).unwrap();
+        // SAFETY: same serial group.
+        unsafe { std::env::remove_var(key) };
+        assert_eq!(rec.val.as_bytes(), b"a\xffb");
     }
 
     #[test]

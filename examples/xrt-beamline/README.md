@@ -143,7 +143,7 @@ The XRT detector's acquisition task is fully async. A driver author only needs t
 |------|---------|
 | `PortHandle` | Read/write parameters via `read_int32().await`, `set_params_and_notify().await` |
 | `ArrayPublisher` | Publish a generated frame to downstream plugins: `publisher.publish(frame).await` |
-| `QueuedArrayCounter` | Wait until in-flight frames drain at end of acquisition |
+| `DriverPool` | Frames plugins receive; their queued count holds ADAcquireBusy under WaitForPlugins |
 
 The acquisition loop runs inside a `current_thread` tokio runtime created by the task thread. All I/O is async and reliable — there are no lossy or blocking APIs in the data path.
 

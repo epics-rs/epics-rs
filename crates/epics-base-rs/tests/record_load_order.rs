@@ -23,6 +23,7 @@ use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::device_support::{DeviceReadOutcome, DeviceSupport};
 use epics_base_rs::server::ioc_app::DeviceSupportContext;
 use epics_base_rs::server::ioc_builder::IocBuilder;
+use epics_base_rs::server::record::{DbLinkType, DevSup, Dset};
 use epics_base_rs::server::record::{PiniMode, Record};
 use epics_base_rs::server::records::ai::AiRecord;
 
@@ -63,6 +64,12 @@ fn load_ordered_names() -> Vec<String> {
 /// database came from the builder or from iocsh `dbLoadRecords`.
 #[epics_macros_rs::epics_test]
 async fn builder_wires_device_support_in_database_load_order() {
+    static ROW: DevSup = DevSup {
+        name: "devSeq",
+        choice: "seqDev",
+        link_type: DbLinkType::InstIo,
+        dset: Dset::new(6, &[3], false),
+    };
     let names = load_ordered_names();
 
     let mut db = String::new();
@@ -79,13 +86,16 @@ async fn builder_wires_device_support_in_database_load_order() {
     let captured = Arc::clone(&wired);
 
     let (_database, _) = IocBuilder::new()
-        .register_dynamic_device_support(move |ctx: &DeviceSupportContext| {
-            captured
-                .lock()
-                .unwrap()
-                .push(ctx.inp.trim_start_matches('@').to_string());
-            Some(Box::new(NoopDevice) as Box<dyn DeviceSupport>)
-        })
+        .register_dynamic_device_support(
+            &[("ai", std::slice::from_ref(&ROW))],
+            move |ctx: &DeviceSupportContext| {
+                captured
+                    .lock()
+                    .unwrap()
+                    .push(ctx.inp.trim_start_matches('@').to_string());
+                Some(Box::new(NoopDevice) as Box<dyn DeviceSupport>)
+            },
+        )
         .db_string(&db, &HashMap::new())
         .unwrap()
         .build()
@@ -114,7 +124,7 @@ async fn all_record_names_returns_load_order() {
     }
 
     assert_eq!(
-        db.all_record_names().await,
+        db.all_record_names(),
         names,
         "all_record_names must return database load order, not hash order"
     );

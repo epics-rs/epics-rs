@@ -31,15 +31,37 @@ fn int64in_metadata_override(
 // Alarm threshold fields (HIHI/HIGH/LOW/LOLO/HHSV/HSV/LSV/LLSV) are intentionally absent
 // from the field list so they route to RecordInstance::common.analog_alarm via
 // put_common_field, matching the path used by longin/ao/ai.
+static INT64IN_POSTED: [crate::server::record::FieldIx; 1] = crate::server::record::declared_set(
+    crate::server::record::dbd_generated::INT64IN_FIELDS,
+    ["VAL"],
+);
+
+/// devI64inSoft.c returns `dbGetLink`'s status.
+const INT64IN_STATUS: crate::server::record::ProcessStatusRule =
+    crate::server::record::ProcessStatusRule::io(crate::server::record::SoftStatus {
+        plain: true,
+        raw: false,
+        async_: false,
+    });
+
 #[derive(EpicsRecord)]
 // `dset_owns_udf_on_computed`: C `int64inRecord.c:144` is
 // `if (status==0) prec->udf = FALSE;` with no `status == 2` fold, the longin
 // twin. `devI64inSoft.c::readLocked` likewise returns the `dbGetLink` status,
 // never 2.
+// `soft_input_read_as`: devI64inSoft and devI64inSoftCallback read INP as
+// `DBR_INT64` (`devI64inSoft.c:40`, `devI64inSoftCallback.c:62`).
+// `process_posted_fields`: `monitor()` posts VAL alone (`int64inRecord.c:366-389`);
+// the SVAL and SIMM a cycle reads from SIOL/SIML stay silent.
 #[record(
     type = "int64in",
     metadata_override = int64in_metadata_override,
-    dset_owns_udf_on_computed
+    process_posted_fields = INT64IN_POSTED,
+    dset_owns_udf_on_computed,
+    seeds_trackers,
+    process_status = INT64IN_STATUS,
+    soft_input_read_as = Int64,
+    spill(INP, HIHI, LOLO, HIGH, LOW, HHSV, LLSV, HSV, LSV, OLDSIMM, SSCN, SIMPVT)
 )]
 pub struct Int64inRecord {
     #[field(type = "Int64")]
@@ -75,18 +97,18 @@ pub struct Int64inRecord {
     pub aftc: f64,
     #[field(type = "Double")]
     pub afvl: f64,
-    #[field(type = "Double")]
-    pub alst: f64,
-    #[field(type = "Double")]
-    pub mlst: f64,
+    #[field(type = "Int64")]
+    pub alst: i64,
+    #[field(type = "Int64")]
+    pub mlst: i64,
     // SIMM is `DBF_MENU menu(menuYesNo)` (int64inRecord.dbd.pod:279-283):
     // the two-choice NO/YES simulation menu, served as DBR_ENUM.
     #[field(type = "Short", menu_choices = MENU_YES_NO)]
     pub simm: i16,
-    #[field(type = "String")]
-    pub siml: String,
-    #[field(type = "String")]
-    pub siol: String,
+    #[field(type = "PvStr", link)]
+    pub siml: PvString,
+    #[field(type = "PvStr", link)]
+    pub siol: PvString,
     // SVAL is `DBF_INT64` (int64inRecord.dbd.pod:270-272) — the BUFFER C's
     // `readValue` reads SIOL into (`dbGetLink(&prec->siol, DBR_INT64,
     // &prec->sval)`, int64inRecord.c:409) before publishing `val = sval`.
@@ -117,11 +139,11 @@ impl Default for Int64inRecord {
             mdel: 0,
             aftc: 0.0,
             afvl: 0.0,
-            alst: 0.0,
-            mlst: 0.0,
+            alst: 0,
+            mlst: 0,
             simm: 0,
-            siml: String::new(),
-            siol: String::new(),
+            siml: PvString::new(),
+            siol: PvString::new(),
             sval: 0,
             sims: 0,
             // C `field(SDLY,DBF_DOUBLE) { initial("-1.0") }` — negative means

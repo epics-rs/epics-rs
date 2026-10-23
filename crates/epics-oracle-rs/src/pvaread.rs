@@ -97,6 +97,7 @@ use crate::ntshape::NtShape;
 use crate::pvatool::{PvaTools, Readings};
 use crate::report::{Counts, Denominator, StaleRow};
 use crate::surface::{Coverage, Surface};
+use epics_libcom_rs::cfmt::CFloat;
 
 /// The named contracts a PVA channel can differ on.
 ///
@@ -358,7 +359,7 @@ impl PvaReport {
             "  channels measured on BOTH sides, BOTH contracts: {}/{} = {:.1}%",
             cov.measured,
             cov.enumerated,
-            cov.percent()
+            CFloat(cov.percent())
         );
         let _ = writeln!(
             s,
@@ -581,7 +582,7 @@ pub fn probe(
     let mut cases = Vec::new();
     for (i, rt) in record_types.iter().enumerate() {
         let n = surface.fields_of(rt).count();
-        eprintln!(
+        epics_base_rs::stderr_println!(
             "[{}/{}] pva read: {rt} ({n} channels)",
             i + 1,
             record_types.len()
@@ -885,7 +886,10 @@ fn resolve<S: PvaServer>(
 
         let t = PvaTools::new(bench.tools, ioc.port(), ioc.side());
         let names: Vec<String> = pending.iter().map(|&i| pvs[i].clone()).collect();
-        let readings = contract.batch(&t, &names);
+        let mut readings = contract.batch(&t, &names);
+        if ioc.alive() {
+            name_foreign_holders(&mut readings, &ioc.foreign_holders());
+        }
 
         if ioc.alive() {
             for (&i, r) in pending.iter().zip(readings) {
@@ -910,7 +914,7 @@ fn resolve<S: PvaServer>(
             // terminate.
             suspects.clone_from(&pending);
         }
-        eprintln!(
+        epics_base_rs::stderr_println!(
             "    the {} PVA server died under {} — reading its {} unanswered channel(s) \
              one at a time, each death re-confirmed on a server that channel is the sole \
              client of, so only the channel that kills it is charged",
@@ -947,6 +951,22 @@ fn resolve<S: PvaServer>(
         pending.retain(|&i| out[i].is_none());
     }
     settle(out, ioc.side(), contract.tool())
+}
+
+/// A batch that failed on a live server, with another process holding a socket
+/// on its port, says who: the tools' own message is only `Timeout`. Diagnosis
+/// only -- ports come from a range nothing else is handed (`ioc::claim_port`),
+/// so this is a deliberate squatter or a process outside the harness.
+fn name_foreign_holders(readings: &mut [Result<String, ToolError>], holders: &[String]) {
+    if holders.is_empty() {
+        return;
+    }
+    for e in readings.iter_mut().filter_map(|r| r.as_mut().err()) {
+        e.message.push_str(&format!(
+            " [the port is also held by {}]",
+            holders.join(", ")
+        ));
+    }
 }
 
 /// Turn the resolved slots into [`Readings`], stating the unresolved ones.
@@ -1770,5 +1790,20 @@ mod tests {
         };
         let case = adjudicate(&ai, &c, &r, &mut al);
         assert_eq!(case.verdict, Verdict::Defect);
+    }
+
+    /// The tools' `Timeout` names no cause; a foreign socket on the port is one.
+    #[test]
+    fn a_failed_read_names_the_foreign_holder_of_its_port() {
+        let mut r: Vec<Result<String, ToolError>> =
+            vec![Ok("v".into()), Err(terr(Side::C, "pvxget"))];
+        name_foreign_holders(&mut r, &[]);
+        assert_eq!(r[1].as_ref().unwrap_err().message, "Timeout");
+        name_foreign_holders(&mut r, &["pid 7 (squatter)".to_string()]);
+        assert_eq!(r[0].as_ref().unwrap(), "v");
+        assert_eq!(
+            r[1].as_ref().unwrap_err().message,
+            "Timeout [the port is also held by pid 7 (squatter)]"
+        );
     }
 }

@@ -130,7 +130,8 @@ impl NTScalar {
                             fields: vec![
                                 ("index".into(), FieldDesc::Scalar(ScalarType::Int)),
                                 ("choices".into(), FieldDesc::ScalarArray(ScalarType::String)),
-                            ],
+                            ]
+                            .into(),
                         },
                     ));
                 }
@@ -138,7 +139,7 @@ impl NTScalar {
                     "display".into(),
                     FieldDesc::Structure {
                         struct_id: String::new(),
-                        fields: display_fields,
+                        fields: display_fields.into(),
                     },
                 ));
             } else {
@@ -149,7 +150,8 @@ impl NTScalar {
                         fields: vec![
                             ("description".into(), FieldDesc::Scalar(ScalarType::String)),
                             ("units".into(), FieldDesc::Scalar(ScalarType::String)),
-                        ],
+                        ]
+                        .into(),
                     },
                 ));
             }
@@ -164,7 +166,8 @@ impl NTScalar {
                         ("limitLow".into(), FieldDesc::Scalar(self.value_type)),
                         ("limitHigh".into(), FieldDesc::Scalar(self.value_type)),
                         ("minStep".into(), FieldDesc::Scalar(self.value_type)),
-                    ],
+                    ]
+                    .into(),
                 },
             ));
         }
@@ -200,12 +203,16 @@ impl NTScalar {
                             FieldDesc::Scalar(ScalarType::Int),
                         ),
                         ("hysteresis".into(), FieldDesc::Scalar(ScalarType::Double)),
-                    ],
+                    ]
+                    .into(),
                 },
             ));
         }
 
-        FieldDesc::Structure { struct_id, fields }
+        FieldDesc::Structure {
+            struct_id,
+            fields: fields.into(),
+        }
     }
 
     // derive the value from the descriptor so the optional

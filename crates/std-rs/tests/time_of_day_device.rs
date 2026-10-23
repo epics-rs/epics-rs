@@ -47,8 +47,8 @@ record(stringin, "TOD_STR") {
     // Register the std-module device support through the new entry point —
     // the boxed factory satisfies `register_device_support`'s `Fn` bound.
     let mut builder = IocBuilder::new();
-    for (dtyp, factory) in std_rs::std_device_supports() {
-        builder = builder.register_device_support(dtyp, factory);
+    for (record_type, devsup, factory) in std_rs::std_device_supports() {
+        builder = builder.register_device_support(record_type, devsup, factory);
     }
     let (db, _) = builder
         .db_string(db_content, &HashMap::new())

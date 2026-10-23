@@ -10,10 +10,14 @@ use std::sync::Arc;
 use asyn_rs::runtime::sync::Notify;
 use parking_lot::Mutex;
 
-use asyn_rs::error::AsynResult;
-use asyn_rs::param::{EnumEntry, ParamType};
+use asyn_rs::error::{AsynError, AsynResult, AsynStatus};
+use asyn_rs::param::{EnumEntry, ParamType, ParamValue};
+use asyn_rs::port::InterfaceMask;
 use asyn_rs::port::{PortDriver, PortDriverBase, PortFlags};
+use asyn_rs::request::ParamSetValue;
+use asyn_rs::trace::TraceMask;
 use asyn_rs::user::AsynUser;
+use epics_libcom_rs::cfmt::CFloat;
 
 // --- Constants (matching original testAsynPortDriver) ---
 
@@ -24,19 +28,8 @@ pub const MIN_UPDATE_TIME: f64 = 0.02;
 pub const DEFAULT_MAX_POINTS: i32 = 1000;
 pub const DEFAULT_UPDATE_TIME: f64 = 0.5;
 
-pub const VERT_GAIN_CHOICES: &[(&str, i32)] = &[("x1", 1), ("x2", 2), ("x5", 5), ("x10", 10)];
-pub const TIME_PER_DIV_CHOICES: &[(&str, f64)] = &[
-    ("0.001", 0.001),
-    ("0.002", 0.002),
-    ("0.005", 0.005),
-    ("0.01", 0.01),
-    ("0.02", 0.02),
-    ("0.05", 0.05),
-    ("0.1", 0.1),
-    ("0.2", 0.2),
-    ("0.5", 0.5),
-    ("1.0", 1.0),
-];
+/// C `allVoltsPerDivSelections`, in volts at unit gain.
+pub const ALL_VOLTS_PER_DIV_SELECTIONS: [i32; 4] = [1, 2, 5, 10];
 
 // --- Simple xorshift64 RNG (no rand dependency) ---
 
@@ -51,9 +44,6 @@ impl Rng {
         self.0 ^= self.0 >> 7;
         self.0 ^= self.0 << 17;
         (self.0 as f64) / (u64::MAX as f64)
-    }
-    pub fn next_centered(&mut self) -> f64 {
-        self.next_f64() * 2.0 - 1.0
     }
 }
 
@@ -79,56 +69,81 @@ pub struct ScopeSimulator {
     pub p_min_value: usize,
     pub p_max_value: usize,
     pub p_mean_value: usize,
+    /// Fixed at construction, as C `pTimeBase_`.
+    time_base: Vec<f64>,
+    /// C `voltsPerDivStrings_/Values_`: the table `readEnum` serves for
+    /// `VoltsPerDivSelect`, values in mV.
+    volts_per_div_choices: Arc<[EnumEntry]>,
 }
 
 impl ScopeSimulator {
     pub fn new(port_name: &str, notify: Arc<Notify>) -> Self {
-        let flags = PortFlags {
-            can_block: true,
-            ..PortFlags::default()
-        };
-        let mut base = PortDriverBase::new(port_name, 1, flags);
+        // testAsynPortDriver registers with ASYN_DESTRUCTIBLE alone: it never
+        // blocks (testAsynPortDriver.cpp:54).
+        let mut base = PortDriverBase::new(
+            port_name,
+            1,
+            PortFlags::default(),
+            // testAsynPortDriver.cpp:52-53.
+            InterfaceMask::INT32
+                | InterfaceMask::FLOAT64
+                | InterfaceMask::FLOAT64_ARRAY
+                | InterfaceMask::ENUM
+                | InterfaceMask::DRV_USER,
+            InterfaceMask::INT32
+                | InterfaceMask::FLOAT64
+                | InterfaceMask::FLOAT64_ARRAY
+                | InterfaceMask::ENUM,
+        );
 
-        let p_run = base.create_param("P_Run", ParamType::Int32).unwrap();
-        let p_max_points = base.create_param("P_MaxPoints", ParamType::Int32).unwrap();
+        let p_run = base.create_param("SCOPE_RUN", ParamType::Int32).unwrap();
+        let p_max_points = base
+            .create_param("SCOPE_MAX_POINTS", ParamType::Int32)
+            .unwrap();
         let p_time_per_div = base
-            .create_param("P_TimePerDiv", ParamType::Float64)
+            .create_param("SCOPE_TIME_PER_DIV", ParamType::Float64)
             .unwrap();
         let p_time_per_div_select = base
-            .create_param("P_TimePerDivSelect", ParamType::Enum)
+            .create_param("SCOPE_TIME_PER_DIV_SELECT", ParamType::Int32)
             .unwrap();
-        let p_vert_gain = base.create_param("P_VertGain", ParamType::Float64).unwrap();
+        let p_vert_gain = base
+            .create_param("SCOPE_VERT_GAIN", ParamType::Float64)
+            .unwrap();
         let p_vert_gain_select = base
-            .create_param("P_VertGainSelect", ParamType::Enum)
+            .create_param("SCOPE_VERT_GAIN_SELECT", ParamType::Int32)
             .unwrap();
         let p_volts_per_div = base
-            .create_param("P_VoltsPerDiv", ParamType::Float64)
+            .create_param("SCOPE_VOLTS_PER_DIV", ParamType::Float64)
             .unwrap();
         let p_volts_per_div_select = base
-            .create_param("P_VoltsPerDivSelect", ParamType::Enum)
+            .create_param("SCOPE_VOLTS_PER_DIV_SELECT", ParamType::Int32)
             .unwrap();
         let p_volt_offset = base
-            .create_param("P_VoltOffset", ParamType::Float64)
+            .create_param("SCOPE_VOLT_OFFSET", ParamType::Float64)
             .unwrap();
         let p_trigger_delay = base
-            .create_param("P_TriggerDelay", ParamType::Float64)
+            .create_param("SCOPE_TRIGGER_DELAY", ParamType::Float64)
             .unwrap();
         let p_noise_amplitude = base
-            .create_param("P_NoiseAmplitude", ParamType::Float64)
+            .create_param("SCOPE_NOISE_AMPLITUDE", ParamType::Float64)
             .unwrap();
         let p_update_time = base
-            .create_param("P_UpdateTime", ParamType::Float64)
+            .create_param("SCOPE_UPDATE_TIME", ParamType::Float64)
             .unwrap();
         let p_waveform = base
-            .create_param("P_Waveform", ParamType::Float64Array)
+            .create_param("SCOPE_WAVEFORM", ParamType::Float64Array)
             .unwrap();
         let p_time_base = base
-            .create_param("P_TimeBase", ParamType::Float64Array)
+            .create_param("SCOPE_TIME_BASE", ParamType::Float64Array)
             .unwrap();
-        let p_min_value = base.create_param("P_MinValue", ParamType::Float64).unwrap();
-        let p_max_value = base.create_param("P_MaxValue", ParamType::Float64).unwrap();
+        let p_min_value = base
+            .create_param("SCOPE_MIN_VALUE", ParamType::Float64)
+            .unwrap();
+        let p_max_value = base
+            .create_param("SCOPE_MAX_VALUE", ParamType::Float64)
+            .unwrap();
         let p_mean_value = base
-            .create_param("P_MeanValue", ParamType::Float64)
+            .create_param("SCOPE_MEAN_VALUE", ParamType::Float64)
             .unwrap();
 
         base.set_int32_param(p_run, 0, 0).unwrap();
@@ -138,73 +153,25 @@ impl ScopeSimulator {
             .unwrap();
         base.set_float64_param(p_volt_offset, 0, 0.0).unwrap();
         base.set_float64_param(p_trigger_delay, 0, 0.0).unwrap();
-        base.set_float64_param(p_noise_amplitude, 0, 0.0).unwrap();
-        base.set_float64_param(p_vert_gain, 0, 1.0).unwrap();
+        base.set_float64_param(p_noise_amplitude, 0, 0.1).unwrap();
         base.set_float64_param(p_volts_per_div, 0, 1.0).unwrap();
         base.set_float64_param(p_time_per_div, 0, 0.001).unwrap();
 
-        let vert_choices: Arc<[EnumEntry]> = Arc::from(
-            VERT_GAIN_CHOICES
-                .iter()
-                .map(|(s, v)| EnumEntry {
-                    string: s.to_string(),
-                    value: *v,
-                    severity: 0,
-                })
-                .collect::<Vec<_>>(),
-        );
-        base.set_enum_choices_param(p_vert_gain_select, 0, vert_choices)
-            .unwrap();
-        base.set_enum_index_param(p_vert_gain_select, 0, 0).unwrap();
+        // A driver array, not a param, so no callback ever posts it
+        // (testAsynPortDriver.cpp:71, served by readFloat64Array :360).
+        let time_base = (0..DEFAULT_MAX_POINTS)
+            .map(|i| i as f64 / (DEFAULT_MAX_POINTS - 1) as f64 * NUM_DIVISIONS)
+            .collect();
 
-        let time_choices: Arc<[EnumEntry]> = Arc::from(
-            TIME_PER_DIV_CHOICES
-                .iter()
-                .enumerate()
-                .map(|(i, (s, _))| EnumEntry {
-                    string: s.to_string(),
-                    value: i as i32,
-                    severity: 0,
-                })
-                .collect::<Vec<_>>(),
-        );
-        base.set_enum_choices_param(p_time_per_div_select, 0, time_choices)
-            .unwrap();
-        base.set_enum_index_param(p_time_per_div_select, 0, 0)
+        base.set_float64_param(p_min_value, 0, 0.0).unwrap();
+        base.set_float64_param(p_max_value, 0, 0.0).unwrap();
+        base.set_float64_param(p_mean_value, 0, 0.0).unwrap();
+        // C's calloc'd pData_, served before the first run (:63, :356).
+        base.params
+            .set_float64_array(p_waveform, 0, vec![0.0; DEFAULT_MAX_POINTS as usize])
             .unwrap();
 
-        let vpd_choices = Self::make_volts_per_div_choices(1.0);
-        base.set_enum_choices_param(p_volts_per_div_select, 0, vpd_choices)
-            .unwrap();
-        base.set_enum_index_param(p_volts_per_div_select, 0, 0)
-            .unwrap();
-
-        // Pre-compute initial waveform/time_base so PINI records get real data
-        {
-            let initial_config = SimConfig {
-                run: false,
-                max_points: DEFAULT_MAX_POINTS as usize,
-                time_per_div: 0.001,
-                volts_per_div: 1.0,
-                volt_offset: 0.0,
-                trigger_delay: 0.0,
-                noise_amplitude: 0.0,
-                update_time: DEFAULT_UPDATE_TIME,
-            };
-            let mut rng = Rng::new(0xDEAD_BEEF_CAFE_1234);
-            let result = compute_waveform(&initial_config, &mut rng);
-            let _ = base
-                .params
-                .set_float64_array(p_waveform, 0, result.waveform);
-            let _ = base
-                .params
-                .set_float64_array(p_time_base, 0, result.time_base);
-            let _ = base.set_float64_param(p_min_value, 0, result.min_val);
-            let _ = base.set_float64_param(p_max_value, 0, result.max_val);
-            let _ = base.set_float64_param(p_mean_value, 0, result.mean_val);
-        }
-
-        Self {
+        let mut driver = Self {
             base,
             notify,
             p_run,
@@ -224,24 +191,34 @@ impl ScopeSimulator {
             p_min_value,
             p_max_value,
             p_mean_value,
-        }
+            time_base,
+            volts_per_div_choices: Arc::from([]),
+        };
+        driver
+            .base
+            .set_int32_param(driver.p_vert_gain_select, 0, 10)
+            .unwrap();
+        driver.set_vert_gain().unwrap();
+        driver
     }
 
-    pub fn make_volts_per_div_choices(vert_gain: f64) -> Arc<[EnumEntry]> {
-        let base_values = [0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0];
-        Arc::from(
-            base_values
-                .iter()
-                .enumerate()
-                .map(|(i, &v)| {
-                    let scaled = v / vert_gain;
-                    EnumEntry {
-                        string: format!("{scaled:.2}"),
-                        value: i as i32,
-                        severity: 0,
-                    }
-                })
-                .collect::<Vec<_>>(),
+    /// C `setVertGain`: the gain is the select's raw value, and the
+    /// volts-per-division table is rebuilt for it.
+    fn set_vert_gain(&mut self) -> AsynResult<()> {
+        let gain = self.base.get_int32_param(self.p_vert_gain_select, 0)? as f64;
+        self.base.set_float64_param(self.p_vert_gain, 0, gain)?;
+        self.volts_per_div_choices = ALL_VOLTS_PER_DIV_SELECTIONS
+            .iter()
+            .map(|&v| EnumEntry {
+                string: format!("{:.2}", CFloat(v as f64 / gain)),
+                value: (v as f64 / gain * 1000.0 + 0.5) as i32,
+                severity: 0,
+            })
+            .collect();
+        self.base.do_callbacks_enum(
+            self.p_volts_per_div_select,
+            0,
+            self.volts_per_div_choices.clone(),
         )
     }
 
@@ -275,46 +252,24 @@ impl PortDriver for ScopeSimulator {
     fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
         self.base.check_ready()?;
 
-        let is_enum = user.reason == self.p_vert_gain_select
-            || user.reason == self.p_volts_per_div_select
-            || user.reason == self.p_time_per_div_select;
-
-        if is_enum {
-            self.base
-                .params
-                .set_enum_index(user.reason, user.addr, value as usize)?;
-        } else {
-            self.base.params.set_int32(user.reason, user.addr, value)?;
-        }
+        self.base.set_int32_param(user.reason, user.addr, value)?;
 
         if user.reason == self.p_run {
             if value != 0 {
                 self.notify.notify_one();
             }
         } else if user.reason == self.p_vert_gain_select {
-            let gain = VERT_GAIN_CHOICES
-                .get(value as usize)
-                .map(|(_, v)| *v as f64)
-                .unwrap_or(1.0);
-            self.base.set_float64_param(self.p_vert_gain, 0, gain)?;
-            let choices = Self::make_volts_per_div_choices(gain);
-            self.base
-                .set_enum_choices_param(self.p_volts_per_div_select, 0, choices)?;
-            let (idx, ch) = self.base.get_enum_param(self.p_volts_per_div_select, 0)?;
-            if let Ok(v) = ch[idx].string.parse::<f64>() {
-                self.base.set_float64_param(self.p_volts_per_div, 0, v)?;
-            }
+            self.set_vert_gain()?;
         } else if user.reason == self.p_volts_per_div_select {
-            let (_, choices) = self.base.get_enum_param(self.p_volts_per_div_select, 0)?;
-            if let Some(entry) = choices.get(value as usize) {
-                if let Ok(v) = entry.string.parse::<f64>() {
-                    self.base.set_float64_param(self.p_volts_per_div, 0, v)?;
-                }
-            }
+            // C setVoltsPerDiv: the select's value is mV.
+            let mv = self.base.get_int32_param(self.p_volts_per_div_select, 0)?;
+            self.base
+                .set_float64_param(self.p_volts_per_div, 0, mv as f64 / 1000.0)?;
         } else if user.reason == self.p_time_per_div_select {
-            if let Some(&(_, tpd)) = TIME_PER_DIV_CHOICES.get(value as usize) {
-                self.base.set_float64_param(self.p_time_per_div, 0, tpd)?;
-            }
+            // C setTimePerDiv: the select's value is microseconds.
+            let us = self.base.get_int32_param(self.p_time_per_div_select, 0)?;
+            self.base
+                .set_float64_param(self.p_time_per_div, 0, us as f64 / 1e6)?;
         }
         self.base.call_param_callbacks(user.addr)?;
         Ok(())
@@ -322,25 +277,57 @@ impl PortDriver for ScopeSimulator {
 
     fn write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {
         self.base.check_ready()?;
-        let value = if user.reason == self.p_update_time {
-            value.max(MIN_UPDATE_TIME)
-        } else {
-            value
-        };
-        self.base
-            .params
-            .set_float64(user.reason, user.addr, value)?;
+        self.base.set_float64_param(user.reason, user.addr, value)?;
         if user.reason == self.p_update_time {
-            self.notify.notify_one();
+            if value < MIN_UPDATE_TIME {
+                self.base.trace_print_at(
+                    user.addr,
+                    user.reason as i32,
+                    TraceMask::WARNING,
+                    file!(),
+                    line!(),
+                    format_args!(
+                        "testAsynPortDriver:writeFloat64: warning, update time too small, \
+                         changed from {:.6} to {:.6}\n",
+                        CFloat(value),
+                        CFloat(MIN_UPDATE_TIME)
+                    ),
+                );
+                self.base
+                    .set_float64_param(self.p_update_time, 0, MIN_UPDATE_TIME)?;
+            }
+            if self.base.get_int32_param(self.p_run, 0)? != 0 {
+                self.notify.notify_one();
+            }
         }
-        self.base.call_param_callback(user.addr, user.reason)?;
+        self.base.call_param_callbacks(user.addr)?;
         Ok(())
     }
 
+    /// C `readEnum`: only `VoltsPerDivSelect` has a driver table; the other
+    /// selects keep their db strings.
+    fn read_enum(&mut self, user: &AsynUser) -> AsynResult<(usize, Arc<[EnumEntry]>)> {
+        if user.reason == self.p_volts_per_div_select {
+            return Ok((0, self.volts_per_div_choices.clone()));
+        }
+        Err(AsynError::Status {
+            status: AsynStatus::Error,
+            message: "no enum table".into(),
+        })
+    }
+
+    /// C `readFloat64Array` (:338-357): either array, cut to MaxPoints.
     fn read_float64_array(&mut self, user: &AsynUser, buf: &mut [f64]) -> AsynResult<usize> {
         self.base.check_ready()?;
-        let data = self.base.params.get_float64_array(user.reason, user.addr)?;
-        let n = data.len().min(buf.len());
+        let max_points = self.base.get_int32_param(self.p_max_points, 0)?;
+        let waveform;
+        let data: &[f64] = if user.reason == self.p_time_base {
+            &self.time_base
+        } else {
+            waveform = self.base.params.get_float64_array(user.reason, user.addr)?;
+            &waveform
+        };
+        let n = (max_points.max(0) as usize).min(buf.len()).min(data.len());
         buf[..n].copy_from_slice(&data[..n]);
         Ok(n)
     }
@@ -367,7 +354,8 @@ pub struct ParamIndices {
 
 pub struct SimConfig {
     pub run: bool,
-    pub max_points: usize,
+    /// C `epicsInt32 maxPoints`: a negative one is an empty trace.
+    pub max_points: i32,
     pub time_per_div: f64,
     pub volts_per_div: f64,
     pub volt_offset: f64,
@@ -378,7 +366,6 @@ pub struct SimConfig {
 
 pub struct SimResult {
     pub waveform: Vec<f64>,
-    pub time_base: Vec<f64>,
     pub min_val: f64,
     pub max_val: f64,
     pub mean_val: f64,
@@ -386,31 +373,25 @@ pub struct SimResult {
 
 pub fn read_config(base: &PortDriverBase, idx: &ParamIndices) -> SimConfig {
     SimConfig {
-        run: base.params.get_int32(idx.p_run, 0).unwrap_or(0) != 0,
+        run: base.get_int32_param(idx.p_run, 0).unwrap_or(0) != 0,
         max_points: base
-            .params
-            .get_int32(idx.p_max_points, 0)
-            .unwrap_or(DEFAULT_MAX_POINTS) as usize,
+            .get_int32_param(idx.p_max_points, 0)
+            .unwrap_or(DEFAULT_MAX_POINTS),
         time_per_div: base
-            .params
-            .get_float64(idx.p_time_per_div, 0)
+            .get_float64_param(idx.p_time_per_div, 0)
             .unwrap_or(0.001),
         volts_per_div: base
-            .params
-            .get_float64(idx.p_volts_per_div, 0)
+            .get_float64_param(idx.p_volts_per_div, 0)
             .unwrap_or(1.0),
-        volt_offset: base.params.get_float64(idx.p_volt_offset, 0).unwrap_or(0.0),
+        volt_offset: base.get_float64_param(idx.p_volt_offset, 0).unwrap_or(0.0),
         trigger_delay: base
-            .params
-            .get_float64(idx.p_trigger_delay, 0)
+            .get_float64_param(idx.p_trigger_delay, 0)
             .unwrap_or(0.0),
         noise_amplitude: base
-            .params
-            .get_float64(idx.p_noise_amplitude, 0)
+            .get_float64_param(idx.p_noise_amplitude, 0)
             .unwrap_or(0.0),
         update_time: base
-            .params
-            .get_float64(idx.p_update_time, 0)
+            .get_float64_param(idx.p_update_time, 0)
             .unwrap_or(DEFAULT_UPDATE_TIME),
     }
 }
@@ -420,40 +401,58 @@ pub fn compute_waveform(config: &SimConfig, rng: &mut Rng) -> SimResult {
     let time_range = NUM_DIVISIONS * config.time_per_div;
     let dt = time_range / num_points as f64;
 
-    let mut waveform = Vec::with_capacity(num_points);
-    let mut time_base = Vec::with_capacity(num_points);
-    let mut min_val = f64::MAX;
-    let mut max_val = f64::MIN;
+    let mut waveform = Vec::with_capacity(num_points.max(0) as usize);
+    let mut min_val = 1e6;
+    let mut max_val = -1e6;
     let mut sum = 0.0;
 
     for i in 0..num_points {
         let t = i as f64 * dt + config.trigger_delay;
-        time_base.push(t);
+        // C simTask (testAsynPortDriver.cpp:204-212): noise spans half the
+        // amplitude either way, and the statistics are of the unscaled volts.
         let y = AMPLITUDE * (2.0 * std::f64::consts::PI * FREQUENCY * t).sin()
-            + config.noise_amplitude * rng.next_centered();
-        let scaled = NUM_DIVISIONS / 2.0 + (config.volt_offset + y) / config.volts_per_div;
-        if scaled < min_val {
-            min_val = scaled;
+            + config.noise_amplitude * (rng.next_f64() - 0.5);
+        if y < min_val {
+            min_val = y;
         }
-        if scaled > max_val {
-            max_val = scaled;
+        if y > max_val {
+            max_val = y;
         }
-        sum += scaled;
-        waveform.push(scaled);
+        sum += y;
+        waveform.push(NUM_DIVISIONS / 2.0 + (config.volt_offset + y) / config.volts_per_div);
     }
 
-    let mean_val = if num_points > 0 {
-        sum / num_points as f64
-    } else {
-        0.0
-    };
+    let mean_val = sum / num_points as f64;
     SimResult {
         waveform,
-        time_base,
         min_val,
         max_val,
         mean_val,
     }
+}
+
+/// The end of a C simTask cycle (testAsynPortDriver.cpp:220-230): the
+/// statistics go out with callParamCallbacks before the trace's
+/// doCallbacksFloat64Array.
+fn post_cycle(base: &mut PortDriverBase, idx: &ParamIndices, result: SimResult) {
+    base.update_time_stamp();
+    let _ = base.set_float64_param(idx.p_min_value, 0, result.min_val);
+    let _ = base.set_float64_param(idx.p_max_value, 0, result.max_val);
+    let _ = base.set_float64_param(idx.p_mean_value, 0, result.mean_val);
+    let _ = base.call_param_callbacks(0);
+    for update in waveform_updates(idx, result.waveform) {
+        let _ = base.set_param(&update);
+    }
+}
+
+/// The trace, stored as C's pData_ for readFloat64Array and posted with
+/// doCallbacksFloat64Array.
+fn waveform_updates(idx: &ParamIndices, waveform: Vec<f64>) -> [ParamSetValue; 2] {
+    let waveform = ParamValue::Float64Array(waveform.into());
+    [
+        ParamSetValue::new(idx.p_waveform, 0, waveform.clone()),
+        ParamSetValue::array(idx.p_waveform, 0, waveform),
+    ]
 }
 
 /// Background simulation task using the concrete ScopeSimulator type.
@@ -473,20 +472,7 @@ pub async fn sim_task(port: Arc<Mutex<ScopeSimulator>>, notify: Arc<Notify>, idx
 
         let result = compute_waveform(&config, &mut rng);
 
-        {
-            let mut guard = port.lock();
-            let base = &mut guard.base;
-            let _ = base
-                .params
-                .set_float64_array(idx.p_waveform, 0, result.waveform);
-            let _ = base
-                .params
-                .set_float64_array(idx.p_time_base, 0, result.time_base);
-            let _ = base.set_float64_param(idx.p_min_value, 0, result.min_val);
-            let _ = base.set_float64_param(idx.p_max_value, 0, result.max_val);
-            let _ = base.set_float64_param(idx.p_mean_value, 0, result.mean_val);
-            let _ = base.call_param_callbacks(0);
-        }
+        post_cycle(&mut port.lock().base, &idx, result);
 
         let sleep_dur = std::time::Duration::from_secs_f64(config.update_time);
         asyn_rs::runtime::select! {
@@ -519,20 +505,7 @@ pub async fn sim_task_dyn(
 
         let result = compute_waveform(&config, &mut rng);
 
-        {
-            let mut guard = port.lock();
-            let base = guard.base_mut();
-            let _ = base
-                .params
-                .set_float64_array(idx.p_waveform, 0, result.waveform);
-            let _ = base
-                .params
-                .set_float64_array(idx.p_time_base, 0, result.time_base);
-            let _ = base.set_float64_param(idx.p_min_value, 0, result.min_val);
-            let _ = base.set_float64_param(idx.p_max_value, 0, result.max_val);
-            let _ = base.set_float64_param(idx.p_mean_value, 0, result.mean_val);
-            let _ = base.call_param_callbacks(0);
-        }
+        post_cycle(port.lock().base_mut(), &idx, result);
 
         let sleep_dur = std::time::Duration::from_secs_f64(config.update_time);
         asyn_rs::runtime::select! {
@@ -562,22 +535,23 @@ pub async fn sim_task_handle(
 
         let result = compute_waveform(&config, &mut rng);
 
+        // C simTask stamps the port (updateTimeStamp, testAsynPortDriver.cpp
+        // :220), sets the statistics, calls callParamCallbacks and posts the
+        // waveform with doCallbacksFloat64Array (:224-230); it never goes
+        // through writeFloat64Array, which the asynPortDriver default refuses.
+        let _ = handle.update_time_stamp().await;
         let _ = handle
-            .write_float64_array(idx.p_waveform, 0, result.waveform)
+            .set_params_and_notify(
+                0,
+                vec![
+                    ParamSetValue::new(idx.p_min_value, 0, ParamValue::Float64(result.min_val)),
+                    ParamSetValue::new(idx.p_max_value, 0, ParamValue::Float64(result.max_val)),
+                    ParamSetValue::new(idx.p_mean_value, 0, ParamValue::Float64(result.mean_val)),
+                ],
+            )
             .await;
-        let _ = handle
-            .write_float64_array(idx.p_time_base, 0, result.time_base)
-            .await;
-        let _ = handle
-            .write_float64(idx.p_min_value, 0, result.min_val)
-            .await;
-        let _ = handle
-            .write_float64(idx.p_max_value, 0, result.max_val)
-            .await;
-        let _ = handle
-            .write_float64(idx.p_mean_value, 0, result.mean_val)
-            .await;
-        let _ = handle.call_param_callbacks(0).await;
+        let waveform = waveform_updates(&idx, result.waveform);
+        let _ = handle.set_params_and_notify(0, waveform.into()).await;
 
         let sleep_dur = std::time::Duration::from_secs_f64(config.update_time);
         asyn_rs::runtime::select! {
@@ -596,7 +570,7 @@ async fn read_config_handle(
         max_points: handle
             .read_int32(idx.p_max_points, 0)
             .await
-            .unwrap_or(DEFAULT_MAX_POINTS) as usize,
+            .unwrap_or(DEFAULT_MAX_POINTS),
         time_per_div: handle
             .read_float64(idx.p_time_per_div, 0)
             .await
@@ -621,5 +595,141 @@ async fn read_config_handle(
             .read_float64(idx.p_update_time, 0)
             .await
             .unwrap_or(DEFAULT_UPDATE_TIME),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use asyn_rs::interfaces::InterfaceType;
+    use asyn_rs::interrupt::AsyncInterruptReceiver;
+    use epics_base_rs::runtime::interrupt_accept::InterruptGate;
+
+    /// A scope whose interrupts are open, its constructor posts made.
+    fn open_scope(name: &str) -> ScopeSimulator {
+        let mut driver = ScopeSimulator::new(name, Arc::new(Notify::new()));
+        driver.base.own_interrupts(InterruptGate::opened());
+        driver.base.call_param_callbacks(0).unwrap();
+        driver
+    }
+
+    /// The statistics and waveform posts that reached `rx`, with their
+    /// interface.
+    fn cycle_posts(
+        rx: &mut AsyncInterruptReceiver,
+        idx: &ParamIndices,
+    ) -> Vec<(usize, Option<InterfaceType>)> {
+        let watched = [
+            idx.p_min_value,
+            idx.p_max_value,
+            idx.p_mean_value,
+            idx.p_waveform,
+        ];
+        std::iter::from_fn(|| rx.try_recv().ok())
+            .filter(|v| watched.contains(&v.reason))
+            .map(|v| (v.reason, v.iface))
+            .collect()
+    }
+
+    fn result() -> SimResult {
+        SimResult {
+            waveform: vec![1.0, 2.0],
+            min_val: 1.0,
+            max_val: 2.0,
+            mean_val: 1.5,
+        }
+    }
+
+    /// simTask posts the statistics with callParamCallbacks, then the trace
+    /// with doCallbacksFloat64Array (testAsynPortDriver.cpp:224-230), and
+    /// readFloat64Array still serves it (:338-357).
+    #[test]
+    fn a_cycle_posts_the_waveform_as_an_array_callback() {
+        let mut driver = open_scope("scopeCycle");
+        let idx = driver.param_indices();
+        let mut rx = driver.base.interrupts.subscribe_async(64, 1 << 16);
+        post_cycle(&mut driver.base, &idx, result());
+        assert_eq!(
+            cycle_posts(&mut rx, &idx),
+            [
+                (idx.p_min_value, None),
+                (idx.p_max_value, None),
+                (idx.p_mean_value, None),
+                (idx.p_waveform, Some(InterfaceType::Float64Array)),
+            ]
+        );
+        driver.base.set_connected(true);
+        let mut buf = [0.0; 2];
+        let n = driver
+            .read_float64_array(&AsynUser::new(idx.p_waveform), &mut buf)
+            .unwrap();
+        assert_eq!(buf[..n], [1.0, 2.0]);
+    }
+
+    /// The PortHandle task posts as simTask does.
+    #[epics_base_rs::epics_test]
+    async fn a_handle_cycle_posts_the_waveform_as_an_array_callback() {
+        use asyn_rs::runtime::config::RuntimeConfig;
+        use asyn_rs::runtime::port::create_port_runtime;
+
+        let mut driver = open_scope("scopeHandleCycle");
+        let idx = driver.param_indices();
+        driver.base.set_int32_param(idx.p_run, 0, 1).unwrap();
+        driver
+            .base
+            .set_float64_param(idx.p_update_time, 0, 10.0)
+            .unwrap();
+        let (runtime, _) = create_port_runtime(
+            &asyn_rs::registry::claim_port("scopeHandleCycle").unwrap(),
+            driver,
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        let handle = runtime.port_handle().clone();
+        let mut rx = handle.interrupts().subscribe_async(64, 1 << 16);
+        let task = asyn_rs::runtime::task::spawn(sim_task_handle(
+            handle.clone(),
+            Arc::new(Notify::new()),
+            idx,
+        ));
+        let mut posts = Vec::new();
+        for _ in 0..1000 {
+            if posts.iter().any(|(r, _)| *r == idx.p_waveform) {
+                break;
+            }
+            asyn_rs::runtime::task::sleep(std::time::Duration::from_millis(5)).await;
+            posts.extend(cycle_posts(&mut rx, &idx));
+        }
+        task.abort();
+        assert!(
+            posts.iter().any(|(r, _)| *r == idx.p_waveform),
+            "no Waveform post in 5 s: {posts:?}"
+        );
+        assert_eq!(
+            posts[..4],
+            [
+                (idx.p_min_value, None),
+                (idx.p_max_value, None),
+                (idx.p_mean_value, None),
+                (idx.p_waveform, Some(InterfaceType::Float64Array)),
+            ]
+        );
+        std::mem::forget(runtime);
+    }
+
+    /// testAsynPortDriver.cpp:52-53; asynPortDriver adds Common itself.
+    #[test]
+    fn port_carries_the_c_interface_and_interrupt_masks() {
+        let driver = ScopeSimulator::new("scopeMasks", Arc::new(Notify::new()));
+        let interrupts = InterfaceMask::INT32
+            | InterfaceMask::FLOAT64
+            | InterfaceMask::FLOAT64_ARRAY
+            | InterfaceMask::ENUM;
+        assert_eq!(driver.base.interrupt_mask(), interrupts);
+        assert_eq!(
+            driver.base.interface_mask(),
+            interrupts | InterfaceMask::DRV_USER | InterfaceMask::COMMON
+        );
     }
 }

@@ -1,6 +1,8 @@
 use crate::error::{CaError, CaResult};
+use crate::server::record::{CycleCell, CycleRead, CycleValue};
 use crate::server::record::{ProcessOutcome, Record};
 use crate::types::EpicsValue;
+use crate::types::PvString;
 
 /// Choice labels for the SELM link-selection menu, in index order.
 /// C `menu(dfanoutSELM)`: 0=All, 1=Specified, 2=Mask.
@@ -17,25 +19,25 @@ pub struct DfanoutRecord {
     /// (dfanoutRecord.dbd.pod:188): unsigned 0..65535, used as a bit
     /// mask in `SELM=Mask`.
     pub seln: u16,
-    pub outa: String,
-    pub outb: String,
-    pub outc: String,
-    pub outd: String,
-    pub oute: String,
-    pub outf: String,
-    pub outg: String,
-    pub outh: String,
-    pub outi: String,
-    pub outj: String,
-    pub outk: String,
-    pub outl: String,
-    pub outm: String,
-    pub outn: String,
-    pub outo: String,
-    pub outp: String,
-    pub dol: String,
+    pub outa: PvString,
+    pub outb: PvString,
+    pub outc: PvString,
+    pub outd: PvString,
+    pub oute: PvString,
+    pub outf: PvString,
+    pub outg: PvString,
+    pub outh: PvString,
+    pub outi: PvString,
+    pub outj: PvString,
+    pub outk: PvString,
+    pub outl: PvString,
+    pub outm: PvString,
+    pub outn: PvString,
+    pub outo: PvString,
+    pub outp: PvString,
+    pub dol: PvString,
     pub omsl: i16,
-    pub sell: String,
+    pub sell: PvString,
     pub ivoa: i16,
     pub ivov: f64,
     // Limit-alarm configuration (C `dfanoutRecord.c::checkAlarms`).
@@ -66,25 +68,25 @@ impl Default for DfanoutRecord {
             // selected output is `seln - 1` (dfanoutRecord.c:316-322), so the
             // C default 1 drives OUTA while 0 would drive nothing.
             seln: 1,
-            outa: String::new(),
-            outb: String::new(),
-            outc: String::new(),
-            outd: String::new(),
-            oute: String::new(),
-            outf: String::new(),
-            outg: String::new(),
-            outh: String::new(),
-            outi: String::new(),
-            outj: String::new(),
-            outk: String::new(),
-            outl: String::new(),
-            outm: String::new(),
-            outn: String::new(),
-            outo: String::new(),
-            outp: String::new(),
-            dol: String::new(),
+            outa: PvString::new(),
+            outb: PvString::new(),
+            outc: PvString::new(),
+            outd: PvString::new(),
+            oute: PvString::new(),
+            outf: PvString::new(),
+            outg: PvString::new(),
+            outh: PvString::new(),
+            outi: PvString::new(),
+            outj: PvString::new(),
+            outk: PvString::new(),
+            outl: PvString::new(),
+            outm: PvString::new(),
+            outn: PvString::new(),
+            outo: PvString::new(),
+            outp: PvString::new(),
+            dol: PvString::new(),
             omsl: 0,
-            sell: String::new(),
+            sell: PvString::new(),
             ivoa: 0,
             ivov: 0.0,
             hihi: 0.0,
@@ -123,7 +125,7 @@ impl DfanoutRecord {
     }
 
     /// Get all non-empty output link targets.
-    pub fn output_links(&self) -> Vec<&str> {
+    pub fn output_links(&self) -> Vec<&[u8]> {
         [
             &self.outa, &self.outb, &self.outc, &self.outd, &self.oute, &self.outf, &self.outg,
             &self.outh, &self.outi, &self.outj, &self.outk, &self.outl, &self.outm, &self.outn,
@@ -131,11 +133,11 @@ impl DfanoutRecord {
         ]
         .iter()
         .filter(|s| !s.is_empty())
-        .map(|s| s.as_str())
+        .map(|s| s.as_bytes())
         .collect()
     }
 
-    fn out_slot_mut(&mut self, name: &str) -> Option<&mut String> {
+    fn out_slot_mut(&mut self, name: &str) -> Option<&mut PvString> {
         Some(match name {
             "OUTA" => &mut self.outa,
             "OUTB" => &mut self.outb,
@@ -157,7 +159,7 @@ impl DfanoutRecord {
         })
     }
 
-    fn out_slot(&self, name: &str) -> Option<&str> {
+    fn out_slot(&self, name: &str) -> Option<&PvString> {
         Some(match name {
             "OUTA" => &self.outa,
             "OUTB" => &self.outb,
@@ -181,20 +183,75 @@ impl DfanoutRecord {
 }
 
 impl Record for DfanoutRecord {
-    /// C `dfanoutRecord.c::init_record` (:96-111) ends without touching
-    /// MLST/ALST/LALM, which is the other half of the note on the MLST/ALST
-    /// field declarations above: `caget D:DF.MLST` on a C IOC reads 0 even
-    /// when the record was loaded with a nonzero VAL.
-    fn seed_deadband_tracking(&mut self) {}
+    // The menus are stored as `i16` and served as ENUM, so they stay General.
+    crate::slot_map!(crate::server::record::dbd_generated::slots::dfanout;
+        fields:
+        VAL => val,
+        SELN => seln,
+        HIHI => hihi,
+        LOLO => lolo,
+        HIGH => high,
+        LOW => low,
+        HYST => hyst,
+        ADEL => adel,
+        MDEL => mdel,
+        IVOV => ivov,
+        LALM => lalm,
+        ALST => alst,
+        MLST => mlst;
+        custom: SELM, SELL, OUTA, OUTB, OUTC, OUTD, OUTE, OUTF, OUTG, OUTH, OUTI, OUTJ, OUTK,
+            OUTL, OUTM, OUTN, OUTO, OUTP, DOL, OMSL, HHSV, LLSV, HSV, LSV, IVOA;
+        spill: EGU, PREC, HOPR, LOPR);
+
+    fn acts_before_process(&self) -> bool {
+        false
+    }
+
+    fn cycle_hooks(&self) -> crate::server::record::CycleHooks {
+        crate::server::record::CycleHooks::NONE
+    }
+
+    /// `monitor()` posts VAL alone (`dfanoutRecord.c:283-298`).
+    fn process_posted_fields(&self) -> Option<crate::server::record::DeclaredFields> {
+        Some(
+            &const {
+                crate::server::record::declared_set(
+                    crate::server::record::dbd_generated::DFANOUT_FIELDS,
+                    ["VAL"],
+                )
+            },
+        )
+    }
+
+    fn has_array_monitor_post(&self) -> bool {
+        false
+    }
 
     fn record_type(&self) -> &'static str {
         "dfanout"
+    }
+
+    /// `dfanoutRecord.c:119` keeps the DOL status; `push_values` drops the outputs'.
+    fn process_status_rule(&self) -> crate::server::record::ProcessStatusRule {
+        crate::server::record::ProcessStatusRule::ZERO
+            .with_dol(crate::server::record::DolStatus::Kept)
     }
 
     /// C `dfanoutRecord.c:116-122`: the scalar `dbGetLink(&prec->dol, ..., &prec->val, 0, 0)`
     /// under `dol.type != CONSTANT && omsl == menuOmslclosed_loop`.
     fn fetches_dol_closed_loop(&self) -> bool {
         true
+    }
+
+    /// DOL is read at `DBR_DOUBLE` (`dfanoutRecord.c:119`) and SELL at
+    /// `DBR_USHORT` (`:126`), so a source those requests cannot convert is a
+    /// failed read.
+    fn input_link_request(&self, link_field: &str) -> crate::server::record::InputLinkRequest {
+        crate::server::record::InputLinkRequest::As(match link_field {
+            "DOL" => crate::server::record::LinkReadAs::Double,
+            "SELL" => crate::server::record::LinkReadAs::UShort,
+            _ => crate::server::record::LinkReadAs::Native,
+        })
     }
 
     fn menu_field_choices(&self, field: &str) -> Option<&'static [&'static str]> {
@@ -316,10 +373,62 @@ impl Record for DfanoutRecord {
         self.lalm = val;
     }
 
-    fn get_field(&self, name: &str) -> Option<EpicsValue> {
-        if let Some(s) = self.out_slot(name) {
-            return Some(EpicsValue::String(s.to_string().into()));
+    fn cycle_cell(&self, cell: CycleCell) -> CycleRead {
+        match cell {
+            CycleCell::Val => CycleRead::Value(CycleValue::Double(self.val)),
+            CycleCell::Mdel => CycleRead::Value(CycleValue::Double(self.mdel)),
+            CycleCell::Adel => CycleRead::Value(CycleValue::Double(self.adel)),
+            CycleCell::Mlst => CycleRead::Value(CycleValue::Double(self.mlst)),
+            CycleCell::Alst => CycleRead::Value(CycleValue::Double(self.alst)),
+            CycleCell::Hyst => CycleRead::Value(CycleValue::Double(self.hyst)),
+            CycleCell::Lalm => CycleRead::Value(CycleValue::Double(self.lalm)),
+            _ => CycleRead::Absent,
         }
+    }
+
+    fn put_cycle_cell(&mut self, cell: CycleCell, value: CycleValue) -> CaResult<()> {
+        match (cell, value) {
+            (CycleCell::Lalm, CycleValue::Double(v)) => self.lalm = v,
+            (CycleCell::Alst, CycleValue::Double(v)) => self.alst = v,
+            (CycleCell::Mlst, CycleValue::Double(v)) => self.mlst = v,
+            (cell, value) => return self.put_field(cell.name(), value.into()),
+        }
+        Ok(())
+    }
+
+    fn link_text_ref(&self, link_field: &str) -> Option<&[u8]> {
+        match link_field {
+            "DOL" => Some(self.dol.as_bytes()),
+            "SELL" => Some(self.sell.as_bytes()),
+            // OUTA..OUTP, which the output row reads every cycle.
+            _ => {
+                let [b'O', b'U', b'T', slot] = *link_field.as_bytes() else {
+                    return None;
+                };
+                Some(match slot {
+                    b'A' => self.outa.as_bytes(),
+                    b'B' => self.outb.as_bytes(),
+                    b'C' => self.outc.as_bytes(),
+                    b'D' => self.outd.as_bytes(),
+                    b'E' => self.oute.as_bytes(),
+                    b'F' => self.outf.as_bytes(),
+                    b'G' => self.outg.as_bytes(),
+                    b'H' => self.outh.as_bytes(),
+                    b'I' => self.outi.as_bytes(),
+                    b'J' => self.outj.as_bytes(),
+                    b'K' => self.outk.as_bytes(),
+                    b'L' => self.outl.as_bytes(),
+                    b'M' => self.outm.as_bytes(),
+                    b'N' => self.outn.as_bytes(),
+                    b'O' => self.outo.as_bytes(),
+                    b'P' => self.outp.as_bytes(),
+                    _ => return None,
+                })
+            }
+        }
+    }
+
+    fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
             "VAL" => Some(EpicsValue::Double(self.val)),
             // SELM is DBF_MENU (dfanoutRecord.dbd.pod): served as DBR_ENUM,
@@ -345,20 +454,11 @@ impl Record for DfanoutRecord {
             "ADEL" => Some(EpicsValue::Double(self.adel)),
             "MLST" => Some(EpicsValue::Double(self.mlst)),
             "ALST" => Some(EpicsValue::Double(self.alst)),
-            _ => None,
+            _ => self.out_slot(name).map(|s| EpicsValue::String(s.clone())),
         }
     }
 
     fn put_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
-        if self.out_slot(name).is_some() {
-            return match value {
-                EpicsValue::String(s) => {
-                    *self.out_slot_mut(name).unwrap() = s.as_str_lossy().into_owned();
-                    Ok(())
-                }
-                _ => Err(CaError::TypeMismatch(name.into())),
-            };
-        }
         match name {
             "VAL" | "IVOV" | "HIHI" | "HIGH" | "LOW" | "LOLO" | "HYST" | "LALM" | "MDEL"
             | "ADEL" | "MLST" | "ALST" => {
@@ -429,15 +529,50 @@ impl Record for DfanoutRecord {
             "DOL" | "SELL" => match value {
                 EpicsValue::String(s) => {
                     match name {
-                        "DOL" => self.dol = s.as_str_lossy().into_owned(),
-                        "SELL" => self.sell = s.as_str_lossy().into_owned(),
+                        "DOL" => self.dol = s,
+                        "SELL" => self.sell = s,
                         _ => unreachable!(),
                     }
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
             },
-            _ => Err(CaError::FieldNotFound(name.to_string())),
+            _ => match (self.out_slot_mut(name), value) {
+                (Some(slot), EpicsValue::String(s)) => {
+                    *slot = s;
+                    Ok(())
+                }
+                (Some(_), _) => Err(CaError::TypeMismatch(name.into())),
+                (None, _) => Err(CaError::FieldNotFound(name.to_string())),
+            },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// OUTn lands and reads back through the fallback arm; a non-string put
+    /// to it is a type mismatch and an unknown name is not found, as before
+    /// the named fields moved ahead of it. softIoc: `dbpf D.OUTC SINK` reads
+    /// back `SINK NPP NMS`.
+    #[test]
+    fn out_links_and_named_fields_resolve_through_one_match() {
+        let mut r = DfanoutRecord::default();
+        r.put_field("OUTC", EpicsValue::String("SINK".into()))
+            .unwrap();
+        r.put_field("VAL", EpicsValue::Double(2.0)).unwrap();
+        assert_eq!(r.get_field("OUTC"), Some(EpicsValue::String("SINK".into())));
+        assert_eq!(r.get_field("VAL"), Some(EpicsValue::Double(2.0)));
+        assert!(matches!(
+            r.put_field("OUTC", EpicsValue::Double(1.0)),
+            Err(CaError::TypeMismatch(_))
+        ));
+        assert!(matches!(
+            r.put_field("NOPE", EpicsValue::Double(1.0)),
+            Err(CaError::FieldNotFound(_))
+        ));
+        assert_eq!(r.get_field("NOPE"), None);
     }
 }

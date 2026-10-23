@@ -26,6 +26,7 @@
 //! Posting the waveform per frame would make a `camonitor` on `AP_Data` fire
 //! at the detector frame rate.
 
+use asyn_rs::port::InterfaceMask;
 use std::collections::VecDeque;
 use std::sync::Arc;
 
@@ -37,6 +38,7 @@ use ad_core_rs::ndarray::NDArray;
 use ad_core_rs::ndarray_pool::NDArrayPool;
 use ad_core_rs::plugin::runtime::{
     NDPluginProcess, ParamChangeResult, ParamUpdate, PluginParamSnapshot, ProcessResult,
+    WriteOutcome, WritePort, WriteVerdict,
 };
 use parking_lot::Mutex;
 
@@ -195,6 +197,12 @@ impl AttrPlotState {
     /// Mirrors C++ `writeInt32(NDAttrPlotDataSelect)`: rejects out-of-range
     /// blocks and selections that point past the tracked attributes.
     fn set_data_select(&mut self, block: usize, value: i32) -> Result<(), &'static str> {
+        self.check_data_select(block, value)?;
+        self.data_selections[block] = value;
+        Ok(())
+    }
+
+    fn check_data_select(&self, block: usize, value: i32) -> Result<(), &'static str> {
         if block >= self.n_data_blocks {
             return Err("data block index out of range");
         }
@@ -203,7 +211,6 @@ impl AttrPlotState {
         if value > 0 && (value as usize) >= self.attributes.len() {
             return Err("attribute selection out of range");
         }
-        self.data_selections[block] = value;
         Ok(())
     }
 
@@ -406,19 +413,49 @@ impl AttrPlotState {
         updates
     }
 
-    /// Metadata plus an unconditional `AP_Data` post — the shape C++ produces
-    /// for a `DataSelect` write (`callback_selected` then `callback_data`,
-    /// `NDPluginAttrPlot.cpp:286-287`). Re-arms the exposure clock so the
-    /// forced post also counts as this period's exposure.
-    fn build_updates(&mut self) -> Vec<ParamUpdate> {
-        self.last_expose = Some(std::time::Instant::now());
-        let mut updates = self.data_updates();
-        updates.extend(self.meta_updates());
+    /// C `callback_selected` (`NDPluginAttrPlot.cpp:227-244`): each block's
+    /// label and selection, flushed per block.
+    fn selected_updates(&self) -> Vec<ParamUpdate> {
+        let mut updates = Vec::new();
+        for block in 0..self.n_data_blocks {
+            let addr = block as i32;
+            if let Some(label) = self.params.data_label {
+                updates.push(ParamUpdate::octet_addr(label, addr, self.data_label(block)));
+            }
+            if let Some(select) = self.params.data_select {
+                updates.push(ParamUpdate::int32_addr(
+                    select,
+                    addr,
+                    self.data_selections[block],
+                ));
+            }
+            updates.push(ParamUpdate::callbacks(addr));
+        }
         updates
+    }
+
+    /// An `AP_Data` post outside the exposure clock, which it re-arms so the
+    /// post also counts as this period's exposure.
+    fn expose_now(&mut self) -> Vec<ParamUpdate> {
+        self.last_expose = Some(std::time::Instant::now());
+        self.data_updates()
     }
 }
 
 impl NDPluginProcess for AttrPlotProcessor {
+    const ASYN_FLAGS: asyn_rs::port::PortFlags = ad_core_rs::plugin::runtime::ASYN_MULTIDEVICE;
+    // NDPluginAttrPlot.cpp:51-55, the same mask for both.
+    const INTERFACE_MASK: InterfaceMask = InterfaceMask::FLOAT64_ARRAY
+        .or(InterfaceMask::GENERIC_POINTER)
+        .or(InterfaceMask::INT32)
+        .or(InterfaceMask::FLOAT64)
+        .or(InterfaceMask::OCTET);
+    const INTERRUPT_MASK: InterfaceMask = Self::INTERFACE_MASK;
+    /// `std::max(n_attributes, n_data_blocks)` (NDPluginAttrPlot.cpp:48).
+    fn max_addr(&self) -> usize {
+        let state = self.state.lock();
+        state.n_attributes.max(state.n_data_blocks)
+    }
     fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
         let mut state = self.state.lock();
 
@@ -470,20 +507,47 @@ impl NDPluginProcess for AttrPlotProcessor {
         Ok(())
     }
 
+    /// C `NDPluginAttrPlot::writeInt32` (NDPluginAttrPlot.cpp:270-296)
+    /// returns `asynError` for a selection it cannot bind and stores nothing.
+    fn validate_int32(
+        &self,
+        reason: usize,
+        addr: i32,
+        value: i32,
+        verdict: WriteVerdict<i32>,
+        params: &mut WritePort<'_>,
+    ) -> WriteOutcome<i32> {
+        let state = self.state.lock();
+        if Some(reason) == state.params.data_select
+            && (addr < 0 || state.check_data_select(addr as usize, value).is_err())
+        {
+            return WriteOutcome::from(WriteVerdict::Refuse {
+                keep: params.get_int32_param(reason, addr).unwrap_or(0),
+                message: String::new(),
+            })
+            .settled();
+        }
+        verdict.into()
+    }
+
     fn on_param_change(&self, reason: usize, params: &PluginParamSnapshot) -> ParamChangeResult {
         let mut state = self.state.lock();
         if Some(reason) == state.params.data_select {
             let block = params.addr as usize;
             let value = params.value.as_i32();
             if state.set_data_select(block, value).is_ok() {
-                // Re-emit label + waveform for the rebound block.
-                return ParamChangeResult::updates(state.build_updates());
+                // C `callback_selected` then `callback_data` (:286-287).
+                let mut updates = state.selected_updates();
+                updates.extend(state.expose_now());
+                return ParamChangeResult::updates(updates);
             }
         } else if Some(reason) == state.params.reset {
             // C calls reset_data() on ANY write to the reset param — there is no
             // value test (NDPluginAttrPlot.cpp:290-292).
             state.reset();
-            return ParamChangeResult::updates(state.build_updates());
+            let mut updates = state.expose_now();
+            updates.extend(state.meta_updates());
+            return ParamChangeResult::updates(updates);
         }
         ParamChangeResult::updates(vec![])
     }
@@ -494,6 +558,23 @@ mod tests {
     use super::*;
     use ad_core_rs::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
     use ad_core_rs::ndarray::{NDDataType, NDDimension};
+
+    /// NDPluginAttrPlot.cpp:48 passes max(n_attributes, n_data_blocks)
+    /// whoever builds the plugin.
+    #[test]
+    fn an_attr_plot_port_has_c_s_addresses() {
+        let (handle, _jh) = ad_core_rs::plugin::runtime::create_plugin_runtime(
+            &asyn_rs::asyn_record::claim_port("ATTRPLOT_ADDR").unwrap(),
+            AttrPlotProcessor::new(3, 10, 5),
+            1_000_000,
+            1,
+            0,
+            "",
+            std::sync::Arc::new(ad_core_rs::plugin::wiring::WiringRegistry::new()),
+            ad_core_rs::plugin::runtime::DEFAULT_PLUGIN_THREADS,
+        );
+        assert_eq!(handle.port_runtime().port_handle().max_addr(), 5);
+    }
 
     fn make_array_with_attrs(uid: i32, attrs: &[(&str, f64)]) -> NDArray {
         let mut arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
@@ -517,6 +598,8 @@ mod tests {
             "ATTRPLOT_ADP53",
             blocks.max(n_attributes),
             asyn_rs::port::PortFlags::default(),
+            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
+            asyn_rs::port::InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         proc.register_params(&mut base).unwrap();
         proc
@@ -595,6 +678,114 @@ mod tests {
                 matches!(u, ParamUpdate::Float64Array { reason: r, .. } if *r == data_reason)
             }),
             "a DataSelect write must post AP_Data even inside the period",
+        );
+    }
+
+    /// A `DataSelect` write flushes each block's label before `AP_Data`
+    /// posts (NDPluginAttrPlot.cpp:286-287).
+    #[test]
+    fn a_data_select_write_posts_the_labels_before_the_data() {
+        let proc = proc_with_params(8, 100, 2);
+        let select_reason = proc.state.lock().params.data_select.unwrap();
+        let arr = make_array_with_attrs(1, &[("Temp", 25.0)]);
+        proc.process_array(&Arc::new(arr), &NDArrayPool::new(1_000_000));
+        let snapshot = PluginParamSnapshot {
+            enable_callbacks: true,
+            reason: select_reason,
+            addr: 0,
+            value: ad_core_rs::plugin::runtime::ParamChangeValue::Int32(0),
+        };
+        let result = proc.on_param_change(select_reason, &snapshot);
+        let mut seq: Vec<(&str, i32)> = result
+            .param_updates
+            .iter()
+            .map(|u| match u {
+                ParamUpdate::Int32 { addr, .. }
+                | ParamUpdate::Float64 { addr, .. }
+                | ParamUpdate::Octet { addr, .. } => ("set", *addr),
+                ParamUpdate::Float64Array { addr, .. } => ("array", *addr),
+                ParamUpdate::Callbacks { addr } => ("flush", *addr),
+            })
+            .collect();
+        seq.dedup();
+        assert_eq!(
+            seq,
+            [
+                ("set", 0),
+                ("flush", 0),
+                ("set", 1),
+                ("flush", 1),
+                ("array", 0),
+                ("array", 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_unbindable_data_select_is_refused_as_c_write_int32_does() {
+        let mut proc = AttrPlotProcessor::new(8, 100, 4);
+        let mut base = asyn_rs::port::PortDriverBase::new(
+            "ATTRPLOT_V",
+            8,
+            asyn_rs::port::PortFlags::default(),
+            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
+            asyn_rs::port::InterfaceMask::UNMIGRATED_INTERRUPTS,
+        );
+        proc.register_params(&mut base).unwrap();
+        let select = proc.state.lock().params.data_select.unwrap();
+        base.set_int32_param(select, 1, 0).unwrap();
+        proc.process_array(
+            &Arc::new(make_array_with_attrs(1, &[("Temp", 25.0)])),
+            &NDArrayPool::new(1_000_000),
+        );
+        let refused = WriteVerdict::Refuse {
+            keep: 0,
+            message: String::new(),
+        };
+
+        assert_eq!(
+            proc.validate_int32(
+                select,
+                1,
+                0,
+                WriteVerdict::Accept(0),
+                &mut ad_core_rs::plugin::runtime::WritePort::new(&mut base)
+            )
+            .verdict,
+            WriteVerdict::Accept(0)
+        );
+        assert_eq!(
+            proc.validate_int32(
+                select,
+                1,
+                -1,
+                WriteVerdict::Accept(-1),
+                &mut ad_core_rs::plugin::runtime::WritePort::new(&mut base)
+            )
+            .verdict,
+            WriteVerdict::Accept(-1)
+        );
+        assert_eq!(
+            proc.validate_int32(
+                select,
+                1,
+                9,
+                WriteVerdict::Accept(9),
+                &mut ad_core_rs::plugin::runtime::WritePort::new(&mut base)
+            )
+            .verdict,
+            refused
+        );
+        assert_eq!(
+            proc.validate_int32(
+                select,
+                5,
+                0,
+                WriteVerdict::Accept(0),
+                &mut ad_core_rs::plugin::runtime::WritePort::new(&mut base)
+            )
+            .verdict,
+            refused
         );
     }
 

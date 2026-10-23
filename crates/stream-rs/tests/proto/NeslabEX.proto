@@ -1,0 +1,32 @@
+## NeslabEX.proto
+##
+## stream protocol file for Thermo Scientific Neslab EX Bath/Circulator
+##
+## Kurt Goetze
+## June 19, 2013
+
+#
+# Read Commands
+#
+get_temp {
+    out "\xCA\x00\x01\x20\x00\xDE";
+    in "%*6r%2r%*r";
+}
+
+get_sp {
+    out "\xCA\x00\x01\x70\x00\x8E";
+    in "%*6r%2r%*r";
+}
+
+get_status {
+    out "\xCA\x00\x01\x09\x00\xF5";
+    in "%*7r%1r%*3r";
+}
+
+#
+# Set Commands
+#
+set_temp {
+    out 0xCA;
+    out "\x00\x03\xF0\x02%.2r%<~sum>";
+}

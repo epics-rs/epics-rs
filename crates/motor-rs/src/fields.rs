@@ -1,3 +1,4 @@
+use asyn_rs::interfaces::motor::PostMessage;
 use epics_base_rs::types::PvString;
 
 use crate::flags::*;
@@ -10,15 +11,14 @@ pub struct PositionFields {
     pub rlv: f64,
     pub off: f64,
     pub diff: f64,
-    /// Raw step difference. 64-bit to cover high-resolution / long-travel
-    /// axes beyond the 32-bit range (epics-modules/motor #192).
-    pub rdif: i64,
+    /// Raw step difference (DBF_LONG).
+    pub rdif: i32,
     pub dval: f64,
     pub drbv: f64,
-    pub rval: i64,
-    pub rrbv: i64,
-    pub rmp: i64,
-    pub rep: i64,
+    pub rval: i32,
+    pub rrbv: i32,
+    pub rmp: i32,
+    pub rep: i32,
 }
 
 impl Default for PositionFields {
@@ -56,7 +56,7 @@ pub struct ConversionFields {
     /// 2963-2972): any write forces SET to Set/Use mode.
     pub sset: i16,
     pub suse: i16,
-    pub igset: bool,
+    pub igset: i16,
     pub mres: f64,
     pub eres: f64,
     pub srev: i32,
@@ -88,8 +88,10 @@ impl Default for ConversionFields {
             set: false,
             sset: 0,
             suse: 0,
-            igset: false,
-            mres: 1.0,
+            igset: 0,
+            // dbd-true default — MRES has no initial(); init sets 1.0 and
+            // marks M_MRES (motorRecord.cc:3917-3921).
+            mres: 0.0,
             eres: 0.0,
             srev: 200,
             // dbd-true default — UREV has no initial(). The init-time
@@ -169,13 +171,13 @@ impl Default for VelocityFields {
 #[derive(Debug, Clone)]
 pub struct RetryFields {
     pub bdst: f64,
-    pub frac: f64,
+    pub frac: f32,
     pub rdbd: f64,
     pub spdb: f64,
     pub rtry: i16,
     pub rmod: RetryMode,
     pub rcnt: i16,
-    pub miss: bool,
+    pub miss: i16,
 }
 
 impl Default for RetryFields {
@@ -188,7 +190,7 @@ impl Default for RetryFields {
             rtry: 10,
             rmod: RetryMode::Default,
             rcnt: 0,
-            miss: false,
+            miss: 0,
         }
     }
 }
@@ -204,14 +206,14 @@ pub struct LimitFields {
     pub rhlm: f64,
     /// Raw low limit (in motor steps) — invariant for MRES changes
     pub rllm: f64,
-    pub lvio: bool,
-    pub hls: bool,
-    pub lls: bool,
+    pub lvio: i16,
+    pub hls: i16,
+    pub lls: i16,
     /// Raw high limit switch readback (C 3727: `rhls = msta.Bits.RA_PLUS_LS`),
     /// unmapped by DIR/MRES polarity — HLS/LLS derive from these (C 3733-3734).
-    pub rhls: bool,
+    pub rhls: i16,
     /// Raw low limit switch readback (C 3728: `rlls = msta.Bits.RA_MINUS_LS`).
-    pub rlls: bool,
+    pub rlls: i16,
     pub hlsv: i16,
 }
 
@@ -224,13 +226,13 @@ impl Default for LimitFields {
             dllm: 0.0,
             rhlm: 0.0,
             rllm: 0.0,
-            // C dbd LVIO has no initial() (0), and init_record resets it
-            // before the initial-readback check (motorRecord.cc:734-743).
-            lvio: false,
-            hls: false,
-            lls: false,
-            rhls: false,
-            rlls: false,
+            // C dbd initial("1"); init_record resets it before the
+            // initial-readback check (motorRecord.cc:734-743).
+            lvio: 1,
+            hls: 0,
+            lls: 0,
+            rhls: 0,
+            rlls: 0,
             hlsv: 0,
         }
     }
@@ -240,13 +242,13 @@ impl Default for LimitFields {
 #[derive(Debug, Clone)]
 pub struct ControlFields {
     pub spmg: SpmgMode,
-    pub stop: bool,
-    pub homf: bool,
-    pub homr: bool,
-    pub jogf: bool,
-    pub jogr: bool,
-    pub twf: bool,
-    pub twr: bool,
+    pub stop: i16,
+    pub homf: i16,
+    pub homr: i16,
+    pub jogf: i16,
+    pub jogr: i16,
+    pub twf: i16,
+    pub twr: i16,
     pub twv: f64,
     pub cnen: bool,
 }
@@ -255,14 +257,14 @@ impl Default for ControlFields {
     fn default() -> Self {
         Self {
             spmg: SpmgMode::Go,
-            stop: false,
-            homf: false,
-            homr: false,
-            jogf: false,
-            jogr: false,
-            twf: false,
-            twr: false,
-            twv: 1.0,
+            stop: 0,
+            homf: 0,
+            homr: 0,
+            jogf: 0,
+            jogr: 0,
+            twf: 0,
+            twr: 0,
+            twv: 0.0,
             cnen: false,
         }
     }
@@ -271,35 +273,39 @@ impl Default for ControlFields {
 /// Status fields.
 #[derive(Debug, Clone)]
 pub struct StatusFields {
-    pub dmov: bool,
-    pub movn: bool,
+    pub dmov: i16,
+    pub movn: i16,
     pub msta: MstaFlags,
     pub mip: MipFlags,
     pub phase: MotionPhase,
-    pub cdir: bool,
-    pub tdir: bool,
-    pub athm: bool,
+    pub cdir: i16,
+    pub tdir: i16,
+    pub athm: i16,
     pub stup: i16,
     /// Raw velocity reported by the driver, in motor steps/sec.
     /// C: `motorRecord.dbd` `field(RVEL,DBF_LONG)` "Raw Velocity"; devMotorAsyn
-    /// fills it with `floor(status.velocity)`. 64-bit here for consistency
-    /// with the other raw fields (epics-modules/motor #192).
-    pub rvel: i64,
+    /// fills it with `floor(status.velocity)`.
+    pub rvel: i32,
+    /// The driver ignores a base velocity, so accel math drops VBAS
+    /// (epics-modules/motor #76, unmerged). Not on MSTA: C never sets
+    /// bit 15.
+    pub vbas_unsupported: bool,
 }
 
 impl Default for StatusFields {
     fn default() -> Self {
         Self {
-            dmov: true,
-            movn: false,
+            dmov: 1,
+            movn: 0,
             msta: MstaFlags::empty(),
             mip: MipFlags::empty(),
             phase: MotionPhase::Idle,
-            cdir: false,
-            tdir: false,
-            athm: false,
+            cdir: 0,
+            tdir: 0,
+            athm: 0,
             stup: 0,
             rvel: 0,
+            vbas_unsupported: false,
         }
     }
 }
@@ -344,25 +350,30 @@ impl Default for DisplayFields {
 
 /// Database-link and menu fields imported from the public C `motorRecord.dbd`
 /// surface (motorRecord.dbd:233-265, 739-760). The link strings hold the
-/// `DBF_INLINK` / `DBF_OUTLINK` specification clients open by C name; `post` is
-/// the `DBF_STRING` post-move command. `omsl` is the `menuOmsl` selector
-/// (0 = supervisory, 1 = closed_loop).
+/// `DBF_INLINK` / `DBF_OUTLINK` specification clients open by C name; `init`,
+/// `prem` and `post` are the `DBF_STRING` startup, pre-move and post-move
+/// commands. `omsl` is the `menuOmsl` selector (0 = supervisory, 1 =
+/// closed_loop).
 #[derive(Debug, Clone, Default)]
 pub struct LinkFields {
-    pub out: String,
+    pub out: PvString,
     /// `field(CARD,DBF_SHORT)` (motorRecord.dbd:239-243), the one field that is
     /// a pure function of [`Self::out`]: `init_record` switches on the OUT link
     /// TYPE and stores the card number, -1, or 0 (`motorRecord.cc:653-670`).
-    /// It lives beside the link it is derived from; `motor_derive_card` is the
-    /// only writer.
+    /// It lives beside the link it is derived from; `motor_derive_card`
+    /// writes it, and `motor_failed_dset_init` forces C's -1 after it.
     pub card: i16,
-    pub rdbl: String,
-    pub dol: String,
-    pub rlnk: String,
-    pub stoo: String,
-    pub dinp: String,
-    pub rinp: String,
-    pub post: String,
+    pub rdbl: PvString,
+    pub dol: PvString,
+    pub rlnk: PvString,
+    pub stoo: PvString,
+    pub dinp: PvString,
+    pub rinp: PvString,
+    pub init: PvString,
+    pub prem: PvString,
+    /// Shared with the device a move armed with it, which reads it when
+    /// that move is done.
+    pub post: PostMessage,
     pub omsl: i16,
 }
 
@@ -398,25 +409,117 @@ impl Default for TimingFields {
     }
 }
 
+/// A row of the record's post table: C `mmap_field`'s bits as they sit in
+/// MMAP, `nmap_field`'s 32 up (motorRecord.cc:333-389), and between and past
+/// them the posts C makes without a mark.
+pub mod m {
+    pub const VAL: u64 = 1 << 0;
+    pub const DVAL: u64 = 1 << 1;
+    pub const HLM: u64 = 1 << 2;
+    pub const LLM: u64 = 1 << 3;
+    pub const DMOV: u64 = 1 << 4;
+    pub const SPMG: u64 = 1 << 5;
+    pub const RCNT: u64 = 1 << 6;
+    pub const MRES: u64 = 1 << 7;
+    pub const ERES: u64 = 1 << 8;
+    pub const UEIP: u64 = 1 << 9;
+    pub const STOP: u64 = 1 << 10;
+    pub const LVIO: u64 = 1 << 11;
+    pub const RVAL: u64 = 1 << 12;
+    pub const RLV: u64 = 1 << 13;
+    pub const OFF: u64 = 1 << 14;
+    pub const RBV: u64 = 1 << 15;
+    pub const DHLM: u64 = 1 << 16;
+    pub const DLLM: u64 = 1 << 17;
+    pub const DRBV: u64 = 1 << 18;
+    pub const MOVN: u64 = 1 << 19;
+    pub const HLS: u64 = 1 << 20;
+    pub const LLS: u64 = 1 << 21;
+    pub const RRBV: u64 = 1 << 22;
+    pub const MSTA: u64 = 1 << 23;
+    pub const ATHM: u64 = 1 << 24;
+    pub const TDIR: u64 = 1 << 25;
+    pub const MIP: u64 = 1 << 26;
+    pub const DIFF: u64 = 1 << 27;
+    pub const RDIF: u64 = 1 << 28;
+    /// The raw switch `monitor()` posts beside HLS or LLS (3576-3589).
+    pub const RHLS: u64 = 1 << 29;
+    pub const RLLS: u64 = 1 << 30;
+    /// `process_motor_info`'s own UEIP post (3671-3675), no `MARK`.
+    pub const UEIP_POSTED: u64 = 1 << 31;
+    pub const SBAS: u64 = 1 << 32;
+    pub const SREV: u64 = 1 << 33;
+    pub const UREV: u64 = 1 << 34;
+    pub const VELO: u64 = 1 << 35;
+    pub const VBAS: u64 = 1 << 36;
+    pub const MISS: u64 = 1 << 37;
+    pub const STUP: u64 = 1 << 38;
+    pub const JOGF: u64 = 1 << 39;
+    pub const JOGR: u64 = 1 << 40;
+    pub const HOMF: u64 = 1 << 41;
+    pub const HOMR: u64 = 1 << 42;
+    pub const RHLM: u64 = 1 << 43;
+    pub const RLLM: u64 = 1 << 44;
+    /// The rows `MARK` / `MARK_AUX` name, as they sit in MMAP and NMAP.
+    pub const MMAP: u64 = (1 << 29) - 1;
+    pub const NMAP: u64 = ((1 << 13) - 1) << 32;
+    /// What `monitor()` posts above its short circuit (3462-3549).
+    pub const UPPER: u64 = RBV | RRBV | DRBV | DIFF | RDIF | MSTA;
+    // `special()`'s literal posts, drained by the put.
+    pub const PUT_DMOV: u64 = 1 << 45;
+    pub const PUT_VBAS: u64 = 1 << 46;
+    pub const PUT_SBAS: u64 = 1 << 47;
+    pub const PUT_VELO: u64 = 1 << 48;
+    pub const PUT_DLLM: u64 = 1 << 49;
+    pub const PUT_DHLM: u64 = 1 << 50;
+    pub const PUT_HLM: u64 = 1 << 51;
+    pub const PUT_LLM: u64 = 1 << 52;
+    pub const PUT_STUP: u64 = 1 << 53;
+    /// `monitor()`'s own CNEN post (3541-3548), raised and drained inside the
+    /// take that derives it.
+    pub const CNEN: u64 = 1 << 54;
+    /// velcheckB's MRES<0 branch posts both user limits (2903-2905) ahead of
+    /// the tail post every MRES put makes.
+    pub const PUT_HLM_SWAP: u64 = 1 << 55;
+    pub const PUT_LLM_SWAP: u64 = 1 << 56;
+}
+
 /// Internal bookkeeping fields (not directly exposed as PVs).
 #[derive(Debug, Clone, Default)]
 pub struct InternalFields {
     pub lval: f64,
     pub ldvl: f64,
-    pub lrvl: i64,
+    pub lrvl: i32,
     /// Last RLV value posted (C `motorRecord.dbd` LRLV, DBF_DOUBLE, SPC_NOMOD).
     pub lrlv: f64,
-    /// Monitored-field bitmap (C `motorRecord.dbd` MMAP, DBF_ULONG, SPC_NOMOD).
-    pub mmap: i64,
-    /// Non-monitored-field bitmap (C `motorRecord.dbd` NMAP, DBF_ULONG,
-    /// SPC_NOMOD).
-    pub nmap: i64,
+    /// C `pmr->vers` (DBF_FLOAT, SPC_NOMOD): a `.db` value until
+    /// `init_record` pass 0 stamps the version (motorRecord.cc:608).
+    pub vers: f32,
+    /// C `mmap` and `nmap` (DBF_ULONG): the fields the next `monitor()`
+    /// posts, set by `MotorRecord::mark` at C's `MARK` sites and drained
+    /// by the cycle ([`m`] has the bits). A loaded word keeps all 32 bits.
+    pub mmap: u32,
+    pub nmap: u32,
+    /// `process_motor_info`'s UEIP post, made without a mark (3671-3675).
+    pub ueip_posted: bool,
+    /// The cycle that set this ran `process()`, so the next take of the
+    /// post marks is its `monitor()`; any other take is a put's.
+    pub monitor_due: bool,
+    /// The last pass committed STAT = COMM_ALARM: what C `build_trans`
+    /// reads during the next pass's `do_work`, ahead of its `alarm_sub`.
+    pub comm_alarm: bool,
+    /// `monitor()` found a mark below its short circuit this cycle
+    /// (motorRecord.cc:3550-3551), so an alarm move posts that group too.
+    pub monitor_lower_marked: bool,
+    /// The literal `DBE_VAL_LOG` posts `special()` makes itself, drained
+    /// by the put that ran it ([`m`]'s `PUT_*` bits).
+    pub put_posted: u64,
     pub lspg: SpmgMode,
     /// C `pmr->sync` — latched SYNC request. Set by a nonzero SYNC put,
     /// consumed by `apply_latent_sync` only when the record is idle under
     /// SPMG Go/Move on a pass that dispatched nothing
     /// (motorRecord.cc:2540-2544 chain end).
-    pub sync: bool,
+    pub sync: i16,
     /// C `pmr->pp` — post-process this motion when the axis stops. Armed by
     /// the commanded stop while moving (motorRecord.cc:1892), jog/home
     /// arming (2025, 2110, 2125), jog stop (2152) and backlash arming
@@ -424,11 +527,9 @@ pub struct InternalFields {
     /// process the previous move") and consumed at completion. A Pause
     /// never sets it — that is what keeps a paused move's target alive in
     /// VAL/DVAL for the Go resume instead of syncing it back to readback.
-    pub pp: bool,
+    pub pp: i16,
     /// Backlash final move pending after MainMove completes
     pub backlash_pending: bool,
-    /// Pending retarget value (for NTM stop-and-replan)
-    pub pending_retarget: Option<f64>,
     /// A jog/home command that arrived while the axis was already moving.
     /// The record stops the current motion first and re-issues this once the
     /// driver reports done. Kept separate from the MIP JOGF/JOGR/HOMF/HOMR
@@ -437,14 +538,6 @@ pub struct InternalFields {
     pub queued_motion: Option<QueuedMotion>,
     /// Remember jog direction for backlash (cleared by stop_jog)
     pub jog_was_forward: bool,
-    /// True after the initial DMOV 1→0 notification has been sent.
-    /// Reset when DMOV returns to 1.
-    pub dmov_notified: bool,
-    /// Set when a same-direction retarget (ExtendMove) occurred during a
-    /// motion. On completion, evaluate_position_error verifies that the
-    /// driver actually followed the retarget and, if not, replans once
-    /// independent of retry settings. Cleared after the check.
-    pub verify_retarget_on_completion: bool,
     /// Set once `init_record` pass 1 has reconciled the load-time
     /// invariants: raw limits (RHLM/RLLM derived from the loaded DHLM/DLLM
     /// at the final MRES) and the rev↔EGU speed pairs (S/VELO, SBAS/VBAS,
@@ -489,20 +582,4 @@ pub struct InternalFields {
     /// GET_INFO (C 2546 gates on `proc_ind == NOTHING_DONE`). Set by
     /// `determine_event`, consumed at `do_process_inner` entry.
     pub idle_status_pass: bool,
-    /// One-pass mark: `process_motor_info` recomputed DIFF/RDIF this
-    /// cycle — the C `MARK(M_DIFF)` / `MARK(M_RDIF)` of
-    /// `process_motor_info` (motorRecord.cc:3764-3767), set on every
-    /// `CALLBACK_DATA` pass. C `monitor()` (3522-3531) then posts both
-    /// with `monitor_mask | DBE_VAL_LOG` regardless of whether the value
-    /// changed, so a `camonitor DIFF/RDIF` on a settled axis parked at a
-    /// constant non-zero following error gets an event every poll. Read by
-    /// `force_posted_fields`; reset at the top of each `process()`.
-    pub diff_rdif_marked: bool,
-    /// Driver commands a put queued at special() time (C sends them
-    /// from special() before the pp pass runs do_work: pidcof
-    /// 3003-3026, set_user/dial_*limit 4076-4328). Every motor put is
-    /// followed by a process pass; `do_process` drains this buffer in
-    /// front of the pass's own commands, preserving C's emission
-    /// order.
-    pub special_cmds: Vec<crate::flags::MotorCommand>,
 }

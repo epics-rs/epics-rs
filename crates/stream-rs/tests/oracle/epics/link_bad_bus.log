@@ -1,0 +1,18 @@
+-	drvStreamInit()
+-	StreamProtocolParser::path = /home/stevek/work/_tgt/monitor/trial/crates/stream-rs/tests/oracle/epics
+_main_	streamInitRecord(rec): SEVR=0
+_main_	streamInitRecord(rec): create new Stream object
+_main_	streamInitRecord(rec): calling initRecord
+_main_	Stream::initRecord rec: parse link string "l.proto p Q"
+_main_	Stream::initRecord rec: filename="l.proto" protocol="p" bus="Q" addr=0 params=""
+_main_	Stream::initRecord rec: attachBus("Q", 0, "")
+_main_	Cannot find a bus named 'Q' for 'rec'
+_main_	rec: Can't attach to bus Q 0
+_main_	rec: Record initialization failed
+_main_	streamInitRecord(rec) done status=0x1f70012
+VAL 0 = 0x0
+SEVR "INVALID"
+STAT "UDF"
+UDF 0 = 0x0
+PACT 0 = 0x0
+PROC 1 = 0x1

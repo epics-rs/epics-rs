@@ -1,0 +1,2 @@
+Terminator = CR LF;
+p { out "a\_b" 0x02 "c"; }

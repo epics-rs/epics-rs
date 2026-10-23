@@ -12,7 +12,7 @@ use ad_core_rs::plugin::channel::NDArrayOutput;
 /// create a SimDetector. All records use standard asyn DTYPs handled by
 /// the universal asyn device support factory.
 pub fn register(ioc: &mut ad_plugins_rs::ioc::AdIoc) {
-    epics_base_rs::runtime::env::set_default("ADSIMDETECTOR", env!("CARGO_MANIFEST_DIR"));
+    epics_base_rs::runtime::env::set_default_path("ADSIMDETECTOR", env!("CARGO_MANIFEST_DIR"));
 
     let driver_runtime: Arc<std::sync::Mutex<Option<SimDetectorRuntime>>> =
         Arc::new(std::sync::Mutex::new(None));
@@ -22,30 +22,45 @@ pub fn register(ioc: &mut ad_plugins_rs::ioc::AdIoc) {
         let rt = driver_runtime.clone();
         ioc.register_startup_command(CommandDef::new(
             "simDetectorConfig",
+            // simDetector.cpp:1171-1187. maxBuffers is accepted and unused, as
+            // C's NDArrayPool takes only maxMemory (asynNDArrayDriver.cpp:881);
+            // priority and stackSize only matter to an ASYN_CANBLOCK port,
+            // which simDetector is not.
             vec![
                 ArgDesc { name: "portName", arg_type: ArgType::String },
-                ArgDesc { name: "sizeX", arg_type: ArgType::Int },
-                ArgDesc { name: "sizeY", arg_type: ArgType::Int },
+                ArgDesc { name: "maxSizeX", arg_type: ArgType::Int },
+                ArgDesc { name: "maxSizeY", arg_type: ArgType::Int },
+                ArgDesc { name: "dataType", arg_type: ArgType::Int },
+                ArgDesc { name: "maxBuffers", arg_type: ArgType::Int },
                 ArgDesc { name: "maxMemory", arg_type: ArgType::Int },
+                ArgDesc { name: "priority", arg_type: ArgType::Int },
+                ArgDesc { name: "stackSize", arg_type: ArgType::Int },
             ],
-            "simDetectorConfig portName [sizeX] [sizeY] [maxMemory]",
-            move |args: &[ArgValue], _ctx: &CommandContext| {
+            "simDetectorConfig portName maxSizeX maxSizeY dataType maxBuffers maxMemory priority stackSize",
+            move |args: &[ArgValue], ctx: &CommandContext| {
                 let port_name = match &args[0] {
-                    ArgValue::String(s) => s.clone(),
+                    ArgValue::String(s) => s.to_str()?.to_owned(),
                     _ => return Err("portName required".into()),
                 };
-                let size_x = match args.get(1) { Some(ArgValue::Int(n)) => *n as i32, _ => 256 };
-                let size_y = match args.get(2) { Some(ArgValue::Int(n)) => *n as i32, _ => 256 };
-                let max_memory = match args.get(3) { Some(ArgValue::Int(n)) => *n as usize, _ => 50_000_000 };
+                // An absent iocsh int is 0; C floors a negative maxMemory to 0
+                // (unlimited, :1163-1165).
+                let int = |i: usize| match args.get(i) {
+                    Some(ArgValue::Int(n)) => *n,
+                    _ => 0,
+                };
+                let (size_x, size_y, data_type) = (int(1) as i32, int(2) as i32, int(3) as i32);
+                let max_memory = int(5).max(0) as usize;
 
-                println!("simDetectorConfig: port={port_name}, size={size_x}x{size_y}, maxMemory={max_memory}");
-
-                let runtime = create_sim_detector(&port_name, size_x, size_y, max_memory, NDArrayOutput::new())
+                // ADDriver is an asynPortDriver: the name is registered before
+                // the detector or its acquisition task exist.
+                let claim = asyn_rs::manager::claim_port_driver(&port_name).map_err(|e| e.to_string())?;
+                let runtime = create_sim_detector(&claim, size_x, size_y, data_type, max_memory, NDArrayOutput::new())
                     .map_err(|e| format!("failed to create SimDetector: {e}"))?;
 
                 let port_handle = runtime.port_handle().clone();
 
-                asyn_rs::asyn_record::register_port(&port_name, port_handle)
+                claim
+                    .publish(port_handle, ctx.db().scan_control().interrupt_gate())
                     .map_err(|e| e.to_string())?;
 
                 mgr.set_driver(Arc::new(GenericDriverContext::new(

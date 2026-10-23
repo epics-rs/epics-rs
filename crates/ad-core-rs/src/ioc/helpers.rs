@@ -1,6 +1,8 @@
 use epics_base_rs::server::iocsh::registry::*;
 use epics_ca_rs::server::ioc_app::IocApplication;
 
+use crate::plugin::runtime::{ArraySource, PluginThreads, plugin_threads};
+
 /// Standard C-compatible arg descriptors for plugin configure commands.
 ///
 /// Matches: `(portName, queueSize, blockingCallbacks, NDArrayPort, NDArrayAddr, maxBuffers, maxMemory, priority, stackSize, maxThreads)`
@@ -47,6 +49,30 @@ pub fn plugin_arg_defs() -> Vec<ArgDesc> {
             arg_type: ArgType::Int,
         },
     ]
+}
+
+/// The first `nargs` of [`plugin_arg_defs`], for the commands whose C
+/// `iocshFuncDef` stops early: 9 for `NDProcessConfigure`,
+/// `NDPosPluginConfigure` and `NDScatterConfigure` (no `maxThreads`), 7 for
+/// `NDCircularBuffConfigure` (NDPluginCircularBuff.cpp:484).
+pub fn plugin_arg_defs_to(nargs: usize) -> Vec<ArgDesc> {
+    let mut defs = plugin_arg_defs();
+    defs.truncate(nargs);
+    defs
+}
+
+/// Arg descriptors for the `NDFile*Configure` commands, whose C signature
+/// takes `priority, stackSize` straight after `NDArrayAddr`
+/// (NDFileTIFF.cpp:651-660).
+pub fn file_arg_defs() -> Vec<ArgDesc> {
+    let mut defs = plugin_arg_defs_to(5);
+    for name in ["priority", "stackSize"] {
+        defs.push(ArgDesc {
+            name,
+            arg_type: ArgType::Int,
+        });
+    }
+    defs
 }
 
 /// Arg descriptors for the two plugin `*Configure` commands whose C signature
@@ -124,23 +150,49 @@ pub fn attr_arg_defs() -> Vec<ArgDesc> {
     ]
 }
 
-/// Extract port_name, queue_size, and ndarray_port from C-compatible plugin args.
+/// The `NDPluginDriver` constructor arguments a plugin `*Configure` line
+/// leads with.
+pub struct PluginArgs {
+    pub port_name: String,
+    /// As written: the runtime applies C's floor (NDPluginDriver.cpp:989-995).
+    pub queue_size: i32,
+    /// Handed to the plugin's constructor, which starts its threads only
+    /// when this is 0 (NDPluginDriver.cpp:164-166).
+    pub blocking_callbacks: i32,
+    pub source: ArraySource,
+}
+
+/// Extract the [`PluginArgs`] of C-compatible plugin args.
 ///
 /// C format: `(portName, queueSize, blockingCallbacks, NDArrayPort, NDArrayAddr, ...)`
-pub fn extract_plugin_args(args: &[ArgValue]) -> Result<(String, usize, String), String> {
+pub fn extract_plugin_args(args: &[ArgValue]) -> Result<PluginArgs, String> {
     let port_name = match &args[0] {
-        ArgValue::String(s) => s.clone(),
+        ArgValue::String(s) => s.to_str()?.to_owned(),
         _ => return Err("portName required".into()),
     };
+    // An absent iocsh int argument is 0.
     let queue_size = match args.get(1) {
-        Some(ArgValue::Int(n)) => *n as usize,
-        _ => 20,
+        Some(ArgValue::Int(n)) => *n as i32,
+        _ => 0,
     };
-    let ndarray_port = match args.get(3) {
-        Some(ArgValue::String(s)) => s.clone(),
+    let blocking_callbacks = match args.get(2) {
+        Some(ArgValue::Int(n)) => *n as i32,
+        _ => 0,
+    };
+    let port = match args.get(3) {
+        Some(ArgValue::String(s)) => s.to_str()?.to_owned(),
         _ => String::new(),
     };
-    Ok((port_name, queue_size, ndarray_port))
+    let addr = match args.get(4) {
+        Some(ArgValue::Int(n)) => *n as i32,
+        _ => 0,
+    };
+    Ok(PluginArgs {
+        port_name,
+        queue_size,
+        blocking_callbacks,
+        source: ArraySource { port, addr },
+    })
 }
 
 /// The `maxThreads` argument of a plugin `*Configure` command, as written.
@@ -148,9 +200,8 @@ pub fn extract_plugin_args(args: &[ArgValue]) -> Result<(String, usize, String),
 /// C's `NDPluginDriver` constructor floors it — `if (maxThreads < 1)
 /// maxThreads = 1` (NDPluginDriver.cpp:117) — and an absent iocsh int
 /// argument is 0, so 0 is the "operator said nothing" value on both sides.
-/// The floor is deliberately not applied here: the plugin's `MAX_THREADS`
-/// owner clamps every write, and duplicating the clamp gives two sites that
-/// can disagree about the ceiling the plugin is actually running on.
+/// The floor is [`PluginThreads::with_max_threads`]'s alone, so the threads a
+/// plugin reports are the ones it runs with.
 ///
 /// `index` is the argument's position in *that command's* C signature, which
 /// is not uniform. Most carry it at 9; the two whose signature inserts an
@@ -165,6 +216,18 @@ pub fn max_threads_arg(args: &[ArgValue], index: usize) -> i32 {
         Some(ArgValue::Int(n)) => *n as i32,
         _ => 0,
     }
+}
+
+/// The `priority` and `stackSize` a plugin `*Configure` command carries,
+/// through [`plugin_threads`]. `stack_index` is `stackSize`'s position; every
+/// ADCore `*Configure` signature puts `priority` just before it. An absent
+/// iocsh int argument is 0.
+pub fn threads_arg(args: &[ArgValue], stack_index: usize) -> PluginThreads {
+    let int = |index| match args.get(index) {
+        Some(ArgValue::Int(n)) => *n,
+        _ => 0,
+    };
+    plugin_threads(int(stack_index - 1), int(stack_index))
 }
 
 /// The count a plugin `*Configure` command carries — `maxOverlays` at 5
@@ -184,6 +247,18 @@ pub fn count_arg(args: &[ArgValue], index: usize) -> usize {
     }
 }
 
+/// The `maxMemory` argument of a plugin `*Configure` command at `index`, the
+/// limit of the pool C builds the plugin (asynNDArrayDriver.cpp:881).
+///
+/// iocsh reads it as an `int` that C converts to `size_t`, so -1 is as
+/// unlimited as an absent argument's 0.
+pub fn max_memory_arg(args: &[ArgValue], index: usize) -> usize {
+    match args.get(index) {
+        Some(ArgValue::Int(n)) => *n as i32 as isize as usize,
+        _ => 0,
+    }
+}
+
 /// Auto-derive DTYP name from port name: `"ROI1"` → `"asynROI1"`.
 pub fn dtyp_from_port(port_name: &str) -> String {
     format!("asyn{port_name}")
@@ -199,35 +274,20 @@ pub fn dtyp_from_port(port_name: &str) -> String {
 /// `create_monitor_set`, `create_triggered_set`) are no longer registered here.
 /// They are handled by `AutosaveStartupConfig::register_startup_commands()`.
 pub fn register_noop_commands(mut app: IocApplication) -> IocApplication {
-    for cmd in &["startPVAServer", "callbackSetQueueSize"] {
-        let name = *cmd;
-        app = app.register_startup_command(CommandDef::new(
-            name,
-            vec![
-                ArgDesc {
-                    name: "arg1",
-                    arg_type: ArgType::String,
-                },
-                ArgDesc {
-                    name: "arg2",
-                    arg_type: ArgType::String,
-                },
-            ],
-            format!("{name} [args...] - no-op (not implemented)"),
-            move |_args: &[ArgValue], _ctx: &CommandContext| {
-                // B16: callbackSetQueueSize sizes the asyn callback queue in C.
-                // The Rust plugin model uses a per-plugin bounded channel sized
-                // at plugin construction, so this is a genuine no-op — warn so
-                // a cmd file tuning it is not silently ineffective.
-                if name == "callbackSetQueueSize" {
-                    eprintln!(
-                        "warning: callbackSetQueueSize is a no-op in epics-rs; \
-                         plugin queue size is set per-plugin at construction"
-                    );
-                }
-                Ok(CommandOutcome::Continue)
+    app = app.register_startup_command(CommandDef::new(
+        "startPVAServer",
+        vec![
+            ArgDesc {
+                name: "arg1",
+                arg_type: ArgType::String,
             },
-        ));
-    }
+            ArgDesc {
+                name: "arg2",
+                arg_type: ArgType::String,
+            },
+        ],
+        "startPVAServer [args...] - no-op (not implemented)",
+        |_args: &[ArgValue], _ctx: &CommandContext| Ok(CommandOutcome::Continue),
+    ));
     app
 }

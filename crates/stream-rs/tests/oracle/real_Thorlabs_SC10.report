@@ -1,0 +1,320 @@
+rec0: Thorlabs_SC10.proto getID(1,2,3,4,5,6,7,8,9) P
+getID {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 500; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "id?";
+    in "id?\x0d%s";
+}
+rec1: Thorlabs_SC10.proto setEnable(1,2,3,4,5,6,7,8,9) P
+setEnable {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 500; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "ens";
+    in "ens";
+}
+rec2: Thorlabs_SC10.proto getEnable(1,2,3,4,5,6,7,8,9) P
+getEnable {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 500; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "ens?";
+    in "ens?\x0d%{0|1}";
+}
+rec3: Thorlabs_SC10.proto setTrig(1,2,3,4,5,6,7,8,9) P
+setTrig {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 500; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "trig=%{0|1}";
+    in "trig=%{0|1}";
+}
+rec4: Thorlabs_SC10.proto getTrig(1,2,3,4,5,6,7,8,9) P
+getTrig {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 500; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "trig?";
+    in "trig?\x0d%{0|1}";
+}
+rec5: Thorlabs_SC10.proto setXTO(1,2,3,4,5,6,7,8,9) P
+setXTO {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 500; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "xto=%{0|1}";
+    in "xto=%{0|1}";
+}
+rec6: Thorlabs_SC10.proto getXTO(1,2,3,4,5,6,7,8,9) P
+getXTO {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 500; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "xto?";
+    in "xto?\x0d%{0|1}";
+}
+rec7: Thorlabs_SC10.proto getClosed(1,2,3,4,5,6,7,8,9) P
+getClosed {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 500; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "closed?";
+    in "closed?\x0d%{0|1}";
+}
+rec8: Thorlabs_SC10.proto getInterlock(1,2,3,4,5,6,7,8,9) P
+getInterlock {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 500; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "interlock?";
+    in "interlock?\x0d%{0|1}";
+}
+rec9: Thorlabs_SC10.proto setMode(1,2,3,4,5,6,7,8,9) P
+setMode {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 500; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "mode=%i";
+    in "mode=%i";
+}
+rec10: Thorlabs_SC10.proto getMode(1,2,3,4,5,6,7,8,9) P
+getMode {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 500; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "mode?";
+    in "mode?\x0d%i";
+}
+rec11: Thorlabs_SC10.proto setRep(1,2,3,4,5,6,7,8,9) P
+setRep {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 500; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "rep=%i";
+    in "rep=%i";
+}
+rec12: Thorlabs_SC10.proto getRep(1,2,3,4,5,6,7,8,9) P
+getRep {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 500; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "rep?";
+    in "rep?\x0d%i";
+}
+rec13: Thorlabs_SC10.proto setOpen(1,2,3,4,5,6,7,8,9) P
+setOpen {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 500; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "open=%i";
+    in "open=%i";
+}
+rec14: Thorlabs_SC10.proto getOpen(1,2,3,4,5,6,7,8,9) P
+getOpen {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 500; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "open?";
+    in "open?\x0d%i";
+}
+rec15: Thorlabs_SC10.proto setShut(1,2,3,4,5,6,7,8,9) P
+setShut {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 500; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "shut=%i";
+    in "shut=%i";
+}
+rec16: Thorlabs_SC10.proto getShut(1,2,3,4,5,6,7,8,9) P
+getShut {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 500; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "shut?";
+    in "shut?\x0d%i";
+}
+rec17: Thorlabs_SC10.proto saveComm(1,2,3,4,5,6,7,8,9) P
+saveComm {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 500; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "save";
+    in "save";
+}
+rec18: Thorlabs_SC10.proto saveProg(1,2,3,4,5,6,7,8,9) P
+saveProg {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 500; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "savp";
+    in "savp";
+}
+rec19: Thorlabs_SC10.proto restoreProg(1,2,3,4,5,6,7,8,9) P
+restoreProg {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 500; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "resp";
+    in "resp";
+}

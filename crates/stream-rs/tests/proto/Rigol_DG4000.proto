@@ -1,0 +1,62 @@
+# Rigol_DG4000.proto
+
+# StreamDevice protocol file for Rigol DG4000 Arbitrary Waveform Generator
+# Most of the protocols are generic to many commands, but a few are for specific commands.
+
+# Mark Rivers
+# March 8, 2025
+
+ReplyTimeout = 1000;
+WriteTimeout = 1000;
+# Many records have PINI=YES, so there can be many operations in the queue
+# Set 3 seconds LockTimeout to prevent queue timeout
+LockTimeout = 3000;
+
+getLongString {
+   out "\$1?";
+   in  "%#s";
+}
+
+getString {
+   out "\$1?";
+   in  "%s";
+   ExtraInput = Ignore;
+}
+
+setString {
+   out "\$1 %s";
+}
+
+getInt {
+   out "\$1?";
+   in  "%d";
+}
+
+setInt {
+   out "\$1 %d";
+}
+
+getFloat {
+   out "\$1?";
+   in  "%f";
+}
+
+setFloat {
+   out "\$1 %f";
+}
+
+setNone {
+   out "\$1";
+}
+
+setWaveform1 {
+   separator=",";
+   out ":OUTP1:STAT ON";
+   out ":TRAC:DATA VOLATILE, (%f)";
+}
+
+setWaveform2 {
+   separator=",";
+   out ":OUTP2:STAT ON";
+   out ":TRAC:DATA VOLATILE, (%f)";
+}

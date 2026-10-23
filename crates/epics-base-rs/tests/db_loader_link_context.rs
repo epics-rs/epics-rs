@@ -12,7 +12,7 @@
 //! not disambiguate two boards by their OUT link.
 //!
 //! The two halves of the invariant are pinned separately below, because they are
-//! deliberately distinct: `common.out` is the link *text* (always populated),
+//! deliberately distinct: `common.text.out` is the link *text* (always populated),
 //! while `parsed_out` is the *framework's* dispatch of that link (armed only for
 //! a record type that does not declare the field, so a record driving its own
 //! link is not driven twice per cycle).
@@ -24,7 +24,7 @@ use epics_base_rs::error::CaResult;
 use epics_base_rs::server::device_support::DeviceSupport;
 use epics_base_rs::server::ioc_app::DeviceSupportContext;
 use epics_base_rs::server::ioc_builder::IocBuilder;
-use epics_base_rs::server::record::{FieldDesc, ParsedLink, Record};
+use epics_base_rs::server::record::{DbLinkType, DevSup, Dset, FieldDesc, ParsedLink, Record};
 use epics_base_rs::types::{DbFieldType, EpicsValue};
 
 /// Stand-in for a C-faithful custom record type: it declares `OUT` in its own
@@ -81,11 +81,23 @@ impl DeviceSupport for NoopDevice {
 
 const OUT_LINK: &str = "#C0 S0 @scaler1";
 
+/// `device(ownsOut, <link_type>, devOwnsOut, "ownsOutDev")`, typed for the
+/// OUT each case writes so `dbInitRecordLinks` keeps it.
+const fn owns_out_row(link_type: DbLinkType) -> DevSup {
+    DevSup {
+        name: "devOwnsOut",
+        choice: "ownsOutDev",
+        link_type,
+        dset: Dset::new(6, &[3], false),
+    }
+}
+
 /// The db file's `OUT` value must reach the dynamic device-support factory.
 /// Before the fix `ctx.out` was `""` and a factory keying on the link (C
 /// `scaler_init_record`) could not tell two boards apart.
 #[epics_macros_rs::epics_test]
 async fn record_owned_out_link_reaches_device_support_context() {
+    static ROW: DevSup = owns_out_row(DbLinkType::VmeIo);
     let seen: Arc<Mutex<Vec<(String, String, String)>>> = Arc::new(Mutex::new(Vec::new()));
     let captured = Arc::clone(&seen);
 
@@ -100,14 +112,17 @@ record(ownsOut, "SCALER:1") {{
 
     let (database, _) = IocBuilder::new()
         .register_record_type("ownsOut", || Box::new(OwnsOutRecord::default()))
-        .register_dynamic_device_support(move |ctx: &DeviceSupportContext| {
-            captured.lock().unwrap().push((
-                ctx.dtyp.to_string(),
-                ctx.inp.to_string(),
-                ctx.out.to_string(),
-            ));
-            Some(Box::new(NoopDevice) as Box<dyn DeviceSupport>)
-        })
+        .register_dynamic_device_support(
+            &[("ownsOut", std::slice::from_ref(&ROW))],
+            move |ctx: &DeviceSupportContext| {
+                captured.lock().unwrap().push((
+                    ctx.dtyp.to_string(),
+                    ctx.inp.to_string(),
+                    ctx.out.to_string(),
+                ));
+                Some(Box::new(NoopDevice) as Box<dyn DeviceSupport>)
+            },
+        )
         .db_string(&db, &HashMap::new())
         .unwrap()
         .build()
@@ -132,7 +147,7 @@ record(ownsOut, "SCALER:1") {{
         instance.record.get_field("OUT"),
         Some(EpicsValue::String(OUT_LINK.into()))
     );
-    assert_eq!(instance.common.out, OUT_LINK);
+    assert_eq!(instance.common.text.out, OUT_LINK);
 }
 
 /// The other half of the invariant: mirroring the link *text* must not arm the
@@ -142,6 +157,7 @@ record(ownsOut, "SCALER:1") {{
 /// device support) would write that link twice per process cycle.
 #[epics_macros_rs::epics_test]
 async fn record_owned_out_link_does_not_arm_framework_dispatch() {
+    static ROW: DevSup = owns_out_row(DbLinkType::Constant);
     let db = r#"
 record(ownsOut, "SCALER:2") {
     field(DTYP, "ownsOutDev")
@@ -151,9 +167,10 @@ record(ownsOut, "SCALER:2") {
 
     let (database, _) = IocBuilder::new()
         .register_record_type("ownsOut", || Box::new(OwnsOutRecord::default()))
-        .register_dynamic_device_support(|_ctx: &DeviceSupportContext| {
-            Some(Box::new(NoopDevice) as Box<dyn DeviceSupport>)
-        })
+        .register_dynamic_device_support(
+            &[("ownsOut", std::slice::from_ref(&ROW))],
+            |_ctx: &DeviceSupportContext| Some(Box::new(NoopDevice) as Box<dyn DeviceSupport>),
+        )
         .db_string(db, &HashMap::new())
         .unwrap()
         .build()
@@ -164,12 +181,12 @@ record(ownsOut, "SCALER:2") {
     let instance = instance.read();
 
     // Link text: populated, so device support sees it.
-    assert_eq!(instance.common.out, "TARGET:PV PP");
+    assert_eq!(instance.common.text.out, "TARGET:PV PP");
     // Framework dispatch: unarmed, because the record type owns the field.
     assert!(
-        matches!(instance.parsed_out, ParsedLink::None),
+        matches!(instance.parsed_out.link(), ParsedLink::None),
         "framework OUT dispatch must stay unarmed for a record that owns OUT, \
          got {:?}",
-        instance.parsed_out
+        instance.parsed_out.link()
     );
 }

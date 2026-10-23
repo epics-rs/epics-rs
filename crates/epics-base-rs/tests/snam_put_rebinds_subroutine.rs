@@ -32,26 +32,26 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use epics_base_rs::server::database::PvDatabase;
-use epics_base_rs::server::record::{Record, SubroutineFn};
+use epics_base_rs::server::record::{Record, Subroutine};
 use epics_base_rs::server::records::asub_record::ASubRecord;
 use epics_base_rs::server::records::sub_record::SubRecord;
 use epics_base_rs::types::EpicsValue;
 
 /// An aSub subroutine that stamps `marker` into VALA, so VALA names which
 /// routine actually ran.
-fn stamps(marker: f64) -> Arc<SubroutineFn> {
-    Arc::new(Box::new(move |rec: &mut dyn Record| {
+fn stamps(marker: f64) -> Arc<Subroutine> {
+    Arc::new(Subroutine::Plain(Box::new(move |rec: &mut dyn Record| {
         rec.put_field("VALA", EpicsValue::Double(marker))?;
         Ok(0_i64)
-    }) as SubroutineFn)
+    })))
 }
 
 /// A `sub` subroutine that writes `marker` into VAL.
-fn writes_val(marker: f64) -> Arc<SubroutineFn> {
-    Arc::new(Box::new(move |rec: &mut dyn Record| {
+fn writes_val(marker: f64) -> Arc<Subroutine> {
+    Arc::new(Subroutine::Plain(Box::new(move |rec: &mut dyn Record| {
         rec.put_field("VAL", EpicsValue::Double(marker))?;
         Ok(0_i64)
-    }) as SubroutineFn)
+    })))
 }
 
 async fn process(db: &PvDatabase, name: &str) {
@@ -72,7 +72,7 @@ async fn field(db: &PvDatabase, rec: &str, f: &str) -> Option<EpicsValue> {
 #[epics_macros_rs::epics_test]
 async fn asub_snam_put_swaps_the_running_subroutine() {
     let db = PvDatabase::new();
-    let mut registry: HashMap<String, Arc<SubroutineFn>> = HashMap::new();
+    let mut registry: HashMap<String, Arc<Subroutine>> = HashMap::new();
     registry.insert("fnA".into(), stamps(1.0));
     registry.insert("fnB".into(), stamps(2.0));
     db.install_subroutine_registry(registry.clone()).await;
@@ -113,7 +113,7 @@ async fn asub_snam_put_swaps_the_running_subroutine() {
 #[epics_macros_rs::epics_test]
 async fn asub_empty_snam_put_unbinds_the_subroutine() {
     let db = PvDatabase::new();
-    let mut registry: HashMap<String, Arc<SubroutineFn>> = HashMap::new();
+    let mut registry: HashMap<String, Arc<Subroutine>> = HashMap::new();
     registry.insert("fnA".into(), stamps(1.0));
     db.install_subroutine_registry(registry.clone()).await;
 
@@ -155,7 +155,7 @@ async fn asub_empty_snam_put_unbinds_the_subroutine() {
 #[epics_macros_rs::epics_test]
 async fn sub_empty_snam_put_parks_and_keeps_the_binding() {
     let db = PvDatabase::new();
-    let mut registry: HashMap<String, Arc<SubroutineFn>> = HashMap::new();
+    let mut registry: HashMap<String, Arc<Subroutine>> = HashMap::new();
     registry.insert("fnA".into(), writes_val(1.0));
     db.install_subroutine_registry(registry.clone()).await;
 
@@ -210,7 +210,7 @@ async fn sub_empty_snam_put_parks_and_keeps_the_binding() {
 #[epics_macros_rs::epics_test]
 async fn asub_rejected_snam_put_still_unbinds_and_still_stores() {
     let db = PvDatabase::new();
-    let mut registry: HashMap<String, Arc<SubroutineFn>> = HashMap::new();
+    let mut registry: HashMap<String, Arc<Subroutine>> = HashMap::new();
     registry.insert("fnA".into(), stamps(1.0));
     db.install_subroutine_registry(registry.clone()).await;
 
@@ -251,7 +251,7 @@ async fn asub_rejected_snam_put_still_unbinds_and_still_stores() {
 #[epics_macros_rs::epics_test]
 async fn sub_snam_put_swaps_the_running_subroutine() {
     let db = PvDatabase::new();
-    let mut registry: HashMap<String, Arc<SubroutineFn>> = HashMap::new();
+    let mut registry: HashMap<String, Arc<Subroutine>> = HashMap::new();
     registry.insert("fnA".into(), writes_val(1.0));
     registry.insert("fnB".into(), writes_val(2.0));
     db.install_subroutine_registry(registry.clone()).await;
@@ -285,7 +285,7 @@ async fn sub_snam_put_swaps_the_running_subroutine() {
 #[epics_macros_rs::epics_test]
 async fn internal_put_of_an_unregistered_snam_is_refused_and_unbinds() {
     let db = PvDatabase::new();
-    let mut registry: HashMap<String, Arc<SubroutineFn>> = HashMap::new();
+    let mut registry: HashMap<String, Arc<Subroutine>> = HashMap::new();
     registry.insert("fnA".into(), stamps(1.0));
     db.install_subroutine_registry(registry.clone()).await;
 
@@ -325,7 +325,7 @@ async fn internal_put_of_an_unregistered_snam_is_refused_and_unbinds() {
 #[epics_macros_rs::epics_test]
 async fn posting_internal_put_of_an_unregistered_snam_is_refused_and_unbinds() {
     let db = PvDatabase::new();
-    let mut registry: HashMap<String, Arc<SubroutineFn>> = HashMap::new();
+    let mut registry: HashMap<String, Arc<Subroutine>> = HashMap::new();
     registry.insert("fnA".into(), writes_val(1.0));
     db.install_subroutine_registry(registry.clone()).await;
 
@@ -361,7 +361,7 @@ async fn posting_internal_put_of_an_unregistered_snam_is_refused_and_unbinds() {
 #[epics_macros_rs::epics_test]
 async fn internal_put_of_a_registered_snam_swaps_the_routine() {
     let db = PvDatabase::new();
-    let mut registry: HashMap<String, Arc<SubroutineFn>> = HashMap::new();
+    let mut registry: HashMap<String, Arc<Subroutine>> = HashMap::new();
     registry.insert("fnA".into(), stamps(1.0));
     registry.insert("fnB".into(), stamps(2.0));
     db.install_subroutine_registry(registry.clone()).await;
@@ -392,7 +392,7 @@ async fn snam_resolves_the_stored_name_not_the_one_the_caller_sent() {
     let stored_name: String = long_name.chars().take(39).collect();
 
     let db = PvDatabase::new();
-    let mut registry: HashMap<String, Arc<SubroutineFn>> = HashMap::new();
+    let mut registry: HashMap<String, Arc<Subroutine>> = HashMap::new();
     registry.insert("seed".into(), writes_val(1.0));
     registry.insert(stored_name.clone(), writes_val(7.0));
     db.install_subroutine_registry(registry.clone()).await;

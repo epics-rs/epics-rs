@@ -159,7 +159,7 @@ async fn blocking_rtems_server_serves_real_ca_client_end_to_end() {
     //     subscription circuit's event-task thread delivers it → the client
     //     monitor receives it. All server-side steps run on park_on std::threads.
     let ch = client.create_channel("E2E:AO");
-    ch.wait_connected(budget::FACT_BUDGET)
+    ch.wait_connected(fact_budget::FACT_BUDGET)
         .await
         .expect("channel connects to the blocking server");
     let mut monitor = ch.subscribe().await.expect("subscribe");
@@ -218,6 +218,3 @@ async fn blocking_rtems_server_serves_real_ca_client_end_to_end() {
         .expect("udp thread joins")
         .expect("udp responder exits cleanly");
 }
-
-#[path = "common/budget.rs"]
-mod budget;

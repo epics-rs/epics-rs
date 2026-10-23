@@ -1,5 +1,6 @@
 # ao record template for poll delay
 record(bo,"$(P)$(R)") {
     field(DTYP,"asynInt32")
+    field(DESC, "$(DESC=)")
     field(OUT,"@asyn($(PORT))MODBUS_READ")
 }

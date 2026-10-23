@@ -42,8 +42,8 @@
 //! The port raised SIMM first for every record, so a broken SIOL on an mca
 //! published `STAT = SIMM_ALARM` where C publishes `STAT = LINK_ALARM` with
 //! `AMSG = "field SIOL"` — the operator lost the only indication that the
-//! simulation source itself was gone. `Record::raises_simm_after_read` is the
-//! per-record declaration of that order; `mca` overrides it to `true`.
+//! simulation source itself was gone. mca's `readValue` link half
+//! (`read_value_links`) raises it after the read.
 //!
 //! C read against `mca` at `687d563` and `epics-base` at `8f5015b66`.
 //! Boundaries: {mca, longin} x {SIMS INVALID, SIMS NO_ALARM} x {broken SIOL,
@@ -58,11 +58,12 @@
 // itself, which the backend does not remove.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
-use epics_base_rs::server::database::{PvDatabase, RecordLoad};
-use epics_base_rs::server::db_loader::{apply_fields, create_record, parse_db};
+use epics_base_rs::server::database::PvDatabase;
+use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::recgbl::alarm_status;
-use epics_base_rs::server::record::AlarmSeverity;
+use epics_base_rs::server::record::{AlarmSeverity, DbLinkType, DevSup, Dset};
 use epics_base_rs::types::EpicsValue;
 
 /// `SIMS = INVALID` (3) on both record types, with a SIOL naming a record no
@@ -111,25 +112,49 @@ record(mca, "MCA:OK") {
 }
 "#;
 
-async fn load(db: &PvDatabase, text: &str) {
-    mca_rs::register_mca_record_type();
-    for def in parse_db(text, &HashMap::new()).unwrap() {
-        let mut rec = create_record(&def.record_type).unwrap();
-        let mut common = Vec::new();
-        apply_fields(&mut rec, &def.fields, &mut common).unwrap();
-        db.add_loaded_record(&def.name, rec, RecordLoad::from_common_fields(common))
-            .await
-            .unwrap();
-    }
+/// `mcaSupport.dbd`'s `device(mca,CONSTANT,devMCA_soft,"Soft Channel")`.
+static SOFT_MCA: DevSup = DevSup {
+    name: "devMCA_soft",
+    choice: "Soft Channel",
+    link_type: DbLinkType::Constant,
+    dset: Dset::new(6, &[2, 4, 5], false),
+};
+
+async fn build(text: &str) -> Arc<PvDatabase> {
+    let (name, factory) = mca_rs::mca_record_factory();
+    let (db, _) = IocBuilder::new()
+        .register_record_type(name, factory)
+        .register_device_support("mca", &SOFT_MCA, || Box::new(mca_rs::SoftMca))
+        .db_string(text, &HashMap::new())
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    db.ioc_init().await;
+    db
 }
 
-/// Put SIMM = YES and process once.
+/// A read pass, the only one that reaches `readValue` (`mcaRecord.c:1097`).
+async fn read(db: &PvDatabase, name: &str) {
+    db.put_record_field_from_ca_no_notify(name, "READ", EpicsValue::Short(1))
+        .await
+        .unwrap();
+}
+
+/// Put SIMM = YES and run a pass that reads: an mca's `READ`, a longin's
+/// process.
 async fn simulate(db: &PvDatabase, name: &str) {
     db.put_pv(&format!("{name}.SIMM"), EpicsValue::Short(1))
         .await
         .unwrap();
+    if name.starts_with("MCA") {
+        return read(db, name).await;
+    }
     let mut v = epics_base_rs::server::database::ProcStack::new();
-    db.process_record_with_links(name, &mut v).await.unwrap();
+    db.process_record_with_links(name, &mut v)
+        .await
+        .or_else(epics_base_rs::error::CaError::unless_process_status)
+        .unwrap();
 }
 
 fn alarm_of(db: &PvDatabase, name: &str) -> (u16, AlarmSeverity, String) {
@@ -138,7 +163,7 @@ fn alarm_of(db: &PvDatabase, name: &str) -> (u16, AlarmSeverity, String) {
     (
         inst.common.stat,
         inst.common.sevr,
-        inst.common.amsg.as_str().to_owned(),
+        String::from(&inst.common.amsg),
     )
 }
 
@@ -147,8 +172,7 @@ fn alarm_of(db: &PvDatabase, name: &str) -> (u16, AlarmSeverity, String) {
 /// the equal INVALID severity loses the strict-greater tie.
 #[tokio::test]
 async fn a_broken_siol_on_an_mca_publishes_link_alarm_not_simm() {
-    let db = PvDatabase::new();
-    load(&db, DB_BROKEN_SIOL).await;
+    let db = build(DB_BROKEN_SIOL).await;
 
     simulate(&db, "MCA:BROKEN").await;
 
@@ -170,8 +194,7 @@ async fn a_broken_siol_on_an_mca_publishes_link_alarm_not_simm() {
 /// were applied to every record this assertion flips.
 #[tokio::test]
 async fn a_broken_siol_on_a_longin_still_publishes_simm_alarm() {
-    let db = PvDatabase::new();
-    load(&db, DB_BROKEN_SIOL).await;
+    let db = build(DB_BROKEN_SIOL).await;
 
     simulate(&db, "LI:BROKEN").await;
 
@@ -189,8 +212,7 @@ async fn a_broken_siol_on_a_longin_still_publishes_simm_alarm() {
 /// report the broken link.
 #[tokio::test]
 async fn without_sims_both_orders_report_the_broken_link() {
-    let db = PvDatabase::new();
-    load(&db, DB_NO_SIMS).await;
+    let db = build(DB_NO_SIMS).await;
 
     simulate(&db, "MCA:NOSIMS").await;
     simulate(&db, "LI:NOSIMS").await;
@@ -212,8 +234,7 @@ async fn without_sims_both_orders_report_the_broken_link() {
 /// must not have dropped it.
 #[tokio::test]
 async fn a_working_siol_on_an_mca_still_raises_simm_alarm() {
-    let db = PvDatabase::new();
-    load(&db, DB_WORKING_SIOL).await;
+    let db = build(DB_WORKING_SIOL).await;
     db.put_pv(
         "SIM:OK:SPEC",
         EpicsValue::LongArray(vec![1, 2, 3, 4, 5, 6, 7, 8].into()),

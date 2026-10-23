@@ -1,0 +1,33 @@
+# Parser features, compiled by C and rs alike (see ok_features in cases.txt).
+Terminator = CR LF;
+greeting = "hello" " world";
+ReplyTimeout = 2000;
+
+sub { out "S" $greeting; wait 100; }
+reference { sub; in "%d"; }
+nested { reference; out "N"; }
+params {
+    out "$1:$2" "\$3";
+    in "${1}x%s";
+    @init { reference; }
+    @mismatch { out "mismatch $1"; }
+}
+escapes { out "\x41\101\e\a\b\f\n\r\t\v\\\"\'" 0x42 66 0102 '\x43' -1 255; }
+constants { out STX "a" ETX EOT CR LF ESC DEL; in "x" skip "y" ? "z"; }
+percent { out "%% 100%%"; in "%*d %?d %=s %#x %-5f %!3c"; }
+fields { out "%(VAL)s %(X.VAL)d %(X.RVAL)i"; in "%(VAL)[a-z]"; }
+spaces { in "a b  c" "\_"; out " lead"; }
+locals {
+    ExtraInput = Ignore;
+    ReadTimeout = 50;
+    MaxInput = 10;
+    LockTimeout = 0x100;
+    Separator = ",";
+    InTerminator = "";
+    OutTerminator = NL;
+    out "%d";
+    disconnect;
+    connect 1000;
+    exec "echo %s";
+}
+binary { out "%B\x00\xff %<sum8> %{a|b=c} %T(%Y)"; in "%[^,]%<xor>"; }

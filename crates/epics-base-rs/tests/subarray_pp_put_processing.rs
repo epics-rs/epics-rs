@@ -45,7 +45,7 @@ async fn field(
     rec: &str,
     f: &str,
 ) -> Option<EpicsValue> {
-    db.get_pv(&format!("{rec}.{f}")).ok()
+    db.get_pv(format!("{rec}.{f}")).ok()
 }
 
 /// C, `caput SA:CONST.NELM 2` on `INP="[1,2,3,4]" MALM=8 INDX=0`:

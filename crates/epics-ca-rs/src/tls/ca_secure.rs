@@ -76,7 +76,7 @@ impl TlsMode {
     /// Resolve from `EPICS_CAS_TLS_MODE`. Unrecognized values fall
     /// back to `RustOnly` with a warning.
     pub fn from_env() -> Self {
-        match epics_base_rs::runtime::env::get("EPICS_CAS_TLS_MODE")
+        match epics_base_rs::runtime::env::get_lossy("EPICS_CAS_TLS_MODE")
             .as_deref()
             .map(|s| s.to_ascii_lowercase())
             .as_deref()

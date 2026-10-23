@@ -1,5 +1,6 @@
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 
+use crate::types::PvString;
 use epics_macros_rs::EpicsRecord;
 
 /// Choice labels for the `seq` select-mechanism menu, in index order.
@@ -105,12 +106,26 @@ pub(crate) fn set_seq_dly_limit(value: f64) {
     constant_init = "SELL:SELN,DOL0:DO0,DOL1:DO1,DOL2:DO2,DOL3:DO3,DOL4:DO4,\
                      DOL5:DO5,DOL6:DO6,DOL7:DO7,DOL8:DO8,DOL9:DO9,DOLA:DOA,\
                      DOLB:DOB,DOLC:DOC,DOLD:DOD,DOLE:DOE,DOLF:DOF",
+    // DOLn is read at `DBR_DOUBLE` (`seqRecord.c:259`) and SELL at
+    // `DBR_USHORT` (`:152`), so a source those requests cannot convert is a
+    // failed read.
+    link_read_as(
+        DOL0 = Double, DOL1 = Double, DOL2 = Double, DOL3 = Double,
+        DOL4 = Double, DOL5 = Double, DOL6 = Double, DOL7 = Double,
+        DOL8 = Double, DOL9 = Double, DOLA = Double, DOLB = Double,
+        DOLC = Double, DOLD = Double, DOLE = Double, DOLF = Double,
+        SELL = UShort,
+    ),
     init = seq_init_record,
+    take_cycle_posted_fields = seq_monitor_posts,
+    fields_posted_only_when_marked = SEQ_CLAIMED,
+    process_posted_fields = SEQ_POSTED_SET,
     // seq's VAL is a `pp(TRUE)` "trigger" — C `process()` posts VAL only with
     // alarm events (`if (events) db_post_events(&prec->val, events)`,
     // seqRecord.c:227-229), never DBE_VALUE/DBE_LOG. So a run of `caput VAL`
     // posts no per-put value monitor (only the connect-time snapshot).
-    no_value_monitor
+    no_value_monitor,
+    spill(PREC)
 )]
 pub struct SeqRecord {
     // VAL is `field(VAL,DBF_LONG){ pp(TRUE) }` (seqRecord.dbd:21-25) — the "Used
@@ -139,8 +154,8 @@ pub struct SeqRecord {
     // SELN is `DBF_USHORT` (seqRecord.dbd.pod:271): unsigned 0..65535.
     #[field(type = "UShort")]
     pub seln: u16,
-    #[field(type = "String")]
-    pub sell: String,
+    #[field(type = "PvStr", link)]
+    pub sell: PvString,
     #[field(type = "Short")]
     pub offs: i16,
     #[field(type = "Short")]
@@ -177,38 +192,38 @@ pub struct SeqRecord {
     pub dlye: f64,
     #[field(type = "Double")]
     pub dlyf: f64,
-    #[field(type = "String")]
-    pub dol0: String,
-    #[field(type = "String")]
-    pub dol1: String,
-    #[field(type = "String")]
-    pub dol2: String,
-    #[field(type = "String")]
-    pub dol3: String,
-    #[field(type = "String")]
-    pub dol4: String,
-    #[field(type = "String")]
-    pub dol5: String,
-    #[field(type = "String")]
-    pub dol6: String,
-    #[field(type = "String")]
-    pub dol7: String,
-    #[field(type = "String")]
-    pub dol8: String,
-    #[field(type = "String")]
-    pub dol9: String,
-    #[field(type = "String")]
-    pub dola: String,
-    #[field(type = "String")]
-    pub dolb: String,
-    #[field(type = "String")]
-    pub dolc: String,
-    #[field(type = "String")]
-    pub dold: String,
-    #[field(type = "String")]
-    pub dole: String,
-    #[field(type = "String")]
-    pub dolf: String,
+    #[field(type = "PvStr", link)]
+    pub dol0: PvString,
+    #[field(type = "PvStr", link)]
+    pub dol1: PvString,
+    #[field(type = "PvStr", link)]
+    pub dol2: PvString,
+    #[field(type = "PvStr", link)]
+    pub dol3: PvString,
+    #[field(type = "PvStr", link)]
+    pub dol4: PvString,
+    #[field(type = "PvStr", link)]
+    pub dol5: PvString,
+    #[field(type = "PvStr", link)]
+    pub dol6: PvString,
+    #[field(type = "PvStr", link)]
+    pub dol7: PvString,
+    #[field(type = "PvStr", link)]
+    pub dol8: PvString,
+    #[field(type = "PvStr", link)]
+    pub dol9: PvString,
+    #[field(type = "PvStr", link)]
+    pub dola: PvString,
+    #[field(type = "PvStr", link)]
+    pub dolb: PvString,
+    #[field(type = "PvStr", link)]
+    pub dolc: PvString,
+    #[field(type = "PvStr", link)]
+    pub dold: PvString,
+    #[field(type = "PvStr", link)]
+    pub dole: PvString,
+    #[field(type = "PvStr", link)]
+    pub dolf: PvString,
     #[field(type = "Double")]
     pub do0: f64,
     #[field(type = "Double")]
@@ -241,38 +256,38 @@ pub struct SeqRecord {
     pub doe: f64,
     #[field(type = "Double")]
     pub dof: f64,
-    #[field(type = "String")]
-    pub lnk0: String,
-    #[field(type = "String")]
-    pub lnk1: String,
-    #[field(type = "String")]
-    pub lnk2: String,
-    #[field(type = "String")]
-    pub lnk3: String,
-    #[field(type = "String")]
-    pub lnk4: String,
-    #[field(type = "String")]
-    pub lnk5: String,
-    #[field(type = "String")]
-    pub lnk6: String,
-    #[field(type = "String")]
-    pub lnk7: String,
-    #[field(type = "String")]
-    pub lnk8: String,
-    #[field(type = "String")]
-    pub lnk9: String,
-    #[field(type = "String")]
-    pub lnka: String,
-    #[field(type = "String")]
-    pub lnkb: String,
-    #[field(type = "String")]
-    pub lnkc: String,
-    #[field(type = "String")]
-    pub lnkd: String,
-    #[field(type = "String")]
-    pub lnke: String,
-    #[field(type = "String")]
-    pub lnkf: String,
+    #[field(type = "PvStr", link)]
+    pub lnk0: PvString,
+    #[field(type = "PvStr", link)]
+    pub lnk1: PvString,
+    #[field(type = "PvStr", link)]
+    pub lnk2: PvString,
+    #[field(type = "PvStr", link)]
+    pub lnk3: PvString,
+    #[field(type = "PvStr", link)]
+    pub lnk4: PvString,
+    #[field(type = "PvStr", link)]
+    pub lnk5: PvString,
+    #[field(type = "PvStr", link)]
+    pub lnk6: PvString,
+    #[field(type = "PvStr", link)]
+    pub lnk7: PvString,
+    #[field(type = "PvStr", link)]
+    pub lnk8: PvString,
+    #[field(type = "PvStr", link)]
+    pub lnk9: PvString,
+    #[field(type = "PvStr", link)]
+    pub lnka: PvString,
+    #[field(type = "PvStr", link)]
+    pub lnkb: PvString,
+    #[field(type = "PvStr", link)]
+    pub lnkc: PvString,
+    #[field(type = "PvStr", link)]
+    pub lnkd: PvString,
+    #[field(type = "PvStr", link)]
+    pub lnke: PvString,
+    #[field(type = "PvStr", link)]
+    pub lnkf: PvString,
 }
 
 /// `seqRecord.c:279-280` `get_dol` — within each of the 16 `linkGrp`s the
@@ -299,7 +314,7 @@ impl Default for SeqRecord {
             // an unset SELN defaults to 1, not 0. Only observable when the
             // .db omits SELN and SELM is Specified/Mask (All ignores SELN).
             seln: 1,
-            sell: String::new(),
+            sell: PvString::new(),
             offs: 0,
             // C `seqRecord.dbd.pod:287` `field(SHFT,DBF_SHORT){ initial("-1") }`:
             // unset SHFT defaults to -1, so SELM=Mask shifts SELN bits LEFT by
@@ -324,22 +339,22 @@ impl Default for SeqRecord {
             dlyd: 0.0,
             dlye: 0.0,
             dlyf: 0.0,
-            dol0: String::new(),
-            dol1: String::new(),
-            dol2: String::new(),
-            dol3: String::new(),
-            dol4: String::new(),
-            dol5: String::new(),
-            dol6: String::new(),
-            dol7: String::new(),
-            dol8: String::new(),
-            dol9: String::new(),
-            dola: String::new(),
-            dolb: String::new(),
-            dolc: String::new(),
-            dold: String::new(),
-            dole: String::new(),
-            dolf: String::new(),
+            dol0: PvString::new(),
+            dol1: PvString::new(),
+            dol2: PvString::new(),
+            dol3: PvString::new(),
+            dol4: PvString::new(),
+            dol5: PvString::new(),
+            dol6: PvString::new(),
+            dol7: PvString::new(),
+            dol8: PvString::new(),
+            dol9: PvString::new(),
+            dola: PvString::new(),
+            dolb: PvString::new(),
+            dolc: PvString::new(),
+            dold: PvString::new(),
+            dole: PvString::new(),
+            dolf: PvString::new(),
             do0: 0.0,
             do1: 0.0,
             do2: 0.0,
@@ -356,22 +371,22 @@ impl Default for SeqRecord {
             dod: 0.0,
             doe: 0.0,
             dof: 0.0,
-            lnk0: String::new(),
-            lnk1: String::new(),
-            lnk2: String::new(),
-            lnk3: String::new(),
-            lnk4: String::new(),
-            lnk5: String::new(),
-            lnk6: String::new(),
-            lnk7: String::new(),
-            lnk8: String::new(),
-            lnk9: String::new(),
-            lnka: String::new(),
-            lnkb: String::new(),
-            lnkc: String::new(),
-            lnkd: String::new(),
-            lnke: String::new(),
-            lnkf: String::new(),
+            lnk0: PvString::new(),
+            lnk1: PvString::new(),
+            lnk2: PvString::new(),
+            lnk3: PvString::new(),
+            lnk4: PvString::new(),
+            lnk5: PvString::new(),
+            lnk6: PvString::new(),
+            lnk7: PvString::new(),
+            lnk8: PvString::new(),
+            lnk9: PvString::new(),
+            lnka: PvString::new(),
+            lnkb: PvString::new(),
+            lnkc: PvString::new(),
+            lnkd: PvString::new(),
+            lnke: PvString::new(),
+            lnkf: PvString::new(),
         }
     }
 }
@@ -382,6 +397,40 @@ impl SeqRecord {
     }
 }
 
+/// VAL, posted with alarm events alone, SELN, posted by `asyncFinish`, and
+/// DO0..DOF, posted by `processCallback` (`seqRecord.c:227-232`, `:266-268`):
+/// all a cycle posts.
+const SEQ_POSTED: [&str; 18] = [
+    "VAL", "SELN", "DO0", "DO1", "DO2", "DO3", "DO4", "DO5", "DO6", "DO7", "DO8", "DO9", "DOA",
+    "DOB", "DOC", "DOD", "DOE", "DOF",
+];
+
+static SEQ_POSTED_SET: [crate::server::record::FieldIx; 18] = crate::server::record::declared_set(
+    crate::server::record::dbd_generated::SEQ_FIELDS,
+    SEQ_POSTED,
+);
+
+/// SELN and DO0..DOF, each decided against the record's own copy.
+const SEQ_CLAIMED: &[&str] = SEQ_POSTED.split_at(1).1;
+
+/// C `asyncFinish`'s SELN post (`seqRecord.c:230-232`): `if (prec->seln !=
+/// prec->oldn)` post it with `events | DBE_VALUE | DBE_LOG`, then `oldn = seln`.
+/// Taken once per cycle at its close, which is where `asyncFinish` runs.
+fn seq_monitor_posts(rec: &mut SeqRecord) -> crate::server::record::CycleMarks {
+    use crate::server::record::{CycleMarks, CyclePostMask};
+    const POSTS_NAMED: [(&str, CyclePostMask); 1] = [("SELN", CyclePostMask::MonitorValueLog)];
+    let moved = rec.seln != rec.oldn;
+    rec.oldn = rec.seln;
+    static POSTS: [(
+        crate::server::record::FieldIx,
+        crate::server::record::CyclePostMask,
+    ); 1] = crate::server::record::declared_post_table(
+        crate::server::record::dbd_generated::SEQ_FIELDS,
+        POSTS_NAMED,
+    );
+    CycleMarks::of(&POSTS, u128::from(moved))
+}
+
 /// C `seqRecord.c:init_record` — `Record::init_record` for `seq`, wired through
 /// `#[record(init = seq_init_record)]`.
 ///
@@ -390,11 +439,9 @@ impl SeqRecord {
 /// `prec->oldn = prec->seln` (`seqRecord.c:121,128`) so the first `process`
 /// posts a SELN monitor only on a real change. The SELL constant seed itself
 /// is this framework's constant-link owner's job (`SELL:SELN` in
-/// `constant_init`), which runs after the init passes; OLDN therefore tracks
-/// the default/`.db` SELN here. A non-empty CONSTANT `field(SELL,…)` — the one
-/// case where C seeds SELN inside `init_record` before this copy — is the sole
-/// configuration where OLDN would differ, and is not exercised by the soft
-/// database surface.
+/// `constant_init`), which runs after the init passes and ends by dropping
+/// the init-time marks through [`seq_monitor_posts`], which copies the seeded
+/// SELN into OLDN as C's order does.
 fn seq_init_record(rec: &mut SeqRecord, pass: u8) -> crate::error::CaResult<()> {
     if pass == 1 {
         rec.oldn = rec.seln;
@@ -416,7 +463,7 @@ mod tests {
         let rec = SeqRecord::default();
         assert_eq!(rec.shft, -1);
         // SELM=Mask(2), SELN=1, default SHFT=-1 → mask = 1<<1 = 0b10 → slot 1.
-        let sel = select_link_indices_ex(SelmKind::FanoutSeq, 2, 1, rec.offs, rec.shft, 16);
-        assert_eq!(sel.indices, vec![1]);
+        let sel = select_link_indices_ex(SelmKind::FanoutSeq, 2, 1, rec.offs, rec.shft);
+        assert_eq!(sel.indices().collect::<Vec<_>>(), vec![1]);
     }
 }

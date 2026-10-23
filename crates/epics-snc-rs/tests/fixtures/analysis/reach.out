@@ -1,0 +1,21 @@
+$ snc reach.st
+reach.st:4: error: state change statement not allowed here
+reach.st:10: error: state change statement not allowed here
+reach.st:9: warning: state 'c' in state set 's1' cannot be reached from start state
+reach.st:10: warning: state 'd' in state set 's1' cannot be reached from start state
+reach.st:11: warning: state 'e' in state set 's1' cannot be reached from start state
+reach.st:12: warning: state 'f' in state set 's1' cannot be reached from start state
+reach.st:13: warning: state 'g' in state set 's1' cannot be reached from start state
+reach.st:14: warning: state 'h' in state set 's1' cannot be reached from start state
+$ snc +W reach.st
+reach.st:4: error: state change statement not allowed here
+reach.st:10: error: state change statement not allowed here
+reach.st:9: warning: state 'c' in state set 's1' cannot be reached from start state
+reach.st:10: warning: state 'd' in state set 's1' cannot be reached from start state
+reach.st:11: warning: state 'e' in state set 's1' cannot be reached from start state
+reach.st:12: warning: state 'f' in state set 's1' cannot be reached from start state
+reach.st:13: warning: state 'g' in state set 's1' cannot be reached from start state
+reach.st:14: warning: state 'h' in state set 's1' cannot be reached from start state
+$ snc -w reach.st
+reach.st:4: error: state change statement not allowed here
+reach.st:10: error: state change statement not allowed here

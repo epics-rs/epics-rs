@@ -1,0 +1,220 @@
+rec0: Alicat_PCD.proto getUnits(1,2,3,4,5,6,7,8,9) P
+getUnits {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "1 DCU 6";
+    in "1 %d";
+}
+rec1: Alicat_PCD.proto setUnits(1,2,3,4,5,6,7,8,9) P
+setUnits {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+  @Init {
+    out "1 DCU 6";
+    in "1 %d";
+  }
+
+    out "1 DCU 6 %d";
+    in "1";
+}
+rec2: Alicat_PCD.proto getRamp(1,2,3,4,5,6,7,8,9) P
+getRamp {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "1 SR";
+    in "1%f";
+}
+rec3: Alicat_PCD.proto setRamp(1,2,3,4,5,6,7,8,9) P
+setRamp {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+  @Init {
+    out "1 SR";
+    in "1%f";
+  }
+
+    out "1 SR %f 4";
+}
+rec4: Alicat_PCD.proto getPressure(1,2,3,4,5,6,7,8,9) P
+getPressure {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "1";
+    in "1 %f %(2)f%(3)40c";
+}
+rec5: Alicat_PCD.proto getMaxPressure(1,2,3,4,5,6,7,8,9) P
+getMaxPressure {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "1 LR";
+    in "1 38 %*f %f";
+}
+rec6: Alicat_PCD.proto setMaxPressure(1,2,3,4,5,6,7,8,9) P
+setMaxPressure {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+  @Init {
+    out "1 LR";
+    in "1 38 %*f %f";
+  }
+
+    out "1 LR 38 0 0 %f";
+    in "1 38 %*f %*f";
+}
+rec7: Alicat_PCD.proto setSetpoint(1,2,3,4,5,6,7,8,9) P
+setSetpoint {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+  @Init {
+    out "1";
+    in "1 %*f %f";
+  }
+
+    out "1 LS %f";
+}
+rec8: Alicat_PCD.proto setPause(1,2,3,4,5,6,7,8,9) P
+setPause {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "1 HC";
+}
+rec9: Alicat_PCD.proto setRun(1,2,3,4,5,6,7,8,9) P
+setRun {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "1 C";
+}
+rec10: Alicat_PCD.proto setVent(1,2,3,4,5,6,7,8,9) P
+setVent {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "1 E";
+    in "1";
+}
+rec11: Alicat_PCD.proto getValves(1,2,3,4,5,6,7,8,9) P
+getValves {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "1 VD";
+    in "1 %f %(2)f";
+}
+rec12: Alicat_PCD.proto getFirmware(1,2,3,4,5,6,7,8,9) P
+getFirmware {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "1VE";
+    in "%*6c%80c";
+}

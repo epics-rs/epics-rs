@@ -1,6 +1,10 @@
-use asyn_rs::error::AsynResult;
+use std::sync::Arc;
+
+use asyn_rs::error::{AsynError, AsynResult};
 use asyn_rs::param::ParamType;
 use asyn_rs::port::PortDriverBase;
+
+use crate::driver::ndarray_driver::ArrayOwner;
 
 /// Parameters for asynNDArrayDriver base (file I/O, pool stats, array info, attributes).
 #[derive(Clone, Copy)]
@@ -91,65 +95,77 @@ pub struct NDArrayDriverParams {
 }
 
 impl NDArrayDriverParams {
-    pub fn create(base: &mut PortDriverBase) -> AsynResult<Self> {
+    /// Create the parameters with what C's `asynNDArrayDriver` constructor
+    /// attaches to them, for drivers and plugins alike (NDPluginDriver.h:57):
+    /// the `ADAcquireBusy` store rules and the `NDNumQueuedArrays` updater,
+    /// both reading the returned counter.
+    pub fn create(base: &mut PortDriverBase) -> AsynResult<(Self, Arc<ArrayOwner>)> {
+        let params = Self::create_params(base)?;
+        let owner = ArrayOwner::new();
+        owner.bind_port(base);
+        crate::driver::ndarray_driver::acquire_busy_rules(base, &params, owner.queued());
+        crate::driver::ndarray_driver::write_octet_rules(base, &params, owner.attributes());
+        Ok((params, owner))
+    }
+
+    /// The `NDArraySizeX/Y/Z` reasons of a port that already created these
+    /// params. Only ROI, ROIStat and Transform set them in C; a plugin port
+    /// otherwise keeps the constructor's 0 (asynNDArrayDriver.cpp:967-970).
+    pub fn array_size_reasons(base: &PortDriverBase) -> AsynResult<[usize; 3]> {
+        let find = |name: &str| {
+            base.find_param(name)
+                .ok_or_else(|| AsynError::ParamNotFound(name.to_string()))
+        };
+        Ok([
+            find("ARRAY_SIZE_X")?,
+            find("ARRAY_SIZE_Y")?,
+            find("ARRAY_SIZE_Z")?,
+        ])
+    }
+
+    fn create_params(base: &mut PortDriverBase) -> AsynResult<Self> {
         Ok(Self {
-            // Detector info
+            // C createParam order (asynNDArrayDriver.cpp:889-952), which asynReport
+            // prints as each parameter's index.
             port_name_self: base.create_param("PORT_NAME_SELF", ParamType::Octet)?,
             ad_core_version: base.create_param("ADCORE_VERSION", ParamType::Octet)?,
             driver_version: base.create_param("DRIVER_VERSION", ParamType::Octet)?,
             manufacturer: base.create_param("MANUFACTURER", ParamType::Octet)?,
             model: base.create_param("MODEL", ParamType::Octet)?,
             serial_number: base.create_param("SERIAL_NUMBER", ParamType::Octet)?,
-            firmware_version: base.create_param("FIRMWARE_VERSION", ParamType::Octet)?,
             sdk_version: base.create_param("SDK_VERSION", ParamType::Octet)?,
-
-            // Array info
+            firmware_version: base.create_param("FIRMWARE_VERSION", ParamType::Octet)?,
+            acquire: base.create_param("ACQUIRE", ParamType::Int32)?,
+            acquire_busy: base.create_param("ACQUIRE_BUSY", ParamType::Int32)?,
+            wait_for_plugins: base.create_param("WAIT_FOR_PLUGINS", ParamType::Int32)?,
             array_size_x: base.create_param("ARRAY_SIZE_X", ParamType::Int32)?,
             array_size_y: base.create_param("ARRAY_SIZE_Y", ParamType::Int32)?,
             array_size_z: base.create_param("ARRAY_SIZE_Z", ParamType::Int32)?,
             array_size: base.create_param("ARRAY_SIZE", ParamType::Int32)?,
-            array_counter: base.create_param("ARRAY_COUNTER", ParamType::Int32)?,
-            array_callbacks: base.create_param("ARRAY_CALLBACKS", ParamType::Int32)?,
             n_dimensions: base.create_param("ARRAY_NDIMENSIONS", ParamType::Int32)?,
+            // C creates it asynParamInt32 (asynNDArrayDriver.cpp:905), against
+            // its own header (asynNDArrayDriver.h:66, asynInt32Array) and its
+            // doCallbacksInt32Array (NDPluginDriver.cpp:246); not copied.
             array_dimensions: base.create_param("ARRAY_DIMENSIONS", ParamType::Int32Array)?,
             data_type: base.create_param("DATA_TYPE", ParamType::Int32)?,
             color_mode: base.create_param("COLOR_MODE", ParamType::Int32)?,
             unique_id: base.create_param("UNIQUE_ID", ParamType::Int32)?,
-            bayer_pattern: base.create_param("BAYER_PATTERN", ParamType::Int32)?,
-            codec: base.create_param("CODEC", ParamType::Octet)?,
-            compressed_size: base.create_param("COMPRESSED_SIZE", ParamType::Int32)?,
             timestamp_rbv: base.create_param("TIME_STAMP", ParamType::Float64)?,
             epics_ts_sec: base.create_param("EPICS_TS_SEC", ParamType::Int32)?,
             epics_ts_nsec: base.create_param("EPICS_TS_NSEC", ParamType::Int32)?,
-
-            // NDArray data
-            ndarray_data: base.create_param("ARRAY_DATA", ParamType::GenericPointer)?,
-
-            // Pool stats
-            pool_max_memory: base.create_param("POOL_MAX_MEMORY", ParamType::Float64)?,
-            pool_used_memory: base.create_param("POOL_USED_MEMORY", ParamType::Float64)?,
-            pool_alloc_buffers: base.create_param("POOL_ALLOC_BUFFERS", ParamType::Int32)?,
-            pool_free_buffers: base.create_param("POOL_FREE_BUFFERS", ParamType::Int32)?,
-            pool_max_buffers: base.create_param("POOL_MAX_BUFFERS", ParamType::Int32)?,
-            pool_pre_alloc: base.create_param("POOL_PRE_ALLOC_BUFFERS", ParamType::Int32)?,
-            pool_empty_free_list: base.create_param("POOL_EMPTY_FREELIST", ParamType::Int32)?,
-            pool_poll_stats: base.create_param("POOL_POLL_STATS", ParamType::Int32)?,
-            pool_num_pre_alloc_buffers: base
-                .create_param("POOL_NUM_PRE_ALLOC_BUFFERS", ParamType::Int32)?,
-
-            // File I/O extras
-            auto_save: base.create_param("AUTO_SAVE", ParamType::Int32)?,
-            file_format: base.create_param("FILE_FORMAT", ParamType::Int32)?,
-            free_capture: base.create_param("FREE_CAPTURE", ParamType::Int32)?,
-
-            // File I/O
+            bayer_pattern: base.create_param("BAYER_PATTERN", ParamType::Int32)?,
+            codec: base.create_param("CODEC", ParamType::Octet)?,
+            compressed_size: base.create_param("COMPRESSED_SIZE", ParamType::Int32)?,
+            array_counter: base.create_param("ARRAY_COUNTER", ParamType::Int32)?,
             file_path: base.create_param("FILE_PATH", ParamType::Octet)?,
+            file_path_exists: base.create_param("FILE_PATH_EXISTS", ParamType::Int32)?,
             file_name: base.create_param("FILE_NAME", ParamType::Octet)?,
             file_number: base.create_param("FILE_NUMBER", ParamType::Int32)?,
             file_template: base.create_param("FILE_TEMPLATE", ParamType::Octet)?,
             auto_increment: base.create_param("AUTO_INCREMENT", ParamType::Int32)?,
             full_file_name: base.create_param("FULL_FILE_NAME", ParamType::Octet)?,
-            file_path_exists: base.create_param("FILE_PATH_EXISTS", ParamType::Int32)?,
+            file_format: base.create_param("FILE_FORMAT", ParamType::Int32)?,
+            auto_save: base.create_param("AUTO_SAVE", ParamType::Int32)?,
             write_file: base.create_param("WRITE_FILE", ParamType::Int32)?,
             read_file: base.create_param("READ_FILE", ParamType::Int32)?,
             file_write_mode: base.create_param("WRITE_MODE", ParamType::Int32)?,
@@ -157,26 +173,28 @@ impl NDArrayDriverParams {
             file_write_message: base.create_param("WRITE_MESSAGE", ParamType::Octet)?,
             num_capture: base.create_param("NUM_CAPTURE", ParamType::Int32)?,
             num_captured: base.create_param("NUM_CAPTURED", ParamType::Int32)?,
+            free_capture: base.create_param("FREE_CAPTURE", ParamType::Int32)?,
             capture: base.create_param("CAPTURE", ParamType::Int32)?,
             delete_driver_file: base.create_param("DELETE_DRIVER_FILE", ParamType::Int32)?,
             lazy_open: base.create_param("FILE_LAZY_OPEN", ParamType::Int32)?,
             create_dir: base.create_param("CREATE_DIR", ParamType::Int32)?,
             temp_suffix: base.create_param("FILE_TEMP_SUFFIX", ParamType::Octet)?,
-
-            // Attributes
             attributes_file: base.create_param("ND_ATTRIBUTES_FILE", ParamType::Octet)?,
             attributes_status: base.create_param("ND_ATTRIBUTES_STATUS", ParamType::Int32)?,
             attributes_macros: base.create_param("ND_ATTRIBUTES_MACROS", ParamType::Octet)?,
-
-            // Queue
+            ndarray_data: base.create_param("ARRAY_DATA", ParamType::GenericPointer)?,
+            array_callbacks: base.create_param("ARRAY_CALLBACKS", ParamType::Int32)?,
+            pool_max_buffers: base.create_param("POOL_MAX_BUFFERS", ParamType::Int32)?,
+            pool_alloc_buffers: base.create_param("POOL_ALLOC_BUFFERS", ParamType::Int32)?,
+            pool_pre_alloc: base.create_param("POOL_PRE_ALLOC_BUFFERS", ParamType::Int32)?,
+            pool_num_pre_alloc_buffers: base
+                .create_param("POOL_NUM_PRE_ALLOC_BUFFERS", ParamType::Int32)?,
+            pool_free_buffers: base.create_param("POOL_FREE_BUFFERS", ParamType::Int32)?,
+            pool_max_memory: base.create_param("POOL_MAX_MEMORY", ParamType::Float64)?,
+            pool_used_memory: base.create_param("POOL_USED_MEMORY", ParamType::Float64)?,
+            pool_empty_free_list: base.create_param("POOL_EMPTY_FREELIST", ParamType::Int32)?,
+            pool_poll_stats: base.create_param("POOL_POLL_STATS", ParamType::Int32)?,
             num_queued_arrays: base.create_param("NUM_QUEUED_ARRAYS", ParamType::Int32)?,
-
-            // WaitForPlugins
-            wait_for_plugins: base.create_param("WAIT_FOR_PLUGINS", ParamType::Int32)?,
-
-            // Acquire (needed by plugins that use NDArrayDriverParams directly)
-            acquire: base.create_param("ACQUIRE", ParamType::Int32)?,
-            acquire_busy: base.create_param("ACQUIRE_BUSY", ParamType::Int32)?,
         })
     }
 }
@@ -184,12 +202,19 @@ impl NDArrayDriverParams {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use asyn_rs::port::InterfaceMask;
     use asyn_rs::port::PortFlags;
 
     #[test]
     fn test_create_ndarray_driver_params() {
-        let mut base = PortDriverBase::new("test", 1, PortFlags::default());
-        let params = NDArrayDriverParams::create(&mut base).unwrap();
+        let mut base = PortDriverBase::new(
+            "test",
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
+        );
+        let (params, _) = NDArrayDriverParams::create(&mut base).unwrap();
         assert!(base.find_param("ARRAY_COUNTER").is_some());
         assert!(base.find_param("FILE_PATH").is_some());
         assert!(base.find_param("POOL_MAX_MEMORY").is_some());
@@ -203,9 +228,98 @@ mod tests {
 
     #[test]
     fn test_ndarray_driver_param_count() {
-        let mut base = PortDriverBase::new("test", 1, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            "test",
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
+        );
         let _ = NDArrayDriverParams::create(&mut base).unwrap();
         // Should have created ~50 params
         assert!(base.params.len() >= 45);
+    }
+
+    /// C's createParam order (asynNDArrayDriver.cpp:889-952): the index
+    /// asynReport prints for each.
+    #[test]
+    fn params_are_created_in_c_order() {
+        let mut base = PortDriverBase::new(
+            "order",
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
+        );
+        let _ = NDArrayDriverParams::create(&mut base).unwrap();
+        let c = [
+            "PORT_NAME_SELF",
+            "ADCORE_VERSION",
+            "DRIVER_VERSION",
+            "MANUFACTURER",
+            "MODEL",
+            "SERIAL_NUMBER",
+            "SDK_VERSION",
+            "FIRMWARE_VERSION",
+            "ACQUIRE",
+            "ACQUIRE_BUSY",
+            "WAIT_FOR_PLUGINS",
+            "ARRAY_SIZE_X",
+            "ARRAY_SIZE_Y",
+            "ARRAY_SIZE_Z",
+            "ARRAY_SIZE",
+            "ARRAY_NDIMENSIONS",
+            "ARRAY_DIMENSIONS",
+            "DATA_TYPE",
+            "COLOR_MODE",
+            "UNIQUE_ID",
+            "TIME_STAMP",
+            "EPICS_TS_SEC",
+            "EPICS_TS_NSEC",
+            "BAYER_PATTERN",
+            "CODEC",
+            "COMPRESSED_SIZE",
+            "ARRAY_COUNTER",
+            "FILE_PATH",
+            "FILE_PATH_EXISTS",
+            "FILE_NAME",
+            "FILE_NUMBER",
+            "FILE_TEMPLATE",
+            "AUTO_INCREMENT",
+            "FULL_FILE_NAME",
+            "FILE_FORMAT",
+            "AUTO_SAVE",
+            "WRITE_FILE",
+            "READ_FILE",
+            "WRITE_MODE",
+            "WRITE_STATUS",
+            "WRITE_MESSAGE",
+            "NUM_CAPTURE",
+            "NUM_CAPTURED",
+            "FREE_CAPTURE",
+            "CAPTURE",
+            "DELETE_DRIVER_FILE",
+            "FILE_LAZY_OPEN",
+            "CREATE_DIR",
+            "FILE_TEMP_SUFFIX",
+            "ND_ATTRIBUTES_FILE",
+            "ND_ATTRIBUTES_STATUS",
+            "ND_ATTRIBUTES_MACROS",
+            "ARRAY_DATA",
+            "ARRAY_CALLBACKS",
+            "POOL_MAX_BUFFERS",
+            "POOL_ALLOC_BUFFERS",
+            "POOL_PRE_ALLOC_BUFFERS",
+            "POOL_NUM_PRE_ALLOC_BUFFERS",
+            "POOL_FREE_BUFFERS",
+            "POOL_MAX_MEMORY",
+            "POOL_USED_MEMORY",
+            "POOL_EMPTY_FREELIST",
+            "POOL_POLL_STATS",
+            "NUM_QUEUED_ARRAYS",
+        ];
+        for (index, name) in c.iter().enumerate() {
+            assert_eq!(base.find_param(name), Some(index), "{name}");
+        }
     }
 }

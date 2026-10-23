@@ -881,7 +881,10 @@ fn decode_structure_body_cached_at_depth(
             cur, order, cache, policy, depth,
         )?);
     }
-    Ok(FieldDesc::Structure { struct_id, fields })
+    Ok(FieldDesc::Structure {
+        struct_id,
+        fields: fields.into(),
+    })
 }
 
 // Union twin of [`decode_structure_body_cached_at_depth`] — decodes into
@@ -989,15 +992,9 @@ pub fn encode_pv_field(value: &PvField, desc: &FieldDesc, order: ByteOrder, out:
             }
         }
         (FieldDesc::Structure { fields, .. }, PvField::Structure(s)) => {
-            for (name, child_desc) in fields {
-                let child_val = s
-                    .get_field(name)
-                    .cloned()
-                    .unwrap_or_else(|| default_value_for(child_desc));
-                encode_pv_field(&child_val, child_desc, order, out);
-            }
+            encode_structure_fields(s, fields, order, out);
         }
-        (FieldDesc::StructureArray { struct_id, fields }, PvField::StructureArray(items)) => {
+        (FieldDesc::StructureArray { fields, .. }, PvField::StructureArray(items)) => {
             encode_size_into(items.len() as u32, order, out);
             // each element is preceded by a presence byte —
             // 0x00 for a null (absent) element, 0x01 followed by the
@@ -1009,16 +1006,12 @@ pub fn encode_pv_field(value: &PvField, desc: &FieldDesc, order: ByteOrder, out:
             // body carries no id of its own — synthesizing the descriptor
             // from the value's `struct_id` only masked a mismatch that
             // `value_matches_descriptor` now rejects on checked paths.
-            let element_desc = FieldDesc::Structure {
-                struct_id: struct_id.clone(),
-                fields: fields.clone(),
-            };
             for s in items {
                 match s {
                     None => out.put_u8(0x00),
                     Some(s) => {
                         out.put_u8(0x01);
-                        encode_pv_field(&PvField::Structure(s.clone()), &element_desc, order, out);
+                        encode_structure_fields(s, fields, order, out);
                     }
                 }
             }
@@ -1521,6 +1514,32 @@ pub fn changed_bitset_paths(desc: &FieldDesc, changed: &crate::proto::BitSet) ->
     out
 }
 
+/// `s`'s fields in `fields`' order, by reference; a field `s` lacks encodes
+/// as its descriptor default.
+fn encode_structure_fields(
+    s: &PvStructure,
+    fields: &[(String, FieldDesc)],
+    order: ByteOrder,
+    out: &mut Vec<u8>,
+) {
+    for (i, (name, child_desc)) in fields.iter().enumerate() {
+        match member_at(s, i, name) {
+            Some(v) => encode_pv_field(v, child_desc, order, out),
+            None => encode_pv_field(&default_value_for(child_desc), child_desc, order, out),
+        }
+    }
+}
+
+/// The member of `s` the descriptor names `name` at index `i`. A value
+/// built from its descriptor holds it at `i`; one assembled by hand in
+/// another order is still found by name.
+fn member_at<'a>(s: &'a PvStructure, i: usize, name: &str) -> Option<&'a PvField> {
+    match s.fields.get(i) {
+        Some((n, v)) if n == name => Some(v),
+        _ => s.get_field(name),
+    }
+}
+
 /// Encode the value bytes for `value` consulting `bitset` to know which
 /// fields to emit. Mirrors pvxs `to_wire_valid(buf, value)`.
 ///
@@ -1541,64 +1560,51 @@ pub fn encode_pv_field_with_bitset(
     order: ByteOrder,
     out: &mut Vec<u8>,
 ) {
-    fn any_descendant_set(
-        bitset: &crate::proto::BitSet,
-        pos: usize,
-        desc_local: &FieldDesc,
-    ) -> bool {
-        let total = desc_local.total_bits();
-        for i in 0..total {
-            if bitset.get(pos + i) {
-                return true;
-            }
-        }
-        false
+    if bitset.any_in(bit_offset..bit_offset + desc.total_bits()) {
+        encode_marked(value, desc, bitset, bit_offset, order, out);
     }
+}
 
-    match desc {
-        FieldDesc::Scalar(_)
-        | FieldDesc::ScalarArray(_)
-        | FieldDesc::Variant
-        | FieldDesc::VariantArray
-        | FieldDesc::Union { .. }
-        | FieldDesc::UnionArray { .. }
-        | FieldDesc::StructureArray { .. } => {
-            if bitset.get(bit_offset) {
-                encode_pv_field(value, desc, order, out);
-            }
-            // else: emit no bytes
+/// [`encode_pv_field_with_bitset`] for a subtree with some bit set. A member
+/// is looked up only once its own span tests set, as pvxs `to_wire_valid`
+/// touches storage only at valid bits.
+fn encode_marked(
+    value: &PvField,
+    desc: &FieldDesc,
+    bitset: &crate::proto::BitSet,
+    bit_offset: usize,
+    order: ByteOrder,
+    out: &mut Vec<u8>,
+) {
+    let FieldDesc::Structure { fields, .. } = desc else {
+        encode_pv_field(value, desc, order, out);
+        return;
+    };
+    // Own bit set → the whole subtree changed; emit every
+    // descendant leaf unconditionally (pvxs BitSet compression).
+    if bitset.get(bit_offset) {
+        encode_pv_field(value, desc, order, out);
+        return;
+    }
+    let mut child_bit = bit_offset + 1;
+    for (i, (name, child_desc)) in fields.iter().enumerate() {
+        let span = child_desc.total_bits();
+        if bitset.any_in(child_bit..child_bit + span) {
+            let missing;
+            let child_value = match value {
+                PvField::Structure(s) => member_at(s, i, name),
+                _ => None,
+            };
+            let child_value = match child_value {
+                Some(v) => v,
+                None => {
+                    missing = default_value_for(child_desc);
+                    &missing
+                }
+            };
+            encode_marked(child_value, child_desc, bitset, child_bit, order, out);
         }
-        FieldDesc::Structure { fields, .. } => {
-            // Own bit set → the whole subtree changed; emit every
-            // descendant leaf unconditionally (pvxs BitSet compression).
-            if bitset.get(bit_offset) {
-                encode_pv_field(value, desc, order, out);
-                return;
-            }
-            if !any_descendant_set(bitset, bit_offset, desc) {
-                return;
-            }
-            // Recurse into each child; emit only set ones.
-            let mut child_bit = bit_offset + 1;
-            for (name, child_desc) in fields {
-                let child_value = match value {
-                    PvField::Structure(s) => s
-                        .get_field(name)
-                        .cloned()
-                        .unwrap_or_else(|| default_value_for(child_desc)),
-                    _ => default_value_for(child_desc),
-                };
-                encode_pv_field_with_bitset(
-                    &child_value,
-                    child_desc,
-                    bitset,
-                    child_bit,
-                    order,
-                    out,
-                );
-                child_bit += child_desc.total_bits();
-            }
-        }
+        child_bit += span;
     }
 }
 
@@ -1619,22 +1625,6 @@ pub fn decode_pv_field_with_bitset(
     cur: &mut Cursor<&[u8]>,
     order: ByteOrder,
 ) -> Result<PvField, DecodeError> {
-    // Helper: true iff the bit at `pos` is set, OR any descendant of
-    // a structure starting at `pos` (with `desc_local`) is set.
-    fn any_descendant_set(
-        bitset: &crate::proto::BitSet,
-        pos: usize,
-        desc_local: &FieldDesc,
-    ) -> bool {
-        let total = desc_local.total_bits();
-        for i in 0..total {
-            if bitset.get(pos + i) {
-                return true;
-            }
-        }
-        false
-    }
-
     // The bit at `bit_offset` represents this descriptor itself.
     // For Structure, recurse into children. For scalar/leaf, decode iff
     // the bit is set.
@@ -1662,7 +1652,7 @@ pub fn decode_pv_field_with_bitset(
             }
             // The struct is "present" only if some descendant bit is
             // set. If none, return a default-filled structure.
-            if !any_descendant_set(bitset, bit_offset, desc) {
+            if !bitset.any_in(bit_offset..bit_offset + desc.total_bits()) {
                 return Ok(default_value_for(desc));
             }
             let mut s = PvStructure::new(struct_id);
@@ -1689,20 +1679,6 @@ pub fn decode_pv_field_with_bitset_cached(
     order: ByteOrder,
     cache: &mut TypeCache,
 ) -> Result<PvField, DecodeError> {
-    fn any_descendant_set(
-        bitset: &crate::proto::BitSet,
-        pos: usize,
-        desc_local: &FieldDesc,
-    ) -> bool {
-        let total = desc_local.total_bits();
-        for i in 0..total {
-            if bitset.get(pos + i) {
-                return true;
-            }
-        }
-        false
-    }
-
     match desc {
         FieldDesc::Scalar(_)
         | FieldDesc::ScalarArray(_)
@@ -1721,7 +1697,7 @@ pub fn decode_pv_field_with_bitset_cached(
             if bitset.get(bit_offset) {
                 return decode_pv_field_cached(desc, cur, order, cache);
             }
-            if !any_descendant_set(bitset, bit_offset, desc) {
+            if !bitset.any_in(bit_offset..bit_offset + desc.total_bits()) {
                 return Ok(default_value_for(desc));
             }
             let mut s = PvStructure::new(struct_id);
@@ -1763,20 +1739,6 @@ pub fn decode_pv_field_with_bitset_into(
     order: ByteOrder,
     cache: &mut TypeCache,
 ) -> Result<(), DecodeError> {
-    fn any_descendant_set(
-        bitset: &crate::proto::BitSet,
-        pos: usize,
-        desc_local: &FieldDesc,
-    ) -> bool {
-        let total = desc_local.total_bits();
-        for i in 0..total {
-            if bitset.get(pos + i) {
-                return true;
-            }
-        }
-        false
-    }
-
     match desc {
         FieldDesc::Scalar(_)
         | FieldDesc::ScalarArray(_)
@@ -1795,7 +1757,7 @@ pub fn decode_pv_field_with_bitset_into(
                 *dst = decode_pv_field_cached(desc, cur, order, cache)?;
                 return Ok(());
             }
-            if !any_descendant_set(bitset, bit_offset, desc) {
+            if !bitset.any_in(bit_offset..bit_offset + desc.total_bits()) {
                 return Ok(());
             }
             match dst {
@@ -1903,7 +1865,7 @@ impl<'a> ValueCow<'a> {
 /// Flatten 0xFD/0xFE markers embedded in `any` payloads of a bitset-gated
 /// value of type `desc`, starting at `value_start` in `src`. `bitset` is the
 /// changed-field set (pvData §5.4 numbering, root = bit 0). Used for
-/// GET/PUT/MONITOR/PUT_GET DATA values.
+/// GET/PUT/MONITOR DATA values.
 ///
 /// Returns the cursor position at the end of the value and, when a marker
 /// was actually rewritten, the replacement bytes for `src[value_start..end]`.
@@ -2651,6 +2613,35 @@ mod tests {
     use super::*;
     use crate::pvdata::{UnionItem, VariantValue};
 
+    /// Members stored in another order than the descriptor's still encode
+    /// by name, through both the full and the bitset encoder.
+    #[test]
+    fn out_of_order_members_encode_like_descriptor_order() {
+        let desc = crate::nt::NTScalar::new(ScalarType::Double)
+            .with_display()
+            .build();
+        let PvField::Structure(mut s) = default_value_for(&desc) else {
+            unreachable!()
+        };
+        s.fields[0].1 = PvField::Scalar(ScalarValue::Double(4.5));
+        let ordered = PvField::Structure(s.clone());
+        s.fields.reverse();
+        let reversed = PvField::Structure(s);
+        let order = ByteOrder::Little;
+        let (mut a, mut b) = (Vec::new(), Vec::new());
+        encode_pv_field(&ordered, &desc, order, &mut a);
+        encode_pv_field(&reversed, &desc, order, &mut b);
+        assert_eq!(a, b);
+        let mut bits = crate::proto::BitSet::new();
+        bits.set(1); // value
+        bits.set(desc.bit_for_path("display.units").unwrap());
+        let (mut a, mut b) = (Vec::new(), Vec::new());
+        encode_pv_field_with_bitset(&ordered, &desc, &bits, 0, order, &mut a);
+        encode_pv_field_with_bitset(&reversed, &desc, &bits, 0, order, &mut b);
+        assert_eq!(a, b);
+        assert_eq!(&a[..8], &4.5f64.to_le_bytes());
+    }
+
     /// `decode_type_desc_cached_opt` is pvxs `from_wire_type`
     /// (`dataencode.cpp:729-745`): the NULL (`0xFF`) type code consumes
     /// exactly one byte and yields the absent `Value` (`Ok(None)`) with the
@@ -2848,10 +2839,12 @@ mod tests {
                             ("severity".into(), FieldDesc::Scalar(ScalarType::Int)),
                             ("status".into(), FieldDesc::Scalar(ScalarType::Int)),
                             ("message".into(), FieldDesc::Scalar(ScalarType::String)),
-                        ],
+                        ]
+                        .into(),
                     },
                 ),
-            ],
+            ]
+            .into(),
         }
     }
 
@@ -2917,7 +2910,8 @@ mod tests {
             fields: vec![
                 ("name".into(), FieldDesc::Scalar(ScalarType::String)),
                 ("value".into(), FieldDesc::Variant),
-            ],
+            ]
+            .into(),
         };
         for order in [ByteOrder::Little, ByteOrder::Big] {
             let mut buf = Vec::new();
@@ -2940,11 +2934,11 @@ mod tests {
     fn struct_array_element_accepts_type_cache_markers() {
         let element = FieldDesc::Structure {
             struct_id: "elem_t".into(),
-            fields: vec![("x".into(), FieldDesc::Scalar(ScalarType::Double))],
+            fields: vec![("x".into(), FieldDesc::Scalar(ScalarType::Double))].into(),
         };
         let expected = FieldDesc::StructureArray {
             struct_id: "elem_t".into(),
-            fields: vec![("x".into(), FieldDesc::Scalar(ScalarType::Double))],
+            fields: vec![("x".into(), FieldDesc::Scalar(ScalarType::Double))].into(),
         };
         for order in [ByteOrder::Little, ByteOrder::Big] {
             // Inline element struct descriptor bytes (`0x80 ...`).
@@ -3191,21 +3185,24 @@ mod tests {
                 ("severity".into(), FieldDesc::Scalar(ScalarType::Int)),
                 ("status".into(), FieldDesc::Scalar(ScalarType::Int)),
                 ("message".into(), FieldDesc::Scalar(ScalarType::String)),
-            ],
+            ]
+            .into(),
         };
         let nt_double = FieldDesc::Structure {
             struct_id: "epics:nt/NTScalar:1.0".into(),
             fields: vec![
                 ("value".into(), FieldDesc::Scalar(ScalarType::Double)),
                 ("alarm".into(), alarm.clone()),
-            ],
+            ]
+            .into(),
         };
         let nt_int = FieldDesc::Structure {
             struct_id: "epics:nt/NTScalar:1.0".into(),
             fields: vec![
                 ("value".into(), FieldDesc::Scalar(ScalarType::Int)),
                 ("alarm".into(), alarm.clone()),
-            ],
+            ]
+            .into(),
         };
 
         let order = ByteOrder::Little;
@@ -3259,7 +3256,8 @@ mod tests {
             fields: vec![
                 ("value".into(), FieldDesc::Scalar(ScalarType::Double)),
                 ("alarm".into(), FieldDesc::Scalar(ScalarType::Int)),
-            ],
+            ]
+            .into(),
         };
 
         let mut prior_struct = PvStructure::new("test:S:1.0");
@@ -3332,7 +3330,7 @@ mod tests {
         for _ in 0..n {
             d = FieldDesc::Structure {
                 struct_id: String::new(),
-                fields: vec![("f0".into(), d)],
+                fields: vec![("f0".into(), d)].into(),
             };
         }
         d
@@ -3479,7 +3477,7 @@ mod tests {
         for desc in [
             FieldDesc::StructureArray {
                 struct_id: "S".into(),
-                fields: vec![("x".into(), FieldDesc::Scalar(ScalarType::Int))],
+                fields: vec![("x".into(), FieldDesc::Scalar(ScalarType::Int))].into(),
             },
             FieldDesc::UnionArray {
                 struct_id: String::new(),
@@ -3566,10 +3564,12 @@ mod tests {
                         fields: vec![
                             ("severity".into(), FieldDesc::Scalar(ScalarType::Int)),
                             ("status".into(), FieldDesc::Scalar(ScalarType::Int)),
-                        ],
+                        ]
+                        .into(),
                     },
                 ),
-            ],
+            ]
+            .into(),
         }
     }
 
@@ -3607,7 +3607,8 @@ mod tests {
                             ("severity".into(), FieldDesc::Scalar(ScalarType::Int)),
                             ("status".into(), FieldDesc::Scalar(ScalarType::Int)),
                             ("message".into(), FieldDesc::Scalar(ScalarType::String)),
-                        ],
+                        ]
+                        .into(),
                     },
                 ),
                 (
@@ -3621,10 +3622,12 @@ mod tests {
                             ),
                             ("nanoseconds".into(), FieldDesc::Scalar(ScalarType::Int)),
                             ("userTag".into(), FieldDesc::Scalar(ScalarType::Int)),
-                        ],
+                        ]
+                        .into(),
                     },
                 ),
-            ],
+            ]
+            .into(),
         }
     }
 
@@ -3952,13 +3955,16 @@ mod tests {
                                 "status".into(),
                                 FieldDesc::Structure {
                                     struct_id: String::new(),
-                                    fields: Vec::new(),
+                                    fields: Vec::new().into(),
                                 },
-                            )],
+                            )]
+                            .into(),
                         },
-                    )],
+                    )]
+                    .into(),
                 },
-            )],
+            )]
+            .into(),
         };
 
         // request_to_mask names alarm (bit 2) + alarm.status (bit 4); the
@@ -4045,7 +4051,8 @@ mod tests {
                             ("severity".into(), FieldDesc::Scalar(ScalarType::Int)),
                             ("status".into(), FieldDesc::Scalar(ScalarType::Int)),
                             ("message".into(), FieldDesc::Scalar(ScalarType::String)),
-                        ],
+                        ]
+                        .into(),
                     },
                 ),
                 (
@@ -4059,10 +4066,12 @@ mod tests {
                             ),
                             ("nanoseconds".into(), FieldDesc::Scalar(ScalarType::Int)),
                             ("userTag".into(), FieldDesc::Scalar(ScalarType::Int)),
-                        ],
+                        ]
+                        .into(),
                     },
                 ),
-            ],
+            ]
+            .into(),
         };
         // pvRequest `field(timeStamp, alarm.status)`.
         let req = FieldDesc::Structure {
@@ -4076,7 +4085,7 @@ mod tests {
                             "timeStamp".into(),
                             FieldDesc::Structure {
                                 struct_id: String::new(),
-                                fields: Vec::new(),
+                                fields: Vec::new().into(),
                             },
                         ),
                         (
@@ -4087,14 +4096,17 @@ mod tests {
                                     "status".into(),
                                     FieldDesc::Structure {
                                         struct_id: String::new(),
-                                        fields: Vec::new(),
+                                        fields: Vec::new().into(),
                                     },
-                                )],
+                                )]
+                                .into(),
                             },
                         ),
-                    ],
+                    ]
+                    .into(),
                 },
-            )],
+            )]
+            .into(),
         };
 
         let mask = request_to_mask(&value_desc, Some(&req)).unwrap();
@@ -4375,7 +4387,8 @@ mod tests {
             fields: vec![
                 ("a".into(), FieldDesc::Scalar(ScalarType::Long)),
                 ("b".into(), FieldDesc::Scalar(ScalarType::Long)),
-            ],
+            ]
+            .into(),
         }
     }
 

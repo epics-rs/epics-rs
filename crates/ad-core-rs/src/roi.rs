@@ -1,5 +1,6 @@
 use crate::error::{ADError, ADResult};
 use crate::ndarray::{NDArray, NDDataBuffer};
+use crate::ndarray_pool::NDArrayPool;
 
 use crate::color_layout::ColorLayout;
 use crate::pixel_cast::{PixelCast, with_buffer};
@@ -7,7 +8,9 @@ use crate::pixel_cast::{PixelCast, with_buffer};
 /// Crop a region of interest from the source array.
 /// Data type and color mode are preserved. ROI parameters are clamped
 /// to source dimensions so the function never panics on out-of-bounds input.
+/// The crop is allocated from `pool`.
 pub fn crop_roi(
+    pool: &NDArrayPool,
     source: &NDArray,
     src_layout: &ColorLayout,
     min_x: usize,
@@ -37,7 +40,7 @@ pub fn crop_roi(
             size_y: 0,
         };
         let dims = dst_layout.make_dims();
-        return Ok(NDArray::new(dims, source_data.data_type()));
+        return pool.alloc(dims, source_data.data_type());
     }
 
     let dst_layout = ColorLayout {
@@ -48,17 +51,14 @@ pub fn crop_roi(
     let dims = dst_layout.make_dims();
     let data_type = source_data.data_type();
 
-    let mut result = NDArray::new(dims, data_type);
-
     // Fast path: full-frame copy (no actual crop needed)
     if min_x == 0 && min_y == 0 && size_x == src_layout.size_x && size_y == src_layout.size_y {
-        result.data = source_data.clone();
-        return Ok(result);
+        return pool.alloc_with(dims, source_data.clone());
     }
 
     let num_elements = dst_layout.num_elements();
+    let mut dst_data = NDDataBuffer::zeros(data_type, num_elements);
     with_buffer!(source_data, |src_v| {
-        let mut dst_data = NDDataBuffer::zeros(data_type, num_elements);
         crate::pixel_cast::with_buffer_mut!(&mut dst_data, |dst_v| {
             for y in 0..size_y {
                 let src_y = min_y + y;
@@ -73,8 +73,8 @@ pub fn crop_roi(
                 }
             }
         });
-        result.data = dst_data;
     });
+    let mut result = pool.alloc_with(dims, dst_data)?;
 
     // Update output dims to track cumulative offset from source
     let (x_dim, y_dim) = match src_layout.color_mode {
@@ -127,7 +127,7 @@ mod tests {
         };
         let data: Vec<f64> = (0..12).map(|x| x as f64).collect();
         let arr = make_mono_array(4, 3, NDDataBuffer::F64(data.clone()));
-        let result = crop_roi(&arr, &layout, 0, 0, 4, 3).unwrap();
+        let result = crop_roi(&NDArrayPool::new(0), &arr, &layout, 0, 0, 4, 3).unwrap();
         if let NDDataBuffer::F64(v) = &result.data {
             assert_eq!(v, &data);
         }
@@ -142,7 +142,7 @@ mod tests {
         };
         let data: Vec<f64> = (0..16).map(|x| x as f64).collect();
         let arr = make_mono_array(4, 4, NDDataBuffer::F64(data));
-        let result = crop_roi(&arr, &layout, 1, 1, 2, 2).unwrap();
+        let result = crop_roi(&NDArrayPool::new(0), &arr, &layout, 1, 1, 2, 2).unwrap();
         if let NDDataBuffer::F64(v) = &result.data {
             assert_eq!(v, &[5.0, 6.0, 9.0, 10.0]);
         }
@@ -163,7 +163,7 @@ mod tests {
         };
         let data: Vec<u8> = (0..12).collect();
         let arr = make_rgb1_array(2, 2, NDDataBuffer::U8(data.clone()));
-        let result = crop_roi(&arr, &layout, 0, 0, 2, 2).unwrap();
+        let result = crop_roi(&NDArrayPool::new(0), &arr, &layout, 0, 0, 2, 2).unwrap();
         if let NDDataBuffer::U8(v) = &result.data {
             assert_eq!(v, &data);
         }
@@ -186,7 +186,7 @@ mod tests {
             }
         }
         let arr = make_rgb1_array(3, 3, NDDataBuffer::U8(data));
-        let result = crop_roi(&arr, &layout, 1, 1, 2, 2).unwrap();
+        let result = crop_roi(&NDArrayPool::new(0), &arr, &layout, 1, 1, 2, 2).unwrap();
         if let NDDataBuffer::U8(v) = &result.data {
             assert_eq!(v.len(), 12);
             assert_eq!(v[0], 11);
@@ -207,7 +207,7 @@ mod tests {
         };
         let data: Vec<u8> = (0..16).collect();
         let arr = make_mono_array(4, 4, NDDataBuffer::U8(data));
-        let result = crop_roi(&arr, &layout, 2, 2, 10, 10).unwrap();
+        let result = crop_roi(&NDArrayPool::new(0), &arr, &layout, 2, 2, 10, 10).unwrap();
         assert_eq!(result.dims[0].size, 2);
         assert_eq!(result.dims[1].size, 2);
     }
@@ -228,6 +228,6 @@ mod tests {
             compressor: 0,
             original_data_type: crate::ndarray::NDDataType::UInt8,
         });
-        assert!(crop_roi(&arr, &layout, 0, 0, 4, 4).is_err());
+        assert!(crop_roi(&NDArrayPool::new(0), &arr, &layout, 0, 0, 4, 4).is_err());
     }
 }

@@ -17,24 +17,26 @@
 //! i.e. the record keeps an EMPTY link, byte for byte what a `longin` with
 //! no `INP` at all shows.
 //!
-//! This port's accepted-type table is static, so `{pva:…}` parses in every
-//! binary — including `softioc-rs`, which is C's CA-only `softIoc` and
-//! installs no `pva` link set. The link then loaded clean and, because the
-//! lset boundary addresses a `PvaJson`/`Pva` link by its BARE name, it was
-//! dispatched to whatever other lset happened to be registered: with a `ca`
-//! link set installed the measured `{pva:{pv:"SRC"}}` link asked the CA lset
-//! for `SRC` (`cached:SRC`, `open:SRC`) — a pva link silently serviced over
-//! Channel Access, with nothing said at boot.
+//! The port refuses the same field at load when no `pva` link type is
+//! declared (`softioc_undeclared_json_link_type` pins that). This file is the
+//! other fact: a binary that declares `pva` but has installed no `pva` link
+//! set, and `pva://`, which C has no `link()` gate for. Either way the link
+//! used to load clean and, because the lset boundary addresses a
+//! `PvaJson`/`Pva` link by its BARE name, it was dispatched to whatever other
+//! lset happened to be registered: with a `ca` link set installed the
+//! measured `{pva:{pv:"SRC"}}` link asked the CA lset for `SRC` (`cached:SRC`,
+//! `open:SRC`) — a pva link silently serviced over Channel Access, with
+//! nothing said at boot.
 //!
-//! The port cannot refuse at load the way C does: the link-set installers
-//! fire at `initHookAfterCaLinkInit`, long after `dbLoadRecords`. So the
-//! refusal is at link init, which is `PvDatabase::db_init_link_locality` —
-//! the single owner of the post-`dbInitLink` view that both the parse cache
+//! The installers fire at `initHookAfterCaLinkInit`, long after
+//! `dbLoadRecords`, so that refusal is at link init, which is
+//! `PvDatabase::db_init_link_locality` — the single owner of the
+//! post-`dbInitLink` view that both the parse cache
 //! (`initialize_link_locality`) and every re-parsing consumer
 //! (`record_link_fields` → `setup_cp_links`, `setup_external_link_opens`,
 //! `dbcaxr`) already route through.
 
-use epics_base_rs::server::database::{LinkSet, PvDatabase};
+use epics_base_rs::server::database::{LinkRef, LinkSet, PvDatabase};
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::record::ParsedLink;
 use epics_base_rs::types::EpicsValue;
@@ -62,25 +64,38 @@ impl SpyLset {
 
 #[async_trait::async_trait]
 impl LinkSet for SpyLset {
-    fn is_connected(&self, _name: &str) -> bool {
+    fn is_connected(&self, _name: LinkRef<'_>) -> bool {
         true
     }
-    async fn get_value(&self, name: &str) -> Option<EpicsValue> {
-        self.asked
-            .lock()
-            .push(format!("{}:get:{name}", self.scheme));
+    async fn get_value(&self, link: LinkRef<'_>) -> Option<EpicsValue> {
+        let name = link.name;
+        self.asked.lock().push(format!(
+            "{}:get:{}",
+            self.scheme,
+            String::from_utf8_lossy(name)
+        ));
         Some(EpicsValue::Long(3))
     }
-    fn get_cached_value(&self, name: &str) -> Option<EpicsValue> {
-        self.asked
-            .lock()
-            .push(format!("{}:read:{name}", self.scheme));
+    fn get_cached_value(&self, link: LinkRef<'_>) -> Option<EpicsValue> {
+        let name = link.name;
+        self.asked.lock().push(format!(
+            "{}:read:{}",
+            self.scheme,
+            String::from_utf8_lossy(name)
+        ));
         Some(EpicsValue::Long(3))
     }
-    async fn connect_link(&self, name: &str) {
-        self.asked
-            .lock()
-            .push(format!("{}:open:{name}", self.scheme));
+    async fn connect_link(
+        &self,
+        link: LinkRef<'_>,
+        _: Option<epics_base_rs::server::database::CaLinkInit>,
+    ) {
+        let name = link.name;
+        self.asked.lock().push(format!(
+            "{}:open:{}",
+            self.scheme,
+            String::from_utf8_lossy(name)
+        ));
     }
 }
 
@@ -97,6 +112,8 @@ record(calc,   "REPARSED") { field(CALC, "A") field(INPA, "{pva:{pv:\"SRC\"}}") 
 
 async fn build(lsets: &[(&'static str, Arc<SpyLset>)]) -> Arc<PvDatabase> {
     let db = IocBuilder::new()
+        // QSRV2 disabled: pvalink's installer installs nothing.
+        .register_link_type("pva", |_db| async { Vec::new() })
         .db_string(DB, &HashMap::new())
         .unwrap()
         .build()
@@ -205,9 +222,9 @@ async fn locally_serviced_and_ca_shaped_links_are_not_refused() {
 /// (`initialize_link_locality` says so, and `record_link_fields` does not
 /// enumerate it), so the scheme has to survive to the link-set boundary as
 /// well: `external_pv_name` returns `pva://…` and
-/// `split_external_link_name` reads it back as `LinkTarget::Scheme("pva")`.
-/// Addressed by its bare name the link resolved to `LinkTarget::Any` and was
-/// measured being read from the CA link set (`read:SRC`, `A` delivered 9.0).
+/// `split_external_link_name` reads it back as the `pva` scheme. Addressed
+/// by its bare name the link is a CA link, and was measured being read from
+/// the CA link set (`read:SRC`, `A` delivered 9.0).
 #[epics_macros_rs::epics_test]
 async fn a_reparsed_pva_link_is_not_serviced_by_another_schemes_link_set() {
     let ca = SpyLset::new("ca");

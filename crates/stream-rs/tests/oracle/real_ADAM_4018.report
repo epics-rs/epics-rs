@@ -1,0 +1,95 @@
+rec0: ADAM_4018.proto queryAll(1,2,3,4,5,6,7,8,9) P
+queryAll {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "#1";
+    in ">%(2:ai0)f%(2:ai1)f%(2:ai2)f%(2:ai3)f%(2:ai4)f%(2:ai5)f%(2:ai6)f%(2:ai7)f";
+}
+rec1: ADAM_4018.proto queryModel(1,2,3,4,5,6,7,8,9) P
+queryModel {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "$1M";
+    in "!1%s";
+}
+rec2: ADAM_4018.proto queryFW(1,2,3,4,5,6,7,8,9) P
+queryFW {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "$1F";
+    in "!1%s";
+}
+rec3: ADAM_4018.proto queryInput(1,2,3,4,5,6,7,8,9) P
+queryInput {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "$12";
+    in "!1%{00|01|02|03|04|05|06|0E|0F|10|11|12|13|14}%*2s%*2s";
+}
+rec4: ADAM_4018.proto queryBaud(1,2,3,4,5,6,7,8,9) P
+queryBaud {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "$12";
+    in "!1%*2s%{03|04|05|06|07|08}%*2s";
+}
+rec5: ADAM_4018.proto setInput(1,2,3,4,5,6,7,8,9) P
+setInput {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "\x2511%{00|01|02|03|04|05|06|0E|0F|10|11|12|13|14}%(2:baud){03|04|05|06|07|08}00";
+}

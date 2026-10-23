@@ -1,0 +1,4 @@
+AsynDriverInterface::lockRequest(rec, 5000 msec)
+rec lockRequest: port P not connected
+AsynDriverInterface::exceptionHandler(rec, Connect)
+AsynDriverInterface::exceptionHandler(rec) P 0 connected. ioAction: None

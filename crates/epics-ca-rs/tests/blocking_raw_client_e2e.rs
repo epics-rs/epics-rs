@@ -27,14 +27,11 @@
 //! makes that a checked property rather than an assumption.
 //!
 //! Waits go through [`Circuit`], which never discards a frame — see the
-//! `common/raw_ca.rs` module docs for why that matters when one write produces
+//! `raw-ca` crate docs for why that matters when one write produces
 //! two replies whose order the server does not fix.
 //!
 //! Ports are always ephemeral (`:0`) — never the real 5064, per the
 //! `build() ⟹ listening` port-ownership rule.
-
-#[path = "common/raw_ca.rs"]
-mod raw_ca;
 
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream, UdpSocket};
@@ -45,8 +42,9 @@ use epics_base_rs::runtime::task::block_on_sync;
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::types::EpicsValue;
 use epics_ca_rs::protocol::{
-    CA_MINOR_VERSION, CA_PROTO_CLEAR_CHANNEL, CA_PROTO_EVENT_ADD, CA_PROTO_READ_NOTIFY,
-    CA_PROTO_SEARCH, CA_PROTO_VERSION, CA_PROTO_WRITE, CA_PROTO_WRITE_NOTIFY, CaHeader, pad_string,
+    CA_MINOR_VERSION, CA_PROTO_CLEAR_CHANNEL, CA_PROTO_ECHO, CA_PROTO_EVENT_ADD,
+    CA_PROTO_READ_NOTIFY, CA_PROTO_SEARCH, CA_PROTO_VERSION, CA_PROTO_WRITE, CA_PROTO_WRITE_NOTIFY,
+    CaHeader, ECA_DEFUNCT, ECA_INTERNAL, ECA_TOLARGE, pad_string,
 };
 use epics_ca_rs::server::blocking::{BlockingCaServer, bind_udp_search};
 use raw_ca::*;
@@ -340,7 +338,9 @@ fn blocking_server_answers_a_raw_udp_search() {
     let udp_thread = thread::spawn(move || srv.serve_udp_search(resp));
 
     let client = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
-    client.set_read_timeout(Some(budget::FACT_BUDGET)).unwrap();
+    client
+        .set_read_timeout(Some(fact_budget::FACT_BUDGET))
+        .unwrap();
 
     // VERSION prelude + SEARCH, the shape a real CA client broadcasts.
     let mut dg = {
@@ -437,7 +437,7 @@ fn blocking_server_answers_a_raw_udp_search() {
     });
     client.send_to(&probe, resp_addr).unwrap();
 
-    budget::barrier::until(
+    fact_budget::barrier::until(
         "an unknown PV must draw no UDP reply",
         // Nothing may precede the barrier datagram, and the batch-up path can
         // coalesce replies, so a datagram carrying cid 0x43 is denied even
@@ -484,7 +484,9 @@ fn a_udp_search_leads_to_a_working_tcp_circuit() {
     let accept = thread::spawn(move || srv_tcp.serve());
 
     let client = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
-    client.set_read_timeout(Some(budget::FACT_BUDGET)).unwrap();
+    client
+        .set_read_timeout(Some(fact_budget::FACT_BUDGET))
+        .unwrap();
     let mut dg = {
         let mut h = CaHeader::new(CA_PROTO_VERSION);
         h.count = CA_MINOR_VERSION;
@@ -526,4 +528,272 @@ fn a_udp_search_leads_to_a_working_tcp_circuit() {
     server.shutdown();
     accept.join().unwrap();
     udp_thread.join().unwrap().expect("responder exits cleanly");
+}
+
+/// A DBR_ENUM subscription on a stringin gets a zeroed ECA_GETFAIL update for
+/// every value change and stays subscribed: the record has no `put_enum_str`,
+/// so C's `cvt_st_e` (`dbFastLinkConv.c:247`) fails each `read_reply`
+/// (`camessage.c:540-557`). softIoc R7.0.10-146-g8f5015b66 answers both
+/// writes below this way.
+#[test]
+fn a_dbr_enum_monitor_on_a_stringin_is_getfail_per_update() {
+    use epics_base_rs::server::records::stringin::StringinRecord;
+    const DBR_ENUM: u16 = 3;
+    const ECA_GETFAIL: u32 = epics_ca_rs::protocol::ECA_GETFAIL;
+
+    let db = Arc::new(PvDatabase::new());
+    block_on_sync(db.add_record("SI", Box::new(StringinRecord::new("abc"))))
+        .expect("no async runtime on this test thread")
+        .expect("add_record");
+    let (server, addr, accept) = start_server(db);
+    let mut c = connect_and_handshake(addr);
+    let sid = create_channel(&mut c, 1, "SI");
+
+    let mut add = event_add_frame(sid, 0x51);
+    add[4..6].copy_from_slice(&DBR_ENUM.to_be_bytes());
+    c.send(&add);
+    let mut frames = vec![c.expect(CA_PROTO_EVENT_ADD, "initial")];
+    for text in [&b"xyz"[..], b"uvw"] {
+        let mut h = CaHeader::new(CA_PROTO_WRITE);
+        h.cid = sid;
+        h.set_payload_size(40, 1, CA_MINOR_VERSION).unwrap();
+        let mut w = h.to_bytes().to_vec();
+        w.extend_from_slice(text);
+        w.resize(16 + 40, 0);
+        c.send(&w);
+        frames.push(c.expect(CA_PROTO_EVENT_ADD, "update"));
+    }
+    for f in frames {
+        let hdr = CaHeader::from_bytes(&f).unwrap();
+        assert_eq!(
+            (hdr.data_type, hdr.cid, ioid_of(&f), &f[16..]),
+            (DBR_ENUM, ECA_GETFAIL, 0x51, &[0u8; 8][..])
+        );
+    }
+
+    drop(c);
+    server.shutdown();
+    accept.join().unwrap();
+}
+
+/// A misaligned frame is refused by the receive gate with `log_header`'s
+/// three lines before the disconnect (camessage.c:2452-2463, 282-307).
+/// softIoc 8f5015b66 prints these for the same frame sent on its own after
+/// the handshake, which is why N is 0.
+#[test]
+fn a_misaligned_frame_prints_log_header_before_the_disconnect() {
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = seen.clone();
+    let listener = epics_base_rs::runtime::log::errlog_add_listener(move |line| {
+        if line.starts_with("CAS: ") {
+            sink.lock().unwrap().push(line.to_string());
+        }
+    });
+    let db = seed_db(&[("RAW:MIS", EpicsValue::Double(0.0))]);
+    let (server, addr, accept) = start_server(db);
+    let mut c = connect_and_handshake(addr);
+    let peer = c.local_addr();
+    let mut h = CaHeader::new(CA_PROTO_ECHO);
+    h.postsize = 4;
+    h.data_type = 7;
+    h.count = 3;
+    h.cid = 0x1234;
+    h.available = 0x55;
+    let mut w = h.to_bytes().to_vec();
+    w.extend_from_slice(b"abcd");
+    c.send(&w);
+    assert_eq!(
+        c.expect_error("the gate answers the frame"),
+        0x8e,
+        "ECA_INTERNAL"
+    );
+    c.expect_closed("RSRV_ERROR ends the circuit");
+    epics_base_rs::runtime::log::errlog_flush();
+    let lines: Vec<String> = seen
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|l| l.contains(&peer.to_string()))
+        .cloned()
+        .collect();
+    assert_eq!(
+        lines,
+        [
+            format!("CAS: request from {peer} => CAS: Missaligned protocol rejected\n"),
+            format!("CAS: Request from {peer} => cmmd=23 cid=0x1234 type=7 count=3 postsize=4\n"),
+            format!("CAS: Request from {peer} =>   available=0x55 \tN=0 paddr=(nil)\n"),
+            format!("CAS: forcing disconnect from {peer}\n"),
+        ]
+    );
+    epics_base_rs::runtime::log::errlog_remove_listener(listener);
+
+    server.shutdown();
+    accept.join().unwrap();
+}
+
+/// The `CAS: ` console lines naming `peer` that `send` provokes, after
+/// `errlog_flush` has drained them.
+fn cas_lines_for(peer: impl Fn() -> SocketAddr, send: impl FnOnce()) -> Vec<String> {
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = seen.clone();
+    let listener = epics_base_rs::runtime::log::errlog_add_listener(move |line| {
+        if line.starts_with("CAS: ") {
+            sink.lock().unwrap().push(line.to_string());
+        }
+    });
+    send();
+    epics_base_rs::runtime::log::errlog_flush();
+    epics_base_rs::runtime::log::errlog_remove_listener(listener);
+    let peer = peer().to_string();
+    let lines = seen.lock().unwrap();
+    lines
+        .iter()
+        .filter(|l| l.contains(&peer))
+        .cloned()
+        .collect()
+}
+
+/// A peer that sends anything before its VERSION is a pre-4 client: RSRV
+/// answers `ECA_DEFUNCT`, logs the header and keeps the circuit
+/// (camessage.c:2491-2508). Lines are softIoc 8f5015b66's for this frame.
+#[test]
+fn a_frame_before_version_prints_log_header_and_keeps_the_circuit() {
+    let db = seed_db(&[("RAW:OLD", EpicsValue::Double(0.0))]);
+    let (server, addr, accept) = start_server(db);
+    let mut c = Circuit::new(std::net::TcpStream::connect(addr).expect("connect"));
+    let peer = c.local_addr();
+    let lines = cas_lines_for(
+        || peer,
+        || {
+            c.expect(CA_PROTO_VERSION, "unsolicited VERSION greeting");
+            let mut h = CaHeader::new(CA_PROTO_ECHO);
+            h.data_type = 5;
+            h.count = 6;
+            h.cid = 0x77;
+            h.available = 0x88;
+            c.send(&h.to_bytes());
+            assert_eq!(c.expect_error("the gate answers"), ECA_DEFUNCT);
+        },
+    );
+    assert_eq!(
+        lines,
+        [
+            format!("CAS: request from {peer} => CAS: Client version too old\n"),
+            format!("CAS: Request from {peer} => cmmd=23 cid=0x77 type=5 count=6 postsize=0\n"),
+            format!("CAS: Request from {peer} =>   available=0x88 \tN=0 paddr=(nil)\n"),
+        ]
+    );
+    server.shutdown();
+    accept.join().unwrap();
+}
+
+/// A declared body past the receive ceiling is `ECA_TOLARGE` and a drain,
+/// not a disconnect (camessage.c:2539-2556). Lines are softIoc 8f5015b66
+/// with `EPICS_CA_AUTO_ARRAY_BYTES=NO`, the mode in which C has a ceiling.
+#[test]
+fn a_body_past_the_ceiling_prints_log_header_and_keeps_the_circuit() {
+    let db = seed_db(&[("RAW:BIG", EpicsValue::Double(0.0))]);
+    let (server, addr, accept) = start_server(db);
+    let mut c = connect_and_handshake(addr);
+    let peer = c.local_addr();
+    let lines = cas_lines_for(
+        || peer,
+        || {
+            let mut w = Vec::new();
+            for v in [CA_PROTO_EVENT_ADD, 0xffff, 6, 0] {
+                w.extend_from_slice(&u16::to_be_bytes(v));
+            }
+            for v in [0x55u32, 0x66, 0x0200_0000, 1] {
+                w.extend_from_slice(&v.to_be_bytes());
+            }
+            w.extend_from_slice(&[0; 64]);
+            c.send(&w);
+            assert_eq!(c.expect_error("the gate answers"), ECA_TOLARGE);
+        },
+    );
+    assert_eq!(
+        lines,
+        [
+            format!(
+                "CAS: request from {peer} => CAS: server unable to load large request message\n"
+            ),
+            format!(
+                "CAS: Request from {peer} => cmmd=1 cid=0x55 type=6 count=1 postsize=33554432\n"
+            ),
+            format!("CAS: Request from {peer} =>   available=0x66 \tN=0 paddr=(nil)\n"),
+        ]
+    );
+    server.shutdown();
+    accept.join().unwrap();
+}
+
+/// A command past the dispatch table is `bad_tcp_cmd_action`'s log_header
+/// and then RSRV_ERROR's disconnect (camessage.c:341-352, camsgtask.c:151).
+/// Lines are softIoc 8f5015b66's for this frame.
+#[test]
+fn a_bad_command_prints_log_header_before_the_disconnect() {
+    let db = seed_db(&[("RAW:BAD", EpicsValue::Double(0.0))]);
+    let (server, addr, accept) = start_server(db);
+    let mut c = connect_and_handshake(addr);
+    let peer = c.local_addr();
+    let lines = cas_lines_for(
+        || peer,
+        || {
+            let mut h = CaHeader::new(99);
+            h.data_type = 5;
+            h.count = 6;
+            h.cid = 0x77;
+            h.available = 0x88;
+            c.send(&h.to_bytes());
+            assert_eq!(c.expect_error("the handler answers"), ECA_INTERNAL);
+            c.expect_closed("RSRV_ERROR ends the circuit");
+        },
+    );
+    assert_eq!(
+        lines,
+        [
+            format!("CAS: request from {peer} => invalid (damaged?) request code from TCP\n"),
+            format!("CAS: Request from {peer} => cmmd=99 cid=0x77 type=5 count=6 postsize=0\n"),
+            format!("CAS: Request from {peer} =>   available=0x88 \tN=0 paddr=(nil)\n"),
+            format!("CAS: forcing disconnect from {peer}\n"),
+        ]
+    );
+    server.shutdown();
+    accept.join().unwrap();
+}
+
+/// A scalar DBR_STRING put with no NUL is RSRV_ERROR (camessage.c:764), and
+/// RSRV ends every such circuit with `CAS: forcing disconnect from <peer>`
+/// (camsgtask.c:151), as softIoc 8f5015b66 prints for this put.
+#[test]
+fn a_string_put_without_a_nul_forces_the_disconnect() {
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = seen.clone();
+    let listener = epics_base_rs::runtime::log::errlog_add_listener(move |line| {
+        if line.starts_with("CAS: forcing") {
+            sink.lock().unwrap().push(line.to_string());
+        }
+    });
+    let db = seed_db(&[("RAW:STR", EpicsValue::String("x".into()))]);
+    let (server, addr, accept) = start_server(db.clone());
+    let mut c = connect_and_handshake(addr);
+    let sid = create_channel(&mut c, 1, "RAW:STR");
+    let mut h = CaHeader::new(CA_PROTO_WRITE);
+    h.cid = sid;
+    h.set_payload_size(40, 1, CA_MINOR_VERSION).unwrap();
+    let mut w = h.to_bytes().to_vec();
+    w.extend_from_slice(&b"abcdefghij".repeat(4));
+    c.send(&w);
+    c.expect_closed("RSRV_ERROR ends the circuit");
+    epics_base_rs::runtime::log::errlog_flush();
+    let lines = seen.lock().unwrap().clone();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(
+        lines[0].starts_with("CAS: forcing disconnect from 127.0.0.1:"),
+        "{lines:?}"
+    );
+    epics_base_rs::runtime::log::errlog_remove_listener(listener);
+
+    server.shutdown();
+    accept.join().unwrap();
 }

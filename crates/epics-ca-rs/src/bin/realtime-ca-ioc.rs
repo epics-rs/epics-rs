@@ -5,12 +5,12 @@
 //! front-end is touched, and every long-lived loop owns a dedicated OS thread.
 //! Four facilities, started in the order C `iocInit` starts its equivalents:
 //!
-//! 1. **Background executor** — `runtime::task::background_init()` (C
-//!    `callbackInit`, `callback.c:286`): the callback pool
-//!    (`cbLow`/`cbMedium`/`cbHigh`), the delayed timer, and the scanOnce
-//!    worker. Started *first* so no record processing can defer a tail into a
-//!    facility that does not exist yet. On this build the `runtime::task`
-//!    spawn/sleep/interval seam routes into it, so asynchronous record
+//! 1. **Background executor** — `runtime::task::background_init()`, which
+//!    `build_ioc`'s `iocBuild` runs (C `callbackInit`, `callback.c:286`):
+//!    the callback pool (`cbLow`/`cbMedium`/`cbHigh`), the delayed timer,
+//!    and the scanOnce worker. Started before any record initialises, so no
+//!    record processing can defer a tail into a facility that does not exist
+//!    yet. On this build the `runtime::task` spawn/sleep/interval seam routes into it, so asynchronous record
 //!    completion (put-callback tails, ODLY re-processing) runs on those std
 //!    threads rather than on a tokio runtime.
 //! 2. **Database** — a small in-process database built through the ordinary
@@ -183,9 +183,9 @@ mod demo_db {
         // independent link's monitor→record latency and on timer callbacks
         // sharing the `cbMedium` band (§5.4).
         //
-        // `RTEMS:CA:FAST` is the chain head — an external CP link, so
-        // `run_monitor`'s inline `dispatch_external_cp_targets` is what
-        // processes it, on the band worker that received the event. Its
+        // `RTEMS:CA:FAST` is the chain head — an external CP link, so the
+        // link's `run_processor` task processes it when `run_monitor`
+        // requests it, on the `dbCaLink` thread. Its
         // FLNK runs C1..C8: nine records processed inline per upstream
         // event, which is the shape §5.4 says is unbounded.
         "record(ai, \"RTEMS:CA:FAST\") {\n",
@@ -485,22 +485,28 @@ mod mutex_alloc_probe {
 #[cfg(exec_backend)]
 mod ioc {
     use std::collections::HashMap;
-    use std::net::{Ipv4Addr, SocketAddrV4};
     use std::process::ExitCode;
     use std::sync::Arc;
+    #[cfg(feature = "bringup-probes")]
     use std::thread;
     use std::time::Instant;
 
     use epics_base_rs::error::CaResult;
     use epics_base_rs::runtime::net::cas_server_port;
-    use epics_base_rs::runtime::task::{StackSizeClass, background_init, block_on_sync};
+    #[cfg(feature = "bringup-probes")]
+    use epics_base_rs::runtime::task::StackSizeClass;
+    use epics_base_rs::runtime::task::block_on_sync;
+    #[cfg(feature = "bringup-probes")]
     use epics_base_rs::runtime::worker_pool::ThreadCharge;
+    #[cfg(feature = "bringup-probes")]
     use epics_base_rs::server::database::PvDatabase;
-    use epics_base_rs::server::ioc_builder::IocBuilder;
+    use epics_base_rs::server::ioc_builder::{BareIoc, IocBuilder};
     use epics_base_rs::server::status_pv::{StatusPv, serve_status_pvs, target_status_pvs};
     use epics_base_rs::types::EpicsValue;
-    use epics_ca_rs::calink::install_calink_resolver;
-    use epics_ca_rs::server::blocking::{BlockingCaServer, bind_udp_search, refused_clients};
+    use epics_ca_rs::calink::{CaLinkResolver, install_calink_resolver};
+    use epics_ca_rs::server::blocking::refused_clients;
+    use epics_ca_rs::server::blocking_serving::BlockingCaServing;
+    use epics_ca_rs::server::stats::ServerStats;
 
     use crate::demo_db::DEMO_DB;
 
@@ -748,7 +754,7 @@ mod ioc {
         seq: u32,
         resolver: &epics_ca_rs::calink::CaLinkResolver,
         db: &Arc<PvDatabase>,
-        server: &Arc<BlockingCaServer>,
+        stats: &ServerStats,
     ) {
         let conns = block_on_sync(resolver.client_connection_count())
             .ok()
@@ -763,7 +769,7 @@ mod ioc {
         };
         println!(
             "FDPROBE seq={seq} FD_CNT={fd_cnt} FD_MAX={fd_max} CA_CONN_CNT={}",
-            server.active_connections()
+            stats.active_clients()
         );
         println!(
             "C6 seq={seq} links={} circuits={conns:?}",
@@ -807,9 +813,9 @@ mod ioc {
             "RTEMS:CA:C8",
             "RTEMS:CA:OTHER",
         ] {
-            let val = db.get_pv(rec).map(|v| v.to_string());
-            let sevr = db.get_pv(&format!("{rec}.SEVR")).map(|v| v.to_string());
-            let stat = db.get_pv(&format!("{rec}.STAT")).map(|v| v.to_string());
+            let val = db.get_pv(rec).map(|v| v.text_g());
+            let sevr = db.get_pv(format!("{rec}.SEVR")).map(|v| v.text_g());
+            let stat = db.get_pv(format!("{rec}.STAT")).map(|v| v.text_g());
             println!("C6 seq={seq} record {rec} VAL={val:?} SEVR={sevr:?} STAT={stat:?}");
         }
     }
@@ -952,9 +958,21 @@ mod ioc {
     /// Driven by `block_on_sync`, which parks this thread between polls of the
     /// build future — `IocBuilder::build` awaits only in-process locks, so no
     /// reactor is involved.
-    fn load_database(db_files: &[String]) -> CaResult<Arc<PvDatabase>> {
+    fn load_database(db_files: &[String]) -> CaResult<(BareIoc, CaLinkResolver)> {
         let macros = HashMap::new();
-        let mut builder = IocBuilder::new();
+        // The `ca://` / ` CA` record-link resolver, installed by the build at
+        // C `dbCaLinkInit` so the link passes and PINI that follow it see the
+        // link set. The CA client it builds lazily reads the `EPICS_CA_*`
+        // variables `main` set before this call; its tasks land on the
+        // callback pool, never a tokio runtime. Kept for the link report.
+        let resolver = Arc::new(std::sync::OnceLock::new());
+        let installed = Arc::clone(&resolver);
+        let mut builder = IocBuilder::new().register_link_type("ca", move |db| async move {
+            let reactor = epics_base_rs::runtime::task::Reactor::current()
+                .expect("the exec backend's reactor is process-global");
+            let _ = installed.set(install_calink_resolver(&db, reactor).await);
+            Vec::new()
+        });
         if db_files.is_empty() {
             println!(
                 "realtime-ca-ioc: no database named on the boot command line; \
@@ -981,9 +999,13 @@ mod ioc {
                 builder = builder.db_file(path, &macros)?;
             }
         }
-        let (db, _autosave) = block_on_sync(builder.build())
+        let ioc = block_on_sync(builder.build_ioc())
             .expect("the RTEMS entry point runs on a plain thread with no runtime entered")?;
-        Ok(db)
+        let resolver = resolver
+            .get()
+            .cloned()
+            .expect("a successful build_ioc ran dbCaLinkInit");
+        Ok((ioc, resolver))
     }
 
     pub fn main() -> ExitCode {
@@ -1012,8 +1034,8 @@ mod ioc {
         //     the rule so this binary and `realtime-pva-ioc` cannot come to
         //     disagree about it.
         //
-        //     SAFETY (edition 2024): the entry thread, before `background_init`
-        //     or any server has started anything, so no concurrent reader or
+        //     SAFETY (edition 2024): the entry thread, before the build or
+        //     any server has started anything, so no concurrent reader or
         //     writer of the environment exists.
         let boot_args: Vec<String> =
             unsafe { epics_rtems_boot::boot_args::apply_boot_env(std::env::args().skip(1)) };
@@ -1073,16 +1095,21 @@ mod ioc {
         // resolver lazily builds reads them once at construction.
         //
         // SAFETY (edition 2024): this runs on the single init thread
-        // before `background_init` starts any other thread, so no
+        // before the build starts any other thread, so no
         // concurrent reader or writer of the environment exists.
+        //
+        // Only for the built-in database: its C6 probe records are what the
+        // topology is for, and a site database keeps the site's search.
         #[cfg(feature = "bringup-probes")]
-        for (var, compiled_in) in [
-            ("EPICS_CA_NAME_SERVERS", C6_NAME_SERVER),
-            ("EPICS_CA_ADDR_LIST", ""),
-            ("EPICS_CA_AUTO_ADDR_LIST", "NO"),
-        ] {
-            if std::env::var_os(var).is_none() {
-                unsafe { std::env::set_var(var, compiled_in) };
+        if boot_args.is_empty() {
+            for (var, compiled_in) in [
+                ("EPICS_CA_NAME_SERVERS", C6_NAME_SERVER),
+                ("EPICS_CA_ADDR_LIST", ""),
+                ("EPICS_CA_AUTO_ADDR_LIST", "NO"),
+            ] {
+                if std::env::var_os(var).is_none() {
+                    unsafe { std::env::set_var(var, compiled_in) };
+                }
             }
         }
 
@@ -1104,12 +1131,6 @@ mod ioc {
         //      location and the backtrace note all survive.
         epics_base_rs::runtime::log::install_panic_hook();
 
-        // (0d) …and say which lock protocol the process got. C prints the
-        //      same fact from `epicsMutexShowAll`; we have no iocsh to ask,
-        //      so it goes on the console at boot. Before any thread that can
-        //      take a record gate exists, so the line cannot be read as a
-        //      report about a process that already ran without it.
-        epics_base_rs::runtime::sync::report_lock_protocol();
         // The board's epoch is fixed for the life of the boot, so this is the
         // one moment the message can be acted on. Every stamp served past the
         // EPICS time stamp's range wraps exactly as C's `epicsTimeFromTime_t`
@@ -1118,77 +1139,19 @@ mod ioc {
         if let Some(why) =
             epics_base_rs::types::wall_clock_range_warning(std::time::SystemTime::now())
         {
-            eprintln!("epics-rs: {why}");
+            epics_libcom_rs::stderr_println!("epics-rs: {why}");
         }
-
-        // (1) C `callbackInit` (callback.c:286) — the callback pool, delayed
-        //     timer and scanOnce worker exist before any record can defer a
-        //     tail into them. Idempotent.
-        background_init();
 
         // (2) The database — every boot argument that was not an
         //     `epicsEnvSet` is a `.db` to load, in order (C `dbLoadRecords`).
-        let db = match load_database(&boot_args) {
-            Ok(db) => db,
+        let (ioc, resolver) = match load_database(&boot_args) {
+            Ok(loaded) => loaded,
             Err(e) => {
-                eprintln!("realtime-ca-ioc: iocInit failed: {e}");
+                epics_libcom_rs::stderr_println!("realtime-ca-ioc: iocInit failed: {e}");
                 return ExitCode::FAILURE;
             }
         };
-
-        // (2b) The calink resolver: install the `ca://` record-link resolver on
-        //      the database so ` CA`-modified / `ca://...` INP/OUT fields
-        //      resolve. C reaches the same state through `dbCaLinkInit`
-        //      (`dbCa.c:352-355`) during iocInit, after the database exists.
-        //      Installed here — after the database, before the CA front-end —
-        //      so every record's link fields route through it before the
-        //      server answers its first client.
-        //
-        //      The CA client reaches upstream servers the way a host client
-        //      does — the UDP SEARCH socket plus any `EPICS_CA_NAME_SERVERS`
-        //      circuits — and every task the resolver spawns lands on the
-        //      callback pool `background_init` started above via
-        //      `runtime::task::spawn`, never a tokio runtime.
-        let resolver = block_on_sync(install_calink_resolver(&db))
-            .expect("the RTEMS entry point runs on a plain thread with no runtime entered");
-
-        // (2c) iocInit's link phases, in `IocApplication::run`'s order
-        //      (`ioc_app.rs:913-925`) and for its reasons. Without them the
-        //      resolver above is mounted and unreachable:
-        //
-        //      * `initialize_link_locality` commits C `dbInitLink`'s locality
-        //        decision (`dbLink.c:118-129` falling through
-        //        `dbDbInitLink`'s `S_db_notFound`, `dbDbLink.c:94-96`) — a
-        //        `Db` link naming a record this IOC does not have becomes a
-        //        `Ca` link. `INP=UPSTREAM:AI CP`, the bare ` CA`-modifier
-        //        spelling C calls `pvlOptCA`, is a `Db` link until this runs,
-        //        so without it that whole spelling reads nothing forever.
-        //      * `setup_cp_links` warms external CP/CPP links. A Passive
-        //        holder of one is never scanned, so its link never opens
-        //        lazily and its monitor is never created — a chicken-and-egg
-        //        a lazy open cannot break.
-        //      * `setup_external_link_opens` stages the rest, as C's
-        //        `dbInitLink` hands every non-local `PV_LINK` to
-        //        `dbCaAddLink` regardless of direction. Without it every
-        //        other external link pays one cold scan cycle to stage its
-        //        own open.
-        //
-        //      AFTER the mount above, not before: the warm path
-        //      (`resolve_external_pv`) routes through the registered link
-        //      set's lazy open and is a documented no-op when no lset is
-        //      installed, so running these first would silently warm nothing.
-        //
-        //      `realtime-pva-ioc` needs no equivalent: `install_pvalink_resolver`
-        //      walks the whole database itself and pre-registers every
-        //      `pva://` link. `install_calink_resolver` registers the link set
-        //      and scans nothing — C's `dbCaLinkInit` does not scan either —
-        //      because for CA the scan IS these three iocInit passes.
-        block_on_sync(async {
-            db.initialize_link_locality().await;
-            db.setup_cp_links().await;
-            db.setup_external_link_opens().await;
-        })
-        .expect("the RTEMS entry point runs on a plain thread with no runtime entered");
+        let db = ioc.database().clone();
 
         // (2d) Periodic scan + PINI. C `iocInit` owns `scanInit`/
         //      `initialProcess` (`dbScan.c`, `iocInit.c:653`) independent
@@ -1196,12 +1159,14 @@ mod ioc {
         //      had NO scan start at all (the scheduler lived only in the
         //      hosted async CA server's run loop, which this blocking
         //      target never runs), so every periodic `SCAN` field and
-        //      every `PINI=YES` record was silently dead here. The core
-        //      `ScanOwner` runs the PINI pass and the `scan-%g` threads on
-        //      a dedicated owner thread (exec-backend safe: a parked
-        //      detached task would be dropped by the executor). Held to
-        //      the end of `main`: this IOC scans for as long as it serves.
-        let _scan_owner = epics_base_rs::server::scan::ScanOwner::start(db.clone());
+        //      every `PINI=YES` record was silently dead here. PINI=YES and
+        //      the `scan-%g` threads start inside `build_ioc`; `run` is
+        //      `iocRun`, whose `scanRun` lets them scan, with PINI=RUN/RUNNING.
+        if !block_on_sync(ioc.run())
+            .expect("the RTEMS entry point runs on a plain thread with no runtime entered")
+        {
+            return ExitCode::FAILURE;
+        }
 
         // (3) The CA front-end. UDP search port and TCP port are the same
         //     value, as under a C IOC (caservertask.c:492-500). No ACF is
@@ -1210,26 +1175,6 @@ mod ioc {
         let acf = epics_base_rs::server::access_security::new_acf_cell(None);
         let db_for_status = db.clone();
         let db_for_names = db.clone();
-        let server = match BlockingCaServer::bind((Ipv4Addr::UNSPECIFIED, port), db, acf) {
-            Ok(s) => Arc::new(s),
-            Err(e) => {
-                // Not "cannot bind": `BlockingCaServer::bind` also calls
-                // `local_addr`, and on RTEMS that is the call that fails.
-                // The inner error says which.
-                eprintln!("realtime-ca-ioc: cannot start the CA TCP server on port {port}: {e}");
-                return ExitCode::FAILURE;
-            }
-        };
-        let udp = match bind_udp_search(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port)) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!(
-                    "realtime-ca-ioc: cannot start the CA UDP search responder on port {port}: {e}"
-                );
-                return ExitCode::FAILURE;
-            }
-        };
-
         // (3b) The status PVs. Nothing on this target has a shell, so these
         //      numbers are the only way to ask the IOC how it is doing from
         //      anywhere but the serial console — and the console is
@@ -1245,18 +1190,19 @@ mod ioc {
         //      is the entry point that owns a `BlockingPvaServer`, and it
         //      publishes it there.
         //
-        //      Registered after `bind` so `CA_CONN_CNT` reads the server that
-        //      is already listening, and before the accept thread starts so
-        //      the first client cannot find them missing.
+        //      Registered before the serving starts so the first client
+        //      cannot find them missing; `CA_CONN_CNT` reads the stats every
+        //      listener counts into.
         let started = Instant::now();
-        let conns_server = server.clone();
+        let stats = Arc::new(ServerStats::default());
+        let conns_stats = stats.clone();
         let mut status = target_status_pvs(STATUS_PREFIX, started);
         status.extend([
             // devIocStats' `@ca_connections` (ioc.template:82-94). The ceiling
             // number: measured on target at 142 concurrent, the 143rd refused
             // by the libbsd socket zone with ENFILE.
             StatusPv::new(format!("{STATUS_PREFIX}:CA_CONN_CNT"), move || {
-                EpicsValue::Double(conns_server.active_connections() as f64)
+                EpicsValue::Double(conns_stats.active_clients() as f64)
             }),
             // No upstream counterpart: devIocStats counts CA clients and CA
             // connections but never refusals. Named in the shape of the ones
@@ -1268,59 +1214,31 @@ mod ioc {
             }),
         ]);
         if let Err(e) = serve_status_pvs(db_for_status, status) {
-            eprintln!("realtime-ca-ioc: cannot register the status PVs: {e}");
+            epics_libcom_rs::stderr_println!(
+                "realtime-ca-ioc: cannot register the status PVs: {e}"
+            );
             return ExitCode::FAILURE;
         }
 
         // Listed after the status PVs are registered, so the console names
         // everything a client can reach rather than only what the `.db`
         // carried.
-        let mut names = block_on_sync(db_for_names.all_record_names())
-            .expect("the RTEMS entry point runs on a plain thread with no runtime entered");
+        let mut names = db_for_names.all_record_names();
         names.sort();
 
-        let srv_tcp = server.clone();
-        // The stack class states what this thread takes; the charge is what
-        // makes the worker pool's budget know it was taken. Held inside the
-        // body, so it is released by the thread ending and by nothing else,
-        // and a `spawn` that fails drops the closure and gives it back.
-        let charge = ThreadCharge::fixed(StackSizeClass::Medium);
-        let tcp_thread = match thread::Builder::new()
-            .name("CAS-TCP".to_string())
-            // caservertask.c:717-719 — `epicsThreadStackMedium`. It accepts and
-            // hands off; the per-client thread is where the depth is.
-            .stack_size(StackSizeClass::Medium.bytes())
-            .spawn(move || {
-                let _charge = charge;
-                srv_tcp.serve()
-            }) {
-            Ok(h) => h,
+        let serving = match BlockingCaServing::start(port, port, db, acf, stats.clone()) {
+            Ok(s) => s,
             Err(e) => {
-                eprintln!("realtime-ca-ioc: cannot start the CA accept thread: {e}");
-                return ExitCode::FAILURE;
-            }
-        };
-        let srv_udp = server.clone();
-        let charge = ThreadCharge::fixed(StackSizeClass::Medium);
-        let udp_thread = match thread::Builder::new()
-            .name("CAS-UDP".to_string())
-            // caservertask.c:723-725 — `epicsThreadStackMedium`, same as TCP.
-            .stack_size(StackSizeClass::Medium.bytes())
-            .spawn(move || {
-                let _charge = charge;
-                srv_udp.serve_udp_search(udp)
-            }) {
-            Ok(h) => h,
-            Err(e) => {
-                eprintln!("realtime-ca-ioc: cannot start the CA name-search thread: {e}");
+                epics_libcom_rs::stderr_println!("realtime-ca-ioc: {e}");
                 return ExitCode::FAILURE;
             }
         };
 
         println!(
-            "realtime-ca-ioc: serving {} records on CA port {port} (TCP + UDP search), \
+            "realtime-ca-ioc: serving {} records on CA port {} (TCP + UDP search), \
              RTEMS execution model, no tokio runtime",
-            names.len()
+            names.len(),
+            serving.tcp_port()
         );
 
         // (5-udp) PROBE: the client's SEARCH socket, end to end against this
@@ -1375,7 +1293,11 @@ mod ioc {
             if declared.is_empty() {
                 "none declared".to_string()
             } else {
-                declared.join(", ")
+                declared
+                    .iter()
+                    .map(|n| n.to_str_lossy())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             },
         );
         for name in &names {
@@ -1386,8 +1308,8 @@ mod ioc {
         //
         // (a) The band-occupancy tick. A `runtime::task::spawn` +
         //     `runtime::task::sleep` loop, which on this target IS a
-        //     `cbMedium` band task — the same band `run_monitor` and its
-        //     inline `dispatch_external_cp_targets` run on (§5.4). Each
+        //     `cbMedium` band task — the same band `run_monitor` runs on
+        //     (§5.4); the link's `run_processor` runs on `dbCaLink`. Each
         //     wake writes an incrementing count to `RTEMS:CA:TICK`, so a
         //     host `camonitor` on that record measures the band's timer
         //     jitter directly: `Instant` is 1-second-quantized on target
@@ -1442,10 +1364,16 @@ mod ioc {
         {
             let probe_db = db_for_names.clone();
             let probe_resolver = resolver.clone();
-            let probe_server = server.clone();
+            let probe_stats = stats.clone();
+            let env = |var| {
+                epics_base_rs::runtime::env::get_lossy(var).unwrap_or_else(|| "(unset)".to_string())
+            };
             println!(
-                "C6 probe: EPICS_CA_NAME_SERVERS={C6_NAME_SERVER} (compiled in), \
-                 EPICS_CA_ADDR_LIST empty, EPICS_CA_AUTO_ADDR_LIST=NO; reporting every 10 s",
+                "C6 probe: EPICS_CA_NAME_SERVERS={}, EPICS_CA_ADDR_LIST={}, \
+                 EPICS_CA_AUTO_ADDR_LIST={}; reporting every 10 s",
+                env("EPICS_CA_NAME_SERVERS"),
+                env("EPICS_CA_ADDR_LIST"),
+                env("EPICS_CA_AUTO_ADDR_LIST"),
             );
             let charge = ThreadCharge::fixed(StackSizeClass::Medium);
             match thread::Builder::new()
@@ -1464,7 +1392,7 @@ mod ioc {
                     loop {
                         thread::sleep(std::time::Duration::from_secs(10));
                         seq += 1;
-                        c6_report(seq, &probe_resolver, &probe_db, &probe_server);
+                        c6_report(seq, &probe_resolver, &probe_db, &probe_stats);
                         // The census is one line per open descriptor, so it
                         // runs on the same 1-minute pass as the task census
                         // rather than every 10 s: an outage measurement wants
@@ -1477,7 +1405,9 @@ mod ioc {
                     }
                 }) {
                 Ok(_) => {}
-                Err(e) => eprintln!("C6 probe: cannot start the reporter thread: {e}"),
+                Err(e) => epics_libcom_rs::stderr_println!(
+                    "C6 probe: cannot start the reporter thread: {e}"
+                ),
             }
 
             // The write-deadline measurement, only when the rig named a peer
@@ -1496,7 +1426,9 @@ mod ioc {
                         c6_write_deadline_probe();
                     }) {
                     Ok(_) => {}
-                    Err(e) => eprintln!("C6 probe: cannot start the write-deadline probe: {e}"),
+                    Err(e) => epics_libcom_rs::stderr_println!(
+                        "C6 probe: cannot start the write-deadline probe: {e}"
+                    ),
                 }
             }
         }
@@ -1505,15 +1437,12 @@ mod ioc {
         // on this target. Joining the accept thread is how the main thread
         // waits; the accept loop only returns if `shutdown()` is requested,
         // which nothing here does.
-        let _ = tcp_thread.join();
-        match udp_thread.join() {
-            Ok(Ok(())) => ExitCode::SUCCESS,
-            Ok(Err(e)) => {
-                eprintln!("realtime-ca-ioc: name-search responder failed: {e}");
-                ExitCode::FAILURE
-            }
-            Err(_) => {
-                eprintln!("realtime-ca-ioc: name-search thread panicked");
+        match serving.join() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                epics_libcom_rs::stderr_println!(
+                    "realtime-ca-ioc: name-search responder failed: {e}"
+                );
                 ExitCode::FAILURE
             }
         }
@@ -1527,13 +1456,12 @@ fn main() -> ExitCode {
 
 #[cfg(tokio_backend)]
 fn main() -> ExitCode {
-    eprintln!(
+    epics_base_rs::runtime::task::refuse_backend(
         "realtime-ca-ioc: built with the tokio task backend, which this entry point \
          does not start a runtime for.\n\
          Build it for `armv7-rtems-eabihf` or a VxWorks target, or on a host \
-         rebuild with EPICS_RS_BUILD_EXEC_BACKEND=thread."
-    );
-    ExitCode::FAILURE
+         rebuild with EPICS_RS_BUILD_EXEC_BACKEND=thread.",
+    )
 }
 
 #[cfg(test)]
@@ -1615,9 +1543,9 @@ mod tests {
             }
         }
         assert_eq!(
-            sites, 5,
-            "expected the accept thread, the UDP responder, the bring-up \
-             probe and the write-deadline probe's two legs, found {sites} — \
+            sites, 3,
+            "expected the bring-up probe and the write-deadline probe's two \
+             legs (the serving threads are `BlockingCaServing`'s), found {sites} — \
              a thread was added or moved, and the account has to be told \
              about it"
         );
@@ -1711,7 +1639,7 @@ mod tests {
         let prod = production(src, Comments::Keep);
         // `concat!` so these assertions cannot match their own source text.
         assert!(
-            prod.contains(concat!("install_calink_", "resolver(&db)")),
+            prod.contains(concat!("install_calink_", "resolver(&db, reactor)")),
             "the calink resolver is no longer installed; ` CA`-modified and \
              ca://... record links would silently never resolve, and there is no \
              shell on the target to say so"
@@ -1729,46 +1657,29 @@ mod tests {
     }
 
     /// The mount is not enough on its own: iocInit's three link phases are
-    /// what route the database's links through it.
-    ///
-    /// This binary does not go through `IocApplication::run`, which is the
-    /// only other place these are called, so dropping them here drops them
-    /// entirely — and the failure is silent in exactly the way the target
-    /// cannot survive. Without `initialize_link_locality` the bare
-    /// ` CA`-modifier spelling (`INP=UPSTREAM:AI CP`) stays a local `Db` link
-    /// to a record that does not exist; without `setup_cp_links` a Passive
-    /// holder of an external CP link never opens it; without
-    /// `setup_external_link_opens` every other external link waits for a cold
-    /// scan. The IOC boots and serves in all three cases.
+    /// what route the database's links through it, and PINI=YES reads them.
+    /// Both run inside `IocBuilder::build_ioc`, after the link-set
+    /// installers it runs at C `dbCaLinkInit`, so the resolver must be
+    /// mounted by an installer registered on the builder. Mounted after the
+    /// build, the IOC boots and serves with the phases having routed nothing:
+    /// the bare ` CA`-modifier spelling (`INP=UPSTREAM:AI CP`) stays a local
+    /// `Db` link and a Passive holder of an external CP link never opens it.
     #[test]
-    fn iocinit_link_phases_run_after_the_mount() {
+    fn the_calink_mount_is_installed_by_the_build() {
         let src = include_str!("realtime-ca-ioc.rs");
         let prod = production(src, Comments::Keep);
         // `concat!` so these assertions cannot match their own source text.
-        let mount = concat!("install_calink_", "resolver(&db)");
-        let phases = [
-            concat!("initialize_link_", "locality()"),
-            concat!("setup_cp_", "links()"),
-            concat!("setup_external_link_", "opens()"),
-        ];
-        let mount_at = prod
-            .find(mount)
-            .expect("the mount guard above covers this; if it passed, this cannot fail");
-        for phase in phases {
-            let at = prod.find(phase).unwrap_or_else(|| {
-                panic!(
-                    "this entry point no longer calls `{phase}`; it is not reached by \
-                     `IocApplication::run` either, so the database's ca:// links would \
-                     never be routed through the mounted resolver and the IOC would boot \
-                     and serve with every external link dead"
-                )
-            });
-            assert!(
-                at > mount_at,
-                "`{phase}` must run AFTER the resolver mount: the warm path routes \
-                 through the registered link set and is a no-op with none installed"
-            );
-        }
+        let at = |needle: &str| {
+            prod.find(needle)
+                .unwrap_or_else(|| panic!("this entry point no longer calls `{needle}`"))
+        };
+        let registered = at(concat!("register_link_", "type(\"ca\", "));
+        let mount = at(concat!("install_calink_", "resolver(&db, reactor)"));
+        let build = at(concat!("builder.build_", "ioc()"));
+        assert!(
+            registered < mount && mount < build,
+            "the calink mount must be the installer the build runs at dbCaLinkInit"
+        );
     }
 
     /// A panic on a per-connection thread kills that thread and leaves the IOC
@@ -1804,7 +1715,7 @@ mod tests {
         let recs =
             epics_base_rs::server::db_loader::parse_db(crate::demo_db::DEMO_DB, &HashMap::new())
                 .expect("the built-in database must parse");
-        let names: Vec<&str> = recs.iter().map(|r| r.name.as_str()).collect();
+        let names: Vec<&str> = recs.iter().map(|r| r.name.to_str().unwrap()).collect();
         assert_eq!(
             names,
             vec!["RTEMS:AO", "RTEMS:LO", "RTEMS:MSG", "RTEMS:BO"],
@@ -1812,7 +1723,7 @@ mod tests {
         );
         for rec in &recs {
             assert!(
-                !rec.name.starts_with("RTEMS:CA:"),
+                !rec.name.starts_with(b"RTEMS:CA:"),
                 "{} is a C6 probe record; the measurement rig belongs behind \
                  `bringup-probes`, not in the default image",
                 rec.name
@@ -1883,7 +1794,7 @@ mod tests {
         );
         let recs = epics_base_rs::server::db_loader::parse_db(&full, &HashMap::new())
             .expect("demo + C6 + E8 must parse together");
-        let names: Vec<&str> = recs.iter().map(|r| r.name.as_str()).collect();
+        let names: Vec<&str> = recs.iter().map(|r| r.name.to_str().unwrap()).collect();
 
         for n in [
             "RTEMS:E8:WF",

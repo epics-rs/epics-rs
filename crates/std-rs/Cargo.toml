@@ -9,10 +9,15 @@ repository.workspace = true
 
 [dependencies]
 epics-base-rs = { workspace = true }
+epics-libcom-rs = { workspace = true }
+epics-seq-rs = { workspace = true }
 asyn-rs = { workspace = true }
 tokio = { version = "1", features = ["sync", "time", "rt"] }
 tracing = "0.1"
 chrono = { version = "0.4", features = ["std"] }
+
+[build-dependencies]
+epics-snc-rs = { workspace = true }
 
 [features]
 

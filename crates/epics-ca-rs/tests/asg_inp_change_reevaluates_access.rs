@@ -97,7 +97,7 @@ async fn serve(gate: i32) -> u16 {
 
 async fn connect(client: &CaClient, pv: &str) -> CaChannel {
     let ch = client.create_channel(pv);
-    ch.wait_connected(budget::FACT_BUDGET)
+    ch.wait_connected(fact_budget::FACT_BUDGET)
         .await
         .unwrap_or_else(|e| panic!("{pv} must connect: {e:?}"));
     ch
@@ -110,7 +110,7 @@ async fn write_bit(ch: &CaChannel) -> bool {
 
 /// Wait for the wire to carry the expected transition.
 async fn await_write_bit(ch: &CaChannel, want: bool, what: &str) {
-    let deadline = std::time::Instant::now() + budget::FACT_BUDGET;
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
     loop {
         if write_bit(ch).await == want {
             return;
@@ -180,6 +180,3 @@ async fn opening_the_gate_grants_write_to_a_connected_client() {
         .await
         .expect("the write must be granted once the gate is open");
 }
-
-#[path = "common/budget.rs"]
-mod budget;

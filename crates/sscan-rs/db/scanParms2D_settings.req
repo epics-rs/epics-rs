@@ -1,0 +1,10 @@
+$(P)$(Q):scanParms1.SP
+$(P)$(Q):scanParms1.EP
+$(P)$(Q):scanParms1.NP
+$(P)$(Q):scanParms1.AR
+$(P)$(Q):scanParms1.AFT
+$(P)$(Q):scanParms2.SP
+$(P)$(Q):scanParms2.EP
+$(P)$(Q):scanParms2.NP
+$(P)$(Q):scanParms2.AR
+$(P)$(Q):scanParms2.AFT

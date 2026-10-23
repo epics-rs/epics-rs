@@ -1,0 +1,45 @@
+#USDigital AB5 Quadrature Encoder Counter
+#Format: 8bit binary
+#
+######COMMANDS########
+#Ping (1 byte) 0x41  'A'
+# Return: 1-byte 0x34  '4'
+#
+#Read Counter (4 bytes) 01 
+# Return: 4-byte unsigned int. 
+#
+#Set Counter (6 bytes) 22, Multiplier (0-4), 4-byte preset value
+# Return: 1-byte checksum
+#
+#Read Status 0x55
+# Return: 1-byte value of LS7166 (encoder chip) Status Reg. 
+# 		Bit-0: Borrow Flip-flop
+#		Bit-1  Carry Flip-flop
+#		Bit-3  Sign Bit
+#		Bit-4  Up(1)/Down(0) Count Direction 
+
+# Terminator = 0x00;
+ExtraInput = Ignore;
+
+ping {
+	out 65;
+	in "%1r";
+	@replytimeout {in 0x00;}
+	}	
+
+readCnts {
+	out 1;
+	in "%#4r";
+	}
+
+setCntMode {
+	out 34 "%(A).1r%(B)#.4r";
+	in "%1r";
+	}
+
+
+readSR {
+	out 85;
+	in "%1r";
+	}
+

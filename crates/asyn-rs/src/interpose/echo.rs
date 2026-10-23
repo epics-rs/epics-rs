@@ -41,7 +41,7 @@ impl OctetInterpose for EchoInterpose {
         user: &AsynUser,
         buf: &mut [u8],
         next: &mut dyn OctetNext,
-    ) -> AsynResult<OctetReadResult> {
+    ) -> OctetReadResult {
         next.read(user, buf)
     }
 
@@ -52,9 +52,9 @@ impl OctetInterpose for EchoInterpose {
         next: &mut dyn OctetNext,
     ) -> AsynResult<usize> {
         // C `asynInterposeEcho.c::writeIt` (:40-85) counts a byte as transferred
-        // only once its echo has come back and matched — `transfered++` sits at
+        // only once its echo has come back and matched — `transferred++` sits at
         // the bottom of the loop, after the echo check — and publishes that
-        // count on *every* break (`*nbytesTransfered = transfered`, :83). So a
+        // count on *every* break (`*nbytesTransferred = transferred`, :83). So a
         // half-echoed command reports the bytes the device confirmed, and each
         // failure exit here carries `total` out with it.
         let mut total = 0;
@@ -79,20 +79,16 @@ impl OctetInterpose for EchoInterpose {
             let echo_user = AsynUser::new(user.reason)
                 .with_addr(user.addr)
                 .with_timeout_opt(user.timeout);
-            let echo_result = match next.read(&echo_user, &mut echo_buf) {
-                Ok(r) => r,
+            let echo_result = next.read(&echo_user, &mut echo_buf);
+            match echo_result.status {
+                Ok(()) => {}
                 // C :64-68 — a timed-out echo read keeps its `asynTimeout`
                 // status and only *replaces the message*; it does not become
                 // `asynError`. The status is the contract: `asynRecord` maps it
                 // to a different alarm than a generic error, and a device
                 // support layer that retries on timeout must still see one.
-                // The count in the message is C's `transfered` — the 0-based
+                // The count in the message is C's `transferred` — the 0-based
                 // index of the char whose echo never came back.
-                //
-                // Classify by the carried status, not the variant: the layer
-                // below may be the EOS interpose, which returns C's
-                // `asynTimeout` wrapped in `PartialRead`, and a variant match
-                // would drop it into the generic branch below.
                 Err(e) if e.status() == AsynStatus::Timeout => {
                     return Err(AsynError::Status {
                         status: AsynStatus::Timeout,
@@ -103,7 +99,7 @@ impl OctetInterpose for EchoInterpose {
                 // C :69 — any other failing status breaks with the lower
                 // layer's status and message intact.
                 Err(e) => return Err(e.with_partial_write(total)),
-            };
+            }
 
             // C :70-79 — a short echo read and a mismatched echo are ONE
             // branch, reporting what came back against what went out.
@@ -119,7 +115,7 @@ impl OctetInterpose for EchoInterpose {
                 }
                 .with_partial_write(total));
             }
-            // C `transfered++` (:80) — after the echo matched, not after the
+            // C `transferred++` (:80) — after the echo matched, not after the
             // write.
             total += n;
         }
@@ -154,15 +150,17 @@ mod tests {
     }
 
     impl OctetNext for EchoBase {
-        fn read(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<OctetReadResult> {
+        fn read(&mut self, _user: &AsynUser, buf: &mut [u8]) -> OctetReadResult {
             if let Some(b) = self.echo_queue.pop_front() {
                 buf[0] = b;
-                Ok(OctetReadResult {
+                OctetReadResult {
                     nbytes_transferred: 1,
                     eom_reason: EomReason::CNT,
-                })
+                    taken_back: 0,
+                    status: Ok(()),
+                }
             } else {
-                Err(AsynError::Status {
+                OctetReadResult::failed(AsynError::Status {
                     status: AsynStatus::Timeout,
                     message: "no echo data".into(),
                 })
@@ -199,12 +197,14 @@ mod tests {
     fn test_echo_mismatch() {
         struct BadEchoBase;
         impl OctetNext for BadEchoBase {
-            fn read(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<OctetReadResult> {
+            fn read(&mut self, _user: &AsynUser, buf: &mut [u8]) -> OctetReadResult {
                 buf[0] = b'X'; // Always echoes wrong char
-                Ok(OctetReadResult {
+                OctetReadResult {
                     nbytes_transferred: 1,
                     eom_reason: EomReason::CNT,
-                })
+                    taken_back: 0,
+                    status: Ok(()),
+                }
             }
             fn write(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
                 Ok(data.len())
@@ -227,7 +227,7 @@ mod tests {
         // back against what went out, both escaped.
         assert_eq!(err.status(), AsynStatus::Error);
         assert_eq!(err.message(), "got back 'X' instead of 'A'");
-        // C `asynInterposeEcho.c:83` publishes `*nbytesTransfered = transfered`
+        // C `asynInterposeEcho.c:83` publishes `*nbytesTransferred = transferred`
         // on the mismatch break — the byte was sent but never confirmed, so it
         // does not count as transferred.
         assert_eq!(err.partial_write(), Some(0));
@@ -237,8 +237,8 @@ mod tests {
     fn test_echo_no_response() {
         struct NoEchoBase;
         impl OctetNext for NoEchoBase {
-            fn read(&mut self, _user: &AsynUser, _buf: &mut [u8]) -> AsynResult<OctetReadResult> {
-                Err(AsynError::Status {
+            fn read(&mut self, _user: &AsynUser, _buf: &mut [u8]) -> OctetReadResult {
+                OctetReadResult::failed(AsynError::Status {
                     status: AsynStatus::Timeout,
                     message: "timeout".into(),
                 })
@@ -269,7 +269,7 @@ mod tests {
         assert_eq!(err.partial_write(), Some(0));
     }
 
-    /// R8-49: the timeout message counts C's `transfered` — the 0-based index
+    /// R8-49: the timeout message counts C's `transferred` — the 0-based index
     /// of the char whose echo never came back, not the char position in the
     /// buffer minus one, and not the byte count written.
     #[test]
@@ -278,15 +278,17 @@ mod tests {
             written: usize,
         }
         impl OctetNext for EchoesOnlyTheFirst {
-            fn read(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<OctetReadResult> {
+            fn read(&mut self, _user: &AsynUser, buf: &mut [u8]) -> OctetReadResult {
                 if self.written == 1 {
                     buf[0] = b'A';
-                    return Ok(OctetReadResult {
+                    return OctetReadResult {
                         nbytes_transferred: 1,
                         eom_reason: EomReason::CNT,
-                    });
+                        taken_back: 0,
+                        status: Ok(()),
+                    };
                 }
-                Err(AsynError::Status {
+                OctetReadResult::failed(AsynError::Status {
                     status: AsynStatus::Timeout,
                     message: "timeout".into(),
                 })
@@ -316,14 +318,14 @@ mod tests {
     }
 
     /// R8-49: a non-timeout failure from the layer below breaks with its own
-    /// status and message intact (C :73 — `break` without rewriting either).
+    /// status and message intact (C :69 — `break` without rewriting either).
     /// Only the timeout arm rewrites the message.
     #[test]
     fn non_timeout_read_error_propagates_untouched() {
         struct BrokenReadBase;
         impl OctetNext for BrokenReadBase {
-            fn read(&mut self, _user: &AsynUser, _buf: &mut [u8]) -> AsynResult<OctetReadResult> {
-                Err(AsynError::Status {
+            fn read(&mut self, _user: &AsynUser, _buf: &mut [u8]) -> OctetReadResult {
+                OctetReadResult::failed(AsynError::Status {
                     status: AsynStatus::Disconnected,
                     message: "port disconnected".into(),
                 })
@@ -357,11 +359,13 @@ mod tests {
     fn short_echo_and_control_chars_use_the_escaped_mismatch_message() {
         struct ShortEchoBase;
         impl OctetNext for ShortEchoBase {
-            fn read(&mut self, _user: &AsynUser, _buf: &mut [u8]) -> AsynResult<OctetReadResult> {
-                Ok(OctetReadResult {
+            fn read(&mut self, _user: &AsynUser, _buf: &mut [u8]) -> OctetReadResult {
+                OctetReadResult {
                     nbytes_transferred: 0,
                     eom_reason: EomReason::CNT,
-                })
+                    taken_back: 0,
+                    status: Ok(()),
+                }
             }
             fn write(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
                 Ok(data.len())
@@ -382,14 +386,14 @@ mod tests {
         assert_eq!(err.message(), "got back '' instead of '\\n'");
     }
 
-    /// R8-49: a short write from the layer below is C's `nbytesTransfered != 1`
+    /// R8-49: a short write from the layer below is C's `nbytesTransferred != 1`
     /// break (:55-60), reported as its own diagnostic rather than folded into
     /// the echo mismatch.
     #[test]
     fn short_write_reports_the_char_count_c_reports() {
         struct ShortWriteBase;
         impl OctetNext for ShortWriteBase {
-            fn read(&mut self, _user: &AsynUser, _buf: &mut [u8]) -> AsynResult<OctetReadResult> {
+            fn read(&mut self, _user: &AsynUser, _buf: &mut [u8]) -> OctetReadResult {
                 unreachable!("write never succeeds, so no echo is read")
             }
             fn write(&mut self, _user: &mut AsynUser, _data: &[u8]) -> AsynResult<usize> {

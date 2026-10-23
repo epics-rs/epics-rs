@@ -1,80 +1,35 @@
-//! XIA PF4 dual-filter bank state machine.
-//!
-//! Pure Rust port of `pf4.st` — manages two 4-bit filter banks where each bank
-//! has 4 filter blades (16 combinations), using Chantler table data from
+//! `pf4.st`, compiled by snc-rs from `build.rs` and run on `epics-seq-rs`.
+//! Its escaped C is the `%%#include` lines, the prototypes (`:134-146`) and
+//! the functions after the program (`:491-847`); the functions are here in
+//! Rust under their C names, and `chantler.h`'s table is
 //! [`crate::data::chantler`].
+//!
+//! Defects fixed in the `.st` copy (the Other blade's interval and its
+//! missing data, the glass term below 2 keV, the show-array count) are named
+//! there.
 
-use epics_base_rs::server::database::PvDatabase;
+// SNL calls these by their C names, with C's arity.
+#![allow(non_snake_case, clippy::too_many_arguments)]
 
-use crate::data::chantler::{find_material, other_absorption_length_um};
-use crate::db_access::{DbChannel, DbMultiMonitor, alloc_origin};
+use crate::data::chantler::{FILTER_MATERIALS, FilterMaterial, other_absorption_length_um};
+use epics_seq_rs::Place;
+use epics_seq_rs::c::*;
 
-/// Number of filter combinations per bank (4 bits = 16).
-pub const NUM_COMBINATIONS: usize = 16;
-
-/// Material index constants matching the SNL code.
-pub const MAT_AL: u8 = 0;
-pub const MAT_TI: u8 = 1;
-pub const MAT_GLASS: u8 = 2;
-pub const MAT_OTHER: u8 = 3;
-
-/// State of the PF4 bank state machine.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Pf4State {
-    Init,
-    Idle,
-    FilterBits,
-    FilterPos,
-    RecalcBank,
-    BankControl,
-    BankOff,
+macro_rules! seqg_escaped {
+    (r#"#include <stdio.h>"#) => {};
+    (r#"#include <math.h>"#) => {};
+    (r#"#include <string.h>"#) => {};
+    (r#"#include "chantler.h""#) => {};
+    // The prototypes (`:134-146`).
+    (r#"static double TiAbsorptionLength(double); static double GlassAbsorptionLength(double); static double AlAbsorptionLength(double); static int isLegalOther(char *s); static double OtherAbsorptionLength(double keV, char *species); static int fillShowArrays(char *species, int N, float *E, float *T); static int numInArray(int,short*,short); static void sortDecreasing(int,double*,short*,int); static double thickZ(int,int,int,int,int,int,int,int,int,int,double,double,double,double); static void RecalcFilters(double,short*,double*,int,int,int,int,int,int,double,double,double,double, char *, char *, char *, char *);"#) => {};
+    // The functions (`:491-847`), below in Rust.
+    (r#"double AlAbsorptionLength(double keV) { double Wcoef0[]={1.90195,-0.00120447,4.3745e-7,8.68635e-11,3.40793e-15,-1.05816e-19,5.83389e-25}; double Wcoef1[]={-1625.33,0.328256,-2.68391e-5,1.26554e-9,-2.41557e-14,2.12864e-19,-7.28743e-25}; double kink = 26797.5; double* pointer; double sum,power; double eV; int i; eV = keV * 1000; if (eV>60000.) eV = 60000.; pointer = (eV<kink) ? Wcoef0 : Wcoef1; sum = 0.; power=1.; for( i=0; i<7; i++ ) { sum += pointer[i] * power; power *= eV; } return sum; } double TiAbsorptionLength(double keV) { double eV; double mu; eV = keV * 1000.; if( eV < 1e3 ) mu = 0; else if( eV < 4966.4 ) { double c0=0.00092284; double c1=2.5891e+08; double powA=-2.6651; mu = c0+c1*pow(eV,powA); } else { double offset = 5.63768167444831e-5; double amp = 24061652313.4169; double powB = -2.91380053083527; double intercept = -0.268162843203489; double slope = 3.74221014277593e-5; double ampExp = -1.05663835782997; double invTau = -0.000570785180739491; double extra = (eV < 6456) ? (intercept+slope*eV) : (ampExp*exp(invTau*eV)); mu = (offset + amp*pow(eV,powB) + extra); } return( 1./mu ); } double GlassAbsorptionLength(double keV) { double absLength; double c0,c1,c2; double c3,c4,c5,c6,c7; double keV2, keVn; keV2 = keV*keV; if( keV < 2 ) absLength = 0; else if( keV < 2.472 ) { c0 = 0.5059463974; c1 = -0.1259565387; c2 = 0.01763933889; absLength = c0 + c1*keV + c2*keV2; } else if( keV < 3.6084 ) { c0 = 0.4570603245; c1 = -0.08869920063; c2 = 0.01032934773; absLength = c0 + c1*keV + c2*keV2; } else if( keV < 4.0385 ) { c0 = 0.3708574258; c1 = -0.04453063888; c2 = 3.979930821e-3; absLength = c0 + c1*keV + c2*keV2; } else if( keV < 7.112 ) { c0 = 0.2830642538; c1 = -0.0223186563; c2 = 1.412011413e-3; absLength = c0 + c1*keV + c2*keV2; } else { c0 = 0.2715022686; c1 = -0.02428526798; c2 = 2.984228845e-3; c3 = -2.003675391e-4; c4 = 7.983398893e-6; c5 = -1.869726202e-7; c6 = 2.378962632e-9; c7 = -1.270082060e-11; absLength = c0 + c1*keV; keVn = keV2; absLength += c2*keVn; keVn *= keV; absLength += c3*keVn; keVn *= keV; absLength += c4*keVn; keVn *= keV; absLength += c5*keVn; keVn *= keV; absLength += c6*keVn; keVn *= keV; absLength += c7*keVn; } absLength *= keV*keV*keV; return( absLength ); } int isLegalOther(char *s) { int i; for (i=0; i<NUM_SPECIES; i++) { if (strcmp(filtermat[i].name, s) == 0) break; } if (i >= NUM_SPECIES) return(0); return(1); } double OtherAbsorptionLength(double keV, char *species) { int i, j; double mu, frac, absLen; for (i=0; i<NUM_SPECIES; i++) { if (strcmp(filtermat[i].name, species) == 0) break; } if (i >= NUM_SPECIES) { return(0.); } for (j=0; j<filtermat[i].numEntries; j++) { if (keV < filtermat[i].keV[j]) break; } if ((j < 1) || (j >= filtermat[i].numEntries)) { return(0.); } frac = (keV - filtermat[i].keV[j-1]) / (filtermat[i].keV[j] - filtermat[i].keV[j-1]); mu = filtermat[i].mu[j-1] + frac * (filtermat[i].mu[j] - filtermat[i].mu[j-1]); absLen = 1/(matdensity[i]*mu); absLen *= 1.e4; return(absLen); } void RecalcFilters(double keV,short* bits,double* xmit,int d,int b,int z1, int z2,int z3,int z4,double f1,double f2,double f3,double f4, char *other1, char *other2, char *other3, char *other4) { double absLenAl,absLenTi,absLenGlass; double xAl,xTi,xGlass; double xOther1, xOther2, xOther3, xOther4; int i; double absLenOther1=0, absLenOther2=0, absLenOther3=0, absLenOther4=0; if (d >= 10) printf("\nRecalcFilters: keV=%g\n",keV); absLenAl = AlAbsorptionLength(keV); absLenTi = TiAbsorptionLength(keV); absLenGlass = GlassAbsorptionLength(keV); if (z1==3) absLenOther1 = OtherAbsorptionLength(keV, other1); if (z2==3) absLenOther2 = OtherAbsorptionLength(keV, other2); if (z3==3) absLenOther3 = OtherAbsorptionLength(keV, other3); if (z4==3) absLenOther4 = OtherAbsorptionLength(keV, other4); if (z1==3 && f1 > 0 && absLenOther1 == 0) printf("RecalcFilters: no data for Other blade 1 '%s' at %g keV; it is left out\n", other1, keV); if (z2==3 && f2 > 0 && absLenOther2 == 0) printf("RecalcFilters: no data for Other blade 2 '%s' at %g keV; it is left out\n", other2, keV); if (z3==3 && f3 > 0 && absLenOther3 == 0) printf("RecalcFilters: no data for Other blade 3 '%s' at %g keV; it is left out\n", other3, keV); if (z4==3 && f4 > 0 && absLenOther4 == 0) printf("RecalcFilters: no data for Other blade 4 '%s' at %g keV; it is left out\n", other4, keV); for (i=0;i<16;i++) { if (b) { xAl = (z1==0 && i&1) ? f1 : 0; xAl += (z2==0 && i&2) ? f2 : 0; xAl += (z3==0 && i&4) ? f3 : 0; xAl += (z4==0 && i&8) ? f4 : 0; xTi = (z1==1 && i&1) ? f1 : 0; xTi += (z2==1 && i&2) ? f2 : 0; xTi += (z3==1 && i&4) ? f3 : 0; xTi += (z4==1 && i&8) ? f4 : 0; xGlass = (z1==2 && i&1) ? f1 : 0; xGlass += (z2==2 && i&2) ? f2 : 0; xGlass += (z3==2 && i&4) ? f3 : 0; xGlass += (z4==2 && i&8) ? f4 : 0; xOther1 = (z1==3 && i&1) ? f1 : 0; xOther2 = (z2==3 && i&2) ? f2 : 0; xOther3 = (z3==3 && i&4) ? f3 : 0; xOther4 = (z4==3 && i&8) ? f4 : 0; if (d >= 10) { printf("       in RecalcFilters %3d, Aluminum = %g,   Titanium = %g,   Glass = %g\n",i,xAl,xTi,xGlass); } xmit[i] = exp(-xAl*1000./absLenAl); xmit[i] *= exp(-xTi*1000./absLenTi); if (xGlass > 0) xmit[i] *= exp(-xGlass*1000./absLenGlass); if (xOther1 > 0 && absLenOther1 > 0) xmit[i] *= exp(-xOther1*1000./absLenOther1); if (xOther2 > 0 && absLenOther2 > 0) xmit[i] *= exp(-xOther2*1000./absLenOther2); if (xOther3 > 0 && absLenOther3 > 0) xmit[i] *= exp(-xOther3*1000./absLenOther3); if (xOther4 > 0 && absLenOther4 > 0) xmit[i] *= exp(-xOther4*1000./absLenOther4); } else xmit[i] = 1.; bits[i] = i; } if (b) sortDecreasing(d,xmit,bits,16); } void sortDecreasing(int d,double* arr,short* bits,int n) { int ii, jj; double a; short b; if (d >= 9) { printf("       before sorting, bits=%d",bits[0]); for (ii=1; ii<n; ii++) { printf(",%d", bits[ii]); } printf("\n"); if (d >= 10) { printf("                   transmit=%g",arr[0]); for (ii=1; ii<n/3; ii++) { printf(", %g", arr[ii]); } printf("\n"); } } for (jj=1;jj<n;jj++) { a = arr[jj]; b = bits[jj]; ii = jj-1; while(ii>=0 && arr[ii]<a) { arr[ii+1] = arr[ii]; bits[ii+1] = bits[ii]; ii--; } arr[ii+1] = a; bits[ii+1] = b; } if (d >= 8) { printf("       after sorting, bits=%d",bits[0]); for (ii=1; ii<n; ii++) { printf(",%d", bits[ii]); } printf("\n"); if (d >= 10) { printf("                   transmit=%g",arr[0]); for (ii=1; ii<n/3; ii++) { printf(", %g", arr[ii]); } printf("\n"); } } } double thickZ(int z,int b,int b1,int b2,int b3,int b4,int z1,int z2,int z3, int z4,double f1,double f2,double f3,double f4) { double sum = 0.0; if( b ) { sum += (b1 && (z1==z)) ? f1 : 0; sum += (b2 && (z2==z)) ? f2 : 0; sum += (b3 && (z3==z)) ? f3 : 0; sum += (b4 && (z4==z)) ? f4 : 0; } return sum; } int numInArray(int N,short arr[],short value) { int i; for( i=0; i<N; i++ ) if( value==arr[i] ) return i; return 0; } static int fillShowArrays(char *species, int N, float *E, float *T) { int i, j, k; for (i=0; i<NUM_SPECIES; i++) { if (strcmp(filtermat[i].name, species) == 0) break; } if (i >= NUM_SPECIES) { return(1); } for (j=0; j<filtermat[i].numEntries; j++) { E[j] = filtermat[i].keV[j]; T[j] = filtermat[i].mu[j]; } k = j-1; for (; j<N; j++) { E[j] = filtermat[i].keV[k]; T[j] = filtermat[i].mu[k]; } return(0); }"#) => {};
 }
 
-/// Configuration for one PF4 bank.
-#[derive(Debug, Clone)]
-pub struct Pf4BankConfig {
-    /// Filter blade thicknesses in mm (4 blades).
-    pub thicknesses: [f64; 4],
-    /// Material index for each blade (0=Al, 1=Ti, 2=Glass, 3=Other).
-    pub material_indices: [u8; 4],
-    /// Material name for "Other" blades.
-    pub other_materials: [String; 4],
-}
+epics_seq_rs::include_program!("pf4");
 
-impl Default for Pf4BankConfig {
-    fn default() -> Self {
-        Self {
-            thicknesses: [0.0; 4],
-            material_indices: [0; 4],
-            other_materials: [String::new(), String::new(), String::new(), String::new()],
-        }
-    }
-}
-
-/// Full PF4 configuration.
-#[derive(Debug, Clone)]
-pub struct Pf4Config {
-    pub prefix: String,
-    pub hardware: String,
-    pub bank: String,
-}
-
-impl Pf4Config {
-    pub fn new(p: &str, h: &str, b: &str) -> Self {
-        Self {
-            prefix: p.to_string(),
-            hardware: h.to_string(),
-            bank: b.to_string(),
-        }
-    }
-}
-
-/// Absorption length of aluminium in microns at the given photon energy.
-///
-/// Direct port of `pf4.st`'s `AlAbsorptionLength` (`:484-505`): a 7-term
-/// polynomial in eV with two coefficient sets split at the `kink` energy, the
-/// input clamped to 60 keV. Returns microns.
-fn al_absorption_length_microns(kev: f64) -> f64 {
+/// `AlAbsorptionLength` (`pf4.st:495-516`), microns.
+fn AlAbsorptionLength(keV: f64) -> f64 {
     const WCOEF0: [f64; 7] = [
         1.90195,
         -0.00120447,
@@ -95,78 +50,64 @@ fn al_absorption_length_microns(kev: f64) -> f64 {
     ];
     const KINK: f64 = 26797.5;
 
-    let mut ev = kev * 1000.0; // convert to eV
-    if ev > 60000.0 {
-        ev = 60000.0;
+    let mut eV = keV * 1000.0;
+    if eV > 60000.0 {
+        eV = 60000.0;
     }
-    let coef = if ev < KINK { &WCOEF0 } else { &WCOEF1 };
+    let coef = if eV < KINK { &WCOEF0 } else { &WCOEF1 };
     let mut sum = 0.0;
     let mut power = 1.0;
-    for &c in coef.iter() {
+    for &c in coef {
         sum += c * power;
-        power *= ev;
+        power *= eV;
     }
     sum
 }
 
-/// Absorption length of titanium in microns at the given photon energy.
-///
-/// Direct port of `pf4.st`'s `TiAbsorptionLength` (`:509-538`): below 1 keV the
-/// coefficient `mu` is 0 (returns +inf → full transmission); separate fits
-/// between the L- and K-edges and above the K-edge. Returns `1/mu` in microns.
-fn ti_absorption_length_microns(kev: f64) -> f64 {
-    let ev = kev * 1000.0; // convert keV to eV
-    let mu = if ev < 1e3 {
-        0.0 // this routine only good above 1000 eV
-    } else if ev < 4966.4 {
-        // above L-edge, and below K-edge
+/// `TiAbsorptionLength` (`pf4.st:520-549`), microns: `1/0`, +inf, below
+/// 1 keV.
+fn TiAbsorptionLength(keV: f64) -> f64 {
+    let eV = keV * 1000.0;
+    let mu = if eV < 1e3 {
+        0.0
+    } else if eV < 4966.4 {
         let c0 = 0.00092284;
         let c1 = 2.5891e+08;
-        let pow_a = -2.6651;
-        c0 + c1 * ev.powf(pow_a)
+        let powA = -2.6651;
+        c0 + c1 * eV.powf(powA)
     } else {
-        // above the K-edge
         let offset = 5.63768167444831e-5;
         let amp = 24061652313.4169;
-        let pow_b = -2.91380053083527;
+        let powB = -2.91380053083527;
         let intercept = -0.268162843203489;
         let slope = 3.74221014277593e-5;
-        let amp_exp = -1.05663835782997;
-        let inv_tau = -0.000570785180739491;
-        let extra = if ev < 6456.0 {
-            intercept + slope * ev
+        let ampExp = -1.05663835782997;
+        let invTau = -0.000570785180739491;
+        let extra = if eV < 6456.0 {
+            intercept + slope * eV
         } else {
-            amp_exp * (inv_tau * ev).exp()
+            ampExp * (invTau * eV).exp()
         };
-        offset + amp * ev.powf(pow_b) + extra
+        offset + amp * eV.powf(powB) + extra
     };
     1.0 / mu
 }
 
-/// Absorption length of borosilicate glass in microns at the given photon energy.
-///
-/// Direct port of `pf4.st`'s `GlassAbsorptionLength` (`:553-610`): a piecewise
-/// polynomial in keV with breakpoints at the S, K, Ca and Fe K-edges, finally
-/// scaled by energy^3. Below 2 keV returns 0 (full absorption). Returns microns.
-fn glass_absorption_length_microns(kev: f64) -> f64 {
-    let kev2 = kev * kev;
-    let mut abs_length;
-    if kev < 2.0 {
-        abs_length = 0.0; // this routine only good above 2 keV
-    } else if kev < 2.472 {
-        // below Sulphur K edge
-        abs_length = 0.5059463974 + -0.1259565387 * kev + 0.01763933889 * kev2;
-    } else if kev < 3.6084 {
-        // above Sulphur K and below Potassium K
-        abs_length = 0.4570603245 + -0.08869920063 * kev + 0.01032934773 * kev2;
-    } else if kev < 4.0385 {
-        // above Potassium K and below Calcium K
-        abs_length = 0.3708574258 + -0.04453063888 * kev + 3.979930821e-3 * kev2;
-    } else if kev < 7.112 {
-        // above Calcium K and below Iron K
-        abs_length = 0.2830642538 + -0.0223186563 * kev + 1.412011413e-3 * kev2;
+/// `GlassAbsorptionLength` (`pf4.st:564-621`), microns: 0 below 2 keV.
+fn GlassAbsorptionLength(keV: f64) -> f64 {
+    let keV2 = keV * keV;
+    let mut absLength;
+    if keV < 2.0 {
+        absLength = 0.0;
+    } else if keV < 2.472 {
+        absLength = 0.5059463974 + -0.1259565387 * keV + 0.01763933889 * keV2;
+    } else if keV < 3.6084 {
+        absLength = 0.4570603245 + -0.08869920063 * keV + 0.01032934773 * keV2;
+    } else if keV < 4.0385 {
+        absLength = 0.3708574258 + -0.04453063888 * keV + 3.979930821e-3 * keV2;
+    } else if keV < 7.112 {
+        absLength = 0.2830642538 + -0.0223186563 * keV + 1.412011413e-3 * keV2;
     } else {
-        // above Iron K
         let c0 = 0.2715022686;
         let c1 = -0.02428526798;
         let c2 = 2.984228845e-3;
@@ -175,1006 +116,529 @@ fn glass_absorption_length_microns(kev: f64) -> f64 {
         let c5 = -1.869726202e-7;
         let c6 = 2.378962632e-9;
         let c7 = -1.270082060e-11;
-        abs_length = c0 + c1 * kev;
-        let mut kevn = kev2;
-        abs_length += c2 * kevn;
-        kevn *= kev;
-        abs_length += c3 * kevn;
-        kevn *= kev;
-        abs_length += c4 * kevn;
-        kevn *= kev;
-        abs_length += c5 * kevn;
-        kevn *= kev;
-        abs_length += c6 * kevn;
-        kevn *= kev;
-        abs_length += c7 * kevn;
+        absLength = c0 + c1 * keV;
+        let mut keVn = keV2;
+        absLength += c2 * keVn;
+        keVn *= keV;
+        absLength += c3 * keVn;
+        keVn *= keV;
+        absLength += c4 * keVn;
+        keVn *= keV;
+        absLength += c5 * keVn;
+        keVn *= keV;
+        absLength += c6 * keVn;
+        keVn *= keV;
+        absLength += c7 * keVn;
     }
-    abs_length *= kev * kev * kev; // finally scale by energy^3
-    abs_length
+    absLength *= keV * keV * keV;
+    absLength
 }
 
-/// Check whether an "Other" material name is legal (found in Chantler tables).
-pub fn is_legal_other(name: &str) -> bool {
-    find_material(name).is_some()
+/// C's `strcmp(filtermat[i].name, species) == 0` search, case-sensitive.
+fn filtermat(species: &[u8]) -> Option<&'static FilterMaterial> {
+    FILTER_MATERIALS
+        .iter()
+        .find(|m| m.name.as_bytes() == species)
 }
 
-/// Calculate the transmission for a single filter blade.
-///
-/// `thickness_mm` is in millimetres. Al, Ti and Glass use the analytic
-/// absorption-length fits ported from `pf4.st`; only "Other" reads the Chantler
-/// table, mirroring `RecalcFilters` (`pf4.st:661-699`) where the three named
-/// materials use `AlAbsorptionLength`/`TiAbsorptionLength`/`GlassAbsorptionLength`
-/// and only `z==3` calls `OtherAbsorptionLength`.
-///
-/// **DEVIATION from C, deliberate — CBUG-B4.** An "Other" blade whose material
-/// name is not in the Chantler table, or whose energy is outside that material's
-/// tabulated range, has **no absorption data** — and C answers that with `0.`
-/// (`pf4.st:629-631`, `:637-639`), which reaches the divisor below as
-/// `exp(-x*1000./0.)` = `exp(-inf)` = `0.0`: the blade is reported **perfectly
-/// opaque**, which is the maximally wrong answer, delivered with no error and no
-/// alarm. Both of C's `printf` diagnostics for it are commented out in the
-/// shipped source. A mistyped material name is an ordinary operator error.
-///
-/// The port cannot compute a transmission it has no data for and does not invent
-/// one: the blade is **not modelled** (transmission `1.0`, contributing no
-/// attenuation) and the condition is logged. It is already visible to the
-/// operator too — an unknown name drives `otherLegal` false
-/// ([`is_legal_other`], published via [`Pf4Actions::write_other_legal`]), which
-/// is the field the record has for exactly this.
-///
-/// Not modelling the blade is also the safe direction of the two wrong answers:
-/// a blade believed opaque is one the ranking would happily select to attenuate,
-/// letting far more beam through than predicted.
-pub fn calc_blade_transmission(
-    energy_kev: f64,
-    thickness_mm: f64,
-    mat_idx: u8,
-    other_name: &str,
-) -> f64 {
-    if thickness_mm <= 0.0 || energy_kev <= 0.0 {
-        return 1.0;
+/// `isLegalOther` (`pf4.st:624-631`).
+pub fn isLegalOther(s: impl CSrc) -> i32 {
+    s.with_c_bytes(filtermat).is_some() as i32
+}
+
+/// `OtherAbsorptionLength` (`pf4.st:633-661`), microns, on `[j-1, j]` as
+/// the `.st` copy fixes it (CBUG-B1, B2: see [`other_absorption_length_um`]);
+/// `0.` for an unknown species or an energy outside its table.
+fn OtherAbsorptionLength(keV: f64, species: &[u8]) -> f64 {
+    filtermat(species)
+        .and_then(|mat| other_absorption_length_um(mat, keV))
+        .unwrap_or(0.)
+}
+
+/// `RecalcFilters` (`pf4.st:664-733`): the transmission of the 16 blade
+/// combinations, each material's thickness summed into one exponent, sorted
+/// by decreasing transmission while the bank is on.
+pub fn RecalcFilters(
+    keV: f64,
+    bits: &impl Place<[i16; 16]>,
+    xmit: &impl Place<[f64; 16]>,
+    d: i32,
+    b: i32,
+    z1: i32,
+    z2: i32,
+    z3: i32,
+    z4: i32,
+    f1: f64,
+    f2: f64,
+    f3: f64,
+    f4: f64,
+    other1: impl CSrc,
+    other2: impl CSrc,
+    other3: impl CSrc,
+    other4: impl CSrc,
+) {
+    let z = [z1, z2, z3, z4];
+    let f = [f1, f2, f3, f4];
+    if d >= 10 {
+        printf("\nRecalcFilters: keV=%g\n", &[CArg::from(keV)]);
     }
-    let abs_len_microns = match mat_idx {
-        MAT_AL => al_absorption_length_microns(energy_kev),
-        MAT_TI => ti_absorption_length_microns(energy_kev),
-        MAT_GLASS => glass_absorption_length_microns(energy_kev),
-        MAT_OTHER => {
-            match find_material(other_name)
-                .and_then(|mat| other_absorption_length_um(mat, energy_kev))
-            {
-                Some(len) => len,
-                None => {
-                    tracing::error!(
-                        material = other_name,
-                        energy_kev,
-                        "pf4: no absorption data for this Other blade \
-                         (unknown material, or energy outside its Chantler table); \
-                         the blade is NOT modelled — its transmission is reported as 1.0"
-                    );
-                    return 1.0;
+    let absLenAl = AlAbsorptionLength(keV);
+    let absLenTi = TiAbsorptionLength(keV);
+    let absLenGlass = GlassAbsorptionLength(keV);
+    let species = [
+        (z1 == 3).then(|| other1.to_c_vec()),
+        (z2 == 3).then(|| other2.to_c_vec()),
+        (z3 == 3).then(|| other3.to_c_vec()),
+        (z4 == 3).then(|| other4.to_c_vec()),
+    ];
+    let absLenOther = species
+        .each_ref()
+        .map(|s| s.as_deref().map_or(0., |s| OtherAbsorptionLength(keV, s)));
+    for k in 0..4 {
+        if let Some(s) = &species[k]
+            && f[k] > 0.0
+            && absLenOther[k] == 0.0
+        {
+            printf(
+                "RecalcFilters: no data for Other blade %d '%s' at %g keV; it is left out\n",
+                &[
+                    CArg::from(k as i32 + 1),
+                    CArg::from(&s[..]),
+                    CArg::from(keV),
+                ],
+            );
+        }
+    }
+
+    let mut x = [0.0; 16];
+    let mut bit = [0i16; 16];
+    for i in 0..16 {
+        if b != 0 {
+            let inBeam = |k: usize, mat: i32| z[k] == mat && i & (1 << k) != 0;
+            let sum =
+                |mat: i32| (0..4).fold(0.0, |s, k| s + if inBeam(k, mat) { f[k] } else { 0.0 });
+            let (xAl, xTi, xGlass) = (sum(0), sum(1), sum(2));
+            if d >= 10 {
+                printf(
+                    "       in RecalcFilters %3d, Aluminum = %g,   Titanium = %g,   Glass = %g\n",
+                    &[
+                        CArg::from(i as i32),
+                        CArg::from(xAl),
+                        CArg::from(xTi),
+                        CArg::from(xGlass),
+                    ],
+                );
+            }
+            x[i] = (-xAl * 1000. / absLenAl).exp();
+            x[i] *= (-xTi * 1000. / absLenTi).exp();
+            if xGlass > 0.0 {
+                x[i] *= (-xGlass * 1000. / absLenGlass).exp();
+            }
+            for k in 0..4 {
+                let xOther = if inBeam(k, 3) { f[k] } else { 0.0 };
+                if xOther > 0.0 && absLenOther[k] > 0.0 {
+                    x[i] *= (-xOther * 1000. / absLenOther[k]).exp();
                 }
             }
+        } else {
+            x[i] = 1.;
         }
-        _ => return 1.0,
-    };
-    // C: xmit *= exp(-thickness_mm*1000 / absLen_microns) (pf4.st:693-699).
-    (-thickness_mm * 1000.0 / abs_len_microns).exp()
+        bit[i] = i as i16;
+    }
+    if b != 0 {
+        sortDecreasing(d, &mut x, &mut bit);
+    }
+    xmit.set(x);
+    bits.set(bit);
 }
 
-/// Calculate transmissions for all 16 combinations in a bank, sorted by
-/// decreasing transmission. Returns `(transmissions, bit_patterns)`.
-pub fn recalc_filters(
-    energy_kev: f64,
-    bank_config: &Pf4BankConfig,
-    bank_on: bool,
-) -> ([f64; NUM_COMBINATIONS], [u8; NUM_COMBINATIONS]) {
-    let mut xmit = [1.0_f64; NUM_COMBINATIONS];
-    let mut bits = [0_u8; NUM_COMBINATIONS];
-
-    if !bank_on || energy_kev <= 0.0 {
-        for (i, b) in bits.iter_mut().enumerate() {
-            *b = i as u8;
+/// `sortDecreasing` (`pf4.st:736-794`), an insertion sort.
+fn sortDecreasing(d: i32, arr: &mut [f64; 16], bits: &mut [i16; 16]) {
+    let print = |head: &str, arr: &[f64; 16], bits: &[i16; 16]| {
+        printf(head, &[CArg::from(bits[0])]);
+        for &b in &bits[1..] {
+            printf(",%d", &[CArg::from(b)]);
         }
-        return (xmit, bits);
-    }
-
-    // Calculate per-blade transmissions
-    let mut blade_trans = [1.0_f64; 4];
-    for (b, bt) in blade_trans.iter_mut().enumerate() {
-        *bt = calc_blade_transmission(
-            energy_kev,
-            bank_config.thicknesses[b],
-            bank_config.material_indices[b],
-            &bank_config.other_materials[b],
-        );
-    }
-
-    // Calculate all 16 combinations
-    for (i, (x, bi)) in xmit.iter_mut().zip(bits.iter_mut()).enumerate() {
-        *x = 1.0;
-        *bi = i as u8;
-        for (b, &bt) in blade_trans.iter().enumerate() {
-            if i & (1 << b) != 0 {
-                *x *= bt;
+        printf("\n", &[]);
+        if d >= 10 {
+            printf("                   transmit=%g", &[CArg::from(arr[0])]);
+            for &t in &arr[1..16 / 3] {
+                printf(", %g", &[CArg::from(t)]);
             }
+            printf("\n", &[]);
         }
+    };
+    if d >= 9 {
+        print("       before sorting, bits=%d", arr, bits);
     }
-
-    // Sort by decreasing transmission (insertion sort to match SNL)
-    sort_decreasing(&mut xmit, &mut bits);
-
-    (xmit, bits)
-}
-
-/// Sort arrays by decreasing transmission, keeping bits synchronized.
-fn sort_decreasing(xmit: &mut [f64; NUM_COMBINATIONS], bits: &mut [u8; NUM_COMBINATIONS]) {
-    for j in 1..NUM_COMBINATIONS {
-        let a = xmit[j];
-        let b = bits[j];
-        let mut i = j as isize - 1;
-        while i >= 0 && xmit[i as usize] < a {
-            xmit[(i + 1) as usize] = xmit[i as usize];
-            bits[(i + 1) as usize] = bits[i as usize];
-            i -= 1;
+    for jj in 1..16 {
+        let a = arr[jj];
+        let b = bits[jj];
+        let mut ii = jj;
+        while ii > 0 && arr[ii - 1] < a {
+            arr[ii] = arr[ii - 1];
+            bits[ii] = bits[ii - 1];
+            ii -= 1;
         }
-        xmit[(i + 1) as usize] = a;
-        bits[(i + 1) as usize] = b;
+        arr[ii] = a;
+        bits[ii] = b;
+    }
+    if d >= 8 {
+        print("       after sorting, bits=%d", arr, bits);
     }
 }
 
-/// Find the position index for a given bit pattern in the sorted bits array.
-pub fn find_position(bits: &[u8; NUM_COMBINATIONS], pattern: u8) -> usize {
-    bits.iter().position(|&b| b == pattern).unwrap_or(0)
-}
-
-/// Calculate total thickness of a given material type currently in beam.
-pub fn thickness_by_material(
-    target_mat: u8,
-    bank_on: bool,
-    bit_states: [bool; 4],
-    mat_indices: [u8; 4],
-    thicknesses: [f64; 4],
+/// `thickZ` (`pf4.st:798-812`): the thickness of material `z` in the beam.
+pub fn thickZ(
+    z: i32,
+    b: i32,
+    b1: i32,
+    b2: i32,
+    b3: i32,
+    b4: i32,
+    z1: i32,
+    z2: i32,
+    z3: i32,
+    z4: i32,
+    f1: f64,
+    f2: f64,
+    f3: f64,
+    f4: f64,
 ) -> f64 {
-    if !bank_on {
-        return 0.0;
-    }
     let mut sum = 0.0;
-    for i in 0..4 {
-        if bit_states[i] && mat_indices[i] == target_mat {
-            sum += thicknesses[i];
+    if b != 0 {
+        for (bn, zn, fk) in [(b1, z1, f1), (b2, z2, f2), (b3, z3, f3), (b4, z4, f4)] {
+            sum += if bn != 0 && zn == z { fk } else { 0.0 };
         }
     }
     sum
 }
 
-/// Extract the 4 bit states from a bit pattern.
-pub fn pattern_to_bits(pattern: u8) -> [bool; 4] {
-    [
-        pattern & 1 != 0,
-        pattern & 2 != 0,
-        pattern & 4 != 0,
-        pattern & 8 != 0,
-    ]
+/// `numInArray` (`pf4.st:817-823`): the first index of `arr` holding
+/// `value`, else 0.
+pub fn numInArray(N: i32, arr: &impl Place<[i16; 16]>, value: i16) -> i32 {
+    arr.modify(|arr| {
+        arr.iter()
+            .take(N.max(0) as usize)
+            .position(|&a| a == value)
+            .map_or(0, |i| i as i32)
+    })
 }
 
-/// Encode 4 bit states into a bit pattern.
-pub fn bits_to_pattern(b1: bool, b2: bool, b3: bool, b4: bool) -> u8 {
-    (b1 as u8) | ((b2 as u8) << 1) | ((b3 as u8) << 2) | ((b4 as u8) << 3)
-}
-
-/// PF4 bank controller — pure logic.
-#[derive(Debug, Clone)]
-pub struct Pf4Controller {
-    pub state: Pf4State,
-    pub bank_config: Pf4BankConfig,
-    pub energy_kev: f64,
-    pub bank_on: bool,
-    pub use_mono: bool,
-    pub local_energy: f64,
-    pub mono_energy: f64,
-
-    /// Current filter bit states.
-    pub bit_states: [bool; 4],
-    /// Current filter position index (0-15 in sorted order).
-    pub filter_pos: usize,
-    /// Sorted transmissions.
-    pub xmit: [f64; NUM_COMBINATIONS],
-    /// Sorted bit patterns.
-    pub bits: [u8; NUM_COMBINATIONS],
-    /// Current bank transmission.
-    pub transmission: f64,
-    /// Current bank inverse transmission.
-    pub inv_transmission: f64,
-
-    /// Combined Al thickness in beam (mm).
-    pub filter_al: f64,
-    /// Combined Ti thickness in beam (mm).
-    pub filter_ti: f64,
-    /// Combined Glass thickness in beam (mm).
-    pub filter_glass: f64,
-}
-
-impl Default for Pf4Controller {
-    fn default() -> Self {
-        let mut bits = [0u8; NUM_COMBINATIONS];
-        for (i, b) in bits.iter_mut().enumerate() {
-            *b = i as u8;
-        }
-        Self {
-            state: Pf4State::Init,
-            bank_config: Pf4BankConfig::default(),
-            energy_kev: 10.0,
-            bank_on: false,
-            use_mono: true,
-            local_energy: 10.0,
-            mono_energy: 10.0,
-            bit_states: [false; 4],
-            filter_pos: 0,
-            xmit: [1.0; NUM_COMBINATIONS],
-            bits,
-            transmission: 1.0,
-            inv_transmission: 1.0,
-            filter_al: 0.0,
-            filter_ti: 0.0,
-            filter_glass: 0.0,
-        }
-    }
-}
-
-/// Events that drive the PF4 state machine.
-#[derive(Debug, Clone)]
-pub enum Pf4Event {
-    /// Filter control bits changed from hardware.
-    BitsChanged([bool; 4]),
-    /// Mono energy changed.
-    MonoEnergyChanged(f64),
-    /// Local energy changed.
-    LocalEnergyChanged(f64),
-    /// Energy source selection changed (true = use mono).
-    EnergySelectChanged(bool),
-    /// Bank on/off control changed.
-    BankControlChanged(bool),
-    /// Filter thicknesses changed.
-    ThicknessChanged([f64; 4]),
-    /// Material indices changed.
-    MaterialChanged([u8; 4]),
-    /// "Other" material names changed.
-    OtherMaterialChanged([String; 4]),
-    /// Filter position selection changed (user picks from sorted list).
-    FilterPosChanged(usize),
-}
-
-/// Actions the caller should take after processing a PF4 event.
-#[derive(Debug, Clone, Default)]
-pub struct Pf4Actions {
-    /// New bit states to write to hardware.
-    pub set_bits: Option<[bool; 4]>,
-    /// Updated transmission labels for all 16 positions.
-    pub write_labels: Option<[String; NUM_COMBINATIONS]>,
-    /// Updated transmission value.
-    pub write_transmission: Option<f64>,
-    /// Updated inverse transmission value.
-    pub write_inv_transmission: Option<f64>,
-    /// Other material legality flags.
-    pub write_other_legal: Option<[bool; 4]>,
-    /// Material thickness readbacks.
-    pub write_filter_al: Option<f64>,
-    pub write_filter_ti: Option<f64>,
-    pub write_filter_glass: Option<f64>,
-}
-
-impl Pf4Controller {
-    /// Recompute transmission / inverse-transmission for the current filter
-    /// position and stage the matching writes.
-    ///
-    /// C (pf4.st:281-282) PVPUTs `trans` unconditionally but `invtrans` only when
-    /// `trans > 0.0`; a zero transmission (e.g. a glass blade below 2 keV) leaves
-    /// `{H}invTrans{B}` at its prior value rather than publishing +inf. This is the
-    /// single owner of both writes so the gate holds on every path.
-    fn emit_transmission(&mut self, actions: &mut Pf4Actions) {
-        self.transmission = self.xmit[self.filter_pos];
-        self.inv_transmission = if self.transmission > 0.0 {
-            1.0 / self.transmission
-        } else {
-            f64::INFINITY
-        };
-        actions.write_transmission = Some(self.transmission);
-        if self.transmission > 0.0 {
-            actions.write_inv_transmission = Some(self.inv_transmission);
-        }
-    }
-
-    /// Recalculate all filter transmissions and update derived values.
-    pub fn recalculate(&mut self) -> Pf4Actions {
-        let mut actions = Pf4Actions::default();
-
-        let effective_energy = if self.use_mono {
-            self.mono_energy
-        } else {
-            self.local_energy
-        };
-        self.energy_kev = effective_energy;
-
-        let (xmit, bits) = recalc_filters(self.energy_kev, &self.bank_config, self.bank_on);
-        self.xmit = xmit;
-        self.bits = bits;
-
-        // Update filter position
-        let current_pattern = bits_to_pattern(
-            self.bit_states[0],
-            self.bit_states[1],
-            self.bit_states[2],
-            self.bit_states[3],
-        );
-        self.filter_pos = find_position(&self.bits, current_pattern);
-        self.emit_transmission(&mut actions);
-
-        // Material thicknesses
-        self.filter_al = thickness_by_material(
-            MAT_AL,
-            self.bank_on,
-            self.bit_states,
-            self.bank_config.material_indices,
-            self.bank_config.thicknesses,
-        );
-        self.filter_ti = thickness_by_material(
-            MAT_TI,
-            self.bank_on,
-            self.bit_states,
-            self.bank_config.material_indices,
-            self.bank_config.thicknesses,
-        );
-        self.filter_glass = thickness_by_material(
-            MAT_GLASS,
-            self.bank_on,
-            self.bit_states,
-            self.bank_config.material_indices,
-            self.bank_config.thicknesses,
-        );
-
-        // Build labels
-        let mut labels: [String; NUM_COMBINATIONS] = Default::default();
-        for (label, x) in labels.iter_mut().zip(self.xmit.iter()) {
-            *label = format!("{:.3e}", x);
-        }
-        actions.write_labels = Some(labels);
-        // trans / invtrans were staged by emit_transmission above (invtrans gated
-        // on trans > 0).
-        // C only PVPUTs filterAl/Ti/Gl when a blade uses that material
-        // (pf4.st:277-279: `if(z1==0||z2==0||z3==0||z4==0)` etc.), and only in
-        // the bankctl==2 recompute branch, which is reached solely while the bank
-        // is on. A material with no blade — or any material while the bank is off
-        // (thickZ returns 0) — is left at its prior value, not overwritten with 0.
-        let mats = &self.bank_config.material_indices;
-        if self.bank_on && mats.contains(&MAT_AL) {
-            actions.write_filter_al = Some(self.filter_al);
-        }
-        if self.bank_on && mats.contains(&MAT_TI) {
-            actions.write_filter_ti = Some(self.filter_ti);
-        }
-        if self.bank_on && mats.contains(&MAT_GLASS) {
-            actions.write_filter_glass = Some(self.filter_glass);
-        }
-
-        actions
-    }
-
-    /// Process a single event.
-    pub fn step(&mut self, event: Pf4Event) -> Pf4Actions {
-        match event {
-            Pf4Event::BitsChanged(new_bits) => {
-                self.bit_states = new_bits;
-                let current_pattern =
-                    bits_to_pattern(new_bits[0], new_bits[1], new_bits[2], new_bits[3]);
-                self.filter_pos = find_position(&self.bits, current_pattern);
-                let mut actions = Pf4Actions::default();
-                self.emit_transmission(&mut actions);
-                actions
-            }
-
-            Pf4Event::MonoEnergyChanged(e) => {
-                self.mono_energy = e;
-                if self.use_mono {
-                    self.local_energy = e;
-                    self.recalculate()
-                } else {
-                    Pf4Actions::default()
-                }
-            }
-
-            Pf4Event::LocalEnergyChanged(e) => {
-                self.local_energy = e;
-                self.use_mono = false;
-                self.recalculate()
-            }
-
-            Pf4Event::EnergySelectChanged(use_mono) => {
-                self.use_mono = use_mono;
-                if use_mono {
-                    self.local_energy = self.mono_energy;
-                }
-                self.recalculate()
-            }
-
-            Pf4Event::BankControlChanged(on) => {
-                self.bank_on = on;
-                if on {
-                    self.recalculate()
-                } else {
-                    Pf4Actions::default()
-                }
-            }
-
-            Pf4Event::ThicknessChanged(t) => {
-                self.bank_config.thicknesses = t;
-                self.recalculate()
-            }
-
-            Pf4Event::MaterialChanged(m) => {
-                self.bank_config.material_indices = m;
-                self.recalculate()
-            }
-
-            Pf4Event::OtherMaterialChanged(names) => {
-                let legal: [bool; 4] = [
-                    is_legal_other(&names[0]),
-                    is_legal_other(&names[1]),
-                    is_legal_other(&names[2]),
-                    is_legal_other(&names[3]),
-                ];
-                self.bank_config.other_materials = names;
-                let mut actions = self.recalculate();
-                actions.write_other_legal = Some(legal);
-                actions
-            }
-
-            Pf4Event::FilterPosChanged(pos) => {
-                if pos < NUM_COMBINATIONS && self.bank_on {
-                    self.filter_pos = pos;
-                    let pattern = self.bits[pos];
-                    let new_bits = pattern_to_bits(pattern);
-
-                    // Insert first, then remove
-                    let mut actions = Pf4Actions {
-                        set_bits: Some(new_bits),
-                        ..Default::default()
-                    };
-                    self.bit_states = new_bits;
-                    self.emit_transmission(&mut actions);
-                    actions
-                } else {
-                    Pf4Actions::default()
-                }
-            }
-        }
-    }
-}
-
-/// Async entry point — runs the PF4 bank state machine against live PVs.
-pub async fn run(
-    config: Pf4Config,
-    db: PvDatabase,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    use tokio::time::{Duration, sleep};
-
-    println!(
-        "pf4: starting for prefix={}{} bank {}",
-        config.prefix, config.hardware, config.bank
-    );
-
-    let my_origin = alloc_origin();
-    let ph = format!("{}{}", config.prefix, config.hardware);
-    let b = &config.bank;
-
-    // Connect PVs
-    let ch_b1 = DbChannel::with_origin(&db, &format!("{ph}displayBit1{b}"), my_origin);
-    let ch_b2 = DbChannel::with_origin(&db, &format!("{ph}displayBit2{b}"), my_origin);
-    let ch_b3 = DbChannel::with_origin(&db, &format!("{ph}displayBit3{b}"), my_origin);
-    let ch_b4 = DbChannel::with_origin(&db, &format!("{ph}displayBit4{b}"), my_origin);
-    let ch_trans = DbChannel::with_origin(&db, &format!("{ph}trans{b}"), my_origin);
-    let ch_inv_trans = DbChannel::with_origin(&db, &format!("{ph}invTrans{b}"), my_origin);
-    let ch_bankctl = DbChannel::with_origin(&db, &format!("{ph}bank{b}"), my_origin);
-    let _ch_filpos = DbChannel::with_origin(&db, &format!("{ph}fPos{b}"), my_origin);
-    let ch_select_energy = DbChannel::with_origin(&db, &format!("{ph}useMono"), my_origin);
-    let ch_local_energy = DbChannel::with_origin(&db, &format!("{ph}E:local"), my_origin);
-    let ch_filter_al = DbChannel::with_origin(&db, &format!("{ph}filterAl"), my_origin);
-    let ch_filter_ti = DbChannel::with_origin(&db, &format!("{ph}filterTi"), my_origin);
-    let ch_filter_glass = DbChannel::with_origin(&db, &format!("{ph}filterGlass"), my_origin);
-
-    let ch_f1 = DbChannel::with_origin(&db, &format!("{ph}f1{b}"), my_origin);
-    let ch_f2 = DbChannel::with_origin(&db, &format!("{ph}f2{b}"), my_origin);
-    let ch_f3 = DbChannel::with_origin(&db, &format!("{ph}f3{b}"), my_origin);
-    let ch_f4 = DbChannel::with_origin(&db, &format!("{ph}f4{b}"), my_origin);
-
-    let ch_z1 = DbChannel::with_origin(&db, &format!("{ph}Z1{b}"), my_origin);
-    let ch_z2 = DbChannel::with_origin(&db, &format!("{ph}Z2{b}"), my_origin);
-    let ch_z3 = DbChannel::with_origin(&db, &format!("{ph}Z3{b}"), my_origin);
-    let ch_z4 = DbChannel::with_origin(&db, &format!("{ph}Z4{b}"), my_origin);
-
-    // Build multi-monitor
-    let monitored_pvs: Vec<String> = vec![
-        format!("{ph}displayBit1{b}"),
-        format!("{ph}bank{b}"),
-        format!("{ph}fPos{b}"),
-        format!("{ph}E:local"),
-        format!("{ph}useMono"),
-        format!("{ph}f1{b}"),
-        format!("{ph}Z1{b}"),
-    ];
-    let mut monitor = DbMultiMonitor::new_filtered(&db, &monitored_pvs, my_origin).await;
-
-    let mut ctrl = Pf4Controller::default();
-
-    // Read initial values
-    ctrl.mono_energy = {
-        let v = ch_local_energy.get_f64().await;
-        if v > 0.0 { v } else { 10.0 }
+/// `fillShowArrays` (`pf4.st:825-845`): a species' table into `E`/`T`,
+/// padded with its last entry up to `N`; 1 for an unknown species.
+pub fn fillShowArrays(
+    species: impl CSrc,
+    N: i32,
+    E: &impl Place<[f32; 300]>,
+    T: &impl Place<[f32; 300]>,
+) -> i32 {
+    let Some(mat) = species.with_c_bytes(filtermat) else {
+        return 1;
     };
-    ctrl.local_energy = ctrl.mono_energy;
-    ctrl.bank_config.thicknesses = [
-        ch_f1.get_f64().await,
-        ch_f2.get_f64().await,
-        ch_f3.get_f64().await,
-        ch_f4.get_f64().await,
-    ];
-    ctrl.bank_config.material_indices = [
-        ch_z1.get_i16().await as i32 as u8,
-        ch_z2.get_i16().await as i32 as u8,
-        ch_z3.get_i16().await as i32 as u8,
-        ch_z4.get_i16().await as i32 as u8,
-    ];
-    ctrl.bit_states = [
-        ch_b1.get_i16().await as i32 != 0,
-        ch_b2.get_i16().await as i32 != 0,
-        ch_b3.get_i16().await as i32 != 0,
-        ch_b4.get_i16().await as i32 != 0,
-    ];
-    ctrl.bank_on = ch_bankctl.get_i16().await as i32 != 0;
-    ctrl.use_mono = ch_select_energy.get_i16().await as i32 != 0;
-
-    let init_actions = ctrl.recalculate();
-    apply_pf4_actions(
-        &init_actions,
-        &ch_trans,
-        &ch_inv_trans,
-        &ch_filter_al,
-        &ch_filter_ti,
-        &ch_filter_glass,
-    )
-    .await;
-
-    tracing::info!("pf4 state machine running for {ph} bank {b}");
-
-    let pv_b1 = format!("{ph}displayBit1{b}");
-    let pv_bankctl = format!("{ph}bank{b}");
-    let pv_filpos = format!("{ph}fPos{b}");
-    let pv_local_energy = format!("{ph}E:local");
-    let pv_select_energy = format!("{ph}useMono");
-    let pv_f1 = format!("{ph}f1{b}");
-    let pv_z1 = format!("{ph}Z1{b}");
-
-    loop {
-        let (changed_pv, new_val) = monitor.wait_change().await;
-
-        let event: Option<Pf4Event> = if changed_pv == pv_b1 {
-            let bits = [
-                ch_b1.get_i16().await as i32 != 0,
-                ch_b2.get_i16().await as i32 != 0,
-                ch_b3.get_i16().await as i32 != 0,
-                ch_b4.get_i16().await as i32 != 0,
-            ];
-            Some(Pf4Event::BitsChanged(bits))
-        } else if changed_pv == pv_bankctl {
-            Some(Pf4Event::BankControlChanged(new_val as i32 != 0))
-        } else if changed_pv == pv_filpos {
-            Some(Pf4Event::FilterPosChanged(new_val as i32 as usize))
-        } else if changed_pv == pv_local_energy {
-            Some(Pf4Event::LocalEnergyChanged(new_val))
-        } else if changed_pv == pv_select_energy {
-            Some(Pf4Event::EnergySelectChanged(new_val as i32 != 0))
-        } else if changed_pv == pv_f1 {
-            let t = [
-                ch_f1.get_f64().await,
-                ch_f2.get_f64().await,
-                ch_f3.get_f64().await,
-                ch_f4.get_f64().await,
-            ];
-            Some(Pf4Event::ThicknessChanged(t))
-        } else if changed_pv == pv_z1 {
-            let m = [
-                ch_z1.get_i16().await as i32 as u8,
-                ch_z2.get_i16().await as i32 as u8,
-                ch_z3.get_i16().await as i32 as u8,
-                ch_z4.get_i16().await as i32 as u8,
-            ];
-            Some(Pf4Event::MaterialChanged(m))
-        } else {
-            None
-        };
-
-        if let Some(ev) = event {
-            let actions = ctrl.step(ev);
-            apply_pf4_actions(
-                &actions,
-                &ch_trans,
-                &ch_inv_trans,
-                &ch_filter_al,
-                &ch_filter_ti,
-                &ch_filter_glass,
-            )
-            .await;
-
-            if let Some(bits) = actions.set_bits {
-                // Insert first, then remove (as per original SNL)
-                if bits[0] {
-                    let _ = ch_b1.put_i16_process(1_i16).await;
-                }
-                if bits[1] {
-                    let _ = ch_b2.put_i16_process(1_i16).await;
-                }
-                if bits[2] {
-                    let _ = ch_b3.put_i16_process(1_i16).await;
-                }
-                if bits[3] {
-                    let _ = ch_b4.put_i16_process(1_i16).await;
-                }
-                sleep(Duration::from_millis(200)).await;
-                if !bits[0] {
-                    let _ = ch_b1.put_i16_process(0_i16).await;
-                }
-                if !bits[1] {
-                    let _ = ch_b2.put_i16_process(0_i16).await;
-                }
-                if !bits[2] {
-                    let _ = ch_b3.put_i16_process(0_i16).await;
-                }
-                if !bits[3] {
-                    let _ = ch_b4.put_i16_process(0_i16).await;
-                }
-            }
-        }
-    }
-}
-
-async fn apply_pf4_actions(
-    actions: &Pf4Actions,
-    ch_trans: &DbChannel,
-    ch_inv_trans: &DbChannel,
-    ch_filter_al: &DbChannel,
-    ch_filter_ti: &DbChannel,
-    ch_filter_glass: &DbChannel,
-) {
-    if let Some(t) = actions.write_transmission {
-        let _ = ch_trans.put_f64_process(t).await;
-    }
-    if let Some(t) = actions.write_inv_transmission {
-        let _ = ch_inv_trans.put_f64_process(t).await;
-    }
-    if let Some(t) = actions.write_filter_al {
-        let _ = ch_filter_al.put_f64_process(t).await;
-    }
-    if let Some(t) = actions.write_filter_ti {
-        let _ = ch_filter_ti.put_f64_process(t).await;
-    }
-    if let Some(t) = actions.write_filter_glass {
-        let _ = ch_filter_glass.put_f64_process(t).await;
-    }
+    // The `.st` copy bounds `N` by the arrays at its call.
+    let fill = |dst: &mut [f32; 300], src: &[f32]| {
+        let n = N.max(0) as usize;
+        let entries = src.len().min(dst.len());
+        dst[..entries].copy_from_slice(&src[..entries]);
+        let k = entries.saturating_sub(1);
+        dst.iter_mut()
+            .take(n)
+            .skip(entries)
+            .for_each(|v| *v = src[k]);
+    };
+    E.modify(|e| fill(e, mat.kev));
+    T.modify(|t| fill(t, mat.mu));
+    0
 }
 
 #[cfg(test)]
-#[allow(clippy::field_reassign_with_default, clippy::needless_range_loop)]
 mod tests {
+    use std::cell::RefCell;
+    use std::io;
+    use std::rc::Rc;
+
     use super::*;
+    use epics_libcom_rs::runtime::stdio::redirect_stdout;
+    use epics_seq_rs::SeqVar;
 
-    #[test]
-    fn test_bits_to_pattern() {
-        assert_eq!(bits_to_pattern(false, false, false, false), 0);
-        assert_eq!(bits_to_pattern(true, false, false, false), 1);
-        assert_eq!(bits_to_pattern(false, true, false, false), 2);
-        assert_eq!(bits_to_pattern(true, true, true, true), 15);
-    }
-
-    #[test]
-    fn test_pattern_to_bits() {
-        assert_eq!(pattern_to_bits(0), [false, false, false, false]);
-        assert_eq!(pattern_to_bits(5), [true, false, true, false]);
-        assert_eq!(pattern_to_bits(15), [true, true, true, true]);
-    }
-
-    #[test]
-    fn test_roundtrip_bits() {
-        for i in 0..16u8 {
-            let bits = pattern_to_bits(i);
-            assert_eq!(bits_to_pattern(bits[0], bits[1], bits[2], bits[3]), i);
-        }
-    }
-
-    #[test]
-    fn test_is_legal_other() {
-        assert!(is_legal_other("Cu"));
-        assert!(is_legal_other("Al"));
-        assert!(!is_legal_other("Unobtainium"));
-        assert!(!is_legal_other(""));
-    }
-
-    /// CBUG-B4 — an "Other" blade with an unknown material name has no
-    /// absorption data, so it is NOT MODELLED (1.0) and `otherLegal` says so.
-    ///
-    /// This test used to pin C's answer, `0.0`: C returns `0.` for the unknown
-    /// species (`pf4.st:629-631`) and then divides by it — `exp(-t*1000/0)` =
-    /// `exp(-inf)` = 0 — reporting the blade **fully opaque**, silently.
-    #[test]
-    fn test_b4_other_unknown_material_is_not_modelled() {
-        assert_eq!(
-            calc_blade_transmission(10.0, 1.0, MAT_OTHER, "Unobtainium"),
-            1.0 // C: 0.0 (fully opaque)
+    /// [`RecalcFilters`] with the bank on (`bankctl` 3, as `bankControl`
+    /// calls it): the transmissions and bit patterns it leaves.
+    fn recalc(keV: f64, z: [i32; 4], f: [f64; 4], other: [&str; 4]) -> ([f64; 16], [i16; 16]) {
+        let (bits, xmit) = (SeqVar::new([0i16; 16]), SeqVar::new([0.0; 16]));
+        let [z1, z2, z3, z4] = z;
+        let [f1, f2, f3, f4] = f;
+        let [o1, o2, o3, o4] = other;
+        RecalcFilters(
+            keV, &bits, &xmit, 0, 3, z1, z2, z3, z4, f1, f2, f3, f4, o1, o2, o3, o4,
         );
-        // C's strcmp is case-sensitive (pf4.st:627), so "cu" is unknown too.
-        assert_eq!(calc_blade_transmission(10.0, 1.0, MAT_OTHER, "cu"), 1.0);
-        // ... and the operator sees it: the record publishes otherLegal.
-        assert!(!is_legal_other("cu"));
-        assert!(!is_legal_other("Unobtainium"));
+        (xmit.get(), bits.get())
     }
 
-    /// CBUG-B4 — the same for an energy outside the material's tabulated range.
-    /// This test used to pin C's `0.0` (fully opaque).
+    /// One blade of `mm` in bank position 1, the rest empty Al.
+    fn one_blade(keV: f64, mm: f64, z: i32, other: &str) -> f64 {
+        let (xmit, bits) = recalc(keV, [z, 0, 0, 0], [mm, 0.0, 0.0, 0.0], [other, "", "", ""]);
+        xmit[bits.iter().position(|&b| b == 1).unwrap()]
+    }
+
+    /// C `RecalcFilters` at 10 keV for Al 0.2 / Ti 0.02 / glass 0.5 / Al 0.4 mm,
+    /// printed with `%.17g` from `pf4.st`'s own functions. Positions 9, 11, 13
+    /// and 15 hold both Al blades: C sums them into one exponent, and a product
+    /// of per-blade factors is off in the last bits there.
     #[test]
-    fn test_b4_other_energy_above_the_table_is_not_modelled() {
-        // Cu's table ends at 432.95 keV; at or above the last node the scan for
-        // `keV < keV[j]` never breaks, so there is no interval and no data.
+    fn recalc_filters_is_c_recalc_filters_to_the_bit() {
+        let c_bits = [0, 2, 1, 3, 4, 8, 6, 10, 5, 9, 7, 11, 12, 14, 13, 15];
+        let c_xmit = [
+            1.0,
+            0.3695423943703097,
+            0.2506658388144326,
+            0.09263165426232754,
+            0.07205806894912094,
+            0.0628333627485431,
+            0.02662851133315902,
+            0.023219591316434845,
+            0.01806249629647962,
+            0.01575017757889507,
+            0.0066748581297059306,
+            0.005820358334262452,
+            0.004527650785239646,
+            0.0016731589120500719,
+            0.0011349273819409196,
+            0.00041940378215887445,
+        ];
+        assert_eq!(
+            recalc(10.0, [0, 1, 2, 0], [0.2, 0.02, 0.5, 0.4], ["", "", "", ""]),
+            (c_xmit, c_bits)
+        );
+    }
+
+    /// The `.st` copy's `RecalcFilters` at 1.5 keV for the same blades,
+    /// printed with `%.17g`: glass absorbs fully below 2 keV, and the eight
+    /// combinations without it are numbers where upstream C gave NaN.
+    #[test]
+    fn recalc_filters_below_2_kev_is_the_st_c_to_the_bit() {
+        let c_bits = [0, 2, 1, 3, 8, 10, 9, 11, 4, 5, 6, 7, 12, 13, 14, 15];
+        let mut c_xmit = [0.0; 16];
+        c_xmit[..8].copy_from_slice(&[
+            1.0,
+            1.890233923500925e-08,
+            2.967151325687518e-63,
+            5.608610091975288e-71,
+            8.803986989529196e-126,
+            1.664159486966887e-133,
+            2.6122761667314988e-188,
+            4.937813027908837e-196,
+        ]);
+        assert_eq!(
+            recalc(1.5, [0, 1, 2, 0], [0.2, 0.02, 0.5, 0.4], ["", "", "", ""]),
+            (c_xmit, c_bits)
+        );
+    }
+
+    /// What `f` prints through the thread's stdout.
+    fn stdout_of(f: impl FnOnce()) -> String {
+        #[derive(Clone, Default)]
+        struct Sink(Rc<RefCell<Vec<u8>>>);
+        impl io::Write for Sink {
+            fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+                self.0.borrow_mut().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let sink = Sink::default();
+        redirect_stdout(sink.clone(), f);
+        String::from_utf8(sink.0.take()).unwrap()
+    }
+
+    /// An oracle file without its `#` header.
+    fn oracle(text: &str) -> String {
+        text.split_inclusive('\n')
+            .filter(|l| !l.starts_with('#'))
+            .collect()
+    }
+
+    /// C's console lines at `d` 10 and 8, the Other blade without data
+    /// included, byte for byte.
+    #[test]
+    fn recalc_filters_prints_c_s_lines() {
+        let (bits, xmit) = (SeqVar::new([0i16; 16]), SeqVar::new([0.0; 16]));
+        let out = stdout_of(|| {
+            RecalcFilters(
+                10.0,
+                &bits,
+                &xmit,
+                10,
+                1,
+                0,
+                1,
+                3,
+                3,
+                0.2,
+                0.02,
+                0.5,
+                0.4,
+                "",
+                "",
+                "Cu",
+                "Unobtainium",
+            );
+            RecalcFilters(
+                10.0, &bits, &xmit, 8, 1, 0, 1, 2, 0, 0.2, 0.02, 0.5, 0.4, "", "", "", "",
+            );
+        });
+        let c = include_str!("../../tests/oracle/pf4_RecalcFilters_print.txt");
+        assert_eq!(out, oracle(c));
+    }
+
+    /// A bank that is off transmits fully, in bit order.
+    #[test]
+    fn recalc_filters_bank_off() {
+        let (bits, xmit) = (SeqVar::new([7i16; 16]), SeqVar::new([0.0; 16]));
+        RecalcFilters(
+            10.0, &bits, &xmit, 0, 0, 0, 0, 0, 0, 1.0, 1.0, 1.0, 1.0, "", "", "", "",
+        );
+        assert_eq!(xmit.get(), [1.0; 16]);
+        assert_eq!(bits.get(), std::array::from_fn(|i| i as i16));
+    }
+
+    #[test]
+    fn is_legal_other_is_a_case_sensitive_lookup() {
+        assert_eq!(isLegalOther("Cu"), 1);
+        assert_eq!(isLegalOther("Al"), 1);
+        assert_eq!(isLegalOther("cu"), 0);
+        assert_eq!(isLegalOther("Unobtainium"), 0);
+        assert_eq!(isLegalOther(""), 0);
+    }
+
+    /// CBUG-B4: an Other blade of an unknown species is left out (1.0),
+    /// where upstream C divided by its `0.` (`pf4.st:640-642`) and reported
+    /// it opaque.
+    #[test]
+    fn an_other_blade_of_an_unknown_species_is_left_out() {
+        assert_eq!(one_blade(10.0, 1.0, 3, "Unobtainium"), 1.0);
+        assert_eq!(one_blade(10.0, 1.0, 3, "cu"), 1.0);
+    }
+
+    /// CBUG-B4 for an energy at or above the end of the table.
+    #[test]
+    fn an_other_blade_above_its_table_is_left_out() {
         let cu = crate::data::chantler::find_material("Cu").unwrap();
         let last = cu.kev[cu.kev.len() - 1] as f64;
-        assert_eq!(calc_blade_transmission(500.0, 1.0, MAT_OTHER, "Cu"), 1.0);
-        assert_eq!(calc_blade_transmission(last, 1.0, MAT_OTHER, "Cu"), 1.0);
-        // Just below the last node is inside the table (the top bin), so the
-        // blade IS modelled — the boundary is the node itself.
-        let inside = calc_blade_transmission(last - 0.001, 1.0, MAT_OTHER, "Cu");
+        assert_eq!(one_blade(500.0, 1.0, 3, "Cu"), 1.0);
+        assert_eq!(one_blade(last, 1.0, 3, "Cu"), 1.0);
+        let inside = one_blade(last - 0.001, 1.0, 3, "Cu");
         assert!(inside > 0.0 && inside < 1.0);
     }
 
+    /// C guards the Other multiply with `if (xOther1 > 0 ...)` (`pf4.st:723`),
+    /// so a blade of zero thickness is 1.0 whatever its species.
     #[test]
-    fn test_r6_63_other_zero_thickness_stays_transparent() {
-        // C guards the multiply with `if (xOther1 > 0)` (pf4.st:696), so a blade
-        // of zero thickness contributes 1.0 even with a bad material name.
-        assert_eq!(
-            calc_blade_transmission(10.0, 0.0, MAT_OTHER, "Unobtainium"),
-            1.0
-        );
+    fn an_other_blade_of_zero_thickness_transmits() {
+        assert_eq!(one_blade(10.0, 0.0, 3, "Unobtainium"), 1.0);
     }
 
-    /// CBUG-B1 — the "Other" blade's transmission now comes from the interval
-    /// containing the energy. This test used to pin C's backwards extrapolation:
-    /// `absLen(Cu, 10 keV) = 5.28411457133 um -> exp(-1/5.28411457133) =
-    /// 0.827582511947`. The correct absorption length is 1e4/(rho * mu) with
-    /// `mu = 215.521099278` (the value C's own `calcTrans` gives at 10 keV).
+    /// The `.st` copy's `OtherAbsorptionLength`, built with `chantler.c`, to
+    /// the bit: Cu at 8, 10, 100 and 432.9 keV (its top interval), and its
+    /// `0.` below the first node and from the last one.
     #[test]
-    fn test_b1_other_in_range_uses_the_containing_interval() {
+    fn other_absorption_length_is_the_st_c_to_the_bit() {
+        for (keV, c) in [
+            (8.0, 0x4035f2e07fa76aaf),
+            (10.0, 0x4014b6c320d93793),
+            (100.0, 0x40a32842dce22521),
+            (432.9, 0x40c83b37843f5c4b),
+        ] {
+            assert_eq!(OtherAbsorptionLength(keV, b"Cu"), f64::from_bits(c));
+        }
+        for keV in [0.005, 433.0, 1000.0] {
+            assert_eq!(OtherAbsorptionLength(keV, b"Cu"), 0.0);
+        }
+    }
+
+    /// CBUG-B1: the Other blade comes from the interval holding the
+    /// energy, where C extrapolates off the one above it:
+    /// `absLen(Cu, 10 keV) = 5.28411457133 um -> 0.827582511947` for 1 um.
+    #[test]
+    fn an_other_blade_uses_the_interval_holding_the_energy() {
         let cu = crate::data::chantler::find_material("Cu").unwrap();
-        let abs_len_um = 1.0e4 / (cu.density * 215.521099278);
-        let want = (-1.0 / abs_len_um).exp();
-        let t = calc_blade_transmission(10.0, 0.001, MAT_OTHER, "Cu");
+        let absLen = 1.0e4 / (cu.density * 215.521099278);
+        let want = (-1.0 / absLen).exp();
+        let t = one_blade(10.0, 0.001, 3, "Cu");
         assert!(
             (t - want).abs() < 1e-9,
-            "Cu 1um at 10 keV: t={t}, want={want}"
+            "Cu 1 um at 10 keV: {t}, want {want}"
         );
-        // C's answer is a different number: it read the interval ABOVE 10 keV.
         assert!((t - 0.827582511947).abs() > 1e-3);
     }
 
     #[test]
-    fn test_calc_blade_transmission_al() {
-        let t = calc_blade_transmission(10.0, 1.0, MAT_AL, "");
-        // 1mm Al at 10 keV should transmit a meaningful amount
-        assert!(t > 0.0 && t < 1.0, "Al 1mm at 10keV: t={t}");
+    fn al_absorption_length_is_the_polynomial_capped_at_60_kev() {
+        let len = AlAbsorptionLength(10.0);
+        assert!((144.0..145.0).contains(&len), "Al at 10 keV: {len}");
+        assert_eq!(AlAbsorptionLength(70.0), AlAbsorptionLength(60.0));
+    }
+
+    /// Ti is +inf below 1 keV, so it transmits; glass is 0 below 2 keV, so
+    /// it absorbs.
+    #[test]
+    fn ti_and_glass_below_their_fits() {
+        assert!(TiAbsorptionLength(0.5).is_infinite());
+        assert_eq!(one_blade(0.5, 1.0, 1, ""), 1.0);
+        assert_eq!(GlassAbsorptionLength(1.5), 0.0);
+        assert_eq!(one_blade(1.5, 1.0, 2, ""), 0.0);
     }
 
     #[test]
-    fn test_calc_blade_transmission_zero_thickness() {
-        let t = calc_blade_transmission(10.0, 0.0, MAT_AL, "");
-        assert_eq!(t, 1.0);
+    fn glass_is_the_fit_above_the_iron_edge() {
+        let len = GlassAbsorptionLength(10.0);
+        assert!((185.0..195.0).contains(&len), "glass at 10 keV: {len}");
+        let t = one_blade(10.0, 1.0, 2, "");
+        assert!((4.5e-3..6.0e-3).contains(&t), "glass 1 mm at 10 keV: {t}");
+    }
+
+    /// The first index holding the value, else 0.
+    #[test]
+    fn num_in_array_is_the_first_index_or_zero() {
+        let bits = SeqVar::new(std::array::from_fn(|i| (15 - i) as i16));
+        assert_eq!(numInArray(16, &bits, 15), 0);
+        assert_eq!(numInArray(16, &bits, 0), 15);
+        assert_eq!(numInArray(16, &bits, 16), 0);
     }
 
     #[test]
-    fn test_al_absorption_length_analytic() {
-        // AlAbsorptionLength(10 keV): WCOEF0 poly at eV=10000 ~ 144.55 microns.
-        let len = al_absorption_length_microns(10.0);
-        assert!((144.0..145.0).contains(&len), "Al absLen at 10keV = {len}");
-        // 60 keV cap: above 60 keV clamps to the 60 keV value.
-        assert_eq!(
-            al_absorption_length_microns(70.0),
-            al_absorption_length_microns(60.0)
-        );
+    fn thick_z_sums_the_blades_of_a_material_in_the_beam() {
+        let t = |z, b| thickZ(z, b, 1, 0, 1, 0, 0, 1, 0, 1, 1.0, 2.0, 3.0, 4.0);
+        assert_eq!(t(0, 2), 4.0);
+        assert_eq!(t(1, 2), 0.0);
+        assert_eq!(t(0, 0), 0.0);
     }
 
+    /// The table, then its last entry up to `N`; 1 and nothing written for
+    /// an unknown species.
     #[test]
-    fn test_ti_below_1kev_transmits_fully() {
-        // TiAbsorptionLength returns 1/0 = +inf below 1 keV → exp(0) = 1.0.
-        assert!(ti_absorption_length_microns(0.5).is_infinite());
-        let t = calc_blade_transmission(0.5, 1.0, MAT_TI, "");
-        assert_eq!(t, 1.0);
+    fn fill_show_arrays_pads_with_the_last_entry() {
+        let cu = crate::data::chantler::find_material("Cu").unwrap();
+        let n = cu.kev.len();
+        let (e, t) = (SeqVar::new([0.0f32; 300]), SeqVar::new([0.0f32; 300]));
+        assert_eq!(fillShowArrays("Unobtainium", 300, &e, &t), 1);
+        assert_eq!(e.get(), [0.0; 300]);
+        assert_eq!(fillShowArrays("Cu", 300, &e, &t), 0);
+        let (e, t) = (e.get(), t.get());
+        assert_eq!(&e[..n], cu.kev);
+        assert_eq!(&t[..n], cu.mu);
+        assert!(e[n..].iter().all(|&v| v == cu.kev[n - 1]));
+        assert!(t[n..].iter().all(|&v| v == cu.mu[n - 1]));
     }
 
+    /// An `N` past the arrays fills them and stops.
     #[test]
-    fn test_glass_below_2kev_absorbs_fully() {
-        // GlassAbsorptionLength returns 0 below 2 keV → exp(-inf) = 0.0.
-        assert_eq!(glass_absorption_length_microns(1.5), 0.0);
-        let t = calc_blade_transmission(1.5, 1.0, MAT_GLASS, "");
-        assert_eq!(t, 0.0);
-    }
-
-    #[test]
-    fn test_glass_is_analytic_fit_not_silicon() {
-        // GlassAbsorptionLength(10 keV) ~ 190 microns (above-Iron-K branch * keV^3),
-        // distinct from the Si Chantler proxy the port previously used (~130 microns
-        // → a ~10x smaller transmission for a 1 mm blade).
-        let len = glass_absorption_length_microns(10.0);
-        assert!(
-            (185.0..195.0).contains(&len),
-            "Glass absLen at 10keV = {len}"
-        );
-        let t = calc_blade_transmission(10.0, 1.0, MAT_GLASS, "");
-        // exp(-1000/190.1) ~ 5.18e-3, well above the ~4.5e-4 a Si proxy would give.
-        assert!((4.5e-3..6.0e-3).contains(&t), "Glass 1mm at 10keV = {t}");
-    }
-
-    #[test]
-    fn test_recalc_filters_bank_off() {
-        let cfg = Pf4BankConfig::default();
-        let (xmit, bits) = recalc_filters(10.0, &cfg, false);
-        for i in 0..NUM_COMBINATIONS {
-            assert_eq!(xmit[i], 1.0);
-            assert_eq!(bits[i], i as u8);
-        }
-    }
-
-    #[test]
-    fn test_recalc_filters_sorted() {
-        let cfg = Pf4BankConfig {
-            thicknesses: [0.5, 1.0, 2.0, 4.0], // mm Al
-            material_indices: [0, 0, 0, 0],
-            other_materials: Default::default(),
-        };
-        let (xmit, _bits) = recalc_filters(10.0, &cfg, true);
-
-        // Should be sorted in decreasing order
-        for i in 1..NUM_COMBINATIONS {
-            assert!(
-                xmit[i] <= xmit[i - 1] + 1e-15,
-                "Not sorted at {i}: {} > {}",
-                xmit[i],
-                xmit[i - 1]
-            );
-        }
-
-        // First entry should be highest (no filters = 1.0)
-        assert!((xmit[0] - 1.0).abs() < 1e-10);
-    }
-
-    #[test]
-    fn test_find_position() {
-        let mut bits = [0u8; NUM_COMBINATIONS];
-        for i in 0..NUM_COMBINATIONS {
-            bits[i] = (15 - i) as u8; // Reversed order
-        }
-        assert_eq!(find_position(&bits, 15), 0);
-        assert_eq!(find_position(&bits, 0), 15);
-    }
-
-    #[test]
-    fn test_thickness_by_material() {
-        let al = thickness_by_material(
-            MAT_AL,
-            true,
-            [true, false, true, false],
-            [MAT_AL, MAT_TI, MAT_AL, MAT_TI],
-            [1.0, 2.0, 3.0, 4.0],
-        );
-        assert_eq!(al, 4.0); // 1.0 + 3.0
-
-        let ti = thickness_by_material(
-            MAT_TI,
-            true,
-            [true, false, true, false],
-            [MAT_AL, MAT_TI, MAT_AL, MAT_TI],
-            [1.0, 2.0, 3.0, 4.0],
-        );
-        assert_eq!(ti, 0.0); // b2 and b4 not inserted
-    }
-
-    #[test]
-    fn test_controller_default() {
-        let ctrl = Pf4Controller::default();
-        assert_eq!(ctrl.state, Pf4State::Init);
-        assert!(!ctrl.bank_on);
-        assert_eq!(ctrl.filter_pos, 0);
-    }
-
-    #[test]
-    fn test_controller_recalculate() {
-        let mut ctrl = Pf4Controller::default();
-        ctrl.bank_on = true;
-        ctrl.energy_kev = 10.0;
-        ctrl.bank_config.thicknesses = [0.5, 1.0, 2.0, 4.0];
-        ctrl.bank_config.material_indices = [0, 0, 0, 0]; // All Al
-
-        let actions = ctrl.recalculate();
-        assert!(actions.write_transmission.is_some());
-        assert!(actions.write_labels.is_some());
-
-        // With no filters inserted, transmission should be 1.0
-        assert!((ctrl.transmission - 1.0).abs() < 1e-10);
-    }
-
-    #[test]
-    fn test_filter_thickness_writes_gated_by_material_and_bank() {
-        // Bank on, all blades Al → only filterAl is posted; Ti/Glass left alone.
-        let mut ctrl = Pf4Controller::default();
-        ctrl.bank_on = true;
-        ctrl.energy_kev = 10.0;
-        ctrl.bank_config.thicknesses = [0.5, 1.0, 2.0, 4.0];
-        ctrl.bank_config.material_indices = [MAT_AL, MAT_AL, MAT_AL, MAT_AL];
-        let actions = ctrl.recalculate();
-        assert!(actions.write_filter_al.is_some());
-        assert!(actions.write_filter_ti.is_none());
-        assert!(actions.write_filter_glass.is_none());
-
-        // Bank off → none of the three are posted (no spurious 0.0 overwrite).
-        ctrl.bank_on = false;
-        let actions = ctrl.recalculate();
-        assert!(actions.write_filter_al.is_none());
-        assert!(actions.write_filter_ti.is_none());
-        assert!(actions.write_filter_glass.is_none());
-    }
-
-    #[test]
-    fn test_zero_transmission_skips_inv_write() {
-        // A glass blade in beam below 2 keV gives transmission 0. C writes trans
-        // but skips invtrans (pf4.st:282 `if(trans>0.0)`); we must do the same
-        // rather than publishing +inf to {H}invTrans{B}.
-        let mut ctrl = Pf4Controller::default();
-        ctrl.bank_on = true;
-        ctrl.use_mono = true;
-        ctrl.mono_energy = 1.5;
-        ctrl.local_energy = 1.5;
-        ctrl.bank_config.thicknesses = [1.0, 0.0, 0.0, 0.0];
-        ctrl.bank_config.material_indices = [MAT_GLASS, MAT_AL, MAT_AL, MAT_AL];
-        ctrl.bit_states = [true, false, false, false];
-        let actions = ctrl.recalculate();
-        assert_eq!(ctrl.transmission, 0.0);
-        assert_eq!(actions.write_transmission, Some(0.0));
-        assert!(actions.write_inv_transmission.is_none());
-    }
-
-    #[test]
-    fn test_controller_bits_changed() {
-        let mut ctrl = Pf4Controller::default();
-        ctrl.bank_on = true;
-        ctrl.energy_kev = 10.0;
-        ctrl.bank_config.thicknesses = [0.5, 1.0, 2.0, 4.0];
-        ctrl.bank_config.material_indices = [0, 0, 0, 0];
-        ctrl.recalculate();
-
-        let actions = ctrl.step(Pf4Event::BitsChanged([true, false, false, false]));
-        assert!(actions.write_transmission.is_some());
-        // Transmission should be < 1.0 since bit 0 is inserted
-        assert!(ctrl.transmission < 1.0);
-    }
-
-    #[test]
-    fn test_controller_filter_pos_changed() {
-        let mut ctrl = Pf4Controller::default();
-        ctrl.bank_on = true;
-        ctrl.energy_kev = 10.0;
-        ctrl.bank_config.thicknesses = [0.5, 1.0, 2.0, 4.0];
-        ctrl.bank_config.material_indices = [0, 0, 0, 0];
-        ctrl.recalculate();
-
-        // Position 0 is highest transmission (no filters)
-        let actions = ctrl.step(Pf4Event::FilterPosChanged(0));
-        assert!(actions.set_bits.is_some());
-        let bits = actions.set_bits.unwrap();
-        // Highest transmission = all filters out
-        let pattern = bits_to_pattern(bits[0], bits[1], bits[2], bits[3]);
-        assert_eq!(pattern, ctrl.bits[0]);
+    fn fill_show_arrays_stops_at_the_array_end() {
+        let cu = crate::data::chantler::find_material("Cu").unwrap();
+        let (e, t) = (SeqVar::new([0.0f32; 300]), SeqVar::new([0.0f32; 300]));
+        assert_eq!(fillShowArrays("Cu", 400, &e, &t), 0);
+        assert_eq!(e.get()[299], cu.kev[cu.kev.len() - 1]);
     }
 }

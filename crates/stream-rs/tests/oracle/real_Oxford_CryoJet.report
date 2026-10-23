@@ -1,0 +1,247 @@
+rec0: Oxford_CryoJet.proto getSetpointTemp(1,2,3,4,5,6,7,8,9) P
+getSetpointTemp {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+  @Mismatch {
+    in "?\?";
+  }
+
+    out "R0";
+    in "R%f";
+}
+rec1: Oxford_CryoJet.proto getSensorTemp(1,2,3,4,5,6,7,8,9) P
+getSensorTemp {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+  @Mismatch {
+    in "?\?";
+  }
+
+    out "R1";
+    in "R%f";
+}
+rec2: Oxford_CryoJet.proto getTempError(1,2,3,4,5,6,7,8,9) P
+getTempError {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+  @Mismatch {
+    in "?\?";
+  }
+
+    out "R4";
+    in "R%f";
+}
+rec3: Oxford_CryoJet.proto getHeaterCurrent(1,2,3,4,5,6,7,8,9) P
+getHeaterCurrent {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+  @Mismatch {
+    in "?\?";
+  }
+
+    out "R5";
+    in "R%f";
+}
+rec4: Oxford_CryoJet.proto getHeaterVolts(1,2,3,4,5,6,7,8,9) P
+getHeaterVolts {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+  @Mismatch {
+    in "?\?";
+  }
+
+    out "R6";
+    in "R%f";
+}
+rec5: Oxford_CryoJet.proto getSampleFlow(1,2,3,4,5,6,7,8,9) P
+getSampleFlow {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+  @Mismatch {
+    in "?\?";
+  }
+
+    out "R19";
+    in "R%f";
+}
+rec6: Oxford_CryoJet.proto getShieldFlow(1,2,3,4,5,6,7,8,9) P
+getShieldFlow {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+  @Mismatch {
+    in "?\?";
+  }
+
+    out "R18";
+    in "R%f";
+}
+rec7: Oxford_CryoJet.proto getLRMode(1,2,3,4,5,6,7,8,9) P
+getLRMode {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+  @Mismatch {
+    in "";
+  }
+
+    out "X";
+    in "%*4cC%i%*7c";
+}
+rec8: Oxford_CryoJet.proto setLRmode(1,2,3,4,5,6,7,8,9) P
+setLRmode {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "C%d";
+    in "C";
+}
+rec9: Oxford_CryoJet.proto setTemp(1,2,3,4,5,6,7,8,9) P
+setTemp {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "T%3.1f";
+    in "T";
+}
+rec10: Oxford_CryoJet.proto setSampleFlow(1,2,3,4,5,6,7,8,9) P
+setSampleFlow {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "K%2.1f";
+    in "K";
+}
+rec11: Oxford_CryoJet.proto setShieldFlow(1,2,3,4,5,6,7,8,9) P
+setShieldFlow {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "J%2.1f";
+}
+rec12: Oxford_CryoJet.proto setHeaterMode(1,2,3,4,5,6,7,8,9) P
+setHeaterMode {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "A%i";
+    in "A";
+}
+rec13: Oxford_CryoJet.proto setHeaterVolts(1,2,3,4,5,6,7,8,9) P
+setHeaterVolts {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "O%3.2f";
+    in "O";
+}

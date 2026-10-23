@@ -9,15 +9,40 @@ use epics_base_rs::types::EpicsValue;
 
 use std::time::Duration;
 
+/// The status `motor` writes polled from the default.
+fn polled(motor: &mut (impl AsynMotor + ?Sized), user: &AsynUser) -> MotorStatus {
+    let mut status = MotorStatus::default();
+    motor.poll(user, &mut status).unwrap();
+    status
+}
+
+/// `make_record`'s motor resolution, EGU per step.
+const MRES: f64 = 0.001;
+
 /// Helper: create a default motor record with typical settings.
+/// The commands of `effects` past the speed writes ahead of them.
+/// Whether `commands` carry a GET_INFO.
+fn sends_get_info(commands: &[MotorCommand]) -> bool {
+    commands.contains(&MotorCommand::Poll)
+}
+
+fn motion(effects: &ProcessEffects) -> Vec<&MotorCommand> {
+    effects
+        .commands
+        .iter()
+        .filter(|c| !c.is_speed_write())
+        .collect()
+}
+
 fn make_record() -> MotorRecord {
     let mut rec = MotorRecord::new();
-    rec.conv.mres = 0.001;
+    rec.internal.init_invariants_synced = true;
+    rec.conv.mres = MRES;
     rec.limits.dhlm = 100.0;
     rec.limits.dllm = -100.0;
     rec.limits.hlm = 100.0;
     rec.limits.llm = -100.0;
-    rec.limits.lvio = false;
+    rec.limits.lvio = 0;
     rec.vel.velo = 10.0;
     rec.vel.accl = 0.5;
     rec.vel.bvel = 5.0;
@@ -29,11 +54,13 @@ fn make_record() -> MotorRecord {
     rec
 }
 
-/// Helper: simulate a completed move by updating motor info.
+/// Helper: simulate a completed move by updating motor info. The driver
+/// reports steps; `target_pos` is dial EGU.
 fn complete_move(rec: &mut MotorRecord, target_pos: f64) {
+    let steps = target_pos / rec.conv.mres;
     let status = MotorStatus {
-        position: target_pos,
-        encoder_position: target_pos,
+        position: steps,
+        encoder_position: steps,
         done: true,
         moving: false,
         ..Default::default()
@@ -43,9 +70,10 @@ fn complete_move(rec: &mut MotorRecord, target_pos: f64) {
 
 /// Helper: simulate motor in-progress.
 fn motor_moving(rec: &mut MotorRecord, current_pos: f64) {
+    let steps = current_pos / rec.conv.mres;
     let status = MotorStatus {
-        position: current_pos,
-        encoder_position: current_pos,
+        position: steps,
+        encoder_position: steps,
         done: false,
         moving: true,
         ..Default::default()
@@ -62,13 +90,13 @@ fn absolute_move_reaches_target_and_sets_dmov() {
     let effects = rec.plan_motion(CommandSource::Val);
 
     // Verify move started
-    assert!(!rec.stat.dmov);
+    assert!(rec.stat.dmov == 0);
     assert_eq!(rec.stat.phase, MotionPhase::MainMove);
     assert!(rec.stat.mip.contains(MipFlags::MOVE));
-    assert_eq!(effects.commands.len(), 1);
+    assert_eq!(motion(&effects).len(), 1);
     assert!(matches!(
-        effects.commands[0],
-        MotorCommand::MoveAbsolute { position, .. } if (position - 50.0).abs() < 1e-10
+        motion(&effects)[0],
+        MotorCommand::MoveAbsolute { position, .. } if (position - 50_000.0).abs() < 1e-6
     ));
 
     // Simulate motor reaching target
@@ -76,7 +104,7 @@ fn absolute_move_reaches_target_and_sets_dmov() {
     let _effects = rec.check_completion();
 
     // Verify completion
-    assert!(rec.stat.dmov);
+    assert!(rec.stat.dmov != 0);
     assert_eq!(rec.stat.phase, MotionPhase::Idle);
     assert_eq!(rec.stat.mip, MipFlags::empty());
     assert!((rec.pos.rbv - 50.0).abs() < 1e-6);
@@ -107,13 +135,13 @@ fn cdir_uses_fresh_diff_not_stale_pos_diff() {
 
     // The move must be issued in the negative direction.
     assert!(rec.stat.mip.contains(MipFlags::MOVE));
-    assert_eq!(effects.commands.len(), 1);
+    assert_eq!(motion(&effects).len(), 1);
 
     // CDIR must reflect the fresh diff (dval - drbv = -30 - 0 < 0),
     // i.e. negative direction. With MRES > 0, cdir = (diff >= 0).
     // Pre-fix this read the stale diff = +50 and asserted cdir = true.
     assert!(
-        !rec.stat.cdir,
+        rec.stat.cdir == 0,
         "CDIR must be derived from fresh diff (-30), not stale pos.diff (+50)"
     );
     // pos.diff itself must have been refreshed.
@@ -131,9 +159,9 @@ fn soft_limit_rejects_move_and_sets_lvio() {
     rec.pos.dval = 200.0; // Beyond DHLM
     let effects = rec.plan_motion(CommandSource::Val);
 
-    assert!(rec.limits.lvio);
+    assert!(rec.limits.lvio != 0);
     assert!(effects.commands.is_empty());
-    assert!(rec.stat.dmov); // no motion started
+    assert!(rec.stat.dmov != 0); // no motion started
 }
 
 #[test]
@@ -145,16 +173,17 @@ fn backlash_generates_two_phase_move() {
     rec.pos.dval = -10.0;
     rec.pos.drbv = 0.0;
     let effects = rec.plan_motion(CommandSource::Val);
-    assert!(!rec.stat.dmov);
+    assert!(rec.stat.dmov == 0);
     assert_eq!(rec.stat.phase, MotionPhase::MainMove);
     assert!(rec.internal.backlash_pending);
 
-    // First command should go to pretarget (dval - bdst = -10 - 1 = -11)
-    assert_eq!(effects.commands.len(), 1);
-    if let MotorCommand::MoveAbsolute { position, .. } = &effects.commands[0] {
+    // First command should go to pretarget (dval - bdst = -10 - 1 = -11),
+    // in steps at MRES 0.001.
+    assert_eq!(motion(&effects).len(), 1);
+    if let MotorCommand::MoveAbsolute { position, .. } = motion(&effects)[0] {
         assert!(
-            (*position - (-11.0)).abs() < 1e-10,
-            "pretarget should be -11.0, got {position}"
+            (*position - (-11_000.0)).abs() < 1e-6,
+            "pretarget should be -11000 steps, got {position}"
         );
     } else {
         panic!("expected MoveAbsolute");
@@ -168,13 +197,21 @@ fn backlash_generates_two_phase_move() {
     assert_eq!(rec.stat.phase, MotionPhase::BacklashFinal);
     assert!(rec.stat.mip.contains(MipFlags::MOVE_BL));
     assert!(!rec.internal.backlash_pending);
-    assert_eq!(effects.commands.len(), 1);
+    // C 955-968: the final leg writes no SET_VEL_BASE.
+    assert!(matches!(
+        effects.commands[..],
+        [
+            MotorCommand::SetVelocity { .. },
+            MotorCommand::SetAccel { .. },
+            MotorCommand::MoveAbsolute { .. }
+        ]
+    ));
     if let MotorCommand::MoveAbsolute {
         position, velocity, ..
-    } = &effects.commands[0]
+    } = motion(&effects)[0]
     {
-        assert!((*position - (-10.0)).abs() < 1e-10);
-        assert_eq!(*velocity, rec.vel.bvel);
+        assert!((*position - (-10_000.0)).abs() < 1e-6);
+        assert_eq!(*velocity, rec.vel.bvel / rec.conv.mres);
     } else {
         panic!("expected MoveAbsolute");
     }
@@ -184,7 +221,7 @@ fn backlash_generates_two_phase_move() {
     let _effects = rec.check_completion();
 
     // Should be finalized
-    assert!(rec.stat.dmov);
+    assert!(rec.stat.dmov != 0);
     assert_eq!(rec.stat.phase, MotionPhase::Idle);
 }
 
@@ -209,9 +246,9 @@ fn retry_reissues_move_when_error_exceeds_rdbd() {
         "retry marked in MIP"
     );
     assert_eq!(rec.retry.rcnt, 1);
-    assert!(!rec.retry.miss);
+    assert!(rec.retry.miss == 0);
     assert!(matches!(
-        effects.commands[0],
+        motion(&effects)[0],
         MotorCommand::MoveAbsolute { .. }
     ));
 
@@ -223,8 +260,8 @@ fn retry_reissues_move_when_error_exceeds_rdbd() {
     // Third retry
     complete_move(&mut rec, 9.995); // within rdbd
     let _effects = rec.check_completion();
-    assert!(rec.stat.dmov);
-    assert!(!rec.retry.miss);
+    assert!(rec.stat.dmov != 0);
+    assert!(rec.retry.miss == 0);
 }
 
 #[test]
@@ -244,8 +281,8 @@ fn retry_modes_arithmetic_geometric_inposition() {
     // C Arithmetic: factor = (rtry - rcnt + 1) / rtry = (5 - 1 + 1) / 5 = 1.0
     // retry_target = 10.0 (= dval), use_rel=false:
     // position = dval + frac*(retry_target - dval) = 10.0 + 0.5*0 = 10.0
-    if let MotorCommand::MoveAbsolute { position, .. } = &effects.commands[0] {
-        assert!((position - 10.0).abs() < 1e-6);
+    if let MotorCommand::MoveAbsolute { position, .. } = motion(&effects)[0] {
+        assert!((position - 10_000.0).abs() < 1e-6);
     } else {
         panic!("expected MoveAbsolute");
     }
@@ -257,7 +294,7 @@ fn stop_during_move_clears_pending_motion() {
 
     rec.pos.dval = 50.0;
     rec.plan_motion(CommandSource::Val);
-    assert!(!rec.stat.dmov);
+    assert!(rec.stat.dmov == 0);
 
     // Motor is moving
     motor_moving(&mut rec, 25.0);
@@ -270,12 +307,12 @@ fn stop_during_move_clears_pending_motion() {
     assert!(matches!(effects.commands[0], MotorCommand::Stop { .. }));
     // C parity: no eager VAL<-RBV sync at stop-put time; the sync runs
     // once the axis has actually stopped (postProcess). VAL still holds
-    // its pre-stop value (never written in this scenario).
-    assert_eq!(rec.pos.val, 0.0);
+    // the target the move block derived from DVAL (2300).
+    assert_eq!(rec.pos.val, 50.0);
 
     complete_move(&mut rec, 25.0);
     let _ = rec.check_completion();
-    assert!(rec.stat.dmov);
+    assert!(rec.stat.dmov != 0);
     assert_eq!(rec.pos.val, rec.pos.rbv);
 }
 
@@ -285,21 +322,18 @@ fn jog_start_stop_backlash_sequence() {
     rec.retry.bdst = 1.0;
 
     // Start jog forward
-    rec.ctrl.jogf = true;
+    rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
     let effects = rec.plan_motion(CommandSource::Jogf);
-    assert!(!rec.stat.dmov);
+    assert!(rec.stat.dmov == 0);
     assert_eq!(rec.stat.phase, MotionPhase::Jog);
     assert!(rec.stat.mip.contains(MipFlags::JOGF));
     assert!(matches!(
-        effects.commands[0],
-        MotorCommand::MoveVelocity {
-            direction: true,
-            ..
-        }
+        motion(&effects)[0],
+        MotorCommand::MoveVelocity { velocity, .. } if *velocity > 0.0
     ));
 
     // Stop jog
-    rec.ctrl.jogf = false;
+    rec.ctrl.jogf = 0;
     let effects = rec.plan_motion(CommandSource::Jogf);
     assert!(rec.stat.mip.contains(MipFlags::JOG_STOP));
     assert!(matches!(effects.commands[0], MotorCommand::Stop { .. }));
@@ -321,7 +355,7 @@ fn jog_start_stop_backlash_sequence() {
     // BL2 completes
     complete_move(&mut rec, 20.0);
     let _effects = rec.check_completion();
-    assert!(rec.stat.dmov);
+    assert!(rec.stat.dmov != 0);
 }
 
 #[test]
@@ -329,14 +363,14 @@ fn home_forward_reverse_marks_homed() {
     let mut rec = make_record();
 
     // Home forward
-    rec.ctrl.homf = true;
+    rec.ctrl.homf = 1;
     let effects = rec.plan_motion(CommandSource::Homf);
-    assert!(!rec.stat.dmov);
+    assert!(rec.stat.dmov == 0);
     assert_eq!(rec.stat.phase, MotionPhase::Homing);
     assert!(rec.stat.mip.contains(MipFlags::HOMF));
-    assert!(rec.ctrl.homf); // stays latched until home completion (C 893-906)
+    assert!(rec.ctrl.homf != 0); // stays latched until home completion (C 893-906)
     assert!(matches!(
-        effects.commands[0],
+        motion(&effects)[0],
         MotorCommand::Home { forward: true, .. }
     ));
 
@@ -352,8 +386,8 @@ fn home_forward_reverse_marks_homed() {
     };
     rec.process_motor_info(&status);
     let _effects = rec.check_completion();
-    assert!(rec.stat.athm);
-    assert!(rec.stat.dmov);
+    assert!(rec.stat.athm != 0);
+    assert!(rec.stat.dmov != 0);
     assert_eq!(rec.stat.phase, MotionPhase::Idle);
 }
 
@@ -364,7 +398,7 @@ fn dly_delays_final_dmov_assertion() {
 
     rec.pos.dval = 10.0;
     rec.plan_motion(CommandSource::Val);
-    assert!(!rec.stat.dmov);
+    assert!(rec.stat.dmov == 0);
 
     // Motor reaches target
     complete_move(&mut rec, 10.0);
@@ -373,18 +407,18 @@ fn dly_delays_final_dmov_assertion() {
     // Should be in delay wait
     assert_eq!(rec.stat.phase, MotionPhase::DelayWait);
     assert!(effects.schedule_delay.is_some());
-    assert!(!rec.stat.dmov);
+    assert!(rec.stat.dmov == 0);
 
     // Delay expires — C: sets DELAY_ACK, requests fresh poll
     rec.set_event(MotorEvent::DelayExpired);
     let effects = rec.do_process();
-    assert!(effects.status_refresh);
-    assert!(!rec.stat.dmov); // not yet finalized
+    assert!(sends_get_info(&effects.commands));
+    assert!(rec.stat.dmov == 0); // not yet finalized
 
     // Fresh poll arrives — evaluate position error, finalize
     complete_move(&mut rec, 10.0);
     let _effects = rec.check_completion();
-    assert!(rec.stat.dmov);
+    assert!(rec.stat.dmov != 0);
     assert_eq!(rec.stat.phase, MotionPhase::Idle);
 }
 
@@ -407,7 +441,7 @@ fn spmg_stop_blocks_new_commands() {
         "no move under SPMG=Stop"
     );
     assert!(matches!(effects.commands[0], MotorCommand::Stop { .. }));
-    assert!(rec.stat.dmov);
+    assert!(rec.stat.dmov != 0);
     assert_eq!(rec.internal.lspg, SpmgMode::Stop);
 
     // With LSPG synced, a further write is refused outright.
@@ -422,7 +456,7 @@ fn spmg_pause_sends_stop_and_arms_paused_resume() {
     // Start a move
     rec.pos.dval = 50.0;
     rec.plan_motion(CommandSource::Val);
-    assert!(!rec.stat.dmov);
+    assert!(rec.stat.dmov == 0);
 
     // Motor moving at 25
     motor_moving(&mut rec, 25.0);
@@ -431,7 +465,7 @@ fn spmg_pause_sends_stop_and_arms_paused_resume() {
     rec.ctrl.spmg = SpmgMode::Pause;
     let effects = rec.plan_motion(CommandSource::Spmg);
     assert!(matches!(effects.commands[0], MotorCommand::Stop { .. }));
-    assert!(!rec.stat.dmov); // still moving
+    assert!(rec.stat.dmov == 0); // still moving
     assert!(rec.stat.mip.contains(MipFlags::STOP));
 
     // Motor stops at 25. C: Pause never set pp — postProcess is skipped
@@ -439,7 +473,7 @@ fn spmg_pause_sends_stop_and_arms_paused_resume() {
     // MIP_RETRY with DMOV left FALSE for the Go resume.
     complete_move(&mut rec, 25.0);
     let _effects = rec.check_completion();
-    assert!(!rec.stat.dmov);
+    assert!(rec.stat.dmov == 0);
     assert_eq!(rec.stat.mip, MipFlags::RETRY);
     assert_eq!(rec.pos.dval, 50.0); // target preserved
 }
@@ -460,16 +494,15 @@ fn ntm_retargets_while_in_motion() {
 
     // Ensure MIP and CDIR are set (plan_motion sets these)
     assert!(rec.stat.mip.contains(MipFlags::MOVE));
-    assert!(rec.stat.cdir); // positive direction
+    assert!(rec.stat.cdir != 0); // positive direction
 
-    // New target: 80 (same direction, farther)
-    assert_eq!(rec.handle_retarget(80.0), RetargetAction::ExtendMove);
-
-    // New target: -10 (opposite direction, beyond deadband)
-    assert_eq!(rec.handle_retarget(-10.0), RetargetAction::StopAndReplan);
-
-    // New target: 30 (same direction, closer) -> ExtendMove (same dir in C)
-    assert_eq!(rec.handle_retarget(30.0), RetargetAction::ExtendMove);
+    // Every new target parks at the put, opposite direction included:
+    // the NTM stop belongs to the next moving callback.
+    for target in [80.0, -10.0, 30.0] {
+        rec.pos.val = target;
+        rec.pos.dval = target;
+        assert_eq!(rec.plan_motion(CommandSource::Val).commands, [], "{target}");
+    }
 }
 
 #[test]
@@ -483,6 +516,7 @@ fn set_mode_redefines_coordinates() {
 
     // Write VAL=100 → should update OFF, not move
     rec.put_field("VAL", EpicsValue::Double(100.0)).unwrap();
+    let _ = rec.plan_motion(CommandSource::Val);
 
     assert_eq!(rec.pos.val, 100.0);
     assert_eq!(rec.pos.dval, 10.0); // unchanged
@@ -497,10 +531,12 @@ fn frozen_offset_non_set_cascades_normally() {
     let mut rec = make_record();
     rec.conv.foff = FreezeOffset::Frozen;
     rec.pos.val = 10.0;
+    rec.internal.lval = 10.0;
     rec.pos.off = 5.0;
 
     // C: FOFF has no effect in non-SET mode -- VAL recalculated, OFF unchanged
     rec.put_field("DVAL", EpicsValue::Double(20.0)).unwrap();
+    rec.plan_motion(CommandSource::Dval);
 
     assert_eq!(rec.pos.val, 25.0); // dial_to_user(20.0, Pos, 5.0)
     assert_eq!(rec.pos.dval, 20.0);
@@ -512,15 +548,15 @@ fn startup_syncs_positions_from_driver() {
     let mut rec = make_record();
 
     let status = MotorStatus {
-        position: 25.0,
-        encoder_position: 25.0,
+        position: 25_000.0,
+        encoder_position: 25_000.0,
         done: true,
         moving: false,
         ..Default::default()
     };
 
     let effects = rec.initial_readback(&status);
-    assert!(rec.stat.dmov);
+    assert!(rec.stat.dmov != 0);
     assert_eq!(rec.pos.rbv, 25.0);
     assert_eq!(rec.pos.val, 25.0);
     assert_eq!(rec.pos.dval, 25.0);
@@ -528,7 +564,7 @@ fn startup_syncs_positions_from_driver() {
 }
 
 #[test]
-fn startup_moving_starts_polling() {
+fn startup_moving_waits_for_the_poller() {
     let mut rec = make_record();
 
     let status = MotorStatus {
@@ -540,81 +576,101 @@ fn startup_moving_starts_polling() {
     };
 
     let effects = rec.initial_readback(&status);
-    assert!(!rec.stat.dmov);
-    assert!(effects.request_poll);
+    // C init_record forces DMOV done and MOVN clear (motorRecord.cc:721-724).
+    assert!(rec.stat.dmov != 0);
+    assert!(rec.stat.movn == 0);
+    assert!(!rec.stat.mip.contains(MipFlags::EXTERNAL));
+    // Nor does it queue a GET_INFO: the poller posts the move once its
+    // status changes.
+    assert!(!effects.request_poll);
+
+    // The next pass sees the move and takes it as external.
+    rec.process_motor_info(&status);
+    assert!(rec.stat.movn != 0);
+    assert!(rec.stat.dmov == 0);
+    assert!(rec.stat.mip.contains(MipFlags::EXTERNAL));
+}
+
+/// `rec`'s device init on an axis whose cached status is `status`: the
+/// commands it queued for the poller.
+fn device_init(rec: &mut MotorRecord, status: MotorStatus) -> Vec<MotorCommand> {
+    use epics_base_rs::server::device_support::DeviceSupport;
+    use motor_rs::device_state::{StampedStatus, new_shared_state};
+    use motor_rs::device_support::MotorDeviceSupport;
+
+    let state = new_shared_state();
+    state.lock().unwrap().latest_status = Some(StampedStatus { seq: 1, status });
+    let (poll_cmd_tx, _poll_cmd_rx) = tokio::sync::mpsc::channel(16);
+    let (motor_cmd_tx, mut motor_cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut dev = MotorDeviceSupport::new(
+        Default::default(),
+        Duration::from_secs(1),
+        poll_cmd_tx,
+        motor_cmd_tx,
+        state,
+    );
+    dev.init(rec as &mut dyn Record).unwrap();
+    let mut commands = Vec::new();
+    while let Ok(motor_rs::poll_loop::ToAxis::Batch(batch)) = motor_cmd_rx.try_recv() {
+        commands.extend(batch.commands);
+    }
+    commands
 }
 
 #[test]
-fn startup_event_runs_initial_readback_through_live_path() {
+fn device_init_runs_initial_readback() {
     // C init_record (motorRecord.cc:690-733) + devMotorAsyn.c
-    // init_controller: the FIRST device status must flow through
-    // initial_readback — readback adoption and the RSTM restore — not
-    // just flip `initialized`. Drives the real process() path: shared
-    // mailbox → determine_event(Startup) → do_process.
-    use motor_rs::device_state::{StampedStatus, new_shared_state};
-
-    let state = new_shared_state();
-    {
-        let mut ds = state.lock().unwrap();
-        ds.latest_status = Some(StampedStatus {
-            seq: 1,
-            status: MotorStatus {
-                position: 25.0,
-                encoder_position: 25.0,
-                done: true,
-                moving: false,
-                ..Default::default()
-            },
-        });
-    }
-
+    // init_controller: the device init adopts the cached status, before
+    // any process.
     let mut rec = make_record();
-    rec.set_device_state(state.clone());
-    rec.process().unwrap();
+    device_init(
+        &mut rec,
+        MotorStatus {
+            position: 25_000.0,
+            encoder_position: 25_000.0,
+            done: true,
+            moving: false,
+            ..Default::default()
+        },
+    );
 
     assert_eq!(rec.pos.rbv, 25.0);
     assert_eq!(rec.pos.val, 25.0, "boot VAL adopted from the readback");
     assert_eq!(rec.pos.dval, 25.0);
-    assert!(rec.stat.dmov);
+    assert!(rec.stat.dmov != 0);
 }
 
 #[test]
-fn startup_event_applies_rstm_restore_through_live_path() {
-    // The RSTM near-zero restore (devMotorAsyn.c init_controller) must
-    // reach the driver via the live mailbox: the SetPosition command
-    // lands in pending_actions for DeviceSupport.write().
-    use motor_rs::device_state::{StampedStatus, new_shared_state};
-
-    let state = new_shared_state();
-    {
-        let mut ds = state.lock().unwrap();
-        ds.latest_status = Some(StampedStatus {
-            seq: 1,
-            status: MotorStatus {
-                position: 0.0, // controller lost its position
-                encoder_position: 0.0,
-                done: true,
-                moving: false,
-                ..Default::default()
-            },
-        });
-    }
-
+fn device_init_queues_the_rstm_restore_before_the_limits() {
+    // init_controller's position load (devMotorAsyn.c:216-231) precedes
+    // the record's limit writes (motorRecord.cc:717-718).
     let mut rec = make_record();
     rec.conv.rstm = RestoreMode::NearZero;
     rec.retry.rdbd = 0.05;
     rec.pos.dval = 5.0; // autosave-restored target
-    rec.set_device_state(state.clone());
-    rec.process().unwrap();
+    let commands = device_init(
+        &mut rec,
+        MotorStatus {
+            position: 0.0, // controller lost its position
+            encoder_position: 0.0,
+            done: true,
+            moving: false,
+            ..Default::default()
+        },
+    );
 
     assert_eq!(rec.pos.dval, 5.0, "autosaved DVAL kept, not overwritten");
-    let actions = state.lock().unwrap().pending_actions.take().unwrap();
     assert!(
-        actions
-            .commands
-            .iter()
-            .any(|c| matches!(c, MotorCommand::SetPosition { position } if *position == 5.0)),
-        "restore pushes the autosaved position to the driver"
+        matches!(
+            commands.as_slice(),
+            [
+                MotorCommand::InitEncoderRatio { .. },
+                MotorCommand::InitPosition { position },
+                MotorCommand::SetHighLimit { .. },
+                MotorCommand::SetLowLimit { .. },
+            ] if *position == 5000.0
+        ),
+        "{commands:?}"
     );
 }
 
@@ -629,8 +685,8 @@ fn startup_closed_loop_omsl_skips_readback_adoption() {
     rec.pos.dval = 7.0;
 
     let status = MotorStatus {
-        position: 25.0,
-        encoder_position: 25.0,
+        position: 25_000.0,
+        encoder_position: 25_000.0,
         done: true,
         moving: false,
         ..Default::default()
@@ -641,7 +697,10 @@ fn startup_closed_loop_omsl_skips_readback_adoption() {
     assert_eq!(rec.pos.val, 7.0, "closed-loop VAL untouched");
     assert_eq!(rec.pos.dval, 7.0, "closed-loop DVAL untouched");
     assert_eq!(rec.internal.lval, 7.0, "lasts anchored to current VAL");
-    assert!(effects.commands.is_empty());
+    assert!(matches!(
+        effects.commands[..],
+        [MotorCommand::InitEncoderRatio { .. }]
+    ));
 }
 
 #[test]
@@ -673,7 +732,10 @@ fn stup_protocol_round_trip_through_live_path() {
     rec.process().unwrap();
     assert_eq!(rec.get_field("STUP"), Some(EpicsValue::Short(2)), "BUSY");
     let actions = state.lock().unwrap().pending_actions.take().unwrap();
-    assert!(actions.status_refresh, "GET_INFO equivalent requested");
+    assert!(
+        sends_get_info(&actions.commands),
+        "GET_INFO equivalent requested"
+    );
 
     // The driver's status callback acknowledges the request.
     {
@@ -687,13 +749,14 @@ fn stup_protocol_round_trip_through_live_path() {
     assert_eq!(rec.get_field("STUP"), Some(EpicsValue::Short(0)), "OFF");
 }
 
-/// Helper: an idle done status stamped with the given seq.
+/// Helper: an idle done status at dial `pos` on a `make_record` axis,
+/// stamped with the given seq.
 fn idle_status_at(seq: u64, pos: f64) -> motor_rs::device_state::StampedStatus {
     motor_rs::device_state::StampedStatus {
         seq,
         status: MotorStatus {
-            position: pos,
-            encoder_position: pos,
+            position: pos / MRES,
+            encoder_position: pos / MRES,
             done: true,
             moving: false,
             ..Default::default()
@@ -723,13 +786,13 @@ fn set_mode_load_pos_collapses_through_live_path() {
     rec.put_field("DVAL", EpicsValue::Double(3.0)).unwrap();
     rec.process().unwrap();
     assert!(rec.stat.mip.contains(MipFlags::LOAD_P));
-    assert!(!rec.stat.dmov);
+    assert!(rec.stat.dmov == 0);
     let actions = state.lock().unwrap().pending_actions.take().unwrap();
     assert!(
         actions
             .commands
             .iter()
-            .any(|c| matches!(c, MotorCommand::SetPosition { position } if *position == 3.0)),
+            .any(|c| matches!(c, MotorCommand::SetPosition { position } if *position == 3000.0)),
         "redefinition reaches the driver"
     );
 
@@ -740,7 +803,103 @@ fn set_mode_load_pos_collapses_through_live_path() {
         rec.stat.mip.is_empty(),
         "LOAD_P collapses on the live idle poll"
     );
-    assert!(rec.stat.dmov, "DMOV returns TRUE");
+    assert!(rec.stat.dmov != 0, "DMOV returns TRUE");
+}
+
+/// Helper: an idle done status at dial `pos` resting on the low limit switch.
+fn on_low_limit_at(seq: u64, pos: f64) -> motor_rs::device_state::StampedStatus {
+    let mut s = idle_status_at(seq, pos);
+    s.status.low_limit = true;
+    s
+}
+
+/// A SET+FOFF=Frozen VAL redefinition of an axis resting on its low limit
+/// after a reverse move, on a controller that ignores the load (the nf874x
+/// `DH`). `cdir` is the boundary: C 1367 takes the LS-error update only for
+/// the limit in the commanded direction.
+fn frozen_load_on_low_limit(
+    cdir: bool,
+) -> (MotorRecord, motor_rs::device_state::SharedDeviceState) {
+    use motor_rs::device_state::new_shared_state;
+
+    let state = new_shared_state();
+    state.lock().unwrap().latest_status = Some(on_low_limit_at(1, -5.0));
+    let mut rec = make_record();
+    rec.conv.foff = FreezeOffset::Frozen;
+    rec.set_device_state(state.clone());
+    rec.process().unwrap(); // startup
+    rec.stat.cdir = i16::from(cdir);
+
+    rec.put_field("SET", EpicsValue::Short(1)).unwrap();
+    rec.process().unwrap();
+    rec.put_field("VAL", EpicsValue::Double(-6.0)).unwrap();
+    rec.process().unwrap();
+    assert!(rec.stat.mip.contains(MipFlags::LOAD_P));
+    let actions = state.lock().unwrap().pending_actions.take().unwrap();
+    assert!(
+        actions
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::SetPosition { position } if *position == -6000.0))
+    );
+
+    // The GET_INFO callback: the controller kept its position.
+    state.lock().unwrap().latest_status = Some(on_low_limit_at(2, -5.0));
+    rec.process().unwrap();
+    assert!(rec.stat.mip.is_empty(), "LOAD_P collapses");
+    (rec, state)
+}
+
+#[test]
+fn a_load_on_the_commanded_limit_resyncs_val_from_the_readback() {
+    // C 1367-1378 then postProcess 827-849: nf874x SET VAL=2 FOFF=Frozen
+    // after HOMR ends VAL=3 DVAL=-5000 on softIoc, the readback it rests at.
+    let (mut rec, state) = frozen_load_on_low_limit(false);
+    assert!(rec.stat.dmov == 0, "the LS-error update keeps DMOV FALSE");
+    let actions = state.lock().unwrap().pending_actions.take().unwrap();
+    assert!(sends_get_info(&actions.commands), "GET_INFO");
+
+    state.lock().unwrap().latest_status = Some(on_low_limit_at(3, -5.0));
+    rec.process().unwrap();
+    assert!(rec.stat.dmov != 0);
+    assert_eq!((rec.pos.val, rec.pos.dval), (-5.0, -5.0));
+    assert_eq!(rec.pos.rval, -5000);
+    let reload = state
+        .lock()
+        .unwrap()
+        .pending_actions
+        .take()
+        .is_some_and(|a| {
+            a.commands
+                .iter()
+                .any(|c| matches!(c, MotorCommand::SetPosition { .. }))
+        });
+    assert!(!reload, "the synced lasts leave nothing for a second load");
+}
+
+#[test]
+fn a_moving_report_on_the_limit_is_a_stopped_callback() {
+    // The nf874x answers `MD?` with 0 after a DH it ignored: MSTA carries
+    // MOVING and no DONE on the minus limit, so movn = 0 (C 3741-3748) and
+    // C 1345 takes the stopped branch, whose postProcess resyncs VAL.
+    let (mut rec, state) = frozen_load_on_low_limit(false);
+    state.lock().unwrap().pending_actions.take();
+    let mut moving = on_low_limit_at(3, -5.0);
+    moving.status.done = false;
+    moving.status.moving = true;
+    state.lock().unwrap().latest_status = Some(moving);
+    rec.process().unwrap();
+    assert!(rec.stat.movn == 0);
+    assert!(!rec.stat.msta.contains(MstaFlags::DONE));
+    assert!(rec.stat.dmov != 0);
+    assert_eq!((rec.pos.val, rec.pos.dval), (-5.0, -5.0));
+}
+
+#[test]
+fn a_load_on_the_opposite_limit_keeps_the_redefined_val() {
+    let (rec, _) = frozen_load_on_low_limit(true);
+    assert!(rec.stat.dmov != 0);
+    assert_eq!((rec.pos.val, rec.pos.dval), (-6.0, -6.0));
 }
 
 #[test]
@@ -787,7 +946,7 @@ fn load_pos_leaves_rbv_in_old_frame_until_get_info_callback() {
     state.lock().unwrap().latest_status = Some(idle_status_at(2, 3.0));
     rec.process().unwrap();
     assert!(rec.stat.mip.is_empty(), "LOAD_P collapses");
-    assert!(rec.stat.dmov);
+    assert!(rec.stat.dmov != 0);
     assert_eq!(rec.pos.rbv, 0.0, "RBV converges via the GET_INFO callback");
 }
 
@@ -828,13 +987,13 @@ fn parked_set_redefinition_replays_at_load_pos_collapse() {
     state.lock().unwrap().latest_status = Some(idle_status_at(2, 3.0));
     rec.process().unwrap();
     assert!(rec.stat.mip.contains(MipFlags::LOAD_P), "replayed load");
-    assert!(!rec.stat.dmov);
+    assert!(rec.stat.dmov == 0);
     let actions = state.lock().unwrap().pending_actions.take().unwrap();
     assert!(
         actions
             .commands
             .iter()
-            .any(|c| matches!(c, MotorCommand::SetPosition { position } if *position == 7.0)),
+            .any(|c| matches!(c, MotorCommand::SetPosition { position } if *position == 7000.0)),
         "parked redefinition replays to the driver"
     );
 
@@ -842,7 +1001,7 @@ fn parked_set_redefinition_replays_at_load_pos_collapse() {
     state.lock().unwrap().latest_status = Some(idle_status_at(3, 7.0));
     rec.process().unwrap();
     assert!(rec.stat.mip.is_empty());
-    assert!(rec.stat.dmov);
+    assert!(rec.stat.dmov != 0);
 }
 
 #[test]
@@ -879,7 +1038,7 @@ fn latent_sync_latched_during_load_pos_applies_at_collapse() {
     state.lock().unwrap().latest_status = Some(idle_status_at(2, 2.9));
     rec.process().unwrap();
     assert!(rec.stat.mip.is_empty());
-    assert!(rec.stat.dmov);
+    assert!(rec.stat.dmov != 0);
     assert_eq!(rec.get_field("SYNC"), Some(EpicsValue::Short(0)));
     assert_eq!(rec.pos.dval, 2.9, "SYNC reseeded DVAL from the readback");
 }
@@ -907,7 +1066,10 @@ fn noop_put_pass_fires_implicit_get_info_through_live_path() {
     rec.process().unwrap();
     assert_eq!(rec.get_field("STUP"), Some(EpicsValue::Short(2)), "BUSY");
     let actions = state.lock().unwrap().pending_actions.take().unwrap();
-    assert!(actions.status_refresh, "implicit GET_INFO requested");
+    assert!(
+        sends_get_info(&actions.commands),
+        "implicit GET_INFO requested"
+    );
 
     // The data callback acknowledges and must not re-trigger.
     state.lock().unwrap().latest_status = Some(idle_status_at(2, 0.0));
@@ -915,7 +1077,7 @@ fn noop_put_pass_fires_implicit_get_info_through_live_path() {
     assert_eq!(rec.get_field("STUP"), Some(EpicsValue::Short(0)), "OFF");
     let ack = state.lock().unwrap().pending_actions.take();
     assert!(
-        ack.is_none_or(|a| !a.status_refresh),
+        ack.is_none_or(|a| !sends_get_info(&a.commands)),
         "CALLBACK_DATA pass does not re-fire the refresh"
     );
 
@@ -924,16 +1086,15 @@ fn noop_put_pass_fires_implicit_get_info_through_live_path() {
     rec.process().unwrap();
     assert_eq!(rec.get_field("STUP"), Some(EpicsValue::Short(0)));
     let poll = state.lock().unwrap().pending_actions.take();
-    assert!(poll.is_none_or(|a| !a.status_refresh));
+    assert!(poll.is_none_or(|a| !sends_get_info(&a.commands)));
 }
 
 #[test]
-fn coalesced_put_and_status_split_into_two_passes() {
-    // C dbScanLock runs one pass per signal: a dbPutField pass never
-    // consumes the device callback's payload — the callback's own
-    // dbProcess (devMotorAsyn.c statusCallback 757-766) follows as a
-    // CALLBACK_DATA pass with the completion pipeline. A put racing a
-    // fresh status must not reduce the status to a readback apply.
+fn coalesced_put_and_status_share_one_pass() {
+    // C update_values (motorRecord.cc:1276): the put's pass reads the
+    // status statusCallback left (devMotorAsyn.c:757-766) and runs the
+    // completion pipeline; the callback's own dbProcess then reads
+    // nothing.
     use motor_rs::device_state::new_shared_state;
 
     let state = new_shared_state();
@@ -946,25 +1107,21 @@ fn coalesced_put_and_status_split_into_two_passes() {
     rec.put_field("VAL", EpicsValue::Double(10.0)).unwrap();
     rec.process().unwrap();
     assert_eq!(rec.stat.phase, MotionPhase::MainMove);
-    assert!(!rec.stat.dmov);
+    assert!(rec.stat.dmov == 0);
     state.lock().unwrap().pending_actions.take();
 
     // The done status and a CNEN put land before the next pass.
     state.lock().unwrap().latest_status = Some(idle_status_at(2, 10.0));
     rec.put_field("CNEN", EpicsValue::Short(1)).unwrap();
     rec.process().unwrap(); // the put's pass
-    assert_eq!(rec.pos.rbv, 0.0, "put pass leaves the status unconsumed");
-    assert_eq!(
-        rec.stat.phase,
-        MotionPhase::MainMove,
-        "completion is not swallowed by the put pass"
-    );
-    assert!(!rec.stat.dmov);
+    assert_eq!(rec.pos.rbv, 10.0);
+    assert_eq!(rec.stat.phase, MotionPhase::Idle);
+    assert!(rec.stat.dmov != 0);
 
     rec.process().unwrap(); // the status's own pass (its io_intr pulse)
     assert_eq!(rec.pos.rbv, 10.0);
     assert_eq!(rec.stat.phase, MotionPhase::Idle);
-    assert!(rec.stat.dmov);
+    assert!(rec.stat.dmov != 0);
 }
 
 #[test]
@@ -986,13 +1143,24 @@ fn move_start_notify_posts_diff_and_rdif() {
 
     rec.put_field("VAL", EpicsValue::Double(10.0)).unwrap();
     let outcome = rec.process().unwrap();
-    let fields = match outcome.result {
-        RecordProcessResult::AsyncPendingNotify(fields) => fields,
-        other => panic!("expected move-start AsyncPendingNotify, got {other:?}"),
-    };
+    assert_eq!(outcome.result, RecordProcessResult::Complete);
+    assert!(rec.stat.dmov == 0);
+    // The pass's monitor() names its fields; the record holds what they post.
+    let fields: Vec<(&str, EpicsValue)> = rec
+        .take_cycle_posted_fields()
+        .map(|(ix, _)| {
+            let name = epics_base_rs::server::record::field_at(
+                motor_rs::record::dbd_generated::MOTOR_FIELDS,
+                ix,
+            )
+            .expect("declared")
+            .name;
+            (name, rec.get_field(name).expect("readable"))
+        })
+        .collect();
     // diff = dval - drbv = 10 - 0 = 10; rdif = NINT(diff/mres) = 10/0.001 = 10000.
-    let diff = fields.iter().find(|(n, _)| n == "DIFF").map(|(_, v)| v);
-    let rdif = fields.iter().find(|(n, _)| n == "RDIF").map(|(_, v)| v);
+    let diff = fields.iter().find(|(n, _)| *n == "DIFF").map(|(_, v)| v);
+    let rdif = fields.iter().find(|(n, _)| *n == "RDIF").map(|(_, v)| v);
     assert_eq!(
         diff,
         Some(&EpicsValue::Double(10.0)),
@@ -1000,17 +1168,17 @@ fn move_start_notify_posts_diff_and_rdif() {
     );
     assert_eq!(
         rdif,
-        Some(&EpicsValue::Int64(10000)),
+        Some(&EpicsValue::Long(10000)),
         "move-start notify posts RDIF = NINT(diff/mres)"
     );
 }
 
 #[test]
-fn coalesced_put_and_delay_expiry_keeps_watchdog() {
-    // The settle-delay timer is one-shot (poll_loop::spawn_delay): an
-    // expiry consumed by a put-owned pass has no second chance, and
-    // ScheduleDelay idled the poll loop — the record would wedge with
-    // DMOV low. The expiry must survive the put pass and run its own.
+fn coalesced_put_and_delay_expiry_ack_on_the_put_pass() {
+    // C callbackFunc (motorRecord.cc:470-477) leaves MIP_DELAY_ACK for
+    // whatever pass comes next: the put's pass takes the ACK and sends its
+    // GET_INFO (1416-1426); the expiry's own pass still enters the callback
+    // block on the ACK (1280) and ends the wait.
     use motor_rs::device_state::new_shared_state;
 
     let state = new_shared_state();
@@ -1037,25 +1205,23 @@ fn coalesced_put_and_delay_expiry_keeps_watchdog() {
     state.lock().unwrap().expired_delay_id = Some(delay.id);
     rec.put_field("CNEN", EpicsValue::Short(1)).unwrap();
     rec.process().unwrap(); // the put's pass
+    assert!(rec.stat.mip.contains(MipFlags::DELAY_ACK));
+    assert!(state.lock().unwrap().expired_delay_id.is_none());
+    let actions = state.lock().unwrap().pending_actions.take().unwrap();
     assert!(
-        rec.stat.mip.contains(MipFlags::DELAY_REQ),
-        "watchdog still armed after the put pass"
-    );
-    assert!(!rec.stat.mip.contains(MipFlags::DELAY_ACK));
-    assert!(
-        state.lock().unwrap().expired_delay_id.is_some(),
-        "expiry not consumed by the put pass"
+        sends_get_info(&actions.commands),
+        "DELAY_ACK requests the fresh poll"
     );
 
     rec.process().unwrap(); // the expiry's own pass
-    assert!(rec.stat.mip.contains(MipFlags::DELAY_ACK));
-    let actions = state.lock().unwrap().pending_actions.take().unwrap();
-    assert!(actions.status_refresh, "DELAY_ACK requests the fresh poll");
+    assert!(rec.stat.dmov != 0);
+    assert_eq!(rec.stat.phase, MotionPhase::Idle);
+    assert!(!rec.stat.mip.contains(MipFlags::DELAY_ACK));
 
-    // The fresh poll finalizes the motion.
+    // The fresh poll reads an idle axis.
     state.lock().unwrap().latest_status = Some(idle_status_at(3, 10.0));
     rec.process().unwrap();
-    assert!(rec.stat.dmov);
+    assert!(rec.stat.dmov != 0);
     assert_eq!(rec.stat.phase, MotionPhase::Idle);
 }
 
@@ -1078,18 +1244,18 @@ fn sub_step_move_pulses_dmov() {
     rec.pos.dval = 0.0004; // 0.4 steps at mres = 0.001
     rec.pos.drbv = 0.0;
     let effects = rec.plan_motion(CommandSource::Val);
-    assert!(!rec.stat.dmov); // DMOV pulsed to 0
+    assert!(rec.stat.dmov == 0); // DMOV pulsed to 0
     assert!(effects.commands.is_empty()); // no motor command
     assert!(effects.request_poll); // triggers re-process
 
     // Next process cycle: finalize restores DMOV=1
     let _effects = rec.do_process();
-    assert!(rec.stat.dmov);
+    assert!(rec.stat.dmov != 0);
 
     // Move that is at least 1 step should proceed normally
     rec.pos.dval = rec.conv.mres * 2.0; // 2 steps
     let effects = rec.plan_motion(CommandSource::Val);
-    assert!(!rec.stat.dmov);
+    assert!(rec.stat.dmov == 0);
     assert!(!effects.commands.is_empty());
 }
 
@@ -1110,7 +1276,7 @@ fn dir_neg_swaps_limit_mapping() {
 }
 
 #[test]
-fn new_target_opposite_direction_stops_immediately() {
+fn new_target_opposite_direction_stops_at_the_next_callback() {
     let mut rec = make_record();
     rec.timing.ntm = true;
 
@@ -1120,26 +1286,31 @@ fn new_target_opposite_direction_stops_immediately() {
     rec.internal.ldvl = 50.0;
     motor_moving(&mut rec, 25.0);
 
-    // Target in opposite direction
-    let action = rec.handle_retarget(-20.0);
-    assert_eq!(action, RetargetAction::StopAndReplan);
+    // Target in opposite direction: parked at the put, stopped by the
+    // next moving callback (C 1326-1341).
+    rec.pos.dval = -20.0;
+    rec.pos.val = -20.0;
+    assert_eq!(rec.plan_motion(CommandSource::Val).commands, []);
+    motor_moving(&mut rec, 25.5);
+    let effects = rec.check_completion();
+    assert!(matches!(effects.commands[..], [MotorCommand::Stop { .. }]));
 }
 
 #[test]
 fn sim_motor_end_to_end() {
     let user = AsynUser::new(0);
-    let mut motor = SimMotor::new().with_limits(-100.0, 100.0);
+    let mut motor = SimMotor::new().with_limits(-100_000.0, 100_000.0);
     let mut rec = make_record();
 
     // Initial readback
-    let status = motor.poll(&user).unwrap();
+    let status = polled(&mut motor, &user);
     rec.initial_readback(&status);
     assert_eq!(rec.pos.rbv, 0.0);
 
     // Start move
     rec.put_field("VAL", EpicsValue::Double(10.0)).unwrap();
     let effects = rec.plan_motion(CommandSource::Val);
-    assert!(!rec.stat.dmov);
+    assert!(rec.stat.dmov == 0);
 
     // Execute command on motor — use very high velocity for test speed
     if let MotorCommand::MoveAbsolute {
@@ -1147,25 +1318,29 @@ fn sim_motor_end_to_end() {
         min_velocity,
         acceleration,
         ..
-    } = &effects.commands[0]
+    } = motion(&effects)[0]
     {
         motor
-            .move_absolute(&user, *position, *min_velocity, 100000.0, *acceleration)
+            .move_absolute(&user, *position, *min_velocity, 1.0e8, *acceleration)
             .unwrap();
     }
 
-    // Wait for completion
-    std::thread::sleep(Duration::from_millis(10));
-
-    // Poll and update
-    let status = motor.poll(&user).unwrap();
+    // Wait for completion: the ACCL ramp bounds the time, not VELO.
+    let mut status = polled(&mut motor, &user);
+    for _ in 0..150 {
+        std::thread::sleep(Duration::from_millis(20));
+        status = polled(&mut motor, &user);
+        if status.done {
+            break;
+        }
+    }
     assert!(status.done);
-    assert_eq!(status.position, 10.0);
+    assert_eq!(status.position, 10_000.0);
 
     rec.process_motor_info(&status);
     let _effects = rec.check_completion();
 
-    assert!(rec.stat.dmov);
+    assert!(rec.stat.dmov != 0);
     assert!((rec.pos.rbv - 10.0).abs() < 1e-6);
 }
 
@@ -1185,27 +1360,27 @@ fn dbput_to_same_position_pulses_dmov() {
     rec.pos.rval = 0;
     rec.pos.rbv = 0.0;
     rec.pos.drbv = 0.0;
-    rec.stat.dmov = true;
+    rec.stat.dmov = 1;
     rec.stat.phase = MotionPhase::Idle;
 
-    rec.special("VAL", false).unwrap();
-    assert!(!rec.stat.dmov, "pass-0 blink drops DMOV");
+    rec.special("VAL", false, &Default::default()).unwrap();
+    assert!(rec.stat.dmov == 0, "pass-0 blink drops DMOV");
     rec.put_field("VAL", EpicsValue::Double(0.0)).unwrap();
 
     // The pp process pass: put-owned (last_write = Val), so the pulse
     // recovery must NOT eat it — it dispatches, lands in too_small,
     // and posts the pulse's low half.
     let effects = rec.do_process();
-    assert!(!rec.stat.dmov, "pulse low half");
-    assert!(rec.stat.movn, "pulse presents as a (zero-length) move");
+    assert!(rec.stat.dmov == 0, "pulse low half");
+    assert!(rec.stat.movn != 0, "pulse presents as a (zero-length) move");
     assert!(effects.commands.is_empty(), "no motor command");
     assert!(effects.request_poll, "pulse schedules the recovery pass");
     assert_eq!(rec.stat.phase, MotionPhase::Idle);
 
     // The recovery pass restores DMOV=1 — the pulse's high half.
     let _ = rec.do_process();
-    assert!(rec.stat.dmov, "DMOV returns to 1");
-    assert!(!rec.stat.movn);
+    assert!(rec.stat.dmov != 0, "DMOV returns to 1");
+    assert!(rec.stat.movn == 0);
 }
 
 /// Same-position dbPut re-put after a genuinely completed move,
@@ -1217,26 +1392,29 @@ fn dbput_to_same_position_pulses_dmov() {
 fn same_position_reput_after_completed_move_pulses() {
     let mut rec = make_record();
 
-    rec.special("VAL", false).unwrap();
+    rec.special("VAL", false, &Default::default()).unwrap();
     rec.put_field("VAL", EpicsValue::Double(5.0)).unwrap();
     let effects = rec.do_process();
     assert!(!effects.commands.is_empty(), "real move dispatched");
     complete_move(&mut rec, 5.0);
     let _ = rec.check_completion();
-    assert!(rec.stat.dmov);
+    assert!(rec.stat.dmov != 0);
 
     // Blinked re-put of the same target: DMOV pulses, no command.
-    rec.special("VAL", false).unwrap();
+    rec.special("VAL", false, &Default::default()).unwrap();
     rec.put_field("VAL", EpicsValue::Double(5.0)).unwrap();
     let effects = rec.do_process();
-    assert!(!rec.stat.dmov, "pulse low half");
+    assert!(rec.stat.dmov == 0, "pulse low half");
     assert!(effects.commands.is_empty(), "no motor command");
     let _ = rec.do_process();
-    assert!(rec.stat.dmov, "pulse high half restores DMOV");
+    assert!(rec.stat.dmov != 0, "pulse high half restores DMOV");
 
     // Unblinked same-value pass: entry gate refuses, no DMOV edge.
     let effects = rec.plan_motion(CommandSource::Val);
-    assert!(rec.stat.dmov, "DMOV stays 1 — C refuses the unblinked pass");
+    assert!(
+        rec.stat.dmov != 0,
+        "DMOV stays 1 — C refuses the unblinked pass"
+    );
     assert!(effects.commands.is_empty(), "no motor command");
 }
 
@@ -1259,17 +1437,17 @@ fn blinked_put_while_paused_parks_and_resumes_on_go() {
     let _ = rec.check_completion();
 
     // dbPut VAL=7 while paused: blink + park, no dispatch.
-    rec.special("VAL", false).unwrap();
+    rec.special("VAL", false, &Default::default()).unwrap();
     rec.put_field("VAL", EpicsValue::Double(7.0)).unwrap();
     let effects = rec.do_process();
     assert!(effects.commands.is_empty(), "paused put dispatches nothing");
-    assert!(!rec.stat.dmov, "DMOV stays low — a move is pending (C)");
+    assert!(rec.stat.dmov == 0, "DMOV stays low — a move is pending (C)");
     assert_eq!(rec.pos.dval, 7.0, "parked target survives the pause");
 
     // A stray non-put pass must not finalize the parked state.
     let effects = rec.do_process();
     assert!(effects.commands.is_empty());
-    assert!(!rec.stat.dmov, "recovery does not eat the parked move");
+    assert!(rec.stat.dmov == 0, "recovery does not eat the parked move");
 
     // Go dispatches the parked target.
     rec.ctrl.spmg = SpmgMode::Go;
@@ -1281,7 +1459,7 @@ fn blinked_put_while_paused_parks_and_resumes_on_go() {
             .any(|c| matches!(c, MotorCommand::MoveAbsolute { .. })),
         "Go dispatches the move parked during the pause"
     );
-    assert!(!rec.stat.dmov, "move in flight");
+    assert!(rec.stat.dmov == 0, "move in flight");
 }
 
 /// Sequential moves: move to multiple positions and verify each.
@@ -1297,14 +1475,17 @@ fn sequential_moves_verify_position() {
         rec.put_field("VAL", EpicsValue::Double(target)).unwrap();
         let _effects = rec.plan_motion(CommandSource::Val);
 
-        assert!(!rec.stat.dmov, "DMOV should be 0 after move to {target}");
+        assert!(
+            rec.stat.dmov == 0,
+            "DMOV should be 0 after move to {target}"
+        );
 
         // Simulate completion
         complete_move(&mut rec, target);
         let _effects = rec.check_completion();
 
         assert!(
-            rec.stat.dmov,
+            rec.stat.dmov != 0,
             "DMOV should be 1 after completion at {target}"
         );
         assert_eq!(rec.stat.phase, MotionPhase::Idle);
@@ -1339,7 +1520,7 @@ fn calibration_set_current_position_updates_offset() {
 
     // Write new position: "I am now at 10.0"
     rec.put_field("VAL", EpicsValue::Double(10.0)).unwrap();
-    let effects = rec.plan_motion(CommandSource::Set);
+    let effects = rec.plan_motion(CommandSource::Val);
 
     // C 2206-2227: a FOFF=Variable redefinition is offset-only — no
     // controller command (LOAD_POS belongs to the Frozen leg and the
@@ -1374,7 +1555,7 @@ fn calibration_set_current_position_updates_offset() {
     // Now move to 0 in user coords (should move dial to -10)
     rec.put_field("VAL", EpicsValue::Double(0.0)).unwrap();
     let effects = rec.plan_motion(CommandSource::Val);
-    assert!(!rec.stat.dmov);
+    assert!(rec.stat.dmov == 0);
     assert!(
         effects
             .commands
@@ -1397,7 +1578,7 @@ fn sim_motor_sequential_moves() {
     for &target in &targets {
         rec.put_field("VAL", EpicsValue::Double(target)).unwrap();
         let effects = rec.plan_motion(CommandSource::Val);
-        assert!(!rec.stat.dmov);
+        assert!(rec.stat.dmov == 0);
 
         for cmd in &effects.commands {
             if let MotorCommand::MoveAbsolute {
@@ -1416,15 +1597,15 @@ fn sim_motor_sequential_moves() {
         // Wait for SimMotor to reach target
         for _ in 0..100 {
             std::thread::sleep(Duration::from_millis(20));
-            let status = motor.poll(&user).unwrap();
+            let status = polled(&mut motor, &user);
             rec.process_motor_info(&status);
             let _effects = rec.check_completion();
-            if rec.stat.dmov {
+            if rec.stat.dmov != 0 {
                 break;
             }
         }
 
-        assert!(rec.stat.dmov, "Motor should reach target {target}");
+        assert!(rec.stat.dmov != 0, "Motor should reach target {target}");
         assert!(
             (rec.pos.rbv - target).abs() < 0.01,
             "RBV should be ~{target}, got {}",
@@ -1463,16 +1644,16 @@ fn rbv_updates_during_move() {
 
     for _ in 0..100 {
         std::thread::sleep(Duration::from_millis(20));
-        let status = motor.poll(&user).unwrap();
+        let status = polled(&mut motor, &user);
         rec.process_motor_info(&status);
         rbv_history.push(rec.pos.rbv);
         let _effects = rec.check_completion();
-        if rec.stat.dmov {
+        if rec.stat.dmov != 0 {
             break;
         }
     }
 
-    assert!(rec.stat.dmov, "Motor should complete the move");
+    assert!(rec.stat.dmov != 0, "Motor should complete the move");
     assert!(
         rbv_history.len() > 1,
         "Should have multiple RBV updates during move, got {}",
@@ -1522,19 +1703,21 @@ fn sim_motor_homing() {
     // Wait for move to complete (distance=5, velocity=10 → 0.5s)
     for _ in 0..100 {
         std::thread::sleep(Duration::from_millis(20));
-        let status = motor.poll(&user).unwrap();
+        let status = polled(&mut motor, &user);
         rec.process_motor_info(&status);
         let _ = rec.check_completion();
-        if rec.stat.dmov {
+        if rec.stat.dmov != 0 {
             break;
         }
     }
-    assert!(rec.stat.dmov, "First move to 5.0 should complete");
+    assert!(rec.stat.dmov != 0, "First move to 5.0 should complete");
 
-    // Home forward
-    rec.ctrl.homf = true;
-    let effects = rec.plan_motion(CommandSource::Homf);
-    assert!(!rec.stat.dmov);
+    // Home toward the switch at 0: motorSim overshoots it and routes back.
+    // Away from it the sim runs into the hard limit first, which completes
+    // the record there as in C (motorRecord.cc:1367-1380).
+    rec.ctrl.homr = 1;
+    let effects = rec.plan_motion(CommandSource::Homr);
+    assert!(rec.stat.dmov == 0);
     assert!(
         effects
             .commands
@@ -1558,17 +1741,17 @@ fn sim_motor_homing() {
     }
 
     // Wait for homing to complete
-    for _ in 0..100 {
+    for _ in 0..300 {
         std::thread::sleep(Duration::from_millis(20));
-        let status = motor.poll(&user).unwrap();
+        let status = polled(&mut motor, &user);
         rec.process_motor_info(&status);
         let _ = rec.check_completion();
-        if rec.stat.dmov {
+        if rec.stat.dmov != 0 {
             break;
         }
     }
 
-    assert!(rec.stat.dmov, "Homing should complete");
+    assert!(rec.stat.dmov != 0, "Homing should complete");
     assert!(
         (rec.pos.drbv - 0.0).abs() < 0.01,
         "After homing, DRBV should be near 0, got {}",
@@ -1608,13 +1791,13 @@ fn give_up_refires_held_jogf_same_pass() {
     arm_give_up(&mut rec);
 
     // Operator holds JOGF during the move; SPMG stays Go (default).
-    rec.ctrl.jogf = true;
+    rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
 
     // Second short completion: rcnt(1) >= rtry(1) -> give up.
     complete_move(&mut rec, 9.5);
     let effects = rec.check_completion();
 
-    assert!(rec.retry.miss, "give-up latches MISS");
+    assert!(rec.retry.miss != 0, "give-up latches MISS");
     assert_eq!(
         rec.stat.phase,
         MotionPhase::Jog,
@@ -1623,10 +1806,7 @@ fn give_up_refires_held_jogf_same_pass() {
     assert!(
         effects.commands.iter().any(|c| matches!(
             c,
-            MotorCommand::MoveVelocity {
-                direction: true,
-                ..
-            }
+            MotorCommand::MoveVelocity { velocity, .. } if *velocity > 0.0
         )),
         "give-up must re-fire the held jog same-pass, got {:?}",
         effects.commands
@@ -1638,12 +1818,12 @@ fn give_up_refires_held_homf_same_pass() {
     let mut rec = make_record();
     arm_give_up(&mut rec);
 
-    rec.ctrl.homf = true;
+    rec.ctrl.homf = 1;
 
     complete_move(&mut rec, 9.5);
     let effects = rec.check_completion();
 
-    assert!(rec.retry.miss);
+    assert!(rec.retry.miss != 0);
     assert_eq!(rec.stat.phase, MotionPhase::Homing);
     assert!(
         effects
@@ -1664,8 +1844,8 @@ fn give_up_no_button_finalizes_quietly() {
     complete_move(&mut rec, 9.5);
     let effects = rec.check_completion();
 
-    assert!(rec.retry.miss);
-    assert!(rec.stat.dmov);
+    assert!(rec.retry.miss != 0);
+    assert!(rec.stat.dmov != 0);
     assert_eq!(rec.stat.phase, MotionPhase::Idle);
     assert_eq!(rec.stat.mip, MipFlags::empty());
     assert!(
@@ -1674,13 +1854,16 @@ fn give_up_no_button_finalizes_quietly() {
         effects.commands
     );
     assert!(
-        !effects.status_refresh,
+        !sends_get_info(&effects.commands),
         "CALLBACK_DATA give-up must not fire the implicit GET_INFO"
     );
 }
 
+/// C special() arms MIP_JOG_REQ only at mip == MIP_DONE (3042-3046): a
+/// JOGF held through a positional move is never armed, so neither the
+/// completion pass nor a later idle poll starts the jog.
 #[test]
-fn close_enough_defers_held_jog_to_next_idle_poll() {
+fn close_enough_strands_a_jog_pressed_during_the_move() {
     let mut rec = make_record();
     rec.retry.rdbd = 0.5;
     rec.retry.rtry = 3;
@@ -1688,72 +1871,86 @@ fn close_enough_defers_held_jog_to_next_idle_poll() {
     rec.plan_motion(CommandSource::Val);
 
     // Operator holds JOGF during the move; SPMG stays Go.
-    rec.ctrl.jogf = true;
+    rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
 
-    // Close-enough completion (within rdbd): C drops the jog this pass.
     complete_move(&mut rec, 10.0);
     let effects = rec.check_completion();
-    assert!(rec.stat.dmov);
+    assert!(rec.stat.dmov != 0);
     assert_eq!(rec.stat.phase, MotionPhase::Idle);
     assert!(
         !effects
             .commands
             .iter()
             .any(|c| matches!(c, MotorCommand::MoveVelocity { .. })),
-        "close-enough must NOT re-fire the jog in the completion pass, got {:?}",
+        "{:?}",
         effects.commands
     );
-    // ...but it MUST request the forced poll that delivers the resume pass —
-    // otherwise the change-gate suppresses the unchanged settle poll and the
-    // held jog strands. (This is the unit-level guard of the R65 fix; the
-    // second check_completion below only proves the resume given a pass.)
-    assert!(
-        effects.request_poll,
-        "completion with a held jog must request the forced settle poll"
-    );
+    assert!(!effects.request_poll, "no armed request to resume");
 
-    // The next idle poll (level-triggered) re-fires the held jog.
     complete_move(&mut rec, 10.0);
     let effects = rec.check_completion();
-    assert_eq!(rec.stat.phase, MotionPhase::Jog);
+    assert_eq!(rec.stat.phase, MotionPhase::Idle);
     assert!(
-        effects.commands.iter().any(|c| matches!(
-            c,
-            MotorCommand::MoveVelocity {
-                direction: true,
-                ..
-            }
-        )),
-        "idle poll must resume the held jog, got {:?}",
+        !effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::MoveVelocity { .. })),
+        "{:?}",
         effects.commands
     );
+    assert!(rec.ctrl.jogf != 0, "the button stays latched");
 }
 
-/// The SET-mode pp-resync early-return (state_machine.rs:401) quiesces the axis
-/// WITHOUT finalize_motion and dispatches nothing — a formerly-bypassing member
-/// of the held-button deferral family. With the idle-poll change-gate it would
-/// strand a held jog. The shared `request_poll_for_held_button` owner now closes
-/// it too: the pp-resync must request the forced poll.
+/// The SET-mode pp-resync early-return quiesces the axis WITHOUT
+/// finalize_motion and dispatches nothing — a formerly-bypassing member of the
+/// held-button deferral family. With the idle-poll change-gate it would strand
+/// a held home. The shared `request_poll_for_held_button` owner now closes it
+/// too: the pp-resync must request the forced poll.
 #[test]
-fn pp_resync_requests_forced_poll_for_held_jog() {
+fn pp_resync_requests_forced_poll_for_held_home() {
     let mut rec = make_record();
     // dispatch_res_reanchor (SET && !IGSET) armed pp + a forced poll; the
-    // forced poll lands on this Idle-arm pp-resync with a jog still held.
+    // forced poll lands on this Idle-arm pp-resync with a home still held.
     rec.ctrl.spmg = SpmgMode::Go;
-    rec.internal.pp = true;
-    rec.ctrl.jogf = true;
+    rec.internal.pp = 1;
+    // Held from an earlier put whose own pass already ran.
+    rec.ctrl.homf = 1;
     // Reached only with the axis already done and idle (make_record sets
     // msta=DONE; a fresh record is Idle with movn=false).
     assert_eq!(rec.stat.phase, MotionPhase::Idle);
-    assert!(!rec.stat.movn);
+    assert!(rec.stat.movn == 0);
 
     let effects = rec.check_completion();
 
-    assert!(!rec.internal.pp, "the pp-resync consumes pp");
+    assert!(rec.internal.pp == 0, "the pp-resync consumes pp");
     assert!(
         effects.request_poll,
-        "the pp-resync early-return must request a forced poll so the held jog is not stranded by the change-gate"
+        "the pp-resync early-return must request a forced poll so the held home is not stranded by the change-gate"
     );
+}
+
+/// An armed MIP_JOG_REQ is not MIP_DONE, so the pp pass runs maybeRetry
+/// (C 1427-1431), which keeps the request (1088), and the same pass's do_work
+/// starts the jog (2079).
+#[test]
+fn pp_resync_dispatches_an_armed_jog_request() {
+    let mut rec = make_record();
+    rec.ctrl.spmg = SpmgMode::Go;
+    rec.internal.pp = 1;
+    rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
+    assert_eq!(rec.stat.mip, MipFlags::JOG_REQ);
+
+    let effects = rec.check_completion();
+
+    assert!(
+        effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::MoveVelocity { .. })),
+        "{:?}",
+        effects.commands
+    );
+    assert_eq!(rec.stat.mip, MipFlags::JOGF);
 }
 
 #[test]
@@ -1767,7 +1964,7 @@ fn close_enough_move_oneshot_jog_waits_for_spmg_go() {
     rec.pos.dval = 10.0;
     rec.plan_motion(CommandSource::Val);
 
-    rec.ctrl.jogf = true;
+    rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
 
     // Close-enough completion: restore_spmg_move_to_pause flips Move->Pause.
     complete_move(&mut rec, 10.0);
@@ -1788,20 +1985,194 @@ fn close_enough_move_oneshot_jog_waits_for_spmg_go() {
         effects.commands
     );
 
-    // Operator presses Go: the held jog now re-fires.
+    // Operator presses Go: C 1914-1918 re-arms the jog from the held
+    // button.
     rec.ctrl.spmg = SpmgMode::Go;
-    complete_move(&mut rec, 10.0);
-    let effects = rec.check_completion();
+    let effects = rec.plan_motion(CommandSource::Spmg);
     assert_eq!(rec.stat.phase, MotionPhase::Jog);
     assert!(
         effects.commands.iter().any(|c| matches!(
             c,
-            MotorCommand::MoveVelocity {
-                direction: true,
-                ..
-            }
+            MotorCommand::MoveVelocity { velocity, .. } if *velocity > 0.0
         )),
         "SPMG=Go resumes the held jog, got {:?}",
         effects.commands
     );
+}
+
+/// motorSim ignores the encoder ratio (asynMotorAxis::setEncoderRatio is a
+/// no-op), so its encoder counts motor steps: REP is 3000 at 3.0 EGU with
+/// MRES 0.001 whatever ERES says, and an ERES put on an axis without an
+/// encoder, which downloads no ratio, leaves it there.
+#[test]
+fn sim_motor_rep_counts_motor_steps_whatever_eres() {
+    for eres in [0.001, 0.002] {
+        let user = AsynUser::new(0);
+        let mut motor = SimMotor::new().with_position(3000.0);
+        let mut rec = make_record();
+        rec.conv.eres = eres;
+        let effects = rec.initial_readback(&polled(&mut motor, &user));
+        for cmd in &effects.commands {
+            if let MotorCommand::InitEncoderRatio { ratio } = cmd {
+                motor.set_encoder_ratio(&user, *ratio).unwrap();
+            }
+        }
+        rec.process_motor_info(&polled(&mut motor, &user));
+        assert_eq!(rec.pos.rep, 3000, "ERES {eres}");
+
+        rec.put_field("ERES", EpicsValue::Double(eres * 2.0))
+            .unwrap();
+        rec.process_motor_info(&polled(&mut motor, &user));
+        assert_eq!(rec.pos.rep, 3000, "ERES {eres} then {}", eres * 2.0);
+    }
+}
+
+/// A model-1 device that, like devEMC18011 with another motor selected
+/// (devEMC18011.cc:224-231), defers its first `remaining` commands.
+struct DeferringDevice {
+    remaining: std::sync::atomic::AtomicUsize,
+}
+
+impl motor_rs::device_support::BuildTrans for DeferringDevice {
+    fn defers(&self, _command: &MotorCommand) -> bool {
+        use std::sync::atomic::Ordering;
+        self.remaining
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+            .is_ok()
+    }
+}
+
+/// Defers the moves once armed.
+struct DeferringMoves {
+    armed: std::sync::atomic::AtomicBool,
+}
+
+impl motor_rs::device_support::BuildTrans for DeferringMoves {
+    fn defers(&self, command: &MotorCommand) -> bool {
+        self.armed.load(std::sync::atomic::Ordering::Relaxed)
+            && matches!(
+                command,
+                MotorCommand::MoveAbsolute { .. } | MotorCommand::MoveRelative { .. }
+            )
+    }
+}
+
+/// A record whose move to 1.0 ends short at 0.5, with RTRY = 3, on a
+/// device that defers `deferred` of the retry's commands. Returns what the
+/// retry pass queued.
+fn deferred_retry(deferred: usize) -> (MotorRecord, Vec<MotorCommand>) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let device = std::sync::Arc::new(DeferringDevice {
+        remaining: AtomicUsize::new(0),
+    });
+    retry_on(device, |d| d.remaining.store(deferred, Ordering::Relaxed))
+}
+
+/// The retry rig on `device`, with `arm` run just before the retry pass.
+fn retry_on<D: motor_rs::device_support::BuildTrans + 'static>(
+    device: std::sync::Arc<D>,
+    arm: impl FnOnce(&D),
+) -> (MotorRecord, Vec<MotorCommand>) {
+    use motor_rs::device_state::{StampedStatus, new_shared_state};
+
+    let state = new_shared_state();
+    state.lock().unwrap().latest_status = Some(idle_status_at(1, 0.0));
+    let mut rec = make_record();
+    rec.retry.rtry = 3;
+    rec.set_device_state(state.clone());
+    let (port, _rx) = motor_rs::device_support::CommandPort::capture();
+    rec.set_command_port(port.with_build_trans(device.clone()));
+    rec.process().unwrap(); // startup
+
+    rec.put_field("VAL", EpicsValue::Double(1.0)).unwrap();
+    rec.process().unwrap();
+    state.lock().unwrap().pending_actions.take();
+    state.lock().unwrap().latest_status = Some(StampedStatus {
+        seq: 2,
+        status: MotorStatus {
+            position: 0.2 / MRES,
+            encoder_position: 0.2 / MRES,
+            done: false,
+            moving: true,
+            ..Default::default()
+        },
+    });
+    rec.process().unwrap();
+    state.lock().unwrap().pending_actions.take();
+
+    arm(&device);
+    state.lock().unwrap().latest_status = Some(idle_status_at(3, 0.5));
+    rec.process().unwrap();
+    let commands = state
+        .lock()
+        .unwrap()
+        .pending_actions
+        .take()
+        .map(|a| a.commands)
+        .unwrap_or_default();
+    (rec, commands)
+}
+
+#[test]
+fn retry_deferred_by_the_device_is_not_counted() {
+    // devEMC18011.cc:224-231: every command of the retry defers, so
+    // build_trans takes back the count maybeRetry made (rcnt-- per call,
+    // floored at 0) and the transaction goes out as INFO, which sends no
+    // message (motordrvCom.cc:441).
+    let (rec, commands) = deferred_retry(usize::MAX);
+    assert_eq!(commands, [MotorCommand::Poll]);
+    assert_eq!(rec.retry.rcnt, 0);
+    assert!(rec.retry.miss == 0);
+}
+
+#[test]
+fn retry_partly_deferred_sends_the_rest() {
+    // The device selects this motor at the second command: the first
+    // defers and is dropped, the rest go out and the retry is uncounted.
+    let (_, mut all) = deferred_retry(0);
+    all.retain(|c| !matches!(c, MotorCommand::SetVelocity { .. }));
+    let (rec, commands) = deferred_retry(1);
+    assert_eq!(commands, all);
+    assert_eq!(rec.retry.rcnt, 0);
+}
+
+#[test]
+fn retry_not_deferred_counts() {
+    let (rec, commands) = deferred_retry(0);
+    assert!(
+        commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::MoveAbsolute { .. })),
+        "{commands:?}"
+    );
+    assert_eq!(rec.retry.rcnt, 1);
+}
+
+#[test]
+fn retry_last_deferred_keeps_the_built_commands() {
+    // devEMC18011.cc:405-414: each built command is sent by its own
+    // motor_end_trans_com; a deferred last command leaves only an INFO
+    // node behind it (motordrvCom.cc:441). With no move built, nothing
+    // carries the move's record fields or direction.
+    let (_, all) = deferred_retry(0);
+    let device = std::sync::Arc::new(DeferringMoves {
+        armed: std::sync::atomic::AtomicBool::new(false),
+    });
+    let (_, commands) = retry_on(device, |d| {
+        d.armed.store(true, std::sync::atomic::Ordering::Relaxed)
+    });
+    let mut expect: Vec<MotorCommand> = all
+        .into_iter()
+        .filter(|c| {
+            !matches!(
+                c,
+                MotorCommand::MoveAbsolute { .. }
+                    | MotorCommand::MoveRelative { .. }
+                    | MotorCommand::RecordFields(_)
+                    | MotorCommand::MoveDirection { .. }
+            )
+        })
+        .collect();
+    expect.push(MotorCommand::Poll);
+    assert_eq!(commands, expect);
 }

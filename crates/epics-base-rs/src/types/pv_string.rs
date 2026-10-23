@@ -24,8 +24,20 @@ use std::fmt;
 /// UTF-8. Backs `EpicsValue::String`/`StringArray` and (in `epics-pva-rs`)
 /// `ScalarValue::String`/`TypedScalarArray::String`. See the module docs for
 /// why this is a byte newtype rather than `String`.
-#[derive(Clone, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct PvString(Vec<u8>);
+
+impl Clone for PvString {
+    fn clone(&self) -> Self {
+        PvString(self.0.clone())
+    }
+
+    // The derive's `clone_from` is `*self = source.clone()`, a fresh buffer
+    // per copy; a record field copied every cycle keeps its own instead.
+    fn clone_from(&mut self, source: &Self) {
+        self.0.clone_from(&source.0);
+    }
+}
 
 impl PvString {
     /// An empty wire string.
@@ -47,6 +59,33 @@ impl PvString {
     /// Consume into the owned byte buffer.
     pub fn into_bytes(self) -> Vec<u8> {
         self.0
+    }
+
+    /// Replace the bytes in the buffer this string already has, so a slot
+    /// reserved at load does not grow (or reallocate) under the record lock.
+    #[inline(always)]
+    pub fn set_bytes(&mut self, bytes: &[u8]) {
+        // Overwrite in place and extend by the tail only: `clear` then
+        // `extend_from_slice` goes through `Vec`'s out-of-line append even
+        // when the length does not change.
+        self.0.truncate(bytes.len());
+        let (head, tail) = bytes.split_at(self.0.len());
+        self.0.copy_from_slice(head);
+        if !tail.is_empty() {
+            self.0.extend_from_slice(tail);
+        }
+    }
+
+    /// Bytes the buffer holds without growing.
+    pub fn capacity(&self) -> usize {
+        self.0.capacity()
+    }
+
+    /// Grow the buffer to hold `additional` more bytes than its length,
+    /// with no slack, so a later [`Self::set_bytes`] within it allocates
+    /// nothing.
+    pub fn reserve_exact(&mut self, additional: usize) {
+        self.0.reserve_exact(additional);
     }
 
     /// Lossy UTF-8 view for diagnostics / JSON / text comparisons where a
@@ -138,6 +177,18 @@ impl PartialEq<String> for PvString {
     }
 }
 
+impl PartialEq<[u8]> for PvString {
+    fn eq(&self, other: &[u8]) -> bool {
+        self.0 == other
+    }
+}
+
+impl PartialEq<&[u8]> for PvString {
+    fn eq(&self, other: &&[u8]) -> bool {
+        self.0 == *other
+    }
+}
+
 impl PartialEq<PvString> for str {
     fn eq(&self, other: &PvString) -> bool {
         self.as_bytes() == other.0
@@ -179,6 +230,31 @@ impl fmt::Debug for PvString {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clone_from_copies_into_the_buffer_it_has_stringinrecord_178() {
+        let mut oval = PvString::from("previous value");
+        let buf = oval.as_bytes().as_ptr();
+        oval.clone_from(&PvString::from("next"));
+        assert_eq!(oval, "next");
+        assert_eq!(oval.as_bytes().as_ptr(), buf);
+    }
+
+    #[test]
+    fn set_bytes_keeps_the_buffer() {
+        let mut s = PvString::new();
+        s.0.reserve(40);
+        let (buf, cap) = (s.0.as_ptr(), s.0.capacity());
+        s.set_bytes(&[b'x'; 39]);
+        assert_eq!(s.as_bytes(), &[b'x'; 39]);
+        s.set_bytes(b"short");
+        assert_eq!(s, "short");
+        s.set_bytes(b"equal");
+        assert_eq!(s, "equal");
+        s.set_bytes(b"");
+        assert!(s.is_empty());
+        assert_eq!((s.0.as_ptr(), s.0.capacity()), (buf, cap));
+    }
 
     #[test]
     fn round_trips_non_utf8_bytes() {

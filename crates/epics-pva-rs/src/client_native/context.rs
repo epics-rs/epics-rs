@@ -21,7 +21,6 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::OnceLock;
 use std::time::Duration;
 
 use parking_lot::RwLock;
@@ -32,9 +31,8 @@ use crate::pvdata::{FieldDesc, PvField, RpcReply};
 use super::channel::{Channel, ConnectionPool};
 use super::ops_v2::{
     MonitorConnEvent, MonitorEvent, MonitorEventMask, PutOp, RpcArg, SubscriptionHandle, op_get,
-    op_get_get, op_get_put, op_monitor, op_monitor_events, op_monitor_handle,
-    op_monitor_raw_frames_handle, op_monitor_raw_frames_handle_with_request, op_process,
-    op_process_with_request, op_process_with_request_value, op_put, op_put_get, op_rpc,
+    op_monitor, op_monitor_events, op_monitor_handle, op_monitor_raw_frames_handle,
+    op_monitor_raw_frames_handle_with_request, op_put, op_rpc,
 };
 use super::search_engine::{ClientSearchConfig, SearchEngine};
 
@@ -47,7 +45,7 @@ fn empty_pv_request() -> (FieldDesc, PvField) {
     (
         FieldDesc::Structure {
             struct_id: String::new(),
-            fields: Vec::new(),
+            fields: Vec::new().into(),
         },
         PvField::Structure(crate::pvdata::PvStructure::new("")),
     )
@@ -105,8 +103,8 @@ pub struct AssertedIdentity {
 pub struct PvaClientBuilder {
     timeout: Duration,
     server_addr: Option<SocketAddr>,
-    user: Option<String>,
-    host: Option<String>,
+    user: Option<epics_base_rs::types::PvString>,
+    host: Option<epics_base_rs::types::PvString>,
     /// Default monitor pipeline window. `0` (the default) means the
     /// default monitor is **non-pipelined**, matching pvxs
     /// `MonitorBuilder` (`clientmon.cpp:50` — `pipeline=false`): the INIT
@@ -158,6 +156,8 @@ pub struct PvaClientBuilder {
 
 impl PvaClientBuilder {
     pub fn new() -> Self {
+        // pvxs `Config::fromEnv`: one read, so its warnings print once.
+        let env = crate::config::env::Config::from_client_env();
         Self {
             timeout: Duration::from_secs(5),
             server_addr: None,
@@ -168,15 +168,13 @@ impl PvaClientBuilder {
             // a pvRequest `record._options.pipeline`. See the field doc.
             pipeline_size: 0,
             tls: None,
-            name_servers: crate::config::env::name_servers(),
+            name_servers: env.name_servers.clone(),
             priority: 0,
-            // pvxs config.cpp:222,373-391: parse_timeout scales CONN_TMO by
-            // 4/3; enforceTimeout clamps below 2 s and defaults to 40 s.
-            tcp_timeout: super::server_conn::heartbeat_timeout(),
+            tcp_timeout: env.enforced_tcp_timeout(),
             share_udp: false,
             asserted_identity: None,
             max_message_size: None,
-            search_config: ClientSearchConfig::from_env(),
+            search_config: ClientSearchConfig::from_config(&env),
             search_config_overridden: false,
         }
     }
@@ -294,12 +292,12 @@ impl PvaClientBuilder {
         self
     }
 
-    pub fn user(mut self, user: impl Into<String>) -> Self {
+    pub fn user(mut self, user: impl Into<epics_base_rs::types::PvString>) -> Self {
         self.user = Some(user.into());
         self
     }
 
-    pub fn host(mut self, host: impl Into<String>) -> Self {
+    pub fn host(mut self, host: impl Into<epics_base_rs::types::PvString>) -> Self {
         self.host = Some(host.into());
         self
     }
@@ -328,6 +326,8 @@ impl PvaClientBuilder {
     }
 
     pub fn build(self) -> PvaClient {
+        // pvxs `ContextImpl`'s `SockAttach` (`clientimpl.h:234`).
+        crate::sock_attach::can_ipv6();
         let pool = ConnectionPool::new();
         if self.tls.is_some() {
             pool.set_tls(self.tls.clone());
@@ -348,7 +348,7 @@ impl PvaClientBuilder {
                 pipeline_size: self.pipeline_size,
                 pool,
                 channels: RwLock::new(HashMap::new()),
-                search: OnceLock::new(),
+                search: tokio::sync::OnceCell::new(),
                 cache_cleaner: std::sync::Once::new(),
                 name_servers: self.name_servers,
                 priority: self.priority,
@@ -372,13 +372,13 @@ impl Default for PvaClientBuilder {
 struct ClientInner {
     timeout: Duration,
     server_addr: Option<SocketAddr>,
-    user: String,
-    host: String,
+    user: epics_base_rs::types::PvString,
+    host: epics_base_rs::types::PvString,
     pipeline_size: u32,
     pool: Arc<ConnectionPool>,
     channels: RwLock<HashMap<String, CacheEntry>>,
     /// Lazy: only spawn the search engine when we actually need to resolve.
-    search: OnceLock<SearchEngine>,
+    search: tokio::sync::OnceCell<SearchEngine>,
     /// Spawns the periodic [`cache_clean_loop`] exactly once, on the first
     /// channel cached. Deferred to the first cache insert (rather than
     /// `build()`) so the sync builder never requires a Tokio runtime, mirroring
@@ -627,8 +627,8 @@ impl PvaClient {
     /// connection-config field across.
     pub fn with_asserted_identity(
         &self,
-        user: String,
-        host: String,
+        user: impl Into<epics_base_rs::types::PvString>,
+        host: impl Into<epics_base_rs::types::PvString>,
         asserted: AssertedIdentity,
     ) -> PvaClient {
         let mut builder = PvaClientBuilder::new()
@@ -663,6 +663,28 @@ impl PvaClient {
         Self::builder().server_addr(server_addr).build()
     }
 
+    /// This client's effective configuration, pvxs `Context::config()`
+    /// (`client.cpp:418-421`): the values it was built with, `expand()`ed as
+    /// `ContextImpl::effective` is (`client.cpp:543-547`). Built from the
+    /// client's own fields, so a readback never re-reads the environment.
+    pub fn config(&self) -> crate::config::env::Config {
+        let search = &self.inner.search_config;
+        let mut cfg = crate::config::env::Config {
+            udp_port: search.broadcast_port,
+            tcp_port: search.server_port,
+            auto_addr_list: search.auto_addr_list,
+            auto_beacon: false,
+            interfaces: search.interfaces.clone(),
+            address_list: search.addr_list.clone(),
+            name_servers: self.inner.name_servers.clone(),
+            beacon_destinations: Vec::new(),
+            ignore_addrs: Vec::new(),
+            tcp_timeout: self.inner.tcp_timeout.as_secs_f64(),
+        };
+        cfg.expand_client();
+        cfg
+    }
+
     /// True when [`Self::search_engine`] resolves to the process-wide
     /// `SHARED_SEARCH_ENGINE` instead of spawning a per-client engine.
     ///
@@ -692,32 +714,44 @@ impl PvaClient {
             .expect("the search engine is built on the client's executor");
         if self.uses_shared_search_engine() {
             let engine = SHARED_SEARCH_ENGINE
-                .get_or_try_init(|| async {
-                    SearchEngine::spawn(&reactor, Vec::new(), Vec::new()).await
+                // The first sharing client's config is the environment's
+                // (an overridden one never shares), so it is not read again.
+                .get_or_try_init(|| {
+                    SearchEngine::spawn_with_config(
+                        &reactor,
+                        self.inner.search_config.clone(),
+                        Vec::new(),
+                        Vec::new(),
+                        Default::default(),
+                        Default::default(),
+                        self.inner.tcp_timeout,
+                    )
                 })
                 .await?;
             return Ok(engine);
         }
-        if self.inner.search.get().is_none() {
-            // Per-client engine carries the CA credentials so TCP name-server
-            // handshakes authenticate as this client's user/host (pvxs has no
-            // name-server auth exception, clientconn.cpp:215-263) and the
-            // per-client UDP-search config so a caller's `addr_list` / ports
-            // drive the SEARCH path instead of the process environment. The
-            // shared engine above never has either, so it needs neither.
-            let engine = SearchEngine::spawn_with_config(
-                &reactor,
-                self.inner.search_config.clone(),
-                Vec::new(),
-                self.inner.name_servers.clone(),
-                self.inner.user.clone(),
-                self.inner.host.clone(),
-                self.inner.tcp_timeout,
-            )
-            .await?;
-            let _ = self.inner.search.set(engine);
-        }
-        Ok(self.inner.search.get().unwrap())
+        // Per-client engine carries the CA credentials so TCP name-server
+        // handshakes authenticate as this client's user/host (pvxs has no
+        // name-server auth exception, clientconn.cpp:215-263) and the
+        // per-client UDP-search config so a caller's `addr_list` / ports
+        // drive the SEARCH path instead of the process environment. The
+        // shared engine above never has either, so it needs neither. One
+        // spawn per client, as pvxs's one `ContextImpl`: concurrent first
+        // callers wait on it rather than each binding sockets.
+        self.inner
+            .search
+            .get_or_try_init(|| {
+                SearchEngine::spawn_with_config(
+                    &reactor,
+                    self.inner.search_config.clone(),
+                    Vec::new(),
+                    self.inner.name_servers.clone(),
+                    self.inner.user.clone(),
+                    self.inner.host.clone(),
+                    self.inner.tcp_timeout,
+                )
+            })
+            .await
     }
 
     async fn channel(&self, pv_name: &str) -> PvaResult<Arc<Channel>> {
@@ -1193,6 +1227,14 @@ impl PvaClient {
         }
     }
 
+    /// Open the search sockets now rather than at the first search: pvxs
+    /// does it in the `Context` constructor (`src/client.cpp:560-690`),
+    /// where an empty search list is reported. A failure here is met again,
+    /// and returned, by the first operation that searches.
+    pub async fn start(&self) -> PvaResult<()> {
+        self.search_engine().await.map(|_| ())
+    }
+
     /// Send a DISCOVER ping (empty SEARCH) to broadcast targets so
     /// reachable servers reply immediately. Pair with the discovery
     /// stream from the search engine to learn about servers without
@@ -1519,8 +1561,6 @@ impl PvaClient {
     /// (`src/conn.cpp:249-276` drains the frame at `default:`), and its own
     /// pvalink forward link is exactly this PUT
     /// (`ioc/pvalink_lset.cpp:691` -> `ioc/pvalink_channel.cpp:225-263`).
-    /// Prefer it over [`Self::pvprocess`] wherever the peer may be a pvxs
-    /// server; `pvprocess` stays for peers that do implement cmd 16.
     pub async fn pvput_empty_with_request(
         &self,
         pv_name: &str,
@@ -2155,345 +2195,6 @@ impl PvaClient {
         let ch = self.channel_with_forced(pv_name, Some(server)).await?;
         let (req_desc, req_value) = empty_pv_request();
         op_rpc(&ch, &req_desc, &req_value, RpcArg::Null, self.inner.timeout).await
-    }
-
-    /// PVA `PUT_GET` (cmd 12) — atomic put-then-get. PUTs `value_str`
-    /// to the channel's `.value` field and returns the (possibly
-    /// post-processed) value back in one round trip. Returns the
-    /// readback `(introspection, value)`.
-    ///
-    /// Use this when a write has a side effect on the value (a record
-    /// that recalculates on process) and you want the updated value
-    /// without a separate GET — it is a single wire operation and the
-    /// server applies the put then reads back atomically.
-    pub async fn pvput_get(
-        &self,
-        pv_name: &str,
-        value_str: &str,
-    ) -> PvaResult<(FieldDesc, PvField)> {
-        let ch = self.channel(pv_name).await?;
-        op_put_get(&ch, value_str, self.inner.timeout).await
-    }
-
-    /// Atomic `PUT_GET` (cmd 12) of a pre-built [`PvField`] using the
-    /// default `field(value)` pvRequest — the typed-value counterpart of
-    /// [`Self::pvput_get`] (which parses a string). Returns the post-put
-    /// readback `(introspection, value)`.
-    pub async fn pvput_get_pv_field(
-        &self,
-        pv_name: &str,
-        value: &crate::pvdata::PvField,
-    ) -> PvaResult<(FieldDesc, PvField)> {
-        let ch = self.channel(pv_name).await?;
-        crate::client_native::ops_v2::op_put_get_value(&ch, value, self.inner.timeout).await
-    }
-
-    /// Atomic `PUT_GET` (cmd 12) of a pre-built [`PvField`] carrying the
-    /// caller's decoded pvRequest (e.g. a PVA gateway's preserved
-    /// `ChannelContext.pv_request`): one upstream operation that applies
-    /// the put and returns the post-put readback. Like
-    /// [`Self::pvput_pv_field_with_request_value`] but the round trip is a
-    /// single PVA `PUT_GET` rather than a plain PUT — the value is written
-    /// and the server's post-put value returned atomically, with the
-    /// pvRequest's `record._options.process`/`block` honored. The
-    /// pvRequest is serialized in the connection's negotiated byte order at
-    /// INIT; the value targets the `value` bit as in
-    /// [`Self::pvput_pv_field_with_request_value`].
-    ///
-    /// pva2pva `p2pApp/channel.cpp:129-138` (`GWChannel::createChannelPutGet`)
-    /// forwards the original pvRequest verbatim and returns the upstream
-    /// readback.
-    pub async fn pvput_get_pv_field_with_request_value(
-        &self,
-        pv_name: &str,
-        pv_request: &crate::pvdata::PvField,
-        value: &crate::pvdata::PvField,
-    ) -> PvaResult<(FieldDesc, PvField)> {
-        let ch = self.channel(pv_name).await?;
-        let bytes = self.encode_pv_request(&ch, pv_request).await?;
-        crate::client_native::ops_v2::op_put_get_value_raw(&ch, &bytes, value, self.inner.timeout)
-            .await
-    }
-
-    /// [`Self::pvput_get_pv_field_with_request_value`] keeping the readback's
-    /// marked leaves — the PUT_GET a PVA gateway forwards. See
-    /// [`Self::pvget_marked`].
-    pub async fn pvput_get_pv_field_with_request_value_marked(
-        &self,
-        pv_name: &str,
-        pv_request: &crate::pvdata::PvField,
-        value: &crate::pvdata::PvField,
-    ) -> PvaResult<crate::client_native::ops_v2::MarkedRead> {
-        let ch = self.channel(pv_name).await?;
-        let bytes = self.encode_pv_request(&ch, pv_request).await?;
-        crate::client_native::ops_v2::op_put_get_value_raw_marked(
-            &ch,
-            &bytes,
-            value,
-            self.inner.timeout,
-        )
-        .await
-    }
-
-    /// [`Self::pvput_get_pv_field`] keeping the readback's marked leaves.
-    /// See [`Self::pvget_marked`].
-    pub async fn pvput_get_pv_field_marked(
-        &self,
-        pv_name: &str,
-        value: &crate::pvdata::PvField,
-    ) -> PvaResult<crate::client_native::ops_v2::MarkedRead> {
-        let ch = self.channel(pv_name).await?;
-        crate::client_native::ops_v2::op_put_get_value_marked(&ch, value, self.inner.timeout).await
-    }
-
-    /// PVA `PUT_GET` `getGet` subcommand (`QOS_GET`, 0x40) — read the
-    /// channel's current get-side data with no put leg, returning the
-    /// readback `(introspection, value)`. The EPICS pvAccess
-    /// `ChannelPutGet::getGet()` (`clientContextImpl.cpp:1233-1255`)
-    /// counterpart; unlike [`Self::pvput_get`] it never writes.
-    pub async fn pvget_get(&self, pv_name: &str) -> PvaResult<(FieldDesc, PvField)> {
-        let ch = self.channel(pv_name).await?;
-        op_get_get(&ch, self.inner.timeout).await
-    }
-
-    /// PVA `PUT_GET` `getPut` subcommand (`QOS_GET_PUT`, 0x80) — read the
-    /// channel's current put-side data with no put leg. The EPICS pvAccess
-    /// `ChannelPutGet::getPut()` (`clientContextImpl.cpp:1262-1288`)
-    /// counterpart.
-    pub async fn pvget_put(&self, pv_name: &str) -> PvaResult<(FieldDesc, PvField)> {
-        let ch = self.channel(pv_name).await?;
-        op_get_put(&ch, self.inner.timeout).await
-    }
-
-    /// Like [`Self::pvget_get`] but carries a caller-supplied pvRequest at
-    /// INIT, so a `getField(...)` selector projects the get-leg structure's
-    /// readback (pvDatabaseCPP `ChannelPutGetLocal::getGet`,
-    /// modules/pvDatabase/src/pvAccess/channelLocal.cpp). The pvRequest is
-    /// serialized in the connection's negotiated byte order. Absent a
-    /// `getField`, the server falls back to the common `field` selection.
-    pub async fn pvget_get_with_request_value(
-        &self,
-        pv_name: &str,
-        pv_request: &crate::pvdata::PvField,
-    ) -> PvaResult<(FieldDesc, PvField)> {
-        let ch = self.channel(pv_name).await?;
-        let order =
-            crate::client_native::ops_v2::ensure_active_with_op_timeout(&ch, self.inner.timeout)
-                .await?
-                .0
-                .byte_order();
-        let mut bytes = Vec::new();
-        let desc = pv_request.descriptor();
-        crate::pvdata::encode::encode_type_desc(&desc, order, &mut bytes);
-        crate::pvdata::encode::encode_pv_field(pv_request, &desc, order, &mut bytes);
-        crate::client_native::ops_v2::op_get_get_with_request(&ch, &bytes, self.inner.timeout).await
-    }
-
-    /// Like [`Self::pvget_put`] but carries a caller-supplied pvRequest at
-    /// INIT, so a `putField(...)` selector projects the put-leg structure's
-    /// readback (pvDatabaseCPP `ChannelPutGetLocal::getPut`,
-    /// modules/pvDatabase/src/pvAccess/channelLocal.cpp). The pvRequest is
-    /// serialized in the connection's negotiated byte order. Absent a
-    /// `putField`, the server falls back to the common `field` selection.
-    pub async fn pvget_put_with_request_value(
-        &self,
-        pv_name: &str,
-        pv_request: &crate::pvdata::PvField,
-    ) -> PvaResult<(FieldDesc, PvField)> {
-        let ch = self.channel(pv_name).await?;
-        let order =
-            crate::client_native::ops_v2::ensure_active_with_op_timeout(&ch, self.inner.timeout)
-                .await?
-                .0
-                .byte_order();
-        let mut bytes = Vec::new();
-        let desc = pv_request.descriptor();
-        crate::pvdata::encode::encode_type_desc(&desc, order, &mut bytes);
-        crate::pvdata::encode::encode_pv_field(pv_request, &desc, order, &mut bytes);
-        crate::client_native::ops_v2::op_get_put_with_request(&ch, &bytes, self.inner.timeout).await
-    }
-
-    /// PVA `PROCESS` (cmd 16) — trigger record processing without
-    /// transferring a value. The wire equivalent of an EPICS
-    /// `caput .PROC` / `dbProcess`. Succeeds with `()`; a processing
-    /// failure surfaces as a [`PvaError::Protocol`].
-    ///
-    /// Sends the empty default pvRequest, matching EPICS base pvaClient
-    /// `createProcess("")`. Use [`Self::pvprocess_with_request`] to send a
-    /// provider-specific PROCESS request.
-    pub async fn pvprocess(&self, pv_name: &str) -> PvaResult<()> {
-        let ch = self.channel(pv_name).await?;
-        op_process(&ch, self.inner.timeout).await
-    }
-
-    /// Like [`Self::pvprocess`] but sends a caller-supplied PROCESS
-    /// pvRequest (e.g. built via [`Self::request`] →
-    /// [`crate::pv_request::PvRequestExpr::encode`], or
-    /// `record[block=true]`). pvAccess serializes the request on PROCESS
-    /// INIT and the server provider can inspect it during
-    /// `createChannelProcess`. Mirrors pvaClient
-    /// `PvaClientChannel::createProcess(pvRequest)`.
-    pub async fn pvprocess_with_request(&self, pv_name: &str, pv_request: &[u8]) -> PvaResult<()> {
-        let ch = self.channel(pv_name).await?;
-        op_process_with_request(&ch, pv_request, self.inner.timeout).await
-    }
-
-    /// Like [`Self::pvprocess_with_request`] but takes the PROCESS INIT
-    /// pvRequest as a decoded [`PvField`] value rather than pre-encoded
-    /// bytes; it is serialized in the connection's negotiated byte order.
-    /// A PVA-to-PVA gateway uses this to forward the downstream PROCESS
-    /// create-time pvRequest — preserved into `ChannelContext.pv_request`
-    /// — upstream, matching pva2pva `createChannelProcess(..., pvRequest)`
-    /// (channel.cpp:98-107).
-    pub async fn pvprocess_with_request_value(
-        &self,
-        pv_name: &str,
-        pv_request: &PvField,
-    ) -> PvaResult<()> {
-        let ch = self.channel(pv_name).await?;
-        op_process_with_request_value(&ch, pv_request, self.inner.timeout).await
-    }
-
-    /// ChannelArray `getArray` (cmd 14): read the `[offset, count, stride]`
-    /// slice of `pv_name`'s array field. `count == 0` reads to the end.
-    /// Returns the array `(introspection, value)`. Errors with a protocol
-    /// status when the server's source does not serve a windowed array.
-    pub async fn pvarray_get(
-        &self,
-        pv_name: &str,
-        offset: u32,
-        count: u32,
-        stride: u32,
-    ) -> PvaResult<(FieldDesc, PvField)> {
-        let ch = self.channel(pv_name).await?;
-        crate::client_native::ops_v2::op_array_get(&ch, offset, count, stride, self.inner.timeout)
-            .await
-    }
-
-    /// ChannelArray `putArray` (cmd 14): splice `value` into `pv_name`'s
-    /// array field at `offset` with `stride`.
-    pub async fn pvarray_put(
-        &self,
-        pv_name: &str,
-        value: &PvField,
-        offset: u32,
-        stride: u32,
-    ) -> PvaResult<()> {
-        let ch = self.channel(pv_name).await?;
-        crate::client_native::ops_v2::op_array_put(&ch, value, offset, stride, self.inner.timeout)
-            .await
-    }
-
-    /// ChannelArray `setLength` (cmd 14): resize `pv_name`'s array field.
-    pub async fn pvarray_set_length(&self, pv_name: &str, length: u32) -> PvaResult<()> {
-        let ch = self.channel(pv_name).await?;
-        crate::client_native::ops_v2::op_array_set_length(&ch, length, self.inner.timeout).await
-    }
-
-    /// ChannelArray `getLength` (cmd 14): query the element count of
-    /// `pv_name`'s array field.
-    pub async fn pvarray_get_length(&self, pv_name: &str) -> PvaResult<u32> {
-        let ch = self.channel(pv_name).await?;
-        crate::client_native::ops_v2::op_array_get_length(&ch, self.inner.timeout).await
-    }
-
-    /// ChannelArray INIT-only descriptor probe: open the array op (default
-    /// `field(value)` selection), read back the bound array field's
-    /// introspection, then DESTROY. Used by a PVA gateway to resolve the
-    /// upstream array descriptor it must report on a downstream ARRAY INIT.
-    pub async fn pvarray_describe(&self, pv_name: &str) -> PvaResult<FieldDesc> {
-        let ch = self.channel(pv_name).await?;
-        crate::client_native::ops_v2::op_array_describe(&ch, None, self.inner.timeout).await
-    }
-
-    /// [`Self::pvarray_describe`] forwarding the caller's `pv_request`
-    /// (selects the bound array field) verbatim into the INIT frame.
-    pub async fn pvarray_describe_with_request_value(
-        &self,
-        pv_name: &str,
-        pv_request: &PvField,
-    ) -> PvaResult<FieldDesc> {
-        let ch = self.channel(pv_name).await?;
-        crate::client_native::ops_v2::op_array_describe(&ch, Some(pv_request), self.inner.timeout)
-            .await
-    }
-
-    /// [`Self::pvarray_get`] forwarding the caller's `pv_request` (selects
-    /// the bound array field) verbatim into the INIT frame.
-    pub async fn pvarray_get_with_request_value(
-        &self,
-        pv_name: &str,
-        pv_request: &PvField,
-        offset: u32,
-        count: u32,
-        stride: u32,
-    ) -> PvaResult<(FieldDesc, PvField)> {
-        let ch = self.channel(pv_name).await?;
-        crate::client_native::ops_v2::op_array_get_with_request(
-            &ch,
-            pv_request,
-            offset,
-            count,
-            stride,
-            self.inner.timeout,
-        )
-        .await
-    }
-
-    /// [`Self::pvarray_put`] forwarding the caller's `pv_request` (selects
-    /// the bound array field) verbatim into the INIT frame.
-    pub async fn pvarray_put_with_request_value(
-        &self,
-        pv_name: &str,
-        pv_request: &PvField,
-        value: &PvField,
-        offset: u32,
-        stride: u32,
-    ) -> PvaResult<()> {
-        let ch = self.channel(pv_name).await?;
-        crate::client_native::ops_v2::op_array_put_with_request(
-            &ch,
-            pv_request,
-            value,
-            offset,
-            stride,
-            self.inner.timeout,
-        )
-        .await
-    }
-
-    /// [`Self::pvarray_set_length`] forwarding the caller's `pv_request`
-    /// (selects the bound array field) verbatim into the INIT frame.
-    pub async fn pvarray_set_length_with_request_value(
-        &self,
-        pv_name: &str,
-        pv_request: &PvField,
-        length: u32,
-    ) -> PvaResult<()> {
-        let ch = self.channel(pv_name).await?;
-        crate::client_native::ops_v2::op_array_set_length_with_request(
-            &ch,
-            pv_request,
-            length,
-            self.inner.timeout,
-        )
-        .await
-    }
-
-    /// [`Self::pvarray_get_length`] forwarding the caller's `pv_request`
-    /// (selects the bound array field) verbatim into the INIT frame.
-    pub async fn pvarray_get_length_with_request_value(
-        &self,
-        pv_name: &str,
-        pv_request: &PvField,
-    ) -> PvaResult<u32> {
-        let ch = self.channel(pv_name).await?;
-        crate::client_native::ops_v2::op_array_get_length_with_request(
-            &ch,
-            pv_request,
-            self.inner.timeout,
-        )
-        .await
     }
 
     /// Snapshot of the client's current state — channel cache size,
@@ -3611,6 +3312,47 @@ mod tests {
             client.inner.search.get().is_some(),
             "per-client engine must be populated"
         );
+    }
+
+    /// Concurrent first callers get one per-client engine: each spawn binds
+    /// sockets and, with nowhere to search, logs the empty-destination line.
+    /// Workers in parallel, as pvget's op task and `hurry_up` are; a
+    /// current-thread executor never interleaves the two spawns.
+    #[cfg(tokio_backend)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_first_callers_spawn_one_engine() {
+        use epics_base_rs::runtime::log;
+        let client = PvaClient::builder()
+            .auto_addr_list(false)
+            .addr_list(Vec::new())
+            .build();
+        let heard = Arc::new(std::sync::Mutex::new(0usize));
+        let sink = heard.clone();
+        let id = log::errlog_add_listener(move |m| {
+            if m.contains("no search destinations") {
+                *sink.lock().unwrap() += 1;
+            }
+        });
+        let reactor = epics_base_rs::runtime::task::Reactor::current().expect("executor");
+        let mut set = epics_base_rs::runtime::task::TaskSet::new();
+        for _ in 0..8 {
+            let client = client.clone();
+            set.spawn(&reactor, async move {
+                client
+                    .search_engine()
+                    .await
+                    .map(|e| e as *const SearchEngine as usize)
+            });
+        }
+        let mut engines = Vec::new();
+        while let Some(r) = set.join_next().await {
+            engines.push(r.expect("task").expect("engine"));
+        }
+        log::errlog_flush();
+        log::errlog_remove_listener(id);
+        engines.dedup();
+        assert_eq!(engines.len(), 1);
+        assert_eq!(*heard.lock().unwrap(), 1);
     }
 
     // Control: `share_udp(true)` with no name servers still shares the

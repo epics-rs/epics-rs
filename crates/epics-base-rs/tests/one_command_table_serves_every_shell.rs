@@ -78,7 +78,7 @@ async fn one_registration_reaches_the_script_and_the_prompt() {
     IocApplication::new()
         .port(0)
         .register_shell_command(recorder("parityShellCmd", calls.clone()))
-        .register_link_set_installer(move |_db| async move {
+        .register_link_type("ca", move |_db| async move {
             vec![recorder("parityInstallerCmd", installer_calls)]
         })
         .startup_script(&script)

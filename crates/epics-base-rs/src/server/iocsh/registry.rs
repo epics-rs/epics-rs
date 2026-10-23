@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::sync::Arc;
 
+use crate::runtime::log::{StagedLine, write_whole};
+use crate::runtime::stdio;
 use crate::server::database::PvDatabase;
 
 /// Argument type for a command parameter.
@@ -39,17 +41,161 @@ pub struct ArgDesc {
     pub arg_type: ArgType,
 }
 
+/// One `iocshArgString` value: C's `sval`, a `char *` into the line buffer,
+/// so it is the bytes the script held. A command that needs text converts
+/// at its own site — [`Self::to_str`] where the bytes are an identity,
+/// [`Self::to_str_lossy`] where they are only shown.
+#[derive(Clone, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct IocshString(Vec<u8>);
+
+impl IocshString {
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.0
+    }
+
+    /// The text, or the refusal a String-keyed consumer answers a
+    /// non-UTF-8 argument with.
+    pub fn to_str(&self) -> Result<&str, String> {
+        std::str::from_utf8(&self.0)
+            .map_err(|_| format!("'{}' is not valid UTF-8", self.to_str_lossy()))
+    }
+
+    pub fn to_str_lossy(&self) -> std::borrow::Cow<'_, str> {
+        String::from_utf8_lossy(&self.0)
+    }
+
+    /// The file name C `fopen`s: the bytes themselves on Unix.
+    pub fn to_path(&self) -> Result<&std::path::Path, String> {
+        bytes_path(&self.0)
+    }
+
+    /// The bytes as the OS takes a name (`setenv`, `unsetenv`).
+    pub fn to_os_str(&self) -> Result<&std::ffi::OsStr, String> {
+        bytes_os_str(&self.0)
+    }
+}
+
+/// A file name held as bytes, as C hands it to `fopen`.
+pub fn bytes_path(name: &[u8]) -> Result<&std::path::Path, String> {
+    bytes_os_str(name).map(std::path::Path::new)
+}
+
+/// Bytes as an OS string: the bytes themselves on Unix, UTF-8 elsewhere.
+pub fn bytes_os_str(name: &[u8]) -> Result<&std::ffi::OsStr, String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        Ok(std::ffi::OsStr::from_bytes(name))
+    }
+    #[cfg(not(unix))]
+    {
+        std::str::from_utf8(name)
+            .map(std::ffi::OsStr::new)
+            .map_err(|_| format!("'{}' is not valid UTF-8", String::from_utf8_lossy(name)))
+    }
+}
+
+impl std::ops::Deref for IocshString {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl AsRef<[u8]> for IocshString {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for IocshString {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&self.to_str_lossy(), f)
+    }
+}
+
+/// Display-only: a diagnostic quoting the argument.
+impl std::fmt::Display for IocshString {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.to_str_lossy())
+    }
+}
+
+impl From<Vec<u8>> for IocshString {
+    fn from(bytes: Vec<u8>) -> Self {
+        Self(bytes)
+    }
+}
+
+impl From<&[u8]> for IocshString {
+    fn from(bytes: &[u8]) -> Self {
+        Self(bytes.to_vec())
+    }
+}
+
+impl From<String> for IocshString {
+    fn from(s: String) -> Self {
+        Self(s.into_bytes())
+    }
+}
+
+impl From<&str> for IocshString {
+    fn from(s: &str) -> Self {
+        Self(s.as_bytes().to_vec())
+    }
+}
+
+impl From<&String> for IocshString {
+    fn from(s: &String) -> Self {
+        Self(s.as_bytes().to_vec())
+    }
+}
+
+impl From<std::borrow::Cow<'_, str>> for IocshString {
+    fn from(s: std::borrow::Cow<'_, str>) -> Self {
+        Self(s.into_owned().into_bytes())
+    }
+}
+
+impl PartialEq<str> for IocshString {
+    fn eq(&self, other: &str) -> bool {
+        self.0 == other.as_bytes()
+    }
+}
+
+impl PartialEq<&str> for IocshString {
+    fn eq(&self, other: &&str) -> bool {
+        self.0 == other.as_bytes()
+    }
+}
+
+impl PartialEq<IocshString> for &str {
+    fn eq(&self, other: &IocshString) -> bool {
+        self.as_bytes() == other.0
+    }
+}
+
+impl PartialEq<IocshString> for str {
+    fn eq(&self, other: &IocshString) -> bool {
+        self.as_bytes() == other.0
+    }
+}
+
 /// A parsed argument value.
 #[derive(Debug, Clone)]
 pub enum ArgValue {
-    String(String),
+    String(IocshString),
     Int(i64),
     Double(f64),
     /// Every remaining token, for an [`ArgType::Argv`] parameter. Empty when
     /// the line ended at this position — C hands the callback `ac == 0` there
     /// rather than treating the argument as absent, so there is no `Missing`
     /// case for this type.
-    Argv(Vec<String>),
+    Argv(Vec<IocshString>),
     Missing,
 }
 
@@ -75,7 +221,9 @@ pub enum CommandOutcome {
 /// Command result type.
 ///
 /// `Err(msg)` is C's "print `msg` AND mark the line errored"; the silent
-/// failure is [`CommandOutcome::Failed`] on the `Ok` side.
+/// failure is [`CommandOutcome::Failed`] on the `Ok` side. A handler's
+/// `msg` is printed exactly as given, with no `ERROR <file> line <n>:`
+/// frame: it stands for the text the C command prints itself.
 pub type CommandResult = Result<CommandOutcome, String>;
 
 /// Trait for command handlers.
@@ -146,26 +294,13 @@ pub struct CommandContext {
     /// [`CommandContext::new`] creates a fresh unobserved cell for
     /// standalone shells that administer no server.
     acf: crate::server::access_security::AcfCell,
-    /// Output writer — defaults to stdout, redirected to a file by `>` / `>>`.
-    ///
-    /// C's `epicsSetThreadStdout` (`iocsh.cpp:417`), which `startRedirect`
-    /// swaps for the duration of one command line.
-    output: std::cell::RefCell<Box<dyn std::io::Write>>,
-    /// Diagnostic writer — defaults to stderr, redirected by `2>` / `2>>`.
-    ///
-    /// C's `epicsSetThreadStderr` (`iocsh.cpp:422`). It is a SEPARATE cell
-    /// from `output` for the same reason C keeps a separate FILE*: a `2>`
-    /// redirect must leave stdout alone, so `dbl 2>/dev/null` still prints its
-    /// listing. Every shell diagnostic goes through [`Self::eprintln`]; a bare
-    /// `eprintln!` would bypass the swap and is what made `2>` inert.
-    error: std::cell::RefCell<Box<dyn std::io::Write>>,
-    /// Input reader — defaults to stdin, redirected by `<`.
-    ///
-    /// C's `epicsSetThreadStdin` (`iocsh.cpp:412`). No built-in command reads
-    /// it today; it exists so the `<` redirect performs C's swap rather than
-    /// being silently dropped, and so a command that needs input has the same
-    /// seam its C counterpart reads.
-    input: std::cell::RefCell<Box<dyn std::io::BufRead>>,
+    /// C's raw `stdout`/`stderr`: what a C file that does not include
+    /// `epicsStdio.h` writes — `dbAccess.c`, `dbLexRoutines.c`,
+    /// `dbLoadTemplate.y` among them. No iocsh redirect swaps these
+    /// (measured: `dbLoadRecords nosuch.db 2> f` leaves `f` empty), so they
+    /// are not the thread's streams of [`crate::runtime::stdio`].
+    console_out: std::cell::RefCell<Box<dyn std::io::Write>>,
+    console_err: std::cell::RefCell<Box<dyn std::io::Write>>,
     /// The owning shell's live command table, weakly held.
     ///
     /// C needs no such field: its command table IS the registry every other
@@ -209,9 +344,8 @@ impl CommandContext {
             db,
             bridge,
             acf,
-            output: std::cell::RefCell::new(Box::new(std::io::stdout())),
-            error: std::cell::RefCell::new(Box::new(std::io::stderr())),
-            input: std::cell::RefCell::new(Box::new(std::io::BufReader::new(std::io::stdin()))),
+            console_out: std::cell::RefCell::new(Box::new(std::io::stdout())),
+            console_err: std::cell::RefCell::new(Box::new(crate::runtime::log::StagedStderr)),
             commands: std::cell::RefCell::new(std::sync::Weak::new()),
         }
     }
@@ -258,10 +392,9 @@ impl CommandContext {
         &self.bridge
     }
 
-    /// Print a line to the current output (stdout or redirected file).
+    /// Print a line to the thread's stdout, which a `>` redirect sets.
     pub fn println(&self, msg: &str) {
-        let mut out = self.output.borrow_mut();
-        let _ = writeln!(out, "{msg}");
+        stdio::stdout_whole(format_args!("{msg}\n"));
     }
 
     /// Print raw BYTES plus a newline to the current output.
@@ -271,73 +404,110 @@ impl CommandContext {
     /// emits the single byte 0xFF. Routing that through [`Self::println`] would
     /// force it through a Rust `str` and replace it.
     pub fn println_bytes(&self, bytes: &[u8]) {
-        let mut out = self.output.borrow_mut();
-        let _ = out.write_all(bytes);
-        let _ = out.write_all(b"\n");
+        let mut line = StagedLine::default();
+        line.push_bytes(bytes);
+        line.push_bytes(b"\n");
+        stdio::stdout_bytes(line.bytes());
+    }
+
+    /// Print raw BYTES to the current output, as C's `printf("%s")` does.
+    pub fn print_bytes(&self, bytes: &[u8]) {
+        stdio::stdout_bytes(bytes);
     }
 
     /// Print a formatted string to the current output.
     pub fn print_fmt(&self, args: std::fmt::Arguments<'_>) {
-        let mut out = self.output.borrow_mut();
-        let _ = out.write_fmt(args);
-        let _ = writeln!(out);
+        stdio::stdout_whole(format_args!("{args}\n"));
     }
 
-    /// Print a line to the current DIAGNOSTIC stream (stderr, or the file a
-    /// `2>` redirect installed) — C `fprintf(epicsGetThreadStderr(), ...)`.
+    /// Print a line to the thread's stderr, which a `2>` redirect sets —
+    /// C `fprintf(stderr, ...)` under `epicsStdio.h`.
     pub fn eprintln(&self, msg: &str) {
-        let mut err = self.error.borrow_mut();
-        let _ = writeln!(err, "{msg}");
+        let _ = stdio::with_stderr(|err| write_whole(err, format_args!("{msg}\n")));
     }
 
-    /// Read one line from the current INPUT stream (stdin, or the file a `<`
-    /// redirect installed) — C `fgets(..., epicsGetThreadStdin())`. `Ok(0)`
-    /// is end of input.
+    /// A line on C's raw `stdout`, which no iocsh redirect swaps.
+    pub fn console_println(&self, msg: &str) {
+        let _ = write_whole(
+            &mut **self.console_out.borrow_mut(),
+            format_args!("{msg}\n"),
+        );
+    }
+
+    /// Raw BYTES plus a newline on C's raw `stdout`.
+    pub fn console_println_bytes(&self, bytes: &[u8]) {
+        let mut out = self.console_out.borrow_mut();
+        let _ = out.write_all(bytes);
+        let _ = out.write_all(b"\n");
+    }
+
+    /// A line on C's raw `stderr`, which no iocsh redirect swaps.
+    pub fn console_eprintln(&self, msg: &str) {
+        let _ = write_whole(
+            &mut **self.console_err.borrow_mut(),
+            format_args!("{msg}\n"),
+        );
+    }
+
+    /// Exchange the console cells with `other`'s. Called twice around a
+    /// shell's line, it lends that shell what a test captured on this one;
+    /// the thread's own streams need no lending.
+    pub(crate) fn swap_streams(&self, other: &CommandContext) {
+        self.console_out.swap(&other.console_out);
+        self.console_err.swap(&other.console_err);
+    }
+
+    /// Fail the line as C's iocsh fails a command that threw
+    /// (`iocsh.cpp:1275-1285`): `C++ error: <what>` in red on the diagnostic
+    /// stream.
+    pub fn cxx_error(&self, what: impl std::fmt::Display) -> CommandOutcome {
+        self.eprintln(&super::paint_error(&format!("C++ error: {what}")));
+        CommandOutcome::Failed
+    }
+
+    /// Read one line from the thread's stdin, which a `<` redirect sets —
+    /// C `fgets(..., stdin)` under `epicsStdio.h`. `Ok(0)` is end of input.
     pub fn read_line(&self, buf: &mut String) -> std::io::Result<usize> {
-        let mut input = self.input.borrow_mut();
-        input.read_line(buf)
+        stdio::with_stdin(|input| input.read_line(buf))
     }
 
-    /// Temporarily redirect the DIAGNOSTIC stream, run a closure, then
-    /// restore — C `startRedirect`/`stopRedirect` for fd 2.
+    /// Swap both console cells for the length of `f`, so a test can read
+    /// what a command wrote past every redirect.
+    #[cfg(test)]
+    pub(crate) fn with_console<O: std::io::Write + 'static, E: std::io::Write + 'static, R>(
+        &self,
+        out: O,
+        err: E,
+        f: impl FnOnce() -> R,
+    ) -> R {
+        let prev_out = self.console_out.replace(Box::new(out));
+        let prev_err = self.console_err.replace(Box::new(err));
+        let result = f();
+        let _ = self.console_out.borrow_mut().flush();
+        let _ = self.console_err.borrow_mut().flush();
+        self.console_out.replace(prev_out);
+        self.console_err.replace(prev_err);
+        result
+    }
+
+    /// [`stdio::redirect_stderr`], for tests that hold a context.
+    #[cfg(test)]
     pub(crate) fn with_error<W: std::io::Write + 'static, R>(
         &self,
         writer: W,
         f: impl FnOnce() -> R,
     ) -> R {
-        let prev = self.error.replace(Box::new(writer));
-        let result = f();
-        let _ = self.error.borrow_mut().flush();
-        self.error.replace(prev);
-        result
+        stdio::redirect_stderr(writer, f)
     }
 
-    /// Temporarily redirect the INPUT stream, run a closure, then restore —
-    /// C `startRedirect`/`stopRedirect` for fd 0.
-    pub(crate) fn with_input<R: std::io::Read + 'static, T>(
-        &self,
-        reader: R,
-        f: impl FnOnce() -> T,
-    ) -> T {
-        let prev = self
-            .input
-            .replace(Box::new(std::io::BufReader::new(reader)));
-        let result = f();
-        self.input.replace(prev);
-        result
-    }
-
-    /// Temporarily redirect output to a writer, run a closure, then restore.
+    /// [`stdio::redirect_stdout`], for tests that hold a context.
+    #[cfg(test)]
     pub(crate) fn with_output<W: std::io::Write + 'static, R>(
         &self,
         writer: W,
         f: impl FnOnce() -> R,
     ) -> R {
-        let prev = self.output.replace(Box::new(writer));
-        let result = f();
-        let _ = self.output.borrow_mut().flush();
-        self.output.replace(prev);
-        result
+        stdio::redirect_stdout(writer, f)
     }
 
     /// Run an async future from the blocking REPL thread.
@@ -399,6 +569,29 @@ impl CommandRegistry {
     }
 }
 
+/// [`split`]'s words, for tests that read only those.
+#[cfg(test)]
+pub(crate) fn tokenize(line: &[u8]) -> Vec<IocshString> {
+    split(line).map(|s| s.argv).unwrap_or_default()
+}
+
+/// One line's redirect: C `iocshRedirect`'s name and mode for one fd.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Redirect {
+    /// Already expanded once, as C's `split` sees a `macDefExpand`ed line.
+    pub(crate) path: Vec<u8>,
+    pub(crate) append: bool,
+}
+
+/// C `split()`'s result: the words, and each fd's redirect in C's
+/// `std::map` order (`iocsh.cpp:223`), which is the order `openRedirect`
+/// opens them in.
+#[derive(Debug, Default)]
+pub(crate) struct Split {
+    pub(crate) argv: Vec<IocshString>,
+    pub(crate) redirects: std::collections::BTreeMap<u8, Redirect>,
+}
+
 /// Break a command line into words the way C `split()` does
 /// (`iocsh.cpp:255-376`).
 ///
@@ -417,10 +610,8 @@ impl CommandRegistry {
 /// backslashes and `epicsEnvSet X "hello \"world\""` is an unbalanced
 /// quote rather than an escaped one (both measured).
 ///
-/// The state behind all of that is [`ShellScan`], the same instance
-/// shape [`lint_line`] and [`super::parse_redirect`] run: C keeps one
-/// `quote`/`backslash` pair and answers every question from it, so a
-/// second implementation here could only disagree with them.
+/// The state behind all of that is [`ShellScan`]: C keeps one
+/// `quote`/`backslash` pair and answers every question from it.
 ///
 /// C parity (`iocsh.cpp:1184` `macDefExpand` → `:1215` `tokenize.split`):
 /// macros are expanded across the WHOLE line *before* it is split into
@@ -430,49 +621,138 @@ impl CommandRegistry {
 /// position resolves before the command name is taken. The caller
 /// ([`super::IocShell::execute_line`]) owns that one expansion; this
 /// function must not perform a second one.
-pub(crate) fn tokenize(line: &str) -> Vec<String> {
-    // Only ASCII bytes can be a separator, a quote or an escape, and
-    // every byte of a multi-byte character is >= 0x80, so one such byte
-    // stands for the whole character: classifying per character reaches
-    // the same words C reaches per byte, without ever cutting a token
-    // inside a UTF-8 sequence.
-    const NON_ASCII: u8 = 0x80;
-
-    let mut tokens: Vec<String> = Vec::new();
-    let mut current = String::new();
-    let mut inword = false;
+///
+/// Words and redirects come out of the one pass, as in C. A redirect may
+/// sit anywhere and names exactly one word; `<`, `>`, `>>` and `N>`/`N>>` (any `1`-`9` directly before `>`, even inside a word) are
+/// separators. A second operator before the first has its word ends the
+/// scan (`:280-281`, `:293-294`); a second name for one fd ends it too and
+/// keeps the first (`:336-337`).
+pub(crate) fn split(line: &[u8]) -> Result<Split, &'static str> {
+    enum Into {
+        Argv,
+        Fd(u8),
+    }
+    let mut out = Split::default();
     let mut scan = ShellScan::default();
+    // The fd whose operator still waits for its name, and the word being
+    // built with where it goes.
+    let mut pending: Option<u8> = None;
+    let mut word: Option<(Into, Vec<u8>)> = None;
+    let mut modes: std::collections::BTreeMap<u8, bool> = Default::default();
 
-    for ch in line.chars() {
-        let byte = if ch.is_ascii() { ch as u8 } else { NON_ASCII };
-        match scan.feed(byte) {
-            // C `:275-278` `continue`s past the word builder, so the
-            // backslash neither starts a word nor ends one.
-            SplitRole::Escape => {}
-            // C `:312-317`: a separator closes an open word and, when
-            // none is open (`:331`), is simply skipped — which is why a
-            // run of them yields no empty tokens.
-            SplitRole::Separator => {
-                if inword {
-                    tokens.push(std::mem::take(&mut current));
-                    inword = false;
-                }
+    fn close(
+        out: &mut Split,
+        modes: &std::collections::BTreeMap<u8, bool>,
+        word: Option<(Into, Vec<u8>)>,
+    ) {
+        match word {
+            Some((Into::Argv, w)) => out.argv.push(w.into()),
+            Some((Into::Fd(fd), path)) => {
+                out.redirects.insert(
+                    fd,
+                    Redirect {
+                        path,
+                        append: modes[&fd],
+                    },
+                );
             }
-            // C `:345-346` writes nothing for the quote itself, but the
-            // word has begun: `epicsEnvSet X ""` passes an empty token,
-            // not an absent one.
-            SplitRole::Quote => inword = true,
-            SplitRole::Data => {
-                current.push(ch);
-                inword = true;
-            }
+            None => {}
         }
     }
-    // C `:353-354` terminates the word the end of the line leaves open.
-    if inword {
-        tokens.push(current);
+
+    let mut i = 0;
+    'scan: while i < line.len() {
+        let mut c = line[i];
+        i += 1;
+        if scan.is_syntax() {
+            let mut op = None;
+            if c == b'<' {
+                op = Some((0, false));
+            } else {
+                let mut fd = 1;
+                if (b'1'..=b'9').contains(&c) && line.get(i) == Some(&b'>') {
+                    fd = c - b'0';
+                    c = b'>';
+                    i += 1;
+                }
+                if c == b'>' {
+                    let append = line.get(i) == Some(&b'>');
+                    if append {
+                        i += 1;
+                    }
+                    op = Some((fd, append));
+                }
+            }
+            if let Some((fd, append)) = op {
+                if pending.is_some() {
+                    break 'scan;
+                }
+                pending = Some(fd);
+                // C sets the mode on the map entry at the operator, so a
+                // second operator for an fd that keeps its first name still
+                // changes how that name opens.
+                modes.insert(fd, append);
+                close(&mut out, &modes, word.take());
+                if let Some(r) = out.redirects.get_mut(&fd) {
+                    r.append = append;
+                }
+                continue;
+            }
+        }
+        let role = scan.feed(c);
+        if matches!(role, SplitRole::Escape) {
+            continue;
+        }
+        if matches!(role, SplitRole::Separator) {
+            close(&mut out, &modes, word.take());
+            continue;
+        }
+        if word.is_none() {
+            let into = match pending.take() {
+                // C `:336-337`: `return false`, the line as split so far.
+                Some(fd) if out.redirects.contains_key(&fd) => break 'scan,
+                Some(fd) => Into::Fd(fd),
+                None => Into::Argv,
+            };
+            word = Some((into, Vec::new()));
+        }
+        if let (SplitRole::Data, Some((_, w))) = (role, word.as_mut()) {
+            w.push(c);
+        }
     }
-    tokens
+    close(&mut out, &modes, word.take());
+
+    // C `:357-371`, in C's order.
+    if pending.is_some() {
+        return Err("Invalid redirection.");
+    }
+    if scan.unbalanced_quote() {
+        return Err("Unbalanced quote.");
+    }
+    if scan.trailing_backslash() {
+        return Err("Trailing backslash.");
+    }
+    Ok(out)
+}
+
+/// `arg` as line text that [`super::IocShell::execute_line`]'s expansion and
+/// `tokenize` hand back as exactly `arg`: for a caller holding a value C
+/// would pass as a pointer, not as text. Inside a quote a backslash is data
+/// and nothing can be escaped; outside one it makes the next byte data for
+/// both passes (`macCore.c:741-743`, `iocsh.cpp:273-278`). Empty is `""`,
+/// which `split` keeps as an empty word (`:345-346`).
+pub fn escape_arg(arg: &str) -> String {
+    if arg.is_empty() {
+        return "\"\"".to_owned();
+    }
+    let mut out = String::with_capacity(arg.len());
+    for c in arg.chars() {
+        if c.is_ascii_whitespace() || "\\\"'(),$<>".contains(c) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// Scan a command line for the malformed-input conditions C
@@ -481,20 +761,9 @@ pub(crate) fn tokenize(line: &str) -> Vec<String> {
 /// diagnostic for the first problem found, or `None` if the line is
 /// well-formed. L-5: C marks such a line errored; the Rust tokenizer
 /// previously consumed them silently.
-pub(crate) fn lint_line(line: &str) -> Option<&'static str> {
-    let mut scan = ShellScan::default();
-    for &b in line.as_bytes() {
-        scan.feed(b);
-    }
-    // C reports these after the same loop, from the same two pieces of
-    // state (`iocsh.cpp:362-371`).
-    if scan.unbalanced_quote() {
-        return Some("Unbalanced quote.");
-    }
-    if scan.trailing_backslash() {
-        return Some("Trailing backslash.");
-    }
-    None
+#[cfg(test)]
+pub(crate) fn lint_line(line: &[u8]) -> Option<&'static str> {
+    split(line).err()
 }
 
 /// The one owner of C `split()`'s quote/backslash state
@@ -606,70 +875,25 @@ pub(super) enum IntArgError {
 }
 
 /// Parse an `iocshArgInt` token the way C `cvtArg` does
-/// (`iocsh.cpp:820-842`): `strtol(arg, &endp, 0)`. Base-0 means a
-/// `0x`/`0X` prefix is hex and a leading `0` is octal — so `dbpr REC 010`
-/// is 8, not 10, and `postEvent 0x10` is 16, not an error. On signed
-/// overflow C retries with `strtoul` (`0xFFFFFFFFFFFFFFFF` → the same
-/// bit pattern reinterpreted into the signed `long`), and an empty arg
-/// defaults to 0. Trailing non-numeric characters are rejected, matching
-/// C's `if (*endp)` "Invalid integer" check.
-pub(super) fn parse_iocsh_int(token: &str) -> Result<i64, IntArgError> {
-    // C `if (arg && *arg)` — an empty token defaults to 0.
+/// (`iocsh.cpp:820-842`): `strtol(arg, &endp, 0)`, retried as `strtoul` on
+/// `ERANGE`, stored in the `int` `iocshArgBuf.ival`. An empty arg is 0, and
+/// C returns from the range arm before it tests `*endp`.
+pub(super) fn parse_iocsh_int(token: &str) -> Result<i32, IntArgError> {
+    use crate::types::c_parse::{long_to_int, strtol_errno, strtoul_errno, ulong_to_uint};
     if token.is_empty() {
         return Ok(0);
     }
-    // strtol skips leading whitespace, then takes an optional sign.
-    let s = token.trim_start();
-    if s.is_empty() {
-        // Whitespace-only: strtol converts nothing and leaves *endp set
-        // → C reports "Invalid integer".
-        return Err(IntArgError::Invalid);
-    }
-    let (neg, body) = match s.as_bytes()[0] {
-        b'-' => (true, &s[1..]),
-        b'+' => (false, &s[1..]),
-        _ => (false, s),
+    let (value, end) = match strtol_errno(token, 0) {
+        Some((v, end)) => (long_to_int(v), end),
+        None => match strtoul_errno(token, 0) {
+            Some((v, end)) => (ulong_to_uint(v) as i32, end),
+            None => return Err(IntArgError::OutOfRange),
+        },
     };
-    // Base-0 prefix detection on the unsigned magnitude.
-    let (radix, rest): (u32, &str) =
-        if let Some(hex) = body.strip_prefix("0x").or_else(|| body.strip_prefix("0X")) {
-            (16, hex)
-        } else if body.len() > 1 && body.starts_with('0') {
-            // Leading `0` + at least one more char → octal (the C
-            // convention); `0` alone stays decimal so it parses to 0.
-            (8, &body[1..])
-        } else {
-            (10, body)
-        };
-    // `strtol` converts the LONGEST valid prefix and points `endp` at the
-    // first character it could not use, so the digit run and what follows
-    // it are two separate facts: the run alone decides `ERANGE`, the
-    // leftover alone decides `*endp`. Reading them as one — parsing the
-    // whole tail and calling any failure the same thing — is what made
-    // `99999999999999999999abc` "invalid" here where C calls it out of
-    // range.
-    let run_len = rest
-        .find(|c: char| !c.is_digit(radix))
-        .unwrap_or(rest.len());
-    let (digits, leftover) = rest.split_at(run_len);
-    if digits.is_empty() {
-        // strtol converted nothing — a bare sign, `0x` with no hex digit,
-        // octal `08` — so `endp == arg` and C takes the `*endp` arm.
+    if end != token.len() {
         return Err(IntArgError::Invalid);
     }
-    // Signed first; on overflow fall back to unsigned (C `strtol`
-    // ERANGE → `strtoul`) and reinterpret the bit pattern into the
-    // signed result exactly as C stores it in `long ival`. `digits` holds
-    // only characters valid for the radix, so the unsigned parse can fail
-    // for one reason: the magnitude does not fit.
-    let parsed = match i64::from_str_radix(digits, radix) {
-        Ok(v) => v,
-        Err(_) => u64::from_str_radix(digits, radix).map_err(|_| IntArgError::OutOfRange)? as i64,
-    };
-    if !leftover.is_empty() {
-        return Err(IntArgError::Invalid);
-    }
-    Ok(if neg { parsed.wrapping_neg() } else { parsed })
+    Ok(value)
 }
 
 /// C `epicsStrtod(s, &endp)` under the `*endp == '\0'` whole-token check
@@ -734,7 +958,10 @@ pub(super) fn epics_strtod_whole(token: &str) -> Option<f64> {
 }
 
 /// Parse tokens into argument values according to argument descriptors.
-pub(crate) fn parse_args(tokens: &[String], descs: &[ArgDesc]) -> Result<Vec<ArgValue>, String> {
+pub(crate) fn parse_args(
+    tokens: &[IocshString],
+    descs: &[ArgDesc],
+) -> Result<Vec<ArgValue>, String> {
     let mut result = Vec::with_capacity(descs.len());
 
     for (i, desc) in descs.iter().enumerate() {
@@ -786,13 +1013,15 @@ pub(crate) fn parse_args(tokens: &[String], descs: &[ArgDesc]) -> Result<Vec<Arg
             // <n>: ` — already says which line, and adding the parameter
             // name is the only thing on this stream that stops a site
             // script's grep from matching.
-            ArgType::Int => parse_iocsh_int(token)
-                .map(ArgValue::Int)
+            // `strtol`/`epicsStrtod` read the bytes; a non-UTF-8 byte is
+            // not a digit to them, and U+FFFD is not one to these.
+            ArgType::Int => parse_iocsh_int(&token.to_str_lossy())
+                .map(|v| ArgValue::Int(v.into()))
                 .map_err(|why| match why {
                     IntArgError::OutOfRange => format!("Integer '{token}' out of range."),
                     IntArgError::Invalid => format!("Invalid integer '{token}'."),
                 })?,
-            ArgType::Double => epics_strtod_whole(token)
+            ArgType::Double => epics_strtod_whole(&token.to_str_lossy())
                 .map(ArgValue::Double)
                 .ok_or_else(|| format!("Invalid double '{token}'."))?,
             // Handled above: an `Argv` parameter never reaches the
@@ -809,18 +1038,72 @@ pub(crate) fn parse_args(tokens: &[String], descs: &[ArgDesc]) -> Result<Vec<Arg
 mod tests {
     use super::*;
 
+    /// Every `write` a sink received, as its own entry.
+    #[derive(Clone, Default)]
+    struct Writes(Arc<std::sync::Mutex<Vec<Vec<u8>>>>);
+
+    impl std::io::Write for Writes {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().push(buf.to_vec());
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Each line reaches its stream in one `write`, at any length, a deliberate
+    /// deviation from C's chunked `fprintf`: the stream may be stderr or a
+    /// redirect file, where a second writer's line would otherwise land
+    /// between the text and its newline.
+    #[test]
+    fn every_context_line_is_one_write() {
+        // RTEMS-EXEC-MODEL-ALLOW(1): the runtime is built here only to capture
+        // a `BlockingBridge`; the writers under test run synchronously, so the
+        // test passes in the exec-backend suite.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let bridge = {
+            let _guard = rt.enter();
+            crate::runtime::task::BlockingBridge::capture()
+        };
+        let ctx = CommandContext::new(Arc::new(PvDatabase::new()), bridge);
+        let (o, e, co, ce) = (
+            Writes::default(),
+            Writes::default(),
+            Writes::default(),
+            Writes::default(),
+        );
+        ctx.with_console(co.clone(), ce.clone(), || {
+            ctx.with_error(e.clone(), || {
+                ctx.with_output(o.clone(), || {
+                    ctx.println("a line");
+                    ctx.println_bytes(b"\xffbytes");
+                    ctx.print_fmt(format_args!("{} {}", "two", "pieces"));
+                    ctx.eprintln("a diagnostic");
+                    ctx.console_println("console out");
+                    ctx.console_eprintln("console err");
+                })
+            })
+        });
+        let got = |w: &Writes| w.0.lock().unwrap().clone();
+        assert_eq!(got(&o), [&b"a line\n"[..], b"\xffbytes\n", b"two pieces\n"]);
+        assert_eq!(got(&e), [b"a diagnostic\n"]);
+        assert_eq!(got(&co), [b"console out\n"]);
+        assert_eq!(got(&ce), [b"console err\n"]);
+    }
+
     // --- Legacy space-separated syntax ---
 
     #[test]
     fn test_tokenize_simple() {
-        assert_eq!(tokenize("dbl"), vec!["dbl"]);
-        assert_eq!(tokenize("dbgf TEMP.VAL"), vec!["dbgf", "TEMP.VAL"]);
+        assert_eq!(tokenize(b"dbl"), vec!["dbl"]);
+        assert_eq!(tokenize(b"dbgf TEMP.VAL"), vec!["dbgf", "TEMP.VAL"]);
     }
 
     #[test]
     fn test_tokenize_quoted() {
         assert_eq!(
-            tokenize(r#"dbpf TEMP "42.0""#),
+            tokenize(br#"dbpf TEMP "42.0""#),
             vec!["dbpf", "TEMP", "42.0"]
         );
     }
@@ -836,8 +1119,8 @@ mod tests {
     /// `epicsEnvSet("X", "a\\\\b")` → `X=a\\\\b`.
     #[test]
     fn a_backslash_inside_a_quote_is_data() {
-        assert_eq!(tokenize(r#"cmd "a\\b""#), vec!["cmd", r#"a\\b"#]);
-        assert_eq!(tokenize(r#"cmd("a\\\\b")"#), vec!["cmd", r#"a\\\\b"#]);
+        assert_eq!(tokenize(br#"cmd "a\\b""#), vec!["cmd", r#"a\\b"#]);
+        assert_eq!(tokenize(br#"cmd("a\\\\b")"#), vec!["cmd", r#"a\\\\b"#]);
     }
 
     /// The same rule read from the other side: `\"` inside a quoted run
@@ -848,7 +1131,7 @@ mod tests {
     #[test]
     fn an_escaped_quote_inside_a_quote_leaves_the_line_unbalanced() {
         assert_eq!(
-            lint_line(r#"cmd "hello \"world\"""#),
+            lint_line(br#"cmd "hello \"world\"""#),
             Some("Unbalanced quote.")
         );
     }
@@ -861,33 +1144,33 @@ mod tests {
     fn out_of_quote_backslash_escapes_like_c_split() {
         // Space syntax: `echo \"hello\"` prints `"hello"`, `echo a\ b`
         // prints `a b`.
-        assert_eq!(tokenize(r#"echo \"hello\""#), vec!["echo", r#""hello""#]);
-        assert_eq!(tokenize(r#"echo a\ b"#), vec!["echo", "a b"]);
+        assert_eq!(tokenize(br#"echo \"hello\""#), vec!["echo", r#""hello""#]);
+        assert_eq!(tokenize(br#"echo a\ b"#), vec!["echo", "a b"]);
         // Call syntax: `echo(a\,b)` prints `a,b` — the escaped comma
         // does not split the argument.
-        assert_eq!(tokenize(r#"echo(a\,b)"#), vec!["echo", "a,b"]);
+        assert_eq!(tokenize(br#"echo(a\,b)"#), vec!["echo", "a,b"]);
         // Escape-produced quotes are data, not outer quotes — nothing
         // strips them: `echo(\"hi\")` prints `"hi"`.
-        assert_eq!(tokenize(r#"echo(\"hi\")"#), vec!["echo", r#""hi""#]);
+        assert_eq!(tokenize(br#"echo(\"hi\")"#), vec!["echo", r#""hi""#]);
         // The closing-paren scanner honors the same rules:
         // `echo(a\))` prints `a)`, `echo('a)b')` prints `a)b`.
-        assert_eq!(tokenize(r#"echo(a\))"#), vec!["echo", "a)"]);
-        assert_eq!(tokenize(r#"echo('a)b')"#), vec!["echo", "a)b"]);
+        assert_eq!(tokenize(br#"echo(a\))"#), vec!["echo", "a)"]);
+        assert_eq!(tokenize(br#"echo('a)b')"#), vec!["echo", "a)b"]);
         // lint_line agrees these lines are well-formed — pre-fix it
         // passed them and the splitters then mis-parsed.
-        assert_eq!(lint_line(r#"echo \"hello\""#), None);
-        assert_eq!(lint_line(r#"echo(a\,b)"#), None);
+        assert_eq!(lint_line(br#"echo \"hello\""#), None);
+        assert_eq!(lint_line(br#"echo(a\,b)"#), None);
     }
 
     #[test]
     fn test_tokenize_empty() {
-        assert!(tokenize("").is_empty());
-        assert!(tokenize("   ").is_empty());
+        assert!(tokenize(b"").is_empty());
+        assert!(tokenize(b"   ").is_empty());
     }
 
     #[test]
     fn test_tokenize_trailing_whitespace() {
-        assert_eq!(tokenize("dbl   "), vec!["dbl"]);
+        assert_eq!(tokenize(b"dbl   "), vec!["dbl"]);
     }
 
     // --- C++ EPICS function-call syntax ---
@@ -895,7 +1178,7 @@ mod tests {
     #[test]
     fn test_tokenize_cpp_basic() {
         assert_eq!(
-            tokenize(r#"epicsEnvSet("PREFIX", "SIM1:")"#),
+            tokenize(br#"epicsEnvSet("PREFIX", "SIM1:")"#),
             vec!["epicsEnvSet", "PREFIX", "SIM1:"]
         );
     }
@@ -903,14 +1186,14 @@ mod tests {
     #[test]
     fn test_tokenize_cpp_mixed_types() {
         assert_eq!(
-            tokenize(r#"simDetectorConfig("SIM1", 256, 256, 50000000)"#),
+            tokenize(br#"simDetectorConfig("SIM1", 256, 256, 50000000)"#),
             vec!["simDetectorConfig", "SIM1", "256", "256", "50000000"]
         );
     }
 
     #[test]
     fn test_tokenize_cpp_no_args() {
-        assert_eq!(tokenize("iocInit()"), vec!["iocInit"]);
+        assert_eq!(tokenize(b"iocInit()"), vec!["iocInit"]);
     }
 
     #[test]
@@ -920,17 +1203,17 @@ mod tests {
         // nothing there. The port must not fall back to space-separated
         // syntax and hand the command `("L0",`-shaped tokens.
         assert_eq!(
-            tokenize(r#"asynOctetSetInputEos ("L0", 0, "\r")"#),
-            tokenize(r#"asynOctetSetInputEos("L0", 0, "\r")"#)
+            tokenize(br#"asynOctetSetInputEos ("L0", 0, "\r")"#),
+            tokenize(br#"asynOctetSetInputEos("L0", 0, "\r")"#)
         );
-        assert_eq!(tokenize("cmd\t(a, b)"), vec!["cmd", "a", "b"]);
-        assert_eq!(tokenize("iocInit ()"), vec!["iocInit"]);
+        assert_eq!(tokenize(b"cmd\t(a, b)"), vec!["cmd", "a", "b"]);
+        assert_eq!(tokenize(b"iocInit ()"), vec!["iocInit"]);
     }
 
     #[test]
     fn test_tokenize_cpp_spaces_around_commas() {
         assert_eq!(
-            tokenize(r#"cmd( "a" , "b" , 3 )"#),
+            tokenize(br#"cmd( "a" , "b" , 3 )"#),
             vec!["cmd", "a", "b", "3"]
         );
     }
@@ -939,7 +1222,7 @@ mod tests {
     fn test_tokenize_cpp_dbloadrecords() {
         // Matches real C++ EPICS syntax
         assert_eq!(
-            tokenize(r#"dbLoadRecords("path/to/file.db","P=SIM1:,R=cam1:")"#),
+            tokenize(br#"dbLoadRecords("path/to/file.db","P=SIM1:,R=cam1:")"#),
             vec!["dbLoadRecords", "path/to/file.db", "P=SIM1:,R=cam1:"]
         );
     }
@@ -957,23 +1240,23 @@ mod tests {
     /// argument between them.
     #[test]
     fn one_separator_set_applies_off_the_call_shape_too() {
-        assert_eq!(tokenize("dbl)"), vec!["dbl"]);
-        assert_eq!(tokenize("dbl )"), vec!["dbl"]);
-        assert_eq!(tokenize("dbl , ai"), vec!["dbl", "ai"]);
-        assert_eq!(tokenize(r#"echo(a"b"c)"#), vec!["echo", "abc"]);
-        assert_eq!(tokenize(r#"echo "a"b"c""#), vec!["echo", "abc"]);
-        assert_eq!(tokenize("echo(a,,b)"), vec!["echo", "a", "b"]);
+        assert_eq!(tokenize(b"dbl)"), vec!["dbl"]);
+        assert_eq!(tokenize(b"dbl )"), vec!["dbl"]);
+        assert_eq!(tokenize(b"dbl , ai"), vec!["dbl", "ai"]);
+        assert_eq!(tokenize(br#"echo(a"b"c)"#), vec!["echo", "abc"]);
+        assert_eq!(tokenize(br#"echo "a"b"c""#), vec!["echo", "abc"]);
+        assert_eq!(tokenize(b"echo(a,,b)"), vec!["echo", "a", "b"]);
         // An opening quote begins a word even when it closes at once, so
         // an empty argument stays distinguishable from an absent one —
         // `cvtArg` keeps `""` and NULL apart (`iocsh.cpp:858-862`).
-        assert_eq!(tokenize(r#"cmd "" x"#), vec!["cmd", "", "x"]);
+        assert_eq!(tokenize(br#"cmd "" x"#), vec!["cmd", "", "x"]);
     }
 
     #[test]
     fn test_tokenize_cpp_quoted_with_parens_inside() {
         // Parens inside quotes should not confuse the parser
         assert_eq!(
-            tokenize(r#"cmd("hello(world)")"#),
+            tokenize(br#"cmd("hello(world)")"#),
             vec!["cmd", "hello(world)"]
         );
     }
@@ -984,7 +1267,7 @@ mod tests {
             name: "name",
             arg_type: ArgType::String,
         }];
-        let tokens = vec!["TEMP".to_string()];
+        let tokens: Vec<IocshString> = vec!["TEMP".into()];
         let result = parse_args(&tokens, &descs).unwrap();
         assert!(matches!(&result[0], ArgValue::String(s) if s == "TEMP"));
     }
@@ -1034,7 +1317,7 @@ mod tests {
     /// `sval = arg`, which keeps `""` distinct from NULL.
     #[test]
     fn an_empty_token_defaults_for_numbers_and_stays_empty_for_strings() {
-        let empty = vec![String::new()];
+        let empty: Vec<IocshString> = vec![IocshString::default()];
         for arg_type in [ArgType::Int, ArgType::Double] {
             let descs = vec![ArgDesc {
                 name: "only",
@@ -1065,7 +1348,7 @@ mod tests {
                 name: "only",
                 arg_type,
             }];
-            assert!(parse_args(&[token.to_string()], &descs).is_err());
+            assert!(parse_args(&[token.to_string().into()], &descs).is_err());
         }
     }
 
@@ -1078,7 +1361,7 @@ mod tests {
             name: "seconds",
             arg_type: ArgType::Double,
         }];
-        let tokens = vec!["0.0".to_string(), "extra".to_string()];
+        let tokens: Vec<IocshString> = vec!["0.0".into(), "extra".into()];
         let got = parse_args(&tokens, &descs).expect("a surplus token is not an error");
         assert_eq!(got.len(), 1);
         assert!(matches!(&got[0], ArgValue::Double(d) if *d == 0.0));
@@ -1102,7 +1385,7 @@ mod tests {
                 arg_type: ArgType::String,
             },
         ];
-        let got = parse_args(&["only.db".to_string()], &descs).expect("a short line still runs");
+        let got = parse_args(&["only.db".into()], &descs).expect("a short line still runs");
         assert_eq!(got.len(), 3);
         assert!(matches!(&got[0], ArgValue::String(s) if s == "only.db"));
         assert!(matches!(&got[1], ArgValue::Missing));
@@ -1115,7 +1398,7 @@ mod tests {
             name: "level",
             arg_type: ArgType::Int,
         }];
-        let tokens = vec!["42".to_string()];
+        let tokens: Vec<IocshString> = vec!["42".into()];
         let result = parse_args(&tokens, &descs).unwrap();
         assert!(matches!(&result[0], ArgValue::Int(42)));
     }
@@ -1126,8 +1409,27 @@ mod tests {
             name: "level",
             arg_type: ArgType::Int,
         }];
-        let tokens = vec!["abc".to_string()];
+        let tokens: Vec<IocshString> = vec!["abc".into()];
         assert!(parse_args(&tokens, &descs).is_err());
+    }
+
+    /// C `cvtArg` stores `strtol(arg, &endp, 0)`, or its `strtoul` retry, in
+    /// `iocshArgBuf.ival`, an `int` (`iocsh.cpp:822-829`): glibc's base-0
+    /// `0b`, C `isspace` only, and the `long` truncated to `int`.
+    #[test]
+    fn an_iocsh_int_is_c_strtol_into_an_int() {
+        let lp64 = std::ffi::c_long::BITS == 64;
+        assert_eq!(parse_iocsh_int("0b101"), Ok(5));
+        assert_eq!(parse_iocsh_int("\u{a0}5"), Err(IntArgError::Invalid));
+        assert_eq!(parse_iocsh_int("2147483648"), Ok(-2147483648));
+        assert_eq!(
+            parse_iocsh_int("4294967296"),
+            if lp64 {
+                Ok(0)
+            } else {
+                Err(IntArgError::OutOfRange)
+            }
+        );
     }
 
     /// `iocshArgInt` must parse like C `strtol(arg, &endp, 0)`
@@ -1135,6 +1437,14 @@ mod tests {
     /// fallback and empty→0 — not Rust's decimal-only `parse::<i64>`.
     #[test]
     fn test_parse_iocsh_int_base0() {
+        let lp64 = std::ffi::c_long::BITS == 64;
+        let wide = |v| {
+            if lp64 {
+                Ok(v)
+            } else {
+                Err(IntArgError::OutOfRange)
+            }
+        };
         // Decimal.
         assert_eq!(parse_iocsh_int("10"), Ok(10));
         assert_eq!(parse_iocsh_int("0"), Ok(0));
@@ -1149,9 +1459,10 @@ mod tests {
         assert_eq!(parse_iocsh_int("-0x10"), Ok(-16));
         // Empty arg defaults to 0 (C `if (arg && *arg)` else branch).
         assert_eq!(parse_iocsh_int(""), Ok(0));
-        // strtoul fallback: bit pattern reinterpreted into signed long.
-        assert_eq!(parse_iocsh_int("0xFFFFFFFFFFFFFFFF"), Ok(-1));
-        assert_eq!(parse_iocsh_int("18446744073709551615"), Ok(-1));
+        // strtoul fallback, truncated to the int: only a 64-bit unsigned
+        // long holds these.
+        assert_eq!(parse_iocsh_int("0xFFFFFFFFFFFFFFFF"), wide(-1));
+        assert_eq!(parse_iocsh_int("18446744073709551615"), wide(-1));
         // Errors: trailing garbage, invalid octal digit, bare/oversized.
         // Which of C's two sentences each one earns is the point — C
         // returns from the `ERANGE` arm before the `*endp` check, so a
@@ -1174,9 +1485,9 @@ mod tests {
             parse_iocsh_int("99999999999999999999abc"),
             Err(IntArgError::OutOfRange)
         );
-        // `LONG_MIN` itself is in range for `strtol`, and reaches the
-        // same value here through the unsigned retry.
-        assert_eq!(parse_iocsh_int("-9223372036854775808"), Ok(i64::MIN));
+        // A 64-bit `LONG_MIN` is in range for `strtol`, and its low 32 bits
+        // are 0.
+        assert_eq!(parse_iocsh_int("-9223372036854775808"), wide(0));
     }
 
     /// C `cvtArg` quotes the offending VALUE and never the parameter
@@ -1195,11 +1506,11 @@ mod tests {
             arg_type: ArgType::Int,
         }];
         assert_eq!(
-            parse_args(&["notanumber".to_string()], &int_desc).unwrap_err(),
+            parse_args(&["notanumber".into()], &int_desc).unwrap_err(),
             "Invalid integer 'notanumber'."
         );
         assert_eq!(
-            parse_args(&["99999999999999999999".to_string()], &int_desc).unwrap_err(),
+            parse_args(&["99999999999999999999".into()], &int_desc).unwrap_err(),
             "Integer '99999999999999999999' out of range."
         );
         let double_desc = vec![ArgDesc {
@@ -1207,7 +1518,7 @@ mod tests {
             arg_type: ArgType::Double,
         }];
         assert_eq!(
-            parse_args(&["0.1abc".to_string()], &double_desc).unwrap_err(),
+            parse_args(&["0.1abc".into()], &double_desc).unwrap_err(),
             "Invalid double '0.1abc'."
         );
     }
@@ -1245,7 +1556,7 @@ mod tests {
             arg_type: ArgType::Double,
         }];
         assert!(matches!(
-            parse_args(&["0x10".to_string()], &descs).unwrap()[0],
+            parse_args(&["0x10".into()], &descs).unwrap()[0],
             ArgValue::Double(v) if v == 16.0
         ));
     }
@@ -1256,7 +1567,7 @@ mod tests {
             name: "mask",
             arg_type: ArgType::Int,
         }];
-        let result = parse_args(&["0x10".to_string()], &descs).unwrap();
+        let result = parse_args(&["0x10".into()], &descs).unwrap();
         assert!(matches!(&result[0], ArgValue::Int(16)));
     }
 
@@ -1266,7 +1577,7 @@ mod tests {
             name: "value",
             arg_type: ArgType::Double,
         }];
-        let tokens = vec!["3.14".to_string()];
+        let tokens: Vec<IocshString> = vec!["3.14".into()];
         let result = parse_args(&tokens, &descs).unwrap();
         match &result[0] {
             ArgValue::Double(v) => assert!((*v - 3.14).abs() < 1e-10),

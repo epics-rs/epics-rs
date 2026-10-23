@@ -1,0 +1,3 @@
+_main_ garbage_after_command.proto line 2: Garbage after 'disconnect' command: 'x'
+_main_ garbage_after_command.proto line 1: in protocol 'p'
+_main_ while compiling protocol 'p' for 'rec0'

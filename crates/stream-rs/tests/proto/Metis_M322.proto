@@ -1,0 +1,137 @@
+#
+# Support for the Metis M322
+#
+# Abridged Index of Commands: page 49/55 of "Metis M311-M322-H311-H322 042015.pdf"
+#
+
+InTerminator = CR;
+OutTerminator = CR;
+ReadTimeout = 500;
+
+# Address will be 2-digit, 0-padded int passed from db
+
+### The error status is a decimal number, so no conversion is necessary
+getErrorStatus
+{
+  out "\$1fs";
+  in "%02d";
+}
+
+### 
+getBuffMode
+{
+  out "\$1bum";
+  in "%{00|01|02}";
+}
+
+setBuffMode
+{
+  out "\$1bum%{00|01|02}";
+  in "ok";
+  
+  @init { getBuffMode; }
+}
+
+### Read data from the pyrometer (amount of data depends on buffer mode)
+getBuff00Data
+{
+  out "\$1bup";
+  in "%04x";
+}
+
+getBuff01Data
+{
+  out "\$1bup";
+  in "%04x%(\$2:temp2Raw)04x%(\$2:temp2cRaw)04x";
+}
+
+getBuff02Data
+{
+  out "\$1bup";
+  in "%04x%(\$2:temp2Raw)04x%(\$2:temp2cRaw)04x%(\$2:rampSp)04x%(\$2:ao)04x%(\$2:signal)04x%(\$2:stat0)02x%(\$2:stat1)02x%(\$2:stat2)02x%(\$2:stat3)02x";
+}
+
+### get/set focus distance
+getMeasDist
+{
+  out "\$1moa";
+  in "%04x";
+}
+
+setMeasDist
+{
+  out "\$1moa%04x";
+  in "ok";
+  
+  @init { getMeasDist; }
+}
+
+### Units (0 = Celsius, 1 = Fahrenheit)
+getUnit
+{
+  out "\$1fh";
+  in "%d";
+}
+
+setUnit
+{
+  out "\$1fh%d";
+  in "ok";
+  
+  @init { getUnit; }
+}
+
+### Read device temperature in Celsius / 256
+getDeviceTemp
+{
+  out "\$1tsc0";
+  in "%04x";
+}
+
+
+### Stuff that isn't implemented
+
+# This would be useful for troubleshooting misconfigurations
+getDeviceAddress
+{
+  out "99ga";
+  in "%02d";
+}
+
+# presumably this changes the temp that is displayed on the screen of the device
+setDispTemp
+{
+  out "\$1an%d";
+  in "ok";
+}
+
+getDispTemp
+{
+  out "\$1ar";
+  in "%d";
+}
+
+setAo1Range
+{
+  out "\$1as%d";
+  in "ok"
+}
+
+getAo1Range
+{
+  out "\$1as";
+  in "%d";
+}
+
+setAo2Range
+{
+  out "\$1ar%d";
+  in "ok"
+}
+
+getAo2Range
+{
+  out "\$1ar";
+  in "%d";
+}
+

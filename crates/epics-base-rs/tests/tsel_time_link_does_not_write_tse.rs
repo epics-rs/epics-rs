@@ -21,9 +21,10 @@
 //! The third row is the control: a `TSEL` that is not `.TIME` IS loaded into
 //! `TSE` (`recGbl.c:322`, `dbGetLink(..., &prec->tse, ...)`), and both agree.
 
+use epics_base_rs::types::WallTime;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::types::EpicsValue;
@@ -60,7 +61,7 @@ async fn a_time_tsel_leaves_the_declared_tse_alone() {
     {
         let rec = db.get_record("TSEW_SRC").expect("source exists");
         let mut inst = rec.write();
-        inst.common.time = SystemTime::UNIX_EPOCH + SRC_STAMP;
+        inst.common.time = WallTime::UNIX_EPOCH + SRC_STAMP;
     }
 
     for rec in ["TSEW_UNDEC", "TSEW_FIVE"] {
@@ -77,7 +78,7 @@ async fn a_time_tsel_leaves_the_declared_tse_alone() {
         let g = inst.read();
         assert_eq!(
             g.common.time,
-            SystemTime::UNIX_EPOCH + SRC_STAMP,
+            WallTime::UNIX_EPOCH + SRC_STAMP,
             "{rec} must still adopt the source stamp"
         );
     }

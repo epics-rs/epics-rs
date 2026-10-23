@@ -1,0 +1,46 @@
+-	drvStreamInit()
+-	StreamProtocolParser::path = /home/stevek/work/_tgt/monitor/trial/crates/stream-rs/tests/oracle/epics
+_main_	streamInitRecord(rec): SEVR=0
+_main_	streamInitRecord(rec): create new Stream object
+_main_	streamInitRecord(rec): calling initRecord
+_main_	Stream::initRecord rec: parse link string "l.proto cois P"
+_main_	Stream::initRecord rec: filename="l.proto" protocol="cois" bus="P" addr=0 params=""
+_main_	Stream::initRecord rec: attachBus("P", 0, "")
+_main_	Stream::initRecord rec: parse("l.proto", "cois")
+_main_	Stream::initRecord rec: initialize the first time
+_main_	StreamCore::startProtocol(rec, startMode=StartInit)
+_main_	StreamCore::evalCommand(rec): activeCommand = out
+_main_	StreamCore::evalOut: outputLine = "I<0d><0a>"
+_main_	StreamCore::evalOut(rec): lockRequest(0)
+_main_	Stream::initRecord rec: waiting for initDone
+P	StreamCore::lockCallback(rec, StreamIoSuccess)
+P	StreamCore::writeCallback(rec, StreamIoSuccess)
+P	StreamCore::evalCommand(rec): activeCommand = in
+P	StreamCore::readCallback(rec, StreamIoSuccess input="x", size=1)
+P	StreamCore::readCallback(rec) inputBuffer="x", size 1
+P	StreamCore::readCallback(rec) inTerminator <0d><0a> not found
+P	StreamCore::readCallback(rec) wait for more input
+P	StreamCore::readCallback(rec, StreamIoEnd input="", size=0)
+P	StreamCore::readCallback(rec) inputBuffer="x", size 1
+P	StreamCore::readCallback(rec) inTerminator <0d><0a> not found
+P	StreamCore::readCallback(rec) end flag received
+P	StreamCore::readCallback(rec) input line: "x"
+P	StreamCore::matchInput(rec): format = "%s"
+P	Stream::matchValue(rec): readData failed
+P	rec: Format "%s" has data type string which is not supported by "rec".
+P	StreamCore::readCallback(rec) match failure
+P	StreamCore::finishProtocol(rec, ScanError) bus owner
+P	Stream::protocolFinishHook(rec, ScanError)
+P	Stream::protocolFinishHook rec: signalling init done
+_main_	Stream::initRecord rec: initDone
+_main_	rec: @init handler failed
+_main_	rec: Record initialization failed
+_main_	streamInitRecord(rec) done status=0xffffffffffffffff
+VAL 0
+SEVR "NO_ALARM"
+STAT "CALC"
+UDF 0 = 0x0
+PACT 0 = 0x0
+PROC 0 = 0x0
+MLST 0
+ALST 0

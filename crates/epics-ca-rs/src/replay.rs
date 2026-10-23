@@ -31,6 +31,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::SystemTime;
 
+use epics_libcom_rs::cfmt::CFloat;
 use std::sync::Mutex;
 
 /// One recorded event. `Beacon` carries enough state to reconstruct
@@ -98,15 +99,15 @@ impl RecordedEvent {
                 version,
             } => format!(
                 "{{\"ts\":{:.3},\"ev\":\"beacon_recv\",\"server\":\"{server}\",\"seq\":{seq},\"version\":{version}}}",
-                ts
+                CFloat(*ts)
             ),
             Self::ClientConnect { ts, peer } => format!(
                 "{{\"ts\":{:.3},\"ev\":\"client_connect\",\"peer\":\"{peer}\"}}",
-                ts
+                CFloat(*ts)
             ),
             Self::ClientDisconnect { ts, peer } => format!(
                 "{{\"ts\":{:.3},\"ev\":\"client_disconnect\",\"peer\":\"{peer}\"}}",
-                ts
+                CFloat(*ts)
             ),
         }
     }

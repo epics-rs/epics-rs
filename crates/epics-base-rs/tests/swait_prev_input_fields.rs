@@ -30,6 +30,8 @@ const ALL: u16 = 0x07; // DBE_VALUE | DBE_LOG | DBE_ALARM
 /// swait: CALC="A", input A driven from SRC through INAN. ADEL is wide so VAL's
 /// archive deadband never crosses and `monitor_mask` is DBE_VALUE alone.
 async fn swait_db() -> PvDatabase {
+    // C `callbackInit`: INAN's link events are applied on a callback band.
+    epics_base_rs::runtime::task::background_init();
     let db = PvDatabase::new();
     db.add_record("SRC", Box::new(AiRecord::new(7.0)))
         .await
@@ -51,6 +53,21 @@ async fn process(db: &PvDatabase) {
         .unwrap();
 }
 
+/// Process W until its A reads `want`. SRC's value reaches the INAN link on
+/// its monitor, which nothing on the record shows until a cycle fetches it;
+/// a cycle that leaves A alone posts neither A nor LA.
+async fn process_until_a(db: &PvDatabase, want: f64) {
+    for _ in 0..400 {
+        process(db).await;
+        let a = db.get_record("W").unwrap().read().record.get_field("A");
+        if a == Some(EpicsValue::Double(want)) {
+            return;
+        }
+        epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    panic!("W.A never read {want}");
+}
+
 async fn subscribe(db: &PvDatabase, field: &str) -> EventReader {
     let inst = db.get_record("W").unwrap();
     let mut g = inst.write();
@@ -62,7 +79,7 @@ async fn subscribe(db: &PvDatabase, field: &str) -> EventReader {
 #[epics_macros_rs::epics_test]
 async fn r9_75_la_holds_previous_input_value() {
     let db = swait_db().await;
-    process(&db).await;
+    process_until_a(&db, 7.0).await;
 
     let inst = db.get_record("W").unwrap();
     let g = inst.read();
@@ -86,29 +103,32 @@ async fn r9_75_la_posts_with_the_inputs_monitor_mask() {
     let mut rx_a = subscribe(&db, "A").await;
     let mut rx_la = subscribe(&db, "LA").await;
 
-    // Priming cycle: no MLST/ALST history yet, so drain what it posts.
-    process(&db).await;
+    // Priming cycles: no MLST/ALST history yet, so drain what they post.
+    process_until_a(&db, 7.0).await;
     while rx_a.try_recv().is_ok() {}
     while rx_la.try_recv().is_ok() {}
 
-    db.put_pv("SRC", EpicsValue::Double(8.0)).await.unwrap();
-    process(&db).await;
+    db.put_pv_and_post("SRC", EpicsValue::Double(8.0))
+        .await
+        .unwrap();
+    process_until_a(&db, 8.0).await;
 
     let ev_a = rx_a.try_recv().expect("changed input A must post");
     let ev_la = rx_la.try_recv().expect("the advanced LA must post too");
     assert_eq!(
-        ev_la.snapshot.value,
+        ev_la.value().as_value().cloned().unwrap(),
         EpicsValue::Double(8.0),
         "C posts LA *after* `*pprev = *pnew`, so the posted value is the new one"
     );
     assert_eq!(
-        ev_la.mask,
+        ev_la.mask(),
         EventMask::VALUE,
         "LA rides the input's `monitor_mask | DBE_VALUE` — got {:?}",
-        ev_la.mask
+        ev_la.mask()
     );
     assert_eq!(
-        ev_la.mask, ev_a.mask,
+        ev_la.mask(),
+        ev_a.mask(),
         "C posts the input and its previous-value field with the identical mask"
     );
 }
@@ -120,7 +140,7 @@ async fn r9_75_la_is_silent_when_the_input_did_not_change() {
     let db = swait_db().await;
     let mut rx_la = subscribe(&db, "LA").await;
 
-    process(&db).await;
+    process_until_a(&db, 7.0).await;
     while rx_la.try_recv().is_ok() {}
 
     // SRC unchanged: A stays 7, so LA stays 7.

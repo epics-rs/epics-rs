@@ -1,0 +1,32 @@
+DBF_LONG:           0 = 0x0   
+DBF_UCHAR:          1 = 0x1   
+DBF_UCHAR:          1 = 0x1   
+DBF_UCHAR:          1 = 0x1   
+DBF_UCHAR:          1 = 0x1   
+DBF_UCHAR:          1 = 0x1   
+DBF_UCHAR:          1 = 0x1   
+DBF_LONG:           1 = 0x1   
+DBF_UCHAR:          1 = 0x1   
+DBF_UCHAR:          1 = 0x1   
+DBF_UCHAR:          1 = 0x1   
+DBF_UCHAR:          1 = 0x1   
+DBF_UCHAR:          1 = 0x1   
+DBF_UCHAR:          1 = 0x1   
+DBF_STRING:         "YES"     
+DBF_STRING:         "abc"     
+DBF_UCHAR:          1 = 0x1   
+DBF_ULONG:          42 = 0x2a 
+DBF_STRING:         "Illegal Value"     
+DBF_STRING:         "SIMM"    
+DBF_LONG:           42 = 0x2a 
+DBF_LONG:           42 = 0x2a 
+DBF_ULONG:          42 = 0x2a 
+DBF_STRING:         "Illegal_Value"     
+DBF_STRING:         "42.7"    
+DBF_STRING:         "42.7"    
+DBF_ULONG:          42 = 0x2a 
+DBF_STRING:         "Illegal Value"     
+DBF_STRING:         "simv"    
+DBF_STRING:         "simv"    
+DBF_STRING:         "abc"     
+DBF_STRING:         "abc"     

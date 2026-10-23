@@ -1,0 +1,5 @@
+# The epid `device(...)` lines from epics-modules/std `stdApp/src/stdSupport.dbd`,
+# in its order: DTYP is an index into this list, so the order is wire-visible.
+device(epid,CONSTANT,devEpidSoft,"Soft Channel")
+device(epid,CONSTANT,devEpidSoftCB,"Async Soft Channel")
+device(epid,INST_IO,devEpidFast,"Fast Epid")

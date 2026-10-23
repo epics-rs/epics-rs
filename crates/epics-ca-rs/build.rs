@@ -79,6 +79,7 @@ fn main() {
     println!("cargo::rustc-check-cfg=cfg(tokio_backend)");
     println!("cargo::rustc-check-cfg=cfg(ca_beacon_monitor)");
     println!("cargo::rustc-check-cfg=cfg(epics_embedded_target)");
+    println!("cargo::rustc-check-cfg=cfg(ca_udp_bcast)");
 
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     // The reactor-free targets: no tokio reactor exists on either, so every
@@ -135,6 +136,14 @@ fn main() {
     // reactor entered and both sockets panic.
     if tokio_backend && std::env::var_os("CARGO_FEATURE_CLIENT").is_some() {
         println!("cargo::rustc-cfg=ca_beacon_monitor");
+    }
+
+    // `ca_udp_bcast` — the CA server opens a second UDP responder on each
+    // interface's broadcast address. C's `#if !(defined(_WIN32) ||
+    // defined(__CYGWIN__))` (`caservertask.c:671`, `:728`), the one condition
+    // the socket, its warnings and its tests all gate on.
+    if !matches!(target_os.as_str(), "windows" | "cygwin") {
+        println!("cargo::rustc-cfg=ca_udp_bcast");
     }
 
     epics_rtems_boot::contract::emit_link_args();

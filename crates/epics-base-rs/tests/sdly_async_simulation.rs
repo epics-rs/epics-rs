@@ -9,14 +9,13 @@
 //! synchronous branch runs (`pact || sdly < 0`). With the default `SDLY = -1.0`
 //! the read/write is synchronous on the single cycle.
 //!
-//! The Rust port models the async path with `SimOutcome::DeferRead`: the fresh
-//! `check_simulation_mode` holds PACT and schedules a `ReprocessAfter`; the
-//! continuation (`is_continuation = true`, the framework analog of C's entry
-//! `pact`) runs the synchronous SIOL branch + alarm tail and releases PACT.
+//! An input's delayed pass is the continuation (`is_continuation = true`, the
+//! framework analog of C's entry `pact`); an output's is its completing pass
+//! (`complete_async_record`), as an async device write's is.
 //!
-//! These tests drive the continuation directly (`process_record_continuation`,
-//! as the swait/scalcout ODLY tests do) so the assertions are deterministic and
-//! do not race the real timer (`SDLY = 100s` makes it unfireable here).
+//! These tests drive that pass directly (`process_record_continuation`,
+//! `complete_async_record`) so the assertions are deterministic and do not
+//! race the real timer (`SDLY = 100s` makes it unfireable here).
 
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::recgbl::alarm_status;
@@ -46,8 +45,8 @@ async fn sdly_async_defers_input_sim_read_to_continuation() {
         .unwrap();
 
     let mut ai = AiRecord::new(0.0);
-    ai.siml = "SDLY_SW".to_string();
-    ai.siol = "SDLY_SRC".to_string();
+    ai.siml = "SDLY_SW".into();
+    ai.siol = "SDLY_SRC".into();
     ai.sims = 1; // SIMM severity = MINOR
     ai.sdly = 100.0; // async; the real timer is unfireable in this test
     db.add_record("SDLY_AI", Box::new(ai)).await.unwrap();
@@ -115,8 +114,8 @@ async fn sdly_negative_reads_input_synchronously() {
         .unwrap();
 
     let mut ai = AiRecord::new(0.0);
-    ai.siml = "SDLYN_SW".to_string();
-    ai.siol = "SDLYN_SRC".to_string();
+    ai.siml = "SDLYN_SW".into();
+    ai.siol = "SDLYN_SRC".into();
     ai.sims = 1;
     // sdly left at the default -1.0 (synchronous).
     db.add_record("SDLYN_AI", Box::new(ai)).await.unwrap();
@@ -158,8 +157,8 @@ async fn sdly_continuation_keeps_simm_latched_from_fresh_cycle() {
         .unwrap();
 
     let mut ai = AiRecord::new(0.0);
-    ai.siml = "SDLYL_SW".to_string();
-    ai.siol = "SDLYL_SRC".to_string();
+    ai.siml = "SDLYL_SW".into();
+    ai.siol = "SDLYL_SRC".into();
     ai.sims = 1;
     ai.sdly = 100.0;
     db.add_record("SDLYL_AI", Box::new(ai)).await.unwrap();
@@ -235,8 +234,8 @@ async fn pact_false_retrigger_reresolves_simm_from_siml() {
         .unwrap();
 
     let mut bo = BoRecord::new(1); // VAL=1 + HIGH>0 arms the one-shot reset
-    bo.siml = "BOH_SW".to_string();
-    bo.siol = "BOH_TGT".to_string();
+    bo.siml = "BOH_SW".into();
+    bo.siol = "BOH_TGT".into();
     bo.high = 100.0;
     // sdly left at the default -1.0; the HIGH timer is the pact=FALSE re-trigger.
     db.add_record("BOH", Box::new(bo)).await.unwrap();
@@ -276,8 +275,8 @@ async fn pact_false_retrigger_reresolves_simm_from_siml() {
 
 /// Output record: `SDLY >= 0` defers the SIOL write (`aoRecord.c::writeValue`
 /// shares the same async branch as the input read). On the fresh cycle the
-/// SIOL target keeps its value and PACT is held; the continuation writes VAL to
-/// the target and clears PACT.
+/// SIOL target keeps its value and PACT is held; the completing pass writes VAL
+/// to the target and clears PACT.
 #[epics_macros_rs::epics_test]
 async fn sdly_async_defers_output_sim_write_to_continuation() {
     let db = PvDatabase::new();
@@ -290,8 +289,8 @@ async fn sdly_async_defers_output_sim_write_to_continuation() {
 
     // ao output: VAL=77 is written to SIOL when simulated.
     let mut ao = AoRecord::new(77.0);
-    ao.siml = "SDLYO_SW".to_string();
-    ao.siol = "SDLYO_TGT".to_string();
+    ao.siml = "SDLYO_SW".into();
+    ao.siol = "SDLYO_TGT".into();
     ao.sdly = 100.0;
     db.add_record("SDLYO_AO", Box::new(ao)).await.unwrap();
 
@@ -311,11 +310,8 @@ async fn sdly_async_defers_output_sim_write_to_continuation() {
         "SIOL target untouched on the delaying cycle (sim write deferred), got {tgt:?}"
     );
 
-    // Continuation: VAL written to the SIOL target, PACT cleared.
-    let mut v2 = epics_base_rs::server::database::ProcStack::new();
-    db.process_record_continuation("SDLYO_AO", &mut v2)
-        .await
-        .unwrap();
+    // Completing pass: VAL written to the SIOL target, PACT cleared.
+    db.complete_async_record("SDLYO_AO").await.unwrap();
 
     let tgt = db.get_pv("SDLYO_TGT").unwrap();
     assert!(

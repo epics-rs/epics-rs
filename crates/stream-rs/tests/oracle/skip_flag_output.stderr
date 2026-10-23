@@ -1,0 +1,5 @@
+_main_ Use of skip modifier '*' only allowed in input formats
+_main_ skip_flag_output.proto line 2: in format string: "%*d"
+_main_ skip_flag_output.proto line 2: in command 'out'
+_main_ skip_flag_output.proto line 1: in protocol 'p'
+_main_ while compiling protocol 'p' for 'rec0'

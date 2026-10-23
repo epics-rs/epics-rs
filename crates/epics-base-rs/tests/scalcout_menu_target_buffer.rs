@@ -35,8 +35,8 @@ async fn add_scalcout(db: &PvDatabase, out: &str, dopt: i16) {
         .unwrap();
     rec.put_field("OCAL", EpicsValue::String("\"HIGH\"".into()))
         .unwrap();
-    rec.special("CALC", true).unwrap();
-    rec.special("OCAL", true).unwrap();
+    rec.special("CALC", true, &Default::default()).unwrap();
+    rec.special("OCAL", true, &Default::default()).unwrap();
     rec.put_field("DOPT", EpicsValue::Short(dopt)).unwrap();
     rec.put_field("OUT", EpicsValue::String(out.into()))
         .unwrap();

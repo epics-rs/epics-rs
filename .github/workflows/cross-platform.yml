@@ -35,15 +35,12 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  # Line tables, not full DWARF. A `cargo nextest run --workspace` target dir
-  # for this workspace measures 91,635 MB here, against the ~86 GB an
-  # ubuntu-latest runner leaves free, and it is nearly all debuginfo: 658 test
-  # binaries at ~300 MB each. Both `checks` and `interop` died writing the
-  # runner's own diagnostic log ("System.IO.IOException: No space left on
-  # device"), which also loses the job log, so the failure arrives with no
-  # output to read. `line-tables-only` keeps the file:line a backtrace is read
-  # with and takes the same target dir to 34,436 MB (measured 2026-08-29).
-  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  # No debuginfo, not even line tables. The all-features test build on
+  # 12059ffc07 (1,674 test binaries) takes 109,470 MB with `line-tables-only`
+  # and 48,809 MB with 0; 17a131b3b's 69,114 MB was the last that fit. A full
+  # disk kills the runner's own diagnostic log, so the job log goes with it.
+  # Panics keep their file:line; backtrace frames do not.
+  CARGO_PROFILE_DEV_DEBUG: 0
   # This workflow never builds the RTEMS target, so the rustc-wrapper wired
   # in .cargo/config.toml (the has-thread-local spec rewrite — a pure
   # passthrough for host builds) has no role in any cell, and on Windows
@@ -59,7 +56,7 @@ jobs:
   build:
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
+    timeout-minutes: ${{ matrix.timeout || 45 }}
     strategy:
       # One platform failing must not cancel the others — each cell
       # reports portability independently.
@@ -74,10 +71,19 @@ jobs:
             os: macos-latest
           - name: macos-x86_64
             os: macos-15-intel
+            # Cold cache: build 24 min + nextest 14 min (fork run
+            # 39797956905). No cache is saved until one run passes.
+            timeout: 95
+          # Build ~20 min, then nextest ran 13927 of 17023 tests in 25 min
+          # before the 45 min default cancelled the job (run 39710144196).
           - name: windows-x86_64
             os: windows-latest
+            timeout: 90
+            test_timeout: 50
           - name: windows-arm64
             os: windows-11-arm
+            timeout: 90
+            test_timeout: 50
 
     steps:
       - uses: actions/checkout@v4
@@ -94,10 +100,48 @@ jobs:
         with:
           key: ${{ matrix.name }}
 
+      # The search_udp v6 tests use `::1` and `ensure_iface_socket` needs an up
+      # non-loopback IPv4 interface; each fails, not skips, without them.
+      # Every hosted image has both, so this only turns an image change into
+      # one clear error. Per-OS commands, same two facts.
+      - name: Test prerequisites (::1, external NIC) - Linux
+        if: runner.os == 'Linux'
+        run: |
+          python3 -c 'import socket; s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM); s.bind(("::1", 0)); s.sendto(b"x", s.getsockname())'
+          ip -4 -o addr show scope global up | grep -q .
+
+      - name: Test prerequisites (::1, external NIC) - macOS
+        if: runner.os == 'macOS'
+        run: |
+          python3 -c 'import socket; s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM); s.bind(("::1", 0)); s.sendto(b"x", s.getsockname())'
+          ifconfig | grep 'inet ' | grep -qv '127\.0\.0\.1'
+
+      # The multi-interface bind tests hold 127.0.0.2 and 127.0.0.4 as a second
+      # NIC; Linux and Windows route all of 127/8 to loopback, Darwin's lo0
+      # carries only 127.0.0.1.
+      - name: Second loopback addresses - macOS
+        if: runner.os == 'macOS'
+        run: |
+          sudo ifconfig lo0 alias 127.0.0.2 up
+          sudo ifconfig lo0 alias 127.0.0.4 up
+          # A second broadcast-capable address for the multi-NIC broadcast
+          # bundle tests; the hosted image has one.
+          sudo ifconfig en0 alias 198.18.0.2 netmask 255.255.255.0 broadcast 198.18.0.255
+
+      - name: Test prerequisites (::1, external NIC) - Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          python -c 'import socket; s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM); s.bind(("::1", 0)); s.sendto(b"x", s.getsockname())'
+          if ($LASTEXITCODE -ne 0) { throw "::1 is not usable" }
+          if (-not (Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.IPAddress -ne '127.0.0.1' -and $_.IPAddress -notlike '169.254.*' })) { throw "no non-loopback IPv4 interface" }
+
       # Compiles libs, bins, AND test targets — the surest catch for
       # platform-specific source that isn't `#[cfg]`-gated.
       - name: Build (workspace + tests)
-        run: cargo build --workspace --tests --verbose
+        # No --verbose: with it, three macos-x86_64 runs stopped logging
+        # mid-build at 39-42 min and sat there until the job timeout.
+        run: cargo build --workspace --tests
 
       # `ci` profile (.config/nextest.toml) adds retries for the
       # genuinely flaky network/timing integration suites.
@@ -108,5 +152,9 @@ jobs:
       # The reference_trees suite is excluded the same way and for the same
       # reason, via profile.ci's default-filter in .config/nextest.toml — it
       # reads epics-base sources directly and this job provisions none.
+      # Below the job timeout, so a hang fails this step and the job log is
+      # kept; `--status-level slow` is what prints the SLOW line naming a
+      # stuck test (profile.ci stops at `retry`). Unix cells take ~15 min; Windows sets its own.
       - name: Test (nextest)
-        run: cargo nextest run --workspace --exclude epics-oracle-rs --profile ci
+        timeout-minutes: ${{ matrix.test_timeout || 30 }}
+        run: cargo nextest run --workspace --exclude epics-oracle-rs --profile ci --status-level slow

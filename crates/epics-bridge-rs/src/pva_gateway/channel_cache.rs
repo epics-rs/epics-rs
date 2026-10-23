@@ -40,6 +40,7 @@ use parking_lot::RwLock;
 use tokio::sync::{Mutex, Notify, broadcast};
 
 use epics_base_rs::runtime::task::Reactor;
+use epics_base_rs::types::RecordName;
 use epics_pva_rs::client::PvaClient;
 use epics_pva_rs::pvdata::{FieldDesc, PvField};
 use epics_pva_rs::server_native::MonitorUpdate;
@@ -80,30 +81,9 @@ pub const DEFAULT_MAX_ENTRIES: usize = 50_000;
 /// upstream monitor task → N downstream subscribers via broadcast.
 pub struct UpstreamEntry {
     pub pv_name: String,
-    /// Latest cached value + introspection. Populated on first
-    /// upstream monitor event. `Arc<RwLock<…>>` so the monitor task
-    /// can write into it without holding a reference to the
-    /// `UpstreamEntry` (avoids the chicken-and-egg between the entry
-    /// and its background task).
-    state: Arc<RwLock<EntryState>>,
-    /// Fan-out for upstream monitor events. Subscribers receive a
-    /// fresh `broadcast::Receiver` from `subscribe()`. Holding the
-    /// sender keeps the channel alive across re-subscribes.
-    tx: broadcast::Sender<MonitorUpdate>,
-    /// Raw-frame fan-out. Carries the upstream MONITOR DATA
-    /// body (`changed | value | overrun`) as a refcounted
-    /// `bytes::Bytes` so N downstream subscribers all share the
-    /// same allocation. Server-side `subscribe_raw` returns a
-    /// receiver from this sender; the monitor task pumps both
-    /// `tx` (decoded PvField, for `subscribe()` and snapshot) and
-    /// `tx_raw` (raw bytes) per upstream event.
-    tx_raw: broadcast::Sender<crate::pva_gateway::source::RawEvent>,
-    /// cached latest raw event. Populated after the first
-    /// upstream monitor event so `subscribe_raw_inner` can deliver it
-    /// as the initial snapshot to new raw subscribers. Cleared on
-    /// type-change so stale bytes from the old descriptor are not
-    /// replayed under the new one. Mirrors `moncache.cpp` `lastelem`.
-    latest_raw: Arc<RwLock<Option<crate::pva_gateway::source::RawEvent>>>,
+    /// The cached value and both fan-out streams, shared with the monitor
+    /// task so it can publish without a reference to the entry.
+    fanout: Arc<Fanout>,
     /// Pulsed on the first successful upstream event. `lookup()` waits
     /// on this so callers see a populated snapshot before returning.
     first_event: Arc<Notify>,
@@ -179,6 +159,103 @@ struct EntryState {
 /// all: the downstream monitor's first frame is the first upstream update.
 fn monitor_seed(state: &RwLock<EntryState>) -> Option<SourceRead> {
     state.read().latest.clone().map(SourceRead::from)
+}
+
+/// One upstream monitor's cached value and its two downstream fan-out
+/// streams, under pva2pva's one entry mutex (`moncache.cpp:131` in
+/// `monitorEvent`, `:279` in `MonitorUser::start`): an event is cached and
+/// sent, and a subscriber registers and takes its seed, each under
+/// `publish`, so a subscriber gets every event once — in its seed or on its
+/// stream.
+struct Fanout {
+    publish: parking_lot::Mutex<()>,
+    state: RwLock<EntryState>,
+    /// The latest raw upstream frame, cleared on a boundary so the old
+    /// descriptor's bytes are not replayed. `moncache.cpp` `lastelem`.
+    latest_raw: RwLock<Option<crate::pva_gateway::source::RawEvent>>,
+    tx: broadcast::Sender<MonitorUpdate>,
+    /// Raw MONITOR DATA bodies (`changed | value | overrun`), refcounted so
+    /// every raw subscriber shares one allocation.
+    tx_raw: broadcast::Sender<crate::pva_gateway::source::RawEvent>,
+}
+
+impl Fanout {
+    fn new(capacity: usize) -> Self {
+        Self {
+            publish: parking_lot::Mutex::new(()),
+            state: RwLock::new(EntryState::default()),
+            latest_raw: RwLock::new(None),
+            tx: broadcast::channel(capacity).0,
+            tx_raw: broadcast::channel(capacity).0,
+        }
+    }
+
+    /// Fold one upstream frame into the cache and fan it out on both
+    /// streams. `true` for the entry's first event.
+    fn publish(
+        &self,
+        pv_name: &str,
+        desc: &FieldDesc,
+        body: bytes::Bytes,
+        order: epics_pva_rs::proto::ByteOrder,
+    ) -> bool {
+        use crate::pva_gateway::source::RawEvent;
+        let _held = self.publish.lock();
+        let outcome = apply_monitor_event(&self.state, desc, &body, order);
+        if outcome.type_changed {
+            tracing::warn!(
+                pv = %pv_name,
+                "pva-gateway: upstream introspection changed — \
+                 emitting type-change boundary to downstream monitors \
+                 (cache descriptor reset)"
+            );
+            // pvxs treats a type change as a subscription boundary
+            // (ioc/pvalink_channel.cpp:342-351 `onTypeChange()`): the new body
+            // under a downstream's original INIT descriptor is undecodable, so
+            // the boundary (MONITOR FINISH downstream) replaces it, on both
+            // streams.
+            *self.latest_raw.write() = None;
+            broadcast_boundary(&self.tx, &self.tx_raw, order);
+            return false;
+        }
+        if let Some(val) = outcome.value {
+            // The upstream event's own changed leaves, as pva2pva copies its
+            // changedBitSet (moncache.cpp:142,187).
+            let _ = self.tx.send(MonitorUpdate {
+                value: val.into(),
+                marked: outcome.marked.map(Into::into),
+                type_changed: false,
+                overrun: Vec::new(),
+            });
+        }
+        let raw_ev = RawEvent {
+            body,
+            byte_order: order,
+            type_changed: false,
+        };
+        *self.latest_raw.write() = Some(raw_ev.clone());
+        let _ = self.tx_raw.send(raw_ev);
+        outcome.was_first
+    }
+
+    /// A decoded subscriber and its seed.
+    fn subscribe(&self) -> (Option<SourceRead>, broadcast::Receiver<MonitorUpdate>) {
+        let _held = self.publish.lock();
+        (monitor_seed(&self.state), self.tx.subscribe())
+    }
+
+    /// A raw subscriber, its seed, and the byte order of the cached frame.
+    fn subscribe_raw(
+        &self,
+    ) -> (
+        Option<SourceRead>,
+        Option<epics_pva_rs::proto::ByteOrder>,
+        broadcast::Receiver<crate::pva_gateway::source::RawEvent>,
+    ) {
+        let _held = self.publish.lock();
+        let order = self.latest_raw.read().as_ref().map(|e| e.byte_order);
+        (monitor_seed(&self.state), order, self.tx_raw.subscribe())
+    }
 }
 
 /// Result of folding one upstream monitor event into [`EntryState`].
@@ -305,7 +382,7 @@ fn apply_monitor_event(
 /// path. A boundary (upstream descriptor change or disconnect) MUST reach
 /// it on whichever stream it subscribed, or it keeps serving values under
 /// the stale INIT descriptor. Both emit sites — the
-/// descriptor-change branch in `spawn_upstream_monitor`'s callback and
+/// descriptor-change branch of [`Fanout::publish`] and
 /// `signal_disconnect_boundary` — route through here so neither can notify
 /// one stream and silently drop the other.
 fn broadcast_boundary(
@@ -321,43 +398,41 @@ fn broadcast_boundary(
     let _ = tx.send(MonitorUpdate::type_change());
 }
 
-/// Surface an upstream disconnect to downstream monitors as a
-/// subscription boundary, mirroring pva2pva `moncache.cpp:212-235`
-/// (`MonitorCacheEntry`'s lost upstream → downstream *unlisten* / MONITOR
-/// FINISH, **not** a fabricated alarm value). Reuses the same empty
-/// `type_changed` marker the descriptor-change path emits (the
-/// `outcome.type_changed` branch in `spawn_upstream_monitor`) via
-/// [`broadcast_boundary`], so the boundary reaches BOTH raw and decoded
-/// downstream subscribers: the native server turns it into MONITOR FINISH
-/// (`server_native/tcp.rs` `build_monitor_finish`) so each downstream
-/// re-opens with a fresh INIT.
-///
-/// Also clears the cached snapshot (`latest_raw` + `state.latest`): after
-/// the boundary there is no live value, so a subscriber attaching during
-/// the outage waits for the reconnect's first frame instead of being
-/// served stale data flagged live.
-///
-/// Idempotent within one outage *by construction*: it no-ops when no
-/// snapshot is cached, and the first call clears it — so repeated
-/// re-subscribe failures during a single outage emit FINISH at most once,
-/// while the next reconnect event repopulates `latest_raw`, re-arming the
-/// boundary for the following disconnect. This invariant replaces the
-/// former `disconnected_alarm_sent` flag.
-fn signal_disconnect_boundary(
-    state: &RwLock<EntryState>,
-    latest_raw: &RwLock<Option<crate::pva_gateway::source::RawEvent>>,
-    tx: &broadcast::Sender<MonitorUpdate>,
-    tx_raw: &broadcast::Sender<crate::pva_gateway::source::RawEvent>,
-) {
-    // No cached snapshot ⇒ nothing was delivered downstream this connection
-    // cycle (or the boundary already fired and cleared it): nothing to revoke.
-    let byte_order = match latest_raw.read().as_ref() {
-        Some(ev) => ev.byte_order,
-        None => return,
-    };
-    *latest_raw.write() = None;
-    state.write().latest = None;
-    broadcast_boundary(tx, tx_raw, byte_order);
+impl Fanout {
+    /// Surface an upstream disconnect to downstream monitors as a
+    /// subscription boundary, mirroring pva2pva `moncache.cpp:212-235`
+    /// (`MonitorCacheEntry`'s lost upstream → downstream *unlisten* / MONITOR
+    /// FINISH, **not** a fabricated alarm value). Reuses the same empty
+    /// `type_changed` marker the descriptor-change path emits (the
+    /// `outcome.type_changed` branch of [`Fanout::publish`]) via
+    /// [`broadcast_boundary`], so the boundary reaches BOTH raw and decoded
+    /// downstream subscribers: the native server turns it into MONITOR FINISH
+    /// (`server_native/tcp.rs` `build_monitor_finish`) so each downstream
+    /// re-opens with a fresh INIT.
+    ///
+    /// Also clears the cached snapshot (`latest_raw` + `state.latest`): after
+    /// the boundary there is no live value, so a subscriber attaching during
+    /// the outage waits for the reconnect's first frame instead of being
+    /// served stale data flagged live.
+    ///
+    /// Idempotent within one outage *by construction*: it no-ops when no
+    /// snapshot is cached, and the first call clears it — so repeated
+    /// re-subscribe failures during a single outage emit FINISH at most once,
+    /// while the next reconnect event repopulates `latest_raw`, re-arming the
+    /// boundary for the following disconnect. This invariant replaces the
+    /// former `disconnected_alarm_sent` flag.
+    fn signal_disconnect_boundary(&self) {
+        let _held = self.publish.lock();
+        // No cached snapshot ⇒ nothing was delivered downstream this connection
+        // cycle (or the boundary already fired and cleared it): nothing to revoke.
+        let byte_order = match self.latest_raw.read().as_ref() {
+            Some(ev) => ev.byte_order,
+            None => return,
+        };
+        *self.latest_raw.write() = None;
+        self.state.write().latest = None;
+        broadcast_boundary(&self.tx, &self.tx_raw, byte_order);
+    }
 }
 
 impl UpstreamEntry {
@@ -367,38 +442,36 @@ impl UpstreamEntry {
     /// its pva2pva citation; this is a thin accessor so that rule has exactly
     /// one owner.
     pub fn snapshot(&self) -> Option<SourceRead> {
-        monitor_seed(&self.state)
+        monitor_seed(&self.fanout.state)
     }
 
     /// Cached introspection if known.
     pub fn introspection(&self) -> Option<FieldDesc> {
-        self.state.read().introspection.clone()
+        self.fanout.state.read().introspection.clone()
     }
 
-    /// Subscribe to upstream events. The receiver is fresh — pre-existing
-    /// values are NOT replayed (broadcast semantics). Callers needing
-    /// the current value should also call [`Self::snapshot`]. The stream
-    /// carries `MonitorUpdate` so an upstream descriptor change reaches
-    /// decoded subscribers as a `type_changed` boundary, the
-    /// decoded-path counterpart of [`Self::subscribe_raw`]'s `RawEvent`.
-    pub fn subscribe(&self) -> broadcast::Receiver<MonitorUpdate> {
+    /// Subscribe to upstream events, with the seed: the cached snapshot,
+    /// or `None` before the first event. An event lands in exactly one of
+    /// the two (`Fanout`). The stream carries `MonitorUpdate` so an
+    /// upstream descriptor change reaches decoded subscribers as a
+    /// `type_changed` boundary.
+    pub fn subscribe(&self) -> (Option<SourceRead>, broadcast::Receiver<MonitorUpdate>) {
         self.poke();
-        self.tx.subscribe()
+        self.fanout.subscribe()
     }
 
-    /// Raw-frame subscriber. Receives upstream MONITOR DATA
-    /// body bytes verbatim. Server uses this to skip its own
-    /// `encode_pv_field` step.
-    pub fn subscribe_raw(&self) -> broadcast::Receiver<crate::pva_gateway::source::RawEvent> {
+    /// Raw-frame counterpart of [`Self::subscribe`]: upstream MONITOR DATA
+    /// bodies verbatim, so the server skips its own `encode_pv_field`, plus
+    /// the byte order of the cached frame.
+    pub fn subscribe_raw(
+        &self,
+    ) -> (
+        Option<SourceRead>,
+        Option<epics_pva_rs::proto::ByteOrder>,
+        broadcast::Receiver<crate::pva_gateway::source::RawEvent>,
+    ) {
         self.poke();
-        self.tx_raw.subscribe()
-    }
-
-    /// latest cached raw upstream frame. Returns `None` until
-    /// the first upstream monitor event has been received (or after a
-    /// type-change resets the cache).
-    pub fn snapshot_raw(&self) -> Option<crate::pva_gateway::source::RawEvent> {
-        self.latest_raw.read().clone()
+        self.fanout.subscribe_raw()
     }
 
     /// Number of live downstream subscribers (broadcast receivers).
@@ -406,7 +479,7 @@ impl UpstreamEntry {
         // Count both fan-out streams: typed PvField subscribers AND
         // raw-frame subscribers. The upstream monitor task should
         // stay alive when either path has consumers.
-        self.tx.receiver_count() + self.tx_raw.receiver_count()
+        self.fanout.tx.receiver_count() + self.fanout.tx_raw.receiver_count()
     }
 
     /// Single keep-predicate for both eviction paths: an entry is retained
@@ -522,7 +595,7 @@ impl ChannelEntry {
             || self
                 .monitors
                 .values()
-                .any(|e| e.state.read().latest.is_some())
+                .any(|e| e.fanout.state.read().latest.is_some())
     }
 
     /// `true` while any variant still holds its `drop_poke` recency grace.
@@ -959,7 +1032,8 @@ impl ChannelCache {
         let addr =
             epics_base_rs::runtime::task::timeout(connect_timeout, self.client.pvconnect(pv_name))
                 .await
-                .map_err(|_| GwError::UpstreamTimeout(pv_name.to_string()))??;
+                .map_err(|_| GwError::UpstreamTimeout(pv_name.to_string()))?
+                .map_err(GwError::Upstream)?;
         // Record / refresh the connection admission (poked recent).
         self.entries
             .lock()
@@ -988,21 +1062,13 @@ impl ChannelCache {
         pv_name: &str,
         pv_request: Option<PvField>,
     ) -> Arc<UpstreamEntry> {
-        let (tx, _rx0) = broadcast::channel::<MonitorUpdate>(BROADCAST_CAPACITY);
-        let (tx_raw, _rx0_raw) =
-            broadcast::channel::<crate::pva_gateway::source::RawEvent>(BROADCAST_CAPACITY);
+        let fanout = Arc::new(Fanout::new(BROADCAST_CAPACITY));
         let first_event = Arc::new(Notify::new());
-        let state = Arc::new(RwLock::new(EntryState::default()));
-
-        let latest_raw = Arc::new(RwLock::new(None::<crate::pva_gateway::source::RawEvent>));
 
         let pv_name_owned = pv_name.to_string();
         let client = self.client.clone();
-        let tx_for_task = tx.clone();
-        let tx_raw_for_task = tx_raw.clone();
-        let state_for_task = state.clone();
+        let fanout_for_task = fanout.clone();
         let first_event_for_task = first_event.clone();
-        let latest_raw_for_task = latest_raw.clone();
         // The downstream-forwarded pvRequest (if any) is re-cloned per
         // reconnect because each `pvmonitor_raw_frames_handle_with_request`
         // call consumes it; the client re-encodes it per upstream
@@ -1020,10 +1086,8 @@ impl ChannelCache {
             // delivering an event must not tight-loop).
             let event_seen = Arc::new(AtomicBool::new(false));
             loop {
-                let tx_inner = tx_for_task.clone();
-                let state_inner = state_for_task.clone();
+                let fanout_inner = fanout_for_task.clone();
                 let first_event_inner = first_event_for_task.clone();
-                let _pv_name_for_cb = pv_name_owned.clone();
 
                 // final form: TRUE wire-bytes forwarding via
                 // `pvmonitor_raw_frames_handle` — the upstream monitor
@@ -1034,16 +1098,8 @@ impl ChannelCache {
                 // first-event signal + future typed `subscribe()`
                 // callers, which today are unused for the gateway
                 // path).
-                let tx_raw_inner = tx_raw_for_task.clone();
                 let pv_clone = pv_name_owned.clone();
-                let latest_raw_inner = latest_raw_for_task.clone();
                 let event_seen_inner = event_seen.clone();
-                // tx_inner moves into the callback so decoded
-                // events fan out to typed subscribers (subscribe_inner /
-                // subscribe_checked fallback path). Pre-fix this sender
-                // was dropped here before the closure captured it, so
-                // bcast_rx.recv() in subscribe_inner blocked forever
-                // after the initial snapshot.
                 let raw_cb =
                     move |desc: &FieldDesc,
                           body: bytes::Bytes,
@@ -1053,84 +1109,9 @@ impl ChannelCache {
                         // its backoff floor when it ends (vs. a clean FINISH
                         // that returns without ever delivering one).
                         event_seen_inner.store(true, Ordering::Relaxed);
-                        let outcome = apply_monitor_event(&state_inner, desc, &body, order);
-                        use crate::pva_gateway::source::RawEvent;
-                        if outcome.type_changed {
-                            tracing::warn!(
-                                pv = %pv_clone,
-                                "pva-gateway: upstream introspection changed — \
-                                 emitting type-change boundary to downstream monitors \
-                                 (cache descriptor reset)"
-                            );
-                            // pvxs treats reconnect/type-change as
-                            // a subscription boundary
-                            // (ioc/pvalink_channel.cpp:342-351 `onTypeChange()`).
-                            // Forwarding the new body under the downstream's
-                            // original MONITOR INIT descriptor would deliver
-                            // bytes the client can't decode — possibly causing
-                            // a protocol error or silently corrupted values.
-                            // Emit a marker event with no body so the
-                            // downstream dispatch path sends MONITOR FINISH
-                            // and the client knows to reopen with a fresh
-                            // INIT against the new descriptor.
-                            // clear stale bytes so new raw
-                            // subscribers don't replay the old descriptor.
-                            *latest_raw_inner.write() = None;
-                            // Emit the boundary on BOTH fanout streams through
-                            // the single owner: the raw `RawEvent` for raw-path
-                            // subscribers AND the decoded
-                            // `MonitorUpdate::type_change()` so a field-masked /
-                            // pipelined / filtered downstream monitor — forced
-                            // onto the decoded path — also gets a MONITOR FINISH
-                            // instead of the next value re-encoded under its
-                            // stale INIT descriptor.
-                            broadcast_boundary(&tx_inner, &tx_raw_inner, order);
-                            // Skip the normal body forward — the bytes are
-                            // for the NEW descriptor; sending them under
-                            // the old INIT descriptor is exactly the
-                            // bug.
-                            return;
-                        }
-                        if outcome.was_first {
+                        if fanout_inner.publish(&pv_clone, desc, body, order) {
                             first_event_inner.notify_waiters();
                         }
-                        // fan out decoded value to typed subscribers
-                        // (subscribe/subscribe_checked fallback path).
-                        // Guard: skip the initial event (`was_first`) because
-                        // subscribe_inner always delivers it via snapshot().
-                        // Broadcasting it races with bcast_rx creation and
-                        // produces a duplicate first value in the mpsc.
-                        // `outcome.value` was read under the state write lock,
-                        // so it is the exact merged value — no separate
-                        // state_inner.read() re-acquisition needed.
-                        if !outcome.was_first {
-                            if let Some(val) = outcome.value {
-                                // Carry the upstream event's real changed-leaf
-                                // paths so the downstream cooked monitor's
-                                // changedBitSet matches what the upstream IOC
-                                // marked, not a full mask of every requested
-                                // leaf (pva2pva moncache.cpp:142,187 copy the
-                                // upstream changedBitSet verbatim). `overrun`
-                                // is filled later by `subscribe_inner` on lag.
-                                let _ = tx_inner.send(epics_pva_rs::server_native::MonitorUpdate {
-                                    value: val,
-                                    marked: outcome.marked,
-                                    type_changed: false,
-                                    overrun: Vec::new(),
-                                });
-                            }
-                        }
-                        // cache latest raw event for initial
-                        // snapshot delivery to new raw subscribers.
-                        // Clone is cheap (Bytes is refcounted).
-                        let raw_ev = RawEvent {
-                            body,
-                            byte_order: order,
-                            type_changed: false,
-                        };
-                        *latest_raw_inner.write() = Some(raw_ev.clone());
-                        // Fan out raw body — refcount only, no copy.
-                        let _ = tx_raw_inner.send(raw_ev);
                     };
                 // The upstream monitor's CONNECTION-STATE stream — where
                 // this task learns that the upstream came or went.
@@ -1148,10 +1129,7 @@ impl ChannelCache {
                 // from both observers (here and after the terminal end
                 // below) fires it exactly once — the same two-observer,
                 // one-owner shape `inp_disconnect_scan` has in pvalink.
-                let state_conn = state_for_task.clone();
-                let latest_raw_conn = latest_raw_for_task.clone();
-                let tx_conn = tx_for_task.clone();
-                let tx_raw_conn = tx_raw_for_task.clone();
+                let fanout_conn = fanout_for_task.clone();
                 let pv_name_conn = pv_name_owned.clone();
                 let conn_cb = move |ev: epics_pva_rs::client_native::ops_v2::MonitorConnEvent| {
                     use epics_pva_rs::client_native::ops_v2::MonitorConnEvent;
@@ -1163,12 +1141,7 @@ impl ChannelCache {
                                 "pva-gateway: upstream monitor left the connected state — \
                                  revoking the cached value with a monitor-unlisten boundary"
                             );
-                            signal_disconnect_boundary(
-                                &state_conn,
-                                &latest_raw_conn,
-                                &tx_conn,
-                                &tx_raw_conn,
-                            );
+                            fanout_conn.signal_disconnect_boundary();
                         }
                     }
                 };
@@ -1218,12 +1191,7 @@ impl ChannelCache {
                         // reopen instead of observing stale data at NoAlarm.
                         // Idempotent per outage (clears the snapshot), so a
                         // backoff retry storm emits FINISH at most once.
-                        signal_disconnect_boundary(
-                            &state_for_task,
-                            &latest_raw_for_task,
-                            &tx_for_task,
-                            &tx_raw_for_task,
-                        );
+                        fanout_for_task.signal_disconnect_boundary();
                         // guard removed — cleanup_tick aborts via AbortOnDrop.
                         epics_base_rs::runtime::task::sleep(backoff).await;
                         backoff = std::cmp::min(backoff * 2, max_backoff);
@@ -1244,12 +1212,7 @@ impl ChannelCache {
                 // outage. The gateway's own loop re-subscribes; the first real
                 // upstream event after reconnect repopulates the snapshot via
                 // the normal monitor callback path.
-                signal_disconnect_boundary(
-                    &state_for_task,
-                    &latest_raw_for_task,
-                    &tx_for_task,
-                    &tx_raw_for_task,
-                );
+                fanout_for_task.signal_disconnect_boundary();
                 if let epics_pva_rs::client_native::ops_v2::MonitorTermination::Failed(e) =
                     raw_result
                 {
@@ -1299,10 +1262,7 @@ impl ChannelCache {
 
         Arc::new(UpstreamEntry {
             pv_name: pv_name.to_string(),
-            state,
-            tx,
-            tx_raw,
-            latest_raw,
+            fanout,
             first_event,
             _monitor_task: AbortOnDrop(join.abort_handle()),
             drop_poke: parking_lot::Mutex::new(true),
@@ -1487,7 +1447,7 @@ impl ChannelCache {
         let Some(inv) = self.invalidator.get() else {
             return;
         };
-        let batch: Arc<[String]> = names.into_iter().collect();
+        let batch: Arc<[RecordName]> = names.into_iter().map(RecordName::from).collect();
         inv.publish(batch);
     }
 
@@ -1557,17 +1517,10 @@ impl ChannelCache {
     /// several pvRequest variants without a live upstream IOC.
     #[cfg(test)]
     pub(crate) async fn insert_test_variant(&self, pv_name: &str, req_key: Vec<u8>) {
-        let (tx, rx0) = broadcast::channel::<MonitorUpdate>(4);
-        drop(rx0);
-        let (tx_raw, rx0_raw) = broadcast::channel::<crate::pva_gateway::source::RawEvent>(4);
-        drop(rx0_raw);
         let task = self.reactor.spawn(std::future::pending::<()>());
         let entry = Arc::new(UpstreamEntry {
             pv_name: pv_name.to_string(),
-            state: Arc::new(RwLock::new(EntryState::default())),
-            tx,
-            tx_raw,
-            latest_raw: Arc::new(RwLock::new(None)),
+            fanout: Arc::new(Fanout::new(4)),
             first_event: Arc::new(Notify::new()),
             _monitor_task: AbortOnDrop(task.abort_handle()),
             drop_poke: parking_lot::Mutex::new(false),
@@ -1621,12 +1574,13 @@ impl ChannelCache {
             .get(pv_name)
             .and_then(|ch| ch.monitors.get(&Vec::new()).cloned())
             .expect("default test monitor variant must exist");
+        let _held = entry.fanout.publish.lock();
         {
-            let mut s = entry.state.write();
+            let mut s = entry.fanout.state.write();
             s.introspection = Some(value.descriptor());
             s.latest = Some(value.clone());
         }
-        let _ = entry.tx.send(MonitorUpdate::from(value));
+        let _ = entry.fanout.tx.send(MonitorUpdate::from(value));
     }
 }
 
@@ -1721,6 +1675,52 @@ mod tests {
             &mut body,
         );
         body
+    }
+
+    /// A subscriber taken while events are being published gets each later
+    /// event exactly once: its seed is event `k` and its stream carries
+    /// `k+1..=N`, on both streams. The seed and the receiver used to be
+    /// taken apart, and an event published between them reached a
+    /// subscriber twice (gateway_155's `[7.0, 7.0]`).
+    #[test]
+    fn a_subscriber_gets_each_event_once_in_its_seed_or_its_stream() {
+        const N: usize = 5000;
+        let desc = FieldDesc::Scalar(ScalarType::Double);
+        let fanout = Arc::new(Fanout::new(N + 1));
+        let publisher = {
+            let fanout = fanout.clone();
+            let desc = desc.clone();
+            std::thread::spawn(move || {
+                for i in 1..=N {
+                    let v = PvField::Scalar(ScalarValue::Double(i as f64));
+                    let body = bytes::Bytes::from(encode_body(&desc, &v, &[0]));
+                    fanout.publish("X", &desc, body, ByteOrder::Little);
+                }
+            })
+        };
+        let mut subs = Vec::new();
+        while !publisher.is_finished() && subs.len() < 2000 {
+            subs.push((fanout.subscribe(), fanout.subscribe_raw()));
+        }
+        publisher.join().unwrap();
+        let seq = |seed: &Option<SourceRead>| match seed.as_ref().map(|r| &r.value) {
+            None => 0,
+            Some(PvField::Scalar(ScalarValue::Double(v))) => *v as usize,
+            Some(other) => panic!("seed {other:?}"),
+        };
+        for ((seed, mut rx), (raw_seed, _, raw_rx)) in subs {
+            let first = seq(&seed);
+            assert_eq!(rx.len(), N - first, "decoded after seed {first}");
+            if let Ok(u) = rx.try_recv() {
+                assert_eq!(
+                    u.value.into_owned(),
+                    PvField::Scalar(ScalarValue::Double((first + 1) as f64)),
+                    "the stream resumes right after seed {first}"
+                );
+            }
+            let raw_first = seq(&raw_seed);
+            assert_eq!(raw_rx.len(), N - raw_first, "raw after seed {raw_first}");
+        }
     }
 
     /// BUG 2 regression: `apply_monitor_event` must update
@@ -1823,7 +1823,8 @@ mod tests {
             fields: vec![
                 ("a".to_string(), FieldDesc::Scalar(ScalarType::Int)),
                 ("b".to_string(), FieldDesc::Scalar(ScalarType::Int)),
-            ],
+            ]
+            .into(),
         };
         let full = |a: i32, b: i32| {
             let mut s = epics_pva_rs::pvdata::PvStructure::new("");
@@ -1865,7 +1866,8 @@ mod tests {
             fields: vec![
                 ("a".to_string(), FieldDesc::Scalar(ScalarType::Int)),
                 ("b".to_string(), FieldDesc::Scalar(ScalarType::Int)),
-            ],
+            ]
+            .into(),
         };
         let full = |a: i32, b: i32| {
             let mut s = epics_pva_rs::pvdata::PvStructure::new("");
@@ -1921,7 +1923,8 @@ mod tests {
             fields: vec![
                 ("a".to_string(), FieldDesc::Scalar(ScalarType::Int)),
                 ("b".to_string(), FieldDesc::Scalar(ScalarType::Int)),
-            ],
+            ]
+            .into(),
         };
         let full = |a: i32, b: i32| {
             let mut s = epics_pva_rs::pvdata::PvStructure::new("");
@@ -2022,19 +2025,12 @@ mod tests {
     /// real client) and exercise the subscribe / poke counters.
     #[tokio::test]
     async fn entry_subscribe_returns_fresh_receivers() {
-        let (tx, rx0) = broadcast::channel::<MonitorUpdate>(4);
-        drop(rx0);
-        let (tx_raw, rx0_raw) = broadcast::channel::<crate::pva_gateway::source::RawEvent>(4);
-        drop(rx0_raw);
         let task = crate::test_reactor().spawn(async {
             epics_base_rs::runtime::task::sleep(Duration::from_secs(60)).await;
         });
         let entry = UpstreamEntry {
             pv_name: "X".into(),
-            state: Arc::new(RwLock::new(EntryState::default())),
-            tx,
-            tx_raw,
-            latest_raw: Arc::new(RwLock::new(None)),
+            fanout: Arc::new(Fanout::new(4)),
             first_event: Arc::new(Notify::new()),
             _monitor_task: AbortOnDrop(task.abort_handle()),
             drop_poke: parking_lot::Mutex::new(false),
@@ -2055,17 +2051,10 @@ mod tests {
     #[tokio::test]
     async fn is_retained_keeps_subscribers_and_poked_evicts_idle() {
         fn make(drop_poke: bool) -> UpstreamEntry {
-            let (tx, rx0) = broadcast::channel::<MonitorUpdate>(4);
-            drop(rx0);
-            let (tx_raw, rx0_raw) = broadcast::channel::<crate::pva_gateway::source::RawEvent>(4);
-            drop(rx0_raw);
             let task = crate::test_reactor().spawn(std::future::pending::<()>());
             UpstreamEntry {
                 pv_name: "X".into(),
-                state: Arc::new(RwLock::new(EntryState::default())),
-                tx,
-                tx_raw,
-                latest_raw: Arc::new(RwLock::new(None)),
+                fanout: Arc::new(Fanout::new(4)),
                 first_event: Arc::new(Notify::new()),
                 _monitor_task: AbortOnDrop(task.abort_handle()),
                 drop_poke: parking_lot::Mutex::new(drop_poke),
@@ -2107,18 +2096,17 @@ mod tests {
     #[test]
     fn disconnect_emits_unlisten_boundary_and_clears_snapshot() {
         use crate::pva_gateway::source::RawEvent;
-        use tokio::sync::broadcast;
-        let state = RwLock::new(EntryState::default());
-        state.write().latest = Some(PvField::Scalar(ScalarValue::Double(1.0)));
-        let latest_raw = RwLock::new(Some(RawEvent {
+        let fanout = Fanout::new(8);
+        fanout.state.write().latest = Some(PvField::Scalar(ScalarValue::Double(1.0)));
+        *fanout.latest_raw.write() = Some(RawEvent {
             body: bytes::Bytes::from_static(&[1, 2, 3]),
             byte_order: ByteOrder::Big,
             type_changed: false,
-        }));
-        let (tx, mut rx) = broadcast::channel::<MonitorUpdate>(8);
-        let (tx_raw, mut rx_raw) = broadcast::channel::<crate::pva_gateway::source::RawEvent>(8);
+        });
+        let mut rx = fanout.tx.subscribe();
+        let mut rx_raw = fanout.tx_raw.subscribe();
 
-        signal_disconnect_boundary(&state, &latest_raw, &tx, &tx_raw);
+        fanout.signal_disconnect_boundary();
 
         let ev = rx_raw.try_recv().expect("raw boundary event emitted");
         assert!(ev.type_changed, "must be a subscription-boundary marker");
@@ -2130,11 +2118,11 @@ mod tests {
             "decoded fanout must also carry the boundary"
         );
         assert!(
-            latest_raw.read().is_none(),
+            fanout.latest_raw.read().is_none(),
             "latest_raw cleared on disconnect"
         );
         assert!(
-            state.read().latest.is_none(),
+            fanout.state.read().latest.is_none(),
             "state.latest cleared on disconnect"
         );
     }
@@ -2145,14 +2133,12 @@ mod tests {
     #[test]
     fn disconnect_boundary_is_idempotent_per_outage() {
         use crate::pva_gateway::source::RawEvent;
-        use tokio::sync::broadcast;
-        let state = RwLock::new(EntryState::default());
-        let latest_raw = RwLock::new(None::<crate::pva_gateway::source::RawEvent>);
-        let (tx, mut rx) = broadcast::channel::<MonitorUpdate>(8);
-        let (tx_raw, mut rx_raw) = broadcast::channel::<crate::pva_gateway::source::RawEvent>(8);
+        let fanout = Fanout::new(8);
+        let mut rx = fanout.tx.subscribe();
+        let mut rx_raw = fanout.tx_raw.subscribe();
 
         // No cached snapshot ⇒ nothing to revoke ⇒ no emission on either stream.
-        signal_disconnect_boundary(&state, &latest_raw, &tx, &tx_raw);
+        fanout.signal_disconnect_boundary();
         assert!(
             rx_raw.try_recv().is_err(),
             "no raw boundary without a prior snapshot"
@@ -2163,12 +2149,12 @@ mod tests {
         );
 
         // Arm with a snapshot, fire once — both streams get exactly one.
-        *latest_raw.write() = Some(RawEvent {
+        *fanout.latest_raw.write() = Some(RawEvent {
             body: bytes::Bytes::from_static(&[9]),
             byte_order: ByteOrder::Little,
             type_changed: false,
         });
-        signal_disconnect_boundary(&state, &latest_raw, &tx, &tx_raw);
+        fanout.signal_disconnect_boundary();
         assert!(
             rx_raw.try_recv().is_ok(),
             "first disconnect emits a raw boundary"
@@ -2179,7 +2165,7 @@ mod tests {
         );
 
         // Second call within one outage: snapshot already cleared, no-op on both.
-        signal_disconnect_boundary(&state, &latest_raw, &tx, &tx_raw);
+        fanout.signal_disconnect_boundary();
         assert!(
             rx_raw.try_recv().is_err(),
             "second call within one outage must not re-emit raw"

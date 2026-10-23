@@ -26,11 +26,16 @@ fn entry_point_refuses_a_build_with_no_runtime_to_run_on() {
         .stdin(Stdio::null())
         .output()
         .expect("spawn realtime-pva-ioc");
-    assert!(!out.status.success(), "expected a refusal exit status");
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("EPICS_RS_BUILD_EXEC_BACKEND"),
-        "the refusal must name the variable that fixes it; got: {stderr}"
+    // `runtime::task::refuse_backend`: the text on stderr, exit status 1.
+    assert_eq!(out.status.code(), Some(1), "a refusal is a failed start");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "realtime-pva-ioc: built with the tokio task backend, which this entry point \
+         does not start a runtime for.\n\
+         Build it for `armv7-rtems-eabihf` or a VxWorks target, or on a host \
+         rebuild with EPICS_RS_BUILD_EXEC_BACKEND=thread, which routes the \
+         `runtime::task` seam to the same std-thread executor the target uses.\n"
     );
 }
 
@@ -181,7 +186,8 @@ mod exec_model {
         // search for, which is what drives the search engine and the dial.
         std::fs::write(
             &db,
-            "record(ai, \"LOCAL:PAI\") { field(INP, \"pva://UPSTREAM:AI CP\") }\n",
+            "record(ai, \"LOCAL:PAI\") { field(INP, \"pva://UPSTREAM:AI CP\") }\n\
+             record(ai, \"LOCAL:JSON\") { field(INP, {pva:\"UPSTREAM:AI\"}) }\n",
         )
         .expect("write the db");
 
@@ -244,6 +250,11 @@ mod exec_model {
             std::thread::sleep(Duration::from_millis(50));
             console = read_log();
         }
+        // The resolver must be in place at link init, not mounted after it.
+        assert!(
+            !console.contains("refused"),
+            "link init refused a pva link:\n{console}"
+        );
 
         // Phase 2 — wait for the client to report that it is searching. The
         // search engine's first tick and the first name-server dial happen after
@@ -429,5 +440,91 @@ mod exec_model {
             bare.iter().any(|n| n == "RTEMS:PVA:AO"),
             "the fallback must actually be the demo database:\n{bare_log}"
         );
+    }
+
+    /// A bare remote link here is a CA link, as in softIocPVX, whose dbCa
+    /// reads the source and writes the sink over CA (`dbLink.c:118-130`). With
+    /// no `ca` network half the holder stayed LINK/INVALID for good.
+    #[test]
+    #[ignore = "spawns the EPICS base softIoc from $EPICS_BASE; runs in --profile interop"]
+    fn a_bare_remote_link_reads_and_writes_over_ca() {
+        use epics_oracle_rs::ioc::{CIoc, CTools, Ioc as _};
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let remote_db = dir.path().join("remote.db");
+        std::fs::write(
+            &remote_db,
+            "record(ai, \"REMOTE:AI\") { field(VAL, \"42.5\") }\n\
+             record(ao, \"REMOTE:BACK\") { }\n",
+        )
+        .expect("write the remote db");
+        let tools = CTools::discover().expect("the C tools");
+        let remote = CIoc::boot(&tools, &remote_db).expect("boot the C softIoc");
+        let ca = format!("127.0.0.1:{}", remote.port());
+
+        let db = dir.path().join("holder.db");
+        std::fs::write(
+            &db,
+            "record(ai, \"H\") { field(INP, \"REMOTE:AI CP\") field(FLNK, \"W\") }\n\
+             record(ao, \"W\") { field(OMSL, \"closed_loop\") field(DOL, \"H NPP\") \
+             field(OUT, \"REMOTE:BACK PP\") }\n",
+        )
+        .expect("write the db");
+        let log_path = dir.path().join("console.log");
+        let log = std::fs::File::create(&log_path).expect("create the console log");
+        let log_err = log.try_clone().expect("clone the console log handle");
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_realtime-pva-ioc"));
+        cmd.arg(&db)
+            .env("EPICS_PVA_SERVER_PORT", KERNEL_PICKS)
+            .env("EPICS_PVAS_SERVER_PORT", KERNEL_PICKS)
+            .env("EPICS_PVA_BROADCAST_PORT", KERNEL_PICKS)
+            .env("EPICS_PVA_AUTO_ADDR_LIST", "NO")
+            .env("EPICS_CA_ADDR_LIST", &ca)
+            .env("EPICS_CA_AUTO_ADDR_LIST", "NO")
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(log))
+            .stderr(Stdio::from(log_err));
+        #[cfg(not(feature = "bringup-probes"))]
+        cmd.env(
+            "EPICS_PVA_NAME_SERVERS",
+            format!("127.0.0.1:{}", closed_port()),
+        );
+        let mut child = Killed(cmd.spawn().expect("spawn realtime-pva-ioc"));
+        let console = || std::fs::read_to_string(&log_path).unwrap_or_default();
+
+        let ca_tool = |tool: &str, args: &[&str]| {
+            let out = Command::new(tools.tool(tool))
+                .args(args)
+                .env("EPICS_CA_ADDR_LIST", &ca)
+                .env("EPICS_CA_AUTO_ADDR_LIST", "NO")
+                .output()
+                .expect("run a C CA tool");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let mut back_reaches = |want: &str| {
+            let deadline = Instant::now() + INIT_BUDGET;
+            loop {
+                let got = ca_tool("caget", &["-t", "-w", "1", "REMOTE:BACK"]);
+                if got == want {
+                    return;
+                }
+                assert!(
+                    child.0.try_wait().expect("poll the child").is_none(),
+                    "realtime-pva-ioc exited:\n{}",
+                    console()
+                );
+                assert!(
+                    Instant::now() < deadline,
+                    "REMOTE:BACK is {got:?}, not {want:?}: the bare CP link never \
+                     carried REMOTE:AI over CA:\n{}",
+                    console()
+                );
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        };
+        // The first event, at connect, then one the source posts later.
+        back_reaches("42.5");
+        ca_tool("caput", &["-w", "1", "REMOTE:AI", "7"]);
+        back_reaches("7");
     }
 }

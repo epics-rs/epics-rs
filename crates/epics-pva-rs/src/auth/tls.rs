@@ -62,6 +62,7 @@
 //! here — that work belongs in `client_native::server_conn` / `server_native::tcp`,
 //! which can decide per-target whether to upgrade the socket.
 
+use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
@@ -166,7 +167,7 @@ fn ssl_key_log() -> Option<Arc<dyn rustls::KeyLog>> {
     KEYLOG
         .get_or_init(|| match std::env::var_os("SSLKEYLOGFILE") {
             Some(path) if !path.is_empty() => {
-                eprintln!(
+                epics_libcom_rs::stderr_println!(
                     "NOTICE: debug logging TLS SECRETS to SSLKEYLOGFILE={}",
                     path.to_string_lossy()
                 );
@@ -200,8 +201,7 @@ pub fn load_server_config() -> Result<Option<TlsServerConfig>, TlsConfigError> {
     // Rust-only fallback consulted only when the spec carries no `;`.
     // (PEM keys in our pipeline are unencrypted, so the password is
     // harmless there.)
-    let (keychain_path, inline_password) = crate::config::env::split_keychain_spec(&keychain);
-    let path = PathBuf::from(keychain_path);
+    let (path, inline_password) = crate::config::env::split_keychain_spec(&keychain);
     let password = inline_password.or_else(crate::config::env::server_tls_keychain_password);
     let Keychain {
         certs,
@@ -291,14 +291,13 @@ pub fn load_client_config() -> Result<Option<TlsClientConfig>, TlsConfigError> {
         return Ok(None);
     }
     let mut roots = RootCertStore::empty();
-    if let Ok(ca_path) = std::env::var("EPICS_PVA_TLS_CA_KEYCHAIN") {
+    if let Some(ca_path) = epics_base_rs::runtime::env::get("EPICS_PVA_TLS_CA_KEYCHAIN") {
         // PVA-466: expand $(VAR) / ${VAR} in path env.
         let ca_path = crate::config::env::expand_dollar_vars(&ca_path);
         // pvxs splits the keychain spec at the first `;`
         // (`ossl.cpp:223-229`, `tls` `b3a10bf0`):
         // inline password wins; the env var is the non-pvxs fallback.
-        let (ca_keychain_path, inline_password) = crate::config::env::split_keychain_spec(&ca_path);
-        let path = PathBuf::from(&ca_keychain_path);
+        let (path, inline_password) = crate::config::env::split_keychain_spec(&ca_path);
         let password = inline_password.or_else(crate::config::env::client_tls_keychain_password);
         // A CA keychain may have no private key (PEM cert-only or a
         // PKCS#12 trust store) — that is fine, we only want the certs.
@@ -310,14 +309,15 @@ pub fn load_client_config() -> Result<Option<TlsClientConfig>, TlsConfigError> {
 
     let builder = ClientConfig::builder().with_root_certificates(roots);
 
-    let mut config = if let Ok(keychain) = std::env::var("EPICS_PVA_TLS_KEYCHAIN") {
+    let mut config = if let Some(keychain) =
+        epics_base_rs::runtime::env::get("EPICS_PVA_TLS_KEYCHAIN")
+    {
         // PVA-466: expand $(VAR) / ${VAR} in path env.
         let keychain = crate::config::env::expand_dollar_vars(&keychain);
         // pvxs splits the keychain spec at the first `;`
         // (`ossl.cpp:223-229`, `tls` `b3a10bf0`):
         // inline password wins; the env var is the non-pvxs fallback.
-        let (keychain_path, inline_password) = crate::config::env::split_keychain_spec(&keychain);
-        let path = PathBuf::from(keychain_path);
+        let (path, inline_password) = crate::config::env::split_keychain_spec(&keychain);
         let password = inline_password.or_else(crate::config::env::client_tls_keychain_password);
         let Keychain {
             certs,
@@ -372,7 +372,7 @@ struct Keychain {
 /// containing a `-----BEGIN` marker is treated as PEM, anything else
 /// is handed to the PKCS#12 parser. `password` is only consulted for
 /// PKCS#12 input.
-fn load_keychain(path: &Path, password: Option<&str>) -> Result<Keychain, TlsConfigError> {
+fn load_keychain(path: &Path, password: Option<&OsStr>) -> Result<Keychain, TlsConfigError> {
     let mut file = File::open(path).map_err(|source| TlsConfigError::Io {
         path: path.to_path_buf(),
         source,
@@ -387,8 +387,52 @@ fn load_keychain(path: &Path, password: Option<&str>) -> Result<Keychain, TlsCon
     if is_pem(&bytes) {
         load_pem_keychain(path, &bytes)
     } else {
-        load_pkcs12_keychain(path, &bytes, password.unwrap_or(""))
+        load_pkcs12_keychain(path, &bytes, password)
     }
+}
+
+/// A PKCS#12 password in the two forms OpenSSL 3 reads it in.
+#[cfg(feature = "pkcs12")]
+#[derive(Clone, Copy)]
+struct Pkcs12Password<'a> {
+    /// The bytes PBES2 hands PBKDF2 (`PKCS5_v2_PBKDF2_keyivgen`).
+    raw: &'a [u8],
+    /// The text whose BMPString the MAC and the legacy PBE KDF use
+    /// (`PKCS12_key_gen_utf8_ex`); `None` where `OPENSSL_utf82uni` fails.
+    text: Option<&'a str>,
+}
+
+#[cfg(feature = "pkcs12")]
+impl Pkcs12Password<'_> {
+    /// The BMPString text, or the error OpenSSL's KDF returns without one.
+    fn text(&self, path: &Path) -> Result<&str, TlsConfigError> {
+        self.text.ok_or_else(|| TlsConfigError::Pkcs12 {
+            path: path.to_path_buf(),
+            reason: "keychain password has a code point above U+10FFFF, which \
+                     has no PKCS#12 BMPString"
+                .to_string(),
+        })
+    }
+}
+
+/// The text `OPENSSL_utf82uni` (`p12_utl.c:81-111`) makes the BMPString
+/// of: bytes that are not UTF-8 are Latin-1, one character per byte
+/// (`OPENSSL_asc2uni`). `UTF8_getc` decodes any F0-F7 lead with three
+/// continuation bytes, and above U+10FFFF `utf82uni` returns NULL instead
+/// of falling back.
+#[cfg(feature = "pkcs12")]
+fn utf82uni_text(bytes: &[u8]) -> Option<String> {
+    let e = match std::str::from_utf8(bytes) {
+        Ok(text) => return Some(text.to_owned()),
+        Err(e) => e,
+    };
+    let beyond_utf16 = match bytes[e.valid_up_to()..] {
+        [lead @ 0xf4..=0xf7, b1, b2, b3, ..] => {
+            [b1, b2, b3].iter().all(|b| b & 0xc0 == 0x80) && (lead > 0xf4 || b1 >= 0x90)
+        }
+        _ => false,
+    };
+    (!beyond_utf16).then(|| bytes.iter().map(|&b| char::from(b)).collect())
 }
 
 /// True iff `bytes` looks like PEM — i.e. contains a `-----BEGIN`
@@ -447,9 +491,16 @@ fn load_pem_keychain(path: &Path, bytes: &[u8]) -> Result<Keychain, TlsConfigErr
 fn load_pkcs12_keychain(
     path: &Path,
     bytes: &[u8],
-    password: &str,
+    password: Option<&OsStr>,
 ) -> Result<Keychain, TlsConfigError> {
     use p12::SafeBagKind;
+
+    let raw = password.unwrap_or_default().as_encoded_bytes();
+    let text = utf82uni_text(raw);
+    let pkcs12_password = Pkcs12Password {
+        raw,
+        text: text.as_deref(),
+    };
 
     // Route by the keychain MAC digest algorithm. The `p12` crate
     // hard-`assert_eq!`s the MAC digest against SHA-1 and *panics* on
@@ -458,8 +509,10 @@ fn load_pkcs12_keychain(
     // entry point: SHA-1 MAC → classic `p12` path; anything else →
     // RustCrypto PBES2 path (which also handles a MAC-less keychain).
     if !load_pkcs12_pbes2::has_classic_sha1_mac(bytes) {
-        return load_pkcs12_pbes2::load(path, bytes, password);
+        return load_pkcs12_pbes2::load(path, bytes, pkcs12_password);
     }
+    // `p12` runs only the PKCS#12 KDF, which reads the BMPString.
+    let password = pkcs12_password.text(path)?;
 
     let pfx = p12::PFX::parse(bytes).map_err(|e| TlsConfigError::Pkcs12 {
         path: path.to_path_buf(),
@@ -481,7 +534,7 @@ fn load_pkcs12_keychain(
         // classic PBE primitives — a SHA-1-MAC keychain whose bags are
         // nonetheless PBES2-encrypted (OpenSSL `-macalg sha1` without
         // `-legacy`). Retry through the RustCrypto path.
-        Err(_) => return load_pkcs12_pbes2::load(path, bytes, password),
+        Err(_) => return load_pkcs12_pbes2::load(path, bytes, pkcs12_password),
     };
 
     // First key bag wins (EPICS keychains hold one end-entity key).
@@ -520,7 +573,7 @@ fn load_pkcs12_keychain(
     // PBES2 loader returns `key: None` for it too, so the retry stays
     // correct: it never invents a key that is not there.)
     if key.is_none() {
-        if let Ok(kc) = load_pkcs12_pbes2::load(path, bytes, password) {
+        if let Ok(kc) = load_pkcs12_pbes2::load(path, bytes, pkcs12_password) {
             if kc.key.is_some() {
                 return Ok(kc);
             }
@@ -820,7 +873,7 @@ mod load_pkcs12_pbes2 {
         path: &Path,
         alg: &spki::AlgorithmIdentifierOwned,
         ciphertext: &[u8],
-        password: &str,
+        password: &[u8],
     ) -> Result<Vec<u8>, TlsConfigError> {
         // `EncryptionScheme` is a DER SEQUENCE with the exact shape of
         // an `AlgorithmIdentifier` (oid + parameters), so re-encode the
@@ -938,7 +991,7 @@ mod load_pkcs12_pbes2 {
         path: &Path,
         pfx: &Pfx,
         auth_safe_content: &[u8],
-        password: &str,
+        password: super::Pkcs12Password<'_>,
     ) -> Result<(), TlsConfigError> {
         use rc_hmac::{KeyInit, Mac};
 
@@ -952,7 +1005,7 @@ mod load_pkcs12_pbes2 {
         // ASN.1 `iterations` is `DEFAULT 1`; an absent field means 1.
         let rounds = mac_data.iterations.unwrap_or(1);
         let expected = mac_data.mac.digest.as_bytes();
-        let password_bmp = super::bmp_password(password);
+        let password_bmp = super::bmp_password(password.text(path)?);
 
         // SHA-1 and SHA-256 cover every MAC OpenSSL emits for a `.p12`.
         // RFC 7292 MAC purpose byte is 3 (MAC key material).
@@ -1019,7 +1072,7 @@ mod load_pkcs12_pbes2 {
     fn process_bag(
         path: &Path,
         bag: &SafeBag,
-        password: &str,
+        password: &[u8],
         cert_bags: &mut Vec<(Vec<u8>, Option<Vec<u8>>)>,
         key: &mut Option<PrivateKeyDer<'static>>,
         key_local_id: &mut Option<Vec<u8>>,
@@ -1081,7 +1134,7 @@ mod load_pkcs12_pbes2 {
     pub(super) fn load(
         path: &Path,
         bytes: &[u8],
-        password: &str,
+        password: super::Pkcs12Password<'_>,
     ) -> Result<Keychain, TlsConfigError> {
         let pfx = Pfx::from_der(bytes)
             .map_err(|e| err(path, format!("not a valid PKCS#12 structure: {e}")))?;
@@ -1140,7 +1193,12 @@ mod load_pkcs12_pbes2 {
                     .encrypted_content
                     .as_ref()
                     .ok_or_else(|| err(path, "EncryptedData has no encryptedContent"))?;
-                pbes2_decrypt(path, &eci.content_enc_alg, ciphertext.as_bytes(), password)?
+                pbes2_decrypt(
+                    path,
+                    &eci.content_enc_alg,
+                    ciphertext.as_bytes(),
+                    password.raw,
+                )?
             } else {
                 // Enveloped (public-key) SafeContents — not supported.
                 continue;
@@ -1150,7 +1208,7 @@ mod load_pkcs12_pbes2 {
                 process_bag(
                     path,
                     &bag,
-                    password,
+                    password.raw,
                     &mut cert_bags,
                     &mut key,
                     &mut key_local_id,
@@ -1190,7 +1248,7 @@ mod load_pkcs12_pbes2 {
 fn load_pkcs12_keychain(
     path: &Path,
     _bytes: &[u8],
-    _password: &str,
+    _password: Option<&OsStr>,
 ) -> Result<Keychain, TlsConfigError> {
     Err(TlsConfigError::Pkcs12Disabled(path.to_path_buf()))
 }
@@ -1524,13 +1582,82 @@ mod tests {
         let _ = "ab"; // keep test non-empty when feature is off
     }
 
+    /// OpenSSL's `asc2uni` fallback: a byte that is not UTF-8 is one BMP
+    /// character, so `p\xff` keys the PKCS#12 KDF as U+0070 U+00FF.
+    #[cfg(feature = "pkcs12")]
+    #[test]
+    fn a_non_utf8_password_is_latin1_for_the_kdf() {
+        let pw = utf82uni_text(b"p\xff").unwrap();
+        assert_eq!(bmp_password(&pw), vec![0x00, 0x70, 0x00, 0xff, 0, 0]);
+        assert_eq!(utf82uni_text("pé".as_bytes()).unwrap(), "pé");
+    }
+
+    /// `utf82uni` returns NULL for a decodable sequence above U+10FFFF and
+    /// falls back to Latin-1 only for undecodable bytes, whichever the
+    /// left-to-right scan meets first.
+    #[cfg(feature = "pkcs12")]
+    #[test]
+    fn a_code_point_above_u10ffff_has_no_bmpstring() {
+        assert_eq!(utf82uni_text(b"p\xf4\x90\x80\x80"), None);
+        assert_eq!(utf82uni_text(b"\xf5\x80\x80\x80"), None);
+        assert_eq!(utf82uni_text(b"\xf7\xbf\xbf\xbf\xff"), None);
+        assert_eq!(utf82uni_text(b"\xf4\x8f\xbf\xbf").unwrap(), "\u{10ffff}");
+        assert_eq!(utf82uni_text(b"\xf5\x80").unwrap(), "\u{f5}\u{80}");
+        assert_eq!(
+            utf82uni_text(b"\xf4\x90\x80\x7f").unwrap().chars().count(),
+            4
+        );
+        assert_eq!(
+            utf82uni_text(b"\xff\xf4\x90\x80\x80")
+                .unwrap()
+                .chars()
+                .count(),
+            5
+        );
+    }
+
+    #[cfg(all(unix, feature = "pkcs12"))]
+    #[test]
+    fn a_keychain_password_above_u10ffff_is_refused() {
+        use std::os::unix::ffi::OsStrExt;
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pbes2-raw-pass.p12");
+        let Err(err) = load_keychain(&fixture, Some(OsStr::from_bytes(b"\xf4\x90\x80\x80"))) else {
+            panic!("OpenSSL's KDF fails on this password");
+        };
+        assert!(err.to_string().contains("above U+10FFFF"), "{err}");
+    }
+
+    /// `openssl pkcs12 -export -passout env:PW` with `PW=$'p\xff'`
+    /// (OpenSSL 3.0.13: PBES2 AES-256-CBC bags, HMAC-SHA256 MAC). The
+    /// UTF-8 `pÿ` has the same BMPString, so it passes the MAC and must
+    /// fail the bags, as it does in OpenSSL.
+    #[cfg(all(unix, feature = "pkcs12"))]
+    #[test]
+    fn a_pbes2_keychain_takes_the_raw_password_bytes() {
+        use std::os::unix::ffi::OsStrExt;
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pbes2-raw-pass.p12");
+        let kc = load_keychain(&fixture, Some(OsStr::from_bytes(b"p\xff")))
+            .expect("raw-byte password opens the PBES2 bags");
+        assert_eq!(kc.certs.len(), 1);
+        assert!(kc.key.is_some());
+        let Err(err) = load_keychain(&fixture, Some(OsStr::new("pÿ"))) else {
+            panic!("the Latin-1 text must not open the PBES2 bags");
+        };
+        assert!(
+            err.to_string().contains("PBES2 bag decryption failed"),
+            "{err}"
+        );
+    }
+
     // ─── PKCS#12 keychain loading ───────────────────────────────────
     //
     // These tests generate fixtures with the `openssl` CLI using the
     // *legacy* PBE algorithms (`-keypbe`/`-certpbe`), because the `p12`
     // crate (0.6) does not implement PBES2/AES. If `openssl` is not on
-    // PATH the test is skipped — fixture generation, not the loader,
-    // is what's unavailable.
+    // PATH, or lacks the legacy provider, the test fails: an early return
+    // would score as a pass.
 
     #[cfg(feature = "pkcs12")]
     struct Pem {
@@ -1555,18 +1682,11 @@ mod tests {
 
     /// Build a legacy-PBE PKCS#12 from PEM cert+key using `openssl`.
     ///
-    /// `None` means one thing only: this host cannot produce the fixture,
-    /// because `openssl` is absent or its build refuses the classic
-    /// algorithms. Every other way the generation can fail — no temp dir,
-    /// an unwritable PEM, an unreadable `.p12`, an `openssl` that is on
-    /// PATH but will not execute — is our own fixture breaking, and
-    /// panics. Folding those into the same `None` made a broken fixture
-    /// indistinguishable from an absent tool, and each caller spelled the
-    /// `None` arm as an early return, which nextest scores as a pass.
-    /// This helper is also the sole owner of the skip message, so callers
-    /// return without printing one.
+    /// Panics when `openssl` is absent or its build refuses the classic
+    /// algorithms: a `None` that callers turn into an early return is a
+    /// pass in nextest's report.
     #[cfg(feature = "pkcs12")]
-    fn make_p12(pem: &Pem, ca_pem: Option<&str>, password: &str) -> Option<Vec<u8>> {
+    fn make_p12(pem: &Pem, ca_pem: Option<&str>, password: &str) -> Vec<u8> {
         use std::io::Write;
         let dir = tempfile::tempdir().expect("temp dir for the PKCS#12 fixture");
         let cert_path = dir.path().join("cert.pem");
@@ -1610,23 +1730,16 @@ mod tests {
         let status = match cmd.status() {
             Ok(s) => s,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                eprintln!(
-                    "SKIP: `openssl` is not on PATH, so the PKCS#12 fixture \
-                     cannot be generated; install it to run this test."
-                );
-                return None;
+                panic!("`openssl` is not on PATH, so the PKCS#12 fixture cannot be generated")
             }
             Err(e) => panic!("`openssl` was found on PATH but would not run: {e}"),
         };
-        if !status.success() {
-            eprintln!(
-                "SKIP: `openssl pkcs12 -export -legacy` exited {status}; this \
-                 build has no legacy provider, so the classic fixture cannot \
-                 be generated here."
-            );
-            return None;
-        }
-        Some(std::fs::read(&p12_path).expect("read the generated PKCS#12"))
+        assert!(
+            status.success(),
+            "`openssl pkcs12 -export -legacy` exited {status}; this build has \
+             no legacy provider, so the classic fixture cannot be generated"
+        );
+        std::fs::read(&p12_path).expect("read the generated PKCS#12")
     }
 
     #[cfg(feature = "pkcs12")]
@@ -1647,12 +1760,11 @@ mod tests {
     /// crate cannot decrypt this; the loader must fall through to the
     /// RustCrypto PBES2 path.
     ///
-    /// `None` carries the same single meaning as [`make_p12`]: `openssl`
-    /// is absent, or the build cannot emit a PBES2 keychain (an OpenSSL
-    /// 1.x build, detected by the classic SHA-1 MAC it writes instead).
-    /// Fixture breakage panics, and the skip message is printed here.
+    /// Panics, like [`make_p12`], when `openssl` is absent or the build
+    /// cannot emit a PBES2 keychain (an OpenSSL 1.x build, detected by the
+    /// classic SHA-1 MAC it writes instead).
     #[cfg(feature = "pkcs12")]
-    fn make_p12_pbes2(pem: &Pem, ca_pem: Option<&str>, password: &str) -> Option<Vec<u8>> {
+    fn make_p12_pbes2(pem: &Pem, ca_pem: Option<&str>, password: &str) -> Vec<u8> {
         use std::io::Write;
         let dir = tempfile::tempdir().expect("temp dir for the PBES2 fixture");
         let cert_path = dir.path().join("cert.pem");
@@ -1691,49 +1803,39 @@ mod tests {
         let status = match cmd.status() {
             Ok(s) => s,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                eprintln!(
-                    "SKIP: `openssl` is not on PATH, so the PBES2 PKCS#12 \
-                     fixture cannot be generated; install it to run this test."
-                );
-                return None;
+                panic!("`openssl` is not on PATH, so the PKCS#12 fixture cannot be generated")
             }
             Err(e) => panic!("`openssl` was found on PATH but would not run: {e}"),
         };
-        if !status.success() {
-            eprintln!(
-                "SKIP: `openssl pkcs12 -export` exited {status}; this build \
-                 cannot generate the PBES2 fixture."
-            );
-            return None;
-        }
+        assert!(
+            status.success(),
+            "`openssl pkcs12 -export` exited {status}; this build cannot \
+             generate the PBES2 fixture"
+        );
         let bytes = std::fs::read(&p12_path).expect("read the generated PKCS#12");
         // Guard: an OpenSSL 1.x build writes a classic SHA-1-MAC
         // keychain here, which the `p12` path already covers and does
-        // not exercise the PBES2 loader. Skip the fixture in that case.
+        // not exercise the PBES2 loader. Fail in that case.
         // (`has_classic_sha1_mac` is a pure `der` parse — it never
         // touches the panic-prone `p12` MAC check.)
-        if load_pkcs12_pbes2::has_classic_sha1_mac(&bytes) {
-            eprintln!(
-                "SKIP: this `openssl` wrote a classic SHA-1-MAC keychain, so \
-                 it is an OpenSSL 1.x build and does not exercise the PBES2 \
-                 loader."
-            );
-            return None;
-        }
-        Some(bytes)
+        assert!(
+            !load_pkcs12_pbes2::has_classic_sha1_mac(&bytes),
+            "this `openssl` wrote a classic SHA-1-MAC keychain, so it is an \
+             OpenSSL 1.x build and does not exercise the PBES2 loader"
+        );
+        bytes
     }
 
     #[test]
     #[cfg(feature = "pkcs12")]
+    #[ignore = "needs the openssl CLI (3.x, with the legacy provider); runs in --profile interop"]
     fn pkcs12_loads_leaf_and_key_with_password() {
         let pem = gen_self_signed("epics-pkcs12-leaf");
-        let Some(p12) = make_p12(&pem, None, "secret123") else {
-            return;
-        };
+        let p12 = make_p12(&pem, None, "secret123");
         let (_dir, path) = write_temp(&p12);
 
         // Correct password -> leaf cert + key extracted.
-        let kc = load_keychain(&path, Some("secret123")).expect("load p12");
+        let kc = load_keychain(&path, Some(OsStr::new("secret123"))).expect("load p12");
         assert_eq!(kc.certs.len(), 1, "one leaf cert expected");
         assert!(kc.key.is_some(), "private key must be extracted");
         assert!(matches!(kc.key, Some(PrivateKeyDer::Pkcs8(_))));
@@ -1743,14 +1845,13 @@ mod tests {
 
     #[test]
     #[cfg(feature = "pkcs12")]
+    #[ignore = "needs the openssl CLI (3.x, with the legacy provider); runs in --profile interop"]
     fn pkcs12_wrong_password_is_rejected() {
         let pem = gen_self_signed("epics-pkcs12-leaf");
-        let Some(p12) = make_p12(&pem, None, "secret123") else {
-            return;
-        };
+        let p12 = make_p12(&pem, None, "secret123");
         let (_dir, path) = write_temp(&p12);
 
-        let err = load_keychain(&path, Some("wrong-password")).unwrap_err();
+        let err = load_keychain(&path, Some(OsStr::new("wrong-password"))).unwrap_err();
         match err {
             TlsConfigError::Pkcs12 { reason, .. } => {
                 assert!(reason.contains("MAC"), "got: {reason}");
@@ -1761,6 +1862,7 @@ mod tests {
 
     #[test]
     #[cfg(feature = "pkcs12")]
+    #[ignore = "needs the openssl CLI (3.x, with the legacy provider); runs in --profile interop"]
     fn pkcs12_with_ca_chain_splits_leaf_from_ca() {
         // A CA + a leaf signed by it; pack both into one PKCS#12 and
         // confirm the loader puts the leaf in `certs` and the CA in
@@ -1785,12 +1887,10 @@ mod tests {
             cert: leaf_cert.pem(),
             key: leaf_key.serialize_pem(),
         };
-        let Some(p12) = make_p12(&pem, Some(&ca_cert.pem()), "pw") else {
-            return;
-        };
+        let p12 = make_p12(&pem, Some(&ca_cert.pem()), "pw");
         let (_dir, path) = write_temp(&p12);
 
-        let kc = load_keychain(&path, Some("pw")).expect("load p12 w/ CA");
+        let kc = load_keychain(&path, Some(OsStr::new("pw"))).expect("load p12 w/ CA");
         assert_eq!(kc.certs.len(), 1, "exactly one leaf");
         assert_eq!(kc.ca_certs.len(), 1, "exactly one CA cert");
         assert!(kc.key.is_some());
@@ -1804,14 +1904,13 @@ mod tests {
     /// the loader has to fall through to the RustCrypto PBES2 path.
     #[test]
     #[cfg(feature = "pkcs12")]
+    #[ignore = "needs the openssl CLI (3.x, with the legacy provider); runs in --profile interop"]
     fn pkcs12_pbes2_openssl3_default_loads_leaf_and_key() {
         let pem = gen_self_signed("epics-pbes2-leaf");
-        let Some(p12) = make_p12_pbes2(&pem, None, "pbes2-pw") else {
-            return;
-        };
+        let p12 = make_p12_pbes2(&pem, None, "pbes2-pw");
         let (_dir, path) = write_temp(&p12);
 
-        let kc = load_keychain(&path, Some("pbes2-pw")).expect("load PBES2 p12");
+        let kc = load_keychain(&path, Some(OsStr::new("pbes2-pw"))).expect("load PBES2 p12");
         assert_eq!(kc.certs.len(), 1, "one leaf cert from PBES2 keychain");
         assert!(kc.key.is_some(), "PBES2-shrouded private key must decrypt");
         assert!(matches!(kc.key, Some(PrivateKeyDer::Pkcs8(_))));
@@ -1822,6 +1921,7 @@ mod tests {
     /// `ca_certs`, same split as the classic path.
     #[test]
     #[cfg(feature = "pkcs12")]
+    #[ignore = "needs the openssl CLI (3.x, with the legacy provider); runs in --profile interop"]
     fn pkcs12_pbes2_with_ca_chain_splits_leaf_from_ca() {
         let mut ca_params = rcgen::CertificateParams::new(vec![]).unwrap();
         ca_params
@@ -1843,12 +1943,10 @@ mod tests {
             cert: leaf_cert.pem(),
             key: leaf_key.serialize_pem(),
         };
-        let Some(p12) = make_p12_pbes2(&pem, Some(&ca_cert.pem()), "pw") else {
-            return;
-        };
+        let p12 = make_p12_pbes2(&pem, Some(&ca_cert.pem()), "pw");
         let (_dir, path) = write_temp(&p12);
 
-        let kc = load_keychain(&path, Some("pw")).expect("load PBES2 p12 w/ CA");
+        let kc = load_keychain(&path, Some(OsStr::new("pw"))).expect("load PBES2 p12 w/ CA");
         assert_eq!(kc.certs.len(), 1, "exactly one leaf");
         assert_eq!(kc.ca_certs.len(), 1, "exactly one CA cert");
         assert!(kc.key.is_some());
@@ -1860,14 +1958,13 @@ mod tests {
     /// any bag is decrypted.
     #[test]
     #[cfg(feature = "pkcs12")]
+    #[ignore = "needs the openssl CLI (3.x, with the legacy provider); runs in --profile interop"]
     fn pkcs12_pbes2_wrong_password_is_rejected() {
         let pem = gen_self_signed("epics-pbes2-leaf");
-        let Some(p12) = make_p12_pbes2(&pem, None, "right-pw") else {
-            return;
-        };
+        let p12 = make_p12_pbes2(&pem, None, "right-pw");
         let (_dir, path) = write_temp(&p12);
 
-        let err = load_keychain(&path, Some("wrong-pw")).unwrap_err();
+        let err = load_keychain(&path, Some(OsStr::new("wrong-pw"))).unwrap_err();
         match err {
             TlsConfigError::Pkcs12 { reason, .. } => {
                 assert!(reason.contains("MAC"), "got: {reason}");
@@ -1925,11 +2022,10 @@ mod tests {
     #[test]
     #[cfg(feature = "pkcs12")]
     #[serial(epics_env)]
+    #[ignore = "needs the openssl CLI (3.x, with the legacy provider); runs in --profile interop"]
     fn server_config_loads_from_pkcs12_env() {
         let pem = gen_self_signed("epics-pkcs12-server");
-        let Some(p12) = make_p12(&pem, None, "kc-pw") else {
-            return;
-        };
+        let p12 = make_p12(&pem, None, "kc-pw");
         let (_dir, path) = write_temp(&p12);
 
         // Drive the full env-var path: keychain + password env vars.
@@ -1959,11 +2055,10 @@ mod tests {
     #[test]
     #[cfg(feature = "pkcs12")]
     #[serial(epics_env)]
+    #[ignore = "needs the openssl CLI (3.x, with the legacy provider); runs in --profile interop"]
     fn server_default_requests_client_cert() {
         let pem = gen_self_signed("epics-pkcs12-server");
-        let Some(p12) = make_p12(&pem, None, "kc-pw") else {
-            return;
-        };
+        let p12 = make_p12(&pem, None, "kc-pw");
         let (_dir, path) = write_temp(&p12);
 
         // No client_cert option set → the pvxs `Default` mode.
@@ -1997,11 +2092,10 @@ mod tests {
     #[test]
     #[cfg(feature = "pkcs12")]
     #[serial(epics_env)]
+    #[ignore = "needs the openssl CLI (3.x, with the legacy provider); runs in --profile interop"]
     fn server_config_inline_keychain_password_splits_at_semicolon() {
         let pem = gen_self_signed("epics-pkcs12-server");
-        let Some(p12) = make_p12(&pem, None, "kc-pw") else {
-            return;
-        };
+        let p12 = make_p12(&pem, None, "kc-pw");
         let (_dir, path) = write_temp(&p12);
         let spec = format!("{};kc-pw", path.to_str().unwrap());
 
@@ -2029,11 +2123,10 @@ mod tests {
     #[test]
     #[cfg(feature = "pkcs12")]
     #[serial(epics_env)]
+    #[ignore = "needs the openssl CLI (3.x, with the legacy provider); runs in --profile interop"]
     fn server_config_inline_keychain_password_beats_env_fallback() {
         let pem = gen_self_signed("epics-pkcs12-server");
-        let Some(p12) = make_p12(&pem, None, "kc-pw") else {
-            return;
-        };
+        let p12 = make_p12(&pem, None, "kc-pw");
         let (_dir, path) = write_temp(&p12);
         let spec = format!("{};kc-pw", path.to_str().unwrap());
 
@@ -2055,11 +2148,10 @@ mod tests {
     #[test]
     #[cfg(feature = "pkcs12")]
     #[serial(epics_env)]
+    #[ignore = "needs the openssl CLI (3.x, with the legacy provider); runs in --profile interop"]
     fn server_config_pkcs12_wrong_password_env_errors() {
         let pem = gen_self_signed("epics-pkcs12-server");
-        let Some(p12) = make_p12(&pem, None, "kc-pw") else {
-            return;
-        };
+        let p12 = make_p12(&pem, None, "kc-pw");
         let (_dir, path) = write_temp(&p12);
 
         let _g = EnvGuard::set(&[
@@ -2085,11 +2177,10 @@ mod tests {
     #[test]
     #[cfg(feature = "pkcs12")]
     #[serial(epics_env)]
+    #[ignore = "needs the openssl CLI (3.x, with the legacy provider); runs in --profile interop"]
     fn server_honors_pvas_only_tls_options_require() {
         let pem = gen_self_signed("epics-pkcs12-server");
-        let Some(p12) = make_p12(&pem, None, "kc-pw") else {
-            return;
-        };
+        let p12 = make_p12(&pem, None, "kc-pw");
         let (_dir, path) = write_temp(&p12);
 
         let _g = EnvGuard::set(&[
@@ -2115,11 +2206,10 @@ mod tests {
     #[test]
     #[cfg(feature = "pkcs12")]
     #[serial(epics_env)]
+    #[ignore = "needs the openssl CLI (3.x, with the legacy provider); runs in --profile interop"]
     fn server_falls_back_to_shared_pva_keychain() {
         let pem = gen_self_signed("epics-pkcs12-server");
-        let Some(p12) = make_p12(&pem, None, "kc-pw") else {
-            return;
-        };
+        let p12 = make_p12(&pem, None, "kc-pw");
         let (_dir, path) = write_temp(&p12);
 
         let _g = EnvGuard::set(&[

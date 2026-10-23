@@ -1,0 +1,139 @@
+Terminator = CR LF;
+p { out "GET"; in "%d"; }
+q { out "SET %d"; }
+r { out "GET"; in "%d"; @init { out "I"; in "%d"; } }
+args { out "$1 $2"; }
+s { out "S"; in "%s"; }
+d { out "D"; in "%f"; }
+w { out "GET"; wait 100; in "%d"; }
+t { ReplyTimeout = 100; out "GET"; in "%d"; }
+c { connect 100; out "GET"; }
+i { in "V=%d"; }
+iw { wait 1000; in "V=%d"; }
+ri { in "V=%d"; @init { out "I"; in "%d"; wait 300; } }
+io { out "Q"; in "V=%d"; }
+sm { out "D%.1f"; in "%f"; }
+l { out "L"; in "%d"; }
+u { out "U"; in "%u"; }
+wl { out "W%d"; in "%f"; }
+wu { out "W%u"; in "%f"; }
+as { out "A"; in "%s"; }
+lr { out "W%d"; in "%d"; @init { out "I"; in "%d"; } }
+lw { out "W%d"; in "%d"; }
+lrv { out "W%d"; in "%d"; @init { out "I%d"; in "%d"; } }
+lu { out "W%u"; }
+lf { out "W%f"; }
+lst { out "W%s"; }
+lif { out "W%d"; @init { out "I"; in "%f"; } }
+liu { out "W%d"; @init { out "I"; in "%u"; } }
+bi { out "GET"; in "%#B.#"; }
+si { out "S"; in "%s"; @init { out "I"; in "%s"; } }
+ad { Separator = ","; out "A"; in "%f"; }
+al { Separator = ","; out "A"; in "%d"; }
+au { Separator = ","; out "A"; in "%u"; }
+ass { Separator = " "; out "A"; in "%s"; }
+rwd { Separator = ","; out "A"; in "%d"; out "W%f"; }
+rwl { Separator = ","; out "A"; in "%d"; out "W%d"; }
+rws { Separator = " "; out "A"; in "%s"; out "W%s"; }
+rwsd { Separator = " "; out "A"; in "%s"; out "W%f"; }
+rwls { Separator = ","; out "A"; in "%d"; out "W%s"; }
+rwe { Separator = ","; out "A"; in "%d"; out "W%{a|b}"; }
+aw { out "W%.2f"; }
+awl { out "W%d"; }
+awu { out "W%u"; }
+aoi { out "W%.2f"; @init { out "I%.2f"; in "%f"; } }
+aoil { out "W%d"; @init { out "I"; in "%d"; } }
+aoiu { out "W%u"; @init { out "I"; in "%u"; } }
+aorb { out "W%.2f"; in "%f"; }
+aorbl { out "W%d"; in "%d"; }
+aois { out "W%.2f"; @init { out "I"; in "%s"; } }
+aoii { in "V=%f"; }
+wfd { Separator = ","; out "A"; in "%f"; }
+wfl { Separator = ","; out "A"; in "%d"; }
+wfu { Separator = ","; out "A"; in "%u"; }
+wfs { Separator = " "; out "A"; in "%s"; }
+wfod { Separator = ","; out "%f"; }
+wfol { Separator = ","; out "%d"; }
+wfos { Separator = ","; out "%s"; }
+wfsx { out "A"; in "x%s"; }
+wfcs { out "A"; in "%!5s"; }
+aaod { Separator = ","; out "%f"; }
+aaol { Separator = ","; out "%d"; }
+aaos { Separator = ","; out "%s"; }
+aaoid { Separator = ","; out "W"; @init { out "A"; in "%f"; } }
+aaoil { Separator = ","; out "W"; @init { out "A"; in "%d"; } }
+aaois { Separator = " "; out "W"; @init { out "A"; in "%s"; } }
+aaorb { Separator = ","; out "%f"; in "%f"; }
+aaoisx { out "W"; @init { out "A"; in "x%s"; } }
+aaoiwd { Separator = ","; out "%f"; @init { out "A"; in "%d"; } }
+aaoslrb { Separator = ","; out "%s"; in "%d"; @init { out "A"; in "%d"; } }
+e { out "E"; in "%{a|b|c}"; }
+wd { out "W%d"; in "OK"; }
+wbu { out "W%u"; in "OK"; }
+we { out "W%{a|b}"; in "OK"; }
+ws { out "W%s"; in "OK"; }
+wf { out "W%f"; in "OK"; }
+cow { out "W%f"; }
+col { out "W%d"; }
+cou { out "W%u"; }
+cos { out "W%s"; }
+corb { out "W%f"; in "%f"; }
+coi { out "W%f"; @init { out "I"; in "%f"; } }
+coil { out "W%f"; @init { out "I"; in "%d"; } }
+coiu { out "W%f"; @init { out "I"; in "%u"; } }
+cois { out "W%f"; @init { out "I"; in "%s"; } }
+cowe { out "W%{a|b|c}"; }
+cowen { out "W%#{n=-1|a}"; }
+coie { out "W%f"; @init { out "I"; in "%{x|y|z}"; } }
+coien { out "W%f"; @init { out "I"; in "%#{n=-1|y}"; } }
+i64_wd { out "W%d"; in "%d"; }
+i64_wu { out "W%u"; in "%d"; }
+i64_wf { out "W%f"; in "%d"; }
+i64_e { out "E"; in "%{a|b|c}"; }
+i64_we { out "%{a|b|c}"; in "%d"; }
+i64_en { out "E"; in "%#{m=-1|z=0}"; }
+i64_wen { out "%#{m=-1|z=0}"; in "%d"; }
+i64o_ie { out "W%d"; @init { out "E"; in "%{a|b|c}"; } }
+i64o_ien { out "W%d"; @init { out "E"; in "%#{m=-1|z=0}"; } }
+i64o_we { out "%{a|b|c}"; }
+i64o_wen { out "%#{m=-1|z=0}"; }
+li_wd { out "W%d"; in "%d"; }
+li_wu { out "W%u"; in "%d"; }
+li_wf { out "W%f"; in "%d"; }
+li_e { out "E"; in "%{a|b|c}"; }
+li_we { out "%{a|b|c}"; in "%d"; }
+li_en { out "E"; in "%#{m=-1|z=0}"; }
+li_wen { out "%#{m=-1|z=0}"; in "%d"; }
+lo_ie { out "W%d"; @init { out "E"; in "%{a|b|c}"; } }
+lo_ien { out "W%d"; @init { out "E"; in "%#{m=-1|z=0}"; } }
+lo_we { out "%{a|b|c}"; }
+lo_wen { out "%#{m=-1|z=0}"; }
+lsix { out "S"; in "%s!"; }
+lsi5 { out "S"; in "%!5s"; @init { out "I"; in "%s"; } }
+lsi9 { out "S"; in "%!9s"; @init { out "I"; in "%s"; } }
+lsid { out "D"; in "%f"; @init { out "I"; in "%s"; } }
+lsiw { out "W%s"; in "OK"; @init { out "I"; in "%s"; } }
+lsif { out "W%f"; in "OK"; @init { out "I"; in "%s"; } }
+lsiwm { out "S"; in "%!9s"; @init { out "I"; in "%s"; } @mismatch { out "W%s"; } }
+mbbi_ws { out "W%s"; }
+vs { out "GET"; in "%d"; out "W%s"; }
+qu { out "SET %u"; }
+ld { out "W%d"; }
+lis { out "W%s"; @init { out "I"; in "%s"; } }
+sf { out "W%f"; }
+sd { out "W%d"; }
+su { out "W%u"; }
+ss { out "W%s"; }
+srf { out "R"; in "%f"; }
+srd { out "R"; in "%d"; }
+sru { out "R"; in "%u"; }
+srs { out "R"; in "%s"; }
+sre { out "R"; in "%{a|b|c}"; }
+sif { out "W%f"; @init { out "I"; in "%f"; } }
+sis { out "W%s"; @init { out "I"; in "%s"; } }
+six { out "S"; in "%s!"; }
+sic { out "S"; in "%5c"; }
+si_sis { out "S"; in "%[a-z]"; }
+siw { out "W%s"; in "OK"; }
+si_sif { out "W%f"; in "OK"; }
+si5 { out "S"; in "%!5s"; }

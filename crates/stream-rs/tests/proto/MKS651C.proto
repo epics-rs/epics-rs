@@ -1,0 +1,181 @@
+# MKS651C.proto
+
+# stream protocol file for MKS 651C valve system
+
+
+set_level
+{
+	out "S\$1%f";
+}
+
+get_value
+{
+	out "R\$1";
+	in  "S\$1%f";
+}
+
+set_type
+{
+	out "T\$1%d";
+}
+
+get_type_A
+{
+	out "R26";
+	in  "T1%d";
+}
+
+get_type_B
+{
+	out "R27";
+	in  "T2%d";
+}
+
+get_type_C
+{
+	out "R28";
+	in  "T3%d";
+}
+
+get_type_D
+{
+	out "R29";
+	in  "T4%d";
+}
+
+get_type_E
+{
+	out "R30";
+	in  "T5%d";
+}
+
+set_speed
+{
+	out "I\$1%f";
+}
+
+get_speed_A
+{
+	out "R15";
+	in "I1%f";
+}
+
+get_speed_B
+{
+	out "R16";
+	in "I2%f";
+}
+
+get_speed_C
+{
+	out "R17";
+	in "I3%f";
+}
+
+get_speed_D
+{
+	out "R18";
+	in "I4%f";
+}
+
+get_speed_E
+{
+	out "R19";
+	in "I5%f";
+}
+
+set_lead
+{
+	out "X\$1%f";
+}
+
+get_lead
+{
+	out "R4\$1";
+	in "X\$1%f";
+}
+
+set_gain
+{
+	out "M\$1%f";
+}
+
+get_gain_A
+{
+	out "R46";
+	in "M1%f";
+}
+
+get_gain_B
+{
+	out "R47";
+	in "M2%f";
+}
+
+get_gain_C
+{
+	out "R48";
+	in "M3%f";
+}
+
+get_gain_D
+{
+	out "R49";
+	in "M4%f";
+}
+
+get_gain_E
+{
+	out "R50";
+	in "M5%f";
+}
+
+select_setpoint
+{
+	out "D\$1";
+}
+
+get_pressure
+{
+	out "R5";
+	in  "P%f";
+}
+
+get_position
+{
+	out "R6";
+	in  "V%f";
+}
+
+get_value_E
+{
+	out "R10";
+	in  "S5%f";
+}
+
+open_valve
+{
+	out "O";
+}
+
+close_valve
+{
+	out "C";
+}
+
+halt_motion
+{
+	out "H";
+}
+
+get_error
+{
+	out "R52";
+	in  "CS%d";
+}
+
+get_status
+{
+	out "R37";
+	in  "M%*1i%*1i%1i";
+}

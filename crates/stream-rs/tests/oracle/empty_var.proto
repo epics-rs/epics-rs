@@ -1,0 +1,8 @@
+# compileNumber after an empty variable: its truncate cuts into the digits
+# before it (StreamBuffer::replace on a range before the buffer start).
+# The line C gives that error is read past the end of the arguments, so
+# the oracle masks it (mask_number_lines in tests/oracle.rs).
+x = ;
+w1 { wait 1$x; }
+w2 { wait 12$x; }
+w3 { wait 123$x; }

@@ -22,7 +22,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use epics_base_rs::error::CaResult;
-use epics_base_rs::server::database::{LinkDbfType, LinkMetadata, LinkPutOp, LinkSet, PvDatabase};
+use epics_base_rs::server::database::{
+    LinkDbfType, LinkMetadata, LinkPutOp, LinkRef, LinkSet, PvDatabase,
+};
 use epics_base_rs::server::record::{FieldDesc, ProcessOutcome, Record};
 use epics_base_rs::server::records::ai::AiRecord;
 use epics_base_rs::server::records::sseq::SseqRecord;
@@ -89,25 +91,25 @@ struct ExtLset {
 
 #[epics_base_rs::async_trait]
 impl LinkSet for ExtLset {
-    fn is_connected(&self, _name: &str) -> bool {
+    fn is_connected(&self, _name: LinkRef<'_>) -> bool {
         self.metadata.is_some()
     }
-    fn get_cached_value(&self, _name: &str) -> Option<EpicsValue> {
+    fn get_cached_value(&self, _name: LinkRef<'_>) -> Option<EpicsValue> {
         None
     }
-    async fn get_value(&self, name: &str) -> Option<EpicsValue> {
-        self.get_cached_value(name)
+    async fn get_value(&self, link: LinkRef<'_>) -> Option<EpicsValue> {
+        self.get_cached_value(link)
     }
     async fn put_value(
         &self,
-        _name: &str,
+        _name: LinkRef<'_>,
         value: EpicsValue,
         _op: LinkPutOp,
     ) -> Result<(), String> {
         *self.last_put.lock().unwrap() = Some(value);
         Ok(())
     }
-    fn link_metadata(&self, _name: &str) -> Option<LinkMetadata> {
+    fn link_metadata(&self, _name: LinkRef<'_>) -> Option<LinkMetadata> {
         self.metadata.clone()
     }
 }
@@ -143,6 +145,8 @@ async fn settle() {
 #[epics_macros_rs::epics_test]
 async fn numeric_source_string_destination_puts_the_prec_rendered_string() {
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     let last = Arc::new(Mutex::new(None));
     db.add_record("SRC_NUM", Box::new(AiRecord::new(1.23456789)))
         .await
@@ -181,6 +185,8 @@ async fn numeric_source_string_destination_puts_the_prec_rendered_string() {
 #[epics_macros_rs::epics_test]
 async fn string_source_numeric_destination_puts_atof_of_the_string() {
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     let last = Arc::new(Mutex::new(None));
     db.add_record("SRC_STR", Box::new(StringinRecord::new("")))
         .await
@@ -217,6 +223,8 @@ async fn string_source_numeric_destination_puts_atof_of_the_string() {
 #[epics_macros_rs::epics_test]
 async fn char_array_destination_puts_the_string_bytes() {
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     let last = Arc::new(Mutex::new(None));
     db.add_record("SRC_C", Box::new(AiRecord::new(7.0)))
         .await
@@ -256,6 +264,8 @@ async fn char_array_destination_puts_the_string_bytes() {
 #[epics_macros_rs::epics_test]
 async fn scalar_char_destination_puts_the_double() {
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     let last = Arc::new(Mutex::new(None));
     db.add_record("SRC_C1", Box::new(AiRecord::new(7.0)))
         .await
@@ -293,6 +303,8 @@ async fn scalar_char_destination_puts_the_double() {
 #[epics_macros_rs::epics_test]
 async fn unresolved_destination_is_not_written_at_all() {
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     let last_put = Arc::new(Mutex::new(None));
     db.register_link_set(
         "ca",
@@ -341,6 +353,8 @@ async fn unresolved_destination_is_not_written_at_all() {
 #[epics_macros_rs::epics_test]
 async fn resolved_external_string_destination_takes_the_string_view() {
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     let last_put = Arc::new(Mutex::new(None));
     db.register_link_set(
         "ca",
@@ -354,6 +368,7 @@ async fn resolved_external_string_destination_takes_the_string_view() {
         }),
     )
     .await;
+    db.process_cp_links_on_connect().await;
     db.add_record("SRC_E", Box::new(AiRecord::new(4.5)))
         .await
         .unwrap();

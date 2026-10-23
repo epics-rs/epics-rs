@@ -15,6 +15,9 @@ bytes = "1"
 hostname = "0.4"
 chrono = "0.4"
 parking_lot = "0.12"
+# The record's inline subscriber list (C `mlis`): two monitors without a heap
+# buffer.
+smallvec = "1.15"
 # Lock-free snapshot cells for the read-mostly database indices and the ACF
 # config cell. Readers take an `Arc` snapshot with no lock, so a low-priority
 # reader can never hold a high-priority scan thread off an index.
@@ -34,7 +37,7 @@ epics-libcom-rs = { workspace = true }
 # alternative was writing the status set out twice, once in each IOC binary,
 # which is how two copies of a naming rule come to disagree.
 epics-rtems-boot = { workspace = true }
-serde_json = { version = "1", features = ["preserve_order"] }
+serde_json = { workspace = true, features = ["preserve_order"] }
 
 # Host-only dependencies — gated out for the embedded targets (RTEMS's
 # armv7-rtems-eabihf, and the `*-wrs-vxworks*` triples).
@@ -47,8 +50,7 @@ serde_json = { version = "1", features = ["preserve_order"] }
 # covers non-interactive use, and embedded-target iocsh wiring is a later
 # increment.
 #
-# `socket2` + `if-addrs` back the async UDP net stack (`net::async_udp_v4` /
-# `net::iface_map`); the whole `net` module is gated out on `epics_embedded_target`
+# `socket2` backs the async UDP net stack (`net::async_udp_v4`); the whole `net` module is gated out on `epics_embedded_target`
 # (S1 raw-libc CA driver), so its deps go host-only too.
 #
 # tokio: the hosted build uses the full runtime; the embedded build drops the
@@ -66,7 +68,6 @@ serde_json = { version = "1", features = ["preserve_order"] }
 tokio = { version = "1", features = ["full"] }
 rustyline = "18"
 socket2 = { version = "0.5", features = ["all"] }
-if-addrs = "0.13"
 
 [target.'cfg(any(target_os = "rtems", target_os = "vxworks"))'.dependencies]
 tokio = { version = "1", default-features = false, features = [
@@ -94,6 +95,10 @@ tokio = { version = "1", default-features = false, features = [
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# `autosave::config_menu`'s directory listing, C's tr_dirent.h.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+
 # Dev-only — `path` (no `version`) so `cargo publish` strips this
 # from the uploaded manifest. Lets `epics-base-rs` publish first in
 # the dependency chain without `epics-ca-rs` already being on crates.io.
@@ -109,6 +114,7 @@ source-guard = { path = "../source-guard" }
 rtems-exec-gate = { path = "../../tools/rtems-exec-gate" }
 record-seam-gate = { path = "../../tools/record-seam-gate" }
 epics-ca-rs = { path = "../epics-ca-rs" }
+fact-budget = { path = "../fact-budget" }
 tempfile = "3"
 serial_test = "3"
 criterion = { version = "0.5", features = ["html_reports"] }
@@ -135,6 +141,9 @@ linux-rt = ["epics-libcom-rs/linux-rt"]
 # unconditionally. `client_server.rs` is gated on this feature, so it
 # only compiles when the 12-arg signature is in effect.
 ca-server-tls-test = ["epics-ca-rs/experimental-rust-tls", "epics-ca-rs/cap-tokens"]
+# Test-only: `server::database::fresh_hold_hook`, a closure run at each
+# fresh lock-set hold, for tests that must act between two holds.
+test-hooks = []
 
 [[bench]]
 name = "record_bench"

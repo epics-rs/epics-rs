@@ -22,25 +22,22 @@
 //! from PREC at all.
 
 mod module_records;
+mod seeded;
 
 use epics_base_rs::server::database::LinkBacking;
-use epics_base_rs::server::record::RecordInstance;
 use epics_base_rs::types::EpicsValue;
+use seeded::Seeded;
 
 /// `(units, precision)` for one field of a record carrying EGU="mm", PREC=3.
 fn served(rtype: &str, field: &str) -> (String, i16) {
-    served_with(rtype, field, |_| {})
+    served_with(rtype, field, None, |_| {})
 }
 
-/// The dispatch order the runtime uses: the record's own store first, the
-/// declared-override tail second. `sel`/`sub`/`dfanout` DECLARE EGU/PREC but
-/// model no storage for them, so only the second lands — and `resolve_field`,
-/// which the routing reads back through, spans both.
-fn put(inst: &mut RecordInstance, name: &str, value: EpicsValue) {
-    if inst.record.put_field(name, value.clone()).is_ok() {
-        return;
-    }
-    match inst.put_common_field(name, value) {
+/// The database put: `sel`/`sub`/`dfanout` DECLARE EGU/PREC but model no
+/// storage for them, so it lands in the declared-override tail — and
+/// `resolve_field`, which the routing reads back through, spans both.
+fn put(rec: &Seeded, name: &str, value: EpicsValue) {
+    match rec.put(name, value) {
         // A type that does not declare the field at all — `busy` has no EGU,
         // `sel` no FTVL. Seeding is best-effort; the assertions below say what
         // each type must then serve.
@@ -49,13 +46,28 @@ fn put(inst: &mut RecordInstance, name: &str, value: EpicsValue) {
     }
 }
 
-fn served_with(rtype: &str, field: &str, setup: impl FnOnce(&mut RecordInstance)) -> (String, i16) {
-    let rec = module_records::create_any(rtype).unwrap_or_else(|e| panic!("{rtype}: {e:?}"));
-    let mut inst = RecordInstance::new_boxed(format!("T:{rtype}"), rec);
-    put(&mut inst, "EGU", EpicsValue::String("mm".into()));
-    put(&mut inst, "PREC", EpicsValue::Short(3));
-    setup(&mut inst);
-    let d = inst
+/// `ftvl` is the `.db`'s `field(FTVL,...)`: SPC_NOMOD, so the record takes it
+/// at load or not at all.
+fn served_with(
+    rtype: &str,
+    field: &str,
+    ftvl: Option<i16>,
+    setup: impl FnOnce(&Seeded),
+) -> (String, i16) {
+    let mut rec = module_records::create_any(rtype).unwrap_or_else(|e| panic!("{rtype}: {e:?}"));
+    if let Some(ftvl) = ftvl {
+        match rec.load_field("FTVL", EpicsValue::Short(ftvl)) {
+            Ok(()) | Err(epics_base_rs::error::CaError::FieldNotFound(_)) => {}
+            Err(e) => panic!("{rtype}.FTVL: {e:?}"),
+        }
+    }
+    let rec = Seeded::new(format!("T:{rtype}"), rec);
+    put(&rec, "EGU", EpicsValue::String("mm".into()));
+    put(&rec, "PREC", EpicsValue::Short(3));
+    setup(&rec);
+    let d = rec
+        .cell()
+        .read()
         .snapshot_for_field_with(field, LinkBacking::none())
         .unwrap_or_else(|| panic!("{rtype}.{field}: no snapshot"))
         .display
@@ -68,11 +80,9 @@ fn served_with(rtype: &str, field: &str, setup: impl FnOnce(&mut RecordInstance)
 #[test]
 fn the_types_the_cache_missed_serve_their_own_egu_and_prec() {
     for rtype in ["subArray", "sel", "sub", "dfanout", "scalcout", "acalcout"] {
-        let got = served_with(rtype, "VAL", |inst| {
-            // subArray's VAL is only DBF_DOUBLE once FTVL says so; the others
-            // ignore the put.
-            put(inst, "FTVL", EpicsValue::Short(10));
-        });
+        // subArray's VAL is only DBF_DOUBLE once FTVL says so; the others
+        // declare no FTVL.
+        let got = served_with(rtype, "VAL", Some(10), |_| {});
         assert_eq!(
             got,
             ("mm".to_string(), 3),
@@ -135,28 +145,18 @@ fn calcs_link_backed_arguments_take_the_links_units_not_egu() {
 /// STRING nor ENUM (`subArrayRecord.c:208-212`).
 #[test]
 fn subarrays_val_units_follow_ftvl() {
-    let string_ftvl = served_with("subArray", "VAL", |inst| {
-        put(inst, "FTVL", EpicsValue::Short(0));
-    });
+    let string_ftvl = served_with("subArray", "VAL", Some(0), |_| {});
     assert_eq!(
         string_ftvl.0, "",
         "FTVL=STRING breaks out of C's VAL case before the strncpy"
     );
-    let double_ftvl = served_with("subArray", "VAL", |inst| {
-        put(inst, "FTVL", EpicsValue::Short(10));
-    });
+    let double_ftvl = served_with("subArray", "VAL", Some(10), |_| {});
     assert_eq!(
         double_ftvl.0, "mm",
         "FTVL=DOUBLE falls through to the strncpy"
     );
     // HOPR/LOPR take EGU whatever FTVL says — they are their own cases.
-    assert_eq!(
-        served_with("subArray", "HOPR", |inst| {
-            put(inst, "FTVL", EpicsValue::Short(0));
-        })
-        .0,
-        "mm"
-    );
+    assert_eq!(served_with("subArray", "HOPR", Some(0), |_| {}).0, "mm");
 }
 
 /// The precision seed is per type: `busy`'s switch never writes PREC, so its
@@ -180,7 +180,7 @@ fn a_type_whose_switch_never_seeds_from_prec_keeps_zero() {
 fn swait_serves_prec_on_every_field_but_odly() {
     // PREC = 5, so the ODLY literal cannot be mistaken for the seed.
     let with_prec5 = |field: &str| {
-        served_with("swait", field, |inst| {
+        served_with("swait", field, None, |inst| {
             put(inst, "PREC", EpicsValue::Short(5));
         })
     };

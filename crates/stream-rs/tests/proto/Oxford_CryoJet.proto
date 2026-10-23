@@ -1,0 +1,78 @@
+Terminator = CR;
+
+getSetpointTemp {
+	out "R0";
+	in "R%f";
+	@mismatch { in "?\?"; }
+}
+
+getSensorTemp {
+	out "R1";
+	in "R%f";
+	@mismatch { in "?\?"; }
+}
+
+getTempError {
+	out "R4";
+	in "R%f";
+	@mismatch { in "?\?"; }
+}
+
+getHeaterCurrent {
+	out "R5";
+	in "R%f";
+	@mismatch { in "?\?"; }
+}
+
+getHeaterVolts {
+	out "R6";
+	in "R%f";
+	@mismatch { in "?\?"; }
+}
+
+getSampleFlow {
+	out "R19";
+	in "R%f";
+	@mismatch { in "?\?"; }
+}
+
+getShieldFlow {
+	out "R18";
+	in "R%f";
+	@mismatch { in "?\?"; }
+}
+
+getLRMode {
+	out "X";
+	in "%*4cC%i%*7c";
+	@mismatch {in "";}
+}
+
+setLRmode {
+	out "C%d";
+	in "C"
+}
+
+setTemp {
+	out "T%3.1f";
+	in "T";
+}
+
+setSampleFlow {
+	out "K%2.1f";
+	in "K";
+}
+
+setShieldFlow {
+	out "J%2.1f";
+}
+
+setHeaterMode {
+  out "A%i";
+  in "A";
+}
+
+setHeaterVolts {
+  out "O%3.2f";
+  in "O";
+}

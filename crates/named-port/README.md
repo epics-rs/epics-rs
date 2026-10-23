@@ -67,8 +67,8 @@ Anything else the subject does is a failure and must reach the test as one.
 
 ## Consumers
 
-`epics-ca-rs` (`softioc_spawn_verdict`, `realtime_ca_ioc_boots`, and the shared
-`tests/common`) and `asyn-rs` (`ip_server_port_accepts`).
+`epics-ca-rs` (`softioc_spawn_verdict`, `realtime_ca_ioc_boots`), `c-ca-tools`
+and `asyn-rs` (`ip_server_port_accepts`).
 
 ## Testing
 

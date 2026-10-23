@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use crate::protocol::CA_REPEATER_PORT;
 use epics_base_rs::error::{CaError, CaResult};
+use epics_libcom_rs::cfmt::CFloat;
 
 /// Configuration for the CA server's UDP layer.
 #[derive(Debug, Clone)]
@@ -217,9 +218,17 @@ fn resolve_from_env() -> CaResult<CasUdpConfig> {
         // derive beacon broadcasts only from those interfaces.
         let bcast_iter: Vec<Ipv4Addr> = if !intf_specific.is_empty() {
             // Restrict to broadcasts of the listed interfaces.
+            // C `osiSockDiscoverBroadcastAddresses` answers a 127.0.0.1 match
+            // with 127.0.0.1 itself (`osdNetIfAddrs.c:42-54`).
             intf_specific
                 .iter()
-                .filter_map(|ip| broadcast_for_ip(*ip))
+                .filter_map(|ip| {
+                    if *ip == Ipv4Addr::LOCALHOST {
+                        Some(*ip)
+                    } else {
+                        broadcast_for_ip(*ip)
+                    }
+                })
                 .collect()
         } else {
             discover_broadcast_addrs()
@@ -236,24 +245,11 @@ fn resolve_from_env() -> CaResult<CasUdpConfig> {
     }
     // C `caservertask.c:439` — outside the `if (autobeaconlist)`, so the user's
     // own list is deduped and reported even when auto-discovery is off.
-    let mut beacon_addrs = crate::iocinf::remove_duplicate_addresses(beacon_addrs, |a| *a);
-    if auto_on {
-        if beacon_addrs.is_empty() {
-            // Last-resort fallback: limited broadcast.  C `rsrv_init`
-            // does not add this — it warns and leaves the list empty
-            // — but we keep the limited-broadcast fallback for the
-            // common single-NIC dev/test case where `getifaddrs`
-            // discovery may return no usable bcast. With AUTO=YES this
-            // matches the operator's intent.
-            beacon_addrs.push(SocketAddr::V4(SocketAddrV4::new(
-                Ipv4Addr::BROADCAST,
-                beacon_port,
-            )));
-        }
-    } else if beacon_addrs.is_empty() {
-        // C prints a warning to stderr.  Surface the same diagnostic
-        // so a misconfigured operator sees why no beacons go out.
-        eprintln!("Warning: RSRV has empty beacon address list");
+    let beacon_addrs = crate::iocinf::remove_duplicate_addresses(beacon_addrs, |a| *a);
+    // C `caservertask.c:441-442`, whatever `autobeaconlist` was: an empty
+    // list stays empty, and beacons go nowhere.
+    if beacon_addrs.is_empty() {
+        epics_libcom_rs::stderr_println!("Warning: RSRV has empty beacon address list");
     }
     cfg.beacon_addrs = beacon_addrs;
 
@@ -309,10 +305,12 @@ fn resolve_from_env() -> CaResult<CasUdpConfig> {
         // EPICS_CAS_BEACON_PERIOD in both lines even when the value it
         // fetched came from the deprecated var, so this does too.
         _ => {
-            eprintln!("EPICS \"EPICS_CAS_BEACON_PERIOD\" float fetch failed");
-            eprintln!(
+            epics_libcom_rs::stderr_println!(
+                "EPICS \"EPICS_CAS_BEACON_PERIOD\" float fetch failed"
+            );
+            epics_libcom_rs::stderr_println!(
                 "Setting \"EPICS_CAS_BEACON_PERIOD\" = {:.6}",
-                default_beacon_period_secs()
+                CFloat(default_beacon_period_secs())
             );
         }
     }
@@ -372,22 +370,6 @@ fn parse_ipv4_list(list: &str, env_name: &str, default_port: u16) -> Vec<Ipv4Add
 /// (`osdNetIfAddrs.c:143`) instead of nothing.
 pub fn discover_broadcast_addrs() -> Vec<Ipv4Addr> {
     epics_base_rs::net::iface_v4::broadcast_addrs()
-}
-
-/// C `osiLocalAddr` (libcom `osi/osdNetIfAddrs.c:167-215`, `osiLocalAddrOnce`):
-/// the address of the FIRST interface that is up (`IFF_UP`), `AF_INET`, and
-/// NOT loopback (`IFF_LOOPBACK`). When only loopback exists — or interface
-/// enumeration fails — C falls back to `INADDR_LOOPBACK`, and so do we.
-///
-/// C computes this once per process behind `epicsThreadOnce` and hands out the
-/// cached result; the `OnceLock` mirrors that (an interface list that changes
-/// under a running client is not re-read by C either).
-///
-/// The `IFF_UP` caveat this used to carry is gone: the enumeration behind it
-/// now reports the flag, so a down interface is skipped here as it is in C.
-pub fn osi_local_addr() -> Ipv4Addr {
-    static CACHED: std::sync::OnceLock<Ipv4Addr> = std::sync::OnceLock::new();
-    *CACHED.get_or_init(epics_base_rs::net::iface_v4::local_addr)
 }
 
 /// Return the IPv4 broadcast address of the up, non-loopback interface
@@ -672,6 +654,50 @@ mod tests {
             match saved_auto {
                 Some(v) => std::env::set_var("EPICS_CAS_AUTO_BEACON_ADDR_LIST", v),
                 None => std::env::remove_var("EPICS_CAS_AUTO_BEACON_ADDR_LIST"),
+            }
+        }
+    }
+
+    /// The beacon list C builds from a specific interface list with
+    /// auto-discovery on, and nothing more: a 127.0.0.1 entry beacons to
+    /// itself (`osdNetIfAddrs.c:42-54`), an address that is no interface adds
+    /// nothing, and an empty result stays empty (`caservertask.c:441-442`).
+    /// The port used to add 255.255.255.255 to an empty list.
+    #[test]
+    #[serial_test::serial]
+    fn a_specific_interface_list_beacons_as_c_and_never_to_the_limited_broadcast() {
+        let names = [
+            "EPICS_CAS_INTF_ADDR_LIST",
+            "EPICS_CAS_BEACON_ADDR_LIST",
+            "EPICS_CAS_AUTO_BEACON_ADDR_LIST",
+        ];
+        let saved: Vec<_> = names.iter().map(|n| std::env::var(n).ok()).collect();
+        let beacons = |intf: &str| {
+            // SAFETY: serial_test::serial.
+            unsafe {
+                std::env::set_var("EPICS_CAS_INTF_ADDR_LIST", intf);
+                std::env::remove_var("EPICS_CAS_BEACON_ADDR_LIST");
+                std::env::remove_var("EPICS_CAS_AUTO_BEACON_ADDR_LIST");
+            }
+            resolve_from_env()
+                .expect("resolve_from_env in test")
+                .beacon_addrs
+                .iter()
+                .map(|a| a.ip())
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(beacons("127.0.0.1"), [Ipv4Addr::LOCALHOST]);
+        // TEST-NET-1: never an interface of this host.
+        assert_eq!(beacons("192.0.2.1"), Vec::<std::net::IpAddr>::new());
+
+        // SAFETY: same scoping as above.
+        unsafe {
+            for (n, v) in names.iter().zip(saved) {
+                match v {
+                    Some(v) => std::env::set_var(n, v),
+                    None => std::env::remove_var(n),
+                }
             }
         }
     }

@@ -1,10 +1,16 @@
 use std::time::Instant;
 
-use epics_base_rs::error::CaResult;
+use epics_base_rs::error::{CaResult, DbStatus};
 use epics_base_rs::server::device_support::{DeviceReadOutcome, DeviceSupport, DeviceUdf};
 use epics_base_rs::server::record::Record;
 
 use crate::records::epid::EpidRecord;
+
+/// `do_pid`'s `return(1)` for a pass inside MDT (`devEpidSoft.c:125`).
+const SUB_MDT: DbStatus = match DbStatus::new(1) {
+    Some(s) => s,
+    None => unreachable!(),
+};
 
 /// Soft Channel device support for the epid record.
 ///
@@ -43,6 +49,7 @@ impl EpidSoftDeviceSupport {
         // before that line. `epid.set_outl_write(...)` at the success
         // path re-enables it per `fbon`.
         epid.set_outl_write(false);
+        epid.pid_status = Ok(());
         // C `devEpidSoft.c:110-112`:
         //   if (pepid->inp.type == CONSTANT) { /* nothing to control */
         //       if (recGblSetSevr(pepid,SOFT_ALARM,INVALID_ALARM)) return(0);
@@ -77,6 +84,7 @@ impl EpidSoftDeviceSupport {
 
         // Skip if delta time is less than minimum
         if dt < epid.mdt {
+            epid.pid_status = Err(SUB_MDT);
             return;
         }
 

@@ -13,47 +13,25 @@ pub enum AutosaveError {
         path: String,
         message: String,
     },
+    /// C `readReqFile` could not open the top-level request file, and has
+    /// said so on the console.
+    ReqFileUnopened(String),
     IncludeCycle {
         chain: Vec<String>,
     },
     IncludeDepthExceeded(usize),
-    UndefinedMacro {
-        key: String,
-        source: String,
-        line: usize,
-    },
-    /// A macro whose value resolves back into itself. Distinct from
-    /// [`Self::UndefinedMacro`] because the two faults have different
-    /// causes and different fixes: one name is missing from the
-    /// substitution set, the other is defined in terms of itself.
-    RecursiveMacro {
-        key: String,
-        source: String,
-        line: usize,
-    },
-    /// A `$(`/`${` whose closing delimiter never arrived. Distinct from
-    /// the two above because macLib names no macro for it — it copies
-    /// the reference and the whole rest of the line through verbatim
-    /// (`macCore.c:862-875`) — so what a `.req` author is shown is the
-    /// text that was passed through, not a key to go and define.
-    UnterminatedMacro {
-        reference: String,
-        source: String,
-        line: usize,
-    },
     CorruptSaveFile {
         path: String,
         message: String,
     },
-    /// The set's member list came out empty. Refused rather than carried,
-    /// because a set with no members still rotates and rewrites the files
-    /// holding the values it was configured to protect.
-    EmptySaveSet {
-        name: String,
-        reason: String,
-    },
     PvNotFound(String),
     Ca(CaError),
+    /// C `create_data_set` refusing a method the request file's list
+    /// already has: `bit` is that method's `save_method` bit.
+    AlreadyInMode {
+        request_file: String,
+        bit: u32,
+    },
 }
 
 impl fmt::Display for AutosaveError {
@@ -63,36 +41,23 @@ impl fmt::Display for AutosaveError {
             Self::RequestFile { path, message } => {
                 write!(f, "request file error in '{path}': {message}")
             }
+            Self::ReqFileUnopened(file) => write!(f, "{file}: Can't open .req file"),
             Self::IncludeCycle { chain } => {
                 write!(f, "include cycle detected: {}", chain.join(" -> "))
             }
             Self::IncludeDepthExceeded(depth) => {
                 write!(f, "include depth exceeded maximum of {depth}")
             }
-            Self::UndefinedMacro { key, source, line } => {
-                write!(f, "undefined macro '{key}' in {source} at line {line}")
-            }
-            Self::RecursiveMacro { key, source, line } => {
-                write!(f, "recursive macro '{key}' in {source} at line {line}")
-            }
-            Self::UnterminatedMacro {
-                reference,
-                source,
-                line,
-            } => {
-                write!(
-                    f,
-                    "unterminated macro reference '{reference}' in {source} at line {line}"
-                )
-            }
             Self::CorruptSaveFile { path, message } => {
                 write!(f, "corrupt save file '{path}': {message}")
             }
-            Self::EmptySaveSet { name, reason } => {
-                write!(f, "save set '{name}' has no PVs to save: {reason}")
-            }
             Self::PvNotFound(name) => write!(f, "PV not found: {name}"),
             Self::Ca(e) => write!(f, "CA error: {e}"),
+            // ERRLOG's "%s:%s " prefix with C's __FILE__ (save_restore.c:2373).
+            Self::AlreadyInMode { request_file, bit } => write!(
+                f,
+                "../save_restore.c:create_data_set '{request_file}' already in {bit:x} mode"
+            ),
         }
     }
 }

@@ -111,6 +111,9 @@ impl FramePool {
 /// reusing), and no way to keep the buffer past the drop.
 pub(crate) struct PooledFrame {
     buf: Vec<u8>,
+    /// Where the frame starts in `buf`: a sealed frame's header ends at the
+    /// reservation, so a short header starts past its unused front.
+    start: usize,
     home: Option<Arc<FramePool>>,
 }
 
@@ -119,7 +122,7 @@ impl std::fmt::Debug for PooledFrame {
     /// waveform and an assertion message that dumps it is unreadable.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PooledFrame")
-            .field("len", &self.buf.len())
+            .field("len", &self.len())
             .field("pooled", &self.home.is_some())
             .finish()
     }
@@ -129,7 +132,7 @@ impl std::ops::Deref for PooledFrame {
     type Target = [u8];
 
     fn deref(&self) -> &[u8] {
-        &self.buf
+        &self.buf[self.start..]
     }
 }
 
@@ -139,7 +142,11 @@ impl From<Vec<u8>> for PooledFrame {
     /// would evict the high-water payload buffer the pool exists to keep, so
     /// they carry no home and free normally.
     fn from(buf: Vec<u8>) -> Self {
-        Self { buf, home: None }
+        Self {
+            buf,
+            start: 0,
+            home: None,
+        }
     }
 }
 
@@ -153,8 +160,16 @@ impl Drop for PooledFrame {
 
 /// A CA frame under construction: the header prefix is reserved, the payload
 /// is appended after it.
+///
+/// Either a pooled buffer of its own ([`acquire`](Self::acquire) →
+/// [`seal`](Self::seal)), or the tail of a send buffer the frame is built
+/// straight into ([`over`](Self::over) → [`seal_in_place`](Self::seal_in_place)).
 pub(crate) struct FrameBuf {
     buf: Vec<u8>,
+    /// Where the frame's reservation starts in `buf`.
+    base: usize,
+    /// Where its payload starts: `base` plus the header room reserved.
+    payload_at: usize,
     home: Option<Arc<FramePool>>,
 }
 
@@ -170,7 +185,24 @@ impl FrameBuf {
         buf.resize(HDR_RESERVE, 0);
         Self {
             buf,
+            base: 0,
+            payload_at: HDR_RESERVE,
             home: Some(pool.clone()),
+        }
+    }
+
+    /// Build a frame at the end of `buf`, C `cas_copy_in_header` reserving
+    /// `hdr_len` bytes in the client's send buffer: [`header_len`] for the
+    /// reply, which decides it from the payload size before the payload is
+    /// written, as C does.
+    pub(crate) fn over(mut buf: Vec<u8>, hdr_len: usize) -> Self {
+        let base = buf.len();
+        buf.resize(base + hdr_len, 0);
+        Self {
+            buf,
+            base,
+            payload_at: base + hdr_len,
+            home: None,
         }
     }
 
@@ -189,27 +221,27 @@ impl FrameBuf {
 
     /// Bytes of payload written so far.
     pub(crate) fn payload_len(&self) -> usize {
-        self.buf.len() - HDR_RESERVE
+        self.buf.len() - self.payload_at
     }
 
     /// Read-only view of the payload written so far — for callers that must
     /// inspect the encoded bytes (C `read_action`'s `epicsStrnLen` scan of a
     /// scalar DBR_STRING slot, `camessage.c:666-679`).
     pub(crate) fn payload(&self) -> &[u8] {
-        &self.buf[HDR_RESERVE..]
+        &self.buf[self.payload_at..]
     }
 
     /// Truncate the payload to `len` bytes (C `read_reply` framing a reply at
     /// the request count when the value decoded wider).
     pub(crate) fn truncate_payload(&mut self, len: usize) {
-        self.buf.truncate(HDR_RESERVE + len);
+        self.buf.truncate(self.payload_at + len);
     }
 
     /// Zero-extend the payload to `len` bytes (C `read_reply` zero-filling up
     /// to `dbr_size_n(type, request_count)`).
     pub(crate) fn zero_extend_payload(&mut self, len: usize) {
         if self.payload_len() < len {
-            self.buf.resize(HDR_RESERVE + len, 0);
+            self.buf.resize(self.payload_at + len, 0);
         }
     }
 
@@ -220,26 +252,46 @@ impl FrameBuf {
         self.zero_extend_payload(padded);
     }
 
-    /// Write `hdr` into the reserved prefix and return the finished frame.
-    ///
-    /// A non-extended (16-byte) header leaves 8 reserved bytes unused, so the
-    /// payload shifts down by 8. That shift is bounded by the protocol itself:
-    /// `CaHeader::set_payload_size` selects the extended header for any
-    /// payload `>= 0xFFFF`, so a frame that shifts always carries under 64 KiB
-    /// — and the large-array frames this module exists for fill the
-    /// reservation exactly and never move a byte.
+    /// Write `hdr` into the reserved prefix, ending where the payload starts,
+    /// and return the finished frame. No byte of the payload moves: a 16-byte
+    /// header leaves the reservation's first 8 bytes outside the frame.
     pub(crate) fn seal(mut self, hdr: &CaHeader) -> PooledFrame {
+        debug_assert_eq!(self.payload_at, HDR_RESERVE, "an acquired frame");
         let hdr_bytes = hdr.to_bytes_extended();
-        debug_assert!(hdr_bytes.len() <= HDR_RESERVE);
         let start = HDR_RESERVE - hdr_bytes.len();
         self.buf[start..HDR_RESERVE].copy_from_slice(&hdr_bytes);
-        if start > 0 {
-            self.buf.drain(..start);
-        }
         PooledFrame {
             buf: self.buf,
+            start,
             home: self.home,
         }
+    }
+
+    /// Write `hdr` at the frame's start and hand back the buffer it was built
+    /// at the end of. A header other than the one reserved moves the payload
+    /// to meet it: correct, but only a reply whose size [`header_len`] did not
+    /// predict pays that.
+    pub(crate) fn seal_in_place(mut self, hdr: &CaHeader) -> Vec<u8> {
+        let hdr_bytes = hdr.to_bytes_extended();
+        let at = self.base + hdr_bytes.len();
+        if at < self.payload_at {
+            self.buf.drain(at..self.payload_at);
+        } else if at > self.payload_at {
+            let grow = at - self.payload_at;
+            self.buf.splice(
+                self.payload_at..self.payload_at,
+                std::iter::repeat_n(0, grow),
+            );
+        }
+        self.buf[self.base..at].copy_from_slice(&hdr_bytes);
+        self.buf
+    }
+
+    /// Drop the frame, leaving the buffer it was built at the end of as it
+    /// was.
+    pub(crate) fn abandon(mut self) -> Vec<u8> {
+        self.buf.truncate(self.base);
+        self.buf
     }
 }
 
@@ -275,11 +327,9 @@ pub(crate) fn size_dbr_reply(
     actual_count: u32,
     requested_count: u32,
 ) -> u32 {
-    if data_type == epics_base_rs::types::DBR_CLASS_NAME {
-        return 1;
-    }
-    if requested_count == 0 {
-        return actual_count;
+    let count = reply_count(data_type, actual_count, requested_count);
+    if data_type == epics_base_rs::types::DBR_CLASS_NAME || requested_count == 0 {
+        return count;
     }
     if let Ok(native) = epics_base_rs::types::native_type_for_dbr(data_type) {
         // Plain types (0-6) have no metadata; STS / TIME / GR / CTRL slot
@@ -294,6 +344,49 @@ pub(crate) fn size_dbr_reply(
         }
     }
     requested_count
+}
+
+/// The element count [`size_dbr_reply`] frames a reply at, known before the
+/// payload is written.
+pub(crate) fn reply_count(data_type: u16, actual_count: u32, requested_count: u32) -> u32 {
+    if data_type == epics_base_rs::types::DBR_CLASS_NAME {
+        1
+    } else if requested_count == 0 {
+        actual_count
+    } else {
+        requested_count
+    }
+}
+
+/// C `cas_copy_in_header`'s refusal (`caserverio.c:262-270`) of a reply
+/// header for `count` elements of `data_type`: whether a client of
+/// `client_minor` cannot be sent it.
+pub(crate) fn header_refused(data_type: u16, count: u32, client_minor: u16) -> bool {
+    CaHeader::new(0)
+        .set_payload_size(payload_size(data_type, count), count, client_minor)
+        .is_err()
+}
+
+/// C `dbr_size_n(type, count)`, padded as it goes on the wire: what
+/// `cas_copy_in_header` is asked to reserve for a reply.
+pub(crate) fn payload_size(data_type: u16, count: u32) -> usize {
+    align8(
+        epics_base_rs::types::native_type_for_dbr(data_type).map_or(0, |native| {
+            epics_base_rs::types::dbr_buffer_size(data_type, native, count as usize)
+        }),
+    )
+}
+
+/// The header a reply of `count` elements and [`payload_size`] `payload`
+/// takes, decided before its payload is written as `cas_copy_in_header`
+/// does: the extended form when the payload or the count does not fit 16
+/// bits.
+pub(crate) fn header_len(payload: usize, count: u32) -> usize {
+    if payload >= 0xFFFF || count >= 0xFFFF {
+        HDR_RESERVE
+    } else {
+        16
+    }
 }
 
 #[cfg(test)]
@@ -341,14 +434,88 @@ mod tests {
 
         let second = FrameBuf::acquire(&pool, 0);
         assert_eq!(resident(&pool), None, "the second delivery took it");
-        // `seal` may shift the payload down by 8 when the header is not
-        // extended, so compare against the buffer's own start, not the sealed
-        // frame's: the allocation is what must be identical.
+        // A 16-byte header starts 8 bytes into the allocation, so compare
+        // against the buffer's own start, not the sealed frame's.
         assert_eq!(
             second.buf.as_ptr() as usize,
             back.0,
             "the second delivery must reuse the first's allocation, not allocate"
         );
+    }
+
+    /// The header is written in front of the payload where it lies: sealing
+    /// moves no payload byte, whichever header size the count selects.
+    #[test]
+    fn seal_never_moves_the_payload() {
+        let pool = pool();
+        for n in [8usize, 0x1_0000] {
+            let mut f = FrameBuf::acquire(&pool, n);
+            f.dst().extend(std::iter::repeat_n(0x5Au8, n));
+            let payload = f.payload().as_ptr() as usize;
+            let mut hdr = CaHeader::new(CA_PROTO_EVENT_ADD);
+            hdr.set_payload_size(n, 1, 13).unwrap();
+            let hlen = hdr.to_bytes_extended().len();
+            let sealed = f.seal(&hdr);
+            assert_eq!(sealed.len(), hlen + n);
+            assert_eq!(
+                sealed[hlen..].as_ptr() as usize,
+                payload,
+                "payload of {n} moved"
+            );
+            assert_eq!(&sealed[..hlen], &hdr.to_bytes_extended()[..]);
+        }
+    }
+
+    /// A frame built at the end of a send buffer: the bytes before it are
+    /// untouched and the frame is what `seal` would have made, whichever
+    /// header was reserved — the predicted one leaves the payload in place.
+    #[test]
+    fn a_frame_built_in_place_matches_the_pooled_one() {
+        for (n, reserved) in [(8usize, 16usize), (8, 24), (0x1_0000, 24), (0x1_0000, 16)] {
+            let mut hdr = CaHeader::new(CA_PROTO_EVENT_ADD);
+            hdr.set_payload_size(n, 1, 13).unwrap();
+            let mut pooled = FrameBuf::acquire(&pool(), n);
+            pooled.dst().extend((0..n).map(|i| i as u8));
+            let want = pooled.seal(&hdr).to_vec();
+
+            let mut buf = Vec::with_capacity(4 + 24 + n);
+            buf.extend_from_slice(b"prev");
+            let mut f = FrameBuf::over(buf, reserved);
+            f.dst().extend((0..n).map(|i| i as u8));
+            let payload = f.payload().as_ptr() as usize;
+            let buf = f.seal_in_place(&hdr);
+            assert_eq!(&buf[..4], b"prev");
+            assert_eq!(&buf[4..], &want[..], "{n} bytes, {reserved} reserved");
+            if reserved == want.len() - n {
+                assert_eq!(buf[4 + reserved..].as_ptr() as usize, payload, "moved");
+            }
+        }
+    }
+
+    #[test]
+    fn an_abandoned_frame_leaves_the_buffer_as_it_was() {
+        let mut f = FrameBuf::over(b"prev".to_vec(), 16);
+        f.dst().extend([1u8; 40]);
+        assert_eq!(f.abandon(), b"prev");
+    }
+
+    /// `header_len` is the header `set_payload_size` picks for the size
+    /// `payload_size` reserves.
+    #[test]
+    fn header_len_predicts_the_header_set_payload_size_picks() {
+        use epics_base_rs::types::{DBR_DOUBLE, DBR_TIME_DOUBLE};
+        for t in [DBR_DOUBLE, DBR_TIME_DOUBLE] {
+            for count in [1u32, 8190, 8191, 8192, 0xFFFE, 0xFFFF] {
+                let mut hdr = CaHeader::new(CA_PROTO_EVENT_ADD);
+                hdr.set_payload_size(payload_size(t, count), count, 13)
+                    .unwrap();
+                assert_eq!(
+                    header_len(payload_size(t, count), count),
+                    hdr.to_bytes_extended().len(),
+                    "type {t} count {count}"
+                );
+            }
+        }
     }
 
     /// A control frame handed to the outbox as a plain `Vec` has no home, so it
@@ -374,8 +541,8 @@ mod tests {
         );
     }
 
-    /// Two producers at once — the async driver runs one monitor task per
-    /// subscription — and only one buffer. The second must allocate rather than
+    /// Two producers at once — the async driver's dispatch loop and its event
+    /// task — and only one buffer. The second must allocate rather than
     /// wait, and the slot must not end up holding the smaller of the two.
     #[test]
     fn a_second_concurrent_producer_allocates_and_the_slot_keeps_the_larger() {

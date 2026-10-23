@@ -1,0 +1,6 @@
+# Runtime cases C cannot run (asyn's IP port has no events), in the
+# cases.txt layout. Their logs are written from C's format strings in
+# StreamCore.cc, not generated; run-rt.sh does not read this file.
+event_ok	longout	0	-	events
+event_timeout	longout	0	-	events
+event_unexpected	longout	0	-	events

@@ -11,7 +11,7 @@ const D2R: f64 = PI / 180.0;
 /// 0, `MIN_CHI_PHIm90` 1, `PHI_CONST` 2. The variants were previously
 /// numbered with `PHI_CONST` and `MIN_CHI_PHIm90` swapped; the values are
 /// never cast, but they are corrected here so the repr is a faithful mirror
-/// of the wire menu (see `constraint_from_mode`).
+/// of the wire menu (see `HKL_to_angles` in `snl::orient`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Constraint {
     /// TH = TTH/2 (omega = 0). C `OMEGA_ZERO`.
@@ -70,7 +70,7 @@ pub fn angles_to_hkl(angles_deg: &[f64; 4], omtx_inv: &Mat3, a0_inv: &Mat3) -> O
 /// Calculate diffraction angles (in degrees) from HKL.
 ///
 /// For `PhiConst`, `angles_deg[PHI]` is used as the supplied phi value.
-/// Returns `None` on math errors (NaN results).
+/// Writes all four angles, and returns `None` when any of them is NaN.
 pub fn hkl_to_angles(
     hkl: &Vec3,
     a0: &Mat3,
@@ -121,11 +121,14 @@ pub fn hkl_to_angles(
 
     for i in 0..4 {
         angles_deg[i] = angles[i] / D2R;
-        if angles_deg[i].is_nan() {
-            return None;
-        }
     }
-    Some(())
+    // C's `errno ||` adds no case: each domain error its libm calls can
+    // raise here also leaves a NaN.
+    if angles_deg.iter().any(|a| a.is_nan()) {
+        None
+    } else {
+        Some(())
+    }
 }
 
 /// Calculate A0 matrix from lattice parameters and wavelength.
@@ -216,24 +219,26 @@ pub fn calc_omtx(
 /// Check orientation matrix consistency.
 ///
 /// Returns error in degrees between expected and calculated directions
-/// for the second reflection.
+/// for the second reflection: NaN where C's zero vectors divide by a zero
+/// norm (orient.c:289-312).
 pub fn check_omtx(
     v2_hkl: &Vec3,
     v2_angles: &[f64; 4],
     a0: &Mat3,
     a0_inv: &Mat3,
     o_inv: &Mat3,
-) -> Option<f64> {
+) -> f64 {
     let v2p = mult_mat_vec(a0, v2_hkl);
     let norm = dot(&v2p, &v2p).sqrt();
     let v2p: Vec3 = [v2p[0] / norm, v2p[1] / norm, v2p[2] / norm];
 
-    let v2pp_hkl = angles_to_hkl(v2_angles, o_inv, a0_inv)?;
+    // angles_to_HKL leaves zeros when it fails.
+    let v2pp_hkl = angles_to_hkl(v2_angles, o_inv, a0_inv).unwrap_or([0.0; 3]);
     let v2pp = mult_mat_vec(a0, &v2pp_hkl);
     let norm = dot(&v2pp, &v2pp).sqrt();
     let v2pp: Vec3 = [v2pp[0] / norm, v2pp[1] / norm, v2pp[2] / norm];
 
-    Some(dot(&v2p, &v2pp).acos() / D2R)
+    dot(&v2p, &v2pp).acos() / D2R
 }
 
 #[cfg(test)]
@@ -514,7 +519,7 @@ mod tests {
             calc_omtx(&v1_hkl, &v1_angles, &v2_hkl, &v2_angles, &a0, &a0_inv).unwrap();
 
         // Check OMTX consistency
-        let err = check_omtx(&v2_hkl, &v2_angles, &a0, &a0_inv, &omtx_inv).unwrap();
+        let err = check_omtx(&v2_hkl, &v2_angles, &a0, &a0_inv, &omtx_inv);
         assert!(err < 0.1, "OMTX check error: {err} degrees");
 
         // Use OMTX to convert (1,2,3) and verify round-trip
@@ -530,5 +535,29 @@ mod tests {
                 hkl_back[i]
             );
         }
+    }
+
+    /// a=0 makes A0 NaN, which invertArray's `fabs(det) > SMALL` refuses
+    /// (C calc_A0 returns -1).
+    #[test]
+    fn a_zero_a_fails_calc_a0() {
+        assert!(calc_a0(0.0, 5.431, 5.431, 90.0, 90.0, 90.0, 0.5725).is_none());
+    }
+
+    /// |HKL| = 2 puts asin out of its domain, so TTH and TH are NaN; C
+    /// writes CHI and PHI all the same (orient.c:127-130).
+    #[test]
+    fn a_nan_angle_still_writes_all_four() {
+        let mut angles = [0.0, 0.0, 0.0, 77.0];
+        let r = hkl_to_angles(
+            &[2.0, 0.0, 0.0],
+            &IDENTITY,
+            &IDENTITY,
+            &mut angles,
+            Constraint::OmegaZero,
+        );
+        assert!(r.is_none());
+        assert!(angles[TTH].is_nan() && angles[TH].is_nan());
+        assert_eq!([angles[CHI], angles[PHI]], [0.0, 0.0]);
     }
 }

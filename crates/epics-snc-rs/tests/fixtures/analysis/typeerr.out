@@ -1,0 +1,3 @@
+$ snc typeerr.st
+$ snc +W typeerr.st
+$ snc -w typeerr.st

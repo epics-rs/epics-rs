@@ -1,0 +1,2 @@
+_main_ Can't find readable file 'no_such_file.proto' in 'tests/oracle:tests/none;tests/proto'
+_main_ while reading protocol 'p' for 'rec0'

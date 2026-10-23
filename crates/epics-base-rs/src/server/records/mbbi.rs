@@ -1,4 +1,5 @@
 use crate::error::{CaError, CaResult};
+use crate::server::record::{CycleCell, CycleRead, CycleValue};
 use crate::server::record::{MENU_SIMM, ProcessOutcome, RawSoftEntry, Record};
 use crate::types::{EpicsValue, PvString};
 
@@ -73,8 +74,8 @@ pub struct MbbiRecord {
     pub ftst: PvString,
     pub ffst: PvString,
     pub simm: i16,
-    pub siml: String,
-    pub siol: String,
+    pub siml: PvString,
+    pub siol: PvString,
     // SVAL is `DBF_ULONG` (mbbiRecord.dbd.pod:299-301) — the BUFFER C's
     // `readValue` reads SIOL into (`dbGetLink(&prec->siol, DBR_ULONG,
     // &prec->sval)`, mbbiRecord.c:388) before publishing `val = sval`.
@@ -82,6 +83,11 @@ pub struct MbbiRecord {
     pub sims: i16,
     pub sdly: f64,
     skip_convert: bool,
+    /// `special()` re-labelled the state VAL sits on; the put drains it.
+    label_post: bool,
+    /// C's DBF_SHORT `sdef`: a `.db` value until `init_common`
+    /// writes it, and C tests it as nonzero.
+    pub sdef: i16,
 }
 
 impl Default for MbbiRecord {
@@ -148,12 +154,14 @@ impl Default for MbbiRecord {
             ftst: PvString::new(),
             ffst: PvString::new(),
             simm: 0,
-            siml: String::new(),
-            siol: String::new(),
+            siml: PvString::new(),
+            siol: PvString::new(),
             sval: 0,
             sims: 0,
             sdly: -1.0,
             skip_convert: false,
+            label_post: false,
+            sdef: 0,
         }
     }
 }
@@ -166,33 +174,37 @@ impl MbbiRecord {
         }
     }
 
-    fn raw_values(&self) -> [u32; 16] {
+    /// ZRVL..FFVL, C's `(&prec->zrvl)[i]`.
+    pub fn raw_values(&self) -> [u32; 16] {
         [
             self.zrvl, self.onvl, self.twvl, self.thvl, self.frvl, self.fvvl, self.sxvl, self.svvl,
             self.eivl, self.nivl, self.tevl, self.elvl, self.tvvl, self.ttvl, self.ftvl, self.ffvl,
         ]
     }
 
-    /// C `mbbiRecord.c::init_common` (93-105) — "check if any states are
+    /// C `mbbiRecord.c::init_common` (91-105) — "check if any states are
     /// defined": TRUE as soon as one of ZRVL..FFVL is non-zero or one of
-    /// ZRST..FFST is non-empty.
-    ///
-    /// DERIVED, never stored — the same call `MbboRecord::sdef` makes, and for
-    /// the same reason. C keeps `prec->sdef` as a struct member and recomputes it
-    /// from `init_common`: at init, and from `special()` after every write to any
-    /// of the 32 state fields. A cached copy of a pure function of 32 other
-    /// fields can go stale, and a `special()` that forgets one field is exactly
-    /// how it does. Computing it on demand makes the stale state unreachable
-    /// rather than merely unlikely, and leaves one definition of "are states
-    /// defined" for both records instead of two that can drift.
-    fn sdef(&self) -> bool {
+    /// ZRST..FFST is non-empty. C calls it from `init_record` AFTER the dset's
+    /// `init_record` (`:135`), so SDEF is 0 while the device initialises, and
+    /// from `special()` after a put to any of the 32 state fields (`:221`).
+    fn init_common(&mut self) {
         let rvs = self.raw_values();
-        let sts: [&PvString; 16] = [
+        let sts = self.state_strings();
+        self.sdef = i16::from((0..16).any(|i| rvs[i] != 0 || !sts[i].is_empty()));
+    }
+
+    /// C's `if (prec->sdef)`.
+    pub fn sdef(&self) -> bool {
+        self.sdef != 0
+    }
+
+    /// ZRST..FFST, C's `(&prec->zrst)[i]`.
+    pub fn state_strings(&self) -> [&PvString; 16] {
+        [
             &self.zrst, &self.onst, &self.twst, &self.thst, &self.frst, &self.fvst, &self.sxst,
             &self.svst, &self.eist, &self.nist, &self.test, &self.elst, &self.tvst, &self.ttst,
             &self.ftst, &self.ffst,
-        ];
-        (0..16).any(|i| rvs[i] != 0 || !sts[i].is_empty())
+        ]
     }
 
     fn raw_to_val(&self, raw: u32) -> u16 {
@@ -206,27 +218,6 @@ impl MbbiRecord {
             }
         }
         65535
-    }
-
-    /// The mask `devMbbiSoftRaw::read_mbbi` ANDs the raw word with.
-    ///
-    /// C builds it in the dset's `init_record` (`devMbbiSoftRaw.c:44-49`):
-    /// `if (prec->nobt == 0) prec->mask = 0xffffffff;` — which OVERRIDES an
-    /// explicitly configured MASK — `prec->mask <<= prec->shft;`. The record's
-    /// own `init_record` has already set `mask = (1 << nobt) - 1` when MASK was
-    /// left at 0 (`mbbiRecord.c:154-155`).
-    ///
-    /// C stores the shifted mask back into the MASK *field*; the port applies
-    /// the shift here instead and leaves MASK as the record declared it, because
-    /// the record's `process()` reads MASK on the (shared) device-readback path
-    /// where it must stay unshifted.
-    fn raw_soft_mask(&self) -> u32 {
-        let base = if self.nobt == 0 {
-            0xffff_ffff
-        } else {
-            self.mask
-        };
-        base.checked_shl(u32::from(self.shft)).unwrap_or(0)
     }
 
     /// Per-state severity fields ZRSV..FFSV indexed by state 0..15.
@@ -264,8 +255,7 @@ macro_rules! mbb_get_field {
             "VAL" => Some(EpicsValue::Enum($self.val)),
             // `field(SDEF,DBF_SHORT) { special(SPC_NOMOD) }`
             // (mbbiRecord.dbd.pod:628) — readable over CA, never writable.
-            // Derived, so it cannot disagree with the state table it reports on.
-            "SDEF" => Some(EpicsValue::Short($self.sdef() as i16)),
+            "SDEF" => Some(EpicsValue::Short($self.sdef)),
             $( $str => mbb_get_field!(@get $self, $field, $variant), )*
             _ => None,
         }
@@ -278,7 +268,7 @@ macro_rules! mbb_put_field {
     // `.as_str_lossy().into_owned()`.
     (@put $self:expr, $field:ident, String, $value:expr, $name:expr) => {
         if let EpicsValue::String(v) = $value {
-            $self.$field = v.as_str_lossy().into_owned();
+            $self.$field = v;
         } else {
             return Err(CaError::TypeMismatch($name.into()));
         }
@@ -331,9 +321,7 @@ macro_rules! mbb_put_field {
                     EpicsValue::Short(v) => { $self.val = v as u16; }
                     // C rset `put_enum_str` — the one string→state converter.
                     EpicsValue::String(ref s) => {
-                        let resolved = crate::server::record::resolve_enum_state_string(
-                            "VAL",
-                            $self.enum_state_strings().as_deref(),
+                        let resolved = crate::server::record::resolve_enum_state_string("VAL", &*$self,
                             s,
                         )?;
                         if let EpicsValue::Enum(v) = resolved { $self.val = v; }
@@ -348,6 +336,49 @@ macro_rules! mbb_put_field {
 }
 
 impl Record for MbbiRecord {
+    crate::slot_map!(crate::server::record::dbd_generated::slots::mbbi;
+        fields:
+        RVAL => rval,
+        SDEF => sdef;
+        custom: VAL, NOBT, ZRVL, ONVL, TWVL, THVL, FRVL, FVVL, SXVL, SVVL, EIVL, NIVL, TEVL,
+            ELVL, TVVL, TTVL, FTVL, FFVL,
+            ZRST => zrst, ONST => onst, TWST => twst, THST => thst, FRST => frst, FVST => fvst,
+            SXST => sxst, SVST => svst, EIST => eist, NIST => nist, TEST => test, ELST => elst,
+            TVST => tvst, TTST => ttst, FTST => ftst, FFST => ffst,
+            ZRSV, ONSV, TWSV, THSV, FRSV, FVSV, SXSV,
+            SVSV, EISV, NISV, TESV, ELSV, TVSV, TTSV, FTSV, FFSV, AFTC, AFVL, UNSV, COSV, ORAW,
+            MASK, MLST, LALM, SHFT, SIOL, SVAL, SIML, SIMM, SIMS, SDLY;
+        spill: INP, OLDSIMM, SSCN, SIMPVT);
+
+    /// `mbbiRecord.c:126` loads a constant SIOL as `DBF_USHORT` into the ULONG SVAL.
+    fn siol_load_type(&self) -> Option<crate::types::DbFieldType> {
+        Some(crate::types::DbFieldType::UShort)
+    }
+
+    fn acts_before_process(&self) -> bool {
+        false
+    }
+
+    fn cycle_hooks(&self) -> crate::server::record::CycleHooks {
+        crate::server::record::CycleHooks::WRITE_POSTED
+    }
+
+    /// `mbbiRecord.c:135`
+    fn after_dset_init(&mut self) {
+        self.init_common();
+    }
+
+    fn state_table_written(&mut self) {
+        self.init_common();
+    }
+
+    /// `mbbiRecord.c:133-140` keeps the dset status for the return and seeds
+    /// regardless of it, after the dset init has loaded RVAL.
+    fn seed_deadband_tracking(&mut self, _dset_init: crate::server::device_support::DsetInit) {
+        crate::server::record::seed_trackers_from_val(self);
+        self.oraw = self.rval;
+    }
+
     /// UDF belongs to the dset here, not to `process()`. C
     /// `mbbiRecord.c:168-193` assigns `prec->udf = FALSE` at `:174`, INSIDE
     /// `if (status == 0)`, and folds `2` into `0` only at `:192-193`, so a
@@ -362,6 +393,20 @@ impl Record for MbbiRecord {
 
     fn record_type(&self) -> &'static str {
         "mbbi"
+    }
+
+    /// devmbbiStream.c reads and writes the `mbbiRecord` members itself.
+    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+        Some(self)
+    }
+
+    /// devMbbiSoft.c and devMbbiSoftRaw.c return `dbGetLink`'s status.
+    fn process_status_rule(&self) -> crate::server::record::ProcessStatusRule {
+        crate::server::record::ProcessStatusRule::io(crate::server::record::SoftStatus {
+            plain: true,
+            raw: true,
+            async_: false,
+        })
     }
 
     /// C `mbbiRecord.c:221-226` — the `db_post_events` inside `special()`
@@ -381,14 +426,22 @@ impl Record for MbbiRecord {
     /// label posts nothing, because no subscriber's rendering moved.
     ///
     /// ZRVL..FFVL are `SPC_MOD` too, and C's own comment there says so, but they
-    /// fall outside the index range and post nothing. What they DO reach is
-    /// `init_common`, whose `sdef` this port derives on demand
-    /// (`Self::sdef`) rather than caching, so that half needs no hook.
-    fn monitor_side_effect_fields(&self, put_field: &str) -> &'static [&'static str] {
-        match crate::server::record::multibit_state_string_index(put_field) {
-            Some(state) if state == self.val => &["VAL"],
-            _ => &[],
-        }
+    /// fall outside the index range and post nothing; they reach only
+    /// `init_common` (`Self::special`).
+    fn take_cycle_posted_fields(&mut self) -> crate::server::record::CycleMarks {
+        const VAL_POST_NAMED: [(&str, crate::server::record::CyclePostMask); 1] =
+            [("VAL", crate::server::record::CyclePostMask::ValueLog)];
+        static VAL_POST: [(
+            crate::server::record::FieldIx,
+            crate::server::record::CyclePostMask,
+        ); 1] = crate::server::record::declared_post_table(
+            crate::server::record::dbd_generated::MBBI_FIELDS,
+            VAL_POST_NAMED,
+        );
+        crate::server::record::CycleMarks::of(
+            &VAL_POST,
+            u128::from(std::mem::take(&mut self.label_post)),
+        )
     }
 
     /// `SIMM` is `DBF_MENU menu(menuSimm)` (`mbbiRecord.dbd.pod`): the
@@ -402,19 +455,83 @@ impl Record for MbbiRecord {
         }
     }
 
+    /// `devMbbiSoft.c:51` reads INP as `DBR_USHORT`, `devMbbiSoftRaw.c:55` as
+    /// `DBR_LONG`, `devMbbiSoftCallback.c:62` as `DBR_ENUM`.
+    fn soft_input_request(
+        &self,
+        soft: crate::server::device_support::SoftDtyp,
+    ) -> crate::server::record::InputLinkRequest {
+        use crate::server::device_support::SoftDtyp;
+        use crate::server::record::{InputLinkRequest, LinkReadAs};
+        InputLinkRequest::As(match soft {
+            SoftDtyp::Plain => LinkReadAs::UShort,
+            SoftDtyp::Raw => LinkReadAs::Long,
+            SoftDtyp::Async => LinkReadAs::Enum,
+        })
+    }
+
+    /// The Plain dset's `DBR_USHORT` read: VAL is that state index.
+    fn soft_input_read_u16(
+        &mut self,
+        value: u16,
+        _dpvt: &mut crate::server::device_support::Dpvt,
+    ) -> CaResult<()> {
+        self.val = value;
+        Ok(())
+    }
+
+    fn special(
+        &mut self,
+        field: &str,
+        after: bool,
+        _common: &crate::server::record::CommonFields,
+    ) -> CaResult<()> {
+        // Every state string is `??ST`; a VAL put skips the name scan.
+        if after && field.len() == 4 && field.as_bytes()[2..].eq_ignore_ascii_case(b"ST") {
+            self.label_post =
+                crate::server::record::multibit_state_string_index(field) == Some(self.val);
+        }
+        if after && crate::server::record::multibit_state_field(field) {
+            self.init_common();
+        }
+        Ok(())
+    }
+
+    /// `devMbbiSoftRaw` reads INP as `DBR_LONG` but loads a constant one as
+    /// `DBF_ULONG` (`devMbbiSoftRaw.c:42`), so `4294967295` loads and does not
+    /// read.
+    fn soft_input_load_type(
+        &self,
+        soft: crate::server::device_support::SoftDtyp,
+    ) -> Option<crate::types::DbFieldType> {
+        use crate::server::device_support::SoftDtyp;
+        use crate::types::DbFieldType;
+        Some(match soft {
+            SoftDtyp::Raw => DbFieldType::ULong,
+            SoftDtyp::Plain | SoftDtyp::Async => DbFieldType::UShort,
+        })
+    }
+
     /// C `devMbbiSoftRaw` — `recGblInitConstantLink(&prec->inp, DBF_ULONG,
     /// &prec->rval)` at init (`devMbbiSoftRaw.c:42`, unmasked), and per read
     /// `dbGetLink(pinp, DBR_LONG, &prec->rval, 0, 0)` (`:55`) followed by
     /// `prec->rval &= prec->mask` (`:74`, unconditional in MASK — unlike `bi`,
     /// whose dset masks only when MASK is non-zero). `read_mbbi` returns 0, so the
     /// record's `RVAL >> SHFT` → state-index convert then runs.
+    /// `devXxxSoftRaw::init_record`'s mask (see `raw_soft_dset_mask`).
+    fn init_soft_dset(&mut self, soft: crate::server::device_support::SoftDtyp) {
+        if soft == crate::server::device_support::SoftDtyp::Raw {
+            self.mask = super::raw_soft_dset_mask(self.mask, self.nobt == 0, self.shft);
+        }
+    }
+
     fn raw_soft_input(&mut self, entry: RawSoftEntry, value: EpicsValue) -> Option<CaResult<()>> {
         self.rval = match super::raw_soft_rval_u32("mbbi", &value) {
             Ok(rval) => rval,
             Err(e) => return Some(Err(e)),
         };
         if entry == RawSoftEntry::Read {
-            self.rval &= self.raw_soft_mask();
+            self.rval &= self.mask;
         }
         Some(Ok(()))
     }
@@ -429,14 +546,26 @@ impl Record for MbbiRecord {
         ]))
     }
 
+    fn enum_str_state(&self, name: &PvString) -> Option<u16> {
+        crate::server::record::multibit_enum_str_state(
+            self.sdef(),
+            [
+                &self.zrst, &self.onst, &self.twst, &self.thst, &self.frst, &self.fvst, &self.sxst,
+                &self.svst, &self.eist, &self.nist, &self.test, &self.elst, &self.tvst, &self.ttst,
+                &self.ftst, &self.ffst,
+            ],
+            name,
+        )
+    }
+
     /// C `get_enum_str` (mbbiRecord.c:235-255): any `val <= 15` reads its state slot,
     /// defined or not, so an unset state renders EMPTY; past 15 it is
     /// `"Illegal Value"`. `enum_state_strings` above stops at the last
     /// non-empty state because `no_str` says how many labels are meaningful —
     /// that trim must never reach this read, or an undefined state comes back
     /// as its index, which no C IOC emits.
-    fn enum_string_form(&self) -> Option<crate::server::snapshot::EnumStringForm> {
-        Some(crate::server::record::multibit_enum_string_form([
+    fn enum_slots(&self) -> Option<crate::server::record::EnumSlots<'_>> {
+        Some(crate::server::record::EnumSlots::Multibit([
             &self.zrst, &self.onst, &self.twst, &self.thst, &self.frst, &self.fvst, &self.sxst,
             &self.svst, &self.eist, &self.nist, &self.test, &self.elst, &self.tvst, &self.ttst,
             &self.ftst, &self.ffst,
@@ -459,13 +588,11 @@ impl Record for MbbiRecord {
     }
 
     fn init_record(&mut self, pass: u8) -> CaResult<()> {
-        if pass == 0 {
+        if pass == 1 {
+            // C `mbbiRecord.c:129-130`, after the pass-0 return.
             if self.mask == 0 && self.nobt > 0 && self.nobt <= 32 {
                 self.mask = ((1i64 << self.nobt) - 1) as u32;
             }
-            self.mlst = self.val;
-            self.lalm = self.val;
-            self.oraw = self.rval;
         }
         Ok(())
     }
@@ -484,8 +611,72 @@ impl Record for MbbiRecord {
             self.val = self.raw_to_val(rval);
         }
         self.skip_convert = false;
-        self.oraw = self.rval;
         Ok(ProcessOutcome::complete())
+    }
+
+    /// C `mbbiRecord.c:363-366` posts RVAL with `events | DBE_VALUE |
+    /// DBE_LOG` outside the `if (events)` that gates VAL.
+    fn fields_posted_with_value_mask(
+        &self,
+    ) -> &'static [(&'static str, crate::server::record::ValuePostGate)] {
+        &[("RVAL", crate::server::record::ValuePostGate::OnChangeForced)]
+    }
+
+    /// `monitor()` decides RVAL from the record's own `oraw`, so the
+    /// framework keeps no published copy of it.
+    fn fields_posted_only_when_marked(&self) -> &'static [&'static str] {
+        &["RVAL"]
+    }
+
+    /// `monitor()` posts VAL and RVAL alone (`mbbiRecord.c:349-367`).
+    fn process_posted_fields(&self) -> Option<crate::server::record::DeclaredFields> {
+        Some(
+            &const {
+                crate::server::record::declared_set(
+                    crate::server::record::dbd_generated::MBBI_FIELDS,
+                    ["VAL", "RVAL"],
+                )
+            },
+        )
+    }
+
+    /// C `if (prec->oraw != prec->rval) { ...; prec->oraw = prec->rval; }`
+    /// (`mbbiRecord.c:363-366`), minus the post. Outside init, `monitor()` is
+    /// the only writer of `oraw`.
+    fn take_secondary_value_changes(
+        &mut self,
+        _value_mask: crate::server::recgbl::EventMask,
+    ) -> crate::server::record::SecondaryTake {
+        crate::server::record::SecondaryTake::unguarded(u64::from(
+            crate::server::record::SecondaryTake::advance(&mut self.oraw, self.rval),
+        ))
+    }
+
+    fn link_text_ref(&self, link_field: &str) -> Option<&[u8]> {
+        match link_field {
+            "SIML" => Some(self.siml.as_bytes()),
+            "SIOL" => Some(self.siol.as_bytes()),
+            _ => None,
+        }
+    }
+
+    fn simm_cells(&self) -> Option<crate::server::record::SimmCells> {
+        Some(crate::server::record::SimmCells {
+            simm: self.simm,
+            sims: self.sims,
+            sdly: self.sdly,
+        })
+    }
+
+    fn cycle_cell(&self, cell: CycleCell) -> CycleRead {
+        match cell {
+            CycleCell::Val => CycleRead::Value(CycleValue::Enum(self.val)),
+            CycleCell::Mlst => CycleRead::Value(CycleValue::UShort(self.mlst)),
+            CycleCell::Lalm => CycleRead::Value(CycleValue::UShort(self.lalm)),
+            CycleCell::Aftc => CycleRead::Value(CycleValue::Double(self.aftc)),
+            CycleCell::Afvl => CycleRead::Value(CycleValue::Double(self.afvl)),
+            _ => CycleRead::Absent,
+        }
     }
 
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
@@ -494,7 +685,7 @@ impl Record for MbbiRecord {
             "SHFT" => shft: UShort, "MLST" => mlst: UShort, "LALM" => lalm: UShort,
             "NOBT" => nobt: UShort,
             "SIMM" => simm: Short, "SIML" => siml: String, "SIOL" => siol: String,
-            "SIMS" => sims: Short,
+            "SVAL" => sval: ULong, "SIMS" => sims: Short,
             "SDLY" => sdly: Double,
             "ZRSV" => zrsv: Short, "ONSV" => onsv: Short, "TWSV" => twsv: Short, "THSV" => thsv: Short,
             "FRSV" => frsv: Short, "FVSV" => fvsv: Short, "SXSV" => sxsv: Short, "SVSV" => svsv: Short,
@@ -519,7 +710,7 @@ impl Record for MbbiRecord {
             "SHFT" => shft: UShort, "MLST" => mlst: UShort, "LALM" => lalm: UShort,
             "NOBT" => nobt: UShort,
             "SIMM" => simm: Short, "SIML" => siml: String, "SIOL" => siol: String,
-            "SIMS" => sims: Short,
+            "SVAL" => sval: ULong, "SIMS" => sims: Short,
             "SDLY" => sdly: Double,
             "ZRSV" => zrsv: Short, "ONSV" => onsv: Short, "TWSV" => twsv: Short, "THSV" => thsv: Short,
             "FRSV" => frsv: Short, "FVSV" => fvsv: Short, "SXSV" => sxsv: Short, "SVSV" => svsv: Short,
@@ -541,6 +732,14 @@ impl Record for MbbiRecord {
 
     fn set_device_did_compute(&mut self, did: bool) {
         self.skip_convert = did;
+    }
+
+    fn refused_async_read_keeps_udf(&self) -> bool {
+        true
+    }
+
+    fn raw_soft_read_failure_skips_convert(&self) -> bool {
+        true
     }
 
     /// `mbbi` has an `RVAL → VAL` `convert()` step. A `Soft Channel`
@@ -603,8 +802,8 @@ impl Record for MbbiRecord {
             raw_sev as u16,
             self.aftc,
             self.afvl,
+            common.time_last.get(),
             common.time,
-            crate::runtime::general_time::get_current(),
         );
         self.afvl = new_afvl;
         let sev = AlarmSeverity::from_u16(filtered);
@@ -632,26 +831,28 @@ impl Record for MbbiRecord {
     fn set_val(&mut self, value: EpicsValue) -> CaResult<()> {
         // VAL is DBF_ENUM (mbbiRecord.dbd.pod): the state index. C reads the
         // link as DBR_USHORT, so every numeric carrier coerces to u16.
-        match value {
-            EpicsValue::Enum(v) => self.val = v,
-            EpicsValue::ULong(v) => self.val = v as u16,
-            EpicsValue::Long(v) => self.val = v as u16,
-            EpicsValue::Short(v) => self.val = v as u16,
-            // C rset `put_enum_str` (mbbiRecord.c:273-291), reached from
-            // `dbConvert.c::putStringEnum` — the one string→state converter,
-            // over `enum_state_strings` (the same table `get_enum_strs` serves).
-            EpicsValue::String(ref s) => {
-                let resolved = crate::server::record::resolve_enum_state_string(
-                    "VAL",
-                    self.enum_state_strings().as_deref(),
-                    s,
-                )?;
-                if let EpicsValue::Enum(v) = resolved {
-                    self.val = v;
+        // The numeric carriers own nothing, so their arms skip
+        // `EpicsValue`'s drop, which is out of line and would run on every
+        // soft read.
+        let value = std::mem::ManuallyDrop::new(value);
+        self.val = match *value {
+            EpicsValue::Enum(v) | EpicsValue::UShort(v) => v,
+            EpicsValue::ULong(v) => v as u16,
+            EpicsValue::Long(v) => v as u16,
+            EpicsValue::Short(v) => v as u16,
+            _ => {
+                // C rset `put_enum_str` (mbbiRecord.c:273-291), reached from
+                // `dbConvert.c::putStringEnum` — the one string→state
+                // converter (`Record::enum_str_state`).
+                let EpicsValue::String(s) = std::mem::ManuallyDrop::into_inner(value) else {
+                    return Err(CaError::TypeMismatch("VAL".into()));
+                };
+                match crate::server::record::resolve_enum_state_string("VAL", &*self, &s)? {
+                    EpicsValue::Enum(v) => v,
+                    _ => return Ok(()),
                 }
             }
-            _ => return Err(CaError::TypeMismatch("VAL".into())),
-        }
+        };
         Ok(())
     }
 
@@ -660,23 +861,18 @@ impl Record for MbbiRecord {
     /// BOTH ifaces (devAsynInt32.c:1270 with the record's NOBT-derived mask /
     /// devAsynUInt32Digital.c:903 with the `@asynMask`), and mbbiRecord's
     /// convert (mbbiRecord.c:172-190) then shifts `rval >> SHFT` and resolves
-    /// the state index. The hook performs the (identical) mask + shift +
-    /// lookup inline and returns `true` so the framework skips the forward
-    /// convert.
+    /// the state index. The hook performs the (identical) shift + lookup
+    /// inline and returns `true` so the framework skips the forward convert.
     ///
     /// This is the *device-distinct* entry, separate from the Soft Channel
     /// `set_val` pass-through above — routing the device raw here is what lets
-    /// `set_val` stay single-meaning. Input twin of `mbbo::apply_raw_readback`,
-    /// with an **unconditional** `& mask` (unlike `bi`, whose asynInt32 dset
-    /// leaves mask 0 and reads the value unmasked — `processMbbi` masks on both
-    /// ifaces). The `& mask` here is the masking the prior `set_val` omitted.
+    /// `set_val` stay single-meaning. Input twin of `mbbo::apply_raw_readback`.
     fn apply_raw_readback(&mut self, raw: i32) -> bool {
-        let masked = (raw as u32) & self.mask;
-        self.rval = masked;
+        self.rval = raw as u32;
         let shifted = if self.shft > 0 {
-            masked.checked_shr(self.shft as u32).unwrap_or(0)
+            self.rval.checked_shr(self.shft as u32).unwrap_or(0)
         } else {
-            masked
+            self.rval
         };
         self.val = self.raw_to_val(shifted);
         true

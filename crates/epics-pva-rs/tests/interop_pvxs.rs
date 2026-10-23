@@ -1,9 +1,8 @@
 //! PVA interop: Rust ↔ pvxs (`$PVXS_HOME`) `pvget`/`pvput`/`pvmonitor`.
 //!
 //! Opt-in via `cargo nextest run --profile interop`. Each test
-//! shells out to a pvxs CLI binary; missing binaries → skip with a
-//! SKIP-prefixed stderr line so a host without pvxs installed isn't
-//! a hard fail.
+//! shells out to a pvxs CLI binary; a missing binary fails the test,
+//! because an early return would score as a pass.
 //!
 //! Targets the gaps that pure Rust↔Rust tests can't catch:
 //!
@@ -22,6 +21,7 @@
 //!   the established TCP circuit, expecting the Rust server to
 //!   answer with SEARCH_RESPONSE on the same circuit.
 
+#![allow(clippy::disallowed_macros, reason = "tests may keep eprintln!")]
 #![cfg(feature = "client")]
 
 mod interop_helpers;
@@ -29,6 +29,9 @@ mod interop_helpers;
 #[cfg(unix)]
 #[path = "interop_pvxs_mods/access_denied.rs"]
 mod access_denied;
+#[cfg(unix)]
+#[path = "interop_pvxs_mods/array_cmd14.rs"]
+mod array_cmd14;
 #[cfg(unix)]
 #[path = "interop_pvxs_mods/asg_cross_impl.rs"]
 mod asg_cross_impl;
@@ -51,6 +54,9 @@ mod harness_paths;
 #[path = "interop_pvxs_mods/large_array.rs"]
 mod large_array;
 #[cfg(unix)]
+#[path = "interop_pvxs_mods/monitor_seed_mask.rs"]
+mod monitor_seed_mask;
+#[cfg(unix)]
 #[path = "interop_pvxs_mods/monitor_stream.rs"]
 mod monitor_stream;
 #[cfg(unix)]
@@ -60,14 +66,32 @@ mod pipeline_r1;
 #[path = "interop_pvxs_mods/pipeline_r20.rs"]
 mod pipeline_r20;
 #[cfg(unix)]
+#[path = "interop_pvxs_mods/process_cmd16.rs"]
+mod process_cmd16;
+#[cfg(unix)]
 #[path = "interop_pvxs_mods/put_cross_impl.rs"]
 mod put_cross_impl;
+#[cfg(unix)]
+#[path = "interop_pvxs_mods/put_get_cmd12.rs"]
+mod put_get_cmd12;
 #[cfg(unix)]
 #[path = "interop_pvxs_mods/reverse_complex_types.rs"]
 mod reverse_complex_types;
 #[cfg(unix)]
 #[path = "interop_pvxs_mods/rpc_and_get_field.rs"]
 mod rpc_and_get_field;
+#[cfg(unix)]
+#[path = "interop_pvxs_mods/search_prefix.rs"]
+mod search_prefix;
+#[cfg(unix)]
+#[path = "interop_pvxs_mods/server_ports_env.rs"]
+mod server_ports_env;
+#[cfg(unix)]
+#[path = "interop_pvxs_mods/soft_ioc_pvx_ca_port.rs"]
+mod soft_ioc_pvx_ca_port;
+#[cfg(unix)]
+#[path = "interop_pvxs_mods/start_pvxs_rule.rs"]
+mod start_pvxs_rule;
 #[cfg(unix)]
 #[path = "interop_pvxs_mods/tcp_search_r11.rs"]
 mod tcp_search_r11;
@@ -80,3 +104,6 @@ mod tls_mtls;
 #[cfg(unix)]
 #[path = "interop_pvxs_mods/type_cache.rs"]
 mod type_cache;
+#[cfg(unix)]
+#[path = "interop_pvxs_mods/udp_v6_port_held.rs"]
+mod udp_v6_port_held;

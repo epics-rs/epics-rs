@@ -1,4 +1,5 @@
 use crate::error::{CaError, CaResult};
+use crate::server::record::{CycleCell, CycleRead, CycleValue};
 use crate::server::record::{MENU_YES_NO, ProcessOutcome, Record};
 use crate::types::{EpicsValue, PvString};
 
@@ -29,20 +30,20 @@ pub struct Int64outRecord {
     // LALM/ALST/MLST are DBF_INT64 too, but `special(SPC_NOMOD)`: read-only, so
     // no client put reaches the parse. LALM is the alarm ladder's own
     // `epicsInt64 lalm` (`int64outRecord.c:294`) — the threshold its hysteresis
-    // arm compares against — so it holds that exactly; ALST/MLST stay doubles,
-    // read by the monitor deadband engine.
+    // arm compares against — so it holds that exactly, as ALST/MLST hold the
+    // values `DELTA` compares (`int64outRecord.c:350`).
     pub lalm: i64,
     pub ivoa: i16,
     pub ivov: i64,
     pub adel: i64,
     pub mdel: i64,
-    pub alst: f64,
-    pub mlst: f64,
+    pub alst: i64,
+    pub mlst: i64,
     pub omsl: i16,
-    pub dol: String,
+    pub dol: PvString,
     pub simm: i16,
-    pub siml: String,
-    pub siol: String,
+    pub siml: PvString,
+    pub siol: PvString,
     pub sims: i16,
     pub sdly: f64,
     /// Suppresses THIS cycle's `convert()` — C `int64outRecord.c:146` /
@@ -69,13 +70,13 @@ impl Default for Int64outRecord {
             ivov: 0,
             adel: 0,
             mdel: 0,
-            alst: 0.0,
-            mlst: 0.0,
+            alst: 0,
+            mlst: 0,
             omsl: 0,
-            dol: String::new(),
+            dol: PvString::new(),
             simm: 0,
-            siml: String::new(),
-            siol: String::new(),
+            siml: PvString::new(),
+            siol: PvString::new(),
             sims: 0,
             sdly: -1.0,
             skip_convert: false,
@@ -93,14 +94,83 @@ impl Int64outRecord {
 }
 
 impl Record for Int64outRecord {
+    crate::slot_map!(crate::server::record::dbd_generated::slots::int64out;
+        fields:
+        VAL => val,
+        EGU => egu,
+        DRVH => drvh,
+        DRVL => drvl,
+        HOPR => hopr,
+        LOPR => lopr,
+        HYST => hyst,
+        ADEL => adel,
+        MDEL => mdel,
+        SDLY => sdly,
+        IVOV => ivov,
+        LALM => lalm,
+        ALST => alst,
+        MLST => mlst;
+        custom: DOL, OMSL, SIOL, SIML, SIMM, SIMS, IVOA;
+        spill: OUT, HIHI, LOLO, HIGH, LOW, HHSV, LLSV, HSV, LSV, OLDSIMM, SSCN, SIMPVT);
+
+    fn acts_before_process(&self) -> bool {
+        false
+    }
+
+    fn cycle_hooks(&self) -> crate::server::record::CycleHooks {
+        crate::server::record::CycleHooks::NONE
+    }
+
+    /// `monitor()` posts VAL alone (`int64outRecord.c:353-377`).
+    fn process_posted_fields(&self) -> Option<crate::server::record::DeclaredFields> {
+        Some(
+            &const {
+                crate::server::record::declared_set(
+                    crate::server::record::dbd_generated::INT64OUT_FIELDS,
+                    ["VAL"],
+                )
+            },
+        )
+    }
+
+    fn has_array_monitor_post(&self) -> bool {
+        false
+    }
+
     fn record_type(&self) -> &'static str {
         "int64out"
+    }
+
+    // int64outRecord.c:113-118: a failed dset init returns before the seed.
+    fn seed_deadband_tracking(&mut self, dset_init: crate::server::device_support::DsetInit) {
+        if dset_init != crate::server::device_support::DsetInit::Failed {
+            crate::server::record::seed_trackers_from_val(self);
+        }
+    }
+
+    /// devI64outSoft.c drops `dbPutLink`'s status; devI64outSoftCallback.c returns it.
+    fn process_status_rule(&self) -> crate::server::record::ProcessStatusRule {
+        crate::server::record::ProcessStatusRule::io(crate::server::record::SoftStatus {
+            plain: false,
+            raw: false,
+            async_: true,
+        })
+        .with_dol(crate::server::record::DolStatus::UntilWrite)
     }
 
     /// C `int64outRecord.c:139-150`: the scalar `dbGetLink(&prec->dol, ..., &prec->val, 0, 0)`
     /// under `dol.type != CONSTANT && omsl == menuOmslclosed_loop`.
     fn fetches_dol_closed_loop(&self) -> bool {
         true
+    }
+
+    /// The closed-loop DOL is read at `DBR_INT64` (`int64outRecord.c:138`), so a source
+    /// that request cannot convert is a failed read.
+    fn input_link_request(&self, link_field: &str) -> crate::server::record::InputLinkRequest {
+        crate::server::record::InputLinkRequest::As(match link_field {
+            "DOL" => crate::server::record::LinkReadAs::Int64,
+            _ => crate::server::record::LinkReadAs::Native,
+        })
     }
 
     /// C `int64outRecord.c:135-143`: `process()` clears `udf` to FALSE only on a
@@ -166,6 +236,58 @@ impl Record for Int64outRecord {
         }
     }
 
+    fn link_text_ref(&self, link_field: &str) -> Option<&[u8]> {
+        match link_field {
+            "DOL" => Some(self.dol.as_bytes()),
+            "SIML" => Some(self.siml.as_bytes()),
+            "SIOL" => Some(self.siol.as_bytes()),
+            _ => None,
+        }
+    }
+
+    fn simm_cells(&self) -> Option<crate::server::record::SimmCells> {
+        Some(crate::server::record::SimmCells {
+            simm: self.simm,
+            sims: self.sims,
+            sdly: self.sdly,
+        })
+    }
+
+    fn cycle_cell(&self, cell: CycleCell) -> CycleRead {
+        match cell {
+            CycleCell::Val => CycleRead::Value(CycleValue::Int64(self.val)),
+            CycleCell::Mdel => CycleRead::Value(CycleValue::Int64(self.mdel)),
+            CycleCell::Adel => CycleRead::Value(CycleValue::Int64(self.adel)),
+            CycleCell::Mlst => CycleRead::Value(CycleValue::Int64(self.mlst)),
+            CycleCell::Alst => CycleRead::Value(CycleValue::Int64(self.alst)),
+            CycleCell::Hyst => CycleRead::Value(CycleValue::Int64(self.hyst)),
+            CycleCell::Lalm => CycleRead::Value(CycleValue::Int64(self.lalm)),
+            _ => CycleRead::Absent,
+        }
+    }
+
+    fn put_cycle_cell(&mut self, cell: CycleCell, value: CycleValue) -> CaResult<()> {
+        match (cell, value) {
+            (CycleCell::Lalm, CycleValue::Int64(v)) => {
+                self.validate_put("LALM", &CycleValue::Int64(v).lend())?;
+                self.lalm = v;
+                self.on_put("LALM");
+            }
+            (CycleCell::Alst, CycleValue::Int64(v)) => {
+                self.validate_put("ALST", &CycleValue::Int64(v).lend())?;
+                self.alst = v;
+                self.on_put("ALST");
+            }
+            (CycleCell::Mlst, CycleValue::Int64(v)) => {
+                self.validate_put("MLST", &CycleValue::Int64(v).lend())?;
+                self.mlst = v;
+                self.on_put("MLST");
+            }
+            (cell, value) => return self.put_field(cell.name(), value.into()),
+        }
+        Ok(())
+    }
+
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
             "VAL" => Some(EpicsValue::Int64(self.val)),
@@ -180,8 +302,8 @@ impl Record for Int64outRecord {
             "IVOV" => Some(EpicsValue::Int64(self.ivov)),
             "ADEL" => Some(EpicsValue::Int64(self.adel)),
             "MDEL" => Some(EpicsValue::Int64(self.mdel)),
-            "ALST" => Some(EpicsValue::Double(self.alst)),
-            "MLST" => Some(EpicsValue::Double(self.mlst)),
+            "ALST" => Some(EpicsValue::Int64(self.alst)),
+            "MLST" => Some(EpicsValue::Int64(self.mlst)),
             "OMSL" => Some(EpicsValue::Short(self.omsl)),
             "DOL" => Some(EpicsValue::String(self.dol.clone().into())),
             "SIMM" => Some(EpicsValue::Short(self.simm)),
@@ -205,7 +327,7 @@ impl Record for Int64outRecord {
             }
             "EGU" => {
                 if let EpicsValue::String(v) = value {
-                    self.egu = v;
+                    self.egu.set_bytes(v.as_bytes());
                 } else {
                     return Err(CaError::TypeMismatch("EGU".into()));
                 }
@@ -281,14 +403,18 @@ impl Record for Int64outRecord {
                 }
             }
             "ALST" => {
-                self.alst = value
-                    .to_f64()
-                    .ok_or_else(|| CaError::TypeMismatch("ALST".into()))?;
+                if let EpicsValue::Int64(v) = value {
+                    self.alst = v;
+                } else {
+                    return Err(CaError::TypeMismatch("ALST".into()));
+                }
             }
             "MLST" => {
-                self.mlst = value
-                    .to_f64()
-                    .ok_or_else(|| CaError::TypeMismatch("MLST".into()))?;
+                if let EpicsValue::Int64(v) = value {
+                    self.mlst = v;
+                } else {
+                    return Err(CaError::TypeMismatch("MLST".into()));
+                }
             }
             "OMSL" => {
                 if let EpicsValue::Short(v) = value {
@@ -299,7 +425,7 @@ impl Record for Int64outRecord {
             }
             "DOL" => {
                 if let EpicsValue::String(v) = value {
-                    self.dol = v.as_str_lossy().into_owned();
+                    self.dol = v;
                 } else {
                     return Err(CaError::TypeMismatch("DOL".into()));
                 }
@@ -313,14 +439,14 @@ impl Record for Int64outRecord {
             }
             "SIML" => {
                 if let EpicsValue::String(v) = value {
-                    self.siml = v.as_str_lossy().into_owned();
+                    self.siml = v;
                 } else {
                     return Err(CaError::TypeMismatch("SIML".into()));
                 }
             }
             "SIOL" => {
                 if let EpicsValue::String(v) = value {
-                    self.siol = v.as_str_lossy().into_owned();
+                    self.siol = v;
                 } else {
                     return Err(CaError::TypeMismatch("SIOL".into()));
                 }

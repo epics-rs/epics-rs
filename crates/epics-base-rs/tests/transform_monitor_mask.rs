@@ -57,15 +57,13 @@ async fn transform_with_an_ms_input() -> PvDatabase {
     db.add_record("SRC", Box::new(AiRecord::new(1.0)))
         .await
         .unwrap();
-    {
-        // The alarm limits live in the INSTANCE's `analog_alarm` config.
-        let rec = db.get_record("SRC").unwrap();
-        let mut inst = rec.write();
-        inst.put_common_field("HIHI", EpicsValue::Double(5.0))
-            .unwrap();
-        inst.put_common_field("HHSV", EpicsValue::Short(AlarmSeverity::Major as i16))
-            .unwrap();
-    }
+    // The alarm limits live in the INSTANCE's `analog_alarm` config.
+    db.put_pv_no_process("SRC.HIHI", EpicsValue::Double(5.0))
+        .await
+        .unwrap();
+    db.put_pv_no_process("SRC.HHSV", EpicsValue::Short(AlarmSeverity::Major as i16))
+        .await
+        .unwrap();
 
     let mut t = TransformRecord::default();
     t.put_field("INPA", EpicsValue::String("SRC MS".into()))
@@ -119,9 +117,12 @@ async fn r11_64_transform_channels_post_without_the_cycles_alarm_bits() {
     );
 
     let e = a_rx.try_recv().expect("A moved 1 -> 10, so C posts it");
-    assert_eq!(e.snapshot.value, EpicsValue::Double(10.0));
     assert_eq!(
-        e.mask,
+        e.value().as_value().cloned().unwrap(),
+        EpicsValue::Double(10.0)
+    );
+    assert_eq!(
+        e.mask(),
         EventMask::VALUE | EventMask::LOG,
         "transformRecord.c:794 overwrites the alarm mask with a literal \
          DBE_VALUE|DBE_LOG before the A..P post loop, so A carries no alarm bit"

@@ -1,0 +1,6 @@
+$ snc syncq_after_sync_elem.st
+syncq_after_sync_elem.st:8: error: some array elements of 'v' already sync'd
+$ snc +W syncq_after_sync_elem.st
+syncq_after_sync_elem.st:8: error: some array elements of 'v' already sync'd
+$ snc -w syncq_after_sync_elem.st
+syncq_after_sync_elem.st:8: error: some array elements of 'v' already sync'd

@@ -1,0 +1,5 @@
+p {
+  ReplyTimeout = 10
+    x;
+  out "a";
+}

@@ -107,33 +107,137 @@ use std::path::{Path, PathBuf};
 /// one and hands the next branch the same red with less information. Report
 /// the difference and leave the constant alone.
 const SCOPE_GATED: &[(&str, &str)] = &[
+    (
+        "ad-plugins-rs",
+        "tests/circular_buff_configure_max_buffers.rs",
+    ),
+    ("ad-plugins-rs", "tests/configure_duplicate_port.rs"),
     ("ad-plugins-rs", "tests/ioc_asyn_commands.rs"),
+    (
+        "ad-plugins-rs",
+        "tests/plugin_configure_blocking_callbacks.rs",
+    ),
     ("ad-plugins-rs", "tests/plugin_configure_max_threads.rs"),
+    ("ad-plugins-rs", "tests/plugin_configure_queue_size.rs"),
+    ("ad-plugins-rs", "tests/plugin_configure_source.rs"),
+    ("ad-plugins-rs", "tests/plugin_configure_stack_size.rs"),
+    (
+        "ad-plugins-rs",
+        "tests/plugin_configure_unknown_array_port.rs",
+    ),
+    ("ad-plugins-rs", "tests/plugin_interrupt_sources.rs"),
+    ("ad-plugins-rs", "tests/reference_plugin_asyn_flags.rs"),
+    ("ad-plugins-rs", "tests/std_arrays_configure_queue_size.rs"),
     ("asyn-rs", "tests/process_gate_tests.rs"),
+    (
+        "epics-base-rs",
+        "tests/a_band_blocks_on_the_programs_runtime.rs",
+    ),
     ("epics-base-rs", "tests/client_server.rs"),
+    (
+        "epics-bridge-rs",
+        "tests/a_bare_ca_link_opens_no_pva_channel.rs",
+    ),
+    (
+        "epics-bridge-rs",
+        "tests/connected_pva_link_lset_calls_allocate_nothing.rs",
+    ),
+    (
+        "epics-bridge-rs",
+        "tests/gw_upstream_unresponsive_window.rs",
+    ),
+    (
+        "epics-bridge-rs",
+        "tests/pva_forward_link_dispatch_alloc.rs",
+    ),
     ("epics-bridge-rs", "tests/pva_gateway.rs"),
+    (
+        "epics-bridge-rs",
+        "tests/pva_link_empty_name_processes_invalid.rs",
+    ),
+    ("epics-bridge-rs", "tests/pva_link_parse_warnings.rs"),
+    (
+        "epics-bridge-rs",
+        "tests/pva_link_put_error_prints_the_pvxs_line.rs",
+    ),
+    ("epics-bridge-rs", "tests/pva_link_put_relinks_cp_holder.rs"),
+    ("epics-bridge-rs", "tests/pva_link_scan_needs_an_inlink.rs"),
+    ("epics-bridge-rs", "tests/pva_local_link_unfulfilled.rs"),
+    (
+        "epics-bridge-rs",
+        "tests/pvalink_channel_closes_with_its_last_link.rs",
+    ),
+    (
+        "epics-bridge-rs",
+        "tests/pvalink_cp_scan_of_an_active_record_traces.rs",
+    ),
+    ("epics-bridge-rs", "tests/pvalink_read_stamps_the_reader.rs"),
+    (
+        "epics-bridge-rs",
+        "tests/pvalink_reopened_cp_channel_scans.rs",
+    ),
+    (
+        "epics-bridge-rs",
+        "tests/qsrv_put_fails_on_the_process_status.rs",
+    ),
     ("epics-bridge-rs", "tests/qsrv_remote_log.rs"),
+    ("epics-bridge-rs", "tests/qsrv_rs_resolves_a_ca_link.rs"),
+    ("epics-bridge-rs", "tests/qsrv_ts_filter_probe.rs"),
+    ("epics-bridge-rs", "tests/tpro_names_the_pva_client.rs"),
     ("epics-ca-rs", "src/client/sync_group.rs"),
     ("epics-ca-rs", "src/client/transport.rs"),
+    ("epics-ca-rs", "src/server/ca_server.rs"),
     ("epics-ca-rs", "src/server/tcp.rs"),
-    ("epics-ca-rs", "src/server/udp.rs"),
+    (
+        "epics-ca-rs",
+        "tests/a_loopback_interface_binds_two_responder_sockets.rs",
+    ),
+    (
+        "epics-ca-rs",
+        "tests/a_put_the_task_cannot_send_is_dropped.rs",
+    ),
+    (
+        "epics-ca-rs",
+        "tests/a_put_to_an_unopened_remote_link_is_refused.rs",
+    ),
+    (
+        "epics-ca-rs",
+        "tests/a_string_put_to_an_enum_link_goes_as_dbr_string.rs",
+    ),
+    (
+        "epics-ca-rs",
+        "tests/a_remote_link_put_that_does_not_convert_alarms.rs",
+    ),
     ("epics-ca-rs", "tests/access_rights_spc_nomod.rs"),
     ("epics-ca-rs", "tests/acf_host_identity.rs"),
     ("epics-ca-rs", "tests/acf_hot_reload.rs"),
+    ("epics-ca-rs", "tests/an_out_ca_link_sends_no_event_add.rs"),
     ("epics-ca-rs", "tests/asg_inp_change_reevaluates_access.rs"),
     ("epics-ca-rs", "tests/beacon_ramp_connect.rs"),
     ("epics-ca-rs", "tests/ca_char_put_is_unsigned.rs"),
     ("epics-ca-rs", "tests/ca_client_char_is_unsigned.rs"),
+    ("epics-ca-rs", "tests/ca_client_context_channels.rs"),
+    ("epics-ca-rs", "tests/ca_filter_pre_post.rs"),
     ("epics-ca-rs", "tests/ca_out_link_write_access_gate.rs"),
+    ("epics-ca-rs", "tests/ca_ts_filter_probe.rs"),
     ("epics-ca-rs", "tests/caget_dbr_type.rs"),
     ("epics-ca-rs", "tests/calink_enum_ctrl_attributes.rs"),
     (
         "epics-ca-rs",
         "tests/calink_out_put_clamps_to_element_count.rs",
     ),
+    (
+        "epics-ca-rs",
+        "tests/caput_cli_string_put_prints_what_c_caput_prints.rs",
+    ),
     ("epics-ca-rs", "tests/caput_long_string_readback.rs"),
     ("epics-ca-rs", "tests/caput_old_read_never_aborts.rs"),
     ("epics-ca-rs", "tests/caput_readback_timeout.rs"),
+    (
+        "epics-ca-rs",
+        "tests/caput_sends_the_string_c_caput_sends.rs",
+    ),
+    ("epics-ca-rs", "tests/channel_field_spelling.rs"),
     ("epics-ca-rs", "tests/channel_filters.rs"),
     ("epics-ca-rs", "tests/cli_cainfo_host.rs"),
     ("epics-ca-rs", "tests/cli_caput_enum_order.rs"),
@@ -142,20 +246,71 @@ const SCOPE_GATED: &[(&str, &str)] = &[
     ("epics-ca-rs", "tests/cli_dbr_type_race.rs"),
     ("epics-ca-rs", "tests/cli_monitor_separator.rs"),
     ("epics-ca-rs", "tests/cli_value_format.rs"),
+    ("epics-ca-rs", "tests/cp_process_runs_on_dbcalink.rs"),
+    ("epics-ca-rs", "tests/dbput_ca_link_target.rs"),
     ("epics-ca-rs", "tests/differential_libca.rs"),
+    ("epics-ca-rs", "tests/discovery_dns_update.rs"),
     ("epics-ca-rs", "tests/discovery_mdns.rs"),
+    ("epics-ca-rs", "tests/dollar_long_string_record.rs"),
+    ("epics-ca-rs", "tests/each_ca_link_opens_its_own_channel.rs"),
+    ("epics-ca-rs", "tests/long_string_dollar_monitor_counts.rs"),
+    ("epics-ca-rs", "tests/long_string_plain_monitor_counts.rs"),
+    ("epics-ca-rs", "tests/lsi_val_reads_past_len_to_its_nul.rs"),
+    (
+        "epics-ca-rs",
+        "tests/plain_write_fails_on_the_process_status.rs",
+    ),
     (
         "epics-ca-rs",
         "tests/put_failure_status_is_the_layer_not_the_error.rs",
     ),
     ("epics-ca-rs", "tests/put_native_type_conversion.rs"),
+    (
+        "epics-ca-rs",
+        "tests/qtime_tag_monitor_serves_the_raw_stamp.rs",
+    ),
     ("epics-ca-rs", "tests/rate_limit_parity.rs"),
+    (
+        "epics-ca-rs",
+        "tests/refused_put_callback_answers_after_its_process.rs",
+    ),
+    (
+        "epics-ca-rs",
+        "tests/remote_async_put_completes_on_the_records_band.rs",
+    ),
+    ("epics-ca-rs", "tests/rsrv_error_ctx_is_the_record_name.rs"),
+    ("epics-ca-rs", "tests/rsrv_error_frame_matches_softioc.rs"),
+    ("epics-ca-rs", "tests/scalar_string_write_needs_a_nul.rs"),
+    (
+        "epics-ca-rs",
+        "tests/scan_thread_monitor_post_allocates_nothing.rs",
+    ),
+    (
+        "epics-ca-rs",
+        "tests/softioc_a_ca_put_never_waits_on_the_console.rs",
+    ),
+    ("epics-ca-rs", "tests/softioc_db_channel_create_line.rs"),
+    (
+        "epics-ca-rs",
+        "tests/softioc_prompt_ioc_init_starts_the_ca_server.rs",
+    ),
+    ("epics-ca-rs", "tests/swait_remote_input.rs"),
+    (
+        "epics-ca-rs",
+        "tests/the_ca_server_start_prints_rsrvs_bind_lines.rs",
+    ),
+    (
+        "epics-ca-rs",
+        "tests/the_ca_servers_set_tcp_nodelay_on_the_accepted_socket.rs",
+    ),
     ("epics-ca-rs", "tests/tls_end_to_end.rs"),
+    ("epics-ca-rs", "tests/tpro_names_the_ca_client.rs"),
     (
         "epics-ca-rs",
         "tests/zero_length_array_write_is_not_a_short_frame.rs",
     ),
-    ("epics-pva-rs", "tests/channel_array.rs"),
+    ("epics-libcom-rs", "src/net/loopback_mcast.rs"),
+    ("epics-pva-rs", "src/server/pva_server.rs"),
     ("epics-pva-rs", "tests/create_channel_backpressure.rs"),
     ("epics-pva-rs", "tests/heartbeat_echo.rs"),
     ("epics-pva-rs", "tests/interop_pvxs_mods/access_denied.rs"),
@@ -165,15 +320,28 @@ const SCOPE_GATED: &[(&str, &str)] = &[
         "epics-pva-rs",
         "tests/interop_pvxs_mods/field_projection.rs",
     ),
+    (
+        "epics-pva-rs",
+        "tests/interop_pvxs_mods/monitor_seed_mask.rs",
+    ),
     ("epics-pva-rs", "tests/interop_pvxs_mods/pipeline_r20.rs"),
     (
         "epics-pva-rs",
         "tests/interop_pvxs_mods/rpc_and_get_field.rs",
     ),
+    ("epics-pva-rs", "tests/interop_pvxs_mods/search_prefix.rs"),
+    (
+        "epics-pva-rs",
+        "tests/interop_pvxs_mods/server_ports_env.rs",
+    ),
     ("epics-pva-rs", "tests/interop_pvxs_mods/tcp_search_r11.rs"),
     ("epics-pva-rs", "tests/interop_pvxs_mods/tls_interop.rs"),
     ("epics-pva-rs", "tests/interop_pvxs_mods/tls_mtls.rs"),
     ("epics-pva-rs", "tests/interop_pvxs_mods/type_cache.rs"),
+    (
+        "epics-pva-rs",
+        "tests/interop_pvxs_mods/udp_v6_port_held.rs",
+    ),
     ("epics-pva-rs", "tests/monitor_conn_events.rs"),
     (
         "epics-pva-rs",
@@ -186,10 +354,12 @@ const SCOPE_GATED: &[(&str, &str)] = &[
     ("epics-pva-rs", "tests/rpc_empty_reply.rs"),
     ("epics-pva-rs", "tests/rpc_pvrequest.rs"),
     ("epics-pva-rs", "tests/server_info.rs"),
+    ("epics-pva-rs", "tests/server_lifecycle.rs"),
     ("epics-pva-rs", "tests/set_byte_order_monitor_relatch.rs"),
     ("epics-pva-rs", "tests/set_byte_order_renegotiate.rs"),
     ("epics-pva-rs", "tests/tls.rs"),
     ("epics-pva-rs", "tests/ui25_same_process_discovery.rs"),
+    ("mca-rs", "tests/a_remote_siml_is_a_ca_link.rs"),
     ("optics-rs", "tests/integration_tests.rs"),
     ("optics-rs", "tests/table_link_kind.rs"),
     ("regression-ioc", "tests/families.rs"),
@@ -198,6 +368,7 @@ const SCOPE_GATED: &[(&str, &str)] = &[
     ("scaler-rs", "tests/cnt_abort_cancels_delayed_start.rs"),
     ("scaler-rs", "tests/integration_tests.rs"),
     ("std-rs", "tests/e2e_tests.rs"),
+    ("std-rs", "tests/epid_dtyp_put_keeps_the_init_dset.rs"),
     ("std-rs", "tests/integration_tests.rs"),
     ("std-rs", "tests/snl_runners_drive_the_db.rs"),
     ("std-rs", "tests/timestamp_monitor_gate.rs"),
@@ -258,9 +429,28 @@ fn every_crate_that_derives_the_backend_is_accounted_for() {
     let drifted = rtems_exec_gate::derivation_breaches(&root);
     assert!(drifted.is_empty(), "{}", drifted.join("\n\n"));
 
-    for (_, dir) in &declaring {
-        rtems_exec_gate::assert_crate_is_accounted_for(dir.to_str().expect("crate path is UTF-8"));
-    }
+    // Every crate is judged before any verdict, so one crate's breach cannot
+    // hide another's.
+    let breaches: Vec<String> = declaring
+        .iter()
+        .filter_map(|(_, dir)| {
+            let dir = dir.to_str().expect("crate path is UTF-8");
+            std::panic::catch_unwind(|| rtems_exec_gate::assert_crate_is_accounted_for(dir))
+                .err()
+                .map(|p| match p.downcast::<String>() {
+                    Ok(msg) => *msg,
+                    Err(p) => p
+                        .downcast_ref::<&str>()
+                        .map_or_else(|| format!("{dir}: non-string panic"), |s| s.to_string()),
+                })
+        })
+        .collect();
+    assert!(
+        breaches.is_empty(),
+        "{} crate(s) breach the census:\n\n{}",
+        breaches.len(),
+        breaches.join("\n\n")
+    );
     // Measured through the same function the `scope-gated` binary prints from.
     // Filling this constant in is a merge-time step performed by reading a tree
     // (see that binary's docs), and a reading that could disagree with the

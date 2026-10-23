@@ -236,7 +236,9 @@ async fn async_write_notify_completion_runs_on_background_executor() {
     // (3) Raw CA client on a real socket. Blocking, with a read timeout so a
     //     stalled completion surfaces as a test failure, not an infinite hang.
     let mut stream = TcpStream::connect(("127.0.0.1", tcp_port)).expect("connect to CA server");
-    stream.set_read_timeout(Some(budget::FACT_BUDGET)).unwrap();
+    stream
+        .set_read_timeout(Some(fact_budget::FACT_BUDGET))
+        .unwrap();
 
     // Handshake: VERSION (carrying our minor version), CLIENT_NAME, HOST_NAME.
     let mut version = CaHeader::new(CA_PROTO_VERSION);
@@ -345,6 +347,3 @@ async fn async_write_notify_completion_runs_on_background_executor() {
         .expect("udp thread joins")
         .expect("udp responder exits cleanly");
 }
-
-#[path = "common/budget.rs"]
-mod budget;

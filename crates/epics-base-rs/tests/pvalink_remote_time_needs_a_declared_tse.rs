@@ -18,10 +18,11 @@
 //! touches `time` and not `utag`, so the tag survives in BOTH rows while the
 //! timestamp survives only in the declared one.
 
+use epics_base_rs::types::WallTime;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
-use epics_base_rs::server::database::{LinkSet, PvDatabase};
+use epics_base_rs::server::database::{LinkRef, LinkSet, PvDatabase};
 use epics_base_rs::server::records::ai::AiRecord;
 use epics_base_rs::types::EpicsValue;
 
@@ -30,28 +31,29 @@ const REMOTE_SECS: i64 = 4_100_000;
 const REMOTE_NSEC: i32 = 246_802_468;
 const REMOTE_UTAG: u64 = 0x5A5A_0001;
 
-/// Stub `pva` lset with the `time=true` option on: it answers `time_stamp`,
-/// which is the whole gate — the real lset returns `None` without the option.
+/// Stub `pva` lset with the `time=true` option on: it answers
+/// `read_time_stamp`, which is the whole gate — the real lset returns `None`
+/// without the option.
 struct TimedLset;
 
 #[epics_base_rs::async_trait]
 impl LinkSet for TimedLset {
-    fn is_connected(&self, _: &str) -> bool {
+    fn is_connected(&self, _: LinkRef<'_>) -> bool {
         true
     }
-    fn get_cached_value(&self, _: &str) -> Option<EpicsValue> {
+    fn get_cached_value(&self, _: LinkRef<'_>) -> Option<EpicsValue> {
         Some(EpicsValue::Double(3.0))
     }
-    async fn get_value(&self, name: &str) -> Option<EpicsValue> {
-        self.get_cached_value(name)
+    async fn get_value(&self, link: LinkRef<'_>) -> Option<EpicsValue> {
+        self.get_cached_value(link)
     }
-    fn time_stamp(&self, _: &str) -> Option<(i64, i32, u64)> {
+    fn read_time_stamp(&self, _: LinkRef<'_>) -> Option<(i64, i32, u64)> {
         Some((REMOTE_SECS, REMOTE_NSEC, REMOTE_UTAG))
     }
 }
 
-fn remote_stamp() -> SystemTime {
-    SystemTime::UNIX_EPOCH + Duration::new(REMOTE_SECS as u64, REMOTE_NSEC as u32)
+fn remote_stamp() -> WallTime {
+    WallTime::UNIX_EPOCH + Duration::new(REMOTE_SECS as u64, REMOTE_NSEC as u32)
 }
 
 #[epics_macros_rs::epics_test]
@@ -64,12 +66,17 @@ async fn the_declared_tse_decides_whether_the_remote_time_survives() {
         db.add_record(name, Box::new(AiRecord::new(0.0)))
             .await
             .unwrap();
+        db.put_pv_no_process(
+            format!("{name}.INP"),
+            EpicsValue::String("pva://REMOTE:PV".into()),
+        )
+        .await
+        .unwrap();
+        db.put_pv_no_process(format!("{name}.TSE"), EpicsValue::Short(tse))
+            .await
+            .unwrap();
         let rec = db.get_record(name).expect("record added");
         let mut inst = rec.write();
-        inst.put_common_field("INP", EpicsValue::String("pva://REMOTE:PV".into()))
-            .unwrap();
-        inst.put_common_field("TSE", EpicsValue::Short(tse))
-            .unwrap();
         inst.common.udf = 0;
     }
 

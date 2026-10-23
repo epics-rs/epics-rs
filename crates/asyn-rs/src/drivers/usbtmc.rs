@@ -44,6 +44,7 @@
 //! scaffold convention as [`super::ftdi`].
 
 use crate::error::{AsynError, AsynResult, AsynStatus};
+use crate::port::InterfaceMask;
 use crate::port::{PortDriver, PortDriverBase, PortFlags};
 use crate::user::AsynUser;
 
@@ -252,7 +253,7 @@ impl DrvAsynUsbtmcPort {
     ) -> AsynResult<Self> {
         let config =
             UsbtmcConfig::from_positional(vendor_id, product_id, serial_number, priority, flags);
-        let mut base = PortDriverBase::new(
+        let mut base = PortDriverBase::new_exact_flags(
             port_name,
             1,
             PortFlags {
@@ -260,9 +261,16 @@ impl DrvAsynUsbtmcPort {
                 can_block: true,
                 ..PortFlags::default()
             },
+            // asynCommon, asynOctet, asynInt32 (the status-byte / remote-local
+            // parameters) and asynDrvUser (SRQ, STATUS_BYTE, … resolve to
+            // reasons), no asynOption (drvAsynUSBTMC.c:1285-1324).
+            InterfaceMask::COMMON
+                | InterfaceMask::OCTET
+                | InterfaceMask::INT32
+                | InterfaceMask::DRV_USER,
+            InterfaceMask::INT32,
         );
-        base.init_connected(false);
-        base.auto_connect = !config.no_auto_connect();
+        base.init_auto_connect(!config.no_auto_connect());
         Ok(Self {
             base,
             config,
@@ -316,16 +324,10 @@ impl PortDriver for DrvAsynUsbtmcPort {
         &mut self.base
     }
 
-    /// C drvAsynUSBTMC registers asynCommon, asynOctet and asynInt32
-    /// (drvAsynUSBTMC.c:1285-1322) — asynInt32 carries the status-byte /
-    /// remote-local parameters. It registers no asynOption.
-    fn capabilities(&self) -> Vec<crate::interfaces::Capability> {
-        use crate::interfaces::Capability::*;
-        // C drvAsynUSBTMC registers asynDrvUser (drvAsynUSBTMC.c:1319-1324) —
-        // its drvInfo strings (SRQ, STATUS_BYTE, …) resolve to reasons.
-        vec![
-            OctetRead, OctetWrite, Int32Read, Int32Write, DrvUser, Flush, Connect,
-        ]
+    /// asynInt32Base's getBounds, `*low = *high = 0` (asynInt32Base.c:99): C
+    /// leaves it NULL (drvAsynUSBTMC.c:1303-1306).
+    fn get_bounds_int32(&self, _user: &AsynUser) -> AsynResult<(i32, i32)> {
+        Ok((0, 0))
     }
 
     /// C `asynOctetSetInputEos` (`drvAsynUSBTMC.c:963-985`). The terminator is
@@ -369,11 +371,8 @@ impl PortDriver for DrvAsynUsbtmcPort {
     /// reports `eoslen` 0, otherwise the single byte. Reads the same field
     /// `set_input_eos` writes, so the readback cannot disagree with what the
     /// next request header will carry.
-    fn get_input_eos(&self, _user: &AsynUser) -> Vec<u8> {
-        match self.term_char {
-            Some(c) => vec![c],
-            None => Vec::new(),
-        }
+    fn get_input_eos(&self, _user: &AsynUser) -> AsynResult<Vec<u8>> {
+        Ok(self.term_char.into_iter().collect())
     }
 
     /// C `asynOctetSetOutputEos` (`drvAsynUSBTMC.c:1004-1016`): up to
@@ -403,8 +402,8 @@ impl PortDriver for DrvAsynUsbtmcPort {
 
     /// C `asynOctetGetOutputEos` (`drvAsynUSBTMC.c:1018-1028`) — reads back
     /// the same field the setter wrote.
-    fn get_output_eos(&self, _user: &AsynUser) -> Vec<u8> {
-        self.output_eos.clone()
+    fn get_output_eos(&self, _user: &AsynUser) -> AsynResult<Vec<u8>> {
+        Ok(self.output_eos.clone())
     }
 
     fn connect(&mut self, _user: &AsynUser) -> AsynResult<()> {
@@ -433,6 +432,18 @@ impl PortDriver for DrvAsynUsbtmcPort {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// drvAsynUSBTMC.c:1285-1324: asynCommon, asynOctet, asynInt32 and
+    /// asynDrvUser, with asynInt32 the SRQ interrupt source (:1312-1317).
+    #[test]
+    fn the_port_registers_drv_asyn_usbtmc_s_interfaces() {
+        use InterfaceMask as M;
+        let drv = DrvAsynUsbtmcPort::configure("usbtmc_masks", 0, 0, "", 0, 0).unwrap();
+        assert_eq!(
+            (drv.base().interface_mask(), drv.base().interrupt_mask()),
+            (M::COMMON | M::OCTET | M::INT32 | M::DRV_USER, M::INT32)
+        );
+    }
 
     #[test]
     fn bulk_out_header_matches_c_layout() {
@@ -516,7 +527,7 @@ mod tests {
 
         drv.set_input_eos(&user, b"\n").unwrap();
         assert_eq!(drv.term_char(), Some(b'\n'));
-        assert_eq!(drv.get_input_eos(&user), b"\n".to_vec());
+        assert_eq!(drv.get_input_eos(&user).unwrap(), b"\n".to_vec());
         assert_eq!(
             build_request_bulk_in_header(1, 512, drv.term_char())[8],
             BULK_IN_TERM_CHAR_ENABLED,
@@ -536,7 +547,7 @@ mod tests {
         // eoslen 0 is C's `termChar = -1`.
         drv.set_input_eos(&user, b"").unwrap();
         assert_eq!(drv.term_char(), None);
-        assert!(drv.get_input_eos(&user).is_empty());
+        assert!(drv.get_input_eos(&user).unwrap().is_empty());
     }
 
     #[test]
@@ -585,7 +596,7 @@ mod tests {
         // bTag starts at 1 (C drvAsynUSBTMC.c:1260).
         assert_eq!(drv.current_b_tag(), 1);
         // Auto-connect: flags=0 → auto on.
-        assert!(drv.base().auto_connect);
+        assert!(drv.base().is_auto_connect());
     }
 
     #[test]
@@ -599,7 +610,7 @@ mod tests {
             USBTMC_FLAG_NO_AUTO_CONNECT,
         )
         .unwrap();
-        assert!(!drv.base().auto_connect);
+        assert!(!drv.base().is_auto_connect());
     }
 
     // Only meaningful in a build without the hardware feature — with
@@ -618,6 +629,12 @@ mod tests {
             }
             _ => panic!("expected Status error"),
         }
+    }
+
+    #[test]
+    fn get_bounds_is_asyn_int32_base_s() {
+        let drv = DrvAsynUsbtmcPort::configure("usbtmc0", 0x0957, 0x0407, "", 0, 0).unwrap();
+        assert_eq!(drv.get_bounds_int32(&AsynUser::default()).unwrap(), (0, 0));
     }
 
     #[test]

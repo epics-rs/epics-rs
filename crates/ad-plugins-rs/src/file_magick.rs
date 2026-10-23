@@ -1,15 +1,16 @@
+use asyn_rs::port::InterfaceMask;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use ad_core_rs::color::{NDColorMode, convert_rgb_layout};
 use ad_core_rs::error::{ADError, ADResult};
-use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDataType, NDDimension};
+use ad_core_rs::ndarray::{NDArray, NDDataBuffer};
 use ad_core_rs::ndarray_pool::NDArrayPool;
-use ad_core_rs::plugin::file_base::{NDFileMode, NDFileWriter};
-use ad_core_rs::plugin::file_controller::FilePluginController;
-use ad_core_rs::plugin::runtime::{
-    NDPluginProcess, ParamChangeResult, PluginParamSnapshot, ProcessResult,
+use ad_core_rs::plugin::file_base::{NDFileOpenMode, NDFileWriter};
+use ad_core_rs::plugin::file_controller::{
+    FileControl, FilePluginController, SettingsStore, WriterSettings,
 };
+use ad_core_rs::plugin::runtime::{NDPluginProcess, ProcessResult};
 
 use image::codecs::png::{CompressionType as PngCompression, FilterType as PngFilter};
 use image::{DynamicImage, ImageEncoder, ImageFormat};
@@ -50,6 +51,13 @@ impl MagickCompression {
 /// Supports UInt8 and UInt16 data in mono and RGB color modes.
 pub struct MagickWriter {
     current_path: Option<PathBuf>,
+    cfg: WriterSettings<MagickSettings>,
+}
+
+/// The settings C `writeFile` reads from the param library
+/// (NDFileMagick.cpp:118-121).
+#[derive(Clone)]
+struct MagickSettings {
     quality: u8,
     bit_depth: u32,
     compress_type: MagickCompression,
@@ -59,25 +67,29 @@ impl MagickWriter {
     pub fn new() -> Self {
         Self {
             current_path: None,
-            quality: 100,
-            // 0 = keep the native depth of the NDArray data type. GraphicsMagick
-            // `image.depth(0)` is likewise a no-op; an explicit 8/16/32 forces
-            // the output sample depth.
-            bit_depth: 0,
-            compress_type: MagickCompression::None,
+            cfg: WriterSettings::new(MagickSettings {
+                quality: 100,
+                // 0 = keep the native depth of the NDArray data type. GraphicsMagick
+                // `image.depth(0)` is likewise a no-op; an explicit 8/16/32 forces
+                // the output sample depth.
+                bit_depth: 0,
+                compress_type: MagickCompression::None,
+            }),
         }
     }
 
     pub fn set_quality(&mut self, q: u8) {
-        self.quality = q;
+        self.cfg.store().update(|s| s.quality = q);
     }
 
     pub fn set_bit_depth(&mut self, depth: u32) {
-        self.bit_depth = depth;
+        self.cfg.store().update(|s| s.bit_depth = depth);
     }
 
     pub fn set_compress_type(&mut self, idx: i32) {
-        self.compress_type = MagickCompression::from_index(idx);
+        self.cfg
+            .store()
+            .update(|s| s.compress_type = MagickCompression::from_index(idx));
     }
 
     /// C's `openFile` structure chain (NDFileMagick.cpp:71-95).
@@ -290,7 +302,9 @@ impl MagickWriter {
 }
 
 impl NDFileWriter for MagickWriter {
-    fn open_file(&mut self, path: &Path, _mode: NDFileMode, _array: &NDArray) -> ADResult<()> {
+    fn open_file(&mut self, path: &Path, mode: NDFileOpenMode, _array: &NDArray) -> ADResult<()> {
+        // NDFileMagick.cpp:35-38
+        mode.refuse_read_or_append("NDFileMagick")?;
         self.current_path = Some(path.to_path_buf());
         Ok(())
     }
@@ -300,8 +314,9 @@ impl NDFileWriter for MagickWriter {
             .current_path
             .as_ref()
             .ok_or_else(|| ADError::UnsupportedConversion("no file open".into()))?;
+        self.cfg.refresh();
 
-        let img = Self::array_to_image(array, self.bit_depth)?;
+        let img = Self::array_to_image(array, self.cfg.bit_depth)?;
 
         // Determine format from extension, default to PNG
         let format = ImageFormat::from_path(path).unwrap_or(ImageFormat::Png);
@@ -311,7 +326,7 @@ impl NDFileWriter for MagickWriter {
                 // JPEG: use the quality setting.
                 let mut buf = Vec::new();
                 let encoder =
-                    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, self.quality);
+                    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, self.cfg.quality);
                 img.write_with_encoder(encoder).map_err(|e| {
                     ADError::UnsupportedConversion(format!("Magick encode error: {e}"))
                 })?;
@@ -321,7 +336,7 @@ impl NDFileWriter for MagickWriter {
                 // PNG: map the GraphicsMagick compression type onto the PNG
                 // deflate compression level. Zip/BZip → best, None → uncompressed,
                 // everything else → the encoder default.
-                let compression = match self.compress_type {
+                let compression = match self.cfg.compress_type {
                     MagickCompression::None => PngCompression::Uncompressed,
                     MagickCompression::Zip | MagickCompression::BZip => PngCompression::Best,
                     _ => PngCompression::default(),
@@ -354,74 +369,11 @@ impl NDFileWriter for MagickWriter {
         Ok(())
     }
 
+    /// C `readFile` returns asynError (NDFileMagick.cpp:163-168).
     fn read_file(&mut self) -> ADResult<NDArray> {
-        let path = self
-            .current_path
-            .as_ref()
-            .ok_or_else(|| ADError::UnsupportedConversion("no file open".into()))?;
-
-        let img = image::open(path)
-            .map_err(|e| ADError::UnsupportedConversion(format!("Magick read error: {e}")))?;
-
-        let width = img.width() as usize;
-        let height = img.height() as usize;
-
-        match img {
-            DynamicImage::ImageLuma8(buf) => {
-                let mut arr = NDArray::new(
-                    vec![NDDimension::new(width), NDDimension::new(height)],
-                    NDDataType::UInt8,
-                );
-                arr.data = NDDataBuffer::U8(buf.into_raw());
-                Ok(arr)
-            }
-            DynamicImage::ImageRgb8(buf) => {
-                let mut arr = NDArray::new(
-                    vec![
-                        NDDimension::new(3),
-                        NDDimension::new(width),
-                        NDDimension::new(height),
-                    ],
-                    NDDataType::UInt8,
-                );
-                arr.data = NDDataBuffer::U8(buf.into_raw());
-                Ok(arr)
-            }
-            DynamicImage::ImageLuma16(buf) => {
-                let mut arr = NDArray::new(
-                    vec![NDDimension::new(width), NDDimension::new(height)],
-                    NDDataType::UInt16,
-                );
-                arr.data = NDDataBuffer::U16(buf.into_raw());
-                Ok(arr)
-            }
-            DynamicImage::ImageRgb16(buf) => {
-                let mut arr = NDArray::new(
-                    vec![
-                        NDDimension::new(3),
-                        NDDimension::new(width),
-                        NDDimension::new(height),
-                    ],
-                    NDDataType::UInt16,
-                );
-                arr.data = NDDataBuffer::U16(buf.into_raw());
-                Ok(arr)
-            }
-            other => {
-                // Convert anything else to RGB8
-                let rgb = other.to_rgb8();
-                let mut arr = NDArray::new(
-                    vec![
-                        NDDimension::new(3),
-                        NDDimension::new(width),
-                        NDDimension::new(height),
-                    ],
-                    NDDataType::UInt8,
-                );
-                arr.data = NDDataBuffer::U8(rgb.into_raw());
-                Ok(arr)
-            }
-        }
+        Err(ADError::UnsupportedConversion(
+            "NDFileMagick cannot read".into(),
+        ))
     }
 
     fn close_file(&mut self) -> ADResult<()> {
@@ -437,25 +389,89 @@ impl NDFileWriter for MagickWriter {
 /// Magick file processor wrapping `FilePluginController<MagickWriter>`.
 pub struct MagickFileProcessor {
     ctrl: Mutex<FilePluginController<MagickWriter>>,
+    settings: SettingsStore<MagickSettings>,
     quality_idx: Option<usize>,
     bit_depth_idx: Option<usize>,
     compress_type_idx: Option<usize>,
+    /// The plugin's driver, for the posts a capture flush makes.
+    attributes: Option<ad_core_rs::plugin::runtime::PluginAttributes>,
 }
 
 impl MagickFileProcessor {
     pub fn new() -> Self {
+        let writer = MagickWriter::new();
         Self {
-            ctrl: Mutex::new(FilePluginController::new(MagickWriter::new())),
+            settings: writer.cfg.store(),
+            ctrl: Mutex::new(FilePluginController::new(writer)),
             quality_idx: None,
             bit_depth_idx: None,
             compress_type_idx: None,
+            attributes: None,
         }
     }
 }
 
 impl NDPluginProcess for MagickFileProcessor {
+    const ASYN_FLAGS: asyn_rs::port::PortFlags = ad_core_rs::plugin::runtime::ASYN_CANBLOCK;
+    // NDFileMagick.cpp:202, the same mask for both.
+    const INTERFACE_MASK: InterfaceMask = InterfaceMask::GENERIC_POINTER;
+    const INTERRUPT_MASK: InterfaceMask = Self::INTERFACE_MASK;
+
+    fn posts_before_write(&self, reason: usize, value: i32) -> bool {
+        self.ctrl.lock().posts_before_write(reason, value)
+    }
+
+    fn processing_required(&self, array: &NDArray) -> bool {
+        self.ctrl.lock().processing_required(array)
+    }
+
+    /// C NDPluginFile::writeInt32 (NDPluginFile.cpp:799-870). C reads the
+    /// Magick settings from the param library at open (NDFileMagick.cpp:
+    /// 118-121), so the writer takes them inside the write, before any file
+    /// I/O after it.
+    fn validate_int32(
+        &self,
+        reason: usize,
+        _addr: i32,
+        value: i32,
+        verdict: ad_core_rs::plugin::runtime::WriteVerdict<i32>,
+        params: &mut ad_core_rs::plugin::runtime::WritePort<'_>,
+    ) -> ad_core_rs::plugin::runtime::WriteOutcome<i32> {
+        let mut ctrl = self.ctrl.lock();
+        let out = ctrl.write_int32(reason, value, verdict, params);
+        let kept = out.verdict.kept();
+        if Some(reason) == self.quality_idx {
+            let q = kept.clamp(1, 100) as u8;
+            self.settings.update(|s| s.quality = q);
+        } else if Some(reason) == self.bit_depth_idx {
+            self.settings.update(|s| s.bit_depth = kept as u32);
+        } else if Some(reason) == self.compress_type_idx {
+            let c = MagickCompression::from_index(kept);
+            self.settings.update(|s| s.compress_type = c);
+        }
+        out
+    }
+
+    /// C NDPluginFile::writeOctet: the setting is stored inside the write.
+    fn validate_octet(
+        &self,
+        reason: usize,
+        _addr: i32,
+        _value: &str,
+        verdict: ad_core_rs::plugin::runtime::WriteVerdict<String>,
+        _params: &asyn_rs::port::PortDriverBase,
+    ) -> ad_core_rs::plugin::runtime::WriteOutcome<String> {
+        self.ctrl.lock().write_octet(reason, verdict)
+    }
     fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
-        self.ctrl.lock().process_array(array)
+        // Made before the controller lock: its reads wait on the actor,
+        // which takes that lock in its writes.
+        let mut post = ad_core_rs::plugin::runtime::PortPost::of(self.attributes.as_ref());
+        self.ctrl.lock().process_array(array, &mut post)
+    }
+
+    fn bind_attributes(&mut self, attributes: ad_core_rs::plugin::runtime::PluginAttributes) {
+        self.attributes = Some(attributes);
     }
 
     fn plugin_type(&self) -> &str {
@@ -464,8 +480,8 @@ impl NDPluginProcess for MagickFileProcessor {
 
     /// C `NDPluginFile.cpp:948` (base of every file writer) sets
     /// `NDArrayCallbacks = 0`: file plugins write to disk, not downstream.
-    fn does_array_callbacks(&self) -> bool {
-        false
+    fn array_callbacks_seed(&self) -> Option<bool> {
+        Some(false)
     }
 
     fn register_params(
@@ -477,41 +493,37 @@ impl NDPluginProcess for MagickFileProcessor {
         self.quality_idx = Some(base.create_param("MAGICK_QUALITY", ParamType::Int32)?);
         self.bit_depth_idx = Some(base.create_param("MAGICK_BIT_DEPTH", ParamType::Int32)?);
         self.compress_type_idx = Some(base.create_param("MAGICK_COMPRESS_TYPE", ParamType::Int32)?);
-        // Set defaults
-        base.set_int32_param(self.quality_idx.unwrap(), 0, 100)?;
-        base.set_int32_param(self.bit_depth_idx.unwrap(), 0, 8)?;
-        base.set_int32_param(self.compress_type_idx.unwrap(), 0, 0)?;
         Ok(())
-    }
-
-    fn on_param_change(&self, reason: usize, params: &PluginParamSnapshot) -> ParamChangeResult {
-        if Some(reason) == self.quality_idx {
-            let q = params.value.as_i32().clamp(1, 100) as u8;
-            self.ctrl.lock().writer.set_quality(q);
-            return ParamChangeResult::empty();
-        }
-        if Some(reason) == self.bit_depth_idx {
-            let d = params.value.as_i32() as u32;
-            self.ctrl.lock().writer.set_bit_depth(d);
-            return ParamChangeResult::empty();
-        }
-        if Some(reason) == self.compress_type_idx {
-            self.ctrl
-                .lock()
-                .writer
-                .set_compress_type(params.value.as_i32());
-            return ParamChangeResult::empty();
-        }
-        self.ctrl.lock().on_param_change(reason, params)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ad_core_rs::ndarray::{NDDataType, NDDimension};
     use std::sync::atomic::{AtomicU32, Ordering};
 
     static TEST_COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    #[test]
+    fn test_register_params_leaves_the_magick_controls_undefined() {
+        // NDFileMagick.cpp's constructor sets only PluginType.
+        use asyn_rs::port::InterfaceMask;
+        use asyn_rs::port::{PortDriverBase, PortFlags};
+        let mut base = PortDriverBase::new(
+            "MAGICK_INIT",
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
+        );
+        let mut proc = MagickFileProcessor::new();
+        proc.register_params(&mut base).unwrap();
+        for name in ["MAGICK_QUALITY", "MAGICK_BIT_DEPTH", "MAGICK_COMPRESS_TYPE"] {
+            let reason = base.find_param(name).unwrap();
+            assert!(base.get_int32_param(reason, 0).is_err(), "{name}");
+        }
+    }
 
     fn temp_path(ext: &str) -> PathBuf {
         let n = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -519,6 +531,28 @@ mod tests {
             "adcore_test_magick_{}_{n}.{ext}",
             std::process::id()
         ))
+    }
+
+    /// C `openFile` refuses NDFileModeRead (NDFileMagick.cpp:35), so ReadFile
+    /// fails at the open.
+    #[test]
+    fn read_file_is_refused_at_the_open() {
+        let path = temp_path("png");
+        let mut writer = MagickWriter::new();
+        let arr = NDArray::new(
+            vec![NDDimension::new(4), NDDimension::new(4)],
+            NDDataType::UInt8,
+        );
+        writer
+            .open_file(&path, NDFileOpenMode::WRITE, &arr)
+            .unwrap();
+        writer.write_file(&Arc::new(arr)).unwrap();
+        writer.close_file().unwrap();
+        let mut proc = MagickFileProcessor::new();
+        let (out, _base) = crate::test_util::read_file(&mut proc, &path);
+        assert_eq!(out.trace, crate::test_util::read_refused_lines(&path));
+        assert_eq!(out.publish, ad_core_rs::plugin::runtime::Published::Nothing);
+        std::fs::remove_file(&path).ok();
     }
 
     /// R8-75, Magick writer: same defect as the cited TIFF site. C sets
@@ -542,7 +576,7 @@ mod tests {
         let path = temp_path("png");
         let mut writer = MagickWriter::new();
         writer
-            .open_file(&path, NDFileMode::Single, &arr)
+            .open_file(&path, NDFileOpenMode::WRITE, &arr)
             .expect("open");
         let err = writer.write_file(&Arc::new(arr)).unwrap_err();
         assert!(
@@ -572,13 +606,53 @@ mod tests {
         let path = temp_path("png");
         let mut writer = MagickWriter::new();
         writer
-            .open_file(&path, NDFileMode::Single, &arr)
+            .open_file(&path, NDFileOpenMode::WRITE, &arr)
             .expect("open");
         writer
             .write_file(&Arc::new(arr))
             .expect("3-D WITH ColorMode=RGB1 must still write");
         assert!(path.exists());
         std::fs::remove_file(&path).ok();
+    }
+
+    /// C reads the Magick settings per frame (NDFileMagick.cpp:118-121), so a
+    /// setting write during a file write returns at once and the next frame
+    /// takes it.
+    #[test]
+    fn a_setting_write_during_a_busy_write_returns_at_once() {
+        use ad_core_rs::plugin::runtime::WriteVerdict;
+        use asyn_rs::port::InterfaceMask;
+        use asyn_rs::port::{PortDriverBase, PortFlags};
+        let mut base = PortDriverBase::new(
+            "magick_settings_write",
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
+        );
+        let mut proc = MagickFileProcessor::new();
+        proc.register_params(&mut base).unwrap();
+        let mut w = |idx: Option<usize>, v| {
+            proc.validate_int32(
+                idx.unwrap(),
+                0,
+                v,
+                WriteVerdict::Accept(v),
+                &mut ad_core_rs::plugin::runtime::WritePort::new(&mut base),
+            );
+        };
+        let writer = Arc::clone(&proc.ctrl.lock().writer);
+        assert!(
+            crate::test_util::returns_while_busy(&writer, || {
+                w(proc.quality_idx, 70);
+                w(proc.bit_depth_idx, 16);
+            }),
+            "the setting write waited for the file write"
+        );
+        let mut w = writer.lock();
+        assert_eq!(w.cfg.quality, 100, "not read before the next frame");
+        w.cfg.refresh();
+        assert_eq!((w.cfg.quality, w.cfg.bit_depth), (70, 16));
     }
 
     #[test]
@@ -596,16 +670,18 @@ mod tests {
             }
         }
 
-        writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
+        writer
+            .open_file(&path, NDFileOpenMode::WRITE, &arr)
+            .unwrap();
         writer.write_file(&Arc::new(arr.clone())).unwrap();
-
-        let read_back = writer.read_file().unwrap();
-        assert_eq!(read_back.data.data_type(), NDDataType::UInt8);
-        if let (NDDataBuffer::U8(orig), NDDataBuffer::U8(read)) = (&arr.data, &read_back.data) {
-            assert_eq!(orig, read);
-        }
-
         writer.close_file().unwrap();
+
+        let read_back = image::open(&path).unwrap();
+        assert_eq!(read_back.color(), image::ColorType::L8);
+        let NDDataBuffer::U8(orig) = &arr.data else {
+            unreachable!()
+        };
+        assert_eq!(read_back.as_bytes(), &orig[..]);
         std::fs::remove_file(&path).ok();
     }
 
@@ -624,16 +700,18 @@ mod tests {
             }
         }
 
-        writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
+        writer
+            .open_file(&path, NDFileOpenMode::WRITE, &arr)
+            .unwrap();
         writer.write_file(&Arc::new(arr.clone())).unwrap();
-
-        let read_back = writer.read_file().unwrap();
-        assert_eq!(read_back.data.data_type(), NDDataType::UInt16);
-        if let (NDDataBuffer::U16(orig), NDDataBuffer::U16(read)) = (&arr.data, &read_back.data) {
-            assert_eq!(orig, read);
-        }
-
         writer.close_file().unwrap();
+
+        let read_back = image::open(&path).unwrap();
+        assert_eq!(read_back.color(), image::ColorType::L16);
+        let NDDataBuffer::U16(orig) = &arr.data else {
+            unreachable!()
+        };
+        assert_eq!(read_back.into_luma16().into_raw(), *orig);
         std::fs::remove_file(&path).ok();
     }
 
@@ -664,14 +742,15 @@ mod tests {
             }
         }
 
-        writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
+        writer
+            .open_file(&path, NDFileOpenMode::WRITE, &arr)
+            .unwrap();
         writer.write_file(&Arc::new(arr)).unwrap();
-
-        let read_back = writer.read_file().unwrap();
-        assert_eq!(read_back.dims.len(), 3);
-        assert_eq!(read_back.dims[0].size, 3);
-
         writer.close_file().unwrap();
+
+        let read_back = image::open(&path).unwrap();
+        assert_eq!(read_back.color(), image::ColorType::Rgb8);
+        assert_eq!((read_back.width(), read_back.height()), (4, 4));
         std::fs::remove_file(&path).ok();
     }
 
@@ -746,7 +825,7 @@ mod tests {
         let mut w_none = MagickWriter::new();
         w_none.set_compress_type(0); // None
         w_none
-            .open_file(&path_none, NDFileMode::Single, &arr)
+            .open_file(&path_none, NDFileOpenMode::WRITE, &arr)
             .unwrap();
         w_none.write_file(&Arc::new(arr.clone())).unwrap();
         w_none.close_file().unwrap();
@@ -755,7 +834,7 @@ mod tests {
         let mut w_zip = MagickWriter::new();
         w_zip.set_compress_type(7); // Zip
         w_zip
-            .open_file(&path_zip, NDFileMode::Single, &arr)
+            .open_file(&path_zip, NDFileOpenMode::WRITE, &arr)
             .unwrap();
         w_zip.write_file(&Arc::new(arr)).unwrap();
         w_zip.close_file().unwrap();

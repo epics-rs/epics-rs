@@ -15,9 +15,10 @@
 //!     caller is safe: it stalls only that driver's private runtime. This
 //!     must SUCCEED.
 //!
-//! (b) the target port's **own actor thread** — a `PortDriver` method calling
-//!     back into its own port. Parking here can never be serviced: the actor
-//!     is the thread that would have to run the request. This must return an
+//! (b) inside the target port's **own driver call** — a `PortDriver` method
+//!     calling back into its own port, on the actor thread or, on a port
+//!     without `ASYN_CANBLOCK`, on the caller the actor is lent to. The port
+//!     is busy with the very call that is asking, so this must return an
 //!     ERROR rather than deadlock (and rather than panic).
 
 // RTEMS-EXEC-MODEL-ALLOW(1): checked, not waived — all 1 ran and passed
@@ -34,11 +35,12 @@ use std::time::Duration;
 
 use asyn_rs::error::AsynResult;
 use asyn_rs::param::ParamType;
+use asyn_rs::port::InterfaceMask;
 use asyn_rs::port::{PortDriver, PortDriverBase, PortFlags};
 use asyn_rs::port_handle::PortHandle;
 use asyn_rs::request::RequestOp;
 use asyn_rs::runtime::config::RuntimeConfig;
-use asyn_rs::runtime::port::create_port_runtime;
+use asyn_rs::runtime::port::create_port_runtime_unclaimed;
 use asyn_rs::user::AsynUser;
 
 /// Every test blocks a thread on purpose; a regression must surface as a
@@ -74,7 +76,13 @@ struct PlainDriver {
 
 impl PlainDriver {
     fn new(name: &str) -> Self {
-        let mut base = PortDriverBase::new(name, 1, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            name,
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
+        );
         base.create_param("VAL", ParamType::Int32).unwrap();
         Self { base }
     }
@@ -98,8 +106,9 @@ impl PortDriver for PlainDriver {
 /// `can call blocking only when running on the multi-threaded runtime`.
 #[test]
 fn submit_blocking_from_foreign_current_thread_runtime_succeeds() {
-    let (handle, _join) = create_port_runtime(PlainDriver::new("ctx_a"), RuntimeConfig::default())
-        .expect("the port runtime thread must start");
+    let (handle, _join) =
+        create_port_runtime_unclaimed(PlainDriver::new("ctx_a"), RuntimeConfig::default())
+            .expect("the port runtime thread must start");
     let port: PortHandle = handle.port_handle().clone();
 
     run_with_watchdog("ctx-a", move || {
@@ -121,11 +130,10 @@ fn submit_blocking_from_foreign_current_thread_runtime_succeeds() {
     .unwrap();
 }
 
-// ── (b) caller is the target port's own actor thread ─────────────────────────
+// ── (b) caller is inside the target port's own driver call ───────────────────
 
 /// A driver that calls back into its own port from inside a `PortDriver`
-/// method — i.e. from the actor thread that would have to service the very
-/// request it is submitting.
+/// method — i.e. while the port is running the call that is submitting.
 struct SelfCallingDriver {
     base: PortDriverBase,
     /// Handle to this driver's own port, installed after the runtime is built.
@@ -145,7 +153,7 @@ impl PortDriver for SelfCallingDriver {
 
     fn io_read_int32(&mut self, _user: &AsynUser) -> AsynResult<i32> {
         let me = self.self_handle.lock().clone().expect("handle installed");
-        // Re-entrant call into our own port, from our own actor thread.
+        // Re-entrant call into our own port, from inside its driver call.
         match me.submit_blocking(RequestOp::Int32Read, AsynUser::new(0)) {
             Ok(_) => panic!("re-entrant submit_blocking must not report success"),
             Err(_) => {
@@ -158,8 +166,9 @@ impl PortDriver for SelfCallingDriver {
 
 /// (b) A `PortDriver` method that calls `submit_blocking` on its own port must
 /// get an error back. Blocking would deadlock forever (the actor cannot
-/// service the request it is waiting on) and today's `block_in_place` panics
-/// the actor thread instead. Neither is acceptable: the call must fail fast.
+/// service the request it is waiting on), and the old `block_in_place`
+/// panicked the actor thread instead. Neither is acceptable: the call must
+/// fail fast.
 ///
 /// On unfixed main the actor thread panics, the reply channel is dropped, and
 /// the outer call fails with "actor dropped reply channel" — the port is dead
@@ -169,7 +178,13 @@ fn submit_blocking_from_own_actor_thread_returns_error() {
     let self_handle = Arc::new(parking_lot::Mutex::new(None));
     let got_error = Arc::new(AtomicBool::new(false));
 
-    let mut base = PortDriverBase::new("ctx_b", 1, PortFlags::default());
+    let mut base = PortDriverBase::new(
+        "ctx_b",
+        1,
+        PortFlags::default(),
+        InterfaceMask::UNMIGRATED_ALL,
+        InterfaceMask::UNMIGRATED_INTERRUPTS,
+    );
     base.create_param("VAL", ParamType::Int32).unwrap();
     let driver = SelfCallingDriver {
         base,
@@ -177,14 +192,14 @@ fn submit_blocking_from_own_actor_thread_returns_error() {
         got_error: got_error.clone(),
     };
 
-    let (handle, _join) = create_port_runtime(driver, RuntimeConfig::default())
+    let (handle, _join) = create_port_runtime_unclaimed(driver, RuntimeConfig::default())
         .expect("the port runtime thread must start");
     let port: PortHandle = handle.port_handle().clone();
     *self_handle.lock() = Some(port.clone());
 
     let got_error_probe = got_error.clone();
     run_with_watchdog("ctx-b", move || {
-        // Drives io_read_int32 on the actor thread, which re-enters the port.
+        // Drives io_read_int32, which re-enters the port.
         let v = port
             .read_int32_blocking(0, 0)
             .expect("the outer request itself must still complete");

@@ -80,9 +80,8 @@ impl std::error::Error for ConvertJsonError {}
 /// There is no `comment` token here: `yajl_lex_lex` consumes a comment and
 /// loops (`yajl_lex.c:730-737`), so `Comment` never escapes the lexer and
 /// [`Lexer::lex_comment`] reports its outcome on its own enum instead. There
-/// is no identifier token because identifiers are lexed only in key position
-/// (`yajl_lex_key`, `:791`), and key position is unreachable — `dbcj_start_map`
-/// cancels the parse at the `{` itself.
+/// is no identifier token because `yajl_lex_key` hands one back as
+/// `yajl_tok_string` (`yajl_lex.c:892-894`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Tok {
     Eof,
@@ -267,14 +266,73 @@ impl Lexer {
             }
         };
 
-        // C's `lexed:` epilogue (`yajl_lex.c:749-776`).
+        self.lexed(tok, txt, start_offset, *off)
+    }
+
+    /// C `yajl_lex_key` (`yajl_lex.c:793-895`) — the KEY lexer, which takes a
+    /// JSON5 identifier where the value lexer takes `true` or a number.
+    fn lex_key(&mut self, txt: &[u8], off: &mut usize) -> (Tok, Vec<u8>) {
+        let mut start_offset = *off;
+        let tok = loop {
+            if *off >= txt.len() {
+                break Tok::Eof;
+            }
+            let c = self.read_char(txt, off);
+            match c {
+                b'\t' | b'\n' | 0x0b | 0x0c | b'\r' | b' ' => start_offset += 1,
+                b'}' => break Tok::RightBrace,
+                b'\'' | b'"' => break self.lex_string(txt, off, c),
+                b'/' => match self.lex_comment(txt, off) {
+                    CommentEnd::Done => {
+                        self.buf.clear();
+                        self.buf_in_use = false;
+                        start_offset = *off;
+                    }
+                    CommentEnd::Eof => break Tok::Eof,
+                    CommentEnd::Error => break Tok::Error,
+                },
+                b'$' | b'_' | b'A'..=b'Z' | b'a'..=b'z' => {
+                    // `yajl_lex_identifier` (`:406-420`) reads one past the end.
+                    loop {
+                        if *off >= txt.len() {
+                            break;
+                        }
+                        let c = self.read_char(txt, off);
+                        if !matches!(c, b'$' | b'_' | b'0'..=b'9' | b'A'..=b'Z' | b'a'..=b'z') {
+                            self.unread_char(off);
+                            break;
+                        }
+                    }
+                    // `RETURN_IF_EOF` inside the loop is `yajl_tok_eof`.
+                    if *off >= txt.len() {
+                        break Tok::Eof;
+                    }
+                    break Tok::Str;
+                }
+                _ => {
+                    self.error = LexError::InvalidChar;
+                    break Tok::Error;
+                }
+            }
+        };
+        let identifier = tok == Tok::Str && !matches!(txt.get(start_offset), Some(b'"' | b'\''));
+        let (tok, out) = self.lexed(tok, txt, start_offset, *off);
+        // An identifier has no quotes for the string arm to strip.
+        if identifier {
+            return (tok, txt.get(start_offset..*off).unwrap_or(&[]).to_vec());
+        }
+        (tok, out)
+    }
+
+    /// C's `lexed:` epilogue (`yajl_lex.c:749-776`).
+    fn lexed(&mut self, tok: Tok, txt: &[u8], start_offset: usize, off: usize) -> (Tok, Vec<u8>) {
         let mut out = Vec::new();
         if tok == Tok::Eof || self.buf_in_use {
             if !self.buf_in_use {
                 self.buf.clear();
             }
             self.buf_in_use = true;
-            let span = txt.get(start_offset..*off).unwrap_or(&[]);
+            let span = txt.get(start_offset..off).unwrap_or(&[]);
             self.buf.extend_from_slice(span);
             self.buf_off = 0;
             if tok != Tok::Eof {
@@ -282,7 +340,7 @@ impl Lexer {
                 self.buf_in_use = false;
             }
         } else if tok != Tok::Error {
-            out = txt.get(start_offset..*off).unwrap_or(&[]).to_vec();
+            out = txt.get(start_offset..off).unwrap_or(&[]).to_vec();
         }
         // "special case for strings. skip the quotes." (`:772-776`)
         if matches!(tok, Tok::Str | Tok::StrWithEscapes) && out.len() >= 2 {
@@ -750,9 +808,7 @@ fn string_decode(src: &[u8]) -> Vec<u8> {
     out
 }
 
-/// `yajl_state`, less the map states (`dbcj_start_map` cancels at the `{`, so
-/// no key is ever lexed) and `got_value` (which needs
-/// `yajl_allow_multiple_values`).
+/// `yajl_state`, less `got_value` (which needs `yajl_allow_multiple_values`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum State {
     Start,
@@ -760,13 +816,18 @@ enum State {
     ArrayStart,
     ArrayNeedVal,
     ArrayGotVal,
+    MapStart,
+    MapNeedKey,
+    MapSep,
+    MapNeedVal,
+    MapGotVal,
     ParseError,
     LexicalError,
 }
 
 /// `yajl_status`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Status {
+pub(crate) enum Status {
     Ok,
     Error,
     ClientCanceled,
@@ -778,8 +839,53 @@ struct Context {
     depth: i32,
     target: DbFieldType,
     elems: usize,
+    /// `dbrSize - 1`, the cut the string callback applies.
+    string_capacity: usize,
+    numbers: Numbers,
     tokens: Vec<Token>,
     refusal: Option<String>,
+}
+
+/// Which number slot the callback table fills. yajl hands a number to
+/// `yajl_number` raw when that slot is set and only otherwise parses it for
+/// `yajl_integer` / `yajl_double` (`yajl_parser.c:305-355`), so under
+/// `dblsj_callbacks` no number can overflow — it is refused as text.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Numbers {
+    /// `dbcj_callbacks`: `dbcj_integer`, `dbcj_double`.
+    Parsed,
+    /// `dblsj_callbacks`: `dblsj_number`.
+    Refused,
+}
+
+/// A `yajl_callbacks` table. Each returns C's `int`, and `false` cancels the
+/// parse through `_CC_CHK`; a slot C leaves NULL is written as the refusal it
+/// stands for, so every table writes all of them.
+pub(crate) trait Callbacks {
+    fn null(&mut self) -> bool;
+    fn boolean(&mut self, value: bool) -> bool;
+    fn integer(&mut self, value: i64) -> bool;
+    fn double(&mut self, value: f64) -> bool;
+    fn string(&mut self, bytes: &[u8]) -> bool;
+    fn start_map(&mut self) -> bool;
+    fn start_array(&mut self) -> bool;
+    /// `yajl_map_key`. Only a table whose `start_map` lets the parse in sees a
+    /// key, and C skips a NULL slot, so the default goes on.
+    fn map_key(&mut self, _key: &[u8]) -> bool {
+        true
+    }
+    /// `yajl_end_map` / `yajl_end_array`; a NULL slot goes on.
+    fn end_map(&mut self) -> bool {
+        true
+    }
+    fn end_array(&mut self) -> bool {
+        true
+    }
+    /// `Some` when the table fills `yajl_number`, which takes a number raw
+    /// before yajl would parse (and overflow-check) it.
+    fn number(&mut self, _text: &[u8]) -> Option<bool> {
+        None
+    }
 }
 
 impl Context {
@@ -800,14 +906,16 @@ impl Context {
         }
         true
     }
+}
 
+impl Callbacks for Context {
     /// `dbcj_null` (`dbConvertJSON.c:30-33`).
     fn null(&mut self) -> bool {
         self.refuse("dbConvertJSON: Null objects not supported\n".into())
     }
 
     /// `dbcj_boolean` (`:35-38`).
-    fn boolean(&mut self) -> bool {
+    fn boolean(&mut self, _value: bool) -> bool {
         self.refuse("dbConvertJSON: Boolean not supported\n".into())
     }
 
@@ -837,11 +945,24 @@ impl Context {
         self.store(Token::Double(value))
     }
 
+    /// `dblsj_number` (`:65-69`), the slot only `dblsj_callbacks` fills.
+    fn number(&mut self, text: &[u8]) -> Option<bool> {
+        if self.numbers == Numbers::Parsed {
+            return None;
+        }
+        let shown = String::from_utf8_lossy(text);
+        Some(self.refuse(format!(
+            "dbLSConvertJSON: Numeric value {shown} provided, string expected\n"
+        )))
+    }
+
     /// `dbcj_string` (`:71-93`): a string is legal ONLY into a `DBF_STRING`
     /// buffer. The comment at `:75-77` is why — nothing here knows a
     /// `DBF_CHAR` field's width, so `dbpf` never reaches this function for one
     /// (it sends the raw bytes instead). The type test precedes the capacity
     /// guard, so a string past the end still refuses the whole put.
+    /// `dblsj_string` (`:95-108`) is this body at `dbrType = DBF_STRING`,
+    /// `elems = 1`.
     fn string(&mut self, bytes: &[u8]) -> bool {
         if self.target != DbFieldType::String {
             let shown = String::from_utf8_lossy(bytes);
@@ -849,22 +970,22 @@ impl Context {
                 "dbConvertJSON: String \"{shown}\" provided, numeric value expected\n"
             ));
         }
-        let len = bytes.len().min(DBR_STRING_CAPACITY);
+        let len = bytes.len().min(self.string_capacity);
         self.store(Token::Text(PvString::from_bytes(&bytes[..len])))
     }
 }
 
 /// C's `struct yajl_handle_t` reduced to the fields a `dbcj` parse touches.
-struct Parser {
+pub(crate) struct Parser<C> {
     lexer: Lexer,
     stack: Vec<State>,
     bytes_consumed: usize,
     parse_error: Option<&'static str>,
-    ctx: Context,
+    pub(crate) ctx: C,
 }
 
-impl Parser {
-    fn new(ctx: Context) -> Self {
+impl<C: Callbacks> Parser<C> {
+    pub(crate) fn new(ctx: C) -> Self {
         Self {
             lexer: Lexer::default(),
             stack: vec![State::Start],
@@ -894,7 +1015,17 @@ impl Parser {
         Status::ClientCanceled
     }
 
-    /// C `yajl_do_parse` (`yajl_parser.c:207-524`), minus the map arms.
+    /// `yajl_parse` over the whole of `txt`.
+    pub(crate) fn parse(&mut self, txt: &[u8]) -> Status {
+        self.do_parse(txt)
+    }
+
+    /// `yajl_complete_parse`.
+    pub(crate) fn finish(&mut self) -> Status {
+        self.do_finish()
+    }
+
+    /// C `yajl_do_parse` (`yajl_parser.c:207-524`).
     fn do_parse(&mut self, txt: &[u8]) -> Status {
         self.bytes_consumed = 0;
         loop {
@@ -914,11 +1045,11 @@ impl Parser {
                     }
                 }
                 State::LexicalError | State::ParseError => return Status::Error,
-                State::Start | State::ArrayStart | State::ArrayNeedVal => {
+                State::Start | State::ArrayStart | State::ArrayNeedVal | State::MapNeedVal => {
                     let mut off = self.bytes_consumed;
                     let (tok, buf) = self.lexer.lex(txt, &mut off);
                     self.bytes_consumed = off;
-                    let mut push_array = false;
+                    let mut push = None;
                     let accepted = match tok {
                         Tok::Eof => return Status::Ok,
                         Tok::Error => {
@@ -930,13 +1061,17 @@ impl Parser {
                             let decoded = string_decode(&buf);
                             self.ctx.string(&decoded)
                         }
-                        Tok::Bool => self.ctx.boolean(),
+                        Tok::Bool => self.ctx.boolean(buf.first() == Some(&b't')),
                         Tok::Null => self.ctx.null(),
-                        Tok::LeftBrace => self.ctx.start_map(),
+                        Tok::LeftBrace => {
+                            push = Some(State::MapStart);
+                            self.ctx.start_map()
+                        }
                         Tok::LeftBracket => {
-                            push_array = true;
+                            push = Some(State::ArrayStart);
                             self.ctx.start_array()
                         }
+                        Tok::Integer | Tok::Double if let Some(ok) = self.ctx.number(&buf) => ok,
                         Tok::Integer => match parse_integer(&buf) {
                             Ok(value) => self.ctx.integer(value),
                             Err(()) => {
@@ -960,7 +1095,9 @@ impl Parser {
                         {
                             // A trailing comma before `]` is JSON5's
                             // (`yajl_parser.c:357-360` admits `array_need_val`);
-                            // `dbcj_callbacks` has no `end_array`.
+                            if !self.ctx.end_array() {
+                                return self.cancel();
+                            }
                             self.stack.pop();
                             continue;
                         }
@@ -974,13 +1111,84 @@ impl Parser {
                         return self.cancel();
                     }
                     // "got a value. transition depends on the state we're in."
-                    if self.state() == State::Start {
-                        self.set(State::ParseComplete);
-                    } else {
-                        self.set(State::ArrayGotVal);
+                    match self.state() {
+                        State::Start => self.set(State::ParseComplete),
+                        State::MapNeedVal => self.set(State::MapGotVal),
+                        _ => self.set(State::ArrayGotVal),
                     }
-                    if push_array {
-                        self.stack.push(State::ArrayStart);
+                    if let Some(state) = push {
+                        self.stack.push(state);
+                    }
+                }
+                // "only difference between these two states is that in start
+                // '}' is valid, whereas in need_key, we've parsed a comma" —
+                // and JSON5 admits that trailing comma too.
+                State::MapStart | State::MapNeedKey => {
+                    let mut off = self.bytes_consumed;
+                    let (tok, key) = self.lexer.lex_key(txt, &mut off);
+                    self.bytes_consumed = off;
+                    match tok {
+                        Tok::Eof => return Status::Ok,
+                        Tok::Error => self.set(State::LexicalError),
+                        Tok::Str | Tok::StrWithEscapes => {
+                            let key = if tok == Tok::StrWithEscapes {
+                                string_decode(&key)
+                            } else {
+                                key
+                            };
+                            if !self.ctx.map_key(&key) {
+                                return self.cancel();
+                            }
+                            self.set(State::MapSep);
+                        }
+                        Tok::RightBrace => {
+                            if !self.ctx.end_map() {
+                                return self.cancel();
+                            }
+                            self.stack.pop();
+                        }
+                        _ => {
+                            self.set(State::ParseError);
+                            self.parse_error =
+                                Some("invalid object key (must be a string or identifier)");
+                        }
+                    }
+                }
+                State::MapSep => {
+                    let mut off = self.bytes_consumed;
+                    let (tok, _) = self.lexer.lex(txt, &mut off);
+                    self.bytes_consumed = off;
+                    match tok {
+                        Tok::Colon => self.set(State::MapNeedVal),
+                        Tok::Eof => return Status::Ok,
+                        Tok::Error => self.set(State::LexicalError),
+                        _ => {
+                            self.set(State::ParseError);
+                            self.parse_error =
+                                Some("object key and value must be separated by a colon (':')");
+                        }
+                    }
+                }
+                State::MapGotVal => {
+                    let mut off = self.bytes_consumed;
+                    let (tok, buf) = self.lexer.lex(txt, &mut off);
+                    self.bytes_consumed = off;
+                    match tok {
+                        Tok::RightBrace => {
+                            if !self.ctx.end_map() {
+                                return self.cancel();
+                            }
+                            self.stack.pop();
+                        }
+                        Tok::Comma => self.set(State::MapNeedKey),
+                        Tok::Eof => return Status::Ok,
+                        Tok::Error => self.set(State::LexicalError),
+                        _ => {
+                            self.set(State::ParseError);
+                            self.parse_error =
+                                Some("after key and value, inside map, I expect ',' or '}'");
+                            self.restore_error_offset(buf.len());
+                        }
                     }
                 }
                 State::ArrayGotVal => {
@@ -989,6 +1197,9 @@ impl Parser {
                     self.bytes_consumed = off;
                     match tok {
                         Tok::RightBracket => {
+                            if !self.ctx.end_array() {
+                                return self.cancel();
+                            }
                             self.stack.pop();
                         }
                         Tok::Comma => self.set(State::ArrayNeedVal),
@@ -1033,38 +1244,77 @@ impl Parser {
 
     /// C `yajl_render_error_string` with `verbose = 1`, which is what
     /// `dbPutConvertJSON` passes (`dbConvertJSON.c:172`).
-    ///
-    /// The window is emitted as bytes and only then read as text, so a caret
-    /// that lands mid-codepoint costs a replacement character here where C
-    /// writes the partial byte; nothing else differs.
-    fn render_error(&self, txt: &[u8]) -> String {
-        let (kind, detail) = match self.state() {
-            State::ParseError => ("parse", self.parse_error),
-            State::LexicalError => ("lexical", Some(self.lexer.error.text())),
-            _ => ("unknown", None),
-        };
-        let mut out = format!("{kind} error");
-        if let Some(detail) = detail {
-            out.push_str(": ");
-            out.push_str(detail);
-        }
-        out.push('\n');
+    pub(crate) fn render_error(&self, txt: &[u8]) -> String {
+        self.error(txt).to_string()
+    }
 
+    /// [`Self::render_error`] as data, for a caller that prints it later.
+    pub(crate) fn error(&self, txt: &[u8]) -> YajlError {
+        let kind = match self.state() {
+            State::ParseError => YajlErrorKind::Parse(self.parse_error),
+            State::LexicalError => YajlErrorKind::Lexical(self.lexer.error),
+            _ => YajlErrorKind::Unknown,
+        };
         // "append as many spaces as needed to make sure the error falls at
         // char 41" (`yajl_parser.c:131-132`).
         let offset = self.bytes_consumed;
         let spaces = if offset < 30 { 40 - offset } else { 10 };
         let start = offset.saturating_sub(30);
         let end = (offset + 30).min(txt.len()).max(start);
-        out.push_str(&" ".repeat(spaces));
-        let window: Vec<u8> = txt[start..end]
-            .iter()
-            .map(|&b| if b == b'\n' || b == b'\r' { b' ' } else { b })
-            .collect();
-        out.push_str(&String::from_utf8_lossy(&window));
-        out.push('\n');
-        out.push_str("                     (right here) ------^\n");
-        out
+        let mut window = [0; 60];
+        for (w, &b) in window.iter_mut().zip(&txt[start..end]) {
+            *w = if b == b'\n' || b == b'\r' { b' ' } else { b };
+        }
+        YajlError {
+            kind,
+            spaces: spaces as u8,
+            window,
+            len: (end - start) as u8,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum YajlErrorKind {
+    Parse(Option<&'static str>),
+    Lexical(LexError),
+    Unknown,
+}
+
+/// What `yajl_render_error_string` prints for one failed parse, fixed-size.
+///
+/// The window is emitted as bytes and only then read as text, so a caret
+/// that lands mid-codepoint costs a replacement character here where C
+/// writes the partial byte; nothing else differs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct YajlError {
+    kind: YajlErrorKind,
+    spaces: u8,
+    window: [u8; 60],
+    len: u8,
+}
+
+impl std::fmt::Display for YajlError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (kind, detail) = match self.kind {
+            YajlErrorKind::Parse(detail) => ("parse", detail),
+            YajlErrorKind::Lexical(e) => ("lexical", Some(e.text())),
+            YajlErrorKind::Unknown => ("unknown", None),
+        };
+        f.write_str(kind)?;
+        f.write_str(" error")?;
+        if let Some(detail) = detail {
+            write!(f, ": {detail}")?;
+        }
+        writeln!(f)?;
+        let window = String::from_utf8_lossy(&self.window[..usize::from(self.len)]);
+        writeln!(
+            f,
+            "{:spaces$}{window}",
+            "",
+            spaces = usize::from(self.spaces)
+        )?;
+        f.write_str("                     (right here) ------^\n")
     }
 }
 
@@ -1124,7 +1374,9 @@ impl Token {
 }
 
 fn truncate(v: &EpicsValue) -> PvString {
-    let text = v.to_string();
+    let EpicsValue::String(text) = v else {
+        unreachable!("both callers hand a DBR_STRING row");
+    };
     let bytes = text.as_bytes();
     PvString::from_bytes(&bytes[..bytes.len().min(DBR_STRING_CAPACITY)])
 }
@@ -1148,7 +1400,7 @@ pub fn db_put_convert_json(
     capacity: usize,
 ) -> Result<EpicsValue, ConvertJsonError> {
     if json.is_empty() {
-        return Ok(EpicsValue::DoubleArray(Vec::new().into()).convert_to(target));
+        return Ok(EpicsValue::DoubleArray(Vec::new().into()).into_type(target));
     }
 
     let txt = json.as_bytes();
@@ -1156,6 +1408,8 @@ pub fn db_put_convert_json(
         depth: 0,
         target,
         elems: capacity,
+        string_capacity: DBR_STRING_CAPACITY,
+        numbers: Numbers::Parsed,
         tokens: Vec::new(),
         refusal: None,
     });
@@ -1184,8 +1438,40 @@ pub fn db_put_convert_json(
             Some(ints) => EpicsValue::Int64Array(ints.into()),
             None => EpicsValue::DoubleArray(tokens.iter().map(Token::real).collect()),
         }
-        .convert_to(target),
+        .into_type(target),
     )
+}
+
+/// C `dbLSConvertJSON` (`dbConvertJSON.c:191-236`) — what a CONSTANT link
+/// loads into a long string (`dbConstLoadLS`, `dbConstLink.c:178-191`).
+///
+/// `Ok(Some)` is the first string; `Ok(None)` is a parse that ended with no
+/// string callback (`[]`, or a bare number still pending because C never calls
+/// `yajl_complete_parse`), where C's `*plen = pdest - pdest + 1` is 1. Any
+/// number, null, bool, map or nested array before the end is `Err`. The
+/// `SIZV - 1` cut is the record's ([`crate::server::record::LsLoad::Text`]).
+pub fn db_ls_convert_json(json: &str) -> Result<Option<PvString>, ConvertJsonError> {
+    let txt = json.as_bytes();
+    let mut parser = Parser::new(Context {
+        depth: 0,
+        target: DbFieldType::String,
+        elems: 1,
+        string_capacity: usize::MAX,
+        numbers: Numbers::Refused,
+        tokens: Vec::new(),
+        refusal: None,
+    });
+    if parser.do_parse(txt) != Status::Ok {
+        return Err(ConvertJsonError {
+            refusal: parser.ctx.refusal.take(),
+            diagnostic: format!("dbLSConvertJSON: {}", parser.render_error(txt)),
+        });
+    }
+    // `dblsj_number` stores nothing, so the one token is a string.
+    Ok(parser.ctx.tokens.into_iter().find_map(|t| match t {
+        Token::Text(s) => Some(s),
+        Token::Int(_) | Token::Double(_) => None,
+    }))
 }
 
 #[cfg(test)]

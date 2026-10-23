@@ -20,10 +20,10 @@ No C dependencies. Just `cargo build`.
 - SET/OFF/DIR/FOFF mode support
 - NTM retarget during motion
 - UEIP readback
-- Acceleration as ACCL (time) or ACCS (EGU/sec²) selected by ACCU; driver-bound rate is EGU/sec²
+- Acceleration as ACCL (time) or ACCS (EGU/sec²) selected by ACCU; driver-bound rate is steps/sec² (EGU/sec² over |MRES|)
 - RSTM restore mode (Never/Always/NearZero/Conditional) with MRES-mismatch interlock
 - SYNC trigger, RVEL actual velocity
-- 64-bit raw fields (RVAL/RRBV/RMP/REP/RDIF) for high-resolution / long-travel axes
+- Raw fields (RVAL/RRBV/RMP/REP/RDIF/RVEL/LRVL) are DBF_LONG as in motorRecord.dbd
 - Device support via asyn motor interface (move, home, moveToHome, stop, profile)
 - Builder pattern for easy motor setup
 - SimMotor for testing (time-based linear interpolation)
@@ -86,7 +86,7 @@ cargo bench -p motor-rs
 ```
 
 The suite covers record processing, motion phases, coordinate conversion,
-device support, axis runtime, C parity (backlash, SET mode, retry, readback,
+device support, the poll loop, C parity (backlash, SET mode, retry, readback,
 NTM), and simulated motor behaviour.
 
 ## Dependencies

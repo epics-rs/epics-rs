@@ -15,11 +15,14 @@ use rayon::prelude::*;
 use ad_core_rs::ndarray::{NDArray, NDDataBuffer};
 use ad_core_rs::ndarray_pool::NDArrayPool;
 use ad_core_rs::plugin::runtime::{
-    NDPluginProcess, ParamUpdate, PluginParamSnapshot, PluginRuntimeHandle, ProcessResult,
+    ArraySource, NDPluginProcess, ParamUpdate, PluginParamSnapshot, PluginRuntimeHandle,
+    ProcessResult,
 };
 use ad_core_rs::plugin::wiring::WiringRegistry;
 use asyn_rs::param::ParamType;
+use asyn_rs::port::InterfaceMask;
 use asyn_rs::port::PortDriverBase;
+use epics_base_rs::types::c_cast;
 use parking_lot::Mutex;
 
 /// Parameter indices for NDStats plugin-specific params.
@@ -64,8 +67,6 @@ pub struct NDStatsParams {
     pub cursor_val: usize,
     pub profile_size_x: usize,
     pub profile_size_y: usize,
-    pub skewx_value: usize,
-    pub skewy_value: usize,
     pub profile_average_x: usize,
     pub profile_average_y: usize,
     pub profile_threshold_x: usize,
@@ -593,10 +594,11 @@ mod simd_kernels {
 
     /// [`super::formula_count_pass`] on vectors: C's bin arithmetic on `f64`
     /// lanes, each lane classified before the truncation so that it lands
-    /// where [`super::slot`] puts it. `bin < 0` is `t <= -1`, `bin > last`
-    /// is `t >= last + 1` (a saturated cast falls on the same side), and a
-    /// NaN truncates to 0 as `as i64` does. The increments stay scalar; a
-    /// histogram scatter has no vector form.
+    /// where [`super::slot`] puts it. `bin < 0` is `t <= -1` or a `t` C's
+    /// `(int)` turns into `INT_MIN` (NaN, `>= 2^31`); `bin > last` is tested
+    /// on the truncated bin, since with HistSize 0 a `t` in (-1, 0) is bin 0,
+    /// past `last` = -1. The increments stay scalar; a histogram scatter has
+    /// no vector form.
     macro_rules! hist_kernel {
         ($t:ty, $vec:ident, $hist:ident, |$y:ident| $to_f64:expr) => {
             #[simd]
@@ -606,9 +608,9 @@ mod simd_kernels {
                 let max = S::f64s::splat(simd, f.hist_max);
                 let scale = S::f64s::splat(simd, f.scale);
                 let half = S::f64s::splat(simd, 0.5);
-                let zero = S::f64s::splat(simd, 0.0);
                 let neg_one = S::f64s::splat(simd, -1.0);
-                let end = S::f64s::splat(simd, (f.last + 1) as f64);
+                let int_end = S::f64s::splat(simd, 2_147_483_648.0);
+                let last = S::i64s::splat(simd, f.last);
                 let below_slot = S::i64s::splat(simd, hist_size as i64);
                 let above_slot = S::i64s::splat(simd, hist_size as i64 + 1);
                 let mut chunks = v.chunks_exact(S::$vec::LEN);
@@ -616,9 +618,9 @@ mod simd_kernels {
                     let $y = S::$vec::from_slice(simd, c);
                     for val in $to_f64 {
                         let t = (val - min) * scale + half;
-                        let below = t.simd_le(neg_one) | val.simd_lt(min);
-                        let above = t.simd_ge(end) | val.simd_gt(max);
-                        let bin = S::i64s::truncate_from(t.simd_eq(t).select(t, zero));
+                        let below = t.simd_le(neg_one) | !t.simd_lt(int_end) | val.simd_lt(min);
+                        let bin = S::i64s::truncate_from(t);
+                        let above = bin.simd_gt(last) | val.simd_gt(max);
                         let slot = below.select(below_slot, above.select(above_slot, bin));
                         for &i in slot.as_slice() {
                             slots[i as usize] += 1;
@@ -1444,7 +1446,9 @@ fn centroid_from(p: &Projection) -> CentroidResult {
 /// - `hist_size`: number of bins
 /// - `hist_min` / `hist_max`: value range for binning
 /// - `scale = (hist_size - 1) / (hist_max - hist_min)`,
-///   `bin = ((val - hist_min) * scale + 0.5) as i64`
+///   `bin = (int)((val - hist_min) * scale + 0.5)`, C's x86 cast: NaN and
+///   anything outside `int` give `INT_MIN`, so they count below. No range
+///   is refused: `hist_max <= hist_min` and `hist_size == 0` bin as C does.
 /// - `bin < 0` or `val < hist_min` counts in `below`; `bin > hist_size - 1`
 ///   or `val > hist_max` in `above`
 /// - Entropy = `-sum(p * ln(p))` for non-zero bins where `p = count / total_count`
@@ -1454,26 +1458,17 @@ pub fn compute_histogram(
     hist_min: f64,
     hist_max: f64,
 ) -> (Vec<f64>, f64, f64, f64) {
-    if hist_size == 0 || hist_max <= hist_min {
-        return (vec![], 0.0, 0.0, 0.0);
-    }
-
     let counts = ad_core_rs::with_buffer!(data, |v| histogram_of(v, hist_size, hist_min, hist_max));
     let histogram: Vec<f64> = counts.bins().iter().map(|&c| c as f64).collect();
 
     // Compute entropy matching C++: -sum(count * ln(count)) / nElements
     // Zero-count bins are treated as count=1 (so ln(1)=0, effectively skipped)
-    let n_elements = data.len() as f64;
-    let entropy = if n_elements > 0.0 {
-        let mut ent = 0.0f64;
-        for &count in &histogram {
-            let c = if count <= 0.0 { 1.0 } else { count };
-            ent += c * c.ln();
-        }
-        -ent / n_elements
-    } else {
-        0.0
-    };
+    let mut ent = 0.0f64;
+    for &count in &histogram {
+        let c = if count <= 0.0 { 1.0 } else { count };
+        ent += c * c.ln();
+    }
+    let entropy = -ent / data.len() as f64;
 
     (
         histogram,
@@ -1602,7 +1597,7 @@ enum Slot {
 /// including which side of an edge a value falls on.
 #[inline(always)]
 fn slot(value: f64, hist_min: f64, hist_max: f64, scale: f64, last: i64) -> Slot {
-    let bin = ((value - hist_min) * scale + 0.5) as i64;
+    let bin = i64::from(c_cast::f64_to_i32((value - hist_min) * scale + 0.5));
     if bin < 0 || value < hist_min {
         Slot::Below
     } else if bin > last || value > hist_max {
@@ -1766,8 +1761,6 @@ pub struct StatsProcessor {
     params: NDStatsParams,
     /// Shared cell to export params after register_params is called.
     params_out: Arc<Mutex<NDStatsParams>>,
-    /// Optional sender to push time series data to the TS port driver.
-    ts_sender: Option<crate::time_series::TimeSeriesSender>,
 }
 
 impl StatsProcessor {
@@ -1777,7 +1770,6 @@ impl StatsProcessor {
             config: Mutex::new(StatsConfig::default()),
             params: NDStatsParams::default(),
             params_out: Arc::new(Mutex::new(NDStatsParams::default())),
-            ts_sender: None,
         }
     }
 
@@ -1791,9 +1783,31 @@ impl StatsProcessor {
         self.params_out.clone()
     }
 
-    /// Set the time series sender for pushing data to the TS port driver.
-    pub fn set_ts_sender(&mut self, sender: crate::time_series::TimeSeriesSender) {
-        self.ts_sender = Some(sender);
+    /// C `computeHistX` (NDPluginStats.cpp:655-673) over the params as they
+    /// stand once `written` holds `value`: bin left edges with histSize as
+    /// the divisor, so the last sits strictly below histMax. An unset param
+    /// reads 0, where C reads an uninitialised local.
+    fn hist_x(
+        &self,
+        params: &asyn_rs::port::PortDriverBase,
+        written: usize,
+        value: f64,
+    ) -> Vec<ParamUpdate> {
+        let p = &self.params;
+        let read = |reason: usize| {
+            if reason == written {
+                value
+            } else if reason == p.hist_size {
+                params.get_int32_param(reason, 0).map_or(0.0, f64::from)
+            } else {
+                params.get_float64_param(reason, 0).unwrap_or(0.0)
+            }
+        };
+        let size = (read(p.hist_size) as i32).max(1);
+        let (min, max) = (read(p.hist_min), read(p.hist_max));
+        let scale = (max - min) / f64::from(size);
+        let hist_x = (0..size).map(|i| min + f64::from(i) * scale).collect();
+        vec![ParamUpdate::float64_array(p.hist_x_array, hist_x)]
     }
 }
 
@@ -1804,9 +1818,54 @@ impl Default for StatsProcessor {
 }
 
 impl NDPluginProcess for StatsProcessor {
-    fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
+    const ASYN_FLAGS: asyn_rs::port::PortFlags = ad_core_rs::plugin::runtime::ASYN_NONE;
+    // NDPluginStats.cpp:778-779, the same mask for both.
+    const INTERFACE_MASK: InterfaceMask = InterfaceMask::INT32_ARRAY
+        .or(InterfaceMask::FLOAT64_ARRAY)
+        .or(InterfaceMask::GENERIC_POINTER);
+    const INTERRUPT_MASK: InterfaceMask = Self::INTERFACE_MASK;
+
+    /// NDPluginStats.cpp:777: address 1 carries the time-series point.
+    fn max_addr(&self) -> usize {
+        2
+    }
+
+    /// C `NDPluginStats::writeInt32` drops the base class status
+    /// (`status = (asynStatus) callParamCallbacks();`, NDPluginStats.cpp:700): a refused NDPluginDriver write keeps
+    /// its clamp and succeeds.
+    fn validate_int32(
+        &self,
+        reason: usize,
+        _addr: i32,
+        _value: i32,
+        verdict: ad_core_rs::plugin::runtime::WriteVerdict<i32>,
+        params: &mut ad_core_rs::plugin::runtime::WritePort<'_>,
+    ) -> ad_core_rs::plugin::runtime::WriteOutcome<i32> {
+        let verdict = verdict.succeed();
+        if reason == self.params.hist_size {
+            let hist_x = self.hist_x(params, reason, f64::from(verdict.kept()));
+            return ad_core_rs::plugin::runtime::WriteOutcome::from(verdict).set_updates(hist_x);
+        }
+        verdict.into()
+    }
+
+    fn validate_float64(
+        &self,
+        reason: usize,
+        _addr: i32,
+        _value: f64,
+        verdict: ad_core_rs::plugin::runtime::WriteVerdict<f64>,
+        params: &asyn_rs::port::PortDriverBase,
+    ) -> ad_core_rs::plugin::runtime::WriteOutcome<f64> {
         let p = &self.params;
-        let info = array.info();
+        if reason == p.hist_min || reason == p.hist_max {
+            let hist_x = self.hist_x(params, reason, verdict.kept());
+            return ad_core_rs::plugin::runtime::WriteOutcome::from(verdict).set_updates(hist_x);
+        }
+        verdict.into()
+    }
+    fn process_array(&self, array: &Arc<NDArray>, pool: &NDArrayPool) -> ProcessResult {
+        let p = &self.params;
         let cfg = *self.config.lock();
 
         let mut result = if cfg.do_compute_statistics {
@@ -1819,39 +1878,64 @@ impl NDPluginProcess for StatsProcessor {
         // the profile vectors inside `doComputeCentroidT` and reads the
         // moments off them, NDPluginStats.cpp:207-240). C rejects ndims>2 for
         // both (NDPluginStats.cpp:205 and :338, `if (ndims>2) return
-        // asynError`): they are computed only for a true 2-D image, never by
-        // treating the first two dims of a 4-D (or [x,y,1]) array as a slice.
+        // asynError`), never treating the first two dims of a 4-D (or
+        // [x,y,1]) array as a slice; a 1-D array is one row (:464-466).
+        let ndims = array.dims.len();
+        let size_x = array.dims.first().map_or(0, |d| d.size);
+        let size_y = match ndims {
+            0 => 0,
+            1 => 1,
+            _ => array.dims[1].size,
+        };
+        let projection = if ndims <= 2 && (cfg.do_compute_centroid || cfg.do_compute_profiles) {
+            project(&array.data, size_x, size_y, cfg.centroid_threshold)
+        } else {
+            None
+        };
         let mut centroid = CentroidResult::default();
-        let two_d = info.color_size <= 1 && array.dims.len() == 2;
-        if two_d && (cfg.do_compute_centroid || cfg.do_compute_profiles) {
-            if let Some(p) = project(
-                &array.data,
-                info.x_size,
-                info.y_size,
-                cfg.centroid_threshold,
-            ) {
-                if cfg.do_compute_centroid {
-                    centroid = centroid_from(&p);
+        if cfg.do_compute_centroid
+            && let Some(p) = &projection
+        {
+            centroid = centroid_from(p);
+        }
+        if cfg.do_compute_profiles {
+            let profiles = match &projection {
+                // C fills the average and threshold profiles only inside
+                // doComputeCentroidT (NDPluginStats.cpp:207-240), so it posts
+                // them as zeros with ComputeCentroid off; the docs make each
+                // calculation independent, and that C defect is not copied.
+                Some(p) => profiles_from(
+                    p,
+                    &array.data,
+                    centroid.centroid_x,
+                    centroid.centroid_y,
+                    cfg.cursor_x,
+                    cfg.cursor_y,
+                ),
+                // A refused array still posts the profiles C calloc'd at
+                // profileSize (NDPluginStats.cpp:468-479).
+                None => {
+                    let (x, y) = (vec![0.0; size_x], vec![0.0; size_y]);
+                    ProfileResult {
+                        avg_x: x.clone(),
+                        avg_y: y.clone(),
+                        threshold_x: x.clone(),
+                        threshold_y: y.clone(),
+                        centroid_x: x.clone(),
+                        centroid_y: y.clone(),
+                        cursor_x: x,
+                        cursor_y: y,
+                    }
                 }
-                if cfg.do_compute_profiles {
-                    let profiles = profiles_from(
-                        &p,
-                        &array.data,
-                        centroid.centroid_x,
-                        centroid.centroid_y,
-                        cfg.cursor_x,
-                        cfg.cursor_y,
-                    );
-                    result.profile_avg_x = profiles.avg_x;
-                    result.profile_avg_y = profiles.avg_y;
-                    result.profile_threshold_x = profiles.threshold_x;
-                    result.profile_threshold_y = profiles.threshold_y;
-                    result.profile_centroid_x = profiles.centroid_x;
-                    result.profile_centroid_y = profiles.centroid_y;
-                    result.profile_cursor_x = profiles.cursor_x;
-                    result.profile_cursor_y = profiles.cursor_y;
-                }
-            }
+            };
+            result.profile_avg_x = profiles.avg_x;
+            result.profile_avg_y = profiles.avg_y;
+            result.profile_threshold_x = profiles.threshold_x;
+            result.profile_threshold_y = profiles.threshold_y;
+            result.profile_centroid_x = profiles.centroid_x;
+            result.profile_centroid_y = profiles.centroid_y;
+            result.profile_cursor_x = profiles.cursor_x;
+            result.profile_cursor_y = profiles.cursor_y;
         }
 
         // Histogram computation
@@ -1867,63 +1951,66 @@ impl NDPluginProcess for StatsProcessor {
         // Compute cursor value: pixel at (cursor_x, cursor_y). C clamps the
         // cursor to the last valid pixel (NDPluginStats.cpp:357-362) and always
         // reads it — an out-of-range cursor yields the edge pixel, never 0.
-        if info.color_size <= 1 && array.dims.len() == 2 && info.x_size > 0 && info.y_size > 0 {
-            let cx = cfg.cursor_x.min(info.x_size - 1);
-            let cy = cfg.cursor_y.min(info.y_size - 1);
-            result.cursor_value = array.data.get_as_f64(cy * info.x_size + cx).unwrap_or(0.0);
+        if cfg.do_compute_profiles && projection.is_some() {
+            let cx = cfg.cursor_x.min(size_x - 1);
+            let cy = cfg.cursor_y.min(size_y - 1);
+            result.cursor_value = array.data.get_as_f64(cy * size_x + cx).unwrap_or(0.0);
         }
 
-        let mut updates = vec![
-            ParamUpdate::float64(p.min_value, result.min),
-            ParamUpdate::float64(p.max_value, result.max),
-            ParamUpdate::float64(p.mean_value, result.mean),
-            ParamUpdate::float64(p.sigma_value, result.sigma),
-            ParamUpdate::float64(p.total, result.total),
-            ParamUpdate::float64(p.net, result.net),
-            ParamUpdate::float64(p.min_x, result.min_x as f64),
-            ParamUpdate::float64(p.min_y, result.min_y as f64),
-            ParamUpdate::float64(p.max_x, result.max_x as f64),
-            ParamUpdate::float64(p.max_y, result.max_y as f64),
-            ParamUpdate::float64(p.centroid_x, centroid.centroid_x),
-            ParamUpdate::float64(p.centroid_y, centroid.centroid_y),
-            ParamUpdate::float64(p.sigma_x, centroid.sigma_x),
-            ParamUpdate::float64(p.sigma_y, centroid.sigma_y),
-            ParamUpdate::float64(p.sigma_xy, centroid.sigma_xy),
-            ParamUpdate::float64(p.centroid_total, centroid.centroid_total),
-            ParamUpdate::float64(p.skewness_x, centroid.skewness_x),
-            ParamUpdate::float64(p.skewness_y, centroid.skewness_y),
-            ParamUpdate::float64(p.kurtosis_x, centroid.kurtosis_x),
-            ParamUpdate::float64(p.kurtosis_y, centroid.kurtosis_y),
-            ParamUpdate::float64(p.eccentricity, centroid.eccentricity),
-            ParamUpdate::float64(p.orientation, centroid.orientation),
-            ParamUpdate::int32(p.hist_below, result.hist_below as i32),
-            ParamUpdate::int32(p.hist_above, result.hist_above as i32),
-            ParamUpdate::float64(p.hist_entropy, result.hist_entropy),
-            ParamUpdate::float64(p.cursor_val, result.cursor_value),
-            ParamUpdate::int32(p.profile_size_x, info.x_size as i32),
-            ParamUpdate::int32(p.profile_size_y, info.y_size as i32),
-        ];
-
-        // Histogram waveforms: the counts (HIST_ARRAY) and the bin X axis
-        // (HIST_X_ARRAY). C++ NDPluginStats::computeHistX fills the X axis
-        // with bin left edges: `scale = (histMax - histMin) / histSize` and
-        // `histX[i] = histMin + i*scale` for i in 0..histSize. The divisor is
-        // the bin count (histSize), not histSize-1, so the last bin's X is
-        // histMin + (histSize-1)*scale, strictly below histMax.
-        if cfg.do_compute_histogram && !result.histogram.is_empty() {
-            updates.push(ParamUpdate::float64_array(
-                p.hist_array,
-                result.histogram.clone(),
-            ));
-            let n = result.histogram.len();
-            let step = (cfg.hist_max - cfg.hist_min) / n as f64;
-            let hist_x: Vec<f64> = (0..n).map(|i| cfg.hist_min + i as f64 * step).collect();
-            updates.push(ParamUpdate::float64_array(p.hist_x_array, hist_x));
+        // C sets each group only under its Compute* flag
+        // (NDPluginStats.cpp:468-479,589-640): a group that is off keeps its
+        // last value, UDF until a frame computes it.
+        let mut updates = Vec::new();
+        if cfg.do_compute_statistics {
+            updates.extend([
+                ParamUpdate::float64(p.min_value, result.min),
+                ParamUpdate::float64(p.max_value, result.max),
+                ParamUpdate::float64(p.mean_value, result.mean),
+                ParamUpdate::float64(p.sigma_value, result.sigma),
+                ParamUpdate::float64(p.total, result.total),
+                ParamUpdate::float64(p.net, result.net),
+                ParamUpdate::float64(p.min_x, result.min_x as f64),
+                ParamUpdate::float64(p.min_y, result.min_y as f64),
+                ParamUpdate::float64(p.max_x, result.max_x as f64),
+                ParamUpdate::float64(p.max_y, result.max_y as f64),
+            ]);
+        }
+        if cfg.do_compute_centroid {
+            updates.extend([
+                ParamUpdate::float64(p.centroid_x, centroid.centroid_x),
+                ParamUpdate::float64(p.centroid_y, centroid.centroid_y),
+                ParamUpdate::float64(p.sigma_x, centroid.sigma_x),
+                ParamUpdate::float64(p.sigma_y, centroid.sigma_y),
+                ParamUpdate::float64(p.sigma_xy, centroid.sigma_xy),
+                ParamUpdate::float64(p.centroid_total, centroid.centroid_total),
+                ParamUpdate::float64(p.skewness_x, centroid.skewness_x),
+                ParamUpdate::float64(p.skewness_y, centroid.skewness_y),
+                ParamUpdate::float64(p.kurtosis_x, centroid.kurtosis_x),
+                ParamUpdate::float64(p.kurtosis_y, centroid.kurtosis_y),
+                ParamUpdate::float64(p.eccentricity, centroid.eccentricity),
+                ParamUpdate::float64(p.orientation, centroid.orientation),
+            ]);
+        }
+        if cfg.do_compute_histogram {
+            updates.extend([
+                ParamUpdate::int32(p.hist_below, result.hist_below as i32),
+                ParamUpdate::int32(p.hist_above, result.hist_above as i32),
+                ParamUpdate::float64(p.hist_entropy, result.hist_entropy),
+            ]);
+        }
+        if cfg.do_compute_profiles {
+            updates.push(ParamUpdate::float64(p.cursor_val, result.cursor_value));
+        }
+        if cfg.do_compute_centroid || cfg.do_compute_profiles {
+            updates.extend([
+                ParamUpdate::int32(p.profile_size_x, size_x as i32),
+                ParamUpdate::int32(p.profile_size_y, size_y as i32),
+            ]);
         }
 
         // Profile waveforms: emit the computed X/Y projections to asyn
         // clients (C++ doCallbacksFloat64Array for each PROFILE_* waveform).
-        if cfg.do_compute_profiles && !result.profile_avg_x.is_empty() {
+        if cfg.do_compute_profiles {
             updates.push(ParamUpdate::float64_array(
                 p.profile_average_x,
                 result.profile_avg_x.clone(),
@@ -1958,43 +2045,55 @@ impl NDPluginProcess for StatsProcessor {
             ));
         }
 
-        // Send time series data to TS port driver (if configured)
-        if let Some(ref sender) = self.ts_sender {
-            let ts_data = crate::time_series::TimeSeriesData {
-                values: vec![
-                    result.min,
-                    result.min_x as f64,
-                    result.min_y as f64,
-                    result.max,
-                    result.max_x as f64,
-                    result.max_y as f64,
-                    result.mean,
-                    result.sigma,
-                    result.total,
-                    result.net,
-                    centroid.centroid_total,
-                    centroid.centroid_x,
-                    centroid.centroid_y,
-                    centroid.sigma_x,
-                    centroid.sigma_y,
-                    centroid.sigma_xy,
-                    centroid.skewness_x,
-                    centroid.skewness_y,
-                    centroid.kurtosis_x,
-                    centroid.kurtosis_y,
-                    centroid.eccentricity,
-                    centroid.orientation,
-                    // C `timeSeries[TSTimestamp] = pArray->timeStamp`
-                    // (NDPluginStats.cpp:577) — the standalone double.
-                    array.time_stamp,
-                ],
-            };
-            let _ = sender.try_send(ts_data);
+        // Histogram waveform: the counts (HIST_ARRAY), after the profiles
+        // as C posts it (NDPluginStats.cpp:637). The bin X axis is posted
+        // by the HistSize/HistMin/HistMax write (`on_param_change`).
+        if cfg.do_compute_histogram {
+            updates.push(ParamUpdate::float64_array(
+                p.hist_array,
+                result.histogram.clone(),
+            ));
         }
+
+        // C posts the time-series point at address 1 every frame
+        // (NDPluginStats.cpp:555-586), whatever ArrayCallbacks says.
+        let ts_point = crate::time_series_plugin::time_series_point(
+            pool,
+            array,
+            &[
+                result.min,
+                result.min_x as f64,
+                result.min_y as f64,
+                result.max,
+                result.max_x as f64,
+                result.max_y as f64,
+                result.mean,
+                result.sigma,
+                result.total,
+                result.net,
+                centroid.centroid_total,
+                centroid.centroid_x,
+                centroid.centroid_y,
+                centroid.sigma_x,
+                centroid.sigma_y,
+                centroid.sigma_xy,
+                centroid.skewness_x,
+                centroid.skewness_y,
+                centroid.kurtosis_x,
+                centroid.kurtosis_y,
+                centroid.eccentricity,
+                centroid.orientation,
+                // C `timeSeries[TSTimestamp] = pArray->timeStamp`
+                // (NDPluginStats.cpp:577) — the standalone double.
+                array.time_stamp,
+            ],
+        );
 
         *self.latest_stats.lock() = result;
         // C++ Stats forwards the input array to downstream plugins
-        ProcessResult::forward(array, updates)
+        let mut out = ProcessResult::forward(array, updates);
+        out.addressed.extend(ts_point.map(|a| (1, a)));
+        out
     }
 
     fn plugin_type(&self) -> &str {
@@ -2005,9 +2104,10 @@ impl NDPluginProcess for StatsProcessor {
         &mut self,
         base: &mut PortDriverBase,
     ) -> Result<(), asyn_rs::error::AsynError> {
+        // NDPluginStats.cpp's constructor sets only PluginType; every control
+        // param below is left to its PINI record.
         self.params.compute_statistics =
             base.create_param("COMPUTE_STATISTICS", ParamType::Int32)?;
-        base.set_int32_param(self.params.compute_statistics, 0, 1)?;
 
         self.params.bgd_width = base.create_param("BGD_WIDTH", ParamType::Int32)?;
         self.params.min_value = base.create_param("MIN_VALUE", ParamType::Float64)?;
@@ -2022,7 +2122,6 @@ impl NDPluginProcess for StatsProcessor {
         self.params.max_y = base.create_param("MAX_Y", ParamType::Float64)?;
 
         self.params.compute_centroid = base.create_param("COMPUTE_CENTROID", ParamType::Int32)?;
-        base.set_int32_param(self.params.compute_centroid, 0, 1)?;
 
         self.params.centroid_threshold =
             base.create_param("CENTROID_THRESHOLD", ParamType::Float64)?;
@@ -2032,8 +2131,8 @@ impl NDPluginProcess for StatsProcessor {
         self.params.sigma_x = base.create_param("SIGMAX_VALUE", ParamType::Float64)?;
         self.params.sigma_y = base.create_param("SIGMAY_VALUE", ParamType::Float64)?;
         self.params.sigma_xy = base.create_param("SIGMAXY_VALUE", ParamType::Float64)?;
-        self.params.skewness_x = base.create_param("SKEWNESSX_VALUE", ParamType::Float64)?;
-        self.params.skewness_y = base.create_param("SKEWNESSY_VALUE", ParamType::Float64)?;
+        self.params.skewness_x = base.create_param("SKEWX_VALUE", ParamType::Float64)?;
+        self.params.skewness_y = base.create_param("SKEWY_VALUE", ParamType::Float64)?;
         self.params.kurtosis_x = base.create_param("KURTOSISX_VALUE", ParamType::Float64)?;
         self.params.kurtosis_y = base.create_param("KURTOSISY_VALUE", ParamType::Float64)?;
         self.params.eccentricity = base.create_param("ECCENTRICITY_VALUE", ParamType::Float64)?;
@@ -2041,10 +2140,8 @@ impl NDPluginProcess for StatsProcessor {
 
         self.params.compute_histogram = base.create_param("COMPUTE_HISTOGRAM", ParamType::Int32)?;
         self.params.hist_size = base.create_param("HIST_SIZE", ParamType::Int32)?;
-        base.set_int32_param(self.params.hist_size, 0, 256)?;
         self.params.hist_min = base.create_param("HIST_MIN", ParamType::Float64)?;
         self.params.hist_max = base.create_param("HIST_MAX", ParamType::Float64)?;
-        base.set_float64_param(self.params.hist_max, 0, 255.0)?;
         // HIST_BELOW/HIST_ABOVE are integer pixel counts: C registers them as
         // asynInt32 and pushes via setIntegerParam (NDPluginStats.cpp:827-828,
         // 627-628; epicsInt32 fields NDPluginStats.h:86-87). A client reading
@@ -2055,16 +2152,12 @@ impl NDPluginProcess for StatsProcessor {
 
         self.params.compute_profiles = base.create_param("COMPUTE_PROFILES", ParamType::Int32)?;
         self.params.cursor_x = base.create_param("CURSOR_X", ParamType::Int32)?;
-        base.set_int32_param(self.params.cursor_x, 0, 0)?;
         self.params.cursor_y = base.create_param("CURSOR_Y", ParamType::Int32)?;
-        base.set_int32_param(self.params.cursor_y, 0, 0)?;
 
         self.params.cursor_val = base.create_param("CURSOR_VAL", ParamType::Float64)?;
         self.params.profile_size_x = base.create_param("PROFILE_SIZE_X", ParamType::Int32)?;
         self.params.profile_size_y = base.create_param("PROFILE_SIZE_Y", ParamType::Int32)?;
 
-        self.params.skewx_value = base.create_param("SKEWX_VALUE", ParamType::Float64)?;
-        self.params.skewy_value = base.create_param("SKEWY_VALUE", ParamType::Float64)?;
         self.params.profile_average_x =
             base.create_param("PROFILE_AVERAGE_X", ParamType::Float64Array)?;
         self.params.profile_average_y =
@@ -2114,7 +2207,9 @@ impl NDPluginProcess for StatsProcessor {
         } else if reason == p.cursor_y {
             cfg.cursor_y = snapshot.value.as_i32().max(0) as usize;
         } else if reason == p.hist_size {
-            cfg.hist_size = (snapshot.value.as_i32().max(1)) as usize;
+            // C bins a HistSize of 0 into an empty HistArray; a negative one
+            // crashes C (calloc fails, then a NULL HistArray), so it bins as 0.
+            cfg.hist_size = snapshot.value.as_i32().max(0) as usize;
         } else if reason == p.hist_min {
             cfg.hist_min = snapshot.value.as_f64();
         } else if reason == p.hist_max {
@@ -2124,48 +2219,38 @@ impl NDPluginProcess for StatsProcessor {
     }
 }
 
-/// Create a stats plugin runtime with an integrated time series port.
-///
-/// Returns:
-/// Create a stats plugin runtime. The TS receiver is stored in the registry
-/// for later pickup by `NDTimeSeriesConfigure`.
+/// Create a stats plugin runtime: C's two addresses (NDPluginStats.cpp:777),
+/// address 1 carrying the time-series point an NDPluginTimeSeries port reads.
 pub fn create_stats_runtime(
-    port_name: &str,
-    pool: Arc<NDArrayPool>,
-    queue_size: usize,
-    ndarray_port: &str,
+    claim: &asyn_rs::registry::PortClaim,
+    max_memory: usize,
+    queue_size: i32,
+    blocking_callbacks: i32,
+    source: impl Into<ArraySource>,
     wiring: Arc<WiringRegistry>,
-    ts_registry: &crate::time_series::TsReceiverRegistry,
+    threads: ad_core_rs::plugin::runtime::PluginThreads,
 ) -> (
     PluginRuntimeHandle,
     Arc<Mutex<StatsResult>>,
     NDStatsParams,
     std::thread::JoinHandle<()>,
 ) {
-    let (ts_tx, ts_rx) = tokio::sync::mpsc::channel(256);
-
-    let mut processor = StatsProcessor::new();
-    processor.set_ts_sender(ts_tx);
+    let processor = StatsProcessor::new();
     let stats_handle = processor.stats_handle();
     let params_handle = processor.params_handle();
 
     let (plugin_handle, data_jh) = ad_core_rs::plugin::runtime::create_plugin_runtime(
-        port_name,
+        claim,
         processor,
-        pool,
+        max_memory,
         queue_size,
-        ndarray_port,
+        blocking_callbacks,
+        source,
         wiring,
+        threads,
     );
 
     let stats_params = *params_handle.lock();
-
-    // Store the TS receiver for NDTimeSeriesConfigure to pick up
-    let channel_names: Vec<String> = crate::time_series::STATS_TS_CHANNEL_NAMES
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-    ts_registry.store(port_name, ts_rx, channel_names);
 
     (plugin_handle, stats_handle, stats_params, data_jh)
 }
@@ -2173,44 +2258,111 @@ pub fn create_stats_runtime(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// NDPluginStats.cpp:777 passes maxAddr 2 whoever builds the plugin.
+    #[test]
+    fn a_stats_port_has_c_s_two_addresses() {
+        let (handle, _jh) = ad_core_rs::plugin::runtime::create_plugin_runtime(
+            &asyn_rs::asyn_record::claim_port("STATS_ADDR").unwrap(),
+            StatsProcessor::new(),
+            1_000_000,
+            1,
+            0,
+            "",
+            Arc::new(WiringRegistry::new()),
+            ad_core_rs::plugin::runtime::DEFAULT_PLUGIN_THREADS,
+        );
+        assert_eq!(handle.port_runtime().port_handle().max_addr(), 2);
+    }
+
+    /// `status = (asynStatus) callParamCallbacks();` (NDPluginStats.cpp:700).
+    #[test]
+    fn a_refused_base_write_succeeds_as_c_write_int32_does() {
+        use ad_core_rs::plugin::runtime::WriteVerdict;
+        let proc = StatsProcessor::new();
+        let mut base = asyn_rs::port::PortDriverBase::new(
+            "T",
+            1,
+            Default::default(),
+            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
+            asyn_rs::port::InterfaceMask::UNMIGRATED_INTERRUPTS,
+        );
+        let clamp = WriteVerdict::Refuse {
+            keep: 1,
+            message: String::new(),
+        };
+        assert_eq!(
+            proc.validate_int32(
+                0,
+                0,
+                98,
+                clamp,
+                &mut ad_core_rs::plugin::runtime::WritePort::new(&mut base)
+            )
+            .verdict,
+            WriteVerdict::Accept(1)
+        );
+    }
     use ad_core_rs::ndarray::{NDDataType, NDDimension};
 
     #[test]
-    fn test_ts_timestamp_channel_is_the_standalone_double() {
-        // R8-66 family: C `timeSeries[TSTimestamp] = pArray->timeStamp`
-        // (NDPluginStats.cpp:577) — the standalone double a driver sets from its
-        // own clock, not a value derived from epicsTS. The port sent
-        // `timestamp.as_f64()`.
-        use crate::time_series::{NUM_STATS_TS_CHANNELS, STATS_TS_CHANNEL_NAMES};
+    fn test_runtime_leaves_the_controls_to_the_database() {
+        // NDPluginStats.cpp's constructor sets only PluginType.
+        let (handle, _stats, p, _jh) = create_stats_runtime(
+            &asyn_rs::asyn_record::claim_port("STATS_INIT").unwrap(),
+            1_000_000,
+            1,
+            0,
+            "",
+            Arc::new(WiringRegistry::new()),
+            ad_core_rs::plugin::runtime::DEFAULT_PLUGIN_THREADS,
+        );
+        let port = handle.port_runtime().port_handle();
+        for reason in [
+            p.compute_statistics,
+            p.compute_centroid,
+            p.hist_size,
+            p.cursor_x,
+            p.cursor_y,
+        ] {
+            assert!(port.read_int32_blocking(reason, 0).is_err());
+        }
+        assert!(port.read_float64_blocking(p.hist_max, 0).is_err());
+    }
+
+    #[test]
+    fn test_ts_point_is_posted_at_address_1() {
+        // C posts MAX_TIME_SERIES_TYPES doubles at address 1, TSTimestamp last
+        // as `pArray->timeStamp` — the driver's own clock, not epicsTS — with
+        // the frame's uniqueId and epicsTS (NDPluginStats.cpp:555-586).
         use ad_core_rs::ndarray::NDArray;
         use ad_core_rs::ndarray_pool::NDArrayPool;
         use ad_core_rs::plugin::runtime::NDPluginProcess;
 
-        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
-        let mut processor = StatsProcessor::new();
-        processor.set_ts_sender(tx);
-
+        let processor = StatsProcessor::new();
         let mut arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
         arr.data = NDDataBuffer::U8(vec![1, 2, 3, 4]);
+        arr.unique_id = 42;
         arr.timestamp = ad_core_rs::timestamp::EpicsTimestamp {
             sec: 100,
             nsec: 500_000_000,
         };
         arr.time_stamp = 7.25; // hardware clock, unrelated to epicsTS
 
-        processor.process_array(&Arc::new(arr), &NDArrayPool::new(1_000_000));
+        let r = processor.process_array(&Arc::new(arr), &NDArrayPool::new(1_000_000));
 
-        let ts = rx.try_recv().expect("stats pushes a TS sample per frame");
-        assert_eq!(ts.values.len(), NUM_STATS_TS_CHANNELS);
-        let idx = STATS_TS_CHANNEL_NAMES
-            .iter()
-            .position(|n| *n == "TSTimestamp")
-            .unwrap();
-        assert!(
-            (ts.values[idx] - 7.25).abs() < 1e-9,
-            "TSTimestamp carries pArray->timeStamp, got {}",
-            ts.values[idx]
-        );
+        let [(addr, ts)] = r.addressed.as_slice() else {
+            panic!("one TS point per frame, got {}", r.addressed.len());
+        };
+        assert_eq!(*addr, 1);
+        let NDDataBuffer::F64(v) = &ts.data else {
+            panic!("TS point is Float64");
+        };
+        assert_eq!(v.len(), 23);
+        assert_eq!(v[22], 7.25);
+        assert_eq!(ts.unique_id, 42);
+        assert_eq!((ts.timestamp.sec, ts.timestamp.nsec), (100, 500_000_000));
+        assert_eq!(ts.time_stamp, 7.25);
     }
 
     #[test]
@@ -2348,15 +2500,8 @@ mod tests {
     #[cfg(feature = "simd")]
     #[test]
     fn wide_and_float_kernels_match_the_lane_passes_on_every_level() {
-        use fearless_simd::{Level, dispatch};
-        let top = ad_core_rs::simd::level();
-        let mut levels = vec![top, Level::baseline()];
-        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        {
-            levels.extend(top.as_avx2().map(Level::Avx2));
-            levels.extend(top.as_sse4_2().map(Level::Sse4_2));
-            levels.extend(top.as_sse2().map(Level::Sse2));
-        }
+        use fearless_simd::dispatch;
+        let levels = ad_core_rs::simd::levels();
         fn same<T: StatsElem + std::fmt::Debug>(what: &str, got: Range<T>, want: Range<T>) {
             let bits = |x: T| format!("{x:?}");
             assert_eq!(bits(got.min), bits(want.min), "{what} min");
@@ -2729,6 +2874,77 @@ mod tests {
         assert!(c.eccentricity.abs() < 1e-10);
     }
 
+    /// C bins a degenerate range rather than refusing it, and its x86
+    /// `(int)` sends NaN and `t >= 2^31` below (NDPluginStats.cpp:42-63).
+    #[test]
+    fn a_degenerate_histogram_bins_as_c() {
+        let n = 37;
+        let zeros_ones = |i: usize| (i % 2) as f64;
+        for (name, data) in [
+            (
+                "u16",
+                NDDataBuffer::U16((0..n).map(|i| (i % 2) as u16).collect()),
+            ),
+            (
+                "i32",
+                NDDataBuffer::I32((0..n).map(|i| (i % 2) as i32).collect()),
+            ),
+            (
+                "i64",
+                NDDataBuffer::I64((0..n).map(|i| (i % 2) as i64).collect()),
+            ),
+            ("f64", NDDataBuffer::F64((0..n).map(zeros_ones).collect())),
+        ] {
+            // Min = Max = Size = 1: scale 0/0, every pixel below.
+            let (hist, below, above, _) = compute_histogram(&data, 1, 1.0, 1.0);
+            assert_eq!((hist, below, above), (vec![0.0], n as f64, 0.0), "{name}");
+            // Min = Max, Size 4: scale inf, every pixel below.
+            let (_, below, above, _) = compute_histogram(&data, 4, 1.0, 1.0);
+            assert_eq!((below, above), (n as f64, 0.0), "{name}");
+            // Size 0: an empty histogram, every pixel at or over Min above.
+            let (hist, below, above, _) = compute_histogram(&data, 0, 0.0, 9.0);
+            assert_eq!((hist.len(), below, above), (0, 0.0, n as f64), "{name}");
+        }
+        // t >= 2^31 is INT_MIN in C, so a far-above pixel counts below.
+        let data = NDDataBuffer::U16(vec![30000; 5]);
+        let (_, below, above, _) = compute_histogram(&data, 100_000, 0.0, 1.0);
+        assert_eq!((below, above), (5.0, 0.0));
+        let data = NDDataBuffer::F64([vec![3e9; 9], vec![f64::NAN; 9]].concat());
+        let (hist, below, above, _) = compute_histogram(&data, 3, 0.0, 1.0);
+        assert_eq!((hist, below, above), (vec![0.0; 3], 18.0, 0.0));
+    }
+
+    /// HistSize 0 makes C's scale -1/(Max-Min): `(int)` truncates every
+    /// `t` in (-1, 1) to bin 0, past the last bin (-1), so an in-range pixel
+    /// counts above in either half, and only a `t <= -1` pixel below
+    /// (NDPluginStats.cpp:42-52). Lengths that fill whole vectors.
+    #[test]
+    fn a_zero_size_histogram_counts_both_halves_above_on_every_vector_type() {
+        let values = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 20];
+        let cycle = |n: usize| values.iter().cycle().take(n).copied();
+        let n = 8 * values.len();
+        let counted: Vec<_> = [
+            (
+                "f32",
+                NDDataBuffer::F32(cycle(n).map(|v| v as f32).collect()),
+            ),
+            ("f64", NDDataBuffer::F64(cycle(n).map(f64::from).collect())),
+            ("i32", NDDataBuffer::I32(cycle(n).collect())),
+            (
+                "u32",
+                NDDataBuffer::U32(cycle(n).map(|v| v as u32).collect()),
+            ),
+        ]
+        .into_iter()
+        .map(|(name, data)| {
+            let (hist, below, above, _) = compute_histogram(&data, 0, 0.0, 9.0);
+            (name, hist.len(), below, above)
+        })
+        .collect();
+        let want = ["f32", "f64", "i32", "u32"].map(|name| (name, 0, 8.0, 88.0));
+        assert_eq!(counted, want);
+    }
+
     #[test]
     fn test_histogram_basic() {
         // 10 values: 0..9, hist range [0, 9], 10 bins
@@ -2940,6 +3156,8 @@ mod tests {
             "_stats_scratch_",
             1,
             asyn_rs::port::PortFlags::default(),
+            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
+            asyn_rs::port::InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         let _ = ad_core_rs::params::ndarray_driver::NDArrayDriverParams::create(&mut base);
         let _ = ad_core_rs::plugin::params::PluginBaseParams::create(&mut base);
@@ -2964,8 +3182,8 @@ mod tests {
 
         let result = proc.process_array(&Arc::new(arr), &pool);
         let p = proc.params;
-        // HIST_ARRAY, HIST_X_ARRAY and the 8 PROFILE_* waveforms must be
-        // pushed as float64 array updates.
+        // HIST_ARRAY and the 8 PROFILE_* waveforms must be pushed as float64
+        // array updates; HIST_X_ARRAY is posted by the write, not the frame.
         let array_reasons: Vec<usize> = result
             .param_updates
             .iter()
@@ -2977,23 +3195,22 @@ mod tests {
                 _ => None,
             })
             .collect();
-        for reason in [
-            p.hist_array,
-            p.hist_x_array,
-            p.profile_average_x,
-            p.profile_average_y,
-            p.profile_threshold_x,
-            p.profile_threshold_y,
-            p.profile_centroid_x,
-            p.profile_centroid_y,
-            p.profile_cursor_x,
-            p.profile_cursor_y,
-        ] {
-            assert!(
-                array_reasons.contains(&reason),
-                "missing array update for reason {reason}"
-            );
-        }
+        // Each posts where it stands, in C's order: the profiles
+        // (NDPluginStats.cpp:622-629), then the histogram (:637).
+        assert_eq!(
+            array_reasons,
+            [
+                p.profile_average_x,
+                p.profile_average_y,
+                p.profile_threshold_x,
+                p.profile_threshold_y,
+                p.profile_centroid_x,
+                p.profile_centroid_y,
+                p.profile_cursor_x,
+                p.profile_cursor_y,
+                p.hist_array,
+            ]
+        );
     }
 
     #[test]
@@ -3007,6 +3224,8 @@ mod tests {
             "_stats_adp13_",
             1,
             asyn_rs::port::PortFlags::default(),
+            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
+            asyn_rs::port::InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         let _ = ad_core_rs::params::ndarray_driver::NDArrayDriverParams::create(&mut base);
         let _ = ad_core_rs::plugin::params::PluginBaseParams::create(&mut base);
@@ -3046,8 +3265,9 @@ mod tests {
             "centroid_x must not be computed for ndims>2"
         );
 
-        // No profile waveforms emitted for a >2-D array.
-        let profile_reasons = [
+        // The refused array's profiles are still posted, as C's calloc'd
+        // zeros sized dims[0] x dims[1] (NDPluginStats.cpp:468-479,624-633).
+        for reason in [
             p.profile_average_x,
             p.profile_average_y,
             p.profile_threshold_x,
@@ -3056,14 +3276,358 @@ mod tests {
             p.profile_centroid_y,
             p.profile_cursor_x,
             p.profile_cursor_y,
-        ];
-        for u in &result.param_updates {
-            if let ParamUpdate::Float64Array { reason, .. } = u {
-                assert!(
-                    !profile_reasons.contains(reason),
-                    "no profile waveform may be emitted for ndims>2"
-                );
+        ] {
+            assert_eq!(array_of(&result, reason), Some(vec![0.0; 4]));
+        }
+        assert_eq!(float64_of(&result, p.cursor_val), Some(0.0));
+    }
+
+    fn registered_proc(port: &str) -> StatsProcessor {
+        let mut proc = StatsProcessor::new();
+        let mut base = asyn_rs::port::PortDriverBase::new(
+            port,
+            1,
+            asyn_rs::port::PortFlags::default(),
+            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
+            asyn_rs::port::InterfaceMask::UNMIGRATED_INTERRUPTS,
+        );
+        let _ = ad_core_rs::params::ndarray_driver::NDArrayDriverParams::create(&mut base);
+        let _ = ad_core_rs::plugin::params::PluginBaseParams::create(&mut base);
+        proc.register_params(&mut base).unwrap();
+        proc
+    }
+
+    fn float64_of(r: &ProcessResult, reason: usize) -> Option<f64> {
+        use ad_core_rs::plugin::runtime::ParamUpdate;
+        r.param_updates.iter().find_map(|u| match u {
+            ParamUpdate::Float64 {
+                reason: x, value, ..
+            } if *x == reason => Some(*value),
+            _ => None,
+        })
+    }
+
+    fn int32_of(r: &ProcessResult, reason: usize) -> Option<i32> {
+        use ad_core_rs::plugin::runtime::ParamUpdate;
+        r.param_updates.iter().find_map(|u| match u {
+            ParamUpdate::Int32 {
+                reason: x, value, ..
+            } if *x == reason => Some(*value),
+            _ => None,
+        })
+    }
+
+    fn array_of(r: &ProcessResult, reason: usize) -> Option<Vec<f64>> {
+        use ad_core_rs::plugin::runtime::ParamUpdate;
+        r.param_updates.iter().find_map(|u| match u {
+            ParamUpdate::Float64Array {
+                reason: x, value, ..
+            } if *x == reason => Some(value.clone()),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn a_1d_array_has_a_centroid_and_profiles_one_row_high() {
+        // C rejects only ndims>2 (NDPluginStats.cpp:205,338) and sizes a 1-D
+        // array as one row (:464-466).
+        let proc = registered_proc("_stats_1d_");
+        {
+            let mut cfg = proc.config.lock();
+            cfg.do_compute_centroid = true;
+            cfg.do_compute_profiles = true;
+            cfg.cursor_x = 2;
+        }
+        let pool = NDArrayPool::new(1_000_000);
+        let mut arr = NDArray::new(vec![NDDimension::new(5)], NDDataType::UInt8);
+        if let NDDataBuffer::U8(ref mut v) = arr.data {
+            v.copy_from_slice(&[0, 10, 10, 0, 0]);
+        }
+
+        let r = proc.process_array(&Arc::new(arr), &pool);
+        let p = proc.params;
+        assert_eq!(float64_of(&r, p.centroid_total), Some(20.0));
+        assert_eq!(float64_of(&r, p.centroid_x), Some(1.5));
+        assert_eq!(float64_of(&r, p.centroid_y), Some(0.0));
+        assert_eq!(float64_of(&r, p.sigma_x), Some(0.5));
+        assert_eq!(float64_of(&r, p.eccentricity), Some(1.0));
+        assert_eq!(int32_of(&r, p.profile_size_x), Some(5));
+        assert_eq!(int32_of(&r, p.profile_size_y), Some(1));
+        let row = vec![0.0, 10.0, 10.0, 0.0, 0.0];
+        assert_eq!(array_of(&r, p.profile_average_x), Some(row.clone()));
+        assert_eq!(array_of(&r, p.profile_average_y), Some(vec![4.0]));
+        assert_eq!(array_of(&r, p.profile_centroid_x), Some(row.clone()));
+        assert_eq!(array_of(&r, p.profile_centroid_y), Some(vec![10.0]));
+        assert_eq!(array_of(&r, p.profile_cursor_x), Some(row));
+        assert_eq!(array_of(&r, p.profile_cursor_y), Some(vec![10.0]));
+        assert_eq!(float64_of(&r, p.cursor_val), Some(10.0));
+    }
+
+    /// Every value a frame posts lands on the drvInfo C creates it under
+    /// (NDPluginStats.h:108-119), the one NDStats.template binds; a param
+    /// only rs names is a PV no record reads.
+    #[test]
+    fn a_frame_posts_only_c_drv_info_names() {
+        use ad_core_rs::plugin::runtime::ParamUpdate;
+        let mut proc = StatsProcessor::new();
+        let mut base = asyn_rs::port::PortDriverBase::new(
+            "_stats_drvinfo_",
+            1,
+            asyn_rs::port::PortFlags::default(),
+            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
+            asyn_rs::port::InterfaceMask::UNMIGRATED_INTERRUPTS,
+        );
+        let _ = ad_core_rs::params::ndarray_driver::NDArrayDriverParams::create(&mut base);
+        let _ = ad_core_rs::plugin::params::PluginBaseParams::create(&mut base);
+        proc.register_params(&mut base).unwrap();
+        {
+            let mut cfg = proc.config.lock();
+            cfg.do_compute_statistics = true;
+            cfg.do_compute_centroid = true;
+            cfg.do_compute_profiles = true;
+            cfg.do_compute_histogram = true;
+        }
+        let mut arr = NDArray::new(
+            vec![NDDimension::new(4), NDDimension::new(4)],
+            NDDataType::UInt8,
+        );
+        if let NDDataBuffer::U8(ref mut v) = arr.data {
+            for (i, val) in v.iter_mut().enumerate() {
+                *val = i as u8;
             }
+        }
+        let r = proc.process_array(&Arc::new(arr), &NDArrayPool::new(1_000_000));
+        let names: Vec<&str> = r
+            .param_updates
+            .iter()
+            .filter_map(|u| match u {
+                ParamUpdate::Int32 { reason, .. }
+                | ParamUpdate::Float64 { reason, .. }
+                | ParamUpdate::Octet { reason, .. }
+                | ParamUpdate::Float64Array { reason, .. } => Some(*reason),
+                ParamUpdate::Callbacks { .. } => None,
+            })
+            .map(|reason| base.params.param_name(reason).unwrap())
+            .collect();
+        for c_name in [
+            "CENTROID_TOTAL",
+            "CENTROIDX_VALUE",
+            "CENTROIDY_VALUE",
+            "SIGMAX_VALUE",
+            "SIGMAY_VALUE",
+            "SIGMAXY_VALUE",
+            "SKEWX_VALUE",
+            "SKEWY_VALUE",
+            "KURTOSISX_VALUE",
+            "KURTOSISY_VALUE",
+            "ECCENTRICITY_VALUE",
+            "ORIENTATION_VALUE",
+        ] {
+            assert!(names.contains(&c_name), "{c_name} not posted: {names:?}");
+        }
+        assert!(
+            !names.iter().any(|n| n.starts_with("SKEWNESS")),
+            "{names:?}"
+        );
+    }
+
+    #[test]
+    fn each_param_group_posts_only_under_its_compute_flag() {
+        use ad_core_rs::plugin::runtime::ParamUpdate;
+        // NDPluginStats.cpp:589-640: a group whose Compute* is off is not
+        // set, so its PVs stay as they were (UDF before the first frame).
+        let proc = registered_proc("_stats_gate_");
+        let p = proc.params;
+        let statistics = vec![
+            p.min_value,
+            p.max_value,
+            p.mean_value,
+            p.sigma_value,
+            p.total,
+            p.net,
+            p.min_x,
+            p.min_y,
+            p.max_x,
+            p.max_y,
+        ];
+        let centroid = vec![
+            p.centroid_x,
+            p.centroid_y,
+            p.sigma_x,
+            p.sigma_y,
+            p.sigma_xy,
+            p.centroid_total,
+            p.skewness_x,
+            p.skewness_y,
+            p.kurtosis_x,
+            p.kurtosis_y,
+            p.eccentricity,
+            p.orientation,
+        ];
+        let profiles = vec![
+            p.profile_average_x,
+            p.profile_average_y,
+            p.profile_threshold_x,
+            p.profile_threshold_y,
+            p.profile_centroid_x,
+            p.profile_centroid_y,
+            p.profile_cursor_x,
+            p.profile_cursor_y,
+            p.cursor_val,
+        ];
+        let histogram = vec![p.hist_below, p.hist_above, p.hist_entropy, p.hist_array];
+        let sizes = vec![p.profile_size_x, p.profile_size_y];
+        let pool = NDArrayPool::new(1_000_000);
+        let mut arr = NDArray::new(
+            vec![NDDimension::new(4), NDDimension::new(4)],
+            NDDataType::UInt8,
+        );
+        if let NDDataBuffer::U8(ref mut v) = arr.data {
+            for (i, val) in v.iter_mut().enumerate() {
+                *val = i as u8;
+            }
+        }
+        let arr = Arc::new(arr);
+
+        for (flags, want) in [
+            ([false; 4], vec![]),
+            ([true, false, false, false], statistics.clone()),
+            (
+                [false, true, false, false],
+                [&centroid[..], &sizes].concat(),
+            ),
+            (
+                [false, false, true, false],
+                [&profiles[..], &sizes].concat(),
+            ),
+            ([false, false, false, true], histogram.clone()),
+        ] {
+            {
+                let mut cfg = proc.config.lock();
+                cfg.do_compute_statistics = flags[0];
+                cfg.do_compute_centroid = flags[1];
+                cfg.do_compute_profiles = flags[2];
+                cfg.do_compute_histogram = flags[3];
+            }
+            let r = proc.process_array(&arr, &pool);
+            let mut got: Vec<usize> = r
+                .param_updates
+                .iter()
+                .filter_map(|u| match u {
+                    ParamUpdate::Int32 { reason, .. }
+                    | ParamUpdate::Float64 { reason, .. }
+                    | ParamUpdate::Octet { reason, .. }
+                    | ParamUpdate::Float64Array { reason, .. } => Some(*reason),
+                    ParamUpdate::Callbacks { .. } => None,
+                })
+                .collect();
+            got.sort_unstable();
+            let mut want = want;
+            want.sort_unstable();
+            assert_eq!(got, want, "Compute* flags {flags:?}");
+        }
+    }
+
+    /// C's write override stores the value, then `computeHistX` reads the
+    /// three params and posts, all before the write returns. Drives the
+    /// override as the port actor does and returns the axis it posted.
+    fn hist_x_write(
+        proc: &StatsProcessor,
+        base: &mut asyn_rs::port::PortDriverBase,
+        reason: usize,
+        value: f64,
+    ) -> Option<Vec<f64>> {
+        use ad_core_rs::plugin::runtime::{SideParam, WritePort, WriteVerdict};
+        let p = proc.params;
+        let side = if reason == p.hist_size || reason == p.cursor_x {
+            let v = value as i32;
+            let side = proc
+                .validate_int32(
+                    reason,
+                    0,
+                    v,
+                    WriteVerdict::Accept(v),
+                    &mut WritePort::new(base),
+                )
+                .side;
+            base.set_int32_param(reason, 0, v).unwrap();
+            side
+        } else {
+            let side = proc
+                .validate_float64(reason, 0, value, WriteVerdict::Accept(value), base)
+                .side;
+            base.set_float64_param(reason, 0, value).unwrap();
+            side
+        };
+        side.into_iter().find_map(|s| match s {
+            SideParam::Float64Array { reason, value, .. } if reason == p.hist_x_array => {
+                Some(value)
+            }
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn hist_x_array_is_posted_by_the_hist_size_min_max_writes() {
+        use ad_core_rs::plugin::runtime::ParamChangeValue;
+        // C computeHistX runs from writeInt32(HistSize) and
+        // writeFloat64(HistMin/HistMax) only (NDPluginStats.cpp:691,730), on
+        // the write itself: a PINI write's post lands before scanRun and is
+        // dropped, so HistogramX_RBV stays empty until a runtime write.
+        let mut proc = StatsProcessor::new();
+        let mut base = asyn_rs::port::PortDriverBase::new(
+            "_stats_histx_write_",
+            1,
+            asyn_rs::port::PortFlags::default(),
+            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
+            asyn_rs::port::InterfaceMask::UNMIGRATED_INTERRUPTS,
+        );
+        let _ = ad_core_rs::params::ndarray_driver::NDArrayDriverParams::create(&mut base);
+        let _ = ad_core_rs::plugin::params::PluginBaseParams::create(&mut base);
+        proc.register_params(&mut base).unwrap();
+        let p = proc.params;
+        assert_eq!(
+            hist_x_write(&proc, &mut base, p.hist_max, 255.0),
+            Some(vec![0.0])
+        );
+        assert_eq!(
+            hist_x_write(&proc, &mut base, p.hist_size, 4.0),
+            Some(vec![0.0, 63.75, 127.5, 191.25])
+        );
+        assert_eq!(
+            hist_x_write(&proc, &mut base, p.hist_min, 1.0),
+            Some(vec![1.0, 64.5, 128.0, 191.5])
+        );
+        assert_eq!(
+            hist_x_write(&proc, &mut base, p.hist_max, 9.0),
+            Some(vec![1.0, 3.0, 5.0, 7.0])
+        );
+        assert_eq!(
+            hist_x_write(&proc, &mut base, p.hist_size, 0.0),
+            Some(vec![1.0])
+        );
+        assert_eq!(hist_x_write(&proc, &mut base, p.cursor_x, 1.0), None);
+        assert_eq!(
+            hist_x_write(&proc, &mut base, p.centroid_threshold, 1.0),
+            None
+        );
+        // The data thread only takes the new config; it posts nothing.
+        for (reason, value) in [
+            (p.hist_size, ParamChangeValue::Int32(4)),
+            (p.hist_min, ParamChangeValue::Float64(1.0)),
+            (p.hist_max, ParamChangeValue::Float64(9.0)),
+        ] {
+            let snapshot = PluginParamSnapshot {
+                enable_callbacks: true,
+                reason,
+                addr: 0,
+                value,
+            };
+            assert!(
+                proc.on_param_change(reason, &snapshot)
+                    .param_updates
+                    .is_empty()
+            );
         }
     }
 
@@ -3078,6 +3642,8 @@ mod tests {
             "_stats_adp30_",
             1,
             asyn_rs::port::PortFlags::default(),
+            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
+            asyn_rs::port::InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         let _ = ad_core_rs::params::ndarray_driver::NDArrayDriverParams::create(&mut base);
         let _ = ad_core_rs::plugin::params::PluginBaseParams::create(&mut base);
@@ -3133,7 +3699,6 @@ mod tests {
 
     #[test]
     fn test_hist_x_array_uses_bin_count_divisor() {
-        use ad_core_rs::plugin::runtime::ParamUpdate;
         // C++ NDPluginStats::computeHistX: scale = (histMax-histMin)/histSize,
         // histX[i] = histMin + i*scale. For histSize=256, min=0, max=255 the
         // last bin X must be ~254.0 (= 255*255/256), NOT 255.0.
@@ -3142,39 +3707,17 @@ mod tests {
             "_stats_histx_",
             1,
             asyn_rs::port::PortFlags::default(),
+            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
+            asyn_rs::port::InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         let _ = ad_core_rs::params::ndarray_driver::NDArrayDriverParams::create(&mut base);
         let _ = ad_core_rs::plugin::params::PluginBaseParams::create(&mut base);
         proc.register_params(&mut base).unwrap();
 
-        proc.config.lock().do_compute_histogram = true;
-        proc.config.lock().hist_size = 256;
-        proc.config.lock().hist_min = 0.0;
-        proc.config.lock().hist_max = 255.0;
-        let pool = NDArrayPool::new(1_000_000);
-
-        let mut arr = NDArray::new(
-            vec![NDDimension::new(4), NDDimension::new(4)],
-            NDDataType::UInt8,
-        );
-        if let NDDataBuffer::U8(ref mut v) = arr.data {
-            for (i, val) in v.iter_mut().enumerate() {
-                *val = (i * 16) as u8;
-            }
-        }
-
-        let result = proc.process_array(&Arc::new(arr), &pool);
-        let hist_x = result
-            .param_updates
-            .iter()
-            .find_map(|u| match u {
-                ParamUpdate::Float64Array { reason, value, .. }
-                    if *reason == proc.params.hist_x_array =>
-                {
-                    Some(value.clone())
-                }
-                _ => None,
-            })
+        let p = proc.params;
+        hist_x_write(&proc, &mut base, p.hist_min, 0.0);
+        hist_x_write(&proc, &mut base, p.hist_max, 255.0);
+        let hist_x = hist_x_write(&proc, &mut base, p.hist_size, 256.0)
             .expect("HIST_X_ARRAY must be emitted");
 
         assert_eq!(hist_x.len(), 256, "256 bins");
@@ -3205,9 +3748,15 @@ mod tests {
     fn test_stats_runtime_end_to_end() {
         let pool = NDArrayPool::new(1_000_000);
         let wiring = Arc::new(WiringRegistry::new());
-        let ts_registry = crate::time_series::TsReceiverRegistry::new();
-        let (handle, stats, _params, _jh) =
-            create_stats_runtime("STATS_RT", pool, 10, "", wiring, &ts_registry);
+        let (handle, stats, _params, _jh) = create_stats_runtime(
+            &asyn_rs::asyn_record::claim_port("STATS_RT").unwrap(),
+            pool.max_memory(),
+            10,
+            0,
+            "",
+            wiring,
+            ad_core_rs::plugin::runtime::DEFAULT_PLUGIN_THREADS,
+        );
 
         // Plugins default to disabled — enable for test, and fence until the
         // data thread has applied the flip (the write only queues it).
@@ -3235,7 +3784,13 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        rt.block_on(handle.array_sender().publish(Arc::new(arr)));
+        rt.block_on(
+            handle.array_sender().publish(
+                ad_core_rs::ndarray_pool::DriverPool::standalone(0)
+                    .alloc_copy(&arr)
+                    .unwrap(),
+            ),
+        );
 
         // Wait on the observable itself — the stats land when the data thread
         // processes the array; a fixed sleep is a race on a loaded machine.
@@ -3541,7 +4096,7 @@ mod tests {
         let scale = (hist_size - 1) as f64 / (hi - lo);
         let (mut bins, mut below, mut above) = (vec![0.0; hist_size], 0.0, 0.0);
         for &value in vals {
-            let bin = ((value - lo) * scale + 0.5) as i64;
+            let bin = i64::from(c_cast::f64_to_i32((value - lo) * scale + 0.5));
             if bin < 0 || value < lo {
                 below += 1.0;
             } else if bin > hist_size as i64 - 1 || value > hi {

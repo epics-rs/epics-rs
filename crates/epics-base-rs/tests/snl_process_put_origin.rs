@@ -62,11 +62,11 @@ async fn process_put_is_visible_to_other_origins() {
     let ev = other
         .try_recv_event()
         .expect("a different filter origin must receive the post");
-    assert_eq!(ev.snapshot.value.to_f64(), Some(3.25));
+    assert_eq!(ev.value().as_value().cloned().unwrap().to_f64(), Some(3.25));
     let ev = unfiltered
         .try_recv_event()
         .expect("an unfiltered subscriber must receive the post");
-    assert_eq!(ev.snapshot.value.to_f64(), Some(3.25));
+    assert_eq!(ev.value().as_value().cloned().unwrap().to_f64(), Some(3.25));
 }
 
 /// An origin-less channel keeps today's behavior: origin 0 is never filtered.
@@ -83,5 +83,5 @@ async fn originless_process_put_reaches_a_filtered_subscription() {
     let ev = sub
         .try_recv_event()
         .expect("an origin-0 put must not be filtered");
-    assert_eq!(ev.snapshot.value.to_f64(), Some(1.5));
+    assert_eq!(ev.value().as_value().cloned().unwrap().to_f64(), Some(1.5));
 }

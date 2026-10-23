@@ -1,0 +1,23 @@
+record(waveform, "SRC") { field(NELM, "8") field(FTVL, "DOUBLE") field(FLNK, "C:LO") }
+record(compress, "C:LO") { field(INP, "SRC") field(ALG, "0") field(NSAM, "4") field(N, "2") field(BALG, "0") field(PBUF, "0") field(FLNK, "C:HI") }
+record(compress, "C:HI") { field(INP, "SRC") field(ALG, "1") field(NSAM, "4") field(N, "2") field(BALG, "0") field(PBUF, "0") field(FLNK, "C:AV") }
+record(compress, "C:AV") { field(INP, "SRC") field(ALG, "2") field(NSAM, "4") field(N, "2") field(BALG, "0") field(PBUF, "0") field(FLNK, "C:RA") }
+record(compress, "C:RA") { field(INP, "SRC") field(ALG, "3") field(NSAM, "6") field(N, "2") field(BALG, "0") field(PBUF, "0") field(FLNK, "C:CB") }
+record(compress, "C:CB") { field(INP, "SRC") field(ALG, "4") field(NSAM, "5") field(N, "1") field(BALG, "0") field(PBUF, "0") field(FLNK, "C:MD") }
+record(compress, "C:MD") { field(INP, "SRC") field(ALG, "5") field(NSAM, "4") field(N, "3") field(BALG, "0") field(PBUF, "0") field(FLNK, "C:CBL") }
+record(compress, "C:CBL") { field(INP, "SRC") field(ALG, "4") field(NSAM, "5") field(N, "1") field(BALG, "1") field(PBUF, "0") field(FLNK, "C:AVL") }
+record(compress, "C:AVL") { field(INP, "SRC") field(ALG, "2") field(NSAM, "3") field(N, "2") field(BALG, "1") field(PBUF, "0") field(FLNK, "C:AVP") }
+record(compress, "C:AVP") { field(INP, "SRC") field(ALG, "2") field(NSAM, "4") field(N, "3") field(BALG, "0") field(PBUF, "1") field(FLNK, "C:LOP") }
+record(compress, "C:LOP") { field(INP, "SRC") field(ALG, "0") field(NSAM, "4") field(N, "3") field(BALG, "0") field(PBUF, "1") field(FLNK, "C:LIM") }
+record(compress, "C:LIM") { field(INP, "SRC") field(ALG, "2") field(NSAM, "8") field(N, "1") field(BALG, "0") field(PBUF, "0") field(ILIL, "2") field(IHIL, "6") field(FLNK, "C:MDP") }
+record(compress, "C:MDP") { field(INP, "SRC") field(ALG, "5") field(NSAM, "4") field(N, "3") field(BALG, "0") field(PBUF, "1")  }
+record(ai, "SSRC") { field(FLNK, "S:LO") }
+record(compress, "S:LO") { field(INP, "SSRC") field(ALG, "0") field(NSAM, "4") field(N, "3") field(FLNK, "S:HI") }
+record(compress, "S:HI") { field(INP, "SSRC") field(ALG, "1") field(NSAM, "4") field(N, "3") field(FLNK, "S:AV") }
+record(compress, "S:AV") { field(INP, "SSRC") field(ALG, "2") field(NSAM, "4") field(N, "3") field(FLNK, "S:CB") }
+record(compress, "S:CB") { field(INP, "SSRC") field(ALG, "4") field(NSAM, "3") field(N, "1") field(FLNK, "S:RA") }
+record(compress, "S:RA") { field(INP, "SSRC") field(ALG, "3") field(NSAM, "3") field(N, "2")  }
+record(waveform, "WSRC") { field(NELM, "1") field(FTVL, "DOUBLE") field(FLNK, "W:LO") }
+record(compress, "W:LO") { field(INP, "WSRC") field(ALG, "0") field(NSAM, "4") field(N, "3") field(FLNK, "W:AV") }
+record(compress, "W:AV") { field(INP, "WSRC") field(ALG, "2") field(NSAM, "4") field(N, "3") field(FLNK, "W:MD") }
+record(compress, "W:MD") { field(INP, "WSRC") field(ALG, "5") field(NSAM, "4") field(N, "2") }

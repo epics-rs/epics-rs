@@ -62,15 +62,35 @@ pub struct CaServerBuilder {
     audit: Option<crate::audit::AuditLogger>,
     /// Optional bind address for the HTTP introspection listener.
     introspection_addr: Option<std::net::SocketAddr>,
-    /// Grace period (seconds) for graceful drain on signal or admin
-    /// request.
-    drain_grace_secs: u64,
+    /// Grace (seconds) of the opt-in SIGTERM drain; `None` when
+    /// `EPICS_CAS_DRAIN_GRACE_SECS` is unset and SIGTERM has no drain.
+    drain_grace_secs: Option<u64>,
     /// Optional capability-token verifier. When set, the CLIENT_NAME
     /// payload is treated as a `cap:<token>` and verified before its
     /// resolved subject is used for ACF matching. Unset = legacy
     /// "trust the username string" behaviour.
     #[cfg(feature = "cap-tokens")]
     cap_token_verifier: Option<Arc<crate::cap_token::TokenVerifier>>,
+    /// Sockets `iocInit` already bound ([`Self::bound_at_init`]); `None`
+    /// binds in [`Self::build`].
+    bound: Option<RsrvSockets>,
+}
+
+/// RSRV's sockets, bound by `iocInit` at C's `dbInitServers()` point
+/// (`rsrv_init`) and served by the runner from `iocRun`.
+pub struct RsrvSockets {
+    tcp: tcp::BoundTcp,
+    udp: udp::BoundUdp,
+}
+
+impl RsrvSockets {
+    /// C `rsrv_init` on this backend; [`crate::server::rsrv_init`].
+    pub(crate) async fn bind(
+        args: epics_base_rs::server::ioc_app::ServerInitArgs,
+    ) -> CaResult<Self> {
+        let (tcp, udp) = bind_sockets(args.port, args.tcp_port.unwrap_or(args.port)).await?;
+        Ok(Self { tcp, udp })
+    }
 }
 
 /// A database a lifecycle already loaded and carried through `iocInit`,
@@ -90,7 +110,7 @@ pub struct CaServerBuilder {
 struct AdoptedDatabase {
     db: Arc<PvDatabase>,
     acf: epics_base_rs::server::access_security::AcfCell,
-    autosave_config: Option<autosave::SaveSetConfig>,
+    autosave_config: Option<(autosave::SaveSetConfig, autosave::SaveStrategy)>,
     autosave_manager: Option<Arc<autosave::AutosaveManager>>,
 }
 
@@ -120,7 +140,18 @@ impl CaServerBuilder {
             drain_grace_secs: drain_grace_from_env(),
             #[cfg(feature = "cap-tokens")]
             cap_token_verifier: None,
+            bound: None,
         }
+    }
+
+    /// Serve on the sockets `iocInit` bound, when RSRV's init ran; the
+    /// port settings are then the ones it bound with.
+    pub fn bound_at_init(
+        mut self,
+        servers: &mut epics_base_rs::server::ioc_app::InitializedServers,
+    ) -> Self {
+        self.bound = servers.take::<RsrvSockets>(crate::server::RSRV_SERVER);
+        self
     }
 
     /// Bind an HTTP introspection endpoint exposing
@@ -208,7 +239,7 @@ impl CaServerBuilder {
     /// Load an access security configuration file. The path is
     /// retained so `CaServer::reload_acf()` can later re-read it.
     pub fn acf_file(mut self, path: &str) -> CaResult<Self> {
-        let content = std::fs::read_to_string(path).map_err(CaError::Io)?;
+        let content = std::fs::read(path).map_err(CaError::Io)?;
         self.acf = Some(access_security::parse_acf(&content)?);
         self.acf_path = Some(path.to_string());
         Ok(self)
@@ -260,12 +291,20 @@ impl CaServerBuilder {
         Ok(self)
     }
 
-    /// Register a device support factory by DTYP name.
-    pub fn register_device_support<F>(mut self, dtyp: &str, factory: F) -> Self
+    /// Register a device support: its factory under `devsup.choice`, and
+    /// `devsup` as a row of `record_type`'s device menu.
+    pub fn register_device_support<F>(
+        mut self,
+        record_type: &str,
+        devsup: &'static epics_base_rs::server::record::DevSup,
+        factory: F,
+    ) -> Self
     where
         F: Fn() -> Box<dyn device_support::DeviceSupport> + Send + Sync + 'static,
     {
-        self.ioc = self.ioc.register_device_support(dtyp, factory);
+        self.ioc = self
+            .ioc
+            .register_device_support(record_type, devsup, factory);
         self
     }
 
@@ -291,9 +330,13 @@ impl CaServerBuilder {
         self
     }
 
-    /// Configure autosave with a save set configuration.
-    pub fn autosave(mut self, config: autosave::SaveSetConfig) -> Self {
-        self.ioc = self.ioc.autosave(config);
+    /// Configure autosave with one save set and its save method.
+    pub fn autosave(
+        mut self,
+        config: autosave::SaveSetConfig,
+        method: autosave::SaveStrategy,
+    ) -> Self {
+        self.ioc = self.ioc.autosave(config, method);
         self
     }
 
@@ -315,7 +358,7 @@ impl CaServerBuilder {
         // side it came from.
         let (db, acf, autosave_config, autosave_manager) = match self.served {
             None => {
-                let (db, autosave_config) = self.ioc.build().await?;
+                let (db, autosave_config) = self.ioc.build_served().await?;
                 let acf =
                     epics_base_rs::server::access_security::new_acf_cell_watching(self.acf, &db);
                 (db, acf, autosave_config, None)
@@ -343,8 +386,10 @@ impl CaServerBuilder {
         // `self.port` field already incorporates the
         // `EPICS_CAS_SERVER_PORT > EPICS_CA_SERVER_PORT` precedence
         // via cas_server_port() at builder construction.
-        let tcp_port = self.tcp_port.unwrap_or(self.port);
-        let (tcp, udp) = bind_sockets(self.port, tcp_port).await?;
+        let (tcp, udp) = match self.bound {
+            Some(RsrvSockets { tcp, udp }) => (tcp, udp),
+            None => bind_sockets(self.port, self.tcp_port.unwrap_or(self.port)).await?,
+        };
         let server = CaServer {
             db,
             port: udp.port(),
@@ -412,7 +457,7 @@ impl CaServerBuilder {
     pub fn serving(
         db: Arc<PvDatabase>,
         acf: epics_base_rs::server::access_security::AcfCell,
-        autosave_config: Option<autosave::SaveSetConfig>,
+        autosave_config: Option<(autosave::SaveSetConfig, autosave::SaveStrategy)>,
         autosave_manager: Option<Arc<autosave::AutosaveManager>>,
     ) -> Self {
         Self {
@@ -467,9 +512,40 @@ async fn bind_sockets(
     udp_port: u16,
     tcp_port: u16,
 ) -> CaResult<(crate::server::tcp::BoundTcp, crate::server::udp::BoundUdp)> {
-    let tcp = crate::server::tcp::bind_tcp_listeners(tcp_port).await?;
+    // `rsrv_init` reports its sizing variables first (`caservertask.c:510-530`).
+    epics_base_rs::server::event_queue::configure_events_per_que();
+    // deliberate deviation (user-signed-off 2026-10-14), for a bind nothing
+    // can recover. C's `tryBind` returns -1 silently on EADDRINUSE and
+    // `rsrv_init` drops that interface alone (`caservertask.c:136`, `:630`,
+    // `:745-750`), which `bind_udp_responders` does too — for the broadcast
+    // socket's `tryBind` as well (`:703`). On any other error
+    // `tryBind` prints `CAS: <name> bind ERROR: <why>` and calls
+    // `epicsThreadSuspendSelf()` (`:135-141`), and with no interface left
+    // `rsrv_init` ends in `cantProceed("CAS: No TCP server started")` (`:752`):
+    // `iocInit` hangs on its own thread. Here those two cases return `Err`;
+    // under `iocInit` (`RsrvSockets::bind`) it fails the build at the same
+    // `dbInitServers()` point and the IOC returns it.
+    let mut tcp = crate::server::tcp::bind_tcp_listeners(tcp_port).await?;
+    // The TCP set owns the interface list: it has already dropped any address
+    // that is no interface of this host (`caservertask.c:225-226`).
     let cfg = addr_list::from_env()?;
-    let udp = crate::server::udp::bind_udp_responders(udp_port, cfg.intf_addrs, &cfg.mcast_addrs)?;
+    let udp = crate::server::udp::bind_udp_responders_with(
+        udp_port,
+        tcp.interfaces(),
+        &cfg.mcast_addrs,
+        tcp.port(),
+        &crate::server::udp::responder_broadcast_for,
+    )?;
+    // An interface whose UDP bind failed is dropped whole, TCP socket
+    // included (`caservertask.c:744-749`).
+    tcp.retain_interfaces(&udp.interfaces());
+    // Here, where the ports become final, so it precedes the shell: from
+    // `run()` it raced the shell's EOF exit and was lost when the shell won.
+    crate::server::udp::announce_requested_ephemeral(
+        (udp_port, udp.port()),
+        (tcp_port, tcp.port()),
+        cfg.beacon_addrs.len(),
+    );
     Ok((tcp, udp))
 }
 
@@ -512,7 +588,7 @@ pub struct CaServer {
     /// after a config swap and by [`Self::notify_access_change`] for
     /// programmatic access-state changes the server cannot detect.
     acf_reload_tx: tokio::sync::broadcast::Sender<()>,
-    autosave_config: Option<autosave::SaveSetConfig>,
+    autosave_config: Option<(autosave::SaveSetConfig, autosave::SaveStrategy)>,
     autosave_manager: Option<Arc<autosave::AutosaveManager>>,
     /// Optional broadcast channel for connection lifecycle events.
     /// Subscribers (e.g. ca-gateway) get one event per accept/disconnect.
@@ -544,13 +620,12 @@ pub struct CaServer {
     audit: Option<crate::audit::AuditLogger>,
     /// Optional HTTP introspection bind address.
     introspection_addr: Option<std::net::SocketAddr>,
-    /// Grace period in seconds applied when drain is requested.
-    /// Default 30 s; configurable via EPICS_CAS_DRAIN_GRACE_SECS.
-    /// Only consumed by the Unix SIGTERM handler — kept on the
-    /// struct for both cfgs so the constructor signature stays
-    /// stable across platforms.
+    /// Grace (seconds) of the opt-in SIGTERM drain, `None` without
+    /// EPICS_CAS_DRAIN_GRACE_SECS. Only consumed by the Unix signal
+    /// task — kept on the struct for both cfgs so the constructor
+    /// signature stays stable across platforms.
     #[cfg_attr(not(unix), allow(dead_code))]
-    drain_grace_secs: u64,
+    drain_grace_secs: Option<u64>,
     /// Optional capability-token verifier; threaded into per-client
     /// state at accept time so CLIENT_NAME `cap:<token>` payloads
     /// resolve to a verified subject before ACF lookup.
@@ -617,7 +692,7 @@ impl CaServer {
         port: u16,
         tcp_port: Option<u16>,
         acf: epics_base_rs::server::access_security::AcfCell,
-        autosave_config: Option<autosave::SaveSetConfig>,
+        autosave_config: Option<(autosave::SaveSetConfig, autosave::SaveStrategy)>,
         autosave_manager: Option<Arc<autosave::AutosaveManager>>,
     ) -> CaResult<Self> {
         let mut builder =
@@ -691,21 +766,20 @@ impl CaServer {
         // would stall clients on a slow NFS / FUSE mount — the offload is what
         // preserves C's property, not a departure from it.
         //
-        // Through the seam, not `tokio::task::spawn_blocking`: the file read is
-        // reactor-free by nature, which is the case `runtime::task::
-        // spawn_blocking` documents itself as being for, and it is the half
-        // that needs no runtime under `exec_backend`. Naming tokio's directly
-        // made this panic for any caller reaching `reload_acf_from` off a
-        // runtime — an iocsh `asInit` on the blocking driver.
-        let path_owned = path.to_string();
-        let content = epics_base_rs::runtime::task::spawn_blocking(move || {
-            std::fs::read_to_string(path_owned)
-        })
-        .await
-        .map_err(|e| CaError::Io(std::io::Error::other(e)))?
-        .map_err(CaError::Io)?;
-        let parsed = access_security::parse_acf(&content)?;
-        acf.store(Some(Arc::new(parsed)));
+        // `read_acf` offloads the parse too, which resolves HAG hosts.
+        let parsed = access_security::read_acf(path).await?;
+        Self::publish_acf(path, parsed, acf, reload_tx).await
+    }
+
+    /// Install a parsed ACF from `path` and push the access-rights refresh:
+    /// every reload, whoever asks for it, ends here.
+    async fn publish_acf(
+        path: &str,
+        parsed: access_security::AccessSecurityConfig,
+        acf: &epics_base_rs::server::access_security::AcfCell,
+        reload_tx: &tokio::sync::broadcast::Sender<()>,
+    ) -> CaResult<()> {
+        acf.install_async(parsed).await;
         // Notify every active TCP client to recompute and push fresh
         // CA_PROTO_ACCESS_RIGHTS for its open channels. Send-error
         // (no live subscribers) is a normal transient state.
@@ -717,6 +791,30 @@ impl CaServer {
         );
         metrics::counter!("ca_server_acf_reloads_total").increment(1);
         Ok(())
+    }
+
+    /// The POST /reload-acf hook. A bad file is the response, so the read and
+    /// parse run on the caller; the publish runs on `reactor`, since the hook
+    /// is called from an introspection handler task, not from `run`.
+    fn reload_acf_hook(
+        path: Option<String>,
+        acf: epics_base_rs::server::access_security::AcfCell,
+        reload_tx: tokio::sync::broadcast::Sender<()>,
+        reactor: tokio::runtime::Handle,
+    ) -> Arc<dyn Fn() -> Result<(), String> + Send + Sync> {
+        Arc::new(move || {
+            let path = path.clone().ok_or("no ACF source path registered")?;
+            let content = std::fs::read(&path).map_err(|e| format!("read {path}: {e}"))?;
+            let cfg =
+                access_security::parse_acf(&content).map_err(|e| format!("parse {path}: {e}"))?;
+            let (acf, reload_tx) = (acf.clone(), reload_tx.clone());
+            reactor.spawn(async move {
+                if let Err(e) = Self::publish_acf(&path, cfg, &acf, &reload_tx).await {
+                    tracing::warn!(error = %e, "POST /reload-acf: publish failed");
+                }
+            });
+            Ok(())
+        })
     }
 
     /// Returns the path the ACF was loaded from, if any.
@@ -794,13 +892,13 @@ impl CaServer {
         };
         let paths = paths.ok_or_else(|| "no TLS source paths registered".to_string())?;
         let chain = crate::tls::load_certs(&paths.cert)
-            .map_err(|e| format!("loading {}: {e}", paths.cert))?;
+            .map_err(|e| format!("loading {}: {e}", paths.cert.display()))?;
         let key = crate::tls::load_private_key(&paths.key)
-            .map_err(|e| format!("loading {}: {e}", paths.key))?;
+            .map_err(|e| format!("loading {}: {e}", paths.key.display()))?;
         let cfg = match paths.client_ca.as_ref() {
             Some(ca) => {
                 let roots = crate::tls::load_root_store(ca)
-                    .map_err(|e| format!("loading client CA {ca}: {e}"))?;
+                    .map_err(|e| format!("loading client CA {}: {e}", ca.display()))?;
                 crate::tls::TlsConfig::server_mtls_from_pem(chain, key, roots)
                     .map_err(|e| format!("mTLS server build: {e}"))?
             }
@@ -866,11 +964,6 @@ impl CaServer {
         let acf = self.acf.clone();
         let bridge = epics_base_rs::runtime::task::BlockingBridge::capture();
 
-        let autosave_cmds = self
-            .autosave_manager
-            .as_ref()
-            .map(|mgr| autosave::iocsh::autosave_commands(mgr.clone()));
-
         let server = Arc::new(self);
 
         // C `rsrv_register_server` joins the `dbServer` list (`dbServer.c:30`)
@@ -912,6 +1005,7 @@ impl CaServer {
         let ca_cmds = crate::server::iocsh::ca_server_commands();
 
         let server_clone = server.clone();
+        let mark = epics_base_rs::server::db_server::serving_mark([crate::server::RSRV_SERVER]);
         // `run` drives `tokio::net` listeners, so it belongs on the tokio
         // runtime and nowhere else. `bridge.reactor()` used to place it, and
         // under `exec_backend` that is a callback band with no reactor at all:
@@ -920,17 +1014,17 @@ impl CaServer {
         // the outside as an IOC that announces its port and never answers.
         // The bridge itself stays — the shell thread below still needs it to
         // re-enter this runtime.
-        let server_handle = tokio::runtime::Handle::try_current()
+        let mut server_handle = tokio::runtime::Handle::try_current()
             .expect(
                 "CaServer::run_with_shell is awaited on the runtime its listeners bind sockets to",
             )
             .spawn(async move { server_clone.run().await });
+        let ended =
+            epics_base_rs::server::db_server::serving_or_ended(&mark, &mut server_handle).await;
 
-        let (tx, rx) = epics_base_rs::runtime::sync::oneshot::channel();
-        std::thread::spawn(move || {
-            // C runs `iocsh()` on the thread `epicsThreadInit` listed as
-            // `_main_` (`osdThread.c:406-412`); this driver runs it here.
-            epics_base_rs::runtime::task::register_main_thread();
+        // C runs `iocsh()` on the thread `epicsThreadInit` listed as `_main_`
+        // (`osdThread.c:406-412`), after whatever `main` ran there first.
+        let shell_result = match epics_base_rs::runtime::task::run_on_main_thread(move || {
             // The shell administers this server's live policy cell so an
             // interactive `asInit` is a real ACF (re)load, not a dead-end.
             let shell = iocsh::IocShell::new_with_acf(db, bridge, acf);
@@ -938,28 +1032,25 @@ impl CaServer {
                 shell.register(cmd);
             }
             register_fn(&shell);
-            if let Some(cmds) = autosave_cmds {
-                for cmd in cmds {
-                    shell.register(cmd);
-                }
-            }
-            let result = shell.run_repl();
-            let _ = tx.send(result);
-        });
+            shell.run_main_prompt()
+        }) {
+            Ok(rx) => rx.await,
+            Err(e) => Ok(Err(format!("could not start the _main_ thread: {e}"))),
+        };
 
-        let shell_result = rx.await;
-
-        server_handle.abort();
-        let _ = server_handle.await;
+        if ended.is_none() {
+            server_handle.abort();
+            let _ = server_handle.await;
+        }
 
         match shell_result {
             Ok(Ok(())) => Ok(()),
             Ok(Err(e)) => {
-                eprintln!("shell error: {e}");
+                epics_libcom_rs::stderr_println!("shell error: {e}");
                 Err(CaError::InvalidValue(e))
             }
             Err(_) => {
-                eprintln!("shell thread dropped unexpectedly");
+                epics_libcom_rs::stderr_println!("shell thread dropped unexpectedly");
                 Err(CaError::InvalidValue("shell thread dropped".to_string()))
             }
         }
@@ -1077,7 +1168,6 @@ impl CaServer {
         let db_udp = self.db.clone();
         let db_tcp = self.db.clone();
         let acf = self.acf.clone();
-        let port = self.port;
         // Sockets were bound at construction (`bind_sockets`), so the
         // TCP port is already final — no start-up handshake back from
         // the listener task, and nothing downstream (beacon, SEARCH
@@ -1099,15 +1189,15 @@ impl CaServer {
         let autosave_handle = if let Some(ref mgr) = self.autosave_manager {
             let mgr = mgr.clone();
             let db_save = self.db.clone();
-            Some(mgr.start(&seam_reactor, db_save))
-        } else if let Some(ref cfg) = self.autosave_config {
-            let builder = autosave::AutosaveBuilder::new().add_set(cfg.clone());
+            mgr.start(db_save)
+        } else if let Some((cfg, method)) = self.autosave_config.clone() {
+            let builder = autosave::AutosaveBuilder::new().add_set(cfg, method);
             // `build` cannot fail: a set it could not construct is reported
             // on the error log and carried as that set's error status, so
             // there is nothing left here to abandon the autosave task for.
             let mgr = Arc::new(builder.build().await);
             let db_save = self.db.clone();
-            Some(mgr.start(&seam_reactor, db_save))
+            mgr.start(db_save)
         } else {
             None
         };
@@ -1211,7 +1301,7 @@ impl CaServer {
         // available, but the inner Arc-shared state already implements
         // the necessary handle semantics.
         let _hag_refresh_handle = {
-            let secs = epics_base_rs::runtime::env::get("EPICS_RS_HAG_DNS_REFRESH_SECS")
+            let secs = epics_base_rs::runtime::env::get_lossy("EPICS_RS_HAG_DNS_REFRESH_SECS")
                 .and_then(|s| s.parse::<u64>().ok())
                 .unwrap_or(0);
             let path = self.acf_source_path();
@@ -1241,66 +1331,77 @@ impl CaServer {
             }
         };
 
-        // Signal-driven drain: SIGTERM (and SIGINT on unix) flips the
-        // drain flag. The accept loop will exit; existing connections
-        // continue until the grace period elapses, after which run()
-        // returns and the rest of the spawned tasks are aborted.
+        // SIGTERM/SIGINT end the process as they end a C IOC, which has no
+        // handler, once the exit callbacks have run: under an `IocApplication` that is its to
+        // do and nothing is installed here; run alone, this task does it. The
+        // rust-only drain is opt-in (`EPICS_CAS_DRAIN_GRACE_SECS` set): it
+        // takes SIGTERM from either owner, stops accepting, keeps the existing
+        // clients for the grace and then leaves the same way. The exit
+        // callbacks running are the one difference from C left (user decision
+        // 2026-10-17).
         #[cfg(unix)]
         let signal_handle = {
+            use epics_base_rs::server::shutdown_signal::{
+                self as sig, ShutdownSignal, TerminateClaim,
+            };
+            let standalone = !sig::application_owns();
+            let drain_grace = self.drain_grace_secs;
+            // Taken before the spawn, so a SIGTERM racing the task's first
+            // poll is still the drain's.
+            let claim = drain_grace.map(|grace| (TerminateClaim::new(), grace));
             let drain = drain.clone();
-            let grace = self.drain_grace_secs;
-            Some(reactor.spawn(async move {
-                let mut sigterm =
-                    match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                    {
-                        Ok(s) => s,
-                        Err(e) => {
-                            tracing::warn!(error = %e, "drain: cannot install SIGTERM handler");
-                            return;
+            (standalone || claim.is_some()).then(|| {
+                reactor.spawn(async move {
+                    let drained = async {
+                        let Some((claim, grace)) = &claim else {
+                            return std::future::pending().await;
+                        };
+                        sig::recv_claimed(claim).await;
+                        tracing::info!(grace_secs = grace, "SIGTERM received; entering drain mode");
+                        drain.store(true, std::sync::atomic::Ordering::Release);
+                        metrics::counter!("ca_server_drain_total").increment(1);
+                        tokio::time::sleep(std::time::Duration::from_secs(*grace)).await;
+                        tracing::info!("drain grace expired; exiting");
+                        ShutdownSignal::Terminate
+                    };
+                    let direct = async {
+                        if !standalone {
+                            return std::future::pending().await;
+                        }
+                        tokio::select! {
+                            () = sig::recv(ShutdownSignal::Terminate) => ShutdownSignal::Terminate,
+                            () = sig::recv(ShutdownSignal::Interrupt) => ShutdownSignal::Interrupt,
                         }
                     };
-                if sigterm.recv().await.is_some() {
-                    tracing::info!(grace_secs = grace, "SIGTERM received; entering drain mode");
-                    drain.store(true, std::sync::atomic::Ordering::Release);
-                    metrics::counter!("ca_server_drain_total").increment(1);
-                    tokio::time::sleep(std::time::Duration::from_secs(grace)).await;
-                    tracing::info!("drain grace expired; exiting");
-                    // The one exit that leaves the process from inside a
-                    // running IOC, so it is the one that would otherwise skip
-                    // the shutdown callbacks `IocApplication::run` owns —
-                    // ports would never stop and no driver's `Drop` would run.
-                    // C reaches `exit()` the same way everywhere, through
-                    // `epicsExit` (`epicsExit.c:172-177`), never through a bare
-                    // `exit()`.
-                    epics_base_rs::runtime::exit::exit(0);
-                }
-            }))
+                    let by = tokio::select! {
+                        by = drained => by,
+                        by = direct => by,
+                    };
+                    sig::exit_by(by);
+                })
+            })
         };
         #[cfg(not(unix))]
         let signal_handle: Option<tokio::task::JoinHandle<()>> = None;
         let tcp_abort = tcp_handle.abort_handle();
 
         let udp_cfg = addr_list::from_env()?;
-        // C's RSRV announces nothing here, so this line is the port's own —
-        // and it goes through the errlog for the same reason every C boot
-        // line does: `eltc 0` must be able to silence the console. As a raw
-        // `eprintln!` it survived `eltc 0` where every C line vanished.
-        epics_base_rs::runtime::log::errlog_printf(&format!(
-            "CA server: UDP search on port {port}, TCP on port {tcp_port}, beacons → {} address(es)\n",
-            udp_cfg.beacon_addrs.len()
-        ));
 
         // mDNS announce: held for the lifetime of run(). Drops when
         // the function returns, deregistering us from the network.
+        // The announced port is the UDP search port: a client adds the
+        // discovered address to its SEARCH destinations, so a TCP port
+        // announced here is searched on a socket nothing listens on
+        // whenever the two differ (`port(0)`, or a split configuration).
         #[cfg(feature = "discovery")]
         let _mdns = if let Some(ref instance) = self.mdns_instance {
             match crate::discovery::MdnsBackend::announce_helper(
                 instance,
-                tcp_port,
+                self.port,
                 self.mdns_txt.clone(),
             ) {
                 Ok(announcer) => {
-                    tracing::info!(instance = %instance, port = tcp_port,
+                    tracing::info!(instance = %instance, port = self.port,
                         "mDNS announce active");
                     metrics::counter!("ca_server_mdns_announces_total").increment(1);
                     Some(announcer)
@@ -1327,9 +1428,10 @@ impl CaServer {
         let _dns_updater = if let Some(ref reg) = self.dns_update {
             // The configured port may differ from the actual listening
             // port (e.g. when binding 0 for ephemeral). Patch the
-            // registration with `tcp_port` before sending.
+            // registration with the UDP search `port` before sending: a
+            // client searches the SRV port (see the mDNS announce above).
             let mut reg = reg.clone();
-            reg.port = tcp_port;
+            reg.port = self.port;
             match crate::discovery::DnsUpdater::register(reg).await {
                 Ok(updater) => {
                     tracing::info!("RFC 2136 dynamic DNS registration active");
@@ -1369,36 +1471,12 @@ impl CaServer {
             // Share the drain flag so POST /drain triggers the same
             // graceful-shutdown path as SIGTERM.
             let state = state.with_drain(drain.clone());
-            // Wire POST /reload-acf to the same machinery the
-            // built-in reload uses.
-            let acf_clone = self.acf.clone();
-            let acf_path_clone = self.acf_source_path.lock().ok().and_then(|g| g.clone());
-            let acf_reload_tx_clone = self.acf_reload_tx.clone();
-            // The closure outlives this scope inside `IntrospectionState`, and
-            // it is called from an introspection handler task, not from here —
-            // so it has to carry the executor rather than read one off whatever
-            // thread happens to invoke it.
-            let acf_reload_reactor = reactor.clone();
-            let reload_fn: Arc<dyn Fn() -> Result<(), String> + Send + Sync> =
-                Arc::new(move || -> Result<(), String> {
-                    let path = acf_path_clone
-                        .as_ref()
-                        .ok_or("no ACF source path registered")?;
-                    let content =
-                        std::fs::read_to_string(path).map_err(|e| format!("read {path}: {e}"))?;
-                    let cfg = access_security::parse_acf(&content)
-                        .map_err(|e| format!("parse {path}: {e}"))?;
-                    // Avoid awaiting inside the closure — spawn a one-shot
-                    // task to swap the RwLock contents and notify clients.
-                    let acf = acf_clone.clone();
-                    let reload_tx = acf_reload_tx_clone.clone();
-                    acf_reload_reactor.spawn(async move {
-                        acf.store(Some(Arc::new(cfg)));
-                        let _ = reload_tx.send(());
-                    });
-                    Ok(())
-                });
-            let state = state.with_reload_acf(reload_fn);
+            let state = state.with_reload_acf(Self::reload_acf_hook(
+                self.acf_source_path(),
+                self.acf.clone(),
+                self.acf_reload_tx.clone(),
+                reactor.clone(),
+            ));
 
             // POST /reload-tls hook: re-read the cert/key paths and
             // swap the inner ServerConfig Arc atomically. Available
@@ -1412,13 +1490,13 @@ impl CaServer {
                 let reload_tls_fn: Arc<dyn Fn() -> Result<(), String> + Send + Sync> =
                     Arc::new(move || -> Result<(), String> {
                         let chain = crate::tls::load_certs(&paths.cert)
-                            .map_err(|e| format!("loading {}: {e}", paths.cert))?;
+                            .map_err(|e| format!("loading {}: {e}", paths.cert.display()))?;
                         let key = crate::tls::load_private_key(&paths.key)
-                            .map_err(|e| format!("loading {}: {e}", paths.key))?;
+                            .map_err(|e| format!("loading {}: {e}", paths.key.display()))?;
                         let cfg = match paths.client_ca.as_ref() {
                             Some(ca) => {
                                 let roots = crate::tls::load_root_store(ca)
-                                    .map_err(|e| format!("loading {ca}: {e}"))?;
+                                    .map_err(|e| format!("loading {}: {e}", ca.display()))?;
                                 crate::tls::TlsConfig::server_mtls_from_pem(chain, key, roots)
                                     .map_err(|e| format!("mTLS build: {e}"))?
                             }
@@ -1471,11 +1549,15 @@ impl CaServer {
         // into it, so the fact has to travel back: everything above this
         // point is bound and published, everything below it is the serving
         // loop, and `BuiltIoc::run` holds `iocInit` here.
-        epics_base_rs::server::db_server::announce_serving();
+        let beacon_socket = beacon::beacon_socket().and_then(|s| {
+            s.set_nonblocking(true)?;
+            tokio::net::UdpSocket::from_std(s)
+        })?;
+        epics_base_rs::server::db_server::announce_serving(crate::server::RSRV_SERVER);
 
         let result = tokio::select! {
             r = udp_handle => {
-                eprintln!("UDP responder exited: {r:?}");
+                epics_libcom_rs::stderr_println!("UDP responder exited: {r:?}");
                 match r {
                     Ok(inner) => inner,
                     Err(e) => Err(CaError::Io(
@@ -1484,7 +1566,7 @@ impl CaServer {
                 }
             }
             r = tcp_handle => {
-                eprintln!("TCP listener exited: {r:?}");
+                epics_libcom_rs::stderr_println!("TCP listener exited: {r:?}");
                 match r {
                     Ok(inner) => inner,
                     Err(e) => Err(CaError::Io(
@@ -1493,16 +1575,14 @@ impl CaServer {
                 }
             }
             r = beacon::run_beacon_emitter(
+                beacon_socket,
                 tcp_port,
                 udp_cfg.beacon_addrs.clone(),
                 udp_cfg.beacon_period,
                 beacon_reset,
                 #[cfg(feature = "cap-tokens")]
                 None,
-            ) => {
-                eprintln!("Beacon emitter exited: {r:?}");
-                r
-            }
+            ) => match r {}
         };
 
         // Tear down spawned tasks whose JoinHandles were moved into the
@@ -1529,16 +1609,17 @@ impl CaServer {
 #[cfg(feature = "experimental-rust-tls")]
 #[derive(Debug, Clone)]
 pub struct TlsPaths {
-    pub cert: String,
-    pub key: String,
-    pub client_ca: Option<String>,
+    pub cert: std::path::PathBuf,
+    pub key: std::path::PathBuf,
+    pub client_ca: Option<std::path::PathBuf>,
 }
 
 #[cfg(feature = "experimental-rust-tls")]
 fn tls_paths_from_env() -> Option<TlsPaths> {
-    let cert = epics_base_rs::runtime::env::get("EPICS_CAS_TLS_CERT_FILE")?;
-    let key = epics_base_rs::runtime::env::get("EPICS_CAS_TLS_KEY_FILE")?;
-    let client_ca = epics_base_rs::runtime::env::get("EPICS_CAS_TLS_CLIENT_CA_FILE");
+    let cert = epics_base_rs::runtime::env::get("EPICS_CAS_TLS_CERT_FILE")?.into();
+    let key = epics_base_rs::runtime::env::get("EPICS_CAS_TLS_KEY_FILE")?.into();
+    let client_ca =
+        epics_base_rs::runtime::env::get("EPICS_CAS_TLS_CLIENT_CA_FILE").map(Into::into);
     Some(TlsPaths {
         cert,
         key,
@@ -1572,13 +1653,13 @@ fn audit_from_env(
                     return Some(crate::audit::AuditLogger::new(reactor, sink));
                 }
                 Err(e) => {
-                    tracing::warn!(error = %e, path = %path,
+                    tracing::warn!(error = %e, path = %path.to_string_lossy(),
                         "EPICS_CAS_AUDIT_FILE: failed to open; audit disabled");
                 }
             }
         }
     }
-    if let Some(val) = epics_base_rs::runtime::env::get("EPICS_CAS_AUDIT") {
+    if let Some(val) = epics_base_rs::runtime::env::get_lossy("EPICS_CAS_AUDIT") {
         if val.eq_ignore_ascii_case("stderr") {
             return Some(crate::audit::AuditLogger::new(
                 reactor,
@@ -1593,17 +1674,117 @@ fn audit_from_env(
 /// `EPICS_CAS_INTROSPECTION_ADDR=<host>:<port>` enables it; defaults
 /// off.
 fn introspection_from_env() -> Option<std::net::SocketAddr> {
-    epics_base_rs::runtime::env::get("EPICS_CAS_INTROSPECTION_ADDR").and_then(|s| s.parse().ok())
+    epics_base_rs::runtime::env::get_lossy("EPICS_CAS_INTROSPECTION_ADDR")
+        .and_then(|s| s.parse().ok())
 }
 
-/// Drain grace seconds from the env. Default 30 — long enough for a
-/// rolling restart to finish active monitor batches, short enough
-/// that a Kubernetes terminationGracePeriodSeconds of 60 still leaves
-/// headroom for SIGKILL.
-fn drain_grace_from_env() -> u64 {
-    epics_base_rs::runtime::env::get("EPICS_CAS_DRAIN_GRACE_SECS")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(30)
+/// Drain grace seconds from the env; `None` (no drain, as C) when unset.
+/// A value that does not parse keeps the former default of 30 — long
+/// enough for a rolling restart to finish active monitor batches, short
+/// enough that a Kubernetes terminationGracePeriodSeconds of 60 still
+/// leaves headroom for SIGKILL.
+fn drain_grace_from_env() -> Option<u64> {
+    epics_base_rs::runtime::env::get_lossy("EPICS_CAS_DRAIN_GRACE_SECS")
+        .map(|s| s.trim().parse().unwrap_or(30))
+}
+
+#[cfg(test)]
+#[cfg(tokio_backend)]
+mod reload_acf_hook_tests {
+    use super::*;
+    use epics_base_rs::server::records::ai::AiRecord;
+    use epics_base_rs::types::EpicsValue;
+
+    /// POST /reload-acf answers at once and publishes on the reactor; the
+    /// access-rights refresh it fires must find the new inputs' first readings
+    /// in place, as `asInit`'s return does.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_reload_hook_refreshes_with_the_first_readings_in_place() {
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("rv", Box::new(AiRecord::new(5.0)))
+            .await
+            .unwrap();
+        db.put_record_field_from_ca("rv", "VAL", EpicsValue::Double(5.0))
+            .await
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x.acf");
+        std::fs::write(
+            &path,
+            r#"ASG(DEFAULT) { INPA(rv) RULE(1,READ) { CALC("A>1") } }"#,
+        )
+        .unwrap();
+        let acf = epics_base_rs::server::access_security::new_acf_cell_watching(None, &db);
+        let (reload_tx, mut refreshed) = tokio::sync::broadcast::channel(4);
+        let hook = CaServer::reload_acf_hook(
+            Some(path.to_string_lossy().into()),
+            acf.clone(),
+            reload_tx,
+            tokio::runtime::Handle::current(),
+        );
+        // Hold `rv`'s lock across the reload: the first reading is in place
+        // at the refresh only if the publish waited for the watcher to take it.
+        let (locked, held) = std::sync::mpsc::channel();
+        let rec = db.get_record("rv").unwrap();
+        let holder = std::thread::spawn(move || {
+            let _guard = rec.write();
+            locked.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        });
+        held.recv().unwrap();
+        hook().unwrap();
+        refreshed.recv().await.unwrap();
+        assert_eq!(
+            acf.load_full().unwrap().asg[b"DEFAULT".as_slice()].inp_bad(),
+            0
+        );
+        holder.join().unwrap();
+    }
+
+    /// A reload awaited on cbMedium, the INP watcher's band, returns with the
+    /// first readings in place: the install's wait parks no thread there.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reload_from_cb_medium_returns_with_the_first_readings_in_place() {
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("rv", Box::new(AiRecord::new(5.0)))
+            .await
+            .unwrap();
+        db.put_record_field_from_ca("rv", "VAL", EpicsValue::Double(5.0))
+            .await
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x.acf");
+        std::fs::write(
+            &path,
+            r#"ASG(DEFAULT) { INPA(rv) RULE(1,READ) { CALC("A>1") } }"#,
+        )
+        .unwrap();
+        let acf = epics_base_rs::server::access_security::new_acf_cell_watching(None, &db);
+        let (reload_tx, _refreshed) = tokio::sync::broadcast::channel(4);
+        let (locked, held) = std::sync::mpsc::channel();
+        let rec = db.get_record("rv").unwrap();
+        let holder = std::thread::spawn(move || {
+            let _guard = rec.write();
+            locked.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        });
+        held.recv().unwrap();
+        let cell = acf.clone();
+        let reload = epics_base_rs::runtime::task::spawn_background(
+            epics_base_rs::runtime::task::CallbackPriority::Medium,
+            async move { CaServer::reload_acf_inner(&path.to_string_lossy(), &cell, &reload_tx).await },
+        );
+        epics_base_rs::runtime::task::timeout(std::time::Duration::from_secs(5), reload)
+            .await
+            .expect("the reload parked cbMedium")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            acf.load_full().unwrap().asg[b"DEFAULT".as_slice()].inp_bad(),
+            0
+        );
+        holder.join().unwrap();
+    }
 }
 
 #[cfg(test)]
@@ -1656,18 +1837,12 @@ mod access_notifier_tests {
     }
 }
 
-#[cfg(all(test, exec_backend))]
+#[cfg(test)]
 mod acf_reload_needs_no_runtime {
-    //! The measurement behind `reload_acf_inner`'s seam routing.
-    //!
     //! `reload_acf_from` is public and `reload_acf_inner` is reached from
     //! iocsh as well as from `run`, so it has to work on a thread that is not
-    //! inside any runtime — which on the RTEMS execution model is every thread
-    //! the blocking driver and the shell own. `tokio::task::spawn_blocking`
-    //! panics there; the seam's `spawn_blocking` is the callback pool and does
-    //! not. This test is `exec_backend`-only because that is the backend where
-    //! the difference exists: under `tokio_backend` both spellings are the same
-    //! call and neither works off a runtime.
+    //! inside any runtime. `tokio::task::spawn_blocking`, which the read went
+    //! through before `read_acf`, panics there.
 
     #[test]
     fn reload_acf_inner_completes_on_a_thread_with_no_runtime() {
@@ -1763,5 +1938,80 @@ mod listeners_need_the_tokio_runtime {
         assert_eq!(value.to_f64().unwrap_or(0.0) as i64, 4242);
 
         server_task.abort();
+    }
+}
+
+#[cfg(test)]
+#[cfg(tokio_backend)]
+mod bind_sockets_tests {
+    use super::*;
+
+    /// A held UDP port on one of two interfaces drops that interface's TCP
+    /// listener too, as `rsrv_init`'s `cleanup:` does.
+    #[tokio::test]
+    async fn an_interface_whose_udp_bind_failed_loses_its_tcp_listener() {
+        let lo2 = std::net::Ipv4Addr::new(127, 0, 0, 2);
+        // SAFETY: nextest runs this test alone in its process; the list is
+        // read once, memoized.
+        unsafe {
+            std::env::set_var("EPICS_CAS_INTF_ADDR_LIST", "127.0.0.1 127.0.0.2");
+        }
+        // A stranger may hold the picked number on 127.0.0.1 as well, which
+        // fails the start for a reason that says nothing about the rule.
+        let (_held, tcp, udp) = {
+            let mut tries = 0;
+            loop {
+                let held = std::net::UdpSocket::bind((lo2, 0)).expect("hold");
+                let port = held.local_addr().unwrap().port();
+                match bind_sockets(port, 0).await {
+                    Ok((tcp, udp)) => break (held, tcp, udp),
+                    Err(_) if tries < 8 => tries += 1,
+                    Err(e) => panic!("the free interface serves: {e}"),
+                }
+            }
+        };
+        assert_eq!(udp.interfaces(), [std::net::Ipv4Addr::LOCALHOST]);
+        assert_eq!(tcp.interfaces(), [std::net::Ipv4Addr::LOCALHOST]);
+    }
+
+    /// An address that is no interface of this host is dropped by the TCP set
+    /// and never reaches the UDP bind, so the start serves on the rest.
+    #[tokio::test]
+    async fn an_address_that_is_no_interface_is_dropped_before_the_udp_bind() {
+        unsafe {
+            std::env::set_var("EPICS_CAS_INTF_ADDR_LIST", "127.0.0.1 192.0.2.1");
+        }
+        let (tcp, udp) = bind_sockets(0, 0).await.expect("127.0.0.1 serves");
+        assert_eq!(udp.interfaces(), [std::net::Ipv4Addr::LOCALHOST]);
+        assert_eq!(tcp.interfaces(), [std::net::Ipv4Addr::LOCALHOST]);
+    }
+}
+
+#[cfg(all(test, unix, feature = "experimental-rust-tls"))]
+mod tls_paths_tests {
+    use super::*;
+    use std::os::unix::ffi::OsStrExt;
+
+    #[test]
+    #[serial_test::serial(epics_env)]
+    fn a_non_utf8_tls_path_keeps_its_bytes() {
+        let cert = std::ffi::OsStr::from_bytes(b"/c\xff.pem");
+        let key = std::ffi::OsStr::from_bytes(b"/k\xff.pem");
+        // SAFETY: single-threaded under the `epics_env` serial group.
+        unsafe {
+            std::env::set_var("EPICS_CAS_TLS_CERT_FILE", cert);
+            std::env::set_var("EPICS_CAS_TLS_KEY_FILE", key);
+            std::env::remove_var("EPICS_CAS_TLS_CLIENT_CA_FILE");
+        }
+        let paths = tls_paths_from_env();
+        // SAFETY: same serial group.
+        unsafe {
+            std::env::remove_var("EPICS_CAS_TLS_CERT_FILE");
+            std::env::remove_var("EPICS_CAS_TLS_KEY_FILE");
+        }
+        let paths = paths.expect("cert and key are set");
+        assert_eq!(paths.cert.as_os_str(), cert);
+        assert_eq!(paths.key.as_os_str(), key);
+        assert_eq!(paths.client_ca, None);
     }
 }

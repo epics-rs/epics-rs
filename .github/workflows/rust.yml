@@ -8,15 +8,12 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  # Line tables, not full DWARF. A `cargo nextest run --workspace` target dir
-  # for this workspace measures 91,635 MB here, against the ~86 GB an
-  # ubuntu-latest runner leaves free, and it is nearly all debuginfo: 658 test
-  # binaries at ~300 MB each. Both `checks` and `interop` died writing the
-  # runner's own diagnostic log ("System.IO.IOException: No space left on
-  # device"), which also loses the job log, so the failure arrives with no
-  # output to read. `line-tables-only` keeps the file:line a backtrace is read
-  # with and takes the same target dir to 34,436 MB (measured 2026-08-29).
-  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  # No debuginfo, not even line tables. The all-features test build on
+  # 12059ffc07 (1,674 test binaries) takes 109,470 MB with `line-tables-only`
+  # and 48,809 MB with 0; 17a131b3b's 69,114 MB was the last that fit. A full
+  # disk kills the runner's own diagnostic log, so the job log goes with it.
+  # Panics keep their file:line; backtrace frames do not.
+  CARGO_PROFILE_DEV_DEBUG: 0
 
 jobs:
   checks:
@@ -29,6 +26,16 @@ jobs:
         toolchain: 1.99.0
         components: rustfmt, clippy
     - uses: taiki-e/install-action@nextest
+    # The asyn-rs serial tests open a pty, the search_udp v6 tests use `::1`,
+    # and `ensure_iface_socket` needs a non-loopback IPv4 NIC; each fails,
+    # not skips, without them. ubuntu-latest has all three, so this step only
+    # turns a runner-image change into one clear error instead of many test
+    # failures.
+    - name: Test prerequisites (pty, ::1, external NIC)
+      run: |
+        python3 -c 'import os; os.close(os.openpty()[0])'
+        python3 -c 'import socket; s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM); s.bind(("::1", 0)); s.sendto(b"x", s.getsockname())'
+        ip -4 -o addr show scope global up | grep -q .
     - name: Format
       run: cargo fmt --all -- --check
     # Cargo registry + target cache. Placed after the toolchain step
@@ -104,6 +111,16 @@ jobs:
     - uses: Swatinem/rust-cache@v2
       with:
         key: all-features
+    # The asyn-rs serial tests open a pty, the search_udp v6 tests use `::1`,
+    # and `ensure_iface_socket` needs a non-loopback IPv4 NIC; each fails,
+    # not skips, without them. ubuntu-latest has all three, so this step only
+    # turns a runner-image change into one clear error instead of many test
+    # failures.
+    - name: Test prerequisites (pty, ::1, external NIC)
+      run: |
+        python3 -c 'import os; os.close(os.openpty()[0])'
+        python3 -c 'import socket; s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM); s.bind(("::1", 0)); s.sendto(b"x", s.getsockname())'
+        ip -4 -o addr show scope global up | grep -q .
     # epics-oracle-rs boots the compiled C `softIoc` for ground truth and fails
     # loudly (by design) without the C EPICS tree, which no runner has.
     - name: Every feature-gated test, compiled and run
@@ -178,6 +195,16 @@ jobs:
     - uses: Swatinem/rust-cache@v2
       with:
         key: exec-backend
+    # The asyn-rs serial tests open a pty, the search_udp v6 tests use `::1`,
+    # and `ensure_iface_socket` needs a non-loopback IPv4 NIC; each fails,
+    # not skips, without them. ubuntu-latest has all three, so this step only
+    # turns a runner-image change into one clear error instead of many test
+    # failures.
+    - name: Test prerequisites (pty, ::1, external NIC)
+      run: |
+        python3 -c 'import os; os.close(os.openpty()[0])'
+        python3 -c 'import socket; s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM); s.bind(("::1", 0)); s.sendto(b"x", s.getsockname())'
+        ip -4 -o addr show scope global up | grep -q .
     - name: The exec backend is what this job actually built
       run: cargo nextest run --profile ci --workspace -E 'binary(rtems_exec_model_gate)'
     - name: Workspace on the exec backend
@@ -222,9 +249,21 @@ jobs:
   # exactly the retirement trip-wire the deviation doc requires. Pinning a
   # nightly here would mute that trip-wire and drift from what
   # `cargo +nightly` means on a developer machine.
+  #
+  # It is nevertheless PINNED to nightly-2026-10-19, because std stopped
+  # compiling for the target. rust-lang/rust#163732 (first in
+  # nightly-2026-10-20) moved std's libc to 0.2.191, whose newlib `stat`
+  # spells the timestamps `st_atim`/`st_mtim`/`st_ctim` while std's
+  # `os/rtems/fs.rs` and `sys/fs/unix.rs` still read `st_atime`; and
+  # rust-lang/rust#163701 (first in nightly-2026-10-22) added `ReadDir::dir`,
+  # which calls `libc::dirfd` on RTEMS, for which no libc declares it. Lift the
+  # pin once a current nightly's std builds for armv7-rtems-eabihf; until then
+  # the floating trip-wire lives in a local `./scripts/rtems-check.sh` run.
   rtems-closure:
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    env:
+      RTEMS_TOOLCHAIN: nightly-2026-10-19
 
     steps:
     - uses: actions/checkout@v4
@@ -240,7 +279,7 @@ jobs:
       run: ./scripts/csrc-check.sh
     - uses: dtolnay/rust-toolchain@master
       with:
-        toolchain: nightly
+        toolchain: ${{ env.RTEMS_TOOLCHAIN }}
         components: rust-src
     - uses: Swatinem/rust-cache@v2
       with:
@@ -575,18 +614,20 @@ jobs:
   rustdoc-embedded:
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    # The RTEMS rows take `rtems-closure`'s pin, for the reasons its header gives.
+    env:
+      RTEMS_TOOLCHAIN: nightly-2026-10-19
 
     steps:
     - uses: actions/checkout@v4
     - uses: dtolnay/rust-toolchain@master
       with:
-        toolchain: nightly
+        toolchain: ${{ env.RTEMS_TOOLCHAIN }}
         components: rust-src
     # The VxWorks rows below are pinned to nightly-2026-08-30, the last nightly
     # before rust#160170 (first in nightly-2026-08-31) removed the vxworks guard
     # around `libc::O_NOFOLLOW` in std's `set_perm_nofollow`; see the
-    # `vxworks-census` header. The RTEMS rows keep the floating `nightly` above —
-    # the break is VxWorks-only. Drop this second toolchain and restore the
+    # `vxworks-census` header. Drop this second toolchain and restore the
     # VxWorks rows to `+nightly` once rust#162065 (the std-side fix) lands.
     - uses: dtolnay/rust-toolchain@master
       with:
@@ -618,12 +659,12 @@ jobs:
                      epics-rtems-boot epics-bridge-rs asyn-rs; do
           feats=()
           case "$crate" in
-            epics-bridge-rs) feats=(--features qsrv-core,pvalink) ;;
+            epics-bridge-rs) feats=(--features qsrv-core,pvalink,calink-core) ;;
             epics-ca-rs)     feats=(--features client-core) ;;
             asyn-rs)         feats=(--features epics) ;;
           esac
           echo "::group::$crate --lib (armv7-rtems-eabihf)"
-          cargo +nightly doc --no-deps --no-default-features --document-private-items \
+          cargo +"$RTEMS_TOOLCHAIN" doc --no-deps --no-default-features --document-private-items \
             -Zbuild-std=std,panic_abort --target armv7-rtems-eabihf \
             -p "$crate" --lib ${feats[@]+"${feats[@]}"} || rc=1
           echo "::endgroup::"
@@ -644,7 +685,7 @@ jobs:
                      epics-rtems-boot epics-bridge-rs asyn-rs; do
           feats=()
           case "$crate" in
-            epics-bridge-rs) feats=(--features qsrv-core,pvalink) ;;
+            epics-bridge-rs) feats=(--features qsrv-core,pvalink,calink-core) ;;
             epics-ca-rs)     feats=(--features client-core) ;;
             asyn-rs)         feats=(--features epics) ;;
           esac
@@ -655,3 +696,34 @@ jobs:
           echo "::endgroup::"
         done
         exit "$rc"
+
+  # raw_float_format (lints/raw_float_format) needs a format argument's type,
+  # which only a rustc_private lint sees, so it runs on the nightly its
+  # rust-toolchain.toml pins while the workspace stays on stable. That pin must
+  # be a rust-clippy sync date: dylint_driver registers the clippy_utils
+  # symbols of the nearest sync, and on any other nightly rustc panics on the
+  # ones it has since gained.
+  raw-float-format:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: nightly-2026-10-01
+        components: llvm-tools-preview, rustc-dev
+    - uses: Swatinem/rust-cache@v2
+      with:
+        key: raw-float-format
+    - name: Install dylint
+      run: cargo install --locked cargo-dylint@6.2.0 dylint-link@6.2.0
+    - name: Lint UI tests
+      working-directory: lints/raw_float_format
+      run: cargo test
+    - name: raw_float_format
+      run: cargo dylint --all --workspace -- --all-features --keep-going
+    - name: raw_float_format (thread backend)
+      env:
+        EPICS_RS_BUILD_EXEC_BACKEND: thread
+      run: cargo dylint --all --workspace -- --all-features --keep-going

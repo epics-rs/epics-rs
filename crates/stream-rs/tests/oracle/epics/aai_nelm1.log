@@ -1,0 +1,18 @@
+-	drvStreamInit()
+-	StreamProtocolParser::path = /home/stevek/work/_tgt/monitor/trial/crates/stream-rs/tests/oracle/epics
+_main_	streamInitRecord(rec): SEVR=3
+_main_	streamInitRecord(rec): create new Stream object
+_main_	streamInitRecord(rec): calling initRecord
+_main_	Stream::initRecord rec: parse link string "l.proto ad P"
+_main_	Stream::initRecord rec: filename="l.proto" protocol="ad" bus="P" addr=0 params=""
+_main_	Stream::initRecord rec: attachBus("P", 0, "")
+_main_	Stream::initRecord rec: parse("l.proto", "ad")
+_main_	Stream::initRecord rec: initialize the first time
+_main_	streamInitRecord(rec) done status=0x2
+VAL 0
+SEVR "INVALID"
+STAT "UDF"
+UDF 1 = 0x1
+PACT 0 = 0x0
+PROC 0 = 0x0
+NORD 1 = 0x1

@@ -1,0 +1,227 @@
+recordtype(scanparm) {
+	include "dbCommon.dbd" 
+	field(VERS,DBF_FLOAT) {
+		prompt("Code Version")
+		special(SPC_NOMOD)
+		initial("1")
+	}
+	field(VAL,DBF_DOUBLE) {
+		prompt("Result")
+	}
+	field(PREC,DBF_SHORT) {
+		prompt("Display Precision")
+		promptgroup(GUI_DISPLAY)
+		interest(1)
+	}
+	field(PRE,DBF_SHORT) {
+		prompt("PRE-write command")
+		promptgroup(GUI_DISPLAY)
+		pp(TRUE)
+		interest(1)
+	}
+	field(OPRE,DBF_OUTLINK) {
+		prompt("PRE-write OutLink")
+		promptgroup(GUI_COMMON)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(SM,DBF_MENU) {
+		prompt("StepMode")
+		promptgroup(GUI_COMMON)
+		interest(1)
+		menu(sscanP1SM)
+	}
+	field(OSM,DBF_OUTLINK) {
+		prompt("SM OutLink")
+		promptgroup(GUI_COMMON)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(AR,DBF_MENU) {
+		prompt("absRel")
+		promptgroup(GUI_COMMON)
+		interest(1)
+		menu(sscanP1AR)
+	}
+	field(OAR,DBF_OUTLINK) {
+		prompt("AR OutLink")
+		promptgroup(GUI_COMMON)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(AFT,DBF_MENU) {
+		prompt("After")
+		promptgroup(GUI_COMMON)
+		interest(1)
+		menu(sscanPASM)
+	}
+	field(OAFT,DBF_OUTLINK) {
+		prompt("AFT OutLink")
+		promptgroup(GUI_COMMON)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(PPV,DBF_STRING) {
+		prompt("PositionerPVName")
+		promptgroup(GUI_COMMON)
+		interest(1)
+		size(40)
+	}
+	field(RPV,DBF_STRING) {
+		prompt("ReadbackPVName")
+		promptgroup(GUI_COMMON)
+		interest(1)
+		size(40)
+	}
+	field(DPV,DBF_STRING) {
+		prompt("DetPVName")
+		promptgroup(GUI_COMMON)
+		interest(1)
+		size(40)
+	}
+	field(TPV,DBF_STRING) {
+		prompt("TrigPVName")
+		promptgroup(GUI_COMMON)
+		interest(1)
+		size(40)
+	}
+	field(OPPV,DBF_OUTLINK) {
+		prompt("P1PV OutLink")
+		promptgroup(GUI_COMMON)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(ORPV,DBF_OUTLINK) {
+		prompt("R1PV OutLink")
+		promptgroup(GUI_COMMON)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(ODPV,DBF_OUTLINK) {
+		prompt("D1PV OutLink")
+		promptgroup(GUI_COMMON)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(OTPV,DBF_OUTLINK) {
+		prompt("T1PV OutLink")
+		promptgroup(GUI_COMMON)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(SP,DBF_DOUBLE) {
+		prompt("StartPos")
+		promptgroup(GUI_DISPLAY)
+		pp(TRUE)
+		interest(1)
+	}
+	field(OSP,DBF_OUTLINK) {
+		prompt("SP OutLink")
+		promptgroup(GUI_COMMON)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(EP,DBF_DOUBLE) {
+		prompt("EndPos")
+		promptgroup(GUI_DISPLAY)
+		pp(TRUE)
+		interest(1)
+	}
+	field(OEP,DBF_OUTLINK) {
+		prompt("EP OutLink")
+		promptgroup(GUI_COMMON)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(NP,DBF_LONG) {
+		prompt("nPts")
+		promptgroup(GUI_DISPLAY)
+		pp(TRUE)
+		interest(1)
+	}
+	field(ONP,DBF_OUTLINK) {
+		prompt("NP OutLink")
+		promptgroup(GUI_COMMON)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(SC,DBF_SHORT) {
+		prompt("StartCmd")
+		promptgroup(GUI_DISPLAY)
+		interest(1)
+	}
+	field(OSC,DBF_OUTLINK) {
+		prompt("SC OutLink")
+		promptgroup(GUI_COMMON)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(AQT,DBF_DOUBLE) {
+		prompt("Acquire time")
+		promptgroup(GUI_DISPLAY)
+		pp(TRUE)
+		interest(1)
+	}
+	field(OAQT,DBF_OUTLINK) {
+		prompt("AQT OutLink")
+		promptgroup(GUI_COMMON)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(MP,DBF_LONG) {
+		prompt("MaxPts")
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(IMP,DBF_INLINK) {
+		prompt("MP InLink")
+		promptgroup(GUI_COMMON)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(ACT,DBF_SHORT) {
+		prompt("ScanActive")
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(IACT,DBF_INLINK) {
+		prompt("InLink")
+		promptgroup(GUI_COMMON)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(LOAD,DBF_SHORT) {
+		prompt("Load")
+		promptgroup(GUI_DISPLAY)
+		pp(TRUE)
+		interest(1)
+	}
+	field(OLOAD,DBF_OUTLINK) {
+		prompt("LOAD OutLink")
+		promptgroup(GUI_COMMON)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(GO,DBF_SHORT) {
+		prompt("Go")
+		promptgroup(GUI_DISPLAY)
+		pp(TRUE)
+		interest(1)
+	}
+	field(OGO,DBF_OUTLINK) {
+		prompt("GO OutLink")
+		promptgroup(GUI_COMMON)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(STEP,DBF_DOUBLE) {
+		prompt("StepSize")
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(LSTP,DBF_DOUBLE) {
+		prompt("Last stepSize")
+		special(SPC_NOMOD)
+		interest(1)
+	}
+}

@@ -140,7 +140,8 @@ pub struct Deviation {
     /// Observable surfaces this deviation may show up on (`diff::Surface`).
     #[serde(default)]
     pub surface: Vec<String>,
-    /// Boundary classes (from `cases.rs`) this deviation is limited to.
+    /// Boundary classes (from `cases.rs`, or a PVA monitor `Drive`) this
+    /// deviation is limited to.
     #[serde(default)]
     pub classes: Vec<String>,
     /// What the RUN must have driven for this deviation to be producible at all,

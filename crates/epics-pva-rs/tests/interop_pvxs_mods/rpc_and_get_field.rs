@@ -14,6 +14,7 @@
 
 #![cfg(tokio_backend)]
 
+use super::interop_helpers::PvxsOutput;
 use super::interop_helpers::{pvxs_command, pvxs_lib_dir, require_pvxs};
 
 use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
@@ -34,9 +35,7 @@ fn env_key() -> &'static str {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn interop_rpc_pvxcall_against_rust_server() {
-    let Some(pvxcall) = require_pvxs("pvxcall") else {
-        return;
-    };
+    let pvxcall = require_pvxs("pvxcall");
 
     // RPC handler that echoes the input "x" arg back as
     // `Structure { value: Scalar<Int>(x * 2) }`.
@@ -44,7 +43,7 @@ async fn interop_rpc_pvxcall_against_rust_server() {
     pv.open(
         FieldDesc::Structure {
             struct_id: "rpc_in".into(),
-            fields: vec![("x".into(), FieldDesc::Scalar(ScalarType::Int))],
+            fields: vec![("x".into(), FieldDesc::Scalar(ScalarType::Int))].into(),
         },
         PvField::Structure(PvStructure {
             struct_id: "rpc_in".into(),
@@ -83,7 +82,7 @@ async fn interop_rpc_pvxcall_against_rust_server() {
         };
         let out_desc = FieldDesc::Structure {
             struct_id: "rpc_out".into(),
-            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Int))],
+            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Int))].into(),
         };
         let out_val = PvField::Structure(PvStructure {
             struct_id: "rpc_out".into(),
@@ -112,7 +111,7 @@ async fn interop_rpc_pvxcall_against_rust_server() {
             .env(env_key(), lib)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .output()
+            .pvxs_output()
             .expect("pvxcall exec")
     })
     .await
@@ -138,15 +137,13 @@ async fn interop_rpc_pvxcall_against_rust_server() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn interop_get_field_pvxinfo_against_rust_server() {
-    let Some(pvxinfo) = require_pvxs("pvxinfo") else {
-        return;
-    };
+    let pvxinfo = require_pvxs("pvxinfo");
 
     let pv = SharedPV::new();
     pv.open(
         FieldDesc::Structure {
             struct_id: "epics:nt/NTScalar:1.0".into(),
-            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))],
+            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))].into(),
         },
         PvField::Structure(PvStructure {
             struct_id: "epics:nt/NTScalar:1.0".into(),
@@ -173,7 +170,7 @@ async fn interop_get_field_pvxinfo_against_rust_server() {
             .env(env_key(), lib)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .output()
+            .pvxs_output()
             .expect("pvxinfo exec")
     })
     .await

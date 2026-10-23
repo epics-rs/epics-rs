@@ -14,10 +14,10 @@
 //!     so the framework hands the resolved common fields to the record after
 //!     the common-field/init_record passes via `Record::init_links`
 //!     (`ioc_builder`/`iocsh` load path): a passive never-processed calcout
-//!     loaded through a `.db` already shows `OUTV = LOC` for a local OUT link.
-//!     On the lower-level `PvDatabase::add_record` path (no loader), `OUTV`
-//!     holds its `CON` default until the first process re-points it through
-//!     `check_alarms`.
+//!     loaded through a `.db` already shows `OUTV = LOC` for a local OUT link,
+//!   * a runtime put to INPx/OUT classifies nothing: C's `special()` runs
+//!     before `dbAddLink` sets the `lset` (dbAccess.c:1181-1208), so the status
+//!     reads Constant whatever the target, and no later process re-classifies.
 
 use std::time::Duration;
 
@@ -86,8 +86,9 @@ async fn calcout_input_link_status_loc_vs_con() {
     );
 }
 
+/// softIoc R7.0.10: `caput CO.INPC TGT` leaves `CO.INCV` Constant.
 #[epics_macros_rs::epics_test]
-async fn calcout_input_status_reclassifies_on_special() {
+async fn calcout_input_put_to_a_local_link_reads_constant() {
     let db = PvDatabase::new();
     db.add_record("CALC_SP_TGT", Box::new(AoRecord::new(0.0)))
         .await
@@ -95,11 +96,8 @@ async fn calcout_input_status_reclassifies_on_special() {
     db.add_record("CALC_SP", Box::new(CalcoutRecord::default()))
         .await
         .unwrap();
-
-    // Empty at init → CON.
     poll_status(&db, "CALC_SP.INCV", CON, "empty INPC → CON").await;
 
-    // A client put to the INP link re-runs checkLinks via special().
     db.put_record_field_from_ca_no_notify(
         "CALC_SP",
         "INPC",
@@ -107,11 +105,14 @@ async fn calcout_input_status_reclassifies_on_special() {
     )
     .await
     .unwrap();
-    poll_status(&db, "CALC_SP.INCV", LOC, "INPC repointed to local → LOC").await;
+    epics_base_rs::runtime::task::sleep(Duration::from_millis(100)).await;
+    assert_eq!(read_status(&db, "CALC_SP.INCV").await, CON);
 }
 
+/// softIoc R7.0.10: `caput CO.OUT TGT` then `caput CO.PROC 1` leaves
+/// `CO.OUTV` Constant.
 #[epics_macros_rs::epics_test]
-async fn calcout_outv_classifies_via_process() {
+async fn calcout_out_put_to_a_local_link_reads_constant_after_process() {
     let db = PvDatabase::new();
     db.add_record("CALC_OUT_TGT", Box::new(AoRecord::new(0.0)))
         .await
@@ -119,13 +120,8 @@ async fn calcout_outv_classifies_via_process() {
     db.add_record("CALC_OUT", Box::new(CalcoutRecord::default()))
         .await
         .unwrap();
-
-    // The OUT link is a common field, invisible to the record at init, so
-    // OUTV holds its CON default until the first process.
     poll_status(&db, "CALC_OUT.OUTV", CON, "OUTV CON before process").await;
 
-    // Configure a local OUT link, then process: check_alarms mirrors
-    // common.out into the record and re-classifies OUTV → LOC.
     db.put_record_field_from_ca_no_notify(
         "CALC_OUT",
         "OUT",
@@ -137,14 +133,8 @@ async fn calcout_outv_classifies_via_process() {
     db.process_record_with_links("CALC_OUT", &mut visited)
         .await
         .unwrap();
-
-    poll_status(
-        &db,
-        "CALC_OUT.OUTV",
-        LOC,
-        "local OUT link → LOC after process",
-    )
-    .await;
+    epics_base_rs::runtime::task::sleep(Duration::from_millis(100)).await;
+    assert_eq!(read_status(&db, "CALC_OUT.OUTV").await, CON);
 }
 
 /// C `calcoutRecord.c::init_record` (calcoutRecord.c:160-189) classifies the

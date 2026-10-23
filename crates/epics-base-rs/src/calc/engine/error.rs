@@ -78,10 +78,9 @@ impl fmt::Display for CalcError {
 impl std::error::Error for CalcError {}
 
 impl CalcError {
-    /// Return the epics-base `CALC_ERR_*` integer code for this error
-    /// (`postfix.h:83-109`). Variants that have no epics-base equivalent
-    /// (synApps string/array extensions) map to the nearest C code so that
-    /// record-level `perror` reporting stays within the documented range.
+    /// Return the `CALC_ERR_*` integer code for this error (`postfix.h:83-109`,
+    /// plus 14/15 from `sCalcPostfix.h`). Evaluation-only variants map to the
+    /// nearest compile code.
     pub fn code(&self) -> i16 {
         match self {
             // CALC_ERR_TOOMANY        = 1. `StackLeak` is the RUNTIME form of the
@@ -95,7 +94,7 @@ impl CalcError {
             // CALC_ERR_BAD_SEPERATOR  = 4
             CalcError::BadSeparator => 4,
             // CALC_ERR_PAREN_NOT_OPEN = 5
-            CalcError::ParenNotOpen | CalcError::BracketNotOpen | CalcError::BraceNotOpen => 5,
+            CalcError::ParenNotOpen => 5,
             // CALC_ERR_PAREN_OPEN     = 6
             CalcError::ParenOpen => 6,
             // CALC_ERR_CONDITIONAL    = 7
@@ -124,6 +123,11 @@ impl CalcError {
             CalcError::NullArg | CalcError::EmptyProgram => 12,
             // CALC_ERR_INTERNAL       = 13
             CalcError::Internal => 13,
+            // CALC_ERR_BRACKET_NOT_OPEN = 14, CALC_ERR_CURLY_NOT_OPEN = 15
+            // (`sCalcPostfix.h:41-42`, `aCalcPostfix.h:38-39`). Only those two
+            // compilers have `]` and `}`, so base never reaches either.
+            CalcError::BracketNotOpen => 14,
+            CalcError::BraceNotOpen => 15,
         }
     }
 }

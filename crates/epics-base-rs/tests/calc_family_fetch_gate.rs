@@ -95,17 +95,15 @@ async fn r9_73_calcout_freezes_val_and_outputs_the_frozen_value() {
     let mut c = CalcoutRecord::default();
     c.put_field("CALC", EpicsValue::String("A+1".into()))
         .unwrap();
-    c.special("CALC", true).unwrap();
+    c.special("CALC", true, &Default::default()).unwrap();
     c.put_field("A", EpicsValue::Double(5.0)).unwrap();
     c.put_field("VAL", EpicsValue::Double(77.0)).unwrap();
     c.put_field("INPB", EpicsValue::String("NOSUCHREC".into()))
         .unwrap();
     c.put_field("OOPT", EpicsValue::Short(0)).unwrap(); // Every Time
     db.add_record("CO", Box::new(c)).await.unwrap();
-    db.get_record("CO")
-        .unwrap()
-        .write()
-        .put_common_field("OUT", EpicsValue::String("SINK".into()))
+    db.put_pv_no_process("CO.OUT", EpicsValue::String("SINK".into()))
+        .await
         .unwrap();
 
     process(&db, "CO").await;
@@ -131,7 +129,7 @@ async fn r9_73_scalcout_freezes_val_when_an_input_link_fails() {
     let mut c = ScalcoutRecord::new();
     c.put_field("CALC", EpicsValue::String("A+1".into()))
         .unwrap();
-    c.special("CALC", true).unwrap();
+    c.special("CALC", true, &Default::default()).unwrap();
     c.put_field("A", EpicsValue::Double(5.0)).unwrap();
     c.put_field("VAL", EpicsValue::Double(77.0)).unwrap();
     c.put_field("INPA", EpicsValue::String("NOSUCHREC".into()))
@@ -159,17 +157,15 @@ async fn r9_73_acalcout_freezes_val_and_writes_no_output() {
     let mut c = AcalcoutRecord::new();
     c.put_field("CALC", EpicsValue::String("A+1".into()))
         .unwrap();
-    c.special("CALC", true).unwrap();
+    c.special("CALC", true, &Default::default()).unwrap();
     c.put_field("A", EpicsValue::Double(5.0)).unwrap();
     c.put_field("VAL", EpicsValue::Double(77.0)).unwrap();
     c.put_field("INPB", EpicsValue::String("NOSUCHREC".into()))
         .unwrap();
     c.put_field("OOPT", EpicsValue::Short(0)).unwrap(); // Every Time
     db.add_record("AC", Box::new(c)).await.unwrap();
-    db.get_record("AC")
-        .unwrap()
-        .write()
-        .put_common_field("OUT", EpicsValue::String("SINK".into()))
+    db.put_pv_no_process("AC.OUT", EpicsValue::String("SINK".into()))
+        .await
         .unwrap();
 
     process(&db, "AC").await;

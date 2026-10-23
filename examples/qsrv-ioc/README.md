@@ -20,7 +20,7 @@ DEMO:GROUP  (demo:group/v1, atomic)
   temperature  NTScalar  "+channel": "DEMO:AI",  "+type": "scalar",  "+trigger": "*"
   setpoint     plain     "+channel": "DEMO:AO",  "+type": "plain",   "+trigger": "setpoint"
   status       NTEnum    "+channel": "DEMO:BI",  "+type": "scalar",  "+trigger": "status"
-  version      const     "+value": 1
+  version      const     "+const": 1
 ```
 
 - **scalar**: full Normative Type with alarm, timestamp, display, control
@@ -81,6 +81,9 @@ epics> dbgf DEMO:AI         # read AI value
 epics> dbpf DEMO:AO 42.5    # write AO value
 epics> dbpf DEMO:BI 1       # set BI to "On"
 ```
+
+Set `QSRV_IOC_NO_SIMULATOR` to leave the records unwritten, as a C
+softIocPVA serving the same database does.
 
 ## Port Configuration
 

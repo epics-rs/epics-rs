@@ -1,0 +1,23 @@
+StreamCore::startProtocol(rec, startMode=StartAsync)
+StreamCore::evalCommand(rec): activeCommand = in
+StreamCore::readCallback(rec, StreamIoSuccess input="X<0d><0a>V=6<0d><0a>", size=8)
+StreamCore::readCallback(rec) inputBuffer="X<0d><0a>V=6<0d><0a>", size 8
+StreamCore::readCallback(rec) inTerminator <0d><0a> at position 1
+StreamCore::readCallback(rec) input line: "X"
+StreamCore::readCallback(rec) unparsed input left: "V=6<0d><0a>"
+StreamCore::readCallback(rec) async match failure: just restart
+StreamCore::evalIn(rec): early input: V=6<0d><0a>
+StreamCore::readCallback(rec, StreamIoSuccess input="", size=0)
+StreamCore::readCallback(rec) inputBuffer="V=6<0d><0a>", size 5
+StreamCore::readCallback(rec) inTerminator <0d><0a> at position 3
+StreamCore::readCallback(rec) input line: "V=6"
+StreamCore::matchInput(rec): format = "%d"
+StreamCore::scanValue(rec, format=%d, long) input="6" value=6
+StreamCore::evalCommand(rec): activeCommand = end
+StreamCore::finishProtocol(rec, Success) not bus owner
+StreamCore::startProtocol(rec, startMode=StartAsync)
+StreamCore::evalCommand(rec): activeCommand = in
+StreamCore::readCallback(rec, StreamIoTimeout input="", size=0)
+StreamCore::readCallback(rec) inputBuffer="", size 0
+StreamCore::readCallback(rec) inTerminator <0d><0a> not found
+StreamCore::readCallback(rec) async timeout: just restart

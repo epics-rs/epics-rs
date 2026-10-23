@@ -1,9 +1,15 @@
 use super::calc_compile;
 use crate::error::{CaError, CaResult};
 use crate::server::record::{
-    AlarmLimit, AnalogAlarmInput, FieldSlot, InputFetchPolicy, ProcessOutcome, Record,
+    CycleCell, CycleRead, CycleValue, FieldSlot, InputFetchPolicy, ProcessOutcome, Record,
 };
 use crate::types::{EpicsValue, PvString};
+
+/// The calc-family input fields `A..U`, in `LA..LU` order.
+pub(crate) const CALC_INPUT_FIELDS: [&str; crate::calc::CALC_NARGS] = [
+    "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q", "R", "S",
+    "T", "U",
+];
 
 /// Calc record — evaluates CALC expression with inputs A-U.
 ///
@@ -23,27 +29,27 @@ pub struct CalcRecord {
     pub alst: f64,
     pub mlst: f64,
     // Input link strings (INPA..INPU)
-    inpa: String,
-    inpb: String,
-    inpc: String,
-    inpd: String,
-    inpe: String,
-    inpf: String,
-    inpg: String,
-    inph: String,
-    inpi: String,
-    inpj: String,
-    inpk: String,
-    inpl: String,
-    inpm: String,
-    inpn: String,
-    inpo: String,
-    inpp: String,
-    inpq: String,
-    inpr: String,
-    inps: String,
-    inpt: String,
-    inpu: String,
+    inpa: PvString,
+    inpb: PvString,
+    inpc: PvString,
+    inpd: PvString,
+    inpe: PvString,
+    inpf: PvString,
+    inpg: PvString,
+    inph: PvString,
+    inpi: PvString,
+    inpj: PvString,
+    inpk: PvString,
+    inpl: PvString,
+    inpm: PvString,
+    inpn: PvString,
+    inpo: PvString,
+    inpp: PvString,
+    inpq: PvString,
+    inpr: PvString,
+    inps: PvString,
+    inpt: PvString,
+    inpu: PvString,
     /// Bit `i` set ⟺ `INP<i>` is non-empty. Written only by
     /// [`Self::set_inp_link`], the single writer of the 21 texts, so
     /// [`Record::set_input_link_slots`] answers off it without touching them.
@@ -56,6 +62,9 @@ pub struct CalcRecord {
     pub vars: [f64; crate::calc::CALC_NARGS],
     // Previous values LA-LU (saved after each process)
     pub prev: [f64; crate::calc::CALC_NARGS],
+    // The inputs this cycle's `advance_prev_inputs` found apart from LA..LU,
+    // bit i for input i; zero on a cycle that ran no advance.
+    input_changes: u32,
     // This cycle's `calcPerform` outcome (C `calcRecord.c:121-123`). A per-cycle
     // fact, not record state: `check_alarms` — the owner of this record's alarm
     // transitions — consumes it, so it cannot outlive the cycle that set it.
@@ -81,12 +90,18 @@ pub struct CalcRecord {
     // C `RPCL`. Always a program: an empty or uncompilable CALC carries C's
     // empty `END_EXPRESSION` postfix, which `calcPerform` refuses to run — the
     // record then alarms on every process. See [`calc_compile`].
-    rpcl: crate::calc::CompiledExpr,
+    rpcl: crate::calc::Rpcl<CALC_RPCL_SIZE>,
     // C `prec->name`, handed over at creation by `set_async_context`. Only the
     // record knows it, which is why C prints its bad-CALC report from
     // `init_record`/`special` and not from `postfix()`.
-    name: Option<String>,
+    name: Option<crate::types::RecordName>,
+    // The refused CALC put's report, made by `special` under the put's hold
+    // and taken by the put's owner through `take_put_report`.
+    put_report: Option<crate::server::recgbl::PutReport>,
 }
+
+/// `calcRecord.dbd` `rpcl[INFIX_TO_POSTFIX_SIZE(160)]`.
+const CALC_RPCL_SIZE: usize = crate::calc::infix_to_postfix_size(160);
 
 impl Default for CalcRecord {
     fn default() -> Self {
@@ -102,38 +117,40 @@ impl Default for CalcRecord {
             lalm: 0.0,
             alst: 0.0,
             mlst: 0.0,
-            inpa: String::new(),
-            inpb: String::new(),
-            inpc: String::new(),
-            inpd: String::new(),
-            inpe: String::new(),
-            inpf: String::new(),
-            inpg: String::new(),
-            inph: String::new(),
-            inpi: String::new(),
-            inpj: String::new(),
-            inpk: String::new(),
-            inpl: String::new(),
-            inpm: String::new(),
-            inpn: String::new(),
-            inpo: String::new(),
-            inpp: String::new(),
-            inpq: String::new(),
-            inpr: String::new(),
-            inps: String::new(),
-            inpt: String::new(),
-            inpu: String::new(),
+            inpa: PvString::new(),
+            inpb: PvString::new(),
+            inpc: PvString::new(),
+            inpd: PvString::new(),
+            inpe: PvString::new(),
+            inpf: PvString::new(),
+            inpg: PvString::new(),
+            inph: PvString::new(),
+            inpi: PvString::new(),
+            inpj: PvString::new(),
+            inpk: PvString::new(),
+            inpl: PvString::new(),
+            inpm: PvString::new(),
+            inpn: PvString::new(),
+            inpo: PvString::new(),
+            inpp: PvString::new(),
+            inpq: PvString::new(),
+            inpr: PvString::new(),
+            inps: PvString::new(),
+            inpt: PvString::new(),
+            inpu: PvString::new(),
             inp_set: 0,
             inp_generation: 0,
             vars: [0.0; crate::calc::CALC_NARGS],
             prev: [0.0; crate::calc::CALC_NARGS],
+            input_changes: 0,
             calc_alarm: false,
             fetch_gate_failed: false,
             value_computed: false,
             aftc: 0.0,
             afvl: 0.0,
-            rpcl: crate::calc::CompiledExpr::empty(crate::calc::ExprKind::Numeric),
+            rpcl: crate::calc::Rpcl::empty(),
             name: None,
+            put_report: None,
         }
     }
 }
@@ -149,37 +166,22 @@ impl CalcRecord {
             calc: calc.to_string(),
             ..Default::default()
         };
-        rec.rpcl = calc_compile::postfix("calc", "CALC", &rec.calc).program;
+        calc_compile::postfix_into(&rec.calc, &mut rec.rpcl);
         rec
     }
 
-    /// The record's own report of a CALC it could not compile
-    /// (`calcRecord.c:105-110` from `init_record`, `:145-151` from `special`).
-    /// Two errlog records, differing only in the `pmessage` C passes.
-    ///
-    /// This is the counter-example to "a refused `dbpf` is silent": `dbpf`
-    /// prints nothing but its read-back, and the words the user sees come from
-    /// the record. They must carry `prec->name`, which is why C prints them
-    /// here rather than inside `postfix()` — and why `calc_compile` cannot.
-    fn report_bad_calc(&self, pmessage: &str, why: &str) {
+    /// The record's own report of a CALC it could not compile from
+    /// `init_record` (`calcRecord.c:105-110`); `special` makes the same pair
+    /// as a put report. It carries `prec->name`,
+    /// which is why C prints it here rather than inside `postfix()`.
+    fn report_bad_calc(&self, compiled: &calc_compile::CalcCompile, pmessage: &str) {
         // C `precord ? precord->name : "Unknown"`, reached here only if a
         // record compiled before `set_async_context` ran.
-        let name = self.name.as_deref().unwrap_or("Unknown");
-        // `S_db_badField` is `M_dbAccess|15`, positive, so C's `errSymLookup`
-        // fills the slot (`dbAccessDefs.h:184`).
-        crate::server::recgbl::rec_gbl_record_error("Illegal field value", name, pmessage);
-        crate::runtime::log::errlog_printf(&format!(
-            "{name}.CALC: {why} in expression \"{}\"\n",
-            self.calc
-        ));
-    }
-
-    /// C `calcRecord.c::monitor`: advance the `LX` previous-value field
-    /// only when the input `X` actually changed since the last post.
-    fn advance_prev(new: f64, prev: &mut f64) {
-        if new != *prev {
-            *prev = new;
-        }
+        let name = self
+            .name
+            .as_ref()
+            .map_or("Unknown".into(), |n| n.to_str_lossy());
+        compiled.report_in_expression(&name, pmessage, "CALC", &self.calc);
     }
 
     /// Advance LA..LU to A..U. C `calcRecord.c::monitor` (lines 417-423) does
@@ -193,39 +195,44 @@ impl CalcRecord {
     /// calcRecord.c:119-125), so both paths through `process()` come through
     /// here.
     fn advance_prev_inputs(&mut self) {
-        for (new, prev) in self.vars.iter().zip(self.prev.iter_mut()) {
-            Self::advance_prev(*new, prev);
+        let mut changes = 0;
+        for (i, (new, prev)) in self.vars.iter().zip(self.prev.iter_mut()).enumerate() {
+            if *new != *prev {
+                *prev = *new;
+                changes |= 1 << i;
+            }
         }
+        self.input_changes = changes;
     }
 
-    pub fn get_inp_link(&self, idx: usize) -> &str {
+    pub fn get_inp_link(&self, idx: usize) -> &[u8] {
         match idx {
-            0 => &self.inpa,
-            1 => &self.inpb,
-            2 => &self.inpc,
-            3 => &self.inpd,
-            4 => &self.inpe,
-            5 => &self.inpf,
-            6 => &self.inpg,
-            7 => &self.inph,
-            8 => &self.inpi,
-            9 => &self.inpj,
-            10 => &self.inpk,
-            11 => &self.inpl,
-            12 => &self.inpm,
-            13 => &self.inpn,
-            14 => &self.inpo,
-            15 => &self.inpp,
-            16 => &self.inpq,
-            17 => &self.inpr,
-            18 => &self.inps,
-            19 => &self.inpt,
-            20 => &self.inpu,
-            _ => "",
+            0 => self.inpa.as_bytes(),
+            1 => self.inpb.as_bytes(),
+            2 => self.inpc.as_bytes(),
+            3 => self.inpd.as_bytes(),
+            4 => self.inpe.as_bytes(),
+            5 => self.inpf.as_bytes(),
+            6 => self.inpg.as_bytes(),
+            7 => self.inph.as_bytes(),
+            8 => self.inpi.as_bytes(),
+            9 => self.inpj.as_bytes(),
+            10 => self.inpk.as_bytes(),
+            11 => self.inpl.as_bytes(),
+            12 => self.inpm.as_bytes(),
+            13 => self.inpn.as_bytes(),
+            14 => self.inpo.as_bytes(),
+            15 => self.inpp.as_bytes(),
+            16 => self.inpq.as_bytes(),
+            17 => self.inpr.as_bytes(),
+            18 => self.inps.as_bytes(),
+            19 => self.inpt.as_bytes(),
+            20 => self.inpu.as_bytes(),
+            _ => b"",
         }
     }
 
-    fn inp_link_mut(&mut self, idx: usize) -> Option<&mut String> {
+    fn inp_link_mut(&mut self, idx: usize) -> Option<&mut PvString> {
         match idx {
             0 => Some(&mut self.inpa),
             1 => Some(&mut self.inpb),
@@ -255,7 +262,7 @@ impl CalcRecord {
     /// The single writer of `INPA..INPU`: stores the text and keeps `inp_set`
     /// in step. A slot past `INPU` is ignored, as [`Self::get_inp_link`]
     /// ignores it on the read side.
-    pub fn set_inp_link(&mut self, slot: usize, text: impl Into<String>) {
+    pub fn set_inp_link(&mut self, slot: usize, text: impl Into<PvString>) {
         let Some(link) = self.inp_link_mut(slot) else {
             return;
         };
@@ -278,7 +285,7 @@ impl CalcRecord {
     ) -> CaResult<()> {
         match value {
             EpicsValue::String(s) => {
-                self.set_inp_link(slot, s.as_str_lossy());
+                self.set_inp_link(slot, s);
                 Ok(())
             }
             _ => Err(CaError::TypeMismatch(field.into())),
@@ -286,12 +293,13 @@ impl CalcRecord {
     }
 
     /// Get input link strings for external processing.
-    pub fn input_links(&self) -> [&str; 21] {
+    pub fn input_links(&self) -> [&[u8]; 21] {
         [
             &self.inpa, &self.inpb, &self.inpc, &self.inpd, &self.inpe, &self.inpf, &self.inpg,
             &self.inph, &self.inpi, &self.inpj, &self.inpk, &self.inpl, &self.inpm, &self.inpn,
             &self.inpo, &self.inpp, &self.inpq, &self.inpr, &self.inps, &self.inpt, &self.inpu,
         ]
+        .map(PvString::as_bytes)
     }
 
     pub fn set_var(&mut self, idx: usize, val: f64) {
@@ -309,9 +317,15 @@ fn var_index(name: &str) -> Option<usize> {
     }
 }
 
-/// [`Record::field_slot`]'s index for `VAL`, past the `A`..`U` and
-/// `LA`..`LU` blocks.
-const VAL_SLOT: usize = 2 * crate::calc::CALC_NARGS;
+use crate::server::record::dbd_generated::slots::calc as slots;
+
+// `A`..`U` then `LA`..`LU`, contiguous in `calcRecord.dbd`: the
+// `get_slot_f64` / `put_slot_f64` overrides index both blocks off `A`.
+const _: () = assert!(
+    slots::U.0 - slots::A.0 + 1 == crate::calc::CALC_NARGS as u16
+        && slots::LA.0 == slots::U.0 + 1
+        && slots::LU.0 - slots::LA.0 + 1 == crate::calc::CALC_NARGS as u16
+);
 
 /// `LA`..`LU` → 0..21, the same index into the previous-value block.
 fn prev_index(name: &str) -> Option<usize> {
@@ -322,11 +336,68 @@ fn prev_index(name: &str) -> Option<usize> {
 }
 
 impl Record for CalcRecord {
-    /// C `calcRecord.c::init_record` (:90-114) ends without touching
-    /// MLST/ALST/LALM — `sub` and `calcout`, the two records closest to it,
-    /// both do seed (`subRecord.c:130-132`, `calcoutRecord.c:217-219`), so
-    /// this is per-type and not derivable from the record's shape.
-    fn seed_deadband_tracking(&mut self) {}
+    /// C `monitor()` posts every input A..U when the alarm moved, changed or
+    /// not: `if (*pnew != *pprev || monitor_mask & DBE_ALARM)` with
+    /// `monitor_mask | DBE_VALUE | DBE_LOG` (calcRecord.c:418-420).
+    fn alarm_cycle_monitored_fields(&self) -> crate::server::record::DeclaredFields {
+        &const {
+            crate::server::record::declared_set(
+                crate::server::record::dbd_generated::CALC_FIELDS,
+                CALC_INPUT_FIELDS,
+            )
+        }
+    }
+
+    /// C `monitor()` posts A..U against LA..LU, the record's own copies
+    /// (calcRecord.c:415-423); `advance_prev_inputs` made the comparison.
+    fn take_cycle_posted_fields(&mut self) -> crate::server::record::CycleMarks {
+        use crate::server::record::{CycleMarks, CyclePostMask, uniform_post_table};
+        static POSTS: [(crate::server::record::FieldIx, CyclePostMask); crate::calc::CALC_NARGS] =
+            uniform_post_table(
+                crate::server::record::dbd_generated::CALC_FIELDS,
+                &CALC_INPUT_FIELDS,
+                CyclePostMask::MonitorValueLog,
+            );
+        CycleMarks::of(&POSTS, u128::from(std::mem::take(&mut self.input_changes)))
+    }
+
+    fn fields_posted_only_when_marked(&self) -> &'static [&'static str] {
+        &CALC_INPUT_FIELDS
+    }
+
+    /// `monitor()` posts VAL and A..U alone; LA..LU are written, never
+    /// posted (calcRecord.c:415-423).
+    fn process_posted_fields(&self) -> Option<crate::server::record::DeclaredFields> {
+        static POSTED: [crate::server::record::FieldIx; 22] = crate::server::record::declared_set(
+            crate::server::record::dbd_generated::CALC_FIELDS,
+            [
+                "VAL", "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O",
+                "P", "Q", "R", "S", "T", "U",
+            ],
+        );
+        Some(&POSTED)
+    }
+
+    /// The walk takes this cycle's A..U marks only when there are any.
+    fn cycle_marked_fields(&self) -> bool {
+        self.input_changes != 0
+    }
+
+    fn alarm_cycle_posts_value_log(&self) -> bool {
+        true
+    }
+
+    fn acts_before_process(&self) -> bool {
+        false
+    }
+
+    fn cycle_hooks(&self) -> crate::server::record::CycleHooks {
+        crate::server::record::CycleHooks::INPUT_FETCH
+    }
+
+    fn has_array_monitor_post(&self) -> bool {
+        false
+    }
 
     fn record_type(&self) -> &'static str {
         "calc"
@@ -339,8 +410,9 @@ impl Record for CalcRecord {
     }
 
     fn init_record(&mut self, pass: u8) -> CaResult<()> {
-        if pass == 0 {
-            // C `calcRecord.c::init_record:105-110` — postfix() into RPCL; a
+        if pass == 1 {
+            // C `calcRecord.c::init_record:105-110`, after the pass-0 return at
+            // :98 — postfix() into RPCL; a
             // failure is logged (errlog + recGblRecordError) but does NOT abort
             // the record's init (`return 0`). Only `special()` refuses.
             //
@@ -348,16 +420,8 @@ impl Record for CalcRecord {
             // there, and the empty program it leaves in RPCL is what makes the
             // record alarm on every process. Skipping the compile for an empty
             // CALC left the port with no program and no alarm.
-            let compiled = calc_compile::postfix(self.record_type(), "CALC", &self.calc);
-            if let Some(why) = compiled.error_str() {
-                self.report_bad_calc("calc: init_record: Illegal CALC field", why);
-            }
-            self.rpcl = compiled.program;
-            if !self.calc.is_empty() {
-                self.mlst = self.val;
-                self.alst = self.val;
-                self.lalm = self.val;
-            }
+            let compiled = calc_compile::postfix_into(&self.calc, &mut self.rpcl);
+            self.report_bad_calc(&compiled, "calc: init_record: Illegal CALC field");
         }
         Ok(())
     }
@@ -368,27 +432,41 @@ impl Record for CalcRecord {
     /// stays stored and RPCL is left empty. calcout/scalcout/acalcout make the
     /// opposite choice (store the status in CLCV, accept the put); both
     /// dispositions run off the one compile owner, `calc_compile`.
-    fn special(&mut self, field: &str, after: bool) -> CaResult<()> {
+    fn special(
+        &mut self,
+        field: &str,
+        after: bool,
+        _common: &crate::server::record::CommonFields,
+    ) -> CaResult<()> {
         if !after || !field.eq_ignore_ascii_case("CALC") {
             return Ok(());
         }
-        let compiled = calc_compile::postfix(self.record_type(), "CALC", &self.calc);
-        let why = compiled.error_str();
-        self.rpcl = compiled.program;
-        if let Some(why) = why {
-            self.report_bad_calc("calc: Illegal CALC field", why);
+        let compiled = calc_compile::postfix_into(&self.calc, &mut self.rpcl);
+        self.put_report =
+            compiled.put_report_in_expression("calc: Illegal CALC field", "CALC", &self.calc);
+        let failed = compiled.error_str().is_some();
+        if failed {
             return Err(CaError::BadField("calc: Illegal CALC field".into()));
         }
         Ok(())
     }
 
+    fn take_put_report(&mut self) -> Option<crate::server::recgbl::PutReport> {
+        self.put_report.take()
+    }
+
     /// C hands the record its own name at `dbDefineRecord`; the port hands it
     /// over here. `special()` needs it to name the PV it is refusing.
-    fn set_async_context(&mut self, name: String, _db: crate::server::database::AsyncDbHandle) {
+    fn set_async_context(
+        &mut self,
+        name: crate::types::RecordName,
+        _db: crate::server::database::AsyncDbHandle,
+    ) {
         self.name = Some(name);
     }
 
     fn process(&mut self) -> CaResult<ProcessOutcome> {
+        self.input_changes = 0;
         // C `calcRecord.c::process` (119-125):
         //
         // ```c
@@ -452,66 +530,7 @@ impl Record for CalcRecord {
     /// C reads `prec->inpa..inpu` off the record and copies nothing; the generic
     /// `get_field` path hands back an owned `EpicsValue` per link, which is
     /// 21 clones on every cycle of a record that wires none of them.
-    /// The framework's per-cycle cells, read as struct members — the
-    /// defaults would each cost a full `get_field` name match. `calc`'s
-    /// `get_field` has 32 four-character arms, so every one of these is a
-    /// walk through that bucket on every scan cycle.
-    ///
-    /// `hyst` is `None` because `calc` declares no HYST
-    /// (`calcRecord.dbd.pod`).
-    fn analog_alarm_input(&self) -> Option<AnalogAlarmInput> {
-        Some(AnalogAlarmInput {
-            val: AlarmLimit::Double(self.val),
-            hyst: None,
-            lalm: Some(AlarmLimit::Double(self.lalm)),
-        })
-    }
-
-    fn alarm_filter_cells(&self) -> Option<(f64, f64)> {
-        Some((self.aftc, self.afvl))
-    }
-
-    fn store_alarm_filter_value(&mut self, afvl: f64) {
-        self.afvl = afvl;
-    }
-
-    fn store_analog_lalm(&mut self, lalm: AlarmLimit) {
-        self.lalm = lalm.as_f64();
-    }
-
-    fn val(&self) -> Option<EpicsValue> {
-        Some(EpicsValue::Double(self.val))
-    }
-
-    fn monitor_deadband_value(&self) -> Option<f64> {
-        Some(self.val)
-    }
-
-    /// `calc` declares no OVAL, so the default's `get_field("OVAL")` is a
-    /// miss through the whole four-character bucket on every cycle.
-    fn output_link_value(&self) -> Option<EpicsValue> {
-        self.val()
-    }
-
-    fn monitor_deadband_cells(&self) -> crate::server::record::MonitorDeadbandCells {
-        crate::server::record::MonitorDeadbandCells {
-            mdel: Some(self.mdel),
-            adel: Some(self.adel),
-            mlst: Some(self.mlst),
-            alst: Some(self.alst),
-        }
-    }
-
-    fn store_monitor_last_posted(&mut self, val: f64, mlst: bool, alst: bool) {
-        if mlst {
-            self.mlst = val;
-        }
-        if alst {
-            self.alst = val;
-        }
-    }
-
-    fn link_text_ref(&self, link_field: &str) -> Option<&str> {
+    fn link_text_ref(&self, link_field: &str) -> Option<&[u8]> {
         // INPA..INPU differ in their last byte alone, so the cycle's 21 asks
         // cost one shape test and one indexed branch instead of 21 name
         // compares.
@@ -519,29 +538,56 @@ impl Record for CalcRecord {
             return None;
         };
         Some(match slot {
-            b'A' => &self.inpa,
-            b'B' => &self.inpb,
-            b'C' => &self.inpc,
-            b'D' => &self.inpd,
-            b'E' => &self.inpe,
-            b'F' => &self.inpf,
-            b'G' => &self.inpg,
-            b'H' => &self.inph,
-            b'I' => &self.inpi,
-            b'J' => &self.inpj,
-            b'K' => &self.inpk,
-            b'L' => &self.inpl,
-            b'M' => &self.inpm,
-            b'N' => &self.inpn,
-            b'O' => &self.inpo,
-            b'P' => &self.inpp,
-            b'Q' => &self.inpq,
-            b'R' => &self.inpr,
-            b'S' => &self.inps,
-            b'T' => &self.inpt,
-            b'U' => &self.inpu,
+            b'A' => self.inpa.as_bytes(),
+            b'B' => self.inpb.as_bytes(),
+            b'C' => self.inpc.as_bytes(),
+            b'D' => self.inpd.as_bytes(),
+            b'E' => self.inpe.as_bytes(),
+            b'F' => self.inpf.as_bytes(),
+            b'G' => self.inpg.as_bytes(),
+            b'H' => self.inph.as_bytes(),
+            b'I' => self.inpi.as_bytes(),
+            b'J' => self.inpj.as_bytes(),
+            b'K' => self.inpk.as_bytes(),
+            b'L' => self.inpl.as_bytes(),
+            b'M' => self.inpm.as_bytes(),
+            b'N' => self.inpn.as_bytes(),
+            b'O' => self.inpo.as_bytes(),
+            b'P' => self.inpp.as_bytes(),
+            b'Q' => self.inpq.as_bytes(),
+            b'R' => self.inpr.as_bytes(),
+            b'S' => self.inps.as_bytes(),
+            b'T' => self.inpt.as_bytes(),
+            b'U' => self.inpu.as_bytes(),
             _ => return None,
         })
+    }
+
+    /// C `monitor()` and `checkAlarms` read these as struct members. `calc`
+    /// declares no OVAL and no HYST (`calcRecord.dbd.pod`).
+    fn cycle_cell(&self, cell: CycleCell) -> CycleRead {
+        match cell {
+            CycleCell::Val => CycleRead::Value(CycleValue::Double(self.val)),
+            CycleCell::Mdel => CycleRead::Value(CycleValue::Double(self.mdel)),
+            CycleCell::Adel => CycleRead::Value(CycleValue::Double(self.adel)),
+            CycleCell::Mlst => CycleRead::Value(CycleValue::Double(self.mlst)),
+            CycleCell::Alst => CycleRead::Value(CycleValue::Double(self.alst)),
+            CycleCell::Lalm => CycleRead::Value(CycleValue::Double(self.lalm)),
+            CycleCell::Aftc => CycleRead::Value(CycleValue::Double(self.aftc)),
+            CycleCell::Afvl => CycleRead::Value(CycleValue::Double(self.afvl)),
+            CycleCell::Oval | CycleCell::Hyst => CycleRead::Absent,
+        }
+    }
+
+    fn put_cycle_cell(&mut self, cell: CycleCell, value: CycleValue) -> CaResult<()> {
+        match (cell, value) {
+            (CycleCell::Lalm, CycleValue::Double(v)) => self.lalm = v,
+            (CycleCell::Alst, CycleValue::Double(v)) => self.alst = v,
+            (CycleCell::Mlst, CycleValue::Double(v)) => self.mlst = v,
+            (CycleCell::Afvl, CycleValue::Double(v)) => self.afvl = v,
+            (cell, value) => return self.put_field(cell.name(), value.into()),
+        }
+        Ok(())
     }
 
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
@@ -622,7 +668,7 @@ impl Record for CalcRecord {
             },
             "EGU" => match value {
                 EpicsValue::String(s) => {
-                    self.egu = s;
+                    self.egu.set_bytes(s.as_bytes());
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
@@ -741,41 +787,91 @@ impl Record for CalcRecord {
         Some(self.inp_generation)
     }
 
-    /// `A`..`U`, `LA`..`LU` and `VAL` — the fields a link reads — by
-    /// index into the three `f64` blocks C lays them out in.
-    fn field_slot(&self, field: &str) -> Option<FieldSlot> {
-        let slot = if let Some(i) = var_index(field) {
-            i
-        } else if let Some(i) = prev_index(field) {
-            crate::calc::CALC_NARGS + i
-        } else if field == "VAL" {
-            VAL_SLOT
-        } else {
-            return None;
-        };
-        Some(FieldSlot(slot as u16))
-    }
+    crate::slot_map!(crate::server::record::dbd_generated::slots::calc;
+        fields:
+        VAL => val,
+        EGU => egu,
+        PREC => prec,
+        HOPR => hopr,
+        LOPR => lopr,
+        AFTC => aftc,
+        ADEL => adel,
+        MDEL => mdel,
+        A => vars[0],
+        B => vars[1],
+        C => vars[2],
+        D => vars[3],
+        E => vars[4],
+        F => vars[5],
+        G => vars[6],
+        H => vars[7],
+        I => vars[8],
+        J => vars[9],
+        K => vars[10],
+        L => vars[11],
+        M => vars[12],
+        N => vars[13],
+        O => vars[14],
+        P => vars[15],
+        Q => vars[16],
+        R => vars[17],
+        S => vars[18],
+        T => vars[19],
+        U => vars[20],
+        LA => prev[0],
+        LB => prev[1],
+        LC => prev[2],
+        LD => prev[3],
+        LE => prev[4],
+        LF => prev[5],
+        LG => prev[6],
+        LH => prev[7],
+        LI => prev[8],
+        LJ => prev[9],
+        LK => prev[10],
+        LL => prev[11],
+        LM => prev[12],
+        LN => prev[13],
+        LO => prev[14],
+        LP => prev[15],
+        LQ => prev[16],
+        LR => prev[17],
+        LS => prev[18],
+        LT => prev[19],
+        LU => prev[20],
+        AFVL => afvl,
+        LALM => lalm,
+        ALST => alst,
+        MLST => mlst;
+        custom: CALC, INPA, INPB, INPC, INPD, INPE, INPF, INPG, INPH, INPI, INPJ, INPK, INPL,
+            INPM, INPN, INPO, INPP, INPQ, INPR, INPS, INPT, INPU;
+        spill: HIHI, LOLO, HIGH, LOW, HHSV, LLSV, HSV, LSV, HYST);
 
+    /// `slot_ref`'s value with no call per link read: the default's
+    /// out-of-line `slot_ref` cost calc-link +29 instr/cycle.
     fn get_slot_f64(&self, slot: FieldSlot) -> Option<f64> {
-        let i = usize::from(slot.0);
-        if i < crate::calc::CALC_NARGS {
+        const N: usize = crate::calc::CALC_NARGS;
+        let i = usize::from(slot.0.wrapping_sub(slots::A.0));
+        if i < N {
             Some(self.vars[i])
-        } else if i < VAL_SLOT {
-            Some(self.prev[i - crate::calc::CALC_NARGS])
-        } else if i == VAL_SLOT {
+        } else if i < 2 * N {
+            Some(self.prev[i - N])
+        } else if slot == slots::VAL {
             Some(self.val)
         } else {
-            None
+            self.slot_ref(slot)?.to_f64()
         }
     }
 
+    /// `A`..`U` only: the multi-input fetch is the one caller.
     fn put_slot_f64(&mut self, slot: FieldSlot, value: f64) -> bool {
-        let i = usize::from(slot.0);
-        if i < crate::calc::CALC_NARGS {
-            self.vars[i] = value;
-            true
-        } else {
-            false
+        let i = usize::from(slot.0.wrapping_sub(slots::A.0));
+        match self.vars.get_mut(i) {
+            Some(v) => {
+                *v = value;
+                true
+            }
+            None => false,
         }
     }
 
@@ -888,5 +984,27 @@ mod tests {
         assert_eq!(rec.val, 2.0);
         rec.process().unwrap();
         assert_eq!(rec.val, 3.0);
+    }
+
+    /// RPCL holds `postfix()`'s bytes: FETCH_VAL, LITERAL_INT 1, ADD, END.
+    #[test]
+    fn rpcl_is_the_c_postfix() {
+        let rec = CalcRecord::new("VAL+1");
+        assert_eq!(rec.rpcl.as_ref()[..8], [3, 2, 1, 0, 0, 0, 50, 0]);
+    }
+
+    /// A program longer than C's 560-byte RPCL is a failed compile, not a
+    /// longer buffer.
+    #[test]
+    fn a_program_past_the_rpcl_size_fails_to_compile() {
+        let long = vec!["1.5"; 60].join("+");
+        let mut rpcl = crate::calc::Rpcl::<CALC_RPCL_SIZE>::empty();
+        let compiled = calc_compile::postfix_into(&long, &mut rpcl);
+        assert_eq!(compiled.status, calc_compile::POSTFIX_ERR);
+        assert!(rpcl.is_empty());
+        let fits = vec!["1.5"; 56].join("+");
+        let compiled = calc_compile::postfix_into(&fits, &mut rpcl);
+        assert_eq!(compiled.status, calc_compile::POSTFIX_OK);
+        assert!(!rpcl.is_empty());
     }
 }

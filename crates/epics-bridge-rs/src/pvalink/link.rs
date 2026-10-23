@@ -3,9 +3,10 @@
 // RTEMS-EXEC-MODEL-ALLOW(23): checked - these run and pass in the exec-backend
 // suite.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use parking_lot::Mutex;
@@ -13,21 +14,18 @@ use tokio::sync::mpsc;
 
 use epics_base_rs::runtime::task::{self, TaskAbortHandle};
 use epics_pva_rs::client::PvaClient;
-use epics_pva_rs::client_native::CacheAction;
-use epics_pva_rs::client_native::ops_v2::{MonitorEvent, MonitorEventMask, PutLeaf};
+use epics_pva_rs::client_native::ops_v2::{
+    MonitorEvent, MonitorEventMask, PutLeaf, effective_typed_put_path,
+};
 use epics_pva_rs::pv_request::PvRequestExpr;
 use epics_pva_rs::pvdata::{PvField, PvStructure, ScalarValue};
 
-use super::config::{LinkDirection, ProcMode, PvaLinkConfig};
+use super::config::{ProcMode, PvaLinkConfig};
 
 #[derive(Debug, thiserror::Error)]
 pub enum PvaLinkError {
     #[error("PVA error: {0}")]
     Pva(#[from] epics_pva_rs::error::PvaError),
-    #[error("link is INP-only, write requested")]
-    NotWritable,
-    #[error("link is OUT-only, read requested")]
-    NotReadable,
     #[error("pvalink monitor for {0:?} is disconnected (cached value is stale)")]
     Disconnected(String),
     #[error("field {0:?} not found in remote NT structure")]
@@ -137,6 +135,215 @@ fn enqueue_scan_trigger(tx: &mpsc::Sender<ScanEvent>, overrun: &ScanOverrun, eve
     }
 }
 
+/// pvxs `pvaLinkChannel::connected`, `num_disconnect`, `num_type_change` and
+/// `op_put`, with its links' `put_scratch` (`pvxs/ioc/pvalink.h:150-170`):
+/// what pvxs moves under `pvaLinkChannel::lock`. The connection changes only under
+/// [`Outbox`]'s lock, where a put tests it, so a put is either held before a
+/// connect releases it or sees the connection after.
+#[derive(Default)]
+pub(crate) struct Connection {
+    connected: AtomicBool,
+    /// [`Self::down`] is the one place the count moves.
+    disconnects: AtomicUsize,
+    /// [`Self::up`] is the one place the count moves.
+    type_changes: AtomicUsize,
+    /// Upstream puts on the wire ([`PutInFlight`]).
+    puts_in_flight: AtomicUsize,
+    outbox: Mutex<Outbox>,
+}
+
+impl Connection {
+    /// A value arrived. The first one since the channel was down connects it
+    /// and counts a type change, as pvxs's `run()` re-creates its cache
+    /// (`pvxs/ioc/pvalink_channel.cpp:342-353`). A put held for the
+    /// connection comes back to be sent.
+    pub(crate) fn up(&self) -> Option<PutOp> {
+        let mut out = self.outbox.lock();
+        if self.connected.swap(true, Ordering::AcqRel) {
+            return None;
+        }
+        self.type_changes.fetch_add(1, Ordering::Relaxed);
+        out.held.take()
+    }
+
+    /// The connection is lost; true when it was up, which counts one
+    /// disconnect and, as `pvaLink::onDisconnect` does, drops every staged
+    /// write (`pvxs/ioc/pvalink_channel.cpp:362-373`, `pvalink_link.cpp:75-81`).
+    /// Nothing is held while up; a put on the wire fails with the
+    /// disconnect and keeps nothing ([`send_put`]), pvxs's `op_put.reset()`.
+    pub(crate) fn down(&self) -> bool {
+        let mut out = self.outbox.lock();
+        let was_up = self.connected.swap(false, Ordering::AcqRel);
+        if was_up {
+            self.disconnects.fetch_add(1, Ordering::Relaxed);
+            out.staged.clear();
+        }
+        was_up
+    }
+
+    /// A put succeeded: pvxs `linkPutDone` restarts the channel's put
+    /// (`pvxs/ioc/pvalink_channel.cpp:205-208`), which takes every write
+    /// staged behind it.
+    fn restart(&self) -> Option<PutOp> {
+        let mut out = self.outbox.lock();
+        out.start(false, self.is_up())
+    }
+
+    fn is_up(&self) -> bool {
+        self.connected.load(Ordering::Acquire)
+    }
+}
+
+/// The channel's writes not yet sent.
+#[derive(Default)]
+pub(crate) struct Outbox {
+    /// Each field's latest write not yet taken by a put: pvxs's per-link
+    /// `put_scratch`, keyed by the link's `field`.
+    staged: HashMap<String, StagedPut>,
+    /// A put started while the channel was down, with the writes it took:
+    /// pvxs's `op_put` before its build, and the links' `put_queue`.
+    held: Option<PutOp>,
+}
+
+impl Outbox {
+    /// pvxs `pvaLinkChannel::put(force)` (`pvxs/ioc/pvalink_channel.cpp:220-280`):
+    /// take every staged write into a put that replaces the held one and
+    /// carries its writes too, as `linkBuildPut` sends every queued value
+    /// (`:127-184`). It comes back to send when `connected`, and is held
+    /// otherwise.
+    fn start(&mut self, force: bool, connected: bool) -> Option<PutOp> {
+        if self.staged.is_empty() && !force {
+            return None;
+        }
+        // `if((reqProcess&2) || force) proc = "true"` over the links this put
+        // takes: a forced put outranks even a staged NPP (`:258-260`).
+        let proc = if force {
+            ProcMode::Pp
+        } else {
+            combine_proc(self.staged.values().map(|s| s.proc))
+        };
+        let mut fields = self.held.take().map(|op| op.fields).unwrap_or_default();
+        fields.extend(self.staged.drain());
+        let op = PutOp { fields, proc };
+        if connected {
+            return Some(op);
+        }
+        self.held = Some(op);
+        None
+    }
+}
+
+/// One channel put: the writes it carries and its process option.
+pub(crate) struct PutOp {
+    fields: HashMap<String, StagedPut>,
+    proc: ProcMode,
+}
+
+/// Send one channel put: pvxs's op once built, `linkBuildPut` assigning each
+/// write into the `GetOPut` readback (`_doGet`, `src/clientget.cpp:678-692`;
+/// `pvxs/ioc/pvalink_channel.cpp:127-184`), so every leaf the readback marked
+/// goes back with them and a group target's other members are rewritten too.
+/// A forced put with nothing staged sends the readback untouched.
+async fn send_put(
+    client: &PvaClient,
+    pv_name: &str,
+    channel: &Arc<Connection>,
+    op: PutOp,
+) -> PvaLinkResult<usize> {
+    let block = op.fields.values().any(|s| s.block);
+    let req = build_put_request(op.proc, block);
+    let on_wire = PutInFlight::start(&channel.puts_in_flight);
+    let put_result = match client.pvput_begin(pv_name, Some(&req), true).await {
+        Ok(put) => {
+            let intro = put.introspection().clone();
+            let assignments: Vec<(String, PutLeaf)> = op
+                .fields
+                .iter()
+                .map(|(field, sp)| {
+                    let leaf = match &sp.value {
+                        QueuedPut::Field(f) => PutLeaf::Typed(f.clone()),
+                        QueuedPut::Str(s) => PutLeaf::Str(s.clone()),
+                    };
+                    (effective_typed_put_path(&intro, field), leaf)
+                })
+                .collect();
+            put.commit_fields_onto_present(&assignments).await
+        }
+        Err(e) => Err(e),
+    };
+    drop(on_wire);
+    match put_result {
+        Ok(()) => {
+            if let Some(next) = channel.restart() {
+                let reactor = epics_base_rs::runtime::task::Reactor::current()
+                    .expect("a channel put completes on the IOC's reactor");
+                spawn_put(&reactor, client, pv_name, channel, next);
+            }
+            Ok(1)
+        }
+        // A disconnect cancels the put and its writes go with it, as pvxs's
+        // `op_put.reset()` keeps none (`pvxs/ioc/pvalink_channel.cpp:362-370`),
+        // and prints nothing. Only a non-retry write's record alarms for it.
+        Err(e) if is_disconnect(&e) => {
+            if !op.fields.is_empty() && op.fields.values().all(|s| s.retry) {
+                Ok(0)
+            } else {
+                Err(PvaLinkError::Pva(e))
+            }
+        }
+        Err(e) => {
+            // pvxs `linkPutDone` (`pvxs/ioc/pvalink_channel.cpp:192`), for
+            // every put the channel sends.
+            epics_base_rs::stderr_println!("{pv_name} PVA link put ERROR: {}", put_what(&e));
+            Err(PvaLinkError::Pva(e))
+        }
+    }
+}
+
+/// pvxs's `e.what()` for a failed put: a server's refusal is its message
+/// alone (`RemoteError(msg)`, `src/client.cpp:83-85`).
+fn put_what(e: &epics_pva_rs::error::PvaError) -> Cow<'_, str> {
+    match e {
+        epics_pva_rs::error::PvaError::RemoteError(status) => {
+            Cow::Borrowed(status.message().unwrap_or_default())
+        }
+        e => Cow::Owned(e.to_string()),
+    }
+}
+
+/// Send a put no record waits on: one held for the connect, or one a
+/// completed put restarted.
+fn spawn_put(
+    reactor: &epics_base_rs::runtime::task::Reactor,
+    client: &PvaClient,
+    pv_name: &str,
+    channel: &Arc<Connection>,
+    op: PutOp,
+) {
+    let (client, pv_name, channel) = (client.clone(), pv_name.to_owned(), channel.clone());
+    reactor.spawn(async move {
+        // A failure is printed by `send_put`.
+        let _ = send_put(&client, &pv_name, &channel, op).await;
+    });
+}
+
+/// One put on the wire for [`PvaLink::put_in_flight`], counted from its
+/// start until it is dropped on any exit — pvxs's `op_put` lifetime.
+struct PutInFlight<'a>(&'a AtomicUsize);
+
+impl<'a> PutInFlight<'a> {
+    fn start(puts: &'a AtomicUsize) -> Self {
+        puts.fetch_add(1, Ordering::Relaxed);
+        Self(puts)
+    }
+}
+
+impl Drop for PutInFlight<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 /// Take an INP link from connected to disconnected: stamp the
 /// disconnect time and enqueue the payload-less scan trigger that makes
 /// CP / passive-CPP targets process and expose LINK_ALARM/INVALID.
@@ -144,30 +351,31 @@ fn enqueue_scan_trigger(tx: &mpsc::Sender<ScanEvent>, overrun: &ScanOverrun, eve
 /// **The single owner of that transition**, called from the two places
 /// that can observe it — the monitor's `Disconnected`/`Finished` event and
 /// the subscription future returning — so neither can implement half of it.
-/// Idempotent by construction: the `swap` gate means the second observer of
-/// one outage is a no-op, and a subscription that never delivered an event
-/// synthesizes no scan at all. The gate is ours, not pvxs parity: pvxs has
+/// Idempotent by construction: the [`Connection::down`] gate means the
+/// second observer of one outage is a no-op, and a subscription that never
+/// delivered an event synthesizes no scan at all. The gate is ours, not
+/// pvxs parity: pvxs has
 /// one observer, so its `catch(client::Disconnect&)` arm clears `connected`
 /// and runs every link's `onDisconnect()` unconditionally
 /// (`pvxs/ioc/pvalink_channel.cpp:360-373`, `pvxs/ioc/pvalink_link.cpp:75-81`); its
 /// `if(!connected)` at `pvalink_channel.cpp:342` is the value-update path's
 /// reconnect arm, not a disconnect gate.
 fn inp_disconnect_scan(
-    connected: &AtomicBool,
-    disconnect_time: &Mutex<Option<(i64, i32)>>,
+    connected: &Connection,
+    snaps: &Mutex<Snaps>,
     tx: &mpsc::Sender<ScanEvent>,
     overrun: &ScanOverrun,
 ) {
-    if !connected.swap(false, Ordering::AcqRel) {
+    if !connected.down() {
         return;
     }
-    // Capture the disconnect-event time so a `time=true` link adopts it
-    // (not the stale last value's time, nor local processing time) while
-    // disconnected — pvxs `snap_time = e.time` in `onDisconnect`
-    // (`pvxs/ioc/pvalink_channel.cpp:372`). We have no client-supplied exception
-    // time, so the observation moment (now) is the closest analogue.
+    // pvxs `snap_time = e.time` (`pvxs/ioc/pvalink_channel.cpp:372`). We have
+    // no client-supplied exception time, so the observation moment (now) is
+    // the closest analogue.
     if let Ok(dur) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
-        *disconnect_time.lock() = Some((dur.as_secs() as i64, dur.subsec_nanos() as i32));
+        snaps
+            .lock()
+            .disconnect((dur.as_secs() as i64, dur.subsec_nanos() as i32));
     }
     // Notify the scan forwarder of the lifecycle transition so CP /
     // passive-CPP targets process and expose LINK_ALARM/INVALID even
@@ -181,11 +389,67 @@ fn inp_disconnect_scan(
     enqueue_scan_trigger(tx, overrun, ScanEvent::Disconnected);
 }
 
-/// A live PVA link.
+/// pvxs `pvaLink`'s `snap_severity` / `snap_message` / `snap_time` /
+/// `snap_tag` (`pvxs/ioc/pvalink.h:248-251`), which the alarm and timestamp
+/// getters report: a value read latches them (`pvalink_lset.cpp:396-422`)
+/// and a disconnect sets every link's time (`pvalink_channel.cpp:370-373`).
 ///
-/// Constructed once per record-link instance. For INP links the optional
-/// monitor task spawns automatically; for OUT links the link just owns the
-/// PvaClient and writes synchronously.
+/// Keyed by the selected field root (`""` = top level) because one shared
+/// `PvaLink` serves sibling DB links that differ in `.field` (the registry
+/// keys on `(pv, pipeline, Q)`, not field), and pvxs reads the snapshot at
+/// `root[fieldName]`. A field with no entry holds pvxs's initial snapshot,
+/// `INVALID_ALARM` and blank, with the last disconnect's time.
+#[derive(Default)]
+struct Snaps {
+    fields: HashMap<String, Snap>,
+    disconnected_at: Option<(i64, i32)>,
+}
+
+struct Snap {
+    severity: i32,
+    message: Arc<str>,
+    time: (i64, i32),
+    tag: u64,
+}
+
+/// pvxs's initial `snap_time = {}`, the EPICS epoch, as `(seconds past the
+/// POSIX epoch, nanoseconds)`.
+pub(crate) const NO_TIME: (i64, i32) = (
+    epics_base_rs::runtime::general_time::EPICS_EPOCH_UNIX_SECS as i64,
+    0,
+);
+
+impl Snaps {
+    fn alarm(&self, field: &str) -> (i32, Arc<str>) {
+        // pvxs initial `snap_severity` (`pvxs/ioc/pvalink.h:250`).
+        const INVALID_ALARM: i32 = 3;
+        self.fields.get(field).map_or_else(
+            || (INVALID_ALARM, no_text()),
+            |snap| (snap.severity, snap.message.clone()),
+        )
+    }
+
+    fn stamp(&self, field: &str) -> (i64, i32, u64) {
+        match self.fields.get(field) {
+            Some(snap) => (snap.time.0, snap.time.1, snap.tag),
+            None => {
+                let (secs, nsec) = self.disconnected_at.unwrap_or(NO_TIME);
+                (secs, nsec, 0)
+            }
+        }
+    }
+
+    fn disconnect(&mut self, time: (i64, i32)) {
+        for snap in self.fields.values_mut() {
+            snap.time = time;
+        }
+        self.disconnected_at = Some(time);
+    }
+}
+
+/// A live PVA link channel: pvxs `pvaLinkChannel`, one per
+/// `(channelName, pvRequest)` whichever input and output links attach to
+/// it. Its monitor task spawns at open.
 pub struct PvaLink {
     /// Field declaration order matters: Rust drops fields in
     /// declaration order, so `_monitor_abort` MUST come BEFORE
@@ -197,18 +461,19 @@ pub struct PvaLink {
     _monitor_abort: Option<MonitorAbort>,
     config: PvaLinkConfig,
     client: PvaClient,
-    /// Latest received value (INP only — None until first event).
-    latest: Arc<Mutex<Option<PvField>>>,
-    /// Live-connection flag for INP+monitor links (B-pvalink-restart).
+    /// Latest received value (INP only — None until first event), one
+    /// shared snapshot per update so a read borrows it.
+    latest: Arc<Mutex<Option<Arc<PvField>>>>,
+    /// The channel's connection, kept by the monitor (B-pvalink-restart),
+    /// and its puts.
     ///
-    /// The INP monitor task is a re-subscribe loop: it sets this
-    /// `true` while a subscription is live and `false` the moment
-    /// `pvmonitor` returns (IOC restart / transient I/O), then
-    /// re-subscribes with exponential backoff. `is_connected()`
-    /// reads this flag so a downstream IOC restart is reflected as
-    /// a disconnect instead of serving the stale cached value
-    /// forever. `None` for OUT / non-monitor links.
-    monitor_connected: Option<Arc<AtomicBool>>,
+    /// The monitor task is a re-subscribe loop: it marks the channel up
+    /// while a subscription is live and down the moment `pvmonitor`
+    /// returns (IOC restart / transient I/O), then re-subscribes with
+    /// exponential backoff. `is_connected()` reads it so a downstream IOC
+    /// restart is reflected as a disconnect instead of serving the stale
+    /// cached value forever.
+    channel: Arc<Connection>,
     /// Receiver half of the INP-monitor record-notification channel.
     ///
     /// B3: every monitor event for an INP+monitor link pushes the new
@@ -224,76 +489,32 @@ pub struct PvaLink {
     /// subscription ends, so the forwarder can scan CP/CPP targets on
     /// the disconnect even though no value accompanies it.
     notify_rx: Mutex<Option<mpsc::Receiver<ScanEvent>>>,
-    /// Per-field staged OUT writes — this link's role as the shared
-    /// `pvaLinkChannel` PUT owner (pvxs `put_scratch` / `put_queue`,
-    /// `pvxs/ioc/pvalink_channel.cpp:127-263`).
-    ///
-    /// Sibling OUT links to the same `(pv, pipeline, queue_size)` now
-    /// resolve to THIS one `PvaLink` (the registry no longer keys on
-    /// per-link OUT options), and each stages its value here keyed by
-    /// its own `field` selector (`""` = root). A non-deferred write
-    /// flushes the whole map into ONE combined upstream PUT, with the
-    /// process option resolved across every participating field
-    /// (PP/CP/CPP beats NPP, `pvxs/ioc/pvalink_channel.cpp:257-263`). A
-    /// `defer=true` write stays staged until a non-deferred sibling —
-    /// or the production drain — flushes it, so several fields combine
-    /// into one PUT (`documentation/pvalink.rst:111-113`).
-    ///
-    /// Keyed per field with most-recent-wins overwrite: pvxs keeps one
-    /// `put_scratch` per link and a later write to the same field
-    /// supersedes the earlier one before the channel PUT starts
-    /// (`pvxs/ioc/pvalink_lset.cpp:645-653`), so `retry` replays only the most
-    /// recent incomplete value, never a stale FIFO log.
-    ///
-    /// Stores [`QueuedPut`] (via [`StagedPut`]), not a bare `PvField`:
-    /// a string-form write must replay through the string `pvput` path
-    /// (which coerces the text against the channel's introspected
-    /// type), not as a `PvField::Scalar(String)` that would mismatch a
-    /// numeric record.
-    out_scratch: Mutex<HashMap<String, StagedPut>>,
-    /// Set when a disconnected flush left `retry=true` writes staged for
-    /// replay. The `LinkSet::flush_puts` production drain re-attempts the
-    /// staged writes only while this is set, so a freshly-`defer`red
-    /// write awaiting its sibling is never flushed early — only a
-    /// genuinely stuck retry write is replayed on the next OUT activity
-    /// (pvxs replays the queued put on the client reconnect event,
-    /// `pvalink.rst:99-100`).
-    retry_pending: AtomicBool,
-    /// `(seconds_past_epoch, nanoseconds)` captured at the moment the
-    /// INP monitor subscription last dropped — pvxs `snap_time = e.time`
-    /// set in `onDisconnect` (`pvxs/ioc/pvalink_channel.cpp:372`). A `time=true`
-    /// link in the disconnected-stale state adopts THIS into the owning
-    /// record's time, not the stale last-value timestamp and not local
-    /// processing time, mirroring pvxs `pvaGetValue` copying `snap_time`
-    /// on the invalid read (`pvxs/ioc/pvalink_lset.cpp:268-270`). `None` until the
-    /// first disconnect; shared with the monitor task, so it is an `Arc`.
-    disconnect_time: Arc<Mutex<Option<(i64, i32)>>>,
     /// Coalescing overrun accounting for the scan-trigger queue. Shared
     /// with the monitor task (producer, marks on a full queue) and the
     /// scan forwarder (consumer, drains the owed scan), so a full local
     /// queue coalesces to `latest` + an overrun marker rather than
     /// silently dropping a CP/CPP scan. `Arc` because it is shared.
     scan_overrun: Arc<ScanOverrun>,
-    /// Value-read-latched remote alarm snapshot, keyed by the selected
-    /// field root (`""` = top level). pvxs `pvaLink` keeps a
-    /// `snap_severity` / `snap_message` pair initialized to
-    /// `INVALID_ALARM` / blank and updated ONLY by `pvaGetValue` on a
-    /// connected value read (`pvxs/ioc/pvalink.h:250`,
-    /// `pvxs/ioc/pvalink_lset.cpp:412-422`). The ungated DB-link alarm inspection
-    /// ([`Self::remote_alarm_snapshot`], the `dbGetAlarm` /
-    /// `dbGetAlarmMsg` analog) reports THIS latched value, not the live
-    /// cached monitor alarm — so a connected link reports the initial
-    /// INVALID/blank until the first value read, exactly like pvxs
-    /// `dbGetAlarm` before the first `dbGetLink`
-    /// (`pvxs/test/testpvalink.cpp:373-375`).
-    ///
-    /// Keyed by field because one shared `PvaLink` serves sibling DB
-    /// links that differ in `.field` (the registry keys on
-    /// `(pv, pipeline, Q)`, not field), and pvxs resolves the alarm at
-    /// `root[fieldName]` — each field root carries its own alarm, so each
-    /// gets its own latch. An absent entry is the pvxs initial
-    /// `INVALID_ALARM` / blank snapshot.
-    snap_alarm: Mutex<HashMap<String, (i32, String)>>,
+    /// What the last value read latched. Shared with the monitor task,
+    /// whose disconnect writes the time.
+    snaps: Arc<Mutex<Snaps>>,
+}
+
+/// The blank remote message, shared so a snapshot without one allocates
+/// nothing.
+fn no_text() -> Arc<str> {
+    static NONE: std::sync::LazyLock<Arc<str>> = std::sync::LazyLock::new(|| Arc::from(""));
+    NONE.clone()
+}
+
+/// `text` as the `Arc<str>` a record's message store shares: `held` when it
+/// already says it, so only a changed remote message allocates.
+fn shared_text(held: Option<&Arc<str>>, text: &str) -> Arc<str> {
+    match held {
+        Some(held) if **held == *text => held.clone(),
+        _ if text.is_empty() => no_text(),
+        _ => Arc::from(text),
+    }
 }
 
 /// A queued OUT-link Put, preserving the caller's original value
@@ -305,8 +526,7 @@ enum QueuedPut {
     /// path so the text is coerced against the channel's native
     /// scalar type, not forced to a `String` field.
     Str(String),
-    /// From [`PvaLink::write_pv_field`] — replayed verbatim via the
-    /// typed `pvput_pv_field` path.
+    /// From [`PvaLink::write_pv_field`] — assigned into the PUT verbatim.
     Field(PvField),
 }
 
@@ -360,247 +580,156 @@ impl PvaLink {
         let reactor = epics_base_rs::runtime::task::Reactor::current()
             .expect("PvaLink::open is awaited on the IOC's reactor");
         let latest = Arc::new(Mutex::new(None));
-        let disconnect_time: Arc<Mutex<Option<(i64, i32)>>> = Arc::new(Mutex::new(None));
+        let snaps: Arc<Mutex<Snaps>> = Arc::default();
         let scan_overrun = Arc::new(ScanOverrun::default());
-        let mut notify_rx = None;
-        let mut monitor_abort = None;
-        let mut monitor_connected = None;
+        // pvxs `pvaLinkChannel::open` (`pvxs/ioc/pvalink_channel.cpp:101-122`):
+        // every channel runs this one monitor, whichever links attach to it.
+        // Its connection is what an output link's put waits for and what
+        // gates a non-retry write (`valid()`), so an output link needs it as
+        // much as an input link needs the value.
+        //
+        // B3 / B4-Q: the channel buffer is sized to the link's
+        // `Q` (monitor queue depth). When it fills, the monitor
+        // task does NOT silently drop the event — it coalesces to
+        // the `latest` cache and arms an overrun marker via
+        // `enqueue_scan_trigger`, so the forwarder still runs one
+        // CP/CPP scan with the newest value (EPICS
+        // `db_queue_event_log` replace-last-on-full,
+        // `dbEvent.c:812-827`).
+        let (tx, rx) = mpsc::channel::<ScanEvent>(config.queue_size.max(1));
 
-        if matches!(config.direction, LinkDirection::Inp) && config.monitor {
-            // B3 / B4-Q: the channel buffer is sized to the link's
-            // `Q` (monitor queue depth). When it fills, the monitor
-            // task does NOT silently drop the event — it coalesces to
-            // the `latest` cache and arms an overrun marker via
-            // `enqueue_scan_trigger`, so the forwarder still runs one
-            // CP/CPP scan with the newest value (EPICS
-            // `db_queue_event_log` replace-last-on-full,
-            // `dbEvent.c:812-827`).
-            let (tx, rx) = mpsc::channel::<ScanEvent>(config.queue_size.max(1));
-            notify_rx = Some(rx);
-
-            let pv_name = config.pv_name.clone();
-            let latest_clone = latest.clone();
-            let client_clone = client.clone();
-            let connected = Arc::new(AtomicBool::new(false));
-            let connected_for_task = connected.clone();
-            monitor_connected = Some(connected);
-            let disconnect_time_task = disconnect_time.clone();
-            let scan_overrun_task = scan_overrun.clone();
-            // B4-pipeline / B4-Q: when the link asks for pipeline
-            // flow-control or a non-default queue depth, build a
-            // pvRequest carrying `record[pipeline=...,queueSize=N]`
-            // so the negotiation reaches the server. Otherwise use
-            // the plain monitor (lower overhead, matches prior
-            // behaviour).
-            let request = monitor_request(&config);
-            // B-pvalink-restart: the INP monitor is a re-subscribe
-            // loop, mirroring `channel_cache.rs::spawn_upstream_monitor`.
-            // The subscription runs on the TYPED EVENT STREAM
-            // (`pvmonitor_events`), not on the value-only `pvmonitor`,
-            // because the disconnect must arrive as an EVENT — see
-            // `inp_disconnect_scan` below.
-            let join = reactor.spawn(async move {
-                let mut backoff = Duration::from_millis(250);
-                let max_backoff = Duration::from_secs(30);
-                loop {
-                    let tx_inner = tx.clone();
-                    let tx_disc = tx.clone();
-                    let latest_inner = latest_clone.clone();
-                    let connected_inner = connected_for_task.clone();
-                    let connected_disc = connected_for_task.clone();
-                    let overrun_inner = scan_overrun_task.clone();
-                    let overrun_disc = scan_overrun_task.clone();
-                    let disconnect_time_ev = disconnect_time_task.clone();
-                    // pvxs's pvalink channel is driven by the monitor's
-                    // event stream: `Connected` / value updates / the
-                    // `catch(client::Disconnect&)` branch
-                    // (`pvxs/ioc/pvalink_channel.cpp:335-373`). Ours must be too.
-                    //
-                    // `mask_disconnected: false` is the load-bearing half.
-                    // `op_monitor_events` RE-SUBSCRIBES INTERNALLY on
-                    // connection loss (`ops_v2.rs`, `MonitorEnd::ConnectionLost`
-                    // → deliver `Disconnected`, sleep, loop), so the
-                    // subscription future does NOT return when the upstream
-                    // IOC dies. Inferring the disconnect from that future
-                    // returning — what this loop did before — therefore
-                    // never fired: measured on the RTEMS stage-5 target —
-                    // killing the upstream left both downstream records at
-                    // their stale value with `SEVR=0 STAT=0` and
-                    // `is_connected() == true`, while the
-                    // client itself correctly reported the peer gone
-                    // (`conn alive=false channels=[]`, `active=0 searching=2`).
-                    let on_event = move |ev: MonitorEvent| match ev {
-                        MonitorEvent::Connected { .. } => {
-                            connected_inner.store(true, Ordering::Release);
+        let pv_name = config.pv_name.clone();
+        let latest_clone = latest.clone();
+        let client_clone = client.clone();
+        let connected = Arc::new(Connection::default());
+        let connected_for_task = connected.clone();
+        let snaps_task = snaps.clone();
+        let scan_overrun_task = scan_overrun.clone();
+        // B4-pipeline / B4-Q: when the link asks for pipeline
+        // flow-control or a non-default queue depth, build a
+        // pvRequest carrying `record[pipeline=...,queueSize=N]`
+        // so the negotiation reaches the server. Otherwise use
+        // the plain monitor (lower overhead, matches prior
+        // behaviour).
+        let request = monitor_request(&config);
+        // The connect sends a put held for it.
+        let release = {
+            let (reactor, client, pv_name, channel) = (
+                reactor.clone(),
+                client.clone(),
+                pv_name.clone(),
+                connected.clone(),
+            );
+            move |op: PutOp| spawn_put(&reactor, &client, &pv_name, &channel, op)
+        };
+        // B-pvalink-restart: the INP monitor is a re-subscribe
+        // loop, mirroring `channel_cache.rs::spawn_upstream_monitor`.
+        // The subscription runs on the TYPED EVENT STREAM
+        // (`pvmonitor_events`), not on the value-only `pvmonitor`,
+        // because the disconnect must arrive as an EVENT — see
+        // `inp_disconnect_scan` below.
+        let join = reactor.spawn(async move {
+            let mut backoff = Duration::from_millis(250);
+            let max_backoff = Duration::from_secs(30);
+            loop {
+                let tx_inner = tx.clone();
+                let tx_disc = tx.clone();
+                let latest_inner = latest_clone.clone();
+                let connected_inner = connected_for_task.clone();
+                let connected_disc = connected_for_task.clone();
+                let overrun_inner = scan_overrun_task.clone();
+                let overrun_disc = scan_overrun_task.clone();
+                let snaps_ev = snaps_task.clone();
+                let release = release.clone();
+                // pvxs's pvalink channel is driven by the monitor's
+                // event stream: value updates and the
+                // `catch(client::Disconnect&)` branch
+                // (`pvxs/ioc/pvalink_channel.cpp:335-373`). Ours must be too.
+                // `Connected` is masked there (`:110-112`): the channel is
+                // connected by its first value, not by the circuit.
+                //
+                // `mask_disconnected: false` is the load-bearing half.
+                // `op_monitor_events` RE-SUBSCRIBES INTERNALLY on
+                // connection loss (`ops_v2.rs`, `MonitorEnd::ConnectionLost`
+                // → deliver `Disconnected`, sleep, loop), so the
+                // subscription future does NOT return when the upstream
+                // IOC dies. Inferring the disconnect from that future
+                // returning — what this loop did before — therefore
+                // never fired: measured on the RTEMS stage-5 target —
+                // killing the upstream left both downstream records at
+                // their stale value with `SEVR=0 STAT=0` and
+                // `is_connected() == true`, while the
+                // client itself correctly reported the peer gone
+                // (`conn alive=false channels=[]`, `active=0 searching=2`).
+                let on_event = move |ev: MonitorEvent| match ev {
+                    MonitorEvent::Connected { .. } => {}
+                    MonitorEvent::Data { value, .. } => {
+                        if let Some(op) = connected_inner.up() {
+                            release(op);
                         }
-                        MonitorEvent::Data { value, .. } => {
-                            connected_inner.store(true, Ordering::Release);
-                            *latest_inner.lock() = Some(value.clone());
-                            // The value is now cached in `latest`; enqueue a
-                            // scan trigger, coalescing to the cache + overrun
-                            // marker if the queue is full rather than dropping
-                            // the CP/CPP scan (EPICS `db_queue_event_log`,
-                            // `dbEvent.c:812-827`).
-                            enqueue_scan_trigger(
-                                &tx_inner,
-                                &overrun_inner,
-                                ScanEvent::Value(value),
-                            );
-                        }
-                        // A clean end-of-stream is as much a loss of the
-                        // live value as a dropped circuit: pvxs pushes
-                        // `Finished()` into the same stream the
-                        // `Disconnect` lands in, and `pvaLinkChannel`
-                        // stops being `connected` either way.
-                        MonitorEvent::Disconnected | MonitorEvent::Finished => {
-                            inp_disconnect_scan(
-                                &connected_disc,
-                                &disconnect_time_ev,
-                                &tx_disc,
-                                &overrun_disc,
-                            );
-                        }
-                    };
-                    let result = client_clone
-                        .pvmonitor_events(
-                            &pv_name,
-                            request.as_ref(),
-                            MonitorEventMask {
-                                mask_connected: false,
-                                mask_disconnected: false,
-                            },
-                            on_event,
-                        )
-                        .await;
-                    // The subscription future returned — the stream ended
-                    // for good (`Fatal`/`Remote`, or the channel closed),
-                    // rather than dropping a circuit it re-subscribes to
-                    // itself. Same transition, same owner: idempotent
-                    // because it is gated on the prior `connected` state,
-                    // so a `Disconnected` event already handled above does
-                    // not scan twice here.
-                    inp_disconnect_scan(
-                        &connected_for_task,
-                        &disconnect_time_task,
-                        &tx,
-                        &scan_overrun_task,
-                    );
-                    match &result {
-                        Ok(()) => tracing::debug!(
-                            pv = %pv_name,
-                            "pvalink: INP monitor ended, re-subscribing"
-                        ),
-                        Err(e) => tracing::warn!(
-                            pv = %pv_name,
-                            error = %e,
-                            backoff_ms = backoff.as_millis() as u64,
-                            "pvalink: INP monitor failed, will retry"
-                        ),
+                        *latest_inner.lock() = Some(Arc::new(value.clone()));
+                        // The value is now cached in `latest`; enqueue a
+                        // scan trigger, coalescing to the cache + overrun
+                        // marker if the queue is full rather than dropping
+                        // the CP/CPP scan (EPICS `db_queue_event_log`,
+                        // `dbEvent.c:812-827`).
+                        enqueue_scan_trigger(&tx_inner, &overrun_inner, ScanEvent::Value(value));
                     }
-                    task::sleep(backoff).await;
-                    backoff = std::cmp::min(backoff * 2, max_backoff);
-                }
-            });
-            monitor_abort = Some(MonitorAbort(join.abort_handle()));
-        } else if matches!(config.direction, LinkDirection::Out) {
-            // pvxs pvalink runs a monitor on EVERY channel — INP *and*
-            // OUT — to maintain `lchan->connected`
-            // (`pvxs/ioc/pvalink_channel.cpp:342-363`); the OUT-write gate
-            // `valid()` is `connected && root` (`pvxs/ioc/pvalink_link.cpp:69`,
-            // applied at `pvxs/ioc/pvalink_lset.cpp:609`). An OUT link must
-            // therefore track connection too, even though it never reads
-            // the cached value: without it `is_connected()` (the
-            // `latest.is_some()` fallback) is permanently false for OUT
-            // links, so the non-retry write gate below would drop every
-            // OUT write. This is the same re-subscribe-with-backoff loop
-            // as the INP monitor, stripped to connection-tracking only —
-            // no value cache, no scan triggers, no disconnect-time
-            // capture (those are INP-read concerns).
-            let pv_name = config.pv_name.clone();
-            let client_clone = client.clone();
-            let connected = Arc::new(AtomicBool::new(false));
-            let connected_for_task = connected.clone();
-            monitor_connected = Some(connected);
-            // pvxs keeps one `pvaLinkChannel` per `(channelName,
-            // pvRequest)` and calls `chan.monitor(this, pvRequest)` for
-            // BOTH INP and OUT channels, with `pvRequest` coming from
-            // `pvaLink::makeRequest()` (`pvxs/ioc/pvalink_link.cpp:49-65`,
-            // installed at `pvxs/ioc/pvalink_channel.cpp` channel open). That
-            // request always carries `record._options.atomic=true`,
-            // `pipeline=<cfg>`, and `queueSize=<Q/4>`. The OUT
-            // connection-tracking monitor must therefore open with the
-            // same request as the INP monitor — not a plain
-            // option-less subscription — so the server sees the pvalink
-            // atomic/pipeline/queue negotiation on the OUT liveness path.
-            let request = monitor_request(&config);
-            let join = reactor.spawn(async move {
-                let mut backoff = Duration::from_millis(250);
-                let max_backoff = Duration::from_secs(30);
-                loop {
-                    let connected_inner = connected_for_task.clone();
-                    // Same event stream as the INP monitor, for the same
-                    // reason: `op_monitor_events` re-subscribes internally
-                    // on connection loss, so the future returning is NOT
-                    // the disconnect signal. Without the `Disconnected`
-                    // event the OUT-write gate would keep reporting a dead
-                    // upstream as writable and every put would be swallowed
-                    // by the peer's absence instead of deferring/retrying.
-                    // Liveness is proven by a delivered event, never by
-                    // entering the subscription; the value itself is ignored.
-                    let on_event = move |ev: MonitorEvent| match ev {
-                        MonitorEvent::Connected { .. } | MonitorEvent::Data { .. } => {
-                            connected_inner.store(true, Ordering::Release);
-                        }
-                        MonitorEvent::Disconnected | MonitorEvent::Finished => {
-                            connected_inner.store(false, Ordering::Release);
-                        }
-                    };
-                    let result = client_clone
-                        .pvmonitor_events(
-                            &pv_name,
-                            request.as_ref(),
-                            MonitorEventMask {
-                                mask_connected: false,
-                                mask_disconnected: false,
-                            },
-                            on_event,
-                        )
-                        .await;
-                    // The subscription future returned — the stream ended
-                    // for good. Reflect the disconnect so the OUT-write gate
-                    // sees `is_connected() == false` until re-subscribed.
-                    connected_for_task.store(false, Ordering::Release);
-                    match &result {
-                        Ok(()) => tracing::debug!(
-                            pv = %pv_name,
-                            "pvalink: OUT connection monitor ended, re-subscribing"
-                        ),
-                        Err(e) => tracing::warn!(
-                            pv = %pv_name,
-                            error = %e,
-                            backoff_ms = backoff.as_millis() as u64,
-                            "pvalink: OUT connection monitor failed, will retry"
-                        ),
+                    // A clean end-of-stream is as much a loss of the
+                    // live value as a dropped circuit: pvxs pushes
+                    // `Finished()` into the same stream the
+                    // `Disconnect` lands in, and `pvaLinkChannel`
+                    // stops being `connected` either way.
+                    MonitorEvent::Disconnected | MonitorEvent::Finished => {
+                        inp_disconnect_scan(&connected_disc, &snaps_ev, &tx_disc, &overrun_disc);
                     }
-                    task::sleep(backoff).await;
-                    backoff = std::cmp::min(backoff * 2, max_backoff);
+                };
+                let result = client_clone
+                    .pvmonitor_events(
+                        &pv_name,
+                        request.as_ref(),
+                        MonitorEventMask {
+                            mask_connected: true,
+                            mask_disconnected: false,
+                        },
+                        on_event,
+                    )
+                    .await;
+                // The subscription future returned — the stream ended
+                // for good (`Fatal`/`Remote`, or the channel closed),
+                // rather than dropping a circuit it re-subscribes to
+                // itself. Same transition, same owner: idempotent
+                // because it is gated on the prior `connected` state,
+                // so a `Disconnected` event already handled above does
+                // not scan twice here.
+                inp_disconnect_scan(&connected_for_task, &snaps_task, &tx, &scan_overrun_task);
+                match &result {
+                    Ok(()) => tracing::debug!(
+                        pv = %pv_name,
+                        "pvalink: INP monitor ended, re-subscribing"
+                    ),
+                    Err(e) => tracing::warn!(
+                        pv = %pv_name,
+                        error = %e,
+                        backoff_ms = backoff.as_millis() as u64,
+                        "pvalink: INP monitor failed, will retry"
+                    ),
                 }
-            });
-            monitor_abort = Some(MonitorAbort(join.abort_handle()));
-        }
+                task::sleep(backoff).await;
+                backoff = std::cmp::min(backoff * 2, max_backoff);
+            }
+        });
+        let monitor_abort = MonitorAbort(join.abort_handle());
 
         Ok(Self {
             config,
             client,
             latest,
-            monitor_connected,
-            notify_rx: Mutex::new(notify_rx),
-            out_scratch: Mutex::new(HashMap::new()),
-            snap_alarm: Mutex::new(HashMap::new()),
-            retry_pending: AtomicBool::new(false),
-            disconnect_time,
+            channel: connected,
+            notify_rx: Mutex::new(Some(rx)),
+            snaps,
             scan_overrun,
-            _monitor_abort: monitor_abort,
+            _monitor_abort: Some(monitor_abort),
         })
     }
 
@@ -624,9 +753,8 @@ impl PvaLink {
     /// Take the INP-monitor notification receiver (B3). Returns the
     /// channel exactly once; subsequent calls return `None`. The
     /// resolver calls this right after `open` to spawn the
-    /// scan-on-update forwarder. `None` for OUT / non-monitor links
-    /// (they never created a channel) or after the receiver has
-    /// already been claimed.
+    /// scan-on-update forwarder. `None` for a test link built without a
+    /// monitor, or after the receiver has already been claimed.
     pub fn take_notify_rx(&self) -> Option<mpsc::Receiver<ScanEvent>> {
         self.notify_rx.lock().take()
     }
@@ -649,50 +777,41 @@ impl PvaLink {
     /// but differ in which sub-field they target (pvxs
     /// `pvxs/ioc/pvalink_link.cpp:91` — `root = lchan->root[fieldName]`).
     pub async fn read_with_field(&self, field: &str) -> PvaLinkResult<PvField> {
-        if matches!(self.config.direction, LinkDirection::Out) {
-            return Err(PvaLinkError::NotReadable);
-        }
-        // a monitor link serves its cached value ONLY
+        // the channel serves its cached value ONLY
         // while the subscription is live. When the upstream monitor is
         // down — an IOC restart / transient I/O, or before the first
         // event has ever arrived — the cache is not a valid current
         // read; surface a failed read so the lset's `get_value`
         // returns `None` and base processing raises LINK_ALARM/INVALID,
         // instead of handing back a stale value as if it were fresh.
-        // The `latest` slot is still retained for the diagnostic /
-        // timestamp accessors (`latest_value`, `time_stamp`). Mirrors
+        // The `latest` slot is still retained for the diagnostic
+        // accessor (`latest_value`). Mirrors
         // pvxs `pvaGetValue`'s `!self->valid()` gate
         // (pvxs/ioc/pvalink_lset.cpp:259-272), which returns failure while
         // disconnected and does NOT fall back to a one-shot GET.
-        // Non-monitor INP links keep the fresh-GET path: each read
-        // proves connectivity by itself, so there is no stale window.
-        if self.config.monitor {
-            if !self.is_connected() {
-                return Err(PvaLinkError::Disconnected(self.config.pv_name.clone()));
-            }
-            let cached = self.latest.lock().clone();
-            return match cached {
-                Some(v) => {
-                    // value-read latch: pvxs `pvaGetValue` copies the live
-                    // `fld_severity` / `fld_message` into the snapshot on
-                    // every connected read (`pvxs/ioc/pvalink_lset.cpp:412-422`).
-                    self.latch_alarm_snapshot(field, &v);
-                    Ok(select_link_value(&v, field))
-                }
-                // Connected flag set but the first event has not yet
-                // written `latest` (the callback stores the flag before
-                // the value): not-yet-valid, surface a failed read.
-                None => Err(PvaLinkError::Disconnected(self.config.pv_name.clone())),
-            };
+        if !self.is_connected() {
+            return Err(PvaLinkError::Disconnected(self.config.pv_name.clone()));
         }
-        let result = self.client.pvget_full(&self.config.pv_name).await?;
-        Ok(select_link_value(&result.value, field))
+        let cached = self.latest.lock();
+        match cached.as_ref() {
+            Some(v) => {
+                // value-read latch: pvxs `pvaGetValue` copies the live
+                // `fld_severity` / `fld_message` into the snapshot on
+                // every connected read (`pvxs/ioc/pvalink_lset.cpp:412-422`).
+                self.latch_snapshot(field, v);
+                Ok(select_link_value(v, field).clone())
+            }
+            // Connected flag set but the first event has not yet
+            // written `latest` (the callback stores the flag before
+            // the value): not-yet-valid, surface a failed read.
+            None => Err(PvaLinkError::Disconnected(self.config.pv_name.clone())),
+        }
     }
 
     /// Synchronous fast-path read: return the cached field if the
     /// monitor has delivered at least one event, without ever
-    /// awaiting. Returns `None` for OUT links, non-monitor INPs,
-    /// or pre-first-event INPs.
+    /// awaiting. Returns `None` while disconnected or before the first
+    /// event.
     ///
     /// Lets the record-link resolver path skip `block_on` on every
     /// process — the typical hot case where a monitor has already
@@ -706,9 +825,13 @@ impl PvaLink {
     /// `self.config.field`. Mirrors the per-link field override path
     /// (`pvxs/ioc/pvalink_link.cpp:91`).
     pub fn try_read_cached_with_field(&self, field: &str) -> Option<PvField> {
-        if matches!(self.config.direction, LinkDirection::Out) || !self.config.monitor {
-            return None;
-        }
+        self.with_cached_value(field, PvField::clone)
+    }
+
+    /// [`Self::try_read_cached_with_field`] handing `read` the selected
+    /// value in place, so a record-thread read copies nothing it does not
+    /// convert.
+    pub fn with_cached_value<R>(&self, field: &str, read: impl FnOnce(&PvField) -> R) -> Option<R> {
         // same disconnect gate as `read_with_field` — the
         // sync fast path must never serve a stale cached value while the
         // monitor subscription is down. Returning `None` makes the lset
@@ -717,11 +840,12 @@ impl PvaLink {
         if !self.is_connected() {
             return None;
         }
-        let v = self.latest.lock().clone()?;
+        let cached = self.latest.lock();
+        let v = cached.as_ref()?;
         // value-read latch — same as `read_with_field` (pvxs
         // `pvaGetValue` snapshot, `pvxs/ioc/pvalink_lset.cpp:412-422`).
-        self.latch_alarm_snapshot(field, &v);
-        Some(select_link_value(&v, field))
+        self.latch_snapshot(field, v);
+        Some(read(select_link_value(v, field)))
     }
 
     /// Convenience: read the value as f64.
@@ -839,8 +963,8 @@ impl PvaLink {
     }
 
     /// Core OUT-write path: stage `value` under `field` on the shared
-    /// channel scratch, then — unless `defer` — flush the whole scratch
-    /// into one combined upstream PUT. Mirrors pvxs `pvaPutValue`
+    /// channel, then — unless `defer` — put every staged write in one
+    /// upstream PUT. Mirrors pvxs `pvaPutValue`
     /// (`pvxs/ioc/pvalink_lset.cpp:645-653`): `put_scratch = value; if(!defer)
     /// lchan->put()`.
     async fn stage_and_flush(
@@ -852,246 +976,65 @@ impl PvaLink {
         block: bool,
         value: QueuedPut,
     ) -> PvaLinkResult<()> {
-        if matches!(self.config.direction, LinkDirection::Inp) {
-            return Err(PvaLinkError::NotWritable);
-        }
-        // pvxs `pvaPutValueX` gates EVERY put — deferred or not — on
-        // `if(!self->retry && !self->valid()) return -1`
-        // (`pvxs/ioc/pvalink_lset.cpp:609`), BEFORE staging into `put_scratch`.
-        // A non-retry write to a disconnected channel would fail
-        // identically on every replay, so it must not occupy the
-        // scratch (nor return Ok on the deferred path). `retry` links
-        // skip this gate and queue for replay instead — the disconnect
-        // is handled in `flush_scratch`, which restores the staged
-        // value and arms the production drain. This `retry` is the
-        // PER-CALL link's option (combine-PUT siblings carry their own),
-        // and `is_connected()` is the shared channel's connection truth.
-        if !retry && !self.is_connected() {
-            return Err(PvaLinkError::Disconnected(self.config.pv_name.clone()));
-        }
-        self.stage_put(
-            field,
-            StagedPut {
-                value,
-                proc,
-                retry,
-                block,
-            },
-        );
-        if defer {
-            // Cached for sibling coalescing; a non-deferred sibling — or
-            // the `flush_puts` production drain — flushes it later.
-            return Ok(());
-        }
-        self.flush_scratch().await.map(|_| ())
+        let staged = StagedPut {
+            value,
+            proc,
+            retry,
+            block,
+        };
+        self.put(Some((field, staged)), retry, defer, false)
+            .await
+            .map(|_| ())
     }
 
-    /// Stage one field's write into the shared scratch, overwriting any
-    /// earlier staged write for the same field (most-recent-wins, pvxs
-    /// single `put_scratch` per link, `pvxs/ioc/pvalink_lset.cpp:645-653`).
-    fn stage_put(&self, field: &str, staged: StagedPut) {
-        self.out_scratch.lock().insert(field.to_string(), staged);
+    /// The channel put every OUT write and forward link takes, as pvxs
+    /// `pvaPutValueX` / `pvaScanForward` under `lchan->lock`. Returns the
+    /// number of upstream PUTs sent (0 or 1).
+    ///
+    /// `if(!self->retry && !self->valid()) return -1` comes first, before
+    /// staging (`pvxs/ioc/pvalink_lset.cpp:609,677`): a non-retry write to a
+    /// down channel occupies nothing. `retry` is the calling link's own
+    /// option; the channel is shared and its `config` is the first opener's.
+    /// A retry put on a down channel is held, and the connect sends it.
+    async fn put(
+        &self,
+        write: Option<(&str, StagedPut)>,
+        retry: bool,
+        defer: bool,
+        force: bool,
+    ) -> PvaLinkResult<usize> {
+        let op = {
+            let mut out = self.channel.outbox.lock();
+            let connected = self.channel.is_up();
+            if !retry && !connected {
+                return Err(PvaLinkError::Disconnected(self.config.pv_name.clone()));
+            }
+            if let Some((field, staged)) = write {
+                // Most-recent-wins: one `put_scratch` per link.
+                out.staged.insert(field.to_string(), staged);
+            }
+            if defer {
+                return Ok(0);
+            }
+            match out.start(force, connected) {
+                Some(op) => op,
+                None => return Ok(0),
+            }
+        };
+        send_put(&self.client, &self.config.pv_name, &self.channel, op).await
     }
 
     /// Number of distinct fields currently staged on this channel — the
     /// shared `put_scratch` size (0 when nothing is queued).
     pub fn staged_count(&self) -> usize {
-        self.out_scratch.lock().len()
-    }
-
-    /// Flush every staged field into ONE combined upstream PUT. Mirrors
-    /// pvxs `pvaLinkChannel::put` (`pvxs/ioc/pvalink_channel.cpp:220-263`).
-    ///
-    /// A single staged field keeps the typed path (a typed array PUT
-    /// must NOT round-trip through `Display` + parse); multiple fields
-    /// are assigned into one prototype via `pvput_fields` so siblings
-    /// land in one PUT (`linkBuildPut`, `pvxs/ioc/pvalink_channel.cpp:127-184`).
-    /// The process option is resolved across all participating links — PP/CP/CPP
-    /// forces processing over NPP (`pvxs/ioc/pvalink_channel.cpp:257-263`).
-    ///
-    /// On a disconnect, `retry=true` fields are restored to the scratch
-    /// (most-recent-wins) and `retry_pending` is set so the production
-    /// drain replays them on reconnect; `retry=false` fields are
-    /// dropped and surfaced as an error so the owning record alarms.
-    /// Returns the number of upstream PUTs issued (0 or 1).
-    pub async fn flush_scratch(&self) -> PvaLinkResult<usize> {
-        if matches!(self.config.direction, LinkDirection::Inp) {
-            return Err(PvaLinkError::NotWritable);
-        }
-        self.issue_put(false).await
-    }
-
-    /// Single owner of "this channel issues one upstream PUT", the port
-    /// of pvxs `pvaLinkChannel::put(bool force)`
-    /// (`pvxs/ioc/pvalink_channel.cpp:220-280`). `force` is the forward-link
-    /// entry: it makes the PUT happen even with nothing staged and
-    /// pins `record._options.process` to `"true"` (`:258-260`).
-    ///
-    /// No direction gate here — pvxs has none on the channel put, and
-    /// the scratch is the only way a value enters, so `stage_and_flush`
-    /// is where an INP link is refused.
-    async fn issue_put(&self, force: bool) -> PvaLinkResult<usize> {
-        // Snapshot + clear (pvxs moves used_scratch into put_queue).
-        let staged: Vec<(String, StagedPut)> = {
-            let mut scratch = self.out_scratch.lock();
-            if scratch.is_empty() && !force {
-                return Ok(0);
-            }
-            scratch.drain().collect()
-        };
-        // `if((reqProcess&2) || force) proc = "true"` — a forced put outranks even
-        // a staged NPP sibling (`pvxs/ioc/pvalink_channel.cpp:258-260`).
-        let combined_proc = if force {
-            ProcMode::Pp
-        } else {
-            combine_proc(staged.iter().map(|(_, s)| s.proc))
-        };
-        let block = staged.iter().any(|(_, s)| s.block);
-        let req = build_put_request(combined_proc, block);
-
-        let put_result = if staged.is_empty() {
-            // Forced with nothing staged: pvxs `linkBuildPut` returns the
-            // prototype untouched, so the DATA phase carries an empty
-            // changed bitset and no value (`pvxs/ioc/pvalink_channel.cpp:127-184`).
-            self.client
-                .pvput_empty_with_request(&self.config.pv_name, &req)
-                .await
-        } else if staged.len() == 1 {
-            let (field, sp) = &staged[0];
-            self.put_single(field, &sp.value, &req).await
-        } else {
-            // One combined PUT assigning every staged field into the
-            // same prototype (pvxs `linkBuildPut`,
-            // pvxs/ioc/pvalink_channel.cpp:127-184). Each leaf travels as typed
-            // pvData: a staged `PvField` is assigned into the descriptor
-            // leaf verbatim — matching pvxs `value = tosend` for an array
-            // leaf — instead of being stringified into a bracketed list the
-            // field parser would re-split on commas, which corrupts a typed
-            // scalar array. String writes still lower through the CLI parser
-            // so the text is coerced against the native scalar type.
-            let assignments: Vec<(String, PutLeaf)> = staged
-                .iter()
-                .map(|(field, sp)| {
-                    let leaf = match &sp.value {
-                        QueuedPut::Field(f) => PutLeaf::Typed(f.clone()),
-                        QueuedPut::Str(s) => PutLeaf::Str(s.clone()),
-                    };
-                    (put_field_path(field), leaf)
-                })
-                .collect();
-            self.client
-                .pvput_fields_typed(&self.config.pv_name, &assignments, Some(&req))
-                .await
-        };
-
-        match put_result {
-            Ok(()) => {
-                self.retry_pending.store(false, Ordering::Release);
-                Ok(1)
-            }
-            Err(e) if is_disconnect(&e) => {
-                if staged.is_empty() {
-                    // A forced put stages nothing, so there is no
-                    // retry-eligible field to requeue and the caller owns
-                    // reporting the disconnect.
-                    return Err(PvaLinkError::Pva(e));
-                }
-                // Requeue retry-eligible fields for replay; drop the
-                // rest. Most-recent-wins: only restore a field a newer
-                // write has not already re-staged.
-                let mut any_retry = false;
-                let mut any_dropped = false;
-                {
-                    let mut scratch = self.out_scratch.lock();
-                    for (field, sp) in staged {
-                        if sp.retry {
-                            scratch.entry(field).or_insert(sp);
-                            any_retry = true;
-                        } else {
-                            any_dropped = true;
-                        }
-                    }
-                }
-                if any_retry {
-                    self.retry_pending.store(true, Ordering::Release);
-                    // Discard the dead channel so the replay re-resolves a
-                    // fresh one. pvxs's channel auto-recovers on reconnect;
-                    // our cached channel does not re-create after a failed
-                    // `create_channel` (a pinned `EPICS_PVA_ADDR_LIST`
-                    // retry link would otherwise NEVER replay — the dead
-                    // channel stays cached forever). `Drop` removes it
-                    // unconditionally so the next `flush_retry_pending`
-                    // opens a new channel against the now-present PV.
-                    self.client
-                        .cache_clear_action(&self.config.pv_name, CacheAction::Drop)
-                        .await;
-                }
-                if any_dropped {
-                    // A non-retry link saw a real disconnect — its
-                    // record must alarm. Retry links stay queued.
-                    Err(PvaLinkError::Pva(e))
-                } else {
-                    Ok(0)
-                }
-            }
-            Err(e) => Err(PvaLinkError::Pva(e)),
-        }
-    }
-
-    /// Replay any retry-queued writes if a prior disconnect left them
-    /// staged — the per-channel half of the `LinkSet::flush_puts`
-    /// production drain. No-op unless `retry_pending` is set, so a
-    /// freshly-`defer`red write awaiting its sibling is never flushed
-    /// early; only a genuinely stuck retry write is replayed. Mirrors
-    /// pvxs replaying the queued put on the client reconnect event
-    /// (`pvalink.rst:99-100`).
-    pub async fn flush_retry_pending(&self) -> PvaLinkResult<usize> {
-        if !self.retry_pending.load(Ordering::Acquire) {
-            return Ok(0);
-        }
-        self.flush_scratch().await
-    }
-
-    /// Issue one single-field PUT, choosing the string vs typed path
-    /// and root vs sub-field targeting (pvxs `linkBuildPut:138`:
-    /// `top[fieldName]` when `fieldName` is non-empty).
-    async fn put_single(
-        &self,
-        field: &str,
-        value: &QueuedPut,
-        req: &PvRequestExpr,
-    ) -> Result<(), epics_pva_rs::error::PvaError> {
-        match value {
-            QueuedPut::Str(s) => {
-                if is_subfield(field) {
-                    self.client
-                        .pvput_field_with_request(&self.config.pv_name, field, req, s)
-                        .await
-                } else {
-                    self.client
-                        .pvput_with_request(&self.config.pv_name, req, s)
-                        .await
-                }
-            }
-            QueuedPut::Field(f) => {
-                if is_subfield(field) {
-                    self.client
-                        .pvput_pv_field_field_with_request(&self.config.pv_name, field, req, f)
-                        .await
-                } else {
-                    self.client
-                        .pvput_pv_field_with_request(&self.config.pv_name, req, f)
-                        .await
-                }
-            }
-        }
+        self.channel.outbox.lock().staged.len()
     }
 
     /// Fire this link's forward link (FLNK): trigger the remote target to
     /// process, transferring no value. Mirrors pvxs `pvaScanForward`
     /// (`pvxs/ioc/pvalink_lset.cpp:672-688`), which is `lchan->put(true)`
     /// at `:691` — the forced arm of the same channel put every OUT write
-    /// takes, so it goes through `Self::issue_put` here too.
+    /// takes, so it goes through `Self::put` here too.
     ///
     /// It must NOT be a PVA `PROCESS` (cmd 16): pvxs implements no handler
     /// for that command anywhere. `CMD_PROCESS` occurs once in its tree, as
@@ -1107,35 +1050,52 @@ impl PvaLink {
     /// with no trigger sent and no blocking connect attempted. A `retry`
     /// link skips the gate and issues the put anyway: pvxs reaches
     /// `lchan->put(true)`, whose `doit = force` is unconditionally true
-    /// (`pvxs/ioc/pvalink_channel.cpp:226,266`), so the operation is started and the
-    /// client holds it until the channel connects. `retry` is the link's
-    /// own option here, not a per-call flag, matching `self->retry`.
-    pub async fn scan_forward(&self) -> PvaLinkResult<()> {
-        if !self.config.retry && !self.is_connected() {
-            return Err(PvaLinkError::Disconnected(self.config.pv_name.clone()));
-        }
+    /// (`pvxs/ioc/pvalink_channel.cpp:226,266`), so the operation is started and
+    /// held until the channel connects. `retry` is the
+    /// forwarding link's own option, `self->retry`: this channel is shared by
+    /// every link to the PV and its `config` is only the first opener's.
+    pub async fn scan_forward(&self, retry: bool) -> PvaLinkResult<()> {
         // "FWD_LINK is never deferred, and always results in a Put"
         // (`pvxs/ioc/pvalink_lset.cpp:682`).
-        self.issue_put(true).await.map(|_| ())
+        self.put(None, retry, false, true).await.map(|_| ())
     }
 
     /// True when the link currently has a live upstream connection.
     /// Mirrors pvxs `pvaIsConnected` (pvxs/ioc/pvalink_lset.cpp:186).
     ///
-    /// B-pvalink-restart: for INP+monitor links this reads the
+    /// B-pvalink-restart: this reads the
     /// monitor task's live-connection flag — it goes `false` the
     /// moment the upstream subscription ends (IOC restart / transient
     /// I/O) and back `true` once the re-subscribe loop delivers a
-    /// fresh event. Pre-fix this returned `latest.is_some()`, which
+    /// fresh value. Pre-fix this returned `latest.is_some()`, which
     /// stayed `true` forever once any value had been cached, so an
-    /// IOC restart was never reflected. For non-monitor links (which
-    /// never run the monitor task) it falls back to "a value has been
-    /// cached".
+    /// IOC restart was never reflected. A test link built without a
+    /// monitor falls back to "a value has been cached".
     pub fn is_connected(&self) -> bool {
-        match &self.monitor_connected {
-            Some(flag) => flag.load(Ordering::Acquire),
-            None => self.latest.lock().is_some(),
-        }
+        self.channel.is_up()
+    }
+
+    /// pvxs `num_disconnect`: how many times the monitor lost its connection.
+    pub fn num_disconnect(&self) -> usize {
+        self.channel.disconnects.load(Ordering::Relaxed)
+    }
+
+    /// pvxs `num_type_change`: how many times the monitor connected.
+    pub fn num_type_change(&self) -> usize {
+        self.channel.type_changes.load(Ordering::Relaxed)
+    }
+
+    /// pvxs `op_put` set: an upstream put is on the wire, or a `retry` put
+    /// is held for the connection, as pvxs's op waits for it.
+    pub fn put_in_flight(&self) -> bool {
+        self.channel.puts_in_flight.load(Ordering::Relaxed) > 0
+            || self.channel.outbox.lock().held.is_some()
+    }
+
+    /// pvxs `pvaLink::valid`: connected, and a value has arrived
+    /// (`lchan->connected && lchan->root`, `pvalink_link.cpp:69-72`).
+    pub fn is_valid(&self) -> bool {
+        self.is_connected() && self.latest.lock().is_some()
     }
 
     /// Raw remote NT `alarm.severity` of the latest cached value, read
@@ -1150,8 +1110,8 @@ impl PvaLink {
     /// `pvxs/ioc/pvalink_lset.cpp:412-430`). `field=""` keeps the
     /// top-level root.
     fn remote_alarm_severity(&self, field: &str) -> Option<i32> {
-        let v = self.latest.lock().clone()?;
-        let PvField::Structure(s) = select_target(&v, field) else {
+        let cached = self.latest.lock();
+        let PvField::Structure(s) = select_target(cached.as_ref()?, field) else {
             return None;
         };
         let PvField::Structure(a) = s.get_field("alarm")? else {
@@ -1171,11 +1131,11 @@ impl PvaLink {
     /// is non-`NO_ALARM` (pvxs clears `snap_message` when
     /// `snap_severity == 0`). Pure so the value-read latch and any caller
     /// share one extraction rule.
-    fn alarm_from_value(value: &PvField, field: &str) -> (i32, String) {
+    fn alarm_from_value<'v>(value: &'v PvField, field: &str) -> (i32, Cow<'v, str>) {
         let PvField::Structure(s) = select_target(value, field) else {
             // A cached value that is not a structure carries no alarm
             // sub-field — `NO_ALARM`, no message (pvxs default snapshot).
-            return (0, String::new());
+            return (0, Cow::Borrowed(""));
         };
         let alarm = match s.get_field("alarm") {
             Some(PvField::Structure(a)) => Some(a),
@@ -1194,35 +1154,47 @@ impl PvaLink {
             alarm
                 .and_then(|a| a.get_field("message"))
                 .and_then(|m| match m {
-                    PvField::Scalar(ScalarValue::String(m)) if !m.is_empty() => Some(m.to_string()),
+                    PvField::Scalar(ScalarValue::String(m)) => Some(m.as_str_lossy()),
                     _ => None,
                 })
                 .unwrap_or_default()
         } else {
-            String::new()
+            Cow::Borrowed("")
         };
         (severity, message)
     }
 
-    /// Latch the remote alarm snapshot for `field` from the value being
-    /// read. The Rust counterpart of pvxs `pvaGetValue` copying the live
-    /// `fld_severity` / `fld_message` into `snap_severity` /
-    /// `snap_message` (`pvxs/ioc/pvalink_lset.cpp:412-422`): the ungated
-    /// DB-link alarm inspection ([`Self::remote_alarm_snapshot`]) reports
-    /// THIS latched snapshot, not the live cached monitor alarm — so a
+    /// Latch `field`'s snapshot from the value being read: pvxs
+    /// `pvaGetValue` copying `fld_*` into `snap_*` on every connected read
+    /// (`pvxs/ioc/pvalink_lset.cpp:396-422`). The alarm and timestamp getters
+    /// report THIS, not the live cached monitor value — so a
     /// connected-but-never-read link reports the initial INVALID/blank
     /// exactly like pvxs `dbGetAlarm` before the first `dbGetLink`
     /// (`pvxs/test/testpvalink.cpp:373-375`). Called from the value-read
     /// path ([`Self::read_with_field`] / [`Self::try_read_cached_with_field`])
-    /// on a connected read. Reuses the existing key allocation in steady
-    /// state so a hot CP/CPP read does not allocate per process.
-    fn latch_alarm_snapshot(&self, field: &str, value: &PvField) {
-        let snap = Self::alarm_from_value(value, field);
-        let mut g = self.snap_alarm.lock();
-        match g.get_mut(field) {
-            Some(slot) => *slot = snap,
+    /// on a connected read. Reuses the existing key and the held message in
+    /// steady state, so a hot read allocates only when the remote message
+    /// text changes.
+    fn latch_snapshot(&self, field: &str, value: &PvField) {
+        let (severity, message) = Self::alarm_from_value(value, field);
+        let (time, tag) = Self::stamp_from_value(value, field);
+        let mut g = self.snaps.lock();
+        match g.fields.get_mut(field) {
+            Some(snap) => {
+                snap.message = shared_text(Some(&snap.message), &message);
+                snap.severity = severity;
+                snap.time = time;
+                snap.tag = tag;
+            }
             None => {
-                g.insert(field.to_string(), snap);
+                let message = shared_text(None, &message);
+                let snap = Snap {
+                    severity,
+                    message,
+                    time,
+                    tag,
+                };
+                g.fields.insert(field.to_string(), snap);
             }
         }
     }
@@ -1242,7 +1214,7 @@ impl PvaLink {
     /// [`epics_base_rs::server::database::RemoteAlarm::from_severity_message`].
     ///
     /// Crucially it reports the value-read-LATCHED snapshot
-    /// (`Self::latch_alarm_snapshot`), not the live cached monitor
+    /// (`Self::latch_snapshot`), not the live cached monitor
     /// alarm. pvxs `snap_severity` is initialized to `INVALID_ALARM`
     /// with a blank message (`pvxs/ioc/pvalink.h:250`) and only
     /// `pvaGetValue` updates it; so a connected link that has never been
@@ -1259,18 +1231,10 @@ impl PvaLink {
         field: &str,
     ) -> Option<epics_base_rs::server::database::RemoteAlarm> {
         use epics_base_rs::server::database::RemoteAlarm;
-        // pvxs initial `snap_severity` (`pvxs/ioc/pvalink.h:250`): a
-        // connected-but-never-read link reports INVALID with a blank msg.
-        const INVALID_ALARM: i32 = 3;
         if self.monitor_disconnected_stale() || self.latest.lock().is_none() {
             return None;
         }
-        let (severity, message) = self
-            .snap_alarm
-            .lock()
-            .get(field)
-            .cloned()
-            .unwrap_or((INVALID_ALARM, String::new()));
+        let (severity, message) = self.snaps.lock().alarm(field);
         Some(RemoteAlarm::from_severity_message(severity, message))
     }
 
@@ -1292,7 +1256,7 @@ impl PvaLink {
     /// (`pvxs/ioc/pvalink_channel.cpp:370-373`; the retention is pvxs's own comment
     /// at `:375-376`).
     fn monitor_disconnected_stale(&self) -> bool {
-        self.config.monitor && !self.is_connected() && self.latest.lock().is_some()
+        !self.is_connected() && self.latest.lock().is_some()
     }
 
     /// Severity to fold into the owning record's `LINK_ALARM`, after
@@ -1359,7 +1323,7 @@ impl PvaLink {
     /// When the remote NT structure has no `alarm.message` string but
     /// the severity does propagate, a synthetic message is returned so
     /// the alarm is still observable.
-    pub fn alarm_message(&self) -> Option<String> {
+    pub fn alarm_message(&self) -> Option<Arc<str>> {
         self.alarm_message_with(&self.config.field, self.config.sevr)
     }
 
@@ -1369,7 +1333,15 @@ impl PvaLink {
     /// same rationale as [`Self::link_alarm_severity_with`] —
     /// the alarm-message gate must use the caller's per-link `sevr`,
     /// not whichever cached link's mode happens to be shared.
-    pub fn alarm_message_with(&self, field: &str, sevr: super::config::SevrMode) -> Option<String> {
+    ///
+    /// The text is the snapshot's own `Arc` when the value read this cycle
+    /// latched the same message, so an alarmed link's steady cycle shares
+    /// it rather than allocating.
+    pub fn alarm_message_with(
+        &self,
+        field: &str,
+        sevr: super::config::SevrMode,
+    ) -> Option<Arc<str>> {
         // disconnect dominates — report the link failure,
         // not the stale remote alarm message. Pairs with the INVALID
         // severity `link_alarm_severity_with` returns for the same
@@ -1377,18 +1349,20 @@ impl PvaLink {
         // message rather than a misleading snapshot of the last remote
         // alarm string.
         if self.monitor_disconnected_stale() {
-            return Some("pvalink monitor disconnected".to_string());
+            static DISCONNECTED: std::sync::LazyLock<Arc<str>> =
+                std::sync::LazyLock::new(|| Arc::from("pvalink monitor disconnected"));
+            return Some(DISCONNECTED.clone());
         }
         // Severity gate first — NMS / sub-threshold links report
         // nothing.
-        let sev = self.link_alarm_severity_with(field, sevr)?;
-        let v = self.latest.lock().clone()?;
+        self.link_alarm_severity_with(field, sevr)?;
+        let cached = self.latest.lock();
         // Resolve the alarm string relative to the link's selected
         // field root, matching `remote_alarm_severity` — pvxs reads
         // `fld_message` from the same selected `root[fieldName]`
         // (`pvxs/ioc/pvalink_link.cpp:90-110`,
         // `pvxs/ioc/pvalink_lset.cpp:412-430`).
-        let PvField::Structure(s) = select_target(&v, field) else {
+        let PvField::Structure(s) = select_target(cached.as_ref()?, field) else {
             return None;
         };
         let msg = s.get_field("alarm").and_then(|alarm| {
@@ -1397,89 +1371,68 @@ impl PvaLink {
             };
             match a.get_field("message") {
                 Some(PvField::Scalar(ScalarValue::String(m))) if !m.is_empty() => {
-                    Some(m.to_string())
+                    Some(m.as_str_lossy())
                 }
                 _ => None,
             }
         });
-        Some(msg.unwrap_or_else(|| format!("remote severity {sev}")))
+        // No `alarm.message` leaves pvxs's `snap_message` empty
+        // (`pvalink_lset.cpp:423-427`).
+        let msg = msg?;
+        let held = self.snaps.lock();
+        Some(shared_text(
+            held.fields.get(field).map(|snap| &snap.message),
+            &msg,
+        ))
     }
 
     /// Latest cached NT value, if any. Returned as the raw [`PvField`]
     /// so callers can pull whichever sub-field they need (alarm,
-    /// timeStamp, value, etc.). pvxs `pvaGetTimeStampTag`
-    /// (pvxs/ioc/pvalink_lset.cpp:577) lives on top of this.
+    /// timeStamp, value, etc.).
     pub fn latest_value(&self) -> Option<PvField> {
-        self.latest.lock().clone()
+        self.latest.lock().as_deref().cloned()
     }
 
-    /// Timestamp the owning record adopts on a `time=true` read,
-    /// `(seconds, nanoseconds, userTag)`. This is the value-read
-    /// time-adoption hook (consumed by the database INP read path), the
-    /// Rust counterpart of pvxs `pvaGetValue` setting `precord->time`:
-    ///
-    /// * **Connected** — the remote NT `timeStamp` of the cached value,
-    ///   resolved at the link's selected field root
-    ///   (`pvxs/ioc/pvalink_lset.cpp:394-409`, the connected-read snapshot).
-    /// * **Disconnected-stale** — the *disconnect-event* time captured
-    ///   when the subscription dropped (pvxs `snap_time = e.time`,
-    ///   `pvxs/ioc/pvalink_channel.cpp:372`; adopted on the invalid read at
-    ///   `pvxs/ioc/pvalink_lset.cpp:268-270`). The stale last-value timestamp is
-    ///   NOT served — the record's time means "upstream link
-    ///   disconnected at this moment", not "local process ran" and not
-    ///   "the last value's time". The last value's `userTag` is kept
-    ///   alongside (pvxs leaves `snap_tag` unchanged on disconnect).
-    ///   When no disconnect was ever recorded, `None` (keep local time).
-    ///
-    /// `None` otherwise (no cached value / no timeStamp slot). The
-    /// metadata getter `pvaGetTimeStampTag` stays gated through
-    /// `CHECK_VALID` via `Self::monitor_disconnected_stale` in
-    /// [`Self::link_metadata`] — only this value-read hook adopts the
-    /// disconnect time.
+    /// pvxs `pvaGetTimeStampTag` (`pvxs/ioc/pvalink_lset.cpp:585-601`):
+    /// `field`'s snapshot, `(seconds, nanoseconds, userTag)`, while the link
+    /// is valid (`CHECK_VALID`).
     pub fn time_stamp(&self, field: &str) -> Option<(i64, i32, u64)> {
-        if self.monitor_disconnected_stale() {
-            // Adopt the recorded disconnect-event time; keep the last
-            // value's userTag (read from the retained snapshot, 0 when
-            // absent). Without a recorded disconnect, keep local time.
-            let (secs, nsec) = (*self.disconnect_time.lock())?;
-            let utag = self.cached_timestamp(field).map_or(0, |(_, _, u)| u);
-            return Some((secs, nsec, utag));
-        }
-        self.cached_timestamp(field)
+        self.is_valid().then(|| self.snap_stamp(field))
     }
 
-    /// `(seconds, nanoseconds, userTag)` from the cached NT value's
-    /// `timeStamp` slot, resolved at the selected field root. The raw
-    /// connected-read snapshot used by [`Self::time_stamp`]; reads the
-    /// retained value regardless of connection state (the caller decides
-    /// whether to serve it).
-    fn cached_timestamp(&self, field: &str) -> Option<(i64, i32, u64)> {
-        let v = self.latest.lock().clone()?;
-        // Resolve `timeStamp` relative to the selected field root —
-        // pvxs reads `fld_seconds`/`fld_nanoseconds`/`fld_usertag` from
-        // the same `root[fieldName]` selected by `onTypeChange`
-        // (`pvxs/ioc/pvalink_link.cpp:90-110`,
-        // `pvxs/ioc/pvalink_lset.cpp:399-409`).
-        let PvField::Structure(s) = select_target(&v, field) else {
-            return None;
+    /// The `snap_time` / `snap_tag` pvxs `pvaGetValue` copies into a
+    /// `time=true` link's record on every read, failed or not
+    /// (`pvxs/ioc/pvalink_lset.cpp:268-272`, `:438-442`): the last read's,
+    /// the disconnect's time once the channel drops (the tag stays), and
+    /// `{0,0}` before either.
+    pub fn snap_stamp(&self, field: &str) -> (i64, i32, u64) {
+        self.snaps.lock().stamp(field)
+    }
+
+    /// The `snap_time` / `snap_tag` pvxs latches from `value` at the selected
+    /// field root (`pvxs/ioc/pvalink_link.cpp:90-110`,
+    /// `pvxs/ioc/pvalink_lset.cpp:396-414`): `{0,0}` without
+    /// `timeStamp.secondsPastEpoch`, and 0 for an absent nanoseconds or tag.
+    fn stamp_from_value(value: &PvField, field: &str) -> ((i64, i32), u64) {
+        let PvField::Structure(s) = select_target(value, field) else {
+            return (NO_TIME, 0);
         };
-        let ts = s.get_field("timeStamp")?;
-        let PvField::Structure(t) = ts else {
-            return None;
+        let Some(PvField::Structure(t)) = s.get_field("timeStamp") else {
+            return (NO_TIME, 0);
         };
-        let secs = match t.get_field("secondsPastEpoch")? {
-            PvField::Scalar(ScalarValue::Long(v)) => *v,
-            PvField::Scalar(ScalarValue::ULong(v)) => *v as i64,
-            _ => return None,
+        let secs = match t.get_field("secondsPastEpoch") {
+            Some(PvField::Scalar(ScalarValue::Long(v))) => Some(*v),
+            Some(PvField::Scalar(ScalarValue::ULong(v))) => Some(*v as i64),
+            _ => None,
         };
-        let nsec = match t.get_field("nanoseconds")? {
-            PvField::Scalar(ScalarValue::Int(v)) => *v,
-            PvField::Scalar(ScalarValue::UInt(v)) => *v as i32,
-            _ => return None,
-        };
-        // `pvxs/ioc/pvalink_lset.cpp:406-409` reads `timeStamp.userTag` into
-        // the snapshot tag, falling back to 0 when the field is absent
-        // (`if(self->fld_usertag) snap_tag = ...; else snap_tag = 0;`).
+        let time = secs.map_or(NO_TIME, |secs| {
+            let nsec = match t.get_field("nanoseconds") {
+                Some(PvField::Scalar(ScalarValue::Int(v))) => *v,
+                Some(PvField::Scalar(ScalarValue::UInt(v))) => *v as i32,
+                _ => 0,
+            };
+            (secs, nsec)
+        });
         // The wire field is a signed int32; zero-extend (`as u32 as u64`)
         // rather than sign-extend so a bit-31 tag like 0x9000_0000 widens
         // to 0x0000_0000_9000_0000, not 0xFFFF_FFFF_9000_0000 (the
@@ -1489,7 +1442,7 @@ impl PvaLink {
             Some(PvField::Scalar(ScalarValue::UInt(v))) => *v as u64,
             _ => 0,
         };
-        Some((secs, nsec, utag))
+        (time, utag)
     }
 
     /// Remote display / control / valueAlarm metadata snapshot for
@@ -1556,8 +1509,8 @@ impl PvaLink {
         // (`pvxs/ioc/pvalink_link.cpp:90-110`, `pvxs/ioc/pvalink_lset.cpp:199-240`).
         let value_field = select_link_value(&root, field);
 
-        let dbf_type = link_dbf_type(&value_field);
-        let element_count = link_element_count(&value_field);
+        let dbf_type = link_dbf_type(value_field);
+        let element_count = link_element_count(value_field);
 
         // display / control / valueAlarm are read from the selected
         // metadata root, NOT the top-level root. pvxs derives `fld_meta`
@@ -1573,15 +1526,15 @@ impl PvaLink {
         // metadata sub-structures, so its metadata root is empty.
         let meta_root = match select_target(&root, field) {
             s @ PvField::Structure(_) => s,
-            _ => PvField::Null,
+            _ => &NULL_FIELD,
         };
-        let graphic_limits = limit_pair(&meta_root, "display.limitLow", "display.limitHigh");
-        let control_limits = limit_pair(&meta_root, "control.limitLow", "control.limitHigh");
+        let graphic_limits = limit_pair(meta_root, "display.limitLow", "display.limitHigh");
+        let control_limits = limit_pair(meta_root, "control.limitLow", "control.limitHigh");
         let alarm_limits = {
-            let lolo = scalar_as_f64(&extract_field(&meta_root, "valueAlarm.lowAlarmLimit"));
-            let lo = scalar_as_f64(&extract_field(&meta_root, "valueAlarm.lowWarningLimit"));
-            let hi = scalar_as_f64(&extract_field(&meta_root, "valueAlarm.highWarningLimit"));
-            let hihi = scalar_as_f64(&extract_field(&meta_root, "valueAlarm.highAlarmLimit"));
+            let lolo = scalar_as_f64(extract_field(meta_root, "valueAlarm.lowAlarmLimit"));
+            let lo = scalar_as_f64(extract_field(meta_root, "valueAlarm.lowWarningLimit"));
+            let hi = scalar_as_f64(extract_field(meta_root, "valueAlarm.highWarningLimit"));
+            let hihi = scalar_as_f64(extract_field(meta_root, "valueAlarm.highAlarmLimit"));
             match (lolo, lo, hi, hihi) {
                 // pvxs writes each of the four buffers independently
                 // and leaves a missing one untouched; we only surface
@@ -1598,9 +1551,9 @@ impl PvaLink {
             }
         };
         let precision =
-            scalar_as_f64(&extract_field(&meta_root, "display.precision")).map(|p| p as i16);
-        let units = string_field(&meta_root, "display.units");
-        let description = string_field(&meta_root, "display.description");
+            scalar_as_f64(extract_field(meta_root, "display.precision")).map(|p| p as i16);
+        let units = string_field(meta_root, "display.units");
+        let description = string_field(meta_root, "display.description");
 
         Some(LinkMetadata {
             dbf_type,
@@ -1618,27 +1571,18 @@ impl PvaLink {
         })
     }
 
-    /// Test-only constructor: build a [`PvaLink`] with a pre-seeded
-    /// cached value and no live connection. Lets the unit tests
+    /// Test-only constructor: build a [`PvaLink`] with no monitor, up when
+    /// `cached` stands in for the monitor's first value. Lets the unit tests
     /// exercise the cache-reading accessors (`link_alarm_severity`,
     /// `alarm_message`, `try_read_cached`) and the defer queue
     /// without standing up a PVA server.
     #[cfg(test)]
     pub(crate) fn for_test(config: PvaLinkConfig, cached: Option<PvField>) -> Self {
-        let client = PvaClient::builder().timeout(Duration::from_secs(1)).build();
-        Self {
-            _monitor_abort: None,
-            config,
-            client,
-            latest: Arc::new(Mutex::new(cached)),
-            monitor_connected: None,
-            notify_rx: Mutex::new(None),
-            out_scratch: Mutex::new(HashMap::new()),
-            snap_alarm: Mutex::new(HashMap::new()),
-            retry_pending: AtomicBool::new(false),
-            disconnect_time: Arc::new(Mutex::new(None)),
-            scan_overrun: Arc::new(ScanOverrun::default()),
+        let (link, channel) = Self::for_test_with_monitor_flag(config, cached);
+        if link.latest.lock().is_some() {
+            channel.up();
         }
+        link
     }
 
     /// Test-only constructor: build a [`PvaLink`] around a
@@ -1647,7 +1591,7 @@ impl PvaLink {
     /// real `write` / `write_pv_field` wire paths without UDP
     /// discovery.
     ///
-    /// The link is marked CONNECTED (`monitor_connected = Some(true)`):
+    /// The link is marked CONNECTED:
     /// a link built around a live, server-pinned client stands in for
     /// one whose channel monitor has already delivered its first event,
     /// so the OUT-write disconnect gate (`stage_and_flush`) lets non-retry
@@ -1656,24 +1600,15 @@ impl PvaLink {
     /// [`Self::for_test_with_monitor_flag`] with the flag left false.
     #[cfg(test)]
     pub(crate) fn for_test_with_client(config: PvaLinkConfig, client: PvaClient) -> Self {
-        Self {
-            _monitor_abort: None,
-            config,
-            client,
-            latest: Arc::new(Mutex::new(None)),
-            monitor_connected: Some(Arc::new(AtomicBool::new(true))),
-            notify_rx: Mutex::new(None),
-            out_scratch: Mutex::new(HashMap::new()),
-            snap_alarm: Mutex::new(HashMap::new()),
-            retry_pending: AtomicBool::new(false),
-            disconnect_time: Arc::new(Mutex::new(None)),
-            scan_overrun: Arc::new(ScanOverrun::default()),
-        }
+        let (mut link, channel) = Self::for_test_with_monitor_flag(config, None);
+        link.client = client;
+        channel.up();
+        link
     }
 
     /// Test-only constructor for a link whose live-connection flag is
     /// externally controllable (INP+monitor or OUT). Returns the link
-    /// plus the shared `AtomicBool` so a test can simulate the
+    /// plus the shared [`Connection`] so a test can simulate the
     /// re-subscribe loop's connect / event / disconnect transitions
     /// (B-pvalink-restart) without standing up a PVA server. For an OUT
     /// link, setting the flag `true` stands in for the channel monitor
@@ -1683,20 +1618,17 @@ impl PvaLink {
     pub(crate) fn for_test_with_monitor_flag(
         config: PvaLinkConfig,
         cached: Option<PvField>,
-    ) -> (Self, Arc<AtomicBool>) {
+    ) -> (Self, Arc<Connection>) {
         let client = PvaClient::builder().timeout(Duration::from_secs(1)).build();
-        let flag = Arc::new(AtomicBool::new(false));
+        let flag = Arc::new(Connection::default());
         let link = Self {
             _monitor_abort: None,
             config,
             client,
-            latest: Arc::new(Mutex::new(cached)),
-            monitor_connected: Some(flag.clone()),
+            latest: Arc::new(Mutex::new(cached.map(Arc::new))),
+            channel: flag.clone(),
             notify_rx: Mutex::new(None),
-            out_scratch: Mutex::new(HashMap::new()),
-            snap_alarm: Mutex::new(HashMap::new()),
-            retry_pending: AtomicBool::new(false),
-            disconnect_time: Arc::new(Mutex::new(None)),
+            snaps: Arc::default(),
             scan_overrun: Arc::new(ScanOverrun::default()),
         };
         (link, flag)
@@ -1708,7 +1640,13 @@ impl PvaLink {
     /// transition.
     #[cfg(test)]
     pub(crate) fn record_disconnect_time_for_test(&self, secs: i64, nsec: i32) {
-        *self.disconnect_time.lock() = Some((secs, nsec));
+        self.snaps.lock().disconnect((secs, nsec));
+    }
+
+    /// Test-only: the monitor's delivery of `value`.
+    #[cfg(test)]
+    pub(crate) fn set_latest_for_test(&self, value: PvField) {
+        *self.latest.lock() = Some(Arc::new(value));
     }
 }
 
@@ -1803,14 +1741,6 @@ fn build_put_request(proc: ProcMode, block: bool) -> PvRequestExpr {
     }
 }
 
-/// True iff `field` names a non-default sub-field (not `""` or `"value"`).
-/// When true, PUT must use `pvput_field_with_request` to target that
-/// specific field in the DATA phase. Mirrors pvxs `linkBuildPut:138`:
-/// `top[fieldName]` when `fieldName` is non-empty.
-fn is_subfield(field: &str) -> bool {
-    !field.is_empty() && field != "value"
-}
-
 /// Resolve the combined `record._options.process` mode across all
 /// fields participating in one PUT. Mirrors pvxs
 /// `pvxs/ioc/pvalink_channel.cpp:257-263`: PP/CP/CPP force processing
@@ -1835,24 +1765,8 @@ fn combine_proc(modes: impl Iterator<Item = ProcMode>) -> ProcMode {
     }
 }
 
-/// Render a queued OUT value to its PUT string form for a combined
-/// multi-field PUT. A typed `PvField` is rendered via `Display`: the
-/// combined `pvput_fields` path is the documented scalar-field
-/// coalescing case (`pvalink.rst:111-113`), while a lone typed array
-/// stays on the single-field typed path (see [`PvaLink::flush_scratch`]).
-/// The dotted field path for a staged write's `pvput_fields_typed`
-/// assignment: a root write (`""`) targets `value`.
-fn put_field_path(field: &str) -> String {
-    if field.is_empty() {
-        "value".to_string()
-    } else {
-        field.to_string()
-    }
-}
-
-/// build the pvRequest for a pvalink monitor channel (INP value monitor
-/// or OUT connection-tracking monitor — pvxs uses the same
-/// `makeRequest()` output for both).
+/// build the pvRequest for a pvalink channel's monitor (pvxs
+/// `makeRequest()`, whichever links attach to the channel).
 ///
 /// pvxs `pvaLink::makeRequest` (`pvxs/ioc/pvalink_link.cpp:49-65`) ALWAYS
 /// emits three fields on every pvalink monitor request:
@@ -1896,13 +1810,16 @@ fn monitor_request(config: &PvaLinkConfig) -> Option<epics_pva_rs::pv_request::P
 /// through nested structures). The target is the basis both for the
 /// value (see [`select_link_value`]) and for the display / control /
 /// valueAlarm metadata.
-fn select_target(root: &PvField, field: &str) -> PvField {
+fn select_target<'v>(root: &'v PvField, field: &str) -> &'v PvField {
     if field.is_empty() {
-        root.clone()
+        root
     } else {
         extract_field(root, field)
     }
 }
+
+/// What a path that names no field selects.
+static NULL_FIELD: PvField = PvField::Null;
 
 /// Select the link's *value* from the remote root, following pvxs's
 /// `pvaGetDBFtype` / `onTypeChange` rule
@@ -1918,7 +1835,7 @@ fn select_target(root: &PvField, field: &str) -> PvField {
 /// PV) is selected directly instead of being searched for a non-existent
 /// `value` child, and that an explicitly selected sub-structure drills
 /// into its own `.value`.
-fn select_link_value(root: &PvField, field: &str) -> PvField {
+fn select_link_value<'v>(root: &'v PvField, field: &str) -> &'v PvField {
     // A selected union / non-empty variant resolves to its concrete
     // member before the value is read — pvxs `value.lookup("->")`
     // (`pvxs/ioc/pvalink_lset.cpp:278-279`); the NTNDArray `value` member is a
@@ -1927,9 +1844,8 @@ fn select_link_value(root: &PvField, field: &str) -> PvField {
     match select_target(root, field).deref_selected() {
         PvField::Structure(s) => s
             .get_field("value")
-            .map(|v| v.deref_selected().clone())
-            .unwrap_or(PvField::Null),
-        other => other.clone(),
+            .map_or(&NULL_FIELD, PvField::deref_selected),
+        other => other,
     }
 }
 
@@ -1939,18 +1855,18 @@ fn select_link_value(root: &PvField, field: &str) -> PvField {
 /// member at every descent step and at the leaf (pvxs `lookup("->")`),
 /// so a path that crosses an NTNDArray-style union resolves to the
 /// active member instead of stopping at the union.
-fn extract_field(root: &PvField, path: &str) -> PvField {
+fn extract_field<'v>(root: &'v PvField, path: &str) -> &'v PvField {
     if path.is_empty() {
-        return root.deref_selected().clone();
+        return root.deref_selected();
     }
-    let mut cursor = root.clone();
+    let mut cursor = root;
     for segment in path.split('.') {
         cursor = match cursor.deref_selected() {
-            PvField::Structure(s) => s.get_field(segment).cloned().unwrap_or(PvField::Null),
-            other => return other.clone(),
+            PvField::Structure(s) => s.get_field(segment).unwrap_or(&NULL_FIELD),
+            other => return other,
         };
     }
-    cursor.deref_selected().clone()
+    cursor.deref_selected()
 }
 
 fn scalar_as_f64(field: &PvField) -> Option<f64> {
@@ -2119,8 +2035,8 @@ fn link_element_count(value_field: &PvField) -> Option<i64> {
 /// `*lo`/`*hi` buffer untouched against a record's zero-initialised
 /// limit field.
 fn limit_pair(root: &PvField, lo_path: &str, hi_path: &str) -> Option<(f64, f64)> {
-    let lo = scalar_as_f64(&extract_field(root, lo_path));
-    let hi = scalar_as_f64(&extract_field(root, hi_path));
+    let lo = scalar_as_f64(extract_field(root, lo_path));
+    let hi = scalar_as_f64(extract_field(root, hi_path));
     match (lo, hi) {
         (None, None) => None,
         (l, h) => Some((l.unwrap_or(0.0), h.unwrap_or(0.0))),
@@ -2204,7 +2120,7 @@ mod tests {
         let root = PvField::Structure(s);
         let v = extract_field(&root, "value");
         match v {
-            PvField::Scalar(ScalarValue::Double(d)) => assert_eq!(d, 1.5),
+            PvField::Scalar(ScalarValue::Double(d)) => assert_eq!(*d, 1.5),
             other => panic!("got {other:?}"),
         }
     }
@@ -2218,14 +2134,16 @@ mod tests {
         let mut root = PvStructure::new("epics:nt/NTScalar:1.0");
         root.fields
             .push(("alarm".into(), PvField::Structure(alarm)));
-        let value = extract_field(&PvField::Structure(root), "alarm.severity");
+        let root = PvField::Structure(root);
+        let value = extract_field(&root, "alarm.severity");
         assert!(matches!(value, PvField::Scalar(ScalarValue::Int(2))));
     }
 
     #[test]
     fn missing_field_returns_null() {
         let s = PvStructure::new("epics:nt/NTScalar:1.0");
-        let v = extract_field(&PvField::Structure(s), "nope");
+        let s = PvField::Structure(s);
+        let v = extract_field(&s, "nope");
         assert!(matches!(v, PvField::Null));
     }
 
@@ -2245,12 +2163,12 @@ mod tests {
         let nt = PvField::Structure(nt);
         assert!(matches!(
             select_link_value(&nt, ""),
-            PvField::Scalar(ScalarValue::Double(d)) if d == 2.5
+            PvField::Scalar(ScalarValue::Double(d)) if *d == 2.5
         ));
         // explicit field="value" yields the same scalar.
         assert!(matches!(
             select_link_value(&nt, "value"),
-            PvField::Scalar(ScalarValue::Double(d)) if d == 2.5
+            PvField::Scalar(ScalarValue::Double(d)) if *d == 2.5
         ));
 
         // Bare top-level scalar (PV whose root is not an NT structure):
@@ -2504,6 +2422,7 @@ mod tests {
             Some("member hot"),
             "message must come from the selected member"
         );
+        link.try_read_cached_with_field("member");
         assert_eq!(
             link.time_stamp("member"),
             Some((999, 7, 5)),
@@ -2524,6 +2443,7 @@ mod tests {
             "top-level NO_ALARM under MS propagates nothing"
         );
         assert_eq!(link_top.alarm_message(), None);
+        link_top.try_read_cached_with_field("");
         assert_eq!(
             link_top.time_stamp(""),
             Some((1, 0, 0)),
@@ -2591,7 +2511,7 @@ mod tests {
                 Some(nt_with_alarm(sev, Some("oops"))),
             );
             assert_eq!(link.link_alarm_severity(), Some(sev), "sev={sev}");
-            assert_eq!(link.alarm_message(), Some("oops".to_string()), "sev={sev}");
+            assert_eq!(link.alarm_message().as_deref(), Some("oops"), "sev={sev}");
         }
     }
 
@@ -2604,16 +2524,16 @@ mod tests {
         let invalid =
             PvaLink::for_test(inp_cfg(SevrMode::Msi), Some(nt_with_alarm(3, Some("dead"))));
         assert_eq!(invalid.link_alarm_severity(), Some(3));
-        assert_eq!(invalid.alarm_message(), Some("dead".to_string()));
+        assert_eq!(invalid.alarm_message().as_deref(), Some("dead"));
     }
 
     #[test]
-    fn b2_synthetic_message_when_no_alarm_message_field() {
+    fn b2_no_message_when_no_alarm_message_field() {
         // MS link, severity propagates, but the NT struct has no
-        // alarm.message — a synthetic message is returned.
+        // alarm.message — pvxs stores an empty snap_message.
         let link = PvaLink::for_test(inp_cfg(SevrMode::Ms), Some(nt_with_alarm(2, None)));
         assert_eq!(link.link_alarm_severity(), Some(2));
-        assert_eq!(link.alarm_message(), Some("remote severity 2".to_string()));
+        assert_eq!(link.alarm_message(), None);
     }
 
     #[test]
@@ -2649,14 +2569,14 @@ mod tests {
         let pre = link.remote_alarm_snapshot("").expect("connected snapshot");
         assert_eq!(pre.severity, 3); // INVALID_ALARM
         assert_eq!(pre.status, 14); // LINK_ALARM
-        assert_eq!(pre.message, "");
+        assert_eq!(&*pre.message, "");
         // a value read latches the snapshot (pvxs pvaGetValue).
         assert!(link.try_read_cached_with_field("").is_some());
         // AFTER the read: remote MINOR(1) + LINK_ALARM(14) + message.
         let post = link.remote_alarm_snapshot("").expect("connected snapshot");
         assert_eq!(post.severity, 1);
         assert_eq!(post.status, 14); // LINK_ALARM
-        assert_eq!(post.message, "hi");
+        assert_eq!(&*post.message, "hi");
     }
 
     /// `MS` link with a remote MAJOR alarm: BOTH the gated owning-record
@@ -2675,7 +2595,7 @@ mod tests {
         let snap = link.remote_alarm_snapshot("").expect("connected snapshot");
         assert_eq!(snap.severity, 2);
         assert_eq!(snap.status, 14); // LINK_ALARM
-        assert_eq!(snap.message, "oops");
+        assert_eq!(&*snap.message, "oops");
     }
 
     /// A NO_ALARM cached value yields a snapshot with severity 0, status
@@ -2694,7 +2614,7 @@ mod tests {
         let snap = link.remote_alarm_snapshot("").expect("connected snapshot");
         assert_eq!(snap.severity, 0);
         assert_eq!(snap.status, 0); // NO_ALARM
-        assert_eq!(snap.message, "", "NO_ALARM snapshot carries no message");
+        assert_eq!(&*snap.message, "", "NO_ALARM snapshot carries no message");
     }
 
     /// CHECK_VALID: a disconnected-stale monitor link serves no snapshot
@@ -2707,7 +2627,7 @@ mod tests {
             inp_cfg(SevrMode::Nms),
             Some(nt_with_alarm(2, Some("was-major"))),
         );
-        flag.store(true, Ordering::Release);
+        flag.up();
         // latch a real snapshot so the disconnect-refusal below is not
         // merely refusing the initial INVALID default.
         assert!(link.try_read_cached_with_field("").is_some());
@@ -2715,7 +2635,7 @@ mod tests {
             .remote_alarm_snapshot("")
             .expect("connected monitor serves the snapshot");
         assert_eq!(snap.severity, 2);
-        flag.store(false, Ordering::Release);
+        flag.down();
         assert!(
             link.remote_alarm_snapshot("").is_none(),
             "disconnected-stale monitor refuses the snapshot (CHECK_VALID)"
@@ -2786,13 +2706,11 @@ mod tests {
         assert!(req.record_options.iter().any(|(k, _)| k == "queueSize"));
     }
 
-    /// An OUT link's connection-tracking monitor must open with the same pvalink
-    /// pvRequest as an INP monitor — pvxs uses one `makeRequest()` output for both
-    /// directions (`pvxs/ioc/pvalink_link.cpp:49-65`,
-    /// `pvxs/ioc/pvalink_channel.cpp` channel open).
-    /// Regression for the OUT path opening a plain option-less
-    /// `pvmonitor` so the server saw no atomic/pipeline/queue
-    /// negotiation on the liveness monitor that gates OUT writes.
+    /// A channel opened by an OUT link monitors with the pvxs `makeRequest()`
+    /// pvRequest (`pvxs/ioc/pvalink_link.cpp:49-65`), as one opened by an
+    /// INP link does. Regression for an OUT-only option-less `pvmonitor`
+    /// that negotiated no atomic/pipeline/queue on the monitor that gates
+    /// OUT writes.
     #[test]
     fn out_connection_monitor_request_matches_pvxs_make_request() {
         let cfg = PvaLinkConfig {
@@ -2831,7 +2749,7 @@ mod tests {
     async fn scan_forward_on_disconnected_link_is_gated() {
         let (link, _flag) = PvaLink::for_test_with_monitor_flag(inp_cfg(SevrMode::Ms), None);
         assert!(!link.is_connected());
-        match link.scan_forward().await {
+        match link.scan_forward(link.config().retry).await {
             Err(PvaLinkError::Disconnected(_)) => {}
             other => {
                 panic!("disconnected forward must be gated to Disconnected, got {other:?}")
@@ -2846,16 +2764,14 @@ mod tests {
     /// unconditionally (`pvxs/ioc/pvalink_channel.cpp:226,266`) and lets the client
     /// hold it until the channel connects. The put here cannot succeed
     /// (no server), so what this pins is only that the failure is not the
-    /// gate's `Disconnected`.
+    /// gate's `Disconnected`. The channel is opened without `retry`: the
+    /// gate reads the forwarding link's, not the first opener's.
     #[tokio::test]
     async fn scan_forward_on_disconnected_retry_link_is_not_gated() {
-        let cfg = PvaLinkConfig {
-            retry: true,
-            ..inp_cfg(SevrMode::Ms)
-        };
-        let (link, _flag) = PvaLink::for_test_with_monitor_flag(cfg, None);
+        let (link, _flag) = PvaLink::for_test_with_monitor_flag(inp_cfg(SevrMode::Ms), None);
+        assert!(!link.config().retry);
         assert!(!link.is_connected());
-        if let Err(PvaLinkError::Disconnected(_)) = link.scan_forward().await {
+        if let Err(PvaLinkError::Disconnected(_)) = link.scan_forward(true).await {
             panic!("a retry link must skip the !valid() gate, not return Disconnected");
         }
     }
@@ -2981,6 +2897,23 @@ mod tests {
                     let subcmd = payload[8];
                     let mut p = Vec::new();
                     p.put_u32(ioid, ORDER);
+                    if subcmd & 0x40 != 0 {
+                        // GetOPut: the present value, `value` = 5 marked.
+                        p.put_u8(0x40);
+                        Status::ok().write_into(ORDER, &mut p);
+                        let mut changed = epics_pva_rs::proto::BitSet::new();
+                        changed.set(1);
+                        changed.write_into(ORDER, &mut p);
+                        p.put_f64(5.0, ORDER);
+                        if sock
+                            .write_all(&app_frame(Command::Put.code(), p))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                        continue;
+                    }
                     if subcmd & 0x08 != 0 {
                         obs.lock().unwrap().put_init_req = Some(payload[9..].to_vec());
                         p.put_u8(0x08);
@@ -2998,7 +2931,8 @@ mod tests {
                         Status::ok().write_into(ORDER, &mut p);
                         let intro = FieldDesc::Structure {
                             struct_id: "epics:nt/NTScalar:1.0".into(),
-                            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))],
+                            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))]
+                                .into(),
                         };
                         epics_pva_rs::pvdata::encode::encode_type_desc(&intro, ORDER, &mut p);
                     } else {
@@ -3029,14 +2963,15 @@ mod tests {
     /// spelled CMD_PROCESS: `pvaScanForward` is `lchan->put(true)`
     /// (`pvxs/ioc/pvalink_lset.cpp:683`), which `pvaLinkChannel::put` turns into a
     /// PUT with `record._options.process = "true"`
-    /// (`pvxs/ioc/pvalink_channel.cpp:257-263`) whose `linkBuildPut` marked no field
-    /// (`:127-184`), i.e. an EMPTY changed bitset.
+    /// (`pvxs/ioc/pvalink_channel.cpp:257-263`) whose `linkBuildPut` returns
+    /// the fetched present value untouched (`:127-184`,
+    /// `src/clientget.cpp:678-692`).
     ///
     /// Pre-fix `scan_forward` sent cmd 16; the switch above drained it and
     /// the op blocked to the client timeout, so the remote record never
     /// processed and no in-tree epics-rs-to-epics-rs test could see it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn forward_link_puts_an_empty_bitset_with_process_true() {
+    async fn forward_link_puts_the_present_value_with_process_true() {
         use epics_pva_rs::proto::ByteOrder;
         use epics_pva_rs::pvdata::{PvField, ScalarValue};
 
@@ -3051,7 +2986,7 @@ mod tests {
             client,
         );
 
-        link.scan_forward()
+        link.scan_forward(link.config().retry)
             .await
             .expect("the forward link must complete against a pvxs command switch");
 
@@ -3073,20 +3008,19 @@ mod tests {
         let req_val =
             epics_pva_rs::pvdata::encode::decode_pv_field(&req_desc, &mut cur, ByteOrder::Little)
                 .expect("pvRequest value");
-        let process = match &req_val {
-            PvField::Structure(s) => {
-                extract_field(&PvField::Structure(s.clone()), "record._options.process")
-            }
-            other => panic!("pvRequest is not a structure: {other:?}"),
-        };
+        assert!(
+            matches!(req_val, PvField::Structure(_)),
+            "pvRequest is not a structure: {req_val:?}"
+        );
+        let process = extract_field(&req_val, "record._options.process");
         assert_eq!(
-            process,
+            *process,
             PvField::Scalar(ScalarValue::String("true".into())),
             "a forced put pins record._options.process to \"true\" \
              (pvxs/ioc/pvalink_channel.cpp:258-260)"
         );
 
-        // The DATA phase marks nothing: an empty changed bitset, no value.
+        // The DATA phase is the present value as fetched, marked as fetched.
         let data = seen
             .put_data_body
             .as_ref()
@@ -3094,16 +3028,15 @@ mod tests {
         let mut cur = std::io::Cursor::new(&data[..]);
         let changed = epics_pva_rs::proto::BitSet::decode(&mut cur, ByteOrder::Little)
             .expect("changed bitset");
-        assert_eq!(
-            changed.count(),
-            0,
-            "a forward link writes no field, so linkBuildPut leaves the \
-             prototype unmarked (pvxs/ioc/pvalink_channel.cpp:127-184)"
+        assert!(
+            changed.get(1) && changed.count() == 1,
+            "a forward link sends back the readback's marks: {changed:?}"
         );
+        let rest = &data[cur.position() as usize..];
         assert_eq!(
-            cur.position() as usize,
-            data.len(),
-            "an unmarked bitset must be followed by no value bytes"
+            rest,
+            5.0f64.to_le_bytes(),
+            "the target's present value goes back unchanged"
         );
     }
 
@@ -3111,9 +3044,7 @@ mod tests {
     /// never as a silent `Ok`. pvxs raises no record alarm on this path —
     /// `linkPutDone` reports the failed put with `errlogPrintf` and carries
     /// an explicit `// TODO: signal INVALID_ALARM ?`
-    /// (`pvxs/ioc/pvalink_channel.cpp:192-195`) — so the resolver's spawned task
-    /// logs it to the console and the record stays unalarmed. The `Err`
-    /// is what gives it something to log.
+    /// (`pvxs/ioc/pvalink_channel.cpp:192-195`).
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_refused_forward_link_put_is_not_reported_as_success() {
         let obs = Arc::new(std::sync::Mutex::new(ConnSwitchObs::default()));
@@ -3127,7 +3058,7 @@ mod tests {
             client,
         );
 
-        match link.scan_forward().await {
+        match link.scan_forward(link.config().retry).await {
             Err(PvaLinkError::Pva(_)) => {}
             other => panic!("a refused forward-link put must surface, got {other:?}"),
         }
@@ -3216,7 +3147,9 @@ mod tests {
             client,
         );
 
-        link.scan_forward().await.expect("forward link fires");
+        link.scan_forward(link.config().retry)
+            .await
+            .expect("forward link fires");
 
         assert_eq!(
             processed.load(Ordering::SeqCst),
@@ -3252,14 +3185,16 @@ mod tests {
     /// live server. The disconnected case uses [`PvaLink::for_test`].
     fn connected_out(defer: bool, retry: bool) -> PvaLink {
         let (link, flag) = PvaLink::for_test_with_monitor_flag(out_cfg(defer, retry), None);
-        flag.store(true, Ordering::Release);
+        flag.up();
         link
     }
 
     /// Read the single staged value (tests stage exactly one field).
     fn sole_staged(link: &PvaLink) -> Option<QueuedPut> {
-        link.out_scratch
+        link.channel
+            .outbox
             .lock()
+            .staged
             .values()
             .next()
             .map(|s| s.value.clone())
@@ -3316,18 +3251,14 @@ mod tests {
         }
     }
 
+    /// A retry put on a down channel is held, not sent: pvxs's op waits
+    /// for the connection.
     #[tokio::test]
-    async fn b4_retry_queues_on_disconnect() {
-        // retry=true, no server reachable → write should queue rather
-        // than error, and arm the retry-pending flag for the drain.
+    async fn a_retry_put_on_a_down_channel_is_held() {
         let link = PvaLink::for_test(out_cfg(false, true), None);
-        let r = link.write("7").await;
-        assert!(r.is_ok(), "retry write should queue, got {r:?}");
-        assert_eq!(link.staged_count(), 1);
-        assert!(
-            link.retry_pending.load(Ordering::Acquire),
-            "a queued retry write must arm the production drain"
-        );
+        link.write("7").await.expect("a held put is not refused");
+        assert_eq!(link.staged_count(), 0);
+        assert!(link.put_in_flight(), "the held put is pvxs's op_put");
     }
 
     #[tokio::test]
@@ -3342,7 +3273,7 @@ mod tests {
             "non-retry write must surface a disconnect error, got {r:?}"
         );
         assert_eq!(link.staged_count(), 0);
-        assert!(!link.retry_pending.load(Ordering::Acquire));
+        assert!(!link.put_in_flight());
     }
 
     /// BRPVALINK-2 regression: a DEFERRED non-retry write to a
@@ -3371,83 +3302,81 @@ mod tests {
             0,
             "the undeliverable value must NOT occupy the scratch"
         );
-        assert!(!link.retry_pending.load(Ordering::Acquire));
+        assert!(!link.put_in_flight());
     }
 
+    /// A put that fails on a disconnect keeps nothing: pvxs's
+    /// `op_put.reset()` cancels it after `linkBuildPut` took the values
+    /// (`pvxs/ioc/pvalink_channel.cpp:362-370`). Only the non-retry write
+    /// reports it. Connected so the staging gate passes; the failure is the
+    /// real put, with no server behind the test client.
     #[tokio::test]
-    async fn b4_flush_drops_value_when_no_retry() {
-        // defer link, retry=false; staged while connected, then flushed
-        // against no server. The staged value's Put fails on disconnect
-        // → with retry=false it is dropped (it would fail identically on
-        // every replay), leaving the scratch empty and an error for the
-        // record to alarm on. Connected so the staging gate passes; the
-        // failure is the real PUT (no server behind the test client),
-        // i.e. this exercises the flush-time drop, not the stage gate.
-        let link = connected_out(true, false);
+    async fn a_disconnect_drops_a_sent_put() {
+        for retry in [false, true] {
+            let link = connected_out(true, retry);
+            link.write("1").await.unwrap();
+            link.write("2").await.unwrap();
+            assert_eq!(link.staged_count(), 1, "coalesced to the newest");
+            let r = link.put(None, retry, false, false).await;
+            assert_eq!(r.is_err(), !retry, "retry={retry}: {r:?}");
+            assert_eq!(link.staged_count(), 0, "retry={retry}");
+            assert!(!link.put_in_flight(), "retry={retry}");
+        }
+    }
+
+    /// The disconnect drops staged writes too (`pvaLink::onDisconnect`,
+    /// `pvxs/ioc/pvalink_link.cpp:75-81`); a channel never up has no
+    /// disconnect and keeps them.
+    #[tokio::test]
+    async fn a_disconnect_drops_staged_writes() {
+        let (link, channel) = PvaLink::for_test_with_monitor_flag(out_cfg(true, true), None);
         link.write("1").await.unwrap();
-        link.write("2").await.unwrap();
-        // Coalesced to one staged value ("2").
+        assert!(!channel.down(), "never up: no disconnect");
         assert_eq!(link.staged_count(), 1);
-        let r = link.flush_scratch().await;
-        assert!(r.is_err(), "no-retry disconnect surfaces an error");
+        assert!(channel.up().is_none(), "a deferred write is not a put");
+        assert!(channel.down());
         assert_eq!(link.staged_count(), 0);
-        assert!(!link.retry_pending.load(Ordering::Acquire));
+        assert_eq!(link.num_disconnect(), 1);
     }
 
+    /// A put while one is held replaces it and carries its writes, the
+    /// newest per field (`linkBuildPut` sends every queued value); the
+    /// connect hands back that one put.
     #[tokio::test]
-    async fn b4_flush_retry_restores_staged() {
-        // defer + retry: flush against no server → the staged value is
-        // restored for a later retry and the drain is armed. A queued
-        // retry is NOT an error (0 PUTs issued, queued), matching the
-        // immediate-write path.
-        let link = PvaLink::for_test(out_cfg(true, true), None);
+    async fn the_connect_releases_one_held_put() {
+        let (link, channel) = PvaLink::for_test_with_monitor_flag(out_cfg(false, true), None);
+        let other = PvaLinkConfig {
+            field: "b".into(),
+            ..out_cfg(false, true)
+        };
         link.write("1").await.unwrap();
+        link.put_out_str(&other, "9", false).await.unwrap();
         link.write("2").await.unwrap();
-        assert_eq!(link.staged_count(), 1);
-        let r = link.flush_scratch().await;
-        assert!(matches!(r, Ok(0)), "retry disconnect queues, got {r:?}");
-        // retry restores the most-recent staged value ("2").
-        assert_eq!(link.staged_count(), 1);
-        assert!(link.retry_pending.load(Ordering::Acquire));
-        match sole_staged(&link) {
-            Some(QueuedPut::Str(s)) => assert_eq!(s, "2"),
-            other => panic!("most-recent value must be restored, got {other:?}"),
-        }
+        assert!(link.put_in_flight());
+        let op = channel.up().expect("the held put");
+        assert_eq!(op.fields.len(), 2);
+        assert!(matches!(&op.fields[""].value, QueuedPut::Str(s) if s == "2"));
+        assert!(matches!(&op.fields["b"].value, QueuedPut::Str(s) if s == "9"));
+        assert!(!link.put_in_flight());
+        assert!(channel.up().is_none(), "released once");
     }
 
+    /// A forced put (a retry forward link) is held as one too, and keeps
+    /// its process override.
     #[tokio::test]
-    async fn b4_flush_retry_keeps_newer_write() {
-        // defer + retry: most-recent-PUT wins across a failing flush.
-        let link = PvaLink::for_test(out_cfg(true, true), None);
-        link.write("1").await.unwrap();
-        let r = link.flush_scratch().await;
-        assert!(matches!(r, Ok(0)));
-        // A newer write supersedes the restored "1".
-        link.write("2").await.unwrap();
-        // A second flush restores "2" (not the older "1").
-        let r2 = link.flush_scratch().await;
-        assert!(matches!(r2, Ok(0)));
-        match sole_staged(&link) {
-            Some(QueuedPut::Str(s)) => assert_eq!(s, "2"),
-            other => panic!("newer write must survive, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn b4_flush_on_inp_link_rejected() {
-        let link = PvaLink::for_test(inp_cfg(SevrMode::Nms), None);
-        assert!(matches!(
-            link.flush_scratch().await,
-            Err(PvaLinkError::NotWritable)
-        ));
+    async fn a_held_forward_link_put_keeps_its_force() {
+        let (link, channel) = PvaLink::for_test_with_monitor_flag(out_cfg(false, true), None);
+        link.scan_forward(true).await.unwrap();
+        let op = channel.up().expect("the held forward put");
+        assert!(op.fields.is_empty());
+        assert_eq!(op.proc, ProcMode::Pp);
     }
 
     #[test]
     fn b3_take_notify_rx_only_once() {
-        // INP+monitor link built via for_test has no channel (no live
-        // monitor), so take_notify_rx is None — exercised here for
-        // the OUT / non-monitor branch. The live-channel path is
-        // covered by the integration-side forwarder test.
+        // A link built via for_test has no monitor, so take_notify_rx
+        // is None. The live-channel path is covered by the
+        // integration-side forwarder test.
         let link = PvaLink::for_test(inp_cfg(SevrMode::Nms), None);
         assert!(link.take_notify_rx().is_none());
     }
@@ -3474,12 +3403,12 @@ mod tests {
         );
 
         // Monitor delivers an event → flag flips true.
-        flag.store(true, Ordering::Release);
+        flag.up();
         assert!(link.is_connected(), "live subscription reports connected");
 
         // Upstream subscription ends (IOC restart) → flag false, even
         // though `latest` still holds the stale cached value.
-        flag.store(false, Ordering::Release);
+        flag.down();
         assert!(
             link.latest_value().is_some(),
             "stale value is still cached after disconnect"
@@ -3490,7 +3419,7 @@ mod tests {
         );
 
         // Re-subscribe loop delivers a fresh event → connected again.
-        flag.store(true, Ordering::Release);
+        flag.up();
         assert!(link.is_connected(), "re-subscribe restores connected");
     }
 
@@ -3511,8 +3440,8 @@ mod tests {
             Some(nt_with_alarm(0, None)),
         );
         // Connected once, then dropped.
-        flag.store(true, Ordering::Release);
-        flag.store(false, Ordering::Release);
+        flag.up();
+        flag.down();
 
         // Value reads refuse the stale cache.
         assert!(
@@ -3554,7 +3483,7 @@ mod tests {
             inp_cfg(SevrMode::Ms),
             Some(nt_with_alarm(2, Some("hot"))),
         );
-        flag.store(true, Ordering::Release);
+        flag.up();
 
         assert!(link.read().await.is_ok(), "live monitor read succeeds");
         assert!(
@@ -3629,7 +3558,8 @@ mod tests {
 
         // Connected: both getters serve the cached metadata/timestamp
         // (the FR-13 gate is inert while connected).
-        flag.store(true, Ordering::Release);
+        flag.up();
+        link.try_read_cached_with_field("");
         assert_eq!(
             link.time_stamp(""),
             Some((1_700_000_000, 42, 0)),
@@ -3641,16 +3571,12 @@ mod tests {
             "connected monitor surfaces the cached metadata"
         );
 
-        // Disconnected: the metadata getter refuses the stale snapshot
-        // (still gated through CHECK_VALID), and the value-read time hook
-        // refuses the stale *last value* timestamp. With no disconnect
-        // event yet recorded the time hook yields None (keep local time),
-        // never the stale remote 1_700_000_000.
-        flag.store(false, Ordering::Release);
+        // Disconnected: both getters refuse the stale snapshot through
+        // CHECK_VALID.
+        flag.down();
         assert!(
             link.time_stamp("").is_none(),
-            "disconnected monitor with no recorded disconnect time keeps \
-             local time, never the stale latched remote timestamp"
+            "disconnected monitor must not serve the stale latched timestamp"
         );
         assert!(
             link.link_metadata().is_none(),
@@ -3662,16 +3588,11 @@ mod tests {
         );
 
         // Once the circuit-drop time is recorded (pvxs `snap_time =
-        // e.time`), a `time=true` read adopts THAT moment — not the
-        // stale value's 1_700_000_000 — carrying the last value's
-        // userTag (0 in this fixture). The metadata getter stays gated.
+        // e.time`), a `time=true` read writes THAT moment — not the stale
+        // value's 1_700_000_000 — while the getter stays gated.
         link.record_disconnect_time_for_test(1_800_000_500, 7);
-        assert_eq!(
-            link.time_stamp(""),
-            Some((1_800_000_500, 7, 0)),
-            "disconnected monitor adopts the disconnect-event time, not \
-             the stale remote value timestamp"
-        );
+        assert_eq!(link.snap_stamp(""), (1_800_000_500, 7, 0));
+        assert!(link.time_stamp("").is_none());
         assert!(
             link.link_metadata().is_none(),
             "metadata getter stays gated even after a disconnect time is \
@@ -3710,16 +3631,17 @@ mod tests {
         );
 
         // Connected: the full remote timestamp+tag.
-        flag.store(true, Ordering::Release);
+        flag.up();
+        link.try_read_cached_with_field("");
         assert_eq!(link.time_stamp(""), Some((1_700_000_000, 42, 0x55)));
 
         // Disconnected with a recorded drop time: adopt the drop time
         // (seconds/nanos), but keep the last value's userTag 0x55.
-        flag.store(false, Ordering::Release);
+        flag.down();
         link.record_disconnect_time_for_test(1_800_000_500, 7);
         assert_eq!(
-            link.time_stamp(""),
-            Some((1_800_000_500, 7, 0x55)),
+            link.snap_stamp(""),
+            (1_800_000_500, 7, 0x55),
             "disconnect-event time with the last value's userTag preserved"
         );
     }
@@ -3756,7 +3678,8 @@ mod tests {
                 inp_cfg(SevrMode::Nms),
                 Some(PvField::Structure(root)),
             );
-            flag.store(true, Ordering::Release);
+            flag.up();
+            link.try_read_cached_with_field("");
             link.time_stamp("").map(|(_, _, utag)| utag)
         };
 
@@ -3792,8 +3715,7 @@ mod tests {
         );
     }
 
-    /// BUG 2: a live INP+monitor link spawns the re-subscribe loop and
-    /// installs the `monitor_connected` flag. Before the first event
+    /// BUG 2: a live INP+monitor link spawns the re-subscribe loop. Before the first event
     /// the link reports disconnected (no liveness proven yet); the
     /// monitor task is present so a later disconnect is observable.
     #[tokio::test]
@@ -3812,10 +3734,6 @@ mod tests {
         )
         .await
         .expect("open INP monitor link");
-        assert!(
-            link.monitor_connected.is_some(),
-            "INP+monitor link must install the live-connection flag"
-        );
         assert!(
             !link.is_connected(),
             "no event delivered yet → not connected"
@@ -4099,8 +4017,7 @@ mod tests {
     ///
     /// On main: `build_put_request` did not exist — no pvRequest was built
     /// and `record._options.process` / `block` never reached the server.
-    /// After fix: `build_put_request` produces the correct pvRequest, and
-    /// `is_subfield` gates field-targeted vs. value-targeted dispatch.
+    /// After fix: `build_put_request` produces the correct pvRequest.
     ///
     /// pvxs parity:
     ///   pvxs/ioc/pvalink_channel.cpp:31-38 (putReq template)
@@ -4144,17 +4061,6 @@ mod tests {
             "block=false must appear in pvRequest"
         );
 
-        // field="" and field="value" are NOT sub-fields (use pvput_with_request)
-        assert!(!is_subfield(""), "empty field is not a sub-field");
-        assert!(!is_subfield("value"), "\"value\" is not a sub-field");
-
-        // field="DESC" IS a sub-field (use pvput_field_with_request)
-        assert!(
-            is_subfield("DESC"),
-            "\"DESC\" must be treated as a sub-field"
-        );
-        assert!(is_subfield("alarm.severity"), "dotted path is a sub-field");
-
         // A deferred write with field="DESC" and proc=PP queues the
         // value; when flushed the replay uses build_put_request.
         // Verify the defer path still enqueues (does not bypass).
@@ -4167,7 +4073,7 @@ mod tests {
         // Connected so the disconnect gate lets the deferred write
         // stage (we're checking the defer path enqueues, not the gate).
         let (link, flag) = PvaLink::for_test_with_monitor_flag(cfg, None);
-        flag.store(true, Ordering::Release);
+        flag.up();
         // Deferred write queues without hitting the network.
         tokio::runtime::Builder::new_current_thread()
             .build()
@@ -4216,7 +4122,7 @@ mod tests {
         pv.open(
             FieldDesc::Structure {
                 struct_id: "epics:nt/NTScalar:1.0".into(),
-                fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))],
+                fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))].into(),
             },
             PvField::Structure(PvStructure {
                 struct_id: "epics:nt/NTScalar:1.0".into(),
@@ -4299,7 +4205,8 @@ mod tests {
             fields: vec![
                 ("value".into(), FieldDesc::ScalarArray(ScalarType::Long)),
                 ("aux".into(), FieldDesc::ScalarArray(ScalarType::Long)),
-            ],
+            ]
+            .into(),
         };
         let initial = PvField::Structure(PvStructure {
             struct_id: "structure".into(),
@@ -4404,7 +4311,8 @@ mod tests {
             fields: vec![
                 ("value".into(), FieldDesc::Scalar(ScalarType::Double)),
                 ("setpoint".into(), FieldDesc::Scalar(ScalarType::Double)),
-            ],
+            ]
+            .into(),
         }
     }
 
@@ -4510,8 +4418,7 @@ mod tests {
 
     #[cfg(tokio_backend)]
     /// BRIDGE-RS defer drain: two `defer=true` writes to different fields
-    /// are held until an explicit drain (the `LinkSet::flush_puts`
-    /// production path / `flush_scratch`), then sent as ONE combined PUT
+    /// stay staged until a non-deferred put, then go as ONE combined PUT
     /// (pvxs `documentation/pvalink.rst:111-113`).
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn deferred_fields_drain_in_one_put() {
@@ -4560,8 +4467,11 @@ mod tests {
         assert_eq!(struct_double(&pre, "value"), 0.0, "nothing sent yet");
         assert_eq!(struct_double(&pre, "setpoint"), 0.0, "nothing sent yet");
 
-        // Explicit drain → one combined PUT carrying both fields.
-        let n = link.flush_scratch().await.expect("drain succeeds");
+        // A non-deferred put → one combined PUT carrying both fields.
+        let n = link
+            .put(None, false, false, false)
+            .await
+            .expect("drain succeeds");
         assert_eq!(n, 1, "two deferred fields drain as ONE upstream PUT");
         assert_eq!(link.staged_count(), 0);
 
@@ -4572,43 +4482,207 @@ mod tests {
     }
 
     #[cfg(tokio_backend)]
-    /// BRIDGE-RS retry replay: a `retry=true` write issued while the
-    /// target channel does not exist is queued (not errored), and the
-    /// `flush_puts` production drain (`flush_retry_pending`) replays it
-    /// automatically once the PV appears (pvxs `pvalink.rst:99-100`).
+    /// pvxs `linkPutDone` restarts the channel's put when one succeeds
+    /// (`pvxs/ioc/pvalink_channel.cpp:205-208`), so a deferred write staged
+    /// while a put is in flight goes out as that put completes, with no
+    /// further write (softIocPVX: `PUT 2` 2.00 s after a 2 s `PUT 1`).
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn retry_replays_after_target_pv_appears() {
+    async fn a_deferred_write_goes_out_when_the_put_ahead_of_it_completes() {
+        use epics_pva_rs::server_native::{PvaServer, SharedPV, SharedSource};
+
+        let pv = SharedPV::new();
+        pv.open(double_struct_desc(), double_struct_initial())
+            .unwrap();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (open_gate, gate) = std::sync::mpsc::channel::<()>();
+        let gate = std::sync::Mutex::new(Some(gate));
+        pv.on_put({
+            let seen = seen.clone();
+            move |_, v| {
+                seen.lock().unwrap().push(struct_double(&v, "value"));
+                // The first put stays in flight until the gate opens, its
+                // worker handed off so the runtime's timers still run.
+                if let Some(gate) = gate.lock().unwrap().take() {
+                    let _ = tokio::task::block_in_place(|| gate.recv());
+                }
+                Ok(())
+            }
+        });
+        let source = SharedSource::new();
+        source.add("SLOW:PV", pv.clone());
+        let server = PvaServer::isolated(Arc::new(source)).expect("test PVA server must start");
+        let client = PvaClient::builder()
+            .server_addr(server.tcp_addr())
+            .timeout(Duration::from_secs(3))
+            .build();
+        let out = PvaLinkConfig::defaults_for("SLOW:PV", LinkDirection::Out);
+        let deferred = PvaLinkConfig {
+            defer: true,
+            ..out.clone()
+        };
+        let link = Arc::new(PvaLink::for_test_with_client(out.clone(), client));
+        let wait_for = |n: usize| {
+            let seen = seen.clone();
+            async move {
+                let deadline = std::time::Instant::now() + Duration::from_secs(3);
+                while seen.lock().unwrap().len() < n && std::time::Instant::now() < deadline {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
+        };
+
+        let first = tokio::spawn({
+            let link = link.clone();
+            async move { link.put_out_str(&out, "1", false).await }
+        });
+        wait_for(1).await;
+        link.put_out_str(&deferred, "2", false).await.unwrap();
+        assert_eq!(link.staged_count(), 1, "the deferred write is staged");
+        open_gate.send(()).unwrap();
+        first.await.unwrap().unwrap();
+        wait_for(2).await;
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [1.0, 2.0],
+            "the deferred write goes out when the put ahead of it completes"
+        );
+        assert_eq!(link.staged_count(), 0);
+    }
+
+    /// `SLOW:PV` on an isolated server whose first put stays in flight until
+    /// the returned gate opens, then succeeds or (`refuse_first`) is refused.
+    #[cfg(tokio_backend)]
+    fn gated_put_server(
+        refuse_first: bool,
+    ) -> (
+        epics_pva_rs::server_native::PvaServer,
+        PvaClient,
+        Arc<std::sync::Mutex<Vec<f64>>>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        use epics_pva_rs::server_native::{PvaServer, SharedPV, SharedSource};
+
+        let pv = SharedPV::new();
+        pv.open(double_struct_desc(), double_struct_initial())
+            .unwrap();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (open_gate, gate) = std::sync::mpsc::channel::<()>();
+        let gate = std::sync::Mutex::new(Some(gate));
+        pv.on_put({
+            let seen = seen.clone();
+            move |_, v| {
+                seen.lock().unwrap().push(struct_double(&v, "value"));
+                if let Some(gate) = gate.lock().unwrap().take() {
+                    let _ = tokio::task::block_in_place(|| gate.recv());
+                    if refuse_first {
+                        return Err("refused".into());
+                    }
+                }
+                Ok(())
+            }
+        });
+        let source = SharedSource::new();
+        source.add("SLOW:PV", pv);
+        let server = PvaServer::isolated(Arc::new(source)).expect("test PVA server must start");
+        let client = PvaClient::builder()
+            .server_addr(server.tcp_addr())
+            .timeout(Duration::from_secs(3))
+            .build();
+        (server, client, seen, open_gate)
+    }
+
+    #[cfg(tokio_backend)]
+    /// pvxs `linkPutDone` restarts the put only when one succeeds
+    /// (`pvxs/ioc/pvalink_channel.cpp:205-208`): a deferred write staged
+    /// behind a refused put stays staged (softIocPVX: no `PUT 2`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_deferred_write_stays_staged_when_the_put_ahead_of_it_fails() {
+        let (_server, client, seen, open_gate) = gated_put_server(true);
+        let out = PvaLinkConfig::defaults_for("SLOW:PV", LinkDirection::Out);
+        let deferred = PvaLinkConfig {
+            defer: true,
+            ..out.clone()
+        };
+        let link = Arc::new(PvaLink::for_test_with_client(out.clone(), client));
+        let first = tokio::spawn({
+            let link = link.clone();
+            async move { link.put_out_str(&out, "1", false).await }
+        });
+        while seen.lock().unwrap().is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        link.put_out_str(&deferred, "2", false).await.unwrap();
+        open_gate.send(()).unwrap();
+        assert!(first.await.unwrap().is_err(), "the server refuses put 1");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(*seen.lock().unwrap(), [1.0]);
+        assert_eq!(link.staged_count(), 1, "the deferred write waits");
+    }
+
+    #[cfg(tokio_backend)]
+    /// A put that succeeds after its channel went down restarts into a held
+    /// put, as pvxs's restarted op waits for the channel, and the connect
+    /// sends it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_put_restarted_while_down_is_held_for_the_connect() {
+        let (_server, client, seen, open_gate) = gated_put_server(false);
+        let out = PvaLinkConfig::defaults_for("SLOW:PV", LinkDirection::Out);
+        let deferred_retry = PvaLinkConfig {
+            defer: true,
+            retry: true,
+            ..out.clone()
+        };
+        let link = Arc::new(PvaLink::for_test_with_client(out.clone(), client));
+        let first = tokio::spawn({
+            let link = link.clone();
+            async move { link.put_out_str(&out, "1", false).await }
+        });
+        while seen.lock().unwrap().is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(link.channel.down());
+        link.put_out_str(&deferred_retry, "2", false).await.unwrap();
+        open_gate.send(()).unwrap();
+        first.await.unwrap().unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(*seen.lock().unwrap(), [1.0], "nothing goes out while down");
+        assert_eq!(link.staged_count(), 0);
+        let held = link
+            .channel
+            .up()
+            .expect("the connect releases the restarted put");
+        send_put(&link.client, "SLOW:PV", &link.channel, held)
+            .await
+            .unwrap();
+        assert_eq!(*seen.lock().unwrap(), [1.0, 2.0]);
+    }
+
+    #[cfg(tokio_backend)]
+    /// BRIDGE-RS retry replay: a `retry=true` write issued while the
+    /// target channel does not exist is held, and goes out when the
+    /// channel's monitor connects, with no further write (pvxs's op waits
+    /// for the connection, `pvalink.rst:99-100`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_held_retry_put_goes_out_on_connect() {
         use epics_pva_rs::pvdata::{FieldDesc, ScalarType};
-        #[cfg(tokio_backend)]
-        use epics_pva_rs::server_native::PvaServer;
-        use epics_pva_rs::server_native::{SharedPV, SharedSource};
+        use epics_pva_rs::server_native::{PvaServer, SharedPV, SharedSource};
 
         // Server is up the whole time; the channel is absent at first.
         let source = Arc::new(SharedSource::new());
         let server = PvaServer::isolated(source.clone()).expect("test PVA server must start");
-        let addr = server.tcp_addr();
-
         let client = PvaClient::builder()
-            .server_addr(addr)
+            .server_addr(server.tcp_addr())
             .timeout(Duration::from_secs(2))
             .build();
         let cfg = PvaLinkConfig {
             retry: true,
             ..PvaLinkConfig::defaults_for("RETRY:PV", LinkDirection::Out)
         };
-        let link = PvaLink::for_test_with_client(cfg, client);
+        let link = PvaLink::open(cfg, client).await.expect("open");
 
-        // Channel does not exist yet → disconnect → queued, not errored.
-        link.write("42")
-            .await
-            .expect("retry write queues, not errors");
-        assert_eq!(link.staged_count(), 1, "value queued for retry");
-        assert!(
-            link.retry_pending.load(Ordering::Acquire),
-            "queued retry arms the production drain"
-        );
+        link.write("42").await.expect("a held put is not refused");
+        assert!(link.put_in_flight(), "held for the connection");
 
-        // The target PV appears.
         let pv = SharedPV::build_mailbox();
         pv.open(
             FieldDesc::Scalar(ScalarType::Double),
@@ -4617,16 +4691,220 @@ mod tests {
         .unwrap();
         source.add("RETRY:PV", pv.clone());
 
-        // Production drain replays the queued write now that it resolves.
-        let n = link.flush_retry_pending().await.expect("replay");
-        assert_eq!(n, 1, "the queued retry write replays as one PUT");
-        assert_eq!(link.staged_count(), 0);
-        assert!(!link.retry_pending.load(Ordering::Acquire));
-
-        tokio::time::sleep(Duration::from_millis(80)).await;
-        match pv.current().expect("PV value") {
-            PvField::Scalar(ScalarValue::Double(d)) => assert_eq!(d, 42.0),
-            other => panic!("expected Double 42, got {other:?}"),
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while pv.current() != Some(PvField::Scalar(ScalarValue::Double(42.0))) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the held put never went out: {:?}",
+                pv.current()
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
+        assert!(link.is_connected());
+    }
+
+    #[cfg(tokio_backend)]
+    /// pvxs masks the monitor's `Connected` (`pvalink_channel.cpp:110-112`):
+    /// a channel to a PV with no value yet is not connected, and the first
+    /// value connects it and counts one type change (`:342-353`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_first_value_connects_the_channel() {
+        use epics_pva_rs::pvdata::{FieldDesc, ScalarType};
+        use epics_pva_rs::server_native::{PvaServer, SharedPV, SharedSource};
+
+        let source = Arc::new(SharedSource::new());
+        let pv = SharedPV::new();
+        source.add("TYPE:PV", pv.clone());
+        let server = PvaServer::isolated(source).expect("test PVA server must start");
+        let client = PvaClient::builder()
+            .server_addr(server.tcp_addr())
+            .timeout(Duration::from_secs(2))
+            .build();
+        let cfg = PvaLinkConfig::defaults_for("TYPE:PV", LinkDirection::Inp);
+        let link = PvaLink::open(cfg, client.clone()).await.expect("open");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while client.report().channels_active == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the channel never connected"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!link.is_connected(), "a circuit is not a value");
+        assert_eq!(link.num_type_change(), 0);
+
+        pv.open(
+            FieldDesc::Scalar(ScalarType::Double),
+            PvField::Scalar(ScalarValue::Double(1.0)),
+        )
+        .unwrap();
+        while !link.is_connected() {
+            assert!(std::time::Instant::now() < deadline, "the value never came");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(link.num_type_change(), 1);
+    }
+
+    /// softIocPVX writes an unmarked `value` as its type default, so a
+    /// forward link that marks nothing zeroes an ai and blanks a stringin.
+    /// pvxs's own forward sends the readback back and leaves both as they were.
+    // RTEMS-EXEC-MODEL-ALLOW(1): checked - runs and passes in the exec-backend
+    // suite.
+    #[test]
+    #[ignore = "spawns pvxs softIocPVX; runs in --profile interop"]
+    fn a_forward_link_leaves_a_softiocpvx_target_value_alone() {
+        use epics_oracle_rs::ioc::{Ioc as _, PvxIoc, PvxTools};
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db = dir.path().join("fwd.db");
+        std::fs::write(
+            &db,
+            "record(ai, \"FWD:AI\") { field(VAL, \"5\") }\n\
+             record(stringin, \"FWD:SI\") { field(VAL, \"hello\") }\n",
+        )
+        .expect("write the db");
+        let tools = PvxTools::discover().expect("the pvxs tools");
+        let ioc = PvxIoc::boot(&tools, &db).expect("boot softIocPVX");
+        let addr: std::net::SocketAddr = ([127, 0, 0, 1], ioc.port()).into();
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            for pv in ["FWD:AI", "FWD:SI"] {
+                let client = PvaClient::builder()
+                    .server_addr(addr)
+                    .timeout(Duration::from_secs(5))
+                    .build();
+                let before = client.pvget(pv).await.expect("read before");
+                let link = PvaLink::for_test_with_client(
+                    PvaLinkConfig::defaults_for(pv, LinkDirection::Inp),
+                    client.clone(),
+                );
+                link.scan_forward(true).await.expect("forward link fires");
+                let after = client.pvget(pv).await.expect("read after");
+                let value = |v: &PvField| match v {
+                    PvField::Structure(s) => s.get_field("value").cloned(),
+                    _ => None,
+                };
+                assert_eq!(value(&after), value(&before), "{pv}");
+            }
+        });
+    }
+
+    /// pvxs builds a pvalink PUT from the `GetOPut` readback, so a write
+    /// to one member of a softIocPVX group sends the others back marked
+    /// and the group put rewrites and processes them too: here member `b`
+    /// processes and its FLNK counts.
+    // RTEMS-EXEC-MODEL-ALLOW(1): checked - runs and passes in the exec-backend
+    // suite.
+    #[test]
+    #[ignore = "spawns pvxs softIocPVX; runs in --profile interop"]
+    fn a_group_member_write_rewrites_the_other_marked_members() {
+        use epics_oracle_rs::ioc::{Ioc as _, PvxIoc, PvxTools};
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db = dir.path().join("grp.db");
+        std::fs::write(
+            &db,
+            "record(ao, \"GRP:A\") { field(VAL, \"1\")\n\
+               info(Q:group, {\"GRP:G\":{\"a\":{\"+channel\":\"VAL\", \"+putorder\":0}}}) }\n\
+             record(ao, \"GRP:B\") { field(VAL, \"2\") field(FLNK, \"GRP:CNT\")\n\
+               info(Q:group, {\"GRP:G\":{\"b\":{\"+channel\":\"VAL\", \"+putorder\":1}}}) }\n\
+             record(calc, \"GRP:CNT\") { field(INPA, \"GRP:CNT\") field(CALC, \"A+1\") }\n",
+        )
+        .expect("write the db");
+        let tools = PvxTools::discover().expect("the pvxs tools");
+        let ioc = PvxIoc::boot(&tools, &db).expect("boot softIocPVX");
+        let addr: std::net::SocketAddr = ([127, 0, 0, 1], ioc.port()).into();
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let client = PvaClient::builder()
+                .server_addr(addr)
+                .timeout(Duration::from_secs(5))
+                .build();
+            let mut cfg = PvaLinkConfig::defaults_for("GRP:G", LinkDirection::Out);
+            cfg.field = "a".into();
+            cfg.proc = ProcMode::Pp;
+            let link = PvaLink::for_test_with_client(cfg, client.clone());
+            link.write("7").await.expect("member write");
+            let value = |v: PvField| match v {
+                PvField::Structure(s) => match s.get_field("value") {
+                    Some(PvField::Scalar(ScalarValue::Double(d))) => Some(*d),
+                    _ => None,
+                },
+                _ => None,
+            };
+            let a = value(client.pvget("GRP:A").await.expect("read A"));
+            let b = value(client.pvget("GRP:B").await.expect("read B"));
+            let cnt = value(client.pvget("GRP:CNT").await.expect("read CNT"));
+            assert_eq!(a, Some(7.0));
+            assert_eq!(b, Some(2.0));
+            assert_eq!(cnt, Some(1.0), "member b was not rewritten");
+        });
+    }
+
+    /// pvxs `linkBuildPut` assigns a scalar to `value.index` when the target
+    /// `value` is an `enum_t` (`pvalink_channel.cpp:152-154`): a softIocPVX
+    /// longout linked to an mbbo with 2 leaves the mbbo at index 2.
+    // RTEMS-EXEC-MODEL-ALLOW(1): checked - runs and passes in the exec-backend
+    // suite.
+    #[test]
+    #[ignore = "spawns pvxs softIocPVX; runs in --profile interop"]
+    fn a_scalar_put_to_an_enum_target_writes_its_index() {
+        use epics_oracle_rs::ioc::{Ioc as _, PvxIoc, PvxTools};
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db = dir.path().join("enum.db");
+        std::fs::write(
+            &db,
+            "record(mbbo, \"ENUM:MB\") { field(ZRST, \"A\") field(ONST, \"B\")\n\
+               field(TWST, \"C\") field(VAL, \"0\") }\n",
+        )
+        .expect("write the db");
+        let tools = PvxTools::discover().expect("the pvxs tools");
+        let ioc = PvxIoc::boot(&tools, &db).expect("boot softIocPVX");
+        let addr: std::net::SocketAddr = ([127, 0, 0, 1], ioc.port()).into();
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let client = PvaClient::builder()
+                .server_addr(addr)
+                .timeout(Duration::from_secs(5))
+                .build();
+            let index = async || match client.pvget("ENUM:MB").await.expect("read MB") {
+                PvField::Structure(s) => match s.get_field("value") {
+                    Some(PvField::Structure(e)) => e.get_field("index").cloned(),
+                    _ => None,
+                },
+                _ => None,
+            };
+            let mut cfg = PvaLinkConfig::defaults_for("ENUM:MB", LinkDirection::Out);
+            cfg.proc = ProcMode::Pp;
+            let link = PvaLink::for_test_with_client(cfg.clone(), client.clone());
+            link.write_pv_field(&PvField::Scalar(ScalarValue::Int(2)))
+                .await
+                .expect("typed write");
+            assert_eq!(index().await, Some(PvField::Scalar(ScalarValue::Int(2))));
+            let link = PvaLink::for_test_with_client(cfg.clone(), client.clone());
+            link.write("1").await.expect("text write");
+            assert_eq!(index().await, Some(PvField::Scalar(ScalarValue::Int(1))));
+            // An ao source stages a double; the index takes it converted.
+            let link = PvaLink::for_test_with_client(cfg, client.clone());
+            link.write_pv_field(&PvField::Scalar(ScalarValue::Double(2.0)))
+                .await
+                .expect("double write");
+            assert_eq!(index().await, Some(PvField::Scalar(ScalarValue::Int(2))));
+        });
     }
 }

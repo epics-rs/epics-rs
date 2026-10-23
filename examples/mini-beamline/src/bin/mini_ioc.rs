@@ -22,7 +22,9 @@ use std::sync::Arc;
 
 use epics_base_rs::error::CaResult;
 use epics_base_rs::server::iocsh::registry::*;
+use epics_base_rs::server::record::{DbLinkType, DevSup, Dset};
 use epics_ca_rs::server::ioc_app::IocApplication;
+use epics_libcom_rs::cfmt::CFloat;
 
 use ad_core_rs::ioc::{PluginManager, register_noop_commands};
 use ad_core_rs::plugin::channel::NDArrayOutput;
@@ -35,6 +37,22 @@ use mini_beamline::moving_dot::driver::{MovingDotRuntime, create_moving_dot_with
 use mini_beamline::physics::{BeamCurrentConfig, DetectorMode, MovingDotImageConfig};
 use mini_beamline::point_detector::{self, PointDetectorRuntime};
 use mini_beamline::random_waveform::ioc_support::RandomWaveformFactory;
+
+// The two DTYPs this binary serves, as the `device()` lines a C IOC's .dbd
+// would declare for them.
+static MINI_BEAM_CURRENT: DevSup = DevSup {
+    name: "devAiMiniBeamCurrent",
+    choice: "miniBeamCurrent",
+    link_type: DbLinkType::Constant,
+    dset: Dset::new(6, &[2, 3, 4], false),
+};
+
+static MINI_RANDOM_WAVEFORM: DevSup = DevSup {
+    name: "devWfMiniRandom",
+    choice: "miniRandomWaveform",
+    link_type: DbLinkType::Constant,
+    dset: Dset::new(5, &[2, 4], false),
+};
 
 // ============================================================================
 // Environment helpers
@@ -111,9 +129,9 @@ async fn main() -> CaResult<()> {
     let args: Vec<String> = std::env::args().collect();
 
     // Set macro paths so st.cmd can resolve $(MINI_BEAMLINE)/db/..., $(ADCORE)/ioc/..., $(OPTICS)/db/...
-    epics_base_rs::runtime::env::set_default("MINI_BEAMLINE", env!("CARGO_MANIFEST_DIR"));
-    epics_base_rs::runtime::env::set_default("ADCORE", ad_core_rs::AD_CORE_DIR);
-    epics_base_rs::runtime::env::set_default(
+    epics_base_rs::runtime::env::set_default_path("MINI_BEAMLINE", env!("CARGO_MANIFEST_DIR"));
+    epics_base_rs::runtime::env::set_default_path("ADCORE", ad_core_rs::AD_CORE_DIR);
+    epics_base_rs::runtime::env::set_default_path(
         "OPTICS",
         optics_rs::OPTICS_DB_DIR.trim_end_matches("/db"),
     );
@@ -121,7 +139,7 @@ async fn main() -> CaResult<()> {
     let script = if args.len() > 1 && !args[1].starts_with('-') {
         args[1].clone()
     } else {
-        eprintln!("Usage: mini_ioc <st.cmd>");
+        epics_libcom_rs::stderr_println!("Usage: mini_ioc <st.cmd>");
         std::process::exit(1);
     };
 
@@ -164,7 +182,7 @@ async fn main() -> CaResult<()> {
             "miniBeamlineConfig",
             vec![],
             "miniBeamlineConfig - Configure mini beamline IOC",
-            move |_args: &[ArgValue], _ctx: &CommandContext| {
+            move |_args: &[ArgValue], ctx: &CommandContext| {
                 println!("miniBeamlineConfig: setting up beamline...");
 
                 // --- Beam current: background thread producing sine-wave values ---
@@ -176,7 +194,10 @@ async fn main() -> CaResult<()> {
                 let beam_interval = env_u64("BEAM_UPDATE_MS", 100);
                 println!(
                     "  Beam config: offset={}, amp={}, period={}s, interval={}ms",
-                    beam_config.offset, beam_config.amplitude, beam_config.period, beam_interval
+                    CFloat(beam_config.offset).g(),
+                    CFloat(beam_config.amplitude).g(),
+                    CFloat(beam_config.period).g(),
+                    beam_interval
                 );
 
                 let (_beam_jh, beam_rx) = beam_current::start_beam_current_thread(
@@ -194,10 +215,13 @@ async fn main() -> CaResult<()> {
                     ("PD_SLIT", DetectorMode::Slit),
                 ];
                 for (port, mode) in &pd_configs {
-                    let rt = point_detector::create_point_detector(port, *mode)
+                    let claim =
+                        asyn_rs::manager::claim_port_driver(port).map_err(|e| e.to_string())?;
+                    let rt = point_detector::create_point_detector(&claim, *mode)
                         .map_err(|e| format!("failed to create PointDetector {port}: {e}"))?;
                     let port_handle = rt.port_handle().clone();
-                    asyn_rs::asyn_record::register_port(port, port_handle)
+                    claim
+                        .publish(port_handle, ctx.db().scan_control().interrupt_gate())
                         .map_err(|e| e.to_string())?;
                     h.pd_runtimes.lock().unwrap().insert(port.to_string(), rt);
                     println!("  PointDetector '{port}' created");
@@ -217,15 +241,17 @@ async fn main() -> CaResult<()> {
                     "  MovingDot config: {}x{}, sigma=({},{}), bg={}, N/I/s={}",
                     dot_size_x,
                     dot_size_y,
-                    dot_image_config.sigma_x,
-                    dot_image_config.sigma_y,
-                    dot_image_config.background,
-                    dot_image_config.n_per_i_per_s
+                    CFloat(dot_image_config.sigma_x).g(),
+                    CFloat(dot_image_config.sigma_y).g(),
+                    CFloat(dot_image_config.background).g(),
+                    CFloat(dot_image_config.n_per_i_per_s).g()
                 );
 
+                let dot_claim =
+                    asyn_rs::manager::claim_port_driver("DOT").map_err(|e| e.to_string())?;
                 let dot_output = NDArrayOutput::new();
                 let dot_rt = create_moving_dot_with_config(
-                    "DOT",
+                    &dot_claim,
                     dot_size_x,
                     dot_size_y,
                     dot_max_mem,
@@ -234,7 +260,8 @@ async fn main() -> CaResult<()> {
                 )
                 .map_err(|e| format!("failed to create MovingDot: {e}"))?;
                 let dot_handle = dot_rt.port_handle().clone();
-                asyn_rs::asyn_record::register_port("DOT", dot_handle)
+                dot_claim
+                    .publish(dot_handle, ctx.db().scan_control().interrupt_gate())
                     .map_err(|e| e.to_string())?;
 
                 // Connect MovingDot as the data source for the plugin chain
@@ -294,7 +321,7 @@ async fn main() -> CaResult<()> {
 
     {
         let h = holder.clone();
-        app = app.register_device_support("miniBeamCurrent", move || {
+        app = app.register_device_support("ai", &MINI_BEAM_CURRENT, move || {
             let rx = h
                 .beam_rx
                 .lock()
@@ -315,9 +342,19 @@ async fn main() -> CaResult<()> {
     // bundle is atomic per-cycle, the CA stream is per-record.
     // ========================================================================
     {
+        use epics_base_rs::server::ioc_app::{InitHookState, init_hook_register};
         let factory = Arc::new(RandomWaveformFactory::new_with_count(10_000, 10));
-        factory.register_pva_bundle("mini:wf:bundle", "wf");
-        app = app.register_device_support("miniRandomWaveform", move || factory.make());
+        // At iocInit, once the registrar has bound the pvxs server.
+        let bundle = factory.clone();
+        init_hook_register(Arc::new(move |state| {
+            if state == InitHookState::AtBeginning
+                && let Err(e) = bundle.register_pva_bundle("mini:wf:bundle", "wf")
+            {
+                epics_libcom_rs::stderr_println!("mini:wf:bundle: {e}");
+            }
+        }));
+        app =
+            app.register_device_support("waveform", &MINI_RANDOM_WAVEFORM, move || factory.make());
     }
     // PointDetector and MovingDot records now use standard asyn DTYPs
     // (asynFloat64, asynInt32) with @asyn(PORT,...) links. The universal
@@ -340,10 +377,13 @@ async fn main() -> CaResult<()> {
     // + configuration in st.cmd (simMotorCreate + dbLoadRecords per motor).
     // ========================================================================
 
-    epics_base_rs::runtime::env::set_default("MOTOR", motor_rs::MOTOR_IOC_DIR);
+    epics_base_rs::runtime::env::set_default_path("MOTOR", motor_rs::MOTOR_IOC_DIR);
     let motor_holder = SimMotorHolder::new();
     app = app.register_startup_command(motor_holder.sim_motor_create_command());
-    app = app.register_dynamic_device_support(motor_holder.device_support_factory());
+    app = app.register_dynamic_device_support(
+        &motor_rs::devices::devices(),
+        motor_rs::devices::device_support_factory(),
+    );
 
     // ========================================================================
     // Optics serial device drivers (SimHsc slit, SimQxbpm beam position monitor)
@@ -393,14 +433,19 @@ async fn main() -> CaResult<()> {
         "seqStart program macros - Start an optics SNL program",
         move |args: &[ArgValue], ctx: &CommandContext| {
             let program = match &args[0] {
-                ArgValue::String(s) => s.clone(),
+                ArgValue::String(s) => s.to_str()?.to_owned(),
                 _ => return Err("expected program name".into()),
             };
             let macros = match &args[1] {
-                ArgValue::String(s) => s.clone(),
+                ArgValue::String(s) => s.to_str()?.to_owned(),
                 _ => return Err("expected macros string".into()),
             };
-            optics_rs::seq_runner::seq_start(&program, &macros, ctx.bridge(), ctx.db())?;
+            // seq_cmd.c:162: a plain printf, and no error status.
+            if let Err(e) =
+                optics_rs::seq_runner::seq_start(&program, &macros, ctx.bridge(), ctx.db())
+            {
+                ctx.console_println(&e);
+            }
             Ok(CommandOutcome::Continue)
         },
     ));
@@ -433,25 +478,15 @@ async fn main() -> CaResult<()> {
     // The runner paired with the two protocol registrars, because `casr` and
     // `pvxsr` have to answer from the script's first line and `.run(runner)`
     // reaches only the interactive shell.
-    epics_bridge_rs::qsrv::run_ca_pva_qsrv_ioc_app(
-        app.startup_script(&script)
-            // External links resolve with zero further setup: both link sets
-            // install at the base `AfterCaLinkInit` hook — before
-            // `setup_cp_links` warms Passive CP holders and before the iocInit
-            // external-link wait — the `ca` and `pva` link sets.
-            .register_link_set_installer(epics_ca_rs::calink::calink_link_set_install)
-            .register_link_set_installer(epics_bridge_rs::qsrv::pvalink_link_set_install),
-    )
-    .await
+    epics_bridge_rs::qsrv::run_ca_pva_qsrv_ioc_app(app.startup_script(&script)).await
 }
 
 /// The `exec_backend` arm: the dual-protocol runner this IOC hands its
 /// `IocApplication` to is compiled only on the tokio backend.
 #[cfg(exec_backend)]
 fn main() -> CaResult<()> {
-    eprintln!(
+    epics_base_rs::runtime::task::refuse_backend(
         "mini_ioc needs the tokio backend; this build selects the \
-         reactor-free execution model (EPICS_RS_BUILD_EXEC_BACKEND=thread)."
-    );
-    Ok(())
+         reactor-free execution model (EPICS_RS_BUILD_EXEC_BACKEND=thread).",
+    )
 }

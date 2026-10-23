@@ -106,7 +106,7 @@ async fn r15_65_ivoa_ivov_overwrites_val_and_posts_it() {
     );
     let posted = val_rx.try_recv().expect("VAL must post on the IVOV cycle");
     assert_eq!(
-        posted.snapshot.value,
+        posted.value().as_value().cloned().unwrap(),
         EpicsValue::Double(9.0),
         "monitor() posts VAL after the IVOV assignment (dfanoutRecord.c:283-299)"
     );

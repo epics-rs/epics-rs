@@ -1,0 +1,165 @@
+rec0: Oxford_CS800.proto restart(1,2,3,4,5,6,7,8,9) P
+restart {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 2000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 100; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "\x00\x0a\x00\x00\x00\x00%<sum8>";
+}
+rec1: Oxford_CS800.proto ramp(1,2,3,4,5,6,7,8,9) P
+ramp {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 2000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 100; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "\x00\x0b%(1RRATEH.RVAL)r%(1RRATEL.RVAL)r%(1RTEMPH.RVAL)r%(1RTEMPL.RVAL)r%<sum8>";
+}
+rec2: Oxford_CS800.proto plat(1,2,3,4,5,6,7,8,9) P
+plat {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 2000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 100; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "\x00\x0c%(1PTIMEH.RVAL)r%(1PTIMEL.RVAL)r\x00\x00%<sum8>";
+}
+rec3: Oxford_CS800.proto hold(1,2,3,4,5,6,7,8,9) P
+hold {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 2000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 100; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "\x00\x0d\x00\x00\x00\x00%<sum8>";
+}
+rec4: Oxford_CS800.proto cool(1,2,3,4,5,6,7,8,9) P
+cool {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 2000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 100; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "\x00\x0e%(1CTEMPH.RVAL)r%(1CTEMPL.RVAL)r\x00\x00%<sum8>";
+}
+rec5: Oxford_CS800.proto end(1,2,3,4,5,6,7,8,9) P
+end {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 2000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 100; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "\x00\x0f%(1ERATEH.RVAL)r%(1ERATEL.RVAL)r\x00\x00%<sum8>";
+}
+rec6: Oxford_CS800.proto purge(1,2,3,4,5,6,7,8,9) P
+purge {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 2000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 100; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "\x00\x10\x00\x00\x00\x00%<sum8>";
+}
+rec7: Oxford_CS800.proto pause(1,2,3,4,5,6,7,8,9) P
+pause {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 2000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 100; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "\x00\x11\x00\x00\x00\x00%<sum8>";
+}
+rec8: Oxford_CS800.proto resume(1,2,3,4,5,6,7,8,9) P
+resume {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 2000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 100; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "\x00\x12\x00\x00\x00\x00%<sum8>";
+}
+rec9: Oxford_CS800.proto stop(1,2,3,4,5,6,7,8,9) P
+stop {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 2000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 100; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "\x00\x13\x00\x00\x00\x00\x13";
+}
+rec10: Oxford_CS800.proto turbo(1,2,3,4,5,6,7,8,9) P
+turbo {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 2000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 100; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "\x00\x14\x00%(1TURBO.RVAL)r\x00\x00%<sum8>";
+}

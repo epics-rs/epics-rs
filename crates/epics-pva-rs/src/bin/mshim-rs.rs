@@ -35,7 +35,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket as StdUdpSocket};
 use std::sync::Arc;
 
 use clap::Parser;
-use epics_base_rs::net::IfaceMap;
+use epics_base_rs::net::{IfaceMap, PortOrigin, PortUse};
 use epics_pva_rs::cli;
 #[cfg(tokio_backend)]
 use epics_pva_rs::server_native::udp::ForwardableDatagram;
@@ -132,6 +132,8 @@ fn parse_endpoint(s: &str, default_port: u16) -> Result<Endpoint, String> {
     if port == 0 {
         return Err("non-zero port number required".into());
     }
+    let iface =
+        epics_pva_rs::config::IfaceMap::current().normalize(SocketAddr::new(ip, port), iface);
     Ok(Endpoint {
         ip,
         port,
@@ -142,11 +144,6 @@ fn parse_endpoint(s: &str, default_port: u16) -> Result<Endpoint, String> {
 
 fn bind_listen(ep: &Endpoint) -> std::io::Result<UdpSocket> {
     let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
-    sock.set_reuse_address(true)?;
-    #[cfg(unix)]
-    {
-        let _ = sock.set_reuse_port(true);
-    }
     sock.set_broadcast(true)?;
     sock.set_nonblocking(true)?;
     // Multicast groups must bind 0.0.0.0; unicast/broadcast bind to
@@ -156,17 +153,15 @@ fn bind_listen(ep: &Endpoint) -> std::io::Result<UdpSocket> {
     } else {
         SocketAddr::new(ep.ip, ep.port)
     };
-    sock.bind(&bind_addr.into())?;
+    PortUse::Shared.bind(&sock, bind_addr, PortOrigin::Configured)?;
     if let IpAddr::V4(v4) = ep.ip
         && v4.is_multicast()
     {
-        // `@iface`: scope the group join to the named interface, by
-        // its IPv4 address. Without it the kernel picks the default.
-        let join_iface = match &ep.iface {
-            Some(spec) => cli::resolve_iface_ipv4(spec)
-                .map_err(|e| std::io::Error::new(ErrorKind::InvalidInput, e))?,
-            None => Ipv4Addr::UNSPECIFIED,
-        };
+        // pvxs `SockEndpoint::resolve`: the `@iface` interface's address,
+        // the wildcard when it names none or none that resolves.
+        let join_iface = ep.iface.as_deref().map_or(Ipv4Addr::UNSPECIFIED, |n| {
+            epics_pva_rs::config::IfaceMap::current().address_of_v4(n)
+        });
         sock.join_multicast_v4(&v4, &join_iface)?;
     }
     let std_sock: StdUdpSocket = sock.into();
@@ -254,11 +249,10 @@ async fn main() {
     let default_port = args
         .port
         .or_else(|| {
-            std::env::var("EPICS_PVA_BROADCAST_PORT")
-                .ok()
+            epics_base_rs::runtime::env::get_lossy("EPICS_PVA_BROADCAST_PORT")
                 // pvxs-compatible port parse (uint64 + low-16 truncate,
                 // whitespace-tolerant) instead of a strict u16 parse.
-                .and_then(|s| epics_pva_rs::config::env::parse_port_env(&s))
+                .and_then(|s| epics_pva_rs::config::env::parse_port_env(&s).ok())
         })
         .unwrap_or(5076);
 
@@ -266,7 +260,9 @@ async fn main() {
     // (`-p 0` or `EPICS_PVA_BROADCAST_PORT=0`) cannot be a meaningful
     // PVA broadcast/search port (mshim.cpp:70-72).
     if default_port == 0 {
-        eprintln!("mshim-rs: non-zero port number required (got -p/EPICS_PVA_BROADCAST_PORT 0)");
+        epics_libcom_rs::stderr_println!(
+            "mshim-rs: non-zero port number required (got -p/EPICS_PVA_BROADCAST_PORT 0)"
+        );
         std::process::exit(2);
     }
 
@@ -278,7 +274,7 @@ async fn main() {
     {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("mshim-rs: {e}");
+            epics_libcom_rs::stderr_println!("mshim-rs: {e}");
             std::process::exit(2);
         }
     };
@@ -290,34 +286,22 @@ async fn main() {
     {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("mshim-rs: {e}");
+            epics_libcom_rs::stderr_println!("mshim-rs: {e}");
             std::process::exit(2);
         }
     };
 
-    // Resolve each forward destination's `@iface` up-front so a bad
-    // interface name fails fast rather than per-datagram.
-    let forward_targets: Vec<ForwardTarget> = match forward
+    // Each forward destination's `@iface` resolved once, the wildcard when
+    // it names none that resolves (warned about at parse, as pvxs does).
+    let ifmap = epics_pva_rs::config::IfaceMap::current();
+    let forward_targets: Vec<ForwardTarget> = forward
         .iter()
-        .map(|e| {
-            let iface_v4 = match &e.iface {
-                Some(spec) => Some(cli::resolve_iface_ipv4(spec)?),
-                None => None,
-            };
-            Ok(ForwardTarget {
-                addr: SocketAddr::new(e.ip, e.port),
-                ttl: e.ttl,
-                iface_v4,
-            })
+        .map(|e| ForwardTarget {
+            addr: SocketAddr::new(e.ip, e.port),
+            ttl: e.ttl,
+            iface_v4: e.iface.as_deref().map(|n| ifmap.address_of_v4(n)),
         })
-        .collect::<Result<Vec<_>, String>>()
-    {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("mshim-rs: forward interface: {e}");
-            std::process::exit(2);
-        }
-    };
+        .collect();
 
     // Build the send socket via socket2 so we can set per-socket
     // multicast options (TTL / outbound interface). Tokio requires
@@ -325,21 +309,21 @@ async fn main() {
     let send_socket = match Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("mshim-rs: create send socket: {e}");
+            epics_libcom_rs::stderr_println!("mshim-rs: create send socket: {e}");
             std::process::exit(1);
         }
     };
     if let Err(e) = send_socket.bind(&SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0).into())
     {
-        eprintln!("mshim-rs: bind send socket: {e}");
+        epics_libcom_rs::stderr_println!("mshim-rs: bind send socket: {e}");
         std::process::exit(1);
     }
     if let Err(e) = send_socket.set_nonblocking(true) {
-        eprintln!("mshim-rs: send socket set_nonblocking: {e}");
+        epics_libcom_rs::stderr_println!("mshim-rs: send socket set_nonblocking: {e}");
         std::process::exit(1);
     }
     if let Err(e) = send_socket.set_broadcast(true) {
-        eprintln!("mshim-rs: set_broadcast: {e}");
+        epics_libcom_rs::stderr_println!("mshim-rs: set_broadcast: {e}");
     }
     // mshim uses a single shared send socket. `IP_MULTICAST_TTL` /
     // `IP_MULTICAST_IF` are setsockopt state on that socket, so the
@@ -350,7 +334,7 @@ async fn main() {
     let send_sock = match UdpSocket::from_std(send_sock_std) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("mshim-rs: send socket from_std: {e}");
+            epics_libcom_rs::stderr_println!("mshim-rs: send socket from_std: {e}");
             std::process::exit(1);
         }
     };
@@ -365,12 +349,12 @@ async fn main() {
             // Without the snapshot every forwarded broadcast would be
             // misclassified as unicast, so this is fatal rather than an
             // empty set that silently changes the forwarding decision.
-            eprintln!("mshim-rs: interface enumeration: {e}");
+            epics_libcom_rs::stderr_println!("mshim-rs: interface enumeration: {e}");
             std::process::exit(1);
         }
     };
 
-    eprintln!(
+    epics_libcom_rs::stderr_println!(
         "mshim-rs: listening on {} endpoint(s), forwarding to {} target(s)",
         listen.len(),
         forward.len()
@@ -381,9 +365,14 @@ async fn main() {
             extras.push(format!("iface={i}"));
         }
         if extras.is_empty() {
-            eprintln!("  listen {}:{}", ep.ip, ep.port);
+            epics_libcom_rs::stderr_println!("  listen {}:{}", ep.ip, ep.port);
         } else {
-            eprintln!("  listen {}:{} [{}]", ep.ip, ep.port, extras.join(" "));
+            epics_libcom_rs::stderr_println!(
+                "  listen {}:{} [{}]",
+                ep.ip,
+                ep.port,
+                extras.join(" ")
+            );
         }
     }
     for (ep, tgt) in forward.iter().zip(forward_targets.iter()) {
@@ -395,9 +384,14 @@ async fn main() {
             extras.push(format!("iface={i}"));
         }
         if extras.is_empty() {
-            eprintln!("  forward → {}:{}", ep.ip, ep.port);
+            epics_libcom_rs::stderr_println!("  forward → {}:{}", ep.ip, ep.port);
         } else {
-            eprintln!("  forward → {}:{} [{}]", ep.ip, ep.port, extras.join(" "));
+            epics_libcom_rs::stderr_println!(
+                "  forward → {}:{} [{}]",
+                ep.ip,
+                ep.port,
+                extras.join(" ")
+            );
         }
     }
 
@@ -406,7 +400,7 @@ async fn main() {
         let sock = match bind_listen(&ep) {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("mshim-rs: bind {}:{}: {e}", ep.ip, ep.port);
+                epics_libcom_rs::stderr_println!("mshim-rs: bind {}:{}: {e}", ep.ip, ep.port);
                 std::process::exit(1);
             }
         };
@@ -464,10 +458,13 @@ async fn main() {
                                 // (notably `IP_MULTICAST_IF`).
                                 let sref = SockRef::from(send_sock.as_ref());
                                 if let Err(e) = sref.set_multicast_ttl_v4(ttl) {
-                                    eprintln!("mshim-rs: set multicast ttl for {}: {e}", tgt.addr);
+                                    epics_libcom_rs::stderr_println!(
+                                        "mshim-rs: set multicast ttl for {}: {e}",
+                                        tgt.addr
+                                    );
                                 }
                                 if let Err(e) = sref.set_multicast_if_v4(&iface) {
-                                    eprintln!(
+                                    epics_libcom_rs::stderr_println!(
                                         "mshim-rs: set multicast iface for {}: {e}",
                                         tgt.addr
                                     );
@@ -477,12 +474,19 @@ async fn main() {
                             if let Err(e) = send_sock.send_to(&frame, tgt.addr).await
                                 && e.kind() != ErrorKind::WouldBlock
                             {
-                                eprintln!("mshim-rs: forward to {}: {e}", tgt.addr);
+                                epics_libcom_rs::stderr_println!(
+                                    "mshim-rs: forward to {}: {e}",
+                                    tgt.addr
+                                );
                             }
                         }
                     }
                     Err(e) => {
-                        eprintln!("mshim-rs: recv on {}:{}: {e}", ep.ip, ep.port);
+                        epics_libcom_rs::stderr_println!(
+                            "mshim-rs: recv on {}:{}: {e}",
+                            ep.ip,
+                            ep.port
+                        );
                         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                     }
                 }
@@ -495,7 +499,7 @@ async fn main() {
     tokio::select! {
         _ = futures_join_all(handles) => {}
         _ = tokio::signal::ctrl_c() => {
-            eprintln!("mshim-rs: shutting down");
+            epics_libcom_rs::stderr_println!("mshim-rs: shutting down");
         }
     }
 }
@@ -512,12 +516,11 @@ async fn futures_join_all(handles: Vec<tokio::task::JoinHandle<()>>) {
 /// mshim.
 #[cfg(exec_backend)]
 fn main() -> std::process::ExitCode {
-    eprintln!(
+    epics_base_rs::runtime::task::refuse_backend(
         "mshim-rs: this build selects the reactor-free execution backend \
          (EPICS_RS_BUILD_EXEC_BACKEND=thread), and the UDP forwarder needs a \
-         tokio reactor. Unset that variable and rebuild."
-    );
-    std::process::ExitCode::FAILURE
+         tokio reactor. Unset that variable and rebuild.",
+    )
 }
 
 #[cfg(test)]

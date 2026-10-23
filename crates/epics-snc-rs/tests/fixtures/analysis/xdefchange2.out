@@ -1,0 +1,6 @@
+$ snc xdefchange2.st
+xdefchange2.st:7: error: state change statement not allowed here
+$ snc +W xdefchange2.st
+xdefchange2.st:7: error: state change statement not allowed here
+$ snc -w xdefchange2.st
+xdefchange2.st:7: error: state change statement not allowed here

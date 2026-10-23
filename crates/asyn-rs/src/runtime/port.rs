@@ -2,6 +2,8 @@
 
 use std::sync::Arc;
 
+use epics_libcom_rs::runtime::task::{MandatoryThread, StackSizeClass, StackSpec, ThreadPriority};
+
 use tokio::sync::{broadcast, mpsc};
 
 use crate::error::{AsynError, AsynResult, AsynStatus};
@@ -9,6 +11,7 @@ use crate::interrupt::InterruptManager;
 use crate::port::PortDriver;
 use crate::port_actor::PortActor;
 use crate::port_handle::PortHandle;
+use crate::registry::PortClaim;
 use crate::transport::InProcessClient;
 
 use super::config::RuntimeConfig;
@@ -146,7 +149,7 @@ fn stop_port_actor(
                 // teardown did NOT run, and it happens on the way out of a
                 // process where a `tracing` subscriber may already be gone —
                 // on the embedded targets there was never one to begin with.
-                eprintln!(
+                epics_libcom_rs::stderr_println!(
                     "asyn: port '{port_name}' did not stop within {limit:?}; its driver's \
                      teardown has not run"
                 );
@@ -156,13 +159,13 @@ fn stop_port_actor(
 }
 
 /// The one way to wait for a port's connect — C `waitConnect`
-/// (asynManager.c:3292-3336), which arms an exception handler and only then
-/// blocks on the event.
+/// (asynManager.c:3323-3367), which adds an exception handler on the port's
+/// own `dpCommon` and only then blocks on the event.
 ///
 /// Arming first is the whole point: a connect that lands between "am I
 /// connected?" and "start waiting" would be missed by any caller that checked
 /// the flag first. C has that race — it reads `pport->dpc.connected` at
-/// :3308-3311 and only arms afterwards, at :3316 — so here [`Self::arm`]
+/// :3339-3342 and only arms afterwards, at :3347 — so here `arm`
 /// registers the callback first, the caller may then short-circuit on an
 /// already-connected port, and [`Self::wait`] blocks for the rest. That
 /// ordering is a deliberate deviation. Both waiters in the crate — port
@@ -170,27 +173,24 @@ fn stop_port_actor(
 /// grow its own race.
 pub struct ConnectWaiter {
     rx: std::sync::mpsc::Receiver<()>,
-    services: crate::services::PortServices,
-    callback: crate::exception::ExceptionCallbackId,
+    _callback: crate::exception::ExceptionCallbackGuard,
 }
 
 impl ConnectWaiter {
-    /// Register for `port_name`'s connect exception. From here on the connect
-    /// cannot be missed, only waited for.
-    pub fn arm(services: &crate::services::PortServices, port_name: &str) -> Self {
+    /// Register for the port's connect exception, on the port's own slot (-1):
+    /// C's waiting user is bound with `connectDevice(pasynUser, portName, -1)`
+    /// (asynShellCommands.c:563; `pconnectUser` for registration). From here
+    /// on the connect cannot be missed, only waited for.
+    pub(crate) fn arm(announcer: &crate::port::ExceptionAnnouncer) -> Self {
         let (tx, rx) = std::sync::mpsc::channel::<()>();
-        let waited_on = port_name.to_string();
-        let callback = services.exceptions().add_callback(move |event| {
-            if event.exception == crate::exception::AsynException::Connect
-                && event.port_name == waited_on
-            {
+        let callback = announcer.add_user(-1, move |event| {
+            if event.exception == crate::exception::AsynException::Connect {
                 let _ = tx.send(());
             }
         });
         Self {
             rx,
-            services: services.clone(),
-            callback,
+            _callback: callback,
         }
     }
 
@@ -198,12 +198,6 @@ impl ConnectWaiter {
     /// `true` = connected.
     pub fn wait(self, timeout: std::time::Duration) -> bool {
         self.rx.recv_timeout(timeout).is_ok()
-    }
-}
-
-impl Drop for ConnectWaiter {
-    fn drop(&mut self) {
-        self.services.exceptions().remove_callback(self.callback);
     }
 }
 
@@ -217,10 +211,22 @@ impl Drop for ConnectWaiter {
 ///
 /// `Err` means the port does not exist: see [`create_port_runtime_boxed`].
 pub fn create_port_runtime<D: PortDriver>(
+    claim: &PortClaim,
     driver: D,
     config: RuntimeConfig,
 ) -> AsynResult<(PortRuntimeHandle, std::thread::JoinHandle<()>)> {
-    create_port_runtime_boxed(Box::new(driver), config)
+    create_port_runtime_boxed(claim, Box::new(driver), config)
+}
+
+/// [`create_port_runtime`] under a claim on a private registry, for a fixture
+/// that publishes through `register_port` or not at all.
+#[cfg(any(test, feature = "test-support"))]
+pub fn create_port_runtime_unclaimed<D: PortDriver>(
+    driver: D,
+    config: RuntimeConfig,
+) -> AsynResult<(PortRuntimeHandle, std::thread::JoinHandle<()>)> {
+    let claim = crate::registry::PortRegistry::new().claim(&driver.base().port_name)?;
+    create_port_runtime(&claim, driver, config)
 }
 
 /// Create a port runtime from a boxed driver.
@@ -234,61 +240,68 @@ pub fn create_port_runtime<D: PortDriver>(
 /// survives anywhere in the process.
 ///
 /// C parity: `registerPort` → `registerDriver` creates the port thread at
-/// `asynManager.c:2079-2080`, and on failure (:2081-2091) prints, unwinds every
+/// `asynManager.c:2079-2080`, and on failure (:2083-2093) prints, unwinds every
 /// resource it had built for the port, and returns `asynError` **before**
-/// `ellAdd(&pasynBase->asynPortList, ...)` (:2094) — the port never enters the
+/// `ellAdd(&pasynBase->asynPortList, ...)` (:2096) — the port never enters the
 /// list. The unwind is this function's `Err` return: the `PortActor` (which
 /// owns the driver) is dropped along with the closure `Builder::spawn`
-/// rejected, and the one resource that is *not* local — the connect-exception
-/// callback registered with the shared [`crate::exception`] list — is removed
-/// by [`ConnectWaiter`]'s `Drop`.
+/// rejected, and with them the port's own exception lists and the
+/// [`ConnectWaiter`] armed on them.
 ///
 /// A caller that can report the failure returns it, as
-/// `drvAsynIPPortConfigure` does (`drvAsynIPPort.c:1033-1035`: print,
+/// `drvAsynIPPortConfigure` does (`drvAsynIPPort.c:1087-1089`: print,
 /// `ttyCleanup`, `return -1`) — the iocsh command fails and the IOC boots on
 /// without that port. A caller with no error channel — one shaped like a C++
 /// constructor, returning the built port by value — uses
 /// [`port_runtime_unavailable`] instead.
+///
+/// `claim` is the driver's name, held before the driver was built: C's
+/// `asynPortDriver` constructor registers the port ahead of everything else
+/// (asynPortDriver.cpp:4036-4040), so a taken name builds no port thread.
 pub fn create_port_runtime_boxed(
+    claim: &PortClaim,
     mut driver: Box<dyn PortDriver>,
     config: RuntimeConfig,
 ) -> AsynResult<(PortRuntimeHandle, std::thread::JoinHandle<()>)> {
+    if claim.name() != &*driver.base().port_name {
+        return Err(AsynError::Status {
+            status: AsynStatus::Error,
+            message: format!(
+                "port {} built under the claim for {}",
+                driver.base().port_name,
+                claim.name()
+            ),
+        });
+    }
     // The one site that binds a port to its trace configuration and exception
     // list. C does it inside `registerPort` — the sole path into the port list
-    // — which calls `dpCommonInit` (asynManager.c:2066) before adding the port
-    // (:2094); `dpCommonInit` (:510-529) is what inits `exceptionUserList` (:524)
-    // and the port's own `tracePvt` (:528), so no port can exist without them. Every
+    // — which calls `dpCommonInit` (asynManager.c:2068) before adding the port
+    // (:2096); `dpCommonInit` (:512-531) is what inits `exceptionUserList` (:526)
+    // and the port's own `tracePvt` (:530), so no port can exist without them. Every
     // port creator in this crate (`PortManager::register_port`, the
     // `drvAsyn*PortConfigure` iocsh commands, driver-owned ports) funnels
     // through here, so binding here is what makes that true for the port too.
     config.services.bind(driver.base_mut());
 
     // C `registerInterface(asynCommonType)` — reached from `registerPort` for
-    // every port — calls `initPortConnect` and then `portConnectTimerCallback`
-    // (asynManager.c:2131-2136), which queues a connect at
-    // `asynQueuePriorityConnect` the moment the port exists (:3252-3266). An
-    // auto-connect port is therefore brought up BY REGISTRATION, not by whichever
-    // record first happens to do I/O: `CNCT` reads 1 straight after
-    // `drvAsynIPPortConfigure`, and a port no record ever talks to still comes up.
-    //
-    // Arming the actor's connect deadline is that queued request: the actor runs
-    // `service_connect_timer` ahead of anything in its queue, which is what C's
-    // Connect priority buys. It re-arms itself at `secondsBetweenPortConnect` on
-    // failure (C :3281), so a port whose device is down keeps trying without a
-    // single request ever being submitted.
-    let connect_at_registration = driver.base().auto_connect && !driver.base().is_connected();
-    if connect_at_registration {
-        driver.base_mut().connect_retry_at = Some(std::time::Instant::now());
-    }
+    // every port — queues the port's connect at `asynQueuePriorityConnect` the
+    // moment the port exists (asynManager.c:2133-2138, :3283-3297), so an
+    // auto-connect port is brought up BY REGISTRATION, not by whichever record
+    // first does I/O. [`PortActor::new`] arms that connect; it re-arms itself at
+    // `secondsBetweenPortConnect` on failure (C :3312).
+    let connect_at_registration = driver.base().is_auto_connect() && !driver.base().is_connected();
 
-    let port_name = driver.base().port_name.clone();
+    let port_name = driver.base().port_name.to_string();
     let can_block = driver.base().flags.can_block;
+    let callback_thread = driver.base().callback_thread;
     let multi_device = driver.base().flags.multi_device;
     let max_addr = driver.base().max_addr as i32;
+    let get_address = driver.base().get_address_rule();
     // The driver's interface declaration, taken once here — C's port
     // registration is where `registerInterface` is called too, and the set never
-    // changes afterwards (asynManager.c:2105-2138).
+    // changes afterwards (asynManager.c:2104-2140).
     let interfaces = driver.capabilities();
+    let runtime_hooks = std::mem::take(&mut driver.base_mut().runtime_hooks);
 
     // Event broadcast
     let (event_tx, _) = broadcast::channel(256);
@@ -304,52 +317,65 @@ pub fn create_port_runtime_boxed(
     let shared_intr_state = driver.base().interrupts.shared_state();
     let handle_interrupts = Arc::new(InterruptManager::from_shared_state(shared_intr_state));
 
-    // Actor channel
-    let (tx, rx) = mpsc::channel(config.channel_capacity);
-    let actor = PortActor::new(driver, rx);
-    let actor_id = actor.id();
-
-    let event_tx_clone = event_tx.clone();
-    let name_clone = port_name.clone();
-
-    // C's `waitConnect` (asynManager.c:2135, :3292-3337): registration waits on
+    // C's `waitConnect` (asynManager.c:2137, :3323-3368): registration waits on
     // the port's *connect exception* for at most `autoConnectTimeout`, so the
     // line of st.cmd after `drvAsynIPPortConfigure` already sees a live port.
     // The waiter is armed before the actor thread exists, so the connect it
     // waits for cannot fire ahead of it.
     let connect_wait =
-        connect_at_registration.then(|| ConnectWaiter::arm(&config.services, &port_name));
+        connect_at_registration.then(|| ConnectWaiter::arm(&driver.base().announcer));
 
-    let join_handle = match std::thread::Builder::new()
-        .name(format!("asyn-runtime-{port_name}"))
-        .spawn(move || {
-            let _ = event_tx_clone.send(RuntimeEvent::Started {
-                port_name: name_clone.clone(),
-            });
-            actor.run_with_shutdown(shutdown_rx);
-            let _ = event_tx_clone.send(RuntimeEvent::Stopped {
-                port_name: name_clone,
-            });
-            let _ = completion_tx.send(());
-        }) {
-        Ok(jh) => jh,
-        Err(e) => {
-            // Loud at the point of failure, as C is: `printf(
-            // "asynCommon:registerDriver %s epicsThreadCreate failed \n",
-            // portName)` (asynManager.c:2083-2084). `eprintln!` rather than
-            // `tracing`, because the targets where thread creation actually
-            // fails (RTEMS/VxWorks IOCs) install no subscriber and the console
-            // is all there is.
-            eprintln!("asyn: port '{port_name}' runtime thread could not be created: {e}");
-            // Everything this function built for the port is dropped on the way
-            // out — C's :2085-2091 unwind — and the port is never published.
-            return Err(port_thread_unavailable(&port_name, &e));
-        }
+    // Actor channel
+    let (tx, rx) = mpsc::unbounded_channel();
+    let actor = PortActor::new(driver, rx);
+    let actor_link = actor.link();
+
+    let event_tx_clone = event_tx.clone();
+    let name_clone = port_name.clone();
+
+    // C `epicsThreadCreate(portName, priority, stackSize, portThread, pport)`
+    // (asynManager.c:2077-2082), stackSize 0 → `epicsThreadStackMedium`. As an
+    // IOC thread its park state is built at entry, not in its first contended
+    // lock mid-cycle.
+    // C creates the thread, and so reads the priority and stack size, for an
+    // ASYN_CANBLOCK port only (asynManager.c:2074); a synchronous port's
+    // values can never fail its registration.
+    let priority = match config.priority {
+        p if can_block && p != 0 => ThreadPriority::Custom(p),
+        _ => ThreadPriority::Medium,
     };
+    let stack = match config.stack_size {
+        raw if can_block && raw != 0 => StackSpec::from_c(raw),
+        _ => StackSpec::Class(StackSizeClass::Medium),
+    };
+    let join_handle =
+        match MandatoryThread::new(port_name.clone(), priority, StackSizeClass::Medium)
+            .try_spawn_sized(stack, move || {
+                let _ = event_tx_clone.send(RuntimeEvent::Started {
+                    port_name: name_clone.clone(),
+                });
+                actor.run_with_shutdown(shutdown_rx);
+                let _ = event_tx_clone.send(RuntimeEvent::Stopped {
+                    port_name: name_clone,
+                });
+                let _ = completion_tx.send(());
+            }) {
+            Ok(jh) => jh,
+            Err(e) => {
+                // C's line, byte for byte and on the thread's stdout
+                // (asynManager.c:2083-2084).
+                epics_libcom_rs::epics_println!(
+                    "asynCommon:registerDriver {port_name} epicsThreadCreate failed "
+                );
+                // Everything this function built for the port is dropped on the way
+                // out — C's :2085-2091 unwind — and the port is never published.
+                return Err(port_thread_unavailable(&port_name, &e));
+            }
+        };
 
     if let Some(waiter) = connect_wait {
         // A timeout is not a failure: C ignores `waitConnect`'s status here and
-        // the port's own retry timer carries on (asynManager.c:2135, :3281).
+        // the port's own retry timer carries on (asynManager.c:2137, :3312).
         let _ = waiter.wait(config.auto_connect_timeout);
     }
 
@@ -357,12 +383,16 @@ pub fn create_port_runtime_boxed(
         tx,
         port_name.clone(),
         handle_interrupts,
-        actor_id,
+        actor_link,
         config.services.trace().clone(),
     );
     port_handle.set_can_block(can_block);
-    port_handle.set_capabilities(multi_device, max_addr);
+    port_handle.set_callback_thread(callback_thread);
+    port_handle.set_capabilities(multi_device, max_addr, get_address);
     port_handle.set_interfaces(interfaces);
+    for hook in runtime_hooks {
+        hook(&port_handle);
+    }
     let client = InProcessClient::new(port_handle.clone());
 
     let handle = PortRuntimeHandle {
@@ -376,7 +406,7 @@ pub fn create_port_runtime_boxed(
 
     // C `registerPort` ends by arming the port's own process-exit callback —
     // `epicsAtExit(destroyPortDriver, (void *)pport->portName)` — but only for
-    // an `ASYN_DESTRUCTIBLE` port (asynManager.c:2096-2098); every other port
+    // an `ASYN_DESTRUCTIBLE` port (asynManager.c:2098-2100); every other port
     // in C simply survives to process exit with no teardown at all. This line
     // arms it for EVERY port, a deliberate widening: the actor owns the driver,
     // so the teardown a driver owes its device rides its `Drop` (below), and a
@@ -389,14 +419,14 @@ pub fn create_port_runtime_boxed(
     // serial `disconnect`. Drivers therefore need to know nothing about
     // shutdown, which is C's arrangement too: `shutdownPort` fires
     // `asynExceptionShutdown` and leaves the destruction to the driver
-    // (asynManager.c:2301-2305).
+    // (asynManager.c:2303-2307).
     //
     // The callback holds the two channel ends, not the runtime handle: holding
     // a `PortHandle` would keep the port reachable, and so alive, for the life
     // of the process — turning every port ever created into a leak, and
     // breaking the "last `PortHandle` dropped stops the port" contract above.
     // These ends keep nothing alive, exactly as C's callback holds only the
-    // port *name* and looks it up at exit time (asynManager.c:2026-2043).
+    // port *name* and looks it up at exit time (asynManager.c:2028-2045).
     let exit_shutdown_tx = handle.shutdown_tx.clone();
     let exit_completion_rx = handle.completion_rx.clone();
     let exit_port_name = handle.port_name.clone();
@@ -416,7 +446,7 @@ pub fn create_port_runtime_boxed(
 /// it and moving on to the next.
 ///
 /// C does not wait at all — `shutdownPort` disables the port, fires the
-/// shutdown exception and returns (asynManager.c:2296-2306) — but C's teardown
+/// shutdown exception and returns (asynManager.c:2285-2309) — but C's teardown
 /// is the exception handler, which has already run by then. Ours is the
 /// driver's `Drop`, which runs on the actor thread, so leaving without waiting
 /// would be leaving before the teardown this whole path exists to reach. The
@@ -458,7 +488,9 @@ fn port_thread_unavailable(port_name: &str, err: &std::io::Error) -> AsynError {
 /// Callers that *can* report the failure must return the error instead; see
 /// [`create_port_runtime_boxed`].
 pub fn port_runtime_unavailable(port_name: &str, err: &AsynError) -> ! {
-    eprintln!(
+    // C prints this before it throws, ahead of anything the process says next.
+    crate::manager::report_port_driver_register_failure(port_name);
+    epics_libcom_rs::stderr_println!(
         "FATAL: the IOC could not create the runtime for asyn port '{port_name}': {err}. \
          Continuing would leave records bound to a port whose actor thread does not \
          exist — every request queued to it would wait forever — so the process is \
@@ -471,6 +503,7 @@ pub fn port_runtime_unavailable(port_name: &str, err: &AsynError) -> ! {
 mod tests {
     use super::*;
     use crate::param::ParamType;
+    use crate::port::InterfaceMask;
     use crate::port::{PortDriverBase, PortFlags};
 
     struct TestPort {
@@ -479,7 +512,17 @@ mod tests {
 
     impl TestPort {
         fn new(name: &str) -> Self {
-            let mut base = PortDriverBase::new(name, 1, PortFlags::default());
+            Self::with_flags(name, PortFlags::default())
+        }
+
+        fn with_flags(name: &str, flags: PortFlags) -> Self {
+            let mut base = PortDriverBase::new(
+                name,
+                1,
+                flags,
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_INTERRUPTS,
+            );
             base.create_param("VAL", ParamType::Int32).unwrap();
             base.create_param("F64", ParamType::Float64).unwrap();
             Self { base }
@@ -495,10 +538,204 @@ mod tests {
         }
     }
 
+    /// registerPort's priority is C's `unsigned int`, kept as given
+    /// (asynManager.c:2077); 0 is Medium. A synchronous port has no C thread,
+    /// so its priority is never read. Run with RT off: under RT a can-block
+    /// port at 200 gets no thread (`a_refused_port_thread_fails_registration`).
+    #[test]
+    fn a_port_thread_runs_at_its_configured_priority() {
+        use epics_libcom_rs::runtime::task::{C_RT_PRIORITY_ENV, thread_report};
+        const CHILD: &str = "ASYN_RS_PRIO_KEPT_CHILD";
+        const TEST: &str = "runtime::port::tests::a_port_thread_runs_at_its_configured_priority";
+        if std::env::var_os(CHILD).is_none() {
+            let out = std::process::Command::new(std::env::current_exe().expect("the test binary"))
+                .args(["--exact", TEST, "--nocapture"])
+                .env(CHILD, "1")
+                .env(C_RT_PRIORITY_ENV, "NO")
+                .output()
+                .expect("re-exec the test binary");
+            assert!(
+                out.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return;
+        }
+        for (name, can_block, priority, osipri) in [
+            ("prio_0", true, 0, 50),
+            ("prio_1", true, 1, 1),
+            ("prio_200", true, 200, 200),
+            ("sync_200", false, 200, 50),
+        ] {
+            let config = RuntimeConfig {
+                priority,
+                ..RuntimeConfig::default()
+            };
+            let flags = PortFlags {
+                can_block,
+                ..PortFlags::default()
+            };
+            let (_handle, _jh) =
+                create_port_runtime_unclaimed(TestPort::with_flags(name, flags), config)
+                    .expect("the port runtime thread must start");
+            let row = (0..10_000)
+                .find_map(|_| {
+                    let row = thread_report().into_iter().find(|t| t.name() == name);
+                    if row.is_none() {
+                        std::thread::yield_now();
+                    }
+                    row
+                })
+                .expect("the port thread is in the thread report");
+            assert_eq!(row.epics_priority(), osipri, "port {name}");
+        }
+    }
+
+    /// Under RT, a can-block port whose priority maps past the FIFO range gets
+    /// no thread, so registerPort fails with C's line and registers nothing
+    /// (asynManager.c:2081-2092).
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[test]
+    fn a_refused_port_thread_fails_registration() {
+        const CHILD: &str = "ASYN_RS_PRIO_200_CHILD";
+        const TEST: &str = "runtime::port::tests::a_refused_port_thread_fails_registration";
+        if std::env::var_os(CHILD).is_some() {
+            let config = RuntimeConfig {
+                priority: 200,
+                ..RuntimeConfig::default()
+            };
+            let flags = PortFlags {
+                can_block: true,
+                ..PortFlags::default()
+            };
+            match create_port_runtime_unclaimed(TestPort::with_flags("refused_200", flags), config)
+            {
+                Ok(_) => println!("REGISTERED"),
+                Err(_) => println!("FAILED"),
+            }
+            let listed = epics_libcom_rs::runtime::task::thread_report()
+                .into_iter()
+                .any(|t| t.name() == "refused_200");
+            println!("THREAD={listed}");
+            return;
+        }
+        let out = std::process::Command::new(std::env::current_exe().expect("the test binary"))
+            .args(["--exact", TEST, "--nocapture"])
+            .env(CHILD, "1")
+            .env(epics_libcom_rs::runtime::task::RT_PRIORITY_ENV, "YES")
+            // The alias counts only while C's switch is unset.
+            .env_remove(epics_libcom_rs::runtime::task::C_RT_PRIORITY_ENV)
+            .output()
+            .expect("re-exec the test binary");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{stdout}{stderr}");
+        assert!(
+            stdout
+                .lines()
+                .any(|l| l == "asynCommon:registerDriver refused_200 epicsThreadCreate failed "),
+            "{stdout}"
+        );
+        assert!(stdout.lines().any(|l| l == "FAILED"), "{stdout}");
+        assert!(stdout.lines().any(|l| l == "THREAD=false"), "{stdout}");
+    }
+
+    /// The constructor-shaped runtimes (ad-core plugins, NDTimeSeries) abort
+    /// the process when the thread is refused, and C prints the
+    /// `asynPortDriver` line before it throws (asynPortDriver.cpp:4036-4040).
+    #[test]
+    fn port_runtime_unavailable_prints_the_constructor_line_before_it_aborts() {
+        const CHILD: &str = "ASYN_RS_UNAVAILABLE_CHILD";
+        const TEST: &str = "runtime::port::tests::port_runtime_unavailable_prints_the_constructor_line_before_it_aborts";
+        if std::env::var_os(CHILD).is_some() {
+            port_runtime_unavailable(
+                "unavail_port",
+                &AsynError::PortNotFound("unavail_port".into()),
+            );
+        }
+        let out = std::process::Command::new(std::env::current_exe().expect("the test binary"))
+            .args(["--exact", TEST, "--nocapture"])
+            .env(CHILD, "1")
+            .output()
+            .expect("re-exec the test binary");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(!out.status.success(), "the child must abort");
+        assert!(
+            stdout
+                .lines()
+                .any(|l| l
+                    == "asynPortDriver:asynPortDriver ERROR: Can't register port: unavail_port"),
+            "{stdout}"
+        );
+    }
+
+    /// The hook gets a handle that already reaches the running port.
+    #[test]
+    fn a_runtime_hook_runs_once_with_a_live_handle() {
+        let mut port = TestPort::new("rt_hook");
+        let (tx, rx) = std::sync::mpsc::channel();
+        port.base.on_runtime(move |handle| {
+            tx.send(handle.clone()).unwrap();
+        });
+        let (_runtime, _jh) = create_port_runtime_unclaimed(port, RuntimeConfig::default())
+            .expect("the port runtime thread must start");
+
+        let handle = rx.try_recv().expect("the hook ran during creation");
+        assert!(rx.try_recv().is_err(), "the hook ran twice");
+        handle.write_int32_blocking(0, 0, 7).unwrap();
+        assert_eq!(handle.read_int32_blocking(0, 0).unwrap(), 7);
+    }
+
+    /// C's interrupt match calls the driver's `getAddress` on the client
+    /// (asynPortDriver.cpp:627-630), so the handle's filter list is the
+    /// driver's rule.
+    #[test]
+    fn the_handle_resolves_through_the_drivers_get_address() {
+        let mut port = TestPort::with_flags(
+            "rt_get_address",
+            PortFlags {
+                multi_device: true,
+                ..PortFlags::default()
+            },
+        );
+        port.base.set_get_address(crate::port::tests::tag_address);
+        let (runtime, _jh) = create_port_runtime_unclaimed(port, RuntimeConfig::default())
+            .expect("the port runtime thread must start");
+        let handle = runtime.port_handle();
+        assert_eq!(handle.param_list(100), 0);
+        handle.write_int32_blocking(0, 100, 7).unwrap();
+        assert_eq!(handle.read_int32_blocking(0, 0).unwrap(), 7);
+    }
+
+    /// getStringParam's text, without the NUL readOctet counts, cut to
+    /// `max_chars - 1` (asynPortDriver.cpp:551-552).
+    #[test]
+    fn get_string_param_reads_the_stored_text() {
+        let mut port = TestPort::new("rt_string_param");
+        let msg = port.base.create_param("MSG", ParamType::Octet).unwrap();
+        port.base.set_string_param(msg, 0, b"file://x.png").unwrap();
+        let (runtime, _jh) = create_port_runtime_unclaimed(port, RuntimeConfig::default())
+            .expect("the port runtime thread must start");
+        let handle = runtime.port_handle();
+
+        assert_eq!(
+            handle.get_string_param_blocking(msg, 0, 256).unwrap(),
+            b"file://x.png"
+        );
+        assert_eq!(
+            handle.get_string_param_blocking(msg, 0, 5).unwrap(),
+            b"file"
+        );
+        assert_eq!(handle.get_string_param_blocking(msg, 0, 0).unwrap(), b"");
+        assert!(handle.get_string_param_blocking(0, 0, 256).is_err());
+    }
+
     #[test]
     fn port_runtime_int32_roundtrip() {
-        let (handle, _jh) = create_port_runtime(TestPort::new("rt_test"), RuntimeConfig::default())
-            .expect("the port runtime thread must start");
+        let (handle, _jh) =
+            create_port_runtime_unclaimed(TestPort::new("rt_test"), RuntimeConfig::default())
+                .expect("the port runtime thread must start");
 
         handle.port_handle().write_int32_blocking(0, 0, 42).unwrap();
         assert_eq!(handle.port_handle().read_int32_blocking(0, 0).unwrap(), 42);
@@ -513,7 +750,7 @@ mod tests {
         use crate::transport::RuntimeClient;
 
         let (handle, _jh) =
-            create_port_runtime(TestPort::new("rt_client"), RuntimeConfig::default())
+            create_port_runtime_unclaimed(TestPort::new("rt_client"), RuntimeConfig::default())
                 .expect("the port runtime thread must start");
 
         let client = handle.client();
@@ -557,7 +794,7 @@ mod tests {
     #[test]
     fn port_runtime_shutdown() {
         let (handle, jh) =
-            create_port_runtime(TestPort::new("rt_shutdown"), RuntimeConfig::default())
+            create_port_runtime_unclaimed(TestPort::new("rt_shutdown"), RuntimeConfig::default())
                 .expect("the port runtime thread must start");
 
         // Dropping the handle should cause the actor to stop
@@ -568,7 +805,7 @@ mod tests {
 
     #[test]
     fn port_runtime_explicit_shutdown() {
-        let (handle, _jh) = create_port_runtime(
+        let (handle, _jh) = create_port_runtime_unclaimed(
             TestPort::new("rt_explicit_shutdown"),
             RuntimeConfig::default(),
         )
@@ -583,7 +820,7 @@ mod tests {
 
     #[test]
     fn port_runtime_shutdown_while_handles_exist() {
-        let (handle, _jh) = create_port_runtime(
+        let (handle, _jh) = create_port_runtime_unclaimed(
             TestPort::new("rt_shutdown_handles"),
             RuntimeConfig::default(),
         )
@@ -603,7 +840,7 @@ mod tests {
     #[test]
     fn port_runtime_event_subscription() {
         let (handle, _jh) =
-            create_port_runtime(TestPort::new("rt_events"), RuntimeConfig::default())
+            create_port_runtime_unclaimed(TestPort::new("rt_events"), RuntimeConfig::default())
                 .expect("the port runtime thread must start");
 
         let mut rx = handle.subscribe_events();
@@ -623,9 +860,29 @@ mod tests {
     #[test]
     fn port_runtime_port_name() {
         let (handle, _jh) =
-            create_port_runtime(TestPort::new("named_port"), RuntimeConfig::default())
+            create_port_runtime_unclaimed(TestPort::new("named_port"), RuntimeConfig::default())
                 .expect("the port runtime thread must start");
         assert_eq!(handle.port_name(), "named_port");
+    }
+
+    /// A claim covers the one name it holds: a driver named anything else
+    /// gets no port thread.
+    #[test]
+    fn a_claim_for_another_name_builds_no_port() {
+        let claim = crate::registry::PortRegistry::new()
+            .claim("claimed_name")
+            .unwrap();
+        let refused = create_port_runtime(
+            &claim,
+            TestPort::new("other_name"),
+            RuntimeConfig::default(),
+        );
+        assert!(matches!(refused, Err(AsynError::Status { .. })));
+        assert!(
+            !epics_libcom_rs::runtime::task::thread_report()
+                .into_iter()
+                .any(|t| t.name() == "other_name")
+        );
     }
 
     /// The boundary this whole change exists for: the OS refuses the port's
@@ -650,13 +907,13 @@ mod tests {
     /// `create_port_runtime`, not one the registering caller picked: a mask
     /// set by port name through the registry (`asynSetTraceMask`, asynRecord
     /// `TMSK`) must be the mask the driver's `trace_print` reads. C reaches
-    /// the one `tracePvt` through the port (asynManager.c:449-459).
+    /// the one `tracePvt` through the port (asynManager.c:451-461).
     #[test]
     fn the_registry_publishes_the_trace_the_driver_was_bound_to() {
         const PORT: &str = "trace_from_handle";
         let services = crate::services::PortServices::new();
         let trace = services.trace().clone();
-        let (runtime, _actor) = create_port_runtime(
+        let (runtime, _actor) = create_port_runtime_unclaimed(
             TestPort::new(PORT),
             RuntimeConfig {
                 services,
@@ -664,7 +921,12 @@ mod tests {
             },
         )
         .unwrap();
-        crate::registry::register_port(PORT, runtime.port_handle().clone()).unwrap();
+        crate::registry::register_port(
+            PORT,
+            runtime.port_handle().clone(),
+            &crate::registry::open_owner(),
+        )
+        .unwrap();
 
         let entry = crate::registry::get_port(PORT).expect("published");
         assert!(
@@ -680,10 +942,7 @@ mod tests {
         let driver_sees_flow = runtime
             .port_handle()
             .with_driver_blocking(|d: &mut TestPort| {
-                d.base
-                    .trace
-                    .as_ref()
-                    .is_some_and(|t| t.is_enabled(PORT, crate::trace::TraceMask::FLOW))
+                d.base.trace.is_enabled(PORT, crate::trace::TraceMask::FLOW)
             })
             .unwrap();
         assert!(
@@ -722,7 +981,7 @@ mod tests {
 
             let manager = crate::manager::PortManager::new();
             let err = manager
-                .register_port(TestPort::new(PORT))
+                .register_port_unclaimed(TestPort::new(PORT), &crate::registry::open_owner())
                 .err()
                 .expect("thread creation is refused, so registration must fail");
             assert!(
@@ -741,13 +1000,12 @@ mod tests {
             return;
         }
 
-        if unsafe { libc::geteuid() } == 0 {
-            println!(
-                "skipped: running as root, which bypasses RLIMIT_NPROC \
-                 (CAP_SYS_RESOURCE), so thread creation cannot be made to fail"
-            );
-            return;
-        }
+        assert_ne!(
+            unsafe { libc::geteuid() },
+            0,
+            "must not run as root: root bypasses RLIMIT_NPROC (CAP_SYS_RESOURCE), \
+             so thread creation cannot be made to fail"
+        );
 
         let out =
             std::process::Command::new(std::env::current_exe().expect("the test binary path"))
@@ -763,10 +1021,12 @@ mod tests {
              status: {:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
             out.status
         );
-        // The failure is loud where C's is (asynManager.c:2083).
+        // C's `printf` line, on stdout (asynManager.c:2083-2084).
         assert!(
-            stderr.contains(PORT),
-            "the diagnostic on stderr must name the port, got:\n{stderr}"
+            stdout
+                .lines()
+                .any(|l| l == format!("asynCommon:registerDriver {PORT} epicsThreadCreate failed ")),
+            "C's registerDriver line on stdout, got:\n{stdout}"
         );
     }
 }

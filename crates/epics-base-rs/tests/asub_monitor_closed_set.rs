@@ -37,7 +37,7 @@ use std::sync::Arc;
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::event_queue::EventReader;
 use epics_base_rs::server::recgbl::EventMask;
-use epics_base_rs::server::record::{Record, SubroutineFn};
+use epics_base_rs::server::record::{Record, Subroutine};
 use epics_base_rs::server::records::asub_record::ASubRecord;
 use epics_base_rs::server::records::waveform::WaveformRecord;
 use epics_base_rs::types::{DbFieldType, EpicsValue};
@@ -52,12 +52,12 @@ const FT_DOUBLE: i16 = 10;
 
 /// Copies the input channel `A` into the output channel `VALA`, so one cycle
 /// moves both sides at once.
-fn copy_a_to_vala() -> Arc<SubroutineFn> {
-    Arc::new(Box::new(|rec: &mut dyn Record| {
+fn copy_a_to_vala() -> Arc<Subroutine> {
+    Arc::new(Subroutine::Plain(Box::new(|rec: &mut dyn Record| {
         let a = rec.get_field("A").unwrap_or(EpicsValue::Double(0.0));
         rec.put_field("VALA", a)?;
         Ok(0_i64)
-    }) as SubroutineFn)
+    })))
 }
 
 async fn process(db: &PvDatabase, name: &str) {
@@ -96,7 +96,7 @@ async fn asub_reading_a_waveform(eflg: i16) -> PvDatabase {
         .unwrap();
     db.add_record("X", Box::new(x)).await.unwrap();
 
-    let mut registry: HashMap<String, Arc<SubroutineFn>> = HashMap::new();
+    let mut registry: HashMap<String, Arc<Subroutine>> = HashMap::new();
     registry.insert("copy".into(), copy_a_to_vala());
     db.install_subroutine_registry(registry.clone()).await;
     db.get_record("X").unwrap().write().subroutine = registry.get("copy").cloned();
@@ -109,7 +109,7 @@ fn subscribe(db: &PvDatabase, rec: &str, field: &str, id: u32) -> EventReader {
     let mut g = inst.write();
     let full = (EventMask::VALUE | EventMask::LOG | EventMask::ALARM).bits();
     g.add_subscriber(field, id, DbFieldType::Double, full)
-        .unwrap_or_else(|| panic!("a {field} subscription must be accepted"))
+        .unwrap_or_else(|why| panic!("a {field} subscription must be accepted: {why:?}"))
 }
 
 /// The finding's own trigger: `INPA`'s source moves, and `.A` / `.NEA` stay
@@ -139,7 +139,7 @@ async fn asub_input_channels_never_post_from_a_process_cycle() {
             );
             assert_eq!(
                 g.record.get_field("NEA"),
-                Some(EpicsValue::Long(2)),
+                Some(EpicsValue::ULong(2)),
                 "EFLG={eflg}: and really did move the delivered count"
             );
         }
@@ -165,11 +165,11 @@ async fn asub_val_posts_in_every_eflg_arm() {
     for eflg in [EFLG_NEVER, EFLG_ON_CHANGE, EFLG_ALWAYS] {
         let db = asub_reading_a_waveform(eflg).await;
         // A subroutine whose return status moves 0 -> 3 on the second cycle.
-        let bump: Arc<SubroutineFn> = {
+        let bump: Arc<Subroutine> = {
             let seen = std::sync::atomic::AtomicI64::new(0);
-            Arc::new(Box::new(move |_rec: &mut dyn Record| {
+            Arc::new(Subroutine::Plain(Box::new(move |_rec: &mut dyn Record| {
                 Ok(seen.fetch_add(3, std::sync::atomic::Ordering::Relaxed))
-            }) as SubroutineFn)
+            })))
         };
         db.get_record("X").unwrap().write().subroutine = Some(bump);
 
@@ -181,7 +181,7 @@ async fn asub_val_posts_in_every_eflg_arm() {
         let e = val_rx
             .try_recv()
             .unwrap_or_else(|e| panic!("EFLG={eflg}: aSubRecord.c:415 posts VAL on val != oval, outside the EFLG switch ({e:?})"));
-        assert_eq!(e.snapshot.value, EpicsValue::Long(3));
+        assert_eq!(e.value().as_value().cloned().unwrap(), EpicsValue::Long(3));
     }
 }
 
@@ -248,4 +248,59 @@ async fn asub_output_pairs_follow_the_eflg_switch() {
             "aSubEFLG_ALWAYS posts neva[i] unconditionally"
         );
     }
+}
+
+/// `EFLG=ON CHANGE` compares `VALx` against the `OVLx` its last post left, not
+/// against the cycle's start (`aSubRecord.c:432`), pinned against oracleIoc:
+/// after `caput VALA 1.5` the next cycle posts 1.5 again, and after
+/// `caput 2.5; caput 1.5` the cycle is silent, because OVLA already holds 1.5.
+#[epics_macros_rs::epics_test]
+async fn asub_on_change_compares_vala_against_ovla() {
+    let db = PvDatabase::new();
+    let mut y = ASubRecord::default();
+    y.put_field("FTVA", EpicsValue::Short(FT_DOUBLE)).unwrap();
+    db.add_record("Y", Box::new(y)).await.unwrap();
+    let mut rx = subscribe(&db, "Y", "VALA", 1);
+    let count = |rx: &mut EventReader| std::iter::from_fn(|| rx.try_recv().ok()).count();
+    let put = |v: f64| db.put_record_field_from_ca("Y", "VALA", EpicsValue::Double(v));
+
+    put(1.5).await.unwrap();
+    assert_eq!(count(&mut rx), 1, "the put posts");
+    process(&db, "Y").await;
+    assert_eq!(count(&mut rx), 1, "VALA 1.5 != OVLA 0: the cycle posts");
+    process(&db, "Y").await;
+    assert_eq!(count(&mut rx), 0, "OVLA caught up: silent");
+    put(2.5).await.unwrap();
+    put(1.5).await.unwrap();
+    assert_eq!(
+        rx.queue().ncollapse(rx.id()),
+        1,
+        "each put posts; VALA is SPC_DBADDR, so the second by-reference log \
+         drops onto the first (dbEvent.c:794-800)"
+    );
+    assert_eq!(count(&mut rx), 1);
+    process(&db, "Y").await;
+    assert_eq!(count(&mut rx), 0, "VALA 1.5 == OVLA 1.5: silent");
+}
+
+/// A runtime `EFLG` put changes the closed set mid-life: a `VALA` subscribed
+/// under `NEVER` must post once `ALWAYS` takes over, so no membership settled
+/// against the old list may outlive the switch.
+#[epics_macros_rs::epics_test]
+async fn asub_eflg_put_reopens_the_output_pairs() {
+    let db = asub_reading_a_waveform(EFLG_NEVER).await;
+    let mut vala_rx = subscribe(&db, "X", "VALA", 4);
+    drive(&db, vec![1.0]).await;
+    process(&db, "X").await;
+    assert!(vala_rx.try_recv().is_err(), "aSubEFLG_NEVER posts nothing");
+    db.put_record_field_from_ca("X", "EFLG", EpicsValue::Short(EFLG_ALWAYS))
+        .await
+        .unwrap();
+    while vala_rx.try_recv().is_ok() {}
+    drive(&db, vec![4.0, 5.0]).await;
+    process(&db, "X").await;
+    assert!(
+        vala_rx.try_recv().is_ok(),
+        "after EFLG=ALWAYS the moved VALA posts"
+    );
 }

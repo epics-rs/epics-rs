@@ -63,7 +63,7 @@ fn a_forty_deep_flnk_chain_processes_every_record() {
                 assert!(visited.is_empty(), "the frame unwound: {visited:?}");
 
                 for i in 0..CHAIN {
-                    let rec = db.get_record(&format!("L{i}")).expect("record exists");
+                    let rec = db.get_record(format!("L{i}")).expect("record exists");
                     let inst = rec.read();
                     assert_eq!(
                         inst.record.get_field("VAL"),

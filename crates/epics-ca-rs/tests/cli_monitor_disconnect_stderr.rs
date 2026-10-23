@@ -26,13 +26,11 @@
 // command line, so these cases follow `softioc-rs` rather than move.
 #![cfg(tokio_backend)]
 
-mod common;
-
 use std::io::{BufRead, BufReader};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use common::LineCollector;
+use c_ca_tools::LineCollector;
 
 /// A spawned child that is killed and reaped on every exit path, including a
 /// panicking assertion inside the test.
@@ -65,7 +63,7 @@ fn start_ioc() -> (Reaped, u16) {
     // "CA server: UDP search on port 41234, TCP on port 41235, beacons → …"
     let stderr = ioc.0.stderr.take().expect("piped stderr");
     let mut reader = BufReader::new(stderr);
-    let deadline = Instant::now() + budget::FACT_BUDGET;
+    let deadline = Instant::now() + fact_budget::FACT_BUDGET;
     let mut line = String::new();
     loop {
         assert!(
@@ -103,6 +101,8 @@ fn run_disconnect_scenario(resolver_grace: Duration) -> (String, String) {
 
     let mut mon = Reaped(
         Command::new(env!("CARGO_BIN_EXE_camonitor-rs"))
+            .arg("-w")
+            .arg(fact_budget::FACT_BUDGET.as_secs().to_string())
             .arg("TST:AI")
             .env("EPICS_CA_ADDR_LIST", format!("127.0.0.1:{port}"))
             .env("EPICS_CA_AUTO_ADDR_LIST", "NO")
@@ -119,7 +119,10 @@ fn run_disconnect_scenario(resolver_grace: Duration) -> (String, String) {
     // Wait for the first monitor event itself, then take the IOC away
     // under it.
     assert!(
-        out_lines.wait_for(budget::FACT_BUDGET, |t| t.contains("TST:AI")),
+        out_lines.wait_for(fact_budget::FACT_BUDGET, |t| {
+            t.lines()
+                .any(|l| l.contains("TST:AI") && !l.contains("Not connected"))
+        }),
         "no first monitor line within 10s; stdout: {:?}",
         out_lines.text()
     );
@@ -130,12 +133,12 @@ fn run_disconnect_scenario(resolver_grace: Duration) -> (String, String) {
     // The disconnect must surface on both streams; each stream is gated on
     // its own marker so the kill below cannot race either write.
     assert!(
-        out_lines.wait_for(budget::FACT_BUDGET, |t| t.contains("*** disconnected")),
+        out_lines.wait_for(fact_budget::FACT_BUDGET, |t| t.contains("*** disconnected")),
         "no `*** disconnected` on stdout within 10s; stdout: {:?}",
         out_lines.text()
     );
     assert!(
-        err_lines.wait_for(budget::FACT_BUDGET, |t| t.contains("Source File:")),
+        err_lines.wait_for(fact_budget::FACT_BUDGET, |t| t.contains("Source File:")),
         "no CA.Client.Exception block on stderr within 10s; stderr: {:?}",
         err_lines.text()
     );
@@ -200,45 +203,43 @@ fn a_disconnect_under_camonitor_writes_no_per_pv_stderr_line() {
     // deterministic contract; the resolved name must show up within the
     // attempt budget (a cache-bypass regression — the pre-R18-19 port —
     // prints the dotted IP on EVERY pass and fails all attempts).
-    const ATTEMPTS: usize = 5;
-    #[cfg_attr(windows, allow(unused_variables, unused_mut))]
-    let mut resolver_won = false;
+    // The resolved loopback name is a `/etc/hosts` guarantee on unix: there
+    // `getnameinfo` returns `localhost`, so pin that exact name. Windows has
+    // no such alias — `getnameinfo` resolves 127.0.0.1 to the machine's own
+    // (runner-varying) name, so the per-pass shape assert is the whole
+    // R18-19 contract there and one pass suffices.
+    #[cfg(windows)]
+    disconnect_pass(0);
     #[cfg(unix)]
-    let mut last_stderr = String::new();
-    for attempt in 0..ATTEMPTS {
-        // Attempt 0 runs the raw race — the fast path a real disconnect hits.
-        // Later attempts widen the resolver's window stepwise: on macOS the
-        // lookup is an mDNSResponder IPC round-trip that can lose a ~30 ms
-        // connect-to-kill window on every pass (it lost 15 straight on a
-        // loaded CI runner), while a cache-bypass regression stays dotted-IP
-        // at ANY width and still fails every attempt.
-        let grace = Duration::from_millis(250 * attempt as u64);
-        let (stdout, stderr) = run_disconnect_scenario(grace);
-        assert_disconnect_contract(&stdout, &stderr);
-        // The resolved loopback name is a `/etc/hosts` guarantee on unix:
-        // there `getnameinfo` returns `localhost`, so pin that exact name.
-        // Windows has no such alias — `getnameinfo` resolves 127.0.0.1 to the
-        // machine's own (runner-varying) name, so the per-pass shape assert
-        // above is the whole R18-19 contract there and one pass suffices.
-        #[cfg(unix)]
-        {
+    {
+        const ATTEMPTS: usize = 5;
+        let mut last_stderr = String::new();
+        for attempt in 0..ATTEMPTS {
+            let stderr = disconnect_pass(attempt);
             if stderr.contains("    Context: \"localhost:") {
-                resolver_won = true;
-                break;
+                return;
             }
             last_stderr = stderr;
         }
-        #[cfg(windows)]
-        break;
+        panic!(
+            "the exception context never showed the resolved peer name in \
+             {ATTEMPTS} passes — C's `tcpiiu::getHostName` yields it once its \
+             async engine has answered, so a warmed loopback circuit must \
+             resolve within the attempt budget; last stderr: {last_stderr:?}"
+        );
     }
-    #[cfg(unix)]
-    assert!(
-        resolver_won,
-        "the exception context never showed the resolved peer name in \
-         {ATTEMPTS} passes — C's `tcpiiu::getHostName` yields it once its \
-         async engine has answered, so a warmed loopback circuit must \
-         resolve within the attempt budget; last stderr: {last_stderr:?}"
-    );
 }
 
-use common::budget;
+/// One disconnect scenario held to the deterministic contract; its stderr.
+fn disconnect_pass(attempt: usize) -> String {
+    // Attempt 0 runs the raw race — the fast path a real disconnect hits.
+    // Later attempts widen the resolver's window stepwise: on macOS the
+    // lookup is an mDNSResponder IPC round-trip that can lose a ~30 ms
+    // connect-to-kill window on every pass (it lost 15 straight on a
+    // loaded CI runner), while a cache-bypass regression stays dotted-IP
+    // at ANY width and still fails every attempt.
+    let grace = Duration::from_millis(250 * attempt as u64);
+    let (stdout, stderr) = run_disconnect_scenario(grace);
+    assert_disconnect_contract(&stdout, &stderr);
+    stderr
+}

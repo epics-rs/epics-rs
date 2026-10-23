@@ -36,30 +36,30 @@
 # `Record::field_no_mod`, which already owns it; the static entry below is the
 # FIFO default.
 #
-# record.FIELD          DBF type        special     dyn         C source
+# record.FIELD          DBF type        special     dyn         size    C source
 # ---------------------------------------------------------------------------
 
 # waveform/aai/aao: the VAL array's element type IS `FTVL`, its count `NELM`.
-waveform.VAL            DBF_DOUBLE      SPC_DBADDR  FTVL        waveformRecord.c:179-189
-aai.VAL                 DBF_DOUBLE      SPC_DBADDR  FTVL        aaiRecord.c:206-215
-aao.VAL                 DBF_DOUBLE      SPC_DBADDR  FTVL        aaoRecord.c:211-220
+waveform.VAL            DBF_DOUBLE      SPC_DBADDR  FTVL        -       waveformRecord.c:179-189
+aai.VAL                 DBF_DOUBLE      SPC_DBADDR  FTVL        -       aaiRecord.c:206-215
+aao.VAL                 DBF_DOUBLE      SPC_DBADDR  FTVL        -       aaoRecord.c:211-220
 
 # subArray: same shape — element type `FTVL`, but the count is `MALM` (the
 # allocated array), not `NELM` (the sub-array the record extracts from it).
-subArray.VAL            DBF_DOUBLE      SPC_DBADDR  FTVL        subArrayRecord.c:160-170
+subArray.VAL            DBF_DOUBLE      SPC_DBADDR  FTVL        -       subArrayRecord.c:160-170
 
 # mbbo: VAL is DBF_ENUM only when state strings are defined. With no ZRST..FFST,
 # `sdef` is false and C re-types VAL to DBF_USHORT — which CA promotes to
 # DBR_LONG, so a default mbbo's VAL is served as a LONG, not an ENUM.
-mbbo.VAL                DBF_USHORT      SPC_DBADDR  SDEF        mbboRecord.c:300-313
+mbbo.VAL                DBF_USHORT      SPC_DBADDR  SDEF        -       mbboRecord.c:300-313
 
 # compress: the circular buffer is always doubles, `NSAM` deep.
-compress.VAL            DBF_DOUBLE      SPC_DBADDR  -           compressRecord.c:395-407
+compress.VAL            DBF_DOUBLE      SPC_DBADDR  -           -       compressRecord.c:395-407
 
 # histogram: the bin counts are epicsUInt32, `NELM` deep
 # (`histogramRecord.c:303`). CA has no unsigned long, so C serves them as
 # DBR_DOUBLE — `DbFieldType::ULong` reproduces that via `ca_wire_type`.
-histogram.VAL           DBF_ULONG       SPC_DBADDR  -           histogramRecord.c:299-308
+histogram.VAL           DBF_ULONG       SPC_DBADDR  -           -       histogramRecord.c:299-308
 
 # lsi/lso/printf: a long string is a `char *` of `SIZV` bytes. Over plain CA the
 # field is served as a single DBF_STRING (truncated to MAX_STRING_SIZE); the
@@ -72,57 +72,62 @@ histogram.VAL           DBF_ULONG       SPC_DBADDR  -           histogramRecord.
 # `no_elements`, `field_type` and `field_size` and never touches `special` — so
 # `printf.VAL` keeps the SPC_DBADDR its declaration gave it, and is writable
 # where `lsi.OVAL`/`lso.OVAL` are not.
-lsi.VAL                 DBF_STRING      SPC_MOD     -           lsiRecord.c:122-146
-lsi.OVAL                DBF_STRING      SPC_NOMOD   -           lsiRecord.c:122-146
-lso.VAL                 DBF_STRING      SPC_MOD     -           lsoRecord.c:164-188
-lso.OVAL                DBF_STRING      SPC_NOMOD   -           lsoRecord.c:164-188
-printf.VAL              DBF_STRING      SPC_DBADDR  -           printfRecord.c:408-424
+#
+# The `size` column names the field that sets C's `field_size` (`SIZV`). It
+# marks a long string, which pvxs tells apart from a `DBF_STRING` by
+# `field_size > MAX_STRING_SIZE+1` (`ioc/channel.cpp:58-67`); `scalcout.PAA`
+# below is a `DBF_STRING` of 40 and carries `-`.
+lsi.VAL                 DBF_STRING      SPC_MOD     -           SIZV    lsiRecord.c:122-146
+lsi.OVAL                DBF_STRING      SPC_NOMOD   -           SIZV    lsiRecord.c:122-146
+lso.VAL                 DBF_STRING      SPC_MOD     -           SIZV    lsoRecord.c:164-188
+lso.OVAL                DBF_STRING      SPC_NOMOD   -           SIZV    lsoRecord.c:164-188
+printf.VAL              DBF_STRING      SPC_DBADDR  -           SIZV    printfRecord.c:408-424
 
 # aSub: every input A..U and output VALA..VALU is a `void *` whose element type
 # is the matching `FTA`..`FTU` / `FTVA`..`FTVU` menu and whose count is
 # `NEA`..`NEU` / `NOA`..`NOU`. All twelve menus default to DOUBLE.
-aSub.A                  DBF_DOUBLE      SPC_DBADDR  FTA         aSubRecord.c:246-258
-aSub.B                  DBF_DOUBLE      SPC_DBADDR  FTB         aSubRecord.c:246-258
-aSub.C                  DBF_DOUBLE      SPC_DBADDR  FTC         aSubRecord.c:246-258
-aSub.D                  DBF_DOUBLE      SPC_DBADDR  FTD         aSubRecord.c:246-258
-aSub.E                  DBF_DOUBLE      SPC_DBADDR  FTE         aSubRecord.c:246-258
-aSub.F                  DBF_DOUBLE      SPC_DBADDR  FTF         aSubRecord.c:246-258
-aSub.G                  DBF_DOUBLE      SPC_DBADDR  FTG         aSubRecord.c:246-258
-aSub.H                  DBF_DOUBLE      SPC_DBADDR  FTH         aSubRecord.c:246-258
-aSub.I                  DBF_DOUBLE      SPC_DBADDR  FTI         aSubRecord.c:246-258
-aSub.J                  DBF_DOUBLE      SPC_DBADDR  FTJ         aSubRecord.c:246-258
-aSub.K                  DBF_DOUBLE      SPC_DBADDR  FTK         aSubRecord.c:246-258
-aSub.L                  DBF_DOUBLE      SPC_DBADDR  FTL         aSubRecord.c:246-258
-aSub.M                  DBF_DOUBLE      SPC_DBADDR  FTM         aSubRecord.c:246-258
-aSub.N                  DBF_DOUBLE      SPC_DBADDR  FTN         aSubRecord.c:246-258
-aSub.O                  DBF_DOUBLE      SPC_DBADDR  FTO         aSubRecord.c:246-258
-aSub.P                  DBF_DOUBLE      SPC_DBADDR  FTP         aSubRecord.c:246-258
-aSub.Q                  DBF_DOUBLE      SPC_DBADDR  FTQ         aSubRecord.c:246-258
-aSub.R                  DBF_DOUBLE      SPC_DBADDR  FTR         aSubRecord.c:246-258
-aSub.S                  DBF_DOUBLE      SPC_DBADDR  FTS         aSubRecord.c:246-258
-aSub.T                  DBF_DOUBLE      SPC_DBADDR  FTT         aSubRecord.c:246-258
-aSub.U                  DBF_DOUBLE      SPC_DBADDR  FTU         aSubRecord.c:246-258
-aSub.VALA               DBF_DOUBLE      SPC_DBADDR  FTVA        aSubRecord.c:246-258
-aSub.VALB               DBF_DOUBLE      SPC_DBADDR  FTVB        aSubRecord.c:246-258
-aSub.VALC               DBF_DOUBLE      SPC_DBADDR  FTVC        aSubRecord.c:246-258
-aSub.VALD               DBF_DOUBLE      SPC_DBADDR  FTVD        aSubRecord.c:246-258
-aSub.VALE               DBF_DOUBLE      SPC_DBADDR  FTVE        aSubRecord.c:246-258
-aSub.VALF               DBF_DOUBLE      SPC_DBADDR  FTVF        aSubRecord.c:246-258
-aSub.VALG               DBF_DOUBLE      SPC_DBADDR  FTVG        aSubRecord.c:246-258
-aSub.VALH               DBF_DOUBLE      SPC_DBADDR  FTVH        aSubRecord.c:246-258
-aSub.VALI               DBF_DOUBLE      SPC_DBADDR  FTVI        aSubRecord.c:246-258
-aSub.VALJ               DBF_DOUBLE      SPC_DBADDR  FTVJ        aSubRecord.c:246-258
-aSub.VALK               DBF_DOUBLE      SPC_DBADDR  FTVK        aSubRecord.c:246-258
-aSub.VALL               DBF_DOUBLE      SPC_DBADDR  FTVL        aSubRecord.c:246-258
-aSub.VALM               DBF_DOUBLE      SPC_DBADDR  FTVM        aSubRecord.c:246-258
-aSub.VALN               DBF_DOUBLE      SPC_DBADDR  FTVN        aSubRecord.c:246-258
-aSub.VALO               DBF_DOUBLE      SPC_DBADDR  FTVO        aSubRecord.c:246-258
-aSub.VALP               DBF_DOUBLE      SPC_DBADDR  FTVP        aSubRecord.c:246-258
-aSub.VALQ               DBF_DOUBLE      SPC_DBADDR  FTVQ        aSubRecord.c:246-258
-aSub.VALR               DBF_DOUBLE      SPC_DBADDR  FTVR        aSubRecord.c:246-258
-aSub.VALS               DBF_DOUBLE      SPC_DBADDR  FTVS        aSubRecord.c:246-258
-aSub.VALT               DBF_DOUBLE      SPC_DBADDR  FTVT        aSubRecord.c:246-258
-aSub.VALU               DBF_DOUBLE      SPC_DBADDR  FTVU        aSubRecord.c:246-258
+aSub.A                  DBF_DOUBLE      SPC_DBADDR  FTA         -       aSubRecord.c:246-258
+aSub.B                  DBF_DOUBLE      SPC_DBADDR  FTB         -       aSubRecord.c:246-258
+aSub.C                  DBF_DOUBLE      SPC_DBADDR  FTC         -       aSubRecord.c:246-258
+aSub.D                  DBF_DOUBLE      SPC_DBADDR  FTD         -       aSubRecord.c:246-258
+aSub.E                  DBF_DOUBLE      SPC_DBADDR  FTE         -       aSubRecord.c:246-258
+aSub.F                  DBF_DOUBLE      SPC_DBADDR  FTF         -       aSubRecord.c:246-258
+aSub.G                  DBF_DOUBLE      SPC_DBADDR  FTG         -       aSubRecord.c:246-258
+aSub.H                  DBF_DOUBLE      SPC_DBADDR  FTH         -       aSubRecord.c:246-258
+aSub.I                  DBF_DOUBLE      SPC_DBADDR  FTI         -       aSubRecord.c:246-258
+aSub.J                  DBF_DOUBLE      SPC_DBADDR  FTJ         -       aSubRecord.c:246-258
+aSub.K                  DBF_DOUBLE      SPC_DBADDR  FTK         -       aSubRecord.c:246-258
+aSub.L                  DBF_DOUBLE      SPC_DBADDR  FTL         -       aSubRecord.c:246-258
+aSub.M                  DBF_DOUBLE      SPC_DBADDR  FTM         -       aSubRecord.c:246-258
+aSub.N                  DBF_DOUBLE      SPC_DBADDR  FTN         -       aSubRecord.c:246-258
+aSub.O                  DBF_DOUBLE      SPC_DBADDR  FTO         -       aSubRecord.c:246-258
+aSub.P                  DBF_DOUBLE      SPC_DBADDR  FTP         -       aSubRecord.c:246-258
+aSub.Q                  DBF_DOUBLE      SPC_DBADDR  FTQ         -       aSubRecord.c:246-258
+aSub.R                  DBF_DOUBLE      SPC_DBADDR  FTR         -       aSubRecord.c:246-258
+aSub.S                  DBF_DOUBLE      SPC_DBADDR  FTS         -       aSubRecord.c:246-258
+aSub.T                  DBF_DOUBLE      SPC_DBADDR  FTT         -       aSubRecord.c:246-258
+aSub.U                  DBF_DOUBLE      SPC_DBADDR  FTU         -       aSubRecord.c:246-258
+aSub.VALA               DBF_DOUBLE      SPC_DBADDR  FTVA        -       aSubRecord.c:246-258
+aSub.VALB               DBF_DOUBLE      SPC_DBADDR  FTVB        -       aSubRecord.c:246-258
+aSub.VALC               DBF_DOUBLE      SPC_DBADDR  FTVC        -       aSubRecord.c:246-258
+aSub.VALD               DBF_DOUBLE      SPC_DBADDR  FTVD        -       aSubRecord.c:246-258
+aSub.VALE               DBF_DOUBLE      SPC_DBADDR  FTVE        -       aSubRecord.c:246-258
+aSub.VALF               DBF_DOUBLE      SPC_DBADDR  FTVF        -       aSubRecord.c:246-258
+aSub.VALG               DBF_DOUBLE      SPC_DBADDR  FTVG        -       aSubRecord.c:246-258
+aSub.VALH               DBF_DOUBLE      SPC_DBADDR  FTVH        -       aSubRecord.c:246-258
+aSub.VALI               DBF_DOUBLE      SPC_DBADDR  FTVI        -       aSubRecord.c:246-258
+aSub.VALJ               DBF_DOUBLE      SPC_DBADDR  FTVJ        -       aSubRecord.c:246-258
+aSub.VALK               DBF_DOUBLE      SPC_DBADDR  FTVK        -       aSubRecord.c:246-258
+aSub.VALL               DBF_DOUBLE      SPC_DBADDR  FTVL        -       aSubRecord.c:246-258
+aSub.VALM               DBF_DOUBLE      SPC_DBADDR  FTVM        -       aSubRecord.c:246-258
+aSub.VALN               DBF_DOUBLE      SPC_DBADDR  FTVN        -       aSubRecord.c:246-258
+aSub.VALO               DBF_DOUBLE      SPC_DBADDR  FTVO        -       aSubRecord.c:246-258
+aSub.VALP               DBF_DOUBLE      SPC_DBADDR  FTVP        -       aSubRecord.c:246-258
+aSub.VALQ               DBF_DOUBLE      SPC_DBADDR  FTVQ        -       aSubRecord.c:246-258
+aSub.VALR               DBF_DOUBLE      SPC_DBADDR  FTVR        -       aSubRecord.c:246-258
+aSub.VALS               DBF_DOUBLE      SPC_DBADDR  FTVS        -       aSubRecord.c:246-258
+aSub.VALT               DBF_DOUBLE      SPC_DBADDR  FTVT        -       aSubRecord.c:246-258
+aSub.VALU               DBF_DOUBLE      SPC_DBADDR  FTVU        -       aSubRecord.c:246-258
 
 # --- synApps calc module -----------------------------------------------------
 # These record types are not in the base softIoc, so they carry no row in
@@ -130,39 +135,39 @@ aSub.VALU               DBF_DOUBLE      SPC_DBADDR  FTVU        aSubRecord.c:246
 
 # aCalcout: the array inputs AA..LL and the array outputs AVAL/OAV are
 # `double *` of NUSE/NELM elements.
-acalcout.AVAL           DBF_DOUBLE      SPC_DBADDR  -           aCalcoutRecord.c cvt_dbaddr
-acalcout.OAV            DBF_DOUBLE      SPC_DBADDR  -           aCalcoutRecord.c cvt_dbaddr
-acalcout.AA             DBF_DOUBLE      SPC_DBADDR  -           aCalcoutRecord.c cvt_dbaddr
-acalcout.BB             DBF_DOUBLE      SPC_DBADDR  -           aCalcoutRecord.c cvt_dbaddr
-acalcout.CC             DBF_DOUBLE      SPC_DBADDR  -           aCalcoutRecord.c cvt_dbaddr
-acalcout.DD             DBF_DOUBLE      SPC_DBADDR  -           aCalcoutRecord.c cvt_dbaddr
-acalcout.EE             DBF_DOUBLE      SPC_DBADDR  -           aCalcoutRecord.c cvt_dbaddr
-acalcout.FF             DBF_DOUBLE      SPC_DBADDR  -           aCalcoutRecord.c cvt_dbaddr
-acalcout.GG             DBF_DOUBLE      SPC_DBADDR  -           aCalcoutRecord.c cvt_dbaddr
-acalcout.HH             DBF_DOUBLE      SPC_DBADDR  -           aCalcoutRecord.c cvt_dbaddr
-acalcout.II             DBF_DOUBLE      SPC_DBADDR  -           aCalcoutRecord.c cvt_dbaddr
-acalcout.JJ             DBF_DOUBLE      SPC_DBADDR  -           aCalcoutRecord.c cvt_dbaddr
-acalcout.KK             DBF_DOUBLE      SPC_DBADDR  -           aCalcoutRecord.c cvt_dbaddr
-acalcout.LL             DBF_DOUBLE      SPC_DBADDR  -           aCalcoutRecord.c cvt_dbaddr
+acalcout.AVAL           DBF_DOUBLE      SPC_DBADDR  -           -       aCalcoutRecord.c cvt_dbaddr
+acalcout.OAV            DBF_DOUBLE      SPC_DBADDR  -           -       aCalcoutRecord.c cvt_dbaddr
+acalcout.AA             DBF_DOUBLE      SPC_DBADDR  -           -       aCalcoutRecord.c cvt_dbaddr
+acalcout.BB             DBF_DOUBLE      SPC_DBADDR  -           -       aCalcoutRecord.c cvt_dbaddr
+acalcout.CC             DBF_DOUBLE      SPC_DBADDR  -           -       aCalcoutRecord.c cvt_dbaddr
+acalcout.DD             DBF_DOUBLE      SPC_DBADDR  -           -       aCalcoutRecord.c cvt_dbaddr
+acalcout.EE             DBF_DOUBLE      SPC_DBADDR  -           -       aCalcoutRecord.c cvt_dbaddr
+acalcout.FF             DBF_DOUBLE      SPC_DBADDR  -           -       aCalcoutRecord.c cvt_dbaddr
+acalcout.GG             DBF_DOUBLE      SPC_DBADDR  -           -       aCalcoutRecord.c cvt_dbaddr
+acalcout.HH             DBF_DOUBLE      SPC_DBADDR  -           -       aCalcoutRecord.c cvt_dbaddr
+acalcout.II             DBF_DOUBLE      SPC_DBADDR  -           -       aCalcoutRecord.c cvt_dbaddr
+acalcout.JJ             DBF_DOUBLE      SPC_DBADDR  -           -       aCalcoutRecord.c cvt_dbaddr
+acalcout.KK             DBF_DOUBLE      SPC_DBADDR  -           -       aCalcoutRecord.c cvt_dbaddr
+acalcout.LL             DBF_DOUBLE      SPC_DBADDR  -           -       aCalcoutRecord.c cvt_dbaddr
 
 # sCalcout: the string inputs PAA..PLL are `char *` long strings, served as a
 # single DBF_STRING over plain CA exactly like lsi/lso.
-scalcout.PAA            DBF_STRING      SPC_DBADDR  -           sCalcoutRecord.c cvt_dbaddr
-scalcout.PBB            DBF_STRING      SPC_DBADDR  -           sCalcoutRecord.c cvt_dbaddr
-scalcout.PCC            DBF_STRING      SPC_DBADDR  -           sCalcoutRecord.c cvt_dbaddr
-scalcout.PDD            DBF_STRING      SPC_DBADDR  -           sCalcoutRecord.c cvt_dbaddr
-scalcout.PEE            DBF_STRING      SPC_DBADDR  -           sCalcoutRecord.c cvt_dbaddr
-scalcout.PFF            DBF_STRING      SPC_DBADDR  -           sCalcoutRecord.c cvt_dbaddr
-scalcout.PGG            DBF_STRING      SPC_DBADDR  -           sCalcoutRecord.c cvt_dbaddr
-scalcout.PHH            DBF_STRING      SPC_DBADDR  -           sCalcoutRecord.c cvt_dbaddr
-scalcout.PII            DBF_STRING      SPC_DBADDR  -           sCalcoutRecord.c cvt_dbaddr
-scalcout.PJJ            DBF_STRING      SPC_DBADDR  -           sCalcoutRecord.c cvt_dbaddr
-scalcout.PKK            DBF_STRING      SPC_DBADDR  -           sCalcoutRecord.c cvt_dbaddr
-scalcout.PLL            DBF_STRING      SPC_DBADDR  -           sCalcoutRecord.c cvt_dbaddr
+scalcout.PAA            DBF_STRING      SPC_DBADDR  -           -       sCalcoutRecord.c cvt_dbaddr
+scalcout.PBB            DBF_STRING      SPC_DBADDR  -           -       sCalcoutRecord.c cvt_dbaddr
+scalcout.PCC            DBF_STRING      SPC_DBADDR  -           -       sCalcoutRecord.c cvt_dbaddr
+scalcout.PDD            DBF_STRING      SPC_DBADDR  -           -       sCalcoutRecord.c cvt_dbaddr
+scalcout.PEE            DBF_STRING      SPC_DBADDR  -           -       sCalcoutRecord.c cvt_dbaddr
+scalcout.PFF            DBF_STRING      SPC_DBADDR  -           -       sCalcoutRecord.c cvt_dbaddr
+scalcout.PGG            DBF_STRING      SPC_DBADDR  -           -       sCalcoutRecord.c cvt_dbaddr
+scalcout.PHH            DBF_STRING      SPC_DBADDR  -           -       sCalcoutRecord.c cvt_dbaddr
+scalcout.PII            DBF_STRING      SPC_DBADDR  -           -       sCalcoutRecord.c cvt_dbaddr
+scalcout.PJJ            DBF_STRING      SPC_DBADDR  -           -       sCalcoutRecord.c cvt_dbaddr
+scalcout.PKK            DBF_STRING      SPC_DBADDR  -           -       sCalcoutRecord.c cvt_dbaddr
+scalcout.PLL            DBF_STRING      SPC_DBADDR  -           -       sCalcoutRecord.c cvt_dbaddr
 
 # --- asyn module -------------------------------------------------------------
 # asynRecord's BOUT/BINP are `epicsInt8[]` binary buffers of OMAX/IMAX bytes;
 # ERRS is a `char *` error string.
-asyn.BOUT               DBF_CHAR        SPC_DBADDR  -           asynRecord.c cvt_dbaddr
-asyn.BINP               DBF_CHAR        SPC_DBADDR  -           asynRecord.c cvt_dbaddr
-asyn.ERRS               DBF_CHAR        SPC_NOMOD   -           asynRecord.c cvt_dbaddr
+asyn.BOUT               DBF_CHAR        SPC_DBADDR  -           -       asynRecord.c cvt_dbaddr
+asyn.BINP               DBF_CHAR        SPC_DBADDR  -           -       asynRecord.c cvt_dbaddr
+asyn.ERRS               DBF_CHAR        SPC_NOMOD   -           -       asynRecord.c cvt_dbaddr

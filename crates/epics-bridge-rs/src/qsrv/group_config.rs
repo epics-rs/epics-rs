@@ -21,6 +21,7 @@
 //! }
 //! ```
 
+use epics_pva_rs::pvdata::convert::parse_to_i64;
 use serde::Deserialize;
 use std::collections::HashMap;
 
@@ -72,8 +73,11 @@ pub struct GroupPvDef {
     /// a `!Send` guard across it would not have compiled at the
     /// connection-task spawn site. See `record_lock.rs`'s module doc for the
     /// L33 → L1 → L46 acquisition order this lock heads.
+    ///
+    /// Unlisted: pvxs has no per-group lock (`ioc/group.h:78` is the one
+    /// `groupMapMutex`), so `epicsMutexShowAll` has no entry for it.
     pub atomic_write_lock:
-        std::sync::Arc<epics_base_rs::runtime::sync::PriorityInheritanceMutex<()>>,
+        std::sync::Arc<epics_base_rs::runtime::sync::UnlistedPriorityInheritanceMutex<()>>,
     /// One bound [`MemberChannel`] per entry of [`Self::members`], in the
     /// same order — the port's `Group::fields` (`ioc/group.h:44`).
     ///
@@ -98,8 +102,9 @@ pub struct GroupMember {
     /// Field path within the group structure (e.g., "temperature").
     pub field_name: String,
     /// Source record and field (e.g., "TEMP:ai.VAL").
-    /// Empty for Structure and Const mappings (no backing channel).
-    pub channel: String,
+    /// Empty for Structure and Const mappings (no backing channel). Bytes:
+    /// an info(Q:group) prefixes it with the record's own name.
+    pub channel: Vec<u8>,
     /// How to map the record field to PVA structure.
     pub mapping: FieldMapping,
     /// Which fields to update when this member changes.
@@ -187,12 +192,16 @@ impl GroupPvDef {
         );
     }
 
-    fn resolve_self_trigger_default(&mut self) {
-        let has_explicit = self
-            .members
+    /// pvxs's `hasTriggers`: some member names a non-empty `+trigger`
+    /// (`groupconfigprocessor.cpp:300-303`).
+    pub fn has_triggers(&self) -> bool {
+        self.members
             .iter()
-            .any(|m| matches!(m.triggers, TriggerDef::All | TriggerDef::Fields(_)));
-        if has_explicit {
+            .any(|m| matches!(m.triggers, TriggerDef::All | TriggerDef::Fields(_)))
+    }
+
+    fn resolve_self_trigger_default(&mut self) {
+        if self.has_triggers() {
             for m in &mut self.members {
                 if matches!(m.triggers, TriggerDef::SelfOnly) {
                     m.triggers = TriggerDef::None;
@@ -299,7 +308,7 @@ pub fn parse_group_config(json: &str) -> BridgeResult<Vec<GroupPvDef>> {
         // A semantic error in one group must not hide valid siblings in
         // the same file; the JSON *syntax* error above still rejects the
         // whole file (matching the strict-parse boundary).
-        match raw_to_group_def(name.clone(), raw) {
+        match raw_to_group_def(name.clone(), raw, b"") {
             Ok(def) => groups.push(def),
             Err(e) => tracing::warn!(group = %name, error = %e, "ignoring invalid QSRV group"),
         }
@@ -320,10 +329,7 @@ pub fn parse_group_config(json: &str) -> BridgeResult<Vec<GroupPvDef>> {
 ///     })
 /// }
 /// ```
-///
-/// The `record_name` is used as channel prefix: if `+channel` is a bare field
-/// name (no `:` separator), it becomes `"record_name.FIELD"`.
-pub fn parse_info_group(record_name: &str, json: &str) -> BridgeResult<Vec<GroupPvDef>> {
+pub fn parse_info_group(record_name: &[u8], json: &str) -> BridgeResult<Vec<GroupPvDef>> {
     let normalized = relaxed_group_json(json)?;
     let root: HashMap<String, RawGroupDef> = serde_json::from_str(&normalized)
         .map_err(|e| BridgeError::GroupConfigError(e.to_string()))?;
@@ -332,29 +338,16 @@ pub fn parse_info_group(record_name: &str, json: &str) -> BridgeResult<Vec<Group
     for (name, raw) in root {
         // Per-group recovery, as in `parse_group_config` — one invalid
         // group in an info(Q:group) body must not drop its siblings
-        // (pvxs groupconfigprocessor.cpp:128-163).
-        let mut def = match raw_to_group_def(name.clone(), raw) {
+        // (pvxs groupconfigprocessor.cpp:128-163). pvxs prefixes EVERY `+channel` in a record's info(Q:group) with
+        // `"{record}."`, including ones that already hold ':' or '.'
+        // (groupprocessorcontext.cpp:65-66, groupconfigprocessor.cpp:810-818).
+        let def = match raw_to_group_def(name.clone(), raw, &[record_name, b"."].concat()) {
             Ok(d) => d,
             Err(e) => {
                 tracing::warn!(group = %name, error = %e, "ignoring invalid QSRV info(Q:group) group");
                 continue;
             }
         };
-        // pvxs prefixes EVERY `+channel` in a record's info(Q:group) with
-        // `"{record}."` — `channelPrefix = dbRecordName + "."` is applied
-        // unconditionally (groupprocessorcontext.cpp:65-66,
-        // groupconfigprocessor.cpp:810-818); it does NOT skip values that
-        // already contain ':' or '.'. Record-info group JSON is always
-        // record-relative; absolute PV names are reachable only through the
-        // file-based dbLoadGroup path (the empty-prefix case). The earlier
-        // ':'/'.' scan let an info(Q:group) member reference an unrelated
-        // absolute PV that pvxs would not model. Skip only the channel-less
-        // Structure/Const members (empty channel).
-        for member in &mut def.members {
-            if !member.channel.is_empty() {
-                member.channel = format!("{}.{}", record_name, member.channel);
-            }
-        }
         groups.push(def);
     }
     groups.sort_by(|a, b| a.name.cmp(&b.name));
@@ -386,9 +379,10 @@ pub fn merge_group_defs(existing: &mut HashMap<String, GroupPvDef>, new_defs: Ve
                 .collect();
             for member in def.members {
                 if !seen.insert(member.field_name.clone()) {
-                    eprintln!(
+                    epics_base_rs::stderr_println!(
                         "warning: group '{}': ignoring duplicate mapping for field '{}'",
-                        def.name, member.field_name
+                        def.name,
+                        member.field_name
                     );
                     continue;
                 }
@@ -418,9 +412,10 @@ pub fn merge_group_defs(existing: &mut HashMap<String, GroupPvDef>, new_defs: Ve
             // `+atomic:false`.
             if def.atomic_is_set {
                 if existing_def.atomic_is_set && existing_def.atomic != def.atomic {
-                    eprintln!(
+                    epics_base_rs::stderr_println!(
                         "warning: group '{}' atomic setting inconsistent, using latest ({})",
-                        def.name, def.atomic
+                        def.name,
+                        def.atomic
                     );
                 }
                 existing_def.atomic = def.atomic;
@@ -558,40 +553,12 @@ fn json_value_as_string(v: &serde_json::Value) -> Option<String> {
     }
 }
 
-/// Parse a string to `i64` exactly as pvxs `parseTo<int64_t>` does
-/// (`util.cpp:803-817`): `std::stoll(s, &idx, 0)` — base auto-detected
-/// (`0x`/`0X` hex, a leading `0` octal, else decimal), an optional sign,
-/// leading whitespace skipped and trailing whitespace tolerated; any other
-/// trailing character is `NoConvert`. `None` mirrors that throw.
-fn parse_stoll_base0(s: &str) -> Option<i64> {
-    // stoll skips leading whitespace and its caller tolerates trailing
-    // whitespace, so trimming both reproduces the accepted set.
-    let t = s.trim();
-    let (neg, body) = match t.strip_prefix('-') {
-        Some(rest) => (true, rest),
-        None => (false, t.strip_prefix('+').unwrap_or(t)),
-    };
-    if body.is_empty() {
-        return None;
-    }
-    let (radix, digits) =
-        if let Some(hex) = body.strip_prefix("0x").or_else(|| body.strip_prefix("0X")) {
-            (16, hex)
-        } else if body.len() > 1 && body.starts_with('0') {
-            (8, &body[1..])
-        } else {
-            (10, body)
-        };
-    let mag = i64::from_str_radix(digits, radix).ok()?;
-    if neg { mag.checked_neg() } else { Some(mag) }
-}
-
 /// Coerce a JSON `+putorder` value to an `i64` exactly as pvxs
 /// `Value::as<int64_t>()` coerces the parsed scalar
 /// (groupprocessorcontext.cpp:75 → data.cpp:426/448): a JSON integer maps
 /// directly; a JSON real truncates toward zero (`copyOutScalar` static_cast);
 /// a JSON bool becomes 1/0; a JSON string is parsed via
-/// [`parse_stoll_base0`] (pvxs `parseTo<int64_t>`). Any other value (array,
+/// [`parse_to_i64`] (pvxs `parseTo<int64_t>`). Any other value (array,
 /// object, null) or an unparsable string is unconvertible — `None` → the caller
 /// SKIPS this group (stricter than pvxs, which swallows the `as<int64_t>`
 /// NoConvert and serves the group; see the annotation-coercion divergence note
@@ -603,12 +570,18 @@ fn json_value_as_i64(v: &serde_json::Value) -> Option<i64> {
             .or_else(|| n.as_u64().map(|u| u as i64))
             .or_else(|| n.as_f64().map(|f| f as i64)),
         serde_json::Value::Bool(b) => Some(*b as i64),
-        serde_json::Value::String(s) => parse_stoll_base0(s),
+        serde_json::Value::String(s) => parse_to_i64(s).ok(),
         _ => None,
     }
 }
 
-fn raw_to_group_def(name: String, raw: RawGroupDef) -> BridgeResult<GroupPvDef> {
+/// `channel_prefix` is pvxs's `channelPrefix`: `"REC."` for a record's
+/// info(Q:group), empty for a group file.
+fn raw_to_group_def(
+    name: String,
+    raw: RawGroupDef,
+    channel_prefix: &[u8],
+) -> BridgeResult<GroupPvDef> {
     let mut members = Vec::new();
 
     for (field_name, value) in &raw.fields {
@@ -617,7 +590,7 @@ fn raw_to_group_def(name: String, raw: RawGroupDef) -> BridgeResult<GroupPvDef> 
             continue;
         }
 
-        let member = parse_member(field_name, value)?;
+        let member = parse_member(field_name, value, channel_prefix)?;
         // pvxs `defineFields` only permits an empty top-level field name
         // for a metadata mapping: `+type:"meta"` merges alarm/timeStamp at
         // the struct root, every other mapping must be named
@@ -628,9 +601,10 @@ fn raw_to_group_def(name: String, raw: RawGroupDef) -> BridgeResult<GroupPvDef> 
         // (group.rs) and silently produced no runtime value AND no
         // descriptor member — a misconfigured group that loaded clean.
         if member.field_name.is_empty() && member.mapping != FieldMapping::Meta {
-            eprintln!(
+            epics_base_rs::stderr_println!(
                 "warning: group '{}': only +type:\"meta\" can be mapped at struct top; ignoring empty-named field with mapping {:?}",
-                name, member.mapping
+                name,
+                member.mapping
             );
             continue;
         }
@@ -668,18 +642,22 @@ fn raw_to_group_def(name: String, raw: RawGroupDef) -> BridgeResult<GroupPvDef> 
                     // every sibling group still load. Do NOT fail the
                     // whole config. The unknown ref is then filtered out
                     // at runtime in `value_event_mark`.
-                    eprintln!(
+                    epics_base_rs::stderr_println!(
                         "Error: group '{}': member '{}' defines trigger to nonexistent field '{}' (ignored)",
-                        name, member.field_name, target
+                        name,
+                        member.field_name,
+                        target
                     );
                     continue;
                 }
                 // A channel-less target (Structure/Const) is dropped too —
                 // pvxs ignores these (groupconfigprocessor.cpp:405-407).
                 if !channeled_names.contains(target.as_str()) {
-                    eprintln!(
+                    epics_base_rs::stderr_println!(
                         "warning: group '{}': trigger '{}' on member '{}' targets a field without a channel (ignored)",
-                        name, target, member.field_name
+                        name,
+                        target,
+                        member.field_name
                     );
                 }
             }
@@ -741,7 +719,7 @@ fn raw_to_group_def(name: String, raw: RawGroupDef) -> BridgeResult<GroupPvDef> 
         atomic_is_set,
         members,
         atomic_write_lock: std::sync::Arc::new(
-            epics_base_rs::runtime::sync::PriorityInheritanceMutex::new(()),
+            epics_base_rs::runtime::sync::UnlistedPriorityInheritanceMutex::new(()),
         ),
         // Bound by the `finalize()` below, once `members` is settled.
         channels: std::sync::Arc::new(Vec::new()),
@@ -772,7 +750,11 @@ fn validate_field_name(field_name: &str) -> BridgeResult<()> {
         .map_err(BridgeError::GroupConfigError)
 }
 
-fn parse_member(field_name: &str, value: &serde_json::Value) -> BridgeResult<GroupMember> {
+fn parse_member(
+    field_name: &str,
+    value: &serde_json::Value,
+    channel_prefix: &[u8],
+) -> BridgeResult<GroupMember> {
     // pvxs constructs `FieldName(def.name)` before anything else in the field
     // definition; a malformed path throws and aborts this group's build.
     validate_field_name(field_name)?;
@@ -823,7 +805,7 @@ fn parse_member(field_name: &str, value: &serde_json::Value) -> BridgeResult<Gro
     let channel = match mapping {
         FieldMapping::Structure | FieldMapping::Const => {
             if obj.get("+channel").is_some() {
-                eprintln!(
+                epics_base_rs::stderr_println!(
                     "warning: field '{field_name}' has +type={:?}, ignoring +channel",
                     if mapping == FieldMapping::Structure {
                         "structure"
@@ -832,7 +814,7 @@ fn parse_member(field_name: &str, value: &serde_json::Value) -> BridgeResult<Gro
                     }
                 );
             }
-            String::new()
+            Vec::new()
         }
         _ => {
             // pvxs reads `+channel` via `value.as<std::string>()`
@@ -844,11 +826,12 @@ fn parse_member(field_name: &str, value: &serde_json::Value) -> BridgeResult<Gro
             let v = obj.get("+channel").ok_or_else(|| {
                 BridgeError::GroupConfigError(format!("field '{field_name}' missing +channel"))
             })?;
-            json_value_as_string(v).ok_or_else(|| {
+            let channel = json_value_as_string(v).ok_or_else(|| {
                 BridgeError::GroupConfigError(format!(
                     "field '{field_name}': +channel value {v} is not a string, number, or bool"
                 ))
-            })?
+            })?;
+            [channel_prefix, channel.as_bytes()].concat()
         }
     };
 
@@ -1102,6 +1085,23 @@ fn const_from_array(items: &[serde_json::Value]) -> Result<epics_pva_rs::pvdata:
 mod tests {
     use super::*;
 
+    /// pvxs lists no lock per group, so a parsed group adds no entry to
+    /// `epicsMutexShowAll`'s list.
+    #[test]
+    fn a_group_puts_nothing_on_the_mutex_list() {
+        let groups = parse_group_config(
+            r#"{"G:list": {"+atomic": true, "v": {"+type": "scalar", "+channel": "R:ai"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(groups.len(), 1);
+        let listed: Vec<_> = epics_base_rs::runtime::sync::mutex_report(false)
+            .shown
+            .into_iter()
+            .filter(|e| e.file() == file!())
+            .collect();
+        assert!(listed.is_empty(), "{listed:?}");
+    }
+
     #[test]
     fn parse_basic_group() {
         let json = r#"{
@@ -1134,14 +1134,14 @@ mod tests {
 
         let temp = &g.members[0];
         assert_eq!(temp.field_name, "temperature");
-        assert_eq!(temp.channel, "TEMP:ai");
+        assert_eq!(temp.channel, b"TEMP:ai");
         assert_eq!(temp.mapping, FieldMapping::Scalar);
         assert!(matches!(temp.triggers, TriggerDef::All));
         assert_eq!(temp.put_order, Some(0));
 
         let press = &g.members[1];
         assert_eq!(press.field_name, "pressure");
-        assert_eq!(press.channel, "PRESS:ai");
+        assert_eq!(press.channel, b"PRESS:ai");
         if let TriggerDef::Fields(ref fields) = press.triggers {
             assert_eq!(fields, &["temperature", "pressure"]);
         } else {
@@ -1209,10 +1209,10 @@ mod tests {
         assert_eq!(g.struct_id.as_deref(), Some("epics:nt/NTGroup:1.0"));
         assert!(g.atomic);
         let f1 = g.members.iter().find(|m| m.field_name == "fld1").unwrap();
-        assert_eq!(f1.channel, "VAL");
+        assert_eq!(f1.channel, b"VAL");
         assert_eq!(f1.put_order, Some(0));
         let f2 = g.members.iter().find(|m| m.field_name == "fld2").unwrap();
-        assert_eq!(f2.channel, "RVAL");
+        assert_eq!(f2.channel, b"RVAL");
         match &f2.triggers {
             TriggerDef::Fields(t) => assert_eq!(t, &vec!["fld1".to_string(), "fld2".to_string()]),
             other => panic!("expected named trigger fields, got {other:?}"),
@@ -1286,7 +1286,7 @@ mod tests {
         let defs = parse_group_config(json).expect("bare identifier keys are JSON5");
         assert_eq!(defs.len(), 1);
         assert_eq!(defs[0].name, "grp");
-        assert_eq!(defs[0].members[0].channel, "X.VAL");
+        assert_eq!(defs[0].members[0].channel, b"X.VAL");
     }
 
     /// pva2pva enables YAJL `allow_comments` (pva2pva
@@ -1304,7 +1304,7 @@ mod tests {
         }"#;
         let defs = parse_group_config(json).expect("comments must be stripped");
         assert_eq!(defs.len(), 1);
-        assert_eq!(defs[0].members[0].channel, "X.VAL");
+        assert_eq!(defs[0].members[0].channel, b"X.VAL");
     }
 
     /// The normalizer is string-literal aware: comment markers and a
@@ -1318,7 +1318,7 @@ mod tests {
             }
         }"#;
         let defs = parse_group_config(json).expect("strings with markers must parse");
-        assert_eq!(defs[0].members[0].channel, "A/*not a comment*/B//x");
+        assert_eq!(defs[0].members[0].channel, b"A/*not a comment*/B//x");
     }
 
     /// YAJL treats a
@@ -1332,13 +1332,13 @@ mod tests {
     fn group_json_block_comment_separates_tokens() {
         let json = r#"{ "g": { "f": {+channel:"VAL", +putorder:1/*typo*/2} } }"#;
         assert!(
-            parse_info_group("rec", json).is_err(),
+            parse_info_group(b"rec", json).is_err(),
             "block comment must separate 1 and 2, leaving invalid JSON (not splice into 12)"
         );
         // The same comment placed where a separator is legal still parses, and
         // the number before it keeps its value (`1`, not `12`).
         let json = r#"{ "g": { "f": {+channel:"VAL", +putorder:1/*typo*/, +type:"plain"} } }"#;
-        let groups = parse_info_group("rec", json).expect("comment before ',' is valid");
+        let groups = parse_info_group(b"rec", json).expect("comment before ',' is valid");
         assert_eq!(
             groups[0].members[0].put_order,
             Some(1),
@@ -1354,12 +1354,12 @@ mod tests {
     fn group_json_unterminated_block_comment_is_rejected() {
         let json = r#"{ "g": { "f": {+channel:"VAL"} } } /* never closed"#;
         assert!(
-            parse_info_group("rec", json).is_err(),
+            parse_info_group(b"rec", json).is_err(),
             "unterminated block comment must be rejected, matching YAJL"
         );
         // Also rejected mid-document, before any otherwise-valid close.
         let json = r#"{ "g": { "f": {+channel:"VAL" /* unterminated } } }"#;
-        assert!(parse_info_group("rec", json).is_err());
+        assert!(parse_info_group(b"rec", json).is_err());
     }
 
     /// The relaxed normalizer applies to the record `info(Q:group, ...)`
@@ -1373,10 +1373,21 @@ mod tests {
                 "fld1": {+channel:"VAL", +putorder:0}
             }
         }"#;
-        let groups = parse_info_group("rec3", json).expect("unquoted +keys must parse");
+        let groups = parse_info_group(b"rec3", json).expect("unquoted +keys must parse");
         assert_eq!(groups.len(), 1);
         // bare field-name channel gets the record-name prefix applied.
-        assert_eq!(groups[0].members[0].channel, "rec3.VAL");
+        assert_eq!(groups[0].members[0].channel, b"rec3.VAL");
+    }
+
+    /// pvxs prefixes `+channel` with the record's name as dbStatic stores it,
+    /// so a Latin-1 record's member channel keeps its byte.
+    #[test]
+    fn an_info_group_member_channel_keeps_a_latin1_record_name() {
+        let json = r#"{"g": {"f": {"+channel": "VAL"}}}"#;
+        let groups = parse_info_group(b"R\xb5", json).unwrap();
+        assert_eq!(groups[0].members[0].channel, b"R\xb5.VAL");
+        let m = super::super::channel::MemberChannel::new(groups[0].members[0].clone());
+        assert_eq!(m.names(), (&b"R\xb5"[..], "VAL"));
     }
 
     #[test]
@@ -2018,9 +2029,9 @@ mod tests {
             }
         }"#;
 
-        let groups = parse_info_group("TEMP:sensor", json).unwrap();
+        let groups = parse_info_group(b"TEMP:sensor", json).unwrap();
         // Bare field "VAL" should become "TEMP:sensor.VAL"
-        assert_eq!(groups[0].members[0].channel, "TEMP:sensor.VAL");
+        assert_eq!(groups[0].members[0].channel, b"TEMP:sensor.VAL");
     }
 
     /// pvxs prefixes the owning record name onto EVERY info(Q:group)
@@ -2038,9 +2049,9 @@ mod tests {
             }
         }"#;
 
-        let groups = parse_info_group("TEMP:sensor", json).unwrap();
+        let groups = parse_info_group(b"TEMP:sensor", json).unwrap();
         assert_eq!(
-            groups[0].members[0].channel, "TEMP:sensor.PRESS:ai",
+            groups[0].members[0].channel, b"TEMP:sensor.PRESS:ai",
             "info(Q:group) channel must be record-relative even when it contains ':'"
         );
     }
@@ -2058,8 +2069,8 @@ mod tests {
             }
         }"#;
 
-        let groups = parse_info_group("TEMP:sensor", json).unwrap();
-        assert_eq!(groups[0].members[0].channel, "TEMP:sensor.A.B");
+        let groups = parse_info_group(b"TEMP:sensor", json).unwrap();
+        assert_eq!(groups[0].members[0].channel, b"TEMP:sensor.A.B");
     }
 
     #[test]
@@ -2071,7 +2082,7 @@ mod tests {
             }
         }"#;
 
-        let groups = parse_info_group("TEMP:sensor", json).unwrap();
+        let groups = parse_info_group(b"TEMP:sensor", json).unwrap();
         let container = groups[0]
             .members
             .iter()
@@ -2085,7 +2096,7 @@ mod tests {
             .iter()
             .find(|m| m.field_name == "val")
             .unwrap();
-        assert_eq!(val.channel, "TEMP:sensor.VAL");
+        assert_eq!(val.channel, b"TEMP:sensor.VAL");
     }
 
     #[test]
@@ -2141,7 +2152,7 @@ mod tests {
         assert_eq!(grp.members.len(), 1, "duplicate field must collapse");
         assert_eq!(grp.members[0].field_name, "x");
         assert_eq!(
-            grp.members[0].channel, "R1:x",
+            grp.members[0].channel, b"R1:x",
             "first definition must win (pvxs ignores the duplicate)"
         );
     }
@@ -2618,7 +2629,7 @@ mod tests {
         let groups = parse_group_config(json).unwrap();
         assert_eq!(groups[0].members.len(), 1);
         assert_eq!(groups[0].members[0].field_name, "val");
-        assert_eq!(groups[0].members[0].channel, "R:val");
+        assert_eq!(groups[0].members[0].channel, b"R:val");
     }
 
     #[test]
@@ -2681,19 +2692,22 @@ mod tests {
 
     // ---- Q2: member-level annotations coerce via as<T>() like group-level ----
 
-    /// `parse_stoll_base0` mirrors pvxs `parseTo<int64_t>` (`std::stoll(s,_,0)`):
-    /// base auto-detect, sign, leading/trailing whitespace tolerated.
+    /// A string annotation is pvxs `parseTo<int64_t>` (`std::stoll(s,_,0)`):
+    /// base auto-detect, sign, C `isspace` around the number.
     #[test]
-    fn parse_stoll_base0_matches_pvxs() {
-        assert_eq!(parse_stoll_base0("2"), Some(2));
-        assert_eq!(parse_stoll_base0("-7"), Some(-7));
-        assert_eq!(parse_stoll_base0("+9"), Some(9));
-        assert_eq!(parse_stoll_base0("0x10"), Some(16), "hex auto-detect");
-        assert_eq!(parse_stoll_base0("010"), Some(8), "octal auto-detect");
-        assert_eq!(parse_stoll_base0("  42  "), Some(42), "leading/trailing ws");
-        assert_eq!(parse_stoll_base0("2x"), None, "extraneous trailing char");
-        assert_eq!(parse_stoll_base0("abc"), None, "non-numeric");
-        assert_eq!(parse_stoll_base0(""), None, "empty");
+    fn a_string_annotation_is_pvxs_parse_to() {
+        let as_i64 = |s: &str| json_value_as_i64(&serde_json::Value::String(s.into()));
+        assert_eq!(as_i64("2"), Some(2));
+        assert_eq!(as_i64("-7"), Some(-7));
+        assert_eq!(as_i64("+9"), Some(9));
+        assert_eq!(as_i64("0x10"), Some(16), "hex auto-detect");
+        assert_eq!(as_i64("010"), Some(8), "octal auto-detect");
+        assert_eq!(as_i64("  42  "), Some(42), "leading/trailing ws");
+        assert_eq!(as_i64("2x"), None, "extraneous trailing char");
+        assert_eq!(as_i64("abc"), None, "non-numeric");
+        assert_eq!(as_i64(""), None, "empty");
+        assert_eq!(as_i64("0b11"), Some(3), "glibc C23 binary");
+        assert_eq!(as_i64("\u{a0}4"), None, "only C isspace");
     }
 
     /// A `+putorder` given as a numeric string coerces to the integer (pvxs
@@ -2725,7 +2739,7 @@ mod tests {
         }"#;
         let groups = parse_group_config(json).unwrap();
         let a = &groups[0].members[0];
-        assert_eq!(a.channel, "5", "numeric +channel coerces to \"5\"");
+        assert_eq!(a.channel, b"5", "numeric +channel coerces to \"5\"");
         assert_eq!(
             a.struct_id.as_deref(),
             Some("7"),

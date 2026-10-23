@@ -95,10 +95,37 @@ async fn a_common_string_field_carries_bytes() {
         .unwrap();
 
     let inst = db.get_record("D1").unwrap();
-    let desc = inst.read().common.desc.clone();
+    let desc = inst.read().common.text.desc.clone();
     assert_eq!(
         desc.as_bytes(),
         [b'h', 0xFF, b'z'],
         "DESC is a 40-BYTE field, and the escape spends one byte"
     );
+}
+
+/// C `dbPutString` stores a DBF_STRING with `strncpy`: a leading or trailing
+/// space, or a value that is nothing but spaces, is part of the value. softIoc
+/// 7.0.10 `caget -S` reads `[ MF ]` back for `field(VAL," MF ")`.
+#[epics_macros_rs::epics_test]
+async fn spaces_in_a_db_string_value_are_kept() {
+    let (db, _) = IocBuilder::new()
+        .db_string(
+            concat!(
+                r#"record(stringin,"S1") { field(VAL," MF ") }"#,
+                "\n",
+                r#"record(stringout,"S2") { field(VAL,"  two") }"#,
+                "\n",
+                r#"record(stringin,"S3") { field(VAL,"   ") }"#,
+                "\n",
+            ),
+            &HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+
+    assert_eq!(val_bytes(&db, "S1").await, b" MF ");
+    assert_eq!(val_bytes(&db, "S2").await, b"  two");
+    assert_eq!(val_bytes(&db, "S3").await, b"   ");
 }

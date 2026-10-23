@@ -19,7 +19,7 @@ pub mod flush;
 
 use bitflags::bitflags;
 
-use crate::error::AsynResult;
+use crate::error::{AsynError, AsynResult};
 use crate::user::AsynUser;
 
 bitflags! {
@@ -35,45 +35,97 @@ bitflags! {
     }
 }
 
-/// Result of an octet read operation.
-#[derive(Debug, Clone)]
+/// Result of an octet read operation: C `asynOctet::read`'s
+/// `*nbytesTransferred` and `*eomReason`, and the status returned beside them.
+/// A failing read still reports what it transferred (asynInterposeEos.c:242-257),
+/// so the count is not on the error side of a `Result` where `?` would drop it.
+#[must_use = "a failed octet read still reports the bytes it transferred"]
+#[derive(Debug)]
 pub struct OctetReadResult {
     /// Number of bytes actually transferred into the buffer.
     pub nbytes_transferred: usize,
+    /// Bytes an earlier read already returned that this read takes back: the
+    /// lead byte of a two-byte EOS split across reads. C's
+    /// `*nbytesTransferred` is `nbytes_transferred - taken_back`, which goes
+    /// negative there (asynInterposeEos.c:201-204). Only the EOS layer sets it.
+    pub taken_back: usize,
     /// Reason(s) the read terminated.
     pub eom_reason: EomReason,
+    /// The read's `asynStatus`.
+    pub status: AsynResult<()>,
 }
 
-/// The transfer an octet read completed *before* it failed — C's
-/// `*nbytesTransfered` / `*eomReason`, which `asynOctet::read` writes out
-/// even when it returns a failing `asynStatus`
-/// (`asynInterposeEos.c:242-253`).
-///
-/// This owns the bytes rather than pointing at the caller's buffer: it rides
-/// inside [`crate::error::AsynError::PartialRead`], so the data and the
-/// status are one value and a `?` on the read cannot deliver the failure
-/// while dropping the bytes. Every dispatch hop between the interpose and a
-/// record (`port_actor` → `PortHandle` → device support / `SyncIO`) hands the
-/// error on by value, so the transfer arrives with it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PartialOctetRead {
-    /// The bytes transferred into the caller's buffer before the failure.
-    pub data: Vec<u8>,
-    /// The end-of-message reason accumulated up to the failure.
-    pub eom_reason: EomReason,
+impl OctetReadResult {
+    /// A read that succeeded with `nbytes_transferred` bytes.
+    pub fn ok(nbytes_transferred: usize, eom_reason: EomReason) -> Self {
+        Self {
+            nbytes_transferred,
+            taken_back: 0,
+            eom_reason,
+            status: Ok(()),
+        }
+    }
+
+    /// Panic on a failed read; test-only, where the read must have succeeded.
+    #[cfg(test)]
+    pub(crate) fn expect_ok(self) -> Self {
+        if let Err(e) = &self.status {
+            panic!("octet read failed: {e:?}");
+        }
+        self
+    }
+
+    /// The count and eom of a read that must have succeeded; test-only.
+    #[cfg(test)]
+    pub(crate) fn unwrap(self) -> (usize, EomReason) {
+        let r = self.expect_ok();
+        (r.nbytes_transferred, r.eom_reason)
+    }
+
+    /// The failure of a read that must have failed; test-only.
+    #[cfg(test)]
+    pub(crate) fn unwrap_err(self) -> AsynError {
+        match self.status {
+            Err(e) => e,
+            Ok(()) => panic!(
+                "octet read succeeded with {} bytes",
+                self.nbytes_transferred
+            ),
+        }
+    }
+
+    /// The count, or the failure of a read whose failed bytes the test does
+    /// not inspect; test-only.
+    #[cfg(test)]
+    pub(crate) fn into_count(self) -> AsynResult<usize> {
+        self.status.map(|()| self.nbytes_transferred)
+    }
+
+    /// A read that failed having transferred nothing.
+    pub fn failed(e: AsynError) -> Self {
+        Self {
+            nbytes_transferred: 0,
+            taken_back: 0,
+            eom_reason: EomReason::empty(),
+            status: Err(e),
+        }
+    }
 }
 
-impl PartialOctetRead {
-    /// C's `*nbytesTransfered` for this failed read.
-    pub fn nbytes_transferred(&self) -> usize {
-        self.data.len()
+/// A single transfer: it moved `n` bytes, or failed having moved none.
+impl From<AsynResult<(usize, EomReason)>> for OctetReadResult {
+    fn from(r: AsynResult<(usize, EomReason)>) -> Self {
+        match r {
+            Ok((n, eom)) => Self::ok(n, eom),
+            Err(e) => Self::failed(e),
+        }
     }
 }
 
 /// "Next layer" interface — implemented by both the base driver adapter
 /// and by `InterposeChain` to allow recursive dispatch.
 pub trait OctetNext: Send + Sync {
-    fn read(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<OctetReadResult>;
+    fn read(&mut self, user: &AsynUser, buf: &mut [u8]) -> OctetReadResult;
     fn write(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize>;
     fn flush(&mut self, user: &mut AsynUser) -> AsynResult<()>;
 }
@@ -96,7 +148,7 @@ pub enum EosSet {
     /// A layer owns the terminator but C refuses this length: the `switch
     /// (eoslen)` in `setInputEos`/`setOutputEos` answers `"<port> illegal
     /// eoslen <n>"` *before* assigning anything (asynInterposeEos.c:299-310,
-    /// :352-362), so no layer state moved.
+    /// :353-363), so no layer state moved.
     IllegalLength,
 }
 
@@ -123,7 +175,7 @@ pub trait OctetInterpose: Send + Sync {
         user: &AsynUser,
         buf: &mut [u8],
         next: &mut dyn OctetNext,
-    ) -> AsynResult<OctetReadResult>;
+    ) -> OctetReadResult;
 
     fn write(
         &mut self,
@@ -149,25 +201,37 @@ pub trait OctetInterpose: Send + Sync {
     /// `asynUser` addressed*. Default no-op; only EOS-aware layers
     /// (`eos::EosInterpose`) act on it. C asyn routes `setInputEos` through
     /// every interpose via `pasynOctet->setInputEos`, `asynUser` and all
-    /// (asynInterposeEos.c:288); this is the Rust equivalent so a runtime IEOS
+    /// (asynInterposeEos.c:289); this is the Rust equivalent so a runtime IEOS
     /// change reaches the installed EOS interpose on the right device.
     ///
     /// Returns what **this layer** did with the terminator. C's interpose does
     /// not answer with a flag — it either validates the length and stores the
-    /// value, or delegates *downwards* to the next `setInputEos` (:293-295)
+    /// value, or delegates *downwards* to the next `setInputEos` (:294-296)
     /// and ultimately to the driver's, which `initOverride` has replaced with
     /// `setInputEosFail` when the driver has none (asynOctetBase.c:115,
     /// :401-403). [`EosSet`] is that fall-through made explicit, so
     /// [`crate::port::PortDriver::set_input_eos`]'s default can be the Fail
     /// stub without having to guess whether a layer above it answered first.
-    fn set_input_eos(&mut self, _addr: i32, _eos: &[u8]) -> EosSet {
+    fn set_input_eos(&mut self, _user: &AsynUser, _eos: &[u8]) -> EosSet {
         EosSet::NotTaken
     }
 
     /// Notify the layer of an output end-of-string change (see
     /// [`Self::set_input_eos`]). Default: not taken.
-    fn set_output_eos(&mut self, _addr: i32, _eos: &[u8]) -> EosSet {
+    fn set_output_eos(&mut self, _user: &AsynUser, _eos: &[u8]) -> EosSet {
         EosSet::NotTaken
+    }
+
+    /// The input terminator this layer holds for the device, or `None` when
+    /// C's `getInputEos` would delegate to the layer below
+    /// (asynInterposeEos.c:319-321) — the read twin of [`EosSet::NotTaken`].
+    fn input_eos(&self, _user: &AsynUser) -> Option<&[u8]> {
+        None
+    }
+
+    /// The output twin of [`Self::input_eos`].
+    fn output_eos(&self, _user: &AsynUser) -> Option<&[u8]> {
+        None
     }
 
     /// Drop every piece of state scoped to the *current* link, because the
@@ -178,30 +242,37 @@ pub trait OctetInterpose: Send + Sync {
     /// C parity: `asynInterposeEos.c:110` registers `eosInExceptionHandler`
     /// via `exceptionCallbackAdd`, and `:142-151` clears `inBufHead`,
     /// `inBufTail` and `eosInMatch` on `asynExceptionConnect` — which
-    /// `exceptionConnect` (asynManager.c:2158) *and* `exceptionDisconnect`
-    /// (asynManager.c:2185) both fire, so the reset happens on either edge.
+    /// `exceptionConnect` (asynManager.c:2161) *and* `exceptionDisconnect`
+    /// (asynManager.c:2187) both fire, so the reset happens on either edge.
     /// [`crate::port::PortDriverBase::set_connected`] is the Rust owner of
     /// that transition and drives this hook for the whole stack.
     fn connection_changed(&mut self) {}
+
+    /// Whether C's layer registers an exception callback on its `dpCommon`
+    /// (asynInterposeEos.c:110, asynInterposeCom.c:856), one of the
+    /// `exceptionUsers` the port report counts (asynManager.c:1067-1071).
+    fn exception_user(&self) -> bool {
+        false
+    }
 }
 
 /// The key of the port's own interpose chain — C's `pport->dpc`, the
 /// `dpCommon` every addr that names no device resolves to
-/// (`findDpCommon`/`findInterface`, asynManager.c:536-551, 1493-1501).
+/// (`findDpCommon`/`findInterface`, asynManager.c:538-553, 1495-1503).
 pub const PORT_CHAIN: i32 = -1;
 
 /// The octet interpose layers of one port — C's `dpCommon.interposeInterfaceList`,
 /// which exists once per *device* as well as once per port.
 ///
-/// `interposeInterface` takes an `addr` (asynManager.c:2190-2220): `addr >= 0` on
-/// a multi-device port puts the layer on that DEVICE's list (:2202-2206), and
-/// `findInterface` resolves a request device-first, port-second (:1493-1501). So
+/// `interposeInterface` takes an `addr` (asynManager.c:2192-2222): `addr >= 0` on
+/// a multi-device port puts the layer on that DEVICE's list (:2204-2208), and
+/// `findInterface` resolves a request device-first, port-second (:1495-1503). So
 /// `asynInterposeDelay("gpib", 4, 0.01)` slows device 4 and nothing else — a
 /// single port-wide chain slowed every device on the bus (R15-48).
 ///
 /// A device's chain **shadows** the port's rather than extending it, because
 /// that is what C builds: a layer installed on a device whose list was empty
-/// takes its `pPrev` from the *driver's* `interfaceList` (:2211-2215), not from
+/// takes its `pPrev` from the *driver's* `interfaceList` (:2213-2217), not from
 /// the port's interposes, so it delegates straight down to the driver.
 pub struct OctetInterposeStack {
     /// [`PORT_CHAIN`] plus one entry per device that has an interpose of its own.
@@ -209,7 +280,7 @@ pub struct OctetInterposeStack {
     /// The port's device model, handed to every layer at install time
     /// ([`OctetInterpose::attach_port`]) and what decides whether an addr can
     /// name a device at all — C `locateDevice` returns none for a port that is
-    /// not `ASYN_MULTIDEVICE` (asynManager.c:574).
+    /// not `ASYN_MULTIDEVICE` (asynManager.c:576).
     multi_device: bool,
 }
 
@@ -222,15 +293,15 @@ impl OctetInterposeStack {
     }
 
     /// Install an interpose layer on the device `addr` names — C
-    /// `interposeInterface` (asynManager.c:2190-2220). `addr < 0`, or any addr on
+    /// `interposeInterface` (asynManager.c:2192-2222). `addr < 0`, or any addr on
     /// a port that is not multi-device, installs on the port itself
-    /// ([`crate::port::eos_device_key`], C's `locateDevice` at :574).
+    /// ([`crate::port::eos_device_key`], C's `locateDevice` at :576).
     ///
     /// The new layer *becomes* that `dpCommon`'s octet interface (C overwrites the
-    /// interpose node's `pasynInterface` with it, :2217) and the interface it
+    /// interpose node's `pasynInterface` with it, :2219) and the interface it
     /// displaced — the previously installed interpose at the same level, or the
     /// driver's own interface when there was none — becomes the one it delegates
-    /// down to (C hands it back as `pPrev`, :2209-2215).
+    /// down to (C hands it back as `pPrev`, :2211-2218).
     ///
     /// So the **last layer installed is the outermost**: a caller enters it first,
     /// and it calls down through the earlier layers to the driver. An
@@ -246,7 +317,7 @@ impl OctetInterposeStack {
     }
 
     /// The chain a request on `addr` runs through — C `findInterface`
-    /// (asynManager.c:1493-1501): the device's own interposes if it has any,
+    /// (asynManager.c:1494-1503): the device's own interposes if it has any,
     /// otherwise the port's.
     fn chain_key(&self, addr: i32) -> i32 {
         let key = crate::port::eos_device_key(self.multi_device, addr);
@@ -257,15 +328,19 @@ impl OctetInterposeStack {
         }
     }
 
+    fn chain(&self, addr: i32) -> Option<&Vec<Box<dyn OctetInterpose>>> {
+        self.chains.get(&self.chain_key(addr))
+    }
+
     fn chain_mut(&mut self, addr: i32) -> Option<&mut Vec<Box<dyn OctetInterpose>>> {
         let key = self.chain_key(addr);
         self.chains.get_mut(&key).filter(|c| !c.is_empty())
     }
 
     /// Total number of interpose layers on the port, across every device's chain
-    /// — what `reportPrintInterfaceList` (asynManager.c:993-1005) prints, once
-    /// for the port's own `dpCommon` (:1077) and again for each device's
-    /// (:1105), under the `asynReport` iocsh command.
+    /// — what `reportPrintInterfaceList` (asynManager.c:995-1007) prints, once
+    /// for the port's own `dpCommon` (:1079) and again for each device's
+    /// (:1107), under the `asynReport` iocsh command.
     pub fn len(&self) -> usize {
         self.chains.values().map(Vec::len).sum()
     }
@@ -289,25 +364,45 @@ impl OctetInterposeStack {
     /// Returns what the chain did with it — C's chain either terminates in a
     /// layer that stores the value, refuses the length, or falls through to
     /// the driver's method.
-    pub fn set_input_eos(&mut self, addr: i32, eos: &[u8]) -> EosSet {
+    pub fn set_input_eos(&mut self, user: &AsynUser, eos: &[u8]) -> EosSet {
         let mut answer = EosSet::NotTaken;
-        if let Some(chain) = self.chain_mut(addr) {
+        if let Some(chain) = self.chain_mut(user.addr) {
             for layer in chain {
-                answer = answer.merge(layer.set_input_eos(addr, eos));
+                answer = answer.merge(layer.set_input_eos(user, eos));
             }
         }
         answer
     }
 
     /// Forward an output EOS change (see [`Self::set_input_eos`]).
-    pub fn set_output_eos(&mut self, addr: i32, eos: &[u8]) -> EosSet {
+    pub fn set_output_eos(&mut self, user: &AsynUser, eos: &[u8]) -> EosSet {
         let mut answer = EosSet::NotTaken;
-        if let Some(chain) = self.chain_mut(addr) {
+        if let Some(chain) = self.chain_mut(user.addr) {
             for layer in chain {
-                answer = answer.merge(layer.set_output_eos(addr, eos));
+                answer = answer.merge(layer.set_output_eos(user, eos));
             }
         }
         answer
+    }
+
+    /// The input terminator the addressed device's chain answers with: the
+    /// outermost layer that holds one, `None` when every layer delegates to
+    /// the driver.
+    pub fn input_eos(&self, user: &AsynUser) -> Option<Vec<u8>> {
+        let chain = self.chain(user.addr)?;
+        chain
+            .iter()
+            .find_map(|l| l.input_eos(user))
+            .map(<[u8]>::to_vec)
+    }
+
+    /// The output twin of [`Self::input_eos`].
+    pub fn output_eos(&self, user: &AsynUser) -> Option<Vec<u8>> {
+        let chain = self.chain(user.addr)?;
+        chain
+            .iter()
+            .find_map(|l| l.output_eos(user))
+            .map(<[u8]>::to_vec)
     }
 
     /// Tell every layer, on every device's chain, that the port's connection
@@ -317,6 +412,15 @@ impl OctetInterposeStack {
     /// (`asynInterposeEos.c:142-151`); the only caller is the transition owner
     /// [`crate::port::PortDriverBase::set_connected`], and the link it moved is
     /// the one under *all* of them.
+    /// The layers on `addr`'s own chain that C counts among its `dpCommon`'s
+    /// exception users ([`OctetInterpose::exception_user`]); -1 is the port's.
+    pub fn exception_users(&self, addr: i32) -> usize {
+        let key = crate::port::eos_device_key(self.multi_device, addr);
+        self.chains
+            .get(&key)
+            .map_or(0, |c| c.iter().filter(|l| l.exception_user()).count())
+    }
+
     pub fn connection_changed(&mut self) {
         for chain in self.chains.values_mut() {
             for layer in chain {
@@ -332,7 +436,7 @@ impl OctetInterposeStack {
         user: &AsynUser,
         buf: &mut [u8],
         base: &mut dyn OctetNext,
-    ) -> AsynResult<OctetReadResult> {
+    ) -> OctetReadResult {
         let addr = user.addr;
         let Some(layers) = self.chain_mut(addr) else {
             return base.read(user, buf);
@@ -395,7 +499,7 @@ struct InterposeChain<'a> {
 }
 
 impl OctetNext for InterposeChain<'_> {
-    fn read(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<OctetReadResult> {
+    fn read(&mut self, user: &AsynUser, buf: &mut [u8]) -> OctetReadResult {
         if let Some((first, rest)) = self.layers.split_first_mut() {
             let mut next = InterposeChain {
                 layers: rest,
@@ -455,13 +559,15 @@ mod tests {
     }
 
     impl OctetNext for MockBase {
-        fn read(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<OctetReadResult> {
+        fn read(&mut self, _user: &AsynUser, buf: &mut [u8]) -> OctetReadResult {
             let n = self.read_data.len().min(buf.len());
             buf[..n].copy_from_slice(&self.read_data[..n]);
-            Ok(OctetReadResult {
+            OctetReadResult {
                 nbytes_transferred: n,
                 eom_reason: EomReason::CNT,
-            })
+                taken_back: 0,
+                status: Ok(()),
+            }
         }
 
         fn write(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
@@ -484,7 +590,7 @@ mod tests {
             user: &AsynUser,
             buf: &mut [u8],
             next: &mut dyn OctetNext,
-        ) -> AsynResult<OctetReadResult> {
+        ) -> OctetReadResult {
             next.read(user, buf)
         }
         fn write(
@@ -509,7 +615,7 @@ mod tests {
             user: &AsynUser,
             buf: &mut [u8],
             next: &mut dyn OctetNext,
-        ) -> AsynResult<OctetReadResult> {
+        ) -> OctetReadResult {
             next.read(user, buf)
         }
         fn write(
@@ -533,7 +639,7 @@ mod tests {
         let user = AsynUser::default();
         let mut buf = [0u8; 32];
 
-        let result = stack.dispatch_read(&user, &mut buf, &mut base).unwrap();
+        let result = stack.dispatch_read(&user, &mut buf, &mut base).expect_ok();
         assert_eq!(result.nbytes_transferred, 5);
         assert_eq!(&buf[..5], b"hello");
     }
@@ -547,7 +653,7 @@ mod tests {
         let user = AsynUser::default();
         let mut buf = [0u8; 32];
 
-        let result = stack.dispatch_read(&user, &mut buf, &mut base).unwrap();
+        let result = stack.dispatch_read(&user, &mut buf, &mut base).expect_ok();
         assert_eq!(result.nbytes_transferred, 5);
         assert_eq!(&buf[..5], b"world");
     }
@@ -594,7 +700,7 @@ mod tests {
         assert!(base.flushed);
     }
 
-    /// R9-56. C `interposeInterface` (asynManager.c:2209-2217) makes each newly
+    /// R9-56. C `interposeInterface` (asynManager.c:2209-2219) makes each newly
     /// installed layer the port's octet interface and hands it the one it
     /// displaced to call down into, so the *last* install is the *outermost*.
     /// This stack appended and dispatched from index 0, so a later install landed
@@ -612,7 +718,7 @@ mod tests {
                 user: &AsynUser,
                 buf: &mut [u8],
                 next: &mut dyn OctetNext,
-            ) -> AsynResult<OctetReadResult> {
+            ) -> OctetReadResult {
                 next.read(user, buf)
             }
             fn write(
@@ -650,9 +756,9 @@ mod tests {
     /// whole port.
     ///
     /// C `interposeInterface(portName, addr, ...)` puts the layer on the device's
-    /// `dpCommon.interposeInterfaceList` when `addr >= 0` (asynManager.c:2202-2206),
+    /// `dpCommon.interposeInterfaceList` when `addr >= 0` (asynManager.c:2204-2208),
     /// and `findInterface` resolves a request device-first, port-second
-    /// (:1493-1501). Both iocsh interposes pass their addr
+    /// (:1495-1503). Both iocsh interposes pass their addr
     /// (asynInterposeEcho.c:176, asynInterposeDelay.c:187) — so
     /// `asynInterposeDelay("gpib",4,0.01)` slows device 4 and nothing else. The
     /// stack was one port-wide chain, so it slowed every device on the bus.
@@ -669,7 +775,7 @@ mod tests {
                 user: &AsynUser,
                 buf: &mut [u8],
                 next: &mut dyn OctetNext,
-            ) -> AsynResult<OctetReadResult> {
+            ) -> OctetReadResult {
                 next.read(user, buf)
             }
             fn write(
@@ -720,7 +826,7 @@ mod tests {
         assert_eq!(stack.len_for(7), 0);
 
         // The port's own chain (addr < 0) is what every unaddressed device falls
-        // back to — C `findInterface`'s second lookup (:1499-1501).
+        // back to — C `findInterface`'s second lookup (:1500-1502).
         stack.install(PORT_CHAIN, Box::new(Tag(b'P')));
         assert_eq!(
             write_from(&mut stack, 7),
@@ -735,12 +841,50 @@ mod tests {
         );
 
         // A port that never declared ASYN_MULTIDEVICE has no devices to key by:
-        // C's `locateDevice` returns none for it (:574), so every addr — the
+        // C's `locateDevice` returns none for it (:576), so every addr — the
         // iocsh default 0 included — lands on the port itself.
         let mut single = OctetInterposeStack::new(false);
         single.install(0, Box::new(Tag(b'S')));
         assert_eq!(write_from(&mut single, 0), b"Sx");
         assert_eq!(write_from(&mut single, 4), b"Sx");
         assert_eq!(write_from(&mut single, -1), b"Sx");
+    }
+
+    /// The EOS layer's read below every other layer: what each passes up is
+    /// what it got, `taken_back` included.
+    #[test]
+    fn every_layer_above_eos_passes_taken_back_up() {
+        struct TakesBack;
+        impl OctetNext for TakesBack {
+            fn read(&mut self, _: &AsynUser, _: &mut [u8]) -> OctetReadResult {
+                OctetReadResult {
+                    nbytes_transferred: 0,
+                    eom_reason: EomReason::EOS,
+                    taken_back: 1,
+                    status: Ok(()),
+                }
+            }
+            fn write(&mut self, _: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+                Ok(data.len())
+            }
+            fn flush(&mut self, _: &mut AsynUser) -> AsynResult<()> {
+                Ok(())
+            }
+        }
+        let layers: [fn() -> Box<dyn OctetInterpose>; 4] = [
+            || Box::new(com::ComInterpose::new()),
+            || Box::new(echo::EchoInterpose::new()),
+            || Box::new(delay::DelayInterpose::new(std::time::Duration::ZERO)),
+            || Box::new(flush::FlushTimeoutInterpose::new(std::time::Duration::ZERO)),
+        ];
+        for layer in layers {
+            let mut stack = OctetInterposeStack::new(false);
+            stack.install(-1, layer());
+            let mut buf = [0u8; 4];
+            let r = stack
+                .dispatch_read(&AsynUser::default(), &mut buf, &mut TakesBack)
+                .expect_ok();
+            assert_eq!((r.nbytes_transferred, r.taken_back), (0, 1));
+        }
     }
 }

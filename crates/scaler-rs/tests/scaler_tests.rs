@@ -1,5 +1,5 @@
 #![allow(clippy::field_reassign_with_default)]
-use epics_base_rs::server::record::Record;
+use epics_base_rs::server::record::{ProcessAction, ProcessOutcome, Record, RecordProcessResult};
 use epics_base_rs::types::EpicsValue;
 use scaler_rs::device_support::scaler_asyn::ScalerDriver;
 use scaler_rs::device_support::scaler_soft::SoftScalerDriver;
@@ -86,17 +86,6 @@ fn test_get_put_scalar_fields() {
     );
 }
 
-#[test]
-fn test_read_only_scalar_fields() {
-    let mut rec = ScalerRecord::default();
-    assert!(rec.put_field("PCNT", EpicsValue::Short(1)).is_err());
-    assert!(rec.put_field("SS", EpicsValue::Short(1)).is_err());
-    assert!(rec.put_field("US", EpicsValue::Short(1)).is_err());
-    assert!(rec.put_field("NCH", EpicsValue::Short(8)).is_err());
-    assert!(rec.put_field("T", EpicsValue::Double(1.0)).is_err());
-    assert!(rec.put_field("VERS", EpicsValue::Float(1.0)).is_err());
-}
-
 // ============================================================
 // Field access — indexed fields (S1-S64, PR1-PR64, etc.)
 // ============================================================
@@ -104,12 +93,13 @@ fn test_read_only_scalar_fields() {
 #[test]
 fn test_get_put_indexed_s() {
     let rec = ScalerRecord::default();
-    // S fields are read-only and DBF_ULONG (scalerRecord.dbd:1334-1649).
+    // S fields are DBF_ULONG (scalerRecord.dbd:1334-1649).
     assert_eq!(rec.get_field("S1"), Some(EpicsValue::ULong(0)));
     assert_eq!(rec.get_field("S64"), Some(EpicsValue::ULong(0)));
 
     let mut rec = rec;
-    assert!(rec.put_field("S1", EpicsValue::ULong(100)).is_err());
+    rec.put_field("S1", EpicsValue::ULong(100)).unwrap();
+    assert_eq!(rec.get_field("S1"), Some(EpicsValue::ULong(100)));
 }
 
 #[test]
@@ -212,7 +202,7 @@ fn test_tp_to_pr1_conversion() {
     let mut rec = ScalerRecord::default();
     rec.freq = 1e7;
     rec.tp = 2.0; // 2 seconds
-    rec.special("TP", true).unwrap();
+    rec.special("TP", true, &Default::default()).unwrap();
     assert_eq!(rec.pr[0], 20_000_000); // 2.0 * 1e7
     assert_eq!(rec.d[0], 1); // Direction set
     assert_eq!(rec.g[0], 1); // Gate set
@@ -223,7 +213,7 @@ fn test_pr1_to_tp_conversion() {
     let mut rec = ScalerRecord::default();
     rec.freq = 1e7;
     rec.pr[0] = 10_000_000; // 1 second
-    rec.special("PR1", true).unwrap();
+    rec.special("PR1", true, &Default::default()).unwrap();
     assert!((rec.tp - 1.0).abs() < 1e-6);
     assert_eq!(rec.d[0], 1);
     assert_eq!(rec.g[0], 1);
@@ -254,11 +244,11 @@ fn test_init_record_default_freq() {
 fn test_special_rate_clamp() {
     let mut rec = ScalerRecord::default();
     rec.rate = 100.0;
-    rec.special("RATE", true).unwrap();
+    rec.special("RATE", true, &Default::default()).unwrap();
     assert_eq!(rec.rate, 60.0);
 
     rec.rate = -5.0;
-    rec.special("RATE", true).unwrap();
+    rec.special("RATE", true, &Default::default()).unwrap();
     assert_eq!(rec.rate, 0.0);
 }
 
@@ -266,7 +256,7 @@ fn test_special_rate_clamp() {
 fn test_special_pr_auto_enables_gate() {
     let mut rec = ScalerRecord::default();
     rec.pr[4] = 5000; // PR5
-    rec.special("PR5", true).unwrap();
+    rec.special("PR5", true, &Default::default()).unwrap();
     assert_eq!(rec.d[4], 1); // D5 set
     assert_eq!(rec.g[4], 1); // G5 set
 }
@@ -276,7 +266,7 @@ fn test_special_gate_sets_default_preset() {
     let mut rec = ScalerRecord::default();
     rec.g[2] = 1; // G3
     rec.pr[2] = 0; // No preset
-    rec.special("G3", true).unwrap();
+    rec.special("G3", true, &Default::default()).unwrap();
     assert_eq!(rec.pr[2], 1000); // Default preset
 }
 
@@ -285,7 +275,7 @@ fn test_special_gate_no_change_if_preset_exists() {
     let mut rec = ScalerRecord::default();
     rec.g[2] = 1;
     rec.pr[2] = 5000; // Already has preset
-    rec.special("G3", true).unwrap();
+    rec.special("G3", true, &Default::default()).unwrap();
     assert_eq!(rec.pr[2], 5000); // Unchanged
 }
 
@@ -309,37 +299,106 @@ fn test_process_idle_no_change() {
     assert_eq!(rec.us, 0);
 }
 
-// C `scalerRecord.c:471,770-772` — `process()` calls `monitor()` (the
-// S1..Snch DBE_LOG sweep) ONLY while `ss == SCALER_STATE_IDLE`. So the
-// record advertises the active-channel sweep set only when idle, and an
-// empty set while counting or waiting.
+// C `scalerRecord.c:770-772` — `monitor()` sweeps the active channels
+// S1..Snch with DBE_LOG. Whether a cycle reaches `monitor()` at all is the
+// `:470` outcome `process()` returns, so the set does not depend on `ss`.
+fn swept(rec: &ScalerRecord) -> Vec<&'static str> {
+    rec.log_swept_fields().iter().map(|&ix| name(ix)).collect()
+}
+
+/// The scaler field a declared set or post table entry `ix` stands for.
+fn name(ix: epics_base_rs::server::record::FieldIx) -> &'static str {
+    epics_base_rs::server::record::field_at(scaler_rs::records::dbd_generated::SCALER_FIELDS, ix)
+        .expect("declared")
+        .name
+}
+
 #[test]
-fn test_log_swept_fields_idle_active_channels_only() {
+fn test_log_swept_fields_active_channels_only() {
     let mut rec = ScalerRecord::default();
     rec.nch = 3;
-
-    rec.ss = 0; // IDLE — sweeps exactly the active channels S1..S3.
-    assert_eq!(rec.log_swept_fields(), &["S1", "S2", "S3"]);
-
-    rec.ss = 2; // COUNTING — C does not call monitor(); no sweep.
-    assert_eq!(rec.log_swept_fields(), &[] as &[&str]);
-
-    rec.ss = 1; // WAITING — also not idle; no sweep.
-    assert_eq!(rec.log_swept_fields(), &[] as &[&str]);
+    for ss in [0, 1, 2] {
+        rec.ss = ss;
+        assert_eq!(swept(&rec), ["S1", "S2", "S3"], "ss {ss}");
+    }
 
     // nch is clamped to the channel cap, never out of bounds.
-    rec.ss = 0;
     rec.nch = (MAX_SCALER_CHANNELS as i16) + 5;
     assert_eq!(rec.log_swept_fields().len(), MAX_SCALER_CHANNELS);
 }
 
-// Every C `scalerRecord.c` post outside the idle `monitor()` sweep is a literal
-// `DBE_VALUE`: the process/updateCounts posts of CNT/T/VAL/PR1/TP/FREQ and the
-// active channels' Sn (:316/322/329/334/372/425/427/430/478/530/582/588), AND
-// the `special()` posts of PRn/Gn/Dn (:673-676, :682-687, :705-706, :719). The
-// only `DBE_LOG` post is the idle sweep of S1..Snch (line 771). The record
-// advertises all of them as value-only so the framework strips the LOG bit —
-// which for PRn/Gn/Dn means a DBE_LOG subscriber never sees them at all, as in C.
+fn emits(outcome: &ProcessOutcome) -> bool {
+    match outcome.result {
+        RecordProcessResult::Complete => true,
+        // C's :470 skip raises no alarm.
+        RecordProcessResult::CompleteNoEmit { raise: None } => false,
+        ref other => panic!("scaler process() returned {other:?}"),
+    }
+}
+
+// C `scalerRecord.c:470` — the stamp, alarm, `monitor()` and FLNK run only on
+// a cycle that reaches it with `ss` IDLE; one boundary per side.
+#[test]
+fn test_count_start_cycle_returns_no_emit_with_its_cout_write() {
+    let mut rec = ScalerRecord::default();
+    rec.freq = 1e7;
+    rec.tp = 1.0;
+    rec.init_record(1).unwrap();
+    rec.cnt = 1;
+    rec.special("CNT", true, &Default::default()).unwrap();
+    let outcome = rec.process().unwrap();
+    assert_eq!(rec.ss, 2, "COUNTING");
+    assert!(!emits(&outcome), "ss COUNTING at :470");
+    assert!(
+        outcome.actions.iter().any(|a| matches!(
+            a,
+            ProcessAction::WriteDbLink {
+                link_field: "COUT",
+                ..
+            }
+        )),
+        "the :456 COUT put still runs: {:?}",
+        outcome.actions
+    );
+    assert!(!rec.should_fire_forward_link());
+}
+
+#[test]
+fn test_count_done_cycle_emits() {
+    let mut rec = ScalerRecord::default();
+    rec.freq = 1e7;
+    rec.ss = 2;
+    rec.us = 3;
+    rec.cnt = 1;
+    rec.pcnt = 1;
+    rec.set_done();
+    assert!(emits(&rec.process().unwrap()), "ss IDLE at :470");
+    assert!(rec.should_fire_forward_link());
+}
+
+#[test]
+fn test_autocount_waiting_cycle_returns_no_emit() {
+    let mut rec = ScalerRecord::default();
+    rec.freq = 1e7;
+    rec.cont = 1;
+    rec.ss = 1; // WAITING for the auto-count restart, its delay elapsed
+    assert!(!emits(&rec.process().unwrap()), "ss WAITING at :470");
+    assert_eq!(rec.ss, 2, "the auto-count started after :470");
+}
+
+#[test]
+fn test_idle_cycle_that_starts_autocount_emits_and_sweeps() {
+    let mut rec = ScalerRecord::default();
+    rec.freq = 1e7;
+    rec.nch = 2;
+    rec.cont = 1;
+    rec.dly1 = 0.0;
+    let outcome = rec.process().unwrap();
+    assert_eq!(rec.ss, 2, "the auto-count block re-armed ss after :470");
+    assert!(emits(&outcome), "ss IDLE at :470");
+    assert_eq!(swept(&rec), ["S1", "S2"]);
+}
+
 #[test]
 fn test_value_only_change_fields_scalars_plus_active_channels() {
     let mut rec = ScalerRecord::default();
@@ -390,7 +449,7 @@ fn test_count_start_via_special() {
 
     // Start counting
     rec.cnt = 1;
-    rec.special("CNT", true).unwrap();
+    rec.special("CNT", true, &Default::default()).unwrap();
     assert_eq!(rec.us, 2); // REQSTART
 
     // Process to actually start
@@ -437,7 +496,7 @@ fn test_val_set_on_completion() {
     rec.pcnt = 1;
     rec.s[0] = 10_000_000; // 1 second of clock ticks
 
-    // Device support's read() marks counting done before process() runs.
+    // No dset bound: `set_done` stands in for `done()` returning true.
     rec.set_done();
 
     rec.process().unwrap();
@@ -456,19 +515,63 @@ fn test_val_set_on_completion() {
 // Soft scaler driver
 // ============================================================
 
+/// A soft driver bound to a record as device support's `init` binds it;
+/// `fired` is whether a done callback has processed-requested the record.
+struct SoftRig {
+    rec: ScalerRecord,
+    driver: std::sync::Arc<std::sync::Mutex<Box<dyn ScalerDriver>>>,
+    counts: std::sync::Arc<std::sync::Mutex<[u32; MAX_SCALER_CHANNELS]>>,
+    pulses: epics_base_rs::runtime::sync::mpsc::Receiver<()>,
+}
+
+impl SoftRig {
+    fn new() -> Self {
+        use epics_base_rs::server::device_support::DeviceSupport;
+        use scaler_rs::device_support::scaler_asyn::ScalerAsynDeviceSupport;
+
+        let driver = SoftScalerDriver::new(8);
+        let counts = driver.shared_counts();
+        let mut support = ScalerAsynDeviceSupport::new(Box::new(driver));
+        let mut rec = ScalerRecord::default();
+        support.init(&mut rec).unwrap();
+        Self {
+            rec,
+            driver: support.driver(),
+            counts,
+            pulses: support.io_intr_receiver().unwrap(),
+        }
+    }
+
+    fn driver(&self) -> std::sync::MutexGuard<'_, Box<dyn ScalerDriver>> {
+        self.driver.lock().unwrap()
+    }
+
+    fn read(&self) -> [u32; MAX_SCALER_CHANNELS] {
+        let mut counts = [0; MAX_SCALER_CHANNELS];
+        self.driver().read(&mut counts).unwrap();
+        counts
+    }
+
+    fn fired(&mut self) -> bool {
+        self.pulses.try_recv().is_ok()
+    }
+}
+
 #[test]
 fn test_soft_driver_basics() {
-    let mut driver = SoftScalerDriver::new(8);
-    assert_eq!(driver.num_channels(), 8);
-    assert!(!driver.done());
+    let mut rig = SoftRig::new();
+    assert_eq!(rig.driver().num_channels(), 8);
+    rig.read();
+    assert!(!rig.fired());
 }
 
 #[test]
 fn test_soft_driver_reset() {
-    let mut driver = SoftScalerDriver::new(8);
-    driver.arm(true).unwrap();
-    driver.reset().unwrap();
-    assert!(!driver.done());
+    let mut rig = SoftRig::new();
+    rig.driver().arm(true).unwrap();
+    rig.driver().reset().unwrap();
+    rig.read();
+    assert!(!rig.fired());
 }
 
 #[test]
@@ -530,67 +633,69 @@ fn test_soft_driver_read_counts() {
     assert_eq!(counts[1], 1000);
 }
 
+/// C `int32ArrayRead` runs `checkAcquireDone` before `dbGetField`
+/// (`drvScalerSoft.c:409-424`): the read that fetches the preset count does
+/// not complete the count; the next one makes the done callback.
 #[test]
-fn test_soft_driver_preset_done() {
-    let mut driver = SoftScalerDriver::new(8);
-    driver.write_preset(0, 1000).unwrap();
-    driver.arm(true).unwrap();
+fn test_soft_driver_done_is_seen_one_read_later() {
+    let mut rig = SoftRig::new();
+    rig.driver().write_preset(0, 1000).unwrap();
+    rig.driver().arm(true).unwrap();
+    rig.counts.lock().unwrap()[0] = 1000;
 
-    // Simulate counting reaching preset
-    let shared = driver.shared_counts();
-    {
-        let mut guard = shared.lock().unwrap();
-        guard[0] = 1000;
-    }
-
-    let mut counts = [0u32; MAX_SCALER_CHANNELS];
-    driver.read(&mut counts).unwrap();
-    assert!(driver.done());
+    assert_eq!(rig.read()[0], 1000, "the read fetched the preset count");
+    assert!(!rig.fired(), "this read judged the previous counts");
+    rig.read();
+    assert!(rig.fired(), "the next read made the done callback");
 }
 
-/// C `devScalerAsyn.c:292-301` `scaler_done()` is read-and-clear: it
-/// returns 1 exactly once per completed count, then `pPvt->done` is 0
-/// so the next poll returns 0. `ScalerDriver::done` must consume the
-/// flag the same way.
+/// `acquireDoneCallbacks` calls back only while `prevAcquiring` is set and
+/// clears it (`drvScalerSoft.c:618-620`): one callback per arm, however many
+/// reads see the preset reached; the record's `scaler_done()` takes the
+/// latch once (`devScalerAsyn.c:292-301`).
 #[test]
-fn test_soft_driver_done_is_read_and_clear() {
-    let mut driver = SoftScalerDriver::new(8);
-    driver.write_preset(0, 1000).unwrap();
-    driver.arm(true).unwrap();
+fn test_soft_driver_calls_back_once_per_arm() {
+    let mut rig = SoftRig::new();
+    rig.driver().write_preset(0, 1000).unwrap();
+    rig.driver().arm(true).unwrap();
+    rig.counts.lock().unwrap()[0] = 1000;
+    rig.read();
+    rig.read();
+    assert!(rig.fired());
+    rig.read();
+    assert!(!rig.fired(), "prevAcquiring was cleared by the callback");
 
-    let shared = driver.shared_counts();
-    {
-        let mut guard = shared.lock().unwrap();
-        guard[0] = 1000;
-    }
+    rig.rec.ss = 2; // COUNTING
+    rig.rec.process().unwrap();
+    assert_eq!(rig.rec.ss, 0, "process() took the done latch");
+    rig.rec.ss = 2;
+    rig.rec.process().unwrap();
+    assert_eq!(rig.rec.ss, 2, "the latch was read and cleared");
+}
 
-    let mut counts = [0u32; MAX_SCALER_CHANNELS];
-    driver.read(&mut counts).unwrap();
-
-    // First poll reports the completed count.
-    assert!(driver.done(), "first done() poll must report completion");
-    // The flag is cleared — a second poll without a new count is false.
-    assert!(
-        !driver.done(),
-        "done() must clear the flag (C scaler_done read-and-clear)"
-    );
+/// A disarm leaves `prevAcquiring` set (`drvScalerSoft.c:326`), so inputs
+/// that go on counting past the preset still make the done callback.
+#[test]
+fn test_soft_driver_disarm_keeps_prev_acquiring() {
+    let mut rig = SoftRig::new();
+    rig.driver().write_preset(0, 1000).unwrap();
+    rig.driver().arm(true).unwrap();
+    rig.driver().arm(false).unwrap();
+    rig.counts.lock().unwrap()[0] = 1000;
+    rig.read();
+    rig.read();
+    assert!(rig.fired());
 }
 
 #[test]
 fn test_soft_driver_preset_not_reached() {
-    let mut driver = SoftScalerDriver::new(8);
-    driver.write_preset(0, 1000).unwrap();
-    driver.arm(true).unwrap();
-
-    let shared = driver.shared_counts();
-    {
-        let mut guard = shared.lock().unwrap();
-        guard[0] = 500; // Not yet at preset
-    }
-
-    let mut counts = [0u32; MAX_SCALER_CHANNELS];
-    driver.read(&mut counts).unwrap();
-    assert!(!driver.done());
+    let mut rig = SoftRig::new();
+    rig.driver().write_preset(0, 1000).unwrap();
+    rig.driver().arm(true).unwrap();
+    rig.counts.lock().unwrap()[0] = 500; // Not yet at preset
+    rig.read();
+    rig.read();
+    assert!(!rig.fired());
 }
 
 // ============================================================
@@ -625,7 +730,7 @@ fn test_count_start_does_not_panic_when_nch_exceeds_max() {
     rec.g[0] = 1;
 
     rec.cnt = 1;
-    rec.special("CNT", true).unwrap();
+    rec.special("CNT", true, &Default::default()).unwrap();
     // process() calls build_start_actions, which iterates 0..nch and indexes
     // g[i]/pr[i]. Must not panic with nch > MAX_SCALER_CHANNELS.
     rec.process().unwrap();
@@ -642,7 +747,7 @@ fn test_count_start_does_not_panic_when_nch_negative() {
 
     rec.nch = -1;
     rec.cnt = 1;
-    rec.special("CNT", true).unwrap();
+    rec.special("CNT", true, &Default::default()).unwrap();
     rec.process().unwrap();
     assert_eq!(rec.ss, 2); // COUNTING — no panic, loop bound clamped to 0
 }
@@ -690,8 +795,10 @@ fn test_asyn_device_support_clamps_nch() {
         ) -> epics_base_rs::error::CaResult<()> {
             Ok(())
         }
-        fn done(&mut self) -> bool {
-            false
+        fn register_done_interrupt(
+            &mut self,
+            _user: scaler_rs::device_support::scaler_asyn::DoneInterrupt,
+        ) {
         }
         fn num_channels(&self) -> usize {
             999
@@ -727,7 +834,7 @@ fn test_tp_to_pr1_special_truncates_process_rounds() {
     let mut rec = ScalerRecord::default();
     rec.freq = 1e7;
     rec.tp = tp;
-    rec.special("TP", true).unwrap();
+    rec.special("TP", true, &Default::default()).unwrap();
     assert_eq!(rec.pr[0], 10_000_000, "special() TP must truncate (C:672)");
 
     // process() REQSTART — NINT: 10_000_000.5 -> 10_000_001.
@@ -736,7 +843,7 @@ fn test_tp_to_pr1_special_truncates_process_rounds() {
     rec2.tp = tp;
     rec2.init_record(1).unwrap();
     rec2.cnt = 1;
-    rec2.special("CNT", true).unwrap();
+    rec2.special("CNT", true, &Default::default()).unwrap();
     rec2.process().unwrap();
     assert_eq!(
         rec2.pr[0], 10_000_001,
@@ -750,7 +857,7 @@ fn test_tp_to_pr1_saturates_on_large_tp() {
     let mut rec = ScalerRecord::default();
     rec.freq = 1e7;
     rec.tp = 1e30; // tp * freq overflows u32 by many orders of magnitude
-    rec.special("TP", true).unwrap();
+    rec.special("TP", true, &Default::default()).unwrap();
     assert_eq!(rec.pr[0], u32::MAX);
 }
 
@@ -766,7 +873,7 @@ fn test_special_tp_truncates() {
     rec.freq = 1e7;
     // 1.9 ticks of fractional part: 0.999_999_99 s * 1e7 = 9_999_999.9.
     rec.tp = 0.999_999_99;
-    rec.special("TP", true).unwrap();
+    rec.special("TP", true, &Default::default()).unwrap();
     assert_eq!(rec.pr[0], 9_999_999, "special() TP must truncate");
     assert_eq!(rec.d[0], 1);
     assert_eq!(rec.g[0], 1);
@@ -778,7 +885,7 @@ fn test_special_tp_truncates() {
 fn test_special_rat1_not_clamped() {
     let mut rec = ScalerRecord::default();
     rec.rat1 = 100.0;
-    rec.special("RAT1", true).unwrap();
+    rec.special("RAT1", true, &Default::default()).unwrap();
     assert_eq!(rec.rat1, 100.0, "RAT1 has no special() handler in C");
 }
 
@@ -822,9 +929,10 @@ fn test_process_done_during_autocount_does_not_clear_cnt() {
 fn test_process_zeroes_counts_while_waiting() {
     let mut rec = ScalerRecord::default();
     rec.freq = 1e7;
+    rec.nch = 4; // C zeroes and posts `counts[0..nch]` (:574, :579)
     rec.dly = 100.0; // long delay so we stay WAITING
     rec.cnt = 1;
-    rec.special("CNT", true).unwrap();
+    rec.special("CNT", true, &Default::default()).unwrap();
     assert_eq!(rec.us, 1); // WAITING
 
     // Device support left stale counts in S1..; process() must zero them.
@@ -834,6 +942,33 @@ fn test_process_zeroes_counts_while_waiting() {
     assert_eq!(rec.s[0], 0, "S1 zeroed while WAITING");
     assert_eq!(rec.s[3], 0, "S4 zeroed while WAITING");
     assert_eq!(rec.t, 0.0, "T recomputed from zeroed S1");
+}
+
+/// C scalerRecord.c:579-588 — a WAITING cycle zeroes every active channel, so
+/// a 64-channel record posts all 64 `Sn` (:582) then T (:588) ahead of
+/// `monitor()`: 65 marks in the one take, in C's order.
+#[test]
+fn test_waiting_cycle_marks_t_and_every_channel() {
+    let mut rec = ScalerRecord::default();
+    rec.freq = 1e7;
+    rec.nch = MAX_SCALER_CHANNELS as i16;
+    rec.dly = 100.0;
+    rec.cnt = 1;
+    rec.special("CNT", true, &Default::default()).unwrap();
+    rec.s = [1; MAX_SCALER_CHANNELS];
+    rec.t = 1.0;
+    rec.process().unwrap();
+    let marked: Vec<&str> = rec
+        .take_process_posted_fields()
+        .map(|(f, _)| name(f))
+        .collect();
+    let mut expected: Vec<String> = (1..=MAX_SCALER_CHANNELS).map(|i| format!("S{i}")).collect();
+    expected.push("T".to_string());
+    assert_eq!(marked, expected);
+    assert!(
+        rec.take_process_posted_fields().is_empty(),
+        "a take clears them"
+    );
 }
 
 /// C scalerRecord.c:487-490 — after a user count finishes, the
@@ -878,43 +1013,33 @@ fn test_autocount_starts_immediately_when_no_delay() {
 /// C drvScalerSoft.c:303-313 — scalerResetCommand clears all presets.
 #[test]
 fn test_soft_driver_reset_clears_presets() {
-    let mut driver = SoftScalerDriver::new(8);
-    driver.write_preset(0, 1000).unwrap();
-    driver.arm(true).unwrap();
-    driver.reset().unwrap();
+    let mut rig = SoftRig::new();
+    rig.driver().write_preset(0, 1000).unwrap();
+    rig.driver().arm(true).unwrap();
+    rig.driver().reset().unwrap();
     // After reset the preset is gone, so a count that previously would
     // have completed no longer triggers done.
-    let shared = driver.shared_counts();
-    {
-        let mut g = shared.lock().unwrap();
-        g[0] = 5000;
-    }
-    driver.arm(true).unwrap();
-    let mut counts = [0u32; MAX_SCALER_CHANNELS];
-    driver.read(&mut counts).unwrap();
-    assert!(!driver.done(), "no preset after reset -> never done");
+    rig.counts.lock().unwrap()[0] = 5000;
+    rig.driver().arm(true).unwrap();
+    rig.read();
+    rig.read();
+    assert!(!rig.fired(), "no preset after reset -> never done");
 }
 
 /// C drvScalerSoft.c:315-329 — scalerArmCommand clears the scaler data
 /// so a stale count cannot make the scaler report done immediately.
 #[test]
 fn test_soft_driver_arm_clears_counts() {
-    let mut driver = SoftScalerDriver::new(8);
-    driver.write_preset(0, 1000).unwrap();
-
+    let mut rig = SoftRig::new();
+    rig.driver().write_preset(0, 1000).unwrap();
     // A stale count above the preset is sitting in shared state.
-    let shared = driver.shared_counts();
-    {
-        let mut g = shared.lock().unwrap();
-        g[0] = 5000;
-    }
+    rig.counts.lock().unwrap()[0] = 5000;
 
-    // Arming must wipe that stale count, so the first read is not "done".
-    driver.arm(true).unwrap();
-    let mut counts = [0u32; MAX_SCALER_CHANNELS];
-    driver.read(&mut counts).unwrap();
-    assert_eq!(counts[0], 0, "arm() cleared the stale count");
-    assert!(!driver.done(), "arm() prevented an immediate done");
+    // Arming must wipe that stale count, so no read completes the count.
+    rig.driver().arm(true).unwrap();
+    assert_eq!(rig.read()[0], 0, "arm() cleared the stale count");
+    rig.read();
+    assert!(!rig.fired(), "arm() prevented an immediate done");
 }
 
 // ============================================================
@@ -987,35 +1112,39 @@ impl ScalerDriver for QuantizingDriver {
     fn actual_frequency(&self) -> Option<f64> {
         Some(Self::DRIVER_FREQ)
     }
-    fn done(&mut self) -> bool {
-        false
+    fn register_done_interrupt(
+        &mut self,
+        _user: scaler_rs::device_support::scaler_asyn::DoneInterrupt,
+    ) {
     }
     fn num_channels(&self) -> usize {
         8
     }
 }
 
-/// Dispatch the actions a record's process() returned through device
-/// support, mirroring `Database::execute_process_actions`' handling of
-/// `ProcessAction::DeviceCommand` (processing.rs DeviceCommand arm).
-///
-/// Returns the accumulated record-field names every `handle_command`
-/// reported as changed — these are exactly the fields the framework
-/// posts `DBE_VALUE` monitor events for (C `db_post_events`,
-/// `scalerRecord.c:425-430`).
-fn run_device_commands(
-    support: &mut dyn epics_base_rs::server::device_support::DeviceSupport,
-    rec: &mut ScalerRecord,
-    actions: &[epics_base_rs::server::record::ProcessAction],
-) -> Vec<&'static str> {
-    use epics_base_rs::server::record::ProcessAction;
-    let mut posted = Vec::new();
-    for action in actions {
-        if let ProcessAction::DeviceCommand { command, args } = action {
-            posted.extend(support.handle_command(rec, command, args).unwrap());
-        }
-    }
-    posted
+/// C scalerRecord.c:453, :508-535 — an idle cycle marks its counts update
+/// (Sn :582, T :588); the autocount's FREQ (:530) follows the `:470` epilogue,
+/// so it is no mark (its order: `autocount_freq_post.rs`).
+#[test]
+fn test_autocount_freq_is_not_a_process_mark() {
+    let mut rec = ScalerRecord::default();
+    rec.freq = 1e7;
+    rec.nch = 1;
+    rec.cont = 1;
+    rec.dly1 = 0.0;
+    rec.s[0] = 5; // QuantizingDriver reads 0
+    rec.t = 1.0;
+    rec.bind_dset(std::sync::Arc::new(std::sync::Mutex::new(Box::new(
+        QuantizingDriver::new(),
+    ))));
+    rec.process().unwrap();
+    assert_eq!(rec.ss, 2, "the auto-count started");
+    let marked: Vec<&str> = rec
+        .take_process_posted_fields()
+        .map(|(f, _)| name(f))
+        .collect();
+    assert_eq!(marked, ["S1", "T"]);
+    assert_eq!(rec.freq, 1.25e7, "the driver's clock adopted");
 }
 
 /// C scalerRecord.c:405-432 — REQSTART: after the per-channel
@@ -1042,16 +1171,13 @@ fn test_reqstart_reconciles_pr1_tp_freq_with_adjusting_driver() {
     // 1.0 s * 1e7 Hz = 10_000_000 ticks, which is NOT a multiple of
     // QUANTUM (4096), so the driver will quantize it.
     rec.cnt = 1;
-    rec.special("CNT", true).unwrap();
+    rec.special("CNT", true, &Default::default()).unwrap();
     assert_eq!(rec.us, 2, "CNT request -> REQSTART");
 
-    let outcome = rec.process().unwrap();
-    // process() left us/ss in COUNTING and emitted CMD_RESET + CMD_START_COUNT.
+    // process() runs the count start through the bound dset (C:391-433).
+    rec.process().unwrap();
     assert_eq!(rec.ss, 2, "COUNTING");
     assert_eq!(rec.us, 3, "COUNTING");
-
-    // Dispatch the device commands — this runs run_start_count.
-    run_device_commands(&mut support, &mut rec, &outcome.actions);
 
     // The driver adopted its own clock frequency.
     assert_eq!(
@@ -1119,10 +1245,8 @@ fn test_autocount_restores_user_pr1_after_driver_adjustment() {
 
     rec.cont = 1; // CONT mode
     rec.dly1 = 0.0; // start immediately
-    let outcome = rec.process().unwrap();
+    rec.process().unwrap();
     assert_eq!(rec.ss, 2, "auto-count COUNTING");
-
-    run_device_commands(&mut support, &mut rec, &outcome.actions);
 
     // C:532 — user's channel-1 preset is restored.
     assert_eq!(
@@ -1164,10 +1288,8 @@ fn test_reqstart_no_reconciliation_when_driver_does_not_adjust() {
     rec.init_record(1).unwrap();
 
     rec.cnt = 1;
-    rec.special("CNT", true).unwrap();
-    let outcome = rec.process().unwrap();
-
-    run_device_commands(&mut support, &mut rec, &outcome.actions);
+    rec.special("CNT", true, &Default::default()).unwrap();
+    rec.process().unwrap();
 
     // SoftScalerDriver returns the preset unchanged and reports no
     // clock, so PR1 stays NINT(1.0 * 1e7) and FREQ/TP are untouched.
@@ -1257,7 +1379,7 @@ fn test_special_cnt_fires_coutp() {
 
     // CNT write — special() must queue the COUTP put.
     rec.cnt = 1;
-    rec.special("CNT", true).unwrap();
+    rec.special("CNT", true, &Default::default()).unwrap();
     let special = rec.take_special_actions();
     assert!(
         special.iter().any(|a| matches!(
@@ -1304,7 +1426,7 @@ fn test_special_cnt_stop_fires_coutp() {
     // CNT=0 while idle — not a redundant in-progress request, so special()
     // still fires COUTP.
     rec.cnt = 0;
-    rec.special("CNT", true).unwrap();
+    rec.special("CNT", true, &Default::default()).unwrap();
     assert!(
         rec.take_special_actions().iter().any(|a| matches!(
             a,
@@ -1429,7 +1551,7 @@ fn test_fwd_link_does_not_fire_while_waiting_out_dly() {
     rec.freq = 1e7;
     rec.dly = 100.0;
     rec.cnt = 1;
-    rec.special("CNT", true).unwrap();
+    rec.special("CNT", true, &Default::default()).unwrap();
     assert_eq!(rec.us, 1); // USER_STATE_WAITING
 
     rec.process().unwrap();
@@ -1471,7 +1593,7 @@ fn test_count_start_copies_gates_to_directions_only_up_to_nch() {
     rec.d[MAX_SCALER_CHANNELS - 1] = 1;
 
     rec.cnt = 1;
-    rec.special("CNT", true).unwrap();
+    rec.special("CNT", true, &Default::default()).unwrap();
     rec.process().unwrap();
     assert_eq!(rec.ss, 2, "counting");
 
@@ -1568,12 +1690,11 @@ fn test_autocount_timed_branch_does_not_touch_directions() {
 #[derive(Default)]
 struct FlakyScalerState {
     fail_read: bool,
-    done: bool,
-    done_reads: usize,
+    done_user: Option<scaler_rs::device_support::scaler_asyn::DoneInterrupt>,
 }
 
 /// A scaler whose count read can be made to fail while a completed count is
-/// still waiting in the read-and-clear `done()` latch.
+/// still waiting in the record's read-and-clear `done` latch.
 struct FlakyScalerDriver(std::sync::Arc<std::sync::Mutex<FlakyScalerState>>);
 
 impl ScalerDriver for FlakyScalerDriver {
@@ -1600,10 +1721,11 @@ impl ScalerDriver for FlakyScalerDriver {
         counts[0] = 4242;
         Ok(())
     }
-    fn done(&mut self) -> bool {
-        let mut st = self.0.lock().unwrap();
-        st.done_reads += 1;
-        std::mem::take(&mut st.done)
+    fn register_done_interrupt(
+        &mut self,
+        user: scaler_rs::device_support::scaler_asyn::DoneInterrupt,
+    ) {
+        self.0.lock().unwrap().done_user = Some(user);
     }
     fn num_channels(&self) -> usize {
         1
@@ -1617,8 +1739,7 @@ fn flaky_scaler() -> (
 ) {
     let state = std::sync::Arc::new(std::sync::Mutex::new(FlakyScalerState {
         fail_read: true,
-        done: true,
-        done_reads: 0,
+        done_user: None,
     }));
     let dev = scaler_rs::device_support::scaler_asyn::ScalerAsynDeviceSupport::new(Box::new(
         FlakyScalerDriver(std::sync::Arc::clone(&state)),
@@ -1626,46 +1747,55 @@ fn flaky_scaler() -> (
     (state, dev)
 }
 
-/// F5: `processing` raises READ_ALARM/INVALID only on an `Err` from device
-/// support, so a swallowed driver read error left the record showing the
-/// previous scan's counts at NO_ALARM.
-#[test]
-fn test_asyn_device_support_read_error_reaches_the_record() {
-    use epics_base_rs::server::device_support::DeviceSupport;
-
-    let (_state, mut dev) = flaky_scaler();
-    let mut rec = ScalerRecord::default();
-    rec.s[0] = 7;
-
-    assert!(
-        dev.read(&mut rec).is_err(),
-        "a failed driver read must reach the record as an error"
-    );
-    assert_eq!(rec.s[0], 7, "a failed read must not publish counts");
-}
-
-/// F5: `done()` is read-and-clear — it reports a completed count exactly once —
-/// so the failing scan must not consume it, or the completion is lost and no
-/// later scan can re-deliver it.
-#[test]
-fn test_asyn_device_support_read_error_does_not_consume_the_done_latch() {
+/// A user count whose completing cycle cannot read the counters.
+fn completing_with_flaky_read() -> (
+    std::sync::Arc<std::sync::Mutex<FlakyScalerState>>,
+    ScalerRecord,
+) {
     use epics_base_rs::server::device_support::DeviceSupport;
 
     let (state, mut dev) = flaky_scaler();
     let mut rec = ScalerRecord::default();
+    dev.init(&mut rec).unwrap();
+    rec.freq = 1e7;
+    rec.ss = 2; // COUNTING
+    rec.us = 3; // USER COUNTING
+    rec.cnt = 1;
+    rec.pcnt = 1;
+    rec.s[0] = 7;
+    state
+        .lock()
+        .unwrap()
+        .done_user
+        .as_ref()
+        .unwrap()
+        .callback(1);
+    (state, rec)
+}
 
-    let _ = dev.read(&mut rec);
+/// C ignores the dset read status (`scalerRecord.c:572`): a failed read
+/// raises no alarm and the count still completes.
+#[test]
+fn test_asyn_read_error_raises_no_alarm() {
+    let (_state, mut rec) = completing_with_flaky_read();
+    rec.process().unwrap();
+    assert_eq!(rec.s[0], 7, "a failed read must not publish counts");
+    assert_eq!((rec.ss, rec.us, rec.cnt), (0, 0, 0), "the count completed");
+
+    let mut common = epics_base_rs::server::record::CommonFields::default();
+    rec.check_alarms(&mut common);
     assert_eq!(
-        state.lock().unwrap().done_reads,
-        0,
-        "the read-and-clear done latch must survive the failed scan"
+        common.nsev,
+        epics_base_rs::server::record::AlarmSeverity::NoAlarm
     );
+}
 
-    // Next scan, the link is back: the completion is still there to deliver.
-    state.lock().unwrap().fail_read = false;
-    assert!(dev.read(&mut rec).is_ok());
-    assert_eq!(rec.s[0], 4242);
-    let st = state.lock().unwrap();
-    assert_eq!(st.done_reads, 1);
-    assert!(!st.done, "the completion was delivered exactly once");
+/// C asks `done()` at `:366`, ahead of the `:453` read, so the read-and-clear
+/// latch is taken by the cycle that acts on it: the count completes even when
+/// that cycle's read fails.
+#[test]
+fn test_asyn_read_error_still_completes_the_count() {
+    let (_state, mut rec) = completing_with_flaky_read();
+    rec.process().unwrap();
+    assert_eq!((rec.ss, rec.us, rec.cnt), (0, 0, 0), "the count completed");
 }

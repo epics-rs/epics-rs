@@ -33,6 +33,7 @@ use super::peers::ConnSlot;
 use super::runtime::PvaServerConfig;
 use super::source::{ChannelInvalidator, DynSource};
 use super::tcp::{ConnInit, handle_connection_io};
+use crate::liveness_clock::LivenessClock;
 
 /// Run the TCP listener forever. Backwards-compat wrapper that
 /// drops per-peer stats — equivalent to calling
@@ -166,6 +167,7 @@ pub async fn run_tcp_server_on_listener(
                 let peers_for_task = peers.clone();
                 let conn_invalidator = channel_invalidator.clone();
                 let conn_reactor = reactor.clone();
+                let writer_reactor = reactor.clone();
                 conn_tasks.spawn(async move {
                     // declared first so it drops last: every `return` below
                     // and any panic unwinding out of the connection body
@@ -197,6 +199,13 @@ pub async fn run_tcp_server_on_listener(
                         match sock.send_buffer_size() {
                             Ok(sz) if sz > 0 => sz.saturating_mul(super::tcp::TCP_TX_LIMIT_MULT),
                             _ => super::tcp::TX_LIMIT_FALLBACK,
+                        }
+                    };
+                    let local_port = match stream.local_addr() {
+                        Ok(local) => local.port(),
+                        Err(e) => {
+                            debug!(?peer, "local_addr failed, dropping connection: {e}");
+                            return;
                         }
                     };
 
@@ -319,6 +328,9 @@ pub async fn run_tcp_server_on_listener(
                                             x509_identity: x509_id,
                                             channel_invalidator: conn_invalidator,
                                             tx_limit_bytes,
+                                            writer_reactor,
+                                            liveness_clock: LivenessClock::System,
+                                            local_port,
                                         },
                                     )
                                     .await
@@ -353,6 +365,9 @@ pub async fn run_tcp_server_on_listener(
                                     x509_identity: None,
                                     channel_invalidator: conn_invalidator,
                                     tx_limit_bytes,
+                                    writer_reactor,
+                                    liveness_clock: LivenessClock::System,
+                                    local_port,
                                 },
                             )
                             .await

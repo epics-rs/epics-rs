@@ -53,8 +53,9 @@ async fn r9_70_init_rounds_every_dly_to_a_clock_tick() {
     rec.put_field("DLY7", EpicsValue::Double(1.234)).unwrap();
     rec.put_field("DLYA", EpicsValue::Double(0.025)).unwrap();
 
-    // C `init_record`, pass 0.
+    // C `init_record`; the quantize is pass 1's (`sseqRecord.c:198`).
     rec.init_record(0).unwrap();
+    rec.init_record(1).unwrap();
 
     let q = thread_sleep_quantum();
     assert!(q > 0.0, "test assumes a positive clock quantum, got {q}");
@@ -97,7 +98,7 @@ async fn r9_70_init_rounds_every_dly_to_a_clock_tick() {
 async fn r9_70_put_to_dly1_quantizes_dly1() {
     let mut rec = SseqRecord::default();
     rec.put_field("DLY1", EpicsValue::Double(0.037)).unwrap();
-    rec.special("DLY1", true).unwrap();
+    rec.special("DLY1", true, &Default::default()).unwrap();
 
     assert_eq!(
         dly(&rec, "1"),
@@ -114,7 +115,7 @@ async fn r9_70_put_to_dlya_quantizes_dly1_and_leaves_dlya_raw() {
     rec.put_field("DLY1", EpicsValue::Double(0.037)).unwrap();
     rec.put_field("DLYA", EpicsValue::Double(0.083)).unwrap();
 
-    rec.special("DLYA", true).unwrap();
+    rec.special("DLYA", true, &Default::default()).unwrap();
 
     assert_eq!(
         dly(&rec, "1"),
@@ -138,6 +139,7 @@ async fn r9_70_put_to_dlya_quantizes_dly1_and_leaves_dlya_raw() {
 async fn r9_70_default_dly_serves_positive_zero_not_negative_zero() {
     let mut rec = SseqRecord::default();
     rec.init_record(0).unwrap();
+    rec.init_record(1).unwrap();
     for n in ["1", "2", "3", "4", "5", "6", "7", "8", "9", "A"] {
         let v = dly(&rec, n);
         assert_eq!(v, 0.0, "default DLY{n} is 0.0");
@@ -159,7 +161,7 @@ async fn r9_70_huge_put_to_dly1_overflows_to_c_long_min() {
 
     let mut rec = SseqRecord::default();
     rec.put_field("DLY1", EpicsValue::Double(1e300)).unwrap();
-    rec.special("DLY1", true).unwrap();
+    rec.special("DLY1", true, &Default::default()).unwrap();
     let v = dly(&rec, "1");
     assert_eq!(
         v, expect_overflow,
@@ -170,7 +172,7 @@ async fn r9_70_huge_put_to_dly1_overflows_to_c_long_min() {
     // The same for a value that rounds to exactly zero on the put path.
     let mut rec2 = SseqRecord::default();
     rec2.put_field("DLY1", EpicsValue::Double(-0.0)).unwrap();
-    rec2.special("DLY1", true).unwrap();
+    rec2.special("DLY1", true, &Default::default()).unwrap();
     let z = dly(&rec2, "1");
     assert_eq!(z, 0.0);
     assert!(
@@ -206,4 +208,14 @@ async fn r9_70_framework_put_path_matches_c() {
         Some(expect_quantized(0.037)),
         "...and rounds DLY1 instead"
     );
+}
+
+/// C returns from pass 0 before the quantize (`sseqRecord.c:167`), so DLYn
+/// keeps its loaded value between the passes.
+#[test]
+fn pass_0_leaves_dly_as_loaded() {
+    let mut rec = SseqRecord::default();
+    rec.put_field("DLY1", EpicsValue::Double(0.017)).unwrap();
+    rec.init_record(0).unwrap();
+    assert_eq!(rec.get_field("DLY1"), Some(EpicsValue::Double(0.017)));
 }

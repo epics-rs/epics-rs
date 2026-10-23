@@ -1,0 +1,57 @@
+$ snc assign.st
+assign.st:11: error: cannot assign variable 'nope': variable was not declared
+assign.st:12: error: cannot assign variable 's': wrong type
+assign.st:13: error: cannot assign variable 'p': wrong type
+assign.st:14: error: cannot assign variable 'c': wrong type
+assign.st:15: error: cannot assign variable 'a3': wrong type
+assign.st:16: error: cannot assign variable 'ef': wrong type
+assign.st:18: error: variable 'a' already assigned
+assign.st:19: error: variable 'a' is not an array
+assign.st:21: error: array element 'a1[0]' already assigned to 'pv:e0'
+assign.st:22: error: subscript in 'a1[3]' out of range
+assign.st:24: error: variable 'a1' already assigned
+assign.st:25: error: array element 'a1[0]' already assigned to 'pv:e0'
+assign.st:25: error: array element 'a1[2]' already assigned to 'pv:e2'
+assign.st:26: warning: discarding excess PV names in multiple assign to variable 'a2'
+assign.st:27: error: variable 'a2' already assigned
+assign.st:29: warning: discarding excess PV names in multiple assign to variable 'b'
+assign.st:34: error: array element 'e[1]' already assigned to 'e1'
+assign.st:39: warning: state local assign is deprecated
+assign.st:40: error: cannot assign variable 'a': assign must be in the same scope as declaration
+$ snc +W assign.st
+assign.st:11: error: cannot assign variable 'nope': variable was not declared
+assign.st:12: error: cannot assign variable 's': wrong type
+assign.st:13: error: cannot assign variable 'p': wrong type
+assign.st:14: error: cannot assign variable 'c': wrong type
+assign.st:15: error: cannot assign variable 'a3': wrong type
+assign.st:16: error: cannot assign variable 'ef': wrong type
+assign.st:18: error: variable 'a' already assigned
+assign.st:19: error: variable 'a' is not an array
+assign.st:21: error: array element 'a1[0]' already assigned to 'pv:e0'
+assign.st:22: error: subscript in 'a1[3]' out of range
+assign.st:24: error: variable 'a1' already assigned
+assign.st:25: error: array element 'a1[0]' already assigned to 'pv:e0'
+assign.st:25: error: array element 'a1[2]' already assigned to 'pv:e2'
+assign.st:26: warning: discarding excess PV names in multiple assign to variable 'a2'
+assign.st:27: error: variable 'a2' already assigned
+assign.st:29: warning: discarding excess PV names in multiple assign to variable 'b'
+assign.st:34: error: array element 'e[1]' already assigned to 'e1'
+assign.st:39: warning: state local assign is deprecated
+assign.st:40: error: cannot assign variable 'a': assign must be in the same scope as declaration
+$ snc -w assign.st
+assign.st:11: error: cannot assign variable 'nope': variable was not declared
+assign.st:12: error: cannot assign variable 's': wrong type
+assign.st:13: error: cannot assign variable 'p': wrong type
+assign.st:14: error: cannot assign variable 'c': wrong type
+assign.st:15: error: cannot assign variable 'a3': wrong type
+assign.st:16: error: cannot assign variable 'ef': wrong type
+assign.st:18: error: variable 'a' already assigned
+assign.st:19: error: variable 'a' is not an array
+assign.st:21: error: array element 'a1[0]' already assigned to 'pv:e0'
+assign.st:22: error: subscript in 'a1[3]' out of range
+assign.st:24: error: variable 'a1' already assigned
+assign.st:25: error: array element 'a1[0]' already assigned to 'pv:e0'
+assign.st:25: error: array element 'a1[2]' already assigned to 'pv:e2'
+assign.st:27: error: variable 'a2' already assigned
+assign.st:34: error: array element 'e[1]' already assigned to 'e1'
+assign.st:40: error: cannot assign variable 'a': assign must be in the same scope as declaration

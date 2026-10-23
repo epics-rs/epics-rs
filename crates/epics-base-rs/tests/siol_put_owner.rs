@@ -22,7 +22,10 @@ use epics_base_rs::types::EpicsValue;
 
 async fn process(db: &PvDatabase, name: &str) {
     let mut v = epics_base_rs::server::database::ProcStack::new();
-    db.process_record_with_links(name, &mut v).await.unwrap();
+    db.process_record_with_links(name, &mut v)
+        .await
+        .or_else(epics_base_rs::error::CaError::unless_process_status)
+        .unwrap();
 }
 
 async fn alarm_of(db: &PvDatabase, name: &str) -> (u16, AlarmSeverity) {
@@ -38,8 +41,8 @@ async fn add_simulated_ao(db: &PvDatabase, name: &str, siol: &str, val: f64) {
         .await
         .ok();
     let mut ao = AoRecord::new(val);
-    ao.siml = "SIM_ON".to_string();
-    ao.siol = siol.to_string();
+    ao.siml = "SIM_ON".into();
+    ao.siol = siol.into();
     db.add_record(name, Box::new(ao)).await.unwrap();
     let rec = db.get_record(name).unwrap();
     let mut inst = rec.write();
@@ -61,12 +64,12 @@ async fn r15_63_siol_pp_processes_the_passive_target() {
     db.add_record("FLNK_TGT", Box::new(AiRecord::new(0.0)))
         .await
         .unwrap();
-    {
-        let rec = db.get_record("SIOL_TGT").unwrap();
-        let mut inst = rec.write();
-        inst.put_common_field("FLNK", EpicsValue::String("FLNK_TGT".into()))
-            .unwrap();
-    }
+    db.put_pv_no_process("SIOL_TGT.FLNK", EpicsValue::String("FLNK_TGT".into()))
+        .await
+        .unwrap();
+
+    // The forward links bind at iocInit, as C's do.
+    db.ioc_init().await;
     let before = db.get_record("FLNK_TGT").unwrap().read().common.time;
 
     add_simulated_ao(&db, "AO_SIM", "SIOL_TGT PP", 42.0).await;
@@ -96,15 +99,16 @@ async fn r15_63_siol_ms_inherits_the_writers_severity() {
         .unwrap();
 
     add_simulated_ao(&db, "AO_SIM", "SIOL_TGT MS PP", 200.0).await;
-    {
-        // HIHI=100/HHSV=MAJOR — the ao goes MAJOR in the cycle that writes SIOL.
-        let rec = db.get_record("AO_SIM").unwrap();
-        let mut inst = rec.write();
-        inst.put_common_field("HIHI", EpicsValue::Double(100.0))
-            .unwrap();
-        inst.put_common_field("HHSV", EpicsValue::Short(AlarmSeverity::Major as i16))
-            .unwrap();
-    }
+    // HIHI=100/HHSV=MAJOR — the ao goes MAJOR in the cycle that writes SIOL.
+    db.put_pv_no_process("AO_SIM.HIHI", EpicsValue::Double(100.0))
+        .await
+        .unwrap();
+    db.put_pv_no_process(
+        "AO_SIM.HHSV",
+        EpicsValue::Short(AlarmSeverity::Major as i16),
+    )
+    .await
+    .unwrap();
 
     process(&db, "AO_SIM").await;
 

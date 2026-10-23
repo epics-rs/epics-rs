@@ -39,8 +39,8 @@ use crate::surface::{FieldRef, Surface, ValStatus, is_put_candidate};
 /// How long to let monitor updates settle after driving the puts. A port that
 /// posts *extra* events must be caught, so we cannot stop listening the moment
 /// the puts return.
-const MONITOR_SETTLE: Duration = Duration::from_millis(600);
-const MONITOR_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+pub const MONITOR_SETTLE: Duration = Duration::from_millis(600);
+pub const MONITOR_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Array-phase capacity. Fixed so both sides declare the identical `NELM` and
 /// the over-capacity boundary is the same element count on each. Wide enough
@@ -720,14 +720,14 @@ fn array_fixture(dbd: &Dbd, record_type: &str) -> Option<ArrayFixture> {
         // Not a `caput -a REC n v0 v1 …` destination — named rather than
         // dropped in silence.
         DbaddrShape::LongString { .. } => {
-            eprintln!(
+            epics_base_rs::stderr_println!(
                 "    array phase excluded for {record_type}: VAL is special(SPC_DBADDR) but \
                  cvt_dbaddr serves ONE string of SIZV bytes; the put phase drives it"
             );
             return None;
         }
         DbaddrShape::Opaque => {
-            eprintln!(
+            epics_base_rs::stderr_println!(
                 "    array phase excluded for {record_type}: VAL is special(SPC_DBADDR) but \
                  the record type declares no capacity field, so the .dbd names no \
                  bounded element sequence to drive"
@@ -746,7 +746,7 @@ fn array_fixture(dbd: &Dbd, record_type: &str) -> Option<ArrayFixture> {
     })
 }
 
-fn drive_array(
+pub fn drive_array(
     t: &CaTools,
     plan: &[ArrayCase],
     rec_of: &(impl Fn(usize) -> String + Sync),
@@ -868,7 +868,7 @@ fn probe_strings(t: &CaTools, pvs: &[String]) -> Vec<Result<String, ToolError>> 
 /// [`ToolError`] on the case it belongs to. There is no third state in which a
 /// surface is quietly absent, because that state is indistinguishable from
 /// "both sides agreed".
-fn readback(
+pub fn readback(
     t: &CaTools,
     val_pvs: &[String],
     stat_pvs: &[String],
@@ -924,20 +924,20 @@ fn readback(
 /// Everything a CA case needs to identify itself, passed as one value so
 /// [`adjudicate`] keeps a signature a caller can read — the same shape
 /// [`crate::pvaread::ChannelRef`] gives the PVA phases.
-struct CaseRef<'a> {
-    record_type: &'a str,
-    field: &'a str,
+pub struct CaseRef<'a> {
+    pub record_type: &'a str,
+    pub field: &'a str,
     /// Which probe this case came from. Stamped here so no consumer has to
     /// guess it from `class`, which the read and monitor phases both leave
     /// `None`.
-    phase: CasePhase,
+    pub phase: CasePhase,
     /// The destination field's declared `.dbd` type. Carried because an
     /// allowlist row may be scoped by it (see [`crate::allowlist::MatchContext`]).
-    dbf: DbfType,
-    class: Option<&'a str>,
+    pub dbf: DbfType,
+    pub class: Option<&'a str>,
 }
 
-fn adjudicate(
+pub fn adjudicate(
     cr: CaseRef<'_>,
     repro: Reproducer,
     c: &Observation,
@@ -1421,10 +1421,9 @@ mod bisect_tests {
 /// code is computed from.
 #[cfg(test)]
 mod adjudicate_tests {
-    // The three cases driven against the real pair carry `#[cfg(tokio_backend)]`:
-    // they boot `oracle-ioc`, which refuses to start under the reactor-free
-    // `exec_backend`, so they cannot pass there under any treatment. The rest
-    // adjudicate against `FakeIoc` and stay selected on every backend.
+    // The cases driven against the real pair live in `tests/runner_pair.rs`,
+    // where cargo builds `oracle-ioc` for them. The rest adjudicate against
+    // `FakeIoc` and stay selected on every backend.
     use super::*;
     use crate::dbd::DbfType;
     use crate::report::Counts;
@@ -1649,7 +1648,8 @@ mod adjudicate_tests {
             "the C EPICS tree must be built for the oracle to have ground truth; \
              set EPICS_BASE_BIN if it is not at the default path",
         );
-        let dead = crate::ioc::alloc_free_port().expect("a port to aim at");
+        let dead_claim = crate::ioc::claim_port().expect("a port to aim at");
+        let dead = dead_claim.port();
 
         let side_err = |side: Side| -> ToolError {
             CaTools::new(&tools, dead, side)
@@ -1754,157 +1754,6 @@ recordtype(ai) {
         assert_eq!(of("ai"), None);
     }
 
-    /// `value_numeric: None`, so `compare` skipped the surface and the
-    /// truncation contract was reported AGREED while unverified.
-    ///
-    /// The plant is a record type that genuinely has no `NORD`: `ai`. The put
-    /// and every other surface read fine, so only the missing discriminator is
-    /// under test.
-    #[cfg(tokio_backend)]
-    #[test]
-    fn an_unreadable_nord_errors_the_array_case_instead_of_agreeing() {
-        let tools = CTools::discover().expect(
-            "the C EPICS tree must be built for the oracle to have ground truth; \
-             set EPICS_BASE_BIN if it is not at the default path",
-        );
-        let dir = workdir(None).expect("workdir");
-        let db = dir.join("array_nord.db");
-        std::fs::write(&db, crate::record_stmt("ai", "ORACLE:ARR:0")).expect("write db");
-        let pair = Pair::boot(&tools, &db, "ORACLE:ARR:0").expect("both IOCs must boot");
-
-        let plan = vec![ArrayCase {
-            prime: Vec::new(),
-            values: vec!["1".to_string()],
-            class: "array-single-element",
-        }];
-        let rec_of = |_: usize| "ORACLE:ARR:0".to_string();
-        // `Some("NORD")` is the point: the field IS the case's discriminator and
-        // the record does not serve it, which is the failure under test. A type
-        // that declares no length field at all passes `None` and has nothing to
-        // fail on — a different situation, and not this one.
-        let side = |port: u16, s: Side| {
-            drive_array(&CaTools::new(&tools, port, s), &plan, &rec_of, Some("NORD"))
-        };
-        let obs_c = side(pair.c.port(), Side::C);
-        let obs_r = side(pair.rust.port(), Side::Rust);
-        assert!(
-            obs_c[0].value_numeric.is_none() && obs_r[0].value_numeric.is_none(),
-            "ai has no NORD, so neither side can produce the discriminator"
-        );
-
-        let case = adjudicate(
-            CaseRef {
-                record_type: "ai",
-                phase: CasePhase::Array,
-                field: "VAL",
-                dbf: DbfType::Double,
-                class: Some("array-single-element"),
-            },
-            repro(),
-            &obs_c[0],
-            &obs_r[0],
-            &mut shipped(),
-        );
-        assert_eq!(
-            case.verdict,
-            Verdict::Errored,
-            "a missing discriminator is not an agreement"
-        );
-        let counts = Counts::tally(&[case]);
-        assert_eq!(
-            crate::report::exit_status(&crate::report::run_failures(&counts, &[], &[])),
-            1,
-        );
-    }
-
-    /// A `.STAT` PV that will not connect must ERROR **its own case**, and only
-    /// its own case.
-    ///
-    /// Both halves matter. `caget_batch` is all-or-nothing, so the old
-    /// `caget_batch(stat_pvs, false).ok()` turned one unconnectable `.STAT`
-    /// into `stat: None` for every case of the record type: `compare` then
-    /// skipped the alarm surface on all of them and they stayed AGREED, so a
-    /// port that stopped serving STAT reported as an improvement. The other
-    /// half is that the fix must not paint every case ERROR — the good PV in
-    /// the same batch is still measured, via `probe_bisect`.
-    #[cfg(tokio_backend)]
-    #[test]
-    fn a_stat_pv_that_does_not_connect_errors_only_its_own_case() {
-        let tools = CTools::discover().expect(
-            "the C EPICS tree must be built for the oracle to have ground truth; \
-             set EPICS_BASE_BIN if it is not at the default path",
-        );
-        let dir = workdir(None).expect("workdir");
-        let db_text = format!(
-            "{}{}",
-            crate::record_stmt("ai", "ORACLE:RB:0"),
-            crate::record_stmt("ai", "ORACLE:RB:1")
-        );
-        let db = dir.join("readback_stat.db");
-        std::fs::write(&db, &db_text).expect("write db");
-        let pair = Pair::boot(&tools, &db, "ORACLE:RB:0").expect("both IOCs must boot");
-
-        let val_pvs = ["ORACLE:RB:0.VAL".to_string(), "ORACLE:RB:1.VAL".to_string()];
-        // Case 1's STAT does not exist on either side: the reading cannot be
-        // taken, which is not the same as the two sides agreeing about it.
-        let stat_pvs = [
-            "ORACLE:RB:0.STAT".to_string(),
-            "ORACLE:NOSUCHRECORD.STAT".to_string(),
-        ];
-        let sevr_pvs = [
-            "ORACLE:RB:0.SEVR".to_string(),
-            "ORACLE:RB:1.SEVR".to_string(),
-        ];
-        let accepted = || vec![Ok(PutOutcome::Completed), Ok(PutOutcome::Completed)];
-
-        let side = |port: u16, s: Side| {
-            let t = CaTools::new(&tools, port, s);
-            readback(&t, &val_pvs, &stat_pvs, &sevr_pvs, accepted())
-        };
-        let obs_c = side(pair.c.port(), Side::C);
-        let obs_r = side(pair.rust.port(), Side::Rust);
-
-        let verdict = |i: usize| {
-            adjudicate(
-                CaseRef {
-                    record_type: "ai",
-                    phase: CasePhase::Put,
-                    field: "VAL",
-                    dbf: DbfType::Double,
-                    class: Some("over-max"),
-                },
-                repro(),
-                &obs_c[i],
-                &obs_r[i],
-                &mut shipped(),
-            )
-        };
-
-        let measured = verdict(0);
-        assert_ne!(
-            measured.verdict,
-            Verdict::Errored,
-            "the case whose STAT connected must still be measured: {:?}",
-            measured.errors
-        );
-        assert!(
-            obs_c[0].stat.is_some() && obs_r[0].stat.is_some(),
-            "the alarm surface must be read where it can be"
-        );
-
-        let lost = verdict(1);
-        assert_eq!(
-            lost.verdict,
-            Verdict::Errored,
-            "an unread STAT is not an agreement"
-        );
-        let counts = Counts::tally(&[lost]);
-        assert_eq!(
-            crate::report::exit_status(&crate::report::run_failures(&counts, &[], &[])),
-            1,
-        );
-    }
-
     /// The CA monitor probe reads the same drive rule as the PVA one.
     ///
     /// `sel.VAL` is `special(SPC_NOMOD)`, so no client can stimulate it and the
@@ -1915,7 +1764,6 @@ recordtype(ai) {
     ///
     /// No IOC is booted: the exclusion is decided from the `.dbd` before any
     /// `.db` is written, which is the point of it being static.
-    #[cfg(tokio_backend)]
     #[test]
     fn the_monitor_probe_builds_no_case_for_a_val_the_dbd_forbids_writing() {
         const DBD: &str = r#"
@@ -1941,78 +1789,6 @@ recordtype(ai) {
                 .probe_monitor("sel", &surface, &mut shipped())
                 .is_none(),
             "the .dbd forbids writing sel.VAL, so there is nothing to stimulate"
-        );
-    }
-
-    /// A monitor case whose **drive** failed must score ERROR.
-    ///
-    /// The plant is a real refusal against the real pair: `NAME` is
-    /// `special(SPC_NOMOD)`, so the put is refused on both sides, the
-    /// subscription is never stimulated, and both traces are empty. Before
-    /// this, the drive's outcome was discarded, `compare` found no difference
-    /// between two empty traces, and the case was scored AGREED and counted as
-    /// monitor coverage — a positive agreement claim about a subscription that
-    /// was never given anything to post on.
-    #[cfg(tokio_backend)]
-    #[test]
-    fn a_monitor_whose_drive_was_refused_scores_error_not_agreement() {
-        let tools = CTools::discover().expect(
-            "the C EPICS tree must be built for the oracle to have ground truth; \
-             set EPICS_BASE_BIN if it is not at the default path",
-        );
-        let dir = workdir(None).expect("workdir");
-        let db = dir.join("mon_drive_refused.db");
-        std::fs::write(&db, crate::record_stmt("ai", "ORACLE:MONDRIVE")).expect("write db");
-        let pair = Pair::boot(&tools, &db, "ORACLE:MONDRIVE").expect("both IOCs must boot");
-
-        let pvs = vec!["ORACLE:MONDRIVE".to_string()];
-        let obs = |port: u16, side: Side| -> Observation {
-            let t = CaTools::new(&tools, port, side);
-            match t.monitor(&pvs, MONITOR_SETTLE, MONITOR_CONNECT_TIMEOUT, |tt| {
-                tt.caput_drive("ORACLE:MONDRIVE.NAME", "NOPE")
-            }) {
-                Ok(tr) => Observation {
-                    monitor: Some(tr),
-                    ..Default::default()
-                },
-                Err(e) => Observation {
-                    errors: vec![e],
-                    ..Default::default()
-                },
-            }
-        };
-        let c = obs(pair.c.port(), Side::C);
-        let r = obs(pair.rust.port(), Side::Rust);
-
-        let case = adjudicate(
-            CaseRef {
-                record_type: "ai",
-                phase: CasePhase::Monitor,
-                field: "VAL",
-                dbf: DbfType::Double,
-                class: None,
-            },
-            repro(),
-            &c,
-            &r,
-            &mut shipped(),
-        );
-        assert_eq!(
-            case.verdict,
-            Verdict::Errored,
-            "c_monitor={:?} rust_monitor={:?}",
-            c.monitor,
-            r.monitor
-        );
-
-        let counts = Counts::tally(&[case]);
-        assert_eq!(
-            counts.agreed, 0,
-            "an unstimulated subscription is not agreement"
-        );
-        assert_eq!(
-            crate::report::exit_status(&crate::report::run_failures(&counts, &[], &[])),
-            1,
         );
     }
 }

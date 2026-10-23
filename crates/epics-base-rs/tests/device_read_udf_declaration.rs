@@ -26,6 +26,7 @@ use epics_base_rs::server::ioc_app::DeviceSupportContext;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::recgbl::alarm_status;
 use epics_base_rs::server::record::{AlarmSeverity, Record};
+use epics_base_rs::server::record::{DbLinkType, DevSup, Dset};
 use epics_base_rs::types::EpicsValue;
 
 const REC: &str = "TEST:UDF";
@@ -67,6 +68,15 @@ impl DeviceSupport for ScriptedDevice {
 /// Build a fresh record of `record_type` — UDF starts at 1, the state
 /// `iocInit` leaves behind — process it once through `step`, and return
 /// `(UDF, SEVR, STAT)` as a client reads them.
+/// The `device()` line a C IOC's `.dbd` would carry for `scriptedUdf`: a
+/// `.db` may name only a device-menu choice.
+static SCRIPTED_ROW: DevSup = DevSup {
+    name: "devScripted",
+    choice: "scriptedUdf",
+    link_type: DbLinkType::Constant,
+    dset: Dset::new(6, &[3], false),
+};
+
 async fn read_once(record_type: &str, sourced: EpicsValue, step: Step) -> (u8, AlarmSeverity, u16) {
     let cell = Arc::new(Mutex::new(Some(step)));
     // lsi sizes its VAL buffer from SIZV; the default would truncate the
@@ -78,14 +88,17 @@ async fn read_once(record_type: &str, sourced: EpicsValue, step: Step) -> (u8, A
     };
     let db = format!(r#"record({record_type}, "{REC}") {{ field(DTYP, "scriptedUdf"){extra} }}"#);
     let (database, _) = IocBuilder::new()
-        .register_dynamic_device_support(move |ctx: &DeviceSupportContext| {
-            (ctx.dtyp == "scriptedUdf").then(|| {
-                Box::new(ScriptedDevice {
-                    step: Arc::clone(&cell),
-                    sourced: sourced.clone(),
-                }) as Box<dyn DeviceSupport>
-            })
-        })
+        .register_dynamic_device_support(
+            &[(record_type, std::slice::from_ref(&SCRIPTED_ROW))],
+            move |ctx: &DeviceSupportContext| {
+                (ctx.dtyp == "scriptedUdf").then(|| {
+                    Box::new(ScriptedDevice {
+                        step: Arc::clone(&cell),
+                        sourced: sourced.clone(),
+                    }) as Box<dyn DeviceSupport>
+                })
+            },
+        )
         .db_string(&db, &HashMap::new())
         .unwrap()
         .build()
@@ -100,6 +113,7 @@ async fn read_once(record_type: &str, sourced: EpicsValue, step: Step) -> (u8, A
     database
         .process_record_with_links(REC, &mut visited)
         .await
+        .or_else(epics_base_rs::error::CaError::unless_process_status)
         .unwrap();
     let rec = database.get_record(REC).unwrap();
     let inst = rec.read();

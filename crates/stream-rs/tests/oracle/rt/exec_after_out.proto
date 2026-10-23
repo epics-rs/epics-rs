@@ -1,0 +1,2 @@
+Terminator = CR LF;
+p { out "A"; exec "echo x"; out "B"; }

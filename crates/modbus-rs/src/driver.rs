@@ -11,7 +11,7 @@
 use std::time::{Duration, Instant};
 
 use crate::datatype::ModbusDataType;
-use crate::error::{ExceptionCode, ModbusError, ModbusResult};
+use crate::error::{ExceptionCode, IoStatus, ModbusError, ModbusResult};
 use crate::interpose::{LinkType, ModbusFramer, TransactionIdCounter};
 use crate::protocol::{FunctionCode, RequestPdu, ResponsePdu};
 
@@ -121,6 +121,23 @@ impl ModbusFunctionCode {
             223 => Self::WriteMultipleRegistersF23,
             _ => return None,
         })
+    }
+
+    /// The integer [`Self::from_i32`] decodes: C's `modbusFunction_`.
+    pub fn as_i32(self) -> i32 {
+        match self {
+            Self::ReadCoils => 1,
+            Self::ReadDiscreteInputs => 2,
+            Self::ReadHoldingRegisters => 3,
+            Self::ReadInputRegisters => 4,
+            Self::WriteSingleCoil => 5,
+            Self::WriteSingleRegister => 6,
+            Self::WriteMultipleCoils => 15,
+            Self::WriteMultipleRegisters => 16,
+            Self::ReportSlaveId => 17,
+            Self::ReadInputRegistersF23 => 123,
+            Self::WriteMultipleRegistersF23 => 223,
+        }
     }
 
     /// Bytes the reply PDU — function code first, as
@@ -285,6 +302,9 @@ pub struct IoStatistics {
     pub histogram_ms_per_bin: u32,
     /// Read-time histogram; the last bin catches all longer times.
     pub histogram: Vec<u32>,
+    /// The statistics moved since [`Self::take_moved`], one bit per C
+    /// `setIntegerParam` site in `doModbusIO`.
+    moved: u8,
 }
 
 impl Default for IoStatistics {
@@ -299,18 +319,40 @@ impl Default for IoStatistics {
             histogram_enabled: false,
             histogram_ms_per_bin: 1,
             histogram: vec![0; HISTOGRAM_LENGTH],
+            moved: 0,
         }
     }
 }
 
 impl IoStatistics {
+    /// [`Self::take_moved`]'s bit for `read_ok`.
+    pub const READ_OK: u8 = 1 << 0;
+    /// [`Self::take_moved`]'s bit for `write_ok`.
+    pub const WRITE_OK: u8 = 1 << 1;
+    /// [`Self::take_moved`]'s bit for `io_errors`.
+    pub const IO_ERRORS: u8 = 1 << 2;
+    /// [`Self::take_moved`]'s bit for `last_io_msec`.
+    pub const LAST_IO: u8 = 1 << 3;
+    /// [`Self::take_moved`]'s bit for `max_io_msec`.
+    pub const MAX_IO: u8 = 1 << 4;
+
+    /// The statistics `doModbusIO` set since the last call, and clear them. C
+    /// sets a statistic's parameter only where that one moves
+    /// (drvModbusAsyn.cpp:2205-2341), so a value a record wrote to it reads
+    /// back until then.
+    pub fn take_moved(&mut self) -> u8 {
+        std::mem::take(&mut self.moved)
+    }
+
     /// Record a completed I/O cycle of `elapsed` duration into the timing
     /// stats and, if enabled, the histogram.
     fn record_timing(&mut self, elapsed: Duration) {
         let msec = (elapsed.as_secs_f64() * 1000.0 + 0.5) as u32;
         self.last_io_msec = msec;
+        self.moved |= Self::LAST_IO;
         if msec > self.max_io_msec {
             self.max_io_msec = msec;
+            self.moved |= Self::MAX_IO;
         }
         if self.histogram_enabled {
             let bin = (msec / self.histogram_ms_per_bin.max(1)) as usize;
@@ -356,6 +398,74 @@ pub enum ModbusIoResponse {
     /// success and copies nothing, so the caller's data buffer keeps its
     /// previous contents and its records keep their previous values.
     Acknowledged,
+}
+
+/// A line C `doModbusIO` prints through `pasynUserSelf`
+/// (drvModbusAsyn.cpp:2187-2312), for the port's owner to print.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IoTrace {
+    /// `writeRead` failed where the previous one did not fail this way.
+    WriteReadFailed {
+        /// The octet port's `errorMessage`.
+        error: String,
+        /// Bytes of the request sent.
+        nwrite: usize,
+        /// The request's size, slave address and PDU.
+        request_size: usize,
+        /// Bytes the read delivered.
+        nread: usize,
+    },
+    /// `writeRead` succeeded after failing.
+    WriteReadRecovered {
+        /// Failures since the last success (C `currentIOErrors_`).
+        errors: u32,
+        /// Bytes of the request sent.
+        nwrite: usize,
+        /// The request's size, slave address and PDU.
+        request_size: usize,
+        /// Bytes the read delivered.
+        nread: usize,
+    },
+    /// An exception reply; exception 5 is C's ASYN_TRACE_WARNING, the rest
+    /// ASYN_TRACE_ERROR.
+    Exception(u8),
+    /// [`ModbusError::WordCount`].
+    WordCount {
+        /// Count the request asked for.
+        expected: usize,
+        /// Count the reply carried.
+        received: usize,
+    },
+}
+
+/// What C `writeRead` reports beside a failing status.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransportFailure {
+    /// The request went out (`nwrite` is the request size, else 0).
+    pub wrote: bool,
+    /// Bytes the failed read still delivered.
+    pub nread: usize,
+    /// The octet port's `errorMessage`.
+    pub message: String,
+}
+
+/// C `prevIOStatus_`: the `writeRead` status `doModbusIO` last traced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriteReadStatus {
+    Success,
+    Timeout,
+    Failed(IoStatus),
+}
+
+impl WriteReadStatus {
+    fn of(result: &ModbusResult<Vec<u8>>) -> Self {
+        match result {
+            Ok(_) => Self::Success,
+            Err(ModbusError::Timeout) => Self::Timeout,
+            Err(ModbusError::Io(status, _)) => Self::Failed(*status),
+            Err(_) => Self::Failed(IoStatus::Error),
+        }
+    }
 }
 
 /// A byte-stream transport — the underlying `asyn-rs` octet port the framed
@@ -405,6 +515,30 @@ pub trait OctetTransport: Send + Sync {
         self.write_frame(data)?;
         self.read_frame(expected, timeout)
     }
+    /// Whether the octet port is connected, when it leaves its connection to
+    /// the Modbus driver (autoConnect off); `None` when it connects itself.
+    /// C `doModbusIO` then reconnects it before a transaction
+    /// (drvModbusAsyn.cpp:1968-2003).
+    fn manual_connection(&self) -> Option<bool> {
+        None
+    }
+
+    /// C `pasynCommonSyncIO->disconnectDevice` on the octet port.
+    fn disconnect_device(&mut self) -> ModbusResult<()> {
+        Ok(())
+    }
+
+    /// C `pasynCommonSyncIO->connectDevice` on the octet port.
+    fn connect_device(&mut self) -> ModbusResult<()> {
+        Ok(())
+    }
+
+    /// The failure the exchange begun by the last [`Self::write_read`] met
+    /// below the framing, or `None` when nothing there failed.
+    fn transport_failure(&self) -> Option<TransportFailure> {
+        None
+    }
+
     /// Discard any partially received frame.
     ///
     /// `ModbusEngine::transact` calls this whenever a transaction ends
@@ -441,6 +575,10 @@ pub struct ModbusEngine {
     prev_data: Vec<u16>,
     /// I/O statistics.
     pub stats: IoStatistics,
+    prev_write_read: WriteReadStatus,
+    /// `None` until [`Self::record_traces`]: an engine nobody drains keeps
+    /// nothing.
+    traces: Option<Vec<IoTrace>>,
 }
 
 impl ModbusEngine {
@@ -467,7 +605,25 @@ impl ModbusEngine {
             data: vec![0; len],
             prev_data: vec![0; len],
             stats: IoStatistics::default(),
+            prev_write_read: WriteReadStatus::Success,
+            traces: None,
         })
+    }
+
+    /// Keep the [`IoTrace`] lines from here on, for [`Self::take_traces`].
+    pub fn record_traces(&mut self) {
+        self.traces.get_or_insert_with(Vec::new);
+    }
+
+    /// The lines kept since the last call, oldest first.
+    pub fn take_traces(&mut self) -> Vec<IoTrace> {
+        self.traces.as_mut().map(std::mem::take).unwrap_or_default()
+    }
+
+    fn trace(&mut self, line: IoTrace) {
+        if let Some(traces) = self.traces.as_mut() {
+            traces.push(line);
+        }
     }
 
     /// The port configuration.
@@ -614,9 +770,10 @@ impl ModbusEngine {
                 let payload = resp.read_data()?;
                 let nread = payload.len() / 2;
                 if nread != len {
-                    return Err(ModbusError::MalformedResponse(format!(
-                        "register read word count {nread} does not match expected {len}",
-                    )));
+                    return Err(ModbusError::WordCount {
+                        expected: len,
+                        received: nread,
+                    });
                 }
                 Ok(payload
                     .as_chunks::<2>()
@@ -633,10 +790,10 @@ impl ModbusEngine {
                 // byte maps to one output word (`data[i] = pCharIn[i]`).
                 let payload = resp.read_data()?;
                 if payload.len() != len {
-                    return Err(ModbusError::MalformedResponse(format!(
-                        "report-slave-id byte count {} does not match expected {len}",
-                        payload.len(),
-                    )));
+                    return Err(ModbusError::WordCount {
+                        expected: len,
+                        received: payload.len(),
+                    });
                 }
                 Ok(payload.iter().map(|&b| b as u16).collect())
             }
@@ -663,6 +820,7 @@ impl ModbusEngine {
         len: usize,
     ) -> ModbusResult<ModbusIoResponse> {
         let pdu = self.build_request(function, start, data, len)?;
+        let request_size = pdu.as_bytes().len();
         let framed = self.framer.frame_request(pdu.as_bytes())?;
         let expected_txid = framed.transaction_id;
         let is_udp = self.framer.link_type() == LinkType::Udp;
@@ -680,15 +838,45 @@ impl ModbusEngine {
         // transport status (drvModbusAsyn.cpp:2204-2208) — it is the single
         // I/O-error site. A Modbus exception response or a malformed frame is
         // not a transport failure and must never reach it.
-        let response_pdu =
-            match self.transact(transport, &framed, expected_txid, is_udp, expected_reply) {
-                Ok(pdu) => pdu,
+        let outcome = self.transact(transport, &framed, expected_txid, is_udp, expected_reply);
+        let status = WriteReadStatus::of(&outcome);
+        if status != self.prev_write_read {
+            let line = match &outcome {
+                Ok(reply) => IoTrace::WriteReadRecovered {
+                    errors: self.stats.current_io_errors,
+                    nwrite: request_size,
+                    request_size,
+                    nread: reply.len(),
+                },
                 Err(e) => {
-                    self.stats.io_errors += 1;
-                    self.stats.current_io_errors += 1;
-                    return Err(e);
+                    let failure = transport.transport_failure().unwrap_or(TransportFailure {
+                        wrote: true,
+                        nread: 0,
+                        message: match e {
+                            ModbusError::Io(_, message) => message.clone(),
+                            e => e.to_string(),
+                        },
+                    });
+                    IoTrace::WriteReadFailed {
+                        error: failure.message,
+                        nwrite: if failure.wrote { request_size } else { 0 },
+                        request_size,
+                        nread: failure.nread,
+                    }
                 }
             };
+            self.trace(line);
+            self.prev_write_read = status;
+        }
+        let response_pdu = match outcome {
+            Ok(pdu) => pdu,
+            Err(e) => {
+                self.stats.io_errors += 1;
+                self.stats.moved |= IoStatistics::IO_ERRORS;
+                self.stats.current_io_errors += 1;
+                return Err(e);
+            }
+        };
         // Transport succeeded: record the cycle time (C updates LastIOTime /
         // MaxIOTime / the histogram on every successful writeRead, before the
         // exception check, drvModbusAsyn.cpp:2211-2225) and clear the
@@ -707,8 +895,12 @@ impl ModbusEngine {
         // exception returns asynError. Either way no counter moves.
         let resp = match ResponsePdu::parse(&response_pdu) {
             Ok(resp) => resp,
-            Err(ModbusError::Exception(ExceptionCode::Acknowledge)) => {
-                return Ok(ModbusIoResponse::Acknowledged);
+            Err(ModbusError::Exception(code)) => {
+                self.trace(IoTrace::Exception(code.as_u8()));
+                return match code {
+                    ExceptionCode::Acknowledge => Ok(ModbusIoResponse::Acknowledged),
+                    code => Err(ModbusError::Exception(code)),
+                };
             }
             Err(e) => return Err(e),
         };
@@ -723,11 +915,16 @@ impl ModbusEngine {
         // check.
         if function.is_read() {
             self.stats.read_ok += 1;
+            self.stats.moved |= IoStatistics::READ_OK;
         } else {
             self.stats.write_ok += 1;
+            self.stats.moved |= IoStatistics::WRITE_OK;
         }
-        self.parse_response(function, len, &resp)
-            .map(ModbusIoResponse::Data)
+        let words = self.parse_response(function, len, &resp);
+        if let Err(ModbusError::WordCount { expected, received }) = words {
+            self.trace(IoTrace::WordCount { expected, received });
+        }
+        words.map(ModbusIoResponse::Data)
     }
 
     /// Transmit `framed` and receive the matching response PDU. For TCP the
@@ -1670,7 +1867,7 @@ mod tests {
                 3,
             )
             .unwrap_err();
-        assert!(matches!(err, ModbusError::MalformedResponse(_)));
+        assert!(matches!(err, ModbusError::WordCount { .. }));
         // C parity (drvModbusAsyn.cpp:2278-2290): readOK_++ runs before the
         // register `nread != len` check, so the mismatch frame counts as
         // readOK_ and returns asynError with no IOErrors_ bump.
@@ -1717,7 +1914,7 @@ mod tests {
         let err = engine
             .do_modbus_io(&mut transport, ModbusFunctionCode::ReportSlaveId, 0, &[], 1)
             .unwrap_err();
-        assert!(matches!(err, ModbusError::MalformedResponse(_)));
+        assert!(matches!(err, ModbusError::WordCount { .. }));
         // C parity (drvModbusAsyn.cpp:2300-2312): readOK_++ runs at the top of
         // the REPORT_SLAVE_ID case BEFORE the `nread != len` check, so a
         // count-mismatch frame still counts as readOK_ then returns asynError

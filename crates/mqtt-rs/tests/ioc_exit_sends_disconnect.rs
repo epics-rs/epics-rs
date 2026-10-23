@@ -22,6 +22,7 @@
 //! socket dies. An in-process `call_at_exits()` could not test this — the race
 //! being tested *is* the process ending.
 
+#![allow(clippy::disallowed_macros, reason = "tests may keep eprintln!")]
 #![cfg(feature = "ioc")]
 
 use std::io::{Read, Write};
@@ -74,7 +75,9 @@ fn be_the_broker() {
     std::fs::write(
         &script,
         format!(
-            "mqttDriverConfigure(\"MQ4\", \"tcp://127.0.0.1:{broker_port}\", \"mq4-client\", 0)\n"
+            // A script without iocInit builds no IOC, as C's custom main
+            // does, so the driver would never connect.
+            "mqttDriverConfigure(\"MQ4\", \"tcp://127.0.0.1:{broker_port}\", \"mq4-client\", 0)\niocInit\n"
         ),
     )
     .expect("write the child's st.cmd");
@@ -106,6 +109,11 @@ fn be_the_broker() {
     println!("MQ4: packet types after CONNACK: {session:?}; child exited {status}");
 
     assert!(
+        status.contains("exit status: 0"),
+        "the IOC child must run to a clean exit, not die in its protocol runner; \
+         child exited {status}, packets after CONNACK: {session:?}"
+    );
+    assert!(
         session.contains(&DISCONNECT),
         "an IOC exit must put a DISCONNECT on the wire — C's `~MqttClient` \
          disconnects and waits for the packet (mqttClient.cpp:37-41,51-55). \
@@ -120,22 +128,33 @@ fn broker_session(
     ready: &TcpListener,
     deadline: Instant,
 ) -> Result<Vec<u8>, String> {
-    let mut sock = accept_before(broker, deadline)?;
-    sock.set_read_timeout(Some(Duration::from_secs(20)))
-        .map_err(|e| format!("set_read_timeout: {e}"))?;
-
-    match next_packet(&mut sock) {
-        Ok(CONNECT) => {}
-        Ok(other) => return Err(format!("first packet was type {other}, expected CONNECT")),
-        Err(e) => return Err(format!("no CONNECT from the IOC child: {e}")),
-    }
+    // Both listeners' ephemeral ports are open to every process on the box: a
+    // connection that ends before its first byte is someone else's, skipped.
+    let mut sock = loop {
+        let mut sock = accept_before(broker, deadline)?;
+        sock.set_read_timeout(Some(Duration::from_secs(20)))
+            .map_err(|e| format!("set_read_timeout: {e}"))?;
+        match next_packet(&mut sock) {
+            Ok(CONNECT) => break sock,
+            Ok(other) => return Err(format!("first packet was type {other}, expected CONNECT")),
+            Err(e) if e == END => {}
+            Err(e) => return Err(format!("no CONNECT from the IOC child: {e}")),
+        }
+    };
 
     // v5 CONNACK: session_present=0, reason=Success, no properties.
     sock.write_all(&[0x20, 0x03, 0x00, 0x00, 0x00])
         .and_then(|()| sock.flush())
         .map_err(|e| format!("send CONNACK: {e}"))?;
 
-    let mut go = accept_before(ready, deadline)?;
+    let mut go = loop {
+        let mut go = accept_before(ready, deadline)?;
+        match fill(&mut go, &mut [0u8; 1]) {
+            Ok(()) => break go,
+            Err(e) if e == END => {}
+            Err(e) => return Err(format!("no hello on the release socket: {e}")),
+        }
+    };
     go.write_all(b"g")
         .and_then(|()| go.flush())
         .map_err(|e| format!("release the child: {e}"))?;
@@ -223,11 +242,14 @@ fn next_packet(sock: &mut TcpStream) -> Result<u8, String> {
     Ok(header[0] >> 4)
 }
 
+/// [`fill`]'s error for a peer that closed.
+const END: &str = "end of session";
+
 fn fill(sock: &mut TcpStream, buf: &mut [u8]) -> Result<(), String> {
     let mut done = 0;
     while done < buf.len() {
         match sock.read(&mut buf[done..]) {
-            Ok(0) => return Err("end of session".to_string()),
+            Ok(0) => return Err(END.to_string()),
             Ok(n) => done += n,
             Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {}
             Err(e) => return Err(format!("read: {e}")),
@@ -259,19 +281,31 @@ fn be_the_ioc() -> ! {
 
     let outcome = runtime.block_on(async move {
         let handle = epics_base_rs::runtime::task::runtime_handle();
+        let reactor = handle.clone();
         let app = epics_ca_rs::server::ioc_app::IocApplication::new();
         let app = mqtt_rs::ioc::register_mqtt_commands(app, handle);
         app.startup_script(&script)
             .run(move |_config| async move {
                 // The broker has CONNACKed by the time this byte arrives.
-                use tokio::io::AsyncReadExt;
-                let mut go = tokio::net::TcpStream::connect(("127.0.0.1", ready_port))
+                //
+                // The runner is polled on a callback thread under the thread
+                // backend, which has no tokio reactor: a `tokio::net` socket
+                // built here panics there. The socket lives on the runtime.
+                reactor
+                    .spawn(async move {
+                        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                        let mut go = tokio::net::TcpStream::connect(("127.0.0.1", ready_port))
+                            .await
+                            .expect("connect to the release socket");
+                        // The hello that tells this connection from a stray.
+                        go.write_all(b"c").await.expect("say hello to the broker");
+                        let mut b = [0u8; 1];
+                        go.read_exact(&mut b)
+                            .await
+                            .expect("wait for the broker's release byte");
+                    })
                     .await
-                    .expect("connect to the release socket");
-                let mut b = [0u8; 1];
-                go.read_exact(&mut b)
-                    .await
-                    .expect("wait for the broker's release byte");
+                    .expect("the release wait ran to completion");
                 Ok(())
             })
             .await

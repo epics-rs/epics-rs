@@ -61,6 +61,14 @@
 //! Citations into non-EPICS sources (libc, RTEMS, `rtems-libbsd`, VxWorks,
 //! vendored third-party) are outside this table and carry no pin.
 
+#![cfg_attr(
+    test,
+    allow(
+        clippy::disallowed_macros,
+        clippy::disallowed_methods,
+        reason = "tests may keep eprintln! and stderr()"
+    )
+)]
 #![allow(
     clippy::approx_constant,
     clippy::collapsible_match,
@@ -109,7 +117,7 @@ pub mod calc;
 pub mod error;
 pub mod json5;
 pub mod reference;
-// The async UDP net stack (`tokio::net` + `socket2` + `if-addrs`) is host-only:
+// The async UDP net stack (`tokio::net` + `socket2`) is host-only:
 // its deps do not build for RTEMS, and the RTEMS CA server uses the separate
 // S1 raw-libc socket driver, not those modules. The gate now sits on the
 // socket-bearing submodules rather than on `net` itself, so the wire constants
@@ -123,8 +131,9 @@ pub mod reference;
 // are the paths every downstream crate and every module below already spells,
 // and the re-export keeps `crate::net::…` / `crate::runtime::…` valid inside
 // this crate too, so the split cost zero call-site edits.
-pub use epics_libcom_rs::{net, runtime};
+pub use epics_libcom_rs::{epics_print, epics_println, net, runtime, stderr_print, stderr_println};
 pub mod server;
+pub mod sync;
 pub mod types;
 
 // The `exec_backend` / `tokio_backend` cfg is derived twice — once by

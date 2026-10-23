@@ -44,6 +44,8 @@ async fn subscribe_a(db: &PvDatabase, rec: &str) -> EventReader {
 
 /// swait: CALC="A", input A driven from SRC (=7) through INAN, so VAL := A.
 async fn swait_db(mdel: f64, adel: f64) -> PvDatabase {
+    // C `callbackInit`: INAN's link events are applied on a callback band.
+    epics_base_rs::runtime::task::background_init();
     let db = PvDatabase::new();
     db.add_record("SRC", Box::new(AiRecord::new(7.0)))
         .await
@@ -65,16 +67,33 @@ async fn process(db: &PvDatabase, rec: &str) {
         .unwrap();
 }
 
-/// One priming cycle, then move SRC by `delta`. The first cycle of a fresh
-/// record has no MLST/ALST history, so both deadbands trigger unconditionally
-/// (C seeds them in `init_record`); the deadbands only decide anything from the
-/// second cycle on. Drains the priming posts so the caller reads the post it
-/// is actually testing.
+/// Process `rec` until its A reads `want`. SRC's value reaches the INAN link
+/// on its monitor, which nothing on the record shows until a cycle fetches
+/// it; a cycle that leaves A alone posts nothing on A.
+async fn process_until_a(db: &PvDatabase, rec: &str, want: f64) {
+    for _ in 0..400 {
+        process(db, rec).await;
+        let a = db.get_record(rec).unwrap().read().record.get_field("A");
+        if a == Some(EpicsValue::Double(want)) {
+            return;
+        }
+        epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    panic!("{rec}.A never read {want}");
+}
+
+/// Priming cycles until A holds SRC's 7, then move SRC to `to`. The first
+/// cycle of a fresh record has no MLST/ALST history, so both deadbands trigger
+/// unconditionally (C seeds them in `init_record`); the deadbands only decide
+/// anything from the second cycle on. Drains the priming posts so the caller
+/// reads the post it is actually testing.
 async fn prime_then_move(db: &PvDatabase, rec: &str, rx: &mut EventReader, to: f64) {
-    process(db, rec).await;
+    process_until_a(db, rec, 7.0).await;
     while rx.try_recv().is_ok() {}
-    db.put_pv("SRC", EpicsValue::Double(to)).await.unwrap();
-    process(db, rec).await;
+    db.put_pv_and_post("SRC", EpicsValue::Double(to))
+        .await
+        .unwrap();
+    process_until_a(db, rec, to).await;
 }
 
 /// VAL's ADEL is wide enough that the archive deadband does not cross, so
@@ -90,12 +109,12 @@ async fn r9_72_changed_input_posts_dbe_value_without_dbe_log() {
 
     let event = rx.try_recv().expect("a changed input A must post");
     assert_eq!(
-        event.mask,
+        event.mask(),
         EventMask::VALUE,
         "C posts a changed swait input with `monitor_mask | DBE_VALUE`; VAL \
          moved 7 -> 8 with ADEL=1000, so monitor_mask holds DBE_VALUE (MDEL \
          crossed) and no DBE_LOG — got {:?}",
-        event.mask
+        event.mask()
     );
 }
 
@@ -112,11 +131,11 @@ async fn r9_72_input_post_carries_log_when_vals_adel_crossed() {
 
     let event = rx.try_recv().expect("a changed input A must post");
     assert_eq!(
-        event.mask,
+        event.mask(),
         EventMask::VALUE | EventMask::LOG,
         "ADEL=0 puts DBE_LOG into VAL's monitor_mask on any change; the input \
          post inherits it — got {:?}",
-        event.mask
+        event.mask()
     );
 }
 
@@ -144,11 +163,11 @@ async fn r9_72_calc_input_post_still_forces_dbe_log() {
 
     let event = rx.try_recv().expect("a changed input A must post");
     assert_eq!(
-        event.mask,
+        event.mask(),
         EventMask::VALUE | EventMask::LOG,
         "calcRecord.c:420 posts a changed input with `monitor_mask | \
          DBE_VALUE | DBE_LOG` — the forced LOG stays, ADEL crossing or not — \
          got {:?}",
-        event.mask
+        event.mask()
     );
 }

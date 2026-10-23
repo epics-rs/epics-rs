@@ -4,8 +4,10 @@ use std::sync::{Arc, Weak};
 use parking_lot::Mutex;
 
 use crate::attributes::NDAttributeList;
+use crate::codec::Codec;
+use crate::driver::ndarray_driver::ArrayOwner;
 use crate::error::{ADError, ADResult};
-use crate::ndarray::{NDArray, NDDataBuffer, NDDataType, NDDimension};
+use crate::ndarray::{NDArray, NDDataBuffer, NDDataType, NDDimension, PoolTie};
 use crate::timestamp::EpicsTimestamp;
 
 /// If a free-list buffer is more than this ratio larger than needed, discard
@@ -39,6 +41,10 @@ pub struct NDArrayPool {
     this: Weak<Self>,
     /// Unique identity of this pool, stamped onto every array it allocates.
     id: u64,
+    /// The driver that built the pool (C++ `pDriver_`), whose queued count
+    /// every array from it is counted on wherever it is queued
+    /// (NDPluginDriver.cpp:462, :538).
+    owner: Weak<ArrayOwner>,
     max_memory: usize,
     allocated_bytes: AtomicU64,
     next_unique_id: AtomicI32,
@@ -50,10 +56,23 @@ pub struct NDArrayPool {
 impl NDArrayPool {
     /// A pool is always shared: its arrays refer back to it from wherever
     /// they end up, so it lives behind an `Arc` from the start.
+    ///
+    /// No driver owns it, so its arrays are queued uncounted.
     pub fn new(max_memory: usize) -> Arc<Self> {
+        Self::with_owner(max_memory, Weak::new())
+    }
+
+    /// C++ `NDArrayPool(pDriver, maxMemory)`: the pool of the driver `owner`.
+    /// Reached from outside as [`DriverPool::for_driver`].
+    pub(crate) fn for_driver(max_memory: usize, owner: &Arc<ArrayOwner>) -> Arc<Self> {
+        Self::with_owner(max_memory, Arc::downgrade(owner))
+    }
+
+    fn with_owner(max_memory: usize, owner: Weak<ArrayOwner>) -> Arc<Self> {
         Arc::new_cyclic(|this| Self {
             this: this.clone(),
             id: NEXT_POOL_ID.fetch_add(1, Ordering::Relaxed),
+            owner,
             max_memory,
             allocated_bytes: AtomicU64::new(0),
             next_unique_id: AtomicI32::new(1),
@@ -80,9 +99,15 @@ impl NDArrayPool {
             data,
             attributes: NDAttributeList::new(),
             codec: None,
-            pool: Some(self.this.clone()),
+            pool: Some(PoolTie::Charged(self.this.clone())),
             data_size,
         }
+    }
+
+    /// The driver that owns the pool, `None` for an unowned pool or a driver
+    /// that is gone.
+    pub fn owner(&self) -> Option<Arc<ArrayOwner>> {
+        self.owner.upgrade()
     }
 
     /// Identity of this pool (what `NDArray::pool_id` reports for its arrays).
@@ -113,6 +138,30 @@ impl NDArrayPool {
         data_type: NDDataType,
         data_size: usize,
     ) -> ADResult<NDArray> {
+        self.alloc_buffer(dims, data_type, data_size, None)
+    }
+
+    /// C++ `NDArrayPool::alloc` with `pData = NULL` followed by the caller's
+    /// copy into `pArray->pData`, which is how every C driver builds a frame:
+    /// the frame is charged and refused under the same `max_memory` rule as
+    /// [`alloc`](Self::alloc), and takes `data` as its buffer. C's unchecked
+    /// caller-supplied `pData` branch has no caller in ADCore or the drivers
+    /// and is not offered.
+    pub fn alloc_with(&self, dims: Vec<NDDimension>, data: NDDataBuffer) -> ADResult<NDArray> {
+        let data_type = data.data_type();
+        let data_size = data.len() * data_type.element_size();
+        self.alloc_buffer(dims, data_type, data_size, Some(data))
+    }
+
+    /// The allocation of [`alloc_sized`](Self::alloc_sized); `data`, when
+    /// given, is the buffer the slot is filled with instead of its own.
+    fn alloc_buffer(
+        &self,
+        dims: Vec<NDDimension>,
+        data_type: NDDataType,
+        data_size: usize,
+        data: Option<NDDataBuffer>,
+    ) -> ADResult<NDArray> {
         let element_size = data_type.element_size();
         if data_size % element_size != 0 {
             return Err(ADError::InvalidDimensions(format!(
@@ -122,91 +171,48 @@ impl NDArrayPool {
         let num_elements = data_size / element_size;
         let needed_bytes = data_size;
 
-        // Try to find a reusable buffer in the free list. Selection is by Vec
-        // capacity (a buffer big enough to hold the data without reallocating),
-        // but accounting always uses the exact `data_size`.
+        // C++ NDArrayPool::alloc (NDArrayPool.cpp:161-183): the smallest free
+        // buffer whose tracked `dataSize` holds the request. A buffer over
+        // THRESHOLD_SIZE_RATIO of the request is freed and allocated afresh. A reused buffer keeps its `dataSize`,
+        // which is never below the request, so reuse charges nothing.
         let reused = {
             let mut free = self.free_list.lock();
-            let mut best_idx = None;
-            let mut best_cap = usize::MAX;
-            for (i, buf) in free.iter().enumerate() {
-                let cap = buf.data.capacity_bytes();
-                if cap >= needed_bytes && cap < best_cap {
-                    best_cap = cap;
-                    best_idx = Some(i);
-                }
-            }
-            if let Some(idx) = best_idx {
-                if best_cap as f64 > needed_bytes as f64 * THRESHOLD_SIZE_RATIO {
-                    // Oversized: discard it, subtract its tracked data_size.
-                    let dropped = free.swap_remove(idx);
+            let found = free
+                .iter()
+                .enumerate()
+                .filter(|(_, b)| b.data_size >= needed_bytes)
+                .min_by_key(|(_, b)| b.data_size)
+                .map(|(i, _)| i);
+            match found {
+                Some(idx)
+                    if free[idx].data_size as f64 > needed_bytes as f64 * THRESHOLD_SIZE_RATIO =>
+                {
+                    // Its buffer is freed; the fresh allocation below
+                    // stands in for the C array object kept.
+                    let dropped = free.remove(idx);
                     self.num_free_buffers.fetch_sub(1, Ordering::Relaxed);
                     self.allocated_bytes
                         .fetch_sub(dropped.data_size as u64, Ordering::Relaxed);
                     self.num_alloc_buffers.fetch_sub(1, Ordering::Relaxed);
                     None
-                } else {
-                    let buf = free.swap_remove(idx);
-                    self.num_free_buffers.fetch_sub(1, Ordering::Relaxed);
-                    Some(buf)
                 }
-            } else {
-                None
+                Some(idx) => {
+                    self.num_free_buffers.fetch_sub(1, Ordering::Relaxed);
+                    Some(free.remove(idx))
+                }
+                None => None,
             }
         };
 
         if let Some(mut reused) = reused {
-            // Reuse: C parity (NDArrayPool.cpp `alloc`) keeps the buffer's
-            // tracked `dataSize` and `memorySize_` unchanged when the existing
-            // buffer is already large enough — only a grow (realloc) adjusts
-            // accounting. Reusing a 1000-byte buffer for an 800-byte request
-            // therefore leaves `allocated_bytes` at 1000.
-            let old_size = reused.data_size;
-            let effective_size = if needed_bytes > old_size {
-                let diff = (needed_bytes - old_size) as u64;
-                // CAS loop: the limit check and the increment must be atomic so
-                // two threads on the reuse-grow path cannot both pass the check
-                // and over-commit past `max_memory`. Mirrors the fresh-allocation
-                // path; C++ `NDArrayPool::alloc` is fully mutex-serialized.
-                if self.max_memory > 0 {
-                    loop {
-                        let current = self.allocated_bytes.load(Ordering::Relaxed);
-                        if current + diff > self.max_memory as u64 {
-                            // Put the buffer back untouched; the reuse path
-                            // does not consume a slot.
-                            let mut free = self.free_list.lock();
-                            free.push(reused);
-                            self.num_free_buffers.fetch_add(1, Ordering::Relaxed);
-                            return Err(ADError::PoolExhausted(needed_bytes, self.max_memory));
-                        }
-                        if self
-                            .allocated_bytes
-                            .compare_exchange_weak(
-                                current,
-                                current + diff,
-                                Ordering::Relaxed,
-                                Ordering::Relaxed,
-                            )
-                            .is_ok()
-                        {
-                            break;
-                        }
-                    }
-                } else {
-                    self.allocated_bytes.fetch_add(diff, Ordering::Relaxed);
-                }
-                needed_bytes
-            } else {
-                // Buffer already big enough: keep the larger tracked size so
-                // accounting matches the byte count added when it was created.
-                old_size
-            };
-            if reused.data.data_type() != data_type {
+            if let Some(data) = data {
+                reused.data = data;
+            } else if reused.data.data_type() != data_type {
                 reused.data = NDDataBuffer::zeros(data_type, num_elements);
             } else {
                 reused.data.resize(num_elements);
             }
-            return Ok(self.adopt(dims, reused.data, effective_size));
+            return Ok(self.adopt(dims, reused.data, reused.data_size));
         }
 
         // Fresh allocation with CAS loop to avoid TOCTOU race. The reserved
@@ -218,12 +224,19 @@ impl NDArrayPool {
                     let mut freed_enough = false;
                     {
                         let mut free = self.free_list.lock();
-                        free.sort_by_key(|e| std::cmp::Reverse(e.data.capacity_bytes()));
                         let mut reclaimed = 0u64;
                         let over =
                             (current + needed_bytes as u64).saturating_sub(self.max_memory as u64);
-                        while !free.is_empty() && reclaimed < over {
-                            let dropped = free.remove(0);
+                        // Largest `dataSize` first, the end of C++'s multiset
+                        // (NDArrayPool.cpp:207-218).
+                        while let Some(idx) = free
+                            .iter()
+                            .enumerate()
+                            .max_by_key(|(_, b)| b.data_size)
+                            .map(|(i, _)| i)
+                            && reclaimed < over
+                        {
+                            let dropped = free.remove(idx);
                             let dropped_size = dropped.data_size as u64;
                             self.allocated_bytes
                                 .fetch_sub(dropped_size, Ordering::Relaxed);
@@ -236,6 +249,8 @@ impl NDArrayPool {
                         }
                     }
                     if !freed_enough {
+                        // C counts the array it was about to fill.
+                        self.report_limit(self.num_alloc_buffers() + 1);
                         return Err(ADError::PoolExhausted(needed_bytes, self.max_memory));
                     }
                     continue;
@@ -258,15 +273,28 @@ impl NDArrayPool {
                 .fetch_add(needed_bytes as u64, Ordering::Relaxed);
         }
         self.num_alloc_buffers.fetch_add(1, Ordering::Relaxed);
-        Ok(self.adopt(
-            dims,
-            NDDataBuffer::zeros(data_type, num_elements),
-            needed_bytes,
-        ))
+        let data = data.unwrap_or_else(|| NDDataBuffer::zeros(data_type, num_elements));
+        Ok(self.adopt(dims, data, needed_bytes))
+    }
+
+    /// The refusal line C prints on the owning driver's `pasynUserSelf`
+    /// (NDArrayPool.cpp:230-232).
+    fn report_limit(&self, buffers: u32) {
+        if let Some(port) = self.owner().and_then(|o| o.port()) {
+            port.trace().output(
+                port.port_name(),
+                asyn_rs::trace::TraceMask::ERROR,
+                &format!(
+                    "NDArrayPool::alloc:: error: reached limit of {} memory ({buffers} buffers)\n",
+                    self.max_memory
+                ),
+            );
+        }
     }
 
     /// Allocate a copy of an existing NDArray: data, both stamps, attributes,
-    /// codec and `unique_id` all carry across (C++ NDArrayPool.cpp:283-302).
+    /// the codec as [`Codec::copied`] and `unique_id` carry across (C++
+    /// NDArrayPool.cpp:283-302).
     /// Tries the free list first (via alloc()), then copies data from source.
     pub fn alloc_copy(&self, source: &NDArray) -> ADResult<NDArray> {
         let dims = source.dims.clone();
@@ -276,7 +304,7 @@ impl NDArrayPool {
         copy.unique_id = source.unique_id;
         copy.copy_time_stamps_from(source);
         copy.attributes = source.attributes.clone();
-        copy.codec = source.codec.clone();
+        copy.codec = source.codec.as_ref().map(Codec::copied);
         Ok(copy)
     }
 
@@ -292,33 +320,11 @@ impl NDArrayPool {
     }
 
     /// The destructor's half of [`release`](Self::release): put a buffer this
-    /// pool charged for back on the free list, then trim the list while the
-    /// pool is over `max_memory`.
+    /// pool charged for back on the free list. C++ release never trims it
+    /// (NDArrayPool.cpp:360-366); only the next alloc evicts.
     pub(crate) fn recycle(&self, data: NDDataBuffer, data_size: usize) {
-        let mut free = self.free_list.lock();
-        free.push(FreeBuffer { data, data_size });
+        self.free_list.lock().push(FreeBuffer { data, data_size });
         self.num_free_buffers.fetch_add(1, Ordering::Relaxed);
-
-        // If total allocated exceeds max_memory, drop largest free entries.
-        // Accounting and the loop counter both use the exact `data_size` so the
-        // `usize` `excess` can never underflow (max_memory == 0 means unlimited).
-        let total = self.allocated_bytes.load(Ordering::Relaxed) as usize;
-        if self.max_memory > 0 && total > self.max_memory && !free.is_empty() {
-            free.sort_by_key(|e| std::cmp::Reverse(e.data_size));
-            let mut excess = total - self.max_memory;
-            while excess > 0 && !free.is_empty() {
-                let dropped = free.remove(0);
-                let dropped_size = dropped.data_size;
-                self.allocated_bytes
-                    .fetch_sub(dropped_size as u64, Ordering::Relaxed);
-                self.num_free_buffers.fetch_sub(1, Ordering::Relaxed);
-                self.num_alloc_buffers.fetch_sub(1, Ordering::Relaxed);
-                if dropped_size >= excess {
-                    break;
-                }
-                excess -= dropped_size;
-            }
-        }
     }
 
     /// Clear all entries from the free list.
@@ -378,7 +384,7 @@ impl NDArrayPool {
         if copy_dimensions {
             out.dims = src.dims.clone();
         }
-        out.codec = src.codec.clone();
+        out.codec = src.codec.as_ref().map(Codec::copied);
 
         if copy_data {
             if copy_data_type || out.data.data_type() == src.data.data_type() {
@@ -396,22 +402,6 @@ impl NDArrayPool {
         out.attributes.clear();
         out.attributes.copy_from(&src.attributes);
         Ok(out)
-    }
-
-    /// Allocate `count` copies of `template_array`, then immediately release
-    /// them back to the free list (C++ `asynNDArrayDriver::preAllocateBuffers`).
-    ///
-    /// The net effect is that the pool's free list is warmed with `count`
-    /// reusable buffers sized for the template array.
-    pub fn pre_allocate_buffers(&self, template_array: &NDArray, count: usize) -> ADResult<()> {
-        let mut buffers = Vec::with_capacity(count);
-        for _ in 0..count {
-            buffers.push(self.copy(template_array, None, true, true, true)?);
-        }
-        for arr in buffers {
-            self.release(arr);
-        }
-        Ok(())
     }
 
     /// Convert data type only (no dimension changes).
@@ -438,7 +428,7 @@ impl NDArrayPool {
 
     /// Full convert with dimension changes: extract sub-region, bin, reverse.
     ///
-    /// The conversion kernel itself lives in [`crate::convert::convert_dims`]
+    /// The conversion kernel itself lives in [`crate::convert::convert_dims_into`]
     /// (the single owner of C++ `NDArrayPool::convert` semantics — binning
     /// accumulates in the TARGET type, casts are C casts). This wrapper adds
     /// what only a pool can: allocating the output THROUGH the pool so it
@@ -501,9 +491,437 @@ const _: fn() = || {
     assert_send_sync::<NDArrayPool>();
 };
 
+/// A pool a driver owns: C's `NDArrayPool` with a `pDriver_`, the only kind
+/// whose arrays C ever hands a plugin.
+///
+/// Its allocations are [`DriverArray`]s, and those are what the publish API
+/// takes, so an array no driver counts as queued cannot reach a plugin. An
+/// [`NDArrayPool`] built with [`NDArrayPool::new`] stays for scratch arrays.
+#[derive(Clone)]
+pub struct DriverPool {
+    pool: Arc<NDArrayPool>,
+    owner: Arc<ArrayOwner>,
+}
+
+impl DriverPool {
+    /// C++ `NDArrayPool(pDriver, maxMemory)`.
+    pub fn for_driver(max_memory: usize, owner: &Arc<ArrayOwner>) -> Self {
+        Self {
+            pool: NDArrayPool::for_driver(max_memory, owner),
+            owner: Arc::clone(owner),
+        }
+    }
+
+    /// A pool with a driver of its own that no port reads, for a tool or a
+    /// test that publishes without a driver behind it.
+    pub fn standalone(max_memory: usize) -> Self {
+        Self::for_driver(max_memory, &ArrayOwner::new())
+    }
+
+    /// The driver behind `pool`, if it has one that is still there.
+    pub(crate) fn of(pool: Arc<NDArrayPool>) -> Option<Self> {
+        let owner = pool.owner()?;
+        Some(Self { pool, owner })
+    }
+
+    pub fn pool(&self) -> &Arc<NDArrayPool> {
+        &self.pool
+    }
+
+    pub fn owner(&self) -> &Arc<ArrayOwner> {
+        &self.owner
+    }
+
+    fn own(&self, array: ADResult<NDArray>) -> ADResult<DriverArray> {
+        Ok(DriverArray {
+            array: array?,
+            pool: self.clone(),
+        })
+    }
+
+    /// [`NDArrayPool::alloc`].
+    pub fn alloc(&self, dims: Vec<NDDimension>, data_type: NDDataType) -> ADResult<DriverArray> {
+        self.own(self.pool.alloc(dims, data_type))
+    }
+
+    /// [`NDArrayPool::alloc_sized`].
+    pub fn alloc_sized(
+        &self,
+        dims: Vec<NDDimension>,
+        data_type: NDDataType,
+        data_size: usize,
+    ) -> ADResult<DriverArray> {
+        self.own(self.pool.alloc_sized(dims, data_type, data_size))
+    }
+
+    /// [`NDArrayPool::alloc_with`].
+    pub fn alloc_with(&self, dims: Vec<NDDimension>, data: NDDataBuffer) -> ADResult<DriverArray> {
+        self.own(self.pool.alloc_with(dims, data))
+    }
+
+    /// [`NDArrayPool::alloc_copy`].
+    pub fn alloc_copy(&self, source: &NDArray) -> ADResult<DriverArray> {
+        self.own(self.pool.alloc_copy(source))
+    }
+
+    /// [`NDArrayPool::convert`].
+    pub fn convert(
+        &self,
+        src: &NDArray,
+        dims_out: &[NDDimension],
+        target_type: NDDataType,
+    ) -> ADResult<DriverArray> {
+        self.own(self.pool.convert(src, dims_out, target_type))
+    }
+
+    /// Take an array this pool allocated through a helper that works on the
+    /// plain [`NDArrayPool`], such as [`crate::roi::crop_roi`]; `None` for
+    /// any other array.
+    pub fn adopt(&self, array: NDArray) -> Option<DriverArray> {
+        let charged = matches!(&array.pool, Some(PoolTie::Charged(_)));
+        (charged && array.pool_id() == self.pool.id()).then(|| DriverArray {
+            array,
+            pool: self.clone(),
+        })
+    }
+
+    /// [`NDArrayPool::release`].
+    pub fn release(&self, array: DriverArray) {
+        drop(array);
+    }
+
+    /// [`NDArrayPool::convert_type`].
+    pub fn convert_type(&self, src: &NDArray, target_type: NDDataType) -> ADResult<DriverArray> {
+        self.own(self.pool.convert_type(src, target_type))
+    }
+
+    /// What C's `endProcessCallbacks` makes of a plugin's output
+    /// (NDPluginDriver.cpp:285-291). `copied` is C's `copyArray`: the output
+    /// is copied into this pool and counted on this pool's driver, and the
+    /// copy keeps only the codec's name (NDArrayPool.cpp:293). Otherwise an
+    /// array from a driver's pool goes out as it is, counted on that driver,
+    /// and any other is copied into this pool first. `attributes` are what
+    /// `getAttributes` merges onto it; an output someone else still holds is
+    /// copied before they are set on it.
+    pub(crate) fn publishable(
+        &self,
+        mut array: Arc<NDArray>,
+        attributes: Option<&NDAttributeList>,
+        copied: bool,
+    ) -> ADResult<PublishedArray> {
+        if !copied && let Some(pool) = array.pool().and_then(Self::of) {
+            let Some(attributes) = attributes else {
+                return Ok(PublishedArray { array, pool });
+            };
+            if let Some(own) = Arc::get_mut(&mut array) {
+                own.attributes.copy_from(attributes);
+                return Ok(PublishedArray { array, pool });
+            }
+        }
+        let mut copy = self.alloc_copy(&array)?;
+        if let Some(attributes) = attributes {
+            copy.attributes.copy_from(attributes);
+        }
+        Ok(copy.into())
+    }
+}
+
+impl std::ops::Deref for DriverPool {
+    type Target = NDArrayPool;
+
+    fn deref(&self) -> &NDArrayPool {
+        &self.pool
+    }
+}
+
+/// An array from a [`DriverPool`], still the driver's to fill in.
+pub struct DriverArray {
+    array: NDArray,
+    pool: DriverPool,
+}
+
+impl DriverArray {
+    /// Hand the array over for publishing; nothing mutates it after this.
+    pub fn share(self) -> PublishedArray {
+        PublishedArray {
+            array: Arc::new(self.array),
+            pool: self.pool,
+        }
+    }
+}
+
+impl std::ops::Deref for DriverArray {
+    type Target = NDArray;
+
+    fn deref(&self) -> &NDArray {
+        &self.array
+    }
+}
+
+impl std::ops::DerefMut for DriverArray {
+    fn deref_mut(&mut self) -> &mut NDArray {
+        &mut self.array
+    }
+}
+
+/// What a plugin receives: a shared array with the driver pool it is counted
+/// on, C's `pArray` with its `pNDArrayPool` and `pDriver`.
+///
+/// Only a [`DriverPool`] makes one, so every array a plugin queues is
+/// counted on a driver's `NDNumQueuedArrays` (NDPluginDriver.cpp:462, :538).
+///
+/// ```compile_fail
+/// use ad_core_rs::ndarray::{NDArray, NDDataType};
+/// use ad_core_rs::plugin::channel::NDArraySender;
+///
+/// async fn uncounted(sender: &NDArraySender) {
+///     let array = NDArray::new(vec![], NDDataType::UInt8);
+///     sender.publish(std::sync::Arc::new(array)).await;
+/// }
+/// ```
+#[derive(Clone)]
+pub struct PublishedArray {
+    array: Arc<NDArray>,
+    pool: DriverPool,
+}
+
+impl PublishedArray {
+    pub fn array(&self) -> &Arc<NDArray> {
+        &self.array
+    }
+
+    /// The pool it is counted on.
+    pub fn pool(&self) -> &DriverPool {
+        &self.pool
+    }
+
+    /// Back to the driver to change, when this is the array's last holder.
+    pub fn try_into_driver(self) -> Result<DriverArray, PublishedArray> {
+        match Arc::try_unwrap(self.array) {
+            Ok(array) => Ok(DriverArray {
+                array,
+                pool: self.pool,
+            }),
+            Err(array) => Err(PublishedArray {
+                array,
+                pool: self.pool,
+            }),
+        }
+    }
+}
+
+impl From<DriverArray> for PublishedArray {
+    fn from(array: DriverArray) -> Self {
+        array.share()
+    }
+}
+
+impl std::ops::Deref for PublishedArray {
+    type Target = NDArray;
+
+    fn deref(&self) -> &NDArray {
+        &self.array
+    }
+}
+
+/// The pool's one charge for a [`PersistentArray`]'s buffer, held by the
+/// array and by every publish of it: C's one `NDArray` and its reference
+/// count. The buffer goes back to the pool when the last holder goes.
+#[derive(Debug)]
+pub(crate) struct SharedCharge {
+    pool: Weak<NDArrayPool>,
+    data_size: usize,
+    /// The persistent array's buffer, parked here when it is dropped first.
+    parked: Mutex<NDDataBuffer>,
+}
+
+impl SharedCharge {
+    pub(crate) fn pool(&self) -> &Weak<NDArrayPool> {
+        &self.pool
+    }
+}
+
+impl Drop for SharedCharge {
+    fn drop(&mut self) {
+        if let Some(pool) = self.pool.upgrade() {
+            pool.recycle(std::mem::take(self.parked.get_mut()), self.data_size);
+        }
+    }
+}
+
+/// An array a driver allocates once and refills, C's persistent `NDArray *`
+/// such as pilatus `pFlatField` or NDDriverStdArrays `pArrays[0]`: refilled
+/// in place whoever holds its last publish.
+///
+/// A publish is a copy, so a refill never races a plugin, but it is not a
+/// second charge: the array and its publishes hold one charge, so
+/// the pool counts one buffer until the driver and every plugin have let go,
+/// as C's reserve/release of the one array (pilatusDetector.cpp:1728, :290;
+/// NDDriverStdArrays.cpp:153-158, :328).
+pub struct PersistentArray {
+    array: DriverArray,
+    shown: Option<PublishedArray>,
+}
+
+impl PersistentArray {
+    pub fn new(mut array: DriverArray) -> Self {
+        if let Some(PoolTie::Charged(pool)) = array.array.pool.take() {
+            array.array.pool = Some(PoolTie::Shared(Arc::new(SharedCharge {
+                pool,
+                data_size: array.array.data_size,
+                parked: Mutex::default(),
+            })));
+        }
+        Self { array, shown: None }
+    }
+
+    /// The buffer to refill.
+    pub fn refill(&mut self) -> &mut NDArray {
+        self.shown = None;
+        &mut self.array
+    }
+
+    /// The array to publish: the same one until the next refill.
+    pub fn published(&mut self) -> PublishedArray {
+        self.shown
+            .get_or_insert_with(|| {
+                let mut copy = NDArray::clone(&self.array);
+                copy.pool = match &self.array.array.pool {
+                    Some(PoolTie::Shared(charge)) => Some(PoolTie::Shared(charge.clone())),
+                    _ => None,
+                };
+                PublishedArray {
+                    array: Arc::new(copy),
+                    pool: self.array.pool.clone(),
+                }
+            })
+            .clone()
+    }
+}
+
+impl Drop for PersistentArray {
+    fn drop(&mut self) {
+        if let Some(PoolTie::Shared(charge)) = &self.array.array.pool {
+            *charge.parked.lock() = std::mem::take(&mut self.array.array.data);
+        }
+    }
+}
+
+impl std::ops::Deref for PersistentArray {
+    type Target = NDArray;
+
+    fn deref(&self) -> &NDArray {
+        &self.array
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A refill is never refused, held publish or not, and the pool counts
+    /// the persistent array's one buffer throughout, as C's `pFlatField`.
+    #[test]
+    fn a_persistent_array_is_refilled_whoever_holds_its_publish() {
+        let pool = DriverPool::standalone(8);
+        let mut flat = PersistentArray::new(
+            pool.alloc(vec![NDDimension::new(2)], NDDataType::Int32)
+                .unwrap(),
+        );
+        let counts = |pool: &DriverPool| {
+            (
+                pool.num_alloc_buffers(),
+                pool.num_free_buffers(),
+                pool.allocated_bytes(),
+            )
+        };
+        flat.refill().unique_id = 1;
+        let first = flat.published();
+        assert!(Arc::ptr_eq(first.array(), flat.published().array()));
+        assert_eq!(first.pool_id(), pool.id());
+
+        flat.refill().unique_id = 2;
+        assert_eq!(first.unique_id, 1);
+        assert_eq!(flat.published().unique_id, 2);
+        assert_eq!(counts(&pool), (1, 0, 8));
+
+        drop(first);
+        assert_eq!(counts(&pool), (1, 0, 8));
+        assert!(
+            pool.adopt(Arc::unwrap_or_clone(flat.published().array().clone()))
+                .is_none()
+        );
+        drop(flat);
+        assert_eq!(counts(&pool), (1, 1, 8));
+    }
+
+    /// The persistent array and every publish of it hold one charge, as C's
+    /// one `NDArray` and its reserves: with the pool exactly full, a publish
+    /// still goes out, and a held publish keeps the buffer charged past the
+    /// persistent array, so the next alloc is refused until it is let go.
+    #[test]
+    fn a_held_publish_keeps_the_persistent_array_charged() {
+        let pool = DriverPool::standalone(8);
+        let alloc = || pool.alloc(vec![NDDimension::new(2)], NDDataType::Int32);
+        let mut current = PersistentArray::new(alloc().unwrap());
+        current.refill().unique_id = 1;
+        let held = current.published();
+        assert_eq!(held.unique_id, 1);
+        assert_eq!((pool.num_alloc_buffers(), pool.allocated_bytes()), (1, 8));
+
+        drop(current);
+        assert_eq!((pool.num_alloc_buffers(), pool.num_free_buffers()), (1, 0));
+        assert!(alloc().is_err(), "the held publish still holds the pool");
+
+        drop(held);
+        assert_eq!((pool.num_alloc_buffers(), pool.num_free_buffers()), (1, 1));
+        assert!(alloc().is_ok());
+    }
+
+    /// A frame takes a free buffer that holds it, as an alloc does, and is
+    /// filled with the caller's data.
+    #[test]
+    fn a_frame_with_data_reuses_a_free_buffer_like_an_alloc() {
+        let owner = ArrayOwner::new();
+        let pool = NDArrayPool::for_driver(64, &owner);
+        drop(
+            pool.alloc(vec![NDDimension::new(8)], NDDataType::UInt8)
+                .unwrap(),
+        );
+        assert_eq!((pool.num_alloc_buffers(), pool.num_free_buffers()), (1, 1));
+
+        let frame = pool
+            .alloc_with(vec![NDDimension::new(8)], NDDataBuffer::U8(vec![7; 8]))
+            .unwrap();
+        assert_eq!((pool.num_alloc_buffers(), pool.num_free_buffers()), (1, 0));
+        assert_eq!(pool.allocated_bytes(), 8);
+        assert!(matches!(&frame.data, NDDataBuffer::U8(v) if v == &vec![7; 8]));
+        assert_eq!(frame.pool_id(), pool.id());
+        assert!(Arc::ptr_eq(&frame.owner().unwrap(), &owner));
+        drop(frame);
+    }
+
+    /// A frame over `max_memory` is refused as C's `alloc(..., NULL)` is
+    /// before the driver's copy (NDArrayPool.cpp:207-233), after evicting the
+    /// free buffers.
+    #[test]
+    fn a_frame_with_data_over_max_memory_is_refused() {
+        let pool = NDArrayPool::new(64);
+        drop(
+            pool.alloc(vec![NDDimension::new(50)], NDDataType::UInt8)
+                .unwrap(),
+        );
+        let refused = pool.alloc_with(vec![NDDimension::new(100)], NDDataBuffer::U8(vec![0; 100]));
+        assert!(matches!(refused, Err(ADError::PoolExhausted(100, 64))));
+        assert_eq!(pool.allocated_bytes(), 0);
+        assert_eq!((pool.num_alloc_buffers(), pool.num_free_buffers()), (0, 0));
+
+        let frame = pool
+            .alloc_with(vec![NDDimension::new(60)], NDDataBuffer::U8(vec![0; 60]))
+            .unwrap();
+        assert_eq!(frame.data_size, 60);
+        assert_eq!(pool.allocated_bytes(), 60);
+    }
 
     #[test]
     fn test_alloc_auto_id() {
@@ -687,6 +1105,71 @@ mod tests {
             .alloc(vec![NDDimension::new(900)], NDDataType::UInt8)
             .unwrap();
         assert!(reused.data.capacity_bytes() >= 900);
+    }
+
+    /// C++ finds a free buffer by its tracked `dataSize` (NDArrayPool.cpp:161-165),
+    /// which a reuse under another data type keeps.
+    #[test]
+    fn a_reused_buffer_is_found_by_its_data_size() {
+        let pool = NDArrayPool::new(1_000_000);
+        let a = pool
+            .alloc(vec![NDDimension::new(1000)], NDDataType::UInt8)
+            .unwrap();
+        pool.release(a);
+        let b = pool
+            .alloc(vec![NDDimension::new(400)], NDDataType::UInt16)
+            .unwrap();
+        assert_eq!(b.data_size, 1000);
+        pool.release(b);
+        let c = pool
+            .alloc(vec![NDDimension::new(900)], NDDataType::UInt8)
+            .unwrap();
+        assert_eq!(c.data_size, 1000);
+        assert_eq!(pool.num_alloc_buffers(), 1);
+        assert_eq!(pool.allocated_bytes(), 1000);
+    }
+
+    /// A buffer is not stretched past its `dataSize` whatever its capacity:
+    /// C++ has no reuse that grows (NDArrayPool.cpp:161-183).
+    #[test]
+    fn a_free_buffer_smaller_than_the_request_is_not_reused() {
+        let pool = NDArrayPool::new(1_000_000);
+        let mut a = pool
+            .alloc(vec![NDDimension::new(100)], NDDataType::UInt8)
+            .unwrap();
+        if let NDDataBuffer::U8(ref mut v) = a.data {
+            v.reserve_exact(200);
+        }
+        pool.release(a);
+        let b = pool
+            .alloc(vec![NDDimension::new(150)], NDDataType::UInt8)
+            .unwrap();
+        assert_eq!(b.data_size, 150);
+        assert_eq!(pool.num_alloc_buffers(), 2);
+        assert_eq!(pool.allocated_bytes(), 250);
+    }
+
+    /// A frame takes the smallest free buffer that holds it and keeps that
+    /// buffer's `dataSize` (NDArrayPool.cpp:166-183).
+    #[test]
+    fn a_frame_with_data_takes_the_smallest_free_buffer_that_holds_it() {
+        let pool = NDArrayPool::new(1_000_000);
+        let big = pool
+            .alloc(vec![NDDimension::new(4000)], NDDataType::UInt8)
+            .unwrap();
+        let small = pool
+            .alloc(vec![NDDimension::new(1000)], NDDataType::UInt8)
+            .unwrap();
+        pool.release(big);
+        pool.release(small);
+        let w = pool
+            .alloc_with(vec![NDDimension::new(800)], NDDataBuffer::U8(vec![0; 800]))
+            .unwrap();
+        assert_eq!(w.data_size, 1000);
+        assert_eq!(w.data.len(), 800);
+        assert_eq!(pool.num_alloc_buffers(), 2);
+        assert_eq!(pool.num_free_buffers(), 1);
+        assert_eq!(pool.allocated_bytes(), 5000);
     }
 
     #[test]
@@ -1495,6 +1978,44 @@ mod tests {
         assert_eq!(pool.allocated_bytes(), 16);
     }
 
+    /// C `NDArrayPool::copy` assigns only `codec.name` (NDArrayPool.cpp:293),
+    /// so a blosc frame's level, shuffle and compressor read back -1 on the
+    /// copy, through `alloc_copy` and `copy` alike.
+    #[test]
+    fn a_copy_keeps_only_the_codec_name() {
+        let pool = NDArrayPool::new(1_000_000);
+        let mut src = make_4x4_u8();
+        src.codec = Some(Codec {
+            name: crate::codec::CodecName::Blosc,
+            compressed_size: 4,
+            level: 5,
+            shuffle: 1,
+            compressor: 2,
+            original_data_type: NDDataType::UInt16,
+        });
+        let fields = |a: NDArray| {
+            let c = a.codec.clone().unwrap();
+            let kept = (c.name, c.compressed_size, c.original_data_type);
+            (kept, c.level, c.shuffle, c.compressor)
+        };
+        let unset = Codec::UNSET;
+        let want = (
+            (crate::codec::CodecName::Blosc, 4, NDDataType::UInt16),
+            unset,
+            unset,
+            unset,
+        );
+        assert_eq!(fields(pool.alloc_copy(&src).unwrap()), want);
+        assert_eq!(
+            fields(pool.copy(&src, None, true, true, true).unwrap()),
+            want
+        );
+        assert_eq!(
+            fields(pool.copy(&src, None, false, true, true).unwrap()),
+            want
+        );
+    }
+
     /// B8: `convert` / `convert_type` reject compressed input.
     #[test]
     fn test_convert_rejects_compressed_input() {
@@ -1572,29 +2093,11 @@ mod tests {
         }
     }
 
-    /// G2: `pre_allocate_buffers` warms the free list with reusable buffers.
+    /// Concurrent allocations that have to evict free buffers never push
+    /// `allocated_bytes` past `max_memory`: the limit check and the charge
+    /// are one CAS.
     #[test]
-    fn test_pre_allocate_buffers_warms_free_list() {
-        let pool = NDArrayPool::new(10_000_000);
-        let template = pool
-            .alloc(vec![NDDimension::new(256)], NDDataType::UInt16)
-            .unwrap();
-        pool.pre_allocate_buffers(&template, 3).unwrap();
-        assert_eq!(pool.num_free_buffers(), 3);
-    }
-
-    /// BUG 1 regression: concurrent reuse-grow must not overshoot
-    /// `max_memory`.
-    ///
-    /// Many threads each take a small free-list buffer and grow it (a
-    /// reuse-grow). The non-atomic load+fetch_add this test guards against
-    /// let two threads both pass the limit check on the same `current`
-    /// reading and both increment, pushing `allocated_bytes` past
-    /// `max_memory`. With the CAS loop, the invariant
-    /// `allocated_bytes <= max_memory` must hold after every successful
-    /// alloc.
-    #[test]
-    fn test_concurrent_reuse_grow_does_not_overshoot_max_memory() {
+    fn test_concurrent_evicting_allocs_do_not_overshoot_max_memory() {
         use std::sync::Arc;
         use std::sync::atomic::AtomicBool;
         use std::thread;
@@ -1602,36 +2105,16 @@ mod tests {
         const N: usize = 16;
         // Repeat to exercise the race window.
         for _ in 0..50 {
-            // N free buffers, each tracked at data_size = 100 bytes:
-            // allocated_bytes = 1600. max_memory = 2000 leaves only 400 bytes
-            // of headroom. Each reuse-grow from 100 -> 200 bytes adds 100, so
-            // at most 4 of the N grows may succeed; the rest must be rejected.
-            // With a non-atomic load+fetch_add, more than 4 succeed and
-            // allocated_bytes overshoots 2000.
+            // N free 100-byte buffers hold 1600 of the 2000 bytes; none holds
+            // a 200-byte request, so every alloc is fresh and the later ones
+            // must evict.
             let pool = NDArrayPool::new(2000);
-            // Build N genuine reuse-grow candidates: each buffer is allocated
-            // and tracked at 100 bytes (data_size = 100) but its backing Vec is
-            // reserved to >= 200 bytes of capacity. A later 200-byte request
-            // then selects it (capacity 200 >= 200, within the 1.5x threshold)
-            // and takes the reuse-GROW branch (200 > old data_size 100). This
-            // makes the reuse-grow path deterministic regardless of allocator
-            // slack.
-            let mut warm = Vec::with_capacity(N);
-            for _ in 0..N {
-                let mut a = pool
-                    .alloc(vec![NDDimension::new(100)], NDDataType::UInt8)
-                    .unwrap();
-                // data_size stays 100 (pool accounting); only the Vec capacity
-                // grows. swap the buffer for one with len 100 but capacity 200.
-                if let NDDataBuffer::U8(ref mut v) = a.data {
-                    let mut big = Vec::with_capacity(200);
-                    big.resize(100, 0u8);
-                    *v = big;
-                }
-                assert_eq!(a.data_size, 100);
-                assert!(a.data.capacity_bytes() >= 200);
-                warm.push(a);
-            }
+            let warm: Vec<_> = (0..N)
+                .map(|_| {
+                    pool.alloc(vec![NDDimension::new(100)], NDDataType::UInt8)
+                        .unwrap()
+                })
+                .collect();
             for a in warm {
                 pool.release(a);
             }
@@ -1644,7 +2127,6 @@ mod tests {
                 let pool = pool.clone();
                 let overshoot = overshoot.clone();
                 handles.push(thread::spawn(move || {
-                    // Reuse a 100-byte free buffer, grow it to 200 bytes.
                     let res = pool.alloc(vec![NDDimension::new(200)], NDDataType::UInt8);
                     if res.is_ok() && pool.allocated_bytes() > pool.max_memory() as u64 {
                         overshoot.store(true, Ordering::Relaxed);
@@ -1657,7 +2139,7 @@ mod tests {
 
             assert!(
                 !overshoot.load(Ordering::Relaxed),
-                "allocated_bytes overshot max_memory during concurrent reuse-grow"
+                "allocated_bytes overshot max_memory during concurrent allocs"
             );
             assert!(
                 pool.allocated_bytes() <= pool.max_memory() as u64,

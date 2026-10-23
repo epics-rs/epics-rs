@@ -17,7 +17,7 @@
 //! traffic for the life of the process, silently. This module is the missing C
 //! function, and the only place the port builds one of these lists.
 
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, ToSocketAddrs};
+use std::net::SocketAddr;
 
 /// One entry as `addAddrToChannelAccessAddressList` produced it: the resolved
 /// address, plus the DNS name it came from when it was not an IP literal.
@@ -72,40 +72,17 @@ pub(crate) fn add_addr_to_channel_access_address_list(
 /// (`<TAB>` is a literal U+0009 in C's format string and in the output; it is
 /// spelled out here only because a tab in a doc comment is a clippy error.)
 fn bad_address(env_name: &str, token: &str) {
-    eprintln!("../iocinf.cpp: Parsing '{env_name}'");
-    eprintln!("\tBad internet address or host name: '{token}'");
+    epics_libcom_rs::stderr_println!("../iocinf.cpp: Parsing '{env_name}'");
+    epics_libcom_rs::stderr_println!("\tBad internet address or host name: '{token}'");
 }
 
-/// libcom `aToIPAddr` (`aToIPAddr.c:75-194`): `<host>` or `<host>:<port>`, where
-/// `<host>` is a dotted IPv4 literal or a name the resolver knows. Anything else
-/// — an unresolvable name, a non-numeric or out-of-range port, an empty host —
-/// is a failure, and C's caller reports it.
-///
-/// CA is IPv4-only (`sin_family = AF_INET`), so an IPv6-only name is a failure
-/// here as it is in C.
+/// libcom `aToIPAddr`; an entry that came through the resolver keeps its name.
 fn a_to_ip_addr(token: &str, default_port: u16) -> Option<AddrToken> {
-    let (host, port) = match token.rsplit_once(':') {
-        Some((host, port)) => (host, port.parse::<u16>().ok()?),
-        None => (token, default_port),
-    };
-    if host.is_empty() {
-        return None;
-    }
-    if let Ok(ip) = host.parse::<Ipv4Addr>() {
-        return Some(AddrToken {
-            sock: SocketAddr::V4(SocketAddrV4::new(ip, port)),
-            hostname: None,
-            port,
-        });
-    }
-    let sock = format!("{host}:{port}")
-        .to_socket_addrs()
-        .ok()?
-        .find(SocketAddr::is_ipv4)?;
+    let (sock, name) = epics_libcom_rs::runtime::socket::a_to_ip_addr(token, default_port)?;
     Some(AddrToken {
-        sock,
-        hostname: Some(host.to_string()),
-        port,
+        sock: SocketAddr::V4(sock),
+        hostname: name.map(str::to_string),
+        port: sock.port(),
     })
 }
 
@@ -140,7 +117,9 @@ pub(crate) fn remove_duplicate_addresses<T>(
         let addr = addr_of(&entry);
         if kept.iter().any(|k| addr_of(k) == addr) {
             // `iocinf.cpp:123-126`, byte for byte.
-            eprintln!("Warning: Duplicate EPICS CA Address list entry \"{addr}\" discarded");
+            epics_libcom_rs::stderr_println!(
+                "Warning: Duplicate EPICS CA Address list entry \"{addr}\" discarded"
+            );
             continue;
         }
         kept.push(entry);
@@ -184,5 +163,20 @@ mod tests {
     fn a_different_port_is_not_a_duplicate() {
         let got = remove_duplicate_addresses(addrs(&["127.0.0.1:5064", "127.0.0.1:5065"]), |a| *a);
         assert_eq!(got.len(), 2);
+    }
+
+    /// Tokens as libCom's `aToIPAddr` reads them: `%u` is decimal, a bare
+    /// number is a raw address, and a port wraps through `(unsigned)`.
+    #[test]
+    fn a_token_is_read_as_c_a_to_ip_addr() {
+        let sock = |t: &str| a_to_ip_addr(t, 5064).map(|t| t.sock.to_string());
+        assert_eq!(sock("010.0.0.1").as_deref(), Some("10.0.0.1:5064"));
+        assert_eq!(sock("16909060:5065").as_deref(), Some("1.2.3.4:5065"));
+        assert_eq!(sock("1.2.3.4:+5").as_deref(), Some("1.2.3.4:5"));
+        assert_eq!(sock("1.2.3.4:65536"), None);
+        assert_eq!(a_to_ip_addr("010.0.0.1", 5064).unwrap().hostname, None);
+        if std::ffi::c_ulong::BITS == 64 {
+            assert_eq!(sock("1.2.3.4:4294972360").as_deref(), Some("1.2.3.4:5064"));
+        }
     }
 }

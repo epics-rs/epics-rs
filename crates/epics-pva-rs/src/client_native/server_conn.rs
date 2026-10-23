@@ -38,12 +38,13 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 // without that zero meaning anything. Both remaining uses sit inside `cfg`
 // blocks that the target does not compile, so they name the type by full path
 // and the module resolves cleanly.
-use epics_base_rs::runtime::task::{interval, timeout};
+use epics_base_rs::runtime::task::timeout;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use crate::error::{PvaError, PvaResult};
+use crate::liveness_clock::LivenessClock;
 use crate::proto::{
     ByteOrder, Command, ControlCommand, HeaderFlags, MessageType, PvaHeader, ReadExt, Status,
     WriteExt, decode_string, encode_string_into,
@@ -124,7 +125,7 @@ pub(crate) enum IoidSlot {
     /// delete the `Reusable` slot the next GET reply is routed to.
     TwoShot(VecDeque<oneshot::Sender<Frame>>),
     /// Multi-frame ops whose frame count the op itself bounds (GetField,
-    /// PUT sequences, RPC, PUT_GET, ARRAY, PROCESS): unbounded channel.
+    /// PUT sequences, RPC): unbounded channel.
     Stream(mpsc::UnboundedSender<Frame>),
     /// MONITOR: the server-driven stream, bounded at the subscription's
     /// `queueSize` with pvxs's tail squash
@@ -160,6 +161,8 @@ pub struct ServerConn {
     cancel: CancellationToken,
     alive: Arc<AtomicBool>,
     last_rx_nanos: Arc<AtomicU64>,
+    /// What `last_rx_nanos` and the heartbeat read time from.
+    liveness_clock: LivenessClock,
     /// total bytes read off / written to this connection's
     /// socket, for `PvaClient::report`. Shared with the reader/writer
     /// tasks.
@@ -184,8 +187,7 @@ pub struct ServerConn {
     /// because IOID alone is enough to find a registered sink.
     ioid_to_cmd: Arc<DashMap<u32, u8>>,
     /// Per-IOID introspection captured by the reader task from each op's
-    /// INIT response (Get/Put/Monitor → the single descriptor; PUT_GET →
-    /// getIF). The reader consults it to value-flatten 0xFD/0xFE markers
+    /// INIT response (Get/Put/Monitor → the single descriptor). The reader consults it to value-flatten 0xFD/0xFE markers
     /// embedded in an `any` DATA value (see
     /// [`flatten_type_cache_markers`](crate::client_native::decode::flatten_type_cache_markers)).
     /// Inserted on INIT, dropped on MONITOR FINISH and on
@@ -518,13 +520,36 @@ impl ServerConn {
     pub async fn connect(
         reactor: &epics_base_rs::runtime::task::Reactor,
         target: SocketAddr,
-        user: &str,
-        host: &str,
+        user: &[u8],
+        host: &[u8],
         conn: ConnConfig,
+    ) -> PvaResult<Arc<Self>> {
+        Self::connect_on(reactor, target, user, host, conn, LivenessClock::System).await
+    }
+
+    /// [`Self::connect`] with the heartbeat and `last_rx` on `liveness_clock`.
+    async fn connect_on(
+        reactor: &epics_base_rs::runtime::task::Reactor,
+        target: SocketAddr,
+        user: &[u8],
+        host: &[u8],
+        conn: ConnConfig,
+        liveness_clock: LivenessClock,
     ) -> PvaResult<Arc<Self>> {
         let (reader, writer) = dial_pva(target, conn.op_timeout, conn.tcp_timeout).await?;
         // Plain `pva://` TCP — no TLS, so no server X.509 identity.
-        Self::run_handshake_and_spawn(reactor, target, reader, writer, None, user, host, conn).await
+        Self::run_handshake_and_spawn(
+            reactor,
+            target,
+            reader,
+            writer,
+            None,
+            user,
+            host,
+            conn,
+            liveness_clock,
+        )
+        .await
     }
 
     /// Open a plain TCP connection driven by **two blocking threads** instead of
@@ -551,12 +576,23 @@ impl ServerConn {
     pub async fn connect_blocking(
         reactor: &epics_base_rs::runtime::task::Reactor,
         target: SocketAddr,
-        user: &str,
-        host: &str,
+        user: &[u8],
+        host: &[u8],
         conn: ConnConfig,
     ) -> PvaResult<Arc<Self>> {
         let (reader, writer) = dial_blocking(target, conn.op_timeout, conn.tcp_timeout).await?;
-        Self::run_handshake_and_spawn(reactor, target, reader, writer, None, user, host, conn).await
+        Self::run_handshake_and_spawn(
+            reactor,
+            target,
+            reader,
+            writer,
+            None,
+            user,
+            host,
+            conn,
+            LivenessClock::System,
+        )
+        .await
     }
 
     /// Open a TLS-wrapped connection (`pvas://`).
@@ -570,8 +606,8 @@ impl ServerConn {
         target: SocketAddr,
         server_name: &str,
         tls: Arc<crate::auth::TlsClientConfig>,
-        user: &str,
-        host: &str,
+        user: &[u8],
+        host: &[u8],
         conn: ConnConfig,
     ) -> PvaResult<Arc<Self>> {
         let stream = timeout(conn.op_timeout, tokio::net::TcpStream::connect(target))
@@ -613,6 +649,7 @@ impl ServerConn {
             user,
             host,
             conn,
+            LivenessClock::System,
         )
         .await
     }
@@ -620,16 +657,17 @@ impl ServerConn {
     /// Internal: takes already-split read/write halves, runs the handshake,
     /// then spawns the reader/writer/heartbeat tasks. Used by both
     /// [`Self::connect`] and [`Self::connect_tls`].
-    #[allow(clippy::too_many_arguments)] // the `reactor` capability is the 8th
+    #[allow(clippy::too_many_arguments)] // the `reactor` and the liveness clock are the 8th and 9th
     async fn run_handshake_and_spawn(
         reactor: &epics_base_rs::runtime::task::Reactor,
         target: SocketAddr,
         mut reader: DynRead,
         writer: DynWrite,
         server_identity: Option<crate::auth::X509Credentials>,
-        user: &str,
-        host: &str,
+        user: &[u8],
+        host: &[u8],
         conn: ConnConfig,
+        liveness_clock: LivenessClock,
     ) -> PvaResult<Arc<Self>> {
         let ConnConfig {
             op_timeout,
@@ -638,30 +676,26 @@ impl ServerConn {
         } = conn;
         // Step 1+2: read handshake frames until we get CONNECTION_VALIDATION.
         let mut rx_buf: Vec<u8> = Vec::with_capacity(8192);
-        let (byte_order, _server_buf, _server_reg, auth_methods) =
+        let (byte_order, validation) =
             read_handshake_init(&mut reader, &mut rx_buf, op_timeout, max_message_size).await?;
-
-        // Choose auth method: prefer "ca" if offered.
-        let negotiated_auth = select_client_auth(&auth_methods);
 
         // Step 3: send our CONNECTION_VALIDATION reply on the (still-not-spawned) writer.
         let mut writer_owned = writer;
-        let reply = build_client_connection_validation(
-            byte_order,
-            DEFAULT_BUFFER_SIZE,
-            DEFAULT_REGISTRY_SIZE,
-            0,
-            negotiated_auth,
-            user,
-            host,
-        );
+        let reply = answer_connection_validation(target, &validation, byte_order, user, host)?;
         timeout(op_timeout, writer_owned.write_all(&reply))
             .await
             .map_err(|_| PvaError::Timeout)?
             .map_err(PvaError::Io)?;
 
         // Step 4: wait for CONNECTION_VALIDATED.
-        wait_for_validated(&mut reader, &mut rx_buf, op_timeout, max_message_size).await?;
+        wait_for_validated(
+            target,
+            &mut reader,
+            &mut rx_buf,
+            op_timeout,
+            max_message_size,
+        )
+        .await?;
 
         // Spawn background tasks.
         let (writer_tx, mut writer_rx) = mpsc::unbounded_channel::<Vec<u8>>();
@@ -674,7 +708,7 @@ impl ServerConn {
         // many readers.
         let out_order = Arc::new(AtomicBool::new(byte_order.is_big()));
         let alive = Arc::new(AtomicBool::new(true));
-        let last_rx_nanos = Arc::new(AtomicU64::new(now_nanos()));
+        let last_rx_nanos = Arc::new(AtomicU64::new(liveness_clock.now_nanos()));
         let bytes_rx = Arc::new(AtomicU64::new(0));
         let bytes_tx = Arc::new(AtomicU64::new(0));
         let by_ioid: Arc<DashMap<u32, IoidSlot>> = Arc::new(DashMap::new());
@@ -722,6 +756,7 @@ impl ServerConn {
         let cancel_reader = cancel.clone();
         let alive_reader = alive.clone();
         let last_rx_reader = last_rx_nanos.clone();
+        let reader_clock = liveness_clock.clone();
         let bytes_rx_reader = bytes_rx.clone();
         let by_ioid_reader = by_ioid.clone();
         let by_cid_reader = by_cid.clone();
@@ -732,6 +767,7 @@ impl ServerConn {
         let chan_stats_reader = chan_stats.clone();
         let writer_tx_reader = writer_tx.clone();
         let out_order_reader = out_order.clone();
+        let (user_reader, host_reader) = (user.to_vec(), host.to_vec());
         reactor.spawn(async move {
             let mut buf = rx_buf;
             let mut chunk = vec![0u8; 4096];
@@ -744,10 +780,7 @@ impl ServerConn {
             // were a fresh complete frame, the IOID-routed receiver
             // gets garbage, and the application surfaces a Decode
             // error (or worse — wrong shape silently parsed).
-            let mut seg_buf: Vec<u8> = Vec::new();
-            let mut seg_cmd: u8 = 0;
-            let mut seg_flags: crate::proto::HeaderFlags = crate::proto::HeaderFlags(0);
-            let mut expect_seg = false;
+            let mut reassembly = crate::decode::SegmentAssembler::default();
             // Reader-task-owned type cache. Type-cache markers (0xFD
             // define / 0xFE reference) are resolved here, in strict wire
             // order, before frames are routed to per-op tasks — see
@@ -771,7 +804,7 @@ impl ServerConn {
                                 cancel_reader.cancel();
                                 return;
                             }
-                            last_rx_reader.store(now_nanos(), Ordering::SeqCst);
+                            last_rx_reader.store(reader_clock.now_nanos(), Ordering::SeqCst);
                             // count bytes read off the socket.
                             bytes_rx_reader.fetch_add(n as u64, Ordering::Relaxed);
                             // Peek the header once we have 8 bytes — when
@@ -857,93 +890,16 @@ impl ServerConn {
                                     );
                                     continue;
                                 }
-                                // segmentation gate (mirrors
-                                // server-side pvxs conn.cpp:
-                                // 228-244). Validate continuation
-                                // invariants; accumulate until
-                                // SegLast (or unsegmented), then
-                                // dispatch the synthetic Frame.
-                                let raw_seg = frame.header.flags.0
-                                    & crate::proto::HeaderFlags::SEGMENT_MASK;
-                                let continuation = raw_seg
-                                    & crate::proto::HeaderFlags::SEGMENT_LAST
-                                    != 0;
-                                if continuation ^ expect_seg
-                                    || (continuation
-                                        && frame.header.command != seg_cmd)
-                                {
-                                    warn!(
-                                        expect_seg,
-                                        continuation,
-                                        cmd = frame.header.command,
-                                        saved = seg_cmd,
-                                        "PVA segmentation violation from server, closing"
-                                    );
-                                    cancel_reader.cancel();
-                                    return;
-                                }
-                                if raw_seg == 0
-                                    || raw_seg
-                                        == crate::proto::HeaderFlags::SEGMENT_FIRST
-                                {
-                                    expect_seg = true;
-                                    seg_cmd = frame.header.command;
-                                    seg_flags = frame.header.flags;
-                                    seg_buf.clear();
-                                }
-                                // Cap reassembly when the client opted
-                                // into a cap; a peer that streams
-                                // SegFirst → SegMiddle … forever would
-                                // grow seg_buf without bound otherwise.
-                                // `None` = unbounded (pvxs
-                                // parity).
-                                if let Some(cap) = max_message_size {
-                                    if seg_buf.len().saturating_add(frame.payload.len()) > cap {
-                                        warn!(
-                                            accumulated = seg_buf.len(),
-                                            next = frame.payload.len(),
-                                            cap,
-                                            "PVA reassembled message exceeds cap, closing"
-                                        );
-                                        cancel_reader.cancel();
-                                        return;
-                                    }
-                                }
-                                if let Err(e) = crate::peer_buf::try_extend(
-                                    &mut seg_buf,
-                                    &frame.payload,
-                                    "the segment-reassembly buffer",
-                                ) {
-                                    warn!(error = %e, "PVA client reader: closing");
-                                    cancel_reader.cancel();
-                                    return;
-                                }
-                                if raw_seg != 0
-                                    && raw_seg
-                                        != crate::proto::HeaderFlags::SEGMENT_LAST
-                                {
-                                    continue;
-                                }
-                                expect_seg = false;
-                                let mut dispatch_frame = if raw_seg == 0 {
-                                    frame
-                                } else {
-                                    Frame {
-                                        header: crate::proto::PvaHeader {
-                                            version: frame.header.version,
-                                            // Strip the segment bits — the
-                                            // dispatch path expects an
-                                            // unsegmented application frame.
-                                            flags: crate::proto::HeaderFlags(
-                                                seg_flags.0
-                                                    & !crate::proto::HeaderFlags::SEGMENT_MASK,
-                                            ),
-                                            command: seg_cmd,
-                                            payload_length: seg_buf.len() as u32,
-                                        },
-                                        payload: std::mem::take(&mut seg_buf),
-                                    }
-                                };
+                                let mut dispatch_frame =
+                                    match reassembly.push(frame, max_message_size) {
+                                        Ok(Some(whole)) => whole,
+                                        Ok(None) => continue,
+                                        Err(e) => {
+                                            warn!(error = %e, "PVA client reader: closing");
+                                            cancel_reader.cancel();
+                                            return;
+                                        }
+                                    };
                                 // Flatten type-cache markers in wire
                                 // order before routing, so per-op tasks
                                 // never decode a 0xFE reference ahead of
@@ -954,7 +910,30 @@ impl ServerConn {
                                     &mut reader_type_cache,
                                     &op_introspection_reader,
                                 );
-                                route_frame(dispatch_frame, &by_ioid_reader, &by_cid_reader, &by_sid_close_reader, &ioid_to_sid_reader, &ioid_to_cmd_reader, &chan_stats_reader, &writer_tx_reader, &cancel_reader);
+                                let validation = handle_validation_frame(
+                                    &dispatch_frame,
+                                    target,
+                                    if out_order_reader.load(Ordering::SeqCst) {
+                                        ByteOrder::Big
+                                    } else {
+                                        ByteOrder::Little
+                                    },
+                                    &user_reader,
+                                    &host_reader,
+                                );
+                                match validation {
+                                    None => {}
+                                    Some(Ok(None)) => continue,
+                                    Some(Ok(Some(reply))) => {
+                                        let _ = writer_tx_reader.send(reply);
+                                        continue;
+                                    }
+                                    Some(Err(_)) => {
+                                        cancel_reader.cancel();
+                                        return;
+                                    }
+                                }
+                                route_frame(dispatch_frame, target, &by_ioid_reader, &by_cid_reader, &by_sid_close_reader, &ioid_to_sid_reader, &ioid_to_cmd_reader, &chan_stats_reader, &writer_tx_reader, &cancel_reader);
                             }
                         }
                         Err(_) => break,
@@ -990,6 +969,7 @@ impl ServerConn {
         let cancel_hb = cancel.clone();
         let alive_hb = alive.clone();
         let last_rx_hb = last_rx_nanos.clone();
+        let hb_clock = liveness_clock.clone();
         let writer_tx_hb = writer_tx.clone();
         let out_order_hb = out_order.clone();
         reactor.spawn(async move {
@@ -999,7 +979,7 @@ impl ServerConn {
                 tcp_timeout.as_secs_f64(),
             ));
             let hb_timeout = tcp_timeout;
-            let mut tick = interval(hb_interval);
+            let mut tick = hb_clock.interval(hb_interval);
             tick.tick().await; // skip first immediate tick
             loop {
                 tokio::select! {
@@ -1007,9 +987,14 @@ impl ServerConn {
                     _ = tick.tick() => {
                         // Liveness check: are we receiving anything?
                         let last = last_rx_hb.load(Ordering::SeqCst);
-                        let elapsed = now_nanos().saturating_sub(last);
+                        let elapsed = hb_clock.now_nanos().saturating_sub(last);
                         if elapsed > hb_timeout.as_nanos() as u64 {
-                            warn!("PVA connection idle > {hb_timeout:?}, closing");
+                            // pvxs's bufferevent read timeout (`conn.cpp:137-139`).
+                            crate::pvxs_log::log(
+                                crate::pvxs_log::TCP_IO,
+                                crate::pvxs_log::Level::Warn,
+                                format_args!("connection to Server {target} timeout"),
+                            );
                             break;
                         }
                         // Heartbeat probe = application CMD_ECHO with an
@@ -1052,6 +1037,7 @@ impl ServerConn {
             cancel,
             alive,
             last_rx_nanos,
+            liveness_clock,
             bytes_rx,
             bytes_tx,
             by_ioid,
@@ -1256,7 +1242,7 @@ impl ServerConn {
 
     /// Register a stream of frames matching a particular ioid, for an op
     /// whose reply count the op itself bounds (GetField, the PUT
-    /// sequences, RPC, PUT_GET, ARRAY, PROCESS).
+    /// sequences, RPC).
     ///
     /// NOT for MONITOR — see `Self::register_ioid_monitor`.
     pub fn register_ioid_stream(
@@ -1354,7 +1340,7 @@ impl ServerConn {
     /// Time elapsed since the last incoming byte.
     pub fn idle_for(&self) -> Duration {
         let last = self.last_rx_nanos.load(Ordering::SeqCst);
-        let now = now_nanos();
+        let now = self.liveness_clock.now_nanos();
         Duration::from_nanos(now.saturating_sub(last))
     }
 }
@@ -1387,31 +1373,140 @@ pub(super) const DEFAULT_REGISTRY_SIZE: u16 = 32_767;
 /// Select the client-side auth method from the server's advertised list,
 /// preferring `"ca"` when offered and falling back to `"anonymous"`. pvxs
 /// `Connection::handle_CONNECTION_VALIDATION` scans the advertised methods and
-/// selects `"ca"` when present (clientconn.cpp:215-263), with no name-server
+/// selects `"ca"` when present (clientconn.cpp:238-246), with no name-server
 /// exception — so both the normal TCP path and the name-server path must use
-/// this same rule rather than a separate hard-coded policy.
-pub(super) fn select_client_auth(auth_methods: &[String]) -> &'static str {
+/// this same rule rather than a separate hard-coded policy. `None` is a list
+/// with neither method, which pvxs answers by forcing `anonymous`.
+pub(super) fn select_client_auth(auth_methods: &[String]) -> Option<&'static str> {
     if auth_methods.iter().any(|m| m == "ca") {
-        "ca"
+        Some("ca")
+    } else if auth_methods.iter().any(|m| m == "anonymous") {
+        Some("anonymous")
     } else {
-        "anonymous"
+        None
     }
 }
 
-fn now_nanos() -> u64 {
-    use std::time::SystemTime;
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0)
+/// pvxs `Connection::handle_CONNECTION_VALIDATION` (clientconn.cpp:215-288),
+/// run for every CONNECTION_VALIDATION a server sends, at startup or on a
+/// live circuit: the reply frame, or the error that resets the circuit.
+pub(super) fn answer_connection_validation(
+    peer: SocketAddr,
+    frame: &Frame,
+    reply_order: ByteOrder,
+    user: &[u8],
+    host: &[u8],
+) -> PvaResult<Vec<u8>> {
+    use crate::pvxs_log::{CLIENT_IO, Level, log};
+    log(
+        CLIENT_IO,
+        Level::Debug,
+        format_args!("Server {peer} begins validation handshake"),
+    );
+    let req = decode_connection_validation_request(frame).inspect_err(|_| {
+        log(
+            CLIENT_IO,
+            Level::Err,
+            format_args!("Server {peer} sends invalid CONNECTION_VALIDATION.  Disconnect..."),
+        )
+    })?;
+    let auth = match select_client_auth(&req.auth_methods) {
+        Some(auth) => {
+            log(
+                CLIENT_IO,
+                Level::Debug,
+                format_args!("Server {peer} selecting auth '{auth}'"),
+            );
+            auth
+        }
+        None => {
+            log(
+                CLIENT_IO,
+                Level::Warn,
+                format_args!("Server {peer} no supported auth.  try to force 'anonymous'"),
+            );
+            "anonymous"
+        }
+    };
+    if auth == "ca" {
+        log(
+            CLIENT_IO,
+            Level::Info,
+            format_args!(
+                "Server {peer} 'ca' auth as {}@{}",
+                String::from_utf8_lossy(user),
+                String::from_utf8_lossy(host)
+            ),
+        );
+    }
+    Ok(build_client_connection_validation(
+        reply_order,
+        auth,
+        user,
+        host,
+        &auth_groups(auth),
+    ))
 }
 
+/// pvxs `Connection::handle_CONNECTION_VALIDATED` (clientconn.cpp:290-319),
+/// at startup or on a live circuit. A refused credential proceeds without
+/// it; only a frame that does not decode resets the circuit.
+pub(super) fn accept_connection_validated(peer: SocketAddr, frame: &Frame) -> PvaResult<()> {
+    use crate::pvxs_log::{CLIENT_IO, Level, log};
+    let st = decode_connection_validated(frame).inspect_err(|_| {
+        log(
+            CLIENT_IO,
+            Level::Crit,
+            format_args!("Server {peer} sends invalid CONNECTION_VALIDATED.  Disconnecting..."),
+        )
+    })?;
+    if !st.is_success() {
+        log(
+            CLIENT_IO,
+            Level::Err,
+            format_args!("Server {peer} refuses auth.  Trying to proceed w/o cred"),
+        );
+    } else {
+        let msg = st.message().unwrap_or("");
+        let sep = if msg.is_empty() { "" } else { " " };
+        log(
+            CLIENT_IO,
+            Level::Debug,
+            format_args!("Server {peer} accepts auth{sep}{msg}"),
+        );
+    }
+    Ok(())
+}
+
+/// A validation command on a live circuit: `None` for any other command,
+/// else the reply to send (`Some(Ok(Some(_)))`), nothing to send, or the
+/// fault that resets the circuit. pvxs's `ready = true; createChannels()`
+/// after CONNECTION_VALIDATED has nothing to do here: a circuit is only
+/// handed to channels once validated, so none is waiting on it.
+fn handle_validation_frame(
+    frame: &Frame,
+    peer: SocketAddr,
+    reply_order: ByteOrder,
+    user: &[u8],
+    host: &[u8],
+) -> Option<PvaResult<Option<Vec<u8>>>> {
+    let cmd = frame.header.command;
+    if cmd == Command::ConnectionValidation.code() {
+        Some(answer_connection_validation(peer, frame, reply_order, user, host).map(Some))
+    } else if cmd == Command::ConnectionValidated.code() {
+        Some(accept_connection_validated(peer, frame).map(|()| None))
+    } else {
+        None
+    }
+}
+
+/// The handshake's byte order and the server's first CONNECTION_VALIDATION.
 pub(super) async fn read_handshake_init<R: tokio::io::AsyncRead + Unpin>(
     reader: &mut R,
     rx_buf: &mut Vec<u8>,
     op_timeout: Duration,
     max_message_size: Option<usize>,
-) -> PvaResult<(ByteOrder, u32, u16, Vec<String>)> {
+) -> PvaResult<(ByteOrder, Frame)> {
     let mut byte_order = ByteOrder::Little;
     loop {
         let frame = read_one_frame(reader, rx_buf, op_timeout, max_message_size).await?;
@@ -1422,18 +1517,13 @@ pub(super) async fn read_handshake_init<R: tokio::io::AsyncRead + Unpin>(
             continue;
         }
         if frame.header.command == Command::ConnectionValidation.code() {
-            let req = decode_connection_validation_request(&frame)?;
-            return Ok((
-                byte_order,
-                req.server_buffer_size,
-                req.server_registry_size,
-                req.auth_methods,
-            ));
+            return Ok((byte_order, frame));
         }
     }
 }
 
 pub(super) async fn wait_for_validated<R: tokio::io::AsyncRead + Unpin>(
+    peer: SocketAddr,
     reader: &mut R,
     rx_buf: &mut Vec<u8>,
     op_timeout: Duration,
@@ -1445,20 +1535,7 @@ pub(super) async fn wait_for_validated<R: tokio::io::AsyncRead + Unpin>(
             continue;
         }
         if frame.header.command == Command::ConnectionValidated.code() {
-            // pvxs `clientconn.cpp:303-313`: a non-success
-            // CONNECTION_VALIDATED means the server refused the offered
-            // credentials, but pvxs logs "Trying to proceed w/o cred" and
-            // proceeds anyway (`ready = true; createChannels()`) — the
-            // server may still serve PVs anonymously. Only a malformed
-            // frame (`!M.good()`) disconnects, which here is the `?`
-            // decode error below. Hard-failing on non-success instead
-            // left a Rust client unable to reach a refuse-cred-serve-anon
-            // server: the connection tore down and reconnected forever.
-            let st = decode_connection_validated(&frame)?;
-            if !st.is_success() {
-                warn!("server refused auth ({st:?}); proceeding without credentials");
-            }
-            return Ok(());
+            return accept_connection_validated(peer, &frame);
         }
     }
 }
@@ -1566,6 +1643,7 @@ struct FrameFault(String);
 #[allow(clippy::too_many_arguments)]
 fn route_frame(
     frame: Frame,
+    peer: SocketAddr,
     by_ioid: &Arc<DashMap<u32, IoidSlot>>,
     by_cid: &Arc<DashMap<u32, oneshot::Sender<Frame>>>,
     by_sid_close: &Arc<DashMap<u32, (Arc<AtomicBool>, Arc<tokio::sync::Notify>)>>,
@@ -1578,6 +1656,7 @@ fn route_frame(
     let cmd = frame.header.command;
     if let Err(FrameFault(reason)) = route_frame_checked(
         frame,
+        peer,
         by_ioid,
         by_cid,
         by_sid_close,
@@ -1598,6 +1677,7 @@ fn route_frame(
 #[allow(clippy::too_many_arguments)]
 fn route_frame_checked(
     frame: Frame,
+    peer: SocketAddr,
     by_ioid: &Arc<DashMap<u32, IoidSlot>>,
     by_cid: &Arc<DashMap<u32, oneshot::Sender<Frame>>>,
     by_sid_close: &Arc<DashMap<u32, (Arc<AtomicBool>, Arc<tokio::sync::Notify>)>>,
@@ -1724,21 +1804,45 @@ fn route_frame_checked(
         }
     }
 
-    // Application op responses (GET/PUT/MONITOR/RPC/GET_FIELD) route by IOID.
-    // Every one of those pvxs handlers reads the IOID off the wire first and
+    // Nothing but an op reply routes by IOID. pvxs's client reaches no
+    // handler for any other command: the listed ones hit the base no-op
+    // `handle_X`, the rest the `default:` that logs and drains
+    // (conn.cpp:248-251), whatever IOID the body would carry. The two
+    // validation commands have real handlers, which the reader runs
+    // (`handle_validation_frame`) before a frame reaches this router.
+    if !is_op_reply(cmd) {
+        let listed = matches!(
+            Command::from_code(cmd),
+            Some(
+                Command::Echo
+                    | Command::ConnectionValidation
+                    | Command::ConnectionValidated
+                    | Command::Search
+                    | Command::SearchResponse
+                    | Command::AuthNZ
+                    | Command::PutGet
+                    | Command::DestroyRequest
+                    | Command::CancelRequest
+            )
+        );
+        if !listed {
+            crate::pvxs_log::log(
+                crate::pvxs_log::TCP_IO,
+                crate::pvxs_log::Level::Debug,
+                format_args!("Server {peer} Ignore unexpected command 0x{cmd:02x}"),
+            );
+        }
+        return Ok(());
+    }
+
+    // Every op reply handler reads the IOID off the wire first and
     // disconnects when the payload cannot carry it (`!M.good()` →
     // "sends invalid op%02x. Disconnecting...", clientget.cpp:490-494;
-    // clientmon.cpp / clientintrospect.cpp do the same). Any OTHER command
-    // stays ignorable: pvxs's dispatch switch drains an unexpected command's
-    // body and continues, for forward compatibility (conn.cpp:250-252).
+    // clientmon.cpp / clientintrospect.cpp do the same).
     let Some(ioid) = peek_u32(&frame.payload, 0, order) else {
-        return if is_op_reply(cmd) {
-            Err(FrameFault(format!(
-                "op reply payload too short for IOID (cmd {cmd})"
-            )))
-        } else {
-            Ok(())
-        };
+        return Err(FrameFault(format!(
+            "op reply payload too short for IOID (cmd {cmd})"
+        )));
     };
     {
         // Attribute this reply's wire length to the owning channel's
@@ -1793,18 +1897,15 @@ fn route_frame_checked(
         }
     }
     // An IOID with no dispatch slot drops silently (the op completed or was
-    // cancelled; Beacons/SearchResponse are handled out-of-band by the search
-    // engine, not here).
+    // cancelled).
     Ok(())
 }
 
 /// Commands whose client-side pvxs handler routes by a leading IOID and
-/// disconnects on a decode fault. Anything else the server sends is
-/// forward-compatible filler that pvxs drains and ignores (conn.cpp:250-252).
+/// disconnects on a decode fault.
 fn is_op_reply(cmd: u8) -> bool {
     cmd == Command::Get.code()
         || cmd == Command::Put.code()
-        || cmd == Command::PutGet.code()
         || cmd == Command::Monitor.code()
         || cmd == Command::Rpc.code()
         || cmd == Command::GetField.code()
@@ -1921,19 +2022,26 @@ fn maybe_destroy_stale_create_channel(
     let _ = writer_tx.send(frame_out);
 }
 
+/// The POSIX groups a `ca` AuthZ carries; no account lookup for any other.
+pub(super) fn auth_groups(auth: &str) -> Vec<epics_base_rs::types::PvString> {
+    if auth == "ca" {
+        crate::auth::posix_groups()
+    } else {
+        Vec::new()
+    }
+}
+
 pub(super) fn build_client_connection_validation(
     order: ByteOrder,
-    buffer_size: u32,
-    registry_size: u16,
-    qos: u16,
     auth: &str,
-    user: &str,
-    host: &str,
+    user: &[u8],
+    host: &[u8],
+    groups: &[epics_base_rs::types::PvString],
 ) -> Vec<u8> {
     let mut payload = Vec::new();
-    payload.put_u32(buffer_size, order);
-    payload.put_u16(registry_size, order);
-    payload.put_u16(qos, order);
+    payload.put_u32(DEFAULT_BUFFER_SIZE, order);
+    payload.put_u16(DEFAULT_REGISTRY_SIZE, order);
+    payload.put_u16(0, order); // qos
     encode_string_into(auth, order, &mut payload);
 
     // pvxs always reads a Variant payload after the auth method string —
@@ -1943,7 +2051,6 @@ pub(super) fn build_client_connection_validation(
     // server-side ACF can match `group:foo` rules — pvxs ca-auth
     // parity (osgroups.cpp).
     if auth == "ca" {
-        let groups = crate::auth::posix_groups();
         // Variant tag (0xFD) + inline AuthZ structure carrying
         // user (str) + host (str) [+ groups (str[])].
         payload.put_u8(0xFD);
@@ -1963,14 +2070,14 @@ pub(super) fn build_client_connection_validation(
             payload.extend_from_slice(b"groups");
             payload.put_u8(0x68); // string[]
         }
-        encode_string_into(user, order, &mut payload);
-        encode_string_into(host, order, &mut payload);
+        crate::proto::encode_string_bytes_into(user, order, &mut payload);
+        crate::proto::encode_string_bytes_into(host, order, &mut payload);
         if !groups.is_empty() {
             // string-array length prefix (size_t encoding) + each
             // string.
             crate::proto::encode_size_into(groups.len() as u32, order, &mut payload);
-            for g in &groups {
-                encode_string_into(g, order, &mut payload);
+            for g in groups {
+                crate::proto::encode_string_bytes_into(g.as_bytes(), order, &mut payload);
             }
         }
     } else {
@@ -1997,33 +2104,57 @@ use crate::proto::decode_size;
 fn _suppress(_: HeaderFlags, _: Status) {}
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    /// pvxs `buildCAMethod` stores the `osiGetUserName` and `gethostname`
+    /// bytes (client.cpp:519-533); both go on the wire as they are.
+    #[test]
+    fn a_non_utf8_user_and_host_are_sent_byte_for_byte() {
+        let reply =
+            build_client_connection_validation(ByteOrder::Little, "ca", b"op\xff", b"h\xfe", &[]);
+        assert!(
+            reply.windows(7).any(|w| w == b"\x03op\xff\x02h\xfe"),
+            "{reply:?}"
+        );
+    }
+
+    #[test]
+    fn a_non_utf8_group_is_sent_byte_for_byte() {
+        let reply = build_client_connection_validation(
+            ByteOrder::Little,
+            "ca",
+            b"op",
+            b"h",
+            &[epics_base_rs::types::PvString::from(&b"gr\xff"[..])],
+        );
+        assert!(reply.ends_with(b"\x01\x03gr\xff"));
+    }
 
     // The auth-selection rule shared by the normal TCP connection path and the
     // TCP name-server path (pvxs has no name-server auth exception): prefer "ca"
-    // when the server offers it, else fall back to "anonymous".
+    // when the server offers it, else "anonymous" when offered.
     #[test]
     fn select_client_auth_prefers_ca_when_offered() {
         assert_eq!(
             select_client_auth(&["anonymous".to_string(), "ca".to_string()]),
-            "ca",
+            Some("ca"),
             "must select ca when the server advertises anonymous, ca"
         );
         assert_eq!(
             select_client_auth(&["ca".to_string()]),
-            "ca",
+            Some("ca"),
             "must select ca when it is the only method"
         );
         assert_eq!(
             select_client_auth(&["anonymous".to_string()]),
-            "anonymous",
+            Some("anonymous"),
             "must fall back to anonymous when ca is not offered"
         );
         assert_eq!(
-            select_client_auth(&[]),
-            "anonymous",
-            "must fall back to anonymous when no methods are advertised"
+            select_client_auth(&["x509".to_string()]),
+            None,
+            "a list with neither method is pvxs's forced-anonymous case"
         );
     }
 
@@ -2178,7 +2309,14 @@ mod tests {
 
         let mut reader = std::io::Cursor::new(frame);
         let mut rx_buf = Vec::new();
-        let res = wait_for_validated(&mut reader, &mut rx_buf, Duration::from_secs(1), None).await;
+        let res = wait_for_validated(
+            "127.0.0.1:5075".parse().unwrap(),
+            &mut reader,
+            &mut rx_buf,
+            Duration::from_secs(1),
+            None,
+        )
+        .await;
         assert!(
             res.is_ok(),
             "non-success CONNECTION_VALIDATED must proceed anonymously (pvxs parity), got {res:?}"
@@ -2272,6 +2410,11 @@ mod tests {
         );
     }
 
+    const ROUTER_PEER: SocketAddr = SocketAddr::V4(std::net::SocketAddrV4::new(
+        std::net::Ipv4Addr::LOCALHOST,
+        5075,
+    ));
+
     /// Build a fresh set of router DashMaps + cancel token + writer_tx
     /// for unit tests. The writer receiver is leaked (Drop'd) so any
     /// destroy frames the route emits during the test go to /dev/null
@@ -2333,6 +2476,7 @@ mod tests {
             PvaHeader::application(true, order, Command::Monitor.code(), payload.len() as u32);
         route_frame(
             Frame { header, payload },
+            ROUTER_PEER,
             &by_ioid,
             &by_cid,
             &by_sid_close,
@@ -2361,6 +2505,7 @@ mod tests {
                 header: header2,
                 payload: payload2,
             },
+            ROUTER_PEER,
             &by_ioid,
             &by_cid,
             &by_sid_close,
@@ -2400,6 +2545,7 @@ mod tests {
 
         route_frame(
             frame,
+            ROUTER_PEER,
             &by_ioid,
             &by_cid,
             &by_sid_close,
@@ -2452,6 +2598,7 @@ mod tests {
         );
         route_frame(
             Frame { header, payload },
+            ROUTER_PEER,
             &by_ioid,
             &by_cid,
             &by_sid_close,
@@ -2505,6 +2652,7 @@ mod tests {
         );
         route_frame(
             Frame { header, payload },
+            ROUTER_PEER,
             &by_ioid,
             &by_cid,
             &by_sid_close,
@@ -2556,6 +2704,7 @@ mod tests {
         );
         route_frame(
             Frame { header, payload },
+            ROUTER_PEER,
             &by_ioid,
             &by_cid,
             &by_sid_close,
@@ -2636,6 +2785,7 @@ mod tests {
         );
         route_frame(
             Frame { header, payload },
+            ROUTER_PEER,
             &by_ioid,
             &by_cid,
             &by_sid_close,
@@ -2690,6 +2840,7 @@ mod tests {
         let header = PvaHeader::application(true, order, Command::Get.code(), payload.len() as u32);
         route_frame(
             Frame { header, payload },
+            ROUTER_PEER,
             &by_ioid,
             &by_cid,
             &by_sid_close,
@@ -2710,6 +2861,92 @@ mod tests {
         );
     }
 
+    /// pvxs's client handles nothing outside its dispatch list, whatever IOID
+    /// the body carries: `conn.cpp:250` logs "Ignore unexpected command" for
+    /// those, and a listed command with no client handler (the base no-op
+    /// `handle_X`) is dropped without a line.
+    #[test]
+    fn unhandled_server_commands_log_as_pvxs_and_keep_the_circuit() {
+        use epics_base_rs::runtime::log;
+        let order = ByteOrder::Little;
+        let heard = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = heard.clone();
+        let id = log::errlog_add_listener(move |m| {
+            if let Some((_time, line)) = m.split_once(' ') {
+                sink.lock().unwrap().push(line.trim_end().to_string());
+            }
+        });
+        crate::pvxs_log::logger_level_set(crate::pvxs_log::TCP_IO, crate::pvxs_log::Level::Debug);
+        let (by_ioid, by_cid, by_sid_close, ioid_to_sid, ioid_to_cmd, writer_tx, cancel) =
+            fresh_router();
+        // An open GET at IOID 7: an unhandled command naming it must not be
+        // taken for its reply.
+        let (tx, mut rx) = oneshot::channel();
+        by_ioid.insert(7, IoidSlot::TwoShot(VecDeque::from([tx])));
+        ioid_to_cmd.insert(7, Command::Get.code());
+        let mut payload = Vec::new();
+        payload.put_u32(7, order);
+        payload.put_u8(0x08);
+        for cmd in [
+            Command::Array.code(),
+            Command::Beacon.code(),
+            Command::AclChange.code(),
+            Command::Process.code(),
+            Command::MultipleData.code(),
+            Command::OriginTag.code(),
+            0x30,
+            Command::Echo.code(),
+            Command::ConnectionValidation.code(),
+            Command::ConnectionValidated.code(),
+            Command::Search.code(),
+            Command::SearchResponse.code(),
+            Command::AuthNZ.code(),
+            Command::PutGet.code(),
+            Command::DestroyRequest.code(),
+            Command::CancelRequest.code(),
+        ] {
+            let header = PvaHeader::application(true, order, cmd, payload.len() as u32);
+            route_frame(
+                Frame {
+                    header,
+                    payload: payload.clone(),
+                },
+                ROUTER_PEER,
+                &by_ioid,
+                &by_cid,
+                &by_sid_close,
+                &ioid_to_sid,
+                &ioid_to_cmd,
+                &Arc::new(DashMap::new()),
+                &writer_tx,
+                &cancel,
+            );
+        }
+        log::errlog_flush();
+        log::errlog_remove_listener(id);
+        crate::pvxs_log::logger_level_set(crate::pvxs_log::TCP_IO, crate::pvxs_log::Level::Warn);
+        let heard: Vec<String> = heard
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|l| l.contains(&format!("Server {ROUTER_PEER} ")))
+            .cloned()
+            .collect();
+        let line = |cmd: u8| {
+            format!("DEBUG pvxs.tcp.io Server {ROUTER_PEER} Ignore unexpected command 0x{cmd:02x}")
+        };
+        assert_eq!(
+            heard,
+            [0x0e, 0x00, 0x06, 0x10, 0x13, 0x16, 0x30].map(line),
+            "one line per command outside pvxs's dispatch list, none for the listed ones"
+        );
+        assert!(
+            !cancel.is_cancelled(),
+            "an unhandled command keeps the circuit"
+        );
+        assert!(rx.try_recv().is_err(), "the open GET got no reply");
+    }
+
     /// pvxs tears the circuit down for every server frame it cannot decode:
     /// `handle_MESSAGE` throws on `!M.good()` (clientconn.cpp:454-455) and the
     /// dispatch catch calls `bev.reset()` (conn.cpp:277-281); CREATE_CHANNEL
@@ -2727,6 +2964,7 @@ mod tests {
             let header = PvaHeader::application(true, order, cmd, payload.len() as u32);
             route_frame(
                 Frame { header, payload },
+                ROUTER_PEER,
                 &by_ioid,
                 &by_cid,
                 &by_sid_close,
@@ -2777,7 +3015,6 @@ mod tests {
         for cmd in [
             Command::Get.code(),
             Command::Put.code(),
-            Command::PutGet.code(),
             Command::Monitor.code(),
             Command::Rpc.code(),
             Command::GetField.code(),
@@ -2789,11 +3026,14 @@ mod tests {
         }
 
         // Forward compatibility: an unknown command with a short payload is
-        // drained and ignored, exactly as pvxs's dispatch default does.
-        assert!(
-            !route(Command::MultipleData.code(), vec![0x00]),
-            "an unhandled command must stay ignorable, not close the circuit"
-        );
+        // drained and ignored, exactly as pvxs's dispatch default does. The
+        // client's PUT_GET handler is ConnBase's no-op, so it drains too.
+        for cmd in [Command::MultipleData, Command::Array, Command::PutGet] {
+            assert!(
+                !route(cmd.code(), vec![0x00]),
+                "an unhandled command ({cmd:?}) must stay ignorable, not close the circuit"
+            );
+        }
     }
 
     /// Same per-frame-order requirement for CREATE_CHANNEL CID routing —
@@ -2819,6 +3059,7 @@ mod tests {
         );
         route_frame(
             Frame { header, payload },
+            ROUTER_PEER,
             &by_ioid,
             &by_cid,
             &by_sid_close,
@@ -2913,14 +3154,110 @@ mod tests {
         );
     }
 
+    /// A server's CONNECTION_VALIDATION frame offering `methods`.
+    pub(crate) fn validation_request(methods: &[&str]) -> Vec<u8> {
+        use crate::proto::encode_size_into;
+        let order = ByteOrder::Little;
+        let mut payload = Vec::new();
+        payload.put_u32(0x10000, order);
+        payload.put_u16(32_767, order);
+        encode_size_into(methods.len() as u32, order, &mut payload);
+        for m in methods {
+            encode_string_into(m, order, &mut payload);
+        }
+        let mut buf = Vec::new();
+        PvaHeader::application(
+            true,
+            order,
+            Command::ConnectionValidation.code(),
+            payload.len() as u32,
+        )
+        .write_into(&mut buf);
+        buf.extend_from_slice(&payload);
+        buf
+    }
+
+    /// A server's CONNECTION_VALIDATED frame with `payload` as its body.
+    pub(crate) fn validated(payload: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        PvaHeader::application(
+            true,
+            ByteOrder::Little,
+            Command::ConnectionValidated.code(),
+            payload.len() as u32,
+        )
+        .write_into(&mut buf);
+        buf.extend_from_slice(payload);
+        buf
+    }
+
+    /// Read client frames off `sock` until a CONNECTION_VALIDATION, and
+    /// return its auth method.
+    pub(crate) async fn read_validation_reply(sock: &mut tokio::net::TcpStream) -> String {
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 4096];
+        loop {
+            while let Ok(Some((frame, n))) = try_parse_frame_role(&buf, PeerRole::Server) {
+                buf.drain(..n);
+                if !frame.header.flags.is_control()
+                    && frame.header.command == Command::ConnectionValidation.code()
+                {
+                    let mut cur = std::io::Cursor::new(&frame.payload[8..]);
+                    return decode_string(&mut cur, frame.order()).unwrap().unwrap();
+                }
+            }
+            let n = sock.read(&mut tmp).await.unwrap();
+            assert!(n > 0, "client closed before a CONNECTION_VALIDATION");
+            buf.extend_from_slice(&tmp[..n]);
+        }
+    }
+
+    /// A circuit whose handshake completed with `anonymous`, plus the mock
+    /// server's socket.
+    async fn validated_circuit() -> (Arc<ServerConn>, tokio::net::TcpStream) {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut first = Vec::new();
+            PvaHeader::control(
+                true,
+                ByteOrder::Little,
+                ControlCommand::SetByteOrder.code(),
+                0,
+            )
+            .write_into(&mut first);
+            first.extend_from_slice(&validation_request(&["anonymous"]));
+            sock.write_all(&first).await.unwrap();
+            assert_eq!(read_validation_reply(&mut sock).await, "anonymous");
+            sock.write_all(&validated(&[0xFF])).await.unwrap();
+            sock
+        });
+        let conn = ServerConn::connect_on(
+            &crate::test_reactor(),
+            addr,
+            b"op",
+            b"box",
+            ConnConfig {
+                op_timeout: Duration::from_secs(5),
+                tcp_timeout: Duration::from_secs(30),
+                max_message_size: None,
+            },
+            LivenessClock::Manual(Arc::new(crate::liveness_clock::ManualClock::default())),
+        )
+        .await
+        .unwrap();
+        (conn, server.await.unwrap())
+    }
+
     /// Regression: `tcp_timeout` passed to `ServerConn::connect` must
     /// govern the heartbeat idle timeout, not the process environment.
     ///
     /// Setup: a mock server completes the PVA handshake then goes silent.
     /// With `tcp_timeout = 500ms` the heartbeat declares the connection dead
-    /// well within 4 seconds. Before the fix the heartbeat read from
-    /// `EPICS_PVA_CONN_TMO` (default → 40 s) so the connection would still
-    /// be alive at the 4 s deadline.
+    /// at its first tick. Before the fix the heartbeat read from
+    /// `EPICS_PVA_CONN_TMO` (default → 40 s) so that tick would probe instead.
     ///
     /// pvxs upstream:
     ///   - inactivity timeout = `tcpTimeout`     (clientconn.cpp:71-72)
@@ -3002,43 +3339,54 @@ mod tests {
         // Short tcp_timeout so the heartbeat fires quickly:
         //   hb_interval = max(1, min(15, 0.5 * 3/8)) = 1 s
         //   hb_timeout  = 0.5 s
-        // Connection must be declared dead at the first heartbeat tick (~1 s).
+        // On a ManualClock the first tick (1 s) must close the link; with
+        // the env default (40 s) it would probe and arm the second tick.
         let tcp_timeout = Duration::from_millis(500);
         let op_timeout = Duration::from_secs(2);
+        let clock = Arc::new(crate::liveness_clock::ManualClock::default());
 
-        let conn = ServerConn::connect(
+        let conn = ServerConn::connect_on(
             &crate::test_reactor(),
             addr,
-            "testuser",
-            "testhost",
+            b"testuser",
+            b"testhost",
             ConnConfig {
                 op_timeout,
                 tcp_timeout,
                 max_message_size: None,
             },
+            LivenessClock::Manual(clock.clone()),
         )
         .await
         .expect("handshake must succeed");
 
         assert!(conn.is_alive(), "connection must be alive after handshake");
 
-        // Wait for the heartbeat to declare the connection dead.
-        // Deadline = 4 s; before the fix hb_timeout = 40 s (env default)
-        // so this assertion would still be true at 4 s and the timeout
-        // would fire, causing the test to fail.
-        let deadline = Duration::from_secs(4);
-        tokio::time::timeout(deadline, async {
-            loop {
-                if !conn.is_alive() {
-                    break;
+        // Armed: the skipped immediate tick, then tick 1.
+        let armed = |n: usize| {
+            let clock = clock.clone();
+            async move {
+                while clock.ticks().len() < n {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
                 }
-                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(10), armed(2))
+            .await
+            .expect("the first heartbeat tick was never armed");
+        clock.advance(Duration::from_secs(1));
+        // Tick 1 either closes the link or arms tick 2; nothing else moves.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while conn.is_alive() && clock.ticks().len() < 3 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
             }
         })
         .await
-        .expect("connection must be declared dead within 4 s (tcp_timeout=500ms)");
-
-        assert!(!conn.is_alive());
+        .expect("tick 1 was never evaluated");
+        assert!(
+            !conn.is_alive(),
+            "a link silent for 1 s outlived tcp_timeout = {tcp_timeout:?}"
+        );
     }
 
     /// The client heartbeat must use an
@@ -3048,8 +3396,13 @@ mod tests {
     /// Rust client alive past several heartbeat intervals; before the fix
     /// the control probe drew no reply, `last_rx` went stale, and the
     /// connection was torn down despite a healthy server.
-    #[tokio::test]
+    ///
+    /// On a [`ManualClock`]: each tick is known to be evaluated once the
+    /// next one is armed, and each probe known answered once `idle_for`
+    /// reads zero, so load cannot stretch the silence the heartbeat sees.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn pva_rs_71_app_echo_keeps_pvxs_link_alive() {
+        use crate::liveness_clock::ManualClock;
         use crate::proto::encode_size_into;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -3059,10 +3412,13 @@ mod tests {
             .await
             .expect("bind mock server");
         let addr = listener.local_addr().expect("mock server addr");
+        let answer = Arc::new(AtomicBool::new(true));
+        let answer_server = answer.clone();
 
         // pvxs-shaped server: complete the handshake, then drain control
         // frames and reply ONLY to application CMD_ECHO with a
-        // server-direction CMD_ECHO (serverconn.cpp:166-178).
+        // server-direction CMD_ECHO (serverconn.cpp:166-178), while
+        // `answer` holds.
         tokio::spawn(async move {
             let Ok((mut sock, _)) = listener.accept().await else {
                 return;
@@ -3089,9 +3445,15 @@ mod tests {
                 return;
             }
 
-            // Drain the client's CONNECTION_VALIDATION reply.
-            let mut drain = [0u8; 512];
-            let _ = tokio::time::timeout(Duration::from_millis(200), sock.read(&mut drain)).await;
+            // The client's CONNECTION_VALIDATION reply.
+            let mut hdr = [0u8; 8];
+            if sock.read_exact(&mut hdr).await.is_err() {
+                return;
+            }
+            let len = u32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]) as usize;
+            if sock.read_exact(&mut vec![0u8; len]).await.is_err() {
+                return;
+            }
 
             // CONNECTION_VALIDATED (Status::ok()).
             let mut vd = Vec::new();
@@ -3102,11 +3464,8 @@ mod tests {
                 return;
             }
 
-            // Echo pump.
-            let mut hdr = [0u8; 8];
-            while let Ok(Ok(_)) =
-                tokio::time::timeout(Duration::from_secs(6), sock.read_exact(&mut hdr)).await
-            {
+            // Echo pump, until the client hangs up.
+            while sock.read_exact(&mut hdr).await.is_ok() {
                 let payload_len = u32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]) as usize;
                 if payload_len > 0 {
                     let mut body = vec![0u8; payload_len];
@@ -3117,7 +3476,10 @@ mod tests {
                 let is_control = hdr[2] & HeaderFlags::CONTROL != 0;
                 // A control EchoRequest (the pre-fix probe) is drained with
                 // no reply, exactly like pvxs.
-                if !is_control && hdr[3] == Command::Echo.code() {
+                if !is_control
+                    && hdr[3] == Command::Echo.code()
+                    && answer_server.load(Ordering::SeqCst)
+                {
                     let mut reply = Vec::with_capacity(8);
                     PvaHeader::application(true, order, Command::Echo.code(), 0)
                         .write_into(&mut reply);
@@ -3129,33 +3491,68 @@ mod tests {
         });
 
         // tcp_timeout = 2 s → hb_interval = max(1, 2×3/8) = 1 s,
-        // hb_timeout = 2 s. With application echo answered each interval,
-        // `last_rx` is refreshed ~every 1 s and the link survives. Without
-        // the fix (control probe, no reply) `last_rx` would go stale and
-        // the heartbeat declares the connection dead at ~3 s.
-        let conn = ServerConn::connect(
+        // hb_timeout = 2 s.
+        const HB: Duration = Duration::from_secs(1);
+        let clock = Arc::new(ManualClock::default());
+        let conn = ServerConn::connect_on(
             &crate::test_reactor(),
             addr,
-            "testuser",
-            "testhost",
+            b"testuser",
+            b"testhost",
             ConnConfig {
                 op_timeout: Duration::from_secs(2),
                 tcp_timeout: Duration::from_secs(2),
                 max_message_size: None,
             },
+            LivenessClock::Manual(clock.clone()),
         )
         .await
         .expect("handshake must succeed");
-
         assert!(conn.is_alive(), "connection must be alive after handshake");
 
-        // Past three heartbeat intervals (3 s): the pre-fix control probe
-        // would have torn the link down by now.
-        tokio::time::sleep(Duration::from_millis(3500)).await;
-        assert!(
-            conn.is_alive(),
-            "application-echo heartbeat must keep the pvxs-shaped link alive"
-        );
+        // A bound on the event, not a margin on the deadline: the clock
+        // does not move while it runs.
+        async fn within(what: &str, mut done: impl FnMut() -> bool) {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while !done() {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("{what}"));
+        }
+        // The immediate first tick is skipped, so tick `n` (at n·HB) is
+        // armed `n + 1`th; it has been evaluated once tick `n + 1` is armed.
+        let evaluated = |n: usize| clock.ticks().len() >= n + 2;
+
+        within("the first heartbeat tick was never armed", || evaluated(0)).await;
+        for n in 1..=10 {
+            clock.advance(HB);
+            within(&format!("tick {n} was never evaluated"), || evaluated(n)).await;
+            within(&format!("the probe of tick {n} was never answered"), || {
+                conn.idle_for() == Duration::ZERO
+            })
+            .await;
+            assert!(conn.is_alive(), "tick {n} closed an answered link");
+        }
+
+        // Silence from here: the probes at +1 s and +2 s still find the
+        // link within tcp_timeout, the one at +3 s does not.
+        answer.store(false, Ordering::SeqCst);
+        for n in 11..=12 {
+            clock.advance(HB);
+            within(&format!("tick {n} was never evaluated"), || evaluated(n)).await;
+            assert!(
+                conn.is_alive(),
+                "tick {n} closed a link silent for only {:?}",
+                conn.idle_for()
+            );
+        }
+        clock.advance(HB);
+        within("a link silent past tcp_timeout was never closed", || {
+            !conn.is_alive()
+        })
+        .await;
     }
 
     /// [`ServerConn::connect_blocking`] completes the same handshake as
@@ -3228,8 +3625,8 @@ mod tests {
         let conn = ServerConn::connect_blocking(
             &crate::test_reactor(),
             addr,
-            "testuser",
-            "testhost",
+            b"testuser",
+            b"testhost",
             ConnConfig {
                 op_timeout: Duration::from_secs(2),
                 tcp_timeout: Duration::from_secs(30),
@@ -3440,10 +3837,9 @@ mod tests {
         /// refusal into a slow one.
         #[test]
         fn dial_to_closed_target_fails_fast() {
-            // Bind, take the addr, drop: nothing listens → RST.
-            let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-            let addr = l.local_addr().expect("addr");
-            drop(l);
+            // Held and never listening → RST.
+            let held = named_port::HeldPort::closed_tcp();
+            let addr = std::net::SocketAddr::from(([127, 0, 0, 1], held.port));
 
             let started = std::time::Instant::now();
             let (tx, rx) = std::sync::mpsc::channel();
@@ -3589,8 +3985,12 @@ mod tests {
                 "a dial toward a blackhole must be pending, not resolved on \
                  the caller's thread"
             );
+            // The pool's own count, not `dial_threads()`: `std` names a thread
+            // from inside it, so a worker `dial()` has just created still
+            // carries its parent's `comm` until it is scheduled. `workers` is
+            // raised under the pool's lock before `dial()` returns in this poll.
             assert_eq!(
-                dial_threads(),
+                PVA_DIAL_POOL.worker_count(),
                 1,
                 "the first poll must have handed the connect to a dedicated \
                  dial thread"
@@ -3770,6 +4170,7 @@ mod tests {
         let route = |frame: Frame| {
             route_frame(
                 frame,
+                ROUTER_PEER,
                 &by_ioid,
                 &by_cid,
                 &by_sid_close,
@@ -3814,5 +4215,54 @@ mod tests {
             "the warm GET reply must route to the Reusable slot"
         );
         assert!(!cancel.is_cancelled());
+    }
+
+    /// pvxs runs `handle_CONNECTION_VALIDATION` whenever the frame arrives
+    /// (clientconn.cpp:215-288): a server that restarts validation on a
+    /// live circuit gets a fresh auth selection and reply, and a following
+    /// CONNECTION_VALIDATED (:290-319) leaves the circuit up.
+    // RTEMS-EXEC-MODEL-ALLOW(1): checked - runs and passes in the exec-backend
+    // suite (hand-built test runtime, mock TCP server).
+    #[tokio::test]
+    async fn a_mid_stream_connection_validation_is_answered() {
+        use tokio::io::AsyncWriteExt;
+        let (conn, mut sock) = validated_circuit().await;
+        sock.write_all(&validation_request(&["anonymous", "ca"]))
+            .await
+            .unwrap();
+        let auth = tokio::time::timeout(Duration::from_secs(5), read_validation_reply(&mut sock))
+            .await
+            .expect("no reply to a mid-stream CONNECTION_VALIDATION");
+        assert_eq!(auth, "ca");
+        sock.write_all(&validated(&[0xFF])).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(conn.is_alive());
+    }
+
+    /// A CONNECTION_VALIDATION or CONNECTION_VALIDATED that does not decode
+    /// resets the circuit mid-stream as at startup (clientconn.cpp:247-251,
+    /// :297-301).
+    // RTEMS-EXEC-MODEL-ALLOW(1): checked - runs and passes in the exec-backend
+    // suite (hand-built test runtime, mock TCP server).
+    #[tokio::test]
+    async fn a_malformed_mid_stream_validation_frame_closes_the_circuit() {
+        use tokio::io::AsyncWriteExt;
+        for bad in [
+            validated(&[]),
+            validation_request(&[])[..PvaHeader::SIZE + 6].to_vec(),
+        ] {
+            let mut bad = bad;
+            let len = (bad.len() - PvaHeader::SIZE) as u32;
+            bad[4..8].copy_from_slice(&len.to_le_bytes());
+            let (conn, mut sock) = validated_circuit().await;
+            sock.write_all(&bad).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while conn.is_alive() {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("a malformed validation frame left the circuit up");
+        }
     }
 }

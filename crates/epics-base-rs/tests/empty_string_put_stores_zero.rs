@@ -55,6 +55,7 @@ record(longout, "LO") { field(VAL, "7") }
 record(ao,      "AO") { field(VAL, "2.5") }
 record(ai,      "AI") { field(PREC, "3") field(HOPR, "10") }
 record(waveform,"WF") { field(FTVL, "DOUBLE") field(NELM, "4") }
+record(aSub,    "AS") { field(FTA, "DOUBLE") field(NOA, "1") }
 "#;
 
 type Db = Arc<PvDatabase>;
@@ -156,4 +157,22 @@ async fn an_empty_put_into_a_waveform_is_still_refused() {
         caput(&db, "WF", "VAL", "").await.is_err(),
         "the array row refuses what the scalar row accepts"
     );
+}
+
+/// `put_pv_no_process` (`dbPutField` without its process) takes the same row: `aSub.A` at NOA 1 is stored as a scalar but declared
+/// `special(SPC_DBADDR)`, so only the declaration sends `""` to
+/// `putStringDouble`. C `dbpf AS.A ""` after `dbpf AS.A 4` reads back 4.
+#[epics_macros_rs::epics_test]
+async fn an_empty_restore_into_a_dbaddr_scalar_is_still_refused() {
+    let db = build().await;
+    db.put_pv_no_process("AS.A", EpicsValue::Double(4.0))
+        .await
+        .unwrap();
+    assert!(
+        db.put_pv_no_process("AS.A", EpicsValue::String("".into()))
+            .await
+            .is_err(),
+        "the restore takes the array row"
+    );
+    assert_eq!(read(&db, "AS", "A"), 4.0);
 }

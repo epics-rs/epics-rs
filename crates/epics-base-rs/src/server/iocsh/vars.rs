@@ -12,7 +12,7 @@
 //! # What a softIoc has here that this table does not
 //!
 //! Measured on `softIoc` R7.0.10: a bare `var` lists 24 names, and the
-//! same command here lists 13, twelve of which are C's. The 24 arrive by
+//! same command here lists 14, thirteen of which are C's. The 24 arrive by
 //! two routes —
 //! `registerAllRecordDeviceDrivers.cpp` copies the 22 `variable()` lines
 //! of `softIoc.dbd` into the iocsh table, and `libComRegister.c:518-520`
@@ -22,24 +22,24 @@
 //! either implements with the default hard-wired or does not have at all.
 //! Each of the 24, with its reason:
 //!
-//! **Registered here (12).** `asCheckClientIP`, from
+//! **Registered here (13).** `asCheckClientIP`, from
 //! `access_commands`; `dbRecordsOnceOnly` and `dbQuietMacroWarnings`,
-//! from `commands`; and the nine knobs `seeded_knobs` seeds:
+//! from `commands`; and the ten knobs `seeded_knobs` seeds:
 //! `boHIGHlimit`, `boHIGHprecision`, `calcoutODLYlimit`,
 //! `calcoutODLYprecision`, `histogramSDELprecision`, `seqDLYlimit`,
-//! `seqDLYprecision`, `callbackParallelThreadsDefault` and
-//! `dbTemplateMaxVars`. All nine were a `const` or a computing function
-//! until they were registered; a name in this table has to reach a global
+//! `seqDLYprecision`, `callbackParallelThreadsDefault`,
+//! `dbTemplateMaxVars` and `dbAccessDebugPUTF`. The first nine were a
+//! `const` or a computing function until they were registered; a name in this table has to reach a global
 //! something actually reads, or `var seqDLYlimit 5000` lists and echoes a
 //! value nothing uses, which looks like it worked. Three of them are C
 //! `double`s, which is what
 //! [`crate::server::iocsh::vars::VarAccess::Double`] is for.
 //!
-//! **C `printf` debug switches with no counterpart here (7).**
+//! **C `printf` debug switches with no counterpart here (6).**
 //! `asCaDebug` (`asCa.c:102`), `atExitDebug` (`epicsExit.c:91`),
-//! `CASDEBUG` (`camessage.c:328`), `dbAccessDebugPUTF`
-//! (`dbAccess.c:1269`), `dbJLinkDebug` (`dbJLink.c:33`), `lnkDebug_debug`
-//! (`lnkDebug.c:33`), `logClientDebug` (`logClient.c:73`). Every one
+//! `CASDEBUG` (`camessage.c:328`), `dbJLinkDebug` (`dbJLink.c:33`),
+//! `lnkDebug_debug` (`lnkDebug.c:33`), `logClientDebug` (`logClient.c:73`).
+//! Every one
 //! guards `printf`/`errlogPrintf` statements in its own C file, and this
 //! port carries no equivalent statements for the knob to switch on.
 //!
@@ -55,7 +55,7 @@
 //! workspace calls `mlockall`. `freeListBypass` — it turns off the
 //! recycling pool in `freeListLib.c:61`, which Rust allocation replaces.
 //!
-//! # The thirteenth, which C's 24 do not include
+//! # The fourteenth, which C's 24 do not include
 //!
 //! `scanParallelThreadsDefault`. `dbCore.dbd:33` declares it on the
 //! parallel-scan branch this port tracks (epics-base #998) and R7.0.10
@@ -106,8 +106,9 @@ static VARIABLES: LazyLock<Mutex<BTreeMap<&'static str, VarDef>>> = LazyLock::ne
 /// The knobs C registers from a `.dbd` `variable()` line rather than from
 /// a C file — seven out of the record `.dbd`s via the generated
 /// `<app>_registerRecordDeviceDriver` (`registerRecordDeviceDriver.pl:270`)
-/// and `callbackParallelThreadsDefault` and `scanParallelThreadsDefault`
-/// out of `dbCore.dbd:32-33`.
+/// and `dbAccessDebugPUTF`, `dbTemplateMaxVars`,
+/// `callbackParallelThreadsDefault` and `scanParallelThreadsDefault` out of
+/// `dbCore.dbd:26-33`.
 /// This port resolves its vendored `.dbd`s at build time and has no such
 /// runtime registrar to hang them off, so the table is born holding them;
 /// that is what keeps it and
@@ -165,6 +166,16 @@ fn seeded_knobs() -> Vec<VarDef> {
                 set: |value| crate::server::db_loader::set_db_template_max_vars(value as i32),
             },
         },
+        // C `dbAccessDebugPUTF` — `dbCore.dbd:26`, an `int` global
+        // (`dbAccess.c:69`) that a put-driven process reads when it defers
+        // a TPRO record to RPRO.
+        VarDef {
+            name: "dbAccessDebugPUTF",
+            access: VarAccess::Int {
+                get: || crate::server::database::db_access_debug_putf() as i64,
+                set: |value| crate::server::database::set_db_access_debug_putf(value as i32),
+            },
+        },
         VarDef {
             name: "boHIGHlimit",
             access: VarAccess::Double {
@@ -217,6 +228,16 @@ fn seeded_knobs() -> Vec<VarDef> {
     ]
 }
 
+/// The variable half of C `iocshFree` (`iocsh.cpp:796-802`): the table goes
+/// back to what it is born holding, the knobs C's next
+/// `registerRecordDeviceDriver` registers again.
+pub(super) fn free() {
+    *VARIABLES.lock().unwrap_or_else(|e| e.into_inner()) = seeded_knobs()
+        .into_iter()
+        .map(|def| (def.name, def))
+        .collect();
+}
+
 /// C `iocshRegisterVariable`. Re-registering the same name is a no-op,
 /// which is what C's `found` branch amounts to for a table whose entries
 /// all point at their own global.
@@ -257,43 +278,16 @@ pub(crate) fn register(registry: &mut CommandRegistry) {
     registry.register(cmd_var());
 }
 
-/// C `strtol(s, &endp, 0)` with the `*endp == '\0'` whole-string check
-/// `varHandler` applies: leading whitespace is skipped, then an optional
-/// sign, then `0x` hex, a leading `0` octal, or decimal. Anything left
-/// over rejects the value.
-fn strtol_base0(s: &str) -> Option<i64> {
-    // C's `strtol` skips leading whitespace before it converts anything,
-    // so `var X " 1"` sets X to 1 there and must here.
-    let s = s.trim_start();
-    let (neg, digits) = match s.strip_prefix('-') {
-        Some(rest) => (true, rest),
-        None => (false, s.strip_prefix('+').unwrap_or(s)),
-    };
-    let magnitude = if let Some(hex) = digits
-        .strip_prefix("0x")
-        .or_else(|| digits.strip_prefix("0X"))
-    {
-        i64::from_str_radix(hex, 16).ok()?
-    } else if digits.len() > 1 && digits.starts_with('0') {
-        i64::from_str_radix(&digits[1..], 8).ok()?
-    } else {
-        digits.parse::<i64>().ok()?
-    };
-    Some(if neg { -magnitude } else { magnitude })
-}
-
 /// C `varHandler(v, NULL)` — `int %s = %d` / `double %s = %g` on stdout
 /// (`iocsh.cpp:1400-1408`). The `%g` is a bare one, so six significant
-/// digits, and [`crate::server::records::printf::format_g`] is the port's glibc-differenced printer for
-/// it rather than a Rust float format that would spell `100000` as
-/// `100000.0`.
+/// digits.
 fn show(ctx: &CommandContext, def: &VarDef) {
     match &def.access {
         VarAccess::Int { get, .. } => ctx.println(&format!("int {} = {}", def.name, get())),
         VarAccess::Double { get, .. } => ctx.println(&format!(
             "double {} = {}",
             def.name,
-            crate::server::records::printf::format_g(get(), 6)
+            epics_libcom_rs::cfmt::CFloat(get()).g()
         )),
     }
 }
@@ -322,11 +316,13 @@ fn cmd_var() -> CommandDef {
         ),
         |args: &[ArgValue], ctx: &CommandContext| {
             let name = match args.first() {
-                Some(ArgValue::String(s)) => Some(s.as_str()),
+                Some(ArgValue::String(s)) => Some(s),
                 _ => None,
             };
+            // `strtol`/`epicsStrtod` read bytes; a non-UTF-8 one is no
+            // digit to either parser.
             let value = match args.get(1) {
-                Some(ArgValue::String(s)) => Some(s.as_str()),
+                Some(ArgValue::String(s)) => Some(s.to_str_lossy()),
                 _ => None,
             };
             let table = VARIABLES.lock().unwrap_or_else(|e| e.into_inner());
@@ -360,30 +356,37 @@ fn cmd_var() -> CommandDef {
             };
 
             // With a value the name is looked up exactly, not globbed.
-            let Some(def) = name.and_then(|name| table.get(name)) else {
+            let Some(def) = name
+                .and_then(|name| name.to_str().ok())
+                .and_then(|name| table.get(name))
+            else {
                 // The set path's own sentence, unframed for the same
                 // reason (`iocsh.cpp:1468-1472`).
-                ctx.eprintln(&format!("No known var '{}'.", name.unwrap_or_default()));
+                let name = name.map(|n| n.to_str_lossy()).unwrap_or_default();
+                ctx.eprintln(&format!("No known var '{name}'."));
                 return Ok(CommandOutcome::Failed);
             };
             match &def.access {
-                VarAccess::Int { set, .. } => match strtol_base0(value) {
-                    Some(parsed) => set(parsed),
+                // `strtol(setString, &endp, 0)` taken whole and non-empty,
+                // its `long` stored through an `int *` (iocsh.cpp:1420-1428).
+                VarAccess::Int { set, .. } => match crate::types::c_parse::strtol(&*value, 0) {
+                    (parsed, end) if !value.is_empty() && end == value.len() => {
+                        set(i64::from(parsed as i32))
+                    }
                     // C leaves the variable alone and prints, but does
                     // not fail the command (`varHandler` never calls
                     // `iocshSetError`).
-                    None => {
-                        ctx.eprintln(&format!("Invalid integer, var '{}' not changed.", def.name))
-                    }
+                    _ => ctx.eprintln(&format!("Invalid integer, var '{}' not changed.", def.name)),
                 },
                 // C reaches `epicsStrtod` from here and from `cvtArg`
                 // alike, so both go through the one port of it.
-                VarAccess::Double { set, .. } => match super::registry::epics_strtod_whole(value) {
-                    Some(parsed) => set(parsed),
-                    None => {
-                        ctx.eprintln(&format!("Invalid double, var '{}' not changed.", def.name))
+                VarAccess::Double { set, .. } => {
+                    match super::registry::epics_strtod_whole(&value) {
+                        Some(parsed) => set(parsed),
+                        None => ctx
+                            .eprintln(&format!("Invalid double, var '{}' not changed.", def.name)),
                     }
-                },
+                }
             }
             Ok(CommandOutcome::Continue)
         },
@@ -418,7 +421,7 @@ mod tests {
         let mut reg = CommandRegistry::new();
         super::super::commands::register_builtins(&mut reg);
         let cmd = reg.get("var").expect("`var` must be registered").clone();
-        let tokens: Vec<String> = tokens.iter().map(|t| (*t).to_string()).collect();
+        let tokens: Vec<IocshString> = tokens.iter().map(|t| IocshString::from(*t)).collect();
         let args = parse_args(&tokens, &cmd.args).unwrap();
         let out_tmp = tempfile::NamedTempFile::new().unwrap();
         let err_tmp = tempfile::NamedTempFile::new().unwrap();
@@ -695,7 +698,7 @@ mod tests {
             .get("scanParallelThreads")
             .expect("`scanParallelThreads` must be registered")
             .clone();
-        let tokens: Vec<String> = ["0", "-1"].iter().map(|t| (*t).to_string()).collect();
+        let tokens: Vec<IocshString> = ["0", "-1"].iter().map(|t| IocshString::from(*t)).collect();
         let args = parse_args(&tokens, &cmd.args).unwrap();
         assert!(matches!(
             cmd.handler.call(&args, &ctx),
@@ -779,14 +782,35 @@ mod tests {
         crate::server::records::seq::set_seq_dly_limit(100000.0);
     }
 
+    /// C `strtol(setString, &endp, 0)` then the `int` store (`iocsh.cpp:
+    /// 1422-1424`): glibc's base-0 prefixes, `ERANGE` saturation truncated to
+    /// `int`, and only an `endp` at the end accepted.
     #[test]
-    fn strtol_base0_takes_hex_octal_and_sign() {
-        assert_eq!(strtol_base0("0x10"), Some(16));
-        assert_eq!(strtol_base0("010"), Some(8));
-        assert_eq!(strtol_base0("-3"), Some(-3));
-        assert_eq!(strtol_base0("12"), Some(12));
-        assert_eq!(strtol_base0(""), None);
-        assert_eq!(strtol_base0("1 "), None);
-        assert_eq!(strtol_base0("nope"), None);
+    fn an_int_var_takes_c_strtol_into_an_int() {
+        use crate::server::db_loader::{db_template_max_vars, set_db_template_max_vars};
+        use crate::types::c_parse::long_to_int;
+
+        let ctx = make_ctx();
+        let restore = db_template_max_vars();
+        let long64 = std::ffi::c_long::BITS == 64;
+        for (token, want) in [
+            ("0x10", 16),
+            ("010", 8),
+            ("0b101", 5),
+            ("-3", -3),
+            (" 12", 12),
+            ("4294967297", if long64 { 1 } else { i32::MAX }),
+            ("99999999999999999999", long_to_int(std::ffi::c_long::MAX)),
+            ("-99999999999999999999", long_to_int(std::ffi::c_long::MIN)),
+            ("", -1),
+            ("1 ", -1),
+            ("nope", -1),
+            ("+-1", -1),
+        ] {
+            set_db_template_max_vars(-1);
+            assert_eq!(run_var(&ctx, &["dbTemplateMaxVars", token]).unwrap(), "");
+            assert_eq!(db_template_max_vars(), want, "{token:?}");
+        }
+        set_db_template_max_vars(restore);
     }
 }

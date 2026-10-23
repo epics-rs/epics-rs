@@ -1,4 +1,5 @@
 use epics_base_rs::types::{DbFieldType, EpicsValue};
+use epics_pva_rs::pvdata::convert::{parse_to_i64, parse_to_u64};
 use epics_pva_rs::pvdata::{PvArray, PvField, ScalarType, ScalarValue, TypedScalarArray};
 
 /// Convert EPICS DBF type to PVA ScalarType.
@@ -240,11 +241,7 @@ fn scalar_to_i64(val: &ScalarValue) -> Result<i64, ScalarConvertError> {
             }
         }
         ScalarValue::String(s) => {
-            // pvxs `parseTo<int64_t>` = `std::stoll(s,&idx,0)`: base-0 radix
-            // (`0x` hex, leading-`0` octal). Reuse the CA path's C-radix
-            // parser so the QSRV PUT accepts the same forms (and still
-            // rejects empty/garbage).
-            EpicsValue::parse_int(&s.as_str_lossy()).map_err(|_| ScalarConvertError {
+            parse_to_i64(&s.as_str_lossy()).map_err(|_| ScalarConvertError {
                 value: s.as_str_lossy().into_owned(),
                 target: "i64",
             })?
@@ -276,10 +273,7 @@ fn scalar_to_u64(val: &ScalarValue) -> Result<u64, ScalarConvertError> {
             }
         }
         ScalarValue::String(s) => {
-            // pvxs `parseTo<uint64_t>` = `std::stoull(s,&idx,0)`: base-0 radix.
-            // Reuse the CA path's C-radix unsigned parser (keeps the full
-            // 64-bit range and `strtoul` sign-wrap behavior).
-            EpicsValue::parse_uint(&s.as_str_lossy()).map_err(|_| ScalarConvertError {
+            parse_to_u64(&s.as_str_lossy()).map_err(|_| ScalarConvertError {
                 value: s.as_str_lossy().into_owned(),
                 target: "u64",
             })?
@@ -710,6 +704,26 @@ mod tests {
             scalar_to_epics_typed(&ScalarValue::String("0xFF".into()), DbFieldType::UInt64)
                 .unwrap(),
             EpicsValue::UInt64(255)
+        );
+    }
+
+    /// The string PUT is pvxs `parseTo` itself: a signed hex, and only C
+    /// `isspace` around the number (util.cpp:786-816).
+    #[test]
+    fn string_to_numeric_put_is_pvxs_parse_to() {
+        assert_eq!(
+            scalar_to_epics_typed(&ScalarValue::String("-0x10".into()), DbFieldType::Int64)
+                .unwrap(),
+            EpicsValue::Int64(-16)
+        );
+        assert_eq!(
+            scalar_to_epics_typed(&ScalarValue::String("0b11".into()), DbFieldType::UInt64)
+                .unwrap(),
+            EpicsValue::UInt64(3)
+        );
+        assert!(
+            scalar_to_epics_typed(&ScalarValue::String("\u{a0}5".into()), DbFieldType::Int64)
+                .is_err()
         );
     }
 

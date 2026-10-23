@@ -29,7 +29,7 @@
 //!   writes into a *sized* destination. `epicsStrSnPrintEscaped` is a macro alias
 //!   for it (epicsString.h:125). This is what `asynShowEos`
 //!   (asynShellCommands.c:305), the echo interpose (asynInterposeEcho.c:73-74),
-//!   the trace errlog branch (asynManager.c:3159) and every `asynRecord` field
+//!   the trace errlog branch (asynManager.c:3184) and every `asynRecord` field
 //!   (asynRecord.c:725,1629,2005) escape through — each with its own buffer size,
 //!   which the caller must state.
 //! - [`print_escaped`] — `epicsStrPrintEscaped` (epicsString.c:230-269), the

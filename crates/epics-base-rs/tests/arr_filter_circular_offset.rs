@@ -44,12 +44,10 @@ async fn rotated_compress_db() -> PvDatabase {
     db.add_record("CB", Box::new(CompressRecord::new(5, 4)))
         .await
         .unwrap();
-    {
-        let rec = db.get_record("CB").unwrap();
-        let mut inst = rec.write();
-        inst.put_common_field("INP", EpicsValue::String("src".into()))
-            .unwrap();
-    }
+    db.put_pv_no_process("CB.INP", EpicsValue::String("src".into()))
+        .await
+        .unwrap();
+
     for i in 0..7 {
         db.put_pv("src", EpicsValue::Double(i as f64))
             .await
@@ -77,18 +75,17 @@ fn through_arr(values: Vec<f64>, start: i64, end: i64) -> Vec<f64> {
         incr: 1,
         end,
     };
-    let event = FilteredMonitorEvent::new(MonitorEvent {
-        snapshot: std::sync::Arc::new(Snapshot::new(
+    let event = FilteredMonitorEvent::new(MonitorEvent::read_log(
+        &mut Snapshot::new(
             EpicsValue::DoubleArray(values.into()),
             0,
             0,
             std::time::SystemTime::UNIX_EPOCH,
-        )),
-        origin: 0,
-        mask: EventMask::VALUE,
-    });
+        ),
+        EventMask::VALUE,
+    ));
     let out = ArrayFilter::new(cfg).apply(event).unwrap();
-    match std::sync::Arc::unwrap_or_clone(out.event.snapshot).value {
+    match out.event.value().as_value().cloned().unwrap() {
         EpicsValue::DoubleArray(v) => v.to_vec(),
         other => panic!("expected DoubleArray, got {other:?}"),
     }

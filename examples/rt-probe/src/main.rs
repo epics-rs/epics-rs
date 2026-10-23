@@ -19,17 +19,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// and PVA servers, which this backend does not compile.
 #[cfg(all(target_os = "linux", exec_backend))]
 fn main() {
-    eprintln!(
+    epics_base_rs::runtime::task::refuse_backend(
         "rt-probe measures the async CA/PVA servers; this build selects the \
          reactor-free backend (EPICS_RS_BUILD_EXEC_BACKEND=thread), which does not
-         have them."
-    );
-    std::process::exit(2);
+         have them.",
+    )
 }
 
 #[cfg(not(target_os = "linux"))]
 fn main() {
-    eprintln!(
+    epics_base_rs::stderr_println!(
         "rt-probe measures Linux RT scheduling (SCHED_FIFO, affinity, PI mutexes); \
          there is nothing for it to probe on this OS."
     );

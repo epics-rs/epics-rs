@@ -1,0 +1,25 @@
+[package]
+name = "epics-seq-rs"
+version.workspace = true
+edition.workspace = true
+description = "Rust port of the EPICS sequencer run-time (seq, pv) that snc-rs generated programs run on"
+license-file = "LICENSE"
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+epics-base-rs = { workspace = true }
+epics-libcom-rs = { workspace = true }
+parking_lot = "0.12"
+
+[dev-dependencies]
+async-trait = "0.1"
+epics-ca-rs = { workspace = true }
+# Dev-only: `#[epics_test]`, the backend-selected test driver.
+epics-macros-rs = { workspace = true }
+# Dev-only, path-only: the one budget a test puts on a fact.
+fact-budget = { path = "../fact-budget" }
+libc = "0.2"
+serial_test = "3"
+tempfile = "3"
+tokio = { version = "1", features = ["full", "test-util"] }

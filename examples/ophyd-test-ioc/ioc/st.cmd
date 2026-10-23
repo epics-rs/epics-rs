@@ -3,13 +3,13 @@
 
 # ===== Simulated Motors =====
 # 6 motors matching ophyd test expectations
-# simMotorCreate(port, lowLimit, highLimit, pollMs)
-simMotorCreate("mtr1", -100, 100, 100)
-simMotorCreate("mtr2", -100, 100, 100)
-simMotorCreate("mtr3", -100, 100, 100)
-simMotorCreate("mtr4", -100, 100, 100)
-simMotorCreate("mtr5", -100, 100, 100)
-simMotorCreate("mtr6", -100, 100, 100)
+# simMotorCreate(port, lowLimit, highLimit, pollMs), limits in steps
+simMotorCreate("mtr1", -100000, 100000, 100)
+simMotorCreate("mtr2", -100000, 100000, 100)
+simMotorCreate("mtr3", -100000, 100000, 100)
+simMotorCreate("mtr4", -100000, 100000, 100)
+simMotorCreate("mtr5", -100000, 100000, 100)
+simMotorCreate("mtr6", -100000, 100000, 100)
 
 dbLoadRecords("$(MOTOR)/motor.template", "P=XF:31IDA-OP{Tbl-Ax:,M=X1}Mtr,PORT=mtr1,VELO=1.0,ACCL=0.5,MRES=0.001")
 dbLoadRecords("$(MOTOR)/motor.template", "P=XF:31IDA-OP{Tbl-Ax:,M=X2}Mtr,PORT=mtr2,VELO=1.0,ACCL=0.5,MRES=0.001")
@@ -19,13 +19,13 @@ dbLoadRecords("$(MOTOR)/motor.template", "P=XF:31IDA-OP{Tbl-Ax:,M=X5}Mtr,PORT=mt
 dbLoadRecords("$(MOTOR)/motor.template", "P=XF:31IDA-OP{Tbl-Ax:,M=X6}Mtr,PORT=mtr6,VELO=1.0,ACCL=0.5,MRES=0.001")
 
 # Also load sim: prefix motors used by some tests
-simMotorCreate("sim_mtr1", -100, 100, 100)
-simMotorCreate("sim_mtr2", -100, 100, 100)
+simMotorCreate("sim_mtr1", -100000, 100000, 100)
+simMotorCreate("sim_mtr2", -100000, 100000, 100)
 dbLoadRecords("$(MOTOR)/motor.template", "P=sim:,M=mtr1,PORT=sim_mtr1,VELO=1.0,ACCL=0.5,MRES=0.001")
 dbLoadRecords("$(MOTOR)/motor.template", "P=sim:,M=mtr2,PORT=sim_mtr2,VELO=1.0,ACCL=0.5,MRES=0.001")
 
 # Fake motor prefix used in tests
-simMotorCreate("fake_mtr", -100, 100, 100)
+simMotorCreate("fake_mtr", -100000, 100000, 100)
 dbLoadRecords("$(MOTOR)/motor.template", "P=XF:31IDA-OP{Tbl-Ax:,M=FakeMtr},PORT=fake_mtr,VELO=1.0,ACCL=0.5,MRES=0.001")
 
 # ===== Sensors =====
@@ -38,7 +38,7 @@ dbLoadRecords("$(OPHYD_TEST_IOC)/db/sensor.template", "P=XF:31IDA-BI{Dev:5},R=E-
 dbLoadRecords("$(OPHYD_TEST_IOC)/db/sensor.template", "P=XF:31IDA-BI{Dev:6},R=E-I")
 
 # ===== SimDetector AreaDetector =====
-simDetectorConfig("SIM", 640, 480, 50000000)
+simDetectorConfig("SIM", 640, 480, 1, 0, 50000000)
 
 # Load SimDetector records with XF:31IDA-BI{Cam:Tbl}: prefix
 epicsEnvSet("EPICS_DB_INCLUDE_PATH", "$(ADSIMDETECTOR)/db:$(ADCORE)/db")
@@ -55,11 +55,19 @@ epicsEnvSet("CBUFFS",     "500")
 epicsEnvSet("NELEMENTS",  "307200")
 epicsEnvSet("FTVL",       "SHORT")
 epicsEnvSet("TYPE",       "Int16")
-< $(ADCORE)/ioc/commonPlugins.cmd
+# image1, which commonPlugins.cmd leaves to the st.cmd as C's does
+NDStdArraysConfigure("IMAGE1", $(QSIZE), 0, "$(PORT)", 0)
+dbLoadRecords("NDStdArrays.template", "P=$(PREFIX),R=image1:,PORT=IMAGE1,NDARRAY_PORT=$(PORT),TYPE=$(TYPE=Int8),FTVL=$(FTVL=UCHAR),NELEMENTS=$(NELEMENTS)")
+< $(ADCORE)/iocBoot/commonPlugins.cmd
 
 # Also load with ADSIM: prefix for ophyd test compatibility.
-# Configure commands are idempotent (skip if port already exists),
-# so only record templates are created with the new prefix.
+# The Configure lines fail here as in C (the ports exist); only the
+# record templates load with the new prefix.
 epicsEnvSet("PREFIX", "ADSIM:")
 dbLoadRecords("$(ADSIMDETECTOR)/db/simDetector.template", "P=ADSIM:,R=cam1:,PORT=SIM,ADDR=0,TIMEOUT=1")
-< $(ADCORE)/ioc/commonPlugins.cmd
+# image1, which commonPlugins.cmd leaves to the st.cmd as C's does
+NDStdArraysConfigure("IMAGE1", $(QSIZE), 0, "$(PORT)", 0)
+dbLoadRecords("NDStdArrays.template", "P=$(PREFIX),R=image1:,PORT=IMAGE1,NDARRAY_PORT=$(PORT),TYPE=$(TYPE=Int8),FTVL=$(FTVL=UCHAR),NELEMENTS=$(NELEMENTS)")
+< $(ADCORE)/iocBoot/commonPlugins.cmd
+
+iocInit()

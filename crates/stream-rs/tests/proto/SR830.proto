@@ -1,0 +1,53 @@
+#Terminator = CR;
+extraInput=ignore;
+
+
+snap {
+   out "SNAP?1,2,3,4,9"; 
+   in "%(\$1:X.VAL)f,%(\$1:Y.VAL)f,%(\$1:R.VAL)f,%(\$1:TH.VAL)f,%(\$1:REF.VAL)f";
+}   
+
+snap_aux {
+   out "SNAP?5,6,7,8"; 
+   in "%(\$1:ADC1.VAL)f,%(\$1:ADC2.VAL)f,%(\$1:ADC3.VAL)f,%(\$1:ADC4.VAL)f";
+}   
+
+disp1 {
+   out "DDEF 1,%(\$1:DispCh1)d,%(\$1:RatioCh1)d"; 
+}   
+
+disp2 {
+   out "DDEF 2,%(\$1:DispCh2)d,%(\$1:RatioCh2)d"; 
+}   
+
+oexp1 {
+   out "OEXP 1,%(\$1:OffsetCh1)f,%(\$1:ExpandCh1)d"; 
+}   
+
+oexp2 {
+   out "OEXP 2,%(\$1:OffsetCh2)f,%(\$1:ExpandCh2)d"; 
+}   
+
+fpop1 {
+   out "FPOP 1,%(\$1:OutputCh1)d"; 
+}   
+
+fpop2 {
+   out "FPOP 2,%(\$1:OutputCh2)d"; 
+}   
+
+auxv1 {
+   out "AUXV 1,%(\$1:AuxOutCh1)f"; 
+}   
+
+auxv2 {
+   out "AUXV 2,%(\$1:AuxOutCh2)f"; 
+}   
+
+auxv3 {
+   out "AUXV 3,%(\$1:AuxOutCh3)f"; 
+}   
+
+auxv4 {
+   out "AUXV 4,%(\$1:AuxOutCh4)f"; 
+}   

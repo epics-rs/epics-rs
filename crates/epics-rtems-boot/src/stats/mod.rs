@@ -73,7 +73,7 @@
 mod backend;
 #[cfg(target_os = "vxworks")]
 #[path = "vxworks.rs"]
-mod backend;
+pub(crate) mod backend;
 #[cfg(not(any(all(target_os = "rtems", rtems_boot_linked), target_os = "vxworks")))]
 #[path = "unsupported.rs"]
 mod backend;

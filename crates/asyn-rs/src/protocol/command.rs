@@ -51,36 +51,48 @@ pub enum PortCommand {
         index: usize,
     },
     Int32ArrayRead {
+        /// The caller's buffer contents the driver reads into.
+        data: Vec<i32>,
         max_elements: usize,
     },
     Int32ArrayWrite {
         data: Vec<i32>,
     },
     Float64ArrayRead {
+        /// The caller's buffer contents the driver reads into.
+        data: Vec<f64>,
         max_elements: usize,
     },
     Float64ArrayWrite {
         data: Vec<f64>,
     },
     Int8ArrayRead {
+        /// The caller's buffer contents the driver reads into.
+        data: Vec<i8>,
         max_elements: usize,
     },
     Int8ArrayWrite {
         data: Vec<i8>,
     },
     Int16ArrayRead {
+        /// The caller's buffer contents the driver reads into.
+        data: Vec<i16>,
         max_elements: usize,
     },
     Int16ArrayWrite {
         data: Vec<i16>,
     },
     Int64ArrayRead {
+        /// The caller's buffer contents the driver reads into.
+        data: Vec<i64>,
         max_elements: usize,
     },
     Int64ArrayWrite {
         data: Vec<i64>,
     },
     Float32ArrayRead {
+        /// The caller's buffer contents the driver reads into.
+        data: Vec<f32>,
         max_elements: usize,
     },
     Float32ArrayWrite {
@@ -92,7 +104,7 @@ pub enum PortCommand {
     NoIo,
     Connect,
     Disconnect,
-    /// `ASYN_DESTRUCTIBLE` port shutdown — C asynManager.c:2251.
+    /// `ASYN_DESTRUCTIBLE` port shutdown — C asynManager.c:2253.
     ShutdownPort,
     ConnectAddr,
     DisconnectAddr,
@@ -114,7 +126,7 @@ pub enum PortCommand {
     /// Query whether auto-connect is enabled for the port.
     GetAutoConnect,
     /// C's `allDevices` argument to `blockProcessCallback`
-    /// (asynManager.c:1692): `true` takes the port-wide holder, `false` the
+    /// (asynManager.c:1694): `true` takes the port-wide holder, `false` the
     /// holder of the `dpCommon` the request's own `addr` resolves to. The
     /// variant was a unit before, which is the wire shape of a port-wide
     /// block only — an externally-tagged unit variant and a struct variant do
@@ -139,6 +151,8 @@ pub enum PortCommand {
     CallParamCallbacks {
         addr: i32,
     },
+    /// The wire carries no updates, as [`Self::CallParamCallbacks`]'s.
+    SetParams,
     GetOption {
         key: String,
     },
@@ -153,6 +167,14 @@ pub enum PortCommand {
     /// `RequestOp::WithDriver`. Code does not serialize, so only the kind of
     /// request survives; converting back yields a call the actor refuses.
     WithDriver,
+    /// `RequestOp::LockPort`, which carries code the same way; converting back
+    /// yields a call the actor refuses.
+    LockPort,
+    /// `RequestOp::Cell`, which carries code the same way; it converts back to
+    /// the same refused call `WithDriver` does.
+    Callback {
+        connect_queue: bool,
+    },
     /// Set input EOS bytes — C `pasynOctet->setInputEos` /
     /// asynRecord IEOS.
     SetInputEos {
@@ -217,6 +239,10 @@ pub enum PortCommand {
     /// `locateDevice(..., TRUE)`. Appended last: the variant order is the
     /// wire encoding.
     ConnectUser,
+    /// C `pasynManager->exceptionDisconnect`. Appended last, as above.
+    ExceptionDisconnect,
+    /// C `pasynManager->exceptionConnect`. Appended last, as above.
+    ExceptionConnect,
 }
 
 #[cfg(test)]
@@ -248,11 +274,17 @@ mod tests {
             },
             PortCommand::EnumRead,
             PortCommand::EnumWrite { index: 2 },
-            PortCommand::Int32ArrayRead { max_elements: 100 },
+            PortCommand::Int32ArrayRead {
+                data: vec![],
+                max_elements: 100,
+            },
             PortCommand::Int32ArrayWrite {
                 data: vec![1, 2, 3],
             },
-            PortCommand::Float64ArrayRead { max_elements: 50 },
+            PortCommand::Float64ArrayRead {
+                data: vec![],
+                max_elements: 50,
+            },
             PortCommand::Float64ArrayWrite {
                 data: vec![1.0, 2.0],
             },
@@ -276,6 +308,7 @@ mod tests {
                 iface: Some("asynFloat64".into()),
             },
             PortCommand::CallParamCallbacks { addr: 0 },
+            PortCommand::SetParams,
             PortCommand::GetOption { key: "baud".into() },
             PortCommand::SetOption {
                 key: "baud".into(),
@@ -303,7 +336,13 @@ mod tests {
             PortCommand::GpibIfc,
             PortCommand::GpibRen { enable: true },
             PortCommand::WithDriver,
+            PortCommand::LockPort,
+            PortCommand::Callback {
+                connect_queue: true,
+            },
             PortCommand::ConnectUser,
+            PortCommand::ExceptionDisconnect,
+            PortCommand::ExceptionConnect,
         ];
         for cmd in commands {
             let json = serde_json::to_string(&cmd).unwrap();

@@ -1,0 +1,8 @@
+record(ai, "SRC") {
+    field(VAL, "41")
+}
+record(calcout, "CO") {
+    field(CALC, "A+B")
+    field(INPA, "1")
+    field(INPB, "2")
+}

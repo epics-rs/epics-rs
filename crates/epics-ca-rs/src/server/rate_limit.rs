@@ -139,19 +139,21 @@ pub struct RateLimitConfig {
 
 impl RateLimitConfig {
     pub fn from_env() -> Self {
-        let msgs_per_sec = epics_base_rs::runtime::env::get("EPICS_CAS_RATE_LIMIT_MSGS_PER_SEC")
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
-        let burst = epics_base_rs::runtime::env::get("EPICS_CAS_RATE_LIMIT_BURST")
+        let msgs_per_sec =
+            epics_base_rs::runtime::env::get_lossy("EPICS_CAS_RATE_LIMIT_MSGS_PER_SEC")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+        let burst = epics_base_rs::runtime::env::get_lossy("EPICS_CAS_RATE_LIMIT_BURST")
             .and_then(|s| s.parse().ok())
             .unwrap_or(if msgs_per_sec > 0 {
                 msgs_per_sec * 4
             } else {
                 0
             });
-        let strike_threshold = epics_base_rs::runtime::env::get("EPICS_CAS_RATE_LIMIT_STRIKES")
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(100);
+        let strike_threshold =
+            epics_base_rs::runtime::env::get_lossy("EPICS_CAS_RATE_LIMIT_STRIKES")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(100);
         Self {
             msgs_per_sec,
             burst,

@@ -96,20 +96,20 @@ struct MqttConfigHandler {
 impl CommandHandler for MqttConfigHandler {
     fn call(&self, args: &[ArgValue], ctx: &CommandContext) -> CommandResult {
         let port_name = match &args[0] {
-            ArgValue::String(s) => s.clone(),
+            ArgValue::String(s) => s.to_str()?.to_owned(),
             _ => return Err("portName required".into()),
         };
         let broker_url = match &args[1] {
-            ArgValue::String(s) => s.clone(),
+            ArgValue::String(s) => s.to_str()?.to_owned(),
             _ => return Err("brokerUrl required".into()),
         };
         let client_id = match &args[2] {
-            ArgValue::String(s) => s.clone(),
+            ArgValue::String(s) => s.to_str()?.to_owned(),
             _ => return Err("clientId required".into()),
         };
         let qos = resolve_iocsh_qos(&args[3]);
         let conn_pv_name = match &args[4] {
-            ArgValue::String(s) if !s.is_empty() => Some(s.clone()),
+            ArgValue::String(s) if !s.is_empty() => Some(s.to_str()?.to_owned()),
             _ => None,
         };
 
@@ -122,13 +122,17 @@ impl CommandHandler for MqttConfigHandler {
             ..MqttConfig::default()
         };
 
+        // `MqttDriver` derives from `Autoparam::Driver` and so from
+        // `asynPortDriver` (drvMqtt.h:23, autoparamDriver.h:245): its base
+        // registers the port before the body builds anything.
+        let claim = match asyn_rs::manager::claim_port_driver(&port_name) {
+            Ok(claim) => claim,
+            Err(e) => return Ok(ctx.cxx_error(e)),
+        };
+
         // Pre-bind config overlay (Z2M `normalize_on_off`); empty for generic
         // MQTT. Topic params themselves are created on demand when records bind.
         let overlay = take_pending_topics(&port_name);
-        println!(
-            "mqttDriverConfigure: port={port_name} broker={}:{}",
-            config.broker_host, config.broker_port,
-        );
 
         let (publish_tx, publish_rx) = tokio::sync::mpsc::unbounded_channel();
         // Shared broker-connection flag: the event loop is the sole writer, the
@@ -149,24 +153,32 @@ impl CommandHandler for MqttConfigHandler {
         // port actor takes the driver, for the same reason `shutdown` is.
         let teardown_done = driver.teardown_ack();
 
-        // A port whose actor thread the OS refused is not a port: fail the
-        // command before the registration below claims the name for it. Same
-        // end state as C by a different route — `MqttDriver` derives from
-        // `Autoparam::Driver` and so from `asynPortDriver` (drvMqtt.h:23,
-        // autoparamDriver.h:245) and `mqttDriverConfigure` builds it with a
-        // bare `new` (drvMqtt.cpp:736-739), so a failed `registerPort` throws
-        // out of its constructor (asynPortDriver.cpp:4036-4040), iocsh catches
-        // it (iocsh.cpp:1269-1279) and st.cmd continues with the port missing.
-        // The `?` is the same error channel the duplicate-name failure below
-        // already uses.
-        let (runtime_handle, _actor_jh) =
-            create_port_runtime(driver, RuntimeConfig::default()).map_err(|e| e.to_string())?;
+        // A port whose actor thread the OS refused is not a port: dropping the
+        // claim frees the name. Same end state as C by a different route — a
+        // failed `registerPort` throws out of the constructor
+        // (asynPortDriver.cpp:4036-4040), iocsh catches it
+        // (iocsh.cpp:1269-1279) and st.cmd continues with the port missing.
+        // Both failures below report as that throw.
+        let Ok((runtime_handle, _actor_jh)) =
+            create_port_runtime(&claim, driver, RuntimeConfig::default())
+        else {
+            return Ok(
+                ctx.cxx_error(asyn_rs::manager::report_port_driver_register_failure(
+                    &port_name,
+                )),
+            );
+        };
         let port_handle = runtime_handle.port_handle().clone();
 
-        if let Err(e) = asyn_rs::asyn_record::register_port(&port_name, port_handle.clone()) {
+        let owner = ctx.db().scan_control().interrupt_gate();
+        if claim.publish(port_handle.clone(), owner).is_err() {
             // Nothing published this port, so ask the actor to stop.
             runtime_handle.shutdown();
-            return Err(e.to_string());
+            return Ok(
+                ctx.cxx_error(asyn_rs::manager::report_port_driver_register_failure(
+                    &port_name,
+                )),
+            );
         }
         // The registry above holds a live `PortHandle` for this port, which is
         // what keeps its actor alive; the `PortRuntimeHandle` may drop here.
@@ -191,18 +203,13 @@ impl CommandHandler for MqttConfigHandler {
             w.field("OSV", "NO_ALARM");
             w.end();
             // A bad `connPvName` (a space, `.`, `$`, `\'` or `"` — rejected by
-            // db_loader::validate_name) used to be discarded here and the
-            // success line printed anyway, so the IOC booted reporting a
-            // Connected PV that `dbl` never listed. The failure is carried to
-            // the end of the command instead of returned here, so the port
-            // this call already registered still gets its init hook and its
-            // event loop.
-            match crate::db_gen::load_generated_db("mqttDriverConfigure", &db_str, ctx) {
-                Ok(()) => println!("mqttDriverConfigure: connected PV = {pv_name}"),
-                Err(e) => {
-                    eprintln!("{e}");
-                    conn_pv_error = Some(e);
-                }
+            // db_loader::validate_name) is carried to the end of the command
+            // instead of returned here, so the port this call already
+            // registered still gets its init hook and its event loop. C's
+            // command is silent on success (drvMqtt.cpp:737-739); `dbl` lists
+            // the PV.
+            if let Err(e) = crate::db_gen::load_generated_db("mqttDriverConfigure", &db_str, ctx) {
+                conn_pv_error = Some(e);
             }
         }
 

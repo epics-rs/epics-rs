@@ -85,7 +85,7 @@ async fn poll_double(db: &PvDatabase, pv: &str, want: f64, label: &str) {
 /// Step 1 is a `WAITn` step into a CA link that resolves to nothing (no link
 /// set is registered, so the target has no DBF class — C's disconnected
 /// `CA_LINK`). C's `default:` arm makes no put and raises no `waiting`, so no
-/// `WTG1` event is ever emitted and the sequence runs straight through step 2.
+/// `WTG1 1` is ever emitted and the sequence runs straight through step 2.
 #[epics_macros_rs::epics_test]
 async fn r17_3_a_wait_step_with_an_unresolvable_lnk_never_raises_wtg() {
     let db = PvDatabase::new();
@@ -134,10 +134,16 @@ async fn r17_3_a_wait_step_with_an_unresolvable_lnk_never_raises_wtg() {
     // the write does (`processing.rs:3474-3477` runs the link writes, THEN
     // `notify_from_snapshot`), so "no event yet" is not "no event".
     epics_base_rs::runtime::task::sleep(Duration::from_millis(40)).await;
-    assert!(
-        wtg_rx.try_recv().is_err(),
+    // The start's clear posts WTG1 0 (sseqRecord.c:343); nothing else may.
+    let mut posted = Vec::new();
+    while let Ok(ev) = wtg_rx.try_recv() {
+        posted.push(ev.value().as_value().cloned());
+    }
+    assert_eq!(
+        posted,
+        [Some(EpicsValue::Short(0))],
         "C's `default:` arm makes no put and never sets `waiting`: a WAIT step \
-         whose LNK resolves to no class must emit NO WTG1 event at all"
+         whose LNK resolves to no class must emit no WTG1 1"
     );
     assert_eq!(
         db.get_pv("SS_NR.WTG1").unwrap(),

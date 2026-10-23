@@ -19,3 +19,8 @@ epics-base-rs = { workspace = true, optional = true }
 epics-pva-rs = { workspace = true, optional = true }
 epics-ca-rs = { workspace = true, optional = true }
 epics-bridge-rs = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile = "3"
+# Dev-only and path-only: the held-port rule for a port the child must bind.
+named-port = { path = "../../crates/named-port" }

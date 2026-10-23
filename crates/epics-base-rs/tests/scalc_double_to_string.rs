@@ -121,7 +121,7 @@ fn the_record_sval_is_rendered_at_prec() {
     let mut rec = ScalcoutRecord::new();
     rec.put_field("CALC", EpicsValue::String("A+0.5".into()))
         .unwrap();
-    rec.special("CALC", true).unwrap();
+    rec.special("CALC", true, &Default::default()).unwrap();
     rec.put_field("A", EpicsValue::Double(2.0)).unwrap();
     rec.process().unwrap();
     assert_eq!(rec.val, 2.5);
@@ -146,7 +146,7 @@ fn a_string_marked_program_ignores_prec() {
     // `AA` is FETCH_AA, which is what stamps the program USES_STRING.
     rec.put_field("CALC", EpicsValue::String("AA+0.5".into()))
         .unwrap();
-    rec.special("CALC", true).unwrap();
+    rec.special("CALC", true, &Default::default()).unwrap();
     rec.put_field("AA", EpicsValue::String("2".into())).unwrap();
     for prec in [0i16, 2, 8] {
         rec.put_field("PREC", EpicsValue::Short(prec)).unwrap();
@@ -163,10 +163,10 @@ fn the_record_osv_is_the_c_conversion_of_oval() {
     let mut rec = ScalcoutRecord::new();
     rec.put_field("CALC", EpicsValue::String("A".into()))
         .unwrap();
-    rec.special("CALC", true).unwrap();
+    rec.special("CALC", true, &Default::default()).unwrap();
     rec.put_field("OCAL", EpicsValue::String("A*2".into()))
         .unwrap();
-    rec.special("OCAL", true).unwrap();
+    rec.special("OCAL", true, &Default::default()).unwrap();
     rec.put_field("DOPT", EpicsValue::Short(1)).unwrap(); // Use OCAL
     rec.put_field("OOPT", EpicsValue::Short(0)).unwrap(); // Every Time
     rec.put_field("A", EpicsValue::Double(0.5)).unwrap();
@@ -187,7 +187,7 @@ fn a_string_result_is_not_reformatted() {
     let mut rec = ScalcoutRecord::new();
     rec.put_field("CALC", EpicsValue::String("\"3.5\"+\"x\"".into()))
         .unwrap();
-    rec.special("CALC", true).unwrap();
+    rec.special("CALC", true, &Default::default()).unwrap();
     rec.process().unwrap();
     assert_eq!(rec.sval, "3.5x");
     assert_eq!(rec.val, 3.5, "C: *presult = atof(ps->s)");

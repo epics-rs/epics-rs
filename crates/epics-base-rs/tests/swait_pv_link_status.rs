@@ -8,12 +8,9 @@
 //! one to `PV_OK`. The port had none of the fields: a client read of INAV..OUTV
 //! was a `FieldNotFound`.
 //!
-//! `execOutput` also reads DOL only `if (!pwait->dolv)` (:764). That guard's
-//! observable effect — an unset or unresolvable DOL leaves DOLD alone, and C
-//! writes the stale DOLD to OUT anyway — is what the framework's output-time
-//! fetch already produces by dropping a failed read, so the port does not gate
-//! on DOLV; see `r9_76_dol_fetch_does_not_wait_for_the_classification_task` for
-//! why gating on it would be wrong.
+//! `execOutput` also reads DOL only `if (!pwait->dolv)` (:764). DOLV is the DOL
+//! `recDynLink`'s own connection state, so an unset or unconnected DOL leaves
+//! DOLD alone, and C writes the stale DOLD to OUT anyway.
 
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::record::Record;
@@ -38,26 +35,8 @@ async fn process(db: &PvDatabase, rec: &str) {
         .unwrap();
 }
 
-/// Wait until the spawned classification task has published `f` on `rec` as
-/// `want`, and fail naming the field if it never does.
-///
-/// This used to be a `settle()` that yielded eight times and hoped. A yield
-/// hands the thread to another task *on the caller's runtime*, and the
-/// classification is not always there: `refresh_link_status` goes through
-/// `schedule_record_init`, which spawns through the runtime seam, and under
-/// `exec_backend` that is a background-executor thread with no relation to
-/// this test's runtime at all. Eight yields then synchronise with nothing, and
-/// which assertion loses the race varied per run — the two tests that failed
-/// on the exec backend were not the same two each time.
-///
-/// Waiting on the observable instead is correct on every backend, and at every
-/// call site here it waits for a value the field did NOT already hold — a
-/// transition away from the constructed `[SWAIT_NO_PV; 14]` — so returning
-/// proves the post landed rather than merely agreeing with the default. The one
-/// place where the classified value and the default coincide has no wait at
-/// all, and says so. The whole status batch is applied under a single record
-/// write lock (`post_fields_with_mask`), so observing one field of it means the
-/// rest have landed too.
+/// Wait until `rec.f` reads `want`: each link searches on its own task and
+/// its status lands from a callback band.
 async fn settle_until(db: &PvDatabase, rec: &str, f: &str, want: u16) {
     for _ in 0..400 {
         if field(db, rec, f).await == Some(EpicsValue::Enum(want)) {
@@ -75,6 +54,8 @@ async fn settle_until(db: &PvDatabase, rec: &str, f: &str, want: u16) {
 /// NO_PV — C's three states, one per link.
 #[epics_macros_rs::epics_test]
 async fn r9_76_pv_status_classifies_each_link() {
+    // C `callbackInit`: the links' events are applied on a callback band.
+    epics_base_rs::runtime::task::background_init();
     let db = PvDatabase::new();
     db.add_record("SRC", Box::new(AiRecord::new(7.0)))
         .await
@@ -122,6 +103,8 @@ async fn r9_76_pv_status_classifies_each_link() {
 /// name is emptied.
 #[epics_macros_rs::epics_test]
 async fn r9_76_put_to_a_pv_name_reclassifies_it() {
+    // C `callbackInit`: the links' events are applied on a callback band.
+    epics_base_rs::runtime::task::background_init();
     let db = PvDatabase::new();
     db.add_record("SRC", Box::new(AiRecord::new(7.0)))
         .await
@@ -129,11 +112,6 @@ async fn r9_76_put_to_a_pv_name_reclassifies_it() {
     db.add_record("W", Box::new(SwaitRecord::default()))
         .await
         .unwrap();
-    // No wait here, and it would not be one: `SwaitRecord`'s constructed
-    // `pv_status` is already `[SWAIT_NO_PV; 14]` (swait.rs:221), so the
-    // classification writes NO_PV over NO_PV and there is no transition to
-    // observe. This assertion pins the constructed default; the two waits
-    // below are the ones that pin the classification.
     assert_eq!(
         field(&db, "W", "INAV").await,
         Some(EpicsValue::Enum(NO_PV)),
@@ -161,13 +139,43 @@ async fn r9_76_put_to_a_pv_name_reclassifies_it() {
     );
 }
 
+/// Wait until `rec.f` reads `want` — the OUT write is a CA put.
+async fn settle_val(db: &PvDatabase, rec: &str, f: &str, want: f64) {
+    for _ in 0..400 {
+        if field(db, rec, f).await == Some(EpicsValue::Double(want)) {
+            return;
+        }
+        epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    panic!(
+        "{rec}.{f} did not reach {want} before timeout (last {:?})",
+        field(db, rec, f).await
+    );
+}
+
+/// Process `rec` until `target.VAL` reads `want`: a link's value lands on its
+/// first monitor, after its status reads PV_OK, and shows nowhere else.
+async fn process_until(db: &PvDatabase, rec: &str, target: &str, want: f64) {
+    for _ in 0..400 {
+        process(db, rec).await;
+        epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(5)).await;
+        if field(db, target, "VAL").await == Some(EpicsValue::Double(want)) {
+            return;
+        }
+    }
+    panic!(
+        "{target}.VAL did not reach {want} before timeout (last {:?})",
+        field(db, target, "VAL").await
+    );
+}
+
 /// DOPT="Use DOL" with a DOL that did NOT connect (PV_NC): C skips the
 /// `recDynLinkGet` (`if (!pwait->dolv)`), so DOLD keeps its client-put value —
-/// and that stale DOLD is what C writes to OUT. The port reaches the same
-/// observable state through the failed read (the framework writes DOLD only on
-/// a successful fetch), so DOLV reports the bad status without gating on it.
+/// and that stale DOLD is what C writes to OUT.
 #[epics_macros_rs::epics_test]
 async fn r9_76_unresolvable_dol_keeps_dold_and_still_writes_it() {
+    // C `callbackInit`: the links' events are applied on a callback band.
+    epics_base_rs::runtime::task::background_init();
     let db = PvDatabase::new();
     db.add_record("SINK", Box::new(AiRecord::new(0.0)))
         .await
@@ -178,15 +186,13 @@ async fn r9_76_unresolvable_dol_keeps_dold_and_still_writes_it() {
     w.put_field("DOPT", EpicsValue::Short(1)).unwrap(); // Use DOL
     w.put_field("DOLN", EpicsValue::String("NOSUCHREC".into()))
         .unwrap();
+    w.put_field("OUTN", EpicsValue::String("SINK".into()))
+        .unwrap();
     w.put_field("DOLD", EpicsValue::Double(42.0)).unwrap();
     db.add_record("W", Box::new(w)).await.unwrap();
-    // OUT routes through RecordInstance::put_common_field (populates parsed_out).
-    db.get_record("W")
-        .unwrap()
-        .write()
-        .put_common_field("OUT", EpicsValue::String("SINK".into()))
-        .unwrap();
-    settle_until(&db, "W", "DOLV", PV_NC).await;
+    // `init_record` adds the DOL and OUT links.
+    db.ioc_init().await;
+    settle_until(&db, "W", "OUTV", PV_OK).await;
 
     assert_eq!(
         field(&db, "W", "DOLV").await,
@@ -196,15 +202,13 @@ async fn r9_76_unresolvable_dol_keeps_dold_and_still_writes_it() {
 
     process(&db, "W").await;
 
+    // DOPT=Use DOL still writes DOLD to OUT — the missing PV suppresses the
+    // fetch, not the write.
+    settle_val(&db, "SINK", "VAL", 42.0).await;
     assert_eq!(
         field(&db, "W", "DOLD").await,
         Some(EpicsValue::Double(42.0)),
         "the DOL name does not resolve — DOLD keeps its put value, as under C's !dolv"
-    );
-    assert_eq!(
-        field(&db, "SINK", "VAL").await,
-        Some(EpicsValue::Double(42.0)),
-        "DOPT=Use DOL still writes DOLD to OUT — the missing PV suppresses the fetch, not the write"
     );
 }
 
@@ -212,6 +216,8 @@ async fn r9_76_unresolvable_dol_keeps_dold_and_still_writes_it() {
 /// what reaches OUT.
 #[epics_macros_rs::epics_test]
 async fn r9_76_connected_dol_is_fetched_at_output_time() {
+    // C `callbackInit`: the links' events are applied on a callback band.
+    epics_base_rs::runtime::task::background_init();
     let db = PvDatabase::new();
     db.add_record("DOLSRC", Box::new(AiRecord::new(5.0)))
         .await
@@ -225,72 +231,24 @@ async fn r9_76_connected_dol_is_fetched_at_output_time() {
     w.put_field("DOPT", EpicsValue::Short(1)).unwrap();
     w.put_field("DOLN", EpicsValue::String("DOLSRC".into()))
         .unwrap();
+    w.put_field("OUTN", EpicsValue::String("SINK".into()))
+        .unwrap();
     w.put_field("DOLD", EpicsValue::Double(42.0)).unwrap();
     db.add_record("W", Box::new(w)).await.unwrap();
-    // OUT routes through RecordInstance::put_common_field (populates parsed_out).
-    db.get_record("W")
-        .unwrap()
-        .write()
-        .put_common_field("OUT", EpicsValue::String("SINK".into()))
-        .unwrap();
+    db.ioc_init().await;
+    settle_until(&db, "W", "OUTV", PV_OK).await;
     settle_until(&db, "W", "DOLV", PV_OK).await;
-
     assert_eq!(
         field(&db, "W", "DOLV").await,
         Some(EpicsValue::Enum(PV_OK)),
         "DOLSRC resolves"
     );
 
-    process(&db, "W").await;
-
+    // The freshly fetched DOLD is written to OUT.
+    process_until(&db, "W", "SINK", 5.0).await;
     assert_eq!(
         field(&db, "W", "DOLD").await,
         Some(EpicsValue::Double(5.0)),
         "PV_OK — C runs the DOL get and DOLD takes the link's value"
-    );
-    assert_eq!(
-        field(&db, "SINK", "VAL").await,
-        Some(EpicsValue::Double(5.0)),
-        "the freshly fetched DOLD is written to OUT"
-    );
-}
-
-/// The status fields are published by a spawned classification task, so they
-/// are not a gate: a cycle that runs while DOLV still reads NO_PV must still
-/// fetch a DOL that resolves. Gating the fetch on `DOLV == PV_OK` made this
-/// cycle skip a get C performs.
-///
-/// The pre-state is OBSERVED, not asserted. The classification runs on the
-/// process-global background executor, which is a real parallel executor, so
-/// "the task has not landed yet" is a race the test cannot win reliably — it
-/// failed 2 of 18 full-suite runs when it was an assertion. What the contract
-/// needs is that the fetch is independent of DOLV, which the final assertion
-/// pins whichever way the race went; the observed value rides in its message.
-#[epics_macros_rs::epics_test]
-async fn r9_76_dol_fetch_does_not_wait_for_the_classification_task() {
-    let db = PvDatabase::new();
-    db.add_record("DOLSRC", Box::new(AiRecord::new(7.0)))
-        .await
-        .unwrap();
-
-    let mut w = SwaitRecord::default();
-    w.put_field("CALC", EpicsValue::String("1".into())).unwrap();
-    w.put_field("DOPT", EpicsValue::Short(1)).unwrap();
-    w.put_field("DOLN", EpicsValue::String("DOLSRC".into()))
-        .unwrap();
-    w.put_field("DOLD", EpicsValue::Double(42.0)).unwrap();
-    db.add_record("W", Box::new(w)).await.unwrap();
-
-    // No settle(): process on the heels of add_record, so DOLV is usually
-    // still the init NO_PV.
-    let dolv_before = field(&db, "W", "DOLV").await;
-
-    process(&db, "W").await;
-
-    assert_eq!(
-        field(&db, "W", "DOLD").await,
-        Some(EpicsValue::Double(7.0)),
-        "the DOL resolves, so the get runs — regardless of DOLV, which read \
-         {dolv_before:?} when this cycle started"
     );
 }

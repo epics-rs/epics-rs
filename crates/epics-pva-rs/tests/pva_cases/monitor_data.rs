@@ -23,7 +23,7 @@ fn hex(bytes: &[u8]) -> String {
 fn one_int_struct() -> (FieldDesc, PvField) {
     let desc = FieldDesc::Structure {
         struct_id: String::new(),
-        fields: vec![("v".into(), FieldDesc::Scalar(ScalarType::Int))],
+        fields: vec![("v".into(), FieldDesc::Scalar(ScalarType::Int))].into(),
     };
     let val = PvField::Structure(PvStructure {
         struct_id: String::new(),

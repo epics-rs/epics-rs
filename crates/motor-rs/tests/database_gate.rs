@@ -11,6 +11,16 @@ use epics_base_rs::types::EpicsValue;
 use motor_rs::MotorRecord;
 use motor_rs::flags::*;
 
+/// The status `motor` writes polled from the default.
+fn polled(
+    motor: &mut (impl asyn_rs::interfaces::motor::AsynMotor + ?Sized),
+    user: &asyn_rs::user::AsynUser,
+) -> asyn_rs::interfaces::motor::MotorStatus {
+    let mut status = asyn_rs::interfaces::motor::MotorStatus::default();
+    motor.poll(user, &mut status).unwrap();
+    status
+}
+
 fn make_record(state: motor_rs::device_state::SharedDeviceState) -> MotorRecord {
     let mut rec = MotorRecord::new();
     rec.set_device_state(state);
@@ -96,7 +106,7 @@ async fn sync_zero_release_processes_with_implicit_get_info() {
     );
     let actions = state.lock().unwrap().pending_actions.take();
     assert!(
-        actions.is_some_and(|a| a.status_refresh),
+        actions.is_some_and(|a| a.commands.contains(&motor_rs::flags::MotorCommand::Poll)),
         "the implicit GET_INFO requests a device status refresh"
     );
 }
@@ -125,15 +135,11 @@ async fn user_limit_put_processes_with_implicit_get_info() {
 }
 
 #[tokio::test]
-async fn pid_gain_put_rides_its_pass_to_the_driver() {
-    // PCOF is NOT pp(TRUE) in C (special() forwards SET_PGAIN with no
-    // process pass), but motor-rs has no put-time driver channel: the
-    // SetPidGain command rides the process pass that follows the put.
-    // The motor pp entry therefore keeps PCOF as a special()-transport
-    // extension — this pins that the forward still reaches the device
-    // mailbox under the modeled gate.
-    let state = motor_rs::device_state::new_shared_state();
-    let mut rec = make_record(state.clone());
+async fn a_pid_gain_put_reaches_the_driver_at_put_time() {
+    // PCOF is not pp(TRUE): C special() sends SET_PGAIN at put time.
+    let mut rec = make_record(motor_rs::device_state::new_shared_state());
+    let (port, mut sent) = motor_rs::device_support::CommandPort::capture();
+    rec.set_command_port(port);
     rec.stat.msta = MstaFlags::DONE | MstaFlags::GAIN_SUPPORT;
     let db = PvDatabase::new();
     db.add_record("M1", Box::new(rec)).await.unwrap();
@@ -142,19 +148,29 @@ async fn pid_gain_put_rides_its_pass_to_the_driver() {
         .await
         .unwrap();
 
-    let actions = state
-        .lock()
-        .unwrap()
-        .pending_actions
-        .take()
-        .expect("the transport pass writes the device mailbox");
-    assert!(
-        actions
-            .commands
-            .iter()
-            .any(|c| matches!(c, MotorCommand::SetPidGain { .. })),
-        "SetPidGain forwarded through the put's process pass"
-    );
+    let Ok(motor_rs::poll_loop::ToAxis::Batch(batch)) = sent.try_recv() else {
+        panic!("no batch");
+    };
+    assert!(matches!(
+        batch.commands.as_slice(),
+        [q] if matches!(q, MotorCommand::SetPidGain { .. })
+    ));
+}
+
+/// Stands in for the poller thread: runs the driver commands the record
+/// passes queued.
+fn run_queued(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<motor_rs::poll_loop::ToAxis>,
+    motor: &std::sync::Mutex<dyn asyn_rs::interfaces::motor::AsynMotor>,
+) {
+    while let Ok(motor_rs::poll_loop::ToAxis::Batch(batch)) = rx.try_recv() {
+        motor_rs::poll_loop::execute_commands(
+            &mut *motor.lock().unwrap(),
+            &batch.trace,
+            &batch.commands,
+            &mut |_| {},
+        );
+    }
 }
 
 /// A retry dispatch is emitted on a driver-callback (CALLBACK_DATA) pass —
@@ -183,12 +199,16 @@ async fn retry_dispatched_on_callback_pass_reaches_the_driver() {
         moves: Arc<AtomicU32>,
     }
     impl AsynMotor for UndershootMotor {
-        fn poll(&mut self, _user: &AsynUser) -> Result<MotorStatus, AsynError> {
-            Ok(MotorStatus {
+        fn poll_failure(&self) -> asyn_rs::interfaces::motor::PollFailure {
+            asyn_rs::interfaces::motor::PollFailure::PROBLEM_AND_COMMS_ERROR
+        }
+        fn poll(&mut self, _user: &AsynUser, status: &mut MotorStatus) -> Result<(), AsynError> {
+            *status = MotorStatus {
                 position: self.position,
                 done: true,
                 ..MotorStatus::default()
-            })
+            };
+            Ok(())
         }
         fn move_absolute(
             &mut self,
@@ -199,7 +219,18 @@ async fn retry_dispatched_on_callback_pass_reaches_the_driver() {
             _accel: f64,
         ) -> Result<(), AsynError> {
             let n = self.moves.fetch_add(1, Ordering::SeqCst);
-            self.position = if n == 0 { position - 0.05 } else { position };
+            // 0.05 EGU short at MRES 0.001.
+            self.position = if n == 0 { position - 50.0 } else { position };
+            Ok(())
+        }
+        fn move_relative(
+            &mut self,
+            _user: &AsynUser,
+            _distance: f64,
+            _min_vel: f64,
+            _max_vel: f64,
+            _accel: f64,
+        ) -> Result<(), AsynError> {
             Ok(())
         }
         fn stop(&mut self, _user: &AsynUser, _accel: f64) -> Result<(), AsynError> {
@@ -236,7 +267,7 @@ async fn retry_dispatched_on_callback_pass_reaches_the_driver() {
     rec.limits.dllm = -100.0;
     rec.limits.hlm = 100.0;
     rec.limits.llm = -100.0;
-    rec.limits.lvio = false;
+    rec.limits.lvio = 0;
     rec.vel.velo = 100000.0;
     rec.vel.accl = 0.5;
     rec.stat.msta = MstaFlags::DONE;
@@ -244,11 +275,20 @@ async fn retry_dispatched_on_callback_pass_reaches_the_driver() {
     // poll_cmd_rx is held alive so PollDirective sends succeed; the test
     // drives statuses by hand instead of running the poll loop.
     let (poll_cmd_tx, _poll_cmd_rx) = tokio::sync::mpsc::channel(16);
+    let (motor_cmd_tx, mut motor_cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+    // The poller's startup poll fills the cache init reads.
+    state.lock().unwrap().latest_status = Some(motor_rs::device_state::StampedStatus {
+        seq: 1,
+        status: polled(
+            &mut *motor.lock().unwrap(),
+            &asyn_rs::user::AsynUser::new(0),
+        ),
+    });
     let mut dev = MotorDeviceSupport::new(
-        motor.clone(),
-        0,
+        Default::default(),
         Duration::from_secs(1),
         poll_cmd_tx,
+        motor_cmd_tx,
         state.clone(),
     );
     {
@@ -265,29 +305,37 @@ async fn retry_dispatched_on_callback_pass_reaches_the_driver() {
         inst.device = Some(Box::new(dev));
     }
 
-    // Startup pass consumes the init-seeded status (seq 1).
+    // init_record took the cached status (seq 1); the startup pass reads
+    // the poller's first post.
+    state.lock().unwrap().latest_status = Some(StampedStatus {
+        seq: 2,
+        status: polled(&mut *motor.lock().unwrap(), &user),
+    });
     let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_readback("M1", &mut visited)
         .await
         .unwrap();
+    run_queued(&mut motor_cmd_rx, &motor);
 
     // Move to 1.0 — the put pass dispatches, the driver undershoots.
     db.put_record_field_from_ca_no_notify("M1", "VAL", EpicsValue::Double(1.0))
         .await
         .unwrap();
+    run_queued(&mut motor_cmd_rx, &motor);
     assert_eq!(moves.load(Ordering::SeqCst), 1, "put pass dispatched");
 
     // Completion callback pass: diff = 0.05 >= RDBD -> maybeRetry arms and
     // re-dispatches ON THIS PASS. The write must reach the driver.
     let stamp = |seq: u64| {
-        let status = motor.lock().unwrap().poll(&user).unwrap();
+        let status = polled(&mut *motor.lock().unwrap(), &user);
         state.lock().unwrap().latest_status = Some(StampedStatus { seq, status });
     };
-    stamp(2);
+    stamp(3);
     let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_readback("M1", &mut visited)
         .await
         .unwrap();
+    run_queued(&mut motor_cmd_rx, &motor);
     assert_eq!(
         moves.load(Ordering::SeqCst),
         2,
@@ -295,11 +343,12 @@ async fn retry_dispatched_on_callback_pass_reaches_the_driver() {
     );
 
     // Retry landed on target: the next callback pass finalizes.
-    stamp(3);
+    stamp(4);
     let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_readback("M1", &mut visited)
         .await
         .unwrap();
+    run_queued(&mut motor_cmd_rx, &motor);
     assert_eq!(
         db.get_pv("M1.DMOV").unwrap(),
         EpicsValue::Short(1),
@@ -307,20 +356,16 @@ async fn retry_dispatched_on_callback_pass_reaches_the_driver() {
     );
     assert_eq!(
         db.get_pv("M1.MIP").unwrap(),
-        EpicsValue::Short(0),
+        EpicsValue::UShort(0),
         "MIP collapses to DONE after the retry converges"
     );
 }
 
-/// A write parked before the first status pulse (autosave pass-1 restore,
-/// or a CA put in the init→first-poll window) must not turn that pulse
-/// into a command pass: the pulse anchors (Startup), the anchor leaves the
-/// parked target untouched, and the write replays as a real move on the
-/// pass the anchor's forced refresh queues. Pre-fix, the pulse was consumed
-/// as a put pass against an unanchored baseline and the following Startup
-/// synced the mid-flight readback into VAL/DVAL.
+/// The device init anchors the record (C init_record), so a put before
+/// the first status pulse is an ordinary put pass: C has no pre-anchor
+/// window, as init_record precedes any dbPutField.
 #[tokio::test]
-async fn parked_pre_pulse_put_anchors_first_then_replays_as_a_move() {
+async fn a_put_before_the_first_pulse_moves_at_once() {
     use asyn_rs::error::AsynError;
     use asyn_rs::interfaces::motor::{AsynMotor, MotorStatus};
     use asyn_rs::user::AsynUser;
@@ -337,12 +382,16 @@ async fn parked_pre_pulse_put_anchors_first_then_replays_as_a_move() {
         loads: Arc<AtomicU32>,
     }
     impl AsynMotor for SpyMotor {
-        fn poll(&mut self, _user: &AsynUser) -> Result<MotorStatus, AsynError> {
-            Ok(MotorStatus {
+        fn poll_failure(&self) -> asyn_rs::interfaces::motor::PollFailure {
+            asyn_rs::interfaces::motor::PollFailure::PROBLEM_AND_COMMS_ERROR
+        }
+        fn poll(&mut self, _user: &AsynUser, status: &mut MotorStatus) -> Result<(), AsynError> {
+            *status = MotorStatus {
                 position: self.position,
                 done: true,
                 ..MotorStatus::default()
-            })
+            };
+            Ok(())
         }
         fn move_absolute(
             &mut self,
@@ -354,6 +403,16 @@ async fn parked_pre_pulse_put_anchors_first_then_replays_as_a_move() {
         ) -> Result<(), AsynError> {
             self.moves.fetch_add(1, Ordering::SeqCst);
             self.position = position;
+            Ok(())
+        }
+        fn move_relative(
+            &mut self,
+            _user: &AsynUser,
+            _distance: f64,
+            _min_vel: f64,
+            _max_vel: f64,
+            _accel: f64,
+        ) -> Result<(), AsynError> {
             Ok(())
         }
         fn stop(&mut self, _user: &AsynUser, _accel: f64) -> Result<(), AsynError> {
@@ -393,17 +452,26 @@ async fn parked_pre_pulse_put_anchors_first_then_replays_as_a_move() {
     rec.limits.dllm = -100.0;
     rec.limits.hlm = 100.0;
     rec.limits.llm = -100.0;
-    rec.limits.lvio = false;
+    rec.limits.lvio = 0;
     rec.vel.velo = 100000.0;
     rec.vel.accl = 0.5;
     rec.stat.msta = MstaFlags::DONE;
 
     let (poll_cmd_tx, _poll_cmd_rx) = tokio::sync::mpsc::channel(16);
+    let (motor_cmd_tx, mut motor_cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+    // The poller's startup poll fills the cache init reads.
+    state.lock().unwrap().latest_status = Some(motor_rs::device_state::StampedStatus {
+        seq: 1,
+        status: polled(
+            &mut *motor.lock().unwrap(),
+            &asyn_rs::user::AsynUser::new(0),
+        ),
+    });
     let mut dev = MotorDeviceSupport::new(
-        motor.clone(),
-        0,
+        Default::default(),
         Duration::from_secs(1),
         poll_cmd_tx,
+        motor_cmd_tx,
         state.clone(),
     );
     {
@@ -420,65 +488,65 @@ async fn parked_pre_pulse_put_anchors_first_then_replays_as_a_move() {
         inst.device = Some(Box::new(dev));
     }
 
-    // Put BEFORE any status pulse processed: init() cleared the pass0
-    // latch, so this parks a fresh last_write — the pass-1/early-CA-put
-    // window. The put's own process pass consumes the init-seeded status
-    // (seq 1) as the ANCHOR, not as a put pass.
     db.put_record_field_from_ca_no_notify("M1", "VAL", EpicsValue::Double(1.0))
         .await
         .unwrap();
-
-    assert_eq!(
-        moves.load(Ordering::SeqCst),
-        0,
-        "the anchor pass must not dispatch the parked put"
-    );
+    run_queued(&mut motor_cmd_rx, &motor);
+    assert_eq!(moves.load(Ordering::SeqCst), 1, "the put moves at once");
     assert_eq!(
         loads.load(Ordering::SeqCst),
         0,
-        "the anchor must not redefine the controller position"
-    );
-    assert_eq!(
-        db.get_pv("M1.VAL").unwrap(),
-        EpicsValue::Double(1.0),
-        "the anchor must not sync the parked target away"
-    );
-    assert_eq!(
-        db.get_pv("M1.DVAL").unwrap(),
-        EpicsValue::Double(1.0),
-        "the anchor must not sync the parked dial target away"
+        "the anchor kept the controller position"
     );
 
     let stamp = |seq: u64| {
-        let status = motor.lock().unwrap().poll(&user).unwrap();
+        let status = polled(&mut *motor.lock().unwrap(), &user);
         state.lock().unwrap().latest_status = Some(StampedStatus { seq, status });
     };
 
-    // The anchor's forced refresh queues the replay pass: the parked put
-    // now dispatches as an ordinary post-init move.
+    // Completion pass: the axis landed on target.
     stamp(2);
     let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_readback("M1", &mut visited)
         .await
         .unwrap();
-    assert_eq!(
-        moves.load(Ordering::SeqCst),
-        1,
-        "the parked put replays as a real move after the anchor"
-    );
-
-    // Completion pass: the axis landed on target.
-    stamp(3);
-    let mut visited = epics_base_rs::server::database::ProcStack::new();
-    db.process_record_readback("M1", &mut visited)
-        .await
-        .unwrap();
+    run_queued(&mut motor_cmd_rx, &motor);
     assert_eq!(db.get_pv("M1.DMOV").unwrap(), EpicsValue::Short(1));
-    assert_eq!(db.get_pv("M1.MIP").unwrap(), EpicsValue::Short(0));
+    assert_eq!(db.get_pv("M1.MIP").unwrap(), EpicsValue::UShort(0));
     assert_eq!(db.get_pv("M1.RBV").unwrap(), EpicsValue::Double(1.0));
     assert_eq!(
         loads.load(Ordering::SeqCst),
         0,
         "no position redefine anywhere on the parked-put path"
     );
+}
+
+#[tokio::test]
+async fn only_a_udf_put_of_one_raises_udf_alarm() {
+    // UDF is pp(TRUE) in dbCommon.dbd, and alarm_sub tests `udf == TRUE`
+    // (motorRecord.cc:3372): oracleMotorIoc reads NO_ALARM after
+    // `dbpf M1.UDF 2` and `255`, UDF/INVALID only after `1`.
+    use epics_base_rs::server::recgbl::alarm_status;
+    let state = motor_rs::device_state::new_shared_state();
+    let db = PvDatabase::new();
+    db.add_record("M1", Box::new(make_record(state.clone())))
+        .await
+        .unwrap();
+    anchor(&db, &state).await;
+
+    for (udf, sevr, stat) in [
+        ("2", 0, alarm_status::NO_ALARM),
+        ("255", 0, alarm_status::NO_ALARM),
+        ("1", 3, alarm_status::UDF_ALARM),
+        ("0", 0, alarm_status::NO_ALARM),
+    ] {
+        db.put_record_field_from_ca_no_notify("M1", "UDF", EpicsValue::String(udf.into()))
+            .await
+            .unwrap();
+        assert_eq!(
+            (db.get_pv("M1.SEVR").unwrap(), db.get_pv("M1.STAT").unwrap()),
+            (EpicsValue::Short(sevr), EpicsValue::Short(stat as i16)),
+            "UDF {udf}"
+        );
+    }
 }

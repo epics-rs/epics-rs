@@ -69,8 +69,8 @@ async fn r15_62_failed_seq_lnk_put_alarms_in_the_same_cycle() {
 
     let mut seq = SeqRecord::new();
     seq.selm = 0; // All
-    seq.dol1 = "SEQ_SRC".to_string();
-    seq.lnk1 = "NO_SUCH_TARGET".to_string();
+    seq.dol1 = "SEQ_SRC".into();
+    seq.lnk1 = "NO_SUCH_TARGET".into();
     db.add_record("SEQ_BAD", Box::new(seq)).await.unwrap();
 
     process(&db, "SEQ_BAD").await;
@@ -99,8 +99,8 @@ async fn r15_62_successful_seq_lnk_put_leaves_no_alarm() {
 
     let mut seq = SeqRecord::new();
     seq.selm = 0;
-    seq.dol1 = "SEQ_SRC".to_string();
-    seq.lnk1 = "SEQ_DST".to_string();
+    seq.dol1 = "SEQ_SRC".into();
+    seq.lnk1 = "SEQ_DST".into();
     db.add_record("SEQ_OK", Box::new(seq)).await.unwrap();
 
     process(&db, "SEQ_OK").await;
@@ -131,8 +131,8 @@ async fn r15_62_fanout_forward_links_still_raise_no_put_alarm() {
 
     let mut fanout = FanoutRecord::new();
     fanout.selm = 0; // All
-    fanout.lnk1 = "FO_DST".to_string();
-    fanout.lnk2 = "NO_SUCH_TARGET".to_string();
+    fanout.lnk1 = "FO_DST".into();
+    fanout.lnk2 = "NO_SUCH_TARGET".into();
     db.add_record("FO", Box::new(fanout)).await.unwrap();
 
     process(&db, "FO").await;

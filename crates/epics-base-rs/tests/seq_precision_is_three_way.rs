@@ -16,22 +16,25 @@
 //! `route_field_metadata` took the slot over. The `DOn` arm's `dbGetPrecision`
 //! fails on a CONSTANT link (`S_db_noLSET`) and falls through with it.
 
+mod seeded;
+
 use epics_base_rs::server::database::LinkBacking;
 use epics_base_rs::server::db_loader::create_record;
-use epics_base_rs::server::record::RecordInstance;
 use epics_base_rs::types::EpicsValue;
+use seeded::Seeded;
 
-fn seq_with_prec(prec: i16) -> RecordInstance {
-    let rec = create_record("seq").expect("seq is registered");
-    let mut inst = RecordInstance::new_boxed("S".to_string(), rec);
-    inst.put_common_field("PREC", EpicsValue::Short(prec))
+fn seq_with_prec(prec: i16) -> Seeded {
+    let rec = Seeded::new("S", create_record("seq").expect("seq is registered"));
+    rec.put("PREC", EpicsValue::Short(prec))
         .expect("seq declares PREC");
-    inst
+    rec
 }
 
 /// `caget -s` — the DBR_STRING form, which is where a precision shows.
-fn dbr_string_of(inst: &RecordInstance, field: &str) -> String {
+fn dbr_string_of(inst: &Seeded, field: &str) -> String {
     let snap = inst
+        .cell()
+        .read()
         .snapshot_for_field_with(field, LinkBacking::none())
         .expect("field exists");
     let bytes = epics_base_rs::types::encode_dbr(0, &snap).expect("DBR_STRING encodes");
@@ -39,8 +42,10 @@ fn dbr_string_of(inst: &RecordInstance, field: &str) -> String {
     String::from_utf8_lossy(&bytes[..end]).into_owned()
 }
 
-fn precision_of(inst: &RecordInstance, field: &str) -> Option<i16> {
-    inst.snapshot_for_field_with(field, LinkBacking::none())
+fn precision_of(inst: &Seeded, field: &str) -> Option<i16> {
+    inst.cell()
+        .read()
+        .snapshot_for_field_with(field, LinkBacking::none())
         .expect("field exists")
         .precision()
 }
@@ -49,9 +54,8 @@ fn precision_of(inst: &RecordInstance, field: &str) -> Option<i16> {
 /// `caget -s S.DO1` — C prints `1.235`.
 #[test]
 fn a_do_field_over_a_constant_dol_takes_the_records_own_prec() {
-    let mut inst = seq_with_prec(3);
-    inst.record
-        .put_field("DO1", EpicsValue::Double(1.234_567_89))
+    let inst = seq_with_prec(3);
+    inst.put("DO1", EpicsValue::Double(1.234_567_89))
         .expect("DO1 is a value slot");
     assert_eq!(dbr_string_of(&inst, "DO1"), "1.235");
     assert_eq!(precision_of(&inst, "DO1"), Some(3));

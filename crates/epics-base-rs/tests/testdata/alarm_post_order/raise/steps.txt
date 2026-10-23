@@ -1,0 +1,5 @@
+monitor X X.SEVR X.STAT X.AMSG X.ACKS
+caput X 1
+caput X 12
+caput X 7
+caput X 0

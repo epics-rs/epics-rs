@@ -1,0 +1,39 @@
+-	drvStreamInit()
+-	StreamProtocolParser::path = /home/stevek/work/_tgt/monitor/trial/crates/stream-rs/tests/oracle/epics
+_main_	streamInitRecord(rec): SEVR=3
+_main_	streamInitRecord(rec): create new Stream object
+_main_	streamInitRecord(rec): calling initRecord
+_main_	Stream::initRecord rec: parse link string "l.proto wfod P"
+_main_	Stream::initRecord rec: filename="l.proto" protocol="wfod" bus="P" addr=0 params=""
+_main_	Stream::initRecord rec: attachBus("P", 0, "")
+_main_	Stream::initRecord rec: parse("l.proto", "wfod")
+_main_	Stream::initRecord rec: initialize the first time
+_main_	streamInitRecord(rec) done status=0x2
+_main_	Stream::process(rec)
+_main_	Stream::process(rec) start
+_main_	StreamCore::startProtocol(rec, startMode=StartNormal)
+_main_	StreamCore::evalCommand(rec): activeCommand = out
+_main_	StreamCore::formatOutput(rec): format = %f
+_main_	Stream::formatValue(rec, format=%f, fieldaddr=(nil)
+_main_	Stream::formatValue(rec) format=%f type=DBF_DOUBLE
+_main_	streamPrintf(rec,format=%f)
+_main_	StreamCore::printValue(rec, %f, 65535.0): "65535.000000"
+_main_	StreamCore::evalOut: outputLine = "65535.000000<0d><0a>"
+_main_	StreamCore::evalOut(rec): lockRequest(5000)
+_main_	Stream::process(rec): protocol started
+P	StreamCore::lockCallback(rec, StreamIoSuccess)
+P	StreamCore::writeCallback(rec, StreamIoSuccess)
+P	StreamCore::evalCommand(rec): activeCommand = end
+P	StreamCore::finishProtocol(rec, Success) bus owner
+P	Stream::protocolFinishHook(rec, Success)
+cbLow	recordProcessCallback(rec) processing record
+cbLow	Stream::process(rec)
+cbLow	Stream::process(rec) ready. don't convert
+cbLow	recordProcessCallback(rec) processing record done
+VAL 65535 = 0xffff
+SEVR "NO_ALARM"
+STAT "NO_ALARM"
+UDF 0 = 0x0
+PACT 0 = 0x0
+PROC 0 = 0x0
+NORD 1 = 0x1

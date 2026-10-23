@@ -1,0 +1,23 @@
+[package]
+name = "raw_float_format"
+version = "0.1.0"
+edition = "2024"
+description = "Dylint lint: a raw float formatted where C printf spells it differently"
+license-file = "../../LICENSE"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+dylint_linting = "6.2.0"
+serde = { version = "1.0", features = ["derive"] }
+
+[dev-dependencies]
+dylint_testing = "6.2.0"
+
+[package.metadata.rust-analyzer]
+rustc_private = true
+
+# Built on its own pinned nightly, never by the workspace's stable toolchain.
+[workspace]

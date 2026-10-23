@@ -26,6 +26,7 @@
 //! `iocRun` the second, `iocInit` both.
 
 use super::registry::*;
+use crate::runtime::version::EPICS_RELEASE_VERSION;
 
 /// Register the `miscIocRegister.c` command set on `registry`.
 pub(crate) fn register(registry: &mut CommandRegistry) {
@@ -52,7 +53,11 @@ fn cmd_ioc_build() -> CommandDef {
         "iocBuild — Initialize the IOC and leave it in a quiescent state.",
         |_args: &[ArgValue], ctx: &CommandContext| {
             use crate::server::ioc_app::ShellTransition;
-            match crate::server::ioc_app::build_from_shell(ctx.bridge()) {
+            match crate::server::ioc_app::build_from_shell(
+                ctx.bridge(),
+                &|line| ctx.println(line),
+                &|line| ctx.eprintln(line),
+            ) {
                 ShellTransition::Done => Ok(CommandOutcome::Continue),
                 ShellTransition::Failed => Ok(CommandOutcome::Failed),
                 // C `iocBuild_1` (`iocInit.c:116-121`) refuses from any state
@@ -63,12 +68,12 @@ fn cmd_ioc_build() -> CommandDef {
                 }
                 // No `IocApplication` lifecycle to drive — a bare
                 // `PvDatabase` shell or a `CaServerBuilder` binary. C runs
-                // `iocBuild_1` for those too, so this arm does, and the
-                // record-load close is this shell's contribution to it.
+                // `iocBuild` for those too, so this arm does.
                 ShellTransition::NotOurs => {
-                    if crate::server::ioc_app::build_without_application(|| {
-                        ctx.block_on(async { ctx.db().ioc_init().await });
-                    }) {
+                    if ctx.block_on(crate::server::ioc_app::build_without_application(
+                        ctx.db(),
+                        |line| ctx.println(line),
+                    )) {
                         Ok(CommandOutcome::Continue)
                     } else {
                         Ok(CommandOutcome::Failed)
@@ -91,21 +96,9 @@ fn cmd_ioc_run() -> CommandDef {
         "iocRun — Bring the IOC out of its initial quiescent state to the \
          running state.",
         |_args: &[ArgValue], ctx: &CommandContext| {
-            use crate::server::ioc_app::ShellTransition;
-            // Two ways to reach `iocRunning`, and C has both: out of
-            // `iocBuilt`, which is the IOC this `run` built and still owns,
-            // and out of `iocPaused`, which owns nothing because the build
-            // already happened. `Refused`/`NotOurs` is the second case — no
-            // built IOC to consume — so the plain transition is what runs,
-            // and it is also the only one a `CaServerBuilder` IOC has.
-            match crate::server::ioc_app::run_from_shell(ctx.bridge()) {
-                ShellTransition::Done => return Ok(CommandOutcome::Continue),
-                ShellTransition::Failed => return Ok(CommandOutcome::Failed),
-                ShellTransition::Refused | ShellTransition::NotOurs => {}
-            }
             // C `iocshSetError(iocRun())`: a non-zero status fails the
             // line, and `iocRun` has already printed its own diagnostic.
-            if crate::server::ioc_app::ioc_run() == 0 {
+            if crate::server::ioc_app::run_from_shell(ctx) {
                 Ok(CommandOutcome::Continue)
             } else {
                 Ok(CommandOutcome::Failed)
@@ -161,14 +154,11 @@ fn cmd_core_release() -> CommandDef {
 /// The banner lines themselves, so the shell command and the build print one
 /// text.
 ///
-/// C prints five lines: a `#` rule, `epicsReleaseVersion` ("EPICS
-/// R7.0.10.1-DEV"), the two `epicsVCS.h` revision lines, and the rule again.
-/// This port drops the release-version line. epics-rs's release is not the
-/// EPICS Base version, and branding that line `## epics-rs R7.0.10.1-DEV` read
-/// as if the port claimed to BE that C dev build; the base level this tree
-/// tracks is named by `EPICS_VERSION_STRING` (every tool's `-V` banner)
-/// instead. What coreRelease keeps is this build's own revision and date — the
-/// port's real release identity.
+/// C prints five lines: a `#` rule, `epicsReleaseVersion`, the two
+/// `epicsVCS.h` revision lines, and the rule again. The release line is the
+/// C base level this tree ports ([`EPICS_RELEASE_VERSION`]), which is what an
+/// operator or a tool reading the banner compares against; the revision
+/// lines are this build's own stamp.
 ///
 /// C has one `coreRelease()` and calls it from both places — the iocsh
 /// command and `iocBuild_1` (`iocInit.c:147`) — and the port had the wording
@@ -176,10 +166,11 @@ fn cmd_core_release() -> CommandDef {
 /// without a second copy. The command still renders through the iocsh
 /// context so a redirection applies to it; the build writes stdout, as C's
 /// `printf` does.
-pub(crate) fn core_release_block() -> [String; 4] {
+pub(crate) fn core_release_block() -> [String; 5] {
     let rule = "#".repeat(76);
     [
         rule.clone(),
+        format!("## {EPICS_RELEASE_VERSION}"),
         format!("## Rev. {VCS_VERSION}"),
         format!("## Rev. Date {VCS_VERSION_DATE}"),
         rule,
@@ -240,7 +231,7 @@ fn cmd_dlload() -> CommandDef {
             // C's line verbatim; the text after the colon is what
             // `epicsLoadError()` would carry, which here is a fixed
             // property of the binary rather than a per-call `dlerror`.
-            ctx.println(&format!(
+            ctx.console_println(&format!(
                 "epicsLoadLibrary failed: {name}: this IOC is statically \
                  linked and has no dynamic loader, and a shared library has \
                  no registrar path into its compile-time registries"
@@ -270,7 +261,7 @@ fn cmd_system() -> CommandDef {
          command interpreter for execution.",
         |args: &[ArgValue], _ctx: &CommandContext| {
             let cmd = match &args[0] {
-                ArgValue::String(s) => s.as_str(),
+                ArgValue::String(s) => s.to_os_str()?,
                 _ => return Ok(CommandOutcome::Failed),
             };
             Ok(run_system(cmd))
@@ -282,7 +273,7 @@ fn cmd_system() -> CommandDef {
 /// C's `system()` hands the string to `/bin/sh -c` on POSIX and to
 /// `cmd.exe /C` on Windows, so the argument keeps its shell grammar —
 /// `system "ls | wc -l"` is a pipeline, not an argv.
-fn run_system(cmd: &str) -> CommandOutcome {
+fn run_system(cmd: impl AsRef<std::ffi::OsStr>) -> CommandOutcome {
     #[cfg(windows)]
     let mut c = {
         let mut c = std::process::Command::new("cmd");
@@ -323,16 +314,19 @@ mod tests {
         ctx
     }
 
+    /// stdout as the operator sees it: the thread's and the raw one (dlload.c).
     fn run(ctx: &CommandContext, name: &str, tokens: &[&str]) -> (String, bool) {
         let mut reg = CommandRegistry::new();
         register(&mut reg);
         let cmd = reg.get(name).unwrap();
-        let tokens: Vec<String> = tokens.iter().map(|t| t.to_string()).collect();
+        let tokens: Vec<IocshString> = tokens.iter().map(|t| IocshString::from(*t)).collect();
         let args = parse_args(&tokens, &cmd.args).unwrap();
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let path = tmp.path().to_path_buf();
-        let outcome = ctx.with_output(std::fs::File::create(&path).unwrap(), || {
-            cmd.handler.call(&args, ctx)
+        let out = std::fs::File::create(&path).unwrap();
+        let raw = out.try_clone().unwrap();
+        let outcome = ctx.with_console(raw, std::io::stderr(), || {
+            ctx.with_output(out, || cmd.handler.call(&args, ctx))
         });
         let failed = matches!(outcome, Ok(CommandOutcome::Failed));
         (std::fs::read_to_string(&path).unwrap(), failed)
@@ -371,7 +365,7 @@ mod tests {
     /// shell: refused from the wrong state, accepted from the right one.
     #[test]
     fn ioc_run_and_ioc_pause_carry_the_transition_status() {
-        use crate::server::ioc_app::{IocState, get_ioc_state, note_scan_owner_started};
+        use crate::server::ioc_app::{IocState, build_without_application, get_ioc_state, ioc_run};
 
         let ctx = make_ctx();
         {
@@ -385,7 +379,10 @@ mod tests {
         assert!(run(&ctx, "iocRun", &[]).1, "iocRun from iocVoid fails");
         assert!(run(&ctx, "iocPause", &[]).1, "iocPause from iocVoid fails");
 
-        note_scan_owner_started();
+        assert!(ctx.block_on(build_without_application(ctx.db(), |line| {
+            ctx.println(line)
+        })));
+        assert_eq!(ioc_run(), 0);
         assert!(!run(&ctx, "iocPause", &[]).1, "a running IOC pauses");
         assert_eq!(get_ioc_state(), IocState::Paused);
         assert!(!run(&ctx, "iocRun", &[]).1, "a paused IOC runs again");
@@ -394,33 +391,45 @@ mod tests {
 
     /// C `coreRelease` prints five lines: a 76-`#` rule, `epicsReleaseVersion`,
     /// the two revision lines, and the rule again (`misc/epicsRelease.c:23-27`).
-    /// This port drops the `epicsReleaseVersion` line — epics-rs's release is
-    /// not the base version — so coreRelease prints four: the rule, the two
-    /// revision lines, the rule.
+    /// The release line is C's `## EPICS R7.0.10.1-DEV` (softIoc 8f5015b66).
     #[test]
-    fn core_release_prints_four_lines_without_the_base_version() {
+    fn core_release_prints_five_lines() {
         let ctx = make_ctx();
         let (out, failed) = run(&ctx, "coreRelease", &[]);
         assert!(!failed, "coreRelease never fails in C");
         let lines: Vec<&str> = out.lines().collect();
-        assert_eq!(lines.len(), 4, "the base-version line is dropped: {out:?}");
+        assert_eq!(lines.len(), 5, "{out:?}");
         assert_eq!(lines[0], "#".repeat(76));
-        assert_eq!(lines[3], "#".repeat(76));
-        assert_eq!(lines[1], format!("## Rev. {VCS_VERSION}"));
-        assert_eq!(lines[2], format!("## Rev. Date {VCS_VERSION_DATE}"));
-        // No remaining line states a release version: the dropped line was the
-        // only "epics-rs …" identity line, and no line carries the base token.
-        assert!(
-            !out.contains("epics-rs") && !out.contains("R7.0.10"),
-            "the base-version identity line is gone: {out:?}"
-        );
+        assert_eq!(lines[4], "#".repeat(76));
+        assert_eq!(lines[1], "## EPICS R7.0.10.1-DEV");
+        assert_eq!(lines[2], format!("## Rev. {VCS_VERSION}"));
+        assert_eq!(lines[3], format!("## Rev. Date {VCS_VERSION_DATE}"));
         // The stamp reaches the line: neither renders as a bare label the
         // way `## Rev. Date ` did before `build.rs` filled the pair.
-        assert!(lines[1].len() > "## Rev. ".len(), "empty revision: {out:?}");
+        assert!(lines[2].len() > "## Rev. ".len(), "empty revision: {out:?}");
         assert!(
-            lines[2].len() > "## Rev. Date ".len(),
+            lines[3].len() > "## Rev. Date ".len(),
             "empty date: {out:?}"
         );
+    }
+
+    /// The revision names the commit checked out when this crate was built,
+    /// as C's `FORCE`d `epicsVCS.h` does, even when the commit touched no
+    /// file of this package. Nothing to compare outside a git checkout.
+    #[test]
+    fn the_revision_names_the_checked_out_commit() {
+        let Ok(out) = std::process::Command::new("git")
+            .args(["describe", "--always", "--tags", "--abbrev=20"])
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .output()
+        else {
+            return;
+        };
+        if !out.status.success() {
+            return;
+        }
+        let head = String::from_utf8(out.stdout).unwrap();
+        assert_eq!(VCS_VERSION.trim_end_matches("-dirty"), head.trim());
     }
 
     /// C declares one `iocshArgString`, and the whole string reaches the
@@ -447,5 +456,19 @@ mod tests {
         let (out, failed) = run(&ctx, "system", &["exit 3"]);
         assert!(failed, "a non-zero exit must fail the line");
         assert!(out.is_empty(), "C prints no diagnostic of its own: {out:?}");
+    }
+
+    /// dlload.c does not include `epicsStdio.h`, so its failure line stays on
+    /// the console under `dlload x > f` (`dlload.c:16`; no oracle IOC
+    /// registers the command).
+    #[test]
+    fn dlload_s_failure_line_stays_on_the_console() {
+        let shell = crate::server::iocsh::tests::make_shell();
+        let (file, console) = shell.file_and_console("dlload myLibrary.so");
+        assert_eq!(file, "");
+        assert!(
+            console.starts_with("epicsLoadLibrary failed: myLibrary.so: "),
+            "{console}"
+        );
     }
 }

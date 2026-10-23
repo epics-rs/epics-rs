@@ -48,7 +48,7 @@ impl OctetInterpose for DelayInterpose {
         user: &AsynUser,
         buf: &mut [u8],
         next: &mut dyn OctetNext,
-    ) -> AsynResult<OctetReadResult> {
+    ) -> OctetReadResult {
         next.read(user, buf)
     }
 
@@ -62,7 +62,7 @@ impl OctetInterpose for DelayInterpose {
         // epicsThreadSleep(delay) — AFTER every char, including the last
         // and including a single-char write. On a write error it breaks
         // before sleeping and publishes what it managed to send
-        // (`*nbytesTransfered = transfered`, :52), so the count rides out on
+        // (`*nbytesTransferred = transferred`, :51), so the count rides out on
         // the error instead of being dropped by `?`.
         //
         // The chunking is unconditional in C: `writeIt` has no zero-delay
@@ -108,11 +108,13 @@ mod tests {
     }
 
     impl OctetNext for RecordingBase {
-        fn read(&mut self, _user: &AsynUser, _buf: &mut [u8]) -> AsynResult<OctetReadResult> {
-            Ok(OctetReadResult {
+        fn read(&mut self, _user: &AsynUser, _buf: &mut [u8]) -> OctetReadResult {
+            OctetReadResult {
                 nbytes_transferred: 0,
                 eom_reason: EomReason::CNT,
-            })
+                taken_back: 0,
+                status: Ok(()),
+            }
         }
         fn write(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
             self.written.push(data.to_vec());

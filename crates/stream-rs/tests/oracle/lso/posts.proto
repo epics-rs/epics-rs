@@ -1,0 +1,5 @@
+Terminator = CR LF;
+ReplyTimeout = 200;
+p { out "S%s"; in "%s"; @init { out "Q\$1"; in "%s"; } }
+q { out "Q\$1"; in "%s"; in "%s"; }
+f { out "Q\$1"; in "%!8s"; }

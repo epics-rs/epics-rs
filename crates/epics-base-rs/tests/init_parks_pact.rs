@@ -24,7 +24,7 @@
 //!
 //! The boundary is SNAM: empty parks, non-empty does not. PACT is a `dbCommon`
 //! field with one owner, so the transition happens in the init owner
-//! (`RecordInstance::run_init_passes`) off the record's `Record::parks_pact`,
+//! (`RecordInstance::run_init_pass0`) off the record's `Record::parks_pact`,
 //! not by a record reaching into common state. The put owner re-asks the same
 //! predicate either side of an SNAM put, which is C's two-pass `special()`.
 

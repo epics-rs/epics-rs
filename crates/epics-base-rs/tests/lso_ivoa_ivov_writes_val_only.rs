@@ -119,10 +119,13 @@ fn text(db: &PvDatabase, name: &str, f: &str) -> String {
 /// Every value-class event the subscriber has queued, as text. A long-string
 /// post carries `String` when the value fits `MAX_STRING_SIZE` and `CharArray`
 /// otherwise, so both carriers count.
-fn drain(rx: &mut EventReader) -> Vec<String> {
+fn drain(db: &PvDatabase, rx: &mut EventReader) -> Vec<String> {
     let mut out = Vec::new();
     while let Ok(ev) = rx.try_recv() {
-        match &ev.snapshot.value {
+        match &ev
+            .delivered_value(&db.get_record("L").unwrap().read(), "VAL")
+            .unwrap()
+        {
             EpicsValue::CharArray(b) => {
                 let end = b.iter().position(|&c| c == 0).unwrap_or(b.len());
                 out.push(String::from_utf8_lossy(&b[..end]).into_owned());
@@ -244,12 +247,12 @@ async fn the_untouched_oval_lets_the_value_monitor_fire() {
             .unwrap()
     };
     // Drain the subscription's initial snapshot; only process-time posts count.
-    drain(&mut rx);
+    drain(&db, &mut rx);
 
     let mut posted = Vec::new();
     for _ in 0..3 {
         process(&db, "L").await;
-        posted.extend(drain(&mut rx));
+        posted.extend(drain(&db, &mut rx));
     }
     assert!(
         posted.iter().any(|v| v == "fault"),

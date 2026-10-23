@@ -56,7 +56,6 @@
 #![cfg(tokio_backend)]
 #![cfg(feature = "client")]
 
-use std::net::{Ipv4Addr, UdpSocket};
 use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
@@ -73,14 +72,14 @@ use serial_test::serial;
 const VALUE: f64 = 25.0;
 
 /// The environment pvxs#200 reports, with this host's broadcast addresses
-/// and a picked port pair. Returns the address list actually used so the
+/// and the kernel-picked ports. Returns the address list actually used so the
 /// test can print what it measured.
 ///
 /// # Safety (edition 2024)
 ///
 /// Process-env writes; the two tests in this file are `#[serial]`, so no
 /// other thread reads or writes the environment concurrently.
-fn apply_pvxs200_env(udp_port: u16) -> String {
+fn apply_pvxs200_env() -> String {
     // `broadcast_addrs()` is deliberately NOT used: it is C's SEARCH
     // destination set, which for a point-to-point interface is the PEER
     // address — and on a `wg`/tailscale `/32` that peer address is the
@@ -127,14 +126,14 @@ fn apply_pvxs200_env(udp_port: u16) -> String {
     unsafe {
         std::env::set_var("EPICS_PVA_ADDR_LIST", &addr_list);
         std::env::set_var("EPICS_PVA_AUTO_ADDR_LIST", "NO");
-        std::env::set_var("EPICS_PVA_BROADCAST_PORT", udp_port.to_string());
+        std::env::set_var("EPICS_PVA_BROADCAST_PORT", "0");
         std::env::set_var("EPICS_PVA_CONN_TMO", "30");
         std::env::set_var("EPICS_PVAS_AUTO_BEACON_ADDR_LIST", "NO");
         std::env::set_var("EPICS_PVAS_BEACON_ADDR_LIST", &addr_list);
         // Not in the reporter's list: deviation 2. The server reads its TCP
         // bind port from here, and `0` is the kernel's "pick one" — the
         // number is then whatever the listener that actually came up holds,
-        // published by [`name_the_bound_tcp_port`] before any client is
+        // published by [`name_the_bound_ports`] before any client is
         // built.
         std::env::set_var("EPICS_PVA_SERVER_PORT", "0");
     }
@@ -157,35 +156,23 @@ fn clear_pvxs200_env() {
     }
 }
 
-/// The one port in this test that still has to be named before anything
-/// binds: a SEARCH is sent to a port both halves agreed on in advance, so
-/// neither the client nor the server can be the one that picks it.
+/// Publish the TCP and search ports the server actually bound, so a client
+/// built after this reads numbers somebody owns rather than ones somebody
+/// guessed.
 ///
-/// That leaves the pick-and-drop window here and nowhere else in this file.
-/// The server's TCP port used to be picked the same way and no longer is —
-/// see [`name_the_bound_tcp_port`], which reads the number off the listener
-/// that came up instead of predicting it.
-fn pick_broadcast_port() -> u16 {
-    let u = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).expect("pick udp port");
-    let port = u.local_addr().unwrap().port();
-    drop(u);
-    port
-}
-
-/// Publish the TCP port the server actually bound, so a client built after
-/// this reads a number somebody owns rather than one somebody guessed.
-///
-/// `EPICS_PVA_SERVER_PORT` went into the environment as `0` before the
-/// server started; the server turned that into a bound listener, and this is
-/// where the answer comes back out.
-fn name_the_bound_tcp_port(server: &PvaServer) -> u16 {
+/// `EPICS_PVA_SERVER_PORT` and `EPICS_PVA_BROADCAST_PORT` went into the
+/// environment as `0` before the server started; the server turned them into
+/// bound sockets, and this is where the answers come back out.
+fn name_the_bound_ports(server: &PvaServer) -> (u16, u16) {
     let port = server.tcp_addr().port();
+    let udp = server.report().udp_port;
     // SAFETY: same as `apply_pvxs200_env` — both tests here are `#[serial]`
     // and no thread of theirs reads the environment concurrently.
     unsafe {
         std::env::set_var("EPICS_PVA_SERVER_PORT", port.to_string());
+        std::env::set_var("EPICS_PVA_BROADCAST_PORT", udp.to_string());
     }
-    port
+    (port, udp)
 }
 
 /// The server half: a wildcard-bound PVA server carrying the env config,
@@ -196,7 +183,7 @@ fn serve(pv_name: &str) -> PvaServer {
         .expect("open shared pv");
     let source = SharedSource::new();
     source.add(pv_name, pv);
-    let config = PvaServerConfig::default().with_env();
+    let config = PvaServerConfig::default().with_env().unwrap();
     PvaServer::start(Arc::new(source), config).expect("PVA server must start")
 }
 
@@ -218,11 +205,10 @@ fn scalar_f64(v: &PvField) -> f64 {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
 async fn same_process_client_reaches_a_same_process_server_under_pvxs200_env() {
-    let udp_port = pick_broadcast_port();
-    let addr_list = apply_pvxs200_env(udp_port);
+    let addr_list = apply_pvxs200_env();
     let pv_name = "UI25:SAMEPROC";
     let server = serve(pv_name);
-    let tcp_port = name_the_bound_tcp_port(&server);
+    let (tcp_port, udp_port) = name_the_bound_ports(&server);
 
     // Built after the env is in place: the client resolves its search
     // config once, at build time (`ClientSearchConfig::from_env`).
@@ -258,11 +244,10 @@ async fn same_process_client_reaches_a_same_process_server_under_pvxs200_env() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
 async fn same_host_other_process_client_reaches_the_server_under_pvxs200_env() {
-    let udp_port = pick_broadcast_port();
-    let addr_list = apply_pvxs200_env(udp_port);
+    let addr_list = apply_pvxs200_env();
     let pv_name = "UI25:OTHERPROC";
     let server = serve(pv_name);
-    let tcp_port = name_the_bound_tcp_port(&server);
+    let (tcp_port, udp_port) = name_the_bound_ports(&server);
 
     // `env!`, not `option_env!`: `pvget-rs` is a `[[bin]]` of this package
     // under the `client` feature this test target already builds with, so

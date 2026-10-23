@@ -37,16 +37,16 @@
 
 #![cfg(exec_backend)]
 
-#[path = "common/raw_ca.rs"]
-mod raw_ca;
-
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use epics_base_rs::error::{CaError, CaResult};
 use epics_base_rs::runtime::task::{background_init, block_on_sync};
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
+use epics_base_rs::server::record::{FieldDesc, ProcessOutcome, Record, RecordProcessResult};
+use epics_base_rs::types::{DbFieldType, EpicsValue};
 use epics_ca_rs::protocol::{
     CA_PROTO_ACCESS_RIGHTS, CA_PROTO_CLEAR_CHANNEL, CA_PROTO_CREATE_CHAN, CA_PROTO_EVENT_ADD,
     CA_PROTO_READ_NOTIFY, CA_PROTO_WRITE, CA_PROTO_WRITE_NOTIFY,
@@ -314,19 +314,16 @@ fn a_pending_put_callback_does_not_block_the_circuit() {
     let started = Instant::now();
     c.send(&write_frame(CA_PROTO_WRITE_NOTIFY, proc_sid, 0x21, 1.0));
 
-    // While the ODLY delay is running, an unrelated READ_NOTIFY on the same
-    // circuit must be answered — the message thread is not parked on the
-    // put-callback.
+    // While the put is pending, an unrelated READ_NOTIFY on the same circuit
+    // is answered ahead of it: a message thread parked on the put-callback
+    // could only reply after the WRITE_NOTIFY.
     c.send(&read_notify_frame(ao_sid, 0x22));
-    let r = c.expect(CA_PROTO_READ_NOTIFY, "READ_NOTIFY while put pending");
-    let read_at = started.elapsed();
-    assert_eq!(payload_double(&r), 1.5, "the ao still serves its value");
-    assert!(
-        read_at < ODLY,
-        "the READ_NOTIFY must be answered before the ODLY delay elapses \
-         (answered after {read_at:?}, ODLY is {ODLY:?}); a blocked message \
-         thread would serialise it behind the put-callback"
+    let r = c.expect_absent_before(
+        |f| cmmd_of(f) == CA_PROTO_WRITE_NOTIFY,
+        |f| cmmd_of(f) == CA_PROTO_READ_NOTIFY,
+        "READ_NOTIFY answered while the put is pending",
     );
+    assert_eq!(payload_double(&r), 1.5, "the ao still serves its value");
 
     // The put-callback itself lands only after the delay, on the executor.
     let wn = c.expect(CA_PROTO_WRITE_NOTIFY, "deferred WRITE_NOTIFY");
@@ -341,6 +338,90 @@ fn a_pending_put_callback_does_not_block_the_circuit() {
         "the put-callback must not complete before the ODLY delay \
          (completed after {done_at:?}, ODLY is {ODLY:?})"
     );
+
+    drop(c);
+    server.shutdown();
+    accept.join().unwrap();
+}
+
+/// A record whose process cycle goes async and stays there until the test calls
+/// `PvDatabase::complete_async_record` — C's PACT held across a device
+/// round-trip, with a deterministic end instead of a timer.
+struct HeldRecord {
+    val: f64,
+}
+
+static HELD_FIELDS: &[FieldDesc] = &[FieldDesc::new("VAL", DbFieldType::Double, false)];
+
+impl Record for HeldRecord {
+    fn record_type(&self) -> &'static str {
+        "held_putcb"
+    }
+
+    fn process(&mut self) -> CaResult<ProcessOutcome> {
+        Ok(ProcessOutcome {
+            result: RecordProcessResult::AsyncPending,
+            actions: Vec::new(),
+            device_did_compute: false,
+            status: Ok(()),
+        })
+    }
+
+    fn get_field(&self, name: &str) -> Option<EpicsValue> {
+        (name == "VAL").then_some(EpicsValue::Double(self.val))
+    }
+
+    fn put_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
+        match (name, value) {
+            ("VAL", EpicsValue::Double(v)) => {
+                self.val = v;
+                Ok(())
+            }
+            ("VAL", _) => Err(CaError::TypeMismatch("VAL".into())),
+            _ => Err(CaError::FieldNotFound(name.to_string())),
+        }
+    }
+
+    fn declared_fields(&self) -> &'static [FieldDesc] {
+        HELD_FIELDS
+    }
+
+    fn process_passive_fields(&self) -> &'static [&'static str] {
+        &["VAL"]
+    }
+}
+
+/// The put-callback stays pending until the test completes it, and the test
+/// does so only after the READ_NOTIFY reply has arrived. A message thread
+/// parked on the put — however it hands the completion over — can never
+/// produce that reply, so the property needs no clock and no reply race: the
+/// reply is either there while the put is held, or the test fails waiting.
+#[test]
+fn a_held_put_callback_does_not_block_the_circuit() {
+    let db = build_real_db();
+    block_on_sync(db.add_record("RT:HELD", Box::new(HeldRecord { val: 0.0 })))
+        .expect("blockable")
+        .expect("add RT:HELD");
+    let (server, addr, accept) = start_server(db.clone());
+    let mut c = connect_and_handshake(addr);
+
+    let held_sid = create_channel(&mut c, 1, "RT:HELD.VAL");
+    let ao_sid = create_channel(&mut c, 2, "RT:AO");
+
+    c.send(&write_frame(CA_PROTO_WRITE_NOTIFY, held_sid, 0x41, 3.0));
+    c.send(&read_notify_frame(ao_sid, 0x42));
+    let r = c.expect_absent_before(
+        |f| cmmd_of(f) == CA_PROTO_WRITE_NOTIFY,
+        |f| cmmd_of(f) == CA_PROTO_READ_NOTIFY,
+        "READ_NOTIFY answered while the put-callback is held",
+    );
+    assert_eq!(payload_double(&r), 1.5, "the ao still serves its value");
+
+    block_on_sync(db.complete_async_record("RT:HELD"))
+        .expect("blockable")
+        .expect("complete the held put");
+    let wn = c.expect(CA_PROTO_WRITE_NOTIFY, "released WRITE_NOTIFY");
+    assert_eq!(ioid_of(&wn), 0x41, "WRITE_NOTIFY reply echoes our ioid");
 
     drop(c);
     server.shutdown();

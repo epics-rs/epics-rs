@@ -1,1091 +1,465 @@
-//! High-resolution analyzer crystal control -- native Rust port of `hrCtl.st`.
+//! `hrCtl.st`, compiled by snc-rs from `build.rs` and run on `epics-seq-rs`.
 //!
-//! Controls a 4-bounce high-resolution monochromator with two analyzer crystals,
-//! each with independent (H,K,L,A) parameters. Supports nested and symmetric
-//! geometries, single-crystal and two-crystal operating modes, and world/local
-//! offset tracking for beam wander correction.
-//!
-//! Crystal angles are in *micro-radian* motor units internally; user-facing
-//! angles (theta, phi) are in degrees.
+//! The escaped C follows: the `%{ }%` subroutines as Rust, then one
+//! `seqg_escaped!` arm per fragment, its text as cpp hands it to snc.
 
-use std::collections::HashMap;
-use std::time::Duration;
+use std::ffi::c_int;
 
-use epics_base_rs::server::database::PvDatabase;
-use tracing::info;
+use epics_seq_rs::c::*;
 
-use crate::db_access::{DbChannel, DbMultiMonitor, alloc_origin};
-use crate::snl::kohzu_ctl::HC;
+/// `%%  static short  hrCtl_LS_TEST = 0;`: the real limit switches.
+const LS_TEST: i16 = 0;
 
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
-
-const PI: f64 = std::f64::consts::PI;
-/// Radians to degrees.
-const R2D: f64 = 180.0 / PI;
-/// Degrees to radians.
-const D2R: f64 = PI / 180.0;
-/// Micro-radians to degrees.
-const UR2D: f64 = R2D / 1_000_000.0;
-/// Degrees to micro-radians.
-const D2UR: f64 = 1_000_000.0 * PI / 180.0;
-
-// ---------------------------------------------------------------------------
-// Operating modes
-// ---------------------------------------------------------------------------
-
-/// HR operating mode (opMode / Mode2).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HrOpMode {
-    /// Single crystal -- only phi1 moves.
-    Single = 0,
-    /// Two crystals locked -- phi1 and phi2 move together.
-    TwoLocked = 1,
-    /// Two crystals independent -- user adjusts theta2 for fine energy.
-    TwoIndependent = 2,
-}
-
-impl HrOpMode {
-    pub fn from_i16(v: i16) -> Self {
-        match v {
-            1 => Self::TwoLocked,
-            2 => Self::TwoIndependent,
-            _ => Self::Single,
-        }
+/// `hrCtl_calc2dSpacing`.
+fn calc_2d_spacing(v: &seqg::seqg_vars, xtal: c_int, a: f64, h: f64, k: f64, l: f64) -> f64 {
+    let result = (2.0 * a) / sqrt(h * h + k * k + l * l);
+    v.opAlert.set(0);
+    if h % 2.0 != k % 2.0 || h % 2.0 != l % 2.0 {
+        v.opAlert.set(1);
     }
-}
-
-/// HR geometry (nested vs symmetric).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HrGeometry {
-    /// Nested: surfaces 1,4 use (H1,K1,L1); surfaces 2,3 use (H2,K2,L2).
-    Nested = 0,
-    /// Symmetric: surfaces 1,2 use (H1,K1,L1); surfaces 3,4 use (H2,K2,L2).
-    Symmetric = 1,
-}
-
-impl HrGeometry {
-    pub fn from_i16(v: i16) -> Self {
-        if v == 0 {
-            Self::Nested
-        } else {
-            Self::Symmetric
-        }
+    let avg = f64::from(((h + k + l) / 2.0) as f32);
+    let nint = avg.round();
+    if fabs(avg - nint) <= 0.25 && nint % 2.0 != 0.0 {
+        v.opAlert.set(1);
     }
-}
-
-// ---------------------------------------------------------------------------
-// State enum
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HrState {
-    Init,
-    InitSequence,
-    WaitForCommand,
-    DInputChanged,
-    PhiLimits,
-    EChanged,
-    LambdaChanged,
-    ThetaChanged,
-    CalcMovements,
-    MoveHr,
-    UpdateReadback,
-    CheckDone,
-    MotorsStopped,
-    CheckMotorLimits,
-    StopHr,
-    Tweak,
-}
-
-// ---------------------------------------------------------------------------
-// Pure physics functions
-// ---------------------------------------------------------------------------
-
-/// Calculate 2d-spacing for a crystal from lattice constant and Miller indices.
-/// Returns (two_d, is_forbidden, message).
-pub fn calc_2d_spacing(a: f64, h: f64, k: f64, l: f64) -> (f64, bool, String) {
-    let hkl_sq = h * h + k * k + l * l;
-    if hkl_sq <= 0.0 {
-        return (0.0, true, "Invalid HKL: all zero".to_string());
-    }
-    let two_d = (2.0 * a) / hkl_sq.sqrt();
-    let forbidden = crate::snl::kohzu_ctl::is_forbidden_reflection(h, k, l);
-    let msg = if forbidden {
-        "Invalid HKL combination".to_string()
-    } else {
-        "New d spacing".to_string()
-    };
-    (two_d, forbidden, msg)
-}
-
-/// Compute phi1 from theta1 (they are equal in all modes).
-pub fn theta1_to_phi1(theta1: f64) -> f64 {
-    theta1
-}
-
-/// Compute phi2 from phi1, theta1, theta2 for nested geometry.
-pub fn calc_phi2_nested(phi1: f64, theta1: f64, theta2: f64) -> f64 {
-    phi1 + theta1 + theta2
-}
-
-/// Compute phi2 for symmetric geometry.
-pub fn calc_phi2_symmetric(theta2: f64) -> f64 {
-    theta2
-}
-
-/// Compute phi2 for two-independent mode with nested geometry.
-/// Uses the perturbation formula from hrCtl.st.
-pub fn calc_phi2_independent_nested(
-    phi1: f64,
-    theta1: f64,
-    theta2_nom: f64,
-    lambda: f64,
-    lambda_nom: f64,
-    d1: f64,
-    d2: f64,
-) -> f64 {
-    let correction = R2D
-        * (lambda - lambda_nom)
-        * (1.0 / (d1 * (theta1 * D2R).cos()) + 1.0 / (d2 * (theta2_nom * D2R).cos()));
-    (phi1 + theta1 + theta2_nom) + correction
-}
-
-/// Compute phi2 for two-independent mode with symmetric geometry.
-pub fn calc_phi2_independent_symmetric(
-    theta2_nom: f64,
-    lambda: f64,
-    lambda_nom: f64,
-    d1: f64,
-    d2: f64,
-    theta1: f64,
-) -> f64 {
-    let correction = R2D
-        * (lambda - lambda_nom)
-        * (1.0 / (d1 * (theta1 * D2R).cos()) + 1.0 / (d2 * (theta2_nom * D2R).cos()));
-    theta2_nom + correction
-}
-
-/// Compute phi motor command from phi angle, offset, and world offset.
-/// `geom_sign` is -1 for symmetric geometry phi2, +1 otherwise.
-pub fn phi_to_motor(phi: f64, phi_off: f64, world_off_deg: f64) -> f64 {
-    (phi - phi_off - world_off_deg) * D2UR
-}
-
-/// Compute phi motor command for phi2 in symmetric geometry (world sign is reversed).
-pub fn phi2_to_motor_symmetric(phi2: f64, phi2_off: f64, world_off_deg: f64) -> f64 {
-    (phi2 - phi2_off + world_off_deg) * D2UR
-}
-
-/// Convert motor readback (micro-radians) to phi angle (degrees) with offset.
-pub fn motor_to_phi(motor_ur: f64, phi_off: f64, world_off_deg: f64) -> f64 {
-    motor_ur * UR2D + phi_off + world_off_deg
-}
-
-/// For phi2 in symmetric geometry, world offset sign is reversed.
-pub fn motor_to_phi2_symmetric(motor_ur: f64, phi2_off: f64, world_off_deg: f64) -> f64 {
-    motor_ur * UR2D + phi2_off - world_off_deg
-}
-
-/// Calculate readback values from motor positions.
-pub struct HrReadback {
-    pub phi1_rdbk: f64,
-    pub theta1_rdbk: f64,
-    pub phi2_rdbk: f64,
-    pub theta2_rdbk: f64,
-    pub lambda_rdbk: f64,
-    pub e_rdbk: f64,
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn calc_readback(
-    phi1_mot_rdbk: f64,
-    phi2_mot_rdbk: f64,
-    phi1_off: f64,
-    phi2_off: f64,
-    world_off: f64, // in degrees already (worldOff * uR2D applied by caller)
-    d1: f64,
-    d2: f64,
-    op_mode: HrOpMode,
-    geom: HrGeometry,
-) -> HrReadback {
-    let world_off_deg = world_off * UR2D;
-
-    let phi1_rdbk = motor_to_phi(phi1_mot_rdbk, phi1_off, world_off_deg);
-    let theta1_rdbk_initial = phi1_rdbk;
-
-    let (phi2_rdbk, lambda_rdbk) = match op_mode {
-        HrOpMode::Single => {
-            let lambda = d1 * (theta1_rdbk_initial * D2R).sin();
-            (0.0, lambda)
-        }
-        HrOpMode::TwoLocked => {
-            let phi2 = match geom {
-                HrGeometry::Nested => motor_to_phi(phi2_mot_rdbk, phi2_off, world_off_deg),
-                HrGeometry::Symmetric => {
-                    motor_to_phi2_symmetric(phi2_mot_rdbk, phi2_off, world_off_deg)
-                }
-            };
-            let lambda = d1 * (theta1_rdbk_initial * D2R).sin();
-            (phi2, lambda)
-        }
-        HrOpMode::TwoIndependent => {
-            let phi2 = match geom {
-                HrGeometry::Nested => motor_to_phi(phi2_mot_rdbk, phi2_off, world_off_deg),
-                HrGeometry::Symmetric => {
-                    motor_to_phi2_symmetric(phi2_mot_rdbk, phi2_off, world_off_deg)
-                }
-            };
-            let theta2_nom = (d1 * (theta1_rdbk_initial * D2R).sin() / d2).asin() * R2D;
-            let lambda = match geom {
-                HrGeometry::Nested => {
-                    d1 * (theta1_rdbk_initial * D2R).sin()
-                        + D2R * (phi2 - phi1_rdbk - theta1_rdbk_initial - theta2_nom)
-                            / (1.0 / (d1 * (theta1_rdbk_initial * D2R).cos())
-                                + 1.0 / (d2 * (theta2_nom * D2R).cos()))
-                }
-                HrGeometry::Symmetric => {
-                    d1 * (theta1_rdbk_initial * D2R).sin()
-                        + D2R * (phi2 - theta2_nom)
-                            / (1.0 / (d1 * (theta1_rdbk_initial * D2R).cos())
-                                + 1.0 / (d2 * (theta2_nom * D2R).cos()))
-                }
-            };
-            (phi2, lambda)
-        }
-    };
-
-    // Recompute theta from lambda
-    let theta1_rdbk = if d1 > 0.0 && lambda_rdbk.abs() <= d1 {
-        (lambda_rdbk / d1).asin() * R2D
-    } else {
-        theta1_rdbk_initial
-    };
-    let theta2_rdbk = if d2 > 0.0 && lambda_rdbk.abs() <= d2 && op_mode != HrOpMode::Single {
-        (lambda_rdbk / d2).asin() * R2D
-    } else {
-        0.0
-    };
-    let e_rdbk = if lambda_rdbk > 0.0 {
-        HC / lambda_rdbk
-    } else {
-        0.0
-    };
-
-    HrReadback {
-        phi1_rdbk,
-        theta1_rdbk,
-        phi2_rdbk,
-        theta2_rdbk,
-        lambda_rdbk,
-        e_rdbk,
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Configuration
-// ---------------------------------------------------------------------------
-
-pub struct HrConfig {
-    pub prefix: String,
-    pub n: String,
-    pub m_phi1: String,
-    pub m_phi2: String,
-}
-
-impl HrConfig {
-    pub fn new(prefix: &str, n: &str, m_phi1: &str, m_phi2: &str) -> Self {
-        Self {
-            prefix: prefix.to_string(),
-            n: n.to_string(),
-            m_phi1: m_phi1.to_string(),
-            m_phi2: m_phi2.to_string(),
-        }
-    }
-
-    fn pv(&self, suffix: &str) -> String {
-        format!("{}HR{}_{}", self.prefix, self.n, suffix)
-    }
-
-    fn pv_no_underscore(&self, suffix: &str) -> String {
-        format!("{}HR{}{}", self.prefix, self.n, suffix)
-    }
-
-    fn motor_pv(&self, motor: &str, field: &str) -> String {
-        format!("{}{}{}", self.prefix, motor, field)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Async runner
-// ---------------------------------------------------------------------------
-
-/// Run the HR analyzer crystal control state machine.
-pub async fn run(
-    config: HrConfig,
-    db: PvDatabase,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    println!("hrCtl: starting for prefix={}HR{}", config.prefix, config.n);
-
-    let my_origin = alloc_origin();
-
-    // -- Create channels --
-    let _ch_debug = DbChannel::with_origin(&db, &config.pv_no_underscore("CtlDebug"), my_origin);
-    let ch_msg1 = DbChannel::with_origin(&db, &config.pv("SeqMsg1SI"), my_origin);
-    let ch_msg2 = DbChannel::with_origin(&db, &config.pv("SeqMsg2SI"), my_origin);
-    let ch_alert = DbChannel::with_origin(&db, &config.pv("AlertBO"), my_origin);
-    let ch_oper_ack = DbChannel::with_origin(&db, &config.pv("OperAckBO"), my_origin);
-    let ch_put_vals = DbChannel::with_origin(&db, &config.pv("PutBO"), my_origin);
-    let ch_auto_mode = DbChannel::with_origin(&db, &config.pv("ModeBO"), my_origin);
-    let ch_op_mode = DbChannel::with_origin(&db, &config.pv("Mode2MO"), my_origin);
-    let ch_geom = DbChannel::with_origin(&db, &config.pv_no_underscore("_GeomMO"), my_origin);
-    let ch_moving = DbChannel::with_origin(&db, &config.pv("Moving"), my_origin);
-
-    // Crystal 1
-    let ch_h1 = DbChannel::with_origin(&db, &config.pv("H1AO"), my_origin);
-    let ch_k1 = DbChannel::with_origin(&db, &config.pv("K1AO"), my_origin);
-    let ch_l1 = DbChannel::with_origin(&db, &config.pv("L1AO"), my_origin);
-    let ch_a1 = DbChannel::with_origin(&db, &config.pv("A1AO"), my_origin);
-    let ch_d1 = DbChannel::with_origin(&db, &config.pv("2d1AO"), my_origin);
-
-    // Crystal 2
-    let ch_h2 = DbChannel::with_origin(&db, &config.pv("H2AO"), my_origin);
-    let ch_k2 = DbChannel::with_origin(&db, &config.pv("K2AO"), my_origin);
-    let ch_l2 = DbChannel::with_origin(&db, &config.pv("L2AO"), my_origin);
-    let ch_a2 = DbChannel::with_origin(&db, &config.pv("A2AO"), my_origin);
-    let ch_d2 = DbChannel::with_origin(&db, &config.pv("2d2AO"), my_origin);
-
-    // Energy / lambda
-    let ch_e = DbChannel::with_origin(&db, &config.pv("EAO"), my_origin);
-    let _ch_e_hi = DbChannel::with_origin(&db, &config.pv("EAO.DRVH"), my_origin);
-    let _ch_e_lo = DbChannel::with_origin(&db, &config.pv("EAO.DRVL"), my_origin);
-    let ch_e_rdbk = DbChannel::with_origin(&db, &config.pv("ERdbkAO"), my_origin);
-
-    let ch_lambda = DbChannel::with_origin(&db, &config.pv("LambdaAO"), my_origin);
-    let _ch_lambda_hi = DbChannel::with_origin(&db, &config.pv("LambdaAO.DRVH"), my_origin);
-    let _ch_lambda_lo = DbChannel::with_origin(&db, &config.pv("LambdaAO.DRVL"), my_origin);
-    let ch_lambda_rdbk = DbChannel::with_origin(&db, &config.pv("LambdaRdbkAO"), my_origin);
-
-    // Theta 1/2
-    let ch_theta1 = DbChannel::with_origin(&db, &config.pv("Theta1AO"), my_origin);
-    let _ch_theta1_hi = DbChannel::with_origin(&db, &config.pv("Theta1AO.DRVH"), my_origin);
-    let _ch_theta1_lo = DbChannel::with_origin(&db, &config.pv("Theta1AO.DRVL"), my_origin);
-    let ch_theta1_rdbk = DbChannel::with_origin(&db, &config.pv("Theta1RdbkAO"), my_origin);
-
-    let ch_theta2 = DbChannel::with_origin(&db, &config.pv("Theta2AO"), my_origin);
-    let _ch_theta2_hi = DbChannel::with_origin(&db, &config.pv("Theta2AO.DRVH"), my_origin);
-    let _ch_theta2_lo = DbChannel::with_origin(&db, &config.pv("Theta2AO.DRVL"), my_origin);
-    let ch_theta2_rdbk = DbChannel::with_origin(&db, &config.pv("Theta2RdbkAO"), my_origin);
-
-    // Phi 1/2
-    let ch_phi1 = DbChannel::with_origin(&db, &config.pv("phi1AO"), my_origin);
-    let ch_phi1_off = DbChannel::with_origin(&db, &config.pv("phi1OffAO"), my_origin);
-    let _ch_phi1_hi = DbChannel::with_origin(&db, &config.pv("phi1AO.DRVH"), my_origin);
-    let _ch_phi1_lo = DbChannel::with_origin(&db, &config.pv("phi1AO.DRVL"), my_origin);
-    let ch_phi1_rdbk = DbChannel::with_origin(&db, &config.pv("phi1RdbkAO"), my_origin);
-
-    let ch_phi2 = DbChannel::with_origin(&db, &config.pv("phi2AO"), my_origin);
-    let ch_phi2_off = DbChannel::with_origin(&db, &config.pv("phi2OffAO"), my_origin);
-    let _ch_phi2_hi = DbChannel::with_origin(&db, &config.pv("phi2AO.DRVH"), my_origin);
-    let _ch_phi2_lo = DbChannel::with_origin(&db, &config.pv("phi2AO.DRVL"), my_origin);
-    let ch_phi2_rdbk = DbChannel::with_origin(&db, &config.pv("phi2RdbkAO"), my_origin);
-
-    // Echo PVs
-    let ch_phi1_mot_name = DbChannel::with_origin(&db, &config.pv("phi1PvSI"), my_origin);
-    let ch_phi2_mot_name = DbChannel::with_origin(&db, &config.pv("phi2PvSI"), my_origin);
-    let _ch_phi1_cmd_echo = DbChannel::with_origin(&db, &config.pv("phi1CmdAO"), my_origin);
-    let _ch_phi2_cmd_echo = DbChannel::with_origin(&db, &config.pv("phi2CmdAO"), my_origin);
-    let ch_phi1_rdbk_echo = DbChannel::with_origin(&db, &config.pv("phi1RdbkAI"), my_origin);
-    let ch_phi2_rdbk_echo = DbChannel::with_origin(&db, &config.pv("phi2RdbkAI"), my_origin);
-    let ch_phi1_dmov_echo = DbChannel::with_origin(&db, &config.pv("phi1DmovBI"), my_origin);
-    let ch_phi2_dmov_echo = DbChannel::with_origin(&db, &config.pv("phi2DmovBI"), my_origin);
-
-    // Motor records
-    let ch_phi1_mot_stop =
-        DbChannel::with_origin(&db, &config.motor_pv(&config.m_phi1, ".STOP"), my_origin);
-    let ch_phi2_mot_stop =
-        DbChannel::with_origin(&db, &config.motor_pv(&config.m_phi2, ".STOP"), my_origin);
-    let ch_phi1_dmov =
-        DbChannel::with_origin(&db, &config.motor_pv(&config.m_phi1, ".DMOV"), my_origin);
-    let ch_phi2_dmov =
-        DbChannel::with_origin(&db, &config.motor_pv(&config.m_phi2, ".DMOV"), my_origin);
-    let ch_phi1_hls =
-        DbChannel::with_origin(&db, &config.motor_pv(&config.m_phi1, ".HLS"), my_origin);
-    let ch_phi1_lls =
-        DbChannel::with_origin(&db, &config.motor_pv(&config.m_phi1, ".LLS"), my_origin);
-    let ch_phi2_hls =
-        DbChannel::with_origin(&db, &config.motor_pv(&config.m_phi2, ".HLS"), my_origin);
-    let ch_phi2_lls =
-        DbChannel::with_origin(&db, &config.motor_pv(&config.m_phi2, ".LLS"), my_origin);
-
-    let ch_phi1_set_ao = DbChannel::with_origin(&db, &config.pv("phi1SetAO"), my_origin);
-    let ch_phi2_set_ao = DbChannel::with_origin(&db, &config.pv("phi2SetAO"), my_origin);
-
-    let _ch_phi1_mot_hilim =
-        DbChannel::with_origin(&db, &config.motor_pv(&config.m_phi1, ".HLM"), my_origin);
-    let _ch_phi1_mot_lolim =
-        DbChannel::with_origin(&db, &config.motor_pv(&config.m_phi1, ".LLM"), my_origin);
-    let _ch_phi2_mot_hilim =
-        DbChannel::with_origin(&db, &config.motor_pv(&config.m_phi2, ".HLM"), my_origin);
-    let _ch_phi2_mot_lolim =
-        DbChannel::with_origin(&db, &config.motor_pv(&config.m_phi2, ".LLM"), my_origin);
-
-    let ch_phi1_mot_cmd =
-        DbChannel::with_origin(&db, &config.motor_pv(&config.m_phi1, ""), my_origin);
-    let ch_phi2_mot_cmd =
-        DbChannel::with_origin(&db, &config.motor_pv(&config.m_phi2, ""), my_origin);
-    let ch_phi1_mot_rbv =
-        DbChannel::with_origin(&db, &config.motor_pv(&config.m_phi1, ".RBV"), my_origin);
-    let ch_phi2_mot_rbv =
-        DbChannel::with_origin(&db, &config.motor_pv(&config.m_phi2, ".RBV"), my_origin);
-
-    let ch_world_off = DbChannel::with_origin(&db, &config.pv("worldOffAO"), my_origin);
-    let _ch_use_set = DbChannel::with_origin(&db, &config.pv("UseSetBO"), my_origin);
-
-    let _ch_theta_min =
-        DbChannel::with_origin(&db, &config.pv_no_underscore("_thetaMin"), my_origin);
-    let _ch_theta_max =
-        DbChannel::with_origin(&db, &config.pv_no_underscore("_thetaMax"), my_origin);
-
-    // Build multi-monitor for all event-driving PVs
-    let monitored_pvs: Vec<String> = vec![
-        config.pv("EAO"),
-        config.pv("LambdaAO"),
-        config.pv("Theta1AO"),
-        config.pv("Theta2AO"),
-        config.pv("H1AO"),
-        config.pv("K1AO"),
-        config.pv("L1AO"),
-        config.pv("A1AO"),
-        config.pv("H2AO"),
-        config.pv("K2AO"),
-        config.pv("L2AO"),
-        config.pv("A2AO"),
-        config.pv("PutBO"),
-        config.pv("ModeBO"),
-        config.pv("OperAckBO"),
-        config.motor_pv(&config.m_phi1, ".RBV"),
-        config.motor_pv(&config.m_phi2, ".RBV"),
-        config.pv("worldOffAO"),
-        config.pv("phi1OffAO"),
-        config.pv("phi2OffAO"),
-        config.pv("UseSetBO"),
-        config.pv("Mode2MO"),
-        config.pv_no_underscore("_GeomMO"),
-        config.pv("Moving"),
-    ];
-    let mut monitor = DbMultiMonitor::new_filtered(&db, &monitored_pvs, my_origin).await;
-    println!(
-        "hrCtl: subscribed to {} PVs, {} active",
-        monitored_pvs.len(),
-        monitor.sub_count()
-    );
-
-    // -- Initialize --
-    let _ = ch_put_vals.put_i16_process(0).await;
-    let _ = ch_auto_mode.put_i16_process(0).await;
-    let _ = ch_oper_ack.put_i16_process(0).await;
-
-    let phi1_name = format!("{}{}", config.prefix, config.m_phi1);
-    let phi2_name = format!("{}{}", config.prefix, config.m_phi2);
-    let _ = ch_phi1_mot_name.put_string_process(&phi1_name).await;
-    let _ = ch_phi2_mot_name.put_string_process(&phi2_name).await;
-
-    // Read crystal parameters
-    let mut h1 = ch_h1.get_f64().await;
-    let mut k1 = ch_k1.get_f64().await;
-    let mut l1 = ch_l1.get_f64().await;
-    let mut a1 = ch_a1.get_f64().await;
-    let (mut d1, _, _) = calc_2d_spacing(a1, h1, k1, l1);
-    let _ = ch_d1.put_f64_process(d1).await;
-
-    let mut h2 = ch_h2.get_f64().await;
-    let mut k2 = ch_k2.get_f64().await;
-    let mut l2 = ch_l2.get_f64().await;
-    let mut a2 = ch_a2.get_f64().await;
-    let (mut d2, _, _) = calc_2d_spacing(a2, h2, k2, l2);
-    let _ = ch_d2.put_f64_process(d2).await;
-
-    let mut op_mode = HrOpMode::from_i16(ch_op_mode.get_i16().await);
-    let mut geom = HrGeometry::from_i16(ch_geom.get_i16().await);
-    let mut phi1_off = ch_phi1_off.get_f64().await;
-    let mut phi2_off = ch_phi2_off.get_f64().await;
-    let mut world_off = ch_world_off.get_f64().await;
-    let mut auto_mode = false;
-    let mut use_set_mode = false;
-    let mut _caused_move = false;
-
-    // Read motor readbacks and compute initial angles
-    let phi1_mot_rdbk = ch_phi1_mot_rbv.get_f64().await;
-    let phi2_mot_rdbk = ch_phi2_mot_rbv.get_f64().await;
-    let world_off_deg = world_off * UR2D;
-
-    let mut phi1_val = motor_to_phi(phi1_mot_rdbk, phi1_off, world_off_deg);
-    let mut theta1_val = phi1_val;
-    let _ = ch_phi1.put_f64_process(phi1_val).await;
-    let _ = ch_theta1.put_f64_process(theta1_val).await;
-
-    let mut phi2_val = match geom {
-        HrGeometry::Nested => motor_to_phi(phi2_mot_rdbk, phi2_off, world_off_deg),
-        HrGeometry::Symmetric => motor_to_phi2_symmetric(phi2_mot_rdbk, phi2_off, world_off_deg),
-    };
-    let mut theta2_val = match geom {
-        HrGeometry::Nested => phi2_val - phi1_val - theta1_val,
-        HrGeometry::Symmetric => phi2_val,
-    };
-    let _ = ch_phi2.put_f64_process(phi2_val).await;
-    let _ = ch_theta2.put_f64_process(theta2_val).await;
-
-    // Compute initial lambda/E from theta1
-    let mut lambda_val = d1 * (theta1_val * D2R).sin();
-    let _ = ch_lambda.put_f64_process(lambda_val).await;
-    let mut e_val = if lambda_val > 0.0 {
-        HC / lambda_val
-    } else {
-        0.0
-    };
-    let _ = ch_e.put_f64_process(e_val).await;
-
-    // Initial readback
-    let rdbk = calc_readback(
-        phi1_mot_rdbk,
-        phi2_mot_rdbk,
-        phi1_off,
-        phi2_off,
-        world_off,
-        d1,
-        d2,
-        op_mode,
-        geom,
-    );
-    let _ = ch_phi1_rdbk.put_f64_process(rdbk.phi1_rdbk).await;
-    let _ = ch_theta1_rdbk.put_f64_process(rdbk.theta1_rdbk).await;
-    let _ = ch_phi2_rdbk.put_f64_process(rdbk.phi2_rdbk).await;
-    let _ = ch_theta2_rdbk.put_f64_process(rdbk.theta2_rdbk).await;
-    let _ = ch_lambda_rdbk.put_f64_process(rdbk.lambda_rdbk).await;
-    let _ = ch_e_rdbk.put_f64_process(rdbk.e_rdbk).await;
-
-    let _ = ch_msg1.put_string_process("HR Control Ready").await;
-    let _ = ch_msg2.put_string_process(" ").await;
-
-    info!(
-        "HR controller initialized for {}HR{}",
-        config.prefix, config.n
-    );
-
-    // PV name constants for dispatch
-    let pv_e = config.pv("EAO");
-    let pv_lambda = config.pv("LambdaAO");
-    let pv_theta1 = config.pv("Theta1AO");
-    let pv_theta2 = config.pv("Theta2AO");
-    let pv_h1 = config.pv("H1AO");
-    let pv_k1 = config.pv("K1AO");
-    let pv_l1 = config.pv("L1AO");
-    let pv_a1 = config.pv("A1AO");
-    let pv_h2 = config.pv("H2AO");
-    let pv_k2 = config.pv("K2AO");
-    let pv_l2 = config.pv("L2AO");
-    let pv_a2 = config.pv("A2AO");
-    let pv_put_vals = config.pv("PutBO");
-    let pv_auto_mode = config.pv("ModeBO");
-    let pv_oper_ack = config.pv("OperAckBO");
-    let pv_phi1_mot_rbv = config.motor_pv(&config.m_phi1, ".RBV");
-    let pv_phi2_mot_rbv = config.motor_pv(&config.m_phi2, ".RBV");
-    let pv_world_off = config.pv("worldOffAO");
-    let pv_phi1_off = config.pv("phi1OffAO");
-    let pv_phi2_off = config.pv("phi2OffAO");
-    let pv_use_set = config.pv("UseSetBO");
-    let pv_op_mode = config.pv("Mode2MO");
-    let pv_geom = config.pv_no_underscore("_GeomMO");
-
-    println!("hrCtl: ready");
-
-    // -- Main loop --
-    let mut deferred_events: HashMap<String, f64> = HashMap::new();
-    loop {
-        let mut proceed_to_theta_changed = false;
-
-        let (changed_pv, new_val) = if let Some(key) = deferred_events.keys().next().cloned() {
-            let val = deferred_events.remove(&key).unwrap();
-            (key, val)
-        } else {
-            monitor.wait_change().await
-        };
-
-        if changed_pv == pv_e {
-            let new_e = new_val;
-            if (new_e - e_val).abs() > 1e-15 {
-                e_val = new_e;
-                lambda_val = HC / e_val;
-                let _ = ch_lambda.put_f64_process(lambda_val).await;
-                proceed_to_theta_changed = true;
-            }
-        } else if changed_pv == pv_lambda {
-            let new_l = new_val;
-            if (new_l - lambda_val).abs() > 1e-15 {
-                lambda_val = new_l;
-                proceed_to_theta_changed = true;
-            }
-        } else if changed_pv == pv_theta1 {
-            theta1_val = new_val;
-            proceed_to_theta_changed = true;
-        } else if changed_pv == pv_theta2 {
-            theta2_val = new_val;
-            proceed_to_theta_changed = true;
-        } else if changed_pv == pv_h1
-            || changed_pv == pv_k1
-            || changed_pv == pv_l1
-            || changed_pv == pv_a1
-        {
-            h1 = ch_h1.get_f64().await;
-            k1 = ch_k1.get_f64().await;
-            l1 = ch_l1.get_f64().await;
-            a1 = ch_a1.get_f64().await;
-            let (d, _, _) = calc_2d_spacing(a1, h1, k1, l1);
-            d1 = d;
-            let _ = ch_d1.put_f64_process(d1).await;
-            auto_mode = false;
-            let _ = ch_auto_mode.put_i16_process(0).await;
-        } else if changed_pv == pv_h2
-            || changed_pv == pv_k2
-            || changed_pv == pv_l2
-            || changed_pv == pv_a2
-        {
-            h2 = ch_h2.get_f64().await;
-            k2 = ch_k2.get_f64().await;
-            l2 = ch_l2.get_f64().await;
-            a2 = ch_a2.get_f64().await;
-            let (d, _, _) = calc_2d_spacing(a2, h2, k2, l2);
-            d2 = d;
-            let _ = ch_d2.put_f64_process(d2).await;
-            auto_mode = false;
-            let _ = ch_auto_mode.put_i16_process(0).await;
-        } else if changed_pv == pv_put_vals {
-            if new_val as i16 != 0 {
-                proceed_to_theta_changed = true;
-            }
-        } else if changed_pv == pv_auto_mode {
-            auto_mode = new_val as i16 != 0;
-        } else if changed_pv == pv_oper_ack {
-            if new_val as i16 != 0 {
-                let _ = ch_alert.put_i16_process(0).await;
-                let _ = ch_msg1.put_string_process(" ").await;
-                let _ = ch_msg2.put_string_process(" ").await;
-            }
-        } else if changed_pv == pv_phi1_mot_rbv || changed_pv == pv_phi2_mot_rbv {
-            let rdbk = calc_readback(
-                ch_phi1_mot_rbv.get_f64().await,
-                ch_phi2_mot_rbv.get_f64().await,
-                phi1_off,
-                phi2_off,
-                world_off,
-                d1,
-                d2,
-                op_mode,
-                geom,
-            );
-            let _ = ch_phi1_rdbk.put_f64_process(rdbk.phi1_rdbk).await;
-            let _ = ch_theta1_rdbk.put_f64_process(rdbk.theta1_rdbk).await;
-            let _ = ch_lambda_rdbk.put_f64_process(rdbk.lambda_rdbk).await;
-            let _ = ch_e_rdbk.put_f64_process(rdbk.e_rdbk).await;
-            if op_mode != HrOpMode::Single {
-                let _ = ch_phi2_rdbk.put_f64_process(rdbk.phi2_rdbk).await;
-                let _ = ch_theta2_rdbk.put_f64_process(rdbk.theta2_rdbk).await;
-            }
-        } else if changed_pv == pv_world_off {
-            world_off = ch_world_off.get_f64().await;
-            proceed_to_theta_changed = true;
-        } else if changed_pv == pv_phi1_off {
-            phi1_off = ch_phi1_off.get_f64().await;
-        } else if changed_pv == pv_phi2_off {
-            phi2_off = ch_phi2_off.get_f64().await;
-        } else if changed_pv == pv_use_set {
-            use_set_mode = new_val as i16 != 0;
-        } else if changed_pv == pv_op_mode {
-            op_mode = HrOpMode::from_i16(new_val as i16);
-            auto_mode = false;
-            let _ = ch_auto_mode.put_i16_process(0).await;
-            let _ = ch_msg2.put_string_process("Set to Manual Mode").await;
-        } else if changed_pv == pv_geom {
-            geom = HrGeometry::from_i16(new_val as i16);
-            auto_mode = false;
-            let _ = ch_auto_mode.put_i16_process(0).await;
-            let _ = ch_msg1
-                .put_string_process("New geometry. Switch Phi 2 motor dir.")
-                .await;
-            let _ = ch_alert.put_i16_process(1).await;
-        }
-
-        if !proceed_to_theta_changed {
-            continue;
-        }
-
-        // -- Lambda changed processing --
-        if d1 > 0.0 && lambda_val > d1 {
-            let _ = ch_msg1
-                .put_string_process("Wavelength > 2d spacing of crystal 1.")
-                .await;
-            let _ = ch_alert.put_i16_process(1).await;
-        } else if d2 > 0.0 && lambda_val > d2 && op_mode != HrOpMode::Single {
-            let _ = ch_msg1
-                .put_string_process("Wavelength > 2d spacing of crystal 2.")
-                .await;
-            let _ = ch_alert.put_i16_process(1).await;
-        } else {
-            // Compute theta from lambda
-            match op_mode {
-                HrOpMode::Single => {
-                    if d1 > 0.0 {
-                        theta1_val = (lambda_val / d1).asin() * R2D;
-                    }
-                    let _ = ch_theta1.put_f64_process(theta1_val).await;
-                }
-                HrOpMode::TwoLocked => {
-                    if d1 > 0.0 {
-                        theta1_val = (lambda_val / d1).asin() * R2D;
-                    }
-                    if d2 > 0.0 {
-                        theta2_val = (lambda_val / d2).asin() * R2D;
-                    }
-                    let _ = ch_theta1.put_f64_process(theta1_val).await;
-                    let _ = ch_theta2.put_f64_process(theta2_val).await;
-                }
-                HrOpMode::TwoIndependent => {
-                    if d2 > 0.0 {
-                        theta2_val = (lambda_val / d2).asin() * R2D;
-                    }
-                    let _ = ch_theta2.put_f64_process(theta2_val).await;
-                }
-            }
-        }
-
-        // -- Theta changed -> calc phi, lambda --
-        let world_off_deg = world_off * UR2D;
-        match op_mode {
-            HrOpMode::Single | HrOpMode::TwoLocked => {
-                lambda_val = d1 * (theta1_val * D2R).sin();
-                phi1_val = theta1_to_phi1(theta1_val);
-                if op_mode == HrOpMode::TwoLocked {
-                    phi2_val = match geom {
-                        HrGeometry::Nested => calc_phi2_nested(phi1_val, theta1_val, theta2_val),
-                        HrGeometry::Symmetric => calc_phi2_symmetric(theta2_val),
-                    };
-                }
-            }
-            HrOpMode::TwoIndependent => {
-                let lambda_nom = d1 * (theta1_val * D2R).sin();
-                let theta2_nom = if d2 > 0.0 {
-                    (lambda_nom / d2).asin() * R2D
-                } else {
-                    0.0
-                };
-                lambda_val = d2 * (theta2_val * D2R).sin();
-                phi1_val = theta1_to_phi1(theta1_val);
-                phi2_val = match geom {
-                    HrGeometry::Nested => calc_phi2_independent_nested(
-                        phi1_val, theta1_val, theta2_nom, lambda_val, lambda_nom, d1, d2,
-                    ),
-                    HrGeometry::Symmetric => calc_phi2_independent_symmetric(
-                        theta2_nom, lambda_val, lambda_nom, d1, d2, theta1_val,
-                    ),
-                };
-            }
-        }
-        let _ = ch_phi1.put_f64_process(phi1_val).await;
-        if op_mode != HrOpMode::Single {
-            let _ = ch_phi2.put_f64_process(phi2_val).await;
-        }
-        let _ = ch_lambda.put_f64_process(lambda_val).await;
-        e_val = if lambda_val > 0.0 {
-            HC / lambda_val
-        } else {
-            0.0
-        };
-        let _ = ch_e.put_f64_process(e_val).await;
-
-        // Update readbacks
-        let rdbk = calc_readback(
-            ch_phi1_mot_rbv.get_f64().await,
-            ch_phi2_mot_rbv.get_f64().await,
-            phi1_off,
-            phi2_off,
-            world_off,
-            d1,
-            d2,
-            op_mode,
-            geom,
+    if v.opAlert.get() != 0 {
+        sprintf(
+            &v.seqMsg1,
+            "Invalid HKL combination for crystal %1d",
+            &[CArg::from(xtal)],
         );
-        let _ = ch_phi1_rdbk.put_f64_process(rdbk.phi1_rdbk).await;
-        let _ = ch_theta1_rdbk.put_f64_process(rdbk.theta1_rdbk).await;
-        let _ = ch_lambda_rdbk.put_f64_process(rdbk.lambda_rdbk).await;
-        let _ = ch_e_rdbk.put_f64_process(rdbk.e_rdbk).await;
-        if op_mode != HrOpMode::Single {
-            let _ = ch_phi2_rdbk.put_f64_process(rdbk.phi2_rdbk).await;
-            let _ = ch_theta2_rdbk.put_f64_process(rdbk.theta2_rdbk).await;
-        }
-
-        // -- Calc motor movements --
-        if use_set_mode {
-            let phi1_mot_cur = ch_phi1_mot_rbv.get_f64().await;
-            phi1_off = phi1_val - phi1_mot_cur / D2UR;
-            let _ = ch_phi1_off.put_f64_process(phi1_off).await;
-            if op_mode != HrOpMode::Single {
-                let phi2_mot_cur = ch_phi2_mot_rbv.get_f64().await;
-                phi2_off = phi2_val - phi2_mot_cur / D2UR;
-                let _ = ch_phi2_off.put_f64_process(phi2_off).await;
-            }
-            let _ = ch_put_vals.put_i16_process(0).await;
-        }
-
-        let phi1_mot_desired = phi_to_motor(phi1_val, phi1_off, world_off_deg);
-        let _ = ch_phi1_set_ao.put_f64_process(phi1_mot_desired).await;
-
-        let phi2_mot_desired = if op_mode != HrOpMode::Single {
-            let v = match geom {
-                HrGeometry::Nested => phi_to_motor(phi2_val, phi2_off, world_off_deg),
-                HrGeometry::Symmetric => phi2_to_motor_symmetric(phi2_val, phi2_off, world_off_deg),
-            };
-            let _ = ch_phi2_set_ao.put_f64_process(v).await;
-            v
-        } else {
-            0.0
-        };
-
-        // -- Move motors --
-        let put_requested = ch_put_vals.get_i16().await != 0;
-        if (auto_mode || put_requested) && !use_set_mode {
-            let _ = ch_phi1_mot_cmd.put_f64_process(phi1_mot_desired).await;
-            if op_mode != HrOpMode::Single {
-                let _ = ch_phi2_mot_cmd.put_f64_process(phi2_mot_desired).await;
-            }
-            let _ = ch_put_vals.put_i16_process(0).await;
-            _caused_move = true;
-
-            // Wait for motors
-            loop {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-
-                // Check limit switches
-                if ch_phi1_hls.get_i16().await != 0 || ch_phi1_lls.get_i16().await != 0 {
-                    let _ = ch_msg1
-                        .put_string_process("Theta 1 motor hit a limit switch!")
-                        .await;
-                    let _ = ch_alert.put_i16_process(1).await;
-                    auto_mode = false;
-                    let _ = ch_auto_mode.put_i16_process(0).await;
-                    let _ = ch_phi1_mot_stop.put_i16_process(1).await;
-                    if op_mode != HrOpMode::Single {
-                        let _ = ch_phi2_mot_stop.put_i16_process(1).await;
-                    }
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                    break;
-                }
-                if op_mode != HrOpMode::Single
-                    && (ch_phi2_hls.get_i16().await != 0 || ch_phi2_lls.get_i16().await != 0)
-                {
-                    let _ = ch_msg1
-                        .put_string_process("Theta 2 motor hit a limit switch!")
-                        .await;
-                    let _ = ch_alert.put_i16_process(1).await;
-                    auto_mode = false;
-                    let _ = ch_auto_mode.put_i16_process(0).await;
-                    let _ = ch_phi1_mot_stop.put_i16_process(1).await;
-                    let _ = ch_phi2_mot_stop.put_i16_process(1).await;
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                    break;
-                }
-
-                // Update readbacks
-                let rdbk = calc_readback(
-                    ch_phi1_mot_rbv.get_f64().await,
-                    ch_phi2_mot_rbv.get_f64().await,
-                    phi1_off,
-                    phi2_off,
-                    world_off,
-                    d1,
-                    d2,
-                    op_mode,
-                    geom,
-                );
-                let _ = ch_phi1_rdbk.put_f64_process(rdbk.phi1_rdbk).await;
-                let _ = ch_theta1_rdbk.put_f64_process(rdbk.theta1_rdbk).await;
-                let _ = ch_lambda_rdbk.put_f64_process(rdbk.lambda_rdbk).await;
-                let _ = ch_e_rdbk.put_f64_process(rdbk.e_rdbk).await;
-                if op_mode != HrOpMode::Single {
-                    let _ = ch_phi2_rdbk.put_f64_process(rdbk.phi2_rdbk).await;
-                    let _ = ch_theta2_rdbk.put_f64_process(rdbk.theta2_rdbk).await;
-                }
-
-                let d1_done = ch_phi1_dmov.get_i16().await != 0;
-                let d2_done = if op_mode != HrOpMode::Single {
-                    ch_phi2_dmov.get_i16().await != 0
-                } else {
-                    true
-                };
-                if d1_done && d2_done {
-                    break;
-                }
-            }
-            _caused_move = false;
-            let _ = ch_moving.put_i16_process(0).await;
-        }
-
-        // Echo updates
-        let _ = ch_phi1_rdbk_echo
-            .put_f64_process(ch_phi1_mot_rbv.get_f64().await)
-            .await;
-        let _ = ch_phi2_rdbk_echo
-            .put_f64_process(ch_phi2_mot_rbv.get_f64().await)
-            .await;
-        let _ = ch_phi1_dmov_echo
-            .put_i16_process(ch_phi1_dmov.get_i16().await)
-            .await;
-        let _ = ch_phi2_dmov_echo
-            .put_i16_process(ch_phi2_dmov.get_i16().await)
-            .await;
     }
+    result
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
+/// `hrCtl_calcReadback`.
+fn calc_readback(v: &seqg::seqg_vars) {
+    let (d1, d2, d2r, r2d, ur2d) = (
+        v.D1.get(),
+        v.D2.get(),
+        v.D2R.get(),
+        v.R2D.get(),
+        v.uR2D.get(),
+    );
+    let world = v.worldOff.get() * ur2d;
+    v.phi1Rdbk
+        .set(v.phi1MotRdbk.get() * ur2d + (v.phi1Off.get() + world));
+    v.theta1Rdbk.set(v.phi1Rdbk.get());
+    let theta1 = v.theta1Rdbk.get();
+    let set_phi2_rdbk = || {
+        let off = if v.Geom.get() == 0 {
+            v.phi2Off.get() + world
+        } else {
+            v.phi2Off.get() - world
+        };
+        v.phi2Rdbk.set(v.phi2MotRdbk.get() * ur2d + off);
+    };
+    match v.opMode.get() {
+        0 => v.lambdaRdbk.set(d1 * sin(theta1 * d2r)),
+        1 => {
+            set_phi2_rdbk();
+            v.lambdaRdbk.set(d1 * sin(theta1 * d2r));
+        }
+        2 => {
+            set_phi2_rdbk();
+            v.theta2Nom.set(asin(d1 * sin(theta1 * d2r) / d2) * r2d);
+            let nom = v.theta2Nom.get();
+            let dev = if v.Geom.get() == 0 {
+                v.phi2Rdbk.get() - v.phi1Rdbk.get() - theta1 - nom
+            } else {
+                v.phi2Rdbk.get() - nom
+            };
+            v.lambdaRdbk.set(
+                d1 * sin(theta1 * d2r)
+                    + d2r * dev / (1.0 / (d1 * cos(theta1 * d2r)) + 1.0 / (d2 * cos(nom * d2r))),
+            );
+        }
+        _ => {}
+    }
+    let lambda = v.lambdaRdbk.get();
+    v.theta1Rdbk.set(asin(lambda / d1) * r2d);
+    if v.opMode.get() != 0 {
+        v.theta2Rdbk.set(asin(lambda / d2) * r2d);
+    }
+    v.ERdbk.set(v.hc.get() / lambda);
+}
+
+macro_rules! seqg_escaped {
+    (r#"static short hrCtl_LS_TEST = 0;"#) => {};
+    (r#"#include <string.h>"#) => {};
+    (r#"#include <math.h>"#) => {};
+    (r#"static double hrCtl_calc2dSpacing(struct UserVar *pVar, int xtal, double A, double H, double K, double L);"#) => {};
+    (r#"static void hrCtl_calcReadback(struct UserVar *pVar);"#) => {};
+    ($env:ident, r#"printf("hrCtl:init: entry\n");"#) => {
+        printf("hrCtl:init: entry\n", &[])
+    };
+    ($env:ident, r#"printf("hrCtl:initSequence: entry\n");"#) => {
+        printf("hrCtl:initSequence: entry\n", &[])
+    };
+    ($env:ident, r#"char *hrCtl_pmacP = seq_macValueGet(ssId,"P"); char *hrCtl_pmacM = seq_macValueGet(ssId,"M_PHI1"); if (hrCtl_pmacP == 0 || hrCtl_pmacM == 0) { sprintf(pVar->phi1MotName,"??????"); } else { snprintf(pVar->phi1MotName, sizeof(pVar->phi1MotName), "%s%s", hrCtl_pmacP, hrCtl_pmacM); } hrCtl_pmacM = seq_macValueGet(ssId,"M_PHI2"); if (hrCtl_pmacP == 0 || hrCtl_pmacM == 0) { sprintf(pVar->phi2MotName,"??????"); } else { snprintf(pVar->phi2MotName, sizeof(pVar->phi2MotName), "%s%s", hrCtl_pmacP, hrCtl_pmacM); }"#) => {{
+        let v = $env.var();
+        let p = $env.mac_value_get("P");
+        for (name, motor) in [(&v.phi1MotName, "M_PHI1"), (&v.phi2MotName, "M_PHI2")] {
+            let m = $env.mac_value_get(motor);
+            if p.is_none() || m.is_none() {
+                sprintf(name, "??????", &[]);
+            } else {
+                sprintf(name, "%s%s", &[CArg::from(p.clone()), CArg::from(m)]);
+            }
+        }
+    }};
+    (
+        $env:ident,
+        r#"if (hrCtl_LS_TEST) {"#,
+        $test:block,
+        r#"} else {"#,
+        $real:block,
+        r#"}"#
+    ) => {
+        if LS_TEST != 0 $test else $real
+    };
+    ($env:ident, r#"printf("hrCtl:initSequence: opMode=%d, Geom=%d, phi2=%f\n", pVar->opMode, pVar->Geom, pVar->phi2);"#) => {{
+        let v = $env.var();
+        printf(
+            "hrCtl:initSequence: opMode=%d, Geom=%d, phi2=%f\n",
+            &[
+                CArg::from(v.opMode.get()),
+                CArg::from(v.Geom.get()),
+                CArg::from(v.phi2.get()),
+            ],
+        )
+    }};
+    ($env:ident, r#"printf("hrCtl:waitForCmndEnter: entry\n");"#) => {
+        printf("hrCtl:waitForCmndEnter: entry\n", &[])
+    };
+    ($env:ident, r#"printf("hrCtl:waitForCmdEnter: initSeqDone\n");"#) => {
+        printf("hrCtl:waitForCmdEnter: initSeqDone\n", &[])
+    };
+    ($env:ident, r#"printf("hrCtl:waitForCmdEnter: Geom=%d, phi2=%f\n", pVar->Geom, pVar->phi2);"#) => {{
+        let v = $env.var();
+        printf(
+            "hrCtl:waitForCmdEnter: Geom=%d, phi2=%f\n",
+            &[
+                CArg::from(v.Geom.get()),
+                CArg::from(v.phi2.get()),
+            ],
+        )
+    }};
+    ($env:ident, r#"hrCtl_calcReadback(pVar);"#) => {
+        calc_readback($env.var())
+    };
+    ($env:ident, r#"printf("hrCtl:waitForCmndEnter: Moving=%d; Done=%d\n", pVar->hr_Moving, pVar->hr_Done);"#) => {{
+        let v = $env.var();
+        printf(
+            "hrCtl:waitForCmndEnter: Moving=%d; Done=%d\n",
+            &[
+                CArg::from(v.hr_Moving.get()),
+                CArg::from(v.hr_Done.get()),
+            ],
+        )
+    }};
+    ($env:ident, r#"printf("hrCtl:waitForCmndEnter: asserting 'done'.\n");"#) => {
+        printf("hrCtl:waitForCmndEnter: asserting 'done'.\n", &[])
+    };
+    ($env:ident, r#"printf("hrCtl:waitForCmnd: entry\n");"#) => {
+        printf("hrCtl:waitForCmnd: entry\n", &[])
+    };
+    ($env:ident, r#"printf("hrCtl:waitForCmd: phi1MotRdbkPseudo_mon\n");"#) => {
+        printf("hrCtl:waitForCmd: phi1MotRdbkPseudo_mon\n", &[])
+    };
+    ($env:ident, r#"printf("hrCtl:waitForCmd: phi2MotRdbkPseudo_mon\n");"#) => {
+        printf("hrCtl:waitForCmd: phi2MotRdbkPseudo_mon\n", &[])
+    };
+    ($env:ident, r#"printf("hrCtl:waitForCmd: E_mon\n");"#) => {
+        printf("hrCtl:waitForCmd: E_mon\n", &[])
+    };
+    ($env:ident, r#"printf("hrCtl:waitForCmd: lambda_mon\n");"#) => {
+        printf("hrCtl:waitForCmd: lambda_mon\n", &[])
+    };
+    ($env:ident, r#"printf("hrCtl:waitForCmd: theta*_mon\n");"#) => {
+        printf("hrCtl:waitForCmd: theta*_mon\n", &[])
+    };
+    ($env:ident, r#"printf("hrCtl:waitForCmd: worldOff_mon\n");"#) => {
+        printf("hrCtl:waitForCmd: worldOff_mon\n", &[])
+    };
+    ($env:ident, r#"printf("hrCtl:waitForCmd: phi*Off_mon\n");"#) => {
+        printf("hrCtl:waitForCmd: phi*Off_mon\n", &[])
+    };
+    ($env:ident, r#"printf("hrCtl:waitForCmnd:putVals\n");"#) => {
+        printf("hrCtl:waitForCmnd:putVals\n", &[])
+    };
+    ($env:ident, r#"printf("hrCtl:waitForCmnd: opMode event.\n");"#) => {
+        printf("hrCtl:waitForCmnd: opMode event.\n", &[])
+    };
+    ($env:ident, r#"printf("hrCtl:waitForCmnd: Geom event.\n");"#) => {
+        printf("hrCtl:waitForCmnd: Geom event.\n", &[])
+    };
+    ($env:ident, r#"printf("hrCtl:checkAutoMode: entry\n");"#) => {
+        printf("hrCtl:checkAutoMode: entry\n", &[])
+    };
+    ($env:ident, r#"printf("hrCtl:phiLimits: entry\n");"#) => {
+        printf("hrCtl:phiLimits: entry\n", &[])
+    };
+    ($env:ident, r#"printf("hrCtl:phiLimits\n");"#) => {
+        printf("hrCtl:phiLimits\n", &[])
+    };
+    ($env:ident, r#"snprintf(pVar->seqMsg2, sizeof(pVar->seqMsg2), "Theta1HiLim clipped at %.3f", pVar->thetaMax);"#) => {{
+        let v = $env.var();
+        sprintf(&v.seqMsg2, "Theta1HiLim clipped at %.3f", &[CArg::from(v.thetaMax.get())])
+    }};
+    ($env:ident, r#"snprintf(pVar->seqMsg2, sizeof(pVar->seqMsg2), "Theta1LoLim clipped at %.3f", pVar->thetaMin);"#) => {{
+        let v = $env.var();
+        sprintf(&v.seqMsg2, "Theta1LoLim clipped at %.3f", &[CArg::from(v.thetaMin.get())])
+    }};
+    ($env:ident, r#"snprintf(pVar->seqMsg2, sizeof(pVar->seqMsg2), "Theta2HiLim clipped at %.3f", pVar->thetaMax);"#) => {{
+        let v = $env.var();
+        sprintf(&v.seqMsg2, "Theta2HiLim clipped at %.3f", &[CArg::from(v.thetaMax.get())])
+    }};
+    ($env:ident, r#"snprintf(pVar->seqMsg2, sizeof(pVar->seqMsg2), "Theta2LoLim clipped at %.3f", pVar->thetaMin);"#) => {{
+        let v = $env.var();
+        sprintf(&v.seqMsg2, "Theta2LoLim clipped at %.3f", &[CArg::from(v.thetaMin.get())])
+    }};
+    ($env:ident, r#"printf("hrCtl:checkDone: entry\n");"#) => {
+        printf("hrCtl:checkDone: entry\n", &[])
+    };
+    ($env:ident, r#"printf("hrCtl:checkDone: done\n");"#) => {
+        printf("hrCtl:checkDone: done\n", &[])
+    };
+    ($env:ident, r#"printf("hrCtl:checkDone: not done\n");"#) => {
+        printf("hrCtl:checkDone: not done\n", &[])
+    };
+    ($env:ident, r#"printf("hrCtl:dInputChanged: entry\n");"#) => {
+        printf("hrCtl:dInputChanged: entry\n", &[])
+    };
+    ($env:ident, r#"pVar->D1 = hrCtl_calc2dSpacing(pVar, 1, pVar->A1, pVar->H1, pVar->K1, pVar->L1);"#) => {{
+        let v = $env.var();
+        let d = calc_2d_spacing(v, 1, v.A1.get(), v.H1.get(), v.K1.get(), v.L1.get());
+        v.D1.set(d);
+    }};
+    ($env:ident, r#"pVar->D2 = hrCtl_calc2dSpacing(pVar, 2, pVar->A2, pVar->H2, pVar->K2, pVar->L2);"#) => {{
+        let v = $env.var();
+        let d = calc_2d_spacing(v, 2, v.A2.get(), v.H2.get(), v.K2.get(), v.L2.get());
+        v.D2.set(d);
+    }};
+    ($env:ident, r#"printf("hrCtl:tweak: entry\n");"#) => {
+        printf("hrCtl:tweak: entry\n", &[])
+    };
+    ($env:ident, r#"printf("hrCtl:eChanged: entry\n");"#) => {
+        printf("hrCtl:eChanged: entry\n", &[])
+    };
+    ($env:ident, r#"printf("hrCtl:eChanged\n");"#) => {
+        printf("hrCtl:eChanged\n", &[])
+    };
+    ($env:ident, r#"printf("hrCtl:lChanged: entry\n");"#) => {
+        printf("hrCtl:lChanged: entry\n", &[])
+    };
+    ($env:ident, r#"printf("hrCtl:lChanged, opMode 0\n");"#) => {
+        printf("hrCtl:lChanged, opMode 0\n", &[])
+    };
+    ($env:ident, r#"printf("hrCtl:lChanged, opMode 1\n");"#) => {
+        printf("hrCtl:lChanged, opMode 1\n", &[])
+    };
+    ($env:ident, r#"printf("hrCtl:lChanged, opMode 2\n");"#) => {
+        printf("hrCtl:lChanged, opMode 2\n", &[])
+    };
+    ($env:ident, r#"printf("hrCtl:thChanged: entry\n");"#) => {
+        printf("hrCtl:thChanged: entry\n", &[])
+    };
+    ($env:ident, r#"printf("hrCtl:thChanged\n");"#) => {
+        printf("hrCtl:thChanged\n", &[])
+    };
+    ($env:ident, r#"printf("hrCtl:thChanged: opMode=%d, Geom=%d, theta2=%f\n", pVar->opMode, pVar->Geom, pVar->theta2);"#) => {{
+        let v = $env.var();
+        printf(
+            "hrCtl:thChanged: opMode=%d, Geom=%d, theta2=%f\n",
+            &[
+                CArg::from(v.opMode.get()),
+                CArg::from(v.Geom.get()),
+                CArg::from(v.theta2.get()),
+            ],
+        )
+    }};
+    ($env:ident, r#"printf("hrCtl:thChanged: opMode=%d, Geom=%d, phi2=%f\n", pVar->opMode, pVar->Geom, pVar->phi2);"#) => {{
+        let v = $env.var();
+        printf(
+            "hrCtl:thChanged: opMode=%d, Geom=%d, phi2=%f\n",
+            &[
+                CArg::from(v.opMode.get()),
+                CArg::from(v.Geom.get()),
+                CArg::from(v.phi2.get()),
+            ],
+        )
+    }};
+    ($env:ident, r#"printf("hrCtl:calcMovements: entry\n");"#) => {
+        printf("hrCtl:calcMovements: entry\n", &[])
+    };
+    ($env:ident, r#"printf("hrCtl:calcMovements, USE\n");"#) => {
+        printf("hrCtl:calcMovements, USE\n", &[])
+    };
+    ($env:ident, r#"printf("hrCtl:calcMovements, SET\n");"#) => {
+        printf("hrCtl:calcMovements, SET\n", &[])
+    };
+    ($env:ident, r#"printf("hrCtl:moveHR entry\n");"#) => {
+        printf("hrCtl:moveHR entry\n", &[])
+    };
+    ($env:ident, r#"printf("hrCtl:moveHR: putting to motors\n");"#) => {
+        printf("hrCtl:moveHR: putting to motors\n", &[])
+    };
+    ($env:ident, r#"printf("hrCtl:moveHR: NOT putting to motors\n");"#) => {
+        printf("hrCtl:moveHR: NOT putting to motors\n", &[])
+    };
+    ($env:ident, r#"printf("hrCtl:updateRdbk: entry\n");"#) => {
+        printf("hrCtl:updateRdbk: entry\n", &[])
+    };
+    ($env:ident, r#"printf("hrCtl:updateRdbk: a motor is moving\n");"#) => {
+        printf("hrCtl:updateRdbk: a motor is moving\n", &[])
+    };
+    ($env:ident, r#"printf("hrCtl:updateRdbk: motors stopped\n");"#) => {
+        printf("hrCtl:updateRdbk: motors stopped\n", &[])
+    };
+    ($env:ident, r#"printf("hrCtl:motorsStopped: entry\n");"#) => {
+        printf("hrCtl:motorsStopped: entry\n", &[])
+    };
+    ($env:ident, r#"printf("hrCtl:motorsStopped (we started them)\n");"#) => {
+        printf("hrCtl:motorsStopped (we started them)\n", &[])
+    };
+    ($env:ident, r#"printf("hrCtl:motorsStopped (we didn't start them)\n");"#) => {
+        printf("hrCtl:motorsStopped (we didn't start them)\n", &[])
+    };
+    ($env:ident, r#"printf("hrCtl:chkMotorLimits: entry\n");"#) => {
+        printf("hrCtl:chkMotorLimits: entry\n", &[])
+    };
+    ($env:ident, r#"printf("hrCtl:chkMotorLimitsExit: entry\n");"#) => {
+        printf("hrCtl:chkMotorLimitsExit: entry\n", &[])
+    };
+    ($env:ident, r#"printf("hrCtl:stopHR: entry\n");"#) => {
+        printf("hrCtl:stopHR: entry\n", &[])
+    };
+    ($env:ident, r#"printf("hrCtl:stoppedHRWait: entry\n");"#) => {
+        printf("hrCtl:stoppedHRWait: entry\n", &[])
+    };
+    ($env:ident, r#"printf("hrCtl:updatePsuedo:init: entry\n");"#) => {
+        printf("hrCtl:updatePsuedo:init: entry\n", &[])
+    };
+    ($env:ident, r#"printf("hrCtl:updatePsuedo:update: entry\n");"#) => {
+        printf("hrCtl:updatePsuedo:update: entry\n", &[])
+    };
+    (r#"static double hrCtl_calc2dSpacing(struct UserVar *pVar, int xtal, double A, double H, double K, double L) { double result; float avg; double nint; result = (2*A)/sqrt(H*H + K*K + L*L); pVar->opAlert = 0; if (((fmod(H,2)) != (fmod(K,2))) || ((fmod(H,2)) != (fmod(L,2)))) pVar->opAlert = 1; avg = (H+K+L)/2.0; nint = round(avg); if ((fabs(avg-nint) <= .25) && (fmod(nint,2))) pVar->opAlert = 1; if (pVar->opAlert) { sprintf(pVar->seqMsg1, "Invalid HKL combination for crystal %1d", xtal); } return(result); } static void hrCtl_calcReadback(struct UserVar *pVar) { pVar->phi1Rdbk = pVar->phi1MotRdbk * pVar->uR2D + (pVar->phi1Off + pVar->worldOff*pVar->uR2D); pVar->theta1Rdbk = pVar->phi1Rdbk; switch (pVar->opMode) { case 0: pVar->lambdaRdbk = pVar->D1*sin(pVar->theta1Rdbk*pVar->D2R); break; case 1: if (pVar->Geom == 0) { pVar->phi2Rdbk = pVar->phi2MotRdbk * pVar->uR2D + (pVar->phi2Off + pVar->worldOff*pVar->uR2D); } else { pVar->phi2Rdbk = pVar->phi2MotRdbk * pVar->uR2D + (pVar->phi2Off - pVar->worldOff*pVar->uR2D); } pVar->lambdaRdbk = pVar->D1*sin(pVar->theta1Rdbk*pVar->D2R); break; case 2: if (pVar->Geom == 0) { pVar->phi2Rdbk = pVar->phi2MotRdbk * pVar->uR2D + (pVar->phi2Off + pVar->worldOff*pVar->uR2D); } else { pVar->phi2Rdbk = pVar->phi2MotRdbk * pVar->uR2D + (pVar->phi2Off - pVar->worldOff*pVar->uR2D); } pVar->theta2Nom = asin(pVar->D1*sin(pVar->theta1Rdbk*pVar->D2R)/pVar->D2) * pVar->R2D; if (pVar->Geom == 0) { pVar->lambdaRdbk = pVar->D1*sin(pVar->theta1Rdbk*pVar->D2R) + pVar->D2R * (pVar->phi2Rdbk - pVar->phi1Rdbk - pVar->theta1Rdbk - pVar->theta2Nom) / ( 1/(pVar->D1*cos(pVar->theta1Rdbk*pVar->D2R)) + 1/(pVar->D2*cos(pVar->theta2Nom*pVar->D2R)) ); } else { pVar->lambdaRdbk = pVar->D1*sin(pVar->theta1Rdbk*pVar->D2R) + pVar->D2R * (pVar->phi2Rdbk - pVar->theta2Nom) / ( 1/(pVar->D1*cos(pVar->theta1Rdbk*pVar->D2R)) + 1/(pVar->D2*cos(pVar->theta2Nom*pVar->D2R)) ); } break; } pVar->theta1Rdbk = asin(pVar->lambdaRdbk/pVar->D1) * pVar->R2D; if (pVar->opMode != 0) pVar->theta2Rdbk = asin(pVar->lambdaRdbk/pVar->D2) * pVar->R2D; pVar->ERdbk = pVar->hc/pVar->lambdaRdbk; return; }"#) => {};
+}
+
+epics_seq_rs::include_program!("hrCtl");
 
 #[cfg(test)]
 mod tests {
+    use epics_seq_rs::ProgramVars;
+
     use super::*;
 
+    /// Si, in Å.
+    const A: f64 = 5.43102;
+
+    /// One case per rule: mixed parity alerts, an odd `(H+K+L)/2` alerts.
     #[test]
-    fn test_calc_2d_spacing() {
-        let (two_d, forb, _) = calc_2d_spacing(5.4309, 1.0, 1.0, 1.0);
-        assert!((two_d - 6.2712).abs() < 0.01);
-        assert!(!forb);
+    fn calc_2d_spacing_alerts_as_c() {
+        for ((h, k, l), two_d, alert) in [
+            ((1.0, 1.0, 1.0), 6.271201717948483, 0),
+            ((2.0, 2.0, 0.0), 3.840311070759763, 0),
+            ((1.0, 1.0, 0.0), 7.680622141519526, 1),
+            ((2.0, 2.0, 2.0), 3.1356008589742417, 1),
+        ] {
+            let v = seqg::seqg_vars::zeroed();
+            assert_eq!(calc_2d_spacing(&v, 1, A, h, k, l), two_d);
+            assert_eq!(v.opAlert.get(), alert, "({h} {k} {l})");
+            let msg = if alert == 1 {
+                &b"Invalid HKL combination for crystal 1"[..]
+            } else {
+                b""
+            };
+            assert_eq!(v.seqMsg1.to_c_vec(), msg, "({h} {k} {l})");
+        }
     }
 
+    /// avg = 2^31 is even; C's NINT cast was undefined there.
     #[test]
-    fn test_theta1_to_phi1() {
-        assert_eq!(theta1_to_phi1(14.0), 14.0);
+    fn calc_2d_spacing_rounds_past_int_range() {
+        let v = seqg::seqg_vars::zeroed();
+        calc_2d_spacing(&v, 1, A, 4294967296.0, 0.0, 0.0);
+        assert_eq!(v.opAlert.get(), 0);
+        assert_eq!(v.seqMsg1.to_c_vec(), b"");
     }
 
-    #[test]
-    fn test_phi2_nested() {
-        // phi2 = phi1 + theta1 + theta2
-        let phi2 = calc_phi2_nested(14.0, 14.0, 15.0);
-        assert!((phi2 - 43.0).abs() < 1e-10);
+    /// Inputs `s` steps along; the expected values are the C subroutine's.
+    fn readback(op_mode: i16, geom: i16, s: f64, lambda: f64) -> [f64; 7] {
+        let v = seqg::seqg_vars::zeroed();
+        v.hc.set(12.3984244);
+        // `PI = 4*atan(1.0)` in the init state.
+        v.R2D.set(180.0 / std::f64::consts::PI);
+        v.uR2D.set(v.R2D.get() / 1000000.0);
+        v.D2R.set(std::f64::consts::PI / 180.0);
+        v.opMode.set(op_mode);
+        v.Geom.set(geom);
+        v.D1.set(6.2712 + s * 0.3);
+        v.D2.set(3.1356 + s * 0.7);
+        v.phi1MotRdbk.set(200000.0 + s * 12345.6);
+        v.phi2MotRdbk.set(-150000.0 + s * 23456.7);
+        v.phi1Off.set(0.1 * s);
+        v.phi2Off.set(-0.2 * s);
+        v.worldOff.set(1000.0 * s - 1500.0);
+        v.phi2Rdbk.set(-1.0);
+        v.theta2Rdbk.set(-1.0);
+        v.theta2Nom.set(-1.0);
+        v.lambdaRdbk.set(lambda);
+        calc_readback(&v);
+        [
+            v.phi1Rdbk.get(),
+            v.phi2Rdbk.get(),
+            v.theta1Rdbk.get(),
+            v.theta2Rdbk.get(),
+            v.theta2Nom.get(),
+            v.lambdaRdbk.get(),
+            v.ERdbk.get(),
+        ]
     }
 
+    /// Both two-crystal geometries, and an opMode with no case, which keeps
+    /// lambdaRdbk and leaves phi2Rdbk and theta2Nom alone.
     #[test]
-    fn test_phi2_symmetric() {
-        assert_eq!(calc_phi2_symmetric(15.0), 15.0);
-    }
-
-    #[test]
-    fn test_motor_phi_roundtrip() {
-        let phi = 14.5;
-        let phi_off = 0.1;
-        let world = 0.05;
-        let motor = phi_to_motor(phi, phi_off, world);
-        let phi2 = motor_to_phi(motor, phi_off, world);
-        assert!(
-            (phi - phi2).abs() < 1e-8,
-            "phi roundtrip: {} vs {}",
-            phi,
-            phi2
+    fn calc_readback_is_c_s() {
+        assert_eq!(
+            readback(2, 0, 1.0, -1.0),
+            [
+                12.237858788416633,
+                -7.479044905414372,
+                -6.47415171215186,
+                -11.138031260724732,
+                21.293822721966226,
+                -0.7409354228060743,
+                -16.733475034901996,
+            ]
         );
-    }
-
-    #[test]
-    fn test_motor_phi2_symmetric_roundtrip() {
-        let phi = 14.5;
-        let phi_off = 0.1;
-        let world = 0.05;
-        let motor = phi2_to_motor_symmetric(phi, phi_off, world);
-        let phi2 = motor_to_phi2_symmetric(motor, phi_off, world);
-        assert!((phi - phi2).abs() < 1e-8);
-    }
-
-    #[test]
-    fn test_calc_readback_single() {
-        let d1 = 6.2712;
-        let d2 = 6.0;
-        let phi1_off = 0.0;
-        let phi2_off = 0.0;
-        let world_off = 0.0;
-        // Motor value in micro-radians for theta1=14 deg
-        let theta1_deg = 14.0;
-        let phi1_mot = theta1_deg * D2UR;
-        let rdbk = calc_readback(
-            phi1_mot,
-            0.0,
-            phi1_off,
-            phi2_off,
-            world_off,
-            d1,
-            d2,
-            HrOpMode::Single,
-            HrGeometry::Nested,
+        assert_eq!(
+            readback(2, 1, 1.0, -1.0),
+            [
+                12.237858788416633,
+                -7.4217491259012895,
+                2.112089922975289,
+                3.6200486021395673,
+                21.293822721966226,
+                0.2421787841370635,
+                51.1953367186078,
+            ]
         );
-        // lambda = d1 * sin(theta1)
-        let expected_lambda = d1 * (theta1_deg * D2R).sin();
-        assert!(
-            (rdbk.lambda_rdbk - expected_lambda).abs() < 1e-6,
-            "lambda: {} vs {}",
-            rdbk.lambda_rdbk,
-            expected_lambda
+        assert_eq!(
+            readback(3, 0, 4.0, 1.1),
+            [
+                14.831798453626005,
+                -1.0,
+                8.466552993410478,
+                10.679933156667214,
+                -1.0,
+                1.1,
+                11.271294909090908,
+            ]
         );
-        assert!(
-            (rdbk.theta1_rdbk - theta1_deg).abs() < 0.01,
-            "theta1: {} vs {}",
-            rdbk.theta1_rdbk,
-            theta1_deg
-        );
-        assert!(rdbk.e_rdbk > 0.0);
-    }
-
-    #[test]
-    fn test_calc_readback_two_locked_nested() {
-        let d1 = 6.2712;
-        let d2 = 6.0;
-        let theta1 = 14.0;
-        let theta2 = (d1 * (theta1 * D2R).sin() / d2).asin() * R2D;
-        let phi1 = theta1;
-        let phi2 = phi1 + theta1 + theta2;
-        let phi1_mot = phi1 * D2UR;
-        let phi2_mot = phi2 * D2UR;
-        let rdbk = calc_readback(
-            phi1_mot,
-            phi2_mot,
-            0.0,
-            0.0,
-            0.0,
-            d1,
-            d2,
-            HrOpMode::TwoLocked,
-            HrGeometry::Nested,
-        );
-        let expected_lambda = d1 * (theta1 * D2R).sin();
-        assert!((rdbk.lambda_rdbk - expected_lambda).abs() < 1e-4);
-    }
-
-    #[test]
-    fn test_op_mode_from_i16() {
-        assert_eq!(HrOpMode::from_i16(0), HrOpMode::Single);
-        assert_eq!(HrOpMode::from_i16(1), HrOpMode::TwoLocked);
-        assert_eq!(HrOpMode::from_i16(2), HrOpMode::TwoIndependent);
-        assert_eq!(HrOpMode::from_i16(99), HrOpMode::Single);
-    }
-
-    #[test]
-    fn test_hr_geometry() {
-        assert_eq!(HrGeometry::from_i16(0), HrGeometry::Nested);
-        assert_eq!(HrGeometry::from_i16(1), HrGeometry::Symmetric);
-    }
-
-    #[test]
-    fn test_config_pv() {
-        let cfg = HrConfig::new("xxx:", "1", "m9", "m10");
-        assert_eq!(cfg.pv("EAO"), "xxx:HR1_EAO");
-        assert_eq!(cfg.pv_no_underscore("CtlDebug"), "xxx:HR1CtlDebug");
-        assert_eq!(cfg.motor_pv("m9", ".RBV"), "xxx:m9.RBV");
     }
 }

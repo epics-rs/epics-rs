@@ -58,17 +58,17 @@ async fn r9_77_event_val_posts_dbe_value_without_dbe_log() {
     // where no alarm moves, is the one this test is about.
     process(&db, "EV").await;
     let first = rx.try_recv().expect("event VAL posts on every process");
-    assert_eq!(first.mask, EventMask::VALUE | EventMask::ALARM);
+    assert_eq!(first.mask(), EventMask::VALUE | EventMask::ALARM);
 
     process(&db, "EV").await;
 
     let event = rx.try_recv().expect("event VAL posts on every process");
     assert_eq!(
-        event.mask,
+        event.mask(),
         EventMask::VALUE,
         "C posts event VAL with `monitor_mask | DBE_VALUE` and monitor_mask is \
          empty here (no alarm change, no MDEL/ADEL) — got {:?}",
-        event.mask
+        event.mask()
     );
 }
 
@@ -91,10 +91,10 @@ async fn r9_77_event_val_reposts_each_cycle_still_without_log() {
         .try_recv()
         .expect("C's VAL post has no `if (monitor_mask)` guard — it fires again");
     assert_eq!(
-        event.mask,
+        event.mask(),
         EventMask::VALUE,
         "the unchanged re-post carries DBE_VALUE alone — got {:?}",
-        event.mask
+        event.mask()
     );
 }
 
@@ -124,9 +124,9 @@ async fn r9_77_dbe_log_only_subscriber_receives_nothing() {
     let from_put = rx.try_recv();
     if let Ok(ev) = &from_put {
         assert!(
-            ev.mask.contains(EventMask::LOG),
+            ev.mask().contains(EventMask::LOG),
             "only a put post may reach a LOG-only subscriber here — got {:?}",
-            ev.mask
+            ev.mask()
         );
     }
     assert!(
@@ -157,8 +157,31 @@ async fn r9_77_calc_val_still_logs_on_adel_crossing() {
 
     let event = rx.try_recv().expect("calc VAL moved, so it posts");
     assert!(
-        event.mask.contains(EventMask::LOG),
+        event.mask().contains(EventMask::LOG),
         "ADEL=0 puts DBE_LOG into calc's monitor_mask — got {:?}",
-        event.mask
+        event.mask()
     );
+}
+
+/// A numeric event name ("1") is still a string with no deadband: C reposts it
+/// on every cycle. The port parsed it as a number for the MDEL test and posted
+/// only when it moved (softIoc camonitor: 6 updates in 3 s at `.5 second`, the
+/// port 1).
+#[epics_macros_rs::epics_test]
+async fn r9_77_numeric_event_name_reposts_each_cycle() {
+    let db = PvDatabase::new();
+    db.add_record("EV", Box::new(EventRecord::new("1")))
+        .await
+        .unwrap();
+    let mut rx = subscribe_val(&db, "EV", DbFieldType::String).await;
+
+    process(&db, "EV").await;
+    rx.try_recv().expect("first cycle posts");
+
+    process(&db, "EV").await;
+
+    let event = rx
+        .try_recv()
+        .expect("an unchanged numeric event name posts again, as C's unguarded post does");
+    assert_eq!(event.mask(), EventMask::VALUE, "got {:?}", event.mask());
 }

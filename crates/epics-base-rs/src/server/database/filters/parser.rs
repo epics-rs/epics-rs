@@ -25,9 +25,11 @@
 //! * [`parse_filter_chain`] is the permissive forward-compatibility
 //!   path retained for the CA server: it downgrades an unparseable
 //!   suffix to an unfiltered subscription, skipping bad entries with a
-//!   `tracing::warn!`.
+//!   `tracing::debug!`.
 
 use std::sync::Arc;
+
+use crate::types::RecordName;
 
 use super::{
     ArrayFilter, ArrayFilterConfig, DeadbandFilter, DeadbandMode, DecimateFilter, FilterChain,
@@ -41,8 +43,9 @@ pub struct ParsedChannelName {
     /// Record + optional `.FIELD` portion (everything before the
     /// JSON suffix), with the `$` modifier still attached when
     /// [`Self::string_view`] is set. Caller routes this through the
-    /// existing `parse_pv_name` to get the (base, field) split.
-    pub record_path: String,
+    /// existing `parse_pv_name` to get the (base, field) split. Bytes, as
+    /// `dbChannelCreate` reads them: a record name need not be UTF-8.
+    pub record_path: Vec<u8>,
     /// The `$` long-string modifier was present *where C accepts one* —
     /// directly after the field part. Read this instead of looking for a
     /// trailing `$` on [`Self::record_path`]: a record whose own name ends
@@ -95,17 +98,22 @@ pub struct ParsedChannelName {
 /// emitting the range as `arr` here gives the legacy syntax full support
 /// with no consumer changes — `split_channel_name` is the single owner of
 /// "channel name → record_path + filters".
-pub fn split_channel_name(raw: &str) -> ParsedChannelName {
+///
+/// The JSON suffix must be UTF-8: `chf_parse` hands it to yajl, which
+/// validates strings, so a suffix that is not fails the channel; here it
+/// stays on the record path, which then names nothing.
+pub fn split_channel_name(raw: impl AsRef<[u8]>) -> ParsedChannelName {
+    let raw = raw.as_ref();
     // Anything the grammar does not accept stays whole on the record path,
     // so the record/field lookup downstream fails the channel exactly as C
     // reaches `finish:` with a status and returns no `dbChannel`.
     let whole = || ParsedChannelName {
-        record_path: raw.to_string(),
+        record_path: raw.to_vec(),
         string_view: false,
         json_suffix: None,
     };
 
-    let Some(dot) = raw.find('.') else {
+    let Some(dot) = raw.iter().position(|&b| b == b'.') else {
         // No field part, so no `[range]` and no `{json}` either. The one
         // modifier the port still reads off an undotted name is a trailing
         // `$`: C refuses `REC$` (`caget 'LS:REC$'` reports not found on a
@@ -114,9 +122,9 @@ pub fn split_channel_name(raw: &str) -> ParsedChannelName {
         // for `REC$` since it gained `$` support, and unlike `{` a `$` cannot
         // occur in a real record name — `.db` files spell macros `$(P)`, so a
         // loaded name never carries one.
-        return match raw.strip_suffix('$') {
+        return match raw.strip_suffix(b"$") {
             Some(core) if !core.is_empty() => ParsedChannelName {
-                record_path: raw.to_string(),
+                record_path: raw.to_vec(),
                 string_view: true,
                 json_suffix: None,
             },
@@ -136,16 +144,16 @@ pub fn split_channel_name(raw: &str) -> ParsedChannelName {
     // `$` long-string modifier, innermost of the three. Left ON the record
     // path because `parse_channel_name` and the CA server both expect to
     // find it there; `string_view` is what says it is a modifier.
-    let string_view = rest.starts_with('$');
+    let string_view = rest.starts_with(b"$");
     if string_view {
         rest = &rest[1..];
     }
 
     // `[range]` folded into a leading `arr` entry.
     let mut arr_inner = None;
-    if let Some(body) = rest.strip_prefix('[') {
-        let Some((inner, after)) = body.find(']').and_then(|close| {
-            let (start, incr, end) = parse_array_range(&body[..close])?;
+    if let Some(body) = rest.strip_prefix(b"[") {
+        let Some((inner, after)) = body.iter().position(|&b| b == b']').and_then(|close| {
+            let (start, incr, end) = parse_array_range(std::str::from_utf8(&body[..close]).ok()?)?;
             Some((build_arr_inner(start, incr, end), &body[close + 1..]))
         }) else {
             return whole();
@@ -156,8 +164,11 @@ pub fn split_channel_name(raw: &str) -> ParsedChannelName {
 
     let json_suffix = if rest.is_empty() {
         None
-    } else if rest.starts_with('{') {
-        Some(rest.to_string())
+    } else if rest.starts_with(b"{") {
+        match std::str::from_utf8(rest) {
+            Ok(json) => Some(json.to_string()),
+            Err(_) => return whole(),
+        }
     } else {
         return whole();
     };
@@ -169,12 +180,12 @@ pub fn split_channel_name(raw: &str) -> ParsedChannelName {
     // nowhere — `src.[2]` then fails every existence and locality test in
     // the port while C answers all of them.
     let mut record_path = if field_len == 0 {
-        raw[..dot].to_string()
+        raw[..dot].to_vec()
     } else {
-        raw[..dot + 1 + field_len].to_string()
+        raw[..dot + 1 + field_len].to_vec()
     };
     if string_view {
-        record_path.push('$');
+        record_path.push(b'$');
     }
 
     let json_suffix = match (arr_inner, json_suffix) {
@@ -193,8 +204,7 @@ pub fn split_channel_name(raw: &str) -> ParsedChannelName {
 /// Length of the field-name token at the head of `s` — a C identifier, or
 /// zero when none is present, as C `dbFindFieldPart` measures it
 /// (`dbStaticLib.c:1565-1571`).
-fn field_name_len(s: &str) -> usize {
-    let b = s.as_bytes();
+fn field_name_len(b: &[u8]) -> usize {
     match b.first() {
         Some(&c) if c == b'_' || c.is_ascii_alphabetic() => {}
         _ => return 0,
@@ -213,10 +223,10 @@ pub struct ChannelName {
     /// `record[.FIELD]` with the filter suffix and the `$` modifier
     /// removed — the key [`PvDatabase::find_entry`](crate::server::database::PvDatabase::find_entry)
     /// and the CA CREATE_CHANNEL lookup use.
-    pub record_path: String,
+    pub record_path: Vec<u8>,
     /// The record (or alias) [`Self::record_path`] names, without the
     /// field.
-    pub record: String,
+    pub record: RecordName,
     /// The addressed field, uppercased, defaulting to `VAL` when the
     /// client named none (`parse_pv_name`).
     pub field: String,
@@ -228,6 +238,15 @@ pub struct ChannelName {
     /// here already folded into a leading `arr` entry by
     /// [`split_channel_name`].
     pub json_suffix: Option<String>,
+}
+
+/// Whether a channel's field text can name a field at all. C
+/// `dbFindFieldPart` finds the declaration with `strncmp` (and
+/// `dbGetRecordAttribute` the attribute with `strcmp`), so the spelling must be
+/// the declared one exactly, and every declared name is upper-case: `REC.val`
+/// is "not found" where the port's case-blind lookups would answer it.
+pub fn spells_a_field(field: &str) -> bool {
+    !field.bytes().any(|b| b.is_ascii_lowercase())
 }
 
 /// Resolve a raw CA/PVA channel name the way C `dbChannelCreate` does
@@ -248,7 +267,7 @@ pub struct ChannelName {
 /// `dbChannelDelete(chan); chan = NULL` at `finish:`
 /// (`dbChannel.c:514-527`), so base never connects a channel whose filter
 /// it could not build.
-pub fn parse_channel_name(raw: &str) -> ChannelName {
+pub fn parse_channel_name(raw: impl AsRef<[u8]>) -> ChannelName {
     let parsed = split_channel_name(raw);
     // `split_channel_name` decided whether the trailing `$` is a modifier;
     // re-deriving it here with `strip_suffix` would strip the last character
@@ -256,16 +275,16 @@ pub fn parse_channel_name(raw: &str) -> ChannelName {
     let core = if parsed.string_view {
         parsed
             .record_path
-            .strip_suffix('$')
+            .strip_suffix(b"$")
             .unwrap_or(&parsed.record_path)
     } else {
-        parsed.record_path.as_str()
+        parsed.record_path.as_slice()
     };
     let (record, field) = crate::server::database::parse_pv_name(core);
     ChannelName {
-        record: record.to_string(),
+        record: RecordName::from(record),
         field: field.to_ascii_uppercase(),
-        record_path: core.to_string(),
+        record_path: core.to_vec(),
         string_view: parsed.string_view,
         json_suffix: parsed.json_suffix,
     }
@@ -359,8 +378,9 @@ fn merge_arr_into_json(arr_inner: &str, existing: &str) -> String {
 /// rather than silently downgrade to an unfiltered stream.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FilterParseError {
-    /// The suffix was not valid JSON (after JSON5 key normalization).
-    InvalidJson { suffix: String, message: String },
+    /// yajl refused the suffix (`chf_parse`'s `yajl_status_error`,
+    /// `dbChannel.c:291-296`); `block` is the text C prints.
+    Syntax { suffix: String, block: String },
     /// The suffix parsed but its top-level value is not an object.
     NotObject { suffix: String },
     /// A requested filter name is not implemented (EPICS `parse_stop`
@@ -378,8 +398,8 @@ pub enum FilterParseError {
 impl std::fmt::Display for FilterParseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::InvalidJson { suffix, message } => {
-                write!(f, "invalid channel-filter JSON `{suffix}`: {message}")
+            Self::Syntax { suffix, block } => {
+                write!(f, "invalid channel-filter JSON `{suffix}`: {block}")
             }
             Self::NotObject { suffix } => {
                 write!(f, "channel-filter body `{suffix}` is not a JSON object")
@@ -403,34 +423,205 @@ impl std::error::Error for FilterParseError {}
 /// Parse the JSON suffix into a [`FilterChain`], rejecting any
 /// syntactically-present-but-unparseable filter request.
 ///
-/// This is the channel-creation contract: it mirrors EPICS base
-/// `dbChannelCreate()` / `chf_parse()`, which abort channel creation on
-/// malformed JSON, a non-object body, an unknown filter name, or a
-/// filter whose own parser rejects its configuration. An empty object
-/// (`{}`) is a valid no-filter request and yields an empty chain. The
-/// documented JSON5 unquoted-key forms are accepted via
-/// [`crate::json5::relaxed_to_strict`].
+/// This is the channel-creation contract: C `chf_parse` (`dbChannel.c:262-307`)
+/// — one yajl pass whose callbacks are `dbChannel.c`'s `chf_*` over
+/// `chfPlugin.c`'s per-option ones, so the first refusal left to right is the
+/// one that stops the parse, whether it is yajl's syntax error, an unknown
+/// filter, an unknown option, a value its option cannot store, or a filter's
+/// `parse_end`. An empty object (`{}`) is a valid no-filter request and
+/// yields an empty chain.
 pub fn try_parse_filter_chain(json: &str) -> Result<FilterChain, FilterParseError> {
-    let normalized =
-        crate::json5::relaxed_to_strict(json).map_err(|e| FilterParseError::InvalidJson {
-            suffix: json.to_string(),
-            message: e.to_string(),
-        })?;
-    let value: serde_json::Value =
-        serde_json::from_str(&normalized).map_err(|e| FilterParseError::InvalidJson {
-            suffix: json.to_string(),
-            message: e.to_string(),
-        })?;
-    let obj = value
-        .as_object()
-        .ok_or_else(|| FilterParseError::NotObject {
-            suffix: json.to_string(),
-        })?;
-    let mut chain = FilterChain::new();
-    for (key, cfg) in obj {
-        chain.push(build_filter(key, cfg)?);
+    use crate::server::db_convert_json::{Parser, Status};
+    let txt = json.as_bytes();
+    let mut parser = Parser::new(ChfScan::new(json));
+    let mut status = parser.parse(txt);
+    if status == Status::Ok {
+        status = parser.finish();
     }
-    Ok(chain)
+    match status {
+        Status::Ok => Ok(parser.ctx.chain),
+        Status::ClientCanceled => Err(parser
+            .ctx
+            .refusal
+            .take()
+            .expect("a cancelled scan says why")),
+        Status::Error => Err(FilterParseError::Syntax {
+            suffix: json.to_string(),
+            block: parser.render_error(txt),
+        }),
+    }
+}
+
+/// `chf_parse`'s `parseContext` (`dbChannel.c:44-48`) and the open filter's
+/// `chfFilter` (`chfPlugin.c`), as the yajl callbacks share them.
+struct ChfScan<'a> {
+    suffix: &'a str,
+    /// The opening `{` has been seen.
+    opened: bool,
+    filter: Option<OpenFilter>,
+    chain: FilterChain,
+    refusal: Option<FilterParseError>,
+}
+
+/// One filter between its key and its value's end.
+struct OpenFilter {
+    name: &'static str,
+    defs: &'static [ArgDef],
+    build: FilterBuilder,
+    depth: u32,
+    /// `f->nextParam`: the option the last key selected; never reset.
+    next: Option<&'static ArgDef>,
+    stored: Vec<(&'static str, ArgValue)>,
+}
+
+impl ChfScan<'_> {
+    fn new(suffix: &str) -> ChfScan<'_> {
+        ChfScan {
+            suffix,
+            opened: false,
+            filter: None,
+            chain: FilterChain::new(),
+            refusal: None,
+        }
+    }
+
+    fn refuse(&mut self, refusal: FilterParseError) -> bool {
+        self.refusal = Some(refusal);
+        false
+    }
+
+    fn bad_config(&mut self) -> bool {
+        let name = self.filter.as_ref().map_or("", |f| f.name).to_string();
+        self.refuse(FilterParseError::BadConfig {
+            name,
+            config: self.suffix.to_string(),
+        })
+    }
+
+    /// A value outside any filter: only the opening `{` is legal there.
+    fn not_object(&mut self) -> bool {
+        self.refuse(FilterParseError::NotObject {
+            suffix: self.suffix.to_string(),
+        })
+    }
+
+    /// `parse_boolean` / `_integer` / `_double` / `_string`
+    /// (`chfPlugin.c:391-445`), then `chf_value`.
+    fn scalar(&mut self, store: impl FnOnce(&ArgDef) -> Option<ArgValue>) -> bool {
+        let Some(filter) = self.filter.as_mut() else {
+            return self.not_object();
+        };
+        let Some(value) = filter.next.and_then(store) else {
+            return self.bad_config();
+        };
+        let name = filter.next.expect("stored under an option").name;
+        // A repeated key overwrites the same member, at the later position.
+        filter.stored.retain(|(n, _)| *n != name);
+        filter.stored.push((name, value));
+        self.value()
+    }
+
+    /// `chf_value` (`dbChannel.c:72-85`): a value that closes at depth 0 runs
+    /// the filter's `parse_end` (`chfPlugin.c:361-389`).
+    fn value(&mut self) -> bool {
+        if self.filter.as_ref().is_some_and(|f| f.depth > 0) {
+            return true;
+        }
+        let Some(filter) = self.filter.take() else {
+            return true;
+        };
+        match (filter.build)(&Opts(filter.stored)) {
+            Some(built) => {
+                self.chain.push(built);
+                true
+            }
+            None => self.refuse(FilterParseError::BadConfig {
+                name: filter.name.to_string(),
+                config: self.suffix.to_string(),
+            }),
+        }
+    }
+}
+
+impl crate::server::db_convert_json::Callbacks for ChfScan<'_> {
+    /// `chfPlugin` leaves `parse_null` NULL, which `CALLIF` turns into
+    /// `parse_stop` (`chfPlugin.c:571`, `dbChannel.c:50`).
+    fn null(&mut self) -> bool {
+        if self.filter.is_none() {
+            return self.not_object();
+        }
+        self.bad_config()
+    }
+    fn boolean(&mut self, value: bool) -> bool {
+        self.scalar(|def| store_boolean(def, value))
+    }
+    /// `parse_integer` range-checks yajl's `long` into `epicsInt32` first
+    /// (`chfPlugin.c:409-413`).
+    fn integer(&mut self, value: i64) -> bool {
+        self.scalar(|def| store_integer(def, i32::try_from(value).ok()?))
+    }
+    fn double(&mut self, value: f64) -> bool {
+        self.scalar(|def| store_double(def, value))
+    }
+    fn string(&mut self, bytes: &[u8]) -> bool {
+        self.scalar(|def| store_string(def, std::str::from_utf8(bytes).ok()?))
+    }
+    /// `chf_start_map` (`dbChannel.c:197-208`); the plugin's own
+    /// `parse_start_map` continues at any depth.
+    fn start_map(&mut self) -> bool {
+        match self.filter.as_mut() {
+            Some(filter) => filter.depth += 1,
+            None if !self.opened => self.opened = true,
+            None => return self.not_object(),
+        }
+        true
+    }
+    fn end_map(&mut self) -> bool {
+        let Some(filter) = self.filter.as_mut() else {
+            return true;
+        };
+        filter.depth -= 1;
+        self.value()
+    }
+    /// `chfPlugin` leaves `parse_start_array` NULL.
+    fn start_array(&mut self) -> bool {
+        if self.filter.is_none() {
+            return self.not_object();
+        }
+        self.bad_config()
+    }
+    /// `chf_map_key` (`dbChannel.c:163-200`), and inside a filter
+    /// `parse_map_key` (`chfPlugin.c:455-490`).
+    fn map_key(&mut self, key: &[u8]) -> bool {
+        let key = String::from_utf8_lossy(key);
+        if let Some(filter) = self.filter.as_mut() {
+            filter.next = filter.defs.iter().find(|d| chf_prefix_match(&key, d.name));
+            if filter.next.is_none() {
+                let filter = filter.name.to_string();
+                return self.refuse(FilterParseError::UnknownOption {
+                    filter,
+                    key: key.into_owned(),
+                });
+            }
+            return true;
+        }
+        match PLUGINS.iter().find(|(name, _, _)| **name == *key) {
+            Some((name, defs, build)) => {
+                self.filter = Some(OpenFilter {
+                    name,
+                    defs,
+                    build: *build,
+                    depth: 0,
+                    next: None,
+                    stored: Vec::new(),
+                });
+                true
+            }
+            None => self.refuse(FilterParseError::UnknownFilter {
+                name: key.into_owned(),
+            }),
+        }
+    }
 }
 
 /// Permissive parse retained for the CA-server forward-compatibility
@@ -438,16 +629,17 @@ pub fn try_parse_filter_chain(json: &str) -> Result<FilterChain, FilterParseErro
 /// an unparseable suffix to an unfiltered subscription rather than
 /// failing the request. Returns an empty chain on JSON / non-object
 /// failure and skips individual unparseable entries with a
-/// `tracing::warn!`. New channel-creation boundaries must use
+/// `tracing::debug!`. New channel-creation boundaries must use
 /// [`try_parse_filter_chain`] so a bad suffix rejects the channel
 /// (EPICS `dbChannelCreate` parity) instead of silently changing the
 /// requested semantics. JSON5 unquoted keys are accepted here too.
 pub fn parse_filter_chain(json: &str) -> FilterChain {
+    // Debug, not warn: C prints at `dbChannelCreate`, never per read.
     let mut chain = FilterChain::new();
     let normalized = match crate::json5::relaxed_to_strict(json) {
         Ok(normalized) => normalized,
         Err(e) => {
-            tracing::warn!(
+            tracing::debug!(
                 json = %json,
                 error = %e,
                 "channel filter JSON parse failed; subscription proceeds without filters",
@@ -458,7 +650,7 @@ pub fn parse_filter_chain(json: &str) -> FilterChain {
     let value: serde_json::Value = match serde_json::from_str(&normalized) {
         Ok(v) => v,
         Err(e) => {
-            tracing::warn!(
+            tracing::debug!(
                 json = %json,
                 error = %e,
                 "channel filter JSON parse failed; subscription proceeds without filters",
@@ -467,14 +659,14 @@ pub fn parse_filter_chain(json: &str) -> FilterChain {
         }
     };
     let Some(obj) = value.as_object() else {
-        tracing::warn!(json = %json, "channel filter JSON must be an object");
+        tracing::debug!(json = %json, "channel filter JSON must be an object");
         return chain;
     };
     for (key, cfg) in obj {
         match build_filter(key, cfg) {
             Ok(filt) => chain.push(filt),
             Err(e) => {
-                tracing::warn!(error = %e, "channel filter skipped");
+                tracing::debug!(error = %e, "channel filter skipped");
             }
         }
     }
@@ -601,31 +793,6 @@ impl Opts {
     }
 }
 
-/// C `epicsParseInt32(val, ival, 0, &end)` as `store_string_value` calls
-/// it (`chfPlugin.c:253`): leading whitespace skipped, `strtol` with base
-/// 0 so `0x`/`0` prefixes are honoured, at least one digit required, and
-/// trailing text ALLOWED because the `units` out-parameter is non-NULL
-/// and then ignored (`epicsStdlib.c:33-53`).
-fn epics_parse_int32(s: &str) -> Option<i32> {
-    let s = s.trim_start();
-    let (neg, s) = match s.strip_prefix('-') {
-        Some(rest) => (true, rest),
-        None => (false, s.strip_prefix('+').unwrap_or(s)),
-    };
-    let (radix, digits) = match s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
-        Some(rest) => (16, rest),
-        None if s.starts_with('0') => (8, s),
-        None => (10, s),
-    };
-    let len = digits.chars().take_while(|c| c.is_digit(radix)).count();
-    if len == 0 {
-        // `strtol` consumed the leading `0` of a bare `0x` and stopped.
-        return (radix == 16).then_some(0);
-    }
-    let mag = i64::from_str_radix(&digits[..len], radix).ok()?;
-    i32::try_from(if neg { -mag } else { mag }).ok()
-}
-
 /// C `epicsParseDouble(val, dval, &end)` (`chfPlugin.c:273`): the numeric
 /// prefix wins and the remainder lands in the ignored `units` pointer, so
 /// `"0.5 V"` stores 0.5 exactly as `"0.5"` does, while an `ERANGE` result
@@ -689,7 +856,8 @@ fn store_string(def: &ArgDef, val: &str) -> Option<ArgValue> {
         return None;
     }
     Some(match def.ty {
-        ArgType::Int32 => ArgValue::Int(epics_parse_int32(val)?),
+        // C `epicsParseInt32(val, ival, 0, &end)` (`chfPlugin.c:253`).
+        ArgType::Int32 => ArgValue::Int(crate::types::c_parse::epics_parse_int32_units(val)?),
         ArgType::Double => ArgValue::Double(epics_parse_double(val)?),
         ArgType::Str => ArgValue::Str(val.to_string()),
         ArgType::Enum(map) => {
@@ -1039,21 +1207,21 @@ mod tests {
     #[test]
     fn split_plain_record_name() {
         let p = split_channel_name("TEMP");
-        assert_eq!(p.record_path, "TEMP");
+        assert_eq!(p.record_path, b"TEMP");
         assert!(p.json_suffix.is_none());
     }
 
     #[test]
     fn split_record_dot_field() {
         let p = split_channel_name("TEMP.VAL");
-        assert_eq!(p.record_path, "TEMP.VAL");
+        assert_eq!(p.record_path, b"TEMP.VAL");
         assert!(p.json_suffix.is_none());
     }
 
     #[test]
     fn split_filter_only_no_field() {
         let p = split_channel_name(r#"TEMP.{"dbnd":{"d":0.5}}"#);
-        assert_eq!(p.record_path, "TEMP");
+        assert_eq!(p.record_path, b"TEMP");
         assert_eq!(p.json_suffix.as_deref(), Some(r#"{"dbnd":{"d":0.5}}"#));
     }
 
@@ -1066,7 +1234,7 @@ mod tests {
     fn split_refuses_a_separator_after_the_field() {
         let raw = r#"TEMP.VAL.{"dbnd":{"d":0.5}}"#;
         let p = split_channel_name(raw);
-        assert_eq!(p.record_path, raw);
+        assert_eq!(p.record_path, raw.as_bytes());
         assert!(p.json_suffix.is_none());
     }
 
@@ -1074,7 +1242,7 @@ mod tests {
     #[test]
     fn split_pvxs_field_directly_followed_by_filter() {
         let p = split_channel_name(r#"test:ai.VAL{"dbnd":{"d":0.0}}"#);
-        assert_eq!(p.record_path, "test:ai.VAL");
+        assert_eq!(p.record_path, b"test:ai.VAL");
         assert_eq!(p.json_suffix.as_deref(), Some(r#"{"dbnd":{"d":0.0}}"#));
     }
 
@@ -1087,7 +1255,7 @@ mod tests {
     fn split_refuses_a_filter_with_no_field_separator() {
         let raw = r#"TEMP{"arr":{"s":0,"i":1,"e":4}}"#;
         let p = split_channel_name(raw);
-        assert_eq!(p.record_path, raw);
+        assert_eq!(p.record_path, raw.as_bytes());
         assert!(p.json_suffix.is_none());
     }
 
@@ -1099,21 +1267,21 @@ mod tests {
     fn split_keeps_braces_that_belong_to_the_record_name() {
         let bare = "XF:31IDA-OP{Tbl-Ax:X1}Mtr";
         let p = split_channel_name(bare);
-        assert_eq!(p.record_path, bare);
+        assert_eq!(p.record_path, bare.as_bytes());
         assert!(p.json_suffix.is_none());
 
         let p = split_channel_name("XF:31IDA-OP{Tbl-Ax:X1}Mtr.DESC");
-        assert_eq!(p.record_path, "XF:31IDA-OP{Tbl-Ax:X1}Mtr.DESC");
+        assert_eq!(p.record_path, b"XF:31IDA-OP{Tbl-Ax:X1}Mtr.DESC");
         assert!(p.json_suffix.is_none());
 
         let p = split_channel_name(r#"XF:31IDA-OP{Tbl-Ax:X1}Mtr.VAL{"dbnd":{"d":0.1}}"#);
-        assert_eq!(p.record_path, "XF:31IDA-OP{Tbl-Ax:X1}Mtr.VAL");
+        assert_eq!(p.record_path, b"XF:31IDA-OP{Tbl-Ax:X1}Mtr.VAL");
         assert_eq!(p.json_suffix.as_deref(), Some(r#"{"dbnd":{"d":0.1}}"#));
 
         // A record name may even END in `}` — the closing brace carries no
         // more meaning than the opening one.
         let p = split_channel_name("XF:31IDA-OP{Tbl}.VAL");
-        assert_eq!(p.record_path, "XF:31IDA-OP{Tbl}.VAL");
+        assert_eq!(p.record_path, b"XF:31IDA-OP{Tbl}.VAL");
         assert!(p.json_suffix.is_none());
     }
 
@@ -1122,7 +1290,7 @@ mod tests {
     #[test]
     fn split_array_range_single_element() {
         let p = split_channel_name("WF.VAL[3]");
-        assert_eq!(p.record_path, "WF.VAL");
+        assert_eq!(p.record_path, b"WF.VAL");
         assert_eq!(p.json_suffix.as_deref(), Some(r#"{"arr":{"s":3,"e":3}}"#));
     }
 
@@ -1130,7 +1298,7 @@ mod tests {
     #[test]
     fn split_array_range_start_end() {
         let p = split_channel_name("WF.VAL[2:5]");
-        assert_eq!(p.record_path, "WF.VAL");
+        assert_eq!(p.record_path, b"WF.VAL");
         assert_eq!(p.json_suffix.as_deref(), Some(r#"{"arr":{"s":2,"e":5}}"#));
     }
 
@@ -1138,7 +1306,7 @@ mod tests {
     #[test]
     fn split_array_range_start_incr_end() {
         let p = split_channel_name("WF.VAL[0:2:10]");
-        assert_eq!(p.record_path, "WF.VAL");
+        assert_eq!(p.record_path, b"WF.VAL");
         assert_eq!(p.json_suffix.as_deref(), Some(r#"{"arr":{"i":2,"e":10}}"#));
     }
 
@@ -1149,11 +1317,11 @@ mod tests {
     #[test]
     fn split_array_range_needs_the_separator() {
         let p = split_channel_name("WF.[1:4]");
-        assert_eq!(p.record_path, "WF");
+        assert_eq!(p.record_path, b"WF");
         assert_eq!(p.json_suffix.as_deref(), Some(r#"{"arr":{"s":1,"e":4}}"#));
 
         let p = split_channel_name("WF[1:4]");
-        assert_eq!(p.record_path, "WF[1:4]");
+        assert_eq!(p.record_path, b"WF[1:4]");
         assert!(p.json_suffix.is_none());
     }
 
@@ -1182,7 +1350,7 @@ mod tests {
     #[test]
     fn split_array_range_with_json_filter() {
         let p = split_channel_name(r#"WF.VAL[2:5]{"dbnd":{"d":0.5}}"#);
-        assert_eq!(p.record_path, "WF.VAL");
+        assert_eq!(p.record_path, b"WF.VAL");
         assert_eq!(
             p.json_suffix.as_deref(),
             Some(r#"{"arr":{"s":2,"e":5},"dbnd":{"d":0.5}}"#)
@@ -1200,7 +1368,11 @@ mod tests {
     fn split_array_range_invalid_left_intact() {
         for raw in ["WF.VAL[]", "WF.VAL[a:b]", "WF.VAL[1:2:3:4]"] {
             let p = split_channel_name(raw);
-            assert_eq!(p.record_path, raw, "invalid range must stay in the name");
+            assert_eq!(
+                p.record_path,
+                raw.as_bytes(),
+                "invalid range must stay in the name"
+            );
             assert!(p.json_suffix.is_none());
         }
     }
@@ -1474,8 +1646,11 @@ mod tests {
 
     #[test]
     fn try_parse_rejects_malformed_json() {
+        let err = try_parse_filter_chain("{]").unwrap_err();
+        assert!(matches!(err, FilterParseError::Syntax { .. }));
+        // yajl reads `not` as a JSON5 key, so the lookup refuses it first.
         let err = try_parse_filter_chain("{not json").unwrap_err();
-        assert!(matches!(err, FilterParseError::InvalidJson { .. }));
+        assert_eq!(err, FilterParseError::UnknownFilter { name: "not".into() });
     }
 
     #[test]
@@ -1531,10 +1706,9 @@ mod tests {
     /// `yajl_parse_integer`, `yajl_parser.c:57-62`), a leading `+`
     /// (`yajl_lex.c:438`), and a leading or trailing `.` (`:478`, `:491`).
     ///
-    /// What this pins is the ROUTING: that `try_parse_filter_chain` still
-    /// reads its suffix through [`crate::json5::relaxed_to_strict`]. The
-    /// conversions themselves are pinned in `json5.rs`'s own tests, and a
-    /// path that stopped going through it fails here with `InvalidJson`.
+    /// What this pins is the ROUTING: that `try_parse_filter_chain` reads
+    /// its suffix through the JSON5 yajl lexer, whose conversions are pinned
+    /// in `db_convert_json.rs`'s own tests.
     #[test]
     fn try_parse_accepts_the_json5_numeric_literals_yajl_lexes() {
         for json in [
@@ -1571,42 +1745,20 @@ mod tests {
         );
     }
 
-    /// DELIBERATE deviation, recorded rather than fixed. C accepts a
-    /// non-finite filter argument: `Infinity`/`NaN` lex as
-    /// `yajl_tok_double` under JSON5 (`yajl_lex.c:673-682`, `:684-693`),
-    /// `epicsStrtod` converts them without setting `ERANGE` so the
-    /// overflow guard does not fire (`yajl_parser.c:329-353`),
-    /// `chfPlugin`'s `parse_double` forwards them (`chfPlugin.c:423-434`)
-    /// and `store_double_value` writes the raw double with no finite check
-    /// (`chfPlugin.c:206-209`) — `{"dbnd":{"d":Infinity}}` builds a channel
-    /// whose deadband suppresses every update.
-    ///
-    /// The port refuses it. `relaxed_to_strict` is the dialect's single
-    /// reader and its output alphabet is strict JSON, which has no
-    /// spelling for a non-finite, so the value arrives as `null` and
-    /// `store` stops the parse. Accepting it needs either a second reader
-    /// for this path — the two-reader split `json5.rs` exists to prevent —
-    /// or a per-consumer re-spelling that trades this deviation for a
-    /// narrower one elsewhere (`Infinity` as the string `"Infinity"` is
-    /// what C's `store_string_value` wants for a double option, but C's
-    /// `store_double_value` writes `"inf"` into a STRING option, so the
-    /// re-spelling would diverge on `sync`'s `s`). The refusal is narrower
-    /// than C, never a wrong answer: C's own outcome is a degenerate
-    /// filter.
+    /// C accepts a non-finite filter argument: `Infinity`/`NaN` lex as
+    /// `yajl_tok_double` under JSON5 (`yajl_lex.c:673-693`), and
+    /// `store_double_value` writes the raw double with no finite check
+    /// (`chfPlugin.c:206-209`). softIoc R7.0.10 connects each name below.
     #[test]
-    fn a_non_finite_filter_argument_is_refused_where_c_accepts_it() {
+    fn a_non_finite_filter_argument_is_accepted_as_in_c() {
         for json in [
             r#"{"dbnd":{"d":Infinity}}"#,
             r#"{"dbnd":{"d":-Infinity}}"#,
             r#"{"dbnd":{"d":NaN}}"#,
             r#"{"dbnd":{"abs":Infinity}}"#,
         ] {
-            let err = try_parse_filter_chain(json)
-                .expect_err("the port refuses a non-finite filter argument");
-            assert!(
-                matches!(err, FilterParseError::BadConfig { .. }),
-                "{json}: {err}"
-            );
+            let chain = try_parse_filter_chain(json).unwrap_or_else(|e| panic!("{json}: {e}"));
+            assert_eq!(chain.len(), 1, "{json}");
         }
     }
 
@@ -1631,8 +1783,8 @@ mod tests {
     fn cn(raw: &str) -> (String, String, String, bool, Option<String>) {
         let c = parse_channel_name(raw);
         (
-            c.record_path,
-            c.record,
+            String::from_utf8(c.record_path).unwrap(),
+            c.record.to_string(),
             c.field,
             c.string_view,
             c.json_suffix,
@@ -1713,8 +1865,8 @@ mod tests {
     fn channel_name_folds_a_range_into_an_arr_filter() {
         let c = parse_channel_name("REC.VAL[0:2]");
         assert_eq!(
-            (c.record_path.as_str(), c.field.as_str()),
-            ("REC.VAL", "VAL")
+            (&c.record_path[..], c.field.as_str()),
+            (&b"REC.VAL"[..], "VAL")
         );
         assert_eq!(c.json_suffix.as_deref(), Some(r#"{"arr":{"e":2}}"#));
     }
@@ -1735,8 +1887,8 @@ mod tests {
         ] {
             let c = parse_channel_name(raw);
             assert_eq!(
-                (c.record.as_str(), c.field.as_str(), c.record_path.as_str()),
-                ("src", "VAL", "src"),
+                (&c.record[..], c.field.as_str(), &c.record_path[..]),
+                (&b"src"[..], "VAL", &b"src"[..]),
                 "{raw}"
             );
             assert_eq!(c.json_suffix.as_deref(), Some(expect_json), "{raw}");
@@ -1761,11 +1913,10 @@ mod tests {
         use crate::server::pv::MonitorEvent;
         use crate::server::recgbl::EventMask;
         use crate::server::snapshot::Snapshot;
-        FilteredMonitorEvent::new(MonitorEvent {
-            snapshot: Arc::new(Snapshot::new(v, 0, 0, std::time::SystemTime::UNIX_EPOCH)),
-            origin: 0,
-            mask: EventMask::VALUE,
-        })
+        FilteredMonitorEvent::new(MonitorEvent::read_log(
+            &mut Snapshot::new(v, 0, 0, std::time::SystemTime::UNIX_EPOCH),
+            EventMask::VALUE,
+        ))
     }
 
     fn conv_doubles(json: &str, input: Vec<f64>) -> Vec<f64> {
@@ -1774,7 +1925,7 @@ mod tests {
         let out = chain
             .apply(conv_ev(EpicsValue::DoubleArray(input.into())))
             .expect("value event must survive an arr filter");
-        match Arc::unwrap_or_clone(out.event.snapshot).value {
+        match out.event.value().as_value().cloned().unwrap() {
             EpicsValue::DoubleArray(v) => v.to_vec(),
             other => panic!("expected DoubleArray, got {other:?}"),
         }
@@ -1798,6 +1949,18 @@ mod tests {
             conv_doubles(r#"{"arr":{"s":"0x2","e":" 5 elements"}}"#, all),
             vec![2.0, 3.0, 4.0, 5.0]
         );
+    }
+
+    /// `epicsParseInt32` is libcom's `strtol` (`epicsStdlib.c:26-53`): the
+    /// glibc `0b` prefix counts, and only C `isspace` is skipped.
+    #[test]
+    fn arr_string_bounds_are_libcom_strtol() {
+        let all: Vec<f64> = (0..10).map(f64::from).collect();
+        assert_eq!(
+            conv_doubles(r#"{"arr":{"s":"0b10","e":"0b101"}}"#, all),
+            vec![2.0, 3.0, 4.0, 5.0]
+        );
+        assert!(try_parse_filter_chain(r#"{"arr":{"e":"\u00a05"}}"#).is_err());
     }
 
     /// The same `Conv = 1` reached from the other side:
@@ -1899,7 +2062,7 @@ mod tests {
                 state.set(set);
                 for (chain, got) in [(&numeric, &mut got_numeric), (&worded, &mut got_worded)] {
                     if let Some(out) = chain.apply(conv_ev(EpicsValue::Double(value))) {
-                        match Arc::unwrap_or_clone(out.event.snapshot).value {
+                        match out.event.value().as_value().cloned().unwrap() {
                             EpicsValue::Double(v) => got.push(v),
                             other => panic!("expected Double, got {other:?}"),
                         }

@@ -1,15 +1,16 @@
+use asyn_rs::port::InterfaceMask;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use ad_core_rs::color::{NDColorMode, convert_rgb_layout};
 use ad_core_rs::error::{ADError, ADResult};
-use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDataType, NDDimension};
+use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDataType};
 use ad_core_rs::ndarray_pool::NDArrayPool;
-use ad_core_rs::plugin::file_base::{NDFileMode, NDFileWriter};
-use ad_core_rs::plugin::file_controller::FilePluginController;
-use ad_core_rs::plugin::runtime::{
-    NDPluginProcess, ParamChangeResult, PluginParamSnapshot, ProcessResult,
+use ad_core_rs::plugin::file_base::{NDFileOpenMode, NDFileWriter};
+use ad_core_rs::plugin::file_controller::{
+    FileControl, FilePluginController, SettingsStore, WriterSettings,
 };
+use ad_core_rs::plugin::runtime::{NDPluginProcess, ProcessResult};
 
 use jpeg_encoder::{ColorType as JpegColorType, Encoder as JpegEncoder};
 use parking_lot::Mutex;
@@ -17,30 +18,34 @@ use parking_lot::Mutex;
 /// JPEG file writer using `jpeg-encoder` for encoding and `jpeg-decoder` for decoding.
 pub struct JpegWriter {
     current_path: Option<PathBuf>,
-    pub(crate) quality: u8,
+    pub(crate) quality: WriterSettings<u8>,
 }
 
 impl JpegWriter {
     pub fn new(quality: u8) -> Self {
         Self {
             current_path: None,
-            quality,
+            quality: WriterSettings::new(quality),
         }
     }
 
     pub fn set_quality(&mut self, quality: u8) {
-        self.quality = quality;
+        self.quality.store().update(|q| *q = quality);
     }
 }
 
 impl NDFileWriter for JpegWriter {
-    fn open_file(&mut self, path: &Path, _mode: NDFileMode, array: &NDArray) -> ADResult<()> {
+    fn open_file(&mut self, path: &Path, mode: NDFileOpenMode, array: &NDArray) -> ADResult<()> {
+        // NDFileJPEG.cpp:34-37
+        mode.refuse_read_or_append("NDFileJPEG")?;
         let dt = array.data.data_type();
         if dt != NDDataType::UInt8 && dt != NDDataType::Int8 {
             return Err(ADError::UnsupportedConversion(
                 "JPEG only supports UInt8/Int8 data".into(),
             ));
         }
+        // C reads NDFileJPEGQuality here (NDFileJPEG.cpp:98).
+        self.quality.refresh();
         self.current_path = Some(path.to_path_buf());
         Ok(())
     }
@@ -112,7 +117,7 @@ impl NDFileWriter for JpegWriter {
         };
 
         let mut buf = Vec::new();
-        let encoder = JpegEncoder::new(&mut buf, self.quality);
+        let encoder = JpegEncoder::new(&mut buf, *self.quality);
         encoder
             .encode(&data, width as u16, height as u16, color_type)
             .map_err(|e| ADError::UnsupportedConversion(format!("JPEG encode error: {}", e)))?;
@@ -121,42 +126,11 @@ impl NDFileWriter for JpegWriter {
         Ok(())
     }
 
+    /// C `readFile` returns asynError (NDFileJPEG.cpp:194-198).
     fn read_file(&mut self) -> ADResult<NDArray> {
-        let path = self
-            .current_path
-            .as_ref()
-            .ok_or_else(|| ADError::UnsupportedConversion("no file open".into()))?;
-
-        let file_data = std::fs::read(path)?;
-        let mut decoder = jpeg_decoder::Decoder::new(&file_data[..]);
-        let pixels = decoder
-            .decode()
-            .map_err(|e| ADError::UnsupportedConversion(format!("JPEG decode error: {}", e)))?;
-        let info = decoder.info().unwrap();
-
-        let (width, height) = (info.width as usize, info.height as usize);
-
-        let dims = match info.pixel_format {
-            jpeg_decoder::PixelFormat::L8 => {
-                vec![NDDimension::new(width), NDDimension::new(height)]
-            }
-            jpeg_decoder::PixelFormat::RGB24 => {
-                vec![
-                    NDDimension::new(3),
-                    NDDimension::new(width),
-                    NDDimension::new(height),
-                ]
-            }
-            _ => {
-                return Err(ADError::UnsupportedConversion(
-                    "unsupported JPEG pixel format".into(),
-                ));
-            }
-        };
-
-        let mut arr = NDArray::new(dims, NDDataType::UInt8);
-        arr.data = NDDataBuffer::U8(pixels);
-        Ok(arr)
+        Err(ADError::UnsupportedConversion(
+            "NDFileJPEG cannot read".into(),
+        ))
     }
 
     fn close_file(&mut self) -> ADResult<()> {
@@ -172,14 +146,20 @@ impl NDFileWriter for JpegWriter {
 /// JPEG file processor wrapping `FilePluginController<JpegWriter>`.
 pub struct JpegFileProcessor {
     ctrl: Mutex<FilePluginController<JpegWriter>>,
+    quality: SettingsStore<u8>,
     jpeg_quality_idx: Option<usize>,
+    /// The plugin's driver, for the posts a capture flush makes.
+    attributes: Option<ad_core_rs::plugin::runtime::PluginAttributes>,
 }
 
 impl JpegFileProcessor {
     pub fn new(quality: u8) -> Self {
+        let writer = JpegWriter::new(quality);
         Self {
-            ctrl: Mutex::new(FilePluginController::new(JpegWriter::new(quality))),
+            quality: writer.quality.store(),
+            ctrl: Mutex::new(FilePluginController::new(writer)),
             jpeg_quality_idx: None,
+            attributes: None,
         }
     }
 }
@@ -191,8 +171,59 @@ impl Default for JpegFileProcessor {
 }
 
 impl NDPluginProcess for JpegFileProcessor {
+    const ASYN_FLAGS: asyn_rs::port::PortFlags = ad_core_rs::plugin::runtime::ASYN_CANBLOCK;
+    // NDFileJPEG.cpp:303, the same mask for both.
+    const INTERFACE_MASK: InterfaceMask = InterfaceMask::GENERIC_POINTER;
+    const INTERRUPT_MASK: InterfaceMask = Self::INTERFACE_MASK;
+
+    fn posts_before_write(&self, reason: usize, value: i32) -> bool {
+        self.ctrl.lock().posts_before_write(reason, value)
+    }
+
+    fn processing_required(&self, array: &NDArray) -> bool {
+        self.ctrl.lock().processing_required(array)
+    }
+
+    /// C NDPluginFile::writeInt32 (NDPluginFile.cpp:799-870). C reads
+    /// NDFileJPEGQuality from the param library at open (NDFileJPEG.cpp:98),
+    /// so the write stores it without waiting on a file write in progress.
+    fn validate_int32(
+        &self,
+        reason: usize,
+        _addr: i32,
+        value: i32,
+        verdict: ad_core_rs::plugin::runtime::WriteVerdict<i32>,
+        params: &mut ad_core_rs::plugin::runtime::WritePort<'_>,
+    ) -> ad_core_rs::plugin::runtime::WriteOutcome<i32> {
+        let mut ctrl = self.ctrl.lock();
+        let out = ctrl.write_int32(reason, value, verdict, params);
+        if Some(reason) == self.jpeg_quality_idx {
+            let q = out.verdict.kept().clamp(1, 100) as u8;
+            self.quality.update(|v| *v = q);
+        }
+        out
+    }
+
+    /// C NDPluginFile::writeOctet: the setting is stored inside the write.
+    fn validate_octet(
+        &self,
+        reason: usize,
+        _addr: i32,
+        _value: &str,
+        verdict: ad_core_rs::plugin::runtime::WriteVerdict<String>,
+        _params: &asyn_rs::port::PortDriverBase,
+    ) -> ad_core_rs::plugin::runtime::WriteOutcome<String> {
+        self.ctrl.lock().write_octet(reason, verdict)
+    }
     fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
-        self.ctrl.lock().process_array(array)
+        // Made before the controller lock: its reads wait on the actor,
+        // which takes that lock in its writes.
+        let mut post = ad_core_rs::plugin::runtime::PortPost::of(self.attributes.as_ref());
+        self.ctrl.lock().process_array(array, &mut post)
+    }
+
+    fn bind_attributes(&mut self, attributes: ad_core_rs::plugin::runtime::PluginAttributes) {
+        self.attributes = Some(attributes);
     }
 
     fn plugin_type(&self) -> &str {
@@ -201,8 +232,8 @@ impl NDPluginProcess for JpegFileProcessor {
 
     /// C `NDPluginFile.cpp:948` (base of every file writer) sets
     /// `NDArrayCallbacks = 0`: file plugins write to disk, not downstream.
-    fn does_array_callbacks(&self) -> bool {
-        false
+    fn array_callbacks_seed(&self) -> Option<bool> {
+        Some(false)
     }
 
     fn register_params(
@@ -215,19 +246,9 @@ impl NDPluginProcess for JpegFileProcessor {
         // Seed the readback PV with the actual encoder default (C++ NDFileJPEG.cpp:327
         // sets NDFileJPEGQuality default to 50). Without this the PV reads 0 while the
         // encoder uses its constructed default, so PV and effective quality disagree.
-        base.set_int32_param(idx, 0, i32::from(self.ctrl.lock().writer.quality))?;
+        base.set_int32_param(idx, 0, i32::from(self.quality.get(|q| *q)))?;
         self.jpeg_quality_idx = Some(idx);
         Ok(())
-    }
-
-    fn on_param_change(&self, reason: usize, params: &PluginParamSnapshot) -> ParamChangeResult {
-        // JPEG-specific: quality change
-        if Some(reason) == self.jpeg_quality_idx {
-            let q = params.value.as_i32().clamp(1, 100) as u8;
-            self.ctrl.lock().writer.set_quality(q);
-            return ParamChangeResult::empty();
-        }
-        self.ctrl.lock().on_param_change(reason, params)
     }
 }
 
@@ -247,6 +268,28 @@ mod tests {
             prefix,
             n
         ))
+    }
+
+    /// C `openFile` refuses NDFileModeRead (NDFileJPEG.cpp:34), so ReadFile
+    /// fails at the open.
+    #[test]
+    fn read_file_is_refused_at_the_open() {
+        let path = temp_path("jpeg_read_refused");
+        let mut writer = JpegWriter::new(90);
+        let arr = NDArray::new(
+            vec![NDDimension::new(4), NDDimension::new(4)],
+            NDDataType::UInt8,
+        );
+        writer
+            .open_file(&path, NDFileOpenMode::WRITE, &arr)
+            .unwrap();
+        writer.write_file(&Arc::new(arr)).unwrap();
+        writer.close_file().unwrap();
+        let mut proc = JpegFileProcessor::new(90);
+        let (out, _base) = crate::test_util::read_file(&mut proc, &path);
+        assert_eq!(out.trace, crate::test_util::read_refused_lines(&path));
+        assert_eq!(out.publish, ad_core_rs::plugin::runtime::Published::Nothing);
+        std::fs::remove_file(&path).ok();
     }
 
     /// R8-75, JPEG writer: same defect as the cited TIFF site. C defaults
@@ -272,7 +315,7 @@ mod tests {
         let path = temp_path("jpeg_3d_no_colormode");
         let mut writer = JpegWriter::new(90);
         writer
-            .open_file(&path, NDFileMode::Single, &arr)
+            .open_file(&path, NDFileOpenMode::WRITE, &arr)
             .expect("open");
         let err = writer.write_file(&Arc::new(arr)).unwrap_err();
         assert!(
@@ -294,7 +337,7 @@ mod tests {
         let path = temp_path("jpeg_1d");
         let mut writer = JpegWriter::new(90);
         writer
-            .open_file(&path, NDFileMode::Single, &arr)
+            .open_file(&path, NDFileOpenMode::WRITE, &arr)
             .expect("open");
         assert!(matches!(
             writer.write_file(&Arc::new(arr)).unwrap_err(),
@@ -313,7 +356,7 @@ mod tests {
         let path = temp_path("jpeg_3d_rgb1");
         let mut writer = JpegWriter::new(90);
         writer
-            .open_file(&path, NDFileMode::Single, &arr)
+            .open_file(&path, NDFileOpenMode::WRITE, &arr)
             .expect("open");
         writer
             .write_file(&Arc::new(arr))
@@ -337,7 +380,9 @@ mod tests {
             }
         }
 
-        writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
+        writer
+            .open_file(&path, NDFileOpenMode::WRITE, &arr)
+            .unwrap();
         writer.write_file(&Arc::new(arr)).unwrap();
         writer.close_file().unwrap();
 
@@ -360,7 +405,7 @@ mod tests {
             NDDataType::UInt16,
         );
 
-        let result = writer.open_file(&path, NDFileMode::Single, &arr);
+        let result = writer.open_file(&path, NDFileOpenMode::WRITE, &arr);
         assert!(result.is_err());
     }
 
@@ -381,14 +426,14 @@ mod tests {
 
         let mut writer_high = JpegWriter::new(95);
         writer_high
-            .open_file(&path_high, NDFileMode::Single, &arr)
+            .open_file(&path_high, NDFileOpenMode::WRITE, &arr)
             .unwrap();
         writer_high.write_file(&Arc::new(arr.clone())).unwrap();
         writer_high.close_file().unwrap();
 
         let mut writer_low = JpegWriter::new(10);
         writer_low
-            .open_file(&path_low, NDFileMode::Single, &arr)
+            .open_file(&path_low, NDFileOpenMode::WRITE, &arr)
             .unwrap();
         writer_low.write_file(&Arc::new(arr)).unwrap();
         writer_low.close_file().unwrap();
@@ -409,19 +454,62 @@ mod tests {
     #[test]
     fn test_default_quality_is_50() {
         // C++ NDFileJPEG.cpp:327 default quality is 50.
-        assert_eq!(JpegFileProcessor::default().ctrl.lock().writer.quality, 50);
-        assert_eq!(JpegWriter::new(50).quality, 50);
+        assert_eq!(JpegFileProcessor::default().quality.get(|q| *q), 50);
+        assert_eq!(*JpegWriter::new(50).quality, 50);
     }
 
     #[test]
     fn test_register_params_seeds_quality_pv() {
+        use asyn_rs::port::InterfaceMask;
         use asyn_rs::port::{PortDriverBase, PortFlags};
-        let mut base = PortDriverBase::new("jpeg_param_test", 1, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            "jpeg_param_test",
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
+        );
         let mut proc = JpegFileProcessor::new(50);
         proc.register_params(&mut base).unwrap();
         let idx = proc.jpeg_quality_idx.unwrap();
         // Readback PV must equal the encoder's effective quality, not 0.
         assert_eq!(base.get_int32_param(idx, 0).unwrap(), 50);
+    }
+
+    /// C reads NDFileJPEGQuality at open (NDFileJPEG.cpp:98), so a quality
+    /// write during a file write returns at once and the next open takes it.
+    #[test]
+    fn a_quality_write_during_a_busy_write_returns_at_once() {
+        use ad_core_rs::plugin::runtime::WriteVerdict;
+        use asyn_rs::port::InterfaceMask;
+        use asyn_rs::port::{PortDriverBase, PortFlags};
+        let mut base = PortDriverBase::new(
+            "jpeg_quality_write",
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
+        );
+        let mut proc = JpegFileProcessor::new(50);
+        proc.register_params(&mut base).unwrap();
+        let idx = proc.jpeg_quality_idx.unwrap();
+        let writer = Arc::clone(&proc.ctrl.lock().writer);
+        assert!(
+            crate::test_util::returns_while_busy(&writer, || {
+                proc.validate_int32(
+                    idx,
+                    0,
+                    80,
+                    WriteVerdict::Accept(80),
+                    &mut ad_core_rs::plugin::runtime::WritePort::new(&mut base),
+                );
+            }),
+            "the quality write waited for the file write"
+        );
+        let mut w = writer.lock();
+        assert_eq!(*w.quality, 50, "not read before the next open");
+        w.quality.refresh();
+        assert_eq!(*w.quality, 80);
     }
 
     #[test]
@@ -440,27 +528,35 @@ mod tests {
             }
         }
 
-        writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
+        writer
+            .open_file(&path, NDFileOpenMode::WRITE, &arr)
+            .unwrap();
         writer.write_file(&Arc::new(arr)).unwrap();
-
-        let read_back = writer.read_file().unwrap();
-        assert_eq!(read_back.data.data_type(), NDDataType::UInt8);
-        if let NDDataBuffer::U8(ref v) = read_back.data {
-            // With uniform input at max quality, decoded values should be close
-            for &px in v.iter() {
-                assert!(
-                    (px as i16 - 128).unsigned_abs() < 5,
-                    "pixel {} too far from 128",
-                    px
-                );
-            }
-        }
-
         writer.close_file().unwrap();
+
+        let (info, pixels) = decode(&path);
+        assert_eq!(info.pixel_format, jpeg_decoder::PixelFormat::L8);
+        // With uniform input at max quality, decoded values should be close
+        for &px in pixels.iter() {
+            assert!(
+                (px as i16 - 128).unsigned_abs() < 5,
+                "pixel {} too far from 128",
+                px
+            );
+        }
         std::fs::remove_file(&path).ok();
     }
 
-    /// Write an RGB-mode array to JPEG and return the decoded array's dims.
+    /// The file as an independent decoder reads it.
+    fn decode(path: &Path) -> (jpeg_decoder::ImageInfo, Vec<u8>) {
+        let bytes = std::fs::read(path).unwrap();
+        let mut decoder = jpeg_decoder::Decoder::new(&bytes[..]);
+        let pixels = decoder.decode().unwrap();
+        (decoder.info().unwrap(), pixels)
+    }
+
+    /// Write an RGB-mode array to JPEG and return the decoded
+    /// `[components, width, height]`.
     fn jpeg_roundtrip_dims(prefix: &str, mode: NDColorMode, dims: Vec<usize>) -> Vec<usize> {
         use ad_core_rs::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
         let path = temp_path(prefix);
@@ -482,12 +578,19 @@ mod tests {
             }
         }
 
-        writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
+        writer
+            .open_file(&path, NDFileOpenMode::WRITE, &arr)
+            .unwrap();
         writer.write_file(&Arc::new(arr)).unwrap();
-        let read_back = writer.read_file().unwrap();
         writer.close_file().unwrap();
+        let (info, _) = decode(&path);
         std::fs::remove_file(&path).ok();
-        read_back.dims.iter().map(|d| d.size).collect()
+        let components = match info.pixel_format {
+            jpeg_decoder::PixelFormat::L8 => 1,
+            jpeg_decoder::PixelFormat::RGB24 => 3,
+            other => panic!("unexpected {other:?}"),
+        };
+        vec![components, info.width as usize, info.height as usize]
     }
 
     #[test]
@@ -495,8 +598,8 @@ mod tests {
         // RGB2 [x=5, c=3, y=4]: C writes width=5, height=4, 3 JCS_RGB
         // components (NDFileJPEG.cpp:67-78). The Rust converts to RGB1 first;
         // before the fix the stale ColorMode=RGB2 attribute made info() read
-        // the RGB1 dims as width=3, color=5 -> a 3x4 grayscale JPEG. Decoded
-        // dims must be RGB24 [3, 5, 4], not grayscale [3, 4].
+        // the RGB1 dims as width=3, color=5 -> a 3x4 grayscale JPEG. The
+        // file must be RGB24 5x4, not grayscale 3x4.
         let dims = jpeg_roundtrip_dims("jpeg_rgb2", NDColorMode::RGB2, vec![5, 3, 4]);
         assert_eq!(dims, vec![3, 5, 4]);
     }
@@ -504,7 +607,7 @@ mod tests {
     #[test]
     fn test_adp12_rgb3_jpeg_written_as_rgb_not_grayscale() {
         // RGB3 [x=5, y=4, c=3]: C writes width=5, height=4, 3 components
-        // (NDFileJPEG.cpp:72-78). Decoded dims must be RGB24 [3, 5, 4].
+        // (NDFileJPEG.cpp:72-78). The file must be RGB24 5x4.
         let dims = jpeg_roundtrip_dims("jpeg_rgb3", NDColorMode::RGB3, vec![5, 4, 3]);
         assert_eq!(dims, vec![3, 5, 4]);
     }

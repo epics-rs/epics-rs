@@ -37,7 +37,8 @@ impl NTEnum {
                         fields: vec![
                             ("index".into(), FieldDesc::Scalar(ScalarType::Int)),
                             ("choices".into(), FieldDesc::ScalarArray(ScalarType::String)),
-                        ],
+                        ]
+                        .into(),
                     },
                 ),
                 ("alarm".into(), alarm_desc()),
@@ -46,10 +47,12 @@ impl NTEnum {
                     "display".into(),
                     FieldDesc::Structure {
                         struct_id: String::new(),
-                        fields: vec![("description".into(), FieldDesc::Scalar(ScalarType::String))],
+                        fields: vec![("description".into(), FieldDesc::Scalar(ScalarType::String))]
+                            .into(),
                     },
                 ),
-            ],
+            ]
+            .into(),
         }
     }
 

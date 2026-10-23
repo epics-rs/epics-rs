@@ -33,9 +33,9 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use epics_base_rs::error::CaError;
+use epics_base_rs::error::DbStatus;
 use epics_base_rs::server::database::PvDatabase;
-use epics_base_rs::server::pv::{WriteContext, WriteHook};
+use epics_base_rs::server::pv::{PvWrite, WriteContext, WriteForward, WriteHook};
 use epics_base_rs::types::EpicsValue;
 use tokio::sync::Notify;
 
@@ -171,14 +171,24 @@ fn is_positive(v: &EpicsValue) -> bool {
 /// (including the owner's own reset to 0) are inert, so a reset never
 /// re-raises.
 fn control_write_hook(trigger: ControlTrigger, flags: Arc<ControlFlags>) -> WriteHook {
-    Arc::new(move |value: EpicsValue, _ctx: WriteContext| {
+    Arc::new(move |write: PvWrite, _ctx: WriteContext| {
         let trigger = trigger;
         let flags = flags.clone();
         Box::pin(async move {
-            if is_positive(&value) {
-                flags.raise(trigger);
-            }
-            Ok::<(), CaError>(())
+            // `gateStat::write` completes at once (S_casApp_success). An
+            // alarm acknowledgement is no value to it: `smartCopy` refuses the
+            // ack gdd (gddAppTable.cc:532-538), so the stat is processed again
+            // with the value it holds, which a flag PV here holds at zero.
+            let raise: WriteForward = Box::new(move |done| {
+                if matches!(&write, PvWrite::Value(value) if is_positive(value)) {
+                    flags.raise(trigger);
+                }
+                if let Some(done) = done {
+                    done.succeed();
+                }
+                Ok(())
+            });
+            Ok::<_, DbStatus>(raise)
         })
     })
 }
@@ -344,6 +354,7 @@ mod tests {
     use crate::ca_gateway::pvlist::PvList;
     use crate::ca_gateway::stats::Stats;
     use arc_swap::ArcSwap;
+    use epics_base_rs::error::CaError;
     use epics_base_rs::server::pv::ProcessVariable;
     use tokio::sync::RwLock;
 
@@ -351,7 +362,9 @@ mod tests {
     /// CA server's write path would (without a network round-trip).
     async fn fire(pv: &Arc<ProcessVariable>, v: EpicsValue) -> Result<(), CaError> {
         let hook = pv.write_hook().expect("control PV has a write hook");
-        hook(v, WriteContext::default()).await
+        hook(PvWrite::Value(v), WriteContext::default())
+            .await
+            .map_err(CaError::ProcessStatus)?(None)
     }
 
     /// is_positive matches C's `val > 0` trigger condition across the
@@ -402,12 +415,12 @@ mod tests {
         for (suffix, _) in CONTROL_FLAGS {
             let name = format!("gw:{suffix}");
             assert!(
-                db.find_pv(&name).await.is_some(),
+                db.find_pv(&name).is_some(),
                 "control PV {name} must be registered"
             );
         }
 
-        let pv = db.find_pv("gw:newAsFlag").await.unwrap();
+        let pv = db.find_pv("gw:newAsFlag").unwrap();
         // A zero write is inert (so the owner's reset never re-raises).
         fire(&pv, EpicsValue::Double(0.0)).await.unwrap();
         assert!(
@@ -449,7 +462,7 @@ mod tests {
         );
 
         // Drive report2Flag positive via its write hook.
-        let pv = db.find_pv("gw:report2Flag").await.unwrap();
+        let pv = db.find_pv("gw:report2Flag").unwrap();
         fire(&pv, EpicsValue::Long(1)).await.unwrap();
 
         // The owner resets the flag back to 0 after handling. The flag is
@@ -490,7 +503,7 @@ mod tests {
             shutdown.clone(),
         );
 
-        let pv = db.find_pv("gw:quitFlag").await.unwrap();
+        let pv = db.find_pv("gw:quitFlag").unwrap();
         fire(&pv, EpicsValue::Long(1)).await.unwrap();
 
         // shutdown must be notified within a bounded wait.

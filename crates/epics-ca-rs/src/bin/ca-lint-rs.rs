@@ -102,17 +102,19 @@ fn lint_env(issues: &mut Vec<Issue>) {
     let known: HashSet<&str> = KNOWN_ENV.iter().copied().collect();
     let mut seen_addr_list = false;
     let mut seen_auto_addr_list = false;
-    for (k, v) in std::env::vars() {
+    // `vars()` panics on an entry that is not UTF-8.
+    for (k, v) in std::env::vars_os() {
+        let (k, v) = (k.to_string_lossy(), v.to_string_lossy());
         if !(k.starts_with("EPICS_CA") || k.starts_with("EPICS_CAS")) {
             continue;
         }
-        if !known.contains(k.as_str()) {
+        if !known.contains(k.as_ref()) {
             issues.push(Issue::Warn(format!(
                 "{k} is not a recognized EPICS env var (typo? new since this lint?)",
             )));
             continue;
         }
-        match k.as_str() {
+        match k.as_ref() {
             "EPICS_CA_ADDR_LIST" => {
                 seen_addr_list = !v.trim().is_empty();
                 for tok in v.split_whitespace() {
@@ -149,7 +151,7 @@ fn lint_db_file(path: &str, macros: &HashMap<String, String>, issues: &mut Vec<I
             return;
         }
     };
-    let mut seen: HashMap<String, usize> = HashMap::new();
+    let mut seen: HashMap<epics_base_rs::types::RecordName, usize> = HashMap::new();
     for (i, r) in recs.iter().enumerate() {
         if let Some(prev) = seen.insert(r.name.clone(), i) {
             issues.push(Issue::Error(format!(
@@ -164,13 +166,13 @@ fn lint_db_file(path: &str, macros: &HashMap<String, String>, issues: &mut Vec<I
         }
         // Distinguish "unsubstituted macro" (loud, common cause of bugs)
         // from generic odd-character warnings.
-        if r.name.contains("$(") {
+        if r.name.windows(2).any(|w| w == b"$(") {
             issues.push(Issue::Warn(format!(
                 "{path}: record name {:?} contains unsubstituted macro — pass macros via --macro KEY=VALUE",
                 r.name
             )));
         } else {
-            for c in r.name.chars() {
+            for c in r.name.to_str_lossy().chars() {
                 if !(c.is_ascii_alphanumeric() || c == ':' || c == '_' || c == '-' || c == '.') {
                     issues.push(Issue::Warn(format!(
                         "{path}: record name {:?} contains unusual character {c:?}",
@@ -186,7 +188,7 @@ fn lint_db_file(path: &str, macros: &HashMap<String, String>, issues: &mut Vec<I
 
 fn lint_acf_file(path: &str, issues: &mut Vec<Issue>) {
     use epics_base_rs::server::access_security;
-    let content = match std::fs::read_to_string(path) {
+    let content = match std::fs::read(path) {
         Ok(s) => s,
         Err(e) => {
             issues.push(Issue::Error(format!("{path}: cannot read: {e}")));
@@ -206,50 +208,60 @@ fn lint_acf_file(path: &str, issues: &mut Vec<Issue>) {
         cfg.hag.len(),
         cfg.asg.len(),
     );
-    if !cfg.asg.contains_key("DEFAULT") {
+    if !cfg.asg.contains_key(b"DEFAULT".as_slice()) {
         issues.push(Issue::Warn(format!(
             "{path}: no DEFAULT ASG — channels not matching any explicit ASG will fall through to ReadWrite",
         )));
     }
     // Cross-check: every UAG/HAG referenced in any rule must be defined.
-    let known_uag: HashSet<&str> = cfg.uag.keys().map(|s| s.as_str()).collect();
-    let known_hag: HashSet<&str> = cfg.hag.keys().map(|s| s.as_str()).collect();
+    let shown = |name: &[u8]| String::from_utf8_lossy(name).into_owned();
+    let known_uag: HashSet<&[u8]> = cfg.uag.keys().map(Vec::as_slice).collect();
+    let known_hag: HashSet<&[u8]> = cfg.hag.keys().map(Vec::as_slice).collect();
     for (asg_name, asg) in &cfg.asg {
+        let asg_name = shown(asg_name);
         for (i, rule) in asg.rules.iter().enumerate() {
             for u in &rule.uag {
-                if !known_uag.contains(u.as_str()) {
+                if !known_uag.contains(u.as_slice()) {
                     issues.push(Issue::Error(format!(
-                        "{path}: ASG {asg_name:?} rule {i} references undefined UAG {u:?}",
+                        "{path}: ASG {asg_name:?} rule {i} references undefined UAG {:?}",
+                        shown(u)
                     )));
                 }
             }
             for h in &rule.hag {
-                if !known_hag.contains(h.as_str()) {
+                if !known_hag.contains(h.as_slice()) {
                     issues.push(Issue::Error(format!(
-                        "{path}: ASG {asg_name:?} rule {i} references undefined HAG {h:?}",
+                        "{path}: ASG {asg_name:?} rule {i} references undefined HAG {:?}",
+                        shown(h)
                     )));
                 }
             }
         }
     }
     // Reverse: warn on UAG/HAG that no rule references (probably stale).
-    let mut used_uag: HashSet<&str> = HashSet::new();
-    let mut used_hag: HashSet<&str> = HashSet::new();
+    let mut used_uag: HashSet<&[u8]> = HashSet::new();
+    let mut used_hag: HashSet<&[u8]> = HashSet::new();
     for asg in cfg.asg.values() {
         for rule in &asg.rules {
             for u in &rule.uag {
-                used_uag.insert(u.as_str());
+                used_uag.insert(u);
             }
             for h in &rule.hag {
-                used_hag.insert(h.as_str());
+                used_hag.insert(h);
             }
         }
     }
     for u in known_uag.difference(&used_uag) {
-        issues.push(Issue::Warn(format!("{path}: UAG {u:?} defined but unused")));
+        issues.push(Issue::Warn(format!(
+            "{path}: UAG {:?} defined but unused",
+            shown(u)
+        )));
     }
     for h in known_hag.difference(&used_hag) {
-        issues.push(Issue::Warn(format!("{path}: HAG {h:?} defined but unused")));
+        issues.push(Issue::Warn(format!(
+            "{path}: HAG {:?} defined but unused",
+            shown(h)
+        )));
     }
 }
 
@@ -257,7 +269,7 @@ fn main() {
     let args = Args::parse();
     let did_anything = args.env || !args.db.is_empty() || !args.acf.is_empty();
     if !did_anything {
-        eprintln!(
+        epics_libcom_rs::stderr_println!(
             "ca-lint-rs: nothing to do — pass --env, --db FILE, and/or --acf FILE.\n\
              See `ca-lint-rs --help`."
         );
@@ -272,7 +284,9 @@ fn main() {
         if let Some((k, v)) = kv.split_once('=') {
             macros.insert(k.trim().to_string(), v.trim().to_string());
         } else {
-            eprintln!("warning: --macro expects KEY=VALUE, got {kv:?}; skipping");
+            epics_libcom_rs::stderr_println!(
+                "warning: --macro expects KEY=VALUE, got {kv:?}; skipping"
+            );
         }
     }
     for db in &args.db {

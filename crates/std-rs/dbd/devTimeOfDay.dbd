@@ -1,0 +1,5 @@
+# The devTimeOfDay `device(...)` lines from epics-modules/std
+# `stdApp/src/stdSupport.dbd`. Base registers its own ai/stringin lines first,
+# as a softIoc built with std loads base.dbd before stdSupport.dbd.
+device(stringin, CONSTANT, devSiTodString, "Time of Day")
+device(ai, CONSTANT, devAiTodSeconds, "Sec Past Epoch")

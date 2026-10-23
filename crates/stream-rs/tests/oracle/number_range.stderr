@@ -1,0 +1,3 @@
+_main_ number_range.proto line 0: Value 99999999999 out of range [0...4294967295]
+_main_ number_range.proto line 0: in variable maxinput
+_main_ while compiling protocol 'p' for 'rec0'

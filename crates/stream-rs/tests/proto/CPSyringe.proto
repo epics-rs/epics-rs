@@ -1,0 +1,71 @@
+# CPSyringe.proto
+
+# StreamDevice protocol file for Cole-Palmer Syringe Pump
+
+# Mark Rivers
+# November 22, 2013
+
+OutTerminator = "\r";
+ExtraInput = Ignore;
+ReplyTimeout = 3000;
+PollPeriod = 500;
+
+getString {
+   out "\$1?";
+   in  "\r\n%s\r\n%*[><:NE]";
+}
+
+setString {
+   out "\$1 %s";
+   in "\r\n%*[><:NE]";
+}
+
+setNoneString {
+   out "%s";
+   in "\r\n%*[><:NE]";
+}
+
+getInt {
+   out "\$1?";
+   in  "\r\n%d\r\n%*[><:NE]";
+}
+
+setInt {
+   out "\$1 %d";
+   in "\r\n%*[><:NE]";
+}
+
+getFloat {
+   out "\$1?";
+   in  "\r\n%f\r\n%*[><:NE]";
+}
+
+getFloatEGU {
+   out "\$1?";
+   in  "\r\n%f %(EGU)s\r\n%*[><:NE]";
+   @mismatch {
+     in "NA"
+   };
+}
+
+setFloat {
+   out "\$1 %.3f %(EGU)s";
+   in "\r\n%*[><:NE]";
+}
+
+setNone {
+   out "\$1";
+   in "\r\n%*[><:NE]";
+}
+
+reverseDirection {
+   out "dir rev";
+   in "\r\n%*[><:NE]";
+}
+
+getRun {
+   InTerminator = "";
+   out "run?";
+   in "\r\n%[><:NE]";
+}
+

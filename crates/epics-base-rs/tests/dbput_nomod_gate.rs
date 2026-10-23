@@ -57,7 +57,10 @@ async fn out_link_write_to_a_nomod_field_is_refused_and_alarms_the_writer() {
 
     db.put_pv("AO.VAL", EpicsValue::Double(2.0)).await.unwrap();
     let mut v = epics_base_rs::server::database::ProcStack::new();
-    db.process_record_with_links("AO", &mut v).await.unwrap();
+    db.process_record_with_links("AO", &mut v)
+        .await
+        .or_else(CaError::unless_process_status)
+        .unwrap();
 
     let wf = db.get_record("WF").unwrap();
     {
@@ -185,13 +188,20 @@ async fn every_dbcommon_nomod_field_is_refused_on_every_route() {
             db.put_pv(&format!("AO2.{field}"), value.clone()).await,
             db.put_pv_and_post(&format!("AO2.{field}"), value.clone())
                 .await,
-            db.check_external_put_preconditions("AO2", field).await,
         ] {
-            assert!(
-                matches!(res, Err(CaError::ReadOnlyField(_))),
-                "{field}: C refuses with S_db_noMod on every route, got {res:?}"
-            );
+            // TIME is also DBF_NOACCESS, which `dbPut` refuses first.
+            let refused = if field == "TIME" {
+                matches!(res, Err(CaError::BadDbrType(_)))
+            } else {
+                matches!(res, Err(CaError::ReadOnlyField(_)))
+            };
+            assert!(refused, "{field}: C refuses on every route, got {res:?}");
         }
+        let res = db.check_external_put_preconditions("AO2", field).await;
+        assert!(
+            matches!(res, Err(CaError::ReadOnlyField(_))),
+            "{field}: doPreProcessing refuses with S_db_noMod, got {res:?}"
+        );
     }
 
     // Nothing landed: the alarm state a client tried to forge is still clean.

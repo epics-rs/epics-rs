@@ -15,11 +15,9 @@
 //! absent / bad / good, crossed with a `.sav` that is absent, bad or
 //! good, plus the two ways the rule can be switched off or fail.
 
-use std::time::Duration;
-
 use epics_base_rs::server::autosave::backup::BackupConfig;
 use epics_base_rs::server::autosave::save_file::{read_save_file, validate_save_file};
-use epics_base_rs::server::autosave::save_set::{SaveSet, SaveSetConfig, SaveStrategy};
+use epics_base_rs::server::autosave::save_set::{SaveSet, SaveSetConfig};
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::records::ao::AoRecord;
 use epics_base_rs::types::EpicsValue;
@@ -36,13 +34,11 @@ async fn one_pv_set(sav: &std::path::Path, backup: BackupConfig) -> SaveSet {
     SaveSet::new(SaveSetConfig {
         name: "s".into(),
         save_path: sav.to_path_buf(),
-        strategy: SaveStrategy::Periodic {
-            interval: Duration::from_secs(60),
-        },
         request_file: None,
         request_pvs: vec!["PV1".into()],
         backup,
         macros: Default::default(),
+        macro_string: None,
         search_paths: Vec::new(),
     })
     .await
@@ -50,13 +46,7 @@ async fn one_pv_set(sav: &std::path::Path, backup: BackupConfig) -> SaveSet {
 }
 
 fn savb_only() -> BackupConfig {
-    BackupConfig {
-        enable_savb: true,
-        num_seq_files: 0,
-        seq_period: Duration::from_secs(60),
-        enable_dated: false,
-        dated_interval: Duration::from_secs(3600),
-    }
+    BackupConfig { enable_savb: true }
 }
 
 async fn first_value(path: &std::path::Path) -> String {
@@ -171,14 +161,7 @@ async fn a_set_without_savb_backups_writes_none() {
     let sav = dir.path().join("set.sav");
 
     let db = one_pv_db().await;
-    let set = one_pv_set(
-        &sav,
-        BackupConfig {
-            enable_savb: false,
-            ..savb_only()
-        },
-    )
-    .await;
+    let set = one_pv_set(&sav, BackupConfig { enable_savb: false }).await;
     set.save_once(&db).await.unwrap();
     set.save_once(&db).await.unwrap();
 

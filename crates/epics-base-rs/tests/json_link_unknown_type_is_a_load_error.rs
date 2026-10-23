@@ -185,10 +185,9 @@ async fn a_runtime_put_of_an_unknown_json_link_is_refused() {
         .unwrap()
         .0;
 
-    let rec = db.get_record("TRIG").unwrap();
-    let err = rec
-        .write()
-        .put_common_field("SDIS", EpicsValue::String(r#"{'nosuch':1}"#.into()))
+    let err = db
+        .put_pv_no_process("TRIG.SDIS", EpicsValue::String(r#"{'nosuch':1}"#.into()))
+        .await
         .expect_err("C's `dbPutField` on a link field parses before it stores");
 
     assert!(

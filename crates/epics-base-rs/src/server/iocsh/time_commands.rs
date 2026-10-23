@@ -44,8 +44,7 @@ fn cmd_clock_time_report() -> CommandDef {
                 _ => 0,
             };
             let report = crate::runtime::general_time::clock_time_report(level);
-            let body = report.strip_suffix('\n').unwrap_or(&report);
-            ctx.print_fmt(format_args!("{body}"));
+            ctx.console_println(report.strip_suffix('\n').unwrap_or(&report));
             Ok(CommandOutcome::Continue)
         },
     )
@@ -98,5 +97,15 @@ mod tests {
                 .count(),
             out.lines().count()
         );
+    }
+
+    /// osiClockTime.c does not include `epicsStdio.h`, so the report stays
+    /// on the console under `cmd > f`. C oracle (`oracleStdIoc`): `f` empty.
+    #[test]
+    fn the_report_stays_on_the_console() {
+        let shell = crate::server::iocsh::tests::make_shell();
+        let (file, console) = shell.file_and_console("ClockTime_Report");
+        assert_eq!(file, "");
+        assert_eq!(console, crate::runtime::general_time::clock_time_report(0));
     }
 }

@@ -1,13 +1,22 @@
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
+
 use super::calc_compile;
-use super::link_status::{LinkStatusGen, SWAIT_NO_PV, SWAIT_PV_STATUS_CHOICES, classify_swait_pv};
+use super::link_status::{SWAIT_NO_PV, SWAIT_PV_NC, SWAIT_PV_OK, SWAIT_PV_STATUS_CHOICES};
 use crate::calc::NumericInputs;
-use crate::calc::{CompiledExpr, ExprKind, eval as calc_eval};
+use crate::calc::{Rpcl, eval as calc_eval};
 use crate::error::{CaError, CaResult};
+use crate::runtime::task::{CallbackPriority, spawn_blocking_background};
 use crate::server::database::AsyncDbHandle;
-use crate::server::record::{
-    FieldMetadataOverride, InputFetchPolicy, MENU_YES_NO, ProcessAction, ProcessOutcome, Record,
-    RecordProcessResult,
+use crate::server::rec_dyn_link::{
+    CaType, Deliver, Io, LinkEvent, LinkHost, LinkSpec, NOTIFY_IN_PROGRESS, RecDynLink,
 };
+use crate::server::recgbl::PutReport;
+use crate::server::record::{CycleCell, CycleRead, CycleValue, ScanType};
+use crate::server::record::{
+    FieldMetadataOverride, MENU_YES_NO, ProcessAction, ProcessOutcome, Record, RecordProcessResult,
+};
+use crate::types::PvString;
 use crate::types::{EpicsValue, c_cast};
 
 /// The PV-status fields, in C's `NUM_LINKS` order: the twelve inputs
@@ -20,6 +29,44 @@ const SWAIT_PV_STATUS_FIELDS: [&str; 14] = [
     "DOLV", "OUTV",
 ];
 
+/// C `DOL_INDEX` and `OUT_INDEX`: the links after the twelve inputs.
+const DOL_INDEX: usize = 12;
+const OUT_INDEX: usize = 13;
+
+/// The callbacks swait hands `recDynLink` (`swaitRecord.c`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Cb {
+    /// `pvSearchCallback`.
+    Search,
+    /// `notifyCallback`.
+    Notify,
+    /// `inputChanged`.
+    Input,
+}
+
+/// Link events in arrival order: queued by a link's task without the
+/// record's lock, applied under it from a callback worker.
+#[derive(Default)]
+struct Inbox(Mutex<VecDeque<(usize, u64, LinkEvent)>>);
+
+/// What a drained link event leaves the callback worker to do outside the
+/// record's borrow.
+enum Drain {
+    Done,
+    /// `ioIntProcess`'s `dbProcess`.
+    Process,
+    /// `notifyCallback`'s `recGblFwdLink`.
+    FwdLink,
+}
+
+/// C `isBlank`: a non-empty name of white space alone.
+fn is_blank(name: &[u8]) -> bool {
+    !name.is_empty() && name.iter().all(|b| matches!(b, b' ' | b'\t'..=b'\r'))
+}
+
+/// `swaitRecord.dbd:431` `char rpcl[184]`.
+const SWAIT_RPCL_SIZE: usize = 184;
+
 // swait (string wait) record from synApps calc module.
 // Functionally equivalent to scalcout, but uses INxN/INxP naming for input links
 // (INxN = link name, INxP = process passive flag) instead of INPx.
@@ -31,7 +78,7 @@ pub struct SwaitRecord {
     /// C `RPCL`. Always a program: an empty or uncompilable CALC carries C's
     /// empty `END_EXPRESSION` postfix, which `calcPerform` refuses to run, so
     /// the record alarms on every process. See [`calc_compile`].
-    compiled_calc: CompiledExpr,
+    rpcl: Rpcl<SWAIT_RPCL_SIZE>,
     /// CLCV ("CALC Valid", `swaitRecord.dbd:433`, `DBF_LONG`) — `postfix()`'s
     /// return status, stored on every compile (`swaitRecord.c:304` at init,
     /// `:561` in `special(SPC_CALC)`) and posted `DBE_VALUE` (`:309`, `:566`).
@@ -40,11 +87,10 @@ pub struct SwaitRecord {
     pub clcv: i32,
     /// INIT ("Initialized?", `swaitRecord.dbd:42`, `DBF_SHORT`, `SPC_NOMOD`).
     /// C `swaitRecord.c:330` and `:374` set `pwait->init = TRUE` in
-    /// `init_record` and NOTHING ever clears it — unlike `ai`/`ao`'s INIT
-    /// (`ConvertPhase`) this is not a conversion phase but a latch:
-    /// "this record has been through init_record". The port served 0 for the
-    /// life of the IOC.
-    initialized: bool,
+    /// `init_record` and NOTHING ever clears it — unlike `ai`/`ao`'s INIT this
+    /// is not a conversion phase but a latch: "this record has been through
+    /// init_record".
+    init: i16,
     /// This cycle's `calcPerform` outcome. C `swaitRecord.c:409-410`:
     /// `if (calcPerform(...)) recGblSetSevr(pwait, CALC_ALARM, INVALID_ALARM)`.
     ///
@@ -68,11 +114,10 @@ pub struct SwaitRecord {
     pub dopt: i16,
     // DOLN ("DOL PV Name", C `swaitRecord.dbd:150`, DBF_STRING/SPC_MOD) and
     // DOLD ("Desired Output Data", :466). With DOPT="Use DOL", C `execOutput`
-    // (swaitRecord.c:763-772) fetches DOLN's PV into DOLD at OUTPUT time and
-    // writes DOLD to OUT; see [`Record::output_time_input_links`]. With DOLN
-    // unset (C `dolv == NO_PV`) the get is skipped and DOLD keeps whatever was
-    // written to it (an operator/client put, or the init value).
-    pub doln: String,
+    // (swaitRecord.c:763-772) reads DOLN's link into DOLD at OUTPUT time and
+    // writes DOLD to OUT. With DOLV not PV_OK the get is skipped and DOLD keeps
+    // whatever was written to it (an operator/client put, or the init value).
+    pub doln: PvString,
     pub dold: f64,
     // OVAL ("Old Value", C `swaitRecord.dbd:440`): the VAL of the PREVIOUS
     // cycle. C sets it at `swaitRecord.c:471` (`pwait->oval = pwait->val`,
@@ -93,7 +138,9 @@ pub struct SwaitRecord {
     // `odly == 0` it calls `execOutput` immediately. `f32` mirrors the C
     // `float` field so a CA client sees DBR_FLOAT (not DBR_DOUBLE).
     pub odly: f32,
-    pub out: crate::server::record::SparseText,
+    /// OUTN ("OUT PV Name", `swaitRecord.dbd:158`, DBF_STRING/SPC_MOD): the
+    /// name of the output link, a PV name and not a link field.
+    pub outn: PvString,
     pub prec: i16,
     // MDEL / ADEL (C `swaitRecord.dbd:477-486`, both DBF_DOUBLE): the monitor
     // and archive deadbands `monitor()` (swaitRecord.c:622-640) tests VAL
@@ -112,8 +159,8 @@ pub struct SwaitRecord {
     pub mlst: f64,
     pub alst: f64,
     // INxN: input link names; INxP: process passive flags (0/1)
-    pub inp_names: [String; 12], // INAN..INLN
-    pub inp_passive: [i16; 12],  // INAP..INLP
+    pub inp_names: [PvString; 12], // INAN..INLN
+    pub inp_passive: [i16; 12],    // INAP..INLP
     // numeric input values A-L
     pub num_vals: [f64; 12],
     // LA..LL ("Last Val of Input x", C `swaitRecord.dbd:298-331`, DBF_DOUBLE,
@@ -128,11 +175,20 @@ pub struct SwaitRecord {
     // INAV..INLV / DOLV / OUTV — the `menu(swaitINAV)` PV-connection status of
     // each link, indexed as `SWAIT_PV_STATUS_FIELDS` (C keeps the same array,
     // swaitRecord.c:334-338). Read-only to clients (`special(SPC_NOMOD)`,
-    // swaitRecord.dbd:166-250); written only by `refresh_link_status`, the
-    // single owner of the classification, through `put_field_internal`.
+    // swaitRecord.dbd:166-250). Each is its link's state, written by
+    // `name_changed` and `pv_search_callback`.
     pv_status: [i16; 14],
-    // This cycle's `fetch_values()` outcome, pushed by the framework through
-    // `set_fetch_gate_failed`. C `swaitRecord.c::process` (407-414):
+    /// C `caLinkStruct[NUM_LINKS]`, indexed as `pv_status`.
+    links: [RecDynLink<Cb>; 14],
+    inbox: Arc<Inbox>,
+    /// C `ioProcCb`'s priority, set from PRIO at init (`swaitRecord.c:313`):
+    /// the band link events are applied on.
+    prio: CallbackPriority,
+    /// The `pv_status` and link-name posts owed, a bit per link.
+    status_posts: u16,
+    name_posts: u16,
+    // This cycle's `fetch_values()` outcome. C `swaitRecord.c::process`
+    // (407-414):
     //
     // ```c
     // if (fetch_values(pwait)==0) {
@@ -146,7 +202,7 @@ pub struct SwaitRecord {
     // — so unlike the calc family, a failed input ALSO raises READ_ALARM at
     // INVALID severity. The OOPT switch that follows (:425) is outside the
     // gate and runs against the frozen VAL.
-    fetch_gate_failed: bool,
+    fetch_failed: bool,
     // Simulation mode — C `swaitRecord.dbd:497-517` (SIOL, SVAL, SIML, SIMM,
     // SIMS) and `swaitRecord.c:402-422`. The record had none of these fields, so
     // a swait could not be put into simulation at all: SIMM was unreadable and
@@ -163,22 +219,29 @@ pub struct SwaitRecord {
     // The framework owns the branch (`Record::simulation_substitutes_input_stage`
     // + `check_simulation_mode`): it resolves SIMM from SIML, reads SIOL into
     // SVAL, writes VAL, raises SIMM_ALARM, and pushes `simulation_active` here.
-    pub siml: String,
+    pub siml: PvString,
     pub simm: i16,
-    pub siol: String,
+    pub siol: PvString,
     pub sval: f64,
     pub sims: i16,
     // This cycle's simulation state, pushed by the framework through
-    // `set_simulation_active` before `process()` — the twin of
-    // `fetch_gate_failed`. C `swaitRecord.c:407/415`: a simulated cycle takes the
-    // `else` branch, which runs NEITHER `fetch_values()` NOR `calcPerform()`.
+    // `set_simulation_active` before `process()`. C `swaitRecord.c:407/415`: a
+    // simulated cycle takes the `else` branch, which runs NEITHER
+    // `fetch_values()` NOR `calcPerform()`.
     simulation_active: bool,
-    // Async context + generation gate for `refresh_link_status`, the same
-    // shape calcout/sseq use (see `link_status::LinkStatusGen`): a refresh
-    // classifies a snapshot of the link names off-thread, and only the latest
-    // one issued may publish.
-    async_ctx: Option<(String, AsyncDbHandle)>,
-    link_gen: LinkStatusGen,
+    // The record's name and database, which every link's task is spawned on.
+    async_ctx: Option<(crate::types::RecordName, AsyncDbHandle)>,
+    /// This cycle's SCAN is I/O Intr.
+    io_intr: bool,
+    /// C `cbStruct.procPending`: an input changed during the ODLY wait.
+    proc_pending: bool,
+    /// This pass runs `recGblFwdLink`: C `process` when it schedules no
+    /// output (swaitRecord.c:477-480), `execOutput` when OUTV is not PV OK
+    /// (`:791-795`); otherwise OUT's put callback runs it (`:378-386`).
+    fwd_link: bool,
+    // A refused CALC put's report, made by `special()` under the put's hold
+    // and printed by the put's owner after it.
+    put_report: Option<PutReport>,
     cached_should_output: bool,
     // ODLY delay state (C `cbStruct.outputWait`, an internal flag — swait has
     // no DLYA database field, unlike scalcout). `output_wait` marks that the
@@ -187,6 +250,10 @@ pub struct SwaitRecord {
     // OUT + posts OEVT exactly once after the delay.
     output_wait: bool,
     pending_output: bool,
+    /// The CLCV/CALC/CLCV posts owed by a CALC `special()`.
+    calc_post: bool,
+    /// This cycle's `monitor()` posts of A..L and LA..LL, a bit per input.
+    input_changes: u16,
 }
 
 impl Default for SwaitRecord {
@@ -194,19 +261,19 @@ impl Default for SwaitRecord {
         Self {
             val: 0.0,
             calc: String::new(),
-            compiled_calc: CompiledExpr::empty(ExprKind::Numeric),
+            rpcl: Rpcl::empty(),
             clcv: 0,
-            initialized: false,
+            init: 0,
             calc_alarm: false,
             calc_succeeded: false,
             oopt: 0,
             dopt: 0,
-            doln: String::new(),
+            doln: PvString::new(),
             dold: 0.0,
             oval: 0.0,
             oevt: 0,
             odly: 0.0,
-            out: crate::server::record::SparseText::default(),
+            outn: PvString::new(),
             prec: 0,
             mdel: 0.0,
             adel: 0.0,
@@ -219,18 +286,28 @@ impl Default for SwaitRecord {
             // C `init_record` sets NO_PV for every blank name (swaitRecord.c:349),
             // and every name starts blank.
             pv_status: [SWAIT_NO_PV; 14],
-            fetch_gate_failed: false,
-            siml: String::new(),
+            links: std::array::from_fn(|_| RecDynLink::default()),
+            inbox: Arc::default(),
+            prio: CallbackPriority::Low,
+            status_posts: 0,
+            name_posts: 0,
+            fetch_failed: false,
+            siml: PvString::new(),
             simm: 0,
-            siol: String::new(),
+            siol: PvString::new(),
             sval: 0.0,
             sims: 0,
             simulation_active: false,
             async_ctx: None,
-            link_gen: LinkStatusGen::default(),
+            io_intr: false,
+            proc_pending: false,
+            fwd_link: true,
+            put_report: None,
             cached_should_output: true,
             output_wait: false,
             pending_output: false,
+            calc_post: false,
+            input_changes: 0,
         }
     }
 }
@@ -252,9 +329,20 @@ impl SwaitRecord {
         // returns 0 from `special()`, so the put SUCCEEDS and the client reads
         // the verdict back from CLCV (the calcout/scalcout/acalcout disposition,
         // not calcRecord's S_db_badField rejection).
-        let compiled = calc_compile::postfix("swait", "CALC", &self.calc);
+        let compiled = calc_compile::postfix_into(&self.calc, &mut self.rpcl);
         self.clcv = compiled.status;
-        self.compiled_calc = compiled.program;
+    }
+
+    /// C `recGblRecordError(S_db_badField, pwait, pmessage)` on a CALC
+    /// `postfix()` refused (swaitRecord.c:305-307, :562-564); swait writes no
+    /// `calcErrorStr` line. Returned, not printed: `special()` runs under the
+    /// put's hold.
+    fn bad_calc_report(&self, pmessage: &'static str) -> Option<PutReport> {
+        (self.clcv != 0).then_some(PutReport::RecordError {
+            status: "Illegal field value",
+            message: pmessage,
+            then: None,
+        })
     }
 
     /// Build the calc inputs. `prev_val` is the cell C passes as `presult`, which
@@ -337,11 +425,9 @@ impl SwaitRecord {
     }
 
     fn num_val_index(name: &str) -> Option<usize> {
-        // Single letter A-L
-        if name.len() == 1 {
-            CHAN.iter().position(|&c| c.to_string() == name)
-        } else {
-            None
+        match name.as_bytes() {
+            [c @ b'A'..=b'L'] => Some(usize::from(c - b'A')),
+            _ => None,
         }
     }
 
@@ -360,55 +446,221 @@ impl SwaitRecord {
         SWAIT_PV_STATUS_FIELDS.iter().position(|&f| f == name)
     }
 
-    /// True for the link-NAME fields whose put re-classifies the PV status —
-    /// C `special()` (swaitRecord.c:507-559) re-runs the search for any name in
-    /// `INAN`..`INLN`, `DOLN`, `OUTN`. `OUTN` is a common field, so its put is
-    /// not visible in `special()`; it is caught by `check_alarms` instead, the
-    /// same split calcout uses.
-    fn is_pv_name_field(name: &str) -> bool {
-        Self::inp_name_index(name).is_some() || name == "DOLN"
+    /// The `recDynLink` a name field names: INAN..INLN, DOLN and OUTN.
+    fn dyn_link_index(name: &str) -> Option<usize> {
+        match name {
+            "DOLN" => Some(DOL_INDEX),
+            "OUTN" => Some(OUT_INDEX),
+            _ => Self::inp_name_index(name),
+        }
     }
 
-    /// Re-classify every PV name into its `menu(swaitINAV)` status and post the
-    /// result. The SINGLE writer of `pv_status`: C's statuses are set only by
-    /// `init_record`, `special()` and `pvSearchCallback` — all of them "the
-    /// name changed, re-run the search" — so the port funnels all three through
-    /// here. No-op without an async context.
-    fn refresh_link_status(&self) {
+    fn link_name(&mut self, li: usize) -> &mut PvString {
+        match li {
+            DOL_INDEX => &mut self.doln,
+            OUT_INDEX => &mut self.outn,
+            _ => &mut self.inp_names[li],
+        }
+    }
+
+    /// The closure link `li`'s task hands its events to: queued, then applied
+    /// under the record's lock from a callback worker, so the link reactor
+    /// never waits on that lock.
+    fn deliver(&self, li: usize) -> Option<Deliver> {
+        let (name, h) = self.async_ctx.clone()?;
+        let inbox = self.inbox.clone();
+        let prio = self.prio;
+        Some(Arc::new(move |generation, event| {
+            inbox.0.lock().unwrap().push_back((li, generation, event));
+            let (h, name) = (h.clone(), name.clone());
+            drop(spawn_blocking_background(prio, move |_| {
+                h.with_held(&name, |held| {
+                    loop {
+                        let next = held.with(|rec, common| {
+                            rec.as_any_mut()
+                                .and_then(|a| a.downcast_mut::<Self>())
+                                .map_or(Drain::Done, |s| s.drain_inbox(common.scan))
+                        });
+                        match next {
+                            Drain::Done => break,
+                            Drain::Process => {
+                                let _ = held.db_process(&name);
+                            }
+                            Drain::FwdLink => held.fwd_link(),
+                        }
+                    }
+                });
+            }));
+        }))
+    }
+
+    /// `recDynLinkAddInput` / `recDynLinkAddOutput` on link `li`'s name.
+    fn add_link(&mut self, li: usize) {
+        let Some(deliver) = self.deliver(li) else {
+            return;
+        };
         let Some((name, handle)) = &self.async_ctx else {
             return;
         };
-        let rec_name = name.clone();
-        let handle = handle.clone();
-        let mut links: Vec<String> = self.inp_names.to_vec();
-        links.push(self.doln.clone());
-        links.push(self.out.as_str().to_owned());
-        let link_gen = self.link_gen.clone();
-        // Stamp this refresh; a later one supersedes it (see `LinkStatusGen`).
-        let token = link_gen.next();
-        let sched = handle.clone();
-        // Through the database's `iocInit` owner — see `schedule_record_init`.
-        // The parking key; `rec_name` itself moves into the future below.
-        let init_key = rec_name.clone();
-        sched.schedule_record_init(&init_key, async move {
-            let mut fields: Vec<(String, EpicsValue)> = Vec::with_capacity(links.len());
-            for (i, link) in links.iter().enumerate() {
-                let status = classify_swait_pv(&handle, link);
-                fields.push((
-                    SWAIT_PV_STATUS_FIELDS[i].to_string(),
-                    EpicsValue::Enum(status as u16),
-                ));
+        let pvname = match li {
+            DOL_INDEX => &self.doln,
+            OUT_INDEX => &self.outn,
+            _ => &self.inp_names[li],
+        };
+        let spec = LinkSpec {
+            io: if li < OUT_INDEX {
+                Io::Input
+            } else {
+                Io::Output
+            },
+            ca_type: CaType::Double,
+            scalar: true,
+            search_callback: Some(Cb::Search),
+            // C hands DOL `inputChanged` too, whose `&pwait->inap + 12` reads
+            // the first bytes of CALC and whose `&pwait->a + 12` writes LA, so
+            // a DOL change processes an I/O Intr record. Not copied.
+            monitor_callback: (li < DOL_INDEX).then_some(Cb::Input),
+        };
+        let host = LinkHost {
+            handle,
+            record: name.as_bytes(),
+        };
+        self.links[li].add(host, &pvname.as_str_lossy(), spec, deliver);
+    }
+
+    /// C `special(after)` on a link name (swaitRecord.c:507-552): a blank name
+    /// is reset to empty, a name searched for afresh as `PV_NC`, and an empty
+    /// one leaves the link `NO_PV`.
+    fn name_changed(&mut self, li: usize) {
+        let old = self.pv_status[li];
+        let name = self.link_name(li);
+        let blank = is_blank(name.as_bytes());
+        if blank {
+            *name = PvString::new();
+        }
+        let named = !name.is_empty();
+        if blank {
+            self.name_posts |= 1 << li;
+        }
+        if named {
+            self.pv_status[li] = SWAIT_PV_NC;
+            self.add_link(li);
+        } else if old != SWAIT_NO_PV {
+            self.pv_status[li] = SWAIT_NO_PV;
+            self.links[li].clear();
+        }
+        if self.pv_status[li] != old {
+            self.status_posts |= 1 << li;
+        }
+    }
+
+    /// Every queued link event, oldest first: `recDynLink` applies it, then
+    /// the callback C would call runs, up to the first that leaves the
+    /// record to be processed or forward-linked, the later events left
+    /// queued.
+    fn drain_inbox(&mut self, scan: ScanType) -> Drain {
+        loop {
+            let next = self.inbox.0.lock().unwrap().pop_front();
+            let Some((li, generation, event)) = next else {
+                return Drain::Done;
+            };
+            match self.links[li].apply(generation, event) {
+                Some(Cb::Search) => self.pv_search_callback(li),
+                Some(Cb::Input) if self.input_changed(li, scan) => return Drain::Process,
+                Some(Cb::Notify) => {
+                    self.fwd_link = true;
+                    return Drain::FwdLink;
+                }
+                Some(Cb::Input) | None => {}
             }
-            // `DBE_VALUE` alone, as C posts every `pPvStat`:
-            // `swaitRecord.c:527`, `:550`, `:923`.
-            if link_gen.is_current(token) {
-                let _ = handle.post_fields_with_mask(
-                    &rec_name,
-                    fields,
-                    crate::server::recgbl::EventMask::VALUE,
-                );
+        }
+    }
+
+    /// C `inputChanged` and the `ioIntProcess` it requests
+    /// (swaitRecord.c:818-900), one lock hold here: on an I/O Intr record an
+    /// INxP input takes the monitored value, and the record processes, or
+    /// owes a process once the ODLY wait ends.
+    fn input_changed(&mut self, li: usize, scan: ScanType) -> bool {
+        if scan != ScanType::IoIntr || self.inp_passive[li] == 0 {
+            return false;
+        }
+        let Some(&[v]) = self.links[li].get(1) else {
+            return false;
+        };
+        self.num_vals[li] = v;
+        if self.output_wait {
+            self.proc_pending = true;
+            return false;
+        }
+        true
+    }
+
+    /// C `pvSearchCallback` (swaitRecord.c:976-1000).
+    fn pv_search_callback(&mut self, li: usize) {
+        let status = if self.links[li].connection_status() == 0 {
+            SWAIT_PV_OK
+        } else {
+            SWAIT_PV_NC
+        };
+        if self.pv_status[li] != status {
+            self.pv_status[li] = status;
+            self.status_posts |= 1 << li;
+        }
+    }
+
+    /// C `execOutput` (swaitRecord.c:752-790): with OUTV PV_OK, DOLD read from
+    /// DOL when DOPT says so and DOLV is PV_OK, then a put with completion,
+    /// or a plain put when one is still in progress, and the forward link
+    /// left to the completion; otherwise the cycle's forward link. OEVT goes
+    /// out from [`Record::output_event`].
+    fn exec_output(&mut self) {
+        // C's `recGblFwdLink` here (`:794`) runs inside `schedOutput` (`:427`)
+        // ahead of `monitor()` (`:475`), so the FLNK target reads this VAL with
+        // the last cycle's SEVR, STAT and TIME. The cycle's tail runs it after
+        // the posts, as the put callback's comes after them. Not copied.
+        self.fwd_link = self.pv_status[OUT_INDEX] != SWAIT_PV_OK;
+        if !self.fwd_link {
+            let value = if self.dopt != 0 {
+                if self.pv_status[DOL_INDEX] == SWAIT_PV_OK
+                    && let Some(&[v]) = self.links[DOL_INDEX].get(1)
+                {
+                    self.dold = v;
+                }
+                self.dold
+            } else {
+                self.val
+            };
+            if self.links[OUT_INDEX].put_callback(value, Cb::Notify) == NOTIFY_IN_PROGRESS {
+                self.links[OUT_INDEX].put(value);
             }
-        });
+        }
+        // C `:801-805`: an input changed during the wait processes it again.
+        if self.io_intr
+            && self.proc_pending
+            && let Some((name, h)) = &self.async_ctx
+        {
+            h.scan_once(&name.to_str_lossy());
+        }
+    }
+
+    /// C `fetch_values` (swaitRecord.c:686-705): a `PV_NC` input, or a
+    /// `PV_OK` one whose `recDynLinkGet` fails, fails the fetch at once; a
+    /// `NO_PV` input keeps its value, as an I/O Intr record's INxP input
+    /// keeps the one its monitor brought.
+    fn fetch_values(&mut self) -> bool {
+        for i in 0..DOL_INDEX {
+            match self.pv_status[i] {
+                SWAIT_PV_NC => return false,
+                SWAIT_PV_OK if self.io_intr && self.inp_passive[i] != 0 => {}
+                SWAIT_PV_OK => match self.links[i].get(1) {
+                    Some(&[v]) => self.num_vals[i] = v,
+                    Some(_) => {}
+                    None => return false,
+                },
+                _ => {}
+            }
+        }
+        true
     }
 }
 
@@ -434,10 +686,101 @@ const SWAIT_DOPT_CHOICES: &[&str] = &["Use VAL", "Use DOL"];
 /// *precision = 3;` — the one field swait answers with a literal instead of PREC.
 const SWAIT_ODLY_PRECISION: i16 = 3;
 
+/// The link-name fields, in `pv_status` order.
+const SWAIT_LINK_NAME_FIELDS: [&str; 14] = [
+    "INAN", "INBN", "INCN", "INDN", "INEN", "INFN", "INGN", "INHN", "ININ", "INJN", "INKN", "INLN",
+    "DOLN", "OUTN",
+];
+
+/// VAL, then each input beside its LA..LL, in `monitor()`'s post order.
+const SWAIT_MONITORED: [&str; 25] = [
+    "VAL", "A", "LA", "B", "LB", "C", "LC", "D", "LD", "E", "LE", "F", "LF", "G", "LG", "H", "LH",
+    "I", "LI", "J", "LJ", "K", "LK", "L", "LL",
+];
+
+/// What a process cycle may post: `monitor()`'s fields and the DOLD
+/// `execOutput` posts when its read moved it (swaitRecord.c:769-770).
+const SWAIT_PROCESS_POSTED: [&str; 26] = {
+    let mut t = ["DOLD"; 26];
+    let mut i = 0;
+    while i < 25 {
+        t[i] = SWAIT_MONITORED[i];
+        i += 1;
+    }
+    t
+};
+
+/// `special()`'s CALC posts, the input pairs `monitor()` marks, then each
+/// link's status and name, all of them a literal `DBE_VALUE` in C.
+const SWAIT_POSTS_NAMED: [(&str, crate::server::record::CyclePostMask); 55] = {
+    use crate::server::record::CyclePostMask::{MonitorValue, Value};
+    let mut t = [("", MonitorValue); 55];
+    t[0] = ("CLCV", Value);
+    t[1] = ("CALC", Value);
+    t[2] = ("CLCV", Value);
+    let mut i = 0;
+    while i < 24 {
+        t[3 + i] = (SWAIT_MONITORED[1 + i], MonitorValue);
+        i += 1;
+    }
+    let mut i = 0;
+    while i < 14 {
+        t[27 + i] = (SWAIT_PV_STATUS_FIELDS[i], Value);
+        t[41 + i] = (SWAIT_LINK_NAME_FIELDS[i], Value);
+        i += 1;
+    }
+    t
+};
+
 impl Record for SwaitRecord {
-    /// C `swaitRecord.c::init_record` (:266-) ends without touching
-    /// MLST/ALST; both writes are in `monitor()` (:630,:639).
-    fn seed_deadband_tracking(&mut self) {}
+    crate::slot_map!(crate::server::record::dbd_generated::slots::swait;
+        fields:
+        OVAL => oval,
+        INIT => init;
+        custom: INAN, INBN, INCN, INDN, INEN, INFN, INGN, INHN, ININ, INJN, INKN, INLN, DOLN,
+            OUTN, INAV, INBV, INCV, INDV, INEV, INFV, INGV, INHV, INIV, INJV, INKV, INLV, DOLV, OUTV,
+            A, B, C, D, E, F, G, H, I, J, K, L, LA, LB, LC, LD, LE, LF, LG, LH, LI, LJ, LK, LL,
+            INAP, INBP, INCP, INDP, INEP, INFP, INGP, INHP, INIP, INJP, INKP, INLP, CALC, CLCV,
+            VAL, PREC, OOPT, ODLY, DOPT, DOLD, OEVT, ADEL, MDEL, ALST, MLST, SIOL, SVAL, SIML,
+            SIMM, SIMS;
+        spill: VERS, HOPR, LOPR, CBST);
+
+    /// `swaitRecord.c:416` reads SIOL at `DBR_DOUBLE` and `:402` SIML at
+    /// `DBR_ENUM`, so a source that request cannot convert is a failed read.
+    fn input_link_request(&self, link_field: &str) -> crate::server::record::InputLinkRequest {
+        crate::server::record::InputLinkRequest::As(match link_field {
+            "SIOL" => crate::server::record::LinkReadAs::Double,
+            "SIML" => crate::server::record::LinkReadAs::Enum,
+            _ => crate::server::record::LinkReadAs::Native,
+        })
+    }
+
+    fn acts_before_process(&self) -> bool {
+        false
+    }
+
+    fn cycle_hooks(&self) -> crate::server::record::CycleHooks {
+        crate::server::record::CycleHooks::WRITE_POSTED
+            .union(crate::server::record::CycleHooks::PUT_REPORT)
+            .union(crate::server::record::CycleHooks::OUTPUT_HOOKS)
+            .union(crate::server::record::CycleHooks::CONTEXT)
+    }
+
+    fn set_process_context(&mut self, ctx: &crate::server::record::ProcessContext) {
+        self.io_intr = ctx.scan == ScanType::IoIntr;
+    }
+
+    fn should_fire_forward_link(&self) -> bool {
+        self.fwd_link
+    }
+
+    fn owns_io_intr_list(&self) -> bool {
+        true
+    }
+
+    fn take_put_report(&mut self) -> Option<PutReport> {
+        self.put_report.take()
+    }
 
     /// The same rset shape as `bo`'s `HIGH` and `busy`'s `HIGH`: one named
     /// field answered with a constant. `ODLY` is `DBF_FLOAT`, so it clears
@@ -449,6 +792,10 @@ impl Record for SwaitRecord {
                 precision: Some(SWAIT_ODLY_PRECISION),
                 ..Default::default()
             })
+    }
+
+    fn has_array_monitor_post(&self) -> bool {
+        false
     }
 
     fn record_type(&self) -> &'static str {
@@ -477,53 +824,147 @@ impl Record for SwaitRecord {
     }
 
     fn init_record(&mut self, pass: u8) -> CaResult<()> {
-        if pass == 0 {
+        if pass == 1 {
+            // C `swaitRecord.c:302`, after pass 0 returned at :280.
             self.recompile();
+            // Not under a put's hold, so it prints at once.
+            if let Some(report) = self.bad_calc_report("swait:init_record: Illegal CALC field") {
+                let name = self
+                    .async_ctx
+                    .as_ref()
+                    .map_or("Unknown".into(), |(n, _)| n.to_str_lossy());
+                report.emit(&name, "");
+            }
             // C `swaitRecord.c:330`: `pwait->init = TRUE;` — and never cleared.
-            self.initialized = true;
+            self.init = 1;
         }
         Ok(())
     }
 
-    fn set_async_context(&mut self, name: String, db: AsyncDbHandle) {
+    /// A `.db` CALC is stored as text, as `dbPutString` stores it; C compiles
+    /// it in `init_record` pass 1, and only a put's `special` compiles it
+    /// earlier.
+    fn load_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
+        match (name, value) {
+            ("CALC", EpicsValue::String(s)) => self.calc = s.as_str_lossy().into_owned(),
+            (name, value) => return self.put_field(name, value),
+        }
+        Ok(())
+    }
+
+    fn set_async_context(&mut self, name: crate::types::RecordName, db: AsyncDbHandle) {
         self.async_ctx = Some((name, db));
-        // C `init_record` (swaitRecord.c:334-373) searches every PV name and
-        // seeds INAV..INLV/DOLV/OUTV. The INxN/DOLN names are swait fields
-        // (applied before `add_record`), so classify them now; OUTN is a common
-        // field not yet applied, and `init_links` re-runs the refresh once it
-        // is. The generation gate lets that later, fuller refresh win.
-        self.refresh_link_status();
     }
 
+    /// C `init_record` pass 1's search of every PV name (swaitRecord.c:334-371),
+    /// here where PRIO is known: C sets `ioProcCb`'s band in the same pass.
+    /// `iocInit` calls this again after the loader did; C adds each link
+    /// once, so one already added keeps its channel.
     fn init_links(&mut self, common: &crate::server::record::CommonFields) {
-        self.out.set(&common.out);
-        self.refresh_link_status();
+        self.prio = common.callback_priority();
+        for li in 0..self.links.len() {
+            if self.links[li].is_added() {
+                continue;
+            }
+            let name = self.link_name(li);
+            if is_blank(name.as_bytes()) {
+                *name = PvString::new();
+            }
+            if name.is_empty() {
+                self.pv_status[li] = SWAIT_NO_PV;
+            } else {
+                self.pv_status[li] = SWAIT_PV_NC;
+                self.add_link(li);
+            }
+        }
     }
 
-    /// A put to a PV-name field re-runs the search — C `special()`
-    /// (swaitRecord.c:507-559) sets the status to `PV_NC` and re-issues
-    /// `recDynLinkAddInput`/`AddOutput`, or to `NO_PV` when the name was
-    /// cleared. `refresh_link_status` re-reads the name the put just stored.
-    fn special(&mut self, field: &str, after: bool) -> CaResult<()> {
+    /// A put to a PV-name field re-runs the search — see `name_changed`.
+    fn special(
+        &mut self,
+        field: &str,
+        after: bool,
+        _common: &crate::server::record::CommonFields,
+    ) -> CaResult<()> {
         if !after {
             return Ok(());
         }
-        if Self::is_pv_name_field(field) {
-            self.refresh_link_status();
+        if let Some(li) = Self::dyn_link_index(field) {
+            self.name_changed(li);
+        }
+        self.calc_post = field == "CALC";
+        if self.calc_post {
+            self.put_report = self.bad_calc_report("swaitRecord:special: Illegal CALC field");
         }
         Ok(())
+    }
+
+    /// C `special(SPC_CALC)` posts CLCV, CALC, CLCV, each a literal
+    /// `DBE_VALUE` (swaitRecord.c:566-568), and does not process; `monitor()`
+    /// posts each moved input then its LA..LL with `monitor_mask | DBE_VALUE`
+    /// (`:647-654`).
+    fn take_cycle_posted_fields(&mut self) -> crate::server::record::CycleMarks {
+        use crate::server::record::CycleMarks;
+        let calc = if std::mem::take(&mut self.calc_post) {
+            0b111
+        } else {
+            0
+        };
+        let mut inputs = 0u64;
+        for i in 0..12 {
+            if self.input_changes & (1 << i) != 0 {
+                inputs |= 0b11 << (2 * i);
+            }
+        }
+        self.input_changes = 0;
+        let links = u128::from(std::mem::take(&mut self.status_posts)) << 27
+            | u128::from(std::mem::take(&mut self.name_posts)) << 41;
+        static SWAIT_POSTS: [(
+            crate::server::record::FieldIx,
+            crate::server::record::CyclePostMask,
+        ); 55] = crate::server::record::declared_post_table(
+            crate::server::record::dbd_generated::SWAIT_FIELDS,
+            SWAIT_POSTS_NAMED,
+        );
+        CycleMarks::of(&SWAIT_POSTS, u128::from(calc | inputs << 3) | links)
+    }
+
+    /// `monitor()` posts VAL and the A..L / LA..LL pairs alone, and
+    /// `execOutput` DOLD.
+    fn process_posted_fields(&self) -> Option<crate::server::record::DeclaredFields> {
+        Some(
+            &const {
+                crate::server::record::declared_set(
+                    crate::server::record::dbd_generated::SWAIT_FIELDS,
+                    SWAIT_PROCESS_POSTED,
+                )
+            },
+        )
+    }
+
+    fn fields_posted_only_when_marked(&self) -> &'static [&'static str] {
+        &SWAIT_MONITORED[1..]
+    }
+
+    /// The deadband classes, with the walk told to take this cycle's input
+    /// marks only when there are any.
+    fn monitor_value_classes(
+        &mut self,
+        gate: crate::server::record::MonitorValueGate,
+        last_posted: &mut [f64; 2],
+    ) -> crate::server::record::MonitorValueClasses {
+        let mut classes = crate::server::record::monitor_deadband_classes(
+            self,
+            gate.array_monitor_post,
+            last_posted,
+        );
+        classes.marked = self.input_changes != 0;
+        classes
     }
 
     fn check_alarms(&mut self, common: &mut crate::server::record::CommonFields) {
         use crate::server::recgbl::{self, alarm_status};
         use crate::server::record::AlarmSeverity;
-
-        // OUTN lives in the common fields, so a runtime re-point is invisible to
-        // `special()`. Catch it here — the same split calcout uses for its OUT.
-        if self.out != common.out {
-            self.out.set(&common.out);
-            self.refresh_link_status();
-        }
 
         // C `swaitRecord.c:409-410` — a failed `calcPerform` is
         // `recGblSetSevr(pwait, CALC_ALARM, INVALID_ALARM)`. Consuming the flag
@@ -542,7 +983,7 @@ impl Record for SwaitRecord {
         // `recGblSetSevr(pwait, READ_ALARM, INVALID_ALARM)`. This is what makes
         // swait's gate visible to a client even though VAL simply freezes; the
         // calc family raises nothing at all on the same failure.
-        if self.fetch_gate_failed {
+        if self.fetch_failed {
             recgbl::rec_gbl_set_sevr(common, alarm_status::READ_ALARM, AlarmSeverity::Invalid);
         }
 
@@ -576,27 +1017,6 @@ impl Record for SwaitRecord {
         false
     }
 
-    /// C `swaitRecord.c::fetch_values` (686-705) returns at the FIRST input that
-    /// is `PV_NC` or whose `recDynLinkGet` fails, and `process` (408) gates
-    /// `calcPerform` on the status.
-    fn input_fetch_policy(&self) -> InputFetchPolicy {
-        InputFetchPolicy::AbortOnFirstFailure
-    }
-
-    fn set_fetch_gate_failed(&mut self, failed: bool) {
-        self.fetch_gate_failed = failed;
-    }
-
-    /// swait's input fetch is NOT `dbGetLink`. `fetch_values`
-    /// (`swaitRecord.c:686-705`) reads INAA..INPL with `recDynLinkGet`, a
-    /// CA-style get that has no `setLinkAlarm`; the failure is answered by
-    /// `process` with `recGblSetSevr(pwait, READ_ALARM, INVALID_ALARM)`
-    /// (`swaitRecord.c:413`). Its SIML/SIOL reads ARE `dbGetLink`
-    /// (`:402`, `:416`) and keep the framework's uniform rule.
-    fn multi_input_fetch_is_db_get_link(&self) -> bool {
-        false
-    }
-
     /// C `swaitRecord.c:402-422` — swait's simulation replaces `fetch_values()`
     /// and `calcPerform()`, and nothing else: the OOPT switch (`:425`),
     /// `execOutput`, the monitors and the forward link all still run. So it is
@@ -617,41 +1037,26 @@ impl Record for SwaitRecord {
         self.simulation_active = active;
     }
 
-    /// C `swaitRecord.c:415` — the simulation branch never calls
-    /// `fetch_values()`, so a simulated cycle reads no input link at all (A..L
-    /// keep their previous values, and no input's connection state can gate the
-    /// cycle). `Some(&[])` is "no active inputs this cycle", the same per-cycle
-    /// restriction sel uses for `Specified`.
-    fn narrows_input_links(&self) -> bool {
-        true
-    }
-
-    fn select_input_links(
-        &self,
-        _selector: Option<u16>,
-    ) -> Option<&'static [(&'static str, &'static str)]> {
-        if self.simulation_active {
-            Some(&[])
-        } else {
-            None
-        }
-    }
-
     fn process(&mut self) -> CaResult<ProcessOutcome> {
         // ODLY continuation: this is the watchdog re-process scheduled by a
         // previous cycle (C `swaitRecord.c::process` `if (pact && outputWait)
         // execOutput`, line 394). Do NOT re-evaluate CALC / OOPT — C runs
         // `execOutput` directly. Restore the captured output decision so the
-        // framework writes the OUT link + posts OEVT this cycle, then clear the
-        // wait flag. Mirrors scalcout's `dlya == 1` branch (swait has no DLYA
-        // field — the wait state is the internal `output_wait` flag, as C uses
+        // framework posts OEVT this cycle, then clear the wait flag. Mirrors
+        // scalcout's `dlya == 1` branch (swait has no DLYA field — the wait
+        // state is the internal `output_wait` flag, as C uses
         // `cbStruct.outputWait`).
         if self.output_wait {
             self.output_wait = false;
+            self.exec_output();
             self.cached_should_output = self.pending_output;
             self.pending_output = false;
             return Ok(ProcessOutcome::complete());
         }
+
+        // C `:404`, before the inputs are read.
+        self.proc_pending = false;
+        self.fwd_link = true;
 
         // C `swaitRecord.c:432-446` compares against `pwait->oval`, which still
         // holds the PREVIOUS cycle's VAL at this point; `:471` advances it after
@@ -659,23 +1064,23 @@ impl Record for SwaitRecord {
         let old_val = self.oval;
 
         // C `swaitRecord.c:408-414` runs the calc only `if (fetch_values(pwait)
-        // ==0)`; its `fetch_values` (686-705) returns at the first input that is
-        // PV_NC or whose get fails. A failed input freezes VAL and UDF and
-        // raises READ_ALARM/INVALID instead (see `check_alarms`). The OOPT
-        // decision below stays outside the gate, as in C — it runs against the
-        // frozen VAL.
+        // ==0)`. A failed input freezes VAL and UDF and raises
+        // READ_ALARM/INVALID instead (see `check_alarms`). The OOPT decision
+        // below stays outside the gate, as in C — it runs against the frozen
+        // VAL.
         // C `swaitRecord.c:415-422` — a SIMULATED cycle takes the `else` branch,
         // which runs neither `fetch_values()` nor `calcPerform()`: VAL already
         // holds SVAL and SIMM_ALARM is already raised (both by the framework's
         // simulation owner). No calc runs, so no CALC_ALARM — and none can leak
         // in from an earlier failed cycle, because `check_alarms` consumed it.
-        if !self.simulation_active && !self.fetch_gate_failed {
+        self.fetch_failed = !self.simulation_active && !self.fetch_values();
+        if !self.simulation_active && !self.fetch_failed {
             // C `swaitRecord.c:409-410` — inside that gate, `calcPerform` runs
             // unconditionally, and a -1 is CALC_ALARM/INVALID with VAL left
             // alone. An empty or uncompilable CALC is the empty program and
             // fails here every cycle.
             let mut inputs = self.build_inputs(self.val);
-            let outcome = calc_eval(&self.compiled_calc, &mut inputs);
+            let outcome = calc_eval(&self.rpcl, &mut inputs);
             // C writes the stores through `&pwait->a` as the expression runs, so
             // they stand whether or not a later operator failed the perform.
             self.apply_stores(&inputs);
@@ -695,19 +1100,27 @@ impl Record for SwaitRecord {
 
         // Cache before framework calls should_output() via trait dispatch.
         self.cached_should_output = self.eval_should_output(old_val);
+        // C `schedOutput` (swaitRecord.c:719-729) without ODLY: `execOutput`
+        // at once, ahead of the OVAL update.
+        let delayed = self.odly > 0.0;
+        if self.cached_should_output && !delayed {
+            self.exec_output();
+        }
         // C `swaitRecord.c:471`: `pwait->oval = pwait->val;` — unconditional,
         // after the OOPT test. OVAL is the old-value tracker, NOT the output
-        // value: `execOutput` composes the output from VAL/DOLD at write time
-        // (see `output_link_value`).
+        // value: `execOutput` composes the output from VAL/DOLD.
         self.oval = self.val;
 
-        // C `swaitRecord.c::monitor` (647-654) advances each previous-input
-        // field to the input it just posted (`*pprev = *pnew`) — so LA..LL is
-        // "the value of input A..L as of the last cycle that posted it", which
-        // for these fields is every cycle the input changed. Assigning
-        // unconditionally is the same state: the C guard only skips the
-        // assignment when the two are already equal.
-        self.prev_vals = self.num_vals;
+        // C `swaitRecord.c::monitor` (647-654): each input that differs from
+        // its LA..LL posts, advances `*pprev = *pnew`, and posts LA..LL.
+        let mut changes = 0;
+        for (i, (new, prev)) in self.num_vals.iter().zip(&mut self.prev_vals).enumerate() {
+            if *new != *prev {
+                *prev = *new;
+                changes |= 1 << i;
+            }
+        }
+        self.input_changes = changes;
 
         // ODLY (C `swaitRecord.c::schedOutput`, lines 719-729): when output
         // should fire and ODLY > 0, defer ONLY the OUT write + OEVT + forward
@@ -719,9 +1132,10 @@ impl Record for SwaitRecord {
         // captures the output decision and suppresses this cycle's OUT/OEVT
         // (`cached_should_output = false`), then re-processes after the delay;
         // the `output_wait` branch above emits the output exactly once.
-        if self.cached_should_output && self.odly > 0.0 {
+        if self.cached_should_output && delayed {
             self.pending_output = self.cached_should_output;
             self.output_wait = true;
+            self.fwd_link = false;
             self.cached_should_output = false;
             let delay = crate::runtime::time::duration_from_secs(self.odly as f64);
             // `CompleteDeferOutput`, NOT bare `AsyncPending`: swait posts the
@@ -742,7 +1156,7 @@ impl Record for SwaitRecord {
                 result: RecordProcessResult::CompleteDeferOutput,
                 actions: vec![ProcessAction::ReprocessAfter(delay)],
                 device_did_compute: false,
-                post_write_fields: Vec::new(),
+                status: Ok(()),
             });
         }
 
@@ -753,80 +1167,11 @@ impl Record for SwaitRecord {
         self.cached_should_output
     }
 
-    /// C `swaitRecord.c::execOutput` (761-774): the value written to OUT is
-    /// composed at output time, not staged during `process()` —
-    /// `outValue = pwait->dopt ? pwait->dold : pwait->val`. With DOPT="Use DOL"
-    /// the DOLD it reads is the one the framework just refreshed from the DOL
-    /// link (see [`Record::output_time_input_links`]).
-    fn output_link_value(&self) -> Option<EpicsValue> {
-        Some(EpicsValue::Double(if self.dopt == 1 {
-            self.dold
-        } else {
-            self.val
-        }))
-    }
-
-    /// DOL is read at OUTPUT time, and only under DOPT="Use DOL" — C
-    /// `execOutput` (763-772) guards the `recDynLinkGet` with `if (pwait->dopt)`
-    /// and, inside it, `if (!pwait->dolv)` (DOLV == PV_OK).
-    ///
-    /// The DOLV half of that guard needs no arm here: the framework's
-    /// output-time fetch skips an empty name and writes the value field only
-    /// when the read SUCCEEDS (`processing.rs`), so a DOL name that is unset or
-    /// does not resolve leaves DOLD at its last value — exactly what C's
-    /// `if (!pwait->dolv)` produces, and C still writes that stale DOLD to OUT.
-    /// Gating on `pv_status` instead would ADD a divergence: that field is
-    /// filled by an async classification task, so a cycle running before the
-    /// task lands would skip a fetch C performs.
-    fn output_time_input_links(&self) -> &'static [(&'static str, &'static str)] {
-        if self.dopt == 1 {
-            &[("DOLN", "DOLD")]
-        } else {
-            &[]
-        }
-    }
-
-    /// C posts CLCV explicitly from `special()` (`db_post_events(pwait,
-    /// &pwait->clcv, DBE_VALUE)`, swaitRecord.c:566) — CLCV is not `pp(TRUE)`,
-    /// so nothing else would post it. Same shape as scalcout/acalcout.
-    fn monitor_side_effect_fields(&self, put_field: &str) -> &'static [&'static str] {
-        match put_field {
-            "CALC" => &["CLCV"],
-            _ => &[],
-        }
-    }
-
     /// C `execOutput` posts the refreshed DOLD with `DBE_VALUE` alone
     /// (swaitRecord.c:770), not the framework default `DBE_VALUE | DBE_LOG`;
     /// CLCV's post (`:309`, `:566`) carries a literal `DBE_VALUE` too.
     fn value_only_change_fields(&self) -> &'static [&'static str] {
         &["DOLD", "CLCV"]
-    }
-
-    /// C `swaitRecord.c::monitor` (647-654) posts a changed input A..L with
-    /// `monitor_mask | DBE_VALUE` — no forced `DBE_LOG`:
-    ///
-    /// ```c
-    /// for (i=0, pnew=&pwait->a, pprev=&pwait->la; i<MAX_FIELDS; i++, pnew++, pprev++) {
-    ///     if (*pnew != *pprev) {
-    ///         db_post_events(pwait, pnew, monitor_mask|DBE_VALUE);
-    ///         ...
-    /// ```
-    ///
-    /// so an archiver subscribed `DBE_LOG` to `swait.A` is sent a value only on
-    /// a cycle where VAL's own ADEL deadband crossed (which puts `DBE_LOG` into
-    /// `monitor_mask`), not on every change. `calcRecord.c:420` writes
-    /// `monitor_mask | DBE_VALUE | DBE_LOG` in the same loop and keeps the
-    /// framework default.
-    ///
-    /// LA..LL ride the same post: C advances `*pprev = *pnew` between the two
-    /// `db_post_events` calls, so the previous-value field is published with the
-    /// same mask as the input that moved it.
-    fn fields_posted_with_monitor_mask(&self) -> &'static [&'static str] {
-        &[
-            "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "LA", "LB", "LC", "LD",
-            "LE", "LF", "LG", "LH", "LI", "LJ", "LK", "LL",
-        ]
     }
 
     /// `OEVT` ("Output Event"): post the numeric output event when output
@@ -836,9 +1181,9 @@ impl Record for SwaitRecord {
     /// (`cached_should_output`). swait has no IVOA field, so — like its C —
     /// the post is never IVOA-suppressed. Stringified so the numeric event
     /// matches a `SCAN="Event"` record's `EVNT`.
-    fn output_event(&self) -> Option<String> {
+    fn output_event(&self) -> Option<crate::types::PvString> {
         if self.cached_should_output && self.oevt > 0 {
-            Some(self.oevt.to_string())
+            Some(self.oevt.to_string().into())
         } else {
             None
         }
@@ -848,15 +1193,44 @@ impl Record for SwaitRecord {
         Some(EpicsValue::Double(self.val))
     }
 
-    /// C reads `pwait->inan..inln` off the record and copies nothing; the generic
-    /// `get_field` path hands back an owned `EpicsValue` per link, which is
-    /// 12 clones on every cycle of a record that wires none of them.
-    fn link_text_ref(&self, link_field: &str) -> Option<&str> {
-        let [b'I', b'N', slot, b'N'] = *link_field.as_bytes() else {
-            return None;
-        };
-        let slot = usize::from(slot.checked_sub(b'A')?);
-        self.inp_names.get(slot).map(String::as_str)
+    fn link_text_ref(&self, link_field: &str) -> Option<&[u8]> {
+        match link_field {
+            "SIML" => Some(self.siml.as_bytes()),
+            "SIOL" => Some(self.siol.as_bytes()),
+            _ => None,
+        }
+    }
+
+    // C `swaitRecord.dbd` declares SIML/SIMM/SIOL/SIMS and no SDLY, so the
+    // simulation is always synchronous: the -1.0 `check_simulation_mode`
+    // takes for an undeclared SDLY.
+    fn simm_cells(&self) -> Option<crate::server::record::SimmCells> {
+        Some(crate::server::record::SimmCells {
+            simm: self.simm,
+            sims: self.sims,
+            sdly: -1.0,
+        })
+    }
+
+    fn cycle_cell(&self, cell: CycleCell) -> CycleRead {
+        match cell {
+            CycleCell::Val => CycleRead::Value(CycleValue::Double(self.val)),
+            CycleCell::Oval => CycleRead::Value(CycleValue::Double(self.oval)),
+            CycleCell::Mdel => CycleRead::Value(CycleValue::Double(self.mdel)),
+            CycleCell::Adel => CycleRead::Value(CycleValue::Double(self.adel)),
+            CycleCell::Mlst => CycleRead::Value(CycleValue::Double(self.mlst)),
+            CycleCell::Alst => CycleRead::Value(CycleValue::Double(self.alst)),
+            _ => CycleRead::Absent,
+        }
+    }
+
+    fn put_cycle_cell(&mut self, cell: CycleCell, value: CycleValue) -> CaResult<()> {
+        match (cell, value) {
+            (CycleCell::Alst, CycleValue::Double(v)) => self.alst = v,
+            (CycleCell::Mlst, CycleValue::Double(v)) => self.mlst = v,
+            (cell, value) => return self.put_field(cell.name(), value.into()),
+        }
+        Ok(())
     }
 
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
@@ -869,7 +1243,7 @@ impl Record for SwaitRecord {
             "SIMS" => Some(EpicsValue::Short(self.sims)),
             "CALC" => Some(EpicsValue::String(self.calc.clone().into())),
             "CLCV" => Some(EpicsValue::Long(self.clcv)),
-            "INIT" => Some(EpicsValue::Short(if self.initialized { 1 } else { 0 })),
+            "INIT" => Some(EpicsValue::Short(self.init)),
             "OOPT" => Some(EpicsValue::Short(self.oopt)),
             "DOPT" => Some(EpicsValue::Short(self.dopt)),
             "DOLN" => Some(EpicsValue::String(self.doln.clone().into())),
@@ -877,7 +1251,7 @@ impl Record for SwaitRecord {
             "OVAL" => Some(EpicsValue::Double(self.oval)),
             "OEVT" => Some(EpicsValue::UShort(self.oevt)),
             "ODLY" => Some(EpicsValue::Float(self.odly)),
-            // OUTN is aliased to common.out via RecordInstance; not stored locally.
+            "OUTN" => Some(EpicsValue::String(self.outn.clone().into())),
             "PREC" => Some(EpicsValue::Short(self.prec)),
             "MDEL" => Some(EpicsValue::Double(self.mdel)),
             "ADEL" => Some(EpicsValue::Double(self.adel)),
@@ -919,6 +1293,11 @@ impl Record for SwaitRecord {
                     return Err(CaError::TypeMismatch("CALC".into()));
                 }
             }
+            "OVAL" => {
+                self.oval = value
+                    .to_f64()
+                    .ok_or_else(|| CaError::TypeMismatch("OVAL".into()))?;
+            }
             "CLCV" => {
                 self.clcv = value
                     .to_f64()
@@ -937,7 +1316,7 @@ impl Record for SwaitRecord {
             }
             "DOLN" => {
                 if let EpicsValue::String(s) = value {
-                    self.doln = s.as_str_lossy().into_owned();
+                    self.doln = s;
                 } else {
                     return Err(CaError::TypeMismatch("DOLN".into()));
                 }
@@ -960,13 +1339,19 @@ impl Record for SwaitRecord {
                         .ok_or_else(|| CaError::TypeMismatch("ODLY".into()))?,
                 );
             }
-            // OUTN falls through to put_common_field which mirrors to common.out.
+            "OUTN" => {
+                if let EpicsValue::String(s) = value {
+                    self.outn = s;
+                } else {
+                    return Err(CaError::TypeMismatch("OUTN".into()));
+                }
+            }
             "SIML" => match value {
-                EpicsValue::String(s) => self.siml = s.as_str_lossy().into_owned(),
+                EpicsValue::String(s) => self.siml = s,
                 _ => return Err(CaError::TypeMismatch("SIML".into())),
             },
             "SIOL" => match value {
-                EpicsValue::String(s) => self.siol = s.as_str_lossy().into_owned(),
+                EpicsValue::String(s) => self.siol = s,
                 _ => return Err(CaError::TypeMismatch("SIOL".into())),
             },
             "SIMM" => {
@@ -1021,16 +1406,14 @@ impl Record for SwaitRecord {
                         .to_f64()
                         .ok_or_else(|| CaError::TypeMismatch(name.into()))?;
                 } else if let Some(idx) = Self::pv_status_index(name) {
-                    // SPC_NOMOD to clients; this is where `refresh_link_status`'s
-                    // `post_fields` -> `put_field_internal` stores the status it
-                    // just classified.
+                    // SPC_NOMOD to clients.
                     self.pv_status[idx] = value
                         .to_f64()
                         .ok_or_else(|| CaError::TypeMismatch(name.into()))?
                         as i16;
                 } else if let Some(idx) = Self::inp_name_index(name) {
                     if let EpicsValue::String(s) = value {
-                        self.inp_names[idx] = s.as_str_lossy().into_owned();
+                        self.inp_names[idx] = s;
                     } else {
                         return Err(CaError::TypeMismatch(name.into()));
                     }
@@ -1046,30 +1429,6 @@ impl Record for SwaitRecord {
             }
         }
         Ok(())
-    }
-
-    /// The `INAN..INLN` texts read straight off the record's own array, not
-    /// through the default body's one name match per link.
-    /// See [`Record::set_input_link_slots`].
-    fn set_input_link_slots(&self) -> Option<(u64, u64)> {
-        crate::server::record::input_link_slots_of(&self.inp_names)
-    }
-
-    fn multi_input_links(&self) -> &'static [(&'static str, &'static str)] {
-        &[
-            ("INAN", "A"),
-            ("INBN", "B"),
-            ("INCN", "C"),
-            ("INDN", "D"),
-            ("INEN", "E"),
-            ("INFN", "F"),
-            ("INGN", "G"),
-            ("INHN", "H"),
-            ("ININ", "I"),
-            ("INJN", "J"),
-            ("INKN", "K"),
-            ("INLN", "L"),
-        ]
     }
 }
 

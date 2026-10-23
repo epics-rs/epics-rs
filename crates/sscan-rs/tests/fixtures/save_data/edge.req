@@ -1,0 +1,25 @@
+# leading comment
+  
+[prefix]   # the ioc prefix
+$(P)
+[status]
+$(UNDEF)saveData_status
+[filename]
+	$(P)$(Q)fileName  # trailing
+[counter]
+$(LONGNAMES)x
+[fileSystem]
+$(P)$(BIG)$(BIG)$(BIG)$(BIG)tail
+[scanRecord]
+$(P)scan1, handshake
+$(P)scan2,$(P)scan2.AWAIT
+# a comment line
+$(P)scan3
+[extraPV]
+$(P)a "first desc"
+$(P)b    "unterminated
+$(P)c
+[averyveryveryverylongsectionname]
+x
+[noclose
+y

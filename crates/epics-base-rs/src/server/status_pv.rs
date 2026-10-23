@@ -309,7 +309,7 @@ async fn register(
     initial: EpicsValue,
 ) -> CaResult<Arc<ProcessVariable>> {
     db.add_pv(name, initial).await?;
-    db.find_pv(name).await.ok_or_else(|| {
+    db.find_pv(name).ok_or_else(|| {
         crate::error::CaError::ChannelNotFound(format!(
             "status PV {name} vanished between add_pv and find_pv"
         ))
@@ -383,9 +383,7 @@ mod tests {
         .expect("registration");
         pvs.stop();
 
-        let pv = block_on_sync(db.find_pv("T:COUNT"))
-            .expect("plain thread")
-            .expect("the PV was registered");
+        let pv = db.find_pv("T:COUNT").expect("the PV was registered");
         const DBE_VALUE: u16 = 1;
         let mut rx = pv
             .add_subscriber(1, DbFieldType::Double, DBE_VALUE)
@@ -403,7 +401,7 @@ mod tests {
              read hook would not have"
         );
         assert_eq!(
-            format!("{}", pv.get()),
+            pv.get().text_g(),
             "42",
             "and the stored value must be the pushed sample, not the registered one"
         );
@@ -443,19 +441,15 @@ mod tests {
         .expect("registration");
         handle.stop();
 
-        let num = block_on_sync(db.find_pv("T:NUM"))
-            .expect("plain thread")
-            .expect("registered");
-        let text = block_on_sync(db.find_pv("T:STR"))
-            .expect("plain thread")
-            .expect("registered");
+        let num = db.find_pv("T:NUM").expect("registered");
+        let text = db.find_pv("T:STR").expect("registered");
         assert!(matches!(num.get(), EpicsValue::Double(_)));
         assert!(
             matches!(text.get(), EpicsValue::String(_)),
             "a string reader must produce a string PV; a double PV here would \
              make UPTIME a number and break every site's stringin client"
         );
-        assert_eq!(format!("{}", text.get()), "00:00:07");
+        assert_eq!(text.get().text_g(), "00:00:07");
     }
 
     /// Every value in one tick is read before any of them is published, so
@@ -480,19 +474,15 @@ mod tests {
         handle.stop();
         assert_eq!(handle.names(), &["T:FIRST", "T:SECOND"]);
 
-        let first = block_on_sync(db.find_pv("T:FIRST"))
-            .expect("plain thread")
-            .expect("registered");
-        let second = block_on_sync(db.find_pv("T:SECOND"))
-            .expect("plain thread")
-            .expect("registered");
+        let first = db.find_pv("T:FIRST").expect("registered");
+        let second = db.find_pv("T:SECOND").expect("registered");
 
         let seen = Arc::new(Mutex::new(String::new()));
         let observer = {
             let seen = seen.clone();
             let first = first.clone();
             move || {
-                *seen.lock().expect("observation") = format!("{}", first.get());
+                *seen.lock().expect("observation") = first.get().text_g();
                 EpicsValue::Double(2.0)
             }
         };
@@ -509,7 +499,7 @@ mod tests {
              spans two instants instead of one"
         );
         assert_eq!(
-            format!("{}", first.get()),
+            first.get().text_g(),
             "9",
             "precondition: this tick's sample really was published by it"
         );
@@ -571,7 +561,7 @@ mod tests {
         db.add_pv("T:NOPE", EpicsValue::Double(0.0))
             .await
             .expect("add");
-        let pv = db.find_pv("T:NOPE").await.expect("registered");
+        let pv = db.find_pv("T:NOPE").expect("registered");
         assert!(
             !push_once(&[(Box::new(double(1.0)), pv)]),
             "on a current-thread runtime the publish cannot be driven"

@@ -34,12 +34,17 @@
 //! that never
 //! resolved a class takes C's `default:` arm instead, makes no put at all and
 //! raises nothing — that boundary is `sseq_unresolved_lnk_no_wait.rs`.
+//!
+//! The line is C's `printf`, on stdout: oracleIoc (calc 3-7-5 sseq) with LNK1
+//! `T1 CA` into a second IOC's `ASG RO` record prints, on `dbpf SQ.PROC 1`,
+//! `sseq:processCallback: dbCaPutLinkCallback for link 0 failed.  Aborting.`
+//! to stdout and nothing to stderr.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use epics_base_rs::server::database::{
-    LinkDbfType, LinkMetadata, LinkPutOp, LinkSet, PutAdmission, PvDatabase,
+    LinkDbfType, LinkMetadata, LinkPutOp, LinkRef, LinkSet, PutAdmission, PvDatabase,
 };
 use epics_base_rs::server::recgbl::EventMask;
 use epics_base_rs::server::record::Record;
@@ -55,26 +60,26 @@ struct AdmissionLset {
 
 #[async_trait::async_trait]
 impl LinkSet for AdmissionLset {
-    fn is_connected(&self, _: &str) -> bool {
+    fn is_connected(&self, _: LinkRef<'_>) -> bool {
         self.admission == PutAdmission::Connected
     }
-    fn put_admission(&self, _: &str) -> PutAdmission {
+    fn put_admission(&self, _: LinkRef<'_>) -> PutAdmission {
         self.admission
     }
-    fn link_metadata(&self, _: &str) -> Option<LinkMetadata> {
+    fn link_metadata(&self, _: LinkRef<'_>) -> Option<LinkMetadata> {
         Some(LinkMetadata {
             dbf_type: Some(LinkDbfType::Double),
             element_count: Some(1),
             ..Default::default()
         })
     }
-    fn get_cached_value(&self, _: &str) -> Option<EpicsValue> {
+    fn get_cached_value(&self, _: LinkRef<'_>) -> Option<EpicsValue> {
         None
     }
-    async fn get_value(&self, name: &str) -> Option<EpicsValue> {
-        self.get_cached_value(name)
+    async fn get_value(&self, link: LinkRef<'_>) -> Option<EpicsValue> {
+        self.get_cached_value(link)
     }
-    async fn put_value(&self, _: &str, _: EpicsValue, _: LinkPutOp) -> Result<(), String> {
+    async fn put_value(&self, _: LinkRef<'_>, _: EpicsValue, _: LinkPutOp) -> Result<(), String> {
         Ok(())
     }
 }
@@ -125,6 +130,7 @@ async fn poll_double(db: &PvDatabase, pv: &str, want: f64, label: &str) {
 async fn three_step_sseq(db: &PvDatabase, prefix: &str, admission: PutAdmission) {
     db.register_link_set("ca", Arc::new(AdmissionLset { admission }))
         .await;
+    db.process_cp_links_on_connect().await;
     db.add_record(&format!("{prefix}_T2"), Box::new(AoRecord::new(0.0)))
         .await
         .unwrap();
@@ -151,6 +157,8 @@ async fn three_step_sseq(db: &PvDatabase, prefix: &str, admission: PutAdmission)
 #[epics_macros_rs::epics_test]
 async fn a_refused_put_callback_aborts_the_whole_sequence() {
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     three_step_sseq(&db, "SS_REF", PutAdmission::Refused).await;
 
     let mut abort_rx = db
@@ -193,7 +201,7 @@ async fn a_refused_put_callback_aborts_the_whole_sequence() {
     // C posts ABORT=1 at the refusal and ABORT=0 from `asyncFinish` (:477).
     let mut saw_raise = false;
     while let Ok(ev) = abort_rx.try_recv() {
-        if ev.snapshot.value == EpicsValue::Short(1) {
+        if ev.value().as_value().cloned().unwrap() == EpicsValue::Short(1) {
             saw_raise = true;
         }
     }
@@ -208,12 +216,51 @@ async fn a_refused_put_callback_aborts_the_whole_sequence() {
     );
 }
 
+/// The refusal's line goes to stdout, as C's `printf` does.
+#[cfg(unix)]
+#[epics_macros_rs::epics_test]
+async fn the_refusal_is_printed_on_stdout() {
+    use std::os::fd::AsRawFd;
+
+    let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
+    three_step_sseq(&db, "SS_OUT", PutAdmission::Refused).await;
+    let out = tempfile::NamedTempFile::new().unwrap();
+    let err = tempfile::NamedTempFile::new().unwrap();
+    // SAFETY: nextest runs this test in its own process; nothing else holds
+    // fds 1 and 2 while they are swapped.
+    let saved = unsafe {
+        let saved = (libc::dup(1), libc::dup(2));
+        libc::dup2(out.as_file().as_raw_fd(), 1);
+        libc::dup2(err.as_file().as_raw_fd(), 2);
+        saved
+    };
+    kick(&db, "SS_OUT").await;
+    poll_short(&db, "SS_OUT.BUSY", 0, "the aborted sequence must finish").await;
+    std::io::Write::flush(&mut std::io::stdout()).unwrap();
+    // SAFETY: restoring the descriptors this test replaced.
+    unsafe {
+        libc::dup2(saved.0, 1);
+        libc::dup2(saved.1, 2);
+        libc::close(saved.0);
+        libc::close(saved.1);
+    }
+    let line = "sseq:processCallback: dbCaPutLinkCallback for link 0 failed.  Aborting.";
+    let out = std::fs::read_to_string(out.path()).unwrap();
+    let err = std::fs::read_to_string(err.path()).unwrap();
+    assert!(out.lines().any(|l| l == line), "stdout: {out:?}");
+    assert!(!err.contains(line), "stderr: {err:?}");
+}
+
 /// The counter-boundary, so the fix cannot be "never dispatch": the same
 /// sequence with the put ADMITTED issues the callback, raises `WTG1`, and runs
 /// to the end.
 #[epics_macros_rs::epics_test]
 async fn an_admitted_put_callback_still_waits_and_completes() {
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     three_step_sseq(&db, "SS_OK", PutAdmission::Connected).await;
 
     let mut wtg_rx = db
@@ -245,7 +292,7 @@ async fn an_admitted_put_callback_still_waits_and_completes() {
     );
     let mut saw_wait = false;
     while let Ok(ev) = wtg_rx.try_recv() {
-        if ev.snapshot.value == EpicsValue::Short(1) {
+        if ev.value().as_value().cloned().unwrap() == EpicsValue::Short(1) {
             saw_wait = true;
         }
     }

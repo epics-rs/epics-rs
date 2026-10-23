@@ -1,0 +1,2 @@
+_main_ number_garbage_in_var.proto line 3: Garbage in variable 'replytimeout' after numeric value 10:  x
+_main_ while compiling protocol 'p' for 'rec0'

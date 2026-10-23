@@ -2,10 +2,11 @@
 //!
 //! Corresponds to C++ QSRV's `pvif.h/pvif.cpp` (ScalarBuilder, etc.).
 
+use epics_base_rs::server::database::char_view::{DollarView, PvaDollar};
 use epics_base_rs::server::recgbl::EventMask;
 use epics_base_rs::server::snapshot::{ControlInfo, DisplayInfo, PropertySupport, Snapshot};
 use epics_base_rs::types::{EpicsValue, PvString, WallTime};
-use epics_pva_rs::channel_shape::ChannelShape;
+use epics_pva_rs::channel_shape::{ChannelShape, ChannelValue};
 use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
 
 use crate::convert::{epics_to_pv_field, epics_to_scalar};
@@ -251,6 +252,19 @@ pub fn read_leaf_paths(
 ) -> Vec<String> {
     let everything = EventMask::VALUE | EventMask::ALARM | EventMask::PROPERTY;
     let mut paths = change_leaf_paths(prefix, mapping, everything, props);
+    paths.extend(assigned_leaf_paths(prefix, mapping, is_value_field));
+    paths
+}
+
+/// The leaves a member carries with no event behind them: a Scalar's
+/// `IOCSource::initialize` form and a Const's `info.cval`, both assigned at
+/// `onSubscribe` (`groupsource.cpp:414-424`) and again on every read.
+pub fn assigned_leaf_paths(
+    prefix: &str,
+    mapping: FieldMapping,
+    is_value_field: bool,
+) -> Vec<String> {
+    let mut paths = Vec::new();
     match mapping {
         // `IOCSource::initialize` — Scalar only.
         FieldMapping::Scalar => {
@@ -361,6 +375,14 @@ pub enum NtType {
     /// removes the dual meaning of a `CharArray` snapshot (byte array vs.
     /// string) by making the channel's intent explicit.
     LongString,
+    /// A long-string field with no room past `MAX_STRING_SIZE + 1`, which
+    /// pvxs leaves the `DBF_STRING` `cvt_dbaddr` made it
+    /// (`ioc/channel.cpp:58-60`): the same scalar string, read to the
+    /// buffer's NUL rather than over `LEN` elements.
+    LongStringField,
+    /// A `$` channel, served as its text or its `DBR_CHAR` image. The
+    /// snapshot carries the value `View::read` already made of it.
+    Dollar(PvaDollar),
 }
 
 impl NtType {
@@ -370,6 +392,95 @@ impl NtType {
             "bi" | "bo" | "mbbi" | "mbbo" => NtType::Enum,
             "waveform" | "compress" | "histogram" => NtType::ScalarArray,
             _ => NtType::Scalar,
+        }
+    }
+}
+
+/// A channel's `$` decision, taken once per read and handed to both the
+/// value read and [`nt_type_for_channel`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum View {
+    /// No `$`: the field as it is.
+    Field,
+    /// A `$` channel.
+    Dollar(DollarView),
+    /// [`ChannelValue::Text`]: no `$`, read as one.
+    Text(DollarView),
+}
+
+impl View {
+    /// Of a channel whose value chain is `filters`; `None` where `$` is
+    /// refused (`dbChannel.c:486-505`).
+    pub(crate) fn of(
+        instance: &epics_base_rs::server::record::RecordInstance,
+        field: &str,
+        string_view: bool,
+        filters: &epics_base_rs::server::database::filters::FilterChain,
+    ) -> Option<Self> {
+        if !string_view {
+            return Some(
+                match ChannelValue::of_record_channel(instance, field, filters) {
+                    ChannelValue::Text(dollar) => Self::Text(dollar),
+                    _ => Self::Field,
+                },
+            );
+        }
+        DollarView::of(instance, field, filters).map(Self::Dollar)
+    }
+
+    /// The served value of the field's own `value`, through `filters` in
+    /// read context. C's `dbChannelCreate` swaps the address to the char
+    /// view before any filter opens (`dbChannel.c:486-494`) and `dbGet`
+    /// reads the filtered log after, so a `$` renders before the chain and
+    /// finishes after it ([`DollarView::finish`]). A chain that drops the
+    /// read yields the unfiltered field: `dbChannelGet` reads the live record
+    /// when the log is NULL (`dbAccess.c:924-930`).
+    pub(crate) fn read(
+        self,
+        value: EpicsValue,
+        filters: &epics_base_rs::server::database::filters::FilterChain,
+    ) -> EpicsValue {
+        let chain = |value: EpicsValue| {
+            if filters.is_empty() {
+                value
+            } else {
+                filters.apply_to_read_value(value.clone()).unwrap_or(value)
+            }
+        };
+        match self {
+            Self::Field => chain(value),
+            Self::Dollar(dollar) | Self::Text(dollar) => {
+                let image = dollar.render(value);
+                let log = chain(image.clone());
+                dollar.finish(image, log)
+            }
+        }
+    }
+
+    /// [`Self::read`] on the field's whole snapshot: a `ts` value mode reads
+    /// its time and narrows its properties, as `dbGet` reads both off the
+    /// log (`dbAccess.c:341-348`).
+    pub(crate) fn read_snapshot(
+        self,
+        mut snap: epics_base_rs::server::snapshot::Snapshot,
+        filters: &epics_base_rs::server::database::filters::FilterChain,
+    ) -> epics_base_rs::server::snapshot::Snapshot {
+        match self {
+            Self::Field if !filters.is_empty() => {
+                filters.apply_to_read_snapshot(snap.clone()).unwrap_or(snap)
+            }
+            _ => {
+                snap.value = self.read(snap.value, filters);
+                snap
+            }
+        }
+    }
+
+    /// The char view a monitor's subscriptions read their entries through.
+    pub(crate) fn dollar(self) -> Option<DollarView> {
+        match self {
+            Self::Field => None,
+            Self::Dollar(dollar) | Self::Text(dollar) => Some(dollar),
         }
     }
 }
@@ -401,87 +512,32 @@ impl NtType {
 /// a `bi` VAL is, and a `REC.SCAN` member is `NTEnum` while a `BI.DESC` one
 /// stays an `NTScalar` string.
 ///
-/// Three ways a channel is a long string. Two are pvxs's own test
-/// ("final field type is `DBR_CHAR`, the field is an array, and the
-/// channel's format is `String`"); the third, `$` on a `DBF_STRING`
-/// field, is a deliberate deviation because pvxs's code does not honour
-/// it — see the last bullet.
-///
-/// - The record type declares the field one (`Record::long_string_fields`
-///   — `lsi`/`lso` VAL/OVAL, `printf` VAL). These are C's `SPC_DBADDR`
-///   fields whose `cvt_dbaddr` reports a `DBF_STRING` with `field_size >
-///   MAX_STRING_SIZE+1`; pvxs re-views them as a `DBR_CHAR` array and
-///   forces `form = "String"` (`ioc/channel.cpp:59-74`).
-/// - The record carries `info(Q:form, "String")` and the field is the VAL
-///   of a `DBF_CHAR` array — the QSRV long-string idiom for a plain
-///   `waveform`/`aai` of CHAR. The info tag applies to VAL only
-///   (`dbIsValueField`, `ioc/channel.cpp:40-47`), so another field of the
-///   same record stays a byte array.
-/// - The channel name carried the `$` modifier. `dbChannelCreate` re-views
-///   a `DBF_STRING` or link field as a `DBR_CHAR` array
-///   (`dbChannel.c:486-505`), but pvxs ends up with `form = "String"` for
-///   the LINK case only: `dbChannelCreate` rewrites `addr.field_type` to
-///   `DBF_CHAR` for a `DBF_STRING` field (`dbChannel.c:488-493`) and keeps
-///   the original type for a link (`:494-499`), so pvxs's duplicate of that
-///   logic (`ioc/channel.cpp:59-74`) can only fire on the link arm and a
-///   `$`-ed `DBF_STRING` field keeps `form = "Default"`. Measured against a
-///   stock pvxs 1.5.2 IOC, `record.NAME$` returns `NTScalarArray int8_t[]`
-///   while `record.INP$` returns a string; pvxs's own `NAME$` case
-///   (`test/testqsingle.cpp:268`) does not catch it because `testFldEq`'s
-///   conversion-failure arm is `testFalse(false)` (`test/testioc.h:66-69`),
-///   which always passes. This port serves both as a long string, following
-///   pvxs's documentation (`documentation/ioc.rst:112-116` — a `$` on a
-///   `DBF_STRING` or `DBF_*LINK` field makes it "visible as a PVA string")
-///   rather than its code.
+/// A long string is [`ChannelValue::Text`] or
+/// [`ChannelValue::LongStringField`]; a `$` channel is [`NtType::Dollar`]
+/// instead, whatever its format.
 pub(crate) fn nt_type_for_channel(
     instance: &epics_base_rs::server::record::RecordInstance,
     field_upper: &str,
     resolved: Option<&EpicsValue>,
-    string_view: bool,
+    view: View,
+    filters: &epics_base_rs::server::database::filters::FilterChain,
 ) -> NtType {
-    // The `$` view, decided first. `getChannelValueType` reads the decision
-    // back off `chan.format()` (`iocsource.cpp:635-636`), which pvxs sets to
-    // "String" for a `$`-ed LINK field only — the deviation above. Deciding
-    // it here is what keeps this function the whole of
-    // `getChannelValueType`: the single-record path used to branch on `$`
-    // before calling in, so the group path — which has no such branch —
-    // served the unviewed NT.
-    if string_view {
-        return NtType::LongString;
+    // The `$` view, decided first, so the single-record and group paths
+    // cannot reach different answers for one channel.
+    match view {
+        View::Dollar(dollar) if dollar.scalar() => return NtType::Scalar,
+        View::Dollar(dollar) => return NtType::Dollar(dollar.serve),
+        View::Text(_) => return NtType::LongString,
+        View::Field => {}
     }
-    if instance
-        .record
-        .long_string_fields()
-        .iter()
-        .any(|f| f.eq_ignore_ascii_case(field_upper))
-    {
-        return NtType::LongString;
-    }
-    // `final_field_type == DBR_CHAR && isArray && format == "String"`. The
-    // `DBR_CHAR` half is `DBR_CHAR`, not `DBR_UCHAR` — pvxs tests the signed
-    // one — and the `isArray` half is pvxs's own conjunct: a `Q:form,"String"`
-    // record whose VAL holds ONE element is a `DBR_CHAR` scalar, not a long
-    // string.
-    let is_array = ChannelShape::of_channel(&*instance.record, field_upper, resolved).is_array();
-    if is_array
-        && field_upper.eq_ignore_ascii_case("VAL")
-        && matches!(resolved, Some(EpicsValue::CharArray(_)))
-        && instance.get_info("Q:form") == Some("String")
-    {
-        return NtType::LongString;
-    }
-    // `TypeCode valueType(fromDbrType(final_field_type)); if(isArray)
-    // valueType = valueType.arrayOf();` — the count decides the shape and
-    // nothing else does. The element type rides on the resolved value, which
-    // is `client_field_value`, i.e. the value already projected onto the
-    // field's DECLARED type, so reading the DBF off it IS reading the
-    // declaration.
-    if is_array {
-        return NtType::ScalarArray;
-    }
-    match resolved {
-        Some(EpicsValue::Enum(_)) => NtType::Enum,
-        _ => NtType::Scalar,
+    match ChannelValue::of_channel(instance, field_upper, resolved, filters) {
+        ChannelValue::Text(_) => NtType::LongString,
+        ChannelValue::LongStringField => NtType::LongStringField,
+        ChannelValue::Shaped(shape) if shape.is_array() => NtType::ScalarArray,
+        ChannelValue::Shaped(_) => match resolved {
+            Some(EpicsValue::Enum(_)) => NtType::Enum,
+            _ => NtType::Scalar,
+        },
     }
 }
 
@@ -510,6 +566,10 @@ pub(crate) enum BareLeaf {
     /// A `DBR_CHAR` array whose channel format is `String` — pvxs
     /// `TypeCode::String` (`getChannelValueType`, `iocsource.cpp:635-636`).
     LongString,
+    /// [`NtType::LongStringField`].
+    LongStringField,
+    /// [`NtType::Dollar`].
+    Dollar(PvaDollar),
     /// The channel's `dbChannelFinalElements()` is not 1
     /// ([`ChannelShape`]) — pvxs `valueType.arrayOf()`.
     Array(ScalarType),
@@ -529,13 +589,14 @@ impl BareLeaf {
         field_upper: &str,
         resolved: Option<&EpicsValue>,
         field_dbf: epics_base_rs::types::DbFieldType,
-        string_view: bool,
+        view: View,
+        filters: &epics_base_rs::server::database::filters::FilterChain,
     ) -> Self {
         let scalar = crate::convert::dbf_to_scalar_type(
-            resolved.map(|v| v.db_field_type()).unwrap_or(field_dbf),
+            filters.final_field_type(resolved.map(|v| v.db_field_type()).unwrap_or(field_dbf)),
         );
         Self::from_nt(
-            nt_type_for_channel(instance, field_upper, resolved, string_view),
+            nt_type_for_channel(instance, field_upper, resolved, view, filters),
             scalar,
         )
     }
@@ -554,9 +615,11 @@ impl BareLeaf {
         instance: &epics_base_rs::server::record::RecordInstance,
         field_upper: &str,
         resolved: &EpicsValue,
+        filters: &epics_base_rs::server::database::filters::FilterChain,
     ) -> Self {
-        let scalar = crate::convert::dbf_to_scalar_type(resolved.db_field_type());
-        match ChannelShape::of_channel(&*instance.record, field_upper, Some(resolved)) {
+        let scalar =
+            crate::convert::dbf_to_scalar_type(filters.final_field_type(resolved.db_field_type()));
+        match ChannelShape::of_channel(&*instance.record, field_upper, Some(resolved), filters) {
             ChannelShape::Array => BareLeaf::Array(scalar),
             ChannelShape::Scalar => BareLeaf::Scalar(scalar),
         }
@@ -568,6 +631,8 @@ impl BareLeaf {
     pub(crate) fn from_nt(nt_type: NtType, scalar: ScalarType) -> Self {
         match nt_type {
             NtType::LongString => BareLeaf::LongString,
+            NtType::LongStringField => BareLeaf::LongStringField,
+            NtType::Dollar(dollar) => BareLeaf::Dollar(dollar),
             NtType::ScalarArray => BareLeaf::Array(scalar),
             NtType::Scalar | NtType::Enum => BareLeaf::Scalar(scalar),
         }
@@ -576,7 +641,11 @@ impl BareLeaf {
     /// The leaf's introspection.
     pub(crate) fn desc(self) -> FieldDesc {
         match self {
-            BareLeaf::LongString => FieldDesc::Scalar(ScalarType::String),
+            BareLeaf::LongString | BareLeaf::LongStringField => {
+                FieldDesc::Scalar(ScalarType::String)
+            }
+            BareLeaf::Dollar(PvaDollar::Text) => FieldDesc::Scalar(ScalarType::String),
+            BareLeaf::Dollar(PvaDollar::Chars) => FieldDesc::ScalarArray(ScalarType::Byte),
             BareLeaf::Array(t) => FieldDesc::ScalarArray(t),
             BareLeaf::Scalar(t) => FieldDesc::Scalar(t),
         }
@@ -593,8 +662,11 @@ impl BareLeaf {
     pub(crate) fn value(self, value: &EpicsValue) -> PvField {
         match self {
             BareLeaf::LongString => PvField::Scalar(ScalarValue::String(long_string_value(value))),
+            BareLeaf::LongStringField => {
+                PvField::Scalar(ScalarValue::String(long_string_field_value(value)))
+            }
             BareLeaf::Scalar(_) => PvField::Scalar(epics_to_scalar(value)),
-            BareLeaf::Array(_) => epics_to_pv_field(value),
+            BareLeaf::Dollar(_) | BareLeaf::Array(_) => epics_to_pv_field(value),
         }
     }
 }
@@ -682,9 +754,9 @@ fn limit_scalar(t: ScalarType, v: f64) -> ScalarValue {
         ScalarType::ULong => ScalarValue::ULong(v as u64),
         ScalarType::Float => ScalarValue::Float(v as f32),
         ScalarType::Double => ScalarValue::Double(v),
-        // String values are non-numeric and never reach the limit
-        // builders; fall back to the textual rendering for completeness.
-        ScalarType::String => ScalarValue::String(v.to_string().into()),
+        // Every caller is gated on `is_numeric_scalar`, as pvxs builds
+        // limit members only `if(isnumeric)` (`nt.cpp:58`, `:87`, `:96`).
+        ScalarType::String => unreachable!("a string value has no limits"),
     }
 }
 
@@ -909,6 +981,17 @@ pub(crate) fn long_string_value(value: &EpicsValue) -> PvString {
     }
 }
 
+/// [`long_string_value`] of a [`NtType::LongStringField`] channel: the
+/// buffer to its NUL, past `LEN` included.
+pub(crate) fn long_string_field_value(value: &EpicsValue) -> PvString {
+    match value {
+        EpicsValue::CharArray(bytes) => PvString::from_bytes(
+            epics_base_rs::server::database::char_view::long_string_field_bytes(bytes),
+        ),
+        other => long_string_value(other),
+    }
+}
+
 /// Convert a long-string Snapshot into a scalar-string NTScalar.
 ///
 /// pvxs serves a `form = "String"` `DBF_CHAR` view as a `pvString`
@@ -916,9 +999,12 @@ pub(crate) fn long_string_value(value: &EpicsValue) -> PvString {
 /// We decode the `CharArray` to a `String` and reuse the standard
 /// NTScalar builder, which emits the string-scalar metadata set
 /// (`display = {description, units}`, no numeric `control`/`valueAlarm`).
-fn snapshot_to_nt_long_string(snapshot: &Snapshot) -> PvStructure {
+fn snapshot_to_nt_long_string(
+    snapshot: &Snapshot,
+    text: fn(&EpicsValue) -> PvString,
+) -> PvStructure {
     let mut snap = snapshot.clone();
-    snap.value = EpicsValue::String(long_string_value(&snapshot.value));
+    snap.value = EpicsValue::String(text(&snapshot.value));
     snapshot_to_nt_scalar(&snap)
 }
 
@@ -928,7 +1014,10 @@ pub fn snapshot_to_pv_structure(snapshot: &Snapshot, nt_type: NtType) -> PvStruc
         NtType::Scalar => snapshot_to_nt_scalar(snapshot),
         NtType::Enum => snapshot_to_nt_enum(snapshot),
         NtType::ScalarArray => snapshot_to_nt_scalar_array(snapshot),
-        NtType::LongString => snapshot_to_nt_long_string(snapshot),
+        NtType::LongString => snapshot_to_nt_long_string(snapshot, long_string_value),
+        NtType::LongStringField => snapshot_to_nt_long_string(snapshot, long_string_field_value),
+        NtType::Dollar(PvaDollar::Text) => snapshot_to_nt_scalar(snapshot),
+        NtType::Dollar(PvaDollar::Chars) => snapshot_to_nt_scalar_array(snapshot),
     }
 }
 
@@ -1065,7 +1154,7 @@ pub fn build_nt_scalar_desc(scalar_type: ScalarType) -> FieldDesc {
     }
     FieldDesc::Structure {
         struct_id: "epics:nt/NTScalar:1.0".into(),
-        fields,
+        fields: fields.into(),
     }
 }
 
@@ -1085,7 +1174,8 @@ pub fn build_nt_enum_desc() -> FieldDesc {
                     fields: vec![
                         ("index".into(), FieldDesc::Scalar(ScalarType::Int)),
                         ("choices".into(), FieldDesc::ScalarArray(ScalarType::String)),
-                    ],
+                    ]
+                    .into(),
                 },
             ),
             ("alarm".into(), alarm_desc()),
@@ -1094,10 +1184,12 @@ pub fn build_nt_enum_desc() -> FieldDesc {
                 "display".into(),
                 FieldDesc::Structure {
                     struct_id: String::new(),
-                    fields: vec![("description".into(), FieldDesc::Scalar(ScalarType::String))],
+                    fields: vec![("description".into(), FieldDesc::Scalar(ScalarType::String))]
+                        .into(),
                 },
             ),
-        ],
+        ]
+        .into(),
     }
 }
 
@@ -1120,7 +1212,7 @@ pub fn build_nt_scalar_array_desc(element_type: ScalarType) -> FieldDesc {
     }
     FieldDesc::Structure {
         struct_id: "epics:nt/NTScalarArray:1.0".into(),
-        fields,
+        fields: fields.into(),
     }
 }
 
@@ -1133,7 +1225,9 @@ pub fn build_field_desc_for_nt(nt_type: NtType, scalar_type: ScalarType) -> Fiel
         // A long-string field is advertised as a scalar-string NTScalar,
         // independent of the bound field's `DBF_CHAR` storage type, so
         // the descriptor matches the `pvString` value the GET path emits.
-        NtType::LongString => build_nt_scalar_desc(ScalarType::String),
+        NtType::LongString | NtType::LongStringField => build_nt_scalar_desc(ScalarType::String),
+        NtType::Dollar(PvaDollar::Text) => build_nt_scalar_desc(ScalarType::String),
+        NtType::Dollar(PvaDollar::Chars) => build_nt_scalar_array_desc(ScalarType::Byte),
     }
 }
 
@@ -1367,7 +1461,8 @@ fn alarm_desc() -> FieldDesc {
             ("severity".into(), FieldDesc::Scalar(ScalarType::Int)),
             ("status".into(), FieldDesc::Scalar(ScalarType::Int)),
             ("message".into(), FieldDesc::Scalar(ScalarType::String)),
-        ],
+        ]
+        .into(),
     }
 }
 
@@ -1381,7 +1476,8 @@ fn timestamp_desc() -> FieldDesc {
             ),
             ("nanoseconds".into(), FieldDesc::Scalar(ScalarType::Int)),
             ("userTag".into(), FieldDesc::Scalar(ScalarType::Int)),
-        ],
+        ]
+        .into(),
     }
 }
 
@@ -1393,7 +1489,8 @@ fn form_desc() -> FieldDesc {
         fields: vec![
             ("index".into(), FieldDesc::Scalar(ScalarType::Int)),
             ("choices".into(), FieldDesc::ScalarArray(ScalarType::String)),
-        ],
+        ]
+        .into(),
     }
 }
 
@@ -1412,7 +1509,7 @@ fn display_desc(scalar_type: ScalarType, numeric: bool) -> FieldDesc {
     FieldDesc::Structure {
         // Anonymous id to match the value builder / pvxs (see `build_display`).
         struct_id: String::new(),
-        fields,
+        fields: fields.into(),
     }
 }
 
@@ -1423,7 +1520,8 @@ fn control_desc(scalar_type: ScalarType) -> FieldDesc {
             ("limitLow".into(), FieldDesc::Scalar(scalar_type)),
             ("limitHigh".into(), FieldDesc::Scalar(scalar_type)),
             ("minStep".into(), FieldDesc::Scalar(scalar_type)),
-        ],
+        ]
+        .into(),
     }
 }
 
@@ -1509,7 +1607,8 @@ fn value_alarm_desc(scalar_type: ScalarType) -> FieldDesc {
                 FieldDesc::Scalar(ScalarType::Int),
             ),
             ("hysteresis".into(), FieldDesc::Scalar(ScalarType::Double)),
-        ],
+        ]
+        .into(),
     }
 }
 
@@ -2503,7 +2602,7 @@ mod tests {
         );
     }
 
-    /// R15-33 — a READ (GET reply, PUT_GET readback, monitor seed) frames
+    /// R15-33 — a READ (GET reply, PUT readback, monitor seed) frames
     /// what the source ASSIGNED, and QSRV's source assigns a strict subset
     /// of the NT.
     ///

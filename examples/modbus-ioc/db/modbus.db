@@ -48,16 +48,19 @@ record(longout, "$(P)$(R)SetReg0") {
 }
 
 # ---- Driver statistics ----
+# Periodic, as statistics.template reads them: C never posts READ_OK or
+# IO_ERRORS, so on I/O Intr these never process and readPoller reports
+# them as an invalid reason every poll (drvModbusAsyn.cpp:1722-1727).
 record(longin, "$(P)$(R)ReadOK") {
     field(DESC, "Successful reads")
     field(DTYP, "asynInt32")
     field(INP,  "@asyn($(HR) 0) READ_OK")
-    field(SCAN, "I/O Intr")
+    field(SCAN, "1 second")
 }
 
 record(longin, "$(P)$(R)IOErrors") {
     field(DESC, "I/O errors")
     field(DTYP, "asynInt32")
     field(INP,  "@asyn($(HR) 0) IO_ERRORS")
-    field(SCAN, "I/O Intr")
+    field(SCAN, "1 second")
 }

@@ -1,0 +1,176 @@
+==L0
+Driver: stream
+  StreamDevice 2.8.26 2026-08-10 17:18:59 +0200
+  commit: 562dd5ad36e07989a8bbb231dcb5bd165537c7f6
+  (C) 1999 Dirk Zimoch (dirk.zimoch@psi.ch)
+  Use interest level 100 for license information
+  registered bus interfaces:
+    DebugInterface
+    DummyInterface
+    AsynDriverInterface
+==L1
+Driver: stream
+  StreamDevice 2.8.26 2026-08-10 17:18:59 +0200
+  commit: 562dd5ad36e07989a8bbb231dcb5bd165537c7f6
+  (C) 1999 Dirk Zimoch (dirk.zimoch@psi.ch)
+  Use interest level 100 for license information
+  registered bus interfaces:
+    DebugInterface
+    DummyInterface
+    AsynDriverInterface
+  registered converters:
+    %/ RegexpConverter
+    %< ChecksumConverter
+    %B BinaryConverter
+    %D BCDConverter
+    %E StdDoubleConverter
+    %G StdDoubleConverter
+    %R RawFloatConverter
+    %T TimestampConverter
+    %X StdLongConverter
+    %[ StdCharsetConverter
+    %b BinaryConverter
+    %c StdCharsConverter
+    %d StdLongConverter
+    %e StdDoubleConverter
+    %f StdDoubleConverter
+    %g StdDoubleConverter
+    %i StdLongConverter
+    %m MantissaExponentConverter
+    %o StdLongConverter
+    %r RawConverter
+    %s StdStringConverter
+    %u StdLongConverter
+    %x StdLongConverter
+    %{ EnumConverter
+  connected records:
+    R1: p.proto get dummy
+    R2: p.proto put dummy
+==L2
+Driver: stream
+  StreamDevice 2.8.26 2026-08-10 17:18:59 +0200
+  commit: 562dd5ad36e07989a8bbb231dcb5bd165537c7f6
+  (C) 1999 Dirk Zimoch (dirk.zimoch@psi.ch)
+  Use interest level 100 for license information
+  registered bus interfaces:
+    DebugInterface
+    DummyInterface
+    AsynDriverInterface
+  registered converters:
+    %/ RegexpConverter
+    %< ChecksumConverter
+    %B BinaryConverter
+    %D BCDConverter
+    %E StdDoubleConverter
+    %G StdDoubleConverter
+    %R RawFloatConverter
+    %T TimestampConverter
+    %X StdLongConverter
+    %[ StdCharsetConverter
+    %b BinaryConverter
+    %c StdCharsConverter
+    %d StdLongConverter
+    %e StdDoubleConverter
+    %f StdDoubleConverter
+    %g StdDoubleConverter
+    %i StdLongConverter
+    %m MantissaExponentConverter
+    %o StdLongConverter
+    %r RawConverter
+    %s StdStringConverter
+    %u StdLongConverter
+    %x StdLongConverter
+    %{ EnumConverter
+  connected records:
+
+R1: p.proto get dummy
+get {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    out "VAL?";
+    in "%f";
+}
+
+R2: p.proto put dummy
+put {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    out "SET %s";
+}
+==L3
+Driver: stream
+  StreamDevice 2.8.26 2026-08-10 17:18:59 +0200
+  commit: 562dd5ad36e07989a8bbb231dcb5bd165537c7f6
+  (C) 1999 Dirk Zimoch (dirk.zimoch@psi.ch)
+  Use interest level 100 for license information
+  registered bus interfaces:
+    DebugInterface
+    DummyInterface
+    AsynDriverInterface
+  registered converters:
+    %/ RegexpConverter
+    %< ChecksumConverter
+    %B BinaryConverter
+    %D BCDConverter
+    %E StdDoubleConverter
+    %G StdDoubleConverter
+    %R RawFloatConverter
+    %T TimestampConverter
+    %X StdLongConverter
+    %[ StdCharsetConverter
+    %b BinaryConverter
+    %c StdCharsConverter
+    %d StdLongConverter
+    %e StdDoubleConverter
+    %f StdDoubleConverter
+    %g StdDoubleConverter
+    %i StdLongConverter
+    %m MantissaExponentConverter
+    %o StdLongConverter
+    %r RawConverter
+    %s StdStringConverter
+    %u StdLongConverter
+    %x StdLongConverter
+    %{ EnumConverter
+  connected records:
+    R1: p.proto get dummy
+      active command=none flags=0x0000
+    R2: p.proto put dummy
+      active command=none flags=0x0000
+==L100
+Driver: stream
+  StreamDevice 2.8.26 2026-08-10 17:18:59 +0200
+  commit: 562dd5ad36e07989a8bbb231dcb5bd165537c7f6
+  (C) 1999 Dirk Zimoch (dirk.zimoch@psi.ch)
+
+StreamDevice is free software: You can redistribute it and/or modify
+it under the terms of the GNU Lesser General Public License as published
+by the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+StreamDevice is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU Lesser General Public License for more details
+
+You should have received a copy of the GNU Lesser General Public License
+along with StreamDevice. If not, see https://www.gnu.org/licenses/.
+==END

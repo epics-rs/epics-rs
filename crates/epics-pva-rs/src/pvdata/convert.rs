@@ -28,6 +28,8 @@
 
 use std::borrow::Cow;
 
+use epics_base_rs::runtime::stdlib::{c_isspace, strtoll_errno, strtoull_errno};
+
 use super::scalar::{ScalarType, ScalarValue};
 use super::structure::PvField;
 
@@ -286,19 +288,12 @@ pub fn as_u8(f: &PvField) -> Result<u8, NoConvert> {
 /// `"true"`/`"false"` (`data.cpp:438`); every integer and real renders through
 /// `SB()<<src` (`copyOutScalar`, `data.cpp:409`). Array, struct and unselected
 /// union storage have no arm → [`NoConvert`]; a selected union derefs.
-///
-/// DEVIATION, deliberate and recorded: `SB()<<double` is `std::ostream`'s
-/// default float format (6 significant digits, `1e+20`); the port renders a
-/// real with Rust's shortest round-trip form. No `record._options` reader
-/// observes that text — a numeric store always satisfies the integer/bool
-/// conversion the readers try first — so this only affects the reason text of
-/// a [`NoConvert`], never a decision.
 pub fn as_string(f: &PvField) -> Result<String, NoConvert> {
     match store_of(f) {
         Store::Bool(b) => Ok(if b { "true".into() } else { "false".into() }),
         Store::Integer(n) => Ok(n.to_string()),
         Store::UInteger(n) => Ok(n.to_string()),
-        Store::Real(n) => Ok(n.to_string()),
+        Store::Real(n) => Ok(super::fmt::render_real(n)),
         Store::Str(s) => Ok(s.into_owned()),
         Store::Compound(Some(inner)) => as_string(inner),
         Store::Array | Store::Compound(None) | Store::Null => Err(no_scalar_arm(f, "string")),
@@ -307,64 +302,36 @@ pub fn as_string(f: &PvField) -> Result<String, NoConvert> {
 
 /// pvxs `parseTo<uint64_t>` (`util.cpp:786-799`) — `std::stoull(s, &idx, 0)`
 /// followed by a trailing-whitespace skip and an "extraneous characters"
-/// check.
-///
-/// `strtoull` with base 0 is not a decimal parse: it skips leading
-/// whitespace, takes an optional sign, then picks the radix from the prefix —
-/// `0x`/`0X` → 16, a leading `0` → 8, otherwise 10. A leading `-` NEGATES the
-/// parsed unsigned value (defined by C, not an error), so `"-1"` is
-/// `u64::MAX`. Overflow is `std::out_of_range` → `NoConvert`.
-///
-/// So `"0x10"` is 16, `"010"` is 8, `"10"` is 10, and `"12abc"` is NoConvert
-/// (the `abc` is extraneous). The port's decimal-only `str::parse` rejected
-/// the first two and accepted nothing pvxs rejects.
+/// check. `std::stoull` is libcom's [`strtoull_errno`] at base 0: a leading
+/// `-` negates (`"-1"` is `u64::MAX`), `0x`/`0b`/leading-`0` pick the radix,
+/// and overflow is `std::out_of_range` → `NoConvert`.
 pub fn parse_to_u64(s: &str) -> Result<u64, NoConvert> {
-    let b = s.as_bytes();
-    let mut i = 0usize;
-    while i < b.len() && epics_base_rs::runtime::stdlib::c_isspace(b[i] as char) {
-        i += 1;
-    }
-    let negate = match b.get(i) {
-        Some(b'-') => {
-            i += 1;
-            true
-        }
-        Some(b'+') => {
-            i += 1;
-            false
-        }
-        _ => false,
-    };
-    // base 0 radix selection, exactly as strtoull does it.
-    let (radix, start) = match (b.get(i), b.get(i + 1)) {
-        (Some(b'0'), Some(b'x' | b'X')) => (16u32, i + 2),
-        (Some(b'0'), _) => (8u32, i),
-        _ => (10u32, i),
-    };
-    let mut end = start;
-    while end < b.len() && (b[end] as char).is_digit(radix) {
-        end += 1;
-    }
-    if end == start {
-        // No digit sequence at all — `std::stoull` raises `invalid_argument`,
-        // which `parseTo` re-raises as NoConvert. (A bare `"0x"` differs in
-        // wording only: strtoull consumes the `0` and leaves `x` extraneous.)
+    parse_base0(s, "integer", |b| strtoull_errno(b, 0))
+}
+
+/// pvxs `parseTo<int64_t>` (`util.cpp:802-816`) — `std::stoll(s, &idx, 0)`,
+/// the same scan as [`parse_to_u64`] with a signed range. Its extraneous text
+/// says "unsigned", as pvxs's does.
+pub fn parse_to_i64(s: &str) -> Result<i64, NoConvert> {
+    parse_base0(s, "unsigned", |b| strtoll_errno(b, 0))
+}
+
+/// `parseTo` around its `std::stoll`/`std::stoull` `scan`: `None` (ERANGE)
+/// is `std::out_of_range`, raised before the trailing check; nothing
+/// converted is `std::invalid_argument`.
+fn parse_base0<T>(
+    s: &str,
+    what: &str,
+    scan: impl FnOnce(&[u8]) -> Option<(T, usize)>,
+) -> Result<T, NoConvert> {
+    let (v, end) =
+        scan(s.as_bytes()).ok_or_else(|| NoConvert::new(format!("Out of range : \"{s}\"")))?;
+    if end == 0 {
         return Err(NoConvert::new(format!("Invalid input : \"{s}\"")));
     }
-    let mut v = u64::from_str_radix(&s[start..end], radix)
-        .map_err(|_| NoConvert::new(format!("Out of range : \"{s}\"")))?;
-    if negate {
-        // C: "if the subject sequence begins with a minus sign, the value is
-        // negated" — a wrap, not an error.
-        v = v.wrapping_neg();
-    }
-    let mut j = end;
-    while j < b.len() && epics_base_rs::runtime::stdlib::c_isspace(b[j] as char) {
-        j += 1;
-    }
-    if j != b.len() {
+    if !s.as_bytes()[end..].iter().all(|&c| c_isspace(c as char)) {
         return Err(NoConvert::new(format!(
-            "Extraneous characters after integer: \"{s}\""
+            "Extraneous characters after {what}: \"{s}\""
         )));
     }
     Ok(v)
@@ -374,6 +341,21 @@ pub fn parse_to_u64(s: &str) -> Result<u64, NoConvert> {
 mod tests {
     use super::*;
     use crate::pvdata::{PvStructure, TypedScalarArray, VariantValue};
+
+    /// `SB()<<src` (`data.cpp:409`): the stream default, `%g` at six digits.
+    #[test]
+    fn as_string_renders_a_real_as_the_stream_default() {
+        for (v, want) in [(0.1 + 0.2, "0.3"), (1e20, "1e+20"), (-f64::NAN, "-nan")] {
+            assert_eq!(
+                as_string(&PvField::Scalar(ScalarValue::Double(v))).unwrap(),
+                want
+            );
+        }
+        assert_eq!(
+            as_string(&PvField::Scalar(ScalarValue::Float(0.1))).unwrap(),
+            "0.1"
+        );
+    }
 
     #[test]
     fn as_bool_converts_every_numeric_storage_class() {
@@ -534,8 +516,54 @@ mod tests {
         }
         // Octal radix rejects 8/9 as digits — they become extraneous.
         assert!(parse_to_u64("08").is_err());
+        // `0x` with no hex digit after it is no prefix: stoull takes the `0`.
+        for s in ["0x", "0xg", "-0x", " 0X "] {
+            assert_eq!(
+                parse_to_u64(s).unwrap_err().message(),
+                format!("Extraneous characters after integer: \"{s}\"")
+            );
+        }
+        assert_eq!(parse_to_u64("0x1"), Ok(1));
         // Overflow is `std::out_of_range` → NoConvert.
         assert!(parse_to_u64("18446744073709551616").is_err());
+    }
+
+    /// libstdc++ `stoll`/`stoull` are glibc `strtoll`/`strtoull`, which g++'s
+    /// `_GNU_SOURCE` builds with the C23 `0b` prefix under base 0.
+    #[test]
+    fn parse_to_takes_the_glibc_binary_prefix() {
+        assert_eq!(parse_to_i64("0b101"), Ok(5));
+        assert_eq!(parse_to_i64("-0b11"), Ok(-3));
+        assert_eq!(parse_to_u64("0B11"), Ok(3));
+        assert_eq!(
+            parse_to_u64("0b2").unwrap_err().message(),
+            "Extraneous characters after integer: \"0b2\""
+        );
+    }
+
+    #[test]
+    fn parse_to_i64_is_stoll_base_zero() {
+        assert_eq!(parse_to_i64("-1"), Ok(-1));
+        assert_eq!(parse_to_i64("0x10"), Ok(16));
+        assert_eq!(parse_to_i64("-010"), Ok(-8));
+        assert_eq!(parse_to_i64("-9223372036854775808"), Ok(i64::MIN));
+        assert_eq!(
+            parse_to_i64("9223372036854775808").unwrap_err().message(),
+            "Out of range : \"9223372036854775808\""
+        );
+        // stoll raises out_of_range before parseTo looks at the tail.
+        assert_eq!(
+            parse_to_i64("9999999999999999999x").unwrap_err().message(),
+            "Out of range : \"9999999999999999999x\""
+        );
+        assert_eq!(
+            parse_to_i64("5x").unwrap_err().message(),
+            "Extraneous characters after unsigned: \"5x\""
+        );
+        assert_eq!(
+            parse_to_i64("x").unwrap_err().message(),
+            "Invalid input : \"x\""
+        );
     }
 
     #[test]

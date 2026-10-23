@@ -1,0 +1,496 @@
+# StreamEpics cases for run-epics.sh and tests/epics.rs, tab separated:
+# case  record  link  VAL  device-table  options
+# The device table is request=>reply pairs (Python escapes), '-' for no
+# device listening; pairs are separated by ';;'.
+link_plain	longin	l.proto p P	0	GET\r\n=>7\r\n	-
+link_spaces	longin	   l.proto    p    P    	0	GET\r\n=>7\r\n	-
+link_args	longout	l.proto args(A,B) P 0 x y	3	A B\r\n=>	-
+link_args_space	longout	l.proto args (A, B) P	3	A B\r\n=>	-
+link_args_nested	longout	l.proto args(A(1),B\)) P	3	-	-
+link_addr_hex	longin	l.proto p P 0x1f rest of it	0	-	noproc
+link_addr_octal	longin	l.proto p P 010 z	0	-	noproc
+link_addr_none	longin	l.proto p P abc	0	-	noproc
+link_addr_neg	longin	l.proto p P -3	0	-	noproc
+link_no_protocol	longin	l.proto	0	-	noproc
+link_no_bus	longin	l.proto p	0	-	noproc
+link_empty	longin	<empty>	0	-	noproc
+link_bad_protocol	longin	l.proto nosuch P	0	-	-
+link_bad_file	longin	nosuch.proto p P	0	-	-
+link_bad_bus	longin	l.proto p Q	0	-	-
+init_ok	longin	l.proto r P	0	I\r\n=>5\r\n;;GET\r\n=>6\r\n	-
+init_fail	longin	l.proto r P	0	-	-
+init_proc2	longin	l.proto r P	0	I\r\n=>5\r\n;;GET\r\n=>6\r\n	proc2
+ai_ok	ai	l.proto d P	0	D\r\n=>3.5\r\n	noval
+ai_mismatch	ai	l.proto d P	0	D\r\n=>abc\r\n	noval
+reply_timeout	longin	l.proto t P	0	GET\r\n=>	-
+wait_timer	longin	l.proto w P	0	GET\r\n=>7\r\n	-
+twice	longin	l.proto p P	0	GET\r\n=>7\r\n	twice
+tpro	longin	l.proto p P	0	GET\r\n=>7\r\n	tpro
+si_ok	stringin	l.proto s P	0	S\r\n=>hello\r\n	noval
+connect_fault	longin	l.proto c P	0	-	-
+intr_ok	longin	l.proto i P	0	@=>V=5\r\n	intr
+intr_flip	longin	l.proto iw P	0	x=>	noproc,flip
+intr_pause	longin	l.proto i P	0	x=>	intr,pauserun
+init_rerun	longin	l.proto r P	0	I\r\n=>5\r\n;;GET\r\n=>6\r\n	noproc,pauserun
+intr_init_rerun	longin	l.proto ri P	0	I\r\n=>5\r\n	intr,pauserun
+asyncconnect	longin	l.proto r P	0	I\r\n=>5\r\n!close	noproc,reconnect
+intr_out	longin	l.proto io P	0	Q\r\n=>V=5\r\n!once	intr
+ai_scale	ai	l.proto d P	0	D\r\n=>3.5\r\n	-	ASLO=2;AOFF=1	-
+ai_aslo_zero	ai	l.proto d P	0	D\r\n=>3.5\r\n	-	ASLO=0;AOFF=1	-
+ai_smoo	ai	l.proto sm P	0	D0.0\r\n=>4\r\n;;D4.0\r\n=>2\r\n	twice	SMOO=0.5	-
+ai_long	ai	l.proto l P	0	L\r\n=>-5\r\n	-	ASLO=2	RVAL
+ai_ulong	ai	l.proto u P	0	U\r\n=>4294967301\r\n	-	-	RVAL
+ai_linr	ai	l.proto l P	0	L\r\n=>3\r\n	-	LINR=SLOPE;ESLO=2;EOFF=1	RVAL
+ai_wlong	ai	l.proto wl P	5.7	W1\r\n=>1\r\n	-	ASLO=2;AOFF=2	-
+ai_wlinr	ai	l.proto wl P	0	W-9\r\n=>1\r\n	-	LINR=SLOPE;RVAL=-9	RVAL
+ai_wulong_neg	ai	l.proto wu P	-1	W18446744073709551615\r\n=>1\r\n	-	-	-
+ai_wurval_neg	ai	l.proto wu P	0	W18446744073709551615\r\n=>1\r\n	-	LINR=SLOPE;RVAL=-1	RVAL
+ai_string	ai	l.proto as P	0	A\r\n=>x\r\n	-	-	-
+ai_smoo_init	ai	l.proto d P	10	D\r\n=>2\r\n	-	SMOO=0.5;UDF=0	-
+ai_smoo_udf	ai	l.proto d P	0	D\r\n=>x\r\n!once;;\n=>2\r\n	twice,noval	SMOO=0.5	-
+ai_smoo_nan	ai	l.proto d P	nan	D\r\n=>x\r\n!once;;\n=>2\r\n	twice	SMOO=0.5;UDF=0	-
+ai_smoo_inf	ai	l.proto d P	inf	D\r\n=>x\r\n!once;;\n=>2\r\n	twice	SMOO=0.5;UDF=0	-
+ai_bad_link	ai	l.proto nosuch P	0	-	-	-	-
+ai_ulong_big	ai	l.proto u P	0	U\r\n=>18446744073709551615\r\n	-	-	RVAL
+reload_ok	longin	l.proto p P	0	GET\r\n=>7\r\n	reload
+reload_init	longin	l.proto r P	0	I\r\n=>5\r\n;;GET\r\n=>6\r\n	reload
+reload_intr	longin	l.proto i P	0	@=>V=5\r\n	intr,reload,quiet,report
+report_ok	longin	l.proto p P	0	GET\r\n=>7\r\n	report
+report_intr	longin	l.proto i P	0	x=>	intr,report
+report_reconnect	longin	l.proto r P	0	I\r\n=>5\r\n!close	noproc,reconnect,report
+report_badbus	longin	l.proto p NOBUS	0	-	noproc,report
+lo_init	longout	l.proto lr P	0	I\r\n=>5\r\n	noproc	-	MLST;ALST
+lo_init_mdel	longout	l.proto lr P	0	I\r\n=>5\r\n	noproc	MDEL=10;ADEL=-1	MLST;ALST
+lo_write	longout	l.proto lw P	-3	W-3\r\n=>-7\r\n	-	-	MLST;ALST
+lo_wulong_neg	longout	l.proto lu P	-1	W4294967295\r\n=>	-	-	-
+lo_wdouble	longout	l.proto lf P	1	W1.000000\r\n=>	-	-	-
+lo_wstring	longout	l.proto lst P	1	W1\r\n=>	-	-	-
+lo_rdouble	longout	l.proto lif P	0	I\r\n=>5\r\n	noproc	-	-
+lo_init_ulong	longout	l.proto liu P	0	I\r\n=>4294967295\r\n	noproc	-	MLST;ALST
+bin_in	longin	l.proto bi P	0	GET\r\n=>.##.#\r\n	-
+bin_in_mismatch	longin	l.proto bi P	0	GET\r\n=>x#\r\n	-
+si_split	stringin	l.proto s P	0	S\r\n=>\r\n	noval
+si_init_split	stringin	l.proto si P	0	I\r\n=>\r\n	noval,noproc
+aai_double	aai	l.proto ad P	0	A\r\n=>1.5,2,-3\r\n	noval	FTVL=DOUBLE;NELM=4	NORD
+aai_full	aai	l.proto ad P	0	A\r\n=>1,2,3\r\n	noval	FTVL=DOUBLE;NELM=2	NORD
+aai_float_long	aai	l.proto al P	0	A\r\n=>16777217,4294967297,-2\r\n	noval	FTVL=FLOAT;NELM=4	NORD
+aai_short	aai	l.proto al P	0	A\r\n=>70000,-1\r\n	noval	FTVL=SHORT;NELM=4	NORD
+aai_ushort	aai	l.proto al P	0	A\r\n=>70000,-1\r\n	noval	FTVL=USHORT;NELM=4	NORD
+aai_enum	aai	l.proto al P	0	A\r\n=>65537,3\r\n	noval	FTVL=ENUM;NELM=4	NORD
+aai_char	aai	l.proto al P	0	A\r\n=>300,-1\r\n	noval	FTVL=CHAR;NELM=4	NORD
+aai_uchar	aai	l.proto al P	0	A\r\n=>300,-1\r\n	noval	FTVL=UCHAR;NELM=4	NORD
+aai_long	aai	l.proto al P	0	A\r\n=>4294967297,-2\r\n	noval	FTVL=LONG;NELM=4	NORD
+aai_ulong	aai	l.proto au P	0	A\r\n=>4294967295,5\r\n	noval	FTVL=ULONG;NELM=4	NORD
+aai_int64	aai	l.proto al P	0	A\r\n=>9223372036854775807,-1\r\n	noval	FTVL=INT64;NELM=4	NORD
+aai_uint64	aai	l.proto al P	0	A\r\n=>-1,2\r\n	noval	FTVL=UINT64;NELM=4	NORD
+aai_long_double	aai	l.proto al P	0	A\r\n=>3,-4\r\n	noval	FTVL=DOUBLE;NELM=4	NORD
+aai_none	aai	l.proto ad P	0	A\r\n=>x\r\n	noval	FTVL=DOUBLE;NELM=4	NORD
+aai_d2long	aai	l.proto ad P	0	A\r\n=>1.5\r\n	noval	FTVL=LONG;NELM=4	NORD
+aai_l2string	aai	l.proto al P	0	A\r\n=>1\r\n	noval	FTVL=STRING;NELM=4	NORD
+aai_s2double	aai	l.proto ass P	0	A\r\n=>ab\r\n	noval	FTVL=DOUBLE;NELM=4	NORD
+aai_strings	aai	l.proto ass P	0	A\r\n=>ab cd ef\r\n	noval	FTVL=STRING;NELM=4	NORD
+aai_chars	aai	l.proto ass P	0	A\r\n=>hello\r\n	noval	FTVL=CHAR;NELM=10	NORD
+aai_chars_full	aai	l.proto ass P	0	A\r\n=>hello\r\n	noval	FTVL=UCHAR;NELM=4	NORD
+aai_wdouble	aai	l.proto rwd P	0	A\r\n=>1,-2,3\r\n	noval	FTVL=SHORT;NELM=4	NORD
+aai_wenum	aai	l.proto rwl P	0	A\r\n=>65535,1\r\n	noval	FTVL=ENUM;NELM=4	NORD
+aai_wchar	aai	l.proto rwl P	0	A\r\n=>255,1\r\n	noval	FTVL=CHAR;NELM=4	NORD
+aai_wuint64	aai	l.proto rwl P	0	A\r\n=>-1,7\r\n	noval	FTVL=UINT64;NELM=4	NORD
+aai_wstring_double	aai	l.proto rwsd P	0	A\r\n=>ab\r\n	noval	FTVL=STRING;NELM=4	NORD
+aai_wdouble_long	aai	l.proto rwl P	0	A\r\n=>3\r\n	noval	FTVL=DOUBLE;NELM=4	NORD
+aai_wstrings	aai	l.proto rws P	0	A\r\n=>ab cd\r\n	noval	FTVL=STRING;NELM=4	NORD
+aai_wchars	aai	l.proto rws P	0	A\r\n=>hello\r\n	noval	FTVL=CHAR;NELM=10	NORD
+aai_wchars_full	aai	l.proto rws P	0	A\r\n=>hello\r\n	noval	FTVL=CHAR;NELM=4	NORD
+aai_wchars_nelm	aai	l.proto rwls P	0	A\r\n=>104,105,106\r\n	noval	FTVL=CHAR;NELM=3	NORD
+aai_wenum_range	aai	l.proto rwe P	0	A\r\n=>0,5\r\n	noval	FTVL=LONG;NELM=4	NORD
+aai_chars_shorter	aai	l.proto ass P	0	A\r\n=>hello\r\n!once;;\n=>hi\r\n	noval,twice	FTVL=CHAR;NELM=10	NORD
+aai_nelm1	aai	l.proto ad P	0	-	noval,noproc	FTVL=DOUBLE;NELM=1	NORD
+bo_wl	bo	b.proto wl P	1	B1\r\n=>	-	-	RVAL
+bo_wl_mask	bo	b.proto wl P	1	B-1\r\n=>	-	MASK=0xffffffff	RVAL
+bo_wl_mask0	bo	b.proto wl P	0	B0\r\n=>	-	MASK=6	RVAL
+bo_wl_val2	bo	b.proto wl P	2	B2\r\n=>	-	-	RVAL
+bo_wu	bo	b.proto wu P	1	B1\r\n=>	-	-	RVAL
+bo_wu_mask	bo	b.proto wu P	1	B4294967295\r\n=>	-	MASK=0xffffffff	RVAL
+bo_we	bo	b.proto we P	1	BON\r\n=>	-	-	-
+bo_ws	bo	b.proto ws P	0	Bzero\r\n=>	-	ZNAM=zero;ONAM=one	-
+bo_ws_one	bo	b.proto ws P	1	Bone\r\n=>	-	ZNAM=zero;ONAM=one	-
+bo_wd	bo	b.proto wd P	1	B\r\n=>	-	-	-
+bo_init_long	bo	b.proto il P	0	I\r\n=>5\r\n	noproc	-	RVAL;RBV;ORAW;ORBV;MLST
+bo_init_zero	bo	b.proto il P	1	I\r\n=>0\r\n	noproc	-	RVAL;RBV;ORAW;ORBV;MLST
+bo_init_neg	bo	b.proto il P	0	I\r\n=>-1\r\n	noproc	-	RVAL;RBV;ORAW;ORBV
+bo_init_mask	bo	b.proto il P	1	I\r\n=>9\r\n	noproc	MASK=6	RVAL;RBV;ORAW;ORBV;MLST
+bo_init_mask_set	bo	b.proto il P	0	I\r\n=>3\r\n	noproc	MASK=6	RVAL;RBV;ORAW;ORBV;MLST
+bo_init_ulong_big	bo	b.proto iu P	0	I\r\n=>4294967296\r\n	noproc	-	RVAL;RBV;ORAW;ORBV;MLST
+bo_init_enum	bo	b.proto ie P	0	I\r\n=>ON\r\n	noproc	-	RVAL;RBV;ORAW;ORBV;MLST
+bo_init_string	bo	b.proto is P	0	I\r\n=>one\r\n	noproc	ZNAM=zero;ONAM=one	RVAL;MLST
+bo_init_string_zero	bo	b.proto is P	1	I\r\n=>zero\r\n	noproc	ZNAM=zero;ONAM=one	RVAL;MLST
+bo_init_string_bad	bo	b.proto is P	0	I\r\n=>two\r\n	noproc	ZNAM=zero;ONAM=one	-
+bo_init_string_long	bo	b.proto is P	0	I\r\n=>abcdefghijklmnopqrstuvwxyz\r\n	noproc	ZNAM=zero;ONAM=abcdefghijklmnopqrstuvwxy	-
+bo_init_double	bo	b.proto id P	0	I\r\n=>1.5\r\n	noproc	-	-
+bo_init_proc	bo	b.proto il P	0	I\r\n=>5\r\n;;W1\r\n=>	-	-	RVAL;RBV;ORAW;ORBV;MLST
+bo_init_rerun	bo	b.proto ir P	0	I0\r\n=>5\r\n;;I1\r\n=>0\r\n	noproc,pauserun	-	RVAL;RBV;ORAW;ORBV;MLST
+bo_readback	bo	b.proto rl P	1	W1\r\n=>0\r\n	-	-	RVAL;RBV;ORAW;ORBV;MLST
+bo_readback_mask	bo	b.proto rl P	1	W3\r\n=>6\r\n	-	MASK=3	RVAL;RBV;ORAW;ORBV;MLST
+bo_readback_string	bo	b.proto rs P	0	W0\r\n=>one\r\n	-	ZNAM=zero;ONAM=one	RVAL;MLST
+bo_intr	bo	b.proto ii P	0	@=>V=5\r\n	intr	-	RVAL;RBV;ORAW;ORBV;MLST
+bo_bad_link	bo	b.proto nosuch P	0	-	-	-	-
+bo_readback_dol	bo	b.proto rl P	1	W1\r\n=>0\r\n	-	OMSL=closed_loop;DOL=nosuch	RVAL;RBV;MLST
+ao_w	ao	l.proto aw P	5	W2.00\r\n=>	-	ASLO=2;AOFF=1	OVAL
+ao_w_aslo_one	ao	l.proto aw P	5	W4.00\r\n=>	-	AOFF=1	OVAL
+ao_wl	ao	l.proto awl P	5.7	W5\r\n=>	-	-	RVAL
+ao_wl_neg	ao	l.proto awl P	-5.7	W-5\r\n=>	-	-	-
+ao_wlinr	ao	l.proto awl P	7	W3\r\n=>	-	LINR=SLOPE;ESLO=2;EOFF=1	RVAL
+ao_wu_neg	ao	l.proto awu P	-1	W18446744073709551615\r\n=>	-	-	-
+ao_wurval_neg	ao	l.proto awu P	-1	W18446744073709551615\r\n=>	-	LINR=SLOPE	RVAL
+ao_init	ao	l.proto aoi P	4	I1.50\r\n=>3.5\r\n	noproc	ASLO=2;AOFF=1	OVAL;MLST;ALST;OMOD;RBV;ORBV
+ao_init_proc	ao	l.proto aoi P	4	I1.50\r\n=>3.5\r\n;;W3.50\r\n=>	-	ASLO=2;AOFF=1	OVAL;RVAL
+ao_init_long	ao	l.proto aoil P	0	I\r\n=>-3\r\n	noproc	ASLO=2;AOFF=1;LINR=SLOPE;ESLO=10	RVAL;RBV;ORBV;ORAW;OVAL
+ao_init_ulong	ao	l.proto aoiu P	0	I\r\n=>4294967301\r\n	noproc	-	RVAL;RBV;OVAL
+ao_init_deadband	ao	l.proto aoi P	3	I3.00\r\n=>3.2\r\n	noproc	MDEL=1;ADEL=1;MLST=3;ALST=3	OVAL;MLST;ALST;ORBV;RBV
+ao_init_string	ao	l.proto aois P	3	I\r\n=>x\r\n	noproc	-	OVAL
+ao_readback	ao	l.proto aorb P	2	W2.00\r\n=>7.5\r\n	-	-	OVAL;MLST
+ao_readback_long	ao	l.proto aorbl P	2	W2\r\n=>9\r\n	-	-	OVAL;RVAL;RBV
+ao_intr	ao	l.proto aoii P	0	@=>V=6.5\r\n	intr	ASLO=2	OVAL;MLST;ALST;RVAL
+ao_init_rerun	ao	l.proto aoi P	4	I4.00\r\n=>5\r\n;;I5.00\r\n=>6\r\n	noproc,pauserun	-	OVAL;MLST
+ao_bad_link	ao	l.proto nosuch P	0	-	-	-	-
+ao_wu_big	ao	l.proto awu P	1e19	W10000000000000000000\r\n=>	-	-	-
+ao_init_rerun_nan	ao	l.proto aoi P	4	I4.00\r\n=>5\r\n;;I5.00\r\n=>nan\r\n	noproc,pauserun	-	OVAL;MLST;ALST
+ao_init_ulong_wrap	ao	l.proto aoiu P	0	I\r\n=>18446744073709551613\r\n	noproc	-	RVAL;RBV;OVAL
+ao_init_rerun_mdel	ao	l.proto aoi P	4	I4.00\r\n=>5\r\n;;I5.00\r\n=>6\r\n	noproc,pauserun	MDEL=1;ADEL=1	OVAL;MLST;ALST
+wf_double	waveform	l.proto wfd P	0	A\r\n=>1.5,2,-3\r\n	noval	FTVL=DOUBLE;NELM=4;RARM=1	NORD;RARM
+wf_float	waveform	l.proto wfd P	0	A\r\n=>1.5,0.1,1e40\r\n	noval	FTVL=FLOAT;NELM=4	NORD
+wf_double_full	waveform	l.proto wfd P	0	A\r\n=>1,2,3,4,5\r\n	noval	FTVL=DOUBLE;NELM=4	NORD
+wf_double_part	waveform	l.proto wfd P	0	A\r\n=>1,2,x\r\n	noval	FTVL=DOUBLE;NELM=4	NORD
+wf_double_none	waveform	l.proto wfd P	0	A\r\n=>x\r\n	noval	FTVL=DOUBLE;NELM=4	NORD
+wf_double_to_long	waveform	l.proto wfd P	0	A\r\n=>1,2\r\n	noval	FTVL=LONG;NELM=4	NORD
+wf_long	waveform	l.proto wfl P	0	A\r\n=>-1,70000,4294967297\r\n	noval	FTVL=LONG;NELM=4	NORD
+wf_ulong	waveform	l.proto wfl P	0	A\r\n=>-1,70000,4294967297\r\n	noval	FTVL=ULONG;NELM=4	NORD
+wf_short	waveform	l.proto wfl P	0	A\r\n=>-1,70000,32768\r\n	noval	FTVL=SHORT;NELM=4	NORD
+wf_ushort	waveform	l.proto wfl P	0	A\r\n=>-1,70000,32768\r\n	noval	FTVL=USHORT;NELM=4	NORD
+wf_char	waveform	l.proto wfl P	0	A\r\n=>65,322,-1\r\n	noval	FTVL=CHAR;NELM=4	NORD
+wf_uchar	waveform	l.proto wfl P	0	A\r\n=>65,322,-1\r\n	noval	FTVL=UCHAR;NELM=4	NORD
+wf_int64	waveform	l.proto wfl P	0	A\r\n=>-1,9223372036854775807,4294967297\r\n	noval	FTVL=INT64;NELM=4	NORD
+wf_uint64	waveform	l.proto wfl P	0	A\r\n=>-1,70000\r\n	noval	FTVL=UINT64;NELM=4	NORD
+wf_long_double	waveform	l.proto wfl P	0	A\r\n=>-1,70000\r\n	noval	FTVL=DOUBLE;NELM=4	NORD
+wf_long_float	waveform	l.proto wfl P	0	A\r\n=>-1,16777217\r\n	noval	FTVL=FLOAT;NELM=4	NORD
+wf_long_to_string	waveform	l.proto wfl P	0	A\r\n=>1\r\n	noval	FTVL=STRING;NELM=4	NORD
+wf_ulong_fmt	waveform	l.proto wfu P	0	A\r\n=>4294967295,1\r\n	noval	FTVL=ULONG;NELM=4	NORD
+wf_string	waveform	l.proto wfs P	0	A\r\n=>ab cd ef\r\n	noval	FTVL=STRING;NELM=2	NORD
+wf_chars	waveform	l.proto wfs P	0	A\r\n=>hello\r\n	noval	FTVL=CHAR;NELM=10	NORD
+wf_chars_full	waveform	l.proto wfs P	0	A\r\n=>hello\r\n	noval	FTVL=UCHAR;NELM=3	NORD
+wf_chars_none	waveform	l.proto wfsx P	0	A\r\n=>\r\n	noval	FTVL=CHAR;NELM=10	NORD
+wf_chars_fail	waveform	l.proto wfcs P	0	A\r\n=>ab\r\n	noval	FTVL=CHAR;NELM=10	NORD
+wf_string_to_double	waveform	l.proto wfs P	0	A\r\n=>ab\r\n	noval	FTVL=DOUBLE;NELM=4	NORD
+wf_w_double	waveform	l.proto wfod P	[1.5,2,-3]	1.500000,2.000000,-3.000000\r\n=>	putval	FTVL=DOUBLE;NELM=4	NORD
+wf_w_float	waveform	l.proto wfod P	[1.5,0.1]	1.500000,0.100000\r\n=>	putval	FTVL=FLOAT;NELM=4	NORD
+wf_w_long_d	waveform	l.proto wfod P	[-1,7]	-1.000000,7.000000\r\n=>	putval	FTVL=LONG;NELM=4	NORD
+wf_w_ulong_d	waveform	l.proto wfod P	[4294967295]	4294967295.000000\r\n=>	putval	FTVL=ULONG;NELM=4	NORD
+wf_w_short_d	waveform	l.proto wfod P	[-2,3]	-2.000000,3.000000\r\n=>	putval	FTVL=SHORT;NELM=4	NORD
+wf_w_ushort_d	waveform	l.proto wfod P	[65535]	65535.000000\r\n=>	putval	FTVL=USHORT;NELM=4	NORD
+wf_w_char_d	waveform	l.proto wfod P	Aé	-2.000000,65.000000\r\n=>	putval	FTVL=CHAR;NELM=4	NORD
+wf_w_uchar_d	waveform	l.proto wfod P	Aé	255.000000,65.000000\r\n=>	putval	FTVL=UCHAR;NELM=4	NORD
+wf_w_int64_d	waveform	l.proto wfod P	[-5,9007199254740993,16777217]	-5.000000,9007199254740992.000000\r\n=>	putval	FTVL=INT64;NELM=4	NORD
+wf_w_uint64_d	waveform	l.proto wfod P	[9223372036854775807]	18446744073709551616.000000\r\n=>	putval	FTVL=UINT64;NELM=4	NORD
+wf_w_string_d	waveform	l.proto wfod P	["a"]	-	putval	FTVL=STRING;NELM=4	NORD
+wf_w_long	waveform	l.proto wfol P	[-1,7]	-1,7\r\n=>	putval	FTVL=LONG;NELM=4	NORD
+wf_w_ulong	waveform	l.proto wfol P	[4294967295]	4294967295\r\n=>	putval	FTVL=ULONG;NELM=4	NORD
+wf_w_short	waveform	l.proto wfol P	[-2,3]	-2,3\r\n=>	putval	FTVL=SHORT;NELM=4	NORD
+wf_w_ushort	waveform	l.proto wfol P	[65535]	65535\r\n=>	putval	FTVL=USHORT;NELM=4	NORD
+wf_w_char	waveform	l.proto wfol P	Aé	-2,65\r\n=>	putval	FTVL=CHAR;NELM=4	NORD
+wf_w_uchar	waveform	l.proto wfol P	Aé	255\r\n=>	putval	FTVL=UCHAR;NELM=4	NORD
+wf_w_int64	waveform	l.proto wfol P	[-5,9223372036854775807]	-5,9223372036854775807\r\n=>	putval	FTVL=INT64;NELM=4	NORD
+wf_w_uint64	waveform	l.proto wfol P	[9223372036854775807,5]	-1\r\n=>	putval	FTVL=UINT64;NELM=4	NORD
+wf_w_double_l	waveform	l.proto wfol P	[1.5]	-	putval	FTVL=DOUBLE;NELM=4	NORD
+wf_w_string	waveform	l.proto wfos P	["ab","cd"]	ab,cd\r\n=>	putval	FTVL=STRING;NELM=4	NORD
+wf_w_chars	waveform	l.proto wfos P	hello	hello\r\n=>	putval	FTVL=CHAR;NELM=10	NORD
+wf_w_chars_full	waveform	l.proto wfos P	hello	hell\r\n=>	putval	FTVL=UCHAR;NELM=5	NORD
+wf_w_double_s	waveform	l.proto wfos P	[1]	-	putval	FTVL=DOUBLE;NELM=4	NORD
+wf_w_empty	waveform	l.proto wfod P	[]	\r\n=>	putval	FTVL=DOUBLE;NELM=4	NORD
+aao_w_double	aao	l.proto aaod P	[1.5,2,-3]	1.500000,2.000000,-3.000000\r\n=>	putval	FTVL=DOUBLE;NELM=4	NORD
+aao_w_float	aao	l.proto aaod P	[1.5,0.1]	1.500000,0.100000\r\n=>	putval	FTVL=FLOAT;NELM=4	NORD
+aao_w_long_d	aao	l.proto aaod P	[-1,7]	-1.000000,7.000000\r\n=>	putval	FTVL=LONG;NELM=4	NORD
+aao_w_ulong_d	aao	l.proto aaod P	[4294967295]	4294967295.000000\r\n=>	putval	FTVL=ULONG;NELM=4	NORD
+aao_w_short_d	aao	l.proto aaod P	[-2,3]	-2.000000,3.000000\r\n=>	putval	FTVL=SHORT;NELM=4	NORD
+aao_w_ushort_d	aao	l.proto aaod P	[65535]	65535.000000\r\n=>	putval	FTVL=USHORT;NELM=4	NORD
+aao_w_char_d	aao	l.proto aaod P	Aé	65.000000,-61.000000,-87.000000,0.000000\r\n=>	putval	FTVL=CHAR;NELM=4	NORD
+aao_w_uchar_d	aao	l.proto aaod P	Aé	65.000000,195.000000,169.000000,0.000000\r\n=>	putval	FTVL=UCHAR;NELM=4	NORD
+aao_w_int64_d	aao	l.proto aaod P	[-5,9007199254740993]	-5.000000,9007199254740992.000000\r\n=>	putval	FTVL=INT64;NELM=4	NORD
+aao_w_uint64_d	aao	l.proto aaod P	[9223372036854775807]	9223372036854775808.000000\r\n=>	putval	FTVL=UINT64;NELM=4	NORD
+aao_w_long	aao	l.proto aaol P	[-1,7]	-1,7\r\n=>	putval	FTVL=LONG;NELM=4	NORD
+aao_w_ulong_l	aao	l.proto aaol P	[4294967295]	4294967295\r\n=>	putval	FTVL=ULONG;NELM=4	NORD
+aao_w_short_l	aao	l.proto aaol P	[-2,3]	-2,3\r\n=>	putval	FTVL=SHORT;NELM=4	NORD
+aao_w_ushort_l	aao	l.proto aaol P	[65535]	65535\r\n=>	putval	FTVL=USHORT;NELM=4	NORD
+aao_w_char_l	aao	l.proto aaol P	Aé	65,-61,-87,0\r\n=>	putval	FTVL=CHAR;NELM=4	NORD
+aao_w_uchar_l	aao	l.proto aaol P	Aé	65,195,169,0\r\n=>	putval	FTVL=UCHAR;NELM=4	NORD
+aao_w_int64_l	aao	l.proto aaol P	[-5,9223372036854775807]	-5,9223372036854775807\r\n=>	putval	FTVL=INT64;NELM=4	NORD
+aao_w_uint64_l	aao	l.proto aaol P	[9223372036854775807]	9223372036854775807\r\n=>	putval	FTVL=UINT64;NELM=4	NORD
+aao_w_double_l	aao	l.proto aaol P	[1.5]	-	putval	FTVL=DOUBLE;NELM=4	NORD
+aao_w_string	aao	l.proto aaos P	["ab","c"]	ab,c\r\n=>	putval	FTVL=STRING;NELM=4	NORD
+aao_w_chars	aao	l.proto aaos P	hello	hello\r\n=>	putval	FTVL=CHAR;NELM=8	NORD
+aao_w_chars_full	aao	l.proto aaos P	hello	hel\r\n=>	putval	FTVL=CHAR;NELM=4	NORD
+aao_w_uchars	aao	l.proto aaos P	hi	hi\r\n=>	putval	FTVL=UCHAR;NELM=8	NORD
+aao_w_double_s	aao	l.proto aaos P	[1.5]	-	putval	FTVL=DOUBLE;NELM=4	NORD
+aao_w_empty	aao	l.proto aaod P	[]	\r\n=>	putval	FTVL=DOUBLE;NELM=4	NORD
+aao_init_double	aao	l.proto aaoid P	0	A\r\n=>1.5,2,-3\r\n	noval,noproc	FTVL=DOUBLE;NELM=4	NORD;HASH
+aao_init_float	aao	l.proto aaoid P	0	A\r\n=>1.5,0.1\r\n	noval,noproc	FTVL=FLOAT;NELM=4	NORD
+aao_init_full	aao	l.proto aaoid P	0	A\r\n=>1,2,3\r\n	noval,noproc	FTVL=DOUBLE;NELM=2	NORD
+aao_init_none	aao	l.proto aaoid P	0	A\r\n=>x\r\n	noval,noproc	FTVL=DOUBLE;NELM=4	NORD
+aao_init_d_long	aao	l.proto aaoid P	0	A\r\n=>1,2\r\n	noval,noproc	FTVL=LONG;NELM=4	NORD
+aao_init_long	aao	l.proto aaoil P	0	A\r\n=>-1,7\r\n	noval,noproc	FTVL=LONG;NELM=4	NORD
+aao_init_l_double	aao	l.proto aaoil P	0	A\r\n=>-1,7\r\n	noval,noproc	FTVL=DOUBLE;NELM=4	NORD
+aao_init_l_float	aao	l.proto aaoil P	0	A\r\n=>-1,7\r\n	noval,noproc	FTVL=FLOAT;NELM=4	NORD
+aao_init_ulong	aao	l.proto aaoil P	0	A\r\n=>4294967295,-1\r\n	noval,noproc	FTVL=ULONG;NELM=4	NORD
+aao_init_short	aao	l.proto aaoil P	0	A\r\n=>65535,-2\r\n	noval,noproc	FTVL=SHORT;NELM=4	NORD
+aao_init_ushort	aao	l.proto aaoil P	0	A\r\n=>70000,-1\r\n	noval,noproc	FTVL=USHORT;NELM=4	NORD
+aao_init_char	aao	l.proto aaoil P	0	A\r\n=>65,322,-1\r\n	noval,noproc	FTVL=CHAR;NELM=4	NORD
+aao_init_uchar	aao	l.proto aaoil P	0	A\r\n=>255,256\r\n	noval,noproc	FTVL=UCHAR;NELM=4	NORD
+aao_init_int64	aao	l.proto aaoil P	0	A\r\n=>-5,7\r\n	noval,noproc	FTVL=INT64;NELM=4	NORD
+aao_init_uint64	aao	l.proto aaoil P	0	A\r\n=>-1\r\n	noval,noproc	FTVL=UINT64;NELM=4	NORD
+aao_init_l_string	aao	l.proto aaoil P	0	A\r\n=>1\r\n	noval,noproc	FTVL=STRING;NELM=4	NORD
+aao_init_string	aao	l.proto aaois P	0	A\r\n=>ab c\r\n	noval,noproc	FTVL=STRING;NELM=4	NORD
+aao_init_chars	aao	l.proto aaois P	0	A\r\n=>hello\r\n	noval,noproc	FTVL=CHAR;NELM=8	NORD
+aao_init_chars_full	aao	l.proto aaois P	0	A\r\n=>hello\r\n	noval,noproc	FTVL=CHAR;NELM=4	NORD
+aao_init_s_double	aao	l.proto aaois P	0	A\r\n=>ab\r\n	noval,noproc	FTVL=DOUBLE;NELM=4	NORD
+aao_init_mpst	aao	l.proto aaoid P	0	A\r\n=>1.5,2\r\n	noval,noproc	FTVL=DOUBLE;NELM=4;MPST=On Change;APST=On Change	NORD;HASH
+aao_readback	aao	l.proto aaorb P	[1,2]	1.000000,2.000000\r\n=>3,4,5\r\n	putval	FTVL=DOUBLE;NELM=4	NORD
+aao_init_rerun	aao	l.proto aaoid P	0	A\r\n=>1,2\r\n;;A\r\n=>3,4,5\r\n	noval,noproc,pauserun	FTVL=DOUBLE;NELM=4;MPST=On Change	NORD;HASH
+aao_init_chars_none	aao	l.proto aaois P	0	A\r\n=>\r\n	noval,noproc	FTVL=CHAR;NELM=8	NORD
+aao_w_uint64_init	aao	l.proto aaoiwd P	0	A\r\n=>-1\r\n;;18446744073709551616.000000\r\n=>	noval	FTVL=UINT64;NELM=4	NORD
+aao_w_chars_shorter	aao	l.proto aaoslrb P	0	A\r\n=>104,105,106\r\n;;hij\r\n=>104,105\r\n;;hi\r\n=>104,105\r\n	noval,twice	FTVL=CHAR;NELM=4	NORD
+bi_long	bi	l.proto l P	0	L\r\n=>5\r\n	-	ZNAM=Z;ONAM=O	RVAL
+bi_long_zero	bi	l.proto l P	1	L\r\n=>0\r\n	-	ZNAM=Z;ONAM=O	RVAL
+bi_mask	bi	l.proto l P	1	L\r\n=>9\r\n	-	MASK=6;ZNAM=Z;ONAM=O	RVAL
+bi_long_neg	bi	l.proto l P	0	L\r\n=>-2\r\n	-	ZNAM=Z;ONAM=O	RVAL
+bi_ulong_big	bi	l.proto u P	1	U\r\n=>4294967296\r\n	-	ZNAM=Z;ONAM=O	RVAL
+bi_enum	bi	l.proto e P	0	E\r\n=>c\r\n	-	ZNAM=Z;ONAM=O	-
+bi_enum_zero	bi	l.proto e P	1	E\r\n=>a\r\n	-	ZNAM=Z;ONAM=O	-
+bi_str_one	bi	l.proto s P	0	S\r\n=>On\r\n	-	ZNAM=Off;ONAM=On	-
+bi_str_zero	bi	l.proto s P	1	S\r\n=>Off\r\n	-	ZNAM=Off;ONAM=On	-
+bi_str_none	bi	l.proto s P	0	S\r\n=>x\r\n	-	ZNAM=Off;ONAM=On	-
+bi_str_long	bi	l.proto s P	0	S\r\n=>abcdefghijklmnopqrstuvwxyz0123\r\n	-	ONAM=abcdefghijklmnopqrstuvwxyz0123	ONAM
+bi_str_trunc	bi	l.proto s P	0	S\r\n=>abcdefghijklmnopqrstuvwxyz0123\r\n	-	ONAM=abcdefghijklmnopqrstuvwxy	ONAM
+bi_double	bi	l.proto d P	0	D\r\n=>1\r\n	-	ZNAM=Z;ONAM=O	-
+bi_wlong	bi	l.proto wd P	0	W4294967295\r\n=>OK\r\n	-	RVAL=4294967295;ZNAM=Z;ONAM=O	RVAL
+bi_wulong	bi	l.proto wbu P	0	W4294967295\r\n=>OK\r\n	-	RVAL=4294967295;ZNAM=Z;ONAM=O	-
+bi_wenum	bi	l.proto we P	1	Wb\r\n=>OK\r\n	-	ZNAM=Z;ONAM=O	-
+bi_wstr	bi	l.proto ws P	1	WOn\r\n=>OK\r\n	-	ZNAM=Off;ONAM=On	-
+bi_wstr_zero	bi	l.proto ws P	0	WOff\r\n=>OK\r\n	-	ZNAM=Off;ONAM=On	-
+bi_wdouble	bi	l.proto wf P	0	W\r\n=>OK\r\n	-	ZNAM=Z;ONAM=O	-
+co_wd	calcout	l.proto cow P	0	W4.500000\r\n=>	-	CALC=A*1.5;A=3	OVAL;MLST;ALST
+co_wl	calcout	l.proto col P	0	W-2\r\n=>	-	CALC=A;A=-2.7	OVAL
+co_wu	calcout	l.proto cou P	0	W18446744073709551615\r\n=>	-	CALC=A;A=-1	OVAL
+co_ws	calcout	l.proto cos P	0	-	-	CALC=A;A=1	OVAL
+co_ocal	calcout	l.proto cow P	0	W4.000000\r\n=>	-	CALC=A;A=2;OCAL=A*2;DOPT=Use OCAL	OVAL
+co_oopt	calcout	l.proto cow P	0	W1.000000\r\n=>	-	CALC=A;A=1;OOPT=When Zero	OVAL
+co_odly	calcout	l.proto cow P	0	W2.000000\r\n=>	-	CALC=A;A=2;ODLY=0.2	OVAL;DLYA
+co_rb	calcout	l.proto corb P	0	W2.000000\r\n=>7\r\n	-	CALC=A;A=2	OVAL;MLST;ALST
+co_init	calcout	l.proto coi P	0	I\r\n=>7.5\r\n	noproc	-	OVAL;MLST;ALST
+co_init_long	calcout	l.proto coil P	0	I\r\n=>-3\r\n	noproc	-	MLST;ALST
+co_init_ulong	calcout	l.proto coiu P	0	I\r\n=>-1\r\n	noproc	-	MLST;ALST
+co_init_str	calcout	l.proto cois P	0	I\r\n=>x\r\n	noproc	-	MLST;ALST
+co_init_proc	calcout	l.proto coi P	0	I\r\n=>7.5\r\n;;W1.000000\r\n=>	-	CALC=A;A=1	OVAL;MLST;ALST
+co_rerun	calcout	l.proto coi P	0	I\r\n=>5\r\n;;W1.000000\r\n=>	pauserun	CALC=A;A=1;ADEL=100	MLST;ALST
+co_init_ulong_big	calcout	l.proto coiu P	0	I\r\n=>18446744073709551615\r\n	noproc	-	MLST;ALST
+co_wu_big	calcout	l.proto cou P	0	W10000000000000000000\r\n=>	-	CALC=A;A=1e19	OVAL
+co_wl_big	calcout	l.proto col P	0	W-9223372036854775808\r\n=>	-	CALC=A;A=1e19	OVAL
+co_rb_alarm	calcout	l.proto corb P	0	W10.000000\r\n=>9\r\n	-	CALC=A;A=10;HIGH=8;HSV=MINOR	OVAL;MLST;ALST
+co_rerun_nan	calcout	l.proto coi P	0	I\r\n=>nan\r\n;;W1.000000\r\n=>	pauserun	CALC=A;A=1	MLST;ALST
+co_we	calcout	l.proto cowe P	0	Wc\r\n=>	-	CALC=A;A=2	OVAL
+co_wen	calcout	l.proto cowen P	0	Wn\r\n=>	-	CALC=A;A=-1	OVAL
+co_init_enum	calcout	l.proto coie P	0	I\r\n=>z\r\n	noproc	-	MLST;ALST
+co_init_enumn	calcout	l.proto coien P	0	I\r\n=>n\r\n	noproc	-	MLST;ALST
+i64_long_neg	int64in	l.proto l P	0	L\r\n=>-7\r\n	-
+i64_long_big	int64in	l.proto l P	0	L\r\n=>9000000000\r\n	-
+i64_ulong_big	int64in	l.proto u P	0	U\r\n=>18446744073709551615\r\n	-
+i64_double	int64in	l.proto d P	0	D\r\n=>3.5\r\n	-
+i64_string	int64in	l.proto as P	0	A\r\n=>x\r\n	-
+i64_wlong	int64in	l.proto i64_wd P	-9000000000	W-9000000000\r\n=>1\r\n	-
+i64_wulong_neg	int64in	l.proto i64_wu P	-1	W18446744073709551615\r\n=>1\r\n	-
+i64_wdouble	int64in	l.proto i64_wf P	3	x=>	-
+i64_enum	int64in	l.proto i64_e P	0	E\r\n=>c\r\n	-
+i64_wenum	int64in	l.proto i64_we P	1	b\r\n=>2\r\n	-
+i64_enum_neg	int64in	l.proto i64_en P	0	E\r\n=>m\r\n	-
+i64_wenum_neg	int64in	l.proto i64_wen P	-1	m\r\n=>3\r\n	-
+i64_intr_bad	int64in	l.proto nosuch P	0	-	intr,errlog
+i64o_init	int64out	l.proto lr P	0	I\r\n=>5\r\n	noproc	-	MLST;ALST
+i64o_init_mdel	int64out	l.proto lr P	0	I\r\n=>5\r\n	noproc	MDEL=10;ADEL=-1	MLST;ALST
+i64o_init_big	int64out	l.proto lr P	0	I\r\n=>-9000000000\r\n	noproc	-	MLST;ALST
+i64o_init_ulong	int64out	l.proto liu P	0	I\r\n=>18446744073709551615\r\n	noproc	-	MLST;ALST
+i64o_write	int64out	l.proto lw P	-3	W-3\r\n=>-7\r\n	-	-	MLST;ALST
+i64o_wbig	int64out	l.proto lw P	9000000000	W9000000000\r\n=>-9000000000\r\n	-	-	MLST;ALST
+i64o_wulong_neg	int64out	l.proto lu P	-1	W18446744073709551615\r\n=>	-	-	-
+i64o_wdouble	int64out	l.proto lf P	1	W1.000000\r\n=>	-	-	-
+i64o_wstring	int64out	l.proto lst P	1	W1\r\n=>	-	-	-
+i64o_rdouble	int64out	l.proto lif P	0	I\r\n=>5\r\n	noproc	-	-
+i64o_enum	int64out	l.proto i64o_ie P	0	E\r\n=>c\r\n	noproc	-	MLST;ALST
+i64o_enum_neg	int64out	l.proto i64o_ien P	0	E\r\n=>m\r\n	noproc	-	MLST;ALST
+i64o_wenum	int64out	l.proto i64o_we P	1	b\r\n=>	-	-	-
+i64o_wenum_neg	int64out	l.proto i64o_wen P	-1	m\r\n=>	-	-	-
+li_long_neg	longin	l.proto l P	0	L\r\n=>-7\r\n	-
+li_long_big	longin	l.proto l P	0	L\r\n=>3000000000\r\n	-
+li_ulong_big	longin	l.proto u P	0	U\r\n=>4294967301\r\n	-
+li_double	longin	l.proto d P	0	D\r\n=>3.5\r\n	-
+li_string	longin	l.proto as P	0	A\r\n=>x\r\n	-
+li_wlong	longin	l.proto li_wd P	-5	W-5\r\n=>1\r\n	-
+li_wulong_neg	longin	l.proto li_wu P	-1	W18446744073709551615\r\n=>1\r\n	-
+li_wdouble	longin	l.proto li_wf P	3	x=>	-
+li_enum	longin	l.proto li_e P	0	E\r\n=>c\r\n	-
+li_wenum	longin	l.proto li_we P	1	b\r\n=>2\r\n	-
+li_enum_neg	longin	l.proto li_en P	0	E\r\n=>m\r\n	-
+li_wenum_neg	longin	l.proto li_wen P	-1	m\r\n=>3\r\n	-
+lo_enum	longout	l.proto lo_ie P	0	E\r\n=>c\r\n	noproc	-	MLST;ALST
+lo_enum_neg	longout	l.proto lo_ien P	0	E\r\n=>m\r\n	noproc	-	MLST;ALST
+lo_wenum	longout	l.proto lo_we P	1	b\r\n=>	-	-	-
+lo_wenum_neg	longout	l.proto lo_wen P	-1	m\r\n=>	-	-	-
+lsi_ok	lsi	l.proto s P	0	S\r\n=>hello\r\n	noval	SIZV=41	LEN
+lsi_full	lsi	l.proto s P	0	S\r\n=>abcdefghijklmnopqrst\r\n	noval	SIZV=10	LEN
+lsi_exact	lsi	l.proto s P	0	S\r\n=>hello\r\n	noval	SIZV=6	LEN
+lsi_mismatch_after	lsi	l.proto lsix P	0	S\r\n=>abc?\r\n	noval	SIZV=41	LEN
+lsi_fixwidth_short	lsi	l.proto lsi5 P	0	I\r\n=>oldold\r\n;;S\r\n=>ab\r\n	noval	SIZV=41	LEN
+lsi_fixwidth_grow	lsi	l.proto lsi9 P	0	I\r\n=>o\r\n;;S\r\n=>abcdef\r\n	noval	SIZV=41	LEN
+lsi_double	lsi	l.proto lsid P	0	I\r\n=>old\r\n;;D\r\n=>1\r\n	noval	SIZV=41	LEN
+lsi_write	lsi	l.proto lsiw P	0	I\r\n=>hithere\r\n;;Whithere\r\n=>OK\r\n	noval	SIZV=41	LEN
+lsi_wdouble	lsi	l.proto lsif P	0	I\r\n=>old\r\n;;W\r\n=>OK\r\n	noval	SIZV=41	LEN
+lsi_wfailed	lsi	l.proto lsiwm P	0	I\r\n=>o\r\n;;S\r\n=>abcdef\r\n;;Wabcdef\r\n=>	noval	SIZV=41	LEN
+# devlsoStream.c
+lso_write	lso	lso.proto w P	hello	Shello\r\n=>	noval	DOL={const:'hello'}	LEN;OVAL;OLEN
+lso_readback	lso	lso.proto rb P	hello	Shello\r\n=>world!\r\n	noval	DOL={const:'hello'}	LEN;OVAL;OLEN
+lso_long	lso	lso.proto rb P	hello	Shello\r\n=>0123456789ABCDEFGHIJ\r\n	noval	SIZV=16;DOL={const:'hello'}	LEN;OVAL;OLEN
+lso_bad_out	lso	lso.proto wd P	hello	x=>	noval	DOL={const:'hello'}	LEN;OVAL;OLEN
+lso_bad_in	lso	lso.proto rd P	hello	Shello\r\n=>5\r\n	noval	DOL={const:'hello'}	LEN;OVAL;OLEN
+lso_fixw	lso	lso.proto fw P	hello	Shello\r\n=>abc\r\n	noval	DOL={const:'hello'}	LEN;OVAL;OLEN
+lso_init	lso	lso.proto i P	hello	Q\r\n=>init\r\n	noproc,noval	-	LEN;OVAL;OLEN
+lso_init_rerun	lso	lso.proto i P	hello	Q\r\n=>one\r\n!once;;\n=>three\r\n	noproc,pauserun,noval	-	LEN;OVAL;OLEN
+lso_init_always	lso	lso.proto i P	hello	Q\r\n=>one\r\n!once;;\n=>three\r\n	noproc,pauserun,noval	MPST=Always;APST=Always	LEN;OVAL;OLEN
+mbbi_val	mbbi	l.proto p P	0	GET\r\n=>3\r\n	-	-	RVAL;MLST
+mbbi_rval	mbbi	l.proto p P	0	GET\r\n=>7\r\n	-	ONVL=5;TWVL=7	RVAL;MLST
+mbbi_rval_none	mbbi	l.proto p P	0	GET\r\n=>6\r\n	-	ONVL=5;TWVL=7	RVAL;MLST
+mbbi_nobt	mbbi	l.proto p P	0	GET\r\n=>13\r\n	-	NOBT=2;ONVL=1	RVAL;MASK;MLST
+mbbi_shft	mbbi	l.proto p P	0	GET\r\n=>7\r\n	-	NOBT=2;SHFT=2;ONVL=1	RVAL;MASK;MLST
+mbbi_mask_shft	mbbi	l.proto p P	0	GET\r\n=>255\r\n	-	MASK=3;SHFT=4;ONVL=3	RVAL;MASK;MLST
+mbbi_strs_only	mbbi	l.proto p P	0	GET\r\n=>1\r\n	-	ZRST=a;ONST=b	RVAL;MLST
+mbbi_trunc	mbbi	l.proto p P	0	GET\r\n=>65537\r\n	-	-	RVAL;MLST
+mbbi_trunc_rval	mbbi	l.proto p P	0	GET\r\n=>65537\r\n	-	ONVL=1	RVAL;MLST
+mbbi_neg	mbbi	l.proto p P	0	GET\r\n=>-1\r\n	-	-	RVAL;MLST
+mbbi_ulong	mbbi	l.proto u P	0	U\r\n=>4294967298\r\n	-	ONVL=2	RVAL;MLST
+mbbi_string	mbbi	l.proto s P	0	S\r\n=>b\r\n	-	ZRST=a;ONST=b;ONVL=9	RVAL;MLST
+mbbi_string_none	mbbi	l.proto s P	0	S\r\n=>x\r\n	-	ZRST=a;ONST=b	MLST
+mbbi_double	mbbi	l.proto d P	0	D\r\n=>1\r\n	-	-	MLST
+mbbi_init_states	mbbi	l.proto r P	0	I\r\n=>5\r\n	noproc	ONVL=5	RVAL;MLST
+mbbi_init_nobt	mbbi	l.proto r P	0	I\r\n=>13\r\n	noproc	NOBT=2;ONVL=1	RVAL;MASK;MLST
+mbbi_wval	mbbi	l.proto q P	3	SET 3\r\n=>	-	-	RVAL;MLST
+mbbi_wrval	mbbi	l.proto q P	1	SET 5\r\n=>	-	NOBT=3;ONVL=5;RVAL=13	RVAL;MLST
+mbbi_wrval_nomask	mbbi	l.proto q P	1	SET 13\r\n=>	-	ONVL=5;RVAL=13	RVAL;MLST
+mbbi_wulong	mbbi	l.proto wu P	2	W2\r\n=>1\r\n	-	-	MLST
+mbbi_wstring	mbbi	l.proto mbbi_ws P	1	Wb\r\n=>	-	ZRST=a;ONST=b	MLST
+mbbi_wdouble	mbbi	l.proto sm P	0	D0.0\r\n=>1\r\n	-	-	MLST
+mbbi_wstring_big	mbbi	l.proto vs P	0	GET\r\n=>20\r\n	-	-	RVAL;MLST
+mbbid_val	mbbiDirect	l.proto p P	0	GET\r\n=>10\r\n	-	-	RVAL;MASK;B0;B1;B2;B3
+mbbid_nobt	mbbiDirect	l.proto p P	0	GET\r\n=>31\r\n	-	NOBT=4	RVAL;MASK;B0;B4
+mbbid_shft	mbbiDirect	l.proto p P	0	GET\r\n=>255\r\n	-	NOBT=4;SHFT=4	RVAL;MASK;B0;B3;B4
+mbbid_neg	mbbiDirect	l.proto p P	0	GET\r\n=>-1\r\n	-	-	RVAL;B1F
+mbbid_ulong	mbbiDirect	l.proto u P	0	U\r\n=>4294967301\r\n	-	-	RVAL;B0;B2
+mbbid_ulong_mask	mbbiDirect	l.proto u P	0	U\r\n=>4294967551\r\n	-	NOBT=8	RVAL;MASK
+mbbid_double	mbbiDirect	l.proto d P	3	D\r\n=>3.5\r\n	-	-	RVAL;B0
+mbbid_init	mbbiDirect	l.proto r P	0	I\r\n=>5\r\n	noproc	-	RVAL;MLST;B0;B1;B2
+mbbid_init_nobt	mbbiDirect	l.proto r P	0	I\r\n=>7\r\n	noproc	NOBT=4	RVAL;ORAW;MLST;B0
+mbbid_wval	mbbiDirect	l.proto q P	9	SET 9\r\n=>	-	-	RVAL;B0
+mbbid_wval_neg	mbbiDirect	l.proto q P	-1	SET -1\r\n=>	-	-	RVAL
+mbbid_wulong_neg	mbbiDirect	l.proto qu P	-1	SET 18446744073709551615\r\n=>	-	-	RVAL
+mbbid_wrval	mbbiDirect	l.proto q P	0	SET 15\r\n=>	-	NOBT=4;RVAL=255	RVAL;MASK
+mbbid_wrval_shft	mbbiDirect	l.proto q P	0	SET 240\r\n=>	-	NOBT=4;SHFT=4;RVAL=255	RVAL;MASK
+mbbid_bad_link	mbbiDirect	l.proto nosuch P	0	-	-	-	-
+mbbo_w	mbbo	l.proto lw P	2	W2\r\n=>7\r\n	-	-	MLST;RVAL;RBV
+mbbo_w_states	mbbo	l.proto lw P	2	W20\r\n=>10\r\n	-	ONVL=10;TWVL=20	MLST;RVAL;RBV
+mbbo_w_nomatch	mbbo	l.proto lw P	1	W10\r\n=>99\r\n	-	ONVL=10	MLST;RVAL;RBV
+mbbo_w_shft	mbbo	l.proto lw P	3	W48\r\n=>255\r\n	-	NOBT=4;SHFT=4	MLST;RVAL;RBV;MASK
+mbbo_wl_neg	mbbo	l.proto lw P	65535	W-1\r\n=>-1\r\n	-	-	MLST;RVAL;RBV
+mbbo_wu	mbbo	l.proto lu P	65535	W65535\r\n=>	-	-	RVAL
+mbbo_wu_rval_neg	mbbo	l.proto lu P	1	W4294967295\r\n=>	-	ONVL=4294967295	RVAL
+mbbo_wd_rval_neg	mbbo	l.proto ld P	1	W-1\r\n=>	-	ONVL=4294967295	RVAL
+mbbo_wstring	mbbo	l.proto lst P	1	Wone\r\n=>	-	ZRST=zero;ONST=one	MLST
+mbbo_wstring_big	mbbo	l.proto lst P	20	-	-	-	MLST
+mbbo_wdouble	mbbo	l.proto lf P	1	-	-	-	MLST
+mbbo_init	mbbo	l.proto lr P	0	I\r\n=>5\r\n	noproc	-	MLST;LALM;RVAL;RBV;ORAW;ORBV
+mbbo_init_states	mbbo	l.proto lr P	0	I\r\n=>6\r\n	noproc	ONVL=5;TWVL=6;TWSV=MAJOR	MLST;LALM;RVAL;RBV;NSEV;NSTA
+mbbo_init_unknown	mbbo	l.proto lr P	0	I\r\n=>9\r\n	noproc	ONVL=5;UNSV=MINOR	MLST;RVAL;NSEV;NSTA
+mbbo_init_shft	mbbo	l.proto lr P	0	I\r\n=>255\r\n	noproc	NOBT=4;SHFT=4	MLST;RVAL;RBV;MASK
+mbbo_init_string	mbbo	l.proto lis P	0	I\r\n=>b\r\n	noproc	ZRST=a;ONST=b	MLST;RVAL
+mbbo_init_string_none	mbbo	l.proto lis P	0	I\r\n=>q\r\n	noproc	ZRST=a;ONST=b	MLST;RVAL;NSEV;NSTA
+mbbo_noinit_states	mbbo	l.proto lw P	1	-	noproc	ONVL=5	MLST;RVAL
+mbbo_bad_link	mbbo	l.proto nosuch P	0	-	-	-	-
+mbbo_w_mask	mbbo	l.proto ld P	1	W15\r\n=>	-	ONVL=31;NOBT=4	MLST;RVAL;MASK
+mbbo_rdouble	mbbo	l.proto lif P	0	I\r\n=>5\r\n	noproc	-	MLST;RVAL
+mbbo_init_illegal	mbbo	l.proto lw P	20	-	noproc	ZRST=a	MLST;RVAL;NSEV;NSTA
+mbbo_init_cos	mbbo	l.proto lr P	0	I\r\n=>1\r\n	noproc	COSV=MINOR	MLST;LALM;NSEV;NSTA
+mbbo_init_cos_rerun	mbbo	l.proto lrv P	0	I0\r\n=>1\r\n;;I1\r\n=>2\r\n	noproc,pauserun	COSV=MINOR	MLST;LALM;NSEV;NSTA
+mbbod_w	mbboDirect	l.proto lw P	5	W5\r\n=>6\r\n	-	-	MLST;RVAL;RBV;B0;B1;B2
+mbbod_w_mask	mbboDirect	l.proto lw P	19	W3\r\n=>255\r\n	-	NOBT=4	MLST;RVAL;RBV;MASK
+mbbod_w_shft	mbboDirect	l.proto lw P	3	W48\r\n=>255\r\n	-	NOBT=4;SHFT=4	MLST;RVAL;RBV;MASK
+mbbod_wu_neg	mbboDirect	l.proto lu P	-1	W4294967295\r\n=>	-	-	RVAL
+mbbod_wd_neg	mbboDirect	l.proto ld P	-1	W-1\r\n=>	-	-	RVAL
+mbbod_wd_mask_neg	mbboDirect	l.proto ld P	-1	W-1\r\n=>	-	NOBT=32	RVAL;MASK
+mbbod_wu_mask	mbboDirect	l.proto lu P	-1	W4294967295\r\n=>	-	NOBT=32	RVAL;MASK
+mbbod_wdouble	mbboDirect	l.proto lf P	1	-	-	-	NSEV
+mbbod_wstring	mbboDirect	l.proto lst P	1	-	-	-	-
+mbbod_timeout	mbboDirect	l.proto t P	1	GET\r\n=>	-	-	NSEV
+mbbod_noinit	mbboDirect	l.proto lw P	1	-	noproc	-	MLST
+mbbod_init	mbboDirect	l.proto lr P	0	I\r\n=>5\r\n	noproc	-	MLST;RVAL;RBV;ORAW;ORBV;B0;B1;B2
+mbbod_init_shft	mbboDirect	l.proto lr P	0	I\r\n=>255\r\n	noproc	NOBT=4;SHFT=4	MLST;RVAL;RBV;MASK;B0;B3;B4
+mbbod_init_ulong	mbboDirect	l.proto liu P	0	I\r\n=>4294967301\r\n	noproc	-	MLST;RVAL;B0;B1;B2
+mbbod_rdouble	mbboDirect	l.proto lif P	0	I\r\n=>5\r\n	noproc	-	MLST;RVAL
+mbbod_bad_link	mbboDirect	l.proto nosuch P	0	-	-	-	-
+mbbod_wu_mask_cut	mbboDirect	l.proto lu P	19	W3\r\n=>	-	NOBT=4	RVAL;MASK
+sc_wdouble	scalcout	l.proto sf P	0	W1.500000\r\n=>	-	CALC=1.5	OVAL
+sc_wocal	scalcout	l.proto sf P	0	W2.500000\r\n=>	-	CALC=1;DOPT=Use OCAL;OCAL=2.5	OVAL
+sc_wlong	scalcout	l.proto sd P	0	W-2\r\n=>	-	CALC=-2.7	OVAL
+sc_wbig	scalcout	l.proto sd P	0	W-9223372036854775808\r\n=>	-	CALC=1e30	OVAL
+sc_wulong_neg	scalcout	l.proto su P	0	W18446744073709551615\r\n=>	-	CALC=-1	OVAL
+sc_wstring	scalcout	l.proto ss P	0	Wabc\r\n=>	-	CALC='abc'	OSV;SVAL
+sc_wstring_num	scalcout	l.proto ss P	0	W1.5\r\n=>	-	CALC=1.5	OSV;SVAL
+sc_wosv	scalcout	l.proto ss P	0	Wxyz\r\n=>	-	CALC='abc';DOPT=Use OCAL;OCAL='xyz'	OSV;SVAL
+sc_rdouble	scalcout	l.proto srf P	0	R\r\n=>2.25\r\n	-	CALC=1	OVAL;SVAL
+sc_rlong	scalcout	l.proto srd P	0	R\r\n=>-7\r\n	-	CALC=1	OVAL
+sc_rulong	scalcout	l.proto sru P	0	R\r\n=>4294967295\r\n	-	CALC=1	-
+sc_rstring	scalcout	l.proto srs P	0	R\r\n=>abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJ\r\n	-	CALC=1	SVAL;OSV
+sc_renum	scalcout	l.proto sre P	0	R\r\n=>c\r\n	-	CALC=1	-
+sc_init	scalcout	l.proto sif P	0	I\r\n=>3.5\r\n	noproc	-	SVAL
+sc_init_str	scalcout	l.proto sis P	0	I\r\n=>hello\r\n	noproc	-	SVAL;OSV
+sc_bad_link	scalcout	l.proto nosuch P	0	-	-	CALC=1	OVAL
+sc_odly	scalcout	l.proto sf P	0	W2.000000\r\n=>	-	CALC=A;A=2;ODLY=0.2	OVAL;DLYA
+si_long	stringin	l.proto s P	old	S\r\n=>abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMN\r\n	-	-	-
+si_mismatch_after	stringin	l.proto six P	old	S\r\n=>abc?\r\n	-	-	-
+si_short_chars	stringin	l.proto sic P	old	S\r\n=>ab\r\n	-	-	-
+si_charset_miss	stringin	l.proto si_sis P	old	S\r\n=>123\r\n	-	-	-
+si_double	stringin	l.proto d P	old	D\r\n=>1\r\n	-	-	-
+si_write	stringin	l.proto siw P	hi there	Whi there\r\n=>OK\r\n	-	-	-
+si_wdouble	stringin	l.proto si_sif P	old	W\r\n=>OK\r\n	-	-	-
+si_fixwidth_short	stringin	l.proto si5 P	old	S\r\n=>ab\r\n	-	-	-
+# devstringoutStream.c
+so_write	stringout	so.proto w P	hello	Shello\r\n=>	-	-	OVAL
+so_readback	stringout	so.proto rb P	hello	Shello\r\n=>world\r\n	-	-	OVAL
+so_empty	stringout	so.proto rb P	hello	Shello\r\n=>\r\n	-	-	OVAL
+so_long	stringout	so.proto rb P	hello	Shello\r\n=>0123456789012345678901234567890123456789ABCDE\r\n	-	-	OVAL
+so_bad_out	stringout	so.proto wd P	hello	x=>	-	-	OVAL
+so_bad_in	stringout	so.proto rd P	hello	Shello\r\n=>5\r\n	-	-	OVAL
+so_init	stringout	so.proto i P	hello	Q\r\n=>init\r\n	noproc	-	OVAL
+so_init_rerun	stringout	so.proto i P	hello	Q\r\n=>one\r\n!once;;\n=>two\r\n	noproc,pauserun	-	OVAL
+so_init_always	stringout	so.proto i P	hello	Q\r\n=>one\r\n!once;;\n=>two\r\n	noproc,pauserun	MPST=Always;APST=Always	OVAL
+so_scan_fixw	stringout	so.proto rf P	hello	Shello\r\n=>ab\r\n	-	-	OVAL
+so_scan_charset	stringout	so.proto rc P	hello	Shello\r\n=>ab\r\n	-	-	OVAL
+so_scan_charset_x	stringout	so.proto rcw P	hello	Shello\r\n=>12y\r\n	-	-	OVAL
+mbbod_noinit_udf	mbboDirect	l.proto t P	1	-	noproc,noval	-	-
+mbbod_reload_sevr	mbboDirect	l.proto t P	1	GET\r\n=>	reload	-	-
+re_match	stringin	re.proto m P	0	R\r\n=>id=abc;\r\n	noval
+re_group	stringin	re.proto g P	0	R\r\n=>foo-bar\r\n	noval
+re_width	stringin	re.proto w P	0	R\r\n=>abcdef\r\n	noval
+re_too_long	stringin	re.proto m P	0	R\r\n=>id=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa;\r\n	noval
+re_truncate	stringin	re.proto t P	0	R\r\n=>id=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa;\r\n	noval
+re_subst	stringin	re.proto s P	0	R\r\n=>banana\r\n	noval
+re_subst_groups	stringin	re.proto sg P	0	R\r\n=>foo-bar\r\n	noval
+re_subst_nth	stringin	re.proto sn P	0	R\r\n=>banana\r\n	noval
+re_subst_first	stringin	re.proto sf P	0	R\r\n=>banana\r\n	noval
+re_subst_last	stringin	re.proto sw P	0	R\r\n=>banana\r\n	noval
+re_subst_out	stringout	re.proto o P	banana	Wbonono\r\n=>	-	-	OVAL
+re_no_match	stringin	re.proto n P	0	R\r\n=>abc\r\n	noval
+re_limit	stringin	re.proto l P	0	R\r\n=>aaaaaaaaaaaaaaaaaaaaaaaaaaaaaacb\r\n	noval
+re_bad	stringin	re.proto e P	0	-	noval

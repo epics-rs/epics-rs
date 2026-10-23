@@ -80,11 +80,13 @@ fn a_script_and_a_closed_stdin_end_the_process_as_c_does() {
 /// past EOF (C `:258-261` spins forever once anything was loaded), so the
 /// harnesses that want a server must ask for it.
 ///
-/// The proof is the "CA server:" line, not a stopwatch: reaching it means
-/// the process passed the point where the interactive arm would already
-/// have read EOF and returned, and it is still running there. A bare sleep
-/// would pass on a loaded host for the wrong reason — an IOC too slow to
-/// boot is also an IOC that has not exited.
+/// That `-S` picks the serving arm is `softioc-rs`'s unit test
+/// `dash_s_selects_the_serving_arm`; this case shows only that the serving
+/// arm serves past EOF. The proof is a served read, not a stopwatch: stdin is
+/// closed from the spawn, and a `caget` answered on the port the "CA server:"
+/// line names is a read served after it. A bare sleep would pass on a loaded
+/// host for the wrong reason — an IOC too slow to boot is also an IOC that
+/// has not exited.
 #[test]
 fn dash_s_keeps_serving_after_stdin_is_closed() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_softioc-rs"))
@@ -99,21 +101,36 @@ fn dash_s_keeps_serving_after_stdin_is_closed() {
 
     let mut stderr = BufReader::new(child.stderr.take().expect("piped stderr"));
     let deadline = Instant::now() + Duration::from_secs(60);
-    let mut serving = false;
+    let mut port = None;
     while Instant::now() < deadline {
         let mut line = String::new();
         if stderr.read_line(&mut line).expect("read the IOC's stderr") == 0 {
             break;
         }
-        if line.starts_with("CA server:") {
-            serving = true;
+        if let Some((_, rest)) = line.split_once("CA server: UDP search on port ") {
+            port = rest.split(',').next().and_then(|p| p.parse::<u16>().ok());
             break;
         }
     }
+    let Some(port) = port else {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("the -S IOC never announced its CA server");
+    };
+    let read = Command::new(env!("CARGO_BIN_EXE_caget-rs"))
+        .args(["-w", "10", "EOF:SERVED"])
+        .env("EPICS_CA_AUTO_ADDR_LIST", "NO")
+        .env("EPICS_CA_ADDR_LIST", format!("127.0.0.1:{port}"))
+        .output()
+        .expect("run caget-rs");
     let alive = child.try_wait().expect("poll the IOC").is_none();
     let _ = child.kill();
     let _ = child.wait();
-    assert!(serving, "the -S IOC never announced its CA server");
+    assert!(
+        read.status.success(),
+        "-S must serve past EOF: caget failed: {}",
+        String::from_utf8_lossy(&read.stderr)
+    );
     assert!(alive, "-S must serve past EOF, not exit with the shell");
 }
 

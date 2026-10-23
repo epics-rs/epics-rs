@@ -9,7 +9,9 @@
 // names the port that is missing rather than a platform class.
 #[cfg(not(procserv_host_platform))]
 fn main() {
-    eprintln!("procserv-rs needs forkpty(3); no Windows (ConPTY) backend exists yet");
+    epics_base_rs::stderr_println!(
+        "procserv-rs needs forkpty(3); no Windows (ConPTY) backend exists yet"
+    );
     std::process::exit(2);
 }
 
@@ -528,7 +530,7 @@ mod app {
         // validation owner (`ProcServConfig::validate`) as the library path,
         // run at the foreground gate here for both modes.
         if let Err(e) = cfg.validate() {
-            eprintln!("procserv-rs: {e}");
+            epics_base_rs::stderr_println!("procserv-rs: {e}");
             return ExitCode::FAILURE;
         }
 
@@ -548,7 +550,7 @@ mod app {
             {
                 Ok(r) => r,
                 Err(e) => {
-                    eprintln!("procserv-rs: bind runtime build failed: {e}");
+                    epics_base_rs::stderr_println!("procserv-rs: bind runtime build failed: {e}");
                     return ExitCode::FAILURE;
                 }
             };
@@ -557,7 +559,7 @@ mod app {
             match result {
                 Ok(listeners) => listeners,
                 Err(e) => {
-                    eprintln!("procserv-rs: {e}");
+                    epics_base_rs::stderr_println!("procserv-rs: {e}");
                     return ExitCode::FAILURE;
                 }
             }
@@ -579,7 +581,7 @@ mod app {
                 has_logport: cfg.listen.log.is_some(),
             };
             if let Err(e) = fork_and_go(parent) {
-                eprintln!("procserv-rs: daemonize failed: {e}");
+                epics_base_rs::stderr_println!("procserv-rs: daemonize failed: {e}");
                 return ExitCode::FAILURE;
             }
         }

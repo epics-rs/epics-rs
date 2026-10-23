@@ -97,7 +97,10 @@
 
 use std::io::Write as _;
 
+use epics_base_rs::types::c_parse;
+
 use crate::cli::IntStyle;
+use epics_libcom_rs::cfmt::CFloat;
 
 /// C's "last occurrence wins" for a value-taking option: the getopt loop
 /// overwrites its variable on each pass, so the final assignment is the one
@@ -444,14 +447,15 @@ impl<'m> Scan<'m> {
             out.push('\n');
         }
         if !out.is_empty() {
-            let _ = std::io::stderr().write_all(out.as_bytes());
+            let _ = epics_libcom_rs::runtime::log::StagedStderr.write_all(out.as_bytes());
         }
 
         match terminal {
             None => {
                 if let Some(diagnostic) = self.error {
                     // C's `case '?'` / `case ':'`: the one line, then `return 1`.
-                    let _ = std::io::stderr().write_all(diagnostic.as_bytes());
+                    let _ = epics_libcom_rs::runtime::log::StagedStderr
+                        .write_all(diagnostic.as_bytes());
                     std::process::exit(1)
                 }
             }
@@ -462,7 +466,7 @@ impl<'m> Scan<'m> {
             Some((_, Terminal::Usage(status))) => {
                 // C's `usage()` writes to stderr whatever brought it here —
                 // `-h`, or the `default:` arm's exit-1 path.
-                let _ = std::io::stderr().write_all(usage.as_bytes());
+                let _ = epics_libcom_rs::runtime::log::StagedStderr.write_all(usage.as_bytes());
                 std::process::exit(status)
             }
         }
@@ -477,55 +481,26 @@ pub const CA_PRIORITY_MAX: u8 = 99;
 /// precision `-e`/`-f`/`-g` will accept.
 pub const VALID_DOUBLE_DIGITS: i32 = 18;
 
-/// The digit run C's `%d`/`%u`/`%lu` conversions consume: leading
-/// whitespace, an optional `+`/`-`, then decimal digits, stopping at the
-/// first non-digit and IGNORING whatever trails (`"3x"` scans as `3`).
-/// `None` when no digit was consumed — C's `sscanf(...) != 1`.
-///
-/// The magnitude is accumulated in 64 bits (C uses `strtoul`, which clamps
-/// to `ULONG_MAX`); the caller narrows it to the width of its own format.
-fn scan_digits(s: &str) -> Option<(bool, u64)> {
-    let mut chars = s.trim_start().chars().peekable();
-    let neg = match chars.peek() {
-        Some('+') => {
-            chars.next();
-            false
-        }
-        Some('-') => {
-            chars.next();
-            true
-        }
-        _ => false,
-    };
-    let digits: String = chars.take_while(char::is_ascii_digit).collect();
-    if digits.is_empty() {
-        return None;
-    }
-    Some((neg, digits.parse::<u64>().unwrap_or(u64::MAX)))
-}
-
-/// C `sscanf("%u")`: the magnitude truncates to 32 bits and a leading `-`
-/// negates modulo 2^32. Probed on the compiled C (`sscanf.c` driver):
-/// `"-1" → 4294967295`, `"99999999999" → 1215752191`, `"5000000000" →
-/// 705032704`, `"3x" → 3`, `"abc" → no conversion`.
+/// C `sscanf("%u")`: libcom's glibc `%u`, the `unsigned long` `strtoul`
+/// returns narrowed to 32 bits, so a leading `-` wraps and `"3x"` is `3`.
 pub fn scan_u32(s: &str) -> Option<u32> {
-    let (neg, mag) = scan_digits(s)?;
-    let mag = mag as u32;
-    Some(if neg { mag.wrapping_neg() } else { mag })
+    let (v, _) = c_parse::scanf_ulong(s, 10)?;
+    Some(c_parse::ulong_to_uint(v))
 }
 
-/// C `sscanf("%d")`: identical 32-bit truncation to [`scan_u32`], read as
-/// signed. Probed: `"-3" → -3`, `"5000000000" → 705032704`.
+/// C `sscanf("%d")`: libcom's glibc `%d`, `strtol`'s `long` narrowed to `int`.
 pub fn scan_i32(s: &str) -> Option<i32> {
-    scan_u32(s).map(|v| v as i32)
+    let (v, _) = c_parse::scanf_long(s, 10)?;
+    Some(c_parse::long_to_int(v))
 }
 
 /// C `sscanf("%lu")` (`camonitor.c:269`, into an `unsigned long reqElems`):
-/// 64-bit, so — unlike [`scan_u32`] — a large magnitude is NOT truncated.
-/// Probed: `"-3" → 18446744073709551613`, `"99999999999" → 99999999999`.
+/// unlike [`scan_u32`] nothing is narrowed past C's `unsigned long`.
 pub fn scan_u64(s: &str) -> Option<u64> {
-    let (neg, mag) = scan_digits(s)?;
-    Some(if neg { mag.wrapping_neg() } else { mag })
+    let (v, _) = c_parse::scanf_ulong(s, 10)?;
+    // Through u128: `c_ulong` is u64 or u32 by target, and either direct
+    // conversion is a same-type one somewhere.
+    Some(u128::from(v) as u64)
 }
 
 /// C `epicsScanDouble` (`epicsStdlib.h:203`) = `!epicsParseDouble(str, to, NULL)`.
@@ -661,6 +636,7 @@ impl Scan<'_> {
                     format!(
                         "'{a}' is not a valid timeout value - ignored, using '{t:.1}'. \
                          ('{tool} -h' for help.)",
+                        t = CFloat(t),
                         tool = self.tool.0
                     ),
                 ),
@@ -918,7 +894,8 @@ impl CTool {
     /// `cainfo.c:202-205`, plus the getopt `'?'`/`':'` cases). No C CA tool
     /// exits 2, and none dumps its usage block on an error.
     pub fn usage_error(self, what: &str) -> ! {
-        let _ = std::io::stderr().write_all(self.diagnostic(what).as_bytes());
+        let _ =
+            epics_libcom_rs::runtime::log::StagedStderr.write_all(self.diagnostic(what).as_bytes());
         std::process::exit(1)
     }
 
@@ -1001,7 +978,8 @@ impl CTool {
         // something the walk cannot see standing at an option's position —
         // a positional it will not take, say. Neither has anything to warn
         // about first.
-        let _ = std::io::stderr().write_all(self.usage_diagnostic(&cmd, error).as_bytes());
+        let _ = epics_libcom_rs::runtime::log::StagedStderr
+            .write_all(self.usage_diagnostic(&cmd, error).as_bytes());
         std::process::exit(1)
     }
 
@@ -1226,7 +1204,7 @@ mod tests {
     }
 
     /// The three C conversions differ, and the difference is observable.
-    /// Probed with a gcc driver against glibc:
+    /// Probed with a gcc driver against glibc (LP64):
     ///   "-3"          %d → -3          %u → 4294967293  %lu → 2^64-3
     ///   "5000000000"  %d → 705032704   %u → 705032704   %lu → 5000000000
     ///   "3x"          all → 3 (trailing garbage ignored)
@@ -1235,21 +1213,37 @@ mod tests {
     fn digit_scanners_match_glibc_sscanf() {
         assert_eq!(scan_i32("-3"), Some(-3));
         assert_eq!(scan_u32("-3"), Some(4_294_967_293));
-        assert_eq!(scan_u64("-3"), Some(u64::MAX - 2));
 
-        assert_eq!(scan_i32("5000000000"), Some(705_032_704));
-        assert_eq!(scan_u32("5000000000"), Some(705_032_704));
-        assert_eq!(scan_u64("5000000000"), Some(5_000_000_000));
-
-        assert_eq!(scan_u32("99999999999"), Some(1_215_752_191));
-        assert_eq!(scan_u64("99999999999"), Some(99_999_999_999));
+        if std::ffi::c_long::BITS == 64 {
+            assert_eq!(scan_u64("-3"), Some(u64::MAX - 2));
+            assert_eq!(scan_i32("5000000000"), Some(705_032_704));
+            assert_eq!(scan_u32("5000000000"), Some(705_032_704));
+            assert_eq!(scan_u64("5000000000"), Some(5_000_000_000));
+            assert_eq!(scan_u32("99999999999"), Some(1_215_752_191));
+            assert_eq!(scan_u64("99999999999"), Some(99_999_999_999));
+        } else {
+            assert_eq!(scan_u64("-3"), Some(4_294_967_293));
+            assert_eq!(scan_i32("5000000000"), Some(i32::MAX));
+            assert_eq!(scan_u32("5000000000"), Some(u32::MAX));
+            assert_eq!(scan_u64("5000000000"), Some(u64::from(u32::MAX)));
+        }
 
         for s in ["3x", "  3  ", "+3"] {
             assert_eq!(scan_i32(s), Some(3), "{s}");
         }
-        for s in ["abc", "", "-", "+", "x3"] {
+        for s in ["abc", "", "-", "+", "x3", "+-1", "\u{a0}7"] {
             assert_eq!(scan_i32(s), None, "{s}");
             assert_eq!(scan_u64(s), None, "{s}");
+        }
+        assert_eq!(scan_i32("\u{0b}7"), Some(7));
+
+        // vfscanf saturates through strtol/strtoul before it narrows, so an
+        // overflow is not the low bits of the magnitude.
+        if std::ffi::c_long::BITS == 64 {
+            assert_eq!(scan_i32("9223372036854775808"), Some(-1));
+            assert_eq!(scan_i32("-9223372036854775809"), Some(0));
+            assert_eq!(scan_u32("-99999999999999999999"), Some(u32::MAX));
+            assert_eq!(scan_u64("-99999999999999999999"), Some(u64::MAX));
         }
     }
 
@@ -1325,8 +1319,10 @@ mod tests {
         // camonitor's %lu keeps 64 bits where caget's %d truncates.
         let m = matches_of(&["caget", "-#", "5000000000"]);
         let cam = CTool::new("camonitor");
-        assert_eq!(cam.scan(&m).req_elems_ulong("max_elements"), 5_000_000_000);
-        assert_eq!(n(&["caget", "-#", "5000000000"]), 705_032_704);
+        if std::ffi::c_long::BITS == 64 {
+            assert_eq!(cam.scan(&m).req_elems_ulong("max_elements"), 5_000_000_000);
+            assert_eq!(n(&["caget", "-#", "5000000000"]), 705_032_704);
+        }
     }
 
     /// Any non-zero level selects `ca_client_status` mode, so the `%u` wrap
@@ -1539,6 +1535,21 @@ mod tests {
                 "'abc' is not a valid array element count - ignored. ('caget -h' for help.)",
             ]
         );
+    }
+
+    /// C echoes the surviving timeout with `%.1f`: a `-w nan` that scanned
+    /// shows as `nan`, or `-nan` with the sign bit set.
+    #[test]
+    fn a_nan_timeout_is_echoed_as_c_prints_it() {
+        for (w, shown) in [("nan", "nan"), ("-nan", "-nan")] {
+            assert_eq!(
+                warnings_of(&["caget", &format!("-w{w}"), "-w", "qq"]),
+                [format!(
+                    "'qq' is not a valid timeout value - ignored, using '{shown}'. \
+                     ('caget -h' for help.)"
+                )]
+            );
+        }
     }
 
     /// R13-26, the other half: `-h`/`-V` end C's loop where they stand, so an

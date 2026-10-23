@@ -177,11 +177,12 @@ impl IfaceV4 {
 
 /// Enumerate the machine's IPv4 interfaces.
 ///
-/// Every `AF_INET` interface the OS reports, filtered by nothing: eligibility
-/// is [`IfaceV4::is_eligible`]'s job and the destination choice is
-/// [`IfaceV4::search_destination`]'s, so a caller that wants the raw list for
-/// diagnostics gets it and a caller that wants C's SEARCH destinations composes
-/// the two.
+/// Every `AF_INET` interface the OS reports up: one without `IFF_UP` is not
+/// configured, and C (`osdNetIfAddrs.c:100`) and pvxs (`IfaceMap::_refresh`,
+/// `osdSockExt.cpp:284`) drop it before any caller sees it, so no bind,
+/// join or route can name a down NIC's address. Loopback stays; excluding it
+/// is [`IfaceV4::is_eligible`]'s job, and the destination choice is
+/// [`IfaceV4::search_destination`]'s.
 pub fn enumerate() -> io::Result<Vec<IfaceV4>> {
     sys::enumerate()
 }
@@ -232,6 +233,39 @@ pub fn local_addr() -> Ipv4Addr {
         .unwrap_or(Ipv4Addr::LOCALHOST)
 }
 
+/// C `osiLocalAddr` itself: [`local_addr`] computed once per process behind
+/// `epicsThreadOnce`, printing C's line when it falls back to loopback
+/// (`osdNetIfAddrs.c:167-216`, `WIN32/osdNetIntf.c:47-129`). Every caller
+/// shares the one computation, so the line prints once, for whichever of the
+/// pvxs server GUID or the CA repeater registration asks first.
+pub fn osi_local_addr() -> Ipv4Addr {
+    static ONCE: std::sync::OnceLock<Ipv4Addr> = std::sync::OnceLock::new();
+    *ONCE.get_or_init(|| {
+        use crate::runtime::log::errlog_vprintf;
+        match enumerate() {
+            Ok(ifaces) => ifaces
+                .into_iter()
+                .find(|i| i.is_eligible())
+                .map(|i| i.ip)
+                .unwrap_or_else(|| {
+                    errlog_vprintf(format_args!("osiLocalAddr(): only loopback found\n"));
+                    Ipv4Addr::LOCALHOST
+                }),
+            Err(e) => {
+                if cfg!(windows) {
+                    errlog_vprintf(format_args!(
+                        "WSAIoctl SIO_GET_INTERFACE_LIST failed {}\n",
+                        e.raw_os_error().unwrap_or(0)
+                    ));
+                } else {
+                    errlog_vprintf(format_args!("osiLocalAddrOnce(): getifaddrs failed.\n"));
+                }
+                Ipv4Addr::LOCALHOST
+            }
+        }
+    })
+}
+
 #[cfg(unix)]
 mod sys {
     //! Unix, hosted and embedded alike: `getifaddrs(3)`.
@@ -262,7 +296,7 @@ mod sys {
     //! | RTEMS 5 / 7 | `<bsp>/lib/include/ifaddrs.h` |
     //! | VxWorks 7 | `usr/h/public/net/ifaddrs.h` (sixth field is a union of `ifu_broadaddr`/`ifu_dstaddr`, which is one pointer) |
 
-    use super::IfaceV4;
+    use super::{IfaceV4, flags};
     use std::ffi::CStr;
     use std::io;
     use std::net::Ipv4Addr;
@@ -415,6 +449,9 @@ mod sys {
                     // family (`:75`) — both are skips, not failures.
                     continue;
                 };
+                if node.ifa_flags & flags::IFF_UP == 0 {
+                    continue;
+                }
                 let name = if node.ifa_name.is_null() {
                     String::new()
                 } else {
@@ -436,43 +473,34 @@ mod sys {
 
 #[cfg(not(unix))]
 mod sys {
-    //! Windows: no `getifaddrs`, so the `if-addrs` crate — which is what the
-    //! host enumeration used before this module existed, and which C mirrors by
-    //! giving Windows its own `os/WIN32/osdNetIntf.c` rather than including
-    //! either shared file.
-    //!
-    //! `if-addrs` does not surface `ifa_flags`, so the flags are reconstructed
-    //! from what it does report: an interface it lists is treated as up, and a
-    //! reported broadcast address is what `IFF_BROADCAST` means. That is the
-    //! same approximation the pre-existing host path made, and it is confined
-    //! to the one platform that cannot do better.
+    //! Windows: no `getifaddrs`; C has its own `os/WIN32/osdNetIntf.c`. The
+    //! walk is [`crate::net::win_adapters`], which lists up adapters only, so
+    //! every entry is `IFF_UP`, and `IFF_BROADCAST` is a v4 subnet broadcast
+    //! — C's `(addr & mask) | (bcast & ~mask)` (`osdNetIntf.c:233-238`).
 
     use super::{IfaceV4, flags};
     use std::io;
     use std::net::IpAddr;
 
     pub(super) fn enumerate() -> io::Result<Vec<IfaceV4>> {
-        let ifs = if_addrs::get_if_addrs()?;
         let mut out = Vec::new();
-        for iface in ifs {
-            let if_addrs::IfAddr::V4(v4) = &iface.addr else {
+        for a in crate::net::win_adapters::up_adapter_addrs()? {
+            let IpAddr::V4(ip) = a.ip else {
                 continue;
             };
-            let IpAddr::V4(ip) = iface.ip() else {
-                continue;
-            };
+            let dest = a.broadcast_v4();
             let mut f = flags::IFF_UP;
-            if iface.is_loopback() {
+            if a.loopback {
                 f |= flags::IFF_LOOPBACK;
             }
-            if v4.broadcast.is_some() {
+            if dest.is_some() {
                 f |= flags::IFF_BROADCAST;
             }
             out.push(IfaceV4 {
-                name: iface.name.clone(),
+                netmask: Some(a.netmask_v4()),
+                name: a.name,
                 ip,
-                netmask: Some(v4.netmask),
-                dest: v4.broadcast,
+                dest,
                 flags: f,
             });
         }

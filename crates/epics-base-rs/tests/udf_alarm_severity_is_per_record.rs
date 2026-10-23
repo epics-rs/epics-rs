@@ -81,10 +81,8 @@ async fn lso_udf_is_invalid_even_when_udfs_says_minor() {
 #[epics_macros_rs::epics_test]
 async fn mbbi_direct_udf_is_invalid_even_when_udfs_says_minor() {
     let rec = MbbiDirectRecord::default();
-    let mut common = CommonFields {
-        udfs: AlarmSeverity::Minor as i16,
-        ..Default::default()
-    };
+    let mut common = CommonFields::default();
+    common.udfs = AlarmSeverity::Minor as i16;
     assert_ne!(common.udf, 0, "a fresh record is undefined");
 
     rec_gbl_check_udf(

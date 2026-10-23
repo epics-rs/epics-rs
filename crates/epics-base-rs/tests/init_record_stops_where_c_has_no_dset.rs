@@ -30,9 +30,32 @@ use std::sync::Arc;
 
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
+use epics_base_rs::server::record::{DbLinkType, DevSup, Dset, register_device_row};
 use epics_base_rs::types::EpicsValue;
 
+/// `device(<type>, INST_IO, devAsynInt32, "asynInt32")` loaded with no dset
+/// registered behind it: asyn's `.dbd` on an IOC that does not link asyn.
+static DECLARED_ONLY: [DevSup; 2] = [
+    DevSup {
+        name: "devAsynInt32",
+        choice: "asynInt32",
+        link_type: DbLinkType::Constant,
+        dset: Dset::new(6, &[], false),
+    },
+    DevSup {
+        name: "devNobody",
+        choice: "nobodyRegisteredThis",
+        link_type: DbLinkType::Constant,
+        dset: Dset::new(6, &[], false),
+    },
+];
+
 async fn ioc(db_text: &str) -> Arc<PvDatabase> {
+    for rtype in ["ai", "ao", "aai", "aao", "calc"] {
+        for row in &DECLARED_ONLY {
+            register_device_row(rtype, row);
+        }
+    }
     IocBuilder::new()
         .db_string(db_text, &HashMap::new())
         .unwrap()
@@ -66,16 +89,19 @@ async fn an_ai_with_no_dset_seeds_no_tracker() {
 
 /// The SAME record type with device support present runs the whole tail. This
 /// is the half a per-cell patch gets wrong: the seed is not deleted, it is
-/// conditional on reaching it.
+/// conditional on reaching it. The dset must lack `init_record`, which returns
+/// before the seed (`aiRecord.c:121-128`); softIoc reads 1.5 here and 0 for
+/// Soft Channel.
 #[epics_macros_rs::epics_test]
-async fn an_ai_with_a_soft_channel_seeds_its_trackers() {
-    let db = ioc("record(ai, \"T:S\") { field(DTYP,\"Soft Channel\") field(VAL,\"1.5\") }\n").await;
+async fn an_ai_with_a_dset_reaching_the_tail_seeds_its_trackers() {
+    let db =
+        ioc("record(ai, \"T:S\") { field(DTYP,\"Soft Timestamp\") field(VAL,\"1.5\") }\n").await;
 
     for field in ["MLST", "ALST", "LALM"] {
         assert_eq!(
             f64_of(&db, &format!("T:S.{field}")),
             1.5,
-            "a dset C always links reaches `aiRecord.c:127-129`"
+            "devTimestampAI has no init_record and reaches `aiRecord.c:129-131`"
         );
     }
 }
@@ -105,13 +131,13 @@ async fn an_ao_with_no_dset_is_not_marked_initialised() {
 #[epics_macros_rs::epics_test]
 async fn a_record_type_with_no_dset_test_still_runs_its_passes() {
     let db = ioc(
-        "record(calc, \"T:C\") { field(DTYP,\"asynInt32\") field(CALC,\"1\") field(VAL,\"1.5\") }\n",
+        "record(calc, \"T:C\") { field(DTYP,\"asynInt32\") field(CALC,\"1\") field(INPA,\"3\") }\n",
     )
     .await;
 
     assert_eq!(
-        f64_of(&db, "T:C.MLST"),
-        1.5,
-        "calcRecord.c has no `!pdset` branch, so nothing is skipped"
+        f64_of(&db, "T:C.A"),
+        3.0,
+        "calcRecord.c has no `!pdset` branch, so pass 1 loads INPA (:101)"
     );
 }

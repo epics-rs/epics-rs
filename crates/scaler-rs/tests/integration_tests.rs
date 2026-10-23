@@ -14,6 +14,19 @@ use epics_ca_rs::server::CaServerBuilder;
 use scaler_rs::ScalerRecord;
 use std::collections::HashMap;
 
+/// `pv` once it reads `want`, or what it reads after 10 s: a slow host fires
+/// the DLY timer late, not never.
+async fn reaches(server: &epics_ca_rs::server::CaServer, pv: &str, want: EpicsValue) -> EpicsValue {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let v = server.get(pv).await.unwrap();
+        if v == want || std::time::Instant::now() >= deadline {
+            return v;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+}
+
 // ============================================================
 // Scaler: CNT start/stop via framework
 // ============================================================
@@ -112,7 +125,7 @@ async fn test_scaler_dly_delayed_start() {
 record(scaler, "TEST:SC3") {
     field(FREQ, "1000000")
     field(TP, "1.0")
-    field(DLY, "0.2")
+    field(DLY, "0.5")
 }
 "#;
     let macros = HashMap::new();
@@ -126,8 +139,9 @@ record(scaler, "TEST:SC3") {
         .unwrap();
     let db = server.database().clone();
 
-    // Start counting with DLY=0.2s
+    // Start counting with DLY=0.5s
     // special("CNT") sets US=WAITING, then process returns AsyncPendingReprocess
+    let cnt = std::time::Instant::now();
     server
         .put("TEST:SC3.CNT", EpicsValue::Short(1))
         .await
@@ -135,20 +149,23 @@ record(scaler, "TEST:SC3") {
     db.put_record_field_from_ca("TEST:SC3", "PROC", EpicsValue::Short(1))
         .await
         .unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     // During DLY wait
     let us = server.get("TEST:SC3.US").await.unwrap();
     assert_eq!(us, EpicsValue::Short(1), "US should be WAITING during DLY");
 
     // Wait for DLY to expire + framework re-process
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-
-    let ss = server.get("TEST:SC3.SS").await.unwrap();
+    let ss = reaches(&server, "TEST:SC3.SS", EpicsValue::Short(2)).await;
     assert_eq!(
         ss,
         EpicsValue::Short(2),
         "SS should be COUNTING after DLY expires"
+    );
+    // C's delayed callback never fires early.
+    assert!(
+        cnt.elapsed() >= std::time::Duration::from_millis(500),
+        "counting {:?} after the CNT put",
+        cnt.elapsed()
     );
 
     let us = server.get("TEST:SC3.US").await.unwrap();
@@ -279,8 +296,10 @@ impl ScalerDriver for QuantizingDriver {
     fn actual_frequency(&self) -> Option<f64> {
         Some(Self::DRIVER_FREQ)
     }
-    fn done(&mut self) -> bool {
-        false
+    fn register_done_interrupt(
+        &mut self,
+        _user: scaler_rs::device_support::scaler_asyn::DoneInterrupt,
+    ) {
     }
     fn num_channels(&self) -> usize {
         8
@@ -291,10 +310,7 @@ impl ScalerDriver for QuantizingDriver {
 ///
 /// A count-start whose driver adjusts the channel-0 preset (and adopts
 /// its own clock) must produce `DBE_VALUE` monitor events on `.PR1`,
-/// `.TP`, and `.FREQ`. `run_start_count` runs inside
-/// `DeviceSupport::handle_command`, AFTER the process snapshot was
-/// built and notified; pre-fix the framework never posted those fields
-/// so CA/PVA clients subscribed to PR1/TP/FREQ stayed stale.
+/// `.TP`, and `.FREQ`.
 #[tokio::test]
 async fn test_count_start_posts_pr1_tp_freq_monitor_events() {
     let db = PvDatabase::new();
@@ -337,8 +353,8 @@ async fn test_count_start_posts_pr1_tp_freq_monitor_events() {
         (pr1, tp, freq)
     };
 
-    // Drive CNT=1 -> REQSTART, then process: the CNT block emits
-    // CMD_RESET + CMD_START_COUNT, which the framework dispatches.
+    // Drive CNT=1 -> REQSTART, then process: the count start runs through
+    // the bound dset inside process().
     {
         let rec = db.get_record("TEST:SCMON").unwrap();
         let mut inst = rec.write();
@@ -348,7 +364,7 @@ async fn test_count_start_posts_pr1_tp_freq_monitor_events() {
             .and_then(|a| a.downcast_mut::<ScalerRecord>())
             .unwrap();
         scaler.cnt = 1;
-        scaler.special("CNT", true).unwrap();
+        scaler.special("CNT", true, &Default::default()).unwrap();
         assert_eq!(scaler.us, 2, "CNT=1 -> REQSTART");
     }
 
@@ -372,18 +388,18 @@ async fn test_count_start_posts_pr1_tp_freq_monitor_events() {
     // The posted values must be the reconciled ones, not stale.
     let expected_pr1 = QuantizingDriver::quantize(12_500_000); // NINT(1.0*1.25e7)
     assert_eq!(
-        pr1_evt.snapshot.value.clone(),
+        pr1_evt.value().as_value().cloned().unwrap(),
         // PR1 is DBF_ULONG (scalerRecord.dbd:945) -> native EpicsValue::ULong.
         EpicsValue::ULong(expected_pr1),
         "posted PR1 must be the driver-programmed (quantized) preset"
     );
     assert_eq!(
-        freq_evt.snapshot.value.clone(),
+        freq_evt.value().as_value().cloned().unwrap(),
         EpicsValue::Double(QuantizingDriver::DRIVER_FREQ),
         "posted FREQ must be the driver's actual clock"
     );
     let expected_tp = expected_pr1 as f64 / QuantizingDriver::DRIVER_FREQ;
-    match tp_evt.snapshot.value.clone() {
+    match tp_evt.value().as_value().cloned().unwrap() {
         EpicsValue::Double(v) => assert!(
             (v - expected_tp).abs() < 1e-12,
             "posted TP must be recomputed from effective PR1/FREQ: got {v}, want {expected_tp}"
@@ -454,7 +470,7 @@ async fn test_value_change_post_is_value_only_no_log_bit() {
             .and_then(|a| a.downcast_mut::<ScalerRecord>())
             .unwrap();
         scaler.cnt = 1;
-        scaler.special("CNT", true).unwrap();
+        scaler.special("CNT", true, &Default::default()).unwrap();
     }
 
     let mut visited = epics_base_rs::server::database::ProcStack::new();
@@ -468,15 +484,15 @@ async fn test_value_change_post_is_value_only_no_log_bit() {
         "FREQ change must reach a DBE_VALUE subscriber after the driver adopted its clock (C:430)",
     );
     assert!(
-        evt.mask.contains(EventMask::VALUE),
+        evt.mask().contains(EventMask::VALUE),
         "FREQ post must carry DBE_VALUE, got {:?}",
-        evt.mask
+        evt.mask()
     );
     assert!(
-        !evt.mask.contains(EventMask::LOG),
+        !evt.mask().contains(EventMask::LOG),
         "FREQ value-change post must NOT carry DBE_LOG (C posts a literal DBE_VALUE, \
          scalerRecord.c:430); got {:?}",
-        evt.mask
+        evt.mask()
     );
 
     // The DBE_LOG-only subscriber must see nothing — the value-change post
@@ -528,7 +544,7 @@ async fn test_count_start_guard_triggers_tp_recompute_and_post() {
         // Simulate the user writing TP: special() runs the truncating
         // tp_to_pr1, so pr[0] = trunc(tp*freq) = 10_000_000.
         scaler.tp = user_tp;
-        scaler.special("TP", true).unwrap();
+        scaler.special("TP", true, &Default::default()).unwrap();
         assert_eq!(
             scaler.pr[0], 10_000_000,
             "user TP write -> truncating tp_to_pr1"
@@ -552,7 +568,7 @@ async fn test_count_start_guard_triggers_tp_recompute_and_post() {
             .and_then(|a| a.downcast_mut::<ScalerRecord>())
             .unwrap();
         scaler.cnt = 1;
-        scaler.special("CNT", true).unwrap();
+        scaler.special("CNT", true, &Default::default()).unwrap();
         assert_eq!(scaler.us, 2, "CNT=1 -> REQSTART");
     }
 
@@ -569,7 +585,7 @@ async fn test_count_start_guard_triggers_tp_recompute_and_post() {
          old_pr1 must be captured BEFORE the :409-410 guard",
     );
     let expected_tp = 10_000_001_f64 / freq; // pr1 / freq, C:426
-    match tp_evt.snapshot.value.clone() {
+    match tp_evt.value().as_value().cloned().unwrap() {
         EpicsValue::Double(v) => assert!(
             (v - expected_tp).abs() < 1e-12,
             "TP must be recomputed from the guard-adjusted PR1/FREQ: got {v}, want {expected_tp}"
@@ -695,7 +711,7 @@ record(scaler, "TEST:SC_E2") {
     field(SCAN, "10 second")
     field(FREQ, "1000000")
     field(TP, "1.0")
-    field(DLY, "0.1")
+    field(DLY, "0.5")
 }
 "#;
     let macros = HashMap::new();
@@ -707,13 +723,13 @@ record(scaler, "TEST:SC_E2") {
         .await
         .unwrap();
 
+    let cnt = std::time::Instant::now();
     server
         .put("TEST:SC_E2.CNT", EpicsValue::Short(1))
         .await
         .unwrap();
 
     // Mid-wait: WAITING, not counting.
-    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
     assert_eq!(
         server.get("TEST:SC_E2.US").await.unwrap(),
         EpicsValue::Short(1),
@@ -726,11 +742,16 @@ record(scaler, "TEST:SC_E2") {
     );
 
     // Past expiry: delayCallbackFunc's scanOnce has started the count.
-    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     assert_eq!(
-        server.get("TEST:SC_E2.SS").await.unwrap(),
+        reaches(&server, "TEST:SC_E2.SS", EpicsValue::Short(2)).await,
         EpicsValue::Short(2),
         "SS == SCALER_STATE_COUNTING: the watchdog started the count with no scan source"
+    );
+    // C's delayed callback never fires early.
+    assert!(
+        cnt.elapsed() >= std::time::Duration::from_millis(500),
+        "counting {:?} after the CNT put",
+        cnt.elapsed()
     );
     assert_eq!(
         server.get("TEST:SC_E2.US").await.unwrap(),

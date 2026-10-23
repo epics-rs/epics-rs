@@ -34,11 +34,6 @@
 //! Ports are always ephemeral (`:0`) — never the real 5064, per the
 //! `build() ⟹ listening` port-ownership rule.
 
-// RTEMS-EXEC-MODEL-ALLOW(1): measured, not argued — all 1 case(s) here run and
-// pass under `EPICS_RS_BUILD_EXEC_BACKEND=thread`. The file-level gate removed
-// with this marker asserted a reactor panic the exec backend does not produce,
-// and while it stood the exec-backend suite could not see this file at all.
-
 use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -120,7 +115,7 @@ impl Record for AlternatingRecord {
                 result: RecordProcessResult::AsyncPending,
                 actions: Vec::new(),
                 device_did_compute: false,
-                post_write_fields: Vec::new(),
+                status: Ok(()),
             })
         } else {
             Ok(ProcessOutcome::complete())

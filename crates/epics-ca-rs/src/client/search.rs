@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 // reasons that were both about `AsyncUdpV4` rather than about UDP:
 //
 //   * `AsyncUdpV4` does not compile for either embedded target — it is built
-//     on `tokio::net`, `socket2` and `if-addrs`, and none of the three cross
+//     on `tokio::net` and `socket2`, and neither crosses
 //     to `armv7-rtems-eabihf` or the `*-wrs-vxworks*` triples.
 //   * On any backend-free build the engine runs on a callback-pool worker
 //     (`runtime::task::spawn`), where `tokio::net::UdpSocket` panics — "there
@@ -32,6 +32,7 @@ use std::time::{Duration, Instant};
 // (design §4.2, §4.5); it is no longer the only mode the target has.
 use epics_base_rs::net::search_udp::{SearchDatagram, SearchUdpSocket};
 use epics_base_rs::runtime::sync::mpsc;
+use epics_base_rs::types::PvString;
 use tokio::io::AsyncReadExt;
 // The `runtime::task` seam, not `tokio::time::interval`: this engine is
 // compiled for the RTEMS target, where the periodic ticker is the delayed
@@ -42,6 +43,7 @@ use crate::protocol::*;
 
 use super::circuit_breaker::CircuitBreakerRegistry;
 use super::types::{SearchAttempts, SearchReason, SearchRequest, SearchResponse};
+use epics_libcom_rs::cfmt::CFloat;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 /// Snippet of a UDP/TCP search-response datagram, plus the address it
@@ -256,8 +258,11 @@ fn resolve_max_search_period_secs() -> f64 {
         Ok(v) => v,
         // C `getMaxPeriod` (`udpiiu.cpp:85-90`), verbatim.
         Err(_) => {
-            eprintln!("EPICS \"{name}\" wasn't a real number");
-            eprintln!("Setting \"{name}\" = {default_secs:.6} seconds");
+            epics_libcom_rs::stderr_println!("EPICS \"{name}\" wasn't a real number");
+            epics_libcom_rs::stderr_println!(
+                "Setting \"{name}\" = {:.6} seconds",
+                CFloat(default_secs)
+            );
             return default_secs;
         }
     };
@@ -267,8 +272,11 @@ fn resolve_max_search_period_secs() -> f64 {
     // one deviation here, because a NaN tick would stop the client searching
     // altogether.
     if v.is_nan() || v < MAX_SEARCH_PERIOD_LOWER_LIMIT_SECS {
-        eprintln!("\"{name}\" out of range (low)");
-        eprintln!("Setting \"{name}\" = {MAX_SEARCH_PERIOD_LOWER_LIMIT_SECS:.6} seconds");
+        epics_libcom_rs::stderr_println!("\"{name}\" out of range (low)");
+        epics_libcom_rs::stderr_println!(
+            "Setting \"{name}\" = {:.6} seconds",
+            CFloat(MAX_SEARCH_PERIOD_LOWER_LIMIT_SECS)
+        );
         return MAX_SEARCH_PERIOD_LOWER_LIMIT_SECS;
     }
     // C's upper bound is not on the period: `getNTimers` (`udpiiu.cpp:96-111`)
@@ -287,8 +295,8 @@ fn resolve_max_search_period_secs() -> f64 {
     // out-of-range period gets.
     if search_timer_count(v) > MAX_SEARCH_TIMER_COUNT {
         let capped = max_search_period_upper_limit_secs();
-        eprintln!("\"{name}\" out of range (high)");
-        eprintln!("Setting \"{name}\" = {capped:.6} seconds");
+        epics_libcom_rs::stderr_println!("\"{name}\" out of range (high)");
+        epics_libcom_rs::stderr_println!("Setting \"{name}\" = {:.6} seconds", CFloat(capped));
         return capped;
     }
     v
@@ -352,7 +360,7 @@ struct PendingSearch {
     #[allow(dead_code)]
     cid: u32,
     #[allow(dead_code)]
-    pv_name: String,
+    pv_name: PvString,
     /// Pre-built payload: SEARCH header + padded PV name (no VERSION prefix).
     search_payload: Vec<u8>,
     /// Which bucket this search currently lives in.
@@ -433,7 +441,7 @@ struct SearchEngineState {
     /// IOC replying after the connect handshake completed). Now
     /// `Cancel`-only clears. Bounded at
     /// `MULTIPLY_DEFINED_RESOLVED_CAP` to cap memory.
-    resolved: HashMap<u32, (String, SocketAddr)>,
+    resolved: HashMap<u32, (PvString, SocketAddr)>,
 }
 
 const MULTIPLY_DEFINED_RESOLVED_CAP: usize = 1024;
@@ -1007,7 +1015,7 @@ async fn run_engine(
     // EPICS_CA_NAMESERVER_QUEUE_DEPTH; default 256 is large enough to
     // ride out a few-second TCP stall without observable search loss
     // and small enough to bound RSS at a few MB worst-case.
-    let ns_queue_cap = epics_base_rs::runtime::env::get("EPICS_CA_NAMESERVER_QUEUE_DEPTH")
+    let ns_queue_cap = epics_base_rs::runtime::env::get_lossy("EPICS_CA_NAMESERVER_QUEUE_DEPTH")
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(256)
         .max(8);
@@ -1041,7 +1049,7 @@ async fn run_engine(
     // default 60 s balances responsiveness against DNS load. Literal
     // IP entries (`hostname == None`) short-circuit inside
     // `refresh_dns` so the cost is bounded by hostname count.
-    let dns_refresh_secs: u64 = epics_base_rs::runtime::env::get("EPICS_CA_DNS_REFRESH_SECS")
+    let dns_refresh_secs: u64 = epics_base_rs::runtime::env::get_lossy("EPICS_CA_DNS_REFRESH_SECS")
         .and_then(|s| s.parse().ok())
         .filter(|&n: &u64| n > 0)
         .unwrap_or(60);
@@ -1281,20 +1289,18 @@ async fn serve_nameserver_circuit(
     let mut version = CaHeader::new(CA_PROTO_VERSION);
     version.count = CA_MINOR_VERSION;
     handshake.extend_from_slice(&version.to_bytes());
-    let user = epics_base_rs::runtime::env::get("USER")
-        .or_else(|| epics_base_rs::runtime::env::get("USERNAME"))
-        .unwrap_or_else(|| "unknown".to_string());
+    let identity = super::types::ClientIdentity::from_os();
     // extended-form headers when the USER / hostname
     // payload exceeds 16-bit postsize (libca's
     // `insertRequestHeader` parity). See the matching note in
     // `client/transport.rs` connect path.
     handshake.extend_from_slice(&super::transport::build_identity_frame(
         CA_PROTO_CLIENT_NAME,
-        &user,
+        &identity.user,
     ));
     handshake.extend_from_slice(&super::transport::build_identity_frame(
         CA_PROTO_HOST_NAME,
-        &epics_base_rs::runtime::env::hostname(),
+        &identity.host,
     ));
     // `OnStall::Stop`, and only here: the read task below does not exist yet,
     // so this circuit has no receive watchdog to own the "keep the socket"
@@ -1653,7 +1659,7 @@ fn handle_request(state: &mut SearchEngineState, req: SearchRequest) -> Option<u
                 return None;
             }
 
-            let search_payload = build_search_payload(cid, &pv_name);
+            let search_payload = build_search_payload(cid, pv_name.as_bytes());
 
             // Drop any stale entry before re-scheduling.
             state.remove_channel(cid);
@@ -2223,8 +2229,8 @@ fn ns_try_send(ns_tx: &mpsc::Sender<Vec<u8>>, frame: Vec<u8>) {
 
 /// Build per-channel search payload (SEARCH header + padded PV name).
 /// Does NOT include the VERSION header — that is prepended once per datagram.
-fn build_search_payload(cid: u32, pv_name: &str) -> Vec<u8> {
-    let pv_payload = pad_string(pv_name);
+fn build_search_payload(cid: u32, pv_name: &[u8]) -> Vec<u8> {
+    let pv_payload = pad_bytes(pv_name);
 
     let mut search_hdr = CaHeader::new(CA_PROTO_SEARCH);
     search_hdr.postsize = pv_payload.len() as u16;
@@ -2290,7 +2296,7 @@ mod tests {
             state,
             SearchRequest::Schedule {
                 cid,
-                pv_name: pv_name.to_string(),
+                pv_name: pv_name.into(),
                 reason: SearchReason::Initial,
             },
         );
@@ -2413,14 +2419,21 @@ mod tests {
 
     #[test]
     fn build_search_payload_size() {
-        let payload = build_search_payload(42, "TEST:PV");
+        let payload = build_search_payload(42, b"TEST:PV");
         // CaHeader::SIZE (16) + pad_string("TEST:PV") = 16 + 8 = 24
         assert_eq!(payload.len(), 24);
     }
 
+    /// libca's search carries `pName` as its bytes (`udpiiu::pushDatagramMsg`).
+    #[test]
+    fn build_search_payload_carries_a_non_utf8_name_byte_for_byte() {
+        let payload = build_search_payload(1, b"T:\xff");
+        assert_eq!(&payload[CaHeader::SIZE..], b"T:\xff\0\0\0\0\0");
+    }
+
     #[test]
     fn build_search_payload_alignment() {
-        let payload = build_search_payload(1, "A");
+        let payload = build_search_payload(1, b"A");
         // pad_string("A") = 8 bytes (1 char + null + 6 padding)
         assert_eq!(payload.len(), CaHeader::SIZE + 8);
         assert_eq!(payload.len() % 8, 0);
@@ -2985,7 +2998,13 @@ mod tests {
         // `AsyncUdpV4` directly, which is why these two tests stay
         // `tokio_backend`.
         use epics_base_rs::net::AsyncUdpV4;
-        let sniffer = AsyncUdpV4::bind_single(Ipv4Addr::LOCALHOST, 0, false).expect("bind sniffer");
+        let sniffer = AsyncUdpV4::bind_single(
+            Ipv4Addr::LOCALHOST,
+            0,
+            epics_base_rs::net::PortUse::Exclusive,
+            false,
+        )
+        .expect("bind sniffer");
         let sniffer_addr = sniffer
             .local_addrs()
             .first()
@@ -3094,7 +3113,13 @@ mod tests {
         // `AsyncUdpV4` directly, which is why these two tests stay
         // `tokio_backend`.
         use epics_base_rs::net::AsyncUdpV4;
-        let sniffer = AsyncUdpV4::bind_single(Ipv4Addr::LOCALHOST, 0, false).expect("bind sniffer");
+        let sniffer = AsyncUdpV4::bind_single(
+            Ipv4Addr::LOCALHOST,
+            0,
+            epics_base_rs::net::PortUse::Exclusive,
+            false,
+        )
+        .expect("bind sniffer");
         let sniffer_addr = sniffer
             .local_addrs()
             .first()

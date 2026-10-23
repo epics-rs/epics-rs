@@ -1,5 +1,43 @@
 # Changelog
 
+## v0.32.0 — 2026-10-22
+
+Minor release; the pinned toolchain moves 1.99.0 → 1.99.1. The record
+cycle, CA, PVA and asyn follow C and pvxs; sscan, StreamDevice and the
+sequencer are ported.
+
+### Breaking
+
+- `IocApplication::register_link_set_installer` → `register_link_type(key, installer)`, one link set per JSON link type per database.
+- `DeviceSupport`: `WriteCompletion` → `DeviceDone`, which also completes `read_begin`; `add_record(&str)` → `add_record(&mut dyn Record)`; `DeviceInitOutcome::Live` → `Ok(DeviceUdf)` / `DoNotConvert(DeviceUdf)`.
+- `Record`: `restamps_time_after_completion`, `stamps_after_write` and `alarms_before_stamp` → `stamp_point()`; `processes_after_put(field)` → `processes_after_put(field, pp)`.
+- `CommonFields::time` and `general_time::get_current`: `SystemTime` → `WallTime`; the process-wide `scan_pause`/`scan_run`/`scan_stop` → each database's own interruptAccept gate.
+- `RecordInstance::invalidate_metadata_cache` removed, CTRL metadata being read from the fields each time; `PvDatabase::find_pv` and `all_record_names` are no longer async.
+- CA client: `CaChannel::on_connection_change`, `on_access_rights_change` and `EventWatcher` → `create_channel_with_events`; CA names are bytes.
+- asyn ports: built under a `PortClaim` (`claim_port_driver`, `create_port_runtime(&claim, ..)`, `claim.publish`) that `PortManager::register_port` takes; `PortDriverBase::new`/`new_exact_flags` and `ADDriverBase::new` take C's interface and interrupt masks, and `ADDriverBase::new` no sensor size.
+- asyn octet reads: `PortDriver::read_octet`/`io_read_octet` `AsynResult<usize>` → `OctetReadResult` and `SyncIO::read_octet`/`write_read` → `OctetRead`, the bytes beside the status; `io_read_octet_eom` and `PartialOctetRead` removed.
+- asyn params: `ParamList`'s value accessors are crate-private, the `*_strict` getters are gone, an unset `get_*_param` → `ParamUndefined`; per-parameter stamps → the port's `update_time_stamp`/`get_time_stamp`/`set_time_stamp`.
+- asyn: the `*_blocking` helpers are gone; `subscribe_async` tokio broadcast → per-subscriber ring; `PortDriver::get_option(key)` → `get_option(user, key)`; `AxisRuntime` and `AsynOctet` removed.
+- motor: `AsynMotor::poll(user) -> MotorStatus` → `poll(user, &mut MotorStatus)` plus a required `poll_failure()`; `MotorPollLoop::run().await` → `start()`.
+- areaDetector: `NDPluginProcess` must declare `INTERFACE_MASK` and `INTERRUPT_MASK`, and `max_addr()` replaces `create_plugin_runtime_multi_addr`; `prepare_array(Arc<NDArray>)` → `prepare_array(DriverArray) -> PublishedArray`; `ADDriver::set_shutter` returns `()`.
+- autosave: `AutosaveBuilder::add_set(cfg)` → `add_set(cfg, SaveStrategy)`; `restore_from_file(db, path)` → `restore_from_file(db, path, RestorePass)`; `CompatMode` and `autosave::iocsh` removed.
+- libcom: `PriorityInheritanceMutex` is the movable form, `PinnedPriorityInheritanceMutex` beside it; `InterruptGate::on_open` callbacks return `EdgeDone`; `scan_once(cb)` → `scan_once(name, cb)`; calc's `cvt::fmt_*` and `strtod` → `cfmt::CFloat` and `runtime::stdlib::strtod`.
+- PVA: `PvaClient`'s `pvput_get*`, `pvget_get`/`pvget_put`, `pvprocess*` and `pvarray_*` removed, as a pvxs 1.5.3 server answers none of them; `config::env`'s list readers and `PvaServerConfig::with_env` return `Result`; `epics-bridge-rs` drops `run_ca_pva_qsrv_ioc`, `BridgeMonitor`, `qsrv::PvaPvHandle` and `install_pvalink`.
+
+### New
+
+- `sscan-rs`: synApps sscan R2-12, with the sscan and scanparm records, saveData's MDA writer and `scanProg.st`.
+- `epics-stream-rs` (imported as `stream_rs`; `stream-rs` is taken on crates.io): StreamDevice, with PCRE 8.45 ported to Rust for `%/regexp/`.
+- `epics_base_rs::server::rec_dyn_link`: recDynLink, which sscan's and swait's links run on.
+- `epics-snc-rs` and `epics-seq-rs`: the sequencer R2-2-9, snc at build time and seq at run time, so an unchanged upstream .st builds from `build.rs`; std's delayDo and femto, optics' twelve programs, sscan's `scanProg.st` and usb-ctr's `USBCTR_SNL.st` now run on it.
+
+### Highlights
+
+- A monitored 2001-record IOC under SCHED_FIFO on PREEMPT_RT wakes late as often as C softIoc: over 35 interleaved 60 s rounds the late-wake count and p99 match C's.
+- `PvDatabase::new` resolves a CA, CP or CPP link to a local record with no network, as C keeps dbCa in base; the `ca` link set adds only libca's network half.
+- An asyn port registers as `asynPortDriver` registers it: the name is claimed before the driver is built, and a constructor that fails after that leaves a registered, disabled port.
+- IOC threads ask for SCHED_FIFO by default under `EPICS_ALLOW_POSIX_THREAD_PRIORITY_SCHEDULING` (unset means YES), and fall back silently where the process may not.
+
 ## v0.31.0 — 2026-10-06
 
 Minor release. **The pinned toolchain moves 1.94.0 -> 1.99.0**, which
@@ -4125,11 +4163,13 @@ layer-by-layer code review across `pva-rs`, `ca-rs`, and `bridge-rs`.
   `configureChannelAccessAddressList`).
 - `casr` iocsh command (RSRV `casr` analog) on `epics_ca_rs::server::iocsh`,
   reading from `Arc<ServerStats>` (connects/disconnects/uptime).
-- `Channel::on_access_rights_change(cb)` callback wrapper.
+- `Channel::on_access_rights_change(cb)` callback wrapper (removed at
+  `ecf39866d`).
 
 **Round 2 (commit `007346e`)**
 - `Channel::on_connection_change(cb)` — libca `ca_change_connection_event`
   analog. Filters Connected / Disconnected events from the broadcast.
+  Removed at `ecf39866d`.
 - `Channel::host_name()` — libca `ca_host_name` analog returning the
   resolved server address.
 - `Channel::receive_watchdog_delay() -> Duration` — libca

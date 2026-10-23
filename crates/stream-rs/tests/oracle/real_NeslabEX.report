@@ -1,0 +1,64 @@
+rec0: NeslabEX.proto get_temp(1,2,3,4,5,6,7,8,9) P
+get_temp {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "\xca\x00\x01\x20\x00\xde";
+    in "%*6r%2r%*r";
+}
+rec1: NeslabEX.proto get_sp(1,2,3,4,5,6,7,8,9) P
+get_sp {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "\xca\x00\x01\x70\x00\x8e";
+    in "%*6r%2r%*r";
+}
+rec2: NeslabEX.proto get_status(1,2,3,4,5,6,7,8,9) P
+get_status {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "\xca\x00\x01\x09\x00\xf5";
+    in "%*7r%1r%*3r";
+}
+rec3: NeslabEX.proto set_temp(1,2,3,4,5,6,7,8,9) P
+set_temp {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "\xca";
+    out "\x00\x03\xf0\x02%.2r%<~sum>";
+}

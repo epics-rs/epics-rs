@@ -1,3 +1,5 @@
+use epics_libcom_rs::cfmt::CFloat;
+
 use crate::flags::{FreezeOffset, MotorDir, MotorError};
 
 /// Convert dial position to user position.
@@ -13,10 +15,8 @@ pub fn user_to_dial(user: f64, dir: MotorDir, off: f64) -> f64 {
 }
 
 /// Convert dial position to raw steps.
-/// raw = round(dial / mres)
-/// 64-bit result to cover high-resolution / long-travel axes
-/// (epics-modules/motor #192).
-pub fn dial_to_raw(dial: f64, mres: f64) -> Result<i64, MotorError> {
+/// raw = round(dial / mres), stored as C's DBF_LONG (`epicsInt32`).
+pub fn dial_to_raw(dial: f64, mres: f64) -> Result<i32, MotorError> {
     if mres == 0.0 {
         return Err(MotorError::InvalidFieldValue("MRES cannot be zero".into()));
     }
@@ -25,15 +25,23 @@ pub fn dial_to_raw(dial: f64, mres: f64) -> Result<i64, MotorError> {
     // 0 or i64::MIN/MAX. Reject it so the caller does not corrupt RVAL.
     if !raw.is_finite() {
         return Err(MotorError::InvalidFieldValue(format!(
-            "dial/mres is not finite (dial={dial}, mres={mres})"
+            "dial/mres is not finite (dial={}, mres={})",
+            CFloat(dial).g(),
+            CFloat(mres).g()
         )));
     }
-    Ok(raw.round() as i64)
+    Ok(to_long(raw.round()))
+}
+
+/// Assign a rounded step count to a DBF_LONG field: C `NINT` yields a
+/// `long` (motor.h:88) that the `epicsInt32` field assignment truncates.
+pub fn to_long(v: f64) -> i32 {
+    epics_base_rs::types::c_cast::f64_to_c_long(v) as i32
 }
 
 /// Convert raw steps to dial position.
 /// dial = raw * mres
-pub fn raw_to_dial(raw: i64, mres: f64) -> f64 {
+pub fn raw_to_dial(raw: i32, mres: f64) -> f64 {
     raw as f64 * mres
 }
 
@@ -75,7 +83,7 @@ pub fn cascade_from_val(
     mres: f64,
     set_mode: bool,
     current_dval: f64,
-) -> Result<(f64, i64, f64), MotorError> {
+) -> Result<(f64, i32, f64), MotorError> {
     if set_mode {
         // SET mode: redefine offset, no move
         let new_off = calc_offset(val, current_dval, dir);
@@ -90,53 +98,17 @@ pub fn cascade_from_val(
     }
 }
 
-/// Update position cascade when DVAL is written.
-/// Returns (new_val, new_rval, new_off).
-pub fn cascade_from_dval(
-    dval: f64,
-    dir: MotorDir,
-    off: f64,
-    _foff: FreezeOffset,
-    mres: f64,
-    set_mode: bool,
-    current_val: f64,
-) -> Result<(f64, i64, f64), MotorError> {
-    let rval = dial_to_raw(dval, mres)?;
-    if set_mode {
-        let new_off = calc_offset(current_val, dval, dir);
-        Ok((current_val, rval, new_off))
-    } else {
-        // C: non-SET mode always recalculates VAL from DVAL. FOFF has no effect.
-        let val = dial_to_user(dval, dir, off);
-        Ok((val, rval, off))
-    }
-}
-
-/// Update position cascade when RVAL is written.
-/// Returns (new_val, new_dval, new_off).
-pub fn cascade_from_rval(
-    rval: i64,
-    dir: MotorDir,
-    off: f64,
-    _foff: FreezeOffset,
-    mres: f64,
-    set_mode: bool,
-    current_val: f64,
-) -> (f64, f64, f64) {
-    let dval = raw_to_dial(rval, mres);
-    if set_mode {
-        let new_off = calc_offset(current_val, dval, dir);
-        (current_val, dval, new_off)
-    } else {
-        // C: non-SET mode always recalculates VAL from DVAL. FOFF has no effect.
-        let val = dial_to_user(dval, dir, off);
-        (val, dval, off)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dial_to_raw_names_a_non_finite_dial_in_c_spelling() {
+        let Err(MotorError::InvalidFieldValue(msg)) = dial_to_raw(f64::NAN, 1e-5) else {
+            panic!("a NaN dial is refused");
+        };
+        assert_eq!(msg, "dial/mres is not finite (dial=nan, mres=1e-05)");
+    }
 
     #[test]
     fn test_dial_to_user_pos_no_off() {
@@ -278,56 +250,6 @@ mod tests {
     }
 
     #[test]
-    fn test_cascade_dval_frozen_off() {
-        // C: FOFF has no effect in non-SET mode -- VAL recalculated normally
-        let (val, rval, off) = cascade_from_dval(
-            5.0,
-            MotorDir::Pos,
-            0.0,
-            FreezeOffset::Frozen,
-            0.01,
-            false,
-            10.0,
-        )
-        .unwrap();
-        assert_eq!(val, 5.0); // recalculated: dial_to_user(5.0, Pos, 0.0)
-        assert_eq!(rval, 500);
-        assert_eq!(off, 0.0); // unchanged
-    }
-
-    #[test]
-    fn test_cascade_rval_normal() {
-        let (val, dval, off) = cascade_from_rval(
-            1000,
-            MotorDir::Pos,
-            0.0,
-            FreezeOffset::Variable,
-            0.01,
-            false,
-            0.0,
-        );
-        assert_eq!(dval, 10.0);
-        assert_eq!(val, 10.0);
-        assert_eq!(off, 0.0);
-    }
-
-    #[test]
-    fn test_cascade_rval_neg_dir() {
-        let (val, dval, off) = cascade_from_rval(
-            1000,
-            MotorDir::Neg,
-            5.0,
-            FreezeOffset::Variable,
-            0.01,
-            false,
-            0.0,
-        );
-        assert_eq!(dval, 10.0);
-        assert_eq!(val, -5.0); // -1*10 + 5
-        assert_eq!(off, 5.0);
-    }
-
-    #[test]
     fn test_set_mode_val_write_updates_off() {
         // SET=1, writing VAL changes OFF but not DVAL
         let (dval, _rval, off) = cascade_from_val(
@@ -342,22 +264,5 @@ mod tests {
         .unwrap();
         assert_eq!(dval, 25.0); // DVAL unchanged (= current_dval)
         assert_eq!(off, 75.0); // 100 - 1*25
-    }
-
-    #[test]
-    fn test_frozen_offset_non_set_cascades_normally() {
-        // C: FOFF has no effect in non-SET mode -- VAL recalculated, OFF unchanged
-        let (val, _rval, off) = cascade_from_dval(
-            20.0,
-            MotorDir::Pos,
-            5.0,
-            FreezeOffset::Frozen,
-            0.01,
-            false,
-            30.0,
-        )
-        .unwrap();
-        assert_eq!(val, 25.0); // dial_to_user(20.0, Pos, 5.0) = 20+5
-        assert_eq!(off, 5.0); // unchanged
     }
 }

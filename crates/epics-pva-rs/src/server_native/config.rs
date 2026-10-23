@@ -206,12 +206,11 @@ pub struct PvaServerConfig {
     /// at sites with strict UDP bandwidth budgets can lower this; the
     /// only correctness constraint is `> beacon_period`.
     pub beacon_period_long: Duration,
-    /// Number of short-interval beacons emitted before the cadence
-    /// drops to `beacon_period_long`. Default 10 (pvxs
-    /// `src/server.cpp:829` hardcodes the same value). After this many
-    /// bursts every receiver in earshot has had multiple chances to
-    /// notice the new server; further short-interval beacons just
-    /// burn UDP bandwidth without informational gain.
+    /// Number of `beacon_period` waits after the first beacon before the
+    /// cadence drops to `beacon_period_long`. Default 10, pvxs's hardcoded
+    /// `beaconCnt<10u` (`src/server.cpp:813-817`): 11 beacons at the short
+    /// period. After those every receiver in earshot has had multiple
+    /// chances to notice the new server.
     pub beacon_burst_count: u8,
     /// Explicit beacon destinations, each carrying optional pvxs multicast
     /// modifiers (TTL / outgoing interface; see [`crate::config::Endpoint`]).
@@ -222,26 +221,15 @@ pub struct PvaServerConfig {
     /// Auto-discover per-NIC broadcast addresses for beacons. From
     /// `EPICS_PVAS_AUTO_BEACON_ADDR_LIST` (default true).
     pub auto_beacon: bool,
-    /// Interfaces to bind UDP responder on. When empty, bind 0.0.0.0.
-    /// From `EPICS_PVAS_INTF_ADDR_LIST`.
-    pub interfaces: Vec<std::net::IpAddr>,
-    /// PVX-82: deferred config error set by [`Self::with_env`] when
-    /// `EPICS_PVA[S]_INTF_ADDR_LIST` named interface(s) that all failed to
-    /// resolve. `PvaServer::start` refuses to bind in that case rather than
-    /// silently promoting the (now-empty) `interfaces` to the wildcard
-    /// `0.0.0.0`. `None` on any programmatically-built config — an empty
-    /// `interfaces` set directly by a caller is an intentional wildcard.
-    /// Public only because the config is built with struct-update syntax
-    /// across the crate boundary; it is not a user-facing knob.
-    pub intf_addr_error: Option<String>,
-    /// PVX-82 (IGNORE sibling): deferred config error set by
-    /// [`Self::with_env`] when `EPICS_PVAS_IGNORE_ADDR_LIST` named peer(s)
-    /// to block that all failed to resolve. `PvaServer::start` refuses to
-    /// start rather than running with a silently-empty blocklist (pvxs
-    /// hard-fails the same config — `config.cpp:172-174`, `required=true`).
-    /// `None` on any programmatically-built config. Public for the same
-    /// struct-update reason as [`Self::intf_addr_error`]; not a user knob.
-    pub ignore_addr_error: Option<String>,
+    /// Interfaces to bind the TCP listeners and UDP responder on. When empty,
+    /// bind `bind_ip`. Each TCP listener binds its own entry's port; a port
+    /// of 0 takes `tcp_port`, then the first listener's bound port
+    /// (`server.cpp:476-486`). A multicast entry is a search group, joined on
+    /// its `@iface` (else the default route), and adds that interface's
+    /// address (else the wildcard) as pvxs `Config::expand` does
+    /// (`config.cpp:497-509`). From `EPICS_PVAS_INTF_ADDR_LIST`; a plain
+    /// `SocketAddr` converts via `.into()`.
+    pub interfaces: Vec<crate::config::Endpoint>,
     /// Emit `0xFD` / `0xFE` type-cache markers in INIT and RPC responses
     /// so repeated compound descriptors collapse to a 3-byte reference
     /// (saves 100-500 bytes per repeat for NTScalar / NTTable channels).
@@ -297,18 +285,6 @@ pub struct PvaServerConfig {
     /// `safe_capacity`, so this cap is a resource policy rather than the only
     /// thing standing between a peer and the heap.
     pub max_message_size: Option<usize>,
-    /// Serve the `PUT_GET` operation (PVA cmd 12). `PUT_GET` is a Rust
-    /// extension: pvxs declares the command but leaves `handle_PUT_GET`
-    /// an empty stub (`serverconn.cpp:259-260`) and its client never
-    /// sends cmd 12 (`clientimpl.h:143`). When `true` (the default) this
-    /// server implements the full INIT/put/readback/destroy lifecycle so
-    /// a PUT_GET-capable client gets a real round trip. Set `false` for
-    /// strict pvxs-compatible behavior: every cmd-12 frame is answered
-    /// with a deterministic error `Status` instead of the Rust round
-    /// trip. We reply with an explicit error rather than pvxs's silent
-    /// drop so the policy is visible at the wire level and a client fails
-    /// fast instead of waiting out its `op_timeout`.
-    pub serve_put_get: bool,
     /// UDP-SEARCH ignore list. Each entry is `(IpAddr, port_or_zero)` —
     /// matching UDP SEARCH datagrams are silently dropped before
     /// admission. `port == 0` matches any port from that IP. Mirrors
@@ -318,26 +294,7 @@ pub struct PvaServerConfig {
     /// host's discovery traffic can be suppressed while its direct TCP
     /// clients still connect. Empty = allow all (default).
     pub ignore_addrs: Vec<(std::net::IpAddr, u16)>,
-    /// Spawn a parallel IPv6 UDP listener bound to `[::]:udp_port`
-    /// alongside the existing IPv4 per-NIC responder. Required for
-    /// PVA clients that send SEARCH over IPv6 unicast / multicast.
-    /// Default `false` keeps every existing deployment exactly v4-only.
-    ///
-    /// Stage 2 of the PR #205 IPv6 effort. The v6 responder shares
-    /// the GUID / TCP-port / protocol of the v4 path so a single
-    /// client sees one consistent PVA server regardless of which
-    /// address family carried the SEARCH. Beacon emission stays on
-    /// the v4 path for now; v6 multicast beacons are deferred.
-    pub enable_ipv6_udp: bool,
-    /// Per-monitor "high" watermark — emit a `tracing::warn!` when an
-    /// outbound monitor queue grows past this many items. Default:
-    /// `monitor_queue_depth * 3 / 4` (3, for the pvxs per-op default
-    /// depth of 4). Mirrors pvxs
-    /// `MonitorControlOp::setWatermarks` `high` argument; high-mark
-    /// callbacks (`onHighMark`) aren't surfaced yet — the watermark
-    /// drives diagnostics only.
-    pub monitor_high_watermark: usize,
-    /// Per-monitor "low" watermark — companion to `high`, currently
+    /// Per-monitor "low" watermark, currently
     /// unused (pvxs notes the `onLowMark` callback isn't fully
     /// implemented either). Reserved for future flow-control logic.
     pub monitor_low_watermark: usize,
@@ -412,19 +369,14 @@ impl Default for PvaServerConfig {
             beacon_destinations: Vec::new(),
             auto_beacon: true,
             interfaces: Vec::new(),
-            intf_addr_error: None,
-            ignore_addr_error: None,
             emit_type_cache: false,
             write_queue_depth: 1024,
             ignore_addrs: Vec::new(),
-            enable_ipv6_udp: false,
-            monitor_high_watermark: (super::source::DEFAULT_MONITOR_QUEUE_LIMIT as usize) * 3 / 4,
             monitor_low_watermark: 0,
             auth_complete: None,
             send_timeout: Duration::from_secs(5),
             tls_handshake_timeout: Duration::from_secs(10),
             max_message_size: Some(DEFAULT_MAX_MESSAGE_SIZE),
-            serve_put_get: true,
         }
     }
 }
@@ -460,23 +412,24 @@ impl PvaServerConfig {
     /// `PvaServerConfig::isolated().with_env()` isolated in an empty
     /// environment (ports stay ephemeral, `auto_beacon` stays off) instead
     /// of silently reverting to the LAN-facing defaults.
-    pub fn with_env(mut self) -> Self {
+    ///
+    /// An address list is appended to the caller's, as `split_addr_into`
+    /// appends to the `Config` it fills (`config.cpp:151-183`).
+    ///
+    /// An invalid interface or ignore entry fails it with pvxs's `what()`,
+    /// as `required=true` throws out of `Config::fromEnv`
+    /// (`config.cpp:172-173`), so no server binds a configuration pvxs
+    /// refuses.
+    pub fn with_env(mut self) -> std::io::Result<Self> {
         use crate::config::env;
-        // server respects EPICS_PVAS_SERVER_PORT first, then
-        // falls back to EPICS_PVA_SERVER_PORT (pvxs config.cpp:
-        // 402-408 PickOne precedence).
-        if let Some(v) = env::pvas_server_port_opt() {
-            self.tcp_port = v;
-        }
+        env::server_port_logged(env::SERVER_PORT_VARS, &mut self.tcp_port);
+        env::server_port_logged(env::SERVER_BROADCAST_PORT_VARS, &mut self.udp_port);
         // Server TLS listen port: EPICS_PVAS_TLS_PORT first, then the shared
         // EPICS_PVA_TLS_PORT (pvxs config.cpp:495-501 PickOne, `tls`
         // `b3a10bf0`). Only takes effect when `tls` is configured (see
         // `tls_port`).
         if let Some(v) = env::pvas_tls_port_opt() {
             self.tls_port = v;
-        }
-        if let Some(v) = env::server_broadcast_port_opt() {
-            self.udp_port = v;
         }
         // Anti-downgrade: `disable_plaintext=true` in the TLS options makes
         // the server refuse plaintext (parseTLSOptions, config.cpp:453-460 on
@@ -508,21 +461,28 @@ impl PvaServerConfig {
                 .saturating_mul(12)
                 .max(self.beacon_period + Duration::from_secs(1));
         }
-        if let Some(v) = env::server_beacon_endpoints_opt() {
-            self.beacon_destinations = v;
+        // pvxs reads the interfaces, the ignore list, then the beacons
+        // (`config.cpp:418-432`), each appended to the caller's list, keyed
+        // by this config's ports.
+        let invalid = |what| std::io::Error::new(std::io::ErrorKind::InvalidInput, what);
+        if let Some(v) = env::server_intf_addr_list_opt().map_err(invalid)? {
+            env::split_addr_into(&mut self.interfaces, v, self.tcp_port);
+        }
+        if let Some(v) = env::server_ignore_addr_list_opt().map_err(invalid)? {
+            let ep =
+                |(ip, port)| crate::config::Endpoint::from(std::net::SocketAddr::new(ip, port));
+            let mut ignore: Vec<_> = self.ignore_addrs.iter().copied().map(ep).collect();
+            env::split_addr_into(&mut ignore, v.into_iter().map(ep).collect(), 0);
+            self.ignore_addrs = ignore
+                .iter()
+                .map(|e| (e.addr.ip(), e.addr.port()))
+                .collect();
+        }
+        if let Some(v) = env::server_beacon_endpoints_on(self.udp_port) {
+            env::split_addr_into(&mut self.beacon_destinations, v, self.udp_port);
         }
         if let Some(v) = env::auto_beacon_addr_list_enabled_opt() {
             self.auto_beacon = v;
-        }
-        // PVX-82: a non-blank INTF list whose tokens all fail to resolve is
-        // a misconfiguration — record it so `PvaServer::start` refuses to
-        // bind rather than silently falling back to the wildcard. A blank /
-        // unset var leaves `interfaces` untouched (caller value preserved;
-        // empty ⟹ intentional wildcard at bind).
-        match env::server_intf_addr_list_checked() {
-            Ok(Some(v)) => self.interfaces = v,
-            Ok(None) => {}
-            Err(msg) => self.intf_addr_error = Some(msg),
         }
         if let Some(v) = env::send_timeout_secs_opt() {
             self.send_timeout = Duration::from_secs_f64(v);
@@ -540,17 +500,7 @@ impl PvaServerConfig {
         if let Some(c) = env::conn_timeout_secs_opt() {
             self.idle_timeout = Duration::from_secs_f64(env::effective_tcp_timeout_secs(c));
         }
-        // PVX-82 (IGNORE sibling): same all-unresolvable gate as INTF —
-        // a non-blank IGNORE list that resolves to nothing means the
-        // requested blocklist is silently empty; record it so
-        // `PvaServer::start` refuses rather than running unfiltered. A
-        // blank / unset var leaves a caller-supplied `ignore_addrs` intact.
-        match env::server_ignore_addr_list_checked() {
-            Ok(Some(v)) => self.ignore_addrs = v,
-            Ok(None) => {}
-            Err(msg) => self.ignore_addr_error = Some(msg),
-        }
-        self
+        Ok(self)
     }
 }
 
@@ -576,7 +526,7 @@ pub struct ClientCredentials {
     /// Account name (e.g., the `ca` auth's `user` field, or the x509
     /// leaf cert subject CommonName). Empty when the auth method does
     /// not carry one.
-    pub account: String,
+    pub account: epics_base_rs::types::PvString,
     /// Host identity of the peer, as the ACF `HAG(...)` gate matches it:
     /// the connection's peer address in numeric form, port stripped and
     /// IPv4-mapped IPv6 collapsed to IPv4 (QSRV `ioc/credentials.cpp:27-29`).
@@ -610,5 +560,5 @@ pub struct ClientCredentials {
     /// trusting it would let `account="nobody", roles=["admin"]` satisfy
     /// any group-gated rule — an ACL bypass. Every constructor funnels
     /// through `with_server_derived`, so a wire value can never reach here.
-    pub roles: Vec<String>,
+    pub roles: Vec<epics_base_rs::types::PvString>,
 }

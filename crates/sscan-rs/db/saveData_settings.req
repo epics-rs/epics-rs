@@ -1,0 +1,7 @@
+$(P)saveData_fileSystem.$
+$(P)saveData_subDir.$
+$(P)saveData_baseName.$
+$(P)saveData_scanNumber
+$(P)saveData_realTime1D
+$(P)saveData_maxAllowedRetries
+$(P)saveData_retryWaitInSecs

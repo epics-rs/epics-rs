@@ -12,8 +12,9 @@ use super::dbd_generated;
 use epics_base_rs::error::{CaError, CaResult};
 use epics_base_rs::server::database::AsyncDbHandle;
 use epics_base_rs::server::record::{
-    FieldDeclaration, FieldDesc, FieldMetadataOverride, OutTarget, ProcessAction, ProcessActions,
-    ProcessOutcome, Record,
+    CycleMarks, CyclePostMask, FieldDeclaration, FieldDesc, FieldMetadataOverride,
+    InputLinkRequest, LinkRead, LinkReadAs, OutTarget, ProcessAction, ProcessActions,
+    ProcessOutcome, Record, ReturnPact, StampPoint,
 };
 use epics_base_rs::types::{EpicsValue, PvString};
 
@@ -186,13 +187,14 @@ impl LinkKind {
     /// this question. `is_ca_link` is C's `dbInitLink` locality test, and
     /// `field_type` is `Some` only for a target the IOC can address right now
     /// — so an external link with no cached value is exactly C's
-    /// `dbCaIsLinkConnected() == 0`.
+    /// `dbCaIsLinkConnected() == 0`. Any other link is `Constant` only when
+    /// its type is, as `checkLinks` tests: a removed DB link is `PV_LINK`.
     fn from_target(target: &OutTarget) -> Self {
         match (target.is_ca_link, target.field_type.is_some()) {
             (true, true) => LinkKind::CaConnected,
             (true, false) => LinkKind::CaDisconnected,
-            (false, true) => LinkKind::Db,
-            (false, false) => LinkKind::Constant,
+            (false, _) if target.constant_type => LinkKind::Constant,
+            (false, _) => LinkKind::Db,
         }
     }
 }
@@ -384,12 +386,12 @@ pub struct TableRecord {
     pub ulzr: f64,
 
     // --- Motor drive output links (PV names) ---
-    pub m0xl: String,
-    pub m0yl: String,
-    pub m1yl: String,
-    pub m2xl: String,
-    pub m2yl: String,
-    pub m2zl: String,
+    pub m0xl: PvString,
+    pub m0yl: PvString,
+    pub m1yl: PvString,
+    pub m2xl: PvString,
+    pub m2yl: PvString,
+    pub m2zl: PvString,
 
     // --- Motor drive values ---
     pub m0x: f64,
@@ -400,12 +402,12 @@ pub struct TableRecord {
     pub m2z: f64,
 
     // --- Motor readback input links ---
-    pub r0xi: String,
-    pub r0yi: String,
-    pub r1yi: String,
-    pub r2xi: String,
-    pub r2yi: String,
-    pub r2zi: String,
+    pub r0xi: PvString,
+    pub r0yi: PvString,
+    pub r1yi: PvString,
+    pub r2xi: PvString,
+    pub r2yi: PvString,
+    pub r2zi: PvString,
 
     // --- Motor readback values ---
     pub r0x: f64,
@@ -416,12 +418,12 @@ pub struct TableRecord {
     pub r2z: f64,
 
     // --- Encoder input links ---
-    pub e0xi: String,
-    pub e0yi: String,
-    pub e1yi: String,
-    pub e2xi: String,
-    pub e2yi: String,
-    pub e2zi: String,
+    pub e0xi: PvString,
+    pub e0yi: PvString,
+    pub e1yi: PvString,
+    pub e2xi: PvString,
+    pub e2yi: PvString,
+    pub e2zi: PvString,
 
     // --- Encoder values ---
     pub e0x: f64,
@@ -432,12 +434,12 @@ pub struct TableRecord {
     pub e2z: f64,
 
     // --- Speed output links ---
-    pub v0xl: String,
-    pub v0yl: String,
-    pub v1yl: String,
-    pub v2xl: String,
-    pub v2yl: String,
-    pub v2zl: String,
+    pub v0xl: PvString,
+    pub v0yl: PvString,
+    pub v1yl: PvString,
+    pub v2xl: PvString,
+    pub v2yl: PvString,
+    pub v2zl: PvString,
 
     // --- Speed values ---
     pub v0x: f64,
@@ -448,20 +450,20 @@ pub struct TableRecord {
     pub v2z: f64,
 
     // --- Speed input links ---
-    pub v0xi: String,
-    pub v0yi: String,
-    pub v1yi: String,
-    pub v2xi: String,
-    pub v2yi: String,
-    pub v2zi: String,
+    pub v0xi: PvString,
+    pub v0yi: PvString,
+    pub v1yi: PvString,
+    pub v2xi: PvString,
+    pub v2yi: PvString,
+    pub v2zi: PvString,
 
     // --- Motor high limit input links ---
-    pub h0xl: String,
-    pub h0yl: String,
-    pub h1yl: String,
-    pub h2xl: String,
-    pub h2yl: String,
-    pub h2zl: String,
+    pub h0xl: PvString,
+    pub h0yl: PvString,
+    pub h1yl: PvString,
+    pub h2xl: PvString,
+    pub h2yl: PvString,
+    pub h2zl: PvString,
 
     // --- Motor high limit values ---
     pub h0x: f64,
@@ -472,12 +474,12 @@ pub struct TableRecord {
     pub h2z: f64,
 
     // --- Motor low limit input links ---
-    pub l0xl: String,
-    pub l0yl: String,
-    pub l1yl: String,
-    pub l2xl: String,
-    pub l2yl: String,
-    pub l2zl: String,
+    pub l0xl: PvString,
+    pub l0yl: PvString,
+    pub l1yl: PvString,
+    pub l2xl: PvString,
+    pub l2yl: PvString,
+    pub l2zl: PvString,
 
     // --- Motor low limit values ---
     pub l0x: f64,
@@ -527,13 +529,53 @@ pub struct TableRecord {
     link_kinds: [[LinkKind; 6]; 7],
 
     // --- Internal: this record's name and database handle ---
-    async_ctx: Option<(String, AsyncDbHandle)>,
+    async_ctx: Option<(epics_base_rs::types::RecordName, AsyncDbHandle)>,
 
     // --- Internal: previous angle unit (for conversion) ---
     curr_aunit: AngleUnit,
 
     // --- Internal: previous yaw angle (for the YANG offset rotation) ---
     curr_yang: f64,
+
+    /// `special()`'s posts owed by a put, a bit per [`SPECIAL_POSTS`] row; the
+    /// put drains them.
+    special_posts: u64,
+
+    // --- Internal: where the cycle resumes after its link-stage read ---
+    resume: Resume,
+}
+
+/// The read or put a cycle has in flight: C's `process()` reads and puts its
+/// links inline, the port in the link stage, one at a time, and picks the
+/// cycle up again from [`Record::link_read_result`] or
+/// [`Record::set_out_link_write_status`] at step `at` of `stage`'s loop.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct Resume {
+    stage: Stage,
+    at: usize,
+}
+
+/// A loop of `dbGetLink`s or `dbPutLink`s C's `process()` makes. Each returns
+/// at its first failure, leaving the later axes as they were.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+enum Stage {
+    /// No read in flight.
+    #[default]
+    Idle,
+    /// `GetReadback` ahead of SYNC's or INIT's branch (`tableRecord.c:461`,
+    /// `:494`), which runs after it.
+    Branch { init: bool },
+    /// `SaveMotorSpeeds` (`:536`), then the move from the motor positions
+    /// `sm` the cycle started at.
+    Speeds { sm: [f64; 6] },
+    /// The move's `dbPutLink`s, one per step `at`: `ProcessOutputLinks`'s
+    /// speeds (0-5) and drives (6-11), then `RestoreMotorSpeeds`'s saved
+    /// speeds `sv0x` (12-17) (`tableRecord.c:573-574`).
+    Move { sv0x: [f64; 6], mask: u8 },
+    /// The closing `GetReadback` (`:587`).
+    Readbacks,
+    /// The closing `ReadEncoders` (`:591`).
+    Encoders,
 }
 
 impl Default for TableRecord {
@@ -616,78 +658,78 @@ impl Default for TableRecord {
             ulxr: 0.0,
             ulyr: 0.0,
             ulzr: 0.0,
-            m0xl: String::new(),
-            m0yl: String::new(),
-            m1yl: String::new(),
-            m2xl: String::new(),
-            m2yl: String::new(),
-            m2zl: String::new(),
+            m0xl: PvString::new(),
+            m0yl: PvString::new(),
+            m1yl: PvString::new(),
+            m2xl: PvString::new(),
+            m2yl: PvString::new(),
+            m2zl: PvString::new(),
             m0x: 0.0,
             m0y: 0.0,
             m1y: 0.0,
             m2x: 0.0,
             m2y: 0.0,
             m2z: 0.0,
-            r0xi: String::new(),
-            r0yi: String::new(),
-            r1yi: String::new(),
-            r2xi: String::new(),
-            r2yi: String::new(),
-            r2zi: String::new(),
+            r0xi: PvString::new(),
+            r0yi: PvString::new(),
+            r1yi: PvString::new(),
+            r2xi: PvString::new(),
+            r2yi: PvString::new(),
+            r2zi: PvString::new(),
             r0x: 0.0,
             r0y: 0.0,
             r1y: 0.0,
             r2x: 0.0,
             r2y: 0.0,
             r2z: 0.0,
-            e0xi: String::new(),
-            e0yi: String::new(),
-            e1yi: String::new(),
-            e2xi: String::new(),
-            e2yi: String::new(),
-            e2zi: String::new(),
+            e0xi: PvString::new(),
+            e0yi: PvString::new(),
+            e1yi: PvString::new(),
+            e2xi: PvString::new(),
+            e2yi: PvString::new(),
+            e2zi: PvString::new(),
             e0x: 0.0,
             e0y: 0.0,
             e1y: 0.0,
             e2x: 0.0,
             e2y: 0.0,
             e2z: 0.0,
-            v0xl: String::new(),
-            v0yl: String::new(),
-            v1yl: String::new(),
-            v2xl: String::new(),
-            v2yl: String::new(),
-            v2zl: String::new(),
+            v0xl: PvString::new(),
+            v0yl: PvString::new(),
+            v1yl: PvString::new(),
+            v2xl: PvString::new(),
+            v2yl: PvString::new(),
+            v2zl: PvString::new(),
             v0x: 0.0,
             v0y: 0.0,
             v1y: 0.0,
             v2x: 0.0,
             v2y: 0.0,
             v2z: 0.0,
-            v0xi: String::new(),
-            v0yi: String::new(),
-            v1yi: String::new(),
-            v2xi: String::new(),
-            v2yi: String::new(),
-            v2zi: String::new(),
-            h0xl: String::new(),
-            h0yl: String::new(),
-            h1yl: String::new(),
-            h2xl: String::new(),
-            h2yl: String::new(),
-            h2zl: String::new(),
+            v0xi: PvString::new(),
+            v0yi: PvString::new(),
+            v1yi: PvString::new(),
+            v2xi: PvString::new(),
+            v2yi: PvString::new(),
+            v2zi: PvString::new(),
+            h0xl: PvString::new(),
+            h0yl: PvString::new(),
+            h1yl: PvString::new(),
+            h2xl: PvString::new(),
+            h2yl: PvString::new(),
+            h2zl: PvString::new(),
             h0x: 0.0,
             h0y: 0.0,
             h1y: 0.0,
             h2x: 0.0,
             h2y: 0.0,
             h2z: 0.0,
-            l0xl: String::new(),
-            l0yl: String::new(),
-            l1yl: String::new(),
-            l2xl: String::new(),
-            l2yl: String::new(),
-            l2zl: String::new(),
+            l0xl: PvString::new(),
+            l0yl: PvString::new(),
+            l1yl: PvString::new(),
+            l2xl: PvString::new(),
+            l2yl: PvString::new(),
+            l2zl: PvString::new(),
             l0x: 0.0,
             l0y: 0.0,
             l1y: 0.0,
@@ -722,6 +764,8 @@ impl Default for TableRecord {
             async_ctx: None,
             curr_aunit: AngleUnit::Degrees,
             curr_yang: 0.0,
+            special_posts: 0,
+            resume: Resume::default(),
         }
     }
 }
@@ -2116,32 +2160,217 @@ impl TableRecord {
         )
     }
 
-    /// Build ReadDbLink actions to read motor readbacks.
-    fn build_read_rbv_actions(&self) -> Vec<ProcessAction> {
-        let mut actions = Vec::new();
+    /// SYNC's branch after its `GetReadback` (`tableRecord.c:462-478`): the
+    /// drive follows the readbacks.
+    fn sync_to_readbacks(&mut self) {
+        let r = self.motor_readback();
+        let rb = self.do_motor_to_user(&r);
+        self.set_user_readback(&rb);
+
+        let ax0 = self.user_offset();
+        let mut ax = [0.0; 6];
+        let mut axl = [0.0; 6];
+        let mut m0x = [0.0; 6];
         for i in 0..6 {
-            if self.lnk_stat[i].can_rw_drive {
-                actions.push(ProcessAction::ReadDbLink {
-                    link_field: MOTOR_RBV_LINK[i],
-                    target_field: MOTOR_RBV_VAL[i],
-                });
-            }
+            m0x[i] = r[i];
+            ax[i] = rb[i];
+            axl[i] = ax[i] + ax0[i];
         }
-        actions
+        self.set_user_drive(&ax);
+        self.set_motor_drive(&m0x);
+        self.set_user_last(&axl);
+        self.sync = 0;
     }
 
-    /// Build ReadDbLink actions to read encoders.
-    fn build_read_encoder_actions(&self) -> Vec<ProcessAction> {
-        let mut actions = Vec::new();
+    /// INIT's branch (`tableRecord.c:480-503`): offsets zeroed, the drive
+    /// taken from the readbacks.
+    fn init_from_readbacks(&mut self) {
+        let ax0 = [0.0f64; 6];
+        let uhax = self.user_hi_abs();
+        let ulax = self.user_lo_abs();
+        let mut uhaxr = [0.0f64; 6];
+        let mut ulaxr = [0.0f64; 6];
         for i in 0..6 {
-            if self.lnk_stat[i].can_read_position {
-                actions.push(ProcessAction::ReadDbLink {
-                    link_field: ENCODER_LINK[i],
-                    target_field: ENCODER_VAL[i],
-                });
+            uhaxr[i] = uhax[i] - ax0[i];
+            ulaxr[i] = ulax[i] - ax0[i];
+        }
+        self.set_user_offset(&ax0);
+        self.set_user_hi_rel(&uhaxr);
+        self.set_user_lo_rel(&ulaxr);
+
+        let r = self.motor_readback();
+        let rb = self.do_motor_to_user(&r);
+        self.set_user_readback(&rb);
+
+        let mut ax = [0.0; 6];
+        let mut axl = [0.0; 6];
+        let mut m0x = [0.0; 6];
+        for i in 0..6 {
+            m0x[i] = r[i];
+            ax[i] = rb[i];
+            axl[i] = ax[i] + ax0[i];
+        }
+        self.set_user_drive(&ax);
+        self.set_motor_drive(&m0x);
+        self.set_user_last(&axl);
+        self.init = 0;
+    }
+
+    /// The move after `SaveMotorSpeeds` (`tableRecord.c:537-574`): speeds
+    /// scaled so every motor stops at once, then the writes.
+    fn move_motors(&mut self, sm: &[f64; 6]) -> Vec<ProcessAction> {
+        let m = self.motor_drive();
+        let sv0x = self.speed_val();
+
+        // Find which motors must move and max distance/speed
+        let mut motor_move_mask: u8 = 0;
+        let mut velo: f64 = 0.0;
+        let mut move_max: f64 = 0.0;
+
+        for i in 0..6 {
+            if self.lnk_stat[i].can_rw_speed && (m[i] - sm[i]).abs() > SMALL {
+                motor_move_mask |= 1 << i;
+                move_max = move_max.max((m[i] - sm[i]).abs());
+                velo = velo.max(sv0x[i]);
             }
         }
-        actions
+
+        if move_max > SMALL {
+            let mut v = [0.0f64; 6];
+            let mut speed_ratio = LARGE;
+            for i in 0..6 {
+                if self.lnk_stat[i].can_rw_speed {
+                    v[i] = velo * (m[i] - sm[i]).abs() / move_max;
+                    if v[i] > 0.0 {
+                        speed_ratio = speed_ratio.min(sv0x[i] / v[i]);
+                    }
+                }
+            }
+            if speed_ratio < 1.0 {
+                for vi in v.iter_mut() {
+                    *vi *= speed_ratio;
+                }
+            }
+            self.set_speed_val(&v);
+        } else {
+            self.set_speed_val(&sv0x);
+        }
+
+        self.next_write(sv0x, motor_move_mask, 0)
+    }
+
+    /// The move's put from step `from` on (see [`Stage::Move`]); past the
+    /// last, the tail every branch reaches.
+    fn next_write(&mut self, sv0x: [f64; 6], mask: u8, from: usize) -> Vec<ProcessAction> {
+        for at in from..18 {
+            let i = at % 6;
+            let action = match at / 6 {
+                0 => (mask & (1 << i) != 0 && self.lnk_stat[i].can_rw_speed).then(|| {
+                    ProcessAction::WriteDbLink {
+                        link_field: SPEED_OUT_LINK[i],
+                        value: EpicsValue::Double(self.speed_val()[i]),
+                    }
+                }),
+                1 => self.lnk_stat[i]
+                    .can_rw_drive
+                    .then(|| ProcessAction::WriteDbLink {
+                        link_field: MOTOR_DRIVE_LINK[i],
+                        value: EpicsValue::Double(self.motor_drive()[i]),
+                    }),
+                // Every speed-capable motor, moved or not (`:998-1006`); a
+                // failed put returns from `process()` with PACT set.
+                _ => self.lnk_stat[i]
+                    .can_rw_speed
+                    .then(|| ProcessAction::WriteDbLinkOrReturn {
+                        link_field: SPEED_OUT_LINK[i],
+                        value: EpicsValue::Double(sv0x[i]),
+                        pact: ReturnPact::Held,
+                    }),
+            };
+            if let Some(action) = action {
+                self.resume = Resume {
+                    stage: Stage::Move { sv0x, mask },
+                    at,
+                };
+                return vec![action];
+            }
+        }
+        self.resume = Resume::default();
+        self.close_cycle()
+    }
+
+    /// `stage`'s next read from axis `from`, zeroing the readback or encoder
+    /// of each axis its loop passes as C does; past the loop's end, what
+    /// follows it.
+    fn next_read(&mut self, stage: Stage, from: usize) -> Vec<ProcessAction> {
+        for i in from..6 {
+            let read = match stage {
+                Stage::Idle | Stage::Move { .. } => None,
+                Stage::Branch { .. } | Stage::Readbacks => {
+                    let mut r = self.motor_readback();
+                    r[i] = 0.0;
+                    self.set_motor_readback(&r);
+                    self.lnk_stat[i]
+                        .can_rw_drive
+                        .then_some((MOTOR_RBV_LINK[i], MOTOR_RBV_VAL[i]))
+                }
+                Stage::Speeds { .. } => self.lnk_stat[i]
+                    .can_rw_speed
+                    .then_some((SPEED_IN_LINK[i], SPEED_VAL[i])),
+                Stage::Encoders => {
+                    let mut e = self.encoder_motor();
+                    e[i] = 0.0;
+                    self.set_encoder_motor(&e);
+                    self.lnk_stat[i]
+                        .can_read_position
+                        .then_some((ENCODER_LINK[i], ENCODER_VAL[i]))
+                }
+            };
+            if let Some((link_field, target_field)) = read {
+                self.resume = Resume { stage, at: i };
+                return vec![ProcessAction::ReadDbLink {
+                    link_field,
+                    target_field,
+                }];
+            }
+        }
+        self.resume = Resume::default();
+        match stage {
+            Stage::Idle | Stage::Move { .. } => Vec::new(),
+            Stage::Branch { init } => {
+                if init {
+                    self.init_from_readbacks();
+                } else {
+                    self.sync_to_readbacks();
+                }
+                self.close_cycle()
+            }
+            Stage::Speeds { sm } => self.move_motors(&sm),
+            Stage::Readbacks => self.next_read(Stage::Encoders, 0),
+            Stage::Encoders => {
+                let r = self.motor_readback();
+                let rb = self.do_motor_to_user(&r);
+                self.set_user_readback(&rb);
+                let e = self.encoder_motor();
+                let eu = self.do_motor_to_user(&e);
+                self.set_encoder_user(&eu);
+                Vec::new()
+            }
+        }
+    }
+
+    /// The tail every branch reaches (`tableRecord.c:580-592`): the user-
+    /// coordinate copies and limits, then the closing reads.
+    fn close_cycle(&mut self) -> Vec<ProcessAction> {
+        let ax = self.user_drive();
+        let ax0 = self.user_offset();
+        let mut axl = [0.0; 6];
+        for i in 0..6 {
+            axl[i] = ax[i] + ax0[i];
+        }
+        self.set_user_last(&axl);
+        self.do_calc_user_limits();
+        self.next_read(Stage::Readbacks, 0)
     }
 
     /// Build ReadDbLink actions to read motor limits.
@@ -2159,66 +2388,6 @@ impl TableRecord {
                 });
             }
         }
-        actions
-    }
-
-    /// Build ReadDbLink actions to read motor speeds.
-    fn build_read_speed_actions(&self) -> Vec<ProcessAction> {
-        let mut actions = Vec::new();
-        for i in 0..6 {
-            if self.lnk_stat[i].can_rw_speed {
-                actions.push(ProcessAction::ReadDbLink {
-                    link_field: SPEED_IN_LINK[i],
-                    target_field: SPEED_VAL[i],
-                });
-            }
-        }
-        actions
-    }
-
-    /// Build WriteDbLink actions to write speed then drive values.
-    fn build_output_actions(
-        &self,
-        motor_move_mask: u8,
-        saved_speeds: &[f64; 6],
-    ) -> Vec<ProcessAction> {
-        let mut actions = Vec::new();
-        let speeds = self.speed_val();
-        let motors = self.motor_drive();
-
-        // Write speeds for motors that need to move
-        for i in 0..6 {
-            if (motor_move_mask & (1 << i)) != 0 && self.lnk_stat[i].can_rw_speed {
-                actions.push(ProcessAction::WriteDbLink {
-                    link_field: SPEED_OUT_LINK[i],
-                    value: EpicsValue::Double(speeds[i]),
-                });
-            }
-        }
-
-        // Write drive values for all connected motors
-        for i in 0..6 {
-            if self.lnk_stat[i].can_rw_drive {
-                actions.push(ProcessAction::WriteDbLink {
-                    link_field: MOTOR_DRIVE_LINK[i],
-                    value: EpicsValue::Double(motors[i]),
-                });
-            }
-        }
-
-        // Restore original speeds. C RestoreMotorSpeeds writes the saved speed
-        // to every can_RW_speed motor, NOT just the ones that moved
-        // (tableRecord.c:998-1006, called unconditionally at :574) — a
-        // stationary speed-capable motor still has its speed link restored.
-        for i in 0..6 {
-            if self.lnk_stat[i].can_rw_speed {
-                actions.push(ProcessAction::WriteDbLink {
-                    link_field: SPEED_OUT_LINK[i],
-                    value: EpicsValue::Double(saved_speeds[i]),
-                });
-            }
-        }
-
         actions
     }
 
@@ -2319,6 +2488,19 @@ impl TableRecord {
 // Record trait implementation
 // ===========================================================================
 
+/// `special()`'s literal-`DBE_VALUE` posts, in [`TableRecord::special_posts`] bit order.
+static SPECIAL_POSTS: [(epics_base_rs::server::record::FieldIx, CyclePostMask); 5] =
+    epics_base_rs::server::record::declared_post_table(
+        dbd_generated::TABLE_FIELDS,
+        [
+            ("SET", CyclePostMask::Value),
+            ("SYNC", CyclePostMask::Value),
+            ("INIT", CyclePostMask::Value),
+            ("ZERO", CyclePostMask::Value),
+            ("READ", CyclePostMask::Value),
+        ],
+    );
+
 /// Record-internal monitor posts that C `tableRecord.c` emits with a
 /// literal `DBE_VALUE` — never `DBE_LOG`. `monitor()` posts the thirteen
 /// six-element arrays plus `LVIO` with `monitor_mask = recGblResetAlarms |
@@ -2352,6 +2534,26 @@ const TABLE_VALUE_ONLY_FIELDS: &[&str] = &[
     "LVIO", "SYNC", "INIT", "ZERO", "READ", "SET", "AEGU",
 ];
 
+/// What a process cycle posts: `monitor()`'s arrays and LVIO, and the SYNC,
+/// INIT, ZERO or READ `process()` clears (tableRecord.c:449-503, :882-915).
+/// SET and AEGU, last above, post only from `special()`.
+const TABLE_PROCESS_POSTED: &[&str] = TABLE_VALUE_ONLY_FIELDS
+    .split_at(TABLE_VALUE_ONLY_FIELDS.len() - 2)
+    .0;
+static TABLE_PROCESS_POSTED_SET: [epics_base_rs::server::record::FieldIx;
+    TABLE_PROCESS_POSTED.len()] = {
+    let mut set = [epics_base_rs::server::record::FieldIx::UNDECLARED; TABLE_PROCESS_POSTED.len()];
+    let mut i = 0;
+    while i < set.len() {
+        set[i] = epics_base_rs::server::record::declared_field_ix(
+            dbd_generated::TABLE_FIELDS,
+            TABLE_PROCESS_POSTED[i],
+        );
+        i += 1;
+    }
+    set
+};
+
 /// Angle-class fields for which C `tableRecord.c::get_units` reports the
 /// angular engineering units `aegu` (tableRecord.c:758-768); every other
 /// field reports the linear units `legu` (the default branch, :770).
@@ -2365,7 +2567,12 @@ impl Record for TableRecord {
         "table"
     }
 
-    fn set_async_context(&mut self, name: String, db: AsyncDbHandle) {
+    /// `tableRecord.c:594`, after the motor puts and the `:576` return.
+    fn stamp_point(&self) -> StampPoint {
+        StampPoint::AfterLinkWrites
+    }
+
+    fn set_async_context(&mut self, name: epics_base_rs::types::RecordName, db: AsyncDbHandle) {
         self.async_ctx = Some((name, db));
     }
 
@@ -2379,6 +2586,7 @@ impl Record for TableRecord {
         let mut actions = Vec::new();
         self.check_links();
         self.lvio = 0;
+        self.resume = Resume::default();
 
         if self.zero != 0 {
             // --- Zero table ---
@@ -2403,55 +2611,9 @@ impl Record for TableRecord {
             // --- Read motors (readback done below) ---
             self.read = 0;
         } else if self.sync != 0 {
-            // --- Sync: read motor readbacks and set drive values to match ---
-            let r = self.motor_readback();
-            let rb = self.do_motor_to_user(&r);
-            self.set_user_readback(&rb);
-
-            let ax0 = self.user_offset();
-            let mut ax = [0.0; 6];
-            let mut axl = [0.0; 6];
-            let mut m0x = [0.0; 6];
-            for i in 0..6 {
-                m0x[i] = r[i];
-                ax[i] = rb[i];
-                axl[i] = ax[i] + ax0[i];
-            }
-            self.set_user_drive(&ax);
-            self.set_motor_drive(&m0x);
-            self.set_user_last(&axl);
-            self.sync = 0;
+            self.resume.stage = Stage::Branch { init: false };
         } else if self.init != 0 {
-            // --- Init: read motors, zero offsets, recalculate ---
-            let ax0 = [0.0f64; 6];
-            let uhax = self.user_hi_abs();
-            let ulax = self.user_lo_abs();
-            let mut uhaxr = [0.0f64; 6];
-            let mut ulaxr = [0.0f64; 6];
-            for i in 0..6 {
-                uhaxr[i] = uhax[i] - ax0[i];
-                ulaxr[i] = ulax[i] - ax0[i];
-            }
-            self.set_user_offset(&ax0);
-            self.set_user_hi_rel(&uhaxr);
-            self.set_user_lo_rel(&ulaxr);
-
-            let r = self.motor_readback();
-            let rb = self.do_motor_to_user(&r);
-            self.set_user_readback(&rb);
-
-            let mut ax = [0.0; 6];
-            let mut axl = [0.0; 6];
-            let mut m0x = [0.0; 6];
-            for i in 0..6 {
-                m0x[i] = r[i];
-                ax[i] = rb[i];
-                axl[i] = ax[i] + ax0[i];
-            }
-            self.set_user_drive(&ax);
-            self.set_motor_drive(&m0x);
-            self.set_user_last(&axl);
-            self.init = 0;
+            self.resume.stage = Stage::Branch { init: true };
         } else if self.set == SetMode::Set {
             // --- SET mode: update offsets ---
             let ax = self.user_drive();
@@ -2494,70 +2656,15 @@ impl Record for TableRecord {
                 }
                 self.set_user_drive(&ax_restored);
             } else {
-                // Save motor speeds, coordinate speeds, write outputs
-                let sv0x = self.speed_val();
-
-                // Find which motors must move and max distance/speed
-                let mut motor_move_mask: u8 = 0;
-                let mut velo: f64 = 0.0;
-                let mut move_max: f64 = 0.0;
-
-                for i in 0..6 {
-                    if self.lnk_stat[i].can_rw_speed && (m[i] - sm[i]).abs() > SMALL {
-                        motor_move_mask |= 1 << i;
-                        move_max = move_max.max((m[i] - sm[i]).abs());
-                        velo = velo.max(sv0x[i]);
-                    }
-                }
-
-                if move_max > SMALL {
-                    let mut v = [0.0f64; 6];
-                    let mut speed_ratio = LARGE;
-                    for i in 0..6 {
-                        if self.lnk_stat[i].can_rw_speed {
-                            v[i] = velo * (m[i] - sm[i]).abs() / move_max;
-                            if v[i] > 0.0 {
-                                speed_ratio = speed_ratio.min(sv0x[i] / v[i]);
-                            }
-                        }
-                    }
-                    if speed_ratio < 1.0 {
-                        for vi in v.iter_mut() {
-                            *vi *= speed_ratio;
-                        }
-                    }
-                    self.set_speed_val(&v);
-                } else {
-                    self.set_speed_val(&sv0x);
-                }
-
-                actions.extend(self.build_output_actions(motor_move_mask, &sv0x));
+                self.resume.stage = Stage::Speeds { sm };
             }
         }
 
-        // Save user-coordinate values (ignore offsets)
-        let ax = self.user_drive();
-        let ax0 = self.user_offset();
-        let mut axl = [0.0; 6];
-        for i in 0..6 {
-            axl[i] = ax[i] + ax0[i];
+        // SYNC, INIT and a move read first; every other branch closes now.
+        match self.resume.stage {
+            Stage::Idle => actions.extend(self.close_cycle()),
+            stage => actions.extend(self.next_read(stage, 0)),
         }
-        self.set_user_last(&axl);
-
-        // Calculate user limits
-        self.do_calc_user_limits();
-
-        // Read motor drive values and transform to offset user coordinates
-        let r = self.motor_readback();
-        let rb = self.do_motor_to_user(&r);
-        self.set_user_readback(&rb);
-
-        // Read encoders and transform to offset user coordinates
-        let e = self.encoder_motor();
-        let eu = self.do_motor_to_user(&e);
-        self.set_encoder_user(&eu);
-
-        // Pre-process actions (read links) are done via pre_process_actions
         Ok(ProcessOutcome::complete_with(actions))
     }
 
@@ -2597,11 +2704,53 @@ impl Record for TableRecord {
             .copied()
             .map(|link_field| ProcessAction::ResolveOutTarget { link_field })
             .collect();
-        actions.extend(self.build_read_rbv_actions());
-        actions.extend(self.build_read_encoder_actions());
         actions.extend(self.build_read_limit_actions());
-        actions.extend(self.build_read_speed_actions());
         actions.into()
+    }
+
+    /// Every `dbGetLink` table makes asks for `DBR_DOUBLE`.
+    fn input_link_request(&self, _link_field: &str) -> InputLinkRequest {
+        InputLinkRequest::As(LinkReadAs::Double)
+    }
+
+    /// Resumes the cycle after the read `Resume` holds; never asks which
+    /// link reported, so the cycle path compares no names.
+    fn link_read_result(&mut self, _link_field: &'static str, read: LinkRead) -> ProcessActions {
+        let Resume { stage, at } = self.resume;
+        let from = if matches!(read, LinkRead::Failed) {
+            6
+        } else {
+            at + 1
+        };
+        self.next_read(stage, from).into()
+    }
+
+    /// Resumes the move after the put `Resume` holds. A failed put ends
+    /// `ProcessOutputLinks` (`tableRecord.c:937-950`), whose status `process()`
+    /// discards, and ends `process()` in `RestoreMotorSpeeds`, where the
+    /// framework returns the status.
+    fn set_out_link_write_status(
+        &mut self,
+        _link_field: &'static str,
+        _value: &EpicsValue,
+        failed: bool,
+    ) -> ProcessActions {
+        let Resume {
+            stage: Stage::Move { sv0x, mask },
+            at,
+        } = self.resume
+        else {
+            return ProcessActions::new();
+        };
+        let from = match (failed, at) {
+            (false, _) => at + 1,
+            (true, ..12) => 12,
+            (true, _) => {
+                self.resume = Resume::default();
+                return ProcessActions::new();
+            }
+        };
+        self.next_write(sv0x, mask, from).into()
     }
 
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
@@ -2683,78 +2832,78 @@ impl Record for TableRecord {
             "ULXR" => Some(EpicsValue::Double(self.ulxr)),
             "ULYR" => Some(EpicsValue::Double(self.ulyr)),
             "ULZR" => Some(EpicsValue::Double(self.ulzr)),
-            "M0XL" => Some(EpicsValue::String(self.m0xl.clone().into())),
-            "M0YL" => Some(EpicsValue::String(self.m0yl.clone().into())),
-            "M1YL" => Some(EpicsValue::String(self.m1yl.clone().into())),
-            "M2XL" => Some(EpicsValue::String(self.m2xl.clone().into())),
-            "M2YL" => Some(EpicsValue::String(self.m2yl.clone().into())),
-            "M2ZL" => Some(EpicsValue::String(self.m2zl.clone().into())),
+            "M0XL" => Some(EpicsValue::String(self.m0xl.clone())),
+            "M0YL" => Some(EpicsValue::String(self.m0yl.clone())),
+            "M1YL" => Some(EpicsValue::String(self.m1yl.clone())),
+            "M2XL" => Some(EpicsValue::String(self.m2xl.clone())),
+            "M2YL" => Some(EpicsValue::String(self.m2yl.clone())),
+            "M2ZL" => Some(EpicsValue::String(self.m2zl.clone())),
             "M0X" => Some(EpicsValue::Double(self.m0x)),
             "M0Y" => Some(EpicsValue::Double(self.m0y)),
             "M1Y" => Some(EpicsValue::Double(self.m1y)),
             "M2X" => Some(EpicsValue::Double(self.m2x)),
             "M2Y" => Some(EpicsValue::Double(self.m2y)),
             "M2Z" => Some(EpicsValue::Double(self.m2z)),
-            "R0XI" => Some(EpicsValue::String(self.r0xi.clone().into())),
-            "R0YI" => Some(EpicsValue::String(self.r0yi.clone().into())),
-            "R1YI" => Some(EpicsValue::String(self.r1yi.clone().into())),
-            "R2XI" => Some(EpicsValue::String(self.r2xi.clone().into())),
-            "R2YI" => Some(EpicsValue::String(self.r2yi.clone().into())),
-            "R2ZI" => Some(EpicsValue::String(self.r2zi.clone().into())),
+            "R0XI" => Some(EpicsValue::String(self.r0xi.clone())),
+            "R0YI" => Some(EpicsValue::String(self.r0yi.clone())),
+            "R1YI" => Some(EpicsValue::String(self.r1yi.clone())),
+            "R2XI" => Some(EpicsValue::String(self.r2xi.clone())),
+            "R2YI" => Some(EpicsValue::String(self.r2yi.clone())),
+            "R2ZI" => Some(EpicsValue::String(self.r2zi.clone())),
             "R0X" => Some(EpicsValue::Double(self.r0x)),
             "R0Y" => Some(EpicsValue::Double(self.r0y)),
             "R1Y" => Some(EpicsValue::Double(self.r1y)),
             "R2X" => Some(EpicsValue::Double(self.r2x)),
             "R2Y" => Some(EpicsValue::Double(self.r2y)),
             "R2Z" => Some(EpicsValue::Double(self.r2z)),
-            "E0XI" => Some(EpicsValue::String(self.e0xi.clone().into())),
-            "E0YI" => Some(EpicsValue::String(self.e0yi.clone().into())),
-            "E1YI" => Some(EpicsValue::String(self.e1yi.clone().into())),
-            "E2XI" => Some(EpicsValue::String(self.e2xi.clone().into())),
-            "E2YI" => Some(EpicsValue::String(self.e2yi.clone().into())),
-            "E2ZI" => Some(EpicsValue::String(self.e2zi.clone().into())),
+            "E0XI" => Some(EpicsValue::String(self.e0xi.clone())),
+            "E0YI" => Some(EpicsValue::String(self.e0yi.clone())),
+            "E1YI" => Some(EpicsValue::String(self.e1yi.clone())),
+            "E2XI" => Some(EpicsValue::String(self.e2xi.clone())),
+            "E2YI" => Some(EpicsValue::String(self.e2yi.clone())),
+            "E2ZI" => Some(EpicsValue::String(self.e2zi.clone())),
             "E0X" => Some(EpicsValue::Double(self.e0x)),
             "E0Y" => Some(EpicsValue::Double(self.e0y)),
             "E1Y" => Some(EpicsValue::Double(self.e1y)),
             "E2X" => Some(EpicsValue::Double(self.e2x)),
             "E2Y" => Some(EpicsValue::Double(self.e2y)),
             "E2Z" => Some(EpicsValue::Double(self.e2z)),
-            "V0XL" => Some(EpicsValue::String(self.v0xl.clone().into())),
-            "V0YL" => Some(EpicsValue::String(self.v0yl.clone().into())),
-            "V1YL" => Some(EpicsValue::String(self.v1yl.clone().into())),
-            "V2XL" => Some(EpicsValue::String(self.v2xl.clone().into())),
-            "V2YL" => Some(EpicsValue::String(self.v2yl.clone().into())),
-            "V2ZL" => Some(EpicsValue::String(self.v2zl.clone().into())),
+            "V0XL" => Some(EpicsValue::String(self.v0xl.clone())),
+            "V0YL" => Some(EpicsValue::String(self.v0yl.clone())),
+            "V1YL" => Some(EpicsValue::String(self.v1yl.clone())),
+            "V2XL" => Some(EpicsValue::String(self.v2xl.clone())),
+            "V2YL" => Some(EpicsValue::String(self.v2yl.clone())),
+            "V2ZL" => Some(EpicsValue::String(self.v2zl.clone())),
             "V0X" => Some(EpicsValue::Double(self.v0x)),
             "V0Y" => Some(EpicsValue::Double(self.v0y)),
             "V1Y" => Some(EpicsValue::Double(self.v1y)),
             "V2X" => Some(EpicsValue::Double(self.v2x)),
             "V2Y" => Some(EpicsValue::Double(self.v2y)),
             "V2Z" => Some(EpicsValue::Double(self.v2z)),
-            "V0XI" => Some(EpicsValue::String(self.v0xi.clone().into())),
-            "V0YI" => Some(EpicsValue::String(self.v0yi.clone().into())),
-            "V1YI" => Some(EpicsValue::String(self.v1yi.clone().into())),
-            "V2XI" => Some(EpicsValue::String(self.v2xi.clone().into())),
-            "V2YI" => Some(EpicsValue::String(self.v2yi.clone().into())),
-            "V2ZI" => Some(EpicsValue::String(self.v2zi.clone().into())),
-            "H0XL" => Some(EpicsValue::String(self.h0xl.clone().into())),
-            "H0YL" => Some(EpicsValue::String(self.h0yl.clone().into())),
-            "H1YL" => Some(EpicsValue::String(self.h1yl.clone().into())),
-            "H2XL" => Some(EpicsValue::String(self.h2xl.clone().into())),
-            "H2YL" => Some(EpicsValue::String(self.h2yl.clone().into())),
-            "H2ZL" => Some(EpicsValue::String(self.h2zl.clone().into())),
+            "V0XI" => Some(EpicsValue::String(self.v0xi.clone())),
+            "V0YI" => Some(EpicsValue::String(self.v0yi.clone())),
+            "V1YI" => Some(EpicsValue::String(self.v1yi.clone())),
+            "V2XI" => Some(EpicsValue::String(self.v2xi.clone())),
+            "V2YI" => Some(EpicsValue::String(self.v2yi.clone())),
+            "V2ZI" => Some(EpicsValue::String(self.v2zi.clone())),
+            "H0XL" => Some(EpicsValue::String(self.h0xl.clone())),
+            "H0YL" => Some(EpicsValue::String(self.h0yl.clone())),
+            "H1YL" => Some(EpicsValue::String(self.h1yl.clone())),
+            "H2XL" => Some(EpicsValue::String(self.h2xl.clone())),
+            "H2YL" => Some(EpicsValue::String(self.h2yl.clone())),
+            "H2ZL" => Some(EpicsValue::String(self.h2zl.clone())),
             "H0X" => Some(EpicsValue::Double(self.h0x)),
             "H0Y" => Some(EpicsValue::Double(self.h0y)),
             "H1Y" => Some(EpicsValue::Double(self.h1y)),
             "H2X" => Some(EpicsValue::Double(self.h2x)),
             "H2Y" => Some(EpicsValue::Double(self.h2y)),
             "H2Z" => Some(EpicsValue::Double(self.h2z)),
-            "L0XL" => Some(EpicsValue::String(self.l0xl.clone().into())),
-            "L0YL" => Some(EpicsValue::String(self.l0yl.clone().into())),
-            "L1YL" => Some(EpicsValue::String(self.l1yl.clone().into())),
-            "L2XL" => Some(EpicsValue::String(self.l2xl.clone().into())),
-            "L2YL" => Some(EpicsValue::String(self.l2yl.clone().into())),
-            "L2ZL" => Some(EpicsValue::String(self.l2zl.clone().into())),
+            "L0XL" => Some(EpicsValue::String(self.l0xl.clone())),
+            "L0YL" => Some(EpicsValue::String(self.l0yl.clone())),
+            "L1YL" => Some(EpicsValue::String(self.l1yl.clone())),
+            "L2XL" => Some(EpicsValue::String(self.l2xl.clone())),
+            "L2YL" => Some(EpicsValue::String(self.l2yl.clone())),
+            "L2ZL" => Some(EpicsValue::String(self.l2zl.clone())),
             "L0X" => Some(EpicsValue::Double(self.l0x)),
             "L0Y" => Some(EpicsValue::Double(self.l0y)),
             "L1Y" => Some(EpicsValue::Double(self.l1y)),
@@ -2772,7 +2921,7 @@ impl Record for TableRecord {
             "LEGU" => Some(EpicsValue::String(self.legu.clone())),
             "AEGU" => Some(EpicsValue::String(self.aegu.clone())),
             "PREC" => Some(EpicsValue::Short(self.prec)),
-            "MMAP" => Some(EpicsValue::Long(self.mmap as i32)),
+            "MMAP" => Some(EpicsValue::ULong(self.mmap)),
             "GEOM" => Some(EpicsValue::Enum(self.geom as u16)),
             "TORAD" => Some(EpicsValue::Double(self.torad)),
             "AUNIT" => Some(EpicsValue::Enum(self.aunit as u16)),
@@ -2820,21 +2969,8 @@ impl Record for TableRecord {
                 }
             };
         }
-        macro_rules! put_string {
-            ($field:expr) => {
-                match value {
-                    EpicsValue::String(v) => {
-                        $field = v.as_str_lossy().into_owned();
-                        Ok(())
-                    }
-                    _ => Err(CaError::TypeMismatch(name.into())),
-                }
-            };
-        }
-        // Byte-faithful put for genuine DBF_STRING display fields
-        // (`tableRecord.dbd` LEGU/AEGU, `PvString`): store the wire bytes
-        // verbatim so a non-UTF-8 EGU round-trips unchanged. (The `*L`/`*I`
-        // motor fields above are DBF_OUTLINK/INLINK grammar — `put_string!`.)
+        // Byte-faithful put for the DBF_STRING display fields (LEGU/AEGU) and
+        // the motor link fields alike: C keeps both as the bytes given.
         macro_rules! put_pvstring {
             ($field:expr) => {
                 match value {
@@ -2878,15 +3014,88 @@ impl Record for TableRecord {
         }
 
         match name {
-            // Read-only fields
-            "VERS" | "AXL" | "AYL" | "AZL" | "XL" | "YL" | "ZL" | "AXRB" | "AYRB" | "AZRB"
-            | "XRB" | "YRB" | "ZRB" | "EAX" | "EAY" | "EAZ" | "EX" | "EY" | "EZ" | "HLAX"
-            | "HLAY" | "HLAZ" | "HLX" | "HLY" | "HLZ" | "LLAX" | "LLAY" | "LLAZ" | "LLX"
-            | "LLY" | "LLZ" | "M0X" | "M0Y" | "M1Y" | "M2X" | "M2Y" | "M2Z" | "R0X" | "R0Y"
-            | "R1Y" | "R2X" | "R2Y" | "R2Z" | "E0X" | "E0Y" | "E1Y" | "E2X" | "E2Y" | "E2Z"
-            | "V0X" | "V0Y" | "V1Y" | "V2X" | "V2Y" | "V2Z" | "H0X" | "H0Y" | "H1Y" | "H2X"
-            | "H2Y" | "H2Z" | "L0X" | "L0Y" | "L1Y" | "L2X" | "L2Y" | "L2Z" | "LVIO" | "MMAP"
-            | "TORAD" => Err(CaError::ReadOnlyField(name.into())),
+            "VERS" => match value {
+                EpicsValue::Float(v) => {
+                    self.vers = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch(name.into())),
+            },
+            "AXL" => put_double!(self.axl),
+            "AYL" => put_double!(self.ayl),
+            "AZL" => put_double!(self.azl),
+            "XL" => put_double!(self.xl),
+            "YL" => put_double!(self.yl),
+            "ZL" => put_double!(self.zl),
+            "AXRB" => put_double!(self.axrb),
+            "AYRB" => put_double!(self.ayrb),
+            "AZRB" => put_double!(self.azrb),
+            "XRB" => put_double!(self.xrb),
+            "YRB" => put_double!(self.yrb),
+            "ZRB" => put_double!(self.zrb),
+            "EAX" => put_double!(self.eax),
+            "EAY" => put_double!(self.eay),
+            "EAZ" => put_double!(self.eaz),
+            "EX" => put_double!(self.ex),
+            "EY" => put_double!(self.ey),
+            "EZ" => put_double!(self.ez),
+            "HLAX" => put_double!(self.hlax),
+            "HLAY" => put_double!(self.hlay),
+            "HLAZ" => put_double!(self.hlaz),
+            "HLX" => put_double!(self.hlx),
+            "HLY" => put_double!(self.hly),
+            "HLZ" => put_double!(self.hlz),
+            "LLAX" => put_double!(self.llax),
+            "LLAY" => put_double!(self.llay),
+            "LLAZ" => put_double!(self.llaz),
+            "LLX" => put_double!(self.llx),
+            "LLY" => put_double!(self.lly),
+            "LLZ" => put_double!(self.llz),
+            "TORAD" => put_double!(self.torad),
+            "LVIO" => put_short!(self.lvio),
+            "MMAP" => match value {
+                EpicsValue::ULong(v) => {
+                    self.mmap = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch(name.into())),
+            },
+            "M0X" => put_double!(self.m0x),
+            "M0Y" => put_double!(self.m0y),
+            "M1Y" => put_double!(self.m1y),
+            "M2X" => put_double!(self.m2x),
+            "M2Y" => put_double!(self.m2y),
+            "M2Z" => put_double!(self.m2z),
+            "R0X" => put_double!(self.r0x),
+            "R0Y" => put_double!(self.r0y),
+            "R1Y" => put_double!(self.r1y),
+            "R2X" => put_double!(self.r2x),
+            "R2Y" => put_double!(self.r2y),
+            "R2Z" => put_double!(self.r2z),
+            "E0X" => put_double!(self.e0x),
+            "E0Y" => put_double!(self.e0y),
+            "E1Y" => put_double!(self.e1y),
+            "E2X" => put_double!(self.e2x),
+            "E2Y" => put_double!(self.e2y),
+            "E2Z" => put_double!(self.e2z),
+            "V0X" => put_double!(self.v0x),
+            "V0Y" => put_double!(self.v0y),
+            "V1Y" => put_double!(self.v1y),
+            "V2X" => put_double!(self.v2x),
+            "V2Y" => put_double!(self.v2y),
+            "V2Z" => put_double!(self.v2z),
+            "H0X" => put_double!(self.h0x),
+            "H0Y" => put_double!(self.h0y),
+            "H1Y" => put_double!(self.h1y),
+            "H2X" => put_double!(self.h2x),
+            "H2Y" => put_double!(self.h2y),
+            "H2Z" => put_double!(self.h2z),
+            "L0X" => put_double!(self.l0x),
+            "L0Y" => put_double!(self.l0y),
+            "L1Y" => put_double!(self.l1y),
+            "L2X" => put_double!(self.l2x),
+            "L2Y" => put_double!(self.l2y),
+            "L2Z" => put_double!(self.l2z),
 
             "VAL" => put_double!(self.val),
             "LX" => put_double!(self.lx),
@@ -2934,48 +3143,48 @@ impl Record for TableRecord {
             "ULXR" => put_double!(self.ulxr),
             "ULYR" => put_double!(self.ulyr),
             "ULZR" => put_double!(self.ulzr),
-            "M0XL" => put_string!(self.m0xl),
-            "M0YL" => put_string!(self.m0yl),
-            "M1YL" => put_string!(self.m1yl),
-            "M2XL" => put_string!(self.m2xl),
-            "M2YL" => put_string!(self.m2yl),
-            "M2ZL" => put_string!(self.m2zl),
-            "R0XI" => put_string!(self.r0xi),
-            "R0YI" => put_string!(self.r0yi),
-            "R1YI" => put_string!(self.r1yi),
-            "R2XI" => put_string!(self.r2xi),
-            "R2YI" => put_string!(self.r2yi),
-            "R2ZI" => put_string!(self.r2zi),
-            "E0XI" => put_string!(self.e0xi),
-            "E0YI" => put_string!(self.e0yi),
-            "E1YI" => put_string!(self.e1yi),
-            "E2XI" => put_string!(self.e2xi),
-            "E2YI" => put_string!(self.e2yi),
-            "E2ZI" => put_string!(self.e2zi),
-            "V0XL" => put_string!(self.v0xl),
-            "V0YL" => put_string!(self.v0yl),
-            "V1YL" => put_string!(self.v1yl),
-            "V2XL" => put_string!(self.v2xl),
-            "V2YL" => put_string!(self.v2yl),
-            "V2ZL" => put_string!(self.v2zl),
-            "V0XI" => put_string!(self.v0xi),
-            "V0YI" => put_string!(self.v0yi),
-            "V1YI" => put_string!(self.v1yi),
-            "V2XI" => put_string!(self.v2xi),
-            "V2YI" => put_string!(self.v2yi),
-            "V2ZI" => put_string!(self.v2zi),
-            "H0XL" => put_string!(self.h0xl),
-            "H0YL" => put_string!(self.h0yl),
-            "H1YL" => put_string!(self.h1yl),
-            "H2XL" => put_string!(self.h2xl),
-            "H2YL" => put_string!(self.h2yl),
-            "H2ZL" => put_string!(self.h2zl),
-            "L0XL" => put_string!(self.l0xl),
-            "L0YL" => put_string!(self.l0yl),
-            "L1YL" => put_string!(self.l1yl),
-            "L2XL" => put_string!(self.l2xl),
-            "L2YL" => put_string!(self.l2yl),
-            "L2ZL" => put_string!(self.l2zl),
+            "M0XL" => put_pvstring!(self.m0xl),
+            "M0YL" => put_pvstring!(self.m0yl),
+            "M1YL" => put_pvstring!(self.m1yl),
+            "M2XL" => put_pvstring!(self.m2xl),
+            "M2YL" => put_pvstring!(self.m2yl),
+            "M2ZL" => put_pvstring!(self.m2zl),
+            "R0XI" => put_pvstring!(self.r0xi),
+            "R0YI" => put_pvstring!(self.r0yi),
+            "R1YI" => put_pvstring!(self.r1yi),
+            "R2XI" => put_pvstring!(self.r2xi),
+            "R2YI" => put_pvstring!(self.r2yi),
+            "R2ZI" => put_pvstring!(self.r2zi),
+            "E0XI" => put_pvstring!(self.e0xi),
+            "E0YI" => put_pvstring!(self.e0yi),
+            "E1YI" => put_pvstring!(self.e1yi),
+            "E2XI" => put_pvstring!(self.e2xi),
+            "E2YI" => put_pvstring!(self.e2yi),
+            "E2ZI" => put_pvstring!(self.e2zi),
+            "V0XL" => put_pvstring!(self.v0xl),
+            "V0YL" => put_pvstring!(self.v0yl),
+            "V1YL" => put_pvstring!(self.v1yl),
+            "V2XL" => put_pvstring!(self.v2xl),
+            "V2YL" => put_pvstring!(self.v2yl),
+            "V2ZL" => put_pvstring!(self.v2zl),
+            "V0XI" => put_pvstring!(self.v0xi),
+            "V0YI" => put_pvstring!(self.v0yi),
+            "V1YI" => put_pvstring!(self.v1yi),
+            "V2XI" => put_pvstring!(self.v2xi),
+            "V2YI" => put_pvstring!(self.v2yi),
+            "V2ZI" => put_pvstring!(self.v2zi),
+            "H0XL" => put_pvstring!(self.h0xl),
+            "H0YL" => put_pvstring!(self.h0yl),
+            "H1YL" => put_pvstring!(self.h1yl),
+            "H2XL" => put_pvstring!(self.h2xl),
+            "H2YL" => put_pvstring!(self.h2yl),
+            "H2ZL" => put_pvstring!(self.h2zl),
+            "L0XL" => put_pvstring!(self.l0xl),
+            "L0YL" => put_pvstring!(self.l0yl),
+            "L1YL" => put_pvstring!(self.l1yl),
+            "L2XL" => put_pvstring!(self.l2xl),
+            "L2YL" => put_pvstring!(self.l2yl),
+            "L2ZL" => put_pvstring!(self.l2zl),
             "INIT" => put_short!(self.init),
             "ZERO" => put_short!(self.zero),
             "SYNC" => put_short!(self.sync),
@@ -3017,60 +3226,6 @@ impl Record for TableRecord {
             "PPO1" => put_dbaddr_array!(self.ppo1.iter_mut()),
             "PPO2" => put_dbaddr_array!(self.ppo2.iter_mut()),
             _ => Err(CaError::FieldNotFound(name.into())),
-        }
-    }
-
-    fn put_field_internal(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
-        // Allow the framework to write read-only motor/encoder/limit/speed fields
-        macro_rules! put_double_internal {
-            ($field:expr) => {
-                match value {
-                    EpicsValue::Double(v) => {
-                        $field = v;
-                        Ok(())
-                    }
-                    _ => Err(CaError::TypeMismatch(name.into())),
-                }
-            };
-        }
-        match name {
-            "M0X" => put_double_internal!(self.m0x),
-            "M0Y" => put_double_internal!(self.m0y),
-            "M1Y" => put_double_internal!(self.m1y),
-            "M2X" => put_double_internal!(self.m2x),
-            "M2Y" => put_double_internal!(self.m2y),
-            "M2Z" => put_double_internal!(self.m2z),
-            "R0X" => put_double_internal!(self.r0x),
-            "R0Y" => put_double_internal!(self.r0y),
-            "R1Y" => put_double_internal!(self.r1y),
-            "R2X" => put_double_internal!(self.r2x),
-            "R2Y" => put_double_internal!(self.r2y),
-            "R2Z" => put_double_internal!(self.r2z),
-            "E0X" => put_double_internal!(self.e0x),
-            "E0Y" => put_double_internal!(self.e0y),
-            "E1Y" => put_double_internal!(self.e1y),
-            "E2X" => put_double_internal!(self.e2x),
-            "E2Y" => put_double_internal!(self.e2y),
-            "E2Z" => put_double_internal!(self.e2z),
-            "V0X" => put_double_internal!(self.v0x),
-            "V0Y" => put_double_internal!(self.v0y),
-            "V1Y" => put_double_internal!(self.v1y),
-            "V2X" => put_double_internal!(self.v2x),
-            "V2Y" => put_double_internal!(self.v2y),
-            "V2Z" => put_double_internal!(self.v2z),
-            "H0X" => put_double_internal!(self.h0x),
-            "H0Y" => put_double_internal!(self.h0y),
-            "H1Y" => put_double_internal!(self.h1y),
-            "H2X" => put_double_internal!(self.h2x),
-            "H2Y" => put_double_internal!(self.h2y),
-            "H2Z" => put_double_internal!(self.h2z),
-            "L0X" => put_double_internal!(self.l0x),
-            "L0Y" => put_double_internal!(self.l0y),
-            "L1Y" => put_double_internal!(self.l1y),
-            "L2X" => put_double_internal!(self.l2x),
-            "L2Y" => put_double_internal!(self.l2y),
-            "L2Z" => put_double_internal!(self.l2z),
-            _ => self.put_field(name, value),
         }
     }
 
@@ -3143,21 +3298,27 @@ impl Record for TableRecord {
             }
             "SSET" => {
                 self.set = SetMode::Set;
+                self.special_posts |= 1;
             }
             "SUSE" => {
                 self.set = SetMode::Use;
+                self.special_posts |= 1;
             }
             "SYNC" => {
                 self.sync = 1;
+                self.special_posts |= 1 << 1;
             }
             "INIT" => {
                 self.init = 1;
+                self.special_posts |= 1 << 2;
             }
             "ZERO" => {
                 self.zero = 1;
+                self.special_posts |= 1 << 3;
             }
             "READ" => {
                 self.read = 1;
+                self.special_posts |= 1 << 4;
             }
             "AUNIT" => {
                 // Update angle unit label and conversion
@@ -3203,23 +3364,30 @@ impl Record for TableRecord {
         dbd_generated::TABLE_FIELDS
     }
 
+    fn declared_dbaddr_fields(&self) -> Option<&'static [&'static str]> {
+        Some(dbd_generated::TABLE_DBADDR)
+    }
+
     /// C `tableRecord.c` posts every record-internal change with a literal
     /// `DBE_VALUE` (no `DBE_LOG`); see `TABLE_VALUE_ONLY_FIELDS`.
     fn value_only_change_fields(&self) -> &'static [&'static str] {
         TABLE_VALUE_ONLY_FIELDS
     }
 
-    /// C `tableRecord.c::special()` flips SET mode on an `SSET`/`SUSE` write
-    /// and posts `SET` with `DBE_VALUE` (tableRecord.c:658-663). Neither
-    /// `SSET` nor `SUSE` is `pp(TRUE)`, so no process cycle posts `SET`; the
-    /// framework posts it here as a side effect of the put. `SET` is named in
-    /// `TABLE_VALUE_ONLY_FIELDS`, so the side-effect post carries
-    /// `DBE_VALUE` only — matching C's literal mask.
-    fn monitor_side_effect_fields(&self, put_field: &str) -> &'static [&'static str] {
-        match put_field {
-            "SSET" | "SUSE" => &["SET"],
-            _ => &[],
-        }
+    /// C writes VAL, UDF and the motor readbacks, speeds and limits without
+    /// posting them.
+    fn process_posted_fields(&self) -> Option<epics_base_rs::server::record::DeclaredFields> {
+        Some(&TABLE_PROCESS_POSTED_SET)
+    }
+
+    /// C `tableRecord.c::special()` posts SET on an `SSET`/`SUSE` write, and
+    /// SYNC, INIT, ZERO or READ on its own write, each with a literal
+    /// `DBE_VALUE` (tableRecord.c:658-679).
+    fn take_cycle_posted_fields(&mut self) -> CycleMarks {
+        CycleMarks::of(
+            &SPECIAL_POSTS,
+            u128::from(std::mem::take(&mut self.special_posts)),
+        )
     }
 
     /// Per-field metadata C `tableRecord.c` serves through its RSET callbacks:
@@ -3350,6 +3518,13 @@ impl Record for TableRecord {
         Ok(())
     }
 
+    /// C `init_record` ends in `monitor(ptbl)` (`tableRecord.c:405`), whose
+    /// `recGblResetAlarms` (`:882`) clears the born UDF/INVALID with no
+    /// `checkAlarms` before it; UDF stays 1 until `process()` (`:437`).
+    fn init_resets_alarms(&self) -> bool {
+        true
+    }
+
     fn as_any_mut(&mut self) -> Option<&mut dyn Any> {
         Some(self)
     }
@@ -3363,6 +3538,58 @@ impl Record for TableRecord {
 #[allow(clippy::excessive_precision, clippy::needless_range_loop)]
 mod tests {
     use super::*;
+
+    /// The declared name a post table entry `ix` stands for.
+    fn name(ix: epics_base_rs::server::record::FieldIx) -> &'static str {
+        epics_base_rs::server::record::field_at(dbd_generated::TABLE_FIELDS, ix)
+            .expect("declared")
+            .name
+    }
+
+    /// The link a read result names is never looked at: the cycle resumes
+    /// from the read [`Resume`] holds, so no name is compared on the way.
+    #[test]
+    fn link_read_result_resumes_from_its_own_cursor() {
+        let mut t = TableRecord::default();
+        t.lnk_stat[0].can_rw_drive = true;
+        t.lnk_stat[1].can_rw_drive = true;
+        let reads = |actions: Vec<ProcessAction>| -> Vec<&'static str> {
+            actions
+                .iter()
+                .map(|a| match a {
+                    ProcessAction::ReadDbLink { link_field, .. } => *link_field,
+                    other => panic!("{other:?}"),
+                })
+                .collect()
+        };
+        assert_eq!(reads(t.next_read(Stage::Readbacks, 0)), ["R0XI"]);
+        let next = t.link_read_result("not a link", LinkRead::Succeeded);
+        assert_eq!(reads(next.into_vec()), ["R0YI"]);
+        let next = t.link_read_result("not a link", LinkRead::Failed);
+        assert!(next.into_vec().is_empty());
+        assert_eq!(t.resume, Resume::default());
+    }
+
+    /// `field_is_dbaddr` answers from the generated `SPC_DBADDR` list, which
+    /// is the `.dbd`'s declared special on every field.
+    #[test]
+    fn the_dbaddr_list_is_the_generated_one() {
+        use epics_base_rs::server::record::{FieldDeclaration, Special};
+
+        let rec = TableRecord::new();
+        assert!(std::ptr::eq(
+            rec.declared_dbaddr_fields().unwrap(),
+            dbd_generated::record_dbaddr_fields("table").unwrap()
+        ));
+        for desc in rec.field_list() {
+            assert_eq!(
+                rec.field_is_dbaddr(desc.name),
+                desc.declared_special == Special::DbAddr,
+                "{}",
+                desc.name
+            );
+        }
+    }
 
     /// Helper: create a table record with SRI geometry and typical dimensions.
     fn make_sri_table() -> TableRecord {
@@ -3893,11 +4120,11 @@ mod tests {
         t.put_field("AX", EpicsValue::Double(1.5)).unwrap();
         assert_eq!(t.get_field("AX"), Some(EpicsValue::Double(1.5)));
 
-        // Read-only field
-        assert!(t.put_field("AXRB", EpicsValue::Double(1.0)).is_err());
-
-        // put_field_internal bypasses read-only
-        assert!(t.put_field_internal("R0X", EpicsValue::Double(3.0)).is_ok());
+        // A SPC_NOMOD field is stored; the database's gate refuses a client put.
+        t.put_field("AXRB", EpicsValue::Double(1.0)).unwrap();
+        assert_eq!(t.get_field("AXRB"), Some(EpicsValue::Double(1.0)));
+        t.put_field_internal("R0X", EpicsValue::Double(3.0))
+            .unwrap();
         assert_eq!(t.get_field("R0X"), Some(EpicsValue::Double(3.0)));
 
         // Field not found
@@ -3964,6 +4191,34 @@ mod tests {
         assert_eq!(t.curr_yang, 90.0);
     }
 
+    /// Runs the move's put chain from `next`, failing the puts `fails` names
+    /// by their place in the chain: (returns, link, value) per put.
+    fn run_puts(
+        t: &mut TableRecord,
+        mut next: Vec<ProcessAction>,
+        fails: &[usize],
+    ) -> Vec<(bool, &'static str, f64)> {
+        let mut puts = Vec::new();
+        while let [action] = next.as_slice() {
+            let (returns, link_field, value) = match action {
+                ProcessAction::WriteDbLink { link_field, value } => (false, *link_field, value),
+                ProcessAction::WriteDbLinkOrReturn {
+                    link_field, value, ..
+                } => (true, *link_field, value),
+                _ => break,
+            };
+            puts.push((returns, link_field, value.to_f64().unwrap()));
+            next = t
+                .set_out_link_write_status(
+                    link_field,
+                    &value.clone(),
+                    fails.contains(&(puts.len() - 1)),
+                )
+                .into_vec();
+        }
+        puts
+    }
+
     #[test]
     fn test_speed_restore_covers_all_speed_capable_motors() {
         // C RestoreMotorSpeeds restores the saved speed on EVERY can_RW_speed
@@ -3973,23 +4228,45 @@ mod tests {
             t.lnk_stat[i].can_rw_speed = i < 2; // motors 0 and 1 speed-capable
             t.lnk_stat[i].can_rw_drive = false;
         }
+        t.v0x = 5.0;
         let saved = [11.0, 22.0, 0.0, 0.0, 0.0, 0.0];
 
         // Only motor 0 is in the move mask; motor 1 stays put.
-        let actions = t.build_output_actions(0b01, &saved);
-
-        let restored = |link: &str, want: f64| {
-            actions.iter().any(|a| {
-                matches!(a,
-                    ProcessAction::WriteDbLink { link_field, value: EpicsValue::Double(v) }
-                    if *link_field == link && (*v - want).abs() < 1e-12)
-            })
-        };
-        assert!(restored("V0XL", 11.0), "moving motor 0 speed restored");
-        assert!(
-            restored("V0YL", 22.0),
-            "stationary speed-capable motor 1 speed restored"
+        let next = t.next_write(saved, 0b01, 0);
+        assert_eq!(
+            run_puts(&mut t, next, &[]),
+            [
+                (false, "V0XL", 5.0),
+                (true, "V0XL", 11.0),
+                (true, "V0YL", 22.0)
+            ]
         );
+    }
+
+    #[test]
+    fn test_a_failed_put_ends_its_loop() {
+        // ProcessOutputLinks returns at a failed put and process() goes on to
+        // RestoreMotorSpeeds (tableRecord.c:937-950, :573-574), which returns
+        // at its own first failure.
+        let mut t = TableRecord::new();
+        for i in 0..6 {
+            t.lnk_stat[i].can_rw_speed = i < 2;
+            t.lnk_stat[i].can_rw_drive = i < 2;
+        }
+        t.v0x = 5.0;
+        t.v0y = 6.0;
+        t.m0x = 1.0;
+        t.m0y = 2.0;
+        let saved = [11.0, 22.0, 0.0, 0.0, 0.0, 0.0];
+
+        let next = t.next_write(saved, 0b11, 0);
+        // V0XL's speed fails: V0YL's speed and both drives are skipped. The
+        // first restore fails: V0YL's is never put.
+        assert_eq!(
+            run_puts(&mut t, next, &[0, 1]),
+            [(false, "V0XL", 5.0), (true, "V0XL", 11.0)]
+        );
+        assert_eq!(t.resume, Resume::default());
     }
 
     #[test]
@@ -4109,22 +4386,31 @@ mod tests {
     }
 
     #[test]
-    fn test_sset_suse_post_set_as_side_effect() {
-        let t = TableRecord::new();
+    fn test_special_posts_its_flag_as_side_effect() {
+        let mut t = TableRecord::new();
 
-        // C special() flips SET mode on SSET/SUSE and posts SET with
-        // DBE_VALUE; SSET/SUSE are not pp, so the SET monitor must come from
-        // the side-effect post, not a process cycle.
-        assert_eq!(t.monitor_side_effect_fields("SSET"), &["SET"]);
-        assert_eq!(t.monitor_side_effect_fields("SUSE"), &["SET"]);
-        // Unrelated puts trigger no side-effect post.
-        assert!(t.monitor_side_effect_fields("AX").is_empty());
-        assert!(t.monitor_side_effect_fields("SYNC").is_empty());
-
-        // SET is a value-only field, so the framework strips the LOG bit from
-        // the side-effect post — the SET monitor carries DBE_VALUE alone,
-        // matching C's literal db_post_events(set, DBE_VALUE).
-        assert!(t.value_only_change_fields().contains(&"SET"));
+        // C special() posts SET on SSET/SUSE, and SYNC/INIT/ZERO/READ on their
+        // own put, each with a literal DBE_VALUE (tableRecord.c:658-679).
+        for (field, want) in [
+            ("SSET", Some("SET")),
+            ("SUSE", Some("SET")),
+            ("AX", None),
+            ("SYNC", Some("SYNC")),
+            ("INIT", Some("INIT")),
+            ("ZERO", Some("ZERO")),
+            ("READ", Some("READ")),
+        ] {
+            t.on_put(field);
+            let posts: Vec<_> = t
+                .take_cycle_posted_fields()
+                .map(|(f, m)| (name(f), m))
+                .collect();
+            let want: Vec<_> = want
+                .map(|f| (f, CyclePostMask::Value))
+                .into_iter()
+                .collect();
+            assert_eq!(posts, want, "{field}");
+        }
     }
 
     #[test]
@@ -5371,7 +5657,7 @@ mod menu_choice_tests {
     fn table_geom_snapshot_carries_labels() {
         let mut rec = TableRecord::new();
         rec.geom = Geometry::Newport; // index 2
-        let inst = RecordInstance::new("TBL:GEOM".into(), rec);
+        let inst = RecordInstance::new("TBL:GEOM", rec);
 
         let snap = inst.snapshot_for_field("GEOM").unwrap();
         assert_eq!(snap.value, EpicsValue::Enum(2));
@@ -5407,6 +5693,40 @@ mod menu_choice_tests {
 }
 
 #[cfg(test)]
+mod init_alarm_tests {
+    use super::TableRecord;
+    use epics_base_rs::server::ioc_builder::IocBuilder;
+    use epics_base_rs::types::EpicsValue;
+    use std::collections::HashMap;
+
+    // RTEMS-EXEC-MODEL-ALLOW(1): checked - runs and passes in the exec-backend
+    // suite.
+
+    /// oracleTableIoc `table.db` (one default table): after iocInit `T.UDF`
+    /// reads 1 and `T.STAT`/`T.SEVR` read NO_ALARM, and a `caput T.SSET 1`
+    /// leaves them so — `init_record`'s `monitor()` (`tableRecord.c:405`)
+    /// runs `recGblResetAlarms` (`:882`) without `checkAlarms`.
+    #[tokio::test]
+    async fn init_resets_alarms_but_keeps_udf() {
+        let (db, _autosave) = IocBuilder::new()
+            .register_record_type("table", || Box::new(TableRecord::default()))
+            .db_string("record(table, \"T\") {}\n", &HashMap::new())
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        db.put_record_field_from_ca("T", "SSET", EpicsValue::Short(1))
+            .await
+            .unwrap();
+        let rec = db.get_record("T").expect("table record loaded");
+        let inst = rec.read();
+        assert_eq!(inst.get_common_field("UDF"), Some(EpicsValue::UChar(1)));
+        assert_eq!(inst.get_common_field("STAT"), Some(EpicsValue::Short(0)));
+        assert_eq!(inst.get_common_field("SEVR"), Some(EpicsValue::Short(0)));
+    }
+}
+
+#[cfg(test)]
 mod rset_routing_tests {
     use super::TableRecord;
     use epics_base_rs::server::record::RecordInstance;
@@ -5421,7 +5741,7 @@ mod rset_routing_tests {
     /// leaves.
     #[test]
     fn table_val_takes_the_recgbl_range_not_an_empty_cache() {
-        let inst = RecordInstance::new("TBL:LIM".into(), TableRecord::new());
+        let inst = RecordInstance::new("TBL:LIM", TableRecord::new());
         let snap = inst.snapshot_for_field("VAL").unwrap();
 
         assert!(
@@ -5441,7 +5761,7 @@ mod rset_routing_tests {
         let mut rec = TableRecord::new();
         rec.set_calc_hi_limit(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
         rec.set_calc_lo_limit(&[-1.0, -2.0, -3.0, -4.0, -5.0, -6.0]);
-        let inst = RecordInstance::new("TBL:LIM".into(), rec);
+        let inst = RecordInstance::new("TBL:LIM", rec);
 
         let snap = inst.snapshot_for_field("AX").unwrap();
         assert_eq!(snap.display_limits(), Some((-1.0, 1.0)));

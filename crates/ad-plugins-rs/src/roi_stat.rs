@@ -9,22 +9,24 @@ use std::sync::Arc;
 use ad_core_rs::ndarray::{NDArray, NDDataBuffer};
 use ad_core_rs::ndarray_pool::NDArrayPool;
 use ad_core_rs::plugin::runtime::{
-    NDPluginProcess, ParamUpdate, PluginParamSnapshot, PluginRuntimeHandle, ProcessResult,
+    ArraySource, NDPluginProcess, ParamUpdate, PluginParamSnapshot, PluginRuntimeHandle,
+    ProcessResult,
 };
 use ad_core_rs::plugin::wiring::WiringRegistry;
 use asyn_rs::param::ParamType;
+use asyn_rs::port::InterfaceMask;
 use asyn_rs::port::PortDriverBase;
 use parking_lot::{MappedMutexGuard, Mutex, MutexGuard};
 
 #[cfg(feature = "parallel")]
 use crate::par_util;
 use crate::stats::{StatsElem, merge_range};
-use crate::time_series::{TimeSeriesData, TimeSeriesSender};
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
 
-/// Configuration for a single ROI region.
-#[derive(Debug, Clone)]
+/// Configuration for a single ROI region. The default is NDPluginROIStat.cpp's
+/// starting ROI: Use 0 (`:557`) and zero geometry.
+#[derive(Debug, Clone, Default)]
 pub struct ROIStatROI {
     pub enabled: bool,
     /// Offset in pixels: [x, y].
@@ -33,17 +35,6 @@ pub struct ROIStatROI {
     pub size: [usize; 2],
     /// Width of the background border (pixels). 0 = no background subtraction.
     pub bgd_width: usize,
-}
-
-impl Default for ROIStatROI {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            offset: [0, 0],
-            size: [0, 0],
-            bgd_width: 0,
-        }
-    }
 }
 
 /// Statistics computed for a single ROI.
@@ -64,23 +55,9 @@ pub enum TSMode {
     Acquiring,
 }
 
-/// Number of statistics tracked per ROI (min, max, mean, total, net).
-const NUM_STATS: usize = 5;
-
-/// Per-ROI stat names used for time series channel naming.
-const ROI_STAT_NAMES: [&str; NUM_STATS] = ["MinValue", "MaxValue", "MeanValue", "Total", "Net"];
-
-/// Generate time series channel names for ROIStat with the given number of ROIs.
-/// Produces names like "TS1:MinValue", "TS1:MaxValue", ..., "TS2:MinValue", etc.
-pub fn roi_stat_ts_channel_names(num_rois: usize) -> Vec<String> {
-    let mut names = Vec::with_capacity(num_rois * NUM_STATS);
-    for roi_idx in 0..num_rois {
-        for stat_name in &ROI_STAT_NAMES {
-            names.push(format!("TS{}:{}", roi_idx + 1, stat_name));
-        }
-    }
-    names
-}
+/// Series kept per ROI: min, max, mean, total, net and the frame's
+/// timestamp (C's MAX_TIME_SERIES_TYPES).
+const TS_TYPES: usize = 6;
 
 /// Parameter indices for NDROIStat plugin-specific params.
 ///
@@ -116,6 +93,8 @@ pub struct ROIStatParams {
     pub ts_min_value: usize,
     pub ts_max_value: usize,
     pub ts_timestamp: usize,
+    /// The base `NDArraySizeX/Y/Z`; ROIStat sets X and Y from its input.
+    pub array_size: [usize; 3],
 }
 
 /// Processor that computes ROI statistics on 2D arrays.
@@ -125,17 +104,53 @@ pub struct ROIStatParams {
 struct ROIStatState {
     rois: Vec<ROIStatROI>,
     results: Vec<ROIStatResult>,
-    /// Time series buffers: `[roi_index][stat_index][time_point]`.
+    /// C's TSAcquiring.
     ts_mode: TSMode,
+    /// Time series buffers: `[roi_index][stat_index][time_point]`, each
+    /// `ts_num_points` long as C's `timeSeries_`; `ts_current` are valid.
     ts_buffers: Vec<Vec<Vec<f64>>>,
     ts_num_points: usize,
     ts_current: usize,
 }
 
+impl ROIStatState {
+    /// NDPluginROIStat::clearTimeSeries, less the CurrentPoint post.
+    fn clear_time_series(&mut self) {
+        self.ts_current = 0;
+        self.size_time_series();
+    }
+
+    /// Every buffer zeroed at `ts_num_points`, as C's calloc.
+    fn size_time_series(&mut self) {
+        let n = self.ts_num_points;
+        for buf in self.ts_buffers.iter_mut().flatten() {
+            buf.clear();
+            buf.resize(n, 0.0);
+        }
+    }
+
+    /// NDPluginROIStat::doTimeSeriesCallbacks: every ROI, used or not.
+    fn time_series_callbacks(&self, p: &ROIStatParams, updates: &mut Vec<ParamUpdate>) {
+        let reasons = [
+            p.ts_min_value,
+            p.ts_max_value,
+            p.ts_mean_value,
+            p.ts_total,
+            p.ts_net,
+            p.ts_timestamp,
+        ];
+        for (roi, bufs) in self.ts_buffers.iter().enumerate() {
+            for (&reason, buf) in reasons.iter().zip(bufs) {
+                // C passes currentTSPoint_ even past a shrunk buffer.
+                let points = buf[..self.ts_current.min(buf.len())].to_vec();
+                updates.push(ParamUpdate::float64_array_addr(reason, roi as i32, points));
+            }
+        }
+    }
+}
+
 pub struct ROIStatProcessor {
     state: Mutex<ROIStatState>,
-    /// Optional sender to push flattened stats to a TimeSeriesPortDriver.
-    ts_sender: Option<TimeSeriesSender>,
     /// Registered asyn param indices.
     params: ROIStatParams,
     /// Shared cell to export params after register_params is called.
@@ -143,11 +158,16 @@ pub struct ROIStatProcessor {
 }
 
 impl ROIStatProcessor {
-    /// Create a new processor with the given ROI definitions.
-    pub fn new(rois: Vec<ROIStatROI>, ts_num_points: usize) -> Self {
+    /// Create a new processor of `rois.len()` ROIs, C's maxROIs: one per
+    /// address (NDPluginROIStat.cpp:495), and at least one (:502-505). `rois`
+    /// seeds their geometry.
+    pub fn new(mut rois: Vec<ROIStatROI>, ts_num_points: usize) -> Self {
+        if rois.is_empty() {
+            rois.push(ROIStatROI::default());
+        }
         let n = rois.len();
         let results = vec![ROIStatResult::default(); n];
-        let ts_buffers = vec![vec![Vec::new(); NUM_STATS]; n];
+        let ts_buffers = vec![vec![vec![0.0; ts_num_points]; TS_TYPES]; n];
         Self {
             state: Mutex::new(ROIStatState {
                 rois,
@@ -157,7 +177,6 @@ impl ROIStatProcessor {
                 ts_num_points,
                 ts_current: 0,
             }),
-            ts_sender: None,
             params: ROIStatParams::default(),
             params_out: Arc::new(Mutex::new(ROIStatParams::default())),
         }
@@ -178,40 +197,30 @@ impl ROIStatProcessor {
         self.state.lock().rois.clone()
     }
 
-    /// Mutable access to ROI definitions.
-    pub fn rois_mut(&self) -> MappedMutexGuard<'_, Vec<ROIStatROI>> {
-        MutexGuard::map(self.state.lock(), |s| &mut s.rois)
+    /// Mutable access to ROI definitions; their count is the port's.
+    pub fn rois_mut(&self) -> MappedMutexGuard<'_, [ROIStatROI]> {
+        MutexGuard::map(self.state.lock(), |s| s.rois.as_mut_slice())
     }
 
     /// Set the time series mode.
     pub fn set_ts_mode(&self, mode: TSMode) {
         let mut state = self.state.lock();
         if mode == TSMode::Acquiring && state.ts_mode != TSMode::Acquiring {
-            // Reset time series on start
-            for roi_bufs in &mut state.ts_buffers {
-                for stat_buf in roi_bufs.iter_mut() {
-                    stat_buf.clear();
-                }
-            }
-            state.ts_current = 0;
+            state.clear_time_series();
         }
         state.ts_mode = mode;
     }
 
     /// Get time series buffer for a specific ROI and stat index.
-    /// stat_index: 0=min, 1=max, 2=mean, 3=total, 4=net
+    /// stat_index: 0=min, 1=max, 2=mean, 3=total, 4=net, 5=timestamp
     pub fn ts_buffer(&self, roi_index: usize, stat_index: usize) -> Vec<f64> {
         let state = self.state.lock();
-        if roi_index < state.ts_buffers.len() && stat_index < NUM_STATS {
-            state.ts_buffers[roi_index][stat_index].clone()
+        if roi_index < state.ts_buffers.len() && stat_index < TS_TYPES {
+            let buf = &state.ts_buffers[roi_index][stat_index];
+            buf[..state.ts_current.min(buf.len())].to_vec()
         } else {
             Vec::new()
         }
-    }
-
-    /// Set the sender for pushing time series data to a TimeSeriesPortDriver.
-    pub fn set_ts_sender(&mut self, sender: TimeSeriesSender) {
-        self.ts_sender = Some(sender);
     }
 
     /// Clamp a ROI's geometry to the array dimensions, mirroring the C
@@ -359,6 +368,98 @@ fn roi_stats_of<T: StatsElem>(
 }
 
 impl NDPluginProcess for ROIStatProcessor {
+    const ASYN_FLAGS: asyn_rs::port::PortFlags = ad_core_rs::plugin::runtime::ASYN_MULTIDEVICE;
+    // NDPluginROIStat.cpp:496-497, the same mask for both.
+    const INTERFACE_MASK: InterfaceMask = InterfaceMask::INT32_ARRAY
+        .or(InterfaceMask::FLOAT64)
+        .or(InterfaceMask::FLOAT64_ARRAY)
+        .or(InterfaceMask::GENERIC_POINTER);
+    const INTERRUPT_MASK: InterfaceMask = Self::INTERFACE_MASK;
+    // NDPluginROIStat.cpp:389-390; no writeFloat64 override.
+    const WRITE_INT32_EPILOGUE: ad_core_rs::plugin::runtime::WriteEpilogue =
+        ad_core_rs::plugin::runtime::WriteEpilogue::AddrAndZero;
+
+    /// maxROIs (NDPluginROIStat.cpp:495).
+    fn max_addr(&self) -> usize {
+        self.state.lock().rois.len()
+    }
+
+    /// C `NDPluginROIStat::writeInt32` keeps the base class clamp but replaces its
+    /// errorMessage with its own, carrying `getAddress`'s status
+    /// (`"%s: status=%d, function=%d, value=%d"`, NDPluginROIStat.cpp:393).
+    fn validate_int32(
+        &self,
+        reason: usize,
+        _addr: i32,
+        value: i32,
+        verdict: ad_core_rs::plugin::runtime::WriteVerdict<i32>,
+        _params: &mut ad_core_rs::plugin::runtime::WritePort<'_>,
+    ) -> ad_core_rs::plugin::runtime::WriteOutcome<i32> {
+        let verdict = match verdict {
+            ad_core_rs::plugin::runtime::WriteVerdict::Refuse { keep, .. } => {
+                ad_core_rs::plugin::runtime::WriteVerdict::Refuse {
+                    keep,
+                    message: format!(
+                        "NDPluginROIStat::writeInt32: status=0, function={reason}, value={value}"
+                    ),
+                }
+            }
+            accepted => accepted,
+        };
+        let p = &self.params;
+        if reason != p.ts_control && reason != p.ts_num_points {
+            return verdict.into();
+        }
+        let value = verdict.kept();
+        let mut state = self.state.lock();
+        let mut updates = Vec::new();
+        if reason == p.ts_num_points {
+            // C reallocates the series zeroed and keeps currentTSPoint_.
+            state.ts_num_points = value.max(0) as usize;
+            state.size_time_series();
+        } else {
+            // NDPluginROIStat.cpp:361-382, inside the write.
+            let callbacks = match value {
+                // EraseStart
+                0 => {
+                    state.clear_time_series();
+                    updates.push(ParamUpdate::int32(p.ts_current_point, 0));
+                    state.ts_mode = TSMode::Acquiring;
+                    updates.push(ParamUpdate::int32(p.ts_acquiring, 1));
+                    false
+                }
+                // Start
+                1 => {
+                    if state.ts_current < state.ts_num_points {
+                        state.ts_mode = TSMode::Acquiring;
+                        updates.push(ParamUpdate::int32(p.ts_acquiring, 1));
+                    }
+                    false
+                }
+                // Stop
+                2 => {
+                    state.ts_mode = TSMode::Idle;
+                    updates.push(ParamUpdate::int32(p.ts_acquiring, 0));
+                    true
+                }
+                // Read
+                3 => true,
+                // Erase
+                4 => {
+                    state.clear_time_series();
+                    updates.push(ParamUpdate::int32(p.ts_current_point, 0));
+                    true
+                }
+                _ => false,
+            };
+            if callbacks {
+                state.time_series_callbacks(p, &mut updates);
+            }
+        }
+        ad_core_rs::plugin::runtime::WriteOutcome::from(verdict)
+            .set_updates(updates)
+            .settled()
+    }
     fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
         // NDPluginROIStat operates on the raw array dimensions like the C
         // plugin (NDPluginROIStat.cpp): dims[0] = X, dims[1] = Y. Only 1-D
@@ -453,62 +554,17 @@ impl NDPluginProcess for ROIStatProcessor {
         let mut guard = self.state.lock();
         let state = &mut *guard;
         state.results = new_results;
-        // A param write can replace the ROI list while the statistics run
-        // unlocked; every loop below indexes `results` by a `rois` index, so
-        // restore the length invariant against the list as it now stands.
-        state
-            .results
-            .resize(state.rois.len(), ROIStatResult::default());
-
-        // Accumulate time series (fixed-length: stop when full)
-        if state.ts_mode == TSMode::Acquiring {
-            if state.ts_num_points > 0 && state.ts_current >= state.ts_num_points {
-                // Buffer full — stop acquiring
-                state.ts_mode = TSMode::Idle;
-            } else {
-                // Ensure ts_buffers match roi count
-                while state.ts_buffers.len() < state.rois.len() {
-                    state.ts_buffers.push(vec![Vec::new(); NUM_STATS]);
-                }
-
-                for (i, result) in state.results.iter().enumerate() {
-                    if i >= state.ts_buffers.len() {
-                        break;
-                    }
-                    let stats = [
-                        result.min,
-                        result.max,
-                        result.mean,
-                        result.total,
-                        result.net,
-                    ];
-                    for (s, &val) in stats.iter().enumerate() {
-                        let buf = &mut state.ts_buffers[i][s];
-                        buf.push(val);
-                    }
-                }
-                state.ts_current += 1;
-            }
-        }
-
-        // Send flattened stats to TimeSeriesPortDriver if connected
-        if let Some(ref sender) = self.ts_sender {
-            let mut values = Vec::with_capacity(state.results.len() * NUM_STATS);
-            for result in &state.results {
-                values.push(result.min);
-                values.push(result.max);
-                values.push(result.mean);
-                values.push(result.total);
-                values.push(result.net);
-            }
-            let _ = sender.try_send(TimeSeriesData { values });
-        }
 
         // Build per-ROI param updates (only for enabled ROIs)
         let p = &self.params;
         let mut updates = Vec::new();
+        // NDPluginROIStat.cpp:222-224: an axis the input lacks keeps its
+        // previous value.
+        for (reason, dim) in p.array_size.into_iter().zip(&array.dims).take(2) {
+            updates.push(ParamUpdate::int32(reason, dim.size as i32));
+        }
         for (i, roi) in rois.iter().enumerate() {
-            if !roi.enabled || i >= state.results.len() {
+            if !roi.enabled {
                 continue;
             }
             let result = &state.results[i];
@@ -543,66 +599,47 @@ impl NDPluginProcess for ROIStatProcessor {
                     updates.push(ParamUpdate::int32_addr(p.dim1_size, addr, size[1] as i32));
                 }
             }
+            // NDPluginROIStat.cpp:311, ahead of the series posts.
+            updates.push(ParamUpdate::callbacks(addr));
         }
-        updates.push(ParamUpdate::int32(
-            p.ts_current_point,
-            state.ts_current as i32,
-        ));
-        updates.push(ParamUpdate::int32(
-            p.ts_acquiring,
-            if state.ts_mode == TSMode::Acquiring {
-                1
-            } else {
-                0
-            },
-        ));
-
-        // Write time series buffers to params for waveform readback
-        for (i, roi) in rois.iter().enumerate() {
-            if !roi.enabled || i >= state.ts_buffers.len() {
-                continue;
+        // NDPluginROIStat.cpp:290-321: each used ROI stores this frame's
+        // point; a full series stops and posts.
+        if state.ts_mode == TSMode::Acquiring {
+            let n = state.ts_num_points;
+            let k = state.ts_current;
+            for (i, roi) in state.rois.iter().enumerate() {
+                if !roi.enabled {
+                    continue;
+                }
+                let r = &state.results[i];
+                for (buf, v) in state.ts_buffers[i].iter_mut().zip([
+                    r.min,
+                    r.max,
+                    r.mean,
+                    r.total,
+                    r.net,
+                    array.time_stamp,
+                ]) {
+                    // C writes past a buffer TSNumPoints shrank under it.
+                    if let Some(slot) = buf.get_mut(k) {
+                        *slot = v;
+                    }
+                }
             }
-            let addr = i as i32;
-            let bufs = &state.ts_buffers[i];
-            // stat order: min=0, max=1, mean=2, total=3, net=4
-            if !bufs.is_empty() {
-                updates.push(ParamUpdate::float64_array_addr(
-                    p.ts_min_value,
-                    addr,
-                    bufs[0].clone(),
-                ));
-            }
-            if bufs.len() > 1 {
-                updates.push(ParamUpdate::float64_array_addr(
-                    p.ts_max_value,
-                    addr,
-                    bufs[1].clone(),
-                ));
-            }
-            if bufs.len() > 2 {
-                updates.push(ParamUpdate::float64_array_addr(
-                    p.ts_mean_value,
-                    addr,
-                    bufs[2].clone(),
-                ));
-            }
-            if bufs.len() > 3 {
-                updates.push(ParamUpdate::float64_array_addr(
-                    p.ts_total,
-                    addr,
-                    bufs[3].clone(),
-                ));
-            }
-            if bufs.len() > 4 {
-                updates.push(ParamUpdate::float64_array_addr(
-                    p.ts_net,
-                    addr,
-                    bufs[4].clone(),
-                ));
+            state.ts_current += 1;
+            updates.push(ParamUpdate::int32(
+                p.ts_current_point,
+                state.ts_current as i32,
+            ));
+            if state.ts_current >= n {
+                state.ts_mode = TSMode::Idle;
+                updates.push(ParamUpdate::int32(p.ts_acquiring, 0));
+                state.time_series_callbacks(p, &mut updates);
             }
         }
 
-        ProcessResult::sink(updates)
+        // C `endProcessCallbacks(pArray, true, true)` (NDPluginROIStat.cpp:323).
+        ProcessResult::forward(array, updates)
     }
 
     fn plugin_type(&self) -> &str {
@@ -613,8 +650,9 @@ impl NDPluginProcess for ROIStatProcessor {
         &mut self,
         base: &mut PortDriverBase,
     ) -> Result<(), asyn_rs::error::AsynError> {
-        // Global params
         let state = self.state.get_mut();
+
+        // Global params
         self.params.reset_all = base.create_param("ROISTAT_RESETALL", ParamType::Int32)?;
         self.params.ts_control = base.create_param("ROISTAT_TS_CONTROL", ParamType::Int32)?;
         self.params.ts_num_points = base.create_param("ROISTAT_TS_NUM_POINTS", ParamType::Int32)?;
@@ -652,18 +690,31 @@ impl NDPluginProcess for ROIStatProcessor {
         self.params.ts_timestamp =
             base.create_param("ROISTAT_TS_TIMESTAMP", ParamType::Float64Array)?;
 
-        // Set initial per-ROI values
+        // NDPluginROIStat.cpp:552-579; BgdWidth is left to the database.
         for (i, roi) in state.rois.iter().enumerate() {
             let addr = i as i32;
+            base.set_string_param(self.params.name, addr, "")?;
             base.set_int32_param(self.params.use_, addr, roi.enabled as i32)?;
-            base.set_int32_param(self.params.bgd_width, addr, roi.bgd_width as i32)?;
             base.set_int32_param(self.params.dim0_min, addr, roi.offset[0] as i32)?;
-            base.set_int32_param(self.params.dim1_min, addr, roi.offset[1] as i32)?;
             base.set_int32_param(self.params.dim0_size, addr, roi.size[0] as i32)?;
+            base.set_int32_param(self.params.dim0_max_size, addr, 0)?;
+            base.set_int32_param(self.params.dim1_min, addr, roi.offset[1] as i32)?;
             base.set_int32_param(self.params.dim1_size, addr, roi.size[1] as i32)?;
+            base.set_int32_param(self.params.dim1_max_size, addr, 0)?;
+            for stat in [
+                self.params.min_value,
+                self.params.max_value,
+                self.params.mean_value,
+                self.params.total,
+                self.params.net,
+            ] {
+                base.set_float64_param(stat, addr, 0.0)?;
+            }
         }
 
         // Export params
+        self.params.array_size =
+            ad_core_rs::params::ndarray_driver::NDArrayDriverParams::array_size_reasons(base)?;
         *self.params_out.lock() = self.params;
 
         Ok(())
@@ -697,85 +748,42 @@ impl NDPluginProcess for ROIStatProcessor {
             for r in &mut state.results {
                 *r = ROIStatResult::default();
             }
-        } else if reason == p.ts_control {
-            // 0=EraseStart (clear+start), 1=Start (resume), 2=Stop, 3=Read, 4=Erase
-            match snapshot.value.as_i32() {
-                0 => {
-                    // EraseStart: clear buffers then start
-                    for roi_bufs in &mut state.ts_buffers {
-                        for stat_buf in roi_bufs.iter_mut() {
-                            stat_buf.clear();
-                        }
-                    }
-                    state.ts_current = 0;
-                    state.ts_mode = TSMode::Acquiring;
-                }
-                1 => {
-                    // Start: resume without clearing
-                    state.ts_mode = TSMode::Acquiring;
-                }
-                2 => {
-                    // Stop
-                    state.ts_mode = TSMode::Idle;
-                }
-                3 => {
-                    // Read: callback without stopping (no-op here, param update triggers read)
-                }
-                4 => {
-                    // Erase: clear buffers
-                    for roi_bufs in &mut state.ts_buffers {
-                        for stat_buf in roi_bufs.iter_mut() {
-                            stat_buf.clear();
-                        }
-                    }
-                    state.ts_current = 0;
-                }
-                _ => {}
-            }
-        } else if reason == p.ts_num_points {
-            state.ts_num_points = snapshot.value.as_i32().max(0) as usize;
         }
         ad_core_rs::plugin::runtime::ParamChangeResult::empty()
     }
 }
 
-/// Create a ROIStat plugin runtime. The TS receiver is stored in the registry
-/// for later pickup by `NDTimeSeriesConfigure`.
+/// Create a ROIStat plugin runtime. `num_rois` is C's maxROIs: the port's
+/// addresses and, at least one, its ROIs.
 pub fn create_roi_stat_runtime(
-    port_name: &str,
-    pool: Arc<NDArrayPool>,
-    queue_size: usize,
-    ndarray_port: &str,
+    claim: &asyn_rs::registry::PortClaim,
+    max_memory: usize,
+    queue_size: i32,
+    blocking_callbacks: i32,
+    source: impl Into<ArraySource>,
     wiring: Arc<WiringRegistry>,
     num_rois: usize,
-    ts_registry: &crate::time_series::TsReceiverRegistry,
+    threads: ad_core_rs::plugin::runtime::PluginThreads,
 ) -> (
     PluginRuntimeHandle,
     ROIStatParams,
     std::thread::JoinHandle<()>,
 ) {
-    let (ts_tx, ts_rx) = tokio::sync::mpsc::channel(256);
-
-    let rois: Vec<ROIStatROI> = (0..num_rois).map(|_| ROIStatROI::default()).collect();
-    let mut processor = ROIStatProcessor::new(rois, 2048);
-    processor.set_ts_sender(ts_tx);
+    let processor = ROIStatProcessor::new(vec![ROIStatROI::default(); num_rois], 2048);
     let params_handle = processor.params_handle();
 
-    let (handle, data_jh) = ad_core_rs::plugin::runtime::create_plugin_runtime_multi_addr(
-        port_name,
+    let (handle, data_jh) = ad_core_rs::plugin::runtime::create_plugin_runtime(
+        claim,
         processor,
-        pool,
+        max_memory,
         queue_size,
-        ndarray_port,
+        blocking_callbacks,
+        source,
         wiring,
-        num_rois,
+        threads,
     );
 
     let roi_stat_params = *params_handle.lock();
-
-    // Store the TS receiver for NDTimeSeriesConfigure to pick up
-    let channel_names = roi_stat_ts_channel_names(num_rois);
-    ts_registry.store(port_name, ts_rx, channel_names);
 
     (handle, roi_stat_params, data_jh)
 }
@@ -783,6 +791,344 @@ pub fn create_roi_stat_runtime(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `"%s: status=%d, function=%d, value=%d"` (NDPluginROIStat.cpp:393).
+    #[test]
+    fn a_refused_base_write_carries_c_error_message() {
+        use ad_core_rs::plugin::runtime::WriteVerdict;
+        let proc = ROIStatProcessor::new(vec![], 0);
+        let mut base = asyn_rs::port::PortDriverBase::new(
+            "T",
+            1,
+            Default::default(),
+            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
+            asyn_rs::port::InterfaceMask::UNMIGRATED_INTERRUPTS,
+        );
+        let clamp = WriteVerdict::Refuse {
+            keep: 1,
+            message: String::new(),
+        };
+        assert_eq!(
+            proc.validate_int32(
+                71,
+                0,
+                99,
+                clamp,
+                &mut ad_core_rs::plugin::runtime::WritePort::new(&mut base)
+            )
+            .verdict,
+            WriteVerdict::Refuse {
+                keep: 1,
+                message: "NDPluginROIStat::writeInt32: status=0, function=71, value=99".into(),
+            }
+        );
+        assert_eq!(
+            proc.validate_int32(
+                71,
+                0,
+                1,
+                WriteVerdict::Accept(1),
+                &mut ad_core_rs::plugin::runtime::WritePort::new(&mut base)
+            )
+            .verdict,
+            WriteVerdict::Accept(1)
+        );
+    }
+
+    #[test]
+    fn ts_control_sets_ts_acquiring_from_the_write() {
+        // NDPluginROIStat.cpp:361-382, with no frame in between: the TSRead
+        // record is disabled until TSAcquiring reads 1.
+        let (handle, p, _jh) = create_roi_stat_runtime(
+            &asyn_rs::asyn_record::claim_port("RS_TSCTL").unwrap(),
+            1_000_000,
+            1,
+            0,
+            "",
+            Arc::new(WiringRegistry::new()),
+            1,
+            ad_core_rs::plugin::runtime::DEFAULT_PLUGIN_THREADS,
+        );
+        let port = handle.port_runtime().port_handle();
+        let acquiring = || port.read_int32_blocking(p.ts_acquiring, 0).unwrap();
+        port.write_int32_blocking(p.ts_control, 0, 1).unwrap();
+        assert_eq!(acquiring(), 1, "Start");
+        port.write_int32_blocking(p.ts_control, 0, 3).unwrap();
+        assert_eq!(acquiring(), 1, "Read");
+        port.write_int32_blocking(p.ts_control, 0, 2).unwrap();
+        assert_eq!(acquiring(), 0, "Stop");
+        port.write_int32_blocking(p.ts_control, 0, 0).unwrap();
+        assert_eq!(acquiring(), 1, "EraseStart");
+        port.write_int32_blocking(p.ts_control, 0, 4).unwrap();
+        assert_eq!(acquiring(), 1, "Erase keeps acquiring");
+        port.write_int32_blocking(p.ts_control, 0, 2).unwrap();
+        // Start is refused once the series is full.
+        port.write_int32_blocking(p.ts_num_points, 0, 0).unwrap();
+        port.write_int32_blocking(p.ts_control, 0, 1).unwrap();
+        assert_eq!(acquiring(), 0, "Start on a full series");
+    }
+
+    #[test]
+    fn time_series_arrays_post_only_from_do_time_series_callbacks() {
+        // NDPluginROIStat.cpp:312-320, 361-382, 451-464: a frame stores its
+        // point, Stop/Read/Erase and a full series post currentTSPoint_ of it.
+        use ad_core_rs::plugin::runtime::{SideParam, WritePort, WriteVerdict};
+        use asyn_rs::port::{InterfaceMask, PortDriverBase, PortFlags};
+        let mut base = PortDriverBase::new(
+            "RS_TSCB",
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
+        );
+        let roi = ROIStatROI {
+            enabled: true,
+            offset: [0, 0],
+            size: [2, 2],
+            bgd_width: 0,
+        };
+        let mut proc = ROIStatProcessor::new(vec![roi], 3);
+        ad_core_rs::params::ndarray_driver::NDArrayDriverParams::create(&mut base).unwrap();
+        proc.register_params(&mut base).unwrap();
+        let p = proc.params;
+        let mut control = |v| -> Vec<ParamUpdate> {
+            let mut port = WritePort::new(&mut base);
+            let out = proc.validate_int32(p.ts_control, 0, v, WriteVerdict::Accept(v), &mut port);
+            out.side
+                .into_iter()
+                .filter_map(|s| match s {
+                    SideParam::Float64Array {
+                        reason,
+                        addr,
+                        value,
+                    } => Some(ParamUpdate::float64_array_addr(reason, addr, value)),
+                    _ => None,
+                })
+                .collect()
+        };
+        let means = |updates: &[ParamUpdate]| -> Vec<Vec<f64>> {
+            updates
+                .iter()
+                .filter_map(|u| match u {
+                    ParamUpdate::Float64Array { reason, value, .. }
+                        if *reason == p.ts_mean_value =>
+                    {
+                        Some(value.clone())
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        let pool = NDArrayPool::new(1_000_000);
+        let frame = |v: f64| {
+            proc.process_array(&Arc::new(make_2d_array(2, 2, |_, _| v)), &pool)
+                .param_updates
+        };
+
+        assert_eq!(means(&control(0)), Vec::<Vec<f64>>::new(), "EraseStart");
+        assert_eq!(means(&frame(1.0)), Vec::<Vec<f64>>::new());
+        assert_eq!(means(&frame(2.0)), Vec::<Vec<f64>>::new());
+        assert_eq!(means(&control(3)), vec![vec![1.0, 2.0]], "Read");
+        assert_eq!(means(&frame(3.0)), vec![vec![1.0, 2.0, 3.0]], "full");
+        assert_eq!(means(&frame(4.0)), Vec::<Vec<f64>>::new(), "stopped");
+        assert_eq!(means(&control(2)), vec![vec![1.0, 2.0, 3.0]], "Stop");
+        assert_eq!(means(&control(4)), vec![Vec::<f64>::new()], "Erase");
+    }
+
+    #[test]
+    fn time_series_records_each_frame_time_stamp() {
+        // NDPluginROIStat.cpp:299, posted at :462.
+        use ad_core_rs::plugin::runtime::{SideParam, WritePort, WriteVerdict};
+        use asyn_rs::port::{InterfaceMask, PortDriverBase, PortFlags};
+        let mut base = PortDriverBase::new(
+            "RS_TSTS",
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
+        );
+        let roi = ROIStatROI {
+            enabled: true,
+            offset: [0, 0],
+            size: [1, 1],
+            bgd_width: 0,
+        };
+        let mut proc = ROIStatProcessor::new(vec![roi], 4);
+        ad_core_rs::params::ndarray_driver::NDArrayDriverParams::create(&mut base).unwrap();
+        proc.register_params(&mut base).unwrap();
+        let p = proc.params;
+        let mut control = |v| {
+            let mut port = WritePort::new(&mut base);
+            proc.validate_int32(p.ts_control, 0, v, WriteVerdict::Accept(v), &mut port)
+                .side
+        };
+        control(0);
+        let pool = NDArrayPool::new(1_000_000);
+        for t in [10.5, 11.25] {
+            let mut arr = make_2d_array(1, 1, |_, _| 0.0);
+            arr.time_stamp = t;
+            proc.process_array(&Arc::new(arr), &pool);
+        }
+        let stamps: Vec<Vec<f64>> = control(3)
+            .into_iter()
+            .filter_map(|s| match s {
+                SideParam::Float64Array { reason, value, .. } if reason == p.ts_timestamp => {
+                    Some(value)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(stamps, vec![vec![10.5, 11.25]]);
+    }
+
+    /// C clamps maxROIs below 1 to one ROI (NDPluginROIStat.cpp:502-505) on
+    /// the one address asynPortDriver gives it (asynPortDriver.cpp:4006).
+    #[test]
+    fn a_max_rois_below_1_still_seeds_roi_0() {
+        let (handle, p, _jh) = create_roi_stat_runtime(
+            &asyn_rs::asyn_record::claim_port("RS_ZERO").unwrap(),
+            1_000_000,
+            1,
+            0,
+            "",
+            Arc::new(WiringRegistry::new()),
+            0,
+            ad_core_rs::plugin::runtime::DEFAULT_PLUGIN_THREADS,
+        );
+        let port = handle.port_runtime().port_handle();
+        assert_eq!(port.read_int32_blocking(p.dim0_max_size, 0).unwrap(), 0);
+        assert_eq!(port.read_float64_blocking(p.total, 0).unwrap(), 0.0);
+    }
+
+    /// C's one maxROIs is both counts (NDPluginROIStat.cpp:495, :502-505),
+    /// whoever builds the plugin.
+    #[test]
+    fn four_rois_build_a_four_address_port() {
+        let (handle, _jh) = ad_core_rs::plugin::runtime::create_plugin_runtime(
+            &asyn_rs::asyn_record::claim_port("RS_FOUR").unwrap(),
+            ROIStatProcessor::new(vec![ROIStatROI::default(); 4], 16),
+            1_000_000,
+            1,
+            0,
+            "",
+            Arc::new(WiringRegistry::new()),
+            ad_core_rs::plugin::runtime::DEFAULT_PLUGIN_THREADS,
+        );
+        assert_eq!(handle.port_runtime().port_handle().max_addr(), 4);
+    }
+
+    // RTEMS-EXEC-MODEL-ALLOW(1): checked, not waived — it ran and passed on
+    // the exec backend (`EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run
+    // -p ad-plugins-rs --all-features`, 729/729).
+    /// pool_throughput's ROIStat stage as NDROIStatConfigure builds it: four
+    /// quadrants set through the port, each posting its own total.
+    #[test]
+    fn four_quadrant_rois_each_post_their_own_total() {
+        let (handle, p, _jh) = create_roi_stat_runtime(
+            &asyn_rs::asyn_record::claim_port("RS_QUAD").unwrap(),
+            1_000_000,
+            4,
+            0,
+            "",
+            Arc::new(WiringRegistry::new()),
+            4,
+            ad_core_rs::plugin::runtime::DEFAULT_PLUGIN_THREADS,
+        );
+        let port = handle.port_runtime().port_handle();
+        for (addr, (x, y)) in [(0, 0), (2, 0), (0, 2), (2, 2)].into_iter().enumerate() {
+            for (reason, value) in [
+                (p.use_, 1),
+                (p.dim0_min, x),
+                (p.dim1_min, y),
+                (p.dim0_size, 2),
+                (p.dim1_size, 2),
+            ] {
+                port.write_int32_blocking(reason, addr as i32, value)
+                    .unwrap();
+            }
+        }
+        port.write_int32_blocking(handle.plugin_params.enable_callbacks, 0, 1)
+            .unwrap();
+        assert!(handle.wait_params_applied(std::time::Duration::from_secs(10)));
+        let frame = make_2d_array(4, 4, |x, y| (1 + x / 2 + 2 * (y / 2)) as f64);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(
+            handle.array_sender().publish(
+                ad_core_rs::ndarray_pool::DriverPool::standalone(0)
+                    .alloc_copy(&frame)
+                    .unwrap(),
+            ),
+        );
+        assert!(handle.wait_params_applied(std::time::Duration::from_secs(10)));
+        let totals: Vec<f64> = (0..4)
+            .map(|addr| port.read_float64_blocking(p.total, addr).unwrap())
+            .collect();
+        assert_eq!(totals, [4.0, 8.0, 12.0, 16.0]);
+    }
+
+    #[test]
+    fn test_runtime_seeds_each_roi_as_the_c_constructor() {
+        // Every value NDPluginROIStat.cpp:552-579 sets, at every address;
+        // the controls stay undefined.
+        let (handle, p, _jh) = create_roi_stat_runtime(
+            &asyn_rs::asyn_record::claim_port("RS_INIT").unwrap(),
+            1_000_000,
+            1,
+            0,
+            "",
+            Arc::new(WiringRegistry::new()),
+            2,
+            ad_core_rs::plugin::runtime::DEFAULT_PLUGIN_THREADS,
+        );
+        let port = handle.port_runtime().port_handle();
+        for addr in 0..2 {
+            for reason in [
+                p.use_,
+                p.dim0_min,
+                p.dim0_size,
+                p.dim0_max_size,
+                p.dim1_min,
+                p.dim1_size,
+                p.dim1_max_size,
+            ] {
+                assert_eq!(port.read_int32_blocking(reason, addr).unwrap(), 0);
+            }
+            for reason in [p.min_value, p.max_value, p.mean_value, p.total, p.net] {
+                assert_eq!(port.read_float64_blocking(reason, addr).unwrap(), 0.0);
+            }
+            for reason in [p.bgd_width, p.reset] {
+                assert!(port.read_int32_blocking(reason, addr).is_err());
+            }
+        }
+        assert_eq!(port.read_int32_blocking(p.ts_num_points, 0).unwrap(), 2048);
+        for reason in [
+            p.reset_all,
+            p.ts_control,
+            p.ts_current_point,
+            p.ts_acquiring,
+        ] {
+            assert!(port.read_int32_blocking(reason, 0).is_err());
+        }
+        // The port handle has no blocking octet read; Name goes through the base.
+        use asyn_rs::port::InterfaceMask;
+        use asyn_rs::port::{PortDriverBase, PortFlags};
+        let mut base = PortDriverBase::new(
+            "RS_NAME",
+            2,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
+        );
+        let mut proc = ROIStatProcessor::new(vec![ROIStatROI::default(); 2], 2048);
+        ad_core_rs::params::ndarray_driver::NDArrayDriverParams::create(&mut base).unwrap();
+        proc.register_params(&mut base).unwrap();
+        for addr in 0..2 {
+            assert_eq!(base.get_string_param(proc.params.name, addr).unwrap(), b"");
+        }
+    }
     use ad_core_rs::ndarray::{NDDataType, NDDimension};
 
     fn make_2d_array(x: usize, y: usize, fill: impl Fn(usize, usize) -> f64) -> NDArray {
@@ -798,6 +1144,33 @@ mod tests {
             }
         }
         arr
+    }
+
+    /// C hands every frame on, whatever its rank (NDPluginROIStat.cpp:323).
+    #[test]
+    fn every_frame_is_handed_on() {
+        let pool = NDArrayPool::new(1_000_000);
+        let rois = vec![ROIStatROI {
+            enabled: true,
+            offset: [0, 0],
+            size: [2, 2],
+            bgd_width: 0,
+        }];
+        let proc = ROIStatProcessor::new(rois, 0);
+        let three_d = NDArray::new(
+            vec![
+                NDDimension::new(2),
+                NDDimension::new(2),
+                NDDimension::new(2),
+            ],
+            NDDataType::Float64,
+        );
+        for arr in [make_2d_array(2, 2, |_, _| 1.0), three_d] {
+            let arr = Arc::new(arr);
+            let result = proc.process_array(&arr, &pool);
+            assert_eq!(result.output_arrays.len(), 1);
+            assert!(Arc::ptr_eq(&result.output_arrays[0], &arr));
+        }
     }
 
     #[test]
@@ -1022,6 +1395,48 @@ mod tests {
         assert!((ts[4] - 5.0).abs() < 1e-10);
     }
 
+    /// C flushes each used ROI's list (NDPluginROIStat.cpp:311) before a
+    /// full series posts its arrays (:319).
+    #[test]
+    fn each_roi_flushes_before_the_time_series_posts() {
+        let roi = ROIStatROI {
+            enabled: true,
+            offset: [0, 0],
+            size: [2, 2],
+            bgd_width: 0,
+        };
+        let proc = ROIStatProcessor::new(vec![roi.clone(), roi], 1);
+        proc.set_ts_mode(TSMode::Acquiring);
+        let r = proc.process_array(
+            &Arc::new(make_2d_array(2, 2, |_, _| 1.0)),
+            &NDArrayPool::new(1_000_000),
+        );
+        let mut seq: Vec<(&str, i32)> = r
+            .param_updates
+            .iter()
+            .map(|u| match u {
+                ParamUpdate::Int32 { addr, .. }
+                | ParamUpdate::Float64 { addr, .. }
+                | ParamUpdate::Octet { addr, .. } => ("set", *addr),
+                ParamUpdate::Float64Array { addr, .. } => ("array", *addr),
+                ParamUpdate::Callbacks { addr } => ("flush", *addr),
+            })
+            .collect();
+        seq.dedup();
+        assert_eq!(
+            seq,
+            [
+                ("set", 0),
+                ("flush", 0),
+                ("set", 1),
+                ("flush", 1),
+                ("set", 0),
+                ("array", 0),
+                ("array", 1),
+            ]
+        );
+    }
+
     #[test]
     fn test_u8_data() {
         let mut arr = NDArray::new(
@@ -1050,53 +1465,16 @@ mod tests {
         assert!((r.max - 16.0).abs() < 1e-10);
     }
 
+    /// NDPluginROIStat.cpp:222-224 sets X and Y from the input, leaves an
+    /// axis a 1-D frame lacks as it was, and never touches Z or ArraySize.
     #[test]
-    fn test_ts_channel_names() {
-        let names = roi_stat_ts_channel_names(2);
-        assert_eq!(names.len(), 10); // 2 ROIs * 5 stats
-        assert_eq!(names[0], "TS1:MinValue");
-        assert_eq!(names[1], "TS1:MaxValue");
-        assert_eq!(names[4], "TS1:Net");
-        assert_eq!(names[5], "TS2:MinValue");
-        assert_eq!(names[9], "TS2:Net");
-    }
-
-    #[test]
-    fn test_ts_sender_integration() {
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<TimeSeriesData>(16);
-
-        let rois = vec![
-            ROIStatROI {
-                enabled: true,
-                offset: [0, 0],
-                size: [4, 4],
-                bgd_width: 0,
-            },
-            ROIStatROI {
-                enabled: true,
-                offset: [0, 0],
-                size: [2, 2],
-                bgd_width: 0,
-            },
-        ];
-
-        let mut proc = ROIStatProcessor::new(rois, 0);
-        proc.set_ts_sender(tx);
-
-        let pool = NDArrayPool::new(1_000_000);
-        let arr = make_2d_array(4, 4, |_, _| 7.0);
-        proc.process_array(&Arc::new(arr), &pool);
-
-        let data = rx.try_recv().unwrap();
-        // 2 ROIs * 5 stats = 10 values
-        assert_eq!(data.values.len(), 10);
-        // ROI1: min=7, max=7, mean=7, total=112 (4*4*7), net=112
-        assert!((data.values[0] - 7.0).abs() < 1e-10); // min
-        assert!((data.values[1] - 7.0).abs() < 1e-10); // max
-        assert!((data.values[2] - 7.0).abs() < 1e-10); // mean
-        assert!((data.values[3] - 112.0).abs() < 1e-10); // total
-        // ROI2: 2x2 region, total=28 (2*2*7)
-        assert!((data.values[8] - 28.0).abs() < 1e-10); // total
+    fn the_array_sizes_describe_the_input() {
+        let sizes = crate::test_util::array_sizes(
+            "RS_SIZES",
+            ROIStatProcessor::new(vec![], 0),
+            &[make_2d_array(8, 6, |_, _| 0.0), make_1d_array(5, |_| 0.0)],
+        );
+        assert_eq!(sizes, [[8, 6, 0, 0], [5, 6, 0, 0]]);
     }
 
     fn make_1d_array(n: usize, fill: impl Fn(usize) -> f64) -> NDArray {
@@ -1139,6 +1517,7 @@ mod tests {
 
     #[test]
     fn test_adp16_geometry_writeback_uses_clamped_values() {
+        use asyn_rs::port::InterfaceMask;
         use asyn_rs::port::{PortDriverBase, PortFlags};
 
         let arr = make_2d_array(4, 4, |_, _| 10.0);
@@ -1149,7 +1528,14 @@ mod tests {
             bgd_width: 0,
         }];
         let mut proc = ROIStatProcessor::new(rois, 0);
-        let mut base = PortDriverBase::new("roistat_adp16", 1, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            "roistat_adp16",
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
+        );
+        ad_core_rs::params::ndarray_driver::NDArrayDriverParams::create(&mut base).unwrap();
         proc.register_params(&mut base).unwrap();
         let p = *proc.params_handle().lock();
 

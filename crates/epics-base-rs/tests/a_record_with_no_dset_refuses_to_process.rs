@@ -21,6 +21,7 @@ use std::sync::{Arc, Mutex};
 
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
+use epics_base_rs::server::record::{DbLinkType, DevSup, Dset, register_device_row};
 use epics_base_rs::types::EpicsValue;
 
 fn listen() -> Arc<Mutex<Vec<String>>> {
@@ -37,7 +38,29 @@ fn heard(sink: &Arc<Mutex<Vec<String>>>) -> String {
     sink.lock().expect("sink").join("\n")
 }
 
+/// `device(<type>, INST_IO, devAsynInt32, "asynInt32")` loaded with no dset
+/// registered behind it: asyn's `.dbd` on an IOC that does not link asyn.
+static DECLARED_ONLY: [DevSup; 2] = [
+    DevSup {
+        name: "devAsynInt32",
+        choice: "asynInt32",
+        link_type: DbLinkType::Constant,
+        dset: Dset::new(6, &[], false),
+    },
+    DevSup {
+        name: "devNobody",
+        choice: "nobodyRegisteredThis",
+        link_type: DbLinkType::Constant,
+        dset: Dset::new(6, &[], false),
+    },
+];
+
 async fn ioc(db_text: &str) -> Arc<PvDatabase> {
+    for rtype in ["ai", "ao", "aai", "aao", "calc"] {
+        for row in &DECLARED_ONLY {
+            register_device_row(rtype, row);
+        }
+    }
     IocBuilder::new()
         .db_string(db_text, &HashMap::new())
         .unwrap()
@@ -59,7 +82,11 @@ async fn the_first_cycle_refuses_and_the_record_stays_active() {
     )
     .await;
 
-    db.process_record("T:A").await.unwrap();
+    let status = db.process_record("T:A").await;
+    assert!(
+        matches!(status, Err(epics_base_rs::error::CaError::ProcessStatus(s)) if s.get() == (514 << 16) | 5),
+        "`aoRecord.c:175` returns S_dev_missingSup, got {status:?}"
+    );
     let after_one = heard(&sink);
     assert!(
         after_one.contains("recGblRecordError: write_ao Error (514,5) PV: T:A"),
@@ -99,4 +126,42 @@ async fn a_record_type_with_no_dset_check_still_processes() {
         "the cycle ran"
     );
     assert_eq!(db.get_pv("T:C.PACT").unwrap(), EpicsValue::Char(0));
+}
+
+const CHILD: &str = "NO_DSET_CONSOLE_CHILD";
+
+/// The build's console for an `ai` whose DTYP no one registered. softIoc
+/// R7.0.10 on `device(ai,INST_IO,devFoo,"foo")` with nothing behind it prints
+/// `recGblRecordError: ai: init_record Error (514,3) PV: R1` for the record
+/// and no other line about it.
+#[test]
+fn the_build_says_only_cs_line_for_a_record_with_no_dset() {
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "child_builds_a_record_with_no_dset",
+            "--nocapture",
+        ])
+        .env(CHILD, "1")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let lines: Vec<_> = String::from_utf8_lossy(&out.stderr)
+        .lines()
+        .filter(|l| l.contains("T:N"))
+        .map(str::to_string)
+        .collect();
+    assert_eq!(
+        lines,
+        ["recGblRecordError: ai: init_record Error (514,3) PV: T:N"]
+    );
+}
+
+#[epics_macros_rs::epics_test]
+async fn child_builds_a_record_with_no_dset() {
+    if std::env::var_os(CHILD).is_none() {
+        return;
+    }
+    ioc("record(ai, \"T:N\") { field(DTYP,\"nobodyRegisteredThis\") }\n").await;
+    epics_base_rs::runtime::log::errlog_flush();
 }

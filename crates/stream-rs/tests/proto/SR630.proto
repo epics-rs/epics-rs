@@ -1,0 +1,157 @@
+#  The db is set up to be relatively robust, if
+#any timeout errors occur, we should be able to
+#ignore it and wait .1 seconds for things to
+#update.
+@replytimeout
+{
+}
+
+
+#mbbi
+curr_channel
+{
+  out "CHAN?";
+  in  "%d";
+}
+
+
+#mbbo
+set_channel
+{
+  out "CHAN %(RVAL)d";
+}
+
+
+
+
+#ai
+#
+#  a link to the current channel number is passed
+#as an argument.
+curr_measure
+{
+  out "MEAS? %(\$1)d";
+ 
+  in  "%f";
+}
+
+
+#ai
+#
+#  a link to the current channel number is passed
+#as an argument.
+curr_units
+{
+	out "UNIT? %(\$1)d";
+	in "%s";
+}
+
+
+#ai
+#
+#  a link to the current channel number is passed
+#as an argument.
+curr_delta
+{
+  	out "TDLT? %(\$1)d";
+	in "%f";
+}
+
+
+#ai
+#
+#  a link to the current channel number is passed
+#as an argument.
+curr_nominal
+{
+	out "TNOM? %(\$1)d";
+	in  "%f";
+}
+
+
+
+
+#mbbi
+#
+#ZRST - ABS
+#ONST - CENT
+#TWST - FHRN
+#THST - mDC
+#FRST - DC
+get_units
+{
+  out "UNIT? \$1";
+  in "%s";
+}
+
+#mbbo
+#
+#ZRST - ABS
+#ONST - CENT
+#TWST - FHRN
+#THST - mDC
+#FRST - DC
+set_units
+{
+  out "UNIT \$1,%s";
+} 
+
+
+
+
+#mbbi
+#
+#ZRST - B
+#ONST - E
+#TWST - J
+#THST - K
+#FRST - R
+#FVST - S
+#SXST - T
+get_type
+{
+  out "TTYP? \$1";
+  in "%s";
+}
+
+
+#mbbo
+#
+#ZRST - B
+#ONST - E
+#TWST - J
+#THST - K
+#FRST - R
+#FVST - S
+#SXST - T
+set_type
+{
+  out "TTYP \$1,%s";
+}
+
+
+
+
+#ai
+get_nominal
+{
+  out "TNOM? \$1";
+  in  "%f";
+}
+
+
+#ao
+set_nominal
+{
+  out "TNOM \$1,%f";
+}
+
+
+
+
+#ai
+get_delta_measure
+{
+  out "TDLT? \$1";
+  in  "%f";
+}

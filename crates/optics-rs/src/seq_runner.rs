@@ -12,71 +12,41 @@
 //! seqStart("orient", "P=mini:,PM=mini:,mTTH=tth,mTH=th,mCHI=chi,mPHI=phi")
 //! ```
 
-// RTEMS-EXEC-MODEL-ALLOW(1): checked, not waived — all 1 ran and passed
+// RTEMS-EXEC-MODEL-ALLOW(2): checked, not waived — all 2 ran and passed
 // on the exec backend (measured on this tree:
 // `EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p optics-rs
-// --all-features`, 412/412). optics-rs became a census subject when its
+// --all-features`, 459/459). optics-rs became a census subject when its
 // `build.rs` began deriving `tokio_backend`; nothing here builds a CA
 // server, and the reactor these obtain comes from `#[tokio::test]`
 // itself, which the backend does not remove.
 
-use std::collections::HashMap;
-
+use epics_base_rs::runtime::task::BlockingBridge;
 use epics_base_rs::server::database::PvDatabase;
-use epics_base_rs::server::snl::spawn_program;
 
-/// Parse a macro string like `"P=mini:,M_THETA=dcm:theta"` into a HashMap.
-pub fn parse_macros(input: &str) -> HashMap<String, String> {
-    let mut map = HashMap::new();
-    for part in input.split(',') {
-        let part = part.trim();
-        if let Some((k, v)) = part.split_once('=') {
-            map.insert(k.trim().to_string(), v.trim().to_string());
-        }
-    }
-    map
-}
-
-/// Helper to get a macro value or return an error.
-fn require_macro(
-    macros: &HashMap<String, String>,
-    key: &str,
-    program: &str,
-) -> Result<String, String> {
-    macros
-        .get(key)
-        .cloned()
-        .ok_or_else(|| format!("{program}: required macro '{key}' not specified"))
-}
-
-/// Helper to get a macro value with a default.
-fn macro_or(macros: &HashMap<String, String>, key: &str, default: &str) -> String {
-    macros
-        .get(key)
-        .cloned()
-        .unwrap_or_else(|| default.to_string())
-}
+// `SEQ_PROGRAMS`: every program `build.rs` compiled from `src/snl/*.st`.
+include!(concat!(env!("OUT_DIR"), "/seq_programs.rs"));
 
 /// Start an optics SNL program by name.
 ///
-/// This is the Rust equivalent of the C EPICS `seq &program, "macros"` command.
-/// Spawns a tokio task that runs the state machine asynchronously.
+/// This is the Rust equivalent of the C EPICS `seq &program, "macros"` command:
+/// the macros are parsed over the program's `program` parameters, so a macro
+/// left out takes the default its `.st` gives it.
 ///
-/// # Supported programs
+/// | Name | Description |
+/// |------|-------------|
+/// | `kohzuCtl` | Kohzu double-crystal monochromator |
+/// | `kohzuCtl_soft` | Kohzu soft motor variant |
+/// | `hrCtl` | High-resolution analyzer |
+/// | `ml_monoCtl` | Multi-layer monochromator |
+/// | `orient` | 4-circle diffractometer |
+/// | `filterDrive` | Automatic filter selection |
+/// | `pf4` | XIA PF4 filter bank |
+/// | `Io` | Ion chamber intensity |
+/// | `flexCombinedMotion` | Coarse+fine flexure stage |
 ///
-/// | Name | Macros | Description |
-/// |------|--------|-------------|
-/// | `kohzuCtl` | P, M_THETA, M_Y, M_Z, GEOM(opt) | Kohzu double-crystal monochromator |
-/// | `kohzuCtl_soft` | P, MONO(opt) | Kohzu soft motor variant |
-/// | `hrCtl` | P, N(opt), M_PHI1, M_PHI2 | High-resolution analyzer |
-/// | `ml_monoCtl` | P, M_THETA, M_THETA2(opt), M_Z(opt) | Multi-layer monochromator |
-/// | `orient` | P, PM, mTTH, mTH, mCHI, mPHI | 4-circle diffractometer |
-/// | `filterDrive` | P, R | Automatic filter selection |
-/// | `pf4` | P, R, H(opt) | XIA PF4 dual filter bank |
-/// | `Io` | P, R | Ion chamber intensity |
-/// | `flexCombinedMotion` | P, CM, FM | Coarse+fine flexure stage |
-///
-/// Returns `Ok(())` if the program was found and spawned, or `Err` with a message.
+/// Returns `Ok(())` if the program was found and spawned, or `Err` with
+/// seq_cmd.c's console line for one it does not know. A compiled program is
+/// started by `seq`, whose result seq_cmd.c:159-160 ignores.
 ///
 /// Must be called with the runtime access captured for the shell thread (use
 /// `CommandContext::bridge()` from st.cmd startup commands, since st.cmd runs
@@ -84,152 +54,116 @@ fn macro_or(macros: &HashMap<String, String>, key: &str, default: &str) -> Strin
 pub fn seq_start(
     program: &str,
     macro_str: &str,
-    bridge: &epics_base_rs::runtime::task::BlockingBridge,
+    _bridge: &BlockingBridge,
     db: &PvDatabase,
 ) -> Result<(), String> {
-    let macros = parse_macros(macro_str);
-
-    match program {
-        "kohzuCtl" => {
-            let config = crate::snl::kohzu_ctl::KohzuConfig::new(
-                &require_macro(&macros, "P", program)?,
-                &require_macro(&macros, "M_THETA", program)?,
-                &require_macro(&macros, "M_Y", program)?,
-                &require_macro(&macros, "M_Z", program)?,
-                macro_or(&macros, "GEOM", "0").parse::<i32>().unwrap_or(0),
-            );
-            spawn_program(bridge, db, "kohzuCtl", move |db| {
-                crate::snl::kohzu_ctl::run(config, db)
-            });
-        }
-        "kohzuCtl_soft" => {
-            let config = crate::snl::kohzu_ctl_soft::KohzuSoftConfig::new(
-                &require_macro(&macros, "P", program)?,
-                &macro_or(&macros, "MONO", ""),
-                &require_macro(&macros, "M_THETA", program)?,
-                &require_macro(&macros, "M_Y", program)?,
-                &require_macro(&macros, "M_Z", program)?,
-                macro_or(&macros, "GEOM", "0").parse::<i32>().unwrap_or(0),
-            );
-            spawn_program(bridge, db, "kohzuCtl_soft", move |db| {
-                crate::snl::kohzu_ctl_soft::run(config, db)
-            });
-        }
-        "hrCtl" => {
-            let config = crate::snl::hr_ctl::HrConfig::new(
-                &require_macro(&macros, "P", program)?,
-                &macro_or(&macros, "N", "1"),
-                &require_macro(&macros, "M_PHI1", program)?,
-                &require_macro(&macros, "M_PHI2", program)?,
-            );
-            spawn_program(bridge, db, "hrCtl", move |db| {
-                crate::snl::hr_ctl::run(config, db)
-            });
-        }
-        "ml_monoCtl" => {
-            let config = crate::snl::ml_mono_ctl::MlMonoConfig::new(
-                &require_macro(&macros, "P", program)?,
-                &require_macro(&macros, "M_THETA", program)?,
-                &macro_or(&macros, "M_THETA2", ""),
-                &macro_or(&macros, "M_Y", ""),
-                &macro_or(&macros, "M_Z", ""),
-                macro_or(&macros, "Y_OFFSET", "35.0")
-                    .parse::<f64>()
-                    .unwrap_or(35.0),
-                macro_or(&macros, "GEOM", "0").parse::<i32>().unwrap_or(0),
-            );
-            spawn_program(bridge, db, "ml_monoCtl", move |db| {
-                crate::snl::ml_mono_ctl::run(config, db)
-            });
-        }
-        "orient" => {
-            let config = crate::snl::orient::OrientConfig::new(
-                &require_macro(&macros, "P", program)?,
-                &require_macro(&macros, "PM", program)?,
-                &require_macro(&macros, "mTTH", program)?,
-                &require_macro(&macros, "mTH", program)?,
-                &require_macro(&macros, "mCHI", program)?,
-                &require_macro(&macros, "mPHI", program)?,
-            );
-            spawn_program(bridge, db, "orient", move |db| {
-                crate::snl::orient::run(config, db)
-            });
-        }
-        "filterDrive" => {
-            let config = crate::snl::filter_drive::FilterDriveConfig::new(
-                &require_macro(&macros, "P", program)?,
-                &require_macro(&macros, "R", program)?,
-                macro_or(&macros, "N", "8").parse::<usize>().unwrap_or(8),
-            );
-            spawn_program(bridge, db, "filterDrive", move |db| {
-                crate::snl::filter_drive::run(config, db)
-            });
-        }
-        "pf4" => {
-            let config = crate::snl::pf4::Pf4Config::new(
-                &require_macro(&macros, "P", program)?,
-                &macro_or(&macros, "H", ""),
-                &require_macro(&macros, "B", program)?,
-            );
-            spawn_program(bridge, db, "pf4", move |db| {
-                crate::snl::pf4::run(config, db)
-            });
-        }
-        "Io" => {
-            let config = crate::snl::io::IoConfig::new(
-                &require_macro(&macros, "P", program)?,
-                &macro_or(&macros, "MONO", ""),
-                &macro_or(&macros, "VSC", ""),
-            );
-            bridge.spawn(async move {
-                if let Err(e) = crate::snl::io::run(config).await {
-                    eprintln!("Io error: {e}");
-                }
-            });
-        }
-        "flexCombinedMotion" => {
-            let config = crate::snl::flex_combined_motion::FlexConfig::new(
-                &require_macro(&macros, "P", program)?,
-                &require_macro(&macros, "M", program)?,
-                &macro_or(&macros, "CAP", ""),
-                &require_macro(&macros, "FM", program)?,
-                &require_macro(&macros, "CM", program)?,
-            );
-            bridge.spawn(async move {
-                if let Err(e) = crate::snl::flex_combined_motion::run(config).await {
-                    eprintln!("flexCombinedMotion error: {e}");
-                }
-            });
-        }
-        _ => {
-            return Err(format!(
-                "unknown program '{program}'. Available: kohzuCtl, kohzuCtl_soft, hrCtl, ml_monoCtl, orient, filterDrive, pf4, Io, flexCombinedMotion"
-            ));
-        }
+    if let Some(compiled) = SEQ_PROGRAMS.iter().find(|p| p.prog_name() == program) {
+        let _ = compiled.start(macro_str, 0, db);
+        return Ok(());
     }
-
-    println!("seq {program} started with macros: {macro_str}");
-    Ok(())
+    Err(format!("Can't find sequencer `{program}'."))
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use epics_base_rs::server::database::db_access::DbSubscription;
+    use epics_base_rs::server::ioc_builder::IocBuilder;
+    use epics_base_rs::server::records::busy::BusyRecord;
+
     use super::*;
 
-    #[test]
-    fn test_parse_macros() {
-        let m = parse_macros("P=mini:,M_THETA=dcm:theta, M_Y = dcm:y");
-        assert_eq!(m.get("P").unwrap(), "mini:");
-        assert_eq!(m.get("M_THETA").unwrap(), "dcm:theta");
-        assert_eq!(m.get("M_Y").unwrap(), "dcm:y");
+    /// `records` and the shipped `db`, past `iocInit`'s PINI pass. snc builds
+    /// `+c` by default, so a program starts only once every channel it
+    /// assigns has connected: the database must hold all of them.
+    async fn ioc(records: &str, db: &str, macros: &[(&str, &str)]) -> Arc<PvDatabase> {
+        let macros: HashMap<String, String> = macros
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let (db, _) = IocBuilder::new()
+            .register_record_type("busy", || Box::new(BusyRecord::default()))
+            .register_record_type("motor", || Box::new(motor_rs::MotorRecord::new()))
+            .db_string(records, &macros)
+            .unwrap()
+            .db_file(&format!("{}/db/{db}", env!("CARGO_MANIFEST_DIR")), &macros)
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        db.ioc_init().await;
+        db.mark_pini_done();
+        db
     }
 
-    #[test]
-    fn test_parse_macros_empty() {
-        let m = parse_macros("");
-        assert!(m.is_empty());
+    /// `filterDrive.db` under `P`, `R=f:`.
+    async fn filter_drive_ioc(p: &str) -> Arc<PvDatabase> {
+        let kev = format!("{p}kev");
+        ioc(
+            &format!("record(ao, \"{kev}\") {{}}\n"),
+            "filterDrive.db",
+            &[("P", p), ("R", "f:"), ("DESC", "fd"), ("KEV", &kev)],
+        )
+        .await
     }
 
+    /// `ml_monoSeq.db` under `P=Y:`, with the `th` the tests pass as
+    /// `M_THETA` and the program's default `m12`, `m10` and `m11` motors.
+    async fn ml_mono_ioc() -> Arc<PvDatabase> {
+        ioc(
+            "record(motor, \"Y:th\") {}\nrecord(motor, \"Y:m12\") {}\n\
+             record(motor, \"Y:m10\") {}\nrecord(motor, \"Y:m11\") {}\n",
+            "ml_monoSeq.db",
+            &[("P", "Y:")],
+        )
+        .await
+    }
+
+    /// `seq_main.c:67`, `:140-142`: every start posts the sequencer release
+    /// and the spawn on errlog, the thread named by the `name` macro, else by
+    /// the program. Io starts without the PINI wait and posts them the same.
+    #[epics_base_rs::epics_test]
+    async fn every_start_posts_seqs_errlog_lines() {
+        let lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = lines.clone();
+        epics_base_rs::runtime::log::errlog_add_listener(move |m| {
+            if m.contains("equencer") {
+                sink.lock().unwrap().push(m.trim_end().to_owned());
+            }
+        });
+        let db = PvDatabase::new();
+        let bridge = BlockingBridge::capture();
+        seq_start("Io", "name=io1", &bridge, &db).unwrap();
+        seq_start("kohzuCtl", "P=T:", &bridge, &db).unwrap();
+        epics_base_rs::runtime::log::errlog_flush();
+        let lines: Vec<String> = lines
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|l| {
+                let (head, tail) = l.split_once("thread 0x").unwrap_or((l, ""));
+                match tail.split_once(':') {
+                    Some((_, rest)) => format!("{head}thread *:{rest}"),
+                    None => l.clone(),
+                }
+            })
+            .collect();
+        let release = "sevr=info Sequencer release ";
+        assert_eq!(lines.len(), 4, "{lines:?}");
+        assert!(lines[0].starts_with(release) && lines[2].starts_with(release));
+        assert_eq!(
+            lines[1],
+            "sevr=info Spawning sequencer program \"Io\", thread *: \"io1\""
+        );
+        assert_eq!(
+            lines[3],
+            "sevr=info Spawning sequencer program \"kohzuCtl\", thread *: \"kohzuCtl\""
+        );
+    }
+
+    /// seq_cmd.c:162.
     #[test]
     fn test_unknown_program() {
         let rt = tokio::runtime::Runtime::new().unwrap();
@@ -238,51 +172,185 @@ mod tests {
             epics_base_rs::runtime::task::BlockingBridge::capture()
         };
         let db = PvDatabase::new();
-        let result = seq_start("nonexistent", "P=x:", &bridge, &db);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("unknown program"));
+        assert_eq!(
+            seq_start("nonexistent", "P=x:", &bridge, &db),
+            Err("Can't find sequencer `nonexistent'.".to_string())
+        );
     }
 
-    /// The lattice records kohzuCtl reads on its way to `ready`, as
-    /// `kohzuSeq.db` declares them, plus the d-spacing record it writes. The
-    /// motors are left out on purpose: a missing PV reads as 0 and swallows a
-    /// put, which is enough to reach the d-spacing write without a motor
-    /// record type. `Bragg2dSpacingAO` starts at -1 so "never written" is
-    /// told apart from the 0 an ungated start computes from H=K=L=0.
-    const KOHZU_LATTICE_DB: &str = r#"
-record(ao, "T:BraggHAO") { field(PINI, "YES") field(DOL, "1") }
-record(ao, "T:BraggKAO") { field(PINI, "YES") field(DOL, "1") }
-record(ao, "T:BraggLAO") { field(PINI, "YES") field(DOL, "1") }
-record(ao, "T:BraggAAO") { field(PINI, "YES") field(DOL, "5.43102") }
-record(ao, "T:Bragg2dSpacingAO") { field(PINI, "YES") field(DOL, "1") field(VAL, "-1") }
+    /// filterDrive's blade count is the `NUM_FILTERS` macro
+    /// (`filterDrive.st:338`), published to `NumFilters` by `start`.
+    #[epics_base_rs::epics_test]
+    async fn filter_drive_takes_its_blade_count_from_num_filters() {
+        let db = filter_drive_ioc("F:").await;
+        let bridge = epics_base_rs::runtime::task::BlockingBridge::capture();
+        seq_start(
+            "filterDrive",
+            "NAME=fd,P=F:,R=f:,NUM_FILTERS=2",
+            &bridge,
+            &db,
+        )
+        .unwrap();
+        for _ in 0..300 {
+            if db.get_pv("F:f:NumFilters").unwrap().to_f64() == Some(2.0) {
+                return;
+            }
+            epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("NumFilters is {:?}", db.get_pv("F:f:NumFilters").unwrap());
+    }
+
+    /// A negative count assigns no blade and is published as it is
+    /// (`filterDrive.st:344-367`).
+    #[epics_base_rs::epics_test]
+    async fn filter_drive_publishes_a_negative_num_filters() {
+        let db = filter_drive_ioc("N:").await;
+        let bridge = epics_base_rs::runtime::task::BlockingBridge::capture();
+        seq_start("filterDrive", "P=N:,R=f:,NUM_FILTERS=-1", &bridge, &db).unwrap();
+        for _ in 0..300 {
+            if db.get_pv("N:f:NumFilters").unwrap().to_f64() == Some(-1.0) {
+                return;
+            }
+            epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("NumFilters is {:?}", db.get_pv("N:f:NumFilters").unwrap());
+    }
+
+    /// initSequence puts the `Y_OFF` macro into the y offset
+    /// (`ml_monoCtl.st:520-530`), and updatePsuedo puts the y motor readback,
+    /// 0 here, once the readback's first monitor sets `yMotRdbk_mon`, as every
+    /// monitor sets its synced flag (`seq_ca.c:328-329`, `ml_monoCtl.st:1218`).
+    /// The two state sets run on their own threads, so either put may be the
+    /// last; C guarantees only that every value put is one of the two.
+    #[epics_base_rs::epics_test]
+    async fn ml_mono_puts_y_off_or_the_y_readback_into_its_y_offset() {
+        let db = ml_mono_ioc().await;
+        let mut sub = DbSubscription::subscribe(&db, "Y:ml_mono_yOffset")
+            .await
+            .unwrap();
+        let bridge = epics_base_rs::runtime::task::BlockingBridge::capture();
+        seq_start("ml_monoCtl", "P=Y:,M_THETA=th,Y_OFF=40", &bridge, &db).unwrap();
+        let mut posts = Vec::new();
+        for _ in 0..300 {
+            // initSequence's puts end on the y motor's name (`ml_monoCtl.st:536`)
+            let init_done = db.get_pv("Y:ml_monoYPv").unwrap().text_g() == "Y:m10";
+            while let Ok(e) = sub.try_recv_event() {
+                posts.push(e.value().as_value().and_then(|v| v.to_f64()));
+            }
+            if init_done && posts.contains(&Some(0.0)) {
+                assert!(
+                    posts.iter().all(|&p| p == Some(40.0) || p == Some(0.0)),
+                    "y offset posts {posts:?}"
+                );
+                return;
+            }
+            epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!(
+            "y offset posts {posts:?}, y motor {:?}",
+            db.get_pv("Y:ml_monoYPv").unwrap()
+        );
+    }
+
+    /// A motor macro the command line leaves out takes the program's default
+    /// (`ml_monoCtl.st:1`), which initSequence names in `{P}ml_monoTheta2Pv`.
+    #[epics_base_rs::epics_test]
+    async fn ml_mono_theta2_motor_defaults_to_m12() {
+        let db = ml_mono_ioc().await;
+        let bridge = epics_base_rs::runtime::task::BlockingBridge::capture();
+        seq_start("ml_monoCtl", "P=Y:,M_THETA=th", &bridge, &db).unwrap();
+        for _ in 0..300 {
+            if db.get_pv("Y:ml_monoTheta2Pv").unwrap().text_g() == "Y:m12" {
+                return;
+            }
+            epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!(
+            "theta2MotName is {:?}",
+            db.get_pv("Y:ml_monoTheta2Pv").unwrap()
+        );
+    }
+
+    /// `kohzuCtl.st:1` defines every macro the program reads, so `seq` starts
+    /// it on its prefix alone.
+    #[test]
+    fn kohzu_ctl_starts_on_its_program_defaults() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let bridge = {
+            let _guard = rt.enter();
+            epics_base_rs::runtime::task::BlockingBridge::capture()
+        };
+        let db = PvDatabase::new();
+        assert_eq!(seq_start("kohzuCtl", "P=T:", &bridge, &db), Ok(()));
+    }
+
+    /// The motors `kohzuSeq.db` leaves to the IOC. kohzuCtl is built `+c`,
+    /// so it starts only once every pv it assigns has connected.
+    const KOHZU_MOTORS: &str = r#"
+record(motor, "T:th") {}
+record(motor, "T:y") {}
+record(motor, "T:z") {}
 "#;
 
     fn two_d(db: &PvDatabase) -> f64 {
         db.get_pv("T:Bragg2dSpacingAO").unwrap().to_f64().unwrap()
     }
 
-    /// Load the fixture the way `st.cmd`'s `dbLoadRecords` does — into a
-    /// database still in its load phase, so every record's `init_record`
-    /// (where a constant `DOL` seeds `VAL`) is owed to `iocInit` and has NOT
-    /// run when `seqStart` follows.
-    async fn load_lattice(db: &PvDatabase) {
+    /// Load `kohzuSeq.db` and the motors the way `st.cmd`'s `dbLoadRecords`
+    /// does — into a database still in its load phase, so every record's
+    /// `init_record` (where a constant `DOL` seeds `VAL`) is owed to
+    /// `iocInit` and has NOT run when `seqStart` follows.
+    /// `Bragg2dSpacingAO` is set to -1, which neither the pass (its `DOL` 1,
+    /// then the program's 2a/√3) nor an ungated start (2A/0 from the
+    /// unprocessed lattice) writes.
+    async fn load_kohzu(db: &PvDatabase) {
         use epics_base_rs::server::db_loader;
+        db_loader::register_record_type(
+            "motor",
+            Box::new(|| Box::new(motor_rs::MotorRecord::new())),
+        );
+        db_loader::register_record_type(
+            "busy",
+            Box::new(|| Box::new(epics_base_rs::server::records::busy::BusyRecord::default())),
+        );
+        let macros: HashMap<String, String> = [
+            ("P", "T:"),
+            ("M_THETA", "th"),
+            ("M_Y", "y"),
+            ("M_Z", "z"),
+            ("yOffHi", "50"),
+            ("yOffLo", "-50"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let kohzu_db =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/db/kohzuSeq.db"))
+                .unwrap();
         db.begin_load().unwrap();
-        for mut def in db_loader::parse_db(KOHZU_LATTICE_DB, &HashMap::new()).unwrap() {
-            let mut record = db_loader::create_record(&def.record_type).unwrap();
-            let mut common_fields = Vec::new();
-            db_loader::apply_fields(&mut record, &def.fields, &mut common_fields).unwrap();
-            db.add_loaded_record(
-                &def.name,
-                record,
-                epics_base_rs::server::database::RecordLoad {
-                    common_fields,
-                    info_tags: std::mem::take(&mut def.info_tags),
-                },
-            )
-            .await
-            .unwrap();
+        for text in [kohzu_db.as_str(), KOHZU_MOTORS] {
+            for mut def in db_loader::parse_db(text, &macros).unwrap() {
+                let mut record = db_loader::create_record(&def.record_type).unwrap();
+                let mut common_fields = Vec::new();
+                db_loader::apply_fields(&mut record, &def.fields, &mut common_fields).unwrap();
+                db.add_loaded_record(
+                    &def.name,
+                    record,
+                    epics_base_rs::server::database::RecordLoad {
+                        common_fields,
+                        info_tags: std::mem::take(&mut def.info_tags),
+                    },
+                )
+                .await
+                .unwrap();
+            }
         }
+        db.get_record("T:Bragg2dSpacingAO")
+            .unwrap()
+            .write()
+            .record
+            .put_field("VAL", epics_base_rs::types::EpicsValue::Double(-1.0))
+            .unwrap();
     }
 
     /// `seqStart` is issued from `st.cmd`, before `iocInit`. The program must
@@ -293,7 +361,7 @@ record(ao, "T:Bragg2dSpacingAO") { field(PINI, "YES") field(DOL, "1") field(VAL,
     #[epics_base_rs::epics_test]
     async fn kohzu_ctl_reads_the_lattice_only_after_pini() {
         let db = PvDatabase::new();
-        load_lattice(&db).await;
+        load_kohzu(&db).await;
         let bridge = epics_base_rs::runtime::task::BlockingBridge::capture();
         seq_start("kohzuCtl", "P=T:,M_THETA=th,M_Y=y,M_Z=z", &bridge, &db).unwrap();
 

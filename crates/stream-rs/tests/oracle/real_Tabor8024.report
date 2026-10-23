@@ -1,0 +1,155 @@
+rec0: Tabor8024.proto getString(1,2,3,4,5,6,7,8,9) P
+getString {
+  extraInput    = error;
+  lockTimeout   = 30000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 3000; # ms
+  writeTimeout  = 3000; # ms
+  pollPeriod    = 3000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "1?";
+    in "%s";
+}
+rec1: Tabor8024.proto setString(1,2,3,4,5,6,7,8,9) P
+setString {
+  extraInput    = error;
+  lockTimeout   = 30000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 3000; # ms
+  writeTimeout  = 3000; # ms
+  pollPeriod    = 3000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "1 %s";
+}
+rec2: Tabor8024.proto getInt(1,2,3,4,5,6,7,8,9) P
+getInt {
+  extraInput    = ignore;
+  lockTimeout   = 30000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 3000; # ms
+  writeTimeout  = 3000; # ms
+  pollPeriod    = 3000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "1?";
+    in "%d";
+}
+rec3: Tabor8024.proto setInt(1,2,3,4,5,6,7,8,9) P
+setInt {
+  extraInput    = error;
+  lockTimeout   = 30000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 3000; # ms
+  writeTimeout  = 3000; # ms
+  pollPeriod    = 3000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "1 %d";
+}
+rec4: Tabor8024.proto getFloat(1,2,3,4,5,6,7,8,9) P
+getFloat {
+  extraInput    = error;
+  lockTimeout   = 30000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 3000; # ms
+  writeTimeout  = 3000; # ms
+  pollPeriod    = 3000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "1?";
+    in "%f";
+}
+rec5: Tabor8024.proto setFloat(1,2,3,4,5,6,7,8,9) P
+setFloat {
+  extraInput    = error;
+  lockTimeout   = 30000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 3000; # ms
+  writeTimeout  = 3000; # ms
+  pollPeriod    = 3000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "1 %f";
+}
+rec6: Tabor8024.proto setNone(1,2,3,4,5,6,7,8,9) P
+setNone {
+  extraInput    = error;
+  lockTimeout   = 30000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 3000; # ms
+  writeTimeout  = 3000; # ms
+  pollPeriod    = 3000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "1";
+}
+rec7: Tabor8024.proto setWaveform(1,2,3,4,5,6,7,8,9) P
+setWaveform {
+  extraInput    = error;
+  lockTimeout   = 30000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 3000; # ms
+  writeTimeout  = 10000; # ms
+  pollPeriod    = 3000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out ":TRAC:DATA #0%.2r\x0a";
+}
+rec8: Tabor8024.proto setUserWfSize(1,2,3,4,5,6,7,8,9) P
+setUserWfSize {
+  extraInput    = error;
+  lockTimeout   = 30000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 3000; # ms
+  writeTimeout  = 5000; # ms
+  pollPeriod    = 3000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out ":TRAC:DEL 1";
+    out ":TRAC:DEF 1,%d";
+}
+rec9: Tabor8024.proto getError(1,2,3,4,5,6,7,8,9) P
+getError {
+  extraInput    = error;
+  lockTimeout   = 30000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 3000; # ms
+  writeTimeout  = 3000; # ms
+  pollPeriod    = 3000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out ":SYST:ERR?";
+    in "%40c";
+}

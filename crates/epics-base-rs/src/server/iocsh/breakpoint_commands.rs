@@ -36,9 +36,9 @@ pub(crate) fn register(registry: &mut CommandRegistry) {
 /// C `iocshArgStringRecord` reaches the handler as `args[0].sval`, which is
 /// `NULL` when the argument was omitted. Every command but `dbc`/`dbs` treats
 /// that as its usage error; those two treat it as "the default lock set".
-fn sval(args: &[ArgValue], index: usize) -> Option<&str> {
+fn sval(args: &[ArgValue], index: usize) -> Option<&[u8]> {
     match args.get(index) {
-        Some(ArgValue::String(s)) if !s.is_empty() => Some(s.as_str()),
+        Some(ArgValue::String(s)) if !s.is_empty() => Some(s.as_bytes()),
         _ => None,
     }
 }
@@ -56,13 +56,13 @@ fn ival(args: &[ArgValue], index: usize) -> i32 {
 /// shared by the five commands that require a name (`dbBkpt.c:285-288`,
 /// `:410-413`, `:858-861`).
 fn usage(ctx: &CommandContext, command: &str) -> CommandResult {
-    ctx.println(&format!("Usage: {command} \"record_name\""));
+    ctx.console_println(&format!("Usage: {command} \"record_name\""));
     Ok(CommandOutcome::Failed)
 }
 
 /// Print the message and fail the line — every `BkptError` path in C.
 fn refuse(ctx: &CommandContext, err: &BkptError) -> CommandResult {
-    ctx.println(&err.message());
+    ctx.console_println(&err.message());
     Ok(CommandOutcome::Failed)
 }
 
@@ -76,16 +76,17 @@ fn table_with_printer(ctx: &CommandContext) -> Arc<BreakpointTable> {
     let table = ctx.db().breakpoints_or_install();
     let db = ctx.db().clone();
     let bridge = ctx.bridge().clone();
-    table.set_printer(Arc::new(move |name: &str| {
+    table.set_printer(Arc::new(move |name: &[u8]| {
         // C `dbPrint` (`dbBkpt.c:818-821`): a blank line, the level-2 dump,
         // then the hanging `-> ` prompt. Its own context, because the one the
-        // `dbb` line ran on is long gone by the time a record processes — and
-        // `CommandContext::new` writes to stdout, which is where C's `printf`
-        // goes.
+        // `dbb` line ran on is long gone by the time a record processes. The
+        // dump is dbTest.c's `dbpr`; the rest is dbBkpt.c's plain `printf`.
         let ctx = CommandContext::new(db.clone(), bridge.clone());
-        ctx.println("");
+        ctx.console_println("");
         super::commands::dbpr_report(&ctx, name, 2);
-        ctx.print_fmt(format_args!("-> "));
+        print!("-> ");
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
     }));
     table
 }
@@ -211,7 +212,7 @@ fn cmd_dbs() -> CommandDef {
     )
 }
 
-fn resume(ctx: &CommandContext, name: Option<&str>, stepping: bool) -> CommandResult {
+fn resume(ctx: &CommandContext, name: Option<&[u8]>, stepping: bool) -> CommandResult {
     let Some(table) = ctx.db().breakpoints() else {
         return refuse(ctx, &BkptError::NoneStopped);
     };
@@ -223,7 +224,7 @@ fn resume(ctx: &CommandContext, name: Option<&str>, stepping: bool) -> CommandRe
     match outcome {
         Ok(announcement) => {
             if let Some(line) = announcement {
-                ctx.println(&line);
+                ctx.console_println(&line);
             }
             Ok(CommandOutcome::Continue)
         }
@@ -242,7 +243,7 @@ fn cmd_dbstat() -> CommandDef {
         |_args: &[ArgValue], ctx: &CommandContext| {
             if let Some(table) = ctx.db().breakpoints() {
                 for line in table.status(ctx.db()) {
-                    ctx.println(&line.render());
+                    ctx.console_println(&line.render());
                 }
             }
             Ok(CommandOutcome::Continue)
@@ -311,7 +312,7 @@ fn cmd_dbap() -> CommandDef {
             };
             match breakpoint::toggle_autoprint(ctx.db(), name) {
                 Ok(line) => {
-                    ctx.println(&line);
+                    ctx.console_println(&line);
                     Ok(CommandOutcome::Continue)
                 }
                 Err(e) => refuse(ctx, &e),
@@ -364,7 +365,7 @@ mod tests {
         );
 
         let cmd = reg.get("dbb").unwrap();
-        let args = parse_args(&["BKPT:ONE".to_string()], &cmd.args).unwrap();
+        let args = parse_args(&["BKPT:ONE".into()], &cmd.args).unwrap();
         assert!(
             matches!(cmd.handler.call(&args, &ctx), Ok(CommandOutcome::Continue)),
             "dbb on a record with a lock set must succeed"
@@ -406,5 +407,34 @@ mod tests {
             stat[0].render()
         );
         std::mem::forget(rt);
+    }
+
+    /// dbBkpt.c does not include `epicsStdio.h`, so its lines stay on the
+    /// console under `cmd > f`. C oracle (`oracleStdIoc`): every `f` empty.
+    #[test]
+    fn the_debugger_s_lines_stay_on_the_console() {
+        let shell = crate::server::iocsh::tests::make_shell();
+        shell.ctx.db().build_lock_sets();
+        let console = |line| {
+            let (file, console) = shell.file_and_console(line);
+            assert_eq!(file, "", "{line}");
+            console
+        };
+        assert_eq!(console("dbb"), "Usage: dbb \"record_name\"\n");
+        assert_eq!(
+            console("dbc"),
+            "   BKPT> No records are currently stopped\n"
+        );
+        assert_eq!(console("dbb TEST_REC"), "");
+        assert!(console("dbstat").starts_with("LSet: "));
+        assert_eq!(
+            console("dbap TEST_REC"),
+            "   BKPT> Auto print on for record TEST_REC\n"
+        );
+        assert_eq!(console("dbd TEST_REC"), "");
+        assert_eq!(
+            console("dbd TEST_REC"),
+            "   BKPT> No breakpoint set in this record\n"
+        );
     }
 }

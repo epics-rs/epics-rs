@@ -1,0 +1,233 @@
+rec0: SRS_SG390.proto getIdString(1,2,3,4,5,6,7,8,9) P
+getIdString {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 500; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\n";
+  separator     = "";
+
+    out "*IDN?";
+    in "%120c";
+}
+rec1: SRS_SG390.proto getFreq(1,2,3,4,5,6,7,8,9) P
+getFreq {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 500; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\n";
+  separator     = "";
+
+    out "FREQ?";
+    in "%f";
+}
+rec2: SRS_SG390.proto setFreq(1,2,3,4,5,6,7,8,9) P
+setFreq {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 500; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\n";
+  separator     = "";
+
+    out "FREQ %f";
+}
+rec3: SRS_SG390.proto setFreqMHz(1,2,3,4,5,6,7,8,9) P
+setFreqMHz {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 500; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\n";
+  separator     = "";
+
+    out "FREQ %f MHz";
+}
+rec4: SRS_SG390.proto getFreqMHz(1,2,3,4,5,6,7,8,9) P
+getFreqMHz {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 500; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\n";
+  separator     = "";
+
+    out "FREQ? MHz";
+    in "%f";
+}
+rec5: SRS_SG390.proto getAmp(1,2,3,4,5,6,7,8,9) P
+getAmp {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 500; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\n";
+  separator     = "";
+
+    out "AMPR?";
+    in "%f";
+}
+rec6: SRS_SG390.proto setAmp(1,2,3,4,5,6,7,8,9) P
+setAmp {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 500; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\n";
+  separator     = "";
+
+    out "AMPR %f";
+}
+rec7: SRS_SG390.proto getAmpRMS(1,2,3,4,5,6,7,8,9) P
+getAmpRMS {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 500; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\n";
+  separator     = "";
+
+    out "AMPR? RMS";
+    in "%f";
+}
+rec8: SRS_SG390.proto setAmpRMS(1,2,3,4,5,6,7,8,9) P
+setAmpRMS {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 500; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\n";
+  separator     = "";
+
+    out "AMPR %f RMS";
+}
+rec9: SRS_SG390.proto getPhase(1,2,3,4,5,6,7,8,9) P
+getPhase {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 500; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\n";
+  separator     = "";
+
+    out "PHAS?";
+    in "%f";
+}
+rec10: SRS_SG390.proto setPhase(1,2,3,4,5,6,7,8,9) P
+setPhase {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 500; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\n";
+  separator     = "";
+
+    out "PHAS %f";
+}
+rec11: SRS_SG390.proto getRF(1,2,3,4,5,6,7,8,9) P
+getRF {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 500; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\n";
+  separator     = "";
+
+    out "ENBR?";
+    in "%d";
+}
+rec12: SRS_SG390.proto setRF(1,2,3,4,5,6,7,8,9) P
+setRF {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 500; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\n";
+  separator     = "";
+
+    out "ENBR %d";
+}
+rec13: SRS_SG390.proto getLF(1,2,3,4,5,6,7,8,9) P
+getLF {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 500; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\n";
+  separator     = "";
+
+    out "ENBL?";
+    in "%d";
+}
+rec14: SRS_SG390.proto setLF(1,2,3,4,5,6,7,8,9) P
+setLF {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 500; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\n";
+  separator     = "";
+
+    out "ENBL %d";
+}

@@ -1,0 +1,8 @@
+Terminator = CR LF;
+f { out "X"; in "Receviced input %f"; }
+m { out "GET"; in "%d"; }
+z { out "A" 0x00 "B"; in "Receviced input %f"; }
+t { LockTimeout = 700; WriteTimeout = 30; ReplyTimeout = 250; ReadTimeout = 50; MaxInput = 10; out "X"; in "%s"; }
+i { in "Receviced input %f"; }
+r { out "X"; in "Receviced input %f"; @init { out "I"; in "Receviced input %f"; } }
+n { InTerminator = ""; out "X"; in "Receviced input %f%*s"; }

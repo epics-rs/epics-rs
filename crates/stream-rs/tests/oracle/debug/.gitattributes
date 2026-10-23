@@ -1,0 +1,2 @@
+# writeRequest prints the output as it is, CR included
+*.log -text

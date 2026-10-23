@@ -38,7 +38,7 @@ async fn add(db: &PvDatabase, name: &str, record: Box<dyn Record>) {
     db.add_record(name, record).await.unwrap();
 }
 
-async fn time_of(db: &PvDatabase, name: &str) -> std::time::SystemTime {
+async fn time_of(db: &PvDatabase, name: &str) -> epics_base_rs::types::WallTime {
     let rec = db.get_record(name).unwrap();
     let inst = rec.read();
     inst.common.time

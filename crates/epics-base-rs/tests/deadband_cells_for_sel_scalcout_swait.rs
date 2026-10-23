@@ -22,10 +22,10 @@ use epics_base_rs::types::EpicsValue;
 
 fn instance(rtype: &str) -> RecordInstance {
     match rtype {
-        "sel" => RecordInstance::new("D:SEL".into(), SelRecord::default()),
-        "scalcout" => RecordInstance::new("D:SCALC".into(), ScalcoutRecord::default()),
-        "swait" => RecordInstance::new("D:SWAIT".into(), SwaitRecord::default()),
-        "ai" => RecordInstance::new("D:AI".into(), AiRecord::default()),
+        "sel" => RecordInstance::new("D:SEL", SelRecord::default()),
+        "scalcout" => RecordInstance::new("D:SCALC", ScalcoutRecord::default()),
+        "swait" => RecordInstance::new("D:SWAIT", SwaitRecord::default()),
+        "ai" => RecordInstance::new("D:AI", AiRecord::default()),
         other => panic!("unknown case {other}"),
     }
 }

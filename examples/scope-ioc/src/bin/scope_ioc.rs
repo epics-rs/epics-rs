@@ -21,6 +21,7 @@ use scope_ioc::driver::*;
 use epics_base_rs::error::CaResult;
 use epics_base_rs::server::iocsh::registry::*;
 use epics_ca_rs::server::ioc_app::IocApplication;
+use epics_libcom_rs::cfmt::CFloat;
 
 // ========== DriverHolder + Command Handlers ==========
 
@@ -46,25 +47,31 @@ struct ConfigHandler {
 }
 
 impl CommandHandler for ConfigHandler {
-    fn call(&self, args: &[ArgValue], _ctx: &CommandContext) -> CommandResult {
+    fn call(&self, args: &[ArgValue], ctx: &CommandContext) -> CommandResult {
         let port_name = match &args[0] {
-            ArgValue::String(s) => s.clone(),
+            ArgValue::String(s) => s.to_str()?.to_owned(),
             _ => return Err("portName required".into()),
         };
 
         println!("scopeSimulatorConfig: port={port_name}");
 
+        let claim = asyn_rs::manager::claim_port_driver(&port_name).map_err(|e| e.to_string())?;
         let notify = Arc::new(Notify::new());
         let driver = ScopeSimulator::new(&port_name, notify.clone());
         let indices = driver.param_indices();
 
         // Create the port runtime (actor thread + PortHandle)
         let (runtime_handle, _actor_jh) =
-            create_port_runtime(driver, RuntimeConfig::default()).map_err(|e| e.to_string())?;
+            create_port_runtime(&claim, driver, RuntimeConfig::default())
+                .map_err(|e| e.to_string())?;
 
         // Register port in global registry so universal asyn device support can find it
         let port_handle = runtime_handle.port_handle().clone();
-        asyn_rs::asyn_record::register_port(&port_name, port_handle.clone())
+        claim
+            .publish(
+                port_handle.clone(),
+                ctx.db().scan_control().interrupt_gate(),
+            )
             .map_err(|e| e.to_string())?;
 
         // Start background simulation task using the PortHandle API
@@ -137,14 +144,14 @@ impl CommandHandler for ReportHandler {
         println!("ScopeSimulator Report");
         println!("  Run:            {}", if run != 0 { "Yes" } else { "No" });
         println!("  MaxPoints:      {max_pts}");
-        println!("  UpdateTime:     {update_t:.3} s");
-        println!("  VoltsPerDiv:    {vpd:.3} V");
-        println!("  TimePerDiv:     {tpd:.4} s");
-        println!("  VoltOffset:     {offset:.3} V");
-        println!("  NoiseAmplitude: {noise:.3} V");
-        println!("  MinValue:       {min_v:.4}");
-        println!("  MaxValue:       {max_v:.4}");
-        println!("  MeanValue:      {mean_v:.4}");
+        println!("  UpdateTime:     {:.3} s", CFloat(update_t));
+        println!("  VoltsPerDiv:    {:.3} V", CFloat(vpd));
+        println!("  TimePerDiv:     {:.4} s", CFloat(tpd));
+        println!("  VoltOffset:     {:.3} V", CFloat(offset));
+        println!("  NoiseAmplitude: {:.3} V", CFloat(noise));
+        println!("  MinValue:       {:.4}", CFloat(min_v));
+        println!("  MaxValue:       {:.4}", CFloat(max_v));
+        println!("  MeanValue:      {:.4}", CFloat(mean_v));
 
         Ok(CommandOutcome::Continue)
     }
@@ -157,12 +164,12 @@ impl CommandHandler for ReportHandler {
 async fn main() -> CaResult<()> {
     let args: Vec<String> = std::env::args().collect();
 
-    epics_base_rs::runtime::env::set_default("SCOPE_IOC", env!("CARGO_MANIFEST_DIR"));
+    epics_base_rs::runtime::env::set_default_path("SCOPE_IOC", env!("CARGO_MANIFEST_DIR"));
 
     let script = if args.len() > 1 && !args[1].starts_with('-') {
         args[1].clone()
     } else {
-        eprintln!("Usage: scope_ioc <st.cmd>");
+        epics_base_rs::stderr_println!("Usage: scope_ioc <st.cmd>");
         std::process::exit(1);
     };
 
@@ -207,25 +214,15 @@ async fn main() -> CaResult<()> {
     // The runner paired with the two protocol registrars, because `casr` and
     // `pvxsr` have to answer from the script's first line and `.run(runner)`
     // reaches only the interactive shell.
-    epics_bridge_rs::qsrv::run_ca_pva_qsrv_ioc_app(
-        app.startup_script(&script)
-            // External links resolve with zero further setup: both link sets
-            // install at the base `AfterCaLinkInit` hook — before
-            // `setup_cp_links` warms Passive CP holders and before the iocInit
-            // external-link wait — the `ca` and `pva` link sets.
-            .register_link_set_installer(epics_ca_rs::calink::calink_link_set_install)
-            .register_link_set_installer(epics_bridge_rs::qsrv::pvalink_link_set_install),
-    )
-    .await
+    epics_bridge_rs::qsrv::run_ca_pva_qsrv_ioc_app(app.startup_script(&script)).await
 }
 
 /// The `exec_backend` arm: the dual-protocol runner this IOC hands its
 /// `IocApplication` to is compiled only on the tokio backend.
 #[cfg(exec_backend)]
 fn main() -> CaResult<()> {
-    eprintln!(
+    epics_base_rs::runtime::task::refuse_backend(
         "scope_ioc needs the tokio backend; this build selects the \
-         reactor-free execution model (EPICS_RS_BUILD_EXEC_BACKEND=thread)."
-    );
-    Ok(())
+         reactor-free execution model (EPICS_RS_BUILD_EXEC_BACKEND=thread).",
+    )
 }

@@ -92,6 +92,24 @@ impl BitSet {
         self.bytes[byte_idx] & (1 << (i % 8)) != 0
     }
 
+    /// True iff any bit in `range` is set; bits past the storage read as
+    /// clear. A structure's subtree is `bit..bit + desc.total_bits()`.
+    pub fn any_in(&self, range: std::ops::Range<usize>) -> bool {
+        let end = range.end.min(self.bytes.len() * 8);
+        if range.start >= end {
+            return false;
+        }
+        let (first, last) = (range.start / 8, (end - 1) / 8);
+        let lo = 0xFFu8 << (range.start % 8);
+        let hi = 0xFFu8 >> (7 - (end - 1) % 8);
+        if first == last {
+            return self.bytes[first] & lo & hi != 0;
+        }
+        self.bytes[first] & lo != 0
+            || self.bytes[first + 1..last].iter().any(|&b| b != 0)
+            || self.bytes[last] & hi != 0
+    }
+
     /// Set every bit that is set in `other`.
     pub fn union_with(&mut self, other: &BitSet) {
         if self.bytes.len() < other.bytes.len() {
@@ -236,6 +254,26 @@ impl BitSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn any_in_matches_a_per_bit_scan_at_every_boundary() {
+        // Single bits at byte edges and interior, against every range
+        // over and past a 3-byte store: empty, inside one byte, spanning
+        // bytes, ending exactly on a set bit, starting just past it.
+        for set in [0usize, 7, 8, 12, 15, 16, 23] {
+            let mut b = BitSet::new();
+            b.set(23); // storage is 3 bytes whichever bit is under test
+            b.clear(23);
+            b.set(set);
+            for start in 0..=26 {
+                for end in start..=26 {
+                    let scan = (start..end).any(|i| b.get(i));
+                    assert_eq!(b.any_in(start..end), scan, "bit {set} range {start}..{end}");
+                }
+            }
+        }
+        assert!(!BitSet::new().any_in(0..64));
+    }
 
     #[test]
     fn empty_bitset_encodes_as_zero_size() {

@@ -19,6 +19,7 @@
 // record-layer cases keep compiling in that configuration.
 #![cfg(feature = "ioc")]
 
+use asyn_rs::port::InterfaceMask;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -26,6 +27,7 @@ use ad_core_rs::attributes::{NDAttrValue, NDAttributeSource};
 use ad_core_rs::driver::ndarray_driver::{
     ATTR_STATUS_OK, ATTR_STATUS_XML_SYNTAX_ERROR, NDArrayDriverBase,
 };
+use ad_core_rs::plugin::runtime::ASYN_CANBLOCK;
 use epics_base_rs::server::records::ai::AiRecord;
 #[cfg(tokio_backend)]
 use epics_ca_rs::client::CaClient;
@@ -33,6 +35,8 @@ use epics_ca_rs::client::CaClient;
 use epics_ca_rs::server::CaServer;
 
 const PV: &str = "ADATTR:Temp";
+#[cfg(tokio_backend)]
+const PREC_PV: &str = "ADATTR:Prec";
 
 fn attributes_xml() -> String {
     format!(
@@ -43,7 +47,7 @@ fn attributes_xml() -> String {
 
 fn load_attributes(drv: &mut NDArrayDriverBase, xml: &str) -> Result<(), ()> {
     drv.port_base
-        .set_string_param(drv.params.attributes_file, 0, xml.to_string())
+        .set_string_param(drv.params.attributes_file, 0, xml)
         .expect("set NDAttributesFile");
     drv.read_nd_attributes_file().map_err(|_| ())
 }
@@ -67,7 +71,15 @@ fn status(drv: &NDArrayDriverBase) -> i32 {
 /// rather than reporting the file as loaded.
 #[test]
 fn an_epics_pv_attribute_with_no_ca_client_stays_undefined_and_says_so() {
-    let mut drv = NDArrayDriverBase::new("ADATTR_NOCLIENT", 1 << 20).expect("driver");
+    let mut drv = NDArrayDriverBase::new(
+        "ADATTR_NOCLIENT",
+        1,
+        1 << 20,
+        ASYN_CANBLOCK,
+        InterfaceMask::UNMIGRATED_SUBCLASS,
+        InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
+    )
+    .expect("driver");
 
     assert!(
         load_attributes(&mut drv, &attributes_xml()).is_err(),
@@ -81,9 +93,12 @@ fn an_epics_pv_attribute_with_no_ca_client_stays_undefined_and_says_so() {
 #[cfg(tokio_backend)]
 #[tokio::test]
 async fn an_epics_pv_attribute_is_fed_from_the_installed_ca_client() {
+    let mut prec3 = AiRecord::new(42.5);
+    prec3.prec = 3;
     let server = CaServer::builder()
         .port(0)
         .record(PV, AiRecord::new(42.5))
+        .record(PREC_PV, prec3)
         .build()
         .await
         .expect("build CA server");
@@ -99,10 +114,25 @@ async fn an_epics_pv_attribute_is_fed_from_the_installed_ca_client() {
     }
     let client = Arc::new(CaClient::new().await.expect("CA client"));
 
-    let mut drv = NDArrayDriverBase::new("ADATTR_FED", 1 << 20).expect("driver");
+    let mut drv = NDArrayDriverBase::new(
+        "ADATTR_FED",
+        1,
+        1 << 20,
+        ASYN_CANBLOCK,
+        InterfaceMask::UNMIGRATED_SUBCLASS,
+        InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
+    )
+    .expect("driver");
     drv.set_ca_client(client, tokio::runtime::Handle::current());
 
-    load_attributes(&mut drv, &attributes_xml()).expect("a fed EPICS_PV attribute loads clean");
+    // C asks the IOC for DBR_STRING (PVAttribute.cpp:294), which renders the
+    // ai at its PREC.
+    let xml = format!(
+        "<Attributes><Attribute name=\"Temp\" type=\"EPICS_PV\" source=\"{PV}\" \
+         dbrtype=\"DBR_DOUBLE\"/><Attribute name=\"Text\" type=\"EPICS_PV\" \
+         source=\"{PREC_PV}\" dbrtype=\"DBR_STRING\"/></Attributes>"
+    );
+    load_attributes(&mut drv, &xml).expect("a fed EPICS_PV attribute loads clean");
     assert_eq!(status(&drv), ATTR_STATUS_OK);
 
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -110,6 +140,21 @@ async fn an_epics_pv_attribute_is_fed_from_the_installed_ca_client() {
         match attribute_value(&drv, "Temp") {
             NDAttrValue::Float64(v) => {
                 assert!((v - 42.5).abs() < 1e-9, "monitored value was {v}");
+                break;
+            }
+            other => {
+                assert!(
+                    Instant::now() < deadline,
+                    "the EPICS_PV attribute never left {other:?}"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+    }
+    loop {
+        match attribute_value(&drv, "Text") {
+            NDAttrValue::String(text) => {
+                assert_eq!(text, "42.500");
                 break;
             }
             other => {

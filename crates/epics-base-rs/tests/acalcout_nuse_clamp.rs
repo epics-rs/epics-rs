@@ -83,7 +83,10 @@ async fn the_process_time_clamp_posts_the_corrected_nuse() {
 
     assert_eq!(nuse(&db).await, 4, "process clamped NUSE to NELM");
     let event = rx.try_recv().expect("the clamp must post NUSE");
-    assert_eq!(event.snapshot.value, EpicsValue::ULong(4));
+    assert_eq!(
+        event.value().as_value().cloned().unwrap(),
+        EpicsValue::ULong(4)
+    );
 }
 
 /// `special(NUSE)` — C clamps, posts a bare `DBE_VALUE`, and returns -1, so the
@@ -106,7 +109,10 @@ async fn a_put_of_an_illegal_nuse_is_refused_and_the_clamped_value_is_posted() {
     assert!(status.is_err(), "C's special() returns -1: the put fails");
     assert_eq!(nuse(&db).await, 4, "the clamped value stays");
     let event = rx.try_recv().expect("the refused put must still post NUSE");
-    assert_eq!(event.snapshot.value, EpicsValue::ULong(4));
+    assert_eq!(
+        event.value().as_value().cloned().unwrap(),
+        EpicsValue::ULong(4)
+    );
 }
 
 /// A LEGAL put is unaffected — the refusal is not a blanket rejection of NUSE.

@@ -45,7 +45,12 @@
 //! stores 1 (`strtol` stops at the `.`).
 
 use crate::error::{CaError, CaResult};
+pub use crate::runtime::stdlib::{
+    atoi, atol, long_to_int, scanf_long, scanf_ulong, strtol, strtol_errno, strtoll, strtoll_errno,
+    strtoul, strtoul_auto, strtoul_errno, strtoull, strtoull_errno, ulong_to_uint,
+};
 use crate::types::{DbFieldType, EpicsValue};
+use std::ffi::{c_long, c_ulong};
 
 /// A destination C reaches through a numeric parse on a `DBR_STRING` put.
 ///
@@ -364,12 +369,11 @@ fn parse_two_way(target: NumericField, s: &str) -> Option<EpicsValue> {
         // value outside it (`epicsStdlib.c:181-261`).
         NumericField::Char => EpicsValue::Char(in_range(parse_long(s)?, -0x80, 0x7f)? as i8 as u8),
         NumericField::Short => EpicsValue::Short(in_range(parse_long(s)?, -0x8000, 0x7fff)? as i16),
-        NumericField::Long => {
-            EpicsValue::Long(in_range(parse_long(s)?, -0x8000_0000, 0x7fff_ffff)? as i32)
-        }
-        // `epicsParseInt64` adds no check of its own: `long` is 64 bits here, so
-        // `strtol`'s own ERANGE is the whole range test (`epicsStdlib.c:281-297`).
-        NumericField::Int64 => EpicsValue::Int64(parse_long(s)?),
+        NumericField::Long => EpicsValue::Long(epics_parse_int32_units(s)?),
+        // `epicsParseInt64` adds no check of its own: it reads `long long`
+        // where `long` is narrower, so `strtoll`'s ERANGE is the whole range
+        // test (`epicsStdlib.c:281-297`).
+        NumericField::Int64 => EpicsValue::Int64(converted(strtoll_errno(s, 0))?.0),
 
         // The unsigned widths deliberately admit a NEGATIVE value. C's test is
         //
@@ -382,8 +386,9 @@ fn parse_two_way(target: NumericField, s: &str) -> Option<EpicsValue> {
         // out-of-range *positive* band is rejected.
         NumericField::UChar => EpicsValue::UChar(outside_band(parse_ulong(s)?, 0xff)? as u8),
         NumericField::UShort => EpicsValue::UShort(outside_band(parse_ulong(s)?, 0xffff)? as u16),
-        // No band: the destination is as wide as `unsigned long`.
-        NumericField::UInt64 => EpicsValue::UInt64(parse_ulong(s)?),
+        // No band: `epicsParseUInt64` reads `unsigned long long` where
+        // `unsigned long` is narrower (`epicsStdlib.c:300-315`).
+        NumericField::UInt64 => EpicsValue::UInt64(converted(strtoull_errno(s, 0))?.0),
 
         NumericField::Float => EpicsValue::Float(narrow_to_f32(parse_double(s)?)?),
         NumericField::Double => EpicsValue::Double(parse_double(s)?),
@@ -426,13 +431,13 @@ pub(crate) fn narrow_to_f32(v: f64) -> Option<f32> {
 }
 
 /// `value < lo || value > hi` -> `S_stdlib_overflow`.
-fn in_range(v: i64, lo: i64, hi: i64) -> Option<i64> {
+fn in_range(v: c_long, lo: c_long, hi: c_long) -> Option<c_long> {
     (lo..=hi).contains(&v).then_some(v)
 }
 
 /// C's unsigned band test: reject only `value > max && value <= !max`. The
 /// complement — a sign-extended negative — is accepted and truncated.
-fn outside_band(v: u64, max: u64) -> Option<u64> {
+fn outside_band(v: c_ulong, max: c_ulong) -> Option<c_ulong> {
     (!(v > max && v <= !max)).then_some(v)
 }
 
@@ -458,26 +463,23 @@ fn outside_band(v: u64, max: u64) -> Option<u64> {
 /// field becomes 1); this owner refuses without writing — puts here are atomic.
 fn parse_ulong_via_double(s: &str) -> Row {
     let stored = |v: u32| Row::Stored(EpicsValue::ULong(v));
-    let d = scan_int(s, 0);
-    let int_value = if d.any {
-        let parsed = (|| {
-            let v = u64::try_from(d.magnitude?).ok()?;
-            let v = if d.negative { v.wrapping_neg() } else { v };
-            Some(outside_band(v, 0xffff_ffff)? as u32)
-        })();
-        match parsed {
-            // An integer parse that overflowed gets NO fallback: C's `status`
-            // is not `S_stdlib_noConversion`, so the via-double arm is skipped
-            // and the overflow is returned.
-            None => return Row::Refused,
-            some => some,
-        }
+    // An integer parse that overflowed gets NO fallback: C's `status` is not
+    // `S_stdlib_noConversion`, so the via-double arm is skipped and the
+    // overflow is returned.
+    let Some((v, end)) = strtoul_errno(s, 0) else {
+        return Row::Refused;
+    };
+    let int_value = if end > 0 {
+        let Some(v) = outside_band(v, 0xffff_ffff) else {
+            return Row::Refused;
+        };
+        Some(v as u32)
     } else {
         None
     };
     let stopped_at_float = s
         .as_bytes()
-        .get(d.end)
+        .get(end)
         .is_some_and(|c| matches!(c, b'.' | b'e' | b'E'));
     match int_value {
         Some(prefix) if stopped_at_float => match parse_double(s) {
@@ -499,117 +501,20 @@ fn parse_ulong_via_double(s: &str) -> Row {
     }
 }
 
-/// What the integer scanner found, before it is given a signedness.
-struct Digits {
-    negative: bool,
-    /// Magnitude, without the sign. `None` once it exceeds `u64`, which is what
-    /// `strtol`/`strtoul` report as `ERANGE`.
-    magnitude: Option<u128>,
-    /// Whether any digit was consumed at all. `false` is `strtol`'s
-    /// `endp == str`, i.e. `S_stdlib_noConversion`.
-    any: bool,
-    /// Byte index where scanning stopped — `strtol`'s `*endp`. C's
-    /// `putStringUlong` reads the character here to decide on the
-    /// via-double fallback.
-    end: usize,
-}
-
-/// The scanning half of `strtol`/`strtoul`: leading space, an optional sign,
-/// the base prefix, then the digits. Trailing text is left unread — whether
-/// that is legal is the caller's `units` argument, not this scanner's business.
-///
-/// `base == 0` is `strtol`'s auto-detect, which is what `dbConvertBase` gives
-/// the `dbConvert` rows; `dbtpf` passes a literal 10 instead, so `0x10` there
-/// scans as the single digit `0` and leaves `x10` for the extraneous test.
-fn scan_int(s: &str, mut base: u32) -> Digits {
-    let b = s.as_bytes();
-    let mut i = 0;
-    while i < b.len() && crate::runtime::stdlib::c_isspace(b[i] as char) {
-        i += 1;
-    }
-    let negative = i < b.len() && b[i] == b'-';
-    if i < b.len() && (b[i] == b'-' || b[i] == b'+') {
-        i += 1;
-    }
-
-    // Base detection, `dbConvertBase == 0`. A prefix only counts when a digit of
-    // that base follows it; otherwise the leading `0` is itself the number and
-    // the `x`/`b` is trailing text. `0b` is binary on the reference toolchain
-    // (glibc implements the C23 binary literal in `strtol` base 0, measured:
-    // `caput REC.PREC 0b11` stores 3).
-    if base == 0 {
-        base = 10;
-        if i < b.len() && b[i] == b'0' {
-            let next = b.get(i + 1).map(|c| c.to_ascii_lowercase());
-            let after = b.get(i + 2).copied();
-            if next == Some(b'x') && after.is_some_and(|c| c.is_ascii_hexdigit()) {
-                base = 16;
-                i += 2;
-            } else if next == Some(b'b') && after.is_some_and(|c| c == b'0' || c == b'1') {
-                base = 2;
-                i += 2;
-            } else {
-                // The leading `0` is a valid octal digit and is consumed by the loop.
-                base = 8;
-            }
-        }
-    }
-
-    let mut magnitude = Some(0u128);
-    let mut any = false;
-    while i < b.len() {
-        let Some(d) = (b[i] as char).to_digit(base) else {
-            break;
-        };
-        any = true;
-        magnitude = magnitude
-            .and_then(|m| m.checked_mul(u128::from(base)))
-            .and_then(|m| m.checked_add(u128::from(d)));
-        i += 1;
-    }
-    Digits {
-        negative,
-        magnitude,
-        any,
-        end: i,
-    }
-}
-
-/// C `strtol`'s signed result plus `epicsParseLong`'s status: `None` for
-/// `S_stdlib_noConversion` and for `ERANGE`.
-fn long_from(d: &Digits) -> Option<i64> {
-    if !d.any {
-        return None;
-    }
-    let m = d.magnitude?;
-    if d.negative {
-        // `-i64::MIN` has no positive counterpart, so the bound is asymmetric.
-        (m <= i64::MAX as u128 + 1).then(|| (m as i128).wrapping_neg() as i64)
-    } else {
-        (m <= i64::MAX as u128).then_some(m as i64)
-    }
-}
-
-/// C `strtoul`'s unsigned result plus `epicsParseULong`'s status. A leading `-`
-/// negates modulo 2^64 and is NOT an error — that is what lets `-1` reach an
-/// unsigned field as `ULONG_MAX`.
-fn ulong_from(d: &Digits) -> Option<u64> {
-    if !d.any {
-        return None;
-    }
-    let m = d.magnitude?;
-    let v = u64::try_from(m).ok()?;
-    Some(if d.negative { v.wrapping_neg() } else { v })
+/// `epicsParse*`'s status over a `strto*_errno` read: `None` for `ERANGE` and
+/// for `S_stdlib_noConversion` (`endp == str`).
+fn converted<T>(read: Option<(T, usize)>) -> Option<(T, usize)> {
+    read.filter(|&(_, end)| end > 0)
 }
 
 /// C `strtol(s, &end, 0)` plus `epicsParseLong`'s status.
-fn parse_long(s: &str) -> Option<i64> {
-    long_from(&scan_int(s, 0))
+fn parse_long(s: &str) -> Option<c_long> {
+    converted(strtol_errno(s, 0)).map(|(v, _)| v)
 }
 
 /// C `strtoul(s, &end, 0)` plus `epicsParseULong`'s status.
-fn parse_ulong(s: &str) -> Option<u64> {
-    ulong_from(&scan_int(s, 0))
+fn parse_ulong(s: &str) -> Option<c_ulong> {
+    converted(strtoul_errno(s, 0)).map(|(v, _)| v)
 }
 
 /// `if (c && !units) return S_stdlib_extraneous;`, after the trailing
@@ -620,16 +525,10 @@ fn extraneous(s: &str, end: usize) -> bool {
         .is_empty()
 }
 
-fn strict_long(s: &str, base: u32) -> Option<i64> {
-    let d = scan_int(s, base);
-    let v = long_from(&d)?;
-    (!extraneous(s, d.end)).then_some(v)
-}
-
-fn strict_ulong(s: &str, base: u32) -> Option<u64> {
-    let d = scan_int(s, base);
-    let v = ulong_from(&d)?;
-    (!extraneous(s, d.end)).then_some(v)
+/// A `strto*_errno` read under `units == NULL`.
+fn strict<T>(s: &str, read: Option<(T, usize)>) -> Option<T> {
+    let (v, end) = converted(read)?;
+    (!extraneous(s, end)).then_some(v)
 }
 
 /// The `epicsParse*(str, &value, 10, NULL)` family — the STRICT form, which
@@ -665,26 +564,49 @@ pub fn parse_auto_base_units_null(target: NumericField, s: &str) -> Option<Epics
     parse_units_null(target, s, 0)
 }
 
+/// C `epicsParseUInt16(s, &val, dbConvertBase, NULL)` (`epicsStdlib.c:229-243`),
+/// as `putStringMenu` and `dbPutStringNum` call it: any tail but whitespace is
+/// extraneous.
+pub fn epics_parse_uint16(s: &str) -> Option<u16> {
+    Some(outside_band(strict(s, strtoul_errno(s, 0))?, 0xffff)? as u16)
+}
+
+/// C `epicsParseInt32(s, &val, 0, &end)` (`epicsStdlib.c:246-261`): the
+/// tail after the number is the caller's.
+pub fn epics_parse_int32_units(s: &str) -> Option<i32> {
+    Some(in_range(parse_long(s)?, -0x8000_0000, 0x7fff_ffff)? as i32)
+}
+
+/// [`epics_parse_uint16`] with a `units` pointer, as `putStringEnum` passes
+/// `&end`: the tail after the number is the caller's.
+pub fn epics_parse_uint16_units(s: &str) -> Option<u16> {
+    Some(outside_band(parse_ulong(s)?, 0xffff)? as u16)
+}
+
 fn parse_units_null(target: NumericField, s: &str, base: u32) -> Option<EpicsValue> {
     Some(match target {
         NumericField::Char => {
-            EpicsValue::Char(in_range(strict_long(s, base)?, -0x80, 0x7f)? as i8 as u8)
+            EpicsValue::Char(in_range(strict(s, strtol_errno(s, base))?, -0x80, 0x7f)? as i8 as u8)
         }
         NumericField::Short => {
-            EpicsValue::Short(in_range(strict_long(s, base)?, -0x8000, 0x7fff)? as i16)
+            EpicsValue::Short(in_range(strict(s, strtol_errno(s, base))?, -0x8000, 0x7fff)? as i16)
         }
         NumericField::Long => {
-            EpicsValue::Long(in_range(strict_long(s, base)?, -0x8000_0000, 0x7fff_ffff)? as i32)
+            EpicsValue::Long(
+                in_range(strict(s, strtol_errno(s, base))?, -0x8000_0000, 0x7fff_ffff)? as i32,
+            )
         }
-        NumericField::Int64 => EpicsValue::Int64(strict_long(s, base)?),
-        NumericField::UChar => EpicsValue::UChar(outside_band(strict_ulong(s, base)?, 0xff)? as u8),
+        NumericField::Int64 => EpicsValue::Int64(strict(s, strtoll_errno(s, base))?),
+        NumericField::UChar => {
+            EpicsValue::UChar(outside_band(strict(s, strtoul_errno(s, base))?, 0xff)? as u8)
+        }
         NumericField::UShort => {
-            EpicsValue::UShort(outside_band(strict_ulong(s, base)?, 0xffff)? as u16)
+            EpicsValue::UShort(outside_band(strict(s, strtoul_errno(s, base))?, 0xffff)? as u16)
         }
         NumericField::ULong => {
-            EpicsValue::ULong(outside_band(strict_ulong(s, base)?, 0xffff_ffff)? as u32)
+            EpicsValue::ULong(outside_band(strict(s, strtoul_errno(s, base))?, 0xffff_ffff)? as u32)
         }
-        NumericField::UInt64 => EpicsValue::UInt64(strict_ulong(s, base)?),
+        NumericField::UInt64 => EpicsValue::UInt64(strict(s, strtoull_errno(s, base))?),
         // `epicsParseFloat32`/`Float64` are `epicsParseDouble` with the same
         // NULL `units`, which is the one this workspace already owns.
         NumericField::Float => EpicsValue::Float(narrow_to_f32(
@@ -696,168 +618,14 @@ fn parse_units_null(target: NumericField, s: &str, base: u32) -> Option<EpicsVal
     })
 }
 
-/// C `epicsParseDouble` (`epicsStdlib.c:150-176`): `strtod`, then ERANGE is a
-/// refusal whichever way it went — overflow to infinity, or underflow to zero
-/// or to a subnormal. Verified on the reference softIoc: `1e400`, `-1e400`,
-/// `1e-320` and `4.9e-324` are all refused, while `NaN`, `Inf` and `infinity`
-/// are stored.
+/// C `epicsParseDouble` with `units` (`epicsStdlib.c:150-176`): ERANGE is a
+/// refusal whichever way it went, and trailing text is the caller's. Verified
+/// on the reference softIoc: `1e400`, `-1e400`, `1e-320` and `4.9e-324` are
+/// refused, `NaN`, `Inf`, `infinity` and `12.34.56` (as 12.34) stored.
 fn parse_double(s: &str) -> Option<f64> {
-    let (v, kind) = strtod(s)?;
-    match kind {
-        // An `inf`/`nan` LITERAL sets no errno: the value is exact, not a range
-        // failure. Only a finite literal that *became* infinite overflowed.
-        Literal::NonFinite => Some(v),
-        Literal::Finite { significant } => {
-            if v.is_infinite() {
-                return None; // ERANGE, overflowed
-            }
-            if v == 0.0 && significant {
-                return None; // ERANGE, underflowed to zero
-            }
-            if v != 0.0 && v.abs() < f64::MIN_POSITIVE {
-                return None; // ERANGE, underflowed to a subnormal
-            }
-            Some(v)
-        }
-    }
-}
-
-enum Literal {
-    /// An `inf`/`nan` word — exact, never a range error.
-    NonFinite,
-    /// A numeric literal. `significant` records whether its mantissa held a
-    /// non-zero digit, which is what tells `0.0` (exact) from `1e-400` (a value
-    /// that underflowed *to* zero and must be refused).
-    Finite { significant: bool },
-}
-
-/// The scanning half of `strtod`: leading space, sign, then an `inf`/`nan`
-/// word, a hex-float, or a decimal float. Returns the value and which kind of
-/// literal it was; `None` is `endp == str` (`S_stdlib_noConversion`).
-///
-/// The hex form is not decoration — `strtod` accepts it and so does the
-/// reference IOC: `caput REC.VAL 0x10` stores 16.
-fn strtod(s: &str) -> Option<(f64, Literal)> {
-    let t = s.trim_start_matches(crate::runtime::stdlib::c_isspace);
-    let (sign, body) = match t.as_bytes().first() {
-        Some(b'-') => (-1.0, &t[1..]),
-        Some(b'+') => (1.0, &t[1..]),
-        _ => (1.0, t),
-    };
-    let lower = body.to_ascii_lowercase();
-
-    if lower.starts_with("infinity") || lower.starts_with("inf") {
-        return Some((sign * f64::INFINITY, Literal::NonFinite));
-    }
-    if lower.starts_with("nan") {
-        // `strtod` gives NaN the sign it was written with; NaN has no ordering,
-        // so only the sign bit differs and no consumer of a record field reads it.
-        return Some((f64::NAN, Literal::NonFinite));
-    }
-    if lower.starts_with("0x") {
-        let (v, significant) = hex_float(&lower[2..])?;
-        return Some((sign * v, Literal::Finite { significant }));
-    }
-
-    // Decimal: the longest prefix Rust's own parser accepts, which is the same
-    // grammar `strtod` scans. It yields `inf` on overflow and `0.0`/subnormal on
-    // underflow instead of an errno, which `parse_double` then classifies.
-    //
-    // At most ONE `.`: `strtod` ends the mantissa at the second one and leaves
-    // the rest as trailing text, which every call site here permits (a non-NULL
-    // `units`). Scanning greedily instead made the whole slice unparseable and
-    // refused the put, so `12.34.56` — accepted by C as 12.34 into a DBF_DOUBLE
-    // or DBF_FLOAT, and as 12 into a DBF_ULONG through `cvt_st_ul`'s via-double
-    // fallback (`dbFastLinkConv.c:172-187`) — was rejected outright. Bounding
-    // the scan is also what makes `body[..i]` a well-formed float literal by
-    // construction rather than by hope.
-    let b = body.as_bytes();
-    let mut i = 0;
-    let mut significant = false;
-    let mut mantissa_digits = 0;
-    let mut seen_point = false;
-    while i < b.len() {
-        if b[i].is_ascii_digit() {
-            mantissa_digits += 1;
-            significant |= b[i] != b'0';
-        } else if b[i] == b'.' && !seen_point {
-            seen_point = true;
-        } else {
-            break;
-        }
-        i += 1;
-    }
-    if mantissa_digits == 0 {
-        return None;
-    }
-    let mantissa_end = i;
-    // An exponent counts only when it actually has digits — `1e` is the value 1
-    // followed by the trailing text `e`.
-    if i < b.len() && (b[i] | 0x20) == b'e' {
-        let mut j = i + 1;
-        if j < b.len() && (b[j] == b'+' || b[j] == b'-') {
-            j += 1;
-        }
-        if j < b.len() && b[j].is_ascii_digit() {
-            while j < b.len() && b[j].is_ascii_digit() {
-                j += 1;
-            }
-            i = j;
-        }
-    }
-    let v: f64 = body[..i]
-        .parse()
-        .or_else(|_| body[..mantissa_end].parse())
-        .ok()?;
-    Some((sign * v, Literal::Finite { significant }))
-}
-
-/// `strtod`'s hex form: `h.h[p±d]`, the digits scaled by 2^exponent.
-fn hex_float(s: &str) -> Option<(f64, bool)> {
-    let b = s.as_bytes();
-    let mut i = 0;
-    let mut mantissa = 0.0f64;
-    let mut significant = false;
-    let mut digits = 0;
-    while i < b.len() && b[i].is_ascii_hexdigit() {
-        let d = (b[i] as char).to_digit(16)?;
-        mantissa = mantissa * 16.0 + f64::from(d);
-        significant |= d != 0;
-        digits += 1;
-        i += 1;
-    }
-    let mut scale = 0i32;
-    if i < b.len() && b[i] == b'.' {
-        i += 1;
-        while i < b.len() && b[i].is_ascii_hexdigit() {
-            let d = (b[i] as char).to_digit(16)?;
-            mantissa = mantissa * 16.0 + f64::from(d);
-            significant |= d != 0;
-            digits += 1;
-            scale -= 4;
-            i += 1;
-        }
-    }
-    if digits == 0 {
-        return None;
-    }
-    if i < b.len() && b[i] == b'p' {
-        let mut j = i + 1;
-        let neg = b.get(j) == Some(&b'-');
-        if b.get(j) == Some(&b'+') || neg {
-            j += 1;
-        }
-        let start = j;
-        let mut e = 0i32;
-        while j < b.len() && b[j].is_ascii_digit() {
-            e = e.saturating_mul(10).saturating_add((b[j] - b'0') as i32);
-            j += 1;
-        }
-        if j > start {
-            scale += if neg { -e } else { e };
-        }
-    }
-    Some((mantissa * (scale as f64).exp2(), significant))
+    crate::runtime::stdlib::epics_parse_double_units(s)
+        .ok()
+        .map(|(v, _)| v)
 }
 
 #[cfg(test)]
@@ -873,6 +641,38 @@ mod tests {
             // `None` for both would let a store-skip pass as a refusal.
             Ok(Converted::Unchanged) | Err(_) => None,
         }
+    }
+
+    #[test]
+    fn strtod_words_and_hex_are_case_blind_epicsstdlib_150() {
+        // softIoc R7.0.10, `caput H <s>` into an ao VAL.
+        for (s, v) in [("0X1P4", 16.0), ("0x1p4", 16.0), ("0x1.8P1", 3.0)] {
+            assert_eq!(
+                put(NumericField::Double, s),
+                Some(EpicsValue::Double(v)),
+                "{s}"
+            );
+        }
+        assert_eq!(
+            put(NumericField::Double, "INF"),
+            Some(EpicsValue::Double(f64::INFINITY))
+        );
+        assert_eq!(
+            put(NumericField::Double, "-Inf"),
+            Some(EpicsValue::Double(f64::NEG_INFINITY))
+        );
+        assert!(
+            matches!(put(NumericField::Double, "NAN"), Some(EpicsValue::Double(v)) if v.is_nan())
+        );
+    }
+
+    #[test]
+    fn a_0x_without_hex_digits_reads_as_zero_epicsstdlib_150() {
+        // softIoc R7.0.10: `caput H 0XG` stores 0.
+        assert_eq!(
+            put(NumericField::Double, "0XG"),
+            Some(EpicsValue::Double(0.0))
+        );
     }
 
     /// The array row — same parse, no empty-string carve-out.

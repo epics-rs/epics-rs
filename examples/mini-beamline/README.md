@@ -45,7 +45,7 @@ The MovingDot acquisition task is fully async. A driver author only needs three 
 |------|---------|
 | `PortHandle` | Read/write parameters via `read_int32().await`, `set_params_and_notify().await` |
 | `ArrayPublisher` | Publish a generated frame to downstream plugins: `publisher.publish(frame).await` |
-| `QueuedArrayCounter` | Wait until in-flight frames drain at end of acquisition |
+| `DriverPool` | Frames plugins receive; their queued count holds ADAcquireBusy under WaitForPlugins |
 
 The acquisition loop runs inside a `current_thread` tokio runtime created by the task thread. All I/O is async and reliable — there are no lossy or blocking APIs in the data path.
 
@@ -210,7 +210,7 @@ cargo build --release -p mini-beamline --features ioc
 ```bash
 # 1. Enable callbacks on the driver AND on the plugin that serves ArrayData.
 #    NDPluginBase.template defaults EnableCallbacks to Disable, and
-#    commonPlugins.cmd does not override it, so without this ArrayData
+#    the st.cmd's image1 does not override it, so without this ArrayData
 #    stays at its .db value however many frames the driver produces.
 caput mini:dot:cam1:ArrayCallbacks 1
 caput mini:dot:image1:EnableCallbacks 1
@@ -317,8 +317,8 @@ Values must be set before the `miniBeamlineConfig()` call.
 Motors are configured in `st.cmd` using `simMotorCreate` and `dbLoadRecords`:
 
 ```
-# simMotorCreate(port, lowLimit, highLimit, [pollMs])
-simMotorCreate("ph_mtr", -100, 100, 100)
+# simMotorCreate(port, lowLimit, highLimit, [pollMs]), limits in steps
+simMotorCreate("ph_mtr", -100000, 100000, 100)
 
 # dbLoadRecords(template, macros)
 #   VELO, ACCL, HLM, LLM, MRES, PREC have defaults in motor.template
@@ -343,9 +343,9 @@ Optics devices are configured in `st.cmd`:
 
 ```bash
 # Kohzu DCM: 3 SimMotors + kohzuSeq.db + kohzuCtl state machine
-simMotorCreate("dcm_theta", -10, 90, 100)
-simMotorCreate("dcm_y", -50, 50, 100)
-simMotorCreate("dcm_z", -50, 50, 100)
+simMotorCreate("dcm_theta", -10000, 90000, 100)
+simMotorCreate("dcm_y", -50000, 50000, 100)
+simMotorCreate("dcm_z", -50000, 50000, 100)
 dbLoadRecords("$(MOTOR)/motor.template", "P=mini:,M=dcm:theta,PORT=dcm_theta")
 dbLoadRecords("$(MOTOR)/motor.template", "P=mini:,M=dcm:y,PORT=dcm_y")
 dbLoadRecords("$(MOTOR)/motor.template", "P=mini:,M=dcm:z,PORT=dcm_z")

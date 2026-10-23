@@ -1,0 +1,83 @@
+rec0: Synaccess_netBooter.proto reboot(1,2,3,4,5,6,7,8,9) P
+reboot {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    out "$A4 1";
+    in "%*s";
+}
+rec1: Synaccess_netBooter.proto setall(1,2,3,4,5,6,7,8,9) P
+setall {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    out "$A7 1";
+    in "%*s";
+}
+rec2: Synaccess_netBooter.proto set(1,2,3,4,5,6,7,8,9) P
+set {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    out "$A3 1 %d";
+    in "%*s";
+}
+rec3: Synaccess_netBooter.proto get_status5(1,2,3,4,5,6,7,8,9) P
+get_status5 {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "\r\n";
+  separator     = "";
+  @Mismatch {
+    in "%*1c$A5\x0d\x0a%*4c%(12status5.RVAL)1b%(12status4.RVAL)1b%(12status3.RVAL)1b%(12status2.RVAL)1b%(12status1.RVAL)1b";
+  }
+
+    out "$A5";
+    in "$A5\x0d\x0a%*4c%(12status5.RVAL)1b%(12status4.RVAL)1b%(12status3.RVAL)1b%(12status2.RVAL)1b%(12status1.RVAL)1b";
+}
+rec4: Synaccess_netBooter.proto get_status16(1,2,3,4,5,6,7,8,9) P
+get_status16 {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    out "$A5";
+    in "$A5\x0d\x0d\x0a%*4c%(12status16.RVAL)1b%(12status15.RVAL)1b%(12status14.RVAL)1b%(12status13.RVAL)1b%(12status12.RVAL)1b%(12status11.RVAL)1b%(12status10.RVAL)1b%(12status9.RVAL)1b%(12status8.RVAL)1b%(12status7.RVAL)1b%(12status6.RVAL)1b%(12status5.RVAL)1b%(12status4.RVAL)1b%(12status3.RVAL)1b%(12status2.RVAL)1b%(12status1.RVAL)1b";
+}

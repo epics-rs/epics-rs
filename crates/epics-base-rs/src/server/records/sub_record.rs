@@ -1,4 +1,5 @@
 use crate::error::{CaError, CaResult};
+use crate::server::record::{CycleCell, CycleRead, CycleValue};
 use crate::server::record::{InputFetchPolicy, ProcessOutcome, Record};
 use crate::types::{EpicsValue, PvString};
 
@@ -11,6 +12,23 @@ const VAL_NAMES: [&str; INP_ARG_MAX] = [
     "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q", "R", "S",
     "T", "U",
 ];
+
+/// `LA..LU`, C's `pold` copies of `A..U`.
+const PREV_NAMES: [&str; INP_ARG_MAX] = [
+    "LA", "LB", "LC", "LD", "LE", "LF", "LG", "LH", "LI", "LJ", "LK", "LL", "LM", "LN", "LO", "LP",
+    "LQ", "LR", "LS", "LT", "LU",
+];
+
+/// VAL, then `A..U`: all `monitor()` posts (`subRecord.c:396-410`).
+const SUB_MONITORED: [&str; INP_ARG_MAX + 1] = {
+    let mut t = ["VAL"; INP_ARG_MAX + 1];
+    let mut i = 0;
+    while i < INP_ARG_MAX {
+        t[1 + i] = VAL_NAMES[i];
+        i += 1;
+    }
+    t
+};
 
 /// The 21 input link field names `INPA..INPU`.
 const INP_NAMES: [&str; INP_ARG_MAX] = [
@@ -56,9 +74,13 @@ pub struct SubRecord {
     /// `.db` load, not runtime-settable by clients.
     pub inam: PvString,
     /// Input links `INPA..INPU`.
-    pub inp: [String; INP_ARG_MAX],
+    pub inp: [PvString; INP_ARG_MAX],
     /// Input values `A..U`.
     pub a: [f64; INP_ARG_MAX],
+    /// `LA..LU`: the `A..U` `monitor()` last posted.
+    pub la: [f64; INP_ARG_MAX],
+    /// This cycle's `monitor()` posts of `A..U`, a bit per input.
+    input_changes: u32,
     /// Monitor / archive deadbands and last-posted trackers. C
     /// `subRecord.c::monitor` (lines 386-394) gates the `VAL` post on the
     /// MDEL/ADEL deadbands against MLST/ALST, and `checkAlarms` (319-373)
@@ -84,8 +106,10 @@ impl Default for SubRecord {
             val: 0.0,
             snam: PvString::new(),
             inam: PvString::new(),
-            inp: std::array::from_fn(|_| String::new()),
+            inp: std::array::from_fn(|_| PvString::new()),
             a: [0.0; INP_ARG_MAX],
+            la: [0.0; INP_ARG_MAX],
+            input_changes: 0,
             mdel: 0.0,
             adel: 0.0,
             lalm: 0.0,
@@ -97,6 +121,74 @@ impl Default for SubRecord {
 }
 
 impl Record for SubRecord {
+    crate::slot_map!(crate::server::record::dbd_generated::slots::sub;
+        fields:
+        VAL => val,
+        SNAM => snam,
+        INAM => inam,
+        MDEL => mdel,
+        ADEL => adel,
+        LALM => lalm,
+        MLST => mlst,
+        ALST => alst,
+        A => a[0],
+        LA => la[0],
+        B => a[1],
+        LB => la[1],
+        C => a[2],
+        LC => la[2],
+        D => a[3],
+        LD => la[3],
+        E => a[4],
+        LE => la[4],
+        F => a[5],
+        LF => la[5],
+        G => a[6],
+        LG => la[6],
+        H => a[7],
+        LH => la[7],
+        I => a[8],
+        LI => la[8],
+        J => a[9],
+        LJ => la[9],
+        K => a[10],
+        LK => la[10],
+        L => a[11],
+        LL => la[11],
+        M => a[12],
+        LM => la[12],
+        N => a[13],
+        LN => la[13],
+        O => a[14],
+        LO => la[14],
+        P => a[15],
+        LP => la[15],
+        Q => a[16],
+        LQ => la[16],
+        R => a[17],
+        LR => la[17],
+        S => a[18],
+        LS => la[18],
+        T => a[19],
+        LT => la[19],
+        U => a[20],
+        LU => la[20];
+        custom: INPA, INPB, INPC, INPD, INPE, INPF, INPG, INPH, INPI, INPJ, INPK, INPL, INPM,
+            INPN, INPO, INPP, INPQ, INPR, INPS, INPT, INPU, BRSV;
+        spill: EGU, HOPR, LOPR, HIHI, LOLO, HIGH, LOW, PREC, HHSV, LLSV, HSV, LSV, HYST);
+
+    fn acts_before_process(&self) -> bool {
+        false
+    }
+
+    fn cycle_hooks(&self) -> crate::server::record::CycleHooks {
+        crate::server::record::CycleHooks::NONE
+    }
+
+    fn has_array_monitor_post(&self) -> bool {
+        false
+    }
+
     fn record_type(&self) -> &'static str {
         "sub"
     }
@@ -115,14 +207,6 @@ impl Record for SubRecord {
     // (`ioc_app::wire_subroutine`) and not from here — this ran in pass 0,
     // before the resolution existed, and seeded the trackers of records C
     // leaves at zero.
-
-    /// Empty for the reason the note above `record_type` gives: `sub`'s
-    /// tracker seed is `subRecord.c:130-132`, the tail below `init_record`'s
-    /// two early returns, and only a record whose SNAM actually resolved
-    /// reaches it. The generic tail runs before the resolution and so cannot
-    /// answer that; `ioc_app::wire_subroutine`, which performs the resolution,
-    /// does it there.
-    fn seed_deadband_tracking(&mut self) {}
 
     /// C `subRecord.c:119-123`: an empty `SNAM` names no subroutine, so
     /// `init_record` prints `"%s.SNAM is empty"`, sets `prec->pact = TRUE` and
@@ -152,8 +236,63 @@ impl Record for SubRecord {
     fn process(&mut self) -> CaResult<ProcessOutcome> {
         // The subroutine is invoked by the framework via
         // `RecordInstance::subroutine` (it needs the registry of
-        // named functions, which the record does not own).
+        // named functions, which the record does not own), before this.
+        // C `monitor()` (`:403-410`): each input that differs from its LA..LU
+        // posts and advances `*pold = *pnew`, on every cycle.
+        let mut changes = 0;
+        for (i, (new, old)) in self.a.iter().zip(&mut self.la).enumerate() {
+            if *new != *old {
+                *old = *new;
+                changes |= 1 << i;
+            }
+        }
+        self.input_changes = changes;
         Ok(ProcessOutcome::complete())
+    }
+
+    /// `monitor()` posts VAL and `A..U` alone.
+    fn process_posted_fields(&self) -> Option<crate::server::record::DeclaredFields> {
+        Some(
+            &const {
+                crate::server::record::declared_set(
+                    crate::server::record::dbd_generated::SUB_FIELDS,
+                    SUB_MONITORED,
+                )
+            },
+        )
+    }
+
+    /// Each moved input with `monitor_mask | DBE_VALUE | DBE_LOG`
+    /// (`subRecord.c:405`); `process()` made the comparisons.
+    fn take_cycle_posted_fields(&mut self) -> crate::server::record::CycleMarks {
+        use crate::server::record::{CycleMarks, CyclePostMask, uniform_post_table};
+        static POSTS: [(crate::server::record::FieldIx, CyclePostMask); INP_ARG_MAX] =
+            uniform_post_table(
+                crate::server::record::dbd_generated::SUB_FIELDS,
+                &VAL_NAMES,
+                CyclePostMask::MonitorValueLog,
+            );
+        CycleMarks::of(&POSTS, u128::from(std::mem::take(&mut self.input_changes)))
+    }
+
+    fn fields_posted_only_when_marked(&self) -> &'static [&'static str] {
+        &VAL_NAMES
+    }
+
+    /// The deadband classes, with the walk told to take this cycle's input
+    /// marks only when there are any.
+    fn monitor_value_classes(
+        &mut self,
+        gate: crate::server::record::MonitorValueGate,
+        last_posted: &mut [f64; 2],
+    ) -> crate::server::record::MonitorValueClasses {
+        let mut classes = crate::server::record::monitor_deadband_classes(
+            self,
+            gate.array_monitor_post,
+            last_posted,
+        );
+        classes.marked = self.input_changes != 0;
+        classes
     }
 
     /// C `subRecord.c::do_sub` writes `prec->udf` in exactly one place — the
@@ -173,12 +312,34 @@ impl Record for SubRecord {
     /// C reads `prec->inpa..inpu` off the record and copies nothing; the generic
     /// `get_field` path hands back an owned `EpicsValue` per link, which is
     /// 21 clones on every cycle of a record that wires none of them.
-    fn link_text_ref(&self, link_field: &str) -> Option<&str> {
+    fn link_text_ref(&self, link_field: &str) -> Option<&[u8]> {
         let [b'I', b'N', b'P', slot] = *link_field.as_bytes() else {
             return None;
         };
         let slot = usize::from(slot.checked_sub(b'A')?);
-        self.inp.get(slot).map(String::as_str)
+        self.inp.get(slot).map(PvString::as_bytes)
+    }
+
+    fn cycle_cell(&self, cell: CycleCell) -> CycleRead {
+        match cell {
+            CycleCell::Val => CycleRead::Value(CycleValue::Double(self.val)),
+            CycleCell::Mdel => CycleRead::Value(CycleValue::Double(self.mdel)),
+            CycleCell::Adel => CycleRead::Value(CycleValue::Double(self.adel)),
+            CycleCell::Mlst => CycleRead::Value(CycleValue::Double(self.mlst)),
+            CycleCell::Alst => CycleRead::Value(CycleValue::Double(self.alst)),
+            CycleCell::Lalm => CycleRead::Value(CycleValue::Double(self.lalm)),
+            _ => CycleRead::Absent,
+        }
+    }
+
+    fn put_cycle_cell(&mut self, cell: CycleCell, value: CycleValue) -> CaResult<()> {
+        match (cell, value) {
+            (CycleCell::Lalm, CycleValue::Double(v)) => self.lalm = v,
+            (CycleCell::Alst, CycleValue::Double(v)) => self.alst = v,
+            (CycleCell::Mlst, CycleValue::Double(v)) => self.mlst = v,
+            (cell, value) => return self.put_field(cell.name(), value.into()),
+        }
+        Ok(())
     }
 
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
@@ -199,6 +360,9 @@ impl Record for SubRecord {
         }
         if let Some(idx) = VAL_NAMES.iter().position(|&n| n == name) {
             return Some(EpicsValue::Double(self.a[idx]));
+        }
+        if let Some(idx) = PREV_NAMES.iter().position(|&n| n == name) {
+            return Some(EpicsValue::Double(self.la[idx]));
         }
         None
     }
@@ -268,7 +432,7 @@ impl Record for SubRecord {
         if let Some(idx) = INP_NAMES.iter().position(|&n| n == name) {
             return match value {
                 EpicsValue::String(s) => {
-                    self.inp[idx] = s.as_str_lossy().into_owned();
+                    self.inp[idx] = s;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
@@ -276,6 +440,12 @@ impl Record for SubRecord {
         }
         if let Some(idx) = VAL_NAMES.iter().position(|&n| n == name) {
             self.a[idx] = value
+                .to_f64()
+                .ok_or_else(|| CaError::TypeMismatch(name.into()))?;
+            return Ok(());
+        }
+        if let Some(idx) = PREV_NAMES.iter().position(|&n| n == name) {
+            self.la[idx] = value
                 .to_f64()
                 .ok_or_else(|| CaError::TypeMismatch(name.into()))?;
             return Ok(());
@@ -369,7 +539,7 @@ mod tests {
         rec.put_field("VAL", EpicsValue::Double(7.0)).unwrap();
         rec.init_record(0).unwrap();
         rec.init_record(1).unwrap();
-        rec.seed_deadband_tracking();
+        rec.seed_deadband_tracking(crate::server::device_support::DsetInit::Ok);
         for field in ["MLST", "ALST", "LALM"] {
             assert_eq!(
                 rec.get_field(field),

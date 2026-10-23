@@ -1,0 +1,285 @@
+rec0: InstekGPP.proto getIDN(1,2,3,4,5,6,7,8,9) P
+getIDN {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+  @Init {
+    out "*IDN?";
+    in "%39c";
+  }
+
+    out "*IDN?";
+    in "%39c";
+}
+rec1: InstekGPP.proto getError(1,2,3,4,5,6,7,8,9) P
+getError {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out ":SYST:ERR?";
+    in "%39c";
+}
+rec2: InstekGPP.proto getAllmeas(1,2,3,4,5,6,7,8,9) P
+getAllmeas {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out ":MEAS1:ALL?";
+    in "%f,%(2)f,%*f";
+}
+rec3: InstekGPP.proto getVset(1,2,3,4,5,6,7,8,9) P
+getVset {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out ":SOUR:VOLT:ALL?";
+    in "%f,%(1)f,%*f";
+}
+rec4: InstekGPP.proto getIset(1,2,3,4,5,6,7,8,9) P
+getIset {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out ":SOUR:CURR:ALL?";
+    in "%f,%(1)f,%*f";
+}
+rec5: InstekGPP.proto getOutState(1,2,3,4,5,6,7,8,9) P
+getOutState {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out ":OUTP1:STAT?";
+    in "%s";
+}
+rec6: InstekGPP.proto getCurrLimState(1,2,3,4,5,6,7,8,9) P
+getCurrLimState {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out ":SOUR1:CURR:LIM:STAT?";
+    in "%d";
+}
+rec7: InstekGPP.proto setOutState(1,2,3,4,5,6,7,8,9) P
+setOutState {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out ":OUTP1:STAT %s";
+}
+rec8: InstekGPP.proto setVolt(1,2,3,4,5,6,7,8,9) P
+setVolt {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "SOUR1:VOLT %f";
+}
+rec9: InstekGPP.proto setCurrent(1,2,3,4,5,6,7,8,9) P
+setCurrent {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "SOUR1:CURR %f";
+}
+rec10: InstekGPP.proto getOVPValue(1,2,3,4,5,6,7,8,9) P
+getOVPValue {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out ":OUTP1:OVP?";
+    in "%f";
+}
+rec11: InstekGPP.proto getOVPState(1,2,3,4,5,6,7,8,9) P
+getOVPState {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out ":OUTP1:OVP:STAT?";
+    in "%s";
+}
+rec12: InstekGPP.proto getOCPValue(1,2,3,4,5,6,7,8,9) P
+getOCPValue {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out ":OUTP1:OCP?";
+    in "%f";
+}
+rec13: InstekGPP.proto getOCPState(1,2,3,4,5,6,7,8,9) P
+getOCPState {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out ":OUTP1:OCP:STAT?";
+    in "%s";
+}
+rec14: InstekGPP.proto setOVPValue(1,2,3,4,5,6,7,8,9) P
+setOVPValue {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out ":OUTP1:OVP %f";
+}
+rec15: InstekGPP.proto setOVPState(1,2,3,4,5,6,7,8,9) P
+setOVPState {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out ":OUTP1:OVP:STAT %s";
+}
+rec16: InstekGPP.proto setOCPValue(1,2,3,4,5,6,7,8,9) P
+setOCPValue {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out ":OUTP1:OCP %f";
+}
+rec17: InstekGPP.proto setOCPState(1,2,3,4,5,6,7,8,9) P
+setOCPState {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out ":OUTP1:OCP:STAT %s";
+}

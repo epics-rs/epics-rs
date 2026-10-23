@@ -73,7 +73,8 @@ fn output(
     arr.unique_id = src.unique_id;
     arr.copy_time_stamps_from(src);
     arr.attributes = src.attributes.clone();
-    arr.codec = src.codec.clone();
+    // C copies the frame onto it with `copy(pArray, pArrayOut, 0, 0)`.
+    arr.codec = src.codec.as_ref().map(crate::codec::Codec::copied);
     Ok(arr)
 }
 
@@ -338,18 +339,12 @@ fn rgb_layout_rows_scalar<T: Copy>(
     }
 }
 
-/// Convert NDArray element type using C cast semantics.
-///
-/// Thin alias for [`crate::convert::convert_type`] — C++ `convertType`
-/// (`NDArrayPool.cpp:378-388`), `*pDataOut++ = (dataTypeOut)(*pDataIn++)`.
-/// A C cast truncates to the low bits on narrowing (`(epicsUInt8)300 == 44`);
-/// it does **not** clamp, so this must not reintroduce a `clamp()`.
-pub fn convert_data_type(src: &NDArray, target_type: NDDataType) -> ADResult<NDArray> {
-    crate::convert::convert_type(src, target_type)
-}
-
-/// [`convert_data_type`] into a buffer the caller owns — the alias for
-/// [`crate::convert::convert_type_into`].
+/// Convert NDArray element type using C cast semantics, into a buffer the
+/// caller owns — the alias for [`crate::convert::convert_type_into`], C++
+/// `convertType` (`NDArrayPool.cpp:378-388`), `*pDataOut++ =
+/// (dataTypeOut)(*pDataIn++)`. A C cast truncates to the low bits on
+/// narrowing (`(epicsUInt8)300 == 44`); it does **not** clamp, so this must
+/// not reintroduce a `clamp()`.
 pub fn convert_data_type_into(src: &NDArray, out: &mut NDDataBuffer) -> ADResult<()> {
     crate::convert::convert_type_into(src, out)
 }
@@ -1363,19 +1358,8 @@ mod simd_kernels {
 #[cfg(all(test, feature = "simd"))]
 mod simd_tests {
     use super::*;
-    use fearless_simd::{Level, dispatch};
-
-    fn levels() -> Vec<Level> {
-        let top = crate::simd::level();
-        let mut out = vec![top, Level::baseline()];
-        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        {
-            out.extend(top.as_avx2().map(Level::Avx2));
-            out.extend(top.as_sse4_2().map(Level::Sse4_2));
-            out.extend(top.as_sse2().map(Level::Sse2));
-        }
-        out
-    }
+    use crate::simd::levels;
+    use fearless_simd::dispatch;
 
     /// A pseudo-random frame, with the values whose BT.601 outputs land on
     /// an exact half, on the clamp edges or beyond them mixed in.
@@ -1785,7 +1769,9 @@ mod tests {
             v[1] = 128;
             v[2] = 255;
         }
-        let result = convert_data_type(&arr, NDDataType::UInt16).unwrap();
+        let result = NDArrayPool::new(0)
+            .convert_type(&arr, NDDataType::UInt16)
+            .unwrap();
         assert_eq!(result.data.data_type(), NDDataType::UInt16);
         if let NDDataBuffer::U16(ref v) = result.data {
             assert_eq!(v[0], 10);
@@ -1804,7 +1790,9 @@ mod tests {
             v[1] = 128.7;
             v[2] = 300.0;
         }
-        let result = convert_data_type(&arr, NDDataType::UInt8).unwrap();
+        let result = NDArrayPool::new(0)
+            .convert_type(&arr, NDDataType::UInt8)
+            .unwrap();
         if let NDDataBuffer::U8(ref v) = result.data {
             assert_eq!(v[0], 246); // (epicsUInt8)-10
             assert_eq!(v[1], 128); // truncated
@@ -1817,9 +1805,39 @@ mod tests {
     #[test]
     fn test_convert_data_type_same_type_noop() {
         let arr = NDArray::new(vec![NDDimension::new(5)], NDDataType::UInt8);
-        let result = convert_data_type(&arr, NDDataType::UInt8).unwrap();
+        let result = NDArrayPool::new(0)
+            .convert_type(&arr, NDDataType::UInt8)
+            .unwrap();
         assert_eq!(result.data.len(), 5);
         assert_eq!(result.data.data_type(), NDDataType::UInt8);
+    }
+
+    /// C copies the frame onto a conversion output with
+    /// `copy(pArray, pArrayOut, 0, 0)`, which carries only `codec.name`.
+    #[test]
+    fn a_conversion_output_keeps_only_the_codec_name() {
+        let pool = NDArrayPool::new(1_000_000);
+        let mut src = NDArray::new(
+            vec![
+                NDDimension::new(3),
+                NDDimension::new(2),
+                NDDimension::new(2),
+            ],
+            NDDataType::UInt8,
+        );
+        src.codec = Some(crate::codec::Codec {
+            name: crate::codec::CodecName::Blosc,
+            compressed_size: 12,
+            level: 5,
+            shuffle: 1,
+            compressor: 2,
+            original_data_type: NDDataType::UInt8,
+        });
+        let out = convert_rgb_layout(&pool, &src, NDColorMode::RGB1, NDColorMode::RGB3).unwrap();
+        let c = out.codec.clone().unwrap();
+        let unset = crate::codec::Codec::UNSET;
+        assert_eq!(c.name, crate::codec::CodecName::Blosc);
+        assert_eq!((c.level, c.shuffle, c.compressor), (unset, unset, unset));
     }
 
     #[test]

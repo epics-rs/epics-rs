@@ -21,24 +21,35 @@
 //! `getStringShort` (`dbConvert.c:211-233`) applies, which is what makes it a
 //! general rule of the string-to-numeric get and not a per-function quirk.
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use epics_base_rs::error::CaError;
-use epics_base_rs::server::record::RecordInstance;
-use epics_base_rs::server::records::ai::AiRecord;
+use epics_base_rs::server::database::PvDatabase;
+use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::types::{DbFieldType, EpicsValue, PvString, encode_dbr};
 
 const DBR_TIME_DOUBLE: u16 = 20;
 const DBR_TIME_SHORT: u16 = 15;
 
-fn ai_with_desc(desc: &str) -> RecordInstance {
-    let mut inst = RecordInstance::new("A".to_string(), AiRecord::new(0.0));
-    inst.put_common_field("DESC", EpicsValue::String(PvString::from(desc.to_string())))
-        .expect("DESC accepts a string");
-    inst
+async fn ai_with_desc(desc: &str) -> Arc<PvDatabase> {
+    IocBuilder::new()
+        .db_string(
+            &format!(r#"record(ai, "A") {{ field(DESC, "{desc}") }}"#),
+            &HashMap::new(),
+        )
+        .expect("DESC accepts a string")
+        .build()
+        .await
+        .unwrap()
+        .0
 }
 
-#[test]
-fn a_non_numeric_desc_read_as_double_is_a_get_failure() {
-    let inst = ai_with_desc("hello");
+#[epics_macros_rs::epics_test]
+async fn a_non_numeric_desc_read_as_double_is_a_get_failure() {
+    let db = ai_with_desc("hello").await;
+    let rec = db.get_record("A").unwrap();
+    let inst = rec.read();
     let snap = inst
         .snapshot_for_field("DESC")
         .expect("DESC has a snapshot");
@@ -63,9 +74,11 @@ fn a_non_numeric_desc_read_as_double_is_a_get_failure() {
     ));
 }
 
-#[test]
-fn a_numeric_desc_still_reads_as_its_value() {
-    let inst = ai_with_desc("12.5");
+#[epics_macros_rs::epics_test]
+async fn a_numeric_desc_still_reads_as_its_value() {
+    let db = ai_with_desc("12.5").await;
+    let rec = db.get_record("A").unwrap();
+    let inst = rec.read();
     let snap = inst
         .snapshot_for_field("DESC")
         .expect("DESC has a snapshot");
@@ -75,9 +88,11 @@ fn a_numeric_desc_still_reads_as_its_value() {
     assert_eq!(f64::from_be_bytes(data[16..24].try_into().unwrap()), 12.5);
 }
 
-#[test]
-fn an_empty_desc_reads_as_a_successful_zero() {
-    let inst = ai_with_desc("");
+#[epics_macros_rs::epics_test]
+async fn an_empty_desc_reads_as_a_successful_zero() {
+    let db = ai_with_desc("").await;
+    let rec = db.get_record("A").unwrap();
+    let inst = rec.read();
     let snap = inst
         .snapshot_for_field("DESC")
         .expect("DESC has a snapshot");

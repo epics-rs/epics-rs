@@ -1,0 +1,9 @@
+$ snc notfunc.st
+notfunc.st:2: error: not a function type
+notfunc.st:3: error: not a function type
+$ snc +W notfunc.st
+notfunc.st:2: error: not a function type
+notfunc.st:3: error: not a function type
+$ snc -w notfunc.st
+notfunc.st:2: error: not a function type
+notfunc.st:3: error: not a function type

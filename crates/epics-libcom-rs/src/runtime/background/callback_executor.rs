@@ -274,15 +274,53 @@ impl CallbackPriority {
 
 /// Why a [`CallbackHandle::request`] was rejected.
 ///
-/// Note there is no `Shutdown` variant: a request arriving after the pool has
-/// stopped is a silent no-op returning `Ok(())`, matching C — `callbackStop`
-/// halts the queues and late `callbackRequest`s are simply dropped without
-/// surfacing an error to the caller (`callback.c:237-284`).
+/// Note there is no `Shutdown` variant: a request arriving after
+/// `callbackStop` is a silent no-op returning `Ok(())`, matching C, whose
+/// ring outlives its workers until `callbackCleanup` (`callback.c:237-284`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CallbackError {
     /// The band's ring was full — C `S_db_bufFull` (`callback.c:373`): the
     /// push found every slot of the ring taken.
     QueueFull,
+    /// Before `callbackInit` or after `callbackCleanup` — C `S_db_notInit`
+    /// (`callback.c:360-363`).
+    NotInit,
+}
+
+/// C `cbState` (`callback.c:69-71`), with `callbackStop`'s drain as a state
+/// of its own: the low bits of a band's [`PriorityQueue::word`], whose other
+/// bits count the requests it was given. Only [`CallbackPool::init`],
+/// [`CallbackPool::stop`] and [`CallbackPool::cleanup`] change it.
+mod band_state {
+    /// C `cbRun`.
+    pub(super) const RUN: u64 = 0;
+    /// Inside `callbackStop`: requests still run, until the band is found
+    /// with all it was given run.
+    pub(super) const STOPPING: u64 = 1;
+    /// C `cbInit`: requests are refused with `S_db_notInit`.
+    pub(super) const INIT: u64 = 2;
+    /// C `cbStop`: a request is taken and never run.
+    pub(super) const STOPPED: u64 = 3;
+    /// The state's bits of the word.
+    pub(super) const MASK: u64 = 3;
+    /// The band's workers are told to exit: a request is dropped un-run.
+    pub(super) const SHUTDOWN: u64 = 4;
+    /// Every bit that refuses a request: `INIT`, `STOPPED` and `SHUTDOWN`,
+    /// so admitting one is a single test of the word.
+    pub(super) const REFUSE: u64 = 6;
+    /// One request in the word's count.
+    pub(super) const ONE: u64 = 8;
+}
+
+/// One worker's count of the requests it has run, on a line of its own so
+/// the count costs its worker one store and nobody else anything.
+#[repr(align(128))]
+struct Finished(AtomicU64);
+
+std::thread_local! {
+    /// The band this thread works for, as its queue's address: the one band
+    /// whose drain [`CallbackPool::stop`] cannot wait for from here.
+    static WORKER_OF: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// One FIFO entry of a band.
@@ -293,7 +331,129 @@ enum Queued {
     /// (its `SCHEDULED` state is the claim), so these are bounded by the live
     /// task count and take no ring slot: a wake that the ring could reject
     /// would strand a long-lived task forever.
-    Task(Callback),
+    Task(TaskEntry),
+    /// A [`CallbackCell`] request — holds a ring slot, as [`Queued::Ring`]
+    /// does, but queues the requester's own cell instead of a closure.
+    Cell(CellEntry),
+}
+
+/// What a [`CallbackCell`] runs — C `epicsCallback.callback` with its `user`
+/// pointer already bound, since the body is the cell's own field.
+pub trait CallbackBody: Send + Sync + 'static {
+    /// One run of the request. The cell is idle again before this is called,
+    /// so a request made from inside it queues the cell once more.
+    fn run(&self);
+}
+
+/// A preallocated, re-armable callback request — C's `epicsCallback` in its
+/// intrusive form (epics-base `proto/callback-intrusive`): the requester owns
+/// it, a request queues the cell itself, and nothing is allocated per request.
+///
+/// A request while the cell is queued is taken by the run already pending and
+/// returns `Ok`, as the prototype does (`callback.c:865-868`). This deviates
+/// from released C, where an `epicsCallback` "may be queued multiple times"
+/// (`callback.h:108`) and each request runs it once. The cell goes idle just
+/// before its body runs (`:635-638`), so a request from the body, or one that
+/// arrives while it runs, queues it again. Either way the run sees what the
+/// requester wrote before requesting: the claim and the clear are both
+/// read-modify-writes of one flag, so every request is ordered against the
+/// clear.
+pub struct CallbackCell<B> {
+    queued: AtomicBool,
+    body: B,
+}
+
+impl<B: CallbackBody> CallbackCell<B> {
+    /// A cell running `body`, idle. Allocated here, once, by its owner.
+    pub fn new(body: B) -> Arc<Self> {
+        Arc::new(CallbackCell {
+            queued: AtomicBool::new(false),
+            body,
+        })
+    }
+
+    /// The body, for the owner that keeps state in it.
+    pub fn body(&self) -> &B {
+        &self.body
+    }
+
+    /// Whether a run of this cell is pending on a band.
+    pub fn is_queued(&self) -> bool {
+        self.queued.load(Ordering::Acquire)
+    }
+}
+
+/// A cell as its band holds it, type-erased so every body shares one entry.
+trait CellRun: Send + Sync {
+    fn idle(&self);
+    fn run_body(&self);
+}
+
+impl<B: CallbackBody> CellRun for CallbackCell<B> {
+    fn idle(&self) {
+        self.queued.swap(false, Ordering::AcqRel);
+    }
+
+    fn run_body(&self) {
+        self.body.run();
+    }
+}
+
+/// A queued cell. Dropped un-run — refused by a band that shut down under it,
+/// or left in one that is torn down — it puts the cell back to idle, so a later
+/// request is not taken by a run that will never come.
+struct CellEntry(Option<Arc<dyn CellRun>>);
+
+impl CellEntry {
+    fn run(mut self) {
+        if let Some(cell) = self.0.take() {
+            cell.idle();
+            cell.run_body();
+        }
+    }
+}
+
+impl Drop for CellEntry {
+    fn drop(&mut self) {
+        if let Some(cell) = self.0.take() {
+            cell.idle();
+        }
+    }
+}
+
+/// A spawned task as its band holds it, so a wake queues the task's own `Arc`
+/// rather than a closure it would have to allocate.
+pub(super) trait Run: Send + Sync {
+    /// Poll the task once.
+    fn run(self: Arc<Self>);
+    /// The entry was dropped without running: the band shut down under it.
+    fn cancel_unrun(&self);
+}
+
+/// A task's run-queue entry. The task's state stays `SCHEDULED` while the
+/// entry exists, so no later wake re-queues it: dropped un-run — queued past
+/// shutdown, left in a band that is torn down, refused by an exhausted arena —
+/// the entry cancels the task, or its handle would never resolve.
+pub(super) struct TaskEntry(Option<Arc<dyn Run>>);
+
+impl TaskEntry {
+    pub(super) fn new(task: Arc<dyn Run>) -> Self {
+        TaskEntry(Some(task))
+    }
+
+    fn run(mut self) {
+        if let Some(task) = self.0.take() {
+            task.run();
+        }
+    }
+}
+
+impl Drop for TaskEntry {
+    fn drop(&mut self) {
+        if let Some(task) = self.0.take() {
+            task.cancel_unrun();
+        }
+    }
 }
 
 /// One priority band: a bounded lock-free FIFO plus the park slots its workers
@@ -310,7 +470,15 @@ struct PriorityQueue {
     /// C `cbQueueSet.queueOverflows` — lifetime overflow count
     /// (`callback.c:57`).
     overflows: AtomicU64,
-    shutdown: AtomicBool,
+    /// The band's [`band_state`] and shutdown bit and, above them, the requests taken onto the
+    /// ring — counted before the push and given back when the push is
+    /// refused or coalesced. One word, so no request is counted once the
+    /// band is `STOPPED` and the band is `STOPPED` only with every counted
+    /// request run.
+    word: AtomicU64,
+    /// What each worker has run of them; the count equal to their sum is a
+    /// drained band.
+    finished: Box<[Finished]>,
     /// C `cbQueueSet.semWakeUp` (`callback.c:54`), as one park slot per
     /// worker. Cache-line aligned, and kept out of `used`'s line — see
     /// `callback_queue::Parking`.
@@ -318,15 +486,129 @@ struct PriorityQueue {
 }
 
 impl PriorityQueue {
-    fn new(capacity: usize, workers: usize) -> Self {
+    fn new(capacity: usize, workers: usize, state: u64) -> Self {
         PriorityQueue {
             capacity,
             queue: BandQueue::with_capacity(capacity),
             high_water: AtomicUsize::new(0),
             overflows: AtomicU64::new(0),
-            shutdown: AtomicBool::new(false),
+            word: AtomicU64::new(state),
+            finished: (0..workers).map(|_| Finished(AtomicU64::new(0))).collect(),
             parking: Parking::new(workers),
         }
+    }
+
+    /// The band's answer to a request: `Ok(true)` to push it, `Ok(false)`
+    /// to take it and never run it (`cbStop`, or a band shut down), or C's
+    /// "Callbacks not initialized" (`callback.c:360-363`). A pushed request
+    /// is counted here.
+    #[inline]
+    fn admit(&self, name: &str) -> Result<bool, CallbackError> {
+        // One RMW counts the request and reads the state it was counted in.
+        // The count never carries into the low bits, and a refusal's passing
+        // count cannot meet a seal: no band is sealed from `INIT`/`STOPPED`.
+        let word = self.word.fetch_add(band_state::ONE, Ordering::AcqRel);
+        if word & band_state::REFUSE == 0 {
+            return Ok(true);
+        }
+        self.refuse(name, word)
+    }
+
+    /// [`Self::admit`]'s refusal, its count given back.
+    #[cold]
+    fn refuse(&self, name: &str, word: u64) -> Result<bool, CallbackError> {
+        self.unadmit();
+        if word & band_state::MASK == band_state::INIT {
+            tracing::error!(
+                target: "epics_base_rs::runtime::callback",
+                band = name,
+                "callbackRequest: ERROR Callbacks not initialized"
+            );
+            return Err(CallbackError::NotInit);
+        }
+        if word & band_state::SHUTDOWN != 0 {
+            // Pool stopped: C drops late callbackRequests after callbackStop
+            // without surfacing an error (`callback.c:237-284`). This also
+            // absorbs the teardown race where the delayed timer fires into a
+            // pool that has just been dropped.
+            tracing::trace!(
+                target: "epics_base_rs::runtime::callback",
+                band = name,
+                "callbackRequest after shutdown dropped"
+            );
+        }
+        Ok(false)
+    }
+
+    /// The band's workers are told to exit.
+    fn is_shut_down(&self, order: Ordering) -> bool {
+        self.word.load(order) & band_state::SHUTDOWN != 0
+    }
+
+    /// Give back the count of a request [`Self::admit`] pushed and the
+    /// ring did not keep.
+    fn unadmit(&self) {
+        self.word.fetch_sub(band_state::ONE, Ordering::AcqRel);
+    }
+
+    /// Move the band from state `from` to `to`, keeping its count; `false`
+    /// when it was not in `from`.
+    fn transition(&self, from: u64, to: u64) -> bool {
+        let mut word = self.word.load(Ordering::Acquire);
+        while word & band_state::MASK == from {
+            match self.word.compare_exchange_weak(
+                word,
+                (word & !band_state::MASK) | to,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(now) => word = now,
+            }
+        }
+        false
+    }
+
+    #[cfg(test)]
+    fn state(&self) -> u64 {
+        self.word.load(Ordering::Acquire) & band_state::MASK
+    }
+
+    /// Worker `slot` ran one request.
+    fn finish(&self, slot: usize) {
+        let count = &self.finished[slot].0;
+        count.store(count.load(Ordering::Relaxed) + 1, Ordering::Release);
+    }
+
+    /// `STOPPING` to `STOPPED`, if every request the band was given has
+    /// run; true once the band is `STOPPED`, whoever sealed it. The finishes
+    /// are read first: a request made from a callback is counted before that
+    /// callback's finish, so it is seen with it; one counted after the read
+    /// fails the exchange.
+    fn seal(&self) -> bool {
+        match self.word.load(Ordering::Acquire) & band_state::MASK {
+            band_state::STOPPING => {}
+            state => return state == band_state::STOPPED,
+        }
+        let finished: u64 = self
+            .finished
+            .iter()
+            .map(|f| f.0.load(Ordering::Acquire))
+            .sum();
+        let draining = (finished * band_state::ONE) | band_state::STOPPING;
+        let mut word = self.word.load(Ordering::Acquire);
+        while word & !band_state::SHUTDOWN == draining {
+            match self.word.compare_exchange_weak(
+                word,
+                (word & !band_state::MASK) | band_state::STOPPED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(now) => word = now,
+            }
+        }
+        word & band_state::MASK == band_state::STOPPED
     }
 
     /// Deepen the high-water mark if `depth` — the ring's depth as the push
@@ -361,18 +643,8 @@ impl PriorityQueue {
 
     /// Port of `callbackRequest` for a single band (`callback.c:341-377`).
     fn request(&self, name: &str, cb: Callback) -> Result<(), CallbackError> {
-        if self.shutdown.load(Ordering::Acquire) {
-            // Pool stopped: C drops late callbackRequests after callbackStop
-            // without surfacing an error (`callback.c:237-284`). Drop `cb`
-            // (deallocated here, never invoked) and report success. This also
-            // absorbs the teardown race where the delayed timer fires into a
-            // pool that has just been dropped.
-            drop(cb);
-            tracing::trace!(
-                target: "epics_base_rs::runtime::callback",
-                band = name,
-                "callbackRequest after shutdown dropped"
-            );
+        if !self.admit(name)? {
+            // Dropped here, deallocated and never invoked.
             return Ok(());
         }
         // callback.c:789-824 — the push that begins a batch recruits a worker
@@ -387,6 +659,7 @@ impl PriorityQueue {
             // was never queued.
             Err(entry) => {
                 drop(entry);
+                self.unadmit();
                 return Err(self.report_full(name));
             }
         };
@@ -394,16 +667,47 @@ impl PriorityQueue {
         Ok(())
     }
 
+    /// [`Self::request`] for a [`CallbackCell`]: the slot first, then the
+    /// cell's claim, so a full band refuses either way and a cell already
+    /// queued gives its slot back (`callback.c:855-868`, intrusive form).
+    fn request_cell<B: CallbackBody>(
+        &self,
+        name: &str,
+        cell: &Arc<CallbackCell<B>>,
+    ) -> Result<(), CallbackError> {
+        if !self.admit(name)? {
+            return Ok(());
+        }
+        // A swap, not a compare-exchange: a coalesced request must still
+        // write, so the run pending for it acquires what it published.
+        let claim = || {
+            (!cell.queued.swap(true, Ordering::AcqRel))
+                .then(|| Queued::Cell(CellEntry(Some(Arc::clone(cell) as Arc<dyn CellRun>))))
+        };
+        match self
+            .queue
+            .push_ring_claimed(claim, || self.parking.wake_one())
+        {
+            Ok(Some(depth)) => self.deepen_high_water(depth),
+            Ok(None) => self.unadmit(),
+            Err(()) => {
+                self.unadmit();
+                return Err(self.report_full(name));
+            }
+        }
+        Ok(())
+    }
+
     /// Queue a spawned future's run-queue entry. Never refused for capacity —
-    /// see [`Queued::Task`]. After shutdown `cb` is dropped un-run, which is
-    /// how the task learns it was cancelled.
-    fn schedule_task(&self, cb: Callback) {
-        if self.shutdown.load(Ordering::Acquire) {
+    /// see [`Queued::Task`]. After shutdown `entry` is dropped un-run, which
+    /// is how the task learns it was cancelled.
+    fn schedule_task(&self, entry: TaskEntry) {
+        if self.is_shut_down(Ordering::Acquire) {
             return;
         }
         if let Err(entry) = self
             .queue
-            .push_task(Queued::Task(cb), || self.parking.wake_one())
+            .push_task(Queued::Task(entry), || self.parking.wake_one())
         {
             // Only reachable with the whole 4 G index space queued; dropping
             // the entry finalizes its task rather than stranding it.
@@ -481,7 +785,7 @@ impl PriorityQueue {
     /// Stop the band and wake every worker so each re-tests its exit
     /// condition. Idempotent.
     fn request_shutdown(&self) {
-        self.shutdown.store(true, Ordering::SeqCst);
+        self.word.fetch_or(band_state::SHUTDOWN, Ordering::SeqCst);
         self.parking.wake_all();
     }
 }
@@ -547,10 +851,14 @@ fn drain_band<const BATCHED: bool>(
             // callback.c:574-581 — give the slots back before sleeping, so a
             // band that has caught up is holding none of its ring.
             returns.flush();
-            if pq.shutdown.load(Ordering::SeqCst) {
+            // callback.c:217-226 — inside `callbackStop` a band is drained
+            // when its worker finds it empty. Left to `stop`'s polling, a
+            // steady requester could keep every sampled instant short of it.
+            pq.seal();
+            if pq.is_shut_down(Ordering::SeqCst) {
                 return;
             }
-            parked.park_until(|| !pq.queue.is_empty() || pq.shutdown.load(Ordering::SeqCst));
+            parked.park_until(|| !pq.queue.is_empty() || pq.is_shut_down(Ordering::SeqCst));
             // callback.c:607 — a sleep makes the carried root worthless: every
             // entry this worker could have taken from it was taken by whoever
             // emptied the band, so the next pop starts from a fresh read
@@ -575,12 +883,20 @@ fn drain_band<const BATCHED: bool>(
         if popped.more {
             pq.parking.wake_one();
         }
-        let cb = match popped.value {
-            Queued::Ring(cb) => cb,
-            Queued::Task(cb) => cb,
-        };
         // callback.c:228 — run the callback owning no band state.
-        run_isolated(FACILITY, cb);
+        match popped.value {
+            Queued::Ring(cb) => {
+                run_isolated(FACILITY, cb);
+                pq.finish(slot);
+            }
+            Queued::Task(entry) => {
+                run_isolated(FACILITY, move || entry.run());
+            }
+            Queued::Cell(entry) => {
+                run_isolated(FACILITY, move || entry.run());
+                pq.finish(slot);
+            }
+        };
     }
 }
 
@@ -602,11 +918,21 @@ impl CallbackHandle {
         pq.request(priority.name_prefix(), cb)
     }
 
+    /// Queue `cell` on `priority` — `callbackRequest` of a requester-owned
+    /// `epicsCallback`. Allocates nothing. See [`CallbackCell`].
+    pub fn request_cell<B: CallbackBody>(
+        &self,
+        priority: CallbackPriority,
+        cell: &Arc<CallbackCell<B>>,
+    ) -> Result<(), CallbackError> {
+        self.queues[priority.index()].request_cell(priority.name_prefix(), cell)
+    }
+
     /// Queue a spawned future's run-queue entry on `priority`. Unlike
     /// [`request`](Self::request) this cannot fail: the entry takes no ring
     /// slot. The caller guarantees at most one such entry per task.
-    pub(super) fn schedule_task(&self, priority: CallbackPriority, cb: Callback) {
-        self.queues[priority.index()].schedule_task(cb);
+    pub(super) fn schedule_task(&self, priority: CallbackPriority, entry: TaskEntry) {
+        self.queues[priority.index()].schedule_task(entry);
     }
 
     /// Lifetime overflow count for a band — C `queueOverflows`
@@ -667,6 +993,24 @@ impl CallbackPool {
         queue_size: usize,
         threads_per_priority: [usize; NUM_CALLBACK_PRIORITIES],
     ) -> Self {
+        Self::build(queue_size, threads_per_priority, band_state::RUN)
+    }
+
+    /// [`Self::new`] for the IOC's own pool, whose bands wait at C `cbInit`
+    /// for [`Self::init`]: constructing it is not `callbackInit`.
+    pub(super) fn new_uninitialized() -> Self {
+        Self::build(
+            CONFIGURED_QUEUE_SIZE.load(Ordering::Relaxed),
+            CallbackPriority::ALL.map(|p| CONFIGURED_THREADS[p.index()].load(Ordering::Relaxed)),
+            band_state::INIT,
+        )
+    }
+
+    fn build(
+        queue_size: usize,
+        threads_per_priority: [usize; NUM_CALLBACK_PRIORITIES],
+        state: u64,
+    ) -> Self {
         let capacity = queue_size.max(1);
         let threads_per_priority = threads_per_priority.map(|n| n.max(1));
         let queues: [Arc<PriorityQueue>; NUM_CALLBACK_PRIORITIES] =
@@ -674,6 +1018,7 @@ impl CallbackPool {
                 Arc::new(PriorityQueue::new(
                     capacity,
                     threads_per_priority[p.index()],
+                    state,
                 ))
             });
 
@@ -691,6 +1036,7 @@ impl CallbackPool {
                 };
                 let pq = Arc::clone(pq);
                 let watched_name = name.clone();
+                let (started, wait) = crate::runtime::sync::start_latch();
                 // A band with no worker is a band whose queued callbacks never
                 // run again — deferred record processing, delayed callbacks,
                 // monitor tails. There is no error path out of a constructor
@@ -715,13 +1061,75 @@ impl CallbackPool {
                         crate::runtime::taskwd::CheckIn::Unbounded,
                         None,
                     );
+                    WORKER_OF.set(Arc::as_ptr(&pq) as usize);
+                    drop(started);
                     run_facility_loop(FACILITY, || worker_loop(&pq, j), || pq.request_shutdown());
                 });
+                // callback.c:216, :333 — `callbackInit` waits on
+                // `startStopEvent` until the thread has registered.
+                wait.wait();
                 workers.push(handle);
             }
         }
 
         CallbackPool { queues, workers }
+    }
+
+    /// C `callbackInit`'s state half (`callback.c:292-295`): `cbInit` to
+    /// `cbRun`, or C's warning when the bands are already armed.
+    pub fn init(&self) {
+        if !self.arm() {
+            crate::stderr_println!("Warning: callbackInit called again before callbackCleanup");
+        }
+    }
+
+    /// `cbInit` to `cbRun`, or `false` when the bands were not in `cbInit`.
+    pub fn arm(&self) -> bool {
+        self.transition_all(band_state::INIT, band_state::RUN)
+    }
+
+    /// Every band from `from` to `to`, or none when the first is not in
+    /// `from`: only these three pool methods move the bands, and always
+    /// together.
+    fn transition_all(&self, from: u64, to: u64) -> bool {
+        let (first, rest) = self.queues.split_first().expect("three bands");
+        if !first.transition(from, to) {
+            return false;
+        }
+        for pq in rest {
+            pq.transition(from, to);
+        }
+        true
+    }
+
+    /// C `callbackStop` (`callback.c:237-260`): from `cbRun` only, wait
+    /// until every band has been found with all it was given run, a request
+    /// made before then included, and refuse to run anything more. The
+    /// workers stay up for the spawned tasks they also carry. A band this
+    /// thread works for is not waited for: C's `callbackStop` would be
+    /// joining itself.
+    pub fn stop(&self) {
+        if !self.transition_all(band_state::RUN, band_state::STOPPING) {
+            return;
+        }
+        let own = WORKER_OF.get();
+        for pq in &self.queues {
+            if Arc::as_ptr(pq) as usize == own {
+                pq.transition(band_state::STOPPING, band_state::STOPPED);
+                continue;
+            }
+            while !pq.seal() {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+    }
+
+    /// C `callbackCleanup`'s state half (`callback.c:262-268`): `cbStop` back
+    /// to `cbInit`, the only way the bands are armed again.
+    pub fn cleanup(&self) {
+        if !self.transition_all(band_state::STOPPED, band_state::INIT) {
+            crate::stderr_println!("callbackCleanup() but not stopped");
+        }
     }
 
     /// A cheap, clonable submission handle (see [`CallbackHandle`]).
@@ -735,6 +1143,15 @@ impl CallbackPool {
     /// [`CallbackHandle::request`].
     pub fn request(&self, priority: CallbackPriority, cb: Callback) -> Result<(), CallbackError> {
         self.queues[priority.index()].request(priority.name_prefix(), cb)
+    }
+
+    /// See [`CallbackHandle::request_cell`].
+    pub fn request_cell<B: CallbackBody>(
+        &self,
+        priority: CallbackPriority,
+        cell: &Arc<CallbackCell<B>>,
+    ) -> Result<(), CallbackError> {
+        self.queues[priority.index()].request_cell(priority.name_prefix(), cell)
     }
 
     /// Lifetime overflow count for a band — C `queueOverflows`
@@ -809,9 +1226,11 @@ impl DedicatedExecutor {
     /// run.
     pub fn new(name: &str, priority: ThreadPriority, threads: usize) -> std::io::Result<Self> {
         let threads = threads.max(1);
+        // A server's executor is no `callback.c` band: always armed.
         let queue = Arc::new(PriorityQueue::new(
             CONFIGURED_QUEUE_SIZE.load(Ordering::Relaxed).max(1),
             threads,
+            band_state::RUN,
         ));
         let mut workers = Vec::with_capacity(threads);
         for j in 0..threads {
@@ -894,9 +1313,54 @@ impl Drop for CallbackPool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A band state at C `cbRun`.
+    fn armed() -> u64 {
+        band_state::RUN
+    }
+
+    /// A closure as a task entry, for the band tests that only need one run.
+    struct OnceRun(std::sync::Mutex<Option<Callback>>);
+
+    impl OnceRun {
+        fn entry(f: impl FnOnce() + Send + 'static) -> TaskEntry {
+            TaskEntry::new(Arc::new(OnceRun(std::sync::Mutex::new(Some(Box::new(f))))))
+        }
+    }
+
+    impl Run for OnceRun {
+        fn run(self: Arc<Self>) {
+            if let Some(f) = self.0.lock().unwrap().take() {
+                f();
+            }
+        }
+
+        fn cancel_unrun(&self) {}
+    }
     use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
+
+    /// C `callbackInit` waits for each band thread's `taskwdInsert`
+    /// (`callback.c:216`, `:333`), so a pool that exists has every band
+    /// registered and none still starting up.
+    #[test]
+    fn every_band_is_registered_when_the_pool_is_built() {
+        let _pool = CallbackPool::with_config(4, 1);
+        let out = std::cell::RefCell::new(String::new());
+        crate::runtime::taskwd::taskwd_show(1, &|line| {
+            out.borrow_mut().push_str(line);
+            out.borrow_mut().push('\n');
+        });
+        let out = out.into_inner();
+        for prio in CallbackPriority::ALL {
+            assert!(
+                out.contains(prio.name_prefix()),
+                "{} was not registered when the pool was built:\n{out}",
+                prio.name_prefix()
+            );
+        }
+    }
 
     const T: Duration = Duration::from_secs(5);
 
@@ -1483,7 +1947,7 @@ mod tests {
     /// would have cleared it, which shuts the band for the life of the IOC.
     #[test]
     fn a_drained_ring_takes_requests_again() {
-        let pq = PriorityQueue::new(2, 1);
+        let pq = PriorityQueue::new(2, 1, armed());
         for _ in 0..2 {
             assert!(pq.request("cbLow", Box::new(|| {})).is_ok());
         }
@@ -1513,7 +1977,7 @@ mod tests {
     fn the_ring_count_never_reads_below_the_entries_queued() {
         const CAPACITY: usize = 4;
         const TOTAL: usize = 20_000;
-        let pq = Arc::new(PriorityQueue::new(CAPACITY, 1));
+        let pq = Arc::new(PriorityQueue::new(CAPACITY, 1, armed()));
         let claimed = Arc::new(AtomicUsize::new(0));
         let popped = Arc::new(AtomicUsize::new(0));
         // A broken count panics the thread that reads it, and the remaining
@@ -1687,7 +2151,7 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         pool.handle().schedule_task(
             CallbackPriority::Low,
-            Box::new(move || tx.send(99u32).unwrap()),
+            OnceRun::entry(move || tx.send(99u32).unwrap()),
         );
         gate_tx.send(()).unwrap();
         assert_eq!(
@@ -1747,7 +2211,7 @@ mod tests {
     /// can hold still.
     #[test]
     fn a_high_water_reset_leaves_the_queued_entries_counted() {
-        let pq = PriorityQueue::new(4, 1);
+        let pq = PriorityQueue::new(4, 1, armed());
         for _ in 0..3 {
             pq.request("cbLow", Box::new(|| {})).unwrap();
         }
@@ -1777,7 +2241,7 @@ mod tests {
     /// on its own.
     #[test]
     fn the_capacity_boundary_refuses_every_push_past_it() {
-        let pq = PriorityQueue::new(2, 1);
+        let pq = PriorityQueue::new(2, 1, armed());
         assert!(pq.request("cbLow", Box::new(|| {})).is_ok());
         assert!(pq.request("cbLow", Box::new(|| {})).is_ok());
         assert_eq!(
@@ -1798,17 +2262,236 @@ mod tests {
     /// is exactly full.
     #[test]
     fn a_full_band_still_takes_a_task_entry() {
-        let pq = PriorityQueue::new(1, 1);
+        let pq = PriorityQueue::new(1, 1, armed());
         pq.request("cbLow", Box::new(|| {})).unwrap();
         assert_eq!(
             pq.request("cbLow", Box::new(|| {})),
             Err(CallbackError::QueueFull)
         );
-        pq.schedule_task(Box::new(|| {}));
+        pq.schedule_task(OnceRun::entry(|| {}));
         assert_eq!(
             pq.stats(false).num_used,
             1,
             "the task entry was charged to the ring"
+        );
+    }
+
+    /// An entry left queued when its band is torn down never ran, so it
+    /// cancels its task.
+    #[test]
+    fn a_task_entry_dropped_with_its_band_cancels_the_task() {
+        struct Flag(AtomicBool);
+        impl Run for Flag {
+            fn run(self: Arc<Self>) {}
+            fn cancel_unrun(&self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let flag = Arc::new(Flag(AtomicBool::new(false)));
+        let pq = PriorityQueue::new(1, 1, armed());
+        pq.schedule_task(TaskEntry::new(Arc::clone(&flag) as Arc<dyn Run>));
+        assert!(!flag.0.load(Ordering::SeqCst), "cancelled while queued");
+        drop(pq);
+        assert!(
+            flag.0.load(Ordering::SeqCst),
+            "the un-run entry was dropped silently"
+        );
+    }
+
+    /// A cell body that counts its runs and reports each one.
+    struct Count {
+        runs: AtomicUsize,
+        tx: std::sync::Mutex<mpsc::Sender<usize>>,
+        /// Requests the body makes of its own cell, once each.
+        requeue: std::sync::Mutex<Option<(CallbackHandle, Arc<CallbackCell<Count>>)>>,
+    }
+
+    impl CallbackBody for Count {
+        fn run(&self) {
+            let n = self.runs.fetch_add(1, Ordering::SeqCst) + 1;
+            if let Some((h, cell)) = self.requeue.lock().unwrap().take() {
+                assert!(!cell.is_queued(), "the cell runs while still queued");
+                h.request_cell(CallbackPriority::Low, &cell).unwrap();
+            }
+            self.tx.lock().unwrap().send(n).unwrap();
+        }
+    }
+
+    fn count_cell() -> (Arc<CallbackCell<Count>>, mpsc::Receiver<usize>) {
+        let (tx, rx) = mpsc::channel();
+        let cell = CallbackCell::new(Count {
+            runs: AtomicUsize::new(0),
+            tx: std::sync::Mutex::new(tx),
+            requeue: std::sync::Mutex::new(None),
+        });
+        (cell, rx)
+    }
+
+    /// Pin the band's only worker inside a callback until the sender drops.
+    fn hold_worker(pool: &CallbackPool) -> mpsc::Sender<()> {
+        let (started_tx, started_rx) = mpsc::channel();
+        let (gate_tx, gate_rx) = mpsc::channel::<()>();
+        pool.request(
+            CallbackPriority::Low,
+            Box::new(move || {
+                started_tx.send(()).unwrap();
+                let _ = gate_rx.recv();
+            }),
+        )
+        .unwrap();
+        started_rx.recv_timeout(T).unwrap();
+        gate_tx
+    }
+
+    /// Requests of a queued cell are taken by its pending run and give their
+    /// slot back: one run, one slot used.
+    #[test]
+    fn a_queued_cell_takes_a_second_request_into_its_pending_run() {
+        let mut pool = CallbackPool::with_config(4, 1);
+        let gate = hold_worker(&pool);
+        let (cell, rx) = count_cell();
+        for _ in 0..3 {
+            assert_eq!(pool.request_cell(CallbackPriority::Low, &cell), Ok(()));
+        }
+        assert!(cell.is_queued());
+        assert_eq!(pool.stats(CallbackPriority::Low, false).num_used, 1);
+        drop(gate);
+        assert_eq!(rx.recv_timeout(T).unwrap(), 1);
+        assert!(rx.recv_timeout(Duration::from_millis(100)).is_err());
+        assert!(!cell.is_queued());
+        pool.shutdown();
+    }
+
+    /// The cell is idle when its body runs, so the body's own request queues
+    /// it once more, and a request after a run queues it again.
+    #[test]
+    fn a_cell_requested_from_its_own_run_runs_again() {
+        let mut pool = CallbackPool::with_config(4, 1);
+        let (cell, rx) = count_cell();
+        *cell.body().requeue.lock().unwrap() = Some((pool.handle(), Arc::clone(&cell)));
+        pool.request_cell(CallbackPriority::Low, &cell).unwrap();
+        assert_eq!(rx.recv_timeout(T).unwrap(), 1);
+        assert_eq!(rx.recv_timeout(T).unwrap(), 2);
+        pool.request_cell(CallbackPriority::Low, &cell).unwrap();
+        assert_eq!(rx.recv_timeout(T).unwrap(), 3);
+        pool.shutdown();
+    }
+
+    /// The slot is taken before the claim: a full band refuses an idle cell
+    /// and leaves it idle, and refuses a queued one too, counting both.
+    #[test]
+    fn a_full_band_refuses_a_cell_queued_or_not() {
+        let mut pool = CallbackPool::with_config(1, 1);
+        let gate = hold_worker(&pool);
+        let (queued, rx) = count_cell();
+        pool.request_cell(CallbackPriority::Low, &queued).unwrap();
+        let (idle, idle_rx) = count_cell();
+        assert_eq!(
+            pool.request_cell(CallbackPriority::Low, &idle),
+            Err(CallbackError::QueueFull)
+        );
+        assert!(!idle.is_queued(), "a refused cell stayed claimed");
+        assert_eq!(
+            pool.request_cell(CallbackPriority::Low, &queued),
+            Err(CallbackError::QueueFull)
+        );
+        assert_eq!(pool.overflow_count(CallbackPriority::Low), 2);
+        drop(gate);
+        assert_eq!(rx.recv_timeout(T).unwrap(), 1);
+        pool.request_cell(CallbackPriority::Low, &idle).unwrap();
+        assert_eq!(idle_rx.recv_timeout(T).unwrap(), 1);
+        pool.shutdown();
+    }
+
+    /// A cell left in a band that is torn down, or requested after shutdown,
+    /// is idle afterwards and never runs.
+    #[test]
+    fn a_cell_dropped_with_its_band_is_idle_again() {
+        let (cell, rx) = count_cell();
+        let pq = PriorityQueue::new(1, 1, armed());
+        pq.request_cell("test", &cell).unwrap();
+        assert!(cell.is_queued());
+        drop(pq);
+        assert!(!cell.is_queued(), "the un-run entry left the cell claimed");
+
+        let pool = CallbackPool::new();
+        let h = pool.handle();
+        drop(pool);
+        assert_eq!(h.request_cell(CallbackPriority::Low, &cell), Ok(()));
+        assert!(!cell.is_queued());
+        assert!(rx.recv_timeout(Duration::from_millis(100)).is_err());
+    }
+
+    /// A body that panics leaves the band running and the cell requestable.
+    #[test]
+    fn a_panicking_cell_body_leaves_the_cell_idle() {
+        struct Boom(AtomicUsize, std::sync::Mutex<mpsc::Sender<()>>);
+        impl CallbackBody for Boom {
+            fn run(&self) {
+                let first = self.0.fetch_add(1, Ordering::SeqCst) == 0;
+                self.1.lock().unwrap().send(()).unwrap();
+                if first {
+                    panic!("first run");
+                }
+            }
+        }
+        let mut pool = CallbackPool::with_config(4, 1);
+        let (tx, rx) = mpsc::channel();
+        let cell = CallbackCell::new(Boom(AtomicUsize::new(0), std::sync::Mutex::new(tx)));
+        for _ in 0..2 {
+            pool.request_cell(CallbackPriority::Low, &cell).unwrap();
+            rx.recv_timeout(T).unwrap();
+            let deadline = Instant::now() + T;
+            while cell.is_queued() {
+                assert!(Instant::now() < deadline, "the cell stayed queued");
+                std::thread::yield_now();
+            }
+        }
+        assert_eq!(cell.body().0.load(Ordering::SeqCst), 2);
+        pool.shutdown();
+    }
+
+    /// A request taken by the pending run is served by it: the run sees what
+    /// the requester wrote first. Probabilistic — store buffering loses one
+    /// request in ~600k trials under a plain-store clear — and time-bounded.
+    #[test]
+    fn a_coalesced_request_is_seen_by_the_pending_run() {
+        struct Latest {
+            latest: AtomicUsize,
+            seen: AtomicUsize,
+        }
+        impl CallbackBody for Latest {
+            fn run(&self) {
+                let v = self.latest.load(Ordering::Acquire);
+                self.seen.fetch_max(v, Ordering::AcqRel);
+            }
+        }
+        const N: usize = 50;
+        let mut pool = CallbackPool::with_config(1024, 1);
+        let budget = Instant::now() + Duration::from_secs(2);
+        let (mut trials, mut lost) = (0usize, 0usize);
+        while Instant::now() < budget {
+            let cell = CallbackCell::new(Latest {
+                latest: AtomicUsize::new(0),
+                seen: AtomicUsize::new(0),
+            });
+            for i in 1..=N {
+                cell.body().latest.store(i, Ordering::Release);
+                while pool.request_cell(CallbackPriority::Low, &cell).is_err() {
+                    std::thread::yield_now();
+                }
+            }
+            let deadline = Instant::now() + T;
+            while cell.body().seen.load(Ordering::Acquire) != N && Instant::now() < deadline {
+                std::thread::yield_now();
+            }
+            lost += usize::from(cell.body().seen.load(Ordering::Acquire) != N);
+            trials += 1;
+        }
+        pool.shutdown();
+        assert_eq!(
+            lost, 0,
+            "{lost} of {trials} trials left the last request unserved"
         );
     }
 
@@ -1956,5 +2639,234 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A flag a callback sets when it runs.
+    fn runs(flag: &Arc<AtomicBool>) -> Callback {
+        let flag = flag.clone();
+        Box::new(move || flag.store(true, Ordering::SeqCst))
+    }
+
+    /// C `callbackRequest` refuses with `S_db_notInit` before `callbackInit`
+    /// (`callback.c:360-363`).
+    #[test]
+    fn a_request_before_init_is_refused() {
+        let pool = CallbackPool::new_uninitialized();
+        let ran = Arc::new(AtomicBool::new(false));
+        assert_eq!(
+            pool.request(CallbackPriority::Low, runs(&ran)),
+            Err(CallbackError::NotInit)
+        );
+        pool.init();
+        pool.request(CallbackPriority::Low, runs(&ran)).unwrap();
+        pool.stop();
+        assert!(ran.load(Ordering::SeqCst));
+    }
+
+    /// A second `callbackInit` warns and changes nothing (`callback.c:292-295`).
+    #[test]
+    fn a_second_init_leaves_the_bands_armed() {
+        let pool = CallbackPool::new_uninitialized();
+        pool.init();
+        pool.init();
+        assert!(pool.queues.iter().all(|pq| pq.state() == band_state::RUN));
+        assert!(!pool.arm());
+    }
+
+    /// `callbackStop` returns once work queued before it has run: each
+    /// `callbackTask` empties its ring before it sees the stop
+    /// (`callback.c:210-235`).
+    #[test]
+    fn a_request_before_the_stop_runs_before_it_returns() {
+        let pool = CallbackPool::with_config(8, 1);
+        let ran = Arc::new(AtomicBool::new(false));
+        let flag = ran.clone();
+        pool.request(
+            CallbackPriority::Low,
+            Box::new(move || {
+                std::thread::sleep(Duration::from_millis(50));
+                flag.store(true, Ordering::SeqCst);
+            }),
+        )
+        .unwrap();
+        pool.stop();
+        assert!(ran.load(Ordering::SeqCst));
+    }
+
+    /// A request a draining callback makes lands in the ring its worker is
+    /// still emptying, so it runs before `callbackStop` returns.
+    #[test]
+    fn a_request_during_the_drain_runs_before_the_stop_returns() {
+        let pool = CallbackPool::with_config(8, 1);
+        let ran = Arc::new(AtomicBool::new(false));
+        let (band, handle, inner) = (
+            Arc::clone(&pool.queues[CallbackPriority::Medium.index()]),
+            pool.handle(),
+            runs(&ran),
+        );
+        pool.request(
+            CallbackPriority::Medium,
+            Box::new(move || {
+                while band.state() != band_state::STOPPING {
+                    std::thread::yield_now();
+                }
+                handle.request(CallbackPriority::High, inner).unwrap();
+            }),
+        )
+        .unwrap();
+        pool.stop();
+        assert!(ran.load(Ordering::SeqCst));
+    }
+
+    /// C `callbackTask` leaves its drain the first time it finds its band
+    /// empty (`callback.c:217-226`), whatever another band is doing: a
+    /// band is not held open to requests while `callbackStop` waits on
+    /// another one.
+    #[test]
+    fn a_band_found_empty_is_sealed_while_the_stop_waits_on_another() {
+        let pool = Arc::new(CallbackPool::with_config(8, 1));
+        let (low_started_tx, low_started) = std::sync::mpsc::channel();
+        let (release_low, low_held) = std::sync::mpsc::channel::<()>();
+        pool.request(
+            CallbackPriority::Low,
+            Box::new(move || {
+                low_started_tx.send(()).unwrap();
+                let _ = low_held.recv();
+            }),
+        )
+        .unwrap();
+        low_started.recv_timeout(T).unwrap();
+        let medium = Arc::clone(&pool.queues[CallbackPriority::Medium.index()]);
+        let band = Arc::clone(&medium);
+        pool.request(
+            CallbackPriority::Medium,
+            Box::new(move || {
+                while band.state() != band_state::STOPPING {
+                    std::thread::yield_now();
+                }
+            }),
+        )
+        .unwrap();
+        let stopper = {
+            let pool = Arc::clone(&pool);
+            std::thread::spawn(move || pool.stop())
+        };
+        let deadline = std::time::Instant::now() + T;
+        while medium.state() != band_state::STOPPED {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Medium left open while the stop waits on Low"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        release_low.send(()).unwrap();
+        stopper.join().unwrap();
+    }
+
+    /// `callbackStop` on a band whose workers were told to exit (the
+    /// `run_facility_loop` exit path's `request_shutdown`) seals it on the
+    /// count alone: the shutdown bit is not part of the drain test.
+    #[test]
+    fn a_stop_seals_a_shut_down_band() {
+        let pool = CallbackPool::with_config(8, 1);
+        let ran = Arc::new(AtomicBool::new(false));
+        pool.request(CallbackPriority::Medium, runs(&ran)).unwrap();
+        let band = Arc::clone(&pool.queues[CallbackPriority::Medium.index()]);
+        let finished = || -> u64 {
+            band.finished
+                .iter()
+                .map(|f| f.0.load(Ordering::Acquire))
+                .sum()
+        };
+        while finished() != 1 {
+            std::thread::yield_now();
+        }
+        band.request_shutdown();
+        let (done, stopped) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            pool.stop();
+            let _ = done.send(());
+        });
+        assert!(
+            stopped.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "callbackStop spun on the shut-down band"
+        );
+        assert_eq!(band.state(), band_state::STOPPED);
+    }
+
+    /// After `callbackStop` a request is taken (`Ok`) and never run: C's
+    /// ring outlives its workers until `callbackCleanup`.
+    #[test]
+    fn a_request_after_the_stop_is_taken_and_never_runs() {
+        let pool = CallbackPool::with_config(8, 1);
+        pool.stop();
+        let ran = Arc::new(AtomicBool::new(false));
+        assert_eq!(pool.request(CallbackPriority::Low, runs(&ran)), Ok(()));
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!ran.load(Ordering::SeqCst));
+    }
+
+    /// `callbackCleanup` is the way back to `cbInit`, and the next
+    /// `callbackInit` arms the bands for a second IOC.
+    #[test]
+    fn cleanup_rearms_the_bands_for_a_second_ioc() {
+        let pool = CallbackPool::new_uninitialized();
+        pool.init();
+        pool.stop();
+        pool.cleanup();
+        let ran = Arc::new(AtomicBool::new(false));
+        assert_eq!(
+            pool.request(CallbackPriority::Low, runs(&ran)),
+            Err(CallbackError::NotInit)
+        );
+        pool.init();
+        pool.request(CallbackPriority::Low, runs(&ran)).unwrap();
+        pool.stop();
+        assert!(ran.load(Ordering::SeqCst));
+    }
+}
+
+#[cfg(test)]
+mod rv_stop_race {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+    use std::time::Duration;
+
+    /// RV: C callbackStop joins its workers, so no callback runs after it
+    /// returns (callback.c:237-260).
+    #[test]
+    fn rv_nothing_runs_after_stop_returns() {
+        let mut late_total = 0;
+        for _ in 0..300 {
+            let pool = Arc::new(CallbackPool::with_config(1024, 1));
+            let stopped = Arc::new(AtomicBool::new(false));
+            let late = Arc::new(AtomicUsize::new(0));
+            let quit = Arc::new(AtomicBool::new(false));
+            let hammer = {
+                let (pool, stopped, late, quit) =
+                    (pool.clone(), stopped.clone(), late.clone(), quit.clone());
+                std::thread::spawn(move || {
+                    while !quit.load(Ordering::SeqCst) {
+                        let (s, l) = (stopped.clone(), late.clone());
+                        let _ = pool.request(
+                            CallbackPriority::Low,
+                            Box::new(move || {
+                                if s.load(Ordering::SeqCst) {
+                                    l.fetch_add(1, Ordering::SeqCst);
+                                }
+                            }),
+                        );
+                    }
+                })
+            };
+            std::thread::sleep(Duration::from_micros(200));
+            pool.stop();
+            stopped.store(true, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(2));
+            quit.store(true, Ordering::SeqCst);
+            hammer.join().unwrap();
+            late_total += late.load(Ordering::SeqCst);
+        }
+        assert_eq!(late_total, 0, "callbacks ran after callbackStop returned");
     }
 }

@@ -8,7 +8,7 @@
 //! the listener peels it and processes the inner SEARCH/etc. packet
 //! as if it had arrived directly.
 //!
-//! Why a separate socket from [`super::AsyncUdpV4`]? pvxs collapses
+//! Why a separate socket from `super::AsyncUdpV4`? pvxs collapses
 //! the SEARCH receive path and the ORIGIN_TAG receive path into a
 //! single wildcard socket. Our per-NIC bundle binds the loopback NIC
 //! to `127.0.0.1` (not wildcard), which the kernel will not deliver
@@ -27,19 +27,69 @@
 //! `#endif`. A repin to HEAD must add 5; leaving the number is what makes it
 //! wrong.
 
-// RTEMS-EXEC-MODEL-ALLOW(3): every test binds tokio::net UDP sockets, which
-// need a reactor the exec backend does not start; on the exec backend these
-// still run on the tokio driver `#[tokio::test]` builds, and pass.
-use std::io;
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::net::Ipv4Addr;
 
-use socket2::{Domain, Protocol, Socket, Type};
-use tokio::net::UdpSocket;
+use socket2::SockRef;
 
 // The group literal itself is wire data, not a socket, and lives in
 // [`super::ORIGIN_TAG_MCAST_GROUP`] so RTEMS builds — which drop this
 // module — can still name it.
 pub use super::ORIGIN_TAG_MCAST_GROUP;
+
+/// Linux: take only the groups this socket joined. The kernel default
+/// `IP_MULTICAST_ALL=1` would also hand a wildcard socket every datagram for a
+/// group some other socket on the host holds, and per-NIC routing relies on
+/// the opposite (libcom 51191e6155). Call it on the new socket *before* the
+/// bind, as libcom does, so no datagram is queued under the default.
+/// A no-op elsewhere.
+pub fn deny_unjoined_multicast(sock: SockRef<'_>) {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = sock.set_multicast_all_v4(false);
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = sock;
+}
+
+/// Make a bound wildcard UDP socket a member of the ORIGIN_TAG channel:
+/// joined to `224.0.0.128` on loopback, with its multicast sends looped back
+/// and kept on the host. `bind_loopback_mcast` applies it to the socket it
+/// builds; the exec backend's blocking responder applies it to its one search
+/// socket, as pvxs's `UDPCollector` is both at once. A second wildcard socket
+/// on that port would share its reuse group and take about half the unicast
+/// SEARCHes. The caller has already called [`deny_unjoined_multicast`], before
+/// the bind.
+///
+/// Only a failed join or option is logged and the socket kept, as pvxs's
+/// `evsocket::mcast_join`/`mcast_loop` do (`evhelper.cpp:536-545`,
+/// `:611-620` at 1.5.3).
+pub fn enable_loopback_mcast(sock: SockRef<'_>) {
+    // Receive side: join 224.0.0.128 on the loopback interface so the
+    // kernel delivers forwarded packets to us.
+    if let Err(e) = sock.join_multicast_v4(&ORIGIN_TAG_MCAST_GROUP, &Ipv4Addr::LOCALHOST) {
+        tracing::error!("Unable to join mcast4 group {ORIGIN_TAG_MCAST_GROUP}: {e}");
+    }
+
+    // Send side: any send to 224.0.0.128 from this socket goes out
+    // via loopback (TTL=1 so it stays on this host) and loops back
+    // into our own and any peer's listeners.
+    //
+    // TTL is intentionally hard-coded to 1 and does NOT honour
+    // `runtime::net::ca_mcast_ttl()` / `EPICS_CA_MCAST_TTL`: this is
+    // the host-local pvxs ORIGIN_TAG channel (udp_collector.cpp),
+    // which is TTL=1 by design. `EPICS_CA_MCAST_TTL` governs routed
+    // CA multicast only and must not leak this loopback channel onto
+    // the wire.
+    for (what, set) in [
+        ("loopback", sock.set_multicast_loop_v4(true)),
+        ("TTL", sock.set_multicast_ttl_v4(1)),
+        ("interface", sock.set_multicast_if_v4(&Ipv4Addr::LOCALHOST)),
+    ] {
+        if let Err(e) = set {
+            tracing::error!("Unable to set mcast {what}4: {e}");
+        }
+    }
+}
 
 /// Bind a UDP socket configured for the pvxs ORIGIN_TAG forwarding
 /// channel.
@@ -59,10 +109,23 @@ pub use super::ORIGIN_TAG_MCAST_GROUP;
 ///
 /// Returns the tokio-wrapped socket. Caller still drives `recv_from`/
 /// `send_to` on it; this helper does no I/O.
-pub fn bind_loopback_mcast(port: u16) -> io::Result<UdpSocket> {
+///
+/// Only a failed socket or bind is an error, as pvxs's `evsocket::bind`
+/// throws; a failed join or multicast option is logged and the socket kept,
+/// as `evsocket::mcast_join`/`mcast_loop` do (`evhelper.cpp:536-545`,
+/// `:611-620` at 1.5.3).
+#[cfg(tokio_backend)]
+pub fn bind_loopback_mcast(port: u16) -> std::io::Result<tokio::net::UdpSocket> {
+    use std::net::{SocketAddr, SocketAddrV4};
+
+    use socket2::{Domain, Protocol, Socket, Type};
+
+    use super::fanout::{PortOrigin, PortUse};
+
     let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
 
-    // Same SO_REUSE* policy as the per-NIC bundle: required so a PVA
+    // Same SO_REUSE* policy as the per-NIC bundle, applied at the bind
+    // below: required so a PVA
     // server and client on the same host can both join the group.
     //
     // On every platform, Windows included: this is the socket pvxs builds
@@ -74,53 +137,27 @@ pub fn bind_loopback_mcast(port: u16) -> io::Result<UdpSocket> {
     // Applying it here would stop a second local PVA process from joining
     // the ORIGIN_TAG channel on Windows.)
     //
-    // Set unconditionally, including for an ephemeral port — unlike the
-    // unicast sockets in `async_udp_v4`. Co-binding *is* the purpose of
-    // this helper (one listener takes an ephemeral port and publishes it,
-    // the others join that same port), and multicast group traffic is
-    // delivered to every joined socket rather than load-balanced across the
-    // reuse group, so sharing costs nothing here.
-    sock.set_reuse_address(true)?;
-    #[cfg(unix)]
-    sock.set_reuse_port(true)?;
+    // Set on an ephemeral port too: co-binding *is* the purpose of this
+    // helper (one listener takes an ephemeral port and publishes it, the
+    // others join that same port). On 0 they go on after the bind on unix, so
+    // the first listener cannot land in a stranger's reuse group; Windows sets
+    // them before, as C does. See `bind_fanout`.
 
-    // Linux: don't let mcast packets that arrive on a different NIC
-    // bleed into this socket. Mirrors libcom 51191e6155 — the kernel
-    // default IP_MULTICAST_ALL=1 is wrong for our per-NIC routing.
-    #[cfg(target_os = "linux")]
-    {
-        let _ = sock.set_multicast_all_v4(false);
-    }
-
+    deny_unjoined_multicast(SockRef::from(&sock));
     sock.set_nonblocking(true)?;
     let bind_addr: SocketAddr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port));
-    sock.bind(&bind_addr.into())?;
+    PortUse::Shared.bind(&sock, bind_addr, PortOrigin::Configured)?;
 
-    // Receive side: join 224.0.0.128 on the loopback interface so the
-    // kernel delivers forwarded packets to us.
-    sock.join_multicast_v4(&ORIGIN_TAG_MCAST_GROUP, &Ipv4Addr::LOCALHOST)?;
-
-    // Send side: any send to 224.0.0.128 from this socket goes out
-    // via loopback (TTL=1 so it stays on this host) and loops back
-    // into our own and any peer's listeners.
-    //
-    // TTL is intentionally hard-coded to 1 and does NOT honour
-    // `runtime::net::ca_mcast_ttl()` / `EPICS_CA_MCAST_TTL`: this is
-    // the host-local pvxs ORIGIN_TAG channel (udp_collector.cpp),
-    // which is TTL=1 by design. `EPICS_CA_MCAST_TTL` governs routed
-    // CA multicast only and must not leak this loopback channel onto
-    // the wire.
-    sock.set_multicast_loop_v4(true)?;
-    sock.set_multicast_ttl_v4(1)?;
-    sock.set_multicast_if_v4(&Ipv4Addr::LOCALHOST)?;
+    enable_loopback_mcast(SockRef::from(&sock));
 
     let std_sock: std::net::UdpSocket = sock.into();
-    UdpSocket::from_std(std_sock)
+    tokio::net::UdpSocket::from_std(std_sock)
 }
 
-#[cfg(test)]
+#[cfg(all(test, tokio_backend))]
 mod tests {
     use super::*;
+    use std::net::{SocketAddr, SocketAddrV4};
     use std::time::Duration;
 
     /// Bind succeeds on an ephemeral port, local addr is wildcard.
@@ -154,6 +191,19 @@ mod tests {
             .expect("recv timeout")
             .expect("recv ok");
         assert_eq!(&buf[..n], b"origin-tag-loop");
+    }
+
+    /// The channel takes only the groups it joined: another process holding
+    /// `224.0.0.128` must not feed this socket (Linux `IP_MULTICAST_ALL`).
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn the_channel_takes_only_the_groups_it_joined() {
+        let sock = bind_loopback_mcast(0).expect("bind");
+        assert!(
+            !SockRef::from(&sock)
+                .multicast_all_v4()
+                .expect("IP_MULTICAST_ALL")
+        );
     }
 
     /// Two independent sockets co-bound to the same port (SO_REUSEPORT)

@@ -39,7 +39,7 @@ fn make_array(id: i32) -> Arc<NDArray> {
 /// Control has never been turned on: every frame is ignored outright.
 #[test]
 fn r9_79_frames_are_ignored_until_control_turns_acquisition_on() {
-    let mut cb = CircularBuffer::new(3, 1, TriggerCondition::External);
+    let mut cb = CircularBuffer::new(3, 1, TriggerCondition::default());
 
     for i in 0..5 {
         let r = cb.push(make_array(i));
@@ -62,7 +62,7 @@ fn r9_79_frames_are_ignored_until_control_turns_acquisition_on() {
 /// the very next frame is ignored.
 #[test]
 fn r9_79_user_stop_stops_recording_immediately() {
-    let mut cb = CircularBuffer::new(3, 2, TriggerCondition::External);
+    let mut cb = CircularBuffer::new(3, 2, TriggerCondition::default());
     cb.start();
     cb.push(make_array(1));
     cb.push(make_array(2));
@@ -84,7 +84,7 @@ fn r9_79_user_stop_stops_recording_immediately() {
 /// only inside the `if (scopeControl)` body.
 #[test]
 fn r9_79_trigger_while_stopped_does_not_arm_a_flush() {
-    let mut cb = CircularBuffer::new(2, 1, TriggerCondition::External);
+    let mut cb = CircularBuffer::new(2, 1, TriggerCondition::default());
     cb.start();
     cb.push(make_array(1));
     cb.stop();
@@ -104,7 +104,7 @@ fn r9_79_trigger_while_stopped_does_not_arm_a_flush() {
 /// special case.
 #[test]
 fn r9_79_completion_turns_control_off() {
-    let mut cb = CircularBuffer::new(1, 1, TriggerCondition::External);
+    let mut cb = CircularBuffer::new(1, 1, TriggerCondition::default());
     cb.start();
     cb.set_preset_trigger_count(1);
 

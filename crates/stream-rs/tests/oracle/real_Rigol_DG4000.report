@@ -1,0 +1,156 @@
+rec0: Rigol_DG4000.proto getLongString(1,2,3,4,5,6,7,8,9) P
+getLongString {
+  extraInput    = error;
+  lockTimeout   = 3000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 1000; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "1?";
+    in "%#s";
+}
+rec1: Rigol_DG4000.proto getString(1,2,3,4,5,6,7,8,9) P
+getString {
+  extraInput    = ignore;
+  lockTimeout   = 3000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 1000; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "1?";
+    in "%s";
+}
+rec2: Rigol_DG4000.proto setString(1,2,3,4,5,6,7,8,9) P
+setString {
+  extraInput    = error;
+  lockTimeout   = 3000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 1000; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "1 %s";
+}
+rec3: Rigol_DG4000.proto getInt(1,2,3,4,5,6,7,8,9) P
+getInt {
+  extraInput    = error;
+  lockTimeout   = 3000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 1000; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "1?";
+    in "%d";
+}
+rec4: Rigol_DG4000.proto setInt(1,2,3,4,5,6,7,8,9) P
+setInt {
+  extraInput    = error;
+  lockTimeout   = 3000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 1000; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "1 %d";
+}
+rec5: Rigol_DG4000.proto getFloat(1,2,3,4,5,6,7,8,9) P
+getFloat {
+  extraInput    = error;
+  lockTimeout   = 3000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 1000; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "1?";
+    in "%f";
+}
+rec6: Rigol_DG4000.proto setFloat(1,2,3,4,5,6,7,8,9) P
+setFloat {
+  extraInput    = error;
+  lockTimeout   = 3000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 1000; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "1 %f";
+}
+rec7: Rigol_DG4000.proto setNone(1,2,3,4,5,6,7,8,9) P
+setNone {
+  extraInput    = error;
+  lockTimeout   = 3000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 1000; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "1";
+}
+rec8: Rigol_DG4000.proto setWaveform1(1,2,3,4,5,6,7,8,9) P
+setWaveform1 {
+  extraInput    = error;
+  lockTimeout   = 3000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 1000; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = ",";
+
+    out ":OUTP1:STAT ON";
+    out ":TRAC:DATA VOLATILE, (%f)";
+}
+rec9: Rigol_DG4000.proto setWaveform2(1,2,3,4,5,6,7,8,9) P
+setWaveform2 {
+  extraInput    = error;
+  lockTimeout   = 3000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 1000; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = ",";
+
+    out ":OUTP2:STAT ON";
+    out ":TRAC:DATA VOLATILE, (%f)";
+}

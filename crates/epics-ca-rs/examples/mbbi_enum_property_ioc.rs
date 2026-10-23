@@ -34,52 +34,62 @@
 #![cfg_attr(exec_backend, allow(dead_code, unused_imports))]
 
 use epics_base_rs::error::CaResult;
-use epics_base_rs::server::device_support::{DeviceInitOutcome, DeviceSupport, PropertyPost};
-use epics_base_rs::server::record::Record;
+use epics_base_rs::server::database::AsyncDbHandle;
+use epics_base_rs::server::device_support::{
+    DeviceInitOutcome, DeviceSupport, IoIntrAction, PropertyPost,
+};
+#[cfg(tokio_backend)]
+use epics_base_rs::server::ioc_builder::IocBuilder;
+use epics_base_rs::server::record::{DbLinkType, DevSup, Dset, Record};
 use epics_base_rs::types::EpicsValue;
 #[cfg(tokio_backend)]
-use epics_ca_rs::server::CaServer;
+use epics_ca_rs::server::CaServerBuilder;
 use std::collections::HashMap;
 
-/// Holds both ends until the framework claims the receiver: the device owns
-/// the source subscription, the framework owns the post.
-struct EnumProp {
-    rx: Option<tokio::sync::mpsc::Receiver<PropertyPost>>,
-    tx: Option<tokio::sync::mpsc::Sender<PropertyPost>>,
-}
+/// `device(mbbi, CONSTANT, devMbbiEnumProp, "enumProp")`, with the
+/// `init_record` and `read_mbbi` a C dset for it would carry.
+static ENUM_PROP: DevSup = DevSup {
+    name: "devMbbiEnumProp",
+    choice: "enumProp",
+    link_type: DbLinkType::Constant,
+    dset: Dset::new(5, &[2, 4], false),
+};
 
-impl EnumProp {
-    fn new() -> Self {
-        let (tx, rx) = tokio::sync::mpsc::channel(4);
-        Self {
-            rx: Some(rx),
-            tx: Some(tx),
-        }
-    }
+/// The driver thread's callback takes the record's lock, as C's does.
+#[derive(Default)]
+struct EnumProp {
+    db: Option<AsyncDbHandle>,
 }
 
 impl DeviceSupport for EnumProp {
+    fn bind_database(&mut self, db: AsyncDbHandle) {
+        self.db = Some(db);
+    }
+
     fn init(&mut self, _record: &mut dyn Record) -> CaResult<DeviceInitOutcome> {
-        let tx = self.tx.take().expect("init runs once");
+        let db = self.db.clone().expect("bound before init");
         let delay: u64 = std::env::var("RIG_DELAY")
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(5);
-        tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
-            eprintln!("[ioc] re-keying enum strings, posting DBE_PROPERTY on VAL");
-            let _ = tx
-                .send(PropertyPost {
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(delay));
+            epics_libcom_rs::stderr_println!(
+                "[ioc] re-keying enum strings, posting DBE_PROPERTY on VAL"
+            );
+            db.run_io_intr_callback_with("RIG:MBBI", |held| {
+                let _ = held.put_property(PropertyPost {
                     writes: vec![
                         ("ZRST".into(), EpicsValue::String("OFF".into())),
                         ("ONST".into(), EpicsValue::String("ON".into())),
                         ("TWST".into(), EpicsValue::String("FAULT".into())),
                     ],
                     post_field: "VAL".into(),
-                })
-                .await;
+                });
+                IoIntrAction::Skip
+            });
         });
-        Ok(DeviceInitOutcome::Live)
+        Ok(DeviceInitOutcome::ok())
     }
 
     fn write(&mut self, _record: &mut dyn Record) -> CaResult<()> {
@@ -88,10 +98,6 @@ impl DeviceSupport for EnumProp {
 
     fn dtyp(&self) -> &str {
         "enumProp"
-    }
-
-    fn property_post_receiver(&mut self) -> Option<tokio::sync::mpsc::Receiver<PropertyPost>> {
-        self.rx.take()
     }
 }
 
@@ -112,15 +118,32 @@ record(mbbi, "RIG:MBBI") {
     field(SCAN, "Passive")
 }
 "#;
-    let server = CaServer::builder()
-        .port(port)
-        .tcp_port(port)
+    let args = epics_base_rs::server::ioc_app::ServerInitArgs {
+        port,
+        tcp_port: Some(port),
+    };
+    let mut ioc = IocBuilder::new()
         .db_string(db, &HashMap::new())?
-        .register_device_support("enumProp", || Box::new(EnumProp::new()))
-        .build()
+        .register_device_support("mbbi", &ENUM_PROP, || Box::<EnumProp>::default())
+        .register_server_init(
+            epics_ca_rs::server::RSRV_SERVER,
+            args,
+            epics_ca_rs::server::rsrv_init,
+        )
+        .build_ioc()
         .await?;
-    let _scan = epics_base_rs::server::scan::ScanOwner::start(server.database().clone());
-    eprintln!("[ioc] serving RIG:MBBI on CA port {port}");
+    let server = CaServerBuilder::serving(
+        ioc.database().clone(),
+        epics_base_rs::server::access_security::new_acf_cell(None),
+        None,
+        None,
+    )
+    .port(port)
+    .tcp_port(port)
+    .bound_at_init(ioc.servers());
+    ioc.run().await;
+    let server = server.build().await?;
+    epics_libcom_rs::stderr_println!("[ioc] serving RIG:MBBI on CA port {port}");
     server.run().await
 }
 
@@ -128,9 +151,8 @@ record(mbbi, "RIG:MBBI") {
 /// this backend does not compile.
 #[cfg(exec_backend)]
 fn main() -> CaResult<()> {
-    eprintln!(
+    epics_base_rs::runtime::task::refuse_backend(
         "mbbi_enum_property_ioc: needs the tokio backend; this build selects \
-         EPICS_RS_BUILD_EXEC_BACKEND=thread."
-    );
-    Ok(())
+         EPICS_RS_BUILD_EXEC_BACKEND=thread.",
+    )
 }

@@ -3,6 +3,7 @@
 //! Builds a beamline from current motor positions, runs ray tracing,
 //! and returns the screen capture (2D intensity) plus beam statistics.
 
+use epics_libcom_rs::cfmt::CFloat;
 use xrt_core::consts::CH;
 use xrt_materials::crystal::CrystalGeometry;
 use xrt_materials::crystal_variants::CrystalSi;
@@ -305,7 +306,7 @@ pub fn simulate(config: &SimConfig, motors: &MotorPositions) -> SimResult {
         let nm3 = (0..beam.nrays()).filter(|&i| beam.state[i] == -3).count();
         let n0 = (0..beam.nrays()).filter(|&i| beam.state[i] == 0).count();
         let n2 = (0..beam.nrays()).filter(|&i| beam.state[i] == 2).count();
-        eprintln!(
+        epics_libcom_rs::stderr_println!(
             "  DCM1: Good={n1} Over={n3} Out={nm1} Absorbed={nm2} Dead={nm3} state0={n0} state2={n2} total={}",
             beam.nrays()
         );
@@ -325,7 +326,7 @@ pub fn simulate(config: &SimConfig, motors: &MotorPositions) -> SimResult {
         );
         xtal2.reflect(&mut beam, &c2);
         let _n = (0..beam.nrays()).filter(|&i| beam.state[i] == 1).count();
-        eprintln!("  DCM2: good={_n}");
+        epics_libcom_rs::stderr_println!("  DCM2: good={_n}");
         // No kill_lost — keep all rays with amplitude weighting
     }
 
@@ -349,7 +350,7 @@ pub fn simulate(config: &SimConfig, motors: &MotorPositions) -> SimResult {
         );
         hfm.reflect(&mut beam);
         let _n = (0..beam.nrays()).filter(|&i| beam.state[i] == 1).count();
-        eprintln!("  HFM:  good={_n}");
+        epics_libcom_rs::stderr_println!("  HFM:  good={_n}");
         // No kill_lost — keep all rays with amplitude weighting
     }
 
@@ -388,7 +389,7 @@ pub fn simulate(config: &SimConfig, motors: &MotorPositions) -> SimResult {
         );
         vfm.reflect(&mut beam);
         let _n = (0..beam.nrays()).filter(|&i| beam.state[i] == 1).count();
-        eprintln!("  VFM:  good={_n}");
+        epics_libcom_rs::stderr_println!("  VFM:  good={_n}");
         // No kill_lost — keep all rays with amplitude weighting
     }
 
@@ -410,16 +411,21 @@ pub fn simulate(config: &SimConfig, motors: &MotorPositions) -> SimResult {
                 good.iter().map(|&i| beam.y[i]).sum::<f64>() / n,
                 good.iter().map(|&i| beam.z[i]).sum::<f64>() / n,
             ];
-            eprintln!(
+            epics_libcom_rs::stderr_println!(
                 "  screen auto: ({:.1},{:.1},{:.1}) n_good={}",
-                c[0],
-                c[1],
-                c[2],
+                CFloat(c[0]),
+                CFloat(c[1]),
+                CFloat(c[2]),
                 good.len()
             );
             c
         } else {
-            eprintln!("  screen fallback: ({x_sample:.1},{y_sample:.1},{z_sample:.1})");
+            epics_libcom_rs::stderr_println!(
+                "  screen fallback: ({:.1},{:.1},{:.1})",
+                CFloat(x_sample),
+                CFloat(y_sample),
+                CFloat(z_sample)
+            );
             [x_sample, y_sample, z_sample]
         }
     };

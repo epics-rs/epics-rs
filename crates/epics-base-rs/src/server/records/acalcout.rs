@@ -29,8 +29,7 @@
 //! - `RPVT` (`rpvtStruct*`), `RPCL`/`ORPC` (compiled reverse-Polish buffers)
 //!   — internal C pointers, no value type.
 //! - `PAVL`/`PAA`/`POAV` (previous-value array scratch) — used only by C
-//!   `monitor()`/`fetch_values` to detect array change; the framework's
-//!   generic change-detection on `AVAL`/`AA..LL`/`OAV` subsumes them.
+//!   `monitor()`/`fetch_values` to detect array change; held privately here.
 //!
 //! The accessible `DBF_NOACCESS` arrays (`AVAL`, `AA..LL`, `OAV`) carry
 //! `special(SPC_DBADDR)` and are served by C `cvt_dbaddr` as `DBF_DOUBLE`
@@ -51,10 +50,6 @@
 //!   reports `Constant`(3), matching C overwriting the dbd `initial("1")`
 //!   for every CONSTANT link (see `AcalcoutRecord::default`). Live per-link
 //!   CA-connectivity reclassification (C `checkLinks`) is not modeled.
-//! - Array `AVAL`/`OAV` MDEL/ADEL deadband (C `monitor()` per-element delta
-//!   vs `pavl`/`poav`, aCalcoutRecord.c:987-1021) is replaced by the
-//!   framework's generic array change-detection (post on any change). Differs
-//!   only when MDEL/ADEL > 0; the default 0 posts on any change in both.
 //! - `IVOA` is applied on a CALC/OCAL evaluation failure (the C
 //!   `CALC_ALARM`=INVALID path), matching siblings `scalcout`/`calcout`. The
 //!   limit-alarm/MS-link-driven `INVALID` IVOA gate of C `execOutput` is now
@@ -99,18 +94,23 @@
 //!   hysteresis vs C.
 
 use crate::error::{CaError, CaResult};
+use crate::server::record::{CycleCell, CycleRead, CycleValue};
 use crate::server::record::{
-    CyclePostMask, InputFetchPolicy, OutTarget, ProcessAction, ProcessOutcome, Record,
+    CycleMarks, CyclePostMask, InputFetchPolicy, OutTarget, ProcessAction, ProcessOutcome, Record,
     RecordProcessResult,
 };
 use crate::types::{EpicsValue, PvString};
 
 use super::calc_compile;
-use crate::calc::{ArrayInputs, CompiledExpr, ExprKind, acalc_eval};
+use crate::calc::{ArrayInputs, Rpcl, acalc_eval};
 // `LINK_CON` (= 3, the `Constant` link-status index) is the value C
 // `init_record` writes for an unconfigured link; shared with `calcout`.
-use super::link_status::{LINK_CON, LinkRole, LinkStatusGen, post_link_status};
+use super::link_status::{
+    LINK_CON, LinkCheck, LinkCheckSpec, LinkCheckState, LinkRole, LinkRule, LinkStatusGen,
+    LinkStatusPosts, post_link_status,
+};
 use crate::server::database::AsyncDbHandle;
+use crate::server::recgbl::PutReport;
 
 /// Code version reported by `VERS` (C `#define VERSION 1.4`).
 const VERSION: f64 = 1.4;
@@ -131,6 +131,15 @@ struct CalcPass {
     /// array fields it stored into.
     inputs: ArrayInputs,
 }
+
+/// C `monitor()`'s AVAL/OAV post masks (`aCalcoutRecord.c:996-1000`):
+/// `monitor_mask` plus `DBE_VALUE` for an MDEL crossing, `DBE_LOG` for an
+/// ADEL crossing, in [`AcalcoutRecord::monitor_array`]'s row order.
+const AVAL_OAV_MASKS: [CyclePostMask; 3] = [
+    CyclePostMask::MonitorValue,
+    CyclePostMask::MonitorLog,
+    CyclePostMask::MonitorValueLog,
+];
 
 const ARR_NAMES: [&str; 12] = [
     "AA", "BB", "CC", "DD", "EE", "FF", "GG", "HH", "II", "JJ", "KK", "LL",
@@ -183,6 +192,43 @@ const INAV_NAMES: [&str; 12] = [
 const IAAV_NAMES: [&str; 12] = [
     "IAAV", "IBBV", "ICCV", "IDDV", "IEEV", "IFFV", "IGGV", "IHHV", "IIIV", "IJJV", "IKKV", "ILLV",
 ];
+
+/// C `checkLinks`' walk from `&pcalc->inpa`/`&pcalc->inav`: INPA..INPL,
+/// INAA..INLL, OUT (aCalcoutRecord.c:1150-1200).
+static ACALCOUT_LINK_CHECK: LinkCheckSpec = LinkCheckSpec {
+    links: &[
+        ("INPA", "INAV"),
+        ("INPB", "INBV"),
+        ("INPC", "INCV"),
+        ("INPD", "INDV"),
+        ("INPE", "INEV"),
+        ("INPF", "INFV"),
+        ("INPG", "INGV"),
+        ("INPH", "INHV"),
+        ("INPI", "INIV"),
+        ("INPJ", "INJV"),
+        ("INPK", "INKV"),
+        ("INPL", "INLV"),
+        ("INAA", "IAAV"),
+        ("INBB", "IBBV"),
+        ("INCC", "ICCV"),
+        ("INDD", "IDDV"),
+        ("INEE", "IEEV"),
+        ("INFF", "IFFV"),
+        ("INGG", "IGGV"),
+        ("INHH", "IHHV"),
+        ("INII", "IIIV"),
+        ("INJJ", "IJJV"),
+        ("INKK", "IKKV"),
+        ("INLL", "ILLV"),
+        ("OUT", "OUTV"),
+    ],
+    rule: LinkRule::Locality,
+    // C `aCalcoutRecord.c:1157`.
+    mask: crate::server::recgbl::EventMask::VALUE,
+    repost_local: false,
+    in_cycle: true,
+};
 const PA_NAMES: [&str; 12] = [
     "PA", "PB", "PC", "PD", "PE", "PF", "PG", "PH", "PI", "PJ", "PK", "PL",
 ];
@@ -218,9 +264,8 @@ const PA_NAMES: [&str; 12] = [
 /// The ledger is held in atomics and every operation takes `&self`. That is not
 /// a concurrency feature: it is what lets the charge sit at C's OWN seam.
 /// `cvt_dbaddr` runs when a client resolves a channel on an `SPC_DBADDR` field,
-/// which reaches this port as [`AcalcoutRecord::dbaddr_capacity`] — a `&self`
-/// hook, because answering "how many elements does this channel have" is a
-/// read. A charge is idempotent per [`ArrayBuf`] and the test-and-set is one
+/// which reaches this port as [`Record::cvt_dbaddr`] — a `&self` hook,
+/// because resolving a channel is a read. A charge is idempotent per [`ArrayBuf`] and the test-and-set is one
 /// `fetch_or`, so the ledger stays a pure function of which buffers have been
 /// demanded, whoever asks and however often.
 mod array_mem {
@@ -385,9 +430,15 @@ mod array_mem {
 
 use array_mem::{ArrayBuf, ArrayMem};
 
+/// `aCalcoutRecord.dbd:805,811` `unsigned char rpcl[282]`, `orpc[282]`.
+const ACALCOUT_RPCL_SIZE: usize = 282;
+
 /// aCalcout record state. Field comments cite the `aCalcoutRecord.dbd`
 /// declaration; behaviour cites `aCalcoutRecord.c`.
 pub struct AcalcoutRecord {
+    /// VERS: C `vers = VERSION` in `init_record` pass 0; a `.db` VERS lands
+    /// until then.
+    vers: f64,
     // --- result ---
     pub val: f64,
     aval: Vec<f64>,
@@ -418,13 +469,13 @@ pub struct AcalcoutRecord {
     /// C `RPCL`. Always a program: an empty or uncompilable CALC carries C's
     /// empty `END_EXPRESSION` postfix, which `aCalcPerform` refuses to run
     /// (`aCalcPerform.c:312-314`), so the record alarms on every process.
-    compiled_calc: CompiledExpr,
+    rpcl: Rpcl<ACALCOUT_RPCL_SIZE>,
     clcv: i32,
 
     // --- OCAL / output-data option ---
     pub ocal: String,
-    /// C `ORPC`. Same contract as [`Self::compiled_calc`].
-    compiled_ocal: CompiledExpr,
+    /// C `ORPC`. Same contract as [`Self::rpcl`].
+    orpc: Rpcl<ACALCOUT_RPCL_SIZE>,
     oclv: i32,
     dopt: i16, // 0=Use CALC, 1=Use OCAL
     oval: f64,
@@ -433,24 +484,27 @@ pub struct AcalcoutRecord {
 
     // --- scalar inputs A..L ---
     num_vals: [f64; 12],
-    inp_links: [String; 12],
+    inp_links: [PvString; 12],
     pa: [f64; 12], // PA..PL
 
     // --- array inputs AA..LL ---
     arr_vals: [Vec<f64>; 12],
-    ina_links: [String; 12],
+    ina_links: [PvString; 12],
 
     // --- link status, derived from the links by `refresh_link_status` ---
-    inav: [i16; 12], // INAV..INLV
-    iaav: [i16; 12], // IAAV..ILLV
-    outv: i16,
+    /// INAV..INLV, IAAV..ILLV, OUTV: `ACALCOUT_LINK_CHECK` order.
+    link_status: [i16; 25],
+    link_check: LinkCheckState,
     /// Async surface + generation gate for `refresh_link_status`, the shape
     /// calcout/scalcout/transform use (see `link_status::post_link_status`).
-    async_ctx: Option<(String, AsyncDbHandle)>,
+    async_ctx: Option<(crate::types::RecordName, AsyncDbHandle)>,
     link_gen: LinkStatusGen,
+    // A refused CALC/OCAL put's report, made by `special()` under the put's
+    // hold and printed by the put's owner after it.
+    put_report: Option<PutReport>,
 
     // --- output link + options ---
-    out: String,
+    out: PvString,
     oopt: i16, // 0..6, see acalcoutOOPT
     odly: f64,
     wait: i16,
@@ -486,11 +540,27 @@ pub struct AcalcoutRecord {
     cstat: i32,
     cact: u8,
     amask: u32,
+    /// The arrays `afterCalc` owes a post, copied from `amask` when the passes
+    /// end and TAKEN by [`Record::take_process_posted_fields`] — AMASK itself
+    /// stays readable until the next process.
+    amask_posts: u32,
+    /// DLYA moved this pass: C posts it from `process()` with `DBE_VALUE`
+    /// alone (`aCalcoutRecord.c:341`, `:424`), TAKEN with `amask_posts`.
+    dlya_moved: bool,
+    /// C `pavl`/`poav` — `monitor()`'s previous AVAL/OAV, `nelm` long, written
+    /// only by [`Self::complete_cycle`].
+    pavl: Vec<f64>,
+    poav: Vec<f64>,
+    /// AVAL (bit 0) and OAV (bit 1) posts `monitor()` made, taken by
+    /// `take_cycle_posted_fields`.
+    aval_oav_posts: u8,
     /// AMEM + PMEM, and the ledger of which array buffers C would have
     /// `calloc`'d by now. The ONE thing allowed to add to AMEM — see
     /// [`array_mem`].
     mem: ArrayMem,
     newm: u32,
+    /// CLCV (bit 0) / OCLV (bit 1) owed by the last CALC/OCAL `special()`.
+    calc_posts: u64,
 
     // --- process flags ---
     calc_alarm: bool,
@@ -504,11 +574,16 @@ pub struct AcalcoutRecord {
     /// `cached_should_output` on the continuation so the deferred OUT write
     /// fires once after the delay. Mirrors `scalcout`/`calcout`.
     pending_output: bool,
+    /// `prec->pact` at `process()` entry: C takes the delayed-output arm only
+    /// with PACT held, so a re-entry after a device-link put cleared it
+    /// (`dbAccess.c:1194`) is a fresh cycle.
+    pact: bool,
 }
 
 impl Default for AcalcoutRecord {
     fn default() -> Self {
         Self {
+            vers: VERSION,
             val: 0.0,
             aval: Vec::new(),
             pval: 0.0,
@@ -516,10 +591,10 @@ impl Default for AcalcoutRecord {
             nuse: 0, // dbd initial("0")
             nuse_post_pending: None,
             calc: String::new(),
-            compiled_calc: CompiledExpr::empty(ExprKind::Array),
+            rpcl: Rpcl::empty(),
             clcv: 0,
             ocal: String::new(),
-            compiled_ocal: CompiledExpr::empty(ExprKind::Array),
+            orpc: Rpcl::empty(),
             oclv: 0,
             dopt: 0,
             oval: 0.0,
@@ -536,12 +611,12 @@ impl Default for AcalcoutRecord {
             // (aCalcoutRecord.c:210-216,242), and a default record has all
             // links constant. The dbd `1` is never observed. Matches sibling
             // `calcout` (`in_status: [LINK_CON; 21]`).
-            inav: [LINK_CON; 12],
-            iaav: [LINK_CON; 12],
-            outv: LINK_CON,
+            link_status: [LINK_CON; 25],
+            link_check: LinkCheckState::default(),
             async_ctx: None,
             link_gen: LinkStatusGen::default(),
-            out: String::new(),
+            put_report: None,
+            out: PvString::new(),
             oopt: 0,
             odly: 0.0,
             wait: 0,
@@ -571,12 +646,19 @@ impl Default for AcalcoutRecord {
             cstat: 0,
             cact: 0,
             amask: 0,
+            amask_posts: 0,
+            dlya_moved: false,
+            pavl: Vec::new(),
+            poav: Vec::new(),
+            aval_oav_posts: 0,
             mem: ArrayMem::default(),
             newm: 0,
+            calc_posts: 0,
             calc_alarm: false,
             fetch_gate_failed: false,
             cached_should_output: false,
             pending_output: false,
+            pact: false,
         }
     }
 }
@@ -650,8 +732,51 @@ impl AcalcoutRecord {
     fn complete_cycle(&mut self) -> ProcessOutcome {
         self.mem.allocate(ArrayBuf::Pavl, self.nelm);
         self.mem.allocate(ArrayBuf::Poav, self.nelm);
+        let (n, nelm) = (self.num_elements(), self.nelm as usize);
+        let (mdel, adel) = (self.mdel, self.adel);
+        let aval = Self::monitor_array(&mut self.pavl, &self.aval, n, nelm, mdel, adel);
+        let oav = Self::monitor_array(&mut self.poav, &self.oav, n, nelm, mdel, adel);
+        self.aval_oav_posts = aval | oav << 3;
         self.mem.sync();
         ProcessOutcome::complete()
+    }
+
+    /// C `monitor()`'s AVAL/OAV test (`aCalcoutRecord.c:985-1021`): a post when
+    /// any of the first `numElements` elements moved past MDEL or ADEL against
+    /// the previous copy, which only a post advances. Elements past NUSE are
+    /// neither compared nor copied, so a NUSE change alone posts nothing.
+    ///
+    /// Returns the post's bit in its field's three [`AVAL_OAV_MASKS`] rows,
+    /// 0 for no post.
+    fn monitor_array(
+        prev: &mut Vec<f64>,
+        cur: &[f64],
+        n: usize,
+        nelm: usize,
+        mdel: f64,
+        adel: f64,
+    ) -> u8 {
+        if prev.len() < nelm {
+            prev.resize(nelm, 0.0);
+        }
+        let n = n.min(nelm);
+        let at = |i: usize| cur.get(i).copied().unwrap_or(0.0);
+        let (mut diff_mdel, mut diff_adel) = (false, false);
+        for (i, p) in prev[..n].iter().enumerate() {
+            let delta = (p - at(i)).abs();
+            diff_mdel |= delta > mdel;
+            diff_adel |= delta > adel;
+        }
+        let row = match (diff_mdel, diff_adel) {
+            (false, false) => return 0,
+            (true, false) => 0,
+            (false, true) => 1,
+            (true, true) => 2,
+        };
+        for (i, p) in prev[..n].iter_mut().enumerate() {
+            *p = at(i);
+        }
+        1 << row
     }
 
     /// The `SPC_DBADDR` field name → the buffer C's `cvt_dbaddr` /
@@ -845,7 +970,7 @@ impl AcalcoutRecord {
     ///   straight into the record's fields on the way there.
     fn eval(
         &self,
-        compiled: &CompiledExpr,
+        compiled: &Rpcl<ACALCOUT_RPCL_SIZE>,
         n: usize,
         prev_val: f64,
         prev_aval: &[f64],
@@ -928,17 +1053,42 @@ impl AcalcoutRecord {
     /// which is **-1** on failure (aCalcPostfix.c:801-809), not a generic 1 and
     /// not the CALC_ERR_* code. An empty CALC is a valid empty program with
     /// status 0 (aCalcPostfix.c:439-441).
-    fn recompile_calc(&mut self) {
-        let compiled = calc_compile::acalc_postfix("acalcout", "CALC", &self.calc);
+    ///
+    /// Both callers, `init_record` (`:245-252`) and `special()`, follow a
+    /// refused compile with `recGblRecordError(S_db_badField, pcalc,
+    /// pmessage)`, whatever DOPT says; the `printf` after it is behind
+    /// `aCalcoutRecordDebug >= 10`. The report is returned, not printed:
+    /// `special()` runs under the put's hold.
+    fn recompile_calc(&mut self, pmessage: &'static str) -> Option<PutReport> {
+        let compiled = calc_compile::acalc_postfix_into(&self.calc, &mut self.rpcl);
         self.clcv = compiled.status;
-        self.compiled_calc = compiled.program;
+        Self::bad_expr_report(self.clcv, pmessage)
     }
 
     /// C `aCalcoutRecord.c::special:483-490` — same, into ORPC/OCLV.
-    fn recompile_ocal(&mut self) {
-        let compiled = calc_compile::acalc_postfix("acalcout", "OCAL", &self.ocal);
+    fn recompile_ocal(&mut self, pmessage: &'static str) -> Option<PutReport> {
+        let compiled = calc_compile::acalc_postfix_into(&self.ocal, &mut self.orpc);
         self.oclv = compiled.status;
-        self.compiled_ocal = compiled.program;
+        Self::bad_expr_report(self.oclv, pmessage)
+    }
+
+    fn bad_expr_report(status: i32, pmessage: &'static str) -> Option<PutReport> {
+        (status != 0).then_some(PutReport::RecordError {
+            status: "Illegal field value",
+            message: pmessage,
+            then: None,
+        })
+    }
+
+    /// `init_record` is not under a put's hold, so it prints at once.
+    fn init_report(&self, report: Option<PutReport>) {
+        if let Some(report) = report {
+            let name = self
+                .async_ctx
+                .as_ref()
+                .map_or("Unknown".into(), |(n, _)| n.to_str_lossy());
+            report.emit(&name, "");
+        }
     }
 
     fn num_index(name: &str) -> Option<usize> {
@@ -981,8 +1131,8 @@ impl AcalcoutRecord {
     /// Classify all 25 links and publish INAV..INLV / IAAV..ILLV / OUTV,
     /// mirroring C `aCalcoutRecord.c::init_record` (209-243) and the
     /// `special()` re-classification (528-569). No-op without an async context.
-    fn refresh_link_status(&self) {
-        let mut links: Vec<(&'static str, String, LinkRole)> = Vec::with_capacity(25);
+    fn refresh_link_status(&self, posts: LinkStatusPosts) {
+        let mut links: Vec<(&'static str, PvString, LinkRole)> = Vec::with_capacity(25);
         for i in 0..12 {
             links.push((INAV_NAMES[i], self.inp_links[i].clone(), LinkRole::Input));
             links.push((IAAV_NAMES[i], self.ina_links[i].clone(), LinkRole::Input));
@@ -993,8 +1143,18 @@ impl AcalcoutRecord {
             self.async_ctx.as_ref(),
             &self.link_gen,
             links,
-            crate::server::recgbl::EventMask::VALUE,
+            LinkRule::Locality,
+            ACALCOUT_LINK_CHECK.mask,
+            posts,
         );
+    }
+
+    /// The `link_status` slot of a status field.
+    fn status_index(name: &str) -> Option<usize> {
+        ACALCOUT_LINK_CHECK
+            .links
+            .iter()
+            .position(|&(_, status)| status == name)
     }
 
     fn pa_index(name: &str) -> Option<usize> {
@@ -1053,11 +1213,57 @@ const ACALCOUT_SIZE_NUSE: i16 = 1;
 const ACALCOUT_INAV_CHOICES: &[&str] = &["Ext PV NC", "Ext PV OK", "Local PV", "Constant"];
 
 impl Record for AcalcoutRecord {
-    /// C `aCalcoutRecord.c::init_record` (:171-281) ends without touching
-    /// MLST/ALST/LALM, unlike the `calcout` it is modelled on
-    /// (`calcoutRecord.c:217-219`). An `acalcout` given a nonzero initial
-    /// VAL posts that value once on its first cycle in C.
-    fn seed_deadband_tracking(&mut self) {}
+    crate::slot_map!(crate::server::record::dbd_generated::slots::acalcout;
+        fields:
+        VERS => vers;
+        custom: VAL, AVAL, NELM, NUSE, PVAL, CALC, CLCV, INPA, INPB, INPC, INPD, INPE, INPF,
+            INPG, INPH, INPI, INPJ, INPK, INPL, INAA, INBB, INCC, INDD, INEE, INFF, INGG, INHH,
+            INII, INJJ, INKK, INLL, OUT, INAV, INBV, INCV, INDV, INEV, INFV, INGV, INHV, INIV,
+            INJV, INKV, INLV, IAAV, IBBV, ICCV, IDDV, IEEV, IFFV, IGGV, IHHV, IIIV, IJJV, IKKV,
+            ILLV, OUTV, OOPT, ODLY, WAIT, DLYA, DOPT, OCAL, OCLV, OEVT, IVOA, IVOV,
+            EGU => egu, PREC => prec, HOPR => hopr, LOPR => lopr,
+            HIHI, LOLO, HIGH, LOW, HHSV, LLSV, HSV, LSV, HYST, ADEL, MDEL, A, B, C,
+            D, E, F, G, H, I, J, K, L, AA, BB, CC, DD, EE, FF, GG, HH, II, JJ, KK, LL, NEWM,
+            OVAL, OAV, PA, PB, PC, PD, PE, PF, PG, PH, PI, PJ, PK, PL, POVL, LALM, ALST, MLST,
+            CACT, CSTAT, AMASK, SIZE, AMEM, PMEM;
+        spill: RPVT, PAVL, PAA, POAV);
+
+    fn stamp_point(&self) -> crate::server::record::StampPoint {
+        crate::server::record::StampPoint::AfterAlarms
+    }
+
+    fn acts_before_process(&self) -> bool {
+        false
+    }
+
+    fn cycle_hooks(&self) -> crate::server::record::CycleHooks {
+        crate::server::record::CycleHooks::CYCLE_POSTED
+            .union(crate::server::record::CycleHooks::WRITE_POSTED)
+            .union(crate::server::record::CycleHooks::PROCESS_POSTED)
+            .union(crate::server::record::CycleHooks::PUT_REPORT)
+            .union(crate::server::record::CycleHooks::INPUT_FETCH)
+            .union(crate::server::record::CycleHooks::CONTINUATION)
+            .union(crate::server::record::CycleHooks::OUTPUT_HOOKS)
+            .union(crate::server::record::CycleHooks::LINK_CHECK)
+    }
+
+    fn link_check(&mut self) -> Option<LinkCheck<'_>> {
+        Some(LinkCheck {
+            spec: &ACALCOUT_LINK_CHECK,
+            statuses: &mut self.link_status,
+            field_types: &mut [],
+            tail: None,
+            state: &mut self.link_check,
+        })
+    }
+
+    fn take_put_report(&mut self) -> Option<PutReport> {
+        self.put_report.take()
+    }
+
+    fn has_array_monitor_post(&self) -> bool {
+        false
+    }
 
     fn record_type(&self) -> &'static str {
         "acalcout"
@@ -1070,12 +1276,17 @@ impl Record for AcalcoutRecord {
     /// does.
     fn init_record(&mut self, pass: u8) -> CaResult<()> {
         if pass == 0 {
+            self.vers = VERSION;
             // C `init_record` pass 0 (`aCalcoutRecord.c:188-190`) — a .db or an
             // autosave restore can name NUSE > NELM, and the record must not
             // enter its first cycle holding it.
             self.clamp_nuse(CyclePostMask::ValueLog);
-            self.recompile_calc();
-            self.recompile_ocal();
+        } else {
+            // C `aCalcoutRecord.c:245-260`, after the pass-0 return at :192.
+            let report = self.recompile_calc("acalcout: init_record: Illegal CALC field");
+            self.init_report(report);
+            let report = self.recompile_ocal("acalcout: init_record: Illegal OCAL field");
+            self.init_report(report);
         }
         Ok(())
     }
@@ -1100,13 +1311,24 @@ impl Record for AcalcoutRecord {
     /// C `aCalcoutRecord.c::special:469-491` — a put to CALC/OCAL recompiles
     /// into RPCL/ORPC, stores `aCalcPostfix()`'s return status in CLCV/OCLV,
     /// posts DBE_VALUE for it, and returns 0: the put is ACCEPTED.
-    fn special(&mut self, field: &str, after: bool) -> CaResult<()> {
+    fn special(
+        &mut self,
+        field: &str,
+        after: bool,
+        _common: &crate::server::record::CommonFields,
+    ) -> CaResult<()> {
         if !after {
             return Ok(());
         }
         match field {
-            "CALC" => self.recompile_calc(),
-            "OCAL" => self.recompile_ocal(),
+            "CALC" => {
+                self.put_report = self.recompile_calc("acalcout: special(): Illegal CALC field");
+                self.calc_posts = 0b01;
+            }
+            "OCAL" => {
+                self.put_report = self.recompile_ocal("acalcout: special(): Illegal OCAL field");
+                self.calc_posts = 0b10;
+            }
             // C `aCalcoutRecord.c:494-501`:
             //
             //   case acalcoutRecordNUSE:
@@ -1131,31 +1353,34 @@ impl Record for AcalcoutRecord {
             }
             _ => {}
         }
-        // C `aCalcoutRecord.c:503-533` re-classifies the link a put just
-        // re-pointed — the INPA..INPL, INAA..INLL and OUT cases together.
-        if Self::inp_index(field).is_some() || Self::ina_index(field).is_some() || field == "OUT" {
-            self.refresh_link_status();
+        // C `aCalcoutRecord.c:503-569` re-classifies the link a put just
+        // re-pointed — the INPA..INPL, INAA..INLL and OUT cases together — and
+        // posts that link's status alone.
+        let status = match (Self::inp_index(field), Self::ina_index(field)) {
+            (Some(i), _) => Some(INAV_NAMES[i]),
+            (_, Some(i)) => Some(IAAV_NAMES[i]),
+            _ => (field == "OUT").then_some("OUTV"),
+        };
+        if let Some(status) = status {
+            self.refresh_link_status(LinkStatusPosts::Put(status));
         }
         Ok(())
     }
 
-    fn set_async_context(&mut self, name: String, db: AsyncDbHandle) {
+    fn set_async_context(&mut self, name: crate::types::RecordName, db: AsyncDbHandle) {
         self.async_ctx = Some((name, db));
         // C `init_record` (aCalcoutRecord.c:209-243) classifies all 25 links
         // before any process. Every one of them is an acalcout-owned field
         // (OUT included), already applied when `add_record` runs.
-        self.refresh_link_status();
+        self.refresh_link_status(LinkStatusPosts::All);
     }
 
-    /// C posts the validity field explicitly from `special()`
-    /// (`db_post_events(pcalc, &pcalc->clcv, DBE_VALUE)`,
-    /// aCalcoutRecord.c:478,490).
-    fn monitor_side_effect_fields(&self, put_field: &str) -> &'static [&'static str] {
-        match put_field {
-            "CALC" => &["CLCV"],
-            "OCAL" => &["OCLV"],
-            _ => &[],
-        }
+    fn set_process_continuation(
+        &mut self,
+        _continuation: bool,
+        pact: crate::server::record::Pact<'_>,
+    ) {
+        self.pact = pact.held();
     }
 
     fn process(&mut self) -> CaResult<ProcessOutcome> {
@@ -1165,8 +1390,9 @@ impl Record for AcalcoutRecord {
         // runs `execOutput` directly; the alarm state captured by the delaying
         // cycle persists. Restore the captured output decision, clear DLYA, and
         // let the framework write the OUT link + post OEVT. Mirrors `scalcout`.
-        if self.dlya == 1 {
+        if self.pact && self.dlya == 1 {
             self.dlya = 0;
+            self.dlya_moved = true;
             self.cached_should_output = self.pending_output;
             self.pending_output = false;
             return Ok(self.complete_cycle());
@@ -1219,7 +1445,7 @@ impl Record for AcalcoutRecord {
         let mut calc_failed = false;
         // CALC pass: the `VAL` token reads `prec->val` (this pass's result
         // field) before it is overwritten.
-        let pass = self.eval(&self.compiled_calc, n, self.val, &self.aval);
+        let pass = self.eval(&self.rpcl, n, self.val, &self.aval);
         // C passes `&pcalc->amask` straight into aCalcPerform, which zeroes it at
         // entry (`aCalcPerform.c:326`) — so the CALC pass REPLACES the record's mask
         // and nothing carries over from the previous process.
@@ -1246,7 +1472,7 @@ impl Record for AcalcoutRecord {
             // It sees the CALC pass's stores, because C's two calls share the same
             // record fields — which is why `apply_stores` above must land before this
             // `eval` rebuilds its inputs from them.
-            let pass = self.eval(&self.compiled_ocal, n, self.oval, &self.oav);
+            let pass = self.eval(&self.orpc, n, self.oval, &self.oav);
             // C `aCalcoutRecord.c:1288-1291` — the OCAL pass gets a LOCAL mask that is
             // then OR'd in, so a CALC-pass store stays flagged.
             self.amask |= pass.inputs.amask;
@@ -1287,6 +1513,7 @@ impl Record for AcalcoutRecord {
                 self.mem.allocate(ArrayBuf::Arr(i), self.nelm);
             }
         }
+        self.amask_posts = self.amask;
 
         if calc_failed {
             // C afterCalc line 304-305: cstat != 0 → CALC_ALARM (raised in
@@ -1348,17 +1575,15 @@ impl Record for AcalcoutRecord {
         // hook, not now. Mirrors `scalcout`/`calcout`.
         if oopt_fires && self.odly > 0.0 {
             self.dlya = 1;
+            self.dlya_moved = true;
             self.pending_output = write_out;
             self.cached_should_output = false;
             let delay = crate::runtime::time::duration_from_secs(self.odly);
             return Ok(ProcessOutcome {
-                result: RecordProcessResult::AsyncPendingNotify(vec![(
-                    "DLYA".to_string(),
-                    EpicsValue::UShort(1),
-                )]),
+                result: RecordProcessResult::AsyncPendingNotify(Vec::new()),
                 actions: vec![ProcessAction::ReprocessAfter(delay)],
                 device_did_compute: false,
-                post_write_fields: Vec::new(),
+                status: Ok(()),
             });
         }
 
@@ -1524,56 +1749,74 @@ impl Record for AcalcoutRecord {
     /// so that client never saw the array widen when `NUSE` grew — the exact
     /// reconnect problem the `SIZE` menu's own comment (`:619-626`) describes,
     /// arriving under the setting chosen to avoid it.
-    fn dbaddr_capacity(&self, field: &str) -> Option<u32> {
-        // This IS `cvt_dbaddr`, and its first act is the allocation
-        // (`aCalcoutRecord.c:589-617`) — the record cannot hand out a `pfield`
-        // for a buffer it has not `calloc`'d yet, so the charge belongs here and
-        // at no other read seam:
-        //
-        // ```c
-        // if (ppd[i] == NULL) {
-        //     ppd[i] = (double *)calloc(pcalc->nelm, sizeof(double));
-        //     pcalc->amem += pcalc->nelm * sizeof(double);
-        //     db_post_events(pcalc, &pcalc->amem, DBE_VALUE|DBE_LOG);
-        //     pcalc->pmem = pcalc->amem;
-        // }
-        // paddr->pfield = ppd[i];
-        // ```
-        //
-        // C reaches it from `dbNameToAddr`, i.e. once per resolved channel;
-        // the port reaches it from `FieldDeclaration::field_native_count`,
-        // whose callers are CA create-channel (`epics-ca-rs` `server/tcp.rs`)
-        // and the three `dbNameToAddr`-shaped iocsh commands. `get_field` is
-        // NOT this seam even though C's `get_array_info` (`:653-658`) charges
-        // too: the framework reads every field through `get_field` for its own
-        // change detection on every cycle, and C's `dbGet` does no such thing,
-        // so charging there would allocate all fourteen buffers on cycle one.
-        //
-        // `field_native_count` has already refused any field the `.dbd` does
-        // not declare `special(SPC_DBADDR)`, which is exactly AVAL, AA..LL and
-        // OAV (`aCalcoutRecord.dbd`) — the fourteen buffers C allocates here.
+    fn dbaddr_capacity(&self, _field: &str) -> Option<u32> {
+        Some(self.dbaddr_no_elements() as u32)
+    }
+
+    /// `cvt_dbaddr`'s first act is the allocation (`aCalcoutRecord.c:589-617`):
+    /// the record cannot hand out a `pfield` for a buffer it has not
+    /// `calloc`'d, so a channel resolving on AVAL, AA..LL or OAV charges it.
+    ///
+    /// ```c
+    /// if (ppd[i] == NULL) {
+    ///     ppd[i] = (double *)calloc(pcalc->nelm, sizeof(double));
+    ///     pcalc->amem += pcalc->nelm * sizeof(double);
+    ///     db_post_events(pcalc, &pcalc->amem, DBE_VALUE|DBE_LOG);
+    ///     pcalc->pmem = pcalc->amem;
+    /// }
+    /// ```
+    ///
+    /// Not [`Record::dbaddr_capacity`]: the load settles all fourteen
+    /// capacities at once, and charging there read AMEM=112 on a record no
+    /// client had touched. Not `get_field` either, though C's `get_array_info`
+    /// (`:653-658`) charges: the framework reads every field through it on
+    /// every cycle for change detection, which C's `dbGet` does not.
+    fn cvt_dbaddr(&self, field: &str) {
         if let Some(buf) = Self::dbaddr_buf(field) {
             self.mem.allocate_for_dbaddr(buf, self.nelm);
         }
-        Some(self.dbaddr_no_elements() as u32)
     }
 
     /// C reads `prec->inpa..inpl / inaa..inll` off the record and copies nothing; the generic
     /// `get_field` path hands back an owned `EpicsValue` per link, which is
     /// 24 clones on every cycle of a record that wires none of them.
-    fn link_text_ref(&self, link_field: &str) -> Option<&str> {
+    fn link_text_ref(&self, link_field: &str) -> Option<&[u8]> {
         match *link_field.as_bytes() {
             [b'I', b'N', b'P', slot] => {
                 let slot = usize::from(slot.checked_sub(b'A')?);
-                self.inp_links.get(slot).map(String::as_str)
+                self.inp_links.get(slot).map(PvString::as_bytes)
             }
             // INAA..INLL, the doubled-letter array/string inputs.
             [b'I', b'N', slot, tail] if slot == tail => {
                 let slot = usize::from(slot.checked_sub(b'A')?);
-                self.ina_links.get(slot).map(String::as_str)
+                self.ina_links.get(slot).map(PvString::as_bytes)
             }
             _ => None,
         }
+    }
+
+    fn cycle_cell(&self, cell: CycleCell) -> CycleRead {
+        match cell {
+            CycleCell::Val => CycleRead::Value(CycleValue::Double(self.val)),
+            CycleCell::Oval => CycleRead::Value(CycleValue::Double(self.oval)),
+            CycleCell::Mdel => CycleRead::Value(CycleValue::Double(self.mdel)),
+            CycleCell::Adel => CycleRead::Value(CycleValue::Double(self.adel)),
+            CycleCell::Mlst => CycleRead::Value(CycleValue::Double(self.mlst)),
+            CycleCell::Alst => CycleRead::Value(CycleValue::Double(self.alst)),
+            CycleCell::Hyst => CycleRead::Value(CycleValue::Double(self.hyst)),
+            CycleCell::Lalm => CycleRead::Value(CycleValue::Double(self.lalm)),
+            _ => CycleRead::Absent,
+        }
+    }
+
+    fn put_cycle_cell(&mut self, cell: CycleCell, value: CycleValue) -> CaResult<()> {
+        match (cell, value) {
+            (CycleCell::Lalm, CycleValue::Double(v)) => self.lalm = v,
+            (CycleCell::Alst, CycleValue::Double(v)) => self.alst = v,
+            (CycleCell::Mlst, CycleValue::Double(v)) => self.mlst = v,
+            (cell, value) => return self.put_field(cell.name(), value.into()),
+        }
+        Ok(())
     }
 
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
@@ -1599,7 +1842,6 @@ impl Record for AcalcoutRecord {
             "OEVT" => Some(EpicsValue::UShort(self.oevt)),
             "IVOA" => Some(EpicsValue::Short(self.ivoa)),
             "IVOV" => Some(EpicsValue::Double(self.ivov)),
-            "OUTV" => Some(EpicsValue::Short(self.outv)),
             "EGU" => Some(EpicsValue::String(self.egu.clone())),
             "PREC" => Some(EpicsValue::Short(self.prec)),
             "HOPR" => Some(EpicsValue::Double(self.hopr)),
@@ -1620,12 +1862,12 @@ impl Record for AcalcoutRecord {
             "MLST" => Some(EpicsValue::Double(self.mlst)),
             "SIZE" => Some(EpicsValue::Short(self.size)),
             "NEWM" => Some(EpicsValue::ULong(self.newm)),
-            "CACT" => Some(EpicsValue::Char(self.cact)),
+            "CACT" => Some(EpicsValue::UChar(self.cact)),
             "CSTAT" => Some(EpicsValue::Long(self.cstat)),
             "AMASK" => Some(EpicsValue::ULong(self.amask)),
             "AMEM" => Some(EpicsValue::Long(self.mem.amem())),
             "PMEM" => Some(EpicsValue::Long(self.mem.pmem())),
-            "VERS" => Some(EpicsValue::Double(VERSION)),
+            "VERS" => Some(EpicsValue::Double(self.vers)),
             _ => {
                 if let Some(idx) = Self::num_index(name) {
                     return Some(EpicsValue::Double(self.num_vals[idx]));
@@ -1639,11 +1881,8 @@ impl Record for AcalcoutRecord {
                 if let Some(idx) = Self::ina_index(name) {
                     return Some(EpicsValue::String(self.ina_links[idx].clone().into()));
                 }
-                if let Some(idx) = Self::inav_index(name) {
-                    return Some(EpicsValue::Short(self.inav[idx]));
-                }
-                if let Some(idx) = Self::iaav_index(name) {
-                    return Some(EpicsValue::Short(self.iaav[idx]));
+                if let Some(idx) = Self::status_index(name) {
+                    return Some(EpicsValue::Enum(self.link_status[idx] as u16));
                 }
                 if let Some(idx) = Self::pa_index(name) {
                     return Some(EpicsValue::Double(self.pa[idx]));
@@ -1822,7 +2061,7 @@ impl Record for AcalcoutRecord {
             }
             "OUT" => match value {
                 EpicsValue::String(s) => {
-                    self.out = s.as_str_lossy().into_owned();
+                    self.out = s;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("OUT".into())),
@@ -1881,7 +2120,7 @@ impl Record for AcalcoutRecord {
             // SPC_NOMOD fields share; this arm is the link-status refresh's
             // write (`post_fields` -> `put_field_internal`), its only writer.
             "OUTV" => {
-                self.outv = value
+                self.link_status[24] = value
                     .to_f64()
                     .ok_or_else(|| CaError::TypeMismatch("OUTV".into()))?
                     as i16;
@@ -2057,8 +2296,6 @@ impl Record for AcalcoutRecord {
                 );
                 Ok(())
             }
-            // VERS is a fixed code-version constant; accept and ignore writes.
-            "VERS" => Ok(()),
             _ => {
                 if let Some(idx) = Self::num_index(name) {
                     self.num_vals[idx] = value
@@ -2079,7 +2316,7 @@ impl Record for AcalcoutRecord {
                 if let Some(idx) = Self::inp_index(name) {
                     match value {
                         EpicsValue::String(s) => {
-                            self.inp_links[idx] = s.as_str_lossy().into_owned();
+                            self.inp_links[idx] = s;
                             return Ok(());
                         }
                         _ => return Err(CaError::TypeMismatch(name.into())),
@@ -2088,7 +2325,7 @@ impl Record for AcalcoutRecord {
                 if let Some(idx) = Self::ina_index(name) {
                     match value {
                         EpicsValue::String(s) => {
-                            self.ina_links[idx] = s.as_str_lossy().into_owned();
+                            self.ina_links[idx] = s;
                             return Ok(());
                         }
                         _ => return Err(CaError::TypeMismatch(name.into())),
@@ -2097,15 +2334,8 @@ impl Record for AcalcoutRecord {
                 // INAV..INLV / IAAV..ILLV are `special(SPC_NOMOD)`
                 // (aCalcoutRecord.dbd:246-413): DERIVED from the link, refused
                 // to clients by `is_no_mod` — see the `OUTV` arm above.
-                if let Some(idx) = Self::inav_index(name) {
-                    self.inav[idx] = value
-                        .to_f64()
-                        .ok_or_else(|| CaError::TypeMismatch(name.into()))?
-                        as i16;
-                    return Ok(());
-                }
-                if let Some(idx) = Self::iaav_index(name) {
-                    self.iaav[idx] = value
+                if let Some(idx) = Self::status_index(name) {
+                    self.link_status[idx] = value
                         .to_f64()
                         .ok_or_else(|| CaError::TypeMismatch(name.into()))?
                         as i16;
@@ -2164,12 +2394,12 @@ impl Record for AcalcoutRecord {
     /// body's one name match per link.
     /// See [`Record::set_input_link_slots`].
     fn set_input_link_slots(&self) -> Option<(u64, u64)> {
-        let mut texts: [&str; 24] = [""; 24];
+        let mut texts: [&[u8]; 24] = [b""; 24];
         for (dst, src) in texts[..12].iter_mut().zip(&self.inp_links) {
-            *dst = src.as_str();
+            *dst = src.as_bytes();
         }
         for (dst, src) in texts[12..].iter_mut().zip(&self.ina_links) {
-            *dst = src.as_str();
+            *dst = src.as_bytes();
         }
         crate::server::record::input_link_slots_of(&texts)
     }
@@ -2265,9 +2495,9 @@ impl Record for AcalcoutRecord {
     /// same OOPT/calc-fail/ODLY decision as the OUT write (`cached_should_output`)
     /// — the framework adds the IVOA `Don't_drive` veto. Stringified so the
     /// numeric event matches a `SCAN="Event"` record's `EVNT`.
-    fn output_event(&self) -> Option<String> {
+    fn output_event(&self) -> Option<crate::types::PvString> {
         if self.cached_should_output && self.oevt > 0 {
-            Some(self.oevt.to_string())
+            Some(self.oevt.to_string().into())
         } else {
             None
         }
@@ -2294,14 +2524,41 @@ impl Record for AcalcoutRecord {
         }
     }
 
-    /// Scalar inputs `A..L` are re-posted with the alarm bits on a cycle whose
+    /// C's process-cycle `db_post_events` set (`afterCalc`, `monitor()`, the
+    /// NUSE clamp); DLYA posts as a process mark. AMASK, NEWM and CACT are written every
+    /// cycle and only ever read, so the set is closed rather than blacklisted.
+    fn process_posted_fields(&self) -> Option<crate::server::record::DeclaredFields> {
+        Some(
+            &const {
+                crate::server::record::declared_set(
+                    crate::server::record::dbd_generated::ACALCOUT_FIELDS,
+                    [
+                        "VAL", "AVAL", "OAV", "OVAL", "AMEM", "NUSE", "A", "B", "C", "D", "E", "F",
+                        "G", "H", "I", "J", "K", "L", "AA", "BB", "CC", "DD", "EE", "FF", "GG",
+                        "HH", "II", "JJ", "KK", "LL",
+                    ],
+                )
+            },
+        )
+    }
+
+    /// Scalar inputs `A..L` are re-posted on a cycle whose
     /// alarm transition fired, even when their value did not change: C
     /// `monitor()` posts each with `monitor_mask|DBE_VALUE|DBE_LOG` when
     /// `(*pnew != *pprev) || (monitor_mask & DBE_ALARM)`
     /// (aCalcoutRecord.c:1024-1029). The array inputs (`newm`-gated) and `OVAL`
     /// (change-gated) are NOT in this set, so they are omitted.
-    fn alarm_cycle_monitored_fields(&self) -> &'static [&'static str] {
-        &["A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L"]
+    fn alarm_cycle_monitored_fields(&self) -> crate::server::record::DeclaredFields {
+        &const {
+            crate::server::record::declared_set(
+                crate::server::record::dbd_generated::ACALCOUT_FIELDS,
+                ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L"],
+            )
+        }
+    }
+
+    fn alarm_cycle_posts_value_log(&self) -> bool {
+        true
     }
 
     /// SPC_NOMOD / internal trackers that this record mutates in `process()` /
@@ -2364,19 +2621,56 @@ impl Record for AcalcoutRecord {
     /// the caput value is the last thing the subscriber ever hears, and it is
     /// wrong.
     ///
-    /// AMASK needs no clearing here: [`AcalcoutRecord::process`] assigns
-    /// `self.amask` from the pass's mask on every cycle, which is C's
-    /// `*amask = 0` at the head of aCalcPerform. NEWM does — it accumulates
-    /// across `fetch_values` calls until `monitor()` zeroes it, which is why this
-    /// hook TAKES.
-    fn take_cycle_posted_fields(&mut self) -> Vec<(&'static str, CyclePostMask)> {
-        let (amask, newm) = (self.amask, self.newm);
-        self.newm = 0;
-        let mut marks = Vec::new();
+    /// AMASK's posts are `afterCalc`'s, made inside `process()`, so they are
+    /// taken by [`Record::take_process_posted_fields`]; this take holds NEWM,
+    /// which accumulates across `fetch_values` calls until `monitor()` zeroes it.
+    fn take_cycle_posted_fields(&mut self) -> CycleMarks {
+        /// NUSE then AMEM, one entry per mask (`CyclePostMask` order), then
+        /// each array's NEWM post, then `monitor()`'s AVAL and OAV, one entry
+        /// per [`AVAL_OAV_MASKS`] row, then `special()`'s CLCV and OCLV.
+        const POSTS_NAMED: [(&str, CyclePostMask); 14 + ARR_NAMES.len()] = {
+            use CyclePostMask::{MonitorValueLog, Value, ValueLog};
+            let mut table = [("NUSE", Value); 14 + ARR_NAMES.len()];
+            table[1] = ("NUSE", ValueLog);
+            table[2] = ("NUSE", MonitorValueLog);
+            table[3] = ("AMEM", Value);
+            table[4] = ("AMEM", ValueLog);
+            table[5] = ("AMEM", MonitorValueLog);
+            let mut i = 0;
+            while i < ARR_NAMES.len() {
+                table[6 + i] = (ARR_NAMES[i], MonitorValueLog);
+                i += 1;
+            }
+            let mut j = 0;
+            while j < AVAL_OAV_MASKS.len() {
+                table[6 + ARR_NAMES.len() + j] = ("AVAL", AVAL_OAV_MASKS[j]);
+                table[9 + ARR_NAMES.len() + j] = ("OAV", AVAL_OAV_MASKS[j]);
+                j += 1;
+            }
+            table[12 + ARR_NAMES.len()] = ("CLCV", Value);
+            table[13 + ARR_NAMES.len()] = ("OCLV", Value);
+            table
+        };
+        fn slot(mask: CyclePostMask) -> u32 {
+            match mask {
+                CyclePostMask::Value => 0,
+                CyclePostMask::ValueLog => 1,
+                CyclePostMask::MonitorValueLog => 2,
+                CyclePostMask::MonitorValue
+                | CyclePostMask::MonitorLog
+                | CyclePostMask::ResetValueLog
+                | CyclePostMask::ResetValueLogOnAlarm
+                | CyclePostMask::ResetAlarm => {
+                    unreachable!("NUSE and AMEM post no one-sided or reset mask")
+                }
+            }
+        }
+        let newm = std::mem::take(&mut self.newm);
+        let mut bits = 0u64;
         // C's NUSE clamp post, with the mask of whichever C site made it. Marked
         // by `clamp_nuse`, the only site that can clamp.
         if let Some(mask) = self.nuse_post_pending.take() {
-            marks.push(("NUSE", mask));
+            bits |= 1 << slot(mask);
         }
         // C's `db_post_events(pcalc, &pcalc->amem, ...)`, marked by whichever
         // `ArrayMem` operation made it — `monitor()`'s tail with the cycle's
@@ -2384,24 +2678,52 @@ impl Record for AcalcoutRecord {
         // DBE_VALUE|DBE_LOG. The put path has no process cycle behind it, so
         // without the mark that post has no carrier at all.
         if let Some(mask) = self.mem.take_post() {
-            marks.push(("AMEM", mask));
+            bits |= 1 << (3 + slot(mask));
         }
-        for (i, name) in ARR_NAMES.iter().enumerate() {
-            let bit = 1u32 << i;
-            // C `afterCalc` (`:296`) runs first, and with a LITERAL mask — the
-            // alarm bits are not in scope there.
-            if amask & bit != 0 {
-                marks.push((*name, CyclePostMask::ValueLog));
+        // C `monitor()` (`:1034`), with `monitor_mask` folded in. An array the
+        // expression STORED into and whose input link ALSO delivered a change
+        // is posted from both `afterCalc` and here — two events, two masks.
+        // C reads only bits `0..ARRAY_MAX_FIELDS`; a put can set the rest.
+        bits |= u64::from(newm & ((1 << ARR_NAMES.len()) - 1)) << 6;
+        // C `monitor()` (`:1000`, `:1017`), marked by `complete_cycle`.
+        bits |= u64::from(std::mem::take(&mut self.aval_oav_posts)) << (6 + ARR_NAMES.len());
+        // C `special()` (`aCalcoutRecord.c:478`, `:490`), a literal DBE_VALUE.
+        bits |= std::mem::take(&mut self.calc_posts) << (12 + ARR_NAMES.len());
+        static POSTS: [(
+            crate::server::record::FieldIx,
+            crate::server::record::CyclePostMask,
+        ); 14 + ARR_NAMES.len()] = crate::server::record::declared_post_table(
+            crate::server::record::dbd_generated::ACALCOUT_FIELDS,
+            POSTS_NAMED,
+        );
+        CycleMarks::of(&POSTS, u128::from(bits))
+    }
+
+    /// C `afterCalc` (`:294-298`): the arrays the expression stored into, with
+    /// a LITERAL `DBE_VALUE|DBE_LOG`, before `recGblGetTimeStamp` and
+    /// `monitor()` — so the post carries the previous stamp and the alarm not
+    /// yet reset.
+    fn take_process_posted_fields(&mut self) -> CycleMarks {
+        /// `afterCalc`'s array posts, then DLYA's, in C's order.
+        const POSTS_NAMED: [(&str, CyclePostMask); ARR_NAMES.len() + 1] = {
+            let mut table = [("DLYA", CyclePostMask::Value); ARR_NAMES.len() + 1];
+            let mut i = 0;
+            while i < ARR_NAMES.len() {
+                table[i] = (ARR_NAMES[i], CyclePostMask::ValueLog);
+                i += 1;
             }
-            // C `monitor()` (`:1034`) runs after, with `monitor_mask` folded in.
-            // An array the expression STORED into and whose input link ALSO
-            // delivered a change is in both masks, and C posts it from both
-            // loops — two events, two masks.
-            if newm & bit != 0 {
-                marks.push((*name, CyclePostMask::MonitorValueLog));
-            }
-        }
-        marks
+            table
+        };
+        static POSTS: [(crate::server::record::FieldIx, CyclePostMask); ARR_NAMES.len() + 1] =
+            crate::server::record::declared_post_table(
+                crate::server::record::dbd_generated::ACALCOUT_FIELDS,
+                POSTS_NAMED,
+            );
+        let dlya = u128::from(std::mem::take(&mut self.dlya_moved)) << ARR_NAMES.len();
+        CycleMarks::of(
+            &POSTS,
+            u128::from(std::mem::take(&mut self.amask_posts)) | dlya,
+        )
     }
 
     /// AA..LL post from AMASK/NEWM and from nothing else. C `monitor()` keeps a
@@ -2414,15 +2736,50 @@ impl Record for AcalcoutRecord {
     /// (PAA exists, but it is `fetch_values`' scratch buffer for exactly that
     /// comparison — one buffer reused for every link, not a per-field previous
     /// value.)
+    ///
+    /// AVAL and OAV post from `monitor()`'s own PAVL/POAV test, marked by
+    /// `AcalcoutRecord::complete_cycle`.
     fn fields_posted_only_when_marked(&self) -> &'static [&'static str] {
-        &ARR_NAMES
+        &[
+            "AA", "BB", "CC", "DD", "EE", "FF", "GG", "HH", "II", "JJ", "KK", "LL", "AVAL", "OAV",
+        ]
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The declared name a post table entry `ix` stands for.
+    fn name(ix: crate::server::record::FieldIx) -> &'static str {
+        crate::server::record::field_at(crate::server::record::dbd_generated::ACALCOUT_FIELDS, ix)
+            .expect("declared")
+            .name
+    }
     use crate::server::record::FieldDeclaration;
+
+    /// NEWM bits past LL mark nothing: a put of any value posts only the
+    /// arrays C's `monitor()` loop reads (`i < ARRAY_MAX_FIELDS`).
+    #[test]
+    fn newm_bits_past_ll_mark_no_post() {
+        for newm in [0x1000, 0x2000, 0x4000, u32::MAX] {
+            let mut rec = AcalcoutRecord::new();
+            rec.put_field("NEWM", EpicsValue::ULong(newm)).unwrap();
+            let marked: Vec<_> = rec
+                .take_cycle_posted_fields()
+                .map(|(f, m)| (name(f), m))
+                .collect();
+            let want: Vec<_> = if newm == u32::MAX {
+                ARR_NAMES
+                    .iter()
+                    .map(|&f| (f, CyclePostMask::MonitorValueLog))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            assert_eq!(marked, want, "NEWM={newm:#x}");
+        }
+    }
 
     #[test]
     fn test_acalcout_default_matches_dbd_initials() {
@@ -2433,9 +2790,9 @@ mod tests {
         assert_eq!(rec.get_field("VERS"), Some(EpicsValue::Double(1.4)));
         // Link status = Constant(3): C init_record overwrites the dbd
         // initial("1") to acalcoutINAV_CON for the (default) constant links.
-        assert_eq!(rec.get_field("INAV"), Some(EpicsValue::Short(3)));
-        assert_eq!(rec.get_field("ILLV"), Some(EpicsValue::Short(3)));
-        assert_eq!(rec.get_field("OUTV"), Some(EpicsValue::Short(3)));
+        assert_eq!(rec.get_field("INAV"), Some(EpicsValue::Enum(3)));
+        assert_eq!(rec.get_field("ILLV"), Some(EpicsValue::Enum(3)));
+        assert_eq!(rec.get_field("OUTV"), Some(EpicsValue::Enum(3)));
         assert_eq!(rec.get_field("VAL"), Some(EpicsValue::Double(0.0)));
     }
 
@@ -2450,11 +2807,11 @@ mod tests {
         // A default record has all-constant links → every field = 3
         // (`acalcoutINAV_CON`). This is the C-parity case the oracle measured:
         // `caput ACALCOUT.INAV 0` then caget → C returns 3, not the put value.
-        let inst = RecordInstance::new("A:LS".into(), AcalcoutRecord::new());
+        let inst = RecordInstance::new("A:LS", AcalcoutRecord::new());
         for name in ["INAV", "INLV", "IAAV", "ILLV", "OUTV"] {
             assert_eq!(
                 inst.resolve_field(name),
-                Some(EpicsValue::Short(LINK_CON)),
+                Some(EpicsValue::Enum(LINK_CON as u16)),
                 "{name} should read derived Constant(3)"
             );
             assert!(
@@ -2466,9 +2823,10 @@ mod tests {
 
     #[test]
     fn test_acalcout_field_list_count() {
-        // 138 dbd record fields minus 6 DBF_NOACCESS internal pointer/scratch
-        // fields (RPVT, PAVL, PAA, POAV, RPCL, ORPC) = 132 modeled fields.
-        assert_eq!(AcalcoutRecord::default().field_list().len(), 132);
+        // 138 dbd record fields minus the 2 DBF_NOACCESS internals the
+        // generator cannot describe (RPCL, ORPC: sized array members) = 136;
+        // RPVT, PAVL, PAA, POAV are carried as pointer rows for `dbpr`.
+        assert_eq!(AcalcoutRecord::default().field_list().len(), 136);
     }
 
     #[test]
@@ -2478,7 +2836,7 @@ mod tests {
         rec.put_field("B", EpicsValue::Double(4.0)).unwrap();
         rec.put_field("CALC", EpicsValue::String("A+B".into()))
             .unwrap();
-        rec.special("CALC", true).unwrap();
+        rec.special("CALC", true, &Default::default()).unwrap();
         rec.process().unwrap();
         assert_eq!(rec.val, 7.0);
         // Scalar result broadcasts into AVAL (C aCalcPerform toArray).
@@ -2499,7 +2857,7 @@ mod tests {
         .unwrap();
         rec.put_field("CALC", EpicsValue::String("AA+1".into()))
             .unwrap();
-        rec.special("CALC", true).unwrap();
+        rec.special("CALC", true, &Default::default()).unwrap();
         rec.process().unwrap();
         assert_eq!(
             rec.get_field("AVAL"),
@@ -2517,10 +2875,10 @@ mod tests {
             .unwrap();
         rec.put_field("CALC", EpicsValue::String("AA".into()))
             .unwrap();
-        rec.special("CALC", true).unwrap();
+        rec.special("CALC", true, &Default::default()).unwrap();
         rec.put_field("OCAL", EpicsValue::String("AA*2".into()))
             .unwrap();
-        rec.special("OCAL", true).unwrap();
+        rec.special("OCAL", true, &Default::default()).unwrap();
         rec.put_field("DOPT", EpicsValue::Short(1)).unwrap();
         rec.process().unwrap();
         assert_eq!(
@@ -2539,7 +2897,7 @@ mod tests {
         let mut rec = AcalcoutRecord::new();
         rec.put_field("CALC", EpicsValue::String("42".into()))
             .unwrap();
-        rec.special("CALC", true).unwrap();
+        rec.special("CALC", true, &Default::default()).unwrap();
         rec.put_field("OOPT", EpicsValue::Short(0)).unwrap();
         rec.process().unwrap();
         assert_eq!(rec.multi_output_links(), &[("OUT", "AVAL")]);
@@ -2550,7 +2908,7 @@ mod tests {
         let mut rec = AcalcoutRecord::new();
         rec.put_field("CALC", EpicsValue::String("42".into()))
             .unwrap();
-        rec.special("CALC", true).unwrap();
+        rec.special("CALC", true, &Default::default()).unwrap();
         rec.put_field("OOPT", EpicsValue::Short(6)).unwrap(); // Never
         rec.process().unwrap();
         assert_eq!(rec.multi_output_links(), &[]);
@@ -2561,7 +2919,7 @@ mod tests {
         let mut rec = AcalcoutRecord::new();
         rec.put_field("CALC", EpicsValue::String("A".into()))
             .unwrap();
-        rec.special("CALC", true).unwrap();
+        rec.special("CALC", true, &Default::default()).unwrap();
         rec.put_field("OOPT", EpicsValue::Short(1)).unwrap(); // On Change
         rec.put_field("MDEL", EpicsValue::Double(0.5)).unwrap();
 
@@ -2579,10 +2937,10 @@ mod tests {
         let mut rec = AcalcoutRecord::new();
         rec.put_field("CALC", EpicsValue::String("1".into()))
             .unwrap();
-        rec.special("CALC", true).unwrap();
+        rec.special("CALC", true, &Default::default()).unwrap();
         rec.put_field("OCAL", EpicsValue::String("2".into()))
             .unwrap();
-        rec.special("OCAL", true).unwrap();
+        rec.special("OCAL", true, &Default::default()).unwrap();
         rec.put_field("DOPT", EpicsValue::Short(1)).unwrap();
         rec.process().unwrap();
         assert_eq!(rec.multi_output_links(), &[("OUT", "OAV")]);
@@ -2597,10 +2955,10 @@ mod tests {
         let mut rec = AcalcoutRecord::new();
         rec.put_field("CALC", EpicsValue::String("5".into()))
             .unwrap();
-        rec.special("CALC", true).unwrap();
+        rec.special("CALC", true, &Default::default()).unwrap();
         rec.put_field("OCAL", EpicsValue::String("VAL+10".into()))
             .unwrap();
-        rec.special("OCAL", true).unwrap();
+        rec.special("OCAL", true, &Default::default()).unwrap();
         rec.put_field("DOPT", EpicsValue::Short(1)).unwrap();
         rec.process().unwrap();
         assert_eq!(rec.get_field("OVAL"), Some(EpicsValue::Double(10.0)));
@@ -2615,7 +2973,7 @@ mod tests {
         let mut rec = AcalcoutRecord::new();
         // Non-empty CALC that fails to compile.
         rec.calc = "???bad".into();
-        rec.compiled_calc = CompiledExpr::empty(ExprKind::Array);
+        rec.rpcl = Rpcl::empty();
         rec.process().unwrap();
         assert!(rec.calc_alarm);
         assert_eq!(rec.cstat, -1);
@@ -2644,7 +3002,7 @@ mod tests {
         // A finite result clears UDF (C `else pcalc->udf = FALSE`).
         rec.put_field("CALC", EpicsValue::String("1+1".into()))
             .unwrap();
-        rec.special("CALC", true).unwrap();
+        rec.special("CALC", true, &Default::default()).unwrap();
         rec.process().unwrap();
         rec.check_alarms(&mut common);
         assert_eq!(rec.get_field("VAL"), Some(EpicsValue::Double(2.0)));
@@ -2653,7 +3011,7 @@ mod tests {
         // CALC_ALARM (`if(cstat)`) and leaves `udf` at FALSE.
         rec.put_field("CALC", EpicsValue::String("1e300*1e300".into()))
             .unwrap();
-        rec.special("CALC", true).unwrap();
+        rec.special("CALC", true, &Default::default()).unwrap();
         rec.process().unwrap();
         assert!(rec.calc_alarm, "non-finite result raises CALC_ALARM");
         rec.check_alarms(&mut common);
@@ -2706,7 +3064,7 @@ mod tests {
         let mut rec = AcalcoutRecord::new();
         rec.put_field("CALC", EpicsValue::String("1e300*1e300".into()))
             .unwrap();
-        rec.special("CALC", true).unwrap();
+        rec.special("CALC", true, &Default::default()).unwrap();
         rec.process().unwrap();
         match rec.get_field("VAL") {
             Some(EpicsValue::Double(v)) => {
@@ -2727,7 +3085,7 @@ mod tests {
         rec.put_field("NELM", EpicsValue::ULong(4)).unwrap();
         rec.put_field("CALC", EpicsValue::String("ACOS(2)".into()))
             .unwrap();
-        rec.special("CALC", true).unwrap();
+        rec.special("CALC", true, &Default::default()).unwrap();
         rec.process().unwrap();
         match rec.get_field("VAL") {
             Some(EpicsValue::Double(v)) => assert!(v.is_nan(), "VAL = {v}, expected NaN"),
@@ -2741,7 +3099,7 @@ mod tests {
     fn test_acalcout_ivoa_dont_drive_on_failure() {
         let mut rec = AcalcoutRecord::new();
         rec.calc = "???bad".into();
-        rec.compiled_calc = CompiledExpr::empty(ExprKind::Array);
+        rec.rpcl = Rpcl::empty();
         rec.put_field("IVOA", EpicsValue::Short(1)).unwrap(); // Don't drive
         rec.process().unwrap();
         assert!(!rec.cached_should_output);
@@ -2753,7 +3111,7 @@ mod tests {
         let mut rec = AcalcoutRecord::new();
         rec.put_field("NELM", EpicsValue::ULong(2)).unwrap();
         rec.calc = "???bad".into();
-        rec.compiled_calc = CompiledExpr::empty(ExprKind::Array);
+        rec.rpcl = Rpcl::empty();
         rec.put_field("IVOA", EpicsValue::Short(2)).unwrap(); // Set to IVOV
         rec.put_field("IVOV", EpicsValue::Double(9.0)).unwrap();
         rec.process().unwrap();
@@ -2816,8 +3174,7 @@ mod tests {
         assert_eq!(rec.get_field("PMEM"), Some(EpicsValue::Long(32)));
         assert!(
             !rec.take_cycle_posted_fields()
-                .iter()
-                .any(|(f, _)| *f == "AMEM"),
+                .any(|(f, _)| name(f) == "AMEM"),
             "amem == pmem, so monitor() posts nothing (:1044)"
         );
     }
@@ -2855,7 +3212,7 @@ mod tests {
         let mut rec = AcalcoutRecord::new();
         rec.put_field("CALC", EpicsValue::String("1".into()))
             .unwrap();
-        rec.special("CALC", true).unwrap();
+        rec.special("CALC", true, &Default::default()).unwrap();
         rec.put_field("ODLY", EpicsValue::Double(0.05)).unwrap();
 
         rec.process().unwrap();
@@ -2871,6 +3228,9 @@ mod tests {
             "no monitor() ran to commit it"
         );
 
+        let pact = std::sync::atomic::AtomicBool::new(true);
+        let held = crate::server::record::Pact::new(&pact);
+        rec.set_process_continuation(true, held);
         rec.process().unwrap();
         assert_eq!(rec.get_field("AMEM"), Some(EpicsValue::Long(32)));
         assert_eq!(rec.get_field("PMEM"), Some(EpicsValue::Long(32)));
@@ -2886,7 +3246,7 @@ mod tests {
         stored
             .put_field("CALC", EpicsValue::String("AA:=3;SUM(AA)".into()))
             .unwrap();
-        stored.special("CALC", true).unwrap();
+        stored.special("CALC", true, &Default::default()).unwrap();
         stored.process().unwrap();
         assert_ne!(stored.amask & 1, 0, "STORE_AA set the mask bit");
         assert_eq!(
@@ -2898,7 +3258,7 @@ mod tests {
         let mut read = AcalcoutRecord::new();
         read.put_field("CALC", EpicsValue::String("AA+1".into()))
             .unwrap();
-        read.special("CALC", true).unwrap();
+        read.special("CALC", true, &Default::default()).unwrap();
         read.process().unwrap();
         assert_eq!(
             read.get_field("AMEM"),
@@ -2924,7 +3284,9 @@ mod tests {
             "pmem = amem, right there (:699)"
         );
         assert_eq!(
-            rec.take_cycle_posted_fields(),
+            rec.take_cycle_posted_fields()
+                .map(|(f, m)| (name(f), m))
+                .collect::<Vec<_>>(),
             vec![("AMEM", CyclePostMask::ValueLog)],
             "C's literal DBE_VALUE|DBE_LOG (:698)"
         );
@@ -2938,8 +3300,7 @@ mod tests {
         );
         assert!(
             !rec.take_cycle_posted_fields()
-                .iter()
-                .any(|(f, _)| *f == "AMEM"),
+                .any(|(f, _)| name(f) == "AMEM"),
             "and posts nothing"
         );
     }
@@ -2991,7 +3352,7 @@ mod tests {
     /// about to hand out a `pfield` for, charges it, posts AMEM with a literal
     /// `DBE_VALUE|DBE_LOG` and commits PMEM — all before the record has ever
     /// processed. Resolving a channel on `.AA` is what runs it, and here that
-    /// is `field_native_count` → `dbaddr_capacity`.
+    /// is `field_native_count` → `cvt_dbaddr`.
     #[test]
     fn resolving_a_channel_on_an_array_field_charges_it_like_cvt_dbaddr() {
         let rec = AcalcoutRecord::new();
@@ -3017,7 +3378,7 @@ mod tests {
         assert_eq!(rec.get_field("AMEM"), Some(EpicsValue::Long(16)));
     }
 
-    /// The reason the charge is at `dbaddr_capacity` and not at `get_field`.
+    /// The reason the charge is at `cvt_dbaddr` and not at `get_field`.
     /// The framework reads EVERY field through `get_field` on every cycle to
     /// change-detect it; C's `dbGet` does nothing of the kind. A process cycle
     /// must therefore charge its four buffers and no more — not the fourteen
@@ -3060,7 +3421,7 @@ mod tests {
             "the raw store keeps what the client sent; special() has not run yet"
         );
 
-        let status = rec.special("NUSE", true);
+        let status = rec.special("NUSE", true, &Default::default());
         assert!(status.is_err(), "C returns -1, so the put must fail");
         assert_eq!(
             rec.get_field("NUSE"),
@@ -3068,7 +3429,9 @@ mod tests {
             "and the clamped value stays"
         );
         assert_eq!(
-            rec.take_cycle_posted_fields(),
+            rec.take_cycle_posted_fields()
+                .map(|(f, m)| (name(f), m))
+                .collect::<Vec<_>>(),
             vec![("NUSE", CyclePostMask::Value)],
             "posted with C's literal DBE_VALUE (:497)"
         );
@@ -3104,7 +3467,9 @@ mod tests {
 
         assert_eq!(rec.get_field("NUSE"), Some(EpicsValue::ULong(4)));
         assert_eq!(
-            rec.take_cycle_posted_fields(),
+            rec.take_cycle_posted_fields()
+                .map(|(f, m)| (name(f), m))
+                .collect::<Vec<_>>(),
             vec![("NUSE", CyclePostMask::ValueLog)],
             "C's init post is DBE_VALUE|DBE_LOG (:189)"
         );
@@ -3122,7 +3487,7 @@ mod tests {
         .unwrap();
         rec.put_field("CALC", EpicsValue::String("AA".into()))
             .unwrap();
-        rec.special("CALC", true).unwrap();
+        rec.special("CALC", true, &Default::default()).unwrap();
         rec.process().unwrap();
         // num_elements = NUSE (3) since 0 < NUSE < NELM.
         assert_eq!(

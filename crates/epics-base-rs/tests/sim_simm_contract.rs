@@ -230,7 +230,8 @@ async fn unset_sscn_leaves_scan_alone_on_a_simm_transition() {
 /// `busy` (`busyRecord.dbd`) declares SIMM/SIML/SIOL but NO SSCN and NO
 /// OLDSIMM, and `busyRecord.c` calls neither recGblSaveSimm nor
 /// recGblCheckSimm — it has no `special()` at all. So a SIMM transition on a
-/// busy record must NOT move its SCAN, even with SSCN set. Same for `swait`.
+/// busy record must NOT move its SCAN, and an SSCN put is
+/// `S_dbLib_fieldNotFound`. Same for `swait`.
 #[epics_macros_rs::epics_test]
 async fn busy_has_no_sscn_so_a_simm_transition_never_swaps_its_scan() {
     let db = PvDatabase::new();
@@ -240,9 +241,11 @@ async fn busy_has_no_sscn_so_a_simm_transition_never_swaps_its_scan() {
     db.put_pv("BUSY.SCAN", EpicsValue::Enum(SCAN_1_SECOND))
         .await
         .unwrap();
-    db.put_pv("BUSY.SSCN", EpicsValue::Enum(SCAN_PASSIVE))
-        .await
-        .unwrap();
+    let sscn = db.put_pv("BUSY.SSCN", EpicsValue::Enum(SCAN_PASSIVE)).await;
+    assert!(
+        matches!(sscn, Err(epics_base_rs::error::CaError::FieldNotFound(_))),
+        "{sscn:?}"
+    );
 
     db.put_pv("BUSY.SIMM", EpicsValue::Short(1)).await.unwrap();
 
@@ -252,10 +255,6 @@ async fn busy_has_no_sscn_so_a_simm_transition_never_swaps_its_scan() {
         inst.common.scan,
         ScanType::SEC1,
         "busy's C support never reaches recGblCheckSimm"
-    );
-    assert_eq!(
-        inst.get_common_field("SSCN"),
-        Some(EpicsValue::Enum(SCAN_PASSIVE))
     );
 }
 
@@ -290,7 +289,7 @@ async fn failed_siml_read_sets_nsta_link_alarm_without_touching_sevr() {
     let db = PvDatabase::new();
     let mut li = LonginRecord::new(5);
     // A DB link to a record that does not exist: `dbTryGetLink` fails.
-    li.siml = "NO:SUCH:RECORD".to_string();
+    li.siml = "NO:SUCH:RECORD".into();
     db.add_record("SIMLFAIL", Box::new(li)).await.unwrap();
     // VAL written so the record's own UDF alarm (INVALID) cannot mask the
     // severity-less LINK_ALARM we are asserting on.
@@ -321,13 +320,14 @@ async fn failed_siml_read_sets_nsta_link_alarm_without_touching_sevr() {
 async fn busy_failed_siml_read_raises_link_alarm_at_invalid_severity() {
     let db = PvDatabase::new();
     let mut b = BusyRecord::new();
-    b.siml = "NO:SUCH:RECORD".to_string();
+    b.siml = "NO:SUCH:RECORD".into();
     db.add_record("BUSYFAIL", Box::new(b)).await.unwrap();
     db.put_pv("BUSYFAIL", EpicsValue::Short(0)).await.unwrap();
 
     let mut v = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("BUSYFAIL", &mut v)
         .await
+        .or_else(epics_base_rs::error::CaError::unless_process_status)
         .unwrap();
 
     let rec = db.get_record("BUSYFAIL").unwrap();
@@ -372,13 +372,14 @@ async fn failed_siol_read_raises_link_alarm_at_default_sims() {
     let db = PvDatabase::new();
     let mut li = LonginRecord::new(5);
     li.simm = 1; // YES — simulate
-    li.siol = "NO:SUCH:RECORD".to_string(); // dbGetLink fails
+    li.siol = "NO:SUCH:RECORD".into(); // dbGetLink fails
     li.sims = 0; // NO_ALARM — the dbd default
     db.add_record("SIOLFAIL", Box::new(li)).await.unwrap();
 
     let mut v = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("SIOLFAIL", &mut v)
         .await
+        .or_else(epics_base_rs::error::CaError::unless_process_status)
         .unwrap();
 
     let rec = db.get_record("SIOLFAIL").unwrap();
@@ -408,13 +409,14 @@ async fn failed_siol_read_loses_the_tie_to_simm_alarm_at_sims_invalid() {
     let db = PvDatabase::new();
     let mut li = LonginRecord::new(5);
     li.simm = 1;
-    li.siol = "NO:SUCH:RECORD".to_string();
+    li.siol = "NO:SUCH:RECORD".into();
     li.sims = 3; // INVALID — same severity as the LINK_ALARM
     db.add_record("SIOLTIE", Box::new(li)).await.unwrap();
 
     let mut v = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("SIOLTIE", &mut v)
         .await
+        .or_else(epics_base_rs::error::CaError::unless_process_status)
         .unwrap();
 
     let rec = db.get_record("SIOLTIE").unwrap();
@@ -471,7 +473,10 @@ async fn simm_raw_on_a_menu_yesno_input_is_soft_alarm_and_no_substitution() {
     db.put_pv("RAWIN.SIMM", EpicsValue::Short(2)).await.unwrap();
 
     let mut v = epics_base_rs::server::database::ProcStack::new();
-    db.process_record_with_links("RAWIN", &mut v).await.unwrap();
+    db.process_record_with_links("RAWIN", &mut v)
+        .await
+        .or_else(epics_base_rs::error::CaError::unless_process_status)
+        .unwrap();
 
     assert_eq!(
         db.get_pv("RAWIN").unwrap(),
@@ -498,7 +503,7 @@ async fn simm_raw_on_a_menu_yesno_output_writes_nothing() {
         .await
         .unwrap();
     let mut lo = LongoutRecord::new(0);
-    lo.siol = "SINK".to_string();
+    lo.siol = "SINK".into();
     db.add_record("RAWOUT", Box::new(lo)).await.unwrap();
     db.put_pv("RAWOUT.SIMM", EpicsValue::Short(2))
         .await
@@ -508,6 +513,7 @@ async fn simm_raw_on_a_menu_yesno_output_writes_nothing() {
     let mut v = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("RAWOUT", &mut v)
         .await
+        .or_else(epics_base_rs::error::CaError::unless_process_status)
         .unwrap();
 
     assert_eq!(
@@ -530,13 +536,16 @@ async fn busy_simm_raw_is_soft_alarm_and_writes_nothing() {
         .await
         .unwrap();
     let mut b = BusyRecord::new();
-    b.siol = "BSINK".to_string();
+    b.siol = "BSINK".into();
     db.add_record("BRAW", Box::new(b)).await.unwrap();
     db.put_pv("BRAW.SIMM", EpicsValue::Short(2)).await.unwrap();
     db.put_pv("BRAW", EpicsValue::Short(1)).await.unwrap();
 
     let mut v = epics_base_rs::server::database::ProcStack::new();
-    db.process_record_with_links("BRAW", &mut v).await.unwrap();
+    db.process_record_with_links("BRAW", &mut v)
+        .await
+        .or_else(epics_base_rs::error::CaError::unless_process_status)
+        .unwrap();
 
     assert_eq!(db.get_pv("BSINK").unwrap(), EpicsValue::Long(0));
     let rec = db.get_record("BRAW").unwrap();
@@ -604,7 +613,7 @@ async fn w10_e5_busy_failed_siml_read_performs_no_output_write() {
         .unwrap();
 
     let mut b = BusyRecord::new();
-    b.siml = "NO:SUCH:RECORD".to_string();
+    b.siml = "NO:SUCH:RECORD".into();
     db.add_record("E5BUSY", Box::new(b)).await.unwrap();
     db.put_record_field_from_ca_no_notify("E5BUSY", "OUT", EpicsValue::String("E5TGT".into()))
         .await
@@ -614,6 +623,7 @@ async fn w10_e5_busy_failed_siml_read_performs_no_output_write() {
     let mut v = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("E5BUSY", &mut v)
         .await
+        .or_else(epics_base_rs::error::CaError::unless_process_status)
         .unwrap();
 
     let inst = db.get_record("E5BUSY").unwrap();
@@ -644,8 +654,8 @@ async fn w10_e5_busy_failed_siml_read_suppresses_the_siol_redirect_as_well() {
         .unwrap();
 
     let mut b = BusyRecord::new();
-    b.siml = "NO:SUCH:RECORD".to_string();
-    b.siol = "E5STGT".to_string();
+    b.siml = "NO:SUCH:RECORD".into();
+    b.siol = "E5STGT".into();
     b.simm = 1; // YES — but the SIML read overwrites SIMM before it is tested,
     // and in C the failed read returns before that test is ever reached.
     db.add_record("E5SBUSY", Box::new(b)).await.unwrap();
@@ -654,6 +664,7 @@ async fn w10_e5_busy_failed_siml_read_suppresses_the_siol_redirect_as_well() {
     let mut v = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("E5SBUSY", &mut v)
         .await
+        .or_else(epics_base_rs::error::CaError::unless_process_status)
         .unwrap();
 
     assert_eq!(

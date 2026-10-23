@@ -12,6 +12,7 @@ ioc = ["dep:epics-base-rs", "dep:epics-ca-rs", "dep:ad-plugins-rs", "ad-plugins-
 ad-core-rs = { workspace = true }
 ad-plugins-rs = { workspace = true, optional = true }
 asyn-rs = { workspace = true }
+epics-libcom-rs = { workspace = true }
 motor-rs = { workspace = true, optional = true }
 sim-detector = { path = "../sim-detector", optional = true }
 parking_lot = "0.12"
@@ -24,3 +25,7 @@ epics-ca-rs = { workspace = true, optional = true }
 name = "ophyd-test-ioc"
 path = "src/bin/ophyd_test_ioc.rs"
 required-features = ["ioc"]
+
+[dev-dependencies]
+# The boot test names its CA port; the retry rule lives in one place.
+named-port = { path = "../../crates/named-port" }

@@ -302,7 +302,7 @@ pub fn register_rsrv_commands(mut app: IocApplication) -> IocApplication {
         app = app.register_startup_command(cmd.clone());
         app = app.register_shell_command(cmd);
     }
-    app
+    app.register_server_init(crate::server::RSRV_SERVER, crate::server::rsrv_init)
 }
 
 /// C's `registrar(rsrvRegistrar)` line — `softIoc.dbd`'s seventh — whose
@@ -351,6 +351,7 @@ pub fn register_ca_db_server() {
                 out(&line);
             }
         })),
+        client: Some(crate::server::current_client::client_initiating_current_thread),
     });
 }
 
@@ -622,6 +623,45 @@ mod tests {
                 .iter()
                 .any(|l| l.contains(&server.tcp_port().to_string())),
             "the published addresses are this server's, not a stale copy: {detailed:?}"
+        );
+    }
+
+    /// The blocking RSRV publishes too: `casr` on an exec-backend IOC reports
+    /// the server it is running, and counts its clients, as on tokio.
+    #[test]
+    fn starting_blocking_serving_publishes_the_casr_source() {
+        use crate::server::blocking_serving::BlockingCaServing;
+        use epics_base_rs::server::database::PvDatabase;
+
+        let stats = Arc::new(ServerStats::default());
+        let serving = BlockingCaServing::start(
+            0,
+            0,
+            Arc::new(PvDatabase::new()),
+            epics_base_rs::server::access_security::new_acf_cell(None),
+            stats.clone(),
+        )
+        .expect("bind an ephemeral server");
+
+        let detailed = casr_report_lines(1);
+        assert!(
+            detailed
+                .iter()
+                .any(|l| l.contains(&serving.tcp_port().to_string())),
+            "the published addresses are this server's: {detailed:?}"
+        );
+
+        let _client =
+            std::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, serving.tcp_port()))
+                .expect("connect");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while serving.active_connections() == 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(stats.active_clients(), 1);
+        assert_eq!(
+            casr_report_lines(0),
+            casr_lines(1, 0, &CasrAddrs::default())
         );
     }
 

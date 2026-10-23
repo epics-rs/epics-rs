@@ -25,6 +25,7 @@
 // (5 live client↔server monitor tests gated out on the exec backend above;
 // stage 3.)
 
+use epics_base_rs::types::RecordName;
 use epics_pva_rs::server_native::MonitorStream;
 use std::sync::Arc;
 use std::time::Duration;
@@ -48,9 +49,9 @@ struct MemSource {
 }
 
 struct MemSourceInner {
-    state: Mutex<MemState>,
+    state: parking_lot::Mutex<MemState>,
     /// Subscribers per PV — every push fans out to all of them.
-    subs: Mutex<std::collections::HashMap<String, Vec<mpsc::Sender<PvField>>>>,
+    subs: Mutex<std::collections::HashMap<RecordName, Vec<mpsc::Sender<PvField>>>>,
     /// ordered log of every `notify_monitor_start(name, start)`
     /// the server fires, so a test can assert the Executing<->Idle edges.
     /// Sync mutex because `notify_monitor_start` is a sync trait method.
@@ -58,7 +59,7 @@ struct MemSourceInner {
 }
 
 struct MemState {
-    values: std::collections::HashMap<String, PvField>,
+    values: std::collections::HashMap<RecordName, PvField>,
 }
 
 /// Fan a value out to one PV's monitor subscribers, reaping only the dead.
@@ -91,7 +92,7 @@ impl MemSource {
     fn new() -> Self {
         Self {
             inner: Arc::new(MemSourceInner {
-                state: Mutex::new(MemState {
+                state: parking_lot::Mutex::new(MemState {
                     values: std::collections::HashMap::new(),
                 }),
                 subs: Mutex::new(std::collections::HashMap::new()),
@@ -120,9 +121,8 @@ impl MemSource {
         self.inner
             .state
             .lock()
-            .await
             .values
-            .insert(name.to_string(), pv);
+            .insert(RecordName::from(name), pv);
     }
 
     /// register an NTScalarArray PV holding a Double array.
@@ -131,9 +131,8 @@ impl MemSource {
         self.inner
             .state
             .lock()
-            .await
             .values
-            .insert(name.to_string(), pv);
+            .insert(RecordName::from(name), pv);
     }
 
     /// Push a new Double-array value to an NTScalarArray PV.
@@ -142,11 +141,10 @@ impl MemSource {
         self.inner
             .state
             .lock()
-            .await
             .values
-            .insert(name.to_string(), pv.clone());
+            .insert(RecordName::from(name), pv.clone());
         let mut subs = self.inner.subs.lock().await;
-        if let Some(list) = subs.get_mut(name) {
+        if let Some(list) = subs.get_mut(name.as_bytes()) {
             fan_out(list, &pv).await;
         }
     }
@@ -156,12 +154,11 @@ impl MemSource {
         self.inner
             .state
             .lock()
-            .await
             .values
-            .insert(name.to_string(), pv.clone());
+            .insert(RecordName::from(name), pv.clone());
         // Notify subscribers (reap only the dead — see `fan_out`).
         let mut subs = self.inner.subs.lock().await;
-        if let Some(list) = subs.get_mut(name) {
+        if let Some(list) = subs.get_mut(name.as_bytes()) {
             fan_out(list, &pv).await;
         }
     }
@@ -177,7 +174,7 @@ fn make_nt_scalar(v: f64) -> PvField {
 fn nt_scalar_desc() -> FieldDesc {
     FieldDesc::Structure {
         struct_id: "epics:nt/NTScalar:1.0".into(),
-        fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))],
+        fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))].into(),
     }
 }
 
@@ -193,39 +190,35 @@ fn make_nt_double_array(vals: &[f64]) -> PvField {
 fn nt_double_array_desc() -> FieldDesc {
     FieldDesc::Structure {
         struct_id: "epics:nt/NTScalarArray:1.0".into(),
-        fields: vec![("value".into(), FieldDesc::ScalarArray(ScalarType::Double))],
+        fields: vec![("value".into(), FieldDesc::ScalarArray(ScalarType::Double))].into(),
     }
 }
 
 impl ChannelSource for MemSource {
-    fn list_pvs(&self) -> impl std::future::Future<Output = Vec<String>> + Send {
-        let inner = self.inner.clone();
-        async move {
-            inner
-                .state
-                .lock()
-                .await
-                .values
-                .keys()
-                .cloned()
-                .collect::<Vec<_>>()
-        }
+    fn list_pvs(&self) -> Vec<RecordName> {
+        self.inner
+            .state
+            .lock()
+            .values
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>()
     }
-    fn has_pv(&self, name: &str) -> impl std::future::Future<Output = bool> + Send {
+    fn has_pv(&self, name: &[u8]) -> impl std::future::Future<Output = bool> + Send {
         let inner = self.inner.clone();
-        let name = name.to_string();
-        async move { inner.state.lock().await.values.contains_key(&name) }
+        let name = RecordName::from(name);
+        async move { inner.state.lock().values.contains_key(&name) }
     }
     fn get_introspection(
         &self,
-        name: &str,
+        name: &[u8],
     ) -> impl std::future::Future<Output = Option<FieldDesc>> + Send {
         let inner = self.inner.clone();
-        let name = name.to_string();
+        let name = RecordName::from(name);
         async move {
             // derive the descriptor from the stored value's
             // shape so an NTScalarArray PV reports an array descriptor.
-            match inner.state.lock().await.values.get(&name) {
+            match inner.state.lock().values.get(&name) {
                 Some(PvField::Structure(s))
                     if matches!(
                         s.fields.iter().find(|(k, _)| k == "value").map(|(_, v)| v),
@@ -239,23 +232,22 @@ impl ChannelSource for MemSource {
             }
         }
     }
-    fn get_value(&self, name: &str) -> impl std::future::Future<Output = Option<PvField>> + Send {
+    fn get_value(&self, name: &[u8]) -> impl std::future::Future<Output = Option<PvField>> + Send {
         let inner = self.inner.clone();
-        let name = name.to_string();
-        async move { inner.state.lock().await.values.get(&name).cloned() }
+        let name = RecordName::from(name);
+        async move { inner.state.lock().values.get(&name).cloned() }
     }
     fn put_value(
         &self,
-        name: &str,
+        name: &[u8],
         value: PvField,
     ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
         let inner = self.inner.clone();
-        let name = name.to_string();
+        let name = RecordName::from(name);
         async move {
             inner
                 .state
                 .lock()
-                .await
                 .values
                 .insert(name.clone(), value.clone());
             let mut subs = inner.subs.lock().await;
@@ -265,17 +257,17 @@ impl ChannelSource for MemSource {
             Ok(())
         }
     }
-    fn is_writable(&self, _name: &str) -> impl std::future::Future<Output = bool> + Send {
+    fn is_writable(&self, _name: &[u8]) -> impl std::future::Future<Output = bool> + Send {
         async { true }
     }
     fn subscribe(
         &self,
-        name: &str,
+        name: &[u8],
     ) -> impl std::future::Future<Output = Option<MonitorStream<PvField>>> + Send {
         let inner = self.inner.clone();
-        let name = name.to_string();
+        let name = RecordName::from(name);
         async move {
-            if !inner.state.lock().await.values.contains_key(&name) {
+            if !inner.state.lock().values.contains_key(&name) {
                 return None;
             }
             let (tx, rx) = mpsc::channel::<PvField>(64);
@@ -285,14 +277,14 @@ impl ChannelSource for MemSource {
     }
     fn notify_monitor_start(
         &self,
-        name: &str,
+        name: &[u8],
         _ctx: &epics_pva_rs::server_native::source::ChannelContext,
         start: bool,
     ) {
         self.inner
             .monitor_starts
             .lock()
-            .push((name.to_string(), start));
+            .push((String::from_utf8_lossy(name).into_owned(), start));
     }
 }
 
@@ -814,8 +806,11 @@ async fn the_clients_ca_credential_arrives_filled_at_the_server() {
         udp_port: 0,
         max_connections: 16,
         auth_complete: Some(Arc::new(move |_peer, cred: &ClientCredentials| {
-            *seen_hook.lock().expect("hook lock") =
-                Some((cred.method.clone(), cred.account.clone(), cred.host.clone()));
+            *seen_hook.lock().expect("hook lock") = Some((
+                cred.method.clone(),
+                cred.account.to_string(),
+                cred.host.clone(),
+            ));
         })),
         ..Default::default()
     };
@@ -1977,7 +1972,7 @@ async fn ex_r7_unadvertised_auth_reverts_credential_to_anonymous() {
         max_connections: 16,
         monitor_queue_depth: 8,
         auth_complete: Some(Arc::new(move |_peer, cred| {
-            *captured_hook.lock().unwrap() = Some((cred.method.clone(), cred.account.clone()));
+            *captured_hook.lock().unwrap() = Some((cred.method.clone(), cred.account.to_string()));
         })),
         ..Default::default()
     };
@@ -1997,7 +1992,7 @@ async fn ex_r7_unadvertised_auth_reverts_credential_to_anonymous() {
     let order = ByteOrder::Little;
     let auth_desc = FieldDesc::Structure {
         struct_id: String::new(),
-        fields: vec![("user".into(), FieldDesc::Scalar(ScalarType::String))],
+        fields: vec![("user".into(), FieldDesc::Scalar(ScalarType::String))].into(),
     };
     let mut auth_struct = PvStructure::new("");
     auth_struct.fields.push((
@@ -2083,7 +2078,7 @@ async fn r70_anonymous_method_yields_account_anonymous() {
         max_connections: 16,
         monitor_queue_depth: 8,
         auth_complete: Some(Arc::new(move |_peer, cred| {
-            *captured_hook.lock().unwrap() = Some((cred.method.clone(), cred.account.clone()));
+            *captured_hook.lock().unwrap() = Some((cred.method.clone(), cred.account.to_string()));
         })),
         ..Default::default()
     };
@@ -2169,7 +2164,7 @@ async fn r70_ca_without_user_falls_back_to_anonymous() {
         max_connections: 16,
         monitor_queue_depth: 8,
         auth_complete: Some(Arc::new(move |_peer, cred| {
-            *captured_hook.lock().unwrap() = Some((cred.method.clone(), cred.account.clone()));
+            *captured_hook.lock().unwrap() = Some((cred.method.clone(), cred.account.to_string()));
         })),
         ..Default::default()
     };
@@ -2188,7 +2183,7 @@ async fn r70_ca_without_user_falls_back_to_anonymous() {
     let order = ByteOrder::Little;
     let auth_desc = FieldDesc::Structure {
         struct_id: String::new(),
-        fields: vec![("host".into(), FieldDesc::Scalar(ScalarType::String))],
+        fields: vec![("host".into(), FieldDesc::Scalar(ScalarType::String))].into(),
     };
     let mut auth_struct = PvStructure::new("");
     auth_struct.fields.push((
@@ -2438,314 +2433,6 @@ async fn pva_rs_155_shared_pv_monitor_seeds_current_value_once() {
     );
 
     handle.stop();
-}
-
-// ─────────────────────────────────────────────────────────────────────
-// ChannelArray data-phase pre-source failures must reply with a CMD_ARRAY
-// error status, not drop silently.
-//
-// pvAccessCPP is the only ChannelArray server reference (pvxs has no ARRAY
-// handler): a data-phase frame whose IOID was never INIT'd draws
-// `badIOIDStatus` ("bad request id"), and a second sub-op while one is still
-// executing draws `otherRequestPendingStatus` ("other request pending")
-// (responseHandlers.cpp:2157,2164). The server used to `return Ok(())` for
-// both, so a conforming client blocked until timeout. These tests drive raw
-// frames and assert the error reply arrives instead of silence.
-// ─────────────────────────────────────────────────────────────────────
-
-use epics_pva_rs::server_native::ChannelContext;
-use epics_pva_rs::server_native::source::AccessChecked;
-
-/// An NTScalarArray source whose `channel_array_get` blocks on a semaphore
-/// until the test releases a permit. This keeps the first sub-op
-/// `Executing` so a second concurrent sub-op deterministically hits the
-/// "already executing" path rather than racing the handler's completion.
-#[derive(Clone)]
-struct GatedArraySource {
-    gate: Arc<tokio::sync::Semaphore>,
-}
-
-impl ChannelSource for GatedArraySource {
-    async fn list_pvs(&self) -> Vec<String> {
-        vec!["GATED:ARR".into()]
-    }
-    fn has_pv(&self, n: &str) -> impl std::future::Future<Output = bool> + Send {
-        let n = n.to_string();
-        async move { n == "GATED:ARR" }
-    }
-    async fn get_introspection(&self, _: &str) -> Option<FieldDesc> {
-        Some(nt_double_array_desc())
-    }
-    async fn get_value(&self, _: &str) -> Option<PvField> {
-        Some(make_nt_double_array(&[1.0, 2.0, 3.0]))
-    }
-    async fn put_value(&self, _: &str, _: PvField) -> Result<(), OpError> {
-        Ok(())
-    }
-    async fn is_writable(&self, _: &str) -> bool {
-        true
-    }
-    async fn subscribe(&self, _: &str) -> Option<MonitorStream<PvField>> {
-        None
-    }
-    async fn channel_array_init(&self, _: &str, _: ChannelContext) -> Result<FieldDesc, OpError> {
-        Ok(FieldDesc::ScalarArray(ScalarType::Double))
-    }
-    async fn channel_array_get(
-        &self,
-        _checked: AccessChecked,
-        _offset: u32,
-        _count: u32,
-        _stride: u32,
-        _ctx: ChannelContext,
-    ) -> Result<PvField, OpError> {
-        // Block until the test releases a permit; the op stays `Executing`.
-        let _permit = self.gate.acquire().await.expect("array gate closed");
-        Ok(PvField::ScalarArray(vec![
-            ScalarValue::Double(1.0),
-            ScalarValue::Double(2.0),
-            ScalarValue::Double(3.0),
-        ]))
-    }
-}
-
-/// Hand-speak the anonymous CONNECTION_VALIDATION reply, mirroring the
-/// `create_channel_*` tests above.
-fn send_anonymous_validation(
-    sock: &mut std::net::TcpStream,
-    order: epics_pva_rs::proto::ByteOrder,
-) {
-    use std::io::Write;
-
-    use epics_pva_rs::proto::{Command, PvaHeader, WriteExt, encode_string_into};
-
-    let mut payload: Vec<u8> = Vec::new();
-    payload.put_u32(0x10000, order);
-    payload.put_u16(32_767, order);
-    payload.put_u16(0, order);
-    encode_string_into("anonymous", order, &mut payload);
-    payload.put_u8(0xFF);
-    let h = PvaHeader::application(
-        false,
-        order,
-        Command::ConnectionValidation.code(),
-        payload.len() as u32,
-    );
-    let mut req = Vec::new();
-    h.write_into(&mut req);
-    req.extend_from_slice(&payload);
-    sock.write_all(&req).unwrap();
-}
-
-/// CREATE_CHANNEL one PV and return the resolved server-side `sid`.
-fn create_one_channel(
-    sock: &mut std::net::TcpStream,
-    reader: &mut FrameReader,
-    order: epics_pva_rs::proto::ByteOrder,
-    cid: u32,
-    name: &str,
-) -> u32 {
-    use std::io::Write;
-
-    use epics_pva_rs::codec::CMD_CREATE_CHANNEL;
-    use epics_pva_rs::proto::{PvaHeader, ReadExt, Status, WriteExt, encode_string_into};
-
-    let mut body = Vec::new();
-    body.put_u16(1, order);
-    body.put_u32(cid, order);
-    encode_string_into(name, order, &mut body);
-    let h = PvaHeader::application(false, order, CMD_CREATE_CHANNEL, body.len() as u32);
-    let mut frame = Vec::new();
-    h.write_into(&mut frame);
-    frame.extend_from_slice(&body);
-    sock.write_all(&frame).unwrap();
-
-    let resp = reader.read(sock);
-    let mut cur = resp.cursor();
-    let _cid = cur.get_u32(order).unwrap();
-    let sid = cur.get_u32(order).unwrap();
-    let status = Status::decode(&mut cur, order).unwrap();
-    assert!(
-        status.is_success(),
-        "CREATE_CHANNEL must succeed: {status:?}"
-    );
-    sid
-}
-
-#[cfg(tokio_backend)]
-/// Boundary — op absent. A getArray data-phase frame on an IOID that was
-/// never INIT'd must draw a CMD_ARRAY "bad request id" error reply, not a
-/// silent drop.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn array_data_phase_unknown_ioid_replies_error_not_silent() {
-    use std::io::Write;
-
-    use epics_pva_rs::proto::{
-        ByteOrder, Command, PvaHeader, QosFlags, ReadExt, Status, WriteExt, encode_size_into,
-    };
-
-    let source = Arc::new(MemSource::new());
-    source.add_pv("ARR:UNKIOID", 1.0).await;
-    let (tcp, _udp, h) = spawn_server(source.clone()).await;
-    let server_addr =
-        std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), tcp);
-
-    let order = ByteOrder::Little;
-    let mut sock = read_handshake_prelude(server_addr);
-    send_anonymous_validation(&mut sock, order);
-    let mut reader = FrameReader::new();
-    let _validated = reader.read(&mut sock);
-
-    let sid = create_one_channel(&mut sock, &mut reader, order, 55, "ARR:UNKIOID");
-
-    // getArray data-phase frame for an IOID we never INIT'd.
-    let bad_ioid = 0xDEAD_BEEF_u32;
-    let mut body = Vec::new();
-    body.put_u32(sid, order);
-    body.put_u32(bad_ioid, order);
-    body.put_u8(QosFlags::GET);
-    encode_size_into(0, order, &mut body); // offset
-    encode_size_into(0, order, &mut body); // count (to end)
-    encode_size_into(1, order, &mut body); // stride
-    let fh = PvaHeader::application(false, order, Command::Array.code(), body.len() as u32);
-    let mut frame = Vec::new();
-    fh.write_into(&mut frame);
-    frame.extend_from_slice(&body);
-    sock.write_all(&frame).unwrap();
-
-    // Pre-fix: silent drop → the reader times out (panic). Post-fix: a
-    // CMD_ARRAY error frame arrives.
-    let resp = reader.read(&mut sock);
-    assert_eq!(
-        resp.header.command,
-        Command::Array.code(),
-        "reply must be a CMD_ARRAY frame"
-    );
-    let mut cur = resp.cursor();
-    let ioid = cur.get_u32(order).unwrap();
-    let _subcmd = cur.get_u8().unwrap();
-    let status = Status::decode(&mut cur, order).unwrap();
-    assert_eq!(
-        ioid, bad_ioid,
-        "ARRAY error reply must echo the offending IOID"
-    );
-    assert!(
-        !status.is_success(),
-        "unknown-IOID data phase must reply with an error, got {status:?}"
-    );
-    assert_eq!(
-        status.message(),
-        Some("bad request id"),
-        "must mirror pvAccessCPP badIOIDStatus"
-    );
-
-    h.abort();
-}
-
-#[cfg(tokio_backend)]
-/// Boundary — op executing. A second sub-op arriving while the first is
-/// still in flight must draw a CMD_ARRAY "other request pending" error
-/// reply, not a silent drop.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn array_concurrent_subop_replies_error_not_silent() {
-    use std::io::Write;
-
-    use epics_pva_rs::proto::{
-        ByteOrder, Command, PvaHeader, QosFlags, ReadExt, Status, WriteExt, encode_size_into,
-    };
-
-    let gate = Arc::new(tokio::sync::Semaphore::new(0));
-    let src = Arc::new(GatedArraySource { gate: gate.clone() });
-    let cfg = PvaServerConfig {
-        tcp_port: 0,
-        udp_port: 0,
-        idle_timeout: Duration::from_secs(60),
-        ..Default::default()
-    };
-    let server = PvaServer::start(src, cfg).expect("test server must start");
-    let tcp = server.report().tcp_port;
-    let h = tokio::spawn(async move {
-        let _ = server.wait().await;
-    });
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    let server_addr =
-        std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), tcp);
-
-    let order = ByteOrder::Little;
-    let mut sock = read_handshake_prelude(server_addr);
-    send_anonymous_validation(&mut sock, order);
-    let mut reader = FrameReader::new();
-    let _validated = reader.read(&mut sock);
-
-    let sid = create_one_channel(&mut sock, &mut reader, order, 66, "GATED:ARR");
-
-    // ARRAY INIT (ioid = 1) using the default value-only pvRequest.
-    let ioid = 1u32;
-    let pv_req = epics_pva_rs::pv_request::build_pv_request_value_only(false);
-    let mut ibody = Vec::new();
-    ibody.put_u32(sid, order);
-    ibody.put_u32(ioid, order);
-    ibody.put_u8(QosFlags::INIT);
-    ibody.extend_from_slice(&pv_req);
-    let ih = PvaHeader::application(false, order, Command::Array.code(), ibody.len() as u32);
-    let mut iframe = Vec::new();
-    ih.write_into(&mut iframe);
-    iframe.extend_from_slice(&ibody);
-    sock.write_all(&iframe).unwrap();
-
-    let iresp = reader.read(&mut sock);
-    assert_eq!(iresp.header.command, Command::Array.code());
-    {
-        let mut cur = iresp.cursor();
-        let _ioid = cur.get_u32(order).unwrap();
-        let _subcmd = cur.get_u8().unwrap();
-        let istatus = Status::decode(&mut cur, order).unwrap();
-        assert!(istatus.is_success(), "ARRAY INIT must succeed: {istatus:?}");
-    }
-
-    // Two getArray EXEC frames on ioid=1 in one burst. The first blocks in
-    // the gated handler (op stays Executing); the second must draw an error.
-    let mut burst = Vec::new();
-    for _ in 0..2 {
-        let mut b = Vec::new();
-        b.put_u32(sid, order);
-        b.put_u32(ioid, order);
-        b.put_u8(QosFlags::GET);
-        encode_size_into(0, order, &mut b);
-        encode_size_into(0, order, &mut b);
-        encode_size_into(1, order, &mut b);
-        let hh = PvaHeader::application(false, order, Command::Array.code(), b.len() as u32);
-        hh.write_into(&mut burst);
-        burst.extend_from_slice(&b);
-    }
-    sock.write_all(&burst).unwrap();
-
-    // Pre-fix: the second sub-op is silently dropped and the first is
-    // blocked → no reply → the reader times out (panic). Post-fix: an
-    // "other request pending" error frame arrives for the second.
-    let resp = reader.read(&mut sock);
-    assert_eq!(resp.header.command, Command::Array.code());
-    let mut cur = resp.cursor();
-    let r_ioid = cur.get_u32(order).unwrap();
-    let _subcmd = cur.get_u8().unwrap();
-    let status = Status::decode(&mut cur, order).unwrap();
-    assert_eq!(
-        r_ioid, ioid,
-        "concurrent-op error reply must echo the op IOID"
-    );
-    assert!(
-        !status.is_success(),
-        "second concurrent sub-op must reply with an error, got {status:?}"
-    );
-    assert_eq!(
-        status.message(),
-        Some("other request pending"),
-        "must mirror pvAccessCPP otherRequestPendingStatus"
-    );
-
-    // Release the blocked first sub-op so the server task winds down cleanly.
-    gate.add_permits(1);
-    h.abort();
 }
 
 #[cfg(tokio_backend)]

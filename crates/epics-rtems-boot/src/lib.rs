@@ -170,6 +170,14 @@ pub mod contract;
 pub mod shell;
 pub mod stats;
 
+/// The lowest address of the calling task's stack, from its `TASK_DESC`: a
+/// VxWorks RTP has no `pthread_getattr_np`, and the descriptor's binding is
+/// this crate's.
+#[cfg(target_os = "vxworks")]
+pub fn current_task_stack_low() -> Option<usize> {
+    stats::backend::current_task_stack_low()
+}
+
 /// Undefined symbol deliberately left in this crate's object graph when it is
 /// built for RTEMS without [`contract::BSP_PREFIX_ENV`].
 ///

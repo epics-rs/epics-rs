@@ -1,0 +1,6 @@
+$ snc syncq_after_sync.st
+syncq_after_sync.st:8: error: variable 's' already sync'd
+$ snc +W syncq_after_sync.st
+syncq_after_sync.st:8: error: variable 's' already sync'd
+$ snc -w syncq_after_sync.st
+syncq_after_sync.st:8: error: variable 's' already sync'd

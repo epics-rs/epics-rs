@@ -45,6 +45,9 @@ pub struct ChannelStat {
     /// via [`Self::set_report_info`] — the single writer — and `None` when
     /// the source attaches nothing (the default).
     pub(crate) report_info: parking_lot::Mutex<Option<String>>,
+    /// The channel's live MONITOR ops by IOID, each registered for the life
+    /// of its subscriber task ([`MonitorStatSlot`]).
+    monitors: parking_lot::Mutex<Vec<(u32, Arc<MonitorStat>)>>,
 }
 
 impl ChannelStat {
@@ -54,7 +57,44 @@ impl ChannelStat {
             tx: AtomicU64::new(0),
             rx: AtomicU64::new(0),
             report_info: parking_lot::Mutex::new(None),
+            monitors: parking_lot::Mutex::new(Vec::new()),
         })
+    }
+
+    /// The channel's report entry; `zero` takes each counter and resets it,
+    /// so an increment landing between the read and the reset is neither
+    /// lost nor counted twice.
+    pub(crate) fn report(&self, zero: bool) -> ChannelReport {
+        let take = |c: &AtomicU64| {
+            if zero {
+                c.swap(0, Ordering::Relaxed)
+            } else {
+                c.load(Ordering::Relaxed)
+            }
+        };
+        ChannelReport {
+            name: self.name.clone(),
+            tx: take(&self.tx),
+            rx: take(&self.rx),
+            report_info: self.report_info.lock().clone(),
+            monitors: self
+                .monitors
+                .lock()
+                .iter()
+                .map(|(ioid, m)| m.report(*ioid, zero))
+                .collect(),
+        }
+    }
+
+    /// Register MONITOR `ioid`'s statistics with the report until the
+    /// returned slot drops.
+    pub(crate) fn monitor(self: &Arc<Self>, ioid: u32) -> MonitorStatSlot {
+        let stat = Arc::new(MonitorStat::default());
+        self.monitors.lock().push((ioid, stat.clone()));
+        MonitorStatSlot {
+            chan: self.clone(),
+            stat,
+        }
     }
 
     /// Record source-supplied contextual info for this channel — the
@@ -127,7 +167,7 @@ pub struct PeerEntry {
     /// peer credentials `(account, method)` once the
     /// connection-validation handshake establishes them. pvxs
     /// `Server::report` includes `ReportInfo`/credentials per peer.
-    pub(crate) credentials: parking_lot::Mutex<Option<(String, String)>>,
+    pub(crate) credentials: parking_lot::Mutex<Option<(epics_base_rs::types::PvString, String)>>,
     /// Live channels currently open on this connection, keyed by server
     /// channel id (SID). Each value is the SAME `Arc<ChannelStat>` the
     /// connection task holds in its channel table, so the report reads the
@@ -164,8 +204,8 @@ impl PeerEntry {
 
     /// record the validated peer credentials (set once at
     /// connection validation).
-    pub(crate) fn set_credentials(&self, account: &str, method: &str) {
-        *self.credentials.lock() = Some((account.to_string(), method.to_string()));
+    pub(crate) fn set_credentials(&self, account: &epics_base_rs::types::PvString, method: &str) {
+        *self.credentials.lock() = Some((account.clone(), method.to_string()));
     }
 
     /// Register a newly-opened channel: bump the live + lifetime counts
@@ -245,15 +285,7 @@ impl PeerRegistry {
                     // per-channel snapshot from the swapped (pre-reset) values
                     // so per-PV deltas are neither lost nor double-counted.
                     let chans = e.channels_by_sid.lock();
-                    snap.channels_detail = chans
-                        .values()
-                        .map(|c| ChannelReport {
-                            name: c.name.clone(),
-                            tx: c.tx.swap(0, Ordering::Relaxed),
-                            rx: c.rx.swap(0, Ordering::Relaxed),
-                            report_info: c.report_info.lock().clone(),
-                        })
-                        .collect();
+                    snap.channels_detail = chans.values().map(|c| c.report(true)).collect();
                 }
                 (*addr, snap)
             })
@@ -326,6 +358,80 @@ pub struct ChannelReport {
     /// Source-supplied contextual info (pvxs `ReportInfo`); `None` when the
     /// owning source's `channel_report_info` hook returned nothing.
     pub report_info: Option<String>,
+    /// The channel's live MONITOR ops.
+    pub monitors: Vec<MonitorReport>,
+}
+
+/// One MONITOR op's queue statistics — pvxs `MonitorStat::maxQueue` and
+/// `nSquash` (`servermon.cpp:278-286`, `:312-318`). Reported, never logged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MonitorReport {
+    pub ioid: u32,
+    /// Deepest the op's update queue has been.
+    pub max_queue: usize,
+    /// Updates squashed into the queue tail because it was full.
+    pub n_squash: u64,
+}
+
+/// The counters behind a [`MonitorReport`]. The op's subscriber task is the
+/// only writer, except a zeroing report.
+#[derive(Debug, Default)]
+pub(crate) struct MonitorStat {
+    max_queue: AtomicUsize,
+    n_squash: AtomicU64,
+}
+
+impl MonitorStat {
+    /// An update was appended, leaving `depth` queued.
+    pub(crate) fn queued(&self, depth: usize) {
+        if depth > self.max_queue.load(Ordering::Relaxed) {
+            self.max_queue.store(depth, Ordering::Relaxed);
+        }
+    }
+
+    /// An update was squashed into the full queue's tail.
+    pub(crate) fn squashed(&self) {
+        self.n_squash.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn report(&self, ioid: u32, zero: bool) -> MonitorReport {
+        if zero {
+            MonitorReport {
+                ioid,
+                max_queue: self.max_queue.swap(0, Ordering::Relaxed),
+                n_squash: self.n_squash.swap(0, Ordering::Relaxed),
+            }
+        } else {
+            MonitorReport {
+                ioid,
+                max_queue: self.max_queue.load(Ordering::Relaxed),
+                n_squash: self.n_squash.load(Ordering::Relaxed),
+            }
+        }
+    }
+}
+
+/// A MONITOR op's registration with its channel's report; dropping it —
+/// however the subscriber task ends — removes the op from the report.
+pub(crate) struct MonitorStatSlot {
+    chan: Arc<ChannelStat>,
+    stat: Arc<MonitorStat>,
+}
+
+impl MonitorStatSlot {
+    /// The counters this slot reports, for the op's queue to record into.
+    pub(crate) fn stat(&self) -> Arc<MonitorStat> {
+        self.stat.clone()
+    }
+}
+
+impl Drop for MonitorStatSlot {
+    fn drop(&mut self) {
+        self.chan
+            .monitors
+            .lock()
+            .retain(|(_, m)| !Arc::ptr_eq(m, &self.stat));
+    }
 }
 
 /// Lock-free snapshot returned by [`PeerRegistry::snapshot`].
@@ -341,7 +447,7 @@ pub struct PeerSnapshot {
     pub tls: bool,
     /// validated peer credentials `(account, method)`, or
     /// `None` before the connection-validation handshake completes.
-    pub credentials: Option<(String, String)>,
+    pub credentials: Option<(epics_base_rs::types::PvString, String)>,
     /// Per-channel report entries for the channels currently open on this
     /// peer — name + per-channel tx/rx counters + optional `ReportInfo`
     /// (pvxs `Report::Connection::channels`, src/server.cpp:260-268).
@@ -364,12 +470,7 @@ impl From<&PeerEntry> for PeerSnapshot {
                 .channels_by_sid
                 .lock()
                 .values()
-                .map(|c| ChannelReport {
-                    name: c.name.clone(),
-                    tx: c.tx.load(Ordering::Relaxed),
-                    rx: c.rx.load(Ordering::Relaxed),
-                    report_info: c.report_info.lock().clone(),
-                })
+                .map(|c| c.report(false))
                 .collect(),
         }
     }
@@ -453,7 +554,7 @@ mod tests {
         let reg = PeerRegistry::new();
         let addr: SocketAddr = "127.0.0.1:5076".parse().unwrap();
         let e = PeerEntry::new(true);
-        e.set_credentials("op", "ca");
+        e.set_credentials(&"op".into(), "ca");
         let x = ChannelStat::new("X:PV".into());
         let y = ChannelStat::new("Y:PV".into());
         e.channel_opened(1, x.clone());
@@ -521,6 +622,47 @@ mod tests {
     /// Helper: close a channel via the registry's live entry.
     fn e_close(reg: &PeerRegistry, addr: SocketAddr, sid: u32) {
         reg.inner.read().get(&addr).unwrap().channel_closed(sid);
+    }
+
+    /// A MONITOR's `maxQueue`/`nSquash` reach the server report through its
+    /// channel, and a zeroing report resets them (pvxs `stats(stat, reset)`).
+    #[test]
+    fn a_zeroing_report_takes_the_monitor_counters() {
+        let reg = PeerRegistry::new();
+        let addr: SocketAddr = "127.0.0.1:5098".parse().unwrap();
+        let e = PeerEntry::new(false);
+        reg.insert(addr, e.clone());
+        let chan = ChannelStat::new("dut".into());
+        e.channels_by_sid.lock().insert(1, chan.clone());
+        let slot = chan.monitor(9);
+        slot.stat().queued(3);
+        slot.stat().queued(2);
+        slot.stat().squashed();
+        let monitors = |zero| {
+            reg.snapshot_zeroed(zero)
+                .remove(0)
+                .1
+                .channels_detail
+                .remove(0)
+                .monitors
+        };
+        let counted = vec![MonitorReport {
+            ioid: 9,
+            max_queue: 3,
+            n_squash: 1,
+        }];
+        assert_eq!(monitors(false), counted);
+        assert_eq!(monitors(true), counted);
+        assert_eq!(
+            monitors(false),
+            vec![MonitorReport {
+                ioid: 9,
+                max_queue: 0,
+                n_squash: 0,
+            }]
+        );
+        drop(slot);
+        assert_eq!(monitors(false), vec![]);
     }
 
     /// `snapshot_zeroed(true)` must not lose a byte increment

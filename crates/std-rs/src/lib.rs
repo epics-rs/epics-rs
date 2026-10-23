@@ -62,17 +62,41 @@ pub use records::timestamp::TimestampRecord;
 pub const STD_DB_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/db");
 
 /// Return the epid record type factory for injection into IocBuilder.
+///
+/// Also loads std's `.dbd` ([`register_std_dbd`]), as `stdSupport.dbd` does in
+/// C: without its `device()` menus a std DTYP serves only the bound choice and
+/// a DTYP put by name is refused. Every factory below does the same.
 pub fn epid_record_factory() -> (&'static str, epics_base_rs::server::RecordFactory) {
+    register_std_dbd();
     ("epid", Box::new(|| Box::new(EpidRecord::default())))
+}
+
+/// Hand std's generated `.dbd` to base, C's `dbLoadDatabase` of it: the
+/// record types and menus the dbStatic reports walk, and the `device()` menus
+/// of std's own record types. Idempotent: base dedups a repeat.
+///
+/// The `device()` lines std adds to base's types (`devTimeOfDay.dbd`'s ai and
+/// stringin) arrive when their support is registered instead, because a
+/// type's DTYP index is the order its lines arrive: registered here, they
+/// would land before asyn's whenever the record types are registered first.
+pub fn register_std_dbd() {
+    use records::dbd_generated::{DBD, RECORD_TYPES, devices};
+    epics_base_rs::server::record::register_contributed_dbd(&DBD);
+    for &record_type in RECORD_TYPES {
+        let rows = devices(record_type).unwrap_or_default();
+        epics_base_rs::server::record::register_dbd_devices(record_type, rows);
+    }
 }
 
 /// Return the throttle record type factory for injection into IocBuilder.
 pub fn throttle_record_factory() -> (&'static str, epics_base_rs::server::RecordFactory) {
+    register_std_dbd();
     ("throttle", Box::new(|| Box::new(ThrottleRecord::default())))
 }
 
 /// Return the timestamp record type factory for injection into IocBuilder.
 pub fn timestamp_record_factory() -> (&'static str, epics_base_rs::server::RecordFactory) {
+    register_std_dbd();
     (
         "timestamp",
         Box::new(|| Box::new(TimestampRecord::default())),
@@ -96,35 +120,45 @@ pub fn register_std_record_types() {
     }
 }
 
-/// Return the "Sec Past Epoch" (`ai`) device support factory from
-/// `devTimeOfDay.c` (`devAiTodSeconds`) for injection into a builder.
-pub fn sec_past_epoch_device_factory() -> (&'static str, epics_base_rs::server::DeviceSupportFactory)
-{
+/// A std device support as its record type, its `devSup` row and its factory,
+/// the three arguments of `register_device_support`.
+pub type StdDeviceSupport = (
+    &'static str,
+    &'static epics_base_rs::server::record::DevSup,
+    epics_base_rs::server::DeviceSupportFactory,
+);
+
+/// The "Sec Past Epoch" (`ai`) device support from `devTimeOfDay.c`
+/// (`devAiTodSeconds`).
+pub fn sec_past_epoch_device_factory() -> StdDeviceSupport {
+    register_std_dbd();
     (
-        "Sec Past Epoch",
+        "ai",
+        &records::dbd_generated::DEVICES_AI[0],
         Box::new(|| Box::new(SecPastEpochDeviceSupport::new())),
     )
 }
 
-/// Return the "Time of Day" (`stringin`) device support factory from
-/// `devTimeOfDay.c` (`devSiTodString`) for injection into a builder.
-pub fn time_of_day_device_factory() -> (&'static str, epics_base_rs::server::DeviceSupportFactory) {
+/// The "Time of Day" (`stringin`) device support from `devTimeOfDay.c`
+/// (`devSiTodString`).
+pub fn time_of_day_device_factory() -> StdDeviceSupport {
+    register_std_dbd();
     (
-        "Time of Day",
+        "stringin",
+        &records::dbd_generated::DEVICES_STRINGIN[0],
         Box::new(|| Box::new(TimeOfDayStringDeviceSupport::new())),
     )
 }
 
-/// Return all std-module device support factories for bulk registration.
+/// Return all std-module device supports for bulk registration.
 ///
 /// These are the `devTimeOfDay.c` DTYPs ("Sec Past Epoch" ai, "Time of Day"
 /// stringin). They need only the framework's `ProcessContext` (PHAS/TSE), no
 /// INP, so a static [`DeviceSupportFactory`](epics_base_rs::server::DeviceSupportFactory)
 /// suffices. Register each onto an `IocBuilder` / `IocApplication` /
-/// `CaServerBuilder` via its `register_device_support(dtyp, factory)` — the
-/// boxed factory satisfies the method's `Fn` bound — mirroring how
-/// [`std_record_factories()`] is injected via `register_record_type()`.
-pub fn std_device_supports() -> Vec<(&'static str, epics_base_rs::server::DeviceSupportFactory)> {
+/// `CaServerBuilder` via its `register_device_support(record_type, devsup,
+/// factory)`, which also adds the row to the record type's DTYP menu.
+pub fn std_device_supports() -> Vec<StdDeviceSupport> {
     vec![
         sec_past_epoch_device_factory(),
         time_of_day_device_factory(),

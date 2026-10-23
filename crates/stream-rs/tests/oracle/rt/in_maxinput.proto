@@ -1,0 +1,3 @@
+Terminator = CR LF;
+MaxInput = 3;
+p { out "GET"; in "%d"; }

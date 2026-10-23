@@ -1,0 +1,22 @@
+-	drvStreamInit()
+-	StreamProtocolParser::path = /home/stevek/work/_tgt/monitor/trial/crates/stream-rs/tests/oracle/epics
+_main_	streamInitRecord(rec): SEVR=0
+_main_	streamInitRecord(rec): create new Stream object
+_main_	streamInitRecord(rec): calling initRecord
+_main_	Stream::initRecord rec: parse link string "l.proto i P"
+_main_	Stream::initRecord rec: filename="l.proto" protocol="i" bus="P" addr=0 params=""
+_main_	Stream::initRecord rec: attachBus("P", 0, "")
+_main_	Stream::initRecord rec: parse("l.proto", "i")
+_main_	Stream::initRecord rec: initialize the first time
+_main_	streamInitRecord(rec) done status=0x2
+_main_	streamGetIointInfo(rec,cmd=0): stream=0x5df9e2fd2940, ioscanpvt=0x5df9e2fd4470
+_main_	streamGetIointInfo(rec): start later...
+_main_	rec: starting "I/O Intr"
+_main_	StreamCore::startProtocol(rec, startMode=StartAsync)
+_main_	StreamCore::evalCommand(rec): activeCommand = in
+VAL 0 = 0x0
+SEVR "NO_ALARM"
+STAT "UDF"
+UDF 0 = 0x0
+PACT 0 = 0x0
+PROC 0 = 0x0

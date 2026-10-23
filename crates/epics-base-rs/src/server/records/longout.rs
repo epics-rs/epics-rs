@@ -8,6 +8,7 @@
 //! `should_output_fn` knob this file can switch back to the derive form.
 
 use crate::error::{CaError, CaResult};
+use crate::server::record::{CycleCell, CycleRead, CycleValue};
 use crate::server::record::{MENU_YES_NO, ProcessOutcome, Record};
 use crate::types::{EpicsValue, PvString};
 
@@ -39,13 +40,13 @@ pub struct LongoutRecord {
     // Cause B (commit 224d5ad5).
     pub adel: i32,
     pub mdel: i32,
-    pub alst: f64,
-    pub mlst: f64,
+    pub alst: i32,
+    pub mlst: i32,
     pub omsl: i16,
-    pub dol: String,
+    pub dol: PvString,
     pub simm: i16,
-    pub siml: String,
-    pub siol: String,
+    pub siml: PvString,
+    pub siol: PvString,
     pub sims: i16,
     pub sdly: f64,
     /// Output Execution Option (epics-base 7.0.8):
@@ -80,7 +81,7 @@ pub struct LongoutRecord {
     /// reaches C's `conditional_write`. The OUT-change re-trigger
     /// (PR #6c573b4 part 2) is wired through
     /// [`Record::special("OUT", true)`] — `RecordInstance::put_common_field`
-    /// fires it after `common.out` is updated, so OUT is owned by
+    /// fires it after `common.text.out` is updated, so OUT is owned by
     /// the RecordInstance (common-field side), not by this struct.
     pub first_output_done: bool,
     /// `OOCH` (Output Exec. on OUT Change) — C `menuYesNo`. When YES
@@ -111,13 +112,13 @@ impl Default for LongoutRecord {
             ivov: 0,
             adel: 0,
             mdel: 0,
-            alst: 0.0,
-            mlst: 0.0,
+            alst: 0,
+            mlst: 0,
             omsl: 0,
-            dol: String::new(),
+            dol: PvString::new(),
             simm: 0,
-            siml: String::new(),
-            siol: String::new(),
+            siml: PvString::new(),
+            siol: PvString::new(),
             sims: 0,
             sdly: -1.0,
             oopt: 0,
@@ -181,14 +182,66 @@ const LONGOUT_OOPT_CHOICES: &[&str] = &[
 ];
 
 impl Record for LongoutRecord {
+    // The alarm ladder lives in dbCommon's analog block; the menus are
+    // stored as `i16` and served as ENUM. Neither maps.
+    crate::slot_map!(crate::server::record::dbd_generated::slots::longout;
+        fields:
+        VAL => val,
+        EGU => egu,
+        DRVH => drvh,
+        DRVL => drvl,
+        HOPR => hopr,
+        LOPR => lopr,
+        ADEL => adel,
+        MDEL => mdel,
+        SDLY => sdly,
+        IVOV => ivov,
+        PVAL => pval,
+        LALM => lalm,
+        ALST => alst,
+        MLST => mlst;
+        custom: DOL, OMSL, SIOL, SIML, SIMM, SIMS, IVOA, OOCH, OOPT;
+        spill: OUT, HIHI, LOLO, HIGH, LOW, HHSV, LLSV, HSV, LSV, HYST, OLDSIMM, SSCN, SIMPVT);
+
+    fn acts_before_process(&self) -> bool {
+        false
+    }
+
+    fn cycle_hooks(&self) -> crate::server::record::CycleHooks {
+        crate::server::record::CycleHooks::OUTPUT_HOOKS
+    }
+
+    fn has_array_monitor_post(&self) -> bool {
+        false
+    }
+
     fn record_type(&self) -> &'static str {
         "longout"
+    }
+
+    /// devLoSoft.c drops `dbPutLink`'s status; devLoSoftCallback.c returns it.
+    fn process_status_rule(&self) -> crate::server::record::ProcessStatusRule {
+        crate::server::record::ProcessStatusRule::io(crate::server::record::SoftStatus {
+            plain: false,
+            raw: false,
+            async_: true,
+        })
+        .with_dol(crate::server::record::DolStatus::UntilWrite)
     }
 
     /// C `longoutRecord.c:147-158`: the scalar `dbGetLink(&prec->dol, ..., &prec->val, 0, 0)`
     /// under `dol.type != CONSTANT && omsl == menuOmslclosed_loop`.
     fn fetches_dol_closed_loop(&self) -> bool {
         true
+    }
+
+    /// The closed-loop DOL is read at `DBR_LONG` (`longoutRecord.c:148`), so a source
+    /// that request cannot convert is a failed read.
+    fn input_link_request(&self, link_field: &str) -> crate::server::record::InputLinkRequest {
+        crate::server::record::InputLinkRequest::As(match link_field {
+            "DOL" => crate::server::record::LinkReadAs::Long,
+            _ => crate::server::record::LinkReadAs::Native,
+        })
     }
 
     /// C `longoutRecord.c:145-153`: `process()` clears `udf` to FALSE only on a
@@ -221,15 +274,27 @@ impl Record for LongoutRecord {
     /// when `DRVH > DRVL` (equal limits = no clamping). Without this an
     /// operator or DOL link writing outside the window propagates the
     /// unclamped value to the OUT link / device.
-    /// C `longoutRecord.c:126` — `init_record` seeds PVAL from the loaded VAL,
-    /// alongside the MLST/ALST/LALM seed [`Record::seed_deadband_tracking`]
-    /// owns. Without it a `field(VAL,"5")` longout starts with `pval = 0`, so
-    /// the first `caput LO 0` is not a transition to C but is to the port.
-    fn init_record(&mut self, pass: u8) -> CaResult<()> {
-        if pass == 0 {
+    /// C `longoutRecord.c:123-126` seeds PVAL with the trackers, after `:117-120`
+    /// returns a nonzero dset status. Without it a `field(VAL,"5")` longout
+    /// starts with `pval = 0`, so the first `caput LO 0` is not a transition
+    /// to C but is to the port.
+    fn seed_deadband_tracking(&mut self, dset_init: crate::server::device_support::DsetInit) {
+        if dset_init != crate::server::device_support::DsetInit::Failed {
+            crate::server::record::seed_trackers_from_val(self);
             self.pval = self.val;
         }
-        Ok(())
+    }
+
+    /// `monitor()` posts VAL alone (`longoutRecord.c:371-395`).
+    fn process_posted_fields(&self) -> Option<crate::server::record::DeclaredFields> {
+        Some(
+            &const {
+                crate::server::record::declared_set(
+                    crate::server::record::dbd_generated::LONGOUT_FIELDS,
+                    ["VAL"],
+                )
+            },
+        )
     }
 
     fn process(&mut self) -> CaResult<ProcessOutcome> {
@@ -262,6 +327,57 @@ impl Record for LongoutRecord {
         }
     }
 
+    fn link_text_ref(&self, link_field: &str) -> Option<&[u8]> {
+        match link_field {
+            "DOL" => Some(self.dol.as_bytes()),
+            "SIML" => Some(self.siml.as_bytes()),
+            "SIOL" => Some(self.siol.as_bytes()),
+            _ => None,
+        }
+    }
+
+    fn simm_cells(&self) -> Option<crate::server::record::SimmCells> {
+        Some(crate::server::record::SimmCells {
+            simm: self.simm,
+            sims: self.sims,
+            sdly: self.sdly,
+        })
+    }
+
+    fn cycle_cell(&self, cell: CycleCell) -> CycleRead {
+        match cell {
+            CycleCell::Val => CycleRead::Value(CycleValue::Long(self.val)),
+            CycleCell::Mdel => CycleRead::Value(CycleValue::Long(self.mdel)),
+            CycleCell::Adel => CycleRead::Value(CycleValue::Long(self.adel)),
+            CycleCell::Mlst => CycleRead::Value(CycleValue::Long(self.mlst)),
+            CycleCell::Alst => CycleRead::Value(CycleValue::Long(self.alst)),
+            CycleCell::Lalm => CycleRead::Value(CycleValue::Long(self.lalm)),
+            _ => CycleRead::Absent,
+        }
+    }
+
+    fn put_cycle_cell(&mut self, cell: CycleCell, value: CycleValue) -> CaResult<()> {
+        match (cell, value) {
+            (CycleCell::Lalm, CycleValue::Long(v)) => {
+                self.validate_put("LALM", &CycleValue::Long(v).lend())?;
+                self.lalm = v;
+                self.on_put("LALM");
+            }
+            (CycleCell::Alst, CycleValue::Long(v)) => {
+                self.validate_put("ALST", &CycleValue::Long(v).lend())?;
+                self.alst = v;
+                self.on_put("ALST");
+            }
+            (CycleCell::Mlst, CycleValue::Long(v)) => {
+                self.validate_put("MLST", &CycleValue::Long(v).lend())?;
+                self.mlst = v;
+                self.on_put("MLST");
+            }
+            (cell, value) => return self.put_field(cell.name(), value.into()),
+        }
+        Ok(())
+    }
+
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
             "VAL" => Some(EpicsValue::Long(self.val)),
@@ -277,8 +393,8 @@ impl Record for LongoutRecord {
             "IVOV" => Some(EpicsValue::Long(self.ivov)),
             "ADEL" => Some(EpicsValue::Long(self.adel)),
             "MDEL" => Some(EpicsValue::Long(self.mdel)),
-            "ALST" => Some(EpicsValue::Double(self.alst)),
-            "MLST" => Some(EpicsValue::Double(self.mlst)),
+            "ALST" => Some(EpicsValue::Long(self.alst)),
+            "MLST" => Some(EpicsValue::Long(self.mlst)),
             "OMSL" => Some(EpicsValue::Short(self.omsl)),
             "DOL" => Some(EpicsValue::String(self.dol.clone().into())),
             "SIMM" => Some(EpicsValue::Short(self.simm)),
@@ -303,7 +419,7 @@ impl Record for LongoutRecord {
             }
             "EGU" => {
                 if let EpicsValue::String(v) = value {
-                    self.egu = v;
+                    self.egu.set_bytes(v.as_bytes());
                 }
             }
             "HOPR" => {
@@ -355,12 +471,12 @@ impl Record for LongoutRecord {
                 }
             }
             "ALST" => {
-                if let EpicsValue::Double(v) = value {
+                if let EpicsValue::Long(v) = value {
                     self.alst = v;
                 }
             }
             "MLST" => {
-                if let EpicsValue::Double(v) = value {
+                if let EpicsValue::Long(v) = value {
                     self.mlst = v;
                 }
             }
@@ -371,7 +487,7 @@ impl Record for LongoutRecord {
             }
             "DOL" => {
                 if let EpicsValue::String(v) = value {
-                    self.dol = v.as_str_lossy().into_owned();
+                    self.dol = v;
                 }
             }
             "SIMM" => {
@@ -381,12 +497,12 @@ impl Record for LongoutRecord {
             }
             "SIML" => {
                 if let EpicsValue::String(v) = value {
-                    self.siml = v.as_str_lossy().into_owned();
+                    self.siml = v;
                 }
             }
             "SIOL" => {
                 if let EpicsValue::String(v) = value {
-                    self.siol = v.as_str_lossy().into_owned();
+                    self.siol = v;
                 }
             }
             "SIMS" => {
@@ -459,9 +575,14 @@ impl Record for LongoutRecord {
     /// `val == pval` suppression. We fire on `after=true` because the
     /// common `out` field is set inside `RecordInstance::put_common_field`
     /// AFTER the `special(name, false)` validation hook — so by the
-    /// time we run, `instance.common.out` already holds the new value
+    /// time we run, `instance.common.text.out` already holds the new value
     /// (we don't need to read it; just react to the field name).
-    fn special(&mut self, field: &str, after: bool) -> crate::error::CaResult<()> {
+    fn special(
+        &mut self,
+        field: &str,
+        after: bool,
+        _common: &crate::server::record::CommonFields,
+    ) -> crate::error::CaResult<()> {
         if after && field == "OUT" && self.ooch == 1 {
             self.first_output_done = false;
         }
@@ -484,20 +605,20 @@ mod tests {
         use crate::server::record::Record;
         // C `longoutRecord.c` init_record ends with mlst=alst=lalm=val, so a
         // record initialised to a nonzero VAL posts no spurious first-cycle
-        // monitor (DELTA(mlst,val)==0). The trackers default to 0.0, which
+        // monitor (DELTA(mlst,val)==0). The trackers default to 0, which
         // conflates "never published" with "published 0"; the framework seed
         // must lift them to val via the generic get_field/put_field path.
         let mut r = LongoutRecord::new(5);
-        assert_eq!(r.mlst, 0.0, "precondition: tracker is the 0.0 default");
-        assert_eq!(r.alst, 0.0);
+        assert_eq!(r.mlst, 0, "precondition: tracker is the 0 default");
+        assert_eq!(r.alst, 0);
         assert_eq!(r.lalm, 0);
-        r.seed_deadband_tracking();
-        assert_eq!(r.mlst, 5.0, "mlst seeded from val");
-        assert_eq!(r.alst, 5.0, "alst seeded from val");
+        r.seed_deadband_tracking(crate::server::device_support::DsetInit::Ok);
+        assert_eq!(r.mlst, 5, "mlst seeded from val");
+        assert_eq!(r.alst, 5, "alst seeded from val");
         assert_eq!(r.lalm, 5, "lalm seeded from val");
         // First process leaves val unchanged: DELTA(mlst=5, val=5)=0 is not
         // > mdel(0), so no DBE_VALUE/DBE_LOG post — matching C.
-        assert!((5.0_f64 - r.mlst).abs() <= 0.0);
+        assert_eq!(r.val.abs_diff(r.mlst), 0);
     }
 
     #[test]
@@ -664,7 +785,7 @@ mod tests {
         );
         // OOCH=YES then OUT change (fired via `special(OUT, true)`).
         r.ooch = 1;
-        r.special("OUT", true).unwrap();
+        r.special("OUT", true, &Default::default()).unwrap();
         assert!(
             r.compute_should_output(),
             "OOCH=YES + OUT change must force the next On_Change write"
@@ -681,7 +802,7 @@ mod tests {
         // OOCH=NO (explicitly set — the dbd default is now YES(1) per
         // initial("1")) — OUT change must NOT trigger a write.
         r.ooch = 0;
-        r.special("OUT", true).unwrap();
+        r.special("OUT", true, &Default::default()).unwrap();
         assert!(
             !r.compute_should_output(),
             "OOCH=NO: OUT change is silent, val==pval still suppresses output"

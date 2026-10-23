@@ -1,6 +1,6 @@
 //! Asyn iocsh shell-command registration.
 //!
-//! C parity: `asynRegister` (asynShellCommands.c:1347-1379) registers 27
+//! C parity: `asynRegister` (asynShellCommands.c:1349-1381) registers 27
 //! shell commands — the report/option/trace setters (`asynReport`,
 //! `asynSetOption`, `asynShowOption`, the five `asynSetTrace*`), the ten
 //! octet I/O and EOS commands, `asynEnable`/`asynAutoConnect`/
@@ -22,7 +22,8 @@
 // server, and the reactor these obtain comes from `#[tokio::test]`
 // itself, which the backend does not remove.
 
-use std::sync::{Arc, Mutex, OnceLock};
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::Duration;
 
 use epics_base_rs::server::ioc_app::IocApplication;
@@ -38,8 +39,9 @@ use crate::drivers::prologix::DrvAsynPrologixPort;
 use crate::drivers::serial_port::DrvAsynSerialPort;
 use crate::drivers::usbtmc::DrvAsynUsbtmcPort;
 use crate::drivers::vxi11::DrvVxi11Port;
-use crate::error::AsynResult;
-use crate::escape::escaped_from_raw;
+use crate::error::{AsynError, AsynResult};
+use crate::escape::{escaped_from_raw, print_escaped};
+use crate::interfaces::InterfaceType;
 use crate::manager::PortManager;
 use crate::port::PortDriver;
 use crate::runtime::config::RuntimeConfig;
@@ -67,15 +69,49 @@ use crate::user::AsynUser;
 /// the startup shell and the interactive shell a table each; the table is now
 /// one, so the second call would only displace the name with itself.
 pub fn register_asyn_commands(mut app: IocApplication, mgr: Arc<PortManager>) -> IocApplication {
+    epics_base_rs::server::driver_support::register_driver_support(
+        "drvAsyn",
+        Arc::new(DrvAsyn(mgr.clone())),
+    );
     for def in build_asyn_commands(mgr) {
         app = app.register_startup_command(def);
     }
     app
 }
 
+/// C `asynSetTraceMaskUsage` (asynShellCommands.c:623-636), printed above an
+/// unparsable mask string. The first two pieces join with no newline in C.
+const TRACE_MASK_USAGE: &str = "Set logging level bit mask, either as a number,  \
+or since asyn R4-35 a combination of names.
+  mask bits
+    0x01 - ERROR
+    0x02 - DEVICE
+    0x04 - FILTER
+    0x08 - DRIVER
+    0x10 - FLOW
+    0x20 - WARNING
+
+  eg. the following are equivalent
+    asynSetTraceMask MYPORT -1 0x21
+    asynSetTraceMask MYPORT -1 \"WARNING+ERROR\"
+";
+
+/// C `asynSetTraceIOMaskUsage` (asynShellCommands.c:713-723).
+const TRACE_IO_MASK_USAGE: &str = "Set logging I/O print formatting bit mask, either as a number,
+  or since asyn R4-35 a combination of names.
+  mask bits
+    0x01 - ASCII
+    0x02 - ESCAPE
+    0x04 - HEX
+
+  eg. the following are equivalent
+    asynSetTraceIOMask MYPORT -1 0x6
+    asynSetTraceIOMask MYPORT -1 \"ESCAPE+HEX\"
+";
+
 /// The trace a trace-setting command acts on. C connects an `asynUser` to
 /// the named port first (asynShellCommands.c:645-651) and `setTrace*` then
-/// writes that port's own `dpCommon` (asynManager.c:2774-2802), whichever
+/// writes that port's own `dpCommon` (asynManager.c:2788-2816), whichever
 /// manager the command was registered with; a port that does not exist is
 /// the `connectDevice` failure C prints and returns on. With no port named
 /// the setter writes the global config (C `pasynUser == NULL`), which lives
@@ -93,7 +129,7 @@ fn arg_int(args: &[ArgValue], i: usize) -> Option<i64> {
     match args.get(i) {
         Some(ArgValue::Int(v)) => Some(*v),
         Some(ArgValue::Double(v)) => Some(*v as i64),
-        Some(ArgValue::String(s)) => s.parse::<i64>().ok(),
+        Some(ArgValue::String(s)) => s.to_str_lossy().parse::<i64>().ok(),
         _ => None,
     }
 }
@@ -102,18 +138,21 @@ fn arg_f64(args: &[ArgValue], i: usize) -> Option<f64> {
     match args.get(i) {
         Some(ArgValue::Double(v)) => Some(*v),
         Some(ArgValue::Int(v)) => Some(*v as f64),
-        Some(ArgValue::String(s)) => s.parse::<f64>().ok(),
+        Some(ArgValue::String(s)) => s.to_str_lossy().parse::<f64>().ok(),
         _ => None,
     }
 }
 
-fn arg_str(args: &[ArgValue], i: usize) -> Option<String> {
-    match args.get(i) {
-        Some(ArgValue::String(s)) => Some(s.clone()),
+/// A text argument. The port registry and the drivers key on `String`, so
+/// bytes that are not UTF-8 are refused here rather than renamed. No command
+/// reads a `Double` argument as text; C's `iocshArgString` is the token itself,
+/// so there is no C spelling to give one.
+fn arg_str(args: &[ArgValue], i: usize) -> Result<Option<String>, String> {
+    Ok(match args.get(i) {
+        Some(ArgValue::String(s)) => Some(s.to_str()?.to_owned()),
         Some(ArgValue::Int(v)) => Some(v.to_string()),
-        Some(ArgValue::Double(v)) => Some(v.to_string()),
         _ => None,
-    }
+    })
 }
 
 /// Rust port of EPICS `epicsStrnRawFromEscaped` (libcom `epicsString.c`):
@@ -126,8 +165,8 @@ fn arg_str(args: &[ArgValue], i: usize) -> Option<String> {
 /// `default:` arm). `\xXX` consumes up to two hex digits; a `\x` with no
 /// following hex digit emits nothing and the next character is reprocessed
 /// as ordinary input (C's `goto input`). A raw or `\0` NUL ends the scan.
-fn raw_from_escaped(src: &str) -> Vec<u8> {
-    let b = src.as_bytes();
+fn raw_from_escaped(src: &[u8]) -> Vec<u8> {
+    let b = src;
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
     while i < b.len() {
@@ -216,7 +255,7 @@ const SHELL_IO_TIMEOUT: Duration = Duration::from_secs(2);
 /// — the 2 s I/O deadline ([`SHELL_IO_TIMEOUT`]), and
 /// `ASYN_REASON_QUEUE_EVEN_IF_NOT_CONNECTED`, which is what lets an `st.cmd`
 /// set a line's EOS before the device is powered on. No queue-wait deadline: C
-/// passes `queueRequest(..., 0.0)` (:244).
+/// passes `queueRequest(..., 0.0)` (:245).
 fn shell_eos_user(addr: i32) -> AsynUser {
     AsynUser::default()
         .with_addr(addr)
@@ -224,49 +263,130 @@ fn shell_eos_user(addr: i32) -> AsynUser {
         .queue_even_if_not_connected()
 }
 
+/// C `pasynManager->connectDevice` as a shell command meets it: the port, or
+/// the errorMessage it leaves (asynManager.c:1331-1343).
+fn shell_connect_device(
+    mgr: &PortManager,
+    port: Option<&str>,
+) -> Result<crate::port_handle::PortHandle, String> {
+    let Some(port) = port else {
+        return Err("asynManager:connectDevice no port name provided".into());
+    };
+    mgr.find_port_handle(port)
+        .map_err(|_| format!("asynManager:connectDevice port {port} not found"))
+}
+
+/// C `findInterface` (asynShellCommands.c:69-91): the port by name, refused
+/// with C's line when the name is missing, unknown (connectDevice's message,
+/// asynManager.c:1340-1341) or the port lacks `iface`.
+fn shell_find_interface(
+    mgr: &PortManager,
+    ctx: &CommandContext,
+    port: Option<&str>,
+    iface: crate::interfaces::InterfaceType,
+) -> Option<crate::port_handle::PortHandle> {
+    let Some(port) = port else {
+        ctx.println("Missing portName argument");
+        return None;
+    };
+    let handle = match shell_connect_device(mgr, Some(port)) {
+        Ok(handle) => handle,
+        Err(msg) => {
+            ctx.println(&format!("Port {port} connectDevice failed: {msg}"));
+            return None;
+        }
+    };
+    if !handle.has_interface(iface) {
+        ctx.println(&format!(
+            "Port {port} does not provide required {} interface",
+            iface.asyn_name()
+        ));
+        return None;
+    }
+    Some(handle)
+}
+
+/// A queued shell request's failure as C prints it: a request the queue
+/// refused is `queueRequest failed: %s` (asynShellCommands.c:128, :175),
+/// one that ran and failed is `<ran>%s` (:101, :147), from the callback.
+fn shell_request_failure(
+    ctx: &CommandContext,
+    handle: &crate::port_handle::PortHandle,
+    ran: &str,
+    e: &AsynError,
+) {
+    if e.never_ran() {
+        ctx.println(&format!("queueRequest failed: {}", e.message_display()));
+    } else {
+        callback_println(ctx, handle, &format!("{ran}{}", e.message_display()));
+    }
+}
+
+/// A line C's option callback prints (:101, :147, :149). `queueRequest` runs
+/// the callback on the port thread of a canBlock port and on the caller's
+/// otherwise (asynManager.c:145-172), so only then does a `>` redirect take it.
+fn callback_println(ctx: &CommandContext, handle: &crate::port_handle::PortHandle, line: &str) {
+    if handle.can_block() {
+        ctx.console_println(line);
+    } else {
+        ctx.println(line);
+    }
+}
+
+/// C `eosArgs.eos[10]` (asynShellCommands.c:189).
+const EOS_ARG_SIZE: usize = 10;
+
 /// Shared body of `asynOctetSetInputEos` / `asynOctetSetOutputEos`.
 ///
 /// C parity: `asynShellCommands.c::asynSetEos` (:219-253) escape-decodes the
 /// `eos` argument, `connectDevice`s its `asynUser` to `(portName, addr)` through
-/// `findInterface` (:79-80, :233-234) and routes the bytes to
+/// `findInterface` (:79-80, :235-236) and routes the bytes to
 /// `pasynOctet->setInputEos`/`setOutputEos` — which read the addr off that user
 /// to pick the device's terminator. The addr is threaded here for the same
 /// reason: EOS is per device (see [`crate::port::eos_device_key`]).
 ///
-/// The driver enforces the 2-byte terminator limit and reports
-/// `illegal eoslen N`, so no length check is duplicated here (single owner of
-/// the limit).
+/// The argument is refused here only when it does not fit C's `eos[10]`
+/// buffer (:229-233); the 2-byte terminator limit stays the driver's, which
+/// reports `illegal eoslen N`.
 fn asyn_set_eos(
     mgr: &Arc<PortManager>,
     ctx: &CommandContext,
     args: &[ArgValue],
     set_input: bool,
 ) -> CommandResult {
-    let cmd = if set_input {
-        "asynOctetSetInputEos"
-    } else {
-        "asynOctetSetOutputEos"
-    };
-    let port = arg_str(args, 0).ok_or_else(|| "portName required".to_string())?;
+    let port = arg_str(args, 0)?;
     let addr = arg_int(args, 1).unwrap_or(0) as i32;
-    let eos = raw_from_escaped(&arg_str(args, 2).unwrap_or_default());
-    match mgr.find_port_handle(&port) {
-        Ok(handle) => {
-            // The shell's own user ([`shell_eos_user`]), carrying the device the
-            // command named. This is the *shell* command; the record's IEOS/OEOS
-            // put is queued at Low priority with no waiver (asynRecord.c:1296)
-            // and stays refused on a disconnected port.
-            let user = shell_eos_user(addr);
-            let res = if set_input {
-                handle.set_input_eos_blocking(user, &eos)
-            } else {
-                handle.set_output_eos_blocking(user, &eos)
-            };
-            if let Err(e) = res {
-                ctx.println(&format!("{cmd}: {e}"));
-            }
-        }
-        Err(e) => ctx.println(&format!("{cmd}: {e}")),
+    // C `asynOctetSetInputEos` decodes the argument's bytes as they are.
+    let Some(ArgValue::String(arg)) = args.get(2) else {
+        ctx.println("Missing EOS argument");
+        return Ok(CommandOutcome::Continue);
+    };
+    let eos = raw_from_escaped(arg);
+    // UPSTREAM DEFECT (asynShellCommands.c:231): epicsStrnRawFromEscaped
+    // never counts past dstlen-1 (epicsString.c:57), so C's check cannot
+    // fire and a long EOS is cut to 9 bytes; the refusal is what C means.
+    if eos.len() >= EOS_ARG_SIZE {
+        ctx.println(&format!(
+            "End of string argument \"{}\" too long.",
+            arg.to_str_lossy()
+        ));
+        return Ok(CommandOutcome::Continue);
+    }
+    let Some(handle) = shell_find_interface(mgr, ctx, port.as_deref(), InterfaceType::Octet) else {
+        return Ok(CommandOutcome::Continue);
+    };
+    // The shell's own user ([`shell_eos_user`]), carrying the device the
+    // command named. This is the *shell* command; the record's IEOS/OEOS
+    // put is queued at Low priority with no waiver (asynRecord.c:1296)
+    // and stays refused on a disconnected port.
+    let user = shell_eos_user(addr);
+    let res = if set_input {
+        handle.set_input_eos_blocking(user, &eos)
+    } else {
+        handle.set_output_eos_blocking(user, &eos)
+    };
+    if let Err(e) = res {
+        ctx.println(&format!("Set EOS failed: {}", e.message_display()));
     }
     Ok(CommandOutcome::Continue)
 }
@@ -281,33 +401,328 @@ fn asyn_show_eos(
     args: &[ArgValue],
     get_input: bool,
 ) -> CommandResult {
-    let cmd = if get_input {
-        "asynOctetGetInputEos"
-    } else {
-        "asynOctetGetOutputEos"
-    };
-    let port = arg_str(args, 0).ok_or_else(|| "portName required".to_string())?;
+    let port = arg_str(args, 0)?;
     let addr = arg_int(args, 1).unwrap_or(0) as i32;
-    match mgr.find_port_handle(&port) {
-        Ok(handle) => {
-            let user = shell_eos_user(addr);
-            let res = if get_input {
-                handle.get_input_eos_blocking(user)
-            } else {
-                handle.get_output_eos_blocking(user)
-            };
-            match res {
-                // C `printf("\"%s\"\n", cbuf)` over the escaped terminator.
-                Ok(eos) => ctx.println(&format!(
-                    "\"{}\"",
-                    escaped_from_raw(&eos, SHOW_EOS_BUF_SIZE)
-                )),
-                Err(e) => ctx.println(&format!("Get EOS failed: {e}")),
-            }
-        }
-        Err(e) => ctx.println(&format!("{cmd}: {e}")),
+    let Some(handle) = shell_find_interface(mgr, ctx, port.as_deref(), InterfaceType::Octet) else {
+        return Ok(CommandOutcome::Continue);
+    };
+    let user = shell_eos_user(addr);
+    let res = if get_input {
+        handle.get_input_eos_blocking(user)
+    } else {
+        handle.get_output_eos_blocking(user)
+    };
+    match res {
+        // C `printf("\"%s\"\n", cbuf)` over the escaped terminator.
+        Ok(eos) => ctx.println(&format!(
+            "\"{}\"",
+            escaped_from_raw(&eos, SHOW_EOS_BUF_SIZE)
+        )),
+        // UPSTREAM DEFECT (asynShellCommands.c:301): C's readback
+        // prints "Set EOS failed"; the verb is not copied.
+        Err(e) => ctx.println(&format!("Get EOS failed: {}", e.message_display())),
     }
     Ok(CommandOutcome::Continue)
+}
+
+/// C `READ_TIMEOUT` and `BUFFER_SIZE` (asynShellCommands.c:311-314): what an
+/// `asynOctetConnect` with a zero timeout or buffer length gets.
+const OCTET_DEVICE_TIMEOUT: Duration = Duration::from_secs(1);
+const OCTET_DEVICE_BUFFER: usize = 160;
+
+/// One `asynOctetConnect` entry, C's `asynIOPvt`.
+struct OctetDevice {
+    sio: crate::sync_io::SyncIOHandle,
+    reason: usize,
+    /// `None` is a negative timeout, which C hands on as "wait forever".
+    timeout: Option<Duration>,
+    buffer_len: usize,
+}
+
+impl OctetDevice {
+    fn user(&self) -> AsynUser {
+        self.sio.user(self.reason).with_timeout_opt(self.timeout)
+    }
+
+    fn submit(&self, op: crate::request::RequestOp) -> AsynResult<crate::request::RequestResult> {
+        self.sio.port()?.submit_blocking(op, self.user())
+    }
+
+    fn octet_read(&self, op: crate::request::OctetReadOp) -> crate::request::OctetRead {
+        match self.sio.port() {
+            Ok(port) => port.submit_octet_read_blocking(op, self.user()),
+            Err(e) => crate::request::OctetRead::failed(e),
+        }
+    }
+
+    fn trace_error(&self, args: std::fmt::Arguments<'_>) {
+        self.sio.print(self.reason as i32, TraceMask::ERROR, args);
+    }
+
+    /// C's `nread` clamp (:410-411, :484-485).
+    ///
+    /// UPSTREAM DEFECT (asynShellCommands.c:410-413): a negative count
+    /// passes C's `>` check and reads `(size_t)nread` bytes into the
+    /// buffer; it reads the buffer's length here, as 0 does.
+    fn read_len(&self, nread: i64) -> usize {
+        match usize::try_from(nread) {
+            Ok(n) if n > 0 => n.min(self.buffer_len),
+            _ => self.buffer_len,
+        }
+    }
+
+    /// C's `strlen(output) > write_buffer_len` refusal, then
+    /// `dbTranslateEscape` (:440-447, :475-482).
+    fn translate(&self, output: &[u8]) -> Option<Vec<u8>> {
+        let output = output.split(|&b| b == 0).next().unwrap_or_default();
+        if output.len() > self.buffer_len {
+            self.trace_error(format_args!("Error writing, buffer too small\n"));
+            return None;
+        }
+        Some(raw_from_escaped(output))
+    }
+}
+
+/// C's `asynHash` (asynShellCommands.c:316): the `asynOctetConnect` entries
+/// by device name, process-wide like the shell itself.
+static OCTET_DEVICES: LazyLock<Mutex<HashMap<String, Arc<OctetDevice>>>> =
+    LazyLock::new(Default::default);
+
+/// C `asynFindEntry` and the "Entry not found" every I/O command prints on a
+/// miss.
+fn octet_device(ctx: &CommandContext, entry: Option<&str>) -> Option<Arc<OctetDevice>> {
+    let found = entry.and_then(|e| OCTET_DEVICES.lock().unwrap().get(e).cloned());
+    if found.is_none() {
+        ctx.println("Entry not found");
+    }
+    found
+}
+
+/// C `asynOctetConnect` (asynShellCommands.c:330-361).
+fn octet_connect(mgr: &PortManager, ctx: &CommandContext, args: &[ArgValue]) -> CommandResult {
+    let entry = arg_str(args, 0)?;
+    let port = arg_str(args, 1)?;
+    let addr = arg_int(args, 2).unwrap_or(0) as i32;
+    let timeout = arg_int(args, 3).unwrap_or(0);
+    let buffer_len = arg_int(args, 4).unwrap_or(0);
+    let drv_info = arg_str(args, 5)?;
+    // UPSTREAM DEFECT (asynShellCommands.c:351): C hashes epicsStrDup(NULL)
+    // for a missing name; asynOctetDisconnect's refusal (:373-376) is used.
+    let Some(entry) = entry else {
+        ctx.println("device name not specified");
+        return Ok(CommandOutcome::Continue);
+    };
+    if OCTET_DEVICES.lock().unwrap().contains_key(&entry) {
+        ctx.println("Entry already connected");
+        return Ok(CommandOutcome::Continue);
+    }
+    let connected = shell_connect_device(mgr, port.as_deref()).and_then(|_| {
+        let sio = crate::sync_io::SyncIOHandle::connect(
+            mgr,
+            port.as_deref().unwrap_or_default(),
+            addr,
+            OCTET_DEVICE_TIMEOUT,
+            InterfaceType::Octet,
+        )
+        .map_err(|e| e.message_display().to_string())?;
+        let reason = match &drv_info {
+            Some(info) => sio
+                .drv_user_create(info)
+                .map_err(|e| e.message_display().to_string())?,
+            None => 0,
+        };
+        Ok((sio, reason))
+    });
+    let (sio, reason) = match connected {
+        Ok(c) => c,
+        Err(msg) => {
+            ctx.println(&format!("connect failed {msg}"));
+            return Ok(CommandOutcome::Continue);
+        }
+    };
+    let timeout = match timeout {
+        0 => Some(OCTET_DEVICE_TIMEOUT),
+        t if t < 0 => None,
+        t => Some(Duration::from_secs(t as u64)),
+    };
+    // UPSTREAM DEFECT (asynShellCommands.c:357): a negative length is a
+    // failed calloc C never checks; it gets the default here.
+    let buffer_len = usize::try_from(buffer_len)
+        .ok()
+        .filter(|&n| n > 0)
+        .unwrap_or(OCTET_DEVICE_BUFFER);
+    OCTET_DEVICES.lock().unwrap().insert(
+        entry,
+        Arc::new(OctetDevice {
+            sio,
+            reason,
+            timeout,
+            buffer_len,
+        }),
+    );
+    Ok(CommandOutcome::Continue)
+}
+
+/// C's success print for a read (:420-422, :494-496).
+fn print_octet_read(ctx: &CommandContext, eom: crate::interpose::EomReason, data: &[u8]) {
+    ctx.println(&format!("eomReason {:#x}", eom.bits()));
+    ctx.println(&print_escaped(data));
+}
+
+/// The asynOctet named-device commands (asynShellCommands.c:330-516,
+/// :1010-1085).
+fn octet_device_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
+    use crate::request::{OctetReadOp, RequestOp};
+    let string = |name| ArgDesc {
+        name,
+        arg_type: ArgType::String,
+    };
+    let int = |name| ArgDesc {
+        name,
+        arg_type: ArgType::Int,
+    };
+    vec![
+        CommandDef::new(
+            "asynOctetConnect",
+            vec![
+                string("device name"),
+                string("asyn portName"),
+                int("asyn addr (default=0)"),
+                int("timeout (sec) (default=1)"),
+                int("buffer length (default=80)"),
+                string("drvInfo"),
+            ],
+            "asynOctetConnect device port [addr] [timeout] [buffer length] [drvInfo]",
+            move |args: &[ArgValue], ctx: &CommandContext| octet_connect(&mgr, ctx, args),
+        ),
+        // C asynOctetDisconnect (:363-395). Dropping the entry frees its
+        // user; rs has no drvUser destroy to fail.
+        CommandDef::new(
+            "asynOctetDisconnect",
+            vec![string("device name")],
+            "asynOctetDisconnect device",
+            |args: &[ArgValue], ctx: &CommandContext| {
+                let Some(entry) = arg_str(args, 0)? else {
+                    ctx.println("device name not specified");
+                    return Ok(CommandOutcome::Continue);
+                };
+                if OCTET_DEVICES.lock().unwrap().remove(&entry).is_none() {
+                    ctx.println("device name not found");
+                }
+                Ok(CommandOutcome::Continue)
+            },
+        ),
+        // C asynOctetRead (:396-425).
+        CommandDef::new(
+            "asynOctetRead",
+            vec![string("device name"), int("max. bytes")],
+            "asynOctetRead device [max. bytes]",
+            |args: &[ArgValue], ctx: &CommandContext| {
+                let Some(dev) = octet_device(ctx, arg_str(args, 0)?.as_deref()) else {
+                    return Ok(CommandOutcome::Continue);
+                };
+                let buf_size = dev.read_len(arg_int(args, 1).unwrap_or(0));
+                let read = dev.octet_read(OctetReadOp::Read { buf_size });
+                let eom = read.eom();
+                match read.into_parts() {
+                    (data, Ok(())) => print_octet_read(ctx, eom, &data),
+                    (data, Err(e)) => dev.trace_error(format_args!(
+                        "Error reading, ninp={} error {}\n",
+                        data.len(),
+                        e.message_display()
+                    )),
+                }
+                Ok(CommandOutcome::Continue)
+            },
+        ),
+        // C asynOctetWrite (:427-458).
+        CommandDef::new(
+            "asynOctetWrite",
+            vec![string("device name"), string("output string")],
+            "asynOctetWrite device output",
+            |args: &[ArgValue], ctx: &CommandContext| {
+                let Some(dev) = octet_device(ctx, arg_str(args, 0)?.as_deref()) else {
+                    return Ok(CommandOutcome::Continue);
+                };
+                let output = match args.get(1) {
+                    Some(ArgValue::String(s)) => s.as_bytes().to_vec(),
+                    _ => Vec::new(),
+                };
+                let Some(data) = dev.translate(&output) else {
+                    return Ok(CommandOutcome::Continue);
+                };
+                let len = data.len();
+                if let Err(e) = dev.submit(RequestOp::OctetWrite { data }) {
+                    dev.trace_error(format_args!(
+                        "Error in asynOctetWrite, nout={}, len={len} error {}\n",
+                        e.partial_write().unwrap_or(0),
+                        e.message_display()
+                    ));
+                }
+                Ok(CommandOutcome::Continue)
+            },
+        ),
+        // C asynOctetWriteRead (:460-500). A read that fails after the write
+        // went out reports the whole write, as C's nout does.
+        CommandDef::new(
+            "asynOctetWriteRead",
+            vec![
+                string("device name"),
+                string("output string"),
+                int("max. bytes"),
+            ],
+            "asynOctetWriteRead device output [max. bytes]",
+            |args: &[ArgValue], ctx: &CommandContext| {
+                let Some(dev) = octet_device(ctx, arg_str(args, 0)?.as_deref()) else {
+                    return Ok(CommandOutcome::Continue);
+                };
+                let output = match args.get(1) {
+                    Some(ArgValue::String(s)) => s.as_bytes().to_vec(),
+                    _ => Vec::new(),
+                };
+                let Some(data) = dev.translate(&output) else {
+                    return Ok(CommandOutcome::Continue);
+                };
+                let len = data.len();
+                let buf_size = dev.read_len(arg_int(args, 2).unwrap_or(0));
+                let read = dev.octet_read(OctetReadOp::WriteRead { data, buf_size });
+                let eom = read.eom();
+                match read.into_parts() {
+                    (data, Ok(())) => print_octet_read(ctx, eom, &data),
+                    (data, Err(e)) => {
+                        let nout = match e.octet_step() {
+                            Some(crate::error::OctetStep::Read) => len,
+                            _ => e.partial_write().unwrap_or(0),
+                        };
+                        dev.trace_error(format_args!(
+                            "Error in WriteRead, nout {nout} ninp={} error {}\n",
+                            data.len(),
+                            e.message_display()
+                        ));
+                    }
+                }
+                Ok(CommandOutcome::Continue)
+            },
+        ),
+        // C asynOctetFlush (:502-516).
+        CommandDef::new(
+            "asynOctetFlush",
+            vec![string("device name")],
+            "asynOctetFlush device",
+            |args: &[ArgValue], ctx: &CommandContext| {
+                let Some(dev) = octet_device(ctx, arg_str(args, 0)?.as_deref()) else {
+                    return Ok(CommandOutcome::Continue);
+                };
+                if let Err(e) = dev.submit(RequestOp::Flush) {
+                    dev.trace_error(format_args!(
+                        "Error in asynFlush, status={}\n",
+                        e.c_status_code()
+                    ));
+                }
+                Ok(CommandOutcome::Continue)
+            },
+        ),
+    ]
 }
 
 /// `asynReport` body — walks every registered port (or the named one
@@ -349,35 +764,61 @@ fn enable_style_args() -> Vec<ArgDesc> {
 fn shell_enable_target(
     mgr: &Arc<PortManager>,
     ctx: &CommandContext,
-    cmd: &str,
     args: &[ArgValue],
 ) -> Option<(crate::port_handle::PortHandle, i32, bool)> {
-    let port = arg_str(args, 0).filter(|s| !s.is_empty())?;
+    let port = arg_str(args, 0).ok().flatten();
     let addr = arg_int(args, 1).unwrap_or(0) as i32;
     let yes = arg_int(args, 2).unwrap_or(0) != 0;
-    match mgr.find_port_handle(&port) {
+    match shell_connect_device(mgr, port.as_deref()) {
         Ok(handle) => Some((handle, addr, yes)),
-        Err(e) => {
-            ctx.println(&format!("{cmd}: {e}"));
+        Err(msg) => {
+            ctx.println(&msg);
             None
         }
     }
 }
 
 fn report_ports(mgr: &Arc<PortManager>, level: i32, port: Option<&str>) {
+    // `asynReport` passes `stdout`, the thread's, to `pasynManager->report`
+    // (asynShellCommands.c:589).
+    epics_libcom_rs::epics_print!("{}", ports_report(mgr, level, port));
+}
+
+/// C `pasynManager->report(fp, level, portName)` (asynManager.c:1138-1173):
+/// each port's `reportPrintPort` text, every port when `port` is `None`.
+fn ports_report(mgr: &PortManager, level: i32, port: Option<&str>) -> String {
+    use std::fmt::Write as _;
     let names = match port {
         Some(name) => vec![name.to_string()],
         None => mgr.list_port_names(),
     };
+    let mut out = String::new();
     for name in names {
         match mgr.find_port_handle(&name) {
-            Ok(handle) => {
-                let _ = handle
-                    .report_blocking(level)
-                    .map_err(|e| eprintln!("asynReport {name}: {e}"));
+            // C's report reads the port directly and cannot fail; a port whose
+            // actor is gone says so on the same `fp`.
+            Ok(handle) => match handle.report_blocking(level) {
+                Ok(text) => out.push_str(&text),
+                Err(e) => {
+                    let _ = writeln!(out, "asynReport {name}: {e}");
+                }
+            },
+            // C prints the miss on the report's own `fp` (:1150-1153).
+            Err(_) => {
+                let _ = writeln!(out, "asynManager:report port {name} not found");
             }
-            Err(e) => eprintln!("asynReport: {e}"),
         }
+    }
+    out
+}
+
+/// C drvAsyn.c: the `drvet` asyn.dbd's `driver(drvAsyn)` adds so that
+/// `dbior` prints every port's report.
+struct DrvAsyn(Arc<PortManager>);
+
+impl epics_base_rs::server::driver_support::DriverSupport for DrvAsyn {
+    fn report(&self, level: i32) -> Option<Vec<u8>> {
+        Some(ports_report(&self.0, level, None).into_bytes())
     }
 }
 
@@ -430,7 +871,7 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
             "asynReport [level] [portName] - Report registered ports",
             move |args: &[ArgValue], _ctx: &CommandContext| {
                 let level = arg_int(args, 0).unwrap_or(0) as i32;
-                let port = arg_str(args, 1);
+                let port = arg_str(args, 1)?;
                 report_ports(&mgr_r, level, port.as_deref());
                 Ok(CommandOutcome::Continue)
             },
@@ -462,35 +903,31 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
             ],
             "asynSetOption portName addr key value",
             move |args: &[ArgValue], ctx: &CommandContext| {
-                let port = arg_str(args, 0).ok_or_else(|| "portName required".to_string())?;
+                let port = arg_str(args, 0)?;
                 let addr = arg_int(args, 1).unwrap_or(0) as i32;
-                let key = arg_str(args, 2).ok_or_else(|| "key required".to_string())?;
-                let value = arg_str(args, 3).unwrap_or_default();
+                let (Some(key), Some(value)) = (arg_str(args, 2)?, arg_str(args, 3)?) else {
+                    ctx.println("Missing key/value argument");
+                    return Ok(CommandOutcome::Continue);
+                };
                 // C `asynSetOption` builds its own asynUser and gives it
                 // `timeout = 2` (asynShellCommands.c:119) before queueing the
                 // setOption callback; `addr` rides on the same user, as C's
                 // `findInterface(portName, addr, ...)` connects it to the device.
                 // It queues at `asynQueuePriorityConnect` carrying
-                // `ASYN_REASON_QUEUE_EVEN_IF_NOT_CONNECTED` (:121,:126) — that is
+                // `ASYN_REASON_QUEUE_EVEN_IF_NOT_CONNECTED` (:121,:127) — that is
                 // what lets an `st.cmd` configure a serial line whose device is
                 // not powered on yet.
                 let user = AsynUser::default()
                     .with_addr(addr)
                     .with_timeout(SHELL_IO_TIMEOUT)
                     .queue_even_if_not_connected();
-                match mgr_r.find_port_handle(&port) {
-                    Ok(handle) => match handle.set_option_blocking(user, &key, &value) {
-                        Ok(()) => Ok(CommandOutcome::Continue),
-                        Err(e) => {
-                            ctx.println(&format!("asynSetOption: {e}"));
-                            Ok(CommandOutcome::Continue)
-                        }
-                    },
-                    Err(e) => {
-                        ctx.println(&format!("asynSetOption: {e}"));
-                        Ok(CommandOutcome::Continue)
+                let iface = InterfaceType::Option;
+                if let Some(handle) = shell_find_interface(&mgr_r, ctx, port.as_deref(), iface) {
+                    if let Err(e) = handle.set_option_blocking(user, &key, &value) {
+                        shell_request_failure(ctx, &handle, "setOption failed ", &e);
                     }
                 }
+                Ok(CommandOutcome::Continue)
             },
         ));
     }
@@ -587,6 +1024,9 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
         ));
     }
 
+    // asynOctetConnect and the named-device I/O commands -------------------
+    out.extend(octet_device_commands(mgr.clone()));
+
     // asynInterposeEcho portName addr -------------------------------------
     //
     // C `asynInterposeEcho.c:189-210` registers this so a startup script can
@@ -597,8 +1037,8 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
     //
     // The `addr` names the DEVICE the layer lands on: C hands it to
     // `interposeInterface` (:176), which puts the layer on that device's
-    // `dpCommon.interposeInterfaceList` (asynManager.c:2202-2206), and
-    // `findInterface` resolves a request device-first (:1493-1501). On a port that
+    // `dpCommon.interposeInterfaceList` (asynManager.c:2204-2208), and
+    // `findInterface` resolves a request device-first (:1495-1503). On a port that
     // is not multi-device every addr resolves to the port itself.
     {
         let mgr_r = mgr.clone();
@@ -617,7 +1057,7 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
             "asynInterposeEcho portName [addr] - install the echo interpose \
              (half-duplex devices that echo each char)",
             move |args: &[ArgValue], ctx: &CommandContext| {
-                let port = arg_str(args, 0)
+                let port = arg_str(args, 0)?
                     .filter(|s| !s.is_empty())
                     .ok_or_else(|| "portName required".to_string())?;
                 let addr = arg_int(args, 1).unwrap_or(0) as i32;
@@ -667,7 +1107,7 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
             "asynInterposeDelay portName addr delay(sec) - install the delay \
              interpose (one write per character, delay after each)",
             move |args: &[ArgValue], ctx: &CommandContext| {
-                let port = arg_str(args, 0)
+                let port = arg_str(args, 0)?
                     .filter(|s| !s.is_empty())
                     .ok_or_else(|| "portName required".to_string())?;
                 let addr = arg_int(args, 1).unwrap_or(0) as i32;
@@ -718,9 +1158,9 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
             ],
             "asynShowOption portName addr key - print one driver option",
             move |args: &[ArgValue], ctx: &CommandContext| {
-                let port = arg_str(args, 0).ok_or_else(|| "portName required".to_string())?;
+                let port = arg_str(args, 0)?;
                 let addr = arg_int(args, 1).unwrap_or(0) as i32;
-                let Some(key) = arg_str(args, 2) else {
+                let Some(key) = arg_str(args, 2)? else {
                     // C: "Missing key argument" (:160-163).
                     ctx.println("Missing key argument");
                     return Ok(CommandOutcome::Continue);
@@ -729,12 +1169,12 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
                     .with_addr(addr)
                     .with_timeout(SHELL_IO_TIMEOUT)
                     .queue_even_if_not_connected();
-                match mgr_r.find_port_handle(&port) {
-                    Ok(handle) => match handle.get_option_blocking(user, &key) {
-                        Ok(value) => ctx.println(&format!("{key}={value}")),
-                        Err(e) => ctx.println(&format!("getOption failed {e}")),
-                    },
-                    Err(e) => ctx.println(&format!("asynShowOption: {e}")),
+                let iface = InterfaceType::Option;
+                if let Some(handle) = shell_find_interface(&mgr_r, ctx, port.as_deref(), iface) {
+                    match handle.get_option_blocking(user, &key) {
+                        Ok(value) => callback_println(ctx, &handle, &format!("{key}={value}")),
+                        Err(e) => shell_request_failure(ctx, &handle, "getOption failed ", &e),
+                    }
                 }
                 Ok(CommandOutcome::Continue)
             },
@@ -762,9 +1202,14 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
             ],
             "asynSetTraceIOTruncateSize portName addr size - bytes of each I/O to trace",
             move |args: &[ArgValue], ctx: &CommandContext| {
-                let port = arg_str(args, 0).filter(|s| !s.is_empty());
+                let port = arg_str(args, 0)?.filter(|s| !s.is_empty());
                 let addr = arg_int(args, 1).unwrap_or(-1) as i32;
-                let size = arg_int(args, 2).unwrap_or(0).max(0) as usize;
+                // C's `int size` reaches setTraceIOTruncateSize as a `size_t`,
+                // so a negative one sign-extends into a size it refuses.
+                let typed = arg_int(args, 2).unwrap_or(0) as i32;
+                let size = typed as usize;
+                // UPSTREAM DEFECT (asynShellCommands.c:923): the same
+                // strlen(portName) as asynSetTraceFile; no port name is global.
                 let trace = match trace_for(&mgr_r, port.as_deref()) {
                     Ok(t) => t,
                     Err(e) => {
@@ -775,11 +1220,19 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
                 // Same addr routing as the trace-mask setters: C connects the
                 // asynUser to (port, addr) first, so `addr >= 0` writes the
                 // device's dpCommon and `addr < 0` the port's
-                // (asynManager.c:2945-2959 via findTracePvt).
-                match port.as_deref() {
+                // (asynManager.c:2957-2984 via findTracePvt).
+                let set = match port.as_deref() {
                     Some(p) if addr >= 0 => trace.set_device_io_truncate_size(p, addr, size),
                     Some(p) => trace.set_io_truncate_size(Some(p), size),
                     None => trace.set_io_truncate_size(None, size),
+                };
+                // UPSTREAM DEFECT (asynShellCommands.c:929-931): C prints the
+                // asynUser's errorMessage, which the refusal never writes — a
+                // blank line, or connectDevice's stale text on the global rung.
+                if set.is_err() {
+                    ctx.println(&format!(
+                        "asynSetTraceIOTruncateSize: size {typed} cannot be allocated"
+                    ));
                 }
                 Ok(CommandOutcome::Continue)
             },
@@ -805,23 +1258,30 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
              the named source",
             move |args: &[ArgValue], ctx: &CommandContext| {
                 let (Some(port), Some(function)) = (
-                    arg_str(args, 0).filter(|s| !s.is_empty()),
-                    arg_str(args, 1).filter(|s| !s.is_empty()),
+                    arg_str(args, 0)?.filter(|s| !s.is_empty()),
+                    arg_str(args, 1)?.filter(|s| !s.is_empty()),
                 ) else {
-                    // C's usage line (asynShellCommands.c:1187-1190).
-                    ctx.println("Usage: asynRegisterTimeStampSource portName functionName");
+                    // C's usage line names the command as it once was
+                    // (asynShellCommands.c:1187-1190), as do the two below.
+                    ctx.println("Usage: registerUserTimeStampSource portName functionName");
                     return Ok(CommandOutcome::Continue);
                 };
-                match mgr_r.find_port_handle(&port) {
-                    Ok(handle) => {
-                        if let Err(e) = handle.set_time_stamp_source_blocking(Some(&function)) {
-                            ctx.println(&format!("asynRegisterTimeStampSource: {e}"));
-                        }
-                    }
-                    Err(_) => ctx.println(&format!(
-                        "asynRegisterTimeStampSource, cannot connect to port {port}"
-                    )),
+                let Ok(handle) = mgr_r.find_port_handle(&port) else {
+                    ctx.println(&format!(
+                        "asynRegisterUserStampSource, cannot connect to port {port}"
+                    ));
+                    return Ok(CommandOutcome::Continue);
+                };
+                // C resolves the function in the shell, before the port sees it
+                // (:1197-1201).
+                if crate::timestamp::find_time_stamp_source(&function).is_none() {
+                    ctx.println(&format!(
+                        "asynRegisterUserStampSource, cannot find function {function}"
+                    ));
+                    return Ok(CommandOutcome::Continue);
                 }
+                // C drops registerTimeStampSource's status (:1202).
+                let _ = handle.set_time_stamp_source_blocking(Some(&function));
                 Ok(CommandOutcome::Continue)
             },
         ));
@@ -838,15 +1298,14 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
             }],
             "asynUnregisterTimeStampSource portName - back to the port's default clock",
             move |args: &[ArgValue], ctx: &CommandContext| {
-                let Some(port) = arg_str(args, 0).filter(|s| !s.is_empty()) else {
+                let Some(port) = arg_str(args, 0)?.filter(|s| !s.is_empty()) else {
                     ctx.println("Usage: asynUnregisterTimeStampSource portName");
                     return Ok(CommandOutcome::Continue);
                 };
                 match mgr_r.find_port_handle(&port) {
+                    // C drops unregisterTimeStampSource's status (:1219).
                     Ok(handle) => {
-                        if let Err(e) = handle.set_time_stamp_source_blocking(None) {
-                            ctx.println(&format!("asynUnregisterTimeStampSource: {e}"));
-                        }
+                        let _ = handle.set_time_stamp_source_blocking(None);
                     }
                     Err(_) => ctx.println(&format!(
                         "asynUnregisterTimeStampSource, cannot connect to port {port}"
@@ -876,14 +1335,70 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
         },
     ));
 
+    // asynSetQueueLockPortTimeout portName timeout ------------------------
+    // C asynShellCommands.c:1277-1307 → `setQueueLockPortTimeout`
+    // (asynManager.c:2393-2406): the port's floor for every SyncIO call's
+    // queue deadline.
+    {
+        let mgr_r = mgr.clone();
+        out.push(CommandDef::new(
+            "asynSetQueueLockPortTimeout",
+            vec![
+                ArgDesc {
+                    name: "portName",
+                    arg_type: ArgType::String,
+                },
+                ArgDesc {
+                    name: "timeout",
+                    arg_type: ArgType::Double,
+                },
+            ],
+            "asynSetQueueLockPortTimeout portName timeout - least seconds a SyncIO call \
+             waits in the port's queue (C default 2.0)",
+            move |args: &[ArgValue], ctx: &CommandContext| {
+                match shell_connect_device(&mgr_r, arg_str(args, 0)?.as_deref()) {
+                    Ok(handle) => handle.set_queue_lock_port_timeout(duration_from_secs(
+                        arg_f64(args, 1).unwrap_or(0.0),
+                    )),
+                    Err(msg) => ctx.println(&msg),
+                }
+                Ok(CommandOutcome::Continue)
+            },
+        ));
+    }
+
+    // asynShutdownPort portName --------------------------------------------
+    // C asynShellCommands.c:1323-1343: connectDevice's errorMessage, then
+    // shutdownPort's, each on its own line; silent on success.
+    {
+        let mgr_r = mgr.clone();
+        out.push(CommandDef::new(
+            "asynShutdownPort",
+            vec![ArgDesc {
+                name: "portName",
+                arg_type: ArgType::String,
+            }],
+            "Permanently disables the port and destroys the port driver,\n\
+             releasing its resources.\n",
+            move |args: &[ArgValue], ctx: &CommandContext| {
+                let port = arg_str(args, 0)?;
+                if let Err(msg) = shell_connect_device(&mgr_r, port.as_deref()) {
+                    ctx.println(&msg);
+                } else if let Err(e) = mgr_r.shutdown_port(port.as_deref().unwrap_or_default()) {
+                    ctx.println(&e.message_display().to_string());
+                }
+                Ok(CommandOutcome::Continue)
+            },
+        ));
+    }
+
     // asynWaitConnect portName timeout ------------------------------------
     // C asynShellCommands.c (asynWaitConnect) → pasynManager->waitConnect
-    // (asynManager.c:3292-3336). The st.cmd line that follows a
+    // (asynManager.c:3323-3367). The st.cmd line that follows a
     // drvAsynIPPortConfigure for a slow device: block here until the port is up
     // rather than let the next line's I/O fail on a still-connecting port.
     {
         let mgr_r = mgr.clone();
-        let services_wait = services.clone();
         out.push(CommandDef::new(
             "asynWaitConnect",
             vec![
@@ -897,33 +1412,56 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
                 },
             ],
             "asynWaitConnect portName timeout - block until the port is connected",
-            move |args: &[ArgValue], ctx: &CommandContext| {
-                let port = arg_str(args, 0)
-                    .filter(|s| !s.is_empty())
-                    .ok_or_else(|| "portName required".to_string())?;
+            move |args: &[ArgValue], _ctx: &CommandContext| {
+                let port = arg_str(args, 0)?;
                 let timeout = duration_from_secs(arg_f64(args, 1).unwrap_or(0.0));
-                let handle = match mgr_r.find_port_handle(&port) {
-                    Ok(h) => h,
-                    Err(e) => {
-                        ctx.println(&format!("asynWaitConnect: {e}"));
-                        return Ok(CommandOutcome::Continue);
-                    }
+                let Ok(handle) = shell_connect_device(&mgr_r, port.as_deref()) else {
+                    // An unbound user's asynPrint goes to the global trace;
+                    // printf's "%s" of NULL is glibc's "(null)".
+                    mgr_r.trace_manager().print(
+                        None,
+                        None,
+                        0,
+                        TraceMask::ERROR,
+                        format_args!(
+                            "waitConnect: port={} error calling connectDevice\n",
+                            port.as_deref().unwrap_or("(null)")
+                        ),
+                    );
+                    return Ok(CommandOutcome::Continue);
                 };
+                let port = port.unwrap_or_default();
                 // Arm before the check: a connect landing between the two would
-                // be lost the other way round (C :3313-3316 registers the
+                // be lost the other way round (C :3344-3347 registers the
                 // exception handler before it waits).
-                let waiter = crate::runtime::port::ConnectWaiter::arm(&services_wait, &port);
+                let waiter = crate::runtime::port::ConnectWaiter::arm(&handle.announcer());
                 // `-1`, the PORT's own slot, even on a multi-device port: C's
                 // `waitConnect` resolves `findDpCommon` only to reject an
                 // unbound user, then reads `pport->dpc.connected` explicitly
                 // (asynManager.c:3327-3342). `asynWaitConnect portName` names no
                 // device, and the link it waits for is the port's.
-                if handle.is_connected_blocking(-1).unwrap_or(false) {
-                    return Ok(CommandOutcome::Continue);
-                }
-                if !waiter.wait(timeout) {
-                    ctx.println(&format!("asynWaitConnect: {port} not connected"));
-                }
+                let flow = |args: std::fmt::Arguments<'_>| {
+                    handle
+                        .trace()
+                        .print(Some(&port), None, 0, TraceMask::FLOW, args)
+                };
+                // The manager traces only a wait it actually does
+                // (asynManager.c:3354-3364).
+                let connected = handle.is_connected_blocking(-1).unwrap_or(false) || {
+                    flow(format_args!(
+                        "asynManager:waitConnect port={port} waiting for connection event\n"
+                    ));
+                    let connected = waiter.wait(timeout);
+                    flow(format_args!(
+                        "asynManager:waitConnect port={port} exit, isConnected={}\n",
+                        i32::from(connected)
+                    ));
+                    connected
+                };
+                flow(format_args!(
+                    "waitConnect: port={port} exit, isConnected={}\n",
+                    i32::from(connected)
+                ));
                 Ok(CommandOutcome::Continue)
             },
         ));
@@ -939,25 +1477,25 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
         "asynSetAutoConnectTimeout timeout - seconds a new port waits for its first connect \
          (C default 0.5)",
         move |args: &[ArgValue], _ctx: &CommandContext| {
-            // C `setAutoConnectTimeout` (asynManager.c:2370-2377) writes the
+            // C `setAutoConnectTimeout` (asynManager.c:2375-2391) writes the
             // process-global `pasynBase->autoConnectTimeout`; every port
-            // registered after this line reads the new value (:2135).
-            crate::runtime::config::set_auto_connect_timeout(duration_from_secs(
-                arg_f64(args, 0).unwrap_or(0.0),
-            ));
+            // registered after this line (:2137) and every IP connect
+            // (drvAsynIPPort.c:546) reads the new value.
+            crate::runtime::config::set_auto_connect_timeout(arg_f64(args, 0).unwrap_or(0.0));
             Ok(CommandOutcome::Continue)
         },
     ));
 
     // asynInterposeEosConfig portName addr processIn processOut ------------
     // C asynInterposeEos.c:393-410. The layer `drvAsynIPPortConfigure`
-    // installs by default (:1065) is the same one, with both halves on; this
+    // installs by default (:1119) is the same one, with both halves on; this
     // command is how a port created WITHOUT it (noProcessEos=1, or a serial
     // port) gets EOS processing back, and how a port gets one half only.
     {
         let mgr_r = mgr.clone();
         out.push(CommandDef::new(
             "asynInterposeEosConfig",
+            // C's iocshArgs, and no usage text (asynInterposeEos.c:394-406).
             vec![
                 ArgDesc {
                     name: "portName",
@@ -968,20 +1506,18 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
                     arg_type: ArgType::Int,
                 },
                 ArgDesc {
-                    name: "processIn",
+                    name: "processIn (0,1) => (no,yes)",
                     arg_type: ArgType::Int,
                 },
                 ArgDesc {
-                    name: "processOut",
+                    name: "processOut (0,1) => (no,yes)",
                     arg_type: ArgType::Int,
                 },
             ],
-            "asynInterposeEosConfig portName addr processIn processOut - install the EOS \
-             interpose (terminator handling) on the port",
+            "",
             move |args: &[ArgValue], ctx: &CommandContext| {
-                let port = arg_str(args, 0)
-                    .filter(|s| !s.is_empty())
-                    .ok_or_else(|| "portName required".to_string())?;
+                // An absent name is C's `strlen(NULL)` crash (:93), not copied.
+                let port = arg_str(args, 0)?.ok_or_else(|| "portName required".to_string())?;
                 let addr = arg_int(args, 1).unwrap_or(0) as i32;
                 let process_in = arg_int(args, 2).unwrap_or(0) != 0;
                 let process_out = arg_int(args, 3).unwrap_or(0) != 0;
@@ -993,7 +1529,8 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
                             ctx.println(&format!("{port} interposeInterface failed: {e}"));
                         }
                     }
-                    Err(_) => ctx.println(&format!("{port} interposeInterface failed.")),
+                    // C connects to the port before it interposes (:103-105).
+                    Err(_) => ctx.println(&format!("{port} connectDevice failed")),
                 }
                 Ok(CommandOutcome::Continue)
             },
@@ -1022,7 +1559,7 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
             "asynInterposeFlushConfig portName addr timeout(msec) - install the flush \
              interpose (a read with this timeout drains the input before each write)",
             move |args: &[ArgValue], ctx: &CommandContext| {
-                let port = arg_str(args, 0)
+                let port = arg_str(args, 0)?
                     .filter(|s| !s.is_empty())
                     .ok_or_else(|| "portName required".to_string())?;
                 let addr = arg_int(args, 1).unwrap_or(0) as i32;
@@ -1067,34 +1604,33 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
             ],
             "asynSetTraceMask [portName] [addr] mask",
             move |args: &[ArgValue], ctx: &CommandContext| {
-                let port = arg_str(args, 0).filter(|s| !s.is_empty());
+                let port = arg_str(args, 0)?.filter(|s| !s.is_empty());
                 let addr = arg_int(args, 1).unwrap_or(-1) as i32;
-                let mask_str = arg_str(args, 2).ok_or_else(|| "mask required".to_string())?;
-                match TraceMask::from_symbolic(&mask_str) {
-                    Ok(m) => {
-                        let trace = match trace_for(&mgr_r, port.as_deref()) {
-                            Ok(t) => t,
-                            Err(e) => {
-                                ctx.println(&e);
-                                return Ok(CommandOutcome::Continue);
-                            }
-                        };
-                        if let Some(p) = port.as_deref() {
-                            if addr >= 0 {
-                                trace.set_device_trace_mask(p, addr, m);
-                            } else {
-                                trace.set_trace_mask(Some(p), m);
-                            }
-                        } else {
-                            trace.set_trace_mask(None, m);
-                        }
-                        Ok(CommandOutcome::Continue)
-                    }
-                    Err(e) => {
-                        ctx.println(&format!("asynSetTraceMask: {e}"));
-                        Ok(CommandOutcome::Continue)
-                    }
+                // A missing mask is C's NULL, which reads as 0.
+                let mask_str = arg_str(args, 2)?.unwrap_or_default();
+                let (m, rest) = TraceMask::from_c_mask_string(&mask_str);
+                if !rest.is_empty() {
+                    ctx.println(&format!(
+                        "{TRACE_MASK_USAGE}\nError: Mask string invalid at \"{rest}\""
+                    ));
                 }
+                let trace = match trace_for(&mgr_r, port.as_deref()) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        ctx.println(&e);
+                        return Ok(CommandOutcome::Continue);
+                    }
+                };
+                if let Some(p) = port.as_deref() {
+                    if addr >= 0 {
+                        trace.set_device_trace_mask(p, addr, m);
+                    } else {
+                        trace.set_trace_mask(Some(p), m);
+                    }
+                } else {
+                    trace.set_trace_mask(None, m);
+                }
+                Ok(CommandOutcome::Continue)
             },
         ));
     }
@@ -1120,42 +1656,41 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
             ],
             "asynSetTraceIOMask [portName] [addr] mask",
             move |args: &[ArgValue], ctx: &CommandContext| {
-                let port = arg_str(args, 0).filter(|s| !s.is_empty());
+                let port = arg_str(args, 0)?.filter(|s| !s.is_empty());
                 let addr = arg_int(args, 1).unwrap_or(-1) as i32;
-                let mask_str = arg_str(args, 2).ok_or_else(|| "mask required".to_string())?;
-                match TraceIoMask::from_symbolic(&mask_str) {
-                    Ok(m) => {
-                        let trace = match trace_for(&mgr_r, port.as_deref()) {
-                            Ok(t) => t,
-                            Err(e) => {
-                                ctx.println(&e);
-                                return Ok(CommandOutcome::Continue);
-                            }
-                        };
-                        // C parity: asynShellCommands.c:734-754 calls
-                        // `connectDevice(pasynUser, portName, addr)`
-                        // before `setTraceIOMask`. When `addr >= 0` the
-                        // pasynUser carries a `pdevice`, so
-                        // `setTraceIOMask` (asynManager.c:2830-2833)
-                        // writes the device-specific dpCommon; only
-                        // when `addr < 0` does it fall to the
-                        // every-device + port fallback.
-                        if let Some(p) = port.as_deref() {
-                            if addr >= 0 {
-                                trace.set_device_trace_io_mask(p, addr, m);
-                            } else {
-                                trace.set_trace_io_mask(Some(p), m);
-                            }
-                        } else {
-                            trace.set_trace_io_mask(None, m);
-                        }
-                        Ok(CommandOutcome::Continue)
-                    }
-                    Err(e) => {
-                        ctx.println(&format!("asynSetTraceIOMask: {e}"));
-                        Ok(CommandOutcome::Continue)
-                    }
+                // A missing mask is C's NULL, which reads as 0.
+                let mask_str = arg_str(args, 2)?.unwrap_or_default();
+                let (m, rest) = TraceIoMask::from_c_mask_string(&mask_str);
+                if !rest.is_empty() {
+                    ctx.println(&format!(
+                        "{TRACE_IO_MASK_USAGE}\nError: Mask string invalid at \"{rest}\""
+                    ));
                 }
+                let trace = match trace_for(&mgr_r, port.as_deref()) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        ctx.println(&e);
+                        return Ok(CommandOutcome::Continue);
+                    }
+                };
+                // C parity: asynShellCommands.c:734-754 calls
+                // `connectDevice(pasynUser, portName, addr)`
+                // before `setTraceIOMask`. When `addr >= 0` the
+                // pasynUser carries a `pdevice`, so
+                // `setTraceIOMask` (asynManager.c:2844-2847)
+                // writes the device-specific dpCommon; only
+                // when `addr < 0` does it fall to the
+                // every-device + port fallback.
+                if let Some(p) = port.as_deref() {
+                    if addr >= 0 {
+                        trace.set_device_trace_io_mask(p, addr, m);
+                    } else {
+                        trace.set_trace_io_mask(Some(p), m);
+                    }
+                } else {
+                    trace.set_trace_io_mask(None, m);
+                }
+                Ok(CommandOutcome::Continue)
             },
         ));
     }
@@ -1181,40 +1716,37 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
             ],
             "asynSetTraceInfoMask [portName] [addr] mask",
             move |args: &[ArgValue], ctx: &CommandContext| {
-                let port = arg_str(args, 0).filter(|s| !s.is_empty());
+                let port = arg_str(args, 0)?.filter(|s| !s.is_empty());
                 let addr = arg_int(args, 1).unwrap_or(-1) as i32;
-                let mask_str = arg_str(args, 2).ok_or_else(|| "mask required".to_string())?;
-                match TraceInfoMask::from_symbolic(&mask_str) {
-                    Ok(m) => {
-                        let trace = match trace_for(&mgr_r, port.as_deref()) {
-                            Ok(t) => t,
-                            Err(e) => {
-                                ctx.println(&e);
-                                return Ok(CommandOutcome::Continue);
-                            }
-                        };
-                        // C parity: asynShellCommands.c:799-820 routes
-                        // through `connectDevice(pasynUser, portName, addr)`.
-                        // `setTraceInfoMask` (asynManager.c:2872-2875)
-                        // writes the device-specific dpCommon when
-                        // `pdevice != NULL` (addr >= 0); falls to
-                        // every-device + port otherwise.
-                        if let Some(p) = port.as_deref() {
-                            if addr >= 0 {
-                                trace.set_device_trace_info_mask(p, addr, m);
-                            } else {
-                                trace.set_trace_info_mask(Some(p), m);
-                            }
-                        } else {
-                            trace.set_trace_info_mask(None, m);
-                        }
-                        Ok(CommandOutcome::Continue)
-                    }
-                    Err(e) => {
-                        ctx.println(&format!("asynSetTraceInfoMask: {e}"));
-                        Ok(CommandOutcome::Continue)
-                    }
+                // A missing mask is C's NULL, which reads as 0.
+                let mask_str = arg_str(args, 2)?.unwrap_or_default();
+                let (m, rest) = TraceInfoMask::from_c_mask_string(&mask_str);
+                if !rest.is_empty() {
+                    ctx.println(&format!("Mask string invalid at \"{rest}\""));
                 }
+                let trace = match trace_for(&mgr_r, port.as_deref()) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        ctx.println(&e);
+                        return Ok(CommandOutcome::Continue);
+                    }
+                };
+                // C parity: asynShellCommands.c:799-820 routes
+                // through `connectDevice(pasynUser, portName, addr)`.
+                // `setTraceInfoMask` (asynManager.c:2886-2889)
+                // writes the device-specific dpCommon when
+                // `pdevice != NULL` (addr >= 0); falls to
+                // every-device + port otherwise.
+                if let Some(p) = port.as_deref() {
+                    if addr >= 0 {
+                        trace.set_device_trace_info_mask(p, addr, m);
+                    } else {
+                        trace.set_trace_info_mask(Some(p), m);
+                    }
+                } else {
+                    trace.set_trace_info_mask(None, m);
+                }
+                Ok(CommandOutcome::Continue)
             },
         ));
     }
@@ -1240,20 +1772,11 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
             ],
             "asynSetTraceFile [portName] [addr] [filename]",
             move |args: &[ArgValue], ctx: &CommandContext| {
-                let port = arg_str(args, 0).filter(|s| !s.is_empty());
+                let port = arg_str(args, 0)?.filter(|s| !s.is_empty());
                 let addr = arg_int(args, 1).unwrap_or(-1) as i32;
-                let filename = arg_str(args, 2).unwrap_or_default();
-                let target = match filename.as_str() {
-                    "" | "stderr" => TraceFile::Stderr,
-                    "stdout" => TraceFile::Stdout,
-                    path => match std::fs::File::create(path) {
-                        Ok(f) => TraceFile::File(Arc::new(std::sync::Mutex::new(f))),
-                        Err(e) => {
-                            ctx.println(&format!("asynSetTraceFile: fopen failed: {e}"));
-                            return Ok(CommandOutcome::Continue);
-                        }
-                    },
-                };
+                // UPSTREAM DEFECT (asynShellCommands.c:867): C takes
+                // strlen(portName) after connectDevice fails, so a missing port
+                // name crashes; here it addresses the global trace as "" does.
                 let trace = match trace_for(&mgr_r, port.as_deref()) {
                     Ok(t) => t,
                     Err(e) => {
@@ -1261,9 +1784,25 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
                         return Ok(CommandOutcome::Continue);
                     }
                 };
+                // A missing filename is C's NULL fp, the errlog sink (:872).
+                let target = match arg_str(args, 2)?.as_deref() {
+                    None => TraceFile::Errlog,
+                    Some("" | "stderr") => TraceFile::Stderr,
+                    Some("stdout") => TraceFile::Stdout,
+                    Some(path) => match std::fs::File::create(path) {
+                        Ok(f) => TraceFile::File(Arc::new(std::sync::Mutex::new(f))),
+                        Err(e) => {
+                            ctx.println(&format!(
+                                "fopen failed {}",
+                                epics_base_rs::server::iocsh::c_strerror(&e)
+                            ));
+                            return Ok(CommandOutcome::Continue);
+                        }
+                    },
+                };
                 // C parity: asynShellCommands.c:858-892 routes through
                 // `connectDevice(pasynUser, portName, addr)`. The
-                // `setTraceFile` resolver (asynManager.c:2898-2926)
+                // `setTraceFile` resolver (asynManager.c:2912-2940)
                 // walks `findTracePvt(puserPvt)` which picks the
                 // device-specific `dpCommon` when `pdevice != NULL`.
                 if let Some(p) = port.as_deref() {
@@ -1288,19 +1827,17 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
             enable_style_args(),
             "asynEnable portName addr yesNo - enable (1) or disable (0) a port or one of its devices",
             move |args: &[ArgValue], ctx: &CommandContext| {
-                let (handle, addr, yes) = match shell_enable_target(&mgr_r, ctx, "asynEnable", args)
-                {
-                    Some(t) => t,
-                    None => return Ok(CommandOutcome::Continue),
+                let Some((handle, addr, yes)) = shell_enable_target(&mgr_r, ctx, args) else {
+                    return Ok(CommandOutcome::Continue);
                 };
                 // C `asynEnable` builds a user, `connectDevice(pasynUser,
                 // portName, addr)`s it and calls the single
                 // `pasynManager->enable` (asynShellCommands.c:949-968);
                 // `findDpCommon` inside that call is what makes the addr select
                 // a device or the port. The shell itself does not choose.
-                let r = handle.set_enable_blocking(addr, yes);
+                let r = handle.set_enable(addr, yes);
                 if let Err(e) = r {
-                    ctx.println(&format!("asynEnable: {e}"));
+                    ctx.println(&e.message_display().to_string());
                 }
                 Ok(CommandOutcome::Continue)
             },
@@ -1316,16 +1853,14 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
             "asynAutoConnect portName addr yesNo - turn auto-connect on (1) or off (0) for a port \
              or one of its devices",
             move |args: &[ArgValue], ctx: &CommandContext| {
-                let (handle, addr, yes) =
-                    match shell_enable_target(&mgr_r, ctx, "asynAutoConnect", args) {
-                        Some(t) => t,
-                        None => return Ok(CommandOutcome::Continue),
-                    };
+                let Some((handle, addr, yes)) = shell_enable_target(&mgr_r, ctx, args) else {
+                    return Ok(CommandOutcome::Continue);
+                };
                 // Same shape as `asynEnable` above — C `asynAutoConnect`
                 // (asynShellCommands.c:983-1002): one call, addr on the user.
-                let r = handle.set_auto_connect_blocking(addr, yes);
+                let r = handle.set_auto_connect(addr, yes);
                 if let Err(e) = r {
-                    ctx.println(&format!("asynAutoConnect: {e}"));
+                    ctx.println(&e.message_display().to_string());
                 }
                 Ok(CommandOutcome::Continue)
             },
@@ -1360,15 +1895,13 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
 /// registry so `asynRecord` device support resolves it by name. The
 /// runtime handle is parked in a process-lifetime static.
 ///
-/// `priority` is accepted for startup-script compatibility but has no
-/// effect: the Rust runtime schedules every port actor uniformly
-/// (priority is advisory in C too). `noAutoConnect` and `noProcessEos`
-/// are honored — by default the command installs an EOS interpose (C
-/// `drvAsynIPPort.c:1065-1066` `asynInterposeEosConfig`), and a nonzero
+/// `priority` is the port thread's band, as C's `registerPort` takes it.
+/// `noAutoConnect` and `noProcessEos` are honored — by default the command installs an EOS interpose (C
+/// `drvAsynIPPort.c:1119-1120` `asynInterposeEosConfig`), and a nonzero
 /// `noProcessEos` suppresses it.
 /// Build a configured IP port driver: parse host info, honor
 /// `noAutoConnect`, and install the default EOS interpose unless
-/// `noProcessEos` (C `drvAsynIPPort.c:1065-1066`). Shared by the iocsh
+/// `noProcessEos` (C `drvAsynIPPort.c:1119-1120`). Shared by the iocsh
 /// command and its tests so the install decision has a single owner.
 pub(crate) fn build_configured_ip_port(
     port: &str,
@@ -1407,16 +1940,16 @@ pub fn drv_asyn_ip_port_configure_command(services: PortServices) -> CommandDef 
         "drvAsynIPPortConfigure portName hostInfo [priority] [noAutoConnect] [noProcessEos] \
          - create an IP octet port",
         move |args: &[ArgValue], ctx: &CommandContext| {
-            let port = arg_str(args, 0)
+            let port = arg_str(args, 0)?
                 .filter(|s| !s.is_empty())
                 .ok_or_else(|| "portName required".to_string())?;
-            let host = arg_str(args, 1)
+            let host = arg_str(args, 1)?
                 .filter(|s| !s.is_empty())
                 .ok_or_else(|| "hostInfo required".to_string())?;
             let no_auto_connect = arg_int(args, 3).unwrap_or(0) != 0;
             let no_process_eos = arg_int(args, 4).unwrap_or(0) != 0;
 
-            let driver =
+            let mut driver =
                 match build_configured_ip_port(&port, &host, no_auto_connect, no_process_eos) {
                     Ok(d) => d,
                     Err(e) => {
@@ -1424,15 +1957,36 @@ pub fn drv_asyn_ip_port_configure_command(services: PortServices) -> CommandDef 
                         return Ok(CommandOutcome::Continue);
                     }
                 };
+            // Before the port thread can connect it, as C's runs before the
+            // new port's first connect completes.
+            let restored = driver.restore_com_settings_at_configure();
 
-            if publish_configured_port("drvAsynIPPortConfigure", &port, driver, &services, ctx)
-                .is_none()
+            if publish_configured_port(
+                Refusal::Line("drvAsynIPPortConfigure: Can't register myself."),
+                &port,
+                driver,
+                arg_int(args, 2).unwrap_or(0) as u32,
+                0,
+                &services,
+                ctx,
+            )
+            .is_none()
             {
                 return Ok(CommandOutcome::Continue);
             }
-            ctx.println(&format!(
-                "drvAsynIPPortConfigure: octet port '{port}' -> {host}"
-            ));
+            if let Some(restored) = restored {
+                // asynInterposeCom.c:834-836: the IP port has an asynOption.
+                ctx.println(
+                    "INFO -- asynInterposeCOM options extending and perhaps overriding \
+                     those of lower interface.",
+                );
+                if let Err(e) = restored {
+                    ctx.println(&format!(
+                        "WARNING -- Can't set serial port parameters: {}",
+                        e.message()
+                    ));
+                }
+            }
             Ok(CommandOutcome::Continue)
         },
     )
@@ -1441,15 +1995,14 @@ pub fn drv_asyn_ip_port_configure_command(services: PortServices) -> CommandDef 
 /// Build the `drvAsynIPServerPortConfigure` iocsh command.
 ///
 /// C parity: `drvAsynIPServerPort.c::drvAsynIPServerPortConfigure(portName,
-/// serverInfo, maxClients, priority, noAutoConnect, noProcessEos)` (:523-722),
-/// registered as a 6-argument iocsh command (:727-739). Configure binds the
+/// serverInfo, maxClients, priority, noAutoConnect, noProcessEos)` (:544-743),
+/// registered as a 6-argument iocsh command (:748-760). Configure binds the
 /// listening socket, pre-creates one child port per client slot named
-/// `<parent>:<N>` (:682-708), and starts the `connectionListener` thread
-/// (:711-714) — so by the time `st.cmd` returns from this line, the server is
+/// `<parent>:<N>` (:703-729), and starts the `connectionListener` thread
+/// (:732-735) — so by the time `st.cmd` returns from this line, the server is
 /// accepting and every child port an IOC could bind device support to exists.
 ///
-/// `priority` is accepted for startup-script compatibility but has no effect
-/// (the Rust runtime schedules port actors uniformly).
+/// `priority` is the band of the server's thread and of every child's.
 pub fn drv_asyn_ip_server_port_configure_command(services: PortServices) -> CommandDef {
     CommandDef::new(
         "drvAsynIPServerPortConfigure",
@@ -1482,10 +2035,10 @@ pub fn drv_asyn_ip_server_port_configure_command(services: PortServices) -> Comm
         "drvAsynIPServerPortConfigure portName serverInfo maxClients [priority] \
          [noAutoConnect] [noProcessEos] - create an IP server (listening) port",
         move |args: &[ArgValue], ctx: &CommandContext| {
-            let port = arg_str(args, 0)
+            let port = arg_str(args, 0)?
                 .filter(|s| !s.is_empty())
                 .ok_or_else(|| "portName required".to_string())?;
-            let server_info = arg_str(args, 1)
+            let server_info = arg_str(args, 1)?
                 .filter(|s| !s.is_empty())
                 .ok_or_else(|| "serverInfo required".to_string())?;
             let max_clients = arg_int(args, 2).unwrap_or(0);
@@ -1500,10 +2053,10 @@ pub fn drv_asyn_ip_server_port_configure_command(services: PortServices) -> Comm
                 }
             };
             // C takes maxClients from the shell argument and rejects 0
-            // ("No clients.", drvAsynIPServerPort.c:545-548).
+            // ("No clients.", drvAsynIPServerPort.c:566-569).
             config.max_clients = max_clients.max(0) as usize;
             // C stores noProcessEos on the server and hands it to every child's
-            // `drvAsynIPPortConfigure` (:688-694) — that is its only use. The
+            // `drvAsynIPPortConfigure` (:709-715) — that is its only use. The
             // argument was parsed into the command's arg list and then never
             // read, so a `\n`-terminated client of an IP server never had an EOS
             // layer to terminate on (R19-107).
@@ -1517,10 +2070,18 @@ pub fn drv_asyn_ip_server_port_configure_command(services: PortServices) -> Comm
                 }
             };
             if no_auto_connect {
-                driver.base_mut().auto_connect = false;
+                driver.base_mut().init_auto_connect(false);
+            }
+            // C binds the listening socket on this thread before `registerPort`
+            // (:626), whatever `noAutoConnect` says: that governs only the
+            // server port's own autoConnect (:648).
+            if let Err(e) = driver.create_server_socket() {
+                ctx.println(&e.message());
+                ctx.println("drvAsynIPServerPortConfigure: Error in createServerSocket.");
+                return Ok(CommandOutcome::Continue);
             }
 
-            // The child ports C pre-creates at configure (:682-708) — device
+            // The child ports C pre-creates at configure (:703-729) — device
             // support binds to `<parent>:<N>` before any client has connected.
             let n_children = driver.child_port_names().len();
             let children = (0..n_children)
@@ -1534,49 +2095,50 @@ pub fn drv_asyn_ip_server_port_configure_command(services: PortServices) -> Comm
                 }
             };
 
-            let Some(handle) = publish_configured_port(
-                "drvAsynIPServerPortConfigure",
+            // C hands the server's priority to every child (:711-713).
+            let priority = arg_int(args, 3).unwrap_or(0) as u32;
+            if publish_configured_port(
+                Refusal::Line("drvAsynIPServerPortConfigure: Can't register myself."),
                 &port,
                 driver,
+                priority,
+                0,
                 &services,
                 ctx,
-            ) else {
-                return Ok(CommandOutcome::Continue);
-            };
-            // C binds the listening socket inside configure — `createServerSocket`
-            // at drvAsynIPServerPort.c:605, before `registerPort` and regardless
-            // of `noAutoConnect`, which governs only the *server* port's own
-            // autoConnect (:627); the child ports are created with
-            // `noAutoConnect = 1` unconditionally (:693, and the comment saying
-            // why at :689). So the server is listening when st.cmd moves to
-            // the next line, not when some record first pokes it.
-            if let Err(e) = handle.port_handle().connect_blocking() {
-                ctx.println(&format!(
-                    "drvAsynIPServerPortConfigure: cannot listen on {server_info}: {e}"
-                ));
-                crate::asyn_record::unregister_port(&port);
-                handle.shutdown();
+            )
+            .is_none()
+            {
                 return Ok(CommandOutcome::Continue);
             }
-            drop(handle);
 
             for child in children {
                 let name = child.base().port_name.clone();
                 // C traces and keeps going: a child that cannot be created costs
-                // that slot, not the server (:694-697). The helper has already
+                // that slot, not the server (:715-718). The helper has already
                 // printed and cleaned up whichever way it failed.
-                publish_configured_port(
-                    &format!("drvAsynIPServerPortConfigure: {name}"),
+                // The child is a `drvAsynIPPortConfigure` call (:709), whose
+                // own refusal line comes first, then the server's trace line.
+                if publish_configured_port(
+                    Refusal::Line("drvAsynIPPortConfigure: Can't register myself."),
                     &name,
                     child,
+                    priority,
+                    0,
                     &services,
                     ctx,
-                );
+                )
+                .is_none()
+                {
+                    services.trace().print(
+                        Some(&port),
+                        None,
+                        0,
+                        crate::trace::TraceMask::ERROR,
+                        format_args!("drvAsynIPServerPort: unable to create port {name}\n"),
+                    );
+                }
             }
 
-            ctx.println(&format!(
-                "drvAsynIPServerPortConfigure: server port '{port}' -> {server_info}"
-            ));
             Ok(CommandOutcome::Continue)
         },
     )
@@ -1590,9 +2152,8 @@ pub fn drv_asyn_ip_server_port_configure_command(services: PortServices) -> Comm
 ///
 /// The created port is registered in the [`crate::asyn_record`] port
 /// registry so `asynRecord` device support resolves it by name. As with
-/// the IP command, `priority` is accepted for startup-script
-/// compatibility but has no effect (the Rust runtime schedules port
-/// actors uniformly); `noAutoConnect` and `noProcessEos` are honored —
+/// the IP command, `priority` is the port thread's band; `noAutoConnect`
+/// and `noProcessEos` are honored —
 /// by default an EOS interpose is installed (C
 /// `drvAsynSerialPort.c:1126` enables EOS processing in octetBase),
 /// suppressed by a nonzero `noProcessEos`.
@@ -1600,13 +2161,15 @@ pub fn drv_asyn_ip_server_port_configure_command(services: PortServices) -> Comm
 pub fn drv_asyn_serial_port_configure_command(services: PortServices) -> CommandDef {
     CommandDef::new(
         "drvAsynSerialPortConfigure",
+        // C's iocshArgs, and no usage text (drvAsynSerialPort.c:1145-1155,
+        // drvAsynSerialPortWin32.c:818-828).
         vec![
             ArgDesc {
-                name: "portName",
+                name: "port name",
                 arg_type: ArgType::String,
             },
             ArgDesc {
-                name: "ttyName",
+                name: "tty name",
                 arg_type: ArgType::String,
             },
             ArgDesc {
@@ -1614,7 +2177,7 @@ pub fn drv_asyn_serial_port_configure_command(services: PortServices) -> Command
                 arg_type: ArgType::Int,
             },
             ArgDesc {
-                name: "noAutoConnect",
+                name: "disable auto-connect",
                 arg_type: ArgType::Int,
             },
             ArgDesc {
@@ -1622,15 +2185,18 @@ pub fn drv_asyn_serial_port_configure_command(services: PortServices) -> Command
                 arg_type: ArgType::Int,
             },
         ],
-        "drvAsynSerialPortConfigure portName ttyName [priority] [noAutoConnect] [noProcessEos] \
-         - create a serial octet port",
+        "",
         move |args: &[ArgValue], ctx: &CommandContext| {
-            let port = arg_str(args, 0)
-                .filter(|s| !s.is_empty())
-                .ok_or_else(|| "portName required".to_string())?;
-            let tty = arg_str(args, 1)
-                .filter(|s| !s.is_empty())
-                .ok_or_else(|| "ttyName required".to_string())?;
+            // C tests only for an absent argument (drvAsynSerialPort.c:1046-1053);
+            // an empty one goes on to configure.
+            let Some(port) = arg_str(args, 0)? else {
+                ctx.println("Port name missing.");
+                return Ok(CommandOutcome::Continue);
+            };
+            let Some(tty) = arg_str(args, 1)? else {
+                ctx.println("TTY name missing.");
+                return Ok(CommandOutcome::Continue);
+            };
             let no_auto_connect = arg_int(args, 3).unwrap_or(0) != 0;
             let no_process_eos = arg_int(args, 4).unwrap_or(0) != 0;
 
@@ -1643,14 +2209,19 @@ pub fn drv_asyn_serial_port_configure_command(services: PortServices) -> Command
                     }
                 };
 
-            if publish_configured_port("drvAsynSerialPortConfigure", &port, driver, &services, ctx)
-                .is_none()
+            if publish_configured_port(
+                Refusal::Line("drvAsynSerialPortConfigure: Can't register myself."),
+                &port,
+                driver,
+                arg_int(args, 2).unwrap_or(0) as u32,
+                0,
+                &services,
+                ctx,
+            )
+            .is_none()
             {
                 return Ok(CommandOutcome::Continue);
             }
-            ctx.println(&format!(
-                "drvAsynSerialPortConfigure: octet port '{port}' -> {tty}"
-            ));
             Ok(CommandOutcome::Continue)
         },
     )
@@ -1659,15 +2230,14 @@ pub fn drv_asyn_serial_port_configure_command(services: PortServices) -> Command
 /// Build the `prologixGPIBConfigure` iocsh command.
 ///
 /// C parity: `drvPrologixGPIB.c::prologixGPIBConfigure(portName, host,
-/// priority, noAutoConnect)` (lines 547-628). `host` may be `"hostname"`
-/// (the bridge's fixed `:1234 TCP` is appended) or `"hostname:port"`; see
+/// priority, noAutoConnect)` (lines 547-603). `host` may be `"hostname"`
+/// (the bridge's fixed `:1234 TCP` is appended, :571) or `"hostname:port"`; see
 /// [`DrvAsynPrologixPort::new`]. The created GPIB port is registered in the
 /// [`crate::asyn_record`] port registry so `asynRecord` device support
 /// resolves it by name.
 ///
-/// As with the IP/serial commands, `priority` is accepted for startup-script
-/// compatibility but has no effect (the Rust runtime schedules port actors
-/// uniformly); `noAutoConnect` is honored. There is no `noProcessEos` arg —
+/// As with the IP/serial commands, `priority` is the port thread's band;
+/// `noAutoConnect` is honored. There is no `noProcessEos` arg —
 /// the prologix driver owns EOS itself (it passes `noProcessEos=1` to its
 /// inner `_TCP` IP port, mirroring C's `drvAsynIPPortConfigure(... 1)` at
 /// drvPrologixGPIB.c:575).
@@ -1695,10 +2265,10 @@ pub fn drv_asyn_prologix_port_configure_command(services: PortServices) -> Comma
         "prologixGPIBConfigure portName host [priority] [noAutoConnect] \
          - create a Prologix GPIB-Ethernet port",
         move |args: &[ArgValue], ctx: &CommandContext| {
-            let port = arg_str(args, 0)
+            let port = arg_str(args, 0)?
                 .filter(|s| !s.is_empty())
                 .ok_or_else(|| "portName required".to_string())?;
-            let host = arg_str(args, 1)
+            let host = arg_str(args, 1)?
                 .filter(|s| !s.is_empty())
                 .ok_or_else(|| "host required".to_string())?;
             let no_auto_connect = arg_int(args, 3).unwrap_or(0) != 0;
@@ -1711,71 +2281,129 @@ pub fn drv_asyn_prologix_port_configure_command(services: PortServices) -> Comma
                 }
             };
 
-            if publish_configured_port("prologixGPIBConfigure", &port, driver, &services, ctx)
-                .is_none()
+            if publish_configured_port(
+                Refusal::Gpib,
+                &port,
+                driver,
+                arg_int(args, 2).unwrap_or(0) as u32,
+                0,
+                &services,
+                ctx,
+            )
+            .is_none()
             {
                 return Ok(CommandOutcome::Continue);
             }
-            ctx.println(&format!(
-                "prologixGPIBConfigure: GPIB port '{port}' -> {host}"
-            ));
             Ok(CommandOutcome::Continue)
         },
     )
 }
 
+/// How a `*Configure` command's driver reaches `registerPort`: directly
+/// through the manager with its own refusal line, or through `asynGpib`.
+enum Refusal<'a> {
+    Line(&'a str),
+    Gpib,
+}
+
+/// The prologix and vxi11 drivers' line when `pasynGpib->registerPort`
+/// returns NULL (drvPrologixGPIB.c:600, drvVxi11.c:1764).
+const GPIB_REFUSAL: &str = "registerPort failed";
+
+/// C `gpibPvtList`: the port names `asynGpib` has accepted.
+static GPIB_PORTS: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(Default::default);
+
 /// The single path a `*Configure` shell command uses to turn a freshly built
 /// driver into a live, named, traceable port — C's `registerPort`, which is the
-/// sole entry into the port list (asynManager.c:2045, adding the port at
-/// :2094). Binding the
+/// sole entry into the port list (asynManager.c:2047, adding the port at
+/// :2096). Binding the
 /// port to its trace configuration and exception list happens inside
 /// [`create_port_runtime`], driven by the services passed here, so a port an
 /// st.cmd builds is traceable from the moment it exists.
 ///
+/// `refusal` is the driver's own C line, printed on stdout when
+/// `registerPort` refuses; C prints no cause beyond the manager's own line.
+/// A GPIB driver goes through `asynGpib`'s `registerPort` first, which refuses
+/// a name already on its own list before the manager is reached.
+///
 /// `None` means **no port was published**, for either reason C has: the runtime
-/// thread could not be created (asynManager.c:2082-2092), or the name is
+/// thread could not be created (asynManager.c:2083-2093), or the name is
 /// already taken. Both have already printed the diagnostic and torn down
 /// whatever was half-built, so the caller has nothing to clean up and only has
 /// to stop — C's `drvAsynIPPortConfigure: Can't register myself.` / `ttyCleanup`
-/// / `return -1` (drvAsynIPPort.c:1033-1035).
+/// / `return -1` (drvAsynIPPort.c:1087-1089).
 ///
 /// `Some` hands back the runtime handle for the callers that need it (the
 /// server port binds its listening socket through it). Callers that do not may
 /// drop it: the registry above holds a live `PortHandle`, and that is what
 /// keeps the actor alive.
 fn publish_configured_port<D: PortDriver>(
-    command: &str,
+    refusal: Refusal<'_>,
     port: &str,
     driver: D,
+    priority: u32,
+    stack_size: usize,
     services: &PortServices,
     ctx: &CommandContext,
 ) -> Option<PortRuntimeHandle> {
+    let refusal = match refusal {
+        Refusal::Line(line) => line,
+        Refusal::Gpib => {
+            // asynGpib.c:571-576, then the driver's own refusal line; the
+            // name joins the list before the manager is asked (:597).
+            if !GPIB_PORTS.lock().unwrap().insert(port.to_string()) {
+                ctx.println(&format!(
+                    "asynGpib:registerDriver {port} already registered"
+                ));
+                ctx.println(GPIB_REFUSAL);
+                return None;
+            }
+            GPIB_REFUSAL
+        }
+    };
+    // Before the port thread exists: an actor would auto-connect a refused
+    // duplicate to its device (C's registerPort creates the thread).
+    let Ok(claim) = crate::asyn_record::claim_port(port) else {
+        ctx.println(refusal);
+        return None;
+    };
     let config = RuntimeConfig {
         services: services.clone(),
+        priority,
+        stack_size,
         ..RuntimeConfig::default()
     };
-    let (handle, _jh) = match create_port_runtime(driver, config) {
+    let (handle, _jh) = match create_port_runtime(&claim, driver, config) {
         Ok(v) => v,
-        Err(e) => {
-            ctx.println(&format!("{command}: {e}"));
+        Err(_) => {
+            ctx.println(refusal);
             return None;
         }
     };
-    if let Err(e) = crate::asyn_record::register_port(port, handle.port_handle().clone()) {
-        ctx.println(&format!("{command}: {e}"));
+    if claim
+        .publish(
+            handle.port_handle().clone(),
+            ctx.db().scan_control().interrupt_gate(),
+        )
+        .is_err()
+    {
+        ctx.println(refusal);
         handle.shutdown();
         return None;
     }
     Some(handle)
 }
 
+/// C `drvAsynFTDIPort` registers its port thread with a 500000-byte stack
+/// (drvAsynFTDIPort.cpp:586-590).
+const FTDI_STACK_SIZE: usize = 500_000;
+
 /// Build the `drvAsynFTDIPortConfigure` iocsh command.
 ///
 /// C parity: `drvAsynFTDIPort.cpp:641-660` — nine positional args
 /// (`portName`, `vendorID`, `productID`, `baudrate`, `latency`, `priority`,
 /// `noAutoConnect`, `noProcessEos`, `mode`), all but the name integers.
-/// `priority` is accepted for startup-script compatibility but has no effect
-/// (the Rust runtime schedules port actors uniformly).
+/// `priority` is the port thread's band.
 pub fn drv_asyn_ftdi_port_configure_command(services: PortServices) -> CommandDef {
     let int_args = [
         "vendorID",
@@ -1801,7 +2429,33 @@ pub fn drv_asyn_ftdi_port_configure_command(services: PortServices) -> CommandDe
         "drvAsynFTDIPortConfigure portName vendorID productID baudrate latency [priority] \
          [noAutoConnect] [noProcessEos] [mode] - create an FTDI octet port",
         move |args: &[ArgValue], ctx: &CommandContext| {
-            let port = arg_str(args, 0)
+            // drvAsynFTDIPort.cpp:522-526, before any argument is checked.
+            let mode = arg_int(args, 8).unwrap_or(0) as i32;
+            ctx.println(&format!(
+                "drvAsynFTDIPortConfigure: latency={}",
+                arg_int(args, 4).unwrap_or(0) as i32
+            ));
+            ctx.println(&format!(
+                "drvAsynFTDIPortConfigure: priority={}",
+                arg_int(args, 5).unwrap_or(0) as u32
+            ));
+            ctx.println(&format!(
+                "drvAsynFTDIPortConfigure: noAutoconnect={}",
+                arg_int(args, 6).unwrap_or(0) as i32
+            ));
+            ctx.println(&format!(
+                "drvAsynFTDIPortConfigure: noProcessEos={}",
+                arg_int(args, 7).unwrap_or(0) as i32
+            ));
+            ctx.println(&format!(
+                "drvAsynFTDIPortConfigure: mode={}",
+                if mode & crate::drivers::ftdi::UART_SPI_BIT != 0 {
+                    "SPI"
+                } else {
+                    "UART"
+                }
+            ));
+            let port = arg_str(args, 0)?
                 .filter(|s| !s.is_empty())
                 .ok_or_else(|| "portName required".to_string())?;
             let driver = match DrvAsynFtdiPort::configure(
@@ -1813,7 +2467,7 @@ pub fn drv_asyn_ftdi_port_configure_command(services: PortServices) -> CommandDe
                 arg_int(args, 5).unwrap_or(0) as u32,
                 arg_int(args, 6).unwrap_or(0) != 0,
                 arg_int(args, 7).unwrap_or(0) != 0,
-                arg_int(args, 8).unwrap_or(0) as i32,
+                mode,
             ) {
                 Ok(d) => d,
                 Err(e) => {
@@ -1821,13 +2475,15 @@ pub fn drv_asyn_ftdi_port_configure_command(services: PortServices) -> CommandDe
                     return Ok(CommandOutcome::Continue);
                 }
             };
-            if publish_configured_port("drvAsynFTDIPortConfigure", &port, driver, &services, ctx)
-                .is_some()
-            {
-                ctx.println(&format!(
-                    "drvAsynFTDIPortConfigure: FTDI port '{port}' created"
-                ));
-            }
+            publish_configured_port(
+                Refusal::Line("drvAsynFTDIPortConfigure: Can't register myself."),
+                &port,
+                driver,
+                arg_int(args, 5).unwrap_or(0) as u32,
+                FTDI_STACK_SIZE,
+                &services,
+                ctx,
+            );
             Ok(CommandOutcome::Continue)
         },
     )
@@ -1838,8 +2494,7 @@ pub fn drv_asyn_ftdi_port_configure_command(services: PortServices) -> CommandDe
 /// C parity: `drvVxi11.c:1789-1802` — seven positional args (`portName`,
 /// `host name`, `flags`, `default timeout`, `vxiName`, `priority`,
 /// `disable auto-connect`). `default timeout` is a *string* in C, parsed by the
-/// driver, so it is a string here too. `priority` has no effect in the Rust
-/// runtime.
+/// driver, so it is a string here too. `priority` is the port thread's band.
 pub fn vxi11_configure_command(services: PortServices) -> CommandDef {
     CommandDef::new(
         "vxi11Configure",
@@ -1876,18 +2531,18 @@ pub fn vxi11_configure_command(services: PortServices) -> CommandDef {
         "vxi11Configure portName hostName [flags] [defaultTimeout] [vxiName] [priority] \
          [noAutoConnect] - create a VXI-11 port",
         move |args: &[ArgValue], ctx: &CommandContext| {
-            let port = arg_str(args, 0)
+            let port = arg_str(args, 0)?
                 .filter(|s| !s.is_empty())
                 .ok_or_else(|| "portName required".to_string())?;
-            let host = arg_str(args, 1)
+            let host = arg_str(args, 1)?
                 .filter(|s| !s.is_empty())
                 .ok_or_else(|| "hostName required".to_string())?;
             let driver = match DrvVxi11Port::configure(
                 &port,
                 &host,
                 arg_int(args, 2).unwrap_or(0) as i32,
-                &arg_str(args, 3).unwrap_or_default(),
-                &arg_str(args, 4).unwrap_or_default(),
+                &arg_str(args, 3)?.unwrap_or_default(),
+                &arg_str(args, 4)?.unwrap_or_default(),
                 arg_int(args, 5).unwrap_or(0) as i32,
                 arg_int(args, 6).unwrap_or(0) != 0,
             ) {
@@ -1897,9 +2552,15 @@ pub fn vxi11_configure_command(services: PortServices) -> CommandDef {
                     return Ok(CommandOutcome::Continue);
                 }
             };
-            if publish_configured_port("vxi11Configure", &port, driver, &services, ctx).is_some() {
-                ctx.println(&format!("vxi11Configure: VXI-11 port '{port}' -> {host}"));
-            }
+            publish_configured_port(
+                Refusal::Gpib,
+                &port,
+                driver,
+                arg_int(args, 5).unwrap_or(0) as u32,
+                0,
+                &services,
+                ctx,
+            );
             Ok(CommandOutcome::Continue)
         },
     )
@@ -1910,8 +2571,8 @@ pub fn vxi11_configure_command(services: PortServices) -> CommandDef {
 /// C parity: `drvAsynUSBTMC.c:1332-1345` — six positional args (`port name`,
 /// `vendor ID number`, `product ID number`, `serial string`, `priority`,
 /// `flags`). A vendor/product of 0 is C's "take the first USBTMC device found",
-/// and an empty serial string is "any serial number". `priority` has no effect
-/// in the Rust runtime.
+/// and an empty serial string is "any serial number". `priority` is the port
+/// thread's band.
 pub fn usbtmc_configure_command(services: PortServices) -> CommandDef {
     CommandDef::new(
         "usbtmcConfigure",
@@ -1944,14 +2605,14 @@ pub fn usbtmc_configure_command(services: PortServices) -> CommandDef {
         "usbtmcConfigure portName [vendorID] [productID] [serialNumber] [priority] [flags] \
          - create a USBTMC port",
         move |args: &[ArgValue], ctx: &CommandContext| {
-            let port = arg_str(args, 0)
+            let port = arg_str(args, 0)?
                 .filter(|s| !s.is_empty())
                 .ok_or_else(|| "portName required".to_string())?;
             let driver = match DrvAsynUsbtmcPort::configure(
                 &port,
                 arg_int(args, 1).unwrap_or(0) as i32,
                 arg_int(args, 2).unwrap_or(0) as i32,
-                &arg_str(args, 3).unwrap_or_default(),
+                &arg_str(args, 3)?.unwrap_or_default(),
                 arg_int(args, 4).unwrap_or(0) as i32,
                 arg_int(args, 5).unwrap_or(0) as i32,
             ) {
@@ -1961,9 +2622,26 @@ pub fn usbtmc_configure_command(services: PortServices) -> CommandDef {
                     return Ok(CommandOutcome::Continue);
                 }
             };
-            if publish_configured_port("usbtmcConfigure", &port, driver, &services, ctx).is_some() {
-                ctx.println(&format!("usbtmcConfigure: USBTMC port '{port}' created"));
+            // drvAsynUSBTMC.c:1243-1252.
+            let vendor_id = arg_int(args, 1).unwrap_or(0) as i32;
+            let product_id = arg_int(args, 2).unwrap_or(0) as i32;
+            if arg_str(args, 3)?.unwrap_or_default().is_empty() {
+                ctx.println(&match (vendor_id, product_id) {
+                    (0, 0) => "No device information specified.  Will connect to first USB TMC device found.".to_string(),
+                    (0, p) => format!("Will connect to first USB TMC device found with product ID {p:#06x}."),
+                    (v, 0) => format!("Will connect to first USB TMC device found with vendor ID {v:#06x}."),
+                    (v, p) => format!("Will connect to first USB TMC device found with vendor ID {v:#06x} and product ID {p:#06x}."),
+                });
             }
+            publish_configured_port(
+                Refusal::Line("registerPort failed"),
+                &port,
+                driver,
+                arg_int(args, 4).unwrap_or(0) as u32,
+                0,
+                &services,
+                ctx,
+            );
             Ok(CommandOutcome::Continue)
         },
     )
@@ -1972,21 +2650,63 @@ pub fn usbtmc_configure_command(services: PortServices) -> CommandDef {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::error::AsynResult;
+    use crate::error::{AsynError, AsynResult, AsynStatus};
     use crate::exception::AsynException;
     use crate::param::ParamType;
+    use crate::port::InterfaceMask;
     use crate::port::{PortDriver, PortDriverBase, PortFlags};
     use crate::user::AsynUser;
     use std::sync::Mutex;
 
+    #[test]
+    fn a_double_argument_has_no_text() {
+        assert_eq!(arg_str(&[ArgValue::Double(0.5)], 0), Ok(None));
+    }
+
+    /// C `report` writes a missing port's line to the report's `fp`
+    /// (asynManager.c:1150-1153), the stream an `asynReport` redirect captures.
+    #[test]
+    fn a_missing_port_is_reported_in_the_report_text() {
+        let mgr = PortManager::new();
+        assert_eq!(
+            ports_report(&mgr, 0, Some("no_such_port")),
+            "asynManager:report port no_such_port not found\n"
+        );
+    }
+
+    #[test]
+    fn a_port_that_cannot_report_says_so_in_the_report_text() {
+        let mgr = PortManager::new();
+        let rt = mgr
+            .register_port_unclaimed(
+                DummyDriver::new("gone_port"),
+                &crate::registry::open_owner(),
+            )
+            .unwrap();
+        rt.shutdown_and_wait();
+        let text = ports_report(&mgr, 0, Some("gone_port"));
+        assert!(text.starts_with("asynReport gone_port: "), "{text:?}");
+    }
+
+    /// Keeps its options, as a real driver does; the base keeps none.
     struct DummyDriver {
         base: PortDriverBase,
+        options: std::collections::HashMap<String, String>,
     }
     impl DummyDriver {
         fn new(name: &str) -> Self {
-            let mut base = PortDriverBase::new(name, 1, PortFlags::default());
+            let mut base = PortDriverBase::new(
+                name,
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_INTERRUPTS,
+            );
             base.create_param("VAL", ParamType::Int32).unwrap();
-            Self { base }
+            Self {
+                base,
+                options: Default::default(),
+            }
         }
     }
     impl PortDriver for DummyDriver {
@@ -1995,6 +2715,16 @@ mod tests {
         }
         fn base_mut(&mut self) -> &mut PortDriverBase {
             &mut self.base
+        }
+        fn get_option(&self, user: &AsynUser, key: &str) -> AsynResult<String> {
+            match self.options.get(key) {
+                Some(value) => Ok(value.clone()),
+                None => self.base.read_option(user, key),
+            }
+        }
+        fn set_option(&mut self, _user: &mut AsynUser, key: &str, value: &str) -> AsynResult<()> {
+            self.options.insert(key.to_owned(), value.to_owned());
+            Ok(())
         }
     }
 
@@ -2010,6 +2740,13 @@ mod tests {
             d
         }
 
+        /// An `ASYN_CANBLOCK` port, where a SyncIO call queues.
+        fn blocking(name: &str) -> Self {
+            let mut d = Self::new(name);
+            d.base.flags.can_block = true;
+            d
+        }
+
         /// A multi-device port — the other half of C's `findDpCommon` split.
         fn multi_device(name: &str, max_addr: usize) -> Self {
             let mut base = PortDriverBase::new(
@@ -2019,9 +2756,14 @@ mod tests {
                     multi_device: true,
                     ..PortFlags::default()
                 },
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_INTERRUPTS,
             );
             base.create_param("VAL", ParamType::Int32).unwrap();
-            Self { base }
+            Self {
+                base,
+                options: Default::default(),
+            }
         }
     }
 
@@ -2036,7 +2778,13 @@ mod tests {
     impl OctetDriver {
         fn new(name: &str, input: &[u8], written: Arc<Mutex<Vec<u8>>>) -> Self {
             Self {
-                base: PortDriverBase::new(name, 1, PortFlags::default()),
+                base: PortDriverBase::new(
+                    name,
+                    1,
+                    PortFlags::default(),
+                    InterfaceMask::UNMIGRATED_ALL,
+                    InterfaceMask::UNMIGRATED_INTERRUPTS,
+                ),
                 input: input.to_vec(),
                 pos: 0,
                 written,
@@ -2050,11 +2798,15 @@ mod tests {
         fn base_mut(&mut self) -> &mut PortDriverBase {
             &mut self.base
         }
-        fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+        fn io_read_octet(
+            &mut self,
+            _user: &AsynUser,
+            buf: &mut [u8],
+        ) -> crate::interpose::OctetReadResult {
             let n = (self.input.len() - self.pos).min(buf.len());
             buf[..n].copy_from_slice(&self.input[self.pos..self.pos + n]);
             self.pos += n;
-            Ok(n)
+            crate::interpose::OctetReadResult::ok(n, crate::interpose::EomReason::empty())
         }
         fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
             self.written.lock().unwrap().extend_from_slice(data);
@@ -2064,18 +2816,23 @@ mod tests {
 
     fn fresh_mgr_with_port(name: &str) -> Arc<PortManager> {
         let mgr = Arc::new(PortManager::new());
-        let _ = mgr.register_port(DummyDriver::new(name)).unwrap();
+        let _ = mgr
+            .register_port_unclaimed(DummyDriver::new(name), &crate::registry::open_owner())
+            .unwrap();
         mgr
     }
 
     /// The same, for a port that carries `ASYN_MULTIDEVICE`. An `addr`
     /// names a device only on such a port — `locateDevice` returns NULL
-    /// otherwise (asynManager.c:574) — so every per-device trace routing
+    /// otherwise (asynManager.c:576) — so every per-device trace routing
     /// test has to build its port this way.
     fn fresh_mgr_with_multi_device_port(name: &str, max_addr: usize) -> Arc<PortManager> {
         let mgr = Arc::new(PortManager::new());
         let _ = mgr
-            .register_port(DummyDriver::multi_device(name, max_addr))
+            .register_port_unclaimed(
+                DummyDriver::multi_device(name, max_addr),
+                &crate::registry::open_owner(),
+            )
             .unwrap();
         mgr
     }
@@ -2088,7 +2845,7 @@ mod tests {
         let mgr = fresh_mgr_with_port("trace_mask_port");
 
         // Subscribe to exception events so we can verify the per-set
-        // announce fires (asynManager.c:2790).
+        // announce fires (asynManager.c:2804).
         let observed: Arc<Mutex<Vec<AsynException>>> = Arc::new(Mutex::new(Vec::new()));
         let observed_clone = observed.clone();
         mgr.exception_manager().add_callback(move |ev| {
@@ -2109,7 +2866,7 @@ mod tests {
         // exercised via the round-trip through the registered command.
         let trace = mgr.trace_manager().clone();
         // simulate: asynSetTraceMask "trace_mask_port" -1 "ERROR+WARNING"
-        let mask = TraceMask::from_symbolic("ERROR+WARNING").unwrap();
+        let (mask, _) = TraceMask::from_c_mask_string("ERROR+WARNING");
         trace.set_trace_mask(Some("trace_mask_port"), mask);
 
         // The registered set itself is guarded by
@@ -2142,7 +2899,7 @@ mod tests {
         // command means adding it here; a C command still missing is a gap this
         // list names by its absence.
         let mut expected = vec![
-            // asynShellCommands.c:1352-1378
+            // asynShellCommands.c:1354-1380
             "asynReport",
             "asynSetOption",
             "asynSetTraceMask",
@@ -2158,10 +2915,18 @@ mod tests {
             "asynRegisterTimeStampSource",
             "asynUnregisterTimeStampSource",
             "asynSetMinTimerPeriod",
+            "asynSetQueueLockPortTimeout",
+            "asynOctetConnect",
+            "asynOctetDisconnect",
+            "asynOctetRead",
+            "asynOctetWrite",
+            "asynOctetWriteRead",
+            "asynOctetFlush",
             "asynOctetSetInputEos",
             "asynOctetGetInputEos",
             "asynOctetSetOutputEos",
             "asynOctetGetOutputEos",
+            "asynShutdownPort",
             // interpose layers
             "asynInterposeEcho",
             "asynInterposeDelay",
@@ -2180,9 +2945,24 @@ mod tests {
         assert_eq!(names, expected);
     }
 
+    /// asynShutdownPortUsage verbatim (asynShellCommands.c:1312-1314).
+    #[test]
+    fn asyn_shutdown_port_usage_is_c_s() {
+        let cmds = build_asyn_commands(Arc::new(PortManager::new()));
+        let def = cmds
+            .iter()
+            .find(|c| c.name == "asynShutdownPort")
+            .expect("registered");
+        assert_eq!(
+            def.usage,
+            "Permanently disables the port and destroys the port driver,\n\
+             releasing its resources.\n"
+        );
+    }
+
     /// R19-120: `asynSetTraceIOTruncateSize` routes `addr` the way every other
     /// trace setter does — device dpCommon when `addr >= 0`, port when `addr <
-    /// 0` (C asynManager.c:2945-2959 via `findTracePvt`).
+    /// 0` (C asynManager.c:2957-2984 via `findTracePvt`).
     #[test]
     fn iocsh_set_trace_io_truncate_size_routes_addr_to_the_device() {
         let mgr = fresh_mgr_with_multi_device_port("trunc_port", 8);
@@ -2206,12 +2986,84 @@ mod tests {
         };
 
         set(-1, 40);
-        assert_eq!(trace.snapshot("trunc_port", None).io_truncate_size, 40);
+        assert_eq!(
+            trace.snapshot(Some("trunc_port"), None).io_truncate_size,
+            40
+        );
 
         // addr >= 0 writes the device, not the port.
         set(2, 4096);
-        assert_eq!(trace.snapshot("trunc_port", Some(2)).io_truncate_size, 4096);
-        assert_eq!(trace.snapshot("trunc_port", None).io_truncate_size, 40);
+        assert_eq!(
+            trace.snapshot(Some("trunc_port"), Some(2)).io_truncate_size,
+            4096
+        );
+        assert_eq!(
+            trace.snapshot(Some("trunc_port"), None).io_truncate_size,
+            40
+        );
+    }
+
+    /// C hands `int size` to `setTraceIOTruncateSize` as a `size_t`, so a
+    /// negative size is one `calloc` refuses and nothing changes
+    /// (asynShellCommands.c:916-931, asynManager.c:2963-2975); the shell
+    /// clamped it to 0 and wrote that.
+    #[test]
+    fn iocsh_set_trace_io_truncate_size_refuses_a_negative_size() {
+        let mgr = fresh_mgr_with_multi_device_port("trunc_neg_port", 8);
+        let trace = mgr.trace_manager().clone();
+        let out = shell_output(
+            mgr,
+            &[
+                "asynSetTraceIOTruncateSize trunc_neg_port -1 40",
+                "asynSetTraceIOTruncateSize trunc_neg_port -1 -1",
+            ],
+        );
+        assert_eq!(
+            trace
+                .snapshot(Some("trunc_neg_port"), None)
+                .io_truncate_size,
+            40
+        );
+        assert_eq!(
+            out,
+            "asynSetTraceIOTruncateSize: size -1 cannot be allocated\n"
+        );
+    }
+
+    /// C `queueLockPort` queues with `max(queueLockPortTimeout, timeout)`
+    /// (asynManager.c:1894-1896); `asynSetQueueLockPortTimeout` sets the
+    /// port's half (asynShellCommands.c:1284-1307, asynManager.c:2393-2406).
+    #[test]
+    fn iocsh_set_queue_lock_port_timeout_floors_the_syncio_deadline() {
+        use crate::sync_io::SyncIOHandle;
+        use std::time::Duration;
+
+        let mgr = Arc::new(PortManager::new());
+        mgr.register_port_unclaimed(
+            DummyDriver::blocking("qlp_port"),
+            &crate::registry::open_owner(),
+        )
+        .unwrap();
+        let handle = mgr.find_port_handle("qlp_port").unwrap();
+        let deadline = |timeout_ms| {
+            SyncIOHandle::from_handle(handle.clone(), 0, Duration::from_millis(timeout_ms))
+                .user(0)
+                .queue_timeout()
+        };
+        assert_eq!(deadline(200), Some(Duration::from_secs(2)), "C default");
+
+        let cmds = build_asyn_commands(mgr);
+        cmds.iter()
+            .find(|c| c.name == "asynSetQueueLockPortTimeout")
+            .expect("asynSetQueueLockPortTimeout must be registered")
+            .handler
+            .call(
+                &[ArgValue::String("qlp_port".into()), ArgValue::Double(0.5)],
+                &make_ctx(),
+            )
+            .unwrap();
+        assert_eq!(deadline(200), Some(Duration::from_millis(500)));
+        assert_eq!(deadline(1000), Some(Duration::from_millis(1000)));
     }
 
     /// R19-120: `asynShowOption` prints `key=value` for a driver option
@@ -2315,7 +3167,7 @@ mod tests {
     /// connected — whether it was connected before the call or connects during
     /// it — and gives up after the timeout otherwise.
     ///
-    /// C `waitConnect` (asynManager.c:3292-3336) arms the connect exception
+    /// C `waitConnect` (asynManager.c:3323-3367) arms the connect exception
     /// handler and only then reads the connected flag, so the connect that
     /// lands in between is not lost. The three boundaries here are exactly
     /// that: already-connected, connects-during-the-wait, never-connects.
@@ -2330,10 +3182,18 @@ mod tests {
             ..RuntimeConfig::default()
         };
         let _ = mgr
-            .register_port_with_config(DummyDriver::disconnected("wc_late"), cfg.clone())
+            .register_port_unclaimed_with_config(
+                DummyDriver::disconnected("wc_late"),
+                cfg.clone(),
+                &crate::registry::open_owner(),
+            )
             .unwrap();
         let _ = mgr
-            .register_port_with_config(DummyDriver::disconnected("wc_never"), cfg)
+            .register_port_unclaimed_with_config(
+                DummyDriver::disconnected("wc_never"),
+                cfg,
+                &crate::registry::open_owner(),
+            )
             .unwrap();
 
         let cmds = build_asyn_commands(mgr.clone());
@@ -2390,10 +3250,76 @@ mod tests {
         );
     }
 
+    /// asynWaitConnect prints nothing on the console: a port it cannot connect
+    /// to is an ERROR trace on the unbound user, so the global trace
+    /// (asynShellCommands.c:562-567), and the outcome is a FLOW trace on the
+    /// port (:569-572).
+    #[test]
+    fn wait_connect_reports_through_the_trace() {
+        let mgr = Arc::new(PortManager::new());
+        let cfg = RuntimeConfig {
+            auto_connect: false,
+            services: mgr.services().clone(),
+            ..RuntimeConfig::default()
+        };
+        mgr.register_port_unclaimed_with_config(
+            DummyDriver::disconnected("wc2_never"),
+            cfg,
+            &crate::registry::open_owner(),
+        )
+        .unwrap();
+        let sink = || {
+            let f = tempfile::NamedTempFile::new().unwrap();
+            let file = TraceFile::File(Arc::new(std::sync::Mutex::new(f.reopen().unwrap())));
+            (f, file)
+        };
+        let (global_out, global_file) = sink();
+        mgr.trace_manager().set_trace_file(None, global_file);
+        let (port_out, port_file) = sink();
+        let port_trace = crate::registry::get_port("wc2_never")
+            .unwrap()
+            .handle
+            .trace()
+            .clone();
+        port_trace.set_trace_file(Some("wc2_never"), port_file);
+        port_trace.set_trace_mask(Some("wc2_never"), TraceMask::ERROR | TraceMask::FLOW);
+        assert_eq!(
+            shell_output(
+                mgr,
+                &[
+                    r#"asynWaitConnect("wc2_nosuch", 0.05)"#,
+                    r#"asynWaitConnect()"#,
+                    r#"asynWaitConnect("wc2_never", 0.05)"#,
+                ]
+            ),
+            ""
+        );
+        let global = std::fs::read_to_string(global_out.path()).unwrap();
+        assert!(
+            global.contains("waitConnect: port=wc2_nosuch error calling connectDevice\n")
+                && global.contains("waitConnect: port=(null) error calling connectDevice\n"),
+            "{global:?}"
+        );
+        // The manager's two FLOW lines (asynManager.c:3354-3364), then the
+        // shell's (asynShellCommands.c:572-574).
+        let port = std::fs::read_to_string(port_out.path()).unwrap();
+        let at = |line: &str| {
+            port.find(line)
+                .unwrap_or_else(|| panic!("{line:?} in {port:?}"))
+        };
+        let waiting = at("asynManager:waitConnect port=wc2_never waiting for connection event\n");
+        let manager = at("asynManager:waitConnect port=wc2_never exit, isConnected=0\n");
+        let shell = at(" waitConnect: port=wc2_never exit, isConnected=0\n");
+        assert!(waiting < manager && manager < shell, "{port:?}");
+        // waitConnect reads dpc.connected under asynManagerLock: nothing
+        // passes through portThread (asynManager.c:3339-3341).
+        assert!(!port.contains("portThread"), "{port:?}");
+    }
+
     /// R19-117: `asynSetAutoConnectTimeout` rewrites the value a newly
     /// registered port waits for its first connect — C's process-global
-    /// `pasynBase->autoConnectTimeout` (asynManager.c:2370-2377), read at every
-    /// port registration (:2135). It was hard-coded at 0.5 s, which is too
+    /// `pasynBase->autoConnectTimeout` (asynManager.c:2375-2382), read at every
+    /// port registration (:2137). It was hard-coded at 0.5 s, which is too
     /// short for a slow device and was the reason C exposes the knob.
     #[test]
     fn iocsh_set_auto_connect_timeout_rewrites_the_registration_wait() {
@@ -2431,6 +3357,78 @@ mod tests {
         );
     }
 
+    /// `help` prints a command's iocshArg names and its usage text
+    /// (iocsh.cpp:950-972); C registers these two with names of its own and no
+    /// usage (asynInterposeEos.c:394-406, drvAsynSerialPort.c:1145-1155).
+    #[test]
+    fn help_shows_c_argument_names_and_no_usage() {
+        let synopsis = |cmd: &CommandDef| {
+            (
+                cmd.args.iter().map(|a| a.name).collect::<Vec<_>>(),
+                cmd.usage.clone(),
+            )
+        };
+        let cmds = build_asyn_commands(Arc::new(PortManager::new()));
+        let eos = cmds
+            .iter()
+            .find(|c| c.name == "asynInterposeEosConfig")
+            .expect("asynInterposeEosConfig must be registered");
+        assert_eq!(
+            synopsis(eos),
+            (
+                vec![
+                    "portName",
+                    "addr",
+                    "processIn (0,1) => (no,yes)",
+                    "processOut (0,1) => (no,yes)",
+                ],
+                String::new()
+            )
+        );
+        #[cfg(asyn_serial_backend)]
+        assert_eq!(
+            synopsis(&drv_asyn_serial_port_configure_command(PortServices::new())),
+            (
+                vec![
+                    "port name",
+                    "tty name",
+                    "priority",
+                    "disable auto-connect",
+                    "noProcessEos",
+                ],
+                String::new()
+            )
+        );
+    }
+
+    /// asynInterposeEos.c:103-105: a port `connectDevice` cannot find, an
+    /// empty name among them, prints C's line and the shell goes on.
+    #[test]
+    fn eos_config_on_an_unknown_port_prints_c_connect_device_line() {
+        const CHILD: &str = "ASYN_RS_EOS_CONFIG_UNKNOWN_CHILD";
+        const TEST: &str =
+            "iocsh::tests::eos_config_on_an_unknown_port_prints_c_connect_device_line";
+        if std::env::var_os(CHILD).is_some() {
+            let cmds = build_asyn_commands(Arc::new(PortManager::new()));
+            let cmd = cmds
+                .iter()
+                .find(|c| c.name == "asynInterposeEosConfig")
+                .expect("asynInterposeEosConfig must be registered");
+            println!("---begin");
+            call_configure(cmd, &[ArgValue::String("eos_no_such_port".into())]);
+            call_configure(cmd, &[ArgValue::String("".into())]);
+            println!("---end");
+            return;
+        }
+        let (stdout, _) = run_child(TEST, CHILD);
+        let begin = stdout.find("---begin\n").expect("marker") + "---begin\n".len();
+        let end = stdout.find("---end").expect("marker");
+        assert_eq!(
+            &stdout[begin..end],
+            "eos_no_such_port connectDevice failed\n connectDevice failed\n"
+        );
+    }
+
     /// R19-118 boundary: `asynInterposeEosConfig` installs the EOS layer from
     /// the shell, and its two flags each gate exactly one direction.
     ///
@@ -2445,11 +3443,10 @@ mod tests {
         let mgr = Arc::new(PortManager::new());
         let written = Arc::new(Mutex::new(Vec::new()));
         let _ = mgr
-            .register_port(OctetDriver::new(
-                "eos_cfg",
-                b"line1\nline2\n",
-                written.clone(),
-            ))
+            .register_port_unclaimed(
+                OctetDriver::new("eos_cfg", b"line1\nline2\n", written.clone()),
+                &crate::registry::open_owner(),
+            )
             .unwrap();
         let cmds = build_asyn_commands(mgr.clone());
         let ctx = make_ctx();
@@ -2474,7 +3471,7 @@ mod tests {
             .set_input_eos_blocking(shell_eos_user(0), b"\n")
             .unwrap();
         // processOut = 0 gates C's `writeIt` alone (asynInterposeEos.c:161-163):
-        // `setOutputEos` (:344-363) and `getOutputEos` (:365-390) carry no
+        // `setOutputEos` (:345-364) and `getOutputEos` (:366-391) carry no
         // `processEosOut` test at all, so the terminator is stored, answered
         // asynSuccess and read back — it is simply never appended. A startup
         // script that sets OEOS and reads it back therefore succeeds, which is
@@ -2494,10 +3491,11 @@ mod tests {
         let user = AsynUser::default()
             .with_addr(0)
             .with_timeout(SHELL_IO_TIMEOUT);
-        let first = handle
-            .submit_blocking(crate::request::RequestOp::OctetRead { buf_size: 32 }, user)
-            .unwrap();
-        assert_eq!(first.data.as_deref(), Some(&b"line1"[..]));
+        let (first, status) = handle
+            .submit_octet_read_blocking(crate::request::OctetReadOp::Read { buf_size: 32 }, user)
+            .into_parts();
+        status.unwrap();
+        assert_eq!(first, b"line1");
 
         // processOut = 0: the write is handed to the driver verbatim — the
         // output terminator is NOT appended, even though OEOS is set.
@@ -2522,7 +3520,10 @@ mod tests {
         let mgr = Arc::new(PortManager::new());
         let written = Arc::new(Mutex::new(Vec::new()));
         let _ = mgr
-            .register_port(OctetDriver::new("flush_cfg", b"stale", written.clone()))
+            .register_port_unclaimed(
+                OctetDriver::new("flush_cfg", b"stale", written.clone()),
+                &crate::registry::open_owner(),
+            )
             .unwrap();
         let cmds = build_asyn_commands(mgr.clone());
         let ctx = make_ctx();
@@ -2558,11 +3559,13 @@ mod tests {
         let user = AsynUser::default()
             .with_addr(0)
             .with_timeout(SHELL_IO_TIMEOUT);
-        let after = handle
-            .submit_blocking(crate::request::RequestOp::OctetRead { buf_size: 16 }, user)
-            .unwrap();
+        let (after, status) = handle
+            .submit_octet_read_blocking(crate::request::OctetReadOp::Read { buf_size: 16 }, user)
+            .into_parts();
+        status.unwrap();
         assert_eq!(
-            after.nbytes, 0,
+            after.len(),
+            0,
             "the flush layer must have drained the driver's stale input"
         );
 
@@ -2583,14 +3586,22 @@ mod tests {
 
     /// R19-116: `asynEnable` / `asynAutoConnect` exist on the shell, and they
     /// pick port-level vs device-level state by C's `findDpCommon` rule
-    /// (asynManager.c:536-544) — a device only when the port is multi-device
+    /// (asynManager.c:538-546) — a device only when the port is multi-device
     /// AND the caller named one.
     #[test]
     fn iocsh_enable_and_autoconnect_follow_c_find_dp_common() {
         let mgr = Arc::new(PortManager::new());
-        let _ = mgr.register_port(DummyDriver::new("edp_single")).unwrap();
         let _ = mgr
-            .register_port(DummyDriver::multi_device("edp_multi", 2))
+            .register_port_unclaimed(
+                DummyDriver::new("edp_single"),
+                &crate::registry::open_owner(),
+            )
+            .unwrap();
+        let _ = mgr
+            .register_port_unclaimed(
+                DummyDriver::multi_device("edp_multi", 2),
+                &crate::registry::open_owner(),
+            )
             .unwrap();
 
         let seen: Arc<Mutex<Vec<(String, AsynException, i32)>>> = Arc::new(Mutex::new(Vec::new()));
@@ -2599,7 +3610,7 @@ mod tests {
             seen_cb
                 .lock()
                 .unwrap()
-                .push((ev.port_name.clone(), ev.exception, ev.addr));
+                .push((ev.port_name.to_string(), ev.exception, ev.addr));
         });
 
         let cmds = build_asyn_commands(mgr.clone());
@@ -2667,23 +3678,23 @@ mod tests {
     /// commands depend on this for st.cmd terminators.
     #[test]
     fn raw_from_escaped_decodes_c_escapes() {
-        assert_eq!(raw_from_escaped(r"\r\n"), vec![b'\r', b'\n']);
-        assert_eq!(raw_from_escaped(r"\t"), vec![b'\t']);
-        assert_eq!(raw_from_escaped(r"\\"), vec![b'\\']);
-        assert_eq!(raw_from_escaped("AB"), vec![b'A', b'B']);
+        assert_eq!(raw_from_escaped(br"\r\n"), vec![b'\r', b'\n']);
+        assert_eq!(raw_from_escaped(br"\t"), vec![b'\t']);
+        assert_eq!(raw_from_escaped(br"\\"), vec![b'\\']);
+        assert_eq!(raw_from_escaped(b"AB"), vec![b'A', b'B']);
         // \xXX hex escape: two digits, then a single digit.
-        assert_eq!(raw_from_escaped(r"\x41"), vec![0x41]);
-        assert_eq!(raw_from_escaped(r"\x4"), vec![0x04]);
+        assert_eq!(raw_from_escaped(br"\x41"), vec![0x41]);
+        assert_eq!(raw_from_escaped(br"\x4"), vec![0x04]);
         // Unknown escape → the escaped char passes through (C `default:`).
-        assert_eq!(raw_from_escaped(r"\z"), vec![b'z']);
+        assert_eq!(raw_from_escaped(br"\z"), vec![b'z']);
         // \0 → NUL byte.
-        assert_eq!(raw_from_escaped(r"\0"), vec![0]);
+        assert_eq!(raw_from_escaped(br"\0"), vec![0]);
         // Trailing lone backslash with no following char is dropped (C break).
-        assert_eq!(raw_from_escaped(r"a\"), vec![b'a']);
+        assert_eq!(raw_from_escaped(br"a\"), vec![b'a']);
         // \x with no hex digit emits nothing; the char is reprocessed as
         // ordinary input (C `goto input`).
-        assert_eq!(raw_from_escaped(r"\xg"), vec![b'g']);
-        assert!(raw_from_escaped("").is_empty());
+        assert_eq!(raw_from_escaped(br"\xg"), vec![b'g']);
+        assert!(raw_from_escaped(b"").is_empty());
     }
 
     /// The EOS shell commands hand their `asynUser` C's 2 s I/O deadline.
@@ -2708,7 +3719,7 @@ mod tests {
             user.reason,
             crate::user::ASYN_REASON_QUEUE_EVEN_IF_NOT_CONNECTED,
             "C asynSetEos stamps ASYN_REASON_QUEUE_EVEN_IF_NOT_CONNECTED \
-             (asynShellCommands.c:241)"
+             (asynShellCommands.c:240)"
         );
         assert_eq!(
             user.timeout,
@@ -2751,10 +3762,19 @@ mod tests {
 
         let rec = Recorded::default();
         let mgr = Arc::new(PortManager::new());
-        mgr.register_port(RecordingDriver {
-            base: PortDriverBase::new("eos_port", 1, PortFlags::default()),
-            rec: rec.clone(),
-        })
+        mgr.register_port_unclaimed(
+            RecordingDriver {
+                base: PortDriverBase::new(
+                    "eos_port",
+                    1,
+                    PortFlags::default(),
+                    InterfaceMask::UNMIGRATED_ALL,
+                    InterfaceMask::UNMIGRATED_INTERRUPTS,
+                ),
+                rec: rec.clone(),
+            },
+            &crate::registry::open_owner(),
+        )
         .unwrap();
 
         let ctx = make_ctx();
@@ -2769,9 +3789,9 @@ mod tests {
             .handler
             .call(
                 &[
-                    ArgValue::String("eos_port".to_string()),
+                    ArgValue::String("eos_port".into()),
                     ArgValue::Int(0),
-                    ArgValue::String(r"\r\n".to_string()),
+                    ArgValue::String(r"\r\n".into()),
                 ],
                 &ctx,
             )
@@ -2792,9 +3812,9 @@ mod tests {
             .handler
             .call(
                 &[
-                    ArgValue::String("eos_port".to_string()),
+                    ArgValue::String("eos_port".into()),
                     ArgValue::Int(0),
-                    ArgValue::String(r"\n".to_string()),
+                    ArgValue::String(r"\n".into()),
                 ],
                 &ctx,
             )
@@ -2806,10 +3826,517 @@ mod tests {
         );
     }
 
+    /// Run `lines` through a real iocsh carrying the asyn commands on `mgr`,
+    /// returning what they printed to stdout.
+    fn shell_output(mgr: Arc<PortManager>, lines: &[&str]) -> String {
+        let ctx = make_ctx();
+        let shell =
+            epics_base_rs::server::iocsh::IocShell::new(ctx.db().clone(), ctx.bridge().clone());
+        for def in build_asyn_commands(mgr) {
+            shell.register(def);
+        }
+        let out = tempfile::NamedTempFile::new().unwrap();
+        // iocsh, as C's, reads an unquoted `\` as an escape (iocsh.cpp:275),
+        // so a Windows path goes in with the `/` Windows also takes.
+        let path = out.path().display().to_string().replace('\\', "/");
+        for line in lines {
+            shell.execute_line(format!("{line} >> {path}")).unwrap();
+        }
+        std::fs::read_to_string(out.path()).unwrap()
+    }
+
+    /// A port with the default driver hooks under `name`.
+    fn shell_test_base(name: &str) -> PortDriverBase {
+        PortDriverBase::new(
+            name,
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
+        )
+    }
+
+    /// asynSetOption / asynShowOption print what C's do (asynShellCommands.c:
+    /// 101, 112-118, 128, 147-149, 160-166) and reach the port through
+    /// findInterface (:74-89).
+    #[test]
+    fn option_shell_commands_print_cs_lines() {
+        struct OptPort {
+            base: PortDriverBase,
+        }
+        impl PortDriver for OptPort {
+            fn base(&self) -> &PortDriverBase {
+                &self.base
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.base
+            }
+            fn set_option(&mut self, _: &mut AsynUser, key: &str, _: &str) -> AsynResult<()> {
+                Err(AsynError::Status {
+                    status: AsynStatus::Error,
+                    message: format!("opt_port unknown key {key}"),
+                })
+            }
+            fn get_option(&self, _: &AsynUser, key: &str) -> AsynResult<String> {
+                match key {
+                    "baud" => Ok("9600".into()),
+                    _ => Err(AsynError::Status {
+                        status: AsynStatus::Error,
+                        message: format!("opt_port unknown key {key}"),
+                    }),
+                }
+            }
+        }
+        struct NoOptPort {
+            base: PortDriverBase,
+        }
+        impl PortDriver for NoOptPort {
+            fn base(&self) -> &PortDriverBase {
+                &self.base
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.base
+            }
+            fn capabilities(&self) -> Vec<crate::interfaces::Capability> {
+                InterfaceMask::COMMON
+                    .or(InterfaceMask::OCTET)
+                    .capabilities()
+            }
+        }
+        let mgr = Arc::new(PortManager::new());
+        let owner = crate::registry::open_owner();
+        let opt = |name| OptPort {
+            base: shell_test_base(name),
+        };
+        mgr.register_port_unclaimed(opt("opt_port"), &owner)
+            .unwrap();
+        mgr.register_port_unclaimed(opt("opt_off"), &owner).unwrap();
+        mgr.register_port_unclaimed(
+            NoOptPort {
+                base: shell_test_base("opt_none"),
+            },
+            &owner,
+        )
+        .unwrap();
+        mgr.find_port_handle("opt_off")
+            .unwrap()
+            .set_enable(-1, false)
+            .unwrap();
+        assert_eq!(
+            shell_output(
+                mgr,
+                &[
+                    r#"asynSetOption("opt_port", 0, "parity")"#,
+                    r#"asynSetOption("opt_port", 0, "parity", "none")"#,
+                    r#"asynSetOption("opt_nosuch", 0, "parity", "none")"#,
+                    r#"asynSetOption("opt_none", 0, "parity", "none")"#,
+                    r#"asynSetOption("opt_off", 0, "parity", "none")"#,
+                    r#"asynShowOption("opt_port", 0)"#,
+                    r#"asynShowOption("opt_port", 0, "baud")"#,
+                    r#"asynShowOption("opt_port", 0, "stop")"#,
+                    r#"asynShowOption("opt_none", 0, "baud")"#,
+                    r#"asynShowOption("opt_off", 0, "baud")"#,
+                    r#"asynShowOption()"#,
+                ]
+            ),
+            "Missing key/value argument\n\
+             setOption failed opt_port unknown key parity\n\
+             Port opt_nosuch connectDevice failed: \
+             asynManager:connectDevice port opt_nosuch not found\n\
+             Port opt_none does not provide required asynOption interface\n\
+             queueRequest failed: port opt_off disabled\n\
+             Missing key argument\n\
+             baud=9600\n\
+             getOption failed opt_port unknown key stop\n\
+             Port opt_none does not provide required asynOption interface\n\
+             queueRequest failed: port opt_off disabled\n\
+             Missing key argument\n"
+        );
+    }
+
+    /// C prints a failed EOS command as `Set EOS failed: <errorMessage>`
+    /// (asynShellCommands.c:250, :301) and an unknown port through
+    /// findInterface's `Port %s connectDevice failed: %s` (:80). An IP port with
+    /// noProcessEos takes no terminator (mythen's `IP_M1K`).
+    #[test]
+    fn eos_shell_failures_print_cs_lines() {
+        struct NoEosPort {
+            base: PortDriverBase,
+        }
+        impl PortDriver for NoEosPort {
+            fn base(&self) -> &PortDriverBase {
+                &self.base
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.base
+            }
+        }
+        let mgr = Arc::new(PortManager::new());
+        mgr.register_port_unclaimed(
+            NoEosPort {
+                base: PortDriverBase::new(
+                    "eos_refusing",
+                    1,
+                    PortFlags::default(),
+                    InterfaceMask::UNMIGRATED_ALL,
+                    InterfaceMask::UNMIGRATED_INTERRUPTS,
+                ),
+            },
+            &crate::registry::open_owner(),
+        )
+        .unwrap();
+        assert_eq!(
+            shell_output(
+                mgr,
+                &[
+                    r#"asynOctetSetOutputEos("eos_refusing", 0, "\r")"#,
+                    r#"asynOctetSetInputEos("eos_refusing", 0, "\n")"#,
+                    r#"asynOctetSetOutputEos("eos_nosuch", 0, "\r")"#,
+                    r#"asynOctetGetInputEos("eos_nosuch", 0)"#,
+                ]
+            ),
+            "Set EOS failed: eos_refusing setOutputEos not implemented\n\
+             Set EOS failed: eos_refusing setInputEos not implemented\n\
+             Port eos_nosuch connectDevice failed: \
+             asynManager:connectDevice port eos_nosuch not found\n\
+             Port eos_nosuch connectDevice failed: \
+             asynManager:connectDevice port eos_nosuch not found\n"
+        );
+    }
+
+    /// asynSetEos checks its argument before it looks for the port
+    /// (asynShellCommands.c:226-233): a missing EOS and one that does not fit
+    /// C's `eos[10]` are refused with C's lines.
+    #[test]
+    fn eos_argument_failures_print_cs_lines() {
+        let mgr = Arc::new(PortManager::new());
+        assert_eq!(
+            shell_output(
+                mgr,
+                &[
+                    r#"asynOctetSetInputEos("eosarg_nosuch", 0)"#,
+                    r#"asynOctetSetOutputEos("eosarg_nosuch", 0, "0123456789")"#,
+                    r#"asynOctetSetOutputEos("eosarg_nosuch", 0, "012345678")"#,
+                ]
+            ),
+            "Missing EOS argument\n\
+             End of string argument \"0123456789\" too long.\n\
+             Port eosarg_nosuch connectDevice failed: \
+             asynManager:connectDevice port eosarg_nosuch not found\n"
+        );
+    }
+
+    /// A driver with no EOS methods answers the get side with asynOctetBase's
+    /// Fail stubs (asynOctetBase.c:116, :118, :405-415) unless an EOS layer
+    /// holds the terminator; asynInterposeEos delegates getInputEos down when
+    /// processEosIn is off (asynInterposeEos.c:319-322) and always holds the
+    /// output terminator (:366-391).
+    #[test]
+    fn get_eos_without_a_layer_prints_the_fail_stub() {
+        struct NoEosPort {
+            base: PortDriverBase,
+        }
+        impl PortDriver for NoEosPort {
+            fn base(&self) -> &PortDriverBase {
+                &self.base
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.base
+            }
+        }
+        let mgr = Arc::new(PortManager::new());
+        for name in ["geos_none", "geos_half"] {
+            mgr.register_port_unclaimed(
+                NoEosPort {
+                    base: shell_test_base(name),
+                },
+                &crate::registry::open_owner(),
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            shell_output(
+                mgr,
+                &[
+                    r#"asynOctetGetInputEos("geos_none", 0)"#,
+                    r#"asynOctetGetOutputEos("geos_none", 0)"#,
+                    r#"asynInterposeEosConfig("geos_half", 0, 0, 1)"#,
+                    r#"asynOctetGetInputEos("geos_half", 0)"#,
+                    r#"asynOctetGetOutputEos("geos_half", 0)"#,
+                ]
+            ),
+            "Get EOS failed: geos_none getInputEos not implemented\n\
+             Get EOS failed: geos_none getOutputEos not implemented\n\
+             Get EOS failed: geos_half getInputEos not implemented\n\
+             \"\"\n"
+        );
+    }
+
+    /// The trace commands print what asynShellCommands.c's do: a mask string is
+    /// parsed by asynTrace*MaskStringToInt (:670-699, :756-783, :822-849), which
+    /// reports the unparsed tail and still applies the bits read before it; a
+    /// port that does not exist prints connectDevice's errorMessage alone
+    /// (:653, :867, :923), and asynSetTraceFile connects before it opens the
+    /// file (:866-881).
+    #[test]
+    fn trace_shell_commands_print_cs_lines() {
+        struct TrPort {
+            base: PortDriverBase,
+        }
+        impl PortDriver for TrPort {
+            fn base(&self) -> &PortDriverBase {
+                &self.base
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.base
+            }
+        }
+        let mgr = Arc::new(PortManager::new());
+        mgr.register_port_unclaimed(
+            TrPort {
+                base: shell_test_base("tr_port"),
+            },
+            &crate::registry::open_owner(),
+        )
+        .unwrap();
+        let out = shell_output(
+            mgr.clone(),
+            &[
+                r#"asynSetTraceMask("tr_nosuch", -1, "ERROR")"#,
+                r#"asynSetTraceMask("tr_port", -1, "FLOW+NOPE")"#,
+                r#"asynSetTraceMask("", -1, "0x20 | 2")"#,
+                r#"asynSetTraceIOMask("tr_port", -1, "HEX|bogus")"#,
+                r#"asynSetTraceInfoMask("tr_port", -1, "asyn_traceinfo_port+X")"#,
+                r#"asynSetTraceInfoMask("", -1)"#,
+                r#"asynSetTraceFile("tr_nosuch", -1, "/nonexistent-dir/trace.txt")"#,
+                r#"asynSetTraceFile("tr_port", -1, "/nonexistent-dir/trace.txt")"#,
+                r#"asynSetTraceFile("tr_port", -1)"#,
+                r#"asynSetTraceIOTruncateSize("tr_nosuch", -1, 10)"#,
+            ],
+        );
+        assert_eq!(
+            out,
+            format!(
+                "asynManager:connectDevice port tr_nosuch not found\n\
+                 {TRACE_MASK_USAGE}\nError: Mask string invalid at \"NOPE\"\n\
+                 {TRACE_MASK_USAGE}\nError: Mask string invalid at \" | 2\"\n\
+                 {TRACE_IO_MASK_USAGE}\nError: Mask string invalid at \"bogus\"\n\
+                 Mask string invalid at \"X\"\n\
+                 asynManager:connectDevice port tr_nosuch not found\n\
+                 fopen failed No such file or directory\n\
+                 asynManager:connectDevice port tr_nosuch not found\n"
+            )
+        );
+        let trace = crate::registry::get_port("tr_port")
+            .unwrap()
+            .handle
+            .trace()
+            .clone();
+        assert_eq!(trace.get_trace_mask(Some("tr_port")), TraceMask::FLOW);
+        assert_eq!(trace.get_trace_io_mask(Some("tr_port")), TraceIoMask::HEX);
+        assert_eq!(
+            trace.get_trace_info_mask(Some("tr_port")),
+            TraceInfoMask::PORT
+        );
+        // A missing filename is C's NULL fp, the errlog sink (:872).
+        assert_eq!(
+            trace.with_dp_common("tr_port", None, |c| matches!(c.file, TraceFile::Errlog)),
+            Some(true)
+        );
+        let global = mgr.trace_manager();
+        assert_eq!(global.get_trace_mask(None), TraceMask::WARNING);
+        assert_eq!(global.get_trace_info_mask(None), TraceInfoMask::empty());
+    }
+
+    /// asynEnable, asynAutoConnect and asynSetQueueLockPortTimeout print
+    /// connectDevice's errorMessage alone (asynShellCommands.c:957, :991,
+    /// :1291; asynManager.c:1331-1343) and the call's own the same way (:962).
+    #[test]
+    fn enable_shell_commands_print_cs_lines() {
+        struct EnPort {
+            base: PortDriverBase,
+        }
+        impl PortDriver for EnPort {
+            fn base(&self) -> &PortDriverBase {
+                &self.base
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.base
+            }
+        }
+        let mgr = Arc::new(PortManager::new());
+        let mut base = shell_test_base("en_dead");
+        base.flags.destructible = true;
+        mgr.register_port_unclaimed(EnPort { base }, &crate::registry::open_owner())
+            .unwrap();
+        mgr.shutdown_port("en_dead").unwrap();
+        assert_eq!(
+            shell_output(
+                mgr,
+                &[
+                    r#"asynEnable("en_nosuch", 0, 1)"#,
+                    r#"asynEnable("", 0, 1)"#,
+                    r#"asynEnable()"#,
+                    r#"asynEnable("en_dead", -1, 1)"#,
+                    r#"asynAutoConnect("en_nosuch", 0, 1)"#,
+                    r#"asynAutoConnect()"#,
+                    r#"asynSetQueueLockPortTimeout("en_nosuch", 1.0)"#,
+                    r#"asynSetQueueLockPortTimeout()"#,
+                ]
+            ),
+            "asynManager:connectDevice port en_nosuch not found\n\
+             asynManager:connectDevice port  not found\n\
+             asynManager:connectDevice no port name provided\n\
+             asynManager:enable: port has been shut down\n\
+             asynManager:connectDevice port en_nosuch not found\n\
+             asynManager:connectDevice no port name provided\n\
+             asynManager:connectDevice port en_nosuch not found\n\
+             asynManager:connectDevice no port name provided\n"
+        );
+    }
+
+    /// asynShutdownPort prints connectDevice's errorMessage, then
+    /// shutdownPort's, and nothing on success or on a port already shut down
+    /// (asynShellCommands.c:1324-1342, asynManager.c:2268-2278).
+    #[test]
+    fn shutdown_port_shell_command_prints_cs_lines() {
+        struct SdPort {
+            base: PortDriverBase,
+        }
+        impl PortDriver for SdPort {
+            fn base(&self) -> &PortDriverBase {
+                &self.base
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.base
+            }
+        }
+        let mgr = Arc::new(PortManager::new());
+        let mut base = shell_test_base("sd_port");
+        base.flags.destructible = true;
+        mgr.register_port_unclaimed(SdPort { base }, &crate::registry::open_owner())
+            .unwrap();
+        mgr.register_port_unclaimed(
+            SdPort {
+                base: shell_test_base("sd_fixed"),
+            },
+            &crate::registry::open_owner(),
+        )
+        .unwrap();
+        assert_eq!(
+            shell_output(
+                mgr,
+                &[
+                    r#"asynShutdownPort("sd_nosuch")"#,
+                    r#"asynShutdownPort()"#,
+                    r#"asynShutdownPort("sd_fixed")"#,
+                    r#"asynShutdownPort("sd_port")"#,
+                    r#"asynShutdownPort("sd_port")"#,
+                    r#"asynEnable("sd_port", -1, 1)"#,
+                ]
+            ),
+            "asynManager:connectDevice port sd_nosuch not found\n\
+             asynManager:connectDevice no port name provided\n\
+             asynManager:shutdownPort: port does not support shutting down\n\
+             asynManager:enable: port has been shut down\n"
+        );
+    }
+
+    /// The time-stamp source commands print C's lines, including its
+    /// registerUserTimeStampSource / asynRegisterUserStampSource names
+    /// (asynShellCommands.c:1187-1201, :1210-1219).
+    #[test]
+    fn time_stamp_shell_commands_print_cs_lines() {
+        struct TsPort {
+            base: PortDriverBase,
+        }
+        impl PortDriver for TsPort {
+            fn base(&self) -> &PortDriverBase {
+                &self.base
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.base
+            }
+        }
+        let mgr = Arc::new(PortManager::new());
+        mgr.register_port_unclaimed(
+            TsPort {
+                base: shell_test_base("tss_port"),
+            },
+            &crate::registry::open_owner(),
+        )
+        .unwrap();
+        // A shut-down port still connects in C (connectDevice has no defunct
+        // check) and the shell drops the register status (:1202, :1219), so
+        // neither command prints anything for it.
+        let mut base = shell_test_base("tss_gone");
+        base.flags.destructible = true;
+        mgr.register_port_unclaimed(TsPort { base }, &crate::registry::open_owner())
+            .unwrap();
+        crate::timestamp::register_time_stamp_source("tss_fn", std::time::SystemTime::now);
+        // The one way the swap can fail here: the port's actor is gone, so the
+        // request comes back as an error C never has to print.
+        struct DeadPort {
+            base: PortDriverBase,
+        }
+        impl PortDriver for DeadPort {
+            fn base(&self) -> &PortDriverBase {
+                &self.base
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.base
+            }
+            fn report(&mut self, _out: &mut dyn std::fmt::Write, _level: i32) {
+                panic!("actor dies");
+            }
+        }
+        mgr.register_port_unclaimed(
+            DeadPort {
+                base: shell_test_base("tss_dead"),
+            },
+            &crate::registry::open_owner(),
+        )
+        .unwrap();
+        let dead = mgr.find_port_handle("tss_dead").unwrap();
+        // Submitted, so the report panics on the actor rather than here.
+        let report = crate::request::RequestOp::Report {
+            level: 1,
+            sync_locked: false,
+        };
+        assert!(
+            dead.try_submit(report, AsynUser::default())
+                .unwrap()
+                .wait_blocking(std::time::Duration::from_secs(5))
+                .is_err()
+        );
+        assert_eq!(
+            shell_output(
+                mgr,
+                &[
+                    r#"asynShutdownPort("tss_gone")"#,
+                    r#"asynRegisterTimeStampSource("tss_gone", "tss_fn")"#,
+                    r#"asynUnregisterTimeStampSource("tss_gone")"#,
+                    r#"asynRegisterTimeStampSource("tss_dead", "tss_fn")"#,
+                    r#"asynUnregisterTimeStampSource("tss_dead")"#,
+                    r#"asynRegisterTimeStampSource("tss_port")"#,
+                    r#"asynRegisterTimeStampSource("tss_nosuch", "tss_fn")"#,
+                    r#"asynRegisterTimeStampSource("tss_port", "tss_no_such_fn")"#,
+                    r#"asynUnregisterTimeStampSource()"#,
+                    r#"asynUnregisterTimeStampSource("tss_nosuch")"#,
+                ]
+            ),
+            "Usage: registerUserTimeStampSource portName functionName\n\
+             asynRegisterUserStampSource, cannot connect to port tss_nosuch\n\
+             asynRegisterUserStampSource, cannot find function tss_no_such_fn\n\
+             Usage: asynUnregisterTimeStampSource portName\n\
+             asynUnregisterTimeStampSource, cannot connect to port tss_nosuch\n"
+        );
+    }
+
     /// R14-48: the `addr` argument names the device whose terminator is being
     /// set. C threads it into `findInterface(portName, addr, ...)`, which
     /// `connectDevice`s the queued `asynUser` to that device
-    /// (asynShellCommands.c:79-80, :233-234) — so `setInputEos` lands on that
+    /// (asynShellCommands.c:79-80, :235-236) — so `setInputEos` lands on that
     /// device's EOS. iocsh parsed the addr and dropped it, so every
     /// `asynOctetSetInputEos port <addr> ...` wrote device 0's.
     ///
@@ -2838,29 +4365,34 @@ mod tests {
                 self.base.set_input_eos(user.addr, eos);
                 Ok(())
             }
-            fn get_input_eos(&self, user: &AsynUser) -> Vec<u8> {
-                self.base.input_eos(user.addr).to_vec()
+            fn get_input_eos(&self, user: &AsynUser) -> AsynResult<Vec<u8>> {
+                Ok(self.base.input_eos(user.addr).to_vec())
             }
             fn set_output_eos(&mut self, user: &AsynUser, eos: &[u8]) -> AsynResult<()> {
                 self.base.set_output_eos(user.addr, eos);
                 Ok(())
             }
-            fn get_output_eos(&self, user: &AsynUser) -> Vec<u8> {
-                self.base.output_eos(user.addr).to_vec()
+            fn get_output_eos(&self, user: &AsynUser) -> AsynResult<Vec<u8>> {
+                Ok(self.base.output_eos(user.addr).to_vec())
             }
         }
 
         let mgr = Arc::new(PortManager::new());
-        mgr.register_port(MultiPort {
-            base: PortDriverBase::new(
-                "eos_multi",
-                4,
-                PortFlags {
-                    multi_device: true,
-                    ..PortFlags::default()
-                },
-            ),
-        })
+        mgr.register_port_unclaimed(
+            MultiPort {
+                base: PortDriverBase::new(
+                    "eos_multi",
+                    4,
+                    PortFlags {
+                        multi_device: true,
+                        ..PortFlags::default()
+                    },
+                    InterfaceMask::UNMIGRATED_ALL,
+                    InterfaceMask::UNMIGRATED_INTERRUPTS,
+                ),
+            },
+            &crate::registry::open_owner(),
+        )
         .unwrap();
 
         let ctx = make_ctx();
@@ -2932,7 +4464,7 @@ mod tests {
         assert_eq!(escaped_from_raw(b"", n), "");
         for s in [r"\r\n", r"\t", r"\x1b", "ab"] {
             assert_eq!(
-                escaped_from_raw(&raw_from_escaped(s), n),
+                escaped_from_raw(&raw_from_escaped(s.as_bytes()), n),
                 s,
                 "escape/unescape must round-trip"
             );
@@ -2943,10 +4475,10 @@ mod tests {
         // decodes `\0` via C's `case '0'` (one NUL, following digits literal), so
         // `\0` is unambiguous and a NUL-then-digit round-trips exactly.
         assert_eq!(escaped_from_raw(b"\0", n), r"\0");
-        assert_eq!(raw_from_escaped(r"\0"), vec![0u8]); // `\0` in -> single NUL out
-        assert_eq!(raw_from_escaped(r"\x00"), vec![0u8]); // decoder also accepts `\x00`
+        assert_eq!(raw_from_escaped(br"\0"), vec![0u8]); // `\0` in -> single NUL out
+        assert_eq!(raw_from_escaped(br"\x00"), vec![0u8]); // decoder also accepts `\x00`
         assert_eq!(escaped_from_raw(b"\x001", n), r"\01"); // NUL then '1'
-        assert_eq!(raw_from_escaped(r"\01"), vec![0u8, b'1']); // no octal: NUL then '1'
+        assert_eq!(raw_from_escaped(br"\01"), vec![0u8, b'1']); // no octal: NUL then '1'
         // C sizes `cbuf` at 4 * sizeof(eos) + 2 precisely so the widest
         // terminator — 10 bytes, every one of them `\xNN` — still escapes whole
         // (40 chars, one under the bound).
@@ -2973,19 +4505,23 @@ mod tests {
             echo: VecDeque<u8>,
         }
         impl OctetNext for EchoingLink {
-            fn read(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<OctetReadResult> {
+            fn read(&mut self, _user: &AsynUser, buf: &mut [u8]) -> OctetReadResult {
                 match self.echo.pop_front() {
                     Some(b) => {
                         buf[0] = b;
-                        Ok(OctetReadResult {
+                        OctetReadResult {
                             nbytes_transferred: 1,
                             eom_reason: EomReason::CNT,
-                        })
+                            taken_back: 0,
+                            status: Ok(()),
+                        }
                     }
-                    None => Ok(OctetReadResult {
+                    None => OctetReadResult {
                         nbytes_transferred: 0,
                         eom_reason: EomReason::empty(),
-                    }),
+                        taken_back: 0,
+                        status: Ok(()),
+                    },
                 }
             }
             fn write(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
@@ -3000,7 +4536,7 @@ mod tests {
 
         /// The raw device below the port's interpose chain — the driver's own
         /// `asynOctet`, which the manager's layers sit on top of
-        /// (asynManager.c:2190-2220). It does not run the chain: the port does.
+        /// (asynManager.c:2192-2222). It does not run the chain: the port does.
         struct InterposedDriver {
             base: PortDriverBase,
             link: EchoingLink,
@@ -3015,25 +4551,33 @@ mod tests {
             fn io_write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
                 self.link.write(user, data)
             }
-            fn io_read_octet_eom(
+            fn io_read_octet(
                 &mut self,
                 user: &AsynUser,
                 buf: &mut [u8],
-            ) -> AsynResult<(usize, EomReason)> {
-                let r = self.link.read(user, buf)?;
-                Ok((r.nbytes_transferred, r.eom_reason))
+            ) -> crate::interpose::OctetReadResult {
+                self.link.read(user, buf)
             }
         }
 
         let sizes = Arc::new(Mutex::new(Vec::new()));
         let mgr = Arc::new(PortManager::new());
-        mgr.register_port(InterposedDriver {
-            base: PortDriverBase::new("echo_port", 1, PortFlags::default()),
-            link: EchoingLink {
-                sizes: sizes.clone(),
-                echo: VecDeque::new(),
+        mgr.register_port_unclaimed(
+            InterposedDriver {
+                base: PortDriverBase::new(
+                    "echo_port",
+                    1,
+                    PortFlags::default(),
+                    InterfaceMask::UNMIGRATED_ALL,
+                    InterfaceMask::UNMIGRATED_INTERRUPTS,
+                ),
+                link: EchoingLink {
+                    sizes: sizes.clone(),
+                    echo: VecDeque::new(),
+                },
             },
-        })
+            &crate::registry::open_owner(),
+        )
         .unwrap();
         let handle = mgr.find_port_handle("echo_port").unwrap();
 
@@ -3057,7 +4601,7 @@ mod tests {
             .expect("asynInterposeEcho must be registered");
         echo_cmd
             .handler
-            .call(&[ArgValue::String("echo_port".to_string())], &ctx)
+            .call(&[ArgValue::String("echo_port".into())], &ctx)
             .expect("handler returns Ok");
 
         // After the command: the echo layer is on the port, so the same
@@ -3080,7 +4624,7 @@ mod tests {
         // panic and not a silent success.
         echo_cmd
             .handler
-            .call(&[ArgValue::String("no_such_port".to_string())], &ctx)
+            .call(&[ArgValue::String("no_such_port".into())], &ctx)
             .expect("unknown port is reported, not an Err");
     }
 
@@ -3100,11 +4644,13 @@ mod tests {
             sizes: Arc<Mutex<Vec<usize>>>,
         }
         impl OctetNext for CountingLink {
-            fn read(&mut self, _user: &AsynUser, _buf: &mut [u8]) -> AsynResult<OctetReadResult> {
-                Ok(OctetReadResult {
+            fn read(&mut self, _user: &AsynUser, _buf: &mut [u8]) -> OctetReadResult {
+                OctetReadResult {
                     nbytes_transferred: 0,
                     eom_reason: EomReason::empty(),
-                })
+                    taken_back: 0,
+                    status: Ok(()),
+                }
             }
             fn write(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
                 self.sizes.lock().unwrap().push(data.len());
@@ -3133,12 +4679,21 @@ mod tests {
 
         let sizes = Arc::new(Mutex::new(Vec::new()));
         let mgr = Arc::new(PortManager::new());
-        mgr.register_port(InterposedDriver {
-            base: PortDriverBase::new("delay_port", 1, PortFlags::default()),
-            link: CountingLink {
-                sizes: sizes.clone(),
+        mgr.register_port_unclaimed(
+            InterposedDriver {
+                base: PortDriverBase::new(
+                    "delay_port",
+                    1,
+                    PortFlags::default(),
+                    InterfaceMask::UNMIGRATED_ALL,
+                    InterfaceMask::UNMIGRATED_INTERRUPTS,
+                ),
+                link: CountingLink {
+                    sizes: sizes.clone(),
+                },
             },
-        })
+            &crate::registry::open_owner(),
+        )
         .unwrap();
         let handle = mgr.find_port_handle("delay_port").unwrap();
 
@@ -3163,7 +4718,7 @@ mod tests {
             .handler
             .call(
                 &[
-                    ArgValue::String("delay_port".to_string()),
+                    ArgValue::String("delay_port".into()),
                     ArgValue::Int(0),
                     ArgValue::Double(0.001),
                 ],
@@ -3191,7 +4746,7 @@ mod tests {
             .handler
             .call(
                 &[
-                    ArgValue::String("no_such_port".to_string()),
+                    ArgValue::String("no_such_port".into()),
                     ArgValue::Int(0),
                     ArgValue::Double(0.001),
                 ],
@@ -3207,11 +4762,55 @@ mod tests {
     fn report_request_op_invokes_driver_report() -> AsynResult<()> {
         let mgr = fresh_mgr_with_port("report_port");
         let handle = mgr.find_port_handle("report_port")?;
-        // Default Drv impl prints to stderr; just confirm the round
-        // trip succeeds without error and returns `write_ok`.
-        handle.report_blocking(0)?;
-        handle.report_blocking(2)?;
+        assert!(handle.report_blocking(0)?.contains("Port: report_port"));
+        assert!(handle.report_blocking(2)?.contains("Port: report_port"));
         Ok(())
+    }
+
+    /// R15-51: `asynReport` writes to stdout. C's `asynReport` passes `stdout` to
+    /// `pasynManager->report` (asynShellCommands.c:589) — it is an answer to an
+    /// iocsh question, so `asynReport 1 port > file` captures it.
+    ///
+    /// libtest's capture rewrites `print!` to an in-process buffer before the
+    /// bytes reach fd 1, on any thread, unless the process was started with
+    /// `--nocapture`; so this re-execs the test binary as a child selecting just
+    /// this test with `--nocapture` forced, and reads the child's real stdout.
+    #[cfg(unix)]
+    #[test]
+    fn asyn_report_writes_to_stdout() {
+        const CHILD_ENV: &str = "ASYN_REPORT_WRITES_TO_STDOUT_CHILD";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let mgr = fresh_mgr_with_port("stdout_rep");
+            report_ports(&mgr, 0, Some("stdout_rep"));
+            return;
+        }
+
+        let exe = std::env::current_exe().unwrap();
+        let output = std::process::Command::new(exe)
+            .args([
+                "iocsh::tests::asyn_report_writes_to_stdout",
+                "--exact",
+                "--nocapture",
+            ])
+            .env(CHILD_ENV, "1")
+            .output()
+            .unwrap();
+        let captured = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            captured.contains("stdout_rep multiDevice:No") && captured.contains("Port: stdout_rep"),
+            "the manager block and the driver block both belong on stdout: {captured}"
+        );
+    }
+
+    /// `dbior` reaches asyn through drvAsyn, as asyn.dbd's `driver(drvAsyn)`
+    /// does in C.
+    #[test]
+    fn dbior_reports_asyn_ports_through_drv_asyn() {
+        use epics_base_rs::server::driver_support::DriverSupport as _;
+        let mgr = fresh_mgr_with_port("dbior_rep");
+        let text = String::from_utf8(DrvAsyn(mgr).report(0).unwrap()).unwrap();
+        assert!(text.contains("dbior_rep multiDevice:No"), "{text}");
+        assert!(text.contains("Port: dbior_rep"), "{text}");
     }
 
     /// `asynReport` covers every port of the process registry, not only the
@@ -3232,22 +4831,33 @@ mod tests {
             fn base_mut(&mut self) -> &mut PortDriverBase {
                 &mut self.base
             }
-            fn report(&self, _out: &mut dyn std::fmt::Write, _level: i32) {
+            fn report(&mut self, _out: &mut dyn std::fmt::Write, _level: i32) {
                 self.reports.fetch_add(1, Ordering::SeqCst);
             }
         }
 
         const PORT: &str = "report_by_hand";
         let reports = Arc::new(AtomicUsize::new(0));
-        let (runtime, _actor) = crate::runtime::port::create_port_runtime(
+        let (runtime, _actor) = crate::runtime::port::create_port_runtime_unclaimed(
             Reporting {
-                base: PortDriverBase::new(PORT, 1, PortFlags::default()),
+                base: PortDriverBase::new(
+                    PORT,
+                    1,
+                    PortFlags::default(),
+                    InterfaceMask::UNMIGRATED_ALL,
+                    InterfaceMask::UNMIGRATED_INTERRUPTS,
+                ),
                 reports: reports.clone(),
             },
             crate::runtime::config::RuntimeConfig::default(),
         )
         .unwrap();
-        crate::registry::register_port(PORT, runtime.port_handle().clone()).unwrap();
+        crate::registry::register_port(
+            PORT,
+            runtime.port_handle().clone(),
+            &crate::registry::open_owner(),
+        )
+        .unwrap();
 
         let mgr = Arc::new(PortManager::new());
         report_ports(&mgr, 0, Some(PORT));
@@ -3262,6 +4872,263 @@ mod tests {
     /// Build a minimal `CommandContext` for exercising registered
     /// handlers in-process. Mirrors the helper used in
     /// `epics-base-rs/src/server/iocsh/commands.rs::tests`.
+    /// A port whose every read is the message `x\r\n`, fanned out to its octet interrupt
+    /// users as C's stream drivers do, with C's EOS layer on top.
+    struct LinePort {
+        base: PortDriverBase,
+    }
+    impl PortDriver for LinePort {
+        fn base(&self) -> &PortDriverBase {
+            &self.base
+        }
+        fn base_mut(&mut self) -> &mut PortDriverBase {
+            &mut self.base
+        }
+        fn io_read_octet(
+            &mut self,
+            _user: &AsynUser,
+            buf: &mut [u8],
+        ) -> crate::interpose::OctetReadResult {
+            buf[..3].copy_from_slice(b"x\r\n");
+            crate::interpose::OctetReadResult::ok(3, crate::interpose::EomReason::END)
+        }
+    }
+
+    fn line_port(mgr: &PortManager, name: &str) -> crate::port_handle::PortHandle {
+        let mut base = PortDriverBase::new(
+            name,
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
+        );
+        base.octet_interrupt_process = true;
+        base.install_octet_interpose(Box::new(crate::interpose::eos::EosInterpose::default()));
+        mgr.register_port_unclaimed(LinePort { base }, &crate::registry::open_owner())
+            .unwrap();
+        mgr.find_port_handle(name).unwrap()
+    }
+
+    /// What `PortHandle::input_eos(0)` answers inside each octet interrupt
+    /// callback, which runs on the port thread inside the driver's read.
+    fn eos_in_callbacks(
+        handle: &crate::port_handle::PortHandle,
+    ) -> (
+        Arc<Mutex<Vec<Vec<u8>>>>,
+        crate::interrupt::SyncCallbackSubscription,
+    ) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let (sink, reader) = (seen.clone(), handle.clone());
+        let sub = handle
+            .interrupts()
+            .register_sync_callback(
+                crate::interrupt::InterruptFilter {
+                    addr: Some(0),
+                    iface: Some(crate::interfaces::InterfaceType::Octet),
+                    ..Default::default()
+                },
+                move |_| {
+                    let eos = reader.get_input_eos(&AsynUser::new(0)).unwrap();
+                    sink.lock().unwrap().push(eos)
+                },
+            )
+            .unwrap();
+        (seen, sub)
+    }
+
+    fn read_line(handle: &crate::port_handle::PortHandle) {
+        let (_, status) = handle
+            .submit_octet_read_blocking(
+                crate::request::OctetReadOp::Read { buf_size: 16 },
+                AsynUser::new(0).with_timeout(std::time::Duration::from_secs(1)),
+            )
+            .into_parts();
+        status.expect("read");
+    }
+
+    /// The terminator a port was given is what an interrupt callback inside
+    /// the next read sees, though the driver is borrowed by that read.
+    #[test]
+    fn the_input_eos_set_is_read_inside_an_interrupt_callback() {
+        let mgr = Arc::new(PortManager::new());
+        let handle = line_port(&mgr, "eos_intr");
+        let (seen, _sub) = eos_in_callbacks(&handle);
+        handle
+            .set_input_eos_blocking(shell_eos_user(0), b"\n")
+            .unwrap();
+        read_line(&handle);
+        assert_eq!(*seen.lock().unwrap(), [b"\n".to_vec()]);
+    }
+
+    /// A port whose read reports END hands its octet interrupt users END
+    /// (asynOctetBase.c:234-236), through the port thread and the EOS layer.
+    #[test]
+    fn an_end_read_reaches_the_interrupt_user_as_end() {
+        let mgr = Arc::new(PortManager::new());
+        let handle = line_port(&mgr, "eom_end");
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let _sub = handle
+            .interrupts()
+            .register_sync_callback(
+                crate::interrupt::InterruptFilter {
+                    addr: Some(0),
+                    iface: Some(crate::interfaces::InterfaceType::Octet),
+                    ..Default::default()
+                },
+                move |iv| sink.lock().unwrap().push(iv.eom_reason),
+            )
+            .unwrap();
+        read_line(&handle);
+        assert_eq!(*seen.lock().unwrap(), [crate::interpose::EomReason::END]);
+    }
+
+    /// `asynOctetSetInputEos` at run time reaches the next callback.
+    #[test]
+    fn a_runtime_set_input_eos_is_seen_by_the_next_callback() {
+        let mgr = Arc::new(PortManager::new());
+        let handle = line_port(&mgr, "eos_rt");
+        let (seen, _sub) = eos_in_callbacks(&handle);
+        read_line(&handle);
+        let ctx = make_ctx();
+        let cmds = build_asyn_commands(mgr.clone());
+        cmds.iter()
+            .find(|c| c.name == "asynOctetSetInputEos")
+            .unwrap()
+            .handler
+            .call(
+                &[
+                    ArgValue::String("eos_rt".into()),
+                    ArgValue::Int(0),
+                    ArgValue::String(r"\r\n".into()),
+                ],
+                &ctx,
+            )
+            .unwrap();
+        read_line(&handle);
+        assert_eq!(*seen.lock().unwrap(), [b"".to_vec(), b"\r\n".to_vec()]);
+    }
+
+    /// C `getInputEos` called on its caller's thread (StreamDevice's
+    /// `connectToBus`, AsynDriverInterface.cc:450-457) answers without waiting
+    /// for the port and with the status the queued call gives: the driver's
+    /// refusal until an EOS layer is pushed, then the layer's terminator.
+    #[test]
+    fn get_input_eos_answers_as_the_driver_without_waiting_for_the_port() {
+        struct Plain {
+            base: PortDriverBase,
+        }
+        impl PortDriver for Plain {
+            fn base(&self) -> &PortDriverBase {
+                &self.base
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.base
+            }
+        }
+        let mgr = Arc::new(PortManager::new());
+        mgr.register_port_unclaimed(
+            Plain {
+                base: PortDriverBase::new(
+                    "geos_direct",
+                    1,
+                    PortFlags {
+                        can_block: true,
+                        ..PortFlags::default()
+                    },
+                    InterfaceMask::UNMIGRATED_ALL,
+                    InterfaceMask::UNMIGRATED_INTERRUPTS,
+                ),
+            },
+            &crate::registry::open_owner(),
+        )
+        .unwrap();
+        let handle = mgr.find_port_handle("geos_direct").unwrap();
+        let direct = |h: &crate::port_handle::PortHandle| {
+            h.get_input_eos(&AsynUser::new(0)).map_err(|e| e.message())
+        };
+        let queued = |h: &crate::port_handle::PortHandle| {
+            h.get_input_eos_blocking(shell_eos_user(0))
+                .map_err(|e| e.message())
+        };
+        assert_eq!(
+            direct(&handle),
+            Err("geos_direct getInputEos not implemented".to_string())
+        );
+        assert_eq!(direct(&handle), queued(&handle));
+        handle.push_eos_interpose_blocking(-1, true, true).unwrap();
+        assert_eq!(direct(&handle), Ok(Vec::new()));
+        assert_eq!(direct(&handle), queued(&handle));
+        handle
+            .set_input_eos_blocking(shell_eos_user(0), b"\r\n")
+            .unwrap();
+        assert_eq!(direct(&handle), Ok(b"\r\n".to_vec()));
+
+        let hold = handle.hold_driver_blocking::<Plain>().unwrap();
+        let other = handle.clone();
+        let answer = std::thread::spawn(move || other.get_input_eos(&AsynUser::new(0)))
+            .join()
+            .unwrap();
+        assert_eq!(answer.unwrap(), b"\r\n", "answered while the port is held");
+        drop(hold);
+    }
+
+    /// A device whose terminator is one register for all its addresses
+    /// (Prologix's `++eos`): a set at one address is what every address reads.
+    #[test]
+    fn an_input_eos_shared_by_every_address_is_seen_at_each() {
+        struct OneRegister {
+            base: PortDriverBase,
+            eos: Vec<u8>,
+        }
+        impl PortDriver for OneRegister {
+            fn base(&self) -> &PortDriverBase {
+                &self.base
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.base
+            }
+            fn set_input_eos(&mut self, _user: &AsynUser, eos: &[u8]) -> AsynResult<()> {
+                self.eos = eos.to_vec();
+                Ok(())
+            }
+            fn get_input_eos(&self, _user: &AsynUser) -> AsynResult<Vec<u8>> {
+                Ok(self.eos.clone())
+            }
+        }
+        let mgr = Arc::new(PortManager::new());
+        mgr.register_port_unclaimed(
+            OneRegister {
+                base: PortDriverBase::new(
+                    "eos_one",
+                    4,
+                    PortFlags {
+                        multi_device: true,
+                        ..PortFlags::default()
+                    },
+                    InterfaceMask::UNMIGRATED_ALL,
+                    InterfaceMask::UNMIGRATED_INTERRUPTS,
+                ),
+                eos: Vec::new(),
+            },
+            &crate::registry::open_owner(),
+        )
+        .unwrap();
+        let handle = mgr.find_port_handle("eos_one").unwrap();
+        handle
+            .set_input_eos_blocking(shell_eos_user(1), b"\n")
+            .unwrap();
+        for addr in [-1, 0, 1, 3] {
+            assert_eq!(
+                handle
+                    .get_input_eos(&AsynUser::new(0).with_addr(addr))
+                    .unwrap(),
+                b"\n",
+                "addr {addr}"
+            );
+        }
+    }
+
     fn make_ctx() -> CommandContext {
         use epics_base_rs::server::database::PvDatabase;
         let rt = tokio::runtime::Runtime::new().unwrap();
@@ -3286,12 +5153,17 @@ mod tests {
     #[test]
     fn asyn_set_trace_mask_writes_the_named_ports_own_trace() {
         const PORT: &str = "iocsh_foreign_mgr_port";
-        let (runtime, _actor) = crate::runtime::create_port_runtime(
+        let (runtime, _actor) = crate::runtime::create_port_runtime_unclaimed(
             DummyDriver::new(PORT),
             crate::runtime::RuntimeConfig::default(),
         )
         .unwrap();
-        crate::registry::register_port(PORT, runtime.port_handle().clone()).unwrap();
+        crate::registry::register_port(
+            PORT,
+            runtime.port_handle().clone(),
+            &crate::registry::open_owner(),
+        )
+        .unwrap();
         let foreign = Arc::new(PortManager::new());
         let cmds = build_asyn_commands(foreign.clone());
         let cmd = cmds
@@ -3346,7 +5218,7 @@ mod tests {
     /// (`let _addr = arg_int(args, 1)`), so an `asynSetTraceIOMask
     /// MYPORT 3 "ESCAPE"` invocation degraded into a port-wide write
     /// rather than the device-specific dpCommon write C performs
-    /// (asynManager.c:2830-2833 / 2872-2875 / 2898-2926 via
+    /// (asynManager.c:2844-2847 / 2886-2889 / 2912-2940 via
     /// `findTracePvt` over `pdevice`). This test invokes all three
     /// handlers with `addr >= 0` and confirms each fires a per-device
     /// announce (addr propagated through to the device setter).
@@ -3370,9 +5242,9 @@ mod tests {
             .expect("asynSetTraceIOMask must be registered");
         let _ = io_cmd.handler.call(
             &[
-                ArgValue::String("trace_dev_port".to_string()),
+                ArgValue::String("trace_dev_port".into()),
                 ArgValue::Int(5),
-                ArgValue::String("HEX".to_string()),
+                ArgValue::String("HEX".into()),
             ],
             &ctx,
         );
@@ -3384,9 +5256,9 @@ mod tests {
             .expect("asynSetTraceInfoMask must be registered");
         let _ = info_cmd.handler.call(
             &[
-                ArgValue::String("trace_dev_port".to_string()),
+                ArgValue::String("trace_dev_port".into()),
                 ArgValue::Int(7),
-                ArgValue::String("SOURCE".to_string()),
+                ArgValue::String("SOURCE".into()),
             ],
             &ctx,
         );
@@ -3398,9 +5270,9 @@ mod tests {
             .expect("asynSetTraceFile must be registered");
         let _ = file_cmd.handler.call(
             &[
-                ArgValue::String("trace_dev_port".to_string()),
+                ArgValue::String("trace_dev_port".into()),
                 ArgValue::Int(2),
-                ArgValue::String("stderr".to_string()),
+                ArgValue::String("stderr".into()),
             ],
             &ctx,
         );
@@ -3448,7 +5320,32 @@ mod tests {
         );
     }
 
-    /// C drvAsynIPPort.c:1065-1066: an IP port gets an EOS interpose by
+    /// A refused duplicate `drvAsynIPPortConfigure` never dials the device:
+    /// the name is claimed before the port thread, whose auto-connect would
+    /// otherwise open a second circuit to the host.
+    #[test]
+    fn a_refused_duplicate_ip_port_never_connects() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let host = listener.local_addr().unwrap().to_string();
+        let cmd = drv_asyn_ip_port_configure_command(PortServices::new());
+        let ctx = make_ctx();
+        let args = [
+            ArgValue::String("iocsh_ip_dup_test".into()),
+            ArgValue::String(host.as_str().into()),
+        ];
+        cmd.handler.call(&args, &ctx).unwrap();
+        let first = listener.accept().expect("the first port connects");
+        cmd.handler.call(&args, &ctx).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(
+            listener.accept().is_err(),
+            "the refused duplicate opened a circuit"
+        );
+        drop(first);
+    }
+
+    /// C drvAsynIPPort.c:1119-1120: an IP port gets an EOS interpose by
     /// default, suppressed by `noProcessEos`.
     #[test]
     fn build_configured_ip_port_installs_eos_unless_suppressed() {
@@ -3491,6 +5388,300 @@ mod tests {
         assert!(
             crate::asyn_record::get_port("iocsh_serial_cfg_test").is_some(),
             "port must be resolvable via the asyn_record registry"
+        );
+    }
+
+    /// Re-run this test binary on `test` with `CHILD` set and return its
+    /// stdout and stderr: a Configure command prints on the process stdout,
+    /// which a test cannot redirect in-process.
+    fn run_child(test: &str, child_env: &str) -> (String, String) {
+        let out = std::process::Command::new(std::env::current_exe().expect("the test binary"))
+            .args(["--exact", test, "--nocapture"])
+            .env(child_env, "1")
+            .output()
+            .expect("re-exec the test binary");
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert!(out.status.success(), "{stdout}{stderr}");
+        (stdout, stderr)
+    }
+
+    fn call_configure(cmd: &CommandDef, args: &[ArgValue]) {
+        cmd.handler.call(args, &make_ctx()).expect("the command");
+    }
+
+    /// A Configure that succeeds prints nothing, except the server's
+    /// `createServerSocket` lines (drvAsynIPServerPort.c:439-443, :626) and
+    /// FTDI's five argument lines, which C prints first
+    /// (drvAsynIPPort.c:1017-1133, drvAsynFTDIPort.cpp:522-526).
+    #[test]
+    fn a_configure_that_succeeds_prints_only_what_c_prints() {
+        const CHILD: &str = "ASYN_RS_CONFIGURE_QUIET_CHILD";
+        const TEST: &str = "iocsh::tests::a_configure_that_succeeds_prints_only_what_c_prints";
+        if std::env::var_os(CHILD).is_some() {
+            println!("---begin");
+            call_configure(
+                &drv_asyn_ip_port_configure_command(PortServices::new()),
+                &[
+                    ArgValue::String("quiet_ip".into()),
+                    ArgValue::String("127.0.0.1:9001".into()),
+                ],
+            );
+            call_configure(
+                &drv_asyn_ip_server_port_configure_command(PortServices::new()),
+                &[
+                    ArgValue::String("quiet_srv".into()),
+                    ArgValue::String("127.0.0.1:0".into()),
+                    ArgValue::Int(1),
+                ],
+            );
+            call_configure(
+                &drv_asyn_prologix_port_configure_command(PortServices::new()),
+                &[
+                    ArgValue::String("quiet_gpib".into()),
+                    ArgValue::String("127.0.0.1".into()),
+                    ArgValue::Int(0),
+                    ArgValue::Int(1),
+                ],
+            );
+            call_configure(
+                &drv_asyn_ftdi_port_configure_command(PortServices::new()),
+                &[
+                    ArgValue::String("quiet_ftdi".into()),
+                    ArgValue::Int(0x0403),
+                    ArgValue::Int(0x6001),
+                    ArgValue::Int(9600),
+                    ArgValue::Int(16),
+                    ArgValue::Int(0),
+                    ArgValue::Int(1),
+                    ArgValue::Int(0),
+                    ArgValue::Int(1),
+                ],
+            );
+            println!("---end");
+            return;
+        }
+        let (stdout, _) = run_child(TEST, CHILD);
+        let a = stdout.find("---begin\n").expect("begin") + "---begin\n".len();
+        let b = stdout.find("---end").expect("end");
+        assert_eq!(
+            &stdout[a..b],
+            "serverAddr: 127.0.0.1:0\n\
+             serverPort: 0\n\
+             drvAsynFTDIPortConfigure: latency=16\n\
+             drvAsynFTDIPortConfigure: priority=0\n\
+             drvAsynFTDIPortConfigure: noAutoconnect=1\n\
+             drvAsynFTDIPortConfigure: noProcessEos=0\n\
+             drvAsynFTDIPortConfigure: mode=SPI\n"
+        );
+    }
+
+    /// A Configure whose `registerPort` is refused prints the driver's own
+    /// C line, not `{command}: {error}` (drvAsynIPPort.c:1087,
+    /// drvAsynIPServerPort.c:651), and publishes nothing.
+    #[test]
+    fn ip_and_ip_server_configure_print_c_register_refusal() {
+        const CHILD: &str = "ASYN_RS_IP_REFUSAL_CHILD";
+        const TEST: &str = "iocsh::tests::ip_and_ip_server_configure_print_c_register_refusal";
+        if std::env::var_os(CHILD).is_some() {
+            let ip = drv_asyn_ip_port_configure_command(PortServices::new());
+            let srv = drv_asyn_ip_server_port_configure_command(PortServices::new());
+            let ip_args = |name: &str| {
+                [
+                    ArgValue::String(name.into()),
+                    ArgValue::String("127.0.0.1:9001".into()),
+                ]
+            };
+            call_configure(&ip, &ip_args("refuse_ip"));
+            println!("---second ip");
+            call_configure(&ip, &ip_args("refuse_ip"));
+            // The server's child "refuse_srv:0" is already taken.
+            call_configure(&ip, &ip_args("refuse_srv:0"));
+            let srv_args = |name: &str| {
+                [
+                    ArgValue::String(name.into()),
+                    ArgValue::String("127.0.0.1:0".into()),
+                    ArgValue::Int(1),
+                ]
+            };
+            println!("---first server");
+            call_configure(&srv, &srv_args("refuse_srv"));
+            println!("---second server");
+            call_configure(&srv, &srv_args("refuse_srv"));
+            return;
+        }
+        let (stdout, stderr) = run_child(TEST, CHILD);
+        let sec = |from: &str, to: Option<&str>| -> String {
+            let a = stdout.find(from).expect(from) + from.len();
+            let b = to.map_or(stdout.len(), |t| a + stdout[a..].find(t).expect(t));
+            stdout[a..b].to_string()
+        };
+        assert!(
+            sec("---second ip\n", Some("---first server"))
+                .lines()
+                .any(|l| l == "drvAsynIPPortConfigure: Can't register myself."),
+            "{stdout}"
+        );
+        let first = sec("---first server\n", Some("---second server"));
+        assert!(
+            first
+                .lines()
+                .any(|l| l == "drvAsynIPPortConfigure: Can't register myself."),
+            "the child's own line, from the first server: {stdout}"
+        );
+        assert!(
+            format!("{stdout}{stderr}")
+                .lines()
+                .any(|l| l.ends_with("drvAsynIPServerPort: unable to create port refuse_srv:0")),
+            "{stdout}{stderr}"
+        );
+        assert!(
+            sec("---second server\n", None)
+                .lines()
+                .any(|l| l == "drvAsynIPServerPortConfigure: Can't register myself."),
+            "{stdout}"
+        );
+    }
+
+    /// C binds the server socket in configure, before `registerPort`
+    /// (drvAsynIPServerPort.c:626): a busy address prints createServerSocket's
+    /// line and C's refusal and never reaches the port, and a `noAutoConnect`
+    /// server listens while its port stays disconnected.
+    #[test]
+    fn ip_server_configure_binds_before_it_registers() {
+        const CHILD: &str = "ASYN_RS_IP_SERVER_BIND_CHILD";
+        const TEST: &str = "iocsh::tests::ip_server_configure_binds_before_it_registers";
+        if std::env::var_os(CHILD).is_some() {
+            let srv = drv_asyn_ip_server_port_configure_command(PortServices::new());
+            let busy = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let busy_info = format!("127.0.0.1:{}", busy.local_addr().unwrap().port());
+            println!("---busy");
+            call_configure(
+                &srv,
+                &[
+                    ArgValue::String("busy_srv".into()),
+                    ArgValue::String(busy_info.into()),
+                    ArgValue::Int(1),
+                ],
+            );
+            println!(
+                "---published {}",
+                crate::registry::get_port("busy_srv").is_some()
+            );
+            let free = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let free_addr = free.local_addr().unwrap();
+            drop(free);
+            call_configure(
+                &srv,
+                &[
+                    ArgValue::String("idle_srv".into()),
+                    ArgValue::String(free_addr.to_string().into()),
+                    ArgValue::Int(1),
+                    ArgValue::Int(0),
+                    ArgValue::Int(1),
+                ],
+            );
+            let idle = crate::registry::get_port("idle_srv").unwrap().handle;
+            println!("---connected {}", idle.is_connected_blocking(-1).unwrap());
+            println!(
+                "---listening {}",
+                std::net::TcpStream::connect(free_addr).is_ok()
+            );
+            // A refused duplicate gives back the socket it bound (C
+            // `ttyCleanup`, drvAsynIPServerPort.c:651-652).
+            let spare = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let spare_addr = spare.local_addr().unwrap();
+            drop(spare);
+            call_configure(
+                &srv,
+                &[
+                    ArgValue::String("idle_srv".into()),
+                    ArgValue::String(spare_addr.to_string().into()),
+                    ArgValue::Int(1),
+                ],
+            );
+            println!(
+                "---released {}",
+                std::net::TcpListener::bind(spare_addr).is_ok()
+            );
+            println!("---end");
+            return;
+        }
+        let (stdout, stderr) = run_child(TEST, CHILD);
+        let a = stdout.find("---busy\n").expect("busy") + "---busy\n".len();
+        let b = stdout.find("---published").expect("published");
+        let busy: Vec<&str> = stdout[a..b].lines().collect();
+        assert_eq!(busy.len(), 4, "{stdout}{stderr}");
+        assert!(
+            busy[2].starts_with("Error in binding 127.0.0.1:"),
+            "{stdout}"
+        );
+        assert_eq!(
+            busy[3],
+            "drvAsynIPServerPortConfigure: Error in createServerSocket."
+        );
+        assert!(stdout.contains("---published false\n"), "{stdout}");
+        assert!(
+            !format!("{stdout}{stderr}").contains("error calling createSocket"),
+            "{stdout}{stderr}"
+        );
+        assert!(stdout.contains("---connected false\n"), "{stdout}");
+        assert!(stdout.contains("---listening true\n"), "{stdout}");
+        assert!(stdout.contains("---released true\n"), "{stdout}");
+    }
+
+    /// drvAsynSerialPort.c:1106.
+    #[cfg(asyn_serial_backend)]
+    #[test]
+    fn serial_configure_prints_c_register_refusal() {
+        const CHILD: &str = "ASYN_RS_SERIAL_REFUSAL_CHILD";
+        const TEST: &str = "iocsh::tests::serial_configure_prints_c_register_refusal";
+        if std::env::var_os(CHILD).is_some() {
+            let cmd = drv_asyn_serial_port_configure_command(PortServices::new());
+            let args = [
+                ArgValue::String("refuse_serial".into()),
+                ArgValue::String("/dev/ttyS0".into()),
+            ];
+            call_configure(&cmd, &args);
+            println!("---second");
+            call_configure(&cmd, &args);
+            return;
+        }
+        let (stdout, _) = run_child(TEST, CHILD);
+        let second = &stdout[stdout.find("---second").expect("marker")..];
+        assert!(
+            second
+                .lines()
+                .any(|l| l == "drvAsynSerialPortConfigure: Can't register myself."),
+            "{stdout}"
+        );
+    }
+
+    /// drvAsynSerialPort.c:1046-1053: an absent name prints C's line and the
+    /// command returns without creating a port, as a success to the shell.
+    #[cfg(asyn_serial_backend)]
+    #[test]
+    fn serial_configure_prints_c_missing_argument_lines() {
+        const CHILD: &str = "ASYN_RS_SERIAL_MISSING_CHILD";
+        const TEST: &str = "iocsh::tests::serial_configure_prints_c_missing_argument_lines";
+        if std::env::var_os(CHILD).is_some() {
+            let cmd = drv_asyn_serial_port_configure_command(PortServices::new());
+            println!("---begin");
+            call_configure(&cmd, &[ArgValue::Missing, ArgValue::Missing]);
+            call_configure(
+                &cmd,
+                &[ArgValue::String("serial_no_tty".into()), ArgValue::Missing],
+            );
+            assert!(crate::asyn_record::get_port("serial_no_tty").is_none());
+            println!("---end");
+            return;
+        }
+        let (stdout, _) = run_child(TEST, CHILD);
+        let begin = stdout.find("---begin\n").expect("marker") + "---begin\n".len();
+        let end = stdout.find("---end").expect("marker");
+        assert_eq!(
+            &stdout[begin..end],
+            "Port name missing.\nTTY name missing.\n"
         );
     }
 
@@ -3575,6 +5766,69 @@ mod tests {
         );
     }
 
+    /// The FTDI port thread runs on C's 500000-byte stack
+    /// (drvAsynFTDIPort.cpp:590), not the Medium class every other driver's 0
+    /// gives. Measured from outside: the stack mapping that holds the parked
+    /// thread's stack pointer.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn iocsh_ftdi_port_thread_runs_on_c_s_500000_byte_stack() {
+        let cmd = drv_asyn_ftdi_port_configure_command(PortServices::new());
+        let ctx = make_ctx();
+        let result = cmd.handler.call(
+            &[
+                ArgValue::String("ftdi_stack".into()),
+                ArgValue::Int(0x0403),
+                ArgValue::Int(0x6001),
+                ArgValue::Int(9600),
+                ArgValue::Int(1),
+                ArgValue::Int(0),
+                ArgValue::Int(1), // noAutoConnect
+            ],
+            &ctx,
+        );
+        assert!(result.is_ok(), "command failed: {:?}", result.err());
+        let got = parked_thread_stack_bytes("ftdi_stack");
+        assert!(
+            (500_000..500_000 + 64 * 1024).contains(&got),
+            "the FTDI port thread has a {got}-byte stack, C asks for 500000"
+        );
+    }
+
+    /// Size of the mapping holding the stack pointer of the thread named
+    /// `name`, read while it is parked in a syscall.
+    #[cfg(target_os = "linux")]
+    fn parked_thread_stack_bytes(name: &str) -> usize {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let tid = std::fs::read_dir("/proc/self/task")
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|t| std::fs::read_to_string(t.join("comm")).unwrap().trim_end() == name)
+            .expect("the port thread carries the port's name");
+        // `syscall` reads "running" until the thread parks, then ends "sp pc".
+        let sp = loop {
+            let line = std::fs::read_to_string(tid.join("syscall")).unwrap();
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            if fields.len() > 2 {
+                break usize::from_str_radix(&fields[fields.len() - 2][2..], 16).unwrap();
+            }
+            assert!(std::time::Instant::now() < deadline, "{name} never parked");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        };
+        std::fs::read_to_string("/proc/self/maps")
+            .unwrap()
+            .lines()
+            .find_map(|l| {
+                let (lo, hi) = l.split_whitespace().next()?.split_once('-')?;
+                let (lo, hi) = (
+                    usize::from_str_radix(lo, 16).ok()?,
+                    usize::from_str_radix(hi, 16).ok()?,
+                );
+                (lo..hi).contains(&sp).then_some(hi - lo)
+            })
+            .expect("the stack pointer lies in a mapping")
+    }
+
     /// R19-111: `vxi11Configure` exists with C's seven args
     /// (drvVxi11.c:1789-1802) and publishes the port under its name.
     #[test]
@@ -3633,7 +5887,7 @@ mod tests {
                 ArgValue::String("iocsh_usbtmc_cfg_test".into()),
                 ArgValue::Int(0x0699),
                 ArgValue::Int(0x0368),
-                ArgValue::String(String::new()),
+                ArgValue::String(Default::default()),
                 ArgValue::Int(0),
                 ArgValue::Int(0),
             ],
@@ -3643,6 +5897,281 @@ mod tests {
         assert!(
             crate::asyn_record::get_port("iocsh_usbtmc_cfg_test").is_some(),
             "port must be resolvable via the asyn_record registry"
+        );
+    }
+
+    /// drvAsynFTDIPort.cpp:591.
+    #[test]
+    fn ftdi_configure_prints_c_register_refusal() {
+        const CHILD: &str = "ASYN_RS_FTDI_CONFIGURE_PRINTS_C_REGISTER_REFUSAL_CHILD";
+        const TEST: &str = "iocsh::tests::ftdi_configure_prints_c_register_refusal";
+        if std::env::var_os(CHILD).is_some() {
+            let cmd = drv_asyn_ftdi_port_configure_command(PortServices::new());
+            let args = [
+                ArgValue::String("refuse_ftdi".into()),
+                ArgValue::Int(0x0403),
+                ArgValue::Int(0x6001),
+                ArgValue::Int(9600),
+                ArgValue::Int(1),
+                ArgValue::Int(0),
+                ArgValue::Int(1),
+            ];
+            call_configure(&cmd, &args);
+            println!("---second");
+            call_configure(&cmd, &args);
+            return;
+        }
+        let (stdout, _) = run_child(TEST, CHILD);
+        let second = &stdout[stdout.find("---second").expect("marker")..];
+        assert!(
+            second
+                .lines()
+                .any(|l| l == "drvAsynFTDIPortConfigure: Can't register myself."),
+            "{stdout}"
+        );
+        assert!(
+            !stdout[..stdout.find("---second").unwrap()]
+                .contains("drvAsynFTDIPortConfigure: Can't register myself."),
+            "{stdout}"
+        );
+    }
+
+    /// drvPrologixGPIB.c:600.
+    #[test]
+    fn prologix_configure_prints_c_register_refusal() {
+        const CHILD: &str = "ASYN_RS_PROLOGIX_CONFIGURE_PRINTS_C_REGISTER_REFUSAL_CHILD";
+        const TEST: &str = "iocsh::tests::prologix_configure_prints_c_register_refusal";
+        if std::env::var_os(CHILD).is_some() {
+            let cmd = drv_asyn_prologix_port_configure_command(PortServices::new());
+            let args = [
+                ArgValue::String("refuse_prologix".into()),
+                ArgValue::String("127.0.0.1:1234".into()),
+                ArgValue::Int(0),
+                ArgValue::Int(1),
+            ];
+            call_configure(&cmd, &args);
+            println!("---second");
+            call_configure(&cmd, &args);
+            return;
+        }
+        let (stdout, _) = run_child(TEST, CHILD);
+        let at = stdout.find("---second").expect("marker");
+        assert!(!stdout[..at].contains("registerPort failed"), "{stdout}");
+        let lines: Vec<&str> = stdout[at..].lines().collect();
+        let gpib = lines
+            .iter()
+            .position(|l| *l == "asynGpib:registerDriver refuse_prologix already registered")
+            .unwrap_or_else(|| panic!("no asynGpib line:\n{stdout}"));
+        assert_eq!(lines.get(gpib + 1).copied(), Some("registerPort failed"));
+        assert!(!stdout.contains("asynCommon:registerDriver"), "{stdout}");
+    }
+
+    /// drvVxi11.c:1764.
+    #[test]
+    fn vxi11_configure_prints_c_register_refusal() {
+        const CHILD: &str = "ASYN_RS_VXI11_CONFIGURE_PRINTS_C_REGISTER_REFUSAL_CHILD";
+        const TEST: &str = "iocsh::tests::vxi11_configure_prints_c_register_refusal";
+        if std::env::var_os(CHILD).is_some() {
+            let cmd = vxi11_configure_command(PortServices::new());
+            let args = [
+                ArgValue::String("refuse_vxi11".into()),
+                ArgValue::String("127.0.0.1".into()),
+                ArgValue::Int(0),
+                ArgValue::String("1.0".into()),
+                ArgValue::String("inst0".into()),
+                ArgValue::Int(0),
+                ArgValue::Int(1),
+            ];
+            call_configure(&cmd, &args);
+            println!("---second");
+            call_configure(&cmd, &args);
+            return;
+        }
+        let (stdout, _) = run_child(TEST, CHILD);
+        let at = stdout.find("---second").expect("marker");
+        assert!(!stdout[..at].contains("registerPort failed"), "{stdout}");
+        let lines: Vec<&str> = stdout[at..].lines().collect();
+        let gpib = lines
+            .iter()
+            .position(|l| *l == "asynGpib:registerDriver refuse_vxi11 already registered")
+            .unwrap_or_else(|| panic!("no asynGpib line:\n{stdout}"));
+        assert_eq!(lines.get(gpib + 1).copied(), Some("registerPort failed"));
+        assert!(!stdout.contains("asynCommon:registerDriver"), "{stdout}");
+    }
+
+    /// drvAsynUSBTMC.c:1278.
+    #[test]
+    fn usbtmc_configure_prints_c_register_refusal() {
+        const CHILD: &str = "ASYN_RS_USBTMC_CONFIGURE_PRINTS_C_REGISTER_REFUSAL_CHILD";
+        const TEST: &str = "iocsh::tests::usbtmc_configure_prints_c_register_refusal";
+        if std::env::var_os(CHILD).is_some() {
+            let cmd = usbtmc_configure_command(PortServices::new());
+            let args = [
+                ArgValue::String("refuse_usbtmc".into()),
+                ArgValue::Int(0x0699),
+                ArgValue::Int(0x0368),
+                ArgValue::String(Default::default()),
+                ArgValue::Int(0),
+                ArgValue::Int(0),
+            ];
+            call_configure(&cmd, &args);
+            println!("---second");
+            call_configure(&cmd, &args);
+            return;
+        }
+        let (stdout, _) = run_child(TEST, CHILD);
+        let at = stdout.find("---second").expect("marker");
+        assert!(!stdout[..at].contains("registerPort failed"), "{stdout}");
+        assert!(
+            stdout[at..].lines().any(|l| l == "registerPort failed"),
+            "{stdout}"
+        );
+    }
+
+    /// The asynOctet named-device commands print what C's do
+    /// (asynShellCommands.c:331-516): a connect keyed by device name, the
+    /// read's eomReason and escaped data, and each refusal's line.
+    #[test]
+    fn octet_device_shell_commands_print_cs_lines() {
+        use crate::interpose::EomReason;
+        use std::collections::VecDeque;
+
+        /// Queues what is written; a read takes what fits.
+        struct Queue {
+            base: PortDriverBase,
+            queued: VecDeque<u8>,
+        }
+        impl PortDriver for Queue {
+            fn base(&self) -> &PortDriverBase {
+                &self.base
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.base
+            }
+            fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+                self.queued.extend(data.iter().copied());
+                Ok(data.len())
+            }
+            fn io_read_octet(
+                &mut self,
+                _user: &AsynUser,
+                buf: &mut [u8],
+            ) -> crate::interpose::OctetReadResult {
+                let n = buf.len().min(self.queued.len());
+                for (b, q) in buf.iter_mut().zip(self.queued.drain(..n)) {
+                    *b = q;
+                }
+                let eom = if n == buf.len() {
+                    EomReason::CNT
+                } else {
+                    EomReason::empty()
+                };
+                crate::interpose::OctetReadResult::ok(n, eom)
+            }
+        }
+
+        let mgr = Arc::new(PortManager::new());
+        mgr.register_port_unclaimed(
+            Queue {
+                base: shell_test_base("octet_dev_port"),
+                queued: VecDeque::new(),
+            },
+            &crate::registry::open_owner(),
+        )
+        .unwrap();
+
+        let out = shell_output(
+            mgr,
+            &[
+                "asynOctetWrite od_dev ab",
+                "asynOctetConnect od_dev octet_dev_port",
+                "asynOctetConnect od_dev octet_dev_port",
+                "asynOctetConnect od_dev2 octet_dev_missing",
+                "asynOctetWrite od_dev ab",
+                "asynOctetRead od_dev 0",
+                "asynOctetWriteRead od_dev xy 1",
+                "asynOctetFlush od_dev",
+                "asynOctetDisconnect od_dev",
+                "asynOctetDisconnect od_dev",
+                "asynOctetDisconnect",
+                "asynOctetRead od_dev",
+            ],
+        );
+        assert_eq!(
+            out,
+            "Entry not found\n\
+             Entry already connected\n\
+             connect failed asynManager:connectDevice port octet_dev_missing not found\n\
+             eomReason 0x0\n\
+             ab\n\
+             eomReason 0x1\n\
+             x\n\
+             device name not found\n\
+             device name not specified\n\
+             Entry not found\n"
+        );
+    }
+
+    /// asynShellCommands.c:419/:494 print `nread` on a failed read, so a
+    /// read that delivered bytes before it timed out reports them in `ninp=`.
+    #[test]
+    fn a_failed_octet_read_reports_the_bytes_it_delivered() {
+        use crate::interpose::{EomReason, OctetReadResult};
+        use crate::trace::TraceFile;
+
+        /// Every read delivers `abc` and then times out.
+        struct Cut {
+            base: PortDriverBase,
+        }
+        impl PortDriver for Cut {
+            fn base(&self) -> &PortDriverBase {
+                &self.base
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.base
+            }
+            fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+                Ok(data.len())
+            }
+            fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> OctetReadResult {
+                buf[..3].copy_from_slice(b"abc");
+                OctetReadResult {
+                    status: Err(AsynError::Status {
+                        status: AsynStatus::Timeout,
+                        message: "cut".into(),
+                    }),
+                    ..OctetReadResult::ok(3, EomReason::empty())
+                }
+            }
+        }
+
+        let port = "octet_cut_port";
+        let mgr = Arc::new(PortManager::new());
+        mgr.register_port_unclaimed(
+            Cut {
+                base: shell_test_base(port),
+            },
+            &crate::registry::open_owner(),
+        )
+        .unwrap();
+        let log = tempfile::NamedTempFile::new().unwrap();
+        let file = Arc::new(Mutex::new(log.reopen().unwrap()));
+        let trace = mgr.find_port_handle(port).unwrap().trace().clone();
+        trace.set_trace_file(Some(port), TraceFile::File(file.clone()));
+        trace.set_device_trace_file(port, 0, TraceFile::File(file));
+        shell_output(
+            mgr,
+            &[
+                &format!("asynOctetConnect cut_dev {port}"),
+                "asynOctetRead cut_dev 8",
+                "asynOctetWriteRead cut_dev xy 8",
+            ],
+        );
+        let log = std::fs::read_to_string(log.path()).unwrap();
+        assert!(log.contains("Error reading, ninp=3 error"), "{log}");
+        assert!(
+            log.contains("Error in WriteRead, nout 2 ninp=3 error"),
+            "{log}"
         );
     }
 }

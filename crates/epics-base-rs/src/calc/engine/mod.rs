@@ -7,7 +7,6 @@ pub mod postfix;
 pub mod random;
 pub mod scanf;
 pub(crate) mod stack;
-pub mod strtod;
 pub mod token;
 
 pub mod checksum;
@@ -16,6 +15,7 @@ pub mod value;
 
 pub mod array;
 pub mod array_value;
+pub(crate) mod bytecode;
 
 use error::CalcError;
 use opcodes::Opcode;
@@ -30,32 +30,27 @@ pub enum ExprKind {
     Array,
 }
 
+/// A compiled program: C's postfix bytes in its dialect's encoding
+/// (`bytecode.rs`), exactly what C's `postfix()`, `sCalcPostfix()` or
+/// `aCalcPostfix()` writes for the same source. A record keeps it inline in an
+/// [`Rpcl`]; the evaluators take either as `&[u8]`.
 #[derive(Debug, Clone)]
 pub struct CompiledExpr {
-    pub code: Vec<Opcode>,
+    code: Vec<u8>,
     pub kind: ExprKind,
-    /// C's `USES_STRING` marker — the byte `sCalcPostfix` writes at the head of
-    /// the postfix, and the ONLY thing `sCalcPerform` looks at to choose between
-    /// its two evaluators (`sCalcPerform.c:399`).
-    ///
-    /// It is a property of the SOURCE, not of the compiled code: C sets it while
-    /// looking each element up (`sCalcPostfix.c:447-471`), so it latches on the
-    /// element the lexer FOUND — before the compiler has had a chance to rewrite
-    /// it. `AA:="x";1` is the case that pins the difference: `AA` is looked up as
-    /// `FETCH_AA` (string-typed → marker set) and only afterwards retracted and
-    /// rewritten to `STORE_AA` (`:552-557`), which is NOT in the marker's list.
-    /// So the program is USES_STRING even though no string-typed opcode survives
-    /// in it, and C runs the string evaluator — the one whose STORE_AA writes the
-    /// string args.
-    ///
-    /// A re-scan of the finished opcodes cannot see that, which is why the flag is
-    /// recorded once, at the lookup, by its single owner (`postfix::compile`) and
-    /// carried here. Always `false` for the numeric and array engines, which have
-    /// no such marker.
-    pub uses_string: bool,
+}
+
+impl AsRef<[u8]> for CompiledExpr {
+    fn as_ref(&self) -> &[u8] {
+        &self.code
+    }
 }
 
 impl CompiledExpr {
+    pub(crate) fn new(code: Vec<u8>, kind: ExprKind) -> Self {
+        Self { code, kind }
+    }
+
     /// C's `*pout = END_EXPRESSION` buffer — the program a compiler leaves
     /// behind when it has nothing to say.
     ///
@@ -68,62 +63,37 @@ impl CompiledExpr {
     /// ([`is_empty`](Self::is_empty)).
     pub fn empty(kind: ExprKind) -> Self {
         Self {
-            code: Vec::new(),
+            code: vec![bytecode::END],
             kind,
-            // C writes `NO_STRING` first and only overwrites it when an element
-            // says otherwise (`sCalcPostfix.c:437`); the empty program has no
-            // elements. It is refused before the marker is ever read, anyway.
-            uses_string: false,
         }
+    }
+
+    /// The postfix bytes.
+    pub fn code(&self) -> &[u8] {
+        &self.code
     }
 
     /// C `*post == END_EXPRESSION` — the program has no instruction to run.
-    ///
-    /// The single definition of that test: all three evaluators refuse such a
-    /// program, so a failed or empty compile fails every evaluation instead of
-    /// quietly yielding a value.
+    /// All three evaluators refuse such a program, so a failed or empty
+    /// compile fails every evaluation instead of quietly yielding a value.
     pub fn is_empty(&self) -> bool {
-        self.code
-            .iter()
-            .all(|op| matches!(op, Opcode::Core(opcodes::CoreOp::End)))
+        bytecode::is_empty(&self.code)
     }
 
-    /// C's UNTIL ceiling — a STATIC pre-scan of the whole postfix, run before a
-    /// single opcode executes (`sCalcPerform.c:341-365`, and `aCalcPerform.c:355-390`
-    /// with `MAX_UNTIL_OP` for the literal 10):
-    ///
-    /// ```c
-    /// /* find all UNTIL operators in postfix, noting their locations */
-    /// for (i=0, post=postfix; *post != END_EXPRESSION; post++) {
-    ///     switch (*post) {
-    ///     case UNTIL:
-    ///         until_scratch[i].until_loc = post;
-    ///         i++;
-    ///         if (i>9) { printf("sCalcPerform: too many UNTILs\n"); return(-1); }
-    ///         break;
-    ///     ...
-    /// ```
-    ///
-    /// The count is of UNTIL **opcodes present**, not of UNTILs executed, so
-    /// reachability is irrelevant: compiled C fails
-    /// `0?(UNTIL(1)+…ten of them…):7` with -1 even though the conditional never
-    /// takes that branch — and runs the nine-UNTIL version to 7.
-    ///
-    /// Both evaluators used to count at RUN time instead, incrementing as each new
-    /// UNTIL was first reached, so the ten-on-a-dead-branch program evaluated
-    /// happily. This is the single owner of the ceiling for both of them; the
-    /// scratch table each keeps at run time is now only a location map, with no
-    /// ceiling of its own to enforce.
-    pub fn check_until_ceiling(&self) -> Result<(), CalcError> {
-        let untils = self
-            .code
-            .iter()
-            .filter(|op| matches!(op, Opcode::Control(opcodes::ControlOp::Until(_))))
-            .count();
-        if untils > MAX_UNTILS {
-            return Err(CalcError::Overflow);
-        }
-        Ok(())
+    /// C's `USES_STRING` head byte (`sCalcPostfix.c:447-471`), the only thing
+    /// `sCalcPerform` looks at to choose between its two evaluators
+    /// (`sCalcPerform.c:399`). It latches on the element the lexer FOUND, so
+    /// `AA:="x";1` is USES_STRING although its `FETCH_AA` was rewritten to
+    /// `STORE_AA`. Always `false` for the numeric and array dialects.
+    pub fn uses_string(&self) -> bool {
+        self.kind == ExprKind::String && bytecode::uses_string(&self.code)
+    }
+
+    /// The decoded instructions, up to `END_EXPRESSION`.
+    pub fn ops(&self) -> Vec<Opcode> {
+        bytecode::instructions(self.kind, &self.code)
+            .map(|(_, op)| op)
+            .collect()
     }
 
     /// Compute which input arguments this expression reads and which it
@@ -136,17 +106,16 @@ impl CompiledExpr {
         use opcodes::CoreOp;
         let mut inputs: u32 = 0;
         let mut stores: u32 = 0;
-        for op in &self.code {
+        for (_, op) in bytecode::instructions(self.kind, &self.code) {
             match op {
-                Opcode::Core(CoreOp::End) => break,
                 Opcode::Core(CoreOp::PushVar(idx)) | Opcode::Core(CoreOp::PushDoubleVar(idx)) => {
-                    if (*idx as usize) < CALC_NARGS {
-                        inputs |= (1u32 << *idx) & !stores;
+                    if (idx as usize) < CALC_NARGS {
+                        inputs |= (1u32 << idx) & !stores;
                     }
                 }
                 Opcode::Core(CoreOp::StoreVar(idx)) | Opcode::Core(CoreOp::StoreDoubleVar(idx)) => {
-                    if (*idx as usize) < CALC_NARGS {
-                        stores |= 1u32 << *idx;
+                    if (idx as usize) < CALC_NARGS {
+                        stores |= 1u32 << idx;
                     }
                 }
                 _ => {}
@@ -155,15 +124,62 @@ impl CompiledExpr {
         (inputs, stores)
     }
 
-    /// Produce a human-readable disassembly of the compiled postfix stream,
-    /// one opcode per line, analogous to C `calcExprDump` (`postfix.c:541-654`).
-    /// Diagnostics only.
+    /// One instruction per line with its byte offset, analogous to C
+    /// `calcExprDump` (`postfix.c:541-654`). Diagnostics only.
     pub fn disassemble(&self) -> String {
-        let mut out = String::new();
-        for (i, op) in self.code.iter().enumerate() {
-            out.push_str(&format!("{:4}: {:?}\n", i, op));
+        bytecode::disassemble(self.kind, &self.code)
+    }
+}
+
+/// C `INFIX_TO_POSTFIX_SIZE(n)` (`postfix.h:60`): the postfix buffer an
+/// `n`-byte infix field needs.
+pub const fn infix_to_postfix_size(n: usize) -> usize {
+    n * 21 / 6
+}
+
+/// A record's `RPCL`/`ORPC` field: the compiled program inline, in a buffer of
+/// the C record's size (`calcRecord.dbd` `rpcl[INFIX_TO_POSTFIX_SIZE(160)]`,
+/// `sCalcoutRecord.dbd` `rpcl[282]`, ...).
+#[derive(Debug, Clone)]
+pub struct Rpcl<const N: usize> {
+    code: [u8; N],
+}
+
+impl<const N: usize> Rpcl<N> {
+    /// The `END_EXPRESSION` program ([`CompiledExpr::empty`]).
+    pub const fn empty() -> Self {
+        Self {
+            code: [bytecode::END; N],
         }
-        out
+    }
+
+    /// Copy `expr` in. C's buffer is sized so that no infix its field can hold
+    /// compiles past it; a program that does not fit is refused, and the
+    /// buffer holds the `END_EXPRESSION` program instead.
+    pub fn set(&mut self, expr: &CompiledExpr) -> Result<(), CalcError> {
+        let src = expr.code();
+        if src.len() > N {
+            self.code[0] = bytecode::END;
+            return Err(CalcError::Internal);
+        }
+        self.code[..src.len()].copy_from_slice(src);
+        Ok(())
+    }
+
+    pub fn is_empty(&self) -> bool {
+        bytecode::is_empty(&self.code)
+    }
+}
+
+impl<const N: usize> Default for Rpcl<N> {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
+impl<const N: usize> AsRef<[u8]> for Rpcl<N> {
+    fn as_ref(&self) -> &[u8] {
+        &self.code
     }
 }
 
@@ -238,12 +254,6 @@ pub(crate) fn abs_val(x: f64) -> f64 {
 /// fields A..U). Doubled-letter previous-value slots (LA..LU) and any
 /// per-record array slots scale to the same size.
 pub const CALC_NARGS: usize = 21;
-
-/// C's `until_scratch[10]` guarded by `if (i>9) return(-1)` (`sCalcPerform.c:329`,
-/// `:356-360`) and aCalc's `MAX_UNTIL_OP 10` with `if (i > (MAX_UNTIL_OP-1))`
-/// (`aCalcPerform.c:297`, `:369-373`). The TENTH distinct UNTIL fails the perform,
-/// so the usable ceiling is nine — the same in both engines.
-const MAX_UNTILS: usize = 9;
 
 #[derive(Debug, Clone)]
 pub struct NumericInputs {

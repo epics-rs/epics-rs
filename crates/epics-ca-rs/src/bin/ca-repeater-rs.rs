@@ -92,7 +92,7 @@ fn main() {
             //
             // After detach, stderr goes to /dev/null. The eprintln! is
             // still useful when `-v` or `-d` was passed.
-            eprintln!("ca-repeater: {e}");
+            epics_libcom_rs::stderr_println!("ca-repeater: {e}");
             std::process::exit(1);
         }
     });
@@ -103,10 +103,9 @@ fn main() {
 /// rather than `/dev/null`.
 #[cfg(exec_backend)]
 fn main() -> std::process::ExitCode {
-    eprintln!(
+    epics_base_rs::runtime::task::refuse_backend(
         "ca-repeater-rs: this build selects the reactor-free execution backend \
          (EPICS_RS_BUILD_EXEC_BACKEND=thread), and the repeater's UDP loops need \
-         a tokio reactor. Unset that variable and rebuild to run the repeater."
-    );
-    std::process::ExitCode::FAILURE
+         a tokio reactor. Unset that variable and rebuild to run the repeater.",
+    )
 }

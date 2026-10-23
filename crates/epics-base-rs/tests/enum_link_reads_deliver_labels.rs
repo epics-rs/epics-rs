@@ -20,7 +20,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use epics_base_rs::server::database::{LinkMetadata, LinkPutOp, LinkSet, PvDatabase};
+use epics_base_rs::server::database::{LinkMetadata, LinkPutOp, LinkRef, LinkSet, PvDatabase};
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::types::EpicsValue;
 
@@ -120,7 +120,7 @@ async fn lsi_inp_at_char_array_source_reads_the_bytes() {
         let rec = db.get_record("WFC").unwrap();
         let mut inst = rec.write();
         inst.record
-            .put_field_internal("VAL", EpicsValue::CharArray(b"hello".to_vec().into()))
+            .put_field_internal("VAL", EpicsValue::CharArray(b"hello\0".to_vec().into()))
             .unwrap();
     }
     process(&db, "LIC").await;
@@ -214,25 +214,25 @@ struct EnumLset {
 
 #[epics_base_rs::async_trait]
 impl LinkSet for EnumLset {
-    fn is_connected(&self, _name: &str) -> bool {
+    fn is_connected(&self, _name: LinkRef<'_>) -> bool {
         true
     }
-    fn get_cached_value(&self, _name: &str) -> Option<EpicsValue> {
+    fn get_cached_value(&self, _name: LinkRef<'_>) -> Option<EpicsValue> {
         Some(self.value.clone())
     }
-    async fn get_value(&self, name: &str) -> Option<EpicsValue> {
-        self.get_cached_value(name)
+    async fn get_value(&self, link: LinkRef<'_>) -> Option<EpicsValue> {
+        self.get_cached_value(link)
     }
     async fn put_value(
         &self,
-        _name: &str,
+        _name: LinkRef<'_>,
         value: EpicsValue,
         _op: LinkPutOp,
     ) -> Result<(), String> {
         *self.last_put.lock().unwrap() = Some(value);
         Ok(())
     }
-    fn link_metadata(&self, _name: &str) -> Option<LinkMetadata> {
+    fn link_metadata(&self, _name: LinkRef<'_>) -> Option<LinkMetadata> {
         Some(self.metadata.clone())
     }
 }
@@ -254,6 +254,7 @@ async fn stringin_inp_at_external_enum_renders_via_cached_choices() {
         }),
     )
     .await;
+    db.process_cp_links_on_connect().await;
     process(&db, "SIX").await;
     assert_eq!(
         field_str(&db, "SIX", "VAL"),
@@ -276,6 +277,7 @@ async fn stringin_inp_at_external_enum_without_choices_falls_back_to_digits() {
         }),
     )
     .await;
+    db.process_cp_links_on_connect().await;
     process(&db, "SIY").await;
     assert_eq!(field_str(&db, "SIY", "VAL"), "1");
 }

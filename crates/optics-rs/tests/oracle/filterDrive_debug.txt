@@ -1,0 +1,152 @@
+=== debug 15, energy 12
+filterDrive: Energy change detected
+filterDrive: entering state: update_filters
+filterDrive: Calculating transmission for blade 0.
+  species = 'C', index = 2
+  density = 1.7000e+00 gm/cm3, thickness = 1.0000e+02 um
+  energy = 1.2000e+01
+  E1 = 1.1793e+01 keV, mu1 = 1.4320e+00
+  E2 = 1.2607e+01 keV, mu2 = 1.1995e+00
+  frac = 0.2543, mu = 1.3729e+00
+  attenuation length ='4.2847e+03' um, transmission=9.7693e-01
+filterDrive: Calculating transmission for blade 1.
+  species = 'C', index = 2
+  density = 1.7000e+00 gm/cm3, thickness = 1.0000e+02 um
+  energy = 1.2000e+01
+  E1 = 1.1793e+01 keV, mu1 = 1.4320e+00
+  E2 = 1.2607e+01 keV, mu2 = 1.1995e+00
+  frac = 0.2543, mu = 1.3729e+00
+  attenuation length ='4.2847e+03' um, transmission=9.7693e-01
+filterDrive: <#-enabled>=2, <#-permutations>=4, transmission=1.000000e+00
+  00: 00    1.000000e+00
+  01: 01    9.769314e-01
+  10: 10    9.769314e-01
+  11: 11    9.543949e-01
+filterDrive: Current index = 0
+filterDrive: Filter up: index = 0, transm = 1.000000e+00
+filterDrive: Filter down: index = 1, transm = 9.769314e-01
+=== debug 1, setpoint 0.5
+filterDrive: transmission setpoint changed.
+Action = 0
+filterDrive: Required transmission = 5.000000e-01
+filterDrive: New filter index: 3
+filterDrive: Selected filters are: 11   Transmission = 9.543949e-01
+filterDrive: Busy record was set
+filterDrive: entering state: update_filters
+filterDrive: clearing busy record.
+=== step up
+filterDrive: step up.
+Action = 1
+filterDrive: Next filter pattern is 01,  Transmission = 9.769314e-01
+filterDrive: Busy record was set
+filterDrive: entering state: update_filters
+filterDrive: clearing busy record.
+=== step down
+filterDrive: step down.
+Action = 2
+filterDrive: Next filter pattern is 11,  Transmission = 9.543949e-01
+filterDrive: Busy record was set
+filterDrive: entering state: update_filters
+filterDrive: clearing busy record.
+=== mask 9
+filterDrive: filter mask setpoint changed.
+Action = 3
+filterDrive: ERROR! Invalid filter mask: 9
+filterDrive:   Valid masks are in the range (0 - 3)
+filterDrive: Busy record was set
+filterDrive: entering state: update_filters
+filterDrive: clearing busy record.
+=== mask 2
+filterDrive: filter mask setpoint changed.
+Action = 3
+filterDrive: Required filter mask: 2
+filterDrive: Adjusted filter mask: 2
+filterDrive: Next filter pattern is 10,  Transmission = 9.769314e-01
+filterDrive: Busy record was set
+filterDrive: entering state: update_filters
+filterDrive: clearing busy record.
+=== setpoint 0.5
+filterDrive: transmission setpoint changed.
+Action = 0
+filterDrive: Required transmission = 5.000000e-01
+filterDrive: New filter index: 3
+filterDrive: Selected filters are: 11   Transmission = 9.543949e-01
+filterDrive: Busy record was set
+filterDrive: entering state: update_filters
+filterDrive: clearing busy record.
+=== setpoint 0.5 again
+filterDrive: transmission setpoint changed.
+Action = 0
+filterDrive: Required transmission = 5.000000e-01
+filterDrive: New filter index: 3
+filterDrive: Selected filters are: 11   Transmission = 9.543949e-01
+NO CHANGE! Current settings are best.
+filterDrive: Busy record was set
+filterDrive: entering state: update_filters
+filterDrive: clearing busy record.
+=== step down at the bottom
+filterDrive: step down.
+Action = 2
+filterDrive: No more steps down available!
+filterDrive: Next filter pattern is 11,  Transmission = 9.543949e-01
+filterDrive: Busy record was set
+filterDrive: entering state: update_filters
+filterDrive: clearing busy record.
+=== mask 0
+filterDrive: filter mask setpoint changed.
+Action = 3
+filterDrive: Required filter mask: 0
+filterDrive: Adjusted filter mask: 0
+filterDrive: Next filter pattern is 00,  Transmission = 1.000000e+00
+filterDrive: Busy record was set
+filterDrive: entering state: update_filters
+filterDrive: clearing busy record.
+=== step up at the top
+filterDrive: step up.
+Action = 1
+filterDrive: No more steps up available!
+filterDrive: Next filter pattern is 00,  Transmission = 1.000000e+00
+filterDrive: Busy record was set
+filterDrive: entering state: update_filters
+filterDrive: clearing busy record.
+=== energy 1000
+filterDrive: Energy change detected
+filterDrive: entering state: update_filters
+Energy '1000.000000' not found in filter data
+Energy '1000.000000' not found in filter data
+=== debug 0, material Xx, energy 10
+=== debug 1, material 0
+filterDrive: Configuration change detected
+filterDrive: entering state: update_filters
+Filter material 'Xx' not found
+filterDrive: Busy record was set
+filterDrive: entering state: update_filters
+Filter material 'Xx' not found
+filterDrive: clearing busy record.
+=== debug 2, energy 12
+Filter material 'Xx' not found
+filterDrive: <#-enabled>=2, <#-permutations>=4, transmission=1.000000e+00
+  00: 00    1.000000e+00
+  01: 01    0.000000e+00
+  10: 10    9.769314e-01
+  11: 11    0.000000e+00
+filterDrive: Current index = 0
+filterDrive: Filter up: index = 0, transm = 1.000000e+00
+filterDrive: Filter down: index = 2, transm = 9.769314e-01
+=== debug 4, energy 13
+filterDrive: Calculating transmission for blade 0.
+Filter material 'Xx' not found
+filterDrive: Calculating transmission for blade 1.
+  species = 'C', index = 2
+  density = 1.7000e+00 gm/cm3, thickness = 1.0000e+02 um
+  energy = 1.3000e+01
+  attenuation length ='5.2783e+03' um, transmission=9.8123e-01
+=== debug 8, energy 14
+Filter material 'Xx' not found
+  E1 = 1.3477e+01 keV, mu1 = 1.0112e+00
+  E2 = 1.4407e+01 keV, mu2 = 8.5861e-01
+  frac = 0.5624, mu = 9.2539e-01
+=== energy 1000 at debug 8
+Filter material 'Xx' not found
+Energy '1000.000000' not found in filter data
+=== end

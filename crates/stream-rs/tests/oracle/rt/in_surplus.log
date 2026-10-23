@@ -1,0 +1,25 @@
+StreamCore::startProtocol(rec, startMode=StartNormal)
+StreamCore::evalCommand(rec): activeCommand = out
+StreamCore::evalOut: outputLine = "GET<0d><0a>"
+StreamCore::evalOut(rec): lockRequest(5000)
+StreamCore::lockCallback(rec, StreamIoSuccess)
+StreamCore::writeCallback(rec, StreamIoSuccess)
+StreamCore::evalCommand(rec): activeCommand = in
+StreamCore::readCallback(rec, StreamIoSuccess input="V", size=1)
+StreamCore::readCallback(rec) inputBuffer="V", size 1
+StreamCore::readCallback(rec) inTerminator <0d><0a> not found
+StreamCore::readCallback(rec) wait for more input
+StreamCore::readCallback(rec, StreamIoEnd input="AL 42 x", size=7)
+StreamCore::readCallback(rec) inputBuffer="VAL 42 x", size 8
+StreamCore::readCallback(rec) inTerminator <0d><0a> not found
+StreamCore::readCallback(rec) end flag received
+StreamCore::readCallback(rec) input line: "VAL 42 x"
+StreamCore::matchInput(rec): format = "%d"
+StreamCore::scanValue(rec, format=%d, long) input="42" value=42
+rec: 2 bytes surplus input " x"
+rec: after 6 bytes: "VAL 42"
+StreamCore::readCallback(rec) match failure
+StreamCore::finishProtocol(rec, ScanError) bus owner
+starting exception handler
+StreamCore::evalCommand(rec): activeCommand = end
+StreamCore::finishProtocol(rec, Success) bus owner

@@ -3,6 +3,7 @@
 use std::fmt;
 
 use epics_base_rs::types::PvString;
+use epics_libcom_rs::cfmt::CFloat;
 
 /// PVA scalar types. The wire encoding uses the type-code lookup table from
 /// pvData (`FieldCreateFactory.cpp`), not the enum's discriminant.
@@ -198,8 +199,8 @@ impl fmt::Display for ScalarValue {
             Self::UShort(v) => write!(f, "{v}"),
             Self::UInt(v) => write!(f, "{v}"),
             Self::ULong(v) => write!(f, "{v}"),
-            Self::Float(v) => write!(f, "{v}"),
-            Self::Double(v) => write!(f, "{v}"),
+            Self::Float(v) => write!(f, "{}", CFloat(f64::from(*v)).g()),
+            Self::Double(v) => write!(f, "{}", CFloat(*v).g()),
             Self::String(v) => write!(f, "{v}"),
         }
     }
@@ -255,6 +256,16 @@ impl ScalarValue {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// pvxs turns a double into text with `SB() << double` (`data.cpp:409`,
+    /// `:602`; `datafmt.cpp:150`), a default ostream: `%g`.
+    #[test]
+    fn float_display_is_ostream_percent_g() {
+        assert_eq!(ScalarValue::Double(1.23456789).to_string(), "1.23457");
+        assert_eq!(ScalarValue::Double(1e20).to_string(), "1e+20");
+        assert_eq!(ScalarValue::Double(-f64::NAN).to_string(), "-nan");
+        assert_eq!(ScalarValue::Float(0.1).to_string(), "0.1");
+    }
 
     #[test]
     fn scalar_type_round_trip() {

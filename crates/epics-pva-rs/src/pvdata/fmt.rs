@@ -28,6 +28,8 @@
 //! such case (an empty untyped `ScalarArray`, which the decoder never
 //! produces).
 
+use epics_libcom_rs::cfmt::CFloat;
+
 use super::scalar::{ScalarType, ScalarValue};
 use super::structure::{PvField, PvStructure, UnionItem, VariantValue};
 use super::typed_array::TypedScalarArray;
@@ -72,56 +74,15 @@ pub fn escape(s: &str) -> String {
 /// across modules is how the CLI formatter came to print `NaN` where every
 /// other caller printed `nan`.
 ///
-/// `%g` with precision `P`: round to `P` significant digits; let `X` be the
-/// resulting decimal exponent. Use `%e` when `X < -4 || X >= P`, else `%f`
-/// with `P-1-X` decimals. Either way strip trailing zeros and any trailing
-/// `.`. The `%e` exponent carries a sign and at least two digits.
-///
-/// Rust's `{}` is not `%g`: it prints the shortest round-tripping form
-/// (`0.1f64` → `0.1`, but `1e6` → `1000000` and `1.0/3.0` →
-/// `0.3333333333333333`) and spells a NaN `NaN`.
+/// [`CFloat`] owns the conversion.
 pub(crate) fn format_g(v: f64, precision: usize) -> String {
-    // glibc prints the same three words for %g, %f and %e, and libstdc++
-    // carries the sign bit of a NaN through to the text.
-    if v.is_nan() {
-        return if v.is_sign_negative() { "-nan" } else { "nan" }.to_string();
-    }
-    if v.is_infinite() {
-        return if v < 0.0 { "-inf" } else { "inf" }.to_string();
-    }
-    // `{:.*e}` rounds the mantissa to `precision` significant digits AND
-    // renormalizes the exponent (`9_999_999.0` → `1.00000e7`), so the
-    // exponent read back here is the one `%g` branches on.
-    let sci = format!("{:.*e}", precision - 1, v);
-    let (mantissa, exponent) = sci
-        .split_once('e')
-        .expect("LowerExp always emits an 'e' separator");
-    let exp: i32 = exponent
-        .parse()
-        .expect("LowerExp always emits a decimal exponent");
-    if exp < -4 || exp >= precision as i32 {
-        let sign = if exp < 0 { '-' } else { '+' };
-        format!("{}e{sign}{:02}", strip_trailing_zeros(mantissa), exp.abs())
-    } else {
-        let decimals = (precision as i32 - 1 - exp).max(0) as usize;
-        strip_trailing_zeros(&format!("{v:.decimals$}"))
-    }
+    format!("{:.precision$}", CFloat(v).g())
 }
 
 /// pvxs's precision for a real (`datafmt.cpp:148-151`): the C++ stream
 /// default of six significant digits.
-fn render_real(v: f64) -> String {
+pub(crate) fn render_real(v: f64) -> String {
     format_g(v, 6)
-}
-
-/// `%g`'s trailing-zero removal: only meaningful for a fractional form, and
-/// the `.` goes with the last zero.
-fn strip_trailing_zeros(s: &str) -> String {
-    if !s.contains('.') {
-        return s.to_string();
-    }
-    let trimmed = s.trim_end_matches('0');
-    trimmed.strip_suffix('.').unwrap_or(trimmed).to_string()
 }
 
 /// pvxs `TypeCode::name()` (`src/type.cpp:126-166`). Deliberately the C-ish
@@ -411,16 +372,7 @@ fn show_compound_array(
     out.push_str("]\n");
 }
 
-/// The differential that makes three transcriptions of `%g` safe.
-///
-/// `epics-base-rs` (`printf` record), `epics-pva-rs` (`pvget`/`pvinfo`/
-/// `pvmonitor`) and `asyn-rs` (`paramVal::report`) each carry their own
-/// `format_g`, because sharing one would force a crate dependency none of
-/// the three otherwise needs. What keeps them equal is not review but this
-/// test: each crate runs the SAME sample through its own `format_g` and
-/// through glibc's `snprintf("%.*g")` and requires byte equality. A
-/// transcription that drifts fails here, in its own crate, on the sample
-/// that caught the drift.
+/// [`format_g`] against glibc's `snprintf("%.*g")`, byte for byte.
 ///
 /// Gated on `target_env = "gnu"`: the assertion is glibc's exact output,
 /// and newlib (RTEMS) / musl are not that reference.

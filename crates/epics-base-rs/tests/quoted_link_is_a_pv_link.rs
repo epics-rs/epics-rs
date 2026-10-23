@@ -56,12 +56,9 @@ fn only_empty_text_is_an_unset_link() {
 /// JSON `{const:"…"}` form.
 #[test]
 fn numeric_text_is_still_a_constant() {
-    assert_eq!(
-        parse_link_v2("1.50"),
-        ParsedLink::Constant("1.50".to_string())
-    );
+    assert_eq!(parse_link_v2("1.50"), ParsedLink::constant("1.50"));
     assert_eq!(
         parse_link_v2(r#"{const:"hello"}"#),
-        ParsedLink::Constant("hello".to_string())
+        ParsedLink::json_constant(r#""hello""#)
     );
 }

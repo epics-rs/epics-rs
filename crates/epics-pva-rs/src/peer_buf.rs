@@ -110,12 +110,11 @@ mod tests {
     /// `<name>.push` / `<name>.resize` are all infallible growth, and all
     /// three end at `handle_alloc_error`.
     const PEER_SIZED_BUFFERS: &[(&str, &str)] = &[
-        // Server: reassembly across SegFirst..SegLast, and the socket
-        // accumulator both drivers share via `read_frame`.
-        ("src/server_native/tcp.rs", "seg_buf"),
+        // Every circuit's reassembly across SegFirst..SegLast.
+        ("src/decode.rs", "self.buf"),
+        // Server: the socket accumulator both drivers share via `read_frame`.
         ("src/server_native/tcp.rs", "rx_buf"),
-        // Client: the reader task's accumulator and its reassembly buffer.
-        ("src/client_native/server_conn.rs", "seg_buf"),
+        // Client: the reader task's accumulator.
         ("src/client_native/server_conn.rs", "rx_buf"),
         // Client: the name-server circuit's accumulator.
         ("src/client_native/search_engine.rs", "rx_buf"),
@@ -125,7 +124,7 @@ mod tests {
     /// prose (this module's own docs do quote them) cannot fail the guard.
     ///
     /// Read from disk rather than through `include_str!` — the census spans
-    /// four files in two modules — so `production_str` rather than the
+    /// four files across three modules — so `production_str` rather than the
     /// memoized `production`.
     fn production_source(path: &str) -> String {
         let full = std::fs::read_to_string(format!("{}/{path}", env!("CARGO_MANIFEST_DIR")))

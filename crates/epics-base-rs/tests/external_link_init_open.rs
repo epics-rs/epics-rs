@@ -28,7 +28,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use epics_base_rs::server::database::{LinkSet, PvDatabase};
+use epics_base_rs::server::database::{LinkRef, LinkSet, PvDatabase, RecordLoad};
 use epics_base_rs::server::record::ParsedLink;
 use epics_base_rs::server::records::ai::AiRecord;
 use epics_base_rs::server::records::ao::AoRecord;
@@ -67,48 +67,69 @@ impl CountingLset {
 
 #[async_trait::async_trait]
 impl LinkSet for CountingLset {
-    fn is_connected(&self, name: &str) -> bool {
-        self.cache.lock().contains_key(name)
-    }
-
-    async fn get_value(&self, name: &str) -> Option<EpicsValue> {
-        self.network_reads.fetch_add(1, Ordering::SeqCst);
-        self.connect_link(name).await;
-        self.cache.lock().get(name).cloned()
-    }
-
-    fn get_cached_value(&self, name: &str) -> Option<EpicsValue> {
-        self.cache.lock().get(name).cloned()
-    }
-
-    async fn connect_link(&self, name: &str) {
-        self.opened.lock().push(name.to_string());
+    fn is_connected(&self, link: LinkRef<'_>) -> bool {
+        let name = link.name;
         self.cache
             .lock()
-            .insert(name.to_string(), EpicsValue::Double(12.5));
+            .contains_key(std::str::from_utf8(name).unwrap())
+    }
+
+    async fn get_value(&self, link: LinkRef<'_>) -> Option<EpicsValue> {
+        let name = link.name;
+        self.network_reads.fetch_add(1, Ordering::SeqCst);
+        self.connect_link(link, None).await;
+        self.cache
+            .lock()
+            .get(std::str::from_utf8(name).unwrap())
+            .cloned()
+    }
+
+    fn get_cached_value(&self, link: LinkRef<'_>) -> Option<EpicsValue> {
+        let name = link.name;
+        self.cache
+            .lock()
+            .get(std::str::from_utf8(name).unwrap())
+            .cloned()
+    }
+
+    async fn connect_link(
+        &self,
+        link: LinkRef<'_>,
+        _: Option<epics_base_rs::server::database::CaLinkInit>,
+    ) {
+        let name = link.name;
+        self.opened
+            .lock()
+            .push(String::from_utf8_lossy(name).into_owned());
+        self.cache.lock().insert(
+            String::from_utf8_lossy(name).into_owned(),
+            EpicsValue::Double(12.5),
+        );
     }
 }
 
 async fn add_ai(db: &PvDatabase, name: &str, inp: &str) {
-    db.add_record(name, Box::new(AiRecord::new(0.0)))
-        .await
-        .unwrap();
-    let rec = db.get_record(name).expect("just added");
-    let mut inst = rec.write();
-    inst.put_common_field("INP", EpicsValue::String(inp.into()))
-        .unwrap();
-    inst.common.udf = 0;
+    // As a `.db` loads it, so iocInit is what opens the link.
+    db.add_loaded_record(
+        name,
+        Box::new(AiRecord::new(0.0)),
+        RecordLoad::from_common_fields(vec![("INP".into(), EpicsValue::String(inp.into()))]),
+    )
+    .await
+    .unwrap();
+    db.get_record(name).expect("just added").write().common.udf = 0;
 }
 
 async fn add_ao(db: &PvDatabase, name: &str, out: &str) {
-    db.add_record(name, Box::new(AoRecord::new(0.0)))
-        .await
-        .unwrap();
-    let rec = db.get_record(name).expect("just added");
-    let mut inst = rec.write();
-    inst.put_common_field("OUT", EpicsValue::String(out.into()))
-        .unwrap();
-    inst.common.udf = 0;
+    // As a `.db` loads it, so iocInit is what opens the link.
+    db.add_loaded_record(
+        name,
+        Box::new(AoRecord::new(0.0)),
+        RecordLoad::from_common_fields(vec![("OUT".into(), EpicsValue::String(out.into()))]),
+    )
+    .await
+    .unwrap();
+    db.get_record(name).expect("just added").write().common.udf = 0;
 }
 
 async fn process(db: &PvDatabase, name: &str) {
@@ -134,7 +155,10 @@ async fn non_cp_external_inp_link_is_opened_at_init_not_on_first_scan() {
     let reads = Arc::new(AtomicUsize::new(0));
     let lset = CountingLset::new(&reads);
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     db.register_link_set("ca", lset.clone()).await;
+    db.process_cp_links_on_connect().await;
 
     // No `CP` / `CPP` modifier — `setup_cp_links` ignores this link entirely.
     add_ai(&db, "AI_PLAIN", "ca://REMOTE:IN").await;
@@ -173,6 +197,8 @@ async fn out_only_external_link_is_opened_at_init() {
     let reads = Arc::new(AtomicUsize::new(0));
     let lset = CountingLset::new(&reads);
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     db.register_link_set("ca", lset.clone()).await;
 
     add_ao(&db, "AO_PLAIN", "ca://REMOTE:OUT").await;
@@ -196,6 +222,8 @@ async fn record_specific_input_link_fields_are_opened_at_init() {
     let reads = Arc::new(AtomicUsize::new(0));
     let lset = CountingLset::new(&reads);
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     db.register_link_set("ca", lset.clone()).await;
 
     db.add_record("CALC1", Box::new(CalcRecord::new("A+B")))
@@ -230,6 +258,8 @@ async fn local_and_constant_links_stage_nothing() {
     let reads = Arc::new(AtomicUsize::new(0));
     let lset = CountingLset::new(&reads);
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     db.register_link_set("ca", lset.clone()).await;
 
     db.add_record("LOCAL_TGT", Box::new(AiRecord::new(1.0)))
@@ -261,7 +291,10 @@ async fn plain_non_local_db_link_converts_and_opens_at_init() {
     let reads = Arc::new(AtomicUsize::new(0));
     let lset = CountingLset::new(&reads);
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     db.register_link_set("ca", lset.clone()).await;
+    db.process_cp_links_on_connect().await;
 
     // No modifier at all — `setup_cp_links` never looked at this link, and
     // pre-fix nothing else converted or opened it either.
@@ -307,6 +340,8 @@ async fn plain_non_local_db_link_keeps_its_field_in_the_channel_name() {
     let reads = Arc::new(AtomicUsize::new(0));
     let lset = CountingLset::new(&reads);
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     db.register_link_set("ca", lset.clone()).await;
 
     add_ai(&db, "AI_NONLOCAL_FLD", "OTHER:PV.SEVR").await;
@@ -326,6 +361,8 @@ async fn local_db_link_is_not_converted() {
     let reads = Arc::new(AtomicUsize::new(0));
     let lset = CountingLset::new(&reads);
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     db.register_link_set("ca", lset.clone()).await;
 
     db.add_record("LOCAL_SRC", Box::new(AiRecord::new(7.0)))
@@ -363,6 +400,8 @@ async fn non_local_cp_link_keeps_its_conversion_and_its_external_trigger() {
     let reads = Arc::new(AtomicUsize::new(0));
     let lset = CountingLset::new(&reads);
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     db.register_link_set("ca", lset.clone()).await;
 
     add_ai(&db, "AI_CP_NONLOCAL", "OTHER:CP CP").await;
@@ -381,9 +420,7 @@ async fn non_local_cp_link_keeps_its_conversion_and_its_external_trigger() {
         other => panic!("a non-local CP link must be Ca, got {other:?}"),
     }
     assert!(
-        db.external_cp_pv_names()
-            .await
-            .contains(&"OTHER:CP".to_string()),
+        db.external_cp_pv_names().await.contains(&"OTHER:CP".into()),
         "the external CP trigger must still be registered"
     );
 }
@@ -398,6 +435,8 @@ async fn a_record_added_after_init_does_not_un_convert_the_link() {
     let reads = Arc::new(AtomicUsize::new(0));
     let lset = CountingLset::new(&reads);
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     db.register_link_set("ca", lset.clone()).await;
 
     add_ai(&db, "AI_EARLY", "LATE_SRC").await;
@@ -427,6 +466,8 @@ async fn constant_link_is_not_converted() {
     let reads = Arc::new(AtomicUsize::new(0));
     let lset = CountingLset::new(&reads);
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     db.register_link_set("ca", lset.clone()).await;
 
     add_ai(&db, "AI_CONST2", "3.5").await;
@@ -452,17 +493,19 @@ async fn external_forward_link_is_opened_at_init() {
     let reads = Arc::new(AtomicUsize::new(0));
     let lset = CountingLset::new(&reads);
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     db.register_link_set("ca", lset.clone()).await;
 
     db.add_record("AI_FWD", Box::new(AiRecord::new(0.0)))
         .await
         .unwrap();
-    {
-        let rec = db.get_record("AI_FWD").expect("just added");
-        let mut inst = rec.write();
-        inst.put_common_field("FLNK", EpicsValue::String("ca://REMOTE:FWD.PROC".into()))
-            .unwrap();
-    }
+    db.put_pv_no_process(
+        "AI_FWD.FLNK",
+        EpicsValue::String("ca://REMOTE:FWD.PROC".into()),
+    )
+    .await
+    .unwrap();
 
     let staged = db.setup_external_link_opens().await;
     assert_eq!(staged, 1, "an external FLNK must be staged at init");
@@ -484,6 +527,8 @@ async fn local_forward_link_stages_nothing() {
     let reads = Arc::new(AtomicUsize::new(0));
     let lset = CountingLset::new(&reads);
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     db.register_link_set("ca", lset.clone()).await;
 
     db.add_record("FWD_TGT", Box::new(AiRecord::new(1.0)))
@@ -492,12 +537,9 @@ async fn local_forward_link_stages_nothing() {
     db.add_record("AI_FWD_LOCAL", Box::new(AiRecord::new(0.0)))
         .await
         .unwrap();
-    {
-        let rec = db.get_record("AI_FWD_LOCAL").expect("just added");
-        let mut inst = rec.write();
-        inst.put_common_field("FLNK", EpicsValue::String("FWD_TGT".into()))
-            .unwrap();
-    }
+    db.put_pv_no_process("AI_FWD_LOCAL.FLNK", EpicsValue::String("FWD_TGT".into()))
+        .await
+        .unwrap();
 
     let staged = db.setup_external_link_opens().await;
     assert_eq!(staged, 0, "a local FLNK resolves as a DB link");
@@ -519,6 +561,8 @@ async fn forward_link_never_registers_a_cp_holder() {
     let reads = Arc::new(AtomicUsize::new(0));
     let lset = CountingLset::new(&reads);
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     db.register_link_set("ca", lset.clone()).await;
 
     db.add_record("CP_SRC", Box::new(AiRecord::new(1.0)))
@@ -527,16 +571,13 @@ async fn forward_link_never_registers_a_cp_holder() {
     db.add_record("AI_FWD_CP", Box::new(AiRecord::new(0.0)))
         .await
         .unwrap();
-    {
-        let rec = db.get_record("AI_FWD_CP").expect("just added");
-        let mut inst = rec.write();
-        inst.put_common_field("FLNK", EpicsValue::String("CP_SRC CP".into()))
-            .unwrap();
-    }
+    db.put_pv_no_process("AI_FWD_CP.FLNK", EpicsValue::String("CP_SRC CP".into()))
+        .await
+        .unwrap();
 
     db.setup_cp_links().await;
     assert!(
-        db.get_cp_targets("CP_SRC").is_empty(),
+        db.get_external_cp_targets(b"CP_SRC").is_empty(),
         "a forward link's CP modifier is masked off, so no holder edge exists"
     );
 }
@@ -552,6 +593,8 @@ async fn external_cp_link_already_warmed_is_not_staged_again() {
     let reads = Arc::new(AtomicUsize::new(0));
     let lset = CountingLset::new(&reads);
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     db.register_link_set("ca", lset.clone()).await;
 
     add_ai(&db, "AI_CP", "ca://REMOTE:CP CP").await;
@@ -586,6 +629,8 @@ async fn external_cp_link_already_warmed_is_not_staged_again() {
 #[epics_macros_rs::epics_test]
 async fn no_link_set_registered_stages_nothing_and_leaves_the_link_openable() {
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     add_ai(&db, "AI_NOLSET", "ca://REMOTE:IN").await;
 
     assert_eq!(

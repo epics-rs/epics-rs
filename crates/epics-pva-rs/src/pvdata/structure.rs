@@ -254,9 +254,8 @@ impl PvField {
     ///   `UnionArray` PVs routed through this recovery are therefore
     ///   not round-trippable here. Producers that need wire-faithful
     ///   introspection should hand the canonical descriptor through
-    ///   their registration API (e.g.
-    ///   `epics_bridge_rs::qsrv::PvaPvHandle::descriptor`) so the
-    ///   server emits it directly instead of calling this recovery.
+    ///   the PV's `open` (`SharedPV::open`) so the server emits it
+    ///   directly instead of calling this recovery.
     /// - `Variant` with no captured descriptor and bare `Null` both
     ///   degrade to `FieldDesc::Variant`.
     pub fn descriptor(&self) -> FieldDesc {
@@ -347,7 +346,7 @@ impl PvField {
                 }
                 FieldDesc::Structure {
                     struct_id: s.struct_id.clone(),
-                    fields,
+                    fields: fields.into(),
                 }
             }
             Self::StructureArray(arr) => {
@@ -360,7 +359,7 @@ impl PvField {
                 }
                 FieldDesc::StructureArray {
                     struct_id: first.struct_id.clone(),
-                    fields,
+                    fields: fields.into(),
                 }
             }
             // Sibling variants / per-item selector indices are not

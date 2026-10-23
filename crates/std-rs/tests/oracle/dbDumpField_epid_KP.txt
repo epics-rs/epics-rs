@@ -1,0 +1,18 @@
+recordtype(epid) 
+    KP
+	         prompt: Proportional Gain
+	          extra: 
+	      indRecordType: 64
+	        special: 0 
+	     field_type: DBF_DOUBLE
+	process_passive: 0
+	       property: 0
+	           base: 0
+	    promptgroup: 30 - Action
+	       interest: 1
+	       as_level: 1
+	        initial: 
+	           size: 8
+	         offset: 1088
+Attribute: name RTYP value epid
+Attribute: name VERS value none specified

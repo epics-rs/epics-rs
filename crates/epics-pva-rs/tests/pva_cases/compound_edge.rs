@@ -44,7 +44,7 @@ fn int_struct(v: i32) -> PvStructure {
 fn struct_array_desc() -> FieldDesc {
     FieldDesc::StructureArray {
         struct_id: String::new(),
-        fields: vec![("v".to_string(), FieldDesc::Scalar(ScalarType::Int))],
+        fields: vec![("v".to_string(), FieldDesc::Scalar(ScalarType::Int))].into(),
     }
 }
 

@@ -25,32 +25,29 @@
 //! served field took the record's raw `PREC`.
 
 mod module_records;
+mod seeded;
 
 use epics_base_rs::server::database::{LinkBacking, PvDatabase};
-use epics_base_rs::server::record::RecordInstance;
 use epics_base_rs::server::records::ai::AiRecord;
 use epics_base_rs::types::EpicsValue;
+use seeded::Seeded;
 
 /// The precision this record type serves for `field` with `PREC` set to
 /// `prec` and every link left constant — i.e. `dbGetPrecision` on a backing
 /// link fails, which is the arm each type resolves differently.
 fn served(rtype: &str, prec: i16, field: &str) -> Option<i16> {
     let rec = module_records::create_any(rtype).unwrap_or_else(|e| panic!("{rtype}: {e:?}"));
-    let mut inst = RecordInstance::new_boxed(format!("T:{rtype}"), rec);
-    if inst
-        .record
-        .put_field("PREC", EpicsValue::Short(prec))
-        .is_err()
-    {
-        match inst.put_common_field("PREC", EpicsValue::Short(prec)) {
-            // `bo` and `busy` declare no PREC at all — their only precision is
-            // the `HIGH` literal — so the seed is meaningless there and the
-            // assertion below says what each must answer anyway.
-            Ok(_) | Err(epics_base_rs::error::CaError::FieldNotFound(_)) => {}
-            Err(e) => panic!("{rtype}.PREC: {e:?}"),
-        }
+    let rec = Seeded::new(format!("T:{rtype}"), rec);
+    match rec.put("PREC", EpicsValue::Short(prec)) {
+        // `bo` and `busy` declare no PREC at all — their only precision is
+        // the `HIGH` literal — so the seed is meaningless there and the
+        // assertion below says what each must answer anyway.
+        Ok(_) | Err(epics_base_rs::error::CaError::FieldNotFound(_)) => {}
+        Err(e) => panic!("{rtype}.PREC: {e:?}"),
     }
-    inst.snapshot_for_field_with(field, LinkBacking::none())
+    rec.cell()
+        .read()
+        .snapshot_for_field_with(field, LinkBacking::none())
         .unwrap_or_else(|| panic!("{rtype}.{field}: no snapshot"))
         .precision()
 }

@@ -22,7 +22,7 @@ use motor_rs::flags::SpmgMode;
 use motor_rs::record::MotorRecord;
 
 fn instance_of(rec: MotorRecord) -> RecordInstance {
-    RecordInstance::new("M".to_string(), rec)
+    RecordInstance::new("M", rec)
 }
 
 /// `motorRecord.dbd:495-501` — `field(LSPG,DBF_MENU) initial("3")`, and C
@@ -63,8 +63,8 @@ fn lspg_on_the_initial_answers_the_initial() {
 #[test]
 fn pp_answers_the_store_once_it_leaves_the_initial() {
     let mut rec = MotorRecord::default();
-    assert!(!rec.internal.pp, "the store starts on the .dbd initial");
-    rec.internal.pp = true;
+    assert!(rec.internal.pp == 0, "the store starts on the .dbd initial");
+    rec.internal.pp = 1;
 
     let inst = instance_of(rec);
     assert_eq!(

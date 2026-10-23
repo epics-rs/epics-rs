@@ -8,7 +8,6 @@ pub mod gpib;
 pub mod int32;
 pub mod int64;
 pub mod motor;
-pub mod octet;
 // No `option` module: the asynOption interface has no trait of its own. A
 // driver implements it by overriding `PortDriver::get_option` / `set_option`
 // and declaring `Capability::Option`, which is what `PortHandle::has_interface`
@@ -167,7 +166,7 @@ pub enum Capability {
     Gpib,
     /// The `asynOption` interface (`get_option` / `set_option`). C drivers
     /// register it explicitly (`option.interfaceType = asynOptionType` in
-    /// drvAsynIPPort.c:1025, drvAsynSerialPort.c:1098, drvVxi11.c:1777,
+    /// drvAsynIPPort.c:1079, drvAsynSerialPort.c:1098, drvVxi11.c:1777,
     /// drvAsynFTDIPort.cpp:582) and asynRecord's `optioniv` is the result of
     /// `findInterface(asynOptionType)` (asynRecord.c:1177-1186).
     Option,
@@ -248,57 +247,159 @@ impl Capability {
     }
 }
 
-/// Default capabilities for port drivers that only support scalar cache-based I/O.
-///
-/// This is the parameter-library port's interface set — the analogue of C's
-/// `asynPortDriver`, which registers every standard interface its
-/// `interfaceMask` names (asynPortDriver.cpp:4056-4071). A transport that speaks only
-/// bytes (an IP socket, a serial line) registers far fewer and must override
-/// [`crate::port::PortDriver::capabilities`] to say so, because asynRecord reads
-/// that declaration into OCTETIV / I32IV / UI32IV / F64IV / OPTIONIV / GPIBIV and
-/// refuses I/O on an interface the port does not have (asynRecord.c:1177-1240,
-/// :1328-1360).
-pub fn default_capabilities() -> Vec<Capability> {
-    vec![
-        Capability::Int32Read,
-        Capability::Int32Write,
-        Capability::Int64Read,
-        Capability::Int64Write,
-        Capability::Float64Read,
-        Capability::Float64Write,
-        Capability::OctetRead,
-        Capability::OctetWrite,
-        Capability::UInt32DigitalRead,
-        Capability::UInt32DigitalWrite,
-        Capability::EnumRead,
-        Capability::EnumWrite,
-        Capability::GenericPointerRead,
-        Capability::GenericPointerWrite,
-        Capability::Option,
-        // A parameter-library port resolves drvInfo → reason, so it registers
-        // asynDrvUser, exactly as C `asynPortDriver` does
-        // (asynPortDriver.cpp:4057, `asynDrvUserMask` -> `ifaceDrvUser`).
-        Capability::DrvUser,
-        Capability::Flush,
-        Capability::Connect,
-    ]
+/// C's `interfaceMask` / `interruptMask` bits (asynPortDriver.h:24-39). An
+/// `asynPortDriver` registers exactly the interfaces its mask names
+/// (asynPortDriver.cpp:4055-4071), which is what asynRecord's OPTIONIV, UI32IV,
+/// … report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct InterfaceMask(u32);
+
+impl InterfaceMask {
+    pub const NONE: Self = Self(0);
+    pub const COMMON: Self = Self(0x0001);
+    pub const DRV_USER: Self = Self(0x0002);
+    pub const OPTION: Self = Self(0x0004);
+    pub const INT32: Self = Self(0x0008);
+    pub const UINT32_DIGITAL: Self = Self(0x0010);
+    pub const FLOAT64: Self = Self(0x0020);
+    pub const OCTET: Self = Self(0x0040);
+    pub const INT8_ARRAY: Self = Self(0x0080);
+    pub const INT16_ARRAY: Self = Self(0x0100);
+    pub const INT32_ARRAY: Self = Self(0x0200);
+    pub const FLOAT32_ARRAY: Self = Self(0x0400);
+    pub const FLOAT64_ARRAY: Self = Self(0x0800);
+    pub const GENERIC_POINTER: Self = Self(0x1000);
+    pub const ENUM: Self = Self(0x2000);
+    pub const INT64: Self = Self(0x4000);
+    pub const INT64_ARRAY: Self = Self(0x8000);
+    /// asynGpib, which a GPIB port registers through `asynGpib.c:606` and no
+    /// asynPortDriver mask names.
+    pub const GPIB: Self = Self(0x1_0000);
+
+    /// A port not yet given its C driver's mask (asynPortDriver.cpp:4055-4071):
+    /// the scalar set every port declared before masks existed. Each use is a
+    /// site still to migrate.
+    pub const UNMIGRATED_ALL: Self = Self::COMMON
+        .or(Self::DRV_USER)
+        .or(Self::OPTION)
+        .or(Self::INT32)
+        .or(Self::UINT32_DIGITAL)
+        .or(Self::FLOAT64)
+        .or(Self::OCTET)
+        .or(Self::GENERIC_POINTER)
+        .or(Self::ENUM)
+        .or(Self::INT64);
+
+    /// The interrupt mask of a port not yet given its C driver's: every
+    /// interface may interrupt, as every one could before masks existed. Each
+    /// use is a site still to migrate.
+    pub const UNMIGRATED_INTERRUPTS: Self = Self::ALL;
+
+    /// Every bit: a mask that restricts nothing.
+    pub const ALL: Self = Self(u32::MAX);
+
+    /// The bit C names `iface` by, or `None` for a Rust-only interface.
+    pub const fn of(iface: InterfaceType) -> Option<Self> {
+        Some(match iface {
+            InterfaceType::Int32 => Self::INT32,
+            InterfaceType::Int64 => Self::INT64,
+            InterfaceType::Float64 => Self::FLOAT64,
+            InterfaceType::Octet => Self::OCTET,
+            InterfaceType::UInt32Digital => Self::UINT32_DIGITAL,
+            InterfaceType::Enum => Self::ENUM,
+            InterfaceType::GenericPointer => Self::GENERIC_POINTER,
+            InterfaceType::Int8Array => Self::INT8_ARRAY,
+            InterfaceType::Int16Array => Self::INT16_ARRAY,
+            InterfaceType::Int32Array => Self::INT32_ARRAY,
+            InterfaceType::Int64Array => Self::INT64_ARRAY,
+            InterfaceType::Float32Array => Self::FLOAT32_ARRAY,
+            InterfaceType::Float64Array => Self::FLOAT64_ARRAY,
+            InterfaceType::Gpib => Self::GPIB,
+            InterfaceType::Option => Self::OPTION,
+            InterfaceType::DrvUser => Self::DRV_USER,
+            InterfaceType::Common => Self::COMMON,
+            InterfaceType::UInt64 | InterfaceType::Motor => return None,
+        })
+    }
+
+    /// A C subclass (an areaDetector driver or plugin) whose own masks, ORed
+    /// into its base class's, are not yet carried over. Each use is a site
+    /// still to migrate.
+    pub const UNMIGRATED_SUBCLASS: Self = Self::NONE;
+
+    /// The interrupt mask of a C subclass not yet given its own: every
+    /// interface may interrupt, as with [`Self::UNMIGRATED_INTERRUPTS`], so
+    /// the port refuses none of the subclass's interrupt clients. Each use is
+    /// a site still to migrate.
+    pub const UNMIGRATED_SUBCLASS_INTERRUPTS: Self = Self::ALL;
+
+    pub const fn or(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    pub const fn bits(self) -> u32 {
+        self.0
+    }
+
+    pub const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    /// The capabilities of the interfaces this mask names.
+    pub fn capabilities(self) -> Vec<Capability> {
+        use Capability::*;
+        let table: [(Self, &[Capability]); 17] = [
+            (Self::INT32, &[Int32Read, Int32Write]),
+            (Self::INT64, &[Int64Read, Int64Write]),
+            (Self::FLOAT64, &[Float64Read, Float64Write]),
+            (Self::OCTET, &[OctetRead, OctetWrite]),
+            (
+                Self::UINT32_DIGITAL,
+                &[UInt32DigitalRead, UInt32DigitalWrite],
+            ),
+            (Self::ENUM, &[EnumRead, EnumWrite]),
+            (
+                Self::GENERIC_POINTER,
+                &[GenericPointerRead, GenericPointerWrite],
+            ),
+            (Self::INT8_ARRAY, &[Int8ArrayRead, Int8ArrayWrite]),
+            (Self::INT16_ARRAY, &[Int16ArrayRead, Int16ArrayWrite]),
+            (Self::INT32_ARRAY, &[Int32ArrayRead, Int32ArrayWrite]),
+            (Self::INT64_ARRAY, &[Int64ArrayRead, Int64ArrayWrite]),
+            (Self::FLOAT32_ARRAY, &[Float32ArrayRead, Float32ArrayWrite]),
+            (Self::FLOAT64_ARRAY, &[Float64ArrayRead, Float64ArrayWrite]),
+            (Self::OPTION, &[Option]),
+            (Self::DRV_USER, &[DrvUser]),
+            (Self::GPIB, &[Gpib]),
+            (Self::COMMON, &[Flush, Connect]),
+        ];
+        table
+            .iter()
+            .filter(|(bit, _)| self.contains(*bit))
+            .flat_map(|(_, caps)| caps.iter().copied())
+            .collect()
+    }
+}
+
+impl std::ops::BitOr for InterfaceMask {
+    type Output = Self;
+    fn bitor(self, other: Self) -> Self {
+        self.or(other)
+    }
 }
 
 /// The interface set of a byte-transport port: `asynCommon` + `asynOctet` +
 /// `asynOption`, exactly what drvAsynIPPort / drvAsynSerialPort /
-/// drvAsynFTDIPort register (drvAsynIPPort.c:1037-1053). No register interface,
+/// drvAsynFTDIPort register (drvAsynIPPort.c:1091-1109). No register interface,
 /// so a record pointed at one with IFACE=Int32 gets C's "No asynInt32 interface"
 /// rather than a silent cache read. No `asynDrvUser` either — a byte transport
 /// has no parameters to name, so every client stays at reason 0 and asynRecord
 /// refuses a non-blank DRVINFO (asynRecord.c:1258-1266).
 pub fn octet_transport_capabilities() -> Vec<Capability> {
-    vec![
-        Capability::OctetRead,
-        Capability::OctetWrite,
-        Capability::Option,
-        Capability::Flush,
-        Capability::Connect,
-    ]
+    InterfaceMask::COMMON
+        .or(InterfaceMask::OPTION)
+        .or(InterfaceMask::OCTET)
+        .capabilities()
 }
 
 #[cfg(test)]
@@ -366,9 +467,11 @@ mod interface_type_tests {
         assert!(!Capability::Int32Write.is_read());
     }
 
+    /// The unmigrated set is the one every port declared before masks: the
+    /// scalars, no arrays, no Motor.
     #[test]
-    fn default_capabilities_has_scalars() {
-        let caps = default_capabilities();
+    fn unmigrated_all_has_scalars() {
+        let caps = InterfaceMask::UNMIGRATED_ALL.capabilities();
         assert!(caps.contains(&Capability::Int32Read));
         assert!(caps.contains(&Capability::Float64Write));
         assert!(caps.contains(&Capability::OctetRead));
@@ -376,12 +479,32 @@ mod interface_type_tests {
         assert!(!caps.contains(&Capability::Int32ArrayRead));
     }
 
+    /// A mask names exactly its interfaces: no asynOption or asynUInt32Digital
+    /// unless asked for (asynPortDriver.cpp:4060, :4069).
+    #[test]
+    fn a_mask_declares_only_its_interfaces() {
+        let caps = (InterfaceMask::COMMON | InterfaceMask::INT32 | InterfaceMask::INT32_ARRAY)
+            .capabilities();
+        let types: std::collections::BTreeSet<_> = caps
+            .iter()
+            .map(|c| c.interface_type().asyn_name())
+            .collect();
+        assert_eq!(
+            types.into_iter().collect::<Vec<_>>(),
+            ["asynCommon", "asynInt32", "asynInt32Array"]
+        );
+    }
+
     /// R11-48: only a port that can resolve a drvInfo string declares
     /// `asynDrvUser`. C's byte transports register no such interface, which is
     /// what makes asynRecord force REASON=0 there (asynRecord.c:1258-1266).
     #[test]
     fn only_a_parameter_library_port_declares_drv_user() {
-        assert!(default_capabilities().contains(&Capability::DrvUser));
+        assert!(
+            InterfaceMask::UNMIGRATED_ALL
+                .capabilities()
+                .contains(&Capability::DrvUser)
+        );
         assert!(!octet_transport_capabilities().contains(&Capability::DrvUser));
         assert_eq!(Capability::DrvUser.interface_type(), InterfaceType::DrvUser);
         assert!(!Capability::DrvUser.is_read());

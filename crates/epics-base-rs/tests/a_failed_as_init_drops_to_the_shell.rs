@@ -73,3 +73,26 @@ async fn a_succeeding_as_init_still_hands_off() {
 
     assert!(served.load(Ordering::SeqCst), "the Run arm must hand off");
 }
+
+/// The script's own `iocInit` failing at `asInit` returns -1 to the script
+/// and nothing else: C reaches `iocsh(NULL)` (softIoc R7.0.10, no `-d`, stdin
+/// `exit`: the prompt, exit 0). The startup phase had already seen the failed
+/// build's closed signal, and the tail must not wait on it a second time.
+#[epics_macros_rs::epics_test]
+async fn a_script_s_failed_ioc_init_reaches_the_shell() {
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("st.cmd");
+    std::fs::write(
+        &script,
+        "asSetFilename(\"/no/such/directory/nope.acf\")\niocInit\n",
+    )
+    .unwrap();
+    let outcome = IocApplication::new()
+        .port(0)
+        .startup_script(script.to_str().unwrap())
+        .before_ioc_init(|| IocInitDecision::skip(true))
+        .run(|_config| async { Ok(()) })
+        .await;
+
+    assert!(outcome.is_ok(), "got {outcome:?}");
+}

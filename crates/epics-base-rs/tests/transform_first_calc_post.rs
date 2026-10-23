@@ -44,7 +44,7 @@ fn subscribe(db: &PvDatabase, field: &str, id: u32) -> EventReader {
     let mut g = inst.write();
     let full = (EventMask::VALUE | EventMask::LOG | EventMask::ALARM).bits();
     g.add_subscriber(field, id, DbFieldType::Double, full)
-        .unwrap_or_else(|| panic!("a {field} subscription must be accepted"))
+        .unwrap_or_else(|_| panic!("a {field} subscription must be accepted"))
 }
 
 async fn process(db: &PvDatabase) {
@@ -65,12 +65,16 @@ async fn the_first_cycle_posts_every_channel_though_none_moved() {
     process(&db).await;
 
     assert_eq!(
-        a.try_recv().map(|e| e.snapshot.value.clone()).ok(),
+        a.try_recv()
+            .map(|e| e.value().as_value().cloned().unwrap())
+            .ok(),
         Some(EpicsValue::Double(5.0)),
         "firstCalcPosted == 0 posts A whether or not it moved"
     );
     assert_eq!(
-        b.try_recv().map(|e| e.snapshot.value.clone()).ok(),
+        b.try_recv()
+            .map(|e| e.value().as_value().cloned().unwrap())
+            .ok(),
         Some(EpicsValue::Double(0.0)),
         "and every other channel with it, at its unchanged value"
     );
@@ -92,30 +96,32 @@ async fn the_second_cycle_posts_nothing() {
     );
 }
 
-/// A channel that genuinely moves still posts on a later cycle — the one-shot
-/// is additive to the change test, not a replacement for it.
+/// oracleStdIoc, `record(transform,"TR"){field(CLCB,"A+1")}` under
+/// `camonitor -m va TR.A`, `caput TR.A 7`: two posts, dbPut's and then the
+/// `pp(TRUE)` cycle's — `monitor()` compares A against LA, which the put did
+/// not move, not against what was last published.
 #[epics_macros_rs::epics_test]
-async fn a_later_change_still_posts() {
+async fn a_put_to_a_posts_from_the_put_and_from_its_cycle() {
     let db = transform_db().await;
     let mut a = subscribe(&db, "A", 1);
-
     process(&db).await;
-    assert!(a.try_recv().is_ok());
-    assert!(a.try_recv().is_err());
-
-    db.put_pv("T.A", EpicsValue::Double(9.0)).await.unwrap();
-    // Drain the put's own post so only the process cycle's remains.
     while a.try_recv().is_ok() {}
-    process(&db).await;
-    assert!(
-        a.try_recv().is_err(),
-        "the put already published 9.0, so the cycle finds A unchanged"
-    );
 
-    db.put_pv("T.A", EpicsValue::Double(11.0)).await.unwrap();
-    while a.try_recv().is_ok() {}
-    process(&db).await;
-    assert!(a.try_recv().is_err(), "same on the next put");
+    for v in [9.0, 11.0] {
+        db.put_record_field_from_ca_no_notify("T", "A", EpicsValue::Double(v))
+            .await
+            .unwrap();
+        let mut got = Vec::new();
+        while let Ok(e) = a.try_recv() {
+            got.push(e.value().as_value().cloned().unwrap());
+        }
+        assert_eq!(got, vec![EpicsValue::Double(v); 2], "caput T.A {v}");
+        process(&db).await;
+        assert!(
+            a.try_recv().is_err(),
+            "LA caught up, so the next cycle is silent"
+        );
+    }
 }
 
 /// C's `monitor_mask = DBE_VALUE|DBE_LOG` OVERWRITES `recGblResetAlarms`'s

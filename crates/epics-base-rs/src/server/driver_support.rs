@@ -24,12 +24,10 @@
 //! C's other nullable slot, `drvet.report`, IS representable and is what
 //! [`DriverSupport::report`]'s `Option` return models — see there.
 //!
-//! `drvet.init`, called once by `initDrvSup` during `iocInit`, has deliberately
-//! no counterpart on the trait. Nothing in this crate's `iocInit`
-//! (`server/ioc_app.rs`) runs a driver-init pass, so a slot here would be a
-//! method no caller ever reaches; a driver that needs one-time setup does it
-//! where it registers. Adding the pass and the slot together is the change that
-//! closes it.
+//! `drvet.init` is [`DriverSupport::init`], which the build calls for
+//! every registered driver, in registration order, immediately before the
+//! build announces `initHookAfterInitDrvSup` — C `initDrvSup`'s place in
+//! `iocBuild_2` (`iocInit.c:167-168`).
 
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -43,18 +41,31 @@ pub trait DriverSupport: Send + Sync + 'static {
     /// (`dbTest.c:738-742`).
     ///
     /// `None` is C's NULL `report` slot: `dbior` prints
-    /// `Driver: <name> No report available` and moves on. `Some(text)` is a
-    /// report that ran — `dbior` prints `Driver: <name>` and then the text,
-    /// so `Some("")` reproduces C's header-only output for a `report` that
-    /// printed nothing at this level.
+    /// `Driver: <name> No report available` and moves on. `Some(bytes)` is a
+    /// report that ran — `dbior` prints `Driver: <name>` and then the bytes as
+    /// they are, as C's `printf` writes them, so `Some(vec![])` reproduces C's
+    /// header-only output for a `report` that printed nothing at this level.
     ///
     /// The report is RETURNED rather than printed because the iocsh `>`
     /// redirect swaps one command's output stream, not the process's stdout
     /// (`iocsh.cpp:417` `epicsSetThreadStdout`, which this port models as a
     /// per-context writer). A driver that wrote to `println!` would escape
     /// `dbior > file` no matter what the command did; a driver that returns
-    /// its text cannot.
-    fn report(&self, level: i32) -> Option<String>;
+    /// its bytes cannot.
+    fn report(&self, level: i32) -> Option<Vec<u8>>;
+
+    /// C `drvet.init`, which `initDrvSup` calls once per build
+    /// (`iocInit.c:411-412`), ignoring its status. The default is C's NULL
+    /// `init` slot.
+    fn init(&self) {}
+}
+
+/// C `initDrvSup` (`iocInit.c:398-413`): every driver's `init`, in
+/// `drvList` order.
+pub(crate) fn init_drv_sup() {
+    for (_, drvet) in driver_supports() {
+        drvet.init();
+    }
 }
 
 /// The one table, in registration order.
@@ -126,14 +137,14 @@ mod tests {
 
     struct Reporting(&'static str);
     impl DriverSupport for Reporting {
-        fn report(&self, level: i32) -> Option<String> {
-            Some(format!("{} at level {level}", self.0))
+        fn report(&self, level: i32) -> Option<Vec<u8>> {
+            Some(format!("{} at level {level}", self.0).into_bytes())
         }
     }
 
     struct Silent;
     impl DriverSupport for Silent {
-        fn report(&self, _level: i32) -> Option<String> {
+        fn report(&self, _level: i32) -> Option<Vec<u8>> {
             None
         }
     }
@@ -148,7 +159,7 @@ mod tests {
             Arc::new(Reporting("probe"))
         ));
         let found = find_driver_support("drvRegistryProbe").expect("just registered");
-        assert_eq!(found.report(2).as_deref(), Some("probe at level 2"));
+        assert_eq!(found.report(2).as_deref(), Some(&b"probe at level 2"[..]));
         assert!(find_driver_support("drvNoSuchDriverProbe").is_none());
     }
 

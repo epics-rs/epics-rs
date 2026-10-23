@@ -1,0 +1,70 @@
+# CPSyringe.proto
+
+# StreamDevice protocol file for Harvard Apparatus syringe pump
+
+# Mark Rivers
+# November 22, 2013
+
+OutTerminator = "\r";
+ExtraInput = Ignore;
+ReplyTimeout = 3000;
+PollPeriod = 500;
+
+getString {
+   out "\$1";
+   in  "\n%[ A-Z]\r\n%*[><:/*^]";
+}
+
+setString {
+   out "\$1 %s";
+   in "\n%*[><:/*^]";
+}
+
+setNoneString {
+   out "%s";
+   in "\n%*[><:/*^]";
+}
+
+getInt {
+   out "\$1";
+   in  "\n%d\r\n%*[><:/*^]";
+}
+
+setInt {
+   out "\$1 %d";
+   in "\n%*[><:/*^]";
+}
+
+getFloat {
+   out "\$1";
+   in  "\n%f\r\n%*[><:/*^]";
+}
+
+getFloatEGU {
+   out "\$1";
+   in  "\n%f %(EGU)s\r\n%*[><:/*^]";
+   @mismatch {
+     in "NA"
+   };
+}
+
+setFloat {
+   out "\$1 %.3f";
+   in "\n%*[><:/*^]";
+}
+
+setNone {
+   out "\$1";
+   in "\n%*[><:/*^]";
+}
+
+reverseDirection {
+   out "dir rev";
+   in "\n%*[><:/*^]";
+}
+
+getRun {
+   out "dir";
+   in "\n%*s\r\n%d%[><:/*^]";
+}
+

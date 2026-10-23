@@ -87,9 +87,12 @@ pub fn fork_and_go(parent: DaemonParent<'_>) -> ProcServResult<()> {
             // the daemon's pid BEFORE exiting (procServ.cc:887-899).
             let daemon_pid = child.as_raw();
             if !parent.quiet {
-                eprintln!("{}: spawning daemon process: {daemon_pid}", parent.name);
+                epics_base_rs::stderr_println!(
+                    "{}: spawning daemon process: {daemon_pid}",
+                    parent.name
+                );
                 if !parent.has_logfile {
-                    eprintln!(
+                    epics_base_rs::stderr_println!(
                         "Warning: No log file{} specified.",
                         if parent.has_logport {
                             ""
@@ -104,7 +107,7 @@ pub fn fork_and_go(parent: DaemonParent<'_>) -> ProcServResult<()> {
             {
                 // C `writePidFile` logs and continues on failure
                 // (procServ.cc:130-137); match that best-effort behavior.
-                eprintln!(
+                epics_base_rs::stderr_println!(
                     "{}: cannot write pid file {}: {e}",
                     parent.name,
                     p.display()
@@ -134,14 +137,16 @@ pub fn fork_and_go(parent: DaemonParent<'_>) -> ProcServResult<()> {
                 // comes from the PTY, not the daemon's 0/1/2, so a failed
                 // redirect doesn't break it — warn and continue.
                 if let Err(e) = dup2(null_fd, fd) {
-                    eprintln!("procserv-rs: dup2(/dev/null, {fd}) failed: {e}; continuing");
+                    epics_base_rs::stderr_println!(
+                        "procserv-rs: dup2(/dev/null, {fd}) failed: {e}; continuing"
+                    );
                 }
             }
             // C `setsid();` (procServ.cc:910) — also unchecked. Failing to
             // detach from the controlling terminal does not break the daemon;
             // warn and continue rather than abort the already-published child.
             if let Err(e) = setsid() {
-                eprintln!("procserv-rs: setsid failed: {e}; continuing");
+                epics_base_rs::stderr_println!("procserv-rs: setsid failed: {e}; continuing");
             }
             Ok(())
         }

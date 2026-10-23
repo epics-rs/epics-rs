@@ -122,7 +122,7 @@ cargo +nightly build --release --locked \
 # PVA (QSRV) IOC
 cargo +nightly build --release --locked \
     -Zbuild-std=std,panic_abort --target armv7-rtems-eabihf \
-    -p epics-bridge-rs --bin realtime-pva-ioc --no-default-features --features qsrv-core,pvalink
+    -p epics-bridge-rs --bin realtime-pva-ioc --no-default-features --features qsrv-core,pvalink,calink-core
 ```
 
 The feature selections are deliberate, not defaults — `scripts/rtems-check.sh`

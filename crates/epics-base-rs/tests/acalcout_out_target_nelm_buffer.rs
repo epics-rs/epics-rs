@@ -27,7 +27,7 @@
 use std::sync::{Arc, Mutex};
 
 use epics_base_rs::error::CaResult;
-use epics_base_rs::server::database::{LinkMetadata, LinkPutOp, LinkSet, PvDatabase};
+use epics_base_rs::server::database::{LinkMetadata, LinkPutOp, LinkRef, LinkSet, PvDatabase};
 use epics_base_rs::server::record::{FieldDesc, ProcessOutcome, Record};
 use epics_base_rs::server::records::acalcout::AcalcoutRecord;
 use epics_base_rs::types::EpicsValue;
@@ -101,7 +101,7 @@ struct CountingLset {
 
 #[epics_base_rs::async_trait]
 impl LinkSet for CountingLset {
-    fn is_connected(&self, _name: &str) -> bool {
+    fn is_connected(&self, _name: LinkRef<'_>) -> bool {
         self.element_count.is_some()
     }
     /// The subject of these tests is which BUFFER the record hands the OUT
@@ -111,25 +111,25 @@ impl LinkSet for CountingLset {
     /// (`dbCaPutLinkCallback`, `dbCa.c:529-532`) is covered by
     /// `out_link_failure_alarm.rs`, and folding it in here would make the
     /// no-metadata case assert nothing at all.
-    fn put_admission(&self, _name: &str) -> epics_base_rs::server::database::PutAdmission {
+    fn put_admission(&self, _name: LinkRef<'_>) -> epics_base_rs::server::database::PutAdmission {
         epics_base_rs::server::database::PutAdmission::Connected
     }
-    fn get_cached_value(&self, _name: &str) -> Option<EpicsValue> {
+    fn get_cached_value(&self, _name: LinkRef<'_>) -> Option<EpicsValue> {
         None
     }
-    async fn get_value(&self, name: &str) -> Option<EpicsValue> {
-        self.get_cached_value(name)
+    async fn get_value(&self, link: LinkRef<'_>) -> Option<EpicsValue> {
+        self.get_cached_value(link)
     }
     async fn put_value(
         &self,
-        _name: &str,
+        _name: LinkRef<'_>,
         value: EpicsValue,
         _op: LinkPutOp,
     ) -> Result<(), String> {
         *self.last_put.lock().unwrap() = Some(value);
         Ok(())
     }
-    fn link_metadata(&self, _name: &str) -> Option<LinkMetadata> {
+    fn link_metadata(&self, _name: LinkRef<'_>) -> Option<LinkMetadata> {
         self.element_count.map(|n| LinkMetadata {
             element_count: Some(n),
             ..Default::default()
@@ -146,10 +146,10 @@ fn invalid_ivov_record(dopt: i16, nelm: u32, out: &str) -> AcalcoutRecord {
     a.put_field("NELM", EpicsValue::ULong(nelm)).unwrap();
     a.put_field("CALC", EpicsValue::String("10".into()))
         .unwrap();
-    a.special("CALC", true).unwrap();
+    a.special("CALC", true, &Default::default()).unwrap();
     a.put_field("DOPT", EpicsValue::Short(dopt)).unwrap();
     a.put_field("OCAL", EpicsValue::String("7".into())).unwrap();
-    a.special("OCAL", true).unwrap();
+    a.special("OCAL", true, &Default::default()).unwrap();
     a.put_field("HIHI", EpicsValue::Double(5.0)).unwrap();
     a.put_field("HHSV", EpicsValue::Short(3)).unwrap();
     a.put_field("IVOA", EpicsValue::Short(2)).unwrap();
@@ -172,6 +172,8 @@ async fn process(db: &PvDatabase, name: &str) {
 #[epics_macros_rs::epics_test]
 async fn ivov_reaches_a_scalar_target_under_use_ocal() {
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     let last = Arc::new(Mutex::new(None));
     db.add_record("PROBE", Box::new(ScalarProbe { last: last.clone() }))
         .await
@@ -194,6 +196,8 @@ async fn ivov_reaches_a_scalar_target_under_use_ocal() {
 #[epics_macros_rs::epics_test]
 async fn ivov_bypasses_an_array_target_under_use_ocal() {
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     let last = Arc::new(Mutex::new(None));
     db.add_record("APROBE", Box::new(ArrayProbe { last: last.clone() }))
         .await
@@ -216,6 +220,8 @@ async fn ivov_bypasses_an_array_target_under_use_ocal() {
 #[epics_macros_rs::epics_test]
 async fn ivov_is_a_no_op_under_use_val() {
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     let last = Arc::new(Mutex::new(None));
     db.add_record("PROBE", Box::new(ScalarProbe { last: last.clone() }))
         .await
@@ -239,6 +245,8 @@ async fn ivov_is_a_no_op_under_use_val() {
 #[epics_macros_rs::epics_test]
 async fn a_single_element_source_picks_the_scalar_buffer() {
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     let last = Arc::new(Mutex::new(None));
     db.add_record("APROBE", Box::new(ArrayProbe { last: last.clone() }))
         .await
@@ -267,6 +275,8 @@ async fn a_single_element_source_picks_the_scalar_buffer() {
 #[epics_macros_rs::epics_test]
 async fn an_external_array_target_gets_the_array_buffer() {
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     let last_put = Arc::new(Mutex::new(None));
     db.register_link_set(
         "ca",
@@ -276,6 +286,7 @@ async fn an_external_array_target_gets_the_array_buffer() {
         }),
     )
     .await;
+    db.process_cp_links_on_connect().await;
     db.add_record("AC", Box::new(invalid_ivov_record(1, 3, "ca://EXT")))
         .await
         .unwrap();
@@ -294,6 +305,8 @@ async fn an_external_array_target_gets_the_array_buffer() {
 #[epics_macros_rs::epics_test]
 async fn an_unresolved_external_target_defaults_to_the_scalar_buffer() {
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     let last_put = Arc::new(Mutex::new(None));
     db.register_link_set(
         "ca",
@@ -303,6 +316,7 @@ async fn an_unresolved_external_target_defaults_to_the_scalar_buffer() {
         }),
     )
     .await;
+    db.process_cp_links_on_connect().await;
     db.add_record("AC", Box::new(invalid_ivov_record(1, 3, "ca://EXT")))
         .await
         .unwrap();

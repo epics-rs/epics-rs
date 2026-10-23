@@ -3,11 +3,7 @@ use epics_base_rs::calc::{CalcError, compile, scalc_compile};
 
 fn opcodes_without_end(expr: &str) -> Vec<Opcode> {
     let compiled = compile(expr).unwrap();
-    compiled
-        .code
-        .into_iter()
-        .filter(|op| !matches!(op, Opcode::Core(CoreOp::End)))
-        .collect()
+    compiled.ops()
 }
 
 /// Same, through the sCalc compiler. `>?`, `<?`, `NRNDM` and the doubled-letter
@@ -15,11 +11,7 @@ fn opcodes_without_end(expr: &str) -> Vec<Opcode> {
 /// `postfix.c`'s — the numeric compiler rejects them (`CALC_ERR_SYNTAX`).
 fn scalc_opcodes_without_end(expr: &str) -> Vec<Opcode> {
     let compiled = scalc_compile(expr).unwrap();
-    compiled
-        .code
-        .into_iter()
-        .filter(|op| !matches!(op, Opcode::Core(CoreOp::End)))
-        .collect()
+    compiled.ops()
 }
 
 fn c(op: CoreOp) -> Opcode {

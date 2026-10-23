@@ -12,6 +12,7 @@ ioc = ["dep:epics-base-rs", "dep:ad-plugins-rs", "ad-plugins-rs/ioc", "ad-plugin
 ad-core-rs = { workspace = true }
 ad-plugins-rs = { workspace = true, optional = true }
 asyn-rs = { workspace = true }
+epics-libcom-rs = { workspace = true }
 rand = "0.9"
 parking_lot = "0.12"
 epics-base-rs = { workspace = true, optional = true }
@@ -26,4 +27,8 @@ name = "demo"
 path = "examples/demo.rs"
 
 [dev-dependencies]
+asyn-rs = { workspace = true, features = ["test-support"] }
 tokio = { version = "1", features = ["full"] }
+tempfile = "3"
+# Dev-only and path-only: the held-port rule for a port the child must bind.
+named-port = { path = "../../crates/named-port" }

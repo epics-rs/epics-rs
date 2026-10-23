@@ -1,0 +1,8 @@
+_main_ empty_var.proto line 0: Unsigned numeric value expected: 
+_main_ empty_var.proto line 6: in command 'wait'
+_main_ empty_var.proto line 6: in protocol 'w1'
+_main_ while compiling protocol 'w1' for 'rec0'
+_main_ empty_var.proto line 0: Unsigned numeric value expected: 
+_main_ empty_var.proto line 7: in command 'wait'
+_main_ empty_var.proto line 7: in protocol 'w2'
+_main_ while compiling protocol 'w2' for 'rec1'

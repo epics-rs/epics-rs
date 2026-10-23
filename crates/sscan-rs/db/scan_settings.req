@@ -1,0 +1,7 @@
+# FILE... scan_settings.req
+file sscanRecord_settings.req P=$(P),S=scan1
+file sscanRecord_settings.req P=$(P),S=scan2
+file sscanRecord_settings.req P=$(P),S=scan3
+file sscanRecord_settings.req P=$(P),S=scan4
+file sscanRecord_settings.req P=$(P),S=scanH
+

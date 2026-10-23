@@ -42,8 +42,8 @@ async fn sim_output_runs_ao_oroc_body_writes_limited_oval_to_siol() {
         .unwrap();
 
     let mut ao = AoRecord::new(0.0);
-    ao.siml = "AOROC_SW".to_string();
-    ao.siol = "AOROC_TGT".to_string();
+    ao.siml = "AOROC_SW".into();
+    ao.siol = "AOROC_TGT".into();
     ao.oroc = 1.0; // rate limit: at most 1.0 EGU per cycle
     // sdly left at the default -1.0 (synchronous sim write).
     db.add_record("AOROC", Box::new(ao)).await.unwrap();
@@ -96,8 +96,8 @@ async fn sim_output_runs_bo_high_momentary_reset_in_sim_mode() {
         .unwrap();
 
     let mut bo = BoRecord::new(1); // VAL=1
-    bo.siml = "BOHI_SW".to_string();
-    bo.siol = "BOHI_TGT".to_string();
+    bo.siml = "BOHI_SW".into();
+    bo.siol = "BOHI_TGT".into();
     bo.high = 100.0; // momentary: hold high then reset (timer unfireable here)
     // sdly left at the default -1.0 (synchronous sim write).
     db.add_record("BOHI", Box::new(bo)).await.unwrap();
@@ -160,8 +160,8 @@ async fn sim_output_sims_invalid_does_not_veto_siol_write() {
         .unwrap();
 
     let mut ao = AoRecord::new(5.0); // finite, in range -> own alarm NoAlarm
-    ao.siml = "AOIV_SW".to_string();
-    ao.siol = "AOIV_TGT".to_string();
+    ao.siml = "AOIV_SW".into();
+    ao.siol = "AOIV_TGT".into();
     ao.sims = 3; // SIMM severity = INVALID
     ao.ivoa = 1; // Don't drive outputs — must NOT fire (own nsev is NoAlarm)
     db.add_record("AOIV", Box::new(ao)).await.unwrap();
@@ -204,8 +204,8 @@ async fn sim_output_real_invalid_alarm_ivoa_dont_drive_suppresses() {
         .unwrap();
 
     let mut bo = BoRecord::new(1);
-    bo.siml = "BOIV_SW".to_string();
-    bo.siol = "BOIV_TGT".to_string();
+    bo.siml = "BOIV_SW".into();
+    bo.siol = "BOIV_TGT".into();
     bo.osv = 3; // one-state severity = INVALID -> real STATE_ALARM/INVALID
     bo.sims = 0; // isolate: INVALID comes from the record's own alarm
     bo.ivoa = 1; // Don't drive outputs
@@ -260,8 +260,8 @@ async fn sim_output_simm_alarm_loses_stat_on_severity_tie() {
         .unwrap();
 
     let mut bo = BoRecord::new(1);
-    bo.siml = "BOTIE_SW".to_string();
-    bo.siol = "BOTIE_TGT".to_string();
+    bo.siml = "BOTIE_SW".into();
+    bo.siol = "BOTIE_TGT".into();
     bo.osv = 1; // one-state severity = MINOR -> STATE_ALARM/MINOR (set first)
     bo.sims = 1; // SIMM severity = MINOR -> ties; must NOT override STAT
     db.add_record("BOTIE", Box::new(bo)).await.unwrap();

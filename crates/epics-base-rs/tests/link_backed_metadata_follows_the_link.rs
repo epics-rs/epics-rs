@@ -165,8 +165,10 @@ async fn asub_routes_metadata_through_both_its_in_and_out_links() {
 
     let mut asub = ASubRecord::default();
     asub.put_field("PREC", EpicsValue::Short(7)).unwrap();
-    asub.inp[0] = "SRC".into();
-    asub.out[0] = "SRC".into();
+    asub.put_field("INPA", EpicsValue::String("SRC".into()))
+        .unwrap();
+    asub.put_field("OUTA", EpicsValue::String("SRC".into()))
+        .unwrap();
     db.add_record("ASUB", Box::new(asub)).await.unwrap();
     db.ioc_init().await;
 

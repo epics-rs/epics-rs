@@ -56,7 +56,7 @@ async fn wf_into_aa(db: &PvDatabase, data: Vec<f64>) {
     a.put_field("NELM", EpicsValue::ULong(4)).unwrap();
     a.put_field("CALC", EpicsValue::String("SUM(AA)".into()))
         .unwrap();
-    a.special("CALC", true).unwrap();
+    a.special("CALC", true, &Default::default()).unwrap();
     a.put_field("INAA", EpicsValue::String("WF".into()))
         .unwrap();
     db.add_record("A", Box::new(a)).await.unwrap();
@@ -87,7 +87,9 @@ async fn r11_c4_a_link_that_reverts_a_caput_still_posts_aa() {
     process(&db, "A").await;
     let first = aa_rx.try_recv().expect("AA moved on the first fetch");
     assert_eq!(
-        first.snapshot.value,
+        first
+            .delivered_value(&db.get_record("A").unwrap().read(), "AA")
+            .unwrap(),
         EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0, 4.0].into())
     );
 
@@ -114,7 +116,10 @@ async fn r11_c4_a_link_that_reverts_a_caput_still_posts_aa() {
 
     let mut seen = Vec::new();
     while let Ok(e) = aa_rx.try_recv() {
-        seen.push(e.snapshot.value.clone());
+        seen.push(
+            e.delivered_value(&db.get_record("A").unwrap().read(), "AA")
+                .unwrap(),
+        );
     }
     assert_eq!(
         seen.last(),
@@ -175,7 +180,7 @@ async fn r11_c4_a_caput_alone_sets_no_newm_bit() {
     a.put_field("NELM", EpicsValue::ULong(4)).unwrap();
     a.put_field("CALC", EpicsValue::String("SUM(AA)".into()))
         .unwrap();
-    a.special("CALC", true).unwrap();
+    a.special("CALC", true, &Default::default()).unwrap();
     db.add_record("A", Box::new(a)).await.unwrap();
 
     db.put_record_field_from_ca(

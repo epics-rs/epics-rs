@@ -1,0 +1,67 @@
+rec0: Encoder_AD4.proto ping(1,2,3,4,5,6,7,8,9) P
+ping {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+  @ReplyTimeout {
+    in "\x00";
+  }
+
+    out "\x41";
+    in "%1r";
+}
+rec1: Encoder_AD4.proto readCnts(1,2,3,4,5,6,7,8,9) P
+readCnts {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "\x01";
+    in "%#4r";
+}
+rec2: Encoder_AD4.proto setCntMode(1,2,3,4,5,6,7,8,9) P
+setCntMode {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "\x22%(A).1r%(B)#.4r";
+    in "%1r";
+}
+rec3: Encoder_AD4.proto readSR(1,2,3,4,5,6,7,8,9) P
+readSR {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "\x55";
+    in "%1r";
+}

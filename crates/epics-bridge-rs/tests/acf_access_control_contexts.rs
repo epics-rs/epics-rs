@@ -69,12 +69,12 @@ async fn restricted_context() -> (AccessContext, &'static str) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn restricted_asg_denies_write_on_multi_thread_runtime() {
     let (ctx, pv) = restricted_context().await;
-    assert!(ctx.can_read(pv).await, "RESTRICTED grants READ");
+    assert!(ctx.can_read(pv.as_bytes()).await, "RESTRICTED grants READ");
     assert!(
-        !ctx.can_write(pv).await,
+        !ctx.can_write(pv.as_bytes()).await,
         "RESTRICTED grants no WRITE — the record's ASG must decide, not DEFAULT"
     );
-    assert!(!ctx.write_grant(pv).await.allowed);
+    assert!(!ctx.write_grant(pv.as_bytes()).await.allowed);
 }
 
 /// The same check on a current-thread runtime must produce the same answer.
@@ -85,14 +85,14 @@ async fn restricted_asg_denies_write_on_multi_thread_runtime() {
 #[tokio::test(flavor = "current_thread")]
 async fn restricted_asg_denies_write_on_current_thread_runtime() {
     let (ctx, pv) = restricted_context().await;
-    assert!(ctx.can_read(pv).await, "RESTRICTED grants READ");
+    assert!(ctx.can_read(pv.as_bytes()).await, "RESTRICTED grants READ");
     assert!(
-        !ctx.can_write(pv).await,
+        !ctx.can_write(pv.as_bytes()).await,
         "RESTRICTED grants no WRITE — a current-thread runtime must not silently \
          fall back to the DEFAULT ASG and grant the write"
     );
     assert!(
-        !ctx.write_grant(pv).await.allowed,
+        !ctx.write_grant(pv.as_bytes()).await.allowed,
         "a denied write must stay denied on a current-thread runtime"
     );
 }

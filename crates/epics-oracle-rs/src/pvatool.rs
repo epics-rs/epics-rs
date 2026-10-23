@@ -53,7 +53,7 @@ use std::time::Duration;
 pub type Readings = Vec<Result<String, ToolError>>;
 
 use crate::catool::{ToolError, wait_bounded};
-use crate::ioc::{PvxTools, Side, alloc_free_port};
+use crate::ioc::{PortClaim, PvxTools, Side, claim_port};
 
 /// One monitor event: the PV it names, and the body `pvxmonitor` printed under
 /// it.
@@ -68,14 +68,18 @@ pub struct PvaEvent {
     pub body: String,
 }
 
-/// Did this tool die because it could not bind its beacon port?
+/// Did this tool die because another socket held a port its client context
+/// binds?
 ///
-/// Matched on the message rather than an exit code because pvxs reports it as a
-/// plain `ERROR: Address already in use` and exits like any other failure. The
-/// match is on the text pvxs prints; the `ERROR` label around it carries ANSI
+/// A context binds two: the beacon port (`client.cpp:642`), which fails as a
+/// plain `ERROR: Address already in use`, and a random search port on UDP4
+/// then the same number on UDP6 (`client.cpp:576-594`), which fails as
+/// `Unable to bind random UDP6 port`. Either throws before the tool sends
+/// anything. Matched on the message rather than an exit code because pvxs
+/// exits like any other failure; the `ERROR` label around it carries ANSI
 /// colour codes, so only the stable part is compared.
-fn is_beacon_collision(stderr: &str) -> bool {
-    stderr.contains("Address already in use")
+fn is_port_collision(stderr: &str) -> bool {
+    stderr.contains("Address already in use") || stderr.contains("Unable to bind random UDP")
 }
 
 /// Wall-clock cap on any single tool invocation, mirroring
@@ -84,10 +88,10 @@ const TOOL_TIMEOUT: Duration = Duration::from_secs(8);
 /// PVA connect/operation timeout handed to the tools via `-w`.
 const PVA_TIMEOUT_SECS: &str = "3";
 
-/// How many times a tool is retried when it cannot bind its beacon port.
+/// How many times a tool is retried on a [`is_port_collision`].
 ///
 /// The port is allocated by binding, then released so the child can bind it
-/// (`alloc_free_port`) — a child process cannot inherit the fd. That window is
+/// (`claim_port`) — a child process cannot inherit the fd. That window is
 /// small but real, and the same window `CIoc::boot`/`PvxIoc::boot` close by
 /// retrying on a fresh port; this is that discipline applied to the clients.
 const BEACON_ATTEMPTS: usize = 8;
@@ -168,9 +172,9 @@ impl PvaTools {
     ///
     /// Because the client *binds* it, the number must be one **no live server
     /// holds** — and a number allocated up front is owned by nobody.
-    /// `alloc_free_port` binds a port, reads its number, and releases it, so a
+    /// `claim_port` reserves a number only while its claim is held, so a
     /// beacon port chosen at start-up is merely a number that *was* free once.
-    /// Every later `alloc_free_port` may hand the same number to a `softIocPVX`
+    /// Every later claim may hand the same number to a `softIocPVX`
     /// or `oracle-ioc` search port, entirely legitimately — it is free. From
     /// that moment every client aimed at that beacon port dies on `Address
     /// already in use` (measured directly: a plain UDP socket squatting the port
@@ -209,33 +213,55 @@ impl PvaTools {
     fn run_raw(&self, tool: &str, args: &[String]) -> Result<std::process::Output, ToolError> {
         let mut last = String::new();
         for _ in 0..BEACON_ATTEMPTS {
-            let beacon = alloc_free_port().map_err(|e| self.err(tool, e.to_string()))?;
+            let claim = claim_port().map_err(|e| self.err(tool, e.to_string()))?;
+            let beacon = claim.port();
             let child = self
                 .command(tool, args, beacon)
                 .spawn()
                 .map_err(|e| self.err(tool, format!("spawn: {e}")))?;
             let out = wait_bounded(child, TOOL_TIMEOUT).map_err(|e| self.err(tool, e))?;
 
-            // The client builds its context — and binds the beacon port —
-            // before it reads anything, so a bind failure means nothing was
-            // measured and the whole invocation is safe to retry on a fresh
-            // port. The only other socket a client binds is its search TX, and
-            // that one is kernel-assigned (`client.cpp:580`), so EADDRINUSE
-            // here is always the beacon port.
-            if is_beacon_collision(&String::from_utf8_lossy(&out.stderr)) {
-                last = format!("beacon port {beacon}: address already in use");
+            // The client builds its context — and binds its ports — before it
+            // reads anything, so a collision means nothing was measured and
+            // the whole invocation is safe to retry.
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            if is_port_collision(&stderr) {
+                last = format!("beacon port {beacon}: {}", stderr.trim());
                 continue;
             }
             return Ok(out);
         }
         Err(self.err(
             tool,
-            format!("could not get a free beacon port in {BEACON_ATTEMPTS} attempts ({last})"),
+            format!("lost a port in all {BEACON_ATTEMPTS} attempts ({last})"),
         ))
     }
 
     /// Run a tool to completion, returning stdout on success.
     fn run(&self, tool: &str, args: &[String]) -> Result<String, ToolError> {
+        let (stdout, stderr) = self.run_maybe_empty(tool, args)?;
+        // pvxs tools can exit 0 having printed only a diagnostic — a timed-out
+        // GET reports `Timeout` on stderr and still succeeds. Treating that as
+        // a reading would score a case AGREED on two empty strings, which is
+        // the "exit 0 when you could not look" failure this harness exists to
+        // prevent.
+        if stdout.trim().is_empty() {
+            return Err(self.err(
+                tool,
+                if stderr.is_empty() {
+                    "tool exited 0 but printed nothing".to_string()
+                } else {
+                    stderr
+                },
+            ));
+        }
+        Ok(stdout)
+    }
+
+    /// [`Self::run`] without the empty-output refusal: (stdout, stderr) of a
+    /// tool that exited 0, stdout possibly empty. Only a caller for which "nothing" is a
+    /// legitimate answer (`pvxlist`'s list of servers) may use it.
+    fn run_maybe_empty(&self, tool: &str, args: &[String]) -> Result<(String, String), ToolError> {
         let out = self.run_raw(tool, args)?;
 
         let stdout = String::from_utf8_lossy(&out.stdout).to_string();
@@ -255,22 +281,7 @@ impl PvaTools {
                 },
             ));
         }
-        // pvxs tools can exit 0 having printed only a diagnostic — a timed-out
-        // GET reports `Timeout` on stderr and still succeeds. Treating that as
-        // a reading would score a case AGREED on two empty strings, which is
-        // the "exit 0 when you could not look" failure this harness exists to
-        // prevent.
-        if stdout.trim().is_empty() {
-            return Err(self.err(
-                tool,
-                if stderr.is_empty() {
-                    "tool exited 0 but printed nothing".to_string()
-                } else {
-                    stderr
-                },
-            ));
-        }
-        Ok(stdout)
+        Ok((stdout, stderr))
     }
 
     /// `pvxget <pv>` — the value as a pvxs client renders it.
@@ -465,7 +476,7 @@ impl PvaTools {
 
     /// Spawn `pvxmonitor` and return only once every PV has seeded.
     ///
-    /// Retries on a beacon collision exactly as [`Self::run_raw`] does, and for
+    /// Retries on a [`is_port_collision`] exactly as [`Self::run_raw`] does, and for
     /// the same reason: the client *binds* `EPICS_PVA_BROADCAST_PORT`, and a
     /// number that was free when it was allocated can be taken by an IOC before
     /// the child binds it. A collision here kills the tool before it ever
@@ -480,7 +491,8 @@ impl PvaTools {
 
         let mut last = String::new();
         for _ in 0..BEACON_ATTEMPTS {
-            let beacon = alloc_free_port().map_err(|e| self.err("pvxmonitor", e.to_string()))?;
+            let claim = claim_port().map_err(|e| self.err("pvxmonitor", e.to_string()))?;
+            let beacon = claim.port();
             let mut child = self
                 .command("pvxmonitor", pvs, beacon)
                 .spawn()
@@ -542,6 +554,7 @@ impl PvaTools {
                     rx,
                     erx,
                     lines,
+                    _claim: claim,
                 });
             }
 
@@ -550,8 +563,8 @@ impl PvaTools {
             let _ = child.kill();
             let _ = child.wait();
             let stderr = erx.recv_timeout(STDERR_DRAIN).unwrap_or_default();
-            if is_beacon_collision(&stderr) {
-                last = format!("beacon port {beacon}: address already in use");
+            if is_port_collision(&stderr) {
+                last = format!("beacon port {beacon}: {}", stderr.trim());
                 continue;
             }
             let stderr = stderr.trim();
@@ -566,7 +579,7 @@ impl PvaTools {
         }
         Err(self.err(
             "pvxmonitor",
-            format!("could not get a free beacon port in {BEACON_ATTEMPTS} attempts ({last})"),
+            format!("lost a port in all {BEACON_ATTEMPTS} attempts ({last})"),
         ))
     }
 
@@ -598,7 +611,10 @@ impl PvaTools {
     /// the two addresses that answered, and the caller that reports the
     /// failure has no other way to get them.
     pub fn servers(&self) -> Result<Vec<String>, ToolError> {
-        let out = self.run("pvxlist", &["-w".into(), PVA_TIMEOUT_SECS.into()])?;
+        // An empty list is an answer here, not a tool failure: a UDP port shared
+        // with a process that is not this IOC (SO_REUSEPORT) drops a share of the
+        // unicast pings, and `pvxlist` then exits 0 printing nothing.
+        let (out, _) = self.run_maybe_empty("pvxlist", &["-w".into(), PVA_TIMEOUT_SECS.into()])?;
         let distinct: std::collections::BTreeSet<&str> = out
             .lines()
             .map(str::trim)
@@ -619,6 +635,9 @@ struct Subscription {
     erx: mpsc::Receiver<String>,
     /// Lines already drained during the seed sync — the seed events themselves.
     lines: Vec<String>,
+    /// The beacon port `pvxmonitor` bound, kept claimed until the subscriber
+    /// has been killed in [`Self::collect`]; the last field, so it drops last.
+    _claim: PortClaim,
 }
 
 impl Subscription {
@@ -768,20 +787,25 @@ mod tests {
     /// the message text and not on the label.
     const BIND_FAILURE: &str = "\u{1b}[31;1mERROR\u{1b}[0m: Address already in use";
 
+    /// A search-port collision, as `pvxget` prints it when its UDP6 bind of
+    /// the UDP4 search port's number fails (forced with an LD_PRELOAD `bind`).
+    const UDP6_FAILURE: &str = "\u{1b}[31;1mERROR\u{1b}[0m: Unable to bind random UDP6 port";
+
     /// The retry in `run_raw` is only as good as its trigger. If this stops
     /// matching, a collision silently becomes an ERROR verdict again.
     #[test]
-    fn a_beacon_collision_is_recognized_from_what_pvxs_actually_prints() {
-        assert!(is_beacon_collision(BIND_FAILURE));
+    fn a_port_collision_is_recognized_from_what_pvxs_actually_prints() {
+        assert!(is_port_collision(BIND_FAILURE));
+        assert!(is_port_collision(UDP6_FAILURE));
     }
 
     /// ...and it must not fire on the ordinary failures, or a real ERROR would
     /// be retried eight times and then reported as a port problem.
     #[test]
-    fn an_ordinary_tool_failure_is_not_read_as_a_beacon_collision() {
-        assert!(!is_beacon_collision("Timeout with 1 outstanding"));
-        assert!(!is_beacon_collision(""));
-        assert!(!is_beacon_collision(
+    fn an_ordinary_tool_failure_is_not_read_as_a_port_collision() {
+        assert!(!is_port_collision("Timeout with 1 outstanding"));
+        assert!(!is_port_collision(""));
+        assert!(!is_port_collision(
             "\u{1b}[31;1mERROR\u{1b}[0m: Channel not found"
         ));
     }

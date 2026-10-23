@@ -1,0 +1,297 @@
+rec0: example.proto binary(1,2,3,4,5,6,7,8,9) P
+binary {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 1000; # ms
+  replyTimeout  = 10000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 10000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    out "%B\x00\xff";
+}
+rec1: example.proto ai(1,2,3,4,5,6,7,8,9) P
+ai {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 1000; # ms
+  replyTimeout  = 10000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 10000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    out "%(NAME)s [int] ? ";
+    in "%i";
+}
+rec2: example.proto set-ao(1,2,3,4,5,6,7,8,9) P
+set-ao {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 1000; # ms
+  replyTimeout  = 10000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 10000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    out "%(NAME)s = %f %(EGU)s [0x%04x]";
+}
+rec3: example.proto li(1,2,3,4,5,6,7,8,9) P
+li {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 1000; # ms
+  replyTimeout  = 10000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 10000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    out "%(NAME)s [int] ? ";
+    in "%i";
+}
+rec4: example.proto lo(1,2,3,4,5,6,7,8,9) P
+lo {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 1000; # ms
+  replyTimeout  = 10000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 10000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    out "%(NAME)s = %i = %#x = %b(bin) = %D(BCD)";
+}
+rec5: example.proto bi(1,2,3,4,5,6,7,8,9) P
+bi {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 1000; # ms
+  replyTimeout  = 10000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 10000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    out "%(NAME)s [0 or 1] ? ";
+    in "%i";
+}
+rec6: example.proto bo(1,2,3,4,5,6,7,8,9) P
+bo {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 1000; # ms
+  replyTimeout  = 10000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 10000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    out "%(NAME)s = %i = %{false|true} = \"%s\"";
+}
+rec7: example.proto enums(1,2,3,4,5,6,7,8,9) P
+enums {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 1000; # ms
+  replyTimeout  = 10000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 10000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    out "%{choice0|choice1|choice2} %d %s";
+}
+rec8: example.proto checksum(1,2,3,4,5,6,7,8,9) P
+checksum {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 1000; # ms
+  replyTimeout  = 10000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 10000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    out "%s%<sum> sum";
+    out "%s%<nsum> nsum";
+    out "%s%<-sum> -sum";
+    out "%s%<notsum> notsum";
+    out "%s%<~sum> ~sum";
+    out "%s%<xor> xor";
+    out "%s%<crc8> crc8";
+    out "%s%<ccitt8> ccitt8";
+    out "%s%<sum16> sum16";
+    out "%s%<crc16> crc16";
+    out "%s%<crc16r> crc16r";
+    out "%s%<ccitt16> ccitt16";
+    out "%s%<ccitt16a> ccitt16 with augment";
+    out "%s%<sum32> sum32";
+    out "%s%<crc32> crc32";
+    out "%s%<crc32r> crcr32";
+    out "%s%<jamcrc> jamcrc";
+    out "%s%<adler32> adler32";
+    out "%s%0<sum> sum (ASCII)";
+    out "%s%0<nsum> nsum (ASCII)";
+    out "%s%0<-sum> -sum (ASCII)";
+    out "%s%0<notsum> notsum (ASCII)";
+    out "%s%0<~sum> ~sum (ASCII)";
+    out "%s%0<xor> xor (ASCII)";
+    out "%s%0<crc8> crc8 (ASCII)";
+    out "%s%0<ccitt8> ccitt8 (ASCII)";
+    out "%s%0<sum16> sum16 (ASCII)";
+    out "%s%0<crc16> crc16 (ASCII)";
+    out "%s%0<crc16r> crc16r (ASCII)";
+    out "%s%0<ccitt16> ccitt16 (ASCII)";
+    out "%s%0<ccitt16a> ccitt16 with augment (ASCII)";
+    out "%s%0<sum32> sum32 (ASCII)";
+    out "%s%0<crc32> crc32 (ASCII)";
+    out "%s%0<crc32r> crcr32 (ASCII)";
+    out "%s%0<jamcrc> jamcrc (ASCII)";
+    out "%s%0<adler32> adler32 (ASCII)";
+    out "%s%0<hexsum8> hexsum8 (ASCII)";
+}
+rec9: example.proto command(1,2,3,4,5,6,7,8,9) P
+command {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 1000; # ms
+  replyTimeout  = 10000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 10000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    out "%s";
+}
+rec10: example.proto info(1,2,3,4,5,6,7,8,9) P
+info {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 1000; # ms
+  replyTimeout  = 10000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 10000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    out "%s";
+    in "%39c";
+}
+rec11: example.proto read(1,2,3,4,5,6,7,8,9) P
+read {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 1000; # ms
+  replyTimeout  = 10000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 10000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    in "%39c";
+}
+rec12: example.proto spy(1,2,3,4,5,6,7,8,9) P
+spy {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 1000; # ms
+  replyTimeout  = 10000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 10; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    in "%39c";
+}
+rec13: example.proto calcout(1,2,3,4,5,6,7,8,9) P
+calcout {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 1000; # ms
+  replyTimeout  = 10000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 10000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    out "OVAL=%f A=%(A)f B=%(B)f C=%(C)f";
+}
+rec14: example.proto scalcout(1,2,3,4,5,6,7,8,9) P
+scalcout {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 1000; # ms
+  replyTimeout  = 10000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 10000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    out "OVAL=%f SOV=%s A=%(A)f B=%(B)f AA=%(AA)s";
+}
+rec15: example.proto string_wave_out(1,2,3,4,5,6,7,8,9) P
+string_wave_out {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 1000; # ms
+  replyTimeout  = 10000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 10000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r\n";
+  separator     = ", ";
+
+    out "waveform %(NAME)s = (%s)";
+}
+rec16: example.proto char_wave_in(1,2,3,4,5,6,7,8,9) P
+char_wave_in {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 1000; # ms
+  replyTimeout  = 10000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 10000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "";
+  separator     = "";
+
+    out "\x0d\x0aEnter String: ";
+    in "%1000c";
+    out "Got: \"%s\"\x0d\x0a";
+}

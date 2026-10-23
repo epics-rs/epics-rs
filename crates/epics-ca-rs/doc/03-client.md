@@ -126,7 +126,7 @@ On reconnection (`TransportEvent::ChannelCreated`):
 1. Update sid, native_type, element_count, server_addr,
    access_rights, last_connected_at
 2. Wake all `connect_waiters`
-3. Broadcast `Connected` + `AccessRightsChanged`
+3. Broadcast `AccessRightsChanged` + `Connected`
 4. `subscriptions.restore_for_channel(cid, sid, ...)` re-issues
    EVENT_ADD for every subscription whose receiver is still alive,
    purges the rest as stale
@@ -152,10 +152,11 @@ The search engine combines several layered policies:
    address is in penalty for `PENALTY_DURATION` (30 s). Search
    responses from penalised servers are ignored so the channel can
    find another server.
-5. **Datagram sequence validation** — outgoing VERSION header carries
-   `data_type = 0x8000` (sequenceNoIsValid) plus `cid = seq_no`. We
-   only accept SEARCH responses preceded by a VERSION whose seq_no
-   matches (or by an unflagged VERSION, for legacy servers).
+5. **Datagram sequence number** — outgoing VERSION header carries
+   `data_type = 1` (sequenceNoIsValid) plus `cid = seq_no`, which the
+   server echoes. libca scores search RTT with the echo; this client
+   does not model that timer and resolves every SEARCH response, as
+   libca `searchRespAction` does.
 
 ### Send loop
 

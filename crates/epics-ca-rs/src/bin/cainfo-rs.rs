@@ -1,7 +1,8 @@
 use clap::{CommandFactory, FromArgMatches, Parser};
 use epics_ca_rs::DbFieldType;
-use epics_ca_rs::client::CaClient;
+use epics_ca_rs::client::{CaClient, ChannelInfo};
 use epics_ca_rs::copt::{self, CTool};
+use epics_libcom_rs::cfmt::CFloat;
 
 /// Owner of every C-scanned option argument in this binary (see
 /// [`epics_ca_rs::copt`]).
@@ -42,7 +43,7 @@ Channel Access options:
 Example: cainfo my_channel another_channel
 
 "#,
-        timeout = epics_ca_rs::cli::DEFAULT_CLI_TIMEOUT_SECS,
+        timeout = CFloat(epics_ca_rs::cli::DEFAULT_CLI_TIMEOUT_SECS),
         max = epics_ca_rs::copt::CA_PRIORITY_MAX,
     );
     // C's SECOND `fprintf` in `usage()` (`cainfo.c:49`): the same banner
@@ -115,7 +116,7 @@ struct Args {
     diag: u8,
 
     /// PV names to query.
-    pv_names: Vec<String>,
+    pv_names: Vec<std::ffi::OsString>,
 }
 
 #[tokio::main]
@@ -151,6 +152,11 @@ async fn main() {
     if !stat_mode && !diag && args.pv_names.is_empty() {
         TOOL.no_pv_name();
     }
+    let pv_names: Vec<_> = args
+        .pv_names
+        .into_iter()
+        .map(epics_ca_rs::cli::pv_name_arg)
+        .collect();
 
     let client = CaClient::new().await.expect("failed to create CA client");
 
@@ -170,50 +176,35 @@ async fn main() {
     // `cainfo()` runs — stdout stays empty and the tool exits 1. It never
     // prints a `State: never connected` block, because a connect failure
     // means the print phase never happens.
-    let channels =
-        match epics_ca_rs::cli::connect_pvs(&client, &args.pv_names, priority, timeout).await {
-            Ok(channels) => channels,
-            Err(e) => {
-                eprintln!("{e}");
-                std::process::exit(1);
-            }
-        };
+    let channels = match epics_ca_rs::cli::connect_pvs(&client, &pv_names, priority, timeout).await
+    {
+        Ok(channels) => channels,
+        Err(e) => e.exit(),
+    };
 
     let mut failed = false;
-    for (pv_name, ch) in args.pv_names.iter().zip(&channels) {
+    for (pv_name, ch) in pv_names.iter().zip(&channels) {
         match ch.info().await {
             Ok(info) => {
-                // C `cainfo.c::printResult`: PV name on its own
-                // line, then five indented lines using a
-                // fixed-column key layout. Mirror it exactly so
-                // existing operator workflows that grep on
-                // `State:` / `Host:` etc. keep working.
-                let read_prefix = if info.access_rights.read { "" } else { "no " };
-                let write_prefix = if info.access_rights.write { "" } else { "no " };
                 // C `cainfo.c:101` prints `ca_host_name(chid)` — the
                 // reverse-resolved name, not the dotted IP (W10-B5). The
                 // resolution lives behind `Channel::host_name`, the
                 // `ca_host_name` analog; `info.server_addr` is the raw peer
                 // address and must not reach this line.
                 let host = ch.host_name().await.unwrap_or_default();
-                println!(
-                    "{name}\n    \
-                     State:            connected\n    \
-                     Host:             {host}\n    \
-                     Access:           {rp}read, {wp}write\n    \
-                     Native data type: {dbf}\n    \
-                     Request type:     {dbr}\n    \
-                     Element count:    {n}",
-                    name = info.pv_name,
-                    rp = read_prefix,
-                    wp = write_prefix,
-                    dbf = dbf_name(info.native_type),
-                    dbr = dbr_name(info.native_type),
-                    n = info.element_count,
-                );
+                use std::io::Write as _;
+                let _ = std::io::stdout()
+                    .lock()
+                    .write_all(&connected_block(&info, &host));
             }
             Err(e) => {
-                eprintln!("{pv_name}: {e}");
+                use std::fmt::Write as _;
+                use std::io::Write as _;
+                // The name is the argument's bytes, which need not be UTF-8.
+                let mut line = epics_libcom_rs::runtime::log::StagedLine::default();
+                line.push_bytes(pv_name.as_bytes());
+                let _ = writeln!(line, ": {e}");
+                let _ = epics_libcom_rs::runtime::log::StagedStderr.write_all(line.bytes());
                 failed = true;
             }
         }
@@ -223,7 +214,7 @@ async fn main() {
     // per-PV block. `-s` never reaches here — its non-zero mode returned
     // above, and `-s 0` is plain per-PV mode.
     if diag {
-        if !args.pv_names.is_empty() {
+        if !pv_names.is_empty() {
             println!();
         }
         println!("--- Client Diagnostics ---");
@@ -233,6 +224,34 @@ async fn main() {
     if failed {
         std::process::exit(1);
     }
+}
+
+/// C `cainfo.c::printResult` for a connected channel: PV name on its own
+/// line, then five indented lines in a fixed-column key layout, so operator
+/// workflows that grep on `State:` / `Host:` keep working. `host` is
+/// `ca_host_name`'s bytes, printed as `%s` prints them.
+fn connected_block(info: &ChannelInfo, host: &[u8]) -> Vec<u8> {
+    use std::io::Write as _;
+    let mut out = [
+        info.pv_name.as_bytes(),
+        b"\n    State:            connected\n    Host:             ",
+        host,
+    ]
+    .concat();
+    let _ = writeln!(
+        out,
+        "\n    \
+         Access:           {rp}read, {wp}write\n    \
+         Native data type: {dbf}\n    \
+         Request type:     {dbr}\n    \
+         Element count:    {n}",
+        rp = if info.access_rights.read { "" } else { "no " },
+        wp = if info.access_rights.write { "" } else { "no " },
+        dbf = dbf_name(info.native_type),
+        dbr = dbr_name(info.native_type),
+        n = info.element_count,
+    );
+    out
 }
 
 /// `dbf_type_to_text` parity. Maps our native field type to the
@@ -293,6 +312,29 @@ mod tests {
     }
     use super::*;
 
+    #[test]
+    fn a_non_utf8_host_name_is_printed_as_its_bytes() {
+        let info = ChannelInfo {
+            pv_name: "rv:ai".into(),
+            server_addr: "192.0.2.3:5064".parse().unwrap(),
+            native_type: DbFieldType::Double,
+            element_count: 1,
+            access_rights: epics_ca_rs::client::AccessRights {
+                read: true,
+                write: false,
+            },
+        };
+        assert_eq!(
+            connected_block(&info, b"caf\xe9.lab:5064"),
+            b"rv:ai\n    State:            connected\n    \
+              Host:             caf\xe9.lab:5064\n    \
+              Access:           read, no write\n    \
+              Native data type: DBF_DOUBLE\n    \
+              Request type:     DBR_DOUBLE\n    \
+              Element count:    1\n"
+        );
+    }
+
     /// `cainfo -s <arg>`, resolved the way `main` resolves it — through the
     /// ordered scan over a real command line, since that is the only way a
     /// resolver can be reached (and the only way its warning gets a position).
@@ -340,9 +382,15 @@ mod tests {
         assert_eq!(stat_level("+"), 0);
         // `-0` converts to 0 → normal per-PV mode (not diagnostics).
         assert_eq!(stat_level("-0"), 0);
-        // Overflow truncates mod 2^32 (NOT saturate): probe-confirmed
-        // `sscanf("99999999999","%u") == 1215752191`.
-        assert_eq!(stat_level("99999999999"), 1_215_752_191);
+        // Overflow truncates mod 2^32 where `long` is 64 bits (probe-confirmed
+        // `sscanf("99999999999","%u") == 1215752191`); a 32-bit `strtoul`
+        // saturates first.
+        let want = if std::ffi::c_ulong::BITS == 64 {
+            1_215_752_191
+        } else {
+            u32::MAX
+        };
+        assert_eq!(stat_level("99999999999"), want);
     }
 
     // The decisive mode-selector property: any non-zero `parse_stat_level`

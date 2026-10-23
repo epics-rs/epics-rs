@@ -1,0 +1,3 @@
+monitor CO.B CO.INBV
+caput CO.INPB ""
+caput CO.INPB 9

@@ -12,8 +12,9 @@ use std::time::Duration;
 use asyn_rs::adapter::{AsynDeviceSupport, AsynLink};
 use asyn_rs::error::AsynResult;
 use asyn_rs::param::ParamType;
+use asyn_rs::port::InterfaceMask;
 use asyn_rs::port::{PortDriver, PortDriverBase, PortFlags};
-use asyn_rs::runtime::{RuntimeConfig, create_port_runtime};
+use asyn_rs::runtime::{RuntimeConfig, create_port_runtime_unclaimed};
 use asyn_rs::user::AsynUser;
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::device_support::DeviceSupport;
@@ -35,7 +36,7 @@ impl PortDriver for CountingPort {
     }
     fn write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {
         self.writes.fetch_add(1, Ordering::SeqCst);
-        self.base.params.set_float64(user.reason, user.addr, value)
+        self.base.set_float64_param(user.reason, user.addr, value)
     }
 }
 
@@ -50,9 +51,11 @@ async fn a_put_on_a_non_blocking_port_writes_the_driver_once() {
             can_block: false,
             ..PortFlags::default()
         },
+        InterfaceMask::UNMIGRATED_ALL,
+        InterfaceMask::UNMIGRATED_INTERRUPTS,
     );
     base.create_param("VAL", ParamType::Float64).unwrap();
-    let (runtime, _actor) = create_port_runtime(
+    let (runtime, _actor) = create_port_runtime_unclaimed(
         CountingPort {
             base,
             writes: writes.clone(),

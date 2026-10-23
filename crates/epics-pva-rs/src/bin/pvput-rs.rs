@@ -115,26 +115,19 @@ async fn main() {
     // route `-p ca` through its CA provider (pvput.cpp:368-399); we
     // cannot, so reject it instead of silently writing over PVA.
     if let Err(e) = check_provider(&args.provider) {
-        eprintln!("pvput-rs: {e}");
+        epics_libcom_rs::stderr_println!("pvput-rs: {e}");
         std::process::exit(1);
-    }
-
-    // pvxs `-v` prints the effective client config once, before the PUT
-    // (tools/put.cpp:109-110). It is a diagnostic, not an output-format
-    // switch — the readback echo formatter stays under `-M`.
-    if args.verbose > 0 {
-        cli::print_effective_config();
     }
 
     // C's own two argument checks, in C's order and wording
     // (pvput.cpp:363-377). Both return 1; clap would have exited 2.
     let Some(pv_name) = args.pv_name else {
-        eprintln!("No pv name specified. ('pvput -h' for help.)");
+        epics_libcom_rs::stderr_println!("No pv name specified. ('pvput -h' for help.)");
         std::process::exit(1);
     };
 
     if args.values.is_empty() {
-        eprintln!("No value(s) specified. ('pvput -h' for help.)");
+        epics_libcom_rs::stderr_println!("No value(s) specified. ('pvput -h' for help.)");
         std::process::exit(1);
     }
 
@@ -150,6 +143,14 @@ async fn main() {
         .timeout(epics_pva_rs::cli::wait_timeout_duration(args.timeout))
         .build();
 
+    // pvxs `-v` prints the context's effective config once, after the
+    // argument checks and before the PUT (tools/put.cpp:115-118). It is a
+    // diagnostic, not an output-format switch — the readback echo
+    // formatter stays under `-M`.
+    if args.verbose > 0 {
+        cli::print_effective_config(&client);
+    }
+
     // Parse the optional pvRequest once (shared by both put forms) with
     // the strict pvxs grammar, so acceptance matches pvxs's own `pvput`:
     // `tools/put.cpp:115` routes `-r` through `RequestBuilder::pvRequest()`
@@ -162,7 +163,10 @@ async fn main() {
         match PvRequestExpr::parse_pvxs_compat(trimmed) {
             Ok(req) => Some(req),
             Err(e) => {
-                eprintln!("error: invalid pvRequest {:?}: {e}", args.request);
+                epics_libcom_rs::stderr_println!(
+                    "error: invalid pvRequest {:?}: {e}",
+                    args.request
+                );
                 std::process::exit(1);
             }
         }
@@ -190,9 +194,17 @@ async fn main() {
     let put_result = client
         .pvput_args(&pv_name, &args.values, request.as_ref())
         .await;
-    if let Err(e) = put_result {
-        eprintln!("error: {e}");
-        std::process::exit(1);
+    match put_result {
+        Ok(_) => {}
+        // tools/put.cpp:167-169.
+        Err(epics_pva_rs::error::PvaError::Timeout) => {
+            epics_libcom_rs::stderr_println!("Timeout");
+            std::process::exit(1);
+        }
+        Err(e) => {
+            epics_libcom_rs::stderr_println!("error: {e}");
+            std::process::exit(1);
+        }
     }
 
     // pvxs-faithful default: the PUT is the whole command. Without
@@ -239,7 +251,7 @@ async fn main() {
         Ok(r) => print!("{}", render(new_label, &r.value, &r.introspection)),
         // A readback GET failure is not the PUT result (already checked);
         // report it to stderr so quiet's stdout stays value-only.
-        Err(e) if args.quiet => eprintln!("pvput-rs: readback failed: {e}"),
+        Err(e) if args.quiet => epics_libcom_rs::stderr_println!("pvput-rs: readback failed: {e}"),
         Err(e) => println!("New : *** {e}"),
     }
 }

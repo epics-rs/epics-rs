@@ -24,15 +24,12 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  # Line tables, not full DWARF. A `cargo nextest run --workspace` target dir
-  # for this workspace measures 91,635 MB here, against the ~86 GB an
-  # ubuntu-latest runner leaves free, and it is nearly all debuginfo: 658 test
-  # binaries at ~300 MB each. Both `checks` and `interop` died writing the
-  # runner's own diagnostic log ("System.IO.IOException: No space left on
-  # device"), which also loses the job log, so the failure arrives with no
-  # output to read. `line-tables-only` keeps the file:line a backtrace is read
-  # with and takes the same target dir to 34,436 MB (measured 2026-08-29).
-  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  # No debuginfo, not even line tables. The all-features test build on
+  # 12059ffc07 (1,674 test binaries) takes 109,470 MB with `line-tables-only`
+  # and 48,809 MB with 0; 17a131b3b's 69,114 MB was the last that fit. A full
+  # disk kills the runner's own diagnostic log, so the job log goes with it.
+  # Panics keep their file:line; backtrace frames do not.
+  CARGO_PROFILE_DEV_DEBUG: 0
   # R7.0.9 is the floor, not a preference: before base 3d70e7064
   # `dbAllocRecord()` reaches every field through `&ppvt->common`, so
   # `__builtin_object_size()` bounds the write to `sizeof(dbCommon)` and
@@ -41,7 +38,11 @@ env:
   # Under R7.0.8 `softIocPVX` therefore died in `dbLoadRecords` for every
   # db holding a calc record, which is what `pipeline_r1` loads.
   EPICS_BASE_VERSION: R7.0.10
-  PVXS_VERSION: 1.3.3
+  # The oracle's ground truth. 1.5.2 changed what softIocPVX sends under
+  # DBE=ALARM (pvxs ef7ef0f), so an older tag fails monitor_seed_mask.
+  PVXS_VERSION: 1.5.3
+  # upstream epics-base/pvxs branch `tls` (TLS build, libpvxs.so.1.5)
+  PVXS_TLS_COMMIT: b3a10bf0222ef72d29e1f25e18dd54ac8b26ab1e
 
 jobs:
   # Cheap gate: decides whether the heavy interop job should run for a
@@ -115,26 +116,30 @@ jobs:
     # Cargo registry + target cache, same shape as every job in
     # `rust.yml`. Placed after the toolchain step because the cache key
     # includes the rustc version. The explicit `key` names the *feature
-    # resolution* this job builds — `cargo build --workspace --tests`
-    # with default features — so it can never restore into a job that
-    # resolves features differently. rust-cache also folds the job name
-    # in, so this stays a separate entry from `rust.yml`'s `checks` job
-    # even though both resolve default features: only this job's target
-    # dir holds the gated interop test binaries.
+    # resolution* this job builds — `--workspace --all-features`, the form
+    # `rust.yml`'s `all-features` job builds — so it can never restore into
+    # a job that resolves features differently. rust-cache also folds the job
+    # name in, so this stays a separate entry from `rust.yml`'s: only this
+    # job's target dir holds the gated interop test binaries.
     - uses: Swatinem/rust-cache@v2
       with:
-        key: default-features
+        key: all-features
 
     # ── EPICS reference build ──────────────────────────────────
     # Cache /opt/epics across runs. Cache key bumps when version
     # changes. ~3 GB; full first-time build ~12 min, cache restore
     # ~30 s.
+    #
+    # With its submodules, as the release tarball ships it: `pvget` is
+    # pvAccessCPP's (modules/pvAccess), and a bare clone builds base without
+    # it. `-pva` keeps the submodule-less trees cached before that from
+    # restoring.
     - name: Restore epics-base cache
       id: cache-epics
       uses: actions/cache@v4
       with:
         path: /opt/epics-base
-        key: epics-base-${{ env.EPICS_BASE_VERSION }}-ubuntu-latest
+        key: epics-base-${{ env.EPICS_BASE_VERSION }}-pva-ubuntu-latest
 
     - name: Build epics-base if cache miss
       if: steps.cache-epics.outputs.cache-hit != 'true'
@@ -142,7 +147,8 @@ jobs:
         sudo mkdir -p /opt/epics-base
         sudo chown $USER /opt/epics-base
         cd /tmp
-        git clone --depth 1 --branch ${{ env.EPICS_BASE_VERSION }} \
+        git clone --depth 1 --recurse-submodules --shallow-submodules \
+          --branch ${{ env.EPICS_BASE_VERSION }} \
           https://github.com/epics-base/epics-base.git
         cd epics-base
         make -j2
@@ -165,13 +171,50 @@ jobs:
         sudo apt-get install -y libevent-dev libssl-dev
         sudo mkdir -p /opt/pvxs
         sudo chown $USER /opt/pvxs
-        cd /tmp
+        # Built where it is cached, as the TLS tree is: its binaries find
+        # their libpvxs by RUNPATH, never by the loader path.
         git clone --depth 1 --branch ${{ env.PVXS_VERSION }} \
-          https://github.com/epics-base/pvxs.git
-        cd pvxs
+          https://github.com/epics-base/pvxs.git /opt/pvxs
+        cd /opt/pvxs
         echo "EPICS_BASE=/opt/epics-base" > configure/RELEASE.local
         make -j2
-        cp -r . /opt/pvxs/
+
+    # ── TLS-capable pvxs ───────────────────────────────────────
+    # The 1.5.x tags have no TLS (`pvxinfo -D` lacks
+    # EPICS_PVA_TLS_KEYCHAIN); it lives on upstream's `tls` branch. Pinned to
+    # the commit the local `~/work/pvxs-tls` checkout is built from, so a
+    # branch move cannot change what `interop_tls_*` verify. Both tests fail,
+    # not skip, without it. Its libpvxs SONAME is 1.5.3's, so neither lib
+    # dir may go on LD_LIBRARY_PATH or into ldconfig: the first one listed
+    # would hand both trees' binaries its own libpvxs.
+    - name: Restore TLS pvxs cache
+      id: cache-pvxs-tls
+      uses: actions/cache@v4
+      with:
+        path: /opt/pvxs-tls
+        key: pvxs-tls-${{ env.PVXS_TLS_COMMIT }}-base-${{ env.EPICS_BASE_VERSION }}-ubuntu-latest-v2
+
+    - name: Build TLS pvxs if cache miss
+      if: steps.cache-pvxs-tls.outputs.cache-hit != 'true'
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libssl-dev cmake
+        sudo mkdir -p /opt/pvxs-tls
+        sudo chown $USER /opt/pvxs-tls
+        # Built where it is cached. The binaries carry RUNPATHs to the build
+        # tree (their own lib/ and the bundled libevent under bundle/usr/),
+        # so a build in /tmp copied to /opt loads only on the run that built
+        # it and fails on every cache hit after.
+        cd /opt/pvxs-tls
+        git init -q .
+        git fetch --depth 1 https://github.com/epics-base/pvxs.git ${{ env.PVXS_TLS_COMMIT }}
+        git checkout FETCH_HEAD
+        # The local build links the bundled libevent submodule; the
+        # system one is not used, so no libevent-dev is installed.
+        git submodule update --init --depth 1 bundle/libevent
+        echo "EPICS_BASE=/opt/epics-base" > configure/RELEASE.local
+        make -C bundle -j2 libevent
+        make -j2
 
     # ── PATH plumbing ──────────────────────────────────────────
     # Tests probe PATH for `softIoc`, `caget`, `pvget`, etc. Put
@@ -193,8 +236,12 @@ jobs:
         HOST_ARCH=$(ls /opt/epics-base/bin | head -n1)
         echo "/opt/epics-base/bin/${HOST_ARCH}" >> "$GITHUB_PATH"
         echo "/opt/pvxs/bin/${HOST_ARCH}" >> "$GITHUB_PATH"
-        echo "LD_LIBRARY_PATH=/opt/epics-base/lib/${HOST_ARCH}:/opt/pvxs/lib/${HOST_ARCH}" \
-          >> "$GITHUB_ENV"
+        echo "LD_LIBRARY_PATH=/opt/epics-base/lib/${HOST_ARCH}" >> "$GITHUB_ENV"
+        if [ ! -x "/opt/pvxs-tls/bin/${HOST_ARCH}/pvxget" ]; then
+          echo "::error::/opt/pvxs-tls has no pvxget — the TLS pvxs cache is incomplete"
+          exit 1
+        fi
+        echo "PVXS_TLS_HOME=/opt/pvxs-tls" >> "$GITHUB_ENV"
         if [ ! -f /opt/pvxs/src/clientreq.cpp ]; then
           echo "::error::/opt/pvxs is not a pvxs source checkout — the cache holds an install prefix, not the tree interop_pvxs reads"
           exit 1
@@ -207,34 +254,83 @@ jobs:
         echo "EPICS_BASE=/opt/epics-base" >> "$GITHUB_ENV"
 
     # ── Dynamic-linker registration ────────────────────────────
-    # The reference binaries link libpvxs.so.1.3 / libca.so by SONAME.
+    # The reference binaries link libca.so by SONAME (libpvxs comes from
+    # each pvxs tree's RUNPATH, see the TLS step).
     # LD_LIBRARY_PATH set above reaches nextest's direct children, but a
     # reference binary spawned as a *grandchild* (test process ->
     # pvxget) is not guaranteed to inherit it. Register the lib dirs
-    # with the system loader so SONAME resolution works regardless, and
-    # fail loudly HERE (with a directory listing) if libpvxs is still
-    # absent — that turns a broken cache into an obvious infra error
-    # instead of 11 cryptic "cannot open shared object file" test fails.
-    - name: Register EPICS/pvxs libs with ldconfig
+    # with the system loader so SONAME resolution works regardless.
+    - name: Register EPICS libs with ldconfig
       run: |
         HOST_ARCH=$(ls /opt/epics-base/bin | head -n1)
         echo "/opt/epics-base/lib/${HOST_ARCH}" | sudo tee /etc/ld.so.conf.d/epics.conf
-        echo "/opt/pvxs/lib/${HOST_ARCH}" | sudo tee -a /etc/ld.so.conf.d/epics.conf
         sudo ldconfig
-        if ! ldconfig -p | grep -q 'libpvxs\.so'; then
-          echo "::error::libpvxs SONAME not registered — /opt/pvxs cache is incomplete"
-          ls -l "/opt/pvxs/lib/${HOST_ARCH}" || true
-          exit 1
-        fi
+
+    # A cache that restores but cannot load is an infra error, not twelve
+    # failing tests: run each pvxs CLI and base's pvget once, and check each
+    # pvxs tree loads its own libpvxs. `-x` passes on a tree whose RUNPATH
+    # dangles.
+    - name: Smoke-run the reference binaries
+      run: |
+        HOST_ARCH=$(ls /opt/epics-base/bin | head -n1)
+        /opt/pvxs/bin/${HOST_ARCH}/pvxget -h > /dev/null
+        ldd /opt/pvxs/bin/${HOST_ARCH}/pvxget | grep -q '/opt/pvxs/lib/'
+        ldd /opt/pvxs-tls/bin/${HOST_ARCH}/pvxget | grep -q '/opt/pvxs-tls/lib/'
+        /opt/pvxs-tls/bin/${HOST_ARCH}/pvxget -h > /dev/null
+        /opt/pvxs-tls/bin/${HOST_ARCH}/pvxinfo -D | grep -q EPICS_PVA_TLS_KEYCHAIN
+        /opt/epics-base/bin/${HOST_ARCH}/pvget -h > /dev/null 2>&1
+
+    # The `auth::tls` PKCS#12 tests shell out to `openssl pkcs12 -export
+    # -legacy`, which fails, not skips, without the legacy provider.
+    # ubuntu-latest has it; this turns a runner-image change into one clear
+    # error instead of thirteen test failures.
+    - name: Test prerequisites (openssl legacy provider)
+      run: |
+        openssl version
+        openssl list -providers -provider legacy | grep -q 'OpenSSL Legacy Provider'
+
+    # ── pyepics ────────────────────────────────────────────────
+    # `pyepics_caget_via_libca_against_rust_ioc` fails when
+    # `python3 -c "import epics"` does. It is installed here so that test
+    # runs; the wheel carries its own libca. A venv, because the runner's
+    # system python refuses `pip install` (PEP 668).
+    - name: Install pyepics
+      run: |
+        python3 -m venv /opt/pyepics-venv
+        /opt/pyepics-venv/bin/pip install pyepics
+        /opt/pyepics-venv/bin/python -c "import epics"
+        echo "/opt/pyepics-venv/bin" >> "$GITHUB_PATH"
 
     # ── Rust interop profile ───────────────────────────────────
+    # `--all-features` as in `rust.yml`'s `all-features` job, which also
+    # leaves out `epics-oracle-rs` (a harness against a built C EPICS/pvxs
+    # that its own reference gate covers).
     - name: Build workspace
-      run: cargo build --workspace --tests
+      run: cargo build --workspace --all-features --exclude epics-oracle-rs --tests
 
     - name: Run wire-golden + interop suites
       # The `interop` profile in .config/nextest.toml filters to
       # the gated binaries (wire_golden_ext, wire_golden_pvxs,
-      # interop_*_rust_*, differential_libca, interop_pvxs).
-      # Skips wrapped in `require_tool` print a
-      # SKIP line + exit 0 when binaries are still missing.
-      run: cargo nextest run --profile interop --no-fail-fast
+      # interop_*_rust_*, differential_libca, stress_load, interop_pvxs,
+      # calink_rights_match_softioc, gw_upstream_unresponsive_window, plus
+      # the c-ca-tools softIoc test and the openssl-driven `auth::tls`
+      # PKCS#12 tests). `--run-ignored all` is what runs the `#[ignore]`d
+      # ones, which is most of them: without it this step ran only the
+      # wire-golden and `interop_pvxs` cases.
+      #
+      # What the ignored tests need, and what this job provides:
+      #   interop_c_client_rust_ioc, interop_rust_client_c_ioc,
+      #   differential_libca, stress_load, calink_rights_match_softioc,
+      #   c-ca-tools:  libca tools and softIoc from /opt/epics-base (PATH
+      #     step above); `require_tool` fails the test if a binary is
+      #     missing.
+      #   gw_upstream_unresponsive_window:  the softIoc under $EPICS_BASE.
+      #   attributes_file_over_ca:  caput/caget and pvAccessCPP's pvget under
+      #     $EPICS_BASE (the submodule build above).
+      #   pyepics_caget_via_libca_against_rust_ioc:  pyepics (step above).
+      #   auth::tls PKCS#12 tests:  the runner's openssl 3.x CLI with the
+      #     legacy provider.
+      #   interop_tls_*:  the TLS pvxs (steps above).
+      run: >-
+        cargo nextest run --profile interop --workspace --all-features
+        --exclude epics-oracle-rs --run-ignored all --no-fail-fast

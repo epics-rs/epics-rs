@@ -114,6 +114,7 @@ pub(crate) struct IoIntrBinding {
     pub addr: i32,
     pub reason: usize,
     pub ui32mask: u32,
+    pub drv_user: Option<crate::port::DrvUser>,
 }
 
 #[derive(Default)]
@@ -130,6 +131,27 @@ struct Registration {
     /// framework takes the wakeup receiver (`iocInit`'s `setup_io_intr`), which
     /// is the point the record's I/O Intr scan actually exists.
     started: bool,
+}
+
+/// C `registerInterrupts`' "No %s interface" refusal (asynRecord.c:611-649),
+/// carrying the interface's C name so the caller formats it into ERRS without
+/// allocating.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct NoInterface(pub(crate) &'static str);
+
+impl std::fmt::Display for NoInterface {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "No {} interface", self.0)
+    }
+}
+
+/// Why `registerInterrupts` failed (asynRecord.c:599-656).
+#[derive(Debug)]
+pub(crate) enum RegisterRefusal {
+    /// The port lacks IFACE, which C reports into ERRS (:617,:627,:637,:647).
+    NoInterface(NoInterface),
+    /// The port refused `registerInterruptUser`, which C only prints (:651-653).
+    Refused(crate::error::AsynError),
 }
 
 /// The record's I/O Intr machinery: the `gotValue` cell, the driver
@@ -160,24 +182,27 @@ impl IoIntrScan {
 
     /// The framework's `get_ioint_info` seam: hand over the wakeup receiver
     /// (C `*iopvt = pasynRecPvt->ioScanPvt`) and arm the record's
-    /// `interruptAccept` gate. Taken once, at `iocInit`.
+    /// `interruptAccept` gate. Taken once, at `iocInit`; a record that loaded
+    /// with SCAN="I/O Intr" registers in [`Self::scan_add`] right after.
     pub(crate) fn take_receiver(&self) -> Option<mpsc::Receiver<()>> {
         let rx = self.rx.lock().unwrap().take()?;
-        {
-            let mut reg = self.reg.lock().unwrap();
-            reg.started = true;
-        }
-        // A record that loaded with SCAN="I/O Intr" set `active` before the IOC
-        // was running; this is the first moment its registration may exist.
-        let _ = self.refresh();
+        self.reg.lock().unwrap().started = true;
         Some(rx)
+    }
+
+    /// iocInit's `scanAdd` → `getIoIntInfo(0)` for a record that loaded with
+    /// SCAN="I/O Intr": the first moment its registration may exist. On a
+    /// refusal `scanAdd`'s demotion clears `active` through
+    /// [`Self::set_active`].
+    pub(crate) fn scan_add(&self) -> Result<(), RegisterRefusal> {
+        self.refresh()
     }
 
     /// C `getIoIntInfo(cmd)` (asynRecord.c:588-594): the record joined (`true`)
     /// or left (`false`) the I/O Intr scan list. Returns the C
-    /// `registerInterrupts` failure text ("No asynInt32 interface", …), which
-    /// the caller reports into ERRS.
-    pub(crate) fn set_active(&self, active: bool) -> Result<(), String> {
+    /// `registerInterrupts` failure, which the caller reports; the record is
+    /// then not on the list, since `scanAdd` demotes it to Passive.
+    pub(crate) fn set_active(&self, active: bool) -> Result<(), RegisterRefusal> {
         {
             let mut reg = self.reg.lock().unwrap();
             if reg.active == active {
@@ -186,13 +211,14 @@ impl IoIntrScan {
             reg.active = active;
         }
         self.refresh()
+            .inspect_err(|_| self.reg.lock().unwrap().active = false)
     }
 
     /// Publish the record's current port binding — C `registerInterrupts`
     /// re-reads PORT / IFACE / ADDR / REASON / UI32MASK off the record every
     /// time it registers, so the port keeps the same fields in the one place the
     /// registration is derived from. `None` = bound to no port.
-    pub(crate) fn rebind(&self, binding: Option<IoIntrBinding>) -> Result<(), String> {
+    pub(crate) fn rebind(&self, binding: Option<IoIntrBinding>) -> Result<(), RegisterRefusal> {
         {
             let mut reg = self.reg.lock().unwrap();
             reg.binding = binding;
@@ -224,7 +250,7 @@ impl IoIntrScan {
     /// The single owner of the registration invariant (see the module doc):
     /// the subscription exists exactly while the record is on the I/O Intr list,
     /// is bound to a port, and the port implements IFACE.
-    fn refresh(&self) -> Result<(), String> {
+    fn refresh(&self) -> Result<(), RegisterRefusal> {
         let mut reg = self.reg.lock().unwrap();
 
         // Every binding change discards whatever the *previous* binding pushed.
@@ -254,12 +280,16 @@ impl IoIntrScan {
         // readback — same rule as `AsynRecord::has_interface`.
         if !binding.handle.has_interface(binding.iface.registry_type()) {
             reg.sub = None;
-            return Err(format!("No {} interface", binding.iface.c_asyn_name()));
+            return Err(RegisterRefusal::NoInterface(NoInterface(
+                binding.iface.c_asyn_name(),
+            )));
         }
 
         let filter = InterruptFilter {
             reason: Some(binding.reason),
-            addr: Some(binding.addr),
+            addr: Some(binding.handle.param_list(binding.addr)),
+            user_addr: Some(binding.addr),
+            drv_user: binding.drv_user.clone(),
             // C passes the record's UI32MASK to
             // `pasynUInt32->registerInterruptUser` (:635); the driver then fires
             // only when the changed bits overlap it. No other interface carries
@@ -303,7 +333,7 @@ impl IoIntrScan {
             },
         );
 
-        reg.sub = Some(sub);
+        reg.sub = Some(sub.map_err(RegisterRefusal::Refused)?);
         Ok(())
     }
 }

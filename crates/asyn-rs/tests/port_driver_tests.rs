@@ -21,6 +21,7 @@ use asyn_rs::error::{AsynError, AsynResult, AsynStatus};
 use asyn_rs::interrupt::InterruptFilter;
 use asyn_rs::manager::PortManager;
 use asyn_rs::param::{EnumEntry, ParamType, ParamValue};
+use asyn_rs::port::InterfaceMask;
 use asyn_rs::port::{DrvUserRequest, PortDriver, PortDriverBase, PortFlags};
 use asyn_rs::user::AsynUser;
 
@@ -43,7 +44,13 @@ struct TestScopeDriver {
 
 impl TestScopeDriver {
     fn new(port_name: &str) -> Self {
-        let mut base = PortDriverBase::new(port_name, 1, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            port_name,
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
+        );
         let p_run = base.create_param("Run", ParamType::Int32).unwrap();
         let p_max_points = base.create_param("MaxPoints", ParamType::Int32).unwrap();
         let _p_update_time = base.create_param("UpdateTime", ParamType::Float64).unwrap();
@@ -179,7 +186,13 @@ struct EchoDriver {
 
 impl EchoDriver {
     fn new(port_name: &str) -> Self {
-        let mut base = PortDriverBase::new(port_name, 1, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            port_name,
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
+        );
         let p_msg = base.create_param("MSG", ParamType::Octet).unwrap();
         Self { base, p_msg }
     }
@@ -194,8 +207,7 @@ impl PortDriver for EchoDriver {
     }
 
     fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
-        self.base
-            .set_string_param(user.reason, user.addr, data.to_vec())?;
+        self.base.set_string_param(user.reason, user.addr, data)?;
         self.base.call_param_callbacks(user.addr)?;
         Ok(data.len())
     }
@@ -215,7 +227,13 @@ struct ErrorDriver {
 
 impl ErrorDriver {
     fn new(port_name: &str) -> Self {
-        let mut base = PortDriverBase::new(port_name, 1, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            port_name,
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
+        );
         let p_val = base.create_param("VAL", ParamType::Int32).unwrap();
         let p_status = base.create_param("STATUS", ParamType::Int32).unwrap();
         base.set_int32_param(p_val, 0, 0).unwrap();
@@ -278,10 +296,11 @@ fn setup_scope() -> (PortManager, asyn_rs::port_handle::PortHandle) {
     // test has no scan facility, so it establishes the precondition itself —
     // the analogue of C linking the non-IOC translation unit's
     // `interruptAccept = 1`. See `interrupt_accept` in `epics-libcom-rs`.
-    epics_libcom_rs::runtime::interrupt_accept::set_interrupts_accepted(true);
+    // The database's gate, opened as `scan_run` would and bound to the port.
+    let gate = epics_libcom_rs::runtime::interrupt_accept::InterruptGate::opened();
     let mgr = PortManager::new();
     let rt = mgr
-        .register_port(TestScopeDriver::new(&unique_name("SCOPE")))
+        .register_port_unclaimed(TestScopeDriver::new(&unique_name("SCOPE")), &gate)
         .unwrap();
     let handle = rt.port_handle().clone();
     (mgr, handle)
@@ -290,7 +309,10 @@ fn setup_scope() -> (PortManager, asyn_rs::port_handle::PortHandle) {
 fn setup_echo() -> (PortManager, asyn_rs::port_handle::PortHandle) {
     let mgr = PortManager::new();
     let rt = mgr
-        .register_port(EchoDriver::new(&unique_name("ECHO")))
+        .register_port_unclaimed(
+            EchoDriver::new(&unique_name("ECHO")),
+            &asyn_rs::registry::open_owner(),
+        )
         .unwrap();
     let handle = rt.port_handle().clone();
     (mgr, handle)
@@ -299,7 +321,10 @@ fn setup_echo() -> (PortManager, asyn_rs::port_handle::PortHandle) {
 fn setup_error() -> (PortManager, asyn_rs::port_handle::PortHandle) {
     let mgr = PortManager::new();
     let rt = mgr
-        .register_port(ErrorDriver::new(&unique_name("ERRTEST")))
+        .register_port_unclaimed(
+            ErrorDriver::new(&unique_name("ERRTEST")),
+            &asyn_rs::registry::open_owner(),
+        )
         .unwrap();
     let handle = rt.port_handle().clone();
     (mgr, handle)
@@ -429,8 +454,10 @@ async fn test_octet_write_read() {
     h.write_octet(reason, 0, b"Hello, EPICS!".to_vec())
         .await
         .unwrap();
-    let data = h.read_octet(reason, 0, 64).await.unwrap();
-    assert_eq!(String::from_utf8_lossy(&data), "Hello, EPICS!");
+    let (data, status) = h.read_octet(reason, 0, 64).await.into_parts();
+    status.unwrap();
+    // C asynPortDriver::readOctet counts the NUL: `strlen(value) + 1`.
+    assert_eq!(data, b"Hello, EPICS!\0");
 }
 
 #[tokio::test]
@@ -442,8 +469,9 @@ async fn test_octet_overwrite() {
         .unwrap();
     h.write_octet(reason, 0, b"first".to_vec()).await.unwrap();
     h.write_octet(reason, 0, b"second".to_vec()).await.unwrap();
-    let data = h.read_octet(reason, 0, 64).await.unwrap();
-    assert_eq!(String::from_utf8_lossy(&data), "second");
+    let (data, status) = h.read_octet(reason, 0, 64).await.into_parts();
+    status.unwrap();
+    assert_eq!(data, b"second\0");
 }
 
 // ============================================================
@@ -508,11 +536,17 @@ async fn test_interrupt_on_param_change() {
         .drv_user_create(&DrvUserRequest::new("NoiseAmplitude", 0))
         .await
         .unwrap();
-    let (_sub, mut rx) = h.interrupts().register_interrupt_user(InterruptFilter {
-        reason: Some(reason),
-        addr: Some(0),
-        ..Default::default()
-    });
+    let (_sub, mut rx) = h
+        .interrupts()
+        .register_interrupt_user(
+            InterruptFilter {
+                reason: Some(reason),
+                addr: Some(0),
+                ..Default::default()
+            },
+            4096,
+        )
+        .unwrap();
     h.write_float64(reason, 0, 0.5).await.unwrap();
     let iv = tokio::time::timeout(Duration::from_millis(200), rx.recv())
         .await
@@ -543,11 +577,17 @@ async fn test_interrupt_filter_excludes_other_params() {
     tokio::time::sleep(Duration::from_millis(20)).await;
 
     // Subscribe only to NoiseAmplitude
-    let (_sub, mut rx) = h.interrupts().register_interrupt_user(InterruptFilter {
-        reason: Some(noise_r),
-        addr: Some(0),
-        ..Default::default()
-    });
+    let (_sub, mut rx) = h
+        .interrupts()
+        .register_interrupt_user(
+            InterruptFilter {
+                reason: Some(noise_r),
+                addr: Some(0),
+                ..Default::default()
+            },
+            4096,
+        )
+        .unwrap();
 
     // Write only to UpdateTime — should NOT trigger NoiseAmplitude interrupt
     h.write_float64(update_r, 0, 1.0).await.unwrap();
@@ -566,16 +606,28 @@ async fn test_multiple_interrupt_subscribers() {
         .drv_user_create(&DrvUserRequest::new("Run", 0))
         .await
         .unwrap();
-    let (_sub1, mut rx1) = h.interrupts().register_interrupt_user(InterruptFilter {
-        reason: Some(reason),
-        addr: Some(0),
-        ..Default::default()
-    });
-    let (_sub2, mut rx2) = h.interrupts().register_interrupt_user(InterruptFilter {
-        reason: Some(reason),
-        addr: Some(0),
-        ..Default::default()
-    });
+    let (_sub1, mut rx1) = h
+        .interrupts()
+        .register_interrupt_user(
+            InterruptFilter {
+                reason: Some(reason),
+                addr: Some(0),
+                ..Default::default()
+            },
+            4096,
+        )
+        .unwrap();
+    let (_sub2, mut rx2) = h
+        .interrupts()
+        .register_interrupt_user(
+            InterruptFilter {
+                reason: Some(reason),
+                addr: Some(0),
+                ..Default::default()
+            },
+            4096,
+        )
+        .unwrap();
     h.write_int32(reason, 0, 1).await.unwrap();
     let iv1 = tokio::time::timeout(Duration::from_millis(200), rx1.recv())
         .await
@@ -663,7 +715,7 @@ async fn test_port_connected_by_default() {
 #[tokio::test]
 async fn test_callback_flushes_multiple_changes() {
     let (_mgr, h) = setup_scope();
-    let mut broadcast_rx = h.interrupts().subscribe_async();
+    let mut broadcast_rx = h.interrupts().subscribe_async(256, 4096);
     let run = h
         .drv_user_create(&DrvUserRequest::new("Run", 0))
         .await

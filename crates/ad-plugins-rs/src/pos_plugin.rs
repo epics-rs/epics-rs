@@ -1,10 +1,13 @@
+use asyn_rs::port::InterfaceMask;
 use std::collections::{HashMap, VecDeque};
+use std::fmt::Write as _;
 use std::sync::Arc;
 
 use ad_core_rs::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
 use ad_core_rs::ndarray::NDArray;
 use ad_core_rs::ndarray_pool::NDArrayPool;
 use ad_core_rs::plugin::runtime::{NDPluginProcess, ParamUpdate, ProcessResult};
+use epics_libcom_rs::cfmt::CFloat;
 use parking_lot::Mutex;
 use serde::Deserialize;
 
@@ -24,7 +27,7 @@ pub struct PositionList {
 /// Asyn param indices for the 17 NDPosPlugin params (resolved in
 /// `register_params`). Names match the C `str_NDPos_*` drvInfo strings
 /// (`NDPosPlugin.h:39-55`) so the `NDPosPlugin.template` records bind.
-#[derive(Default)]
+#[derive(Default, Clone, Copy)]
 struct PosParamIndices {
     filename: Option<usize>,
     file_valid: Option<usize>,
@@ -48,13 +51,14 @@ struct PosParamIndices {
 /// NDPosPlugin processor: attaches position metadata to arrays from a position list.
 pub struct PosPluginProcessor {
     state: Mutex<PosPluginState>,
+    attributes: Option<ad_core_rs::plugin::runtime::PluginAttributes>,
 }
 
 /// The position cursor and the frame-ID tracking counters. One frame consumes
 /// a position, advances the cursor and posts the counters together.
 struct PosPluginState {
+    /// C `positionArray`: one list for both modes, read at `index`.
     positions: VecDeque<HashMap<String, f64>>,
-    all_positions: Vec<HashMap<String, f64>>,
     mode: PosMode,
     index: usize,
     running: bool,
@@ -65,8 +69,8 @@ struct PosPluginState {
     /// C `NDPos_IDDifference` (default 1): the step `ExpectedID` advances by
     /// per frame and per dropped frame (NDPosPlugin.cpp:103,115,193).
     id_difference: i32,
-    missing_frames: usize,
-    duplicate_frames: usize,
+    missing_frames: i32,
+    duplicate_frames: i32,
     params: PosParamIndices,
 }
 
@@ -74,6 +78,7 @@ impl PosPluginProcessor {
     pub fn new(mode: PosMode) -> Self {
         Self {
             state: Mutex::new(PosPluginState::new(mode)),
+            attributes: None,
         }
     }
 
@@ -112,11 +117,11 @@ impl PosPluginProcessor {
         self.state.lock().clear();
     }
 
-    pub fn missing_frames(&self) -> usize {
+    pub fn missing_frames(&self) -> i32 {
         self.state.lock().missing_frames
     }
 
-    pub fn duplicate_frames(&self) -> usize {
+    pub fn duplicate_frames(&self) -> i32 {
         self.state.lock().duplicate_frames
     }
 
@@ -129,7 +134,6 @@ impl PosPluginState {
     fn new(mode: PosMode) -> Self {
         Self {
             positions: VecDeque::new(),
-            all_positions: Vec::new(),
             mode,
             index: 0,
             running: false,
@@ -145,11 +149,7 @@ impl PosPluginState {
     /// Load positions from a JSON string.
     fn load_positions_json(&mut self, json_str: &str) -> Result<usize, serde_json::Error> {
         let list: PositionList = serde_json::from_str(json_str)?;
-        let count = list.positions.len();
-        self.all_positions = list.positions.clone();
-        self.positions = list.positions.into();
-        self.index = 0;
-        Ok(count)
+        Ok(self.append(list.positions))
     }
 
     /// Load positions from an XML string (C++ NDPosPlugin `pos_layout` format).
@@ -174,12 +174,7 @@ impl PosPluginState {
     /// missing any declared dimension's attribute is rejected (matching C
     /// `addPosition` returning `asynError`).
     fn load_positions_xml(&mut self, xml_str: &str) -> Result<usize, String> {
-        let positions = parse_positions_xml(xml_str)?;
-        let count = positions.len();
-        self.all_positions = positions.clone();
-        self.positions = positions.into();
-        self.index = 0;
-        Ok(count)
+        Ok(self.append(parse_positions_xml(xml_str)?))
     }
 
     /// Load positions from a string, auto-detecting format.
@@ -195,11 +190,28 @@ impl PosPluginState {
         }
     }
 
+    /// Load the positions `NDPos_Filename` names. C reads a value holding
+    /// `<pos_layout>` as the XML itself and anything else as a file path
+    /// (NDPosPluginFileReader.cpp:34-38).
+    fn load_filename(&mut self, value: &str) -> Result<usize, String> {
+        if value.contains("<pos_layout>") {
+            return self.load_positions_xml(value);
+        }
+        let text = std::fs::read_to_string(value).map_err(|e| format!("{value}: {e}"))?;
+        self.load_positions_auto(&text)
+    }
+
     /// Load positions directly.
     fn load_positions(&mut self, positions: Vec<HashMap<String, f64>>) {
-        self.all_positions = positions.clone();
-        self.positions = positions.into();
-        self.index = 0;
+        self.append(positions);
+    }
+
+    /// C appends a load to the list, leaving the cursor where it is
+    /// (`positionArray.insert(positionArray.end(), ...)`, NDPosPlugin.cpp:309).
+    fn append(&mut self, positions: Vec<HashMap<String, f64>>) -> usize {
+        let count = positions.len();
+        self.positions.extend(positions);
+        count
     }
 
     /// Start processing.
@@ -221,28 +233,17 @@ impl PosPluginState {
     /// Clear all positions.
     fn clear(&mut self) {
         self.positions.clear();
-        self.all_positions.clear();
         self.index = 0;
     }
 
+    /// C `NDPos_CurrentQty`, `positionArray.size()` in both modes.
     fn remaining_positions(&self) -> usize {
-        match self.mode {
-            PosMode::Discard => self.positions.len(),
-            PosMode::Keep => self.all_positions.len(),
-        }
+        self.positions.len()
     }
 
+    /// C `std::advance(it, index)` in both modes (NDPosPlugin.cpp:145-148).
     fn current_position(&self) -> Option<&HashMap<String, f64>> {
-        match self.mode {
-            PosMode::Discard => self.positions.front(),
-            PosMode::Keep => {
-                if self.index < self.all_positions.len() {
-                    Some(&self.all_positions[self.index])
-                } else {
-                    None
-                }
-            }
-        }
+        self.positions.get(self.index)
     }
 
     /// Whether a position remains to be consumed at the current cursor — C's
@@ -251,7 +252,7 @@ impl PosPluginState {
     fn has_position(&self) -> bool {
         match self.mode {
             PosMode::Discard => !self.positions.is_empty(),
-            PosMode::Keep => self.index < self.all_positions.len(),
+            PosMode::Keep => self.index < self.positions.len(),
         }
     }
 
@@ -298,50 +299,6 @@ fn push_int(updates: &mut Vec<ParamUpdate>, idx: Option<usize>, value: i32) {
 fn push_str(updates: &mut Vec<ParamUpdate>, idx: Option<usize>, value: String) {
     if let Some(i) = idx {
         updates.push(ParamUpdate::octet(i, value));
-    }
-}
-
-/// Format `v` the way C++ `std::ostream << double` does by default
-/// (`defaultfloat`, stream precision 6) — equivalent to C `printf("%g", v)`.
-/// C builds the NDPos_CurrentPos string by streaming each position double
-/// (NDPosPlugin.cpp:159), so the observable octet value must use this format
-/// rather than Rust's shortest-round-trip `Display`.
-fn format_cpp_g6(v: f64) -> String {
-    const PREC: i32 = 6;
-    if v == 0.0 {
-        return if v.is_sign_negative() { "-0" } else { "0" }.to_string();
-    }
-    if v.is_nan() {
-        return "nan".to_string();
-    }
-    if v.is_infinite() {
-        return if v < 0.0 { "-inf" } else { "inf" }.to_string();
-    }
-    // Round to PREC significant figures via scientific form, then read the
-    // decimal exponent — this avoids log10 floor off-by-one at powers of ten.
-    let sci = format!("{:.*e}", (PREC - 1) as usize, v);
-    let epos = sci.find('e').unwrap();
-    let exp: i32 = sci[epos + 1..].parse().unwrap();
-    if exp >= -4 && exp < PREC {
-        // %f branch: precision = PREC-1-exp digits after the point.
-        let prec = (PREC - 1 - exp).max(0) as usize;
-        strip_g_trailing(&format!("{:.*}", prec, v))
-    } else {
-        // %e branch: strip mantissa trailing zeros, render a signed 2+digit
-        // exponent (C printf style: "1.23457e+06", "1e-05").
-        let mantissa = strip_g_trailing(&sci[..epos]);
-        let sign = if exp < 0 { '-' } else { '+' };
-        format!("{}e{}{:02}", mantissa, sign, exp.abs())
-    }
-}
-
-/// Strip `%g` trailing zeros: remove trailing '0' digits after a '.', then a
-/// dangling '.'. No-op for strings without a decimal point.
-fn strip_g_trailing(s: &str) -> String {
-    if s.contains('.') {
-        s.trim_end_matches('0').trim_end_matches('.').to_string()
-    } else {
-        s.to_string()
     }
 }
 
@@ -480,6 +437,137 @@ fn parse_tag_attributes(content: &str) -> HashMap<String, String> {
 }
 
 impl NDPluginProcess for PosPluginProcessor {
+    const ASYN_FLAGS: asyn_rs::port::PortFlags = ad_core_rs::plugin::runtime::ASYN_MULTIDEVICE;
+    // NDPosPlugin.cpp:372-373, the same mask for both.
+    const INTERFACE_MASK: InterfaceMask = InterfaceMask::INT32_ARRAY
+        .or(InterfaceMask::FLOAT64)
+        .or(InterfaceMask::FLOAT64_ARRAY)
+        .or(InterfaceMask::GENERIC_POINTER);
+    const INTERRUPT_MASK: InterfaceMask = Self::INTERFACE_MASK;
+    // NDPosPlugin.cpp:260; no writeFloat64 override.
+    const WRITE_INT32_EPILOGUE: ad_core_rs::plugin::runtime::WriteEpilogue =
+        ad_core_rs::plugin::runtime::WriteEpilogue::Zero;
+    /// NDPosPlugin.cpp:203.
+    const READ_ATTRIBUTES: bool = false;
+
+    fn bind_attributes(&mut self, attributes: ad_core_rs::plugin::runtime::PluginAttributes) {
+        self.attributes = Some(attributes);
+    }
+
+    /// C `NDPosPlugin::writeInt32` drops the base class status
+    /// (`status = (asynStatus)callParamCallbacks();`, NDPosPlugin.cpp:260): a refused NDPluginDriver write keeps
+    /// its clamp and succeeds. Running/Mode/Restart/Delete set their side
+    /// params inside the write (:230-250); every NDPos param C reads per
+    /// frame is mirrored here, before the next write can read it.
+    fn validate_int32(
+        &self,
+        reason: usize,
+        _addr: i32,
+        value: i32,
+        verdict: ad_core_rs::plugin::runtime::WriteVerdict<i32>,
+        _params: &mut ad_core_rs::plugin::runtime::WritePort<'_>,
+    ) -> ad_core_rs::plugin::runtime::WriteOutcome<i32> {
+        use ad_core_rs::plugin::runtime::WriteOutcome;
+        let out = WriteOutcome::from(verdict.succeed());
+        let mut state = self.state.lock();
+        let s = &mut *state;
+        let p = s.params;
+        let is = |i: Option<usize>| i == Some(reason);
+        let int = |out: WriteOutcome<i32>, i: Option<usize>, v: i32| match i {
+            Some(i) => out.set_int32(i, 0, v),
+            None => out,
+        };
+        let empty = |out: WriteOutcome<i32>, i: Option<usize>| match i {
+            Some(i) => out.set_octet(i, 0, ""),
+            None => out,
+        };
+        let out = if is(p.running) {
+            // :54 `running == NDPOS_RUNNING`; ExpectedID resets on any write.
+            s.running = value == 1;
+            s.expected_id = s.id_start;
+            int(out, p.expected_id, s.id_start)
+        } else if is(p.mode) {
+            s.mode = match value {
+                1 => PosMode::Keep,
+                _ => PosMode::Discard,
+            };
+            s.index = 0;
+            int(out, p.current_index, 0)
+        } else if is(p.restart) {
+            s.index = 0;
+            empty(int(out, p.current_index, 0), p.current_pos)
+        } else if is(p.delete) {
+            s.clear();
+            int(
+                empty(int(out, p.current_index, 0), p.current_pos),
+                p.current_qty,
+                0,
+            )
+        } else if is(p.id_start) {
+            s.id_start = value;
+            out
+        } else if is(p.id_difference) {
+            s.id_difference = value;
+            out
+        } else if is(p.expected_id) {
+            s.expected_id = value;
+            out
+        } else if is(p.missing_frames) {
+            s.missing_frames = value;
+            out
+        } else if is(p.duplicate_frames) {
+            s.duplicate_frames = value;
+            out
+        } else {
+            return out;
+        };
+        out.settled()
+    }
+
+    /// C `NDPosPlugin::writeOctet(NDPos_Filename)` loads the positions inside
+    /// the write and fails it on invalid XML (NDPosPlugin.cpp:295-315).
+    fn validate_octet(
+        &self,
+        reason: usize,
+        _addr: i32,
+        value: &str,
+        verdict: ad_core_rs::plugin::runtime::WriteVerdict<String>,
+        _params: &asyn_rs::port::PortDriverBase,
+    ) -> ad_core_rs::plugin::runtime::WriteOutcome<String> {
+        use ad_core_rs::plugin::runtime::{WriteOutcome, WriteVerdict};
+        let mut state = self.state.lock();
+        if Some(reason) != state.params.filename {
+            return verdict.into();
+        }
+        let set = |out: WriteOutcome<String>, i: Option<usize>, v: i32| match i {
+            Some(i) => out.set_int32(i, 0, v),
+            None => out,
+        };
+        let (valid, qty) = (state.params.file_valid, state.params.current_qty);
+        match state.load_filename(value) {
+            Ok(_) => {
+                let n = state.remaining_positions() as i32;
+                set(
+                    set(WriteVerdict::Accept(value.to_string()).into(), valid, 1),
+                    qty,
+                    n,
+                )
+            }
+            Err(_) => set(
+                WriteVerdict::Refuse {
+                    keep: value.to_string(),
+                    message: format!(
+                        "NDPosPlugin:writeOctet: status=3, function={reason}, value={value}"
+                    ),
+                }
+                .into(),
+                valid,
+                0,
+            ),
+        }
+        .settled()
+    }
+
     fn process_array(&self, array: &Arc<NDArray>, pool: &NDArrayPool) -> ProcessResult {
         let mut state = self.state.lock();
         if !state.running {
@@ -523,7 +611,7 @@ impl NDPluginProcess for PosPluginProcessor {
             push_int(
                 &mut updates,
                 state.params.duplicate_frames,
-                state.duplicate_frames as i32,
+                state.duplicate_frames,
             );
             return ProcessResult::sink(updates);
         }
@@ -540,6 +628,32 @@ impl NDPluginProcess for PosPluginProcessor {
                 return ProcessResult::empty();
             }
         };
+        // C `getAttributes` on the copy (NDPosPlugin.cpp:143), before the
+        // position attributes and with the counters set so far (:126, :134).
+        if let Some(attributes) = &self.attributes {
+            let mut pending = Vec::new();
+            push_int(
+                &mut pending,
+                state.params.missing_frames,
+                state.missing_frames,
+            );
+            push_int(
+                &mut pending,
+                state.params.duplicate_frames,
+                state.duplicate_frames,
+            );
+            push_int(
+                &mut pending,
+                state.params.current_qty,
+                state.remaining_positions() as i32,
+            );
+            push_int(
+                &mut pending,
+                state.params.current_index,
+                state.current_index_param(),
+            );
+            attributes.get_attributes(&mut out.attributes, &pending);
+        }
         // C iterates the position std::map (sorted ascending by key), building
         // the CurrentPos string "[k=v,...]" and attaching each attribute in the
         // same loop (NDPosPlugin.cpp:149-166). The attribute description is the
@@ -554,7 +668,8 @@ impl NDPluginProcess for PosPluginProcessor {
             }
             current_pos.push_str(key);
             current_pos.push('=');
-            current_pos.push_str(&format_cpp_g6(value));
+            // `ostream << double` is `%g` (NDPosPlugin.cpp:159).
+            let _ = write!(current_pos, "{}", CFloat(value).g());
             out.attributes.add(NDAttribute::new_static(
                 (*key).clone(),
                 "Position of NDArray",
@@ -576,12 +691,12 @@ impl NDPluginProcess for PosPluginProcessor {
         push_int(
             &mut updates,
             state.params.missing_frames,
-            state.missing_frames as i32,
+            state.missing_frames,
         );
         push_int(
             &mut updates,
             state.params.duplicate_frames,
-            state.duplicate_frames as i32,
+            state.duplicate_frames,
         );
         push_int(
             &mut updates,
@@ -600,6 +715,9 @@ impl NDPluginProcess for PosPluginProcessor {
             output_arrays: vec![Arc::new(out)],
             param_updates: updates,
             scatter: false,
+            addressed: vec![],
+            trace: vec![],
+            counted: true,
         }
     }
 
@@ -691,78 +809,40 @@ impl NDPluginProcess for PosPluginProcessor {
         }
         Ok(())
     }
-
-    fn on_param_change(
-        &self,
-        reason: usize,
-        params: &ad_core_rs::plugin::runtime::PluginParamSnapshot,
-    ) -> ad_core_rs::plugin::runtime::ParamChangeResult {
-        use ad_core_rs::plugin::runtime::{ParamChangeResult, ParamChangeValue};
-
-        let mut state = self.state.lock();
-        let mut updates = Vec::new();
-        if Some(reason) == state.params.running {
-            // C writeInt32(NDPos_Running): start/stop and reset ExpectedID to
-            // IDStart (NDPosPlugin.cpp:230-234).
-            if params.value.as_i32() == 0 {
-                state.stop();
-            } else {
-                state.start();
-                push_int(&mut updates, state.params.expected_id, state.id_start);
-            }
-        } else if Some(reason) == state.params.id_start {
-            // C stores IDStart; it is read on the next Running write.
-            state.id_start = params.value.as_i32();
-        } else if Some(reason) == state.params.id_difference {
-            // C stores IDDifference; it is read each processCallbacks.
-            state.id_difference = params.value.as_i32();
-        } else if Some(reason) == state.params.mode {
-            // C writeInt32(NDPos_Mode): reset index to 0 (NDPosPlugin.cpp:235-237).
-            state.mode = match params.value.as_i32() {
-                1 => PosMode::Keep,
-                _ => PosMode::Discard,
-            };
-            state.index = 0;
-            push_int(&mut updates, state.params.current_index, 0);
-        } else if Some(reason) == state.params.restart {
-            // C writeInt32(NDPos_Restart): reset index, clear CurrentPos
-            // (NDPosPlugin.cpp:238-242).
-            state.index = 0;
-            push_int(&mut updates, state.params.current_index, 0);
-            push_str(&mut updates, state.params.current_pos, String::new());
-        } else if Some(reason) == state.params.delete {
-            // C writeInt32(NDPos_Delete): reset index, clear CurrentPos, clear
-            // positions, CurrentQty=0 (NDPosPlugin.cpp:243-250).
-            state.clear();
-            push_int(&mut updates, state.params.current_index, 0);
-            push_int(&mut updates, state.params.current_qty, 0);
-            push_str(&mut updates, state.params.current_pos, String::new());
-        } else if Some(reason) == state.params.filename {
-            // C writeOctet(NDPos_Filename): validate + load XML, set FileValid,
-            // append positions, set CurrentQty (NDPosPlugin.cpp:295-315).
-            if let ParamChangeValue::Octet(ref xml) = params.value {
-                match state.load_positions_auto(xml) {
-                    Ok(_) => {
-                        push_int(&mut updates, state.params.file_valid, 1);
-                        push_int(
-                            &mut updates,
-                            state.params.current_qty,
-                            state.remaining_positions() as i32,
-                        );
-                    }
-                    Err(_) => {
-                        push_int(&mut updates, state.params.file_valid, 0);
-                    }
-                }
-            }
-        }
-        ParamChangeResult::updates(updates)
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `status = (asynStatus)callParamCallbacks();` (NDPosPlugin.cpp:260).
+    #[test]
+    fn a_refused_base_write_succeeds_as_c_write_int32_does() {
+        use ad_core_rs::plugin::runtime::WriteVerdict;
+        let proc = PosPluginProcessor::new(PosMode::Discard);
+        let mut base = asyn_rs::port::PortDriverBase::new(
+            "T",
+            1,
+            Default::default(),
+            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
+            asyn_rs::port::InterfaceMask::UNMIGRATED_INTERRUPTS,
+        );
+        let clamp = WriteVerdict::Refuse {
+            keep: 1,
+            message: String::new(),
+        };
+        assert_eq!(
+            proc.validate_int32(
+                0,
+                0,
+                98,
+                clamp,
+                &mut ad_core_rs::plugin::runtime::WritePort::new(&mut base)
+            )
+            .verdict,
+            WriteVerdict::Accept(1)
+        );
+    }
     use ad_core_rs::ndarray::{NDDataType, NDDimension};
 
     fn make_array(id: i32) -> NDArray {
@@ -808,6 +888,32 @@ mod tests {
         assert!((x - 3.1).abs() < 1e-10);
 
         assert_eq!(proc.remaining_positions(), 0);
+    }
+
+    /// C `getAttributes` on the copy (NDPosPlugin.cpp:143) comes before the
+    /// position attributes (:161-162) and the CurrentIndex step (:190): a
+    /// position overrides a file attribute of its name, and a PARAM reads the
+    /// index the frame was taken at.
+    #[test]
+    fn the_plugin_attributes_precede_the_position() {
+        use crate::test_util::{publish, with_attributes_file};
+        use ad_core_rs::attributes::NDAttrValue;
+        let proc = PosPluginProcessor::new(PosMode::Keep);
+        let positions = [10.0, 20.0].map(|x| HashMap::from([("X".to_string(), x)]));
+        proc.load_positions(positions.to_vec());
+        proc.start();
+        let xml = r#"<Attributes>
+            <Attribute name="X" type="CONST" source="file"/>
+            <Attribute name="Index" type="PARAM" source="NDPos_CurrentIndex" datatype="INT"/>
+        </Attributes>"#;
+        let (handle, mut rx, _jh) = with_attributes_file("POS_ATTRS", proc, xml);
+        let value = |a: &NDArray, name: &str| a.attributes.get(name).map(|a| a.value.clone());
+        for (id, x) in [(1, 10.0), (2, 20.0)] {
+            publish(&handle, &make_array(id));
+            let out = rx.blocking_recv().unwrap();
+            assert_eq!(value(&out, "X"), Some(NDAttrValue::Float64(x)));
+            assert_eq!(value(&out, "Index"), Some(NDAttrValue::Int32(id - 1)));
+        }
     }
 
     #[test]
@@ -1100,66 +1206,184 @@ mod tests {
         );
     }
 
+    /// NDPosPlugin.cpp:301-313: a valid file sets `NDPos_FileValid` 1 and
+    /// `NDPos_CurrentQty`, an invalid one `NDPos_FileValid` 0 and
+    /// `status = asynError`.
     #[test]
-    fn test_filename_param_loads_positions() {
-        // ADP-33: writing NDPos_Filename loads the XML, posts FileValid=1 + CurrentQty.
-        use ad_core_rs::plugin::runtime::{ParamChangeValue, ParamUpdate, PluginParamSnapshot};
-        let proc = PosPluginProcessor::new(PosMode::Discard);
-        proc.state.lock().params.filename = Some(0);
-        proc.state.lock().params.file_valid = Some(1);
-        proc.state.lock().params.current_qty = Some(8);
+    fn filename_loads_inside_the_write_as_c_write_octet_does() {
+        use ad_core_rs::plugin::runtime::{SideParam, WriteVerdict};
+        let mut proc = PosPluginProcessor::new(PosMode::Discard);
+        let mut base = asyn_rs::port::PortDriverBase::new(
+            "T",
+            1,
+            Default::default(),
+            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
+            asyn_rs::port::InterfaceMask::UNMIGRATED_INTERRUPTS,
+        );
+        proc.register_params(&mut base).unwrap();
+        let (file, valid, qty) = {
+            let p = &proc.state.lock().params;
+            (
+                p.filename.unwrap(),
+                p.file_valid.unwrap(),
+                p.current_qty.unwrap(),
+            )
+        };
+        let write =
+            |v: &str| proc.validate_octet(file, 0, v, WriteVerdict::Accept(v.to_string()), &base);
+        let side = |i: usize, v: i32| SideParam::Int32 {
+            reason: i,
+            addr: 0,
+            value: v,
+        };
 
         let xml = r#"<pos_layout><dimensions><dimension name="x"/></dimensions><positions><position x="1"/><position x="2"/></positions></pos_layout>"#;
-        let snapshot = PluginParamSnapshot {
-            enable_callbacks: true,
-            reason: 0,
-            addr: 0,
-            value: ParamChangeValue::Octet(xml.to_string()),
-        };
-        let result = proc.on_param_change(0, &snapshot);
+        let out = write(xml);
+        assert_eq!(out.verdict, WriteVerdict::Accept(xml.to_string()));
+        assert_eq!(out.side, vec![side(valid, 1), side(qty, 2)]);
+        assert!(out.settled);
         assert_eq!(proc.remaining_positions(), 2);
-        assert!(result.param_updates.iter().any(|u| matches!(
-            u,
-            ParamUpdate::Int32 {
-                reason: 1,
-                value: 1,
-                ..
+
+        let bad = "/nonexistent/positions.xml";
+        let out = write(bad);
+        assert_eq!(
+            out.verdict,
+            WriteVerdict::Refuse {
+                keep: bad.to_string(),
+                message: format!("NDPosPlugin:writeOctet: status=3, function={file}, value={bad}"),
             }
-        )));
-        assert!(result.param_updates.iter().any(|u| matches!(
-            u,
-            ParamUpdate::Int32 {
-                reason: 8,
-                value: 2,
-                ..
-            }
-        )));
+        );
+        assert_eq!(out.side, vec![side(valid, 0)]);
+        assert_eq!(proc.remaining_positions(), 2);
     }
 
+    /// NDPosPlugin.cpp:309 `positionArray.insert(positionArray.end(), ...)`
+    /// and :185 `positionArray.erase(positionArray.begin())`: one list, so a
+    /// load appends and Keep never sees what Discard consumed.
     #[test]
-    fn test_running_param_starts_and_stops() {
-        // ADP-33: writing NDPos_Running routes to start()/stop().
-        use ad_core_rs::plugin::runtime::{ParamChangeValue, PluginParamSnapshot};
+    fn positions_are_one_list_as_c_position_array_is() {
+        let at = |x: f64| HashMap::from([("x".to_string(), x)]);
+        let mut state = PosPluginState::new(PosMode::Discard);
+        state.load_positions(vec![at(1.0), at(2.0)]);
+        state.load_positions(vec![at(3.0)]);
+        assert_eq!(state.remaining_positions(), 3);
+        state.advance();
+        state.mode = PosMode::Keep;
+        assert_eq!(state.remaining_positions(), 2);
+        assert_eq!(state.current_position(), Some(&at(2.0)));
+        state.advance();
+        state.load_positions(vec![at(4.0)]);
+        assert_eq!(state.current_position(), Some(&at(3.0)));
+    }
+
+    /// NDPosPluginFileReader.cpp:34-38: `if (filename.find("<pos_layout>") !=
+    /// std::string::npos)` reads from memory, else `xmlReaderForFile`.
+    #[test]
+    fn filename_without_pos_layout_names_a_file_as_c_validate_xml_does() {
+        let dir = std::env::temp_dir().join(format!("ndpos-file-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("positions.xml");
+        std::fs::write(
+            &path,
+            r#"<pos_layout><dimensions><dimension name="x"/></dimensions><positions><position x="1"/><position x="2"/><position x="3"/></positions></pos_layout>"#,
+        )
+        .unwrap();
         let proc = PosPluginProcessor::new(PosMode::Discard);
-        proc.state.lock().params.running = Some(3);
+        let loaded = proc.state.lock().load_filename(path.to_str().unwrap());
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(loaded, Ok(3));
+        assert_eq!(proc.remaining_positions(), 3);
+    }
 
-        let start = PluginParamSnapshot {
-            enable_callbacks: true,
-            reason: 3,
+    fn pos_port() -> (PosPluginProcessor, asyn_rs::port::PortDriverBase) {
+        let mut proc = PosPluginProcessor::new(PosMode::Keep);
+        let mut base = asyn_rs::port::PortDriverBase::new(
+            "T",
+            1,
+            Default::default(),
+            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
+            asyn_rs::port::InterfaceMask::UNMIGRATED_INTERRUPTS,
+        );
+        proc.register_params(&mut base).unwrap();
+        (proc, base)
+    }
+
+    fn pos_write(
+        proc: &PosPluginProcessor,
+        base: &mut asyn_rs::port::PortDriverBase,
+        name: &str,
+        value: i32,
+    ) -> Vec<ad_core_rs::plugin::runtime::SideParam> {
+        use ad_core_rs::plugin::runtime::WriteVerdict;
+        let reason = base.find_param(name).unwrap();
+        let out = proc.validate_int32(
+            reason,
+            0,
+            value,
+            WriteVerdict::Accept(value),
+            &mut ad_core_rs::plugin::runtime::WritePort::new(base),
+        );
+        assert!(out.settled);
+        out.side
+    }
+
+    /// NDPosPlugin.cpp:230-250: each write sets its side params inside the
+    /// write, and Running resets ExpectedID to IDStart on stop as well.
+    #[test]
+    fn writes_set_their_params_inside_the_write_as_c_write_int32_does() {
+        use ad_core_rs::plugin::runtime::SideParam;
+        let (proc, mut base) = pos_port();
+        let ids = [
+            "NDPos_CurrentPos",
+            "NDPos_CurrentIndex",
+            "NDPos_CurrentQty",
+            "NDPos_ExpectedID",
+        ]
+        .map(|n| (n, base.find_param(n).unwrap()));
+        let id = |n: &str| ids.iter().find(|(m, _)| *m == n).unwrap().1;
+        let int = |n: &str, value| SideParam::Int32 {
+            reason: id(n),
             addr: 0,
-            value: ParamChangeValue::Int32(1),
+            value,
         };
-        proc.on_param_change(3, &start);
+        let pos = SideParam::Octet {
+            reason: id("NDPos_CurrentPos"),
+            addr: 0,
+            value: String::new(),
+        };
+        assert!(pos_write(&proc, &mut base, "NDPos_IDStart", 7).is_empty());
+        assert_eq!(
+            pos_write(&proc, &mut base, "NDPos_Running", 1),
+            [int("NDPos_ExpectedID", 7)]
+        );
         assert!(proc.state.lock().running);
-
-        let stop = PluginParamSnapshot {
-            enable_callbacks: true,
-            reason: 3,
-            addr: 0,
-            value: ParamChangeValue::Int32(0),
-        };
-        proc.on_param_change(3, &stop);
+        assert_eq!(
+            pos_write(&proc, &mut base, "NDPos_Running", 0),
+            [int("NDPos_ExpectedID", 7)]
+        );
         assert!(!proc.state.lock().running);
+        pos_write(&proc, &mut base, "NDPos_Running", 2);
+        assert!(!proc.state.lock().running, ":54 runs only on NDPOS_RUNNING");
+        assert_eq!(
+            pos_write(&proc, &mut base, "NDPos_Mode", 1),
+            [int("NDPos_CurrentIndex", 0)]
+        );
+        assert_eq!(
+            pos_write(&proc, &mut base, "NDPos_Restart", 1),
+            [int("NDPos_CurrentIndex", 0), pos.clone()]
+        );
+        proc.load_positions(vec![HashMap::new()]);
+        assert_eq!(
+            pos_write(&proc, &mut base, "NDPos_Delete", 1),
+            [
+                int("NDPos_CurrentIndex", 0),
+                pos,
+                int("NDPos_CurrentQty", 0)
+            ]
+        );
+        assert_eq!(proc.remaining_positions(), 0);
+        pos_write(&proc, &mut base, "NDPos_MissingFrames", 0);
+        assert_eq!(proc.missing_frames(), 0);
     }
 
     #[test]
@@ -1173,6 +1397,8 @@ mod tests {
         let mut p = HashMap::new();
         p.insert("y".into(), 2.0);
         p.insert("x".into(), 1.5);
+        // libstdc++ formats through `%.*g`, which prints a NaN's sign bit.
+        p.insert("z".into(), -f64::NAN);
         proc.load_positions(vec![p]);
         proc.start();
 
@@ -1184,7 +1410,7 @@ mod tests {
             } => Some(value.clone()),
             _ => None,
         });
-        assert_eq!(s.as_deref(), Some("[x=1.5,y=2]"));
+        assert_eq!(s.as_deref(), Some("[x=1.5,y=2,z=-nan]"));
     }
 
     #[test]
@@ -1244,23 +1470,6 @@ mod tests {
             .as_f64()
             .unwrap();
         assert!((x - 3.0).abs() < 1e-10);
-    }
-
-    #[test]
-    fn test_format_cpp_g6() {
-        // Matches C printf("%g") / C++ default ostream<<double (precision 6).
-        assert_eq!(format_cpp_g6(1.0), "1");
-        assert_eq!(format_cpp_g6(1.5), "1.5");
-        assert_eq!(format_cpp_g6(42.5), "42.5");
-        assert_eq!(format_cpp_g6(100.0), "100");
-        assert_eq!(format_cpp_g6(0.1), "0.1");
-        assert_eq!(format_cpp_g6(0.0001), "0.0001");
-        assert_eq!(format_cpp_g6(0.00001), "1e-05");
-        assert_eq!(format_cpp_g6(1_000_000.0), "1e+06");
-        assert_eq!(format_cpp_g6(1_234_567.0), "1.23457e+06");
-        assert_eq!(format_cpp_g6(123456.0), "123456");
-        assert_eq!(format_cpp_g6(-1.5), "-1.5");
-        assert_eq!(format_cpp_g6(0.0), "0");
     }
 
     #[test]

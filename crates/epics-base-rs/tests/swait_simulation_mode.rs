@@ -46,6 +46,8 @@ const LINK_ALARM: u16 = 14; // alarm.h — C `setLinkAlarm` (dbLink.c:320)
 /// W: CALC = "A+1" over INAN = SRC (10.0), OUT → DEST, OOPT = Every Time.
 /// SIOL reads SIM (42.0); `siml` and `simm` per argument.
 async fn sim_db(siml: &str, simm: i16, sims: i16, siol: &str) -> PvDatabase {
+    // C `callbackInit`: the OUT link's events are applied on a callback band.
+    epics_base_rs::runtime::task::background_init();
     let db = PvDatabase::new();
     db.add_record("SRC", Box::new(AiRecord::new(10.0)))
         .await
@@ -72,14 +74,27 @@ async fn sim_db(siml: &str, simm: i16, sims: i16, siol: &str) -> PvDatabase {
     w.put_field("SIMM", EpicsValue::Short(simm)).unwrap();
     w.put_field("SIMS", EpicsValue::Short(sims)).unwrap();
     db.add_record("W", Box::new(w)).await.unwrap();
-
-    // OUT routes through RecordInstance::put_common_field (populates parsed_out).
-    db.get_record("W")
-        .unwrap()
-        .write()
-        .put_common_field("OUT", EpicsValue::String("DEST".into()))
+    // OUTN put as a client puts it: `special` adds the output link.
+    db.put_pv_no_process("W.OUTN", EpicsValue::String("DEST".into()))
+        .await
         .unwrap();
+    settle(&db, "W", "OUTV", 0.0).await;
     db
+}
+
+/// Wait until `rec.f` reads `want` — OUTV connects and the OUT write lands
+/// over CA.
+async fn settle(db: &PvDatabase, rec: &str, f: &str, want: f64) {
+    for _ in 0..400 {
+        if field(db, rec, f).await == want {
+            return;
+        }
+        epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    panic!(
+        "{rec}.{f} never reached {want}: {}",
+        field(db, rec, f).await
+    );
 }
 
 async fn process(db: &PvDatabase) {
@@ -106,7 +121,7 @@ async fn alarm(db: &PvDatabase) -> (AlarmSeverity, u16, bool) {
 async fn amsg(db: &PvDatabase) -> String {
     let inst = db.get_record("W").unwrap();
     let g = inst.read();
-    g.common.amsg.as_str().to_owned()
+    String::from(&g.common.amsg)
 }
 
 /// SIMM = YES: VAL comes from SIOL through SVAL, the calc does not run, and the
@@ -149,12 +164,9 @@ async fn r11_62_a_simulated_cycle_still_drives_the_output_link() {
 
     process(&db).await;
 
-    assert_eq!(
-        field(&db, "DEST", "VAL").await,
-        42.0,
-        "C:425 — the OOPT switch is outside the simulation branch; execOutput \
-         writes the simulated VAL"
-    );
+    // C:425 — the OOPT switch is outside the simulation branch; execOutput
+    // writes the simulated VAL.
+    settle(&db, "DEST", "VAL", 42.0).await;
 }
 
 /// SIML resolves SIMM on every process (C `:400`), so the mode can be driven
@@ -315,16 +327,15 @@ async fn r11_62_busy_simm_yes_redirects_the_output_to_siol() {
     b.put_field("SIMM", EpicsValue::Short(1)).unwrap(); // YES
     b.put_field("VAL", EpicsValue::Enum(1)).unwrap();
     db.add_record("B", Box::new(b)).await.unwrap();
-    {
-        let inst = db.get_record("B").unwrap();
-        let mut w = inst.write();
-        w.put_common_field("OUT", EpicsValue::String("B_OUT".into()))
-            .unwrap();
-        // busy is `clears_udf() == false` (busyRecord.c:195-208), so a bare
-        // record stays UDF and its INVALID would mask the SIMM_ALARM/SIMS under
-        // test. VAL was defined above; clear UDF as a real dbPut to VAL does.
-        w.put_common_field("UDF", EpicsValue::Char(0)).unwrap();
-    }
+    db.put_pv_no_process("B.OUT", EpicsValue::String("B_OUT".into()))
+        .await
+        .unwrap();
+    // busy is `clears_udf() == false` (busyRecord.c:195-208), so a bare
+    // record stays UDF and its INVALID would mask the SIMM_ALARM/SIMS under
+    // test. VAL was defined above; clear UDF as a real dbPut to VAL does.
+    db.put_pv_no_process("B.UDF", EpicsValue::Char(0))
+        .await
+        .unwrap();
 
     let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("B", &mut visited)
@@ -365,16 +376,15 @@ async fn r11_62_busy_simm_no_drives_the_real_output() {
         .unwrap();
     b.put_field("VAL", EpicsValue::Enum(1)).unwrap();
     db.add_record("B2", Box::new(b)).await.unwrap();
-    {
-        let inst = db.get_record("B2").unwrap();
-        let mut w = inst.write();
-        w.put_common_field("OUT", EpicsValue::String("B2_OUT".into()))
-            .unwrap();
-        // See r11_62_busy_simm_yes: busy stays UDF without an explicit clear
-        // (clears_udf() == false); VAL was defined above, so clear UDF to assert
-        // the NoAlarm the SIMM=NO negative control expects.
-        w.put_common_field("UDF", EpicsValue::Char(0)).unwrap();
-    }
+    db.put_pv_no_process("B2.OUT", EpicsValue::String("B2_OUT".into()))
+        .await
+        .unwrap();
+    // See r11_62_busy_simm_yes: busy stays UDF without an explicit clear
+    // (clears_udf() == false); VAL was defined above, so clear UDF to assert
+    // the NoAlarm the SIMM=NO negative control expects.
+    db.put_pv_no_process("B2.UDF", EpicsValue::Char(0))
+        .await
+        .unwrap();
 
     let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("B2", &mut visited)

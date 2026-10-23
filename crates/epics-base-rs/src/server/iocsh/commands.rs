@@ -1,15 +1,19 @@
 use std::collections::HashMap;
 
 use super::registry::*;
+use crate::calc::engine::string::escaped_from_raw;
 use crate::error::{CaError, CaResult};
-use crate::runtime::log::{ERL_ERROR, ERL_WARNING};
-use crate::runtime::mac_lib::macro_defn_pairs;
+use crate::runtime::log::ERL_ERROR;
+use crate::server::database::char_view::{
+    self, CharView, c_field_size, char_view, field_addr_types, long_string_len,
+};
 use crate::server::database::filters::sync::DbState;
-use crate::server::database::{DbNode, RecordLoad, parse_pv_name};
+use crate::server::database::{DbNameParts, DbNode, parse_pv_name};
 use crate::server::db_loader;
-use crate::server::record::{Base, FieldDeclaration, FieldDesc, Special};
-use crate::types::{DbFieldType, DbfCode, EpicsValue};
-use std::sync::Arc;
+use crate::server::record::{Base, FieldDeclaration, FieldDesc, Special, served_element_size};
+use crate::types::{DbFieldType, DbfCode, EpicsValue, RecordName};
+use epics_libcom_rs::cfmt::CFloat;
+use std::sync::{Arc, Mutex};
 
 /// C `dbRecordsOnceOnly` (`dbLexRoutines.c:52-53`), the exported `int` a
 /// startup script sets with `var dbRecordsOnceOnly 1`.
@@ -24,7 +28,7 @@ use std::sync::Arc;
 /// C tests the flag with a bare `if`, so any non-zero value sets it.
 static DB_RECORDS_ONCE_ONLY: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 
-fn db_records_once_only() -> bool {
+pub(crate) fn db_records_once_only() -> bool {
     DB_RECORDS_ONCE_ONLY.load(std::sync::atomic::Ordering::Relaxed) != 0
 }
 
@@ -55,45 +59,6 @@ fn db_quiet_macro_warnings_var() -> super::vars::VarDef {
             get: || i64::from(db_loader::db_quiet_macro_warnings()),
             set: |v| db_loader::set_db_quiet_macro_warnings(v != 0),
         },
-    }
-}
-
-/// C `createAlias` (`dbLexRoutines.c:1450-1481`) — the one place an
-/// `alias(...)` reaches the database, from a record body or from the file
-/// scope.
-///
-/// An alias name that ALREADY names this same record is not an error and
-/// not a re-creation: C compares `precnode->aliasedRecnode` after
-/// de-aliasing the target and, when they match, leaves `status` at 0 and
-/// creates nothing. Only `dbRecordsOnceOnly` turns that into an error. The
-/// port used to hand every repeat to `add_alias`, whose name-free check
-/// rejected it — a diagnostic C does not print at its own default.
-async fn install_alias(
-    ctx: &CommandContext,
-    alias: &str,
-    target: &str,
-    faults: &mut db_loader::DbFaults,
-) {
-    let canonical = ctx
-        .db()
-        .resolve_alias(target)
-        .unwrap_or_else(|| target.to_string());
-    if ctx
-        .db()
-        .resolve_alias(alias)
-        .is_some_and(|already| already == canonical)
-    {
-        if db_records_once_only() {
-            faults.recoverable(format!(
-                "{ERL_ERROR}: Alias '{alias}' already defined; dbRecordsOnceOnly is set."
-            ));
-        }
-        return;
-    }
-    if let Err(e) = ctx.db().add_alias(alias, target).await {
-        faults.recoverable(format!(
-            "dbLoadRecords: alias '{alias}' for '{target}' rejected: {e}"
-        ));
     }
 }
 
@@ -337,25 +302,42 @@ const PORT_ONLY_COMMANDS: &[(&str, &str)] = &[
     ),
 ];
 
-/// `afterIocRunning <command>` — queue an iocsh command line to run
-/// after iocInit completes. Mirrors epics-base PR #558.
+/// C `afterIocRunning` (`afterIocRunning.c`): queue an iocsh line for the
+/// `initHookAfterIocRunning` of `iocInit`.
 fn cmd_after_ioc_running() -> CommandDef {
     CommandDef::new(
         "afterIocRunning",
         vec![ArgDesc {
-            name: "command",
+            name: "command (before iocInit)",
             arg_type: ArgType::String,
         }],
-        "afterIocRunning <command> — schedule a command for post-iocInit execution",
+        concat!(
+            "Allows you to define commands to be run after the iocInit\n",
+            "Example commands:\n",
+            "  afterIocRunning \"dbpf <PV> <VAL>\"\n",
+            "  afterIocRunning \"date\"\n",
+            "  afterIocRunning \"dbpf $(P)EvtClkSource-Sel 'Upstream (fanout)'\"\n",
+            "  afterIocRunning \"dbpf $(P)Enable-Sel Enabled\"",
+        ),
         |args: &[ArgValue], ctx: &CommandContext| {
+            use crate::runtime::log::{ERL_ERROR, ERL_WARNING};
+            use crate::server::database::AfterIocRunningRefusal;
             let line = match &args[0] {
-                ArgValue::String(s) => s.clone(),
-                _ => {
-                    ctx.println("afterIocRunning: missing command");
-                    return Ok(CommandOutcome::Continue);
-                }
+                ArgValue::String(s) => s.clone().into_bytes(),
+                _ => Vec::new(),
             };
-            ctx.db().queue_after_ioc_running(line);
+            // `printf`s from a void function: the line does not fail, and
+            // no epicsStdio.h reaches `afterIocRunning.c`, so no redirect
+            // takes them.
+            match ctx.db().queue_after_ioc_running(line) {
+                Ok(()) => {}
+                Err(AfterIocRunningRefusal::AfterIocInit) => ctx.console_println(&format!(
+                    "{ERL_WARNING} afterIocRunning: can only be used before 'iocInit'"
+                )),
+                Err(AfterIocRunningRefusal::Empty) => ctx.console_println(&format!(
+                    "{ERL_ERROR} afterIocRunning: received an empty 'command' argument"
+                )),
+            }
             Ok(CommandOutcome::Continue)
         },
     )
@@ -448,11 +430,13 @@ fn cmd_help() -> CommandDef {
 /// SPACES, not commas — `epicsStrtok_r(fieldnames, " ", ...)` — so
 /// `dbl("ai","VAL DESC")` asks for two fields and `dbl("ai","VAL,DESC")`
 /// asks for one field literally named `VAL,DESC`.
-fn split_fields_list(fields: &str) -> Vec<String> {
+fn split_fields_list(fields: &[u8]) -> Vec<String> {
+    // A field name is an ASCII identifier, so a lossy spelling of bytes
+    // that are not text matches no field, as `dbFindField` would not.
     fields
-        .split(' ')
+        .split(|&b| b == b' ')
         .filter(|f| !f.is_empty())
-        .map(str::to_string)
+        .map(|f| String::from_utf8_lossy(f).into_owned())
         .collect()
 }
 
@@ -464,8 +448,8 @@ fn split_fields_list(fields: &str) -> Vec<String> {
 /// the separator and `continue`s), except the pseudo-field
 /// `recordType`, which C answers from `dbGetRecordTypeName` when
 /// `dbFindField` fails.
-fn print_fields_list(ctx: &CommandContext, name: &str, fields: &[String]) {
-    let mut line = String::from(name);
+fn print_fields_list(ctx: &CommandContext, name: &[u8], fields: &[String]) {
+    let mut line = name.to_vec();
     let record = ctx.db().get_record(name);
     for field in fields {
         // C asks `dbFindField` and then `dbGetString`, and nothing else. The
@@ -484,7 +468,7 @@ fn print_fields_list(ctx: &CommandContext, name: &str, fields: &[String]) {
                 // (`dbStaticLib.c:2053`) and `printFieldsList` prints the
                 // empty string for it (`dbTest.c:145`).
                 if desc.no_access() {
-                    return Some(String::new());
+                    return Some(Vec::new());
                 }
                 return Some(
                     inst.resolve_field(field)
@@ -497,17 +481,17 @@ fn print_fields_list(ctx: &CommandContext, name: &str, fields: &[String]) {
             // `dbFldDes` in C, so `dbFindField` finds it and the NULL above
             // is what `dbGetString` answers.
             if inst.resolves_noaccess_name(&field.to_ascii_uppercase()) {
-                return Some(String::new());
+                return Some(Vec::new());
             }
             // C's one exception to `dbFindField` failing (`dbTest.c:135-137`).
-            (field == "recordType").then(|| inst.record.record_type().to_string())
+            (field == "recordType").then(|| inst.record.record_type().as_bytes().to_vec())
         });
         match value {
-            Some(v) => line.push_str(&format!(", \"{v}\"")),
-            None => line.push_str(", "),
+            Some(v) => line.extend_from_slice(&[&b", \""[..], &v, b"\""].concat()),
+            None => line.extend_from_slice(b", "),
         }
     }
-    ctx.println(&line);
+    ctx.println_bytes(&line);
 }
 
 /// C `dbl` and `dbglob` walk the database record-type MAJOR
@@ -557,7 +541,7 @@ fn db_nodes_type_major(ctx: &CommandContext) -> Vec<DbNode> {
 /// `if (dbIsAlias(pdbentry)) continue`, which `dbjlr` (`dbJLink.c:520`),
 /// `dbcar` (`dbCaTest.c:85`) and `dbWriteRecordFP` (`dbStaticLib.c:826`)
 /// each spell for themselves.
-fn record_names_type_major(ctx: &CommandContext) -> Vec<String> {
+pub(crate) fn record_names_type_major(ctx: &CommandContext) -> Vec<RecordName> {
     db_nodes_type_major(ctx)
         .into_iter()
         .filter(|node| node.alias_of.is_none())
@@ -585,7 +569,7 @@ fn cmd_dbl() -> CommandDef {
             // `precordTypename = NULL`; an empty field list is likewise
             // no field list (`:167-168`).
             let type_filter = match &args[0] {
-                ArgValue::String(s) if !s.is_empty() && s != "*" => Some(s.as_str()),
+                ArgValue::String(s) if !s.is_empty() && s != "*" => Some(s.as_bytes()),
                 _ => None,
             };
             let fields = match &args[1] {
@@ -605,7 +589,7 @@ fn cmd_dbl() -> CommandDef {
                 let known = nodes.iter().any(|node| {
                     ctx.db()
                         .get_record(&node.name)
-                        .is_some_and(|rec| rec.read().record.record_type() == filter)
+                        .is_some_and(|rec| rec.read().record.record_type().as_bytes() == filter)
                 });
                 if !known {
                     ctx.println("No record type");
@@ -618,7 +602,7 @@ fn cmd_dbl() -> CommandDef {
                     let rec = ctx.db().get_record(&node.name);
                     if let Some(rec) = rec {
                         let inst = rec.read();
-                        if inst.record.record_type() != filter {
+                        if inst.record.record_type().as_bytes() != filter {
                             continue;
                         }
                     }
@@ -641,11 +625,14 @@ fn cmd_dbl() -> CommandDef {
 /// `tab` is a parameter for the same reason it is one in C: `dbgf`
 /// passes 10 (`dbTest.c:377`) and `dbpr` passes 20 (`dbTest.c:442`),
 /// and those two are the only values C accepts (`dbTest.c:1286-1289`).
+///
+/// Bytes, as C's `char` buffer is: a value's high bytes are copied, not
+/// re-encoded, so a tab stop counts the bytes that are printed.
 struct TabBuffer {
-    out: String,
+    out: Vec<u8>,
     tab: usize,
     next_tab: usize,
-    lines: Vec<String>,
+    lines: Vec<Vec<u8>>,
 }
 
 impl TabBuffer {
@@ -653,7 +640,7 @@ impl TabBuffer {
 
     fn new(tab: usize) -> Self {
         Self {
-            out: String::new(),
+            out: Vec::new(),
             tab,
             next_tab: tab,
             lines: Vec::new(),
@@ -663,21 +650,21 @@ impl TabBuffer {
     /// C reads `out_buff` as a zero-filled fixed buffer, so a position
     /// past the written text is NUL.
     fn at(&self, i: usize) -> u8 {
-        self.out.as_bytes().get(i).copied().unwrap_or(0)
+        self.out.get(i).copied().unwrap_or(0)
     }
 
-    fn insert(&mut self, msg: &str) {
+    fn insert(&mut self, msg: &[u8]) {
         if self.out.len() + msg.len() > Self::MAXLINE {
             self.flush();
         }
-        for b in msg.bytes() {
-            self.out.push(b as char);
+        for &b in msg {
+            self.out.push(b);
             if self.at(self.next_tab - 1) != 0 {
                 self.next_tab += self.tab;
             }
         }
         while self.at(self.next_tab - 1) != b' ' && self.out.len() < Self::MAXLINE {
-            self.out.push(' ');
+            self.out.push(b' ');
         }
     }
 
@@ -688,49 +675,10 @@ impl TabBuffer {
         self.next_tab = self.tab;
     }
 
-    fn finish(mut self) -> Vec<String> {
+    fn finish(mut self) -> Vec<Vec<u8>> {
         self.flush();
         self.lines
     }
-}
-
-/// C `dbEntryToAddr`'s two type words for one field (`dbAccess.c:627-649`):
-/// `paddr->field_type`, the `DBF_*` token the `.dbd` declared except on a
-/// `special(SPC_DBADDR)` row where the record's `cvt_dbaddr` overwrites it,
-/// and `paddr->dbr_field_type`, that token through `mapDBFToDBR`.
-///
-/// **The single owner of "what type is this field read and labelled as".**
-/// Every `dbTest.c` command that prints a `DBF_<T>:` header — `dbgf`, `dbpf`,
-/// `dbtgf`, `dbtpf` — and `dba`, which prints both words, asks here, so the
-/// answer cannot be read off the [`EpicsValue`] the record happens to hold.
-/// It cannot be, in either direction: `DBF_ENUM`, `DBF_MENU` and `DBF_DEVICE`
-/// all collapse onto one served variant and one `mapDBFToDBR` code, so the
-/// variant cannot name the token, while a `DBF_MENU` index is stored in a
-/// short and the variant names the wrong code entirely. Reading it off the
-/// value is what made `dbgf REC.PRIO` answer `DBF_SHORT: 0 = 0x0` where C
-/// answers `DBF_STRING: "LOW"`.
-///
-/// The one place the stored value IS the answer is a
-/// [`runtime_typed`](FieldDesc::runtime_typed) row, where C's `cvt_dbaddr`
-/// re-types the address from the record's own state — `waveform.VAL` to `FTVL`
-/// (`waveformRecord.c::cvt_dbaddr`), `mbbo.VAL` down to `DBF_USHORT` when no
-/// state string is defined (`mbboRecord.c::cvt_dbaddr`) — and the port's
-/// answer to that same question is the variant the record holds. `value` is
-/// therefore consulted for those rows and only those; `None` leaves the
-/// declaration standing, which is what a caller with no value in hand wants.
-fn field_addr_types(fd: &FieldDesc, value: Option<&EpicsValue>) -> (DbfCode, DbfCode) {
-    let field_type = match value {
-        Some(v) if fd.runtime_typed => v.db_field_type().dbf_code(),
-        // C tests `paddr->special`, which `dbEntryToAddr` has just copied from
-        // `pflddes->special` (`dbAccess.c:638-641`) — the DECLARED code, not
-        // the one `cvt_dbaddr` then raises. `lsi.VAL` is the case in hand: it
-        // declares `SPC_DBADDR` and resolves to `SPC_MOD`, so reading the
-        // resolved code skipped the arm and labelled it `DBF_NOACCESS` where C
-        // says `DBF_STRING` (`lsiRecord.c::cvt_dbaddr`).
-        _ if fd.declared_special == Special::DbAddr => fd.dbf_type.dbf_code(),
-        _ => fd.declared_dbf,
-    };
-    (field_type, field_type.dbr_code())
 }
 
 /// C's `printBuffer` label and the port's served type for one DBR code — the
@@ -762,11 +710,17 @@ fn dbr_request(dbr: DbfCode) -> Option<(&'static str, crate::types::DbFieldType)
 /// is what makes the pairs below exhaustive over what can actually arrive —
 /// the fallback is C's own `default:` arm (`dbTest.c:1144-1147`) and not a
 /// guard against a shape this port can construct.
-fn printbuffer_elements(dbr: DbfCode, val: &EpicsValue) -> Vec<String> {
-    use crate::calc::engine::cvt::fmt_g;
+/// `printBuffer`'s `DBR_STRING` element (`dbTest.c:1001-1011`): escaped into a
+/// `MAXLINE - 3` destination, so the text stops at 76 characters.
+fn dbr_string_element(text: &[u8]) -> String {
+    let mut escaped = escaped_from_raw(text);
+    escaped.truncate(TabBuffer::MAXLINE - 4);
+    format!("\"{escaped}\"")
+}
 
+fn printbuffer_elements(dbr: DbfCode, val: &EpicsValue) -> Vec<String> {
     fn quoted(bytes: &[u8]) -> String {
-        format!("\"{}\"", escape_char_array_for_dbgf(bytes))
+        format!("\"{}\"", escaped_from_raw(bytes))
     }
     fn i32_hex(v: i32) -> String {
         format!("{v} = 0x{:x}", v as u32)
@@ -800,9 +754,9 @@ fn printbuffer_elements(dbr: DbfCode, val: &EpicsValue) -> Vec<String> {
     }
 
     match (dbr, val) {
-        (DbfCode::String, EpicsValue::String(v)) => vec![quoted(v.as_bytes())],
+        (DbfCode::String, EpicsValue::String(v)) => vec![dbr_string_element(v.as_bytes())],
         (DbfCode::String, EpicsValue::StringArray(v)) => {
-            v.iter().map(|s| quoted(s.as_bytes())).collect()
+            v.iter().map(|s| dbr_string_element(s.as_bytes())).collect()
         }
         // `%d = 0x%x`, plus the printable character (`dbTest.c:1013-1021`).
         (DbfCode::Char, EpicsValue::Char(v)) => vec![char_scalar(*v)],
@@ -816,12 +770,26 @@ fn printbuffer_elements(dbr: DbfCode, val: &EpicsValue) -> Vec<String> {
         // the NUL `dbpf` appends is a terminator, not a `\x00` in the text.
         // A buffer that STARTS with one gives `len == 0`, and C's
         // `while (len > 0)` then prints nothing under the header.
+        //
+        // Each message is a chunk whose escaped form fits `MAXLINE - 5`, and
+        // all but the last end in ` +` (`:1027-1038`).
         (DbfCode::Char, EpicsValue::CharArray(v)) => {
             let len = v.iter().position(|&b| b == 0).unwrap_or(v.len());
-            match len {
-                0 => vec![],
-                len => vec![quoted(&v[..len])],
+            let mut rest = &v[..len];
+            let mut chunks = Vec::new();
+            while !rest.is_empty() {
+                let mut chunk = rest.len().min(TabBuffer::MAXLINE - 5);
+                while escaped_from_raw(&rest[..chunk]).len() >= TabBuffer::MAXLINE - 5 {
+                    chunk -= 1;
+                }
+                let mut text = quoted(&rest[..chunk]);
+                rest = &rest[chunk..];
+                if !rest.is_empty() {
+                    text.push_str(" +");
+                }
+                chunks.push(text);
             }
+            chunks
         }
         (DbfCode::UChar, EpicsValue::UChar(v)) => vec![format!("{v} = 0x{v:x}")],
         (DbfCode::UChar, EpicsValue::UCharArray(v)) => {
@@ -847,15 +815,16 @@ fn printbuffer_elements(dbr: DbfCode, val: &EpicsValue) -> Vec<String> {
         (DbfCode::UInt64, EpicsValue::UInt64Array(v)) => {
             v.iter().map(|e| format!("{e} = 0x{e:x}")).collect()
         }
-        (DbfCode::Float, EpicsValue::Float(v)) => vec![fmt_g(*v as f64, 6, false, false)],
+        (DbfCode::Float, EpicsValue::Float(v)) => vec![CFloat(*v as f64).g().to_string()],
         (DbfCode::Float, EpicsValue::FloatArray(v)) => v
             .iter()
-            .map(|e| fmt_g(*e as f64, 6, false, false))
+            .map(|e| CFloat(*e as f64).g().to_string())
             .collect(),
-        (DbfCode::Double, EpicsValue::Double(v)) => vec![fmt_g(*v, 12, false, false)],
-        (DbfCode::Double, EpicsValue::DoubleArray(v)) => {
-            v.iter().map(|e| fmt_g(*e, 12, false, false)).collect()
-        }
+        (DbfCode::Double, EpicsValue::Double(v)) => vec![format!("{:.12}", CFloat(*v).g())],
+        (DbfCode::Double, EpicsValue::DoubleArray(v)) => v
+            .iter()
+            .map(|e| format!("{:.12}", CFloat(*e).g()))
+            .collect(),
         // `%u` — the bare index (`dbTest.c:1136-1141`). `dbgf` never reaches
         // this row because it substitutes `DBR_STRING` for a `DBR_ENUM` field
         // before it prints; `dbtgf` and `dbtpf` print the native code and do.
@@ -888,8 +857,10 @@ fn native_readback_lines(dbr: DbfCode, val: &EpicsValue) -> Vec<String> {
     let Some((label, target)) = dbr_request(dbr) else {
         return printbuffer_lines(dbr.name(), 1, Some(&printbuffer_elements(dbr, val)));
     };
+    // A `DBR_STRING` element is `getStringString`'s 39-byte copy
+    // (`dbConvert.c:141-143`) whatever the field's size.
     match val.get_convert(target) {
-        Ok(v) => printbuffer_block(label, dbr, &v),
+        Ok(v) => printbuffer_block(label, dbr, &crate::types::codec::cap_dbr_strings(v)),
         Err(_) => printbuffer_lines(label, 1, None),
     }
 }
@@ -929,20 +900,24 @@ fn printbuffer_block(label: &str, dbr: DbfCode, val: &EpicsValue) -> Vec<String>
 fn printbuffer_lines(dbr: &str, count: usize, elements: Option<&[String]>) -> Vec<String> {
     let mut buf = TabBuffer::new(10);
     match count {
-        1 => buf.insert(&format!("DBF_{dbr}: ")),
-        0 => buf.insert(&format!("DBF_{dbr}[0]: (empty)")),
-        n => buf.insert(&format!("DBF_{dbr}[{n}]: ")),
+        1 => buf.insert(format!("DBF_{dbr}: ").as_bytes()),
+        0 => buf.insert(format!("DBF_{dbr}[0]: (empty)").as_bytes()),
+        n => buf.insert(format!("DBF_{dbr}[{n}]: ").as_bytes()),
     }
     match elements {
         // `status != 0` prints `failed.` regardless of the count.
-        None => buf.insert("failed."),
+        None => buf.insert(b"failed."),
         Some(values) => {
             for v in values {
-                buf.insert(v);
+                buf.insert(v.as_bytes());
             }
         }
     }
+    // Every insert above is a whole `str` and the padding is spaces.
     buf.finish()
+        .into_iter()
+        .map(|line| String::from_utf8(line).expect("whole str inserts"))
+        .collect()
 }
 
 /// C `dbgf` (`dbTest.c:363-389`) once `nameToAddr` has resolved the name.
@@ -957,22 +932,12 @@ fn printbuffer_lines(dbr: &str, count: usize, elements: Option<&[String]>) -> Ve
 /// both are C. `dbpf` ends by calling `dbgf` (`:433`) whatever the put
 /// returned, so its read-back is this printer and not a second rendering.
 ///
-/// A name with no `dbFldDes` behind it is C's record ATTRIBUTE, for which
-/// `dbGetAttributePart` synthesises a `DBF_STRING` descriptor
-/// (`dbStaticLib.c:1265-1272`); `RTYP` is the only such name this port serves.
-fn dbgf_lines(ctx: &CommandContext, pname: &str, val: &EpicsValue) -> Vec<String> {
-    let (rec_name, field) = parse_pv_name(pname);
-    let field = if field.is_empty() { "VAL" } else { field };
-    let Some(rec) = ctx.db().get_record(rec_name) else {
-        return native_readback_lines(DbfCode::String, val);
-    };
-    let inst = rec.read();
-    let Some((_, dbr)) = inst
-        .field_desc(field)
-        .map(|fd| field_addr_types(fd, Some(val)))
-    else {
-        return native_readback_lines(DbfCode::String, val);
-    };
+fn dbgf_lines(addr: &DbAddr, val: &EpicsValue) -> Vec<String> {
+    let inst = addr.rec.read();
+    let (_, dbr) = addr.types(Some(val));
+    if dbr == DbfCode::String {
+        return native_readback_lines(dbr, &long_string_value(&inst, val));
+    }
     if dbr != DbfCode::Enum {
         return native_readback_lines(dbr, val);
     }
@@ -981,7 +946,7 @@ fn dbgf_lines(ctx: &CommandContext, pname: &str, val: &EpicsValue) -> Vec<String
     // (`dbConvert.c:833-911`) by DBF class. `field_as_dbr_string` is that
     // table's single owner here, so `dbgf` and a db-link read of one field
     // cannot disagree about its text.
-    let text = inst.field_as_dbr_string(field).unwrap_or_default();
+    let text = inst.field_as_dbr_string(&addr.field).unwrap_or_default();
     native_readback_lines(DbfCode::String, &EpicsValue::String(text))
 }
 
@@ -1003,27 +968,49 @@ fn dbgf_lines(ctx: &CommandContext, pname: &str, val: &EpicsValue) -> Vec<String
 /// read-back then FAILED printed nothing where C prints the type header and
 /// `failed.` — `dbpf T:AI.RSET, "1"` on a `DBF_NOACCESS` field was silent on
 /// stdout against `softIoc` R7.0.10-146.
-fn dbgf_echo(ctx: &CommandContext, pname: &str) {
-    match ctx.db().get_pv(pname) {
+fn dbgf_echo(ctx: &CommandContext, addr: &DbAddr) {
+    if addr.char_view {
+        // `dbgf`'s request is `MIN(no_elements, sizeof(buffer)/field_size)`
+        // of `DBR_CHAR`, out of a `long[100]` (`dbTest.c:351`, `:371-376`).
+        match addr.char_view().and_then(|v| {
+            v.get(
+                crate::types::DbFieldType::Char,
+                v.no_elements.min(DBGF_BUFFER_BYTES),
+            )
+        }) {
+            Some(chars) => {
+                for line in printbuffer_block("CHAR", DbfCode::Char, &chars) {
+                    ctx.println(&line);
+                }
+            }
+            None => dbgf_failed(ctx, addr),
+        }
+        return;
+    }
+    match ctx.db().get_pv(addr.pv()) {
         Ok(val) => {
-            for line in dbgf_lines(ctx, pname, &val) {
+            for line in dbgf_lines(addr, &val) {
                 ctx.println(&line);
             }
         }
         // C `dbgf` returns 0 whatever `dbGetField` returned
         // (`dbTest.c:388`): the failure is a printed line, not a failed
         // command.
-        Err(_) => dbgf_failed(ctx, pname),
+        Err(_) => dbgf_failed(ctx, addr),
     }
 }
+
+/// `sizeof(long[100])`, the buffer `dbgf` and `dbtpf` read into
+/// (`dbTest.c:351`, `:607`).
+const DBGF_BUFFER_BYTES: usize = 800;
 
 /// C `nameToAddr` (`dbTest.c:787-795`) — the one place every
 /// `dbTest.c` command reports a name it cannot resolve. C prints this
 /// line on stdout and the caller then returns -1 without printing
 /// anything else, so the port must not route it through the shell's
 /// error channel, which writes to stderr and prefixes `Error:`.
-fn print_pv_not_found(ctx: &CommandContext, pname: &str) {
-    ctx.println(&format!("PV '{pname}' not found"));
+fn print_pv_not_found(ctx: &CommandContext, pname: &[u8]) {
+    ctx.println_bytes(&[b"PV '", pname, b"' not found"].concat());
 }
 
 /// C `nameToAddr` (`dbTest.c:787-795`) — the ONE resolution every `dbTest.c`
@@ -1068,27 +1055,51 @@ fn print_pv_not_found(ctx: &CommandContext, pname: &str) {
 /// callers need it, and C's `DBADDR` likewise carries `precord` and
 /// `pfldDes` together: a caller that re-looked-up the record could pick a
 /// different one than the name resolved to.
-fn name_to_addr(ctx: &CommandContext, pname: &str) -> Option<DbAddr> {
-    let (base, field) = parse_pv_name(pname);
+fn name_to_addr(ctx: &CommandContext, pname: &[u8]) -> Option<DbAddr> {
+    let parts = DbNameParts::of(pname);
+    let field = if parts.field.is_empty() {
+        "VAL"
+    } else {
+        parts.field
+    };
+    // `dbFindFieldPart` binary-searches with `strncmp` and
+    // `dbGetAttributePart` with `strncmp` too, so `SI.val` is not a field.
     let resolved = ctx
         .db()
-        .get_record(base)
-        .filter(|_| !matches!(ctx.db().get_pv(pname), Err(CaError::ChannelNotFound(_))));
-    match resolved {
-        Some(rec) => {
-            let field = field.to_ascii_uppercase();
-            let fld_des = rec.read().field_desc(&field);
-            Some(DbAddr {
-                rec,
-                field,
-                fld_des,
-            })
-        }
-        None => {
-            print_pv_not_found(ctx, pname);
-            None
-        }
+        .get_record(parts.record)
+        .filter(|_| !field.bytes().any(|c| c.is_ascii_lowercase()))
+        .filter(|_| {
+            !matches!(
+                ctx.db()
+                    .get_pv([parts.record, b".", field.as_bytes()].concat()),
+                Err(CaError::ChannelNotFound(_))
+            )
+        });
+    let addr = resolved.and_then(|rec| {
+        let fld_des = {
+            let inst = rec.read();
+            match inst.field_desc(field) {
+                Some(fd) => FldDes::Declared(fd),
+                None if rec.declares_name(field) => FldDes::NameOnly,
+                None => FldDes::Attribute(inst.attribute(field)?),
+            }
+        };
+        let addr = DbAddr {
+            rec,
+            record: parts.record.to_vec(),
+            field: field.to_string(),
+            fld_des,
+            char_view: parts.tail.starts_with(b"$"),
+            find_field_ok: parts.tail.first().is_none_or(u8::is_ascii_whitespace),
+        };
+        // `dbAccess.c:697-699`: `$` on anything but a string or a link is
+        // `S_dbLib_fieldNotFound`.
+        (!addr.char_view || addr.char_view().is_some()).then_some(addr)
+    });
+    if addr.is_none() {
+        print_pv_not_found(ctx, pname);
     }
+    addr
 }
 
 /// What [`name_to_addr`] resolved — the port's `DBADDR`, filled once and read
@@ -1105,65 +1116,100 @@ fn name_to_addr(ctx: &CommandContext, pname: &str) -> Option<DbAddr> {
 /// where this port printed nothing and `PV 'T:AI.RSET' not found`.
 struct DbAddr {
     rec: Arc<crate::server::record::RecordCell>,
-    /// C's `pfldDes->name`: uppercased, and `VAL` when the name carried no
-    /// dot.
+    /// The record part of the name as given, alias or not.
+    record: Vec<u8>,
+    /// C's `pfldDes->name`: `VAL` when the name carried no field part.
     field: String,
     /// C's `paddr->pfldDes`, which is never null after `dbNameToAddr`.
-    ///
-    /// `None` here is the one shape C has no counterpart for: the `dbCommon`
-    /// `DBF_NOACCESS` internals this port carries by NAME only
-    /// (`RecordInstance::resolves_noaccess_name`). C has a `dbFldDes` for
-    /// every one of them; the generator carries a descriptor only for the
-    /// rows whose `extra(...)` names a plain scalar, so `RSET`, `MLOK`,
-    /// `MLIS`, `DSET`, `DPVT`, `RDES`, `LSET`, `ASP`, `PPN`, `PPNR`, `SPVT`
-    /// and `BKLNK` arrive with the name and nothing else. They are still
-    /// RESOLVED — the declaration is what C resolves against — so this is a
-    /// missing width, not a missing field.
-    fld_des: Option<&'static FieldDesc>,
+    fld_des: FldDes,
+    /// The name carried the `$` modifier, so the address is C's `DBR_CHAR`
+    /// view of the field ([`DbAddr::char_view`]).
+    char_view: bool,
+    /// `dbFindRecord` accepts the name too — nothing but white space after
+    /// the field part (`dbStaticLib.c:1856-1858`) — which is what `dbpr`
+    /// resolves with after `nameToAddr`.
+    find_field_ok: bool,
+}
+
+/// [`DbAddr::fld_des`], by which of `dbNameToAddr`'s two lookups found the
+/// name (`dbAccess.c:672-675`).
+enum FldDes {
+    /// `dbFindFieldPart`: the record type's declaration.
+    Declared(&'static FieldDesc),
+    /// `dbFindFieldPart` too, for the `dbCommon` `DBF_NOACCESS` internals this
+    /// port carries by NAME only (`RecordInstance::resolves_noaccess_name`).
+    /// C has a `dbFldDes` for every one of them; the generator carries a
+    /// descriptor only for the rows whose `extra(...)` names a plain scalar,
+    /// so `RSET`, `MLOK`, `MLIS`, `DSET`, `DPVT`, `RDES`, `LSET`, `ASP`,
+    /// `PPN`, `PPNR`, `SPVT` and `BKLNK` arrive with the name and nothing
+    /// else. They are still RESOLVED — the declaration is what C resolves
+    /// against — so this is a missing width, not a missing field.
+    NameOnly,
+    /// `dbGetAttributePart`: a record-type attribute (`RTYP`, `VERS`, a
+    /// `dbPutAttribute` name), whose descriptor `dbPutRecordAttribute`
+    /// synthesises as `DBF_STRING`, `SPC_ATTRIBUTE`, `MAX_STRING_SIZE`
+    /// (`dbStaticLib.c:1265-1271`). Carries the attribute's text, C's `pfield`.
+    Attribute(String),
 }
 
 impl DbAddr {
     /// C's `paddr->field_type` and `paddr->dbr_field_type`.
     ///
-    /// Every name-only row above is declared `DBF_NOACCESS` in `dbCommon.dbd`,
-    /// and `mapDBFToDBR` is the identity on it, so both words are
-    /// `DBF_NOACCESS` with no descriptor to consult.
+    /// Every name-only row is declared `DBF_NOACCESS` in `dbCommon.dbd`, and
+    /// `mapDBFToDBR` is the identity on it, so both words are `DBF_NOACCESS`
+    /// with no descriptor to consult.
     fn types(&self, value: Option<&EpicsValue>) -> (DbfCode, DbfCode) {
         match self.fld_des {
-            Some(fd) => field_addr_types(fd, value),
-            None => (DbfCode::NoAccess, DbfCode::NoAccess),
+            FldDes::Declared(fd) => field_addr_types(fd, value),
+            FldDes::NameOnly => (DbfCode::NoAccess, DbfCode::NoAccess),
+            FldDes::Attribute(_) => (DbfCode::String, DbfCode::String),
         }
+    }
+
+    /// The `REC.FIELD` name [`PvDatabase::get_pv`] reads this address by.
+    ///
+    /// [`PvDatabase::get_pv`]: crate::server::database::PvDatabase::get_pv
+    fn pv(&self) -> Vec<u8> {
+        [&self.record[..], b".", self.field.as_bytes()].concat()
+    }
+
+    /// The field as C's `$` modifier re-types it (`dbAccess.c:682-701`), or
+    /// `None` for a field that modifier refuses.
+    /// The field as C's `$` modifier re-types it, or `None` for a field that
+    /// modifier refuses — see [`char_view()`].
+    fn char_view(&self) -> Option<CharView> {
+        char_view(&self.rec.read(), &self.field)
     }
 }
 
-/// The byte width of one element of `code`, as C's `dbFldDes.size` carries
-/// it — `sizeof(prec->field)`, stamped per field by the `GEN_SIZE_OFFSET`
-/// block of the generated `xxxRecord.h`, except for `DBF_STRING` where it is
-/// the `.dbd` `size(N)` attribute (`dbLexRoutines.c:663`, required non-zero
-/// at `:755`).
-///
-/// `None` where the C number is a fact about a C struct this port does not
-/// have: the three link types are `sizeof(DBLINK)` — measured as **80** on
-/// `softIoc` linux-x86_64, and platform-dependent. Printing a width for those
-/// would be inventing an ABI, so `dba` prints `(none)` instead.
-///
-/// A `DBF_NOACCESS` row reaches the last arm only when `field_addr_types` left
-/// the declaration standing, i.e. when no `cvt_dbaddr` re-typed it — and those
-/// are exactly the rows the generator carries a width for, taken from the C
-/// type its `extra(...)` names. `dbCommon.TIME` is the case in hand: C prints
-/// `Field Size: 8`, `sizeof(epicsTimeStamp)`. A width of zero still means the
-/// port has no number, so it keeps `(none)`.
-fn c_field_size(code: DbfCode, declared_size: u16) -> Option<u16> {
-    Some(match code {
-        DbfCode::String => declared_size,
-        DbfCode::NoAccess if declared_size > 0 => declared_size,
-        DbfCode::Char | DbfCode::UChar => 1,
-        // `epicsEnum16` for all three (`epicsTypes.h`).
-        DbfCode::Short | DbfCode::UShort | DbfCode::Enum | DbfCode::Menu | DbfCode::Device => 2,
-        DbfCode::Long | DbfCode::ULong | DbfCode::Float => 4,
-        DbfCode::Double | DbfCode::Int64 | DbfCode::UInt64 => 8,
-        DbfCode::Inlink | DbfCode::Outlink | DbfCode::Fwdlink | DbfCode::NoAccess => return None,
-    })
+/// A char-buffered `DBF_STRING` (lsi/lso/printf VAL) read as `DBR_STRING`
+/// with one element requested: `get_array_info`'s `LEN` decides between no
+/// element and the one string (`dbAccess.c:963-1003`), which is the whole
+/// buffer to its NUL.
+fn long_string_value(inst: &crate::server::record::RecordInstance, val: &EpicsValue) -> EpicsValue {
+    match val {
+        EpicsValue::CharArray(b) | EpicsValue::UCharArray(b) => {
+            if long_string_len(inst) == 0 {
+                EpicsValue::StringArray(Vec::new().into())
+            } else {
+                let text = crate::server::database::char_view::long_string_field_bytes(b);
+                EpicsValue::String(crate::types::codec::cap_dbr_string(
+                    crate::types::PvString::from_bytes(text),
+                ))
+            }
+        }
+        _ => val.clone(),
+    }
+}
+
+/// `dbPutField` through a `$` address, `false` where C's status is non-zero.
+fn char_view_put(ctx: &CommandContext, addr: &DbAddr, value: EpicsValue) -> bool {
+    let field = format!("{}$", addr.field);
+    ctx.block_on(
+        ctx.db()
+            .put_record_field_from_ca_no_notify(&addr.record, &field, value),
+    )
+    .is_ok()
 }
 
 /// C `dbgf` when `dbGetField` fails after `nameToAddr` succeeded
@@ -1176,52 +1222,14 @@ fn c_field_size(code: DbfCode, declared_size: u16) -> Option<u16> {
 /// `DBF_NOACCESS` = 17 (`dbFldTypes.h:90`), so `dbr[17]` reads five past the
 /// end and R7.0.10 prints the adjacent `dbf[1]`, `DBF_CHAR`. The string C
 /// meant is in that table already, stranded at index 12. This prints it.
-/// C's `sprintf` inside `dbGet`'s validity gate (`dbAccess.c:955-960`):
-///
-/// ```c
-/// sprintf(message, "dbGet: dbrType = %d, field_type = %.12s (%d).",
-///         dbrType, dbGetFieldTypeString(field_type), field_type);
-/// ```
-///
-/// The two codes are separate inputs — `dbgf` passes `addr.dbr_field_type` as
-/// `dbrType` (`dbTest.c:380`) while `field_type` is the declaration's — and
-/// they coincide only because `mapDBFToDBR` is the identity on `DBF_NOACCESS`.
-/// The `%.12s` is kept so the port truncates wherever C would, and there is no
-/// trailing newline: `recGblDbaddrError`'s own format string owns the only one
-/// (`recGbl.c:87-90`), so the report is one console line.
-///
-/// A function rather than a `format!` at the raise site so the exact bytes can
-/// be pinned without capturing the log.
-fn dbget_bad_dbrtype_message(dbr: DbfCode, field_type: DbfCode) -> String {
-    let ft_name = format!("DBF_{}", field_type.name());
-    format!(
-        "dbGet: dbrType = {}, field_type = {ft_name:.12} ({}).",
-        dbr as i16, field_type as i16
-    )
-}
-
-fn dbgf_failed(ctx: &CommandContext, pname: &str) {
-    let (rec_name, field) = parse_pv_name(pname);
-    let field = if field.is_empty() { "VAL" } else { field };
-    let (field_type, dbr, field_name) = match ctx.db().get_record(rec_name) {
-        Some(rec) => {
-            let inst = rec.read();
-            match inst.field_desc(field) {
-                Some(fd) => {
-                    let (ft, dbr) = field_addr_types(fd, None);
-                    (ft, dbr, fd.name)
-                }
-                None => (DbfCode::NoAccess, DbfCode::NoAccess, field),
-            }
-        }
-        None => (DbfCode::NoAccess, DbfCode::NoAccess, field),
+fn dbgf_failed(ctx: &CommandContext, addr: &DbAddr) {
+    let (field_type, dbr) = addr.types(None);
+    let field_name = match addr.fld_des {
+        FldDes::Declared(fd) => fd.name,
+        FldDes::NameOnly | FldDes::Attribute(_) => addr.field.as_str(),
     };
-    crate::server::recgbl::rec_gbl_dbaddr_error(
-        "Illegal Database Request Type",
-        rec_name,
-        field_name,
-        &dbget_bad_dbrtype_message(dbr, field_type),
-    );
+    let rec_name = String::from_utf8_lossy(&addr.record);
+    crate::server::recgbl::rec_gbl_bad_dbrtype("dbGet", dbr, field_type, &rec_name, field_name);
     for line in printbuffer_lines(dbr.name(), 1, None) {
         ctx.println(&line);
     }
@@ -1247,35 +1255,48 @@ fn dbgf_failed(ctx: &CommandContext, pname: &str) {
 /// The `????` C prints for an out-of-range type (`:807-808`, `:815-816`) is
 /// unreachable here: [`DbfCode`] has no invalid value.
 ///
-/// C's `dba` also resolves record ATTRIBUTES (`dbNameToAddr` falls back to
-/// `dbGetAttributePart`, `dbAccess.c:670-672`), so `dba("rec.RTYP")` prints a
-/// synthesised `DBF_STRING`/`SPC_ATTRIBUTE` descriptor (`dbStaticLib.c:1265-1272`).
-/// This port has no attribute table — that is the subject `dbPutAttribute` is
-/// still waiting on — so an attribute name reports not-found here.
+/// An attribute's Field Description is C's `dbCalloc`'d descriptor
+/// (`dbStaticLib.c:1265`); the port synthesises none, so it prints `(none)`.
 fn print_db_addr(ctx: &CommandContext, addr: &DbAddr) {
+    let view = addr.char_view.then(|| addr.char_view()).flatten();
     let inst = addr.rec.read();
     let field = addr.field.as_str();
     let value = inst.resolve_field(field);
-    let (field_type, dbr) = addr.types(value.as_ref());
+    let (mut field_type, mut dbr) = addr.types(value.as_ref());
     // C: `no_elements = 1` (`dbAccess.c:635`), overwritten by `cvt_dbaddr`
     // with the CAPACITY for an array — `paddr->no_elements = prec->nelm`
     // (`waveformRecord.c::cvt_dbaddr`), never `NORD`. Reading the current
     // element count instead printed `No Elements: 0` for an unwritten
     // waveform where C prints its `NELM`. `field_native_count` is the same
     // NELM-first rule `CaChannel::create` already applies for `gft`/`pft`.
-    let elements = inst
+    let mut elements = inst
         .record
         .field_native_count(field)
         .or_else(|| inst.record.get_field(field).map(|v| v.count()))
         .unwrap_or(1);
+    let mut field_size = match addr.fld_des {
+        FldDes::Declared(fd) => c_field_size(
+            field_type,
+            served_element_size(&*inst.record, fd, field_type),
+        ),
+        FldDes::NameOnly => None,
+        FldDes::Attribute(_) => Some(char_view::MAX_STRING_SIZE as u16),
+    };
+    // The `$` modifier's re-typing (`dbAccess.c:682-701`).
+    if let Some(view) = view {
+        field_type = view.field_type;
+        dbr = DbfCode::Char;
+        elements = view.no_elements as _;
+        field_size = Some(1);
+    }
 
     match addr.fld_des {
-        Some(fd) => ctx.println(&format!(
+        FldDes::Declared(fd) => ctx.println(&format!(
             "Record Address: {:p} Field Address: (none) Field Description: {:p}",
             Arc::as_ptr(&addr.rec),
             fd as *const FieldDesc,
         )),
-        None => ctx.println(&format!(
+        FldDes::NameOnly | FldDes::Attribute(_) => ctx.println(&format!(
             "Record Address: {:p} Field Address: (none) Field Description: (none)",
             Arc::as_ptr(&addr.rec),
         )),
@@ -1287,10 +1308,7 @@ fn print_db_addr(ctx: &CommandContext, addr: &DbAddr) {
         field_type as i16,
         field_type.name(),
     ));
-    match addr
-        .fld_des
-        .and_then(|fd| c_field_size(field_type, fd.size))
-    {
+    match field_size {
         Some(n) => ctx.println(&format!("    Field Size: {n}")),
         None => ctx.println("    Field Size: (none)"),
     }
@@ -1299,9 +1317,11 @@ fn print_db_addr(ctx: &CommandContext, addr: &DbAddr) {
     // `ASP` :192, `SPVT` :210, `RSET` :218, `DSET` :225, `RDES` :237,
     // `LSET` :243, and so on), which is why C prints `Special: 1` for all of
     // them. It is read off the `.dbd`, not inferred.
-    let special = addr
-        .fld_des
-        .map_or(Special::NoMod as i16, |fd| fd.special as i16);
+    let special = match addr.fld_des {
+        FldDes::Declared(fd) => fd.special.code(),
+        FldDes::NameOnly => Special::NoMod.code(),
+        FldDes::Attribute(_) => Special::Attribute.code(),
+    };
     ctx.println(&format!("       Special: {special}"));
     ctx.println(&format!(
         "DBR Field Type: {} = DBR_{}",
@@ -1363,14 +1383,14 @@ fn cmd_dbgf() -> CommandDef {
             // `nameToAddr` cannot resolve. A field the record type DECLARES
             // resolves, and its read then fails inside `dbGetField`, which is
             // a different outcome and prints differently.
-            if name_to_addr(ctx, name).is_none() {
+            let Some(addr) = name_to_addr(ctx, name) else {
                 return Ok(CommandOutcome::Failed);
-            }
+            };
             // C tests `lset` only AFTER `nameToAddr` (`dbTest.c:366-368`).
             if !dbt_requires_ioc_init(ctx, "dbgf") {
                 return Ok(CommandOutcome::Failed);
             }
-            dbgf_echo(ctx, name);
+            dbgf_echo(ctx, &addr);
             Ok(CommandOutcome::Continue)
         },
     )
@@ -1404,33 +1424,30 @@ fn cmd_dbpf() -> CommandDef {
 
             // C resolves the name before it puts (`dbTest.c:405-406`),
             // so an unknown PV never reaches `dbPutField`; C returns -1.
-            if name_to_addr(ctx, name).is_none() {
+            let Some(addr) = name_to_addr(ctx, name) else {
                 return Ok(CommandOutcome::Failed);
-            }
+            };
             // C tests `lset` only AFTER `nameToAddr` (`dbTest.c:408-410`).
             if !dbt_requires_ioc_init(ctx, "dbpf") {
                 return Ok(CommandOutcome::Failed);
             }
 
-            let (base, field) = parse_pv_name(name);
-            let field = field.to_ascii_uppercase();
+            // `$` makes the address `DBR_CHAR` with `no_elements > 1`, so C
+            // puts `strlen + 1` characters (`dbTest.c:413-416`).
+            if addr.char_view {
+                let mut chars = value_str.as_bytes().to_vec();
+                chars.push(0);
+                let put_ok = char_view_put(ctx, &addr, EpicsValue::CharArray(chars.into()));
+                dbgf_echo(ctx, &addr);
+                return Ok(if put_ok {
+                    CommandOutcome::Continue
+                } else {
+                    CommandOutcome::Failed
+                });
+            }
 
-            // Try to determine the field type for proper parsing
-            let dbf_type = ctx.block_on(async {
-                if let Some(rec) = ctx.db().get_record(base) {
-                    let inst = rec.read();
-                    // Check record-specific fields
-                    if let Some(t) = crate::server::record::record_instance::declared_field_type_of(
-                        inst.record.as_ref(),
-                        &field,
-                    ) {
-                        return Some(t);
-                    }
-                    // Common field types
-                    return common_field_dbf_type(&field);
-                }
-                None
-            });
+            let base = addr.record.as_slice();
+            let field = addr.field.clone();
 
             // C `dbTest.c:413-429`: an ARRAY field is put through its OWN
             // `dbr_field_type`, never the `DBR_STRING` a scalar `dbpf` uses.
@@ -1464,9 +1481,16 @@ fn cmd_dbpf() -> CommandDef {
                     })
                 }
                 Some((capacity, dbr)) => {
-                    match crate::server::db_convert_json::db_put_convert_json(
-                        value_str, dbr, capacity,
-                    ) {
+                    // yajl validates UTF-8, so bytes that are not text are a
+                    // refused literal before any conversion.
+                    let json = match value_str.to_str() {
+                        Ok(json) => json,
+                        Err(e) => {
+                            crate::runtime::log::errlog_printf(&format!("dbConvertJSON: {e}\n"));
+                            return Ok(CommandOutcome::Failed);
+                        }
+                    };
+                    match crate::server::db_convert_json::db_put_convert_json(json, dbr, capacity) {
                         Ok(v) => Some(v),
                         // C `dbTest.c:425-426` returns the status BEFORE
                         // `dbPutField` and before the closing `dbgf`, so a
@@ -1503,53 +1527,18 @@ fn cmd_dbpf() -> CommandDef {
 
             let value = if let Some(v) = array_value {
                 v
-            } else if field == "DTYP" {
-                // DTYP is DBF_DEVICE: its choices are the record type's live
-                // device menu (dynamic, per record type — device support names
-                // registered at runtime), NOT the field-blind static table that
-                // `EpicsValue::parse(Enum, _)` used to consult (the field-blind
-                // menu table, removed with 03 L-7).
-                // `declared_field_type_of(DTYP)` reports `Enum`, so the generic
-                // path below parsed every device-support name as an enum/menu
-                // string and rejected it ("invalid enum or menu string"), which
-                // failed `dbpf <rec>.DTYP <device-support-name>` for every record
-                // type. Feed the value straight to the put path, which already
-                // resolves a numeric index against `device_menu` and stores a
-                // device-support NAME as-is (tier-3, `put_common_field`'s "DTYP"
-                // arm).
-                match value_str.trim().parse::<i64>() {
-                    Ok(i) => EpicsValue::Enum(i as u16),
-                    Err(_) => EpicsValue::String(value_str.trim().into()),
-                }
-            } else if let Some(dbf) = dbf_type {
-                // A `DBF_MENU`/`DBF_ENUM` label is menu-SPECIFIC — "Specified"
-                // is index 1 of `menuFanout` but index 0 of `selSELM` — so its
-                // one resolver is `resolve_menu_field_string`, which needs the
-                // field's own menu. `dbpf` has only the field's declared TYPE
-                // here, so it must not resolve the label itself: it hands the
-                // token to the put path, exactly as the DTYP arm above does.
-                // Resolving it here is what made `dbpf <sel>.SELM Specified`
-                // store menuFanout's 1 instead of selSELM's 0.
-                //
-                // A numeric token still parses here, so a typed put keeps its
-                // typed error, and a token that is neither a number nor a valid
-                // choice is refused downstream by `put_string`/`bad_choice`
-                // rather than silently landing as index 0.
-                //
-                // The fallback is not the menu arm's alone. C hands `dbpf`'s
-                // scalar text to `dbPutField` as `DBR_STRING` and never parses
-                // it itself (`dbTest.c:413`, `:431`), so text no conversion
-                // takes is a failed PUT — value unchanged, nothing printed by
-                // `dbpf`, and the closing `dbgf` still run. Parsing here and
-                // raising the error instead put `ERROR <file> line <n>: cannot
-                // parse 'notanumber' as Double` on stderr and skipped the
-                // read-back entirely, where `softIoc` R7.0.10-146 printed only
-                // `DBF_DOUBLE:         1.5`.
-                EpicsValue::parse(dbf, value_str)
-                    .unwrap_or_else(|_| EpicsValue::String(value_str.trim().into()))
             } else {
-                // No type info available, try as string
-                EpicsValue::String(value_str.clone().into())
+                // C hands `dbpf`'s scalar text to `dbPutField` as
+                // `DBR_STRING` and never parses it itself (`dbTest.c:413`,
+                // `:431`), so the text goes to the put path untouched for every
+                // type: `putStringMenu`/`putStringEnum` resolve a label against
+                // the field's own choices (`dbpf <sel>.SELM Specified` is
+                // selSELM's 0, not menuFanout's 1), `putStringString` copies
+                // the bytes, and `c_parse::put_string` is the one `epicsParse*`
+                // port for the numeric widths. Text no conversion takes is a
+                // failed PUT — value unchanged, nothing printed by `dbpf`, and
+                // the closing `dbgf` still run.
+                EpicsValue::String(value_str.as_bytes().into())
             };
 
             // C `dbpf` writes via `dbPutField` — processing put, but no
@@ -1578,7 +1567,7 @@ fn cmd_dbpf() -> CommandDef {
             // `dbPutField` returned, so the read-back is that one
             // printer rather than a second rendering, and a rejected
             // put still shows the value the record kept.
-            dbgf_echo(ctx, name);
+            dbgf_echo(ctx, &addr);
 
             if put_failed {
                 Ok(CommandOutcome::Failed)
@@ -1605,11 +1594,11 @@ fn cmd_dbpf() -> CommandDef {
 /// Link fields are not routed here: `dbGetString`'s link arms re-render from
 /// the parsed link and `dbpr` prints the type alongside them, which is
 /// [`render_dbpr_link`]'s job.
-pub(super) fn db_get_string(
+pub(crate) fn db_get_string(
     inst: &crate::server::record::RecordInstance,
     desc: &crate::server::record::FieldDesc,
     value: &EpicsValue,
-) -> String {
+) -> Vec<u8> {
     // C `dbGetString` (`dbStaticLib.c:1888-1906`) switches on the DECLARED
     // `DBF_*` token and nothing else: `DBF_MENU` and `DBF_DEVICE` render their
     // choice string (`dbGetStringNum`, `:2131-2160`), while `DBF_ENUM` and
@@ -1625,11 +1614,12 @@ pub(super) fn db_get_string(
     let text = match desc.declared_dbf {
         DbfCode::Menu | DbfCode::Device => {
             // The index is an `epicsEnum16` in C whatever the port stores it
-            // in; a value that is not an index at all leaves the choice list
-            // unreachable and falls through to the plain rendering.
+            // in, so a negative short reads as its unsigned bits; a value
+            // that is not an index at all leaves the choice list unreachable
+            // and falls through to the plain rendering.
             let index = match value {
                 EpicsValue::Enum(v) => Some(*v),
-                EpicsValue::Short(v) => u16::try_from(*v).ok(),
+                EpicsValue::Short(v) => Some(*v as u16),
                 EpicsValue::UShort(v) => Some(*v),
                 EpicsValue::UChar(v) => Some(u16::from(*v)),
                 _ => None,
@@ -1654,7 +1644,12 @@ pub(super) fn db_get_string(
             _ => None,
         },
     };
-    text.unwrap_or_else(|| value.to_string())
+    match (text, value) {
+        (Some(text), _) => text.into_bytes(),
+        // C returns the field's own bytes.
+        (None, EpicsValue::String(s)) => s.as_bytes().to_vec(),
+        (None, value) => value.text_with(usize::MAX, real_to_string).into_bytes(),
+    }
 }
 
 /// C's two hex converters, chosen the way `dbGetStringNum` chooses them.
@@ -1752,7 +1747,7 @@ fn real_to_string(value: f64, is_double: bool) -> String {
 
     if logval > 6 || logval < -2 {
         let prec = PRECISION[i];
-        let formatted = c_format_e(value, prec as usize);
+        let formatted = format!("{:.*e}", prec as usize, CFloat(value));
         let Some(epos) = formatted.find('e') else {
             return format!("{sign}{formatted}");
         };
@@ -1764,7 +1759,7 @@ fn real_to_string(value: f64, is_double: bool) -> String {
         format!("{sign}{mantissa}{exponent}")
     } else {
         let prec = (PRECISION[i] - logval).max(0);
-        let formatted = format!("{value:.*}", prec as usize);
+        let formatted = format!("{:.*}", prec as usize, CFloat(value));
         let trimmed = real_trim(formatted.into_bytes(), prec, PRECISION[i]);
         format!("{sign}{trimmed}")
     }
@@ -1839,38 +1834,6 @@ fn real_trim(mut t: Vec<u8>, prec: i32, precision: i32) -> String {
     }
 }
 
-/// C `sprintf("%.*e", prec, value)`.
-///
-/// Rust's `{:e}` is not it: it writes `1.5e7` where C writes `1.5e+07`, and it
-/// spells the non-finite values with capitals where glibc writes `inf` and
-/// `nan`. Both differences are load-bearing — C's caller splits on the `e` and
-/// pastes the exponent back verbatim, and its absence in `nan`/`inf` is what
-/// makes those return early.
-fn c_format_e(value: f64, prec: usize) -> String {
-    if value.is_nan() {
-        return if value.is_sign_negative() {
-            "-nan"
-        } else {
-            "nan"
-        }
-        .to_string();
-    }
-    if value.is_infinite() {
-        return if value < 0.0 { "-inf" } else { "inf" }.to_string();
-    }
-    let s = format!("{value:.*e}", prec);
-    match s.split_once('e') {
-        Some((mantissa, exp)) => {
-            let (sign, digits) = match exp.strip_prefix('-') {
-                Some(d) => ('-', d),
-                None => ('+', exp.trim_start_matches('+')),
-            };
-            format!("{mantissa}e{sign}{digits:0>2}")
-        }
-        None => s,
-    }
-}
-
 /// [`db_get_string`] addressed by field NAME, for a caller walking a record it
 /// has no descriptor for (`dbReportDeviceConfig` does `dbFindField` then
 /// `dbGetString` for each of its four columns).
@@ -1880,7 +1843,7 @@ fn c_format_e(value: f64, prec: usize) -> String {
 pub(super) fn db_get_string_field(
     inst: &crate::server::record::RecordInstance,
     field: &str,
-) -> Option<String> {
+) -> Option<Vec<u8>> {
     let desc = inst.field_desc(field)?;
     let value = inst.resolve_field(field)?;
     Some(db_get_string(inst, desc, &value))
@@ -1960,21 +1923,33 @@ fn dbpr_choice_text(
 /// rejects the `INST_IO` parse and the link keeps the devsup type with no
 /// text at all. The word is `INST_IO` on a field whose device support
 /// declares it.
+/// What `dbpr` prints a link field as: C's `plink->type` once `dbAddLink`
+/// ran, `PN_LINK` once a SoftCallback `add_record` re-typed it, or the
+/// parse's own type when a failed device-link put skipped `dbAddLink`.
+#[derive(Clone, Copy)]
+enum LinkShape {
+    Added,
+    Pn,
+    Unadded,
+}
+
 fn render_dbpr_link(
     ctx: &CommandContext,
     class: crate::types::DbfLinkClass,
-    raw: &str,
-    rendered: &str,
+    raw: &crate::types::PvString,
+    rendered: &[u8],
     running: bool,
-) -> String {
+) -> Vec<u8> {
     if !running && !raw.is_empty() {
-        return format!("LINK {raw}");
+        return [b"LINK ", raw.as_bytes()].concat();
     }
     let ftype = crate::server::record::LinkFieldType::for_class(class);
-    let parsed = ctx
-        .db()
-        .db_init_link_locality(crate::server::record::parse_link_field(raw, ftype));
-    format!("{} {rendered}", parsed.link_type_after_init(raw).c_name())
+    let parsed = ctx.db().db_init_link_locality(
+        crate::server::record::parse_link_field(raw.as_bytes(), ftype),
+        ftype,
+    );
+    let link_type = parsed.link_type_after_init(raw.as_bytes(), ftype).c_name();
+    [link_type.as_bytes(), b" ", rendered].concat()
 }
 
 fn cmd_dbpr() -> CommandDef {
@@ -2033,6 +2008,14 @@ fn cmd_dbpr() -> CommandDef {
 /// compare `pfield == &paddr->precord->time`; the port has no addresses to
 /// compare, so it keys on the name the same declaration carries.
 ///
+/// A pointer member — `size == sizeof(void *)` and a `*` in `extra(...)`,
+/// `:1239` — prints `PTR %p` of what the record HOLDS in it: the address of the
+/// object the port keeps for that member, and `(nil)` where it keeps none, as
+/// C's is when the member is NULL. Where the port has no generic address for
+/// the object (an array's storage, a record's private block) the record's own
+/// address stands in; like C's it is non-zero, fixed for the record's life, and
+/// no two IOCs agree on it.
+///
 /// Everything else is `size` raw bytes as `%02x ` (`:1249-1262`), trailing
 /// space included — C builds `"00 "` and lets the tab packer absorb it.
 ///
@@ -2042,6 +2025,7 @@ fn cmd_dbpr() -> CommandDef {
 fn dbpr_no_access(
     inst: &crate::server::record::RecordInstance,
     d: &crate::server::record::FieldDesc,
+    held: &DbprHeld,
 ) -> Option<String> {
     if d.name == "TIME" {
         // C `epicsTimeToStrftime(time_buf, 40, "%Y-%m-%d %H:%M:%S.%09f", ...)`
@@ -2053,6 +2037,14 @@ fn dbpr_no_access(
                 inst.common.time,
             ),
         );
+    }
+    if usize::from(d.size) == std::mem::size_of::<*const ()>()
+        && d.extra.is_some_and(|e| e.contains('*'))
+    {
+        return Some(match dbpr_private_pointers(inst, d.name, held) {
+            Some(addr) => format!("PTR {addr:#x}"),
+            None => "PTR (nil)".to_string(),
+        });
     }
     let bkpt = inst.common.bkpt.get();
     let bytes: &[u8] = match d.name {
@@ -2066,7 +2058,148 @@ fn dbpr_no_access(
     Some(out)
 }
 
-pub(super) fn dbpr_report(ctx: &CommandContext, name: &str, level: i32) -> bool {
+/// What `dbpr` reads about a record that is not on the record itself: the
+/// registries are asked before the record guard is taken, as the link
+/// locality is, because none of them is a lock this crate holds under one.
+struct DbprHeld {
+    /// C `precord->lset`: the lock set's mutex.
+    lset: Option<usize>,
+    /// C `precord->asp`: set once access security has a policy.
+    asp: Option<usize>,
+    /// C `precord->spvt`: the record is on a scan list.
+    on_scan_list: bool,
+}
+
+impl DbprHeld {
+    async fn of(ctx: &CommandContext, name: &[u8], scan: crate::server::record::ScanType) -> Self {
+        let db = ctx.db();
+        let on_scan_list = scan.scan_list().is_some()
+            && (db.records_for_scan(scan).await.iter().any(|n| **n == *name)
+                || db
+                    .event_lists()
+                    .iter()
+                    .any(|(_, recs)| recs.iter().any(|n| **n == *name)));
+        Self {
+            lset: db
+                .lock_set_of(name)
+                .and_then(|set| set.mutex)
+                .map(|m| m.addr()),
+            asp: ctx
+                .acf()
+                .load_full()
+                .map(|cfg| std::sync::Arc::as_ptr(&cfg) as usize),
+            on_scan_list,
+        }
+    }
+}
+
+/// The address behind one `DBF_NOACCESS` pointer member, `None` for NULL:
+/// C's `PTR %p` (`dbTest.c:1237-1241`). Rows are named for what C stores
+/// there; the C source that sets each is beside it.
+fn dbpr_private_pointers(
+    inst: &crate::server::record::RecordInstance,
+    name: &str,
+    held: &DbprHeld,
+) -> Option<usize> {
+    let rtype = inst.record.record_type();
+    let record_addr = std::ptr::from_ref::<dyn crate::server::record::Record>(&*inst.record)
+        .cast::<u8>() as usize;
+    let field_is = |field: &str, f: &dyn Fn(&EpicsValue) -> bool| {
+        inst.resolve_field(field).is_some_and(|v| f(&v))
+    };
+    let int_of = |v: &EpicsValue| v.to_f64();
+    match (rtype, name) {
+        // `rset`, `rdes`: the record type's own tables, one per type.
+        (_, "RSET") => Some(rtype.as_ptr() as usize),
+        (_, "RDES") => Some(inst.record.field_list().as_ptr() as usize),
+        // `dset`: the devSup row's, NULL for a record type with no
+        // `device()` line or after a refused device-link put; a DTYP only a
+        // runtime-registered support names has no row, and its device object
+        // stands in.
+        (_, "DSET") if inst.common.dtyp.is_detached() => None,
+        (_, "DSET") => match crate::server::record::dev_sup_of(rtype, inst.common.dtyp.as_str()) {
+            Some(row) => Some(std::ptr::from_ref(&row.dset) as usize),
+            None => inst.device.as_ref().map(|dev| {
+                std::ptr::from_ref::<dyn crate::server::device_support::DeviceSupport>(&**dev)
+                    .cast::<u8>() as usize
+            }),
+        },
+        // `dpvt` of a soft dset, which this port runs in the record:
+        // `devAiSoft` writes its own address (`devAiSoft.c:88`), so a set one
+        // is the devSup row's dset, and a SoftCallback dset's devPvt prints
+        // where it lives.
+        (_, "DPVT") if inst.device.is_none() && inst.common.dtyp.soft().is_some() => {
+            let row = crate::server::record::dev_sup_of(rtype, inst.common.dtyp.as_str())?;
+            match &inst.dpvt {
+                // `devEpidSoftCallback` keeps its trigger in `pact`, not `dpvt`.
+                crate::server::device_support::Dpvt::Null
+                | crate::server::device_support::Dpvt::Triggered => None,
+                crate::server::device_support::Dpvt::Read => {
+                    Some(std::ptr::from_ref(&row.dset) as usize)
+                }
+                crate::server::device_support::Dpvt::Callback(pvt) => {
+                    Some(std::ptr::from_ref(&**pvt).cast::<u8>() as usize)
+                }
+            }
+        }
+        (_, "DPVT") if inst.device.as_ref().is_some_and(|dev| dev.holds_dpvt()) => {
+            inst.device.as_ref().map(|dev| {
+                std::ptr::from_ref::<dyn crate::server::device_support::DeviceSupport>(&**dev)
+                    .cast::<u8>() as usize
+            })
+        }
+        (_, "LSET") => held.lset,
+        (_, "ASP") => held.asp,
+        // `spvt`: `scanAdd` allocates the scan element.
+        (_, "SPVT") => held
+            .on_scan_list
+            .then(|| std::ptr::from_ref(&inst.common.scan) as usize),
+        (_, "PPN") => inst
+            .notify
+            .as_ref()
+            .map(|n| std::sync::Arc::as_ptr(n) as *const u8 as usize),
+        (_, "PPNR") => inst.has_notify_restart().then_some(record_addr),
+        (_, "SIMPVT") => inst.simpvt.then_some(record_addr),
+        // The six array records keep their buffer in `bptr`; `val` is never
+        // assigned (`aaiRecord.c`, `compressRecord.c`, ...).
+        ("aai" | "aao" | "compress" | "subArray" | "histogram" | "waveform", "VAL") => None,
+        ("aai" | "aao" | "compress" | "subArray" | "histogram" | "waveform", "BPTR") => {
+            Some(record_addr)
+        }
+        // lsi/lso/printf's `val` and `oval` are allocated at init.
+        (_, "VAL" | "OVAL") => Some(record_addr),
+        // `compressRecord.c:93`: the Average accumulator, allocated at init.
+        ("compress", "SPTR") => field_is("ALG", &|v| int_of(v) == Some(3.0)).then_some(record_addr),
+        // `histogramRecord.c:127`: allocated only for `SDEL > 0`.
+        ("histogram", "WDOG") => {
+            field_is("SDEL", &|v| int_of(v).is_some_and(|n| n > 0.0)).then_some(record_addr)
+        }
+        // `boRecord.c:150`, `calcoutRecord.c:140`: the callback block.
+        ("bo" | "calcout", "RPVT") => Some(record_addr),
+        // `aSubRecord.c:117-123`: `initFields` allocates the input, output and
+        // old-output buffers of every argument whatever its `NOx`.
+        ("aSub", n)
+            if n.len() == 1 || (n.len() == 4 && (n.starts_with("VAL") || n.starts_with("OVL"))) =>
+        {
+            Some(record_addr)
+        }
+        // `aSubRecord.c:151-156`: resolved at init only for `LFLG=IGNORE`.
+        ("aSub", "SADR") => (field_is("LFLG", &|v| int_of(v) == Some(0.0))
+            && !field_is(
+                "SNAM",
+                &|v| matches!(v, EpicsValue::String(s) if s.is_empty()),
+            ))
+        .then(|| {
+            inst.subroutine
+                .as_ref()
+                .map(|s| std::sync::Arc::as_ptr(s) as *const u8 as usize)
+        })
+        .flatten(),
+        _ => inst.record.held_pointer(name),
+    }
+}
+
+pub(super) fn dbpr_report(ctx: &CommandContext, name: &[u8], level: i32) -> bool {
     // C's `nameToAddr` prints this line and the caller then returns
     // without printing anything else (`dbTest.c:449-450`, `:789-791`).
     // `false` is that failure: `dbpr` turns it into its -1, and `dbtr`
@@ -2077,9 +2210,25 @@ pub(super) fn dbpr_report(ctx: &CommandContext, name: &str, level: i32) -> bool 
     // field the address landed on, so `dbpr T:AI.DESC` and `dbpr T:AI`
     // are the same report — but a field the record type does not declare
     // still has to fail the resolution first.
-    let Some(DbAddr { rec, .. }) = name_to_addr(ctx, name) else {
+    let Some(DbAddr {
+        rec, find_field_ok, ..
+    }) = name_to_addr(ctx, name)
+    else {
         return false;
     };
+    // `dbpr_report` re-finds the name with `dbFindRecord` and
+    // `errMessage(status, pname)`s a refusal (`dbTest.c:1172-1176`), which for
+    // anything after the field part — `LSI.VAL$` — is `S_dbLib_recNotFound`.
+    // The file and line are ours, as at `access_commands.rs`'s `errMessage`.
+    if !find_field_ok {
+        crate::runtime::log::errlog_vprintf(format_args!(
+            "Record Not Found filename=\"{}\" line number={}  {}\n",
+            file!(),
+            line!(),
+            String::from_utf8_lossy(name)
+        ));
+        return false;
+    }
 
     // C `dbpr_report` (`dbTest.c:1156-1276`) walks the record
     // type's WHOLE field table — `dbCommon` first, then the
@@ -2090,22 +2239,24 @@ pub(super) fn dbpr_report(ctx: &CommandContext, name: &str, level: i32) -> bool 
     // hand-written per-level whitelist instead, so `interest`
     // was never read and a field C shows at level 0 could be
     // missing at level 2.
-    let (fields, extras): (Vec<(String, String)>, Vec<(String, String)>) = ctx.block_on(async {
-        let rec_name = { rec.read().name.clone() };
+    let (fields, extras): (Vec<(String, Vec<u8>)>, Vec<(String, Vec<u8>)>) = ctx.block_on(async {
+        let (rec_name, scan) = {
+            let inst = rec.read();
+            (inst.name.clone(), inst.common.scan)
+        };
         let aliases = ctx.db().aliases_for_record(&rec_name);
+        let held = DbprHeld::of(ctx, &rec_name, scan).await;
 
         let inst = rec.read();
-        // DELIBERATE NON-MATCH, measured at level 4: C's walk is over
-        // `papFldDes`, so it reaches the fourteen `dbCommon` `DBF_NOACCESS`
-        // internals too and prints `ASP : PTR (nil)`,
-        // `MLIS: ELL 0 [(nil) .. (nil)]`, `MLOK: 50 83 b8 61 03 58 00 00`,
-        // `DSET: PTR 0x7de2e55c3aa0` and the rest (`dbTest.c:1228-1266`).
-        // Every one of those is a C storage fact — a `void *` read at a struct
-        // offset, an `ELLLIST` header, a raw byte dump of an `epicsMutexId` —
-        // and this port carries those rows by NAME only, with no width and no
-        // pointer, so the walk below has nothing to print for them. They are
-        // resolvable and `dba` reports them ([`DbAddr::fld_des`]); what is
-        // absent is a value, not the field.
+        // DELIBERATE NON-MATCH, measured at level 4: C's walk reaches the
+        // `dbCommon` `DBF_NOACCESS` internals whose value is not a pointer —
+        // `MLIS`/`BKLNK` (`ELL 0 [(nil) .. (nil)]`, an `ELLLIST` header) and
+        // `MLOK` (`50 83 b8 61 03 58 00 00`, a raw dump of an `epicsMutexId`)
+        // — and the record-own array members (`RPCL`, `ORPC`). The port keeps
+        // no `ELLLIST` or mutex id behind them and carries them by NAME only,
+        // with no width, so the walk has nothing to print. They are resolvable
+        // and `dba` reports them ([`DbAddr::fld_des`]); what is absent is a
+        // value, not the field. Pointer members are carried and printed.
         let mut descs: Vec<&crate::server::record::FieldDesc> =
             crate::server::record::dbd_generated::DB_COMMON_FIELDS
                 .iter()
@@ -2120,7 +2271,15 @@ pub(super) fn dbpr_report(ctx: &CommandContext, name: &str, level: i32) -> bool 
         // rendered one here, while the record guard is held, and resolve the
         // type below: the locality half of `dbInitLink` reads the database's
         // record map, which nothing in this crate does under a record lock.
-        let rows: Vec<(String, String, Option<(crate::types::DbfLinkClass, String)>)> = descs
+        let rows: Vec<(
+            String,
+            Vec<u8>,
+            Option<(
+                crate::types::DbfLinkClass,
+                crate::types::PvString,
+                LinkShape,
+            )>,
+        )> = descs
             .iter()
             .filter(|d| i32::from(d.interest) <= level)
             .filter_map(|d| {
@@ -2130,15 +2289,23 @@ pub(super) fn dbpr_report(ctx: &CommandContext, name: &str, level: i32) -> bool 
                 // `dbf_type` — a "served as" answer these rows do not have —
                 // out of the walk: the declaration alone renders them.
                 if d.no_access() {
-                    return dbpr_no_access(&inst, d).map(|t| (d.name.to_string(), t, None));
+                    return dbpr_no_access(&inst, d, &held)
+                        .map(|t| (d.name.to_string(), t.into_bytes(), None));
                 }
                 let value = inst.resolve_field(d.name)?;
                 let link = crate::types::link_class_of(d).map(|class| {
                     let raw = match inst.resolve_field_stored(d.name) {
-                        Some(EpicsValue::String(s)) => s.as_str_lossy().into_owned(),
-                        _ => String::new(),
+                        Some(EpicsValue::String(s)) => s,
+                        _ => crate::types::PvString::new(),
                     };
-                    (class, raw)
+                    let shape = if inst.link_unadded(d.name) {
+                        LinkShape::Unadded
+                    } else if d.name == "INP" && inst.inp_is_pn_link() {
+                        LinkShape::Pn
+                    } else {
+                        LinkShape::Added
+                    };
+                    (class, raw, shape)
                 });
                 Some((d.name.to_string(), db_get_string(&inst, d, &value), link))
             })
@@ -2152,14 +2319,15 @@ pub(super) fn dbpr_report(ctx: &CommandContext, name: &str, level: i32) -> bool 
         // `Q:group`) has to be checkable from the shell.
         let mut extras = Vec::new();
         if !aliases.is_empty() {
-            extras.push(("ALIASES".to_string(), aliases.join(", ")));
+            let names: Vec<&[u8]> = aliases.iter().map(|a| &a[..]).collect();
+            extras.push(("ALIASES".to_string(), names.join(&b", "[..])));
         }
         if level >= 2 {
-            let mut info_keys: Vec<&String> = inst.info.keys().collect();
+            let mut info_keys: Vec<&String> = inst.info().keys().collect();
             info_keys.sort();
             for key in info_keys {
-                let val = inst.info.get(key).cloned().unwrap_or_default();
-                extras.push((format!("info({key})"), val));
+                let val = inst.info().get(key).cloned().unwrap_or_default();
+                extras.push((format!("info({key})"), val.into_bytes()));
             }
         }
         drop(inst);
@@ -2169,7 +2337,18 @@ pub(super) fn dbpr_report(ctx: &CommandContext, name: &str, level: i32) -> bool 
             .into_iter()
             .map(|(name, text, link)| match link {
                 None => (name, text),
-                Some((class, raw)) => {
+                // C's `PN_LINK` is set by `add_record`, so it is never seen
+                // before `iocInit`.
+                Some((_, _, LinkShape::Pn)) if running => {
+                    (name, [&b"PN_LINK "[..], &text].concat())
+                }
+                Some((class, raw, LinkShape::Unadded)) => {
+                    let ftype = crate::server::record::LinkFieldType::for_class(class);
+                    let parsed = crate::server::record::parse_link_field(raw.as_bytes(), ftype);
+                    let link_type = parsed.db_link_type().c_name();
+                    (name, [link_type.as_bytes(), b" ", &text].concat())
+                }
+                Some((class, raw, _)) => {
                     let text = render_dbpr_link(ctx, class, &raw, &text, running);
                     (name, text)
                 }
@@ -2182,13 +2361,13 @@ pub(super) fn dbpr_report(ctx: &CommandContext, name: &str, level: i32) -> bool 
     // `dbpr_msgOut` at tab stop 20 (`dbTest.c:442`).
     let mut buf = TabBuffer::new(20);
     for (name, value) in &fields {
-        buf.insert(&format!("{name:<4}: {value}"));
+        buf.insert(&[format!("{name:<4}: ").as_bytes(), value].concat());
     }
     for line in buf.finish() {
-        ctx.println(&line);
+        ctx.println_bytes(&line);
     }
     for (name, value) in &extras {
-        ctx.println(&format!("{name:<4}: {value}"));
+        ctx.println_bytes(&[format!("{name:<4}: ").as_bytes(), value].concat());
     }
     true
 }
@@ -2241,7 +2420,7 @@ const DBTGF_REQUEST_TYPES: [(&str, crate::types::DbFieldType); 12] = {
 ///
 /// [`EnumStringForm`]: crate::server::snapshot::EnumStringForm
 fn dbr_string_row(snap: &crate::server::snapshot::Snapshot, precision: i16) -> Option<Vec<String>> {
-    use crate::calc::engine::cvt::cvt_double_to_string;
+    use crate::types::cvt_double_to_string;
 
     let prec = precision.max(0) as u16;
     let text = |v: f64| cvt_double_to_string(v, prec);
@@ -2270,7 +2449,7 @@ fn dbtgf_string_elements(
     Some(
         dbr_string_row(snap, precision)?
             .into_iter()
-            .map(|t| format!("\"{}\"", escape_char_array_for_dbgf(t.as_bytes())))
+            .map(|t| dbr_string_element(t.as_bytes()))
             .collect(),
     )
 }
@@ -2335,8 +2514,6 @@ fn dbtgf_option_lines(
     field_type: DbfCode,
     snap: Option<&crate::server::snapshot::Snapshot>,
 ) -> Vec<String> {
-    use crate::calc::engine::cvt::fmt_g;
-
     // Every limit reaches C's block as a plain `double` field of the record,
     // which is 0.0 until something sets it. This port's `Snapshot` encodes
     // "the record states no limit" as NaN, and that encoding has no C
@@ -2350,7 +2527,7 @@ fn dbtgf_option_lines(
     // is why the long lines were already right and only the double lines were
     // not.
     let finite = |v: f64| if v.is_finite() { v } else { 0.0 };
-    let g = move |v: f64| fmt_g(finite(v), 6, false, false);
+    let g = move |v: f64| CFloat(finite(v)).g();
     let l = move |v: f64| -> i32 { finite(v) as i32 };
 
     let mut out = Vec::new();
@@ -2379,10 +2556,7 @@ fn dbtgf_option_lines(
         // `get_graphic_double` fills HOPR/LOPR only for `VAL`.
         out.push("units = \"\"".to_string());
         out.push("precision not returned".to_string());
-        out.push(format!(
-            "time = {}",
-            dbtgf_time_text(crate::types::WallTime::from(inst.common.time))
-        ));
+        out.push(format!("time = {}", dbtgf_time_text(inst.common.time)));
         out.push("enum strings not returned".to_string());
         for name in ["gr", "ctrl"] {
             out.push(format!("{name}Long: 0 .. 0"));
@@ -2529,6 +2703,10 @@ fn cmd_dbtgf() -> CommandDef {
             if !dbt_requires_ioc_init(ctx, "dbtgf") {
                 return Ok(CommandOutcome::Failed);
             }
+            if let Some(view) = addr.char_view.then(|| addr.char_view()).flatten() {
+                dbtgf_char_view(ctx, &addr, &view);
+                return Ok(CommandOutcome::Continue);
+            }
             // C prints `addr.dbr_field_type` here with NO `DBR_STRING`
             // substitution — that is `dbgf`'s alone — so a menu field's
             // native line reads `DBF_ENUM`. The option block below is decided
@@ -2555,8 +2733,26 @@ fn cmd_dbtgf() -> CommandDef {
             for line in printbuffer_lines(native.name(), 0, Some(&native_body)) {
                 ctx.println(&line);
             }
-            // C `long precision = 6` before it asks the record
-            // (`dbConvert.c:778-784`).
+            // A link or an attribute is read as text, `no_elements` 1.
+            let text_read = match &addr.fld_des {
+                FldDes::Attribute(text) => Some((char_view::TextRoute::Attribute, text.as_bytes())),
+                FldDes::Declared(_) | FldDes::NameOnly => snap.as_ref().and_then(|snap| {
+                    let route = char_view::read_route(&inst, &addr.field)?.text_route()?;
+                    Some((route, char_view::text_of(&snap.value)))
+                }),
+            };
+            if let Some((route, text)) = text_read {
+                for (dbr, target) in DBTGF_REQUEST_TYPES {
+                    let lines = match route.read(target) {
+                        Some(read) => printbuffer_block(dbr, target.dbf_code(), &read.get(text, 1)),
+                        None => printbuffer_lines(dbr, 1, None),
+                    };
+                    for line in lines {
+                        ctx.println(&line);
+                    }
+                }
+                return Ok(CommandOutcome::Continue);
+            }
             let Some(snap) = snap else {
                 // Nothing to convert FROM: C's twelve `dbGetField` calls all
                 // land in `dbGet`'s validity gate and `printBuffer` prints the
@@ -2568,14 +2764,26 @@ fn cmd_dbtgf() -> CommandDef {
                 }
                 return Ok(CommandOutcome::Continue);
             };
+            // C `long precision = 6` before it asks the record
+            // (`dbConvert.c:778-784`).
             let precision = snap.precision().unwrap_or(6);
             for (dbr, target) in DBTGF_REQUEST_TYPES {
                 let float_string = (target == crate::types::DbFieldType::String)
                     .then(|| dbtgf_string_elements(&snap, precision))
                     .flatten();
-                let lines = match float_string {
-                    Some(elements) => printbuffer_lines(dbr, elements.len(), Some(&elements)),
-                    None => match snap.value.get_convert(target) {
+                let st_e = (target == crate::types::DbFieldType::Enum)
+                    .then(|| crate::server::record::cvt_st_e_input(&snap.value))
+                    .flatten();
+                let lines = match (float_string, st_e) {
+                    (Some(elements), _) => printbuffer_lines(dbr, elements.len(), Some(&elements)),
+                    (None, Some(s)) => match crate::server::record::cvt_st_e(&*inst.record, s) {
+                        Ok(i) => printbuffer_block(dbr, target.dbf_code(), &EpicsValue::Enum(i)),
+                        Err(report) => {
+                            report.emit(&inst.name.to_str_lossy(), &addr.field);
+                            printbuffer_lines(dbr, 1, None)
+                        }
+                    },
+                    (None, None) => match snap.value.get_convert(target) {
                         Ok(v) => printbuffer_block(dbr, target.dbf_code(), &v),
                         Err(_) => printbuffer_lines(dbr, 1, None),
                     },
@@ -2588,6 +2796,38 @@ fn cmd_dbtgf() -> CommandDef {
         },
     )
 }
+
+/// `dbtgf` on a `$` address: the option block for `DBF_CHAR` (or the link's
+/// type), the empty native `DBR_CHAR` read, then each request type with
+/// `MIN(no_elements, sizeof(long[400]) / element size)` elements
+/// (`dbTest.c:527-591`).
+fn dbtgf_char_view(ctx: &CommandContext, addr: &DbAddr, view: &CharView) {
+    {
+        let inst = addr.rec.read();
+        let snap = inst.snapshot_for_field(&addr.field);
+        for line in dbtgf_option_lines(&inst, view.field_type, snap.as_ref()) {
+            ctx.println(&line);
+        }
+    }
+    for line in printbuffer_lines(DbfCode::Char.name(), 0, Some(&[])) {
+        ctx.println(&line);
+    }
+    for (dbr, target) in DBTGF_REQUEST_TYPES {
+        let n_req = view
+            .no_elements
+            .min(DBTGF_BUFFER_BYTES / target.element_size());
+        let lines = match view.get(target, n_req) {
+            Some(v) => printbuffer_block(dbr, target.dbf_code(), &v),
+            None => printbuffer_lines(dbr, n_req, None),
+        };
+        for line in lines {
+            ctx.println(&line);
+        }
+    }
+}
+
+/// `sizeof(long[400])`, `dbtgf`'s read buffer (`dbTest.c:503`).
+const DBTGF_BUFFER_BYTES: usize = 3200;
 
 /// `dbtpf "pv name", "value"` — Database Test Put Field.
 ///
@@ -2617,13 +2857,13 @@ fn cmd_dbtpf() -> CommandDef {
                     return Ok(CommandOutcome::Failed);
                 }
             };
-            let (base, _) = parse_pv_name(name);
-            let Some(DbAddr { field, .. }) = name_to_addr(ctx, name) else {
+            let Some(addr) = name_to_addr(ctx, name) else {
                 return Ok(CommandOutcome::Failed);
             };
             if !dbt_requires_ioc_init(ctx, "dbtpf") {
                 return Ok(CommandOutcome::Failed);
             }
+            let (base, field) = (addr.record.as_slice(), addr.field.as_str());
 
             for (dbr, target) in DBTGF_REQUEST_TYPES {
                 // C parses the text ITSELF before the put, with
@@ -2637,28 +2877,56 @@ fn cmd_dbtpf() -> CommandDef {
                 // straight through — and `DBR_ENUM` is `epicsParseUInt16`.
                 let parsed = match target {
                     crate::types::DbFieldType::String => {
-                        Some(EpicsValue::String(value_str.as_str().into()))
+                        Some(EpicsValue::String(value_str.as_bytes().into()))
                     }
                     crate::types::DbFieldType::Enum => {
                         match crate::types::c_parse::parse_base10_units_null(
                             crate::types::c_parse::NumericField::UShort,
-                            value_str,
+                            &value_str.to_str_lossy(),
                         ) {
                             Some(EpicsValue::UShort(v)) => Some(EpicsValue::Enum(v)),
                             _ => None,
                         }
                     }
                     t => crate::types::c_parse::NumericField::of(t).and_then(|nf| {
-                        crate::types::c_parse::parse_base10_units_null(nf, value_str)
+                        crate::types::c_parse::parse_base10_units_null(
+                            nf,
+                            &value_str.to_str_lossy(),
+                        )
                     }),
                 };
                 let Some(value) = parsed else {
                     ctx.println(&format!("Cvt to DBR_{dbr} failed."));
                     continue;
                 };
+                if addr.char_view {
+                    if !char_view_put(ctx, &addr, value) {
+                        ctx.println(&format!("Put as DBR_{dbr:<6} Failed."));
+                        continue;
+                    }
+                    // `MIN(no_elements, sizeof(buffer) / field_size)` of
+                    // `DBR_CHAR` (`dbTest.c:690-696`).
+                    let lines = addr
+                        .char_view()
+                        .and_then(|v| {
+                            v.get(
+                                crate::types::DbFieldType::Char,
+                                v.no_elements.min(DBGF_BUFFER_BYTES),
+                            )
+                        })
+                        .map(|v| printbuffer_block("CHAR", DbfCode::Char, &v))
+                        .unwrap_or_default();
+                    let mut lines = lines.into_iter();
+                    let head = lines.next().unwrap_or_default();
+                    ctx.println(&format!("Put as DBR_{dbr:<6} Ok, result as {head}"));
+                    for line in lines {
+                        ctx.println(&line);
+                    }
+                    continue;
+                }
                 let put: CaResult<()> = ctx.block_on(
                     ctx.db()
-                        .put_record_field_from_ca_no_notify(base, &field, value),
+                        .put_record_field_from_ca_no_notify(base, field, value),
                 );
                 if put.is_err() {
                     ctx.println(&format!("Put as DBR_{dbr:<6} Failed."));
@@ -2667,19 +2935,25 @@ fn cmd_dbtpf() -> CommandDef {
                 // C re-reads in the record's NATIVE type and prints it
                 // through the same tab buffer, whose column count
                 // restarts after the un-tabbed prefix (`dbTest.c:690-696`).
-                let readback = ctx.db().get_record(base).and_then(|r| {
-                    let inst = r.read();
-                    let snap = inst.snapshot_for_field(&field)?;
-                    let dbr = inst.field_desc(&field).map_or(DbfCode::String, |fd| {
-                        field_addr_types(fd, Some(&snap.value)).1
-                    });
-                    Some((snap, dbr))
-                });
+                let readback = {
+                    let inst = addr.rec.read();
+                    inst.snapshot_for_field(field).map(|snap| {
+                        let dbr = inst.field_desc(field).map_or(DbfCode::String, |fd| {
+                            field_addr_types(fd, Some(&snap.value)).1
+                        });
+                        let value = if dbr == DbfCode::String {
+                            long_string_value(&inst, &snap.value)
+                        } else {
+                            snap.value.clone()
+                        };
+                        (value, dbr)
+                    })
+                };
                 let lines = match &readback {
                     // C re-reads with `addr.dbr_field_type` and does NOT
                     // substitute `DBR_STRING` for an enum field the way `dbgf`
                     // does, so a `bo` read-back is `DBF_ENUM: 1`.
-                    Some((snap, dbr)) => native_readback_lines(*dbr, &snap.value),
+                    Some((value, dbr)) => native_readback_lines(*dbr, value),
                     None => Vec::new(),
                 };
                 let mut lines = lines.into_iter();
@@ -2815,8 +3089,7 @@ fn ca_dump_texts(value: &EpicsValue) -> Vec<String> {
 /// site.
 fn ca_dump_f(x: f64, width: usize, decimals: usize) -> String {
     let narrowed = crate::types::c_cast::f64_to_f32(x) as f64;
-    let text = crate::calc::engine::cvt::fmt_f(narrowed, decimals);
-    format!("{text:>width$}")
+    format!("{:>width$.decimals$}", CFloat(narrowed))
 }
 
 /// One graphic/alarm/control limit of an integral `DBR_GR_*`/`DBR_CTRL_*`,
@@ -3121,7 +3394,7 @@ fn ca_request_family(dbr: u16) -> Option<crate::types::DbFieldType> {
 struct CaChannel {
     /// C `dbChannelRecord(chan)->name` — the RECORD's own name, so an alias
     /// prints the record it resolves to.
-    record_name: String,
+    record_name: RecordName,
     /// C `dbGetRecordTypeName`, the answer `DBR_CLASS_NAME` carries.
     record_type: String,
     /// The channel's field, already defaulted to `VAL` and upper-cased —
@@ -3157,7 +3430,7 @@ impl CaChannel {
     /// every reply carries (`dbAccess.c:352-365`), so `DBR_STSACK_STRING` sees
     /// them. The port's `Snapshot` leaves them `None` on the GET path, so they
     /// are filled from the record here rather than defaulted to zero.
-    fn create(ctx: &CommandContext, pname: &str) -> Option<Self> {
+    fn create(ctx: &CommandContext, pname: &[u8]) -> Option<Self> {
         let (base, field) = parse_pv_name(pname);
         let field = if field.is_empty() {
             "VAL".to_string()
@@ -3190,7 +3463,10 @@ impl CaChannel {
                 .field_native_count(&field)
                 .or_else(|| inst.record.get_field(&field).map(|v| v.count()))
                 .unwrap_or(1),
-            field_size: c_field_size(snap.value.db_field_type().dbf_code(), fd.size),
+            field_size: {
+                let served = snap.value.db_field_type().dbf_code();
+                c_field_size(served, served_element_size(&*inst.record, fd, served))
+            },
             string_precision: snap.precision().unwrap_or(6),
             address: Arc::as_ptr(&rec) as *const () as usize,
             snap,
@@ -3264,8 +3540,8 @@ impl CaChannel {
     /// The channel addressed as a PV name, always `record.FIELD` — the form
     /// the put and re-read below hand back to the database. Built from the
     /// RECORD's own name, so an alias and its target share one channel.
-    fn pv_name(&self) -> String {
-        format!("{}.{}", self.record_name, self.field)
+    fn pv_name(&self) -> Vec<u8> {
+        [self.record_name.as_bytes(), b".", self.field.as_bytes()].concat()
     }
 
     /// C `dbChannel_put(chan, ..., 1)` (`dbChannel.h:295`), which is `dbPut`:
@@ -3371,8 +3647,8 @@ fn cmd_gft() -> CommandDef {
 /// narrowing table, so `%hd` really wraps into a `short` here. Its one output
 /// object is a `f64`, so a `%ld` result above 2^53 loses C's low bits before
 /// the caller truncates it to `dbr_long_t`.
-fn c_scan_int(s: &str, fmt: &[u8]) -> Option<i64> {
-    match crate::calc::engine::scanf::sscanf(s.as_bytes(), fmt) {
+fn c_scan_int(s: &[u8], fmt: &[u8]) -> Option<i64> {
+    match crate::calc::engine::scanf::sscanf(s, fmt) {
         Ok(crate::calc::engine::value::StackValue::Double(v)) => Some(v as i64),
         _ => None,
     }
@@ -3489,7 +3765,7 @@ fn cmd_pft() -> CommandDef {
                 &mut out,
                 &mut chan,
                 DBR_STRING,
-                EpicsValue::String(value.as_str().into()),
+                EpicsValue::String(value.as_bytes().into()),
                 "\n\t failed ",
                 // The one rung whose GET failure has no leading space and no
                 // type name (`db_test.c:124`).
@@ -3528,10 +3804,11 @@ fn cmd_pft() -> CommandDef {
             }
             // `epicsScanFloat` — STRICT, so a trailing tail refuses the rung
             // where the two `sscanf` rungs above accepted it.
-            let scanned_float = match parse_base10_units_null(NumericField::Float, value) {
-                Some(EpicsValue::Float(f)) => Some(f),
-                _ => None,
-            };
+            let scanned_float =
+                match parse_base10_units_null(NumericField::Float, &value.to_str_lossy()) {
+                    Some(EpicsValue::Float(f)) => Some(f),
+                    _ => None,
+                };
             if let Some(f) = scanned_float {
                 rung(
                     &mut out,
@@ -3604,10 +3881,10 @@ fn cmd_dbtr() -> CommandDef {
                     return Ok(CommandOutcome::Failed);
                 }
             };
-            let (base, _) = parse_pv_name(name);
-            let Some(DbAddr { rec, .. }) = name_to_addr(ctx, name) else {
+            let Some(DbAddr { rec, record, .. }) = name_to_addr(ctx, name) else {
                 return Ok(CommandOutcome::Failed);
             };
+            let base = record.as_slice();
             if !dbt_requires_ioc_init(ctx, "dbtr") {
                 return Ok(CommandOutcome::Failed);
             }
@@ -3621,12 +3898,12 @@ fn cmd_dbtr() -> CommandDef {
             if let Err(e) = processed {
                 // C `recGblRecordError(status, precord, "dbtr(dbProcess)")`
                 // (`dbTest.c:491-492`) renders the numeric status through
-                // `errSymLookup`; the port's process path reports a
-                // `CaError` and has no status number to look up, so the
-                // error's own text takes that slot.
+                // `errSymLookup`, which is a `ProcessStatus`'s text; any
+                // other `CaError` has no status, so its own text takes
+                // that slot.
                 crate::server::recgbl::rec_gbl_record_error(
                     &e.to_string(),
-                    base,
+                    &String::from_utf8_lossy(base),
                     "dbtr(dbProcess)",
                 );
             }
@@ -3634,106 +3911,6 @@ fn cmd_dbtr() -> CommandDef {
             Ok(CommandOutcome::Continue)
         },
     )
-}
-
-/// The `dtype` word C's `lnkConst` gives a JSON value, decided the way
-/// yajl decides which jlif callback to run: an integer token reaches
-/// `lnkConst_integer` (`si64`/`ai64`), a real reaches `lnkConst_double`
-/// (`sf64`/`af64`), a quoted token reaches `lnkConst_string`
-/// (`sc40`/`ac40`) — `lnkConst.c:143-232`. Everything else is C's
-/// `type_names[0]`, `"bug"`.
-fn const_value_dtype(token: &str) -> &'static str {
-    let t = token.trim();
-    if t.starts_with('"') || t.starts_with('\'') {
-        "string"
-    } else if t.starts_with('-')
-        || t.starts_with('+')
-        || t.starts_with(|c: char| c.is_ascii_digit())
-    {
-        if t.contains(['.', 'e', 'E']) {
-            "double"
-        } else {
-            "integer"
-        }
-    } else {
-        "bug"
-    }
-}
-
-/// One `{const: …}` value rendered as C's `lnkConst_report` renders it
-/// (`lnkConst.c:286-347`), at `indent` spaces.
-///
-/// The scalar arms print `'const': <dtype> <value>`, an integer with
-/// `%lld`, a double with `%g` and a string requoted; the array arms
-/// print `'const': array of <n> <dtype>s` and, only from level 2, the
-/// bracketed element list at `indent + 2`.
-fn const_link_report_lines(value: &str, level: i32, indent: usize) -> Vec<String> {
-    use crate::calc::engine::cvt::fmt_g;
-
-    let pad = " ".repeat(indent);
-    let render = |token: &str| -> String {
-        let t = token.trim();
-        match const_value_dtype(t) {
-            // `%g`, not the verbatim token: C reports the parsed double.
-            "double" => t
-                .parse::<f64>()
-                .map(|v| fmt_g(v, 6, false, false))
-                .unwrap_or_else(|_| t.to_string()),
-            // Requoted, because C prints `"%s"` around the decoded string.
-            "string" => format!("\"{}\"", t.trim_matches(['"', '\''])),
-            _ => t.to_string(),
-        }
-    };
-
-    let v = value.trim();
-    let Some(inner) = v.strip_prefix('[').and_then(|r| r.strip_suffix(']')) else {
-        let dtype = const_value_dtype(v);
-        if dtype == "bug" {
-            // C's `default:` arm — it prints the numeric type tag it could
-            // not name. The port has no such tag, so the token stands in.
-            return vec![format!("{pad}'const': bug -- {v}")];
-        }
-        return vec![format!("{pad}'const': {dtype} {}", render(v))];
-    };
-    let elements: Vec<&str> = inner
-        .split(',')
-        .map(str::trim)
-        .filter(|e| !e.is_empty())
-        .collect();
-    let dtype = elements.first().map_or("bug", |e| const_value_dtype(e));
-    let plural = if elements.len() > 1 { "s" } else { "" };
-    let head = format!("{pad}'const': array of {} {dtype}{plural}", elements.len());
-    if level < 2 {
-        return vec![head];
-    }
-    let body: Vec<String> = elements.iter().map(|e| render(e)).collect();
-    vec![
-        head,
-        format!("{}[{}]", " ".repeat(indent + 2), body.join(", ")),
-    ]
-}
-
-/// One JSON link field's report — C `dbJLinkReport` (`dbJLink.c:468-471`),
-/// which calls the link type's own `report` **only when its jlif has
-/// one** and otherwise prints nothing under the `Link field` header.
-///
-/// `const` is the one type this port reports. C also reports `calc`
-/// (`lnkCalc_report`, `lnkCalc.c:412-460`) and pvxs reports `pva`
-/// (`pva_report`, `pvxs/ioc/pvalink_jlif.cpp:228-283`), and both print LIVE link
-/// state — `calc`'s current value, precision, units, alarm and per-input
-/// arguments; `pva`'s open channel and its in-flight put. The port's
-/// `ParsedLink::Calc` / `PvaJsonLink` are parse results with no handle on
-/// the evaluated or opened link, so those two report as a jlif with no
-/// `report` member does: header only. `ca` is a port-only link type with
-/// no C jlif to match at all.
-fn jlink_report_lines(raw: &str, level: i32, indent: usize) -> Vec<String> {
-    let Ok(normalized) = crate::json5::relaxed_to_strict(raw.trim()) else {
-        return Vec::new();
-    };
-    match crate::server::record::json_const_value(&normalized) {
-        Some(value) => const_link_report_lines(value, level, indent),
-        None => Vec::new(),
-    }
 }
 
 /// `dbior [driver name] [interest level]` — Driver Report.
@@ -3790,22 +3967,20 @@ fn cmd_dbior() -> CommandDef {
             };
 
             for (name, drvet) in crate::server::driver_support::driver_supports() {
-                if wanted.as_ref().is_some_and(|want| *want != name) {
+                if wanted
+                    .as_ref()
+                    .is_some_and(|want| want.as_bytes() != name.as_bytes())
+                {
                     continue;
                 }
                 match drvet.report(level) {
                     // C `pdrvet->report == NULL` (`dbTest.c:738-739`).
                     None => ctx.println(&format!("Driver: {name} No report available")),
-                    Some(text) => {
+                    // C's header is a separate `printf` from whatever
+                    // `report()` writes, which goes out byte for byte.
+                    Some(bytes) => {
                         ctx.println(&format!("Driver: {name}"));
-                        // C's header is a separate `printf` from whatever
-                        // `report()` writes, so a report that printed nothing
-                        // leaves the header alone on its line.
-                        if !text.is_empty() {
-                            for line in text.trim_end_matches('\n').split('\n') {
-                                ctx.println(line);
-                            }
-                        }
+                        ctx.print_bytes(&bytes);
                     }
                 }
             }
@@ -3852,28 +4027,43 @@ fn cmd_dbjlr() -> CommandDef {
                 _ => 0,
             };
             match &target {
-                Some(name) => ctx.println(&format!("JSON links in record '{name}'")),
-                None => ctx.println("JSON links in all records"),
+                Some(name) => ctx.console_println(&format!("JSON links in record '{name}'")),
+                None => ctx.console_println("JSON links in all records"),
             }
-            ctx.println("");
+            ctx.console_println("");
 
             for name in record_names_type_major(ctx) {
-                if target.as_ref().is_some_and(|want| *want != name) {
+                if target
+                    .as_ref()
+                    .is_some_and(|want| want.as_bytes() != &*name)
+                {
                     continue;
                 }
                 let Some(rec) = ctx.db().get_record(&name) else {
                     continue;
                 };
                 let record_type = rec.read().record.record_type();
-                ctx.println(&format!("  {record_type} record '{name}':"));
-                for (field, raw, _) in ctx.db().record_link_fields(&name) {
-                    let text = raw.trim();
+                ctx.console_println(&format!("  {record_type} record '{name}':"));
+                for (field, raw, parsed) in ctx.db().record_link_fields(&name) {
+                    // A JSON link is UTF-8 or yajl never built it.
+                    let Ok(text) = std::str::from_utf8(raw.as_bytes()) else {
+                        continue;
+                    };
+                    let text = text.trim();
                     if !(text.starts_with('{') && text.ends_with('}')) {
                         continue;
                     }
-                    ctx.println(&format!("    Link field '{field}':"));
-                    for line in jlink_report_lines(text, level, 6) {
-                        ctx.println(&line);
+                    ctx.console_println(&format!("    Link field '{field}':"));
+                    let live = rec.read().live_link(&field);
+                    let link = live.as_deref().unwrap_or(&parsed);
+                    let class = crate::types::dbf_link_class(record_type, &field);
+                    for line in link.jlink_report(ctx.db(), class, level, 6) {
+                        match line {
+                            crate::server::record::ReportLine::Console(text) => {
+                                ctx.console_println(&text)
+                            }
+                            crate::server::record::ReportLine::Stdout(text) => ctx.println(&text),
+                        }
                     }
                 }
                 if target.is_some() {
@@ -4013,7 +4203,7 @@ fn cmd_dbel() -> CommandDef {
                 _ => 0,
             };
 
-            let record = name.split('.').next().unwrap_or(name);
+            let record = name.split(|&b| b == b'.').next().unwrap_or(name);
             let Some(rec) = ctx.db().get_record(record) else {
                 // C `errMessage(status, " dbNameToAddr failed")`
                 // (`dbEvent.c:164`), which `errlog.c:503-508` renders on the
@@ -4024,7 +4214,7 @@ fn cmd_dbel() -> CommandDef {
                 // `" %s\n"` meeting the leading space C put in the literal.
                 // The file and line are ours, for the reason
                 // `access_commands.rs` gives at its own `errMessage` site.
-                crate::runtime::log::errlog_printf(&format!(
+                crate::runtime::log::errlog_vprintf(format_args!(
                     "Record Not Found filename=\"{}\" line number={}   dbNameToAddr failed\n",
                     file!(),
                     line!()
@@ -4033,23 +4223,23 @@ fn cmd_dbel() -> CommandDef {
             };
 
             let inst = rec.read();
-            let mut subs: Vec<(&String, &crate::server::pv::Subscriber)> = inst
-                .subscribers
+            let mut subs: Vec<(&str, &crate::server::pv::Subscriber)> = inst
+                .field_subscribers()
                 .iter()
-                .flat_map(|(field, bucket)| bucket.iter().map(move |sub| (field, sub)))
+                .map(|entry| (entry.field(), entry.sub()))
                 .collect();
             subs.sort_by_key(|(_, sub)| sub.sid);
 
             if subs.is_empty() {
                 // C `dbEvent.c:173` prints the name AS GIVEN, not the record
                 // it resolved to.
-                ctx.println(&format!(
+                ctx.console_println(&format!(
                     "\"{name}\": No PV event subscriptions ( monitors )."
                 ));
                 return Ok(CommandOutcome::Continue);
             }
 
-            ctx.println(&format!(
+            ctx.console_println(&format!(
                 "{} PV Event Subscriptions ( monitors ).",
                 subs.len()
             ));
@@ -4057,7 +4247,7 @@ fn cmd_dbel() -> CommandDef {
                 for (field, sub) in subs {
                     let report = sub.sink.report();
                     for line in dbel_subscription_lines(field, sub.mask, level, &report) {
-                        ctx.println(&line);
+                        ctx.console_println(&line);
                     }
                 }
             }
@@ -4097,10 +4287,11 @@ fn cmd_dbel() -> CommandDef {
 /// [`PvDatabase::process_record_with_notify`]: crate::server::database::PvDatabase::process_record_with_notify
 async fn dbtpn_lines(
     db: &std::sync::Arc<crate::server::database::PvDatabase>,
-    name: &str,
-    value: Option<String>,
+    name: &[u8],
+    value: Option<IocshString>,
 ) -> Vec<String> {
     let (base, field) = parse_pv_name(name);
+    let shown = String::from_utf8_lossy(base);
     let field = field.to_ascii_uppercase();
     let mut lines = Vec::new();
 
@@ -4115,7 +4306,7 @@ async fn dbtpn_lines(
             Err(_) => false,
         };
         if !ok {
-            lines.push(format!("{base} dbtpnCallback processNotify.status 2"));
+            lines.push(format!("{shown} dbtpnCallback processNotify.status 2"));
             return lines;
         }
         // C `getCallback` -> `dbChannelGet(ppn->chan, DBR_STRING, ...)`
@@ -4130,17 +4321,17 @@ async fn dbtpn_lines(
             Some(text) => lines.push(format!("dbtpn:getCallback value {text}")),
             None => {
                 lines.push("dbtpn:getCallback error".to_string());
-                lines.push(format!("{base} dbtpnCallback processNotify.status 2"));
+                lines.push(format!("{shown} dbtpnCallback processNotify.status 2"));
                 return lines;
             }
         }
-        lines.push(format!("dbtpnCallback: success record={base}"));
+        lines.push(format!("dbtpnCallback: success record={shown}"));
         return lines;
     };
 
     // C `putProcessRequest` (`dbNotify.c:607`).
     let put = db
-        .put_record_field_from_ca(base, &field, EpicsValue::String(text.as_str().into()))
+        .put_record_field_from_ca(base, &field, EpicsValue::String(text.as_bytes().into()))
         .await;
     match put {
         Ok(completion) => {
@@ -4149,12 +4340,12 @@ async fn dbtpn_lines(
                 None => true,
             };
             if settled {
-                lines.push(format!("dbtpnCallback: success record={base}"));
+                lines.push(format!("dbtpnCallback: success record={shown}"));
             } else {
-                lines.push(format!("{base} dbtpnCallback processNotify.status 2"));
+                lines.push(format!("{shown} dbtpnCallback processNotify.status 2"));
             }
         }
-        Err(_) => lines.push(format!("{base} dbtpnCallback processNotify.status 2")),
+        Err(_) => lines.push(format!("{shown} dbtpnCallback processNotify.status 2")),
     }
     lines
 }
@@ -4162,7 +4353,7 @@ async fn dbtpn_lines(
 /// One value as C `dbChannelGet(.., DBR_STRING, ..)` renders it — the
 /// unquoted form of what `dbtgf`'s `DBF_STRING` row prints.
 fn dbr_string_text(value: &EpicsValue, precision: i16) -> String {
-    use crate::calc::engine::cvt::cvt_double_to_string;
+    use crate::types::cvt_double_to_string;
 
     match value {
         EpicsValue::Double(v) => cvt_double_to_string(*v, precision.max(0) as u16),
@@ -4211,7 +4402,7 @@ fn cmd_dbtpn() -> CommandDef {
             // `dbtpn ""` is a non-NULL empty name and falls through to
             // `dbChannelCreate`, which refuses it.
             let ArgValue::String(name) = &args[0] else {
-                ctx.println("Usage: dbtpn \"name\", \"value\"");
+                ctx.console_println("Usage: dbtpn \"name\", \"value\"");
                 return Ok(CommandOutcome::Failed);
             };
             // C `dbChannelCreate` (`dbNotify.c:600-604`) resolves record AND
@@ -4223,7 +4414,7 @@ fn cmd_dbtpn() -> CommandDef {
                     .is_some()
             });
             if !known {
-                ctx.println("dbtpn: No such channel");
+                ctx.console_println("dbtpn: No such channel");
                 return Ok(CommandOutcome::Failed);
             }
 
@@ -4251,13 +4442,14 @@ fn cmd_dbtpn() -> CommandDef {
 /// this reuses the same string put the `dbtpn` arm takes.
 async fn tpn_lines(
     db: &std::sync::Arc<crate::server::database::PvDatabase>,
-    name: &str,
-    value: String,
+    name: &[u8],
+    value: IocshString,
 ) -> Vec<String> {
     let (base, field) = parse_pv_name(name);
+    let shown = String::from_utf8_lossy(base);
     let field = field.to_ascii_uppercase();
     let put = db
-        .put_record_field_from_ca(base, &field, EpicsValue::String(value.as_str().into()))
+        .put_record_field_from_ca(base, &field, EpicsValue::String(value.as_bytes().into()))
         .await;
     let ok = match put {
         Ok(completion) => match completion.into_handle() {
@@ -4269,11 +4461,11 @@ async fn tpn_lines(
     // C prints the RECORD name — `dbChannelRecord(ppn->chan)->name`
     // (`db_test.c:206`) — not the channel name the caller typed.
     if ok {
-        vec![format!("tpnCallback '{base}': Success")]
+        vec![format!("tpnCallback '{shown}': Success")]
     } else {
         // `notifyError` (2), the status the port's other notify path
         // reports a failed completion as.
-        vec![format!("tpnCallback '{base}': Notify status 2")]
+        vec![format!("tpnCallback '{shown}': Notify status 2")]
     }
 }
 
@@ -4350,7 +4542,7 @@ fn dbglob_handler(args: &[ArgValue], ctx: &CommandContext) -> CommandResult {
     // C `dbTest.c:307-309`: a missing or empty pattern is a usage
     // error, not an implicit `*`, and a 1 return.
     let pattern = match args.first() {
-        Some(ArgValue::String(s)) if !s.is_empty() => s.as_str(),
+        Some(ArgValue::String(s)) if !s.is_empty() => s.as_bytes(),
         _ => {
             ctx.println("Usage: dbglob \"pattern\" \"fields\"");
             return Ok(CommandOutcome::Failed);
@@ -4369,11 +4561,11 @@ fn dbglob_handler(args: &[ArgValue], ctx: &CommandContext) -> CommandResult {
     // confused to miss. Field lookup via `get_record` follows
     // alias→canonical; for a simple PV the field-dump branch silently skips,
     // since it is not a record.
-    let mut names: Vec<String> = db_nodes_type_major(ctx)
+    let mut names: Vec<RecordName> = db_nodes_type_major(ctx)
         .into_iter()
         .map(|node| node.name)
         .collect();
-    let mut extra: Vec<String> = ctx.block_on(ctx.db().all_simple_pv_names());
+    let mut extra: Vec<RecordName> = ctx.db().all_simple_pv_names();
     extra.sort();
     extra.dedup();
     extra.retain(|n| !names.contains(n));
@@ -4579,7 +4771,7 @@ const SCAN_PRIORITY_NAMES: [&str; 3] = ["Low", "Medium", "High"];
 /// C `printList` (`dbScan.c:969-992`): print nothing at all when the
 /// list is empty, otherwise the caller's header and then one
 /// left-justified 28-column record name per line.
-fn print_scan_list(ctx: &CommandContext, header: &str, names: &[String]) {
+fn print_scan_list(ctx: &CommandContext, header: &str, names: &[RecordName]) {
     if names.is_empty() {
         return;
     }
@@ -4594,8 +4786,8 @@ fn print_scan_list(ctx: &CommandContext, header: &str, names: &[String]) {
 /// (or I/O event) head and `scanAdd` files the record by `precord->prio`
 /// (`dbScan.c:601-612`), so the grouping is a property of the record,
 /// not of the report.
-fn scan_lists_by_priority(ctx: &CommandContext, names: &[String]) -> [Vec<String>; 3] {
-    let mut out: [Vec<String>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+fn scan_lists_by_priority(ctx: &CommandContext, names: &[RecordName]) -> [Vec<RecordName>; 3] {
+    let mut out: [Vec<RecordName>; 3] = [Vec::new(), Vec::new(), Vec::new()];
     for name in names {
         let Some(rec) = ctx.db().get_record(name) else {
             continue;
@@ -4613,10 +4805,8 @@ fn scan_lists_by_priority(ctx: &CommandContext, names: &[String]) -> [Vec<String
 /// over the event name, not a key, and an absent one prints every event.
 ///
 /// C walks `pevent_list`, the chain `eventNameToHandle` builds, so it
-/// can print an `Event "x"` header for a name that has been registered
-/// but holds no records. The port has no such chain — an event exists
-/// exactly as long as some record's `EVNT` names it — so an empty event
-/// does not appear here. Everything an event actually scans does.
+/// prints an `Event "x"` header for a name that has been registered but
+/// holds no records.
 fn cmd_scanpel() -> CommandDef {
     CommandDef::new(
         "scanpel",
@@ -4627,44 +4817,22 @@ fn cmd_scanpel() -> CommandDef {
         }],
         "scanpel [\"event name\"] — Print info for records with SCAN = \"Event\".",
         |args: &[ArgValue], ctx: &CommandContext| {
-            use crate::server::database::scan_index::normalize_event_name;
-            use crate::server::record::ScanType;
-
-            // C walks `pevent_list`, which `scanAdd` fills at `iocInit`, so
-            // before then it prints nothing and returns 0 — no refusal line.
-            if !scan_lists_exist(ctx) {
-                return Ok(CommandOutcome::Continue);
-            }
-
             let pattern = match args.first() {
                 Some(ArgValue::String(p)) if !p.is_empty() => Some(p.clone()),
                 _ => None,
             };
 
-            // Group the Event-scanned records by the event their `EVNT`
-            // names, through the same normalisation `post_event_named`
-            // routes on, so `"5"`, `" 5 "` and `"5.0"` are one event
-            // here exactly as they are one handle in C.
-            let mut by_event: std::collections::BTreeMap<String, Vec<String>> =
-                std::collections::BTreeMap::new();
-            for name in ctx.block_on(ctx.db().records_for_scan(ScanType::Event)) {
-                let Some(rec) = ctx.db().get_record(&name) else {
-                    continue;
-                };
-                let evnt = normalize_event_name(&rec.read().common.evnt);
-                if evnt.is_empty() {
-                    continue;
-                }
-                by_event.entry(evnt).or_default().push(name);
-            }
+            // C walks `pevent_list` with no gate: before `iocInit` it holds
+            // only what an iocsh `postEvent` created.
+            let by_event = ctx.db().event_lists();
 
             for (event, names) in &by_event {
                 if let Some(pattern) = &pattern
-                    && !epics_strn_glob_match(event.as_bytes(), event.len(), pattern.as_bytes())
+                    && !epics_strn_glob_match(event, event.len(), pattern.as_bytes())
                 {
                     continue;
                 }
-                ctx.println(&format!("Event \"{event}\""));
+                ctx.println_bytes(&[&b"Event \""[..], event, b"\""].concat());
                 for (prio, list) in scan_lists_by_priority(ctx, names).iter().enumerate() {
                     print_scan_list(
                         ctx,
@@ -4741,7 +4909,9 @@ fn cmd_pushd() -> CommandDef {
             };
             match &args[0] {
                 ArgValue::String(dir) => {
-                    if let Err(e) = super::core_commands::set_working_dir(dir) {
+                    if let Err(e) = dir.to_path().and_then(|path| {
+                        super::core_commands::set_working_dir(path).map_err(|e| e.to_string())
+                    }) {
                         return Err(format!("pushd: {dir}: {e}"));
                     }
                     dir_stack().lock().unwrap().push(cwd);
@@ -4893,7 +5063,7 @@ fn cmd_db_create_record() -> CommandDef {
             // base wraps exactly these in `iocshSetError`
             // (`dbStaticIocRegister.c:282-310` at `f4ccf7bc8`);
             // epics-base#498 / UI-105.
-            if let Err(e) = db_loader::validate_record_name(&name, 0, 0) {
+            if let Err(e) = db_loader::validate_record_name(name.as_bytes(), 0, 0) {
                 return Err(format!("dbCreateRecord: {e}"));
             }
             if ctx.db().get_record(&name).is_some() {
@@ -4902,7 +5072,7 @@ fn cmd_db_create_record() -> CommandDef {
             // C reaches this through `dbFindRecordType`
             // (`dbStaticIocRegister.c:299` at `f4ccf7bc8`), whose miss is the same
             // status as a missing type argument.
-            let record = db_loader::create_record(&rec_type).map_err(|_| {
+            let record = db_loader::create_record(&rec_type.to_str_lossy()).map_err(|_| {
                 format!("{S_DB_LIB_RECORD_TYPE_NOT_FOUND} Record Type does not exist")
             })?;
             if let Err(e) = ctx.block_on(ctx.db().add_record(&name, record)) {
@@ -4952,64 +5122,19 @@ fn post_event_handler(args: &[ArgValue], ctx: &CommandContext) -> CommandResult 
     // (`dbScan.c:480-482`) and `postEvent(NULL)` returns at once, so a
     // bare `postEvent` scans nothing.
     match args.first() {
-        Some(ArgValue::String(name)) if !name.trim().is_empty() => {
-            ctx.block_on(ctx.db().post_event_named(name));
+        Some(ArgValue::String(name)) if !name.trim_ascii().is_empty() => {
+            ctx.block_on(ctx.db().post_event_named(name.as_bytes()));
         }
         _ => {}
     }
     Ok(CommandOutcome::Continue)
 }
 
-/// C `epicsStrnGlobMatch` (`epicsString.c:282-312`) — the matcher
-/// `dbglob` and `epicsEnvShow` both call. `?` consumes exactly one
-/// character: the trailing `while (*pattern == '*') pattern++` skips
-/// only `*`, so a `?` left over once the string is exhausted fails the
-/// match. `dbglob`'s help text (`dbIocRegister.c:243`) says "0 or
-/// one characters", but the code is what runs, and this is a
-/// transcription of the code.
-pub(super) fn epics_strn_glob_match(s: &[u8], len: usize, pattern: &[u8]) -> bool {
-    let len = len.min(s.len());
-    let at = |p: usize| pattern.get(p).copied().unwrap_or(0);
-    let mut mp: Option<usize> = None;
-    let mut cp: usize = 0;
-    let mut i: usize = 0;
-    let mut p: usize = 0;
-
-    while i < len && at(p) != b'*' {
-        if at(p) != s[i] && at(p) != b'?' {
-            return false;
-        }
-        p += 1;
-        i += 1;
-    }
-    while i < len {
-        if at(p) == b'*' {
-            p += 1;
-            if at(p) == 0 {
-                return true;
-            }
-            mp = Some(p);
-            cp = i + 1;
-        } else if at(p) == s[i] || at(p) == b'?' {
-            p += 1;
-            i += 1;
-        } else {
-            // The first loop returns on any mismatch, so this branch
-            // is only reachable after a `*` set `mp`.
-            p = mp.unwrap_or(0);
-            i = cp;
-            cp += 1;
-        }
-    }
-    while at(p) == b'*' {
-        p += 1;
-    }
-    at(p) == 0
-}
+pub(super) use epics_libcom_rs::runtime::epics_string::epics_strn_glob_match;
 
 /// [`epics_strn_glob_match`] over whole strings — C `epicsStrGlobMatch`.
-fn glob_match(pattern: &str, text: &str) -> bool {
-    epics_strn_glob_match(text.as_bytes(), text.len(), pattern.as_bytes())
+fn glob_match(pattern: &[u8], text: &[u8]) -> bool {
+    epics_strn_glob_match(text, text.len(), pattern)
 }
 
 /// `iocStats` — record count, uptime, RSS, cores and scan-list totals.
@@ -5026,7 +5151,7 @@ fn cmd_ioc_stats() -> CommandDef {
         "iocStats — Show IOC runtime statistics",
         |_args: &[ArgValue], ctx: &CommandContext| {
             // Record count
-            let names = ctx.block_on(ctx.db().all_record_names());
+            let names = ctx.db().all_record_names();
             ctx.println(&format!("Records:    {}", names.len()));
 
             // Uptime
@@ -5100,29 +5225,36 @@ fn cmd_db_load_records() -> CommandDef {
             // C `dbAccess.c:799-802` tests the file name only for NULL,
             // so an empty name still reaches the open and fails there.
             let path = match &args[0] {
-                ArgValue::String(s) => s,
+                ArgValue::String(s) => s.to_str()?,
                 _ => {
                     // C prints the usage line and returns -1 (`dbAccess.c:799-802`),
                     // which `dbLoadRecordsCallFunc` hands straight to
                     // `iocshSetError` (`dbIocRegister.c:71-74`) — so the line
                     // FAILED, and under `on error break` a boot stops here.
-                    ctx.println("Usage: dbLoadRecords \"file\", \"subs\"");
+                    ctx.console_println("Usage: dbLoadRecords \"file\", \"subs\"");
                     return Ok(CommandOutcome::Failed);
                 }
             };
             let macros_str = match &args[1] {
-                ArgValue::String(s) => s.as_str(),
-                _ => "",
+                ArgValue::String(s) => s.as_bytes(),
+                _ => b"",
             };
 
             // C says NOTHING on the success path: `dbLoadRecords` calls
-            // the (always-NULL in base) `dbLoadRecordsHook` and returns 0
+            // `dbLoadRecordsHook` (NULL in base) and returns 0
             // (`dbAccess.c:804-807`). A progress line here is output no C
             // IOC produces, on the stream a startup script's own output
             // shares. The failure path is [`db_load_records`], which owns
             // the summary and has already written it.
             let mut faults = db_loader::DbFaults::default();
-            match db_load_records(ctx, path, parse_macro_string(macros_str), &mut faults) {
+            let subs = String::from_utf8_lossy(macros_str);
+            match db_load_records(
+                ctx,
+                path,
+                &subs,
+                parse_macro_string(macros_str),
+                &mut faults,
+            ) {
                 Ok(()) => Ok(CommandOutcome::Continue),
                 Err(_) => Ok(CommandOutcome::Failed),
             }
@@ -5143,13 +5275,14 @@ fn cmd_db_load_records() -> CommandDef {
 /// LIMIT, stated: a `.dbd` reaches the same grammar C uses (one `yyparse`
 /// for both commands), so its `record(...)`, `alias(...)` and
 /// `breaktable(...)` install exactly as a `.db`'s would. Its DEFINITIONS —
-/// `recordtype`, `menu`, `device`, `driver`, `registrar`, `function`,
-/// `variable` — are parsed into [`db_loader::ParsedDb::dbd`] and then
-/// dropped, because this port's type system is generated at build time
-/// (`record/dbd_generated.rs`, `tools/dbd-codegen`) rather than built by the
-/// load. `dbLoadDatabase("softIoc.dbd")` therefore leaves a port IOC in the
-/// same state C reaches, since those record types are already present; a
-/// SITE `.dbd` declaring a new record type or device support does not.
+/// `recordtype`, `menu`, `driver`, `function`, `variable` — are parsed into
+/// [`db_loader::ParsedDb::dbd`] and then dropped, because this port's type
+/// system is generated at build time (`record/dbd_generated.rs`,
+/// `tools/dbd-codegen`) rather than built by the load.
+/// `dbLoadDatabase("softIoc.dbd")` therefore leaves a port IOC in the same
+/// state C reaches, since those record types are already present; a SITE
+/// `.dbd` declaring a new record type does not. Its `device()`, `link()` and
+/// `registrar()` lines are kept.
 fn cmd_db_load_database() -> CommandDef {
     CommandDef::new(
         "dbLoadDatabase",
@@ -5177,19 +5310,19 @@ fn cmd_db_load_database() -> CommandDef {
             // way; `astac` is the exception, because `astacCallFunc`
             // (`asIocRegister.c:126-129`) discards `astac`'s status.
             let file = match &args[0] {
-                ArgValue::String(s) => s,
+                ArgValue::String(s) => s.to_str()?,
                 _ => {
-                    ctx.println("Usage: dbLoadDatabase \"file\", \"path\", \"subs\"");
+                    ctx.console_println("Usage: dbLoadDatabase \"file\", \"path\", \"subs\"");
                     return Ok(CommandOutcome::Failed);
                 }
             };
             let path = match &args[1] {
-                ArgValue::String(s) => s.as_str(),
+                ArgValue::String(s) => s.to_str()?,
                 _ => "",
             };
             let substitutions = match &args[2] {
-                ArgValue::String(s) => s.as_str(),
-                _ => "",
+                ArgValue::String(s) => s.as_bytes(),
+                _ => b"",
             };
 
             let mut faults = db_loader::DbFaults::default();
@@ -5240,7 +5373,7 @@ fn db_read_database(
     ctx: &CommandContext,
     file: &str,
     path: &str,
-    substitutions: &str,
+    substitutions: &[u8],
     faults: &mut db_loader::DbFaults,
 ) -> Result<(), DbReadFailure> {
     db_read_database_macros(ctx, file, path, parse_macro_string(substitutions), faults)
@@ -5258,7 +5391,7 @@ fn db_read_database_macros(
     ctx: &CommandContext,
     file: &str,
     path: &str,
-    macros: HashMap<String, String>,
+    macros: HashMap<Vec<u8>, Vec<u8>>,
     faults: &mut db_loader::DbFaults,
 ) -> Result<(), DbReadFailure> {
     // A load OPENS the load phase; it does not close it — the boundary a
@@ -5277,13 +5410,13 @@ fn db_read_database_macros(
     // C installs the search path inside the read
     // (`dbLexRoutines.c:245-253`), before the open, so a load that cannot
     // find its file has still replaced the list `dbDumpPath` reports.
-    let (config, file_path) = resolve_db_file(file, path);
+    let (config, file_path) = db_loader::resolve_db_file(file, path);
     let Some(file_path) = file_path else {
         // The name the caller wrote, deliberately, where C prints
         // `macEnvExpand`'s result (`dbLexRoutines.c:274-286`) and so prints
         // `'(null)'` for exactly the case an operator most needs named — a
         // path built from a macro that was never defined.
-        ctx.eprintln(&format!("{ERL_ERROR}: Can't open file '{file}'"));
+        ctx.console_eprintln(&format!("{ERL_ERROR}: Can't open file '{file}'"));
         return Err(DbReadFailure::CannotOpen);
     };
 
@@ -5302,8 +5435,12 @@ fn db_read_database_macros(
     // column 6: expected 'field', got 'qqq'`, and that positionless line
     // was the whole of what an operator with a syntax error in a real
     // `.db` got: no file, no line, no source.
-    let parsed = db_loader::parse_db_opened_with_breaktables(&file_path, &macros, &config)
-        .map_err(|_| DbReadFailure::Rejected)?;
+    let parsed = db_loader::parse_db_opened_held(
+        &file_path,
+        crate::runtime::mac_lib::MacroDefs::from_byte_map(&macros),
+        &config,
+    )
+    .map_err(|_| DbReadFailure::Rejected)?;
 
     // Merge any `breaktable(...)` definitions into the database's shared
     // breakpoint-table registry (C `bptList`) and snapshot it for the
@@ -5320,7 +5457,19 @@ fn db_read_database_macros(
     super::dbstatic_commands::add_loaded_registrars(&parsed.dbd.registrars);
     // Same for `link()`: `dbLinkType` fills `pdbbase->linkList` from the same
     // parse, so a site's own `link(<key>, <jlif>)` line reaches `dbDumpLink`.
-    super::dbstatic_commands::add_loaded_link_types(&parsed.dbd.link_types);
+    ctx.db().add_loaded_link_types(&parsed.dbd.link_types);
+    // And `device()`: `dbDevice` appends to the record type's `devList`, so
+    // a site's choice is a `DTYP` the same read's records may already name.
+    for device in &parsed.dbd.devices {
+        if let Some(link_type) = crate::server::record::DbLinkType::from_c_name(&device.link_type) {
+            crate::server::record::load_dbd_device(
+                &device.record_type,
+                link_type,
+                &device.dset,
+                &device.choice,
+            );
+        }
+    }
 
     // One install path for `dbLoadDatabase`, `dbLoadRecords` and
     // `dbLoadTemplate`: each definition flows through the SAME per-record
@@ -5330,7 +5479,8 @@ fn db_read_database_macros(
     ctx.block_on(install_record_defs(
         ctx,
         parsed.records,
-        parsed.unresolved_aliases,
+        parsed.file_aliases,
+        parsed.aborted,
         &breaktable_registry,
         faults,
     ))?;
@@ -5364,7 +5514,8 @@ fn db_read_database_macros(
 fn db_load_records(
     ctx: &CommandContext,
     file: &str,
-    macros: HashMap<String, String>,
+    subs: &str,
+    macros: HashMap<Vec<u8>, Vec<u8>>,
     faults: &mut db_loader::DbFaults,
 ) -> Result<(), DbReadFailure> {
     // C passes a hard `0` for the search path (`dbAccess.c:803`), so a
@@ -5376,77 +5527,49 @@ fn db_load_records(
     // whatever the read already reported, on every failure alike, and the
     // second line only the load-phase refusal gets.
     if let Err(failure) = &read {
-        ctx.eprintln(&format!("{ERL_ERROR}: Failed to load '{file}'"));
+        ctx.console_eprintln(&format!("{ERL_ERROR}: Failed to load '{file}'"));
         if matches!(failure, DbReadFailure::AfterIocInit) {
-            ctx.eprintln("    Records cannot be loaded after iocInit!");
+            ctx.console_eprintln("    Records cannot be loaded after iocInit!");
         }
+    } else if let Some(hook) = db_load_records_hook() {
+        hook(file, subs);
     }
     read
 }
 
-/// Build the DB include config the way `dbReadCOM` does
-/// (`dbLexRoutines.c:245-253`): a non-empty `explicit_path` wins outright,
-/// otherwise `EPICS_DB_INCLUDE_PATH`, otherwise `"."`. Only
-/// `dbLoadDatabase` can supply the first arm — C hands `dbLoadRecords` a
-/// hard `0` — which is why `explicit_path` had no caller and the arm was
-/// missing until the command existed.
-///
-/// Resolving the list is also what INSTALLS it: C `dbPath` runs inside
-/// `dbReadCOM`, so the path a load resolved is the path `dbDumpPath`
-/// reports afterwards. This is the only routine that resolves one, so it
-/// is the only writer of [`db_loader::set_loaded_path`].
-fn db_load_config(explicit_path: &str) -> db_loader::DbLoadConfig {
-    let include_paths = if explicit_path.is_empty() {
-        std::env::var("EPICS_DB_INCLUDE_PATH").map_or_else(
-            |_| vec![std::path::PathBuf::from(".")],
-            |val| db_loader::db_path(&val),
-        )
-    } else {
-        db_loader::db_path(explicit_path)
-    };
-    db_loader::set_loaded_path(&include_paths);
-    db_loader::DbLoadConfig {
-        include_paths,
-        max_include_depth: 32,
-    }
+/// C `DB_LOAD_RECORDS_HOOK_ROUTINE`: the file and the RAW substitution
+/// string of a `dbLoadRecords` that succeeded.
+pub type DbLoadRecordsHook = Arc<dyn Fn(&str, &str) + Send + Sync>;
+
+/// C `dbLoadRecordsHook` (`dbAccess.c:74`), process-wide as in C, so an
+/// installer keeps the previous one and chains to it.
+static DB_LOAD_RECORDS_HOOK: Mutex<Option<DbLoadRecordsHook>> = Mutex::new(None);
+
+pub fn db_load_records_hook() -> Option<DbLoadRecordsHook> {
+    DB_LOAD_RECORDS_HOOK.lock().unwrap().clone()
 }
 
-/// Resolve a load's file name through C `dbOpenFile`: the path list is
-/// searched FIRST and the process CWD is never consulted for a bare name.
-/// `None` is C's NULL return, which `dbReadCOM` turns into `Can't open
-/// file` without ever reaching the parser.
-///
-/// `include_path` is `dbLoadDatabase`'s second argument, empty for every
-/// other caller — see [`db_load_config`].
-fn resolve_db_file(
-    path: &str,
-    include_path: &str,
-) -> (db_loader::DbLoadConfig, Option<db_loader::DbOpenedFile>) {
-    let config = db_load_config(include_path);
-    // The located form, not the bare `PathBuf`: every diagnostic the load
-    // raises names the file as the operator wrote it and the path entry it
-    // was found under, which is what C's `inputFile` keeps — see
-    // [`db_loader::DbOpenedFile`].
-    let opened = db_loader::db_open_file_located(path, &config.include_paths);
-    (config, opened)
+pub fn set_db_load_records_hook(hook: Option<DbLoadRecordsHook>) {
+    *DB_LOAD_RECORDS_HOOK.lock().unwrap() = hook;
 }
 
-/// Resolve a `dbLoadTemplate` `.substitutions` file. C keeps the
+/// Open a `dbLoadTemplate` `.substitutions` file. C keeps the
 /// opposite gate here from the one it uses for the templates the file
 /// names: `dbLoadTemplate.y:362-370` tries a bare `fopen(sub_file)`
 /// first and only falls back to the path list when that fails and the
-/// name is not absolute. The templates themselves go through
-/// `dbLoadRecords`, i.e. [`resolve_db_file`]'s rule.
+/// name does not start with a separator. The templates themselves go
+/// through `dbLoadRecords`, i.e. `resolve_db_file`'s rule. `Err` is the
+/// last open's error, C's `errno`.
 ///
 /// `search_path` is the command's third argument, which C substitutes
 /// for `EPICS_DB_INCLUDE_PATH` when it is non-empty (`:365-368`). It
 /// reaches only this lookup: `dbLoadRecords` resets the path list from
 /// the environment for every template, so the argument never affects
 /// the templates the file names.
-fn resolve_substitutions_file(path: &str, search_path: &str) -> std::path::PathBuf {
-    let config = db_load_config("");
-    let direct = std::path::PathBuf::from(path);
-    if direct.exists() || direct.is_absolute() {
+fn open_substitutions_file(path: &str, search_path: &str) -> std::io::Result<std::fs::File> {
+    let config = db_loader::db_load_config("");
+    let direct = std::fs::File::open(path);
+    if direct.is_ok() || path.starts_with(std::path::MAIN_SEPARATOR) {
         return direct;
     }
     let search = if search_path.is_empty() {
@@ -5454,7 +5577,7 @@ fn resolve_substitutions_file(path: &str, search_path: &str) -> std::path::PathB
     } else {
         db_loader::db_path(search_path)
     };
-    db_loader::db_open_file(path, &search).unwrap_or(direct)
+    db_loader::db_open_file(path, &search).map(|opened| opened.file)
 }
 
 /// C's `sub_collect+1` — the substitution string `dbLoadTemplate` hands to
@@ -5480,10 +5603,10 @@ fn resolve_substitutions_file(path: &str, search_path: &str) -> std::path::PathB
 /// `yyerror(NULL)` writes `Substitution file error.` for the first line.
 fn eprint_substitution_fault(ctx: &CommandContext, fault: &db_loader::SubstitutionFault) {
     match &fault.message {
-        Some(message) => ctx.eprintln(&format!("Substitution file error: {message}")),
-        None => ctx.eprintln("Substitution file error."),
+        Some(message) => ctx.console_eprintln(&format!("Substitution file error: {message}")),
+        None => ctx.console_eprintln("Substitution file error."),
     }
-    ctx.eprintln(&format!("line {}: '{}'", fault.line, fault.yytext));
+    ctx.console_eprintln(&format!("line {}: '{}'", fault.line, fault.yytext));
 }
 
 fn c_sub_collect(cmd_collect: &str, row: &[db_loader::RowMacro]) -> String {
@@ -5493,6 +5616,10 @@ fn c_sub_collect(cmd_collect: &str, row: &[db_loader::RowMacro]) -> String {
     }
     for macro_ in row {
         let db_loader::RowMacro { name, value, .. } = macro_;
+        let (name, value) = (
+            String::from_utf8_lossy(name),
+            String::from_utf8_lossy(value),
+        );
         if macro_.quoted {
             parts.push(format!("{name}=\"{value}\""));
         } else {
@@ -5502,526 +5629,48 @@ fn c_sub_collect(cmd_collect: &str, row: &[db_loader::RowMacro]) -> String {
     parts.join(",")
 }
 
-/// The two ways C can fail to give a record its type, told apart by the
-/// same question C asks: is the type DECLARED?
-///
-/// C `dbRecordHead` reaches `dbFindRecordType` first
-/// (`dbLexRoutines.c:1161-1167`), and a type no loaded `.dbd` declares stops
-/// there with `Record type '%s' for record '%s' not found`. A type that IS
-/// declared gets past it and dies one call later inside `dbAllocRecord`
-/// (`dbStaticRun.c:91-96`), because nothing filled in its `rec_size` — the
-/// `.dbd` was read but `x_RegisterRecordDeviceDriver` never ran, so the
-/// recordtype has a shape and no support:
-///
-/// ```c
-///     if (pdbRecordType->rec_size == 0) {
-///         printf("\t*** Did you run x_RegisterRecordDeviceDriver(pdbbase) yet? ***\n");
-///         epicsPrintf("dbAllocRecord(%s) with %s rec_size = 0\n",
-///                     precordName, pdbRecordType->name);
-///         return(S_dbLib_noRecSup);
-///     }
-/// ```
-///
-/// Both then fall out of `dbCreateRecord` into the same `yyerrorAbort`
-/// (`dbLexRoutines.c:1189-1194`), so only the lines ABOVE it differ.
-///
-/// The port's two populations are the same two. `record_fields` is the
-/// vendored `.dbd`s read as a table, so a type it knows is a type this port
-/// declares; `create_record` failing on one of those means no factory is
-/// registered for it — `aCalcout`, `swait`, `busy` and the rest of the
-/// module-owned types an application opts into with `register_record_type`.
-/// That is C's rec_size == 0 exactly: declared, unsupported. Reporting it as
-/// "not found" sent an operator looking for a missing `.dbd` when the `.dbd`
-/// is the one thing that IS there.
-///
-/// One deviation, stated because it is the port's structure and not a
-/// choice: `record_fields` answers for every type this crate vendors, not
-/// for the ones a given IOC has actually loaded `.dbd`s for, because the
-/// port resolves record types from a compile-time table rather than from
-/// `pdbbase`. So a type C would call "not found" (no `.dbd` loaded) is
-/// "declared, unsupported" here whenever the crate vendors its `.dbd`.
-fn record_type_unavailable(ctx: &CommandContext, record_type: &str, name: &str) -> RecordFault {
-    if crate::server::record::dbd_generated::record_fields(record_type).is_some() {
-        // C's `printf`, on stdout, tab included.
-        ctx.println("\t*** Did you run x_RegisterRecordDeviceDriver(pdbbase) yet? ***");
-        // C's `epicsPrintf`, which is errlog and therefore the error
-        // stream, and which carries its own terminator.
-        crate::runtime::log::errlog_printf(&format!(
-            "dbAllocRecord({name}) with {record_type} rec_size = 0\n"
-        ));
-        return RecordFault::Fatal(format!(
-            "{ERL_ERROR}: Can't create {record_type} record '{name}'"
-        ));
-    }
-    RecordFault::Fatal(format!(
-        "{ERL_ERROR}: Record type '{record_type}' for record '{name}' not found"
-    ))
-}
+/// The iocsh load routes' side of [`db_loader::install_records`].
+struct IocshInstall<'a>(&'a CommandContext);
 
-/// Put each field the way C's parser does — one element at a time, so a value
-/// the applier refuses costs that FIELD and nothing else.
-///
-/// C reduces one `field(NAME,"value")` at a time, and every failure arm of
-/// `dbRecordField` ends in `yyerror(NULL)` and `return`
-/// (`dbLexRoutines.c:1405-1416` @`R7.0.10-146-g8f5015b663d764ad75df`):
-///
-/// ```c
-///     status = dbPutString(pdbentry,value);
-///     if (status) {
-///         ...
-///         yyerror(NULL);
-///         return;
-///     }
-/// ```
-///
-/// so the record stays, its remaining fields still load, and only the file's
-/// status goes non-zero. Handing the whole slice to [`db_loader::apply_fields`]
-/// made the FIRST refusal cost the record and every field behind it as well:
-/// measured against `softIoc` R7.0.10 on a `record(ai,"N1"){field(RSET,"1")}`,
-/// C's `dbl` listed `N1` and the port's listed nothing.
-///
-/// Splitting the call is sound because `apply_fields` is itself a loop over
-/// `fields` that carries nothing between iterations — `check_link_syntax` is
-/// per field and `common_fields` is append-only — so N one-field calls are the
-/// same load as one N-field call, minus the abort.
-///
-/// That makes the rule uniform: the menu screen above drops a refused field and
-/// keeps the record, and now the applier's own refusals — `DBF_NOACCESS`, an
-/// unparsable value, a link the syntax check rejects — do the same, rather than
-/// each apply site deciding for itself how much of the file a bad field costs.
-///
-/// The sentence is C's, built from what this site holds: the record, the field
-/// and the value. C's two remaining slots, `pdbentry->message` and
-/// `errSymLookup(status)`, are produced inside `db_loader` and reach here as a
-/// single `CaError` blob, so the port's own text stands in for both.
-fn apply_fields_one_at_a_time(
-    record: &mut Box<dyn crate::server::record::Record>,
-    record_name: &str,
-    fields: &[db_loader::DbFieldDef],
-    common_fields: &mut Vec<(String, EpicsValue)>,
-    faults: &mut db_loader::DbFaults,
-) {
-    for f in fields {
-        let Err(e) = db_loader::apply_fields(record, std::slice::from_ref(f), common_fields) else {
-            continue;
-        };
-        // C's lexer names the line; the parse is over by the time this runs, so
-        // the element's own recorded line takes that seat — as in the screen.
-        faults.seek(f.line, ")");
-        faults.report(db_loader::DbDiagnostic::new(format!(
-            "{ERL_ERROR}: Can't set '{record_name}.{}' to '{}' {e}",
-            f.name,
-            f.value.as_str_lossy(),
-        )));
+impl db_loader::InstallHost for IocshInstall<'_> {
+    fn db(&self) -> &crate::server::database::PvDatabase {
+        self.0.db()
+    }
+
+    fn records_once_only(&self) -> bool {
+        db_records_once_only()
+    }
+
+    fn create_record(&self, record_type: &str) -> Option<Box<dyn crate::server::record::Record>> {
+        db_loader::create_record(record_type).ok()
+    }
+
+    fn warn(&self, line: &str) {
+        self.0.console_eprintln(line);
     }
 }
 
-/// How C classifies a per-record `.db` failure. `dbRecordHead` and
-/// `dbRecordField` (`dbLexRoutines.c:1123-1197`, `:1199-1380`) reach for
-/// `yyerror(NULL)` when the record can be skipped and the rest of the file
-/// still read, and for `yyerrorAbort` only when the parse cannot continue
-/// — an unknown record type or a `dbCreateRecord` that failed for any
-/// other reason. The port had one class, so the first skippable record
-/// discarded every record after it.
-enum RecordFault {
-    /// C `yyerror(NULL)`: report, skip this record, keep loading.
-    Recoverable(String),
-    /// C `yyerrorAbort`: stop the load here.
-    Fatal(String),
-}
-
-/// Install each parsed record definition into the database through the
-/// one routine both `dbLoadRecords` and `dbLoadTemplate` share.
-///
-/// This is the extracted body of the old `dbLoadRecords` install loop:
-/// duplicate-name merge, field application, the creation sink's
-/// load-then-init ordering, alias registration, and the post-load link /
-/// SIMM / watchdog init passes — all identical for both commands so a
-/// template-loaded record is byte-for-byte the same as a directly loaded
-/// one. On the first rejected record it prints the C-visible diagnostic
-/// and propagates the error to the iocsh script chain (epics-base
-/// 144f975), exactly as the inline loop did.
+/// Install each parsed record definition through the routine every load
+/// route shares, so a template-loaded record is byte-for-byte the same as a
+/// directly loaded one.
 async fn install_record_defs(
     ctx: &CommandContext,
     defs: Vec<db_loader::DbRecordDef>,
-    unresolved_aliases: Vec<(String, String)>,
+    file_aliases: Vec<db_loader::DbFileAlias>,
+    aborted: Option<db_loader::ParseAbort>,
     breaktable_registry: &crate::server::cvt_bpt::BreakTableRegistry,
     faults: &mut db_loader::DbFaults,
 ) -> Result<(), DbReadFailure> {
-    // Non-fatal per-record failures (alias reject, merge-field put) join
-    // whatever the parse itself recovered from, in the one owner that
-    // decides what recoverable means: the load continues past them, but
-    // the command must still end in Err so `on error` fires — C's
-    // dbLoadRecords returns non-zero after its parser recovered and kept
-    // going (epics-base#498 / UI-105).
-    for mut def in defs {
-        // C `dbRecordHead` (`dbLexRoutines.c:1136-1157`) reads two record
-        // types as instructions rather than types: `*` modifies the record
-        // already in the database and `#` deletes it. Both skip the body
-        // when the name is unknown (`duplicate = TRUE`), and they report
-        // it differently — `*` with `yyerror(NULL)`, `#` with a bare
-        // WARNING that leaves the load's status clean. The port passed
-        // both to the record factory, so every such block failed as an
-        // unknown record type and took the load with it.
-        let modify_block = def.record_type == "*";
-        if modify_block {
-            let existing = ctx
-                .db()
-                .get_record(&def.name)
-                .map(|rec| rec.read().record.record_type().to_string());
-            match existing {
-                // Continue as the type already there: from here on this is
-                // the same field merge a same-type reload performs, which
-                // is what C's pdbentry does after `dbFindRecord`.
-                Some(t) => def.record_type = t,
-                None => {
-                    faults.recoverable(format!("{ERL_ERROR}: Record '{}' not found", def.name));
-                    continue;
-                }
-            }
-        }
-        if def.record_type == "#" {
-            if !ctx.db().remove_record(&def.name).await {
-                // C also names the file and line here; the port does not
-                // carry either as far as the install loop.
-                ctx.eprintln(&format!(
-                    "{ERL_WARNING}: Record '{}' not found, can't delete",
-                    def.name
-                ));
-            }
-            continue;
-        }
-
-        // Resolve a `LINR` field naming a loaded breakpoint table to its
-        // menuConvert index (shared with the IocBuilder load path).
-        db_loader::resolve_linr_breaktable_names(
-            &def.record_type,
-            &mut def.fields,
-            breaktable_registry,
-        );
-
-        // C creates the record and only THEN puts each field
-        // (`dbCreateRecord` at `dbLexRoutines.c:1172`, `dbPutString` at
-        // `:1405`), so a value `dbPutString` refuses costs that FIELD its
-        // value and nothing else: the record stays and keeps the default,
-        // its other fields load, the rest of the file is read, and the
-        // load's status goes non-zero only at the end (`yyerror`, `:1415`).
-        //
-        // Screening here, once, before the record exists, is what makes that
-        // uniform. The refusal used to be decided at whichever site happened
-        // to apply the field — `add_loaded_record` for a dbCommon field,
-        // `apply_fields` for a record-own one — which gave one rule two
-        // spellings: `SCAN` reported C's wording and aborted the file while
-        // `SELM` reported the port's own wording and continued, and both
-        // discarded a record C keeps. After the screen neither apply site can
-        // see a value its menu would refuse, so neither can decide anything.
-        let (screen_type, screen_name) = (def.record_type.clone(), def.name.clone());
-        def.fields.retain(|f| {
-            let Some(refusal) = db_loader::menu_value_refusal(
-                &screen_type,
-                &screen_name,
-                &f.name.to_uppercase(),
-                &f.value.as_str_lossy(),
-            ) else {
-                return true;
-            };
-            // C refuses this value inside the parse, so `yyerror` names the
-            // line from the lexer. Here the parse is over, so the element's
-            // own recorded line takes the lexer's seat — see
-            // [`db_loader::DbFieldDef`]. Without it every refusal below
-            // would print the file with no line at all, which is what an
-            // operator debugging a real `.db` is left with.
-            faults.seek(f.line, ")");
-            // C's three lines around a refusal go out in one call, because
-            // their ORDER is C's — see [`db_loader::DbDiagnostic`].
-            faults.report(db_loader::DbDiagnostic {
-                notice: refusal.notice,
-                message: refusal.line,
-                suggestion: refusal.suggestion,
-            });
-            false
-        });
-
-        let added: Result<(), RecordFault> = async {
-            // C-parity (dbLexRoutines.c:1170-1188): the SAME
-            // record name re-loaded with the SAME record_type
-            // merges fields into the existing instance (the
-            // standard ADCore convention — simDetector.template
-            // overrides ColorMode menu choices declared by its
-            // included NDArrayBase.template). A different
-            // record_type is skipped with `yyerror(NULL)`, and the
-            // diagnostic names the type being LOADED first and the
-            // type already there last — `recordType` is the new one
-            // and `dbGetRecordTypeName(pdbentry)` the existing one
-            // (`dbLexRoutines.c:1173-1180`).
-            let existing = if let Some(rec) = ctx.db().get_record(&def.name) {
-                let r = rec.read();
-                let existing_type = r.record.record_type();
-                if existing_type != def.record_type {
-                    return Err(RecordFault::Recoverable(format!(
-                        "{ERL_ERROR}: {} record '{}' already exists, can't load {} record",
-                        def.record_type, def.name, existing_type
-                    )));
-                }
-                drop(r);
-                // `dbRecordsOnceOnly` (`dbLexRoutines.c:1181-1187`) refuses
-                // the SECOND declaration once the type matched, and sets
-                // `duplicate` so the body is dropped whole — fields, info
-                // tags and aliases alike. Returning here is that drop.
-                //
-                // A `record("*", …)` block is exempt because C's `*` arm
-                // returns from `dbRecordHead` before `dbCreateRecord`
-                // (`:1136-1144`), so it never reaches the flag: modifying
-                // an existing record is what `*` is FOR, and refusing it
-                // would make the knob mean two different things.
-                if db_records_once_only() && !modify_block {
-                    return Err(RecordFault::Recoverable(format!(
-                        "{ERL_ERROR}: Record '{}' already defined; dbRecordsOnceOnly is set,\n  \
-                         so can't modify record.",
-                        def.name
-                    )));
-                }
-                Some(rec)
-            } else {
-                None
-            };
-
-            let mut common_fields = Vec::new();
-            let is_merge = existing.is_some();
-            let rec_arc = if let Some(rec_arc) = existing {
-                // Merge: apply field overrides directly to the
-                // existing record instance.
-                {
-                    let mut inst = rec_arc.write();
-                    apply_fields_one_at_a_time(
-                        &mut inst.record,
-                        &def.name,
-                        &def.fields,
-                        &mut common_fields,
-                        faults,
-                    );
-                }
-                rec_arc
-            } else {
-                // C `dbFindRecordType` failing is `yyerrorAbort`
-                // (`dbLexRoutines.c:1162-1167`) — an unknown record type
-                // stops the load on both sides.
-                //
-                // The sentence is built HERE because C builds it here, out
-                // of the two things only this site holds: the type and the
-                // RECORD NAME. The factory sees neither, so forwarding its
-                // error put `DB parse error at line 0, column 0: unknown
-                // record type: 'nosuchtype'` on the stream — this port's own
-                // words, and a position it did not have. The factory's
-                // `register_record_type` hint is dropped with it: it is
-                // addressed to whoever builds the IOC, and `IocBuilder`
-                // (`ioc_builder.rs:305`) still shows it to them.
-                let mut record = db_loader::create_record(&def.record_type).map_err(|_| {
-                    record_type_unavailable(ctx, &def.record_type, &def.name)
-                })?;
-                // The breakpoint-table registry is installed by the
-                // creation sink; apply_fields only needs the LINR
-                // index, already resolved above.
-                apply_fields_one_at_a_time(
-                    &mut record,
-                    &def.name,
-                    &def.fields,
-                    &mut common_fields,
-                    faults,
-                );
-                // Record + its whole loaded field set in one call: the
-                // sink applies the common fields and info tags, THEN
-                // runs C's `iocInit` passes, so the initial UDF
-                // severity sees the `.db`'s final UDF (a
-                // `field(VAL,…)` clears it — `dbStaticLib.c:2653`).
-                let load = RecordLoad {
-                    common_fields: std::mem::take(&mut common_fields),
-                    info_tags: def.info_tags.clone(),
-                };
-                if ctx
-                    .db()
-                    .add_loaded_record(&def.name, record, load)
-                    .await
-                    .is_err()
-                {
-                    // C `dbCreateRecord` failing for anything other than
-                    // `S_dbLib_recExists` is `yyerrorAbort`
-                    // (`dbLexRoutines.c:1189-1194`), with the same
-                    // site-built shape as the type miss above.
-                    return Err(RecordFault::Fatal(format!(
-                        "{ERL_ERROR}: Can't create {} record '{}'",
-                        def.record_type, def.name
-                    )));
-                }
-                ctx.db().get_record(&def.name).ok_or_else(|| {
-                    // No C counterpart: this is the port's own invariant
-                    // (the creation sink installed it) failing. It wears
-                    // the `ERROR:` prefix because it now leaves by the same
-                    // exit as the two above.
-                    RecordFault::Fatal(format!(
-                        "{ERL_ERROR}: dbLoadRecords: '{}' vanished between add_record and get_record",
-                        def.name
-                    ))
-                })?
-            };
-
-            // Register any aliases declared in the record body
-            // (epics-base PR #336). Failures are reported but
-            // don't abort the load — the record is already in.
-            // For a merge, aliases declared in the new block
-            // are also registered (C parser appends).
-            for alias in &def.aliases {
-                install_alias(ctx, alias, &def.name, faults).await;
-            }
-
-            // A record created during THIS load — fresh, or a merge whose
-            // original was created during the load — has its whole init deferred
-            // to C's `initDatabase` pass (`drain_deferred_record_inits` at
-            // `iocInit`), so none of the init tail below runs here for it: doing
-            // so would bind the dset against ports not yet configured and out of
-            // C's order. Only a merge into a record created BEFORE the load
-            // (programmatically, already eager-inited) re-inits in place.
-            let init_deferred = ctx.db().record_init_deferred(&def.name);
-
-            // A MERGE re-applies the new block's fields to a record that
-            // is already in the database and already initialised, so
-            // the load-then-init ordering the creation sink guarantees
-            // has to be re-created by hand here: fields first, passes
-            // after. A fresh record took that ordering from the sink
-            // and must not run the passes twice.
-            if is_merge {
-                {
-                    let mut instance = rec_arc.write();
-                    // info(key, value) directives — last write
-                    // wins. Populated before common-field application
-                    // so device support seeing `init_record` can
-                    // observe info tags.
-                    for (k, v) in &def.info_tags {
-                        instance.set_info(k, v);
-                    }
-                }
-                for (name, value) in common_fields {
-                    use crate::server::record::CommonFieldPutResult;
-                    // `.db` load: C's loader converter, whose menu
-                    // bound differs from a runtime dbPut's
-                    // (`dbStaticRun.c::dbPutStringNum`).
-                    // The record data lock is scoped per field so it is
-                    // down before `update_scan_index` re-enters the
-                    // database — the same rule as `field_io`'s put path;
-                    // the data lock is not the processing-exclusion
-                    // mechanism, so the per-field release is a bounded,
-                    // `.await`-free window.
-                    let put = rec_arc.write().put_common_field_db_load(&name, value);
-                    match put {
-                        Ok(CommonFieldPutResult::ScanChanged {
-                            old_scan,
-                            new_scan,
-                            phas,
-                        }) => {
-                            ctx.db()
-                                .update_scan_index(&def.name, old_scan, new_scan, phas, phas);
-                        }
-                        Ok(CommonFieldPutResult::PhasChanged {
-                            scan,
-                            old_phas,
-                            new_phas,
-                        }) => {
-                            ctx.db()
-                                .update_scan_index(&def.name, scan, scan, old_phas, new_phas);
-                        }
-                        Ok(CommonFieldPutResult::NoChange) => {}
-                        Err(e) => {
-                            faults.recoverable(format!(
-                                "put_common_field({name}) failed for {}: {e}",
-                                def.name
-                            ));
-                        }
-                    }
-                }
-                // C `iocInit` calls init_record once per record AFTER all
-                // dbLoadRecords blocks, so init_record always sees the final
-                // merged field set. A merge into a record created during this
-                // load is left for that barrier pass (`init_deferred`); a merge
-                // into a record created BEFORE the load re-runs init in place so
-                // the new field values (LINR / ESLO / ZRST / ...) take effect in
-                // convert routines and post-init derived state. The cost of the
-                // in-place re-run: stateful records (compress accum,
-                // first_output_done) get re-initialised — still better than
-                // silently ignoring field overrides that affect init.
-                if !init_deferred {
-                    rec_arc.write().run_init_passes(&def.name);
-                }
-            }
-            // C's `init_record` checkLinks (`init_links`) and the constant-INP
-            // seed / `dbLoadLinkArray` (`rec_gbl_init_constant_links`). For a
-            // record whose init is deferred to `iocInit`, the barrier pass owns
-            // both; only an in-place re-init (pre-load record merged into) runs
-            // them here.
-            if !init_deferred {
-                {
-                    let mut instance = rec_arc.write();
-                    let inst = &mut *instance;
-                    inst.record.init_links(&inst.common);
-                }
-                ctx.db().rec_gbl_init_constant_links(&rec_arc);
-                if is_merge {
-                    // A merge re-ran `run_init_passes` above against the new
-                    // field set, so the rest of pass 1 owes a re-run too: a
-                    // second block may have introduced SIML/SIOL or moved SDEL.
-                    // A FRESH record takes both from the creation sink
-                    // (`PvDatabase::add_loaded_record`) and must not repeat them
-                    // here — `arm_watchdog` would spawn a second task and
-                    // supersede the first for nothing.
-                    ctx.db().rec_gbl_init_simm(&rec_arc);
-                    ctx.db().arm_watchdog(&def.name);
-                }
-            }
-            Ok(())
-        }
-        .await;
-        match added {
-            Ok(()) => {}
-            // The load's status still goes non-zero (epics-base 144f975:
-            // the `iocshSetError` equivalent, so a startup script fails),
-            // but the records already installed stay and the ones after
-            // this record are still read.
-            Err(RecordFault::Recoverable(msg)) => faults.recoverable(msg),
-            Err(RecordFault::Fatal(msg)) => {
-                // C `yyerrorAbort(NULL)` (`dbYacc.y:385-389`) is
-                // `yyerror(NULL)` plus `yyAbort = TRUE`: the sentence is
-                // the site's own `fprintf`, and the abort adds exactly the
-                // bare `ERROR: ` and the position that a RECOVERED fault
-                // gets. So the two arms print through the SAME owner and
-                // differ only in whether the loop goes on — which is what
-                // makes it impossible for an abort to reach the operator
-                // without the file, line and source echo the rest carry.
-                // This arm used to `ctx.println` the message instead:
-                // stdout, unframed, and invisible to a `2>` startup log.
-                faults.recoverable(msg);
-                return Err(DbReadFailure::Rejected);
-            }
-        }
-    }
-    // File-scope `alias("record","new")` whose target this file does not
-    // declare. C `dbAlias` (`dbLexRoutines.c:1508`) resolves against
-    // `savedPdbbase`, so a record installed by an earlier
-    // `dbLoadRecords` is a legal target; running after the loop above
-    // means this file's own records are equally visible. A target
-    // nothing owns gets C's diagnostic and fails the call's status
-    // through the fault owner, leaving every record that parsed installed.
-    for (target, alias) in unresolved_aliases {
-        if ctx.db().get_record(&target).is_none() {
-            faults.recoverable(db_loader::unknown_alias_message(&alias, &target));
-            continue;
-        }
-        install_alias(ctx, &alias, &target, faults).await;
-    }
-
-    if faults.is_empty() {
-        Ok(())
-    } else {
-        Err(DbReadFailure::Rejected)
-    }
+    db_loader::install_records(
+        &IocshInstall(ctx),
+        defs,
+        file_aliases,
+        aborted,
+        breaktable_registry,
+        faults,
+    )
+    .await
+    .map_err(|db_loader::LoadRejected| DbReadFailure::Rejected)
 }
 
 /// `dbLoadTemplate(subFile [, globalMacros])` — load records described by
@@ -6062,18 +5711,18 @@ fn cmd_db_load_template() -> CommandDef {
             // `dbLoadTemplateCallFunc` passes that status to `iocshSetError`
             // (`dbtoolsIocRegister.c:33-36`), so the line FAILED.
             let path = match &args[0] {
-                ArgValue::String(s) if !s.is_empty() => s,
+                ArgValue::String(s) if !s.is_empty() => s.to_str()?,
                 _ => {
-                    ctx.eprintln("must specify variable substitution file");
+                    ctx.console_eprintln("must specify variable substitution file");
                     return Ok(CommandOutcome::Failed);
                 }
             };
             let macros_str = match &args[1] {
-                ArgValue::String(s) => s.as_str(),
-                _ => "",
+                ArgValue::String(s) => s.as_bytes(),
+                _ => b"",
             };
             let search_path = match &args[2] {
-                ArgValue::String(s) => s.as_str(),
+                ArgValue::String(s) => s.to_str()?,
                 _ => "",
             };
 
@@ -6084,7 +5733,7 @@ fn cmd_db_load_template() -> CommandDef {
             // `var dbTemplateMaxVars` writes the global unvalidated.
             let max_vars = db_loader::db_template_max_vars();
             if max_vars < 1 {
-                ctx.eprintln(&format!(
+                ctx.console_eprintln(&format!(
                     "{ERL_ERROR}: dbTemplateMaxVars = {max_vars}, must be +ve"
                 ));
                 return Ok(CommandOutcome::Failed);
@@ -6096,17 +5745,16 @@ fn cmd_db_load_template() -> CommandDef {
             // returning -1 rather than a parser status. No other load in the
             // port has that shape, and it is one half of what the merged
             // `parse error: <e>` could not say.
-            let file_path = resolve_substitutions_file(path, search_path);
-            let text = match std::fs::read_to_string(&file_path) {
-                Ok(text) => text,
-                Err(e) => {
-                    ctx.eprintln(&format!(
-                        "dbLoadTemplate: error opening sub file {path}: {}",
-                        super::c_strerror(&e)
-                    ));
-                    return Ok(CommandOutcome::Failed);
-                }
-            };
+            let mut text = Vec::new();
+            if let Err(e) = open_substitutions_file(path, search_path)
+                .and_then(|mut file| std::io::Read::read_to_end(&mut file, &mut text))
+            {
+                ctx.console_eprintln(&format!(
+                    "dbLoadTemplate: error opening sub file {path}: {}",
+                    super::c_strerror(&e)
+                ));
+                return Ok(CommandOutcome::Failed);
+            }
 
             // The other half: the file opened and the parse had something
             // to say about it. C reports through one `yyerror`
@@ -6136,7 +5784,7 @@ fn cmd_db_load_template() -> CommandDef {
                     // operator's console like every other line here, not a
                     // log the console never shows.
                     db_loader::SubstitutionEvent::Notice(text) => {
-                        ctx.eprintln(&text);
+                        ctx.console_eprintln(&text);
                         continue;
                     }
                     db_loader::SubstitutionEvent::Load(load) => load,
@@ -6157,15 +5805,15 @@ fn cmd_db_load_template() -> CommandDef {
                 // second install path of its own — the `.dbd` side effects
                 // (`registrar`, `link`) included.
                 let mut faults = db_loader::DbFaults::default();
-                if db_load_records(ctx, &load.file, merged, &mut faults).is_err() {
+                let sub_collect = c_sub_collect(&String::from_utf8_lossy(macros_str), &load.macros);
+                if db_load_records(ctx, &load.file, &sub_collect, merged, &mut faults).is_err() {
                     // C `msiLoadRecords` (`dbLoadTemplate.y:49-57`) names the
                     // row that failed, then `yyerror` + `YYABORT`: the rows
                     // after this one are never read, and `yyparse` fails the
                     // command.
-                    ctx.eprintln(&format!(
-                        "dbLoadRecords(\"{}\", {})",
-                        load.file,
-                        c_sub_collect(macros_str, &load.macros)
+                    ctx.console_eprintln(&format!(
+                        "dbLoadRecords(\"{}\", {sub_collect})",
+                        load.file
                     ));
                     eprint_substitution_fault(
                         ctx,
@@ -6231,7 +5879,7 @@ fn cmd_epics_env_set() -> CommandDef {
             // `iocshLoad("inner.cmd","PORT=OLD")` macro stops shadowing
             // the variable the loaded script is setting.
             super::iocsh_env_clear(name);
-            crate::runtime::env::set(name, value);
+            crate::runtime::env::set(name.to_os_str()?, value.to_os_str()?);
             Ok(CommandOutcome::Continue)
         },
     )
@@ -6250,11 +5898,12 @@ fn cmd_ioc_init() -> CommandDef {
             // `dbpf`, a `dbl`, an `asSetFilename`, runs against an IOC with
             // device support, scan threads and PINI behind it. See
             // [`crate::server::ioc_app::IocLifecycle`] for the invariant.
-            match crate::server::ioc_app::build_from_shell(ctx.bridge()) {
-                crate::server::ioc_app::ShellTransition::Done => {
-                    let _ = crate::server::ioc_app::run_from_shell(ctx.bridge());
-                    return Ok(CommandOutcome::Continue);
-                }
+            match crate::server::ioc_app::build_from_shell(
+                ctx.bridge(),
+                &|line| ctx.println(line),
+                &|line| ctx.eprintln(line),
+            ) {
+                crate::server::ioc_app::ShellTransition::Done => {}
                 crate::server::ioc_app::ShellTransition::Failed => {
                     return Ok(CommandOutcome::Failed);
                 }
@@ -6264,23 +5913,25 @@ fn cmd_ioc_init() -> CommandDef {
                     crate::runtime::log::errlog_printf(&crate::server::ioc_app::build_refusal());
                     return Ok(CommandOutcome::Failed);
                 }
-                crate::server::ioc_app::ShellTransition::NotOurs => {}
+                // No `IocApplication` build to drive: every `CaServerBuilder`
+                // binary and every bare `PvDatabase` shell reaches here. C
+                // has no such shell — `iocInit()` is `iocBuild() || iocRun()`
+                // for everyone (`iocInit.c:111-113`) — so this arm runs the
+                // same two halves over the same state cell. A link that
+                // forward-references a record loaded by a LATER
+                // `dbLoadRecords` in the same `st.cmd` must still classify as
+                // a local PV (R18-92), which the build's record-load close
+                // runs.
+                crate::server::ioc_app::ShellTransition::NotOurs => {
+                    if !ctx.block_on(crate::server::ioc_app::build_without_application(
+                        ctx.db(),
+                        |line| ctx.println(line),
+                    )) {
+                        return Ok(CommandOutcome::Failed);
+                    }
+                }
             }
-            // No `IocApplication` build to drive: every `CaServerBuilder`
-            // binary and every bare `PvDatabase` shell reaches here. C has no
-            // such shell — `iocInit()` is `iocBuild() || iocRun()` for
-            // everyone (`iocInit.c:111-113`) — so this arm runs the same two
-            // halves over the same state cell, and the record-load close is
-            // what it contributes to the build. A link that forward-references
-            // a record loaded by a LATER `dbLoadRecords` in the same `st.cmd`
-            // must still classify as a local PV (R18-92), which is what that
-            // close runs.
-            if !crate::server::ioc_app::build_without_application(|| {
-                ctx.block_on(async { ctx.db().ioc_init().await });
-            }) {
-                return Ok(CommandOutcome::Failed);
-            }
-            if crate::server::ioc_app::ioc_run() == 0 {
+            if crate::server::ioc_app::run_from_shell(ctx) {
                 Ok(CommandOutcome::Continue)
             } else {
                 Ok(CommandOutcome::Failed)
@@ -6298,32 +5949,6 @@ fn cmd_exit() -> CommandDef {
     )
 }
 
-/// C-style escape a CHAR-array buffer for `dbgf` output (epics-base
-/// dc70dfd6). Printable ASCII passes through; well-known C escapes
-/// (`\n`, `\t`, `\r`, `\\`, `\"`, `\a`, `\b`, `\f`, `\v`) get their
-/// short form; everything else is rendered as `\xNN`. Mirrors
-/// `epicsStrnEscapedFromRaw` exactly enough for the dbgf use case —
-/// the surrounding quote pair is added by the caller.
-fn escape_char_array_for_dbgf(buf: &[u8]) -> String {
-    let mut out = String::with_capacity(buf.len());
-    for &b in buf {
-        match b {
-            b'\n' => out.push_str("\\n"),
-            b'\t' => out.push_str("\\t"),
-            b'\r' => out.push_str("\\r"),
-            b'\\' => out.push_str("\\\\"),
-            b'"' => out.push_str("\\\""),
-            0x07 => out.push_str("\\a"),
-            0x08 => out.push_str("\\b"),
-            0x0c => out.push_str("\\f"),
-            0x0b => out.push_str("\\v"),
-            0x20..=0x7e => out.push(b as char),
-            _ => out.push_str(&format!("\\x{b:02x}")),
-        }
-    }
-    out
-}
-
 /// Parse a macro string like "P=IOC:,R=TEMP" into a HashMap.
 ///
 /// C `macParseDefns` (`macUtil.c`) receives text `macDefExpand` has
@@ -6332,13 +5957,14 @@ fn escape_char_array_for_dbgf(buf: &[u8]) -> String {
 /// `$(X)` the caller deliberately quoted through.
 ///
 /// Splitting honors quotes/escapes and trims whitespace via
-/// [`macro_defn_pairs`] so `DESC="a,b",P=IOC:` keeps `a,b` as one value
+/// [`macro_defn_pairs_bytes`](crate::runtime::mac_lib::macro_defn_pairs_bytes)
+/// so `DESC="a,b",P=IOC:` keeps `a,b` as one value
 /// instead of tearing it on the embedded comma (libCom `macParseDefns`
 /// parity). Deletion entries (a name with no `=`) have nothing to remove
 /// from a fresh map and are skipped.
-pub(super) fn parse_macro_string(s: &str) -> HashMap<String, String> {
+pub(super) fn parse_macro_string(s: &[u8]) -> HashMap<Vec<u8>, Vec<u8>> {
     let mut macros = HashMap::new();
-    for (k, v) in macro_defn_pairs(s) {
+    for (k, v) in crate::runtime::mac_lib::macro_defn_pairs_bytes(s) {
         if let Some(v) = v {
             if k.is_empty() {
                 continue;
@@ -6364,28 +5990,11 @@ pub(super) fn parse_macro_string(s: &str) -> HashMap<String, String> {
 /// same treatment, so the check is shared rather than re-inlined per command.
 pub(super) fn check_pdbbase(arg: &ArgValue) -> Result<(), String> {
     if let ArgValue::String(pdbbase) = arg
-        && !(pdbbase.is_empty() || pdbbase.starts_with('0') || pdbbase == "pdbbase")
+        && !(pdbbase.is_empty() || pdbbase.starts_with(b"0") || pdbbase == "pdbbase")
     {
         return Err(format!("Expecting 'pdbbase' got '{pdbbase}'."));
     }
     Ok(())
-}
-
-/// C `printf("%e", v)`: six fraction digits and a signed exponent of at least
-/// two digits. Rust's `{:.6e}` writes the digits but spells the exponent `e2`
-/// where C writes `e+02`, so `dbDumpBreaktable` (`dbStaticLib.c:3549-3550`)
-/// needs the fixup to emit C's bytes.
-fn c_exponential(v: f64) -> String {
-    if !v.is_finite() {
-        return format!("{v}");
-    }
-    let formatted = format!("{v:.6e}");
-    let (mantissa, exponent) = formatted
-        .split_once('e')
-        .expect("Rust LowerExp always emits an `e`");
-    let exponent: i32 = exponent.parse().expect("Rust LowerExp emits a decimal");
-    let sign = if exponent < 0 { '-' } else { '+' };
-    format!("{mantissa}e{sign}{:02}", exponent.abs())
 }
 
 /// The `DBF_INLINK` / `DBF_OUTLINK` / `DBF_FWDLINK` column `dblsr` prints for
@@ -6415,7 +6024,7 @@ fn link_field_kind(record_type: &str, field: &str) -> Option<&'static str> {
 /// Only a link that resolved LOCALLY appears, because C reads
 /// `plink->type != DB_LINK` and skips everything else — a `ca://` target is a
 /// `CA_LINK` and prints nothing here even when the name is local.
-fn dblsr_link_lines(db: &crate::server::database::PvDatabase, record: &str) -> Vec<String> {
+fn dblsr_link_lines(db: &crate::server::database::PvDatabase, record: &[u8]) -> Vec<Vec<u8>> {
     use crate::server::record::ParsedLink;
     let Some(record_type) = db
         .get_record(record)
@@ -6441,13 +6050,14 @@ fn dblsr_link_lines(db: &crate::server::database::PvDatabase, record: &str) -> V
                 } else {
                     "NPP"
                 };
-                Some(format!(
-                    "\t{field}{} {pp} {} {target}",
+                let head = format!(
+                    "\t{field}{} {pp} {} ",
                     link_field_kind(record_type, &field)?,
                     crate::server::record::record_instance::monitor_switch_word(
                         link.monitor_switch
                     )
-                ))
+                );
+                Some([head.as_bytes(), &target].concat())
             }
             _ => None,
         })
@@ -6460,24 +6070,27 @@ fn dblsr_set_lines(
     db: &crate::server::database::PvDatabase,
     set: &crate::server::database::LockSetInfo,
     level: i64,
-) -> Vec<String> {
-    let mut lines = vec![format!(
-        "Lock Set {} {} members {} refs epicsMutexId {}",
-        set.id,
-        set.members.len(),
-        set.refs,
-        // C prints the `epicsMutexId` with `%p`; this is the same identity the
-        // process mutex list carries for that mutex, so `dbLockShowLocked` and
-        // `epicsMutexShowAll` name the set with the same number.
-        set.mutex
-            .as_ref()
-            .map_or_else(|| "(nil)".to_string(), |m| format!("{:#x}", m.addr()))
-    )];
+) -> Vec<Vec<u8>> {
+    let mut lines = vec![
+        format!(
+            "Lock Set {} {} members {} refs epicsMutexId {}",
+            set.id,
+            set.members.len(),
+            set.refs,
+            // C prints the `epicsMutexId` with `%p`; this is the same identity the
+            // process mutex list carries for that mutex, so `dbLockShowLocked` and
+            // `epicsMutexShowAll` name the set with the same number.
+            set.mutex
+                .as_ref()
+                .map_or_else(|| "(nil)".to_string(), |m| format!("{:#x}", m.addr()))
+        )
+        .into_bytes(),
+    ];
     if level == 0 {
         return lines;
     }
     for member in &set.members {
-        lines.push(member.clone());
+        lines.push(member.to_vec());
         if level <= 1 {
             continue;
         }
@@ -6542,7 +6155,7 @@ fn cmd_dblsr() -> CommandDef {
 
             for set in &sets {
                 for line in dblsr_set_lines(db, set, level) {
-                    ctx.println(&line);
+                    ctx.println_bytes(&line);
                 }
             }
             Ok(CommandOutcome::Continue)
@@ -6624,9 +6237,8 @@ fn cmd_dblsr() -> CommandDef {
 /// * **`nNoWrite` comes from the database, not from the lset.** C stages the
 ///   pending out-value on the `caLink` and counts the overwrite there
 ///   (`dbCa.c:548`, `:582`); this port stages it on
-///   [`PvDatabase::external_link_puts_coalesced_for`]'s queue, keyed by
-///   `(scheme, PV name)`. Two record fields naming one PV therefore share the
-///   count where C gives each its own.
+///   [`PvDatabase::external_link_puts_coalesced_for`]'s queue, keyed per
+///   link field as the `caLink` is.
 /// * **The `[IN IS ON OS]` columns.** `ON`/`OS` are dead at the pin — both
 ///   assignments sit inside `/* Disabled by ANJ ... */` (`dbCa.c:539-542`,
 ///   `:555-558`) — so C prints them blank too. `IS` needs C's second,
@@ -6680,7 +6292,7 @@ fn cmd_dbcar() -> CommandDef {
             // instead short-circuits after the first match (`dbCaTest.c:138`)
             // and DOES match an alias, which `get_record` resolves.
             let records = match &only {
-                Some(name) => vec![name.clone()],
+                Some(name) => vec![RecordName::from(name.as_bytes())],
                 None => record_names_type_major(ctx),
             };
             let ca_lset = ctx.block_on(ctx.db().link_set("ca"));
@@ -6714,10 +6326,15 @@ fn cmd_dbcar() -> CommandDef {
                 for (field, _raw, parsed) in fields {
                     let ParsedLink::Ca(ca) = parsed else { continue };
                     ncalinks += 1;
-                    let diagnostics = ca_lset
-                        .as_ref()
-                        .and_then(|lset| ctx.block_on(lset.link_diagnostics(&ca.pv)));
-                    let no_write = ctx.db().external_link_puts_coalesced_for(&ca.pv);
+                    let diagnostics = ca_lset.as_ref().and_then(|lset| {
+                        ctx.block_on(lset.link_diagnostics(crate::server::database::LinkRef::new(
+                            ca.pv.as_bytes(),
+                            &ca.open,
+                        )))
+                    });
+                    let no_write = ctx
+                        .db()
+                        .external_link_puts_coalesced_for(&record, &field, &ca.pv);
                     match diagnostics {
                         Some(d) if d.connected => {
                             nconnected += 1;
@@ -6738,16 +6355,18 @@ fn cmd_dbcar() -> CommandDef {
                                     ["No Access", "Read Only", "Write Only", "Read/Write"];
                                 let rights =
                                     usize::from(d.read_access) | usize::from(d.write_access) << 1;
-                                ctx.println(&format!(
-                                    "{:>21} [{}{}{}{}] host {}, {}",
+                                let mut line = format!(
+                                    "{:>21} [{}{}{}{}] host ",
                                     "",
                                     if d.input_native { "IN" } else { "  " },
                                     if d.input_string { "IS" } else { "  " },
                                     if d.output_native { "ON" } else { "  " },
                                     if d.output_string { "OS" } else { "  " },
-                                    d.host,
-                                    RIGHTS[rights],
-                                ));
+                                )
+                                .into_bytes();
+                                line.extend_from_slice(&d.host);
+                                line.extend_from_slice(format!(", {}", RIGHTS[rights]).as_bytes());
+                                ctx.println_bytes(&line);
                             }
                         }
                         // C's `pca ? pca->nDisconnect : 0` (`dbCaTest.c:131`):
@@ -6799,7 +6418,7 @@ fn cmd_db_notify_dump() -> CommandDef {
             // already holding — the waitList of one block names records
             // whose own blocks are still to come.
             struct Row {
-                name: String,
+                name: RecordName,
                 notify: Option<Arc<crate::server::record::NotifyWaitSet>>,
                 pact: bool,
                 queued: usize,
@@ -6824,13 +6443,13 @@ fn cmd_db_notify_dump() -> CommandDef {
             // appear only inside the entry's `waitList`.
             for row in rows
                 .iter()
-                .filter(|r| r.notify.as_ref().and_then(|w| w.entry_record()) == Some(&r.name[..]))
+                .filter(|r| r.notify.as_ref().and_then(|w| w.entry_record()) == Some(&r.name))
             {
                 let ws = row.notify.as_ref().expect("filtered");
                 // C's `notifyProcessInProgress` / `notifyUserCallbackRequested`
                 // — the two of its seven states the port's slot distinguishes.
                 let state = if ws.completed() { 5 } else { 4 };
-                ctx.println(&format!(
+                ctx.console_println(&format!(
                     "{} state {} ppn {:p}\n  waitList",
                     row.name,
                     state,
@@ -6840,16 +6459,16 @@ fn cmd_db_notify_dump() -> CommandDef {
                     .iter()
                     .filter(|m| m.notify.as_ref().is_some_and(|w| Arc::ptr_eq(w, ws)))
                 {
-                    ctx.println(&format!(
+                    ctx.console_println(&format!(
                         "    {} pact {}",
                         member.name,
                         u8::from(member.pact)
                     ));
                 }
                 if row.queued > 0 {
-                    ctx.println(&format!("{} restartList", row.name));
+                    ctx.console_println(&format!("{} restartList", row.name));
                     for _ in 0..row.queued {
-                        ctx.println(&format!("    {}", row.name));
+                        ctx.console_println(&format!("    {}", row.name));
                     }
                 }
             }
@@ -6908,12 +6527,12 @@ fn cmd_db_put_attribute() -> CommandDef {
             // and an argument given as `""` is a zero-length string, and
             // `dbPutAttribute` treats the two differently.
             let text = |arg: &ArgValue| match arg {
-                ArgValue::String(s) => Some(s.clone()),
-                _ => None,
+                ArgValue::String(s) => s.to_str().map(|s| Some(s.to_owned())),
+                _ => Ok(None),
             };
-            let record_type = text(&args[0]).unwrap_or_default();
-            let name = text(&args[1]);
-            let value = text(&args[2]);
+            let record_type = text(&args[0])?.unwrap_or_default();
+            let name = text(&args[1])?;
+            let value = text(&args[2])?;
 
             match ctx.db().put_record_type_attribute(
                 &record_type,
@@ -6922,7 +6541,7 @@ fn cmd_db_put_attribute() -> CommandDef {
             ) {
                 Ok(()) => Ok(CommandOutcome::Continue),
                 Err(e) => {
-                    crate::runtime::log::errlog_printf(&format!(
+                    crate::runtime::log::errlog_vprintf(format_args!(
                         "{} filename=\"{}\" line number={}  dbPutAttribute failure\n",
                         e.message(),
                         file!(),
@@ -7089,7 +6708,7 @@ fn cmd_dbla() -> CommandDef {
                 }
                 // C prints the target's NAME field (`dbTest.c:265-266`),
                 // which is the record's own name.
-                ctx.println(&format!("{} -> {target}", node.name));
+                ctx.println_bytes(&[&node.name[..], b" -> ", &target].concat());
             }
             Ok(CommandOutcome::Continue)
         },
@@ -7124,14 +6743,14 @@ fn cmd_dbli() -> CommandDef {
                 // out sorted by tag name.
                 let mut tags: Vec<(String, String)> = rec
                     .read()
-                    .info
+                    .info()
                     .iter()
                     .map(|(key, value)| (key.clone(), value.clone()))
                     .collect();
                 tags.sort();
                 for (key, value) in tags {
                     if let Some(pattern) = &pattern
-                        && !glob_match(pattern, &key)
+                        && !glob_match(pattern, key.as_bytes())
                     {
                         continue;
                     }
@@ -7184,7 +6803,7 @@ fn cmd_db_create_alias() -> CommandDef {
             let target = ctx
                 .db()
                 .resolve_alias(record)
-                .unwrap_or_else(|| record.clone());
+                .unwrap_or_else(|| RecordName::from(record.as_bytes()));
             match ctx.block_on(ctx.db().add_alias(alias, &target)) {
                 Ok(()) => Ok(CommandOutcome::Continue),
                 // `add_alias` rejects a missing target with `ChannelNotFound`
@@ -7208,12 +6827,12 @@ fn cmd_db_create_alias() -> CommandDef {
 fn print_db_state(ctx: &CommandContext, name: &str, state: &std::sync::Arc<DbState>, level: i64) {
     let value = if state.get() { "TRUE" } else { "FALSE" };
     if level >= 1 {
-        ctx.println(&format!(
+        ctx.console_println(&format!(
             "id {:p} '{name}' : {value}",
             std::sync::Arc::as_ptr(state)
         ));
     } else {
-        ctx.println(value);
+        ctx.console_println(value);
     }
 }
 
@@ -7240,7 +6859,8 @@ fn cmd_db_state_create() -> CommandDef {
                 // line fails and nothing is printed.
                 return Ok(CommandOutcome::Failed);
             };
-            crate::server::database::filters::sync::db_state_registry().get_or_create(name);
+            crate::server::database::filters::sync::db_state_registry()
+                .get_or_create(name.to_str()?);
             let _ = ctx;
             Ok(CommandOutcome::Continue)
         },
@@ -7298,14 +6918,14 @@ fn cmd_db_state_show() -> CommandDef {
                 return Ok(CommandOutcome::Failed);
             };
             let name = match &args[0] {
-                ArgValue::String(s) => s.as_str(),
-                _ => "",
+                ArgValue::String(s) => s.to_str_lossy(),
+                _ => "".into(),
             };
             let level = match args[1] {
                 ArgValue::Int(v) => v,
                 _ => 0,
             };
-            print_db_state(ctx, name, &state, level);
+            print_db_state(ctx, &name, &state, level);
             Ok(CommandOutcome::Continue)
         },
     )
@@ -7346,7 +6966,7 @@ fn find_db_state(arg: &ArgValue) -> Option<std::sync::Arc<DbState>> {
     let ArgValue::String(name) = arg else {
         return None;
     };
-    crate::server::database::filters::sync::db_state_registry().find(name)
+    crate::server::database::filters::sync::db_state_registry().find(name.to_str().ok()?)
 }
 
 /// `dbDumpBreaktable pdbbase [tableName]` — C `dbDumpBreaktable`
@@ -7413,17 +7033,17 @@ fn cmd_db_dump_breaktable() -> CommandDef {
             let registry = ctx.db().breaktable_registry();
             for table in registry.tables() {
                 if let Some(wanted) = &wanted
-                    && *wanted != table.name
+                    && wanted.as_bytes() != table.name.as_bytes()
                 {
                     continue;
                 }
                 ctx.println(&format!("breaktable({}) {{", table.name));
                 for point in &table.points {
                     ctx.println(&format!(
-                        "\traw={:.6} slope={} eng={:.6}",
-                        point.raw,
-                        c_exponential(point.slope),
-                        point.eng
+                        "\traw={} slope={:e} eng={}",
+                        CFloat(point.raw),
+                        CFloat(point.slope),
+                        CFloat(point.eng)
                     ));
                 }
                 ctx.println("}");
@@ -7435,60 +7055,62 @@ fn cmd_db_dump_breaktable() -> CommandDef {
 
 #[cfg(test)]
 mod dbgf_escape_tests {
-    use super::escape_char_array_for_dbgf;
+    use crate::calc::engine::string::escaped_from_raw;
 
     /// epics-base dc70dfd6 — printable ASCII passes through unchanged.
     #[test]
     fn printable_ascii_passes_through() {
-        assert_eq!(escape_char_array_for_dbgf(b"hello"), "hello");
-        assert_eq!(escape_char_array_for_dbgf(b"a b c"), "a b c");
+        assert_eq!(escaped_from_raw(b"hello"), "hello");
+        assert_eq!(escaped_from_raw(b"a b c"), "a b c");
     }
 
     /// Common C escapes get their short form.
     #[test]
     fn common_c_escapes() {
-        assert_eq!(escape_char_array_for_dbgf(b"a\nb"), "a\\nb");
-        assert_eq!(escape_char_array_for_dbgf(b"a\tb"), "a\\tb");
-        assert_eq!(escape_char_array_for_dbgf(b"a\rb"), "a\\rb");
-        assert_eq!(escape_char_array_for_dbgf(b"a\\b"), "a\\\\b");
-        assert_eq!(escape_char_array_for_dbgf(b"a\"b"), "a\\\"b");
-        assert_eq!(escape_char_array_for_dbgf(b"a\x07b"), "a\\ab");
-        assert_eq!(escape_char_array_for_dbgf(b"a\x08b"), "a\\bb");
-        assert_eq!(escape_char_array_for_dbgf(b"a\x0cb"), "a\\fb");
-        assert_eq!(escape_char_array_for_dbgf(b"a\x0bb"), "a\\vb");
+        assert_eq!(escaped_from_raw(b"a\nb"), "a\\nb");
+        assert_eq!(escaped_from_raw(b"a\tb"), "a\\tb");
+        assert_eq!(escaped_from_raw(b"a\rb"), "a\\rb");
+        assert_eq!(escaped_from_raw(b"a\\b"), "a\\\\b");
+        assert_eq!(escaped_from_raw(b"a\"b"), "a\\\"b");
+        assert_eq!(escaped_from_raw(b"a\x07b"), "a\\ab");
+        assert_eq!(escaped_from_raw(b"a\x08b"), "a\\bb");
+        assert_eq!(escaped_from_raw(b"a\x0cb"), "a\\fb");
+        assert_eq!(escaped_from_raw(b"a\x0bb"), "a\\vb");
     }
 
     /// Other non-printable bytes (and any high-bit byte) become `\xNN`.
     #[test]
     fn other_bytes_use_hex_escape() {
-        assert_eq!(escape_char_array_for_dbgf(&[0x01, 0xff]), "\\x01\\xff");
+        assert_eq!(escaped_from_raw(&[0x01, 0xff]), "\\x01\\xff");
         // DEL (0x7f) is non-printable per the C convention.
-        assert_eq!(escape_char_array_for_dbgf(&[0x7f]), "\\x7f");
+        assert_eq!(escaped_from_raw(&[0x7f]), "\\x7f");
         // Empty buffer stays empty.
-        assert_eq!(escape_char_array_for_dbgf(&[]), "");
-    }
-}
-
-/// Map common field names to their DBF types.
-fn common_field_dbf_type(field: &str) -> Option<crate::types::DbFieldType> {
-    use crate::types::DbFieldType;
-    match field {
-        "SCAN" => Some(DbFieldType::String),
-        "DTYP" => Some(DbFieldType::String),
-        "INP" | "OUT" | "FLNK" | "ASG" => Some(DbFieldType::String),
-        // The dbCommon `DBF_MENU` fields carry a menu index (served as
-        // `DBR_ENUM`); `UDF`/`TPRO` are the genuine `DBF_UCHAR` flags.
-        "SEVR" | "STAT" | "PINI" => Some(DbFieldType::Short),
-        "UDF" | "TPRO" => Some(DbFieldType::Char),
-        "HIHI" | "HIGH" | "LOW" | "LOLO" => Some(DbFieldType::Double),
-        "HHSV" | "HSV" | "LSV" | "LLSV" => Some(DbFieldType::Short),
-        _ => None,
+        assert_eq!(escaped_from_raw(&[]), "");
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// C `afterIocRunningDef` (`afterIocRunning.c:18-29`), which `help`
+    /// prints.
+    #[test]
+    fn after_ioc_running_help_is_c_s() {
+        let def = cmd_after_ioc_running();
+        assert_eq!(def.args.len(), 1);
+        assert_eq!(def.args[0].name, "command (before iocInit)");
+        assert!(matches!(def.args[0].arg_type, ArgType::String));
+        assert_eq!(
+            def.usage,
+            "Allows you to define commands to be run after the iocInit\n\
+             Example commands:\n  \
+             afterIocRunning \"dbpf <PV> <VAL>\"\n  \
+             afterIocRunning \"date\"\n  \
+             afterIocRunning \"dbpf $(P)EvtClkSource-Sel 'Upstream (fanout)'\"\n  \
+             afterIocRunning \"dbpf $(P)Enable-Sel Enabled\""
+        );
+    }
 
     /// `dblsr`'s type word is `pdbFldDes->field_type`, so the same field NAME
     /// takes a different word on a different record type. Measured against
@@ -7532,13 +7154,17 @@ mod tests {
     #[test]
     fn the_failed_read_reports_c_s_own_dbget_message() {
         assert_eq!(
-            dbget_bad_dbrtype_message(DbfCode::NoAccess, DbfCode::NoAccess),
+            crate::server::recgbl::bad_dbrtype_message(
+                "dbGet",
+                DbfCode::NoAccess,
+                DbfCode::NoAccess
+            ),
             "dbGet: dbrType = 17, field_type = DBF_NOACCESS (17)."
         );
         // The two codes are distinct inputs, so a renderer that printed one
         // twice would pass the case above and fail this one.
         assert_eq!(
-            dbget_bad_dbrtype_message(DbfCode::String, DbfCode::Device),
+            crate::server::recgbl::bad_dbrtype_message("dbGet", DbfCode::String, DbfCode::Device),
             "dbGet: dbrType = 0, field_type = DBF_DEVICE (13)."
         );
     }
@@ -7839,18 +7465,25 @@ mod tests {
 
     #[async_trait::async_trait]
     impl crate::server::database::LinkSet for StubCaLset {
-        fn is_connected(&self, name: &str) -> bool {
+        fn is_connected(&self, link: crate::server::database::LinkRef<'_>) -> bool {
+            let name = link.name;
             self.links
                 .lock()
                 .unwrap()
-                .get(name)
+                .get(std::str::from_utf8(name).unwrap())
                 .is_some_and(|d| d.connected)
         }
-        async fn get_value(&self, _name: &str) -> Option<EpicsValue> {
+        async fn get_value(
+            &self,
+            _name: crate::server::database::LinkRef<'_>,
+        ) -> Option<EpicsValue> {
             None
         }
-        fn put_admission(&self, name: &str) -> crate::server::database::PutAdmission {
-            if self.is_connected(name) {
+        fn put_admission(
+            &self,
+            link: crate::server::database::LinkRef<'_>,
+        ) -> crate::server::database::PutAdmission {
+            if self.is_connected(link) {
                 crate::server::database::PutAdmission::Connected
             } else {
                 crate::server::database::PutAdmission::Refused
@@ -7858,7 +7491,7 @@ mod tests {
         }
         async fn put_value(
             &self,
-            _name: &str,
+            _name: crate::server::database::LinkRef<'_>,
             _value: EpicsValue,
             _op: crate::server::database::LinkPutOp,
         ) -> Result<(), String> {
@@ -7874,12 +7507,22 @@ mod tests {
         }
         async fn link_diagnostics(
             &self,
-            name: &str,
+            link: crate::server::database::LinkRef<'_>,
         ) -> Option<crate::server::database::LinkDiagnostics> {
-            self.links.lock().unwrap().get(name).cloned()
+            let name = link.name;
+            self.links
+                .lock()
+                .unwrap()
+                .get(std::str::from_utf8(name).unwrap())
+                .cloned()
         }
-        fn link_names(&self) -> Vec<String> {
-            self.links.lock().unwrap().keys().cloned().collect()
+        fn link_names(&self) -> Vec<crate::types::RecordName> {
+            self.links
+                .lock()
+                .unwrap()
+                .keys()
+                .map(|k| k.as_str().into())
+                .collect()
         }
     }
 
@@ -7891,7 +7534,7 @@ mod tests {
     ) -> crate::server::database::LinkDiagnostics {
         crate::server::database::LinkDiagnostics {
             connected,
-            host: "ioc1.lab:5064".to_string(),
+            host: b"ioc1.lab:5064".to_vec(),
             read_access: read,
             write_access: write,
             n_disconnect: nd,
@@ -7937,6 +7580,7 @@ mod tests {
         let lset = Arc::new(StubCaLset::default());
         ctx.block_on(db.register_link_set("ca", lset.clone()));
         ctx.block_on(db.ioc_init());
+        ctx.block_on(db.process_cp_links_on_connect());
         (db, ctx, lset, dir)
     }
 
@@ -8021,6 +7665,35 @@ mod tests {
         assert_eq!(
             lines[3],
             "                      [IN      ] host ioc1.lab:5064, Read/Write"
+        );
+    }
+
+    /// `%s` of `ca_host_name` prints the resolver's bytes, UTF-8 or not.
+    #[test]
+    fn a_non_utf8_host_name_is_printed_as_its_bytes() {
+        let (_db, ctx, lset, _dir) = dbcar_ctx();
+        lset.set(
+            "UP:PV",
+            crate::server::database::LinkDiagnostics {
+                host: b"caf\xe9.lab:5064".to_vec(),
+                ..diag(true, true, true, 0)
+            },
+        );
+        let mut registry = CommandRegistry::new();
+        register_builtins(&mut registry);
+        let cmd = registry.get("dbcar").unwrap();
+        let tokens = ["L:UP", "2"].map(IocshString::from);
+        let args = parse_args(&tokens, &cmd.args).unwrap();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        ctx.with_output(std::fs::File::create(tmp.path()).unwrap(), || {
+            cmd.handler.call(&args, &ctx).unwrap();
+        });
+        let out = std::fs::read(tmp.path()).unwrap();
+        let needle = b"[IN      ] host caf\xe9.lab:5064, Read/Write\n";
+        assert!(
+            out.windows(needle.len()).any(|w| w == needle),
+            "{}",
+            String::from_utf8_lossy(&out)
         );
     }
 
@@ -8164,17 +7837,52 @@ mod tests {
         let (db, ctx, lset, _dir) = dbcar_ctx();
         lset.set("UP:PV", diag(true, true, true, 0));
         let entered = lset.hold_puts();
-        db.write_external_pv("UP:PV", EpicsValue::Double(1.0), None)
+        let inp = crate::server::database::LinkId {
+            rec: db.get_record("L:UP").unwrap().index(),
+            field: "INP",
+            install: crate::server::database::LinkInstall::Detached,
+        };
+        // The record's own link, whose channel the writes share.
+        let held = db
+            .get_record("L:UP")
+            .unwrap()
+            .read()
+            .stored_link("INP")
+            .cloned()
             .unwrap();
+        let up = held.external().unwrap();
+        db.write_external_pv(
+            inp.clone(),
+            up,
+            EpicsValue::Double(1.0),
+            crate::server::database::ExternalDone::None,
+        )
+        .unwrap();
         entered.recv().expect("the first write reached the lset");
         // Staged behind an in-flight write: restaged, nothing displaced.
-        db.write_external_pv("UP:PV", EpicsValue::Double(2.0), None)
-            .unwrap();
-        assert_eq!(db.external_link_puts_coalesced_for("UP:PV"), 0);
+        db.write_external_pv(
+            inp.clone(),
+            up,
+            EpicsValue::Double(2.0),
+            crate::server::database::ExternalDone::None,
+        )
+        .unwrap();
+        assert_eq!(
+            db.external_link_puts_coalesced_for("L:UP", "INP", "UP:PV"),
+            0
+        );
         // Now one IS displaced.
-        db.write_external_pv("UP:PV", EpicsValue::Double(3.0), None)
-            .unwrap();
-        assert_eq!(db.external_link_puts_coalesced_for("UP:PV"), 1);
+        db.write_external_pv(
+            inp.clone(),
+            up,
+            EpicsValue::Double(3.0),
+            crate::server::database::ExternalDone::None,
+        )
+        .unwrap();
+        assert_eq!(
+            db.external_link_puts_coalesced_for("L:UP", "INP", "UP:PV"),
+            1
+        );
         let out = run_cmd(&ctx, "dbcar", &["L:UP", "2"]);
         assert!(
             out.contains("==> UP:PV                         (0, 1)"),
@@ -8234,6 +7942,35 @@ mod tests {
         assert!(
             run_cmd(&ctx, "dbgf", &["A:ONE.VERS"]).contains("\"none specified\""),
             "the shell path resolves it too"
+        );
+    }
+
+    /// The seed covers every record type the IOC knows, including one
+    /// another crate supplies (`epid`, `sscan`): C seeds each `.dbd` it reads.
+    #[test]
+    fn a_record_type_outside_the_generated_table_starts_with_rtyp_and_vers() {
+        struct Supplied;
+        impl crate::server::record::Record for Supplied {
+            fn record_type(&self) -> &'static str {
+                "suppliedType"
+            }
+            fn get_field(&self, _: &str) -> Option<crate::types::EpicsValue> {
+                None
+            }
+            fn put_field(&mut self, _: &str, _: crate::types::EpicsValue) -> CaResult<()> {
+                Ok(())
+            }
+            fn declared_fields(&self) -> &'static [crate::server::record::FieldDesc] {
+                crate::server::record::dbd_generated::record_fields("longin").unwrap()
+            }
+        }
+        let (db, ctx) = make_ctx();
+        ctx.block_on(db.add_record("S:ONE", Box::new(Supplied)))
+            .unwrap();
+        assert_eq!(attr_of(&db, "S:ONE.RTYP").as_deref(), Some("suppliedType"));
+        assert_eq!(
+            attr_of(&db, "S:ONE.VERS").as_deref(),
+            Some("none specified")
         );
     }
 
@@ -8410,28 +8147,24 @@ mod tests {
     /// Lock Set 3 2 members 2 refs epicsMutexId 0x60c74b8a5c10
     /// ```
     ///
-    /// Two sets for three records, member counts 2 and 1, and `refs` equal to
-    /// the member count because nothing holds a set. The ids and therefore the
-    /// listing order differ from C's — C numbers sets in record-type order and
-    /// this port in name order — which is why the assertion is on the shape
-    /// and the counts rather than on C's exact digits.
+    /// Two sets for three records, numbered in record-type order — the `ai`
+    /// R:C before the `calc` pair — and `refs` equal to the member count
+    /// because nothing holds a set. Only the mutex address is not C's.
     #[test]
     fn dblsr_reports_one_set_per_link_component() {
         let (_db, ctx, _dir) = lock_set_ctx();
         let out = run_cmd(&ctx, "dblsr", &["*", "0"]);
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines.len(), 2, "three records, two lock sets:\n{out}");
-        for (line, members) in lines.iter().zip([2, 1]) {
+        for (line, expected) in lines
+            .iter()
+            .zip(["Lock Set 2 1 members 1 refs", "Lock Set 3 2 members 2 refs"])
+        {
             let head = line
                 .split(" epicsMutexId ")
                 .next()
                 .expect("split always yields one");
-            let id: u64 = head.split_whitespace().nth(2).unwrap().parse().unwrap();
-            assert_eq!(
-                head,
-                format!("Lock Set {id} {members} members {members} refs"),
-                "in {line}"
-            );
+            assert_eq!(head, expected, "in {line}");
             assert!(
                 line.contains(" epicsMutexId 0x"),
                 "C prints the set's epicsMutexId with %p: {line}"
@@ -8637,13 +8370,13 @@ mod tests {
 
         struct Chatty;
         impl DriverSupport for Chatty {
-            fn report(&self, level: i32) -> Option<String> {
-                Some(format!("  chatty state, level {level}"))
+            fn report(&self, level: i32) -> Option<Vec<u8>> {
+                Some(format!("  chatty state, level {level}\n").into_bytes())
             }
         }
         struct NoReport;
         impl DriverSupport for NoReport {
-            fn report(&self, _level: i32) -> Option<String> {
+            fn report(&self, _level: i32) -> Option<Vec<u8>> {
                 None
             }
         }
@@ -8717,9 +8450,9 @@ mod tests {
                 .unwrap();
         });
         db.get_record("TICKER").unwrap().write().common.scan = ScanType::SEC1;
-        db.update_scan_index("TICKER", ScanType::Passive, ScanType::SEC1, 0, 0);
+        db.update_scan_index(b"TICKER", ScanType::Passive, ScanType::SEC1, 0, 0);
         db.get_record("IDLE").unwrap().write().common.scan = ScanType::Event;
-        db.update_scan_index("IDLE", ScanType::Passive, ScanType::Event, 0, 0);
+        db.update_scan_index(b"IDLE", ScanType::Passive, ScanType::Event, 0, 0);
         for _ in 0..3 {
             db.record_scan_overrun(ScanType::SEC1);
         }
@@ -8775,7 +8508,7 @@ mod tests {
         // record on a second rate and check the order rather than asserting
         // on one list.
         db.get_record("IDLE").unwrap().write().common.scan = ScanType::SEC10;
-        db.update_scan_index("IDLE", ScanType::Event, ScanType::SEC10, 0, 0);
+        db.update_scan_index(b"IDLE", ScanType::Event, ScanType::SEC10, 0, 0);
         let buf2 = Arc::new(Mutex::new(Vec::new()));
         ctx.with_output(Sink(buf2.clone()), || {
             cmd.handler.call(&args, &ctx).unwrap();
@@ -8834,7 +8567,7 @@ mod tests {
                 let rec = db.get_record(name).unwrap();
                 let mut w = rec.write();
                 w.common.scan = scan;
-                w.common.evnt = evnt.to_string();
+                w.common.text.evnt = evnt.into();
             }
             db.update_scan_index(name, ScanType::Passive, scan, 0, 0);
         }
@@ -8876,6 +8609,867 @@ mod tests {
         );
     }
 
+    /// C `scanpel` walks `pevent_list`, newest handle first, and labels a
+    /// numeric event by its `%i` number. Oracle — softIoc 7.0.10.1-DEV on
+    /// six calcs loaded TH, TD, TF, TA, TB, T3 with EVNT `0x10`, `16`,
+    /// `0x1p4`, `alpha`, `beta`, `3`:
+    ///
+    /// ```text
+    /// epics> scanpel
+    /// Event "3"
+    ///  Priority Low
+    ///     T3
+    /// Event "beta"
+    ///  Priority Low
+    ///     TB
+    /// Event "alpha"
+    ///  Priority Low
+    ///     TA
+    /// Event "16"
+    ///  Priority Low
+    ///     TH                              TD                              TF
+    /// ```
+    #[test]
+    fn scanpel_walks_events_newest_first_like_c() {
+        use crate::server::record::ScanType;
+
+        let (db, ctx) = make_ctx();
+        let events = [
+            ("TH", "0x10"),
+            ("TD", "16"),
+            ("TF", "0x1p4"),
+            ("TA", "alpha"),
+            ("TB", "beta"),
+            ("T3", "3"),
+        ];
+        ctx.block_on(async {
+            for (name, _) in events {
+                db.add_record(name, Box::new(AiRecord::new(1.0)))
+                    .await
+                    .unwrap();
+            }
+        });
+        for (name, evnt) in events {
+            {
+                let rec = db.get_record(name).unwrap();
+                let mut w = rec.write();
+                w.common.scan = ScanType::Event;
+                w.common.text.evnt = evnt.into();
+            }
+            db.update_scan_index(name, ScanType::Passive, ScanType::Event, 0, 0);
+        }
+        ctx.block_on(db.ioc_init());
+
+        let headers: Vec<String> = run_cmd(&ctx, "scanpel", &[])
+            .lines()
+            .filter(|l| l.starts_with("Event "))
+            .map(str::to_string)
+            .collect();
+        assert_eq!(
+            headers,
+            [
+                "Event \"3\"",
+                "Event \"beta\"",
+                "Event \"alpha\"",
+                "Event \"16\""
+            ]
+        );
+        let out = run_cmd(&ctx, "scanpel", &["16"]);
+        for name in ["TH", "TD", "TF"] {
+            assert!(out.contains(name), "{name} is on event 16 — got:\n{out}");
+        }
+    }
+
+    /// C `dbgf` reads a long-string VAL as `DBR_STRING` and prints it as one
+    /// string; a CHAR waveform and a `$` view of a string or link field are
+    /// char arrays, which C prints as one quoted string under `DBF_CHAR[n]`.
+    /// `$` on any other field, or on an undotted name, is not found.
+    /// Oracle — softIoc
+    /// 7.0.10.1-DEV, each record holding "abc":
+    ///
+    /// ```text
+    /// dbgf LSI      -> DBF_STRING:         "abc"
+    /// dbgf LSO      -> DBF_STRING:         "abc"
+    /// dbgf PF       -> DBF_STRING:         "abc"
+    /// dbgf WF       -> DBF_CHAR[3]:        "abc"
+    /// dbgf LSI.VAL$ -> DBF_CHAR[4]:        "abc"   (LSO, PF, SI alike)
+    /// dbgf LSO.DOL$ -> DBF_CHAR:           0 = 0x0
+    /// dbgf AI.VAL$  -> PV 'AI.VAL$' not found
+    /// dbgf LSI$     -> PV 'LSI$' not found
+    /// ```
+    #[test]
+    fn dbgf_prints_a_long_string_val_as_softioc_does() {
+        let (db, ctx) = make_ctx();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lstr.db");
+        std::fs::write(
+            &path,
+            "record(lsi, \"LSI\") { field(INP, {const:\"abc\"}) }\n\
+             record(lso, \"LSO\") { }\n\
+             record(printf, \"PF\") { field(FMT, \"abc\") }\n\
+             record(waveform, \"WF\") { field(NELM, \"8\") field(FTVL, \"CHAR\") field(INP, [97,98,99]) }\n\
+             record(ai, \"AI\") { }\n\
+             record(stringin, \"SI\") { field(VAL, \"abc\") }\n",
+        )
+        .unwrap();
+        run_cmd(&ctx, "dbLoadRecords", &[path.to_str().unwrap()]);
+        ctx.block_on(db.ioc_init());
+        run_cmd(&ctx, "dbpf", &["LSI.PROC", "1"]);
+        run_cmd(&ctx, "dbpf", &["LSO.VAL", "abc"]);
+        run_cmd(&ctx, "dbpf", &["PF.PROC", "1"]);
+        run_cmd(&ctx, "dbpf", &["WF.PROC", "1"]);
+        for (pv, want) in [
+            ("LSI", "DBF_STRING:         \"abc\"     \n"),
+            ("LSO", "DBF_STRING:         \"abc\"     \n"),
+            ("PF", "DBF_STRING:         \"abc\"     \n"),
+            ("WF", "DBF_CHAR[3]:        \"abc\"     \n"),
+            ("LSI.VAL$", "DBF_CHAR[4]:        \"abc\"     \n"),
+            ("LSO.VAL$", "DBF_CHAR[4]:        \"abc\"     \n"),
+            ("PF.VAL$", "DBF_CHAR[4]:        \"abc\"     \n"),
+            ("SI.VAL$", "DBF_CHAR[4]:        \"abc\"     \n"),
+            ("LSO.DOL$", "DBF_CHAR:           0 = 0x0   \n"),
+            ("AI.VAL$", "PV 'AI.VAL$' not found\n"),
+            ("LSI$", "PV 'LSI$' not found\n"),
+        ] {
+            assert_eq!(run_cmd(&ctx, "dbgf", &[pv]), want, "dbgf {pv}");
+        }
+    }
+
+    /// `dbgf` of a long-string VAL is a `DBR_STRING` get with one element, so
+    /// it is C's 40-byte buffer: 39 characters, the same cut a CA
+    /// `DBR_STRING` get makes. Oracle — softIoc R7.0.10.1-DEV, `lsi` SIZV 100
+    /// holding 70 digits: `dbgf LGL.VAL` -> `DBF_STRING:` + `"0123…8"` (39
+    /// characters), `dbgf LGL.VAL$` -> `DBF_CHAR[71]` with all 70.
+    #[test]
+    fn dbgf_cuts_a_long_string_val_to_the_dbr_string_buffer() {
+        let (db, ctx) = make_ctx();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lgl.db");
+        let digits: String = (0..70).map(|i| char::from(b'0' + (i % 10) as u8)).collect();
+        std::fs::write(
+            &path,
+            format!(
+                "record(lsi, \"LGL\") {{ field(SIZV, \"100\") field(INP, {{const:\"{digits}\"}}) }}\n"
+            ),
+        )
+        .unwrap();
+        run_cmd(&ctx, "dbLoadRecords", &[path.to_str().unwrap()]);
+        ctx.block_on(db.ioc_init());
+        run_cmd(&ctx, "dbpf", &["LGL.PROC", "1"]);
+        assert_eq!(
+            run_cmd(&ctx, "dbgf", &["LGL.VAL"]),
+            format!("DBF_STRING:         \"{}\"         \n", &digits[..39])
+        );
+        assert_eq!(
+            run_cmd(&ctx, "dbgf", &["LGL.VAL$"]),
+            format!("DBF_CHAR[71]:       \n\"{digits}\"        \n")
+        );
+    }
+
+    /// A plain long-string VAL is the SIZV-wide `DBF_STRING` read to its NUL,
+    /// which a device read that failed after scanning (devlsiStream.c) leaves
+    /// past LEN; `$` stays LEN elements. Oracle — streamApp R7.0.10.1-DEV,
+    /// `lsi` SIZV 41 read "o" then `%!9s` failing on "abcdef", SIZV 100 the
+    /// same on 50 `x`, stringin `S` INP `A.VAL`: `dbgf A.VAL` -> `"abcdef"`,
+    /// `A.LEN` 2, `A.VAL$` -> `DBF_CHAR[2]: "ab"`, `B.VAL` -> 39 `x`,
+    /// `S.VAL` -> `"abcdef"`.
+    #[test]
+    fn dbgf_reads_a_long_string_val_past_len_to_its_nul() {
+        use crate::server::records::lsi::LsiRecord;
+        let (db, ctx) = make_ctx();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("past.db");
+        std::fs::write(
+            &path,
+            "record(lsi, \"A\") { field(SIZV, \"41\") }\n\
+             record(lsi, \"B\") { field(SIZV, \"100\") }\n\
+             record(stringin, \"S\") { field(INP, \"A.VAL\") }\n",
+        )
+        .unwrap();
+        run_cmd(&ctx, "dbLoadRecords", &[path.to_str().unwrap()]);
+        ctx.block_on(db.ioc_init());
+        for (name, read) in [("A", b"abcdef".to_vec()), ("B", vec![b'x'; 50])] {
+            let cell = db.get_record(name).unwrap();
+            let mut inst = cell.write();
+            let lsi = inst
+                .record
+                .as_any_mut()
+                .and_then(|a| a.downcast_mut::<LsiRecord>())
+                .unwrap();
+            lsi.val.set_text(b"o");
+            let sizv = lsi.sizv as usize;
+            let failed = lsi.val.scan_in_place(sizv, |buf| {
+                buf[..read.len()].copy_from_slice(&read);
+                buf[read.len()] = 0;
+                None
+            });
+            assert_eq!(failed, None);
+        }
+        run_cmd(&ctx, "dbpf", &["S.PROC", "1"]);
+        for (pv, want) in [
+            ("A", "DBF_STRING:         \"abcdef\"  \n".to_string()),
+            ("A.LEN", "DBF_ULONG:          2 = 0x2   \n".to_string()),
+            ("A.VAL$", "DBF_CHAR[2]:        \"ab\"      \n".to_string()),
+            (
+                "B",
+                format!("DBF_STRING:         \"{}\"         \n", "x".repeat(39)),
+            ),
+            ("S", "DBF_STRING:         \"abcdef\"  \n".to_string()),
+        ] {
+            assert_eq!(run_cmd(&ctx, "dbgf", &[pv]), want, "dbgf {pv}");
+        }
+    }
+
+    /// `dbpr <rec> 2` prints a pointer member as `PTR %p`
+    /// (`dbTest.c:1239-1242`), after `UDFS` in name order. Oracle — softIoc
+    /// R7.0.10.1-DEV (address masked): lsi `LGS`, SIZV 40, `TSEL: CONSTANT
+    /// UDF : 0 UDFS: INVALID` then `VAL : PTR 0x…` on a line of its own;
+    /// printf `PF`, the same line ending `UDFS: INVALID       VAL : PTR 0x…`.
+    #[test]
+    fn dbpr_prints_a_long_string_val_as_a_pointer() {
+        let (db, ctx) = make_ctx();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ptr.db");
+        std::fs::write(
+            &path,
+            "record(lsi, \"LGS\") { field(SIZV, \"40\") field(INP, {const:\"short\"}) }\n\
+             record(lso, \"LSO\") { field(SIZV, \"40\") }\n\
+             record(printf, \"PF\") { field(SIZV, \"100\") field(FMT, \"%s\") }\n",
+        )
+        .unwrap();
+        run_cmd(&ctx, "dbLoadRecords", &[path.to_str().unwrap()]);
+        ctx.block_on(db.ioc_init());
+        let mask = |out: String| -> Vec<String> {
+            out.lines()
+                .map(|l| match l.find("PTR 0x") {
+                    Some(at) => {
+                        let hex_end = l[at + 6..]
+                            .find(|c: char| !c.is_ascii_hexdigit())
+                            .map_or(l.len(), |n| at + 6 + n);
+                        // The tab stop, not the address, sets the line width.
+                        let masked = format!("{}PTR 0xADDR{}", &l[..at], l[hex_end..].trim_end());
+                        format!("{masked:<w$}", w = l.len())
+                    }
+                    None => l.to_string(),
+                })
+                .collect()
+        };
+        for rec in ["LGS", "LSO", "PF"] {
+            let lines = mask(run_cmd(&ctx, "dbpr", &[rec, "2"]));
+            let ptr: Vec<&String> = lines.iter().filter(|l| l.contains("PTR")).collect();
+            assert_eq!(ptr.len(), 1, "{rec}: {lines:#?}");
+            assert!(ptr[0].contains("VAL : PTR 0xADDR"), "{rec}: {ptr:?}");
+            assert_eq!(lines.last(), Some(ptr[0]), "{rec}: VAL sorts last");
+        }
+        let lgs = mask(run_cmd(&ctx, "dbpr", &["LGS", "2"]));
+        assert_eq!(
+            lgs[lgs.len() - 2..],
+            [
+                "TSEL: CONSTANT      UDF : 0             UDFS: INVALID       ".to_string(),
+                "VAL : PTR 0xADDR                        ".to_string(),
+            ]
+        );
+    }
+
+    /// C `dbpf` hands the text to `dbPutField` as `DBR_STRING`, so every
+    /// scalar goes through `putString*`'s `epicsParse*`: an out-of-range
+    /// literal is a refused put and the field keeps its value (77 here).
+    /// Rows are softIoc R7.0.10-146-g8f5015b66 `dbpf` followed by `dbgf`, with
+    /// the hex tail dropped and spaces collapsed; the previous `as`-narrowing
+    /// stored `-2147483648` for `LO.VAL 2147483648`.
+    #[test]
+    fn dbpf_refuses_a_literal_outside_the_field_width_as_epics_parse_does() {
+        let (db, ctx) = make_ctx();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sp.db");
+        std::fs::write(
+            &path,
+            "record(longout, \"LO\") {}\n\
+             record(int64out, \"IQ\") {}\n\
+             record(mbbo, \"MB\") {}\n\
+             record(waveform, \"WU\") { field(FTVL, \"ULONG\") field(NELM, \"2\") }\n",
+        )
+        .unwrap();
+        run_cmd(&ctx, "dbLoadRecords", &[path.to_str().unwrap()]);
+        ctx.block_on(db.ioc_init());
+        // `dbgf` prints `<value> = 0x<hex>` per element; the rows keep the value.
+        let norm = |out: String| {
+            let mut words = Vec::new();
+            let mut it = out.split_whitespace();
+            while let Some(w) = it.next() {
+                if w == "=" {
+                    it.next();
+                } else {
+                    words.push(w);
+                }
+            }
+            words.join(" ")
+        };
+        for (pv, text, want) in [
+            ("LO.VAL", "2147483648", "DBF_LONG: 77"),
+            ("IQ.VAL", "2147483648", "DBF_INT64: 2147483648"),
+            ("MB.RVAL", "2147483648", "DBF_ULONG: 2147483648"),
+            ("WU.VAL", "2147483648", "DBF_ULONG: 2147483648"),
+            ("LO.VAL", "-2147483649", "DBF_LONG: 77"),
+            ("IQ.VAL", "-2147483649", "DBF_INT64: -2147483649"),
+            ("MB.RVAL", "-2147483649", "DBF_ULONG: 2147483647"),
+            ("WU.VAL", "-2147483649", "DBF_ULONG: 2147483647"),
+            ("LO.VAL", "2147483647", "DBF_LONG: 2147483647"),
+            ("IQ.VAL", "2147483647", "DBF_INT64: 2147483647"),
+            ("MB.RVAL", "2147483647", "DBF_ULONG: 2147483647"),
+            ("WU.VAL", "2147483647", "DBF_ULONG: 2147483647"),
+            ("LO.VAL", "-2147483648", "DBF_LONG: -2147483648"),
+            ("IQ.VAL", "-2147483648", "DBF_INT64: -2147483648"),
+            ("MB.RVAL", "-2147483648", "DBF_ULONG: 2147483648"),
+            ("WU.VAL", "-2147483648", "DBF_ULONG: 2147483648"),
+            ("LO.VAL", "9223372036854775807", "DBF_LONG: 77"),
+            (
+                "IQ.VAL",
+                "9223372036854775807",
+                "DBF_INT64: 9223372036854775807",
+            ),
+            ("MB.RVAL", "9223372036854775807", "DBF_ULONG: 77"),
+            ("WU.VAL", "9223372036854775807", "DBF_ULONG: 4294967295"),
+            ("LO.VAL", "9223372036854775808", "DBF_LONG: 77"),
+            ("IQ.VAL", "9223372036854775808", "DBF_INT64: 77"),
+            ("MB.RVAL", "9223372036854775808", "DBF_ULONG: 77"),
+            ("WU.VAL", "9223372036854775808", "DBF_ULONG[2]: 77 78"),
+            ("LO.VAL", "-9223372036854775808", "DBF_LONG: 77"),
+            (
+                "IQ.VAL",
+                "-9223372036854775808",
+                "DBF_INT64: -9223372036854775808",
+            ),
+            ("MB.RVAL", "-9223372036854775808", "DBF_ULONG: 77"),
+            ("WU.VAL", "-9223372036854775808", "DBF_ULONG[2]: 77 78"),
+            ("LO.VAL", "-9223372036854775809", "DBF_LONG: 77"),
+            ("IQ.VAL", "-9223372036854775809", "DBF_INT64: 77"),
+            ("MB.RVAL", "-9223372036854775809", "DBF_ULONG: 77"),
+            ("WU.VAL", "-9223372036854775809", "DBF_ULONG[2]: 77 78"),
+            ("LO.VAL", "18446744073709551615", "DBF_LONG: 77"),
+            ("IQ.VAL", "18446744073709551615", "DBF_INT64: 77"),
+            // A 32-bit `unsigned long` overflows in strtoul instead
+            // (epicsStdlib.c:73); derived, not measured.
+            (
+                "MB.RVAL",
+                "18446744073709551615",
+                if std::ffi::c_ulong::BITS == 64 {
+                    "DBF_ULONG: 4294967295"
+                } else {
+                    "DBF_ULONG: 77"
+                },
+            ),
+            ("WU.VAL", "18446744073709551615", "DBF_ULONG[2]: 77 78"),
+            ("LO.VAL", "18446744073709551616", "DBF_LONG: 77"),
+            ("IQ.VAL", "18446744073709551616", "DBF_INT64: 77"),
+            ("MB.RVAL", "18446744073709551616", "DBF_ULONG: 77"),
+            ("WU.VAL", "18446744073709551616", "DBF_ULONG[2]: 77 78"),
+            ("LO.VAL", "4294967295", "DBF_LONG: 77"),
+            ("IQ.VAL", "4294967295", "DBF_INT64: 4294967295"),
+            ("MB.RVAL", "4294967295", "DBF_ULONG: 4294967295"),
+            ("WU.VAL", "4294967295", "DBF_ULONG: 4294967295"),
+            ("LO.VAL", "4294967296", "DBF_LONG: 77"),
+            ("IQ.VAL", "4294967296", "DBF_INT64: 4294967296"),
+            ("MB.RVAL", "4294967296", "DBF_ULONG: 77"),
+            ("WU.VAL", "4294967296", "DBF_ULONG: 0"),
+            ("LO.VAL", "-0", "DBF_LONG: 0"),
+            ("IQ.VAL", "-0", "DBF_INT64: 0"),
+            ("MB.RVAL", "-0", "DBF_ULONG: 0"),
+            ("WU.VAL", "-0", "DBF_ULONG: 0"),
+            ("LO.VAL", "0x7fffffff", "DBF_LONG: 2147483647"),
+            ("IQ.VAL", "0x7fffffff", "DBF_INT64: 2147483647"),
+            ("MB.RVAL", "0x7fffffff", "DBF_ULONG: 2147483647"),
+            ("WU.VAL", "0x7fffffff", "DBF_ULONG: 2147483647"),
+            ("LO.VAL", "0x80000000", "DBF_LONG: 77"),
+            ("IQ.VAL", "0x80000000", "DBF_INT64: 2147483648"),
+            ("MB.RVAL", "0x80000000", "DBF_ULONG: 2147483648"),
+            ("WU.VAL", "0x80000000", "DBF_ULONG: 2147483648"),
+            ("LO.VAL", "0xffffffff", "DBF_LONG: 77"),
+            ("IQ.VAL", "0xffffffff", "DBF_INT64: 4294967295"),
+            ("MB.RVAL", "0xffffffff", "DBF_ULONG: 4294967295"),
+            ("WU.VAL", "0xffffffff", "DBF_ULONG: 4294967295"),
+            ("LO.VAL", "0x100000000", "DBF_LONG: 77"),
+            ("IQ.VAL", "0x100000000", "DBF_INT64: 4294967296"),
+            ("MB.RVAL", "0x100000000", "DBF_ULONG: 77"),
+            ("WU.VAL", "0x100000000", "DBF_ULONG: 0"),
+            ("LO.VAL", "1e3", "DBF_LONG: 1"),
+            ("IQ.VAL", "1e3", "DBF_INT64: 1"),
+            ("MB.RVAL", "1e3", "DBF_ULONG: 1000"),
+            ("WU.VAL", "1e3", "DBF_ULONG: 1000"),
+            ("LO.VAL", "1.5", "DBF_LONG: 1"),
+            ("IQ.VAL", "1.5", "DBF_INT64: 1"),
+            ("MB.RVAL", "1.5", "DBF_ULONG: 1"),
+            ("WU.VAL", "1.5", "DBF_ULONG: 1"),
+            ("LO.VAL", " 12", "DBF_LONG: 12"),
+            ("IQ.VAL", " 12", "DBF_INT64: 12"),
+            ("MB.RVAL", " 12", "DBF_ULONG: 12"),
+            ("WU.VAL", " 12", "DBF_ULONG: 12"),
+            ("LO.VAL", "12abc", "DBF_LONG: 12"),
+            ("IQ.VAL", "12abc", "DBF_INT64: 12"),
+            ("MB.RVAL", "12abc", "DBF_ULONG: 12"),
+            ("WU.VAL", "12abc", "DBF_ULONG[2]: 77 78"),
+            ("LO.VAL", "12 ", "DBF_LONG: 12"),
+            ("IQ.VAL", "12 ", "DBF_INT64: 12"),
+            ("MB.RVAL", "12 ", "DBF_ULONG: 12"),
+            ("WU.VAL", "12 ", "DBF_ULONG: 12"),
+            ("LO.VAL", "0", "DBF_LONG: 0"),
+            ("IQ.VAL", "0", "DBF_INT64: 0"),
+            ("MB.RVAL", "0", "DBF_ULONG: 0"),
+            ("WU.VAL", "0", "DBF_ULONG: 0"),
+            ("LO.VAL", "-1", "DBF_LONG: -1"),
+            ("IQ.VAL", "-1", "DBF_INT64: -1"),
+            ("MB.RVAL", "-1", "DBF_ULONG: 4294967295"),
+            ("WU.VAL", "-1", "DBF_ULONG: 4294967295"),
+            ("LO.VAL", "+5", "DBF_LONG: 5"),
+            ("IQ.VAL", "+5", "DBF_INT64: 5"),
+            ("MB.RVAL", "+5", "DBF_ULONG: 5"),
+            ("WU.VAL", "+5", "DBF_ULONG: 5"),
+            ("LO.VAL", "010", "DBF_LONG: 8"),
+            ("IQ.VAL", "010", "DBF_INT64: 8"),
+            ("MB.RVAL", "010", "DBF_ULONG: 8"),
+            ("WU.VAL", "010", "DBF_ULONG[2]: 77 78"),
+            ("LO.VAL", "", "DBF_LONG: 0"),
+            ("IQ.VAL", "", "DBF_INT64: 0"),
+            ("MB.RVAL", "", "DBF_ULONG: 0"),
+            ("WU.VAL", "", "DBF_ULONG[0]: (empty)"),
+            ("LO.VAL", "abc", "DBF_LONG: 77"),
+            ("IQ.VAL", "abc", "DBF_INT64: 77"),
+            ("MB.RVAL", "abc", "DBF_ULONG: 77"),
+            ("WU.VAL", "abc", "DBF_ULONG[2]: 77 78"),
+            ("LO.VAL", "0x", "DBF_LONG: 0"),
+            ("IQ.VAL", "0x", "DBF_INT64: 0"),
+            ("MB.RVAL", "0x", "DBF_ULONG: 0"),
+            ("WU.VAL", "0x", "DBF_ULONG[2]: 77 78"),
+            ("LO.VAL", "1e", "DBF_LONG: 1"),
+            ("IQ.VAL", "1e", "DBF_INT64: 1"),
+            ("MB.RVAL", "1e", "DBF_ULONG: 1"),
+            ("WU.VAL", "1e", "DBF_ULONG[2]: 77 78"),
+            ("LO.VAL", "99999999999999999999", "DBF_LONG: 77"),
+            ("IQ.VAL", "99999999999999999999", "DBF_INT64: 77"),
+            ("MB.RVAL", "99999999999999999999", "DBF_ULONG: 77"),
+            ("WU.VAL", "99999999999999999999", "DBF_ULONG[2]: 77 78"),
+        ] {
+            let seed = if pv.starts_with("WU") {
+                "[77,78]"
+            } else {
+                "77"
+            };
+            run_cmd(&ctx, "dbpf", &[pv, seed]);
+            // softIoc prints no error line for a refused scalar put: `dbpf`
+            // echoes the field as it stands, the text `dbgf` then prints. A
+            // refused array put prints `dbConvertJSON: ...` on the error
+            // stream and nothing here.
+            let echo = norm(run_cmd(&ctx, "dbpf", &[pv, text]));
+            if want == "DBF_ULONG[2]: 77 78" {
+                assert_eq!(echo, "", "dbpf {pv} {text:?} echo");
+            } else {
+                assert_eq!(echo, want, "dbpf {pv} {text:?} echo");
+            }
+            assert_eq!(
+                norm(run_cmd(&ctx, "dbgf", &[pv])),
+                want,
+                "dbpf {pv} {text:?}"
+            );
+        }
+    }
+
+    /// `dbpf` on an enum or string field hands the text over untrimmed, as on
+    /// every other type. softIoc R7.0.10-146-g8f5015b66, each row after
+    /// `dbpf BO.VAL 0` / `dbpf SO.VAL z`, on
+    /// `record(bo,"BO"){field(ZNAM,"Off") field(ONAM,"On")}` and
+    /// `record(stringout,"SO"){}`; each refused row also errlogs
+    /// `recGblRecordError: <text> Illegal choice PV: BO`.
+    #[test]
+    fn dbpf_puts_enum_and_string_text_as_c_putstringenum_does() {
+        let (db, ctx) = make_ctx();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("es.db");
+        std::fs::write(
+            &path,
+            "record(bo, \"BO\") { field(ZNAM, \"Off\") field(ONAM, \"On\") }\n\
+             record(stringout, \"SO\") {}\n",
+        )
+        .unwrap();
+        run_cmd(&ctx, "dbLoadRecords", &[path.to_str().unwrap()]);
+        ctx.block_on(db.ioc_init());
+        for (pv, seed, text, want) in [
+            ("BO.VAL", "0", "On", "DBF_STRING:         \"On\"      \n"),
+            ("BO.VAL", "0", "1", "DBF_STRING:         \"On\"      \n"),
+            ("BO.VAL", "0", "65537", "DBF_STRING:         \"Off\"     \n"),
+            ("BO.VAL", "0", "-1", "DBF_STRING:         \"Off\"     \n"),
+            ("BO.VAL", "0", " On", "DBF_STRING:         \"Off\"     \n"),
+            ("BO.VAL", "0", "On ", "DBF_STRING:         \"Off\"     \n"),
+            ("BO.VAL", "0", "2", "DBF_STRING:         \"Off\"     \n"),
+            ("SO.VAL", "z", "a", "DBF_STRING:         \"a\"       \n"),
+            ("SO.VAL", "z", " a", "DBF_STRING:         \" a\"      \n"),
+        ] {
+            run_cmd(&ctx, "dbpf", &[pv, seed]);
+            assert_eq!(
+                run_cmd(&ctx, "dbpf", &[pv, text]),
+                want,
+                "dbpf {pv} {text:?}"
+            );
+        }
+    }
+
+    /// `dbgf` reads `DBR_STRING`, which `getStringString` caps at 39 bytes
+    /// whatever the field's size (`dbConvert.c:141-143`). Oracle — softIoc
+    /// R7.0.10.1 (8f5015b66), a 40-character `DESC`, an `lsi` of 50:
+    ///
+    /// ```text
+    /// dbgf L1.VAL  -> DBF_STRING:         "F...F" (39)
+    /// dbgf D1.DESC -> DBF_STRING:         "F...F" (39)
+    /// ```
+    #[test]
+    fn dbgf_prints_a_string_as_getstringstring_copies_it() {
+        let (db, ctx) = make_ctx();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cap.db");
+        let f50 = "F".repeat(50);
+        std::fs::write(
+            &path,
+            format!(
+                "record(lsi, \"L1\") {{ field(SIZV, 80) field(INP, {{const:\"{f50}\"}}) }}\n\
+                 record(ai, \"D1\") {{ field(DESC, \"{}\") }}\n",
+                &f50[..40]
+            ),
+        )
+        .unwrap();
+        run_cmd(&ctx, "dbLoadRecords", &[path.to_str().unwrap()]);
+        ctx.block_on(db.ioc_init());
+        let want = format!("DBF_STRING:         \"{}\"         \n", &f50[..39]);
+        for pv in ["L1.VAL", "D1.DESC"] {
+            assert_eq!(run_cmd(&ctx, "dbgf", &[pv]), want, "dbgf {pv}");
+        }
+    }
+
+    /// `printBuffer` escapes a `DBR_STRING` with `epicsStrnEscapedFromRaw`
+    /// into `MAXLINE - 3` bytes (`dbTest.c:1001-1011`). softIoc R7.0.10.1
+    /// (8f5015b66) prints `Q1` with `\'` and `Q3`, 39 quotes, as 38 escaped
+    /// pairs on a line of its own.
+    #[test]
+    fn dbgf_escapes_a_string_as_epicsstrnescapedfromraw_does() {
+        let (db, ctx) = make_ctx();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("esc.db");
+        std::fs::write(
+            &path,
+            format!(
+                "record(stringin, \"Q1\") {{ field(VAL, \"it's \\\\ a\\\"b\") }}\n\
+                 record(stringin, \"Q3\") {{ field(VAL, \"{}\") }}\n",
+                "\\\"".repeat(39)
+            ),
+        )
+        .unwrap();
+        run_cmd(&ctx, "dbLoadRecords", &[path.to_str().unwrap()]);
+        ctx.block_on(db.ioc_init());
+        assert_eq!(
+            run_cmd(&ctx, "dbgf", &["Q1"]),
+            "DBF_STRING:         \"it\\'s \\\\ a\\\"b\"     \n"
+        );
+        assert_eq!(
+            run_cmd(&ctx, "dbgf", &["Q3"]),
+            format!("DBF_STRING:         \n\"{}\"  \n", "\\\"".repeat(38))
+        );
+    }
+
+    /// A `DBR_CHAR` array prints in chunks whose escaped text fits
+    /// `MAXLINE - 5` (`dbTest.c:1024-1039`). softIoc R7.0.10.1 (8f5015b66)
+    /// on a 100-digit `dbpf` into a CHAR waveform prints 74 digits, ` +`,
+    /// then the other 26.
+    #[test]
+    fn dbgf_prints_a_long_char_array_in_chunks() {
+        let (db, ctx) = make_ctx();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("w.db");
+        std::fs::write(
+            &path,
+            "record(waveform, \"W1\") { field(FTVL, \"CHAR\") field(NELM, \"120\") }\n",
+        )
+        .unwrap();
+        run_cmd(&ctx, "dbLoadRecords", &[path.to_str().unwrap()]);
+        ctx.block_on(db.ioc_init());
+        let digits = "0123456789".repeat(10);
+        assert_eq!(
+            run_cmd(&ctx, "dbpf", &["W1", &digits]),
+            format!(
+                "DBF_CHAR[101]:      \n\"{}\" +  \n\"{}\"  \n",
+                &digits[..74],
+                &digits[74..]
+            )
+        );
+    }
+
+    /// C stores a `SPC_CALC` string before `postfix()` refuses it
+    /// (`dbStaticLib.c:2589-2599`), so the load fails but the record exists with
+    /// the text — softIoc R7.0.10-146-g8f5015b66 `dbgf CB.CALC` after
+    /// `dbLoadRecords` of `record(calc,"CB") {field(CALC,"A+")}` prints
+    /// `DBF_STRING: "A+"`, and `iocInit` then reports the record's own
+    /// `init_record` error. The record that compiles is untouched.
+    #[test]
+    fn a_calc_that_postfix_refuses_keeps_its_record_and_text() {
+        let (db, ctx) = make_ctx();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.db");
+        std::fs::write(
+            &path,
+            "record(calc, \"CB\") { field(CALC, \"A+\") }\n\
+             record(calc, \"CG\") { field(CALC, \"A+1\") }\n",
+        )
+        .unwrap();
+        run_cmd(&ctx, "dbLoadRecords", &[path.to_str().unwrap()]);
+        ctx.block_on(db.ioc_init());
+        for (pv, want) in [("CB.CALC", "\"A+\""), ("CG.CALC", "\"A+1\"")] {
+            let out = run_cmd(&ctx, "dbgf", &[pv]);
+            assert_eq!(
+                out.split_whitespace().collect::<Vec<_>>()[1..],
+                [want],
+                "{pv}"
+            );
+        }
+    }
+
+    /// A long-string VAL is one `DBF_STRING` to every capacity reader
+    /// (`cvt_dbaddr`'s `no_elements = 1`), whatever LEN a `$` put left.
+    /// Oracle — softIoc R7.0.10, `record(lso,"LSO"){field(SIZV,"40")}`:
+    ///
+    /// ```text
+    /// dbpf LSO.VAL$ hi         -> DBF_CHAR[3]:        "hi"
+    /// dbpf LSO dbpf-string     -> DBF_STRING:         "dbpf-string"
+    /// dbgf LSO.LEN             -> DBF_ULONG:          12 = 0xc
+    /// dba LSO / gft LSO        -> No Elements: 1
+    /// dba LSO.VAL$             -> No Elements: 40
+    /// ```
+    #[test]
+    fn a_long_string_val_has_one_element_after_a_dollar_put() {
+        let (db, ctx) = make_ctx();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("l.db");
+        std::fs::write(&path, "record(lso, \"LSO\") { field(SIZV, \"40\") }\n").unwrap();
+        run_cmd(&ctx, "dbLoadRecords", &[path.to_str().unwrap()]);
+        ctx.block_on(db.ioc_init());
+        assert_eq!(
+            run_cmd(&ctx, "dbpf", &["LSO.VAL$", "hi"]),
+            "DBF_CHAR[3]:        \"hi\"      \n"
+        );
+        assert_eq!(
+            run_cmd(&ctx, "dbpf", &["LSO", "dbpf-string"]),
+            "DBF_STRING:         \"dbpf-string\"       \n"
+        );
+        assert_eq!(
+            run_cmd(&ctx, "dbgf", &["LSO.LEN"]),
+            "DBF_ULONG:          12 = 0xc  \n"
+        );
+        for (cmd, pv, n) in [
+            ("dba", "LSO", 1),
+            ("dba", "LSO.VAL$", 40),
+            ("gft", "LSO", 1),
+        ] {
+            let out = run_cmd(&ctx, cmd, &[pv]);
+            assert!(
+                out.lines().any(|l| l.trim() == format!("No Elements: {n}")),
+                "{cmd} {pv}:\n{out}"
+            );
+        }
+    }
+
+    /// A DBR_STRING put into a long-string VAL is `putStringString`'s
+    /// `strncpy` bounded by the field size, SIZV, not by `MAX_STRING_SIZE`.
+    /// Oracle — softIoc 7.0.10.1-DEV, `dbpf <rec>.VAL` of 70 `x`, then
+    /// `dbgf <rec>.LEN`: O41 41, O42 42, O65 65, O128 71, I128 71; an lso
+    /// whose `OUT` is `DST PP` carries all 70 into DST (LEN 71), a stringout
+    /// only its own 39 (LEN 40).
+    #[test]
+    fn a_long_string_val_put_is_bounded_by_sizv() {
+        let (db, ctx) = make_ctx();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("l.db");
+        std::fs::write(
+            &path,
+            r#"record(lso, "O41") { field(SIZV, "41") }
+record(lso, "O42") { field(SIZV, "42") }
+record(lso, "O65") { field(SIZV, "65") }
+record(lso, "O128") { field(SIZV, "128") }
+record(lsi, "I128") { field(SIZV, "128") }
+record(lso, "SRC") { field(SIZV, "128") field(OUT, "DST PP") }
+record(lso, "DST") { field(SIZV, "128") }
+record(stringout, "SO") { field(OUT, "SOD PP") }
+record(lso, "SOD") { field(SIZV, "128") }
+"#,
+        )
+        .unwrap();
+        run_cmd(&ctx, "dbLoadRecords", &[path.to_str().unwrap()]);
+        ctx.block_on(db.ioc_init());
+        let long = "x".repeat(70);
+        for rec in ["O41", "O42", "O65", "O128", "I128", "SRC", "SO"] {
+            run_cmd(&ctx, "dbpf", &[&format!("{rec}.VAL"), &long]);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        for (rec, len) in [
+            ("O41", 41),
+            ("O42", 42),
+            ("O65", 65),
+            ("O128", 71),
+            ("I128", 71),
+            ("DST", 71),
+            ("SOD", 40),
+        ] {
+            assert_eq!(
+                run_cmd(&ctx, "dbgf", &[&format!("{rec}.LEN")]),
+                format!("DBF_ULONG:          {len} = {:<5}\n", format!("{len:#x}")),
+                "{rec}.LEN"
+            );
+        }
+    }
+
+    /// An empty long-string VAL is `get_array_info`'s zero elements, a
+    /// stringin's is one empty string. Oracle — softIoc 7.0.10.1-DEV, nothing
+    /// written:
+    ///
+    /// ```text
+    /// dbgf LSI / LSO / PF -> DBF_STRING[0]: (empty)
+    /// dbgf SI             -> DBF_STRING:         ""
+    /// dbgf LSO.VAL$       -> DBF_CHAR[0]: (empty)
+    /// dbgf SI.VAL$        -> DBF_CHAR:           0 = 0x0
+    /// ```
+    #[test]
+    fn dbgf_prints_an_empty_long_string_val_as_softioc_does() {
+        let (db, ctx) = make_ctx();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.db");
+        std::fs::write(
+            &path,
+            "record(lsi, \"LSI\") { }\n\
+             record(lso, \"LSO\") { }\n\
+             record(printf, \"PF\") { }\n\
+             record(stringin, \"SI\") { }\n",
+        )
+        .unwrap();
+        run_cmd(&ctx, "dbLoadRecords", &[path.to_str().unwrap()]);
+        ctx.block_on(db.ioc_init());
+        for (pv, want) in [
+            ("LSI", "DBF_STRING[0]: (empty)        \n"),
+            ("LSO", "DBF_STRING[0]: (empty)        \n"),
+            ("PF", "DBF_STRING[0]: (empty)        \n"),
+            ("SI", "DBF_STRING:         \"\"        \n"),
+            ("LSO.VAL$", "DBF_CHAR[0]: (empty)          \n"),
+            ("SI.VAL$", "DBF_CHAR:           0 = 0x0   \n"),
+        ] {
+            assert_eq!(run_cmd(&ctx, "dbgf", &[pv]), want, "dbgf {pv}");
+        }
+    }
+
+    /// A `$` put on a long-string VAL is bounded by SIZV, not by a
+    /// `DBR_STRING`'s 40. Oracle — softIoc R7.0.10, SIZV 50:
+    ///
+    /// ```text
+    /// dbpf LI.VAL$ <39|40|41|49 chars> -> LEN 40|41|42|50, VAL all of them
+    /// ```
+    #[test]
+    fn dbpf_dollar_stores_a_long_string_past_40() {
+        let (db, ctx) = make_ctx();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lsizv.db");
+        std::fs::write(
+            &path,
+            "record(lsi, \"LI\") { field(SIZV, \"50\") }\n\
+             record(lso, \"LO\") { field(SIZV, \"50\") }\n",
+        )
+        .unwrap();
+        run_cmd(&ctx, "dbLoadRecords", &[path.to_str().unwrap()]);
+        ctx.block_on(db.ioc_init());
+        let text: String = ('a'..='z').chain('A'..='Z').collect();
+        for rec in ["LI", "LO"] {
+            for n in [39, 40, 41, 49] {
+                run_cmd(&ctx, "dbpf", &[&format!("{rec}.VAL$"), &text[..n]]);
+                let inst = db.get_record(rec).unwrap();
+                let inst = inst.read();
+                assert_eq!(
+                    inst.resolve_field("LEN"),
+                    Some(EpicsValue::ULong(n as u32 + 1)),
+                    "{rec}.LEN after a {n}-char dbpf"
+                );
+                assert_eq!(
+                    inst.resolve_field("VAL"),
+                    Some(EpicsValue::CharArray(
+                        [&text.as_bytes()[..n], b"\0"].concat().into()
+                    )),
+                    "{rec}.VAL after a {n}-char dbpf"
+                );
+            }
+        }
+    }
+
+    /// `scanpel` walks C's event table, not the records' EVNT: an event a
+    /// calcout's OEVT names exists from `init_record`, ahead of the
+    /// `buildScanLists` events, and one an event record posts or iocsh
+    /// `postEvent` names exists from then on. Oracle — softIoc 7.0.10.1-DEV:
+    ///
+    /// ```text
+    /// record(calc, "TA")    { field(SCAN, "Event") field(EVNT, "alpha") }
+    /// record(calcout, "CO") { field(OEVT, "oev") field(CALC, "1") }
+    /// record(calc, "TB")    { field(SCAN, "Event") field(EVNT, "beta") }
+    /// record(calc, "TO")    { field(EVNT, "oev") }
+    /// record(stringin, "SP") { field(VAL, "posted") }
+    /// record(event, "EP")   { field(INP, "SP") }
+    ///
+    /// epics> scanpel                  -> beta(TB) alpha(TA) oev
+    /// epics> dbpf EP.PROC 1; scanpel  -> posted beta(TB) alpha(TA) oev
+    /// epics> postEvent shellev; scanpel -> shellev posted beta alpha oev
+    /// epics> dbpf TO.SCAN Event; scanpel -> ... oev(TO)
+    /// ```
+    #[test]
+    fn scanpel_walks_the_event_table_like_c() {
+        let (db, ctx) = make_ctx();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("evtab.db");
+        std::fs::write(
+            &path,
+            "record(calc, \"TA\") { field(SCAN, \"Event\") field(EVNT, \"alpha\") field(CALC, \"VAL+1\") }\n\
+             record(calcout, \"CO\") { field(OEVT, \"oev\") field(CALC, \"1\") }\n\
+             record(calc, \"TB\") { field(SCAN, \"Event\") field(EVNT, \"beta\") field(CALC, \"VAL+1\") }\n\
+             record(calc, \"TO\") { field(EVNT, \"oev\") field(CALC, \"VAL+1\") }\n\
+             record(stringin, \"SP\") { field(VAL, \"posted\") }\n\
+             record(event, \"EP\") { field(INP, \"SP\") }\n",
+        )
+        .unwrap();
+        run_cmd(&ctx, "dbLoadRecords", &[path.to_str().unwrap()]);
+        ctx.block_on(db.ioc_init());
+
+        let headers = |ctx: &CommandContext| -> Vec<String> {
+            run_cmd(ctx, "scanpel", &[])
+                .lines()
+                .filter_map(|l| l.strip_prefix("Event \"")?.strip_suffix('"'))
+                .map(str::to_string)
+                .collect()
+        };
+        assert_eq!(headers(&ctx), ["beta", "alpha", "oev"]);
+        assert!(
+            run_cmd(&ctx, "scanpel", &["oev"]).ends_with("Event \"oev\"\n"),
+            "an event no record scans on prints its header alone"
+        );
+
+        // The event record's post runs on a callback task.
+        run_cmd(&ctx, "dbpf", &["EP.PROC", "1"]);
+        for _ in 0..500 {
+            if headers(&ctx).len() == 4 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(headers(&ctx), ["posted", "beta", "alpha", "oev"]);
+
+        run_cmd(&ctx, "postEvent", &["shellev"]);
+        assert_eq!(headers(&ctx), ["shellev", "posted", "beta", "alpha", "oev"]);
+
+        run_cmd(&ctx, "dbpf", &["TO.SCAN", "Event"]);
+        let oev = run_cmd(&ctx, "scanpel", &["oev"]);
+        assert_eq!(
+            oev,
+            format!("Event \"oev\"\n Priority Low\n    {:<28}\n", "TO")
+        );
+    }
+
     /// C `scanpel` (`dbScan.c:411-428`) heads each event `Event "NAME"`,
     /// bands its records by `PRIO` into `priorityName[]` sub-lists, and
     /// prints each name through `printList` — which emits NOTHING for an
@@ -8905,8 +9499,8 @@ mod tests {
                 let rec = db.get_record(name).unwrap();
                 let mut w = rec.write();
                 w.common.scan = scan;
-                w.common.evnt = evnt.to_string();
-                w.common.prio = prio;
+                w.common.text.evnt = evnt.into();
+                w.set_prio(prio);
             }
             db.update_scan_index(name, ScanType::Passive, scan, 0, 0);
         }
@@ -9457,18 +10051,21 @@ mod tests {
 
     /// Run `handler` with the context's stdout sink pointed at a temp
     /// file and return what it wrote.
+    /// Stdout as the operator sees it: the shell's stream and C's raw
+    /// `stdout` (a `Usage:` line from `dbAccess.c`) together.
     fn capture(ctx: &CommandContext, f: impl FnOnce()) -> String {
         let tmp = tempfile::NamedTempFile::new().unwrap();
-        let path = tmp.path().to_path_buf();
-        ctx.with_output(std::fs::File::create(&path).unwrap(), f);
-        std::fs::read_to_string(&path).unwrap()
+        let out = tmp.reopen().unwrap();
+        let console = out.try_clone().unwrap();
+        ctx.with_console(console, std::io::stderr(), || ctx.with_output(out, f));
+        std::fs::read_to_string(tmp.path()).unwrap()
     }
 
     fn run_cmd(ctx: &CommandContext, name: &str, tokens: &[&str]) -> String {
         let mut registry = CommandRegistry::new();
         register_builtins(&mut registry);
         let cmd = registry.get(name).unwrap();
-        let tokens: Vec<String> = tokens.iter().map(|t| t.to_string()).collect();
+        let tokens: Vec<IocshString> = tokens.iter().map(|t| IocshString::from(*t)).collect();
         let args = parse_args(&tokens, &cmd.args).unwrap();
         capture(ctx, || {
             cmd.handler.call(&args, ctx).unwrap();
@@ -9482,7 +10079,7 @@ mod tests {
         let mut registry = CommandRegistry::new();
         register_builtins(&mut registry);
         let cmd = registry.get(name).unwrap();
-        let tokens: Vec<String> = tokens.iter().map(|t| t.to_string()).collect();
+        let tokens: Vec<IocshString> = tokens.iter().map(|t| IocshString::from(*t)).collect();
         let args = parse_args(&tokens, &cmd.args).unwrap();
         let mut failed = false;
         let printed = capture(ctx, || {
@@ -9983,6 +10580,41 @@ BO_REC
         );
     }
 
+    /// `dbpf` hands `DTYP` its text untouched, and C's `cvt_st_device`
+    /// (`dbFastLinkConv.c:319-349`) takes only an exact device name or an
+    /// index below the menu's length. Each row is softIoc 8f5015b66 putting
+    /// the text over `"Raw Soft Channel"`.
+    #[test]
+    fn dbpf_dtyp_puts_the_text_untrimmed() {
+        let (db, ctx) = make_ctx();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dtyp.db");
+        std::fs::write(&path, "record(ai, \"X\") {}\n").unwrap();
+        run_cmd(&ctx, "dbLoadRecords", &[path.to_str().unwrap()]);
+        ctx.block_on(db.ioc_init());
+
+        for (text, kept) in [
+            (" Soft Channel", "Raw Soft Channel"),
+            ("Soft Channel ", "Raw Soft Channel"),
+            ("Soft  Channel", "Raw Soft Channel"),
+            ("", "Raw Soft Channel"),
+            ("nope", "Raw Soft Channel"),
+            ("Soft Channel", "Soft Channel"),
+            ("1", "Raw Soft Channel"),
+            (" 0 ", "Soft Channel"),
+            ("2", "Async Soft Channel"),
+            ("65536", "Raw Soft Channel"),
+            ("-1", "Raw Soft Channel"),
+        ] {
+            run_cmd(&ctx, "dbpf", &["X.DTYP", "Raw Soft Channel"]);
+            assert_eq!(
+                run_cmd(&ctx, "dbpf", &["X.DTYP", text]).trim_end(),
+                format!("DBF_STRING:         \"{kept}\""),
+                "dbpf X.DTYP {text:?}"
+            );
+        }
+    }
+
     /// C's `getMaxRangeValues` (`recGbl.c:372-419`) switches on the DECLARED
     /// DBF, and `DBF_MENU`/`DBF_DEVICE` have no case there — so a menu field
     /// carries no range at all.
@@ -10261,22 +10893,22 @@ BO_REC
     /// `glob_match` call `dbglob_handler` filters record names with.
     #[test]
     fn glob_match_question_mark_consumes_exactly_one() {
-        assert!(glob_match("ab?", "abc"));
-        assert!(!glob_match("ab?", "ab"));
-        assert!(!glob_match("ab?", "abcd"));
-        assert!(glob_match("*", "anything"));
-        assert!(glob_match("a*d", "abcd"));
-        assert!(!glob_match("a*d", "abce"));
-        assert!(glob_match("", ""));
-        assert!(!glob_match("", "x"));
+        assert!(glob_match(b"ab?", b"abc"));
+        assert!(!glob_match(b"ab?", b"ab"));
+        assert!(!glob_match(b"ab?", b"abcd"));
+        assert!(glob_match(b"*", b"anything"));
+        assert!(glob_match(b"a*d", b"abcd"));
+        assert!(!glob_match(b"a*d", b"abce"));
+        assert!(glob_match(b"", b""));
+        assert!(!glob_match(b"", b"x"));
 
         // The live-IOC transcript above, name by name.
-        assert!(!glob_match("REC?", "REC"));
-        assert!(glob_match("REC?", "RECX"));
-        assert!(!glob_match("REC?", "RECXY"));
-        assert!(glob_match("REC*", "REC"));
-        assert!(glob_match("REC*", "RECX"));
-        assert!(glob_match("REC*", "RECXY"));
+        assert!(!glob_match(b"REC?", b"REC"));
+        assert!(glob_match(b"REC?", b"RECX"));
+        assert!(!glob_match(b"REC?", b"RECXY"));
+        assert!(glob_match(b"REC*", b"REC"));
+        assert!(glob_match(b"REC*", b"RECX"));
+        assert!(glob_match(b"REC*", b"RECXY"));
     }
 
     /// Every command the mechanical registration sweep found declaring
@@ -10313,14 +10945,14 @@ BO_REC
         register_builtins(&mut reg);
         let cmd = reg.get("dbCreateRecord").unwrap();
 
-        let tokens = ["pdbbase", "ai", "SIM:NEW"].map(str::to_string);
+        let tokens = ["pdbbase", "ai", "SIM:NEW"].map(IocshString::from);
         let args = parse_args(&tokens, &cmd.args).unwrap();
         cmd.handler
             .call(&args, &ctx)
             .expect("must create the record");
         assert!(db.get_record("SIM:NEW").is_some());
 
-        let bad = ["ai", "SIM:OTHER", "x"].map(str::to_string);
+        let bad = ["ai", "SIM:OTHER", "x"].map(IocshString::from);
         let args = parse_args(&bad, &cmd.args).unwrap();
         let Err(msg) = cmd.handler.call(&args, &ctx) else {
             panic!("a non-pdbbase first argument must be refused");
@@ -10340,7 +10972,7 @@ BO_REC
         register_builtins(&mut reg);
         let cmd = reg.get("dbCreateRecord").unwrap();
         let call = |tokens: &[&str]| {
-            let tokens: Vec<String> = tokens.iter().map(|t| t.to_string()).collect();
+            let tokens: Vec<IocshString> = tokens.iter().map(|t| IocshString::from(*t)).collect();
             let args = parse_args(&tokens, &cmd.args).expect("C accepts a missing argument");
             match cmd.handler.call(&args, &ctx) {
                 Err(msg) => msg,
@@ -10388,16 +11020,35 @@ BO_REC
         let mut reg = CommandRegistry::new();
         register_builtins(&mut reg);
         let cmd = reg.get("dbLoadTemplate").unwrap();
-        let tokens = [
-            "t.substitutions".to_string(),
-            String::new(),
-            subs_dir.path().display().to_string(),
+        let tokens: Vec<IocshString> = vec![
+            "t.substitutions".into(),
+            IocshString::default(),
+            subs_dir.path().display().to_string().into(),
         ];
         let args = parse_args(&tokens, &cmd.args).unwrap();
         cmd.handler
             .call(&args, &ctx)
             .expect("the third argument must locate the .substitutions file");
         assert!(db.get_record("SIM:FROM_ARG").is_some());
+    }
+
+    /// A `.substitutions` that is not UTF-8 loads: C reads it as bytes.
+    #[test]
+    #[serial_test::serial(epics_env)]
+    fn db_load_template_reads_a_latin1_substitutions_file() {
+        let (db, ctx) = make_ctx();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("t.template"), "record(ai,\"$(P)\") { }\n").unwrap();
+        std::fs::write(
+            dir.path().join("t.substitutions"),
+            b"file \"t.template\" { pattern { P } { \"caf\xe9\" } }\n",
+        )
+        .unwrap();
+        let _guard = DbIncludePath::set(dir.path());
+        let subs = dir.path().join("t.substitutions");
+        let (_, failed) = run_cmd_outcome(&ctx, "dbLoadTemplate", &[subs.to_str().unwrap()]);
+        assert!(!failed);
+        assert!(db.get_record(&b"caf\xe9"[..]).is_some());
     }
 
     #[test]
@@ -10434,7 +11085,7 @@ BO_REC
         let mut registry = CommandRegistry::new();
         register_builtins(&mut registry);
         let cmd = registry.get("dbgf").unwrap();
-        let tokens = vec!["TEMP".to_string()];
+        let tokens: Vec<IocshString> = vec!["TEMP".into()];
         let args = parse_args(&tokens, &cmd.args).unwrap();
         let result = cmd.handler.call(&args, &ctx);
         assert!(matches!(result, Ok(CommandOutcome::Continue)));
@@ -10611,6 +11262,13 @@ BO_REC
     #[test]
     fn db_load_records_dtyp_macro_leaves_literal_dtyp_alone() {
         use std::io::Write;
+        static ROW: crate::server::record::DevSup = crate::server::record::DevSup {
+            name: "devScalerRs",
+            choice: "Scaler-rs",
+            link_type: crate::server::record::DbLinkType::Constant,
+            dset: crate::server::record::Dset::new(6, &[3], false),
+        };
+        crate::server::record::register_device_row("ai", &ROW);
 
         let (db, ctx) = make_ctx();
 
@@ -10639,9 +11297,9 @@ record(bo, "$(P)_calc_ctrl") {{
         let mut registry = CommandRegistry::new();
         register_builtins(&mut registry);
         let cmd = registry.get("dbLoadRecords").unwrap();
-        let tokens = vec![
-            path.to_str().unwrap().to_string(),
-            "P=SCALER1,DTYP=Scaler-rs".to_string(),
+        let tokens: Vec<IocshString> = vec![
+            path.to_str().unwrap().to_string().into(),
+            "P=SCALER1,DTYP=Scaler-rs".into(),
         ];
         let args = parse_args(&tokens, &cmd.args).unwrap();
         cmd.handler.call(&args, &ctx).unwrap();
@@ -10678,7 +11336,7 @@ record(bo, "$(P)_calc_ctrl") {{
 
         // Put a value
         let cmd = registry.get("dbpf").unwrap();
-        let tokens = vec!["TEMP".to_string(), "42.0".to_string()];
+        let tokens: Vec<IocshString> = vec!["TEMP".into(), "42.0".into()];
         let args = parse_args(&tokens, &cmd.args).unwrap();
         let result = cmd.handler.call(&args, &ctx);
         assert!(matches!(result, Ok(CommandOutcome::Continue)));
@@ -10718,7 +11376,7 @@ record(bo, "$(P)_calc_ctrl") {{
         register_builtins(&mut registry);
 
         let cmd = registry.get("dbpf").unwrap();
-        let tokens = vec!["DEV.DTYP".to_string(), "Async Soft Channel".to_string()];
+        let tokens: Vec<IocshString> = vec!["DEV.DTYP".into(), "Async Soft Channel".into()];
         let args = parse_args(&tokens, &cmd.args).unwrap();
         let result = cmd.handler.call(&args, &ctx);
         if let Err(e) = &result {
@@ -10760,7 +11418,7 @@ record(bo, "$(P)_calc_ctrl") {{
         let cmd = registry.get("dbpf").unwrap();
 
         let put = |label: &str| {
-            let tokens = vec!["SL.SELM".to_string(), label.to_string()];
+            let tokens: Vec<IocshString> = vec!["SL.SELM".into(), label.to_string().into()];
             let args = parse_args(&tokens, &cmd.args).unwrap();
             cmd.handler.call(&args, &ctx)
         };
@@ -10801,7 +11459,13 @@ record(bo, "$(P)_calc_ctrl") {{
         use crate::server::record::register_device_menu;
         // A record-type name + DTYP name no other test touches (the registry is
         // process-global and append-only).
-        register_device_menu("ai", &["Dbpf Contributed Probe"]);
+        static PROBE: &[crate::server::record::DevSup] = &[crate::server::record::DevSup {
+            name: "devDbpfProbe",
+            choice: "Dbpf Contributed Probe",
+            link_type: crate::server::record::DbLinkType::Constant,
+            dset: crate::server::record::Dset::new(5, &[], false),
+        }];
+        register_device_menu("ai", PROBE);
 
         let (db, ctx) = make_ctx();
         ctx.block_on(async {
@@ -10816,10 +11480,7 @@ record(bo, "$(P)_calc_ctrl") {{
         register_builtins(&mut registry);
 
         let cmd = registry.get("dbpf").unwrap();
-        let tokens = vec![
-            "CONTRIB.DTYP".to_string(),
-            "Dbpf Contributed Probe".to_string(),
-        ];
+        let tokens: Vec<IocshString> = vec!["CONTRIB.DTYP".into(), "Dbpf Contributed Probe".into()];
         let args = parse_args(&tokens, &cmd.args).unwrap();
         let result = cmd.handler.call(&args, &ctx);
         if let Err(e) = &result {
@@ -10851,7 +11512,7 @@ record(bo, "$(P)_calc_ctrl") {{
 
         for level in [0, 1, 2] {
             let cmd = registry.get("dbpr").unwrap();
-            let tokens = vec!["TEMP".to_string(), level.to_string()];
+            let tokens: Vec<IocshString> = vec!["TEMP".into(), level.to_string().into()];
             let args = parse_args(&tokens, &cmd.args).unwrap();
             let result = cmd.handler.call(&args, &ctx);
             assert!(matches!(result, Ok(CommandOutcome::Continue)));
@@ -10955,6 +11616,167 @@ record(bo, "$(P)_calc_ctrl") {{
         rest[..end].to_string()
     }
 
+    /// `dbpr`'s pointer members, against `softIoc` R7.0.10 on the same
+    /// records: `PTR (nil)` where the record holds no object and `PTR 0x...`
+    /// where it does. The table is nil-ness only, since no two IOCs agree on
+    /// an address, measured at level 4 (level 2 prints `VAL` alone, and it
+    /// is the same cell). `ASP` is the one row C answers from a policy: nil
+    /// here, an address once `-a` loaded an ACF.
+    #[test]
+    fn dbpr_prints_a_pointer_member_as_nil_where_the_record_holds_none() {
+        const DB: &str = r#"record(aai,"AAI"){field(FTVL,"DOUBLE")field(NELM,"4")}
+record(aao,"AAO"){field(FTVL,"DOUBLE")field(NELM,"4")}
+record(compress,"CMP"){field(NSAM,"4")}
+record(compress,"CMPA"){field(NSAM,"4")field(ALG,"Average")}
+record(subArray,"SUB"){field(MALM,"4")field(FTVL,"DOUBLE")}
+record(histogram,"HIS"){field(NELM,"4")}
+record(histogram,"HISD"){field(NELM,"4")field(SDEL,"1")}
+record(waveform,"WF"){field(FTVL,"DOUBLE")field(NELM,"4")}
+record(aSub,"ASUB"){field(FTA,"DOUBLE")field(NOA,"3")}
+record(bo,"BO"){}
+record(calcout,"CO"){}
+record(ai,"AI"){}
+record(ai,"AIS"){field(SCAN,"1 second")}
+record(lsi,"LSI"){field(SIZV,"20")}
+record(lso,"LSO"){field(SIZV,"20")}
+record(stringout,"SO"){}
+record(calc,"CAL"){}
+"#;
+        // `<record> <ROW>=<addr|(nil)>...`, from `dbpr <record> 4` on softIoc.
+        const C: &str = "\
+AAI ASP=(nil) BPTR=addr DPVT=(nil) DSET=addr LSET=addr PPN=(nil) PPNR=(nil) RDES=addr RSET=addr SIMPVT=(nil) SPVT=(nil) VAL=(nil)
+AAO ASP=(nil) BPTR=addr DPVT=(nil) DSET=addr LSET=addr PPN=(nil) PPNR=(nil) RDES=addr RSET=addr SIMPVT=(nil) SPVT=(nil) VAL=(nil)
+CMP ASP=(nil) BPTR=addr DPVT=(nil) DSET=(nil) LSET=addr PPN=(nil) PPNR=(nil) RDES=addr RSET=addr SPTR=(nil) SPVT=(nil) VAL=(nil) WPTR=(nil)
+CMPA ASP=(nil) BPTR=addr DPVT=(nil) DSET=(nil) LSET=addr PPN=(nil) PPNR=(nil) RDES=addr RSET=addr SPTR=addr SPVT=(nil) VAL=(nil) WPTR=(nil)
+SUB ASP=(nil) BPTR=addr DPVT=(nil) DSET=addr LSET=addr PPN=(nil) PPNR=(nil) RDES=addr RSET=addr SPVT=(nil) VAL=(nil)
+HIS ASP=(nil) BPTR=addr DPVT=(nil) DSET=addr LSET=addr PPN=(nil) PPNR=(nil) RDES=addr RSET=addr SIMPVT=(nil) SPVT=(nil) VAL=(nil) WDOG=(nil)
+HISD ASP=(nil) BPTR=addr DPVT=(nil) DSET=addr LSET=addr PPN=(nil) PPNR=(nil) RDES=addr RSET=addr SIMPVT=(nil) SPVT=(nil) VAL=(nil) WDOG=addr
+WF ASP=(nil) BPTR=addr DPVT=(nil) DSET=addr LSET=addr PPN=(nil) PPNR=(nil) RDES=addr RSET=addr SIMPVT=(nil) SPVT=(nil) VAL=(nil)
+ASUB A=addr ASP=(nil) CADR=(nil) DPVT=(nil) DSET=(nil) LSET=addr OVLA=addr OVLU=addr PPN=(nil) PPNR=(nil) RDES=addr RSET=addr SADR=(nil) SPVT=(nil) U=addr VALA=addr VALU=addr
+BO ASP=(nil) DPVT=(nil) DSET=addr LSET=addr PPN=(nil) PPNR=(nil) RDES=addr RPVT=addr RSET=addr SIMPVT=(nil) SPVT=(nil) WDPT=(nil)
+CO ASP=(nil) DPVT=(nil) DSET=addr LSET=addr PPN=(nil) PPNR=(nil) RDES=addr RPVT=addr RSET=addr SPVT=(nil)
+AI ASP=(nil) DPVT=(nil) DSET=addr LSET=addr PBRK=(nil) PPN=(nil) PPNR=(nil) RDES=addr RSET=addr SIMPVT=(nil) SPVT=(nil)
+AIS ASP=(nil) DPVT=(nil) DSET=addr LSET=addr PBRK=(nil) PPN=(nil) PPNR=(nil) RDES=addr RSET=addr SIMPVT=(nil) SPVT=addr
+LSI ASP=(nil) DPVT=(nil) DSET=addr LSET=addr OVAL=addr PPN=(nil) PPNR=(nil) RDES=addr RSET=addr SIMPVT=(nil) SPVT=(nil) VAL=addr
+LSO ASP=(nil) DPVT=(nil) DSET=addr LSET=addr OVAL=addr PPN=(nil) PPNR=(nil) RDES=addr RSET=addr SIMPVT=(nil) SPVT=(nil) VAL=addr
+SO ASP=(nil) DPVT=(nil) DSET=addr LSET=addr PPN=(nil) PPNR=(nil) RDES=addr RSET=addr SIMPVT=(nil) SPVT=(nil)
+CAL ASP=(nil) DPVT=(nil) DSET=(nil) LSET=addr PPN=(nil) PPNR=(nil) RDES=addr RSET=addr SPVT=(nil)";
+        let (db, ctx) = make_ctx();
+        load_records(&ctx, DB).expect(".db must load");
+        ctx.block_on(db.ioc_init());
+
+        let mut wrong = Vec::new();
+        for line in C.lines() {
+            let mut cells = line.split(' ');
+            let rec = cells.next().unwrap();
+            for level in [2, 4] {
+                let printed = capture(&ctx, || {
+                    dbpr_report(&ctx, rec.as_bytes(), level);
+                });
+                for cell in line.split(' ').skip(1) {
+                    let (row, want) = cell.split_once('=').unwrap();
+                    let interest = if row == "VAL" { 0 } else { 4 };
+                    if interest > level && !printed.contains(&format!("{row:<4}: ")) {
+                        continue;
+                    }
+                    let got = dbpr_field(&printed, row);
+                    let ok = match want {
+                        "(nil)" => got == "PTR (nil)",
+                        _ => got.starts_with("PTR 0x") && got != "PTR 0x0",
+                    };
+                    if !ok {
+                        wrong.push(format!("dbpr {rec} {level} {row}: C {want}, port {got:?}"));
+                    }
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
+    /// `SIMPVT` against `softIoc` R7.0.10, `dbpr <rec> 4` around `dbpf
+    /// <rec>.PROC 1`: AIS (SIMM YES, SDLY 0) nil, then an address; AIN
+    /// (SDLY -1, the synchronous branch) nil after its process too.
+    #[test]
+    fn dbpr_prints_simpvt_once_a_simulation_has_deferred() {
+        let (db, ctx) = make_ctx();
+        load_records(
+            &ctx,
+            r#"record(ai, "AIS") { field(SIMM, "YES") field(SIOL, "5") field(SDLY, "0") }
+record(ai, "AIN") { field(SIMM, "YES") field(SIOL, "5") field(SDLY, "-1") }"#,
+        )
+        .expect(".db must load");
+        ctx.block_on(db.ioc_init());
+        let simpvt = |rec: &str| {
+            dbpr_field(
+                &capture(&ctx, || {
+                    dbpr_report(&ctx, rec.as_bytes(), 4);
+                }),
+                "SIMPVT",
+            )
+        };
+        assert_eq!(simpvt("AIS"), "PTR (nil)");
+        run_cmd(&ctx, "dbpf", &["AIS.PROC", "1"]);
+        run_cmd(&ctx, "dbpf", &["AIN.PROC", "1"]);
+        assert!(simpvt("AIS").starts_with("PTR 0x"), "{:?}", simpvt("AIS"));
+        assert_eq!(simpvt("AIN"), "PTR (nil)");
+    }
+
+    /// `WPTR` against `softIoc` R7.0.10, `dbpr <rec> 4` around `dbpf
+    /// CMP.PROC 1`: CMP nil, then an address once it has read its INP; CMP0,
+    /// never processed, nil.
+    #[test]
+    fn dbpr_prints_wptr_once_a_compress_has_read_its_input() {
+        let (db, ctx) = make_ctx();
+        load_records(
+            &ctx,
+            r#"record(ai, "SRC") { field(VAL, "2") }
+record(compress, "CMP") { field(INP, "SRC") field(ALG, "N to 1 Average") field(N, "2") field(NSAM, "4") }
+record(compress, "CMP0") { field(INP, "SRC") field(NSAM, "4") }"#,
+        )
+        .expect(".db must load");
+        ctx.block_on(db.ioc_init());
+        let wptr = |rec: &str| {
+            dbpr_field(
+                &capture(&ctx, || {
+                    dbpr_report(&ctx, rec.as_bytes(), 4);
+                }),
+                "WPTR",
+            )
+        };
+        assert_eq!(wptr("CMP"), "PTR (nil)");
+        run_cmd(&ctx, "dbpf", &["CMP.PROC", "1"]);
+        assert!(wptr("CMP").starts_with("PTR 0x"), "{:?}", wptr("CMP"));
+        assert_eq!(wptr("CMP0"), "PTR (nil)");
+    }
+
+    /// `ASP` once an ACF is loaded: C's `asAddMember` has run for the record.
+    #[test]
+    fn dbpr_prints_asp_once_a_policy_is_loaded() {
+        let (db, ctx) = make_ctx();
+        load_records(&ctx, r#"record(ai, "A:AI") {}"#).expect("ai .db must load");
+        ctx.block_on(db.ioc_init());
+        assert_eq!(
+            dbpr_field(
+                &capture(&ctx, || {
+                    dbpr_report(&ctx, b"A:AI", 4);
+                }),
+                "ASP"
+            ),
+            "PTR (nil)"
+        );
+        ctx.acf().store(Some(std::sync::Arc::new(
+            crate::server::access_security::parse_acf("ASG(DEFAULT) { RULE(1,READ) }")
+                .expect("acf"),
+        )));
+        let asp = dbpr_field(
+            &capture(&ctx, || {
+                dbpr_report(&ctx, b"A:AI", 4);
+            }),
+            "ASP",
+        );
+        assert!(asp.starts_with("PTR 0x"), "{asp:?}");
+    }
+
     /// `dbpr`'s `DBF_NOACCESS` rows, against `softIoc` R7.0.10 on the same
     /// record: `BKPT: 00` and `TIME: <undefined>`.
     ///
@@ -10971,7 +11793,7 @@ record(bo, "$(P)_calc_ctrl") {{
         ctx.block_on(db.ioc_init());
 
         let printed = capture(&ctx, || {
-            dbpr_report(&ctx, "N:AI", 4);
+            dbpr_report(&ctx, b"N:AI", 4);
         });
         // `size` bytes as `%02x ` (`dbTest.c:1249-1262`); BKPT is one byte.
         assert_eq!(dbpr_field(&printed, "BKPT"), "00", "dbpr N:AI 4 BKPT");
@@ -10982,6 +11804,803 @@ record(bo, "$(P)_calc_ctrl") {{
             "<undefined>",
             "dbpr N:AI 4 TIME"
         );
+    }
+
+    /// A load that merges FTVL into a record created before it moves the
+    /// type `dbChannelCreate` judges `$` on. `softIoc` R7.0.10 on
+    /// `waveform` NELM 2: `cainfo WS.VAL$` connects with FTVL STRING, and
+    /// `WD.VAL$` is "not found" with FTVL DOUBLE (`dbChannel.c:486-503`).
+    #[test]
+    fn a_merged_ftvl_moves_the_string_view_of_val() {
+        let (db, ctx) = make_ctx();
+        for name in ["WS", "WD"] {
+            ctx.block_on(db.add_record(
+                name,
+                Box::new(crate::server::records::waveform::WaveformRecord::new(
+                    2,
+                    crate::types::DbFieldType::Double,
+                )),
+            ))
+            .unwrap();
+        }
+        load_records(
+            &ctx,
+            r#"record(waveform, "WS") { field(FTVL, "STRING") }
+record(waveform, "WD") { field(FTVL, "DOUBLE") }"#,
+        )
+        .expect("db must load");
+        assert!(db.channel_create_found(b"WS.VAL$"));
+        assert!(!db.channel_create_found(b"WD.VAL$"));
+    }
+
+    /// A device-link put drops the device private, as C `dbPutFieldLink`
+    /// does (`dbAccess.c:1191`). `softIoc` R7.0.10-146 (8f5015b66) on the
+    /// same database: `AIDB` reads `DPVT: PTR 0x...` after its read and
+    /// `DPVT: PTR (nil)` after `dbpf AIDB.INP SRC.VAL`, and `SM` (SMOO 0.5)
+    /// reads 3, then 10 and 10 once its INP moves to `S2`, because
+    /// `devAiSoft.c:81` blends only into a set `dpvt`.
+    #[test]
+    fn a_device_link_put_drops_the_device_private() {
+        let (db, ctx) = make_ctx();
+        load_records(
+            &ctx,
+            r#"record(ai, "SRC") { field(VAL, "3") }
+record(ai, "S1") { field(VAL, "3") }
+record(ai, "S2") { field(VAL, "10") }
+record(ai, "AIDB") { field(INP, "SRC") }
+record(ai, "SM") { field(INP, "S1") field(SMOO, "0.5") }"#,
+        )
+        .expect("db must load");
+        ctx.block_on(db.ioc_init());
+        let dpvt = |rec: &str| {
+            let printed = capture(&ctx, || {
+                dbpr_report(&ctx, rec.as_bytes(), 4);
+            });
+            dbpr_field(&printed, "DPVT") != "PTR (nil)"
+        };
+        let val = |rec: &str| match db.get_pv(format!("{rec}.VAL")).unwrap() {
+            EpicsValue::Double(v) => v,
+            other => panic!("{other:?}"),
+        };
+
+        run_cmd(&ctx, "dbpf", &["AIDB.PROC", "1"]);
+        assert!(dpvt("AIDB"));
+        run_cmd(&ctx, "dbpf", &["AIDB.INP", "SRC.VAL"]);
+        assert!(!dpvt("AIDB"));
+
+        let mut seen = Vec::new();
+        run_cmd(&ctx, "dbpf", &["SM.PROC", "1"]);
+        seen.push(val("SM"));
+        run_cmd(&ctx, "dbpf", &["SM.INP", "S2"]);
+        for _ in 0..2 {
+            run_cmd(&ctx, "dbpf", &["SM.PROC", "1"]);
+            seen.push(val("SM"));
+        }
+        assert_eq!(seen, [3.0, 10.0, 10.0]);
+    }
+
+    /// A device-link put clears PACT whoever set it (`dbAccess.c:1194`), and
+    /// the delayed `process()` already scheduled then runs a fresh cycle.
+    /// `softIoc` R7.0.10-146 (8f5015b66), ODLY/SDLY 2 s and the reads at
+    /// 0.5 s, 3 s and 5.5 s: `CO` PACT 1, then PACT 0 DLYA 1 after `dbpf
+    /// CO.OUT T2 PP`, then T1 0 T2 0 PACT 1 DLYA 1 VAL 1, then T1 0 T2 1
+    /// PACT 0; `SD` PACT 1, PACT 0 after `dbpf SD.INP S2`, then PACT 1 VAL 0
+    /// UDF 1, then PACT 0.
+    ///
+    /// The delays are an hour so no timer fires here; each elapsed delay is
+    /// the continuation the timer would run, fired by hand, and the put is
+    /// held to leaving the pending one current.
+    #[test]
+    fn a_device_link_put_mid_delay_releases_pact_and_the_delay_starts_over() {
+        let (db, ctx) = make_ctx();
+        load_records(
+            &ctx,
+            r#"record(ai, "T1") { field(VAL, "0") }
+record(ai, "T2") { field(VAL, "0") }
+record(calcout, "CO") { field(CALC, "A+1") field(ODLY, "3600") field(OUT, "T1 PP") }
+record(ai, "S1") { field(VAL, "5") }
+record(ai, "S2") { field(VAL, "7") }
+record(ai, "SD") { field(INP, "S1") field(SIMM, "YES") field(SIOL, "S1") field(SDLY, "3600") }"#,
+        )
+        .expect("db must load");
+        ctx.block_on(db.ioc_init());
+        let get = |pv: &str| db.get_pv(pv).unwrap().to_f64().unwrap();
+        let generation = |rec: &str| {
+            db.get_record(rec)
+                .unwrap()
+                .read()
+                .reprocess_generation
+                .load(std::sync::atomic::Ordering::Acquire)
+        };
+        let elapse = |rec: &str| {
+            let token = db.mint_async_token(rec).unwrap();
+            ctx.block_on(token.fire(&db)).unwrap();
+        };
+
+        run_cmd(&ctx, "dbpf", &["CO.PROC", "1"]);
+        assert_eq!(get("CO.PACT"), 1.0);
+        let pending = generation("CO");
+        run_cmd(&ctx, "dbpf", &["CO.OUT", "T2 PP"]);
+        assert_eq!((get("CO.PACT"), get("CO.DLYA")), (0.0, 1.0));
+        assert_eq!(generation("CO"), pending, "the put cancelled the delay");
+        elapse("CO");
+        assert_eq!(
+            [
+                get("T1"),
+                get("T2"),
+                get("CO.PACT"),
+                get("CO.DLYA"),
+                get("CO")
+            ],
+            [0.0, 0.0, 1.0, 1.0, 1.0]
+        );
+        elapse("CO");
+        assert_eq!([get("T1"), get("T2"), get("CO.PACT")], [0.0, 1.0, 0.0]);
+
+        run_cmd(&ctx, "dbpf", &["SD.PROC", "1"]);
+        assert_eq!(get("SD.PACT"), 1.0);
+        let pending = generation("SD");
+        run_cmd(&ctx, "dbpf", &["SD.INP", "S2"]);
+        assert_eq!(get("SD.PACT"), 0.0);
+        assert_eq!(generation("SD"), pending, "the put cancelled the delay");
+        elapse("SD");
+        assert_eq!([get("SD.PACT"), get("SD"), get("SD.UDF")], [1.0, 0.0, 1.0]);
+        elapse("SD");
+        assert_eq!(get("SD.PACT"), 0.0);
+    }
+
+    /// A SoftCallback `add_record` allocates the devPvt `dbpr` prints as
+    /// `DPVT` and re-types INP to `PN_LINK` with only its severity bits, and a
+    /// device-link put replaces both. `softIoc` R7.0.10-146 (8f5015b66) on the
+    /// same database: `INP : PN_LINK S1 NMS` and a set DPVT on both records;
+    /// after `dbpf <rec>.INP S2`, `INP : PN_LINK S2 NMS`, `dbgf` reads
+    /// `"S2 NMS"`, and DPVT is a new address.
+    #[test]
+    fn a_soft_callback_dpvt_is_the_device_object_and_inp_is_a_pn_link() {
+        let (db, ctx) = make_ctx();
+        load_records(
+            &ctx,
+            r#"record(ai, "S1") { field(VAL, "3") }
+record(ai, "S2") { field(VAL, "10") }
+record(ai, "SMA") { field(DTYP, "Async Soft Channel") field(INP, "S1") }
+record(bi, "SMB") { field(DTYP, "Async Soft Channel") field(INP, "S1") }"#,
+        )
+        .expect("db must load");
+        ctx.block_on(db.ioc_init());
+        let row = |rec: &str, field: &str| {
+            let printed = capture(&ctx, || {
+                dbpr_report(&ctx, rec.as_bytes(), 4);
+            });
+            dbpr_field(&printed, field)
+        };
+        let inp = |rec: &str| match db.get_pv(format!("{rec}.INP")).unwrap() {
+            EpicsValue::String(s) => s.as_str_lossy().into_owned(),
+            other => panic!("{other:?}"),
+        };
+        for rec in ["SMA", "SMB"] {
+            let before = row(rec, "DPVT");
+            assert!(before.starts_with("PTR 0x"), "{rec}: {before}");
+            assert_eq!(row(rec, "INP"), "PN_LINK S1 NMS");
+            run_cmd(&ctx, "dbpf", &[&format!("{rec}.INP"), "S2"]);
+            let after = row(rec, "DPVT");
+            assert!(after.starts_with("PTR 0x"), "{rec}: {after}");
+            assert_ne!(before, after, "{rec}");
+            assert_eq!(row(rec, "INP"), "PN_LINK S2 NMS");
+            assert_eq!(inp(rec), "S2 NMS");
+        }
+    }
+
+    /// A refused `add_record` jumps past `dbAddLink`, so the link keeps its
+    /// parse type until a put binds again. `softIoc` R7.0.10-146 (8f5015b66):
+    /// after `dbpf ACB.INP NOPE`, `INP : PV_LINK NOPE NPP NMS` and `PACT: 1`;
+    /// after `dbpf ACB.INP SRC`, `INP : PN_LINK SRC NMS`.
+    #[test]
+    fn a_refused_device_link_put_leaves_a_pv_link() {
+        let (db, ctx) = make_ctx();
+        load_records(
+            &ctx,
+            r#"record(ai, "SRC") { field(VAL, "3") }
+record(ai, "ACB") { field(DTYP, "Async Soft Channel") field(INP, "SRC") }"#,
+        )
+        .expect("db must load");
+        ctx.block_on(db.ioc_init());
+        let row = |field: &str| {
+            let printed = capture(&ctx, || {
+                dbpr_report(&ctx, b"ACB", 1);
+            });
+            dbpr_field(&printed, field)
+        };
+        run_cmd(&ctx, "dbpf", &["ACB.INP", "NOPE"]);
+        assert_eq!(row("INP"), "PV_LINK NOPE NPP NMS");
+        assert_eq!(row("PACT"), "1");
+        run_cmd(&ctx, "dbpf", &["ACB.INP", "SRC"]);
+        assert_eq!(row("INP"), "PN_LINK SRC NMS");
+        assert_eq!(row("PACT"), "0");
+    }
+
+    /// C's add_record arm clears `dpvt` before `add_record` runs
+    /// (`dbAccess.c:1192`), so a refusal drops the one `devAiSoft` set: on
+    /// `softIoc` 8f5015b66 after `dbpf AP.PROC 1`, `dbpf AP.DTYP "Async Soft
+    /// Channel"` and `dbpf AP.INP NOPE`, `dbpr AP 4` prints `DPVT: PTR (nil)`,
+    /// `DSET: PTR (nil)` and `PACT: 1`.
+    #[test]
+    fn a_refused_add_record_clears_a_soft_read_dpvt() {
+        let (db, ctx) = make_ctx();
+        load_records(
+            &ctx,
+            r#"record(ai, "SRC") { field(VAL, "3") }
+record(ai, "AP") { field(DTYP, "Soft Channel") field(INP, "SRC") }"#,
+        )
+        .expect("db must load");
+        ctx.block_on(db.ioc_init());
+        let rec = db.get_record("AP").unwrap();
+        run_cmd(&ctx, "dbpf", &["AP.PROC", "1"]);
+        assert!(matches!(
+            rec.read().dpvt,
+            crate::server::device_support::Dpvt::Read
+        ));
+        run_cmd(&ctx, "dbpf", &["AP.DTYP", "Async Soft Channel"]);
+        run_cmd(&ctx, "dbpf", &["AP.INP", "NOPE"]);
+        let printed = capture(&ctx, || {
+            dbpr_report(&ctx, b"AP", 4);
+        });
+        assert_eq!(dbpr_field(&printed, "DPVT"), "PTR (nil)");
+        assert_eq!(dbpr_field(&printed, "DSET"), "PTR (nil)");
+        assert_eq!(dbpr_field(&printed, "PACT"), "1");
+        assert!(matches!(
+            rec.read().dpvt,
+            crate::server::device_support::Dpvt::Null
+        ));
+    }
+
+    /// `dbpr <rec> 4`'s pointer rows, nil or not, against `softIoc`
+    /// R7.0.10-146 (8f5015b66) on the same database after the same `dbpf`s,
+    /// as `set` or `nil`. Only `DPVT` and `WDPT` are compared: C's `SIMPVT`
+    /// on `AIS` and `WPTR` on `CMP` are allocated by the first process
+    /// (`aiRecord.c:501-504`, `compressRecord.c:334-339`) and this port
+    /// does not answer them yet.
+    #[test]
+    fn dbpr_pointer_rows_are_nil_where_c_s_are() {
+        const C: &str = "\
+AI ASP=nil DPVT=set DSET=set LSET=set PBRK=nil PPN=nil PPNR=nil RDES=set RSET=set SIMPVT=nil SPVT=nil
+AI0 ASP=nil DPVT=nil DSET=set LSET=set PBRK=nil PPN=nil PPNR=nil RDES=set RSET=set SIMPVT=nil SPVT=nil
+AIBAD ASP=nil DPVT=nil DSET=set LSET=set PBRK=nil PPN=nil PPNR=nil RDES=set RSET=set SIMPVT=nil SPVT=nil
+AIRAW ASP=nil DPVT=nil DSET=set LSET=set PBRK=nil PPN=nil PPNR=nil RDES=set RSET=set SIMPVT=nil SPVT=nil
+AIS ASP=nil DPVT=nil DSET=set LSET=set PBRK=nil PPN=nil PPNR=nil RDES=set RSET=set SIMPVT=set SPVT=nil
+BO ASP=nil DPVT=nil DSET=set LSET=set PPN=nil PPNR=nil RDES=set RPVT=set RSET=set SIMPVT=nil SPVT=nil WDPT=nil
+CMP ASP=nil BPTR=set DPVT=nil DSET=nil LSET=set PPN=nil PPNR=nil RDES=set RSET=set SPTR=nil SPVT=nil VAL=nil WPTR=set";
+        const COMPARED: [&str; 2] = ["DPVT", "WDPT"];
+        let (db, ctx) = make_ctx();
+        load_records(
+            &ctx,
+            r#"record(ai, "SRC") { field(VAL, "3") }
+record(ai, "AI") { field(INP, "SRC") }
+record(ai, "AI0") { field(INP, "SRC") }
+record(ai, "AIBAD") { field(INP, "NOSUCH") }
+record(ai, "AIRAW") { field(DTYP, "Raw Soft Channel") field(INP, "SRC") }
+record(ai, "AIS") { field(SIMM, "YES") field(SIOL, "SRC") field(SDLY, "5") }
+record(bo, "BO") { field(HIGH, "1") }
+record(compress, "CMP") { field(INP, "SRC") field(ALG, "N to 1 Average") field(NSAM, "4") }"#,
+        )
+        .expect("db must load");
+        ctx.block_on(db.ioc_init());
+        for rec in ["AI", "AIBAD", "AIRAW", "AIS", "BO", "CMP"] {
+            run_cmd(&ctx, "dbpf", &[&format!("{rec}.PROC"), "1"]);
+        }
+        run_cmd(&ctx, "dbpf", &["BO", "1"]);
+
+        let mut wrong = Vec::new();
+        for line in C.lines() {
+            let mut words = line.split(' ');
+            let rec = words.next().unwrap();
+            let printed = capture(&ctx, || {
+                dbpr_report(&ctx, rec.as_bytes(), 4);
+            });
+            let mut port: Vec<String> = printed
+                .split("  ")
+                .filter_map(|cell| {
+                    let (name, value) = cell.trim().split_once(": ")?;
+                    if !COMPARED.contains(&name.trim()) {
+                        return None;
+                    }
+                    let value = value.trim().strip_prefix("PTR ")?;
+                    let nil = if value == "(nil)" { "nil" } else { "set" };
+                    Some(format!("{}={nil}", name.trim()))
+                })
+                .collect();
+            port.sort();
+            let c: Vec<String> = words
+                .filter(|w| COMPARED.iter().any(|f| w.split('=').next() == Some(*f)))
+                .map(str::to_string)
+                .collect();
+            if port != c {
+                wrong.push(format!(
+                    "{rec}\n  C    {}\n  port {}",
+                    c.join(" "),
+                    port.join(" ")
+                ));
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+
+        // C's DPVT is `&devAiSoft`, so it prints the DSET row's address.
+        let printed = capture(&ctx, || {
+            dbpr_report(&ctx, b"AI", 4);
+        });
+        let ai = crate::server::record::dev_sup_of("ai", "Soft Channel").unwrap();
+        assert_eq!(dbpr_field(&printed, "DPVT"), format!("PTR {:p}", &ai.dset));
+    }
+
+    /// C's `dbFindField` matches a field name case-sensitively, so
+    /// `SRC.desc` names no field. `softIoc` R7.0.10-146 (8f5015b66), with
+    /// `SRC` an ai whose DESC is `hello`: a stringin whose INP is `SRC.desc`,
+    /// loaded or put, reads `INP : CA_LINK SRC.desc NPP NMS`, VAL "" and STAT
+    /// LINK after `dbpf R.PROC 1`, with nothing printed at load; `SRC.DESC`
+    /// reads `hello`; `dbpf SRC.desc x` and `dbgf SRC.desc` print `PV
+    /// 'SRC.desc' not found`.
+    #[test]
+    fn a_lower_case_field_name_is_not_a_field() {
+        let (db, ctx) = make_ctx();
+        let load = capture(&ctx, || {
+            load_records(
+                &ctx,
+                r#"record(ai, "SRC") { field(VAL, "5") field(DESC, "hello") }
+record(stringin, "R") { field(INP, "SRC.desc") }
+record(stringin, "RU") { field(INP, "SRC.DESC") }
+record(stringin, "P") { field(INP, "SRC.DESC") }"#,
+            )
+            .expect("db must load");
+        });
+        assert_eq!(load.trim(), "");
+        ctx.block_on(db.ioc_init());
+        ctx.block_on(db.initialize_link_locality());
+        run_cmd(&ctx, "dbpf", &["P.INP", "SRC.desc"]);
+        for rec in ["R", "RU", "P"] {
+            run_cmd(&ctx, "dbpf", &[&format!("{rec}.PROC"), "1"]);
+        }
+        let row = |rec: &str, field: &str| {
+            let printed = capture(&ctx, || {
+                dbpr_report(&ctx, rec.as_bytes(), 1);
+            });
+            dbpr_field(&printed, field)
+        };
+        for rec in ["R", "P"] {
+            assert_eq!(row(rec, "INP"), "CA_LINK SRC.desc NPP NMS", "{rec}");
+            assert_eq!(row(rec, "VAL"), "", "{rec}");
+            assert_eq!(row(rec, "STAT"), "LINK", "{rec}");
+        }
+        assert_eq!(row("RU", "VAL"), "hello");
+        assert_eq!(
+            run_cmd(&ctx, "dbpf", &["SRC.desc", "x"]).trim(),
+            "PV 'SRC.desc' not found"
+        );
+        assert_eq!(
+            run_cmd(&ctx, "dbgf", &["SRC.desc"]).trim(),
+            "PV 'SRC.desc' not found"
+        );
+    }
+
+    /// `dbPutFieldLink` removes the old link before `dbPutSpecial(paddr, 0)`
+    /// refuses the `SPC_NOMOD` field, and does not restore it
+    /// (`dbAccess.c:1168-1176`); a second put finds no link and fails
+    /// `S_db_badHWaddr` without a line. Every row is `softIoc` R7.0.10-146
+    /// (8f5015b66) on this database and these commands.
+    #[test]
+    fn a_refused_subl_put_removes_the_link() {
+        let heard = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sink = std::sync::Arc::clone(&heard);
+        crate::runtime::log::errlog_add_listener(move |m| {
+            sink.lock().expect("sink").push(m.to_string());
+        });
+        let no_mod_lines = || {
+            crate::runtime::log::errlog_flush();
+            heard
+                .lock()
+                .expect("sink")
+                .drain(..)
+                .filter(|m| m.contains("noMod"))
+                .map(|m| m.trim_end().to_string())
+                .collect::<Vec<_>>()
+        };
+        let (db, ctx) = make_ctx();
+        load_records(
+            &ctx,
+            r#"record(stringin, "NM") { field(VAL, "nosub") }
+record(aSub, "AS") { field(SNAM, "") field(SUBL, "NM") }
+record(aSub, "AC") { field(SUBL, "") }"#,
+        )
+        .expect("db must load");
+        ctx.block_on(db.ioc_init());
+        ctx.block_on(db.initialize_link_locality());
+        let row = |rec: &str, field: &str| {
+            let printed = capture(&ctx, || {
+                dbpr_report(&ctx, rec.as_bytes(), 1);
+            });
+            dbpr_field(&printed, field)
+        };
+        assert_eq!(row("AS", "SUBL"), "DB_LINK NM NPP NMS");
+
+        for (put, line) in [
+            (
+                "OTHER",
+                vec!["recGblDbaddrError: dbPut Attempt to modify noMod field PV: AS.SUBL"],
+            ),
+            ("THIRD", vec![]),
+        ] {
+            assert_eq!(
+                run_cmd(&ctx, "dbpf", &["AS.SUBL", put]).trim_end(),
+                r#"DBF_STRING:         "NM NPP NMS""#
+            );
+            assert_eq!(no_mod_lines(), line);
+            assert_eq!(row("AS", "SUBL"), "PV_LINK NM NPP NMS");
+        }
+
+        run_cmd(&ctx, "dbpf", &["AS.LFLG", "READ"]);
+        run_cmd(&ctx, "dbpf", &["AS.PROC", "1"]);
+        assert_eq!(row("AS", "SNAM"), "");
+        assert_eq!(row("AS", "STAT"), "NO_ALARM");
+        assert_eq!(row("AS", "SEVR"), "NO_ALARM");
+
+        for line in [
+            vec!["recGblDbaddrError: dbPut Attempt to modify noMod field PV: AC.SUBL"],
+            vec![],
+        ] {
+            assert_eq!(
+                run_cmd(&ctx, "dbpf", &["AC.SUBL", "NM"]).trim_end(),
+                r#"DBF_STRING:         """#
+            );
+            assert_eq!(no_mod_lines(), line);
+            assert_eq!(row("AC", "SUBL"), "CONSTANT");
+        }
+    }
+
+    /// An `Async Soft Channel` input completes through `dbProcessNotify` on its
+    /// INP target (`devAiSoftCallback.c` `read_ai`): PACT holds until the
+    /// target's chain finishes, and an INP put cancels the wait (`del_record`
+    /// -> `dbNotifyCancel`, `dbAccess.c:1161`) and clears PACT (`:1194`).
+    /// Every row is `softIoc` R7.0.10-146 (8f5015b66) on this database and
+    /// these commands.
+    #[test]
+    fn an_async_soft_input_waits_for_its_notify() {
+        // C `callbackInit`: no build arms the bands for a bare database.
+        crate::runtime::task::background_init();
+        let (db, ctx) = make_ctx();
+        load_records(
+            &ctx,
+            r#"record(ao, "X") {}
+record(ai, "S2") { field(VAL, "5") }
+record(seq, "SQ") { field(DLY1, "2") field(DOL1, "3") field(LNK1, "X") }
+record(seq, "SQ2") { field(DLY1, "1") field(DOL1, "7") }
+record(ai, "AS") { field(DTYP, "Async Soft Channel") field(INP, "SQ.DO1") }
+record(ai, "AS2") { field(DTYP, "Async Soft Channel") field(INP, "SQ2.DO1") }
+record(ai, "AT") { field(DTYP, "Async Soft Channel") field(INP, "S2") }
+record(ai, "AR") { field(DTYP, "Async Soft Channel") field(INP, "S2") }"#,
+        )
+        .expect("db must load");
+        ctx.block_on(db.ioc_init());
+        ctx.block_on(db.initialize_link_locality());
+        let gf = |pv: &str| run_cmd(&ctx, "dbgf", &[pv]).trim_end().to_string();
+        let sleep = |ms| std::thread::sleep(std::time::Duration::from_millis(ms));
+        const ONE: &str = "DBF_UCHAR:          1 = 0x1";
+        const ZERO: &str = "DBF_UCHAR:          0 = 0x0";
+
+        run_cmd(&ctx, "dbpf", &["AS.PROC", "1"]);
+        assert_eq!(gf("AS.PACT"), ONE);
+        assert_eq!(gf("SQ.PACT"), ONE);
+        assert_eq!(gf("AS.VAL"), "DBF_DOUBLE:         0");
+        run_cmd(&ctx, "dbpf", &["AS2.PROC", "1"]);
+        run_cmd(&ctx, "dbpf", &["AT.PROC", "1"]);
+        sleep(300);
+        assert_eq!(gf("AT.VAL"), "DBF_DOUBLE:         5");
+        assert_eq!(gf("AT.PACT"), ZERO);
+        assert_eq!(gf("AT.STAT"), r#"DBF_STRING:         "NO_ALARM""#);
+
+        assert_eq!(
+            run_cmd(&ctx, "dbpf", &["AS.INP", "S2"]).trim_end(),
+            r#"DBF_STRING:         "S2 NMS""#
+        );
+        assert_eq!(gf("AS.PACT"), ZERO);
+        assert_eq!(gf("AS.VAL"), "DBF_DOUBLE:         0");
+        sleep(2500);
+        assert_eq!(gf("X.VAL"), "DBF_DOUBLE:         3");
+        assert_eq!(gf("SQ.PACT"), ZERO);
+        assert_eq!(gf("AS.VAL"), "DBF_DOUBLE:         0");
+        assert_eq!(gf("AS.PACT"), ZERO);
+        assert_eq!(gf("AS.STAT"), r#"DBF_STRING:         "UDF""#);
+        assert_eq!(gf("AS2.VAL"), "DBF_DOUBLE:         7");
+        assert_eq!(gf("AS2.PACT"), ZERO);
+
+        assert_eq!(
+            run_cmd(&ctx, "dbpf", &["AR.INP", "NOPE"]).trim_end(),
+            r#"DBF_STRING:         "NOPE NPP NMS""#
+        );
+        run_cmd(&ctx, "dbpf", &["AR.PROC", "1"]);
+        assert_eq!(gf("AR.STAT"), r#"DBF_STRING:         "UDF""#);
+        assert_eq!(gf("AR.SEVR"), r#"DBF_STRING:         "INVALID""#);
+        assert_eq!(gf("AR.PACT"), ONE);
+
+        run_cmd(&ctx, "dbpf", &["AS.PROC", "1"]);
+        sleep(300);
+        assert_eq!(gf("AS.VAL"), "DBF_DOUBLE:         5");
+        assert_eq!(gf("AS.PACT"), ZERO);
+    }
+
+    /// A PN_LINK keeps only its severity bits (`devAiSoftCallback.c:115`):
+    /// the notify processes a passive target once, `PP` or `CA` alike, and
+    /// the completion's read processes nothing. `softIoc` R7.0.10-146
+    /// (8f5015b66).
+    #[test]
+    fn an_async_soft_input_processes_its_target_once() {
+        // C `callbackInit`: no build arms the bands for a bare database.
+        crate::runtime::task::background_init();
+        let (db, ctx) = make_ctx();
+        load_records(
+            &ctx,
+            r#"record(calc, "CNT") { field(CALC, "VAL+1") }
+record(ai, "AP") { field(DTYP, "Async Soft Channel") field(INP, "CNT PP") }
+record(calc, "CNT2") { field(CALC, "VAL+1") }
+record(ai, "AC") { field(DTYP, "Async Soft Channel") field(INP, "CNT2 CA") }"#,
+        )
+        .expect("db must load");
+        ctx.block_on(db.ioc_init());
+        ctx.block_on(db.initialize_link_locality());
+        let gf = |pv: &str| run_cmd(&ctx, "dbgf", &[pv]).trim_end().to_string();
+        for (rec, target) in [("AP", "CNT"), ("AC", "CNT2")] {
+            assert_eq!(
+                gf(&format!("{rec}.INP")),
+                format!(r#"DBF_STRING:         "{target} NMS""#)
+            );
+            run_cmd(&ctx, "dbpf", &[&format!("{rec}.PROC"), "1"]);
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            assert_eq!(gf(&format!("{rec}.VAL")), "DBF_DOUBLE:         1", "{rec}");
+            assert_eq!(
+                gf(&format!("{target}.VAL")),
+                "DBF_DOUBLE:         1",
+                "{target}"
+            );
+            assert_eq!(gf(&format!("{target}.PUTF")), "DBF_UCHAR:          0 = 0x0");
+        }
+    }
+
+    /// A target already PACT takes the notify as its restart
+    /// (`dbNotify.c:225-231`) and is processed again once its cycle ends
+    /// (`notifyCallback`, `:299-301`), so the requester completes with the
+    /// second cycle's value. Not again when the target is no longer Passive
+    /// (`:247-249`) or the requester's INP put cancelled the request
+    /// (`dbNotifyCancel`, `:400-410`). `softIoc` R7.0.10-146 (8f5015b66).
+    #[test]
+    fn an_async_soft_input_restarts_a_busy_target() {
+        // C `callbackInit`: no build arms the bands for a bare database.
+        crate::runtime::task::background_init();
+        let (db, ctx) = make_ctx();
+        load_records(
+            &ctx,
+            r#"record(calc, "CN") { field(CALC, "VAL+1") }
+record(seq, "SQ") { field(DLY1, "2") field(DOL1, "CN NPP") field(LNK1, "CN.PROC") }
+record(ai, "AS") { field(DTYP, "Async Soft Channel") field(INP, "SQ.DO1") }
+record(calc, "BN") { field(CALC, "VAL+1") }
+record(seq, "BQ") { field(DLY1, "2") field(DOL1, "BN NPP") field(LNK1, "BN.PROC") }
+record(ai, "AB") { field(DTYP, "Async Soft Channel") field(INP, "BQ.DO1") }
+record(ai, "S2") { field(VAL, "5") }
+record(calc, "EN") { field(CALC, "VAL+1") }
+record(seq, "EQ") { field(SCAN, "Event") field(EVNT, "77") field(DLY1, "2") field(DOL1, "EN NPP") field(LNK1, "EN.PROC") }
+record(ai, "AE") { field(DTYP, "Async Soft Channel") field(INP, "EQ.DO1") }"#,
+        )
+        .expect("db must load");
+        ctx.block_on(db.ioc_init());
+        ctx.block_on(db.initialize_link_locality());
+        let gf = |pv: &str| run_cmd(&ctx, "dbgf", &[pv]).trim_end().to_string();
+        let sleep = |ms| std::thread::sleep(std::time::Duration::from_millis(ms));
+        // The DLY1 windows end on the delay thread's clock, not this one's.
+        let settle = |pv: &str, want: &str| {
+            for _ in 0..2000 {
+                if gf(pv) == want {
+                    return;
+                }
+                sleep(5);
+            }
+        };
+        const ONE: &str = "DBF_UCHAR:          1 = 0x1";
+        const ZERO: &str = "DBF_UCHAR:          0 = 0x0";
+
+        for target in ["SQ.PROC", "BQ.PROC", "EQ.PROC"] {
+            run_cmd(&ctx, "dbpf", &[target, "1"]);
+        }
+        sleep(300);
+        for rec in ["AS.PROC", "AB.PROC", "AE.PROC"] {
+            run_cmd(&ctx, "dbpf", &[rec, "1"]);
+        }
+        assert_eq!(gf("AS.PACT"), ONE);
+        assert_eq!(gf("SQ.PACT"), ONE);
+        assert_eq!(gf("AE.PACT"), ONE);
+        sleep(300);
+        assert_eq!(
+            run_cmd(&ctx, "dbpf", &["AB.INP", "S2"]).trim_end(),
+            r#"DBF_STRING:         "S2 NMS""#
+        );
+        assert_eq!(gf("AB.PACT"), ZERO);
+        settle("CN.VAL", "DBF_DOUBLE:         1");
+        settle("SQ.PACT", ONE);
+        settle("AE.PACT", ZERO);
+        assert_eq!(gf("CN.VAL"), "DBF_DOUBLE:         1");
+        assert_eq!(gf("SQ.PACT"), ONE);
+        assert_eq!(gf("AS.PACT"), ONE);
+        assert_eq!(gf("AS.VAL"), "DBF_DOUBLE:         0");
+        assert_eq!(gf("EN.VAL"), "DBF_DOUBLE:         1");
+        assert_eq!(gf("EQ.PACT"), ZERO);
+        assert_eq!(gf("AE.PACT"), ZERO);
+        assert_eq!(gf("AE.VAL"), "DBF_DOUBLE:         0");
+        settle("AS.PACT", ZERO);
+        assert_eq!(gf("CN.VAL"), "DBF_DOUBLE:         2");
+        assert_eq!(gf("SQ.DO1"), "DBF_DOUBLE:         1");
+        assert_eq!(gf("SQ.PACT"), ZERO);
+        assert_eq!(gf("AS.PACT"), ZERO);
+        assert_eq!(gf("AS.VAL"), "DBF_DOUBLE:         1");
+        assert_eq!(gf("BN.VAL"), "DBF_DOUBLE:         1");
+        assert_eq!(gf("BQ.PACT"), ZERO);
+        assert_eq!(gf("AB.VAL"), "DBF_DOUBLE:         0");
+        assert_eq!(gf("AB.PACT"), ZERO);
+        assert_eq!(gf("EN.VAL"), "DBF_DOUBLE:         1");
+    }
+
+    /// Every record prints its DPVT row. `softIoc` R7.0.10-146 (8f5015b66):
+    /// `DPVT: PTR (nil)` for a processed `Soft Timestamp` stringin, a calc,
+    /// and an `Async Soft Channel` ai after `dbpf AR.INP NOSUCH`, whose
+    /// `add_record` refuses.
+    #[test]
+    fn dbpr_prints_a_nil_dpvt_for_every_record() {
+        let (db, ctx) = make_ctx();
+        load_records(
+            &ctx,
+            r#"record(stringin, "TS") { field(DTYP, "Soft Timestamp") }
+record(calc, "C") { field(CALC, "1") }
+record(ai, "S") { field(VAL, "1") }
+record(ai, "AR") { field(DTYP, "Async Soft Channel") field(INP, "S") }"#,
+        )
+        .expect("db must load");
+        ctx.block_on(db.ioc_init());
+        run_cmd(&ctx, "dbpf", &["TS.PROC", "1"]);
+        run_cmd(&ctx, "dbpf", &["AR.INP", "NOSUCH"]);
+        for rec in ["TS", "C", "AR"] {
+            let printed = capture(&ctx, || {
+                dbpr_report(&ctx, rec.as_bytes(), 4);
+            });
+            assert_eq!(dbpr_field(&printed, "DPVT"), "PTR (nil)", "{rec}");
+        }
+    }
+
+    /// A device-link put whose `add_record` refuses leaves the record with no
+    /// dset and PACT set until a later device-link put binds again. `softIoc`
+    /// R7.0.10-146 (8f5015b66) on the same database: after `dbpf ACB.INP
+    /// NOPE`, `DSET: PTR (nil)` and `PACT: 1`, and `dbpf SRC 7` then `dbpf
+    /// ACB.PROC 1` leaves `ACB` at 3 with RPRO 1, LCNT 0 and PROC 1; `dbpf
+    /// ACB.INP SRC` gives `PACT: 0` and a set `DSET`.
+    #[test]
+    fn a_refused_device_link_put_detaches_the_dset_and_holds_pact() {
+        let (db, ctx) = make_ctx();
+        load_records(
+            &ctx,
+            r#"record(ai, "SRC") { field(VAL, "3") }
+record(ai, "ACB") { field(DTYP, "Async Soft Channel") field(INP, "SRC") }"#,
+        )
+        .expect("db must load");
+        ctx.block_on(db.ioc_init());
+        let dset_nil = || {
+            let printed = capture(&ctx, || {
+                dbpr_report(&ctx, b"ACB", 4);
+            });
+            dbpr_field(&printed, "DSET") == "PTR (nil)"
+        };
+        let get = |pv: &str| db.get_pv(pv).unwrap().to_f64().unwrap();
+
+        run_cmd(&ctx, "dbpf", &["ACB.INP", "NOPE"]);
+        assert!(dset_nil());
+        assert_eq!(get("ACB.PACT"), 1.0);
+
+        let before = get("ACB");
+        run_cmd(&ctx, "dbpf", &["SRC", "7"]);
+        run_cmd(&ctx, "dbpf", &["ACB.PROC", "1"]);
+        assert_eq!(get("ACB"), before);
+        assert_eq!(get("ACB.PACT"), 1.0);
+        // `dbPutField`'s PACT arm: PROC on an active record only sets RPRO.
+        assert_eq!(
+            (get("ACB.RPRO"), get("ACB.LCNT"), get("ACB.PROC")),
+            (1.0, 0.0, 1.0)
+        );
+
+        run_cmd(&ctx, "dbpf", &["ACB.INP", "SRC"]);
+        assert!(!dset_nil());
+        assert_eq!(get("ACB.PACT"), 0.0);
+    }
+
+    /// C reads DTYP under the record's lock (`dbAccess.c:1128`); the port
+    /// prepares the new dset before the hold, so a DTYP that moves in between
+    /// is refused under the hold before the link moves.
+    #[test]
+    fn a_device_link_put_whose_dtyp_moved_is_refused_before_the_link_moves() {
+        let (db, ctx) = make_ctx();
+        load_records(
+            &ctx,
+            r#"record(bi, "DS") { field(DTYP, "Db State") field(INP, "@st1") }"#,
+        )
+        .expect("db must load");
+        ctx.block_on(db.ioc_init());
+        let rec = db.get_record("DS").unwrap();
+        let text = || crate::types::EpicsValue::String("@st2".into());
+        let mut link = crate::server::record::PreparedCommonLink::for_put("INP", &text());
+        link.as_mut().unwrap().ask_add_record(&db, &rec);
+        rec.write().common.dtyp.set_name("Soft Channel");
+        let put = rec.write().gate_device_link_put(link.as_mut().unwrap());
+        assert!(
+            matches!(put, Err(crate::error::CaError::NoSupport)),
+            "{put:?}"
+        );
+        assert_eq!(rec.read().common.text.inp, "@st1");
+    }
+
+    /// `dbpr <rec> 4`'s `DSET` row on one record of every `softIoc.dbd`
+    /// record type, against `softIoc` R7.0.10-146 (8f5015b66): NULL exactly
+    /// on the ten types with no `device()` line.
+    #[test]
+    fn dbpr_dset_row_is_nil_where_c_s_is() {
+        const NIL: &[&str] = &[
+            "aSub",
+            "calc",
+            "compress",
+            "dfanout",
+            "fanout",
+            "permissive",
+            "sel",
+            "seq",
+            "state",
+            "sub",
+        ];
+        const SET: &[&str] = &[
+            "aai",
+            "aao",
+            "ai",
+            "ao",
+            "bi",
+            "bo",
+            "calcout",
+            "event",
+            "histogram",
+            "int64in",
+            "int64out",
+            "longin",
+            "longout",
+            "lsi",
+            "lso",
+            "mbbi",
+            "mbbiDirect",
+            "mbbo",
+            "mbboDirect",
+            "printf",
+            "stringin",
+            "stringout",
+            "subArray",
+            "waveform",
+        ];
+        let (db, ctx) = make_ctx();
+        let text: String = NIL
+            .iter()
+            .chain(SET)
+            .map(|t| format!("record({t}, \"R_{t}\") {{ }}\n"))
+            .collect();
+        load_records(&ctx, &text).expect("db must load");
+        ctx.block_on(db.ioc_init());
+        let nil = |t: &str| {
+            let printed = capture(&ctx, || {
+                dbpr_report(&ctx, format!("R_{t}").as_bytes(), 4);
+            });
+            dbpr_field(&printed, "DSET") == "PTR (nil)"
+        };
+        for t in NIL {
+            assert!(nil(t), "{t}");
+        }
+        for t in SET {
+            assert!(!nil(t), "{t}");
+        }
     }
 
     /// `base(HEX)` reaches `dbpr` and nothing else.
@@ -11004,7 +12623,7 @@ record(bo, "$(P)_calc_ctrl") {{
         ctx.block_on(db.ioc_init());
 
         let printed = capture(&ctx, || {
-            dbpr_report(&ctx, "H:I", 2);
+            dbpr_report(&ctx, b"H:I", 2);
         });
         for (field, expected) in [
             ("ZRVL", "0xa"),
@@ -11167,7 +12786,7 @@ record(ai, "P:FL")      { field(FLNK, "L:B") }
         let mut registry = CommandRegistry::new();
         register_builtins(&mut registry);
         let cmd = registry.get("dbl").unwrap();
-        let tokens = vec!["ai".to_string()];
+        let tokens: Vec<IocshString> = vec!["ai".into()];
         let args = parse_args(&tokens, &cmd.args).unwrap();
         let result = cmd.handler.call(&args, &ctx);
         assert!(matches!(result, Ok(CommandOutcome::Continue)));
@@ -11220,7 +12839,7 @@ record(mbbo, "DUP:CM") {{
         let mut registry = CommandRegistry::new();
         register_builtins(&mut registry);
         let cmd = registry.get("dbLoadRecords").unwrap();
-        let args = parse_args(&[tmp.path().to_string_lossy().to_string()], &cmd.args).unwrap();
+        let args = parse_args(&[tmp.path().to_string_lossy().into()], &cmd.args).unwrap();
         let result = cmd.handler.call(&args, &ctx);
         assert!(
             matches!(result, Ok(CommandOutcome::Continue)),
@@ -11236,7 +12855,10 @@ record(mbbo, "DUP:CM") {{
             // Last-write-wins: DESC + ZRST should reflect the SECOND
             // record block. ONST stays from the FIRST block since
             // the second didn't override it.
-            assert_eq!(inst.common.desc, "second", "second block's DESC must win");
+            assert_eq!(
+                inst.common.text.desc, "second",
+                "second block's DESC must win"
+            );
             assert_eq!(
                 inst.record.get_field("ZRST"),
                 Some(crate::types::EpicsValue::String("Mono-Override".into())),
@@ -11275,7 +12897,7 @@ record(mbbo, "DUP:CM") {{
             r#"record(ao, "BPT:RBK") {{ field(DESC, "first") }}"#
         )
         .expect("write tempfile 1");
-        let args = parse_args(&[tmp1.path().to_string_lossy().to_string()], &cmd.args).unwrap();
+        let args = parse_args(&[tmp1.path().to_string_lossy().into()], &cmd.args).unwrap();
         assert!(matches!(
             cmd.handler.call(&args, &ctx),
             Ok(CommandOutcome::Continue)
@@ -11294,7 +12916,7 @@ record(ao, "BPT:RBK") {{ field(LINR, "ramp") }}
 "#
         )
         .expect("write tempfile 2");
-        let args = parse_args(&[tmp2.path().to_string_lossy().to_string()], &cmd.args).unwrap();
+        let args = parse_args(&[tmp2.path().to_string_lossy().into()], &cmd.args).unwrap();
         assert!(matches!(
             cmd.handler.call(&args, &ctx),
             Ok(CommandOutcome::Continue)
@@ -11349,7 +12971,7 @@ record(ai, "A:BPT") {{ field(LINR, "zebra") }}
 "#
         )
         .expect("write tempfile 1");
-        let args = parse_args(&[tmp1.path().to_string_lossy().to_string()], &cmd.args).unwrap();
+        let args = parse_args(&[tmp1.path().to_string_lossy().into()], &cmd.args).unwrap();
         assert!(matches!(
             cmd.handler.call(&args, &ctx),
             Ok(CommandOutcome::Continue)
@@ -11362,7 +12984,7 @@ record(ai, "A:BPT") {{ field(LINR, "zebra") }}
             .expect("tempfile");
         writeln!(tmp2.as_file(), r#"breaktable(alpha) {{ 0 0  100 100 }}"#)
             .expect("write tempfile 2");
-        let args = parse_args(&[tmp2.path().to_string_lossy().to_string()], &cmd.args).unwrap();
+        let args = parse_args(&[tmp2.path().to_string_lossy().into()], &cmd.args).unwrap();
         assert!(matches!(
             cmd.handler.call(&args, &ctx),
             Ok(CommandOutcome::Continue)
@@ -11467,13 +13089,13 @@ record(ai, "AFTER:HASH") { }
     }
 
     /// R5-4: the same name at a different record type is `yyerror(NULL)`
-    /// (`dbLexRoutines.c:1173-1180`), so the record is skipped and the
-    /// rest of the file still loads. The message names the type being
-    /// LOADED first and the type already in the database last —
-    /// `recordType` then `dbGetRecordTypeName(pdbentry)` — which the port
-    /// had the other way round, without C's `ERROR: ` prefix.
+    /// (`dbLexRoutines.c:1173-1180`) without `duplicate = TRUE`, so the
+    /// body goes to the existing record and the rest of the file still
+    /// loads. The message names the type being LOADED first and the type
+    /// already in the database last — `recordType` then
+    /// `dbGetRecordTypeName(pdbentry)`.
     #[test]
-    fn test_db_load_records_different_type_duplicate_is_skipped() {
+    fn test_db_load_records_different_type_duplicate_merges_into_the_existing_record() {
         let (db, ctx) = make_ctx();
         // Pre-register DUP:CM as an `ai`.
         ctx.block_on(async {
@@ -11484,14 +13106,17 @@ record(ai, "AFTER:HASH") { }
         let err = load_records(
             &ctx,
             r#"
-record(mbbo, "DUP:CM") { field(ZRST, "Mono") }
+record(mbbo, "DUP:CM") { field(ZRST, "Mono") field(DESC, "from mbbo") }
 record(ai, "SIM:C") { field(VAL, "1") }
 "#,
         )
         .expect_err("the load's status must still be non-zero");
+        // The second is `ZRST`, judged against the ai the body landed on.
         assert_eq!(
             err,
-            format!("{ERL_ERROR}: mbbo record 'DUP:CM' already exists, can't load ai record")
+            format!(
+                "{ERL_ERROR}: mbbo record 'DUP:CM' already exists, can't load ai record (+1 more)"
+            )
         );
         assert!(
             exists(&db, &ctx, "SIM:C"),
@@ -11504,6 +13129,11 @@ record(ai, "SIM:C") { field(VAL, "1") }
                 inst.record.record_type(),
                 "ai",
                 "the existing record keeps its own type"
+            );
+            assert_eq!(
+                inst.resolve_field("DESC").unwrap().text_g(),
+                "from mbbo",
+                "a field the existing type declares is applied to it"
             );
         });
     }
@@ -11643,6 +13273,66 @@ record(ai, "SIM:C") { field(VAL, "1") }
         };
         assert_eq!(strs("E:B"), "no_strs = 2:");
         assert_eq!(strs("E:M"), "enum strings not returned");
+    }
+
+    /// `dbtgf`'s `DBR_ENUM` read of a string field is `cvt_st_e` against the
+    /// field's record. softIoc: `"High"` stores VAL 1 into `S:B` and prints
+    /// the unwritten buffer, a defect not copied — here the index is printed
+    /// and VAL stays 0; `"7"` fails with
+    /// `recGblRecordError: 7 Illegal choice PV: S:B7`; stringin fails with
+    /// `recGblRecSupError: … stringin::put_enum_str PV: S:SI.VAL`.
+    #[test]
+    fn dbtgf_reads_a_string_field_as_enum_through_cvt_st_e() {
+        let (db, ctx) = make_ctx();
+        load_records(
+            &ctx,
+            "record(bi, \"S:B\") { field(ZNAM, \"Low\") field(ONAM, \"High\") \
+             field(DESC, \"High\") }\n\
+             record(bi, \"S:B7\") { field(ZNAM, \"Low\") field(ONAM, \"High\") \
+             field(DESC, \"7\") }\n\
+             record(stringin, \"S:SI\") { field(VAL, \"High\") }\n",
+        )
+        .unwrap();
+        ctx.block_on(db.ioc_init());
+        let heard = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sink = Arc::clone(&heard);
+        crate::runtime::log::errlog_add_listener(move |m| {
+            sink.lock().unwrap().push(m.trim_end().to_string())
+        });
+        for (pv, want, line) in [
+            ("S:B.DESC", "1", None),
+            (
+                "S:B7.DESC",
+                "failed.",
+                Some("recGblRecordError: 7 Illegal choice PV: S:B7"),
+            ),
+            (
+                "S:SI",
+                "failed.",
+                Some(
+                    "recGblRecSupError: dbPutField missing record support entry table \
+                     stringin::put_enum_str PV: S:SI.VAL",
+                ),
+            ),
+        ] {
+            crate::runtime::log::errlog_flush();
+            heard.lock().unwrap().clear();
+            let out = run_cmd(&ctx, "dbtgf", &[pv]);
+            crate::runtime::log::errlog_flush();
+            let got: Vec<&str> = out
+                .lines()
+                .find(|l| l.starts_with("DBF_ENUM:"))
+                .unwrap_or_default()
+                .split_whitespace()
+                .collect();
+            assert_eq!(got, ["DBF_ENUM:", want], "{pv}:\n{out}");
+            let said = std::mem::take(&mut *heard.lock().unwrap());
+            match line {
+                Some(line) => assert!(said.iter().any(|l| l == line), "{pv}: {said:?}"),
+                None => assert!(said.is_empty(), "{pv}: {said:?}"),
+            }
+        }
+        assert_eq!(db.get_pv_blocking("S:B").unwrap(), EpicsValue::Enum(0));
     }
 
     /// C prints `<cmd> only works after iocInit` and fails the line
@@ -11858,34 +13548,82 @@ record(ai, "SIM:C") { field(VAL, "1") }
         );
     }
 
-    /// C `lnkConst_report`'s type word comes from which yajl callback
-    /// the token reached, and its array arm prints the element list only
-    /// from level 2 (`lnkConst.c:286-347`).
+    /// A `pva` link reports through its lset (`dbJLink.c:468-471` calling
+    /// pvxs `pva_report`), with the holding field's class, on the shell's
+    /// stdout: pvxs prints through `epicsStdio.h`, so `dbjlr P > f` puts its
+    /// line in `f` while dbJLink.c's headers and lnkCalc.c's lines stay on
+    /// the console (softIocPVX 1.5.3). A `calc` argument reports as an input
+    /// one level down and four spaces in.
     #[test]
-    fn const_link_report_names_the_json_type_it_parsed() {
+    fn dbjlr_hands_a_pva_link_to_its_lset_report() {
+        use crate::server::database::{LinkRef, LinkSet};
+        use crate::types::DbfLinkClass;
+        struct Reporter;
+        #[async_trait::async_trait]
+        impl LinkSet for Reporter {
+            fn is_connected(&self, _: LinkRef<'_>) -> bool {
+                false
+            }
+            async fn get_value(&self, _: LinkRef<'_>) -> Option<EpicsValue> {
+                None
+            }
+            fn report(
+                &self,
+                link: LinkRef<'_>,
+                class: Option<DbfLinkClass>,
+                level: i32,
+                indent: usize,
+            ) -> Vec<String> {
+                let name = String::from_utf8_lossy(link.name);
+                vec![format!("{:indent$}'pva': {name} {class:?} {level}", "")]
+            }
+        }
+        let (db, ctx) = make_ctx();
+        db.declare_link_type("pva");
+        ctx.block_on(db.register_link_set("pva", std::sync::Arc::new(Reporter)));
+        load_records(
+            &ctx,
+            "record(ai, \"P\") { field(INP, {pva:\"SRC\"}) } \
+             record(ao, \"Q\") { field(OUT, {pva:{pv:\"SRC\", proc:true}}) } \
+             record(ai, \"K\") { field(INP, {calc:{expr:\"A\", args:[{pva:\"SRC\"}]}}) }",
+        )
+        .unwrap();
+        ctx.block_on(db.ioc_init());
+
+        let mut registry = CommandRegistry::new();
+        register_builtins(&mut registry);
+        let dbjlr = registry.get("dbjlr").unwrap();
+        // (stdout, console) of `dbjlr rec level`.
+        let report = |rec: &str, level: &str| -> (String, String) {
+            let tokens = [IocshString::from(rec), IocshString::from(level)];
+            let args = parse_args(&tokens, &dbjlr.args).unwrap();
+            let out = tempfile::NamedTempFile::new().unwrap();
+            let console = tempfile::NamedTempFile::new().unwrap();
+            ctx.with_console(console.reopen().unwrap(), std::io::stderr(), || {
+                ctx.with_output(out.reopen().unwrap(), || {
+                    dbjlr.handler.call(&args, &ctx).unwrap();
+                })
+            });
+            let read = |f: &tempfile::NamedTempFile| std::fs::read_to_string(f.path()).unwrap();
+            (read(&out), read(&console))
+        };
         assert_eq!(
-            const_link_report_lines("4.25", 0, 6),
-            vec!["      'const': double 4.25"]
+            report("P", "1"),
+            (
+                "      'pva': SRC Some(InLink) 1\n".to_string(),
+                "JSON links in record 'P'\n\n  ai record 'P':\n    Link field 'INP':\n".to_string()
+            )
         );
+        let (out, _) = report("Q", "0");
+        assert!(out.ends_with(" Some(OutLink) 0\n"), "{out}");
         assert_eq!(
-            const_link_report_lines("4", 0, 6),
-            vec!["      'const': integer 4"]
-        );
-        assert_eq!(
-            const_link_report_lines("\"hi\"", 0, 6),
-            vec!["      'const': string \"hi\""]
-        );
-        assert_eq!(
-            const_link_report_lines("[1, 2, 3]", 0, 6),
-            vec!["      'const': array of 3 integers"]
-        );
-        assert_eq!(
-            const_link_report_lines("[1, 2, 3]", 2, 6),
-            vec!["      'const': array of 3 integers", "        [1, 2, 3]"]
-        );
-        assert_eq!(
-            const_link_report_lines("[1.5]", 2, 6),
-            vec!["      'const': array of 1 double", "        [1.5]"]
+            report("K", "2"),
+            (
+                "          'pva': SRC Some(InLink) 1\n".to_string(),
+                "JSON links in record 'K'\n\n  ai record 'K':\n    Link field 'INP':\n      \
+                 'calc': \"A\" = 0 \n        Input A: 0\n"
+                    .to_string()
+            )
         );
     }
 
@@ -12056,13 +13794,13 @@ record(ai, "SIM:C") { field(VAL, "1") }
         ctx.block_on(db.ioc_init());
 
         assert_eq!(
-            ctx.block_on(dbtpn_lines(&db, "R:LO", Some("7".to_string()))),
+            ctx.block_on(dbtpn_lines(&db, b"R:LO", Some("7".into()))),
             vec!["dbtpnCallback: success record=R:LO"]
         );
         assert_eq!(db.get_pv("R:LO").unwrap(), EpicsValue::Long(7));
 
         assert_eq!(
-            ctx.block_on(dbtpn_lines(&db, "R:SRC", None)),
+            ctx.block_on(dbtpn_lines(&db, b"R:SRC", None)),
             vec![
                 "dbtpn:getCallback value 3.500",
                 "dbtpnCallback: success record=R:SRC",
@@ -12111,14 +13849,14 @@ record(ai, "SIM:C") { field(VAL, "1") }
         ctx.block_on(db.ioc_init());
 
         assert_eq!(
-            ctx.block_on(tpn_lines(&db, "R:LO", "7".to_string())),
+            ctx.block_on(tpn_lines(&db, b"R:LO", "7".into())),
             vec!["tpnCallback 'R:LO': Success"]
         );
         assert_eq!(db.get_pv("R:LO").unwrap(), EpicsValue::Long(7));
 
         // The callback names the record, not the channel the caller typed.
         assert_eq!(
-            ctx.block_on(tpn_lines(&db, "R:LO.VAL", "9".to_string())),
+            ctx.block_on(tpn_lines(&db, b"R:LO.VAL", "9".into())),
             vec!["tpnCallback 'R:LO': Success"]
         );
 
@@ -12155,7 +13893,7 @@ record(ai, "SIM:C") { field(VAL, "1") }
         let tmp = tempfile::Builder::new().suffix(".db").tempfile().unwrap();
         write!(tmp.as_file(), "{body}").unwrap();
         let mut faults = db_loader::DbFaults::default();
-        match db_read_database(ctx, &tmp.path().to_string_lossy(), "", "", &mut faults) {
+        match db_read_database(ctx, &tmp.path().to_string_lossy(), "", b"", &mut faults) {
             Ok(_) => Ok(()),
             Err(DbReadFailure::Rejected) => Err(faults
                 .first_diagnostic()
@@ -12175,11 +13913,7 @@ record(ai, "SIM:C") { field(VAL, "1") }
         let mut registry = CommandRegistry::new();
         register_builtins(&mut registry);
         let cmd = registry.get("dbCreateRecord").unwrap();
-        let args = parse_args(
-            &["pdbbase".to_string(), "ai".to_string(), name.to_string()],
-            &cmd.args,
-        )
-        .unwrap();
+        let args = parse_args(&["pdbbase".into(), "ai".into(), name.into()], &cmd.args).unwrap();
         cmd.handler.call(&args, ctx).map(|_| ())
     }
 
@@ -12249,7 +13983,7 @@ record(ai, "SIM:C") { field(VAL, "1") }
         register_builtins(&mut registry);
         let cmd = registry.get("dbLoadRecords").unwrap();
         for name in ["a.db", "b.db"] {
-            let args = parse_args(&[name.to_string()], &cmd.args).unwrap();
+            let args = parse_args(&[name.to_string().into()], &cmd.args).unwrap();
             cmd.handler.call(&args, &ctx).unwrap_or_else(|e| {
                 panic!("{name}: {e}");
             });
@@ -12257,7 +13991,10 @@ record(ai, "SIM:C") { field(VAL, "1") }
 
         assert!(exists(&db, &ctx, "BASE:TEMP"));
         assert!(exists(&db, &ctx, "B:X"), "b.db's own record must load");
-        assert_eq!(db.resolve_alias("OLD:TEMP").as_deref(), Some("BASE:TEMP"));
+        assert_eq!(
+            db.resolve_alias("OLD:TEMP").as_deref(),
+            Some(&b"BASE:TEMP"[..])
+        );
     }
 
     /// I-R3-4(b): a target NO load owns is a diagnostic that fails the
@@ -12279,7 +14016,7 @@ record(ai, "SIM:C") { field(VAL, "1") }
         // At the read, which owns the wording: the command keeps none of
         // it — it writes C's summary and answers `Failed`.
         let mut faults = db_loader::DbFaults::default();
-        let Err(DbReadFailure::Rejected) = db_read_database(&ctx, "c.db", "", "", &mut faults)
+        let Err(DbReadFailure::Rejected) = db_read_database(&ctx, "c.db", "", b"", &mut faults)
         else {
             panic!("an unknown alias target must fail the call's status");
         };
@@ -12390,11 +14127,11 @@ record(ai, "LATER2") { field(VAL, "2") }
 
     #[test]
     fn test_parse_macro_string() {
-        let macros = parse_macro_string("P=IOC:,R=TEMP");
-        assert_eq!(macros.get("P").unwrap(), "IOC:");
-        assert_eq!(macros.get("R").unwrap(), "TEMP");
+        let macros = parse_macro_string(b"P=IOC:,R=TEMP");
+        assert_eq!(macros.get(b"P".as_slice()).unwrap(), b"IOC:");
+        assert_eq!(macros.get(b"R".as_slice()).unwrap(), b"TEMP");
 
-        let empty = parse_macro_string("");
+        let empty = parse_macro_string(b"");
         assert!(empty.is_empty());
     }
 
@@ -12407,46 +14144,47 @@ record(ai, "LATER2") { field(VAL, "2") }
     #[test]
     fn parse_macro_string_keeps_values_raw_for_the_expander() {
         use crate::server::db_loader::{MacroExpandOptions, expand_macros};
-        fn expand(m: &HashMap<String, String>, name: &str) -> String {
+        fn expand(m: &HashMap<Vec<u8>, Vec<u8>>, name: &str) -> String {
+            let m = crate::runtime::mac_lib::MacroDefs::from_byte_map(m);
             expand_macros(&format!("$({name})"), m, MacroExpandOptions::default()).text
         }
 
         // Quoted comma stays inside the value (macParseDefns parity):
         // raw split would tear this into `DESC="a` + a stray `b"`.
-        let m = parse_macro_string(r#"DESC="a,b",P=IOC:"#);
-        assert_eq!(m.get("DESC").unwrap(), r#""a,b""#);
+        let m = parse_macro_string(br#"DESC="a,b",P=IOC:"#);
+        assert_eq!(m.get(b"DESC".as_slice()).unwrap(), br#""a,b""#);
         assert_eq!(expand(&m, "DESC"), "a,b");
-        assert_eq!(m.get("P").unwrap(), "IOC:");
+        assert_eq!(m.get(b"P".as_slice()).unwrap(), b"IOC:");
 
         // Escaped comma is a literal; the backslash survives the parse
         // and the expansion drops it.
-        let m = parse_macro_string(r#"DESC=a\,b,P=IOC:"#);
-        assert_eq!(m.get("DESC").unwrap(), r#"a\,b"#);
+        let m = parse_macro_string(br#"DESC=a\,b,P=IOC:"#);
+        assert_eq!(m.get(b"DESC".as_slice()).unwrap(), br#"a\,b"#);
         assert_eq!(expand(&m, "DESC"), "a,b");
 
         // Two backslashes: one removal, not two — C expands this to
         // `a\b`.
-        let m = parse_macro_string(r#"B=a\\b"#);
-        assert_eq!(m.get("B").unwrap(), r#"a\\b"#);
+        let m = parse_macro_string(br#"B=a\\b"#);
+        assert_eq!(m.get(b"B".as_slice()).unwrap(), br#"a\\b"#);
         assert_eq!(expand(&m, "B"), r#"a\b"#);
 
         // Whitespace around names and values is trimmed; a quoted NAME
         // is stripped in place, because a name is not re-parsed.
-        let m = parse_macro_string(r#" P = IOC: , "R" = TEMP "#);
-        assert_eq!(m.get("P").unwrap(), "IOC:");
-        assert_eq!(m.get("R").unwrap(), "TEMP");
+        let m = parse_macro_string(br#" P = IOC: , "R" = TEMP "#);
+        assert_eq!(m.get(b"P".as_slice()).unwrap(), b"IOC:");
+        assert_eq!(m.get(b"R".as_slice()).unwrap(), b"TEMP");
 
         // Quoted whitespace inside a value is preserved.
-        let m = parse_macro_string(r#"MSG="a b c""#);
-        assert_eq!(m.get("MSG").unwrap(), r#""a b c""#);
+        let m = parse_macro_string(br#"MSG="a b c""#);
+        assert_eq!(m.get(b"MSG".as_slice()).unwrap(), br#""a b c""#);
         assert_eq!(expand(&m, "MSG"), "a b c");
 
         // A name with no '=' is a deletion: nothing to remove from a
         // fresh map, and the surrounding assignments still parse.
-        let m = parse_macro_string("A=1,DROP,B=2");
-        assert_eq!(m.get("A").unwrap(), "1");
-        assert_eq!(m.get("B").unwrap(), "2");
-        assert!(!m.contains_key("DROP"));
+        let m = parse_macro_string(b"A=1,DROP,B=2");
+        assert_eq!(m.get(b"A".as_slice()).unwrap(), b"1");
+        assert_eq!(m.get(b"B".as_slice()).unwrap(), b"2");
+        assert!(!m.contains_key(b"DROP".as_slice()));
     }
 
     /// R17-66: `dbLoadRecords` is a record-creation path, so the records it
@@ -12489,7 +14227,7 @@ record(mbboDirect, "MBD0") {{ }}
         let mut registry = CommandRegistry::new();
         register_builtins(&mut registry);
         let cmd = registry.get("dbLoadRecords").unwrap();
-        let args = parse_args(&[tmp.path().to_string_lossy().to_string()], &cmd.args).unwrap();
+        let args = parse_args(&[tmp.path().to_string_lossy().into()], &cmd.args).unwrap();
         assert!(matches!(
             cmd.handler.call(&args, &ctx),
             Ok(CommandOutcome::Continue)
@@ -12547,17 +14285,36 @@ record(mbboDirect, "MBD0") {{ }}
         let mut registry = CommandRegistry::new();
         register_builtins(&mut registry);
         let cmd = registry.get(name).unwrap();
-        let tokens: Vec<String> = tokens.iter().map(|t| t.to_string()).collect();
+        let tokens: Vec<IocshString> = tokens.iter().map(|t| IocshString::from(*t)).collect();
         let args = parse_args(&tokens, &cmd.args).unwrap();
+        let out_file = tempfile::NamedTempFile::new().unwrap();
         let err_file = tempfile::NamedTempFile::new().unwrap();
-        let err_path = err_file.path().to_path_buf();
         let mut result = Ok(CommandOutcome::Continue);
-        let out = capture(ctx, || {
-            ctx.with_error(std::fs::File::create(&err_path).unwrap(), || {
-                result = cmd.handler.call(&args, ctx);
-            });
+        with_console_and_shell_streams(ctx, &out_file, &err_file, || {
+            result = cmd.handler.call(&args, ctx);
         });
-        (out, std::fs::read_to_string(&err_path).unwrap(), result)
+        (
+            std::fs::read_to_string(out_file.path()).unwrap(),
+            std::fs::read_to_string(err_file.path()).unwrap(),
+            result,
+        )
+    }
+
+    /// Point each shell stream and its console twin at one file, in the
+    /// order they are written, for a test that asserts on the bytes and not
+    /// on which cell carried them.
+    fn with_console_and_shell_streams(
+        ctx: &CommandContext,
+        out: &tempfile::NamedTempFile,
+        err: &tempfile::NamedTempFile,
+        f: impl FnOnce(),
+    ) {
+        let out = out.reopen().unwrap();
+        let err = err.reopen().unwrap();
+        let (out2, err2) = (out.try_clone().unwrap(), err.try_clone().unwrap());
+        ctx.with_console(out2, err2, || {
+            ctx.with_output(out, || ctx.with_error(err, f));
+        });
     }
 
     /// C `cvtArg` stores NULL for a string argument the line never
@@ -12663,8 +14420,8 @@ record(mbboDirect, "MBD0") {{ }}
                  so can't modify record."
             )
         );
-        assert_eq!(db.get_pv("D:ONE.DESC").unwrap().to_string(), "first");
-        assert_eq!(db.get_pv("D:ONE.EGU").unwrap().to_string(), "");
+        assert_eq!(db.get_pv("D:ONE.DESC").unwrap().text_g(), "first");
+        assert_eq!(db.get_pv("D:ONE.EGU").unwrap().text_g(), "");
     }
 
     /// Clear — C's default — the same file merges, which is the whole
@@ -12680,8 +14437,8 @@ record(mbboDirect, "MBD0") {{ }}
                record(ai, "D:ONE") { field(DESC, "second") field(EGU, "V") }"#,
         )
         .expect("the default merges");
-        assert_eq!(db.get_pv("D:ONE.DESC").unwrap().to_string(), "second");
-        assert_eq!(db.get_pv("D:ONE.EGU").unwrap().to_string(), "V");
+        assert_eq!(db.get_pv("D:ONE.DESC").unwrap().text_g(), "second");
+        assert_eq!(db.get_pv("D:ONE.EGU").unwrap().text_g(), "V");
     }
 
     /// `record("*", …)` returns from C's `dbRecordHead` before
@@ -12697,7 +14454,7 @@ record(mbboDirect, "MBD0") {{ }}
         let outcome = load_records(&ctx, r#"record("*", "D:ONE") { field(DESC, "edited") }"#);
         run_cmd(&ctx, "var", &["dbRecordsOnceOnly", "0"]);
         outcome.expect("a modify block is exempt");
-        assert_eq!(db.get_pv("D:ONE.DESC").unwrap().to_string(), "edited");
+        assert_eq!(db.get_pv("D:ONE.DESC").unwrap().text_g(), "edited");
     }
 
     /// C `createAlias` (`dbLexRoutines.c:1459-1476`): an alias that already
@@ -12717,7 +14474,7 @@ record(mbboDirect, "MBD0") {{ }}
                alias("D:TWO", "D:ALIAS")"#,
         )
         .expect("the default accepts the repeat");
-        assert_eq!(db.get_pv("D:ALIAS.DESC").unwrap().to_string(), "t");
+        assert_eq!(db.get_pv("D:ALIAS.DESC").unwrap().text_g(), "t");
 
         run_cmd(&ctx, "var", &["dbRecordsOnceOnly", "1"]);
         let err = load_records(&ctx, r#"alias("D:TWO", "D:ALIAS")"#).expect_err("once-only");
@@ -12727,7 +14484,7 @@ record(mbboDirect, "MBD0") {{ }}
             format!("{ERL_ERROR}: Alias 'D:ALIAS' already defined; dbRecordsOnceOnly is set.")
         );
         // The alias the FIRST declaration made is untouched either way.
-        assert_eq!(db.get_pv("D:ALIAS.DESC").unwrap().to_string(), "t");
+        assert_eq!(db.get_pv("D:ALIAS.DESC").unwrap().text_g(), "t");
     }
 
     /// An alias name already taken by something else is C's OTHER arm and
@@ -12774,7 +14531,7 @@ record(mbboDirect, "MBD0") {{ }}
             ("A:CAO.OUT", "OTHER:PV CA NMS"),
             ("L:B.FLNK", ""),
         ] {
-            assert_eq!(db.get_pv(pv).unwrap().to_string(), want, "{pv}");
+            assert_eq!(db.get_pv(pv).unwrap().text_g(), want, "{pv}");
         }
     }
 
@@ -12893,7 +14650,7 @@ record(mbboDirect, "MBD0") {{ }}
         let desc = ctx.block_on(async {
             let rec = db.get_record("R:FROMDBD").unwrap();
             let r = rec.read();
-            r.common.desc.to_string()
+            r.common.text.desc.to_string()
         });
         assert_eq!(desc, "declared in a .dbd");
 
@@ -13025,6 +14782,58 @@ record(ai, "R4") { field(SCAN, "1 second") }
         );
         for name in ["R1", "R2", "R3", "R4"] {
             assert!(exists(&db, &ctx, name), "C's dbl lists {name}");
+        }
+    }
+
+    /// Every refusal class prints C's `dbRecordField` sentence from one
+    /// formatter. The oracle is softIoc R7.0.10.1-DEV's stderr for this very
+    /// file, one class per record: a numeric value `dbPutString` cannot parse
+    /// (C1), an illegal menu choice with its suggestion (C2), a JSON link type
+    /// that is not registered (C3), an lso `VAL` (C4, `DBF_NOACCESS`) and a
+    /// link type spelled in the wrong case (C5, the JSON link table is
+    /// case-sensitive). Every record still loads, the one after them too.
+    #[test]
+    fn every_refused_field_class_prints_c_text_from_one_formatter() {
+        let (db, ctx) = make_ctx();
+        let dir = tempfile::tempdir().unwrap();
+        let _path = DbIncludePath::set(dir.path());
+        write_file(
+            dir.path(),
+            "all.db",
+            r#"record(ai, "C1") { field(PREC, "xyz") }
+record(ai, "C2") { field(SCAN, "Passiv") }
+record(ai, "C3") { field(INP, {nosuch:{x:1}}) }
+record(lso, "C4") { field(VAL, "abc") }
+record(ai, "C5") { field(INP, {"CONST":3}) }
+record(ai, "C6") { field(DESC, "ok") }
+"#,
+        );
+        let mut faults = db_loader::DbFaults::default();
+        let read = db_read_database(
+            &ctx,
+            &dir.path().join("all.db").to_string_lossy(),
+            "",
+            b"",
+            &mut faults,
+        );
+        assert!(matches!(read, Err(DbReadFailure::Rejected)));
+        let e = ERL_ERROR;
+        assert_eq!(
+            faults.messages(),
+            [
+                format!("{e}: Can't set 'C1.PREC' to 'xyz'  : No digits to convert"),
+                format!(
+                    "{e}: Can't set 'C2.SCAN' to 'Passiv' using menu menuScan : Illegal choice"
+                ),
+                format!("{e}: Can't set 'C3.INP' to '{{nosuch:{{x:1}}}}'  : Bad Field value"),
+                format!(
+                    "{e}: Can't set 'C4.VAL' to 'abc' Can't set array field before iocInit() : Bad Field value"
+                ),
+                format!("{e}: Can't set 'C5.INP' to '{{\"CONST\":3}}'  : Bad Field value"),
+            ]
+        );
+        for name in ["C1", "C2", "C3", "C4", "C5", "C6"] {
+            assert!(exists(&db, &ctx, name), "C keeps {name}");
         }
     }
 
@@ -13169,21 +14978,21 @@ record(ai, "R4") { field(SCAN, "1 second") }
         let mut registry = CommandRegistry::new();
         register_builtins(&mut registry);
         let cmd = registry.get("dbLoadTemplate").unwrap();
-        let mut tokens = vec![sub_file.to_string_lossy().to_string()];
+        let mut tokens: Vec<IocshString> = vec![sub_file.to_string_lossy().into_owned().into()];
         if let Some(g) = global_macros {
-            tokens.push(g.to_string());
+            tokens.push(g.into());
         }
         let args = parse_args(&tokens, &cmd.args).unwrap();
         // `dbLoadTemplate` writes C's summary itself and answers `Failed`,
         // so the diagnostic is on the stream, not in the return value.
+        let out_file = tempfile::NamedTempFile::new().unwrap();
         let err_file = tempfile::NamedTempFile::new().unwrap();
-        let err_path = err_file.path().to_path_buf();
         let mut result = Ok(CommandOutcome::Continue);
-        ctx.with_error(std::fs::File::create(&err_path).unwrap(), || {
+        with_console_and_shell_streams(ctx, &out_file, &err_file, || {
             result = cmd.handler.call(&args, ctx);
         });
         match result {
-            Ok(CommandOutcome::Failed) => Err(std::fs::read_to_string(&err_path).unwrap()),
+            Ok(CommandOutcome::Failed) => Err(std::fs::read_to_string(err_file.path()).unwrap()),
             Ok(_) => Ok(()),
             Err(e) => Err(e),
         }
@@ -13398,12 +15207,6 @@ record(ai, "IOC:AI2") { field(VAL, "2.5") field(EGU, "amps") }
     /// (`dbLoadTemplate.y:371-374`) before `pdbbase` is touched, returning
     /// -1. Measured on softIoc: `dbLoadTemplate: error opening sub file
     /// nosuch.sub: No such file or directory`.
-    ///
-    /// The reason half of that line is the platform's, exactly as C's own
-    /// `strerror` is, so it is taken from a real failed open of the same path
-    /// rather than pinned: Windows spells this code "The system cannot find
-    /// the file specified." The glibc sentence the measurement above recorded
-    /// is asserted where glibc is what answers.
     #[test]
     fn db_load_template_file_not_found_errors() {
         let (db, ctx) = make_ctx();
@@ -13413,7 +15216,6 @@ record(ai, "IOC:AI2") { field(VAL, "2.5") field(EGU, "amps") }
         let reason = super::super::c_strerror(
             &std::fs::read_to_string(&missing).expect_err("the path must not exist"),
         );
-        #[cfg(all(unix, target_env = "gnu"))]
         assert_eq!(reason, "No such file or directory");
 
         let err = load_template(&ctx, &missing, None)
@@ -13426,6 +15228,44 @@ record(ai, "IOC:AI2") { field(VAL, "2.5") field(EGU, "amps") }
             )
         );
         assert!(!exists(&db, &ctx, "IOC:AI1"), "nothing is created on error");
+    }
+
+    /// `dbLoadTemplate`'s path walk passes over a `.substitutions` file
+    /// that will not open, and the line for none opening carries the last
+    /// open's `errno` (`dbLoadTemplate.y:362-374`). Measured on softIoc:
+    /// `dbLoadTemplate: error opening sub file s.subs: No such device or
+    /// address`.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial(epics_env)]
+    fn db_load_template_passes_over_a_sub_file_that_will_not_open() {
+        let (db, ctx) = make_ctx();
+        let dir = tempfile::tempdir().unwrap();
+        let (p1, p2) = (dir.path().join("p1"), dir.path().join("p2"));
+        std::fs::create_dir(&p1).unwrap();
+        std::fs::create_dir(&p2).unwrap();
+        let _socket = std::os::unix::net::UnixListener::bind(p1.join("s.subs")).unwrap();
+        write_file(&p2, "s.subs", "file t.db { {N=1} }\n");
+        write_file(dir.path(), "t.db", "record(ai, \"T$(N)\") {}\n");
+        let _path = DbIncludePath::set(dir.path());
+
+        let both = std::env::join_paths([&p1, &p2]).unwrap();
+        let both = both.to_str().unwrap();
+        let (_out, err, result) = run_capturing(&ctx, "dbLoadTemplate", &["s.subs", "", both]);
+        assert!(matches!(result, Ok(CommandOutcome::Continue)), "{err}");
+        assert_eq!(err, "");
+        assert!(exists(&db, &ctx, "T1"));
+
+        let reason = super::super::c_strerror(
+            &std::fs::File::open(p1.join("s.subs")).expect_err("a socket does not open"),
+        );
+        let p1 = p1.to_str().unwrap();
+        let (_out, err, result) = run_capturing(&ctx, "dbLoadTemplate", &["s.subs", "", p1]);
+        assert!(matches!(result, Ok(CommandOutcome::Failed)));
+        assert_eq!(
+            err,
+            format!("dbLoadTemplate: error opening sub file s.subs: {reason}\n")
+        );
     }
 
     /// A malformed `.substitutions` file is the OTHER failure: the file
@@ -13677,17 +15517,17 @@ Total 3 records, 2 aliases
         register_builtins(&mut registry);
         let cmd = registry.get("dbCreateAlias").unwrap();
         let call = |tokens: &[&str]| {
-            let tokens: Vec<String> = tokens.iter().map(|t| t.to_string()).collect();
+            let tokens: Vec<IocshString> = tokens.iter().map(|t| IocshString::from(*t)).collect();
             let args = parse_args(&tokens, &cmd.args).expect("C accepts a missing argument");
             cmd.handler.call(&args, &ctx).map(|_| ())
         };
 
         assert!(call(&["pdbbase", "A:one", "A:alias2"]).is_ok());
-        assert_eq!(db.resolve_alias("A:alias2").as_deref(), Some("A:one"));
+        assert_eq!(db.resolve_alias("A:alias2").as_deref(), Some(&b"A:one"[..]));
         // C does not gate this on iocState, so an alias of an alias resolves
         // to the real record (`dbStaticLib.c:1675-1677`).
         assert!(call(&["pdbbase", "A:alias2", "A:alias3"]).is_ok());
-        assert_eq!(db.resolve_alias("A:alias3").as_deref(), Some("A:one"));
+        assert_eq!(db.resolve_alias("A:alias3").as_deref(), Some(&b"A:one"[..]));
 
         assert_eq!(
             call(&["pdbbase", "A:one", "A:alias2"]).unwrap_err(),
@@ -13755,10 +15595,10 @@ Total 3 records, 2 aliases
         register_builtins(&mut registry);
         for name in ["dbStateSet", "dbStateClear", "dbStateShow", "dbStateCreate"] {
             let cmd = registry.get(name).unwrap();
-            let tokens = if name == "dbStateCreate" {
+            let tokens: Vec<IocshString> = if name == "dbStateCreate" {
                 Vec::new()
             } else {
-                vec!["IOCSH_TEST_NO_SUCH_STATE".to_string()]
+                vec!["IOCSH_TEST_NO_SUCH_STATE".into()]
             };
             let args = parse_args(&tokens, &cmd.args).unwrap();
             let printed = capture(&ctx, || {
@@ -13775,8 +15615,8 @@ Total 3 records, 2 aliases
     /// on `softIoc` R7.0.10-146 after
     /// `dbLoadDatabase("$(EPICS_BASE)/dbd/bptTypeKdegC.dbd")`:
     /// `breaktable(%s) {`, then `\traw=%f slope=%e eng=%f` per point, then
-    /// `}` (`dbStaticLib.c:3546-3552`). `%e` is what forces `c_exponential`
-    /// — Rust's `{:.6e}` would write `e-1` where C writes `e-01`.
+    /// `}` (`dbStaticLib.c:3546-3552`). Rust's `{:.6e}` would write `e-1` where
+    /// C writes `e-01`.
     #[test]
     fn db_dump_breaktable_prints_c_s_bytes_for_type_kdegc() {
         let (_db, ctx) = make_ctx();
@@ -13823,15 +15663,19 @@ Total 3 records, 2 aliases
         );
     }
 
-    /// `c_exponential` is the `%e` half of `dbDumpBreaktable`'s format: six
-    /// fraction digits and a signed exponent of at least two digits.
+    /// `dbgf`'s `%g` and `ca_dump_dbr`'s `%f` print a NaN's sign bit, as glibc
+    /// does.
     #[test]
-    fn c_exponential_writes_c_s_two_digit_signed_exponent() {
-        assert_eq!(c_exponential(0.2472694), "2.472694e-01");
-        assert_eq!(c_exponential(0.0), "0.000000e+00");
-        assert_eq!(c_exponential(-1.5), "-1.500000e+00");
-        assert_eq!(c_exponential(1.0e100), "1.000000e+100");
-        assert_eq!(c_exponential(1.0e-7), "1.000000e-07");
+    fn a_negative_nan_prints_as_glibc_spells_it() {
+        assert_eq!(
+            printbuffer_elements(DbfCode::Double, &EpicsValue::Double(-f64::NAN)),
+            ["-nan"]
+        );
+        assert_eq!(
+            printbuffer_elements(DbfCode::Float, &EpicsValue::Float(-f32::NAN)),
+            ["-nan"]
+        );
+        assert_eq!(ca_dump_f(-f64::NAN, 6, 4), "  -nan");
     }
 
     /// `dbDumpPath` reports the path a load INSTALLED, not the one the next
@@ -13861,7 +15705,7 @@ Total 3 records, 2 aliases
         let mut registry = CommandRegistry::new();
         register_builtins(&mut registry);
         let cmd = registry.get("dbLoadRecords").unwrap();
-        let args = parse_args(&["one.db".to_string()], &cmd.args).unwrap();
+        let args = parse_args(&["one.db".into()], &cmd.args).unwrap();
         capture(&ctx, || {
             cmd.handler.call(&args, &ctx).unwrap();
         });
@@ -13876,10 +15720,173 @@ Total 3 records, 2 aliases
         let mut registry = CommandRegistry::new();
         register_builtins(&mut registry);
         let cmd = registry.get("dbDumpPath").unwrap();
-        let args = parse_args(&["notpdbbase".to_string()], &cmd.args).unwrap();
+        let args = parse_args(&["notpdbbase".into()], &cmd.args).unwrap();
         assert!(
             cmd.handler.call(&args, &ctx).is_err(),
             "dbDumpPath must reject a first argument that is not pdbbase"
         );
+    }
+    /// `testdata/<case>/cmds.txt` on `t.db` against softIoc R7.0.10-146
+    /// stdout, `testdata/<case>/softioc.out`, which
+    /// `softIoc -d t.db < cmds.txt 2>/dev/null` printed. Two columns are
+    /// masked, each a deliberate non-match documented at its printer:
+    /// `Field Address` ([`print_db_addr`]) and `time =`
+    /// ([`dbtgf_option_lines`]). Errlog lines went to stderr.
+    fn assert_matches_softioc(case: &str) {
+        let (db, ctx) = make_ctx();
+        let dir = format!(
+            "{}/src/server/iocsh/testdata/{case}",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        run_cmd(&ctx, "dbLoadRecords", &[&format!("{dir}/t.db")]);
+        ctx.block_on(db.ioc_init());
+        let cmds = std::fs::read_to_string(format!("{dir}/cmds.txt")).unwrap();
+        let want = std::fs::read_to_string(format!("{dir}/softioc.out")).unwrap();
+        // Zipping two empty files would compare nothing.
+        assert!(cmds.lines().count() > 0, "cmds.txt is empty");
+        assert!(want.lines().count() > 0, "softioc.out is empty");
+        let mut out = String::new();
+        for line in cmds.lines() {
+            let mut words = line.split_whitespace();
+            let cmd = words.next().unwrap();
+            // iocsh's quoting: `""` is the empty argument, `'...'` one word.
+            let args: Vec<&str> = words
+                .map(|a| {
+                    if a == "\"\"" {
+                        ""
+                    } else {
+                        a.trim_matches('\'')
+                    }
+                })
+                .collect();
+            out.push_str("epics> ");
+            out.push_str(&run_cmd(&ctx, cmd, &args));
+        }
+        let mask = |s: &str| -> String {
+            s.lines()
+                .map(|l| {
+                    if l.starts_with("time = ") {
+                        "time = <masked>".to_string()
+                    } else if let Some(i) = l.find("Record Address: ") {
+                        format!("{}Record Address: <masked>", &l[..i])
+                    } else {
+                        l.to_string()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        for (n, (got, want)) in mask(&out).lines().zip(mask(&want).lines()).enumerate() {
+            assert_eq!(got, want, "{case} line {}", n + 1);
+        }
+        assert_eq!(mask(&out).lines().count(), mask(&want).lines().count());
+    }
+
+    /// `REC.FIELD$` through all seven `dbTest.c` commands.
+    #[test]
+    fn dollar_view_commands_match_softioc_r7_0_10_146() {
+        assert_matches_softioc("dollar_view");
+    }
+
+    /// `RTYP`, `VERS` and a `dbPutAttribute` name through the `dbTest.c`
+    /// commands: `dbGetAttributePart`'s `DBF_STRING` address, read as text.
+    #[test]
+    fn attribute_commands_match_softioc_r7_0_10_146() {
+        assert_matches_softioc("attribute");
+    }
+
+    /// An attribute's `$` address, and a `dbPutAttribute` over `RTYP`, which
+    /// both the plain and the `$` read then serve.
+    #[test]
+    fn attribute_dollar_commands_match_softioc_r7_0_10_146() {
+        assert_matches_softioc("attribute_dollar");
+    }
+
+    /// The bare shell's `iocInit` — every `CaServerBuilder` binary and a
+    /// piped `softioc-rs` — scans as C's does: `iocBuild` starts the scan
+    /// threads (`iocInit.c:186`) and `iocRun` lets them run (`:259`). It
+    /// used to build with no scan owner, so nothing periodic ever processed.
+    #[test]
+    fn a_bare_shell_ioc_init_starts_periodic_scanning() {
+        let (db, ctx) = make_ctx();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("per.db");
+        std::fs::write(
+            &path,
+            "record(calc, \"PER\") { field(SCAN, \".1 second\") field(CALC, \"VAL+1\") }\n",
+        )
+        .unwrap();
+        run_cmd(&ctx, "dbLoadRecords", &[path.to_str().unwrap()]);
+        let (_, failed) = run_cmd_outcome(&ctx, "iocInit", &[]);
+        assert!(!failed, "a void IOC builds and runs");
+
+        std::thread::sleep(std::time::Duration::from_millis(1000));
+        let per = db.get_record("PER").unwrap().read().record.get_field("VAL");
+        assert!(
+            matches!(per, Some(EpicsValue::Double(v)) if v >= 5.0),
+            "a running IOC ticks .1 second: {per:?}"
+        );
+        assert_eq!(crate::server::ioc_app::ioc_shutdown(), 0);
+    }
+
+    /// dbNotify.c does not include `epicsStdio.h`, so `dbtpn`'s refusals stay
+    /// on the console under `cmd > f`. C oracle (`oracleStdIoc`): `f` empty.
+    #[test]
+    fn dbtpn_s_refusals_stay_on_the_console() {
+        let shell = crate::server::iocsh::tests::make_shell();
+        for (line, want) in [
+            ("dbtpn", "Usage: dbtpn \"name\", \"value\"\n"),
+            ("dbtpn nosuch", "dbtpn: No such channel\n"),
+        ] {
+            assert_eq!(
+                shell.file_and_console(line),
+                (String::new(), want.to_string()),
+                "{line}"
+            );
+        }
+    }
+
+    /// dbEvent.c does not include `epicsStdio.h`, so `dbel`'s lines stay on
+    /// the console under `cmd > f`. C oracle (`oracleStdIoc`): `f` empty.
+    #[test]
+    fn dbel_s_lines_stay_on_the_console() {
+        let shell = crate::server::iocsh::tests::make_shell();
+        assert_eq!(
+            shell.file_and_console("dbel TEST_REC 1"),
+            (
+                String::new(),
+                "\"TEST_REC\": No PV event subscriptions ( monitors ).\n".to_string()
+            )
+        );
+    }
+
+    /// dbJLink.c does not include `epicsStdio.h`, so `dbjlr`'s lines stay on
+    /// the console under `cmd > f`. C oracle (`oracleStdIoc`): `f` empty.
+    #[test]
+    fn dbjlr_s_lines_stay_on_the_console() {
+        let shell = crate::server::iocsh::tests::make_shell();
+        assert_eq!(
+            shell.file_and_console("dbjlr TEST_REC 2"),
+            (
+                String::new(),
+                "JSON links in record 'TEST_REC'\n\n  ai record 'TEST_REC':\n".to_string()
+            )
+        );
+    }
+
+    /// dbState.c does not include `epicsStdio.h`, so `dbStateShow`'s line
+    /// stays on the console under `cmd > f`. C oracle (`oracleStdIoc`): `f`
+    /// empty.
+    #[test]
+    fn db_state_show_stays_on_the_console() {
+        let shell = crate::server::iocsh::tests::make_shell();
+        shell.execute_line("dbStateCreate tstdout_x").unwrap();
+        assert_eq!(
+            shell.file_and_console("dbStateShow tstdout_x"),
+            (String::new(), "FALSE\n".to_string())
+        );
+        let (file, console) = shell.file_and_console("dbStateShowAll");
+        assert_eq!(file, "");
+        assert!(console.ends_with("'tstdout_x' : FALSE\n"), "{console}");
     }
 }

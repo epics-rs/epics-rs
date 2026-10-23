@@ -16,7 +16,7 @@
 //! ```rust,ignore
 //! IocApplication::new()
 //!     .port(5064)
-//!     .register_device_support("myDevice", || Box::new(MyDeviceSupport::new()))
+//!     .register_device_support("ai", &MY_DEVICE, || Box::new(MyDeviceSupport::new()))
 //!     .register_startup_command(my_config_command())
 //!     .startup_script("st.cmd")
 //!     .run(my_protocol_runner)
@@ -28,7 +28,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::error::{CaError, CaResult};
 use crate::runtime::net::cas_server_port;
-use crate::server::record::{self, Record, SubroutineFn};
+use crate::server::record::{self, ContextSubroutineFn, Record, Subroutine};
 
 use crate::server::database::PvDatabase;
 use crate::server::device_support::DeviceSupport;
@@ -58,13 +58,9 @@ pub mod init_hooks {
     /// The pause block and the reachable half of the shutdown block are
     /// here because [`super::ioc_pause`] and [`super::ioc_shutdown`] make
     /// those transitions real. Still absent, because the port has no such
-    /// transition to announce them from: `initHookAfterCloseLinks`,
-    /// `initHookAfterStopCallback` and `initHookAfterStopLinks` (no
-    /// `doCloseLinks`, `callbackStop` or `dbCaShutdown` analogue — the
-    /// callback facility has no stop and the link sets have no lifecycle
-    /// methods), `initHookBeforeFree` (C announces it only from
-    /// `iocBuildIsolated`'s shutdown), the two `dbUnitTest` states, and the
-    /// two states C itself marks deprecated.
+    /// transition to announce them from: the two `dbUnitTest` states. The
+    /// two states C marks deprecated are modelled: C's first `iocRun` still
+    /// announces them (`iocInit.c:262-263`, `:270-271`).
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
     pub enum InitHookState {
         /// Start of iocBuild() / iocInit().
@@ -113,10 +109,23 @@ pub mod init_hooks {
 
         /// Start of iocShutdown().
         AtShutdown,
+        /// Links disabled/deleted.
+        AfterCloseLinks,
         /// Scan tasks stopped.
         AfterStopScan,
+        /// Callback tasks stopped.
+        AfterStopCallback,
+        /// CA links stopped.
+        AfterStopLinks,
+        /// Resource cleanup about to happen.
+        BeforeFree,
         /// End of iocShutdown().
         AfterShutdown,
+
+        /// Only announced once. Deprecated in favor of AfterDatabaseRunning.
+        AfterInterruptAccept,
+        /// Only announced once. Deprecated in favor of AfterIocRunning.
+        AtEnd,
     }
 
     impl InitHookState {
@@ -145,8 +154,14 @@ pub mod init_hooks {
                 InitHookState::AfterDatabasePaused => "initHookAfterDatabasePaused",
                 InitHookState::AfterIocPaused => "initHookAfterIocPaused",
                 InitHookState::AtShutdown => "initHookAtShutdown",
+                InitHookState::AfterCloseLinks => "initHookAfterCloseLinks",
                 InitHookState::AfterStopScan => "initHookAfterStopScan",
+                InitHookState::AfterStopCallback => "initHookAfterStopCallback",
+                InitHookState::AfterStopLinks => "initHookAfterStopLinks",
+                InitHookState::BeforeFree => "initHookBeforeFree",
                 InitHookState::AfterShutdown => "initHookAfterShutdown",
+                InitHookState::AfterInterruptAccept => "initHookAfterInterruptAccept",
+                InitHookState::AtEnd => "initHookAtEnd",
             }
         }
     }
@@ -222,6 +237,22 @@ pub enum IocState {
     Paused,
 }
 
+/// C `iocBuildMode` (`iocInit.c:77-79`): whether `iocRun`, `iocPause` and
+/// `iocShutdown` drive the protocol servers, and whether `iocShutdown` frees
+/// what the build made.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum BuildMode {
+    /// C `buildServers`: `iocBuild`'s mode, and the one every `iocShutdown`
+    /// leaves behind (`iocInit.c:761`).
+    #[default]
+    Servers,
+    /// C `buildIsolated` (`iocBuildIsolated`, `iocInit.c:232-247`), the build
+    /// C's `testdb` boots: no server is initialised or run, a CA link reaches
+    /// only this database (`dbCaLinkInitIsolated`), and `iocShutdown` also
+    /// removes DB links and frees the build, so the process can build again.
+    Isolated,
+}
+
 /// The IOC lifecycle's single owner.
 ///
 /// C keeps `iocState` in one file-static and lets only `iocBuild`,
@@ -238,15 +269,34 @@ struct Lifecycle {
     /// running and merely stops them scanning, which is what lets
     /// `iocRun` resume the rates in phase.
     scan: Option<crate::server::scan::ScanOwner>,
+    /// The database `iocBuild` built, from [`initial_process`] until
+    /// `iocShutdown` — C's `pdbbase` as `piniProcess` walks it.
+    db: Option<Arc<PvDatabase>>,
+    /// C `iocBuildMode`: written by a build that succeeds and reset by
+    /// `iocShutdown`.
+    mode: BuildMode,
 }
 
 static LIFECYCLE: Mutex<Lifecycle> = Mutex::new(Lifecycle {
     state: IocState::Void,
     scan: None,
+    db: None,
+    mode: BuildMode::Servers,
 });
 
 fn lifecycle() -> std::sync::MutexGuard<'static, Lifecycle> {
     LIFECYCLE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The `scanCtl` cell of the database this IOC's build published: C's one
+/// `scanCtl`, reached the way C reaches it, through the IOC's own database.
+/// `None` before `initial_process` has published one, when nothing exists
+/// for `scanRun`/`scanPause`/`scanStop` to act on.
+fn ioc_scan_control() -> Option<Arc<crate::server::scan::ScanControl>> {
+    lifecycle()
+        .db
+        .as_ref()
+        .map(|db| Arc::clone(db.scan_control()))
 }
 
 /// C `getIocState` (`iocInit.c:100-103`).
@@ -260,8 +310,8 @@ fn set_ioc_state(state: IocState) {
     lifecycle().state = state;
 }
 
-/// Hand the scan owner to the lifecycle — called once, at the `iocRun`
-/// point, by the build path that created it.
+/// Hand the scan owner to the lifecycle — called once per build, by
+/// [`initial_process`].
 fn adopt_scan_owner(owner: crate::server::scan::ScanOwner) {
     // Replacing an existing owner drops the old one (joining its thread)
     // AFTER the lock is released, so a second `run` in one process cannot
@@ -275,60 +325,68 @@ fn adopt_scan_owner(owner: crate::server::scan::ScanOwner) {
 /// neither state.
 ///
 /// The port's `iocRun` covers C's `scanRun` and `dbRunServers` halves.
-/// `dbCaRun` has no analogue: the link sets ([`crate::server::database::LinkSet`])
+/// `dbCaRun` has no analogue here: the link sets ([`crate::server::database::LinkSet`])
 /// carry no lifecycle methods, so external links keep running across a
-/// pause — see [`ioc_pause`].
+/// pause — see [`ioc_pause`]. The first run's connect-time CP pass sits
+/// between the two halves, in `run_built`.
 pub fn ioc_run() -> i32 {
+    match ioc_run_begin() {
+        Some(running) => {
+            running.finish();
+            0
+        }
+        None => -1,
+    }
+}
+
+/// `iocRun` up to and including `scanRun`; [`IocRunStarted::finish`] is the
+/// rest. `None` when the IOC is neither built nor paused.
+fn ioc_run_begin() -> Option<IocRunStarted> {
     let from = get_ioc_state();
     if from != IocState::Paused && from != IocState::Built {
-        crate::runtime::log::errlog_printf(&format!(
+        crate::runtime::log::errlog_vprintf(format_args!(
             "iocRun: {} IOC not paused\n",
             crate::runtime::log::erl_warning()
         ));
-        return -1;
+        return None;
     }
     init_hook_announce(InitHookState::AtIocRun);
 
-    crate::server::scan::scan_run();
-    init_hook_announce(InitHookState::AfterDatabaseRunning);
-
-    crate::server::db_server::db_run_servers();
-    init_hook_announce(InitHookState::AfterCaServerRunning);
-
-    crate::runtime::log::errlog_printf(if from == IocState::Built {
-        "iocRun: All initialization complete\n"
-    } else {
-        "iocRun: IOC restarted\n"
-    });
-    set_ioc_state(IocState::Running);
-    init_hook_announce(InitHookState::AfterIocRunning);
-    0
+    if let Some(ctl) = ioc_scan_control() {
+        ctl.run();
+    }
+    Some(IocRunStarted { from })
 }
 
-/// The `iocRun` transition as reached by [`crate::server::scan::ScanOwner::start`]
-/// — the one line every bring-up path in this workspace shares.
-///
-/// `IocApplication` is the port of C's `iocBuild`, but it is not the only
-/// way an IOC starts here: `softioc-rs`, `qsrv-rs`, `dual_ioc_rs`,
-/// `oracle_ioc` and the two realtime IOCs build their database through
-/// `CaServerBuilder` / `PvaServerBuilder` and then start the scan owner
-/// themselves. Those paths have no build phase to announce, so their
-/// database is already built by the time they start scanning — which is
-/// why [`IocState::Void`] resolves to [`IocState::Built`] here rather than
-/// being refused. Without this the lifecycle would be correct on one path
-/// and permanently `Void` on six, and `iocPause` would answer "IOC not
-/// running" on the very IOC that is.
-///
-/// A redundant owner (the `try_claim_scan_start` case) finds the IOC
-/// already running and only re-arms the facility cell.
-pub(crate) fn note_scan_owner_started() {
-    if get_ioc_state() == IocState::Void {
-        set_ioc_state(IocState::Built);
-    }
-    if get_ioc_state() == IocState::Built {
-        ioc_run();
-    } else {
-        crate::server::scan::scan_run();
+/// An `iocRun` past `scanRun`, where C runs `dbCaRun` (`iocInit.c:260`).
+#[must_use]
+struct IocRunStarted {
+    from: IocState,
+}
+
+impl IocRunStarted {
+    fn finish(self) {
+        init_hook_announce(InitHookState::AfterDatabaseRunning);
+        if self.from == IocState::Built {
+            init_hook_announce(InitHookState::AfterInterruptAccept);
+        }
+
+        if lifecycle().mode == BuildMode::Servers {
+            crate::server::db_server::db_run_servers();
+            init_hook_announce(InitHookState::AfterCaServerRunning);
+        }
+
+        if self.from == IocState::Built {
+            init_hook_announce(InitHookState::AtEnd);
+        }
+
+        crate::runtime::log::errlog_printf(if self.from == IocState::Built {
+            "iocRun: All initialization complete\n"
+        } else {
+            "iocRun: IOC restarted\n"
+        });
+        set_ioc_state(IocState::Running);
+        init_hook_announce(InitHookState::AfterIocRunning);
     }
 }
 
@@ -342,7 +400,7 @@ pub(crate) fn note_scan_owner_started() {
 /// because there is no `dbCaPause` to call.
 pub fn ioc_pause() -> i32 {
     if get_ioc_state() != IocState::Running {
-        crate::runtime::log::errlog_printf(&format!(
+        crate::runtime::log::errlog_vprintf(format_args!(
             "iocPause: {} IOC not running\n",
             crate::runtime::log::erl_warning()
         ));
@@ -350,10 +408,14 @@ pub fn ioc_pause() -> i32 {
     }
     init_hook_announce(InitHookState::AtIocPause);
 
-    crate::server::db_server::db_pause_servers();
-    init_hook_announce(InitHookState::AfterCaServerPaused);
+    if lifecycle().mode == BuildMode::Servers {
+        crate::server::db_server::db_pause_servers();
+        init_hook_announce(InitHookState::AfterCaServerPaused);
+    }
 
-    crate::server::scan::scan_pause();
+    if let Some(ctl) = ioc_scan_control() {
+        ctl.pause();
+    }
     init_hook_announce(InitHookState::AfterDatabasePaused);
 
     set_ioc_state(IocState::Paused);
@@ -366,33 +428,73 @@ pub fn ioc_pause() -> i32 {
 /// [`IocState::Void`]. Idempotent — C returns 0 immediately when already
 /// void, which is what makes it safe on every exit path.
 ///
-/// C reaches this from `epicsAtExit(exitDatabase)` (`iocInit.c:579`), and
-/// so does the port: [`IocApplication::run`] registers it there, so the
-/// scan threads stop when the IOC's `run` returns however it returns.
+/// C reaches this from `epicsAtExit(exitDatabase)` (`iocInit.c:580`), and
+/// so does the port: every `iocBuild` registers it there, so the scan
+/// threads stop at the exit callbacks
+/// however the IOC was built.
 ///
-/// C's `doCloseLinks`, `callbackStop` and `dbCaShutdown` steps have no
-/// port analogue and are not faked — the callback facility has no stop and
-/// the link sets have no lifecycle methods, so their init-hook states are
-/// not announced either.
+/// Of an isolated build's free branch (`:745-757`) only
+/// `initHookBeforeFree`, `scanCleanup` and `callbackCleanup` are here; the
+/// records, lock sets, access security and iocsh are not freed.
 pub fn ioc_shutdown() -> i32 {
     if get_ioc_state() == IocState::Void {
         return 0;
     }
     init_hook_announce(InitHookState::AtShutdown);
+    let mode = lifecycle().mode;
+
+    let db = lifecycle().db.clone();
+    if let Some(db) = &db {
+        db.close_links(mode == BuildMode::Isolated);
+    }
+    drop(db);
+    init_hook_announce(InitHookState::AfterCloseLinks);
 
     // Dropping the owner is C's `scanStop`: it trips the facility to
-    // `ctlExit` and joins the owner thread. Taken out from under the lock
+    // `ctlExit` and joins the owner thread, which joins the scan threads. Taken out from under the lock
     // first so the join happens with the lifecycle unlocked.
     let owner = lifecycle().scan.take();
     drop(owner);
-    // A build that never reached `iocRun` has no owner to drop, so the
-    // facility is stopped here rather than by the drop above.
-    crate::server::scan::scan_stop();
+    // The rest of `scanStop` (`dbScan.c:178-180`): the `scanOnce` worker
+    // drains its queue and is joined.
+    crate::runtime::task::background_scan_once_stop();
+    let db = lifecycle().db.take();
+    // A parked owner — the database was claimed by another start — trips
+    // nothing on drop, so the published database's facility stops here.
+    if let Some(db) = &db {
+        db.scan_control().stop();
+    }
     init_hook_announce(InitHookState::AfterStopScan);
+    crate::runtime::task::background_callback_stop();
+    init_hook_announce(InitHookState::AfterStopCallback);
 
-    crate::server::db_server::db_stop_servers();
+    if mode != BuildMode::Isolated {
+        crate::server::db_server::db_stop_servers();
+    }
 
-    set_ioc_state(IocState::Void);
+    // Held to here so the `dbCaLink` worker, which exits once its database
+    // drops, is stopped by `dbCaShutdown` and not by the scan stop.
+    if let Some(db) = &db {
+        db.ca_link_shutdown();
+    }
+    drop(db);
+    init_hook_announce(InitHookState::AfterStopLinks);
+
+    if mode == BuildMode::Isolated {
+        init_hook_announce(InitHookState::BeforeFree);
+        // `scanCleanup` frees nothing here: the `scanOnce` ring was reset by
+        // `scanStop`'s join above, and the periodic and I/O Intr lists are
+        // the database's, freed when it drops.
+        crate::runtime::task::background_callback_cleanup();
+        crate::server::iocsh::as_shutdown();
+        crate::server::iocsh::iocsh_free();
+    }
+
+    {
+        let mut life = lifecycle();
+        life.state = IocState::Void;
+        life.mode = BuildMode::Servers;
+    }
     init_hook_announce(InitHookState::AfterShutdown);
     0
 }
@@ -448,11 +550,8 @@ pub fn take_group_load_requests() -> Vec<GroupLoadRequest> {
 /// the st.cmd line; the JSON parse and macLib expansion happen later in the
 /// QSRV runner when the queue is drained.
 ///
-/// [`IocApplication::run`] already registers this command into every
-/// startup shell, so applications using the standard lifecycle need not
-/// call it. It is public for harnesses that build their own iocsh shell
-/// and want the pvxs-compatible `dbLoadGroup` command (its queue is
-/// consumed via [`take_group_load_requests`]).
+/// The QSRV runner registers it as pvxs's `group_enable()` does, only when
+/// QSRV2 is enabled; its queue is consumed via [`take_group_load_requests`].
 pub fn db_load_group_startup_command() -> CommandDef {
     use crate::server::iocsh::registry::{
         ArgDesc, ArgType, ArgValue, CommandContext, CommandOutcome,
@@ -472,50 +571,37 @@ pub fn db_load_group_startup_command() -> CommandDef {
         "dbLoadGroup <jsonFilename> [<macros>]",
         move |args: &[ArgValue], ctx: &CommandContext| {
             let filename = match args.first() {
-                Some(ArgValue::String(s)) => s.clone(),
+                Some(ArgValue::String(s)) => s.to_str()?.to_owned(),
                 _ => return Err("dbLoadGroup: missing filename".into()),
             };
             let macros = match args.get(1) {
-                Some(ArgValue::String(s)) => s.clone(),
+                Some(ArgValue::String(s)) => s.to_str()?.to_owned(),
                 _ => String::new(),
             };
             let mut queue = GROUP_LOAD_REQUESTS.lock().unwrap();
             // Leading `-`: removal by identity, applied to the queue (pvxs
             // groupsourcehooks.cpp:140-179 — never touches the filesystem).
+            // pvxs prints nothing on any success path.
             if let Some(rest) = filename.strip_prefix('-') {
                 if rest == "*" {
-                    let n = queue.len();
                     queue.clear();
-                    ctx.println(&format!(
-                        "dbLoadGroup: cleared all queued group files ({n} removed)"
-                    ));
                 } else {
-                    let before = queue.len();
                     queue.retain(|r| !(r.filename == rest && r.macros == macros));
-                    let dropped = before - queue.len();
-                    ctx.println(&format!(
-                        "dbLoadGroup: removed '{rest}' ({dropped} queued entr{} dropped)",
-                        if dropped == 1 { "y" } else { "ies" }
-                    ));
                 }
                 return Ok(CommandOutcome::Continue);
             }
-            // pvxs opens the file at command time (early error); mirror that
-            // with a readability probe. The QSRV runner re-reads and parses.
-            if let Err(e) = std::fs::metadata(&filename) {
-                return Err(format!("dbLoadGroup: error opening \"{filename}\": {e}"));
+            // pvxs opens the file at command time and answers a failure with
+            // a bare `fprintf` plus `iocshSetError` (groupsourcehooks.cpp:47,
+            // :149-151), not showError's framing. The QSRV runner re-reads
+            // and parses.
+            if std::fs::File::open(&filename).is_err() {
+                ctx.eprintln(&format!("Error opening \"{filename}\""));
+                return Ok(CommandOutcome::Failed);
             }
             // Re-load of the same identity first drops the prior queue entry
             // (pvxs erases the matching `(fname, macros)` before appending).
             queue.retain(|r| !(r.filename == filename && r.macros == macros));
-            queue.push(GroupLoadRequest {
-                filename: filename.clone(),
-                macros,
-            });
-            ctx.println(&format!(
-                "dbLoadGroup: queued '{filename}' ({} group file(s) queued)",
-                queue.len()
-            ));
+            queue.push(GroupLoadRequest { filename, macros });
             Ok(CommandOutcome::Continue)
         },
     )
@@ -537,9 +623,10 @@ pub type DynamicDeviceSupportFactory =
     Box<dyn Fn(&DeviceSupportContext) -> Option<Box<dyn DeviceSupport>> + Send + Sync>;
 
 /// An async external link-set installer, registered on an
-/// [`IocApplication`] via [`IocApplication::register_link_set_installer`]
-/// and invoked by [`IocApplication::run`] at the C `initHookAfterCaLinkInit`
-/// point — BEFORE [`PvDatabase::setup_cp_links`] warms Passive CP holders.
+/// [`IocApplication`] via [`IocApplication::register_link_type`]
+/// and invoked by [`IocApplication::run`] at C `dbCaLinkInit`, just before
+/// `initHookAfterCaLinkInit` — BEFORE [`PvDatabase::setup_cp_links`] warms
+/// Passive CP holders.
 ///
 /// The installer receives the live database, registers its external
 /// [`crate::server::database::LinkSet`] (e.g. the `ca` set from
@@ -552,6 +639,17 @@ pub type DynamicDeviceSupportFactory =
 /// — is what makes a Passive holder of an external CP/CPP link warm at
 /// iocInit: `setup_cp_links`'s `resolve_external_pv` open path is a no-op
 /// unless the matching link set is already installed.
+/// An async consumer of `initHookAfterInitDatabase`, handed the database and
+/// the IOC's one ACF cell. See [`IocApplication::register_after_init_database`].
+pub type AfterInitDatabaseHook = Box<
+    dyn FnOnce(
+            Arc<PvDatabase>,
+            access_security::AcfCell,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>>
+        + Send
+        + 'static,
+>;
+
 pub type LinkSetInstaller = Box<
     dyn FnOnce(
             Arc<PvDatabase>,
@@ -560,6 +658,57 @@ pub type LinkSetInstaller = Box<
         > + Send
         + 'static,
 >;
+
+/// The ports a server init binds ([`IocApplication::register_server_init`]),
+/// as the protocol runner would be given them in [`IocRunConfig`].
+#[derive(Debug, Clone, Copy)]
+pub struct ServerInitArgs {
+    pub port: u16,
+    pub tcp_port: Option<u16>,
+}
+
+/// C `dbServer.init` (`dbServer.h`), which `dbInitServers()` calls inside
+/// `iocBuild` (`iocInit.c:222`): the server binds here, so a port it cannot
+/// have fails `iocInit` instead of a later `iocRun`. What it returns is handed
+/// to the protocol runner through [`IocRunConfig::servers`].
+type ServerInit = Box<
+    dyn FnOnce(
+            ServerInitArgs,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = CaResult<Box<dyn std::any::Any + Send>>>
+                    + Send
+                    + 'static,
+            >,
+        > + Send
+        + 'static,
+>;
+
+/// What each [`IocApplication::register_server_init`] init produced, by the
+/// name it was registered under.
+#[derive(Default)]
+pub struct InitializedServers(Vec<(&'static str, Box<dyn std::any::Any + Send>)>);
+
+impl InitializedServers {
+    pub(crate) fn push(&mut self, name: &'static str, state: Box<dyn std::any::Any + Send>) {
+        self.0.push((name, state));
+    }
+
+    /// The layer each init that ran belongs to.
+    pub(crate) fn names(&self) -> impl Iterator<Item = &'static str> + '_ {
+        self.0.iter().map(|&(name, _)| name)
+    }
+
+    /// Take the state `name`'s init produced. `None` when no such init ran —
+    /// a runner given an `IocRunConfig` by hand binds for itself.
+    pub fn take<T: 'static>(&mut self, name: &str) -> Option<T> {
+        let at = self
+            .0
+            .iter()
+            .position(|(n, state)| *n == name && state.is::<T>())?;
+        self.0.swap_remove(at).1.downcast().ok().map(|state| *state)
+    }
+}
 
 /// Configuration passed to the protocol runner after IOC initialization.
 ///
@@ -582,7 +731,7 @@ pub struct IocRunConfig {
     /// the config in a fresh cell — so a later `asInit`/ACF reload
     /// reaches all of them at once.
     pub acf: access_security::AcfCell,
-    pub autosave_config: Option<autosave::SaveSetConfig>,
+    pub autosave_config: Option<(autosave::SaveSetConfig, autosave::SaveStrategy)>,
     pub autosave_manager: Option<Arc<autosave::AutosaveManager>>,
     pub shell_commands: Vec<CommandDef>,
     /// Retained for API compatibility. [`IocApplication::run`] now
@@ -592,6 +741,60 @@ pub struct IocRunConfig {
     /// (doing so is a no-op on the empty vec, but the hooks have
     /// already run).
     pub after_init_hooks: Vec<Box<dyn FnOnce() + Send>>,
+    /// What the [`IocApplication::register_server_init`] inits bound at
+    /// `dbInitServers`.
+    pub servers: InitializedServers,
+}
+
+impl IocRunConfig {
+    /// A protocol runner's tail once its servers serve: autosave on the
+    /// current reactor, then the interactive iocsh on the `_main_` thread
+    /// with `server_commands`, this config's `shell_commands` and the
+    /// autosave commands, until the shell ends. The exec runners' one copy
+    /// of what `CaServer::run_with_shell` and `PvaServer::run_with_shell` do.
+    pub async fn run_shell(self, server_commands: Vec<CommandDef>) -> CaResult<()> {
+        let autosave = if let Some(mgr) = self.autosave_manager {
+            mgr.start(self.db.clone())
+        } else if let Some((cfg, method)) = self.autosave_config {
+            let mgr = autosave::AutosaveBuilder::new()
+                .add_set(cfg, method)
+                .build()
+                .await;
+            Arc::new(mgr).start(self.db.clone())
+        } else {
+            None
+        };
+
+        let bridge = crate::runtime::task::BlockingBridge::capture();
+        let (db, acf, shell_commands) = (self.db, self.acf, self.shell_commands);
+        let started = crate::runtime::task::run_on_main_thread(move || {
+            let shell = iocsh::IocShell::new_with_acf(db, bridge, acf);
+            for cmd in server_commands.into_iter().chain(shell_commands) {
+                shell.register(cmd);
+            }
+            shell.run_main_prompt()
+        });
+        let result = match started {
+            Err(e) => Err(CaError::InvalidValue(format!(
+                "could not start the _main_ thread: {e}"
+            ))),
+            Ok(rx) => match rx.await {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(e)) => {
+                    crate::stderr_println!("shell error: {e}");
+                    Err(CaError::InvalidValue(e))
+                }
+                Err(_) => {
+                    crate::stderr_println!("shell thread dropped unexpectedly");
+                    Err(CaError::InvalidValue("shell thread dropped".to_string()))
+                }
+            },
+        };
+        if let Some(h) = autosave {
+            h.abort();
+        }
+        result
+    }
 }
 
 /// The two independent questions C softMain asks between the startup script
@@ -637,12 +840,12 @@ impl IocInitDecision {
         }
     }
 
-    /// C's other arm. `iocInit()` is never called, so there is no server to
+    /// C's other arm. `iocInit()` is not called, so there is no server to
     /// hand anything to and the protocol runner is NOT invoked — that is
     /// the whole content of the difference, and passing a runner a flag to
     /// obey would put it back in the hands of the caller who cannot see
     /// this decision. The process goes straight to C's tail
-    /// (`softMain.cpp:247-268`).
+    /// (`softMain.cpp:247-268`), whose prompt may still type `iocInit`.
     pub fn skip(interactive: bool) -> Self {
         Self {
             run: false,
@@ -759,6 +962,9 @@ fn run_startup_phase(
     lines: &[String],
     script: Option<&str>,
 ) -> Result<(), IocRunFailure> {
+    // softMain runs argv's steps on `_main_`, which is not ok to block
+    // (`osdThread.c:406`), and outside any `iocshBody`: their errlog lines
+    // come out after the loader's own stderr. The script's scope raises it.
     for line in lines {
         shell
             .execute_line_reported(line)
@@ -781,13 +987,158 @@ fn run_startup_phase(
     Ok(())
 }
 
+/// Where softMain stands once its `iocInit()` has returned.
+enum SoftMainEnd {
+    /// The IOC is running; what is left is waiting on its servers.
+    Running(RunningIoc),
+    /// It is not, and the tail is the prompt or the forever spin
+    /// (`softMain.cpp:247-268`).
+    NotRunning {
+        interactive: bool,
+    },
+    Failed(IocRunFailure),
+}
+
+/// softMain from `iocsh(st.cmd)` to the return of its own `iocInit()`
+/// (`softMain.cpp:231-245`), run as one job on `_main_`.
+fn soft_main_to_ioc_init(
+    db: Arc<PvDatabase>,
+    bridge: crate::runtime::task::BlockingBridge,
+    acf: access_security::AcfCell,
+    startup_lines: &[String],
+    startup_script: Option<&str>,
+    ioc_init_gate: Option<Box<dyn FnOnce() -> IocInitDecision + Send>>,
+) -> SoftMainEnd {
+    // One shell for the queued lines and the script because C uses one iocsh
+    // context too: a `dbLoadRecords` from `-d` and one from the script are
+    // the same call, so a `dbPutAttribute` or `dbLoadTemplate` queued here
+    // must be visible to the script exactly as it is to a later script line.
+    let has_script = startup_script.is_some();
+    if has_script || !startup_lines.is_empty() {
+        let shell = iocsh::IocShell::new_with_acf(db, bridge.clone(), acf);
+        if let Err(e) = run_startup_phase(&shell, startup_lines, startup_script) {
+            return SoftMainEnd::Failed(e);
+        }
+    }
+
+    // C softMain's turn between `iocsh(st.cmd)` and `iocInit()`
+    // (`softMain.cpp:236-245`). Outside the `if` above because C asks its
+    // question whatever the flags were — a `softIoc` with neither a script
+    // nor a `-d` still reaches this line, and is exactly the case that must
+    // NOT build.
+    // `None` is an application that never installed the gate, and that is
+    // not the same as answering `Run`: such a caller is not C softMain, has
+    // not answered C's `-S`, and owns no tail of its own — the protocol
+    // runner is the whole of its tail. It therefore gets a failed build as an
+    // `Err` rather than a shell it never asked for.
+    let decision = ioc_init_gate.map(|gate| gate());
+    // With no gate this is the `main` of every IOC but softIoc:
+    // `iocsh(st.cmd)` then `iocsh(NULL)`, which builds nothing the script did
+    // not. Without a script it is a programmatic `main` — queued lines are
+    // its own `dbLoadRecords()` calls — whose `iocInit()` is this `run`.
+    let gate_run = decision.map_or(!has_script, |d| d.run);
+    let interactive = decision.is_none_or(|d| d.interactive);
+    // Finish whatever the startup script left undone. Each arm is a state the
+    // script could have stopped in, and the value it carries is this `run`'s
+    // only claim on the transition out of it.
+    let outcome = match take_lifecycle() {
+        // The script spelled neither `iocInit` nor `iocBuild`, so this is the
+        // turn that decides whether the IOC is built at all.
+        Some(IocLifecycle::Armed(build, signal)) => {
+            if !gate_run {
+                // Still armed: an `iocInit` typed at the tail's prompt is C's
+                // same `iocInit()`, and starts RSRV through this build.
+                put_lifecycle(IocLifecycle::Armed(build, signal));
+                return SoftMainEnd::NotRunning { interactive };
+            }
+            match bridge.block_on(build.perform_build(
+                |line: &str| crate::epics_println!("{line}"),
+                |line: &str| crate::stderr_println!("{line}"),
+            )) {
+                Err(e) => return SoftMainEnd::Failed(e.into()),
+                Ok(BuildOutcome::Built(built)) => {
+                    run_and_drain(built, &bridge, None);
+                    match take_lifecycle() {
+                        Some(IocLifecycle::Running(running)) => Ok(running),
+                        _ => unreachable!(
+                            "an iocRun leaves the IOC running, and every lifecycle line \
+                             refuses from that state"
+                        ),
+                    }
+                }
+                Ok(BuildOutcome::AsInitFailed) => {
+                    if decision.is_some() {
+                        soft_main_ioc_init_failed();
+                    }
+                    Err(())
+                }
+            }
+        }
+        // The script spelled `iocBuild` and never `iocRun`. softMain's
+        // `iocInit()` sees `iocBuild_1` refuse from a state that is not
+        // `iocVoid`, and the IOC stays built and quiescent at the prompt,
+        // where an `iocRun` still runs it.
+        Some(IocLifecycle::Built(built)) => {
+            if decision.is_some_and(|d| d.run) {
+                soft_main_ioc_init_refused();
+            }
+            put_lifecycle(IocLifecycle::Built(built));
+            return SoftMainEnd::NotRunning { interactive };
+        }
+        // The script's `iocInit`, or its `iocBuild` and `iocRun`, already did
+        // it. There is no second build to gate and no second decision to
+        // take: the script asked for the IOC to be built and run, which is
+        // what makes every line after those — and the protocol runner — see a
+        // running IOC.
+        // softMain's own `iocInit()` still runs on `-d`, and `iocBuild_1`
+        // refuses it from any state but `iocVoid`.
+        Some(IocLifecycle::Running(running)) => {
+            if decision.is_some_and(|d| d.run) {
+                soft_main_ioc_init_refused();
+            }
+            Ok(running)
+        }
+        Some(IocLifecycle::AsInitFailed) => {
+            if decision.is_some_and(|d| d.run) {
+                soft_main_ioc_init_refused();
+            }
+            Err(())
+        }
+        Some(IocLifecycle::Failed(e)) => return SoftMainEnd::Failed(e.into()),
+        None => unreachable!(
+            "the lifecycle owner is armed before the startup script runs and \
+             every transition puts a state back"
+        ),
+    };
+    match outcome {
+        Ok(running) => SoftMainEnd::Running(running),
+        // `iocBuild_2` returns -1, so `iocBuild` does, so `iocInit()` does —
+        // and a non-zero `iocInit()` is REPORTED, not fatal: C
+        // `softMain.cpp:239-243` prints one line and falls through to the
+        // same tail the never-built arm takes. Measured against
+        // R7.0.10.1-DEV with an unreadable ACF: interactive reaches the
+        // prompt and exits 0 on EOF, `-S` stays alive and listens on nothing,
+        // because `iocRun` — which starts RSRV — never ran.
+        Err(()) => match decision {
+            Some(decision) => SoftMainEnd::NotRunning {
+                interactive: decision.interactive,
+            },
+            None => SoftMainEnd::Failed(IocRunFailure::Startup(CaError::InvalidValue(
+                "iocBuild: asInit Failed.".into(),
+            ))),
+        },
+    }
+}
+
 /// C softMain's tail for a process whose `iocInit()` never ran
 /// (`softMain.cpp:247-268`): the interactive shell, or the forever spin.
 ///
 /// Nothing here starts a server, and that is the point — RSRV is started by
 /// `iocRun` (`rsrv_run`, `caservertask.c`), so a C `softIoc` on this arm has
-/// no listener and answers no search. The protocol runner is therefore not
-/// called at all rather than being handed a flag it might not obey.
+/// no listener and answers no search until the prompt types `iocInit`. That
+/// line performs the build this `run` left armed, which starts the protocol
+/// runner as the script's `iocInit` does; the runner's own shell ends with
+/// this one (`IocShell::run_main_prompt`), and the server ends with it.
 ///
 /// Free rather than a method for the same reason [`run_startup_phase`] is:
 /// the application struct has already been taken apart by here.
@@ -796,6 +1147,7 @@ async fn run_uninitialized_tail(
     bridge: crate::runtime::task::BlockingBridge,
     acf: access_security::AcfCell,
     interactive: bool,
+    mut cannot_proceed_rx: crate::runtime::sync::oneshot::Receiver<()>,
 ) -> Result<(), IocRunFailure> {
     if !interactive {
         // C `softMain.cpp:264-265`: `while (true) epicsThreadSleep(1000.0);`
@@ -805,26 +1157,23 @@ async fn run_uninitialized_tail(
         unreachable!("a pending future never completes");
     }
 
-    let (tx, rx) = crate::runtime::sync::oneshot::channel();
-    // Mandatory for the same reason the two shells above are: this IS the
-    // process on this arm, so a thread that will not start is a boot
-    // failure and not something to carry on without.
-    crate::runtime::task::MandatoryThread::new(
-        "iocsh",
-        crate::runtime::task::ThreadPriority::Iocsh,
-        crate::runtime::task::StackSizeClass::Big,
-    )
-    .try_spawn(move || {
-        // C runs `iocsh(NULL)` on the thread `epicsThreadInit` lists as
-        // `_main_` (`osdThread.c:406-412`), as `CaServer::run_with_shell`
-        // does for the initialised arm.
-        crate::runtime::task::register_main_thread();
-        let shell = iocsh::IocShell::new_with_acf(db, bridge, acf);
-        let _ = tx.send(shell.run_repl());
+    // This IS the process on this arm, so a `_main_` that will not start is a
+    // boot failure and not something to carry on without.
+    let rx = crate::runtime::task::run_on_main_thread(move || {
+        iocsh::IocShell::new_with_acf(db, bridge, acf).run_main_prompt()
     })
-    .map_err(|e| CaError::InvalidValue(format!("could not start the iocsh thread: {e}")))?;
+    .map_err(|e| CaError::InvalidValue(format!("could not start the _main_ thread: {e}")))?;
 
-    match rx.await {
+    let shell = tokio::select! {
+        shell = rx => shell,
+        () = cannot_proceed(&mut cannot_proceed_rx) => {
+            return match take_lifecycle() {
+                Some(IocLifecycle::Failed(e)) => Err(e.into()),
+                _ => unreachable!("a shell signals only after putting its build error"),
+            };
+        }
+    };
+    match shell {
         Ok(Ok(())) => Ok(()),
         // C `softMain.cpp:253-256`: a non-zero `iocsh(NULL)` is
         // `epicsExit(1)`, which is this port's serving-phase status.
@@ -873,14 +1222,14 @@ type ProtocolRunner = Box<
 /// [`IocApplication::run_to_completion`] through the build untouched.
 struct ProtocolStart {
     /// The runtime the runner is spawned onto. `BuiltIoc::run` is reached from
-    /// the `iocsh-startup` thread through `BlockingBridge::block_on`, which is
+    /// the startup-script thread through `BlockingBridge::block_on`, which is
     /// not a runtime thread, so the reactor has to be carried rather than
     /// looked up.
     bridge: crate::runtime::task::BlockingBridge,
     port: u16,
     tcp_port: Option<u16>,
     acf: access_security::AcfCell,
-    autosave_config: Option<autosave::SaveSetConfig>,
+    autosave_config: Option<(autosave::SaveSetConfig, autosave::SaveStrategy)>,
     runner: ProtocolRunner,
 }
 
@@ -900,7 +1249,7 @@ struct ProtocolStart {
 struct ProtocolServer {
     handle: crate::runtime::task::TaskHandle<CaResult<()>>,
     /// The outcome [`Self::await_serving`] collected because the runner
-    /// finished before any layer announced. Held rather than reported on the
+    /// finished before its layers announced. Held rather than reported on the
     /// spot so the outcome still leaves through the one owner.
     finished: Option<Result<(), IocRunFailure>>,
     /// False once the outcome has been taken, so `Drop` does not abort a task
@@ -922,22 +1271,23 @@ impl ProtocolServer {
     }
 
     /// C `iocRun`'s ordering, which the port has to wait for where C gets it
-    /// for free: return once a protocol layer has announced it is serving
-    /// (`db_server::announce_serving`, the port's `rsrv_run` return), or once
-    /// the runner has finished without ever announcing.
+    /// for free: return once the runner serves — some layer, and every layer
+    /// registered at `dbInitServers()` (`iocInit.c:265`), has announced
+    /// (`db_server::announce_serving`, the port's `rsrv_run` return) — or once
+    /// the runner has finished first.
     ///
     /// Both arms are terminal — a runner is either serving or done — so this
     /// is not a check that can be left waiting on a runner that forgot to
     /// signal. A runner that serves nothing resolves through the second arm,
     /// which is what every `async { Ok(()) }` in the tests does.
-    async fn await_serving(&mut self, generation: u64) {
+    async fn await_serving(&mut self, mark: crate::server::db_server::ServingMark) {
         tokio::select! {
             biased;
             joined = &mut self.handle => {
                 self.live = false;
                 self.finished = Some(Self::outcome(joined));
             }
-            () = crate::server::db_server::serving_after(generation) => {}
+            () = crate::server::db_server::serving_after(&mark) => {}
         }
     }
 
@@ -960,9 +1310,11 @@ impl ProtocolServer {
     /// Stop the runner and wait until it is gone — what dropping the awaited
     /// future used to do, made explicit now that the task outlives the await.
     async fn shut_down(mut self) {
-        self.live = false;
-        self.handle.abort();
-        let _ = (&mut self.handle).await;
+        // A runner already joined is accounted for, and its handle spent.
+        if std::mem::replace(&mut self.live, false) {
+            self.handle.abort();
+            let _ = (&mut self.handle).await;
+        }
     }
 }
 
@@ -993,10 +1345,13 @@ impl Drop for ArmedLifecycle {
 struct IocBuild {
     db: Arc<PvDatabase>,
     acf: access_security::AcfCell,
-    autosave_config: Option<autosave::SaveSetConfig>,
+    autosave_config: Option<(autosave::SaveSetConfig, autosave::SaveStrategy)>,
     autosave_startup: Option<Arc<Mutex<AutosaveStartupConfig>>>,
     link_set_installers: Vec<LinkSetInstaller>,
+    after_init_database_hooks: Vec<AfterInitDatabaseHook>,
     after_init_hooks: Vec<Box<dyn FnOnce() + Send>>,
+    /// Run at `dbInitServers`, in registration order.
+    server_inits: Vec<(&'static str, ServerInit)>,
     protocol: ProtocolStart,
 }
 
@@ -1005,12 +1360,16 @@ struct IocBuild {
 struct BuiltIoc {
     db: Arc<PvDatabase>,
     autosave_manager: Option<Arc<autosave::AutosaveManager>>,
+    /// Holds the save task a `create_*_set` started, before or after this.
+    autosave_startup: Option<Arc<Mutex<AutosaveStartupConfig>>>,
     /// Drained by the run half, at C's `initHookAfterIocRunning` point.
     after_init_hooks: Vec<Box<dyn FnOnce() + Send>>,
-    /// Carried, not used: C's servers are initialised by `dbInitServers()` in
-    /// `iocBuild` (`iocInit.c:222`) and only *started* by `dbRunServers()` in
-    /// `iocRun` (`:265-267`), and this port's runner does both at once, so the
-    /// whole of it belongs on the run half.
+    /// The [`ServerInit`]s' state: C's servers are initialised by
+    /// `dbInitServers()` in `iocBuild` (`iocInit.c:222`), which
+    /// [`IocBuild::perform_build`] ran, and only *started* by `dbRunServers()`
+    /// in `iocRun` (`:265-267`), which is the runner's.
+    servers: InitializedServers,
+    /// Carried, not used: everything the runner needs to start.
     protocol: ProtocolStart,
 }
 
@@ -1044,7 +1403,7 @@ enum IocLifecycle {
     /// Armed before the startup script; C's `iocVoid`.
     /// Boxed: `IocBuild` carries the whole database and every registry, and
     /// the other variants are a fraction of its size.
-    Armed(Box<IocBuild>),
+    Armed(Box<IocBuild>, CannotProceed),
     /// C's `iocBuilt`. Boxed for the same reason [`Self::Armed`] is.
     Built(Box<BuiltIoc>),
     /// C's `iocRunning`.
@@ -1059,8 +1418,24 @@ enum IocLifecycle {
 /// (see [`set_ioc_state`]), so this is scoped the same way.
 static LIFECYCLE_OWNER: Mutex<Option<IocLifecycle>> = Mutex::new(None);
 
-fn arm_build(build: IocBuild) {
-    *LIFECYCLE_OWNER.lock().unwrap() = Some(IocLifecycle::Armed(Box::new(build)));
+/// Sent by a shell whose build failed, once [`IocLifecycle::Failed`] holds
+/// the error. C `cantProceed` suspends the thread that ran `iocInit`, so no
+/// later line runs at any script depth; the port parks that thread too, and
+/// this is how the lifecycle owner, which would otherwise wait for the shell
+/// to return, learns it never will.
+type CannotProceed = crate::runtime::sync::oneshot::Sender<()>;
+
+/// Resolves when a shell's build has failed; never when the build succeeded
+/// or ran off the shell, which drop the sender. Callable again after the
+/// startup phase's select already saw the channel close.
+async fn cannot_proceed(rx: &mut crate::runtime::sync::oneshot::Receiver<()>) {
+    if rx.is_terminated() || rx.await.is_err() {
+        std::future::pending::<()>().await;
+    }
+}
+
+fn arm_build(build: IocBuild, cannot_proceed: CannotProceed) {
+    *LIFECYCLE_OWNER.lock().unwrap() = Some(IocLifecycle::Armed(Box::new(build), cannot_proceed));
 }
 
 fn take_lifecycle() -> Option<IocLifecycle> {
@@ -1071,14 +1446,13 @@ fn put_lifecycle(state: IocLifecycle) {
     *LIFECYCLE_OWNER.lock().unwrap() = Some(state);
 }
 
-/// What an iocsh lifecycle line did.
+/// What an iocsh build line did.
 pub(crate) enum ShellTransition {
-    /// This call performed the transition.
+    /// This call performed the build.
     Done,
     /// It performed it and the build failed; the line fails with it.
     Failed,
-    /// This `run` owns a lifecycle, but not in the state this transition
-    /// starts from — a second `iocBuild`, or `iocRun` with nothing built.
+    /// This `run` owns a lifecycle, but past `iocVoid` — a second `iocBuild`.
     Refused,
     /// This IOC has no [`IocApplication`] lifecycle to drive: every
     /// `CaServerBuilder` binary and every bare [`PvDatabase`] shell.
@@ -1086,28 +1460,52 @@ pub(crate) enum ShellTransition {
 }
 
 /// The iocsh `iocBuild` line, and the build half of `iocInit`.
-pub(crate) fn build_from_shell(bridge: &crate::runtime::task::BlockingBridge) -> ShellTransition {
+pub(crate) fn build_from_shell(
+    bridge: &crate::runtime::task::BlockingBridge,
+    out: &dyn Fn(&str),
+    err: &dyn Fn(&str),
+) -> ShellTransition {
     match take_lifecycle() {
         None => ShellTransition::NotOurs,
-        Some(IocLifecycle::Armed(build)) => match bridge.block_on(build.perform_build()) {
-            Ok(BuildOutcome::Built(built)) => {
-                put_lifecycle(IocLifecycle::Built(built));
-                ShellTransition::Done
+        Some(IocLifecycle::Armed(build, signal)) => {
+            match bridge.block_on(build.perform_build(out, err)) {
+                Ok(BuildOutcome::Built(built)) => {
+                    put_lifecycle(IocLifecycle::Built(built));
+                    ShellTransition::Done
+                }
+                Ok(BuildOutcome::AsInitFailed) => {
+                    put_lifecycle(IocLifecycle::AsInitFailed);
+                    ShellTransition::Failed
+                }
+                Err(e) => {
+                    // C `cantProceed` (`rsrv_init`, `caservertask.c:752`); the
+                    // lifecycle owner returns the error instead of hanging (user
+                    // sign-off 2026-10-14). `epicsThreadResume` must not let the
+                    // script run on.
+                    let park = crate::runtime::task::ForeverPark::begin();
+                    put_lifecycle(IocLifecycle::Failed(e));
+                    let _ = signal.send(());
+                    park.park()
+                }
             }
-            Ok(BuildOutcome::AsInitFailed) => {
-                put_lifecycle(IocLifecycle::AsInitFailed);
-                ShellTransition::Failed
-            }
-            Err(e) => {
-                put_lifecycle(IocLifecycle::Failed(e));
-                ShellTransition::Failed
-            }
-        },
+        }
         Some(other) => {
             put_lifecycle(other);
             ShellTransition::Refused
         }
     }
+}
+
+/// softMain's line for a non-zero `iocInit()` it called itself
+/// (`softMain.cpp:241-243`); a script's failed `iocInit` line prints none.
+fn soft_main_ioc_init_failed() {
+    crate::stderr_println!("{} during iocInit()", crate::runtime::log::ERL_ERROR);
+}
+
+/// softMain's `iocInit()` on an IOC the script already took past `iocVoid`.
+fn soft_main_ioc_init_refused() {
+    crate::runtime::log::errlog_printf(&build_refusal());
+    soft_main_ioc_init_failed();
 }
 
 /// C `iocBuild_1`'s refusal (`iocInit.c:117-120`), which every caller of the
@@ -1130,68 +1528,462 @@ pub(crate) fn build_refusal() -> String {
     )
 }
 
-/// The build for a shell with no [`IocApplication`] behind it — every
-/// `CaServerBuilder` binary and every bare [`PvDatabase`] shell.
+/// The states C `iocBuild` announces, in its `initHookAnnounce` order
+/// (`iocInit.c:123-206`).
+pub(crate) const BUILD_HOOK_STATES: [InitHookState; 13] = [
+    InitHookState::AtIocBuild,
+    InitHookState::AtBeginning,
+    InitHookState::AfterCallbackInit,
+    InitHookState::AfterCaLinkInit,
+    InitHookState::AfterInitDrvSup,
+    InitHookState::AfterInitRecSup,
+    InitHookState::AfterInitDevSup,
+    InitHookState::AfterInitDatabase,
+    InitHookState::AfterFinishDevSup,
+    InitHookState::AfterScanInit,
+    InitHookState::AfterInitialProcess,
+    InitHookState::AfterCaServerInit,
+    InitHookState::AfterIocBuilt,
+];
+
+/// The support pass C `iocBuild_2` runs just before announcing `state`:
+/// `initDrvSup`, `initDevSup` and `finishDevSup` (`iocInit.c:167-183`). A
+/// build that announces nothing still runs it.
+fn build_step(state: InitHookState) {
+    match state {
+        InitHookState::AfterInitDrvSup => crate::server::driver_support::init_drv_sup(),
+        InitHookState::AfterInitDevSup => crate::server::record::init_dev_sup(),
+        InitHookState::AfterFinishDevSup => crate::server::record::finish_dev_sup(),
+        _ => {}
+    }
+}
+
+/// C `iocBuild_1` and `iocBuild_3`, and the init hooks `iocBuild` announces,
+/// for every build path: [`IocApplication`]'s, the bare shell's
+/// `iocBuild`/`iocInit` and
+/// [`IocBuilder::build_ioc`](crate::server::ioc_builder::IocBuilder::build_ioc).
 ///
-/// C has no such shell: `iocBuild_1` runs for everyone, so the state cell
-/// advances, `coreRelease()` prints and `Starting iocInit` is said whatever
-/// built the IOC. This arm did none of that. It closed the record load and
-/// returned, leaving `iocState` at [`IocState::Void`], which is why a
-/// measured `iocBuild`/`iocRun` pair answered `iocRun: WARNING IOC not
-/// paused` where C answers `iocRun: All initialization complete`, why a
-/// second `iocBuild` was accepted where C refuses it, and why the
-/// `coreRelease` banner C puts between the two command echoes was missing
-/// from stdout.
+/// C has one `iocBuild`, so a driver's hook runs whatever built the IOC.
+/// The states are announced only through [`Self::until`], which walks
+/// [`BUILD_HOOK_STATES`] in order, so no path can skip or reorder one. A
+/// value of this type is [`IocState::Building`]: only [`Self::begin`] makes
+/// one, so record work done while holding it is after that line by
+/// construction.
+pub(crate) struct BuildSequence {
+    walk: BuildWalk,
+    /// [`Self::ca_link_init`] has run, so `initHookAfterCaLinkInit` may be
+    /// announced.
+    links: bool,
+    /// What [`Self::finish`] records as C `iocBuildMode`.
+    mode: BuildMode,
+}
+
+/// The walk over [`BUILD_HOOK_STATES`] every build makes, announcing or
+/// not: each state reached runs its [`build_step`], in order, once.
+pub(crate) struct BuildWalk {
+    next: usize,
+}
+
+impl BuildWalk {
+    pub(crate) fn new() -> Self {
+        Self { next: 0 }
+    }
+
+    /// Every state not yet passed up to and including `state`, each
+    /// yielded after its [`build_step`]. Panics on a state already passed.
+    pub(crate) fn until(
+        &mut self,
+        state: InitHookState,
+    ) -> impl Iterator<Item = InitHookState> + '_ {
+        let end = BUILD_HOOK_STATES[self.next..]
+            .iter()
+            .position(|s| *s == state)
+            .map(|i| self.next + i + 1)
+            .unwrap_or_else(|| panic!("{} reached out of iocBuild order", state.name()));
+        std::iter::from_fn(move || {
+            (self.next < end).then(|| {
+                let state = BUILD_HOOK_STATES[self.next];
+                self.next += 1;
+                build_step(state);
+                state
+            })
+        })
+    }
+}
+
+impl BuildSequence {
+    /// C `iocBuild_1` (`iocInit.c:116-148`): refused from any state but
+    /// `iocVoid`; otherwise `initHookAtIocBuild`, `Starting iocInit` on the
+    /// errlog (`:129`), `initHookAtBeginning`, then `coreRelease()`, whose
+    /// `printf` (`misc/epicsRelease.c:23-27`) is the build's only stdout
+    /// write (`:147`), then `iocBuilding` — after both announces, so their
+    /// observers read the state the IOC came from.
+    pub(crate) fn begin(out: impl Fn(&str)) -> Option<Self> {
+        Self::begin_mode(BuildMode::Servers, out)
+    }
+
+    /// [`Self::begin`] for C `iocBuild` (`Servers`) or `iocBuildIsolated`.
+    pub(crate) fn begin_mode(mode: BuildMode, out: impl Fn(&str)) -> Option<Self> {
+        if get_ioc_state() != IocState::Void {
+            crate::runtime::log::errlog_printf(&build_refusal());
+            return None;
+        }
+        let mut build = Self {
+            walk: BuildWalk::new(),
+            links: false,
+            mode,
+        };
+        build.reach(InitHookState::AtIocBuild);
+        // C raises the caller to ok-to-block here (`iocInit.c:125-127`).
+        crate::runtime::task::set_thread_ok_to_block(true);
+        crate::runtime::log::errlog_printf("Starting iocInit\n");
+        build.reach(InitHookState::AtBeginning);
+        for line in crate::server::iocsh::misc_commands::core_release_block() {
+            out(&line);
+        }
+        set_ioc_state(IocState::Building);
+        // `taskwdInit(); callbackInit();` (`iocInit.c:150-151`), the one
+        // place every build constructs and arms the callback bands. The
+        // position is `callbackSetQueueSize`'s and `callbackParallelThreads`'s
+        // contract: both refuse once the pool exists (`callback.c:106-109`,
+        // `:162-165`), since the pool reads their knobs when it is built.
+        crate::runtime::task::background_init();
+        Some(build)
+    }
+
+    /// Announce every state not yet announced up to and including `state`,
+    /// each as the iterator yields it, so a caller can run its own work for
+    /// a state before the next is announced. Panics on a state already
+    /// passed.
+    pub(crate) fn until(
+        &mut self,
+        state: InitHookState,
+    ) -> impl Iterator<Item = InitHookState> + '_ {
+        let next = self.walk.next;
+        let end = BUILD_HOOK_STATES[next..]
+            .iter()
+            .position(|s| *s == state)
+            .map(|i| next + i + 1)
+            .unwrap_or_else(|| panic!("{} announced out of iocBuild order", state.name()));
+        assert!(
+            self.links || !BUILD_HOOK_STATES[next..end].contains(&InitHookState::AfterCaLinkInit),
+            "initHookAfterCaLinkInit announced before dbCaLinkInit"
+        );
+        self.walk.until(state).inspect(|state| {
+            if *state == InitHookState::AfterInitDatabase {
+                // C `initDatabase` ends with `epicsAtExit(exitDatabase,
+                // NULL)` (`iocInit.c:580`), whose body is `iocShutdown`.
+                crate::runtime::exit::at_exit("iocShutdown", || {
+                    ioc_shutdown();
+                });
+            }
+            init_hook_announce(*state)
+        })
+    }
+
+    /// [`Self::until`] for a caller with nothing of its own to run.
+    pub(crate) fn reach(&mut self, state: InitHookState) {
+        self.until(state).for_each(drop);
+    }
+
+    /// C `dbCaLinkInit` (`iocInit.c:217`): after `iocBuild_1`'s
+    /// `initHookAfterCallbackInit` and before `iocBuild_2` announces
+    /// `initHookAfterCaLinkInit` (`:165`), whose observers find the
+    /// `dbCaLink` worker up and every link set installed. Panics when
+    /// `initHookAfterCallbackInit` is not the last state announced.
+    pub(crate) async fn ca_link_init(
+        &mut self,
+        db: &Arc<PvDatabase>,
+        installers: Vec<LinkSetInstaller>,
+    ) {
+        assert_eq!(
+            BUILD_HOOK_STATES.get(self.walk.next),
+            Some(&InitHookState::AfterCaLinkInit),
+            "dbCaLinkInit out of iocBuild order"
+        );
+        if self.mode == BuildMode::Isolated {
+            // `dbCaLinkInitIsolated` (`dbCa.c:357-360`).
+            db.ca_link_isolate();
+        }
+        db.ca_link_init();
+        install_link_sets(db, installers).await;
+        self.links = true;
+    }
+
+    /// C `iocBuild_3` (`iocInit.c:201-207`): the states left through
+    /// `initHookAfterCaServerInit`, then `iocBuilt`, then
+    /// `initHookAfterIocBuilt`, whose observers read `iocBuilt`. A build
+    /// that fails before this leaves `iocBuilding`, as C's does.
+    pub(crate) fn finish(mut self) {
+        if self.walk.next < BUILD_HOOK_STATES.len() - 1 {
+            self.reach(InitHookState::AfterCaServerInit);
+        }
+        set_ioc_state(IocState::Built);
+        self.reach(InitHookState::AfterIocBuilt);
+        // Last, as C sets it after `iocBuild_3` returns (`iocInit.c:229`,
+        // `:246`).
+        lifecycle().mode = self.mode;
+    }
+}
+
+/// The link-set half of C `dbCaLinkInit`: every external link set is
+/// registered before any record initialises, and each installer's iocsh
+/// commands go onto the process's command table. An `iocBuild` runs it
+/// through [`BuildSequence::ca_link_init`].
+pub(crate) async fn install_link_sets(db: &Arc<PvDatabase>, installers: Vec<LinkSetInstaller>) {
+    for installer in installers {
+        for cmd in installer(db.clone()).await {
+            iocsh::register_command(cmd);
+        }
+    }
+}
+
+/// The link half of C `initDatabase` for both IOC build paths, after the
+/// records have initialised and before the `iocInit` barrier.
+pub(crate) async fn init_links(db: &PvDatabase) {
+    // C `dbInitLink`'s locality decision, committed once for the whole
+    // database now that every record has loaded: a `Db` link naming a
+    // record this IOC does not have becomes a `Ca` link
+    // (`dbLink.c:118-130` falling through `dbDbInitLink`'s
+    // `S_db_notFound`, `dbDbLink.c:94-96`). Runs BEFORE `setup_cp_links`
+    // for C's reason — `initPVLinks` initialises links before anything
+    // consumes them — and it is a one-shot: C guards re-entry with
+    // `DBLINK_FLAG_INITIALIZED` (`dbLink.c:96-100`), so a record added
+    // later at runtime does not un-convert a link already made external.
+    db.initialize_link_locality().await;
+    db.setup_cp_links().await;
+    // Open the rest of the external links at init, as C does. Every
+    // non-local `PV_LINK` reaches `dbCaAddLink` from `dbInitLink`
+    // (`dbLink.c:118-130`) regardless of direction or CP/CPP policy, so a
+    // C IOC's first scan finds an already-connecting channel.
+    // `setup_cp_links` above covers only the CP/CPP subset; without this
+    // pass every other external `INP`/`OUT`/`DOL`/`TSEL`/`SDIS`/`INPA..`
+    // link pays one cold scan cycle to stage its own open. Runs here — the
+    // same init phase, after link parsing and before scan start — and
+    // after `setup_cp_links` so the `Db`→`Ca` rewrite it applies to
+    // non-local CP holders is already visible to the enumeration.
+    db.setup_external_link_opens().await;
+}
+
+/// C `initDatabase` (`iocInit.c:179`), which every `iocBuild` runs: an
+/// `IocApplication`'s, an `IocBuilder`'s and the bare shell's. The record
+/// init passes, the property posts, the links when `open_links`, then the
+/// `iocInit` barrier. [`scan_init`] follows it, after
+/// `initHookAfterInitDatabase` and `finishDevSup`.
 ///
-/// `close_record_load` is the caller's half — it needs the shell's database
-/// and its blocking bridge — and it sits exactly where C's record work sits,
-/// after `coreRelease()` and inside [`IocState::Building`]. The transition
-/// itself stays here because [`set_ioc_state`] is private to this module and
-/// must remain the only writer.
+/// A database whose scan lists are built has had all of this before its
+/// shell typed `iocInit` (`CaServerBuilder` builds first), and only crosses
+/// the barrier again, which is idempotent. An `IocBuilder` owns the database
+/// it builds and a shell build holds the IOC lifecycle, so nothing races the
+/// check.
 ///
-/// The init hooks C announces around this (`initHookAtIocBuild`,
-/// `initHookAtBeginning`, `initHookAfterIocBuilt`) are deliberately not
-/// announced: they produce no output, so nothing measured says what a bare
-/// shell should do with them, and firing hooks nobody has asked for is not
-/// something a byte-parity fix should decide.
-pub(crate) fn build_without_application(close_record_load: impl FnOnce()) -> bool {
-    // C `iocBuild_1` (`iocInit.c:117-120`).
-    if get_ioc_state() != IocState::Void {
-        crate::runtime::log::errlog_printf(&build_refusal());
+/// `err` is the building thread's stderr, used only by the record init
+/// passes, which run before this returns.
+pub(crate) fn init_database(
+    db: &Arc<PvDatabase>,
+    open_links: bool,
+    err: &dyn Fn(&str),
+) -> impl std::future::Future<Output = ()> + Send + 'static {
+    let fresh = !db.scan_control().lists_built();
+    if fresh {
+        db.drain_deferred_record_inits(err);
+    }
+    let db = db.clone();
+    async move {
+        if fresh {
+            if open_links {
+                init_links(&db).await;
+            }
+        }
+        db.ioc_init().await;
+    }
+}
+
+/// C `scanInit`'s list joins (`iocInit.c:186`), which every `iocBuild` runs
+/// after `finishDevSup`, so a dset's `get_ioint_info(0)` sees what autosave
+/// pass 1 restored and its `init(after)`. A database whose lists are built
+/// has had it.
+pub(crate) async fn scan_init(db: &Arc<PvDatabase>) {
+    if !db.scan_control().lists_built() {
+        setup_io_intr(db.clone()).await;
+    }
+}
+
+/// C `scanInit` and `initialProcess()` (`iocInit.c:186`, `:194-195`,
+/// `:653-657`): the PINI=YES pass, the last record work of `iocBuild_2`, the
+/// registration of `piniProcessHook` (`:630-651`), which runs the RUN,
+/// RUNNING, PAUSE and PAUSED passes from every `iocRun` and `iocPause` after
+/// it, and the scan threads, which scan nothing until `iocRun`'s `scanRun`
+/// opens the database's gate. Every build path publishes its database here,
+/// so every `iocRun` has threads to release.
+///
+/// Must run inside the runtime the scan threads drive records on.
+pub(crate) fn initial_process(db: &Arc<PvDatabase>) {
+    // C's `initHookRegister` ignores a function already registered, so a
+    // rebuild after `iocShutdown` still has one hook.
+    static PINI_HOOK: std::sync::Once = std::sync::Once::new();
+    PINI_HOOK.call_once(|| init_hook_register(Arc::new(pini_process_hook)));
+    let previous = lifecycle().db.replace(Arc::clone(db));
+    drop(previous);
+    db.pini_pass(crate::server::record::PiniMode::Yes);
+    db.mark_pini_done();
+    // After PINI is published, so the owner skips its own pass.
+    adopt_scan_owner(crate::server::scan::ScanOwner::start_running(Arc::clone(
+        db,
+    )));
+}
+
+/// C `piniProcessHook` (`iocInit.c:630-651`), over the database the current
+/// build published rather than one captured at registration.
+fn pini_process_hook(state: InitHookState) {
+    use crate::server::record::PiniMode;
+    let mode = match state {
+        InitHookState::AtIocRun => PiniMode::Run,
+        InitHookState::AfterIocRunning => PiniMode::Running,
+        InitHookState::AtIocPause => PiniMode::Pause,
+        InitHookState::AfterIocPaused => PiniMode::Paused,
+        _ => return,
+    };
+    let db = lifecycle().db.clone();
+    if let Some(db) = db {
+        db.pini_pass(mode);
+    }
+}
+
+/// C `iocRun` over an IOC whose build ran [`initial_process`] — the one
+/// run body for [`IocApplication`] and
+/// [`BareIoc`](crate::server::ioc_builder::BareIoc). False when `iocRun`
+/// refused, which it has already reported.
+pub(crate) async fn run_built(db: &Arc<PvDatabase>) -> bool {
+    // C `iocInit` is `iocBuild() || iocRun()` (iocInit.c:107-110): the same
+    // `iocRun` the shell's runs.
+    let Some(running) = ioc_run_begin() else {
         return false;
-    }
-    // C `iocInit.c:129`, before anything the build prints.
-    crate::runtime::log::errlog_printf("Starting iocInit\n");
-    // C `iocInit.c:147`: `coreRelease()` immediately before the state moves,
-    // and its `printf` (`misc/epicsRelease.c:23-27`) is the only stdout write
-    // on the whole path.
-    for line in crate::server::iocsh::misc_commands::core_release_block() {
-        println!("{line}");
-    }
-    set_ioc_state(IocState::Building);
-    close_record_load();
-    // C `iocBuild_3` (`iocInit.c:205`).
-    set_ioc_state(IocState::Built);
+    };
+    // C `dbCaRun` (`iocInit.c:260`): the CP/CPP links' connect-time
+    // process, after `scanRun` and before the `iocRun` line.
+    db.process_cp_links_on_connect().await;
+    running.finish();
     true
 }
 
-/// The iocsh `iocRun` line, and the run half of `iocInit`.
+/// C `iocBuild` for the bare shell's `iocBuild`/`iocInit`: the record-load
+/// close, then [`initial_process`], inside [`BuildSequence`]. False when
+/// `iocBuild_1` refused. `out` is the building thread's stdout.
+pub(crate) async fn build_without_application(db: &Arc<PvDatabase>, out: impl Fn(&str)) -> bool {
+    let Some(mut build) = BuildSequence::begin(out) else {
+        return false;
+    };
+    build.reach(InitHookState::AfterCallbackInit);
+    build.ca_link_init(db, Vec::new()).await;
+    build.reach(InitHookState::AfterInitDevSup);
+    init_database(db, true, &|line| crate::stderr_println!("{line}")).await;
+    build.reach(InitHookState::AfterInitDatabase);
+    db.scan_control().finish_dev_sup();
+    build.reach(InitHookState::AfterFinishDevSup);
+    scan_init(db).await;
+    build.reach(InitHookState::AfterScanInit);
+    initial_process(db);
+    build.reach(InitHookState::AfterInitialProcess);
+    build.finish();
+    true
+}
+
+/// The iocsh `iocRun` line, and the run half of `iocInit`: C `iocRun()`, then
+/// the `afterIocRunning` lines its `initHookAfterIocRunning` runs. False when
+/// `iocRun` refused, which it has already reported.
 ///
-/// `Refused` is not an error the caller should print: it only means this line
-/// has no freshly built IOC to consume, and the plain [`ioc_run`] transition —
-/// which is what resumes a paused IOC — is the right next thing to try.
-pub(crate) fn run_from_shell(bridge: &crate::runtime::task::BlockingBridge) -> ShellTransition {
+/// Out of `iocBuilt` with this `run`'s build to consume, that build runs.
+/// Otherwise — out of `iocPaused`, or in a `CaServerBuilder` binary's shell,
+/// which has no [`IocApplication`] build — the plain [`ioc_run`] does.
+pub(crate) fn run_from_shell(ctx: &crate::server::iocsh::registry::CommandContext) -> bool {
     match take_lifecycle() {
-        None => ShellTransition::NotOurs,
         Some(IocLifecycle::Built(built)) => {
-            put_lifecycle(IocLifecycle::Running(bridge.block_on(built.run())));
-            ShellTransition::Done
+            run_and_drain(built, ctx.bridge(), Some(ctx));
+            return true;
         }
-        Some(other) => {
-            put_lifecycle(other);
-            ShellTransition::Refused
-        }
+        Some(other) => put_lifecycle(other),
+        None => {}
     }
+    if ioc_run() != 0 {
+        return false;
+    }
+    run_after_ioc_running(ctx.db(), ctx.bridge(), ctx.acf(), Some(ctx));
+    true
+}
+
+/// C `iocRun` from `iocBuilt`, through to the end of the
+/// `initHookAfterIocRunning` announce, where `afterIocRunningHook` runs the
+/// queued lines (`afterIocRunning.c:38-56`). The lines run after the run's
+/// `block_on` has returned, because each blocks on the runtime itself, and
+/// with the lifecycle already `Running`, as C's `iocState` is by then.
+/// `caller` is the shell whose `iocInit` line this is, `None` for softMain's
+/// own `iocInit()`.
+fn run_and_drain(
+    built: Box<BuiltIoc>,
+    bridge: &crate::runtime::task::BlockingBridge,
+    caller: Option<&crate::server::iocsh::registry::CommandContext>,
+) {
+    let db = built.db.clone();
+    let acf = built.protocol.acf.clone();
+    put_lifecycle(IocLifecycle::Running(bridge.block_on(built.run())));
+    run_after_ioc_running(&db, bridge, &acf, caller);
+}
+
+/// C `afterIocRunningHook` (`afterIocRunning.c:43-55`): each queued line
+/// echoed, run through `iocshCmd`, and named if it failed. The shell reads the
+/// same command table every other shell does, so a site-specific name like
+/// `motorReport` is addressable from the queue with no re-registration.
+///
+/// The lines write where `caller`'s `iocInit` line writes, redirect and all,
+/// since C runs them on that thread. The hook's echoes are plain `printf`s,
+/// and no epicsStdio.h reaches `afterIocRunning.c`, so no redirect takes them.
+fn run_after_ioc_running(
+    db: &Arc<PvDatabase>,
+    bridge: &crate::runtime::task::BlockingBridge,
+    acf: &access_security::AcfCell,
+    caller: Option<&crate::server::iocsh::registry::CommandContext>,
+) {
+    use crate::runtime::log::{ANSI_ESC_GREEN, ANSI_ESC_RESET, ERL_ERROR};
+    let out = |line: &[u8]| match caller {
+        Some(ctx) => ctx.console_println_bytes(line),
+        None => stdout_line(line),
+    };
+    let mut shell = None;
+    db.drain_after_ioc_running(|line| {
+        let shell = shell.get_or_insert_with(|| {
+            iocsh::IocShell::new_with_acf(db.clone(), bridge.clone(), acf.clone())
+        });
+        out(&[
+            format!("{ANSI_ESC_GREEN}afterIocRunning:{ANSI_ESC_RESET} ").as_bytes(),
+            &line,
+        ]
+        .concat());
+        let outcome = match caller {
+            Some(ctx) => shell.nested_iocsh_cmd(ctx, &line),
+            None => shell.iocsh_cmd(&line),
+        };
+        // C's non-zero `iocshCmd`: the line's own diagnostic is already out.
+        if !matches!(
+            outcome,
+            Ok(iocsh::registry::CommandOutcome::Continue | iocsh::registry::CommandOutcome::Exit)
+        ) {
+            out(&[
+                format!("{ERL_ERROR} afterIocRunning: command '").as_bytes(),
+                &line,
+                b"' failed to run",
+            ]
+            .concat());
+        }
+    });
+}
+
+/// C's raw `stdout`, for softMain's own `iocInit()`, which has no shell.
+fn stdout_line(line: &[u8]) {
+    use std::io::Write;
+    let mut stdout = std::io::stdout().lock();
+    let _ = stdout.write_all(line);
+    let _ = stdout.write_all(b"\n");
 }
 
 impl IocBuild {
@@ -1199,35 +1991,29 @@ impl IocBuild {
     /// [`IocState::Built`], the quiescent state [`BuiltIoc::run`] is legal
     /// from. `initHookAfterIocBuilt` is announced on this half, as
     /// `iocBuild_3` announces it (`iocInit.c:201-207`).
-    async fn perform_build(self) -> CaResult<BuildOutcome> {
+    ///
+    /// `out` and `err` are the building thread's stdout and stderr, where the
+    /// epicsStdio files C's build runs (`coreRelease`, `asDbLib`,
+    /// `asInitFile`) write: the shell's, redirected, for an `iocInit` line.
+    async fn perform_build(self, out: impl Fn(&str), err: impl Fn(&str)) -> CaResult<BuildOutcome> {
         let Self {
             db,
             acf,
             autosave_config,
             autosave_startup,
             link_set_installers,
+            after_init_database_hooks,
             after_init_hooks,
+            server_inits,
             protocol,
         } = self;
 
         // Collect restore paths and builder from startup config (scoped mutex lock)
-        let (pass0_files, pass1_files, builder_opt) = if let Some(ref config) = autosave_startup {
+        let (pass0_files, pass1_files) = if let Some(ref config) = autosave_startup {
             let cfg = config.lock().unwrap();
-            let pass0: Vec<std::path::PathBuf> = cfg
-                .pass0_restores
-                .iter()
-                .map(|r| cfg.resolve_save_file(&r.filename))
-                .collect();
-            let pass1: Vec<std::path::PathBuf> = cfg
-                .pass1_restores
-                .iter()
-                .map(|r| cfg.resolve_save_file(&r.filename))
-                .collect();
-            // Built even with no set yet: a `create_monitor_set` after
-            // `iocInit` adds to this manager (C `create_data_set`).
-            (pass0, pass1, Some(cfg.into_builder()))
+            (cfg.boot_restores(false), cfg.boot_restores(true))
         } else {
-            (Vec::new(), Vec::new(), None)
+            (Vec::new(), Vec::new())
         };
 
         // initHooks subsystem (C `iocInit.c` / `initHooks.c` parity).
@@ -1257,22 +2043,11 @@ impl IocBuild {
                 InitHookState::AfterInitDevSup,
                 Box::new(move || {
                     Box::pin(async move {
-                        for sav_path in &files {
-                            match autosave::restore_from_file(&db_p0, sav_path).await {
-                                Ok(count) if count > 0 => {
-                                    eprintln!(
-                                        "pass0 restore: {count} PVs from {}",
-                                        sav_path.display()
-                                    );
-                                }
-                                Err(e) => {
-                                    eprintln!(
-                                        "pass0 restore warning: {} - {e}",
-                                        sav_path.display()
-                                    );
-                                }
-                                _ => {}
-                            }
+                        // `reboot_restore` logs its own failure, as C's.
+                        for item in &files {
+                            let _ =
+                                autosave::reboot_restore(&db_p0, item, autosave::RestorePass::Zero)
+                                    .await;
                         }
                     })
                 }),
@@ -1283,37 +2058,29 @@ impl IocBuild {
         {
             let db_p1 = db.clone();
             let files = pass1_files.clone();
-            let cfg_path = autosave_config.as_ref().map(|c| c.save_path.clone());
+            let cfg_path = autosave_config.as_ref().map(|(c, _)| c.save_path.clone());
             lifecycle_hooks.push((
                 InitHookState::AfterInitDatabase,
                 Box::new(move || {
                     Box::pin(async move {
-                        for sav_path in &files {
-                            match autosave::restore_from_file(&db_p1, sav_path).await {
-                                Ok(count) if count > 0 => {
-                                    eprintln!(
-                                        "pass1 restore: {count} PVs from {}",
-                                        sav_path.display()
-                                    );
-                                }
-                                Err(e) => {
-                                    eprintln!(
-                                        "pass1 restore warning: {} - {e}",
-                                        sav_path.display()
-                                    );
-                                }
-                                _ => {}
-                            }
+                        // `reboot_restore` logs its own failure, as C's.
+                        for item in &files {
+                            let _ =
+                                autosave::reboot_restore(&db_p1, item, autosave::RestorePass::One)
+                                    .await;
                         }
                         if let Some(path) = cfg_path {
-                            match autosave::restore_from_file(&db_p1, &path).await {
-                                Ok(count) if count > 0 => {
-                                    eprintln!("autosave: restored {count} PVs");
-                                }
-                                Err(e) => {
-                                    eprintln!("autosave restore warning: {} - {e}", path.display());
-                                }
-                                _ => {}
+                            if let Err(e) = autosave::restore_from_file(
+                                &db_p1,
+                                &path,
+                                autosave::RestorePass::One,
+                            )
+                            .await
+                            {
+                                crate::runtime::log::errlog_vprintf(format_args!(
+                                    "autosave restore warning: {} - {e}\n",
+                                    path.display()
+                                ));
                             }
                         }
                     })
@@ -1321,106 +2088,72 @@ impl IocBuild {
             ));
         }
 
+        // C registers these with `initHookRegister`, after autosave's.
+        for hook in after_init_database_hooks {
+            let (db, acf) = (db.clone(), acf.clone());
+            lifecycle_hooks.push((
+                InitHookState::AfterInitDatabase,
+                Box::new(move || hook(db, acf)),
+            ));
+        }
+
+        // C `iocBuild_1`. `IocLifecycle::Armed` is only ever the IOC's first
+        // build, so the refusal is unreachable here.
+        let Some(mut build) = BuildSequence::begin(&out) else {
+            return Err(CaError::InvalidValue(build_refusal()));
+        };
+
         // Fire an init-hook state: the C-parity sync `init_hook_*`
         // callbacks first, then the local async lifecycle hooks
         // (autosave restore). Drains every lifecycle hook matching
         // `state` out of the table so each fires exactly once.
         macro_rules! announce {
             ($state:expr) => {{
-                let state = $state;
-                init_hook_announce(state);
-                let mut i = 0;
-                while i < lifecycle_hooks.len() {
-                    if lifecycle_hooks[i].0 == state {
-                        let (_, hook) = lifecycle_hooks.remove(i);
-                        hook().await;
-                    } else {
-                        i += 1;
+                for state in build.until($state) {
+                    let mut i = 0;
+                    while i < lifecycle_hooks.len() {
+                        if lifecycle_hooks[i].0 == state {
+                            let (_, hook) = lifecycle_hooks.remove(i);
+                            hook().await;
+                        } else {
+                            i += 1;
+                        }
                     }
                 }
             }};
         }
-
-        // C `iocBuild_1` announces both of these while `iocState` is still
-        // `iocVoid` (`iocInit.c:122` and `:145`) and assigns `iocBuilding`
-        // only after them (`:148`), so an `initHookRegister` observer at
-        // `AtBeginning` reads the PRE-build state. Announcing them below the
-        // assignment showed it `Building` instead — the one thing this order
-        // decides that no caller can see for itself.
-        announce!(InitHookState::AtIocBuild);
-        // C `iocBuild_1` (`iocInit.c:129`), between the two announces above and
-        // through the errlog rather than stdout, so a subscriber that captures
-        // the errlog sink sees the boot start exactly as it sees every later
-        // `iocInit:` line. It is what `epics_oracle_rs::ioc`'s boot classifier
-        // reads to tell "the IOC began initialising" from "the process printed
-        // nothing", and this port emitted it nowhere.
-        crate::runtime::log::errlog_printf("Starting iocInit\n");
-        announce!(InitHookState::AtBeginning);
-        // C `coreRelease()` stands between the announce and the assignment
-        // (`iocInit.c:147`) and writes stdout, as its `printf` does
-        // (`misc/epicsRelease.c:23-27`). The wording is the iocsh command's,
-        // which is C's arrangement too: one function, two callers.
-        for line in crate::server::iocsh::misc_commands::core_release_block() {
-            println!("{line}");
-        }
-
-        // iocBuild begins.
-        set_ioc_state(IocState::Building);
         // C `scanInit` leaves the facility at `ctlPause` (`dbScan.c:199`)
         // and `iocRun`'s `scanRun` is what starts it, so nothing an
         // in-flight build wires up — an I/O Intr callback, a posted event
         // — can process a record before `initHookAfterInterruptAccept`.
-        // The port's facility starts running (a bare `PvDatabase` has no
-        // lifecycle to have paused it), so the build closes the gate here
-        // rather than the facility opening it later.
-        crate::server::scan::scan_pause();
-        // C `initDatabase` registers the shutdown on the process exit list
-        // (`epicsAtExit(exitDatabase, NULL)`, iocInit.c:579), and
-        // `exitDatabase` is a one-line call to `iocShutdown`. Registered
-        // here so `run`'s `call_at_exits()` stops the scan threads however
-        // this IOC ends.
-        crate::runtime::exit::at_exit("iocShutdown", || {
-            ioc_shutdown();
-        });
-        // C `iocBuild_1` builds the callback facilities here and nowhere else
-        // — `iocState = iocBuilding` then `taskwdInit(); callbackInit();`
-        // immediately before this announce (`iocInit.c:148-153`). That
-        // position is the whole of `callbackSetQueueSize`'s and
-        // `callbackParallelThreads`'s contract: both refuse once the pool
-        // exists (`callback.c:106-109`, `:162-165`) because the pool reads
-        // their knobs when it is constructed, so a startup script's
-        // `callbackSetQueueSize 5000` on the line before `iocInit` is only
-        // honoured while nothing has constructed it earlier.
-        crate::runtime::task::background_init();
-        // Both of this IOC's access-security watchers spawn on the pool that
-        // line just built (C `asCaStart`, reached from `asInitCommon`,
-        // `asDbLib.c:147`). They are the reason moving `background_init`
-        // alone changed nothing: the cell used to be created watching, and
-        // that spawn built the pool before the script ran.
+        // A database's scan control is created paused, so the build has
+        // nothing to close.
+        // Both of this IOC's access-security watchers spawn on the pool
+        // `BuildSequence::begin`'s `callbackInit` just built (C `asCaStart`,
+        // reached from `asInitCommon`, `asDbLib.c:147`). They are the reason
+        // moving `background_init` alone changed nothing: the cell used to be
+        // created watching, and that spawn built the pool before the script
+        // ran.
         access_security::start_acf_watchers(&db, &acf);
         announce!(InitHookState::AfterCallbackInit);
-        announce!(InitHookState::AfterCaLinkInit);
 
-        // External link-set installers fire at `AfterCaLinkInit` — the C
-        // `initHookAfterCaLinkInit` point — so every external link set is
+        // External link-set installers run at C `dbCaLinkInit`, before
+        // `initHookAfterCaLinkInit` is announced — so every external link set is
         // registered on the database BEFORE `setup_cp_links` (Phase 2b,
         // below) warms Passive CP/CPP holders. A link set registered later
         // (e.g. inside the Phase-3 protocol runner) is too late: the warm's
         // `resolve_external_pv` open path no-ops when no matching link set
         // is installed, so a Passive holder of an external CP link never
         // opens its monitor and never processes on a remote change. Each
-        // installer also yields its iocsh commands (`caxr`/`dbcaxr`, …),
+        // installer also yields its iocsh commands (`dbcaxr`, …),
         // registered on the process's command table the moment they exist —
         // C `iocshRegister` from a registrar reached by `initHookAfterCaLinkInit`.
         // This is the point that made the table have to be one: the startup
         // shell was constructed before this line, so a per-shell table could
         // never carry these names into the script, however they were handed
         // around afterwards.
-        for installer in link_set_installers {
-            for cmd in installer(db.clone()).await {
-                iocsh::register_command(cmd);
-            }
-        }
+        build.ca_link_init(&db, link_set_installers).await;
+        announce!(InitHookState::AfterCaLinkInit);
 
         announce!(InitHookState::AfterInitDrvSup);
         announce!(InitHookState::AfterInitRecSup);
@@ -1432,7 +2165,7 @@ impl IocBuild {
         // C's `initDatabase` runs HERE, as a whole-database pass that binds each
         // record's dset and only then runs its `init_record`
         // (`drain_deferred_record_inits` → per record `attach_device_support`
-        // ahead of `run_init_passes`). The record was published at
+        // ahead of `run_init_pass0`). The record was published at
         // `dbLoadRecords` but its init deferred to this point, because a
         // record's device-support PORT can be configured by a startup command
         // AFTER the `dbLoadRecords` that created it (ADCore's
@@ -1444,62 +2177,6 @@ impl IocBuild {
         // fires before the startup script's `iocInit` line, and the records it
         // restores were loaded before that.
         announce!(InitHookState::AfterInitDevSup);
-        db.drain_deferred_record_inits();
-        let record_count = db.records_with_device_support().await;
-        let io_intr_count = setup_io_intr(db.clone()).await;
-        setup_property_posts(db.clone()).await;
-        // C `dbInitLink`'s locality decision, committed once for the whole
-        // database now that every record has loaded: a `Db` link naming a
-        // record this IOC does not have becomes a `Ca` link
-        // (`dbLink.c:118-130` falling through `dbDbInitLink`'s
-        // `S_db_notFound`, `dbDbLink.c:94-96`). Runs BEFORE `setup_cp_links`
-        // for C's reason — `initPVLinks` initialises links before anything
-        // consumes them — and it is a one-shot: C guards re-entry with
-        // `DBLINK_FLAG_INITIALIZED` (`dbLink.c:96-100`), so a record added
-        // later at runtime does not un-convert a link already made external.
-        db.initialize_link_locality().await;
-        db.setup_cp_links().await;
-        // Open the rest of the external links at init, as C does. Every
-        // non-local `PV_LINK` reaches `dbCaAddLink` from `dbInitLink`
-        // (`dbLink.c:118-130`) regardless of direction or CP/CPP policy, so a
-        // C IOC's first scan finds an already-connecting channel.
-        // `setup_cp_links` above covers only the CP/CPP subset; without this
-        // pass every other external `INP`/`OUT`/`DOL`/`TSEL`/`SDIS`/`INPA..`
-        // link pays one cold scan cycle to stage its own open. Runs here — the
-        // same init phase, after link parsing and before scan start — and
-        // after `setup_cp_links` so the `Db`→`Ca` rewrite it applies to
-        // non-local CP holders is already visible to the enumeration.
-        db.setup_external_link_opens().await;
-
-        // Phase 2b.5: wait for the CA links to local records to connect
-        // before PINI runs (epics-base PR #768/#856 — `dbCa: iocInit
-        // wait`). This is a CA-facility wait only: `pva://` links and
-        // non-local CA links open in the background and never block
-        // iocInit (pvxs parity — pvalink `linkGlobal_t::init` just opens
-        // channels). Default 10s timeout, override via
-        // `EPICS_RS_INIT_LINK_TIMEOUT` (seconds, fractional accepted).
-        // Pass-through when no CA link set is registered.
-        let link_wait_secs = crate::runtime::env::get("EPICS_RS_INIT_LINK_TIMEOUT")
-            .and_then(|s| s.parse::<f64>().ok())
-            .unwrap_or(10.0)
-            .max(0.0);
-        if link_wait_secs > 0.0 {
-            let (connected, total) = db
-                .wait_for_external_links(crate::runtime::time::duration_from_secs(link_wait_secs))
-                .await;
-            if total > 0 {
-                if connected == total {
-                    eprintln!("iocInit: {connected}/{total} external links connected");
-                } else {
-                    let unconnected = db.unconnected_external_links().await;
-                    eprintln!(
-                        "iocInit: {connected}/{total} external links connected after \
-                         {link_wait_secs}s — proceeding without: {}",
-                        unconnected.join(", ")
-                    );
-                }
-            }
-        }
 
         // C: initDatabase() then initHookAfterInitDatabase (autosave
         // pass 1). The registered hook performs pass-1 + SaveSetConfig
@@ -1509,9 +2186,11 @@ impl IocBuild {
         // startup script loaded now exists, so the link-status classifications
         // queued during the load run here, against the complete database. A
         // no-op when the script already spelled `iocInit` out.
-        db.ioc_init().await;
+        init_database(&db, true, &err).await;
         announce!(InitHookState::AfterInitDatabase);
+        db.scan_control().finish_dev_sup();
         announce!(InitHookState::AfterFinishDevSup);
+        scan_init(&db).await;
 
         // C `iocBuild_2` (`iocInit.c:186-191`): `scanInit()`, then `asInit()`,
         // then `initHookAfterScanInit`. THIS is the second caller of
@@ -1526,9 +2205,9 @@ impl IocBuild {
         // itself, on stderr, and hands `asInitCommon` only a status
         // (`asLibRoutines.c:174-190`), which is why `as_init` returns an
         // outcome and not a message.
-        let as_init = crate::server::iocsh::as_init(&acf);
+        let as_init = crate::server::iocsh::as_init(&acf, &err);
         if let Some(message) = as_init.message() {
-            println!("{message}");
+            out(message);
         }
         if as_init.failed() {
             crate::runtime::log::errlog_printf(&as_init_failed_message(
@@ -1560,58 +2239,37 @@ impl IocBuild {
         // client connecting in the first moments after IOC start
         // could `caget` a PINI record's UDF/default value instead of
         // its processed value. C guarantees this cannot happen.
-        {
-            // C `initialProcess()` (iocInit.c:653-657) — `piniProcess(menuPiniYES)`.
-            db.pini_process(crate::server::record::PiniMode::Yes).await;
-            // Publish completion: a later-started scan owner (or a
-            // non-owner scheduler) sees PINI as already done — the
-            // owner branch then skips its own PINI pass (exactly-once,
-            // as C's `initialProcess`) and non-owners run their hooks
-            // without blocking.
-            db.mark_pini_done();
-        }
+        initial_process(&db);
         announce!(InitHookState::AfterInitialProcess);
 
-        // Phase 2d: Build AutosaveManager from startup config
-        let autosave_manager = if let Some(builder) = builder_opt {
-            // `build` cannot fail: a set it could not construct is reported
-            // on the error log and carried as that set's error status, so
-            // one bad `.req` file no longer costs the IOC every other set.
-            let mgr = Arc::new(builder.build().await);
-            eprintln!("autosave: {} save set(s) configured", mgr.set_names().len());
-            if let Some(ref config) = autosave_startup {
-                config.lock().unwrap().manager = Some(mgr.clone());
-            }
-            Some(mgr)
-        } else {
-            None
+        // The manager the script's first `create_*_set` started, if one ran
+        // before `iocInit`; C has no save task until then.
+        let autosave_manager = autosave_startup
+            .as_ref()
+            .and_then(|config| config.lock().unwrap().manager.clone());
+
+        // C `dbInitServers()` (`iocInit.c:222`): each server binds here, so a
+        // port it cannot have fails this build and no later `st.cmd` line
+        // runs. Started by the runner at `iocRun`.
+        let mut servers = InitializedServers::default();
+        let args = ServerInitArgs {
+            port: protocol.port,
+            tcp_port: protocol.tcp_port,
         };
-
-        let total_records = db.all_record_names().await.len();
-        // A line C does not have, kept because the three counts are what an
-        // operator checks an `st.cmd` by — but said through the errlog, which
-        // is where C puts everything the boot says. A raw `eprintln!` here
-        // was outside `eltc`'s reach: measured, `eltc 0` then `iocInit`
-        // silenced C's console completely and left this line and the CA
-        // server's on the port's.
-        crate::runtime::log::errlog_printf(&format!(
-            "iocInit: {total_records} records, {record_count} with device support, {io_intr_count} I/O Intr\n"
-        ));
-
-        // C: rsrv init / iocBuild end. The Rust CA/PVA listener is
-        // owned by the protocol runner, but PINI is already complete
-        // (Phase 2b.6) so announcing here keeps hook ordering correct
-        // for consumers that key off these states.
+        for (name, init) in server_inits {
+            servers.push(name, init(args).await?);
+        }
         announce!(InitHookState::AfterCaServerInit);
-        announce!(InitHookState::AfterIocBuilt);
         // C `iocBuild` ends here, and the IOC is quiescent — `iocBuilt` is
         // the state `iocRun` below is legal from.
-        set_ioc_state(IocState::Built);
+        build.finish();
 
         Ok(BuildOutcome::Built(Box::new(BuiltIoc {
             db,
             autosave_manager,
+            autosave_startup,
             after_init_hooks,
+            servers,
             protocol,
         })))
     }
@@ -1628,40 +2286,14 @@ impl BuiltIoc {
         let Self {
             db,
             autosave_manager,
+            autosave_startup,
             after_init_hooks,
+            servers,
             protocol,
         } = self;
 
-        // C `piniProcessHook` (iocInit.c:629-646): the hook registered by
-        // `initialProcess()` runs `piniProcess(menuPiniRUN)` when
-        // `initHookAtIocRun` is announced. It is a hook CONSUMER in C, not
-        // part of `iocRun`'s body; the port's hook table is synchronous
-        // and `pini_process` is not, so the pass runs here, immediately
-        // before the transition that announces the state it keys on.
-        db.pini_process(crate::server::record::PiniMode::Run).await;
-        // Periodic scanning is owned by the IOC core, not by any protocol
-        // server — a PVA-only or server-less IOC scans all the same. The
-        // owner's PINI=YES pass is skipped (Phase 2b.6 already ran it and
-        // published completion); the `try_claim_scan_start` claim it takes
-        // keeps a protocol runner or embedded harness that starts another
-        // owner parked and harmless.
-        //
-        // Handed to the lifecycle rather than held in a local: `iocShutdown`
-        // is what stops the scan threads now, and `run` reaches it through
-        // the `epicsAtExit` registration below on every exit path — which
-        // the local could only do by returning from this function.
-        // C `iocInit` is `iocBuild() || iocRun()` (iocInit.c:107-110), and
-        // starting the owner is that `iocRun`: `ScanOwner::start` calls
-        // [`note_scan_owner_started`], which runs the same transition the
-        // shell's `iocRun` runs. One caller, so the two cannot announce
-        // different things.
-        adopt_scan_owner(crate::server::scan::ScanOwner::start(db.clone()));
-        // C `piniProcessHook` at `initHookAfterIocRunning` (iocInit.c:637-639)
-        // — `piniProcess(menuPiniRUNNING)`; a hook consumer for the same
-        // reason as the PINI=RUN pass above, run immediately after the
-        // transition that announces its state.
-        db.pini_process(crate::server::record::PiniMode::Running)
-            .await;
+        // `perform_build` left the IOC built, so this `iocRun` cannot refuse.
+        run_built(&db).await;
 
         // H3: drain `after_init_hooks` HERE — a guaranteed drain
         // point inside `run`. These were previously moved into
@@ -1709,7 +2341,7 @@ impl BuiltIoc {
             autosave_manager,
             // Retained for the runners that build an `IocRunConfig` by hand
             // (`run_ca_ioc`, `run_pva_ioc`, `softioc-rs`): it is how THEY get
-            // their own `casr`/`caxr` onto the table. `IocApplication::run`
+            // their own `casr`/`dbcaxr` onto the table. `IocApplication::run`
             // has already registered everything it owns on the process's one
             // command table, so it hands the field over EMPTY rather than
             // asking the runner to register the same names again.
@@ -1717,6 +2349,7 @@ impl BuiltIoc {
             // Drained above. Handed over empty so a protocol runner that still
             // inspects the field cannot double-run the hooks.
             after_init_hooks: Vec::new(),
+            servers,
         };
         // C's `iocRun` does not return until every layer is up, because
         // `dbRunServers()` is a plain call: `rsrv_run` flips the control words
@@ -1724,17 +2357,31 @@ impl BuiltIoc {
         // bound one phase earlier. Spawning the runner alone does not
         // reproduce that — the next script line would race the runner's own
         // bind and its `casr` registration, and a measured `ss` of 1 was a race
-        // that happened to win. So the generation is sampled BEFORE the spawn
+        // that happened to win. So the counters are sampled BEFORE the spawn
         // and awaited after it: the serve entry of each protocol server
         // announces (see [`crate::server::db_server::announce_serving`]), and
-        // this line is where C's ordering is restored.
-        let generation = crate::server::db_server::serving_generation();
+        // this line is where C's ordering is restored — for every layer
+        // `dbInitServers()` started, since CA alone up left a `pvxsr` on the
+        // next line without QSRV's sources.
+        let mark = crate::server::db_server::serving_mark(config.servers.names());
+        let serve = runner(config);
         let mut server = ProtocolServer {
-            handle: bridge.spawn(runner(config)),
+            handle: bridge.spawn(async move {
+                let result = serve.await;
+                // The task the first `create_*_set` started (save_restore.c:
+                // 2335-2351), stopped and waited for as C's at-exit
+                // save_restoreShutdown does (:771-775).
+                let task = autosave_startup.and_then(|c| c.lock().unwrap().take_task());
+                if let Some(task) = task {
+                    task.abort();
+                    task.await;
+                }
+                result
+            }),
             finished: None,
             live: true,
         };
-        server.await_serving(generation).await;
+        server.await_serving(mark).await;
 
         RunningIoc { server }
     }
@@ -1750,9 +2397,9 @@ pub struct IocApplication {
     device_factories: HashMap<String, DeviceSupportFactory>,
     dynamic_device_factory: Option<DynamicDeviceSupportFactory>,
     record_factories: HashMap<String, super::RecordFactory>,
-    subroutine_registry: HashMap<String, Arc<SubroutineFn>>,
+    subroutine_registry: HashMap<String, Arc<Subroutine>>,
     acf: Option<access_security::AccessSecurityConfig>,
-    autosave_config: Option<autosave::SaveSetConfig>,
+    autosave_config: Option<(autosave::SaveSetConfig, autosave::SaveStrategy)>,
     autosave_startup: Option<Arc<Mutex<AutosaveStartupConfig>>>,
     /// Every iocsh command this application contributes, in registration
     /// order. One list because there is one command table: the two public
@@ -1774,13 +2421,22 @@ pub struct IocApplication {
     /// Callbacks invoked after iocInit completes (e.g., start pollers).
     after_init_hooks: Vec<Box<dyn FnOnce() + Send>>,
     /// Async external link-set installers (CA links via `epics-ca-rs`'s
-    /// `calink`, PVA links via the bridge's `pvalink`). Fired at the
-    /// `AfterCaLinkInit` hook in [`Self::run`] — before `setup_cp_links`
+    /// `calink`, PVA links via the bridge's `pvalink`). Fired at C
+    /// `dbCaLinkInit` in [`Self::run`] — before `setup_cp_links`
     /// — so a Passive holder of an external CP link warms at iocInit.
     link_set_installers: Vec<LinkSetInstaller>,
+    /// The link types those installers serve ([`Self::register_link_type`]),
+    /// declared on the database the moment it exists.
+    json_link_types: Vec<String>,
+    /// Async `initHookAfterInitDatabase` consumers
+    /// ([`Self::register_after_init_database`]).
+    after_init_database_hooks: Vec<AfterInitDatabaseHook>,
     /// C softMain's own turn between the startup script and `iocInit`
-    /// ([`Self::before_ioc_init`]). `None` is [`IocInitDecision::run`].
+    /// ([`Self::before_ioc_init`]). `None` is a custom `main`: the script's
+    /// own `iocInit` is the only build, or `run` builds when there is no script.
     ioc_init_gate: Option<Box<dyn FnOnce() -> IocInitDecision + Send>>,
+    /// [`Self::register_server_init`].
+    server_inits: Vec<(&'static str, ServerInit)>,
 }
 
 impl IocApplication {
@@ -1818,7 +2474,10 @@ impl IocApplication {
             inline_records: Vec::new(),
             after_init_hooks: Vec::new(),
             link_set_installers: Vec::new(),
+            json_link_types: Vec::new(),
+            after_init_database_hooks: Vec::new(),
             ioc_init_gate: None,
+            server_inits: Vec::new(),
         }
     }
 
@@ -1839,14 +2498,20 @@ impl IocApplication {
         self
     }
 
-    /// Register a device support factory by DTYP name.
-    /// Called during iocInit to wire device support to records.
-    pub fn register_device_support<F>(mut self, dtyp: &str, factory: F) -> Self
+    /// Register a device support: its factory under `devsup.choice`, and
+    /// `devsup` as a row of `record_type`'s device menu.
+    pub fn register_device_support<F>(
+        mut self,
+        record_type: &str,
+        devsup: &'static crate::server::record::DevSup,
+        factory: F,
+    ) -> Self
     where
         F: Fn() -> Box<dyn DeviceSupport> + Send + Sync + 'static,
     {
+        crate::server::record::register_device_object_row(record_type, devsup);
         self.device_factories
-            .insert(dtyp.to_string(), Box::new(factory));
+            .insert(devsup.choice.to_string(), Box::new(factory));
         self
     }
 
@@ -1857,10 +2522,20 @@ impl IocApplication {
     /// and returns `Some(device_support)` if it can handle that DTYP.
     ///
     /// Multiple calls are chained: new factory is tried first, then existing.
-    pub fn register_dynamic_device_support<F>(mut self, factory: F) -> Self
+    ///
+    /// `devices` are the `device()` lines the factory serves, added to the
+    /// device menus now: a `.db` may name only a menu choice.
+    pub fn register_dynamic_device_support<F>(
+        mut self,
+        devices: &[(&str, &'static [crate::server::record::DevSup])],
+        factory: F,
+    ) -> Self
     where
         F: Fn(&DeviceSupportContext) -> Option<Box<dyn DeviceSupport>> + Send + Sync + 'static,
     {
+        for (record_type, rows) in devices {
+            crate::server::record::register_device_menu(record_type, rows);
+        }
         if let Some(existing) = self.dynamic_device_factory.take() {
             self.dynamic_device_factory = Some(Box::new(move |ctx: &DeviceSupportContext| {
                 factory(ctx).or_else(|| existing(ctx))
@@ -1917,10 +2592,15 @@ impl IocApplication {
         self
     }
 
-    /// Register an async external link-set installer.
+    /// Add the link type `key` and the installer of its link set: C's
+    /// `link(key, jlif)` line in the `.dbd` and the registrar that binds its
+    /// support, which a C binary links together. The type is declared and
+    /// bound before any startup line loads a `.db`, so a link of this type
+    /// loads; one call for both means no binary can accept a link it has no
+    /// set to service.
     ///
-    /// The installer is invoked by [`Self::run`] at the C
-    /// `initHookAfterCaLinkInit` point — BEFORE
+    /// The installer is invoked by [`Self::run`] at C `dbCaLinkInit`, just
+    /// before `initHookAfterCaLinkInit` — BEFORE
     /// [`PvDatabase::setup_cp_links`] warms Passive CP holders. It
     /// registers its external [`crate::server::database::LinkSet`] on the
     /// live database and returns any iocsh commands it owns, which [`Self::run`]
@@ -1931,15 +2611,70 @@ impl IocApplication {
     /// runner is too late, because `setup_cp_links`'s `resolve_external_pv`
     /// warm has already run and found no matching link set, so a Passive
     /// holder of an external CP/CPP link never opens its monitor. A
-    /// CA-serving IOC wires `epics_ca_rs::calink::calink_link_set_install`
-    /// here so CA links resolve with no further setup.
-    pub fn register_link_set_installer<F, Fut>(mut self, installer: F) -> Self
+    /// IOC runner wires `epics_ca_rs::calink::calink_link_set_install`
+    /// here under `"ca"` so CA links resolve with no further setup.
+    ///
+    /// # Panics
+    ///
+    /// When `key` already has an installer: a type has one link set, and a
+    /// head adding one its runner already installs would install two. In
+    /// [`Self::run`] when this port implements no JSON link type `key`.
+    pub fn register_link_type<F, Fut>(mut self, key: &str, installer: F) -> Self
     where
         F: FnOnce(Arc<PvDatabase>) -> Fut + Send + 'static,
         Fut: std::future::Future<Output = Vec<CommandDef>> + Send + 'static,
     {
+        assert!(
+            !self.json_link_types.iter().any(|k| k == key),
+            "link type '{key}' already has its link set installer"
+        );
+        self.json_link_types.push(key.to_string());
         self.link_set_installers
             .push(Box::new(move |db| Box::pin(installer(db))));
+        self
+    }
+
+    /// Register a server's `dbServer.init`, run by `iocInit` at C's
+    /// `dbInitServers()` point; an `Err` fails `iocInit`. The runner takes
+    /// what it returned from [`IocRunConfig::servers`] under `name`.
+    ///
+    /// # Panics
+    ///
+    /// When `name` is already registered.
+    pub fn register_server_init<F, Fut, T>(mut self, name: &'static str, init: F) -> Self
+    where
+        F: FnOnce(ServerInitArgs) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = CaResult<T>> + Send + 'static,
+        T: Send + 'static,
+    {
+        assert!(
+            !self.server_inits.iter().any(|(n, _)| *n == name),
+            "server '{name}' already has its init"
+        );
+        self.server_inits.push((
+            name,
+            Box::new(move |args| {
+                Box::pin(async move {
+                    init(args)
+                        .await
+                        .map(|state| Box::new(state) as Box<dyn std::any::Any + Send>)
+                })
+            }),
+        ));
+        self
+    }
+
+    /// Register an async `initHookAfterInitDatabase` consumer, run inside
+    /// `iocBuild` before `scanInit` and `initialProcess`: pvxs's
+    /// `processGroups` is one (iochooks.cpp:355), so a group file that throws
+    /// aborts before any scan or PINI.
+    pub fn register_after_init_database<F, Fut>(mut self, hook: F) -> Self
+    where
+        F: FnOnce(Arc<PvDatabase>, access_security::AcfCell) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        self.after_init_database_hooks
+            .push(Box::new(move |db, acf| Box::pin(hook(db, acf))));
         self
     }
 
@@ -1949,9 +2684,10 @@ impl IocApplication {
     /// The one instant at which a caller can both observe that the script
     /// has finished and decide whether the IOC initialises at all — C has
     /// it because `iocsh(st.cmd)` and `iocInit()` are two statements in its
-    /// `main`, and this port had collapsed them into one call. Unset means
-    /// [`IocInitDecision::run`], so an application that never had C's
-    /// `loadedDb` question boots exactly as it did before.
+    /// `main`, and this port had collapsed them into one call. Unset is C's
+    /// custom `main` (`iocsh(st.cmd); iocsh(NULL)`): a startup script that
+    /// never says `iocInit` leaves the IOC uninitialised at the prompt, and
+    /// an application with no script is built by `run`.
     ///
     /// The gate runs on the lifecycle's own task, after the startup shell
     /// has been joined, so anything it prints lands between the script's
@@ -2003,14 +2739,28 @@ impl IocApplication {
     where
         F: Fn(&mut dyn Record) -> CaResult<i64> + Send + Sync + 'static,
     {
-        self.subroutine_registry
-            .insert(name.to_string(), Arc::new(Box::new(func)));
+        self.subroutine_registry.insert(
+            name.to_string(),
+            Arc::new(Subroutine::Plain(Box::new(func))),
+        );
         self
     }
 
-    /// Configure autosave with a save set configuration.
-    pub fn autosave(mut self, config: autosave::SaveSetConfig) -> Self {
-        self.autosave_config = Some(config);
+    /// [`Self::register_subroutine`] for a routine that also needs its
+    /// record's name, `dpvt` or database ([`Subroutine::Context`]).
+    pub fn register_context_subroutine(mut self, name: &str, func: ContextSubroutineFn) -> Self {
+        self.subroutine_registry
+            .insert(name.to_string(), Arc::new(Subroutine::Context(func)));
+        self
+    }
+
+    /// Configure autosave with one save set and its save method.
+    pub fn autosave(
+        mut self,
+        config: autosave::SaveSetConfig,
+        method: autosave::SaveStrategy,
+    ) -> Self {
+        self.autosave_config = Some((config, method));
         self
     }
 
@@ -2021,6 +2771,14 @@ impl IocApplication {
     /// the config during st.cmd execution. After iocInit, the config is consumed to
     /// build an `AutosaveManager`.
     pub fn autosave_startup(mut self, config: Arc<Mutex<AutosaveStartupConfig>>) -> Self {
+        // `$(AUTOSAVE)` as C's envPaths sets it, for
+        // `$(AUTOSAVE)/db/save_restoreStatus.db`.
+        crate::runtime::env::set_default_path(
+            "AUTOSAVE",
+            concat!(env!("CARGO_MANIFEST_DIR"), "/autosave"),
+        );
+        // `$(CALC)`, for the calc records' `*_settings.req` in `$(CALC)/db`.
+        crate::runtime::env::set_default_path("CALC", concat!(env!("CARGO_MANIFEST_DIR"), "/calc"));
         self.autosave_startup = Some(config);
         self
     }
@@ -2078,6 +2836,9 @@ impl IocApplication {
     /// `:251`, `:265`, `:270`, `:277`), and `epicsExit` runs the list first
     /// (`epicsExit.c:172-177`).
     ///
+    /// A SIGTERM or SIGINT does not return: once the callbacks have run, the
+    /// process is killed by that signal, as a C IOC with no handler is.
+    ///
     /// This wrapper is where that becomes structural rather than remembered:
     /// the whole lifecycle sits in `Self::run_to_completion`, whose every
     /// `?` returns *here*, so no exit path can be added later that skips the
@@ -2110,8 +2871,11 @@ impl IocApplication {
         F: FnOnce(IocRunConfig) -> Fut + Send + 'static,
         Fut: std::future::Future<Output = CaResult<()>> + Send + 'static,
     {
+        crate::runtime::task::adopt_current_runtime();
+        super::shutdown_signal::set_application_owns();
         let result = self.run_to_completion(protocol_runner).await;
         crate::runtime::exit::call_at_exits();
+        super::shutdown_signal::exit_if_received();
         result
     }
 
@@ -2140,7 +2904,7 @@ impl IocApplication {
             device_factories,
             dynamic_device_factory,
             record_factories,
-            subroutine_registry,
+            mut subroutine_registry,
             acf,
             autosave_config,
             autosave_startup,
@@ -2151,8 +2915,14 @@ impl IocApplication {
             inline_records,
             after_init_hooks,
             link_set_installers,
+            json_link_types,
+            after_init_database_hooks,
             ioc_init_gate,
+            server_inits,
         } = self;
+        for key in &json_link_types {
+            db.declare_link_type(key);
+        }
 
         // The IOC's single live policy cell, created BEFORE the startup
         // script runs so the script's `asInit` and the servers built
@@ -2179,15 +2949,13 @@ impl IocApplication {
         if let Some(ref config) = autosave_startup {
             let cmds = AutosaveStartupConfig::register_startup_commands(config.clone());
             commands.extend(cmds);
+            // C asSupport.dbd's `configMenuRegistrar`.
+            for (name, func) in crate::server::autosave::config_menu::subroutines(config.clone()) {
+                subroutine_registry
+                    .entry(name.to_string())
+                    .or_insert_with(|| Arc::new(Subroutine::Context(func)));
+            }
         }
-
-        // Register the QSRV `dbLoadGroup` startup command so a
-        // pvxs-compatible st.cmd can queue group definition files before
-        // iocInit (pvxs registers it from its registrar before the
-        // startup script). The QSRV protocol runner drains the queue and
-        // applies it to the served provider; a non-QSRV runner never
-        // drains it, leaving the command a harmless no-op.
-        commands.push(db_load_group_startup_command());
 
         // C has every command registered before it reads a script: the
         // registrars run from `registerRecordDeviceDriver` and `dbLoadDatabase`,
@@ -2229,226 +2997,98 @@ impl IocApplication {
         // one meaning: the script's own `iocInit` line performs this build, so
         // the line after it — a `dbpf`, a `dbl`, an `asSetFilename` — runs
         // against an IOC that has device support, scan threads and PINI behind
-        // it. When the script never spells `iocInit`, the turn after Phase 1
-        // performs the same build instead.
-        arm_build(IocBuild {
-            db: db.clone(),
-            acf: acf.clone(),
-            autosave_config: autosave_config.clone(),
-            autosave_startup,
-            link_set_installers,
-            after_init_hooks,
-            // C parity (`caservertask.c:492-500`): the server-side env var
-            // EPICS_CAS_SERVER_PORT sets `ca_server_port`, and `ca_udp_port =
-            // ca_server_port` — so UDP and TCP bind the same value unless the
-            // Rust-extension `.tcp_port(...)` explicitly splits them. The
-            // `port` field already incorporates the CAS / CA / default
-            // precedence via `cas_server_port()` (see `IocApplication::new`);
-            // `tcp_port` stays `Some(...)` only when the caller explicitly
-            // invoked `.tcp_port(...)`.
-            protocol: ProtocolStart {
-                bridge: bridge.clone(),
-                port,
-                tcp_port,
+        // it. When the script never spells `iocInit`, only the gate's
+        // `IocInitDecision::run` — or having no script at all — builds.
+        let (cannot_proceed_tx, mut cannot_proceed_rx) = crate::runtime::sync::oneshot::channel();
+        arm_build(
+            IocBuild {
+                db: db.clone(),
                 acf: acf.clone(),
-                autosave_config,
-                runner: Box::new(move |config| Box::pin(protocol_runner(config))),
+                autosave_config: autosave_config.clone(),
+                autosave_startup,
+                link_set_installers,
+                after_init_database_hooks,
+                after_init_hooks,
+                server_inits,
+                // C parity (`caservertask.c:492-500`): the server-side env var
+                // EPICS_CAS_SERVER_PORT sets `ca_server_port`, and `ca_udp_port =
+                // ca_server_port` — so UDP and TCP bind the same value unless the
+                // Rust-extension `.tcp_port(...)` explicitly splits them. The
+                // `port` field already incorporates the CAS / CA / default
+                // precedence via `cas_server_port()` (see `IocApplication::new`);
+                // `tcp_port` stays `Some(...)` only when the caller explicitly
+                // invoked `.tcp_port(...)`.
+                protocol: ProtocolStart {
+                    bridge: bridge.clone(),
+                    port,
+                    tcp_port,
+                    acf: acf.clone(),
+                    autosave_config,
+                    runner: Box::new(move |config| Box::pin(protocol_runner(config))),
+                },
             },
-        });
+            cannot_proceed_tx,
+        );
+        // Ahead of `_armed`, so it closes after the runner is gone.
+        let _prompt = iocsh::SoftMainPromptSpan::open().map_err(|e| {
+            CaError::InvalidValue(format!("could not start the _main_ thread: {e}"))
+        })?;
         // From here the static can hold a running IOC, and a running IOC owns
         // a spawned protocol runner. Nothing may return past this line without
         // that value being dropped.
         let _armed = ArmedLifecycle;
 
-        // Phase 1: Execute the queued command lines and then the startup
-        // script, on ONE shell, in a separate std::thread. std::thread (not
-        // spawn_blocking) is required because iocsh commands use
-        // Handle::block_on() which panics inside the tokio runtime context.
-        //
-        // One shell for both because C uses one iocsh context too: a
-        // `dbLoadRecords` from `-d` and one from the script are the same
-        // call, so a `dbPutAttribute` or `dbLoadTemplate` queued here must
-        // be visible to the script exactly as it is to a later script line.
-        if startup_script.is_some() || !startup_lines.is_empty() {
-            // C's `iocsh(pathname)` returns before `iocsh(NULL)` is reached
-            // (`softMain.cpp:231`, `:250`). The script's `iocInit` line now
-            // starts the protocol runner, whose interactive shell is a thread
-            // of its own, so that ordering has to be held rather than implied
-            // — see `iocsh::STARTUP_SCRIPT_PHASE`. A guard, so a failed load
-            // ends the phase too.
-            let _script_phase = iocsh::startup_script_phase();
-            let script = startup_script;
-            let db1 = db.clone();
-            let b1 = bridge.clone();
-            let acf1 = acf.clone();
-
-            let (tx, rx) = crate::runtime::sync::oneshot::channel();
-            // Mandatory: the startup script is what loads this IOC's database.
-            // Booting on without it would serve an empty or half-loaded IOC.
-            // `try_spawn` rather than `spawn` because this *is* a fallible boot
-            // step — the error reaches `run`'s caller, which then never starts
-            // serving, so there is no need to abort the process.
-            crate::runtime::task::MandatoryThread::new(
-                "iocsh-startup",
-                // C bands the thread that runs iocsh, and for the reason
-                // this thread has too — see `iocsh_threads_take_the_iocsh_band`.
-                crate::runtime::task::ThreadPriority::Iocsh,
-                // The shell runs arbitrary registered commands, which reach
-                // record processing and device support — the same depth the
-                // callback bands get, so the same class they use.
-                crate::runtime::task::StackSizeClass::Big,
-            )
-            .try_spawn(move || {
-                let shell = iocsh::IocShell::new_with_acf(db1, b1, acf1);
-                let _ = tx.send(run_startup_phase(&shell, &startup_lines, script.as_deref()));
+        // Phases 1 and 2: softMain from `iocsh(st.cmd)` to the return of its
+        // own `iocInit()` (`softMain.cpp:231-245`), as one job on `_main_`.
+        // One job because C runs those statements in sequence on one thread:
+        // the protocol runner that an `iocInit` starts queues its
+        // `iocsh(NULL)` behind this job, so the prompt cannot open before the
+        // script, the gate's `iocInit()` and the `afterIocRunning` lines that
+        // `iocInit` runs have all returned. On a thread, not this task,
+        // because iocsh commands `block_on`, which panics inside the runtime.
+        let soft_main = {
+            let (db, bridge, acf) = (db.clone(), bridge.clone(), acf.clone());
+            crate::runtime::task::run_on_main_thread(move || {
+                soft_main_to_ioc_init(
+                    db,
+                    bridge,
+                    acf,
+                    &startup_lines,
+                    startup_script.as_deref(),
+                    ioc_init_gate,
+                )
             })
-            .map_err(|e| {
-                CaError::InvalidValue(format!("could not start the iocsh-startup thread: {e}"))
-            })?;
-
-            rx.await
-                .map_err(|_| CaError::InvalidValue("startup thread dropped".into()))??;
-        }
-
-        // C softMain's turn between `iocsh(st.cmd)` and `iocInit()`
-        // (`softMain.cpp:236-245`). Outside the `if` above because C asks
-        // its question whatever the flags were — a `softIoc` with neither a
-        // script nor a `-d` still reaches this line, and is exactly the case
-        // that must NOT build.
-        // `None` is an application that never installed the gate, and that is
-        // not the same as answering `Run`: such a caller is not C softMain,
-        // has not answered C's `-S`, and owns no tail of its own — the
-        // protocol runner is the whole of its tail. It therefore gets a
-        // failed build as an `Err` rather than a shell it never asked for.
-        let decision = ioc_init_gate.map(|gate| gate());
-        // Finish whatever the startup script left undone. Each arm is a state
-        // the script could have stopped in, and the value it carries is this
-        // `run`'s only claim on the transition out of it.
-        let outcome = match take_lifecycle() {
-            // The script spelled neither `iocInit` nor `iocBuild`, so this is
-            // the turn that decides whether the IOC is built at all.
-            Some(IocLifecycle::Armed(build)) => {
-                if let Some(decision) = decision
-                    && !decision.run
-                {
-                    return run_uninitialized_tail(db, bridge, acf, decision.interactive).await;
-                }
-                match build.perform_build().await? {
-                    BuildOutcome::Built(built) => Ok(built.run().await),
-                    BuildOutcome::AsInitFailed => Err(()),
-                }
-            }
-            // The script spelled `iocBuild` and never `iocRun`. C's softMain
-            // would call `iocInit()`, watch `iocBuild_1` refuse from a state
-            // that is not `iocVoid`, and leave the IOC quiescent — bound to no
-            // port and serving nothing, which is the failure this whole owner
-            // exists to remove. Finish the transition the script started, and
-            // say so rather than doing it silently.
-            Some(IocLifecycle::Built(built)) => {
-                crate::runtime::log::errlog_printf(
-                    "iocInit: startup script built the IOC without running it; running it now\n",
-                );
-                Ok(built.run().await)
-            }
-            // The script's `iocInit`, or its `iocBuild` and `iocRun`, already
-            // did it. There is no second build to gate and no second decision
-            // to take: the script asked for the IOC to be built and run, which
-            // is what makes every line after those — and the protocol runner
-            // below — see a running IOC.
-            Some(IocLifecycle::Running(running)) => Ok(running),
-            Some(IocLifecycle::AsInitFailed) => Err(()),
-            Some(IocLifecycle::Failed(e)) => return Err(e.into()),
-            None => unreachable!(
-                "the lifecycle owner is armed before the startup script runs and \
-                 every transition puts a state back"
-            ),
+            .map_err(|e| CaError::InvalidValue(format!("could not start the _main_ thread: {e}")))?
         };
-        let running = match outcome {
-            Ok(running) => running,
-            // `iocBuild_2` returns -1, so `iocBuild` does, so `iocInit()`
-            // does — and a non-zero `iocInit()` is REPORTED, not fatal:
-            // C `softMain.cpp:239-243` prints one line and falls through to
-            // the same tail the never-built arm takes. Measured against
-            // R7.0.10.1-DEV with an unreadable ACF: interactive reaches the
-            // prompt and exits 0 on EOF, `-S` stays alive and listens on
-            // nothing, because `iocRun` — which starts RSRV — never ran.
-            Err(()) => {
-                return match decision {
-                    Some(decision) => {
-                        eprintln!("{} during iocInit()", crate::runtime::log::ERL_ERROR);
-                        run_uninitialized_tail(db, bridge, acf, decision.interactive).await
-                    }
-                    None => Err(IocRunFailure::Startup(CaError::InvalidValue(
-                        "iocBuild: asInit Failed.".into(),
-                    ))),
-                };
+        // A parked shell never answers; its error is in the lifecycle.
+        let end = tokio::select! {
+            end = soft_main => {
+                end.map_err(|_| CaError::InvalidValue("startup thread dropped".into()))?
             }
+            () = cannot_proceed(&mut cannot_proceed_rx) => match take_lifecycle() {
+                Some(IocLifecycle::Failed(e)) => return Err(e.into()),
+                _ => unreachable!("a shell signals only after putting its build error"),
+            },
         };
         // Held as a live local across everything below: the runner is already
         // serving, and a `?` from here on must stop it. `ProtocolServer`'s
         // `Drop` is what makes that true of a return this function does not
         // yet have.
-        let mut server = running.server;
-
-        // Phase 2e: drain `afterIocRunning` queue (epics-base PR #558).
-        // Each line is an iocsh command queued by the startup script;
-        // execute through a fresh shell so post-init state (including
-        // PINI side effects) is visible. It reads the same command table
-        // every other shell does, so a site-specific name like `motorReport`
-        // is addressable from the post-init queue with no re-registration.
-        let pending = db.take_after_ioc_running();
-        if !pending.is_empty() {
-            let db1 = db.clone();
-            let b1 = bridge.clone();
-            let acf1 = acf.clone();
-            let (tx, rx) = crate::runtime::sync::oneshot::channel();
-            // Mandatory for the same reason as "iocsh-startup": the queue holds
-            // commands the startup script deferred to post-init, so skipping it
-            // hands the operator an IOC that is missing part of its own boot.
-            // Still inside `run`, so the failure propagates rather than aborts.
-            crate::runtime::task::MandatoryThread::new(
-                "iocsh-after-ioc-running",
-                // Same reasoning as "iocsh-startup" above.
-                crate::runtime::task::ThreadPriority::Iocsh,
-                // Same reasoning as "iocsh-startup" above.
-                crate::runtime::task::StackSizeClass::Big,
-            )
-            .try_spawn(move || {
-                let shell = iocsh::IocShell::new_with_acf(db1, b1, acf1);
-                let mut errs: Vec<String> = Vec::new();
-                for line in pending {
-                    // A queued line fails in either of the two ways C's
-                    // `scope.errored` covers: with a diagnostic for the
-                    // caller to print (`Err`), or having already printed
-                    // its own (`CommandOutcome::Failed` — an unregistered
-                    // command reports itself at `iocsh.cpp:1302`, and the
-                    // `db*` commands that answer a bare non-zero do the
-                    // same). Reading only `Err` dropped the second kind
-                    // from this summary.
-                    match shell.execute_line(&line) {
-                        Err(e) => errs.push(format!("{line}: {e}")),
-                        Ok(iocsh::registry::CommandOutcome::Failed) => {
-                            errs.push(format!("{line}: failed"));
-                        }
-                        Ok(
-                            iocsh::registry::CommandOutcome::Continue
-                            | iocsh::registry::CommandOutcome::Exit,
-                        ) => {}
-                    }
+        let mut server = match end {
+            SoftMainEnd::Running(running) => running.server,
+            SoftMainEnd::NotRunning { interactive } => {
+                let ended =
+                    run_uninitialized_tail(db, bridge, acf, interactive, cannot_proceed_rx).await;
+                // An `iocInit` typed at the prompt started a runner, which
+                // queues a prompt of its own; stopped and joined here, it can
+                // queue none after `_prompt` closes.
+                if let Some(IocLifecycle::Running(running)) = take_lifecycle() {
+                    running.server.shut_down().await;
                 }
-                let _ = tx.send(errs);
-            })
-            .map_err(|e| {
-                CaError::InvalidValue(format!(
-                    "could not start the iocsh-after-ioc-running thread: {e}"
-                ))
-            })?;
-            if let Ok(errs) = rx.await {
-                for e in errs {
-                    eprintln!("afterIocRunning: {e}");
-                }
+                return ended;
             }
-        }
+            SoftMainEnd::Failed(e) => return Err(e),
+        };
 
         // Phase 3: what softMain does once `iocInit()` has returned — wait for
         // the process to be told to stop. The servers have been running since
@@ -2456,41 +3096,12 @@ impl IocApplication {
         // runner's own tail, which for `run_ca_ioc` and `run_pva_ioc` is the
         // interactive `iocsh(NULL)` of `softMain.cpp:250`.
         //
-        // epics-base PR #671 parity: race it against SIGTERM/SIGINT so a `kill`
-        // (or Ctrl+C on the controlling terminal) cleanly returns Ok(()) instead
-        // of leaving the future suspended forever. The CA/PVA runners already
-        // wire their own signal handlers when used standalone; this one covers
-        // the `IocApplication::run` entry point where the runner closure may
-        // not (e.g., a custom user runner that only sleeps on `pending()`).
-        // SIGINT/SIGTERM racing needs a tokio REACTOR, which is what
-        // `tokio_backend` names — not merely a non-embedded target.
-        // `tokio::signal` registers with the runtime's signal driver and
-        // PANICS ("there is no reactor running") when none is entered; it does
-        // not report that as the `Err` the `sigterm` arm below handles. On
-        // `exec_backend` these futures are polled on the park loop or a
-        // callback-band worker, neither of which enters a runtime, so both
-        // arms must be `pending()` there — including on a host build, where
-        // `cfg(unix)` holds and `epics_embedded_target` does not. `run` then
-        // simply awaits the runner; process-signal shutdown is the exec
-        // driver's concern (a later increment).
-        #[cfg(tokio_backend)]
-        let ctrl_c = async {
-            let _ = tokio::signal::ctrl_c().await;
-        };
-        #[cfg(not(tokio_backend))]
-        let ctrl_c = std::future::pending::<()>();
-        #[cfg(all(unix, tokio_backend))]
-        let sigterm = async {
-            if let Ok(mut sig) =
-                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            {
-                let _ = sig.recv().await;
-            } else {
-                std::future::pending::<()>().await;
-            }
-        };
-        #[cfg(not(all(unix, tokio_backend)))]
-        let sigterm = std::future::pending::<()>();
+        // Race it against SIGTERM/SIGINT so a `kill` stops the servers and
+        // reaches the exit callbacks; `run_phased` then re-raises the signal so
+        // the process ends killed by it, as a C IOC does.
+        use super::shutdown_signal::{ShutdownSignal, recv};
+        let sigterm = recv(ShutdownSignal::Terminate);
+        let ctrl_c = recv(ShutdownSignal::Interrupt);
 
         let outcome = tokio::select! {
             biased;
@@ -2500,11 +3111,11 @@ impl IocApplication {
             // whose failure is not the catch block's.
             res = server.wait() => Some(res),
             _ = ctrl_c => {
-                tracing::info!(target: "epics_base_rs::ioc_app", "SIGINT received, shutting down IOC");
+                tracing::debug!(target: "epics_base_rs::ioc_app", "SIGINT received, shutting down IOC");
                 None
             }
             _ = sigterm => {
-                tracing::info!(target: "epics_base_rs::ioc_app", "SIGTERM received, shutting down IOC");
+                tracing::debug!(target: "epics_base_rs::ioc_app", "SIGTERM received, shutting down IOC");
                 None
             }
         };
@@ -2536,12 +3147,19 @@ pub type DeviceSupportResolver =
 /// Fold the two registration shapes a builder collects — the DTYP-keyed
 /// context-free factories and the single dynamic factory — into the one
 /// lookup [`PvDatabase`] holds. DTYP-keyed first, dynamic as the fallback:
-/// the priority `attach_device_support` had.
+/// the priority `attach_device_support` had. Both are asked for the choice
+/// that serves the record's DTYP, so the init bind and a device-link put
+/// pass the field as stored and an empty one finds row 0
+/// (`dbDTYPtoDevSup`, `dbAccess.c:1052-1054`).
 pub(crate) fn device_support_resolver(
     factories: HashMap<String, DeviceSupportFactory>,
     dynamic_factory: Option<DynamicDeviceSupportFactory>,
 ) -> DeviceSupportResolver {
     Arc::new(move |ctx: &DeviceSupportContext| {
+        let ctx = &DeviceSupportContext {
+            dtyp: crate::server::record::served_choice(ctx.record_type, ctx.dtyp),
+            ..*ctx
+        };
         if let Some(factory) = factories.get(ctx.dtyp) {
             Some(factory())
         } else if let Some(dyn_factory) = dynamic_factory.as_ref() {
@@ -2575,30 +3193,35 @@ pub(crate) fn attach_device_support(
     resolve: Option<&DeviceSupportResolver>,
 ) -> bool {
     let dtyp = instance.common.dtyp.as_str().to_string();
-    if instance.common.dtyp.is_soft() {
+    if instance
+        .common
+        .dtyp
+        .bind(instance.record.record_type())
+        .is_some()
+    {
         // A soft channel needs no dset. Its `"Async Soft Channel"` variant
         // still owns an `add_record`, but that is C's `doResolveLinks` moment,
         // which sits BETWEEN the two init passes — so the init owner runs it,
         // not this one.
         return false;
     }
+    // A device address is text to its support; a name's bytes reach no
+    // dset through this context.
+    let (inp, out) = (
+        instance.common.text.inp.as_str_lossy(),
+        instance.common.text.out.as_str_lossy(),
+    );
     let ctx = DeviceSupportContext {
         record_type: instance.record.record_type(),
         dtyp: &dtyp,
-        inp: &instance.common.inp,
-        out: &instance.common.out,
+        inp: &inp,
+        out: &out,
     };
     let dev_opt = resolve.and_then(|resolve| resolve(&ctx));
     let Some(dev) = dev_opt else {
-        // Two reports, because C makes two and they answer different
-        // questions. This one is deliberately per RECORD, where C's `device
-        // support %s not found` is per DBD ENTRY: C's line names a `device()`
-        // line nobody linked and leaves the operator to find which records
-        // used it, while this names the record that will not work.
-        eprintln!("warning: no device support registered for DTYP '{dtyp}' (record: {name})");
-        // C's own per-record line, the one a site greps for by
-        // `recGblRecordError` and the one that carries the status. Silent for
-        // a record type that needs no device support — the table is the gate.
+        // C's per-record line, the one a site greps for by `recGblRecordError`
+        // and the one that carries the status. Silent for a record type that
+        // needs no device support — the table is the gate.
         crate::server::recgbl::rec_gbl_no_device_support(instance.record.record_type(), name);
         return false;
     };
@@ -2619,8 +3242,10 @@ pub(crate) fn attach_device_support(
 /// whose SNAM names nothing is exactly the same broken record on both.
 ///
 /// Both misses are `fprintf(stderr, "%s.SNAM " ERL_ERROR " function '%s' not
-/// found\n", ...)` in C — the console directly, not the errlog, which is why
-/// this writes `eprintln!` and not [`rec_gbl_record_error`]. The INAM half was
+/// found\n", ...)` in C — stderr, not the errlog, which is why this does not
+/// call [`rec_gbl_record_error`]. Whose stderr differs: aSubRecord.c includes
+/// `epicsStdio.h` (the building thread's, `err`), subRecord.c does not (the
+/// console). The INAM half was
 /// worded `iocInit: <name>.INAM function ... not found` here and the SNAM half
 /// was not written at all, so an IOC that booted with an unresolved SNAM said
 /// nothing and then processed the record as a no-op.
@@ -2628,7 +3253,7 @@ pub(crate) fn attach_device_support(
 /// Returns whether C's `init_record` REACHED ITS TAIL — `false` is C's `return
 /// S_db_BadSub` (either miss) and C's `prec->pact = TRUE; return 0` (an empty
 /// `sub` SNAM), both of which skip everything below them. The init owner
-/// ([`record::RecordInstance::run_init_passes`]) calls this from inside pass 1
+/// ([`record::RecordInstance::run_init_pass1`]) calls this from inside pass 1
 /// and honours the answer, so the tail is unreachable by construction rather
 /// than by a per-record-type opt-out.
 ///
@@ -2636,7 +3261,8 @@ pub(crate) fn attach_device_support(
 pub(crate) fn wire_subroutine(
     instance: &mut record::RecordInstance,
     name: &str,
-    registry: &HashMap<String, Arc<SubroutineFn>>,
+    registry: &HashMap<String, Arc<Subroutine>>,
+    err: &dyn Fn(&str),
 ) -> bool {
     // Both `sub` and `aSub` resolve their subroutine from SNAM via the
     // function registry at init (C `registryFunctionFind`).
@@ -2645,6 +3271,15 @@ pub(crate) fn wire_subroutine(
         return true;
     }
     let erl = crate::runtime::log::ERL_ERROR;
+    // aSubRecord.c includes epicsStdio.h, so its misses go to the building
+    // thread's stderr; subRecord.c does not, so its go to the console.
+    let miss = |line: String| {
+        if rt == "aSub" {
+            err(&line)
+        } else {
+            crate::stderr_println!("{line}")
+        }
+    };
     // INAM: invoke the init routine exactly once at init, before SNAM
     // resolution (C `init_record`: `registryFunctionFind(inam)` then
     // `(*psubroutine)(prec)`, return value discarded).
@@ -2658,13 +3293,13 @@ pub(crate) fn wire_subroutine(
         let inam = inam_field.as_str_lossy();
         if !inam.is_empty() {
             let Some(init_fn) = registry.get(inam.as_ref()) else {
-                eprintln!("{name}.INAM {erl} function '{inam}' not found");
+                miss(format!("{name}.INAM {erl} function '{inam}' not found"));
                 return false;
             };
+            // `subRecord.c:116`, `aSubRecord.c:143`: the status is dropped
+            // and nothing is printed, whatever the routine returned.
             let init_fn = init_fn.clone();
-            if let Err(e) = init_fn(&mut *instance.record) {
-                eprintln!("iocInit: {name}.INAM '{inam}' init routine failed: {e}");
-            }
+            let _ = instance.call_subroutine(&init_fn);
         }
     }
     // C resolves SNAM at init only for a record that will USE the resolution:
@@ -2690,7 +3325,7 @@ pub(crate) fn wire_subroutine(
             // through to the tail below.
             instance.subroutine = None;
             if rt == "sub" {
-                crate::runtime::log::errlog_printf(&format!("{name}.SNAM is empty\n"));
+                crate::runtime::log::errlog_vprintf(format_args!("{name}.SNAM is empty\n"));
                 instance.enter_pact();
                 return false;
             }
@@ -2701,7 +3336,7 @@ pub(crate) fn wire_subroutine(
             // — the second early return past the tail.
             instance.subroutine = registry.get(snam.as_ref()).cloned();
             if instance.subroutine.is_none() {
-                eprintln!("{name}.SNAM {erl} function '{snam}' not found");
+                miss(format!("{name}.SNAM {erl} function '{snam}' not found"));
                 return false;
             }
         }
@@ -2725,6 +3360,9 @@ pub(crate) fn wire_subroutine(
                 }
             }
         }
+        // `aSubRecord.c:163`: `prec->oval = prec->val`, so the first
+        // `monitor()` posts VAL only if it moved since init.
+        //
         // `aSubRecord.c:162`: `strcpy(prec->onam, prec->snam)`. That seed is
         // what gives `fetch_values`' `strcmp(prec->snam, prec->onam)` (`:261`)
         // its meaning — "the SUBL link delivered a name different from the one
@@ -2735,6 +3373,9 @@ pub(crate) fn wire_subroutine(
         _ => {
             if let Some(snam_field) = instance.record.get_field("SNAM") {
                 let _ = instance.record.put_field("ONAM", snam_field);
+            }
+            if let Some(val) = instance.record.get_field("VAL") {
+                let _ = instance.record.put_field("OVAL", val);
             }
         }
     }
@@ -2752,7 +3393,8 @@ pub(crate) fn wire_subroutine(
 /// `update_scan_index`, so the record also leaves the `IoIntr` scan bucket that
 /// `scanpiol` and `dbla` report from.
 ///
-/// `message` is C's `pmessage` verbatim, trailing space included, and the
+/// `message` is C's `pmessage` verbatim, trailing space included (`None` for
+/// a hook that declined, which C demotes without a line), and the
 /// report goes through [`rec_gbl_record_error`] rather than being spelt out
 /// here. Both matter to a site: C's line is `recGblRecordError: <message>
 /// <errSym> PV: <name>` and it goes to the *errlog*, so an operator grepping
@@ -2762,17 +3404,14 @@ pub(crate) fn wire_subroutine(
 /// demotion is `scanAdd`'s documented behaviour, not news.
 ///
 /// [`rec_gbl_record_error`]: crate::server::recgbl::rec_gbl_record_error
-async fn demote_io_intr_to_passive(db: &PvDatabase, name: &str, message: &str) {
+async fn demote_io_intr_to_passive(db: &PvDatabase, name: &[u8], message: Option<&str>) {
     let Some(rec_arc) = db.get_record(name) else {
         return;
     };
-    let result = {
-        let mut inst = rec_arc.write();
-        if inst.common.scan != record::ScanType::IoIntr {
-            return;
-        }
-        inst.set_scan(record::ScanType::Passive)
-    };
+    let result = rec_arc.write().demote_io_intr_scan();
+    if matches!(result, record::CommonFieldPutResult::NoChange) {
+        return;
+    }
     if let record::CommonFieldPutResult::ScanChanged {
         old_scan,
         new_scan,
@@ -2783,17 +3422,21 @@ async fn demote_io_intr_to_passive(db: &PvDatabase, name: &str, message: &str) {
     }
     // C passes `-1`, for which `errSymLookup` is skipped and the slot is
     // empty (`recGbl.c:65-70`) — hence the doubled space in C's own output.
-    crate::server::recgbl::rec_gbl_record_error("", name, message);
+    if let Some(message) = message {
+        crate::server::recgbl::rec_gbl_record_error("", &String::from_utf8_lossy(name), message);
+    }
 }
 
 /// Set up I/O Intr scanning for records with SCAN="I/O Intr".
 ///
-/// The single owner of that wiring — `IocBuilder` calls this too, so the C
-/// `scanAdd` failure paths cannot be present on one startup route and absent on
-/// the other.
+/// The single owner of that wiring, reached through [`scan_init`] by every
+/// build path, so the C `scanAdd` failure paths cannot be present on one
+/// startup route and absent on another.
 pub(crate) async fn setup_io_intr(db: Arc<PvDatabase>) -> usize {
-    let all_names = db.all_record_names().await;
-    let io_intr_recs: Vec<(String, Arc<record::RecordCell>)> = {
+    db.scan_control().build_lists();
+    // `buildScanLists` order (`dbScan.c:1054-1076`), so the refusals print in C's.
+    let all_names = db.iterate_record_names().await;
+    let io_intr_recs: Vec<(crate::types::RecordName, Arc<record::RecordCell>)> = {
         let mut recs = Vec::new();
         for name in &all_names {
             if let Some(arc) = db.get_record(name) {
@@ -2808,7 +3451,7 @@ pub(crate) async fn setup_io_intr(db: Arc<PvDatabase>) -> usize {
     // demotion runs after the loop: it takes the registration mutex and the
     // records map (`update_scan_index`), which must not be entered while this
     // loop holds a record's write guard.
-    let mut demote: Vec<(String, &'static str)> = Vec::new();
+    let mut demote: Vec<(crate::types::RecordName, Option<&'static str>)> = Vec::new();
     for (name, rec_arc) in io_intr_recs {
         let mut inst = rec_arc.write();
         // Wire poll feedback when the record is on I/O Intr scan, OR when the
@@ -2817,8 +3460,6 @@ pub(crate) async fn setup_io_intr(db: Arc<PvDatabase>) -> usize {
         // #60/#208). The device's decision is authoritative — the SCAN check
         // alone would suppress callbacks for a SCAN="Passive" motor, breaking
         // the pp(TRUE) dbPutField re-process gate.
-        // NOTE: property-post wiring (setup_property_posts) is a separate
-        // pass — an enum re-propagation callback is independent of SCAN.
         let independent = inst
             .device
             .as_ref()
@@ -2827,63 +3468,27 @@ pub(crate) async fn setup_io_intr(db: Arc<PvDatabase>) -> usize {
         if !on_io_intr && !independent {
             continue;
         }
-        let Some(mut dev) = inst.device.take() else {
-            // C `dbScan.c:272-276` — `precord->dset == NULL`. The trailing
-            // space is C's literal (`dbScan.c:275`), not a typo.
-            if on_io_intr {
-                demote.push((name, "scanAdd: I/O Intr not valid (no DSET) "));
+        if let Some(dev) = inst.device.as_mut() {
+            dev.bind_interrupt_gate(db.scan_control().interrupt_gate());
+            dev.bind_dev_sup_gate(db.scan_control().dev_sup_gate());
+        }
+        if !on_io_intr {
+            if inst.wire_io_intr_pump() {
+                count += 1;
             }
             continue;
-        };
-        if let Some(mut intr_rx) = dev.io_intr_receiver() {
-            let db_clone = db.clone();
-            let rec_name = name.clone();
-            let rec_arc_clone = rec_arc.clone();
-            // C keeps one I/O Intr scan list per band and fires
-            // `callbackRequest` on the band the record joined —
-            // `callbackSetPriority(prio, &piosl->callback)` (`dbScan.c:597`),
-            // with `scanAdd` filing the record under `precord->prio`. This
-            // pump is per record, so the record's own band is the list it
-            // would be on.
-            let prio = inst.common.callback_priority();
-            crate::runtime::task::spawn_background(prio, async move {
-                while intr_rx.recv().await.is_some() {
-                    // C `scanIoRequest` (`dbScan.c:616-618`): an I/O Intr
-                    // callback queues nothing while the scan facility is
-                    // not running, which is what `interruptAccept` buys a
-                    // building or paused IOC.
-                    if !crate::server::scan::scan_is_running() {
-                        continue;
-                    }
-                    // Process if the device drives SCAN-independently,
-                    // or the record is still on I/O Intr scan.
-                    let process = independent || {
-                        let inst = rec_arc_clone.read();
-                        inst.common.scan == record::ScanType::IoIntr
-                    };
-                    if !process {
-                        continue;
-                    }
-                    let mut visited = crate::server::database::ProcStack::new();
-                    // Driver-callback cycle: an output (`asyn:READBACK`)
-                    // record reads the value back into VAL and skips the
-                    // device write; input records are unaffected.
-                    let _ = db_clone
-                        .process_record_readback(&rec_name, &mut visited)
-                        .await;
-                }
-            });
-            count += 1;
-        } else if on_io_intr {
-            // C `dbScan.c:278-293` — device support with no `get_ioint_info`,
-            // or one whose `get_ioint_info` yields no scan list. The port
-            // collapses all three into "the device offers no interrupt
-            // receiver"; the observable is the same demotion, and the message
-            // is C's first and dominant case (`dbScan.c:281-282`), the one a
-            // device support that never implemented the hook produces.
-            demote.push((name, "scanAdd: I/O Intr not valid (no get_ioint_info)"));
         }
-        inst.device = Some(dev);
+        let add = inst.scan_add_io_intr();
+        let (mut inst, added) = db.settle_scan_add(&rec_arc, inst, add);
+        match added {
+            Ok(()) => {
+                count += 1;
+                if !inst.record.io_intr_scan_add() {
+                    demote.push((name, None));
+                }
+            }
+            Err(message) => demote.push((name, message)),
+        }
     }
     for (name, message) in demote {
         demote_io_intr_to_passive(&db, &name, message).await;
@@ -2891,42 +3496,65 @@ pub(crate) async fn setup_io_intr(db: Arc<PvDatabase>) -> usize {
     count
 }
 
-/// Spawn the out-of-band PROPERTY-post drains for every device exposing a
-/// [`DeviceSupport::property_post_receiver`] (asyn enum-string runtime
-/// re-propagation). C `registerInterruptUser(callbackEnum)` registers the
-/// callback at init; the per-record callback re-applies the enum table and
-/// `db_post_events(DBE_PROPERTY)` independently of `SCAN`. This mirrors
-/// [`setup_io_intr`]: the device owns the source subscription (the asyn
-/// interrupt) and yields a channel of [`PropertyPost`]s; the framework owns
-/// the post (`post_property`). Returns the number of drains wired.
-///
-/// [`PropertyPost`]: crate::server::device_support::PropertyPost
-pub(crate) async fn setup_property_posts(db: Arc<PvDatabase>) -> usize {
-    let names = db.all_record_names().await;
-    let mut count = 0;
-    for name in names {
-        if let Some(rec_arc) = db.get_record(&name) {
-            let mut inst = rec_arc.write();
-            if let Some(mut dev) = inst.device.take() {
-                if let Some(mut rx) = dev.property_post_receiver() {
-                    let db_clone = db.clone();
-                    let rec_name = name.clone();
-                    let prio = inst.common.callback_priority();
-                    crate::runtime::task::spawn_background(prio, async move {
-                        // Each message is the setEnums field block plus the
-                        // one field C posts on; DBE_PROPERTY on that field is
-                        // what makes clients re-read the choices.
-                        while let Some(post) = rx.recv().await {
-                            let _ = db_clone.post_property(&rec_name, post);
+/// The task behind [`record::RecordInstance::wire_io_intr_pump`]: each wake
+/// the device sends is C `scanIoRequest` on the list the record joined.
+pub(crate) fn spawn_io_intr_pump(
+    db: PvDatabase,
+    rec_name: crate::types::RecordName,
+    rec: Arc<record::RecordCell>,
+    mut intr_rx: crate::runtime::sync::mpsc::Receiver<()>,
+    // C keeps one I/O Intr scan list per band and fires `callbackRequest` on
+    // the band the record joined — `callbackSetPriority(prio,
+    // &piosl->callback)` (`dbScan.c:597`), with `scanAdd` filing the record
+    // under `precord->prio`. This pump is per record, so the record's own
+    // band is the list it would be on.
+    prio: crate::runtime::task::CallbackPriority,
+    direct: bool,
+    independent: bool,
+) -> crate::runtime::task::BackgroundTaskHandle<()> {
+    let mut turns = db.register_io_intr_pump(&rec);
+    crate::runtime::task::spawn_background(prio, async move {
+        // One interrupt's pass.
+        let pump = async || {
+            // C `scanIoRequest` (`dbScan.c:616-618`): an I/O Intr callback
+            // queues nothing while the scan facility is not running, which is
+            // what `interruptAccept` buys a building or paused IOC. A
+            // device's own `dbProcess` passes no such gate.
+            if !direct && !db.scan_control().is_running() {
+                return;
+            }
+            // Process if the device drives SCAN-independently, or the record
+            // is still on I/O Intr scan.
+            if !independent && rec.read().common.scan != record::ScanType::IoIntr {
+                return;
+            }
+            let mut visited = crate::server::database::ProcStack::new();
+            // Driver-callback cycle: an output (`asyn:READBACK`) record reads
+            // the value back into VAL and skips the device write; input
+            // records are unaffected.
+            let _ = db.process_record_readback(&rec_name, &mut visited).await;
+        };
+        // A turn is served after the interrupts queued when it was taken, so
+        // a first event behind them sees what they did.
+        loop {
+            tokio::select! {
+                biased;
+                Some(turn) = turns.recv() => {
+                    for _ in 0..intr_rx.len() {
+                        if intr_rx.recv().await.is_none() {
+                            break;
                         }
-                    });
-                    count += 1;
+                        pump().await;
+                    }
+                    let _ = turn.send(());
                 }
-                inst.device = Some(dev);
+                woke = intr_rx.recv() => match woke {
+                    Some(()) => pump().await,
+                    None => break,
+                },
             }
         }
-    }
-    count
+    })
 }
 
 #[cfg(test)]
@@ -2937,9 +3565,9 @@ mod io_intr_scan_add_tests {
     use crate::server::records::ai::AiRecord;
     use std::sync::Arc;
 
-    /// R6-8 — C `scanAdd` (`dbScan.c:272-276`): a `SCAN="I/O Intr"` record with
-    /// no device support (`precord->dset == NULL`) is reported with
-    /// `recGblRecordError` and **demoted to `menuScanPassive`**. It must not be
+    /// R6-8 — C `scanAdd` (`dbScan.c:272-282`): a `SCAN="I/O Intr"` record with
+    /// no device object (here a soft ai, whose C dset has no `get_ioint_info`)
+    /// is reported with `recGblRecordError` and **demoted to `menuScanPassive`**. It must not be
     /// left claiming I/O Intr, and must not stay in the I/O Intr scan bucket
     /// that `scanpiol` reports from.
     #[epics_macros_rs::epics_test]
@@ -2953,7 +3581,7 @@ mod io_intr_scan_add_tests {
             let mut inst = rec.write();
             inst.common.scan = ScanType::IoIntr;
         }
-        db.update_scan_index("NODEV", ScanType::Passive, ScanType::IoIntr, 0, 0);
+        db.update_scan_index(b"NODEV", ScanType::Passive, ScanType::IoIntr, 0, 0);
         assert_eq!(
             db.records_for_scan(ScanType::IoIntr).await,
             vec!["NODEV".to_string()],
@@ -2977,10 +3605,7 @@ mod io_intr_scan_add_tests {
     }
 
     /// R6-8 — C `scanAdd` (`dbScan.c:278-293`): device support that supplies no
-    /// interrupt source (`get_ioint_info == NULL`, or it returns non-zero, or it
-    /// yields a NULL scan list) is the same failure exit — log and demote. The
-    /// port collapses those three C cases into "the device offers no
-    /// `io_intr_receiver`", so this covers all of them.
+    /// interrupt source is demoted to Passive.
     #[epics_macros_rs::epics_test]
     async fn io_intr_with_device_but_no_interrupt_source_is_demoted_to_passive() {
         use crate::error::CaResult;
@@ -3008,7 +3633,7 @@ mod io_intr_scan_add_tests {
             inst.common.scan = ScanType::IoIntr;
             inst.device = Some(Box::new(NoIntrDevice));
         }
-        db.update_scan_index("NOINTR", ScanType::Passive, ScanType::IoIntr, 0, 0);
+        db.update_scan_index(b"NOINTR", ScanType::Passive, ScanType::IoIntr, 0, 0);
 
         let wired = setup_io_intr(db.clone()).await;
         assert_eq!(wired, 0, "no interrupt source ⇒ nothing to wire");
@@ -3027,6 +3652,455 @@ mod io_intr_scan_add_tests {
             );
         }
         assert!(db.records_for_scan(ScanType::IoIntr).await.is_empty());
+    }
+
+    /// A device that hands out a pulse receiver and also has a callback under
+    /// its record's lock, counting both.
+    mod callback_dev {
+        use crate::error::CaResult;
+        use crate::runtime::sync::mpsc;
+        use crate::server::device_support::{
+            DevicePost, DeviceReadOutcome, DeviceSupport, DeviceUdf, IoIntrAction,
+        };
+        use crate::server::record::{CommonFields, Record};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        pub struct Seen {
+            pub callbacks: AtomicUsize,
+            pub answer: Mutex<IoIntrAction>,
+            pub callback_thread: Mutex<Option<std::thread::ThreadId>>,
+            pub read_thread: Mutex<Option<std::thread::ThreadId>>,
+            pub log: Mutex<Vec<&'static str>>,
+            /// Run inside the callback, under the record's lock.
+            pub inside: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+            /// Posted by the callback.
+            pub post: Mutex<Option<DevicePost>>,
+        }
+        impl Default for Seen {
+            fn default() -> Self {
+                Seen {
+                    callbacks: AtomicUsize::new(0),
+                    answer: Mutex::new(IoIntrAction::Skip),
+                    callback_thread: Mutex::default(),
+                    read_thread: Mutex::default(),
+                    log: Mutex::default(),
+                    inside: Mutex::default(),
+                    post: Mutex::default(),
+                }
+            }
+        }
+        pub struct CallbackDev {
+            pub seen: Arc<Seen>,
+            pub pulses: Option<mpsc::Receiver<()>>,
+            pub posts: Vec<DevicePost>,
+        }
+        impl DeviceSupport for CallbackDev {
+            fn dtyp(&self) -> &str {
+                "Callback"
+            }
+            fn io_intr_receiver(&mut self) -> Option<mpsc::Receiver<()>> {
+                self.pulses.take()
+            }
+            fn io_intr_scan_independent(&self) -> bool {
+                true
+            }
+            fn io_intr_callback(
+                &mut self,
+                _record: &mut dyn Record,
+                _common: &mut CommonFields,
+            ) -> IoIntrAction {
+                self.seen.callbacks.fetch_add(1, Ordering::SeqCst);
+                *self.seen.callback_thread.lock().unwrap() = Some(std::thread::current().id());
+                self.seen.log.lock().unwrap().push("callback");
+                if let Some(inside) = self.seen.inside.lock().unwrap().take() {
+                    inside();
+                }
+                self.posts.extend(self.seen.post.lock().unwrap().take());
+                *self.seen.answer.lock().unwrap()
+            }
+            fn take_device_posts(&mut self) -> Vec<DevicePost> {
+                std::mem::take(&mut self.posts)
+            }
+            fn read(&mut self, _record: &mut dyn Record) -> CaResult<DeviceReadOutcome> {
+                *self.seen.read_thread.lock().unwrap() = Some(std::thread::current().id());
+                self.seen.log.lock().unwrap().push("read");
+                Ok(DeviceReadOutcome::computed(DeviceUdf::Defined))
+            }
+            fn write(&mut self, _record: &mut dyn Record) -> CaResult<()> {
+                Ok(())
+            }
+        }
+    }
+
+    async fn callback_db(
+        pulses: Option<crate::runtime::sync::mpsc::Receiver<()>>,
+    ) -> (Arc<PvDatabase>, Arc<callback_dev::Seen>) {
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("CB", Box::new(AiRecord::new(0.0)))
+            .await
+            .unwrap();
+        let seen = Arc::new(callback_dev::Seen::default());
+        let rec = db.get_record("CB").unwrap();
+        let mut inst = rec.write();
+        inst.common.dtyp = "Callback".into();
+        inst.device = Some(Box::new(callback_dev::CallbackDev {
+            seen: seen.clone(),
+            pulses,
+            posts: Vec::new(),
+        }));
+        drop(inst);
+        (db, seen)
+    }
+
+    /// A pulse is C's `scanIoRequest`: it processes the record and runs no
+    /// device code under the lock first (dbScan.c:604-627).
+    #[epics_macros_rs::epics_test]
+    async fn a_pulse_processes_without_the_device_callback() {
+        let (pulse, pulses) = crate::runtime::sync::mpsc::channel(1);
+        let (db, seen) = callback_db(Some(pulses)).await;
+        assert_eq!(setup_io_intr(db.clone()).await, 1);
+        db.scan_control().run();
+
+        pulse.send(()).await.unwrap();
+        while seen.log.lock().unwrap().is_empty() {
+            crate::runtime::task::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(*seen.log.lock().unwrap(), ["read"]);
+        assert_eq!(seen.callbacks.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    /// devEtherIP's check callbacks and devMotorAsyn's `asynCallback` take
+    /// `dbScanLock` on the driver thread and run there (drvEtherIP.c:819-823,
+    /// devMotorAsyn.c:717-726): the callback waits for the lock, runs on the
+    /// caller's thread, and a `Process` answer is `dbProcess` before the lock
+    /// is let go, so a thread waiting for it sees the pass done; `ScanOnce`
+    /// processes on the `scanOnce` thread instead.
+    #[epics_macros_rs::epics_test]
+    async fn the_device_callback_runs_on_the_driver_thread_inside_one_hold() {
+        use std::sync::atomic::Ordering;
+        let (db, seen) = callback_db(None).await;
+        let handle = db.async_handle();
+        use crate::server::device_support::IoIntrRun;
+        let driver = |handle: crate::server::database::AsyncDbHandle| {
+            let t = std::thread::spawn(move || handle.run_io_intr_callback("CB"));
+            let id = t.thread().id();
+            assert_eq!(t.join().unwrap(), IoIntrRun::Ran);
+            id
+        };
+
+        // Before finishDevSup nothing runs, and the caller is told.
+        assert_eq!(handle.run_io_intr_callback("CB"), IoIntrRun::Refused);
+        assert_eq!(seen.callbacks.load(Ordering::SeqCst), 0);
+        db.scan_control().finish_dev_sup();
+        assert_eq!(handle.run_io_intr_callback("NONE"), IoIntrRun::Refused);
+
+        // Skip: the callback ran on the driver thread and nothing processed.
+        let id = driver(handle.clone());
+        assert_eq!(*seen.callback_thread.lock().unwrap(), Some(id));
+        assert_eq!(*seen.log.lock().unwrap(), ["callback"]);
+
+        // Held elsewhere: the driver thread waits for the lock.
+        let held = db.lock_record("CB");
+        let waiting = std::thread::spawn({
+            let handle = handle.clone();
+            move || handle.run_io_intr_callback("CB")
+        });
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(
+            seen.callbacks.load(Ordering::SeqCst),
+            1,
+            "ran under a held lock"
+        );
+        drop(held);
+        waiting.join().unwrap();
+        assert_eq!(seen.callbacks.load(Ordering::SeqCst), 2);
+
+        // Process: a thread that asks for the lock from inside the callback
+        // gets it only after the pass.
+        seen.log.lock().unwrap().clear();
+        *seen.answer.lock().unwrap() = crate::server::device_support::IoIntrAction::Process;
+        let (asked, asking) = std::sync::mpsc::channel();
+        let (other_tx, other) = std::sync::mpsc::channel();
+        *seen.inside.lock().unwrap() = Some(Box::new({
+            let db = db.clone();
+            let seen = seen.clone();
+            move || {
+                let _ = other_tx.send(std::thread::spawn(move || {
+                    asked.send(()).unwrap();
+                    let _gate = db.lock_record("CB");
+                    seen.log.lock().unwrap().push("other");
+                }));
+                asking.recv().unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }));
+        let id = driver(handle.clone());
+        other.recv().unwrap().join().unwrap();
+        assert_eq!(*seen.log.lock().unwrap(), ["callback", "read", "other"]);
+        assert_eq!(*seen.read_thread.lock().unwrap(), Some(id));
+
+        // ScanOnce: the pass runs on the scanOnce thread.
+        seen.log.lock().unwrap().clear();
+        *seen.answer.lock().unwrap() = crate::server::device_support::IoIntrAction::ScanOnce;
+        let id = driver(handle);
+        while seen.log.lock().unwrap().len() < 2 {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(*seen.log.lock().unwrap(), ["callback", "read"]);
+        assert_ne!(*seen.read_thread.lock().unwrap(), Some(id));
+    }
+
+    /// devAsynInt32's `interruptCallbackEnum*` re-keys the states and posts
+    /// DBE_PROPERTY on VAL under `dbScanLock` (devAsynInt32.c:712-766): what
+    /// the callback posts reaches a monitor before the call returns.
+    #[epics_macros_rs::epics_test]
+    async fn a_post_the_device_callback_makes_goes_out_inside_the_hold() {
+        use crate::server::database::db_access::DbSubscription;
+        use crate::server::recgbl::EventMask;
+        let (db, seen) = callback_db(None).await;
+        db.scan_control().finish_dev_sup();
+        let mut sub = DbSubscription::subscribe_with_mask(&db, "CB", 0, EventMask::PROPERTY.bits())
+            .await
+            .unwrap();
+        while sub.try_recv_event().is_ok() {}
+        *seen.post.lock().unwrap() = Some(crate::server::device_support::DevicePost {
+            field: "VAL",
+            mask: EventMask::PROPERTY,
+            value: crate::types::EpicsValue::Double(0.0),
+        });
+        let handle = db.async_handle();
+        std::thread::spawn(move || handle.run_io_intr_callback("CB"))
+            .join()
+            .unwrap();
+        assert!(sub.try_recv_event().is_ok(), "no PROPERTY event");
+        assert_eq!(*seen.log.lock().unwrap(), ["callback"]);
+    }
+
+    /// `setEnums` from an enum callback re-keys the states under the hold
+    /// (devAsynInt32.c:712-766): the next read of the record's metadata has
+    /// the new labels, and the one PROPERTY post goes out before the call
+    /// returns.
+    #[epics_macros_rs::epics_test]
+    async fn a_property_put_from_the_callback_reaches_the_metadata() {
+        use crate::server::database::db_access::DbSubscription;
+        use crate::server::device_support::{IoIntrAction, PropertyPost};
+        use crate::server::recgbl::EventMask;
+        let db = Arc::new(PvDatabase::new());
+        db.add_record(
+            "EN",
+            Box::new(crate::server::records::mbbi::MbbiRecord::new(0)),
+        )
+        .await
+        .unwrap();
+        db.scan_control().finish_dev_sup();
+        let mut sub = DbSubscription::subscribe_with_mask(&db, "EN", 0, EventMask::PROPERTY.bits())
+            .await
+            .unwrap();
+        while sub.try_recv_event().is_ok() {}
+        let handle = db.async_handle();
+        std::thread::spawn(move || {
+            handle.run_io_intr_callback_with("EN", |held| {
+                held.put_property(PropertyPost {
+                    writes: vec![(
+                        "ZRST".into(),
+                        crate::types::EpicsValue::String("LABEL".into()),
+                    )],
+                    post_field: "VAL".into(),
+                })
+                .unwrap();
+                IoIntrAction::Skip
+            })
+        })
+        .join()
+        .unwrap();
+        assert!(sub.try_recv_event().is_ok(), "no PROPERTY event");
+        let snap = db
+            .get_record("EN")
+            .unwrap()
+            .read()
+            .snapshot_for_field("VAL")
+            .unwrap();
+        assert_eq!(snap.enums.unwrap().strings[0].as_str_lossy(), "LABEL");
+    }
+
+    /// A port without `ASYN_CANBLOCK` runs devMotorAsyn's `asynCallback`
+    /// inline from the dset write, and the driver's `statusCallback` from
+    /// inside its write (devMotorAsyn.c:641, 717-726, 755-762): on the
+    /// processing thread, under a recursive `dbScanLock`.
+    mod inline_status_dev {
+        use crate::error::CaResult;
+        use crate::server::database::{AsyncDbHandle, DeviceDoneSource, HeldInstance};
+        use crate::server::device_support::{DevicePost, DeviceSupport, IoIntrAction, WriteStart};
+        use crate::server::recgbl::EventMask;
+        use crate::server::record::{CommonFields, Record};
+        use crate::server::records::ao::AoRecord;
+        use crate::types::EpicsValue;
+        use std::sync::{Arc, Mutex};
+
+        pub struct InlineStatusDev {
+            pub handle: AsyncDbHandle,
+            /// The status the driver calls back with after a write, one
+            /// callback each.
+            pub statuses: Vec<i32>,
+            pub lends: bool,
+            pub log: Arc<Mutex<Vec<String>>>,
+            /// The parameter the port's callback hands the device.
+            pub param: Arc<Mutex<i32>>,
+            pub posts: Vec<DevicePost>,
+        }
+
+        impl InlineStatusDev {
+            fn write_to_port(&mut self) {
+                self.log.lock().unwrap().push("write".into());
+                for &value in &self.statuses {
+                    let param = self.param.clone();
+                    self.handle.run_io_intr_callback_with("SP", move |held| {
+                        held.with_device(|record, common, dev| {
+                            *param.lock().unwrap() = value;
+                            dev.io_intr_callback(record, common)
+                        })
+                        .unwrap_or(IoIntrAction::Skip)
+                    });
+                }
+                self.log.lock().unwrap().push("write returns".into());
+            }
+        }
+
+        impl DeviceSupport for InlineStatusDev {
+            fn dtyp(&self) -> &str {
+                "InlineStatus"
+            }
+            fn io_intr_callback(
+                &mut self,
+                record: &mut dyn Record,
+                _common: &mut CommonFields,
+            ) -> IoIntrAction {
+                let value = *self.param.lock().unwrap();
+                self.log.lock().unwrap().push(format!("callback {value}"));
+                record
+                    .as_any_mut()
+                    .and_then(|any| any.downcast_mut::<AoRecord>())
+                    .unwrap()
+                    .rbv = value;
+                self.posts.push(DevicePost {
+                    field: "RBV",
+                    mask: EventMask::VALUE,
+                    value: EpicsValue::Long(value),
+                });
+                IoIntrAction::Skip
+            }
+            fn take_device_posts(&mut self) -> Vec<DevicePost> {
+                std::mem::take(&mut self.posts)
+            }
+            fn lends_held(&self) -> bool {
+                self.lends
+            }
+            fn write_begin_held(
+                &mut self,
+                _held: &HeldInstance<'_>,
+                _done: &DeviceDoneSource<'_>,
+            ) -> CaResult<WriteStart> {
+                self.write_to_port();
+                Ok(WriteStart::Completed)
+            }
+            fn write(&mut self, _record: &mut dyn Record) -> CaResult<()> {
+                self.write_to_port();
+                Ok(())
+            }
+        }
+    }
+
+    /// A status callback from inside the write lands as under C's recursive
+    /// `dbScanLock`: once the dset call returns, in the order the driver
+    /// called back, each value posted ahead of the cycle's monitor.
+    async fn inline_status_lands(lends: bool) {
+        use crate::server::database::db_access::DbSubscription;
+        use crate::server::recgbl::EventMask;
+        let db = Arc::new(PvDatabase::new());
+        db.add_record(
+            "SP",
+            Box::new(crate::server::records::ao::AoRecord::new(1.0)),
+        )
+        .await
+        .unwrap();
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        {
+            let rec = db.get_record("SP").unwrap();
+            let mut inst = rec.write();
+            inst.common.dtyp = "InlineStatus".into();
+            inst.device = Some(Box::new(inline_status_dev::InlineStatusDev {
+                handle: db.async_handle(),
+                statuses: vec![7, 9],
+                lends,
+                log: log.clone(),
+                param: Arc::default(),
+                posts: Vec::new(),
+            }));
+        }
+        db.scan_control().finish_dev_sup();
+        let mut sub =
+            DbSubscription::subscribe_with_mask(&db, "SP.RBV", 0, EventMask::VALUE.bits())
+                .await
+                .unwrap();
+        while sub.try_recv_event().is_ok() {}
+
+        db.process_record("SP").await.unwrap();
+
+        assert_eq!(
+            *log.lock().unwrap(),
+            ["write", "write returns", "callback 7", "callback 9"]
+        );
+        let rec = db.get_record("SP").unwrap();
+        let rbv = rec.read().record.get_field("RBV");
+        assert_eq!(rbv, Some(crate::types::EpicsValue::Long(9)));
+        let mut posted = Vec::new();
+        while let Ok(event) = sub.try_recv_event() {
+            posted.push(event.value().as_value().and_then(|v| v.to_f64()));
+        }
+        // Each callback's post, then the cycle's own: the readback landed
+        // ahead of `monitor`, which posts RBV as it changed (aoRecord.c:544).
+        assert_eq!(posted, [Some(7.0), Some(9.0), Some(9.0)]);
+    }
+
+    #[epics_macros_rs::epics_test]
+    async fn a_status_callback_from_inside_the_write_lands() {
+        inline_status_lands(false).await;
+    }
+
+    #[epics_macros_rs::epics_test]
+    async fn a_status_callback_from_inside_a_lent_write_lands() {
+        inline_status_lands(true).await;
+    }
+
+    /// A callback owed from outside any dset call, here a driver thread's own
+    /// hold of the record, runs when that hold lets the set go: the queue is
+    /// empty whenever the set is free.
+    #[epics_macros_rs::epics_test]
+    async fn a_callback_owed_outside_a_dset_call_runs_before_the_set_is_let_go() {
+        use crate::server::device_support::IoIntrAction;
+        let (db, _seen) = callback_db(None).await;
+        db.scan_control().finish_dev_sup();
+        let handle = db.async_handle();
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        std::thread::spawn({
+            let log = log.clone();
+            move || {
+                handle.with_instance("CB", |_, _| {
+                    let inner = log.clone();
+                    let run = handle.run_io_intr_callback_with("CB", move |held| {
+                        held.with(|_, _| inner.lock().unwrap().push("callback"));
+                        IoIntrAction::Skip
+                    });
+                    assert_eq!(run, crate::server::device_support::IoIntrRun::Owed);
+                    log.lock().unwrap().push("hold ends");
+                });
+                log.lock().unwrap().push("returned");
+            }
+        })
+        .join()
+        .unwrap();
+        assert_eq!(*log.lock().unwrap(), ["hold ends", "callback", "returned"]);
     }
 
     /// The demotion is scoped to the failure exits: a record that was never on
@@ -3087,48 +4161,32 @@ mod tests {
 
     /// # Invariant
     ///
-    /// MUST: every thread this module creates take its band **and** its OS
-    /// name through `enter_ioc_thread`. MUST NOT: an iocsh thread run at the
-    /// priority it inherited from `POSIX_Init`.
+    /// MUST: every iocsh body this module runs — the startup script with the
+    /// `afterIocRunning` queue its `iocInit` drains, and the `iocsh(NULL)`
+    /// prompts — run as a job on the one `_main_` thread
+    /// (`runtime::task::run_on_main_thread`), as C runs them on one thread in
+    /// `main`'s statement order. MUST NOT: a thread of its own for any of
+    /// them; a second thread is a second `_main_` row, and a prompt that can
+    /// open before the script has returned.
     ///
-    /// All three threads here run iocsh command bodies — the startup script,
-    /// the `afterIocRunning` queue (epics-base PR #558), and the `iocsh(NULL)`
-    /// prompt of an IOC whose `iocInit()` never ran (C `softMain.cpp:250`,
-    /// [`run_uninitialized_tail`]). In C that is one thread, the shell, and
-    /// base-on-RTEMS bands it explicitly:
-    /// `epicsThreadSetPriority(epicsThreadGetIdSelf(), epicsThreadPriorityIocsh)`
-    /// (`libcom/RTEMS/posix/rtems_init.c:1002`), under the comment *"Override
-    /// RTEMS Posix configuration, it gets started with posix prio 2"*. That is
-    /// the same inheritance defect the port has: RTEMS pthreads inherit their
-    /// creator's parameters (`cpukit/posix/src/pthreadattrdefault.c:49-58` (both `rtems` pins))
-    /// and the boot shim runs `POSIX_Init` at `RTEMS_MAXIMUM_PRIORITY - 1`, so
-    /// a thread that skips the prologue runs one level above idle.
-    ///
-    /// `Iocsh` = 91 is the top of the EPICS range — above `High`(90) and every
-    /// scan and callback band. That is C's choice and it is the right one for
-    /// both callers: `run` **awaits** each of these threads, so with an
-    /// inherited near-idle band the whole of iocInit sits behind every scan
-    /// thread and callback worker already running. The startup script is
-    /// bounded (it runs once and exits); the post-init queue is as bounded as
-    /// the command an operator would have typed at the C console, which C runs
-    /// at this same 91.
-    ///
-    /// Source inspection, because the defect is a call that is *absent*.
-    ///
-    /// The prologue itself moved into `runtime::task::MandatoryThread`, which
-    /// takes the band as a constructor argument and runs `enter_ioc_thread`
-    /// before the body — so what this module can still get wrong is *which*
-    /// band it declares, and whether it declares one at all. Both are checked
-    /// below; `thread_census.rs` is what forbids creating a thread here by any
-    /// other route.
+    /// The band that thread takes is pinned beside it, in libcom's
+    /// `the_main_thread_takes_the_iocsh_band`. Source inspection, because the
+    /// defect is a route that is *present*; `thread_census.rs` forbids a
+    /// thread here by any other route.
     #[test]
-    fn iocsh_threads_take_the_iocsh_band() {
+    fn iocsh_bodies_run_on_the_one_main_thread() {
         let prod = production(include_str!("ioc_app.rs"), Comments::Strip);
 
         assert_eq!(
             prod.matches("MandatoryThread::new(").count(),
+            0,
+            "an iocsh body on a thread of its own is a second `_main_`"
+        );
+        assert_eq!(
+            prod.matches("run_on_main_thread(").count(),
             3,
-            "the startup-script, afterIocRunning and uninitialised-tail threads"
+            "the soft-main job, the uninitialised tail and \
+             `IocRunConfig::run_shell`"
         );
         assert_eq!(
             prod.matches("name_current_thread(").count(),
@@ -3141,20 +4199,10 @@ mod tests {
             0,
             "banding without naming leaves an RTEMS-anonymous thread"
         );
-        for name in ["iocsh-startup", "iocsh-after-ioc-running", "iocsh"] {
-            let at = prod
-                .find(&format!("\"{name}\","))
-                .unwrap_or_else(|| panic!("the {name} thread moved; update this guard"));
-            let head = &prod[at..(at + 700).min(prod.len())];
-            assert!(
-                head.contains("ThreadPriority::Iocsh"),
-                "{name} must be declared at `ThreadPriority::Iocsh` \
-                 (posix/rtems_init.c:1002)"
-            );
-        }
     }
 
-    /// `epicsThread.h:86` — the band the guard above pins is C's constant.
+    /// `epicsThread.h:86` — the band libcom's `_main_` guard pins is C's
+    /// constant.
     #[test]
     fn the_iocsh_band_is_epics_thread_priority_iocsh() {
         assert_eq!(crate::runtime::task::ThreadPriority::Iocsh.value(), 91);
@@ -3188,27 +4236,34 @@ mod tests {
         std::fs::write(&b, "{}").unwrap();
 
         shell
-            .execute_line(&format!("dbLoadGroup(\"{}\")", a.display()))
+            .execute_line(format!("dbLoadGroup(\"{}\")", a.display()))
             .unwrap();
         shell
-            .execute_line(&format!("dbLoadGroup(\"{}\",\"M=1\")", b.display()))
+            .execute_line(format!("dbLoadGroup(\"{}\",\"M=1\")", b.display()))
             .unwrap();
         // Re-load of the same identity nets to one entry (pvxs erases first).
         shell
-            .execute_line(&format!("dbLoadGroup(\"{}\")", a.display()))
+            .execute_line(format!("dbLoadGroup(\"{}\")", a.display()))
             .unwrap();
 
-        // Missing file → early error at the st.cmd line (pvxs parity).
-        assert!(
-            shell
-                .execute_line("dbLoadGroup(\"/no/such/group.json\")")
-                .is_err(),
-            "a missing group file must error at command time"
+        // Missing file: softIocPVX 1.5.3 writes `Error opening "nosuch.json"`
+        // to stderr at the st.cmd line and marks the line failed.
+        let err = tmpdir.path().join("err");
+        assert!(matches!(
+            shell.execute_line(format!(
+                "dbLoadGroup(\"/no/such/group.json\") 2> {}",
+                crate::server::iocsh::script_token(&err)
+            )),
+            Ok(crate::server::iocsh::registry::CommandOutcome::Failed)
+        ));
+        assert_eq!(
+            std::fs::read_to_string(&err).unwrap(),
+            "Error opening \"/no/such/group.json\"\n"
         );
 
         // `-file` removes only the matching identity (a, macros="").
         shell
-            .execute_line(&format!("dbLoadGroup(\"-{}\")", a.display()))
+            .execute_line(format!("dbLoadGroup(\"-{}\")", a.display()))
             .unwrap();
 
         let reqs = take_group_load_requests();
@@ -3218,7 +4273,7 @@ mod tests {
 
         // `-*` clears the whole queue.
         shell
-            .execute_line(&format!("dbLoadGroup(\"{}\")", b.display()))
+            .execute_line(format!("dbLoadGroup(\"{}\")", b.display()))
             .unwrap();
         shell.execute_line("dbLoadGroup(\"-*\")").unwrap();
         assert!(
@@ -3341,6 +4396,13 @@ mod tests {
     /// `info()` tag the driver depends on (e.g. asyn `asyn:READBACK`).
     #[epics_macros_rs::epics_test]
     async fn wire_device_support_forwards_info_tags_to_driver() {
+        static ROW: crate::server::record::DevSup = crate::server::record::DevSup {
+            name: "devTest",
+            choice: "TestRecording",
+            link_type: crate::server::record::DbLinkType::Constant,
+            dset: crate::server::record::Dset::new(6, &[3], false),
+        };
+        crate::server::record::register_device_row("ai", &ROW);
         use crate::server::device_support::{DeviceReadOutcome, DeviceSupport};
         use crate::server::record::ScanType;
         use crate::server::records::ai::AiRecord;
@@ -3429,6 +4491,13 @@ mod tests {
     /// stable across runs of the same binary.
     #[epics_macros_rs::epics_test]
     async fn wire_device_support_binds_in_database_load_order() {
+        static ROW: crate::server::record::DevSup = crate::server::record::DevSup {
+            name: "devTest",
+            choice: "SeqDev",
+            link_type: crate::server::record::DbLinkType::InstIo,
+            dset: crate::server::record::Dset::new(6, &[3], false),
+        };
+        crate::server::record::register_device_row("ai", &ROW);
         use crate::server::device_support::{DeviceReadOutcome, DeviceSupport};
         use crate::server::records::ai::AiRecord;
         use std::sync::{Arc as StdArc, Mutex as StdMutex};
@@ -3628,7 +4697,7 @@ mod lifecycle_tests {
     //! so they do not share it.
 
     use super::*;
-    use crate::server::scan::{ScanCtl, scan_ctl};
+    use crate::server::scan::ScanCtl;
 
     /// BOUNDARY: `iocVoid`. C refuses both transitions from it — `iocRun`
     /// because the state is neither `iocBuilt` nor `iocPaused`
@@ -3651,12 +4720,84 @@ mod lifecycle_tests {
         assert_eq!(get_ioc_state(), IocState::Void);
     }
 
-    /// The full walk, and the scan gate at each stop. `note_scan_owner_started`
-    /// stands in for the bring-up path here so the test needs no threads:
-    /// what it drives is the same `ioc_run` the shell's command calls.
+    /// The bare bring-up: `iocBuild_1`, `iocBuild_3`, then the `ioc_run` the
+    /// shell's command calls. Returns the database the build published,
+    /// whose cell the lifecycle drives.
+    async fn build_and_run() -> Arc<PvDatabase> {
+        let db = Arc::new(PvDatabase::new());
+        build_and_run_on(&db).await;
+        db
+    }
+
+    /// [`build_and_run`] over a database the test already loaded.
+    async fn build_and_run_on(db: &Arc<PvDatabase>) {
+        assert!(build_without_application(db, |line| println!("{line}")).await);
+        assert_eq!(get_ioc_state(), IocState::Built);
+        assert_eq!(ioc_run(), 0);
+    }
+
+    /// The bare shell's `iocBuild` announces C's build hooks in C's order
+    /// (`iocInit.c:123-206`), as `IocApplication` and `build_ioc` do.
+    #[epics_macros_rs::epics_test]
+    async fn a_bare_build_walks_c_build_hooks() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = Arc::clone(&seen);
+        init_hook_register(Arc::new(move |state: InitHookState| {
+            log.lock().unwrap().push(state.name());
+        }));
+        build_and_run().await;
+        let seen = seen.lock().unwrap();
+        let end = seen
+            .iter()
+            .position(|n| *n == "initHookAfterIocBuilt")
+            .expect("announced")
+            + 1;
+        assert_eq!(
+            seen[..end],
+            [
+                "initHookAtIocBuild",
+                "initHookAtBeginning",
+                "initHookAfterCallbackInit",
+                "initHookAfterCaLinkInit",
+                "initHookAfterInitDrvSup",
+                "initHookAfterInitRecSup",
+                "initHookAfterInitDevSup",
+                "initHookAfterInitDatabase",
+                "initHookAfterFinishDevSup",
+                "initHookAfterScanInit",
+                "initHookAfterInitialProcess",
+                "initHookAfterCaServerInit",
+                "initHookAfterIocBuilt",
+            ]
+        );
+    }
+
+    /// BOUNDARY: `iocBuild_1` from anything but `iocVoid` refuses and moves
+    /// nothing (`iocInit.c:116-121`), so a second bring-up in one process
+    /// cannot say `Starting iocInit` twice.
+    #[epics_macros_rs::epics_test]
+    async fn a_second_bare_build_is_refused() {
+        build_and_run().await;
+        assert!(BuildSequence::begin(|line| println!("{line}")).is_none());
+        assert_eq!(get_ioc_state(), IocState::Running);
+    }
+
+    /// BOUNDARY: a held [`BuildSequence`] is `iocBuilding`, and one never
+    /// finished leaves the state there, as a failed C `iocBuild` does.
     #[test]
-    fn the_lifecycle_walks_void_running_paused_running_void() {
-        note_scan_owner_started();
+    fn an_unfinished_bare_build_stays_building() {
+        let _unfinished: BuildSequence =
+            BuildSequence::begin(|line| println!("{line}")).expect("void");
+        assert_eq!(get_ioc_state(), IocState::Building);
+        assert_eq!(get_ioc_state(), IocState::Building);
+        assert_eq!(ioc_run(), -1, "iocRun from iocBuilding is C's -1");
+    }
+
+    /// The full walk, and the scan gate at each stop.
+    #[epics_macros_rs::epics_test]
+    async fn the_lifecycle_walks_void_running_paused_running_void() {
+        let db = build_and_run().await;
+        let scan_ctl = || db.scan_control().ctl();
         assert_eq!(get_ioc_state(), IocState::Running);
         assert_eq!(scan_ctl(), ScanCtl::Run);
 
@@ -3680,9 +4821,9 @@ mod lifecycle_tests {
     /// BOUNDARY: the illegal repeat of each transition. C answers a second
     /// `iocPause` with "IOC not running" and a second `iocRun` with "IOC
     /// not paused", both -1, and neither moves the state.
-    #[test]
-    fn a_repeated_transition_is_refused_from_its_own_end_state() {
-        note_scan_owner_started();
+    #[epics_macros_rs::epics_test]
+    async fn a_repeated_transition_is_refused_from_its_own_end_state() {
+        build_and_run().await;
         assert_eq!(ioc_run(), -1, "already running");
         assert_eq!(get_ioc_state(), IocState::Running);
 
@@ -3691,11 +4832,187 @@ mod lifecycle_tests {
         assert_eq!(get_ioc_state(), IocState::Paused);
     }
 
+    /// `iocShutdown` lets go of the database `initialProcess` published, so
+    /// the next build's `initial_process` is not handed the old one's
+    /// leftovers and the old one's records are freed.
+    #[epics_macros_rs::epics_test]
+    async fn shutdown_releases_the_published_database() {
+        let mut build = BuildSequence::begin(|line| println!("{line}")).expect("void");
+        let db = Arc::new(PvDatabase::new());
+        build.reach(InitHookState::AfterCallbackInit);
+        build.ca_link_init(&db, Vec::new()).await;
+        initial_process(&db);
+        build.finish();
+        assert_eq!(ioc_run(), 0);
+        let published = Arc::downgrade(&db);
+        drop(db);
+        assert!(published.strong_count() > 0, "the lifecycle holds it");
+
+        assert_eq!(ioc_shutdown(), 0);
+        // No wait: the `scan-%g` threads holding it are joined, as C's
+        // `scanStop` joins them (`dbScan.c:173-176`).
+        assert_eq!(published.strong_count(), 0);
+    }
+
+    /// C `initDatabase` puts `iocShutdown` on the exit callbacks
+    /// (`iocInit.c:580`) whatever ran `iocBuild`: the bare shell's build
+    /// too.
+    #[epics_macros_rs::epics_test]
+    async fn a_bare_build_is_shut_down_by_the_exit_callbacks() {
+        build_and_run().await;
+        crate::runtime::exit::call_at_exits();
+        assert_eq!(get_ioc_state(), IocState::Void);
+    }
+
+    /// A bare build in `mode`, run, then shut down.
+    async fn build_run_and_shut_down(mode: BuildMode) {
+        let mut build = BuildSequence::begin_mode(mode, |line| println!("{line}")).expect("void");
+        let db = Arc::new(PvDatabase::new());
+        build.reach(InitHookState::AfterCallbackInit);
+        build.ca_link_init(&db, Vec::new()).await;
+        initial_process(&db);
+        build.finish();
+        assert_eq!(ioc_run(), 0);
+        assert_eq!(ioc_shutdown(), 0);
+    }
+
+    /// `asInit`'s `firstTime` across a shutdown, for `mode`.
+    async fn as_init_after_a_shutdown(mode: BuildMode) -> crate::server::iocsh::AsInitOutcome {
+        use crate::server::iocsh::{AsInitOutcome, as_init};
+        let acf = crate::server::access_security::new_acf_cell(None);
+        assert_eq!(as_init(&acf, &|_| {}), AsInitOutcome::NeverEnabled);
+        assert_eq!(as_init(&acf, &|_| {}), AsInitOutcome::NotActive);
+        build_run_and_shut_down(mode).await;
+        as_init(&acf, &|_| {})
+    }
+
+    /// C `asShutdown` (`iocInit.c:754`, `asDbLib.c:157-164`): an isolated
+    /// shutdown puts `firstTime` back, so the next IOC's bare `asInit` is the
+    /// first one again.
+    #[epics_macros_rs::epics_test]
+    async fn an_isolated_shutdown_resets_as_init_s_first_time() {
+        assert_eq!(
+            as_init_after_a_shutdown(BuildMode::Isolated).await,
+            crate::server::iocsh::AsInitOutcome::NeverEnabled
+        );
+    }
+
+    /// `asShutdown` is on the isolated branch only (`iocInit.c:745`).
+    #[epics_macros_rs::epics_test]
+    async fn a_servers_shutdown_keeps_as_init_s_first_time() {
+        assert_eq!(
+            as_init_after_a_shutdown(BuildMode::Servers).await,
+            crate::server::iocsh::AsInitOutcome::NotActive
+        );
+    }
+
+    /// C resets `iocBuildMode` at the end of `iocShutdown` (`iocInit.c:761`)
+    /// because only a build that succeeds sets it (`:229`): a Servers build
+    /// that fails after an isolated IOC shut down is shut down as Servers.
+    #[epics_macros_rs::epics_test]
+    async fn a_failed_build_after_an_isolated_ioc_shuts_down_as_servers() {
+        build_run_and_shut_down(BuildMode::Isolated).await;
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = Arc::clone(&seen);
+        init_hook_register(Arc::new(move |state: InitHookState| {
+            log.lock().unwrap().push(state);
+        }));
+        // A build that fails before `iocBuild_3` never finishes.
+        BuildSequence::begin(|line| println!("{line}")).expect("void");
+        assert_eq!(get_ioc_state(), IocState::Building);
+        assert_eq!(ioc_shutdown(), 0);
+        let seen = seen.lock().unwrap();
+        assert!(seen.contains(&InitHookState::AfterShutdown));
+        assert!(!seen.contains(&InitHookState::BeforeFree), "{seen:?}");
+    }
+
+    /// Did a shutdown in `mode` leave a command and a variable this IOC
+    /// registered?
+    async fn iocsh_tables_after_a_shutdown(mode: BuildMode) -> (bool, bool) {
+        use crate::server::iocsh::registry::{CommandDef, CommandOutcome};
+        use crate::server::iocsh::vars::{VarAccess, VarDef, register_variable, variable_names};
+        crate::server::iocsh::register_command(CommandDef::new(
+            "tstFreeCmd",
+            Vec::new(),
+            "",
+            |_: &[crate::server::iocsh::registry::ArgValue],
+             _: &crate::server::iocsh::registry::CommandContext| {
+                Ok(CommandOutcome::Continue)
+            },
+        ));
+        register_variable(VarDef {
+            name: "tstFreeVar",
+            access: VarAccess::Int {
+                get: || 0,
+                set: |_| {},
+            },
+        });
+        build_run_and_shut_down(mode).await;
+        let registry = crate::server::iocsh::command_registry().read().unwrap();
+        assert!(registry.get("dbl").is_some(), "the base set is born in");
+        assert!(
+            variable_names().contains(&"seqDLYlimit"),
+            "and the seeded knobs"
+        );
+        (
+            registry.get("tstFreeCmd").is_some(),
+            variable_names().contains(&"tstFreeVar"),
+        )
+    }
+
+    /// C `iocshFree` (`iocInit.c:757`): an isolated shutdown leaves the next
+    /// IOC no command or variable a registrar of this one added.
+    #[epics_macros_rs::epics_test]
+    async fn an_isolated_shutdown_frees_the_iocsh_tables() {
+        assert_eq!(
+            iocsh_tables_after_a_shutdown(BuildMode::Isolated).await,
+            (false, false)
+        );
+    }
+
+    /// `iocshFree` is on the isolated branch only.
+    #[epics_macros_rs::epics_test]
+    async fn a_servers_shutdown_keeps_the_iocsh_tables() {
+        assert_eq!(
+            iocsh_tables_after_a_shutdown(BuildMode::Servers).await,
+            (true, true)
+        );
+    }
+
+    /// An exit callback armed before `initDatabase` ends runs after the
+    /// `iocShutdown` it arms (`iocInit.c:580`), one armed after it runs
+    /// before: softIoc's `AfterInitDevSup` `epicsAtExit` sees `iocVoid`.
+    #[epics_macros_rs::epics_test]
+    async fn exit_callbacks_armed_inside_the_build_run_around_ioc_shutdown() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = Arc::clone(&seen);
+        init_hook_register(Arc::new(move |state: InitHookState| {
+            if matches!(
+                state,
+                InitHookState::AfterInitDevSup | InitHookState::AfterFinishDevSup
+            ) {
+                let log = Arc::clone(&log);
+                crate::runtime::exit::at_exit("probe", move || {
+                    log.lock().unwrap().push((state.name(), get_ioc_state()));
+                });
+            }
+        }));
+        build_and_run().await;
+        crate::runtime::exit::call_at_exits();
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [
+                ("initHookAfterFinishDevSup", IocState::Running),
+                ("initHookAfterInitDevSup", IocState::Void),
+            ]
+        );
+    }
+
     /// BOUNDARY: `iocShutdown` from `iocPaused`. C shuts down from any
     /// non-void state, not only from running.
-    #[test]
-    fn a_paused_ioc_can_be_shut_down() {
-        note_scan_owner_started();
+    #[epics_macros_rs::epics_test]
+    async fn a_paused_ioc_can_be_shut_down() {
+        build_and_run().await;
         assert_eq!(ioc_pause(), 0);
         assert_eq!(ioc_shutdown(), 0);
         assert_eq!(get_ioc_state(), IocState::Void);
@@ -3742,9 +5059,9 @@ mod lifecycle_tests {
             let rec = db.get_record("EV").unwrap();
             rec.write().common.scan = ScanType::Event;
         }
-        db.update_scan_index("EV", ScanType::Passive, ScanType::Event, 0, 0);
+        db.update_scan_index(b"EV", ScanType::Passive, ScanType::Event, 0, 0);
 
-        note_scan_owner_started();
+        build_and_run_on(&db).await;
         db.post_event().await;
         let while_running = runs.load(Ordering::SeqCst);
         assert_eq!(while_running, 1, "a running IOC processes its Event list");

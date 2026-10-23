@@ -1,6 +1,6 @@
 use epics_base_rs::error::{CaError, CaResult};
 use epics_base_rs::server::recgbl::{rec_gbl_get_alarm_double, rec_gbl_get_graphic_double};
-use epics_base_rs::types::{DbFieldType, EpicsValue};
+use epics_base_rs::types::{DbFieldType, EpicsValue, PvString};
 
 use crate::coordinate;
 use crate::fields::*;
@@ -11,7 +11,7 @@ use super::dbd_generated::MOTOR_FIELDS;
 
 /// The motorRecord version this port tracks (C `#define VERSION 7.4`,
 /// stamped into VERS at init_record:608; SPC_NOMOD).
-const MOTOR_RECORD_VERSION: f32 = 7.4;
+pub(crate) const MOTOR_RECORD_VERSION: f32 = 7.4;
 
 pub(crate) fn motor_get_field(rec: &MotorRecord, name: &str) -> Option<EpicsValue> {
     match name {
@@ -21,13 +21,13 @@ pub(crate) fn motor_get_field(rec: &MotorRecord, name: &str) -> Option<EpicsValu
         "RLV" => Some(EpicsValue::Double(rec.pos.rlv)),
         "OFF" => Some(EpicsValue::Double(rec.pos.off)),
         "DIFF" => Some(EpicsValue::Double(rec.pos.diff)),
-        "RDIF" => Some(EpicsValue::Int64(rec.pos.rdif)),
+        "RDIF" => Some(EpicsValue::Long(rec.pos.rdif)),
         "DVAL" => Some(EpicsValue::Double(rec.pos.dval)),
         "DRBV" => Some(EpicsValue::Double(rec.pos.drbv)),
-        "RVAL" => Some(EpicsValue::Int64(rec.pos.rval)),
-        "RRBV" => Some(EpicsValue::Int64(rec.pos.rrbv)),
-        "RMP" => Some(EpicsValue::Int64(rec.pos.rmp)),
-        "REP" => Some(EpicsValue::Int64(rec.pos.rep)),
+        "RVAL" => Some(EpicsValue::Long(rec.pos.rval)),
+        "RRBV" => Some(EpicsValue::Long(rec.pos.rrbv)),
+        "RMP" => Some(EpicsValue::Long(rec.pos.rmp)),
+        "REP" => Some(EpicsValue::Long(rec.pos.rep)),
         // Conversion
         "DIR" => Some(EpicsValue::Short(rec.conv.dir as i16)),
         "FOFF" => Some(EpicsValue::Short(rec.conv.foff as i16)),
@@ -36,7 +36,7 @@ pub(crate) fn motor_get_field(rec: &MotorRecord, name: &str) -> Option<EpicsValu
         "SET" => Some(EpicsValue::Short(if rec.conv.set { 1 } else { 0 })),
         "SSET" => Some(EpicsValue::Short(rec.conv.sset)),
         "SUSE" => Some(EpicsValue::Short(rec.conv.suse)),
-        "IGSET" => Some(EpicsValue::Short(if rec.conv.igset { 1 } else { 0 })),
+        "IGSET" => Some(EpicsValue::Short(rec.conv.igset)),
         "MRES" => Some(EpicsValue::Double(rec.conv.mres)),
         "ERES" => Some(EpicsValue::Double(rec.conv.eres)),
         "SREV" => Some(EpicsValue::Long(rec.conv.srev)),
@@ -69,13 +69,13 @@ pub(crate) fn motor_get_field(rec: &MotorRecord, name: &str) -> Option<EpicsValu
         "SBAK" => Some(EpicsValue::Double(rec.vel.sbak)),
         // Retry
         "BDST" => Some(EpicsValue::Double(rec.retry.bdst)),
-        "FRAC" => Some(EpicsValue::Double(rec.retry.frac)),
+        "FRAC" => Some(EpicsValue::Float(rec.retry.frac)),
         "RDBD" => Some(EpicsValue::Double(rec.retry.rdbd)),
         "SPDB" => Some(EpicsValue::Double(rec.retry.spdb)),
         "RTRY" => Some(EpicsValue::Short(rec.retry.rtry)),
         "RMOD" => Some(EpicsValue::Short(rec.retry.rmod as i16)),
         "RCNT" => Some(EpicsValue::Short(rec.retry.rcnt)),
-        "MISS" => Some(EpicsValue::Short(if rec.retry.miss { 1 } else { 0 })),
+        "MISS" => Some(EpicsValue::Short(rec.retry.miss)),
         // Limits
         "HLM" => Some(EpicsValue::Double(rec.limits.hlm)),
         "LLM" => Some(EpicsValue::Double(rec.limits.llm)),
@@ -83,13 +83,12 @@ pub(crate) fn motor_get_field(rec: &MotorRecord, name: &str) -> Option<EpicsValu
         "DLLM" => Some(EpicsValue::Double(rec.limits.dllm)),
         "RHLM" => Some(EpicsValue::Double(rec.limits.rhlm)),
         "RLLM" => Some(EpicsValue::Double(rec.limits.rllm)),
-        "LVIO" => Some(EpicsValue::Short(if rec.limits.lvio { 1 } else { 0 })),
-        "HLS" => Some(EpicsValue::Short(if rec.limits.hls { 1 } else { 0 })),
-        "LLS" => Some(EpicsValue::Short(if rec.limits.lls { 1 } else { 0 })),
-        "RHLS" => Some(EpicsValue::Short(if rec.limits.rhls { 1 } else { 0 })),
-        "RLLS" => Some(EpicsValue::Short(if rec.limits.rlls { 1 } else { 0 })),
-        // C 196/608: init_record stamps the ported motorRecord version.
-        "VERS" => Some(EpicsValue::Float(MOTOR_RECORD_VERSION)),
+        "LVIO" => Some(EpicsValue::Short(rec.limits.lvio)),
+        "HLS" => Some(EpicsValue::Short(rec.limits.hls)),
+        "LLS" => Some(EpicsValue::Short(rec.limits.lls)),
+        "RHLS" => Some(EpicsValue::Short(rec.limits.rhls)),
+        "RLLS" => Some(EpicsValue::Short(rec.limits.rlls)),
+        "VERS" => Some(EpicsValue::Float(rec.internal.vers)),
         "HLSV" => Some(EpicsValue::Short(rec.limits.hlsv)),
         // Control
         "SPMG" => Some(EpicsValue::Short(rec.ctrl.spmg as i16)),
@@ -97,25 +96,25 @@ pub(crate) fn motor_get_field(rec: &MotorRecord, name: &str) -> Option<EpicsValu
         // (motorRecord.cc:725 init, :1859 sync). Same menu as SPMG, so
         // same served form; the declared DBF_MENU makes it a DBR_ENUM.
         "LSPG" => Some(EpicsValue::Short(rec.internal.lspg as i16)),
-        "STOP" => Some(EpicsValue::Short(if rec.ctrl.stop { 1 } else { 0 })),
-        "HOMF" => Some(EpicsValue::Short(if rec.ctrl.homf { 1 } else { 0 })),
-        "HOMR" => Some(EpicsValue::Short(if rec.ctrl.homr { 1 } else { 0 })),
-        "JOGF" => Some(EpicsValue::Short(if rec.ctrl.jogf { 1 } else { 0 })),
-        "JOGR" => Some(EpicsValue::Short(if rec.ctrl.jogr { 1 } else { 0 })),
-        "TWF" => Some(EpicsValue::Short(if rec.ctrl.twf { 1 } else { 0 })),
-        "TWR" => Some(EpicsValue::Short(if rec.ctrl.twr { 1 } else { 0 })),
+        "STOP" => Some(EpicsValue::Short(rec.ctrl.stop)),
+        "HOMF" => Some(EpicsValue::Short(rec.ctrl.homf)),
+        "HOMR" => Some(EpicsValue::Short(rec.ctrl.homr)),
+        "JOGF" => Some(EpicsValue::Short(rec.ctrl.jogf)),
+        "JOGR" => Some(EpicsValue::Short(rec.ctrl.jogr)),
+        "TWF" => Some(EpicsValue::Short(rec.ctrl.twf)),
+        "TWR" => Some(EpicsValue::Short(rec.ctrl.twr)),
         "TWV" => Some(EpicsValue::Double(rec.ctrl.twv)),
         "CNEN" => Some(EpicsValue::Short(if rec.ctrl.cnen { 1 } else { 0 })),
         // Status
-        "DMOV" => Some(EpicsValue::Short(if rec.stat.dmov { 1 } else { 0 })),
-        "MOVN" => Some(EpicsValue::Short(if rec.stat.movn { 1 } else { 0 })),
-        "MSTA" => Some(EpicsValue::Long(rec.stat.msta.bits() as i32)),
-        "MIP" => Some(EpicsValue::Short(rec.stat.mip.bits() as i16)),
-        "CDIR" => Some(EpicsValue::Short(if rec.stat.cdir { 1 } else { 0 })),
-        "TDIR" => Some(EpicsValue::Short(if rec.stat.tdir { 1 } else { 0 })),
-        "ATHM" => Some(EpicsValue::Short(if rec.stat.athm { 1 } else { 0 })),
+        "DMOV" => Some(EpicsValue::Short(rec.stat.dmov)),
+        "MOVN" => Some(EpicsValue::Short(rec.stat.movn)),
+        "MSTA" => Some(EpicsValue::ULong(rec.stat.msta.bits())),
+        "MIP" => Some(EpicsValue::UShort(rec.stat.mip.bits())),
+        "CDIR" => Some(EpicsValue::Short(rec.stat.cdir)),
+        "TDIR" => Some(EpicsValue::Short(rec.stat.tdir)),
+        "ATHM" => Some(EpicsValue::Short(rec.stat.athm)),
         "STUP" => Some(EpicsValue::Short(rec.stat.stup)),
-        "RVEL" => Some(EpicsValue::Int64(rec.stat.rvel)),
+        "RVEL" => Some(EpicsValue::Long(rec.stat.rvel)),
         // PID
         "PCOF" => Some(EpicsValue::Double(rec.pid.pcof)),
         "ICOF" => Some(EpicsValue::Double(rec.pid.icof)),
@@ -126,23 +125,27 @@ pub(crate) fn motor_get_field(rec: &MotorRecord, name: &str) -> Option<EpicsValu
         "ADEL" => Some(EpicsValue::Double(rec.disp.adel)),
         "MDEL" => Some(EpicsValue::Double(rec.disp.mdel)),
         // SYNC is a write-only trigger; readback always 0.
-        "SYNC" => Some(EpicsValue::Short(if rec.internal.sync { 1 } else { 0 })),
+        "SYNC" => Some(EpicsValue::Short(rec.internal.sync)),
         // Timing
         "DLY" => Some(EpicsValue::Double(rec.timing.dly)),
         "NTM" => Some(EpicsValue::Short(if rec.timing.ntm { 1 } else { 0 })),
         "NTMF" => Some(EpicsValue::UShort(rec.timing.ntmf)),
         // Public C motorRecord.dbd link / menu / string surface.
-        "OUT" => Some(EpicsValue::String(rec.links.out.clone().into())),
+        "OUT" => Some(EpicsValue::String(rec.links.out.clone())),
         // `motorRecord.cc:653-670` — derived from OUT at init by
         // `motor_derive_card`, SPC_NOMOD so no client can write it.
         "CARD" => Some(EpicsValue::Short(rec.links.card)),
-        "RDBL" => Some(EpicsValue::String(rec.links.rdbl.clone().into())),
-        "DOL" => Some(EpicsValue::String(rec.links.dol.clone().into())),
-        "RLNK" => Some(EpicsValue::String(rec.links.rlnk.clone().into())),
-        "STOO" => Some(EpicsValue::String(rec.links.stoo.clone().into())),
-        "DINP" => Some(EpicsValue::String(rec.links.dinp.clone().into())),
-        "RINP" => Some(EpicsValue::String(rec.links.rinp.clone().into())),
-        "POST" => Some(EpicsValue::String(rec.links.post.clone().into())),
+        "RDBL" => Some(EpicsValue::String(rec.links.rdbl.clone())),
+        "DOL" => Some(EpicsValue::String(rec.links.dol.clone())),
+        "RLNK" => Some(EpicsValue::String(rec.links.rlnk.clone())),
+        "STOO" => Some(EpicsValue::String(rec.links.stoo.clone())),
+        "DINP" => Some(EpicsValue::String(rec.links.dinp.clone())),
+        "RINP" => Some(EpicsValue::String(rec.links.rinp.clone())),
+        "INIT" => Some(EpicsValue::String(rec.links.init.clone())),
+        "PREM" => Some(EpicsValue::String(rec.links.prem.clone())),
+        "POST" => Some(EpicsValue::String(PvString::from_bytes(
+            rec.links.post.get(),
+        ))),
         "OMSL" => Some(EpicsValue::Short(rec.links.omsl)),
         // Alarm-limit / operator-range surface.
         "HIHI" => Some(EpicsValue::Double(rec.alarm.hihi)),
@@ -154,18 +157,18 @@ pub(crate) fn motor_get_field(rec: &MotorRecord, name: &str) -> Option<EpicsValu
         "HOPR" => Some(EpicsValue::Double(rec.disp.hopr)),
         "LOPR" => Some(EpicsValue::Double(rec.disp.lopr)),
         // Last-value / monitor-map surface (SPC_NOMOD, read-only). LRVL mirrors
-        // RVAL's 64-bit exposure; MMAP/NMAP appear as DBF_LONG over CA.
+        // RVAL; MMAP/NMAP appear as DBF_LONG over CA.
         "LVAL" => Some(EpicsValue::Double(rec.internal.lval)),
         "LDVL" => Some(EpicsValue::Double(rec.internal.ldvl)),
-        "LRVL" => Some(EpicsValue::Int64(rec.internal.lrvl)),
+        "LRVL" => Some(EpicsValue::Long(rec.internal.lrvl)),
         "LRLV" => Some(EpicsValue::Double(rec.internal.lrlv)),
         "ALST" => Some(EpicsValue::Double(rec.disp.alst)),
         "MLST" => Some(EpicsValue::Double(rec.disp.mlst)),
-        "MMAP" => Some(EpicsValue::Long(rec.internal.mmap as i32)),
-        "NMAP" => Some(EpicsValue::Long(rec.internal.nmap as i32)),
+        "MMAP" => Some(EpicsValue::ULong(rec.internal.mmap)),
+        "NMAP" => Some(EpicsValue::ULong(rec.internal.nmap)),
         // C `pmr->pp` — post-process armed for the motion in flight
         // (15 write sites, motorRecord.cc:825..2523).
-        "PP" => Some(EpicsValue::Short(if rec.internal.pp { 1 } else { 0 })),
+        "PP" => Some(EpicsValue::Short(rec.internal.pp)),
         _ => None,
     }
 }
@@ -175,56 +178,33 @@ pub(crate) fn motor_put_field(
     name: &str,
     value: EpicsValue,
 ) -> CaResult<()> {
+    // C special() runs only on a database put: a dbLoadRecords field() is a
+    // raw struct write, and init_record reconciles what it loaded.
+    if !rec.internal.init_invariants_synced {
+        return motor_store_field(rec, name, value);
+    }
     match name {
-        // Position writes -- cascade and set command source
+        // Position writes store the field raw, like C's special() (2595-2607,
+        // a DMOV blink only); the do_work collection (2187-2235) and the
+        // move block (2300-2305) derive the rest. A put that the jog-stop
+        // section consumes therefore never cascades.
         "VAL" => {
             let v = match value {
                 EpicsValue::Double(v) => v,
                 _ => return Err(CaError::TypeMismatch(name.into())),
             };
-            if rec.conv.set && !rec.conv.igset {
-                if rec.conv.foff == FreezeOffset::Variable {
-                    // C 2206-2227: redefine VAL without moving the motor
-                    // and without touching DVAL — offset-only, completes
-                    // on the spot. No last_write: C returns from the
-                    // collection block (2227), nothing to dispatch. No
-                    // controller command is involved, so the #231
-                    // LOAD_POS block does not apply.
-                    rec.set_mode_redefine_val(v);
-                } else {
-                    // #231: LOAD_POS blocked — refuse the Frozen-leg
-                    // redefinition, which needs the controller write
-                    // (C load_pos sends LOAD_POS unconditionally, 3811),
-                    // so DVAL/OFF stay consistent with the controller.
-                    if rec.conv.loadpos_blocked {
-                        return Ok(());
-                    }
-                    // SET+FOFF=Frozen: cascade VAL->DVAL normally, then SetPosition
-                    // C: dval = (val - off) / dir, then load_pos(dval/mres)
-                    let dval = coordinate::user_to_dial(v, rec.conv.dir, rec.pos.off);
-                    if let Ok(rval) = coordinate::dial_to_raw(dval, rec.conv.mres) {
-                        rec.pos.val = v;
-                        rec.pos.dval = dval;
-                        rec.pos.rval = rval;
-                    }
-                    rec.last_write = Some(CommandSource::Set);
+            if rec.conv.set && rec.conv.igset == 0 && rec.conv.foff == FreezeOffset::Frozen {
+                // #231: LOAD_POS blocked — refuse the Frozen-leg
+                // redefinition, which needs the controller write
+                // (C load_pos sends LOAD_POS unconditionally, 3811),
+                // so DVAL/OFF stay consistent with the controller.
+                if rec.conv.loadpos_blocked {
+                    return Ok(());
                 }
+                rec.pos.val = v;
+                rec.last_write = Some(CommandSource::Set);
             } else {
-                // Normal move (not in SET mode)
-                if let Ok((dval, rval, off)) = coordinate::cascade_from_val(
-                    v,
-                    rec.conv.dir,
-                    rec.pos.off,
-                    rec.conv.foff,
-                    rec.conv.mres,
-                    false,
-                    rec.pos.dval,
-                ) {
-                    rec.pos.val = v;
-                    rec.pos.dval = dval;
-                    rec.pos.rval = rval;
-                    rec.pos.off = off;
-                }
+                rec.pos.val = v;
                 rec.last_write = Some(CommandSource::Val);
             }
             Ok(())
@@ -234,123 +214,33 @@ pub(crate) fn motor_put_field(
                 EpicsValue::Double(v) => v,
                 _ => return Err(CaError::TypeMismatch(name.into())),
             };
-            if rec.conv.set && !rec.conv.igset {
+            if rec.conv.set && rec.conv.igset == 0 {
                 // #231: LOAD_POS blocked — refuse SET-mode redefinition.
                 if rec.conv.loadpos_blocked {
                     return Ok(());
                 }
-                if rec.conv.foff == FreezeOffset::Variable {
-                    // SET+FOFF=Variable: recalculate offset, signal SetPosition
-                    if let Ok((val, rval, off)) = coordinate::cascade_from_dval(
-                        v,
-                        rec.conv.dir,
-                        rec.pos.off,
-                        rec.conv.foff,
-                        rec.conv.mres,
-                        true,
-                        rec.pos.val,
-                    ) {
-                        rec.pos.dval = v;
-                        rec.pos.val = val;
-                        rec.pos.rval = rval;
-                        rec.pos.off = off;
-                        // C load_pos Variable leg (motorRecord.cc:3800):
-                        // the recomputed offset retranslates user limits.
-                        rec.set_userlimits();
-                    }
-                } else {
-                    // SET+FOFF=Frozen: DVAL changes directly, SetPosition
-                    if let Ok(rval) = coordinate::dial_to_raw(v, rec.conv.mres) {
-                        rec.pos.dval = v;
-                        rec.pos.val = coordinate::dial_to_user(v, rec.conv.dir, rec.pos.off);
-                        rec.pos.rval = rval;
-                    }
-                }
+                rec.pos.dval = v;
                 rec.last_write = Some(CommandSource::Set);
             } else {
-                // Normal move
-                if let Ok((val, rval, off)) = coordinate::cascade_from_dval(
-                    v,
-                    rec.conv.dir,
-                    rec.pos.off,
-                    rec.conv.foff,
-                    rec.conv.mres,
-                    false,
-                    rec.pos.val,
-                ) {
-                    rec.pos.dval = v;
-                    rec.pos.val = val;
-                    rec.pos.rval = rval;
-                    rec.pos.off = off;
-                }
+                rec.pos.dval = v;
                 rec.last_write = Some(CommandSource::Dval);
             }
             Ok(())
         }
         "RVAL" => {
-            // RVAL is 64-bit (epics-modules/motor #192). Accept Int64 or a
-            // 32-bit Long from older clients.
-            let v: i64 = match value {
-                EpicsValue::Int64(v) => v,
-                EpicsValue::Long(v) => v as i64,
-                _ => return Err(CaError::TypeMismatch(name.into())),
-            };
-            // C special() has no RVAL cascade — the RVAL->DVAL
-            // propagation lives in the do_work collection block
-            // (2196-2197), inside the else that closed-loop OMSL with a
-            // DB-link DOL bypasses (1994). Under that gate a put is a raw
-            // struct write that stays inert (both move and SET-mode
-            // redefinition) until OMSL leaves closed loop.
-            if rec.closed_loop_dol_collection() {
-                rec.pos.rval = v;
-                rec.last_write = Some(CommandSource::Rval);
-                return Ok(());
-            }
-            if rec.conv.set && !rec.conv.igset {
+            let v = as_long(value, name)?;
+            // Under closed-loop OMSL with a DB-link DOL the collection
+            // never reads RVAL (1994): the put stays inert, and is not a
+            // SET-mode redefinition either.
+            if rec.conv.set && rec.conv.igset == 0 && !rec.closed_loop_dol_collection() {
                 // #231: LOAD_POS blocked — refuse SET-mode redefinition.
                 if rec.conv.loadpos_blocked {
                     return Ok(());
                 }
-                if rec.conv.foff == FreezeOffset::Variable {
-                    // SET+FOFF=Variable: recalculate offset, signal SetPosition
-                    let (val, dval, off) = coordinate::cascade_from_rval(
-                        v,
-                        rec.conv.dir,
-                        rec.pos.off,
-                        rec.conv.foff,
-                        rec.conv.mres,
-                        true,
-                        rec.pos.val,
-                    );
-                    rec.pos.rval = v;
-                    rec.pos.val = val;
-                    rec.pos.dval = dval;
-                    rec.pos.off = off;
-                    // C load_pos Variable leg (motorRecord.cc:3800).
-                    rec.set_userlimits();
-                } else {
-                    // SET+FOFF=Frozen: RVAL->DVAL directly, SetPosition
-                    let dval = coordinate::raw_to_dial(v, rec.conv.mres);
-                    rec.pos.rval = v;
-                    rec.pos.dval = dval;
-                    rec.pos.val = coordinate::dial_to_user(dval, rec.conv.dir, rec.pos.off);
-                }
+                rec.pos.rval = v;
                 rec.last_write = Some(CommandSource::Set);
             } else {
-                // Normal move
-                let (val, dval, off) = coordinate::cascade_from_rval(
-                    v,
-                    rec.conv.dir,
-                    rec.pos.off,
-                    rec.conv.foff,
-                    rec.conv.mres,
-                    false,
-                    rec.pos.val,
-                );
                 rec.pos.rval = v;
-                rec.pos.val = val;
-                rec.pos.dval = dval;
-                rec.pos.off = off;
                 rec.last_write = Some(CommandSource::Rval);
             }
             Ok(())
@@ -374,6 +264,8 @@ pub(crate) fn motor_put_field(
                     // C: also update LVAL so offset change doesn't trigger false retarget
                     rec.internal.lval =
                         coordinate::dial_to_user(rec.internal.ldvl, rec.conv.dir, rec.pos.off);
+                    // C special OFF (2786-2791).
+                    rec.mark(m::VAL | m::RBV);
                     rec.set_userlimits();
                     Ok(())
                 }
@@ -391,27 +283,24 @@ pub(crate) fn motor_put_field(
                             // FOFF=Frozen: recalculate VAL from DVAL
                             rec.pos.val =
                                 coordinate::dial_to_user(rec.pos.dval, rec.conv.dir, rec.pos.off);
+                            rec.mark(m::VAL);
                         }
                         FreezeOffset::Variable => {
                             // FOFF=Variable: recalculate OFF to preserve VAL
                             rec.pos.off =
                                 coordinate::calc_offset(rec.pos.val, rec.pos.dval, rec.conv.dir);
+                            rec.mark(m::OFF);
                         }
                     }
+                    // C special DIR (2769-2783).
                     rec.pos.rbv = coordinate::dial_to_user(rec.pos.drbv, rec.conv.dir, rec.pos.off);
+                    rec.mark(m::RBV);
                     rec.set_userlimits();
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
             }
         }
-        "FOFF" => match value {
-            EpicsValue::Short(v) => {
-                rec.conv.foff = FreezeOffset::from_i16(v);
-                Ok(())
-            }
-            _ => Err(CaError::TypeMismatch(name.into())),
-        },
         // C special (motorRecord.cc:2975-2984): FOF/VOF are momentary
         // command fields — ANY write (including 0) forces FOFF to
         // Frozen/Variable; the written value is only stored for reads.
@@ -420,9 +309,7 @@ pub(crate) fn motor_put_field(
         "FOF" => match value {
             EpicsValue::Short(v) => {
                 rec.conv.fof = v;
-                if rec.internal.init_invariants_synced {
-                    rec.conv.foff = FreezeOffset::Frozen;
-                }
+                rec.conv.foff = FreezeOffset::Frozen;
                 Ok(())
             }
             _ => Err(CaError::TypeMismatch(name.into())),
@@ -430,16 +317,7 @@ pub(crate) fn motor_put_field(
         "VOF" => match value {
             EpicsValue::Short(v) => {
                 rec.conv.vof = v;
-                if rec.internal.init_invariants_synced {
-                    rec.conv.foff = FreezeOffset::Variable;
-                }
-                Ok(())
-            }
-            _ => Err(CaError::TypeMismatch(name.into())),
-        },
-        "SET" => match value {
-            EpicsValue::Short(v) => {
-                rec.conv.set = v != 0;
+                rec.conv.foff = FreezeOffset::Variable;
                 Ok(())
             }
             _ => Err(CaError::TypeMismatch(name.into())),
@@ -451,9 +329,7 @@ pub(crate) fn motor_put_field(
         "SSET" => match value {
             EpicsValue::Short(v) => {
                 rec.conv.sset = v;
-                if rec.internal.init_invariants_synced {
-                    rec.conv.set = true;
-                }
+                rec.conv.set = true;
                 Ok(())
             }
             _ => Err(CaError::TypeMismatch(name.into())),
@@ -461,31 +337,13 @@ pub(crate) fn motor_put_field(
         "SUSE" => match value {
             EpicsValue::Short(v) => {
                 rec.conv.suse = v;
-                if rec.internal.init_invariants_synced {
-                    rec.conv.set = false;
-                }
-                Ok(())
-            }
-            _ => Err(CaError::TypeMismatch(name.into())),
-        },
-        "IGSET" => match value {
-            EpicsValue::Short(v) => {
-                rec.conv.igset = v != 0;
+                rec.conv.set = false;
                 Ok(())
             }
             _ => Err(CaError::TypeMismatch(name.into())),
         },
         "MRES" => match value {
             EpicsValue::Double(v) => {
-                if !rec.internal.init_invariants_synced {
-                    // dbLoadRecords lands field() raw (C writes the struct
-                    // directly — special() never runs at load);
-                    // `motor_sync_resolution_at_init` reconciles the
-                    // SREV/UREV/MRES triple once loading completes
-                    // (C check_speed_and_resolution, 3905-3927).
-                    rec.conv.mres = v;
-                    return Ok(());
-                }
                 // Rust guard, not C: special MRES (2834-2843) accepts a
                 // zero put and lets the record degenerate; the Rust
                 // division sites (raw conversions, RDBD-in-steps) require
@@ -495,44 +353,41 @@ pub(crate) fn motor_put_field(
                 }
                 rec.conv.mres = v;
                 // C special MRES (2837-2842): make UREV agree.
-                rec.conv.urev = v * rec.conv.srev as f64;
+                let urev = v * rec.conv.srev as f64;
+                if rec.conv.urev != urev {
+                    rec.conv.urev = urev;
+                    rec.mark(m::UREV);
+                }
                 apply_mres_cascade(rec);
                 // C special MRES (2835): MARK(M_MRES) unconditionally —
                 // the pp(TRUE) process pass re-anchors (do_work 1936).
                 rec.internal.res_reanchor = true;
+                rec.mark(m::MRES);
                 Ok(())
             }
             _ => Err(CaError::TypeMismatch(name.into())),
         },
         "ERES" => match value {
             EpicsValue::Double(v) => {
-                if !rec.internal.init_invariants_synced {
-                    // Raw store during load; init seeds a zero ERES from
-                    // the reconciled MRES (C init_record 692-696) —
-                    // mapping here would capture whatever MRES holds
-                    // mid-load.
-                    rec.conv.eres = v;
-                    return Ok(());
-                }
                 // C special ERES (2927-2929): don't allow ERES = 0.
                 rec.conv.eres = if v == 0.0 { rec.conv.mres } else { v };
                 // C special ERES (2930): MARK(M_ERES) unconditionally.
                 rec.internal.res_reanchor = true;
+                rec.mark(m::ERES);
                 Ok(())
             }
             _ => Err(CaError::TypeMismatch(name.into())),
         },
         "SREV" => match value {
             EpicsValue::Long(v) => {
-                if !rec.internal.init_invariants_synced {
-                    // Raw store during load (even non-positive — C raw-writes
-                    // it and the init reconcile clamps, 3905-3909).
-                    rec.conv.srev = v;
-                    return Ok(());
-                }
                 // C special SREV (2914-2918): a non-positive put is
                 // clamped to 200, not rejected.
-                let v = if v <= 0 { 200 } else { v };
+                let v = if v <= 0 {
+                    rec.mark(m::SREV);
+                    200
+                } else {
+                    v
+                };
                 let old_mres = rec.conv.mres;
                 rec.conv.srev = v;
                 // C special SREV (2919-2923): make MRES agree — and
@@ -550,6 +405,7 @@ pub(crate) fn motor_put_field(
                 // MRES actually changed.
                 if rec.conv.mres != old_mres {
                     rec.internal.res_reanchor = true;
+                    rec.mark(m::MRES);
                 }
                 Ok(())
             }
@@ -557,10 +413,6 @@ pub(crate) fn motor_put_field(
         },
         "UREV" => match value {
             EpicsValue::Double(v) => {
-                if !rec.internal.init_invariants_synced {
-                    rec.conv.urev = v;
-                    return Ok(());
-                }
                 // Rust guard, not C: special UREV (2848-2853) accepts a
                 // zero put and derives MRES = 0; the Rust division sites
                 // require a nonzero resolution, so drop it — uniform
@@ -579,6 +431,7 @@ pub(crate) fn motor_put_field(
                 // MRES actually changed.
                 if rec.conv.mres != old_mres {
                     rec.internal.res_reanchor = true;
+                    rec.mark(m::MRES);
                 }
                 Ok(())
             }
@@ -591,7 +444,7 @@ pub(crate) fn motor_put_field(
                 // dbLoadRecords writes field() values raw, so a template's
                 // UEIP=Yes survives load (MSTA is still empty) until the
                 // first poll's encoder check (process_motor_info 3671-3675).
-                if ueip && rec.internal.init_invariants_synced {
+                if ueip {
                     // C: if UEIP=Yes and encoder present, set URIP=No
                     // If no encoder present, override UEIP back to No
                     if rec.stat.msta.contains(MstaFlags::ENCODER_PRESENT) {
@@ -603,6 +456,7 @@ pub(crate) fn motor_put_field(
                         // fires the do_work re-anchor.
                         rec.conv.ueip = false;
                         rec.internal.res_reanchor = true;
+                        rec.mark(m::UEIP);
                         return Ok(());
                     }
                 }
@@ -620,39 +474,12 @@ pub(crate) fn motor_put_field(
                 // may land Yes (raw field() writes); the first poll
                 // resolves precedence (UEIP is checked first at 3676,
                 // unless the encoder check demotes it).
-                if urip && rec.conv.ueip && rec.internal.init_invariants_synced {
+                if urip && rec.conv.ueip {
                     rec.conv.ueip = false;
                     rec.internal.res_reanchor = true;
+                    rec.mark(m::UEIP);
                 }
                 rec.conv.urip = urip;
-                Ok(())
-            }
-            _ => Err(CaError::TypeMismatch(name.into())),
-        },
-        "RRES" => match value {
-            EpicsValue::Double(v) => {
-                rec.conv.rres = v;
-                Ok(())
-            }
-            _ => Err(CaError::TypeMismatch(name.into())),
-        },
-        "RDBL_VAL" => match value {
-            EpicsValue::Double(v) => {
-                rec.conv.rdbl_value = Some(v);
-                Ok(())
-            }
-            _ => Err(CaError::TypeMismatch(name.into())),
-        },
-        "RSTM" => match value {
-            EpicsValue::Short(v) => {
-                rec.conv.rstm = RestoreMode::from_i16(v);
-                Ok(())
-            }
-            _ => Err(CaError::TypeMismatch(name.into())),
-        },
-        "LOADPOS_BLOCK" => match value {
-            EpicsValue::Short(v) => {
-                rec.conv.loadpos_blocked = v != 0;
                 Ok(())
             }
             _ => Err(CaError::TypeMismatch(name.into())),
@@ -665,18 +492,18 @@ pub(crate) fn motor_put_field(
                 // only. During dbLoadRecords each field() lands raw (C writes
                 // the struct directly); `motor_sync_speed_at_init` reconciles
                 // the pairs once all fields are applied.
-                if rec.internal.init_invariants_synced {
-                    // C motorRecord.cc:2690: VELO is clamped into [VBAS, VMAX].
-                    range_check(&mut rec.vel.velo, rec.vel.vbas, rec.vel.vmax);
-                    let urev_abs = rec.conv.urev.abs();
-                    if urev_abs > 0.0 {
-                        rec.vel.s = rec.vel.velo / urev_abs;
-                    }
-                    // C: 7291b556 — recalc ACCL/ACCS based on ACCU. Also
-                    // special()-only: a load must leave the accel pair raw
-                    // (see `motor_sync_speed_at_init`).
-                    apply_accu_cascade(rec);
+                // C motorRecord.cc:2690: VELO is clamped into [VBAS, VMAX].
+                if range_check(&mut rec.vel.velo, rec.vel.vbas, rec.vel.vmax) {
+                    rec.internal.put_posted |= m::PUT_VELO;
                 }
+                let urev_abs = rec.conv.urev.abs();
+                if urev_abs > 0.0 {
+                    rec.vel.s = rec.vel.velo / urev_abs;
+                }
+                // C: 7291b556 — recalc ACCL/ACCS based on ACCU. Also
+                // special()-only: a load must leave the accel pair raw
+                // (see `motor_sync_speed_at_init`).
+                apply_accu_cascade(rec);
                 Ok(())
             }
             _ => Err(CaError::TypeMismatch(name.into())),
@@ -684,24 +511,24 @@ pub(crate) fn motor_put_field(
         "VBAS" => match value {
             EpicsValue::Double(v) => {
                 rec.vel.vbas = v;
-                if rec.internal.init_invariants_synced {
-                    // C motorRecord.cc:2628-2632: VBAS is forced non-negative.
-                    if rec.vel.vbas < 0.0 {
-                        rec.vel.vbas = 0.0;
-                    }
-                    let urev_abs = rec.conv.urev.abs();
-                    if urev_abs > 0.0 {
-                        rec.vel.sbas = rec.vel.vbas / urev_abs;
-                    }
-                    apply_accu_cascade(rec);
-                    // C motorRecord.cc:3121-3127: a VBAS raised above VMAX
-                    // drags VMAX (and SMAX) up with it.
-                    if rec.vel.vmax != 0.0 && rec.vel.vbas > rec.vel.vmax {
-                        rec.vel.vmax = rec.vel.vbas;
-                        rec.vel.smax = rec.vel.sbas;
-                    }
-                    revalidate_velocities(rec);
+                // C motorRecord.cc:2628-2632: VBAS is forced non-negative.
+                if rec.vel.vbas < 0.0 {
+                    rec.vel.vbas = 0.0;
+                    rec.internal.put_posted |= m::PUT_VBAS;
                 }
+                let urev_abs = rec.conv.urev.abs();
+                if urev_abs > 0.0 && rec.vel.sbas != rec.vel.vbas / urev_abs {
+                    rec.vel.sbas = rec.vel.vbas / urev_abs;
+                    rec.internal.put_posted |= m::PUT_SBAS;
+                }
+                apply_accu_cascade(rec);
+                // C motorRecord.cc:3121-3127: a VBAS raised above VMAX
+                // drags VMAX (and SMAX) up with it.
+                if rec.vel.vmax != 0.0 && rec.vel.vbas > rec.vel.vmax {
+                    rec.vel.vmax = rec.vel.vbas;
+                    rec.vel.smax = rec.vel.sbas;
+                }
+                revalidate_velocities(rec);
                 Ok(())
             }
             _ => Err(CaError::TypeMismatch(name.into())),
@@ -709,23 +536,22 @@ pub(crate) fn motor_put_field(
         "VMAX" => match value {
             EpicsValue::Double(v) => {
                 rec.vel.vmax = v;
-                if rec.internal.init_invariants_synced {
-                    // C motorRecord.cc:2660-2664: VMAX is forced non-negative.
-                    if rec.vel.vmax < 0.0 {
-                        rec.vel.vmax = 0.0;
-                    }
-                    let urev_abs = rec.conv.urev.abs();
-                    if urev_abs > 0.0 {
-                        rec.vel.smax = rec.vel.vmax / urev_abs;
-                    }
-                    // C motorRecord.cc:3110-3117: a VMAX dropped below VBAS
-                    // drags VBAS (and SBAS) down with it.
-                    if rec.vel.vmax != 0.0 && rec.vel.vmax < rec.vel.vbas {
-                        rec.vel.vbas = rec.vel.vmax;
-                        rec.vel.sbas = rec.vel.smax;
-                    }
-                    revalidate_velocities(rec);
+                // C motorRecord.cc:2660-2664: VMAX is forced non-negative.
+                if rec.vel.vmax < 0.0 {
+                    rec.vel.vmax = 0.0;
                 }
+                let urev_abs = rec.conv.urev.abs();
+                if urev_abs > 0.0 {
+                    rec.vel.smax = rec.vel.vmax / urev_abs;
+                }
+                // C motorRecord.cc:3110-3117: a VMAX dropped below VBAS
+                // drags VBAS (and SBAS) down with it.
+                if rec.vel.vmax != 0.0 && rec.vel.vmax < rec.vel.vbas {
+                    rec.vel.vbas = rec.vel.vmax;
+                    rec.vel.sbas = rec.vel.smax;
+                    rec.mark(m::VBAS | m::SBAS);
+                }
+                revalidate_velocities(rec);
                 Ok(())
             }
             _ => Err(CaError::TypeMismatch(name.into())),
@@ -733,16 +559,15 @@ pub(crate) fn motor_put_field(
         "S" => match value {
             EpicsValue::Double(v) => {
                 rec.vel.s = v;
-                if rec.internal.init_invariants_synced {
-                    // C motorRecord.cc:2702: S is clamped into [SBAS, SMAX].
-                    range_check(&mut rec.vel.s, rec.vel.sbas, rec.vel.smax);
-                    let urev_abs = rec.conv.urev.abs();
-                    if urev_abs > 0.0 {
-                        rec.vel.velo = rec.vel.s * urev_abs;
-                    }
-                    // C motorRecord.cc:2710: ACCL/ACCS follow the VELO change.
-                    apply_accu_cascade(rec);
+                // C motorRecord.cc:2702: S is clamped into [SBAS, SMAX].
+                range_check(&mut rec.vel.s, rec.vel.sbas, rec.vel.smax);
+                let urev_abs = rec.conv.urev.abs();
+                if urev_abs > 0.0 && rec.vel.velo != rec.vel.s * urev_abs {
+                    rec.vel.velo = rec.vel.s * urev_abs;
+                    rec.internal.put_posted |= m::PUT_VELO;
                 }
+                // C motorRecord.cc:2710: ACCL/ACCS follow the VELO change.
+                apply_accu_cascade(rec);
                 Ok(())
             }
             _ => Err(CaError::TypeMismatch(name.into())),
@@ -750,24 +575,25 @@ pub(crate) fn motor_put_field(
         "SBAS" => match value {
             EpicsValue::Double(v) => {
                 rec.vel.sbas = v;
-                if rec.internal.init_invariants_synced {
-                    // C motorRecord.cc:2644-2648: SBAS is forced non-negative.
-                    if rec.vel.sbas < 0.0 {
-                        rec.vel.sbas = 0.0;
-                    }
-                    let urev_abs = rec.conv.urev.abs();
-                    if urev_abs > 0.0 {
-                        rec.vel.vbas = rec.vel.sbas * urev_abs;
-                    }
-                    // C motorRecord.cc:2655: ACCL/ACCS follow the VBAS change.
-                    apply_accu_cascade(rec);
-                    // C motorRecord.cc:3121-3127 (shared VBAS/SBAS tail).
-                    if rec.vel.vmax != 0.0 && rec.vel.vbas > rec.vel.vmax {
-                        rec.vel.vmax = rec.vel.vbas;
-                        rec.vel.smax = rec.vel.sbas;
-                    }
-                    revalidate_velocities(rec);
+                // C motorRecord.cc:2644-2648: SBAS is forced non-negative.
+                if rec.vel.sbas < 0.0 {
+                    rec.vel.sbas = 0.0;
+                    rec.internal.put_posted |= m::PUT_SBAS;
                 }
+                // C 2650 has no UREV guard here.
+                let vbas = rec.conv.urev.abs() * rec.vel.sbas;
+                if rec.vel.vbas != vbas {
+                    rec.vel.vbas = vbas;
+                    rec.internal.put_posted |= m::PUT_VBAS;
+                }
+                // C motorRecord.cc:2655: ACCL/ACCS follow the VBAS change.
+                apply_accu_cascade(rec);
+                // C motorRecord.cc:3121-3127 (shared VBAS/SBAS tail).
+                if rec.vel.vmax != 0.0 && rec.vel.vbas > rec.vel.vmax {
+                    rec.vel.vmax = rec.vel.vbas;
+                    rec.vel.smax = rec.vel.sbas;
+                }
+                revalidate_velocities(rec);
                 Ok(())
             }
             _ => Err(CaError::TypeMismatch(name.into())),
@@ -775,22 +601,21 @@ pub(crate) fn motor_put_field(
         "SMAX" => match value {
             EpicsValue::Double(v) => {
                 rec.vel.smax = v;
-                if rec.internal.init_invariants_synced {
-                    // C motorRecord.cc:2675-2679: SMAX is forced non-negative.
-                    if rec.vel.smax < 0.0 {
-                        rec.vel.smax = 0.0;
-                    }
-                    let urev_abs = rec.conv.urev.abs();
-                    if urev_abs > 0.0 {
-                        rec.vel.vmax = rec.vel.smax * urev_abs;
-                    }
-                    // C motorRecord.cc:3110-3117 (shared VMAX/SMAX tail).
-                    if rec.vel.vmax != 0.0 && rec.vel.vmax < rec.vel.vbas {
-                        rec.vel.vbas = rec.vel.vmax;
-                        rec.vel.sbas = rec.vel.smax;
-                    }
-                    revalidate_velocities(rec);
+                // C motorRecord.cc:2675-2679: SMAX is forced non-negative.
+                if rec.vel.smax < 0.0 {
+                    rec.vel.smax = 0.0;
                 }
+                let urev_abs = rec.conv.urev.abs();
+                if urev_abs > 0.0 {
+                    rec.vel.vmax = rec.vel.smax * urev_abs;
+                }
+                // C motorRecord.cc:3110-3117 (shared VMAX/SMAX tail).
+                if rec.vel.vmax != 0.0 && rec.vel.vmax < rec.vel.vbas {
+                    rec.vel.vbas = rec.vel.vmax;
+                    rec.vel.sbas = rec.vel.smax;
+                    rec.mark(m::VBAS | m::SBAS);
+                }
+                revalidate_velocities(rec);
                 Ok(())
             }
             _ => Err(CaError::TypeMismatch(name.into())),
@@ -806,12 +631,10 @@ pub(crate) fn motor_put_field(
                 // the field() value raw and leaves ACCS alone —
                 // `motor_sync_speed_at_init` reconciles the pair, keying on
                 // "did the .db set ACCS" exactly as C does.
-                if rec.internal.init_invariants_synced {
-                    if rec.vel.accl <= 0.0 {
-                        rec.vel.accl = 0.1;
-                    }
-                    update_accs_from_accl(rec);
+                if rec.vel.accl <= 0.0 {
+                    rec.vel.accl = 0.1;
                 }
+                update_accs_from_accl(rec);
                 Ok(())
             }
             _ => Err(CaError::TypeMismatch(name.into())),
@@ -825,20 +648,10 @@ pub(crate) fn motor_put_field(
                 // (updateACCLfromACCS). ACCU is NOT touched (63bfe5d0 dropped
                 // the 36177f7b auto-switch). Runtime-only, as for ACCL.
                 rec.vel.accs = v;
-                if rec.internal.init_invariants_synced {
-                    if rec.vel.accs <= 0.0 {
-                        update_accs_from_accl(rec);
-                    }
-                    update_accl_from_accs(rec);
+                if rec.vel.accs <= 0.0 {
+                    update_accs_from_accl(rec);
                 }
-                Ok(())
-            }
-            _ => Err(CaError::TypeMismatch(name.into())),
-        },
-        "ACCU" => match value {
-            EpicsValue::Short(v) => {
-                // C: 63bfe5d0 — ACCU is autosave/CA-writable; does not recompute.
-                rec.vel.accu = AccsUsed::from_i16(v);
+                update_accl_from_accs(rec);
                 Ok(())
             }
             _ => Err(CaError::TypeMismatch(name.into())),
@@ -846,13 +659,11 @@ pub(crate) fn motor_put_field(
         "BVEL" => match value {
             EpicsValue::Double(v) => {
                 rec.vel.bvel = v;
-                if rec.internal.init_invariants_synced {
-                    // C motorRecord.cc:2714: BVEL is clamped into [VBAS, VMAX].
-                    range_check(&mut rec.vel.bvel, rec.vel.vbas, rec.vel.vmax);
-                    let urev_abs = rec.conv.urev.abs();
-                    if urev_abs > 0.0 {
-                        rec.vel.sbak = rec.vel.bvel / urev_abs;
-                    }
+                // C motorRecord.cc:2714: BVEL is clamped into [VBAS, VMAX].
+                range_check(&mut rec.vel.bvel, rec.vel.vbas, rec.vel.vmax);
+                let urev_abs = rec.conv.urev.abs();
+                if urev_abs > 0.0 {
+                    rec.vel.sbak = rec.vel.bvel / urev_abs;
                 }
                 Ok(())
             }
@@ -869,10 +680,8 @@ pub(crate) fn motor_put_field(
         "HVEL" => match value {
             EpicsValue::Double(v) => {
                 rec.vel.hvel = v;
-                if rec.internal.init_invariants_synced {
-                    // C motorRecord.cc:3081: HVEL is clamped into [VBAS, VMAX].
-                    range_check(&mut rec.vel.hvel, rec.vel.vbas, rec.vel.vmax);
-                }
+                // C motorRecord.cc:3081: HVEL is clamped into [VBAS, VMAX].
+                range_check(&mut rec.vel.hvel, rec.vel.vbas, rec.vel.vmax);
                 Ok(())
             }
             _ => Err(CaError::TypeMismatch(name.into())),
@@ -880,13 +689,25 @@ pub(crate) fn motor_put_field(
         "JVEL" => match value {
             EpicsValue::Double(v) => {
                 rec.vel.jvel = v;
-                if rec.internal.init_invariants_synced {
-                    // C motorRecord.cc:3057: JVEL is clamped into [VBAS, VMAX].
-                    range_check(&mut rec.vel.jvel, rec.vel.vbas, rec.vel.vmax);
-                    // C motorRecord.cc:3059-3072: a JVEL write landing on an
-                    // active jog retunes it in place. The retune command is
-                    // emitted by the process pass that follows this put.
-                    rec.jog_retune_pending = true;
+                // C motorRecord.cc:3057: JVEL is clamped into [VBAS, VMAX].
+                range_check(&mut rec.vel.jvel, rec.vel.vbas, rec.vel.vmax);
+                // C motorRecord.cc:3059-3072: a JVEL write landing on an
+                // active jog retunes it in place. Direction comes from
+                // the JOGR field, not the MIP bit (3064), folded to the
+                // dial frame as emit_jog does.
+                if rec.stat.mip.intersects(MipFlags::JOGF | MipFlags::JOGR) {
+                    let forward = rec.ctrl.jogr == 0;
+                    let dial_forward = forward != (rec.conv.dir == MotorDir::Neg);
+                    let jog = MotorCommand::JogVelocity {
+                        min_velocity: rec.raw_rate(rec.effective_vbas()),
+                        velocity: rec.raw_position(if dial_forward {
+                            rec.vel.jvel
+                        } else {
+                            -rec.vel.jvel
+                        }),
+                        acceleration: rec.raw_rate(rec.jog_accel_egu()),
+                    };
+                    rec.send_special(jog.after_speeds(SpeedWrites::JOG_RETUNE));
                 }
                 Ok(())
             }
@@ -899,7 +720,7 @@ pub(crate) fn motor_put_field(
                 // by JVEL / 0.1. Runtime special() only — during load field()
                 // lands raw, and an unconfigured JAR (== 0) is derived from
                 // VELO/ACCL at init.
-                if rec.internal.init_invariants_synced && rec.vel.jar <= 0.0 {
+                if rec.vel.jar <= 0.0 {
                     rec.vel.jar = rec.vel.jvel / 0.1;
                 }
                 Ok(())
@@ -909,13 +730,11 @@ pub(crate) fn motor_put_field(
         "SBAK" => match value {
             EpicsValue::Double(v) => {
                 rec.vel.sbak = v;
-                if rec.internal.init_invariants_synced {
-                    // C motorRecord.cc:2725: SBAK is clamped into [SBAS, SMAX].
-                    range_check(&mut rec.vel.sbak, rec.vel.sbas, rec.vel.smax);
-                    let urev_abs = rec.conv.urev.abs();
-                    if urev_abs > 0.0 {
-                        rec.vel.bvel = rec.vel.sbak * urev_abs;
-                    }
+                // C motorRecord.cc:2725: SBAK is clamped into [SBAS, SMAX].
+                range_check(&mut rec.vel.sbak, rec.vel.sbas, rec.vel.smax);
+                let urev_abs = rec.conv.urev.abs();
+                if urev_abs > 0.0 {
+                    rec.vel.bvel = rec.vel.sbak * urev_abs;
                 }
                 Ok(())
             }
@@ -928,17 +747,19 @@ pub(crate) fn motor_put_field(
                 // C special BDST (2987-2989): "New backlash distance.
                 // Make sure retry deadband is achievable." Runtime only,
                 // same load/init split as RDBD.
-                if rec.internal.init_invariants_synced {
-                    rec.enforce_min_retry_deadband();
-                }
+                rec.enforce_min_retry_deadband();
                 Ok(())
             }
             _ => Err(CaError::TypeMismatch(name.into())),
         },
         "FRAC" => match value {
-            EpicsValue::Double(v) => {
+            EpicsValue::Float(v) => {
                 // C: FRAC clamped to [0.1, 1.5]
                 rec.retry.frac = v.clamp(0.1, 1.5);
+                Ok(())
+            }
+            EpicsValue::Double(v) => {
+                rec.retry.frac = (v as f32).clamp(0.1, 1.5);
                 Ok(())
             }
             _ => Err(CaError::TypeMismatch(name.into())),
@@ -952,30 +773,7 @@ pub(crate) fn motor_put_field(
                 // init_record enforces once against the final MRES
                 // (C 642) — enforcing mid-load would clamp against
                 // whatever MRES happens to hold at that point in the .db.
-                if rec.internal.init_invariants_synced {
-                    rec.enforce_min_retry_deadband();
-                }
-                Ok(())
-            }
-            _ => Err(CaError::TypeMismatch(name.into())),
-        },
-        "SPDB" => match value {
-            EpicsValue::Double(v) => {
-                rec.retry.spdb = v;
-                Ok(())
-            }
-            _ => Err(CaError::TypeMismatch(name.into())),
-        },
-        "RTRY" => match value {
-            EpicsValue::Short(v) => {
-                rec.retry.rtry = v;
-                Ok(())
-            }
-            _ => Err(CaError::TypeMismatch(name.into())),
-        },
-        "RMOD" => match value {
-            EpicsValue::Short(v) => {
-                rec.retry.rmod = RetryMode::from_i16(v);
+                rec.enforce_min_retry_deadband();
                 Ok(())
             }
             _ => Err(CaError::TypeMismatch(name.into())),
@@ -990,17 +788,30 @@ pub(crate) fn motor_put_field(
                 // selected by `dir_positive ^ (mres < 0)` (4098-4107).
                 // The pair is never re-ordered: writing HLM below LLM
                 // leaves an inverted dial pair, which latches LVIO below
-                // and blocks every move until corrected.
+                // and blocks every move until corrected. A device that
+                // refuses the limit (4112-4121) moves neither, and HLM
+                // goes back to that dial limit as the device left it.
                 let dial = coordinate::user_to_dial(v, rec.conv.dir, rec.pos.off);
                 if rec.conv.dir == MotorDir::Pos {
-                    rec.limits.dhlm = dial;
-                    update_raw_from_dial_high(rec, dial);
-                    queue_limit_forward(rec, DialLimit::High, dial);
+                    if forward_limit(rec, DialLimit::High, dial) {
+                        rec.limits.dhlm = dial;
+                        update_raw_from_dial_high(rec, dial);
+                    } else {
+                        rec.limits.hlm =
+                            coordinate::dial_to_user(rec.limits.dhlm, rec.conv.dir, rec.pos.off);
+                    }
+                    rec.mark(m::DHLM);
                 } else {
-                    rec.limits.dllm = dial;
-                    update_raw_from_dial_low(rec, dial);
-                    queue_limit_forward(rec, DialLimit::Low, dial);
+                    if forward_limit(rec, DialLimit::Low, dial) {
+                        rec.limits.dllm = dial;
+                        update_raw_from_dial_low(rec, dial);
+                    } else {
+                        rec.limits.hlm =
+                            coordinate::dial_to_user(rec.limits.dllm, rec.conv.dir, rec.pos.off);
+                    }
+                    rec.mark(m::DLLM);
                 }
+                rec.mark(m::HLM);
                 detect_inverted_limits(&mut rec.limits, rec.pos.dval);
                 Ok(())
             }
@@ -1013,14 +824,25 @@ pub(crate) fn motor_put_field(
                 // of HLM — DLLM when DIR=Pos, DHLM when DIR=Neg.
                 let dial = coordinate::user_to_dial(v, rec.conv.dir, rec.pos.off);
                 if rec.conv.dir == MotorDir::Pos {
-                    rec.limits.dllm = dial;
-                    update_raw_from_dial_low(rec, dial);
-                    queue_limit_forward(rec, DialLimit::Low, dial);
+                    if forward_limit(rec, DialLimit::Low, dial) {
+                        rec.limits.dllm = dial;
+                        update_raw_from_dial_low(rec, dial);
+                    } else {
+                        rec.limits.llm =
+                            coordinate::dial_to_user(rec.limits.dllm, rec.conv.dir, rec.pos.off);
+                    }
+                    rec.mark(m::DLLM);
                 } else {
-                    rec.limits.dhlm = dial;
-                    update_raw_from_dial_high(rec, dial);
-                    queue_limit_forward(rec, DialLimit::High, dial);
+                    if forward_limit(rec, DialLimit::High, dial) {
+                        rec.limits.dhlm = dial;
+                        update_raw_from_dial_high(rec, dial);
+                    } else {
+                        rec.limits.llm =
+                            coordinate::dial_to_user(rec.limits.dhlm, rec.conv.dir, rec.pos.off);
+                    }
+                    rec.mark(m::DHLM);
                 }
+                rec.mark(m::LLM);
                 detect_inverted_limits(&mut rec.limits, rec.pos.dval);
                 Ok(())
             }
@@ -1029,17 +851,10 @@ pub(crate) fn motor_put_field(
         "DHLM" => match value {
             EpicsValue::Double(v) => {
                 rec.limits.dhlm = v;
-                update_raw_from_dial_high(rec, v);
-                queue_limit_forward(rec, DialLimit::High, v);
-                // C set_dial_highlimit (motorRecord.cc:4236-4277): a dial
-                // high-limit write updates exactly ONE user limit — HLM
-                // when DIR=Pos, LLM when DIR=Neg. No re-ordering.
-                let user = coordinate::dial_to_user(v, rec.conv.dir, rec.pos.off);
-                if rec.conv.dir == MotorDir::Pos {
-                    rec.limits.hlm = user;
-                } else {
-                    rec.limits.llm = user;
-                }
+                // C special() runs set_dial_highlimit (2806); a
+                // dbLoadRecords field() is a raw write.
+                rec.set_dial_limit(true);
+                rec.mark(m::DHLM);
                 detect_inverted_limits(&mut rec.limits, rec.pos.dval);
                 Ok(())
             }
@@ -1048,42 +863,10 @@ pub(crate) fn motor_put_field(
         "DLLM" => match value {
             EpicsValue::Double(v) => {
                 rec.limits.dllm = v;
-                update_raw_from_dial_low(rec, v);
-                queue_limit_forward(rec, DialLimit::Low, v);
-                // C set_dial_lowlimit (motorRecord.cc:4287-4328): mirror
-                // of DHLM — LLM when DIR=Pos, HLM when DIR=Neg.
-                let user = coordinate::dial_to_user(v, rec.conv.dir, rec.pos.off);
-                if rec.conv.dir == MotorDir::Pos {
-                    rec.limits.llm = user;
-                } else {
-                    rec.limits.hlm = user;
-                }
+                // C special() runs set_dial_lowlimit (2811).
+                rec.set_dial_limit(false);
+                rec.mark(m::DLLM);
                 detect_inverted_limits(&mut rec.limits, rec.pos.dval);
-                Ok(())
-            }
-            _ => Err(CaError::TypeMismatch(name.into())),
-        },
-        "RHLM" => match value {
-            EpicsValue::Double(v) => {
-                // C dbd (2e89b552): SPC_NOMOD — a database field() load
-                // is a raw struct write; the raw-wins rule at init
-                // (motor_sync_limits_at_init) derives the dial pair.
-                // Runtime CA writes never reach here (read_only).
-                rec.limits.rhlm = v;
-                Ok(())
-            }
-            _ => Err(CaError::TypeMismatch(name.into())),
-        },
-        "RLLM" => match value {
-            EpicsValue::Double(v) => {
-                rec.limits.rllm = v;
-                Ok(())
-            }
-            _ => Err(CaError::TypeMismatch(name.into())),
-        },
-        "HLSV" => match value {
-            EpicsValue::Short(v) => {
-                rec.limits.hlsv = v;
                 Ok(())
             }
             _ => Err(CaError::TypeMismatch(name.into())),
@@ -1099,8 +882,8 @@ pub(crate) fn motor_put_field(
         },
         "STOP" => match value {
             EpicsValue::Short(v) => {
+                rec.ctrl.stop = v;
                 if v != 0 {
-                    rec.ctrl.stop = true;
                     rec.last_write = Some(CommandSource::Stop);
                 }
                 Ok(())
@@ -1119,7 +902,7 @@ pub(crate) fn motor_put_field(
                 // C writes the field value: a 0-write un-latches a parked
                 // button (e.g. one blocked at its limit switch) without
                 // triggering a dispatch pass.
-                rec.ctrl.homf = v != 0;
+                rec.ctrl.homf = v;
                 if v != 0 {
                     rec.last_write = Some(CommandSource::Homf);
                 }
@@ -1135,7 +918,7 @@ pub(crate) fn motor_put_field(
                     return Err(CaError::InvalidValue("HOMR: home in progress".into()));
                 }
                 // C writes the field value, like HOMF above.
-                rec.ctrl.homr = v != 0;
+                rec.ctrl.homr = v;
                 if v != 0 {
                     rec.last_write = Some(CommandSource::Homr);
                 }
@@ -1145,15 +928,16 @@ pub(crate) fn motor_put_field(
         },
         "JOGF" => match value {
             EpicsValue::Short(v) => {
-                rec.ctrl.jogf = v != 0;
+                rec.ctrl.jogf = v;
                 // C special() motorRecordJOGF (3042-3047): a release
                 // clears a parked MIP_JOG_REQ; a press arms it only on an
                 // idle record (mip == MIP_DONE) away from the limit
                 // switch. The armed request parks across Stop/Pause until
-                // the jog dispatch consumes MIP wholesale (2106).
+                // the jog dispatch consumes MIP wholesale (2106). C marks
+                // none of it.
                 if v == 0 {
                     rec.stat.mip.remove(MipFlags::JOG_REQ);
-                } else if rec.stat.mip.is_empty() && !rec.limits.hls {
+                } else if rec.stat.mip.is_empty() && rec.limits.hls == 0 {
                     rec.stat.mip.insert(MipFlags::JOG_REQ);
                 }
                 rec.last_write = Some(CommandSource::Jogf);
@@ -1163,12 +947,12 @@ pub(crate) fn motor_put_field(
         },
         "JOGR" => match value {
             EpicsValue::Short(v) => {
-                rec.ctrl.jogr = v != 0;
+                rec.ctrl.jogr = v;
                 // C special() motorRecordJOGR (3049-3054), mirror of JOGF
                 // with the low limit switch.
                 if v == 0 {
                     rec.stat.mip.remove(MipFlags::JOG_REQ);
-                } else if rec.stat.mip.is_empty() && !rec.limits.lls {
+                } else if rec.stat.mip.is_empty() && rec.limits.lls == 0 {
                     rec.stat.mip.insert(MipFlags::JOG_REQ);
                 }
                 rec.last_write = Some(CommandSource::Jogr);
@@ -1178,8 +962,8 @@ pub(crate) fn motor_put_field(
         },
         "TWF" => match value {
             EpicsValue::Short(v) => {
+                rec.ctrl.twf = v;
                 if v != 0 {
-                    rec.ctrl.twf = true;
                     rec.last_write = Some(CommandSource::Twf);
                 }
                 Ok(())
@@ -1188,17 +972,10 @@ pub(crate) fn motor_put_field(
         },
         "TWR" => match value {
             EpicsValue::Short(v) => {
+                rec.ctrl.twr = v;
                 if v != 0 {
-                    rec.ctrl.twr = true;
                     rec.last_write = Some(CommandSource::Twr);
                 }
-                Ok(())
-            }
-            _ => Err(CaError::TypeMismatch(name.into())),
-        },
-        "TWV" => match value {
-            EpicsValue::Double(v) => {
-                rec.ctrl.twv = v;
                 Ok(())
             }
             _ => Err(CaError::TypeMismatch(name.into())),
@@ -1206,6 +983,13 @@ pub(crate) fn motor_put_field(
         "CNEN" => match value {
             EpicsValue::Short(v) => {
                 rec.ctrl.cnen = v != 0;
+                // C special() CNEN (3029-3040): the torque command goes
+                // out when the put lands, whatever the pass then does.
+                if rec.stat.msta.contains(MstaFlags::GAIN_SUPPORT) {
+                    rec.send_special(vec![MotorCommand::SetClosedLoop {
+                        enable: rec.ctrl.cnen,
+                    }]);
+                }
                 rec.last_write = Some(CommandSource::Cnen);
                 Ok(())
             }
@@ -1227,6 +1011,10 @@ pub(crate) fn motor_put_field(
                 // than ON is forced back to OFF and does not trigger the
                 // protocol.
                 rec.stat.stup = if v == 1 { 1 } else { 0 };
+                // C 3087-3088 posts the forced OFF.
+                if v != 1 {
+                    rec.internal.put_posted |= m::PUT_STUP;
+                }
                 Ok(())
             }
             _ => Err(CaError::TypeMismatch(name.into())),
@@ -1271,6 +1059,239 @@ pub(crate) fn motor_put_field(
                 } else {
                     v
                 };
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "NTMF" => match value {
+            EpicsValue::UShort(v) => {
+                // C motorRecord.cc:3093-3100: integer compare, minimum 2.
+                // The DBF_USHORT field already truncated any fractional CA
+                // put before special() runs.
+                rec.timing.ntmf = if v < 2 { 2 } else { v };
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        // Sync — write-only trigger. C: `82c26005` (2010-04). Only fires on
+        // non-zero put; the readback chain and VAL/DVAL/RVAL are reseeded
+        // in sync_target_position().
+        "SYNC" => match value {
+            EpicsValue::Short(v) => {
+                // C `pmr->sync` is the field value itself — it holds the
+                // request across a busy/paused pass (the apply is
+                // idle-gated, motorRecord.cc:2540-2544) and a last_write
+                // overtaken by a later put.
+                rec.internal.sync = v;
+                if v != 0 {
+                    rec.last_write = Some(CommandSource::Sync);
+                }
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        _ => motor_store_field(rec, name, value),
+    }
+}
+
+/// A raw field write: the whole put at load, and the put of every field
+/// with no special() case at runtime.
+fn motor_store_field(rec: &mut MotorRecord, name: &str, value: EpicsValue) -> CaResult<()> {
+    match name {
+        // A position write keeps its source: was_position_restored reads
+        // it, and initial_readback drops it before any pass.
+        "VAL" => as_f64(value, name).map(|v| {
+            rec.pos.val = v;
+            rec.last_write = Some(CommandSource::Val);
+        }),
+        "DVAL" => as_f64(value, name).map(|v| {
+            rec.pos.dval = v;
+            rec.last_write = Some(CommandSource::Dval);
+        }),
+        "RVAL" => as_long(value, name).map(|v| {
+            rec.pos.rval = v;
+            rec.last_write = Some(CommandSource::Rval);
+        }),
+        "RLV" => as_f64(value, name).map(|v| {
+            rec.pos.rlv = v;
+            rec.last_write = Some(CommandSource::Rlv);
+        }),
+        "OFF" => as_f64(value, name).map(|v| rec.pos.off = v),
+        "DIR" => as_i16(value, name).map(|v| rec.conv.dir = MotorDir::from_i16(v)),
+        "FOF" => as_i16(value, name).map(|v| rec.conv.fof = v),
+        "VOF" => as_i16(value, name).map(|v| rec.conv.vof = v),
+        "SSET" => as_i16(value, name).map(|v| rec.conv.sset = v),
+        "SUSE" => as_i16(value, name).map(|v| rec.conv.suse = v),
+        "MRES" => as_f64(value, name).map(|v| rec.conv.mres = v),
+        "ERES" => as_f64(value, name).map(|v| rec.conv.eres = v),
+        "SREV" => match value {
+            EpicsValue::Long(v) => {
+                rec.conv.srev = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "UREV" => as_f64(value, name).map(|v| rec.conv.urev = v),
+        "UEIP" => as_i16(value, name).map(|v| rec.conv.ueip = v != 0),
+        "URIP" => as_i16(value, name).map(|v| rec.conv.urip = v != 0),
+        "VELO" => as_f64(value, name).map(|v| rec.vel.velo = v),
+        "VBAS" => as_f64(value, name).map(|v| rec.vel.vbas = v),
+        "VMAX" => as_f64(value, name).map(|v| rec.vel.vmax = v),
+        "S" => as_f64(value, name).map(|v| rec.vel.s = v),
+        "SBAS" => as_f64(value, name).map(|v| rec.vel.sbas = v),
+        "SMAX" => as_f64(value, name).map(|v| rec.vel.smax = v),
+        "ACCL" => as_f64(value, name).map(|v| rec.vel.accl = v),
+        "ACCS" => as_f64(value, name).map(|v| rec.vel.accs = v),
+        "BVEL" => as_f64(value, name).map(|v| rec.vel.bvel = v),
+        "BACC" => as_f64(value, name).map(|v| rec.vel.bacc = v),
+        "HVEL" => as_f64(value, name).map(|v| rec.vel.hvel = v),
+        "JVEL" => as_f64(value, name).map(|v| rec.vel.jvel = v),
+        "JAR" => as_f64(value, name).map(|v| rec.vel.jar = v),
+        "SBAK" => as_f64(value, name).map(|v| rec.vel.sbak = v),
+        "BDST" => as_f64(value, name).map(|v| rec.retry.bdst = v),
+        "FRAC" => match value {
+            EpicsValue::Float(v) => {
+                rec.retry.frac = v;
+                Ok(())
+            }
+            EpicsValue::Double(v) => {
+                rec.retry.frac = v as f32;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "RDBD" => as_f64(value, name).map(|v| rec.retry.rdbd = v),
+        "HLM" => as_f64(value, name).map(|v| rec.limits.hlm = v),
+        "LLM" => as_f64(value, name).map(|v| rec.limits.llm = v),
+        "DHLM" => as_f64(value, name).map(|v| rec.limits.dhlm = v),
+        "DLLM" => as_f64(value, name).map(|v| rec.limits.dllm = v),
+        "SPMG" => as_i16(value, name).map(|v| rec.ctrl.spmg = SpmgMode::from_i16(v)),
+        "STOP" => as_i16(value, name).map(|v| rec.ctrl.stop = v),
+        "HOMF" => as_i16(value, name).map(|v| rec.ctrl.homf = v),
+        "HOMR" => as_i16(value, name).map(|v| rec.ctrl.homr = v),
+        "JOGF" => as_i16(value, name).map(|v| rec.ctrl.jogf = v),
+        "JOGR" => as_i16(value, name).map(|v| rec.ctrl.jogr = v),
+        "TWF" => as_i16(value, name).map(|v| rec.ctrl.twf = v),
+        "TWR" => as_i16(value, name).map(|v| rec.ctrl.twr = v),
+        "CNEN" => as_i16(value, name).map(|v| rec.ctrl.cnen = v != 0),
+        "STUP" => as_i16(value, name).map(|v| rec.stat.stup = v),
+        "PCOF" => as_f64(value, name).map(|v| rec.pid.pcof = v),
+        "ICOF" => as_f64(value, name).map(|v| rec.pid.icof = v),
+        "DCOF" => as_f64(value, name).map(|v| rec.pid.dcof = v),
+        "NTMF" => match value {
+            EpicsValue::UShort(v) => {
+                rec.timing.ntmf = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "SYNC" => as_i16(value, name).map(|v| rec.internal.sync = v),
+        "FOFF" => match value {
+            EpicsValue::Short(v) => {
+                rec.conv.foff = FreezeOffset::from_i16(v);
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "SET" => match value {
+            EpicsValue::Short(v) => {
+                rec.conv.set = v != 0;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "IGSET" => match value {
+            EpicsValue::Short(v) => {
+                rec.conv.igset = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "RRES" => match value {
+            EpicsValue::Double(v) => {
+                rec.conv.rres = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "RDBL_VAL" => match value {
+            EpicsValue::Double(v) => {
+                rec.conv.rdbl_value = Some(v);
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "RSTM" => match value {
+            EpicsValue::Short(v) => {
+                rec.conv.rstm = RestoreMode::from_i16(v);
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "LOADPOS_BLOCK" => match value {
+            EpicsValue::Short(v) => {
+                rec.conv.loadpos_blocked = v != 0;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "ACCU" => match value {
+            EpicsValue::Short(v) => {
+                // C: 63bfe5d0 — ACCU is autosave/CA-writable; does not recompute.
+                rec.vel.accu = AccsUsed::from_i16(v);
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "SPDB" => match value {
+            EpicsValue::Double(v) => {
+                rec.retry.spdb = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "RTRY" => match value {
+            EpicsValue::Short(v) => {
+                rec.retry.rtry = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "RMOD" => match value {
+            EpicsValue::Short(v) => {
+                rec.retry.rmod = RetryMode::from_i16(v);
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "RHLM" => match value {
+            EpicsValue::Double(v) => {
+                // C dbd (2e89b552): SPC_NOMOD — a database field() load
+                // is a raw struct write; the raw-wins rule at init
+                // (motor_sync_limits_at_init) derives the dial pair.
+                // Runtime CA writes never reach here (read_only).
+                rec.limits.rhlm = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "RLLM" => match value {
+            EpicsValue::Double(v) => {
+                rec.limits.rllm = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "HLSV" => match value {
+            EpicsValue::Short(v) => {
+                rec.limits.hlsv = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "TWV" => match value {
+            EpicsValue::Double(v) => {
+                rec.ctrl.twv = v;
                 Ok(())
             }
             _ => Err(CaError::TypeMismatch(name.into())),
@@ -1342,33 +1363,6 @@ pub(crate) fn motor_put_field(
             }
             _ => Err(CaError::TypeMismatch(name.into())),
         },
-        "NTMF" => match value {
-            EpicsValue::UShort(v) => {
-                // C motorRecord.cc:3093-3100: integer compare, minimum 2.
-                // The DBF_USHORT field already truncated any fractional CA
-                // put before special() runs.
-                rec.timing.ntmf = if v < 2 { 2 } else { v };
-                Ok(())
-            }
-            _ => Err(CaError::TypeMismatch(name.into())),
-        },
-        // Sync — write-only trigger. C: `82c26005` (2010-04). Only fires on
-        // non-zero put; VAL/DVAL/RVAL get reseeded from RBV/DRBV/RRBV in
-        // command_planner::sync_positions().
-        "SYNC" => match value {
-            EpicsValue::Short(v) => {
-                if v != 0 {
-                    // C `pmr->sync` is the field value itself — latch it
-                    // so the request survives a busy/paused pass (the
-                    // apply is idle-gated, motorRecord.cc:2540-2544) and
-                    // a last_write overtaken by a later put.
-                    rec.internal.sync = true;
-                    rec.last_write = Some(CommandSource::Sync);
-                }
-                Ok(())
-            }
-            _ => Err(CaError::TypeMismatch(name.into())),
-        },
         // Public C motorRecord.dbd link / string surface. The link string is
         // stored verbatim (the DBF_INLINK/DBF_OUTLINK specification); behavioral
         // link processing (closed-loop DOL drive, RDBL readback, RLNK firing) is
@@ -1380,7 +1374,16 @@ pub(crate) fn motor_put_field(
         "STOO" => put_link_string(value, &mut rec.links.stoo, name),
         "DINP" => put_link_string(value, &mut rec.links.dinp, name),
         "RINP" => put_link_string(value, &mut rec.links.rinp, name),
-        "POST" => put_link_string(value, &mut rec.links.post, name),
+        // Read only by a model-1 device at init (motordevCom.cc:310).
+        "INIT" => put_link_string(value, &mut rec.links.init, name),
+        "PREM" => put_link_string(value, &mut rec.links.prem, name),
+        "POST" => match value {
+            EpicsValue::String(v) => {
+                rec.links.post.set(v.as_bytes());
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
         // menuOmsl: 0 = supervisory, 1 = closed_loop.
         "OMSL" => match value {
             EpicsValue::Short(v) => {
@@ -1447,16 +1450,276 @@ pub(crate) fn motor_put_field(
             }
             _ => Err(CaError::TypeMismatch(name.into())),
         },
+        // SPC_NOMOD: stored here, refused to a client by the database gate.
+        "VERS" => match value {
+            EpicsValue::Float(v) => {
+                rec.internal.vers = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "CARD" => match value {
+            EpicsValue::Short(v) => {
+                rec.links.card = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "HLS" => match value {
+            EpicsValue::Short(v) => {
+                rec.limits.hls = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "LLS" => match value {
+            EpicsValue::Short(v) => {
+                rec.limits.lls = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "RHLS" => match value {
+            EpicsValue::Short(v) => {
+                rec.limits.rhls = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "RLLS" => match value {
+            EpicsValue::Short(v) => {
+                rec.limits.rlls = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "LVIO" => match value {
+            EpicsValue::Short(v) => {
+                rec.limits.lvio = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "RCNT" => match value {
+            EpicsValue::Short(v) => {
+                rec.retry.rcnt = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "MISS" => match value {
+            EpicsValue::Short(v) => {
+                rec.retry.miss = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "LSPG" => match value {
+            EpicsValue::Short(v) => {
+                rec.internal.lspg = SpmgMode::from_i16(v);
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "LVAL" => match value {
+            EpicsValue::Double(v) => {
+                rec.internal.lval = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "LDVL" => match value {
+            EpicsValue::Double(v) => {
+                rec.internal.ldvl = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "LRVL" => match value {
+            EpicsValue::Long(v) => {
+                rec.internal.lrvl = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "LRLV" => match value {
+            EpicsValue::Double(v) => {
+                rec.internal.lrlv = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "PP" => match value {
+            EpicsValue::Short(v) => {
+                rec.internal.pp = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "RBV" => match value {
+            EpicsValue::Double(v) => {
+                rec.pos.rbv = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "DRBV" => match value {
+            EpicsValue::Double(v) => {
+                rec.pos.drbv = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "DIFF" => match value {
+            EpicsValue::Double(v) => {
+                rec.pos.diff = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "RDIF" => match value {
+            EpicsValue::Long(v) => {
+                rec.pos.rdif = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "RRBV" => match value {
+            EpicsValue::Long(v) => {
+                rec.pos.rrbv = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "RMP" => match value {
+            EpicsValue::Long(v) => {
+                rec.pos.rmp = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "REP" => match value {
+            EpicsValue::Long(v) => {
+                rec.pos.rep = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "CDIR" => match value {
+            EpicsValue::Short(v) => {
+                rec.stat.cdir = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "DMOV" => match value {
+            EpicsValue::Short(v) => {
+                rec.stat.dmov = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "MOVN" => match value {
+            EpicsValue::Short(v) => {
+                rec.stat.movn = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "TDIR" => match value {
+            EpicsValue::Short(v) => {
+                rec.stat.tdir = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "ATHM" => match value {
+            EpicsValue::Short(v) => {
+                rec.stat.athm = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "RVEL" => match value {
+            EpicsValue::Long(v) => {
+                rec.stat.rvel = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "MSTA" => match value {
+            EpicsValue::ULong(v) => {
+                rec.stat.msta = MstaFlags::from_bits_retain(v);
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "MIP" => match value {
+            EpicsValue::UShort(v) => {
+                rec.stat.mip = MipFlags::from_bits_retain(v);
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "MMAP" => match value {
+            EpicsValue::ULong(v) => {
+                rec.internal.mmap = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "NMAP" => match value {
+            EpicsValue::ULong(v) => {
+                rec.internal.nmap = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
         _ => Err(CaError::FieldNotFound(name.into())),
+    }
+}
+
+fn as_f64(value: EpicsValue, name: &str) -> CaResult<f64> {
+    match value {
+        EpicsValue::Double(v) => Ok(v),
+        _ => Err(CaError::TypeMismatch(name.into())),
+    }
+}
+
+fn as_i16(value: EpicsValue, name: &str) -> CaResult<i16> {
+    match value {
+        EpicsValue::Short(v) => Ok(v),
+        _ => Err(CaError::TypeMismatch(name.into())),
+    }
+}
+
+/// RVAL is DBF_LONG (motorRecord.dbd): any scalar number takes the C put
+/// conversion to epicsInt32.
+fn as_long(value: EpicsValue, name: &str) -> CaResult<i32> {
+    match value {
+        EpicsValue::Long(v) => Ok(v),
+        v @ (EpicsValue::Double(_)
+        | EpicsValue::Float(_)
+        | EpicsValue::Short(_)
+        | EpicsValue::UShort(_)
+        | EpicsValue::Char(_)
+        | EpicsValue::Int64(_)
+        | EpicsValue::UInt64(_)
+        | EpicsValue::ULong(_)
+        | EpicsValue::Enum(_)) => match v.convert_to(DbFieldType::Long) {
+            EpicsValue::Long(v) => Ok(v),
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        _ => Err(CaError::TypeMismatch(name.into())),
     }
 }
 
 /// Store a DBF_INLINK/DBF_OUTLINK specification string verbatim, mirroring how
 /// C `dbPutString` records the link before `recGblInitConstantLink`/resolution.
-fn put_link_string(value: EpicsValue, slot: &mut String, name: &str) -> CaResult<()> {
+fn put_link_string(value: EpicsValue, slot: &mut PvString, name: &str) -> CaResult<()> {
     match value {
         EpicsValue::String(v) => {
-            *slot = v.as_str_lossy().into_owned();
+            *slot = v;
             Ok(())
         }
         _ => Err(CaError::TypeMismatch(name.into())),
@@ -1526,14 +1789,22 @@ fn apply_mres_cascade(rec: &mut MotorRecord) {
     // the rev-unit speeds are invariant — re-derive the EGU speeds.
     let urev_abs = rec.conv.urev.abs();
     if urev_abs > 0.0 {
-        rec.vel.velo = urev_abs * rec.vel.s;
-        rec.vel.vbas = urev_abs * rec.vel.sbas;
+        let (velo, vbas) = (urev_abs * rec.vel.s, urev_abs * rec.vel.sbas);
+        if rec.vel.velo != velo {
+            rec.vel.velo = velo;
+            rec.mark(m::VELO);
+        }
+        if rec.vel.vbas != vbas {
+            rec.vel.vbas = vbas;
+            rec.mark(m::VBAS);
+        }
         rec.vel.bvel = urev_abs * rec.vel.sbak;
         rec.vel.vmax = urev_abs * rec.vel.smax;
     }
     if rec.conv.mres == 0.0 {
         return;
     }
+    let (dhlm, dllm) = (rec.limits.dhlm, rec.limits.dllm);
     // C special MRES (2877-2906): the raw pair is the invariant —
     // recompute dial from raw. MRES < 0 crosses the assignment with
     // the SIGNED resolution (dhlm = rllm * mres, dllm = rhlm * mres,
@@ -1546,7 +1817,16 @@ fn apply_mres_cascade(rec: &mut MotorRecord) {
     } else {
         rec.limits.dhlm = rec.limits.rllm * rec.conv.mres;
         rec.limits.dllm = rec.limits.rhlm * rec.conv.mres;
+        rec.internal.put_posted |= m::PUT_HLM_SWAP | m::PUT_LLM_SWAP;
     }
+    // C 2880-2909: posted from special(), not marked.
+    if rec.limits.dhlm != dhlm {
+        rec.internal.put_posted |= m::PUT_DHLM;
+    }
+    if rec.limits.dllm != dllm {
+        rec.internal.put_posted |= m::PUT_DLLM;
+    }
+    rec.internal.put_posted |= m::PUT_HLM | m::PUT_LLM;
     rec.set_userlimits();
     // C restores the RDBD >= |MRES| invariant at the next process pass
     // (do_work 1971); enforcing here is the same invariant, one pass
@@ -1556,13 +1836,15 @@ fn apply_mres_cascade(rec: &mut MotorRecord) {
 
 /// C `range_check` (motorRecord.cc:4358): clamp `parm` up to `min`, and
 /// down to `max` unless `max` is 0 (no ceiling configured).
-fn range_check(parm: &mut f64, min: f64, max: f64) {
+fn range_check(parm: &mut f64, min: f64, max: f64) -> bool {
+    let old = *parm;
     if *parm < min {
         *parm = min;
     }
     if max != 0.0 && *parm > max {
         *parm = max;
     }
+    *parm != old
 }
 
 /// C special() `velcheckA` tail (motorRecord.cc:3128-3146): after a
@@ -1571,7 +1853,10 @@ fn range_check(parm: &mut f64, min: f64, max: f64) {
 /// partners of VELO and BVEL.
 fn revalidate_velocities(rec: &mut MotorRecord) {
     let urev_abs = rec.conv.urev.abs();
-    range_check(&mut rec.vel.velo, rec.vel.vbas, rec.vel.vmax);
+    // range_check posts what it clamps (4374-4378).
+    if range_check(&mut rec.vel.velo, rec.vel.vbas, rec.vel.vmax) {
+        rec.internal.put_posted |= m::PUT_VELO;
+    }
     if urev_abs > 0.0 {
         rec.vel.s = rec.vel.velo / urev_abs;
     }
@@ -1588,27 +1873,26 @@ fn revalidate_velocities(rec: &mut MotorRecord) {
 /// after `dbLoadRecords` has applied every `field()` as a raw struct
 /// write. A nonzero loaded UREV wins over a loaded MRES; SREV is clamped
 /// sane first so both derivations divide by the final value.
-///
-/// The Rust default MRES is 1.0 where the dbd leaves it 0.0: the C
-/// `mres == 0 → 1.0` arm (3917-3921) makes both starting points converge,
-/// and the UREV-wins arm overwrites MRES regardless, so no load scenario
-/// can tell the defaults apart.
 pub(crate) fn motor_sync_resolution_at_init(rec: &mut MotorRecord) {
     // C 3905-3909: SREV (steps/revolution) must be sane.
     if rec.conv.srev <= 0 {
         rec.conv.srev = 200;
+        rec.mark(m::SREV);
     }
     // C 3912-3916: UREV (EGU/revolution) <--> MRES (EGU/step).
     if rec.conv.urev != 0.0 {
         rec.conv.mres = rec.conv.urev / rec.conv.srev as f64;
+        rec.mark(m::MRES);
     }
     // C 3917-3921: MRES must end up nonzero.
     if rec.conv.mres == 0.0 {
         rec.conv.mres = 1.0;
+        rec.mark(m::MRES);
     }
     // C 3922-3927: keep the triple consistent at the final MRES.
     if rec.conv.urev != rec.conv.mres * rec.conv.srev as f64 {
         rec.conv.urev = rec.conv.mres * rec.conv.srev as f64;
+        rec.mark(m::UREV);
     }
 }
 
@@ -1734,9 +2018,9 @@ pub(crate) fn motor_sync_speed_at_init(rec: &mut MotorRecord) {
 /// - C runs the switch only under `if (pdset->base.init_record)`
 ///   (`motorRecord.cc:645`) and forces -1 when that dset init fails (`:650`).
 ///   Qualified because the bullet above ends on `dbStaticLib.c`, where those
-///   two numbers land in `dbCopyEntry`/`dbCopyEntryContents`. This port has
-///   no dset-less motor record and no dset-init failure at this point, so the
-///   switch runs unconditionally.
+///   two numbers land in `dbCopyEntry`/`dbCopyEntryContents`. Here the dset
+///   init runs after this pass, so the switch runs unconditionally and a
+///   failed dset init overwrites it ([`motor_failed_dset_init`]).
 pub(crate) fn motor_derive_card(rec: &mut MotorRecord) {
     use epics_base_rs::server::record::{HwLink, ParsedLink, parse_link_v2};
 
@@ -1753,24 +2037,29 @@ pub(crate) fn motor_derive_card(rec: &mut MotorRecord) {
     };
 }
 
-/// Establish the limit invariant at IOC init — the load-time counterpart of
-/// [`apply_mres_cascade`].
-///
-/// Two C steps, in order:
-///
-/// 1. `check_speed_and_resolution` (motorRecord.cc:3968-4017): the raw-wins
-///    rule — a NONZERO raw limit loaded from the database rescales its dial
-///    partner; a zero raw is seeded from the dial value. Under MRES < 0 the
-///    pairs cross (raw low <-> dial high) and scale by |MRES|.
-/// 2. `init_record` 717-718 ("Reset limits in case database values are
-///    invalid"): `set_dial_highlimit`/`set_dial_lowlimit` run last and
-///    re-derive the raw pair with the SIGNED resolution — under MRES < 0
-///    the |MRES|-seeded raw value from step 1 flips sign here (C verbatim).
+/// A dset `init_record` that returned a status (`motorRecord.cc:648-651`):
+/// `pmr->card = -1`. `readback` is `motor_init_record_com`'s reset for a
+/// refused card or signal (motordevCom.cc:250-256): MSTA is RA_PROBLEM alone
+/// and the raw positions are 0.
+pub(crate) fn motor_failed_dset_init(rec: &mut MotorRecord, readback: bool) {
+    if readback {
+        rec.stat.msta = MstaFlags::PROBLEM;
+        rec.pos.rmp = 0;
+        rec.pos.rep = 0;
+    }
+    rec.links.card = -1;
+}
+
+/// `check_speed_and_resolution`'s limit half (motorRecord.cc:3968-4017),
+/// the load-time counterpart of [`apply_mres_cascade`]: the raw-wins rule —
+/// a NONZERO raw limit loaded from the database rescales its dial partner;
+/// a zero raw is seeded from the dial value. Under MRES < 0 the pairs cross
+/// (raw low <-> dial high) and scale by |MRES|. init_record's later
+/// set_dial_highlimit/lowlimit (717-718) belong to the device init that
+/// reaches them ([`MotorRecord::set_dial_limit`]).
 ///
 /// Must run after all `field()` values are applied (the dial put handlers
-/// leave the raw pair untouched until init), and before
-/// `init_invariants_synced` is set — the helpers below are init-gated, so
-/// step 2 inlines their arithmetic.
+/// leave the raw pair untouched until init).
 pub(crate) fn motor_sync_limits_at_init(rec: &mut MotorRecord) {
     let mres = rec.conv.mres;
     if mres != 0.0 {
@@ -1778,36 +2067,41 @@ pub(crate) fn motor_sync_limits_at_init(rec: &mut MotorRecord) {
             // C 3968-3992.
             if rec.limits.rllm != 0.0 {
                 rec.limits.dllm = rec.limits.rllm * mres;
+                rec.mark(m::DLLM);
             }
-            rec.limits.rllm = rec.limits.dllm / mres;
+            if rec.limits.rllm != rec.limits.dllm / mres {
+                rec.limits.rllm = rec.limits.dllm / mres;
+                rec.mark(m::RLLM);
+            }
             if rec.limits.rhlm != 0.0 {
                 rec.limits.dhlm = rec.limits.rhlm * mres;
+                rec.mark(m::DHLM);
             }
-            rec.limits.rhlm = rec.limits.dhlm / mres;
+            if rec.limits.rhlm != rec.limits.dhlm / mres {
+                rec.limits.rhlm = rec.limits.dhlm / mres;
+                rec.mark(m::RHLM);
+            }
         } else {
             // C 3993-4017: MRES < 0 register convention.
             let abs_mres = mres.abs();
             if rec.limits.rllm != 0.0 {
                 rec.limits.dhlm = rec.limits.rllm * abs_mres;
+                rec.mark(m::DHLM);
             }
-            rec.limits.rllm = rec.limits.dhlm / abs_mres;
+            if rec.limits.rllm != rec.limits.dhlm / abs_mres {
+                rec.limits.rllm = rec.limits.dhlm / abs_mres;
+                rec.mark(m::RLLM);
+            }
             if rec.limits.rhlm != 0.0 {
                 rec.limits.dllm = rec.limits.rhlm * abs_mres;
+                rec.mark(m::DLLM);
             }
-            rec.limits.rhlm = rec.limits.dllm / abs_mres;
-        }
-        // Step 2 (C 717-718 via set_dial_high/lowlimit 4243/4294):
-        // signed re-derivation, crossed under MRES < 0.
-        let (raw_high, raw_low) = (rec.limits.dhlm / mres, rec.limits.dllm / mres);
-        if mres < 0.0 {
-            rec.limits.rllm = raw_high;
-            rec.limits.rhlm = raw_low;
-        } else {
-            rec.limits.rhlm = raw_high;
-            rec.limits.rllm = raw_low;
+            if rec.limits.rhlm != rec.limits.dllm / abs_mres {
+                rec.limits.rhlm = rec.limits.dllm / abs_mres;
+                rec.mark(m::RHLM);
+            }
         }
     }
-    rec.set_userlimits();
 }
 
 /// Re-evaluate LVIO after a soft-limit put.
@@ -1818,9 +2112,13 @@ pub(crate) fn motor_sync_limits_at_init(rec: &mut MotorRecord) {
 /// that is not being polled.
 fn detect_inverted_limits(limits: &mut LimitFields, dval: f64) {
     if limits.dllm > limits.dhlm || limits.llm > limits.hlm {
-        limits.lvio = true;
+        limits.lvio = 1;
     } else {
-        limits.lvio = coordinate::check_soft_limits(dval, limits.dhlm, limits.dllm);
+        limits.lvio = i16::from(coordinate::check_soft_limits(
+            dval,
+            limits.dhlm,
+            limits.dllm,
+        ));
     }
 }
 
@@ -1832,66 +2130,54 @@ enum DialLimit {
     Low,
 }
 
-/// Queue the driver forward for a soft-limit put (C set_dial_highlimit
+/// Send the driver forward for a soft-limit put (C set_dial_highlimit
 /// 4236-4277 / set_dial_lowlimit 4287-4328 send SET_HIGH/LOW_LIMIT from
-/// special() before the pp pass runs do_work; `do_process` drains the
-/// buffer in front of the pass's own commands). Init-gated like the raw
-/// helpers: during dbLoadRecords C applies field() as raw struct writes
-/// and special never runs, so a load must not emit. The boundary speaks
-/// dial-frame EGU (like `MotorCommand::SetPosition`) — C's raw-steps
-/// wire value and the MRES-sign register swap live only in the raw pair
-/// (`update_raw_from_dial_high`/`_low`), so the dial side maps to the
-/// command unswapped.
-fn queue_limit_forward(rec: &mut MotorRecord, side: DialLimit, dial: f64) {
-    if !rec.internal.init_invariants_synced {
-        return;
-    }
-    rec.internal.special_cmds.push(match side {
-        DialLimit::High => MotorCommand::SetHighLimit { position: dial },
-        DialLimit::Low => MotorCommand::SetLowLimit { position: dial },
-    });
+/// special() before the pp pass runs do_work); false when the device
+/// refused it.
+fn forward_limit(rec: &mut MotorRecord, side: DialLimit, dial: f64) -> bool {
+    let command = rec.dial_limit_command(side == DialLimit::High, dial);
+    rec.send_special(vec![command])
 }
 
-/// Queue the driver forward for a PID-coefficient put (C special pidcof,
+/// Send the driver forward for a PID-coefficient put (C special pidcof,
 /// motorRecord.cc 3003-3026: build_trans SET_PGAIN/SET_IGAIN/SET_DGAIN
 /// at put time). Callers gate on GAIN_SUPPORT and clamp to 0.0–1.0
 /// first, matching C's order (gate 3003, clamp 3005-3014, send 3017).
 fn queue_pid_gain_forward(rec: &mut MotorRecord, kind: PidGainKind, gain: f64) {
-    rec.internal
-        .special_cmds
-        .push(MotorCommand::SetPidGain { kind, gain });
+    rec.send_special(vec![MotorCommand::SetPidGain { kind, gain }]);
 }
 
 /// C set_dial_highlimit (motorRecord.cc:4243-4275, fd808eb2 PR #206):
 /// the raw image of a dial HIGH limit is `dhlm / mres` with the SIGNED
 /// resolution; under MRES < 0 it addresses the LOW raw register
-/// (SET_LOW_LIMIT -> RLLM). Gated on init: during dbLoadRecords a dial
-/// field() must leave the raw pair at 0 so the raw-wins rule at init
-/// can tell a loaded RHLM/RLLM apart from a derived one (C applies
-/// field() as raw struct writes — special never runs at load).
+/// (SET_LOW_LIMIT -> RLLM).
 fn update_raw_from_dial_high(rec: &mut MotorRecord, dial: f64) {
-    if !rec.internal.init_invariants_synced || rec.conv.mres == 0.0 {
+    if rec.conv.mres == 0.0 {
         return;
     }
     let tmp_raw = dial / rec.conv.mres;
     if rec.conv.mres < 0.0 {
         rec.limits.rllm = tmp_raw;
+        rec.mark(m::RLLM);
     } else {
         rec.limits.rhlm = tmp_raw;
+        rec.mark(m::RHLM);
     }
 }
 
 /// C set_dial_lowlimit (motorRecord.cc:4294-4326): mirror — under
 /// MRES < 0 the dial LOW limit addresses the HIGH raw register.
 fn update_raw_from_dial_low(rec: &mut MotorRecord, dial: f64) {
-    if !rec.internal.init_invariants_synced || rec.conv.mres == 0.0 {
+    if rec.conv.mres == 0.0 {
         return;
     }
     let tmp_raw = dial / rec.conv.mres;
     if rec.conv.mres < 0.0 {
         rec.limits.rhlm = tmp_raw;
+        rec.mark(m::RHLM);
     } else {
         rec.limits.rllm = tmp_raw;
+        rec.mark(m::RLLM);
     }
 }
 

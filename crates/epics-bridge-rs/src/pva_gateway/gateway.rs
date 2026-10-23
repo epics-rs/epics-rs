@@ -6,11 +6,9 @@
 //! that downstream clients connect to, and route every server op
 //! through the cache.
 
-// RTEMS-EXEC-MODEL-ALLOW(2): checked to pass on the exec backend under
-// `EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p epics-bridge-rs
-// --features pva-gateway` (the gateway's spawns/timers ride the runtime::task
-// seam; 739 run, 739 passed on this tree). The default exec-backend gate omits
-// `pva-gateway`, so re-run that combo when touching this module.
+// RTEMS-EXEC-MODEL-ALLOW(3): this file does not build on the exec backend —
+// `pva_gateway/mod.rs` declares it under `#[cfg(tokio_backend)] mod gateway;`,
+// because `PvaGateway` owns the downstream `PvaServer`, which needs a reactor.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -18,7 +16,6 @@ use std::time::Duration;
 use epics_base_rs::server::access_security::{AccessSecurityConfig, parse_acf};
 use epics_pva_rs::client::PvaClient;
 use epics_pva_rs::config::env as pva_env;
-use epics_pva_rs::error::PvaResult;
 use epics_pva_rs::server_native::source::{ChannelSource, DynSource};
 use epics_pva_rs::server_native::{
     CompositeSource, PvaServer, PvaServerConfig, runtime::ServerReport,
@@ -386,9 +383,9 @@ impl PvaGateway {
                 composite
                     .add_source("gateway", Arc::new(layered) as DynSource, 0)
                     .map_err(|e| GwError::Other(format!("gateway source registration: {e}")))?;
-                Ok(PvaServer::start(composite, server_config)?)
+                PvaServer::start(composite, server_config).map_err(GwError::Downstream)
             }
-            _ => Ok(PvaServer::start(Arc::new(layered), server_config)?),
+            _ => PvaServer::start(Arc::new(layered), server_config).map_err(GwError::Downstream),
         }
     }
 
@@ -402,7 +399,7 @@ impl PvaGateway {
     ) -> GwResult<Self> {
         let cache = ChannelCache::new(reactor.clone(), client, DEFAULT_CLEANUP_INTERVAL);
         let source = GatewayChannelSource::new(cache.clone());
-        let server = PvaServer::isolated(Arc::new(source.clone()))?;
+        let server = PvaServer::isolated(Arc::new(source.clone())).map_err(GwError::Downstream)?;
         Ok(Self {
             cache,
             server,
@@ -443,8 +440,8 @@ impl PvaGateway {
 
     /// Block until SIGINT / SIGTERM, [`Self::interrupt`], or a
     /// subsystem task fails. Mirrors `PvaServer::run`.
-    pub async fn run(self) -> PvaResult<()> {
-        self.server.run().await
+    pub async fn run(self) -> GwResult<()> {
+        self.server.run().await.map_err(GwError::Downstream)
     }
 
     /// Stop accepting new connections. Existing in-flight ops finish
@@ -533,6 +530,28 @@ mod tests {
         assert!(
             res.is_err(),
             "unreadable control ACF must fail startup, not silently close the surface"
+        );
+    }
+
+    /// A downstream listener that cannot bind is the downstream side's
+    /// failure: pva-gateway-rs prints `failed to start: {e}`, which must not
+    /// call it an upstream error.
+    #[tokio::test]
+    async fn downstream_bind_failure_names_the_downstream_side() {
+        let mut cfg = isolated_cfg();
+        cfg.server_config.interfaces = vec![
+            "192.0.2.1:0"
+                .parse::<std::net::SocketAddr>()
+                .unwrap()
+                .into(),
+        ];
+        let err = PvaGateway::start(&crate::test_reactor(), cfg)
+            .err()
+            .expect("an unassigned interface must fail the downstream bind");
+        assert!(matches!(err, GwError::Downstream(_)), "{err:?}");
+        assert!(
+            err.to_string().starts_with("downstream PVA server error: "),
+            "{err}"
         );
     }
 

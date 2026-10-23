@@ -17,8 +17,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use epics_base_rs::server::database::PvDatabase;
-use epics_base_rs::server::record::LinkType;
+use epics_base_rs::server::database::{LinkRef, PvDatabase};
+use epics_base_rs::server::record::{LinkFieldType, LinkProcessPolicy, LinkType, OpenLatch};
 use epics_base_rs::server::records::ai::AiRecord;
 use epics_base_rs::types::EpicsValue;
 use epics_ca_rs::calink::{CaLinkResolver, install_calink_resolver};
@@ -96,21 +96,24 @@ async fn ca_link_resolves_remote_value() {
 
     // Open the link + wait for the first monitor event to populate
     // the cache.
+    use epics_base_rs::server::database::LinkSet;
+    let open = OpenLatch::ca(LinkProcessPolicy::NoProcess, LinkFieldType::In);
+    let link = LinkRef::new(b"CALINK:SRC", &open);
+    LinkSet::connect_link(&resolver, link, None).await;
     let connected = resolver
-        .wait_for_link_connected("CALINK:SRC", budget::FACT_BUDGET)
+        .wait_for_link_connected("CALINK:SRC", fact_budget::FACT_BUDGET)
         .await;
     assert!(connected, "CA link must connect to the upstream CA server");
 
     // The monitor-backed cache now serves the remote value.
-    use epics_base_rs::server::database::LinkSet;
-    let value = LinkSet::get_value(&resolver, "CALINK:SRC").await;
+    let value = LinkSet::get_value(&resolver, link).await;
     assert_eq!(
         value.and_then(|v| v.to_f64()),
         Some(73.5),
         "CA link must return the upstream PV's value"
     );
     assert!(
-        LinkSet::is_connected(&resolver, "CALINK:SRC"),
+        LinkSet::is_connected(&resolver, link),
         "CA link must report connected once a value is cached"
     );
     assert_eq!(resolver.link_count(), 1);
@@ -146,29 +149,33 @@ async fn link_diagnostics_reads_a_live_channel() {
     // A name the resolver has never opened is C's `pca == NULL`, which
     // `dbcar` renders as a not-connected link with zero counters — and the
     // report must NOT open it, because `dbcar` is a report.
+    let never = OpenLatch::default();
     assert!(
-        LinkSet::link_diagnostics(&resolver, "CALINK:NEVER")
+        LinkSet::link_diagnostics(&resolver, LinkRef::new(b"CALINK:NEVER", &never))
             .await
             .is_none()
     );
     assert_eq!(resolver.link_count(), 0, "the report opened nothing");
 
+    let open = OpenLatch::default();
+    let link = LinkRef::new(b"CALINK:DIAG", &open);
+    LinkSet::connect_link(&resolver, link, None).await;
     assert!(
         resolver
-            .wait_for_link_connected("CALINK:DIAG", budget::FACT_BUDGET)
+            .wait_for_link_connected("CALINK:DIAG", fact_budget::FACT_BUDGET)
             .await
     );
 
     // Before any read, C's `pvlOptInpNative` is unset: the bit is set BY
     // `dbCaGetLink` (`dbCa.c:455-457`), not by connecting.
-    let before = LinkSet::link_diagnostics(&resolver, "CALINK:DIAG")
+    let before = LinkSet::link_diagnostics(&resolver, link)
         .await
         .expect("an opened link reports");
     assert!(before.connected);
     assert!(!before.input_native, "connecting is not an input transfer");
 
-    let _ = LinkSet::get_value(&resolver, "CALINK:DIAG").await;
-    let after = LinkSet::link_diagnostics(&resolver, "CALINK:DIAG")
+    let _ = LinkSet::get_value(&resolver, link).await;
+    let after = LinkSet::link_diagnostics(&resolver, link)
         .await
         .expect("an opened link reports");
     assert!(after.input_native, "a value read is C's pvlOptInpNative");
@@ -179,9 +186,9 @@ async fn link_diagnostics_reads_a_live_channel() {
     // C prints `ca_host_name(chid)`, the peer with its port — never the
     // empty string, and never the PV name.
     assert!(
-        after.host.contains(&tcp_port.to_string()),
+        after.host.ends_with(format!(":{tcp_port}").as_bytes()),
         "host must name the server's own address, got {:?}",
-        after.host
+        String::from_utf8_lossy(&after.host)
     );
     // The three C never sets at the pin: both OUT bits are inside
     // `/* Disabled by ANJ ... */` (`dbCa.c:539-542`, `:555-558`), and the
@@ -211,26 +218,29 @@ async fn ca_link_init_ready_flips_after_metadata_fetch() {
     let resolver = CaLinkResolver::with_client(client);
 
     use epics_base_rs::server::database::LinkSet;
+    let open = OpenLatch::default();
+    let link = LinkRef::new(b"CALINK:INITREADY", &open);
     // Unopened link: not init-ready.
-    assert!(!LinkSet::init_ready(&resolver, "CALINK:INITREADY"));
+    assert!(!LinkSet::init_ready(&resolver, link));
 
+    LinkSet::connect_link(&resolver, link, None).await;
     let connected = resolver
-        .wait_for_link_connected("CALINK:INITREADY", budget::FACT_BUDGET)
+        .wait_for_link_connected("CALINK:INITREADY", fact_budget::FACT_BUDGET)
         .await;
     assert!(connected, "CA link must connect to the upstream CA server");
 
     // The attribute fetch is detached from the monitor path, so poll
     // for the flip; a connected link whose fetch never completes would
     // hold iocInit, and this assert names that failure.
-    let deadline = std::time::Instant::now() + budget::FACT_BUDGET;
-    while !LinkSet::init_ready(&resolver, "CALINK:INITREADY") {
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    while !LinkSet::init_ready(&resolver, link) {
         assert!(
             std::time::Instant::now() < deadline,
             "metadata fetch never completed: init_ready stayed false on a connected link"
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    assert!(LinkSet::is_connected(&resolver, "CALINK:INITREADY"));
+    assert!(LinkSet::is_connected(&resolver, link));
 }
 
 #[cfg(tokio_backend)]
@@ -252,14 +262,17 @@ async fn ca_link_resolves_with_scheme_prefix() {
     let client = Arc::new(pinned_client(port).await);
     let resolver = CaLinkResolver::with_client(client);
 
+    use epics_base_rs::server::database::LinkSet;
+    let open = OpenLatch::ca(LinkProcessPolicy::NoProcess, LinkFieldType::In);
+    let link = LinkRef::new(b"ca://CALINK:SCHEME", &open);
+    LinkSet::connect_link(&resolver, link, None).await;
     let connected = resolver
-        .wait_for_link_connected("ca://CALINK:SCHEME", budget::FACT_BUDGET)
+        .wait_for_link_connected("ca://CALINK:SCHEME", fact_budget::FACT_BUDGET)
         .await;
     assert!(connected, "scheme-prefixed CA link must connect");
 
-    use epics_base_rs::server::database::LinkSet;
     assert_eq!(
-        LinkSet::get_value(&resolver, "ca://CALINK:SCHEME")
+        LinkSet::get_value(&resolver, link)
             .await
             .and_then(|v| v.to_f64()),
         Some(404.0),
@@ -290,25 +303,29 @@ async fn record_with_ca_inp_link_reads_remote_value() {
     let resolver = CaLinkResolver::with_client(client);
     db.register_link_set("ca", Arc::new(resolver.clone())).await;
 
-    // Pre-open the link and wait so the synchronous lset read serves
-    // from cache (the C `dbCaAddLink` + iocInit-wait analogue).
-    let connected = resolver
-        .wait_for_link_connected("CALINK:INP:SRC", budget::FACT_BUDGET)
-        .await;
-    assert!(connected, "CA link must connect before record processing");
-
     // A soft-channel ai record whose INP is a bare ` CA`-modified
     // link — Gap 1 classifies it as a CA link, Gap 2 resolves it.
     db.add_record("CADST", Box::new(AiRecord::new(0.0)))
         .await
         .unwrap();
     {
+        db.put_pv_no_process("CADST.INP", EpicsValue::String("CALINK:INP:SRC CA".into()))
+            .await
+            .unwrap();
         let rec = db.get_record("CADST").expect("record exists");
         let mut inst = rec.write();
-        inst.put_common_field("INP", EpicsValue::String("CALINK:INP:SRC CA".into()))
-            .unwrap();
         inst.common.udf = 0;
     }
+
+    // iocInit's `dbCaAddLink` opens the record's own channel; wait for it
+    // so the synchronous lset read serves from cache.
+    assert!(db.ca_link_init());
+    db.setup_external_link_opens().await;
+    db.process_cp_links_on_connect().await;
+    let connected = resolver
+        .wait_for_link_connected("CALINK:INP:SRC", fact_budget::FACT_BUDGET)
+        .await;
+    assert!(connected, "CA link must connect before record processing");
 
     let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("CADST", &mut visited)
@@ -332,7 +349,7 @@ async fn record_with_ca_inp_link_reads_remote_value() {
 ///
 /// This is the exact C `dbCa.c` path: `eventCallback` refreshes the
 /// cached value and adds `CA_DBPROCESS` for a CP link (`dbCa.c:891`, `:958-962`),
-/// and the worker thread runs `db_process(prec)` (`dbCa.c:1255`).
+/// and the worker thread runs `db_process(prec)` (`dbCa.c:1314-1321`).
 ///
 /// The holder is Passive on purpose: a Passive record never self-scans,
 /// so its CA link never opens lazily and the monitor that drives the
@@ -357,6 +374,8 @@ async fn ca_cp_holder_processes_on_remote_change() {
 
     pin_env(port);
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
 
     // Passive ai holder with a bare ` CP` INP link to the remote PV. `CP` is
     // the whole modifier: C's process-class chain (`dbStaticLib.c:2369-2373`)
@@ -370,10 +389,14 @@ async fn ca_cp_holder_processes_on_remote_change() {
         .await
         .unwrap();
     {
+        db.put_pv_no_process(
+            "CALINK:CP:HOLDER.INP",
+            EpicsValue::String("CALINK:CP:SRC CP".into()),
+        )
+        .await
+        .unwrap();
         let rec = db.get_record("CALINK:CP:HOLDER").unwrap();
         let mut inst = rec.write();
-        inst.put_common_field("INP", EpicsValue::String("CALINK:CP:SRC CP".into()))
-            .unwrap();
         inst.common.udf = 0;
         assert_eq!(
             inst.common.scan,
@@ -386,16 +409,22 @@ async fn ca_cp_holder_processes_on_remote_change() {
     // the monitor callback can dispatch CP holders (this
     // fix). Uses its own client, which picks
     // up the pinned env set above.
-    let _resolver = install_calink_resolver(&db).await;
+    let _resolver = install_calink_resolver(
+        &db,
+        epics_base_rs::runtime::task::Reactor::current().expect("test runtime"),
+    )
+    .await;
 
     // iocInit step: registers the external CP edge AND warms (opens) the
     // monitor for the Passive holder's source PV.
     db.setup_cp_links().await;
+    // C `dbCaRun`, which releases the processor.
+    db.process_cp_links_on_connect().await;
 
     // (1) The warm's first monitor event must drive the holder to process
     // and read the remote value (5.0) into VAL — with NO explicit
     // process_record call anywhere in this test.
-    let deadline = std::time::Instant::now() + budget::FACT_BUDGET;
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
     loop {
         let v = {
             let rec = db.get_record("CALINK:CP:HOLDER").unwrap();
@@ -418,14 +447,14 @@ async fn ca_cp_holder_processes_on_remote_change() {
     // 42.0 — again with no explicit process_record call.
     let writer = pinned_client(port).await;
     let wch = writer.create_channel("CALINK:CP:SRC");
-    wch.wait_connected(budget::FACT_BUDGET)
+    wch.wait_connected(fact_budget::FACT_BUDGET)
         .await
         .expect("writer channel connects");
     wch.put(&EpicsValue::Double(42.0))
         .await
         .expect("remote write to source");
 
-    let deadline = std::time::Instant::now() + budget::FACT_BUDGET;
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
     loop {
         let v = {
             let rec = db.get_record("CALINK:CP:HOLDER").unwrap();
@@ -470,28 +499,26 @@ async fn ca_link_out_write_updates_remote_pv() {
 
     // Open the link + wait for the first monitor event so the channel
     // is connected and the OUT write has a live circuit to push on.
+    use epics_base_rs::server::database::{LinkPutOp, LinkSet};
+    let open = OpenLatch::default();
+    let link = LinkRef::new(b"CALINK:OUT:DST", &open);
+    LinkSet::connect_link(&resolver, link, None).await;
     let connected = resolver
-        .wait_for_link_connected("CALINK:OUT:DST", budget::FACT_BUDGET)
+        .wait_for_link_connected("CALINK:OUT:DST", fact_budget::FACT_BUDGET)
         .await;
     assert!(connected, "CA link must connect before the OUT write");
 
-    use epics_base_rs::server::database::{LinkPutOp, LinkSet};
     // Bare ` CA`-modified OUT link form: `epics-base-rs` strips the
     // modifier and hands the resolver the bare PV name.
-    LinkSet::put_value(
-        &resolver,
-        "CALINK:OUT:DST",
-        EpicsValue::Double(88.0),
-        LinkPutOp::Plain,
-    )
-    .await
-    .expect("CA-link OUT write must succeed");
+    LinkSet::put_value(&resolver, link, EpicsValue::Double(88.0), LinkPutOp::Plain)
+        .await
+        .expect("CA-link OUT write must succeed");
 
     // The resolver's monitor sees the server-side change — poll the
     // monitor-backed cache until the write propagates back.
-    let deadline = std::time::Instant::now() + budget::FACT_BUDGET;
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
     loop {
-        if LinkSet::get_value(&resolver, "CALINK:OUT:DST")
+        if LinkSet::get_value(&resolver, link)
             .await
             .and_then(|v| v.to_f64())
             == Some(88.0)
@@ -510,7 +537,7 @@ async fn ca_link_out_write_updates_remote_pv() {
     // server, not merely the resolver's local cache.
     let verify_client = pinned_client(port).await;
     let ch = verify_client.create_channel("CALINK:OUT:DST");
-    ch.wait_connected(budget::FACT_BUDGET)
+    ch.wait_connected(fact_budget::FACT_BUDGET)
         .await
         .expect("verify channel connects");
     let (_dbf, read_back) = ch.get().await.expect("verify GET");
@@ -545,29 +572,27 @@ async fn ca_link_out_write_async_waits_for_completion() {
     let client = Arc::new(pinned_client(port).await);
     let resolver = CaLinkResolver::with_client(client);
 
+    use epics_base_rs::server::database::{LinkPutOp, LinkSet};
+    let open = OpenLatch::default();
+    let link = LinkRef::new(b"CALINK:OUT:ASYNC", &open);
+    LinkSet::connect_link(&resolver, link, None).await;
     let connected = resolver
-        .wait_for_link_connected("CALINK:OUT:ASYNC", budget::FACT_BUDGET)
+        .wait_for_link_connected("CALINK:OUT:ASYNC", fact_budget::FACT_BUDGET)
         .await;
     assert!(connected, "CA link must connect before the async OUT write");
 
-    use epics_base_rs::server::database::{LinkPutOp, LinkSet};
     // Completion-aware put: this call returns only after the server's
     // WRITE_NOTIFY completion reply, so the written value is already
     // committed on the upstream PV by the time `put_value` returns.
-    LinkSet::put_value(
-        &resolver,
-        "CALINK:OUT:ASYNC",
-        EpicsValue::Double(42.0),
-        LinkPutOp::Async,
-    )
-    .await
-    .expect("completion-aware CA-link OUT write must succeed");
+    LinkSet::put_value(&resolver, link, EpicsValue::Double(42.0), LinkPutOp::Async)
+        .await
+        .expect("completion-aware CA-link OUT write must succeed");
 
     // An independent CA client GET reads the committed value back —
     // the WRITE_NOTIFY reached the server and completed.
     let verify_client = pinned_client(port).await;
     let ch = verify_client.create_channel("CALINK:OUT:ASYNC");
-    ch.wait_connected(budget::FACT_BUDGET)
+    ch.wait_connected(fact_budget::FACT_BUDGET)
         .await
         .expect("verify channel connects");
     let (_dbf, read_back) = ch.get().await.expect("verify GET");
@@ -597,24 +622,22 @@ async fn ca_link_out_write_accepts_scheme_prefix() {
     let client = Arc::new(pinned_client(port).await);
     let resolver = CaLinkResolver::with_client(client);
 
+    use epics_base_rs::server::database::{LinkPutOp, LinkSet};
+    let open = OpenLatch::default();
+    let link = LinkRef::new(b"ca://CALINK:OUT:SCHEME", &open);
+    LinkSet::connect_link(&resolver, link, None).await;
     let connected = resolver
-        .wait_for_link_connected("ca://CALINK:OUT:SCHEME", budget::FACT_BUDGET)
+        .wait_for_link_connected("ca://CALINK:OUT:SCHEME", fact_budget::FACT_BUDGET)
         .await;
     assert!(connected, "scheme-prefixed CA OUT link must connect");
 
-    use epics_base_rs::server::database::{LinkPutOp, LinkSet};
-    LinkSet::put_value(
-        &resolver,
-        "ca://CALINK:OUT:SCHEME",
-        EpicsValue::Long(123),
-        LinkPutOp::Plain,
-    )
-    .await
-    .expect("scheme-prefixed CA-link OUT write must succeed");
+    LinkSet::put_value(&resolver, link, EpicsValue::Long(123), LinkPutOp::Plain)
+        .await
+        .expect("scheme-prefixed CA-link OUT write must succeed");
 
-    let deadline = std::time::Instant::now() + budget::FACT_BUDGET;
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
     loop {
-        if LinkSet::get_value(&resolver, "ca://CALINK:OUT:SCHEME")
+        if LinkSet::get_value(&resolver, link)
             .await
             .and_then(|v| v.to_f64())
             == Some(123.0)
@@ -657,17 +680,20 @@ async fn ca_link_exposes_remote_metadata() {
     let client = Arc::new(pinned_client(port).await);
     let resolver = CaLinkResolver::with_client(client);
 
+    use epics_base_rs::server::database::{LinkDbfType, LinkSet};
+    let open = OpenLatch::default();
+    let link = LinkRef::new(b"CALINK:META:SRC", &open);
+    LinkSet::connect_link(&resolver, link, None).await;
     let connected = resolver
-        .wait_for_link_connected("CALINK:META:SRC", budget::FACT_BUDGET)
+        .wait_for_link_connected("CALINK:META:SRC", fact_budget::FACT_BUDGET)
         .await;
     assert!(connected, "CA link must connect to the upstream CA server");
 
-    use epics_base_rs::server::database::{LinkDbfType, LinkSet};
     // The CTRL attribute fetch is detached after the `Connected` event,
     // so poll until the cached metadata lands.
-    let deadline = std::time::Instant::now() + budget::FACT_BUDGET;
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
     let md = loop {
-        if let Some(md) = LinkSet::link_metadata(&resolver, "CALINK:META:SRC") {
+        if let Some(md) = LinkSet::link_metadata(&resolver, link) {
             // Wait for the CTRL get to fill the limits, not just the
             // channel-info type/count from a partial first store.
             if md.graphic_limits.is_some() {
@@ -702,7 +728,7 @@ async fn ca_link_exposes_remote_metadata() {
 
     // While connected the metadata is served; the read path gates on the
     // connection flag exactly like the value/alarm getters.
-    assert!(LinkSet::is_connected(&resolver, "CALINK:META:SRC"));
+    assert!(LinkSet::is_connected(&resolver, link));
 }
 
 /// `install_calink_resolver` registers under the `ca` scheme so the
@@ -717,7 +743,11 @@ async fn install_registers_ca_scheme() {
     pin_env(port);
 
     let db = PvDatabase::new();
-    let _resolver = install_calink_resolver(&db).await;
+    let _resolver = install_calink_resolver(
+        &db,
+        epics_base_rs::runtime::task::Reactor::current().expect("test runtime"),
+    )
+    .await;
     let schemes = db.registered_link_schemes().await;
     assert!(
         schemes.contains(&"ca".to_string()),
@@ -739,7 +769,7 @@ fn ca_modifier_link_classifies_as_ca() {
 /// The calink `ca` link set
 /// must install at the base `AfterCaLinkInit` seam (BEFORE `setup_cp_links`)
 /// when an IOC is built with
-/// [`IocApplication::register_link_set_installer`], so a Passive CP holder
+/// [`IocApplication::register_link_type`], so a Passive CP holder
 /// warms through the PRODUCTION `IocApplication::run` path — not only when a
 /// test hand-replicates the ordering with a manual `install_calink_resolver`
 /// + `setup_cp_links` (the [`ca_cp_holder_processes_on_remote_change`] path).
@@ -801,13 +831,17 @@ async fn calink_warms_cp_holder_via_iocapplication_run_seam() {
     // wiring, no feature opt-in.
     let result = IocApplication::new()
         .startup_script(stcmd_path.to_str().unwrap())
-        .register_link_set_installer(epics_ca_rs::calink::calink_link_set_install)
+        .register_link_type("ca", {
+            let reactor = epics_base_rs::runtime::task::Reactor::current()
+                .expect("the test is awaited on the IOC's reactor");
+            move |db| epics_ca_rs::calink::calink_link_set_install(db, reactor)
+        })
         .run(|config| async move {
             // By here iocInit has already run `setup_cp_links` and the
             // external-link wait. Poll the holder until the warm's monitor
             // event drives VAL to the source's 5.0 — with NO explicit
             // process call anywhere in this test.
-            let deadline = std::time::Instant::now() + budget::FACT_BUDGET;
+            let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
             loop {
                 let v = {
                     let rec = config
@@ -832,6 +866,3 @@ async fn calink_warms_cp_holder_via_iocapplication_run_seam() {
         .await;
     result.expect("IOC run returns Ok once the CP holder warmed");
 }
-
-#[path = "common/budget.rs"]
-mod budget;

@@ -1,0 +1,130 @@
+#  databse used with scanProgress.st,   version 1.1
+#  version 1.2, added hangWaitSec and hungTimeStr, hungWaitSec
+#
+grecord(mbbo,"$(P)debug")
+{
+	field(VAL,"0")
+	field(DESC,"debug")
+	field(ZRST,"0")
+	field(ONST,"1")
+	field(TWST,"2")
+	field(THST,"3")
+	field(FRST,"4")
+	field(FVST,"5")
+	field(SXST,"6")
+	field(SVST,"7")
+	field(EIST,"8")
+	field(NIST,"9")
+	field(TEST,"10")
+}
+grecord(ao,"$(P)version")
+{
+	field(VAL,"1.1")
+	field(DESC,"version")
+	field(PREC,"2")
+}
+grecord(ao,"$(P)fractionDone")
+{
+	field(DESC,"Fraction Done")
+	field(PREC,"3")
+	field(HOPR,"1")
+	field(LOPR,"0")
+	field(VAL,"0.0")
+}
+grecord(ao,"$(P)percentDone")
+{
+	field(DESC,"percent Done")
+	field(EGU,"%")
+	field(PREC,"1")
+	field(HOPR,"100.0")
+	field(LOPR,"0.0")
+	field(VAL,"0.0")
+}
+grecord(stringout,"$(P)startingTimeStr")
+{
+	field(VAL,"")
+	field(DESC,"end time")
+}
+grecord(stringout,"$(P)endingTimeStr")
+{
+	field(VAL,"")
+	field(DESC,"end time")
+}
+grecord(stringout,"$(P)remainingTimeStr")
+{
+	field(VAL,"")
+	field(DESC,"remaining time")
+}
+grecord(stringout,"$(P)pauseTimeStr")
+{
+	field(VAL,"")
+	field(DESC,"paused time")
+}
+grecord(stringout,"$(P)totalElapsedTimeStr")
+{
+	field(VAL,"")
+	field(DESC,"total clock time")
+}
+grecord(stringout,"$(P)totalActiveTimeStr")
+{
+	field(VAL,"")
+	field(DESC,"time that scan was scanning")
+}
+grecord(longout,"$(P)remainingSec")
+{
+	field(DESC,"remaining time in scan")
+	field(EGU,"sec")
+	field(VAL,"0")
+}
+grecord(longout,"$(P)Npauses")
+{
+	field(DESC,"number of pauses")
+	field(VAL,"0")
+}
+grecord(longout,"$(P)pauseSec")
+{
+	field(DESC,"time spent paused")
+	field(EGU,"sec")
+	field(VAL,"0")
+}
+grecord(longout,"$(P)hangWaitSec")
+{
+	field(DESC,"wait time before declaring a hang")
+	field(EGU,"sec")
+	field(VAL,"600")
+}
+grecord(longout,"$(P)hungSec")
+{
+	field(DESC,"time spent hung")
+	field(EGU,"sec")
+	field(VAL,"0")
+}
+grecord(stringout,"$(P)hungTimeStr")
+{
+	field(VAL,"")
+	field(DESC,"how long scan has been hung")
+}
+grecord(longout,"$(P)Ntotal")
+{
+	field(DESC,"total number of points in scan")
+	field(VAL,"0")
+}
+grecord(longout,"$(P)Nfinished")
+{
+	field(DESC,"number of points scanned")
+	field(VAL,"0")
+}
+grecord(bo,"$(P)running")
+{
+	field(DESC,"progress bar running")
+	field(VAL,"0")
+	field(ZNAM,"inactive")
+	field(ONAM,"scanning")
+}
+grecord(bo,"$(P)paused")
+{
+	field(DESC,"progress bar paused")
+	field(VAL,"0")
+	field(ZNAM,"OK")
+	field(ONAM,"paused")
+}

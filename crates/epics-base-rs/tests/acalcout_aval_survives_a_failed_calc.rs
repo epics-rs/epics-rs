@@ -63,7 +63,7 @@ async fn primed(db: &PvDatabase, name: &str) {
     a.put_field("NELM", EpicsValue::ULong(6)).unwrap();
     a.put_field("CALC", EpicsValue::String("BB*10".into()))
         .unwrap();
-    a.special("CALC", true).unwrap();
+    a.special("CALC", true, &Default::default()).unwrap();
     a.put_field(
         "BB",
         EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0].into()),
@@ -82,7 +82,7 @@ async fn recalc(db: &PvDatabase, name: &str, calc: &str) {
     g.record
         .put_field("CALC", EpicsValue::String(calc.into()))
         .unwrap();
-    g.record.special("CALC", true).unwrap();
+    g.record.special("CALC", true, &Default::default()).unwrap();
 }
 
 /// Boundary 1 — `status != 0`: the return at `:1591` is taken, so neither

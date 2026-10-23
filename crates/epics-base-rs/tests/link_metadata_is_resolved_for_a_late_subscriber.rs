@@ -1,10 +1,9 @@
 //! The cycle resolves link-backed metadata when — and only when — a consumer
 //! exists, and it re-asks every cycle.
 //!
-//! A [`LinkBacking`] reaches a consumer only through
-//! `RecordInstance::make_monitor_snapshot`, and every caller of that sits
-//! inside a `self.subscribers.get(field)` hit, so a cycle on an unsubscribed
-//! record resolved a map nothing could read. C never had that cost: its
+//! A [`LinkBacking`] reaches a consumer only through the delivery read, which
+//! resolves the link with no record lock held; a post carries no metadata, so
+//! a cycle resolves nothing for it. C never had that cost either: its
 //! metadata slots are `dbDb_lset` entries (`dbDbLink.c:414-415`) reached from
 //! `dbGet`, not from `dbProcess`.
 //!
@@ -82,16 +81,16 @@ async fn a_subscriber_arriving_after_unsubscribed_cycles_still_gets_the_targets_
     db.process_record("CALC").await.unwrap();
 
     let event = rx.try_recv().expect("A posts to its new subscriber");
+    // Metadata is read at delivery, through the GET door, over the log.
+    let mut delivered = db.channel_snapshot_for_field(&rec, "A", false).unwrap();
+    event.write_log_over(&mut delivered);
     assert_eq!(
-        event.snapshot.precision(),
+        delivered.precision(),
         Some(1),
         "A is link-backed: the post must carry SRC's precision, never CALC's own"
     );
     assert_eq!(
-        event
-            .snapshot
-            .units()
-            .map(|u| u.as_str_lossy().into_owned()),
+        delivered.units().map(|u| u.as_str_lossy().into_owned()),
         Some("mm".to_string()),
         "and SRC's units, which only a resolved backing can supply"
     );

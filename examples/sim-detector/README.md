@@ -35,7 +35,7 @@ Acquisition tasks are fully async. A driver author only needs three types from `
 |------|---------|
 | `PortHandle` | Read/write parameters via `read_int32().await`, `set_params_and_notify().await` |
 | `ArrayPublisher` | Publish a generated frame to downstream plugins: `publisher.publish(frame).await` |
-| `QueuedArrayCounter` | Wait until in-flight frames drain at end of acquisition |
+| `DriverPool` | Frames plugins receive; their queued count holds ADAcquireBusy under WaitForPlugins |
 
 The acquisition loop runs inside a `current_thread` tokio runtime created by the task thread. All I/O is async and reliable — there are no lossy or blocking APIs in the data path.
 
@@ -118,13 +118,13 @@ cargo run -p sim-detector --example demo
 epicsEnvSet("PREFIX", "SIM1:")
 epicsEnvSet("CAM",    "cam1:")
 
-# simDetectorConfig(portName, sizeX, sizeY, maxMemory)
-simDetectorConfig("SIM1", 1024, 1024, 50000000)
+# simDetectorConfig(portName, maxSizeX, maxSizeY, dataType, maxBuffers, maxMemory, priority, stackSize)
+simDetectorConfig("SIM1", 1024, 1024, 1, 0, 50000000)
 
 dbLoadRecords("$(SIM_DETECTOR)/db/simDetector.template", "P=$(PREFIX),R=$(CAM),PORT=SIM1")
 
 # Standard areaDetector plugins
-< $(ADCORE)/ioc/commonPlugins.cmd
+< $(ADCORE)/iocBoot/commonPlugins.cmd
 ```
 
 ## Autosave
@@ -171,9 +171,9 @@ file "commonPlugins_settings.req", P=$(P)
 Once the IOC is running, use these iocsh commands:
 
 ```
-fdblist                    # List all save sets and their status
-fdbsave simDetector_settings.req   # Trigger immediate save
-fdbrestore simDetector_settings    # Restore from .sav file
+save_restoreShow                     # List all save sets and their status
+manual_save simDetector_settings.req   # Trigger immediate save
+fdbrestore simDetector_settings.sav   # Restore from .sav file
 ```
 
 ## Verify

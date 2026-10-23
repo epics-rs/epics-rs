@@ -1,0 +1,6 @@
+$ snc noname.st
+(null):0: error: function parameter must have a name
+$ snc +W noname.st
+(null):0: error: function parameter must have a name
+$ snc -w noname.st
+(null):0: error: function parameter must have a name

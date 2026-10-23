@@ -57,6 +57,7 @@
 //! as [`super::ftdi`] and [`super::usbtmc`].
 
 use crate::error::{AsynError, AsynResult, AsynStatus};
+use crate::port::InterfaceMask;
 use crate::port::{PortDriver, PortDriverBase, PortFlags};
 use crate::user::AsynUser;
 use std::collections::BTreeMap;
@@ -273,7 +274,7 @@ impl DrvVxi11Port {
         // at :1016 and :1738, but does not define it).
         let max_addr = if multi_device { 32 } else { 1 };
 
-        let mut base = PortDriverBase::new(
+        let mut base = PortDriverBase::new_exact_flags(
             port_name,
             max_addr,
             PortFlags {
@@ -281,9 +282,12 @@ impl DrvVxi11Port {
                 can_block: true,
                 ..PortFlags::default()
             },
+            // asynGpib's set (drvVxi11.c:1761) plus the asynOption it
+            // registers itself (:1777). No register interface.
+            crate::interfaces::gpib::GPIB_PORT_INTERFACES | InterfaceMask::OPTION,
+            crate::interfaces::gpib::GPIB_PORT_INTERRUPTS,
         );
-        base.init_connected(false);
-        base.auto_connect = !no_auto_connect;
+        base.init_auto_connect(!no_auto_connect);
         Ok(Self {
             base,
             config,
@@ -327,15 +331,6 @@ impl PortDriver for DrvVxi11Port {
         &mut self.base
     }
 
-    /// C drvVxi11 takes asynCommon + asynOctet + asynGpib + asynInt32 from
-    /// `pasynGpib->registerPort` (drvVxi11.c:1761) and registers asynOption
-    /// itself (:1777). No register interface.
-    fn capabilities(&self) -> Vec<crate::interfaces::Capability> {
-        let mut caps = crate::interfaces::gpib::gpib_port_capabilities();
-        caps.push(crate::interfaces::Capability::Option);
-        caps
-    }
-
     /// asynInt32 on a GPIB port is asynGpib's SRQ interrupt source, not a
     /// readable register: `read`/`write` are the asynInt32Base defaults and
     /// fail. See [`crate::interfaces::gpib::int32_read_not_supported`], which
@@ -348,6 +343,12 @@ impl PortDriver for DrvVxi11Port {
     /// See [`Self::read_int32`].
     fn write_int32(&mut self, _user: &mut AsynUser, _value: i32) -> AsynResult<()> {
         Err(crate::interfaces::gpib::int32_write_not_supported())
+    }
+
+    /// asynInt32Base's getBounds, `*low = *high = 0` (asynInt32Base.c:99): C
+    /// leaves it NULL (asynGpib.c:594-608).
+    fn get_bounds_int32(&self, _user: &AsynUser) -> AsynResult<(i32, i32)> {
+        Ok((0, 0))
     }
 
     fn connect(&mut self, _user: &AsynUser) -> AsynResult<()> {
@@ -416,28 +417,13 @@ impl PortDriver for DrvVxi11Port {
     /// C `vxiGetEos` (`drvVxi11.c:1331-1358`): `eos == -1` reports length 0,
     /// otherwise the one byte the link holds. Same field `set_input_eos`
     /// writes and the `device_read` request will read.
-    fn get_input_eos(&self, user: &AsynUser) -> Vec<u8> {
-        match self.input_eos_for(user.addr) {
-            Some(c) => vec![c],
-            None => Vec::new(),
-        }
+    fn get_input_eos(&self, user: &AsynUser) -> AsynResult<Vec<u8>> {
+        Ok(self.input_eos_for(user.addr).into_iter().collect())
     }
 
-    /// C parity: `asynGpib`'s octet vtable leaves `setOutputEos`/`getOutputEos`
-    /// NULL (`asynGpib.c:132` — `...setInputEos, getInputEos, 0, 0`), so a GPIB
-    /// port has no output terminator to set. Refuse rather than cache bytes
-    /// nothing will ever append, exactly as the sibling GPIB port does
-    /// (`super::prologix`).
-    fn set_output_eos(&mut self, _user: &AsynUser, _eos: &[u8]) -> AsynResult<()> {
-        Err(AsynError::Status {
-            status: AsynStatus::Error,
-            message: "output EOS not supported on a GPIB port".into(),
-        })
-    }
-
-    fn get_output_eos(&self, _user: &AsynUser) -> Vec<u8> {
-        Vec::new()
-    }
+    // `asynGpib`'s octet table leaves setOutputEos/getOutputEos NULL
+    // (asynGpib.c:132) and hands it to asynOctetBase (:601), whose Fail
+    // stubs are the PortDriver defaults.
 
     fn gpib_universal_cmd(&mut self, _user: &mut AsynUser, _cmd: u8) -> AsynResult<()> {
         Err(Self::no_transport("vxiUniversalCmd"))
@@ -465,6 +451,20 @@ mod tests {
     /// asynOption itself (:1777). The asynInt32 it gets is asynGpib's SRQ
     /// interrupt source with a NULL vtable (asynGpib.c:140), so a read or a
     /// write of it lands in the asynInt32Base defaults and fails.
+    /// asynGpib's set plus the asynOption drvVxi11.c:1777 registers itself.
+    #[test]
+    fn vxi11_masks_are_asyn_gpib_s_and_option() {
+        use crate::interfaces::gpib::{GPIB_PORT_INTERFACES, GPIB_PORT_INTERRUPTS};
+        let drv = DrvVxi11Port::configure("v_masks", "192.0.2.1", 0, "", "gpib0", 0, true).unwrap();
+        assert_eq!(
+            (drv.base().interface_mask(), drv.base().interrupt_mask()),
+            (
+                GPIB_PORT_INTERFACES | InterfaceMask::OPTION,
+                GPIB_PORT_INTERRUPTS
+            )
+        );
+    }
+
     #[test]
     fn vxi11_registers_the_gpib_port_interfaces() {
         use crate::interfaces::Capability;
@@ -551,6 +551,12 @@ mod tests {
     }
 
     #[test]
+    fn get_bounds_is_asyn_int32_base_s() {
+        let drv = DrvVxi11Port::configure("vxi0", "10.0.0.1", 0, "", "gpib0", 0, false).unwrap();
+        assert_eq!(drv.get_bounds_int32(&AsynUser::default()).unwrap(), (0, 0));
+    }
+
+    #[test]
     fn gateway_link_is_multi_device() {
         let drv = DrvVxi11Port::configure("vxi0", "10.0.0.1", 0, "", "gpib0", 0, false).unwrap();
         assert!(drv.base().flags.multi_device);
@@ -603,9 +609,9 @@ mod tests {
     #[test]
     fn no_auto_connect_disables_framework_auto() {
         let drv = DrvVxi11Port::configure("vxi0", "10.0.0.1", 0, "", "inst0", 0, true).unwrap();
-        assert!(!drv.base().auto_connect);
+        assert!(!drv.base().is_auto_connect());
         let drv = DrvVxi11Port::configure("vxi0", "10.0.0.1", 0, "", "inst0", 0, false).unwrap();
-        assert!(drv.base().auto_connect);
+        assert!(drv.base().is_auto_connect());
     }
 
     #[test]
@@ -668,9 +674,10 @@ mod tests {
         assert_eq!(drv.input_eos_for(3), Some(b'\n'));
         assert_eq!(drv.input_eos_for(7), Some(b';'));
         assert_eq!(drv.input_eos_for(11), None, "an untouched link stays at -1");
-        assert_eq!(drv.get_input_eos(&a3), b"\n".to_vec());
+        assert_eq!(drv.get_input_eos(&a3).unwrap(), b"\n".to_vec());
         assert!(
             drv.get_input_eos(&AsynUser::default().with_addr(11))
+                .unwrap()
                 .is_empty()
         );
 
@@ -704,7 +711,15 @@ mod tests {
         let mut drv =
             DrvVxi11Port::configure("V1", "gw.example", 0, "1.0", "gpib0", 0, false).unwrap();
         let user = AsynUser::default();
-        assert!(drv.set_output_eos(&user, b"\n").is_err());
-        assert!(drv.get_output_eos(&user).is_empty());
+        let err = drv.set_output_eos(&user, b"\n").unwrap_err();
+        assert!(
+            err.to_string().contains("V1 setOutputEos not implemented"),
+            "{err}"
+        );
+        let err = drv.get_output_eos(&user).unwrap_err();
+        assert!(
+            err.to_string().contains("V1 getOutputEos not implemented"),
+            "{err}"
+        );
     }
 }

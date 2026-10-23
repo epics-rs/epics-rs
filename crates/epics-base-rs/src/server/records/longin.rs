@@ -19,6 +19,19 @@ fn longin_metadata_override(
         })
 }
 
+static LONGIN_POSTED: [crate::server::record::FieldIx; 1] = crate::server::record::declared_set(
+    crate::server::record::dbd_generated::LONGIN_FIELDS,
+    ["VAL"],
+);
+
+/// devLiSoft.c returns `dbGetLink`'s status.
+const LONGIN_STATUS: crate::server::record::ProcessStatusRule =
+    crate::server::record::ProcessStatusRule::io(crate::server::record::SoftStatus {
+        plain: true,
+        raw: false,
+        async_: false,
+    });
+
 #[derive(EpicsRecord)]
 // `dset_owns_udf_on_computed`: C `longinRecord.c:148` is
 // `if (status==0) prec->udf = FALSE;` with no `status == 2` fold anywhere in
@@ -26,10 +39,19 @@ fn longin_metadata_override(
 // exactly where it was. The soft dset returns 0 rather than 2 for that reason
 // (`devLiSoft.c::readLocked` ends `return status`), and `devAsynInt32.c`'s
 // `processLi:1057-1060` writes `pr->udf = 0` itself before returning 0.
+// `soft_input_read_as`: devLiSoft and devLiSoftCallback read INP as
+// `DBR_LONG` (`devLiSoft.c:51`, `devLiSoftCallback.c:62`).
+// `process_posted_fields`: `monitor()` posts VAL alone (`longinRecord.c:373-396`);
+// the SVAL and SIMM a cycle reads from SIOL/SIML stay silent.
 #[record(
     type = "longin",
     metadata_override = longin_metadata_override,
-    dset_owns_udf_on_computed
+    process_posted_fields = LONGIN_POSTED,
+    dset_owns_udf_on_computed,
+    seeds_trackers,
+    process_status = LONGIN_STATUS,
+    soft_input_read_as = Long,
+    spill(INP, HIHI, LOLO, HIGH, LOW, HHSV, LLSV, HSV, LSV, HYST, OLDSIMM, SSCN, SIMPVT)
 )]
 pub struct LonginRecord {
     #[field(type = "Long")]
@@ -75,18 +97,18 @@ pub struct LonginRecord {
     pub aftc: f64,
     #[field(type = "Double")]
     pub afvl: f64,
-    #[field(type = "Double")]
-    pub alst: f64,
-    #[field(type = "Double")]
-    pub mlst: f64,
+    #[field(type = "Long")]
+    pub alst: i32,
+    #[field(type = "Long")]
+    pub mlst: i32,
     // SIMM is `DBF_MENU menu(menuYesNo)` (longinRecord.dbd.pod:475-479):
     // the two-choice NO/YES simulation menu, served as DBR_ENUM.
     #[field(type = "Short", menu_choices = MENU_YES_NO)]
     pub simm: i16,
-    #[field(type = "String")]
-    pub siml: String,
-    #[field(type = "String")]
-    pub siol: String,
+    #[field(type = "PvStr", link)]
+    pub siml: PvString,
+    #[field(type = "PvStr", link)]
+    pub siol: PvString,
     // SVAL is `DBF_LONG` (longinRecord.dbd.pod:466-468) — the BUFFER C's
     // `readValue` reads SIOL into (`dbGetLink(&prec->siol, DBR_LONG,
     // &prec->sval)`, longinRecord.c:416) before publishing `val = sval`. An
@@ -118,11 +140,11 @@ impl Default for LonginRecord {
             mdel: 0,
             aftc: 0.0,
             afvl: 0.0,
-            alst: 0.0,
-            mlst: 0.0,
+            alst: 0,
+            mlst: 0,
             simm: 0,
-            siml: String::new(),
-            siol: String::new(),
+            siml: PvString::new(),
+            siol: PvString::new(),
             sval: 0,
             sims: 0,
             // C `field(SDLY,DBF_DOUBLE) { initial("-1.0") }` — negative means

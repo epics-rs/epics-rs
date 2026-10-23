@@ -39,3 +39,13 @@ scaler = ["dep:scaler-rs"]
 optics = ["dep:optics-rs"]
 mca = ["dep:mca-rs"]
 full = ["ca", "pva", "bridge", "asyn", "motor", "ad", "ioc", "calc", "autosave", "busy", "std", "scaler", "optics", "mca"]
+
+[dev-dependencies]
+asyn-rs = { workspace = true }
+mca-rs = { workspace = true }
+motor-rs = { workspace = true }
+optics-rs = { workspace = true }
+scaler-rs = { workspace = true }
+sscan-rs = { path = "../sscan-rs" }
+std-rs = { workspace = true }
+tokio = { version = "1", features = ["full"] }

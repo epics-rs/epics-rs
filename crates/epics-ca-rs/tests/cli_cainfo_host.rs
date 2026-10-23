@@ -46,6 +46,8 @@ async fn cainfo_prints_the_resolved_host_name() {
 
     let out = tokio::task::spawn_blocking(move || {
         Command::new(env!("CARGO_BIN_EXE_cainfo-rs"))
+            .arg("-w")
+            .arg(fact_budget::FACT_BUDGET.as_secs().to_string())
             .arg("TST:INFO")
             .env("EPICS_CA_ADDR_LIST", format!("127.0.0.1:{port}"))
             .env("EPICS_CA_AUTO_ADDR_LIST", "NO")

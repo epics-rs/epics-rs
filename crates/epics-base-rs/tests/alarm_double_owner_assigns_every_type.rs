@@ -24,7 +24,9 @@
 //! the limits (`common.analog_alarm` vs the record's own struct), and
 //! severity-set vs severity-unset.
 
-use epics_base_rs::server::record::{AlarmSeverity, Record, RecordInstance};
+mod seeded;
+
+use epics_base_rs::server::record::{AlarmSeverity, Record};
 use epics_base_rs::server::records::acalcout::AcalcoutRecord;
 use epics_base_rs::server::records::ai::AiRecord;
 use epics_base_rs::server::records::dfanout::DfanoutRecord;
@@ -35,36 +37,40 @@ use epics_base_rs::server::records::sub_record::SubRecord;
 use epics_base_rs::server::records::swait::SwaitRecord;
 use epics_base_rs::server::snapshot::Snapshot;
 use epics_base_rs::types::EpicsValue;
+use seeded::Seeded;
 
-fn snap(inst: &RecordInstance, field: &str) -> Snapshot {
-    inst.snapshot_for_field(field)
+fn snap(inst: &Seeded, field: &str) -> Snapshot {
+    inst.cell()
+        .read()
+        .snapshot_for_field(field)
         .unwrap_or_else(|| panic!("{field} has no snapshot"))
 }
 
 /// `(lolo, low, high, hihi)` as the served snapshot carries them.
-fn limits(inst: &RecordInstance, field: &str) -> (f64, f64, f64, f64) {
+fn limits(inst: &Seeded, field: &str) -> (f64, f64, f64, f64) {
     snap(inst, field)
         .alarm_limits()
         .unwrap_or_else(|| panic!("{field} serves no alarm limits"))
 }
 
-fn inst<R: Record + 'static>(rec: R) -> RecordInstance {
-    RecordInstance::new("T:REC".to_string(), rec)
+fn inst<R: Record + 'static>(rec: R) -> Seeded {
+    Seeded::new("T:REC", Box::new(rec))
 }
 
-/// Set HIHI/LOLO and enable their severities, through whichever store the type
-/// keeps them in — `put_field` for a record with its own fields (dfanout/sel),
-/// `put_common_field` for one with the analog ladder.
-fn arm_bands(inst: &mut RecordInstance) {
+/// Set HIHI/LOLO and enable their severities through the database put, which
+/// reaches whichever store the type keeps them in — the record's own fields
+/// (dfanout/sel) or the analog ladder.
+fn arm_bands(inst: &Seeded) {
     for (field, value) in [
         ("HIHI", EpicsValue::Double(90.0)),
         ("LOLO", EpicsValue::Double(10.0)),
         ("HHSV", EpicsValue::Short(AlarmSeverity::Major as i16)),
         ("LLSV", EpicsValue::Short(AlarmSeverity::Major as i16)),
     ] {
-        if inst.record.put_field(field, value.clone()).is_err() {
-            inst.put_common_field(field, value)
-                .unwrap_or_else(|e| panic!("put {field}: {e:?}"));
+        match inst.put(field, value) {
+            // `seq` and `swait` declare no alarm bands at all.
+            Ok(_) | Err(epics_base_rs::error::CaError::FieldNotFound(_)) => {}
+            Err(e) => panic!("put {field}: {e:?}"),
         }
     }
 }
@@ -74,7 +80,7 @@ fn arm_bands(inst: &mut RecordInstance) {
 /// missing `populate_display_info` arm used to leave behind.
 #[test]
 fn the_three_types_the_cache_missed_serve_nan_not_a_structural_zero() {
-    let cases: Vec<(&str, RecordInstance)> = vec![
+    let cases: Vec<(&str, Seeded)> = vec![
         ("dfanout", inst(DfanoutRecord::new(0.0))),
         ("sel", inst(SelRecord::default())),
         ("sub", inst(SubRecord::default())),
@@ -101,13 +107,13 @@ fn the_three_types_the_cache_missed_serve_nan_not_a_structural_zero() {
 /// be distinguished from if only the unset case were tested.
 #[test]
 fn the_gated_arm_serves_the_bands_once_their_severities_are_enabled() {
-    for (name, mut inst) in [
+    for (name, inst) in [
         ("dfanout", inst(DfanoutRecord::new(0.0))),
         ("sel", inst(SelRecord::default())),
         ("sub", inst(SubRecord::default())),
         ("ai", inst(AiRecord::new(0.0))),
     ] {
-        arm_bands(&mut inst);
+        arm_bands(&inst);
         let (lolo, _, _, hihi) = limits(&inst, "VAL");
         assert_eq!(
             (lolo, hihi),
@@ -123,11 +129,14 @@ fn the_gated_arm_serves_the_bands_once_their_severities_are_enabled() {
 /// this pins the storage-home boundary, not just the arm.
 #[test]
 fn the_limits_come_from_the_records_own_fields_not_the_analog_ladder_slot() {
-    let mut inst = inst(DfanoutRecord::new(0.0));
-    arm_bands(&mut inst);
+    let inst = inst(DfanoutRecord::new(0.0));
+    arm_bands(&inst);
 
     assert_eq!(
-        inst.resolve_field("HIHI").and_then(|v| v.to_f64()),
+        inst.cell()
+            .read()
+            .resolve_field("HIHI")
+            .and_then(|v| v.to_f64()),
         Some(90.0),
         "dfanout stores HIHI on its own struct"
     );
@@ -144,7 +153,7 @@ fn the_limits_come_from_the_records_own_fields_not_the_analog_ladder_slot() {
 /// a zero IS the correct answer.
 #[test]
 fn the_unconditional_arm_ignores_the_severities_entirely() {
-    for (name, mut inst) in [
+    for (name, inst) in [
         ("int64in", inst(Int64inRecord::default())),
         ("acalcout", inst(AcalcoutRecord::default())),
     ] {
@@ -153,10 +162,8 @@ fn the_unconditional_arm_ignores_the_severities_entirely() {
             ("HIHI", EpicsValue::Double(90.0)),
             ("LOLO", EpicsValue::Double(10.0)),
         ] {
-            if inst.record.put_field(field, value.clone()).is_err() {
-                inst.put_common_field(field, value)
-                    .unwrap_or_else(|e| panic!("put {field}: {e:?}"));
-            }
+            inst.put(field, value)
+                .unwrap_or_else(|e| panic!("put {field}: {e:?}"));
         }
 
         let (lolo, _, _, hihi) = limits(&inst, "VAL");
@@ -175,11 +182,11 @@ fn the_unconditional_arm_ignores_the_severities_entirely() {
 /// bands where C serves NaN.
 #[test]
 fn the_types_that_list_nothing_route_even_val_to_the_default_arm() {
-    for (name, mut inst) in [
+    for (name, inst) in [
         ("seq", inst(SeqRecord::default())),
         ("swait", inst(SwaitRecord::default())),
     ] {
-        arm_bands(&mut inst);
+        arm_bands(&inst);
 
         let (lolo, low, high, hihi) = limits(&inst, "VAL");
         for (band, v) in [("lolo", lolo), ("low", low), ("high", high), ("hihi", hihi)] {
@@ -196,8 +203,8 @@ fn the_types_that_list_nothing_route_even_val_to_the_default_arm() {
 /// fields still take the default arm, so `.HIHI` does not carry VAL's bands.
 #[test]
 fn an_unlisted_field_of_a_listed_type_still_takes_the_default_arm() {
-    let mut inst = inst(DfanoutRecord::new(0.0));
-    arm_bands(&mut inst);
+    let inst = inst(DfanoutRecord::new(0.0));
+    arm_bands(&inst);
 
     let (lolo, low, high, hihi) = limits(&inst, "HIHI");
     for (band, v) in [("lolo", lolo), ("low", low), ("high", high), ("hihi", hihi)] {

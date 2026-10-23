@@ -52,10 +52,12 @@ pub struct WaveformRecord {
     /// unrepresentable.
     ///
     /// Private, and written only by [`Self::set_ftvl`], which reallocates VAL in
-    /// the same breath (C allocates `bptr` from `dbValueSize(ftvl)` and never
-    /// re-types it independently). A `pub` field let a caller retype FTVL while
-    /// VAL kept its old element variant — the desync the `field_list`/`get_field`
-    /// pair then reports two different native types from.
+    /// the same breath, and by the `.db` store, which C makes before `bptr`
+    /// exists; `init_record` then allocates VAL of its type ([`Self::size_val`])
+    /// as C allocates `bptr` from `dbValueSize(ftvl)`. A `pub` field let a
+    /// caller retype FTVL while VAL kept its old element variant — the desync
+    /// the `field_list`/`get_field` pair then reports two different native
+    /// types from.
     ftvl: Ftype,
     pub mpst: i16, // Monitor Post Mode: 0=Always, 1=OnChange
     pub apst: i16, // Archive Post Mode: 0=Always, 1=OnChange
@@ -63,7 +65,7 @@ pub struct WaveformRecord {
     /// C `BUSY` (`DBF_SHORT`, `special(SPC_NOMOD)`): waveform acquisition-active
     /// flag, set by waveform device support (e.g. `devAsynXXXTimeSeries`) and
     /// read-only to CA clients. waveformRecord.dbd.pod:461. Waveform kind only.
-    pub busy: bool,
+    pub busy: i16,
     /// C `RARM` (`DBF_SHORT`, `pp(TRUE)`): re-arm acquisition control read by
     /// waveform device support: 1=start (clear, arm), 2=stop, 3=resume, 0=no-op.
     /// The device resets it to 0 each process. waveformRecord.dbd.pod:411.
@@ -92,8 +94,8 @@ pub struct WaveformRecord {
     /// written only by the simulation-mode owner
     /// (`RecordInstance::rec_gbl_save_simm` / `rec_gbl_check_simm`).
     pub simm: i16,
-    pub siml: String,
-    pub siol: String,
+    pub siml: PvString,
+    pub siol: PvString,
     pub sims: i16,
     /// SDLY — "Sim. Mode Async Delay" (`DBF_DOUBLE`, `initial("-1.0")`;
     /// aaiRecord.dbd.pod:409-415, aaoRecord.dbd.pod:442-448,
@@ -114,7 +116,9 @@ pub struct WaveformRecord {
     /// aao-only: desired-output-location input link. Pulled into VAL each
     /// process cycle when `omsl == closed_loop` and the link is a real
     /// (non-constant) link (C `aaoRecord.c::fetchValue` `dbGetLink`, 366).
-    pub dol: String,
+    /// Whether it is a constant is the framework's to say, from the link it
+    /// parsed once ([`Record::pre_input_link_actions`]'s argument).
+    dol: PvString,
     /// Did `init_record` pass 1 load a constant closed-loop DOL into the
     /// buffer? C `fetchValue(prec, 1)` sets `prec->udf = FALSE` on success
     /// (aaoRecord.c:371-374); UDF lives in the common fields, which
@@ -148,6 +152,9 @@ pub struct WaveformRecord {
     /// decide the count for a record that arrived EMPTY — never discard this.
     /// Captured at pass 0, before the record's own seed runs.
     prebuilt_nord: i32,
+    /// VAL was put before init. A `.db` NORD alone is no data, so the init
+    /// rules overwrite it as C's do.
+    val_put: bool,
 }
 
 /// Type aliases for documentation / pattern-match clarity. All point
@@ -211,7 +218,7 @@ impl Default for WaveformRecord {
             mpst: 0,
             apst: 0,
             hash: 0,
-            busy: false,
+            busy: 0,
             rarm: 0,
             egu: PvString::new(),
             hopr: 0.0,
@@ -224,8 +231,8 @@ impl Default for WaveformRecord {
             // non-subArray kinds, which never read the field.)
             malm: 1,
             simm: 0,
-            siml: String::new(),
-            siol: String::new(),
+            siml: PvString::new(),
+            siol: PvString::new(),
             sims: 0,
             // C `field(SDLY,DBF_DOUBLE) { initial("-1.0") }` — negative means
             // "synchronous simulation", the default on all three sim-bearing
@@ -235,12 +242,13 @@ impl Default for WaveformRecord {
             // `DBF_INLINK` with no `initial(...)`, so both default to the
             // zero value: OMSL=supervisory (no DOL fetch), DOL=constant/empty.
             omsl: 0,
-            dol: String::new(),
+            dol: PvString::new(),
             constant_dol_loaded: false,
             dol_fetch_requested: false,
             dol_read_failed: false,
             inp_read_failed: false,
             prebuilt_nord: 0,
+            val_put: false,
         }
     }
 }
@@ -338,6 +346,53 @@ impl WaveformRecord {
         }
     }
 
+    /// A put to VAL, by any route: a client's, a link's or the INP read's.
+    fn put_val(&mut self, value: EpicsValue) -> CaResult<()> {
+        // A DBR_STRING source is C's `putString<FTVL>` row
+        // (`dbConvert.c:941-1147`): each of the `nRequest` elements is
+        // PARSED with `epicsParse*` at `dbConvertBase` 0, and a
+        // non-zero status aborts the whole `dbPut` so the field keeps
+        // its old value. A scalar string is `nRequest == 1`, so it
+        // lands as ONE element.
+        //
+        // Measured on the compiled softIoc, `caput` then `caget`:
+        // `FTVL=CHAR` refuses "hi" and stores 65 for "65";
+        // `FTVL=DOUBLE`/`LONG` refuse "hi", take `0x10` as 16, and
+        // `LONG` truncates 1.7 to 1. The rule does not vary with FTVL,
+        // so neither does this branch. Treating a string as the
+        // buffer's BYTES for CHAR/UCHAR — and silently coercing it to
+        // 0 for every other FTVL — was a special case at one boundary
+        // that C does not have anywhere: the byte carry is what a
+        // client asking DBR_CHAR gets (`caput -S`), which arrives here
+        // already as a `CharArray` and is untouched by this branch.
+        let value = match (&value, c_parse::NumericField::of(self.ftvl_element_type())) {
+            (EpicsValue::String(s), Some(numeric)) => {
+                // The ARRAY row, `put_string_element`: VAL is
+                // `special(SPC_DBADDR)`, so `dbAccess.c:1350` sends
+                // even a one-element string put to `putString*`, which
+                // — alone among the four conversion rows — has no
+                // empty-string carve-out. `caput WF ""` is refused.
+                match c_parse::put_string_element("VAL", numeric, &s.as_str_lossy())? {
+                    c_parse::Converted::Stored(v) => v,
+                    // C skipped the element store, so the buffer keeps
+                    // the element it held and the put still succeeds.
+                    c_parse::Converted::Unchanged => return Ok(()),
+                }
+            }
+            // FTVL=STRING is `putStringString`, a text copy, not a
+            // parse — `NumericField::of` reports None for it.
+            _ => value,
+        };
+        // C `dbAccess.c:1415` `if (isValueField) precord->udf = FALSE;`
+        // — a put to VAL re-establishes the buffer, so the remembered
+        // read failure no longer describes it. (Reachable without a
+        // process only through an NPP link put; subArray's VAL is
+        // `pp(TRUE)`, so a CA put re-derives UDF a moment later.)
+        self.inp_read_failed = false;
+        self.val_put = true;
+        self.land_val_in_buffer(value)
+    }
+
     /// Land a VAL source in the FTVL-typed buffer — the single owner of the
     /// "what does a VAL put do" rule, so VAL is an FTVL-typed ARRAY of at
     /// most [`Self::val_capacity`] elements on every path, by construction.
@@ -367,7 +422,8 @@ impl WaveformRecord {
     /// `dbFastConvert` into `bptr`.
     fn land_val_in_buffer(&mut self, value: EpicsValue) -> CaResult<()> {
         let cap = self.val_capacity();
-        let converted = value.convert_to(self.ftvl_element_type());
+        let target = self.ftvl_element_type();
+        let converted = value.into_type(target);
         // NORD is capped at the capacity (C bounds every request to the
         // allocated element count). The buffer the record holds is at least
         // NORD long and at most the capacity; the CA channel element count
@@ -457,11 +513,12 @@ impl WaveformRecord {
         if !matches!(self.kind, ArrayKind::Aao) || self.omsl != MENU_OMSL_CLOSED_LOOP {
             return;
         }
-        let dol = parse_link_v2(&self.dol);
-        let Some(value) = crate::server::recgbl::simm::constant_load_value(&dol) else {
-            // Not a constant (a real link — fetched per cycle instead), or an
-            // unset one: C `dbConstLoadArray` rejects an empty constant with
-            // `S_db_badField`, leaving NORD and UDF untouched.
+        // Not a constant (a real link — fetched per cycle instead), or a load
+        // that failed: C leaves NORD and UDF untouched.
+        let crate::server::record::ParsedLink::Constant(dol) = parse_link_v2(&self.dol) else {
+            return;
+        };
+        let Ok(value) = dol.load_array(self.ftvl_element_type(), self.val_capacity()) else {
             return;
         };
         // `land_val_in_buffer` IS `dbLoadLinkArray`'s landing rule: convert
@@ -471,12 +528,28 @@ impl WaveformRecord {
         }
     }
 
+    /// The aao DOL text, and whether it is a constant.
+    pub fn set_dol(&mut self, dol: impl Into<PvString>) {
+        self.dol = dol.into();
+    }
+
     /// Reallocate VAL buffer to match current FTVL and `val_capacity` —
     /// C `callocMustSucceed(nelm, dbValueSize(prec->ftvl))`. Also what device
     /// support that wipes the array (`nord = 0` + `memset(bptr, 0, ...)`) calls.
     pub fn reallocate_val(&mut self) {
         self.val = self.ftvl.zeroed(self.val_capacity());
         self.nord = 0;
+    }
+
+    /// C `init_record`'s `callocMustSucceed(capacity, dbValueSize(prec->ftvl))`,
+    /// keeping a builder's elements when they are already of FTVL's type.
+    fn size_val(&mut self) {
+        let typed = std::mem::discriminant(&self.ftvl.zeroed(0));
+        if std::mem::discriminant(&self.val) == typed {
+            self.resize_val_preserving();
+        } else {
+            self.reallocate_val();
+        }
     }
 
     /// Resize the VAL buffer to the current [`Self::val_capacity`] **while
@@ -640,12 +713,14 @@ impl WaveformRecord {
         // are a read that returned 0 — so the remembered failure is over.
         self.inp_read_failed = false;
         let len = self.val.count() as i32;
-        let n_request = n_request.clamp(0, len);
-        let indx = self.indx;
+        let n_request = i64::from(n_request.clamp(0, len));
+        // C's `prec->indx` is `epicsUInt32` in a `long` expression: an INDX
+        // that was never clamped (the init load) is read unsigned.
+        let indx = i64::from(self.indx as u32);
         let mut ecount = n_request - indx;
         if ecount > 0 {
-            if ecount > self.nelm {
-                ecount = self.nelm;
+            if ecount > i64::from(self.nelm as u32) {
+                ecount = i64::from(self.nelm as u32);
             }
             let start = indx as usize;
             let end = start + ecount as usize;
@@ -681,7 +756,7 @@ impl WaveformRecord {
         } else {
             ecount = 0;
         }
-        self.nord = ecount;
+        self.nord = ecount as i32;
     }
 
     /// C `devSASoft.c::read_sa`'s load half (97-119): ask the INP for
@@ -696,9 +771,12 @@ impl WaveformRecord {
     /// elements, and a SCALAR source is one element at `bptr[0]` with
     /// `nRequest = 1`.
     fn sa_load_and_subset(&mut self, source: EpicsValue) -> CaResult<()> {
-        self.sa_clamp_bounds();
-        let n_request = self.indx.saturating_add(self.nelm).min(self.malm.max(1));
-        let mut src = source.convert_to(self.ftvl_element_type());
+        // No clamp here: this is `devSASoft`'s `init_record` too, which C
+        // runs on the unclamped INDX/NELM. The process-time clamp
+        // (`readValue`) is `pre_input_link_actions`.
+        let n_request = (i64::from(self.indx as u32) + i64::from(self.nelm as u32))
+            .min(i64::from(self.malm.max(1))) as i32;
+        let mut src = source.into_type(self.ftvl_element_type());
         src.truncate(n_request as usize);
         let loaded = src.count() as i32;
         self.land_val_in_buffer(src)?;
@@ -729,25 +807,229 @@ impl WaveformRecord {
 /// VAL from DOL each cycle (C `aaoRecord.c::fetchValue`).
 const MENU_OMSL_CLOSED_LOOP: i16 = 1;
 
-/// C `dbLinkIsConstant(&prec->dol)`: is the aao DOL a constant rather than a
-/// fetchable link? Used to gate the process-time fetch (`!isConst`), so a
-/// constant is never re-applied per cycle over a client caput.
-///
-/// The classification is [`parse_link_v2`]'s alone — C's own
-/// `dbParseLink` (`dbStaticLib.c:2346-2357`) is the single classifier, and it
-/// calls a link constant iff the text is empty, parses whole as a double, or
-/// is bracketed (`[1, 2, 3]`). This helper used to ALSO accept a
-/// whitespace-separated numeric list (`"1 2 3"`) as a constant array; C does
-/// not — `epicsParseDouble` rejects the trailing garbage, so C makes that a
-/// PV_LINK to a record named `1`. An empty/unset link is constant
-/// (`dbLink.c:220`, whose `lset` is `dbConst_lset`).
-fn dol_is_constant(dol: &str) -> bool {
-    crate::server::recgbl::simm::is_constant(&parse_link_v2(dol))
+/// The members a slot of any of the four kinds names.
+#[derive(Clone, Copy)]
+enum SlotMember {
+    Rarm,
+    Prec,
+    Egu,
+    Hopr,
+    Lopr,
+    Sdly,
+    Hash,
+}
+
+impl WaveformRecord {
+    /// `slot` in this kind's table. NELM/NORD/INDX/MALM are DBF_ULONG held
+    /// as `i32` and BUSY a `bool`, so none of them maps.
+    fn slot_member(&self, slot: crate::server::record::FieldSlot) -> Option<SlotMember> {
+        use crate::server::record::dbd_generated::slots;
+        use SlotMember::*;
+        macro_rules! table {
+            ($t:ident; $($f:ident => $m:ident),*) => {
+                match slot {
+                    $(slots::$t::$f => Some($m),)*
+                    _ => None,
+                }
+            };
+        }
+        match self.kind {
+            ArrayKind::Waveform => table!(waveform;
+                RARM => Rarm, PREC => Prec, EGU => Egu, HOPR => Hopr, LOPR => Lopr,
+                SDLY => Sdly, HASH => Hash),
+            ArrayKind::Aai => table!(aai;
+                PREC => Prec, EGU => Egu, HOPR => Hopr, LOPR => Lopr, SDLY => Sdly,
+                HASH => Hash),
+            ArrayKind::Aao => table!(aao;
+                PREC => Prec, EGU => Egu, HOPR => Hopr, LOPR => Lopr, SDLY => Sdly,
+                HASH => Hash),
+            ArrayKind::SubArray => table!(subArray;
+                PREC => Prec, EGU => Egu, HOPR => Hopr, LOPR => Lopr),
+        }
+    }
 }
 
 impl Record for WaveformRecord {
+    fn acts_before_process(&self) -> bool {
+        false
+    }
+
+    fn slot_ref(
+        &self,
+        slot: crate::server::record::FieldSlot,
+    ) -> Option<crate::server::record::SlotRef<'_>> {
+        Some(match self.slot_member(slot)? {
+            SlotMember::Rarm => (&self.rarm).into(),
+            SlotMember::Prec => (&self.prec).into(),
+            SlotMember::Egu => (&self.egu).into(),
+            SlotMember::Hopr => (&self.hopr).into(),
+            SlotMember::Lopr => (&self.lopr).into(),
+            SlotMember::Sdly => (&self.sdly).into(),
+            SlotMember::Hash => (&self.hash).into(),
+        })
+    }
+
+    fn declared_store(
+        &self,
+        slot: crate::server::record::FieldSlot,
+    ) -> Option<crate::server::record::DeclaredStore> {
+        use crate::server::record::dbd_generated::slots;
+        match self.kind {
+            ArrayKind::Waveform => crate::declared_store!(slot; slots::waveform;
+                member: RARM, PREC, EGU, HOPR, LOPR, SDLY, HASH;
+                custom: VAL, NELM, FTVL, BUSY, NORD, SIOL, SIML, SIMM, SIMS, MPST, APST;
+                spill: INP, BPTR, OLDSIMM, SSCN, SIMPVT),
+            ArrayKind::Aai => crate::declared_store!(slot; slots::aai;
+                member: PREC, EGU, HOPR, LOPR, SDLY, HASH;
+                custom: VAL, NELM, FTVL, NORD, SIML, SIMM, SIMS, SIOL, MPST, APST;
+                spill: INP, BPTR, OLDSIMM, SSCN, SIMPVT),
+            ArrayKind::Aao => crate::declared_store!(slot; slots::aao;
+                member: PREC, EGU, HOPR, LOPR, SDLY, HASH;
+                custom: VAL, DOL, OMSL, NELM, FTVL, NORD, SIML, SIMM, SIMS, SIOL, MPST, APST;
+                spill: OUT, BPTR, OLDSIMM, SSCN, SIMPVT),
+            ArrayKind::SubArray => crate::declared_store!(slot; slots::subArray;
+                member: PREC, EGU, HOPR, LOPR;
+                custom: VAL, FTVL, MALM, NELM, INDX, BUSY, NORD;
+                spill: INP, BPTR),
+        }
+    }
+
+    fn slot_mut(
+        &mut self,
+        slot: crate::server::record::FieldSlot,
+    ) -> Option<crate::server::record::SlotMut<'_>> {
+        Some(match self.slot_member(slot)? {
+            SlotMember::Rarm => (&mut self.rarm).into(),
+            SlotMember::Prec => (&mut self.prec).into(),
+            SlotMember::Egu => (&mut self.egu).into(),
+            SlotMember::Hopr => (&mut self.hopr).into(),
+            SlotMember::Lopr => (&mut self.lopr).into(),
+            SlotMember::Sdly => (&mut self.sdly).into(),
+            SlotMember::Hash => (&mut self.hash).into(),
+        })
+    }
+
+    /// No kind has an `OVAL`: the served `VAL`, read directly rather than
+    /// through the default's two by-name asks.
+    fn output_link_value(&self) -> Option<EpicsValue> {
+        Some(self.val.head(self.served_element_count()))
+    }
+
+    /// [`Self::output_link_value`], borrowed; aao's OUT writes it
+    /// (`devAaoSoft.c:56`). A `STRING` FTVL has no view.
+    fn output_view(&self) -> Option<crate::server::record::OutView<'_>> {
+        self.monitor_value_view()
+            .map(crate::server::record::OutView::Array)
+    }
+
+    /// The served `VAL` of [`Self::get_field`], borrowed. A `STRING` FTVL has
+    /// no view and falls back to the clone.
+    fn monitor_value_view(&self) -> Option<crate::server::record::ValueView<'_>> {
+        use crate::server::record::ValueView;
+        fn served<T>(a: &[T], n: usize) -> &[T] {
+            &a[..n.min(a.len())]
+        }
+        let n = self.served_element_count();
+        Some(match &self.val {
+            EpicsValue::DoubleArray(a) => ValueView::Double(served(a, n)),
+            EpicsValue::FloatArray(a) => ValueView::Float(served(a, n)),
+            EpicsValue::LongArray(a) => ValueView::Long(served(a, n)),
+            EpicsValue::ULongArray(a) => ValueView::ULong(served(a, n)),
+            EpicsValue::Int64Array(a) => ValueView::Int64(served(a, n)),
+            EpicsValue::UInt64Array(a) => ValueView::UInt64(served(a, n)),
+            EpicsValue::ShortArray(a) => ValueView::Short(served(a, n)),
+            EpicsValue::UShortArray(a) => ValueView::UShort(served(a, n)),
+            EpicsValue::CharArray(a) => ValueView::Char(served(a, n)),
+            EpicsValue::UCharArray(a) => ValueView::UChar(served(a, n)),
+            EpicsValue::EnumArray(a) => ValueView::Enum(served(a, n)),
+            _ => return None,
+        })
+    }
+
+    /// `Self::put_val`'s scalar row without building the one-element array:
+    /// the same parse or `to_<ty>` cast, into `bptr[0]` of the unshared buffer.
+    fn put_primary_element0(&mut self, src: crate::server::record::OutView<'_>) -> bool {
+        use crate::server::record::OutView;
+        let n = match src {
+            OutView::Num(n) => n.into(),
+            OutView::Str(text) => {
+                let (Some(numeric), Ok(text)) = (
+                    c_parse::NumericField::of(self.ftvl_element_type()),
+                    std::str::from_utf8(text),
+                ) else {
+                    return false;
+                };
+                match c_parse::put_string_element("VAL", numeric, text) {
+                    Ok(c_parse::Converted::Stored(v)) => match v.num() {
+                        Some(n) => n,
+                        None => return false,
+                    },
+                    _ => return false,
+                }
+            }
+            OutView::Chars(_) | OutView::Array(_) => return false,
+        };
+        macro_rules! put {
+            ($buf:expr, $x:expr) => {
+                match $buf.head_mut() {
+                    Some([e0, ..]) => {
+                        *e0 = $x;
+                        true
+                    }
+                    _ => false,
+                }
+            };
+        }
+        // `to_field`'s row per element type; `Char` keeps the epicsInt8 bits.
+        let stored = self.val_capacity() > 0
+            && match &mut self.val {
+                EpicsValue::DoubleArray(b) => put!(b, n.to_f64()),
+                EpicsValue::FloatArray(b) => put!(b, n.to_f32()),
+                EpicsValue::ShortArray(b) => put!(b, n.to_i16()),
+                EpicsValue::UShortArray(b) => put!(b, n.to_u16()),
+                EpicsValue::EnumArray(b) => put!(b, n.to_u16()),
+                EpicsValue::CharArray(b) => put!(b, n.to_i8() as u8),
+                EpicsValue::UCharArray(b) => put!(b, n.to_u8()),
+                EpicsValue::LongArray(b) => put!(b, n.to_i32()),
+                EpicsValue::ULongArray(b) => put!(b, n.to_u32()),
+                EpicsValue::Int64Array(b) => put!(b, n.to_i64()),
+                EpicsValue::UInt64Array(b) => put!(b, n.to_u64()),
+                _ => false,
+            };
+        if stored {
+            self.nord = 1;
+            self.inp_read_failed = false;
+        }
+        stored
+    }
+
+    fn cycle_hooks(&self) -> crate::server::record::CycleHooks {
+        crate::server::record::CycleHooks::PRE_INPUT
+            .union(crate::server::record::CycleHooks::INPUT_FETCH)
+    }
+
+    fn has_array_monitor_post(&self) -> bool {
+        !matches!(self.kind, ArrayKind::SubArray)
+    }
+
     fn record_type(&self) -> &'static str {
         self.kind.as_record_type()
+    }
+
+    /// devWfSoft.c and devAaiSoft.c return `dbGetLink`'s status; devAaoSoft.c
+    /// returns 0, and a failed DOL's status is aao's own (`process` below);
+    /// `subArrayRecord.c:71` returns 0.
+    fn process_status_rule(&self) -> crate::server::record::ProcessStatusRule {
+        use crate::server::record::{ProcessStatusRule, SoftStatus};
+        match self.kind {
+            ArrayKind::Waveform | ArrayKind::Aai => ProcessStatusRule::io(SoftStatus {
+                plain: true,
+                raw: false,
+                async_: false,
+            }),
+            ArrayKind::Aao => ProcessStatusRule::io(SoftStatus::NONE),
+            ArrayKind::SubArray => ProcessStatusRule::ZERO,
+        }
     }
 
     /// The index fields four kinds answer from their own array bounds rather
@@ -776,7 +1058,7 @@ impl Record for WaveformRecord {
     /// * `aai` (`:276-291`) / `aao` (`:279-294`) — only `NORD`.
     ///
     /// `VAL` is absent from both lists here: it answers HOPR/LOPR, which is
-    /// what the VAL metadata cache already holds.
+    /// what the record-level VAL metadata already holds.
     fn field_metadata_override(&self, field: &str) -> Option<FieldMetadataOverride> {
         let malm = self.malm as f64;
         let nelm = self.nelm as f64;
@@ -866,7 +1148,7 @@ impl Record for WaveformRecord {
         if pass != 0 {
             return Ok(());
         }
-        self.prebuilt_nord = self.nord;
+        self.prebuilt_nord = if self.val_put { self.nord } else { 0 };
         if matches!(self.kind, ArrayKind::SubArray) {
             if self.malm < 1 {
                 self.malm = 1;
@@ -885,8 +1167,17 @@ impl Record for WaveformRecord {
             // matter. Preserving resize, not a wipe: a `record()`-builder
             // subArray may already hold element data (a `.db` cannot — VAL is
             // `DBF_NOACCESS`).
-            self.resize_val_preserving();
+            self.size_val();
             return Ok(());
+        }
+        // C turns NELM <= 0 into 1 before `callocMustSucceed(prec->nelm, ...)`
+        // (waveformRecord.c:94, aaiRecord.c:109, aaoRecord.c:112).
+        if self.nelm <= 0 {
+            self.nelm = 1;
+        }
+        self.size_val();
+        if self.prebuilt_nord == 0 {
+            self.nord = 0;
         }
         if matches!(self.kind, ArrayKind::Aao) {
             return Ok(());
@@ -895,6 +1186,10 @@ impl Record for WaveformRecord {
             self.nord = 1;
         }
         Ok(())
+    }
+
+    fn dset_init_in_pass0(&self) -> bool {
+        matches!(self.kind, ArrayKind::Aai | ArrayKind::Aao)
     }
 
     /// waveform/aai/aao clear UDF in `process()` itself, on the line after
@@ -957,6 +1252,38 @@ impl Record for WaveformRecord {
     /// * subArray — `devSASoft.c:58-74` loads and subsets (NORD comes from the
     ///   slice, `subset()`), and leaves NORD alone when the load fails; its seed
     ///   is 0 to begin with.
+    fn soft_input_array_request(&self) -> Option<(DbFieldType, usize)> {
+        let nreq = match self.kind {
+            ArrayKind::Waveform | ArrayKind::Aai => self.nelm,
+            ArrayKind::SubArray => self.indx.saturating_add(self.nelm).min(self.malm.max(1)),
+            ArrayKind::Aao => return None,
+        };
+        Some((self.ftvl_element_type(), nreq.max(0) as usize))
+    }
+
+    /// The soft dsets read INP, and SIOL under SIMM (`devAaiSoft.c:87`,
+    /// `waveformRecord.c:351`), and aao's `fetchValue` reads DOL
+    /// (`aaoRecord.c:366`), at `(FTVL, nRequest)`, so a source FTVL cannot
+    /// convert is a failed read.
+    fn input_link_request(&self, link_field: &str) -> crate::server::record::InputLinkRequest {
+        use crate::server::record::LinkReadAs;
+        crate::server::record::InputLinkRequest::As(
+            match (link_field, self.kind, self.soft_input_array_request()) {
+                ("INP" | "SIOL", _, Some((dbr, n_request))) => LinkReadAs::Array { dbr, n_request },
+                ("DOL", ArrayKind::Aao, _) => LinkReadAs::Array {
+                    dbr: self.ftvl_element_type(),
+                    n_request: self.nelm.max(0) as usize,
+                },
+                _ => LinkReadAs::Native,
+            },
+        )
+    }
+
+    /// `FTVL` and `NELM` are fields, so the request above is the instance's.
+    fn input_link_answers_fixed_at_type(&self) -> bool {
+        false
+    }
+
     fn soft_input_dset_init(&mut self, loaded: bool) {
         // `prebuilt_nord`: the elements a caller loaded are not C's calloc'd
         // buffer, and the dset's zeroing arm exists because C's buffer IS empty.
@@ -969,9 +1296,9 @@ impl Record for WaveformRecord {
     /// prec->udf = FALSE; }` (aaoRecord.c:371-374) — the UDF half of the
     /// constant-DOL load, which `init_record` cannot apply itself (UDF is a
     /// common field). An aao whose value came from a constant DOL is DEFINED.
-    fn post_init_finalize_undef(&mut self, udf: &mut bool) -> CaResult<()> {
+    fn post_init_finalize_undef(&mut self, udf: &mut u8) -> CaResult<()> {
         if self.constant_dol_loaded {
-            *udf = false;
+            *udf = 0;
         }
         Ok(())
     }
@@ -1058,9 +1385,26 @@ impl Record for WaveformRecord {
         }
     }
 
+    fn link_text_ref(&self, link_field: &str) -> Option<&[u8]> {
+        match link_field {
+            "DOL" => Some(self.dol.as_bytes()),
+            "SIML" => Some(self.siml.as_bytes()),
+            "SIOL" => Some(self.siol.as_bytes()),
+            _ => None,
+        }
+    }
+
     // EGU/HOPR/LOPR/PREC are backed by typed storage and exposed through both
     // get_field/put_field and field_list, so populate_display_info reads the
     // loaded values for the DBR_GR display limits (waveformRecord.c:251-252).
+    fn simm_cells(&self) -> Option<crate::server::record::SimmCells> {
+        Some(crate::server::record::SimmCells {
+            simm: self.simm,
+            sims: self.sims,
+            sdly: self.sdly,
+        })
+    }
+
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
             "VAL" => {
@@ -1102,7 +1446,7 @@ impl Record for WaveformRecord {
             "RARM" if matches!(self.kind, ArrayKind::Waveform) => {
                 Some(EpicsValue::Short(self.rarm))
             }
-            "BUSY" if self.declares_busy() => Some(EpicsValue::Short(self.busy as i16)),
+            "BUSY" if self.declares_busy() => Some(EpicsValue::Short(self.busy)),
             "EGU" => Some(EpicsValue::String(self.egu.clone())),
             "HOPR" => Some(EpicsValue::Double(self.hopr)),
             "LOPR" => Some(EpicsValue::Double(self.lopr)),
@@ -1122,52 +1466,35 @@ impl Record for WaveformRecord {
         }
     }
 
+    /// A `.db` NELM or FTVL is stored, not sized: `init_record` allocates VAL
+    /// from both (`size_val`), so the `.db` order cannot matter.
+    /// areaDetector loads NELM=0 (NDStats YSIZE=0), which init turns into 1.
+    fn load_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
+        match name {
+            "NELM" if !matches!(self.kind, ArrayKind::SubArray) => match count_put(&value) {
+                Some(n) => {
+                    self.nelm = n;
+                    Ok(())
+                }
+                None => self.put_field(name, value),
+            },
+            "FTVL" => match value {
+                EpicsValue::Short(v) => match Ftype::from_index(v) {
+                    Some(ftvl) => {
+                        self.ftvl = ftvl;
+                        Ok(())
+                    }
+                    None => self.put_field(name, value),
+                },
+                _ => self.put_field(name, value),
+            },
+            _ => self.put_field(name, value),
+        }
+    }
+
     fn put_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
         match name {
-            "VAL" => {
-                // A DBR_STRING source is C's `putString<FTVL>` row
-                // (`dbConvert.c:941-1147`): each of the `nRequest` elements is
-                // PARSED with `epicsParse*` at `dbConvertBase` 0, and a
-                // non-zero status aborts the whole `dbPut` so the field keeps
-                // its old value. A scalar string is `nRequest == 1`, so it
-                // lands as ONE element.
-                //
-                // Measured on the compiled softIoc, `caput` then `caget`:
-                // `FTVL=CHAR` refuses "hi" and stores 65 for "65";
-                // `FTVL=DOUBLE`/`LONG` refuse "hi", take `0x10` as 16, and
-                // `LONG` truncates 1.7 to 1. The rule does not vary with FTVL,
-                // so neither does this branch. Treating a string as the
-                // buffer's BYTES for CHAR/UCHAR — and silently coercing it to
-                // 0 for every other FTVL — was a special case at one boundary
-                // that C does not have anywhere: the byte carry is what a
-                // client asking DBR_CHAR gets (`caput -S`), which arrives here
-                // already as a `CharArray` and is untouched by this branch.
-                let value = match (&value, c_parse::NumericField::of(self.ftvl_element_type())) {
-                    (EpicsValue::String(s), Some(numeric)) => {
-                        // The ARRAY row, `put_string_element`: VAL is
-                        // `special(SPC_DBADDR)`, so `dbAccess.c:1350` sends
-                        // even a one-element string put to `putString*`, which
-                        // — alone among the four conversion rows — has no
-                        // empty-string carve-out. `caput WF ""` is refused.
-                        match c_parse::put_string_element(name, numeric, &s.as_str_lossy())? {
-                            c_parse::Converted::Stored(v) => v,
-                            // C skipped the element store, so the buffer keeps
-                            // the element it held and the put still succeeds.
-                            c_parse::Converted::Unchanged => return Ok(()),
-                        }
-                    }
-                    // FTVL=STRING is `putStringString`, a text copy, not a
-                    // parse — `NumericField::of` reports None for it.
-                    _ => value,
-                };
-                // C `dbAccess.c:1415` `if (isValueField) precord->udf = FALSE;`
-                // — a put to VAL re-establishes the buffer, so the remembered
-                // read failure no longer describes it. (Reachable without a
-                // process only through an NPP link put; subArray's VAL is
-                // `pp(TRUE)`, so a CA put re-derives UDF a moment later.)
-                self.inp_read_failed = false;
-                self.land_val_in_buffer(value)
-            }
+            "VAL" => self.put_val(value),
             "NELM" => {
                 let Some(n) = count_put(&value) else {
                     return Err(CaError::InvalidValue(format!(
@@ -1198,15 +1525,11 @@ impl Record for WaveformRecord {
                     Ok(())
                 } else {
                     // waveform/aai/aao: NELM is `special(SPC_NOMOD)`, so a CA put
-                    // never reaches here — this arm is the `.db`-load / builder
-                    // sizing path, where NELM must be a positive element count.
-                    // Preserve the existing element data instead of wiping VAL.
-                    if n <= 0 {
-                        return Err(CaError::InvalidValue(format!(
-                            "NELM must be positive, got {n}"
-                        )));
-                    }
-                    self.nelm = n;
+                    // never reaches here — this arm is the builder sizing path
+                    // (a `.db` stores through `load_field`). C init_record turns
+                    // NELM <= 0 into 1 (waveformRecord.c:94, aaiRecord.c:109,
+                    // aaoRecord.c:112). Preserve the existing element data.
+                    self.nelm = n.max(1);
                     self.resize_val_preserving();
                     Ok(())
                 }
@@ -1221,8 +1544,10 @@ impl Record for WaveformRecord {
                 // rejects it with `S_db_badChoice` and leaves the field alone,
                 // rather than storing an index whose `dbValueSize` is undefined.
                 let Some(ftvl) = Ftype::from_index(v) else {
-                    return Err(CaError::BadChoice(format!(
-                        "FTVL: {v} is not one of {MENU_FTYPE:?}"
+                    return Err(CaError::BadChoice(crate::error::ChoiceRefusal::index(
+                        "FTVL",
+                        v.into(),
+                        MENU_FTYPE.len(),
                     )));
                 };
                 self.set_ftvl(ftvl);
@@ -1262,7 +1587,15 @@ impl Record for WaveformRecord {
                 };
                 Ok(())
             }
-            "NORD" => Err(CaError::ReadOnlyField(name.to_string())),
+            // SPC_NOMOD fields refuse a runtime put at the database's
+            // `check_no_mod_in_db_put`; reaching here is a `.db` store.
+            "NORD" => {
+                self.nord = value
+                    .to_f64()
+                    .ok_or_else(|| CaError::TypeMismatch("NORD".into()))?
+                    as i32;
+                Ok(())
+            }
             "INDX" if matches!(self.kind, ArrayKind::SubArray) => {
                 let Some(v) = count_put(&value) else {
                     return Err(CaError::TypeMismatch("INDX".into()));
@@ -1303,10 +1636,16 @@ impl Record for WaveformRecord {
                 self.rarm = v;
                 Ok(())
             }
-            "BUSY" if self.declares_busy() => Err(CaError::ReadOnlyField(name.to_string())),
+            "BUSY" if self.declares_busy() => {
+                self.busy = value
+                    .to_f64()
+                    .ok_or_else(|| CaError::TypeMismatch("BUSY".into()))?
+                    as i16;
+                Ok(())
+            }
             "EGU" => {
                 if let EpicsValue::String(s) = value {
-                    self.egu = s;
+                    self.egu.set_bytes(s.as_bytes());
                     Ok(())
                 } else {
                     Err(CaError::TypeMismatch("EGU".into()))
@@ -1341,14 +1680,14 @@ impl Record for WaveformRecord {
             },
             "SIML" if self.has_sim_block() => match value {
                 EpicsValue::String(s) => {
-                    self.siml = s.as_str_lossy().into_owned();
+                    self.siml = s;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("SIML".into())),
             },
             "SIOL" if self.has_sim_block() => match value {
                 EpicsValue::String(s) => {
-                    self.siol = s.as_str_lossy().into_owned();
+                    self.siol = s;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("SIOL".into())),
@@ -1380,7 +1719,7 @@ impl Record for WaveformRecord {
             },
             "DOL" if matches!(self.kind, ArrayKind::Aao) => match value {
                 EpicsValue::String(s) => {
-                    self.dol = s.as_str_lossy().into_owned();
+                    self.set_dol(s);
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("DOL".into())),
@@ -1405,14 +1744,24 @@ impl Record for WaveformRecord {
     /// Residual: the init-time constant-array load (`dbLoadLinkArray`, C's
     /// `init && isConst` arm) is not applied here — it belongs to
     /// `init_record`, not to the per-cycle hook.
-    fn pre_input_link_actions(&mut self) -> ProcessActions {
+    fn pre_input_link_actions(
+        &mut self,
+        dol_is_constant: bool,
+        _dpvt: &mut crate::server::device_support::Dpvt,
+    ) -> ProcessActions {
+        if matches!(self.kind, ArrayKind::SubArray) {
+            // C `readValue`: NELM/INDX are clamped before `read_sa`, on every
+            // process and never at init.
+            self.sa_clamp_bounds();
+            return ProcessActions::new();
+        }
         if !matches!(self.kind, ArrayKind::Aao) || self.omsl != MENU_OMSL_CLOSED_LOOP {
             return ProcessActions::new();
         }
         // C `!dbLinkIsConstant(&prec->dol)`: only a real (DB/CA/PVA) link is
         // fetched at process time; a constant (scalar, array literal, or
         // empty) is not re-applied each cycle.
-        if dol_is_constant(&self.dol) {
+        if dol_is_constant {
             return ProcessActions::new();
         }
         // The cycle now depends on this fetch — `set_resolved_input_links`
@@ -1468,7 +1817,10 @@ impl Record for WaveformRecord {
     fn process(&mut self) -> CaResult<ProcessOutcome> {
         if self.dol_read_failed {
             self.dol_read_failed = false;
-            return Ok(ProcessOutcome::complete_no_emit());
+            return Ok(ProcessOutcome {
+                status: Err(crate::error::DbStatus::FAILED),
+                ..ProcessOutcome::complete_no_emit()
+            });
         }
         Ok(ProcessOutcome::complete())
     }
@@ -1483,21 +1835,16 @@ impl Record for WaveformRecord {
     /// process reload uses, so link delivery and constant reload cannot drift
     /// apart.
     fn set_val(&mut self, value: EpicsValue) -> CaResult<()> {
+        // `dbGetLink` runs the GET table into `bptr`, not the put one VAL's
+        // own put applies: a `DBF_CHAR` source read at FTVL STRING is one
+        // decimal string per byte (`getCharString`), never the joined text.
+        let value = value.get_convert(self.ftvl_element_type())?;
         if matches!(self.kind, ArrayKind::SubArray) {
             return self.sa_load_and_subset(value);
         }
-        match self.put_field("VAL", value.clone()) {
-            Ok(()) => Ok(()),
-            Err(CaError::TypeMismatch(_)) => {
-                let target = self
-                    .get_field("VAL")
-                    .map(|v| v.db_field_type())
-                    .unwrap_or(DbFieldType::Double);
-                let coerced = value.convert_to(target);
-                self.put_field("VAL", coerced)
-            }
-            Err(e) => Err(e),
-        }
+        // No `TypeMismatch` retry: VAL's put already converts to the FTVL
+        // element type, which is the type a retry would convert to.
+        self.put_val(value)
     }
 
     /// C `devSASoft.c::read_sa` (92-123), the CONSTANT-INP arm — subArray is
@@ -1534,18 +1881,28 @@ impl Record for WaveformRecord {
     ///
     /// The other three array kinds keep the default (`false`): `devWfSoft.c`
     /// and `devAaiSoft.c` both open with `if (dbLinkIsConstant(pinp)) return 0;`.
-    fn read_constant_inp(&mut self, value: Option<EpicsValue>) -> bool {
+    fn read_constant_inp(&mut self, inp: &crate::server::record::ParsedLink) -> bool {
         if !matches!(self.kind, ArrayKind::SubArray) {
             return false;
         }
-        match value {
-            Some(v) => {
+        let loaded = match (inp, self.soft_input_array_request()) {
+            (crate::server::record::ParsedLink::Constant(c), Some((ftvl, nreq))) => {
+                c.load_array(ftvl, nreq)
+            }
+            _ => Err(crate::server::record::ConstLoadError::BadField),
+        };
+        match loaded {
+            Ok(v) => {
                 let _ = self.sa_load_and_subset(v);
             }
-            None => {
+            // `if (!status) subset(...)`: the record keeps its slice and the
+            // status reaches `process`.
+            Err(crate::server::record::ConstLoadError::Conversion) => {
+                self.inp_read_failed = true;
+            }
+            Err(crate::server::record::ConstLoadError::BadField) => {
                 // `S_db_badField` — the INP is empty: nRequest = NORD, subset
                 // the buffer the client wrote.
-                self.sa_clamp_bounds();
                 let n_request = self.nord;
                 self.sa_subset(n_request);
             }
@@ -1613,8 +1970,22 @@ impl Record for WaveformRecord {
     /// field tail) and never returns to 0. The port was posting that reset.
     /// `pwf->udf = 0` on the next line is the same shape; the walk already
     /// excludes UDF for every record type.
-    fn process_posted_fields(&self) -> Option<&'static [&'static str]> {
-        Some(&["VAL", "NORD", "BUSY", "HASH"])
+    ///
+    /// Each kind's set indexes its own table; aai/aao declare no BUSY.
+    /// subArray's BUSY is declared but posted by nothing: waveform's is the
+    /// asyn TimeSeries device's (devAsynXXXTimeSeries.h:156). HASH posts from
+    /// `array_monitor_post` alone and the walk never reads it
+    /// ([`Record::event_posted_fields`]), so no set names it.
+    fn process_posted_fields(&self) -> Option<crate::server::record::DeclaredFields> {
+        use crate::server::record::{dbd_generated as t, declared_set};
+        Some(match self.kind {
+            ArrayKind::Waveform => {
+                &const { declared_set(t::WAVEFORM_FIELDS, ["VAL", "NORD", "BUSY"]) }
+            }
+            ArrayKind::Aai => &const { declared_set(t::AAI_FIELDS, ["VAL", "NORD"]) },
+            ArrayKind::Aao => &const { declared_set(t::AAO_FIELDS, ["VAL", "NORD"]) },
+            ArrayKind::SubArray => &const { declared_set(t::SUB_ARRAY_FIELDS, ["VAL", "NORD"]) },
+        })
     }
 
     /// C `devSASoft.c::read_sa` (118-120) runs `subset()` only when the
@@ -1630,6 +2001,14 @@ impl Record for WaveformRecord {
 
 #[cfg(test)]
 mod array_kind_tests {
+    /// C `dbLinkIsConstant(&prec->dol)` as the framework answers it for the
+    /// hook: [`parse_link_v2`]'s classification alone (C's `dbParseLink`,
+    /// `dbStaticLib.c:2346-2357`) — empty, a whole double, or bracketed is
+    /// constant; `1 2 3` is a PV_LINK to a record named `1`.
+    fn dol_is_constant(dol: &PvString) -> bool {
+        crate::server::recgbl::simm::is_constant(&parse_link_v2(dol))
+    }
+
     use super::*;
     use crate::server::record::FieldDeclaration;
     use crate::types::SharedArray;
@@ -1702,6 +2081,23 @@ mod array_kind_tests {
         r.put_field("NELM", EpicsValue::Long(-1)).unwrap();
         r.sa_clamp_bounds();
         assert_eq!(r.get_field("NELM"), Some(EpicsValue::ULong(1)));
+    }
+
+    /// C init_record turns a loaded NELM 0 into 1 for waveform, aai and aao;
+    /// areaDetector's NDStats.template loads NELM=$(YSIZE)=0 on quadEM.
+    #[test]
+    fn array_nelm_zero_loads_as_one() {
+        for kind in [ArrayKind::Waveform, ArrayKind::Aai, ArrayKind::Aao] {
+            for n in [0, 1] {
+                let mut r = WaveformRecord::with_kind(kind);
+                r.put_field("NELM", EpicsValue::ULong(n)).unwrap();
+                assert_eq!(
+                    r.get_field("NELM"),
+                    Some(EpicsValue::ULong(1)),
+                    "{kind:?} {n}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1828,18 +2224,14 @@ mod array_kind_tests {
         assert!(!rarm.read_only, "RARM is pp(TRUE) — client-settable");
         assert!(busy.read_only, "BUSY is special(SPC_NOMOD) — read-only");
 
-        // RARM round-trips through put/get; BUSY is read-only (device-set) and
-        // reflects the struct flag.
+        // RARM round-trips through put/get. BUSY's runtime refusal is the
+        // database's `read_only` gate; `put_field` is the `.db` store.
         let mut wf = WaveformRecord::with_kind(ArrayKind::Waveform);
         wf.put_field("RARM", EpicsValue::Short(1)).unwrap();
         assert_eq!(wf.get_field("RARM"), Some(EpicsValue::Short(1)));
         assert_eq!(wf.get_field("BUSY"), Some(EpicsValue::Short(0)));
-        assert!(
-            wf.put_field("BUSY", EpicsValue::Short(1)).is_err(),
-            "BUSY must reject CA puts (SPC_NOMOD)"
-        );
-        wf.busy = true;
-        assert_eq!(wf.get_field("BUSY"), Some(EpicsValue::Short(1)));
+        wf.put_field("BUSY", EpicsValue::Short(3)).unwrap();
+        assert_eq!(wf.get_field("BUSY"), Some(EpicsValue::Short(3)));
 
         // aai/aao declare neither field: not in field_list, get None, put errors.
         for kind in [ArrayKind::Aai, ArrayKind::Aao] {
@@ -1869,12 +2261,8 @@ mod array_kind_tests {
             .expect("subArray field_list must carry BUSY");
         assert!(busy.read_only, "subArray BUSY is special(SPC_NOMOD)");
         assert_eq!(sub.get_field("BUSY"), Some(EpicsValue::Short(0)));
-        assert!(
-            sub.put_field("BUSY", EpicsValue::Short(1)).is_err(),
-            "subArray BUSY must reject CA puts (SPC_NOMOD)"
-        );
-        sub.busy = true;
-        assert_eq!(sub.get_field("BUSY"), Some(EpicsValue::Short(1)));
+        sub.put_field("BUSY", EpicsValue::Short(3)).unwrap();
+        assert_eq!(sub.get_field("BUSY"), Some(EpicsValue::Short(3)));
     }
 
     /// The static field sets and the runtime get/put arms must agree on which
@@ -1916,7 +2304,7 @@ mod array_kind_tests {
             .expect("waveform must expose itself via as_any_mut");
         // Device-only writes that the generic put path cannot do: BUSY is
         // read-only, RARM is reset by the device after applying it.
-        wf.busy = true;
+        wf.busy = 1;
         wf.rarm = 0;
         assert_eq!(r.get_field("BUSY"), Some(EpicsValue::Short(1)));
         assert_eq!(r.get_field("RARM"), Some(EpicsValue::Short(0)));
@@ -1959,9 +2347,9 @@ mod array_kind_tests {
     fn aao_closed_loop_real_link_emits_read_db_link() {
         let mut aao = WaveformRecord::with_kind(ArrayKind::Aao);
         aao.omsl = MENU_OMSL_CLOSED_LOOP;
-        aao.dol = "srcWaveform.VAL".to_string();
+        aao.set_dol("srcWaveform.VAL".to_string());
         assert_eq!(
-            &*aao.pre_input_link_actions(),
+            &*aao.pre_input_link_actions(dol_is_constant(&aao.dol), &mut Default::default()),
             &[ProcessAction::ReadDbLink {
                 link_field: "DOL",
                 target_field: "VAL",
@@ -1970,8 +2358,12 @@ mod array_kind_tests {
 
         // A bare record name parses to a DB link too (parse_link_v2), so it
         // also arms the fetch.
-        aao.dol = "srcWaveform".to_string();
-        assert_eq!(aao.pre_input_link_actions().len(), 1);
+        aao.set_dol("srcWaveform".to_string());
+        assert_eq!(
+            aao.pre_input_link_actions(dol_is_constant(&aao.dol), &mut Default::default())
+                .len(),
+            1
+        );
     }
 
     /// C gates the process-time fetch on `!dbLinkIsConstant`: a constant DOL
@@ -1986,17 +2378,51 @@ mod array_kind_tests {
         // Constant array literal. NOT `1 2 3`: `epicsParseDouble` rejects the
         // trailing text, so C parses that as a PV_LINK to a record named `1`
         // (`dbStaticLib.c:2346-2357`).
-        aao.dol = "[1,2,3]".to_string();
-        assert!(aao.pre_input_link_actions().is_empty());
+        aao.set_dol("[1,2,3]".to_string());
+        assert!(
+            aao.pre_input_link_actions(dol_is_constant(&aao.dol), &mut Default::default())
+                .is_empty()
+        );
 
-        aao.dol = "42".to_string(); // constant scalar literal
-        assert!(aao.pre_input_link_actions().is_empty());
+        aao.set_dol("42".to_string()); // constant scalar literal
+        assert!(
+            aao.pre_input_link_actions(dol_is_constant(&aao.dol), &mut Default::default())
+                .is_empty()
+        );
 
-        aao.dol = String::new(); // unset
-        assert!(aao.pre_input_link_actions().is_empty());
+        aao.set_dol(String::new()); // unset
+        assert!(
+            aao.pre_input_link_actions(dol_is_constant(&aao.dol), &mut Default::default())
+                .is_empty()
+        );
 
-        aao.dol = "   ".to_string(); // whitespace-only
-        assert!(aao.pre_input_link_actions().is_empty());
+        aao.set_dol("   ".to_string()); // whitespace-only
+        assert!(
+            aao.pre_input_link_actions(dol_is_constant(&aao.dol), &mut Default::default())
+                .is_empty()
+        );
+    }
+
+    /// A DOL put re-decides whether the cycle fetches, each way.
+    #[test]
+    fn a_dol_put_moves_the_fetch_gate_both_ways() {
+        let mut aao = WaveformRecord::with_kind(ArrayKind::Aao);
+        aao.omsl = MENU_OMSL_CLOSED_LOOP;
+        for (dol, fetches) in [
+            ("[1,2,3]", false),
+            ("SRC", true),
+            ("[5]", false),
+            ("SRC", true),
+        ] {
+            aao.put_field("DOL", EpicsValue::String(dol.into()))
+                .unwrap();
+            assert_eq!(
+                !aao.pre_input_link_actions(dol_is_constant(&aao.dol), &mut Default::default())
+                    .is_empty(),
+                fetches,
+                "DOL {dol}"
+            );
+        }
     }
 
     /// Supervisory mode (the default) never fetches DOL, even with a real
@@ -2007,16 +2433,20 @@ mod array_kind_tests {
     fn supervisory_and_non_aao_kinds_emit_nothing() {
         let mut aao = WaveformRecord::with_kind(ArrayKind::Aao);
         aao.omsl = 0; // supervisory
-        aao.dol = "srcWaveform.VAL".to_string();
-        assert!(aao.pre_input_link_actions().is_empty());
+        aao.set_dol("srcWaveform.VAL".to_string());
+        assert!(
+            aao.pre_input_link_actions(dol_is_constant(&aao.dol), &mut Default::default())
+                .is_empty()
+        );
 
         for kind in [ArrayKind::Waveform, ArrayKind::Aai, ArrayKind::SubArray] {
             let mut r = WaveformRecord::with_kind(kind);
             // Force the would-be fetch state; the kind gate must still win.
             r.omsl = MENU_OMSL_CLOSED_LOOP;
-            r.dol = "srcWaveform.VAL".to_string();
+            r.set_dol("srcWaveform.VAL".to_string());
             assert!(
-                r.pre_input_link_actions().is_empty(),
+                r.pre_input_link_actions(dol_is_constant(&r.dol), &mut Default::default())
+                    .is_empty(),
                 "{kind:?} has no OMSL/DOL and must not fetch"
             );
         }
@@ -2180,6 +2610,32 @@ mod array_kind_tests {
         }
     }
 
+    /// A `.db` NORD is no data: pass 0 overwrites it as C's `init_record`s
+    /// do (waveformRecord.c:100, aaiRecord.c:113, devAaoSoft.c:43-51), while a
+    /// VAL put before init keeps its count.
+    #[test]
+    fn loaded_nord_is_overwritten_at_init_but_put_val_is_kept() {
+        for (kind, nelm, want) in [
+            (ArrayKind::Waveform, 1, 1),
+            (ArrayKind::Waveform, 4, 0),
+            (ArrayKind::Aai, 1, 1),
+            (ArrayKind::Aai, 4, 0),
+            (ArrayKind::Aao, 4, 0),
+        ] {
+            let mut r = WaveformRecord::with_kind(kind);
+            r.put_field("NELM", EpicsValue::Long(nelm)).unwrap();
+            r.put_field("NORD", EpicsValue::Long(3)).unwrap();
+            assert_eq!(r.nord, 3, "{kind:?}: the .db store lands");
+            r.init_record(0).unwrap();
+            assert_eq!(r.nord, want, "{kind:?} NELM={nelm}");
+        }
+        let mut wf = WaveformRecord::new(4, DbFieldType::Double);
+        wf.put_field("VAL", EpicsValue::DoubleArray(vec![1.0, 2.0].into()))
+            .unwrap();
+        wf.init_record(0).unwrap();
+        assert_eq!(wf.nord, 2);
+    }
+
     #[test]
     fn put_val_caps_nord_at_nelm() {
         // FTVL=LONG: the buffer's element type is what the source converts INTO
@@ -2218,6 +2674,112 @@ mod array_kind_tests {
     /// into VAL with NORD set to the actual copied length. Source
     /// shorter than INDX → NORD=0. INDX+NELM > source.len → only
     /// available tail is copied, rest zero-padded to NELM.
+    /// The lent VAL is the one `get_field` serves, NORD-capped and empty while
+    /// undefined, for every numeric FTVL.
+    #[test]
+    fn monitor_value_view_lends_the_served_val() {
+        use crate::server::record::ValueView;
+        fn owned(view: ValueView<'_>) -> EpicsValue {
+            match view {
+                ValueView::Double(a) => EpicsValue::DoubleArray(a.to_vec().into()),
+                ValueView::Float(a) => EpicsValue::FloatArray(a.to_vec().into()),
+                ValueView::Long(a) => EpicsValue::LongArray(a.to_vec().into()),
+                ValueView::ULong(a) => EpicsValue::ULongArray(a.to_vec().into()),
+                ValueView::Int64(a) => EpicsValue::Int64Array(a.to_vec().into()),
+                ValueView::UInt64(a) => EpicsValue::UInt64Array(a.to_vec().into()),
+                ValueView::Short(a) => EpicsValue::ShortArray(a.to_vec().into()),
+                ValueView::UShort(a) => EpicsValue::UShortArray(a.to_vec().into()),
+                ValueView::Char(a) => EpicsValue::CharArray(a.to_vec().into()),
+                ValueView::UChar(a) => EpicsValue::UCharArray(a.to_vec().into()),
+                ValueView::Enum(a) => EpicsValue::EnumArray(a.to_vec().into()),
+                ValueView::Scalar(v) => v.into(),
+            }
+        }
+        for ty in [
+            DbFieldType::Double,
+            DbFieldType::Float,
+            DbFieldType::Long,
+            DbFieldType::ULong,
+            DbFieldType::Int64,
+            DbFieldType::UInt64,
+            DbFieldType::Short,
+            DbFieldType::UShort,
+            DbFieldType::Char,
+            DbFieldType::UChar,
+            DbFieldType::Enum,
+        ] {
+            let mut r = WaveformRecord::new(4, ty);
+            for source in [None, Some(vec![3.0, 1.0, 2.0])] {
+                if let Some(source) = source {
+                    r.set_val(EpicsValue::DoubleArray(source.into())).unwrap();
+                }
+                let view = r.monitor_value_view().expect("numeric FTVL lends VAL");
+                assert_eq!(Some(owned(view)), r.get_field("VAL"), "{ty:?}");
+                assert_eq!(r.monitor_deadband_value(), None, "{ty:?}");
+            }
+        }
+        let string = WaveformRecord::new(4, DbFieldType::String);
+        assert!(string.monitor_value_view().is_none());
+    }
+
+    /// pvxs `pvaGetValue` (`pvalink_lset.cpp:330-360`): an NTEnum lands as
+    /// its index in every non-string FTVL, its label in `FTVL=STRING`, and a
+    /// source already at FTVL's type lands as it is.
+    #[test]
+    fn an_ntenum_carrier_lands_as_index_or_label_pvalink_lset_330() {
+        let carrier = || EpicsValue::EnumWithChoices {
+            index: 1,
+            choices: vec!["off".into(), "on".into()],
+        };
+        for (ftvl, landed) in [
+            (DbFieldType::Enum, EpicsValue::EnumArray(vec![1].into())),
+            (
+                DbFieldType::Double,
+                EpicsValue::DoubleArray(vec![1.0].into()),
+            ),
+            (
+                DbFieldType::String,
+                EpicsValue::StringArray(vec!["on".into()].into()),
+            ),
+        ] {
+            let mut r = WaveformRecord::new(4, ftvl);
+            r.set_val(carrier()).unwrap();
+            assert_eq!(r.get_field("VAL"), Some(landed), "{ftvl:?}");
+            assert_eq!(r.nord, 1);
+        }
+        let mut r = WaveformRecord::new(4, DbFieldType::Double);
+        r.set_val(EpicsValue::DoubleArray(vec![2.0, 3.0].into()))
+            .unwrap();
+        assert_eq!(
+            r.get_field("VAL"),
+            Some(EpicsValue::DoubleArray(vec![2.0, 3.0].into()))
+        );
+        assert_eq!(r.nord, 2);
+    }
+
+    /// What goes out is the default body's answer — no `OVAL`, then the
+    /// served `VAL` — for every kind, before and after a value lands.
+    #[test]
+    fn output_link_value_is_the_served_val() {
+        for kind in [
+            ArrayKind::Waveform,
+            ArrayKind::Aai,
+            ArrayKind::Aao,
+            ArrayKind::SubArray,
+        ] {
+            let mut r = WaveformRecord::with_kind(kind);
+            r.set_ftvl(Ftype::Double);
+            r.put_field("NELM", EpicsValue::Long(4)).unwrap();
+            for source in [None, Some(vec![3.0, 1.0])] {
+                if let Some(source) = source {
+                    r.set_val(EpicsValue::DoubleArray(source.into())).unwrap();
+                }
+                assert_eq!(r.get_field("OVAL"), None, "{kind:?}");
+                assert_eq!(r.output_link_value(), r.get_field("VAL"), "{kind:?}");
+            }
+        }
+    }
+
     #[test]
     fn subarray_slices_input_at_indx_with_nelm_take() {
         let mut r = WaveformRecord::with_kind(ArrayKind::SubArray);
@@ -2424,7 +2986,7 @@ mod array_kind_tests {
         let mut rec = WaveformRecord::with_kind(ArrayKind::Waveform);
         rec.put_field("MPST", EpicsValue::Short(0)).unwrap();
         assert_eq!(rec.get_field("MPST"), Some(EpicsValue::Short(0)));
-        let inst = RecordInstance::new("WF:MPST".into(), rec);
+        let inst = RecordInstance::new("WF:MPST", rec);
         let snap = inst.snapshot_for_field("MPST").unwrap();
         assert_eq!(snap.value, EpicsValue::Enum(0));
         assert_eq!(
@@ -2460,20 +3022,16 @@ mod array_kind_tests {
             );
             rec.put_field("SIMS", EpicsValue::Short(2)).unwrap();
             assert_eq!(rec.get_field("SIMS"), Some(EpicsValue::Short(2)));
-            // OLDSIMM is special(SPC_NOMOD) and lives in the common fields
-            // (the simulation owner's latch) — readable, not client-writable.
-            let mut inst = RecordInstance::new("WF:OLDSIMM".into(), rec);
-            assert!(matches!(
-                inst.put_common_field("OLDSIMM", EpicsValue::Short(1)),
-                Err(crate::error::CaError::ReadOnlyField(_))
-            ));
+            // OLDSIMM lives in the common fields (the simulation owner's
+            // latch); its SPC_NOMOD refusal is the database gate's.
+            let inst = RecordInstance::new("WF:OLDSIMM", rec);
             assert_eq!(inst.get_common_field("OLDSIMM"), Some(EpicsValue::Short(0)));
         }
 
         // SIMM snapshot carries the NO/YES menuYesNo labels on these records.
         let mut wf = WaveformRecord::with_kind(ArrayKind::Waveform);
         wf.put_field("SIMM", EpicsValue::Short(1)).unwrap();
-        let inst = RecordInstance::new("WF:SIMM".into(), wf);
+        let inst = RecordInstance::new("WF:SIMM", wf);
         let snap = inst.snapshot_for_field("SIMM").unwrap();
         assert_eq!(snap.value, EpicsValue::Enum(1));
         assert_eq!(snap.enums.as_ref().unwrap().strings, vec!["NO", "YES"]);

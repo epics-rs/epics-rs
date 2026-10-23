@@ -1,0 +1,2 @@
+$(P)$(CONFIG)Menu:currName
+$(P)$(CONFIG)Menu:currDesc

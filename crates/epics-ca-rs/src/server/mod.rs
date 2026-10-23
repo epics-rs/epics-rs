@@ -2,20 +2,23 @@
 
 pub mod access_token;
 pub mod addr_list;
-// The async server front-end — the `tokio::net` accept/beacon/introspection
+// The async server front-end — the `tokio::net` accept/introspection
 // stack and the `CaServer` orchestrator (which also drives `tokio::signal` and
 // the `discovery` stack) — is host-only; its deps do not build for RTEMS or
 // VxWorks. The embedded build serves CA through the `std::net` `blocking`
 // driver plus the runtime-agnostic shared logic in
-// `tcp`/`udp`/`monitor`/`stats`. The gate is `tokio_backend` — the accept loop
+// `tcp`/`udp`/`beacon`/`monitor`/`stats`. The gate is `tokio_backend` — the accept loop
 // hands each client to `runtime::task::Reactor`, so it needs a build where
 // that seam is the tokio runtime, which excludes the two embedded targets and
 // a host `exec_backend` build alike.
-#[cfg(tokio_backend)]
 pub mod beacon;
 pub mod blocking;
+pub mod blocking_serving;
 #[cfg(tokio_backend)]
 pub mod ca_server;
+pub(crate) mod current_client;
+#[cfg(test)]
+mod delivery_alloc_tests;
 pub(crate) mod frame;
 #[cfg(tokio_backend)]
 pub mod introspection;
@@ -34,99 +37,70 @@ pub mod udp;
 
 #[cfg(tokio_backend)]
 pub use ca_server::{AccessRightsNotifier, CaServer, CaServerBuilder};
+
+/// The name RSRV's init is registered under — C's `dbServer.name` for RSRV
+/// (`caservertask.c:1562`).
+pub const RSRV_SERVER: &str = "rsrv";
+
+/// RSRV's sockets as [`rsrv_init`] binds them on this backend.
+#[cfg(tokio_backend)]
+pub type RsrvSockets = ca_server::RsrvSockets;
+#[cfg(exec_backend)]
+pub type RsrvSockets = blocking_serving::BlockingRsrvSockets;
+
+/// C `rsrv_init`, RSRV's `dbServer.init`: what
+/// [`epics_base_rs::server::ioc_app::IocApplication::register_server_init`]
+/// runs under [`RSRV_SERVER`], on either backend, so a CA port this IOC
+/// cannot have fails `iocInit` and not a later line.
+pub async fn rsrv_init(
+    args: epics_base_rs::server::ioc_app::ServerInitArgs,
+) -> epics_base_rs::error::CaResult<RsrvSockets> {
+    #[cfg(tokio_backend)]
+    return RsrvSockets::bind(args).await;
+    #[cfg(exec_backend)]
+    RsrvSockets::bind(args.port, args.tcp_port.unwrap_or(args.port))
+        .map_err(|e| epics_base_rs::error::CaError::InvalidValue(e.to_string()))
+}
+
+/// The blocking RSRV on the sockets its init bound into `servers`, or bound
+/// here for a runner given an `IocRunConfig` by hand.
+#[cfg(exec_backend)]
+fn serve_blocking(
+    servers: &mut epics_base_rs::server::ioc_app::InitializedServers,
+    port: u16,
+    tcp_port: Option<u16>,
+    db: std::sync::Arc<epics_base_rs::server::database::PvDatabase>,
+    acf: epics_base_rs::server::access_security::AcfCell,
+) -> epics_base_rs::error::CaResult<blocking_serving::BlockingCaServing> {
+    let invalid = |e: blocking_serving::ServeError| {
+        epics_base_rs::error::CaError::InvalidValue(e.to_string())
+    };
+    let sockets = match servers.take::<RsrvSockets>(RSRV_SERVER) {
+        Some(sockets) => sockets,
+        None => RsrvSockets::bind(port, tcp_port.unwrap_or(port)).map_err(invalid)?,
+    };
+    blocking_serving::BlockingCaServing::serve(
+        sockets,
+        db,
+        acf,
+        std::sync::Arc::new(ServerStats::default()),
+    )
+    .map_err(invalid)
+}
 /// Live-connection / byte / channel / subscription counters. Runtime-agnostic
 /// (pure atomics) and shared by the async server and the blocking driver's
 /// monitor path, so it lives outside the host-only `ca_server` module.
 pub use stats::ServerStats;
 pub use tcp::ServerConnectionEvent;
 
-// `run_ca_ioc` (below) builds a `CaServer` — the async front-end — so both it
-// and these imports carry its `tokio_backend` gate. Every reactor-free build
-// enters through the blocking server driver (`server::blocking`) instead: the
-// two embedded targets, and a host `exec_backend` build with them.
-#[cfg(tokio_backend)]
+// `run_ca_ioc` (below) builds a `CaServer` — the async front-end — on tokio;
+// every reactor-free build serves through `blocking_serving` instead: the two
+// embedded targets, and a host `exec_backend` build with them.
 use epics_base_rs::error::CaResult;
-#[cfg(tokio_backend)]
 use epics_base_rs::server::ioc_app::IocRunConfig;
 
-/// Convert a `$`-channel snapshot value from `EpicsValue::String` to
-/// `EpicsValue::CharArray` of exactly `MAX_STRING_SIZE` (= 40) elements,
-/// matching C `dbChannel.c:489` which sets `no_elements = field_size` (= 40)
-/// and `dbr_field_type = DBR_CHAR`.  The string bytes are written first,
-/// followed by a NUL terminator, and the remainder zero-padded to 40.
-/// `DBF_STRING` guarantees `strlen <= 39`, so the string always fits.
-/// Non-string values pass through unchanged.
-pub(super) fn apply_long_string(snap: &mut epics_base_rs::server::snapshot::Snapshot) {
-    use epics_base_rs::types::EpicsValue;
-    const MAX_STRING_SIZE: usize = 40;
-    let v = std::mem::replace(&mut snap.value, EpicsValue::Long(0));
-    snap.value = match v {
-        EpicsValue::String(s) => {
-            let mut b = s.into_bytes();
-            b.push(0); // NUL terminator
-            b.resize(MAX_STRING_SIZE, 0); // zero-pad to field_size
-            EpicsValue::CharArray(b.into())
-        }
-        other => other,
-    };
-}
-
-/// Convert a long-string *record* field's snapshot value from
-/// `EpicsValue::CharArray` to a scalar `EpicsValue::String`. C
-/// `cvt_dbaddr` presents lsi/lso VAL & OVAL and printf VAL as a scalar
-/// `DBF_STRING` with `no_elements = 1` (lsiRecord.c:141-143,
-/// lsoRecord.c:183-185, printfRecord.c:415-417); the record stores the
-/// value as a NUL-terminable CHAR array (the long-string carrier). This
-/// is the inverse of [`apply_long_string`] — the conversion the CA
-/// boundary applies for *plain* (non-`$`) access so the channel ships a
-/// single `DBR_STRING` element. The buffer is decoded verbatim (no
-/// UTF-8 validation, matching pvxs raw-byte storage) up to the first
-/// NUL; the DBR_STRING encoder then truncates to `MAX_STRING_SIZE`
-/// (= 40), so an over-long value clips on the wire exactly as C does.
-/// Non-`CharArray` values pass through unchanged.
-pub(super) fn apply_native_long_string(snap: &mut epics_base_rs::server::snapshot::Snapshot) {
-    use epics_base_rs::types::{EpicsValue, PvString};
-    let v = std::mem::replace(&mut snap.value, EpicsValue::Long(0));
-    snap.value = match v {
-        EpicsValue::CharArray(bytes) => {
-            let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
-            EpicsValue::String(PvString::from_bytes(&bytes[..end]))
-        }
-        other => other,
-    };
-}
-
-/// How a channel presents a long-string field on the CA wire. `$`-access
-/// and plain access to a long-string *record* field are mutually
-/// exclusive boundary conversions, so they share one mode rather than two
-/// booleans — the illegal "both at once" state cannot be constructed.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(super) enum LongStringMode {
-    /// Ordinary field: deliver the value verbatim.
-    Plain,
-    /// Client appended `$`: a `DBF_STRING` field is delivered as a
-    /// `DBR_CHAR` array of `MAX_STRING_SIZE` (= 40), per the C
-    /// `dbChannel.c` long-string convention. See [`apply_long_string`].
-    DollarChar,
-    /// Plain access to a long-string *record* field (lsi/lso VAL & OVAL,
-    /// printf VAL): C `cvt_dbaddr` presents it as a scalar `DBF_STRING`,
-    /// so the CHAR-array carrier is decoded to a scalar string before
-    /// encoding. See [`apply_native_long_string`].
-    NativeString,
-}
-
-/// Apply the boundary conversion selected by `mode` to a delivery
-/// snapshot before DBR encoding.
-pub(super) fn apply_long_string_mode(
-    snap: &mut epics_base_rs::server::snapshot::Snapshot,
-    mode: LongStringMode,
-) {
-    match mode {
-        LongStringMode::DollarChar => apply_long_string(snap),
-        LongStringMode::NativeString => apply_native_long_string(snap),
-        LongStringMode::Plain => {}
-    }
-}
+pub(crate) use epics_base_rs::server::database::channel_io::LongStringMode;
+pub(crate) use epics_base_rs::server::database::dbr_delivery::DeliveryStage;
 
 /// Stand `app` up on Channel Access — [`run_ca_ioc`] with C's `rsrvRegistrar`
 /// already run, which is the only order that works.
@@ -142,9 +116,18 @@ pub(super) fn apply_long_string_mode(
 /// `IocApplication::run(run_ca_ioc)` still works and still registers `casr`
 /// on the INTERACTIVE shell — it is the startup shell, the one `st.cmd`
 /// executes on, that only this entry point can reach.
-#[cfg(tokio_backend)]
+///
+/// The `ca` link set comes with it for the same reason: C's dbCa is in every
+/// IOC, so it is the runner's to install, not each head's.
 pub async fn run_ca_ioc_app(app: epics_base_rs::server::ioc_app::IocApplication) -> CaResult<()> {
-    iocsh::register_rsrv_commands(app).run(run_ca_ioc).await
+    iocsh::register_rsrv_commands(app)
+        .register_link_type("ca", {
+            let reactor = epics_base_rs::runtime::task::Reactor::current()
+                .expect("run_ca_ioc_app is awaited on the IOC's reactor");
+            move |db| crate::calink::calink_link_set_install(db, reactor)
+        })
+        .run(run_ca_ioc)
+        .await
 }
 
 /// Run an IOC with the Channel Access protocol.
@@ -167,22 +150,25 @@ pub async fn run_ca_ioc_app(app: epics_base_rs::server::ioc_app::IocApplication)
 /// on the script, because this function is dispatched after the script has
 /// already run.
 #[cfg(tokio_backend)]
-pub async fn run_ca_ioc(config: IocRunConfig) -> CaResult<()> {
+pub async fn run_ca_ioc(mut config: IocRunConfig) -> CaResult<()> {
     // For a caller that reaches the CA server only through this runner: C's
     // `registrar(rsrvRegistrar)` is there from the moment the binary links
     // RSRV, so it must not wait on `run_with_shell`. It is still too late for
     // the startup script, which has already run by the time this runner is
     // dispatched; `run_ca_ioc_app` is the entry point that is early enough.
     iocsh::declare_rsrv_registrar();
-    let server = CaServer::from_parts(
+    let mut builder = CaServerBuilder::serving(
         config.db,
-        config.port,
-        config.tcp_port,
         config.acf,
         config.autosave_config,
         config.autosave_manager,
     )
-    .await?;
+    .port(config.port)
+    .bound_at_init(&mut config.servers);
+    if let Some(tcp_port) = config.tcp_port {
+        builder = builder.tcp_port(tcp_port);
+    }
+    let server = builder.build().await?;
     // `config.after_init_hooks` is always handed over EMPTY —
     // `IocApplication::run` drains the hooks itself after PINI (H3) and
     // owns scanning via the core `ScanOwner`, so the CA server neither
@@ -196,6 +182,113 @@ pub async fn run_ca_ioc(config: IocRunConfig) -> CaResult<()> {
             }
         })
         .await
+}
+
+/// [`run_ca_ioc`] on the exec backend: RSRV through
+/// [`blocking_serving::BlockingCaServing`], then the same `dbServer` join and
+/// shell the tokio `CaServer::run_with_shell` gives.
+#[cfg(exec_backend)]
+pub async fn run_ca_ioc(mut config: IocRunConfig) -> CaResult<()> {
+    iocsh::declare_rsrv_registrar();
+    let serving = serve_blocking(
+        &mut config.servers,
+        config.port,
+        config.tcp_port,
+        config.db.clone(),
+        config.acf.clone(),
+    )?;
+    iocsh::register_ca_db_server();
+    epics_base_rs::server::db_server::db_run_servers();
+    epics_base_rs::server::db_server::announce_serving(RSRV_SERVER);
+    let result = config.run_shell(iocsh::ca_server_commands()).await;
+    serving.shutdown();
+    result
+}
+
+/// RSRV serving a database in the background, on either backend: the async
+/// `CaServer` on a reactor task under `tokio_backend`, the
+/// [`blocking_serving::BlockingCaServing`] threads under `exec_backend`.
+///
+/// For a head that serves CA beside something else in the foreground (a PVA
+/// shell, a second server). Bound, joined to `dbServer` and announced by the
+/// time [`Self::start`] returns, as C's `rsrv_run` has when `iocRun` returns.
+pub struct RsrvServing {
+    #[cfg(tokio_backend)]
+    task: epics_base_rs::runtime::task::TaskHandle<CaResult<()>>,
+    #[cfg(exec_backend)]
+    serving: blocking_serving::BlockingCaServing,
+}
+
+impl RsrvServing {
+    /// Serve `db` on UDP `port` and TCP `tcp_port` (`None` shares `port`),
+    /// on the sockets RSRV's init bound into `servers` when it ran.
+    pub async fn start(
+        db: std::sync::Arc<epics_base_rs::server::database::PvDatabase>,
+        port: u16,
+        tcp_port: Option<u16>,
+        acf: epics_base_rs::server::access_security::AcfCell,
+        autosave_config: Option<(
+            epics_base_rs::server::autosave::SaveSetConfig,
+            epics_base_rs::server::autosave::SaveStrategy,
+        )>,
+        autosave_manager: Option<std::sync::Arc<epics_base_rs::server::autosave::AutosaveManager>>,
+        servers: &mut epics_base_rs::server::ioc_app::InitializedServers,
+    ) -> CaResult<Self> {
+        #[cfg(tokio_backend)]
+        {
+            let mut builder =
+                CaServerBuilder::serving(db, acf, autosave_config, autosave_manager).port(port);
+            if let Some(tcp_port) = tcp_port {
+                builder = builder.tcp_port(tcp_port);
+            }
+            let server = builder.bound_at_init(servers).build().await?;
+            // `CaServer::run` drives `tokio::net`, so the task goes on the
+            // tokio runtime this is awaited on.
+            let task = tokio::runtime::Handle::try_current()
+                .expect("RsrvServing::start is awaited on the IOC's reactor")
+                .spawn(async move {
+                    let result = server.run().await;
+                    if let Err(e) = &result {
+                        epics_libcom_rs::stderr_println!("CA server error: {e}");
+                    }
+                    result
+                });
+            Ok(Self { task })
+        }
+        #[cfg(exec_backend)]
+        {
+            // The blocking server has no autosave tail; the PVA server or the
+            // IOC head runs it.
+            let _ = (autosave_config, autosave_manager);
+            let serving = serve_blocking(servers, port, tcp_port, db, acf)?;
+            iocsh::register_ca_db_server();
+            epics_base_rs::server::db_server::db_run_servers();
+            epics_base_rs::server::db_server::announce_serving(RSRV_SERVER);
+            Ok(Self { serving })
+        }
+    }
+
+    /// Until serving ends, with its result.
+    pub async fn wait(self) -> CaResult<()> {
+        #[cfg(tokio_backend)]
+        let joined = self.task.await;
+        #[cfg(exec_backend)]
+        let joined =
+            epics_base_rs::runtime::task::spawn_blocking(move || self.serving.join()).await;
+        joined.unwrap_or_else(|e| {
+            Err(epics_base_rs::error::CaError::InvalidValue(format!(
+                "CA server task failed: {e}"
+            )))
+        })
+    }
+
+    /// Stop serving.
+    pub fn shutdown(&self) {
+        #[cfg(tokio_backend)]
+        self.task.abort();
+        #[cfg(exec_backend)]
+        self.serving.shutdown();
+    }
 }
 
 /// The address lists RSRV's `casr` prints from level 1 up
@@ -264,16 +357,16 @@ pub(crate) fn casr_addrs(server: &CaServer) -> CaResult<iocsh::CasrAddrs> {
 ///
 /// The broadcast responder address for one interface, under the same
 /// gate `bind_udp_responders` binds the socket with — C
-/// `caservertask.c:671,728` skips it on Windows, and there is no
+/// `caservertask.c:671,728` skips it on Windows and Cygwin, and there is no
 /// broadcast address for a wildcard or loopback interface.
 #[cfg(tokio_backend)]
 fn bcast_responder_addr(ip: std::net::Ipv4Addr, port: u16) -> Option<std::net::SocketAddr> {
-    #[cfg(any(windows, target_os = "windows"))]
+    #[cfg(not(ca_udp_bcast))]
     {
         let _ = (ip, port);
         None
     }
-    #[cfg(not(any(windows, target_os = "windows")))]
+    #[cfg(ca_udp_bcast)]
     {
         addr_list::broadcast_for_ip(ip).map(|b| std::net::SocketAddr::from((b, port)))
     }
@@ -332,7 +425,7 @@ mod spawn_capability_guard {
             ("ca_server.rs", "pub async fn run("),
             ("tcp.rs", "fn write_notify_queue("),
             ("blocking.rs", "fn command_drives_without_spawn("),
-            ("monitor.rs", "fn spawn_monitor_sender"),
+            ("monitor.rs", "fn deliver_monitor_event"),
         ];
 
         let bare = concat!("tokio", "::spawn(");

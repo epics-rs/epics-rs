@@ -29,26 +29,6 @@ record(mbbi, "$(P)$(R)Mode_RBV")
     field(SCAN, "I/O Intr")
 }
 
-# DELIBERATE DIVERGENCE from ADCore's NDCodec.template at the pin
-# (ADCore = R3-14-111-g6c53844e), which declares five Compressor states.
-#
-# The port implements seven codecs -- `ad-core-rs/src/codec.rs` `CodecName`
-# adds Zlib and LZ4HDF5 after the C set -- so a template byte-identical to the
-# pin's cannot express the port's own enum. `ad-plugins-rs/src/codec.rs`
-# writes COMPRESSOR = CodecName::ordinal() on every decompress, including 5
-# and 6; against a five-state record those raw values match no *VL entry, so
-# mbbi VAL becomes 65535 (mbbiRecord.c:180) and UNSV defaults to NO_ALARM --
-# a silently unreadable readback. In the other direction `caput Compressor 5`
-# indexes FVVL, which a five-state template never sets and which has no
-# `initial()` (mbboRecord.dbd.pod:262-264), so RVAL is 0 and asking for Zlib
-# silently yields no compression.
-#
-# The two states below therefore use the port's own numbering, Zlib=5 and
-# LZ4HDF5=6, matching `CodecName::ordinal`. Upstream ADCore has since taken
-# 2 and 5 for ZLIB and LZ4HDF5 (NDCodec.h:7-15 at 926bb4c8); whether the port
-# realigns to that numbering is open, and nothing here settles it. If it is
-# answered "match upstream" these states move, but the record still fronts all
-# seven codecs either way.
 record(mbbo, "$(P)$(R)Compressor")
 {
     field(PINI, "YES")
@@ -58,15 +38,15 @@ record(mbbo, "$(P)$(R)Compressor")
     field(ZRVL, "0")
     field(ONST, "JPEG")
     field(ONVL, "1")
-    field(TWST, "Blosc")
+    field(TWST, "Zlib")
     field(TWVL, "2")
-    field(THST, "LZ4")
+    field(THST, "Blosc")
     field(THVL, "3")
-    field(FRST, "BSLZ4")
+    field(FRST, "LZ4")
     field(FRVL, "4")
-    field(FVST, "Zlib")
+    field(FVST, "LZ4HDF5")
     field(FVVL, "5")
-    field(SXST, "LZ4HDF5")
+    field(SXST, "BSLZ4")
     field(SXVL, "6")
     info(autosaveFields, "VAL")
 }
@@ -79,15 +59,15 @@ record(mbbi, "$(P)$(R)Compressor_RBV")
     field(ZRVL, "0")
     field(ONST, "JPEG")
     field(ONVL, "1")
-    field(TWST, "Blosc")
+    field(TWST, "Zlib")
     field(TWVL, "2")
-    field(THST, "LZ4")
+    field(THST, "Blosc")
     field(THVL, "3")
-    field(FRST, "BSLZ4")
+    field(FRST, "LZ4")
     field(FRVL, "4")
-    field(FVST, "Zlib")
+    field(FVST, "LZ4HDF5")
     field(FVVL, "5")
-    field(SXST, "LZ4HDF5")
+    field(SXST, "BSLZ4")
     field(SXVL, "6")
     field(SCAN, "I/O Intr")
 }
@@ -116,6 +96,24 @@ record(longin, "$(P)$(R)JPEGQuality_RBV")
 {
     field(DTYP, "asynInt32")
     field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))JPEG_QUALITY")
+    field(SCAN, "I/O Intr")
+}
+
+record(longout, "$(P)$(R)ZlibCLevel")
+{
+    field(PINI, "YES")
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))ZLIB_CLEVEL")
+    field(VAL,  "6")
+    field(DRVH, "9")
+    field(DRVL, "0")
+    info(autosaveFields, "VAL")
+}
+
+record(longin, "$(P)$(R)ZlibCLevel_RBV")
+{
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))ZLIB_CLEVEL")
     field(SCAN, "I/O Intr")
 }
 
@@ -221,6 +219,23 @@ record(longin, "$(P)$(R)BloscNumThreads_RBV")
     field(SCAN, "I/O Intr")
 }
 
+record(longout, "$(P)$(R)LZ4HDF5BlockSize")
+{
+    field(PINI, "YES")
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))LZ4HDF5_BLOCKSIZE")
+    field(VAL,  "0")
+    field(DRVL, "0")
+    info(autosaveFields, "VAL")
+}
+
+record(longin, "$(P)$(R)LZ4HDF5BlockSize_RBV")
+{
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))LZ4HDF5_BLOCKSIZE")
+    field(SCAN, "I/O Intr")
+}
+
 record(mbbi, "$(P)$(R)CodecStatus")
 {
     field(DTYP, "asynInt32")
@@ -244,4 +259,5 @@ record(waveform, "$(P)$(R)CodecError")
     field(SCAN, "I/O Intr")
     field(FTVL, "CHAR")
     field(NELM, "256")
+    info(Q:form, "String")
 }

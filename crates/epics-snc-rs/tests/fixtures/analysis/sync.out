@@ -1,0 +1,40 @@
+$ snc sync.st
+sync.st:14: error: variable 'nope' not declared
+sync.st:15: error: variable 'n' not assigned
+sync.st:16: error: event flag 'nope' not declared
+sync.st:17: error: variable 'notef' is not an event flag
+sync.st:19: error: variable 'a' already sync'd
+sync.st:20: error: subscript in 'a1[7]' out of range
+sync.st:22: warning: 'a1[0]' already sync'd
+sync.st:24: error: some array elements of 'a1' already sync'd
+sync.st:25: error: variable 'a2' is assigned to a single channel and can only be sync'd wholesale
+sync.st:26: error: variable 'n' is not an array
+sync.st:33: warning: state local assign is deprecated
+sync.st:34: warning: state local sync is deprecated
+sync.st:35: error: cannot sync variable 'm' to event flag 'ef': sync must be in the same scope as (variable) declaration
+$ snc +W sync.st
+sync.st:14: error: variable 'nope' not declared
+sync.st:15: error: variable 'n' not assigned
+sync.st:16: error: event flag 'nope' not declared
+sync.st:17: error: variable 'notef' is not an event flag
+sync.st:19: error: variable 'a' already sync'd
+sync.st:20: error: subscript in 'a1[7]' out of range
+sync.st:22: warning: 'a1[0]' already sync'd
+sync.st:24: error: some array elements of 'a1' already sync'd
+sync.st:25: error: variable 'a2' is assigned to a single channel and can only be sync'd wholesale
+sync.st:26: error: variable 'n' is not an array
+sync.st:33: warning: state local assign is deprecated
+sync.st:34: warning: state local sync is deprecated
+sync.st:35: error: cannot sync variable 'm' to event flag 'ef': sync must be in the same scope as (variable) declaration
+sync.st:16: warning: treating undeclared object 'nope' as foreign
+$ snc -w sync.st
+sync.st:14: error: variable 'nope' not declared
+sync.st:15: error: variable 'n' not assigned
+sync.st:16: error: event flag 'nope' not declared
+sync.st:17: error: variable 'notef' is not an event flag
+sync.st:19: error: variable 'a' already sync'd
+sync.st:20: error: subscript in 'a1[7]' out of range
+sync.st:24: error: some array elements of 'a1' already sync'd
+sync.st:25: error: variable 'a2' is assigned to a single channel and can only be sync'd wholesale
+sync.st:26: error: variable 'n' is not an array
+sync.st:35: error: cannot sync variable 'm' to event flag 'ef': sync must be in the same scope as (variable) declaration

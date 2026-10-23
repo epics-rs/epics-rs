@@ -84,7 +84,7 @@ iocInit()
 ### IOC Binary
 
 The iocsh commands and the device-support binding are behind the `ioc`
-feature, which is **not** on by default: `mqtt-rs = { version = "0.31",
+feature, which is **not** on by default: `mqtt-rs = { version = "0.32",
 features = ["ioc"] }`.
 
 ```rust
@@ -207,23 +207,32 @@ restore the PV to `1`.
 
 ## Logging
 
-mqtt-rs emits `tracing` events; they are silent unless your binary installs a
-subscriber. The `mqtt-ioc` example does this via `tracing_subscriber::fmt`;
-for your own IOC add the same (or any subscriber) to see mqtt-rs output:
+Driver diagnostics go through the port's asyn trace, with C `drvMqtt`'s text
+and masks, so `asynSetTraceMask` / `asynSetTraceFile` govern them:
 
-| Event | Level | Message |
-|-------|-------|---------|
-| Reconnect handshake | `info` | `MQTT connected, subscribing to N topics` |
-| `poll()` error | `error` | `MQTT connection error: <ConnectionError variant>` |
-| Connected=1 restored from Publish/PingResp | `debug` | `MQTT {Publish,PingResp} received while Connected=0 — restoring Connected=1` |
+| Event | Mask | Message |
+|-------|------|---------|
+| Live session lost | `ERROR` | `MqttDriver::onDisconnectCb: Connection lost. Reconnecting...` |
+| Boot connect failed: every attempt while the address lookup, `socket()` or `connect()` fails at once (`<error>` empty), else only the first, with paho's `TCP/TLS connect failure`, `TCP connect completion failure`, `TCP connect timeout`, `CONNACK return code` or `Received disconnect`; subscribe or publish failed | `ERROR` | `MqttDriver::onFailCb: MQTT Operation error: 'Error: <error>\n'` |
+| Broker refused a subscribe or publish (SUBACK/PUBACK/PUBREC/PUBCOMP reason ≥ 0x80); the session stays up | `ERROR` | `MqttDriver::onFailCb: MQTT Operation error: 'Error: \n'` |
+| A subscribe or publish written and still unacked when its session ends, on a loss (before the `onDisconnectCb` line) or at the exit disconnect; one not yet written waits for the next session, as paho's command queue keeps it | `ERROR` | `MqttDriver::onFailCb: MQTT Operation error: 'Error: \n'` |
+| ConnAck after a loss, or after a boot failure met once the connect was in flight | `ERROR\|DRIVER` | `MqttDriver::onConnectCb: Reconnected.` |
+| Every ConnAck | `DRIVER` | `MqttDriver::onConnectCb: Connected to broker` |
+| SUBACK granted / PUBLISH acked (QoS 0: written, QoS 1: PUBACK, QoS 2: PUBCOMP) | `DRIVER` | `MqttDriver::onSubscribeCb: Subscribed to topic '<t>'` / `MqttDriver::onPublishCb: Published to topic '<t>'` |
+| Inbound payload a record cannot take | `ERROR` | `MqttDriver::onMessageCb: ...` |
+| Write failed | `ERROR` | `MqttDriver::<x>Write: Failed to set value for topic '<t>': ...` |
 
-With the default filter `info` you see reconnects and errors. Use
-`RUST_LOG=info,mqtt_rs=debug` to additionally see the recovery path (useful
-when diagnosing why the Connected PV moved).
+The `\n` in the `onFailCb` rows is the newline paho ends its error text with
+(`mqttClient.cpp:167`): the closing quote opens the next line, as in C.
+
+The Connected PV recovery path (`MQTT {Publish,PingResp} received while
+Connected=0 — restoring Connected=1`) and the shutdown lines are `tracing`
+events at `debug`/`info`; they are silent unless your binary installs a
+subscriber, as the `mqtt-ioc` example does.
 
 ## Dependencies
 
-- [rumqttc](https://crates.io/crates/rumqttc) — async MQTT client
+- [rumqttc-v5-next](https://crates.io/crates/rumqttc-v5-next) — async MQTT v5 client
 - [serde_json](https://crates.io/crates/serde_json) — JSON parsing
 - [asyn-rs](../asyn-rs/) — PortDriver framework
 - epics-base-rs, epics-ca-rs — the record and iocsh side, `ioc` feature only

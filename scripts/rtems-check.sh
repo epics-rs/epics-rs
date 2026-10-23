@@ -69,11 +69,18 @@
 # Usage:
 #   ./scripts/rtems-check.sh          # check every crate and target binary
 #   ./scripts/rtems-check.sh --quiet  # only report failures
+#   RTEMS_TOOLCHAIN=nightly-2026-10-19 ./scripts/rtems-check.sh
+#                                     # a dated nightly instead of `nightly`
 
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
+
+# Exported because `rtems-tls-spec.sh` reads it: the spec must be printed by
+# the toolchain that compiles against it.
+export RTEMS_TOOLCHAIN="${RTEMS_TOOLCHAIN:-nightly}"
+TOOLCHAIN="$RTEMS_TOOLCHAIN"
 
 # The RTEMS target this gate compiles for.
 #
@@ -132,7 +139,7 @@ fi
 # still fire, byte for byte, as they do at 0.2.186. No published `libc`
 # satisfies the predicates; the one that does is the unmerged fork, and which
 # fork lands is not this script's decision.
-COMMON=(+nightly check --locked --no-default-features "-Zbuild-std=std,panic_abort" ${JSON_SPEC_FLAGS[@]+"${JSON_SPEC_FLAGS[@]}"} --target "$TARGET")
+COMMON=(+"$TOOLCHAIN" check --locked --no-default-features "-Zbuild-std=std,panic_abort" ${JSON_SPEC_FLAGS[@]+"${JSON_SPEC_FLAGS[@]}"} --target "$TARGET")
 
 # The crates that must compile for the target.
 #
@@ -167,7 +174,7 @@ CRATES=(epics-libcom-rs epics-base-rs epics-ca-rs epics-pva-rs epics-rtems-boot 
 #
 # So the selection is stated rather than defaulted, and stated per crate rather
 # than globally: it says out loud that this crate's target configuration is a
-# CHOICE. `qsrv-core,pvalink` and not the full `qsrv`: `qsrv` additionally
+# CHOICE. `qsrv-core,pvalink,calink-core` and not the full `qsrv`: `qsrv` additionally
 # implies `qsrv-bin` machinery this target never runs, but `pvalink` — the
 # pva:// record-link resolver — is now on the target (design stage 4). It pulls
 # `epics-pva-rs/client`, whose v4 UDP transport compiles for the triple through
@@ -175,7 +182,8 @@ CRATES=(epics-libcom-rs epics-base-rs epics-ca-rs epics-pva-rs epics-rtems-boot 
 # pull `tls`/`pkcs12` (no `ring`, no `getrandom 0.2`) because the bridge's
 # `epics-pva-rs` dependency is `default-features = false`. Before stage 4 this
 # was `qsrv-core` alone, because `client_native` was 47 errors on this target;
-# the pvalink staging work closed them.
+# the pvalink staging work closed them. `calink-core` is dbCa, which every C
+# IOC links: it pulls `epics-ca-rs` at `client-core`, the selection below.
 #
 # `epics-ca-rs` selects `client-core` for the same reason, one protocol over:
 # `realtime-ca-ioc` mounts the `ca://` record-link resolver (design stage C5), and
@@ -194,7 +202,7 @@ CRATES=(epics-libcom-rs epics-base-rs epics-ca-rs epics-pva-rs epics-rtems-boot 
 # `epics_base_rs` — so the entry is deleted, which is what the workaround
 # comment said to do rather than re-tune it.
 declare -A CRATE_FEATURES=(
-    [epics-bridge-rs]="qsrv-core,pvalink"
+    [epics-bridge-rs]="qsrv-core,pvalink,calink-core"
     [epics-ca-rs]="client-core"
 )
 
@@ -281,8 +289,8 @@ QUIET=0
 
 log() { [[ $QUIET -eq 1 ]] || echo "$@"; }
 
-if ! cargo +nightly --version >/dev/null 2>&1; then
-    echo "error: the nightly toolchain is required for -Zbuild-std." >&2
+if ! cargo "+$TOOLCHAIN" --version >/dev/null 2>&1; then
+    echo "error: the $TOOLCHAIN toolchain is required for -Zbuild-std." >&2
     exit 1
 fi
 
@@ -492,7 +500,7 @@ fi
 # `epics_base_rs::net::iface_v4` instead of `if-addrs`. `socket2` and
 # `tokio::net` are named only on the hosted arm of each, so neither reaches the
 # target's compiled unit — which is what keeps this number at zero while the
-# `epics-bridge-rs:realtime-pva-ioc --features qsrv-core,pvalink` bin above
+# `epics-bridge-rs:realtime-pva-ioc --features qsrv-core,pvalink,calink-core` bin above
 # pulls `epics-pva-rs/client` and still compiles for the target.
 #
 # Zero after the v6 half is a stronger statement than zero before it, and the

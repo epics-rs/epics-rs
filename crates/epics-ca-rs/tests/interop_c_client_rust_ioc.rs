@@ -4,23 +4,15 @@
 //! implementation so we can prove wire-level compatibility in the
 //! direction Rust-server → C-client.
 //!
-//! Both backends. The `softioc-rs` these tests spawn is built with the test's
-//! own feature set, and its async `CaServer` takes the listener capability
-//! from the tokio runtime rather than from the seam `Reactor`, so the C client
-//! reaches it under `EPICS_RS_BUILD_EXEC_BACKEND=thread` as well: all five
-//! cases pass under `EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run
-//! --profile interop -p epics-ca-rs --run-ignored all`.
-//!
-//! Note this file carries no census marker: its tests are plain `#[test]`
-//! whose reactor dependency lives in a *child process*, which the
-//! `rtems_exec_model_gate` anchors cannot see.
+//! Tokio backend only: on the exec backend `softioc-rs`'s `main` refuses
+//! before it serves, so the C tools have nothing to reach.
 
-mod common;
+#![cfg(tokio_backend)]
 
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
-use common::{LineCollector, require_tool, run_caget, run_caput};
+use c_ca_tools::{LineCollector, require_tool, run_caget, run_caput};
 use serial_test::serial;
 
 const TEST_DB: &str = "
@@ -100,7 +92,7 @@ fn spawn_rust_ioc(db_content: &str) -> RustIoc {
         });
 
     let err = LineCollector::spawn(child.stderr.take().expect("piped stderr"));
-    let found = err.wait_for(common::budget::FACT_BUDGET, |t| report_port(t).is_some());
+    let found = err.wait_for(fact_budget::FACT_BUDGET, |t| report_port(t).is_some());
     let port = report_port(&err.text()).unwrap_or_else(|| {
         assert!(!found, "the wait succeeded but the report did not parse");
         panic!("`softioc-rs` never reported its CA port:\n{}", err.text())
@@ -126,9 +118,7 @@ fn report_port(console: &str) -> Option<u16> {
 #[serial]
 #[ignore = "spawns Rust IOC + invokes libca caget/caput; run with --include-ignored"]
 fn c_caget_can_read_from_rust_ioc() {
-    if !require_tool("caget") {
-        return;
-    }
+    require_tool("caget");
     let ioc = spawn_rust_ioc(TEST_DB);
     let out = run_caget("127.0.0.1", ioc.port, "TEST:AI").expect("caget");
     assert!(out.contains("42"), "caget output: {out}\n{}", ioc.console());
@@ -138,9 +128,8 @@ fn c_caget_can_read_from_rust_ioc() {
 #[serial]
 #[ignore = "spawns Rust IOC + invokes libca caget/caput; run with --include-ignored"]
 fn c_caput_can_write_to_rust_ioc() {
-    if !require_tool("caput") || !require_tool("caget") {
-        return;
-    }
+    require_tool("caput");
+    require_tool("caget");
     let ioc = spawn_rust_ioc(TEST_DB);
     assert!(run_caput("127.0.0.1", ioc.port, "TEST:LOUT", "9876"));
     let readback = run_caget("127.0.0.1", ioc.port, "TEST:LOUT").expect("caget");
@@ -151,9 +140,8 @@ fn c_caput_can_write_to_rust_ioc() {
 #[serial]
 #[ignore = "spawns Rust IOC + invokes libca caget/caput; run with --include-ignored"]
 fn c_camonitor_sees_rust_ioc_changes() {
-    if !require_tool("camonitor") || !require_tool("caput") {
-        return;
-    }
+    require_tool("camonitor");
+    require_tool("caput");
     let ioc = spawn_rust_ioc(TEST_DB);
 
     let mut mon = Command::new("camonitor")
@@ -168,9 +156,9 @@ fn c_camonitor_sees_rust_ioc_changes() {
 
     // Wait for camonitor's leading event (it prints the current value on
     // connect) rather than assuming a fixed sleep covers search + connect.
-    let out_lines = common::LineCollector::spawn(mon.stdout.take().expect("piped stdout"));
+    let out_lines = c_ca_tools::LineCollector::spawn(mon.stdout.take().expect("piped stdout"));
     assert!(
-        out_lines.wait_for(budget::FACT_BUDGET, |t| t.contains("TEST:LOUT")),
+        out_lines.wait_for(fact_budget::FACT_BUDGET, |t| t.contains("TEST:LOUT")),
         "camonitor never connected; got:\n{}",
         out_lines.text()
     );
@@ -182,7 +170,7 @@ fn c_camonitor_sees_rust_ioc_changes() {
     }
 
     // Wait for the final value to be observed, then stop camonitor.
-    let saw_final = out_lines.wait_for(budget::FACT_BUDGET, |t| t.contains("30"));
+    let saw_final = out_lines.wait_for(fact_budget::FACT_BUDGET, |t| t.contains("30"));
     let _ = mon.kill();
     let _ = mon.wait();
     assert!(
@@ -196,9 +184,7 @@ fn c_camonitor_sees_rust_ioc_changes() {
 #[serial]
 #[ignore = "spawns Rust IOC + invokes libca caget/caput; run with --include-ignored"]
 fn c_cainfo_describes_rust_ioc_channel() {
-    if !require_tool("cainfo") {
-        return;
-    }
+    require_tool("cainfo");
     let ioc = spawn_rust_ioc(TEST_DB);
     let out = Command::new("cainfo")
         .arg("TEST:AI")
@@ -220,19 +206,17 @@ fn c_cainfo_describes_rust_ioc_channel() {
 #[ignore = "spawns Rust IOC + invokes libca caget/caput; run with --include-ignored"]
 fn pyepics_caget_via_libca_against_rust_ioc() {
     // Pyepics uses libca; if the C tools work this is largely covered.
-    // Provide an explicit smoke through Python only when pyepics is present.
-    let have_python = Command::new("python3").arg("--version").output().is_ok();
-    if !have_python {
-        eprintln!("SKIP: `python3` not found on PATH; install it to run this test");
-        return;
-    }
+    // A missing interpreter or module is a failed run, not a pass: nextest
+    // scores an early return as green.
     let pyepics_check = Command::new("python3")
         .args(["-c", "import epics"])
-        .output();
-    if !matches!(&pyepics_check, Ok(o) if o.status.success()) {
-        eprintln!("SKIP: pyepics not installed");
-        return;
-    }
+        .output()
+        .expect("`python3` not found on PATH; install it to run this test");
+    assert!(
+        pyepics_check.status.success(),
+        "pyepics is not installed (`import epics` failed): {}",
+        String::from_utf8_lossy(&pyepics_check.stderr)
+    );
     let ioc = spawn_rust_ioc(TEST_DB);
     let mut child = Command::new("python3")
         .args([
@@ -259,5 +243,3 @@ fn pyepics_caget_via_libca_against_rust_ioc() {
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(text.contains("42"), "pyepics output: {text}");
 }
-
-use common::budget;

@@ -14,6 +14,7 @@
 
 // RTEMS-EXEC-MODEL-ALLOW(1): not run by the default nextest profile - this file is a module of the `interop_pvxs` binary, which `.config/nextest.toml`'s default-filter excludes.
 
+use super::interop_helpers::PvxsOutput;
 use super::interop_helpers::{pvxs_command, pvxs_lib_dir, require_pvxs};
 
 #[cfg(tokio_backend)]
@@ -35,29 +36,57 @@ fn env_key() -> &'static str {
 #[cfg(tokio_backend)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn interop_beacon_a_pvxlist_discovers_rust_server() {
-    let Some(pvxlist) = require_pvxs("pvxlist") else {
-        return;
+    let pvxlist = require_pvxs("pvxlist");
+
+    // pvxlist must bind the beacon port itself, so it is picked by binding
+    // and releasing; another bind can take it in between, and pvxlist then
+    // exits with `Address already in use`. Such a run is retried on a fresh
+    // port, as the oracle's pvatool BEACON_ATTEMPTS does.
+    const BEACON_ATTEMPTS: usize = 8;
+    let mut attempts = 0;
+    let (out, tcp_addr) = loop {
+        attempts += 1;
+        let (out, tcp_addr) = beacon_a_attempt(&pvxlist).await;
+        if attempts == BEACON_ATTEMPTS
+            || !String::from_utf8_lossy(&out.stderr).contains("Address already in use")
+        {
+            break (out, tcp_addr);
+        }
     };
 
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+
+    // pvxlist prints `<ip>:<tcp_port>` lines for each discovered
+    // server. Our Rust server bound an ephemeral port; assert that
+    // port appears in pvxlist's output (the IP is loopback —
+    // either 127.0.0.1 or the host's primary IP depending on
+    // beacon source-address selection).
+    let want = format!(":{}", tcp_addr.port());
+    assert!(
+        stdout.contains(&want),
+        "pvxlist did not discover Rust server via beacon (expected `{want}` substring).\n\
+         pvxlist stdout: {stdout}\nstderr: {stderr}",
+    );
+}
+
+/// One Direction-A run: a Rust server beaconing to a fresh port and a
+/// pvxlist listening on it. Returns pvxlist's output and the server's address.
+#[cfg(tokio_backend)]
+async fn beacon_a_attempt(
+    pvxlist: &std::path::Path,
+) -> (std::process::Output, std::net::SocketAddr) {
     // Pick an ephemeral UDP port. We tell BOTH pvxlist (via env)
-    // and the Rust server (via beacon_destinations) to use it.
-    let beacon_port: u16 = {
-        let s = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        let p = s.local_addr().unwrap().port();
-        drop(s);
-        p
-    };
+    // and the Rust server (via beacon_destinations) to use it. Held
+    // until pvxlist starts, so neither the server's search port nor
+    // any socket the server binds can take it.
+    let beacon_sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let beacon_port = beacon_sock.local_addr().unwrap().port();
 
     let source = SharedSource::new();
     // Empty source — beacon emission is independent of hosted PVs.
     let cfg = PvaServerConfig {
         tcp_port: 0,
-        udp_port: {
-            let s = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-            let p = s.local_addr().unwrap().port();
-            drop(s);
-            p
-        },
         beacon_destinations: vec![
             format!("127.0.0.1:{beacon_port}")
                 .parse::<std::net::SocketAddr>()
@@ -80,8 +109,9 @@ async fn interop_beacon_a_pvxlist_discovers_rust_server() {
     // intervals.
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    let pvxlist_p = pvxlist.clone();
+    let pvxlist_p = pvxlist.to_path_buf();
     let lib = pvxs_lib_dir().into_os_string();
+    drop(beacon_sock);
     let out = tokio::task::spawn_blocking(move || {
         pvxs_command(&pvxlist_p)
             .arg("-w")
@@ -95,7 +125,7 @@ async fn interop_beacon_a_pvxlist_discovers_rust_server() {
             .env(env_key(), lib)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .output()
+            .pvxs_output()
             .expect("pvxlist exec")
     })
     .await
@@ -103,21 +133,7 @@ async fn interop_beacon_a_pvxlist_discovers_rust_server() {
 
     server.stop();
     tokio::time::sleep(Duration::from_millis(50)).await;
-
-    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
-
-    // pvxlist prints `<ip>:<tcp_port>` lines for each discovered
-    // server. Our Rust server bound an ephemeral port; assert that
-    // port appears in pvxlist's output (the IP is loopback —
-    // either 127.0.0.1 or the host's primary IP depending on
-    // beacon source-address selection).
-    let want = format!(":{}", tcp_addr.port());
-    assert!(
-        stdout.contains(&want),
-        "pvxlist did not discover Rust server via beacon (expected `{want}` substring).\n\
-         pvxlist stdout: {stdout}\nstderr: {stderr}",
-    );
+    (out, tcp_addr)
 }
 
 /// Direction B: pvxs softIocPVX emits beacons; Rust client's
@@ -127,51 +143,31 @@ async fn interop_beacon_a_pvxlist_discovers_rust_server() {
 /// pvxs beacon datagram parses cleanly through the Rust
 /// `udp_collector` + onBeacon dispatch.
 ///
-/// The Rust client's `bind_beacon_udp` deliberately skips the
-/// loopback NIC (to avoid SO_REUSEPORT collision with a co-hosted
-/// Rust server), so this test cannot use 127.0.0.1 for beacons.
-/// Instead pick a non-loopback NIC address from the host and use
-/// that as both pvxs's beacon destination and the bind target the
-/// Rust client picks up. SKIPs cleanly when the host has no
-/// suitable non-loopback IPv4.
+/// The beacon is sent to a non-loopback NIC address, as a beacon
+/// from another host arrives. Fails when the host has no suitable
+/// non-loopback IPv4.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn interop_beacon_b_rust_client_receives_pvxs_beacons() {
-    let Some(softioc) = super::interop_helpers::locate_pvxs(super::interop_helpers::SOFT_IOC_PVX)
-    else {
-        eprintln!("SKIP: softIocPVX not found");
-        return;
-    };
+    let softioc = super::interop_helpers::require_pvxs(super::interop_helpers::SOFT_IOC_PVX);
     let dbd_path = super::interop_helpers::pvxs_dbd_dir().join("softIocPVX.dbd");
-    if !dbd_path.is_file() {
-        eprintln!("SKIP: softIocPVX.dbd missing");
-        return;
-    }
+    assert!(dbd_path.is_file(), "softIocPVX.dbd missing: {dbd_path:?}");
 
-    // Find a non-loopback IPv4 we can bind on (matches what
-    // `bind_non_loopback` enumerates).
-    let local_v4 = match local_non_loopback_v4() {
-        Some(a) => a,
-        None => {
-            eprintln!("SKIP: no non-loopback IPv4 on this host");
-            return;
-        }
-    };
+    // Find a non-loopback IPv4 to send the beacon to.
+    let local_v4 = local_non_loopback_v4()
+        .expect("no non-loopback IPv4 on this host; the pvxs beacon test needs one");
 
-    // Pick an ephemeral UDP port to act as the agreed beacon /
-    // search broadcast port between pvxs and the Rust client.
-    let beacon_port: u16 = {
-        let s = std::net::UdpSocket::bind((local_v4, 0)).unwrap();
-        let p = s.local_addr().unwrap().port();
-        drop(s);
-        p
+    // The agreed beacon / search broadcast port between pvxs and the Rust
+    // client, which binds it on the wildcard: owned there and opened to
+    // that fanout co-bind, so nobody else can take it before the client has.
+    let (beacon_holder, beacon_port) = {
+        use epics_base_rs::net::{PortOrigin, PortUse};
+        use socket2::{Domain, Protocol, Socket, Type};
+        let s = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).unwrap();
+        let any = std::net::SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, 0));
+        PortUse::Shared.bind(&s, any, PortOrigin::Chosen).unwrap();
+        let p = s.local_addr().unwrap().as_socket().unwrap().port();
+        (s, p)
     };
-    let pva_port: u16 = {
-        let l = std::net::TcpListener::bind((local_v4, 0)).unwrap();
-        let p = l.local_addr().unwrap().port();
-        drop(l);
-        p
-    };
-
     let dir = tempfile::tempdir().expect("tempdir");
     let db_path = dir.path().join("beacon.db");
     std::fs::write(
@@ -179,59 +175,41 @@ async fn interop_beacon_b_rust_client_receives_pvxs_beacons() {
         "record(stringout, \"B:HOST\") { field(VAL, \"ok\") }\n",
     )
     .expect("write db");
-    let stdout_path = dir.path().join("ioc.stdout");
-    let stderr_path = dir.path().join("ioc.stderr");
-
-    let mut cmd = super::interop_helpers::pvxs_command(&softioc);
-    cmd.arg("-D")
-        .arg(&dbd_path)
-        .arg("-d")
-        .arg(&db_path)
-        .arg("-S")
-        .env("EPICS_PVAS_SERVER_PORT", pva_port.to_string())
-        .env("EPICS_PVAS_INTF_ADDR_LIST", local_v4.to_string())
-        .env(
-            "EPICS_PVAS_BEACON_ADDR_LIST",
-            format!("{local_v4}:{beacon_port}"),
-        )
-        .env("EPICS_PVAS_AUTO_BEACON_ADDR_LIST", "NO")
-        .env("EPICS_PVAS_BROADCAST_PORT", beacon_port.to_string())
-        // softIocPVX bundles a CA server too — keep it off the
-        // default ports so we don't fight other IOCs on the host.
-        .env("EPICS_CAS_SERVER_PORT", "0")
-        .env("EPICS_CA_SERVER_PORT", "0")
-        .stdout(std::process::Stdio::from(
-            std::fs::File::create(&stdout_path).expect("stdout"),
-        ))
-        .stderr(std::process::Stdio::from(
-            std::fs::File::create(&stderr_path).expect("stderr"),
-        ));
-
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(e) => panic!("failed to spawn softIocPVX: {e}"),
+    let logs = super::interop_helpers::PvxsLogs::in_dir(dir.path(), "ioc");
+    let build = || {
+        // The server's own search port: on the beacon port its wildcard UDP
+        // collector would share a REUSEPORT group with the client's and take a
+        // unicast beacon by hash.
+        let search_port: u16 = {
+            let s = std::net::UdpSocket::bind((local_v4, 0)).unwrap();
+            s.local_addr().unwrap().port()
+        };
+        let pva_port: u16 = {
+            let l = std::net::TcpListener::bind((local_v4, 0)).unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let ca = named_port::free_for_tcp_and_udp();
+        let mut cmd = pvxs_command(&softioc);
+        cmd.arg("-D")
+            .arg(&dbd_path)
+            .arg("-d")
+            .arg(&db_path)
+            .arg("-S")
+            .env("EPICS_PVAS_SERVER_PORT", pva_port.to_string())
+            .env("EPICS_PVAS_INTF_ADDR_LIST", local_v4.to_string())
+            .env(
+                "EPICS_PVAS_BEACON_ADDR_LIST",
+                format!("{local_v4}:{beacon_port}"),
+            )
+            .env("EPICS_PVAS_AUTO_BEACON_ADDR_LIST", "NO")
+            .env("EPICS_PVAS_BROADCAST_PORT", search_port.to_string())
+            // A named CA port: `0` falls back to 5064 (`envSubr.c:410`),
+            // and a lost one is rerun through `port_collision`.
+            .env("EPICS_CAS_INTF_ADDR_LIST", "127.0.0.1")
+            .env("EPICS_CAS_SERVER_PORT", ca.to_string())
+            .env("EPICS_CA_SERVER_PORT", ca.to_string());
+        (cmd, std::net::SocketAddr::from((local_v4, pva_port)))
     };
-    // Wait for PVA TCP port to be live (proxies "IOC up").
-    let tcp_addr: std::net::SocketAddr = format!("{local_v4}:{pva_port}").parse().unwrap();
-    let mut up = false;
-    for _ in 0..50 {
-        if std::net::TcpStream::connect_timeout(&tcp_addr, Duration::from_millis(100)).is_ok() {
-            up = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    if !up {
-        let _ = child.kill();
-        let _ = child.wait();
-        let out = std::fs::read_to_string(&stdout_path).unwrap_or_default();
-        let err = std::fs::read_to_string(&stderr_path).unwrap_or_default();
-        panic!(
-            "softIocPVX did not bind {tcp_addr} within 5s. A spawned IOC that \
-             never comes up is a broken reference, not a missing one.\n\
-             pvxs stdout:\n{out}\npvxs stderr:\n{err}"
-        );
-    }
 
     // Rust client listening on the same broadcast port, so pvxs's beacons
     // reach our UDP collector.
@@ -258,37 +236,50 @@ async fn interop_beacon_b_rust_client_receives_pvxs_beacons() {
         .auto_addr_list(false)
         .addr_list(Vec::new())
         .build();
-    let mut rx = match client.discover().await {
-        Ok(r) => r,
-        Err(e) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            panic!("client.discover() failed: {e:?}");
+    // Listening before softIocPVX starts: pvxs sends one beacon at start
+    // and the next 15 s later (server.cpp beaconIntervalShort).
+    let mut rx = client.discover().await.expect("client.discover()");
+    // The client holds the number now; the holder would take a share of the
+    // beacons.
+    drop(beacon_holder);
+
+    let (ioc, tcp_addr) =
+        match super::interop_helpers::start_pvxs(&logs, build, super::interop_helpers::ioc_ready) {
+            Ok(started) => started,
+            Err(text) => panic!(
+                "softIocPVX did not come up. A spawned IOC that never comes up \
+                 is a broken reference, not a missing one.\n{text}"
+            ),
+        };
+    let pva_port = tcp_addr.port();
+
+    // Up to 4 s for pvxs's beacon, which carries its TCP server endpoint. An
+    // attempt `start_pvxs` reran beaconed before it was killed, on its own
+    // port, so other servers' events are passed over.
+    let mut seen = Vec::new();
+    let discovered = tokio::time::timeout(Duration::from_secs(4), async {
+        while let Some(event) = rx.recv().await {
+            let text = format!("{event:?}");
+            if text.contains(&pva_port.to_string()) {
+                return true;
+            }
+            seen.push(text);
         }
-    };
+        false
+    })
+    .await;
 
-    // Wait up to 4 s for the first Discovered event from pvxs.
-    // softIocPVX bursts beacons every 200 ms by default for the
-    // initial period — should see one well within 4 s.
-    let discovered = tokio::time::timeout(Duration::from_secs(4), rx.recv()).await;
+    drop(ioc);
 
-    let _ = child.kill();
-    let _ = child.wait();
-
-    let event = discovered
-        .expect("timeout waiting for pvxs beacon")
-        .expect("discover channel closed before any beacon");
-    // pvxs's beacon carries its TCP server endpoint; assert the
-    // discovered event matches the port we know pvxs bound.
-    assert!(
-        format!("{event:?}").contains(&pva_port.to_string()),
-        "discovered event did not carry pvxs's pva_port={pva_port}: {event:?}",
+    assert_eq!(
+        discovered,
+        Ok(true),
+        "no beacon carried pvxs's pva_port={pva_port}; saw {seen:?}",
     );
 }
 
 /// Return the first non-loopback IPv4 address bound on a UP
-/// interface, or None if there isn't one. Matches what the Rust
-/// client's `bind_non_loopback` UDP socket enumerates.
+/// interface, or None if there isn't one.
 fn local_non_loopback_v4() -> Option<std::net::Ipv4Addr> {
     let interfaces = epics_base_rs::net::iface_map::IfaceMap::new()
         .expect("getifaddrs must succeed on the host");

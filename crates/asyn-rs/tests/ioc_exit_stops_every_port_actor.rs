@@ -10,7 +10,7 @@
 //! The owner is `epics_libcom_rs::runtime::exit` (C `epicsExit.c`), which
 //! `IocApplication::run` calls on every way out. Ports enrol themselves in it at
 //! creation, where C's `registerPort` enrols an `ASYN_DESTRUCTIBLE` one
-//! (`epicsAtExit(destroyPortDriver, …)`, asynManager.c:2096-2098) — here every
+//! (`epicsAtExit(destroyPortDriver, …)`, asynManager.c:2098-2100) — here every
 //! port enrols, whatever it declared, so a driver still knows nothing about
 //! shutdown.
 //!
@@ -25,10 +25,11 @@ use std::time::Duration;
 
 use asyn_rs::drivers::ip_port::DrvAsynIPPort;
 use asyn_rs::param::ParamType;
+use asyn_rs::port::InterfaceMask;
 use asyn_rs::port::{PortDriver, PortDriverBase, PortFlags};
 use asyn_rs::registry::PortRegistry;
 use asyn_rs::runtime::port::PortRuntimeHandle;
-use asyn_rs::runtime::{RuntimeConfig, create_port_runtime};
+use asyn_rs::runtime::{RuntimeConfig, create_port_runtime_unclaimed};
 
 /// A driver whose entire teardown is observable: it reports its own `Drop`.
 /// Stands in for every driver with a protocol goodbye to send.
@@ -39,7 +40,13 @@ struct TeardownDriver {
 
 impl TeardownDriver {
     fn new(name: &str, torn_down: Sender<&'static str>) -> Self {
-        let mut base = PortDriverBase::new(name, 1, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            name,
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
+        );
         base.create_param("VAL", ParamType::Int32).unwrap();
         Self { base, torn_down }
     }
@@ -70,7 +77,11 @@ impl Drop for TeardownDriver {
 /// its own and prove nothing about who stopped it.
 fn publish(registry: &PortRegistry, name: &str, port: &PortRuntimeHandle) {
     registry
-        .register(name, port.port_handle().clone())
+        .register(
+            name,
+            port.port_handle().clone(),
+            &asyn_rs::registry::open_owner(),
+        )
         .expect("port name is free");
 }
 
@@ -83,7 +94,7 @@ const SETTLE: Duration = Duration::from_secs(5);
 fn ioc_shutdown_stops_every_port_actor_and_runs_each_drivers_teardown() {
     // ---- port 1: a driver that reports its own Drop --------------------
     let (torn_down_tx, torn_down) = std::sync::mpsc::channel();
-    let (recorder, _recorder_thread) = create_port_runtime(
+    let (recorder, _recorder_thread) = create_port_runtime_unclaimed(
         TeardownDriver::new("MQ4:RECORDER", torn_down_tx),
         RuntimeConfig::default(),
     )
@@ -105,7 +116,7 @@ fn ioc_shutdown_stops_every_port_actor_and_runs_each_drivers_teardown() {
         let mut sink = [0u8; 1];
         let _ = peer_saw.send(conn.read(&mut sink));
     });
-    let (ip_port, _ip_thread) = create_port_runtime(
+    let (ip_port, _ip_thread) = create_port_runtime_unclaimed(
         DrvAsynIPPort::new("MQ4:IP", &format!("127.0.0.1:{device_port}")).expect("configure"),
         RuntimeConfig::default(),
     )
@@ -123,13 +134,11 @@ fn ioc_shutdown_stops_every_port_actor_and_runs_each_drivers_teardown() {
         "a running IOC must not have torn its ports down"
     );
     #[cfg(unix)]
-    if let Some(pty) = &serial {
-        assert!(
-            pty.driver_still_holds_the_tty(),
-            "the serial port must be connected before shutdown, or this test \
-             proves nothing about its teardown"
-        );
-    }
+    assert!(
+        serial.driver_still_holds_the_tty(),
+        "the serial port must be connected before shutdown, or this test \
+         proves nothing about its teardown"
+    );
 
     // ---- the IOC shuts down --------------------------------------------
     //
@@ -154,13 +163,11 @@ fn ioc_shutdown_stops_every_port_actor_and_runs_each_drivers_teardown() {
         ),
     }
     #[cfg(unix)]
-    if let Some(pty) = &serial {
-        assert!(
-            !pty.driver_still_holds_the_tty(),
-            "DrvAsynSerialPort's Drop runs `disconnect`; IOC shutdown must \
-             reach it, releasing the tty"
-        );
-    }
+    assert!(
+        !serial.driver_still_holds_the_tty(),
+        "DrvAsynSerialPort's Drop runs `disconnect`; IOC shutdown must \
+         reach it, releasing the tty"
+    );
 }
 
 #[cfg(unix)]
@@ -169,7 +176,7 @@ mod serial {
 
     use asyn_rs::drivers::serial_port::DrvAsynSerialPort;
     use asyn_rs::registry::PortRegistry;
-    use asyn_rs::runtime::{RuntimeConfig, create_port_runtime};
+    use asyn_rs::runtime::{RuntimeConfig, create_port_runtime_unclaimed};
 
     /// The pty master, kept open so the slave's fate is observable.
     pub struct Pty {
@@ -201,9 +208,9 @@ mod serial {
         }
     }
 
-    /// A serial port on a fresh pty, or `None` where the host has no pty to
-    /// give — the same skip the driver's own pty tests take.
-    pub fn open_port_on_a_pty(registry: &PortRegistry) -> Option<Pty> {
+    /// A serial port on a fresh pty. A host with no pty fails the test: an
+    /// early return would score as a pass.
+    pub fn open_port_on_a_pty(registry: &PortRegistry) -> Pty {
         let mut master: RawFd = 0;
         let mut slave: RawFd = 0;
         let mut name = [0u8; 256];
@@ -216,10 +223,11 @@ mod serial {
                 std::ptr::null_mut(),
             )
         };
-        if opened < 0 {
-            eprintln!("openpty unavailable; skipping the serial half of this test");
-            return None;
-        }
+        assert!(
+            opened >= 0,
+            "openpty failed: {}",
+            std::io::Error::last_os_error()
+        );
         let device = unsafe {
             std::ffi::CStr::from_ptr(name.as_ptr() as *const libc::c_char)
                 .to_string_lossy()
@@ -230,12 +238,12 @@ mod serial {
         unsafe { libc::close(slave) };
         unsafe { libc::fcntl(master, libc::F_SETFL, libc::O_NONBLOCK) };
 
-        let (port, _thread) = create_port_runtime(
+        let (port, _thread) = create_port_runtime_unclaimed(
             DrvAsynSerialPort::new("MQ4:SERIAL", &device).expect("configure"),
             RuntimeConfig::default(),
         )
         .expect("the port runtime thread must start");
         super::publish(registry, "MQ4:SERIAL", &port);
-        Some(Pty { master })
+        Pty { master }
     }
 }

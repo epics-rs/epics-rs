@@ -1,28 +1,9 @@
 use crate::error::{CaError, CaResult};
 use crate::server::record::{
-    FieldMetadataOverride, MENU_SIMM, ProcessOutcome, RawSoftEntry, Record, ValuePostGate,
+    CycleCell, CycleRead, CycleValue, FieldMetadataOverride, MENU_SIMM, ProcessOutcome,
+    RawSoftEntry, Record, SimmCells, ValuePostGate,
 };
-use crate::server::records::convert_phase::ConvertPhase;
 use crate::types::{EpicsValue, PvString};
-
-/// The soft `ai` dset's own "a read has completed" state — `prec->dpvt` in
-/// `devAiSoft.c` (set at :90, cleared at :94) and `pdevPvt->smooth` in
-/// `devAiSoftCallback.c` (:194, :182). It is the second term of the three-part
-/// `SMOO` guard, and it is what makes the FIRST soft read of a record — and
-/// the first after a failed one — land unblended.
-///
-/// Named rather than a bare `bool` because the state it carries is not "SMOO
-/// is armed" but "`VAL` currently holds a previous reading": `VAL` alone
-/// cannot say so (a caput, a `SIMM` landing and a constant-`INP` load all
-/// leave a perfectly finite `VAL` that C refuses to blend against).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-enum SoftReadHistory {
-    /// C `dpvt == NULL` / `smooth == FALSE`.
-    #[default]
-    Absent,
-    /// C `dpvt != NULL` / `smooth == TRUE`.
-    Prior,
-}
 
 /// Analog input record with conversion support.
 /// LINR: 0=NO_CONVERSION, 1=SLOPE, 2=LINEAR
@@ -63,14 +44,11 @@ pub struct AiRecord {
     pub lalm: f64,
     pub alst: f64,
     pub mlst: f64,
-    /// C `prec->init` — see [`ConvertPhase`]. Set by `init_record` and by an
-    /// `SPC_LINCONV` put, cleared at the end of every `process`.
-    pub init: ConvertPhase,
+    /// C `prec->init`: nonzero while the next conversion is the initial one.
+    /// Set by `init_record` and by an `SPC_LINCONV` put, cleared at the end of
+    /// every `process`.
+    pub init: i16,
     skip_convert: bool,
-    /// C's soft-dset history flag — see [`SoftReadHistory`]. Owned by
-    /// [`Record::soft_input_read`], which is the only place C touches
-    /// `dpvt`/`smooth` too.
-    soft_history: SoftReadHistory,
     /// Set by `process()` when a `LINR >= 3` breakpoint-table conversion
     /// fails — the table could not be resolved, or the raw value fell past
     /// an end of the table. C `aiRecord.c::convert` raises
@@ -90,8 +68,8 @@ pub struct AiRecord {
     lbrk: usize,
     // Simulation
     pub simm: i16,
-    pub siml: String,
-    pub siol: String,
+    pub siml: PvString,
+    pub siol: PvString,
     pub sims: i16,
     pub sdly: f64,
     /// Simulation value (`field(SVAL,DBF_DOUBLE)`, aiRecord.dbd). The value
@@ -127,16 +105,15 @@ impl Default for AiRecord {
             lalm: 0.0,
             alst: 0.0,
             mlst: 0.0,
-            init: ConvertPhase::default(),
+            init: 0,
             skip_convert: false,
-            soft_history: SoftReadHistory::default(),
             bpt_error: false,
             bpt_registry: None,
             bpt_table: None,
             lbrk: 0,
             simm: 0,
-            siml: String::new(),
-            siol: String::new(),
+            siml: PvString::new(),
+            siol: PvString::new(),
             sims: 0,
             sdly: -1.0,
             sval: 0.0,
@@ -153,9 +130,69 @@ impl AiRecord {
     }
 }
 
+// Out of line so the cycle that raises nothing does not pay the call's
+// register saves.
+#[cold]
+fn raise_bpt_error(common: &mut crate::server::record::CommonFields) {
+    crate::server::recgbl::rec_gbl_set_sevr_msg(
+        common,
+        crate::server::recgbl::alarm_status::SOFT_ALARM,
+        crate::server::record::AlarmSeverity::Major,
+        "BPT Error",
+    );
+}
+
 impl Record for AiRecord {
+    crate::slot_map!(crate::server::record::dbd_generated::slots::ai;
+        fields:
+        RVAL => rval,
+        ORAW => oraw,
+        INIT => init;
+        custom: VAL, PREC => prec, LINR, EGUF, EGUL, EGU => egu, HOPR => hopr, LOPR => lopr, AOFF,
+            ASLO, SMOO, AFTC, ADEL, MDEL, LALM, AFVL, ALST, MLST, ESLO, EOFF, ROFF, SIOL, SVAL,
+            SIML, SIMM, SIMS, SDLY;
+        spill: INP, HIHI, LOLO, HIGH, LOW, HHSV, LLSV, HSV, LSV, HYST, PBRK, LBRK, OLDSIMM,
+            SSCN, SIMPVT);
+
+    fn held_pointer(&self, field: &str) -> Option<usize> {
+        match field {
+            // C `pbrk`, the table `cvtRawToEngBpt`/`cvtEngToRawBpt` found.
+            "PBRK" => self
+                .bpt_table
+                .as_ref()
+                .map(|t| std::sync::Arc::as_ptr(t) as usize),
+            _ => None,
+        }
+    }
+
+    fn acts_before_process(&self) -> bool {
+        false
+    }
+
+    fn cycle_hooks(&self) -> crate::server::record::CycleHooks {
+        crate::server::record::CycleHooks::NONE
+    }
+
+    fn has_array_monitor_post(&self) -> bool {
+        false
+    }
+
     fn record_type(&self) -> &'static str {
         "ai"
+    }
+
+    /// devaiStream.c reads and writes the `aiRecord` members itself.
+    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+        Some(self)
+    }
+
+    /// devAiSoft.c and devAiSoftRaw.c return `dbGetLink`'s status, `aiRecord.c:166` returns it.
+    fn process_status_rule(&self) -> crate::server::record::ProcessStatusRule {
+        crate::server::record::ProcessStatusRule::io(crate::server::record::SoftStatus {
+            plain: true,
+            raw: true,
+            async_: false,
+        })
     }
 
     /// `aiRecord.c:267-288` `get_control_double` lists one field the shared
@@ -171,34 +208,42 @@ impl Record for AiRecord {
             })
     }
 
+    fn eoff_eslo_before_dset_init(&mut self) -> Option<(f64, f64)> {
+        let saved = (self.eoff, self.eslo);
+        // "for old device support that doesn't know about eoff"
+        if self.eslo == 1.0 && self.eoff == 0.0 {
+            self.eoff = self.egul;
+        }
+        Some(saved)
+    }
+
+    fn eoff_eslo_after_dset_init(&mut self, (eoff, eslo): (f64, f64)) {
+        if self.linr == 1 {
+            self.eoff = eoff;
+            self.eslo = eslo;
+        }
+    }
+
     fn init_record(&mut self, pass: u8) -> CaResult<()> {
-        if pass == 0 {
-            // Legacy compatibility: if eslo==1.0 && eoff==0.0, set eoff from egul.
-            // Save eoff/eslo first in case SLOPE mode needs to preserve them.
-            let saved_eoff = self.eoff;
-            let saved_eslo = self.eslo;
+        if pass == 1 {
+            // C `aiRecord.c:114`, after pass 0 returned at :101: `prec->init =
+            // TRUE;` — an initialised record has not converted yet, so the
+            // next conversion is the initial one.
+            self.init = 1;
+        }
+        Ok(())
+    }
 
-            if self.eslo == 1.0 && self.eoff == 0.0 {
-                self.eoff = self.egul;
-            }
-
-            // For SLOPE mode, restore user-configured eoff/eslo
-            if self.linr == 1 {
-                self.eoff = saved_eoff;
-                self.eslo = saved_eslo;
-            }
-
-            // Initialize tracking fields from current val
+    // aiRecord.c:121-132: a dset `init_record` returns before the seed, so a
+    // soft-channel ai keeps MLST/ALST/LALM and ORAW at 0 and posts its first
+    // VAL. ORAW is no deadband tracker but sits on the same C branch.
+    fn seed_deadband_tracking(&mut self, dset_init: crate::server::device_support::DsetInit) {
+        if dset_init == crate::server::device_support::DsetInit::Absent {
             self.mlst = self.val;
             self.alst = self.val;
             self.lalm = self.val;
             self.oraw = self.rval;
-
-            // C `aiRecord.c:114`: `prec->init = TRUE;` — an initialised record
-            // has not converted yet, so the next conversion is the initial one.
-            self.init = ConvertPhase::Initial;
         }
-        Ok(())
     }
 
     fn process(&mut self) -> CaResult<ProcessOutcome> {
@@ -261,7 +306,7 @@ impl Record for AiRecord {
             // with the new value first — `if (prec->init) prec->val = val;` —
             // and only then runs the filter.
             if self.smoo != 0.0 && self.val.is_finite() {
-                if self.init.is_initial() {
+                if self.init != 0 {
                     self.val = v;
                 }
                 self.val = v * (1.0 - self.smoo) + self.val * self.smoo;
@@ -271,11 +316,53 @@ impl Record for AiRecord {
         } // end skip_convert
         self.skip_convert = false;
 
-        self.oraw = self.rval;
         // C `aiRecord.c:170`: `prec->init = FALSE;` on the way out of EVERY
         // process, not just the first one.
-        self.init = ConvertPhase::Converted;
+        self.init = 0;
         Ok(ProcessOutcome::complete())
+    }
+
+    fn link_text_ref(&self, link_field: &str) -> Option<&[u8]> {
+        match link_field {
+            "SIML" => Some(self.siml.as_bytes()),
+            "SIOL" => Some(self.siol.as_bytes()),
+            _ => None,
+        }
+    }
+
+    fn simm_cells(&self) -> Option<SimmCells> {
+        Some(SimmCells {
+            simm: self.simm,
+            sims: self.sims,
+            sdly: self.sdly,
+        })
+    }
+
+    /// C `monitor()` and `checkAlarms` read these as struct members. `ai`
+    /// declares no OVAL and leaves HYST to `CommonFields`.
+    fn cycle_cell(&self, cell: CycleCell) -> CycleRead {
+        match cell {
+            CycleCell::Val => CycleRead::Value(CycleValue::Double(self.val)),
+            CycleCell::Mdel => CycleRead::Value(CycleValue::Double(self.mdel)),
+            CycleCell::Adel => CycleRead::Value(CycleValue::Double(self.adel)),
+            CycleCell::Mlst => CycleRead::Value(CycleValue::Double(self.mlst)),
+            CycleCell::Alst => CycleRead::Value(CycleValue::Double(self.alst)),
+            CycleCell::Lalm => CycleRead::Value(CycleValue::Double(self.lalm)),
+            CycleCell::Aftc => CycleRead::Value(CycleValue::Double(self.aftc)),
+            CycleCell::Afvl => CycleRead::Value(CycleValue::Double(self.afvl)),
+            CycleCell::Oval | CycleCell::Hyst => CycleRead::Absent,
+        }
+    }
+
+    fn put_cycle_cell(&mut self, cell: CycleCell, value: CycleValue) -> CaResult<()> {
+        match (cell, value) {
+            (CycleCell::Lalm, CycleValue::Double(v)) => self.lalm = v,
+            (CycleCell::Alst, CycleValue::Double(v)) => self.alst = v,
+            (CycleCell::Mlst, CycleValue::Double(v)) => self.mlst = v,
+            (CycleCell::Afvl, CycleValue::Double(v)) => self.afvl = v,
+            (cell, value) => return self.put_field(cell.name(), value.into()),
+        }
+        Ok(())
     }
 
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
@@ -303,7 +390,7 @@ impl Record for AiRecord {
             "LALM" => Some(EpicsValue::Double(self.lalm)),
             "ALST" => Some(EpicsValue::Double(self.alst)),
             "MLST" => Some(EpicsValue::Double(self.mlst)),
-            "INIT" => Some(self.init.as_field()),
+            "INIT" => Some(EpicsValue::Short(self.init)),
             "SIMM" => Some(EpicsValue::Short(self.simm)),
             "SIML" => Some(EpicsValue::String(self.siml.clone().into())),
             "SIOL" => Some(EpicsValue::String(self.siol.clone().into())),
@@ -399,7 +486,7 @@ impl Record for AiRecord {
             "LINR" => match value {
                 EpicsValue::Short(v) => {
                     self.linr = v;
-                    self.init = ConvertPhase::Initial;
+                    self.init = 1;
                     // A LINR change re-selects the breakpoint table (C
                     // `special_linconv` sets `init=TRUE`, which makes the next
                     // `cvtRawToEngBpt` re-resolve via `findBrkTable`). Drop the
@@ -414,7 +501,7 @@ impl Record for AiRecord {
             "EGUF" => match value {
                 EpicsValue::Double(v) => {
                     self.eguf = v;
-                    self.init = ConvertPhase::Initial;
+                    self.init = 1;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
@@ -422,7 +509,7 @@ impl Record for AiRecord {
             "EGUL" => match value {
                 EpicsValue::Double(v) => {
                     self.egul = v;
-                    self.init = ConvertPhase::Initial;
+                    self.init = 1;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
@@ -497,8 +584,7 @@ impl Record for AiRecord {
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
             },
-            // AFVL is SPC_NOMOD (read-only to clients); this arm exists so
-            // the framework alarm-filter owner can write the accumulator back.
+            // AFVL is SPC_NOMOD (read-only to clients).
             "AFVL" => match value {
                 EpicsValue::Double(v) => {
                     self.afvl = v;
@@ -537,14 +623,14 @@ impl Record for AiRecord {
             },
             "SIML" => match value {
                 EpicsValue::String(v) => {
-                    self.siml = v.as_str_lossy().into_owned();
+                    self.siml = v;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
             },
             "SIOL" => match value {
                 EpicsValue::String(v) => {
-                    self.siol = v.as_str_lossy().into_owned();
+                    self.siol = v;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
@@ -593,12 +679,7 @@ impl Record for AiRecord {
     /// C-equivalent alarm so the misconfiguration is visible.
     fn check_alarms(&mut self, common: &mut crate::server::record::CommonFields) {
         if self.bpt_error {
-            crate::server::recgbl::rec_gbl_set_sevr_msg(
-                common,
-                crate::server::recgbl::alarm_status::SOFT_ALARM,
-                crate::server::record::AlarmSeverity::Major,
-                "BPT Error",
-            );
+            raise_bpt_error(common);
         }
     }
 
@@ -616,11 +697,30 @@ impl Record for AiRecord {
         self.bpt_table = None;
     }
 
+    fn raw_soft_read_failure_skips_convert(&self) -> bool {
+        true
+    }
+
     /// `ai` has an `RVAL → VAL` `convert()` step (raw → engineering
     /// units). A `Soft Channel` `ai` must skip it — C `devAiSoft.c`
     /// `read_ai` returns 2 ("don't convert").
     fn soft_channel_skips_convert(&self) -> bool {
         true
+    }
+
+    /// C `devAiSoft.c::read_ai` stores `prec->val = value`. A `DOUBLE` delivery
+    /// is already VAL's shape and type, so the generic owner would only confirm
+    /// that through three `get_field("VAL")` probes and a `put_field` by name;
+    /// anything else still takes it.
+    fn set_val(&mut self, value: EpicsValue) -> CaResult<()> {
+        // A `Double` owns nothing, so its arm skips `EpicsValue`'s drop,
+        // which is out of line and would run on every soft read.
+        let value = std::mem::ManuallyDrop::new(value);
+        if let EpicsValue::Double(v) = *value {
+            self.val = v;
+            return Ok(());
+        }
+        self.put_field_internal("VAL", std::mem::ManuallyDrop::into_inner(value))
     }
 
     /// C `devAiSoft.c::read_ai` (:81-93) and `devAiSoftCallback.c::read_ai`
@@ -634,22 +734,66 @@ impl Record for AiRecord {
     /// and at that point `prec->val` is still the PREVIOUS value — the reading
     /// is `vt.val`. So the finiteness test is on what is being blended INTO,
     /// and `dpvt` is the separate answer to "is there anything to blend into".
-    fn soft_input_read(&mut self, value: Option<EpicsValue>) -> CaResult<()> {
-        let Some(value) = value else {
-            self.soft_history = SoftReadHistory::Absent;
+    fn soft_input_read(
+        &mut self,
+        value: Option<EpicsValue>,
+        dpvt: &mut crate::server::device_support::Dpvt,
+    ) -> CaResult<()> {
+        // A `DBR_DOUBLE` reading with SMOO off is the whole dset body; taking
+        // it first keeps the blend's frame and `EpicsValue`'s out-of-line
+        // drop off the per-cycle read.
+        let value = std::mem::ManuallyDrop::new(value);
+        if let Some(EpicsValue::Double(v)) = *value
+            && self.smoo == 0.0
+        {
+            self.val = v;
+            dpvt.read_done();
+            return Ok(());
+        }
+        let Some(value) = std::mem::ManuallyDrop::into_inner(value) else {
+            dpvt.read_failed();
             return Ok(());
         };
         let previous = self.val;
-        let history = self.soft_history;
+        let history = dpvt.smooth();
         // `set_val` stays the coercion owner (an array source delivers
         // `wf[0]`, C `dbGetLink` with `nRequest = NULL`), so the reading is
         // taken through it and blended afterwards.
         self.set_val(value)?;
-        if self.smoo != 0.0 && history == SoftReadHistory::Prior && previous.is_finite() {
+        if self.smoo != 0.0 && history && previous.is_finite() {
             self.val = self.val * (1.0 - self.smoo) + previous * self.smoo;
         }
-        self.soft_history = SoftReadHistory::Prior;
+        dpvt.read_done();
         Ok(())
+    }
+
+    fn soft_input_read_f64(
+        &mut self,
+        value: f64,
+        dpvt: &mut crate::server::device_support::Dpvt,
+    ) -> CaResult<()> {
+        let previous = self.val;
+        let history = dpvt.smooth();
+        self.val = value;
+        if self.smoo != 0.0 && history && previous.is_finite() {
+            self.val = self.val * (1.0 - self.smoo) + previous * self.smoo;
+        }
+        dpvt.read_done();
+        Ok(())
+    }
+
+    /// `devAiSoft.c:57` and `devAiSoftCallback.c:64` read INP as `DBR_DOUBLE`,
+    /// `devAiSoftRaw.c:50` as `DBR_LONG`.
+    fn soft_input_request(
+        &self,
+        soft: crate::server::device_support::SoftDtyp,
+    ) -> crate::server::record::InputLinkRequest {
+        use crate::server::device_support::SoftDtyp;
+        use crate::server::record::{InputLinkRequest, LinkReadAs};
+        InputLinkRequest::As(match soft {
+            SoftDtyp::Plain | SoftDtyp::Async => LinkReadAs::Double,
+            SoftDtyp::Raw => LinkReadAs::Long,
+        })
     }
 
     /// C `devAiSoftRaw` — `recGblInitConstantLink(&prec->inp, DBF_LONG,
@@ -678,11 +822,95 @@ impl Record for AiRecord {
         // prec->rval)`, aiRecord.c:462), so an unchanged RVAL is not re-posted.
         &[("RVAL", ValuePostGate::OnChange)]
     }
+
+    /// `monitor()` decides RVAL from the record's own `oraw`, so the
+    /// framework keeps no published copy of it.
+    fn fields_posted_only_when_marked(&self) -> &'static [&'static str] {
+        &["RVAL"]
+    }
+
+    /// `monitor()` posts VAL and RVAL alone (`aiRecord.c:448-467`); INIT,
+    /// which `process()` clears (`:170`), posts nothing.
+    fn process_posted_fields(&self) -> Option<crate::server::record::DeclaredFields> {
+        Some(
+            &const {
+                crate::server::record::declared_set(
+                    crate::server::record::dbd_generated::AI_FIELDS,
+                    ["VAL", "RVAL"],
+                )
+            },
+        )
+    }
+
+    /// C `if(prec->oraw != prec->rval) { ...; prec->oraw = prec->rval; }`
+    /// inside `if (monitor_mask)` (aiRecord.c:461-464): ORAW advances only
+    /// on a cycle that posts VAL.
+    fn take_secondary_value_changes(
+        &mut self,
+        value_mask: crate::server::recgbl::EventMask,
+    ) -> crate::server::record::SecondaryTake {
+        if value_mask.is_empty() {
+            return crate::server::record::SecondaryTake::NONE;
+        }
+        crate::server::record::SecondaryTake::new(
+            u64::from(crate::server::record::SecondaryTake::advance(
+                &mut self.oraw,
+                self.rval,
+            )),
+            false,
+        )
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::server::device_support::Dpvt;
+
+    /// `set_val`'s typed `DOUBLE` store must land what the generic internal
+    /// delivery lands, and every other shape must still reach that owner.
+    /// The bare entry point and the wrapped one are one read, at every SMOO
+    /// boundary and history state (`a_reading_at_smoo_zero_is_history_for_the_filter`).
+    #[test]
+    fn soft_input_read_f64_is_the_wrapped_read() {
+        for smoo in [0.0, 0.5] {
+            for reading in [2.5, f64::NAN, f64::INFINITY] {
+                let (mut bare, mut wrapped) = (AiRecord::new(1.0), AiRecord::new(1.0));
+                let (mut bare_pvt, mut wrapped_pvt) = (Dpvt::default(), Dpvt::default());
+                bare.smoo = smoo;
+                wrapped.smoo = smoo;
+                for _ in 0..3 {
+                    bare.soft_input_read_f64(reading, &mut bare_pvt).unwrap();
+                    wrapped
+                        .soft_input_read(Some(EpicsValue::Double(reading)), &mut wrapped_pvt)
+                        .unwrap();
+                    assert_eq!(bare.val.to_bits(), wrapped.val.to_bits());
+                    assert_eq!(bare_pvt.smooth(), wrapped_pvt.smooth());
+                }
+                bare.soft_input_read(None, &mut bare_pvt).unwrap();
+                wrapped.soft_input_read(None, &mut wrapped_pvt).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn set_val_lands_what_internal_delivery_lands() {
+        for value in [
+            EpicsValue::Double(2.5),
+            EpicsValue::Double(f64::NAN),
+            EpicsValue::Long(7),
+            EpicsValue::String("3.25".into()),
+            EpicsValue::String("x".into()),
+            EpicsValue::DoubleArray(vec![4.5, 9.0].into()),
+            EpicsValue::DoubleArray(Vec::new().into()),
+        ] {
+            let (mut fast, mut slow) = (AiRecord::new(1.0), AiRecord::new(1.0));
+            let stored = fast.set_val(value.clone());
+            let put = crate::server::record::put_field_internal_default(&mut slow, "VAL", value);
+            assert_eq!(format!("{stored:?}"), format!("{put:?}"));
+            assert_eq!(fast.val.to_bits(), slow.val.to_bits());
+        }
+    }
 
     /// ROFF is DBF_ULONG (aiRecord.dbd.pod:442): a client caput of the full
     /// unsigned range stores and reads back as that value (served ULong,
@@ -702,20 +930,18 @@ mod tests {
     /// SPC_LINCONV parity (aiRecord.c:187): writing LINR / EGUF / EGUL re-arms
     /// the INIT phase, so the next process takes the retuned conversion as its
     /// initial condition instead of blending it into the SMOO history. This
-    /// test previously asserted `!rec.init` — the port's inverted "primed" bit —
-    /// and so pinned the polarity C serves on the wire (`INIT = 1` while
-    /// initial). The behaviour it checks is unchanged; the flag it reads is the
-    /// C one. See tests/init_phase.rs for the whole phase.
+    /// C serves `INIT = 1` while initial. See tests/init_phase.rs for the
+    /// whole phase.
     #[test]
     fn linr_put_re_arms_the_init_phase_for_smoothing() {
         let mut rec = AiRecord::default();
-        rec.init = ConvertPhase::Converted; // post-first-process
+        rec.init = 0; // post-first-process
         rec.smoo = 0.5;
 
         rec.put_field("LINR", EpicsValue::Short(2)).unwrap();
 
         assert!(
-            rec.init.is_initial(),
+            rec.init != 0,
             "LINR put re-arms INIT so the next process reprimes SMOO"
         );
     }

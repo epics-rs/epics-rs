@@ -411,7 +411,7 @@ mod tests {
     fn nt_scalar_desc(value_ty: ScalarType) -> FieldDesc {
         FieldDesc::Structure {
             struct_id: NT_SCALAR.to_string(),
-            fields: vec![("value".to_string(), FieldDesc::Scalar(value_ty))],
+            fields: vec![("value".to_string(), FieldDesc::Scalar(value_ty))].into(),
         }
     }
 
@@ -471,10 +471,12 @@ mod tests {
                         fields: vec![
                             ("severity".to_string(), FieldDesc::Scalar(ScalarType::Int)),
                             ("status".to_string(), FieldDesc::Scalar(ScalarType::Int)),
-                        ],
+                        ]
+                        .into(),
                     },
                 ),
-            ],
+            ]
+            .into(),
         }
     }
 
@@ -562,7 +564,7 @@ mod tests {
         // marker — accepted at the nested level just as at the top level.
         let desc = FieldDesc::Structure {
             struct_id: NT_SCALAR.to_string(),
-            fields: vec![("value".to_string(), FieldDesc::Variant)],
+            fields: vec![("value".to_string(), FieldDesc::Variant)].into(),
         };
         let mut s = PvStructure::new(NT_SCALAR);
         s.set("value", PvField::Null);
@@ -574,7 +576,7 @@ mod tests {
         // NTScalarArray<Int>.value = Null would coerce to an empty array.
         let desc = FieldDesc::Structure {
             struct_id: "epics:nt/NTScalarArray:1.0".to_string(),
-            fields: vec![("value".to_string(), FieldDesc::ScalarArray(ScalarType::Int))],
+            fields: vec![("value".to_string(), FieldDesc::ScalarArray(ScalarType::Int))].into(),
         };
         let mut s = PvStructure::new("epics:nt/NTScalarArray:1.0");
         s.set("value", PvField::Null);
@@ -599,10 +601,12 @@ mod tests {
                     "alarm".to_string(),
                     FieldDesc::Structure {
                         struct_id: "alarm_t".to_string(),
-                        fields: vec![("severity".to_string(), FieldDesc::Scalar(ScalarType::Int))],
+                        fields: vec![("severity".to_string(), FieldDesc::Scalar(ScalarType::Int))]
+                            .into(),
                     },
                 ),
-            ],
+            ]
+            .into(),
         };
         let mut alarm = PvStructure::new("alarm_t");
         alarm.set("severity", PvField::Null);
@@ -667,7 +671,7 @@ mod tests {
         let fields = vec![("value".to_string(), FieldDesc::Scalar(ScalarType::Double))];
         let desc = FieldDesc::StructureArray {
             struct_id: "row_t".to_string(),
-            fields: fields.clone(),
+            fields: fields.clone().into(),
         };
         let mut elem = PvStructure::new("row_t");
         elem.set("value", PvField::Scalar(ScalarValue::Int(1)));
@@ -683,7 +687,7 @@ mod tests {
         let fields = vec![("value".to_string(), FieldDesc::Scalar(ScalarType::Int))];
         let desc = FieldDesc::StructureArray {
             struct_id: "row_t".to_string(),
-            fields: fields.clone(),
+            fields: fields.clone().into(),
         };
         let mut elem = PvStructure::new("other_t");
         elem.set("value", PvField::Scalar(ScalarValue::Int(1)));
@@ -702,7 +706,7 @@ mod tests {
         let fields = vec![("value".to_string(), FieldDesc::Scalar(ScalarType::Int))];
         let desc = FieldDesc::StructureArray {
             struct_id: "row_t".to_string(),
-            fields: fields.clone(),
+            fields: fields.clone().into(),
         };
         let mut elem = PvStructure::new("row_t");
         elem.set("value", PvField::Scalar(ScalarValue::Int(1)));
@@ -822,10 +826,12 @@ mod tests {
                         fields: vec![
                             ("severity".to_string(), FieldDesc::Scalar(ScalarType::Int)),
                             ("message".to_string(), FieldDesc::Scalar(ScalarType::String)),
-                        ],
+                        ]
+                        .into(),
                     },
                 ),
-            ],
+            ]
+            .into(),
         }
     }
 

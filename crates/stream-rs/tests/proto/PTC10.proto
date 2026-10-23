@@ -1,0 +1,350 @@
+# Protocol file for the SRS PTC10 Temperature Controller
+
+OutTerminator = CR LF;
+InTerminator = CR LF;
+
+#
+# TODO: replace all the functions to get/set float values with generic ones:
+#
+#  getFloatValue {	
+#  	out "\$1.Value?";
+#  	in "%f" 
+#  }
+#  getFloatValue {	
+#  	out "\$1.Value?";
+#  	in "%f" 
+#  }
+#
+# NOTE: this is the approach used by the PTC10 support at the CAT formerly known as HP by Arun
+
+### Channel functions
+
+#
+getName {
+  out "\$1.Name?";
+  in "%#s";
+}
+
+# Allow the output to be set manally (required to re-enable TEC output)
+setOutputLevel {
+  out "\$1.Value %f";
+}
+
+# OutputLevel (for an output channel) or temperature (for an input channel)
+getOutputLevel {
+  out "\$1?";
+  in "%f";
+}
+
+### TEC input settings
+
+getTecCurrent {
+  out "\$1.Current?";
+  in "%{1 mA|100 \181A|10 \181A|Auto}";
+}
+
+setTecCurrent {
+  out '\$1.Current %{"1 mA"|"100 \181A"|"10 \181A"|Auto}';
+}
+
+getTecSensor {
+  out "\$1.Sensor?";
+  in "%{Therm|RTD|LM135|AD590}";
+}
+
+setTecSensor {
+  out "\$1.Sensor %{Therm|RTD|LM135|AD590}";
+}
+
+getTecUnits {
+  out "\$1.Units?";
+  in "%{\234|V|mA}";
+}
+### TEC output settings
+
+getTecIOtype {
+  out "\$1.IOtype?";
+  in "%{Set out|Meas out}";
+}
+
+# Should the spaces be removed from the options below?
+setTecIOtype {
+  out "\$1.IOtype %{\"Set out\"|\"Meas out\"}";
+}
+
+getTecRange {
+  out "\$1.Range?";
+  in "%{3V 5A|6V 5A|9V 5A|12V 5A|Auto}";
+}
+
+setTecRange {
+  out '\$1.Range %{"3V 5A"|"6V 5A"|"9V 5A"|"12V 5A"|Auto}';
+}
+
+getTecSlew {
+  out "\$1.Slew?";
+  in "%f";
+}
+
+setTecSlew {
+  out "\$1.Slew %f";
+}
+
+# channel.Vmax for TEC monitor (don't see this setting in the controller)
+
+### RTD settings
+
+getRtdSensor {
+  out "\$1.Sensor?";
+  in "%{Diode|ROX|RTD|Thermistor|AD590}";
+}
+
+setRtdSensor {
+  out "\$1.Sensor %{Diode|ROX|RTD|Thermistor|AD590}";
+}
+
+getRtdRange {
+  out "\$1.Range?";
+  in "%{Auto|10\234|30\234|100\234|300\234|1k\234|3k\234|10k\234|30k\234|100k\234|300k\234|2.5V}";
+}
+
+setRtdRange {
+  out "\$1.Range %{Auto|10\234|30\234|100\234|300\234|1k\234|3k\234|10k\234|30k\234|100k\234|300k\234|2.5V}";
+}
+
+getRtdUnits {
+  out "\$1.Units?";
+  in "%{\234|V|mA}";
+}
+
+# Error: 3A.Units is locked and cannot be changed
+#setRtdUnits {
+#  out "\$1.Units %{\234|V|mA}";
+#}
+
+getRtdCurrent {
+  out "\$1.Current?";
+  in "%{Forward|Reverse|AC|Off}";
+}
+
+setRtdCurrent {
+  out "\$1.Current %{Forward|Reverse|AC|Off}";
+}
+
+getRtdPower {
+  out "\$1.Power?";
+  in "%{Auto|Low|High}";
+}
+
+setRtdPower {
+  out "\$1.Power %{Auto|Low|High}";
+}
+
+### Thermocouple settings
+
+getTcSensor {
+  out "\$1.Sensor?";
+  in "%{B|E|J|K|N|R|S|T}";
+}
+
+setTcSensor {
+  out "\$1.Sensor %{B|E|J|K|N|R|S|T}";
+}
+
+### AIO settings
+
+# IO type applies to Analog IO channels
+getIOtype {
+  out "\$1.IOtype?";
+  in "%{Input|Set out|Meas out}";
+}
+
+# IO type applies to Analog IO channels
+setIOtype {
+  out "\$1.IOtype %{Input|\"Set out\"|\"Meas out\"}";
+}
+
+# Off mode applies to output channels
+# it cancels autotuning, turns PID off, and sets output to zero or low limit
+setOff {
+  out "\$1.off";
+}
+
+# Low limit applies to output channels
+getLowLimit {
+  out "\$1.Lowlmt?";
+  in "%f";
+}
+
+# Low limit applies to output channels
+setLowLimit {
+  out "\$1.Lowlmt %f";
+}
+
+# High limit applies to output channels
+getHighLimit {
+  out "\$1.Hilmt?";
+  in "%f";
+}
+
+# High limit applies to output channels
+setHighLimit {
+  out "\$1.Hilmt %f";
+}
+
+# Set point applies to Analog IO channels and TEC output channels
+getSetpoint {
+  out "\$1.pid.Setpoint?";
+  in "%f";
+}
+
+# Set point applies to Analog IO channels and TEC output channels
+setSetpoint {
+  out "\$1.pid.Setpoint %f";
+}
+
+# Ramp rate applies to Analog IO channels and TEC output channels
+getRampRate {
+  out "\$1.pid.Ramp?";
+  in "%f";
+}
+
+# Ramp rate applies to Analog IO channels and TEC output channels
+setRampRate {
+  out "\$1.pid.Ramp %f";
+}
+
+# Ramp temp applies to Analog IO channels and TEC output channels
+getRampTemp {
+  out "\$1.pid.RampT?";
+  in "%f";
+}
+
+# PID Proportional gain applies to Analog IO channels and TEC output channels
+getPidP {
+  out "\$1.pid.P?";
+  in "%f";
+}
+
+# PID Proportional gain applies to Analog IO channels and TEC output channels
+setPidP {
+  out "\$1.pid.P %f";
+}
+
+# PID Integral gain applies to Analog IO channels and TEC output channels
+getPidI {
+  out "\$1.pid.I?";
+  in "%f";
+}
+
+# PID Derivative gain applies to Analog IO channels and TEC output channels
+setPidI {
+  out "\$1.pid.I %f";
+}
+
+# PID Derivative gain applies to Analog IO channels and TEC output channels
+getPidD {
+  out "\$1.pid.D?";
+  in "%f";
+}
+
+# PID Derivative gain applies to Analog IO channels and TEC output channels
+setPidD {
+  out "\$1.pid.D %f";
+}
+
+# PID Input applies to Analog IO channels
+getPidInput {
+  out "\$1.pid.input?";
+  in "%s";
+}
+
+# PID Input applies to Analog IO channels
+setPidInput {
+  out "\$1.pid.input %s";
+}
+
+# PID mode applies to Analog IO channels
+getPidMode {
+  out "\$1.pid.Mode?";
+  in "%{Off|On}";
+}
+
+# PID mode applies to Analog IO channels
+setPidMode {
+  out "\$1.pid.Mode %{Off|On}";
+}
+
+# lag is an integer
+getTuneLag {
+  out "\$1.tune.Lag?";
+  in "%f";
+}
+
+# 
+setTuneLag {
+  out "\$1.tune.Lag %f";
+}
+
+# 
+getTuneStep {
+  out "\$1.tune.StepY?";
+  in "%f";
+}
+
+# 
+setTuneStep {
+  out "\$1.tune.StepY %f";
+}
+
+# 
+getTuneMode {
+  out "\$1.tune.Mode?";
+  in "%{Off|Auto|Step|Relay}";
+}
+
+# 
+setTuneMode {
+  out "\$1.tune.Mode %{Off|Auto|Step|Relay}";
+}
+
+# 
+getTuneType {
+  out "\$1.tune.Type?";
+  in "%{Cons|Moderate|Aggr|Auto}";
+}
+
+# 
+setTuneType {
+  out "\$1.tune.Type %{Cons|Moderate|Aggr|Auto}";
+}
+
+### Controller functions
+
+setOutputEnable  {
+  out "outputEnable %{Off|On}";
+}
+
+getOutputEnable {
+  out "outputEnable?";
+  in "%{Off|On}";
+}
+
+getOutputNames {
+  out "getOutput.names?";
+  in "";
+}
+
+getOutputUnits {
+  out "getOutput.units?";
+  in "";
+}
+
+getOutput {
+  out "getOutput?";
+  in "";
+}
+
+readoutInitial {
+  out "system.com.verbose medium";
+}

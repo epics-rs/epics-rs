@@ -185,34 +185,6 @@ cast and nothing here justifies a difference on one.
 # --------------------------------------------------------------------------
 
 [[deviation]]
-id = "DESIGN-ASYN-BOUT"
-bucket = "DESIGN-DIVERGENCE"
-upstream = "asyn / asynRecord"
-record_types = ["asyn"]
-fields = ["BOUT"]
-surface = ["value_marking"]
-why = """
-asynRecord.dbd declares BOUT as DBF_CHAR special(SPC_DBADDR), a byte array whose
-capacity C fixes at OMAX (initial 80) and whose write length is NOWT (initial
-80). On a C IOC the field is a pre-sized 80-element buffer, so QSRV2 serves it
-zero-filled at init: pvxget reads back epicsInt8_t[80] = {0,0,...} before
-anything is written. The port declines to pre-size: it lifts the fixed 80-byte
-OMAX cap and serves the ACTUAL written content, so an unwritten BOUT reads back
-as an empty epicsInt8_t[0]. This is an intentional design choice, not a C-bug
-refusal and not a port defect — the 80-element cap was a static asynRecord.dbd
-sizing detail, and the port models the field as a live-length array instead.
-There is no CBUG here: nothing on the C side is wrong, the two just made
-different, defensible sizing decisions.
-
-Matched on the PVA value/marking contract (pvxget), scoped to exactly asyn.BOUT.
-The scope is field-level, so this row justifies only the BOUT length/content
-difference and cannot launder a diff on any other asyn channel.
-
-Expect: on ORACLE:ASYN.BOUT the C softIocPVX serves int8[]{80} (zero-filled to
-the OMAX cap) and the port serves int8[]{0} (empty until written).
-"""
-
-[[deviation]]
 id = "DESIGN-SCALCOUT-PREV-STRING-SCALAR"
 bucket = "DESIGN-DIVERGENCE"
 upstream = "calc / sCalcoutRecord (epics-modules/calc#42)"
@@ -389,6 +361,30 @@ created alarms on both paths, an EMPTY range (which is what an unconfigured
 record has) alarms on neither — and the residue is exactly C's dead-code/sticky
 split, which is what this row exists to allowlist. Those 10 SGNL cases are its
 live scope.
+"""
+
+[[deviation]]
+id = "CBUG-F12-MONITOR"
+bucket = "NOT-REPRODUCED"
+upstream = "epics-base / histogram"
+record_types = ["histogram"]
+fields = ["VAL"]
+surface = ["event_count", "update_events"]
+classes = ["scanned"]
+why = """
+CBUG-F12 on the PVA monitor surface. A bare histogram has LLIM == ULIM == 0, so
+every process takes add_count's direct stat=SOFT/sevr=INVALID write
+(histogramRecord.c:329-332); monitor's recGblResetAlarms resets it to NO_ALARM
+and reports a transition (:284), and db_post_events posts VAL with DBE_ALARM
+(:293-294) while the alarm a client sees stays 0/0. C therefore posts one event
+per process with nothing changed. The port raises no alarm on an empty range
+(CBUG-F12) and posts only what changed.
+
+Scoped to the pva-monitor scanned reproducer, the one case that processes a
+histogram: its VAL put does not process the record, so the passive case agrees.
+Expect: driven 1,2,2,3 with a harness-posted scan after each put, softIocPVX
+posts 8 updates (each put, and an alarm event per scan) and the port 5 (each
+put, and the first scan clearing UDF).
 """
 
 # --------------------------------------------------------------------------

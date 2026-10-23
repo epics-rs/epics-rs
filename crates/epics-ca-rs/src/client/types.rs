@@ -6,7 +6,7 @@ use std::time::Instant;
 use dashmap::DashMap;
 use epics_base_rs::error::{CaError, CaResult};
 use epics_base_rs::runtime::sync::{mpsc, oneshot};
-use epics_base_rs::types::{DbFieldType, EpicsValue};
+use epics_base_rs::types::{DbFieldType, EpicsValue, PvString};
 
 use crate::channel::AccessRights;
 use crate::client::state::ChannelState;
@@ -225,9 +225,10 @@ impl CaOp {
 #[non_exhaustive]
 pub struct CaException {
     pub kind: CaExceptionKind,
-    pub message: String,
+    /// C's `pCtx`: the bytes the server or libca put there.
+    pub message: Vec<u8>,
     pub server_addr: Option<SocketAddr>,
-    pub pv_name: Option<String>,
+    pub pv_name: Option<PvString>,
     /// ECA status code when applicable (server-error path).
     pub status: Option<u32>,
     /// Which operation failed. libca puts this in `exception_handler_args.op`
@@ -280,14 +281,19 @@ pub enum ExceptionSite {
 /// for an address with no PTR record: the dotted address with its port
 /// (`ipAddrToA`, `osiSock.c:97-99`). A caller can therefore never tell the two
 /// configurations apart by the *shape* of what it gets back.
-pub(crate) fn peer_display_name(addr: SocketAddr) -> String {
+/// The first `max` bytes, as C's fixed buffers and `%.Ns` keep them.
+fn c_prefix(s: &[u8], max: usize) -> &[u8] {
+    &s[..s.len().min(max)]
+}
+
+pub(crate) fn peer_display_name(addr: SocketAddr) -> Vec<u8> {
     #[cfg(feature = "client")]
     {
         crate::hostname::cached_name(addr)
     }
     #[cfg(not(feature = "client"))]
     {
-        addr.to_string()
+        addr.to_string().into_bytes()
     }
 }
 
@@ -295,23 +301,22 @@ pub(crate) fn peer_display_name(addr: SocketAddr) -> String {
 /// waits for the resolver instead of reading the cache
 /// (`CaChannel::host_name`, libca `ca_host_name`).
 ///
-/// The blocking pool comes from the seam, not from `tokio::task`: this future
-/// is polled by whichever executor the client runs on, and under
-/// `exec_backend` that is a callback-band worker with no ambient tokio
-/// runtime, where `tokio::task::spawn_blocking` panics from inside itself.
-pub(crate) async fn peer_resolved_name(addr: SocketAddr) -> String {
+/// It runs on `hostname::NAME_LOOKUP`, behind any queued cache lookups, so a
+/// dead resolver holds the name thread and not the shared blocking pool.
+pub(crate) async fn peer_resolved_name(addr: SocketAddr) -> Vec<u8> {
     #[cfg(feature = "client")]
     {
-        epics_base_rs::runtime::task::spawn_blocking(move || crate::hostname::ip_addr_to_a(addr))
-            .await
-            // A join failure is a runtime shutdown, not a channel error, and
-            // C's `ipAddrToA` has a well-defined answer for "no name": the
-            // dotted IP. Give that rather than failing a connected channel.
-            .unwrap_or_else(|_| addr.to_string())
+        match crate::hostname::NAME_LOOKUP.run(move || crate::hostname::ip_addr_to_a(addr)) {
+            Ok(job) => job.await,
+            // No thread to resolve on, and C's `ipAddrToA` has a well-defined
+            // answer for "no name": the dotted IP. Give that rather than
+            // failing a connected channel.
+            Err(_) => addr.to_string().into_bytes(),
+        }
     }
     #[cfg(not(feature = "client"))]
     {
-        addr.to_string()
+        addr.to_string().into_bytes()
     }
 }
 
@@ -369,7 +374,8 @@ pub(crate) const LIBCA_MULTIPLY_DEFINED_SITE: ExceptionSite = ExceptionSite::At(
 pub(crate) fn circuit_disconnect_exception(server_addr: SocketAddr) -> CaException {
     CaException {
         kind: CaExceptionKind::ServerError,
-        message: peer_display_name(server_addr),
+        // `char hostNameTmp[64]` (cac.cpp:1239).
+        message: c_prefix(&peer_display_name(server_addr), 63).to_vec(),
         server_addr: Some(server_addr),
         pv_name: None,
         status: Some(crate::protocol::ECA_DISCONN),
@@ -392,7 +398,8 @@ pub(crate) fn circuit_disconnect_exception(server_addr: SocketAddr) -> CaExcepti
 pub(crate) fn unresponsive_circuit_exception(server_addr: SocketAddr) -> CaException {
     CaException {
         kind: CaExceptionKind::ServerError,
-        message: peer_display_name(server_addr),
+        // `char hostNameTmp[128]` (tcpiiu.cpp:923).
+        message: c_prefix(&peer_display_name(server_addr), 127).to_vec(),
         server_addr: Some(server_addr),
         pv_name: None,
         status: Some(crate::protocol::ECA_UNRESPTMO),
@@ -409,13 +416,22 @@ pub(crate) fn unresponsive_circuit_exception(server_addr: SocketAddr) -> CaExcep
 /// channel) overload, so the text prints verbatim — but it goes through
 /// `exception(…, __FILE__, __LINE__)`, so the `Source File:` line is there.
 pub(crate) fn multiply_defined_pv_exception(
-    pv_name: String,
+    pv_name: PvString,
     accepted: SocketAddr,
     ignored: SocketAddr,
 ) -> CaException {
     CaException {
         kind: CaExceptionKind::ServerError,
-        message: format!("Channel: \"{pv_name}\", Connecting to: {accepted}, Ignored: {ignored}"),
+        // `"Channel: \"%.64s\", Connecting to: %.64s, Ignored: %.64s"`.
+        message: [
+            b"Channel: \"".as_slice(),
+            c_prefix(pv_name.as_bytes(), 64),
+            b"\", Connecting to: ",
+            c_prefix(accepted.to_string().as_bytes(), 64),
+            b", Ignored: ",
+            c_prefix(ignored.to_string().as_bytes(), 64),
+        ]
+        .concat(),
         server_addr: Some(ignored),
         pv_name: Some(pv_name),
         status: Some(crate::protocol::ECA_DBLCHNL),
@@ -481,14 +497,14 @@ pub(crate) fn print_default_exception(exc: &CaException) {
 
     if let Some(block) = render_default_exception(exc, &exception_timestamp()) {
         // One `write_all`: two exceptions racing must not interleave mid-block.
-        let _ = std::io::stderr().write_all(block.as_bytes());
+        let _ = epics_libcom_rs::runtime::log::StagedStderr.write_all(&block);
     }
 }
 
 /// The block itself, split out from the stderr write so the exact C text is
 /// testable. `None` means C prints nothing for this exception.
-pub(crate) fn render_default_exception(exc: &CaException, now: &str) -> Option<String> {
-    use std::fmt::Write as _;
+pub(crate) fn render_default_exception(exc: &CaException, now: &str) -> Option<Vec<u8>> {
+    use std::io::Write as _;
 
     // `CA_PROTO_SERVER_DISCONN` never reaches libca's `vSignal`: it goes to
     // `cac::verifyAndDisconnectChan` and out through the channel's connection
@@ -508,19 +524,23 @@ pub(crate) fn render_default_exception(exc: &CaException, now: &str) -> Option<S
     let status = exc.status.unwrap_or(crate::protocol::ECA_INTERNAL);
     let severity = SEVERITY[(crate::protocol::eca_severity(status) & 0x7) as usize];
 
-    let mut block = String::with_capacity(320);
-    block.push_str("CA.Client.Exception...............................................\n");
+    let mut block = Vec::with_capacity(320);
+    block
+        .extend_from_slice(b"CA.Client.Exception...............................................\n");
     let _ = writeln!(
         block,
         "    {severity}: \"{}\"",
         crate::protocol::eca_message(status)
     );
-    let _ = writeln!(block, "    Context: \"{}\"", exception_context(exc));
+    block.extend_from_slice(b"    Context: \"");
+    write_exception_context(&mut block, exc);
+    block.extend_from_slice(b"\"\n");
     if let ExceptionSite::At(file, line) = exc.source {
         let _ = writeln!(block, "    Source File: {file} line {line}");
     }
     let _ = writeln!(block, "    Current Time: {now}");
-    block.push_str("..................................................................\n");
+    block
+        .extend_from_slice(b"..................................................................\n");
     Some(block)
 }
 
@@ -536,16 +556,24 @@ pub(crate) fn render_default_exception(exc: &CaException, now: &str) -> Option<S
 ///
 /// `data_type` is the discriminator because it is set only where libca has a
 /// `caHdrLargeArray` to take it from — a channel exception.
-fn exception_context(exc: &CaException) -> String {
+/// `channel=%s` is the name's bytes.
+fn write_exception_context(out: &mut Vec<u8>, exc: &CaException) {
+    use std::io::Write as _;
+
     match (&exc.pv_name, exc.data_type) {
-        (Some(pv), Some(dbr)) => format!(
-            "op={}, channel={pv}, type={}, count={}, ctx=\"{}\"",
-            exc.op.code(),
-            epics_base_rs::types::dbr_type_to_text(dbr),
-            exc.count.unwrap_or(0),
-            exc.message,
-        ),
-        _ => exc.message.clone(),
+        (Some(pv), Some(dbr)) => {
+            let _ = write!(out, "op={}, channel=", exc.op.code());
+            out.extend_from_slice(pv.as_bytes());
+            let _ = write!(
+                out,
+                ", type={}, count={}, ctx=\"",
+                epics_base_rs::types::dbr_type_to_text(dbr),
+                exc.count.unwrap_or(0),
+            );
+            out.extend_from_slice(&exc.message);
+            out.push(b'"');
+        }
+        _ => out.extend_from_slice(&exc.message),
     }
 }
 
@@ -565,28 +593,51 @@ fn exception_timestamp() -> String {
 /// User and host names advertised to servers on every CA virtual-circuit
 /// handshake (`CA_PROTO_CLIENT_NAME` / `CA_PROTO_HOST_NAME`).
 ///
-/// libca resolves these once at context creation — user from `$USER`
-/// (then `$USERNAME` on Windows), host from the local hostname — and the
+/// libca resolves these once at context creation — user from
+/// `osiGetUserName` (`cac.cpp:176`), host from the local hostname — and the
 /// `tcpiiu` constructor (`tcpiiu.cpp:755-762`) queues them on every new
 /// circuit. This port keeps them in a shared slot instead so the names
 /// can be overridden at runtime; the handshake builder reads the slot
 /// rather than the environment.
 #[derive(Clone, Debug)]
 pub(crate) struct ClientIdentity {
-    pub(crate) user: String,
-    pub(crate) host: String,
+    /// The passwd name's bytes, sent as they are.
+    pub(crate) user: Vec<u8>,
+    /// libca `localHostName`'s bytes, sent as they are.
+    pub(crate) host: Vec<u8>,
 }
 
 impl ClientIdentity {
-    /// Resolve the identity from the environment the way libca does:
-    /// user from `$USER` falling back to `$USERNAME`, host from the
-    /// local hostname.
-    pub(crate) fn from_env() -> Self {
-        let user = epics_base_rs::runtime::env::get("USER")
-            .or_else(|| epics_base_rs::runtime::env::get("USERNAME"))
-            .unwrap_or_else(|| "unknown".to_string());
-        let host = epics_base_rs::runtime::env::hostname();
-        Self { user, host }
+    /// Resolve the identity the way libca does; a failed
+    /// `osiGetUserName` is an empty name (`cac.cpp:177-178`).
+    pub(crate) fn from_os() -> Self {
+        Self::resolve(
+            epics_base_rs::runtime::env::user_name(),
+            epics_base_rs::runtime::env::ca_local_host_name(),
+        )
+    }
+
+    fn resolve(user: Option<Vec<u8>>, host: Vec<u8>) -> Self {
+        Self {
+            user: user.unwrap_or_default(),
+            host,
+        }
+    }
+}
+
+#[cfg(test)]
+mod client_identity_tests {
+    use super::ClientIdentity;
+
+    /// `cac.cpp:176-178`: a failed `osiGetUserName` sends an empty name, not
+    /// pvxs's `nobody`.
+    #[test]
+    fn a_failed_user_name_is_empty() {
+        assert_eq!(ClientIdentity::resolve(None, b"h".to_vec()).user, b"");
+        assert_eq!(
+            ClientIdentity::resolve(Some(b"op\xff".to_vec()), b"h".to_vec()).user,
+            b"op\xff"
+        );
     }
 }
 
@@ -729,7 +780,7 @@ pub(crate) struct InFlightOps {
     /// `m_available`, and a circuit answers in order, so it is a fence and
     /// not a delay), `CA_PROTO_SERVER_DISCONN`, or a `DropChannel` that
     /// sent no CLEAR_CHANNEL because the channel was not operational.
-    pub(crate) write_identities: Arc<DashMap<u32, Arc<str>>>,
+    pub(crate) write_identities: Arc<DashMap<u32, Arc<[u8]>>>,
     /// monotonic `ioid` source owned by the same registry
     /// that holds the live ids. Keeping the counter here (rather than
     /// a process-global static) lets [`Self::alloc_ioid`] probe
@@ -855,12 +906,17 @@ impl CidAllocator {
 mod default_exception_tests {
     use super::*;
 
+    fn render_default_exception(exc: &CaException, now: &str) -> Option<String> {
+        super::render_default_exception(exc, now)
+            .map(|b| String::from_utf8(b).expect("a UTF-8 block"))
+    }
+
     fn put_failed() -> CaException {
         CaException {
             kind: CaExceptionKind::ServerError,
-            message: "TST:LO".to_string(),
+            message: b"TST:LO".to_vec(),
             server_addr: Some("127.0.0.1:5064".parse().unwrap()),
-            pv_name: Some("TST:LO".to_string()),
+            pv_name: Some("TST:LO".into()),
             status: Some(crate::protocol::ECA_PUTFAIL),
             op: CaOp::Put,
             data_type: Some(0), // DBR_STRING
@@ -889,6 +945,93 @@ mod default_exception_tests {
         );
     }
 
+    /// libca prints `channel=%s` from the channel's name bytes.
+    #[test]
+    fn a_non_utf8_channel_name_is_printed_as_its_bytes() {
+        let mut exc = put_failed();
+        exc.pv_name = Some(PvString::from(b"TST:\xff".as_slice()));
+        let got = super::render_default_exception(&exc, "T").expect("a block");
+        let needle = b"channel=TST:\xff, type=DBR_STRING";
+        assert!(got.windows(needle.len()).any(|w| w == needle));
+    }
+
+    /// `Channel: "%.64s"` copies the name's bytes into the DBLCHNL context.
+    #[test]
+    fn a_multiply_defined_non_utf8_name_is_printed_as_its_bytes() {
+        let exc = multiply_defined_pv_exception(
+            PvString::from(b"TST:\xff".as_slice()),
+            "127.0.0.1:15064".parse().unwrap(),
+            "127.0.0.1:15065".parse().unwrap(),
+        );
+        assert!(exc.message.starts_with(b"Channel: \"TST:\xff\", "));
+    }
+
+    /// The server's diagnostic is C's `pCtx`: `ctx=%.400s` and the
+    /// channel-write `ctx="%s"` both print its bytes.
+    #[test]
+    fn a_non_utf8_server_diagnostic_reaches_the_exception_as_its_bytes() {
+        let got = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let sink = got.clone();
+        let slot: CaExceptionSlot = Arc::new(parking_lot::RwLock::new(Some(Arc::new(
+            move |exc: &CaException| sink.lock().push(exc.message.clone()),
+        ))));
+        for cmd in [
+            crate::protocol::CA_PROTO_WRITE,
+            crate::protocol::CA_PROTO_SEARCH,
+        ] {
+            raise_server_exception(
+                &slot,
+                ServerErrorFrame {
+                    eca_status: crate::protocol::ECA_PUTFAIL,
+                    original_request: cmd,
+                    message: b"bad\xff".to_vec(),
+                    server_addr: "127.0.0.1:5064".parse().unwrap(),
+                    data_type: 0,
+                    count: 1,
+                    pv_name: None,
+                },
+            );
+        }
+        let got = got.lock();
+        assert_eq!(got[0], b"bad\xff");
+        assert!(got[1].starts_with(b"host=") && got[1].ends_with(b" ctx=bad\xff"));
+    }
+
+    /// C cuts each context by bytes: `%.64s` for the DBLCHNL name and
+    /// `%.400s` for the server's diagnostic.
+    #[test]
+    fn contexts_are_cut_at_c_s_byte_widths() {
+        let name = [b'n'; 70];
+        let exc = multiply_defined_pv_exception(
+            PvString::from(name.as_slice()),
+            "127.0.0.1:15064".parse().unwrap(),
+            "127.0.0.1:15065".parse().unwrap(),
+        );
+        let want = [b"Channel: \"".as_slice(), &name[..64], b"\", Connecting"].concat();
+        assert!(exc.message.starts_with(&want));
+
+        let got = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let sink = got.clone();
+        let slot: CaExceptionSlot = Arc::new(parking_lot::RwLock::new(Some(Arc::new(
+            move |exc: &CaException| sink.lock().push(exc.message.clone()),
+        ))));
+        let diag: Vec<u8> = (0..450).map(|i| b'a' + (i % 26) as u8).collect();
+        raise_server_exception(
+            &slot,
+            ServerErrorFrame {
+                eca_status: crate::protocol::ECA_PUTFAIL,
+                original_request: crate::protocol::CA_PROTO_SEARCH,
+                message: diag.clone(),
+                server_addr: "127.0.0.1:5064".parse().unwrap(),
+                data_type: 0,
+                count: 1,
+                pv_name: None,
+            },
+        );
+        let got = got.lock();
+        assert!(got[0].ends_with(&[b" ctx=".as_slice(), &diag[..400]].concat()));
+    }
+
     /// R18-20: the ECA_UNRESPTMO block. `tcpiiu::unresponsiveCircuitNotify`
     /// (`tcpiiu.cpp:922-926`) passes `getHostName()` — the resolved peer name,
     /// nothing else — as the whole context, and reaches `vSignal` through
@@ -900,7 +1043,7 @@ mod default_exception_tests {
     fn an_unresponsive_circuit_renders_c_s_eca_unresptmo_block() {
         let addr: SocketAddr = "127.0.0.1:15064".parse().unwrap();
         let mut exc = unresponsive_circuit_exception(addr);
-        exc.message = "localhost:15064".to_string();
+        exc.message = b"localhost:15064".to_vec();
         let got = render_default_exception(&exc, "Mon Jul 13 2026 20:57:51.950625115")
             .expect("C prints a block when a circuit stops answering echoes");
         assert_eq!(
@@ -923,7 +1066,7 @@ mod default_exception_tests {
     #[test]
     fn a_multiply_defined_pv_renders_c_s_eca_dblchnl_block() {
         let exc = multiply_defined_pv_exception(
-            "TST:AI".to_string(),
+            "TST:AI".into(),
             "127.0.0.1:15064".parse().unwrap(),
             "127.0.0.1:15065".parse().unwrap(),
         );
@@ -952,7 +1095,7 @@ mod default_exception_tests {
         let mut exc = circuit_disconnect_exception(addr);
         // `cached_name` resolves asynchronously; pin the name the live C run
         // printed so the test asserts the block, not the resolver.
-        exc.message = "localhost:15064".to_string();
+        exc.message = b"localhost:15064".to_vec();
         let got = render_default_exception(&exc, "Mon Jul 13 2026 20:57:51.950625115")
             .expect("C prints a block when a circuit with channels dies");
         assert_eq!(
@@ -988,7 +1131,7 @@ mod default_exception_tests {
     fn a_non_channel_exception_prints_the_bare_context() {
         let exc = CaException {
             kind: CaExceptionKind::ServerError,
-            message: "host=127.0.0.1:5064 ctx=whatever".to_string(),
+            message: b"host=127.0.0.1:5064 ctx=whatever".to_vec(),
             server_addr: Some("127.0.0.1:5064".parse().unwrap()),
             pv_name: None,
             status: Some(crate::protocol::ECA_BADMASK),
@@ -1011,9 +1154,9 @@ mod default_exception_tests {
     fn a_server_disconnect_prints_nothing() {
         let exc = CaException {
             kind: CaExceptionKind::ServerDisconnect,
-            message: "server-initiated channel close".to_string(),
+            message: b"server-initiated channel close".to_vec(),
             server_addr: None,
-            pv_name: Some("TST:LO".to_string()),
+            pv_name: Some("TST:LO".into()),
             status: None,
             op: CaOp::Other,
             data_type: None,
@@ -1137,7 +1280,7 @@ pub(crate) enum SearchRequest {
     /// Schedule a PV for searching.
     Schedule {
         cid: u32,
-        pv_name: String,
+        pv_name: PvString,
         reason: SearchReason,
     },
     /// Cancel searching for a PV (channel dropped or connected).
@@ -1200,7 +1343,7 @@ pub(crate) enum SearchResponse {
     /// matching libca's `pvMultiplyDefinedNotify` → `this->exception`
     /// path.
     MultiplyDefined {
-        pv_name: String,
+        pv_name: PvString,
         prev_addr: SocketAddr,
         new_addr: SocketAddr,
     },
@@ -1211,7 +1354,7 @@ pub(crate) enum SearchResponse {
 pub(crate) enum TransportCommand {
     CreateChannel {
         cid: u32,
-        pv_name: String,
+        pv_name: PvString,
         server_addr: SocketAddr,
         priority: u8,
     },
@@ -1420,7 +1563,7 @@ pub(crate) struct ServerErrorFrame {
     /// to carry the echo ends the circuit at the decoder
     /// (`transport::EchoedRequest::parse`, C `cac.cpp:1082-1101`).
     pub(crate) original_request: u16,
-    pub(crate) message: String,
+    pub(crate) message: Vec<u8>,
     pub(crate) server_addr: SocketAddr,
     /// DBR type and element count of the echoed request header — libca's
     /// `hdr.m_dataType` / `hdr.m_count`, which the exception block prints.
@@ -1431,7 +1574,7 @@ pub(crate) struct ServerErrorFrame {
     /// carries. Resolved on the circuit that owns the request, so the
     /// identity of a request that already failed does not depend on whether
     /// its channel is still open.
-    pub(crate) pv_name: Option<Arc<str>>,
+    pub(crate) pv_name: Option<Arc<[u8]>>,
 }
 
 pub(crate) fn raise_server_exception(slot: &CaExceptionSlot, err: ServerErrorFrame) {
@@ -1476,7 +1619,7 @@ pub(crate) fn raise_server_exception(slot: &CaExceptionSlot, err: ServerErrorFra
     let pv_name = is_channel_exception
         .then_some(pv_name)
         .flatten()
-        .map(|n| n.to_string());
+        .map(|n| PvString::from(&*n));
     // `cac::defaultExcep` folds the host into the ctx text itself
     // (`host=%s ctx=%.400s`, `cac.cpp:1006-1016`) before raising; the channel
     // path passes the server's diagnostic through untouched. `message` stays
@@ -1492,10 +1635,14 @@ pub(crate) fn raise_server_exception(slot: &CaExceptionSlot, err: ServerErrorFra
     let message = if is_channel_exception {
         message
     } else {
-        format!(
-            "host={host} ctx={message}",
-            host = peer_display_name(server_addr)
-        )
+        // `char hostName[64]` and `"host=%s ctx=%.400s"`.
+        [
+            b"host=".as_slice(),
+            c_prefix(&peer_display_name(server_addr), 63),
+            b" ctx=",
+            c_prefix(&message, 400),
+        ]
+        .concat()
     };
     dispatch_exception(
         slot,
@@ -1519,4 +1666,18 @@ pub(crate) fn raise_server_exception(slot: &CaExceptionSlot, err: ServerErrorFra
             },
         },
     );
+}
+
+#[cfg(all(test, not(epics_embedded_target)))]
+mod peer_name_tests {
+    use super::*;
+
+    /// `ca_host_name`'s blocking lookup is a name lookup too: it runs on
+    /// `hostname::NAME_LOOKUP`, not the shared blocking pool.
+    #[epics_macros_rs::epics_test]
+    async fn peer_resolved_name_runs_on_the_name_thread() {
+        let a: SocketAddr = "192.0.2.9:5064".parse().unwrap();
+        assert_eq!(peer_resolved_name(a).await, b"192.0.2.9:5064");
+        assert_eq!(crate::hostname::NAME_LOOKUP.worker_count(), 1);
+    }
 }

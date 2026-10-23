@@ -43,7 +43,7 @@
 //! This port keeps that shape exactly, because it is also what makes the
 //! suspension legal here. Record processing below
 //! `PvDatabase::process_record_with_links` is a *synchronous* recursion —
-//! `process_record_with_links_recursive` runs the FLNK/OUT chain as plain calls
+//! `process_record_with_links_recursive_at` runs the FLNK/OUT chain as plain calls
 //! inside the entry record's gate-held region and must not suspend — so a
 //! mid-chain stop cannot be an `.await`; it can only be a parked thread.
 //! Parking a runtime worker would be unacceptable, so the chain runs on the
@@ -63,9 +63,12 @@
 //! nobody is debugging pays one relaxed atomic load where C pays one
 //! comparison.
 
+use crate::runtime::sync::EpicsEvent;
+use crate::types::RecordName;
+use epics_libcom_rs::cfmt::CFloat;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
 use super::PvDatabase;
@@ -92,7 +95,7 @@ const MAX_EP_COUNT: u64 = 99_999;
 /// and how long it has been known.
 #[derive(Debug, Clone)]
 struct EntryPoint {
-    name: String,
+    name: RecordName,
     /// C `pqe->count`.
     count: u64,
     /// C `pqe->time`, stamped when the entry point is first logged.
@@ -124,13 +127,13 @@ struct LockSet {
     /// C `pnode->precord` — where execution is currently stopped, if it is.
     /// Cleared by the continuation thread after a queue pass (`:615`), never
     /// by `dbc`/`dbs`, exactly as in C.
-    stopped_at: Option<String>,
+    stopped_at: Option<RecordName>,
     /// C `pnode->current_ep` — the entry point the stopped record was reached
     /// through, named in the "within Entrypoint" half of the stop message.
-    current_ep: Option<String>,
+    current_ep: Option<RecordName>,
     /// C `pnode->bp_list`, in insertion order: `dbstat` prints it in that
     /// order and `dbd` removes by identity.
-    breakpoints: Vec<String>,
+    breakpoints: Vec<RecordName>,
     /// C `pnode->ep_queue`.
     ep_queue: Vec<EntryPoint>,
     /// C `pnode->step` — stop at the next record, not just at a breakpoint.
@@ -148,36 +151,10 @@ struct LockSet {
     cont: Option<Arc<AtomicU64>>,
     /// C `pnode->ex_sem`, the execution semaphore: signalled when an entry
     /// point is scheduled, and by `dbd` when the last breakpoint goes so the
-    /// thread wakes to find its loop condition false.
-    ex: Arc<BinarySemaphore>,
-}
-
-/// C `epicsEventCreate(epicsEventEmpty)` — a binary semaphore. Signalling one
-/// that is already full is a no-op, and that idempotence is load-bearing: C
-/// signals `ex_sem` once per scheduling and the continuation task answers by
-/// walking the whole queue, so two signals before one pass must not produce
-/// two passes.
-#[derive(Default)]
-struct BinarySemaphore {
-    full: Mutex<bool>,
-    cv: Condvar,
-}
-
-impl BinarySemaphore {
-    fn signal(&self) {
-        let mut full = self.full.lock().expect("breakpoint semaphore poisoned");
-        *full = true;
-        self.cv.notify_one();
-    }
-
-    /// C `epicsEventMustWait`.
-    fn wait(&self) {
-        let mut full = self.full.lock().expect("breakpoint semaphore poisoned");
-        while !*full {
-            full = self.cv.wait(full).expect("breakpoint semaphore poisoned");
-        }
-        *full = false;
-    }
+    /// thread wakes to find its loop condition false. That it is binary is
+    /// load-bearing: one pass walks the whole queue, so two signals before
+    /// it must not make two passes.
+    ex: Arc<EpicsEvent>,
 }
 
 /// C `epicsThreadResume(pnode->taskid)` — what `dbc` (`dbBkpt.c:518`), `dbs`
@@ -215,7 +192,7 @@ pub struct BreakpointTable {
     /// module owes nothing to an output channel and stays testable without
     /// one. `None` until then, and an auto-print is silently skipped, which is
     /// also what C does before `iocInit` wires `dbpr`.
-    printer: Mutex<Option<Arc<dyn Fn(&str) + Send + Sync>>>,
+    printer: Mutex<Option<Arc<dyn Fn(&[u8]) + Send + Sync>>>,
 }
 
 #[derive(Default)]
@@ -280,7 +257,7 @@ pub enum StatLine {
     /// C `dbBkpt.c:906-907` (stopped) and `:918-919` (not).
     LockSet {
         id: u64,
-        stopped_at: Option<String>,
+        stopped_at: Option<RecordName>,
         breakpoint_count: usize,
         task: Option<u64>,
     },
@@ -289,12 +266,12 @@ pub enum StatLine {
     /// a rate. The column heading and the value disagree in C; reproducing the
     /// value is what functional equivalence means here.
     Entrypoint {
-        name: String,
+        name: RecordName,
         count: u64,
         elapsed_secs: f64,
     },
     /// C `:927-935`.
-    Breakpoint { name: String, autoprint: bool },
+    Breakpoint { name: RecordName, autoprint: bool },
 }
 
 impl StatLine {
@@ -328,7 +305,9 @@ impl StatLine {
                 elapsed_secs,
             } => format!(
                 "             Entrypoint: {:<28.28}  #C: {:05}  C/S: {:7.1}",
-                name, count, elapsed_secs
+                name,
+                count,
+                CFloat(*elapsed_secs)
             ),
             Self::Breakpoint { name, autoprint } => format!(
                 "             Breakpoint: {:<28.28}{}",
@@ -357,15 +336,17 @@ fn render_task(task: Option<u64>) -> String {
 /// `lockRecord` until `dbLockInitRecords` runs, so in C every use of this
 /// before `iocInit` is undefined. Here it is an absent identity, and the
 /// callers refuse rather than invent one.
-fn lockset_id(db: &PvDatabase, record: &str) -> Option<u64> {
+fn lockset_id(db: &PvDatabase, record: &[u8]) -> Option<u64> {
     let name = canonical_record_name(db, record)?;
     db.lock_set_of(&name).map(|set| set.id)
 }
 
 /// The canonical name of `name`, or `None` when no such record exists.
 /// C's `dbNameToAddr` half of every command's preamble.
-fn canonical_record_name(db: &PvDatabase, name: &str) -> Option<String> {
-    let name = db.resolve_alias(name).unwrap_or_else(|| name.to_string());
+fn canonical_record_name(db: &PvDatabase, name: &[u8]) -> Option<RecordName> {
+    let name = db
+        .resolve_alias(name)
+        .unwrap_or_else(|| RecordName::from(name));
     db.get_record_no_resolve(&name).map(|_| name)
 }
 
@@ -380,7 +361,7 @@ impl BreakpointTable {
     /// Install what `dbPrint` prints with. Idempotent by last-writer-wins;
     /// `dbb` calls it on every invocation so a bridge captured by a later
     /// shell replaces one whose runtime has gone.
-    pub fn set_printer(&self, printer: Arc<dyn Fn(&str) + Send + Sync>) {
+    pub fn set_printer(&self, printer: Arc<dyn Fn(&[u8]) + Send + Sync>) {
         *self.printer.lock().expect("breakpoint printer poisoned") = Some(printer);
     }
 
@@ -403,7 +384,7 @@ impl BreakpointTable {
     /// `:672-675`. In particular `pact` is checked *after* entry-point
     /// queuing, so the entry-point statistics `dbstat` reports count an async
     /// record's cycles rather than only its completions (C `:754-758`).
-    pub fn before_process(&self, db: &PvDatabase, record: &str) -> Before {
+    pub fn before_process(&self, db: &PvDatabase, record: &[u8]) -> Before {
         let Some(rec) = db.get_record(record) else {
             return Before::Run;
         };
@@ -463,11 +444,18 @@ impl BreakpointTable {
             if !stack.sets[idx].step {
                 return Before::Run;
             }
-            stack.sets[idx].stopped_at = Some(record.to_string());
+            stack.sets[idx].stopped_at = Some(RecordName::from(record));
             // C `:778-780` prints the stop banner with the entry point it was
             // reached through, then leaves the `-> ` prompt hanging.
-            let ep = stack.sets[idx].current_ep.clone().unwrap_or_default();
-            println!("\n   BKPT> Stopped at:  {record}  within Entrypoint:  {ep}\n-> ");
+            let ep = stack.sets[idx]
+                .current_ep
+                .as_ref()
+                .map(|n| n.to_str_lossy().into_owned())
+                .unwrap_or_default();
+            println!(
+                "\n   BKPT> Stopped at:  {}  within Entrypoint:  {ep}\n-> ",
+                String::from_utf8_lossy(record)
+            );
             // C `:786-787` — the stopped lock set becomes the default for a
             // `dbc`/`dbs` with no argument.
             let node = stack.sets.remove(idx).expect("index just used");
@@ -480,7 +468,7 @@ impl BreakpointTable {
         // of the set still process while one is stopped. The thread marks
         // itself suspended here and nowhere else, so what
         // `epicsThreadShowAll` reports is this call, not a flag beside it.
-        rec.lock_record().unheld(crate::runtime::task::suspend_self);
+        rec.unheld(crate::runtime::task::suspend_self);
         Before::Run
     }
 
@@ -488,7 +476,7 @@ impl BreakpointTable {
     ///
     /// Prints the record at interest level 2 through the installed printer,
     /// C's `dbpr(precord->name, 2)`.
-    pub fn after_process(&self, db: &PvDatabase, record: &str) {
+    pub fn after_process(&self, db: &PvDatabase, record: &[u8]) {
         if record_bkpt(db, record) & BKPT_PRINT_MASK == 0 {
             return;
         }
@@ -522,11 +510,14 @@ impl BreakpointTable {
     pub fn set(
         &self,
         db: &PvDatabase,
-        record: &str,
+        record: impl AsRef<[u8]>,
         spawn: impl FnOnce(u64, Arc<BinarySemaphoreHandle>),
     ) -> Result<(), BkptError> {
+        let record = record.as_ref();
         let Some(name) = canonical_record_name(db, record) else {
-            return Err(BkptError::NotFound(record.to_string()));
+            return Err(BkptError::NotFound(
+                String::from_utf8_lossy(record).into_owned(),
+            ));
         };
         if record_bkpt(db, &name) & BKPT_ON_MASK != 0 {
             return Err(BkptError::AlreadySet);
@@ -536,7 +527,9 @@ impl BreakpointTable {
         // `iocInit` that pointer chain ends in a null `lset`; a record with no
         // lock set is as unusable to `dbb` as one the database does not have.
         let Some(id) = lockset_id(db, &name) else {
-            return Err(BkptError::NotFound(record.to_string()));
+            return Err(BkptError::NotFound(
+                String::from_utf8_lossy(record).into_owned(),
+            ));
         };
         let mut stack = self.lock();
         let idx = match stack.sets.iter().position(|s| s.id == id) {
@@ -550,7 +543,7 @@ impl BreakpointTable {
                     ep_queue: Vec::new(),
                     step: false,
                     cont: None,
-                    ex: Arc::new(BinarySemaphore::default()),
+                    ex: Arc::new(EpicsEvent::new()),
                 });
                 stack.sets.len() - 1
             }
@@ -572,9 +565,12 @@ impl BreakpointTable {
     }
 
     /// C `dbd()` (`dbBkpt.c:399-479`) — delete a breakpoint.
-    pub fn clear(&self, db: &PvDatabase, record: &str) -> Result<(), BkptError> {
+    pub fn clear(&self, db: &PvDatabase, record: impl AsRef<[u8]>) -> Result<(), BkptError> {
+        let record = record.as_ref();
         let Some(name) = canonical_record_name(db, record) else {
-            return Err(BkptError::NotFound(record.to_string()));
+            return Err(BkptError::NotFound(
+                String::from_utf8_lossy(record).into_owned(),
+            ));
         };
         if record_bkpt(db, &name) & BKPT_ON_MASK == 0 {
             return Err(BkptError::NotSet);
@@ -611,20 +607,28 @@ impl BreakpointTable {
     }
 
     /// C `dbc()` (`dbBkpt.c:489-518`) — continue: stepping off, then resume.
-    pub fn cont(&self, db: &PvDatabase, record: Option<&str>) -> Result<Option<String>, BkptError> {
+    pub fn cont(
+        &self,
+        db: &PvDatabase,
+        record: Option<&[u8]>,
+    ) -> Result<Option<String>, BkptError> {
         self.resume(db, record, false)
     }
 
     /// C `dbs()` (`dbBkpt.c:528-556`) — step. Unlike `dbc` it leaves stepping
     /// on, so the next record in the chain stops too.
-    pub fn step(&self, db: &PvDatabase, record: Option<&str>) -> Result<Option<String>, BkptError> {
+    pub fn step(
+        &self,
+        db: &PvDatabase,
+        record: Option<&[u8]>,
+    ) -> Result<Option<String>, BkptError> {
         self.resume(db, record, true)
     }
 
     fn resume(
         &self,
         db: &PvDatabase,
-        record: Option<&str>,
+        record: Option<&[u8]>,
         stepping: bool,
     ) -> Result<Option<String>, BkptError> {
         let mut stack = self.lock();
@@ -704,7 +708,11 @@ impl BreakpointTable {
     /// The record `dbp` prints — C `dbp()`'s `FIND_CONT_NODE` half
     /// (`dbBkpt.c:825-845`). With a name it is the *named* record; with none,
     /// the stopped one.
-    pub fn print_target(&self, db: &PvDatabase, record: Option<&str>) -> Result<String, BkptError> {
+    pub fn print_target(
+        &self,
+        db: &PvDatabase,
+        record: Option<&[u8]>,
+    ) -> Result<RecordName, BkptError> {
         let stack = self.lock();
         let (_, target) = stack.find_cont_node(db, record)?;
         Ok(target)
@@ -720,8 +728,8 @@ impl Default for BreakpointTable {
 impl LockSet {
     /// C `:707-739` — add the entry point if new, otherwise bump its count,
     /// and mark it scheduled when `pact` is clear.
-    fn note_entrypoint(&mut self, record: &str, schedule: bool) {
-        match self.ep_queue.iter_mut().find(|e| e.name == record) {
+    fn note_entrypoint(&mut self, record: &[u8], schedule: bool) {
+        match self.ep_queue.iter_mut().find(|e| *e.name == *record) {
             Some(ep) => {
                 if ep.count < MAX_EP_COUNT {
                     ep.count += 1;
@@ -731,7 +739,7 @@ impl LockSet {
                 }
             }
             None => self.ep_queue.push(EntryPoint {
-                name: record.to_string(),
+                name: RecordName::from(record),
                 count: 1,
                 first_seen: Instant::now(),
                 scheduled: schedule,
@@ -743,7 +751,7 @@ impl LockSet {
 impl Stack {
     /// The lock set holding `record` — C's `FIND_LOCKSET` (`:176`), which
     /// compares each node's frozen `l_num` against the record's current id.
-    fn index_of_record(&mut self, db: &PvDatabase, record: &str) -> Option<usize> {
+    fn index_of_record(&mut self, db: &PvDatabase, record: &[u8]) -> Option<usize> {
         if self.sets.is_empty() {
             return None;
         }
@@ -758,8 +766,8 @@ impl Stack {
     fn find_cont_node(
         &self,
         db: &PvDatabase,
-        record: Option<&str>,
-    ) -> Result<(usize, String), BkptError> {
+        record: Option<&[u8]>,
+    ) -> Result<(usize, RecordName), BkptError> {
         match record {
             None => self
                 .sets
@@ -776,8 +784,9 @@ impl Stack {
                 })
                 .ok_or(BkptError::NoneStopped),
             Some(name) => {
-                let canonical = canonical_record_name(db, name)
-                    .ok_or_else(|| BkptError::NotFound(name.to_string()))?;
+                let canonical = canonical_record_name(db, name).ok_or_else(|| {
+                    BkptError::NotFound(String::from_utf8_lossy(name).into_owned())
+                })?;
                 let id = lockset_id(db, &canonical).ok_or(BkptError::NotStopped)?;
                 let idx = self
                     .sets
@@ -795,11 +804,11 @@ impl Stack {
 
 /// C's unlocked `precord->bkpt` read — `dbstat` and `dbb` run it with no
 /// lock set held, and the set may be held by a stepping continuation thread.
-fn record_bkpt(db: &PvDatabase, record: &str) -> u8 {
+fn record_bkpt(db: &PvDatabase, record: &[u8]) -> u8 {
     db.get_record(record).map(|r| r.bkpt().get()).unwrap_or(0)
 }
 
-fn set_record_bkpt(db: &PvDatabase, record: &str, f: impl FnOnce(u8) -> u8) {
+fn set_record_bkpt(db: &PvDatabase, record: &[u8], f: impl FnOnce(u8) -> u8) {
     if let Some(rec) = db.get_record(record) {
         let flag = rec.bkpt();
         flag.set(f(flag.get()));
@@ -807,9 +816,12 @@ fn set_record_bkpt(db: &PvDatabase, record: &str, f: impl FnOnce(u8) -> u8) {
 }
 
 /// C `dbap()` (`dbBkpt.c:848-881`) — toggle auto-print, returning C's line.
-pub fn toggle_autoprint(db: &PvDatabase, record: &str) -> Result<String, BkptError> {
+pub fn toggle_autoprint(db: &PvDatabase, record: impl AsRef<[u8]>) -> Result<String, BkptError> {
+    let record = record.as_ref();
     let Some(name) = canonical_record_name(db, record) else {
-        return Err(BkptError::NotFound(record.to_string()));
+        return Err(BkptError::NotFound(
+            String::from_utf8_lossy(record).into_owned(),
+        ));
     };
     let on = record_bkpt(db, &name) & BKPT_PRINT_MASK == 0;
     set_record_bkpt(db, &name, |b| {
@@ -834,7 +846,7 @@ pub fn toggle_autoprint(db: &PvDatabase, record: &str) -> Result<String, BkptErr
 /// the publication has to happen on the thread — the `EPICS ID` is assigned by
 /// the thread's own registry prologue, so `dbb` cannot know it at spawn.
 pub struct BinarySemaphoreHandle {
-    ex: Arc<BinarySemaphore>,
+    ex: Arc<EpicsEvent>,
     taskid: Arc<AtomicU64>,
 }
 
@@ -874,7 +886,7 @@ pub fn continuation_loop(db: PvDatabase, id: u64, handle: Arc<BinarySemaphoreHan
         // The scheduled entries, snapshotted under the stack lock: processing
         // one takes the record gate and may park, and neither may happen while
         // this thread holds the stack C releases at `:585`.
-        let scheduled: Vec<String> = {
+        let scheduled: Vec<RecordName> = {
             let stack = table.lock();
             let Some(set) = stack.sets.iter().find(|s| s.id == id) else {
                 break;
@@ -956,15 +968,20 @@ mod tests {
     /// `LockSetEdit`, so the merge has to be asked for. Merging is idempotent,
     /// which is why a second call costs nothing.
     fn set_flnk(db: &PvDatabase, from: &str, to: &str) {
+        let rec = db.get_record(from).expect("record");
         {
-            let rec = db.get_record(from).expect("record");
             let mut inst = rec.write();
-            inst.common.flnk = to.to_string();
-            inst.parsed_flnk = crate::server::record::parse_link_field(
-                to,
-                crate::server::record::LinkFieldType::Fwd,
+            inst.common.text.flnk = to.into();
+            inst.set_link_cache(
+                "FLNK",
+                crate::server::record::parse_link_field(
+                    to,
+                    crate::server::record::LinkFieldType::Fwd,
+                ),
             );
         }
+        // The poke stands in for a load, so it gets the load's `dbInitLink`.
+        db.init_record_forwards(&rec);
         db.build_lock_sets();
     }
 
@@ -981,7 +998,7 @@ mod tests {
         let dblsr = |name: &str| db.lock_set_of(name).expect("a set after iocInit");
         let want = dblsr("BP:a").id;
         for seed in ["BP:a", "BP:b", "BP:c"] {
-            assert_eq!(lockset_id(&db, seed), Some(want), "seed {seed}");
+            assert_eq!(lockset_id(&db, seed.as_bytes()), Some(want), "seed {seed}");
         }
         // The chain is one set: this is what makes the id shared, and it is
         // symmetric, so the tail names the same set as the head.
@@ -990,7 +1007,7 @@ mod tests {
         assert_eq!(members, ["BP:a", "BP:b", "BP:c"]);
 
         // A record with no DB links is its own set, as in C.
-        assert_ne!(lockset_id(&db, "BP:lone"), Some(want));
+        assert_ne!(lockset_id(&db, b"BP:lone"), Some(want));
     }
 
     /// C merges lock sets only in `dbDbInitLink`/`dbDbAddLink`, so a link that
@@ -1002,8 +1019,8 @@ mod tests {
         set_flnk(&db, "BP:a", "ca://BP:b");
 
         assert_ne!(
-            lockset_id(&db, "BP:a"),
-            lockset_id(&db, "BP:b"),
+            lockset_id(&db, b"BP:a"),
+            lockset_id(&db, b"BP:b"),
             "a ca:// forward link is a dbCa link, not a lock-set merge"
         );
     }
@@ -1018,8 +1035,8 @@ mod tests {
         db.add_record("BP:pre", Box::new(AiRecord::new(0.0)))
             .await
             .expect("add_record");
-        assert_eq!(lockset_id(&db, "BP:pre"), None, "before build_lock_sets");
-        assert_eq!(lockset_id(&db, "BP:absent"), None, "no such record");
+        assert_eq!(lockset_id(&db, b"BP:pre"), None, "before build_lock_sets");
+        assert_eq!(lockset_id(&db, b"BP:absent"), None, "no such record");
 
         let table = BreakpointTable::new();
         assert_eq!(
@@ -1094,7 +1111,7 @@ mod tests {
     #[tokio::test]
     async fn a_marked_record_whose_lockset_is_gone_is_cleared_and_reported() {
         let db = db_with(&["BP:a"]).await;
-        set_record_bkpt(&db, "BP:a", |b| b | BKPT_ON_MASK);
+        set_record_bkpt(&db, b"BP:a", |b| b | BKPT_ON_MASK);
 
         assert_eq!(
             BreakpointTable::new().clear(&db, "BP:a"),
@@ -1102,7 +1119,7 @@ mod tests {
             "the BKPT bit is set but this table never saw the record"
         );
         assert_eq!(
-            record_bkpt(&db, "BP:a") & BKPT_ON_MASK,
+            record_bkpt(&db, b"BP:a") & BKPT_ON_MASK,
             0,
             "the bit is cleared anyway, so the record is not left marked"
         );
@@ -1119,7 +1136,7 @@ mod tests {
         assert_eq!(table.set(&db, "BP:nope", |_, _| {}).unwrap_err(), missing);
         assert_eq!(table.clear(&db, "BP:nope").unwrap_err(), missing);
         assert_eq!(toggle_autoprint(&db, "BP:nope").unwrap_err(), missing);
-        assert_eq!(table.cont(&db, Some("BP:nope")).unwrap_err(), missing);
+        assert_eq!(table.cont(&db, Some(b"BP:nope")).unwrap_err(), missing);
     }
 
     /// Two breakpoints in one lock set share one stack node; two lock sets
@@ -1149,7 +1166,7 @@ mod tests {
         let table = BreakpointTable::new();
         table.set(&db, "BP:a", |_, _| {}).expect("dbb");
 
-        assert_eq!(table.before_process(&db, "BP:far"), Before::Run);
+        assert_eq!(table.before_process(&db, b"BP:far"), Before::Run);
         assert!(table.lock().sets[0].ep_queue.is_empty());
     }
 
@@ -1164,13 +1181,13 @@ mod tests {
         let table = BreakpointTable::new();
         table.set(&db, "BP:a", |_, _| {}).expect("dbb");
 
-        assert_eq!(table.before_process(&db, "BP:a"), Before::Skip);
-        assert_eq!(table.before_process(&db, "BP:a"), Before::Skip);
+        assert_eq!(table.before_process(&db, b"BP:a"), Before::Skip);
+        assert_eq!(table.before_process(&db, b"BP:a"), Before::Skip);
         {
             let stack = table.lock();
             let ep = &stack.sets[0].ep_queue[0];
             assert_eq!(
-                (ep.name.as_str(), ep.count, ep.scheduled),
+                (&*ep.name.to_str_lossy(), ep.count, ep.scheduled),
                 ("BP:a", 2, true)
             );
         }
@@ -1181,7 +1198,7 @@ mod tests {
             let mut stack = table.lock();
             stack.sets[0].ep_queue[0].scheduled = false;
         }
-        assert_eq!(table.before_process(&db, "BP:a"), Before::Skip);
+        assert_eq!(table.before_process(&db, b"BP:a"), Before::Skip);
         let stack = table.lock();
         let ep = &stack.sets[0].ep_queue[0];
         assert_eq!(
@@ -1206,7 +1223,7 @@ mod tests {
             inst.common.disv = 1;
         }
 
-        assert_eq!(table.before_process(&db, "BP:a"), Before::Run);
+        assert_eq!(table.before_process(&db, b"BP:a"), Before::Run);
         assert!(table.lock().sets[0].ep_queue.is_empty());
     }
 
@@ -1219,12 +1236,12 @@ mod tests {
     /// where the park now lives.
     #[test]
     fn the_execution_semaphore_banks_a_signal() {
-        let ex = Arc::new(BinarySemaphore::default());
+        let ex = EpicsEvent::new();
         ex.signal();
         ex.signal();
         ex.wait(); // returns: the signal was banked
         assert!(
-            !*ex.full.lock().expect("sem"),
+            !ex.try_wait(),
             "epicsEventSignal is binary: two signals before one wait are one pass"
         );
     }
@@ -1248,7 +1265,7 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let stopper = {
             let (table, db, tx) = (table.clone(), db.clone(), tx.clone());
-            let set_id = lockset_id(&db, "BP:a").expect("lock set");
+            let set_id = lockset_id(&db, b"BP:a").expect("lock set");
             crate::runtime::task::spawn_dedicated_thread(
                 "bkptCont".to_string(),
                 crate::runtime::task::ThreadPriority::ScanLow,
@@ -1257,7 +1274,7 @@ mod tests {
                     claim_continuation(set_id, &taskid);
                     let _gate = db.lock_instance(&db.get_record("BP:a").expect("record"));
                     tx.send("entered").expect("send");
-                    assert_eq!(table.before_process(&db, "BP:a"), Before::Run);
+                    assert_eq!(table.before_process(&db, b"BP:a"), Before::Run);
                     tx.send("resumed").expect("send");
                 },
             )
@@ -1305,7 +1322,7 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let stopper = {
             let (table, db, tx) = (table.clone(), db.clone(), tx.clone());
-            let set_id = lockset_id(&db, "BP:a").expect("lock set");
+            let set_id = lockset_id(&db, b"BP:a").expect("lock set");
             let taskid = taskid.clone();
             crate::runtime::task::spawn_dedicated_thread(
                 "bkptCont".to_string(),
@@ -1315,7 +1332,7 @@ mod tests {
                     claim_continuation(set_id, &taskid);
                     let _gate = db.lock_instance(&db.get_record("BP:a").expect("record"));
                     tx.send("entered").expect("send");
-                    assert_eq!(table.before_process(&db, "BP:a"), Before::Run);
+                    assert_eq!(table.before_process(&db, b"BP:a"), Before::Run);
                     tx.send("resumed").expect("send");
                 },
             )
@@ -1375,7 +1392,7 @@ mod tests {
         );
         table.lock().sets[0].stopped_at = Some("BP:a".into());
         assert_eq!(
-            table.cont(&db, Some("BP:a")).expect("dbc"),
+            table.cont(&db, Some(b"BP:a")).expect("dbc"),
             None,
             "the named form never announces"
         );
@@ -1390,9 +1407,9 @@ mod tests {
         assert_eq!(table.cont(&db, None), Err(BkptError::NoneStopped));
 
         table.set(&db, "BP:a", |_, _| {}).expect("dbb");
-        assert_eq!(table.cont(&db, Some("BP:a")), Err(BkptError::NotStopped));
+        assert_eq!(table.cont(&db, Some(b"BP:a")), Err(BkptError::NotStopped));
         assert_eq!(
-            table.cont(&db, Some("BP:far")),
+            table.cont(&db, Some(b"BP:far")),
             Err(BkptError::NotStopped),
             "a record in no breakpointed lock set is 'not stopped in this lockset'"
         );
@@ -1410,7 +1427,7 @@ mod tests {
         table.lock().sets[0].stopped_at = Some("BP:b".into());
 
         assert_eq!(table.print_target(&db, None).expect("dbp"), "BP:b");
-        assert_eq!(table.print_target(&db, Some("BP:a")).expect("dbp"), "BP:a");
+        assert_eq!(table.print_target(&db, Some(b"BP:a")).expect("dbp"), "BP:a");
     }
 
     /// C `dbap` `:868-878`, both directions and both lines.
@@ -1422,12 +1439,12 @@ mod tests {
             toggle_autoprint(&db, "BP:a").expect("dbap"),
             "   BKPT> Auto print on for record BP:a"
         );
-        assert_eq!(record_bkpt(&db, "BP:a") & BKPT_PRINT_MASK, BKPT_PRINT_MASK);
+        assert_eq!(record_bkpt(&db, b"BP:a") & BKPT_PRINT_MASK, BKPT_PRINT_MASK);
         assert_eq!(
             toggle_autoprint(&db, "BP:a").expect("dbap"),
             "   BKPT> Auto print off for record BP:a"
         );
-        assert_eq!(record_bkpt(&db, "BP:a") & BKPT_PRINT_MASK, 0);
+        assert_eq!(record_bkpt(&db, b"BP:a") & BKPT_PRINT_MASK, 0);
     }
 
     /// C `dbPrint` `:810-817`: the BKPT print bit alone is not enough — the
@@ -1440,29 +1457,31 @@ mod tests {
         let seen = Arc::new(Mutex::new(Vec::new()));
         {
             let seen = seen.clone();
-            table.set_printer(Arc::new(move |n: &str| {
-                seen.lock().expect("seen").push(n.to_string())
+            table.set_printer(Arc::new(move |n: &[u8]| {
+                seen.lock()
+                    .expect("seen")
+                    .push(String::from_utf8_lossy(n).into_owned())
             }));
         }
 
         toggle_autoprint(&db, "BP:far").expect("dbap");
-        table.after_process(&db, "BP:far");
+        table.after_process(&db, b"BP:far");
         assert!(seen.lock().expect("seen").is_empty(), "no lock set at all");
 
         table.set(&db, "BP:a", |_, _| {}).expect("dbb");
-        table.after_process(&db, "BP:far");
+        table.after_process(&db, b"BP:far");
         assert!(
             seen.lock().expect("seen").is_empty(),
             "a different lock set holds the breakpoint"
         );
 
         toggle_autoprint(&db, "BP:a").expect("dbap");
-        table.after_process(&db, "BP:a");
+        table.after_process(&db, b"BP:a");
         assert_eq!(*seen.lock().expect("seen"), ["BP:a"]);
 
         // And without the print bit, nothing, breakpoint or not.
         toggle_autoprint(&db, "BP:a").expect("dbap");
-        table.after_process(&db, "BP:a");
+        table.after_process(&db, b"BP:a");
         assert_eq!(seen.lock().expect("seen").len(), 1);
     }
 
@@ -1525,6 +1544,20 @@ mod tests {
         );
     }
 
+    /// C's `%7.1f` spells a NaN `nan`, and `-nan` when its sign bit is set.
+    #[test]
+    fn entrypoint_age_prints_a_nan_as_c_does() {
+        for (elapsed_secs, want) in [(f64::NAN, "C/S:     nan"), (-f64::NAN, "C/S:    -nan")] {
+            let got = StatLine::Entrypoint {
+                name: "BP:a".into(),
+                count: 7,
+                elapsed_secs,
+            }
+            .render();
+            assert!(got.ends_with(want), "{got}");
+        }
+    }
+
     /// Wait for `pred` to hold of the stopped record, or give up. Polling is
     /// how a shell user waits too: the stop happens on the continuation
     /// thread, which the shell has no handle on.
@@ -1532,7 +1565,10 @@ mod tests {
         for _ in 0..400 {
             {
                 let stack = table.lock();
-                let at = stack.sets.front().and_then(|s| s.stopped_at.clone());
+                let at = stack
+                    .sets
+                    .front()
+                    .and_then(|s| s.stopped_at.as_ref().map(|n| n.to_string()));
                 if pred(at.as_deref()) {
                     return at;
                 }
@@ -1643,5 +1679,112 @@ mod tests {
         second.set(&db, "BP:a", |_, _| {}).expect("dbb");
         assert_eq!(second.lock().sets[0].id, from_b);
         assert_eq!(from_b, dblsr, "dbstat prints dblsr's id");
+    }
+
+    /// Spec §5 test 19: a breakpoint parks the OUT write's PP inside the
+    /// target, and the park lets the source's set go (C `dbBkpt.c:794-796`).
+    /// Meanwhile another thread re-points the source's OUT and removes the
+    /// target. The old parse is freed by that put, not later by the frame,
+    /// because the write ended its handle before PP; the frame resumes on
+    /// the target it owns and the next cycle writes the new target.
+    // RTEMS-EXEC-MODEL-ALLOW(1): parks a real OS thread, the std-thread backend's own primitive; the runtime only awaits add_record and the puts; passes on the exec backend.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_out_write_parked_in_its_pp_outlives_its_link_and_its_target() {
+        use crate::server::record::{LinkFieldType, parse_link_field};
+        use crate::server::records::ao::AoRecord;
+
+        let db = PvDatabase::new();
+        for name in ["BPO:src", "BPO:tgt", "BPO:new"] {
+            db.add_record(name, Box::new(AoRecord::new(0.0)))
+                .await
+                .expect("add_record");
+        }
+        // BPO:new links to BPO:tgt so the re-point below keeps the parked
+        // target in the source's set: a re-point that splits it off leaves
+        // the resumed frame on a set that no longer holds it.
+        for (from, to) in [
+            ("BPO:src", "BPO:tgt.VAL PP"),
+            ("BPO:new", "BPO:tgt.VAL NPP"),
+        ] {
+            let rec = db.get_record(from).expect("record");
+            let mut inst = rec.write();
+            inst.common.text.out = to.into();
+            inst.set_link_cache("OUT", parse_link_field(to, LinkFieldType::Out));
+        }
+        db.build_lock_sets();
+        let table = db.breakpoints_or_install();
+        let joiner = {
+            let owned = db.clone();
+            let cell: Arc<Mutex<Option<std::thread::JoinHandle<String>>>> =
+                Arc::new(Mutex::new(None));
+            let out = cell.clone();
+            table
+                .set(&db, "BPO:tgt", move |key, ex| {
+                    *cell.lock().expect("cell") = Some(std::thread::spawn(move || {
+                        continuation_loop(owned, key, ex)
+                    }));
+                })
+                .expect("dbb");
+            out.lock().expect("cell").take().expect("spawned")
+        };
+        let old = match db
+            .get_record("BPO:src")
+            .expect("record")
+            .read()
+            .parsed_out
+            .link()
+        {
+            crate::server::record::ParsedLink::Db(link) => Arc::downgrade(link),
+            other => panic!("a DB link: {other:?}"),
+        };
+
+        db.process_record_with_links("BPO:src", &mut crate::server::database::ProcStack::new())
+            .await
+            .expect("foreign entry falls out of dbProcess");
+        assert_eq!(
+            await_stop(&table, |at| at == Some("BPO:tgt")).as_deref(),
+            Some("BPO:tgt"),
+            "parked in the OUT write's PP"
+        );
+
+        db.put_record_field_from_ca(
+            "BPO:src",
+            "OUT",
+            crate::types::EpicsValue::String("BPO:new.VAL PP".into()),
+        )
+        .await
+        .expect("re-point OUT during the park");
+        assert!(old.upgrade().is_none(), "the put freed the old parse");
+        assert!(db.remove_record("BPO:tgt").await);
+
+        table.cont(&db, None).expect("dbc");
+        assert_eq!(await_stop(&table, |at| at.is_none()), None);
+        // `dbd` cannot name a removed record: empty the set as its tail does.
+        {
+            let mut stack = table.lock();
+            stack.sets[0].breakpoints.clear();
+            stack.sets[0].step = false;
+            let (ex, cont) = (stack.sets[0].ex.clone(), stack.sets[0].cont.clone());
+            drop(stack);
+            resume_continuation(cont.as_ref());
+            ex.signal();
+        }
+        joiner.join().expect("the frame finished without a panic");
+
+        db.get_record("BPO:src")
+            .expect("record")
+            .write()
+            .record
+            .set_val(crate::types::EpicsValue::Double(9.0))
+            .expect("VAL");
+        db.process_record_with_links("BPO:src", &mut crate::server::database::ProcStack::new())
+            .await
+            .or_else(crate::error::CaError::unless_process_status)
+            .expect("process");
+        assert_eq!(
+            db.get_pv("BPO:new").expect("BPO:new").to_f64(),
+            Some(9.0),
+            "the next cycle writes through the new link"
+        );
     }
 }

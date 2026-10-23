@@ -9,6 +9,8 @@ repository.workspace = true
 
 [dependencies]
 epics-base-rs = { workspace = true }
+# `cli` prints every float through `cfmt::CFloat`.
+epics-libcom-rs = { workspace = true }
 # The RTEMS boot shim for `realtime-ca-ioc`. Empty on every non-RTEMS target, so
 # this is an unconditional dependency rather than a `cfg(target_os = "rtems")`
 # one: that keeps `epics_rtems_boot::link_anchor()` a single uncfg'd call in
@@ -40,7 +42,7 @@ hickory-client = { version = "0.24", default-features = false, features = ["dnss
 hickory-proto = { version = "0.24", default-features = false, features = ["dnssec-ring", "tokio-runtime"], optional = true }
 base64 = { version = "0.22", optional = true }
 serde = { version = "1", optional = true, features = ["derive"] }
-serde_json = { version = "1", optional = true }
+serde_json = { workspace = true, optional = true }
 ed25519-dalek = { version = "2", optional = true, features = ["rand_core"] }
 rand_core = { version = "0.6", optional = true, features = ["getrandom"] }
 # Non-optional: the always-on `calink` module derives `thiserror::Error`
@@ -72,17 +74,15 @@ tracing-opentelemetry = { version = "0.25", optional = true }
 # there (the blocking driver drives via the runtime::task seam) but must
 # still type-check for `--lib`.
 #
-# `socket2` (async TCP keepalive + UDP shared-port setup) and `if-addrs`
-# (interface enumeration for beacons / mDNS / addr-list) back only the async
-# front-end; the blocking driver sets socket options via raw `libc`. Both go
-# host-only. The module gates (`server/mod.rs`, `server/udp.rs`, etc.) match
+# `socket2` (async TCP keepalive + UDP shared-port setup) backs only the
+# async front-end; the blocking driver sets socket options via raw `libc`. It
+# goes host-only. The module gates (`server/mod.rs`, `server/udp.rs`, etc.) match
 # this table via the `build.rs`-emitted `epics_embedded_target` cfg, which
 # `Cargo.toml` target tables cannot reference directly (only built-in `cfg()`
 # predicates), hence spelling the target-OS pair out here.
 [target.'cfg(not(any(target_os = "rtems", target_os = "vxworks")))'.dependencies]
 tokio = { version = "1", features = ["full"] }
 socket2 = { version = "0.5", features = ["all"] }
-if-addrs = "0.13"
 
 [target.'cfg(any(target_os = "rtems", target_os = "vxworks"))'.dependencies]
 tokio = { version = "1", default-features = false, features = [
@@ -220,6 +220,14 @@ source-guard = { path = "../source-guard" }
 # cannot see each other's `tests/`, and two copies of a retry rule are two
 # chances to retry on the wrong evidence.
 named-port = { path = "../named-port" }
+# Dev-only, path-only: the one budget a test puts on a fact and the barrier an
+# absence claim closes on, for the integration suites and `src/` unit tests.
+fact-budget = { path = "../fact-budget" }
+# Dev-only, path-only: the C reference tools (`softIoc`, `caget`, `caput`)
+# and the raw-socket CA client, shared by several suites. Crates rather than
+# `tests/` modules, so each suite links what it calls and nothing is dead.
+c-ca-tools = { path = "../c-ca-tools" }
+raw-ca = { path = "../raw-ca" }
 # Dev-only, path-only (no `version`, so `cargo publish` strips the entry
 # entirely): the shared exec-backend test-gating census, called by
 # `tests/rtems_exec_model_gate.rs`. Shared rather than copied because every

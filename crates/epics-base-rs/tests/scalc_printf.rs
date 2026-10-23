@@ -55,8 +55,14 @@ fn width_flags_and_precision_are_snprintfs() {
     assert_eq!(pf("PRINTF(\"%+d\", 5)"), "+5");
     assert_eq!(pf("PRINTF(\"% d\", 5)"), " 5");
     assert_eq!(pf("PRINTF(\"%10.3e|\", 1234.5)"), " 1.234e+03|");
-    assert_eq!(pf("PRINTF(\"%e\", 1234.5678)"), "1.234568e+03");
-    assert_eq!(pf("PRINTF(\"%E\", 1234.5678)"), "1.234568E+03");
+    // The whole perform fails on 1234.5678: the UNTIL pre-scan skips the
+    // byte after the string's NUL (the LITERAL_DOUBLE opcode) and reads the
+    // double's 0x93 byte as an unmatched UNTIL_END (CBUG-O1).
+    for e in ["PRINTF(\"%e\", 1234.5678)", "PRINTF(\"%E\", 1234.5678)"] {
+        assert_eq!(scalc(e, &mut StringInputs::new()), Err(CalcError::Internal));
+    }
+    assert_eq!(pf("PRINTF(\"%e\", 1234.5)"), "1.234500e+03");
+    assert_eq!(pf("PRINTF(\"%E\", 1234.5)"), "1.234500E+03");
     assert_eq!(pf("PRINTF(\"%g\", 0.0001)"), "0.0001");
     assert_eq!(pf("PRINTF(\"%g\", 0.0000001)"), "1e-07");
     assert_eq!(pf("PRINTF(\"%G\", 0.0000001)"), "1E-07");
@@ -65,6 +71,18 @@ fn width_flags_and_precision_are_snprintfs() {
     // glibc's %f rounds half to even, like Rust's.
     assert_eq!(pf("PRINTF(\"%.0f\", 2.5)"), "2");
     assert_eq!(pf("PRINTF(\"%.0f\", 3.5)"), "4");
+}
+
+/// glibc prints a NaN's sign bit, and `#` puts `%e`'s point before the
+/// exponent.
+#[test]
+fn a_negative_nan_and_the_alternate_exponent_are_glibcs() {
+    assert_eq!(pf("PRINTF(\"%f\", -NAN)"), "-nan");
+    assert_eq!(pf("PRINTF(\"%E\", -NAN)"), "-NAN");
+    assert_eq!(pf("PRINTF(\"%G\", -NAN)"), "-NAN");
+    assert_eq!(pf("PRINTF(\"%#g\", -NAN)"), "-nan");
+    assert_eq!(pf("PRINTF(\"%5.1f\", -NAN)"), " -nan");
+    assert_eq!(pf("PRINTF(\"%#.0e\", 1.5)"), "2.e+00");
 }
 
 /// The integer conversions take `l = myNINT(d)` — rounded half away from zero —

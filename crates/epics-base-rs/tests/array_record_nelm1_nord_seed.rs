@@ -73,7 +73,7 @@ async fn build() -> std::sync::Arc<PvDatabase> {
 }
 
 async fn nord(db: &PvDatabase, rec: &str) -> f64 {
-    db.get_pv(&format!("{rec}.NORD")).unwrap().to_f64().unwrap()
+    db.get_pv(format!("{rec}.NORD")).unwrap().to_f64().unwrap()
 }
 
 /// `aai` is the one kind whose dset leaves the seed alone: its single element IS

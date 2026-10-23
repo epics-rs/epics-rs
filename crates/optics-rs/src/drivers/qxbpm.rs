@@ -4,7 +4,7 @@
 //! `SimQxbpm` (in-memory simulation with configurable beam position and noise),
 //! and `QxbpmHolder` (IOC startup command registration).
 //!
-//! Reuses all protocol/math from [`crate::snl::qxbpm`].
+//! The diode-current and position math is `sncqxbpm.st`'s.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -12,13 +12,182 @@ use std::time::Duration;
 
 use asyn_rs::error::AsynResult;
 use asyn_rs::param::ParamType;
+use asyn_rs::port::InterfaceMask;
 use asyn_rs::port::{PortDriverBase, PortFlags};
 use asyn_rs::user::AsynUser;
+use epics_libcom_rs::cfmt::CFloat;
 
-use crate::snl::qxbpm::{
-    CalibrationData, DEFAULT_GX, DEFAULT_GY, DEFAULT_LOW_CURRENT_RAW, DiodeCurrents, RawDiodeData,
-    compute_currents, compute_position, default_calibration, total_current,
-};
+// ---------------------------------------------------------------------------
+// Diode currents and beam position
+// ---------------------------------------------------------------------------
+
+/// Number of gain ranges.
+pub const NUM_GAINS: usize = 6;
+
+/// Number of diode channels.
+pub const NUM_CHANNELS: usize = 4;
+
+/// Default geometric scaling factor for X position.
+pub const DEFAULT_GX: f64 = 4.5;
+
+/// Default geometric scaling factor for Y position.
+pub const DEFAULT_GY: f64 = 4.5;
+
+/// Default low-current raw threshold.
+pub const DEFAULT_LOW_CURRENT_RAW: u32 = 1000;
+
+/// Raw unsigned counts from the four diode channels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RawDiodeData {
+    pub a: u32,
+    pub b: u32,
+    pub c: u32,
+    pub d: u32,
+}
+
+/// Per-gain, per-channel calibration data.
+///
+/// Indexed as `[gain_index * NUM_CHANNELS + channel_index]` where channel
+/// index is 0=A, 1=B, 2=C, 3=D.
+#[derive(Debug, Clone)]
+pub struct CalibrationData {
+    /// Gain trim factors: `current = gain_trim * (raw - offset)`.
+    pub gain_trim: Vec<f64>,
+    /// Dark current offsets (raw counts).
+    pub offset: Vec<i32>,
+}
+
+impl CalibrationData {
+    /// Index into the flat arrays.
+    fn idx(gain: usize, channel: usize) -> usize {
+        gain * NUM_CHANNELS + channel
+    }
+
+    /// Get the gain trim for a specific gain and channel.
+    pub fn get_trim(&self, gain: usize, channel: usize) -> f64 {
+        let i = Self::idx(gain, channel);
+        if i < self.gain_trim.len() {
+            self.gain_trim[i]
+        } else {
+            1.0
+        }
+    }
+
+    /// Get the offset for a specific gain and channel.
+    pub fn get_offset(&self, gain: usize, channel: usize) -> i32 {
+        let i = Self::idx(gain, channel);
+        if i < self.offset.len() {
+            self.offset[i]
+        } else {
+            0
+        }
+    }
+
+    /// Set the offset for a specific gain and channel.
+    pub fn set_offset(&mut self, gain: usize, channel: usize, value: i32) {
+        let i = Self::idx(gain, channel);
+        if i < self.offset.len() {
+            self.offset[i] = value;
+        }
+    }
+
+    /// Set the gain trim for a specific gain and channel.
+    pub fn set_trim(&mut self, gain: usize, channel: usize, value: f64) {
+        let i = Self::idx(gain, channel);
+        if i < self.gain_trim.len() {
+            self.gain_trim[i] = value;
+        }
+    }
+}
+
+impl Default for CalibrationData {
+    fn default() -> Self {
+        Self {
+            gain_trim: vec![1.0; NUM_GAINS * NUM_CHANNELS],
+            offset: vec![0; NUM_GAINS * NUM_CHANNELS],
+        }
+    }
+}
+
+/// Compute the default gain trim factors (from the original set_defaults).
+///
+/// These are based on the full-scale current for each range divided by
+/// 10 VDC full-scale and 100 kHz/VDC.
+pub fn default_gain_trims() -> Vec<f64> {
+    let full_scale = [350e-9, 700e-9, 1400e-9, 7e-6, 70e-6, 700e-6];
+    let mut trims = vec![0.0; NUM_GAINS * NUM_CHANNELS];
+    for gain in 0..NUM_GAINS {
+        let factor = full_scale[gain] / 10.0 / 1e5;
+        for ch in 0..NUM_CHANNELS {
+            trims[gain * NUM_CHANNELS + ch] = factor;
+        }
+    }
+    trims
+}
+
+/// Create a CalibrationData with default trims and zero offsets.
+pub fn default_calibration() -> CalibrationData {
+    CalibrationData {
+        gain_trim: default_gain_trims(),
+        offset: vec![0; NUM_GAINS * NUM_CHANNELS],
+    }
+}
+
+/// Compute the calibrated current for one channel.
+pub fn diode_current(raw: u32, gain: usize, channel: usize, cal: &CalibrationData) -> f64 {
+    let trim = cal.get_trim(gain, channel);
+    let offset = cal.get_offset(gain, channel);
+    trim * (raw as f64 - offset as f64)
+}
+
+/// Calibrated currents for all four channels.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct DiodeCurrents {
+    pub a: f64,
+    pub b: f64,
+    pub c: f64,
+    pub d: f64,
+}
+
+/// Compute calibrated currents from raw data.
+pub fn compute_currents(raw: &RawDiodeData, gain: usize, cal: &CalibrationData) -> DiodeCurrents {
+    DiodeCurrents {
+        a: diode_current(raw.a, gain, 0, cal),
+        b: diode_current(raw.b, gain, 1, cal),
+        c: diode_current(raw.c, gain, 2, cal),
+        d: diode_current(raw.d, gain, 3, cal),
+    }
+}
+
+/// Total beam intensity (sum of all four channels).
+pub fn total_current(currents: &DiodeCurrents) -> f64 {
+    currents.a + currents.b + currents.c + currents.d
+}
+
+/// Beam position from four diode currents.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct BeamPosition {
+    pub x: f64,
+    pub y: f64,
+}
+
+/// Compute beam position from diode currents and geometric factors.
+///
+/// From the original code (empirically discovered mapping):
+/// - X = GX * (B - D) / (B + D)
+/// - Y = GY * (A - C) / (A + C)
+///
+/// C (sncqxbpm.st:493-494) divides unguarded, so a zero quadrant sum yields
+/// NaN (0/0) or ±Inf (nonzero/0) and a tiny sum a large finite value. We
+/// reproduce that IEEE result rather than substituting 0.0, so pos:x / pos:y
+/// carry the same on-the-wire value as C under no-beam or cancelling currents.
+pub fn compute_position(currents: &DiodeCurrents, gx: f64, gy: f64) -> BeamPosition {
+    let bd_sum = currents.b + currents.d;
+    let ac_sum = currents.a + currents.c;
+    let x = gx * (currents.b - currents.d) / bd_sum;
+    let y = gy * (currents.a - currents.c) / ac_sum;
+    BeamPosition { x, y }
+}
 
 // ---------------------------------------------------------------------------
 // Parameter indices
@@ -199,7 +368,15 @@ impl QxbpmDriver {
             can_block: false,
             destructible: true,
         };
-        let mut base = PortDriverBase::new(port_name, 1, flags);
+        let mut base = PortDriverBase::new(
+            port_name,
+            1,
+            flags,
+            // rs-only simulation port: optics has no C driver for it
+            // (sncqxbpm.st talks to the serial port itself).
+            InterfaceMask::INT32 | InterfaceMask::FLOAT64 | InterfaceMask::DRV_USER,
+            InterfaceMask::INT32 | InterfaceMask::FLOAT64,
+        );
         let params = QxbpmParams::create(&mut base)?;
 
         // Initialize all params to 0
@@ -266,7 +443,7 @@ impl asyn_rs::port::PortDriver for QxbpmDriver {
     fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
         self.base().check_ready()?;
         let reason = user.reason;
-        self.base_mut().params.set_int32(reason, user.addr, value)?;
+        self.base_mut().set_int32_param(reason, user.addr, value)?;
 
         if reason == self.params.poll {
             // `poll` publishes the readbacks and fires the callbacks itself.
@@ -343,7 +520,7 @@ impl QxbpmPollLoop {
                         Some(QxbpmPollCommand::Shutdown) | None => return,
                     }
                 }
-                _ = tokio::time::sleep(self.poll_interval) => {
+                _ = epics_base_rs::runtime::task::sleep(self.poll_interval) => {
                     if self.port.is_closed() {
                         return;
                     }
@@ -415,7 +592,7 @@ impl QxbpmHolder {
             "simQxbpmCreate(port, [xPos], [yPos], [pollMs]) - Create a simulated QXBPM",
             move |args: &[ArgValue], ctx: &CommandContext| {
                 let port = match &args[0] {
-                    ArgValue::String(s) => s.clone(),
+                    ArgValue::String(s) => s.to_str()?.to_owned(),
                     _ => return Err("port must be a string".into()),
                 };
                 let x_pos = match &args[1] {
@@ -434,6 +611,8 @@ impl QxbpmHolder {
                     _ => return Err("pollMs must be an integer".into()),
                 };
 
+                let claim = asyn_rs::asyn_record::claim_port(&port)
+                    .map_err(|e| format!("failed to register QXBPM port: {e}"))?;
                 let sim = Arc::new(Mutex::new(SimQxbpm::new(x_pos, y_pos)));
                 let driver = match QxbpmDriver::new(&port, sim) {
                     Ok(d) => d,
@@ -442,6 +621,7 @@ impl QxbpmHolder {
                 let poll_reason = driver.params.poll;
 
                 let (runtime, _actor) = match asyn_rs::runtime::port::create_port_runtime(
+                    &claim,
                     driver,
                     asyn_rs::runtime::config::RuntimeConfig::default(),
                 ) {
@@ -449,7 +629,8 @@ impl QxbpmHolder {
                     Err(e) => return Err(format!("failed to start QXBPM port: {e}")),
                 };
                 let port_handle = runtime.port_handle().clone();
-                if let Err(e) = asyn_rs::asyn_record::register_port(&port, port_handle.clone()) {
+                let owner = ctx.db().scan_control().interrupt_gate();
+                if let Err(e) = claim.publish(port_handle.clone(), owner) {
                     runtime.shutdown();
                     return Err(format!("failed to register QXBPM port: {e}"));
                 }
@@ -470,7 +651,11 @@ impl QxbpmHolder {
                     .lock()
                     .unwrap()
                     .insert(port.clone(), port_handle);
-                println!("simQxbpmCreate: port={port} x={x_pos} y={y_pos} poll={poll_ms}ms");
+                println!(
+                    "simQxbpmCreate: port={port} x={} y={} poll={poll_ms}ms",
+                    CFloat(x_pos).g(),
+                    CFloat(y_pos).g()
+                );
                 Ok(CommandOutcome::Continue)
             },
         )
@@ -499,6 +684,28 @@ impl Default for QxbpmHolder {
 mod tests {
     use super::*;
     use asyn_rs::port::PortDriver;
+
+    /// The driver as registration leaves it: its port starts down and the
+    /// registration connect brings it up (asynManager.c:523, :2133-2137).
+    fn registered(port_name: &str, sim: Arc<Mutex<SimQxbpm>>) -> QxbpmDriver {
+        let mut driver = QxbpmDriver::new(port_name, sim).unwrap();
+        driver.connect(&AsynUser::default()).unwrap();
+        driver
+    }
+
+    /// The port serves Int32 and Float64 params and names them through
+    /// drvUser; PortDriverBase adds Common as asynPortDriver does.
+    #[test]
+    fn test_port_masks_are_the_interfaces_it_serves() {
+        let driver =
+            QxbpmDriver::new("QXBPM_MASKS", Arc::new(Mutex::new(SimQxbpm::new(0.0, 0.0)))).unwrap();
+        let served = InterfaceMask::INT32 | InterfaceMask::FLOAT64;
+        assert_eq!(driver.base().interrupt_mask(), served);
+        assert_eq!(
+            driver.base().interface_mask(),
+            served | InterfaceMask::DRV_USER | InterfaceMask::COMMON
+        );
+    }
 
     #[test]
     fn test_sim_qxbpm_centered() {
@@ -568,7 +775,7 @@ mod tests {
     #[test]
     fn test_qxbpm_driver_poll_updates_params() {
         let sim = Arc::new(Mutex::new(SimQxbpm::new(1.0, -0.5)));
-        let mut driver = QxbpmDriver::new("test_qxbpm", sim).unwrap();
+        let mut driver = registered("test_qxbpm", sim);
         driver.poll().unwrap();
 
         let p = driver.params();
@@ -593,7 +800,7 @@ mod tests {
     #[test]
     fn test_qxbpm_driver_write_gain() {
         let sim = Arc::new(Mutex::new(SimQxbpm::new(0.0, 0.0)));
-        let mut driver = QxbpmDriver::new("test_qxbpm_gain", sim.clone()).unwrap();
+        let mut driver = registered("test_qxbpm_gain", sim.clone());
 
         let p = driver.params;
         let mut user = AsynUser::new(p.gain);
@@ -606,7 +813,7 @@ mod tests {
     #[test]
     fn test_qxbpm_driver_write_mode() {
         let sim = Arc::new(Mutex::new(SimQxbpm::new(0.0, 0.0)));
-        let mut driver = QxbpmDriver::new("test_qxbpm_mode", sim.clone()).unwrap();
+        let mut driver = registered("test_qxbpm_mode", sim.clone());
 
         let p = driver.params;
         let mut user = AsynUser::new(p.mode);
@@ -640,5 +847,189 @@ mod tests {
             reading_g0.currents.a,
             reading_g3.currents.a,
         );
+    }
+
+    #[test]
+    fn calibration_default_trims_nonzero() {
+        let cal = default_calibration();
+        for g in 0..NUM_GAINS {
+            for ch in 0..NUM_CHANNELS {
+                let trim = cal.get_trim(g, ch);
+                assert!(trim > 0.0, "trim[{g}][{ch}] should be > 0, got {trim}");
+            }
+        }
+    }
+
+    #[test]
+    fn calibration_offsets_default_zero() {
+        let cal = default_calibration();
+        for g in 0..NUM_GAINS {
+            for ch in 0..NUM_CHANNELS {
+                assert_eq!(cal.get_offset(g, ch), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn calibration_set_and_get() {
+        let mut cal = CalibrationData::default();
+        cal.set_trim(2, 1, 0.42);
+        cal.set_offset(2, 1, 500);
+        assert!((cal.get_trim(2, 1) - 0.42).abs() < 1e-15);
+        assert_eq!(cal.get_offset(2, 1), 500);
+    }
+
+    #[test]
+    fn calibration_out_of_range() {
+        let cal = CalibrationData::default();
+        // Should return defaults for out-of-range
+        assert!((cal.get_trim(99, 0) - 1.0).abs() < 1e-15);
+        assert_eq!(cal.get_offset(99, 0), 0);
+    }
+
+    #[test]
+    fn diode_current_no_offset() {
+        let cal = CalibrationData {
+            gain_trim: vec![2.0; NUM_GAINS * NUM_CHANNELS],
+            offset: vec![0; NUM_GAINS * NUM_CHANNELS],
+        };
+        // current = 2.0 * (1000 - 0) = 2000.0
+        assert!((diode_current(1000, 0, 0, &cal) - 2000.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn diode_current_with_offset() {
+        let mut cal = CalibrationData {
+            gain_trim: vec![1.0; NUM_GAINS * NUM_CHANNELS],
+            offset: vec![0; NUM_GAINS * NUM_CHANNELS],
+        };
+        cal.set_offset(0, 0, 100);
+        // current = 1.0 * (500 - 100) = 400.0
+        assert!((diode_current(500, 0, 0, &cal) - 400.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn compute_currents_all() {
+        let cal = CalibrationData {
+            gain_trim: vec![1.0; NUM_GAINS * NUM_CHANNELS],
+            offset: vec![0; NUM_GAINS * NUM_CHANNELS],
+        };
+        let raw = RawDiodeData {
+            a: 100,
+            b: 200,
+            c: 300,
+            d: 400,
+        };
+        let c = compute_currents(&raw, 0, &cal);
+        assert!((c.a - 100.0).abs() < 1e-9);
+        assert!((c.b - 200.0).abs() < 1e-9);
+        assert!((c.c - 300.0).abs() < 1e-9);
+        assert!((c.d - 400.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn total_current_sum() {
+        let c = DiodeCurrents {
+            a: 1.0,
+            b: 2.0,
+            c: 3.0,
+            d: 4.0,
+        };
+        assert!((total_current(&c) - 10.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn position_centered() {
+        let c = DiodeCurrents {
+            a: 1.0,
+            b: 1.0,
+            c: 1.0,
+            d: 1.0,
+        };
+        let pos = compute_position(&c, 4.5, 4.5);
+        assert!((pos.x - 0.0).abs() < 1e-9);
+        assert!((pos.y - 0.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn position_x_offset() {
+        // X = GX * (B-D)/(B+D)
+        let c = DiodeCurrents {
+            a: 1.0,
+            b: 3.0,
+            c: 1.0,
+            d: 1.0,
+        };
+        let pos = compute_position(&c, 4.5, 4.5);
+        // x = 4.5 * (3-1)/(3+1) = 4.5 * 0.5 = 2.25
+        assert!((pos.x - 2.25).abs() < 1e-9);
+        assert!((pos.y - 0.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn position_y_offset() {
+        // Y = GY * (A-C)/(A+C)
+        let c = DiodeCurrents {
+            a: 4.0,
+            b: 1.0,
+            c: 2.0,
+            d: 1.0,
+        };
+        let pos = compute_position(&c, 4.5, 4.5);
+        // y = 4.5 * (4-2)/(4+2) = 4.5 * 1/3 = 1.5
+        assert!((pos.y - 1.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn position_zero_denominator_is_nan_like_c() {
+        // No beam: both quadrant sums are 0. C divides 0/0 -> NaN; we match.
+        let c = DiodeCurrents {
+            a: 0.0,
+            b: 0.0,
+            c: 0.0,
+            d: 0.0,
+        };
+        let pos = compute_position(&c, 4.5, 4.5);
+        assert!(pos.x.is_nan(), "pos.x = {}", pos.x);
+        assert!(pos.y.is_nan(), "pos.y = {}", pos.y);
+    }
+
+    #[test]
+    fn position_nonzero_over_zero_is_infinite_like_c() {
+        // X numerator nonzero, B+D == 0 (cancelling currents) -> C yields +-Inf.
+        let c = DiodeCurrents {
+            a: 1.0,
+            b: 2.0,
+            c: 1.0,
+            d: -2.0,
+        };
+        let pos = compute_position(&c, 4.5, 4.5);
+        assert!(pos.x.is_infinite(), "pos.x = {}", pos.x);
+    }
+
+    #[test]
+    fn position_negative_x() {
+        // B < D => x < 0
+        let c = DiodeCurrents {
+            a: 1.0,
+            b: 1.0,
+            c: 1.0,
+            d: 3.0,
+        };
+        let pos = compute_position(&c, 4.5, 4.5);
+        // x = 4.5 * (1-3)/(1+3) = 4.5 * (-0.5) = -2.25
+        assert!((pos.x - (-2.25)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn default_gain_trims_values() {
+        let trims = default_gain_trims();
+        assert_eq!(trims.len(), NUM_GAINS * NUM_CHANNELS);
+        // Gain 0: 350e-9 / 10 / 1e5 = 3.5e-13
+        let expected_g0 = 350e-9 / 10.0 / 1e5;
+        assert!((trims[0] - expected_g0).abs() < 1e-20);
+        // Gain 5: 700e-6 / 10 / 1e5 = 7e-10
+        let expected_g5 = 700e-6 / 10.0 / 1e5;
+        assert!((trims[5 * NUM_CHANNELS] - expected_g5).abs() < 1e-20);
     }
 }

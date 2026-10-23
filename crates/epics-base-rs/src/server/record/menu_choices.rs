@@ -41,8 +41,9 @@
 //! the tables are generated and not written: a hand copy can drift, and the
 //! drift is silent.
 
-use crate::error::{CaError, CaResult};
+use crate::error::{CaError, CaResult, Owed};
 use crate::server::snapshot::EnumStringForm;
+use crate::types::c_parse::{epics_parse_uint16, epics_parse_uint16_units};
 use crate::types::{DbFieldType, EpicsValue, PvString};
 
 /// The shared `menu()` choice tables, re-exported from the tables the generator
@@ -269,88 +270,6 @@ pub fn shared_menu_choices(field: &str) -> Option<&'static [&'static str]> {
     }
 }
 
-/// C `strtoul(str, &end, 0)` — the parse `epicsParseULong` runs
-/// (`epicsStdlib.c:57-79`) with `dbConvertBase`, which is 0 unless
-/// `EPICS_DB_CONVERT_DECIMAL_ONLY=YES` (`epicsConvert.c:37`, `iocInit.c:140`).
-/// Base 0 means: leading whitespace, optional sign, `0x`/`0X` hex, leading-`0`
-/// octal, else decimal. A `-` negates modulo 2^64, exactly as C's `strtoul`
-/// does — `"-65534"` is a *valid* parse producing 0xFFFF…0002.
-///
-/// Returns `(value, rest)`; `None` is C's `S_stdlib_noConversion` /
-/// `S_stdlib_overflow`.
-fn c_strtoul_base0(s: &str) -> Option<(u64, &str)> {
-    use crate::runtime::stdlib::c_isspace;
-
-    let b = s.as_bytes();
-    let mut i = 0;
-    while i < b.len() && c_isspace(b[i] as char) {
-        i += 1;
-    }
-    let mut negate = false;
-    if i < b.len() && (b[i] == b'+' || b[i] == b'-') {
-        negate = b[i] == b'-';
-        i += 1;
-    }
-
-    let mut base: u64 = 10;
-    if i < b.len() && b[i] == b'0' {
-        if i + 1 < b.len() && (b[i + 1] | 0x20) == b'x' {
-            if i + 2 < b.len() && b[i + 2].is_ascii_hexdigit() {
-                base = 16;
-                i += 2;
-            } else {
-                // C strtoul consumes the leading "0" and stops at the 'x'.
-                return Some((0, &s[i + 1..]));
-            }
-        } else {
-            base = 8;
-        }
-    }
-
-    let start = i;
-    let mut acc: u64 = 0;
-    while i < b.len() {
-        let digit = match b[i] {
-            c @ b'0'..=b'9' => u64::from(c - b'0'),
-            c @ b'a'..=b'f' => u64::from(c - b'a') + 10,
-            c @ b'A'..=b'F' => u64::from(c - b'A') + 10,
-            _ => break,
-        };
-        if digit >= base {
-            break;
-        }
-        // C reports ERANGE, which epicsParseULong turns into an error return.
-        acc = acc.checked_mul(base)?.checked_add(digit)?;
-        i += 1;
-    }
-    if i == start {
-        return None; // S_stdlib_noConversion
-    }
-    let value = if negate { acc.wrapping_neg() } else { acc };
-    Some((value, &s[i..]))
-}
-
-/// C `epicsParseUInt16(str, &val, dbConvertBase, NULL)` (`epicsStdlib.c:229-243`).
-///
-/// Whitespace is legal *around* the number (strtoul skips leading, the
-/// `units == NULL` tail check skips trailing) but any other trailing character
-/// is `S_stdlib_extraneous`. The range check is C's, verbatim: a value that
-/// wrapped through the negative side (`> ~0xffff`) is NOT an overflow — it
-/// truncates to its low 16 bits.
-fn epics_parse_uint16(s: &str) -> Option<u16> {
-    let (value, rest) = c_strtoul_base0(s)?;
-    if !rest
-        .bytes()
-        .all(|b| crate::runtime::stdlib::c_isspace(b as char))
-    {
-        return None; // S_stdlib_extraneous
-    }
-    if value > 0xffff && value <= !0xffff_u64 {
-        return None; // S_stdlib_overflow
-    }
-    Some(value as u16)
-}
-
 /// Resolve a `DBF_MENU` field's `DBR_STRING` write against THAT field's own
 /// choice table — C `dbConvert.c::putStringMenu` (lines 1206-1229), the
 /// converter every runtime `dbPut` of a string into a menu field goes through.
@@ -389,11 +308,34 @@ pub fn resolve_menu_field_string(
 /// `putStringMenu`/`dbPutStringNum` hand back to `dbPut`, which aborts before
 /// storing anything (`dbAccess.c:1362` `if (status) goto done`), so the field
 /// keeps its previous value and the record is not processed.
-fn bad_choice(field: &str, choices: &[&str], s: &str) -> CaError {
-    CaError::BadChoice(format!(
-        "{field}: '{s}' is not one of {choices:?} nor an index below {}",
-        choices.len()
+/// `owed` is the converter's report; the loader's `dbPutStringNum` prints
+/// none.
+fn bad_choice(field: &str, choices: &[&str], s: &str, owed: Owed) -> CaError {
+    CaError::BadChoice(crate::error::ChoiceRefusal::menu(
+        field,
+        s,
+        choices.len(),
+        owed,
     ))
+}
+
+/// The `DBF_DEVICE` twin of [`resolve_menu_field_string`]: C's
+/// `cvt_st_device` (`dbFastLinkConv.c:319-349`) takes the same exact label or
+/// index below `nChoice`, and reports a refusal under its own name.
+pub(crate) fn resolve_device_field_string(
+    field: &str,
+    choices: &[&str],
+    dbf_type: DbFieldType,
+    s: &str,
+) -> CaResult<EpicsValue> {
+    resolve_choice(
+        field,
+        choices,
+        dbf_type,
+        s,
+        MenuBound::DbPut,
+        Owed::CvtStDevice,
+    )
 }
 
 /// Resolve a `DBF_MENU` field's `.db` value — C `dbStaticRun.c::dbPutStringNum`
@@ -428,6 +370,16 @@ pub fn binary_enum_states(znam: &PvString, onam: &PvString) -> Vec<PvString> {
     }
 }
 
+/// C `put_enum_str` for the two-state records (`biRecord.c:208-217`,
+/// `boRecord.c`, `busyRecord.c`): ZNAM, then ONAM, both untrimmed, so an
+/// empty name selects an empty slot.
+pub fn binary_enum_str_state(znam: &PvString, onam: &PvString, name: &PvString) -> Option<u16> {
+    [znam, onam]
+        .iter()
+        .position(|state| state.as_bytes() == name.as_bytes())
+        .map(|i| i as u16)
+}
+
 /// C `get_enum_strs` for the 16-state records (`mbbi`/`mbbo`): ZRST..FFST cut at
 /// the last non-empty state — C's high-water `no_str` (`mbbiRecord.c:262-269`).
 pub fn multibit_enum_states(states: [&PvString; 16]) -> Vec<PvString> {
@@ -437,6 +389,23 @@ pub fn multibit_enum_states(states: [&PvString; 16]) -> Vec<PvString> {
         .map(|i| i + 1)
         .unwrap_or(0);
     states[..no_str].iter().map(|s| (*s).clone()).collect()
+}
+
+/// C `put_enum_str` for the 16-state records (`mbbiRecord.c:273-290`,
+/// `mbboRecord.c:354-371`): nothing unless `sdef`, else the first of all 16
+/// slots, defined or not, so an empty name selects the first empty slot.
+pub fn multibit_enum_str_state(
+    sdef: bool,
+    states: [&PvString; 16],
+    name: &PvString,
+) -> Option<u16> {
+    if !sdef {
+        return None;
+    }
+    states
+        .iter()
+        .position(|state| state.as_bytes() == name.as_bytes())
+        .map(|i| i as u16)
 }
 
 /// The 16 state-string fields of `mbbi`/`mbbo`, in the DBD order that gives
@@ -457,6 +426,22 @@ pub fn multibit_state_string_index(field: &str) -> Option<u16> {
         .iter()
         .position(|f| f.eq_ignore_ascii_case(field))
         .map(|i| i as u16)
+}
+
+/// ZRVL..FFVL, the state values.
+const MULTIBIT_STATE_VALUES: [&str; 16] = [
+    "ZRVL", "ONVL", "TWVL", "THVL", "FRVL", "FVVL", "SXVL", "SVVL", "EIVL", "NIVL", "TEVL", "ELVL",
+    "TVVL", "TTVL", "FTVL", "FFVL",
+];
+
+/// One of the 32 state fields whose put reaches `init_common` from
+/// `special()` (`mbbiRecord.c:221`, `mbboRecord.c:286`): every `SPC_MOD`
+/// field but SIMM.
+pub fn multibit_state_field(field: &str) -> bool {
+    multibit_state_string_index(field).is_some()
+        || MULTIBIT_STATE_VALUES
+            .iter()
+            .any(|f| f.eq_ignore_ascii_case(field))
 }
 
 /// C `get_enum_str` for the two-state records (`bi`/`bo`/`busy`):
@@ -485,62 +470,111 @@ pub fn multibit_enum_string_form(states: [&PvString; 16]) -> EnumStringForm {
     )
 }
 
-/// C `dbConvert.c::putStringEnum` (lines 1149-1190) — a `DBR_STRING` write to a
-/// `DBF_ENUM` field, i.e. `caput MY:VALVE Open`.
+/// C `dbFastLinkConv.c::cvt_st_e` (lines 247-282) — a scalar `DBR_STRING`
+/// write to a `DBF_ENUM` field, i.e. `caput MY:VALVE Open`.
 ///
-/// C routes it through the record's `put_enum_str` rset slot (an exact
-/// `strncmp` against the state strings — `boRecord.c::put_enum_str` ZNAM/ONAM,
-/// `mbboRecord.c:354-371` ZRST..FFST) and, when no state matched, falls back to
-/// `epicsParseUInt16` + the `get_enum_strs` bound (`val < no_str`). Both slots
-/// read the SAME state table, so the port takes it once, from
-/// [`Record::enum_state_strings`](crate::server::record::Record::enum_state_strings) —
-/// a name the record advertises to a client is exactly a name a client may put,
-/// by construction.
+/// C routes it through the record's `put_enum_str` rset slot
+/// ([`Record::enum_str_state`](crate::server::record::Record::enum_str_state))
+/// and, when no state matched, falls back to `epicsParseUInt16` + the
+/// `get_enum_strs` bound (`val < no_str`) — see `cvt_st_e`.
 ///
 /// A record whose `enum_state_strings` is `None` leaves both rset slots NULL in
 /// C (`mbbiDirect`/`mbboDirect`), and `putStringEnum` fails the put with
-/// `S_db_noRSET`. The caller passes `None` for that case; the put is REJECTED,
-/// never coerced — C stores nothing on either failure path.
-///
-/// Deviation from C (Tier 2): C's `put_enum_str`
-/// scans all 16 raw state slots, so on a record with states `["a","b"]` a put of
-/// the EMPTY string matches the first undefined slot and stores `VAL=2` — a
-/// state the record's own `get_enum_strs` does not advertise. The port matches
-/// against the advertised (highwater-trimmed) table only, so an unmatched name
-/// is `S_db_badChoice` in every case.
-pub fn resolve_enum_state_string(
+/// `S_db_noRSET`; the put is REJECTED, never coerced — C stores nothing on
+/// either failure path.
+pub fn resolve_enum_state_string<R: crate::server::record::Record + ?Sized>(
     field: &str,
-    states: Option<&[PvString]>,
+    record: &R,
     s: &PvString,
 ) -> CaResult<EpicsValue> {
-    let Some(states) = states else {
+    resolve_enum_state(field, record, s, epics_parse_uint16)
+}
+
+/// C `dbConvert.c::putStringEnum` (lines 1149-1190), the `dbPutConvertRoutine`
+/// row a `special(SPC_DBADDR)` enum field (`mbbo.VAL`) takes: as
+/// [`resolve_enum_state_string`], but the index fallback parses with `&end`.
+pub fn resolve_put_string_enum<R: crate::server::record::Record + ?Sized>(
+    field: &str,
+    record: &R,
+    s: &PvString,
+) -> CaResult<EpicsValue> {
+    resolve_enum_state(field, record, s, epics_parse_uint16_units)
+}
+
+fn resolve_enum_state<R: crate::server::record::Record + ?Sized>(
+    field: &str,
+    record: &R,
+    s: &PvString,
+    parse_index: fn(&str) -> Option<u16>,
+) -> CaResult<EpicsValue> {
+    let Some(states) = record.enum_state_strings() else {
         return Err(CaError::TypeMismatch(format!(
             "{field}: DBF_ENUM field whose record supplies no enum-state table \
              (C put_enum_str == NULL: S_db_noRSET)"
         )));
     };
-    // C `strncmp` is byte-exact and case-SENSITIVE.
-    let index = states
-        .iter()
-        .position(|state| state.as_bytes() == s.as_bytes())
-        .map(|i| i as u16)
-        // C's `get_enum_strs` fallback: `epicsParseUInt16` + `val < no_str`.
-        .or_else(|| {
-            let value = epics_parse_uint16(&s.as_str_lossy())?;
-            (value < states.len() as u16).then_some(value)
-        })
-        .ok_or_else(|| {
-            CaError::BadChoice(format!(
-                "{field}: '{}' is not one of {:?} nor an index below {}",
-                s.as_str_lossy(),
-                states
-                    .iter()
-                    .map(|st| st.as_str_lossy().into_owned())
-                    .collect::<Vec<_>>(),
-                states.len()
-            ))
-        })?;
+    let index = enum_state_index(record, &states, s, parse_index).ok_or_else(|| {
+        CaError::BadChoice(crate::error::ChoiceRefusal::enum_state(
+            field,
+            &s.as_str_lossy(),
+            states.len(),
+        ))
+    })?;
     Ok(EpicsValue::Enum(index))
+}
+
+/// The string `dbGet` hands [`cvt_st_e`] on a `DBR_ENUM` read of `value`:
+/// one `DBF_STRING` element, the fast path's `no_elements == 1`
+/// (`dbAccess.c:967`). `None` for anything else, which `dbGet`'s conversion
+/// table reads instead.
+pub(crate) fn cvt_st_e_input(value: &EpicsValue) -> Option<&PvString> {
+    match value {
+        EpicsValue::String(s) => Some(s),
+        EpicsValue::StringArray(a) if a.len() == 1 => a.first(),
+        _ => None,
+    }
+}
+
+/// C `cvt_st_e` (`dbFastLinkConv.c:247-281`) reading `s` from a field of
+/// `record` as `DBR_ENUM`: the record's `put_enum_str`, then `epicsParseUInt16`
+/// below `no_str`, its `get_enum_strs` count. Every read route — a link, a CA
+/// read or monitor, `dbtgf` — converts here; `Err` is the line C prints.
+///
+/// On a state name C's `put_enum_str` stores the state into the record's VAL
+/// and leaves the reader's buffer unwritten (`:252-254`). That is a C defect
+/// and is not copied: the read answers the state's index and stores nothing.
+pub(crate) fn cvt_st_e<R: crate::server::record::Record + ?Sized>(
+    record: &R,
+    s: &PvString,
+) -> Result<u16, Box<crate::server::recgbl::PutReport>> {
+    use crate::server::recgbl::{PutReport, ReportString};
+    let Some(states) = record.enum_state_strings() else {
+        return Err(Box::new(PutReport::RecSupError {
+            message: "dbPutField",
+            record_type: record.record_type(),
+            support: "put_enum_str",
+        }));
+    };
+    enum_state_index(record, &states, s, epics_parse_uint16).ok_or_else(|| {
+        Box::new(PutReport::IllegalChoice {
+            from: ReportString::new(&s.as_str_lossy()),
+        })
+    })
+}
+
+/// The state `s` selects: the record's `put_enum_str`, else an index
+/// `parse_index` reads below `states.len()`, C's `no_str`.
+fn enum_state_index<R: crate::server::record::Record + ?Sized>(
+    record: &R,
+    states: &[PvString],
+    s: &PvString,
+    parse_index: fn(&str) -> Option<u16>,
+) -> Option<u16> {
+    if let Some(i) = record.enum_str_state(s) {
+        return Some(i);
+    }
+    let value = parse_index(&s.as_str_lossy())?;
+    (value < states.len() as u16).then_some(value)
 }
 
 /// The one string→menu-index converter. Both public entry points are this
@@ -554,8 +588,23 @@ pub(crate) fn resolve_menu_field_string_bounded(
     s: &str,
     bound: MenuBound,
 ) -> CaResult<EpicsValue> {
-    let index =
-        menu_index_from_string(choices, s, bound).ok_or_else(|| bad_choice(field, choices, s))?;
+    let owed = match bound {
+        MenuBound::DbPut => Owed::CvtStMenu,
+        MenuBound::DbLoad => Owed::Nothing,
+    };
+    resolve_choice(field, choices, dbf_type, s, bound, owed)
+}
+
+fn resolve_choice(
+    field: &str,
+    choices: &[&str],
+    dbf_type: DbFieldType,
+    s: &str,
+    bound: MenuBound,
+    owed: Owed,
+) -> CaResult<EpicsValue> {
+    let index = menu_index_from_string(choices, s, bound)
+        .ok_or_else(|| bad_choice(field, choices, s, owed))?;
     Ok(menu_index_value(dbf_type, index))
 }
 
@@ -572,6 +621,12 @@ pub(crate) enum MenuBound {
 /// The shared front end of both C converters: exact label, else a base-0
 /// `epicsParseUInt16` index, then the caller's bound.
 fn menu_index_from_string(choices: &[&str], s: &str, bound: MenuBound) -> Option<i64> {
+    // `dbPutStringNum`: "empty string is the same as writing numeric zero"
+    // (`dbStaticRun.c:405-407`), before the choice test.
+    let s = match bound {
+        MenuBound::DbLoad if s.is_empty() => "0",
+        _ => s,
+    };
     if let Some(i) = choices.iter().position(|c| *c == s) {
         return Some(i as i64);
     }
@@ -785,5 +840,14 @@ mod tests {
         // 0xFFFF_FFFF_FFFF_FFFF, which is `> ~0xffff` is false, so it
         // truncates to 0xffff instead of erroring.
         assert_eq!(epics_parse_uint16("-1"), Some(0xffff));
+    }
+
+    /// glibc's base-0 `strtoul` reads C23 `0b` under EPICS' `_GNU_SOURCE`,
+    /// so `putStringMenu` and `dbPutStringNum` take `0b1` as choice 1.
+    #[test]
+    fn a_menu_index_takes_glibc_s_binary_prefix() {
+        for bound in [MenuBound::DbPut, MenuBound::DbLoad] {
+            assert_eq!(menu_index_from_string(MENU_PRIORITY, "0b1", bound), Some(1));
+        }
     }
 }

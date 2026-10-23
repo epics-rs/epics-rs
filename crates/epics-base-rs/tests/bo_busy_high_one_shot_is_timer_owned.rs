@@ -143,10 +143,11 @@ record(bo, "SB") {
     assert_eq!(db.get_pv("ST").unwrap(), EpicsValue::Long(0));
 }
 
-/// `process()` arms and nothing else: the action it emits is the delayed
-/// callback, and the record keeps no cell for a later cycle to consume.
+/// The pass past the write arms and nothing else: the action
+/// `after_write_actions` emits is the delayed callback, and the record keeps
+/// no cell for a later cycle to consume.
 #[test]
-fn process_arms_the_delayed_callback_and_leaves_val_alone() {
+fn the_write_pass_arms_the_delayed_callback_and_leaves_val_alone() {
     for (label, rec) in [
         ("bo", Box::new(BoRecord::new(1)) as Box<dyn Record>),
         ("busy", {
@@ -157,10 +158,9 @@ fn process_arms_the_delayed_callback_and_leaves_val_alone() {
     ] {
         let mut rec = rec;
         rec.put_field("HIGH", EpicsValue::Double(5.0)).unwrap();
-        let outcome = rec.process().unwrap();
+        rec.process().unwrap();
         assert!(
-            outcome
-                .actions
+            rec.after_write_actions()
                 .iter()
                 .any(|a| matches!(a, ProcessAction::DelayedCallbackAfter(_))),
             "{label}: VAL=1 with HIGH>0 must arm the delayed callback"
@@ -233,7 +233,7 @@ fn the_timer_body_matches_my_callback_func() {
 /// re-arm converted that HIGH with `Duration::from_secs_f64`, which PANICS
 /// above `u64::MAX` seconds, so a value C accepts aborted the timer thread.
 /// The re-arm now takes `runtime::time::duration_from_secs`, the converter the
-/// arming path in `process()` already uses, so such a HIGH re-arms at
+/// arming path in `after_write_actions` already uses, so such a HIGH re-arms at
 /// `Duration::MAX` — C's queued callback that no comparison reaches — rather
 /// than returning `Drop`. `Drop` is reserved for the one-shot that is no
 /// longer live. The representable neighbour is pinned beside it so the rule is

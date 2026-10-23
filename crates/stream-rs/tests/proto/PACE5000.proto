@@ -1,0 +1,80 @@
+# PACE5000.proto
+
+# stream protocol file for GE PACE5000 pressure controller
+
+# Mark Rivers
+# November 13, 2012
+
+getUnits {
+   out ":UNIT:PRES?";
+   in  ":UNIT:PRES %s";
+}
+setUnits {
+   out ":UNIT:PRES %s";
+}
+
+getControl {
+   out ":OUTP:STAT?";
+   in  ":OUTP:STAT %d";
+}
+setControl {
+   out ":OUTP:STAT %d";
+}
+
+getSlewMode {
+   out ":SOUR:PRES:SLEW:MODE?";
+   in  ":SOUR:PRES:SLEW:MODE %s";
+}
+setSlewMode {
+   out ":SOUR:PRES:SLEW:MODE %s";
+}
+
+getSlew {
+   out ":SOUR:PRES:SLEW?";
+   in  ":SOUR:PRES:SLEW %f";
+}
+setSlew {
+   out ":SOUR:PRES:SLEW %f";
+}
+
+getEffort {
+   out ":SOUR:PRES:EFF?";
+   in  ":SOUR:PRES:EFF %f";
+}
+
+getPressure {
+   out ":SENS:PRES?";
+   in  ":SENS:PRES %f";
+}
+
+getSetpoint {
+   out ":SOUR:PRES:LEV:IMM:AMPL?";
+   in  ":SOUR:PRES:LEV:IMM:AMPL %f";
+}
+
+setSetpoint {
+   out ":SOUR:PRES:LEV:IMM:AMPL %f";
+}
+
+getVent {
+   out ":SOUR:PRES:LEV:IMM:AMPL:VENT?";
+   in  ":SOUR:PRES:LEV:IMM:AMPL:VENT %d";
+}
+
+setVent {
+   out ":SOUR:PRES:LEV:IMM:AMPL:VENT %d";
+}
+
+getError {
+   out ":SYST:ERR?";
+   in  ":SYST:ERR %80c";
+}
+
+getModel {
+   out "*IDN?";
+   in  "*IDN %80c";
+}
+
+
+
+

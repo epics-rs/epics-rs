@@ -30,11 +30,11 @@ fn build(fields: &[&str], order: ByteOrder) -> Vec<u8> {
     let owned: Vec<String> = fields.iter().map(|s| s.to_string()).collect();
     let inner = FieldDesc::Structure {
         struct_id: String::new(),
-        fields: build_nested(&owned),
+        fields: build_nested(&owned).into(),
     };
     let pv_request = FieldDesc::Structure {
         struct_id: String::new(),
-        fields: vec![("field".to_string(), inner)],
+        fields: vec![("field".to_string(), inner)].into(),
     };
     // pvRequest wire format begins with the 0x80 type tag (the rest of the
     // structure body follows). encode_type_desc emits both the tag and the
@@ -114,7 +114,7 @@ fn build_with_pipeline(fields: &[&str], queue_size: u32, order: ByteOrder) -> Ve
     let owned: Vec<String> = fields.iter().map(|s| s.to_string()).collect();
     let field_struct = FieldDesc::Structure {
         struct_id: String::new(),
-        fields: build_nested(&owned),
+        fields: build_nested(&owned).into(),
     };
     // Typed options, matching pvxs `.record("pipeline", true)` /
     // `.record("queueSize", N)` (clientreq.cpp:312-323): `bool pipeline`
@@ -131,18 +131,20 @@ fn build_with_pipeline(fields: &[&str], queue_size: u32, order: ByteOrder) -> Ve
                 "queueSize".to_string(),
                 FieldDesc::Scalar(crate::pvdata::ScalarType::UInt),
             ),
-        ],
+        ]
+        .into(),
     };
     let record_struct = FieldDesc::Structure {
         struct_id: String::new(),
-        fields: vec![("_options".to_string(), options_struct.clone())],
+        fields: vec![("_options".to_string(), options_struct.clone())].into(),
     };
     let pv_request_desc = FieldDesc::Structure {
         struct_id: String::new(),
         fields: vec![
             ("field".to_string(), field_struct.clone()),
             ("record".to_string(), record_struct),
-        ],
+        ]
+        .into(),
     };
 
     // pvRequest value (descriptor + full value per
@@ -211,49 +213,10 @@ pub fn request_to_mask(
     // sends as a 6-byte 0xFD-cached empty struct) → wildcard: select the
     // whole structure. pvxs `request2mask`
     // `else if(!fields.valid()) foundrequested = true`.
-    match request_desc.and_then(|rd| mask_for_named_selector(value_desc, rd, "field")) {
+    match request_desc.and_then(|rd| field_selector_mask(value_desc, rd)) {
         Some(result) => result,
         None => Ok(select_all_bits(value_desc)),
     }
-}
-
-/// Derive the distinct put-leg and get-leg field masks for a `ChannelPutGet`
-/// pvRequest, returned as `(put_mask, get_mask)`.
-///
-/// **Not a pvxs behaviour.** pvxs does not implement PUT_GET at all:
-/// `ServerConn::handle_PUT_GET()` (`pvxs/src/serverconn.cpp:259-260`) is an
-/// empty body, so a client's PUT_GET INIT gets no reply whatsoever. There is
-/// no pvxs counterpart for this function to diverge from — the port's PUT_GET
-/// is a **pvAccessCPP / pvDatabaseCPP extension**, a strict superset of pvxs.
-/// Do not file a pvxs-parity finding against it; the references below are the
-/// authority instead, and they are NOT present on this machine, so the
-/// leg-mask derivation is unverified against its source.
-///
-/// pvDatabaseCPP `ChannelPutGetLocal::create` builds two separate copy views
-/// — `PVCopy::create(master, pvRequest, "putField")` for the writable leg and
-/// `PVCopy::create(master, pvRequest, "getField")` for the readback leg
-/// (modules/pvDatabase/src/pvAccess/channelLocal.cpp). `getPut` then returns
-/// the put-leg structure's current value and `getGet` the get-leg structure's
-/// value, so the two legs must mask the channel value by their own selector.
-///
-/// When a leg-specific selector (`putField` / `getField`) is absent, the
-/// pvAccess `getRequestedStructure` fallback uses the common request structure
-/// — i.e. the `field` selector, or the whole structure when even that is
-/// absent (modules/pvAccess/testApp/remote/testServer.cpp `getRequestedStructure`).
-/// That fallback is exactly [`request_to_mask`], so a plain `field`-only or
-/// empty pvRequest yields identical put/get masks (back-compat with the common
-/// NT round trip where the put and readback types coincide).
-pub fn put_get_masks(
-    value_desc: &crate::pvdata::FieldDesc,
-    request_desc: Option<&crate::pvdata::FieldDesc>,
-) -> Result<(crate::proto::BitSet, crate::proto::BitSet), RequestMaskError> {
-    let leg = |selector: &str| match request_desc
-        .and_then(|rd| mask_for_named_selector(value_desc, rd, selector))
-    {
-        Some(result) => result,
-        None => request_to_mask(value_desc, request_desc),
-    };
-    Ok((leg("putField")?, leg("getField")?))
 }
 
 /// Set every bit of `value_desc` (root + all descendants) — the wildcard
@@ -267,23 +230,20 @@ fn select_all_bits(value_desc: &crate::pvdata::FieldDesc) -> crate::proto::BitSe
     mask
 }
 
-/// Compute the field mask for a single *named* top-level selector
-/// (`"field"`, `"putField"`, `"getField"`) inside `request_desc`.
+/// Compute the field mask for the top-level `field` selector inside
+/// `request_desc`.
 ///
-/// Returns `None` when that selector key is absent at the top level, so the
-/// caller can fall back to a more general selector or a wildcard (the pvAccess
-/// `getRequestedStructure` fallback,
-/// modules/pvAccess/testApp/remote/testServer.cpp). Returns `Some(Ok(mask))`
-/// when the selector is present and matches at least one field, and
-/// `Some(Err(EmptyMask))` when it is present but selects nothing usable.
-fn mask_for_named_selector(
+/// Returns `None` when `field` is absent at the top level, so the caller can
+/// fall back to the wildcard. Returns `Some(Ok(mask))` when it is present and
+/// matches at least one field, and `Some(Err(EmptyMask))` when it is present
+/// but selects nothing usable.
+fn field_selector_mask(
     value_desc: &crate::pvdata::FieldDesc,
     request_desc: &crate::pvdata::FieldDesc,
-    selector: &str,
 ) -> Option<Result<crate::proto::BitSet, RequestMaskError>> {
     use crate::pvdata::FieldDesc;
     let request_field = match request_desc {
-        FieldDesc::Structure { fields, .. } => fields.iter().find(|(n, _)| n == selector),
+        FieldDesc::Structure { fields, .. } => fields.iter().find(|(n, _)| n == "field"),
         _ => None,
     };
     match request_field {
@@ -302,8 +262,8 @@ fn mask_for_named_selector(
     }
 }
 
-/// Translate the direct children of one pvRequest selector substructure
-/// (`field` / `putField` / `getField`) into a field `BitSet` over
+/// Translate the direct children of the pvRequest `field` substructure
+/// into a field `BitSet` over
 /// `value_desc`, using pvData spec §5.4 depth-first bit numbering.
 ///
 /// pvxs `request2mask` (pvrequest.cpp:13-52) iterates the request's
@@ -609,7 +569,7 @@ impl PvRequestExpr {
             // empty `field {}` selects all
             FieldDesc::Structure {
                 struct_id: String::new(),
-                fields: Vec::new(),
+                fields: Vec::new().into(),
             }
         } else {
             let mut paths = self.fields.clone();
@@ -624,7 +584,7 @@ impl PvRequestExpr {
             }
             FieldDesc::Structure {
                 struct_id: String::new(),
-                fields: tree,
+                fields: tree.into(),
             }
         };
         let mut top_fields: Vec<(String, FieldDesc)> = vec![("field".to_string(), inner)];
@@ -646,15 +606,16 @@ impl PvRequestExpr {
                         "_options".to_string(),
                         FieldDesc::Structure {
                             struct_id: String::new(),
-                            fields: opts,
+                            fields: opts.into(),
                         },
-                    )],
+                    )]
+                    .into(),
                 },
             ));
         }
         FieldDesc::Structure {
             struct_id: String::new(),
-            fields: top_fields,
+            fields: top_fields.into(),
         }
     }
 
@@ -828,12 +789,12 @@ fn build_nested(paths: &[String]) -> Vec<(String, FieldDesc)> {
         let child = if tails.is_empty() {
             FieldDesc::Structure {
                 struct_id: String::new(),
-                fields: Vec::new(),
+                fields: Vec::new().into(),
             }
         } else {
             FieldDesc::Structure {
                 struct_id: String::new(),
-                fields: build_nested(&tails),
+                fields: build_nested(&tails).into(),
             }
         };
         out.push((head, child));
@@ -867,8 +828,11 @@ fn attach_field_options(tree: &mut [(String, FieldDesc)], path: &str, opts: &[(S
     let FieldDesc::Structure { fields, .. } = child else {
         return;
     };
+    // Rebuilt rather than edited: the new member changes the bit count of
+    // this structure and of every ancestor, each recomputed on the way out.
+    let mut members = std::mem::take(fields).into_vec();
     match tail {
-        Some(rest) => attach_field_options(fields, rest, opts),
+        Some(rest) => attach_field_options(&mut members, rest, opts),
         None => {
             let opt_fields: Vec<(String, FieldDesc)> = opts
                 .iter()
@@ -881,16 +845,17 @@ fn attach_field_options(tree: &mut [(String, FieldDesc)], path: &str, opts: &[(S
                 .collect();
             // Replace an existing `_options` (repeated bracket on the
             // same field) rather than appending a duplicate member.
-            fields.retain(|(n, _)| n != "_options");
-            fields.push((
+            members.retain(|(n, _)| n != "_options");
+            members.push((
                 "_options".to_string(),
                 FieldDesc::Structure {
                     struct_id: String::new(),
-                    fields: opt_fields,
+                    fields: opt_fields.into(),
                 },
             ));
         }
     }
+    *fields = members.into();
 }
 
 /// Errors from [`PvRequestExpr::parse`].
@@ -1550,6 +1515,30 @@ fn is_value_char(c: char) -> bool {
 mod tests {
     use super::*;
 
+    /// Every structure's stored bit count equals a recount of its members.
+    fn assert_counts_exact(desc: &FieldDesc) -> usize {
+        let n = match desc {
+            FieldDesc::Structure { fields, .. } => {
+                1 + fields
+                    .iter()
+                    .map(|(_, c)| assert_counts_exact(c))
+                    .sum::<usize>()
+            }
+            _ => 1,
+        };
+        assert_eq!(desc.total_bits(), n, "{desc}");
+        n
+    }
+
+    #[test]
+    fn field_options_rebuild_every_ancestor_count() {
+        let expr = PvRequestExpr::parse("field(a.b.c[deadband=abs:1.0,x=y],a.d)").expect("parse");
+        let desc = expr.to_field_desc();
+        assert_counts_exact(&desc);
+        // root, field, a, b, c, _options, deadband, x, d
+        assert_eq!(desc.total_bits(), 9);
+    }
+
     #[test]
     fn pv_request_starts_with_structure_tag() {
         let bytes = build_pv_request(false);
@@ -1758,17 +1747,19 @@ mod tests {
                     "value".to_string(),
                     FieldDesc::Structure {
                         struct_id: String::new(),
-                        fields: vec![("index".to_string(), FieldDesc::Scalar(ScalarType::Int))],
+                        fields: vec![("index".to_string(), FieldDesc::Scalar(ScalarType::Int))]
+                            .into(),
                     },
                 ),
                 (
                     "alarm".to_string(),
                     FieldDesc::Structure {
                         struct_id: String::new(),
-                        fields: Vec::new(),
+                        fields: Vec::new().into(),
                     },
                 ),
-            ],
+            ]
+            .into(),
         };
         assert!(
             request_to_mask(&ntenum, Some(&req)).is_ok(),
@@ -1787,17 +1778,19 @@ mod tests {
                     "value".to_string(),
                     FieldDesc::Structure {
                         struct_id: String::new(),
-                        fields: vec![("index".to_string(), FieldDesc::Scalar(ScalarType::Int))],
+                        fields: vec![("index".to_string(), FieldDesc::Scalar(ScalarType::Int))]
+                            .into(),
                     },
                 ),
                 (
                     "alarm".to_string(),
                     FieldDesc::Structure {
                         struct_id: String::new(),
-                        fields: Vec::new(),
+                        fields: Vec::new().into(),
                     },
                 ),
-            ],
+            ]
+            .into(),
         }
     }
 
@@ -1810,16 +1803,17 @@ mod tests {
                 "field".to_string(),
                 FieldDesc::Structure {
                     struct_id: String::new(),
-                    fields: children,
+                    fields: children.into(),
                 },
-            )],
+            )]
+            .into(),
         }
     }
 
     fn empty_struct() -> FieldDesc {
         FieldDesc::Structure {
             struct_id: String::new(),
-            fields: Vec::new(),
+            fields: Vec::new().into(),
         }
     }
 
@@ -1861,7 +1855,7 @@ mod tests {
             "value".to_string(),
             FieldDesc::Structure {
                 struct_id: String::new(),
-                fields: vec![("index".to_string(), empty_struct())],
+                fields: vec![("index".to_string(), empty_struct())].into(),
             },
         )]);
         let mask = request_to_mask(&ntenum_desc(), Some(&req)).expect("nested form resolves");
@@ -1890,38 +1884,6 @@ mod tests {
     }
 
     #[test]
-    fn put_get_masks_resolve_dotted_literal_legs() {
-        // The PUT_GET putField/getField legs go through the same
-        // selector translation and must accept dotted literals too.
-        let req = FieldDesc::Structure {
-            struct_id: String::new(),
-            fields: vec![
-                (
-                    "putField".to_string(),
-                    FieldDesc::Structure {
-                        struct_id: String::new(),
-                        fields: vec![("value.index".to_string(), empty_struct())],
-                    },
-                ),
-                (
-                    "getField".to_string(),
-                    FieldDesc::Structure {
-                        struct_id: String::new(),
-                        fields: vec![("value".to_string(), empty_struct())],
-                    },
-                ),
-            ],
-        };
-        let (put_mask, get_mask) =
-            put_get_masks(&ntenum_desc(), Some(&req)).expect("both legs resolve");
-        assert!(put_mask.get(2) && !put_mask.get(1), "put leg: index only");
-        assert!(
-            get_mask.get(1) && get_mask.get(2),
-            "get leg: value sub-tree (empty selector → implicit all)"
-        );
-    }
-
-    #[test]
     fn request_to_mask_field_as_scalar_errors() {
         // pvxs `request2mask` (pvrequest.cpp) — when `field` is
         // present but is NOT a sub-structure, the trailing `else`
@@ -1938,16 +1900,17 @@ mod tests {
                     "alarm".to_string(),
                     FieldDesc::Structure {
                         struct_id: String::new(),
-                        fields: Vec::new(),
+                        fields: Vec::new().into(),
                     },
                 ),
-            ],
+            ]
+            .into(),
         };
 
         // pvRequest whose `field` is a scalar rather than a sub-struct.
         let req_field_scalar = FieldDesc::Structure {
             struct_id: String::new(),
-            fields: vec![("field".to_string(), FieldDesc::Scalar(ScalarType::Int))],
+            fields: vec![("field".to_string(), FieldDesc::Scalar(ScalarType::Int))].into(),
         };
         assert_eq!(
             request_to_mask(&value, Some(&req_field_scalar)),
@@ -1959,7 +1922,7 @@ mod tests {
         // whole-structure wildcard (pvxs `!fields.valid()` branch).
         let req_no_field = FieldDesc::Structure {
             struct_id: String::new(),
-            fields: Vec::new(),
+            fields: Vec::new().into(),
         };
         let mask = request_to_mask(&value, Some(&req_no_field)).expect("absent field → wildcard");
         for i in 0..value.total_bits() {
@@ -1973,8 +1936,7 @@ mod tests {
     /// Value is itself invalid, so `request2mask` takes
     /// `else if(!fields.valid()) foundrequested = true;`
     /// (`pvrequest.cpp:53-55`) and the still-empty mask is widened by the
-    /// "empty mask is wildcard" branch (`:63-68`). Both mask entry points
-    /// must agree.
+    /// "empty mask is wildcard" branch (`:63-68`).
     #[test]
     fn absent_pvrequest_is_the_all_fields_wildcard() {
         use crate::pvdata::ScalarType;
@@ -1987,125 +1949,17 @@ mod tests {
                     "alarm".to_string(),
                     FieldDesc::Structure {
                         struct_id: String::new(),
-                        fields: vec![("severity".to_string(), FieldDesc::Scalar(ScalarType::Int))],
+                        fields: vec![("severity".to_string(), FieldDesc::Scalar(ScalarType::Int))]
+                            .into(),
                     },
                 ),
-            ],
+            ]
+            .into(),
         };
 
         let mask = request_to_mask(&value, None).expect("an absent pvRequest is never an error");
         for i in 0..value.total_bits() {
             assert!(mask.get(i), "absent pvRequest must set every bit ({i})");
-        }
-
-        let (put_mask, get_mask) =
-            put_get_masks(&value, None).expect("an absent pvRequest is never an error");
-        for i in 0..value.total_bits() {
-            assert!(put_mask.get(i), "absent pvRequest put leg must set bit {i}");
-            assert!(get_mask.get(i), "absent pvRequest get leg must set bit {i}");
-        }
-    }
-
-    #[test]
-    fn put_get_masks_distinct_put_and_get_legs() {
-        // ChannelPutGet negotiates separate putField / getField selections
-        // (pvDatabaseCPP `ChannelPutGetLocal::create`). The put-leg mask and
-        // get-leg mask must reflect their own selector, not collapse to one.
-        use crate::pvdata::ScalarType;
-
-        // value { value: Double (bit 1), aux: Double (bit 2) }
-        let value = FieldDesc::Structure {
-            struct_id: String::new(),
-            fields: vec![
-                ("value".to_string(), FieldDesc::Scalar(ScalarType::Double)),
-                ("aux".to_string(), FieldDesc::Scalar(ScalarType::Double)),
-            ],
-        };
-        let leaf = |name: &str| {
-            (
-                name.to_string(),
-                FieldDesc::Structure {
-                    struct_id: String::new(),
-                    fields: Vec::new(),
-                },
-            )
-        };
-        // putField(value), getField(aux)
-        let req = FieldDesc::Structure {
-            struct_id: String::new(),
-            fields: vec![
-                (
-                    "putField".to_string(),
-                    FieldDesc::Structure {
-                        struct_id: String::new(),
-                        fields: vec![leaf("value")],
-                    },
-                ),
-                (
-                    "getField".to_string(),
-                    FieldDesc::Structure {
-                        struct_id: String::new(),
-                        fields: vec![leaf("aux")],
-                    },
-                ),
-            ],
-        };
-        let (put_mask, get_mask) = put_get_masks(&value, Some(&req)).expect("distinct masks");
-        // put-leg selects `value` (bit 1), not `aux` (bit 2).
-        assert!(put_mask.get(0) && put_mask.get(1) && !put_mask.get(2));
-        // get-leg selects `aux` (bit 2), not `value` (bit 1).
-        assert!(get_mask.get(0) && get_mask.get(2) && !get_mask.get(1));
-    }
-
-    #[test]
-    fn put_get_masks_fallback_to_field_then_wildcard() {
-        // Absent putField/getField → pvAccess `getRequestedStructure`
-        // fallback to the common `field` selector (testServer.cpp), so both
-        // legs collapse to the same mask — back-compat with the NT round
-        // trip. Fully empty pvRequest → both wildcards.
-        use crate::pvdata::ScalarType;
-
-        let value = FieldDesc::Structure {
-            struct_id: String::new(),
-            fields: vec![
-                ("value".to_string(), FieldDesc::Scalar(ScalarType::Double)),
-                ("aux".to_string(), FieldDesc::Scalar(ScalarType::Double)),
-            ],
-        };
-
-        // field(value) only — both legs select `value`.
-        let req_field = FieldDesc::Structure {
-            struct_id: String::new(),
-            fields: vec![(
-                "field".to_string(),
-                FieldDesc::Structure {
-                    struct_id: String::new(),
-                    fields: vec![(
-                        "value".to_string(),
-                        FieldDesc::Structure {
-                            struct_id: String::new(),
-                            fields: Vec::new(),
-                        },
-                    )],
-                },
-            )],
-        };
-        let (put_mask, get_mask) = put_get_masks(&value, Some(&req_field)).expect("field fallback");
-        assert_eq!(
-            put_mask, get_mask,
-            "absent putField/getField → both legs use the `field` selection"
-        );
-        assert!(put_mask.get(0) && put_mask.get(1) && !put_mask.get(2));
-
-        // Empty pvRequest (no field at all) — both legs wildcard.
-        let req_empty = FieldDesc::Structure {
-            struct_id: String::new(),
-            fields: Vec::new(),
-        };
-        let (put_mask, get_mask) =
-            put_get_masks(&value, Some(&req_empty)).expect("empty → wildcard");
-        for i in 0..value.total_bits() {
-            assert!(put_mask.get(i) && get_mask.get(i), "wildcard bit {i}");
         }
     }
 

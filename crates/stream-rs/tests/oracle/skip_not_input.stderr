@@ -1,0 +1,3 @@
+_main_ skip_not_input.proto line 1: Use of 'skip' only allowed in input formats
+_main_ in string variable 'terminator' in protocol file 'skip_not_input.proto' line 1
+_main_ while compiling protocol 'p' for 'rec0'

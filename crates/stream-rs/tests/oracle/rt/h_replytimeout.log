@@ -1,0 +1,16 @@
+StreamCore::startProtocol(rec, startMode=StartNormal)
+StreamCore::evalCommand(rec): activeCommand = out
+StreamCore::evalOut: outputLine = "GET<0d><0a>"
+StreamCore::evalOut(rec): lockRequest(5000)
+StreamCore::lockCallback(rec, StreamIoSuccess)
+StreamCore::writeCallback(rec, StreamIoSuccess)
+StreamCore::evalCommand(rec): activeCommand = in
+StreamCore::readCallback(rec, StreamIoNoReply input="", size=0)
+rec: No reply within 100 ms to "GET<0d><0a>"
+StreamCore::finishProtocol(rec, ReplyTimeout) bus owner
+starting exception handler
+StreamCore::evalCommand(rec): activeCommand = out
+StreamCore::evalOut: outputLine = "TO<0d><0a>"
+StreamCore::writeCallback(rec, StreamIoSuccess)
+StreamCore::evalCommand(rec): activeCommand = end
+StreamCore::finishProtocol(rec, Success) bus owner

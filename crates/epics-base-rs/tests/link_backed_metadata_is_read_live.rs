@@ -119,8 +119,11 @@ async fn a_put_posts_the_targets_current_precision() {
     db.put_pv("CALC.A", EpicsValue::Double(5.0)).await.unwrap();
 
     let event = rx.try_recv().expect("the put posts A");
+    // Metadata is read at delivery, through the GET door, over the log.
+    let mut delivered = db.channel_snapshot_for_field(&rec, "A", false).unwrap();
+    event.write_log_over(&mut delivered);
     assert_eq!(
-        event.snapshot.precision(),
+        delivered.precision(),
         Some(4),
         "the posted snapshot must carry SRC's current precision, not the one \
          cached when CALC last processed (measured: 5.0 where C gives 5.0000)"
@@ -240,7 +243,7 @@ fn the_record_alone_cannot_serve_a_link_backed_field() {
     let mut calc = CalcRecord::default();
     calc.prec = 7;
     calc.set_inp_link(0, "SRC");
-    let inst = RecordInstance::new_boxed("T:CALC".to_string(), Box::new(calc));
+    let inst = RecordInstance::new_boxed("T:CALC", Box::new(calc));
 
     assert!(
         inst.snapshot_for_field("A").is_none(),
@@ -286,8 +289,11 @@ async fn the_property_sweep_posts_a_link_backed_field_with_its_targets_metadata(
     db.put_pv("CALC.PREC", EpicsValue::Short(3)).await.unwrap();
 
     let event = rx.try_recv().expect("the property sweep posts A");
+    // Metadata is read at delivery, through the GET door, over the log.
+    let mut delivered = db.channel_snapshot_for_field(&rec, "A", false).unwrap();
+    event.write_log_over(&mut delivered);
     assert_eq!(
-        event.snapshot.precision(),
+        delivered.precision(),
         Some(1),
         "A is link-backed: the sweep must post SRC's precision, never CALC's own"
     );

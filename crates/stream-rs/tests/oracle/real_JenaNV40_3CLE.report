@@ -1,0 +1,108 @@
+rec0: JenaNV40_3CLE.proto remoteSet(1,2,3,4,5,6,7,8,9) P
+remoteSet {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "setk,1,%{0|1}";
+}
+rec1: JenaNV40_3CLE.proto cloopSet(1,2,3,4,5,6,7,8,9) P
+cloopSet {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "cloop,1,%{0|1}";
+}
+rec2: JenaNV40_3CLE.proto cloopRead(1,2,3,4,5,6,7,8,9) P
+cloopRead {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "cloop,1";
+    in "cloop,1,%i";
+}
+rec3: JenaNV40_3CLE.proto piezoMove(1,2,3,4,5,6,7,8,9) P
+piezoMove {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "set,1,%f";
+}
+rec4: JenaNV40_3CLE.proto piezoRead(1,2,3,4,5,6,7,8,9) P
+piezoRead {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "rk,1";
+    in "rk,1,%f";
+}
+rec5: JenaNV40_3CLE.proto monModeSet(1,2,3,4,5,6,7,8,9) P
+monModeSet {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "monwpa,1,%{0|1|2}";
+}
+rec6: JenaNV40_3CLE.proto monModeRead(1,2,3,4,5,6,7,8,9) P
+monModeRead {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "monwpa,1";
+    in "monwpa,1,%i";
+}

@@ -26,6 +26,7 @@
 // RTEMS-EXEC-MODEL-ALLOW(1): not run by the default nextest profile - this file is a module of the `interop_pvxs` binary, which `.config/nextest.toml`'s default-filter excludes.
 
 use super::interop_helpers::{PVXMONITOR, PVXPUT, pvxs_command, pvxs_lib_dir, require_pvxs};
+use super::interop_helpers::{PvxsOutput, rerun_pvxs};
 
 use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
 #[cfg(tokio_backend)]
@@ -48,15 +49,13 @@ fn env_key() -> &'static str {
 #[cfg(tokio_backend)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn interop_monitor_a_pvxmonitor_streams_from_rust_server() {
-    let Some(pvxmonitor) = require_pvxs(PVXMONITOR) else {
-        return;
-    };
+    let pvxmonitor = require_pvxs(PVXMONITOR);
 
     let pv = SharedPV::new();
     pv.open(
         FieldDesc::Structure {
             struct_id: "epics:nt/NTScalar:1.0".into(),
-            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Int))],
+            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Int))].into(),
         },
         PvField::Structure(PvStructure {
             struct_id: "epics:nt/NTScalar:1.0".into(),
@@ -94,24 +93,30 @@ async fn interop_monitor_a_pvxmonitor_streams_from_rust_server() {
     let server_str_c = server_str.clone();
     let lib = pvxs_lib_dir().into_os_string();
     let out = tokio::task::spawn_blocking(move || {
-        let mut child = pvxs_command(&pvxmonitor_p)
-            .arg("M:STREAM")
-            .env("EPICS_PVA_AUTO_ADDR_LIST", "NO")
-            .env("EPICS_PVA_NAME_SERVERS", &server_str_c)
-            .env(env_key(), lib)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("pvxmonitor spawn");
-        std::thread::sleep(Duration::from_millis(1500));
-        // SIGTERM so the child has a chance to flush stdout.
-        unsafe {
-            libc::kill(child.id() as i32, libc::SIGTERM);
-        }
-        std::thread::sleep(Duration::from_millis(150));
-        // Fallback hard-kill if still alive.
-        let _ = child.kill();
-        child.wait_with_output().expect("wait")
+        // Killed rather than ended, so `pvxs_output` cannot run it.
+        rerun_pvxs(
+            || {
+                let mut child = pvxs_command(&pvxmonitor_p)
+                    .arg("M:STREAM")
+                    .env("EPICS_PVA_AUTO_ADDR_LIST", "NO")
+                    .env("EPICS_PVA_NAME_SERVERS", &server_str_c)
+                    .env(env_key(), &lib)
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .expect("pvxmonitor spawn");
+                std::thread::sleep(Duration::from_millis(1500));
+                // SIGTERM so the child has a chance to flush stdout.
+                unsafe {
+                    libc::kill(child.id() as i32, libc::SIGTERM);
+                }
+                std::thread::sleep(Duration::from_millis(150));
+                // Fallback hard-kill if still alive.
+                let _ = child.kill();
+                child.wait_with_output().expect("wait")
+            },
+            |out| String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
     })
     .await
     .expect("join");
@@ -152,49 +157,13 @@ async fn interop_monitor_a_pvxmonitor_streams_from_rust_server() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn interop_monitor_b_rust_client_streams_from_pvxs_server() {
-    let Some(pvxput) = require_pvxs(PVXPUT) else {
-        return;
-    };
-    // The only absent-prerequisite skip on this path; everything past it
-    // is our own helper, so it panics rather than skipping.
-    if super::interop_helpers::require_cxx().is_none() {
-        return;
-    }
+    let pvxput = require_pvxs(PVXPUT);
+    super::interop_helpers::require_cxx();
     let helper = super::interop_helpers::cpp_helper("reverse_server");
 
-    let port = {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        l.local_addr().unwrap().port()
-    };
     let ready = super::interop_helpers::ReadyFile::new("mon_b_ready");
 
-    let mut child = match std::process::Command::new(&helper)
-        .arg("--port")
-        .arg(port.to_string())
-        .arg("--ready")
-        .arg(ready.path())
-        .arg("--writable")
-        .env(env_key(), pvxs_lib_dir())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
-        Ok(c) => c,
-        Err(e) => panic!("failed to spawn reverse_server: {e}"),
-    };
-    let mut up = false;
-    for _ in 0..50 {
-        if ready.is_up() {
-            up = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    if !up {
-        let _ = child.kill();
-        let _ = child.wait();
-        panic!("reverse_server not ready");
-    }
+    let (srv, port) = super::interop_helpers::start_cpp_server(&helper, &ready, &["--writable"]);
 
     let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
     let client = epics_pva_rs::client_native::PvaClient::builder()
@@ -220,6 +189,17 @@ async fn interop_monitor_b_rust_client_streams_from_pvxs_server() {
         .await
         .expect("subscribe");
 
+    // `pvmonitor_handle` returns before the subscription exists; a put
+    // ahead of the first update is lost to the stream.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while received.lock().unwrap().is_empty() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no first monitor update on W:INT within 5 s"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
     // Drive pvxput to update the value 5 times. Sleep between
     // each so the pvxs server can dispatch one MONITOR DATA frame
     // per put.
@@ -230,7 +210,7 @@ async fn interop_monitor_b_rust_client_streams_from_pvxs_server() {
         let p = pvxput_p.clone();
         let s = server_str.clone();
         let l = lib.clone();
-        let _ = tokio::task::spawn_blocking(move || {
+        let out = tokio::task::spawn_blocking(move || {
             pvxs_command(&p)
                 .arg("-w")
                 .arg("3")
@@ -239,23 +219,27 @@ async fn interop_monitor_b_rust_client_streams_from_pvxs_server() {
                 .env("EPICS_PVA_AUTO_ADDR_LIST", "NO")
                 .env("EPICS_PVA_NAME_SERVERS", &s)
                 .env(env_key(), l)
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
+                .pvxs_output()
         })
-        .await;
+        .await
+        .expect("pvxput task")
+        .expect("spawn pvxput");
+        assert!(
+            out.status.success(),
+            "pvxput W:INT {val} failed ({}): {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
         tokio::time::sleep(Duration::from_millis(60)).await;
     }
     tokio::time::sleep(Duration::from_millis(300)).await;
     handle.stop();
 
-    let _ = child.kill();
-    let _ = child.wait();
+    drop(srv);
 
     let seen = received.lock().unwrap().clone();
-    // 5 puts fire, but the subscribe-establishment race can swallow
-    // the first one or two on slow CI. ≥3 distinct events out of 5
-    // is enough to prove the MONITOR stream itself works.
+    // The first update plus 5 puts; ≥3 proves the MONITOR stream works
+    // without counting on every put arriving as its own update.
     assert!(
         seen.len() >= 3,
         "expected ≥3 monitor events on Rust client, got {}: {seen:?}",

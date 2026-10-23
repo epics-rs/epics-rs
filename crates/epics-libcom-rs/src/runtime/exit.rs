@@ -109,6 +109,26 @@ pub fn exit(status: i32) -> ! {
     std::process::exit(status)
 }
 
+/// [`exit`], ending the way `signo`'s default disposition ends a C IOC: the
+/// exit callbacks run, then `signo` is re-raised at `SIG_DFL`, so the parent
+/// sees the process killed by it (status 143 for SIGTERM, 130 for SIGINT).
+#[cfg(unix)]
+pub fn exit_by_signal(signo: i32) -> ! {
+    call_at_exits();
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    // SAFETY: plain libc calls on a valid signal number and a local set.
+    unsafe {
+        libc::signal(signo, libc::SIG_DFL);
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, signo);
+        libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
+        libc::raise(signo);
+    }
+    // Reached only if the default action somehow did not end the process.
+    std::process::exit(128 + signo)
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex as StdMutex};

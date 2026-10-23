@@ -51,7 +51,7 @@ fn has_reprocess(actions: &[ProcessAction]) -> bool {
 /// `pp(TRUE)` process cycle.
 fn put_cnt(rec: &mut ScalerRecord, cnt: i16) -> Vec<ProcessAction> {
     rec.cnt = cnt;
-    rec.special("CNT", true).unwrap();
+    rec.special("CNT", true, &Default::default()).unwrap();
     let mut actions = rec.take_special_actions();
     actions.extend(rec.process().unwrap().actions);
     actions
@@ -59,7 +59,10 @@ fn put_cnt(rec: &mut ScalerRecord, cnt: i16) -> Vec<ProcessAction> {
 
 /// The record's own scheduled re-entry, as the framework runs it.
 fn fire_timer(rec: &mut ScalerRecord) -> Vec<ProcessAction> {
-    rec.set_process_continuation(true);
+    rec.set_process_continuation(
+        true,
+        epics_base_rs::server::record::Pact::new(&std::sync::atomic::AtomicBool::new(false)),
+    );
     rec.process().unwrap().actions
 }
 
@@ -123,6 +126,28 @@ fn a_refresh_landing_mid_count_refreshes_and_rearms() {
     );
 }
 
+/// The refresh lands with the done interrupt already raised: `updateCounts`
+/// never asks `done()`, so the count stays live and the latch waits for the
+/// `deviceCallbackFunc` process that completes it (`:366`).
+#[test]
+fn a_refresh_landing_after_done_leaves_completion_to_the_interrupt() {
+    let mut rec = counting();
+    rec.set_done();
+
+    let actions = fire_timer(&mut rec);
+    assert_eq!(rec.ss, SCALER_STATE_COUNTING, "a refresh completes nothing");
+    assert!(has_reprocess(&actions), "and re-arms the next update");
+    assert!(!rec.should_fire_forward_link());
+
+    rec.process().unwrap();
+    assert_eq!(
+        rec.ss, SCALER_STATE_IDLE,
+        "the interrupt's process completes it"
+    );
+    assert_eq!(rec.cnt, 0);
+    assert!(rec.should_fire_forward_link());
+}
+
 /// The delayed start is the OTHER callback: it lands with `ss == IDLE` too and
 /// must still start the count.
 #[test]
@@ -130,7 +155,10 @@ fn a_delayed_start_landing_with_ss_idle_still_starts_the_count() {
     let mut rec = ScalerRecord::default();
     rec.freq = 1e7;
     rec.tp = 100.0;
-    rec.dly = 0.01;
+    // Long enough that the put's own process lands inside it: a host that
+    // spends DLY between `special` and that process starts the count there,
+    // as C's `delayCallbackFunc` would have set REQSTART by then.
+    rec.dly = 0.5;
     rec.nch = 4;
     rec.init_record(1).unwrap();
 
@@ -138,7 +166,7 @@ fn a_delayed_start_landing_with_ss_idle_still_starts_the_count() {
     assert!(has_reprocess(&actions), "DLY > 0 arms the delayed start");
     assert_eq!(rec.ss, SCALER_STATE_IDLE, "nothing counts during the wait");
 
-    std::thread::sleep(Duration::from_millis(30));
+    std::thread::sleep(Duration::from_millis(600));
     fire_timer(&mut rec);
     assert_eq!(
         rec.ss, SCALER_STATE_COUNTING,

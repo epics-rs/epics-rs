@@ -1,0 +1,9 @@
+AsynDriverInterface::getBusInterface(rec, P, 0)
+AsynDriverInterface(rec)
+AsynDriverInterface(rec) createAsynUser
+AsynDriverInterface(rec) epicsTimerQueueActive::allocate(true)
+AsynDriverInterface(rec) timerQueue->createTimer()
+AsynDriverInterface(rec) done
+rec: AsynDriverInterface::connectToBus(P, 0): pasynManager->connectDevice(0x*, P, 0) = asynSuccess
+rec: AsynDriverInterface::connectToBus(P, 0): device is now connected
+AsynDriverInterface::getBusInterface(P, 0): new interface allocated

@@ -2,7 +2,7 @@
 
 use crate::error::AsynStatus;
 use crate::interrupt::InterruptValue;
-use crate::request::{RequestOp, RequestResult};
+use crate::request::{ReadEntry, RequestOp, RequestResult};
 
 use super::command::PortCommand;
 use super::event::EventPayload;
@@ -21,7 +21,7 @@ impl From<&RequestOp> for PortCommand {
             RequestOp::Int64Write { value } => Self::Int64Write { value: *value },
             RequestOp::Float64Read => Self::Float64Read,
             RequestOp::Float64Write { value } => Self::Float64Write { value: *value },
-            RequestOp::OctetRead { buf_size } => Self::OctetRead {
+            RequestOp::OctetRead { buf_size, .. } => Self::OctetRead {
                 buf_size: *buf_size,
             },
             RequestOp::OctetWrite { data } => Self::OctetWrite { data: data.clone() },
@@ -29,13 +29,14 @@ impl From<&RequestOp> for PortCommand {
                 data,
                 buf_size,
                 flush,
+                ..
             } => Self::OctetWriteRead {
                 data: data.clone(),
                 buf_size: *buf_size,
                 flush: *flush,
             },
             RequestOp::OctetWriteBinary { data } => Self::OctetWriteBinary { data: data.clone() },
-            RequestOp::OctetReadBinary { buf_size } => Self::OctetReadBinary {
+            RequestOp::OctetReadBinary { buf_size, .. } => Self::OctetReadBinary {
                 buf_size: *buf_size,
             },
             RequestOp::UInt32DigitalRead { mask } => Self::UInt32DigitalRead { mask: *mask },
@@ -45,27 +46,33 @@ impl From<&RequestOp> for PortCommand {
             },
             RequestOp::EnumRead => Self::EnumRead,
             RequestOp::EnumWrite { index } => Self::EnumWrite { index: *index },
-            RequestOp::Int32ArrayRead { max_elements } => Self::Int32ArrayRead {
+            RequestOp::Int32ArrayRead { buf, max_elements } => Self::Int32ArrayRead {
+                data: buf.to_vec(),
                 max_elements: *max_elements,
             },
             RequestOp::Int32ArrayWrite { data } => Self::Int32ArrayWrite { data: data.clone() },
-            RequestOp::Float64ArrayRead { max_elements } => Self::Float64ArrayRead {
+            RequestOp::Float64ArrayRead { buf, max_elements } => Self::Float64ArrayRead {
+                data: buf.to_vec(),
                 max_elements: *max_elements,
             },
             RequestOp::Float64ArrayWrite { data } => Self::Float64ArrayWrite { data: data.clone() },
-            RequestOp::Int8ArrayRead { max_elements } => Self::Int8ArrayRead {
+            RequestOp::Int8ArrayRead { buf, max_elements } => Self::Int8ArrayRead {
+                data: buf.to_vec(),
                 max_elements: *max_elements,
             },
             RequestOp::Int8ArrayWrite { data } => Self::Int8ArrayWrite { data: data.clone() },
-            RequestOp::Int16ArrayRead { max_elements } => Self::Int16ArrayRead {
+            RequestOp::Int16ArrayRead { buf, max_elements } => Self::Int16ArrayRead {
+                data: buf.to_vec(),
                 max_elements: *max_elements,
             },
             RequestOp::Int16ArrayWrite { data } => Self::Int16ArrayWrite { data: data.clone() },
-            RequestOp::Int64ArrayRead { max_elements } => Self::Int64ArrayRead {
+            RequestOp::Int64ArrayRead { buf, max_elements } => Self::Int64ArrayRead {
+                data: buf.to_vec(),
                 max_elements: *max_elements,
             },
             RequestOp::Int64ArrayWrite { data } => Self::Int64ArrayWrite { data: data.clone() },
-            RequestOp::Float32ArrayRead { max_elements } => Self::Float32ArrayRead {
+            RequestOp::Float32ArrayRead { buf, max_elements } => Self::Float32ArrayRead {
+                data: buf.to_vec(),
                 max_elements: *max_elements,
             },
             RequestOp::Float32ArrayWrite { data } => Self::Float32ArrayWrite { data: data.clone() },
@@ -77,6 +84,8 @@ impl From<&RequestOp> for PortCommand {
             RequestOp::ConnectAddr => Self::ConnectAddr,
             RequestOp::DisconnectAddr => Self::DisconnectAddr,
             RequestOp::ConnectUser => Self::ConnectUser,
+            RequestOp::ExceptionDisconnect => Self::ExceptionDisconnect,
+            RequestOp::ExceptionConnect => Self::ExceptionConnect,
             RequestOp::SetEnable { yes } => Self::SetEnable { yes: *yes },
             RequestOp::SetAutoConnect { yes } => Self::SetAutoConnect { yes: *yes },
             RequestOp::GetBoundsInt32 => Self::GetBoundsInt32,
@@ -110,13 +119,18 @@ impl From<&RequestOp> for PortCommand {
                 iface: req.iface.map(|i| i.asyn_name().to_string()),
             },
             RequestOp::CallParamCallbacks { addr, .. } => Self::CallParamCallbacks { addr: *addr },
+            RequestOp::SetParams { .. } => Self::SetParams,
             RequestOp::GetOption { key } => Self::GetOption { key: key.clone() },
             RequestOp::SetOption { key, value } => Self::SetOption {
                 key: key.clone(),
                 value: value.clone(),
             },
-            RequestOp::Report { level } => Self::Report { level: *level },
-            RequestOp::WithDriver(_) => Self::WithDriver,
+            RequestOp::Report { level, .. } => Self::Report { level: *level },
+            RequestOp::WithDriver(_) | RequestOp::WithDriverAfterQueue(_) => Self::WithDriver,
+            RequestOp::LockPort(_) => Self::LockPort,
+            RequestOp::Cell(cell) | RequestOp::CellInline(cell) => Self::Callback {
+                connect_queue: cell.connect_queue(),
+            },
             RequestOp::SetInputEos { eos } => Self::SetInputEos { eos: eos.clone() },
             RequestOp::SetOutputEos { eos } => Self::SetOutputEos { eos: eos.clone() },
             RequestOp::SetTimeStampSource { name } => {
@@ -149,6 +163,7 @@ impl From<&PortCommand> for RequestOp {
             PortCommand::Float64Write { value } => Self::Float64Write { value: *value },
             PortCommand::OctetRead { buf_size } => Self::OctetRead {
                 buf_size: *buf_size,
+                entry: ReadEntry::new(),
             },
             PortCommand::OctetWrite { data } => Self::OctetWrite { data: data.clone() },
             PortCommand::OctetWriteRead {
@@ -159,10 +174,12 @@ impl From<&PortCommand> for RequestOp {
                 data: data.clone(),
                 buf_size: *buf_size,
                 flush: *flush,
+                entry: ReadEntry::new(),
             },
             PortCommand::OctetWriteBinary { data } => Self::OctetWriteBinary { data: data.clone() },
             PortCommand::OctetReadBinary { buf_size } => Self::OctetReadBinary {
                 buf_size: *buf_size,
+                entry: ReadEntry::new(),
             },
             PortCommand::UInt32DigitalRead { mask } => Self::UInt32DigitalRead { mask: *mask },
             PortCommand::UInt32DigitalWrite { value, mask } => Self::UInt32DigitalWrite {
@@ -171,29 +188,35 @@ impl From<&PortCommand> for RequestOp {
             },
             PortCommand::EnumRead => Self::EnumRead,
             PortCommand::EnumWrite { index } => Self::EnumWrite { index: *index },
-            PortCommand::Int32ArrayRead { max_elements } => Self::Int32ArrayRead {
+            PortCommand::Int32ArrayRead { data, max_elements } => Self::Int32ArrayRead {
+                buf: data.as_slice().into(),
                 max_elements: *max_elements,
             },
             PortCommand::Int32ArrayWrite { data } => Self::Int32ArrayWrite { data: data.clone() },
-            PortCommand::Float64ArrayRead { max_elements } => Self::Float64ArrayRead {
+            PortCommand::Float64ArrayRead { data, max_elements } => Self::Float64ArrayRead {
+                buf: data.as_slice().into(),
                 max_elements: *max_elements,
             },
             PortCommand::Float64ArrayWrite { data } => {
                 Self::Float64ArrayWrite { data: data.clone() }
             }
-            PortCommand::Int8ArrayRead { max_elements } => Self::Int8ArrayRead {
+            PortCommand::Int8ArrayRead { data, max_elements } => Self::Int8ArrayRead {
+                buf: data.as_slice().into(),
                 max_elements: *max_elements,
             },
             PortCommand::Int8ArrayWrite { data } => Self::Int8ArrayWrite { data: data.clone() },
-            PortCommand::Int16ArrayRead { max_elements } => Self::Int16ArrayRead {
+            PortCommand::Int16ArrayRead { data, max_elements } => Self::Int16ArrayRead {
+                buf: data.as_slice().into(),
                 max_elements: *max_elements,
             },
             PortCommand::Int16ArrayWrite { data } => Self::Int16ArrayWrite { data: data.clone() },
-            PortCommand::Int64ArrayRead { max_elements } => Self::Int64ArrayRead {
+            PortCommand::Int64ArrayRead { data, max_elements } => Self::Int64ArrayRead {
+                buf: data.as_slice().into(),
                 max_elements: *max_elements,
             },
             PortCommand::Int64ArrayWrite { data } => Self::Int64ArrayWrite { data: data.clone() },
-            PortCommand::Float32ArrayRead { max_elements } => Self::Float32ArrayRead {
+            PortCommand::Float32ArrayRead { data, max_elements } => Self::Float32ArrayRead {
+                buf: data.as_slice().into(),
                 max_elements: *max_elements,
             },
             PortCommand::Float32ArrayWrite { data } => {
@@ -207,6 +230,8 @@ impl From<&PortCommand> for RequestOp {
             PortCommand::ConnectAddr => Self::ConnectAddr,
             PortCommand::DisconnectAddr => Self::DisconnectAddr,
             PortCommand::ConnectUser => Self::ConnectUser,
+            PortCommand::ExceptionDisconnect => Self::ExceptionDisconnect,
+            PortCommand::ExceptionConnect => Self::ExceptionConnect,
             PortCommand::SetEnable { yes } => Self::SetEnable { yes: *yes },
             PortCommand::SetAutoConnect { yes } => Self::SetAutoConnect { yes: *yes },
             PortCommand::GetBoundsInt32 => Self::GetBoundsInt32,
@@ -251,14 +276,21 @@ impl From<&PortCommand> for RequestOp {
             PortCommand::CallParamCallbacks { addr } => Self::CallParamCallbacks {
                 addr: *addr,
                 updates: vec![],
+                time_stamp: None,
             },
+            PortCommand::SetParams => Self::SetParams { updates: vec![] },
             PortCommand::GetOption { key } => Self::GetOption { key: key.clone() },
             PortCommand::SetOption { key, value } => Self::SetOption {
                 key: key.clone(),
                 value: value.clone(),
             },
-            PortCommand::Report { level } => Self::Report { level: *level },
+            PortCommand::Report { level } => Self::Report {
+                level: *level,
+                sync_locked: false,
+            },
             PortCommand::WithDriver => Self::WithDriver(crate::request::DriverCall::spent()),
+            PortCommand::Callback { .. } => Self::WithDriver(crate::request::DriverCall::spent()),
+            PortCommand::LockPort => Self::LockPort(crate::request::PortLockCall::spent()),
             PortCommand::SetInputEos { eos } => Self::SetInputEos { eos: eos.clone() },
             PortCommand::SetOutputEos { eos } => Self::SetOutputEos { eos: eos.clone() },
             PortCommand::SetTimeStampSource { name } => {
@@ -289,11 +321,24 @@ pub fn result_to_reply(result: &RequestResult, request_id: u64) -> PortReply {
             code: ReplyStatus::from(result.status),
             detail: result.message.clone(),
         }
+    } else if let Some(read) = &result.octet {
+        match read.status() {
+            Ok(()) => ReplyPayload::OctetData {
+                data: read.data().to_vec(),
+                nbytes: read.nbytes_transferred(),
+                eom_reason: read.eom().bits(),
+            },
+            // The wire reply has no slot for a failed read's bytes.
+            Err(e) => ReplyPayload::Error {
+                code: ReplyStatus::from(e.status()),
+                detail: e.to_string(),
+            },
+        }
     } else if let Some(data) = &result.data {
         ReplyPayload::OctetData {
             data: data.clone(),
             nbytes: result.nbytes,
-            eom_reason: result.eom_reason,
+            eom_reason: 0,
         }
     } else if let Some(v) = result.int_val {
         ReplyPayload::Value(ParamValue::Int32(v))
@@ -373,6 +418,8 @@ mod tests {
     use std::time::SystemTime;
 
     use super::*;
+    use crate::interpose::EomReason;
+    use crate::request::OctetRead;
 
     #[test]
     fn request_op_to_command_roundtrip() {
@@ -383,7 +430,10 @@ mod tests {
             RequestOp::Int64Write { value: i64::MAX },
             RequestOp::Float64Read,
             RequestOp::Float64Write { value: 3.14 },
-            RequestOp::OctetRead { buf_size: 256 },
+            RequestOp::OctetRead {
+                buf_size: 256,
+                entry: ReadEntry::new(),
+            },
             RequestOp::OctetWrite {
                 data: vec![1, 2, 3],
             },
@@ -391,6 +441,7 @@ mod tests {
                 data: vec![4, 5],
                 buf_size: 128,
                 flush: true,
+                entry: ReadEntry::new(),
             },
             RequestOp::UInt32DigitalRead { mask: 0xFF },
             RequestOp::UInt32DigitalWrite {
@@ -399,11 +450,17 @@ mod tests {
             },
             RequestOp::EnumRead,
             RequestOp::EnumWrite { index: 2 },
-            RequestOp::Int32ArrayRead { max_elements: 100 },
+            RequestOp::Int32ArrayRead {
+                buf: Default::default(),
+                max_elements: 100,
+            },
             RequestOp::Int32ArrayWrite {
                 data: vec![1, 2, 3],
             },
-            RequestOp::Float64ArrayRead { max_elements: 50 },
+            RequestOp::Float64ArrayRead {
+                buf: Default::default(),
+                max_elements: 50,
+            },
             RequestOp::Float64ArrayWrite {
                 data: vec![1.0, 2.0],
             },
@@ -478,7 +535,8 @@ mod tests {
 
     #[test]
     fn result_to_reply_octet_carries_eom_reason() {
-        let result = RequestResult::octet_read_eom(vec![0x41], 1, 0x01 | 0x02);
+        let read = OctetRead::new(vec![0x41], EomReason::CNT | EomReason::EOS, Ok(()));
+        let result = RequestResult::octet_read(read, 0);
         let reply = result_to_reply(&result, 9);
         assert_eq!(
             reply.payload,
@@ -492,7 +550,8 @@ mod tests {
 
     #[test]
     fn result_to_reply_octet_read() {
-        let result = RequestResult::octet_read(vec![0x48, 0x65], 2);
+        let read = OctetRead::new(vec![0x48, 0x65], EomReason::empty(), Ok(()));
+        let result = RequestResult::octet_read(read, 0);
         let reply = result_to_reply(&result, 4);
         assert_eq!(
             reply.payload,
@@ -502,6 +561,26 @@ mod tests {
                 eom_reason: 0,
             }
         );
+    }
+
+    #[test]
+    fn result_to_reply_failed_octet_read_is_an_error() {
+        let read = OctetRead::new(
+            b"ab".to_vec(),
+            EomReason::empty(),
+            Err(crate::error::AsynError::Status {
+                status: AsynStatus::Timeout,
+                message: "t".into(),
+            }),
+        );
+        let reply = result_to_reply(&RequestResult::octet_read(read, 0), 4);
+        assert!(matches!(
+            reply.payload,
+            ReplyPayload::Error {
+                code: ReplyStatus::Timeout,
+                ..
+            }
+        ));
     }
 
     #[test]

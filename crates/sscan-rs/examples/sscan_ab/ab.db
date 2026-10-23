@@ -1,0 +1,35 @@
+record(ao, "M") {
+  field(PREC, "3")
+  field(DRVH, "100")
+  field(DRVL, "-100")
+}
+record(ao, "M2") {
+  field(PREC, "3")
+  field(DRVH, "100")
+  field(DRVL, "-100")
+}
+record(calc, "D") {
+  field(INPA, "M NPP")
+  field(INPB, "M2 NPP")
+  field(CALC, "A*10+B")
+}
+record(sscan, "S1") {
+  field(MPTS, "10")
+  field(NPTS, "4")
+  field(P1PV, "M")
+  field(P1SP, "1")
+  field(P1EP, "4")
+  field(D01PV, "D")
+  field(T1PV, "D.PROC")
+  field(PDLY, "0.2")
+}
+record(sscan, "S2") {
+  field(MPTS, "10")
+  field(NPTS, "3")
+  field(P1PV, "M2")
+  field(P1SP, "1")
+  field(P1EP, "3")
+  field(D01PV, "D")
+  field(T1PV, "S1.EXSC")
+  field(PDLY, "0.2")
+}

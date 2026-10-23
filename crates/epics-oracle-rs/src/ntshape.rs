@@ -495,7 +495,7 @@ mod tests {
     #[test]
     fn an_unparseable_block_yields_no_shape_rather_than_a_wrong_one() {
         assert!(NtShape::observed("").is_none());
-        assert!(NtShape::observed(" Error: field introspection unavailable").is_none());
+        assert!(NtShape::observed(" Error: Implicit Cancel").is_none());
         // A struct with no `value` member is not a shape either.
         assert!(NtShape::observed("struct \"x\" {\n    double other\n}").is_none());
     }

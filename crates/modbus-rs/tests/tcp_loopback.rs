@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use modbus_rs::ModbusDataType;
 use modbus_rs::driver::{ModbusConfig, ModbusEngine, ModbusFunctionCode, OctetTransport};
-use modbus_rs::error::{ModbusError, ModbusResult};
+use modbus_rs::error::{IoStatus, ModbusError, ModbusResult};
 use modbus_rs::interpose::LinkType;
 
 /// A Modbus/TCP `OctetTransport` over a blocking [`TcpStream`].
@@ -23,7 +23,7 @@ impl OctetTransport for TcpTransport {
     fn write_frame(&mut self, data: &[u8]) -> ModbusResult<()> {
         self.stream
             .write_all(data)
-            .map_err(|e| ModbusError::Io(e.to_string()))
+            .map_err(|e| ModbusError::Io(IoStatus::Error, e.to_string()))
     }
 
     fn read_frame(&mut self, _expected: usize, _timeout: Duration) -> ModbusResult<Vec<u8>> {
@@ -31,12 +31,12 @@ impl OctetTransport for TcpTransport {
         let mut header = [0u8; 6];
         self.stream
             .read_exact(&mut header)
-            .map_err(|e| ModbusError::Io(e.to_string()))?;
+            .map_err(|e| ModbusError::Io(IoStatus::Error, e.to_string()))?;
         let pdu_len = u16::from_be_bytes([header[4], header[5]]) as usize;
         let mut pdu = vec![0u8; pdu_len];
         self.stream
             .read_exact(&mut pdu)
-            .map_err(|e| ModbusError::Io(e.to_string()))?;
+            .map_err(|e| ModbusError::Io(IoStatus::Error, e.to_string()))?;
         let mut frame = header.to_vec();
         frame.extend_from_slice(&pdu);
         Ok(frame)

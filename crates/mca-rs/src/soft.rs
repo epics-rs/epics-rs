@@ -15,10 +15,13 @@
 //! called out below.
 
 use epics_base_rs::error::CaResult;
-use epics_base_rs::server::device_support::{DeviceInitOutcome, DeviceReadOutcome, DeviceSupport};
+use epics_base_rs::server::database::DeviceDoneSource;
+use epics_base_rs::server::device_support::{
+    DeviceInitOutcome, DeviceReadOutcome, DeviceSupport, ReadStart,
+};
 use epics_base_rs::server::record::Record;
 
-use crate::record::{McaCommand, McaRecord, McaStatus};
+use crate::record::{McaCommand, McaDset, McaRecord, McaStatus, Nack};
 
 /// `device(mca, CONSTANT, devMCA_soft, "Soft Channel")`.
 #[derive(Debug, Default)]
@@ -45,51 +48,22 @@ impl DeviceSupport for SoftMca {
     /// C `init_record` (`devMCA_soft.c:64-72`): `pmca->nord = 0`.
     fn init(&mut self, record: &mut dyn Record) -> CaResult<DeviceInitOutcome> {
         Self::mca(record)?.nord = 0;
-        Ok(DeviceInitOutcome::Live)
+        Ok(DeviceInitOutcome::ok())
     }
 
-    /// The device half of one process cycle: send what the record asked to send,
-    /// read the status back, and read the spectrum if the record wants it.
-    ///
-    /// The three steps ARE C's `process`, in C's order — see [`crate::record::cycle`]
-    /// for why they are invoked from here rather than from `Record::process`.
-    fn read(&mut self, record: &mut dyn Record) -> CaResult<DeviceReadOutcome> {
-        let mca = Self::mca(record)?;
+    /// The device half of one process cycle, C `mcaRecord.c:509-790`, run by
+    /// the record against this dset — see [`crate::record::cycle`] for why it
+    /// is invoked from here rather than from `Record::process`.
+    fn read_begin(
+        &mut self,
+        record: &mut dyn Record,
+        done: &DeviceDoneSource<'_>,
+    ) -> CaResult<ReadStart> {
+        Ok(Self::mca(record)?.device_read_begin(self, done))
+    }
 
-        // C `send_msg`: every command is a no-op that returns 0, so NACK is never
-        // raised and no record state changes beyond what the record itself
-        // applied when it handed the commands over.
-        for cmd in mca.take_device_requests() {
-            let _: McaCommand = cmd;
-        }
-
-        // C hands `pmca->pstatus` to `send_msg(mcaReadStatus, ...)`, which writes
-        // nothing (`:133-140`), so the record reads back a status of all zeroes —
-        // and `acquiring = 0` in particular. A soft mca therefore never acquires:
-        // a `STRT` forces `ACQG` to 1, the zeroed status reports 0, the record
-        // sees the 1 -> 0 edge and reads the spectrum, and `ACQG` is back to 0 by
-        // the end of that same cycle. That is not an accident of the stub, it is
-        // what a device with no acquisition clock CAN report, so the port keeps
-        // it.
-        //
-        // TIER-3 DEVIATION (a driver's tier is correctness, not parity): C's
-        // zeroed status also carries `dwellTime = 0`, and the record copies it
-        // (`mcaRecord.c:706-709`) — so the first process of a soft mca silently
-        // destroys `DWEL`. Measured on the C IOC built for this port: `DWEL`
-        // reads 1 at iocInit and 0 after a single `caput PROC 1`, on a record
-        // whose `.db` never mentions `DWEL`. A device that cannot correct the
-        // dwell time reports the dwell it was given, not zero.
-        let landed = mca.apply_status(McaStatus {
-            dwell_time: mca.dwel,
-            ..Default::default()
-        });
-
-        if landed {
-            // C `read_array` (`devMCA_soft.c:155-161`): the buffer is left as it is —
-            // the soft device produces no data — and only NORD moves.
-            mca.land_channel_count(mca.nuse);
-        }
-
+    /// [`Self::read_begin`] has run the whole device half.
+    fn read(&mut self, _record: &mut dyn Record) -> CaResult<DeviceReadOutcome> {
         Ok(DeviceReadOutcome::ok())
     }
 
@@ -105,6 +79,43 @@ impl DeviceSupport for SoftMca {
     // has none to stop. The framework's default no-op is exactly right, and an
     // override that poked `ACQG` would make the DEVICE a second writer of state
     // the record already owns.
+}
+
+/// C `send_msg` (`devMCA_soft.c:74-153`) and `read_array` (`:155-161`).
+impl McaDset for SoftMca {
+    /// Every command is an empty `case` that returns 0.
+    fn send_msg(&mut self, _command: McaCommand) -> Result<(), Nack> {
+        Ok(())
+    }
+
+    /// C's `mcaReadStatus` case writes nothing (`:133-140`), so the record
+    /// reads back a status of all zeroes — and `acquiring = 0` in particular.
+    /// A soft mca therefore never acquires: a `STRT` forces `ACQG` to 1, the
+    /// zeroed status reports 0, the record sees the 1 -> 0 edge and reads the
+    /// spectrum, and `ACQG` is back to 0 by the end of that same cycle. That
+    /// is not an accident of the stub, it is what a device with no
+    /// acquisition clock CAN report, so the port keeps it.
+    ///
+    /// TIER-3 DEVIATION (a driver's tier is correctness, not parity): C's
+    /// zeroed status also carries `dwellTime = 0`, and the record copies it
+    /// (`mcaRecord.c:706-709`) — so the first process of a soft mca silently
+    /// destroys `DWEL`. Measured on the C IOC built for this port: `DWEL`
+    /// reads 1 at iocInit and 0 after a single `caput PROC 1`, on a record
+    /// whose `.db` never mentions `DWEL`. A device that cannot correct the
+    /// dwell time reports the dwell it was given, not zero.
+    fn read_status(&mut self, mca: &McaRecord) -> Result<McaStatus, Nack> {
+        Ok(McaStatus {
+            dwell_time: mca.dwel,
+            ..Default::default()
+        })
+    }
+
+    /// The buffer is left as it is — the soft device produces no data — and
+    /// only NORD moves, to NUSE.
+    fn read_array(&mut self, mca: &mut McaRecord) -> Result<(), Nack> {
+        mca.land_channel_count(mca.nuse);
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -125,10 +136,10 @@ mod tests {
         (dev, rec)
     }
 
-    /// One process cycle, the way the framework runs it: device support's `read`,
+    /// One process cycle of a record that is not simulated: the device half,
     /// then the record's `process`.
     fn cycle(dev: &mut SoftMca, rec: &mut McaRecord) {
-        dev.read(rec).unwrap();
+        rec.run_device_cycle(dev);
         for action in rec.process().unwrap().actions {
             if let epics_base_rs::server::record::ProcessAction::DeviceCommand { command, args } =
                 action
@@ -147,7 +158,7 @@ mod tests {
     fn the_soft_device_does_not_destroy_the_dwell_time() {
         let (mut dev, mut rec) = soft_mca(16);
         rec.put_field("DWEL", EpicsValue::Double(0.5)).unwrap();
-        rec.special("DWEL", true).unwrap();
+        rec.special("DWEL", true, &Default::default()).unwrap();
         cycle(&mut dev, &mut rec);
         assert_eq!(rec.dwel, 0.5);
     }

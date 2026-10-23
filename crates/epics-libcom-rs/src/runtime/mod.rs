@@ -23,6 +23,7 @@ pub mod background;
 pub mod blocking_io;
 pub mod build_info;
 pub mod cant_proceed;
+pub mod crt_errno;
 pub mod env;
 pub mod env_table;
 pub mod epics_string;
@@ -38,11 +39,13 @@ pub mod log;
 pub mod log_client;
 pub mod mac_lib;
 pub mod net;
+pub mod offload;
 // `select(2)` over raw fds, and `libc` for the calls: nothing in it exists
 // on Windows, whose hosted server keeps the tokio reactor.
 #[cfg(unix)]
 pub mod readiness;
 pub mod socket;
+pub mod stdio;
 pub mod stdlib;
 pub mod supervise;
 pub mod sync;

@@ -49,7 +49,7 @@ pub mod serial_port;
 ///
 /// C reaches the same place from the other side: `readIt`/`writeIt` compute
 /// `pollmsec = (int)(timeout * 1000.0)` and then `if (pollmsec == 0) pollmsec =
-/// 1` (`drvAsynIPPort.c:741-743`, `:615-617`). Rounding every positive budget
+/// 1` (`drvAsynIPPort.c:741-743`, `:662-664`). Rounding every positive budget
 /// up is that floor generalised — C only ever sees the caller's timeout here,
 /// whereas the deadline loops also feed this a remainder. Each of those C
 /// triples ends `if (pollmsec < 0) pollmsec = -1`, the wait-forever case a
@@ -76,6 +76,50 @@ pub(crate) fn wait_millis(budget: std::time::Duration) -> u128 {
     }
 }
 
+/// An OS error's own text — C's `strerror(errno)` and
+/// `epicsSocketConvertErrnoToString` — without std's ` (os error N)`.
+pub(crate) fn errno_text(e: &std::io::Error) -> String {
+    let text = e.to_string();
+    match e.raw_os_error() {
+        Some(code) => match text.strip_suffix(&format!(" (os error {code})")) {
+            Some(bare) => bare.to_owned(),
+            None => text,
+        },
+        None => text,
+    }
+}
+
+/// A serial transfer failure in C's words, `"<device> <op> error: <why>"` as
+/// asynError, for an OS error a read, write or flush surfaced as
+/// [`crate::error::AsynError::Io`]; a write keeps the count it moved first.
+/// `why` is the backend's: POSIX prints `strerror(errno)`
+/// (drvAsynSerialPort.c:835, :957), Win32 the `GetLastError()` number
+/// (drvAsynSerialPortWin32.c:523, :621, :677).
+pub(crate) fn transfer_failure(
+    e: crate::error::AsynError,
+    device: &str,
+    op: &str,
+    why: fn(&std::io::Error) -> String,
+) -> crate::error::AsynError {
+    use crate::error::{AsynError, AsynStatus};
+    match e {
+        AsynError::Io(err) => AsynError::Status {
+            status: AsynStatus::Error,
+            message: format!("{device} {op} error: {}", why(&err)),
+        },
+        AsynError::PartialWrite { source, nbytes } => {
+            transfer_failure(*source, device, op, why).with_partial_write(nbytes)
+        }
+        other => other,
+    }
+}
+
+/// C-Win32's `%ld` of `GetLastError()`.
+#[cfg(any(windows, test))]
+pub(crate) fn last_error_code(e: &std::io::Error) -> String {
+    e.raw_os_error().unwrap_or(0).to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -86,8 +130,8 @@ mod tests {
     /// nothing positive rounds down into the expired one.
     /// No production C asyn driver passes `ASYN_DESTRUCTIBLE` to `registerPort`
     /// at pin `e2a281e2`. The flag occurs in exactly six places there — its
-    /// definition (asynDriver.h:97), its two consumers (asynManager.c:2096 in
-    /// `registerPort`, :2271 in `shutdownPort`), the `asynPortDriver` base that
+    /// definition (asynDriver.h:97), its two consumers (asynManager.c:2098 in
+    /// `registerPort`, :2273 in `shutdownPort`), the `asynPortDriver` base that
     /// forwards a caller's `asynFlags` (asynPortDriver.cpp:3996), and two *test*
     /// drivers (testAsynPortDriver.cpp:54, asynPortDriverTest.cpp:58) — plus
     /// documentation. Every real transport registers without it, so a port that
@@ -98,9 +142,9 @@ mod tests {
     /// | port | C original | attributes |
     /// |---|---|---|
     /// | FTDI | drvAsynFTDIPort.cpp:586-587 | `ASYN_CANBLOCK` |
-    /// | IP | drvAsynIPPort.c:1028-1029 | `ASYN_CANBLOCK` |
-    /// | IP server (listener) | drvAsynIPServerPort.c:625-626 | `ASYN_CANBLOCK` |
-    /// | IP server (child) | drvAsynIPServerPort.c:690 → drvAsynIPPortConfigure | `ASYN_CANBLOCK` |
+    /// | IP | drvAsynIPPort.c:1082-1083 | `ASYN_CANBLOCK` |
+    /// | IP server (listener) | drvAsynIPServerPort.c:646-647 | `ASYN_CANBLOCK` |
+    /// | IP server (child) | drvAsynIPServerPort.c:711 → drvAsynIPPortConfigure | `ASYN_CANBLOCK` |
     /// | serial | drvAsynSerialPort.c:1101-1102 | `ASYN_CANBLOCK` |
     /// | serial (win32) | drvAsynSerialPortWin32.c:774-775 | `ASYN_CANBLOCK` |
     /// | USBTMC | drvAsynUSBTMC.c:1273-1274 | `ASYN_CANBLOCK` |
@@ -171,5 +215,37 @@ mod tests {
         assert_eq!(wait_millis(Duration::from_millis(1)), 1);
         assert_eq!(wait_millis(Duration::from_micros(1500)), 1);
         assert_eq!(wait_millis(Duration::from_millis(250)), 250);
+    }
+
+    /// C-Win32 prints the bare `GetLastError()` number, `"%s read error: %ld"`
+    /// / `"%s write error: %ld"` / `"%s flush error: %ld"`
+    /// (drvAsynSerialPortWin32.c:621, :523, :677); a write keeps its count and
+    /// a timeout passes through with no text (:535, :644).
+    #[test]
+    fn a_win32_transfer_failure_is_worded_by_its_last_error_number() {
+        use crate::error::{AsynError, AsynStatus};
+        let denied = || AsynError::Io(std::io::Error::from_raw_os_error(5));
+        let e = transfer_failure(denied(), "COM1", "read", last_error_code);
+        assert_eq!(e.status(), AsynStatus::Error);
+        assert_eq!(e.message(), "COM1 read error: 5");
+        let e = transfer_failure(
+            denied().with_partial_write(3),
+            "COM1",
+            "write",
+            last_error_code,
+        );
+        assert_eq!(e.message(), "COM1 write error: 5");
+        assert_eq!(e.partial_write(), Some(3));
+        let e = transfer_failure(denied(), "COM1", "flush", last_error_code);
+        assert_eq!(e.message(), "COM1 flush error: 5");
+        let timeout = AsynError::Status {
+            status: AsynStatus::Timeout,
+            message: String::new(),
+        }
+        .with_partial_write(2);
+        let e = transfer_failure(timeout, "COM1", "write", last_error_code);
+        assert_eq!(e.status(), AsynStatus::Timeout);
+        assert_eq!(e.message(), "");
+        assert_eq!(e.partial_write(), Some(2));
     }
 }

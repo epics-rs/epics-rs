@@ -51,9 +51,13 @@ fn expand_and_notices(src: &str, macros: &HashMap<String, String>) -> (String, S
     };
     assert!(unsafe { libc::dup2(fd, 2) } >= 0, "dup2 onto fd 2 failed");
 
+    // A script line runs inside `iocshBody`, which may block (`iocsh.cpp:1122`).
+    let was = epics_base_rs::runtime::task::thread_is_ok_to_block();
+    epics_base_rs::runtime::task::set_thread_ok_to_block(true);
     let expanded =
         std::panic::catch_unwind(|| expand_macros(src, macros, MacroExpandOptions::default()).text);
 
+    epics_base_rs::runtime::task::set_thread_ok_to_block(was);
     // Restore BEFORE anything can panic on the assertion, or the failure
     // report has nowhere to go.
     assert!(unsafe { libc::dup2(saved, 2) } >= 0, "restore fd 2 failed");
@@ -323,9 +327,13 @@ fn one_table_announces_a_faulty_value_once_however_many_strings_read_it() {
     };
     assert!(unsafe { libc::dup2(fd, 2) } >= 0, "dup2 onto fd 2 failed");
 
+    // A script line runs inside `iocshBody`, which may block (`iocsh.cpp:1122`).
+    let was = epics_base_rs::runtime::task::thread_is_ok_to_block();
+    epics_base_rs::runtime::task::set_thread_ok_to_block(true);
     let mut table = MacroTable::new(&macros(&[("A", "$(NOPE)")]), MacroExpandOptions::default());
     let first = table.expand("\"q[$(A)]\"\n");
     let second = table.expand("\"r[$(A)]\"\n");
+    epics_base_rs::runtime::task::set_thread_ok_to_block(was);
 
     assert!(unsafe { libc::dup2(saved, 2) } >= 0, "restore fd 2 failed");
     unsafe { libc::close(saved) };

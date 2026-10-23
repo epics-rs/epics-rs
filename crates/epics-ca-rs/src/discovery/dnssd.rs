@@ -5,7 +5,8 @@
 //! 1. **PTR** query on the service-type name `_epics-ca._tcp.<zone>` —
 //!    enumerates the service-instance names.
 //! 2. **SRV** query on each `<instance>._epics-ca._tcp.<zone>` — yields
-//!    the target host and TCP port for that instance.
+//!    the target host and the port a SEARCH is sent to for that instance (the
+//!    server's UDP search port, equal to its TCP port in the default setup).
 //! 3. **A/AAAA** query on each SRV record's own `target()` hostname —
 //!    yields the IP addresses for *that* instance only.
 //!

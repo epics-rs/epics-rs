@@ -1159,8 +1159,9 @@ fn coerce_scalar(sv: &ScalarValue, target: ScalarType) -> Option<ScalarValue> {
         UShort(x) => x.to_string(),
         UInt(x) => x.to_string(),
         ULong(x) => x.to_string(),
-        Float(x) => x.to_string(),
-        Double(x) => x.to_string(),
+        // `SB()<<double` (`data.cpp:602`).
+        Float(x) => crate::pvdata::fmt::render_real(f64::from(*x)),
+        Double(x) => crate::pvdata::fmt::render_real(*x),
         String(s) => s.as_str_lossy().into_owned(),
     };
     Some(match target {
@@ -1317,6 +1318,18 @@ impl IntoScalarValue for String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A real stored into a string field is `SB()<<double` (`data.cpp:602`).
+    #[test]
+    fn a_real_coerces_to_the_stream_default_text() {
+        let text = |sv| match coerce_scalar(&sv, ScalarType::String) {
+            Some(ScalarValue::String(s)) => s.as_str_lossy().into_owned(),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(text(ScalarValue::Double(1e20)), "1e+20");
+        assert_eq!(text(ScalarValue::Double(1.0 / 3.0)), "0.333333");
+        assert_eq!(text(ScalarValue::Float(0.1)), "0.1");
+    }
     use crate::nt::NTScalar;
 
     fn make_nt_int() -> Value {
@@ -1497,7 +1510,7 @@ mod tests {
     fn struct_of(name: &str, fdesc: FieldDesc, field: PvField) -> Value {
         let desc = FieldDesc::Structure {
             struct_id: String::new(),
-            fields: vec![(name.into(), fdesc)],
+            fields: vec![(name.into(), fdesc)].into(),
         };
         let mut s = PvStructure::new("");
         s.fields.push((name.into(), field));
@@ -1562,7 +1575,7 @@ mod tests {
         // returned NoField on a null union.
         let desc = FieldDesc::Structure {
             struct_id: String::new(),
-            fields: vec![("value".into(), union_value_desc())],
+            fields: vec![("value".into(), union_value_desc())].into(),
         };
         let mut v = Value::create_from(desc);
         v.set("value->floatValue", 2.5f32).unwrap();
@@ -1661,7 +1674,7 @@ mod tests {
             "rows",
             FieldDesc::StructureArray {
                 struct_id: String::new(),
-                fields: vec![("a".into(), FieldDesc::Scalar(ScalarType::Int))],
+                fields: vec![("a".into(), FieldDesc::Scalar(ScalarType::Int))].into(),
             },
             PvField::StructureArray(vec![Some(elem)]),
         );
@@ -1711,11 +1724,12 @@ mod tests {
             fields: vec![
                 ("a".into(), FieldDesc::Scalar(ScalarType::Int)),
                 ("b".into(), FieldDesc::Scalar(ScalarType::Int)),
-            ],
+            ]
+            .into(),
         };
         let dst_desc = FieldDesc::Structure {
             struct_id: String::new(),
-            fields: vec![("a".into(), FieldDesc::Scalar(ScalarType::Int))],
+            fields: vec![("a".into(), FieldDesc::Scalar(ScalarType::Int))].into(),
         };
         let mut src = Value::create_from(src_desc);
         src.set("b", 1i32).unwrap();
@@ -1735,7 +1749,7 @@ mod tests {
     fn one_field_value(name: &str, fdesc: FieldDesc, field: PvField) -> Value {
         let desc = FieldDesc::Structure {
             struct_id: String::new(),
-            fields: vec![(name.into(), fdesc)],
+            fields: vec![(name.into(), fdesc)].into(),
         };
         let mut s = PvStructure::new("");
         s.fields.push((name.into(), field));
@@ -1774,7 +1788,7 @@ mod tests {
         );
         let dst_desc = FieldDesc::Structure {
             struct_id: String::new(),
-            fields: vec![("value".into(), FieldDesc::ScalarArray(ScalarType::Long))],
+            fields: vec![("value".into(), FieldDesc::ScalarArray(ScalarType::Long))].into(),
         };
         let mut dst = Value::create_from(dst_desc);
         dst.assign(&src).unwrap();
@@ -1849,7 +1863,8 @@ mod tests {
                         ("s".into(), FieldDesc::Scalar(ScalarType::String)),
                     ],
                 },
-            )],
+            )]
+            .into(),
         };
         let mut dst = Value::create_from(dst_desc);
         dst.assign(&src).unwrap();
@@ -1891,7 +1906,8 @@ mod tests {
                     struct_id: String::new(),
                     variants: vec![("i".into(), FieldDesc::Scalar(ScalarType::Int))],
                 },
-            )],
+            )]
+            .into(),
         };
         let mut dst = Value::create_from(dst_desc);
         let err = dst.assign(&src).unwrap_err();
@@ -1929,7 +1945,8 @@ mod tests {
                         ("s".into(), FieldDesc::Scalar(ScalarType::String)),
                     ],
                 },
-            )],
+            )]
+            .into(),
         };
         let mut dst = Value::create_from(dst_desc);
         dst.assign(&src).unwrap();
@@ -1977,7 +1994,7 @@ mod tests {
             "rows",
             FieldDesc::StructureArray {
                 struct_id: String::new(),
-                fields: elem_fields,
+                fields: elem_fields.into(),
             },
             PvField::StructureArray(vec![Some(elem)]),
         );
@@ -2018,7 +2035,8 @@ mod tests {
                 fields: vec![
                     ("a".into(), FieldDesc::Scalar(ScalarType::Long)),
                     ("b".into(), FieldDesc::Scalar(ScalarType::Double)),
-                ],
+                ]
+                .into(),
             },
             PvField::StructureArray(vec![Some(elem), None]),
         );
@@ -2031,9 +2049,11 @@ mod tests {
                     fields: vec![
                         ("a".into(), FieldDesc::Scalar(ScalarType::Int)),
                         ("b".into(), FieldDesc::Scalar(ScalarType::Double)),
-                    ],
+                    ]
+                    .into(),
                 },
-            )],
+            )]
+            .into(),
         };
         let mut dst = Value::create_from(dst_desc);
         dst.assign(&src).unwrap();
@@ -2069,7 +2089,7 @@ mod tests {
         );
         let dst_desc = FieldDesc::Structure {
             struct_id: String::new(),
-            fields: vec![("value".into(), FieldDesc::ScalarArray(ScalarType::Int))],
+            fields: vec![("value".into(), FieldDesc::ScalarArray(ScalarType::Int))].into(),
         };
         let mut dst = Value::create_from(dst_desc);
         let err = dst.assign(&src).unwrap_err();

@@ -8,7 +8,7 @@
 //!   [`crate::decode`] / [`crate::proto`]. Compiles for every target, RTEMS
 //!   included.
 //! * **Async I/O layer** — `accept`, `udp`, `runtime`. Built on
-//!   `tokio::net` (and, underneath it, mio) plus `socket2` / `if-addrs`.
+//!   `tokio::net` (and, underneath it, mio) plus `socket2`.
 //!   None of those cross to `armv7-rtems-eabihf` or the `*-wrs-vxworks*`
 //!   triples (§8.1), so this layer is host-only; each embedded target gets a
 //!   blocking thread-per-client driver instead (design doc §4, §9 phase 6
@@ -30,6 +30,9 @@
 
 #[cfg(tokio_backend)]
 pub mod accept;
+// Beacon destinations, cycle and frame, shared by the tokio responder and
+// the native drivers' beacon thread.
+pub(crate) mod beacon;
 // The blocking thread-per-connection driver — the second driver beside
 // `accept`, for targets with no reactor (RTEMS item 5 stage 3). Owns
 // sockets, so it belongs to the I/O layer; host-compiled and host-tested so
@@ -48,6 +51,8 @@ pub mod op_handle;
 // Per-connection accounting for the report (`pvxsr`). Keyed by peer address
 // and driven from [`tcp`], but it holds no socket of its own.
 pub mod peers;
+// What `pvxsr` reads, from the tokio server and the native drivers alike.
+pub mod report;
 #[cfg(tokio_backend)]
 pub mod runtime;
 // SEARCH parse / name-match / response framing. Protocol only — both the UDP
@@ -66,6 +71,11 @@ pub mod search;
 // holds no socket either — [`udp`] is the async caller, the blocking RTEMS
 // responder is the other.
 pub mod search_engine;
+// The native drivers bound and served on their own threads: the one exec
+// serving path, for `realtime-pva-ioc` and the IOC runners alike.
+pub mod serving;
+// The TCP listener set every driver binds, from the expanded interface list.
+pub(crate) mod serv_iface;
 pub mod server_info;
 pub mod shared_pv;
 pub mod source;
@@ -90,13 +100,16 @@ pub use op_handle::{
 // embedded callers onto `server_native::config::PvaServerConfig` and left every
 // doc reference to the short path unresolvable on those targets.
 pub use config::{DEFAULT_MAX_MESSAGE_SIZE, PvaServerConfig};
-pub use peers::{ChannelReport, PeerEntry, PeerRegistry, PeerSnapshot};
+pub use peers::{ChannelReport, MonitorReport, PeerEntry, PeerRegistry, PeerSnapshot};
+pub use report::{Liveness, LivenessGuard, ServerReport, ServerReportHandle};
 #[cfg(tokio_backend)]
-pub use runtime::{PvaServer, ServerReportHandle, run_pva_server};
-pub use server_info::{SERVER_PV_NAME, SERVER_SOURCE_NAME, ServerInfoSource, USER_SOURCE_NAME};
+pub use runtime::{BoundPvaServer, PvaServer, run_pva_server};
+pub use server_info::{
+    BUILTIN_SOURCE_NAME, SERVER_PV_NAME, SERVER_SOURCE_NAME, ServerInfoSource, USER_SOURCE_NAME,
+};
 pub use shared_pv::{AddPvError, MonitorOutbox, MonitorRing, SharedPV, SharedSource, SquashTail};
 pub use source::{
-    ChannelContext, ChannelInvalidator, ChannelSource, ChannelSourceObj, DynSource, MonitorOptions,
-    MonitorStream, MonitorUpdate, OpError, OpErrorKind, RawMonitorEvent, UpstreamMonitor,
-    plain_monitor_updates,
+    ChannelContext, ChannelInvalidator, ChannelSource, ChannelSourceObj, DynSource, Marks,
+    MonitorOptions, MonitorStream, MonitorUpdate, OpError, OpErrorKind, PostValue, RawMonitorEvent,
+    RegistryEntry, SourceShow, UpstreamMonitor, plain_monitor_updates,
 };

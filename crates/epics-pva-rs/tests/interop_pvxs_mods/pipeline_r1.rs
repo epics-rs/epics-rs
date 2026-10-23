@@ -11,18 +11,16 @@
 //! `record._options.pipeline`. We use that log line as the
 //! authoritative wire-level signal.
 //!
-//! Skip behaviour: if `softIocPVX` is not present under
-//! the resolved pvxs tree's `bin/<arch>/`, the test prints a SKIP line and
-//! returns OK so a CI host without pvxs built doesn't fail.
+//! If `softIocPVX` is not present under the resolved pvxs tree's
+//! `bin/<arch>/`, the test fails.
 
 // RTEMS-EXEC-MODEL-ALLOW(1): not run by the default nextest profile - this file is a module of the `interop_pvxs` binary, which `.config/nextest.toml`'s default-filter excludes.
 
 use super::interop_helpers::{
-    DropChild, SOFT_IOC_PVX, pick_localhost_port, pvxs_command, pvxs_dbd_dir, require_pvxs,
+    SOFT_IOC_PVX, pick_localhost_port, pvxs_command, pvxs_dbd_dir, require_pvxs,
 };
 
 use std::io::Write;
-use std::process::Stdio;
 use std::time::Duration;
 
 const COUNTER_DB: &str = r#"
@@ -36,14 +34,9 @@ record(calc, "R1:CNT") {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn interop_r1_pipeline_option_visible_to_pvxs_server() {
-    let Some(ioc_bin) = require_pvxs(SOFT_IOC_PVX) else {
-        return;
-    };
+    let ioc_bin = require_pvxs(SOFT_IOC_PVX);
     let dbd = pvxs_dbd_dir().join("softIocPVX.dbd");
-    if !dbd.is_file() {
-        eprintln!("SKIP: dbd file missing: {dbd:?}");
-        return;
-    }
+    assert!(dbd.is_file(), "dbd file missing: {dbd:?}");
 
     let dir = tempfile::tempdir().expect("tempdir");
     let db_path = dir.path().join("counter.db");
@@ -53,60 +46,48 @@ async fn interop_r1_pipeline_option_visible_to_pvxs_server() {
     let stderr_path = dir.path().join("ioc.stderr");
     let stdout_path = dir.path().join("ioc.stdout");
 
-    let port = pick_localhost_port();
-
-    let mut cmd = pvxs_command(&ioc_bin);
-    cmd.arg("-D")
-        .arg(&dbd)
-        .arg("-d")
-        .arg(&db_path)
-        .arg("-S")
-        // PVA port — what we want to control.
-        .env("EPICS_PVAS_SERVER_PORT", port.to_string())
-        .env("EPICS_PVAS_INTF_ADDR_LIST", "127.0.0.1")
-        .env("EPICS_PVAS_AUTO_BEACON_ADDR_LIST", "NO")
-        // Stop softIocPVX from also fighting for CA port 5064 on
-        // hosts where another IOC owns it.
-        .env("EPICS_CAS_SERVER_PORT", "0")
-        .env("EPICS_CA_SERVER_PORT", "0")
-        // The signal we depend on. `pvxs.tcp.*` rather than
-        // `pvxs.tcp.setup` alone so the failure path below also captures
-        // the server's per-reply flow-control decisions from `connio`
-        // ("Skip reply sch=.. w=..", "IOID .. acks ..") — a stalled
-        // credit window and a subscription that was never started look
-        // identical from the client side.
-        .env("PVXS_LOG", "pvxs.tcp.*=DEBUG")
-        .stdout(Stdio::from(
-            std::fs::File::create(&stdout_path).expect("stdout"),
-        ))
-        .stderr(Stdio::from(
-            std::fs::File::create(&stderr_path).expect("stderr"),
-        ));
-
-    let child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(e) => panic!("failed to spawn softIocPVX: {e}"),
+    let logs = super::interop_helpers::PvxsLogs {
+        out: stdout_path.clone(),
+        err: stderr_path.clone(),
     };
-    let _ioc = DropChild { child };
-    // Wait until the IOC's PVA port is listening (poll up to 5s).
-    let server_addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-    let mut bound = false;
-    for _ in 0..50 {
-        if std::net::TcpStream::connect_timeout(&server_addr, Duration::from_millis(100)).is_ok() {
-            bound = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    if !bound {
-        let out = std::fs::read_to_string(&stdout_path).unwrap_or_default();
-        let err = std::fs::read_to_string(&stderr_path).unwrap_or_default();
-        panic!(
-            "softIocPVX did not bind {server_addr} within 5s. A spawned IOC that \
-             never comes up is a broken reference, not a missing one.\n\
-             pvxs stdout:\n{out}\npvxs stderr:\n{err}"
-        );
-    }
+    let build = || {
+        // Fresh per attempt: a retry after `port_collision` must not name the
+        // number that was just lost.
+        let port = pick_localhost_port();
+        let server_addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let ca = named_port::free_for_tcp_and_udp();
+        let mut cmd = pvxs_command(&ioc_bin);
+        cmd.arg("-D")
+            .arg(&dbd)
+            .arg("-d")
+            .arg(&db_path)
+            .arg("-S")
+            // PVA port — what we want to control.
+            .env("EPICS_PVAS_SERVER_PORT", port.to_string())
+            .env("EPICS_PVAS_INTF_ADDR_LIST", "127.0.0.1")
+            .env("EPICS_PVAS_AUTO_BEACON_ADDR_LIST", "NO")
+            // A named CA port: `0` falls back to 5064 (`envSubr.c:410`),
+            // and a lost one is rerun through `port_collision`.
+            .env("EPICS_CAS_INTF_ADDR_LIST", "127.0.0.1")
+            .env("EPICS_CAS_SERVER_PORT", ca.to_string())
+            .env("EPICS_CA_SERVER_PORT", ca.to_string())
+            // The signal we depend on. `pvxs.tcp.*` rather than
+            // `pvxs.tcp.setup` alone so the failure path below also captures
+            // the server's per-reply flow-control decisions from `connio`
+            // ("Skip reply sch=.. w=..", "IOID .. acks ..") — a stalled
+            // credit window and a subscription that was never started look
+            // identical from the client side.
+            .env("PVXS_LOG", "pvxs.tcp.*=DEBUG");
+        (cmd, server_addr)
+    };
+    let (_ioc, server_addr) =
+        match super::interop_helpers::start_pvxs(&logs, build, super::interop_helpers::ioc_ready) {
+            Ok(up) => up,
+            Err(text) => panic!(
+                "softIocPVX did not come up. A spawned IOC that \
+             never comes up is a broken reference, not a missing one.\n{text}"
+            ),
+        };
 
     // Build a Rust client pinned to the IOC and ask for pipeline.
     let client = epics_pva_rs::client_native::PvaClient::builder()

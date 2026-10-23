@@ -1,7 +1,7 @@
 //! R17-67: `add_record` is the creation sink, so it owes every record C's
 //! `iocInit` init passes — not just the constant seed.
 //!
-//! It seeded constants and deadbands but never ran `run_init_passes`, so a
+//! It seeded constants and deadbands but never ran `run_init_pass0`, so a
 //! record created programmatically or by iocsh `dbCreateRecord` skipped
 //! `init_record(0)`/`init_record(1)`, the `doInitRecord0` prologue (`pact =
 //! FALSE`; `if (udf && stat == UDF_ALARM) sevr = udfs`) and the post-init UDF

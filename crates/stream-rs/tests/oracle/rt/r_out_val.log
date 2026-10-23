@@ -1,0 +1,11 @@
+StreamCore::startProtocol(rec, startMode=StartNormal)
+StreamCore::evalCommand(rec): activeCommand = out
+StreamCore::formatOutput(rec): StreamProtocolParser::redirect_format
+StreamCore::formatOutput(rec): format = %d
+StreamCore::printValue(rec, %d, 7 = 0x7): "V=7"
+StreamCore::evalOut: outputLine = "V=7<0d><0a>"
+StreamCore::evalOut(rec): lockRequest(5000)
+StreamCore::lockCallback(rec, StreamIoSuccess)
+StreamCore::writeCallback(rec, StreamIoSuccess)
+StreamCore::evalCommand(rec): activeCommand = end
+StreamCore::finishProtocol(rec, Success) bus owner

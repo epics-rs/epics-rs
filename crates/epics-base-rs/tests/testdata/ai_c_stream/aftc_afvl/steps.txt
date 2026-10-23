@@ -1,0 +1,5 @@
+monitor X X.SEVR X.AFVL
+caput X.VAL 1
+caput X.VAL 6
+caput X.VAL 12
+caput X.VAL 7

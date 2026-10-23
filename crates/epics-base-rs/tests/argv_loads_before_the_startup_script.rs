@@ -12,6 +12,11 @@
 use epics_base_rs::server::ioc_app::{IocApplication, IocRunFailure};
 use epics_base_rs::types::EpicsValue;
 
+/// iocsh reads an unquoted `\` as an escape, as C `split()` does.
+fn token(p: &std::path::Path) -> String {
+    p.display().to_string().replace('\\', "/")
+}
+
 /// The `-d` shape: a queued line runs, and it runs BEFORE the script.
 #[epics_macros_rs::epics_test]
 async fn a_queued_line_runs_before_the_startup_script() {
@@ -20,7 +25,7 @@ async fn a_queued_line_runs_before_the_startup_script() {
     let script = dir.path().join("st.cmd");
     std::fs::write(
         &script,
-        format!("epicsEnvShow EPICS_RS_ARGV_ORDER > {}\n", out.display()),
+        format!("epicsEnvShow EPICS_RS_ARGV_ORDER > {}\n", token(&out)),
     )
     .expect("write script");
 
@@ -46,7 +51,7 @@ async fn a_failing_queued_line_stops_the_boot_before_the_script() {
     let dir = tempfile::tempdir().expect("tempdir");
     let ran = dir.path().join("ran.txt");
     let script = dir.path().join("st.cmd");
-    std::fs::write(&script, format!("epicsEnvShow PATH > {}\n", ran.display()))
+    std::fs::write(&script, format!("epicsEnvShow PATH > {}\n", token(&ran)))
         .expect("write script");
 
     let failure = IocApplication::new()
@@ -96,7 +101,7 @@ async fn an_inline_pv_reaches_the_protocol_runner() {
         .pv("ARGV:INLINE:PV", EpicsValue::Double(2.5))
         .run_phased(|config| async move {
             assert!(
-                config.db.find_pv("ARGV:INLINE:PV").await.is_some(),
+                config.db.find_pv("ARGV:INLINE:PV").is_some(),
                 "the inline PV was created before the runner started"
             );
             Ok(())

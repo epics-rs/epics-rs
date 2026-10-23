@@ -1,0 +1,45 @@
+-	drvStreamInit()
+-	StreamProtocolParser::path = /home/stevek/work/_tgt/monitor/trial/crates/stream-rs/tests/oracle/epics
+_main_	streamInitRecord(rec): SEVR=0
+_main_	streamInitRecord(rec): create new Stream object
+_main_	streamInitRecord(rec): calling initRecord
+_main_	Stream::initRecord rec: parse link string "l.proto i P"
+_main_	Stream::initRecord rec: filename="l.proto" protocol="i" bus="P" addr=0 params=""
+_main_	Stream::initRecord rec: attachBus("P", 0, "")
+_main_	Stream::initRecord rec: parse("l.proto", "i")
+_main_	Stream::initRecord rec: initialize the first time
+_main_	streamInitRecord(rec) done status=0x2
+_main_	streamGetIointInfo(rec,cmd=0): stream=0x637999e3c7d0, ioscanpvt=0x637999e3e300
+_main_	streamGetIointInfo(rec): start later...
+_main_	rec: starting "I/O Intr"
+_main_	StreamCore::startProtocol(rec, startMode=StartAsync)
+_main_	StreamCore::evalCommand(rec): activeCommand = in
+P	StreamCore::readCallback(rec, StreamIoSuccess input="V=5<0d><0a>", size=5)
+P	StreamCore::readCallback(rec) inputBuffer="V=5<0d><0a>", size 5
+P	StreamCore::readCallback(rec) inTerminator <0d><0a> at position 3
+P	StreamCore::readCallback(rec) input line: "V=5"
+P	StreamCore::matchInput(rec): format = "%d"
+P	StreamCore::scanValue(rec, format=%d, long) input="5" value=5
+P	Stream::scan() currentValueLength=1
+P	Stream::matchValue(rec): success, 1 bytes consumed
+P	StreamCore::evalCommand(rec): activeCommand = end
+P	StreamCore::finishProtocol(rec, Success) not bus owner
+P	Stream::protocolFinishHook(rec, Success)
+cbLow	recordProcessCallback(rec) processing record
+cbLow	Stream::process(rec)
+cbLow	Stream::process(rec) ready. don't convert
+cbLow	recordProcessCallback(rec) processing record done
+cbLow	recordProcessCallback(rec) restart async protocol
+cbLow	StreamCore::startProtocol(rec, startMode=StartAsync)
+cbLow	StreamCore::evalCommand(rec): activeCommand = in
+P	StreamCore::readCallback(rec, StreamIoTimeout input="", size=0)
+P	StreamCore::readCallback(rec) inputBuffer="", size 0
+P	StreamCore::readCallback(rec) inTerminator <0d><0a> not found
+P	StreamCore::readCallback(rec) async timeout: just restart
+_main_	rec: Protocol aborted
+VAL 5 = 0x5
+SEVR "INVALID"
+STAT "UDF"
+UDF 0 = 0x0
+PACT 0 = 0x0
+PROC 0 = 0x0

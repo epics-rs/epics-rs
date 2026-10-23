@@ -61,7 +61,7 @@ fn strings(items: &[&str]) -> EpicsValue {
 }
 
 async fn nord(db: &PvDatabase, rec: &str) -> f64 {
-    db.get_pv(&format!("{rec}.NORD")).unwrap().to_f64().unwrap()
+    db.get_pv(format!("{rec}.NORD")).unwrap().to_f64().unwrap()
 }
 
 /// The finding's exact case: `caput -a WV 3 7 8 9` on a `FTVL=LONG` waveform.

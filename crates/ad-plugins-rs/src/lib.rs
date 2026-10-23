@@ -70,6 +70,7 @@ pub mod file_jpeg;
 pub mod file_magick;
 pub mod file_netcdf;
 pub mod file_nexus;
+pub mod file_null;
 pub mod file_tiff;
 pub mod gather;
 pub mod hdf5_layout;
@@ -84,9 +85,11 @@ pub mod roi_stat;
 pub mod scatter;
 pub mod stats;
 pub mod std_arrays;
-pub mod time_series;
 pub mod time_series_plugin;
 pub mod transform;
+
+#[cfg(test)]
+mod test_util;
 
 #[cfg(feature = "pva")]
 pub mod pva;
@@ -100,8 +103,5 @@ pub mod pva;
 #[cfg(not(epics_embedded_target))]
 pub mod attr_plot_args;
 
-// `tokio_backend` as well as the feature: the module stands its IOC up on
-// `epics_ca_rs::server::run_ca_ioc_app` and the QSRV runner, and neither
-// exists on the reactor-free backend.
-#[cfg(all(feature = "ioc", tokio_backend))]
+#[cfg(feature = "ioc")]
 pub mod ioc;

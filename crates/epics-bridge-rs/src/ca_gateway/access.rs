@@ -53,7 +53,7 @@ enum Mode {
     /// Explicit opt-in only; not the no-file default.
     AllowAll,
     /// Rules parsed from an `.access` file.
-    Rules(AccessSecurityConfig),
+    Rules(Box<AccessSecurityConfig>),
 }
 
 /// Access security configuration for the gateway.
@@ -95,16 +95,16 @@ impl AccessConfig {
 
     /// Load an `.access` file from disk.
     pub fn from_file(path: &Path) -> BridgeResult<Self> {
-        let content = std::fs::read_to_string(path)?;
+        let content = std::fs::read(path)?;
         Self::from_string(&content)
     }
 
     /// Parse `.access` content from a string.
-    pub fn from_string(content: &str) -> BridgeResult<Self> {
+    pub fn from_string(content: impl AsRef<[u8]>) -> BridgeResult<Self> {
         let config = parse_acf(content)
             .map_err(|e| BridgeError::GroupConfigError(format!("ACF parse: {e}")))?;
         Ok(Self {
-            mode: Mode::Rules(config),
+            mode: Mode::Rules(Box::new(config)),
         })
     }
 
@@ -114,7 +114,13 @@ impl AccessConfig {
     /// rules with a level below `asl` are skipped, matching epics-base
     /// `asLibRoutines.c::asCompute`. Negative or zero ASL is treated
     /// as level 0 (most-restrictive).
-    pub fn can_read(&self, asg: &str, asl: i32, user: &str, host: &str) -> bool {
+    pub fn can_read(
+        &self,
+        asg: &str,
+        asl: i32,
+        user: impl AsRef<[u8]>,
+        host: impl AsRef<[u8]>,
+    ) -> bool {
         match &self.mode {
             // Both allow-all and the read-only default grant reads.
             Mode::AllowAll | Mode::ReadOnly => true,
@@ -144,7 +150,13 @@ impl AccessConfig {
     /// `check_access_method_trap` returns `trap = false` on a `NoAccess`
     /// outcome, matching C `asComputePvt` which only copies `trapMask` on
     /// the lines that raise `access`).
-    pub fn can_write_trap(&self, asg: &str, asl: i32, user: &str, host: &str) -> WritePermit {
+    pub fn can_write_trap(
+        &self,
+        asg: &str,
+        asl: i32,
+        user: impl AsRef<[u8]>,
+        host: impl AsRef<[u8]>,
+    ) -> WritePermit {
         match &self.mode {
             Mode::AllowAll => WritePermit {
                 allowed: true,
@@ -173,7 +185,13 @@ impl AccessConfig {
     /// [`Self::can_write_trap`] for the access-rights *report* path
     /// (`build_access_hook`), which gates reported write rights and never
     /// emits a put-log line, so the trap mask is irrelevant there.
-    pub fn can_write(&self, asg: &str, asl: i32, user: &str, host: &str) -> bool {
+    pub fn can_write(
+        &self,
+        asg: &str,
+        asl: i32,
+        user: impl AsRef<[u8]>,
+        host: impl AsRef<[u8]>,
+    ) -> bool {
         self.can_write_trap(asg, asl, user, host).allowed
     }
 
@@ -199,12 +217,13 @@ impl AccessConfig {
     ///
     /// Delegates to the single dump-format owner
     /// [`AccessSecurityConfig::dump_report`] in `epics-base-rs`, shared
-    /// with the `asdbdump` iocsh command. The verbose member/client
-    /// listing of C's `asDumpFP(..., verbose=TRUE)` is not included (no
-    /// live AS-member registry — see that method's note).
+    /// with the `asdbdump` iocsh command. The gateway resolves no `INP*`
+    /// link, so each prints as C's never-connected channel.
     pub fn dump_report(&self) -> Option<String> {
         match &self.mode {
-            Mode::Rules(cfg) => Some(cfg.dump_report()),
+            // The R1-R3 reports are assembled as text; a non-UTF-8 name is
+            // replaced here rather than carried as bytes through them.
+            Mode::Rules(cfg) => Some(String::from_utf8_lossy(&cfg.dump_report()).into_owned()),
             Mode::ReadOnly | Mode::AllowAll => None,
         }
     }

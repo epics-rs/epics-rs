@@ -20,7 +20,7 @@
 use std::sync::Arc;
 
 use ad_core_rs::ioc::GenericDriverContext;
-use ad_core_rs::ndarray_pool::NDArrayPool;
+use ad_core_rs::ndarray_pool::DriverPool;
 use ad_core_rs::plugin::channel::NDArrayOutput;
 use ad_plugins_rs::ioc::AdIoc;
 use asyn_rs::port::DrvUserRequest;
@@ -29,11 +29,10 @@ use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::iocsh::IocShell;
 use epics_base_rs::server::iocsh::registry::CommandOutcome;
 
-/// An `AdIoc` whose plugin commands can run: they all begin with `m.driver()?`,
-/// which is `Err` until a detector has been configured.
+/// An `AdIoc` with a detector configured, whose output the plugins read.
 fn ad_ioc_with_driver(upstream: &str) -> (AdIoc, IocShell) {
     let ioc = AdIoc::new();
-    let pool = NDArrayPool::new(4_000_000);
+    let pool = DriverPool::standalone(4_000_000);
     let output = Arc::new(parking_lot::Mutex::new(NDArrayOutput::new()));
     ioc.mgr().set_driver(Arc::new(GenericDriverContext::new(
         pool,
@@ -118,7 +117,7 @@ fn roi_stat_max_threads_is_argument_ten() {
     let (_ioc, shell) = ad_ioc_with_driver("MTUP2");
     run(
         &shell,
-        r#"NDROIStatConfigure("MTRS1", 20, 0, "MTUP2", 0, 8, 0, 0, 0, 40000, 3)"#,
+        r#"NDROIStatConfigure("MTRS1", 20, 0, "MTUP2", 0, 8, 0, 0, 0, 4000000, 3)"#,
     );
 
     let port = plugin_port("MTRS1");
@@ -161,7 +160,7 @@ fn a_command_without_the_argument_does_not_invent_one() {
     let (_ioc, shell) = ad_ioc_with_driver("MTUP4");
     run(
         &shell,
-        r#"NDProcessConfigure("MTPR1", 20, 0, "MTUP4", 0, 0, 0, 0, 40000)"#,
+        r#"NDProcessConfigure("MTPR1", 20, 0, "MTUP4", 0, 0, 0, 0, 4000000)"#,
     );
 
     let port = plugin_port("MTPR1");
@@ -169,6 +168,6 @@ fn a_command_without_the_argument_does_not_invent_one() {
         port.read_int32_blocking(reason(&port, "MAX_THREADS"), 0)
             .unwrap(),
         1,
-        "a stackSize of 40000 was read as a thread ceiling"
+        "a stackSize of 4000000 was read as a thread ceiling"
     );
 }

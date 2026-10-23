@@ -1,0 +1,110 @@
+recordtype(stringin)
+    device name:   devSiSoft
+	choice:    Soft Channel
+	link_type: 0
+	pdset:     0x773c82fcc220
+	    number: 5
+	    func 0: (nil) - report()
+	    func 1: (nil) - init()
+	    func 2: 0x773c82fb1aa0 - init_record()
+	    func 3: (nil) - get_ioint_info()
+	    func 4: 0x773c82fb1ad0
+	pdsxt:     0x773c82f7fa90
+	    add_record: 0x773c82f45350
+	    del_record: 0x773c82f45350
+    device name:   devSiSoftCallback
+	choice:    Async Soft Channel
+	link_type: 0
+	pdset:     0x773c82fcc520
+	    number: 5
+	    func 0: (nil) - report()
+	    func 1: 0x773c82fb3930 - init()
+	    func 2: 0x773c82fb3900 - init_record()
+	    func 3: (nil) - get_ioint_info()
+	    func 4: 0x773c82fb37a0
+	pdsxt:     0x773c82fcc550
+	    add_record: 0x773c82fb3a00
+	    del_record: 0x773c82fb3960
+    device name:   devTimestampSI
+	choice:    Soft Timestamp
+	link_type: 12
+	pdset:     0x773c82fcc980
+	    number: 5
+	    func 0: (nil) - report()
+	    func 1: 0x773c82fb4640 - init()
+	    func 2: (nil) - init_record()
+	    func 3: (nil) - get_ioint_info()
+	    func 4: 0x773c82fb4670
+	pdsxt:     0x773c82f7fa90
+	    add_record: 0x773c82f45350
+	    del_record: 0x773c82f45350
+    device name:   devSiGeneralTime
+	choice:    General Time
+	link_type: 12
+	pdset:     0x773c82fcc820
+	    number: 5
+	    func 0: (nil) - report()
+	    func 1: (nil) - init()
+	    func 2: 0x773c82fb43d0 - init_record()
+	    func 3: (nil) - get_ioint_info()
+	    func 4: 0x773c82fb4560
+	pdsxt:     (nil)
+    device name:   devSiEnviron
+	choice:    getenv
+	link_type: 12
+	pdset:     0x773c82fccb40
+	    number: 5
+	    func 0: (nil) - report()
+	    func 1: 0x773c82fb4c40 - init()
+	    func 2: (nil) - init_record()
+	    func 3: (nil) - get_ioint_info()
+	    func 4: 0x773c82fb4d10
+	pdsxt:     0x773c82fccb70
+	    add_record: 0x773c82fb4bf0
+	    del_record: 0x773c82fb4d80
+    device name:   asynSiOctetCmdResponse
+	choice:    asynOctetCmdResponse
+	link_type: 12
+	pdset:     0x773c83082040
+	    number: 5
+	    func 0: (nil) - report()
+	    func 1: (nil) - init()
+	    func 2: 0x773c830244b0 - init_record()
+	    func 3: (nil) - get_ioint_info()
+	    func 4: 0x773c83022530
+	pdsxt:     (nil)
+    device name:   asynSiOctetWriteRead
+	choice:    asynOctetWriteRead
+	link_type: 12
+	pdset:     0x773c83082000
+	    number: 5
+	    func 0: (nil) - report()
+	    func 1: (nil) - init()
+	    func 2: 0x773c83024340 - init_record()
+	    func 3: (nil) - get_ioint_info()
+	    func 4: 0x773c83022530
+	pdsxt:     (nil)
+    device name:   asynSiOctetRead
+	choice:    asynOctetRead
+	link_type: 12
+	pdset:     0x773c83081fc0
+	    number: 5
+	    func 0: (nil) - report()
+	    func 1: (nil) - init()
+	    func 2: 0x773c830237d0 - init_record()
+	    func 3: 0x773c83023100 - get_ioint_info()
+	    func 4: 0x773c83022530
+	pdsxt:     (nil)
+    device name:   devSiTodString
+	choice:    Time of Day
+	link_type: 0
+	pdset:     0x5e25d5277800
+	    number: 5
+	    func 0: (nil) - report()
+	    func 1: (nil) - init()
+	    func 2: 0x5e25d5272c70 - init_record()
+	    func 3: (nil) - get_ioint_info()
+	    func 4: 0x5e25d5272ce0
+	pdsxt:     0x773c82f7fa90
+	    add_record: 0x773c82f45350
+	    del_record: 0x773c82f45350

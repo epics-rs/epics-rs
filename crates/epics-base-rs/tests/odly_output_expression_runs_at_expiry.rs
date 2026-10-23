@@ -32,20 +32,19 @@ async fn calcout_with_ocal(db: &PvDatabase, name: &str, target: &str) {
     c.put_field("CALC", EpicsValue::String("A".into())).unwrap();
     c.put_field("OCAL", EpicsValue::String("A*10".into()))
         .unwrap();
-    c.special("CALC", true).unwrap();
-    c.special("OCAL", true).unwrap();
+    c.special("CALC", true, &Default::default()).unwrap();
+    c.special("OCAL", true, &Default::default()).unwrap();
     c.dopt = 1;
     c.oopt = 0;
     c.put_field("ODLY", EpicsValue::Double(100.0)).unwrap();
     db.add_record(name, Box::new(c)).await.unwrap();
-    wire_out(db, name, target);
+    wire_out(db, name, target).await;
 }
 
-/// `OUT` is a common field, so it is set on the instance after `add_record`.
-fn wire_out(db: &PvDatabase, name: &str, target: &str) {
-    let rec = db.get_record(name).expect("just added");
-    let mut inst = rec.write();
-    inst.put_common_field("OUT", EpicsValue::String(target.into()))
+/// `OUT` is a common field, so it is put through the database after `add_record`.
+async fn wire_out(db: &PvDatabase, name: &str, target: &str) {
+    db.put_pv_no_process(format!("{name}.OUT"), EpicsValue::String(target.into()))
+        .await
         .unwrap();
 }
 
@@ -133,11 +132,11 @@ async fn calcout_use_val_still_writes_at_expiry() {
     let mut c = CalcoutRecord::default();
     c.put_field("CALC", EpicsValue::String("A+5".into()))
         .unwrap();
-    c.special("CALC", true).unwrap();
+    c.special("CALC", true, &Default::default()).unwrap();
     c.oopt = 0;
     c.put_field("ODLY", EpicsValue::Double(100.0)).unwrap();
     db.add_record("CV", Box::new(c)).await.unwrap();
-    wire_out(&db, "CV", "TV");
+    wire_out(&db, "CV", "TV").await;
 
     db.put_pv_no_process("CV.A", EpicsValue::Double(2.0))
         .await
@@ -165,8 +164,8 @@ async fn scalcout_ocal_stores_land_at_expiry() {
         .unwrap();
     sc.put_field("OCAL", EpicsValue::String("A:=A+1;A".into()))
         .unwrap();
-    sc.special("CALC", true).unwrap();
-    sc.special("OCAL", true).unwrap();
+    sc.special("CALC", true, &Default::default()).unwrap();
+    sc.special("OCAL", true, &Default::default()).unwrap();
     sc.dopt = 1;
     sc.oopt = 0;
     sc.put_field("ODLY", EpicsValue::Double(100.0)).unwrap();
@@ -209,8 +208,8 @@ async fn acalcout_ocal_stays_evaluated_at_scheduling_time() {
         .unwrap();
     ac.put_field("OCAL", EpicsValue::String("A*10".into()))
         .unwrap();
-    ac.special("CALC", true).unwrap();
-    ac.special("OCAL", true).unwrap();
+    ac.special("CALC", true, &Default::default()).unwrap();
+    ac.special("OCAL", true, &Default::default()).unwrap();
     ac.put_field("DOPT", EpicsValue::Short(1)).unwrap();
     ac.put_field("OOPT", EpicsValue::Short(0)).unwrap();
     ac.put_field("ODLY", EpicsValue::Double(100.0)).unwrap();

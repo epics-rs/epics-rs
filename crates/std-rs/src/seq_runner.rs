@@ -1,86 +1,82 @@
 //! SNL program launcher for the std module — the Rust stand-in for C's
 //! `seq &program, "macros"`.
 //!
-//! Each `snl` module here is a pure state machine plus a `run(config, db)`
-//! that gives it PVs; this is the one place that turns a program name and a
-//! macro string into the right pair. An IOC binary reaches it with a single
+//! Each `snl` module here is a program snc-rs compiled from the upstream
+//! `.st`; this is the one place that turns a program name and a macro string
+//! into `epics_seq_rs::seq`. An IOC binary reaches it with a single
 //! `seqStart` startup command, the same shape
 //! `optics_rs::seq_runner::seq_start` is registered with.
 
-use std::collections::HashMap;
+// RTEMS-EXEC-MODEL-ALLOW(2): checked, not waived — both ran and passed
+// on the exec backend (measured on this tree:
+// `EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p std-rs
+// --all-features`, 223/223). The reactor each test obtains comes from the
+// test's own `Runtime::new`, which the backend does not remove.
 
 use epics_base_rs::server::database::PvDatabase;
-use epics_base_rs::server::iocsh::macro_defn_pairs;
-use epics_base_rs::server::snl::spawn_program;
 
-/// Split a `seq` macro string into definitions.
+/// Start a std-module SNL program by name, its macros parsed over the
+/// program's `program` parameters as `seq` does, so one left out takes the
+/// `.st`'s default. A macro with no value reads as "", what `seqMacEval`
+/// puts for its `{name}`.
 ///
-/// Through `macro_defn_pairs`, the port's owner of C's `macParseDefns`
-/// grammar (`macUtil.c`), so a quoted value with an embedded comma survives —
-/// a raw `split(',')` tears it. A name given with no `=` is a deletion in
-/// that grammar and is dropped here, since a program can only be started with
-/// definitions.
-pub fn parse_macros(input: &str) -> HashMap<String, String> {
-    macro_defn_pairs(input)
-        .into_iter()
-        .filter_map(|(name, value)| value.map(|v| (name, v)))
-        .collect()
-}
-
-fn require_macro(
-    macros: &HashMap<String, String>,
-    key: &str,
-    program: &str,
-) -> Result<String, String> {
-    macros
-        .get(key)
-        .cloned()
-        .ok_or_else(|| format!("{program}: required macro '{key}' not specified"))
-}
-
-/// Start a std-module SNL program by name.
-///
-/// | Name | Macros | Program |
-/// |------|--------|---------|
-/// | `delayDo` | P, R | `delayDo.st` — wait out an active condition, then process `doSeq` |
-/// | `femto` | P, H, F, G1, G2, G3, NO | `femto.st` — Femto amplifier gain control |
+/// | Name | Program |
+/// |------|---------|
+/// | `delayDo` | `delayDo.st` — wait out an active condition, then process `doSeq` |
+/// | `femto` | `femto.st` — Femto amplifier gain control |
 ///
 /// Must be called with the runtime reachable — from st.cmd that means
 /// `CommandContext::bridge()`, because the shell runs on a blocking thread.
 pub fn seq_start(
     program: &str,
     macro_str: &str,
-    bridge: &epics_base_rs::runtime::task::BlockingBridge,
+    _bridge: &epics_base_rs::runtime::task::BlockingBridge,
     db: &PvDatabase,
 ) -> Result<(), String> {
-    let macros = parse_macros(macro_str);
-
     match program {
         "delayDo" => {
-            let config = crate::snl::delay_do::DelayDoConfig::new(
-                &require_macro(&macros, "P", program)?,
-                &require_macro(&macros, "R", program)?,
-            );
-            spawn_program(bridge, db, "delayDo", move |db| {
-                crate::snl::delay_do::run(config, db)
-            });
+            epics_seq_rs::seq(&crate::snl::delay_do::delayDo, macro_str, 0, db)
+                .ok_or_else(|| "seq: delayDo refused to start".to_string())?;
         }
         "femto" => {
-            let config = crate::snl::femto::FemtoConfig::new(
-                &require_macro(&macros, "P", program)?,
-                &require_macro(&macros, "H", program)?,
-                &require_macro(&macros, "F", program)?,
-                &require_macro(&macros, "G1", program)?,
-                &require_macro(&macros, "G2", program)?,
-                &require_macro(&macros, "G3", program)?,
-                &require_macro(&macros, "NO", program)?,
-            );
-            spawn_program(bridge, db, "femto", move |db| {
-                crate::snl::femto::run(config, db)
-            });
+            epics_seq_rs::seq(&crate::snl::femto::femto, macro_str, 0, db)
+                .ok_or_else(|| "seq: femto refused to start".to_string())?;
         }
-        other => return Err(format!("seq_start: unknown std program '{other}'")),
+        other => return Err(format!("Can't find sequencer `{other}'.")),
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `delayDo.st:1` and `femto.st:15` define every macro the programs
+    /// read, so `seq` starts them with none given.
+    #[test]
+    fn every_program_starts_on_its_program_defaults() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let bridge = {
+            let _guard = rt.enter();
+            epics_base_rs::runtime::task::BlockingBridge::capture()
+        };
+        let db = PvDatabase::new();
+        assert_eq!(seq_start("delayDo", "", &bridge, &db), Ok(()));
+        assert_eq!(seq_start("femto", "", &bridge, &db), Ok(()));
+    }
+
+    /// seq_cmd.c:162.
+    #[test]
+    fn an_unknown_program_is_refused_in_seq_cmd_c_s_words() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let bridge = {
+            let _guard = rt.enter();
+            epics_base_rs::runtime::task::BlockingBridge::capture()
+        };
+        assert_eq!(
+            seq_start("nonexistent", "", &bridge, &PvDatabase::new()),
+            Err("Can't find sequencer `nonexistent'.".to_string())
+        );
+    }
 }

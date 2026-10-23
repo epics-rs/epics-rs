@@ -8,23 +8,18 @@
 //! because a device that finishes before the first status read would otherwise
 //! never show a 1 -> 0 transition, and the record would never read the spectrum.
 //!
-//! A port record cannot call its device support — that is what `ProcessAction`
-//! and the `DeviceSupport` trait exist to prevent — and the framework calls
-//! `DeviceSupport::read()` BEFORE `Record::process()`. So the cycle is split at
-//! the two points where C's control flow crosses into the driver, and each half
-//! is a method ON THE RECORD:
-//!
-//! - C `:510-659` (clear NACK, drain NEWV, ERAS/ERST, STRT, STOP) is
-//!   [`McaRecord::take_device_requests`]: the record applies its own state
-//!   changes and returns the commands to send, in C's order.
-//! - C `:666-742` (status read, ERTM/ELTM/ACT/DWEL, dead time, force a read when
-//!   acquisition stops) is [`McaRecord::apply_status`]: device support performs
-//!   the read; the record decides what the status MEANS and whether the spectrum
-//!   must now be read.
-//! - C `:744-790` (the data read) is device support's, landing through
-//!   [`McaRecord::land_spectrum_read`].
-//! - C `:793-841` (ROI sums, preset stop, commit ACQG, UDF, STIM, alarms,
-//!   forward link) is the record's `process()`.
+//! A port record cannot call its device support from `process()` — the
+//! framework calls `DeviceSupport::read()` BEFORE `Record::process()`. So the
+//! half of C's `process` that crosses into the driver, C `:509-790`, is
+//! [`McaRecord::begin_device_cycle`], which device support's `read_begin`
+//! invokes on every pass with its [`McaDset`]: the record sends each message
+//! at C's site and decides what each answer, and each failure, means. A read
+//! whose callback re-enters the record splits the pass where C's `send_msg`
+//! returns, and the ask after the nested pass goes on from there; `readValue`
+//! splits it again around the SIML and SIOL reads, which are the framework's
+//! to make (`:1106`, `:1118`). C `:793-841` (ROI sums, preset
+//! stop, commit ACQG, UDF, STIM, alarms, forward link) is the record's
+//! `process()`.
 //!
 //! The record therefore remains the only writer of its own state, and device
 //! support remains the only thing that touches hardware. What moved is where the
@@ -33,8 +28,11 @@
 use std::time::SystemTime;
 
 use epics_base_rs::error::CaResult;
+use epics_base_rs::server::database::DeviceDoneSource;
+use epics_base_rs::server::device_support::{ReadStart, SimRead};
 use epics_base_rs::server::record::CommonFields;
-use epics_base_rs::types::EpicsValue;
+use epics_base_rs::types::{EpicsValue, PvString, WallTime, c_cast};
+use epics_libcom_rs::cfmt::CFloat;
 
 use super::McaRecord;
 
@@ -53,15 +51,8 @@ pub enum McaCommand {
     ChannelAdvanceSource(i32),
     NumChannels(i32),
     /// `mcaAcquireMode` — carries the `MODE` menu index (PHA / MCS / List).
-    ///
-    /// **Tier-2 deviation.** C never sends `mcaAcquireMode`: it sends the MODE
-    /// VALUE ITSELF as the command code — `(*pdset->send_msg)(pmca, pmca->mode,
-    /// NULL)` (`mcaRecord.c:630`). So `caput MODE MCS` (index 1) reaches device
-    /// support as command 1, which is `mcaStartAcquire`, and `caput MODE List`
-    /// (index 2) arrives as `mcaStopAcquire`; `mcaAcquireMode` is command 8, and
-    /// no MODE write can ever produce it. That is a collision between two enums
-    /// that happen to share a numbering, not a contract. The port sends the mode
-    /// as a mode command carrying the index.
+    /// C sends it only from `init_record` (`mcaRecord.c:486-487`); a MODE put
+    /// goes out as [`McaCommand::for_mode`].
     AcquireMode(i32),
     Sequence(i32),
     Prescale(i32),
@@ -72,6 +63,74 @@ pub enum McaCommand {
     PresetLiveTime(f64),
     PresetRealTime(f64),
     PresetCounts(f64),
+}
+
+impl McaCommand {
+    /// What a MODE put sends: C passes the MODE index itself as the command
+    /// code, `send_msg(pmca, pmca->mode, NULL)` (`mcaRecord.c:630`), so PHA,
+    /// MCS and List arrive as `mcaData`, `mcaStartAcquire` and
+    /// `mcaStopAcquire`. `None` for an index outside `menu(mcaMODE)`.
+    pub fn for_mode(mode: u16) -> Option<Self> {
+        match mode {
+            0 => Some(Self::Data),
+            1 => Some(Self::StartAcquire),
+            2 => Some(Self::StopAcquire),
+            _ => None,
+        }
+    }
+}
+
+/// C's `-1` from `send_msg` or `read_array`: device support did not
+/// acknowledge the message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Nack;
+
+/// The two messages device support may answer with a callback
+/// (`mcaRecord.c:318-321`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum McaRead {
+    /// `mcaReadStatus`, which C's device answers by setting `rdns`.
+    Status,
+    /// `mcaData`, which C's device answers by setting `rdng`.
+    Data,
+}
+
+/// How an [`McaRead`] went out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sent {
+    /// It completed inside the send; C's device left `rdns`/`rdng` clear.
+    Done,
+    /// It is queued, and its callback re-enters the record on the port's
+    /// thread; the pass ends there (C's `return(0)`, `:681`, `:778`).
+    Queued,
+    /// Its callback already ran on this thread — C `queueRequest` on a port
+    /// without `ASYN_CANBLOCK` — and the record pass it re-enters runs nested
+    /// before this one goes on.
+    Ran,
+}
+
+/// The `mcaDSET` entries the record calls (`mcaRecord.c:158-168`), each
+/// answering C's `(-1,0)=>(failure,success)` as `Err(Nack)` / `Ok`.
+pub trait McaDset {
+    /// `send_msg(pmca, command, parg)` for a command that is not a read:
+    /// the record sends `mcaReadStatus` and `mcaData` through
+    /// [`Self::send_read`] only.
+    fn send_msg(&mut self, command: McaCommand) -> Result<(), Nack>;
+    /// `send_msg(pmca, mcaReadStatus | mcaData, ...)` on the pass that
+    /// starts the read, the MODE put's `mcaData` (`:630`) included. A device that completes it inside the send keeps
+    /// the default: the status is then whatever [`Self::read_status`]
+    /// returns, and the data is sent as a plain [`Self::send_msg`].
+    fn send_read(&mut self, read: McaRead) -> Result<Sent, Nack> {
+        match read {
+            McaRead::Status => Ok(Sent::Done),
+            McaRead::Data => self.send_msg(McaCommand::Data).map(|()| Sent::Done),
+        }
+    }
+    /// `send_msg(pmca, mcaReadStatus, pmca->pstatus)`: the status read back.
+    fn read_status(&mut self, mca: &McaRecord) -> Result<McaStatus, Nack>;
+    /// `read_array(pmca)`: land the spectrum through
+    /// [`McaRecord::land_spectrum_read`] or [`McaRecord::land_channel_count`].
+    fn read_array(&mut self, mca: &mut McaRecord) -> Result<(), Nack>;
 }
 
 /// What device support reads back from the hardware — C `mcaStatus`
@@ -93,21 +152,308 @@ pub struct McaStatus {
     pub dead_time: f64,
 }
 
-impl McaRecord {
-    /// C `process` `mcaRecord.c:510-659` — everything the record does BEFORE the status
-    /// read, and the commands that must reach the device ahead of it.
-    ///
-    /// The record's own state changes are applied here, not by the caller:
-    /// `ERAS` zeroes the spectrum inside the record (`:614`; C's comment at
-    /// `:612-613` gives the reason — cheaper than forcing a read back from
-    /// device support), `STRT` forces `ACQG` to 1 (`:644`), and every consumed
-    /// `NEWV` bit is cleared. So this is the SOLE consumer of
-    /// `NEWV`/`STRT`/`STOP`/`ERAS`/`ERST`: calling it twice for one cycle cannot
-    /// double-send, because the flags are already gone.
-    pub fn take_device_requests(&mut self) -> Vec<McaCommand> {
-        let mut cmds = Vec::new();
-        self.nack = 0;
+/// Where a pass's device half stopped when a send's callback ran inline,
+/// for the ask that goes on once the nested pass is done: C's code after
+/// that `send_msg` returns.
+///
+/// One per open pass, innermost on top: a nested pass runs between its outer
+/// pass's two asks, as C's nested `process` calls do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Resume {
+    /// After the MODE put's `mcaData` (`:630`): the start/stop sends, then
+    /// the status read.
+    Mode,
+    /// After the status read (`:678`), which reuses the `pstatus` the nested
+    /// pass filled.
+    Status,
+    /// After the data read (`:777`), which reads the data again.
+    Data,
+    /// At `readValue` (`:1097`), whose link reads the framework has made;
+    /// `rdng` is the `pmca->rdng = 0` that follows it on a callback's pass
+    /// (`:756`).
+    ReadValue { rdng: bool },
+}
 
+/// C's nesting is at most three `process` calls deep (one per read trip),
+/// and the innermost may stop at `readValue`.
+const RESUME_DEPTH: usize = 4;
+
+/// The open passes' resume points, for [`McaRecord::begin_device_cycle`]'s
+/// ask again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ResumeStack {
+    at: [Option<Resume>; RESUME_DEPTH],
+    len: usize,
+}
+
+impl ResumeStack {
+    fn push(&mut self, resume: Resume) {
+        assert!(self.len < RESUME_DEPTH, "mca passes nested past C's three");
+        self.at[self.len] = Some(resume);
+        self.len += 1;
+    }
+
+    fn pop(&mut self) -> Option<Resume> {
+        let len = self.len.checked_sub(1)?;
+        self.len = len;
+        self.at[len].take()
+    }
+}
+
+/// What [`McaRecord::begin_device_cycle`] left for the pass: the answers of
+/// [`epics_base_rs::server::device_support::ReadStart`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum McaStart {
+    /// The device half is done; `read()` has nothing left.
+    Synchronous,
+    /// A read is queued and the pass ends with the record PACT.
+    Pending,
+    /// A read's callback ran inline; the pass it re-entered runs nested,
+    /// then this pass asks again.
+    Reentered,
+    /// The pass reached `readValue`; the framework reads SIML and SIOL, then
+    /// this pass asks again with what they decided.
+    ReadValue,
+}
+
+/// Which ask of a pass [`McaRecord::begin_device_cycle`] answers.
+#[derive(Debug, Clone, Copy)]
+pub enum Ask<'a> {
+    /// The pass's first.
+    First,
+    /// After a `Reentered` answer, once the nested pass has run.
+    Again,
+    /// After a `ReadValue` answer, with what `readValue`'s link half decided.
+    ReadValue(&'a SimRead),
+}
+
+impl<'a> Ask<'a> {
+    /// The ask `done` makes.
+    pub fn of(done: &'a DeviceDoneSource<'_>) -> Self {
+        match done.sim_read() {
+            Some(sim) => Self::ReadValue(sim),
+            None if done.again() => Self::Again,
+            None => Self::First,
+        }
+    }
+}
+
+/// How far one stretch of the device half got.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Step {
+    /// It ended the pass's device half, `Synchronous` or `Pending`.
+    Ended(McaStart),
+    /// A send's callback ran inline; the pass goes on from here.
+    Nested(Resume),
+    /// The pass reached `readValue`.
+    ReadValue { rdng: bool },
+}
+
+impl McaRecord {
+    /// C `process` `:509-790` up to the first read that is still out or
+    /// whose callback ran inline: every message the cycle sends device
+    /// support, at C's site and in C's order, and what each answer means.
+    /// Device support's `read_begin` calls it on every pass, the re-entered
+    /// ones included; an ask after a `Reentered` or `ReadValue` answer goes
+    /// on where that pass stopped.
+    pub fn begin_device_cycle(&mut self, dset: &mut impl McaDset, ask: Ask<'_>) -> McaStart {
+        let step = match ask {
+            Ask::First => self.device_head(dset),
+            Ask::Again | Ask::ReadValue(_) => match self.resume.pop() {
+                Some(at) => self.resume_at(at, dset, ask),
+                None => {
+                    debug_assert!(
+                        false,
+                        "an ask again follows a Reentered or ReadValue answer"
+                    );
+                    Step::Ended(McaStart::Synchronous)
+                }
+            },
+        };
+        match step {
+            Step::Ended(start) => start,
+            Step::Nested(at) => {
+                self.resume.push(at);
+                McaStart::Reentered
+            }
+            Step::ReadValue { rdng } => {
+                self.resume.push(Resume::ReadValue { rdng });
+                McaStart::ReadValue
+            }
+        }
+    }
+
+    /// [`Self::begin_device_cycle`] as a device's `read_begin` answers it.
+    pub fn device_read_begin(
+        &mut self,
+        dset: &mut impl McaDset,
+        done: &DeviceDoneSource<'_>,
+    ) -> ReadStart {
+        match self.begin_device_cycle(dset, Ask::of(done)) {
+            McaStart::Synchronous => ReadStart::Synchronous,
+            McaStart::Pending => ReadStart::Pending,
+            McaStart::Reentered => ReadStart::Reentered,
+            McaStart::ReadValue => ReadStart::ReadValue,
+        }
+    }
+
+    /// [`Self::begin_device_cycle`] for a device that completes every
+    /// message inside its send, on a record that is not simulated.
+    #[cfg(test)]
+    pub(crate) fn run_device_cycle(&mut self, dset: &mut impl McaDset) {
+        let mut start = self.begin_device_cycle(dset, Ask::First);
+        if start == McaStart::ReadValue {
+            start = self.begin_device_cycle(dset, Ask::ReadValue(&SimRead::Device));
+        }
+        debug_assert_eq!(start, McaStart::Synchronous);
+    }
+
+    /// [`Self::read_data`] on a record that is not simulated.
+    #[cfg(test)]
+    pub(crate) fn read_data_unsimulated(&mut self, dset: &mut impl McaDset) {
+        if let Step::ReadValue { rdng } = self.read_data(dset) {
+            let at = Resume::ReadValue { rdng };
+            self.resume_at(at, dset, Ask::ReadValue(&SimRead::Device));
+        }
+    }
+
+    /// C `:507-790` from the `reprocess:` label.
+    fn device_head(&mut self, dset: &mut impl McaDset) -> Step {
+        if self.nack != 0 {
+            debug_print!(1, "process: clearing NACK field\n");
+            self.nack = 0;
+            self.mmap |= M_NACK;
+        }
+        debug_print!(
+            2,
+            "process: entry, rdng={}, rdns={}, read={}\n",
+            self.rdng,
+            self.rdns,
+            self.read
+        );
+        if self.rdns != 0 {
+            // The status callback's pass: `send_msg` copies what it read.
+            let status = dset.read_status(self);
+            self.apply_status(status);
+            return self.read_data(dset);
+        }
+        if self.rdng != 0 {
+            return self.read_data(dset);
+        }
+        if let Some(at) = self.send_device_requests(dset) {
+            return Step::Nested(at);
+        }
+        self.status_read(dset)
+    }
+
+    /// C's code after the `send_msg` a nested pass ran inside, or after
+    /// `readValue`'s link reads.
+    fn resume_at(&mut self, at: Resume, dset: &mut impl McaDset, ask: Ask<'_>) -> Step {
+        match at {
+            Resume::Mode => {
+                self.send_start_stop(dset);
+                self.status_read(dset)
+            }
+            Resume::Status => {
+                // C reuses `pstatus`, which the nested pass filled.
+                self.apply_status(Ok(self.status));
+                self.read_data(dset)
+            }
+            // C finds `rdng` clear and reads the data a second time (`:778-788`).
+            Resume::Data => {
+                self.read = 0;
+                self.mmap |= M_READ;
+                self.read_value(false)
+            }
+            Resume::ReadValue { rdng } => {
+                let Ask::ReadValue(sim) = ask else {
+                    debug_assert!(false, "a ReadValue answer is asked again with its SimRead");
+                    return Step::Ended(McaStart::Synchronous);
+                };
+                self.finish_read_value(dset, sim);
+                if rdng {
+                    self.rdng = 0;
+                    self.mmap |= M_RDNG;
+                }
+                Step::Ended(McaStart::Synchronous)
+            }
+        }
+    }
+
+    /// C `read_status:` (`:660-742`).
+    fn status_read(&mut self, dset: &mut impl McaDset) -> Step {
+        debug_print!(5, "process: reading elapsed time, etc.\n");
+        match dset.send_read(McaRead::Status) {
+            Err(Nack) => self.apply_status(Err(Nack)),
+            Ok(Sent::Done) => {
+                let status = dset.read_status(self);
+                self.apply_status(status);
+            }
+            Ok(Sent::Queued) => {
+                self.rdns = 1;
+                debug_print!(5, "process: waiting for read status callback.\n");
+                self.mmap |= M_RDNS;
+                return Step::Ended(McaStart::Pending);
+            }
+            Ok(Sent::Ran) => {
+                self.rdns = 1;
+                return Step::Nested(Resume::Status);
+            }
+        }
+        self.read_data(dset)
+    }
+
+    /// C `read_data:` (`:744-790`).
+    pub(crate) fn read_data(&mut self, dset: &mut impl McaDset) -> Step {
+        if self.rdng != 0 {
+            debug_print!(5, "process: get data\n");
+            return self.read_value(true);
+        }
+        if self.read == 0 {
+            return Step::Ended(McaStart::Synchronous);
+        }
+        debug_print!(5, "process: initiate read.\n");
+        // C records the time the read BEGAN, for clients computing counts per
+        // second across it (`:762-764`); the value lands with the stamp.
+        self.stamp_sites.rtim = true;
+        self.mmap |= M_RTIM;
+        let sent = dset.send_read(McaRead::Data);
+        if sent == Ok(Sent::Ran) {
+            // The nested pass runs inside C's `send_msg`, before `READ` clears.
+            self.rdng = 1;
+            return Step::Nested(Resume::Data);
+        }
+        self.read = 0;
+        self.mmap |= M_READ;
+        match sent {
+            // A failed send still reads (`:767-783`). C's device has already
+            // set RDNG (devMcaAsyn.c:287), so a refused queue leaves the record
+            // PACT for good; the port completes the pass with NACK instead.
+            Err(Nack) => self.not_acknowledged(),
+            Ok(Sent::Done) => {}
+            Ok(_) => {
+                self.rdng = 1;
+                debug_print!(5, "process: waiting for read data callback.\n");
+                self.mmap |= M_RDNG;
+                return Step::Ended(McaStart::Pending);
+            }
+        }
+        debug_print!(5, "process: get data\n");
+        self.read_value(false)
+    }
+
+    /// C `:509-659` — everything the record does BEFORE the status read.
+    ///
+    /// The record's own state changes are applied here: `ERAS` zeroes the
+    /// spectrum inside the record (`:614`; C's comment at `:612-613` gives the
+    /// reason — cheaper than forcing a read back from device support), `STRT`
+    /// forces `ACQG` to 1 (`:644`), and every consumed `NEWV` bit is cleared,
+    /// so a message goes out once per put.
+    ///
+    /// `Some` when the MODE put's `mcaData` ran its callback inline: the
+    /// nested pass reads the spectrum, and this one sends start and stop
+    /// from [`Resume::Mode`].
+    pub(crate) fn send_device_requests(&mut self, dset: &mut impl McaDset) -> Option<Resume> {
         // C's NEWV block, in C's field order (`:525-634`). `special()` sets one
         // bit per setup field written; `process` then sends that field's CURRENT
         // value, not the value that was written.
@@ -128,7 +474,10 @@ impl McaRecord {
             (NEWV_PSWP, McaCommand::PresetSweeps(self.pswp)),
         ] {
             if self.newv & bit != 0 {
-                cmds.push(cmd);
+                // C marks each with its NEWV bit, which aliases a posted field
+                // for CHAS (IDTIM) and NUSE (NORD).
+                self.mmap |= bit;
+                self.send_acknowledged(dset, cmd);
                 self.newv &= !bit;
             }
         }
@@ -137,84 +486,195 @@ impl McaRecord {
         // (`:615-619`): under ERST new data are coming in anyway, so posting the
         // zeroed array is not worth the cost. The ERAS-only arm is `:620-626`.
         if self.newv & (NEWV_ERAS | NEWV_ERST) != 0 {
-            cmds.push(McaCommand::Erase);
+            self.send_acknowledged(dset, McaCommand::Erase);
             self.nord = 0;
+            self.mmap |= M_NORD;
             // NUSE channels, not NMAX (`:614`).
             self.zero_spectrum(self.nuse.max(0) as usize);
             if self.newv & NEWV_ERAS != 0 {
                 self.eras = 0;
+                // M_ERAS is M_DTIM's bit, so C posts DTIM on every erase.
+                self.mmap |= NEWV_ERAS | M_VAL;
                 self.newv &= !NEWV_ERAS;
                 self.newr = NEWR_ALL;
             }
         }
 
         if self.newv & NEWV_MODE != 0 {
-            cmds.push(McaCommand::AcquireMode(self.mode as i32));
+            self.mmap |= NEWV_MODE;
             self.newv &= !NEWV_MODE;
+            match McaCommand::for_mode(self.mode) {
+                // PHA is `mcaData`, a read like the one `read_data:` starts:
+                // C's device sets RDNG (devMcaAsyn.c:287) and its callback
+                // re-enters the record, which then reads the spectrum (`:524`).
+                Some(McaCommand::Data) => match dset.send_read(McaRead::Data) {
+                    Ok(Sent::Done) => {}
+                    // C goes on to the status read with RDNG set; the callback
+                    // pass lands the data.
+                    Ok(Sent::Queued) => self.rdng = 1,
+                    Ok(Sent::Ran) => {
+                        self.rdng = 1;
+                        return Some(Resume::Mode);
+                    }
+                    // C's device sets RDNG before the refused queue
+                    // (devMcaAsyn.c:287, :331-336), so `read_data:` after the
+                    // status read re-reads the old buffer and marks VAL.
+                    Err(Nack) => {
+                        self.rdng = 1;
+                        self.not_acknowledged();
+                    }
+                },
+                Some(cmd) => self.send_acknowledged(dset, cmd),
+                None => {}
+            }
         }
+        self.send_start_stop(dset);
+        None
+    }
 
+    /// C `:636-659`.
+    fn send_start_stop(&mut self, dset: &mut impl McaDset) {
         // Start and stop go last, so the status read that follows sees them —
-        // C's comment at `:636` says so; the start block is `:637-654`.
+        // C's comment at `:636` says so; the start block is `:637-654`. C
+        // ignores both sends' status.
         if self.strt != 0 || self.newv & NEWV_ERST != 0 {
-            cmds.push(McaCommand::StartAcquire);
+            debug_print!(5, "process: start acquisition.\n");
+            let _ = dset.send_msg(McaCommand::StartAcquire);
             self.acqg = 1;
-            self.strt = 0;
+            self.mmap |= M_ACQG;
+            if self.strt != 0 {
+                self.strt = 0;
+                self.mmap |= M_STRT;
+            }
             if self.newv & NEWV_ERST != 0 {
                 self.erst = 0;
                 self.newv &= !NEWV_ERST;
+                self.mmap |= NEWV_ERST;
             }
         }
         if self.stop != 0 {
-            cmds.push(McaCommand::StopAcquire);
+            debug_print!(5, "process: stop acquisition.\n");
+            let _ = dset.send_msg(McaCommand::StopAcquire);
             self.stop = 0;
+            self.mmap |= M_STOP;
         }
-
-        cmds
     }
 
-    /// C `process` `:687-742` — what the status device support just read MEANS.
+    /// C `if (status) {pmca->nack = 1; MARK(M_NACK);}` after a send.
+    fn send_acknowledged(&mut self, dset: &mut impl McaDset, cmd: McaCommand) {
+        if dset.send_msg(cmd).is_err() {
+            self.not_acknowledged();
+        }
+    }
+
+    fn not_acknowledged(&mut self) {
+        self.nack = 1;
+        self.mmap |= M_NACK;
+    }
+
+    /// C `process` `:666-742` — what the status read MEANS.
     ///
-    /// Returns `true` when the spectrum must now be read: either a client set
-    /// `READ`, or acquisition has just stopped — C forces a read on the 1 -> 0
-    /// transition (`:735-742`) so the final spectrum is never missed.
+    /// A failed read raises NACK and zeroes `ACQG` unmarked (`:671-674`), and
+    /// the cycle goes on with the status read before it, which is what C's
+    /// `pstatus` still holds. Acquisition stopping forces a spectrum read
+    /// (`:735-742`) so the final spectrum is never missed.
     ///
     /// `ACQG` is deliberately NOT committed here. C's comment at `:736-738`: a
     /// client must not learn that acquisition stopped before the last spectrum
     /// and its ROI sums have been posted. `process()` commits it, after the read.
-    pub fn apply_status(&mut self, status: McaStatus) -> bool {
+    pub(crate) fn apply_status(&mut self, status: Result<McaStatus, Nack>) {
+        match status {
+            Ok(status) => self.status = status,
+            Err(Nack) => {
+                debug_print!(1, "process: error sending mcaReadStatus\n");
+                self.not_acknowledged();
+                self.acqg = 0;
+            }
+        }
+        let status = self.status;
         self.rdns = 0;
+        debug_print!(
+            5,
+            "process: status from callback: elapsedReal={}, elapsedLive={}, acquiring={}\n",
+            CFloat(status.elapsed_real),
+            CFloat(status.elapsed_live),
+            i32::from(status.acquiring)
+        );
 
-        let times_moved = self.ertm != status.elapsed_real || self.eltm != status.elapsed_live;
-        let (prev_ertm, prev_eltm) = (self.ertm, self.eltm);
-        self.ertm = status.elapsed_real;
-        self.eltm = status.elapsed_live;
-        self.act = status.total_counts as i32;
+        // C's `ertp`/`eltp` start at 0 (`:498`) and take the old value only
+        // when that field moved (`:692-701`).
+        let (mut prev_ertm, mut prev_eltm) = (0.0, 0.0);
+        if self.ertm != status.elapsed_real {
+            prev_ertm = self.ertm;
+            self.ertm = status.elapsed_real;
+            self.mmap |= M_ERTM;
+        }
+        if self.eltm != status.elapsed_live {
+            prev_eltm = self.eltm;
+            self.eltm = status.elapsed_live;
+            self.mmap |= M_ELTM;
+        }
+        // C compares the int32 against the double (`:702`), so a fractional
+        // count marks ACT on every pass.
+        if f64::from(self.act) != status.total_counts {
+            self.act = c_cast::f64_to_i32(status.total_counts);
+            self.mmap |= M_ACT;
+        }
         // Device support is allowed to correct DWEL to the dwell the hardware
         // can actually deliver (`:706-709`).
-        self.dwel = status.dwell_time;
-        if times_moved {
+        if self.dwel != status.dwell_time {
+            self.dwel = status.dwell_time;
+            self.mmap |= M_DWEL;
+        }
+        if self.mmap & (M_ERTM | M_ELTM) != 0 {
             self.update_dead_time(prev_ertm, prev_eltm);
+            self.mmap |= M_DTIM | M_IDTIM;
         }
 
-        self.status = status;
+        debug_print!(
+            5,
+            "process: pstatus->acqg={}, acqg={}\n",
+            i32::from(status.acquiring),
+            self.acqg
+        );
         if self.acqg != u16::from(status.acquiring) && !status.acquiring {
             self.read = 1;
+            self.mmap |= M_READ;
         }
-
-        if self.read == 0 {
-            return false;
-        }
-        self.read = 0;
-        // C records the time the read BEGAN, for clients computing counts per
-        // second across it (`:762-764`).
-        self.rtim = epics_seconds(SystemTime::now());
-        true
     }
 
-    /// C `readValue` (`:1097-1132`) once device support has produced the data:
-    /// land it, and mark every region for recomputation.
+    /// C `readValue` (`:1097`) up to its SIML read, a link read the pass
+    /// stops for.
+    fn read_value(&mut self, rdng: bool) -> Step {
+        // Every read marks every region for recomputation (`:1104`).
+        self.newr = NEWR_ALL;
+        Step::ReadValue { rdng }
+    }
+
+    /// C `readValue` past its link reads (`:1108-1132`), and its caller's
+    /// `if (status) nack = 1 else MARK(M_VAL)`.
+    fn finish_read_value(&mut self, dset: &mut impl McaDset, sim: &SimRead) {
+        let read = match sim {
+            SimRead::Device => {
+                let nord = self.nord;
+                let read = dset.read_array(self);
+                if self.nord != nord {
+                    self.mmap |= M_NORD;
+                }
+                read
+            }
+            SimRead::Siol { fetch, db_link } => self.land_siol_read(fetch, *db_link),
+            SimRead::Failed => Err(Nack),
+        };
+        match read {
+            Ok(()) => self.mmap |= M_VAL,
+            Err(Nack) => self.not_acknowledged(),
+        }
+    }
+
+    /// Land a spectrum device support read as a value: `VAL` and `NORD`
+    /// from it, as C's `read_array` writes `bptr` and `nord`.
     pub fn land_spectrum_read(&mut self, data: EpicsValue) -> CaResult<()> {
-        self.read_completed();
         self.land_spectrum(data)
     }
 
@@ -227,38 +687,19 @@ impl McaRecord {
     /// `NORD` is clamped to `NMAX`: the buffer is `NMAX` channels deep, and a
     /// driver claiming to have written more is claiming to have written past it.
     pub fn land_channel_count(&mut self, nord: i32) {
-        self.read_completed();
         self.nord = nord.clamp(0, self.nmax);
-    }
-
-    /// C `readValue`'s first statement: EVERY read marks every region for
-    /// recomputation (`mcaRecord.c:1104`) — the spectrum under them has just
-    /// changed. Qualified, not bare: the nearest preceding file mention in this
-    /// module is `devMCA_soft.c`, which is 162 lines long, so a bare `:1104`
-    /// here reads as a past-EOF error while naming a line that exists.
-    fn read_completed(&mut self) {
-        self.newr = NEWR_ALL;
-        self.rdng = 0;
     }
 
     /// C `mcaRecord.c:710-732`. `DTIM` is the average dead time over the whole acquisition;
     /// `IDTIM` is the dead time over the interval since the previous status read,
-    /// and is the field the record ALARMS on.
-    ///
-    /// **Tier-2 deviation — C's interval is not an interval.** C keeps the
-    /// previous elapsed times in two locals initialised to zero at the top of
-    /// `process` (`:498`, `double ertp=0., eltp=0.;`) and assigns them only
-    /// inside the branch that saw that field CHANGE (`:692-701`). So on a cycle
-    /// where the real time moved but the live time did not — a detector so dead
-    /// that its live-time clock has stopped, which is precisely the condition
-    /// `IDTIM` exists to report — C evaluates `100*(drt - (eltm - 0))/drt`
-    /// instead of `100*(drt - 0)/drt`, gets a large negative number, clamps it to
-    /// 0, and reports 0% instantaneous dead time at the moment the detector is
-    /// 100% dead. The port passes the actual previous values, so the interval is
-    /// the interval.
+    /// and is the field the record ALARMS on. `prev_*` is 0 for a field that
+    /// did not change this read, as C's locals are.
     fn update_dead_time(&mut self, prev_ertm: f64, prev_eltm: f64) {
         self.dtim = if self.ertm > 0.001 {
-            (100.0 * (self.ertm - self.eltm) / self.ertm).clamp(0.0, 100.0)
+            c_max(
+                c_min(100.0 * (self.ertm - self.eltm) / self.ertm, 100.0),
+                0.0,
+            )
         } else {
             0.0
         };
@@ -267,7 +708,7 @@ impl McaRecord {
             let drt = self.ertm - prev_ertm;
             if drt > 0.001 {
                 let dlt = self.eltm - prev_eltm;
-                (100.0 * (drt - dlt) / drt).clamp(0.0, 100.0)
+                c_max(c_min(100.0 * (drt - dlt) / drt, 100.0), 0.0)
             } else {
                 0.0
             }
@@ -282,13 +723,13 @@ impl McaRecord {
     /// `IDTIM`, not on `VAL`. `VAL` is a spectrum: there is nothing for a limit
     /// to be compared against.
     pub(crate) fn check_dead_time_alarms(&mut self, common: &mut CommonFields) {
-        use epics_base_rs::server::recgbl::{alarm_status, rec_gbl_set_sevr};
-        use epics_base_rs::server::record::AlarmSeverity;
+        use epics_base_rs::server::recgbl::{alarm_status, rec_gbl_set_sevr, udf_alarm_active};
+        use epics_base_rs::server::record::{AlarmSeverity, Record};
 
-        // C returns before the ladder when the record is undefined (`:968-971`).
-        // The framework raises UDF_ALARM itself (`rec_gbl_check_udf`), which is
+        // C returns before the ladder when `udf == TRUE` (`:968-971`). The
+        // framework raises UDF_ALARM itself (`rec_gbl_check_udf`), which is
         // the other half of that same branch.
-        if common.udf != 0 {
+        if udf_alarm_active(common.udf, self.udf_alarm_on_exact_one()) {
             return;
         }
 
@@ -325,34 +766,146 @@ impl McaRecord {
     }
 }
 
-/// Seconds past the EPICS epoch — C's `pmca->time.secPastEpoch +
-/// pmca->time.nsec*1.e-9` (`:763`).
-pub(crate) fn epics_seconds(t: SystemTime) -> f64 {
-    let unix = t
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs_f64();
-    unix - epics_base_rs::runtime::general_time::EPICS_EPOCH_UNIX_SECS as f64
+/// C `MAX(a,b)` (`mcaRecord.c:177`): `b` unless `a > b`, so a NaN `b`
+/// wins and a NaN `a` loses, where `f64::max` drops the NaN either way.
+pub(crate) fn c_max(a: f64, b: f64) -> f64 {
+    if a > b { a } else { b }
 }
 
-/// C `:809-816` — the wall-clock time acquisition stopped, to millisecond
-/// precision.
-///
-/// **Tier-2 deviation — C truncates its own output.** C renders `"%b %d, %Y
-/// %H:%M:%S.%03f"` into `pmca->stim` with `epicsTimeToStrftime(pmca->stim, 25,
-/// ...)`. That rendering needs 26 bytes (`Jul 14, 2026 19:28:45.123` is 25
-/// characters, plus the NUL); given 25, `epicsTimeToStrftime` cannot fit the
-/// fractional field and writes its overflow marker instead, so what a client
-/// reads back ends `.**`. Measured on the C IOC built for this port: `STIM =
-/// "Jul 14, 2026 19:28:45.**"`. The `.dbd` declares `STIM` as `size(40)`, so the
-/// buffer was never the constraint — the hard-coded 25 was — and the line
-/// immediately after it (`pmca->stim[25]='\0'`, commented "Trim STIM to 25
-/// characters = .001 sec precision") says exactly what the intent was. The port
-/// emits the milliseconds.
-pub(crate) fn format_stim(t: SystemTime) -> String {
-    let dt: chrono::DateTime<chrono::Local> = t.into();
-    dt.format("%b %d, %Y %H:%M:%S%.3f").to_string()
+/// C `MIN(a,b)` (`mcaRecord.c:178`); see [`c_max`].
+pub(crate) fn c_min(a: f64, b: f64) -> f64 {
+    if a < b { a } else { b }
 }
+
+/// Which of C's two `recGblGetTimeStamp` sites a pass passed: `:762`,
+/// where a read begins (RTIM), and `:811`, where acquisition is seen
+/// stopped (STIM). Both read the TIME the stamp stores, TSEL applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct StampSites {
+    pub rtim: bool,
+    pub stim: bool,
+}
+
+impl StampSites {
+    pub fn any(self) -> bool {
+        self.rtim || self.stim
+    }
+}
+
+/// C's `pmca->time.secPastEpoch + pmca->time.nsec*1.e-9` (`:763`), with
+/// `secPastEpoch` the `epicsUInt32` it is; C's unset `{0, 0}` stamp is 0.
+pub(crate) fn epics_seconds(t: WallTime) -> f64 {
+    if t == WallTime::UNIX_EPOCH {
+        return 0.0;
+    }
+    let secs = t
+        .unix_secs()
+        .wrapping_sub(epics_base_rs::runtime::general_time::EPICS_EPOCH_UNIX_SECS)
+        as u32;
+    f64::from(secs) + f64::from(t.subsec_nanos()) * 1.0e-9
+}
+
+/// C `:812-814`, `epicsTimeToStrftime(pmca->stim, 25, "%b %d, %Y
+/// %H:%M:%S.%03f", &pmca->time)`, written over `stim`'s own buffer.
+///
+/// The prefix renders 22 bytes, leaving 3 of the 25 — too few for three
+/// digits and the NUL — so C's no-room branch (`epicsTime.cpp:265-276`)
+/// writes `bufLenLeft - 1` stars instead: `Jul 14, 2026 19:28:45.**`. The
+/// `stim[25]` trim at `:814` then has nothing to cut.
+pub(crate) fn format_stim(stim: &mut PvString, t: WallTime) {
+    use chrono::{Datelike, Timelike};
+    use std::fmt::Write;
+
+    const BUF_LENGTH: usize = 25;
+    const FRAC_DIGITS: usize = 3;
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+
+    // C's `{0, 0}` stamp (`epicsTime.cpp:176-180`).
+    if t == WallTime::UNIX_EPOCH {
+        stim.set_bytes(b"<undefined>");
+        return;
+    }
+    let dt: chrono::DateTime<chrono::Local> = SystemTime::from(t).into();
+    let mut out = Bounded::<BUF_LENGTH>::default();
+    // `strftime` writes nothing for a prefix that does not fit.
+    if write!(
+        out,
+        "{} {:02}, {} {:02}:{:02}:{:02}.",
+        MONTHS[dt.month0() as usize],
+        dt.day(),
+        dt.year(),
+        dt.hour(),
+        dt.minute(),
+        dt.second(),
+    )
+    .is_err()
+    {
+        out.len = 0;
+    }
+    let left = BUF_LENGTH - out.len;
+    if left > 1 {
+        if FRAC_DIGITS < left {
+            // `nsec + div/2`, clamped below a whole second, over `div`.
+            let frac = (t.subsec_nanos() + 500_000).min(999_999_999) / 1_000_000;
+            let _ = write!(out, "{frac:03}");
+        } else {
+            let _ = out.write_str(&"************"[..left - 1]);
+        }
+    }
+    stim.set_bytes(&out.buf[..out.len]);
+}
+
+/// A `char[N]` for `fmt::Write`: holds at most `N - 1` bytes, the NUL's slot
+/// kept free, and refuses a write that would not fit.
+struct Bounded<const N: usize> {
+    buf: [u8; N],
+    len: usize,
+}
+
+impl<const N: usize> Default for Bounded<N> {
+    fn default() -> Self {
+        Self {
+            buf: [0; N],
+            len: 0,
+        }
+    }
+}
+
+impl<const N: usize> std::fmt::Write for Bounded<N> {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        let end = self.len + s.len();
+        if end >= N {
+            return Err(std::fmt::Error);
+        }
+        self.buf[self.len..end].copy_from_slice(s.as_bytes());
+        self.len = end;
+        Ok(())
+    }
+}
+
+// C `mcaRecord.c:224-240` — the MMAP bits of the fields only `process()`
+// marks. The NEWV bits below share MMAP, and three of them alias these:
+// M_ERAS is M_DTIM, M_CHAS is M_IDTIM, M_NUSE is M_NORD.
+pub(crate) const M_VAL: u32 = 0x0000_0001;
+pub(crate) const M_NACK: u32 = 0x0000_0002;
+pub(crate) const M_BG: u32 = 0x0000_0004;
+pub(crate) const M_ACQG: u32 = 0x0000_0008;
+pub(crate) const M_READ: u32 = 0x0000_0010;
+pub(crate) const M_RDNG: u32 = 0x0000_0020;
+pub(crate) const M_ERTM: u32 = 0x0000_0040;
+pub(crate) const M_ELTM: u32 = 0x0000_0080;
+pub(crate) const M_ACT: u32 = 0x0000_0100;
+pub(crate) const M_STRT: u32 = 0x0000_0200;
+pub(crate) const M_STOP: u32 = 0x0000_0400;
+pub(crate) const M_STIM: u32 = 0x0000_0800;
+pub(crate) const M_RTIM: u32 = 0x0000_1000;
+pub(crate) const M_RDNS: u32 = 0x0000_2000;
+pub(crate) const M_DTIM: u32 = 0x0000_4000;
+pub(crate) const M_IDTIM: u32 = 0x0000_8000;
+pub(crate) const M_NORD: u32 = 0x0001_0000;
+pub(crate) const M_DWEL: u32 = 0x0002_0000;
 
 // C `mcaRecord.c:242-256` — the NEWV bits. `NEWV` is a `DBF_ULONG` field and so
 // is CA-visible: the bit VALUES are part of the field surface, not an

@@ -1,0 +1,3 @@
+AsynDriverInterface::lockRequest(rec, 5000 msec)
+AsynDriverInterface::lockHandler(rec)
+AsynDriverInterface::unlock(rec)

@@ -22,7 +22,7 @@ use motor_rs::ioc::SimMotorHolder;
 #[cfg(tokio_backend)]
 #[epics_base_rs::epics_main]
 async fn main() -> CaResult<()> {
-    epics_base_rs::runtime::env::set_default("OPHYD_TEST_IOC", env!("CARGO_MANIFEST_DIR"));
+    epics_base_rs::runtime::env::set_default_path("OPHYD_TEST_IOC", env!("CARGO_MANIFEST_DIR"));
 
     let mut ioc = AdIoc::new();
 
@@ -34,10 +34,13 @@ async fn main() -> CaResult<()> {
     sim_detector::ioc_support::register(&mut ioc);
 
     // Motors (simMotorCreate command + motor.template)
-    epics_base_rs::runtime::env::set_default("MOTOR", motor_rs::MOTOR_IOC_DIR);
+    epics_base_rs::runtime::env::set_default_path("MOTOR", motor_rs::MOTOR_IOC_DIR);
     let motor_holder = SimMotorHolder::new();
     ioc.register_startup_command(motor_holder.sim_motor_create_command());
-    ioc.register_dynamic_device_support(motor_holder.device_support_factory());
+    ioc.register_dynamic_device_support(
+        &motor_rs::devices::devices(),
+        motor_rs::devices::device_support_factory(),
+    );
 
     ioc.run_from_args_with_pva().await
 }
@@ -46,9 +49,8 @@ async fn main() -> CaResult<()> {
 /// backend, so there is no IOC to build here.
 #[cfg(exec_backend)]
 fn main() -> CaResult<()> {
-    eprintln!(
+    epics_base_rs::runtime::task::refuse_backend(
         "ophyd_test_ioc needs the tokio backend; this build selects the \
-         reactor-free execution model (EPICS_RS_BUILD_EXEC_BACKEND=thread)."
-    );
-    Ok(())
+         reactor-free execution model (EPICS_RS_BUILD_EXEC_BACKEND=thread).",
+    )
 }

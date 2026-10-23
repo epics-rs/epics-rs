@@ -65,7 +65,7 @@ async fn add_event_sibling(db: &PvDatabase, name: &str, evnt: &str, counter: Arc
         let r = db.get_record(name).unwrap();
         let mut inst = r.write();
         inst.common.scan = ScanType::Event;
-        inst.common.evnt = evnt.to_string();
+        inst.common.text.evnt = evnt.into();
     }
     db.update_scan_index(name, ScanType::Passive, ScanType::Event, 0, 0);
 }
@@ -91,12 +91,14 @@ async fn settle(cond: impl Fn() -> bool) {
 #[epics_macros_rs::epics_test]
 async fn calcout_oevt_posts_string_event_on_output() {
     let db = PvDatabase::new();
+    // No `iocRun` over this database: the running transition is its own.
+    db.scan_control().run();
     let count = Arc::new(AtomicUsize::new(0));
     add_event_sibling(&db, "SIB", "e1", count.clone()).await;
 
     let mut c = CalcoutRecord::default();
     c.put_field("CALC", EpicsValue::String("1".into())).unwrap();
-    c.special("CALC", true).unwrap(); // VAL=1, finite
+    c.special("CALC", true, &Default::default()).unwrap(); // VAL=1, finite
     c.put_field("OEVT", EpicsValue::String("e1".into()))
         .unwrap();
     // oopt default 0 = Every_Time → output is due. No OUT link configured.
@@ -127,7 +129,7 @@ async fn calcout_oevt_suppressed_on_dont_drive_invalid() {
     let mut c = CalcoutRecord::default();
     c.put_field("CALC", EpicsValue::String("0/0".into()))
         .unwrap();
-    c.special("CALC", true).unwrap(); // NaN → UDF → INVALID
+    c.special("CALC", true, &Default::default()).unwrap(); // NaN → UDF → INVALID
     c.put_field("IVOA", EpicsValue::Short(1)).unwrap(); // Don't_drive
     c.put_field("OEVT", EpicsValue::String("e2".into()))
         .unwrap();
@@ -168,12 +170,14 @@ async fn calcout_oevt_suppressed_on_dont_drive_invalid() {
 #[epics_macros_rs::epics_test]
 async fn scalcout_oevt_posts_numeric_event_on_output() {
     let db = PvDatabase::new();
+    // No `iocRun` over this database: the running transition is its own.
+    db.scan_control().run();
     let count = Arc::new(AtomicUsize::new(0));
     add_event_sibling(&db, "S_SIB", "5", count.clone()).await;
 
     let mut s = ScalcoutRecord::default();
     s.put_field("CALC", EpicsValue::String("1".into())).unwrap();
-    s.special("CALC", true).unwrap();
+    s.special("CALC", true, &Default::default()).unwrap();
     s.put_field("OEVT", EpicsValue::UShort(5)).unwrap();
     s.oopt = 0; // Every_Time → output is due.
     db.add_record("S_OEVT", Box::new(s)).await.unwrap();
@@ -195,12 +199,14 @@ async fn scalcout_oevt_posts_numeric_event_on_output() {
 #[epics_macros_rs::epics_test]
 async fn acalcout_oevt_posts_numeric_event_on_output() {
     let db = PvDatabase::new();
+    // No `iocRun` over this database: the running transition is its own.
+    db.scan_control().run();
     let count = Arc::new(AtomicUsize::new(0));
     add_event_sibling(&db, "A_SIB", "7", count.clone()).await;
 
     let mut a = AcalcoutRecord::default();
     a.put_field("CALC", EpicsValue::String("1".into())).unwrap();
-    a.special("CALC", true).unwrap();
+    a.special("CALC", true, &Default::default()).unwrap();
     a.put_field("OEVT", EpicsValue::UShort(7)).unwrap();
     a.put_field("OOPT", EpicsValue::Short(0)).unwrap(); // Every_Time
     db.add_record("A_OEVT", Box::new(a)).await.unwrap();
@@ -225,12 +231,14 @@ async fn acalcout_oevt_posts_numeric_event_on_output() {
 #[epics_macros_rs::epics_test]
 async fn swait_oevt_posts_numeric_event_on_output() {
     let db = PvDatabase::new();
+    // No `iocRun` over this database: the running transition is its own.
+    db.scan_control().run();
     let count = Arc::new(AtomicUsize::new(0));
     add_event_sibling(&db, "W_SIB", "3", count.clone()).await;
 
     let mut w = SwaitRecord::default();
     w.put_field("CALC", EpicsValue::String("1".into())).unwrap();
-    w.special("CALC", true).unwrap();
+    w.special("CALC", true, &Default::default()).unwrap();
     w.put_field("OEVT", EpicsValue::UShort(3)).unwrap();
     w.put_field("OOPT", EpicsValue::Short(0)).unwrap(); // Every_Time
     db.add_record("W_OEVT", Box::new(w)).await.unwrap();

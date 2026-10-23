@@ -74,9 +74,8 @@ fn armed_records() -> [Armed; 5] {
             kind: "lso",
             fields: r#"field(IVOV,"fault")"#,
             dbf: DbFieldType::Char,
-            // A long string that fits `MAX_STRING_SIZE` is posted as `String`;
-            // a longer one arrives as `CharArray`.
-            posted: EpicsValue::String("fault".into()),
+            // A long string posts its `LEN` elements, text and NUL.
+            posted: EpicsValue::CharArray(b"fault\0".to_vec().into()),
         },
     ]
 }
@@ -121,7 +120,10 @@ async fn one_cycle(
 
     let mut posts = Vec::new();
     while let Ok(ev) = rx.try_recv() {
-        posts.push(ev.snapshot.value.clone());
+        posts.push(
+            ev.delivered_value(&db.get_record("R").unwrap().read(), "VAL")
+                .unwrap(),
+        );
     }
     let sevr = db.get_record("R").unwrap().read().common.sevr;
     (sevr, posts)

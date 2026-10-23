@@ -56,7 +56,7 @@ async fn r11_c13_a_nan_result_clears_udf_and_raises_no_alarm() {
     let mut w = SwaitRecord::default();
     w.put_field("CALC", EpicsValue::String("0/0".into()))
         .unwrap();
-    w.special("CALC", true).unwrap();
+    w.special("CALC", true, &Default::default()).unwrap();
     db.add_record("W", Box::new(w)).await.unwrap();
 
     process(&db, "W").await;
@@ -85,7 +85,7 @@ async fn r11_c13_a_failing_calc_leaves_udf_set() {
     let mut w = SwaitRecord::default();
     w.put_field("CALC", EpicsValue::String("1+".into()))
         .unwrap(); // uncompilable → fails every cycle
-    w.special("CALC", true).unwrap();
+    w.special("CALC", true, &Default::default()).unwrap();
     db.add_record("W", Box::new(w)).await.unwrap();
 
     process(&db, "W").await;
@@ -118,7 +118,7 @@ async fn r11_c13_a_gated_cycle_does_not_touch_udf() {
     let mut w = SwaitRecord::default();
     w.put_field("CALC", EpicsValue::String("A+1".into()))
         .unwrap();
-    w.special("CALC", true).unwrap();
+    w.special("CALC", true, &Default::default()).unwrap();
     w.put_field("INAN", EpicsValue::String("NOSUCHREC".into()))
         .unwrap();
     db.add_record("W", Box::new(w)).await.unwrap();

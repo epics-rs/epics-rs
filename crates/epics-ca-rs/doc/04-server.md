@@ -102,17 +102,21 @@ async fn handle_client(
 ```rust
 struct ClientState {
     channels:        HashMap<sid, ChannelEntry>,
-    subscriptions:   HashMap<sub_id, SubscriptionEntry>,
+    subscriptions:   HashMap<AttachId, SubscriptionEntry>,
     channel_access:  HashMap<sid, AccessLevel>,
-    next_sid:        AtomicU32,
+    retired:         HashMap<sid, cid>,  // never reissued while a request can name it
     hostname:        HostIdentity,  // Claimed(name) by default; Pinned(ip|cert) otherwise
     username:        String,
     acf:             Arc<Option<AccessSecurityConfig>>,
     tcp_port:        u16,
-    client_minor_version: u16,
+    minor:           CircuitMinor,  // read as each frame is built
     flow_control:    Arc<FlowControlGate>,
 }
 ```
+
+A sid comes from one process-wide counter, C's `bucketID++`
+(`camessage.c:1027-1042`), which skips a sid this circuit holds or has
+retired.
 
 `hostname` is the circuit's access-security identity, and its *source* is
 decided once, at the start of the handler — exactly where C decides it, in
@@ -182,7 +186,7 @@ Highlights:
 
 | Opcode | Behaviour |
 |--------|-----------|
-| `VERSION` | Cache `client_minor_version`. Reply with our version. |
+| `VERSION` | Set `state.minor`. No reply: the server's one VERSION is the greeting sent at connect. |
 | `HOST_NAME` | `state.hostname.claim(name)` — taken unless the identity is `Pinned` (C `host_name_action`). Re-evaluate access rights. |
 | `CLIENT_NAME` | Update `state.username`. Re-evaluate access rights. |
 | `CREATE_CHAN` | DoS guard: refuse if `len(channels) >= EPICS_CAS_MAX_CHANNELS`. Look up PV in `db`, allocate sid, build `ChannelEntry`, send `ACCESS_RIGHTS` + `CREATE_CHAN` response (or `CREATE_CH_FAIL` on miss). |
@@ -317,10 +321,10 @@ Honoured environment variables:
 | `EPICS_CAS_BEACON_PERIOD` | Steady-state beacon period (sec, default 15) |
 | `EPICS_CA_REPEATER_PORT` | Beacon destination port (default 5065) |
 
-`discover_broadcast_addrs()` uses the `if-addrs` crate and returns
-every IPv4 broadcast on every up, non-loopback interface. When the
-crate fails (unsupported OS) the result is `vec![]` and we fall back
-to `255.255.255.255` only.
+`discover_broadcast_addrs()` walks `epics_base_rs::net::iface_v4` and
+returns every IPv4 broadcast on every up, non-loopback interface. When
+the walk fails the result is `vec![]` and we fall back to
+`255.255.255.255` only.
 
 ## Monitor sender (`monitor.rs`)
 

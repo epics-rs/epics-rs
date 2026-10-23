@@ -131,7 +131,7 @@ fn the_inverse_matrix_is_flattened_row_major() {
 /// and `convert_to` short-circuits an equal type.
 #[test]
 fn the_scalar_declaration_does_not_collapse_the_served_array() {
-    let inst = RecordInstance::new("T".to_string(), initialised());
+    let inst = RecordInstance::new("T", initialised());
     for (f, n) in [("A", 9), ("B", 9), ("PP0", 3), ("PPO2", 3)] {
         match inst.client_field_value(f) {
             Some(EpicsValue::DoubleArray(v)) => assert_eq!(v.len(), n, "{f}"),

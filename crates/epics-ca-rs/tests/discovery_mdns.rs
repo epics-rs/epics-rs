@@ -24,12 +24,23 @@ use epics_ca_rs::client::{CaClient, CaClientConfig};
 use epics_ca_rs::discovery::DiscoveryConfig;
 use epics_ca_rs::server::CaServer;
 
-/// Smoke test that may be flaky on hosts without working multicast
-/// (some CI containers) — annotated `#[ignore]` so it's opt-in via
-/// `cargo test -- --ignored`. Real LAN hosts run it cleanly.
-#[ignore]
+/// Opt-in: it needs the `discovery` feature, an up non-loopback IPv4
+/// interface that carries multicast, and UDP 5353 open to `mdns-sd`'s
+/// sockets on this host. It fails by timing out (60 s) where that is missing,
+/// so it is not in the default loop; `--profile interop --run-ignored all
+/// --features discovery` runs it.
+#[ignore = "needs --features discovery and a multicast-capable non-loopback IPv4 interface; run with --profile interop --run-ignored all"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn mdns_server_announce_to_client_discover() {
+    // Without one, the announcer registers no address and the browser
+    // never resolves: a 60 s ChannelNotFound, as in ns-run's lo-only netns.
+    assert!(
+        epics_base_rs::net::iface_v4::enumerate()
+            .unwrap_or_default()
+            .iter()
+            .any(|i| i.is_eligible()),
+        "precondition: no up non-loopback IPv4 interface to announce on"
+    );
     // Build an IOC with a unique mDNS instance name to avoid colliding
     // with any other epics-ca-rs servers running on the developer's
     // machine.
@@ -74,18 +85,15 @@ async fn mdns_server_announce_to_client_discover() {
     .expect("client");
 
     let ch = client.create_channel("MDNS:VAL");
-    ch.wait_connected(budget::FACT_BUDGET)
+    ch.wait_connected(fact_budget::FACT_BUDGET)
         .await
         .expect("connect via mDNS-discovered IOC");
 
     let (_, value) = ch
-        .get_with_timeout(budget::FACT_BUDGET)
+        .get_with_timeout(fact_budget::FACT_BUDGET)
         .await
         .expect("read");
     assert_eq!(value.to_f64().unwrap_or(0.0) as i64, 7777);
 
     server_task.abort();
 }
-
-#[path = "common/budget.rs"]
-mod budget;

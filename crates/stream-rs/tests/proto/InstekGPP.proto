@@ -1,0 +1,91 @@
+# Instekl GPP Power Supply Streams Protocol File 
+#
+#####
+# Interface: ASCII (RS232, GPIB, or LAN)
+#
+
+#ExtraInput = Ignore;
+
+getIDN { 
+  out "*IDN?";
+  in "%39c";
+  @init {out "*IDN?"; in "%39c";}
+}
+
+getError { 
+  out ":SYST:ERR?";
+  in "%39c";
+}
+
+getAllmeas {
+  out ":MEAS\$1:ALL?";
+  in "%f,%(\$2)f,%*f";
+}
+
+getVset {
+  out ":SOUR:VOLT:ALL?";
+  in "%f,%(\$1)f,%*f";
+}
+
+getIset {
+  out ":SOUR:CURR:ALL?";
+  in "%f,%(\$1)f,%*f";
+}
+
+getOutState {
+  out ":OUTP\$1:STAT?";
+  in "%s";
+}
+
+getCurrLimState {
+  out ":SOUR\$1:CURR:LIM:STAT?";
+  in "%d";
+}
+
+setOutState {
+  out ":OUTP\$1:STAT %s";
+}
+
+setVolt {
+  out "SOUR\$1:VOLT %f";
+}
+
+setCurrent {
+  out "SOUR\$1:CURR %f";
+}
+
+getOVPValue  {
+  out ":OUTP\$1:OVP?";
+  in "%f";
+}
+
+getOVPState  {
+  out ":OUTP\$1:OVP:STAT?";
+  in "%s";
+}
+
+getOCPValue  {
+  out ":OUTP\$1:OCP?";
+  in "%f";
+}
+
+getOCPState  {
+  out ":OUTP\$1:OCP:STAT?";
+  in "%s";
+}
+
+setOVPValue  {
+  out ":OUTP\$1:OVP %f";
+}
+
+setOVPState  {
+  out ":OUTP\$1:OVP:STAT %s";
+}
+
+setOCPValue  {
+  out ":OUTP\$1:OCP %f";
+}
+
+setOCPState  {
+  out ":OUTP\$1:OCP:STAT %s";
+}

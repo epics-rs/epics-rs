@@ -6,15 +6,15 @@
 //! below, not at whatever that tree's working copy holds today. These trees are
 //! checked out on local branches here and run ahead of their pins.
 //!
-//! The pin is not academic. `drvAsynIPPort.c` is 34 lines longer at the asyn
-//! checkout (`731d616e`) than at the pin, so `setNonBlock(fd, 1)` reads as
-//! `:511` there and `:536` here. A citation checked against the wrong tree
+//! The pin is not academic. `drvAsynIPPort.c` is 54 lines longer at R4-46 than
+//! at R4-45, yet `setNonBlock(fd, 1)` moved up, from `:536` there to `:516`
+//! here. A citation checked against the wrong tree
 //! looks wrong while being right, and one written against the wrong tree is
 //! wrong here — both happened this round.
 //!
 //! | tree | pinned revision |
 //! | --- | --- |
-//! | `asyn` | `R4-45-19-ge2a281e2` |
+//! | `asyn` | `R4-46` (`76f6164757d5`) |
 //! | `epics-base` | `R7.0.10` |
 //! | `modbus` | `R3-4-10-gb1009d0` |
 //! | `motor` | `R7-4-5-g78b474cd` |
@@ -83,10 +83,14 @@
     clippy::single_match,
     clippy::unnecessary_map_or
 )]
+// A merge of two branches that each add the same variant leaves a doubled
+// match arm, which is otherwise only a warning.
+#![deny(unreachable_patterns)]
 
 pub mod drivers;
 pub mod error;
 pub(crate) mod escape;
+pub mod fixed_text;
 // Public: `PortManager::exception_manager` / `PortServices::exceptions` hand
 // out an `Arc<ExceptionManager>`, and a caller registering an exception
 // callback needs to name `AsynException` to match on it.
@@ -110,6 +114,10 @@ pub mod trace;
 pub(crate) mod transport;
 pub mod user;
 
+/// What C's envPaths names `$(ASYN)`: this crate's directory, holding the
+/// `db/asynRecord.db` a startup script loads as `$(ASYN)/db/asynRecord.db`.
+pub const ASYN_DIR: &str = env!("CARGO_MANIFEST_DIR");
+
 #[cfg(feature = "epics")]
 pub mod adapter;
 #[cfg(feature = "epics")]
@@ -122,5 +130,7 @@ pub mod asyn_record;
 /// `epics_base_rs` types.
 #[cfg(feature = "epics")]
 pub mod dbd_generated;
+#[cfg(feature = "epics")]
+mod dsets;
 #[cfg(feature = "epics")]
 pub mod iocsh;

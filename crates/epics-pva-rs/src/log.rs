@@ -66,7 +66,7 @@ static GLOBAL_HANDLE: OnceLock<FilterReloadHandle> = OnceLock::new();
 /// variable wins.
 pub(crate) fn log_env_base() -> Option<String> {
     for key in ["PVXS_LOG", "EPICS_PVA_LOG", "RUST_LOG"] {
-        if let Ok(spec) = std::env::var(key) {
+        if let Some(spec) = epics_base_rs::runtime::env::get_lossy(key) {
             if !spec.is_empty() {
                 return Some(spec);
             }
@@ -125,10 +125,18 @@ pub fn set_global_handle(handle: FilterReloadHandle) {
 pub fn install_cli_logging(debug: bool) {
     use tracing_subscriber::prelude::*;
 
+    crate::pvxs_log::logger_config_env();
+    if debug {
+        crate::pvxs_log::logger_level_set("pvxs.*", crate::pvxs_log::Level::Debug);
+    }
+
     let (filter, handle) = init_filter();
     let installed = tracing_subscriber::registry()
         .with(filter)
-        .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(|| epics_libcom_rs::runtime::log::StagedStderr),
+        )
         .try_init()
         .is_ok();
     if !installed {

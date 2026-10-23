@@ -32,7 +32,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use epics_base_rs::error::CaResult;
-use epics_base_rs::server::database::{LinkDbfType, LinkMetadata, LinkPutOp, LinkSet, PvDatabase};
+use epics_base_rs::server::database::{
+    LinkDbfType, LinkMetadata, LinkPutOp, LinkRef, LinkSet, PvDatabase,
+};
 use epics_base_rs::server::record::{AlarmSeverity, FieldDesc, ProcessOutcome, Record};
 use epics_base_rs::server::records::ao::AoRecord;
 use epics_base_rs::server::records::sseq::SseqRecord;
@@ -80,22 +82,28 @@ struct CaHoldLset(Arc<CaHoldState>);
 
 #[epics_base_rs::async_trait]
 impl LinkSet for CaHoldLset {
-    fn is_connected(&self, _name: &str) -> bool {
+    fn is_connected(&self, _name: LinkRef<'_>) -> bool {
         true
     }
-    fn get_cached_value(&self, _name: &str) -> Option<EpicsValue> {
+    fn get_cached_value(&self, _name: LinkRef<'_>) -> Option<EpicsValue> {
         None
     }
-    async fn get_value(&self, name: &str) -> Option<EpicsValue> {
-        self.get_cached_value(name)
+    async fn get_value(&self, link: LinkRef<'_>) -> Option<EpicsValue> {
+        self.get_cached_value(link)
     }
-    async fn put_value(&self, name: &str, value: EpicsValue, op: LinkPutOp) -> Result<(), String> {
+    async fn put_value(
+        &self,
+        link: LinkRef<'_>,
+        value: EpicsValue,
+        op: LinkPutOp,
+    ) -> Result<(), String> {
+        let name = link.name;
         let held = op == LinkPutOp::Async;
         self.0
             .puts
             .lock()
             .unwrap()
-            .push((name.to_string(), value, held));
+            .push((String::from_utf8_lossy(name).into_owned(), value, held));
         if held {
             // The completion-aware put stays outstanding until the test
             // completes it — this is what keeps the sseq's `WAITn` parked.
@@ -106,13 +114,19 @@ impl LinkSet for CaHoldLset {
             // executor's `cbMedium` thread, which has no tokio reactor, and
             // a `tokio::time` timer there panics rather than sleeping —
             // taking the whole test's sequence down with it.
-            while !self.0.released.lock().unwrap().contains(name) {
+            while !self
+                .0
+                .released
+                .lock()
+                .unwrap()
+                .contains(std::str::from_utf8(name).unwrap())
+            {
                 epics_base_rs::runtime::task::sleep(Duration::from_millis(2)).await;
             }
         }
         Ok(())
     }
-    fn link_metadata(&self, _name: &str) -> Option<LinkMetadata> {
+    fn link_metadata(&self, _name: LinkRef<'_>) -> Option<LinkMetadata> {
         // Connected, DBF_DOUBLE scalar: the destination type sseq's
         // `processCallback` switch resolves (R16-1) so the step is put at all.
         Some(LinkMetadata {
@@ -128,6 +142,7 @@ async fn ca_hold(db: &PvDatabase) -> Arc<CaHoldState> {
     let state = Arc::new(CaHoldState::default());
     db.register_link_set("ca", Arc::new(CaHoldLset(state.clone())))
         .await;
+    db.process_cp_links_on_connect().await;
     state
 }
 
@@ -307,6 +322,8 @@ fn read_short(db_value: Option<EpicsValue>) -> i16 {
 #[epics_macros_rs::epics_test]
 async fn sseq_waitn_blocks_until_downstream_completes() {
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     // Step-1 target: a CA link whose put-callback the lset holds open until
     // the test completes it (C `dbCaPutLinkCallback`). Step-2 target: a plain
     // sync AO.
@@ -388,6 +405,8 @@ async fn sseq_waitn_blocks_until_downstream_completes() {
 #[epics_macros_rs::epics_test]
 async fn sseq_each_lnkn_dispatched_exactly_once_and_clears_busy() {
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     let c1 = Arc::new(AtomicU32::new(0));
     let c2 = Arc::new(AtomicU32::new(0));
     let c3 = Arc::new(AtomicU32::new(0));
@@ -475,6 +494,8 @@ async fn sseq_each_lnkn_dispatched_exactly_once_and_clears_busy() {
 #[epics_macros_rs::epics_test]
 async fn sseq_abort_during_delay_finishes_without_dispatch() {
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     let count = Arc::new(AtomicU32::new(0));
     db.add_record(
         "SSEQ_AB_TGT",
@@ -540,6 +561,8 @@ async fn sseq_abort_during_delay_finishes_without_dispatch() {
 #[epics_macros_rs::epics_test]
 async fn sseq_second_abort_escapes_hung_wait_callback() {
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     // CA target whose put-callback is never completed — the WAIT step parks
     // forever.
     let _hold = ca_hold(&db).await;
@@ -596,11 +619,13 @@ async fn sseq_second_abort_escapes_hung_wait_callback() {
 /// `recGblSetSevr(pR,SOFT_ALARM,INVALID_ALARM)` and finishes without
 /// running any step (sseqRecord.c:319-323). The async start path must
 /// raise the same alarm AND dispatch no `LNKn` — the regression the old
-/// `MultiOut::Sseq` dispatch covered via `apply_selm_alarm` and the
-/// per-step machine dropped (it finished silently).
+/// `MultiOut::Sseq` dispatch covered and the per-step machine dropped (it
+/// finished silently).
 #[epics_macros_rs::epics_test]
 async fn sseq_seln_out_of_range_raises_invalid_alarm_and_no_dispatch() {
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     let count = Arc::new(AtomicU32::new(0));
     db.add_record(
         "SSEQ_SELN_TGT",
@@ -659,6 +684,8 @@ async fn sseq_seln_out_of_range_raises_invalid_alarm_and_no_dispatch() {
 #[epics_macros_rs::epics_test]
 async fn sseq_link_status_loc_vs_con() {
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     // A local target (ao VAL is DBF_DOUBLE = 10 in C dbStatic numbering,
     // dbFldTypes.h:35) so a DB link to it resolves to LOC with a known field
     // type. DTn/LTn report the dbStatic DBF_* index, not the CA DBR value (6).
@@ -722,6 +749,8 @@ async fn sseq_link_status_loc_vs_con() {
 #[epics_macros_rs::epics_test]
 async fn sseq_link_status_reclassifies_on_special() {
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     db.add_record("SSEQ_SP_TGT", Box::new(AoRecord::new(0.0)))
         .await
         .unwrap();
@@ -767,6 +796,8 @@ async fn sseq_link_status_reclassifies_on_special() {
 #[epics_macros_rs::epics_test]
 async fn sseq_werr_raised_on_local_db_wait_cleared_on_ca_and_constant() {
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     let _hold = ca_hold(&db).await;
     db.add_record("SSEQ_WE_TGT", Box::new(AoRecord::new(0.0)))
         .await
@@ -826,6 +857,8 @@ async fn sseq_werr_raised_on_local_db_wait_cleared_on_ca_and_constant() {
 #[epics_macros_rs::epics_test]
 async fn sseq_waitn_on_local_db_link_does_not_wait() {
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     // Local target that never finishes its own processing.
     db.add_record("SSEQ_WDB_HOLD", Box::new(AsyncHold { val: 0.0 }))
         .await
@@ -864,7 +897,13 @@ async fn sseq_waitn_on_local_db_link_does_not_wait() {
         0,
         "the step never entered the waiting set (C never sets `waiting` here)"
     );
-    // ... and the record says so: WERRn is the misconfig report.
+    // WERRn is written by C's `checkLinks` alone, which neither init (every
+    // link is local) nor a start runs: oracleIoc reads 0 here. A `WAIT1` put
+    // schedules it, and then the dropped wait is reported.
+    assert_eq!(read_short(db.get_pv("SSEQ_WDB.WERR1").ok()), 0);
+    db.put_pv("SSEQ_WDB.WAIT1", EpicsValue::Short(1))
+        .await
+        .unwrap();
     poll_i16(
         &db,
         "SSEQ_WDB.WERR1",
@@ -883,6 +922,8 @@ async fn sseq_waitn_on_local_db_link_does_not_wait() {
 #[epics_macros_rs::epics_test]
 async fn sseq_wait_full_barrier_serialises_steps() {
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     let hold = ca_hold(&db).await;
 
     let mut sseq = SseqRecord::new();
@@ -948,6 +989,8 @@ async fn sseq_wait_full_barrier_serialises_steps() {
 #[epics_macros_rs::epics_test]
 async fn sseq_after_n_overlaps_then_barriers() {
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     let hold = ca_hold(&db).await;
 
     let mut sseq = SseqRecord::new();
@@ -1025,6 +1068,8 @@ async fn sseq_after_n_overlaps_then_barriers() {
 #[epics_macros_rs::epics_test]
 async fn sseq_end_drain_waits_for_all_in_flight() {
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     let hold = ca_hold(&db).await;
 
     let mut sseq = SseqRecord::new();
@@ -1083,6 +1128,8 @@ async fn sseq_end_drain_waits_for_all_in_flight() {
 #[epics_macros_rs::epics_test]
 async fn sseq_abort_drains_in_flight_before_finish() {
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     let hold = ca_hold(&db).await;
 
     let mut sseq = SseqRecord::new();
@@ -1162,6 +1209,8 @@ async fn sseq_abort_drains_in_flight_before_finish() {
 #[epics_macros_rs::epics_test]
 async fn sseq_after_n_does_not_block_lower_index_step() {
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     let hold = ca_hold(&db).await;
     // A sync AO target so step 2's NoWait write lands observably.
     db.add_record("SSEQ_NB_TGT2", Box::new(AoRecord::new(0.0)))
@@ -1214,4 +1263,46 @@ async fn sseq_after_n_does_not_block_lower_index_step() {
     )
     .await;
     poll_short(&db, "SSEQ_NB.WTG1", 0, "step 1 cleared at finish").await;
+}
+
+/// `WERRn` follows C's `checkLinks` schedule, pinned against oracleIoc: a
+/// record whose links are all local never runs it at init (0), a `LNKn` put
+/// naming a PV does (1), and an EXT_NC link anywhere keeps it armed from init
+/// (`LINKS_NOT_OK`, sseqRecord.c:237/252), so the local wait reads 1.
+#[epics_macros_rs::epics_test]
+async fn sseq_werr_follows_c_check_links_schedule() {
+    let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
+    db.add_record("SSEQ_WE_TGT", Box::new(AoRecord::new(0.0)))
+        .await
+        .unwrap();
+    db.add_record("SSEQ_WE_TGT2", Box::new(AoRecord::new(0.0)))
+        .await
+        .unwrap();
+    let local = || {
+        let mut sseq = SseqRecord::new();
+        sseq.put_field("LNK1", EpicsValue::String("SSEQ_WE_TGT".into()))
+            .unwrap();
+        sseq.put_field("WAIT1", EpicsValue::Short(1)).unwrap();
+        sseq
+    };
+    db.add_record("SSEQ_WE_L", Box::new(local())).await.unwrap();
+    let mut ext = local();
+    ext.put_field("LNK2", EpicsValue::String("SSEQ_WE_NOPE CA".into()))
+        .unwrap();
+    db.add_record("SSEQ_WE_X", Box::new(ext)).await.unwrap();
+
+    poll_i16(&db, "SSEQ_WE_L.LNK1V", 2, "LNK1 classifies Local PV").await;
+    poll_i16(&db, "SSEQ_WE_X.WERR1", 1, "LINKS_NOT_OK runs checkLinks").await;
+    assert_eq!(read_short(db.get_pv("SSEQ_WE_L.WERR1").ok()), 0);
+
+    db.put_record_field_from_ca(
+        "SSEQ_WE_L",
+        "LNK1",
+        EpicsValue::String("SSEQ_WE_TGT2".into()),
+    )
+    .await
+    .unwrap();
+    poll_i16(&db, "SSEQ_WE_L.WERR1", 1, "a LNK1 put runs checkLinks").await;
 }

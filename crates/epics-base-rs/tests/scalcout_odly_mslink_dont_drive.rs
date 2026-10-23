@@ -35,14 +35,13 @@ async fn scalcout_odly_mslink_invalid_dont_drive_suppresses_out() {
     db.add_record("SRC", Box::new(AiRecord::new(200.0)))
         .await
         .unwrap();
-    {
-        let rec = db.get_record("SRC").unwrap();
-        let mut inst = rec.write();
-        inst.put_common_field("HIHI", EpicsValue::Double(100.0))
-            .unwrap();
-        inst.put_common_field("HHSV", EpicsValue::Short(AlarmSeverity::Invalid as i16))
-            .unwrap();
-    }
+    db.put_pv_no_process("SRC.HIHI", EpicsValue::Double(100.0))
+        .await
+        .unwrap();
+    db.put_pv_no_process("SRC.HHSV", EpicsValue::Short(AlarmSeverity::Invalid as i16))
+        .await
+        .unwrap();
+
     // OUT target seeded 0.0 — must not be driven to OVAL while suppressed.
     db.add_record("TGT", Box::new(AiRecord::new(0.0)))
         .await
@@ -54,7 +53,7 @@ async fn scalcout_odly_mslink_invalid_dont_drive_suppresses_out() {
     let mut sc = ScalcoutRecord::default();
     sc.put_field("CALC", EpicsValue::String("5".into()))
         .unwrap();
-    sc.special("CALC", true).unwrap();
+    sc.special("CALC", true, &Default::default()).unwrap();
     sc.put_field("INPA", EpicsValue::String("SRC MS".into()))
         .unwrap();
     sc.put_field("ODLY", EpicsValue::Double(100.0)).unwrap();
@@ -78,7 +77,7 @@ async fn scalcout_odly_mslink_invalid_dont_drive_suppresses_out() {
     db.process_record_with_links("SC", &mut v1).await.unwrap();
     assert_eq!(
         db.get_record("SC").unwrap().read().record.get_field("DLYA"),
-        Some(EpicsValue::Short(1)),
+        Some(EpicsValue::UShort(1)),
         "ODLY>0 cycle sets DLYA and defers"
     );
     assert_eq!(

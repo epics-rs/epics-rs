@@ -1,0 +1,2 @@
+Terminator = CR LF;
+hi { out "café \xe9"; }

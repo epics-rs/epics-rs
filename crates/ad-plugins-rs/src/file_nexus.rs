@@ -12,26 +12,22 @@
 //!     /data → same dataset
 //! ```
 
+use asyn_rs::port::InterfaceMask;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use ad_core_rs::attributes::NDAttributeList;
 use ad_core_rs::error::{ADError, ADResult};
-use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDataType, NDDimension};
+use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDataType};
 use ad_core_rs::ndarray_pool::NDArrayPool;
-use ad_core_rs::plugin::file_base::{NDFileMode, NDFileWriter};
-use ad_core_rs::plugin::file_controller::FilePluginController;
-use ad_core_rs::plugin::runtime::{
-    NDPluginProcess, ParamChangeResult, PluginParamSnapshot, ProcessResult,
+use ad_core_rs::plugin::file_base::{NDFileOpenMode, NDFileWriter};
+use ad_core_rs::plugin::file_controller::{
+    FileControl, FilePluginController, SettingsStore, WriterSettings,
 };
+use ad_core_rs::plugin::runtime::{NDPluginProcess, PluginAttributes, ProcessResult};
 use parking_lot::Mutex;
 
 use rust_hdf5::{H5Dataset, H5File};
-
-/// Name of the HDF5 attribute recording the NDArray data type ordinal
-/// (matches C `NDDataType_t`). `read_file` uses it to recover the exact type
-/// — without it `read_raw::<u8>` / `<u16>` cannot distinguish signed vs
-/// unsigned or i32 vs u32 vs f32 (all 4-byte) datasets.
-const DTYPE_ATTR: &str = "NDArrayDataType";
 
 /// Serialize an NDArray data buffer to **little-endian** bytes. `rust-hdf5`
 /// 0.2.15 records every numeric datatype message as little-endian and copies
@@ -325,8 +321,9 @@ pub struct NexusWriter {
     uid_dataset: Option<H5Dataset>,
     /// Per-frame `timeStamp` dataset.
     ts_dataset: Option<H5Dataset>,
-    /// Parsed NeXus XML template tree, if a valid template was loaded.
-    template: Option<XmlElement>,
+    /// Parsed NeXus XML template tree, if a valid template was loaded; read
+    /// at open, where C's `openFile` walks `configDoc`.
+    template: WriterSettings<Option<XmlElement>>,
     /// HDF5 path of the group that contains the main array dataset (template
     /// mode); the dataset itself is named by the template's `pArray` node.
     data_group_path: String,
@@ -335,6 +332,8 @@ pub struct NexusWriter {
     /// (built-in hierarchy only — `Some("entry/data")`). `None` in template
     /// mode, where the template controls all dataset placement.
     nxdata_group_path: Option<String>,
+    /// The plugin's own set, C `getAttributes` in `openFile`.
+    plugin_attributes: NDAttributeList,
 }
 
 impl NexusWriter {
@@ -346,10 +345,11 @@ impl NexusWriter {
             dataset: None,
             uid_dataset: None,
             ts_dataset: None,
-            template: None,
+            template: WriterSettings::new(None),
             data_group_path: "entry/instrument/detector".to_string(),
             data_node_name: "data".to_string(),
             nxdata_group_path: None,
+            plugin_attributes: NDAttributeList::new(),
         }
     }
 
@@ -359,7 +359,7 @@ impl NexusWriter {
 
     /// Whether a NeXus XML template is currently loaded.
     pub fn has_template(&self) -> bool {
-        self.template.is_some()
+        self.template.store().get(Option::is_some)
     }
 
     /// Load (parse and validate) a NeXus XML template. On success the template
@@ -367,21 +367,12 @@ impl NexusWriter {
     /// the writer falls back to its built-in NXentry/NXdata hierarchy. Returns
     /// whether the template parsed successfully (C++ `NDFileNexusTemplateValid`).
     pub fn load_template(&mut self, xml: &str) -> bool {
-        match parse_nexus_template(xml) {
-            Ok(root) => {
-                self.template = Some(root);
-                true
-            }
-            Err(_) => {
-                self.template = None;
-                false
-            }
-        }
+        store_template(&self.template.store(), Some(xml))
     }
 
     /// Clear any loaded template (revert to the built-in hierarchy).
     pub fn clear_template(&mut self) {
-        self.template = None;
+        store_template(&self.template.store(), None);
     }
 
     /// Write the NeXus `NX_class` group marker as a true HDF5 group attribute.
@@ -411,7 +402,7 @@ impl NexusWriter {
     fn process_template(
         h5file: &H5File,
         template: &XmlElement,
-        array: &NDArray,
+        attributes: &NDAttributeList,
     ) -> ADResult<(String, String)> {
         let mut data_group = String::new();
         let mut data_node = String::new();
@@ -427,7 +418,7 @@ impl NexusWriter {
                 None,
                 "",
                 child,
-                array,
+                attributes,
                 &mut data_group,
                 &mut data_node,
             )?;
@@ -446,7 +437,7 @@ impl NexusWriter {
         parent: Option<&rust_hdf5::H5Group>,
         parent_path: &str,
         node: &XmlElement,
-        array: &NDArray,
+        attributes: &NDAttributeList,
         data_group: &mut String,
         data_node: &mut String,
     ) -> ADResult<()> {
@@ -481,7 +472,7 @@ impl NexusWriter {
                     Some(&group),
                     &child_path,
                     child,
-                    array,
+                    attributes,
                     data_group,
                     data_node,
                 )?;
@@ -507,7 +498,7 @@ impl NexusWriter {
                 // Dataset sourced from an NDAttribute, written once.
                 if let Some(parent) = parent {
                     let source = node.attr("source").unwrap_or(&node.name);
-                    if let Some(attr) = array.attributes.get(source) {
+                    if let Some(attr) = attributes.get(source) {
                         Self::write_attr_dataset(parent, &node.name, &attr.value)?;
                     }
                 }
@@ -519,7 +510,7 @@ impl NexusWriter {
                     let attr_name = node.attr("name").unwrap_or(&node.name);
                     let value = if node.attr("type") == Some("ND_ATTR") {
                         node.attr("source")
-                            .and_then(|s| array.attributes.get(s))
+                            .and_then(|s| attributes.get(s))
                             .map(|a| a.value.as_string())
                             .unwrap_or_default()
                     } else {
@@ -616,7 +607,9 @@ impl Default for NexusWriter {
 }
 
 impl NDFileWriter for NexusWriter {
-    fn open_file(&mut self, path: &Path, _mode: NDFileMode, array: &NDArray) -> ADResult<()> {
+    fn open_file(&mut self, path: &Path, mode: NDFileOpenMode, array: &NDArray) -> ADResult<()> {
+        // NDFileNexus.cpp:45-48
+        mode.refuse_read_or_append("NDFileNexus")?;
         self.current_path = Some(path.to_path_buf());
         self.frame_count = 0;
         self.dataset = None;
@@ -634,10 +627,15 @@ impl NDFileWriter for NexusWriter {
         self.ts_dataset = None;
         self.nxdata_group_path = None;
 
-        if let Some(template) = self.template.clone() {
+        self.template.refresh();
+        if let Some(template) = (*self.template).clone() {
             // Template mode: build the group/dataset tree from the user's
             // NeXus XML template (C++ NDFileNexus::loadTemplateFile).
-            let (data_group, data_node) = Self::process_template(&h5file, &template, array)?;
+            // C walks the template against `pFileAttributes`: the plugin's
+            // set with the frame's list on top (NDFileNexus.cpp:53-71).
+            let mut attributes = self.plugin_attributes.clone();
+            attributes.copy_from(&array.attributes);
+            let (data_group, data_node) = Self::process_template(&h5file, &template, &attributes)?;
             self.data_group_path = data_group;
             self.data_node_name = data_node;
         } else {
@@ -696,10 +694,8 @@ impl NDFileWriter for NexusWriter {
         };
         let data_group = resolve_group(&self.data_group_path)?;
 
-        // Element type recorded on the data dataset for lossless read-back,
-        // and the frame bytes serialized explicitly little-endian (rust-hdf5
+        // The frame bytes serialized explicitly little-endian (rust-hdf5
         // 0.2.15 records LE datatypes and copies write_chunk bytes verbatim).
-        let dtype_ordinal = array.data.data_type() as i32;
         let frame_bytes = nd_buffer_to_le_bytes(&array.data);
 
         if self.frame_count == 0 {
@@ -751,12 +747,6 @@ impl NDFileWriter for NexusWriter {
             let ds = create_typed!(data_group, &data_node_name);
             ds.write_chunk(0, &frame_bytes)
                 .map_err(|e| ADError::UnsupportedConversion(format!("NeXus write error: {}", e)))?;
-            // Record the exact data type for lossless read-back.
-            let _ = ds
-                .new_attr::<i32>()
-                .shape(())
-                .create(DTYPE_ATTR)
-                .and_then(|a| a.write_numeric(&dtype_ordinal));
             // Write NDArray attributes on the first frame.
             for attr in array.attributes.iter() {
                 let val_str = attr.value.as_string();
@@ -861,71 +851,12 @@ impl NDFileWriter for NexusWriter {
         Ok(())
     }
 
+    /// Unreachable through `readFileBase`, whose open is refused first; C's
+    /// `readFile` is a stub that fails (NDFileNexus.cpp:115-130).
     fn read_file(&mut self) -> ADResult<NDArray> {
-        let path = self
-            .current_path
-            .as_ref()
-            .ok_or_else(|| ADError::UnsupportedConversion("no file open".into()))?;
-
-        let h5file = H5File::open(path)
-            .map_err(|e| ADError::UnsupportedConversion(format!("NeXus open error: {}", e)))?;
-
-        // Read from the data path established at open_file time (the built-in
-        // entry/instrument/detector/data, or the template's pArray location).
-        let data_path = format!("{}/{}", self.data_group_path, self.data_node_name);
-        let ds = h5file
-            .dataset(&data_path)
-            .map_err(|e| ADError::UnsupportedConversion(format!("NeXus dataset error: {}", e)))?;
-
-        let shape = ds.shape();
-        let dims: Vec<NDDimension> = shape.iter().rev().map(|&s| NDDimension::new(s)).collect();
-        let element_size = ds.element_size();
-
-        // Recover the exact NDArray data type from the recorded attribute.
-        // Untyped read_raw cannot distinguish signed/unsigned or i32/u32/f32
-        // (all same element size), so the recorded type is authoritative.
-        let recorded: Option<NDDataType> = ds
-            .attr(DTYPE_ATTR)
-            .ok()
-            .and_then(|a| a.read_numeric::<i32>().ok())
-            .and_then(|v| NDDataType::from_ordinal(v as u8));
-
-        let data_type = recorded.unwrap_or(match element_size {
-            1 => NDDataType::UInt8,
-            2 => NDDataType::UInt16,
-            4 => NDDataType::Float32,
-            8 => NDDataType::Float64,
-            other => {
-                return Err(ADError::UnsupportedConversion(format!(
-                    "unsupported NeXus element size {}",
-                    other
-                )));
-            }
-        });
-
-        macro_rules! read_typed {
-            ($t:ty, $variant:ident) => {{
-                let data = ds.read_raw::<$t>().map_err(|e| {
-                    ADError::UnsupportedConversion(format!("NeXus read error: {}", e))
-                })?;
-                let mut arr = NDArray::new(dims, data_type);
-                arr.data = NDDataBuffer::$variant(data);
-                return Ok(arr);
-            }};
-        }
-
-        match data_type {
-            NDDataType::Int8 => read_typed!(i8, I8),
-            NDDataType::UInt8 => read_typed!(u8, U8),
-            NDDataType::Int16 => read_typed!(i16, I16),
-            NDDataType::UInt16 => read_typed!(u16, U16),
-            NDDataType::Int32 => read_typed!(i32, I32),
-            NDDataType::UInt32 => read_typed!(u32, U32),
-            NDDataType::Int64 => read_typed!(i64, I64),
-            NDDataType::UInt64 => read_typed!(u64, U64),
-            NDDataType::Float32 => read_typed!(f32, F32),
-            NDDataType::Float64 => read_typed!(f64, F64),
-        }
+        Err(ADError::UnsupportedConversion(
+            "NDFileNexus cannot read".into(),
+        ))
     }
 
     fn close_file(&mut self) -> ADResult<()> {
@@ -937,6 +868,10 @@ impl NDFileWriter for NexusWriter {
         Ok(())
     }
 
+    fn set_plugin_attributes(&mut self, attributes: NDAttributeList) {
+        self.plugin_attributes = attributes;
+    }
+
     fn supports_multiple_arrays(&self) -> bool {
         true
     }
@@ -946,61 +881,42 @@ impl NDFileWriter for NexusWriter {
 // Processor
 // ============================================================
 
+/// Parse `xml` into `store`, or clear it; whether a template is now loaded.
+fn store_template(store: &SettingsStore<Option<XmlElement>>, xml: Option<&str>) -> bool {
+    let root = xml.and_then(|x| parse_nexus_template(x).ok());
+    let valid = root.is_some();
+    store.update(|t| *t = root);
+    valid
+}
+
 pub struct NexusFileProcessor {
     ctrl: Mutex<FilePluginController<NexusWriter>>,
+    template: SettingsStore<Option<XmlElement>>,
     template_path_idx: Option<usize>,
     template_file_idx: Option<usize>,
     template_valid_idx: Option<usize>,
-    /// The template path/file pair a `NEXUS_TEMPLATE_*` write updates. Held
-    /// under its own lock, always taken before `ctrl`.
-    template: Mutex<NexusTemplateSource>,
-}
-
-/// The `NEXUS_TEMPLATE_PATH` / `NEXUS_TEMPLATE_FILE` pair, which
-/// `reload_template` concatenates.
-#[derive(Default)]
-struct NexusTemplateSource {
-    path: String,
-    file: String,
+    attributes: Option<PluginAttributes>,
 }
 
 impl NexusFileProcessor {
     pub fn new() -> Self {
+        let writer = NexusWriter::new();
         Self {
-            ctrl: Mutex::new(FilePluginController::new(NexusWriter::new())),
+            template: writer.template.store(),
+            ctrl: Mutex::new(FilePluginController::new(writer)),
             template_path_idx: None,
             template_file_idx: None,
             template_valid_idx: None,
-            template: Mutex::new(NexusTemplateSource::default()),
+            attributes: None,
         }
     }
 
-    /// Load the NeXus XML template from `template_path + template_file`
-    /// (C++ NDFileNexus::loadTemplateFile). Returns the validity flag value
-    /// for `NEXUS_TEMPLATE_VALID`: 1 if a template was loaded and parsed,
-    /// 0 if the file is unset, missing, or fails to parse.
-    fn reload_template(&self) -> i32 {
-        let full = {
-            let t = self.template.lock();
-            if t.file.is_empty() {
-                self.ctrl.lock().writer.clear_template();
-                return 0;
-            }
-            format!("{}{}", t.path, t.file)
-        };
-        match std::fs::read_to_string(&full) {
-            Ok(xml) => {
-                if self.ctrl.lock().writer.load_template(&xml) {
-                    1
-                } else {
-                    0
-                }
-            }
-            Err(_) => {
-                self.ctrl.lock().writer.clear_template();
-                0
-            }
-        }
+    /// Load the NeXus XML template at `full` (C++
+    /// NDFileNexus::loadTemplateFile); a file that cannot be read or parsed
+    /// leaves no template, as C's NULL `configDoc` does.
+    fn load_template(&self, full: &str) -> bool {
+        let xml = std::fs::read_to_string(full).ok();
+        store_template(&self.template, xml.as_deref())
     }
 }
 
@@ -1011,8 +927,85 @@ impl Default for NexusFileProcessor {
 }
 
 impl NDPluginProcess for NexusFileProcessor {
+    const ASYN_FLAGS: asyn_rs::port::PortFlags = ad_core_rs::plugin::runtime::ASYN_CANBLOCK;
+    // NDFileNexus.cpp:873, the same mask for both.
+    const INTERFACE_MASK: InterfaceMask = InterfaceMask::GENERIC_POINTER;
+    const INTERRUPT_MASK: InterfaceMask = Self::INTERFACE_MASK;
+
+    fn posts_before_write(&self, reason: usize, value: i32) -> bool {
+        self.ctrl.lock().posts_before_write(reason, value)
+    }
+
+    fn processing_required(&self, array: &NDArray) -> bool {
+        self.ctrl.lock().processing_required(array)
+    }
+
+    /// C NDPluginFile::writeInt32 (NDPluginFile.cpp:799-870).
+    fn validate_int32(
+        &self,
+        reason: usize,
+        _addr: i32,
+        value: i32,
+        verdict: ad_core_rs::plugin::runtime::WriteVerdict<i32>,
+        params: &mut ad_core_rs::plugin::runtime::WritePort<'_>,
+    ) -> ad_core_rs::plugin::runtime::WriteOutcome<i32> {
+        let mut ctrl = self.ctrl.lock();
+        ctrl.write_int32(reason, value, verdict, params)
+    }
+
+    /// C `NDFileNexus::writeOctet` (NDFileNexus.cpp:776-813) loads the
+    /// template inside the write, from the path and file in the param
+    /// library, so a capture opened next uses it; a file write in progress
+    /// does not hold the write up.
+    fn validate_octet(
+        &self,
+        reason: usize,
+        _addr: i32,
+        _value: &str,
+        verdict: ad_core_rs::plugin::runtime::WriteVerdict<String>,
+        params: &asyn_rs::port::PortDriverBase,
+    ) -> ad_core_rs::plugin::runtime::WriteOutcome<String> {
+        let out = ad_core_rs::plugin::runtime::WriteOutcome::from(verdict);
+        let stored = |idx: Option<usize>| {
+            if Some(reason) == idx {
+                return out.verdict.kept();
+            }
+            idx.and_then(|i| params.get_string_param(i, 0).ok())
+                .map(|b| String::from_utf8_lossy(b).into_owned())
+                .unwrap_or_default()
+        };
+        if Some(reason) != self.template_path_idx && Some(reason) != self.template_file_idx {
+            return self.ctrl.lock().write_octet(reason, out.verdict);
+        }
+        let file = stored(self.template_file_idx);
+        // C returns before touching the template or its flag (:825).
+        if file.is_empty() {
+            return out;
+        }
+        let full = format!("{}{file}", stored(self.template_path_idx));
+        let valid = self.load_template(&full);
+        let out = match self.template_valid_idx {
+            Some(i) => out.set_int32(i, 0, valid as i32),
+            None => out,
+        };
+        if valid {
+            return out;
+        }
+        out.print(
+            asyn_rs::trace::TraceMask::ERROR,
+            format!("NDFileNexus:loadTemplateFile: Parameter file {full} is invalid\n"),
+        )
+    }
     fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
-        self.ctrl.lock().process_array(array)
+        // Made before the controller lock: its reads wait on the actor,
+        // which takes that lock in its writes.
+        let mut post = ad_core_rs::plugin::runtime::PortPost::of(self.attributes.as_ref());
+        let mut ctrl = self.ctrl.lock();
+        ctrl.process_array(array, &mut post)
+    }
+
+    fn bind_attributes(&mut self, attributes: PluginAttributes) {
+        self.attributes = Some(attributes);
     }
 
     fn plugin_type(&self) -> &str {
@@ -1021,8 +1014,8 @@ impl NDPluginProcess for NexusFileProcessor {
 
     /// C `NDPluginFile.cpp:948` (base of every file writer) sets
     /// `NDArrayCallbacks = 0`: file plugins write to disk, not downstream.
-    fn does_array_callbacks(&self) -> bool {
-        false
+    fn array_callbacks_seed(&self) -> Option<bool> {
+        Some(false)
     }
 
     fn register_params(
@@ -1031,12 +1024,10 @@ impl NDPluginProcess for NexusFileProcessor {
     ) -> asyn_rs::error::AsynResult<()> {
         self.ctrl.lock().register_params(base)?;
         use asyn_rs::param::ParamType;
-        let path_idx = base.create_param("NEXUS_TEMPLATE_PATH", ParamType::Octet)?;
-        let file_idx = base.create_param("NEXUS_TEMPLATE_FILE", ParamType::Octet)?;
-        let valid_idx = base.create_param("NEXUS_TEMPLATE_VALID", ParamType::Int32)?;
-        base.create_param("TEMPLATE_FILE_PATH", ParamType::Octet)?;
-        base.create_param("TEMPLATE_FILE_NAME", ParamType::Octet)?;
-        base.create_param("TEMPLATE_FILE_VALID", ParamType::Int32)?;
+        // NDFileNexus.h:20-22.
+        let path_idx = base.create_param("TEMPLATE_FILE_PATH", ParamType::Octet)?;
+        let file_idx = base.create_param("TEMPLATE_FILE_NAME", ParamType::Octet)?;
+        let valid_idx = base.create_param("TEMPLATE_FILE_VALID", ParamType::Int32)?;
         // C++ NDFileNexus.cpp:883 seeds NDFileNexusTemplateValid = 0.
         base.set_int32_param(valid_idx, 0, 0)?;
         self.template_path_idx = Some(path_idx);
@@ -1044,48 +1035,12 @@ impl NDPluginProcess for NexusFileProcessor {
         self.template_valid_idx = Some(valid_idx);
         Ok(())
     }
-
-    fn on_param_change(&self, reason: usize, params: &PluginParamSnapshot) -> ParamChangeResult {
-        use ad_core_rs::plugin::runtime::ParamChangeValue;
-
-        // NeXus XML template path / file changes trigger a template reload
-        // (C++ NDFileNexus::writeInt32 / writeOctet → loadTemplateFile).
-        if Some(reason) == self.template_path_idx {
-            if let ParamChangeValue::Octet(s) = &params.value {
-                self.template.lock().path = s.clone();
-            }
-            let valid = self.reload_template();
-            return self.template_valid_result(valid);
-        }
-        if Some(reason) == self.template_file_idx {
-            if let ParamChangeValue::Octet(s) = &params.value {
-                self.template.lock().file = s.clone();
-            }
-            let valid = self.reload_template();
-            return self.template_valid_result(valid);
-        }
-        self.ctrl.lock().on_param_change(reason, params)
-    }
-}
-
-impl NexusFileProcessor {
-    /// Build a ParamChangeResult that updates `NEXUS_TEMPLATE_VALID`.
-    fn template_valid_result(&self, valid: i32) -> ParamChangeResult {
-        use ad_core_rs::plugin::runtime::ParamUpdate;
-        match self.template_valid_idx {
-            Some(idx) => ParamChangeResult::updates(vec![ParamUpdate::Int32 {
-                reason: idx,
-                addr: 0,
-                value: valid,
-            }]),
-            None => ParamChangeResult::empty(),
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ad_core_rs::ndarray::NDDimension;
 
     fn temp_path(prefix: &str) -> PathBuf {
         use std::sync::atomic::{AtomicU32, Ordering};
@@ -1097,6 +1052,28 @@ mod tests {
             prefix,
             n
         ))
+    }
+
+    /// C `openFile` refuses NDFileModeRead (NDFileNexus.cpp:45), so ReadFile
+    /// fails at the open.
+    #[test]
+    fn read_file_is_refused_at_the_open() {
+        let path = temp_path("nexus_read_refused");
+        let mut writer = NexusWriter::new();
+        let arr = NDArray::new(
+            vec![NDDimension::new(4), NDDimension::new(4)],
+            NDDataType::UInt8,
+        );
+        writer
+            .open_file(&path, NDFileOpenMode::WRITE, &arr)
+            .unwrap();
+        writer.write_file(&Arc::new(arr)).unwrap();
+        writer.close_file().unwrap();
+        let mut proc = NexusFileProcessor::new();
+        let (out, _base) = crate::test_util::read_file(&mut proc, &path);
+        assert_eq!(out.trace, crate::test_util::read_refused_lines(&path));
+        assert_eq!(out.publish, ad_core_rs::plugin::runtime::Published::Nothing);
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -1114,7 +1091,9 @@ mod tests {
             }
         }
 
-        writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
+        writer
+            .open_file(&path, NDFileOpenMode::WRITE, &arr)
+            .unwrap();
         writer.write_file(&Arc::new(arr)).unwrap();
         writer.close_file().unwrap();
 
@@ -1154,7 +1133,13 @@ mod tests {
             }
         }
 
-        writer.open_file(&path, NDFileMode::Stream, &arr1).unwrap();
+        writer
+            .open_file(
+                &path,
+                NDFileOpenMode::WRITE | NDFileOpenMode::MULTIPLE,
+                &arr1,
+            )
+            .unwrap();
         writer.write_file(&Arc::new(arr1)).unwrap();
         writer.write_file(&Arc::new(arr2)).unwrap();
         writer.close_file().unwrap();
@@ -1197,7 +1182,9 @@ mod tests {
         a2.unique_id = 11;
         a2.time_stamp = 2.5;
 
-        writer.open_file(&path, NDFileMode::Stream, &a1).unwrap();
+        writer
+            .open_file(&path, NDFileOpenMode::WRITE | NDFileOpenMode::MULTIPLE, &a1)
+            .unwrap();
         writer.write_file(&Arc::new(a1)).unwrap();
         writer.write_file(&Arc::new(a2)).unwrap();
         writer.close_file().unwrap();
@@ -1271,7 +1258,9 @@ mod tests {
                 *x = i as u8;
             }
         }
-        writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
+        writer
+            .open_file(&path, NDFileOpenMode::WRITE, &arr)
+            .unwrap();
         writer.write_file(&Arc::new(arr)).unwrap();
         writer.close_file().unwrap();
 
@@ -1290,6 +1279,56 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
+    /// C walks the template against `pFileAttributes`, the plugin's
+    /// `getAttributes` set with the frame's list on top (NDFileNexus.cpp:
+    /// 53-71, :322).
+    #[test]
+    fn template_nd_attr_nodes_read_the_plugin_attributes_under_the_frame() {
+        use crate::test_util::{auto_save_to, publish, wait_saved, with_attributes_file};
+        let template = r#"<NXroot>
+              <NXentry name="entry">
+                <NXdata name="data">
+                  <frames type="pArray"/>
+                  <model type="ND_ATTR" source="Model"/>
+                  <make type="ND_ATTR" source="Manufacturer"/>
+                </NXdata>
+              </NXentry>
+            </NXroot>"#;
+        let proc = NexusFileProcessor::new();
+        assert!(proc.ctrl.lock().writer.lock().load_template(template));
+        let xml = r#"<Attributes>
+            <Attribute name="Model" type="CONST" source="PluginModel"/>
+            <Attribute name="Manufacturer" type="CONST" source="PluginMake"/>
+        </Attributes>"#;
+        let (handle, _rx, _jh) = with_attributes_file("NEXUS_ATTRS", proc, xml);
+        let path = temp_path("plugin_attrs");
+        auto_save_to(&handle, &path);
+        let mut arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
+        arr.attributes
+            .add(ad_core_rs::attributes::NDAttribute::new_static(
+                "Manufacturer",
+                "",
+                ad_core_rs::attributes::NDAttrSource::Driver,
+                ad_core_rs::attributes::NDAttrValue::String("FrameMake".into()),
+            ));
+        publish(&handle, &arr);
+        wait_saved(&handle, 1);
+        let h5file = H5File::open(&path).unwrap();
+        let text = |name: &str| {
+            let bytes: Vec<u8> = h5file
+                .dataset(&format!("entry/data/{name}"))
+                .unwrap()
+                .read_raw()
+                .unwrap();
+            String::from_utf8_lossy(&bytes)
+                .trim_end_matches('\0')
+                .to_string()
+        };
+        assert_eq!(text("model"), "PluginModel");
+        assert_eq!(text("make"), "FrameMake");
+        std::fs::remove_file(&path).ok();
+    }
+
     #[test]
     fn test_load_template_invalid_xml_returns_false() {
         let mut writer = NexusWriter::new();
@@ -1298,8 +1337,9 @@ mod tests {
     }
 
     #[test]
-    fn test_template_param_change_sets_valid_flag() {
-        use ad_core_rs::plugin::runtime::{ParamChangeValue, ParamUpdate, PluginParamSnapshot};
+    fn a_template_write_stores_it_without_waiting_on_a_file_write() {
+        use ad_core_rs::plugin::runtime::SideParam;
+        use asyn_rs::port::InterfaceMask;
         use asyn_rs::port::{PortDriverBase, PortFlags};
 
         let dir = std::env::temp_dir();
@@ -1313,29 +1353,70 @@ mod tests {
         )
         .unwrap();
 
-        let mut base = PortDriverBase::new("nexus_tmpl_test", 1, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            "nexus_tmpl_test",
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
+        );
         let mut proc = NexusFileProcessor::new();
         proc.register_params(&mut base).unwrap();
 
-        let file_idx = proc.template_file_idx.unwrap();
-        let valid_idx = proc.template_valid_idx.unwrap();
+        // The NDFileNexus.template records address these names.
+        let file_idx = base.find_param("TEMPLATE_FILE_NAME").unwrap();
+        let valid_idx = base.find_param("TEMPLATE_FILE_VALID").unwrap();
+        assert_eq!(base.get_int32_param(valid_idx, 0).unwrap(), 0);
 
-        let result = proc.on_param_change(
-            file_idx,
-            &PluginParamSnapshot {
-                enable_callbacks: true,
-                reason: file_idx,
-                addr: 0,
-                value: ParamChangeValue::Octet(tmpl_path.to_string_lossy().into_owned()),
-            },
-        );
-        assert!(result.param_updates.iter().any(|u| matches!(
+        let path = tmpl_path.to_string_lossy().into_owned();
+        // A file write in progress does not hold the template write up; the
+        // writer takes the template at its next open.
+        let writer = Arc::clone(&proc.ctrl.lock().writer);
+        let mut out = None;
+        assert!(crate::test_util::returns_while_busy(&writer, || {
+            out = Some(proc.validate_octet(
+                file_idx,
+                0,
+                &path,
+                ad_core_rs::plugin::runtime::WriteVerdict::Accept(path.clone()),
+                &base,
+            ));
+        }));
+        assert!(out.unwrap().side.iter().any(|u| matches!(
             u,
-            ParamUpdate::Int32 { reason, value: 1, .. } if *reason == valid_idx
+            SideParam::Int32 { reason, value: 1, .. } if *reason == valid_idx
         )));
-        assert!(proc.ctrl.lock().writer.has_template());
+        assert!(proc.template.get(Option::is_some));
+        assert!(
+            writer.lock().template.is_none(),
+            "not read before the next open"
+        );
 
         std::fs::remove_file(&tmpl_path).ok();
+
+        // :825 returns on an empty file; a bad one prints and clears (:830-836).
+        let write = |v: &str| {
+            proc.validate_octet(
+                file_idx,
+                0,
+                v,
+                ad_core_rs::plugin::runtime::WriteVerdict::Accept(v.to_owned()),
+                &base,
+            )
+        };
+        let out = write("");
+        assert!(out.side.is_empty() && out.trace.is_empty());
+        assert!(proc.template.get(Option::is_some));
+        let out = write(&path);
+        assert!(out.side.iter().any(|u| matches!(
+            u,
+            SideParam::Int32 { reason, value: 0, .. } if *reason == valid_idx
+        )));
+        assert_eq!(
+            out.trace[0].1,
+            format!("NDFileNexus:loadTemplateFile: Parameter file {path} is invalid\n")
+        );
+        assert!(!proc.template.get(Option::is_some));
     }
 
     #[test]
@@ -1359,7 +1440,9 @@ mod tests {
         };
 
         let a0 = mk(0);
-        writer.open_file(&path, NDFileMode::Stream, &a0).unwrap();
+        writer
+            .open_file(&path, NDFileOpenMode::WRITE | NDFileOpenMode::MULTIPLE, &a0)
+            .unwrap();
         writer.write_file(&Arc::new(a0)).unwrap();
         writer.write_file(&Arc::new(mk(100))).unwrap();
         writer.close_file().unwrap();
@@ -1398,7 +1481,9 @@ mod tests {
         if let NDDataBuffer::U8(ref mut v) = arr.data {
             v.iter_mut().enumerate().for_each(|(i, x)| *x = i as u8);
         }
-        writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
+        writer
+            .open_file(&path, NDFileOpenMode::WRITE, &arr)
+            .unwrap();
         writer.write_file(&Arc::new(arr)).unwrap();
         writer.close_file().unwrap();
 
@@ -1422,10 +1507,31 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
+    /// C records no NDArray data type attribute on the data (NDFileNexus.cpp
+    /// writes only the template's attributes).
     #[test]
-    fn test_read_file_roundtrips_all_data_types() {
-        // N4: every NDArray data type must round-trip through read_file,
-        // not just u8/u16/f64.
+    fn the_data_carries_no_data_type_attribute() {
+        let path = temp_path("nexus_no_dtype");
+        let mut writer = NexusWriter::new();
+        let arr = NDArray::new(
+            vec![NDDimension::new(2), NDDimension::new(2)],
+            NDDataType::Int16,
+        );
+        writer
+            .open_file(&path, NDFileOpenMode::WRITE, &arr)
+            .unwrap();
+        writer.write_file(&Arc::new(arr)).unwrap();
+        let data_path = format!("{}/{}", writer.data_group_path, writer.data_node_name);
+        writer.close_file().unwrap();
+        let h5 = H5File::open(&path).unwrap();
+        let names = h5.dataset(&data_path).unwrap().attr_names().unwrap();
+        assert!(!names.iter().any(|n| n == "NDArrayDataType"), "{names:?}");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn every_data_type_is_stored_as_its_native_type() {
+        // N4: every NDArray data type must round-trip, not just u8/u16/f64.
         use ad_core_rs::ndarray::NDDataType::*;
         for dt in [
             Int8, UInt8, Int16, UInt16, Int32, UInt32, Int64, UInt64, Float32, Float64,
@@ -1447,22 +1553,22 @@ mod tests {
                 NDDataBuffer::F64(ref mut v) => v.copy_from_slice(&[-1.5, 2.5, -3.5, 4.5]),
             }
 
-            writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
+            writer
+                .open_file(&path, NDFileOpenMode::WRITE, &arr)
+                .unwrap();
             writer.write_file(&Arc::new(arr.clone())).unwrap();
+            let data_path = format!("{}/{}", writer.data_group_path, writer.data_node_name);
             writer.close_file().unwrap();
 
-            let mut reader = NexusWriter::new();
-            reader.current_path = Some(path.clone());
-            let read = reader
-                .read_file()
-                .unwrap_or_else(|e| panic!("{:?} read failed: {}", dt, e));
-            assert_eq!(read.data.data_type(), dt, "{:?}: type must round-trip", dt);
+            let h5 = H5File::open(&path).unwrap();
+            let read = crate::test_util::read_native(&h5.dataset(&data_path).unwrap(), None);
+            assert_eq!(read.data_type(), dt, "{:?}: type must round-trip", dt);
             // Leading frame dim [1] + 2x2 => 3 dims, 4 elements.
-            assert_eq!(read.data.len(), 4, "{:?}: element count", dt);
+            assert_eq!(read.len(), 4, "{:?}: element count", dt);
             for i in 0..4 {
                 assert_eq!(
                     arr.data.get_as_f64(i),
-                    read.data.get_as_f64(i),
+                    read.get_as_f64(i),
                     "{:?}: element {} must round-trip",
                     dt,
                     i

@@ -1,0 +1,7 @@
+AsynDriverInterface::readHandler(rec) input EOS changed from "" to "<0d><0a>"
+AsynDriverInterface::readHandler(rec): ioAction=Read read(1 bytes, timeout=1 sec) returned status asynSuccess: received=1 bytes, eomReason=CNT, buffer="<0d>"
+AsynDriverInterface::readHandler(rec): received 1 of 1 bytes "<0d>" eomReason=CNT
+AsynDriverInterface::readHandler(rec) readMore=-1 bytesToRead=63
+AsynDriverInterface::readHandler(rec): ioAction=Read read(63 bytes, timeout=0.1 sec) returned status asynSuccess: received=-1 bytes, eomReason=EOS, buffer=""
+AsynDriverInterface::readHandler(rec): received -1 of 63 bytes "" eomReason=EOS
+AsynDriverInterface::readHandler(rec) input EOS restored from "<0d><0a>" to ""

@@ -79,7 +79,7 @@ fn read(db: &PvDatabase, field: &str) -> EpicsValue {
 fn drain(rx: &mut EventReader) -> Vec<EventMask> {
     let mut out = Vec::new();
     while let Ok(ev) = rx.try_recv() {
-        out.push(ev.mask);
+        out.push(ev.mask());
     }
     out
 }
@@ -145,13 +145,13 @@ async fn an_alarm_cycle_posts_an_unchanged_oval() {
     // HIGH/HSV are dbCommon, so they are set through the instance — the same
     // place a `.db`'s `field(HIGH,"1")` lands. VAL=5 is above HIGH=1, so the
     // record alarms MINOR from its first cycle onward without VAL ever moving.
-    {
-        let rec = db.get_record("AO").unwrap();
-        let mut inst = rec.write();
-        inst.put_common_field("HIGH", EpicsValue::Double(1.0))
-            .unwrap();
-        inst.put_common_field("HSV", EpicsValue::Short(1)).unwrap();
-    }
+    db.put_pv_no_process("AO.HIGH", EpicsValue::Double(1.0))
+        .await
+        .unwrap();
+    db.put_pv_no_process("AO.HSV", EpicsValue::Short(1))
+        .await
+        .unwrap();
+
     process(&db, "AO").await;
 
     // Second cycle: VAL and OVAL are settled, the alarm transition is what

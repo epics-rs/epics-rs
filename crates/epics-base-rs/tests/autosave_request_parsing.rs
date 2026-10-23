@@ -2,7 +2,23 @@ use std::path::PathBuf;
 
 use epics_base_rs::server::autosave::error::AutosaveError;
 use epics_base_rs::server::autosave::macros::MacroContext;
-use epics_base_rs::server::autosave::request::{self, dedup_entries, load_request_file, pv_names};
+use epics_base_rs::server::autosave::request::{
+    self, RequestEntry, load_request_file_with_search_paths, pv_names,
+};
+
+/// Load `name` with `dir` as the one `set_requestfile_path`, where C
+/// `openReqFile` finds the top-level file and every include.
+async fn load(
+    dir: &std::path::Path,
+    name: &str,
+    ctx: &MacroContext,
+) -> Result<Vec<RequestEntry>, AutosaveError> {
+    Ok(
+        load_request_file_with_search_paths(name, &[dir.to_path_buf()], ctx)
+            .await?
+            .entries,
+    )
+}
 
 #[test]
 fn test_simple_pvs() {
@@ -38,7 +54,7 @@ async fn test_file_include_relative_path() {
     std::fs::write(&main_req, "OUTER_PV\nfile sub/inner.req\nOUTER_PV2\n").unwrap();
 
     let ctx = MacroContext::new();
-    let entries = load_request_file(&main_req, &ctx).await.unwrap();
+    let entries = load(dir.path(), "main.req", &ctx).await.unwrap();
     let names = pv_names(&entries);
     assert_eq!(
         names,
@@ -59,9 +75,7 @@ async fn test_nested_include() {
     std::fs::write(dir.path().join("main.req"), "MAIN_PV\nfile level1.req\n").unwrap();
 
     let ctx = MacroContext::new();
-    let entries = load_request_file(&dir.path().join("main.req"), &ctx)
-        .await
-        .unwrap();
+    let entries = load(dir.path(), "main.req", &ctx).await.unwrap();
     let names = pv_names(&entries);
     assert_eq!(names, vec!["MAIN_PV", "LEVEL1_PV", "LEVEL2_PV"]);
 }
@@ -81,7 +95,7 @@ async fn test_depth_limit() {
     }
 
     let ctx = MacroContext::new();
-    let result = load_request_file(&dir.path().join("level0.req"), &ctx).await;
+    let result = load(dir.path(), "level0.req", &ctx).await;
     assert!(matches!(
         result,
         Err(AutosaveError::IncludeDepthExceeded(_))
@@ -96,7 +110,7 @@ async fn test_circular_include() {
     std::fs::write(dir.path().join("b.req"), "PV_B\nfile a.req\n").unwrap();
 
     let ctx = MacroContext::new();
-    let result = load_request_file(&dir.path().join("a.req"), &ctx).await;
+    let result = load(dir.path(), "a.req", &ctx).await;
     assert!(matches!(result, Err(AutosaveError::IncludeCycle { .. })));
 }
 
@@ -108,15 +122,14 @@ fn test_comments_and_blanks() {
     assert_eq!(pv_names(&entries), vec!["PV1", "PV2"]);
 }
 
+/// C `readReqFile` appends every PV line, a repeated one included
+/// (save_restore.c:3650-3672).
 #[test]
-fn test_duplicate_pv_dedup() {
+fn test_duplicate_pv_kept() {
     let content = "PV1\nPV2\nPV1\nPV3\n";
     let ctx = MacroContext::new();
     let entries = request::parse_request_string(content, &ctx, "test.req").unwrap();
-    let deduped = dedup_entries(entries);
-    let names = pv_names(&deduped);
-    // PV1 last occurrence wins, so it should appear where the last one was but in order
-    assert_eq!(names, vec!["PV2", "PV1", "PV3"]);
+    assert_eq!(pv_names(&entries), vec!["PV1", "PV2", "PV1", "PV3"]);
 }
 
 #[test]
@@ -138,9 +151,31 @@ async fn test_include_with_macros() {
     std::fs::write(dir.path().join("main.req"), "file inner.req P=TEST:\n").unwrap();
 
     let ctx = MacroContext::new();
-    let entries = load_request_file(&dir.path().join("main.req"), &ctx)
-        .await
-        .unwrap();
+    let entries = load(dir.path(), "main.req", &ctx).await.unwrap();
     let names = pv_names(&entries);
     assert_eq!(names, vec!["TEST:pv1", "TEST:pv2"]);
+}
+
+/// C `readReqFile` ends an include's name at whitespace, a quote or `#`
+/// (save_restore.c:3630-3634), so a comma right after an unquoted name is
+/// part of it and that include does not open; the quoted form does.
+#[epics_macros_rs::epics_test]
+async fn a_comma_after_an_unquoted_include_name_is_part_of_the_name() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("inner.req"), "$(P)pv\n").unwrap();
+    std::fs::write(
+        dir.path().join("main.req"),
+        "M\nfile inner.req, P=A:\nfile \"inner.req\", P=B:\n",
+    )
+    .unwrap();
+
+    let list = load_request_file_with_search_paths(
+        "main.req",
+        &[dir.path().to_path_buf()],
+        &MacroContext::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(pv_names(&list.entries), ["M", "B:pv"]);
+    assert!(list.include_unopened);
 }

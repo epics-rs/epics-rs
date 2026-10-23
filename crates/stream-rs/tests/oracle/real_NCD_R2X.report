@@ -1,0 +1,93 @@
+rec0: NCD_R2X.proto relay1query(1,2,3,4,5,6,7,8,9) P
+relay1query {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "\r";
+  separator     = "";
+  @Mismatch {
+    out "\xfe\x04";
+    in "%#{\x00=0|\x01=1}";
+  }
+
+    out "\xfe\x04";
+    in "%#{\x00=0|\x01=1}";
+}
+rec1: NCD_R2X.proto relay2query(1,2,3,4,5,6,7,8,9) P
+relay2query {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "\r";
+  separator     = "";
+  @Mismatch {
+    out "\xfe\x05";
+    in "%#{\x00=0|\x01=1}";
+  }
+
+    out "\xfe\x05";
+    in "%#{\x00=0|\x01=1}";
+}
+rec2: NCD_R2X.proto relay1control(1,2,3,4,5,6,7,8,9) P
+relay1control {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "\r";
+  separator     = "";
+  @Init {
+    out "\xfe\x04";
+    in "%#{\x00=0|\x01=1}";
+  }
+
+    out "\xfe%{\x00|\x01}";
+}
+rec3: NCD_R2X.proto relay2control(1,2,3,4,5,6,7,8,9) P
+relay2control {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "\r";
+  separator     = "";
+  @Init {
+    out "\xfe\x05";
+    in "%#{\x00=0|\x01=1}";
+  }
+
+    out "\xfe%{\x02|\x03}";
+}
+rec4: NCD_R2X.proto enableAll(1,2,3,4,5,6,7,8,9) P
+enableAll {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "\xfe\xf8";
+}

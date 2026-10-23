@@ -1,0 +1,2 @@
+Terminator = CR LF;
+p { out "A%d"; out "B"; }

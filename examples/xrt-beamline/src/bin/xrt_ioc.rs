@@ -17,6 +17,7 @@ use std::sync::Arc;
 use epics_base_rs::error::CaResult;
 use epics_base_rs::server::iocsh::registry::*;
 use epics_ca_rs::server::ioc_app::IocApplication;
+use epics_libcom_rs::cfmt::CFloat;
 
 use ad_core_rs::ioc::{PluginManager, register_noop_commands};
 use ad_core_rs::plugin::channel::NDArrayOutput;
@@ -76,14 +77,14 @@ impl BeamlineHolder {
 async fn main() -> CaResult<()> {
     let args: Vec<String> = std::env::args().collect();
 
-    epics_base_rs::runtime::env::set_default("XRT_BEAMLINE", env!("CARGO_MANIFEST_DIR"));
-    epics_base_rs::runtime::env::set_default("ADCORE", ad_core_rs::AD_CORE_DIR);
-    epics_base_rs::runtime::env::set_default("MOTOR", motor_rs::MOTOR_IOC_DIR);
+    epics_base_rs::runtime::env::set_default_path("XRT_BEAMLINE", env!("CARGO_MANIFEST_DIR"));
+    epics_base_rs::runtime::env::set_default_path("ADCORE", ad_core_rs::AD_CORE_DIR);
+    epics_base_rs::runtime::env::set_default_path("MOTOR", motor_rs::MOTOR_IOC_DIR);
 
     let script = if args.len() > 1 && !args[1].starts_with('-') {
         args[1].clone()
     } else {
-        eprintln!("Usage: xrt_ioc <st.cmd>");
+        epics_libcom_rs::stderr_println!("Usage: xrt_ioc <st.cmd>");
         std::process::exit(1);
     };
 
@@ -115,7 +116,7 @@ async fn main() -> CaResult<()> {
             "xrtBeamlineConfig",
             vec![],
             "xrtBeamlineConfig - Configure XRT beamline simulation IOC",
-            move |_args: &[ArgValue], _ctx: &CommandContext| {
+            move |_args: &[ArgValue], ctx: &CommandContext| {
                 println!("xrtBeamlineConfig: setting up beamline...");
 
                 let sim_config = SimConfig {
@@ -141,16 +142,19 @@ async fn main() -> CaResult<()> {
                     sim_config.nrays,
                     sim_config.screen_nx,
                     sim_config.screen_nz,
-                    sim_config.energy_bandwidth * 100.0,
+                    CFloat(sim_config.energy_bandwidth * 100.0),
                 );
 
+                let claim =
+                    asyn_rs::manager::claim_port_driver("XRT").map_err(|e| e.to_string())?;
                 let xrt_output = NDArrayOutput::new();
                 let xrt_rt =
-                    create_xrt_detector("XRT", size_x, size_y, max_mem, xrt_output, sim_config)
+                    create_xrt_detector(&claim, size_x, size_y, max_mem, xrt_output, sim_config)
                         .map_err(|e| format!("failed to create XRT detector: {e}"))?;
 
                 let xrt_handle = xrt_rt.port_handle().clone();
-                asyn_rs::asyn_record::register_port("XRT", xrt_handle)
+                claim
+                    .publish(xrt_handle, ctx.db().scan_control().interrupt_gate())
                     .map_err(|e| e.to_string())?;
 
                 mgr_c.set_driver(Arc::new(ad_core_rs::ioc::GenericDriverContext::new(
@@ -188,7 +192,10 @@ async fn main() -> CaResult<()> {
 
     let motor_holder = SimMotorHolder::new();
     app = app.register_startup_command(motor_holder.sim_motor_create_command());
-    app = app.register_dynamic_device_support(motor_holder.device_support_factory());
+    app = app.register_dynamic_device_support(
+        &motor_rs::devices::devices(),
+        motor_rs::devices::device_support_factory(),
+    );
 
     let motor_h = motor_holder.clone();
     app = app.register_after_init(move || {
@@ -202,25 +209,15 @@ async fn main() -> CaResult<()> {
     // The runner paired with the two protocol registrars, because `casr` and
     // `pvxsr` have to answer from the script's first line and `.run(runner)`
     // reaches only the interactive shell.
-    epics_bridge_rs::qsrv::run_ca_pva_qsrv_ioc_app(
-        app.startup_script(&script)
-            // External links resolve with zero further setup: both link sets
-            // install at the base `AfterCaLinkInit` hook — before
-            // `setup_cp_links` warms Passive CP holders and before the iocInit
-            // external-link wait — the `ca` and `pva` link sets.
-            .register_link_set_installer(epics_ca_rs::calink::calink_link_set_install)
-            .register_link_set_installer(epics_bridge_rs::qsrv::pvalink_link_set_install),
-    )
-    .await
+    epics_bridge_rs::qsrv::run_ca_pva_qsrv_ioc_app(app.startup_script(&script)).await
 }
 
 /// The `exec_backend` arm: the dual-protocol runner this IOC hands its
 /// `IocApplication` to is compiled only on the tokio backend.
 #[cfg(exec_backend)]
 fn main() -> CaResult<()> {
-    eprintln!(
+    epics_base_rs::runtime::task::refuse_backend(
         "xrt_ioc needs the tokio backend; this build selects the \
-         reactor-free execution model (EPICS_RS_BUILD_EXEC_BACKEND=thread)."
-    );
-    Ok(())
+         reactor-free execution model (EPICS_RS_BUILD_EXEC_BACKEND=thread).",
+    )
 }

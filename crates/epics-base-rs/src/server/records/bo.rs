@@ -1,3 +1,4 @@
+use crate::server::record::{CycleCell, CycleRead, CycleValue, OutView};
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 
 use crate::error::{CaError, CaResult};
@@ -29,16 +30,16 @@ pub struct BoRecord {
     // Monitor
     pub mlst: u16, // last monitored value
     // Output control
-    pub omsl: i16,   // 0=supervisory, 1=closed_loop
-    pub dol: String, // desired output location link
-    pub high: f64,   // seconds to hold output high (toggle delay)
+    pub omsl: i16,     // 0=supervisory, 1=closed_loop
+    pub dol: PvString, // desired output location link
+    pub high: f64,     // seconds to hold output high (toggle delay)
     // Invalid output
     pub ivoa: i16, // 0=Continue, 1=Don't drive, 2=Set to IVOV
     pub ivov: u16, // invalid output value
     // Simulation
     pub simm: i16,
-    pub siml: String,
-    pub siol: String,
+    pub siml: PvString,
+    pub siol: PvString,
     pub sims: i16,
     pub sdly: f64,
     /// Set by `set_device_did_compute(true)` when a device readback has
@@ -67,13 +68,13 @@ impl Default for BoRecord {
             lalm: 0,
             mlst: 0,
             omsl: 0,
-            dol: String::new(),
+            dol: PvString::new(),
             high: 0.0,
             ivoa: 0,
             ivov: 0,
             simm: 0,
-            siml: String::new(),
-            siol: String::new(),
+            siml: PvString::new(),
+            siol: PvString::new(),
             sims: 0,
             sdly: -1.0,
             skip_convert: false,
@@ -133,14 +134,65 @@ pub(crate) fn set_bo_high_limit(value: f64) {
 }
 
 impl Record for BoRecord {
+    // The menus are stored as `i16` and served as ENUM, so they stay General.
+    crate::slot_map!(crate::server::record::dbd_generated::slots::bo;
+        fields:
+        VAL => val,
+        HIGH => high,
+        ZNAM => znam,
+        ONAM => onam,
+        RVAL => rval,
+        SDLY => sdly,
+        IVOV => ivov,
+        ORAW => oraw,
+        MASK => mask,
+        RBV => rbv,
+        ORBV => orbv,
+        MLST => mlst,
+        LALM => lalm;
+        custom: OMSL, DOL, ZSV, OSV, COSV, SIOL, SIML, SIMM, SIMS, IVOA;
+        spill: OUT, RPVT, WDPT, OLDSIMM, SSCN, SIMPVT);
+
+    fn acts_before_process(&self) -> bool {
+        false
+    }
+
+    fn cycle_hooks(&self) -> crate::server::record::CycleHooks {
+        crate::server::record::CycleHooks::NONE
+    }
+
     fn record_type(&self) -> &'static str {
         "bo"
+    }
+
+    /// devboStream.c reads and writes the `boRecord` members itself.
+    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+        Some(self)
+    }
+
+    /// devBoSoft.c, devBoSoftRaw.c and devBoSoftCallback.c return `dbPutLink`'s status.
+    fn process_status_rule(&self) -> crate::server::record::ProcessStatusRule {
+        crate::server::record::ProcessStatusRule::io(crate::server::record::SoftStatus {
+            plain: true,
+            raw: true,
+            async_: true,
+        })
+        .with_dol(crate::server::record::DolStatus::UntilWrite)
     }
 
     /// C `boRecord.c:191-205`: the scalar `dbGetLink(&prec->dol, ..., &val, 0, 0)`
     /// under `dol.type != CONSTANT && omsl == menuOmslclosed_loop`.
     fn fetches_dol_closed_loop(&self) -> bool {
         true
+    }
+
+    /// The closed-loop DOL is read at `DBR_USHORT` (`boRecord.c:197`), so a source
+    /// that request cannot convert is a failed read.
+    fn input_link_request(&self, link_field: &str) -> crate::server::record::InputLinkRequest {
+        crate::server::record::InputLinkRequest::As(match link_field {
+            "DOL" => crate::server::record::LinkReadAs::UShort,
+            _ => crate::server::record::LinkReadAs::Native,
+        })
     }
 
     /// `HIGH` is bo's only DBF_DOUBLE field, and both metadata literals in the
@@ -207,6 +259,10 @@ impl Record for BoRecord {
         Some(EpicsValue::Long(self.rval as i32))
     }
 
+    fn raw_soft_output_view(&self) -> Option<OutView<'_>> {
+        Some(OutView::Num(CycleValue::Long(self.rval as i32)))
+    }
+
     /// C `boRecord.c:230-238` (R7.0.10) is `prec->val = prec->ivov;` followed
     /// by the record's OWN `/* convert val to rval */` block, MASK rule and
     /// all:
@@ -254,19 +310,80 @@ impl Record for BoRecord {
 
     /// C `boRecord.c:167-170,174-175` (R7.0.10) — the derived half of the init
     /// tail: convert VAL to RVAL through MASK, then `oraw = rval; orbv = rbv`.
-    fn init_record_tail(&mut self) {
+    fn init_record_tail(&mut self, _: &mut crate::server::record::CommonFields) {
         self.val_to_rval();
         self.oraw = self.rval;
         self.orbv = self.rbv;
+    }
+
+    /// `devBoSoft`/`devBoSoftRaw` `init_record` return 2 (`devBoSoft.c:46-49`).
+    fn soft_dset_init(&self) -> crate::server::device_support::DsetInit {
+        crate::server::device_support::DsetInit::DoNotConvert
+    }
+
+    /// C `boRecord.c:158-162`: `if(prec->rval==0) prec->val = 0; else
+    /// prec->val = 1; prec->udf = FALSE;`
+    fn dset_init_convert(&mut self) -> Option<bool> {
+        self.val = u16::from(self.rval != 0);
+        Some(false)
     }
 
     /// C `boRecord.c:172-173` — `mlst = lalm = val`, the tracker half of the
     /// same tail. (C assigns `mlst` twice, once on each side of the convert at
     /// `:165` and `:172`; only the second is reachable.) bo seeds no ALST: it
     /// has no ADEL.
-    fn seed_deadband_tracking(&mut self) {
+    fn seed_deadband_tracking(&mut self, _dset_init: crate::server::device_support::DsetInit) {
         self.mlst = self.val;
         self.lalm = self.val;
+    }
+
+    /// C `boRecord.c:411-420` posts RVAL and RBV with `monitor_mask |
+    /// DBE_VALUE | DBE_LOG` outside the `if (monitor_mask)` that gates VAL.
+    fn fields_posted_with_value_mask(
+        &self,
+    ) -> &'static [(&'static str, crate::server::record::ValuePostGate)] {
+        use crate::server::record::ValuePostGate::OnChangeForced;
+        &[("RVAL", OnChangeForced), ("RBV", OnChangeForced)]
+    }
+
+    /// `monitor()` decides RVAL and RBV from the record's own `oraw` and
+    /// `orbv`, so the framework keeps no published copy of them.
+    fn fields_posted_only_when_marked(&self) -> &'static [&'static str] {
+        &["RVAL", "RBV"]
+    }
+
+    /// `monitor()` posts VAL, RVAL and RBV alone (`boRecord.c:398-421`).
+    fn process_posted_fields(&self) -> Option<crate::server::record::DeclaredFields> {
+        Some(
+            &const {
+                crate::server::record::declared_set(
+                    crate::server::record::dbd_generated::BO_FIELDS,
+                    ["VAL", "RVAL", "RBV"],
+                )
+            },
+        )
+    }
+
+    /// VAL is the deadband field and RVAL/RBV are decided from `oraw`/`orbv`.
+    fn answers_own_posts(&self) -> bool {
+        true
+    }
+
+    /// C `if(prec->oraw!=prec->rval) { ...; prec->oraw = prec->rval; }`
+    /// (`boRecord.c:411-415`) and its RBV twin, minus the post. Outside init,
+    /// `monitor()` is the only writer of `oraw`/`orbv`: a client that put
+    /// RVAL is left holding its own value when the cycle converts back to
+    /// the old one.
+    fn take_secondary_value_changes(
+        &mut self,
+        _value_mask: crate::server::recgbl::EventMask,
+    ) -> crate::server::record::SecondaryTake {
+        if self.oraw == self.rval && self.orbv == self.rbv {
+            return crate::server::record::SecondaryTake::NONE;
+        }
+        let rval = crate::server::record::SecondaryTake::advance(&mut self.oraw, self.rval);
+        let rbv = crate::server::record::SecondaryTake::advance(&mut self.orbv, self.rbv);
+        crate::server::record::SecondaryTake::unguarded(u64::from(rval) | u64::from(rbv) << 1)
     }
 
     fn process(&mut self) -> CaResult<ProcessOutcome> {
@@ -287,28 +404,33 @@ impl Record for BoRecord {
         }
         self.skip_convert = false;
 
-        self.oraw = self.rval;
-        self.orbv = self.rbv;
+        Ok(ProcessOutcome {
+            result: crate::server::record::RecordProcessResult::Complete,
+            actions: Vec::new(),
+            device_did_compute: false,
+            status: Ok(()),
+        })
+    }
 
-        // HIGH one-shot: C `boRecord.c:257-262` arms `callbackRequestDelayed`
-        // on every process that leaves VAL at 1, and the timer — never a
-        // process cycle — is what drives the momentary output back to Done.
-        // Arming is therefore idempotent and carries no record state: a caput,
-        // a FLNK or a periodic scan landing inside the window re-arms and moves
-        // the deadline out, exactly as C does, instead of consuming the pulse.
-        let mut actions = Vec::new();
+    /// HIGH one-shot: C `boRecord.c:257-262` arms `callbackRequestDelayed`
+    /// on every pass past `writeValue` that leaves VAL at 1, and the timer —
+    /// never a process cycle — is what drives the momentary output back to
+    /// Done. Arming is therefore idempotent and carries no record state: a
+    /// caput, a FLNK or a periodic scan landing inside the window re-arms and
+    /// moves the deadline out, exactly as C does, instead of consuming the
+    /// pulse.
+    fn after_write_actions(&self) -> crate::server::record::ProcessActions {
+        let mut actions = crate::server::record::ProcessActions::new();
         if self.val == 1 && self.high > 0.0 {
             actions.push(ProcessAction::DelayedCallbackAfter(
                 crate::runtime::time::duration_from_secs(self.high),
             ));
         }
+        actions
+    }
 
-        Ok(ProcessOutcome {
-            result: crate::server::record::RecordProcessResult::Complete,
-            actions,
-            device_did_compute: false,
-            post_write_fields: Vec::new(),
-        })
+    fn acts_after_write(&self) -> bool {
+        true
     }
 
     /// C `boRecord.c::myCallbackFunc` (:105-118) — the HIGH timer's own body,
@@ -343,18 +465,11 @@ impl Record for BoRecord {
     /// Device readback (`asyn:READBACK` / SCAN="I/O Intr" / init seed): store
     /// the raw and resolve VAL to 0/1, mirroring C `processBo`/`initBo`
     /// (devAsynInt32.c:1202-1203,1187 / devAsynUInt32Digital.c:731-732,716).
-    /// When MASK is set (the digital `asynUInt32Digital` config) RVAL keeps the
-    /// masked raw and VAL is `(masked != 0)`; when MASK is 0 (the typical
-    /// `asynInt32` `bo`, whose `initBo`/`processBo` do not mask) RVAL is the raw
-    /// and VAL is `(raw != 0)` — the `mask != 0` split reproduces both device
-    /// supports exactly. Returns `true` so the store reports `computed` and the
+    /// RVAL is the value the dset stores (masked or not, per the dset) and VAL
+    /// is `(RVAL != 0)`. Returns `true` so the store reports `computed` and the
     /// framework skips the forward convert (via `set_device_did_compute`).
     fn apply_raw_readback(&mut self, raw: i32) -> bool {
-        self.rval = if self.mask != 0 {
-            (raw as u32) & self.mask
-        } else {
-            raw as u32
-        };
+        self.rval = raw as u32;
         self.val = if self.rval != 0 { 1 } else { 0 };
         true
     }
@@ -394,6 +509,41 @@ impl Record for BoRecord {
             recgbl::rec_gbl_set_sevr_raw(common, alarm_status::COS_ALARM, self.cosv as u16);
             self.lalm = val;
         }
+    }
+
+    fn link_text_ref(&self, link_field: &str) -> Option<&[u8]> {
+        match link_field {
+            "DOL" => Some(self.dol.as_bytes()),
+            "SIML" => Some(self.siml.as_bytes()),
+            "SIOL" => Some(self.siol.as_bytes()),
+            _ => None,
+        }
+    }
+
+    fn simm_cells(&self) -> Option<crate::server::record::SimmCells> {
+        Some(crate::server::record::SimmCells {
+            simm: self.simm,
+            sims: self.sims,
+            sdly: self.sdly,
+        })
+    }
+
+    fn cycle_cell(&self, cell: CycleCell) -> CycleRead {
+        match cell {
+            CycleCell::Val => CycleRead::Value(CycleValue::Enum(self.val)),
+            CycleCell::Mlst => CycleRead::Value(CycleValue::UShort(self.mlst)),
+            CycleCell::Lalm => CycleRead::Value(CycleValue::UShort(self.lalm)),
+            _ => CycleRead::Absent,
+        }
+    }
+
+    fn put_cycle_cell(&mut self, cell: CycleCell, value: CycleValue) -> CaResult<()> {
+        match (cell, value) {
+            (CycleCell::Lalm, CycleValue::UShort(v)) => self.lalm = v,
+            (CycleCell::Mlst, CycleValue::UShort(v)) => self.mlst = v,
+            (cell, value) => return self.put_field(cell.name(), value.into()),
+        }
+        Ok(())
     }
 
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
@@ -442,13 +592,10 @@ impl Record for BoRecord {
                 }
                 // C rset `put_enum_str` (boRecord.c), reached from
                 // `dbConvert.c::putStringEnum` — one converter, shared with the
-                // framework's put paths (see `Record::enum_state_strings`).
+                // framework's put paths (see `Record::enum_str_state`).
                 EpicsValue::String(ref s) => {
-                    let resolved = crate::server::record::resolve_enum_state_string(
-                        "VAL",
-                        self.enum_state_strings().as_deref(),
-                        s,
-                    )?;
+                    let resolved =
+                        crate::server::record::resolve_enum_state_string("VAL", &*self, s)?;
                     if let EpicsValue::Enum(v) = resolved {
                         self.val = v;
                     }
@@ -482,14 +629,14 @@ impl Record for BoRecord {
             },
             "ZNAM" => match value {
                 EpicsValue::String(v) => {
-                    self.znam = v;
+                    self.znam.set_bytes(v.as_bytes());
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
             },
             "ONAM" => match value {
                 EpicsValue::String(v) => {
-                    self.onam = v;
+                    self.onam.set_bytes(v.as_bytes());
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
@@ -548,7 +695,7 @@ impl Record for BoRecord {
             },
             "DOL" => match value {
                 EpicsValue::String(v) => {
-                    self.dol = v.as_str_lossy().into_owned();
+                    self.dol = v;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
@@ -588,14 +735,14 @@ impl Record for BoRecord {
             },
             "SIML" => match value {
                 EpicsValue::String(v) => {
-                    self.siml = v.as_str_lossy().into_owned();
+                    self.siml = v;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
             },
             "SIOL" => match value {
                 EpicsValue::String(v) => {
-                    self.siol = v.as_str_lossy().into_owned();
+                    self.siol = v;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
@@ -636,14 +783,18 @@ impl Record for BoRecord {
         ))
     }
 
+    fn enum_str_state(&self, name: &PvString) -> Option<u16> {
+        crate::server::record::binary_enum_str_state(&self.znam, &self.onam, name)
+    }
+
     /// C `get_enum_str` (boRecord.c:320-339): VAL 0 -> ZNAM, 1 -> ONAM, and any
     /// other index -> `"Illegal_Value"`. Slot 1 is indexed even when ONAM is
     /// empty, so it renders empty — the `no_str` trim in `enum_state_strings`
     /// is the LABEL list's, not this read's.
-    fn enum_string_form(&self) -> Option<crate::server::snapshot::EnumStringForm> {
-        Some(crate::server::record::binary_enum_string_form(
+    fn enum_slots(&self) -> Option<crate::server::record::EnumSlots<'_>> {
+        Some(crate::server::record::EnumSlots::Binary([
             &self.znam, &self.onam,
-        ))
+        ]))
     }
 
     /// C `boRecord.c:395-400` `monitor()`: `if (prec->mlst != prec->val) { events |=

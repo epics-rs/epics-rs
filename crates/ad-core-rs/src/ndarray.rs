@@ -1,5 +1,7 @@
 use std::sync::Weak;
 
+use epics_libcom_rs::cfmt::CFloat;
+
 use crate::attributes::NDAttributeList;
 use crate::codec::Codec;
 use crate::error::{ADError, ADResult};
@@ -533,18 +535,39 @@ pub struct NDArray {
     pub attributes: NDAttributeList,
     pub codec: Option<Codec>,
     /// The pool that allocated this array (C++ `pNDArrayPool`), `None` for an
-    /// array built outside any pool. Set only by `NDArrayPool::alloc`; the
-    /// destructor returns the buffer through it.
-    pub(crate) pool: Option<Weak<NDArrayPool>>,
+    /// array built outside any pool. Set only by `NDArrayPool::alloc` and
+    /// `PersistentArray`.
+    pub(crate) pool: Option<PoolTie>,
     /// Requested byte count at allocation time (C++ `dataSize`). This is the exact
     /// `num_elements * element_size` requested, NOT the allocator-rounded Vec capacity.
     /// Pool memory accounting adds/subtracts this exact value.
     pub data_size: usize,
 }
 
+/// How an array belongs to its pool.
+#[derive(Debug)]
+pub(crate) enum PoolTie {
+    /// Charged on the pool; the destructor returns the buffer to it.
+    Charged(Weak<NDArrayPool>),
+    /// A [`crate::ndarray_pool::PersistentArray`] or a publish of it: one
+    /// charge they all hold, returned when the last of them goes.
+    Shared(std::sync::Arc<crate::ndarray_pool::SharedCharge>),
+}
+
+impl PoolTie {
+    fn pool(&self) -> &Weak<NDArrayPool> {
+        match self {
+            Self::Charged(pool) => pool,
+            Self::Shared(charge) => charge.pool(),
+        }
+    }
+}
+
 impl Drop for NDArray {
     fn drop(&mut self) {
-        if let Some(pool) = self.pool.take().and_then(|pool| pool.upgrade()) {
+        if let Some(PoolTie::Charged(pool)) = self.pool.take()
+            && let Some(pool) = pool.upgrade()
+        {
             pool.recycle(std::mem::take(&mut self.data), self.data_size);
         }
     }
@@ -610,16 +633,19 @@ impl NDArray {
     /// The pool that allocated this array (C++ `pNDArrayPool`), `None` when it
     /// came from no pool or that pool is gone.
     pub fn pool(&self) -> Option<std::sync::Arc<NDArrayPool>> {
-        self.pool.as_ref().and_then(Weak::upgrade)
+        self.pool.as_ref().and_then(|tie| tie.pool().upgrade())
+    }
+
+    /// The driver this array belongs to (C++ `pArray->pDriver`): its pool's
+    /// owner. `None` outside an owned pool.
+    pub fn owner(&self) -> Option<std::sync::Arc<crate::driver::ndarray_driver::ArrayOwner>> {
+        self.pool()?.owner()
     }
 
     /// Identity of the pool that allocated this array, `0` when it came from
     /// no pool or that pool is gone (C++ `pNDArrayPool`).
     pub fn pool_id(&self) -> u64 {
-        self.pool
-            .as_ref()
-            .and_then(Weak::upgrade)
-            .map_or(0, |pool| pool.id())
+        self.pool().map_or(0, |pool| pool.id())
     }
 
     /// Stamp both timestamps from one time source.
@@ -788,7 +814,10 @@ impl NDArray {
         ));
         out.push_str(&format!(
             "  uniqueId={}, timeStamp={}, epicsTS.secPastEpoch={}, epicsTS.nsec={}\n",
-            self.unique_id, self.time_stamp, self.timestamp.sec, self.timestamp.nsec
+            self.unique_id,
+            CFloat(self.time_stamp),
+            self.timestamp.sec,
+            self.timestamp.nsec
         ));
         out.push_str(&format!("  poolId={}\n", self.pool_id()));
         match &self.codec {
@@ -1093,5 +1122,12 @@ mod tests {
         assert_eq!(v, &[1, 2]);
         let mut empty = NDDataBuffer::F64(vec![]);
         assert!(empty.as_u8_slice_mut().is_empty());
+    }
+
+    #[test]
+    fn report_prints_the_time_stamp_as_c_percent_f() {
+        let mut arr = NDArray::new(vec![NDDimension::new(2)], NDDataType::UInt8);
+        arr.time_stamp = 1.5;
+        assert!(arr.report(0).contains(", timeStamp=1.500000, "));
     }
 }

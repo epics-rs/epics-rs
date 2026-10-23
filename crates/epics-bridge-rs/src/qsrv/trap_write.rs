@@ -101,7 +101,7 @@ mod tests {
         let events: Captured = Arc::new(Mutex::new(Vec::new()));
         let sink = events.clone();
         let handle = register_trap_write_listener(Arc::new(move |msg| {
-            if msg.pv_name == pv {
+            if msg.pv_name == pv.as_bytes() {
                 sink.lock()
                     .unwrap()
                     .push((msg.op, msg.status.map(str::to_owned)));
@@ -112,8 +112,8 @@ mod tests {
 
     fn meta(pv: &str) -> TrapWriteMeta<'_> {
         TrapWriteMeta {
-            pv_name: pv,
-            user: "u",
+            pv_name: pv.as_bytes(),
+            user: b"u",
             host: "h",
             peer: "h:5075",
             dbr_type: 5,

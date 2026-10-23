@@ -10,3 +10,16 @@ repository.workspace = true
 # which `cargo package` drops from the uploaded manifest, so this crate's
 # absence from crates.io is not a hole in anyone's dependency graph.
 publish = false
+
+[dependencies]
+# `net::port_held`: the one reading of "another socket holds this number".
+epics-libcom-rs = { workspace = true }
+socket2 = "0.5"
+
+# `SO_EXCLUSIVEADDRUSE` on the held-port probe (socket2 does not expose it)
+# and the `WSAEACCES` text in `verdict::held_texts`.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Networking_WinSock"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"

@@ -3,23 +3,26 @@
 //! Builds NTScalar and NTScalarArray `PvField` values directly from
 //! `Snapshot`s, with full alarm/timeStamp/display metadata.
 
+use epics_base_rs::types::RecordName;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
 use tokio::sync::mpsc;
 
-use crate::channel_shape::ChannelShape;
+use crate::channel_shape::{ChannelShape, ChannelValue};
 use crate::nt::NTScalar;
 use crate::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue, TypedScalarArray};
-use crate::server_native::source::{PutOptions, SourceRead};
+use crate::server_native::source::{PutOptions, RecordPutKind, SourceRead};
 use crate::server_native::{ChannelSource, OpError};
+use epics_base_rs::server::database::char_view::{
+    DollarView, PvaDollar, channel_field_type, long_string_field_text, plain_re_view,
+};
 
 use crate::server_native::source::{MonitorStream, UpstreamMonitor};
-use epics_base_rs::server::database::filters::{
-    ChannelName, FilterChain, parse_channel_name, try_parse_filter_chain,
-};
+use epics_base_rs::server::database::filters::{ChannelName, FilterChain, db_channel_create};
 use epics_base_rs::server::database::{PvDatabase, PvEntry};
+use epics_base_rs::server::pv::MonitorEvent;
 use epics_base_rs::server::recgbl::{alarm_condition_string, alarm_status};
 use epics_base_rs::server::snapshot::Snapshot;
 use epics_base_rs::types::{EpicsValue, WallTime};
@@ -68,7 +71,7 @@ struct NativeChannel {
 /// [`ChannelSource::notify_channel_close`], which the wire layer fires for
 /// explicit DESTROY_CHANNEL and for connection teardown alike.
 type NativeChannelCache =
-    Arc<parking_lot::Mutex<HashMap<SocketAddr, HashMap<String, Arc<NativeChannel>>>>>;
+    Arc<parking_lot::Mutex<HashMap<SocketAddr, HashMap<RecordName, Arc<NativeChannel>>>>>;
 
 /// Resolve `name` into its channel object, minting it on first use.
 ///
@@ -76,15 +79,16 @@ type NativeChannelCache =
 /// [`FilterChain`] of its own, because a chain built outside this function
 /// is by construction unshared with the channel's other operations.
 fn channel_for(
+    db: &PvDatabase,
     cache: &NativeChannelCache,
-    name: &str,
+    name: &[u8],
     peer: SocketAddr,
 ) -> Option<Arc<NativeChannel>> {
     if let Some(hit) = cache.lock().get(&peer).and_then(|m| m.get(name)).cloned() {
         return Some(hit);
     }
-    let (cn, value_filters) = resolve_channel(name)?;
-    let (_, property_filters) = resolve_channel(name)?;
+    let (cn, value_filters) = resolve_channel(db, name)?;
+    let (_, property_filters) = resolve_channel(db, name)?;
     let ch = Arc::new(NativeChannel {
         cn,
         value_filters,
@@ -94,7 +98,7 @@ fn channel_for(
         .lock()
         .entry(peer)
         .or_default()
-        .insert(name.to_string(), ch.clone());
+        .insert(RecordName::from(name), ch.clone());
     Some(ch)
 }
 
@@ -105,15 +109,121 @@ pub struct PvDatabaseSource {
     /// surface on this source. The gate holds an `Arc` clone of
     /// the caller's `AcfCell` (so hot-swap via that cell is
     /// visible) plus a per-name `(ASG, ASL)` resolver that reads
-    /// the live record's `common.asg` / `common.asl`. Wire-layer
+    /// the live record's `common.text.asg` / `common.asl`. Wire-layer
     /// `*_checked` ops cannot run without an `AccessChecked` minted
     /// here.
     gate: epics_base_rs::server::access_security::AccessGate,
     /// See [`NativeChannelCache`].
     channels: NativeChannelCache,
+    /// Every record monitor's two subscriptions attach here; see
+    /// [`RecordEvents`].
+    events: Arc<RecordEvents>,
 }
 
 impl PvDatabaseSource {
+    /// A record monitor's update stream and the STOP gate over the two
+    /// subscriptions it owns; a mailbox SharedPV has no gate.
+    async fn open_monitor(
+        &self,
+        checked: epics_base_rs::server::access_security::AccessChecked,
+        ctx: crate::server_native::ChannelContext,
+        opts: crate::server_native::source::MonitorOptions,
+        gate_seeds: bool,
+    ) -> Option<(
+        MonitorStream<crate::server_native::source::MonitorUpdate>,
+        Option<crate::server_native::source::MonitorGate>,
+    )> {
+        let db = self.db.clone();
+        let cache = self.channels.clone();
+        let peer = ctx.peer;
+        if !checked.allows_read() {
+            return None;
+        }
+        let name = checked.pv_name().clone();
+        // Both chains come off the channel object, which owns the
+        // value/property split: the value chain is the SAME instance the
+        // GET path runs, and the property chain is the independent
+        // re-parse pvxs's `pPropertiesChannel` carries.
+        let ch = channel_for(&db, &cache, &name, peer)?;
+        let cn = &ch.cn;
+        let value_filters = &ch.value_filters;
+        let property_filters = &ch.property_filters;
+        // A mailbox SharedPV posts a wholly-assigned value and has no
+        // record events to classify — keep the unmarked default.
+        let PvEntry::Record(rec) = channel_entry(&db, cn).await? else {
+            return self
+                .subscribe_checked_opts(checked, ctx, opts)
+                .await
+                .map(|s| (crate::server_native::source::plain_monitor_updates(s), None));
+        };
+        // The channel's shape is settled ONCE, here, exactly as pvxs
+        // settles it once per `dbChannel`: every event this stream yields
+        // is then rendered in it, so a one-element array field's updates
+        // are the scalars its descriptor advertised.
+        let render = record_channel_render(&rec, cn, value_filters)?;
+
+        let is_value_field = epics_base_rs::server::database::is_value_field(&cn.field);
+        let door = MetaDoor::new(
+            db.clone(),
+            rec,
+            cn.field.clone(),
+            render,
+            property_filters.clone(),
+        );
+        // A post is held by this monitor's ring or by the server's queue
+        // behind it, each bounded by the negotiated limit.
+        let held = opts.queue_size.saturating_mul(2);
+        let (stream, halves) = attach_record_pair(
+            &self.events,
+            &db,
+            RecordPair {
+                path: &cn.record_path,
+                value_mask: opts.dbe,
+                filters: [value_filters, property_filters],
+                dollar: render.dollar(),
+                limit: opts.queue_size as usize,
+            },
+            || {
+                let mut ring = PostRing::new(held, door.read()?);
+                // Only a stream the gate seeds has a first post to wait for; the
+                // ungated one carries updates alone (`subscribe_checked_opts_marked`).
+                let mut prime = gate_seeds.then(|| Prime::new(is_value_field));
+                Some(move |ev: MonitorEvent| {
+                    use epics_base_rs::server::recgbl::EventMask;
+                    // A value-half event never carries PROPERTY, a property-half
+                    // event always does (`pLog->mask = caEventMask & select`).
+                    let property = ev.mask().intersects(EventMask::PROPERTY);
+                    let update =
+                        marked_update(&mut ring, render.shape(ev), door.nsec_mask, || door.read());
+                    Prime::gate(&mut prime, property, update)
+                })
+            },
+        )
+        .map_err(|why| report_subscribe_refused(why, peer, &name))
+        .ok()
+        .flatten()?;
+        // STOP takes both halves off the record, so posts made while
+        // stopped are never queued: pvxs `onStart(false)` ⇒
+        // `db_event_disable` (`singlesource.cpp:170-179`, `dbEvent.c:524`).
+        // START is pvxs's `enable()` on each half, which also posts the
+        // half's current value under its own mask: that pair is the
+        // monitor's first update, so its leaves follow `DBE`.
+        let gate = crate::server_native::source::MonitorGate::new(move |active| {
+            let halves = halves.clone();
+            let db = db.clone();
+            async move {
+                for h in &halves {
+                    if active {
+                        h.enable(&db).await;
+                    } else {
+                        h.set_active(false).await;
+                    }
+                }
+            }
+        });
+        Some((stream, Some(gate)))
+    }
+
     pub fn new(db: Arc<PvDatabase>) -> Self {
         let acf: AcfCell = epics_base_rs::server::access_security::new_acf_cell(None);
         let gate = Self::build_gate(db.clone(), acf, None);
@@ -121,6 +231,7 @@ impl PvDatabaseSource {
             db,
             gate,
             channels: Default::default(),
+            events: Arc::new(record_events()),
         }
     }
 
@@ -133,6 +244,7 @@ impl PvDatabaseSource {
             db,
             gate,
             channels: Default::default(),
+            events: Arc::new(record_events()),
         }
     }
 
@@ -152,6 +264,7 @@ impl PvDatabaseSource {
             db,
             gate,
             channels: Default::default(),
+            events: Arc::new(record_events()),
         }
     }
 
@@ -160,16 +273,15 @@ impl PvDatabaseSource {
         acf: AcfCell,
         acl_version: Option<Arc<std::sync::atomic::AtomicU64>>,
     ) -> epics_base_rs::server::access_security::AccessGate {
-        use epics_base_rs::server::access_security::{AccessGate, AsgAslResolver, InpResolver};
-        let asg_db = db.clone();
+        use epics_base_rs::server::access_security::{AccessGate, AsgAslResolver};
         let resolver: AsgAslResolver = Arc::new(move |pv_name| {
-            let db = asg_db.clone();
+            let db = db.clone();
             Box::pin(async move {
                 // The ASG must come off the record the CHANNEL addresses,
                 // so the name is resolved the same way every operation on
                 // it resolves it; a `$` or filter-suffixed name used to miss
                 // the record entirely and fall through to DEFAULT/ASL 0.
-                let base = match resolve_channel(&pv_name) {
+                let base = match resolve_channel(&db, &pv_name) {
                     Some((cn, _filters)) => cn.record,
                     None => return ("DEFAULT".to_string(), 0u8),
                 };
@@ -180,24 +292,10 @@ impl PvDatabaseSource {
                 ("DEFAULT".to_string(), 0u8)
             })
         });
-        // resolve an ACF `INP*` link (`record.field`) to its
-        // current numeric value from the live database, so CALC-gated
-        // rules evaluate against real values instead of failing closed.
-        let inp_db = db.clone();
-        let inp_resolver: InpResolver = Arc::new(move |link: String| {
-            let db = inp_db.clone();
-            Box::pin(async move {
-                let (base, field) = epics_base_rs::server::access_security::inp_link_target(&link);
-                let rec = db.get_record(base)?;
-                let inst = rec.read();
-                inst.resolve_field(field).and_then(|v| v.to_f64())
-            })
-        });
-        let gate = match acl_version {
+        match acl_version {
             Some(v) => AccessGate::required_with_version(acf, resolver, v),
             None => AccessGate::required(acf, resolver),
-        };
-        gate.with_inp_resolver(inp_resolver)
+        }
     }
 
     pub fn database(&self) -> &Arc<PvDatabase> {
@@ -229,19 +327,7 @@ impl PvDatabaseSource {
 /// counts at once (no `display.form`, `uint8_t` `hysteresis`, `double`
 /// limits on integer records, and a full numeric `display`/`control`/
 /// `valueAlarm` on string records).
-fn nt_scalar_for(snap: &Snapshot) -> NTScalar {
-    // Same single owner as the value leaf (`crate::leaf_convert`), so the
-    // NT's `value` member and the type its limits are cut from agree by
-    // construction.
-    let (value_type, is_array) =
-        match crate::leaf_convert::epics_value_to_field_desc_leaf(&snap.value) {
-            FieldDesc::Scalar(t) => (t, false),
-            FieldDesc::ScalarArray(t) => (t, true),
-            // `epics_value_to_field_desc_leaf` returns only those two variants
-            // for an `EpicsValue`; a string scalar is the conservative shape if
-            // that ever changes.
-            _ => (ScalarType::String, false),
-        };
+fn nt_scalar(value_type: ScalarType, is_array: bool) -> NTScalar {
     let mut nt = if is_array {
         NTScalar::array(value_type)
     } else {
@@ -254,34 +340,266 @@ fn nt_scalar_for(snap: &Snapshot) -> NTScalar {
     nt
 }
 
+/// What fixes a channel's NT value tree: the value leaf's shape and the
+/// property leaves the channel serves. Every snapshot with one `NtShape`
+/// fills the same leaves, so a tree filled from one is a correct start for
+/// the next — what lets [`PostRing`] fill in place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NtShape {
+    value: NtValue,
+    properties: epics_base_rs::server::snapshot::PropertySupport,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NtValue {
+    /// pvxs single-record QSRV builds an NTEnum prototype whenever the
+    /// backing DBR type is DBR_ENUM (`ioc/singlesource.cpp:200-204`), and
+    /// `NTEnum::build()` defines `value` as an `enum_t { index, choices }`
+    /// (`src/nt.cpp:121-131`). A Rust `EpicsValue::Enum` *is* that DBR_ENUM
+    /// scalar, so it surfaces as `epics:nt/NTEnum:1.0`, not as a bare
+    /// numeric NTScalar.
+    Enum,
+    Scalar(ScalarType),
+    Array(ScalarType),
+}
+
+impl NtShape {
+    fn of(snap: &Snapshot) -> Self {
+        Self::new(&snap.value, snap.properties)
+    }
+
+    /// The shape a `value` takes on a channel serving `properties`.
+    fn new(
+        value: &EpicsValue,
+        properties: epics_base_rs::server::snapshot::PropertySupport,
+    ) -> Self {
+        // Same single owner as the value leaf (`crate::leaf_convert`), so the
+        // NT's `value` member and the type its limits are cut from agree by
+        // construction.
+        let value = match value {
+            EpicsValue::Enum(_) => NtValue::Enum,
+            v => match crate::leaf_convert::epics_value_to_field_desc_leaf(v) {
+                FieldDesc::Scalar(t) => NtValue::Scalar(t),
+                FieldDesc::ScalarArray(t) => NtValue::Array(t),
+                // `epics_value_to_field_desc_leaf` returns only those two
+                // variants for an `EpicsValue`; a string scalar is the
+                // conservative shape if that ever changes.
+                _ => NtValue::Scalar(ScalarType::String),
+            },
+        };
+        Self { value, properties }
+    }
+
+    fn desc(self) -> FieldDesc {
+        match self.value {
+            NtValue::Enum => nt_enum_desc(),
+            NtValue::Scalar(t) => nt_scalar(t, false).build(),
+            NtValue::Array(t) => nt_scalar(t, true).build(),
+        }
+    }
+}
+
 fn snapshot_to_pv_field(snap: &Snapshot) -> PvField {
-    // pvxs single-record QSRV builds an NTEnum prototype whenever the
-    // backing DBR type is DBR_ENUM (`ioc/singlesource.cpp:200-204`), and
-    // `NTEnum::build()` defines `value` as an `enum_t { index, choices }`
-    // (`src/nt.cpp:121-131`). A Rust `EpicsValue::Enum` *is* that DBR_ENUM
-    // scalar, so it must surface as `epics:nt/NTEnum:1.0` carrying the
-    // discoverable `value.choices`, not as a bare numeric NTScalar.
-    if let EpicsValue::Enum(v) = &snap.value {
-        return build_nt_enum(i32::from(*v), snap);
-    }
-    fill_nt_scalar(&nt_scalar_for(snap).build(), snap)
+    let mut v = crate::pvdata::encode::default_value_for(&NtShape::of(snap).desc());
+    fill_nt(&mut v, snap);
+    v
 }
 
+/// The value and the introspection are one [`NtShape`], so they stay in
+/// lockstep (pvxs `ioc/singlesource.cpp:200-204`, `src/nt.cpp:121-131`).
 fn snapshot_to_field_desc(snap: &Snapshot) -> FieldDesc {
-    // Mirror `snapshot_to_pv_field`: a DBR_ENUM scalar advertises the
-    // NTEnum descriptor (`epics:nt/NTEnum:1.0`) so value and introspection
-    // stay in lockstep (pvxs `ioc/singlesource.cpp:200-204`, `src/nt.cpp:121-131`).
-    if matches!(&snap.value, EpicsValue::Enum(_)) {
-        return nt_enum_desc();
-    }
-    nt_scalar_for(snap).build()
+    NtShape::of(snap).desc()
 }
 
-/// Populate the NTScalar shape `desc` declares from `snap`.
+/// Fill every leaf `snap` serves into `v`, a tree of `NtShape::of(snap)`.
+fn fill_nt(v: &mut PvField, snap: &Snapshot) {
+    let layout = NtLayout::new(NtShape::of(snap));
+    fill_nt_meta(v, layout.shape, snap);
+    fill_nt_event(v, &layout.event, &LogLeaves::of_snapshot(snap));
+}
+
+/// An [`NtShape`] with the positions of the leaves an event assigns, resolved
+/// from its descriptor when the layout is built. pvxs flattens dotted member
+/// names into offsets when a type is built (`type.cpp:270-277`) and still looks
+/// each one up per assignment (`data.cpp:833`); here the per-event fill only
+/// indexes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NtLayout {
+    shape: NtShape,
+    event: EventLeaves,
+}
+
+impl NtLayout {
+    fn new(shape: NtShape) -> Self {
+        Self {
+            shape,
+            event: EventLeaves::of(&shape.desc()),
+        }
+    }
+}
+
+/// Where a tree of one descriptor keeps each event leaf; `None` for a leaf the
+/// descriptor does not declare, pvxs's `if(auto x = node["…"])` no-op.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EventLeaves {
+    /// `value`, or `value.index` on an NTEnum.
+    value: Option<LeafAt>,
+    severity: Option<LeafAt>,
+    status: Option<LeafAt>,
+    message: Option<LeafAt>,
+    seconds: Option<LeafAt>,
+    nanoseconds: Option<LeafAt>,
+    user_tag: Option<LeafAt>,
+}
+
+impl EventLeaves {
+    fn of(desc: &FieldDesc) -> Self {
+        let value = match LeafAt::resolve(desc, "value.index") {
+            Some(at) => Some(at),
+            None => LeafAt::resolve(desc, "value"),
+        };
+        Self {
+            value,
+            severity: LeafAt::resolve(desc, "alarm.severity"),
+            status: LeafAt::resolve(desc, "alarm.status"),
+            message: LeafAt::resolve(desc, "alarm.message"),
+            seconds: LeafAt::resolve(desc, "timeStamp.secondsPastEpoch"),
+            nanoseconds: LeafAt::resolve(desc, "timeStamp.nanoseconds"),
+            user_tag: LeafAt::resolve(desc, "timeStamp.userTag"),
+        }
+    }
+}
+
+/// A leaf one or two members below the root, by member index. Valid for a
+/// tree built from the descriptor it was resolved against:
+/// [`default_value_for`](crate::pvdata::encode::default_value_for) keeps the
+/// descriptor's member order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LeafAt {
+    top: usize,
+    sub: Option<usize>,
+}
+
+impl LeafAt {
+    fn resolve(desc: &FieldDesc, path: &str) -> Option<Self> {
+        fn index(desc: &FieldDesc, name: &str) -> Option<(usize, FieldDesc)> {
+            let FieldDesc::Structure { fields, .. } = desc else {
+                return None;
+            };
+            fields
+                .into_iter()
+                .enumerate()
+                .find(|(_, (n, _))| n == name)
+                .map(|(i, (_, d))| (i, d.clone()))
+        }
+        let (top, rest) = match path.split_once('.') {
+            Some((top, rest)) => (top, Some(rest)),
+            None => (path, None),
+        };
+        let (top, child) = index(desc, top)?;
+        let sub = match rest {
+            Some(name) => Some(index(&child, name)?.0),
+            None => None,
+        };
+        Some(Self { top, sub })
+    }
+
+    fn get(self, v: &mut PvField) -> Option<&mut PvField> {
+        let PvField::Structure(s) = v else {
+            return None;
+        };
+        let top = &mut s.fields.get_mut(self.top)?.1;
+        match self.sub {
+            None => Some(top),
+            Some(i) => match top {
+                PvField::Structure(s) => s.fields.get_mut(i).map(|(_, v)| v),
+                _ => None,
+            },
+        }
+    }
+
+    fn set_scalar(at: Option<Self>, v: &mut PvField, val: ScalarValue) {
+        if let Some(PvField::Scalar(slot)) = at.and_then(|at| at.get(v)) {
+            *slot = val;
+        }
+    }
+}
+
+/// The leaves a log carries: the value, alarm and time `dbGet` reads off a
+/// field log rather than the record (`dbAccess.c:936-1020`).
+struct LogLeaves<'a> {
+    value: &'a EpicsValue,
+    stat: u16,
+    sevr: u16,
+    amsg: &'a str,
+    time: WallTime,
+    utag: i32,
+}
+
+impl<'a> LogLeaves<'a> {
+    fn of_snapshot(snap: &'a Snapshot) -> Self {
+        Self {
+            value: &snap.value,
+            stat: snap.alarm.status,
+            sevr: snap.alarm.severity,
+            amsg: &snap.alarm.amsg,
+            time: snap.timestamp,
+            utag: snap.user_tag,
+        }
+    }
+
+    /// `ev`'s leaves, its value being `value` ([`logged_value`]). The log
+    /// carries the record's raw stamp, as `db_create_field_log` copies it
+    /// (`dbEvent.c:710`); `nsec_mask` is the channel's `Q:time:tag` split,
+    /// which pvxs applies to the served `timeStamp` (`iocsource.cpp:239-248`).
+    fn of_event(ev: &'a MonitorEvent, value: &'a EpicsValue, nsec_mask: u64) -> Self {
+        let (time, utag) =
+            epics_base_rs::server::snapshot::split_nsec(ev.time(), ev.utag(), nsec_mask);
+        Self {
+            value,
+            stat: ev.stat(),
+            sevr: ev.sevr(),
+            amsg: ev.amsg(),
+            time,
+            utag,
+        }
+    }
+}
+
+/// The leaves a value event assigns — pvxs `IOCSource::get` under
+/// `UpdateType::Value | Alarm` (`iocsource.cpp:338-358`): value, alarm and
+/// timeStamp, nothing a metadata read supplies. Each is written into the
+/// leaf `v` already holds, so a scalar event allocates nothing.
+fn fill_nt_event(v: &mut PvField, at: &EventLeaves, log: &LogLeaves) {
+    match log.value {
+        EpicsValue::Enum(index) => {
+            LeafAt::set_scalar(at.value, v, ScalarValue::Int(i32::from(*index)))
+        }
+        other => {
+            if let Some(slot) = at.value.and_then(|at| at.get(v)) {
+                *slot = crate::leaf_convert::epics_value_to_pv_leaf(other);
+            }
+        }
+    }
+    fill_alarm(v, at, log.stat, log.sevr, log.amsg);
+    fill_timestamp(v, at, log.time, log.utag);
+}
+
+/// The leaves a metadata read assigns — `getProperties` under
+/// `UpdateType::Property` (`iocsource.cpp:334-336`) plus the form menu
+/// `IOCSource::initialize` sets — from `meta`, into a tree of `shape`.
+fn fill_nt_meta(v: &mut PvField, shape: NtShape, meta: &Snapshot) {
+    match shape.value {
+        NtValue::Enum => fill_nt_enum_meta(v, meta),
+        NtValue::Scalar(_) | NtValue::Array(_) => fill_nt_scalar_meta(v, meta),
+    }
+}
+
+/// Populate the NTScalar tree `v`'s metadata leaves from `snap`.
 ///
-/// The DESCRIPTOR is the shape's only owner: this starts from
-/// [`default_value_for`](crate::pvdata::encode::default_value_for) — which
-/// already produces a value matching `desc` leaf for leaf — and overwrites
+/// The DESCRIPTOR is the shape's only owner: `v` starts as
+/// [`default_value_for`](crate::pvdata::encode::default_value_for) of it —
+/// a value matching the descriptor leaf for leaf — and this overwrites
 /// only the leaves this channel serves, coercing each to the type the
 /// descriptor declared. A leaf the shape does not carry (`display.limitLow`
 /// on a string NT) is simply not found, which is exactly pvxs's own
@@ -311,21 +629,11 @@ fn snapshot_to_field_desc(snap: &Snapshot) -> FieldDesc {
 /// `*Severity`, `hysteresis`. They are declared, and zero, and the GET reply
 /// leaves them unmarked (`read_checked`), so no client reads a zero as
 /// authoritative.
-fn fill_nt_scalar(desc: &FieldDesc, snap: &Snapshot) -> PvField {
-    let mut v = crate::pvdata::encode::default_value_for(desc);
-
-    set_leaf(
-        &mut v,
-        "value",
-        crate::leaf_convert::epics_value_to_pv_leaf(&snap.value),
-    );
-    set_leaf(&mut v, "alarm", build_alarm(snap));
-    set_leaf(&mut v, "timeStamp", build_timestamp(snap));
-
+fn fill_nt_scalar_meta(v: &mut PvField, snap: &Snapshot) {
     let d = snap.display.clone().unwrap_or_default();
     let c = snap.control.clone().unwrap_or_default();
     for leaf in crate::nt::property_leaves(snap.properties) {
-        write_property_leaf(&mut v, leaf, &d, &c);
+        write_property_leaf(v, leaf, &d, &c);
     }
 
     // `IOCSource::initialize` (`iocsource.cpp:39-65`) fills the form menu and
@@ -335,12 +643,12 @@ fn fill_nt_scalar(desc: &FieldDesc, snap: &Snapshot) -> PvField {
     // `display.form` for any non-VAL field (`record_instance.rs:5165-5169`),
     // which is `iocsource.cpp:53`'s `dbIsValueField` gate.
     set_leaf(
-        &mut v,
+        v,
         "display.form.index",
         PvField::Scalar(ScalarValue::Int(i32::from(d.form))),
     );
     set_leaf(
-        &mut v,
+        v,
         "display.form.choices",
         PvField::ScalarArray(
             crate::nt::FORM_CHOICES
@@ -349,20 +657,19 @@ fn fill_nt_scalar(desc: &FieldDesc, snap: &Snapshot) -> PvField {
                 .collect(),
         ),
     );
-    v
 }
 
 /// Assign the one leaf `leaf` names, from wherever its value is stored.
 ///
 /// Split from [`property_leaves`](crate::nt::property_leaves) because the two
 /// answer different questions — that one says WHICH leaves this channel
-/// serves, this one says what each HOLDS — and joined by `fill_nt_scalar`
+/// serves, this one says what each HOLDS — and joined by `fill_nt_scalar_meta`
 /// walking the first and asking this for the value. Returns whether the leaf
 /// was recognised, which is what `every_property_leaf_has_a_writer` asserts
 /// over every property mask: a leaf added to `property_leaves` with no arm
 /// here would otherwise reach a client marked but never written.
 ///
-/// `value.choices` is the NTEnum shape's leaf, filled by [`build_nt_enum`]
+/// `value.choices` is the NTEnum shape's leaf, filled by [`fill_nt_enum_meta`]
 /// from the snapshot's own enum block; it is recognised and skipped so that
 /// coverage assertion stays exact.
 fn write_property_leaf(
@@ -479,7 +786,8 @@ fn nt_enum_desc() -> FieldDesc {
                     fields: vec![
                         ("index".into(), FieldDesc::Scalar(ScalarType::Int)),
                         ("choices".into(), FieldDesc::ScalarArray(ScalarType::String)),
-                    ],
+                    ]
+                    .into(),
                 },
             ),
             ("alarm".into(), alarm_desc()),
@@ -488,18 +796,24 @@ fn nt_enum_desc() -> FieldDesc {
                 "display".into(),
                 FieldDesc::Structure {
                     struct_id: String::new(),
-                    fields: vec![("description".into(), FieldDesc::Scalar(ScalarType::String))],
+                    fields: vec![("description".into(), FieldDesc::Scalar(ScalarType::String))]
+                        .into(),
                 },
             ),
-        ],
+        ]
+        .into(),
     }
 }
 
-/// Build an NTEnum value from a DBR_ENUM snapshot. `value.choices` comes
+/// Fill an NTEnum tree's metadata leaves. `value.choices` comes
 /// from `Snapshot.enums.strings` (pvxs fills it from the DBR enum metadata,
 /// `ioc/iocsource.cpp:274-285`); an enum snapshot with no choice metadata
 /// yields an empty `choices` array, matching pvxs when the menu is empty.
-fn build_nt_enum(index: i32, snap: &Snapshot) -> PvField {
+///
+/// pvxs NTEnum `display` is the anonymous `Struct("display", {description})`
+/// — description only, no limits/units/precision, narrower than the NTScalar
+/// display.
+fn fill_nt_enum_meta(v: &mut PvField, snap: &Snapshot) {
     // `value.choices` is `getProperties`' DBR_ENUM_STRS leaf
     // (`iocsource.cpp:277-285`), so the fill reads the same option bit
     // `property_leaves` reads to mark it rather than "do we happen to hold a
@@ -515,35 +829,18 @@ fn build_nt_enum(index: i32, snap: &Snapshot) -> PvField {
                 .collect()
         })
         .unwrap_or_default();
-
-    let mut value = PvStructure::new("enum_t");
-    value
-        .fields
-        .push(("index".into(), PvField::Scalar(ScalarValue::Int(index))));
-    value
-        .fields
-        .push(("choices".into(), PvField::ScalarArray(choices)));
-
-    // pvxs NTEnum `display` is the anonymous `Struct("display", {description})`
-    // (description only, no limits/units/precision — narrower than the NTScalar display).
-    let mut display = PvStructure::new("");
     let description = snap
         .display
         .as_ref()
         .map(|d| d.description.clone())
         .unwrap_or_default();
-    display.fields.push((
-        "description".into(),
-        PvField::Scalar(ScalarValue::String(description)),
-    ));
 
-    let mut s = PvStructure::new("epics:nt/NTEnum:1.0");
-    s.fields.push(("value".into(), PvField::Structure(value)));
-    s.fields.push(("alarm".into(), build_alarm(snap)));
-    s.fields.push(("timeStamp".into(), build_timestamp(snap)));
-    s.fields
-        .push(("display".into(), PvField::Structure(display)));
-    PvField::Structure(s)
+    set_leaf(v, "value.choices", PvField::ScalarArray(choices));
+    set_leaf(
+        v,
+        "display.description",
+        PvField::Scalar(ScalarValue::String(description)),
+    );
 }
 
 fn alarm_desc() -> FieldDesc {
@@ -553,7 +850,8 @@ fn alarm_desc() -> FieldDesc {
             ("severity".into(), FieldDesc::Scalar(ScalarType::Int)),
             ("status".into(), FieldDesc::Scalar(ScalarType::Int)),
             ("message".into(), FieldDesc::Scalar(ScalarType::String)),
-        ],
+        ]
+        .into(),
     }
 }
 
@@ -567,24 +865,18 @@ fn timestamp_desc() -> FieldDesc {
             ),
             ("nanoseconds".into(), FieldDesc::Scalar(ScalarType::Int)),
             ("userTag".into(), FieldDesc::Scalar(ScalarType::Int)),
-        ],
+        ]
+        .into(),
     }
 }
 
-fn build_alarm(snap: &Snapshot) -> PvField {
-    let mut a = PvStructure::new("alarm_t");
-    a.fields.push((
-        "severity".into(),
-        PvField::Scalar(ScalarValue::Int(snap.alarm.severity as i32)),
-    ));
+fn fill_alarm(v: &mut PvField, at: &EventLeaves, stat: u16, sevr: u16, amsg: &str) {
+    LeafAt::set_scalar(at.severity, v, ScalarValue::Int(sevr as i32));
     // pvxs `iocsource.cpp:187-223`: PVA `alarm.status` carries the alarm
     // *class* (NONE/DEVICE/DRIVER/RECORD/DB/UNDEFINED, 0–6), not the raw
     // EPICS condition code. Map before emitting so native clients never
     // see e.g. `LINK_ALARM = 14` in a field whose NT contract is 0–6.
-    a.fields.push((
-        "status".into(),
-        PvField::Scalar(ScalarValue::Int(alarm_status_class(snap.alarm.status))),
-    ));
+    LeafAt::set_scalar(at.status, v, ScalarValue::Int(alarm_status_class(stat)));
     // pvxs `iocsource.cpp:230-236`, exactly:
     //     if((options & DBR_AMSG) && meta.amsg[0])
     //         node["alarm.message"] = meta.amsg;
@@ -596,18 +888,21 @@ fn build_alarm(snap: &Snapshot) -> PvField {
     // other record raises UDF via plain `recGblSetSevr` (empty namsg), so
     // its empty amsg falls through here to the "UDF" condition string —
     // which is what pvxs serves for those records too.
-    let message = if !snap.alarm.amsg.is_empty() {
-        snap.alarm.amsg.clone()
-    } else if snap.alarm.status == alarm_status::NO_ALARM {
-        String::new()
+    let message = if !amsg.is_empty() {
+        amsg
+    } else if stat == alarm_status::NO_ALARM {
+        ""
     } else {
-        alarm_condition_string(snap.alarm.status).to_string()
+        alarm_condition_string(stat)
     };
-    a.fields.push((
-        "message".into(),
-        PvField::Scalar(ScalarValue::String(message.into())),
-    ));
-    PvField::Structure(a)
+    // Into the leaf's own buffer, which keeps the longest message it held —
+    // C's `amsg` is a fixed 40 bytes.
+    if let Some(PvField::Scalar(ScalarValue::String(s))) = at.message.and_then(|at| at.get(v)) {
+        let mut buf = std::mem::take(s).into_bytes();
+        buf.clear();
+        buf.extend_from_slice(message.as_bytes());
+        *s = buf.into();
+    }
 }
 
 /// Map a raw EPICS `epicsAlarmCondition` (0–21, `alarm.h`) to the PVA
@@ -639,7 +934,7 @@ fn alarm_status_class(condition: u16) -> i32 {
     }
 }
 
-fn build_timestamp(snap: &Snapshot) -> PvField {
+fn fill_timestamp(v: &mut PvField, at: &EventLeaves, time: WallTime, utag: i32) {
     // pvxs `iocsource.cpp:240-248`: `timeStamp` carries the record's
     // acquisition time and userTag, NOT the serialization wall-clock.
     // `Snapshot.timestamp` is the acquisition `WallTime` (POSIX epoch;
@@ -650,25 +945,18 @@ fn build_timestamp(snap: &Snapshot) -> PvField {
     // `meta.time.nsec & info.nsecMask` for userTag). Using `now()` here
     // overwrote the acquisition time with serialization time and zeroed
     // the userTag on every record-backed GET/MONITOR.
-    let dur = snap.timestamp.since_unix_epoch();
-    let mut t = PvStructure::new("time_t");
-    t.fields.push((
-        "secondsPastEpoch".into(),
-        PvField::Scalar(ScalarValue::Long(dur.as_secs() as i64)),
-    ));
-    t.fields.push((
-        "nanoseconds".into(),
-        PvField::Scalar(ScalarValue::Int(dur.subsec_nanos() as i32)),
-    ));
-    t.fields.push((
-        "userTag".into(),
-        PvField::Scalar(ScalarValue::Int(snap.user_tag)),
-    ));
-    PvField::Structure(t)
+    let dur = time.since_unix_epoch();
+    LeafAt::set_scalar(at.seconds, v, ScalarValue::Long(dur.as_secs() as i64));
+    LeafAt::set_scalar(
+        at.nanoseconds,
+        v,
+        ScalarValue::Int(dur.subsec_nanos() as i32),
+    );
+    LeafAt::set_scalar(at.user_tag, v, ScalarValue::Int(utag));
 }
 
 /// The leaves one QSRV read assigns into its `cloneEmpty()` — the exact set
-/// a GET reply / PUT_GET readback / monitor seed frames.
+/// a GET reply / PUT readback / monitor seed frames.
 ///
 /// pvxs runs `IOCSource::initialize` then `IOCSource::get(…, Everything, …)`
 /// for every single-record read (`singlesource.cpp:283`), which is:
@@ -721,31 +1009,16 @@ fn read_leaves(snap: &Snapshot, is_value_field: bool) -> Vec<String> {
 ///
 /// The one place a raw channel name becomes a record, a field and a
 /// [`FilterChain`], so every operation on the channel — create, read, put,
-/// process, monitor and the ASG lookup — agrees on what it addressed.
-/// [`parse_channel_name`] is the shared owner of the `{json}` / `[range]` /
-/// `$` / `record.FIELD` order (the QSRV bridge channel and CA
-/// CREATE_CHANNEL resolve through it too).
-///
-/// Every filtered name used to be refused here, because one union
-/// subscription had nowhere to hang a chain. Both subscriptions now exist
-/// as separate subscriber slots, each taking its own chain, so the only
-/// refusal left is C's own: a syntactically-present suffix that will not
-/// parse. `dbChannelCreate` runs `chf_parse` and, on failure, reaches
-/// `finish:` where it does `dbChannelDelete(chan); chan = NULL`
-/// (`dbChannel.c:514-529`), with an unknown filter name stopping the parse
-/// at `:179`; [`try_parse_filter_chain`] is that contract's owner in this
-/// workspace. `{}` is a valid no-filter request and yields an empty chain.
+/// monitor and the ASG lookup — agrees on what it addressed. It is
+/// C's `dbChannelCreate` ([`db_channel_create`]), whose NULL pvxs answers
+/// at create. `{}` is a valid no-filter request and yields an empty chain.
 ///
 /// Filters are read-side. C runs the pre/post chains from `dbChannelGet`
-/// and from the event queue, never from `dbChannelPut`, so the PUT and
-/// PROCESS paths resolve the name and drop the chain on the floor.
-fn resolve_channel(name: &str) -> Option<(ChannelName, FilterChain)> {
-    let cn = parse_channel_name(name);
-    let chain = match cn.json_suffix.as_deref() {
-        Some(json) => try_parse_filter_chain(json).ok()?,
-        None => FilterChain::new(),
-    };
-    Some((cn, chain))
+/// and from the event queue, never from `dbChannelPut`, so the PUT path
+/// resolves the name and drops the chain on the floor.
+fn resolve_channel(db: &PvDatabase, name: &[u8]) -> Option<(ChannelName, FilterChain)> {
+    let channel = db_channel_create(db, name).ok()?;
+    Some((channel.name, channel.chain))
 }
 
 /// The database entry a resolved channel addresses.
@@ -764,8 +1037,8 @@ async fn channel_entry(db: &PvDatabase, cn: &ChannelName) -> Option<PvEntry> {
     Some(entry)
 }
 
-async fn snapshot_for(db: &PvDatabase, name: &str) -> Option<Snapshot> {
-    let (cn, filters) = resolve_channel(name)?;
+async fn snapshot_for(db: &PvDatabase, name: &[u8]) -> Option<Snapshot> {
+    let (cn, filters) = resolve_channel(db, name)?;
     channel_snapshot(db, &cn, &filters).await
 }
 
@@ -798,39 +1071,148 @@ async fn channel_snapshot(
             snap
         }
         PvEntry::Record(rec) => {
-            // One door, asked with the view the name carries. It resolves a
-            // link-backed field's metadata from the LINK TARGET's record (so
-            // it must hold no record lock of its own) AND applies the `$`
-            // eligibility rule, answering `None` where C's `dbChannelCreate`
-            // is `S_dbLib_fieldNotFound` (`dbChannel.c:486-505`). An eligible
-            // field is served as its ordinary string snapshot: pvxs collapses
-            // the `DBR_CHAR` `$` view back to a NUL-terminated `pvString`
-            // (`ioc/iocsource.cpp:133-136`), so the view IS the string.
-            let mut snap = db.channel_snapshot_for_field(&rec, &cn.field, cn.string_view)?;
-            record_channel_shape(&rec, &cn.field).shape(&mut snap);
-            snap
+            // The snapshot door resolves a link-backed field's metadata from
+            // the LINK TARGET's record, so it must hold no record lock of its
+            // own. A `$` channel reads the field's own value too: its char
+            // image and its text are both cut from that ([`PvaDollar::render`]).
+            let render = record_channel_render(&rec, cn, filters)?;
+            return record_snapshot(db, &rec, &cn.field, render, filters);
         }
     };
-    if !filters.is_empty()
-        && let Some(value) = filters.apply_to_read_value(snap.value.clone())
-    {
-        snap.value = value;
-    }
+    read_snapshot_chain(filters, &mut snap);
     Some(snap)
 }
 
-/// The shape a record-backed channel bound to `field` serves —
-/// [`ChannelShape`], the one owner of pvxs's `dbChannelFinalElements(chan)
-/// != 1`, asked of the record behind the entry.
+/// [`channel_snapshot`]'s record arm, which takes no `await`: a record
+/// monitor reads its metadata here at subscribe and on each `DBE_PROPERTY`
+/// post, as pvxs's property callback reads `getProperties`
+/// (`singlesource.cpp:97-102`).
+fn record_snapshot(
+    db: &PvDatabase,
+    rec: &Arc<epics_base_rs::server::record::RecordCell>,
+    field: &str,
+    render: ChannelRender,
+    filters: &FilterChain,
+) -> Option<Snapshot> {
+    let mut snap = db.channel_snapshot_for_field(rec, field, false)?;
+    // pvxs splits the `Q:time:tag` bits out of every read it serves
+    // (`iocsource.cpp:239-248`); the record serves rsrv's raw stamp.
+    let nsec_mask = rec.read().qtime_nsec_mask();
+    epics_base_rs::server::snapshot::apply_nsec_mask(&mut snap, nsec_mask);
+    render.read(&mut snap, filters);
+    Some(snap)
+}
+
+/// [`read_chain`] on the whole snapshot, the log `dbGet` reads its value,
+/// time and options off (`dbAccess.c:341-348`): a `ts` value mode stamps
+/// the field's own time and narrows the properties to the type it leaves.
+fn read_snapshot_chain(filters: &FilterChain, snap: &mut Snapshot) {
+    if !filters.is_empty()
+        && let Some(read) = filters.apply_to_read_snapshot(snap.clone())
+    {
+        *snap = read;
+    }
+}
+
+/// `value` through `filters` in read context; the unfiltered value where
+/// the chain drops the read.
+fn read_chain(filters: &FilterChain, value: EpicsValue) -> EpicsValue {
+    if filters.is_empty() {
+        value
+    } else {
+        filters.apply_to_read_value(value.clone()).unwrap_or(value)
+    }
+}
+
+/// What a record channel serves its field's value as — pvxs's
+/// `getChannelValueType` (`ioc/iocsource.cpp:619-643`), settled once per
+/// channel.
 ///
 /// A `SharedPV` never reaches it: a mailbox has no `dbChannel`, so it has no
 /// `special(SPC_DBADDR)` field and its value's own count is the answer by
 /// construction.
-fn record_channel_shape(
+#[derive(Clone, Copy, PartialEq)]
+enum ChannelRender {
+    /// The value in the channel's [`ChannelShape`].
+    Shaped(ChannelShape),
+    /// A long string with no room past `MAX_STRING_SIZE + 1`: pvxs keeps its
+    /// `DBF_STRING` (`ioc/channel.cpp:58-60`), the buffer read to its NUL.
+    LongStringField,
+    /// A channel read through its char address: `$`, or
+    /// [`ChannelValue::Text`].
+    Dollar(DollarView),
+}
+
+impl ChannelRender {
+    /// The event rewrite every post on this channel takes before its fill.
+    fn shape(self, ev: MonitorEvent) -> MonitorEvent {
+        match self {
+            ChannelRender::LongStringField => long_string_field_shaped(ev),
+            ChannelRender::Dollar(d) if d.scalar() => scalar_shaped(ev),
+            ChannelRender::Dollar(d) if d.serve == PvaDollar::Chars => ev,
+            ChannelRender::Dollar(d) => text_shaped(d, ev),
+            ChannelRender::Shaped(ChannelShape::Scalar) => scalar_shaped(ev),
+            ChannelRender::Shaped(ChannelShape::Array) => ev,
+        }
+    }
+
+    /// A read of the channel through its chain `filters`: rendered ahead
+    /// of the chain, finished and shaped after it, as `dbChannelGet` reads
+    /// the log the chain made of the render, and the chain's `arr` may have
+    /// left a scalar's count.
+    fn read(self, snap: &mut Snapshot, filters: &FilterChain) {
+        match self {
+            ChannelRender::Shaped(shape) => {
+                read_snapshot_chain(filters, snap);
+                shape.shape(snap);
+            }
+            ChannelRender::LongStringField => {
+                snap.value = read_chain(filters, long_string_field_text(take_value(snap)));
+            }
+            ChannelRender::Dollar(dollar) => {
+                let image = dollar.render(take_value(snap));
+                let log = read_chain(filters, image.clone());
+                snap.value = dollar.finish(image, log);
+                if dollar.scalar() {
+                    ChannelShape::Scalar.shape(snap);
+                }
+            }
+        }
+    }
+
+    /// A monitor subscription's `$` view on this channel, so the post chain
+    /// sees the char image and the stream is left only the text.
+    fn dollar(self) -> Option<DollarView> {
+        match self {
+            ChannelRender::Dollar(view) => Some(view),
+            _ => None,
+        }
+    }
+}
+
+fn take_value(snap: &mut Snapshot) -> EpicsValue {
+    std::mem::replace(&mut snap.value, EpicsValue::Long(0))
+}
+
+/// [`ChannelRender`] of the record channel `cn` through its value chain
+/// `filters`, or `None` where C refuses its `$` (`S_dbLib_fieldNotFound`,
+/// `dbChannel.c:486-505`).
+fn record_channel_render(
     rec: &std::sync::Arc<epics_base_rs::server::record::RecordCell>,
-    field: &str,
-) -> ChannelShape {
-    ChannelShape::of_record_channel(&rec.read(), field)
+    cn: &ChannelName,
+    filters: &FilterChain,
+) -> Option<ChannelRender> {
+    let inst = rec.read();
+    if cn.string_view {
+        return DollarView::of(&inst, &cn.field, filters).map(ChannelRender::Dollar);
+    }
+    Some(
+        match ChannelValue::of_record_channel(&inst, &cn.field, filters) {
+            ChannelValue::Shaped(shape) => ChannelRender::Shaped(shape),
+            ChannelValue::Text(dollar) => ChannelRender::Dollar(dollar),
+            ChannelValue::LongStringField => ChannelRender::LongStringField,
+        },
+    )
 }
 
 impl ChannelSource for PvDatabaseSource {
@@ -842,7 +1224,7 @@ impl ChannelSource for PvDatabaseSource {
     /// with the channel exactly as `dbChannelDelete` frees the filter pvt
     /// (`dbChannel.c:714-725`). The wire layer fires this once per opened
     /// channel, for explicit DESTROY_CHANNEL and connection teardown alike.
-    fn notify_channel_close(&self, name: &str, ctx: &crate::server_native::ChannelContext) {
+    fn notify_channel_close(&self, name: &[u8], ctx: &crate::server_native::ChannelContext) {
         let mut cache = self.channels.lock();
         if let Some(by_name) = cache.get_mut(&ctx.peer) {
             by_name.remove(name);
@@ -852,17 +1234,26 @@ impl ChannelSource for PvDatabaseSource {
         }
     }
 
-    fn list_pvs(&self) -> impl std::future::Future<Output = Vec<String>> + Send {
-        let db = self.db.clone();
-        async move {
-            let mut names = db.all_record_names().await;
-            names.extend(db.all_simple_pv_names().await);
-            // Aliases are independently addressable channel names —
-            // a PVA client doing channelList must see them so it can
-            // connect by alias. has_name and find_entry already
-            // resolve aliases on the server side.
-            names.extend(db.all_alias_names());
-            names
+    fn list_pvs(&self) -> Vec<RecordName> {
+        let mut names = self.db.all_record_names();
+        names.extend(self.db.all_simple_pv_names());
+        // Aliases are independently addressable channel names —
+        // a PVA client doing channelList must see them so it can
+        // connect by alias. has_name and find_entry already
+        // resolve aliases on the server side.
+        names.extend(self.db.all_alias_names());
+        names
+    }
+
+    /// pvxs `SingleSource::show` (`ioc/singlesource.cpp:480-485`): every
+    /// record node, aliases included (`:398-404`), and no simple PV.
+    fn show(&self) -> crate::server_native::source::SourceShow {
+        let mut names = self.db.all_record_names();
+        names.extend(self.db.all_alias_names());
+        crate::server_native::source::SourceShow {
+            kind: "IOC",
+            names,
+            nested: false,
         }
     }
 
@@ -890,9 +1281,9 @@ impl ChannelSource for PvDatabaseSource {
     /// failing later with "field introspection unavailable".
     ///
     /// A simple PV has no field to narrow, so it resolves exactly as before.
-    fn has_pv(&self, name: &str) -> impl std::future::Future<Output = bool> + Send {
+    fn has_pv(&self, name: &[u8]) -> impl std::future::Future<Output = bool> + Send {
         let db = self.db.clone();
-        let name = name.to_string();
+        let name = RecordName::from(name);
         async move { snapshot_for(&db, &name).await.is_some() }
     }
 
@@ -906,27 +1297,27 @@ impl ChannelSource for PvDatabaseSource {
     /// silent search timeout, which is a different divergence, not a fix.
     /// Keeping `has_name` here also keeps the search reply cheap: no snapshot
     /// is built for a broadcast that may match nothing.
-    fn searchable(&self, name: &str) -> impl std::future::Future<Output = bool> + Send {
+    fn searchable(&self, name: &[u8]) -> impl std::future::Future<Output = bool> + Send {
         let db = self.db.clone();
-        let name = name.to_string();
+        let name = RecordName::from(name);
         async move { db.has_name(&name).await }
     }
 
     fn get_introspection(
         &self,
-        name: &str,
+        name: &[u8],
     ) -> impl std::future::Future<Output = Option<FieldDesc>> + Send {
         let db = self.db.clone();
-        let name = name.to_string();
+        let name = RecordName::from(name);
         async move {
             let snap = snapshot_for(&db, &name).await?;
             Some(snapshot_to_field_desc(&snap))
         }
     }
 
-    fn get_value(&self, name: &str) -> impl std::future::Future<Output = Option<PvField>> + Send {
+    fn get_value(&self, name: &[u8]) -> impl std::future::Future<Output = Option<PvField>> + Send {
         let db = self.db.clone();
-        let name = name.to_string();
+        let name = RecordName::from(name);
         async move {
             let snap = snapshot_for(&db, &name).await?;
             Some(snapshot_to_pv_field(&snap))
@@ -972,12 +1363,12 @@ impl ChannelSource for PvDatabaseSource {
             if !checked.allows_read() {
                 return None;
             }
-            let name = checked.pv_name().to_string();
+            let name = checked.pv_name().clone();
             // The channel's own chain, not one minted for this GET: C runs
             // the read through the same `dbChannel` the monitor uses, which
             // is what lets a read move `dbnd`'s baseline (see
             // [`NativeChannel`]).
-            let ch = channel_for(&cache, &name, peer)?;
+            let ch = channel_for(&db, &cache, &name, peer)?;
             let snap = channel_snapshot(&db, &ch.cn, &ch.value_filters).await?;
             let value = snapshot_to_pv_field(&snap);
             Some(SourceRead::marked(
@@ -993,7 +1384,7 @@ impl ChannelSource for PvDatabaseSource {
     /// The value half of [`Self::read_checked`], for the trait's value-only
     /// consumers: `put_delta_checked`'s prior-value merge and
     /// `CompositeSource`'s owner-resolving forward. No wire reply is framed
-    /// from it — GET, the PUT_GET readback and the monitor seed all take
+    /// from it — GET, the PUT readback and the monitor seed all take
     /// `read_checked` and frame its marks.
     ///
     /// Delegating instead of snapshotting again leaves this source one READ
@@ -1012,11 +1403,11 @@ impl ChannelSource for PvDatabaseSource {
 
     fn put_value(
         &self,
-        name: &str,
+        name: &[u8],
         value: PvField,
     ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
         let db = self.db.clone();
-        let name = name.to_string();
+        let name = RecordName::from(name);
         async move {
             // The WRITE gate ran in `put_value_checked` before reaching
             // here, so every failure below is operational (Failed), not a
@@ -1032,7 +1423,7 @@ impl ChannelSource for PvDatabaseSource {
             // them from local defaults. A record-backed channel keeps the
             // field-write path: the record owns its alarm/time through
             // processing, and the client cannot stamp them.
-            let Some((cn, _filters)) = resolve_channel(&name) else {
+            let Some((cn, filters)) = resolve_channel(&db, &name) else {
                 return Err(OpError::failed(format!("PUT: no such PV '{name}'")));
             };
             match channel_entry(&db, &cn).await {
@@ -1060,14 +1451,9 @@ impl ChannelSource for PvDatabaseSource {
                 // This PUT is non-blocking and has no receiver to await, and
                 // parking a wait-set whose receiver is dropped would occupy
                 // `RecordInstance::notify` until the record's async work ends.
-                Some(PvEntry::Record(_)) => {
-                    put_record_field(
-                        &db,
-                        &cn,
-                        put_payload_to_epics(&value)?,
-                        &PutOptions::default(),
-                    )
-                    .await
+                Some(PvEntry::Record(rec)) => {
+                    let epics = record_put_value(&rec, &cn, &value, &filters)?;
+                    put_record_field(&db, &cn, epics, &PutOptions::default()).await
                 }
                 // Name not in the database: report it rather than falling
                 // through to a write that would silently find nothing.
@@ -1108,20 +1494,18 @@ impl ChannelSource for PvDatabaseSource {
         value: PvField,
         ctx: crate::server_native::ChannelContext,
     ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
-        use epics_base_rs::server::access_security as acs;
         let db = self.db.clone();
         async move {
             if !checked.allows_write() {
                 return Err(crate::server_native::source::put_denied(&checked, &ctx));
             }
-            let name = checked.pv_name().to_string();
-            let Some((cn, _filters)) = resolve_channel(&name) else {
+            let name = checked.pv_name().clone();
+            let Some((cn, filters)) = resolve_channel(&db, &name) else {
                 return Err(OpError::failed(format!("PUT: no such PV '{name}'")));
             };
             let Some(PvEntry::Record(rec)) = channel_entry(&db, &cn).await else {
                 return self.put_value(&name, value).await;
             };
-            let epics = put_payload_to_epics(&value)?;
             // pvxs reads `record._options.process` / `.block` off the INIT
             // pvRequest inside `onPut` (`singlesource.cpp:347-352`) and
             // routes the write on them; this source used to write
@@ -1129,72 +1513,76 @@ impl ChannelSource for PvDatabaseSource {
             // `process=false` still processed, `process=true` never forced,
             // and `block=true` replied before processing finished.
             let opts = put_options_from_ctx(&ctx);
-            // pvxs logs `dbChannelFinalFieldType(pChan)`, i.e. the DBF of
-            // the addressed field, not the type the client sent. This
-            // source keeps no per-channel state, so the field is resolved
-            // here — and only when an event would actually be dispatched,
-            // since resolving it clones the field's current value.
-            let dbr_type = if acs::trap_write_armed(checked.rule_was_trap()) {
-                let dbf = rec
-                    .read()
-                    .client_field_value(&cn.field)
-                    .map(|v| v.db_field_type());
-                dbf.map(|t| t as u16).unwrap_or_default()
-            } else {
-                0
-            };
-            let peer = ctx.peer.to_string();
-            let meta = acs::TrapWriteMeta {
-                pv_name: &name,
-                user: &ctx.creds.account,
-                host: &ctx.creds.host,
-                peer: &peer,
-                dbr_type,
-            };
-            acs::put_with_trap(checked.rule_was_trap(), meta, epics, |v| {
-                put_record_field(&db, &cn, v, &opts)
-            })
+            put_record(
+                &db,
+                &checked,
+                &ctx,
+                (&cn, &filters),
+                &rec,
+                RecordPut::Write(value),
+                &opts,
+            )
             .await
         }
     }
 
-    fn process(&self, name: &str) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
+    /// A record channel's PUT takes the value pvxs's `SingleSource::onPut`
+    /// receives, not the trait default's read-merge-write.
+    ///
+    /// pvxs decodes every EXEC into a freshly built value
+    /// (`Value::Helper::build(op->type)` + `from_wire_valid`,
+    /// `serverget.cpp:466-469`), so an unmarked leaf is its type default, and
+    /// the non-blocking put writes `value` (an NTEnum's `value.index`) whether
+    /// marked or not (`singlesource.cpp:371-380`, `iocsource.cpp:589-591`).
+    /// A blocking put whose `value` is unmarked is `processRequest`
+    /// (`singlesource.cpp:363-364`), which `dbNotify.c:233-252` answers with
+    /// neither a write nor a process; a non-blocking one whose unmarked
+    /// `value` is a numeric array writes nothing (`putArray` of a null array)
+    /// and still post-processes. A mailbox `SharedPV` keeps the merge.
+    fn put_delta_checked(
+        &self,
+        checked: epics_base_rs::server::access_security::AccessChecked,
+        desc: Arc<FieldDesc>,
+        changed: crate::proto::BitSet,
+        delta: &PvField,
+        ctx: crate::server_native::ChannelContext,
+    ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
+        use crate::pvdata::encode::{default_value_for, fill_unmarked_from_prior, prune_to_marked};
         let db = self.db.clone();
-        let name = name.to_string();
+        let delta = delta.clone();
         async move {
-            // The WRITE-class gate ran in `process_checked` (trait
-            // default) before reaching here, so a failure below is
-            // operational, not a denial. pvxs serves PVA PROCESS by
-            // running the IOC processing chain (`iocsource.cpp:397-421`
-            // dbProcess / `singlesource.cpp:347-383`); the backing
-            // database already exposes that through
-            // `process_record_with_links` — the foreign-caller
-            // full-processing entry that is alias-aware, takes the
-            // record's advisory write gate, and runs
-            // INP -> process -> alarms -> OUT -> FLNK with cycle/depth
-            // guards. The previous no-op default returned success while
-            // the record never processed (alarms, monitors, OUT links and
-            // the FLNK chain all skipped).
-            let Some((cn, _filters)) = resolve_channel(&name) else {
-                return Err(OpError::failed(format!("no record serves '{name}'")));
-            };
-            match channel_entry(&db, &cn).await {
-                Some(PvEntry::Record(_)) => {
-                    // PROCESS targets the whole record, not a field, so it
-                    // runs on the resolved record name.
-                    let mut visited = epics_base_rs::server::database::ProcStack::new();
-                    db.process_record_with_links(&cn.record, &mut visited)
-                        .await
-                        .map_err(|e| OpError::failed(e.to_string()))
-                }
-                // A simple/mailbox SharedPV has no record body to run;
-                // report PROCESS as unsupported rather than silently
-                // succeeding (no process hook exists for these).
-                Some(PvEntry::Simple(_)) => Err(OpError::failed(format!(
-                    "PROCESS not supported for simple PV '{name}'"
-                ))),
-                None => Err(OpError::failed(format!("no record serves '{name}'"))),
+            if !checked.allows_write() {
+                return Err(crate::server_native::source::put_denied(&checked, &ctx));
             }
+            let entry = match resolve_channel(&db, checked.pv_name()) {
+                Some((cn, filters)) => channel_entry(&db, &cn).await.map(|e| (cn, e, filters)),
+                None => None,
+            };
+            let Some((cn, PvEntry::Record(rec), filters)) = entry else {
+                let prior = self.get_value_checked(checked.clone(), ctx.clone()).await;
+                let merged = match prior {
+                    Some(prior) => fill_unmarked_from_prior(&desc, &changed, 0, delta, &prior),
+                    None => delta,
+                };
+                return self.put_value_checked(checked, merged, ctx).await;
+            };
+            let opts = put_options_from_ctx(&ctx);
+            let value_marked = matches!(
+                prune_to_marked(&desc, &changed, 0, &delta),
+                Some(PvField::Structure(s)) if s.get_field("value").is_some()
+            );
+            let put = match RecordPutKind::decide(&desc, value_marked, &opts) {
+                RecordPutKind::Nothing => RecordPut::Nothing,
+                RecordPutKind::PostProcess => RecordPut::PostProcess,
+                RecordPutKind::Write => RecordPut::Write(fill_unmarked_from_prior(
+                    &desc,
+                    &changed,
+                    0,
+                    delta,
+                    &default_value_for(&desc),
+                )),
+            };
+            put_record(&db, &checked, &ctx, (&cn, &filters), &rec, put, &opts).await
         }
     }
 
@@ -1206,9 +1594,9 @@ impl ChannelSource for PvDatabaseSource {
     // the record itself — so this source no longer carries any
     // duplicate ACF logic.
 
-    fn is_writable(&self, name: &str) -> impl std::future::Future<Output = bool> + Send {
+    fn is_writable(&self, name: &[u8]) -> impl std::future::Future<Output = bool> + Send {
         let db = self.db.clone();
-        let name = name.to_string();
+        let name = RecordName::from(name);
         async move { db.has_name(&name).await }
     }
 
@@ -1238,7 +1626,7 @@ impl ChannelSource for PvDatabaseSource {
     ) -> impl std::future::Future<Output = Result<(), crate::server_native::source::OpError>> + Send
     {
         let db = self.db.clone();
-        let name = checked.pv_name().to_string();
+        let name = checked.pv_name().clone();
         let pv_request = ctx.pv_request.clone();
         // The op's `RemoteLogger` sink — drained by the wire layer after
         // this hook returns Ok, before the INIT reply.
@@ -1247,7 +1635,7 @@ impl ChannelSource for PvDatabaseSource {
             let Some(PvField::Structure(req)) = pv_request else {
                 return Ok(());
             };
-            let Some((cn, _filters)) = resolve_channel(&name) else {
+            let Some((cn, _filters)) = resolve_channel(&db, &name) else {
                 return Ok(());
             };
             if !matches!(channel_entry(&db, &cn).await, Some(PvEntry::Record(_))) {
@@ -1271,91 +1659,50 @@ impl ChannelSource for PvDatabaseSource {
     ///
     /// [`crate::nt::event_leaves`] is the single owner of that rule; this
     /// method only supplies the per-event mask it keys on.
-    fn subscribe_checked_opts_marked(
+    async fn subscribe_checked_opts_marked(
         &self,
         checked: epics_base_rs::server::access_security::AccessChecked,
         ctx: crate::server_native::ChannelContext,
         opts: crate::server_native::source::MonitorOptions,
-    ) -> impl std::future::Future<
-        Output = Option<MonitorStream<crate::server_native::source::MonitorUpdate>>,
-    > + Send {
-        let db = self.db.clone();
-        let cache = self.channels.clone();
-        let peer = ctx.peer;
-        async move {
-            if !checked.allows_read() {
-                return None;
-            }
-            let name = checked.pv_name().to_string();
-            // Both chains come off the channel object, which owns the
-            // value/property split: the value chain is the SAME instance the
-            // GET path runs, and the property chain is the independent
-            // re-parse pvxs's `pPropertiesChannel` carries.
-            let ch = channel_for(&cache, &name, peer)?;
-            let cn = &ch.cn;
-            let value_filters = &ch.value_filters;
-            let property_filters = &ch.property_filters;
-            // A mailbox SharedPV posts a wholly-assigned value and has no
-            // record events to classify — keep the unmarked default.
-            let PvEntry::Record(rec) = channel_entry(&db, cn).await? else {
-                return self
-                    .subscribe_checked_opts(checked, ctx, opts)
-                    .await
-                    .map(crate::server_native::source::plain_monitor_updates);
-            };
-            // The channel's shape is settled ONCE, here, exactly as pvxs
-            // settles it once per `dbChannel`: every event this stream yields
-            // is then rendered in it, so a one-element array field's updates
-            // are the scalars its descriptor advertised.
-            let shape = record_channel_shape(&rec, &cn.field);
+    ) -> Option<MonitorStream<crate::server_native::source::MonitorUpdate>> {
+        self.open_monitor(checked, ctx, opts, false)
+            .await
+            .map(|(stream, _)| stream)
+    }
 
-            use epics_base_rs::server::database::db_access::DbSubscription;
-            // pvxs's TWO subscriptions, not their union
-            // (`singlesource.cpp:155-167`). The value half carries the
-            // client's resolved `record._options.DBE` (`opts.dbe`, already
-            // reduced to the value classes); the property half is
-            // unconditional — pvxs opens it with `DBE_PROPERTY` whatever
-            // `DBE` said. Each half is a separate subscriber slot with its
-            // own event queue, which is the point: a union subscription let
-            // a queued value post swallow the metadata post that followed
-            // it.
-            let value_sub = DbSubscription::subscribe_with_mask_and_filters(
-                &db,
-                &cn.record_path,
-                0,
-                opts.dbe,
-                Some(value_filters),
-            )
+    async fn subscribe_seeded(
+        &self,
+        checked: epics_base_rs::server::access_security::AccessChecked,
+        ctx: crate::server_native::ChannelContext,
+        opts: crate::server_native::source::MonitorOptions,
+    ) -> Option<
+        crate::server_native::source::SubscriptionSeed<crate::server_native::source::MonitorUpdate>,
+    > {
+        let (updates, on_start) = self
+            .open_monitor(checked.clone(), ctx.clone(), opts, true)
             .await?;
-            let property_sub = DbSubscription::subscribe_with_mask_and_filters(
-                &db,
-                &cn.record_path,
-                0,
-                epics_base_rs::server::recgbl::EventMask::PROPERTY.bits(),
-                Some(property_filters),
-            )
-            .await?;
-            // The subscriptions ARE the stream: `marked_update` runs as the
-            // server pulls, so no task stands between them.
-            Some(MonitorStream::Upstream(UpstreamMonitor::from_db_pair(
-                value_sub,
-                property_sub,
-                match shape {
-                    ChannelShape::Scalar => marked_update_scalar,
-                    ChannelShape::Array => marked_update,
-                },
-            )))
-        }
+        // A record monitor's gate seeds it (see `open_monitor`); a mailbox
+        // has no gate and is seeded by a read.
+        let initial = match on_start {
+            Some(_) => None,
+            None => self.read_checked(checked, ctx).await,
+        };
+        Some(crate::server_native::source::SubscriptionSeed {
+            initial,
+            updates,
+            on_start,
+        })
     }
 
     fn subscribe(
         &self,
-        name: &str,
+        name: &[u8],
     ) -> impl std::future::Future<Output = Option<MonitorStream<PvField>>> + Send {
         let db = self.db.clone();
-        let name = name.to_string();
+        let events = self.events.clone();
+        let name = RecordName::from(name);
         async move {
-            let (cn, filters) = resolve_channel(&name)?;
+            let (cn, filters) = resolve_channel(&db, &name)?;
             let entry = channel_entry(&db, &cn).await?;
             match entry {
                 PvEntry::Simple(pv) => {
@@ -1368,7 +1715,7 @@ impl ChannelSource for PvDatabaseSource {
                     // `ProcessVariable::set` -> `notify_subscribers`.
                     use epics_base_rs::server::pv::PvSubscription;
                     match PvSubscription::subscribe(pv.clone()).await {
-                        Some(sub) => {
+                        Ok(sub) => {
                             let initial = snapshot_to_pv_field(&pv.snapshot());
                             // The seed rides on the stream and is handed out
                             // ahead of the subscription's own events, exactly
@@ -1380,7 +1727,7 @@ impl ChannelSource for PvDatabaseSource {
                                 UpstreamMonitor::from_pv(sub, event_field).with_seed(initial),
                             ))
                         }
-                        None => {
+                        Err(_) => {
                             // Per-PV subscriber cap reached: still honour the
                             // connect-time read so the client at least sees
                             // the current value, then end the stream.
@@ -1391,98 +1738,667 @@ impl ChannelSource for PvDatabaseSource {
                     }
                 }
                 PvEntry::Record(rec) => {
-                    let shape = record_channel_shape(&rec, &cn.field);
-                    // Subscribe via the public DbSubscription API. The mask
-                    // is the one `DbSubscription::subscribe_filtered` picks
-                    // for the unclassified entry (`db_access.rs:297`); it is
-                    // spelled out here because the filtered constructor is
-                    // the only one that takes a chain, and a filtered name
-                    // must not reach a raw stream.
-                    use epics_base_rs::server::database::db_access::DbSubscription;
+                    let render = record_channel_render(&rec, &cn, &filters)?;
+                    // The mask is the one `DbSubscription::subscribe_filtered`
+                    // picks for the unclassified entry (`db_access.rs:297`).
+                    // The metadata is not the event's: it is read once both
+                    // halves are live and reread on each post of the
+                    // `DBE_PROPERTY` half, whose posts yield no value of
+                    // their own.
                     use epics_base_rs::server::recgbl::EventMask;
-                    let sub = DbSubscription::subscribe_with_mask_and_filters(
+                    let (_, property_filters) = resolve_channel(&db, &name)?;
+                    let door = MetaDoor::new(
+                        db.clone(),
+                        rec,
+                        cn.field.clone(),
+                        render,
+                        property_filters.clone(),
+                    );
+                    attach_record_pair(
+                        &events,
                         &db,
-                        &cn.record_path,
-                        0,
-                        (EventMask::VALUE | EventMask::LOG).bits(),
-                        Some(&filters),
-                    )
-                    .await?;
-                    Some(MonitorStream::Upstream(UpstreamMonitor::from_db(
-                        sub,
-                        match shape {
-                            ChannelShape::Scalar => event_field_scalar,
-                            ChannelShape::Array => event_field,
+                        RecordPair {
+                            path: &cn.record_path,
+                            value_mask: (EventMask::VALUE | EventMask::LOG).bits(),
+                            filters: [&filters, &property_filters],
+                            dollar: render.dollar(),
+                            limit: PLAIN_QUEUE_LIMIT,
                         },
-                    )))
+                        || {
+                            let mut meta = door.read()?;
+                            let mut layout = None;
+                            Some(move |ev| {
+                                plain_record_field(
+                                    &mut meta,
+                                    &mut layout,
+                                    render.shape(ev),
+                                    door.nsec_mask,
+                                    || door.read(),
+                                )
+                            })
+                        },
+                    )
+                    .ok()
+                    .flatten()
+                    .map(|(stream, _)| stream)
                 }
             }
         }
     }
 }
 
-/// The per-event transform the record-backed marked-monitor bridge task used
-/// to apply. A free `fn` so it can be a [`UpstreamMonitor`] map pointer.
+/// pvxs's line for a `db_add_event` that returned NULL: subscriptionctx.h:48
+/// throws "Failed to create db subscription" out of `onSubscribe`, and
+/// servermon.cpp:598 logs it at ERR. A missing record is not that refusal.
+fn report_subscribe_refused(
+    why: epics_base_rs::server::pv::SubscribeRefused,
+    peer: std::net::SocketAddr,
+    name: &RecordName,
+) {
+    if why == epics_base_rs::server::pv::SubscribeRefused::CapReached {
+        crate::pvxs_log::log(
+            crate::pvxs_log::TCP_SETUP,
+            crate::pvxs_log::Level::Err,
+            format_args!(
+                "Client {peer} Monitor \"{name}\" onSubscribe() error: \
+                 Failed to create db subscription"
+            ),
+        );
+    }
+}
+
+/// The source a [`PvDatabaseSource`]'s record monitors attach to: one
+/// `event_user` drained by one thread, pvxs's `qsrvSingle`
+/// (`ioc/singlesource.cpp:396-416`). A post wakes the drain only when it
+/// finds it parked; a private subscription per monitor made every post a
+/// wake of that monitor's reader.
+type RecordEvents = epics_base_rs::server::database::db_access::DbEventSource<RecordDelivery>;
+
+fn record_events() -> RecordEvents {
+    use epics_base_rs::runtime::task::{StackSizeClass, ThreadPriority};
+    epics_base_rs::server::database::db_access::DbEventSource::new(
+        "qsrvSingle",
+        ThreadPriority::Custom(17),
+        StackSizeClass::Medium,
+    )
+}
+
+/// The queue limit of a monitor opened through the plain `subscribe`, which
+/// negotiates none: pvxs's `MonitorOp::limit` default (`servermon.cpp:66`).
+const PLAIN_QUEUE_LIMIT: usize = 4;
+
+/// One record subscription's delivery on the [`RecordEvents`] drain.
+struct RecordDelivery(Box<dyn RecordSink>);
+
+trait RecordSink: Send + Sync {
+    fn deliver(&self, ev: MonitorEvent);
+    fn ended(&self);
+}
+
+impl epics_base_rs::server::database::db_access::EventDelivery for RecordDelivery {
+    fn deliver(&self, ev: MonitorEvent) -> impl std::future::Future<Output = ()> + Send {
+        self.0.deliver(ev);
+        std::future::ready(())
+    }
+
+    fn ended(&self) {
+        self.0.ended();
+    }
+}
+
+/// A monitor's transform, shared by its two halves: a property post must
+/// reach the value half's state. `None` until the monitor is set up.
+type SharedMap<T> =
+    Arc<parking_lot::Mutex<Option<Box<dyn FnMut(MonitorEvent) -> Option<T> + Send>>>>;
+
+/// One half of a record monitor: its entries through the shared transform
+/// into the monitor's ring. Each half holds its own producer endpoint, so
+/// the ring ends once both halves have.
+struct RingHalf<T> {
+    map: SharedMap<T>,
+    out: parking_lot::Mutex<Option<crate::server_native::shared_pv::MonitorOutbox<T>>>,
+}
+
+impl<T: crate::server_native::shared_pv::SquashTail + Send + 'static> RecordSink for RingHalf<T> {
+    fn deliver(&self, ev: MonitorEvent) {
+        let update = match self.map.lock().as_mut() {
+            Some(map) => map(ev),
+            None => None,
+        };
+        if let Some(update) = update
+            && let Some(out) = self.out.lock().as_ref()
+        {
+            out.post(update, false);
+        }
+    }
+
+    fn ended(&self) {
+        self.out.lock().take();
+    }
+}
+
+/// What [`attach_record_pair`] subscribes: the channel's record path, the
+/// value half's mask, the value and property chains, the `$` view and the
+/// ring's limit.
+struct RecordPair<'a> {
+    path: &'a [u8],
+    value_mask: u16,
+    filters: [&'a FilterChain; 2],
+    dollar: Option<DollarView>,
+    limit: usize,
+}
+
+/// pvxs's TWO subscriptions for one record channel, not their union
+/// (`singlesource.cpp:155-167`): the value half on `value_mask`, the
+/// property half on a bare `DBE_PROPERTY` whatever `DBE` said, each its own
+/// subscriber slot with its own `filters` chain, so a queued value post
+/// cannot swallow the metadata post behind it. Both feed one ring of
+/// `limit`, through the transform `setup` builds. Both halves attach
+/// disabled and are enabled once it is armed (`singlesource.cpp:147-180`),
+/// so the shared drain never waits on one subscribe's record read.
+fn attach_record_pair<T, F>(
+    events: &RecordEvents,
+    db: &PvDatabase,
+    pair: RecordPair<'_>,
+    setup: impl FnOnce() -> Option<F>,
+) -> Result<
+    Option<(
+        MonitorStream<T>,
+        [epics_base_rs::server::database::db_access::SubscriptionActivation; 2],
+    )>,
+    epics_base_rs::server::pv::SubscribeRefused,
+>
+where
+    T: crate::server_native::shared_pv::SquashTail + Send + 'static,
+    F: FnMut(MonitorEvent) -> Option<T> + Send + 'static,
+{
+    use crate::server_native::shared_pv::MonitorRing;
+    let RecordPair {
+        path,
+        value_mask,
+        filters,
+        dollar,
+        limit,
+    } = pair;
+    let (out, ring) = MonitorRing::bounded(limit);
+    let map: SharedMap<T> = Arc::default();
+    let half = |out| {
+        RecordDelivery(Box::new(RingHalf {
+            map: map.clone(),
+            out: parking_lot::Mutex::new(Some(out)),
+        }))
+    };
+    let mask = [
+        value_mask,
+        epics_base_rs::server::recgbl::EventMask::PROPERTY.bits(),
+    ];
+    let value = events.attach_disabled(
+        db,
+        path,
+        mask[0],
+        Some(filters[0]),
+        dollar,
+        half(out.clone()),
+    )?;
+    let property =
+        events.attach_disabled(db, path, mask[1], Some(filters[1]), dollar, half(out))?;
+    let Some(transform) = setup() else {
+        return Ok(None);
+    };
+    *map.lock() = Some(Box::new(transform));
+    value.enable();
+    property.enable();
+    let halves = [value.activation_handle(), property.activation_handle()];
+    Ok(Some((
+        MonitorStream::Ring(ring.holding([value, property])),
+        halves,
+    )))
+}
+
+/// pvxs's per-subscription `currentValue` (`singlesource.cpp:54-67`), kept
+/// as a ring so a post shares its value with the monitor queue instead of
+/// carrying a tree of its own: each event is filled in place into a slot no
+/// queued post still holds.
+///
+/// `cap` is the negotiated queue limit plus one. When the next event is
+/// mapped the queue holds at most `limit` posts — a squash frees the tail's
+/// slot only after that push — so a free slot exists by construction. Slots
+/// are built on first need rather than at subscribe, so a client's
+/// `queueSize` preallocates nothing it does not fill.
+///
+/// The metadata leaves come from `meta`, the channel's GET-door read, never
+/// from an event: a slot rewrites them only when it last held an older read.
+struct PostRing {
+    meta: Snapshot,
+    /// The leaf set of each event class, for `meta`'s properties and the
+    /// last event's value kind.
+    marks: crate::nt::EventMarks,
+    /// Bumped by every [`Self::set_meta`]; a slot carries the generation it
+    /// was last given.
+    meta_gen: u64,
+    layout: Option<NtLayout>,
+    slots: Vec<(Arc<PvField>, u64)>,
+    next: usize,
+    cap: usize,
+}
+
+impl PostRing {
+    fn new(queue_limit: u32, meta: Snapshot) -> Self {
+        Self {
+            marks: crate::nt::EventMarks::new(
+                meta.properties,
+                matches!(meta.value, EpicsValue::Enum(_)),
+            ),
+            meta,
+            meta_gen: 1,
+            layout: None,
+            slots: Vec::new(),
+            next: 0,
+            cap: (queue_limit as usize).saturating_add(1),
+        }
+    }
+
+    fn set_meta(&mut self, meta: Snapshot) {
+        self.meta = meta;
+        self.meta_gen += 1;
+    }
+
+    /// The leaves an event of `mask` on a value like `value` marks.
+    fn marks(
+        &mut self,
+        mask: epics_base_rs::server::recgbl::EventMask,
+        value: &EpicsValue,
+    ) -> Option<crate::server_native::Marks> {
+        let is_enum = matches!(value, EpicsValue::Enum(_));
+        if !self.marks.is_for(self.meta.properties, is_enum) {
+            self.marks = crate::nt::EventMarks::new(self.meta.properties, is_enum);
+        }
+        self.marks.get(mask).map(|set| Arc::clone(set).into())
+    }
+
+    fn post(&mut self, ev: &LogLeaves) -> crate::server_native::PostValue {
+        let shape = NtShape::new(ev.value, self.meta.properties);
+        let layout = match self.layout {
+            Some(layout) if layout.shape == shape => layout,
+            _ => {
+                self.slots.clear();
+                self.next = 0;
+                *self.layout.insert(NtLayout::new(shape))
+            }
+        };
+        let n = self.slots.len();
+        let free = (0..n)
+            .map(|k| (self.next + k) % n)
+            .find(|&i| Arc::get_mut(&mut self.slots[i].0).is_some());
+        let i = match free {
+            Some(i) => i,
+            None if n < self.cap => {
+                let tree = crate::pvdata::encode::default_value_for(&shape.desc());
+                self.slots.push((Arc::new(tree), 0));
+                n
+            }
+            // Only a consumer holding more posts than it negotiated gets here.
+            None => return fresh_tree(&layout, &self.meta, ev).into(),
+        };
+        let (slot, slot_gen) = &mut self.slots[i];
+        let v = Arc::get_mut(slot).expect("a free slot is unshared");
+        if *slot_gen != self.meta_gen {
+            fill_nt_meta(v, shape, &self.meta);
+            *slot_gen = self.meta_gen;
+        }
+        fill_nt_event(v, &layout.event, ev);
+        self.next = i + 1;
+        Arc::clone(slot).into()
+    }
+}
+
+/// A tree of `shape` holding `meta`'s metadata and `ev`'s value, alarm and
+/// time.
+fn fresh_tree(layout: &NtLayout, meta: &Snapshot, ev: &LogLeaves) -> PvField {
+    let mut v = crate::pvdata::encode::default_value_for(&layout.shape.desc());
+    fill_nt_meta(&mut v, layout.shape, meta);
+    fill_nt_event(&mut v, &layout.event, ev);
+    v
+}
+
+/// A record channel's metadata door, as a record monitor holds it: the
+/// channel's own record, field, render and property-half filter chain.
+struct MetaDoor {
+    db: Arc<PvDatabase>,
+    rec: Arc<epics_base_rs::server::record::RecordCell>,
+    field: String,
+    render: ChannelRender,
+    filters: FilterChain,
+    /// The record's `Q:time:tag` mask, resolved once as pvxs resolves
+    /// `MappingInfo::nsecMask` once per channel (`typeutils.cpp:79-88`).
+    nsec_mask: u64,
+}
+
+impl MetaDoor {
+    fn new(
+        db: Arc<PvDatabase>,
+        rec: Arc<epics_base_rs::server::record::RecordCell>,
+        field: String,
+        render: ChannelRender,
+        filters: FilterChain,
+    ) -> Self {
+        let nsec_mask = rec.read().qtime_nsec_mask();
+        Self {
+            db,
+            rec,
+            field,
+            render,
+            filters,
+            nsec_mask,
+        }
+    }
+
+    /// Takes the record's read lock for the read alone, on the source's
+    /// drain or the subscribing task, neither holding another record lock.
+    fn read(&self) -> Option<Snapshot> {
+        record_snapshot(&self.db, &self.rec, &self.field, self.render, &self.filters)
+    }
+}
+
+/// pvxs's first monitor post waits for an event from each half
+/// (`singlesource.cpp:61-63`) and carries every leaf assigned meanwhile,
+/// from the `display.form` pair `IOCSource::initialize` assigns on.
+struct Prime {
+    value: bool,
+    property: bool,
+    marked: Vec<String>,
+}
+
+impl Prime {
+    fn new(is_value_field: bool) -> Self {
+        let mut marked = vec!["display.form.choices".to_string()];
+        if is_value_field {
+            marked.push("display.form.index".into());
+        }
+        Self {
+            value: false,
+            property: false,
+            marked,
+        }
+    }
+
+    /// `update` as the client sees it: held back, with its leaves kept,
+    /// until both halves have delivered; then the first post with them all.
+    fn gate(
+        prime: &mut Option<Self>,
+        property: bool,
+        update: Option<crate::server_native::source::MonitorUpdate>,
+    ) -> Option<crate::server_native::source::MonitorUpdate> {
+        let Some(p) = prime else {
+            return update;
+        };
+        if property {
+            p.property = true;
+        } else {
+            p.value = true;
+        }
+        let mut update = update?;
+        for leaf in update
+            .marked
+            .take()
+            .map(crate::server_native::source::Marks::into_vec)
+            .unwrap_or_default()
+        {
+            if !p.marked.contains(&leaf) {
+                p.marked.push(leaf);
+            }
+        }
+        if !(p.value && p.property) {
+            return None;
+        }
+        update.marked = prime.take().map(|p| p.marked.into());
+        Some(update)
+    }
+}
+
+/// The per-event transform of a record-backed marked monitor.
+///
+/// A `DBE_PROPERTY` post rereads the metadata through `read_meta`; a value
+/// post takes only value, alarm and time from the event (pvxs
+/// `IOCSource::get`, `iocsource.cpp:334-358`).
 ///
 /// `None` (the bridge's `continue`) is an event whose `DBE_*` class marks no
 /// leaf — no wire meaning, since C would have assigned none either.
 fn marked_update(
-    ev: epics_base_rs::server::pv::MonitorEvent,
+    ring: &mut PostRing,
+    ev: MonitorEvent,
+    nsec_mask: u64,
+    mut read_meta: impl FnMut() -> Option<Snapshot>,
 ) -> Option<crate::server_native::source::MonitorUpdate> {
-    let marked = crate::nt::event_leaves(
-        ev.mask,
-        ev.snapshot.properties,
-        matches!(&ev.snapshot.value, EpicsValue::Enum(_)),
-    );
-    if marked.is_empty() {
-        return None;
+    use epics_base_rs::server::recgbl::EventMask;
+    if ev.mask().intersects(EventMask::PROPERTY)
+        && let Some(meta) = read_meta()
+    {
+        ring.set_meta(meta);
     }
+    let mut held = None;
+    let value = logged_value(&ev, &mut held, &mut read_meta)?;
+    let marked = ring.marks(ev.mask(), value)?;
     Some(crate::server_native::source::MonitorUpdate {
+        value: ring.post(&LogLeaves::of_event(&ev, value, nsec_mask)),
         marked: Some(marked),
-        ..crate::server_native::source::MonitorUpdate::from(snapshot_to_pv_field(&ev.snapshot))
+        type_changed: false,
+        overrun: Vec::new(),
     })
 }
 
-/// The unmarked transform of the two plain `subscribe` bridge tasks: every
-/// event yields its snapshot as a `PvField`, none are filtered.
-fn event_field(ev: epics_base_rs::server::pv::MonitorEvent) -> Option<PvField> {
-    Some(snapshot_to_pv_field(&ev.snapshot))
+/// The plain record `subscribe`'s transform: a `DBE_PROPERTY` post (from
+/// the property half) rereads the metadata and yields nothing; a value post
+/// yields the whole value, its metadata from the last read.
+fn plain_record_field(
+    meta: &mut Snapshot,
+    layout: &mut Option<NtLayout>,
+    ev: MonitorEvent,
+    nsec_mask: u64,
+    mut read_meta: impl FnMut() -> Option<Snapshot>,
+) -> Option<PvField> {
+    use epics_base_rs::server::recgbl::EventMask;
+    if ev.mask().intersects(EventMask::PROPERTY) {
+        if let Some(m) = read_meta() {
+            *meta = m;
+        }
+        return None;
+    }
+    let mut held = None;
+    let value = logged_value(&ev, &mut held, &mut read_meta)?;
+    let shape = NtShape::new(value, meta.properties);
+    let layout = match *layout {
+        Some(layout) if layout.shape == shape => layout,
+        _ => *layout.insert(NtLayout::new(shape)),
+    };
+    Some(fresh_tree(
+        &layout,
+        meta,
+        &LogLeaves::of_event(&ev, value, nsec_mask),
+    ))
 }
 
-/// [`marked_update`] and [`event_field`] for a [`ChannelShape::Scalar`]
-/// channel — a one-element array field, whose events carry the buffer the
-/// record posted and whose descriptor advertises the element.
-///
-/// Two transforms rather than one carrying the shape: `UpstreamMonitor`'s map
-/// is a plain `fn` pointer, and the shape is a per-channel constant chosen
-/// once at subscribe time, so selecting the pointer IS carrying it.
-fn marked_update_scalar(
-    ev: epics_base_rs::server::pv::MonitorEvent,
-) -> Option<crate::server_native::source::MonitorUpdate> {
-    marked_update(scalar_shaped(ev))
+/// `ev`'s value, kept in `held` when the log has no copy to lend: a scalar
+/// by value, or a `dbfl_type_ref` log's field, read at delivery through the
+/// channel's door as `dbGet` reads it (`dbAccess.c:936-940`). `None` when
+/// that read fails.
+fn logged_value<'a>(
+    ev: &'a MonitorEvent,
+    held: &'a mut Option<EpicsValue>,
+    door: impl FnOnce() -> Option<Snapshot>,
+) -> Option<&'a EpicsValue> {
+    use epics_base_rs::server::pv::LogValue;
+    Some(match ev.value() {
+        LogValue::Owned(v) => v,
+        LogValue::Val(v) => held.insert(v),
+        LogValue::Ref => held.insert(door()?.value),
+    })
 }
 
-fn event_field_scalar(ev: epics_base_rs::server::pv::MonitorEvent) -> Option<PvField> {
-    event_field(scalar_shaped(ev))
+/// A mailbox PV's monitor transform: every delivered read yields its whole
+/// value, the PV's metadata read at delivery included.
+fn event_field(snap: Snapshot) -> Option<PvField> {
+    Some(snapshot_to_pv_field(&snap))
+}
+
+/// `ev` with its snapshot's chars decoded to the text `view` serves
+/// ([`DollarView::text`]), in a new `Snapshot` for the reason
+/// [`scalar_shaped`] gives.
+fn text_shaped(
+    view: DollarView,
+    mut ev: epics_base_rs::server::pv::MonitorEvent,
+) -> epics_base_rs::server::pv::MonitorEvent {
+    if matches!(
+        ev.value().as_value(),
+        Some(EpicsValue::CharArray(_) | EpicsValue::UCharArray(_))
+    ) {
+        let value = ev.replace_value(EpicsValue::Long(0));
+        ev.replace_value(view.text(value));
+    }
+    ev
+}
+
+/// [`text_shaped`] for a [`ChannelRender::LongStringField`].
+fn long_string_field_shaped(
+    mut ev: epics_base_rs::server::pv::MonitorEvent,
+) -> epics_base_rs::server::pv::MonitorEvent {
+    if matches!(
+        ev.value().as_value(),
+        Some(EpicsValue::CharArray(_) | EpicsValue::UCharArray(_))
+    ) {
+        let value = ev.replace_value(EpicsValue::Long(0));
+        ev.replace_value(long_string_field_text(value));
+    }
+    ev
 }
 
 /// `ev` with its snapshot collapsed to the one element the channel serves.
 ///
-/// A new `Snapshot` rather than a mutation: `MonitorEvent::snapshot` is the
-/// `Arc` every other subscriber this post reached is holding, and a channel's
-/// shape is not theirs to inherit.
+/// `replace_value` copies the post first: every other subscriber it reached
+/// still holds it, and a channel's shape is not theirs to inherit.
 fn scalar_shaped(
     mut ev: epics_base_rs::server::pv::MonitorEvent,
 ) -> epics_base_rs::server::pv::MonitorEvent {
-    if let Some(value) = ChannelShape::Scalar.collapsed(&ev.snapshot.value) {
-        let mut snap = (*ev.snapshot).clone();
-        snap.value = value;
-        ev.snapshot = std::sync::Arc::new(snap);
+    let collapsed = ev
+        .value()
+        .as_value()
+        .and_then(|v| ChannelShape::Scalar.collapsed(v));
+    if let Some(value) = collapsed {
+        ev.replace_value(value);
     }
     ev
 }
 
 // ── PvField → EpicsValue (PUT path) ────────────────────────────────────
+
+/// `write` inside the `asTrapWrite` put-log bracket pvxs's `SecurityLogger`
+/// opens for every record put ([`epics_base_rs::server::access_security::put_with_trap`]).
+async fn trapped_put<F, Fut>(
+    checked: &epics_base_rs::server::access_security::AccessChecked,
+    ctx: &crate::server_native::ChannelContext,
+    cn: &ChannelName,
+    rec: &epics_base_rs::server::record::RecordCell,
+    epics: EpicsValue,
+    write: F,
+) -> Result<(), OpError>
+where
+    F: FnOnce(EpicsValue) -> Fut,
+    Fut: std::future::Future<Output = Result<(), OpError>>,
+{
+    use epics_base_rs::server::access_security as acs;
+    // pvxs logs `dbChannelFinalFieldType(pChan)`, i.e. the DBF of the
+    // addressed field, not the type the client sent. This source keeps no
+    // per-channel state, so the field is resolved here — and only when an
+    // event would actually be dispatched, since resolving it clones the
+    // field's current value.
+    let dbr_type = if acs::trap_write_armed(checked.rule_was_trap()) {
+        let inst = rec.read();
+        // The declaration before the value: a long-string field is served as
+        // the `LEN` elements it holds, while its address is `DBF_STRING`.
+        let dbf = channel_field_type(&inst, &cn.field, cn.string_view, || {
+            inst.declared_field_type(&cn.field).or_else(|| {
+                inst.client_field_value(&cn.field)
+                    .map(|v| v.db_field_type())
+            })
+        });
+        dbf.map(|t| t as u16).unwrap_or_default()
+    } else {
+        0
+    };
+    let peer = ctx.peer.to_string();
+    let meta = acs::TrapWriteMeta {
+        pv_name: checked.pv_name(),
+        user: ctx.creds.account.as_bytes(),
+        host: &ctx.creds.host,
+        peer: &peer,
+        dbr_type,
+    };
+    acs::put_with_trap(checked.rule_was_trap(), meta, epics, write).await
+}
+
+/// What a record channel's PUT does to the record.
+enum RecordPut {
+    /// Write this value, then process as the options ask.
+    Write(PvField),
+    /// Write nothing and post-process: pvxs's `putArray` of a null array.
+    PostProcess,
+    /// Write nothing, process nothing, reply once the record is free:
+    /// pvxs's blocking `processRequest`.
+    Nothing,
+}
+
+/// The record arm of every PUT, inside the put-log bracket. A put that
+/// writes nothing logs the field as it stands, which is what the record
+/// holds afterwards; `doPreProcessing`'s DISP gate still runs.
+async fn put_record(
+    db: &PvDatabase,
+    checked: &epics_base_rs::server::access_security::AccessChecked,
+    ctx: &crate::server_native::ChannelContext,
+    (cn, filters): (&ChannelName, &FilterChain),
+    rec: &epics_base_rs::server::record::RecordCell,
+    put: RecordPut,
+    opts: &PutOptions,
+) -> Result<(), OpError> {
+    let failed = |e: epics_base_rs::error::CaError| OpError::failed(e.to_string());
+    let current = || {
+        let value = rec.read().client_field_value(&cn.field);
+        value.unwrap_or(EpicsValue::Long(0))
+    };
+    let put = async move {
+        match put {
+            RecordPut::Write(value) => {
+                let (epics, char_address) = record_put_value(rec, cn, &value, filters)?;
+                trapped_put(checked, ctx, cn, rec, epics, |v| {
+                    put_record_field(db, cn, (v, char_address), opts)
+                })
+                .await
+            }
+            RecordPut::PostProcess => {
+                trapped_put(checked, ctx, cn, rec, current(), |_| async {
+                    db.process_field_from_client(&cn.record, &cn.field, opts.process)
+                        .await
+                        .map_err(failed)
+                })
+                .await
+            }
+            RecordPut::Nothing => {
+                trapped_put(checked, ctx, cn, rec, current(), |_| async {
+                    db.notify_unwritten_from_client(&cn.record, &cn.field)
+                        .await
+                        .map_err(failed)
+                })
+                .await
+            }
+        }
+    };
+    // pvxs's `CurrentOp` spans a put that does not wait
+    // (`singlesource.cpp:371`); a blocking one went to `dbProcessNotify`.
+    if opts.block {
+        put.await
+    } else {
+        super::current_op::attached(ctx, put).await
+    }
+}
 
 /// The record-arm backing write of a PVA PUT, shared by the ctx-less
 /// [`ChannelSource::put_value`] and the audited `put_value_checked`.
@@ -1498,10 +2414,16 @@ fn scalar_shaped(
 async fn put_record_field(
     db: &PvDatabase,
     cn: &ChannelName,
-    epics: EpicsValue,
+    (epics, char_address): (EpicsValue, bool),
     opts: &PutOptions,
 ) -> Result<(), OpError> {
-    db.put_field_from_client(&cn.record, &cn.field, epics, opts.process, opts.block)
+    // The char address is the `$` name's.
+    let field = if char_address {
+        std::borrow::Cow::Owned(format!("{}$", cn.field))
+    } else {
+        std::borrow::Cow::Borrowed(cn.field.as_str())
+    };
+    db.put_field_from_client(&cn.record, &field, epics, opts.process, opts.block)
         .await
         .map_err(|e| OpError::failed(e.to_string()))
 }
@@ -1519,6 +2441,49 @@ fn put_options_from_ctx(ctx: &crate::server_native::ChannelContext) -> PutOption
         Some(PvField::Structure(s)) => PutOptions::from_pv_request(s, &ctx.log),
         _ => PutOptions::default(),
     }
+}
+
+/// A record channel's PUT payload as the value its field's put path takes,
+/// and whether it goes through the field's char address. A string put to a
+/// `$` channel or a [`ChannelValue::Text`] one is `putLongString`,
+/// `dbPut(DBR_CHAR, str, strlen+1)` (`ioc/iocsource.cpp:511`), and a char
+/// array put to a `$` channel is the same `dbPut(DBR_CHAR)`. Any other string
+/// is `putScalar`'s `DBR_STRING`, `strncpy`'d into a `MAX_STRING_SIZE`
+/// buffer first (`ioc/iocsource.cpp:499-500`).
+fn record_put_value(
+    rec: &epics_base_rs::server::record::RecordCell,
+    cn: &ChannelName,
+    value: &PvField,
+    filters: &FilterChain,
+) -> Result<(EpicsValue, bool), OpError> {
+    use epics_base_rs::server::database::char_view::pva_char_request;
+    let epics = put_payload_to_epics(value)?;
+    // A char array is the `int8_t[]` only a `$` channel serves.
+    let chars = match &epics {
+        EpicsValue::CharArray(_) | EpicsValue::UCharArray(_) if !cn.string_view => None,
+        v => pva_char_request(v),
+    };
+    if let Some(chars) = chars {
+        if cn.string_view {
+            return Ok((chars, true));
+        }
+        let inst = rec.read();
+        if let ChannelValue::Text(_) = ChannelValue::of_record_channel(&inst, &cn.field, filters) {
+            // Only a field pvxs reshaped takes its chars by the `$` name; a
+            // `DBF_CHAR` one already is them.
+            return Ok((chars, plain_re_view(&inst, &cn.field).is_some()));
+        }
+    }
+    let epics = match epics {
+        EpicsValue::String(text) => {
+            let bytes = text.as_bytes();
+            EpicsValue::String(epics_base_rs::types::PvString::from_bytes(
+                &bytes[..bytes.len().min(39)],
+            ))
+        }
+        other => other,
+    };
+    Ok((epics, false))
 }
 
 /// Decode a record PUT payload down to the [`EpicsValue`] the field takes.
@@ -1768,6 +2733,10 @@ fn scalar_to_epics(v: &ScalarValue) -> EpicsValue {
 use crate::error::PvaError;
 
 #[cfg(test)]
+#[path = "post_ring_alloc_tests.rs"]
+mod post_ring_alloc_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::server_native::ChannelContext;
@@ -1780,7 +2749,7 @@ mod tests {
         ChannelContext {
             peer: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 0),
             creds: std::sync::Arc::new(crate::server_native::config::ClientCredentials {
-                account: account.to_string(),
+                account: account.into(),
                 method: method.to_string(),
                 host: host.to_string(),
                 authority: String::new(),
@@ -2085,6 +3054,17 @@ mod tests {
         }
     }
 
+    /// The `name` sub-structure of the tree `snap` fills.
+    fn event_struct(snap: &Snapshot, name: &str) -> PvStructure {
+        let PvField::Structure(root) = snapshot_to_pv_field(snap) else {
+            panic!("an NT root");
+        };
+        match root.get_field(name) {
+            Some(PvField::Structure(s)) => s.clone(),
+            other => panic!("{name} must be a structure, got {other:?}"),
+        }
+    }
+
     /// Names of `desc`'s immediate children, or panic if it is not a struct.
     fn child_names(desc: &FieldDesc) -> Vec<String> {
         let FieldDesc::Structure { fields, .. } = desc else {
@@ -2325,17 +3305,15 @@ mod tests {
     }
 
     #[test]
-    fn build_timestamp_uses_snapshot_acquisition_time_and_user_tag() {
+    fn fill_timestamp_uses_snapshot_acquisition_time_and_user_tag() {
         // pvxs `iocsource.cpp:240-248`: timeStamp carries the record's
         // acquisition time + userTag, not the serialization wall-clock.
         // Inject the exact (secs, nsec); a `SystemTime` rounds 123_456_789 to
-        // 100 ns on Windows before `build_timestamp` ever reads it.
+        // 100 ns on Windows before `fill_timestamp` ever reads it.
         let ts = WallTime::from_unix(1_700_000_000, 123_456_789);
         let mut snap = Snapshot::new(EpicsValue::Double(1.0), 0, 0, ts);
         snap.user_tag = 42;
-        let PvField::Structure(t) = build_timestamp(&snap) else {
-            panic!("timeStamp must be a structure");
-        };
+        let t = event_struct(&snap, "timeStamp");
         assert!(matches!(
             scalar(&t, "secondsPastEpoch"),
             ScalarValue::Long(1_700_000_000)
@@ -2600,15 +3578,13 @@ mod tests {
     }
 
     #[test]
-    fn build_alarm_message_is_condition_string() {
+    fn fill_alarm_message_is_condition_string() {
         // pvxs `iocsource.cpp:226,236`: alarm.message is the condition
         // string for a non-zero status, "" for NO_ALARM.
         let mut snap = Snapshot::new(EpicsValue::Double(1.0), 0, 0, std::time::UNIX_EPOCH);
         snap.alarm.status = alarm_status::HIHI_ALARM;
         snap.alarm.severity = 2;
-        let PvField::Structure(a) = build_alarm(&snap) else {
-            panic!("alarm must be a structure");
-        };
+        let a = event_struct(&snap, "alarm");
         assert!(matches!(
             scalar(&a, "message"),
             ScalarValue::String(s) if s == "HIHI"
@@ -2616,17 +3592,60 @@ mod tests {
 
         // NO_ALARM keeps an empty message.
         let ok = Snapshot::new(EpicsValue::Double(1.0), 0, 0, std::time::UNIX_EPOCH);
-        let PvField::Structure(a) = build_alarm(&ok) else {
-            panic!("alarm must be a structure");
-        };
+        let a = event_struct(&ok, "alarm");
         assert!(matches!(
             scalar(&a, "message"),
             ScalarValue::String(s) if s.is_empty()
         ));
+
+        // A tree that held "HIHI" and is filled in place again with NO_ALARM
+        // serves "", not the old message's bytes.
+        let mut v = snapshot_to_pv_field(&snap);
+        let layout = NtLayout::new(NtShape::of(&ok));
+        fill_nt_event(&mut v, &layout.event, &LogLeaves::of_snapshot(&ok));
+        assert_eq!(v, snapshot_to_pv_field(&ok));
+    }
+
+    /// Every event leaf resolves, on every NT shape, to the member the dotted
+    /// path names in a tree built from that shape.
+    #[test]
+    fn event_leaves_resolve_to_the_named_member() {
+        let values = [
+            EpicsValue::Double(1.0),
+            EpicsValue::Enum(1),
+            EpicsValue::String(PvString::from("s")),
+            EpicsValue::DoubleArray(vec![1.0, 2.0].into()),
+        ];
+        for value in &values {
+            for properties in [PropertySupport::NONE, PropertySupport::NUMERIC] {
+                let shape = NtShape::new(value, properties);
+                let layout = NtLayout::new(shape);
+                let mut tree = crate::pvdata::encode::default_value_for(&shape.desc());
+                let value_path = match value {
+                    EpicsValue::Enum(_) => "value.index",
+                    _ => "value",
+                };
+                let at = layout.event;
+                for (at, path) in [
+                    (at.value, value_path),
+                    (at.severity, "alarm.severity"),
+                    (at.status, "alarm.status"),
+                    (at.message, "alarm.message"),
+                    (at.seconds, "timeStamp.secondsPastEpoch"),
+                    (at.nanoseconds, "timeStamp.nanoseconds"),
+                    (at.user_tag, "timeStamp.userTag"),
+                ] {
+                    let at = at.unwrap_or_else(|| panic!("{shape:?}: {path} unresolved"));
+                    let by_index: *const PvField = at.get(&mut tree).expect(path);
+                    let by_name: *const PvField = leaf_mut(&mut tree, path).expect(path);
+                    assert_eq!(by_index, by_name, "{shape:?}: {path}");
+                }
+            }
+        }
     }
 
     #[test]
-    fn build_alarm_prefers_carried_amsg_over_condition_string() {
+    fn fill_alarm_prefers_carried_amsg_over_condition_string() {
         // pvxs `iocsource.cpp:230-236`: a non-empty carried amsg wins over
         // the synthesized condition string. mbboDirect raises UDF with the
         // bespoke "UDFS" (`mbboDirectRecord.c:191`), so an undefined
@@ -2635,9 +3654,7 @@ mod tests {
         snap.alarm.status = alarm_status::UDF_ALARM;
         snap.alarm.severity = 3;
         snap.alarm.amsg = "UDFS".to_string();
-        let PvField::Structure(a) = build_alarm(&snap) else {
-            panic!("alarm must be a structure");
-        };
+        let a = event_struct(&snap, "alarm");
         assert!(
             matches!(scalar(&a, "message"), ScalarValue::String(s) if s == "UDFS"),
             "non-empty carried amsg must win over the UDF condition string"
@@ -2650,9 +3667,7 @@ mod tests {
         generic.alarm.status = alarm_status::UDF_ALARM;
         generic.alarm.severity = 3;
         assert!(generic.alarm.amsg.is_empty());
-        let PvField::Structure(a) = build_alarm(&generic) else {
-            panic!("alarm must be a structure");
-        };
+        let a = event_struct(&generic, "alarm");
         assert!(
             matches!(scalar(&a, "message"), ScalarValue::String(s) if s == "UDF"),
             "empty amsg must fall back to the condition string"
@@ -2660,22 +3675,18 @@ mod tests {
 
         // Empty amsg with NO_ALARM stays "".
         let ok = Snapshot::new(EpicsValue::Double(1.0), 0, 0, std::time::UNIX_EPOCH);
-        let PvField::Structure(a) = build_alarm(&ok) else {
-            panic!("alarm must be a structure");
-        };
+        let a = event_struct(&ok, "alarm");
         assert!(matches!(scalar(&a, "message"), ScalarValue::String(s) if s.is_empty()));
     }
 
     #[test]
-    fn build_alarm_status_is_pva_class_not_raw_condition() {
+    fn fill_alarm_status_is_pva_class_not_raw_condition() {
         // pvxs `iocsource.cpp:187-223`: emit the alarm *class* (0–6), not
         // the raw EPICS condition. A `LINK_ALARM = 14` must surface as
         // class 3 (RECORD), never 14.
         let mut snap = Snapshot::new(EpicsValue::Double(1.0), 0, 0, std::time::UNIX_EPOCH);
         snap.alarm.status = alarm_status::LINK_ALARM;
-        let PvField::Structure(a) = build_alarm(&snap) else {
-            panic!("alarm must be a structure");
-        };
+        let a = event_struct(&snap, "alarm");
         assert!(
             matches!(scalar(&a, "status"), ScalarValue::Int(3)),
             "LINK_ALARM (14) must map to status class 3 (RECORD)"
@@ -3066,38 +4077,59 @@ mod tests {
         let src = PvDatabaseSource::new(db.clone());
 
         // Boundary: record base name — servable (VAL), both gates true.
-        assert!(src.searchable("ORACLE:AI").await);
-        assert!(src.has_pv("ORACLE:AI").await);
+        assert!(src.searchable(b"ORACLE:AI").await);
+        assert!(src.has_pv(b"ORACLE:AI").await);
 
         // Boundary: an explicitly addressed servable field.
-        assert!(src.searchable("ORACLE:AI.EGU").await);
-        assert!(src.has_pv("ORACLE:AI.EGU").await);
+        assert!(src.searchable(b"ORACLE:AI.EGU").await);
+        assert!(src.has_pv(b"ORACLE:AI.EGU").await);
 
         // Boundary: THE case. `MLOK` is `DBF_NOACCESS` in ai.dbd (a mutex, so
         // this port models no field for it). The record resolves, so search
         // must still answer; the field has no value, so create must refuse.
         // This is the one name where the two gates disagree.
         assert!(
-            src.searchable("ORACLE:AI.MLOK").await,
+            src.searchable(b"ORACLE:AI.MLOK").await,
             "a DBF_NOACCESS field's record resolves, so pvxs answers the \
              SEARCH — withholding it would replace `Refused to create \
              Channel` with a client timeout"
         );
         assert!(
-            !src.has_pv("ORACLE:AI.MLOK").await,
+            !src.has_pv(b"ORACLE:AI.MLOK").await,
             "a DBF_NOACCESS field has no NT, so CREATE_CHANNEL must be refused \
              rather than claimed and later failed with `field introspection \
              unavailable`"
         );
 
+        // Boundary: `$` on a field that does not take it. softIocPVX on
+        // `record(ai,"DL:AI")` / a DOUBLE waveform `DL:WF`: `pvxget DL:AI.VAL$`
+        // and `DL:WF.VAL$` → `Refused to create Channel`; `DL:AI.NOSUCH$` gets
+        // no answer.
+        db.add_record(
+            "DL:WF",
+            Box::new(
+                epics_base_rs::server::records::waveform::WaveformRecord::new(
+                    4,
+                    epics_base_rs::types::DbFieldType::Double,
+                ),
+            ),
+        )
+        .await
+        .unwrap();
+        for name in ["ORACLE:AI.VAL$", "DL:WF.VAL$"] {
+            assert!(src.searchable(name.as_bytes()).await, "{name}");
+            assert!(!src.has_pv(name.as_bytes()).await, "{name}");
+        }
+        assert!(!src.searchable(b"ORACLE:AI.NOSUCH$").await);
+
         // Boundary: a record that does not exist at all — neither gate.
-        assert!(!src.searchable("NO:SUCH:RECORD").await);
-        assert!(!src.has_pv("NO:SUCH:RECORD").await);
+        assert!(!src.searchable(b"NO:SUCH:RECORD").await);
+        assert!(!src.has_pv(b"NO:SUCH:RECORD").await);
 
         // Boundary: a simple PV has no field to narrow, so the stricter create
         // gate must not change its answer.
-        assert!(src.searchable("SIMPLE:PV").await);
-        assert!(src.has_pv("SIMPLE:PV").await);
+        assert!(src.searchable(b"SIMPLE:PV").await);
+        assert!(src.has_pv(b"SIMPLE:PV").await);
     }
 
     /// Regression: a monitor on a *simple* native PV must observe later
@@ -3156,6 +4188,60 @@ mod tests {
         );
     }
 
+    /// A mailbox PV's monitor reads the PV's metadata at delivery, as its
+    /// GET does: metadata installed after subscribe reaches the next update.
+    #[epics_macros_rs::epics_test]
+    async fn a_simple_pv_monitor_reads_its_metadata_at_delivery() {
+        use epics_base_rs::server::pv::PvMetadata;
+        use epics_base_rs::server::snapshot::DisplayInfo;
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_pv("SIMPLE:META", EpicsValue::Double(1.0))
+            .await
+            .unwrap();
+        let src = PvDatabaseSource::new(db.clone());
+        let mut rx = src
+            .subscribe_ctx("SIMPLE:META", make_ctx("127.0.0.1", "anon", "ca"))
+            .await
+            .expect("subscribe to simple PV");
+        rx.recv().await.expect("initial monitor snapshot");
+
+        db.find_pv("SIMPLE:META")
+            .expect("the PV")
+            .set_metadata(PvMetadata {
+                display: Some(DisplayInfo {
+                    units: "um".into(),
+                    ..Default::default()
+                }),
+                control: None,
+                enums: None,
+            });
+        src.put_value_ctx(
+            "SIMPLE:META",
+            pv_double(2.0),
+            make_ctx("127.0.0.1", "anon", "ca"),
+        )
+        .await
+        .expect("PUT must succeed");
+        let updated =
+            epics_base_rs::runtime::task::timeout(std::time::Duration::from_secs(2), rx.recv())
+                .await
+                .expect("monitor must receive the PUT update within 2s")
+                .expect("monitor stream still open");
+        let PvField::Structure(root) = &updated else {
+            panic!("an NTScalar root")
+        };
+        let units = match root.get_field("display") {
+            Some(PvField::Structure(d)) => d.get_field("units").cloned(),
+            _ => None,
+        };
+        assert_eq!(
+            units,
+            Some(PvField::Scalar(ScalarValue::String("um".into()))),
+            "the update carries the metadata read at delivery"
+        );
+    }
+
     /// Regression: PVA PUT must be gated through ACF when
     /// the source was built with ACF enforcement. Pre-fix the PVA
     /// server stored ACF only as `#[allow(dead_code)]` and never
@@ -3182,7 +4268,7 @@ ASG(SECURE) {
             .unwrap();
         // Mark the record as belonging to the SECURE ASG.
         let rec = db.get_record("AI:SECURE").unwrap();
-        rec.write().common.asg = "SECURE".to_string();
+        rec.write().common.text.asg = "SECURE".to_string();
 
         let source = PvDatabaseSource::new_with_acf(
             db.clone(),
@@ -3238,7 +4324,7 @@ ASG(LOCKED) {
             .await
             .unwrap();
         let rec = db.get_record("AI:LOCKED").unwrap();
-        rec.write().common.asg = "LOCKED".to_string();
+        rec.write().common.text.asg = "LOCKED".to_string();
 
         let source = PvDatabaseSource::new_with_acf(
             db.clone(),
@@ -3278,7 +4364,7 @@ ASG(LOCKED) {
             .await
             .unwrap();
         let rec = db.get_record("AI:MON").unwrap();
-        rec.write().common.asg = "LOCKED".to_string();
+        rec.write().common.text.asg = "LOCKED".to_string();
 
         let source = PvDatabaseSource::new_with_acf(
             db.clone(),
@@ -3321,7 +4407,7 @@ ASG(SECURE) {
             .await
             .unwrap();
         let rec = db.get_record("AI:LIVE").unwrap();
-        rec.write().common.asg = "SECURE".to_string();
+        rec.write().common.text.asg = "SECURE".to_string();
 
         let source = PvDatabaseSource::new_with_acf(db.clone(), cell.clone());
 
@@ -3407,7 +4493,7 @@ ASG(LOCKED) {
         db.add_record("AI:LOCKED", Box::new(AiRecord::new(7.5)))
             .await
             .unwrap();
-        db.get_record("AI:LOCKED").unwrap().write().common.asg = "LOCKED".into();
+        db.get_record("AI:LOCKED").unwrap().write().common.text.asg = "LOCKED".into();
 
         let source = PvDatabaseSource::new_with_acf(
             db.clone(),
@@ -3439,7 +4525,7 @@ ASG(LOCKED) {
 
     /// The same denial on the path the wire actually takes.
     ///
-    /// Every native GET, PUT_GET readback and monitor seed calls
+    /// Every native GET, PUT readback and monitor seed calls
     /// `read_checked` ([`crate::server_native::tcp`] `:5079`, `:7365`,
     /// `:7506`), never `get_value_checked`; the wire layer mints the
     /// `AccessChecked` and hands it over without inspecting it, so the token
@@ -3463,7 +4549,7 @@ ASG(LOCKED) {
         db.add_record("AI:LOCKED", Box::new(AiRecord::new(7.5)))
             .await
             .unwrap();
-        db.get_record("AI:LOCKED").unwrap().write().common.asg = "LOCKED".into();
+        db.get_record("AI:LOCKED").unwrap().write().common.text.asg = "LOCKED".into();
 
         let source = PvDatabaseSource::new_with_acf(
             db.clone(),
@@ -3494,6 +4580,78 @@ ASG(LOCKED) {
             "intruder must be denied on the read path too; got {:?}",
             read.map(|r| r.value)
         );
+    }
+
+    /// softIocPVX 1.5.3 on `record(ai, "T")`: `pvxget 'T.VAL{"ts":{"num":
+    /// "sec"}}'` serves `value uint32_t` and no `display.precision`, while
+    /// `{"num":"dbl"}` serves `value double` and `display.precision`. pvxs
+    /// reads the options at the type the filters leave the log
+    /// (`dbAccess.c:341-348,387-394`).
+    #[epics_macros_rs::epics_test]
+    async fn a_ts_value_mode_reads_its_options_at_the_type_it_serves() {
+        use crate::server_native::source::ChannelSource;
+        use epics_base_rs::server::records::ai::AiRecord;
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("T", Box::new(AiRecord::new(1.0)))
+            .await
+            .unwrap();
+        let source = PvDatabaseSource::new(db.clone());
+        let ctx = make_ctx("anyhost", "alice", "anonymous");
+        for (name, uint, precision) in [
+            (r#"T.VAL{"ts":{"num":"sec"}}"#, true, false),
+            (r#"T.VAL{"ts":{"num":"dbl"}}"#, false, true),
+        ] {
+            let checked = source
+                .access()
+                .check(name, "anyhost", "alice", "anonymous", "")
+                .await;
+            let mut read = source
+                .read_checked(checked, ctx.clone())
+                .await
+                .expect("served");
+            let marked = read.marked.clone().unwrap_or_default();
+            assert_eq!(
+                marked.iter().any(|l| l == "display.precision"),
+                precision,
+                "{name}: {marked:?}"
+            );
+            let value = leaf_mut(&mut read.value, "value").expect("value");
+            assert_eq!(
+                matches!(value, PvField::Scalar(ScalarValue::UInt(_))),
+                uint,
+                "{name}: {value:?}"
+            );
+        }
+    }
+
+    /// softIocPVX prints `dbChannelCreate: Channel filter 'bad' not found`
+    /// once per create of `Y.VAL{"bad":{}}` (`pvxget` makes two creates and
+    /// two lines), and refuses the channel.
+    #[epics_macros_rs::epics_test]
+    async fn create_with_an_unknown_filter_prints_the_line_once() {
+        use crate::server_native::source::ChannelSource;
+        use epics_base_rs::server::records::ai::AiRecord;
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("Y", Box::new(AiRecord::new(2.0)))
+            .await
+            .unwrap();
+        let source = PvDatabaseSource::new(db.clone());
+        let heard = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sink = heard.clone();
+        let id = epics_base_rs::runtime::log::errlog_add_listener(move |m| {
+            sink.lock().unwrap().push(m.to_string());
+        });
+        assert!(!source.has_pv(br#"Y.VAL{"bad":{}}"#).await);
+        epics_base_rs::runtime::log::errlog_flush();
+        epics_base_rs::runtime::log::errlog_remove_listener(id);
+        let lines = heard.lock().unwrap().clone();
+        let n = lines
+            .iter()
+            .filter(|l| l.contains("dbChannelCreate: Channel filter 'bad' not found"))
+            .count();
+        assert_eq!(n, 1, "{lines:?}");
     }
 
     /// A GET through a `dbnd` channel must move the baseline that channel's
@@ -3528,7 +4686,8 @@ ASG(LOCKED) {
             "the GET must be served (dbnd drops the read, so it falls back to the raw field)"
         );
 
-        let ch = channel_for(&source.channels, name, ctx.peer).expect("the GET minted the channel");
+        let ch = channel_for(&source.db, &source.channels, name.as_bytes(), ctx.peer)
+            .expect("the GET minted the channel");
         assert!(
             ch.value_filters
                 .apply_to_event_value(EpicsValue::Double(105.0), EventMask::VALUE)
@@ -3545,7 +4704,7 @@ ASG(LOCKED) {
         // Control, so this test carries its own fails-first evidence: a chain
         // minted per operation — the pre-fix shape — still holds the `NaN`
         // baseline `parse_ok` seeded (`dbnd.c:61`) and passes the same 105.0.
-        let (_, per_operation) = resolve_channel(name).unwrap();
+        let (_, per_operation) = resolve_channel(&db, name.as_bytes()).unwrap();
         assert!(
             per_operation
                 .apply_to_event_value(EpicsValue::Double(105.0), EventMask::VALUE)
@@ -3574,19 +4733,19 @@ ASG(LOCKED) {
         let mut ctx_b = make_ctx("hostb", "bob", "anonymous");
         ctx_b.peer = "127.0.0.1:5002".parse().unwrap();
 
-        let first = channel_for(&source.channels, name, ctx_a.peer).unwrap();
-        let again = channel_for(&source.channels, name, ctx_a.peer).unwrap();
+        let first = channel_for(&source.db, &source.channels, name.as_bytes(), ctx_a.peer).unwrap();
+        let again = channel_for(&source.db, &source.channels, name.as_bytes(), ctx_a.peer).unwrap();
         assert!(
             Arc::ptr_eq(&first, &again),
             "every operation of one peer's channel shares the one object"
         );
-        let other = channel_for(&source.channels, name, ctx_b.peer).unwrap();
+        let other = channel_for(&source.db, &source.channels, name.as_bytes(), ctx_b.peer).unwrap();
         assert!(
             !Arc::ptr_eq(&first, &other),
             "a second peer's channel owns its own filter state"
         );
 
-        source.notify_channel_close(name, &ctx_a);
+        source.notify_channel_close(name.as_bytes(), &ctx_a);
         assert!(
             source.channels.lock().get(&ctx_a.peer).is_none(),
             "closing the channel drops the peer's map entirely once empty"
@@ -3624,7 +4783,7 @@ ASG(LOCKED) {
             .await
             .expect("ulong PUT must succeed");
 
-        let snap = snapshot_for(&db, "UL:SCALAR").await.unwrap();
+        let snap = snapshot_for(&db, b"UL:SCALAR").await.unwrap();
         assert_eq!(
             snap.value,
             EpicsValue::UInt64(big),
@@ -3662,7 +4821,7 @@ ASG(LOCKED) {
             .await
             .expect("ulong[] PUT must succeed");
 
-        let snap = snapshot_for(&db, "UL:WF").await.unwrap();
+        let snap = snapshot_for(&db, b"UL:WF").await.unwrap();
         assert_eq!(
             snap.value,
             EpicsValue::UInt64Array(values.into()),
@@ -3701,7 +4860,7 @@ ASG(LOCKED) {
             .await
             .expect("wire-decoded ulong[] PUT must succeed");
 
-        let snap = snapshot_for(&db, "UL:WFT").await.unwrap();
+        let snap = snapshot_for(&db, b"UL:WFT").await.unwrap();
         assert_eq!(
             snap.value,
             EpicsValue::UInt64Array(values.into()),
@@ -3735,7 +4894,7 @@ ASG(LOCKED) {
             .await
             .expect("uint PUT must succeed");
 
-        let snap = snapshot_for(&db, "UI:SCALAR").await.unwrap();
+        let snap = snapshot_for(&db, b"UI:SCALAR").await.unwrap();
         assert_eq!(
             snap.value,
             EpicsValue::Int64(i64::from(big)),
@@ -3771,7 +4930,7 @@ ASG(LOCKED) {
             .await
             .expect("uint[] PUT must succeed");
 
-        let snap = snapshot_for(&db, "UI:WF").await.unwrap();
+        let snap = snapshot_for(&db, b"UI:WF").await.unwrap();
         assert_eq!(
             snap.value,
             EpicsValue::Int64Array(values.iter().map(|v| i64::from(*v)).collect()),
@@ -3805,7 +4964,7 @@ ASG(LOCKED) {
             .await
             .expect("wire-decoded uint[] PUT must succeed");
 
-        let snap = snapshot_for(&db, "UI:WFT").await.unwrap();
+        let snap = snapshot_for(&db, b"UI:WFT").await.unwrap();
         assert_eq!(
             snap.value,
             EpicsValue::Int64Array(values.iter().map(|v| i64::from(*v)).collect()),
@@ -3839,7 +4998,7 @@ ASG(LOCKED) {
             .await
             .expect("uint PUT must succeed");
 
-        let snap = snapshot_for(&db, "UI:LO").await.unwrap();
+        let snap = snapshot_for(&db, b"UI:LO").await.unwrap();
         assert_eq!(
             snap.value,
             EpicsValue::Long(-1),
@@ -3874,7 +5033,7 @@ ASG(LOCKED) {
             .await
             .expect("uint[] PUT must succeed");
 
-        let snap = snapshot_for(&db, "UI:WFL").await.unwrap();
+        let snap = snapshot_for(&db, b"UI:WFL").await.unwrap();
         assert_eq!(
             snap.value,
             EpicsValue::LongArray(vec![1, 2, -1].into()),
@@ -3911,7 +5070,7 @@ ASG(LOCKED) {
             .await
             .expect("empty double[] PUT must be accepted, not rejected");
 
-        let snap = snapshot_for(&db, "EMPTY:DBL").await.unwrap();
+        let snap = snapshot_for(&db, b"EMPTY:DBL").await.unwrap();
         assert_eq!(
             snap.value,
             EpicsValue::DoubleArray(vec![].into()),
@@ -3941,7 +5100,7 @@ ASG(LOCKED) {
             .await
             .expect("empty string[] PUT must be accepted, not rejected");
 
-        let snap = snapshot_for(&db, "EMPTY:STR").await.unwrap();
+        let snap = snapshot_for(&db, b"EMPTY:STR").await.unwrap();
         assert_eq!(
             snap.value,
             EpicsValue::StringArray(vec![].into()),
@@ -3971,7 +5130,7 @@ ASG(LOCKED) {
             .await
             .expect("empty int[] PUT must be accepted, not rejected");
 
-        let snap = snapshot_for(&db, "EMPTY:INT").await.unwrap();
+        let snap = snapshot_for(&db, b"EMPTY:INT").await.unwrap();
         assert_eq!(
             snap.value,
             EpicsValue::LongArray(vec![].into()),
@@ -4028,7 +5187,7 @@ ASG(LOCKED) {
 
         // Read the snapshot back; the simple PV must have persisted the
         // client-supplied alarm + timeStamp, not local defaults.
-        let snap = snapshot_for(&db, "MB:PV").await.unwrap();
+        let snap = snapshot_for(&db, b"MB:PV").await.unwrap();
         assert_eq!(snap.value, EpicsValue::Double(42.5), "value");
         assert_eq!(snap.alarm.severity, 2, "alarm.severity persisted");
         assert_eq!(snap.alarm.status, 3, "alarm.status persisted");
@@ -4110,61 +5269,6 @@ ASG(DEFAULT) {
             )
             .await
             .expect("ASL=0 record must match RULE(2, WRITE)");
-    }
-
-    /// PVA-61 regression: a record-backed PROCESS must run the record's
-    /// processing chain, not the no-op default success. A `CALC="5"`
-    /// record evaluates the expression into VAL on process, so VAL flips
-    /// from its unprocessed default (0) to 5 — proof the chain ran, which
-    /// the old no-op `Ok(())` could never produce.
-    #[epics_macros_rs::epics_test]
-    async fn process_runs_record_processing_not_noop() {
-        use epics_base_rs::server::records::calc::CalcRecord;
-
-        let db = Arc::new(PvDatabase::new());
-        db.add_record("CALC:PROC", Box::new(CalcRecord::new("5")))
-            .await
-            .unwrap();
-        let source = PvDatabaseSource::new(db.clone());
-        let ctx = make_ctx("localhost", "op", "ca");
-
-        // Unprocessed default.
-        let before = source
-            .get_value_ctx("CALC:PROC", ctx.clone())
-            .await
-            .expect("initial get");
-        assert_eq!(
-            extract_put_value_leaf(&before),
-            Some(PvField::Scalar(ScalarValue::Double(0.0))),
-            "VAL starts at the unprocessed default"
-        );
-
-        // PROCESS via the WRITE-gated checked path (no ACF → allowed).
-        let checked = source
-            .access()
-            .check(
-                "CALC:PROC",
-                &ctx.creds.host,
-                &ctx.creds.account,
-                &ctx.creds.method,
-                "",
-            )
-            .await;
-        source
-            .process_checked(checked, ctx.clone())
-            .await
-            .expect("PROCESS must succeed");
-
-        // The CALC expression was evaluated into VAL: the chain ran.
-        let after = source
-            .get_value_ctx("CALC:PROC", ctx.clone())
-            .await
-            .expect("post-process get");
-        assert_eq!(
-            extract_put_value_leaf(&after),
-            Some(PvField::Scalar(ScalarValue::Double(5.0))),
-            "record PROCESS must evaluate CALC into VAL, not no-op"
-        );
     }
 
     /// An external PVA PUT on a record-backed channel owes C `dbPutField`,
@@ -4290,6 +5394,376 @@ ASG(DEFAULT) {
         }
     }
 
+    /// STOP takes both subscriptions off the record, so a post made while
+    /// stopped is never queued: pvxs `onStart(false)` ⇒ `db_event_disable`
+    /// (`singlesource.cpp:170-179`, `dbEvent.c:524`), which unlinks the event
+    /// from `mlis`. START and RESUME post the current value instead
+    /// (`subscriptionctx.h:56-57`; pinned in `monitor_seed_mask.rs`).
+    #[epics_macros_rs::epics_test]
+    async fn a_stopped_record_monitor_drops_posts_until_resumed() {
+        use epics_base_rs::server::records::ai::AiRecord;
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("AI:GATE", Box::new(AiRecord::new(0.0)))
+            .await
+            .unwrap();
+        let source = PvDatabaseSource::new(db.clone());
+        let ctx = make_ctx("localhost", "op", "ca");
+        let checked = source
+            .access()
+            .check(
+                "AI:GATE",
+                &ctx.creds.host,
+                &ctx.creds.account,
+                &ctx.creds.method,
+                "",
+            )
+            .await;
+        let seed = source
+            .subscribe_seeded(checked, ctx, Default::default())
+            .await
+            .expect("record subscribe");
+        let gate = seed.on_start.expect("a record monitor carries a STOP gate");
+        let mut rx = seed.updates;
+        let put = |v: f64| {
+            let db = db.clone();
+            async move {
+                db.put_record_field_from_ca_no_notify("AI:GATE", "VAL", EpicsValue::Double(v))
+                    .await
+                    .expect("put");
+            }
+        };
+        let value = |u: crate::server_native::source::MonitorUpdate| match &*u.value {
+            PvField::Structure(top) => top.get_field("value").cloned(),
+            other => panic!("expected an NTScalar, got {other:?}"),
+        };
+        let quiet = std::time::Duration::from_millis(300);
+        let within = std::time::Duration::from_secs(2);
+
+        let double = |v: f64| Some(PvField::Scalar(ScalarValue::Double(v)));
+
+        gate.set_active(true).await;
+        let u = epics_base_rs::runtime::task::timeout(within, rx.recv())
+            .await
+            .expect("START posts the current value");
+        assert_eq!(value(u.expect("open")), double(0.0));
+        put(1.0).await;
+        let u = epics_base_rs::runtime::task::timeout(within, rx.recv())
+            .await
+            .expect("a started monitor posts");
+        assert_eq!(value(u.expect("open")), double(1.0));
+
+        gate.set_active(false).await;
+        put(2.0).await;
+        put(2.5).await;
+        gate.set_active(true).await;
+        // RESUME is `enable()` again: each half posts the current value.
+        for half in ["value", "property"] {
+            let u = epics_base_rs::runtime::task::timeout(within, rx.recv())
+                .await
+                .unwrap_or_else(|_| panic!("RESUME posts the {half} half's current value"));
+            assert_eq!(value(u.expect("open")), double(2.5));
+        }
+        assert!(
+            epics_base_rs::runtime::task::timeout(quiet, rx.recv())
+                .await
+                .is_err(),
+            "a post made while stopped must not be delivered, on RESUME or after"
+        );
+
+        put(3.0).await;
+        let u = epics_base_rs::runtime::task::timeout(within, rx.recv())
+            .await
+            .expect("a resumed monitor posts");
+        assert_eq!(value(u.expect("open")), double(3.0));
+    }
+
+    /// The record's post carries its raw stamp (`dbEvent.c:710`); the PVA
+    /// monitor serves it split along the `Q:time:tag` mask its channel read
+    /// once (pvxs `singlesrcsubscriptionctx.h:28-30`, `iocsource.cpp:239-248`).
+    #[epics_macros_rs::epics_test]
+    async fn a_qtime_tag_record_monitor_serves_the_split_stamp() {
+        use epics_base_rs::server::records::ai::AiRecord;
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("AI:QTAG", Box::new(AiRecord::new(0.0)))
+            .await
+            .unwrap();
+        let rec = db.get_record("AI:QTAG").unwrap();
+        rec.write().set_info("Q:time:tag", "nsec:lsb:20");
+        let source = PvDatabaseSource::new(db.clone());
+        let ctx = make_ctx("localhost", "op", "ca");
+        let checked = source
+            .access()
+            .check(
+                "AI:QTAG",
+                &ctx.creds.host,
+                &ctx.creds.account,
+                &ctx.creds.method,
+                "",
+            )
+            .await;
+        let mut rx = source
+            .subscribe_checked_opts_marked(checked, ctx, Default::default())
+            .await
+            .expect("record subscribe");
+        // A tag set after subscribe is not the channel's: pvxs reads it once.
+        rec.write().set_info("Q:time:tag", "nsec:lsb:4");
+
+        db.put_record_field_from_ca_no_notify("AI:QTAG", "VAL", EpicsValue::Double(2.0))
+            .await
+            .expect("put");
+        let update =
+            epics_base_rs::runtime::task::timeout(std::time::Duration::from_secs(2), rx.recv())
+                .await
+                .expect("an update must post within 2s")
+                .expect("stream open");
+
+        let raw = rec.read().common.time;
+        let mask = (1u32 << 20) - 1;
+        let PvField::Structure(top) = &*update.value else {
+            panic!("an NTScalar is a structure");
+        };
+        let Some(PvField::Structure(ts)) = top.get_field("timeStamp") else {
+            panic!("an NTScalar carries timeStamp");
+        };
+        assert!(matches!(
+            scalar(ts, "secondsPastEpoch"),
+            ScalarValue::Long(s) if s == raw.unix_secs() as i64
+        ));
+        assert!(matches!(
+            scalar(ts, "nanoseconds"),
+            ScalarValue::Int(n) if n as u32 == raw.subsec_nanos() & !mask
+        ));
+        assert!(matches!(
+            scalar(ts, "userTag"),
+            ScalarValue::Int(t) if t as u32 == raw.subsec_nanos() & mask
+        ));
+    }
+
+    /// Every record monitor of one source attaches to its one `qsrvSingle`
+    /// drain (`singlesource.cpp:396-416`), which ends with the last monitor:
+    /// two monitors run one drain thread, and both see their own record.
+    #[epics_macros_rs::epics_test]
+    async fn record_monitors_share_the_sources_one_drain() {
+        use epics_base_rs::server::records::ai::AiRecord;
+
+        let db = Arc::new(PvDatabase::new());
+        for name in ["AI:A", "AI:B"] {
+            db.add_record(name, Box::new(AiRecord::new(0.0)))
+                .await
+                .unwrap();
+        }
+        let source = PvDatabaseSource::new(db.clone());
+        let ctx = make_ctx("localhost", "op", "ca");
+        let mut streams = Vec::new();
+        for name in ["AI:A", "AI:B"] {
+            let checked = source
+                .access()
+                .check(
+                    name,
+                    &ctx.creds.host,
+                    &ctx.creds.account,
+                    &ctx.creds.method,
+                    "",
+                )
+                .await;
+            streams.push(
+                source
+                    .subscribe_checked_opts_marked(checked, ctx.clone(), Default::default())
+                    .await
+                    .expect("record subscribe"),
+            );
+        }
+        assert_eq!(source.events.live_drains(), 1, "two monitors, one drain");
+
+        for (name, v) in [("AI:A", 1.0), ("AI:B", 2.0)] {
+            db.put_record_field_from_ca_no_notify(name, "VAL", EpicsValue::Double(v))
+                .await
+                .expect("put");
+        }
+        for (rx, v) in streams.iter_mut().zip([1.0, 2.0]) {
+            let update =
+                epics_base_rs::runtime::task::timeout(std::time::Duration::from_secs(2), rx.recv())
+                    .await
+                    .expect("an update must post within 2s")
+                    .expect("stream open");
+            assert_eq!(
+                extract_put_value_leaf(&update.value),
+                Some(PvField::Scalar(ScalarValue::Double(v)))
+            );
+        }
+
+        drop(streams);
+        for _ in 0..200 {
+            if source.events.live_drains() == 0 {
+                return;
+            }
+            epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("the drain outlived its last monitor");
+    }
+
+    /// A subscribe whose metadata read waits behind its record's writer holds
+    /// nothing the shared drain needs: both halves stay disabled until the
+    /// transform is armed (`singlesource.cpp:147-180`), so the record's post
+    /// queues nothing and a second monitor on the source still receives its.
+    #[epics_macros_rs::epics_test]
+    async fn a_subscribe_waiting_on_its_record_does_not_stall_the_drain() {
+        use epics_base_rs::server::recgbl::EventMask;
+        use epics_base_rs::server::records::ai::AiRecord;
+        use std::sync::mpsc::channel;
+
+        let db = Arc::new(PvDatabase::new());
+        for name in ["AI:A", "AI:B"] {
+            db.add_record(name, Box::new(AiRecord::new(0.0)))
+                .await
+                .unwrap();
+        }
+        // One set per record, as iocInit leaves two unlinked records.
+        db.build_lock_sets();
+        let source = PvDatabaseSource::new(db.clone());
+        let ctx = make_ctx("localhost", "op", "ca");
+        let checked = source
+            .access()
+            .check(
+                "AI:B",
+                &ctx.creds.host,
+                &ctx.creds.account,
+                &ctx.creds.method,
+                "",
+            )
+            .await;
+        let mut b = source
+            .subscribe_checked_opts_marked(checked, ctx.clone(), Default::default())
+            .await
+            .expect("record subscribe");
+
+        let rec_a = db.get_record("AI:A").unwrap();
+        let (entered, entered_rx) = channel();
+        let (locked, locked_rx) = channel();
+        let (release, release_rx) = channel::<()>();
+        let (posted, posted_rx) = channel();
+        let subscriber = {
+            let (events, db, rec_a) = (source.events.clone(), db.clone(), rec_a.clone());
+            std::thread::spawn(move || {
+                let chain = FilterChain::new();
+                let stream = attach_record_pair(
+                    &events,
+                    &db,
+                    RecordPair {
+                        path: b"AI:A",
+                        value_mask: (EventMask::VALUE | EventMask::ALARM).bits(),
+                        filters: [&chain, &chain],
+                        dollar: None,
+                        limit: 4,
+                    },
+                    || {
+                        entered.send(()).unwrap();
+                        locked_rx.recv().unwrap();
+                        // The GET-door read, behind the writer.
+                        drop(rec_a.read());
+                        Some(|_| None::<PvField>)
+                    },
+                );
+                assert!(matches!(stream, Ok(Some(_))));
+            })
+        };
+        let writer = std::thread::spawn(move || {
+            entered_rx.recv().unwrap();
+            let mut held = rec_a.write();
+            locked.send(()).unwrap();
+            held.notify_field("VAL", EventMask::VALUE);
+            posted.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+
+        // AI:A's post is queued ahead of AI:B's.
+        posted_rx.recv().unwrap();
+        db.get_record("AI:B")
+            .unwrap()
+            .write()
+            .notify_field("VAL", EventMask::VALUE);
+        let update =
+            epics_base_rs::runtime::task::timeout(std::time::Duration::from_secs(2), b.recv())
+                .await
+                .map(|u| u.expect("stream open"));
+        release.send(()).unwrap();
+        writer.join().unwrap();
+        subscriber.join().unwrap();
+        update.expect("AI:B's post must reach its monitor within 2s");
+    }
+
+    /// A metadata change reaches the client through the GET door, not the
+    /// event: `EGU` posts `DBE_PROPERTY`, the property half rereads, and both
+    /// that post and every value post after it carry the new units.
+    #[epics_macros_rs::epics_test]
+    async fn an_egu_put_reaches_updates_through_the_metadata_door() {
+        use epics_base_rs::server::records::ai::AiRecord;
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("AI:EGU", Box::new(AiRecord::new(0.0)))
+            .await
+            .unwrap();
+        let source = PvDatabaseSource::new(db.clone());
+        let ctx = make_ctx("localhost", "op", "ca");
+        let checked = source
+            .access()
+            .check(
+                "AI:EGU",
+                &ctx.creds.host,
+                &ctx.creds.account,
+                &ctx.creds.method,
+                "",
+            )
+            .await;
+        let mut rx = source
+            .subscribe_checked_opts_marked(checked, ctx, Default::default())
+            .await
+            .expect("record subscribe");
+        let units = |u: &crate::server_native::MonitorUpdate| {
+            let PvField::Structure(root) = &*u.value else {
+                panic!("an NTScalar root")
+            };
+            match root.get_field("display").and_then(|d| match d {
+                PvField::Structure(d) => d.get_field("units"),
+                _ => None,
+            }) {
+                Some(PvField::Scalar(ScalarValue::String(s))) => s.to_string(),
+                other => panic!("display.units: {other:?}"),
+            }
+        };
+        let next = async |rx: &mut MonitorStream<crate::server_native::MonitorUpdate>| {
+            epics_base_rs::runtime::task::timeout(std::time::Duration::from_secs(2), rx.recv())
+                .await
+                .expect("an update must post within 2s")
+                .expect("stream open")
+        };
+
+        db.put_record_field_from_ca_no_notify("AI:EGU", "EGU", EpicsValue::String("mm".into()))
+            .await
+            .expect("put EGU");
+        let property = next(&mut rx).await;
+        assert!(
+            property
+                .marked
+                .as_ref()
+                .is_some_and(|m| m.iter().any(|l| l == "display.units")),
+            "the EGU post marks display.units"
+        );
+        assert_eq!(units(&property), "mm");
+
+        db.put_record_field_from_ca_no_notify("AI:EGU", "VAL", EpicsValue::Double(1.0))
+            .await
+            .expect("put VAL");
+        let value = next(&mut rx).await;
+        assert_eq!(
+            units(&value),
+            "mm",
+            "a value post keeps the last read's units"
+        );
+    }
+
     /// The event-class rule keys on the event's OWN mask, so the alarm triple
     /// rides `DBE_ALARM` only. Measured on `softIocPVX`: a driven `longin`
     /// posts value+alarm+timeStamp on update 1 (UDF -> NO_ALARM changed the
@@ -4388,23 +5862,24 @@ ASG(DEFAULT) {
         use epics_base_rs::server::recgbl::EventMask;
         use epics_base_rs::server::snapshot::Snapshot;
 
-        let mk = |mask: EventMask| epics_base_rs::server::pv::MonitorEvent {
-            snapshot: std::sync::Arc::new(Snapshot::new(
-                EpicsValue::Double(1.0),
-                0,
-                0,
-                std::time::SystemTime::now(),
-            )),
-            origin: 0,
-            mask,
+        let mk = |mask: EventMask| {
+            epics_base_rs::server::pv::MonitorEvent::read_log(
+                &mut Snapshot::new(EpicsValue::Double(1.0), 0, 0, std::time::SystemTime::now()),
+                mask,
+            )
         };
 
+        let mut ring = PostRing::new(
+            4,
+            Snapshot::new(EpicsValue::Double(1.0), 0, 0, std::time::SystemTime::now()),
+        );
         assert!(
-            marked_update(mk(EventMask::from_bits(0))).is_none(),
+            marked_update(&mut ring, mk(EventMask::from_bits(0)), 0, || None).is_none(),
             "a class that marks no leaf has no wire meaning — C assigns none \
              either, so it must not reach the client as an update"
         );
-        let value = marked_update(mk(EventMask::VALUE)).expect("a DBE_VALUE post is an update");
+        let value = marked_update(&mut ring, mk(EventMask::VALUE), 0, || None)
+            .expect("a DBE_VALUE post is an update");
         assert!(
             value
                 .marked
@@ -4413,6 +5888,57 @@ ASG(DEFAULT) {
                 .any(|m| m == "value"),
             "the positive control: a marking event still comes through"
         );
+    }
+
+    /// Value pairs whose second post changes the NT shape.
+    fn shape_changes() -> [(EpicsValue, EpicsValue); 2] {
+        [
+            (EpicsValue::Double(1.0), EpicsValue::Enum(2)),
+            (EpicsValue::Enum(1), EpicsValue::Double(5.0)),
+        ]
+    }
+
+    /// A shape change between two posts on one `PostRing` serves the tree a
+    /// fresh ring serves for the second post — the new shape's tree, filled
+    /// through its own member indices. A scalar slot takes any scalar, so a
+    /// value check alone passes a stale layout.
+    #[test]
+    fn post_ring_serves_the_new_shape_across_a_shape_change() {
+        use epics_base_rs::server::snapshot::Snapshot;
+        let snap = |v: &EpicsValue| Snapshot::new(v.clone(), 0, 0, std::time::UNIX_EPOCH);
+        for (first, second) in shape_changes() {
+            let mut ring = PostRing::new(4, snap(&first));
+            ring.post(&LogLeaves::of_snapshot(&snap(&first)));
+            let served = ring
+                .post(&LogLeaves::of_snapshot(&snap(&second)))
+                .into_owned();
+            let fresh = PostRing::new(4, snap(&first))
+                .post(&LogLeaves::of_snapshot(&snap(&second)))
+                .into_owned();
+            assert_eq!(served, fresh, "{first:?} then {second:?}");
+        }
+    }
+
+    /// The same for the plain record transform, which keeps its layout
+    /// across events.
+    #[test]
+    fn plain_record_field_serves_the_new_shape_across_a_shape_change() {
+        use epics_base_rs::server::recgbl::EventMask;
+        use epics_base_rs::server::snapshot::Snapshot;
+        let snap = |v: &EpicsValue| Snapshot::new(v.clone(), 0, 0, std::time::UNIX_EPOCH);
+        let ev = |v: &EpicsValue| {
+            epics_base_rs::server::pv::MonitorEvent::read_log(&mut snap(v), EventMask::VALUE)
+        };
+        for (first, second) in shape_changes() {
+            let mut meta = snap(&first);
+            let mut layout = None;
+            plain_record_field(&mut meta, &mut layout, ev(&first), 0, || None)
+                .expect("a value post yields a value");
+            let served = plain_record_field(&mut meta, &mut layout, ev(&second), 0, || None);
+            let fresh = plain_record_field(&mut snap(&first), &mut None, ev(&second), 0, || None);
+            assert!(served.is_some(), "a value post yields a value");
+            assert_eq!(served, fresh, "{first:?} then {second:?}");
+        }
     }
 
     /// A record monitor with nothing posted yet reports `Empty` (park), and
@@ -4460,31 +5986,6 @@ ASG(DEFAULT) {
             .expect("stream open");
     }
 
-    /// A simple/mailbox PV has no record body; PROCESS reports unsupported
-    /// rather than silently succeeding.
-    #[epics_macros_rs::epics_test]
-    async fn process_simple_pv_is_unsupported() {
-        let db = Arc::new(PvDatabase::new());
-        db.add_pv("MAILBOX:PV", EpicsValue::Double(1.0))
-            .await
-            .unwrap();
-        let source = PvDatabaseSource::new(db.clone());
-        let ctx = make_ctx("localhost", "op", "ca");
-        let checked = source
-            .access()
-            .check(
-                "MAILBOX:PV",
-                &ctx.creds.host,
-                &ctx.creds.account,
-                &ctx.creds.method,
-                "",
-            )
-            .await;
-        assert!(
-            source.process_checked(checked, ctx).await.is_err(),
-            "PROCESS on a simple PV must be unsupported, not silent success"
-        );
-    }
     /// asTrapWrite parity: a PVA PUT served by the NATIVE source must
     /// fire the EPICS put-logging hook when the matched ACF rule carries
     /// `TRAPWRITE`, exactly as the QSRV bridge and the CA server already
@@ -4512,7 +6013,7 @@ ASG(AUDIT) {
         db.add_record("AI:AUDIT", Box::new(AiRecord::new(0.0)))
             .await
             .unwrap();
-        db.get_record("AI:AUDIT").unwrap().write().common.asg = "AUDIT".to_string();
+        db.get_record("AI:AUDIT").unwrap().write().common.text.asg = "AUDIT".to_string();
 
         let source = PvDatabaseSource::new_with_acf(
             db.clone(),
@@ -4521,15 +6022,15 @@ ASG(AUDIT) {
 
         // Filter by PV so the assertion holds even under a single-process
         // `cargo test` where another test's put shares the registry.
-        type Seen = Arc<Mutex<Vec<(TrapWriteOp, Option<String>, String, String, u32)>>>;
+        type Seen = Arc<Mutex<Vec<(TrapWriteOp, Option<String>, Vec<u8>, String, u32)>>>;
         let seen: Seen = Arc::new(Mutex::new(Vec::new()));
         let sink = seen.clone();
         let _handle = register_trap_write_listener(Arc::new(move |msg| {
-            if msg.pv_name == "AI:AUDIT" {
+            if msg.pv_name == b"AI:AUDIT" {
                 sink.lock().unwrap().push((
                     msg.op,
                     msg.status.map(str::to_string),
-                    msg.user.to_string(),
+                    msg.user.to_vec(),
                     msg.value_str.to_string(),
                     msg.no_elements,
                 ));
@@ -4551,12 +6052,62 @@ ASG(AUDIT) {
         assert_eq!(got[0].1, None, "BeforeWrite carries no status");
         assert_eq!(got[1].0, TrapWriteOp::AfterWrite);
         assert_eq!(got[1].1, Some("ok".to_string()), "successful put -> ok");
-        assert_eq!(got[0].2, "op", "the authenticated account is logged");
+        assert_eq!(got[0].2, b"op", "the authenticated account is logged");
         assert_eq!(got[0].4, 1, "scalar put -> no_elements = 1");
         assert!(
             got[0].3.contains("7.5"),
             "the written value must reach the log: {:?}",
             got[0].3
+        );
+    }
+
+    /// pvxs's `SecurityLogger` logs `dbChannelFinalFieldType`
+    /// (`ioc/securitylogger.h:43-50`), `DBR_CHAR` on a char address: an lso
+    /// VAL with `SIZV` 64 is one under `$` and, reshaped, without it.
+    #[epics_macros_rs::epics_test]
+    async fn native_put_logs_a_char_address_as_dbr_char() {
+        use epics_base_rs::server::access_security::{TrapWriteOp, register_trap_write_listener};
+        use epics_base_rs::types::DbFieldType;
+        use std::sync::Mutex;
+
+        let acf =
+            parse_acf("ASG(AUDIT) {\n RULE(1, READ)\n RULE(1, WRITE, TRAPWRITE)\n}\n").unwrap();
+        let (db, _) = epics_base_rs::server::ioc_builder::IocBuilder::new()
+            .db_string(
+                r#"record(lso, "LS:T") { field(SIZV, "64") field(ASG, "AUDIT") }"#,
+                &HashMap::new(),
+            )
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        let source = PvDatabaseSource::new_with_acf(
+            db,
+            epics_base_rs::server::access_security::new_acf_cell(Some(acf)),
+        );
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let _handle = register_trap_write_listener(Arc::new(move |msg| {
+            if msg.op == TrapWriteOp::BeforeWrite && msg.pv_name.starts_with(b"LS:T") {
+                sink.lock()
+                    .unwrap()
+                    .push((msg.pv_name.to_vec(), msg.dbr_type));
+            }
+        }));
+        for name in ["LS:T.VAL", "LS:T.VAL$"] {
+            source
+                .put_value_ctx(
+                    name,
+                    PvField::Scalar(ScalarValue::String("hi".into())),
+                    make_ctx("lab-pc1", "op", "ca"),
+                )
+                .await
+                .expect(name);
+        }
+        let char = DbFieldType::Char as u16;
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [(b"LS:T.VAL".to_vec(), char), (b"LS:T.VAL$".to_vec(), char)]
         );
     }
 
@@ -4583,7 +6134,7 @@ ASG(PLAIN) {
         db.add_record("AI:PLAIN", Box::new(AiRecord::new(0.0)))
             .await
             .unwrap();
-        db.get_record("AI:PLAIN").unwrap().write().common.asg = "PLAIN".to_string();
+        db.get_record("AI:PLAIN").unwrap().write().common.text.asg = "PLAIN".to_string();
 
         let source = PvDatabaseSource::new_with_acf(
             db.clone(),
@@ -4593,7 +6144,7 @@ ASG(PLAIN) {
         let hits = Arc::new(AtomicUsize::new(0));
         let sink = hits.clone();
         let _handle = register_trap_write_listener(Arc::new(move |msg| {
-            if msg.pv_name == "AI:PLAIN" {
+            if msg.pv_name == b"AI:PLAIN" {
                 sink.fetch_add(1, Ordering::Relaxed);
             }
         }));
@@ -4647,10 +6198,7 @@ ASG(PLAIN) {
     fn has_processed(db: &PvDatabase, record: &str) -> bool {
         let rec = db.get_record(record).expect("record");
         let t = rec.read().common.time;
-        t.duration_since(std::time::UNIX_EPOCH)
-            .expect("post-1970")
-            .as_secs()
-            > 700_000_000
+        t.unix_secs() > 700_000_000
     }
 
     async fn ai_db(name: &str) -> Arc<PvDatabase> {
@@ -4669,6 +6217,167 @@ ASG(PLAIN) {
             .resolve_field("VAL")
             .and_then(|v| v.to_f64())
             .unwrap()
+    }
+
+    /// An NTEnum PUT to `MB` (an mbbo at index 2) whose wire delta carries a
+    /// stale index 1 and marks `value.index` only when `mark_index` is set.
+    async fn enum_delta_put(mark_index: bool, ctx: ChannelContext) -> Arc<PvDatabase> {
+        let (db, _) = epics_base_rs::server::ioc_builder::IocBuilder::new()
+            .db_string(
+                r#"record(mbbo, "MB") { field(ZRST, "A") field(ONST, "B") field(TWST, "C") field(VAL, "2") }"#,
+                &std::collections::HashMap::new(),
+            )
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        let source = PvDatabaseSource::new(db.clone());
+        let desc = Arc::new(source.get_introspection(b"MB").await.expect("desc"));
+        let mut delta = crate::pvdata::encode::default_value_for(&desc);
+        if let PvField::Structure(root) = &mut delta
+            && let Some(PvField::Structure(value)) = root.get_field_mut("value")
+        {
+            value.set("index", PvField::Scalar(ScalarValue::Int(1)));
+        }
+        // NTEnum bits: 0 root, 1 value, 2 value.index.
+        let mut changed = crate::proto::BitSet::new();
+        if mark_index {
+            changed.set(2);
+        }
+        let checked = source
+            .access()
+            .check(
+                "MB",
+                &ctx.creds.host,
+                &ctx.creds.account,
+                &ctx.creds.method,
+                "",
+            )
+            .await;
+        source
+            .put_delta_checked(checked, desc, changed, &delta, ctx)
+            .await
+            .expect("PUT must succeed");
+        db
+    }
+
+    fn mb_index(db: &PvDatabase) -> f64 {
+        val_of(db, "MB")
+    }
+
+    /// pvxs builds each EXEC's value fresh and its non-blocking put writes
+    /// `value.index` marked or not (`serverget.cpp:466-469`,
+    /// `singlesource.cpp:371-380`): an unmarked index lands as 0, never as the
+    /// record's prior index nor the stale delta slot.
+    #[epics_macros_rs::epics_test]
+    async fn unmarked_enum_index_put_writes_zero() {
+        let db = enum_delta_put(false, make_ctx("lab-pc1", "op", "ca")).await;
+        assert_eq!(mb_index(&db), 0.0);
+    }
+
+    #[epics_macros_rs::epics_test]
+    async fn marked_enum_index_put_writes_the_index() {
+        let db = enum_delta_put(true, make_ctx("lab-pc1", "op", "ca")).await;
+        assert_eq!(mb_index(&db), 1.0);
+    }
+
+    /// A blocking put with `value` unmarked is `processRequest`
+    /// (`singlesource.cpp:363-364`): `dbNotify.c:233-252` neither writes nor
+    /// processes.
+    #[epics_macros_rs::epics_test]
+    async fn blocking_unmarked_enum_put_neither_writes_nor_processes() {
+        let ctx = ctx_with_options(&[("block", PvField::Scalar(ScalarValue::Boolean(true)))]);
+        let db = enum_delta_put(false, ctx).await;
+        assert_eq!(mb_index(&db), 2.0);
+        assert!(!has_processed(&db, "MB"));
+    }
+
+    /// A blocking `processRequest` on a PACT record waits on its restart list
+    /// (`dbNotify.c:225-231`), so the reply comes only once the cycle ends.
+    #[epics_macros_rs::epics_test]
+    async fn blocking_unmarked_put_on_a_busy_record_waits_for_it() {
+        let (db, _) = epics_base_rs::server::ioc_builder::IocBuilder::new()
+            .db_string(
+                r#"record(calcout, "CO") { field(ODLY, "0.3") field(CALC, "1") }"#,
+                &std::collections::HashMap::new(),
+            )
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        let mut visited = epics_base_rs::server::database::ProcStack::new();
+        db.process_record_with_links("CO", &mut visited)
+            .await
+            .unwrap();
+        let busy = || db.get_record("CO").unwrap().read().is_processing();
+        assert!(busy(), "ODLY holds the record PACT");
+        let source = PvDatabaseSource::new(db.clone());
+        let desc = Arc::new(source.get_introspection(b"CO").await.expect("desc"));
+        let delta = crate::pvdata::encode::default_value_for(&desc);
+        let ctx = ctx_with_options(&[("block", PvField::Scalar(ScalarValue::Boolean(true)))]);
+        let checked = source
+            .access()
+            .check(
+                "CO",
+                &ctx.creds.host,
+                &ctx.creds.account,
+                &ctx.creds.method,
+                "",
+            )
+            .await;
+        source
+            .put_delta_checked(checked, desc, crate::proto::BitSet::new(), &delta, ctx)
+            .await
+            .expect("PUT must succeed");
+        assert!(!busy(), "the reply came while the record was still PACT");
+    }
+
+    #[epics_macros_rs::epics_test]
+    async fn blocking_marked_enum_put_writes_and_processes() {
+        let ctx = ctx_with_options(&[("block", PvField::Scalar(ScalarValue::Boolean(true)))]);
+        let db = enum_delta_put(true, ctx).await;
+        assert_eq!(mb_index(&db), 1.0);
+        assert!(has_processed(&db, "MB"));
+    }
+
+    /// pvxs's `putArray` drops a null array before any `dbPut`
+    /// (`iocsource.cpp:542-543`) and `doPostProcessing` still runs, so a put
+    /// marking nothing leaves a waveform's elements and processes it.
+    #[epics_macros_rs::epics_test]
+    async fn unmarked_array_put_writes_nothing_and_processes() {
+        let (db, _) = epics_base_rs::server::ioc_builder::IocBuilder::new()
+            .db_string(
+                r#"record(waveform, "WF") { field(FTVL, "DOUBLE") field(NELM, "4") }"#,
+                &std::collections::HashMap::new(),
+            )
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        db.put_pv("WF", EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0].into()))
+            .await
+            .unwrap();
+        let source = PvDatabaseSource::new(db.clone());
+        let desc = Arc::new(source.get_introspection(b"WF").await.expect("desc"));
+        let delta = crate::pvdata::encode::default_value_for(&desc);
+        let ctx = make_ctx("lab-pc1", "op", "ca");
+        let checked = source
+            .access()
+            .check(
+                "WF",
+                &ctx.creds.host,
+                &ctx.creds.account,
+                &ctx.creds.method,
+                "",
+            )
+            .await;
+        source
+            .put_delta_checked(checked, desc, crate::proto::BitSet::new(), &delta, ctx)
+            .await
+            .expect("PUT must succeed");
+        let val = db.get_record("WF").unwrap().read().resolve_field("VAL");
+        assert_eq!(val.map(|v| v.count()), Some(3), "elements untouched");
+        assert!(has_processed(&db, "WF"));
     }
 
     /// `record[process=false]` — pvxs `setForceProcessingFlag` maps it to
@@ -4743,14 +6452,12 @@ ASG(PLAIN) {
         );
     }
 
-    /// `record[process=true,block=true]` routes through the put-notify
-    /// barrier (`dbProcessNotify`, `ioc/singlesource.cpp:361-370`) instead
-    /// of the fire-and-forget post-processing call. A fully synchronous
-    /// record settles inside the call either way; what this pins is that
-    /// the blocking route is reached and completes rather than being
-    /// dropped on the floor as it was before.
+    /// `record[process=true,block=true]` is `dbProcessNotify`'s
+    /// `putProcessRequest` (`ioc/singlesource.cpp:361-368`), which processes
+    /// only for PROC or a pp field of a Passive record (`dbNotify.c:243-247`):
+    /// the value lands and a scanned record is left alone.
     #[epics_macros_rs::epics_test]
-    async fn put_option_block_true_takes_the_notify_route() {
+    async fn blocking_put_with_process_true_leaves_a_scanned_record_alone() {
         use epics_base_rs::server::record::ScanType;
 
         let db = ai_db("AI:BLOCK").await;
@@ -4768,10 +6475,7 @@ ASG(PLAIN) {
             .await
             .expect("PUT must succeed");
         assert_eq!(val_of(&db, "AI:BLOCK"), 5.0);
-        assert!(
-            has_processed(&db, "AI:BLOCK"),
-            "a blocking forced put must have processed by the time it returns"
-        );
+        assert!(!has_processed(&db, "AI:BLOCK"));
     }
 
     /// Drive `f` in place until it parks — poll it, and keep polling for as
@@ -4930,6 +6634,54 @@ ASG(PLAIN) {
             .subscribe_checked_opts_marked(checked, ctx, opts)
             .await
             .expect("record subscribe")
+    }
+
+    /// A record field whose subscriber cap is full refuses the monitor with
+    /// pvxs's line: subscriptionctx.h:48 throws "Failed to create db
+    /// subscription" out of `onSubscribe`, servermon.cpp:598 logs it at ERR.
+    #[epics_macros_rs::epics_test]
+    async fn a_full_subscriber_cap_refuses_the_monitor_with_pvxss_line() {
+        use crate::server_native::source::MonitorOptions;
+        use epics_base_rs::server::records::ai::AiRecord;
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("AI:CAP", Box::new(AiRecord::new(0.0)))
+            .await
+            .unwrap();
+        let rec = db.get_record("AI:CAP").unwrap();
+        let held: Vec<_> = (1..)
+            .map_while(|sid| {
+                rec.write()
+                    .add_subscriber("VAL", sid, epics_base_rs::types::DbFieldType::Double, 1)
+                    .ok()
+            })
+            .collect();
+        assert!(!held.is_empty());
+        let source = PvDatabaseSource::new(db.clone());
+        let ctx = make_ctx("h", "alice", "anonymous");
+        let peer = ctx.peer;
+        let checked = source
+            .access()
+            .check("AI:CAP", "h", "alice", "anonymous", "")
+            .await;
+        let heard = Arc::new(std::sync::Mutex::new(String::new()));
+        let sink = heard.clone();
+        let listener = epics_base_rs::runtime::log::errlog_add_listener(move |m| {
+            if let Some((_time, line)) = m.split_once(' ') {
+                sink.lock().unwrap().push_str(line);
+            }
+        });
+        let opened = source
+            .subscribe_checked_opts_marked(checked, ctx, MonitorOptions::default())
+            .await;
+        assert!(opened.is_none(), "the cap refuses the monitor");
+        epics_base_rs::runtime::log::errlog_flush();
+        epics_base_rs::runtime::log::errlog_remove_listener(listener);
+        assert_eq!(
+            *heard.lock().unwrap(),
+            format!(
+                "ERR pvxs.tcp.setup Client {peer} Monitor \"AI:CAP\" onSubscribe() error: Failed to create db subscription\n"
+            )
+        );
     }
 
     /// pvxs opens the value subscription with the client's
@@ -5185,34 +6937,705 @@ ASG(PLAIN) {
 
     // ── Channel-name resolution: `$`, `{json}` and `[range]` ──
 
-    /// `REC.DESC$` connects and serves the field's string.
-    ///
-    /// pvxs binds every channel through `dbChannelCreate`
-    /// (`ioc/singlesource.cpp:428-435` → `ioc/channel.cpp:29-78`), which
-    /// peels the `$` long-string modifier and re-views a `DBF_STRING` field
-    /// as a `DBR_CHAR` array — collapsed straight back to a NUL-terminated
-    /// `pvString` on the wire (`ioc/iocsource.cpp:133-136`), so the value
-    /// IS the string. Applying a bare `parse_pv_name` to the whole client
-    /// name left the `$` glued to the field, `DESC$` resolved to nothing,
-    /// and `softIocPVX`'s `pvget REC.DESC$` had no answer here.
+    /// `REC.DESC$` connects and serves the field's `DBR_CHAR` image, the text
+    /// and its NUL, as `int8_t[]`. `dbChannelCreate` made the field
+    /// `DBF_CHAR` before pvxs looks (`dbAccess.c:682-701`), so its format
+    /// stays `Default` (`ioc/iocsource.cpp:633`); `softIocPVX` 1.5.3 serves
+    /// `REC.DESC$` of an empty DESC as `{1}[0]`.
     #[epics_macros_rs::epics_test]
-    async fn a_dollar_long_string_channel_serves_the_field() {
+    async fn a_dollar_string_channel_serves_its_char_image() {
         let db = ai_db("AI:LS").await;
-        db.get_record("AI:LS").unwrap().write().common.desc = "a description".into();
+        db.get_record("AI:LS").unwrap().write().common.text.desc = "a description".into();
         let source = PvDatabaseSource::new(db.clone());
 
         assert!(
-            source.has_pv("AI:LS.DESC$").await,
+            source.has_pv(b"AI:LS.DESC$").await,
             "`$` on a DBF_STRING field must create the channel"
         );
-        let value = source.get_value("AI:LS.DESC$").await.expect("a value");
+        let value = source.get_value(b"AI:LS.DESC$").await.expect("a value");
+        let PvField::Structure(s) = &value else {
+            panic!("expected an NTScalarArray structure, got {value:?}");
+        };
+        assert_eq!(
+            s.get_field("value"),
+            Some(&crate::leaf_convert::epics_value_to_pv_leaf(
+                &EpicsValue::CharArray(b"a description\0".to_vec().into())
+            )),
+        );
+    }
+
+    /// The records the `$` pins below read, as `softIocPVX` 1.5.3 loaded them.
+    async fn dollar_db() -> (Arc<PvDatabase>, PvDatabaseSource) {
+        use std::collections::HashMap;
+        let (db, _) = epics_base_rs::server::ioc_builder::IocBuilder::new()
+            .db_string(
+                r#"
+                record(lso, "LZ:O") { field(SIZV, "64") }
+                record(lso, "LZ:F") { field(SIZV, "64") info(Q:form, "String") }
+                record(lso, "LZ:S") { field(SIZV, "20") }
+                record(lsi, "LZ:J") { field(SIZV, "64") }
+                record(waveform, "LZ:W") { field(FTVL, "STRING") field(NELM, "4") }
+                record(calcout, "LZ:C") { field(INPA, "LZ:J") }
+                "#,
+                &HashMap::new(),
+            )
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        let source = PvDatabaseSource::new(db.clone());
+        (db, source)
+    }
+
+    fn dollar_value(v: Option<PvField>) -> Option<PvField> {
+        match v {
+            Some(PvField::Structure(s)) => s.get_field("value").cloned(),
+            other => panic!("expected an NT structure, got {other:?}"),
+        }
+    }
+
+    fn dollar_chars(b: &[u8]) -> Option<PvField> {
+        Some(crate::leaf_convert::epics_value_to_pv_leaf(
+            &EpicsValue::CharArray(b.to_vec().into()),
+        ))
+    }
+
+    fn dollar_text(t: &str) -> Option<PvField> {
+        Some(PvField::Scalar(ScalarValue::String(t.into())))
+    }
+
+    async fn dollar_put(source: &PvDatabaseSource, name: &str, value: PvField) {
+        source
+            .put_value_ctx(name, value, make_ctx("127.0.0.1", "anon", "ca"))
+            .await
+            .expect("PUT must succeed");
+    }
+
+    /// A CHAR waveform's VAL tagged `info(Q:form, "String")` is pvxs's
+    /// `TypeCode::String` without `$` (`ioc/iocsource.cpp:633`): a string
+    /// NTScalar, no limits or form, and a string put is `putLongString`'s
+    /// `strlen + 1` chars (`:601-603`) — ADCore's `NDAttributesFile` idiom.
+    #[epics_macros_rs::epics_test]
+    async fn a_q_form_string_char_array_serves_text() {
+        use std::collections::HashMap;
+        let (db, _) = epics_base_rs::server::ioc_builder::IocBuilder::new()
+            .db_string(
+                r#"
+                record(waveform, "QF:W") { field(FTVL, "CHAR") field(NELM, "16") info(Q:form, "String") }
+                record(waveform, "QF:U") { field(FTVL, "UCHAR") field(NELM, "16") info(Q:form, "String") }
+                record(waveform, "QF:1") { field(FTVL, "CHAR") field(NELM, "1") info(Q:form, "String") }
+                record(waveform, "QF:N") { field(FTVL, "CHAR") field(NELM, "16") }
+                record(lso, "QF:S") { field(SIZV, "41") info(Q:form, "String") }
+                "#,
+                &HashMap::new(),
+            )
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        let source = PvDatabaseSource::new(db.clone());
+
+        dollar_put(
+            &source,
+            "QF:W",
+            PvField::Scalar(ScalarValue::String("abc".into())),
+        )
+        .await;
+        let nord = db
+            .get_record("QF:W")
+            .unwrap()
+            .read()
+            .client_field_value("NORD");
+        assert_eq!(nord.and_then(|v| v.to_f64()), Some(4.0), "strlen + 1");
+
+        let Some(PvField::Structure(s)) = source.get_value(b"QF:W").await else {
+            panic!("expected an NTScalar");
+        };
+        assert_eq!(s.get_field("value"), dollar_text("abc").as_ref());
+        let Some(PvField::Structure(display)) = s.get_field("display") else {
+            panic!("a string NTScalar keeps display.description/units");
+        };
+        assert!(display.get_field("limitLow").is_none());
+        assert!(display.get_field("form").is_none());
+        assert!(s.get_field("control").is_none());
+
+        // Not `DBR_CHAR`, not `isArray`, no tag: each keeps its `int8_t`/
+        // `uint8_t` value, as `softIocPVX` 1.5.3 serves them.
+        for (name, array) in [("QF:U", true), ("QF:1", false), ("QF:N", true)] {
+            let Some(PvField::Structure(s)) = source.get_value(name.as_bytes()).await else {
+                panic!("{name}: expected an NT structure");
+            };
+            let value = s.get_field("value");
+            let served_array = matches!(
+                value,
+                Some(PvField::ScalarArray(_) | PvField::ScalarArrayTyped(_))
+            );
+            let served_number =
+                matches!(value, Some(PvField::Scalar(v)) if !matches!(v, ScalarValue::String(_)));
+            assert!(
+                if array { served_array } else { served_number },
+                "{name}: {value:?}"
+            );
+        }
+
+        // A long string pvxs leaves `DBR_STRING` (`ioc/channel.cpp:56-60`) is
+        // `putScalar`'s 39-char `strncpy`, not `putLongString`, under any form.
+        let long = "y".repeat(45);
+        dollar_put(
+            &source,
+            "QF:S",
+            PvField::Scalar(ScalarValue::String(long.as_str().into())),
+        )
+        .await;
+        assert_eq!(
+            dollar_value(source.get_value(b"QF:S").await),
+            dollar_text(&long[..39])
+        );
+    }
+
+    /// A `Q:form` long string's chars are sliced by `arr` before the text is
+    /// read (`getArrayValue`, `ioc/iocsource.cpp:122-136`), by GET and by
+    /// monitor alike. `softIocPVX` 1.5.3 serves each one char shorter, for
+    /// the NUL it forces into the last element (`:134`).
+    #[epics_macros_rs::epics_test]
+    async fn a_q_form_string_reads_the_sliced_chars() {
+        let (db, _) = epics_base_rs::server::ioc_builder::IocBuilder::new()
+            .db_string(
+                r#"record(waveform, "QC:W") { field(FTVL, "CHAR") field(NELM, "8") info(Q:form, "String") }
+                   record(lso, "QC:S") { field(SIZV, "64") }"#,
+                &std::collections::HashMap::new(),
+            )
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        let source = PvDatabaseSource::new(db.clone());
+        let channels = [
+            ("QC:W", "ABCDEFGH"),
+            (r#"QC:W.{"arr":{"e":3}}"#, "ABCD"),
+            (r#"QC:W.{"arr":{"s":1}}"#, "BCDEFGH"),
+            ("QC:S", "ABCDEFGH"),
+            (r#"QC:S.{"arr":{"e":3}}"#, "ABCD"),
+            (r#"QC:S.{"arr":{"s":1}}"#, "BCDEFGH"),
+        ];
+        let mut monitors = Vec::new();
+        for (name, _) in channels {
+            monitors.push(source.subscribe(name.as_bytes()).await.expect(name));
+        }
+        db.put_pv_and_post("QC:W", EpicsValue::CharArray(b"ABCDEFGH".to_vec().into()))
+            .await
+            .unwrap();
+        db.put_pv_and_post("QC:S", EpicsValue::String("ABCDEFGH".into()))
+            .await
+            .unwrap();
+        for ((name, want), mut mon) in channels.into_iter().zip(monitors) {
+            let posted = epics_base_rs::runtime::task::timeout(
+                std::time::Duration::from_secs(5),
+                mon.recv(),
+            )
+            .await
+            .expect("a monitor update");
+            assert_eq!(dollar_value(posted), dollar_text(want), "monitor {name}");
+            assert_eq!(
+                dollar_value(source.get_value(name.as_bytes()).await),
+                dollar_text(want),
+                "GET {name}"
+            );
+        }
+    }
+
+    /// A `$` GET per shape, each the `pvxget -r value` answer of
+    /// `softIocPVX` 1.5.3 over the same records after `pvxput LZ:O world`,
+    /// `LZ:F world`, `LZ:S abc` and `LZ:W '["abc","de"]'`.
+    #[epics_macros_rs::epics_test]
+    async fn a_dollar_get_serves_what_softiocpvx_serves() {
+        let (_db, source) = dollar_db().await;
+        for (name, text) in [
+            ("LZ:O.VAL", "world"),
+            ("LZ:F.VAL", "world"),
+            ("LZ:S.VAL", "abc"),
+        ] {
+            dollar_put(
+                &source,
+                name,
+                PvField::Scalar(ScalarValue::String(text.into())),
+            )
+            .await;
+        }
+        dollar_put(
+            &source,
+            "LZ:W.VAL",
+            crate::leaf_convert::epics_value_to_pv_leaf(&EpicsValue::StringArray(
+                vec!["abc".into(), "de".into()].into(),
+            )),
+        )
+        .await;
+        let cases = [
+            ("LZ:O.VAL$", dollar_chars(b"world\0")),
+            ("LZ:O.DESC$", dollar_chars(b"\0")),
+            ("LZ:O.RTYP$", dollar_chars(b"lso\0")),
+            ("LZ:S.VAL$", dollar_chars(b"abc\0")),
+            ("LZ:J.VAL$", dollar_chars(b"")),
+            ("LZ:W.VAL$", dollar_chars(b"ab")),
+            ("LZ:F.VAL$", dollar_text("world")),
+            ("LZ:C.INPA$", dollar_text("LZ:J NPP NMS")),
+        ];
+        for (name, want) in cases {
+            assert_eq!(
+                dollar_value(source.get_value(name.as_bytes()).await),
+                want,
+                "{name}"
+            );
+        }
+    }
+
+    /// An `arr` slice of a `$` channel: `softIocPVX` 1.5.3 over
+    /// `record(stringin,"FS"){field(VAL,"hello")}`, `pvxget -r value`.
+    #[epics_macros_rs::epics_test]
+    async fn a_dollar_arr_slice_serves_what_softiocpvx_serves() {
+        let (db, _) = epics_base_rs::server::ioc_builder::IocBuilder::new()
+            .db_string(
+                r#"record(stringin, "FS") { field(VAL, "hello") }"#,
+                &std::collections::HashMap::new(),
+            )
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        let source = PvDatabaseSource::new(db);
+        let cases = [
+            (r#"FS.VAL${"arr":{"s":1,"e":3}}"#, dollar_chars(b"el\0")),
+            (r#"FS.VAL${"arr":{"s":-3}}"#, dollar_chars(b"\0")),
+            (r#"FS.VAL${"arr":{"s":1,"e":-1}}"#, dollar_chars(b"ello\0")),
+            (r#"FS.VAL${"arr":{"s":3,"e":8}}"#, dollar_chars(b"lo\0")),
+            (
+                r#"FS.VAL${"arr":{"s":1,"e":3,"i":2}}"#,
+                dollar_chars(b"e\0"),
+            ),
+        ];
+        for (name, want) in cases {
+            assert_eq!(
+                dollar_value(source.get_value(name.as_bytes()).await),
+                want,
+                "{name}"
+            );
+        }
+    }
+
+    /// A long string whose failed device read left its NUL past `LEN`
+    /// (devlsiStream.c): pvxs keeps a SIZV 41 VAL the `DBF_STRING`
+    /// `cvt_dbaddr` made it, read to the buffer's NUL, and re-views a SIZV
+    /// 100 VAL as its `LEN` chars (`ioc/channel.cpp:58-67`).
+    #[epics_macros_rs::epics_test]
+    async fn a_long_string_reads_past_len_only_without_the_re_view() {
+        use epics_base_rs::server::records::lsi::LsiRecord;
+        let (db, _) = epics_base_rs::server::ioc_builder::IocBuilder::new()
+            .db_string(
+                r#"record(lsi, "A") { field(SIZV, "41") field(MPST, "Always") }
+                record(lsi, "B") { field(SIZV, "100") field(MPST, "Always") }"#,
+                &std::collections::HashMap::new(),
+            )
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        for (name, read) in [("A", b"abcdef".to_vec()), ("B", vec![b'x'; 50])] {
+            let cell = db.get_record(name).unwrap();
+            let mut inst = cell.write();
+            let lsi = inst
+                .record
+                .as_any_mut()
+                .and_then(|a| a.downcast_mut::<LsiRecord>())
+                .unwrap();
+            lsi.val.set_text(b"o");
+            let sizv = lsi.sizv as usize;
+            lsi.val.scan_in_place(sizv, |buf| {
+                buf[..read.len()].copy_from_slice(&read);
+                buf[read.len()] = 0;
+                None
+            });
+        }
+        let source = PvDatabaseSource::new(db.clone());
+        for (name, want) in [("A.VAL", "abcdef"), ("B.VAL", "xx")] {
+            let want = Some(PvField::Scalar(ScalarValue::String(want.into())));
+            assert_eq!(
+                dollar_value(source.get_value(name.as_bytes()).await),
+                want,
+                "pvget {name}"
+            );
+            let mut mon = source.subscribe(name.as_bytes()).await.expect("subscribes");
+            // MPST Always: the cycle posts VAL, which reads no new text.
+            db.put_record_field_from_ca(&name[..1], "PROC", EpicsValue::Short(1))
+                .await
+                .unwrap();
+            let first = epics_base_rs::runtime::task::timeout(
+                std::time::Duration::from_secs(5),
+                mon.recv(),
+            )
+            .await
+            .expect("an event");
+            assert_eq!(dollar_value(first), want, "pvmonitor {name}");
+        }
+    }
+
+    /// A one-element `arr` slice is a scalar channel: `softIocPVX` 1.5.3's
+    /// `pvxget` over `FS` = "hello", `W` = `[1,2,3]` and `LS` = "hey", and
+    /// `pvxmonitor 'FS.VAL${"arr":{"s":1,"e":1}}'` over `pvxput FS world`,
+    /// `FS ab`, `FS x`.
+    #[epics_macros_rs::epics_test]
+    async fn a_one_element_arr_slice_serves_what_softiocpvx_serves() {
+        let (db, _) = epics_base_rs::server::ioc_builder::IocBuilder::new()
+            .db_string(
+                r#"record(stringin, "FS") { field(VAL, "hello") }
+                record(waveform, "W") { field(FTVL, "LONG") field(NELM, "5") }
+                record(lsi, "LS") { field(SIZV, "20") }"#,
+                &std::collections::HashMap::new(),
+            )
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        let source = PvDatabaseSource::new(db);
+        dollar_put(
+            &source,
+            "W.VAL",
+            crate::leaf_convert::epics_value_to_pv_leaf(&EpicsValue::LongArray(
+                vec![1, 2, 3].into(),
+            )),
+        )
+        .await;
+        let string = |t: &str| PvField::Scalar(ScalarValue::String(t.into()));
+        dollar_put(&source, "LS.VAL", string("hey")).await;
+        let cases = [
+            (r#"FS.VAL${"arr":{"s":1,"e":1}}"#, ScalarValue::Byte(101)),
+            (r#"LS.VAL${"arr":{"s":1,"e":1}}"#, ScalarValue::Byte(101)),
+            (r#"W.VAL{"arr":{"s":1,"e":1}}"#, ScalarValue::Int(2)),
+        ];
+        for (name, want) in cases {
+            let Some(FieldDesc::Structure { fields, .. }) =
+                source.get_introspection(name.as_bytes()).await
+            else {
+                panic!("{name}: no NT descriptor");
+            };
+            let desc = fields.iter().find(|(n, _)| n == "value").map(|(_, d)| d);
+            assert_eq!(desc, Some(&FieldDesc::Scalar(want.scalar_type())), "{name}");
+            assert_eq!(
+                dollar_value(source.get_value(name.as_bytes()).await),
+                Some(PvField::Scalar(want)),
+                "{name}"
+            );
+        }
+        let mut mon = source
+            .subscribe(br#"FS.VAL${"arr":{"s":1,"e":1}}"#)
+            .await
+            .expect("subscribes");
+        for (put, want) in [("world", 111), ("ab", 98), ("x", 0)] {
+            dollar_put(&source, "FS.VAL", string(put)).await;
+            let posted = epics_base_rs::runtime::task::timeout(
+                std::time::Duration::from_secs(5),
+                mon.recv(),
+            )
+            .await
+            .expect("a monitor update");
+            assert_eq!(
+                dollar_value(posted),
+                Some(PvField::Scalar(ScalarValue::Byte(want))),
+                "{put}"
+            );
+        }
+    }
+
+    /// A link's or an attribute's `$` through `arr` is its text re-read at
+    /// the slice's count, from the start: `softIocPVX` 1.5.3's `pvxget`,
+    /// `LK.INP` being `FS NPP NMS`.
+    #[epics_macros_rs::epics_test]
+    async fn a_dollar_link_arr_slice_serves_what_softiocpvx_serves() {
+        let (db, _) = epics_base_rs::server::ioc_builder::IocBuilder::new()
+            .db_string(
+                r#"record(stringin, "FS") { field(VAL, "hello") }
+                record(stringin, "LK") { field(INP, "FS NPP") }"#,
+                &std::collections::HashMap::new(),
+            )
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        let source = PvDatabaseSource::new(db);
+        let byte = |b| Some(PvField::Scalar(ScalarValue::Byte(b)));
+        let cases = [
+            ("LK.INP$", dollar_text("FS NPP NMS")),
+            (r#"LK.INP${"arr":{"s":0,"e":1}}"#, dollar_text("F")),
+            (r#"LK.INP${"arr":{"s":0,"e":2}}"#, dollar_text("FS")),
+            (r#"LK.INP${"arr":{"s":1,"e":3}}"#, dollar_text("FS")),
+            (r#"LK.INP${"arr":{"s":1,"e":1}}"#, byte(0)),
+            (r#"LK.INP${"arr":{"s":0,"e":5}}"#, dollar_text("FS NP")),
+            (r#"LK.INP${"arr":{"s":2}}"#, dollar_text("FS NPP NMS")),
+            ("FS.RTYP$", dollar_chars(b"stringin\0")),
+            (r#"FS.RTYP${"arr":{"s":1,"e":3}}"#, dollar_chars(b"st\0")),
+            (r#"FS.RTYP${"arr":{"s":1,"e":1}}"#, byte(0)),
+            (r#"FS.RTYP${"arr":{"s":0,"e":0}}"#, byte(0)),
+        ];
+        for (name, want) in cases {
+            assert_eq!(
+                dollar_value(source.get_value(name.as_bytes()).await),
+                want,
+                "{name}"
+            );
+        }
+    }
+
+    /// A `$` monitor per shape: `softIocPVX` 1.5.3's `pvxmonitor -r value`
+    /// over `pvxput LZ:O again`, `LZ:W '["xyz"]'`, `LZ:F again`.
+    #[epics_macros_rs::epics_test]
+    async fn a_dollar_monitor_serves_what_softiocpvx_serves() {
+        let (_db, source) = dollar_db().await;
+        let string = |t: &str| PvField::Scalar(ScalarValue::String(t.into()));
+        let strings = |t: &[&str]| {
+            crate::leaf_convert::epics_value_to_pv_leaf(&EpicsValue::StringArray(
+                t.iter().map(|s| (*s).into()).collect::<Vec<_>>().into(),
+            ))
+        };
+        let cases = [
+            (
+                "LZ:O.VAL",
+                string("world"),
+                string("again"),
+                dollar_chars(b"again\0"),
+            ),
+            (
+                "LZ:W.VAL",
+                strings(&["abc", "de"]),
+                strings(&["xyz"]),
+                dollar_chars(b"x"),
+            ),
+            (
+                "LZ:F.VAL",
+                string("world"),
+                string("again"),
+                dollar_text("again"),
+            ),
+        ];
+        for (name, first, second, want) in cases {
+            dollar_put(&source, name, first).await;
+            let mut mon = source
+                .subscribe(format!("{name}$").as_bytes())
+                .await
+                .expect("subscribes");
+            dollar_put(&source, name, second).await;
+            let posted = epics_base_rs::runtime::task::timeout(
+                std::time::Duration::from_secs(5),
+                mon.recv(),
+            )
+            .await
+            .expect("a monitor update");
+            assert_eq!(dollar_value(posted), want, "{name}$");
+        }
+    }
+
+    /// A `$` monitor slices the char image, as its GET does: `softIocPVX`
+    /// 1.5.3's `pvxmonitor 'FS.VAL${"arr":{"s":1,"e":3}}'` over `pvxput FS
+    /// world`, `FS ab`, `FS x`.
+    #[epics_macros_rs::epics_test]
+    async fn a_dollar_arr_monitor_serves_what_softiocpvx_serves() {
+        let (db, _) = epics_base_rs::server::ioc_builder::IocBuilder::new()
+            .db_string(
+                r#"record(stringin, "FS") { field(VAL, "hello") }"#,
+                &std::collections::HashMap::new(),
+            )
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        let source = PvDatabaseSource::new(db);
+        let mut mon = source
+            .subscribe(br#"FS.VAL${"arr":{"s":1,"e":3}}"#)
+            .await
+            .expect("subscribes");
+        for (put, want) in [("world", &b"or\0"[..]), ("ab", b"b\0"), ("x", b"\0")] {
+            dollar_put(
+                &source,
+                "FS.VAL",
+                PvField::Scalar(ScalarValue::String(put.into())),
+            )
+            .await;
+            let posted = epics_base_rs::runtime::task::timeout(
+                std::time::Duration::from_secs(5),
+                mon.recv(),
+            )
+            .await
+            .expect("a monitor update");
+            assert_eq!(dollar_value(posted), dollar_chars(want), "{put}");
+        }
+    }
+
+    /// An `int8_t[]` put to a `$` channel is `dbPut(DBR_CHAR)`, its NUL
+    /// supplied when absent: `softIocPVX` 1.5.3, `pvxput 'LZ:O.VAL$'
+    /// '[104,105,0]'` reads back `"hi"` and `{3}[104,105,0]`, and
+    /// `'[106,107]'` reads back `"jk"` and `{3}[106,107,0]`.
+    #[epics_macros_rs::epics_test]
+    async fn a_dollar_char_put_is_a_dbr_char_put() {
+        let (_db, source) = dollar_db().await;
+        for (put, text, chars) in [(&b"hi\0"[..], "hi", &b"hi\0"[..]), (b"jk", "jk", b"jk\0")] {
+            dollar_put(&source, "LZ:O.VAL$", dollar_chars(put).unwrap()).await;
+            assert_eq!(
+                dollar_value(source.get_value(b"LZ:O.VAL").await),
+                dollar_text(text)
+            );
+            assert_eq!(
+                dollar_value(source.get_value(b"LZ:O.VAL$").await),
+                dollar_chars(chars)
+            );
+        }
+    }
+
+    /// Put 45 characters to `LS:O.VAL` of an lso with `sizv`, return `LEN`.
+    async fn long_string_put_len(sizv: u16) -> f64 {
+        use std::collections::HashMap;
+        let (db, _) = epics_base_rs::server::ioc_builder::IocBuilder::new()
+            .db_string(
+                &format!(r#"record(lso, "LS:O") {{ field(SIZV, "{sizv}") }}"#),
+                &HashMap::new(),
+            )
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        let source = PvDatabaseSource::new(db.clone());
+        source
+            .put_value_ctx(
+                "LS:O.VAL",
+                PvField::Scalar(ScalarValue::String("x".repeat(45).into())),
+                make_ctx("127.0.0.1", "anon", "ca"),
+            )
+            .await
+            .expect("PUT must succeed");
+        let len = db.get_record("LS:O").unwrap().read().resolve_field("LEN");
+        len.and_then(|v| v.to_f64()).expect("LEN")
+    }
+
+    /// pvxs re-views an lso VAL whose `SIZV` exceeds 41 as a char array
+    /// (`ioc/channel.cpp:56-72`), so a string PUT is `putLongString` and 45
+    /// characters store with `LEN` 46 — `softIocPVX` 1.5.3 live.
+    #[epics_macros_rs::epics_test]
+    async fn a_long_string_put_fills_sizv() {
+        assert_eq!(long_string_put_len(64).await, 46.0);
+    }
+
+    /// A plain lso VAL is a `pvString` whatever its `SIZV`, on a GET and on a
+    /// monitor, never-written included. `softIocPVX` 1.5.3, `pvxget` on
+    /// `record(lso,"LS41"){field(SIZV,"41")}` and the same at 64:
+    /// `value string = ""`, then `"abc"` after `pvxput LS41.VAL abc`.
+    #[epics_macros_rs::epics_test]
+    async fn a_plain_long_string_channel_serves_its_text() {
+        use std::collections::HashMap;
+        let text = |v: Option<PvField>| match v {
+            Some(PvField::Structure(s)) => s.get_field("value").cloned(),
+            other => panic!("expected an NTScalar, got {other:?}"),
+        };
+        let string = |t: &str| Some(PvField::Scalar(ScalarValue::String(t.into())));
+        for sizv in [41u16, 64] {
+            let (db, _) = epics_base_rs::server::ioc_builder::IocBuilder::new()
+                .db_string(
+                    &format!(r#"record(lso, "LS:O") {{ field(SIZV, "{sizv}") }}"#),
+                    &HashMap::new(),
+                )
+                .unwrap()
+                .build()
+                .await
+                .unwrap();
+            let source = PvDatabaseSource::new(db.clone());
+            assert_eq!(
+                text(source.get_value(b"LS:O.VAL").await),
+                string(""),
+                "{sizv}"
+            );
+            let mut mon = source.subscribe(b"LS:O.VAL").await.expect("subscribes");
+            source
+                .put_value_ctx(
+                    "LS:O.VAL",
+                    PvField::Scalar(ScalarValue::String("abc".into())),
+                    make_ctx("127.0.0.1", "anon", "ca"),
+                )
+                .await
+                .expect("PUT must succeed");
+            assert_eq!(
+                text(source.get_value(b"LS:O.VAL").await),
+                string("abc"),
+                "{sizv}"
+            );
+            let posted =
+                epics_base_rs::runtime::task::timeout(std::time::Duration::from_secs(5), async {
+                    loop {
+                        let v = text(mon.recv().await);
+                        if v != string("") {
+                            return v;
+                        }
+                    }
+                })
+                .await
+                .expect("a monitor update");
+            assert_eq!(posted, string("abc"), "{sizv}");
+        }
+    }
+
+    /// At `SIZV` 41 pvxs leaves VAL a `DBF_STRING` scalar, so the PUT is
+    /// `putScalar`'s `DBR_STRING` and stores 39 characters, `LEN` 40 —
+    /// `softIocPVX` 1.5.3 live.
+    #[epics_macros_rs::epics_test]
+    async fn a_long_string_put_at_sizv_41_is_a_dbr_string_put() {
+        assert_eq!(long_string_put_len(41).await, 40.0);
+    }
+
+    /// The record answers its long-string VAL's capacity as C's `cvt_dbaddr`
+    /// does, one element; the channel must still take pvxs's long-string
+    /// shape and serve the whole text as one `pvString`.
+    #[epics_macros_rs::epics_test]
+    async fn a_long_string_val_with_one_dbaddr_element_is_served_as_its_text() {
+        use epics_base_rs::server::record::FieldDeclaration;
+        use std::collections::HashMap;
+        let (db, _) = epics_base_rs::server::ioc_builder::IocBuilder::new()
+            .db_string(
+                r#"record(lso, "LS:G") { field(SIZV, "64") }"#,
+                &HashMap::new(),
+            )
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        db.put_record_field_from_ca_no_notify(
+            "LS:G",
+            "VAL",
+            EpicsValue::CharArray(
+                b"a string past forty characters, served whole\0"
+                    .to_vec()
+                    .into(),
+            ),
+        )
+        .await
+        .unwrap();
+        {
+            let rec = db.get_record("LS:G").unwrap();
+            let inst = rec.read();
+            assert_eq!(inst.record.field_native_count("VAL"), Some(1));
+            assert!(
+                crate::channel_shape::ChannelShape::of_record_channel(
+                    &inst,
+                    "VAL",
+                    &FilterChain::new()
+                )
+                .is_array(),
+                "pvxs's long-string channel is a char array"
+            );
+        }
+        let source = PvDatabaseSource::new(db);
+        let value = source.get_value(b"LS:G").await.expect("a value");
         let PvField::Structure(s) = &value else {
             panic!("expected an NTScalar structure, got {value:?}");
         };
         assert_eq!(
             s.get_field("value"),
             Some(&PvField::Scalar(ScalarValue::String(
-                "a description".into()
+                "a string past forty characters, served whole".into()
             ))),
         );
     }
@@ -5225,7 +7648,7 @@ ASG(PLAIN) {
         let db = ai_db("AI:NOLS").await;
         let source = PvDatabaseSource::new(db);
         assert!(
-            !source.has_pv("AI:NOLS.VAL$").await,
+            !source.has_pv(b"AI:NOLS.VAL$").await,
             "`$` on a DBF_DOUBLE field must refuse the channel"
         );
     }
@@ -5264,18 +7687,18 @@ ASG(PLAIN) {
         {
             let rec = db.get_record("AI:LNK").unwrap();
             let mut inst = rec.write();
-            inst.common.inp = "OTHER:PV CP MS".into();
-            inst.common.flnk = "NEXT:REC".into();
+            inst.common.text.inp = "OTHER:PV CP MS".into();
+            inst.common.text.flnk = "NEXT:REC".into();
         }
         let source = PvDatabaseSource::new(db.clone());
 
         for (field, expect) in [("INP", "OTHER:PV CP MS"), ("FLNK", "NEXT:REC")] {
             let name = format!("AI:LNK.{field}");
             assert!(
-                source.has_pv(&name).await,
+                source.has_pv(name.as_bytes()).await,
                 "{name} must create a channel (pvxs channel.cpp:69-74 promotes it)"
             );
-            let value = source.get_value(&name).await.expect("a value");
+            let value = source.get_value(name.as_bytes()).await.expect("a value");
             let PvField::Structure(s) = &value else {
                 panic!("expected an NTScalar structure for {name}, got {value:?}");
             };
@@ -5344,9 +7767,12 @@ ASG(PLAIN) {
         let db = wf_db("WF:FILT").await;
         let source = PvDatabaseSource::new(db);
         let name = r#"WF:FILT.{"arr":{"s":1,"e":2}}"#;
-        assert!(source.has_pv(name).await, "a parseable filter must connect");
+        assert!(
+            source.has_pv(name.as_bytes()).await,
+            "a parseable filter must connect"
+        );
         let value = source
-            .get_value(name)
+            .get_value(name.as_bytes())
             .await
             .expect("GET on a filtered channel");
         assert_eq!(
@@ -5370,11 +7796,11 @@ ASG(PLAIN) {
         let source = PvDatabaseSource::new(db);
         let name = r#"AI:FILT2.{"dbnd":{"d":0.5}}"#;
         assert!(
-            source.has_pv(name).await,
+            source.has_pv(name.as_bytes()).await,
             "a dotted suffix parses like any other"
         );
         assert!(
-            source.get_value(name).await.is_some(),
+            source.get_value(name.as_bytes()).await.is_some(),
             "a deadband filter gates the monitor stream, never the one-shot read"
         );
     }
@@ -5387,7 +7813,7 @@ ASG(PLAIN) {
         let db = wf_db("WF:RANGE").await;
         let source = PvDatabaseSource::new(db);
         let value = source
-            .get_value("WF:RANGE.VAL[1:2]")
+            .get_value(b"WF:RANGE.VAL[1:2]")
             .await
             .expect("GET on a range-suffixed channel");
         assert_eq!(
@@ -5408,7 +7834,7 @@ ASG(PLAIN) {
         let db = wf_db("WF:BADF").await;
         let source = PvDatabaseSource::new(db);
         assert!(
-            !source.has_pv(r#"WF:BADF.{"nosuchfilter":{}}"#).await,
+            !source.has_pv(br#"WF:BADF.{"nosuchfilter":{}}"#).await,
             "an unknown filter name must refuse the channel, not connect it raw"
         );
     }
@@ -5423,11 +7849,11 @@ ASG(PLAIN) {
         db.add_pv("MB:FILT", EpicsValue::Double(1.0)).await.unwrap();
         let source = PvDatabaseSource::new(db);
         assert!(
-            source.has_pv("MB:FILT").await,
+            source.has_pv(b"MB:FILT").await,
             "the mailbox itself is served"
         );
         assert!(
-            !source.has_pv(r#"MB:FILT.{"arr":{"s":0,"e":1}}"#).await,
+            !source.has_pv(br#"MB:FILT.{"arr":{"s":0,"e":1}}"#).await,
             "a mailbox has no filter machinery, so a filtered name addresses nothing"
         );
     }
@@ -5482,7 +7908,7 @@ ASG(PLAIN) {
         let db = ai_db("AI:SRCH").await;
         let source = PvDatabaseSource::new(db);
         assert!(
-            source.searchable(r#"AI:SRCH.{"arr":{"s":0}}"#).await,
+            source.searchable(br#"AI:SRCH.{"arr":{"s":0}}"#).await,
             "search claims what dbChannelTest resolves; the refusal belongs at \
              create, where the client can be told"
         );

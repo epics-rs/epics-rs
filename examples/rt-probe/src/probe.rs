@@ -41,6 +41,7 @@ use epics_base_rs::server::scan::ScanOwner;
 use epics_base_rs::types::EpicsValue;
 use epics_ca_rs::client::CaClient;
 use epics_ca_rs::server::CaServer;
+use epics_libcom_rs::cfmt::CFloat;
 use epics_pva_rs::client_native::context::PvaClient;
 use epics_pva_rs::client_native::ops_v2::{MonitorEvent, MonitorEventMask};
 use epics_pva_rs::server::PvDatabaseSource;
@@ -104,7 +105,7 @@ enum Cmd {
         hogs: usize,
     },
     /// Observe whether an IOC thread actually gets SCHED_FIFO under the
-    /// current `EPICS_RS_ALLOW_RT_PRIORITY` setting — the switch both
+    /// current `EPICS_ALLOW_POSIX_THREAD_PRIORITY_SCHEDULING` setting — the switch both
     /// directions. Reports `enter_ioc_thread`'s verdict and the kernel's
     /// own `sched_getscheduler`/priority for the thread.
     RtPolicy,
@@ -144,13 +145,13 @@ fn report(label: &str, mut us: Vec<f64>) {
     let mean = us.iter().sum::<f64>() / n as f64;
     println!(
         "{label}: n={n} min={:.1} mean={:.1} p50={:.1} p90={:.1} p99={:.1} p99.9={:.1} max={:.1} (us)",
-        us[0],
-        mean,
-        pct(0.50),
-        pct(0.90),
-        pct(0.99),
-        pct(0.999),
-        us[n - 1],
+        CFloat(us[0]),
+        CFloat(mean),
+        CFloat(pct(0.50)),
+        CFloat(pct(0.90)),
+        CFloat(pct(0.99)),
+        CFloat(pct(0.999)),
+        CFloat(us[n - 1]),
     );
 }
 
@@ -187,9 +188,15 @@ async fn boot_ioc_on(ca_port: u16) -> Result<Ioc, Box<dyn std::error::Error>> {
         std::env::set_var("EPICS_CAS_BEACON_ADDR_LIST", "127.0.0.1");
     }
     let macros = std::collections::HashMap::new();
+    // dbCa, which every C IOC links.
+    let reactor =
+        epics_base_rs::runtime::task::Reactor::current().expect("boot runs on the IOC's reactor");
     let (db, _autosave) = IocBuilder::new()
+        .register_link_type("ca", move |db| {
+            epics_ca_rs::calink::calink_link_set_install(db, reactor)
+        })
         .db_string(FAST_DB, &macros)?
-        .build()
+        .build_served()
         .await?;
     let scan = ScanOwner::start(db.clone());
     let ca_server = CaServer::from_parts(
@@ -283,7 +290,7 @@ async fn scan_jitter(samples: usize) -> Result<(), Box<dyn std::error::Error>> {
                 prev = Some(now);
             }
             _ => {
-                eprintln!("scan-jitter: monitor stalled, collected {got}");
+                epics_base_rs::stderr_println!("scan-jitter: monitor stalled, collected {got}");
                 break;
             }
         }
@@ -337,7 +344,10 @@ async fn collect_legs(
                 out.push(LegSample { t_rec, t_arr });
             }
             _ => {
-                eprintln!("collect_legs: monitor stalled, collected {}", out.len());
+                epics_base_rs::stderr_println!(
+                    "collect_legs: monitor stalled, collected {}",
+                    out.len()
+                );
                 break;
             }
         }
@@ -375,7 +385,10 @@ fn report_decomp(label: &str, s: &[LegSample], period_s: f64) {
         .zip(d_a.iter().zip(d_c.iter()))
         .map(|(b, (a, c))| (b - (a + c)).abs())
         .fold(0.0f64, f64::max);
-    println!("{label}: identity max residual = {worst_resid:.6} us (dB == dA + dC)");
+    println!(
+        "{label}: identity max residual = {:.6} us (dB == dA + dC)",
+        CFloat(worst_resid)
+    );
     report(
         &format!("{label} | A scan leg |dev|"),
         d_a.iter().map(|x| x.abs()).collect(),
@@ -405,7 +418,9 @@ fn report_decomp(label: &str, s: &[LegSample], period_s: f64) {
         };
         println!(
             "{label} |   {i:5}  {:10.1}  {:9.1}  {:9.1}  {blame}",
-            d_b[i], d_a[i], d_c[i]
+            CFloat(d_b[i]),
+            CFloat(d_a[i]),
+            CFloat(d_c[i])
         );
     }
     // How much of the chain tail each leg owns, counted over the worst 1 %.
@@ -477,7 +492,7 @@ async fn ca_latency(samples: usize, hogs: usize) -> Result<(), Box<dyn std::erro
                     }
                 }
                 _ => {
-                    eprintln!("ca-latency: stalled at sample {i}");
+                    epics_base_rs::stderr_println!("ca-latency: stalled at sample {i}");
                     break;
                 }
             }
@@ -536,7 +551,7 @@ async fn pva_latency(samples: usize, hogs: usize) -> Result<(), Box<dyn std::err
                 break;
             }
             if t0.elapsed() > Duration::from_secs(2) {
-                eprintln!("pva-latency: stalled at sample {i}");
+                epics_base_rs::stderr_println!("pva-latency: stalled at sample {i}");
                 break;
             }
             tokio::time::sleep(Duration::from_micros(200)).await;
@@ -573,16 +588,18 @@ fn extract_pva_double(f: &epics_pva_rs::PvField) -> Option<f64> {
 
 /// Spawn one IOC thread through the real `enter_ioc_thread` path and report
 /// both the runtime's own verdict and the kernel's ground truth. Run twice by
-/// the caller — once with `EPICS_RS_ALLOW_RT_PRIORITY=YES`, once `=NO` — to see
+/// the caller — once with `EPICS_ALLOW_POSIX_THREAD_PRIORITY_SCHEDULING=YES`, once `=NO` — to see
 /// the switch bite in both directions. Must run as root (or with CAP_SYS_NICE)
 /// for the YES arm to actually obtain SCHED_FIFO.
 fn rt_policy() {
-    use epics_base_rs::runtime::task::{RtPolicy, ThreadPriority, enter_ioc_thread};
-    let raw = std::env::var(epics_base_rs::runtime::task::RT_PRIORITY_ENV).ok();
+    use epics_base_rs::runtime::task::{
+        C_RT_PRIORITY_ENV, RT_PRIORITY_ENV, RtPolicy, ThreadPriority, enter_ioc_thread,
+    };
+    // Both switches: C's decides whenever it is set, the alias only when not.
     println!(
-        "rt-policy: {}={:?} -> RtPolicy::{:?}",
-        epics_base_rs::runtime::task::RT_PRIORITY_ENV,
-        raw,
+        "rt-policy: {C_RT_PRIORITY_ENV}={:?} {RT_PRIORITY_ENV}={:?} -> RtPolicy::{:?}",
+        std::env::var_os(C_RT_PRIORITY_ENV),
+        std::env::var_os(RT_PRIORITY_ENV),
         RtPolicy::current()
     );
     let handle = std::thread::spawn(|| {
@@ -663,7 +680,7 @@ async fn pi_proof(
         .spawn(move || {
             pin_cpu(cpu);
             let ok = set_fifo(low);
-            eprintln!("holder: SCHED_FIFO({low}) set={ok}");
+            epics_base_rs::stderr_println!("holder: SCHED_FIFO({low}) set={ok}");
             h_bar.wait();
             while !h_stop.load(Ordering::Relaxed) {
                 let guard = h_db.lock_record("RT:AO");
@@ -706,7 +723,7 @@ async fn pi_proof(
         .spawn(move || {
             pin_cpu(cpu);
             let ok = set_fifo(med);
-            eprintln!("hog: SCHED_FIFO({med}) set={ok}");
+            epics_base_rs::stderr_println!("hog: SCHED_FIFO({med}) set={ok}");
             m_bar.wait();
             // Spin ~20 ms, then yield CPU0 for ~5 ms. The yield is what makes
             // the PI-OFF arm *terminate* instead of hanging in an unbounded
@@ -738,7 +755,7 @@ async fn pi_proof(
             .spawn(move || -> Vec<f64> {
                 pin_cpu(cpu);
                 let ok = set_fifo(high);
-                eprintln!("waiter: SCHED_FIFO({high}) set={ok}");
+                epics_base_rs::stderr_println!("waiter: SCHED_FIFO({high}) set={ok}");
                 w_bar.wait();
                 let mut lats = Vec::with_capacity(samples);
                 let mut i = 0;

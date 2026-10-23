@@ -1,6 +1,12 @@
-use bitflags::bitflags;
+use std::sync::Arc;
 
-pub use asyn_rs::interfaces::motor::PidGainKind;
+use asyn_rs::error::AsynResult;
+use asyn_rs::interfaces::motor::AsynMotor;
+use asyn_rs::user::AsynUser;
+use bitflags::bitflags;
+use epics_base_rs::types::PvString;
+
+pub use asyn_rs::interfaces::motor::{PidGainKind, PostMessage, RecordFields};
 
 bitflags! {
     /// MIP (Motion In Progress) flags — exposed as a PV field.
@@ -45,11 +51,67 @@ bitflags! {
         const COMM_ERR        = 0x1000; // bit 12: CNTRL_COMM_ERR
         const MINUS_LS        = 0x2000; // bit 13: RA_MINUS_LS
         const HOMED           = 0x4000; // bit 14: RA_HOMED
-        /// Driver does not support a base velocity (VBAS).
-        /// epics-modules/motor issue #76 (proposal PR #80/#81, unmerged).
-        /// When set, record-level acceleration calculations should treat
-        /// VBAS as effectively 0.
-        const VBAS_UNSUPPORTED = 0x8000; // bit 15
+    }
+}
+
+impl MstaFlags {
+    /// The driver's status word, C `MotorStatus.status`: what
+    /// `update_values` copies to MSTA (devMotorAsyn.c:467).
+    pub fn from_status(status: &asyn_rs::interfaces::motor::MotorStatus) -> Self {
+        let mut msta = Self::empty();
+        if status.direction {
+            msta |= Self::DIRECTION;
+        }
+        if status.done {
+            msta |= Self::DONE;
+        }
+        if status.msta_moving {
+            msta |= Self::MOVING;
+        }
+        if status.high_limit {
+            msta |= Self::PLUS_LS;
+        }
+        if status.low_limit {
+            msta |= Self::MINUS_LS;
+        }
+        if status.home {
+            msta |= Self::HOME_LS;
+        }
+        if status.encoder_home {
+            msta |= Self::EA_HOME;
+        }
+        if status.powered {
+            msta |= Self::POSITION;
+        }
+        if status.problem {
+            msta |= Self::PROBLEM;
+        }
+        if status.slip {
+            msta |= Self::SLIP;
+        }
+        if status.slip_stall {
+            msta |= Self::SLIP_STALL;
+        }
+        if status.comms_error {
+            msta |= Self::COMM_ERR;
+        }
+        if status.gain_support {
+            msta |= Self::GAIN_SUPPORT;
+        }
+        if status.has_encoder {
+            msta |= Self::ENCODER_PRESENT;
+        }
+        // RA_HOMED (bit 14) mirrors the driver status word like every
+        // other MSTA bit. C copies pmr->msta wholesale from the driver
+        // each poll (devMotorAsyn.c:467) and never record-manages
+        // RA_HOMED — motorRecord.cc writes it nowhere. A record-side
+        // sticky latch would report a permanently-homed axis after the
+        // driver de-asserts homed (re-home, controller reset, a
+        // SetPosition redefine the controller treats as un-homed).
+        if status.homed {
+            msta |= Self::HOMED;
+        }
+        msta
     }
 }
 
@@ -130,12 +192,12 @@ impl FreezeOffset {
     }
 }
 
-/// A jog or home command queued behind an in-progress motion (stop-then-X).
+/// A home queued behind an in-progress motion (stop-then-home, C 2028).
 /// Tracked outside the MIP bitflags so it cannot be confused with an active
-/// jog/home that a plain STOP has just halted.
+/// home that a plain STOP has just halted. A jog has no queued form: C
+/// postProcess re-fires only a home (856-891).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueuedMotion {
-    Jog { forward: bool },
     Home { forward: bool },
 }
 
@@ -220,7 +282,6 @@ pub enum MotorEvent {
     UserWrite(CommandSource),
     DeviceUpdate(asyn_rs::interfaces::motor::MotorStatus),
     DelayExpired,
-    Startup,
 }
 
 /// Which field triggered the command.
@@ -243,12 +304,15 @@ pub enum CommandSource {
     Cnen,
 }
 
-/// Commands to send to the motor driver.
+/// Commands to send to the motor driver, in C's raw units as
+/// motorRecord's `build_trans` calls carry them: positions in steps
+/// (`dial / mres`), speeds in steps/s and accelerations in steps/s²
+/// (`egu / fabs(mres)`).
 #[derive(Debug, Clone, PartialEq)]
 pub enum MotorCommand {
     MoveAbsolute {
         position: f64,
-        /// Base/start velocity (VBAS, EGU/sec) sent to the driver ahead of the
+        /// Base/start velocity (VBAS) sent to the driver ahead of the
         /// move — canonical asyn `SET_VEL_BASE`/`minVelocity`.
         min_velocity: f64,
         velocity: f64,
@@ -261,11 +325,15 @@ pub enum MotorCommand {
         acceleration: f64,
     },
     MoveVelocity {
-        /// DIAL-frame forward. The jog button is USER-frame; the
-        /// planner folds DIR before emitting (C motorRecord.cc:2119
-        /// commands `jogv = (jvel * dir) / mres` — the velocity sign
-        /// carries DIR).
-        direction: bool,
+        min_velocity: f64,
+        /// Signed: C's `jogv = (jvel * dir) / mres` (motorRecord.cc:2119).
+        velocity: f64,
+        acceleration: f64,
+    },
+    /// C's JOG_VELOCITY: special()'s JVEL retune of a running jog
+    /// (motorRecord.cc:3059-3072). A device runs it as the jog itself
+    /// (devMotorAsyn.c motorMoveVel) but builds it without PREM or POST.
+    JogVelocity {
         min_velocity: f64,
         velocity: f64,
         acceleration: f64,
@@ -276,18 +344,36 @@ pub enum MotorCommand {
         velocity: f64,
         acceleration: f64,
     },
-    /// Absolute move to a controller-defined home position (C: a6f64591).
-    MoveToHome {
-        position: f64,
-        min_velocity: f64,
-        velocity: f64,
-        acceleration: f64,
-    },
+    /// C `writeInt32(motorMoveToHome_, 1)`: the controller's moveToHome
+    /// thread runs the axis's `doMoveToHome` (asynMotorController.cpp:236-242).
+    MoveToHome,
     Stop {
         acceleration: f64,
     },
     SetPosition {
         position: f64,
+    },
+    /// C init_controller's position load (devMotorAsyn.c:216-231): a
+    /// SyncIO write that init_controller reports itself rather than through
+    /// asynCallback.
+    InitPosition {
+        position: f64,
+    },
+    /// MOTOR_ENCODER_POSITION written to the controller port
+    /// (asynMotorController.cpp:367-372); no record command sends it.
+    SetEncoderPosition {
+        position: f64,
+    },
+    /// do_work's SET_ENC_RATIO (motorRecord.cc:1973-1978): encoder and
+    /// motor pulses per scaled count, C's `ep_mp`, which devMotorAsyn's
+    /// build_trans divides.
+    SetEncoderRatio {
+        pulses: [f64; 2],
+    },
+    /// C init_controller's encoder-ratio write (devMotorAsyn.c:186-198),
+    /// reported by init_controller like [`InitPosition`](Self::InitPosition).
+    InitEncoderRatio {
+        ratio: f64,
     },
     SetClosedLoop {
         enable: bool,
@@ -296,8 +382,38 @@ pub enum MotorCommand {
         defer: bool,
     },
     Poll,
+    /// A model-1 record's OUT parm, `mr->out.value.vmeio.parm`, sent when
+    /// the record binds its axis.
+    OutParm {
+        parm: PvString,
+    },
+    /// A model-1 record's INIT text, C `build_trans(PRIMITIVE)` at init
+    /// (motordevCom.cc:309-327); no model-2/3 device sends it.
+    Primitive {
+        init: PvString,
+    },
+    /// The record's PREM and POST, ahead of the move they belong to: C
+    /// `build_trans` reads PREM at each move it builds, and arms the move
+    /// with the POST field itself when it is set then.
+    MoveStrings {
+        prem: PvString,
+        post: Option<PostMessage>,
+    },
+    /// The record's CDIR, ahead of the move it belongs to: what a model-1
+    /// driver polling that move reads as `mr->cdir`.
+    MoveDirection {
+        forward: bool,
+    },
+    /// The record's fields a model-1 device reads in `build_trans`, ahead
+    /// of a transaction that moves.
+    RecordFields(RecordFields),
     ProfileInitialize {
         max_points: usize,
+    },
+    /// The axis's profile in controller units, as a C `defineProfile`
+    /// override has it once the base has converted it.
+    ProfileDefine {
+        positions: Vec<f64>,
     },
     ProfileBuild,
     ProfileExecute,
@@ -310,21 +426,294 @@ pub enum MotorCommand {
         kind: PidGainKind,
         gain: f64,
     },
-    /// Forward the high soft-travel limit, dial-frame EGU (C
-    /// set_dial_highlimit, motorRecord.cc 4236-4277). C's wire value is
-    /// raw steps (dhlm/mres) with an MRES-sign register swap; the
-    /// AsynMotor boundary speaks dial EGU (like SetPosition), so the
-    /// dial high limit is forwarded as the high limit unconditionally —
-    /// the raw-frame fold lives where the raw pair is tracked
-    /// (RHLM/RLLM).
+    /// The controller's high raw limit (SET_HIGH_LIMIT): the dial high
+    /// limit, or the dial low one under a negative MRES (C
+    /// set_dial_highlimit / set_dial_lowlimit, motorRecord.cc 4236-4328).
     SetHighLimit {
         position: f64,
     },
-    /// Forward the low soft-travel limit, dial-frame EGU (C
-    /// set_dial_lowlimit, motorRecord.cc 4287-4328).
+    /// The controller's low raw limit (SET_LOW_LIMIT).
     SetLowLimit {
         position: f64,
     },
+    /// The record's SET_VELOCITY: stored on the axis for its next move
+    /// (devMotorAsyn.c:549-552).
+    SetVelocity {
+        velocity: f64,
+    },
+    /// The record's SET_VEL_BASE (devMotorAsyn.c:545-548).
+    SetVelBase {
+        velocity: f64,
+    },
+    /// The record's SET_ACCEL (devMotorAsyn.c:553-556).
+    SetAccel {
+        acceleration: f64,
+    },
+    /// A driver's own call on its axis, which its parameter write runs
+    /// through [`AxisUser::run`](crate::controller_port::AxisUser::run).
+    Driver(DriverCall),
+}
+
+/// The call a [`MotorCommand::Driver`] runs with the axis locked.
+#[derive(Clone)]
+pub struct DriverCall(Arc<dyn Fn(&mut dyn AsynMotor, &AsynUser) -> AsynResult<()> + Send + Sync>);
+
+impl DriverCall {
+    pub fn new(
+        call: impl Fn(&mut dyn AsynMotor, &AsynUser) -> AsynResult<()> + Send + Sync + 'static,
+    ) -> Self {
+        Self(Arc::new(call))
+    }
+
+    pub(crate) fn run(&self, motor: &mut dyn AsynMotor, user: &AsynUser) -> AsynResult<()> {
+        (self.0)(motor, user)
+    }
+}
+
+impl std::fmt::Debug for DriverCall {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DriverCall")
+    }
+}
+
+impl PartialEq for DriverCall {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+/// Which of SET_VELOCITY, SET_VEL_BASE and SET_ACCEL a motorRecord call site
+/// writes ahead of its move or jog.
+#[derive(Debug, Clone, Copy)]
+pub struct SpeedWrites {
+    velocity: bool,
+    vel_base: bool,
+    /// SET_ACCEL only at a positive acceleration, else always.
+    accel_if_positive: bool,
+}
+
+impl SpeedWrites {
+    /// A move, a home, and the jog backlash take-out leg (motorRecord.cc:
+    /// 872-876, :938-942, :2052-2056, :2527-2531).
+    pub const MOVE: Self = Self {
+        velocity: true,
+        vel_base: true,
+        accel_if_positive: true,
+    };
+    /// A backlash final leg, which writes no SET_VEL_BASE (:955-958,
+    /// :1004-1007).
+    pub const BACKLASH: Self = Self {
+        velocity: true,
+        vel_base: false,
+        accel_if_positive: true,
+    };
+    /// A jog start (:2140-2142).
+    pub const JOG: Self = Self {
+        velocity: false,
+        vel_base: true,
+        accel_if_positive: false,
+    };
+    /// A JVEL write retuning a running jog (:3068-3069).
+    pub const JOG_RETUNE: Self = Self {
+        velocity: false,
+        vel_base: false,
+        accel_if_positive: false,
+    };
+}
+
+/// The speeds an axis moves on: what the record's speed writes stored
+/// last, C's `motorVelBase_` / `motorVelocity_` / `motorAccel_` parameters
+/// or drvMotorAsyn's `min_velocity` / `max_velocity` / `accel`.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct StoredSpeeds {
+    pub min_velocity: f64,
+    pub velocity: f64,
+    pub acceleration: f64,
+}
+
+/// One of the speeds a move runs on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Speed {
+    MinVelocity,
+    Velocity,
+    Acceleration,
+}
+
+impl StoredSpeeds {
+    pub fn get(&self, speed: Speed) -> f64 {
+        match speed {
+            Speed::MinVelocity => self.min_velocity,
+            Speed::Velocity => self.velocity,
+            Speed::Acceleration => self.acceleration,
+        }
+    }
+}
+
+impl MotorCommand {
+    /// devMotorAsyn's `commandIsMove` (devMotorAsyn.c:686-691): a command
+    /// whose completion processes the record, counted in
+    /// `moveRequestPending` from `build_trans` on.
+    pub fn is_move(&self) -> bool {
+        matches!(
+            self,
+            Self::MoveAbsolute { .. }
+                | Self::MoveRelative { .. }
+                | Self::MoveVelocity { .. }
+                | Self::JogVelocity { .. }
+                | Self::Home { .. }
+                | Self::SetPosition { .. }
+        )
+    }
+
+    /// The ratio an encoder-ratio write carries.
+    pub fn encoder_ratio(&self) -> Option<f64> {
+        match *self {
+            Self::SetEncoderRatio {
+                pulses: [encoder, motor],
+            } => Some(encoder / motor),
+            Self::InitEncoderRatio { ratio } => Some(ratio),
+            _ => None,
+        }
+    }
+
+    /// The record's STOP_AXIS, which carries no SET_ACCEL (motorRecord.cc:
+    /// 1337, :1886, :1909, :2031, :2114, :2156): the axis stops on its
+    /// stored acceleration.
+    pub const fn stop_axis() -> Self {
+        Self::Stop { acceleration: 0.0 }
+    }
+
+    /// `self` preceded by the speed writes its call site makes, valued from
+    /// its own fields, in motorRecord.cc's order.
+    pub fn after_speeds(self, writes: SpeedWrites) -> Vec<MotorCommand> {
+        let (min_velocity, velocity, acceleration) = match self {
+            Self::MoveAbsolute {
+                min_velocity,
+                velocity,
+                acceleration,
+                ..
+            }
+            | Self::MoveRelative {
+                min_velocity,
+                velocity,
+                acceleration,
+                ..
+            }
+            | Self::Home {
+                min_velocity,
+                velocity,
+                acceleration,
+                ..
+            } => (min_velocity, Some(velocity), acceleration),
+            // A jog's velocity is its own message's value.
+            Self::MoveVelocity {
+                min_velocity,
+                acceleration,
+                ..
+            }
+            | Self::JogVelocity {
+                min_velocity,
+                acceleration,
+                ..
+            } => (min_velocity, None, acceleration),
+            _ => return vec![self],
+        };
+        let mut commands = Vec::with_capacity(4);
+        if let (true, Some(velocity)) = (writes.velocity, velocity) {
+            commands.push(Self::SetVelocity { velocity });
+        }
+        if writes.vel_base {
+            commands.push(Self::SetVelBase {
+                velocity: min_velocity,
+            });
+        }
+        if !writes.accel_if_positive || acceleration > 0.0 {
+            commands.push(Self::SetAccel { acceleration });
+        }
+        commands.push(self);
+        commands
+    }
+
+    /// This move or stop on the speeds `speed` reads in place of its own;
+    /// a jog keeps its velocity, which is its message's value. Only the
+    /// speeds the command runs on are read, in C's VEL_BASE, VELOCITY,
+    /// ACCEL order (asynMotorController.cpp:207, :297-299, :329-330).
+    pub fn on_speeds(&self, mut speed: impl FnMut(Speed) -> f64) -> Self {
+        let mut command = self.clone();
+        match &mut command {
+            Self::MoveAbsolute {
+                min_velocity,
+                velocity,
+                acceleration,
+                ..
+            }
+            | Self::MoveRelative {
+                min_velocity,
+                velocity,
+                acceleration,
+                ..
+            }
+            | Self::Home {
+                min_velocity,
+                velocity,
+                acceleration,
+                ..
+            } => {
+                *min_velocity = speed(Speed::MinVelocity);
+                *velocity = speed(Speed::Velocity);
+                *acceleration = speed(Speed::Acceleration);
+            }
+            Self::MoveVelocity {
+                min_velocity,
+                acceleration,
+                ..
+            }
+            | Self::JogVelocity {
+                min_velocity,
+                acceleration,
+                ..
+            } => {
+                *min_velocity = speed(Speed::MinVelocity);
+                *acceleration = speed(Speed::Acceleration);
+            }
+            Self::Stop { acceleration } => *acceleration = speed(Speed::Acceleration),
+            _ => {}
+        }
+        command
+    }
+
+    /// A move or stop, which an axis with a speed store runs on its stored
+    /// speeds.
+    pub fn runs_on_speeds(&self) -> bool {
+        matches!(
+            self,
+            Self::MoveAbsolute { .. }
+                | Self::MoveRelative { .. }
+                | Self::MoveVelocity { .. }
+                | Self::JogVelocity { .. }
+                | Self::Home { .. }
+                | Self::Stop { .. }
+        )
+    }
+
+    /// The record's SET_VELOCITY, SET_VEL_BASE or SET_ACCEL.
+    pub fn is_speed_write(&self) -> bool {
+        matches!(
+            self,
+            Self::SetVelocity { .. } | Self::SetVelBase { .. } | Self::SetAccel { .. }
+        )
+    }
+
+    /// Store this speed write in `speeds`; whether it is one.
+    pub fn store_speed(&self, speeds: &mut StoredSpeeds) -> bool {
+        match *self {
+            Self::SetVelocity { velocity } => speeds.velocity = velocity,
+            Self::SetVelBase { velocity } => speeds.min_velocity = velocity,
+            Self::SetAccel { acceleration } => speeds.acceleration = acceleration,
+            _ => return false,
+        }
+        true
+    }
 }
 
 /// Effects returned by process logic.
@@ -332,21 +721,27 @@ pub enum MotorCommand {
 pub struct ProcessEffects {
     pub commands: Vec<MotorCommand>,
     pub schedule_delay: Option<std::time::Duration>,
+    /// A forced poll no C GET_INFO asks for: it prints nothing and posts
+    /// even an unchanged status. A C GET_INFO is a [`MotorCommand::Poll`].
     pub request_poll: bool,
+    /// The pass leaves through C `goto process_exit` (motorRecord.cc:1379,
+    /// 1425, 1454), past do_work and the RLNK put at 1495.
+    pub process_exit: bool,
     /// Not consulted: FLNK is gated solely on DMOV at process exit
     /// (C motorRecord.cc:1509-1510, `if (dmov != 0) recGblFwdLink`) —
     /// the record core neither sets nor reads this. Retained only so
     /// the public struct shape is unchanged.
     pub suppress_forward_link: bool,
-    pub status_refresh: bool,
 }
 
-/// Retarget action when a new target arrives during motion.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RetargetAction {
-    Ignore,
-    StopAndReplan,
-    ExtendMove,
+impl ProcessEffects {
+    /// Append the effects of a later step of the same pass.
+    pub(crate) fn absorb(&mut self, later: ProcessEffects) {
+        self.commands.extend(later.commands);
+        self.schedule_delay = later.schedule_delay.or(self.schedule_delay);
+        self.request_poll |= later.request_poll;
+        self.process_exit |= later.process_exit;
+    }
 }
 
 /// Motor record errors.
@@ -372,3 +767,28 @@ impl std::fmt::Display for MotorError {
 }
 
 impl std::error::Error for MotorError {}
+
+#[cfg(test)]
+mod msta_tests {
+    use super::*;
+    use asyn_rs::interfaces::motor::MotorStatus;
+
+    /// asynMotorController's status params are the MSTA bits in order, so
+    /// motorStatusSlip_ is bit 4 and motorStatusFollowingError_ bit 6
+    /// (asynMotorController.cpp:85-99).
+    #[test]
+    fn slip_and_following_error_are_bits_4_and_6() {
+        let slip = MotorStatus {
+            slip: true,
+            done: false,
+            ..MotorStatus::default()
+        };
+        let stall = MotorStatus {
+            slip_stall: true,
+            done: false,
+            ..MotorStatus::default()
+        };
+        assert_eq!(MstaFlags::from_status(&slip).bits(), 0x10);
+        assert_eq!(MstaFlags::from_status(&stall).bits(), 0x40);
+    }
+}

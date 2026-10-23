@@ -75,7 +75,7 @@ async fn lso_val_in_db_is_refused_with_the_real_reason() {
 
 #[epics_macros_rs::epics_test]
 async fn printf_val_in_db_is_refused_and_other_lso_fields_still_load() {
-    // Family member: printf VAL is in `long_string_fields` too.
+    // Family member: printf VAL is a long string too.
     let db = r#"record(printf, "P") { field(VAL, "x") }"#;
     let status = load(db)
         .await

@@ -1,1089 +1,283 @@
-//! Multi-layer monochromator control -- native Rust port of `ml_monoCtl.st`.
+//! `ml_monoCtl.st`, compiled by snc-rs from `build.rs` and run on
+//! `epics-seq-rs`.
 //!
-//! Controls a multilayer monochromator with variable d-spacing (not crystal).
-//! Key difference from Kohzu: uses `D` (layer spacing) and `Order` instead of
-//! Miller indices (H,K,L) and lattice constant. The effective 2d-spacing is
-//! `2d = 2*D/Order`.
-//!
-//! Motors: Theta, Theta2 (parallel crystals), Z (optional, for beam tracking).
-//! The Y motor provides the y-offset readback but is not commanded.
-//!
-//! Modes: Normal (Z moves) and Freeze-Z (channel-cut, Z frozen).
-//! Z position: z = y_offset / tan(2*theta).
+//! The escaped C follows: the `%{ }%` subroutine as Rust, then one
+//! `seqg_escaped!` arm per fragment, its text as cpp hands it to snc. The
+//! program is `-r`, so the C's file-scope variables are the block
+//! `seqg::seqg_static_vars()` returns.
 
-use std::time::Duration;
+use epics_seq_rs::c::*;
 
-use epics_base_rs::server::database::PvDatabase;
-use tracing::info;
-
-use crate::db_access::{DbChannel, DbMultiMonitor, alloc_origin};
-use crate::snl::kohzu_ctl::HC;
-
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
-
-const RAD_CONV: f64 = 57.29577951308232;
-
-// ---------------------------------------------------------------------------
-// Operating modes
-// ---------------------------------------------------------------------------
-
-/// Multi-layer mono mode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MlMonoMode {
-    /// Normal -- Z motor moves.
-    Normal = 0,
-    /// Freeze Z -- channel-cut, Z frozen.
-    FreezeZ = 1,
-}
-
-impl MlMonoMode {
-    pub fn from_i16(v: i16) -> Self {
-        if v == 1 { Self::FreezeZ } else { Self::Normal }
+/// `ml_monoCtl_calc2dSpacing`, by the name the SNL code calls.
+#[allow(non_snake_case)]
+fn ml_monoCtl_calc2dSpacing() -> f64 {
+    let v = seqg::seqg_static_vars();
+    let result = (2.0 * v.D.get()) / v.Order.get();
+    v.opAlert.set(0);
+    if v.Order.get() < 1.0 {
+        v.opAlert.set(1);
     }
-
-    pub fn z_frozen(self) -> bool {
-        self == Self::FreezeZ
-    }
-}
-
-// ---------------------------------------------------------------------------
-// State enum
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MlMonoState {
-    Init,
-    InitSequence,
-    WaitForCommand,
-    DInputChanged,
-    ThetaLimits,
-    EChanged,
-    LambdaChanged,
-    ThetaChanged,
-    CalcMovements,
-    MoveMlMono,
-    UpdateReadback,
-    CheckDone,
-    ThetaMotorStopped,
-    CheckMotorLimits,
-    StopMlMono,
-}
-
-// ---------------------------------------------------------------------------
-// Pure physics functions
-// ---------------------------------------------------------------------------
-
-/// Calculate effective 2d-spacing from layer spacing D and diffraction order.
-/// Returns (two_d, is_error, message).
-///
-/// C computes `result = (2*D)/Order` unconditionally and returns it, only
-/// raising opAlert when `Order < 1` (ml_monoCtl.st:1314-1329). A `0 < Order < 1`
-/// therefore still yields a finite 2d in C; returning 0.0 zeroed the E/lambda
-/// DRVH-DRVL limits instead. We reproduce the finite quotient and the alert, but
-/// guard `Order <= 0` so we never produce C's bare `2*D/0` infinity.
-pub fn calc_2d_spacing(d: f64, order: f64) -> (f64, bool, &'static str) {
-    if order <= 0.0 {
-        return (0.0, true, "Order must be >= 1");
-    }
-    let two_d = (2.0 * d) / order;
-    if order < 1.0 {
-        (two_d, true, "Order must be >= 1")
+    if v.opAlert.get() != 0 {
+        sprintf(&v.seqMsg1, "Order == %f?", &[CArg::from(v.Order.get())]);
     } else {
-        (two_d, false, "New effective d spacing")
+        sprintf(&v.seqMsg1, "New effective d spacing", &[]);
     }
+    result
 }
 
-/// Convert energy (keV) to wavelength (Angstrom).
-pub fn energy_to_lambda(e: f64) -> f64 {
-    if e <= 0.0 {
-        return f64::INFINITY;
-    }
-    HC / e
-}
-
-/// Convert wavelength to energy.
-pub fn lambda_to_energy(lambda: f64) -> f64 {
-    if lambda <= 0.0 {
-        return f64::INFINITY;
-    }
-    HC / lambda
-}
-
-/// Convert wavelength to theta (degrees) given 2d spacing.
-/// Returns None if impossible.
-pub fn lambda_to_theta(lambda: f64, two_d: f64) -> Option<f64> {
-    if two_d <= 0.0 || lambda <= 0.0 {
-        return None;
-    }
-    let sin_theta = lambda / two_d;
-    if !(-1.0..=1.0).contains(&sin_theta) {
-        return None;
-    }
-    Some(sin_theta.asin() * RAD_CONV)
-}
-
-/// Convert theta (degrees) to wavelength given 2d spacing.
-pub fn theta_to_lambda(theta_deg: f64, two_d: f64) -> f64 {
-    two_d * (theta_deg / RAD_CONV).sin()
-}
-
-/// Calculate Z motor position for the multilayer geometry.
-/// z = y_offset / tan(2*theta)
-pub fn calc_z_position(theta_deg: f64, y_offset: f64) -> f64 {
-    let two_theta_rad = 2.0 * theta_deg / RAD_CONV;
-    let tan_val = two_theta_rad.tan();
-    if tan_val.abs() < 1e-15 {
-        return f64::MAX;
-    }
-    y_offset / tan_val
-}
-
-/// Compute theta limits, clamped to [0.1, 89.0] degrees.
-pub fn compute_theta_limits(motor_hi: f64, motor_lo: f64) -> (f64, f64) {
-    let hi = motor_hi.min(89.0);
-    let lo = motor_lo.max(0.1);
-    (hi, lo)
-}
-
-/// Compute energy/lambda limits from 2d spacing and theta limits.
-pub fn compute_energy_lambda_limits(
-    two_d: f64,
-    theta_hi: f64,
-    theta_lo: f64,
-) -> (f64, f64, f64, f64) {
-    let lambda_hi = two_d * (theta_hi / RAD_CONV).sin();
-    let lambda_lo = two_d * (theta_lo / RAD_CONV).sin();
-    let e_hi = if lambda_lo > 0.0 {
-        HC / lambda_lo
-    } else {
-        f64::INFINITY
+macro_rules! seqg_escaped {
+    (r#"#include <string.h>"#) => {};
+    (r#"#include <math.h>"#) => {};
+    (r#"#include <stdlib.h>"#) => {};
+    (r#"double ml_monoCtl_calc2dSpacing();"#) => {};
+    (r#"char *ml_monoCtl_pmacP;"#) => {};
+    (r#"char *ml_monoCtl_pmacM;"#) => {};
+    (r#"char *ml_monoCtl_pmacGEOM;"#) => {};
+    (r#"char *ml_monoCtl_pmacY_OFF;"#) => {};
+    ($env:ident, r#"printf("ml_monoCtl:initSequence:initSeq=0\n");"#) => {
+        printf("ml_monoCtl:initSequence:initSeq=0\n", &[])
     };
-    let e_lo = if lambda_hi > 0.0 { HC / lambda_hi } else { 0.0 };
-    (e_hi, e_lo, lambda_hi, lambda_lo)
-}
-
-/// Coordinate speeds for theta and Z motors.
-/// Returns (new_th_speed, new_z_speed).
-pub fn coordinate_speeds(
-    theta_delta: f64,
-    z_delta: f64,
-    th_speed: f64,
-    z_speed: f64,
-    cc_mode: MlMonoMode,
-) -> (f64, f64) {
-    let th_time = if th_speed > 0.0 {
-        theta_delta.abs() / th_speed
-    } else {
-        0.0
+    ($env:ident, r#"ml_monoCtl_pmacP = seq_macValueGet(ssId,"P"); ml_monoCtl_pmacM = seq_macValueGet(ssId,"M_THETA"); if (ml_monoCtl_pmacP == 0 || ml_monoCtl_pmacM == 0) { sprintf(thetaMotName,"None"); } else { snprintf(thetaMotName, sizeof(thetaMotName), "%s%s", ml_monoCtl_pmacP, ml_monoCtl_pmacM); } ml_monoCtl_pmacM = seq_macValueGet(ssId,"M_THETA2"); if (ml_monoCtl_pmacP == 0 || ml_monoCtl_pmacM == 0) { sprintf(theta2MotName,"None"); } else { snprintf(theta2MotName, sizeof(theta2MotName), "%s%s", ml_monoCtl_pmacP, ml_monoCtl_pmacM); } ml_monoCtl_pmacM = seq_macValueGet(ssId,"M_Z"); if (ml_monoCtl_pmacP == 0 || ml_monoCtl_pmacM == 0) { sprintf(zMotName,"None"); } else { snprintf(zMotName, sizeof(zMotName), "%s%s", ml_monoCtl_pmacP, ml_monoCtl_pmacM); } ml_monoCtl_pmacM = seq_macValueGet(ssId,"M_Y"); if (ml_monoCtl_pmacP == 0 || ml_monoCtl_pmacM == 0) { sprintf(yMotName,"None"); } else { snprintf(yMotName, sizeof(yMotName), "%s%s", ml_monoCtl_pmacP, ml_monoCtl_pmacM); } ml_monoCtl_pmacY_OFF = seq_macValueGet(ssId,"Y_OFF"); yOffset = atof(ml_monoCtl_pmacY_OFF); if ((yOffset < 1) || (yOffset > 60.)) yOffset = 35.; ml_monoCtl_pmacGEOM = seq_macValueGet(ssId,"GEOM"); geom = 1;"#) => {{
+        let v = $env.var();
+        let p = $env.mac_value_get("P");
+        for (name, motor) in [
+            (&v.thetaMotName, "M_THETA"),
+            (&v.theta2MotName, "M_THETA2"),
+            (&v.zMotName, "M_Z"),
+            (&v.yMotName, "M_Y"),
+        ] {
+            let m = $env.mac_value_get(motor);
+            if p.is_none() || m.is_none() {
+                sprintf(name, "None", &[]);
+            } else {
+                sprintf(name, "%s%s", &[CArg::from(p.clone()), CArg::from(m)]);
+            }
+        }
+        v.yOffset.set(atof($env.mac_value_get("Y_OFF")));
+        if v.yOffset.get() < 1.0 || v.yOffset.get() > 60. {
+            v.yOffset.set(35.);
+        }
+        // C fetches GEOM into ml_monoCtl_pmacGEOM and never reads it.
+        v.geom.set(1);
+    }};
+    ($env:ident, r#"printf("ml_monoCtl:initSequence:initSeq=1\n");"#) => {
+        printf("ml_monoCtl:initSequence:initSeq=1\n", &[])
     };
-    let z_time = if cc_mode.z_frozen() {
-        0.0
-    } else if z_speed > 0.0 {
-        z_delta.abs() / z_speed
-    } else {
-        0.0
+    ($env:ident, r#"printf("ml_monoCtl:initSequence:initSeq=2\n");"#) => {
+        printf("ml_monoCtl:initSequence:initSeq=2\n", &[])
     };
-
-    let max_time = th_time.max(z_time);
-    if max_time <= 0.0 {
-        return (th_speed, z_speed);
-    }
-
-    let new_th = if theta_delta.abs() > 0.0 {
-        theta_delta.abs() / max_time
-    } else {
-        th_speed
+    ($env:ident, r#"printf("ml_monoCtl:initSequence:initSeq=3\n");"#) => {
+        printf("ml_monoCtl:initSequence:initSeq=3\n", &[])
     };
-    let new_z = if z_delta.abs() > 0.0 {
-        z_delta.abs() / max_time
-    } else {
-        z_speed
+    ($env:ident, r#"printf("ml_monoCtl:waitForCmndEnter:initSeqDone\n");"#) => {
+        printf("ml_monoCtl:waitForCmndEnter:initSeqDone\n", &[])
     };
-    (new_th, new_z)
+    (
+        $env:ident,
+        r#"printf("ml_monoCtl:waitForCmndEnter: ml_monoMoving=%d; ml_monoDone=%d\n","#,
+        r#"ml_monoMoving, ml_monoDone);"#
+    ) => {{
+        let v = $env.var();
+        printf(
+            "ml_monoCtl:waitForCmndEnter: ml_monoMoving=%d; ml_monoDone=%d\n",
+            &[
+                CArg::from(v.ml_monoMoving.get()),
+                CArg::from(v.ml_monoDone.get()),
+            ],
+        )
+    }};
+    ($env:ident, r#"printf("ml_monoCtl:waitForCmndEnter: asserting 'done'.\n");"#) => {
+        printf("ml_monoCtl:waitForCmndEnter: asserting 'done'.\n", &[])
+    };
+    ($env:ident, r#"printf("ml_monoCtl:waitForCmnd:Order/D_mon\n");"#) => {
+        printf("ml_monoCtl:waitForCmnd:Order/D_mon\n", &[])
+    };
+    ($env:ident, r#"printf("ml_monoCtl:waitForCmnd:thetaMotXxLim_mon\n");"#) => {
+        printf("ml_monoCtl:waitForCmnd:thetaMotXxLim_mon\n", &[])
+    };
+    ($env:ident, r#"printf("ml_monoCtl:waitForCmnd:theta2MotXxLim_mon\n");"#) => {
+        printf("ml_monoCtl:waitForCmnd:theta2MotXxLim_mon\n", &[])
+    };
+    ($env:ident, r#"printf("ml_monoCtl:waitForCmnd:thetaMotRdbk_mon\n");"#) => {
+        printf("ml_monoCtl:waitForCmnd:thetaMotRdbk_mon\n", &[])
+    };
+    ($env:ident, r#"printf("ml_monoCtl:waitForCmnd:theta2MotRdbk_mon\n");"#) => {
+        printf("ml_monoCtl:waitForCmnd:theta2MotRdbk_mon\n", &[])
+    };
+    ($env:ident, r#"printf("ml_monoCtl:waitForCmnd:E_mon\n");"#) => {
+        printf("ml_monoCtl:waitForCmnd:E_mon\n", &[])
+    };
+    ($env:ident, r#"printf("ml_monoCtl:waitForCmnd:lambda_mon\n");"#) => {
+        printf("ml_monoCtl:waitForCmnd:lambda_mon\n", &[])
+    };
+    ($env:ident, r#"printf("ml_monoCtl:waitForCmnd:theta_mon\n");"#) => {
+        printf("ml_monoCtl:waitForCmnd:theta_mon\n", &[])
+    };
+    ($env:ident, r#"printf("ml_monoCtl:waitForCmnd:putVals\n");"#) => {
+        printf("ml_monoCtl:waitForCmnd:putVals\n", &[])
+    };
+    ($env:ident, r#"printf("ml_monoCtl:waitForCmnd:Tweak\n");"#) => {
+        printf("ml_monoCtl:waitForCmnd:Tweak\n", &[])
+    };
+    ($env:ident, r#"printf("ml_monoCtl:waitForCmnd:yOffset_mon\n");"#) => {
+        printf("ml_monoCtl:waitForCmnd:yOffset_mon\n", &[])
+    };
+    ($env:ident, r#"snprintf(seqMsg1, sizeof(seqMsg1), "y offset changed to %f", yOffset);"#) => {{
+        let v = $env.var();
+        sprintf(
+            &v.seqMsg1,
+            "y offset changed to %f",
+            &[CArg::from(v.yOffset.get())],
+        )
+    }};
+    ($env:ident, r#"printf("ml_monoCtl:waitForCmnd:opAck\n");"#) => {
+        printf("ml_monoCtl:waitForCmnd:opAck\n", &[])
+    };
+    ($env:ident, r#"printf("ml_monoCtl:tweak:E+\n");"#) => {
+        printf("ml_monoCtl:tweak:E+\n", &[])
+    };
+    ($env:ident, r#"printf("ml_monoCtl:tweak:L\n");"#) => {
+        printf("ml_monoCtl:tweak:L\n", &[])
+    };
+    ($env:ident, r#"printf("ml_monoCtl:tweak:th\n");"#) => {
+        printf("ml_monoCtl:tweak:th\n", &[])
+    };
+    ($env:ident, r#"printf("ml_monoCtl:dInputChanged\n");"#) => {
+        printf("ml_monoCtl:dInputChanged\n", &[])
+    };
+    ($env:ident, r#"printf("ml_monoCtl:thetaLimits\n");"#) => {
+        printf("ml_monoCtl:thetaLimits\n", &[])
+    };
+    ($env:ident, r#"printf("ml_monoCtl:eChanged\n");"#) => {
+        printf("ml_monoCtl:eChanged\n", &[])
+    };
+    ($env:ident, r#"printf("ml_monoCtl:lChanged: lambda>2*D\n");"#) => {
+        printf("ml_monoCtl:lChanged: lambda>2*D\n", &[])
+    };
+    ($env:ident, r#"printf("ml_monoCtl:lChanged\n");"#) => {
+        printf("ml_monoCtl:lChanged\n", &[])
+    };
+    ($env:ident, r#"printf("ml_monoCtl:thChanged\n");"#) => {
+        printf("ml_monoCtl:thChanged\n", &[])
+    };
+    ($env:ident, r#"printf("ml_monoCtl:calcMovements\n");"#) => {
+        printf("ml_monoCtl:calcMovements\n", &[])
+    };
+    ($env:ident, r#"printf("ml_monoCtl:move_ml_mono:auto|put\n");"#) => {
+        printf("ml_monoCtl:move_ml_mono:auto|put\n", &[])
+    };
+    ($env:ident, r#"printf("ml_monoCtl:move_ml_mono\n");"#) => {
+        printf("ml_monoCtl:move_ml_mono\n", &[])
+    };
+    ($env:ident, r#"printf("ml_monoCtl:checkDone: done\n");"#) => {
+        printf("ml_monoCtl:checkDone: done\n", &[])
+    };
+    ($env:ident, r#"printf("ml_monoCtl:checkDone: not done\n");"#) => {
+        printf("ml_monoCtl:checkDone: not done\n", &[])
+    };
+    ($env:ident, r#"printf("ml_monoCtl:updateRdbk:thetaMotRdbk==0\n");"#) => {
+        printf("ml_monoCtl:updateRdbk:thetaMotRdbk==0\n", &[])
+    };
+    (
+        $env:ident,
+        r#"printf("ml_monoCtl:updateRdbk:*Dmov (done=%d,moving=%d)\n","#,
+        r#"ml_monoDone, ml_monoMoving);"#
+    ) => {{
+        let v = $env.var();
+        printf(
+            "ml_monoCtl:updateRdbk:*Dmov (done=%d,moving=%d)\n",
+            &[
+                CArg::from(v.ml_monoDone.get()),
+                CArg::from(v.ml_monoMoving.get()),
+            ],
+        )
+    }};
+    ($env:ident, r#"printf("ml_monoCtl:updateRdbk: done\n");"#) => {
+        printf("ml_monoCtl:updateRdbk: done\n", &[])
+    };
+    ($env:ident, r#"printf("ml_monoCtl:updateRdbk: Th limit switch\n");"#) => {
+        printf("ml_monoCtl:updateRdbk: Th limit switch\n", &[])
+    };
+    ($env:ident, r#"printf("ml_monoCtl:updateRdbk: Z limit switch\n");"#) => {
+        printf("ml_monoCtl:updateRdbk: Z limit switch\n", &[])
+    };
+    ($env:ident, r#"printf("ml_monoCtl:updateRdbk:moving\n");"#) => {
+        printf("ml_monoCtl:updateRdbk:moving\n", &[])
+    };
+    (
+        $env:ident,
+        r#"printf("ml_monoCtl:thetaMotStopped:causedMove (done=%d,moving=%d)\n","#,
+        r#"ml_monoDone, ml_monoMoving);"#
+    ) => {{
+        let v = $env.var();
+        printf(
+            "ml_monoCtl:thetaMotStopped:causedMove (done=%d,moving=%d)\n",
+            &[
+                CArg::from(v.ml_monoDone.get()),
+                CArg::from(v.ml_monoMoving.get()),
+            ],
+        )
+    }};
+    (
+        $env:ident,
+        r#"printf("ml_monoCtl:thetaMotStopped:!causedMove (done=%d,moving=%d)\n","#,
+        r#"ml_monoDone, ml_monoMoving);"#
+    ) => {{
+        let v = $env.var();
+        printf(
+            "ml_monoCtl:thetaMotStopped:!causedMove (done=%d,moving=%d)\n",
+            &[
+                CArg::from(v.ml_monoDone.get()),
+                CArg::from(v.ml_monoMoving.get()),
+            ],
+        )
+    }};
+    ($env:ident, r#"printf("ml_monoCtl:chkMotorLimits\n");"#) => {
+        printf("ml_monoCtl:chkMotorLimits\n", &[])
+    };
+    ($env:ident, r#"printf("ml_monoCtl:chkMotorLimitsExit: OK\n");"#) => {
+        printf("ml_monoCtl:chkMotorLimitsExit: OK\n", &[])
+    };
+    ($env:ident, r#"printf("ml_monoCtl:chkMotorLimitsExit: opAlert\n");"#) => {
+        printf("ml_monoCtl:chkMotorLimitsExit: opAlert\n", &[])
+    };
+    ($env:ident, r#"printf("ml_monoCtl:stop_ml_mono\n");"#) => {
+        printf("ml_monoCtl:stop_ml_mono\n", &[])
+    };
+    ($env:ident, r#"printf("ml_monoCtl:stopped_ml_monoWait\n");"#) => {
+        printf("ml_monoCtl:stopped_ml_monoWait\n", &[])
+    };
+    (r#"double ml_monoCtl_calc2dSpacing() { double result; result = (2*D)/Order; opAlert = 0; if (Order < 1) opAlert = 1; if (opAlert) { snprintf(seqMsg1, sizeof(seqMsg1), "Order == %f?", Order); } else { sprintf(seqMsg1, "New effective d spacing"); } return(result); }"#) => {};
 }
 
-// ---------------------------------------------------------------------------
-// Configuration
-// ---------------------------------------------------------------------------
-
-pub struct MlMonoConfig {
-    pub prefix: String,
-    pub m_theta: String,
-    pub m_theta2: String,
-    pub m_y: String,
-    pub m_z: String,
-    pub y_offset: f64,
-    pub geom: i32,
-}
-
-impl MlMonoConfig {
-    pub fn new(
-        prefix: &str,
-        m_theta: &str,
-        m_theta2: &str,
-        m_y: &str,
-        m_z: &str,
-        y_offset: f64,
-        geom: i32,
-    ) -> Self {
-        let y_off = if !(1.0..=60.0).contains(&y_offset) {
-            35.0
-        } else {
-            y_offset
-        };
-        Self {
-            prefix: prefix.to_string(),
-            m_theta: m_theta.to_string(),
-            m_theta2: m_theta2.to_string(),
-            m_y: m_y.to_string(),
-            m_z: m_z.to_string(),
-            y_offset: y_off,
-            geom,
-        }
-    }
-
-    fn pv(&self, suffix: &str) -> String {
-        format!("{}ml_mono{}", self.prefix, suffix)
-    }
-
-    fn motor_pv(&self, motor: &str, field: &str) -> String {
-        format!("{}{}{}", self.prefix, motor, field)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Async runner
-// ---------------------------------------------------------------------------
-
-/// Run the multi-layer monochromator control state machine.
-pub async fn run(
-    config: MlMonoConfig,
-    db: PvDatabase,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    println!("ml_monoCtl: starting for prefix={}", config.prefix);
-
-    let my_origin = alloc_origin();
-
-    // -- Create channels --
-    let _ch_debug = DbChannel::with_origin(&db, &config.pv("CtlDebug"), my_origin);
-    let ch_msg1 = DbChannel::with_origin(&db, &config.pv("SeqMsg1"), my_origin);
-    let ch_msg2 = DbChannel::with_origin(&db, &config.pv("SeqMsg2"), my_origin);
-    let ch_alert = DbChannel::with_origin(&db, &config.pv("Alert"), my_origin);
-    let ch_oper_ack = DbChannel::with_origin(&db, &config.pv("OperAck"), my_origin);
-    let ch_put_vals = DbChannel::with_origin(&db, &config.pv("Put"), my_origin);
-    let ch_auto_mode = DbChannel::with_origin(&db, &config.pv("Mode"), my_origin);
-    let ch_cc_mode = DbChannel::with_origin(&db, &config.pv("Mode2"), my_origin);
-    let ch_moving = DbChannel::with_origin(&db, &config.pv("Moving"), my_origin);
-
-    // D-spacing parameters
-    let ch_order = DbChannel::with_origin(&db, &config.pv("Order"), my_origin);
-    let ch_d = DbChannel::with_origin(&db, &config.pv("D"), my_origin);
-
-    // Energy / lambda / theta
-    let ch_e = DbChannel::with_origin(&db, &config.pv("E"), my_origin);
-    let ch_e_hi = DbChannel::with_origin(&db, &config.pv("E.DRVH"), my_origin);
-    let ch_e_lo = DbChannel::with_origin(&db, &config.pv("E.DRVL"), my_origin);
-    let ch_e_rdbk = DbChannel::with_origin(&db, &config.pv("ERdbk"), my_origin);
-
-    let ch_lambda = DbChannel::with_origin(&db, &config.pv("Lambda"), my_origin);
-    let ch_lambda_hi = DbChannel::with_origin(&db, &config.pv("Lambda.DRVH"), my_origin);
-    let ch_lambda_lo = DbChannel::with_origin(&db, &config.pv("Lambda.DRVL"), my_origin);
-    let ch_lambda_rdbk = DbChannel::with_origin(&db, &config.pv("LambdaRdbk"), my_origin);
-
-    let ch_theta = DbChannel::with_origin(&db, &config.pv("Theta"), my_origin);
-    let ch_theta_hi = DbChannel::with_origin(&db, &config.pv("Theta.DRVH"), my_origin);
-    let ch_theta_lo = DbChannel::with_origin(&db, &config.pv("Theta.DRVL"), my_origin);
-    let ch_theta_rdbk = DbChannel::with_origin(&db, &config.pv("ThetaRdbk"), my_origin);
-
-    // Echo PVs
-    let ch_theta_mot_name = DbChannel::with_origin(&db, &config.pv("ThetaPv"), my_origin);
-    let ch_theta2_mot_name = DbChannel::with_origin(&db, &config.pv("Theta2Pv"), my_origin);
-    let ch_z_mot_name = DbChannel::with_origin(&db, &config.pv("ZPv"), my_origin);
-    let ch_y_mot_name = DbChannel::with_origin(&db, &config.pv("YPv"), my_origin);
-
-    let _ch_theta_cmd_echo = DbChannel::with_origin(&db, &config.pv("ThetaCmd"), my_origin);
-    let _ch_theta2_cmd_echo = DbChannel::with_origin(&db, &config.pv("Theta2Cmd"), my_origin);
-    let _ch_z_cmd_echo = DbChannel::with_origin(&db, &config.pv("ZCmd"), my_origin);
-    let ch_theta_rdbk_echo = DbChannel::with_origin(&db, &config.pv("ThetaRdbkEcho"), my_origin);
-    let ch_theta2_rdbk_echo = DbChannel::with_origin(&db, &config.pv("Theta2RdbkEcho"), my_origin);
-    let ch_z_rdbk_echo = DbChannel::with_origin(&db, &config.pv("ZRdbk"), my_origin);
-    let ch_theta_vel_echo = DbChannel::with_origin(&db, &config.pv("ThetaVel"), my_origin);
-    let ch_theta2_vel_echo = DbChannel::with_origin(&db, &config.pv("Theta2Vel"), my_origin);
-    let ch_z_vel_echo = DbChannel::with_origin(&db, &config.pv("ZVel"), my_origin);
-    let ch_theta_dmov_echo = DbChannel::with_origin(&db, &config.pv("ThetaDmov"), my_origin);
-    let ch_theta2_dmov_echo = DbChannel::with_origin(&db, &config.pv("Theta2Dmov"), my_origin);
-    let ch_z_dmov_echo = DbChannel::with_origin(&db, &config.pv("ZDmov"), my_origin);
-
-    // Motor records
-    let ch_theta_mot_stop =
-        DbChannel::with_origin(&db, &config.motor_pv(&config.m_theta, ".STOP"), my_origin);
-    let ch_theta2_mot_stop =
-        DbChannel::with_origin(&db, &config.motor_pv(&config.m_theta2, ".STOP"), my_origin);
-    let ch_z_stop = DbChannel::with_origin(&db, &config.motor_pv(&config.m_z, ".STOP"), my_origin);
-
-    let ch_theta_dmov =
-        DbChannel::with_origin(&db, &config.motor_pv(&config.m_theta, ".DMOV"), my_origin);
-    let ch_theta2_dmov =
-        DbChannel::with_origin(&db, &config.motor_pv(&config.m_theta2, ".DMOV"), my_origin);
-    let ch_z_dmov = DbChannel::with_origin(&db, &config.motor_pv(&config.m_z, ".DMOV"), my_origin);
-
-    let ch_theta_hls =
-        DbChannel::with_origin(&db, &config.motor_pv(&config.m_theta, ".HLS"), my_origin);
-    let ch_theta_lls =
-        DbChannel::with_origin(&db, &config.motor_pv(&config.m_theta, ".LLS"), my_origin);
-    let ch_theta2_hls =
-        DbChannel::with_origin(&db, &config.motor_pv(&config.m_theta2, ".HLS"), my_origin);
-    let ch_theta2_lls =
-        DbChannel::with_origin(&db, &config.motor_pv(&config.m_theta2, ".LLS"), my_origin);
-    let ch_z_hls = DbChannel::with_origin(&db, &config.motor_pv(&config.m_z, ".HLS"), my_origin);
-    let ch_z_lls = DbChannel::with_origin(&db, &config.motor_pv(&config.m_z, ".LLS"), my_origin);
-
-    let ch_theta_set = DbChannel::with_origin(&db, &config.pv("ThetaSet"), my_origin);
-    let ch_theta2_set = DbChannel::with_origin(&db, &config.pv("Theta2Set"), my_origin);
-    let ch_z_set = DbChannel::with_origin(&db, &config.pv("ZSet"), my_origin);
-
-    let ch_theta_mot_hilim =
-        DbChannel::with_origin(&db, &config.motor_pv(&config.m_theta, ".HLM"), my_origin);
-    let ch_theta_mot_lolim =
-        DbChannel::with_origin(&db, &config.motor_pv(&config.m_theta, ".LLM"), my_origin);
-    let ch_z_mot_hilim =
-        DbChannel::with_origin(&db, &config.motor_pv(&config.m_z, ".HLM"), my_origin);
-    let ch_z_mot_lolim =
-        DbChannel::with_origin(&db, &config.motor_pv(&config.m_z, ".LLM"), my_origin);
-
-    let ch_theta_mot_cmd =
-        DbChannel::with_origin(&db, &config.motor_pv(&config.m_theta, ""), my_origin);
-    let ch_theta2_mot_cmd =
-        DbChannel::with_origin(&db, &config.motor_pv(&config.m_theta2, ""), my_origin);
-    let ch_z_mot_cmd = DbChannel::with_origin(&db, &config.motor_pv(&config.m_z, ""), my_origin);
-
-    let ch_theta_mot_velo =
-        DbChannel::with_origin(&db, &config.motor_pv(&config.m_theta, ".VELO"), my_origin);
-    let ch_theta2_mot_velo =
-        DbChannel::with_origin(&db, &config.motor_pv(&config.m_theta2, ".VELO"), my_origin);
-    let ch_z_mot_velo =
-        DbChannel::with_origin(&db, &config.motor_pv(&config.m_z, ".VELO"), my_origin);
-
-    let ch_theta_mot_rbv =
-        DbChannel::with_origin(&db, &config.motor_pv(&config.m_theta, ".RBV"), my_origin);
-    let ch_theta2_mot_rbv =
-        DbChannel::with_origin(&db, &config.motor_pv(&config.m_theta2, ".RBV"), my_origin);
-    let ch_z_mot_rbv =
-        DbChannel::with_origin(&db, &config.motor_pv(&config.m_z, ".RBV"), my_origin);
-    let ch_y_mot_rbv =
-        DbChannel::with_origin(&db, &config.motor_pv(&config.m_y, ".RBV"), my_origin);
-
-    let _ch_use_set = DbChannel::with_origin(&db, &config.pv("UseSet"), my_origin);
-    let ch_theta_mot_set_flag =
-        DbChannel::with_origin(&db, &config.motor_pv(&config.m_theta, ".SET"), my_origin);
-    let ch_theta2_mot_set_flag =
-        DbChannel::with_origin(&db, &config.motor_pv(&config.m_theta2, ".SET"), my_origin);
-    let ch_z_mot_set_flag =
-        DbChannel::with_origin(&db, &config.motor_pv(&config.m_z, ".SET"), my_origin);
-
-    let ch_y_offset = DbChannel::with_origin(&db, &config.pv("_yOffset"), my_origin);
-
-    // Tweak (inc/dec) feature: ± step buttons for E / lambda / theta.
-    // C ml_monoCtl.st:710-773 (state tweak): each button adds ± the matching
-    // step value, limit-checks, and resets the pressed BO to 0.
-    let ch_e_tweak_val = DbChannel::with_origin(&db, &config.pv("ETweak"), my_origin);
-    let ch_e_inc = DbChannel::with_origin(&db, &config.pv("EInc"), my_origin);
-    let ch_e_dec = DbChannel::with_origin(&db, &config.pv("EDec"), my_origin);
-    let ch_lambda_tweak_val = DbChannel::with_origin(&db, &config.pv("LambdaTweak"), my_origin);
-    let ch_lambda_inc = DbChannel::with_origin(&db, &config.pv("LambdaInc"), my_origin);
-    let ch_lambda_dec = DbChannel::with_origin(&db, &config.pv("LambdaDec"), my_origin);
-    let ch_theta_tweak_val = DbChannel::with_origin(&db, &config.pv("ThetaTweak"), my_origin);
-    let ch_theta_inc = DbChannel::with_origin(&db, &config.pv("ThetaInc"), my_origin);
-    let ch_theta_dec = DbChannel::with_origin(&db, &config.pv("ThetaDec"), my_origin);
-
-    // Wait for key channels
-
-    // Build multi-monitor
-    let monitored_pvs: Vec<String> = vec![
-        config.pv("E"),
-        config.pv("Lambda"),
-        config.pv("Theta"),
-        config.pv("Order"),
-        config.pv("D"),
-        config.pv("Put"),
-        config.pv("Mode"),
-        config.pv("Mode2"),
-        config.pv("OperAck"),
-        config.motor_pv(&config.m_theta, ".RBV"),
-        config.motor_pv(&config.m_theta2, ".RBV"),
-        config.motor_pv(&config.m_y, ".RBV"),
-        config.motor_pv(&config.m_theta, ".HLM"),
-        config.motor_pv(&config.m_theta, ".LLM"),
-        config.pv("_yOffset"),
-        config.pv("UseSet"),
-        config.pv("EInc"),
-        config.pv("EDec"),
-        config.pv("LambdaInc"),
-        config.pv("LambdaDec"),
-        config.pv("ThetaInc"),
-        config.pv("ThetaDec"),
-    ];
-    let mut monitor = DbMultiMonitor::new_filtered(&db, &monitored_pvs, my_origin).await;
-    println!(
-        "ml_monoCtl: subscribed to {} PVs, {} active",
-        monitored_pvs.len(),
-        monitor.sub_count()
-    );
-
-    // -- Initialize --
-    let theta_name = format!("{}{}", config.prefix, config.m_theta);
-    let theta2_name = format!("{}{}", config.prefix, config.m_theta2);
-    let z_name = format!("{}{}", config.prefix, config.m_z);
-    let y_name = format!("{}{}", config.prefix, config.m_y);
-    let _ = ch_theta_mot_name.put_string_process(&theta_name).await;
-    let _ = ch_theta2_mot_name.put_string_process(&theta2_name).await;
-    let _ = ch_z_mot_name.put_string_process(&z_name).await;
-    let _ = ch_y_mot_name.put_string_process(&y_name).await;
-
-    let _ = ch_y_offset.put_f64_process(config.y_offset).await;
-    let _ = ch_put_vals.put_i16_process(0).await;
-    let _ = ch_auto_mode.put_i16_process(0).await;
-    let _ = ch_oper_ack.put_i16_process(0).await;
-
-    // D-spacing
-    let mut order_val = ch_order.get_f64().await;
-    let mut d_val = ch_d.get_f64().await;
-    let (mut two_d, err, msg) = calc_2d_spacing(d_val, order_val);
-    let _ = ch_msg1.put_string_process(msg).await;
-    // C calc2dSpacing sets opAlert from the Order<1 check (1/0).
-    let _ = ch_alert.put_i16_process(err as i16).await;
-
-    // Theta limits
-    let mut theta_mot_hi = ch_theta_mot_hilim.get_f64().await;
-    let mut theta_mot_lo = ch_theta_mot_lolim.get_f64().await;
-    let (mut theta_hi, mut theta_lo) = compute_theta_limits(theta_mot_hi, theta_mot_lo);
-    let _ = ch_theta_hi.put_f64_process(theta_hi).await;
-    let _ = ch_theta_lo.put_f64_process(theta_lo).await;
-    let (e_hi, e_lo, l_hi, l_lo) = compute_energy_lambda_limits(two_d, theta_hi, theta_lo);
-    let _ = ch_e_hi.put_f64_process(e_hi).await;
-    let _ = ch_e_lo.put_f64_process(e_lo).await;
-    let _ = ch_lambda_hi.put_f64_process(l_hi).await;
-    let _ = ch_lambda_lo.put_f64_process(l_lo).await;
-
-    // Initial readback
-    let theta_mot_rdbk = ch_theta_mot_rbv.get_f64().await;
-    let mut theta_rdbk_val = theta_mot_rdbk;
-    let mut lambda_rdbk_val = theta_to_lambda(theta_rdbk_val, two_d);
-    let mut e_rdbk_val = lambda_to_energy(lambda_rdbk_val);
-    let _ = ch_theta_rdbk.put_f64_process(theta_rdbk_val).await;
-    let _ = ch_lambda_rdbk.put_f64_process(lambda_rdbk_val).await;
-    let _ = ch_e_rdbk.put_f64_process(e_rdbk_val).await;
-
-    let mut theta_val = theta_mot_rdbk;
-    let _ = ch_theta.put_f64_process(theta_val).await;
-    let mut lambda_val = theta_to_lambda(theta_val, two_d);
-    let _ = ch_lambda.put_f64_process(lambda_val).await;
-    let mut e_val = lambda_to_energy(lambda_val);
-    let _ = ch_e.put_f64_process(e_val).await;
-
-    let mut auto_mode = false;
-    let mut use_set_mode = false;
-    let mut cc_mode = MlMonoMode::from_i16(ch_cc_mode.get_i16().await);
-    let mut y_offset_val = config.y_offset;
-    let mut _caused_move = false;
-
-    let _ = ch_msg1.put_string_process("ml_mono Control Ready").await;
-    let _ = ch_msg2.put_string_process(" ").await;
-
-    info!("ML mono controller initialized for {}", config.prefix);
-
-    // PV name constants for dispatch
-    let pv_e = config.pv("E");
-    let pv_lambda = config.pv("Lambda");
-    let pv_theta = config.pv("Theta");
-    let pv_order = config.pv("Order");
-    let pv_d = config.pv("D");
-    let pv_put_vals = config.pv("Put");
-    let pv_auto_mode = config.pv("Mode");
-    let pv_cc_mode = config.pv("Mode2");
-    let pv_oper_ack = config.pv("OperAck");
-    let pv_theta_mot_rbv = config.motor_pv(&config.m_theta, ".RBV");
-    let pv_theta2_mot_rbv = config.motor_pv(&config.m_theta2, ".RBV");
-    let pv_y_mot_rbv = config.motor_pv(&config.m_y, ".RBV");
-    let pv_theta_hilim = config.motor_pv(&config.m_theta, ".HLM");
-    let pv_theta_lolim = config.motor_pv(&config.m_theta, ".LLM");
-    let pv_y_offset = config.pv("_yOffset");
-    let pv_use_set = config.pv("UseSet");
-    let pv_e_inc = config.pv("EInc");
-    let pv_e_dec = config.pv("EDec");
-    let pv_lambda_inc = config.pv("LambdaInc");
-    let pv_lambda_dec = config.pv("LambdaDec");
-    let pv_theta_inc = config.pv("ThetaInc");
-    let pv_theta_dec = config.pv("ThetaDec");
-
-    println!(
-        "ml_monoCtl: ready (two_d={:.4}, theta=[{:.1}..{:.1}])",
-        two_d, theta_lo, theta_hi
-    );
-
-    let mut deferred_events: std::collections::HashMap<String, f64> =
-        std::collections::HashMap::new();
-    // -- Main loop --
-    loop {
-        let mut proceed_to_theta_changed = false;
-
-        let (changed_pv, new_val) = if let Some(key) = deferred_events.keys().next().cloned() {
-            let val = deferred_events.remove(&key).unwrap();
-            (key, val)
-        } else {
-            monitor.wait_change().await
-        };
-
-        if changed_pv == pv_e {
-            let new_e = new_val;
-            if (new_e - e_val).abs() > 1e-12 {
-                e_val = new_e;
-                lambda_val = energy_to_lambda(e_val);
-                let _ = ch_lambda.put_f64_process(lambda_val).await;
-                if lambda_val > two_d {
-                    let _ = ch_msg1.put_string_process("Wavelength > 2d spacing.").await;
-                    let _ = ch_alert.put_i16_process(1).await;
-                } else if let Some(th) = lambda_to_theta(lambda_val, two_d) {
-                    theta_val = th;
-                    let _ = ch_theta.put_f64_process(theta_val).await;
-                }
-                proceed_to_theta_changed = true;
-            }
-        } else if changed_pv == pv_lambda {
-            let new_l = new_val;
-            if (new_l - lambda_val).abs() > 1e-12 {
-                lambda_val = new_l;
-                if lambda_val > two_d {
-                    let _ = ch_msg1.put_string_process("Wavelength > 2d spacing.").await;
-                    let _ = ch_alert.put_i16_process(1).await;
-                } else if let Some(th) = lambda_to_theta(lambda_val, two_d) {
-                    theta_val = th;
-                    let _ = ch_theta.put_f64_process(theta_val).await;
-                }
-                proceed_to_theta_changed = true;
-            }
-        } else if changed_pv == pv_theta {
-            let new_th = new_val;
-            if (new_th - theta_val).abs() > 1e-12 {
-                theta_val = new_th;
-                proceed_to_theta_changed = true;
-            }
-        } else if changed_pv == pv_e_inc || changed_pv == pv_e_dec {
-            // C ml_monoCtl.st:711-730 — E tweak by ± ETweakVal, limit-checked,
-            // then (on success) eChanged→lChanged→thChanged recompute & move.
-            if new_val as i16 != 0 {
-                let inc = changed_pv == pv_e_inc;
-                let step = ch_e_tweak_val.get_f64().await;
-                let temp = e_val + step * if inc { 1.0 } else { -1.0 };
-                let e_hi = ch_e_hi.get_f64().await;
-                let e_lo = ch_e_lo.get_f64().await;
-                if temp >= e_lo && temp <= e_hi {
-                    e_val = temp;
-                    let _ = ch_e.put_f64_process(e_val).await;
-                    lambda_val = energy_to_lambda(e_val);
-                    let _ = ch_lambda.put_f64_process(lambda_val).await;
-                    if lambda_val > two_d {
-                        let _ = ch_msg1.put_string_process("Wavelength > 2d spacing.").await;
-                        let _ = ch_alert.put_i16_process(1).await;
-                    } else if let Some(th) = lambda_to_theta(lambda_val, two_d) {
-                        theta_val = th;
-                        let _ = ch_theta.put_f64_process(theta_val).await;
-                    }
-                    proceed_to_theta_changed = true;
-                } else {
-                    let _ = ch_msg1.put_string_process("E tweak exceeds limit").await;
-                    let _ = ch_alert.put_i16_process(1).await;
-                }
-                let reset = if inc { &ch_e_inc } else { &ch_e_dec };
-                let _ = reset.put_i16_process(0).await;
-            }
-        } else if changed_pv == pv_lambda_inc || changed_pv == pv_lambda_dec {
-            // C ml_monoCtl.st:732-751 — lambda tweak by ± LTweakVal, limit-checked.
-            if new_val as i16 != 0 {
-                let inc = changed_pv == pv_lambda_inc;
-                let step = ch_lambda_tweak_val.get_f64().await;
-                let temp = lambda_val + step * if inc { 1.0 } else { -1.0 };
-                let l_hi = ch_lambda_hi.get_f64().await;
-                let l_lo = ch_lambda_lo.get_f64().await;
-                if temp >= l_lo && temp <= l_hi {
-                    lambda_val = temp;
-                    let _ = ch_lambda.put_f64_process(lambda_val).await;
-                    if lambda_val > two_d {
-                        let _ = ch_msg1.put_string_process("Wavelength > 2d spacing.").await;
-                        let _ = ch_alert.put_i16_process(1).await;
-                    } else if let Some(th) = lambda_to_theta(lambda_val, two_d) {
-                        theta_val = th;
-                        let _ = ch_theta.put_f64_process(theta_val).await;
-                    }
-                    proceed_to_theta_changed = true;
-                } else {
-                    let _ = ch_msg1
-                        .put_string_process("Lambda tweak exceeds limit")
-                        .await;
-                    let _ = ch_alert.put_i16_process(1).await;
-                }
-                let reset = if inc { &ch_lambda_inc } else { &ch_lambda_dec };
-                let _ = reset.put_i16_process(0).await;
-            }
-        } else if changed_pv == pv_theta_inc || changed_pv == pv_theta_dec {
-            // C ml_monoCtl.st:753-772 — theta tweak by ± thTweakVal, limit-checked.
-            if new_val as i16 != 0 {
-                let inc = changed_pv == pv_theta_inc;
-                let step = ch_theta_tweak_val.get_f64().await;
-                let temp = theta_val + step * if inc { 1.0 } else { -1.0 };
-                if temp >= theta_lo && temp <= theta_hi {
-                    theta_val = temp;
-                    let _ = ch_theta.put_f64_process(theta_val).await;
-                    proceed_to_theta_changed = true;
-                } else {
-                    let _ = ch_msg1
-                        .put_string_process("Theta tweak exceeds limit")
-                        .await;
-                    let _ = ch_alert.put_i16_process(1).await;
-                }
-                let reset = if inc { &ch_theta_inc } else { &ch_theta_dec };
-                let _ = reset.put_i16_process(0).await;
-            }
-        } else if changed_pv == pv_order {
-            order_val = ch_order.get_f64().await;
-            let (td, err, msg) = calc_2d_spacing(d_val, order_val);
-            two_d = td;
-            let _ = ch_msg1.put_string_process(msg).await;
-            // C ml_monoCtl_calc2dSpacing (ml_monoCtl.st:1321-1322) sets opAlert
-            // from the Order<1 check and dInputChanged pvPuts it
-            // (ml_monoCtl.st:792): bad Order -> 1, valid -> 0 (cleared on return).
-            let _ = ch_alert.put_i16_process(err as i16).await;
-            auto_mode = false;
-            let _ = ch_auto_mode.put_i16_process(0).await;
-            let _ = ch_msg2.put_string_process("Set to Manual Mode").await;
-            let (eh, el, lh, ll) = compute_energy_lambda_limits(two_d, theta_hi, theta_lo);
-            let _ = ch_e_hi.put_f64_process(eh).await;
-            let _ = ch_e_lo.put_f64_process(el).await;
-            let _ = ch_lambda_hi.put_f64_process(lh).await;
-            let _ = ch_lambda_lo.put_f64_process(ll).await;
-        } else if changed_pv == pv_d {
-            d_val = ch_d.get_f64().await;
-            let (td, err, msg) = calc_2d_spacing(d_val, order_val);
-            two_d = td;
-            let _ = ch_msg1.put_string_process(msg).await;
-            // C ml_monoCtl_calc2dSpacing (ml_monoCtl.st:1321-1322) sets opAlert
-            // from the Order<1 check and dInputChanged pvPuts it
-            // (ml_monoCtl.st:792): bad Order -> 1, valid -> 0 (cleared on return).
-            let _ = ch_alert.put_i16_process(err as i16).await;
-            auto_mode = false;
-            let _ = ch_auto_mode.put_i16_process(0).await;
-            let _ = ch_msg2.put_string_process("Set to Manual Mode").await;
-            let (eh, el, lh, ll) = compute_energy_lambda_limits(two_d, theta_hi, theta_lo);
-            let _ = ch_e_hi.put_f64_process(eh).await;
-            let _ = ch_e_lo.put_f64_process(el).await;
-            let _ = ch_lambda_hi.put_f64_process(lh).await;
-            let _ = ch_lambda_lo.put_f64_process(ll).await;
-        } else if changed_pv == pv_put_vals {
-            if new_val as i16 != 0 {
-                proceed_to_theta_changed = true;
-            }
-        } else if changed_pv == pv_auto_mode {
-            auto_mode = new_val as i16 != 0;
-        } else if changed_pv == pv_cc_mode {
-            cc_mode = MlMonoMode::from_i16(new_val as i16);
-        } else if changed_pv == pv_oper_ack {
-            if new_val as i16 != 0 {
-                let _ = ch_alert.put_i16_process(0).await;
-                let _ = ch_msg1.put_string_process(" ").await;
-                let _ = ch_msg2.put_string_process(" ").await;
-                let _ = ch_oper_ack.put_i16_process(0).await;
-            }
-        } else if changed_pv == pv_theta_mot_rbv {
-            let rbv = new_val;
-            let _ = ch_theta_rdbk_echo.put_f64_process(rbv).await;
-            theta_rdbk_val = rbv;
-            lambda_rdbk_val = theta_to_lambda(theta_rdbk_val, two_d);
-            e_rdbk_val = lambda_to_energy(lambda_rdbk_val);
-            let _ = ch_theta_rdbk.put_f64_process(theta_rdbk_val).await;
-            let _ = ch_lambda_rdbk.put_f64_process(lambda_rdbk_val).await;
-            let _ = ch_e_rdbk.put_f64_process(e_rdbk_val).await;
-        } else if changed_pv == pv_theta2_mot_rbv {
-            let _ = ch_theta2_rdbk_echo.put_f64_process(new_val).await;
-        } else if changed_pv == pv_theta_hilim {
-            theta_mot_hi = new_val;
-            let (hi, lo) = compute_theta_limits(theta_mot_hi, theta_mot_lo);
-            theta_hi = hi;
-            theta_lo = lo;
-            let _ = ch_theta_hi.put_f64_process(theta_hi).await;
-            let _ = ch_theta_lo.put_f64_process(theta_lo).await;
-            let (eh, el, lh, ll) = compute_energy_lambda_limits(two_d, theta_hi, theta_lo);
-            let _ = ch_e_hi.put_f64_process(eh).await;
-            let _ = ch_e_lo.put_f64_process(el).await;
-            let _ = ch_lambda_hi.put_f64_process(lh).await;
-            let _ = ch_lambda_lo.put_f64_process(ll).await;
-        } else if changed_pv == pv_theta_lolim {
-            theta_mot_lo = new_val;
-            let (hi, lo) = compute_theta_limits(theta_mot_hi, theta_mot_lo);
-            theta_hi = hi;
-            theta_lo = lo;
-            let _ = ch_theta_hi.put_f64_process(theta_hi).await;
-            let _ = ch_theta_lo.put_f64_process(theta_lo).await;
-            let (eh, el, lh, ll) = compute_energy_lambda_limits(two_d, theta_hi, theta_lo);
-            let _ = ch_e_hi.put_f64_process(eh).await;
-            let _ = ch_e_lo.put_f64_process(el).await;
-            let _ = ch_lambda_hi.put_f64_process(lh).await;
-            let _ = ch_lambda_lo.put_f64_process(ll).await;
-        } else if changed_pv == pv_y_offset {
-            y_offset_val = new_val;
-            auto_mode = false;
-            let _ = ch_auto_mode.put_i16_process(0).await;
-            let _ = ch_msg1
-                .put_string_process(&format!("y offset changed to {:.4}", y_offset_val))
-                .await;
-            let _ = ch_msg2.put_string_process("Set to Manual Mode").await;
-            proceed_to_theta_changed = true;
-        } else if changed_pv == pv_y_mot_rbv {
-            // C ml_monoCtl.st:1204-1207 (yMotRdbk_mon): a Y-motor readback change
-            // sets yOffset = yMotRdbk and pvPuts it; the resulting yOffset_mon
-            // (ml_monoCtl.st:689) drops to Manual mode and recomputes the Z
-            // setpoint (calcMovements zMotDesired = yOffset/tan(2θ),
-            // ml_monoCtl.st:885). A standalone Y move must retrack Z geometry,
-            // so mirror that here (a self put_f64 posts no monitor event, so the
-            // recompute is driven inline rather than via a yOffset re-trigger).
-            y_offset_val = new_val;
-            let _ = ch_y_offset.put_f64_process(y_offset_val).await;
-            auto_mode = false;
-            let _ = ch_auto_mode.put_i16_process(0).await;
-            let _ = ch_msg1
-                .put_string_process(&format!("y offset changed to {:.4}", y_offset_val))
-                .await;
-            let _ = ch_msg2.put_string_process("Set to Manual Mode").await;
-            proceed_to_theta_changed = true;
-        } else if changed_pv == pv_use_set {
-            use_set_mode = new_val as i16 != 0;
-            let sv = if use_set_mode { 1i16 } else { 0 };
-            let _ = ch_theta_mot_set_flag.put_i16_process(sv).await;
-            let _ = ch_theta2_mot_set_flag.put_i16_process(sv).await;
-            let _ = ch_z_mot_set_flag.put_i16_process(sv).await;
-        }
-
-        if !proceed_to_theta_changed {
-            continue;
-        }
-
-        // -- Theta changed --
-        if theta_val <= theta_lo || theta_val >= theta_hi {
-            let _ = ch_msg1
-                .put_string_process("Theta constrained to LIMIT")
-                .await;
-            let _ = ch_alert.put_i16_process(1).await;
-            auto_mode = false;
-            let _ = ch_auto_mode.put_i16_process(0).await;
-            let _ = ch_msg2.put_string_process("Set to Manual Mode").await;
-        }
-
-        lambda_val = theta_to_lambda(theta_val, two_d);
-        let _ = ch_lambda.put_f64_process(lambda_val).await;
-        e_val = lambda_to_energy(lambda_val);
-        let _ = ch_e.put_f64_process(e_val).await;
-
-        let current_rbv = ch_theta_mot_rbv.get_f64().await;
-        theta_rdbk_val = current_rbv;
-        lambda_rdbk_val = theta_to_lambda(theta_rdbk_val, two_d);
-        e_rdbk_val = lambda_to_energy(lambda_rdbk_val);
-        let _ = ch_theta_rdbk.put_f64_process(theta_rdbk_val).await;
-        let _ = ch_lambda_rdbk.put_f64_process(lambda_rdbk_val).await;
-        let _ = ch_e_rdbk.put_f64_process(e_rdbk_val).await;
-
-        // -- Calc movements --
-        let theta_mot_desired = theta_val;
-        let theta2_mot_desired = theta_val;
-        let z_mot_desired = calc_z_position(theta_val, y_offset_val);
-
-        let _ = ch_theta_set.put_f64_process(theta_mot_desired).await;
-        let _ = ch_theta2_set.put_f64_process(theta2_mot_desired).await;
-        let _ = ch_z_set.put_f64_process(z_mot_desired).await;
-
-        // Check Z limits
-        if !cc_mode.z_frozen() {
-            let z_hi = ch_z_mot_hilim.get_f64().await;
-            let z_lo = ch_z_mot_lolim.get_f64().await;
-            if z_mot_desired < z_lo || z_mot_desired > z_hi {
-                let _ = ch_msg1
-                    .put_string_process("Z will exceed soft limits")
-                    .await;
-                let _ = ch_msg2.put_string_process("Setting to Manual Mode").await;
-                let _ = ch_alert.put_i16_process(1).await;
-                auto_mode = false;
-                let _ = ch_auto_mode.put_i16_process(0).await;
-            }
-        }
-
-        // -- Move --
-        let put_requested = ch_put_vals.get_i16().await != 0;
-        if auto_mode || put_requested || use_set_mode {
-            let th_speed = ch_theta_mot_velo.get_f64().await;
-            let z_speed = ch_z_mot_velo.get_f64().await;
-            // Save the pre-coordination motor speeds for restoration after the
-            // move; without it each coordinated move leaves a reduced `.VELO`
-            // that the next move reads back as its baseline, decaying the
-            // speeds geometrically toward zero. C `ml_monoCtl.st` saves
-            // oldThSpeed/oldTh2Speed/oldZSpeed (ml_monoCtl.st:905-907) and
-            // restores them once the motors stop (ml_monoCtl.st:1049-1054).
-            // Theta2 tracks Theta's speed, so read its baseline before it is
-            // overwritten below.
-            let old_th_speed = th_speed;
-            let old_th2_speed = ch_theta2_mot_velo.get_f64().await;
-            let old_z_speed = z_speed;
-            let (new_th, new_z) = coordinate_speeds(
-                theta_val - current_rbv,
-                z_mot_desired - ch_z_mot_rbv.get_f64().await,
-                th_speed,
-                z_speed,
-                cc_mode,
-            );
-            let _ = ch_theta_mot_velo.put_f64_process(new_th).await;
-            let _ = ch_theta2_mot_velo.put_f64_process(new_th).await;
-            if !cc_mode.z_frozen() {
-                let _ = ch_z_mot_velo.put_f64_process(new_z).await;
-            }
-
-            let _ = ch_theta_mot_cmd.put_f64_process(theta_mot_desired).await;
-            let _ = ch_theta2_mot_cmd.put_f64_process(theta2_mot_desired).await;
-            if !cc_mode.z_frozen() {
-                let _ = ch_z_mot_cmd.put_f64_process(z_mot_desired).await;
-            }
-            let _ = ch_put_vals.put_i16_process(0).await;
-            _caused_move = true;
-
-            // Wait for motors
-            loop {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                let th_dmov = ch_theta_dmov.get_i16().await;
-                let th2_dmov = ch_theta2_dmov.get_i16().await;
-                let z_dmov = ch_z_dmov.get_i16().await;
-
-                if ch_theta_hls.get_i16().await != 0
-                    || ch_theta_lls.get_i16().await != 0
-                    || ch_theta2_hls.get_i16().await != 0
-                    || ch_theta2_lls.get_i16().await != 0
-                {
-                    let _ = ch_msg1
-                        .put_string_process("Theta Motor hit a limit switch!")
-                        .await;
-                    let _ = ch_alert.put_i16_process(1).await;
-                    auto_mode = false;
-                    let _ = ch_auto_mode.put_i16_process(0).await;
-                    let _ = ch_theta_mot_stop.put_i16_process(1).await;
-                    let _ = ch_theta2_mot_stop.put_i16_process(1).await;
-                    let _ = ch_z_stop.put_i16_process(1).await;
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                    break;
-                }
-                if !cc_mode.z_frozen()
-                    && (ch_z_hls.get_i16().await != 0 || ch_z_lls.get_i16().await != 0)
-                {
-                    let _ = ch_msg1
-                        .put_string_process("Z Motor hit a limit switch!")
-                        .await;
-                    let _ = ch_alert.put_i16_process(1).await;
-                    auto_mode = false;
-                    let _ = ch_auto_mode.put_i16_process(0).await;
-                    let _ = ch_theta_mot_stop.put_i16_process(1).await;
-                    let _ = ch_theta2_mot_stop.put_i16_process(1).await;
-                    let _ = ch_z_stop.put_i16_process(1).await;
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                    break;
-                }
-
-                let rbv = ch_theta_mot_rbv.get_f64().await;
-                theta_rdbk_val = rbv;
-                lambda_rdbk_val = theta_to_lambda(theta_rdbk_val, two_d);
-                e_rdbk_val = lambda_to_energy(lambda_rdbk_val);
-                let _ = ch_theta_rdbk.put_f64_process(theta_rdbk_val).await;
-                let _ = ch_lambda_rdbk.put_f64_process(lambda_rdbk_val).await;
-                let _ = ch_e_rdbk.put_f64_process(e_rdbk_val).await;
-                let _ = ch_theta_rdbk_echo.put_f64_process(rbv).await;
-                let _ = ch_theta2_rdbk_echo
-                    .put_f64_process(ch_theta2_mot_rbv.get_f64().await)
-                    .await;
-
-                if th_dmov != 0 && th2_dmov != 0 && z_dmov != 0 {
-                    break;
-                }
-            }
-
-            // Restore the pre-coordination motor speeds now the move has
-            // stopped (C `ml_monoCtl.st` state thetaMotStopped,
-            // ml_monoCtl.st:1049-1054). Theta2 tracks Theta's speed and is
-            // restored alongside it.
-            let _ = ch_theta_mot_velo.put_f64_process(old_th_speed).await;
-            let _ = ch_theta2_mot_velo.put_f64_process(old_th2_speed).await;
-            if !cc_mode.z_frozen() {
-                let _ = ch_z_mot_velo.put_f64_process(old_z_speed).await;
-            }
-
-            if _caused_move {
-                _caused_move = false;
-            }
-
-            // Final readback
-            let rbv = ch_theta_mot_rbv.get_f64().await;
-            theta_rdbk_val = rbv;
-            lambda_rdbk_val = theta_to_lambda(theta_rdbk_val, two_d);
-            e_rdbk_val = lambda_to_energy(lambda_rdbk_val);
-            let _ = ch_theta_rdbk.put_f64_process(theta_rdbk_val).await;
-            let _ = ch_lambda_rdbk.put_f64_process(lambda_rdbk_val).await;
-            let _ = ch_e_rdbk.put_f64_process(e_rdbk_val).await;
-            let _ = ch_moving.put_i16_process(0).await;
-        }
-
-        // Update echoes
-        let _ = ch_theta_rdbk_echo
-            .put_f64_process(ch_theta_mot_rbv.get_f64().await)
-            .await;
-        let _ = ch_theta2_rdbk_echo
-            .put_f64_process(ch_theta2_mot_rbv.get_f64().await)
-            .await;
-        let _ = ch_z_rdbk_echo
-            .put_f64_process(ch_z_mot_rbv.get_f64().await)
-            .await;
-        let _ = ch_theta_vel_echo
-            .put_f64_process(ch_theta_mot_velo.get_f64().await)
-            .await;
-        let _ = ch_theta2_vel_echo
-            .put_f64_process(ch_theta2_mot_velo.get_f64().await)
-            .await;
-        let _ = ch_z_vel_echo
-            .put_f64_process(ch_z_mot_velo.get_f64().await)
-            .await;
-        let _ = ch_theta_dmov_echo
-            .put_i16_process(ch_theta_dmov.get_i16().await)
-            .await;
-        let _ = ch_theta2_dmov_echo
-            .put_i16_process(ch_theta2_dmov.get_i16().await)
-            .await;
-        let _ = ch_z_dmov_echo
-            .put_i16_process(ch_z_dmov.get_i16().await)
-            .await;
-
-        // Update y offset from readback
-        let y_rbv = ch_y_mot_rbv.get_f64().await;
-        y_offset_val = y_rbv;
-        let _ = ch_y_offset.put_f64_process(y_offset_val).await;
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
+epics_seq_rs::include_program!("ml_monoCtl");
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// C divides unconditionally and words the alert with `%f`.
     #[test]
-    fn test_calc_2d_spacing() {
-        let (two_d, err, _) = calc_2d_spacing(25.0, 1.0);
-        assert!(!err);
-        assert!((two_d - 50.0).abs() < 1e-10);
-    }
-
-    #[test]
-    fn test_calc_2d_spacing_order2() {
-        let (two_d, err, _) = calc_2d_spacing(25.0, 2.0);
-        assert!(!err);
-        assert!((two_d - 25.0).abs() < 1e-10);
-    }
-
-    #[test]
-    fn test_calc_2d_spacing_invalid_order() {
-        // 0 < Order < 1: C still returns the finite (2*D)/Order with opAlert set,
-        // NOT 0.0 (which would zero the E/lambda limits).
-        let (two_d, err, _) = calc_2d_spacing(25.0, 0.5);
-        assert!(err);
-        assert!((two_d - 100.0).abs() < 1e-9);
-        // Order <= 0: guarded to avoid C's 2*D/0 infinity.
-        let (two_d0, err0, _) = calc_2d_spacing(25.0, 0.0);
-        assert!(err0);
-        assert_eq!(two_d0, 0.0);
-    }
-
-    #[test]
-    fn test_energy_lambda_roundtrip() {
-        for e in [5.0, 10.0, 20.0, 50.0] {
-            let l = energy_to_lambda(e);
-            let e2 = lambda_to_energy(l);
-            assert!((e - e2).abs() < 1e-10);
+    fn calc_2d_spacing_is_c_s() {
+        let v = seqg::seqg_static_vars();
+        for (order, two_d, alert, msg) in [
+            (1.0, 50.0, 0, "New effective d spacing"),
+            (2.0, 25.0, 0, "New effective d spacing"),
+            (0.0, f64::INFINITY, 1, "Order == 0.000000?"),
+            (0.5, 100.0, 1, "Order == 0.500000?"),
+            // C overflowed seqMsg1 by the terminator here.
+            (
+                -1e21,
+                50.0 / -1e21,
+                1,
+                "Order == -1000000000000000000000.000000",
+            ),
+        ] {
+            v.D.set(25.0);
+            v.Order.set(order);
+            assert_eq!(ml_monoCtl_calc2dSpacing(), two_d, "Order {order}");
+            assert_eq!(v.opAlert.get(), alert, "Order {order}");
+            assert_eq!(v.seqMsg1.to_c_vec(), msg.as_bytes(), "Order {order}");
         }
-    }
-
-    #[test]
-    fn test_lambda_to_theta() {
-        let two_d = 50.0;
-        let lambda = 2.0;
-        let theta = lambda_to_theta(lambda, two_d).unwrap();
-        // sin(theta) = 2/50 = 0.04, theta = 2.29 deg
-        assert!((theta - 2.292).abs() < 0.01, "theta={}", theta);
-    }
-
-    #[test]
-    fn test_theta_to_lambda_roundtrip() {
-        let two_d = 50.0;
-        let theta = 5.0;
-        let lambda = theta_to_lambda(theta, two_d);
-        let theta2 = lambda_to_theta(lambda, two_d).unwrap();
-        assert!((theta - theta2).abs() < 1e-10);
-    }
-
-    #[test]
-    fn test_calc_z_position() {
-        // z = y_offset / tan(2*theta)
-        let z = calc_z_position(30.0, 35.0);
-        // tan(60 deg) = 1.7321
-        let expected = 35.0 / (60.0_f64 / RAD_CONV).tan();
-        assert!((z - expected).abs() < 0.01, "z={} expected={}", z, expected);
-    }
-
-    #[test]
-    fn test_compute_theta_limits() {
-        assert_eq!(compute_theta_limits(100.0, -5.0), (89.0, 0.1));
-        assert_eq!(compute_theta_limits(45.0, 5.0), (45.0, 5.0));
-    }
-
-    #[test]
-    fn test_coordinate_speeds() {
-        let (th, z) = coordinate_speeds(10.0, 20.0, 1.0, 1.0, MlMonoMode::Normal);
-        // Z takes 20s, so theta should slow to 0.5
-        assert!((th - 0.5).abs() < 1e-6);
-        assert!((z - 1.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn test_coordinate_speeds_frozen() {
-        let (th, z) = coordinate_speeds(10.0, 20.0, 1.0, 1.0, MlMonoMode::FreezeZ);
-        // Z frozen, only theta matters
-        assert!((th - 1.0).abs() < 1e-6);
-        // z_delta != 0 but z_time = 0, so z_speed adjusted to theta_time
-        assert!((z - 2.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn test_ml_mono_mode() {
-        assert!(!MlMonoMode::Normal.z_frozen());
-        assert!(MlMonoMode::FreezeZ.z_frozen());
-    }
-
-    #[test]
-    fn test_config_pv_names() {
-        let cfg = MlMonoConfig::new("xxx:", "m9", "m12", "m10", "m11", 35.0, 1);
-        assert_eq!(cfg.pv("E"), "xxx:ml_monoE");
-        assert_eq!(cfg.motor_pv("m9", ".RBV"), "xxx:m9.RBV");
-        assert_eq!(cfg.y_offset, 35.0);
-    }
-
-    #[test]
-    fn test_config_y_offset_clamp() {
-        let cfg = MlMonoConfig::new("xxx:", "m9", "m12", "m10", "m11", 0.5, 1);
-        assert_eq!(cfg.y_offset, 35.0); // Clamped to default
-        let cfg2 = MlMonoConfig::new("xxx:", "m9", "m12", "m10", "m11", 100.0, 1);
-        assert_eq!(cfg2.y_offset, 35.0); // Clamped to default
     }
 }

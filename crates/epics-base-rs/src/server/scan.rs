@@ -1,7 +1,8 @@
-// RTEMS-EXEC-MODEL-ALLOW(17): the teardown test drives the scheduler from a
-// tokio task (spawn/abort are its cancellation instrument) and the seven
-// ScanOwner tests (drop-teardown, redundant-owner, PINI-skip, PINI-run,
-// tick-runs-on-its-own-thread, watchdog-registration, scanOnce-creation) use
+// RTEMS-EXEC-MODEL-ALLOW(22): the teardown test drives the scheduler from a
+// tokio task (spawn/abort are its cancellation instrument) and the ScanOwner
+// tests (drop-teardown, redundant-owner, PINI-skip, PINI-run,
+// tick-runs-on-its-own-thread, watchdog-registration, scanOnce-creation, and
+// the three per-database cell boundaries) use
 // the tokio test runtime only as the start-context `ScanOwner::start`
 // requires; the scan/owner threads under test go through the exec seam
 // (`block_on_sync` → `park_on`) when the exec backend is on. The
@@ -9,7 +10,7 @@
 // cap boundaries, the two dedicated-helper boundaries, the idle-band boundary,
 // the mid-pass list-growth boundary, and the config gate) want a runtime only
 // for the `.await` that loads their records — the leader and its helpers are
-// `MandatoryThread`s either way. All seventeen verified passing under
+// `MandatoryThread`s either way. All verified passing under
 // `EPICS_RS_BUILD_EXEC_BACKEND=thread`.
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
@@ -23,6 +24,7 @@ use crate::runtime::taskwd::{CheckIn, TASKWD_DELAY, taskwd_insert};
 use crate::server::database::PvDatabase;
 use crate::server::database::scan_index::ScanPassSnapshot;
 use crate::server::record::ScanType;
+use epics_libcom_rs::cfmt::CFloat;
 
 /// Scan scheduler that processes records at their configured scan rates.
 ///
@@ -41,6 +43,10 @@ struct ScanScheduler {
     /// obligation instead of an ambient one: there is no way to build a
     /// scheduler without having already answered the question.
     driver: TickDriver,
+    /// The result of `ScanControl::try_claim`, taken when the scheduler is
+    /// built so the caller learns synchronously whether it owns the
+    /// facility. A scheduler that lost the claim parks and owns nothing.
+    is_first: bool,
 }
 
 /// The periodic scan rates of the LOADED `menuScan`, slowest-first because
@@ -72,37 +78,50 @@ const FACILITY: &str = "periodic scan";
 /// [`periodic_scans`] slowest-first this is scan-10 → 60 up to
 /// scan-0.1 → 66, the ladder the C IOC measures on RTEMS 6.
 fn periodic_priority(ind: usize) -> ThreadPriority {
-    ThreadPriority::Custom(ThreadPriority::ScanLow.value() + ind as u8)
+    ThreadPriority::Custom(ThreadPriority::ScanLow.value() + ind as u32)
 }
 
 /// C names the thread `scan-%g` of the period in seconds
 /// (`dbScan.c:954`): `scan-10`, `scan-5`, … `scan-0.5`, `scan-0.1`.
-/// Rust's shortest-roundtrip `f64` Display reproduces `%g` for every
-/// menuScan period.
 fn periodic_thread_name(period: Duration) -> String {
-    format!("scan-{}", period.as_secs_f64())
+    format!("scan-{}", CFloat(period.as_secs_f64()).g())
 }
 
 /// Shutdown signal shared by the periodic scan threads.
 ///
-/// The single owner of the stop transition is `ScanStopGuard`, held
+/// The single owner of the stop transition is [`ScanThreads`], held
 /// by the `ScanScheduler::run` future: dropping that future (the
 /// [`ScanOwner`] thread unblocking, tokio cancellation, runtime
-/// teardown) trips the flag and wakes every sleeper, preserving the
-/// teardown contract the previous `JoinSet`-abort implementation
-/// provided. No other path may set the flag.
+/// teardown) trips the flag and wakes every sleeper. No other path may
+/// set the flag.
 struct ScanStop {
     stopped: Mutex<bool>,
     wake: Condvar,
 }
 
-/// RAII owner of the stop transition — see [`ScanStop`].
-struct ScanStopGuard(Arc<ScanStop>);
+/// C `scanStop` (`dbScan.c:159-181`) over the threads one scheduler started:
+/// dropping it stops and joins every rate's thread, then the helpers, as C
+/// waits for each `periodicTask` and joins it before it stops the helpers.
+///
+/// The join cannot wait on its caller: a thread leaves at a sweep boundary,
+/// and a sweep is synchronous record processing on that thread, so the
+/// longest wait is the sweep in flight — C's `startStopEvent` wait. Helpers
+/// stop only after every leader has joined, so a leader waiting on a group
+/// still has its helpers.
+struct ScanThreads {
+    stop: Arc<ScanStop>,
+    leaders: Vec<std::thread::JoinHandle<()>>,
+    helpers: Option<HelperThreads>,
+}
 
-impl Drop for ScanStopGuard {
+impl Drop for ScanThreads {
     fn drop(&mut self) {
-        *recover(FACILITY, self.0.stopped.lock()) = true;
-        self.0.wake.notify_all();
+        *recover(FACILITY, self.stop.stopped.lock()) = true;
+        self.stop.wake.notify_all();
+        for leader in self.leaders.drain(..) {
+            let _ = leader.join();
+        }
+        drop(self.helpers.take());
         // C `deletePeriodic` leaves `papPeriodic` NULL (`dbScan.c:1044-1045`),
         // which is what makes `scanParallelThreads` answerable again — see
         // [`PERIODIC_LISTS_BUILT`].
@@ -123,17 +142,15 @@ impl Drop for ScanStopGuard {
 /// event-driven processing without wedging the shell.
 /// C's fourth state, `ctlInit`, has no analogue and is deliberately
 /// absent: it is the window between the facility's creation (`scanInit`,
-/// `dbScan.c:191-208`) and the first `scanRun`, and this port has no
-/// separate creation step to open it. The build phase that occupies that
-/// window in C occupies [`ScanCtl::Pause`] here, set where C's `scanInit`
-/// sets it — inside the build, before anything can fire.
+/// `dbScan.c:191-208`) and the first `scanRun`. The cell is created in that
+/// window and reads [`ScanCtl::Pause`] there, as C's `scanInit` leaves it
+/// (`dbScan.c:199`), until `run`: a database no lifecycle has started is
+/// not running, whoever holds it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ScanCtl {
-    /// C `ctlRun`, and the port's starting value: a database with no IOC
-    /// lifecycle over it (a test harness, an embedded user of
-    /// `PvDatabase`) has nothing that could have paused it.
+    /// C `ctlRun`: `scanRun` has opened this database's `interruptAccept`.
     Run,
-    /// C `ctlPause`.
+    /// C `ctlPause`, and the value from creation until the first `run`.
     Pause,
     /// C `ctlExit` — terminal for the threads that read it; a later
     /// `scan_run` re-arms the cell, which is what lets one process stand
@@ -141,57 +158,143 @@ pub enum ScanCtl {
     Exit,
 }
 
-/// C's `static volatile enum ctl scanCtl` (`dbScan.c:60`). One cell for the
-/// whole facility, exactly as C has it, so a new asynchronous scan source
-/// cannot grow a private idea of whether the IOC is running.
-static SCAN_CTL: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(SCAN_CTL_RUN);
+/// C's `static volatile enum ctl scanCtl` (`dbScan.c:60`), one per database
+/// as C has one per `pdbbase`: the cell a database's `scan-%g` threads, its
+/// event posts and its I/O Intr callbacks gate on, and the one its
+/// [`ScanOwner`] drives. The cell is created with the database and carries
+/// the scan-start claim, so whoever holds the claim holds the only handle
+/// that may stop the facility; another database's owner cannot reach it.
+pub struct ScanControl {
+    /// Why the facility is not running: [`SCAN_CTL_PAUSE`] or
+    /// [`SCAN_CTL_EXIT`]. Whether the facility runs is `gate` alone; EXIT is
+    /// stored before `stop` closes the gate and cleared before `run` opens it.
+    stopped_as: std::sync::atomic::AtomicU8,
+    claimed: std::sync::atomic::AtomicBool,
+    /// This database's `interruptAccept`, written only by `run`/`pause`/`stop`
+    /// and the one source of "running": open ⟺ [`ScanCtl::Run`].
+    gate: Arc<crate::runtime::interrupt_accept::InterruptGate>,
+    /// Open from C `finishDevSup` on: when a dset's `init(after=1)` ran.
+    /// Never closes, and opens before `gate` can.
+    dev_sup: Arc<crate::runtime::interrupt_accept::InterruptGate>,
+    /// Set by C `scanInit`'s `buildScanLists`; never cleared.
+    lists_built: std::sync::atomic::AtomicBool,
+}
 
-const SCAN_CTL_RUN: u8 = 1;
 const SCAN_CTL_PAUSE: u8 = 2;
 const SCAN_CTL_EXIT: u8 = 3;
 
-/// The facility's current state — what every gate below reads.
-pub fn scan_ctl() -> ScanCtl {
-    match SCAN_CTL.load(std::sync::atomic::Ordering::Acquire) {
-        SCAN_CTL_PAUSE => ScanCtl::Pause,
-        SCAN_CTL_EXIT => ScanCtl::Exit,
-        _ => ScanCtl::Run,
+impl ScanControl {
+    pub(crate) fn new() -> Self {
+        Self {
+            stopped_as: std::sync::atomic::AtomicU8::new(SCAN_CTL_PAUSE),
+            claimed: std::sync::atomic::AtomicBool::new(false),
+            gate: crate::runtime::interrupt_accept::InterruptGate::new(),
+            dev_sup: crate::runtime::interrupt_accept::InterruptGate::new(),
+            lists_built: std::sync::atomic::AtomicBool::new(false),
+        }
     }
-}
 
-/// True while asynchronous scan sources may fire — the single test C spells
-/// `scanCtl == ctlRun` at each of its three gate sites.
-pub fn scan_is_running() -> bool {
-    scan_ctl() == ScanCtl::Run
-}
+    /// The gate C's `finishDevSup` opens, for a device whose dset `init`
+    /// latches the `after` pass (devMotorAsyn's `dbScanLockOK`).
+    pub fn dev_sup_gate(&self) -> &Arc<crate::runtime::interrupt_accept::InterruptGate> {
+        &self.dev_sup
+    }
 
-/// C `scanRun` (`dbScan.c:210-223`). Called by the IOC lifecycle owner on
-/// the `iocRun` transition, never by a protocol server.
-pub fn scan_run() {
-    SCAN_CTL.store(SCAN_CTL_RUN, std::sync::atomic::Ordering::Release);
-    // C `scanRun` sets `interruptAccept = TRUE` here (`dbScan.c:218`). The
-    // false→true edge is what fires asyn's one-shot boot flush, delivering
-    // every seeded `_RBV` value to the records that registered during iocInit.
-    crate::runtime::interrupt_accept::set_interrupts_accepted(true);
-}
+    /// C `finishDevSup` (`iocInit.c:464`): every dset's `init(1)`.
+    pub fn finish_dev_sup(&self) {
+        self.dev_sup.set(true);
+    }
 
-/// C `scanPause` (`dbScan.c:225-237`). The periodic threads stay alive and
-/// keep their deadlines; they simply stop calling `scanList`, which is what
-/// lets `iocRun` resume without rebuilding the facility.
-pub fn scan_pause() {
-    SCAN_CTL.store(SCAN_CTL_PAUSE, std::sync::atomic::Ordering::Release);
-    // C `scanPause` clears `interruptAccept` (`dbScan.c:241`).
-    crate::runtime::interrupt_accept::set_interrupts_accepted(false);
-}
+    /// C `buildScanLists` (`dbScan.c:1055-1076`): from here a record's scan
+    /// moves join and leave the lists; before it, `scanInit` joins each record
+    /// by its SCAN then.
+    pub(crate) fn build_lists(&self) {
+        self.lists_built
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
 
-/// C `scanStop` (`dbScan.c:154-178`), less the joins: the threads are
-/// owned by [`ScanOwner`], whose `Drop` performs C's `epicsThreadMustJoin`
-/// half. Setting the cell first is what makes a source that fires between
-/// the two see a stopped facility rather than a half-torn one.
-pub fn scan_stop() {
-    SCAN_CTL.store(SCAN_CTL_EXIT, std::sync::atomic::Ordering::Release);
-    // C `scanStop` clears `interruptAccept` (`dbScan.c:165`).
-    crate::runtime::interrupt_accept::set_interrupts_accepted(false);
+    /// Whether [`Self::build_lists`] has run.
+    pub(crate) fn lists_built(&self) -> bool {
+        self.lists_built.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// The `interruptAccept` of the database this cell belongs to; what a
+    /// record's I/O Intr subscription binds its port to.
+    pub fn interrupt_gate(&self) -> &Arc<crate::runtime::interrupt_accept::InterruptGate> {
+        &self.gate
+    }
+
+    /// The facility's current state — what every gate reads.
+    pub fn ctl(&self) -> ScanCtl {
+        if self.gate.is_open() {
+            return ScanCtl::Run;
+        }
+        match self.stopped_as.load(std::sync::atomic::Ordering::Acquire) {
+            SCAN_CTL_EXIT => ScanCtl::Exit,
+            _ => ScanCtl::Pause,
+        }
+    }
+
+    /// Whether [`Self::stop`] has begun and no [`Self::run`] has followed —
+    /// [`ScanCtl::Exit`] without reading the gate.
+    pub fn is_exiting(&self) -> bool {
+        self.stopped_as.load(std::sync::atomic::Ordering::Acquire) == SCAN_CTL_EXIT
+    }
+
+    /// True while asynchronous scan sources may fire — the single test C
+    /// spells `scanCtl == ctlRun` at each of its three gate sites.
+    pub fn is_running(&self) -> bool {
+        self.gate.is_open()
+    }
+
+    /// First caller wins; the claimant is the one scheduler that spawns the
+    /// periodic threads and the one owner whose drop may [`Self::stop`].
+    pub(crate) fn try_claim(&self) -> bool {
+        self.claimed
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    /// C `scanRun` (`dbScan.c:210-223`). Called by the IOC lifecycle owner
+    /// on the `iocRun` transition, never by a protocol server.
+    pub fn run(&self) {
+        // C `scanRun` sets `interruptAccept = TRUE` here (`dbScan.c:218`):
+        // the running transition. The false→true edge is what fires asyn's
+        // one-shot boot flush, delivering every seeded `_RBV` value to the
+        // records that registered during iocInit.
+        self.stopped_as
+            .store(SCAN_CTL_PAUSE, std::sync::atomic::Ordering::Release);
+        // `iocBuild` runs `finishDevSup` before any `scanRun`.
+        self.finish_dev_sup();
+        self.gate.set(true);
+    }
+
+    /// C `scanPause` (`dbScan.c:225-237`). The periodic threads stay alive
+    /// and keep their deadlines; they simply stop calling `scanList`, which
+    /// is what lets `iocRun` resume without rebuilding the facility.
+    pub fn pause(&self) {
+        self.stopped_as
+            .store(SCAN_CTL_PAUSE, std::sync::atomic::Ordering::Release);
+        // C `scanPause` clears `interruptAccept` (`dbScan.c:241`).
+        self.gate.set(false);
+    }
+
+    /// C `scanStop` (`dbScan.c:154-178`), less the joins: the threads are
+    /// owned by [`ScanOwner`], whose `Drop` performs C's
+    /// `epicsThreadMustJoin` half. Setting the cell first is what makes a
+    /// source that fires between the two see a stopped facility rather
+    /// than a half-torn one.
+    pub fn stop(&self) {
+        self.stopped_as
+            .store(SCAN_CTL_EXIT, std::sync::atomic::Ordering::Release);
+        // C `scanStop` clears `interruptAccept` (`dbScan.c:165`).
+        self.gate.set(false);
+    }
 }
 
 /// How this facility blocks a plain (banded) thread on a future — both a
@@ -274,8 +377,39 @@ const OVERRUN_REPORT_MAX: f64 = 3600.0;
 struct TickOutcome {
     /// The sweep ran past its deadline, so the rate's cumulative counter moves.
     overran: bool,
-    /// The warning this over-run tripped, already formatted.
-    warning: Option<String>,
+    /// The warning this over-run tripped.
+    warning: Option<OverrunReport>,
+}
+
+/// C's over-run warning (`dbScan.c:832-841`) as the numbers it prints. Data,
+/// not a `String`: the scan thread formats it straight into the errlog arena,
+/// as C's `errlogPrintf` does, and allocates nothing to report.
+#[derive(Clone, Copy)]
+struct OverrunReport {
+    scan: ScanType,
+    average: f64,
+    min: f64,
+    max: f64,
+    overruns: u32,
+    remedy: Remedy,
+}
+
+impl std::fmt::Display for OverrunReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "\ndbScan {} from '{}' scan thread:\n\tScan processing averages {:.3} \
+             seconds ({:.3} .. {:.3}).\n\tOver-runs have now happened {} times in \
+             a row.\n\tTo fix this, move some records to a slower scan rate{}\n",
+            crate::runtime::log::erl_warning(),
+            self.scan,
+            CFloat(self.average),
+            CFloat(self.min),
+            CFloat(self.max),
+            self.overruns,
+            self.remedy.tail(),
+        )
+    }
 }
 
 /// C `periodicTask`'s over-run bookkeeping (`dbScan.c:788-852`) as one owner.
@@ -417,26 +551,21 @@ impl OverrunTracker {
         let warning =
             if self.consecutive >= 10 && (now - self.reported).as_secs_f64() > self.report_delay {
                 let period = self.period.as_secs_f64();
-                let scan = self.scan;
-                let remedy = self.remedy.tail();
-                let msg = format!(
-                    "\ndbScan {} from '{scan}' scan thread:\n\tScan processing \
-                 averages {:.3} seconds ({:.3} .. {:.3}).\n\tOver-runs have now \
-                 happened {} times in a row.\n\tTo fix this, move some records \
-                 to a slower scan rate{remedy}\n",
-                    crate::runtime::log::erl_warning(),
-                    period + self.overtime / f64::from(self.consecutive),
-                    period + self.over_min,
-                    period + self.over_max,
-                    self.consecutive,
-                );
+                let report = OverrunReport {
+                    scan: self.scan,
+                    average: period + self.overtime / f64::from(self.consecutive),
+                    min: period + self.over_min,
+                    max: period + self.over_max,
+                    overruns: self.consecutive,
+                    remedy: self.remedy,
+                };
                 self.reported = now;
                 if self.report_delay < OVERRUN_REPORT_MAX / 2.0 {
                     self.report_delay *= 2.0;
                 } else {
                     self.report_delay = OVERRUN_REPORT_MAX;
                 }
-                Some(msg)
+                Some(report)
             } else {
                 None
             };
@@ -841,7 +970,7 @@ struct HelperPool {
     /// C `helpWanted` (`dbScan.c:179`): one bit per rate with a group open
     /// that a helper may still claim from.
     wanted: AtomicUsize,
-    /// C `helperShutdown` (`dbScan.c:181`), owned by [`HelperStopGuard`].
+    /// C `helperShutdown` (`dbScan.c:181`), owned by [`HelperThreads`].
     shutdown: AtomicBool,
     /// The rate helpers are kept free for: the fastest one with records when
     /// the pool was built, else the fastest there is — C `fastPeriod`
@@ -1093,7 +1222,7 @@ fn spawn_helpers(
     configured: usize,
     configured_reserve: usize,
     rate_helpers: &[usize],
-) -> Option<Arc<HelperPool>> {
+) -> Option<HelperThreads> {
     if passes.is_empty() {
         // A site `menuScan` may carry only the three fixed choices, and then
         // there is no periodic pass for a helper to join. C does not test for
@@ -1113,7 +1242,7 @@ fn spawn_helpers(
         return None;
     }
     if passes.len() > MAX_PARALLEL_THREADS {
-        crate::runtime::log::errlog_printf(&format!(
+        crate::runtime::log::errlog_vprintf(format_args!(
             "scanParallelThreads: {} scan rates exceed the {} the helper pool can serve, \
              running without helpers\n",
             passes.len(),
@@ -1124,7 +1253,7 @@ fn spawn_helpers(
     if n_pool + n_rate > MAX_PARALLEL_THREADS {
         // C drops pool helpers rather than dedicated ones (`dbScan.c:1366-1375`):
         // a rate asked for its own by name, the pool is whatever is left over.
-        crate::runtime::log::errlog_printf(&format!(
+        crate::runtime::log::errlog_vprintf(format_args!(
             "scanParallelThreads: {} helpers exceed {}, dropping pool helpers\n",
             n_pool + n_rate,
             MAX_PARALLEL_THREADS
@@ -1193,47 +1322,57 @@ fn spawn_helpers(
         passes,
     });
 
-    for (me, band) in bands.into_iter().enumerate() {
-        let db = Arc::clone(db);
-        let pool_for_thread = Arc::clone(&pool);
-        let driver = driver.clone();
-        // A helper that could not be created is C's `spawnHelpers` never
-        // reaching the `startStopEvent` it waits for: `iocInit` wedges and the
-        // IOC never serves. See the leaders' `MandatoryThread` for why that is
-        // this process dying here.
-        MandatoryThread::new(
-            format!("scanHelper{me}"),
-            band,
-            // C `opts.stackSize = epicsThreadStackBig` (`dbScan.c:1423`).
-            StackSizeClass::Big,
-        )
-        .spawn(move || {
-            helper_loop(db, pool_for_thread, me, driver, band);
-        });
-    }
-    Some(pool)
+    let threads = bands
+        .into_iter()
+        .enumerate()
+        .map(|(me, band)| {
+            let db = Arc::clone(db);
+            let pool_for_thread = Arc::clone(&pool);
+            let driver = driver.clone();
+            // A helper that could not be created is C's `spawnHelpers` never
+            // reaching the `startStopEvent` it waits for: `iocInit` wedges and
+            // the IOC never serves. See the leaders' `MandatoryThread` for why
+            // that is this process dying here.
+            MandatoryThread::new(
+                format!("scanHelper{me}"),
+                band,
+                // C `opts.stackSize = epicsThreadStackBig` (`dbScan.c:1423`).
+                StackSizeClass::Big,
+            )
+            .spawn(move || {
+                ON_SCAN_THREAD.set(true);
+                helper_loop(db, pool_for_thread, me, driver, band);
+            })
+        })
+        .collect();
+    Some(HelperThreads { pool, threads })
 }
 
 /// RAII owner of the pool's stop transition — C `stopHelpers`
 /// (`dbScan.c:1327-1346`), which `scanStop` calls after the leaders.
 ///
-/// C joins its helpers; the port's scan threads are not joined (see
-/// [`ScanOwner`]'s teardown), so a helper exits at the flag on its next look.
-/// What a helper cannot be left holding is a claim: `run_slots` has no
-/// shutdown check inside its loop, so a helper that has claimed slots finishes
-/// them and subtracts before it reads the flag again, and a parked helper
-/// holds none. That is what lets a leader still waiting on a group reach zero
-/// after the pool has been told to stop.
-struct HelperStopGuard(Arc<HelperPool>);
+/// Dropping it stops and joins every helper, as C's does. A helper exits at
+/// the flag on its next look, and what it cannot be left holding is a claim:
+/// `run_slots` has no shutdown check inside its loop, so a helper that has
+/// claimed slots finishes them and subtracts before it reads the flag again,
+/// and a parked helper holds none. That is what lets a leader still waiting on
+/// a group reach zero after the pool has been told to stop.
+struct HelperThreads {
+    pool: Arc<HelperPool>,
+    threads: Vec<std::thread::JoinHandle<()>>,
+}
 
-impl Drop for HelperStopGuard {
+impl Drop for HelperThreads {
     fn drop(&mut self) {
-        self.0.shutdown.store(true, Ordering::Release);
-        for helper in &self.0.helpers {
+        self.pool.shutdown.store(true, Ordering::Release);
+        for helper in &self.pool.helpers {
             // `wake`, not `signal`: the condition a helper re-tests here is
             // its own exit, and a signal dropped inside the announce window
             // would leave the thread parked for the life of the process.
             helper.wake.wake();
+        }
+        for thread in self.threads.drain(..) {
+            let _ = thread.join();
         }
     }
 }
@@ -1262,7 +1401,7 @@ static CONFIGURED_RATE_HELPERS: Mutex<BTreeMap<usize, usize>> = Mutex::new(BTree
 /// C's `papPeriodic` read as the already-initialised gate (`dbScan.c:288`):
 /// non-NULL from `initPeriodic` until `deletePeriodic` frees it. The port has
 /// no array to test for it, so the gate is its own cell, set where the passes
-/// are built and cleared by [`ScanStopGuard`] — which is what lets one process
+/// are built and cleared by [`ScanThreads`] — which is what lets one process
 /// configure, run and tear down a second IOC, as the C test does three times
 /// over.
 static PERIODIC_LISTS_BUILT: AtomicBool = AtomicBool::new(false);
@@ -1364,7 +1503,7 @@ fn periodic_loop(db: Arc<PvDatabase>, duty: PeriodicDuty, stop: Arc<ScanStop>, d
         // Sleep until the deadline or the stop signal, whichever first.
         let mut stopped = recover(FACILITY, stop.stopped.lock());
         loop {
-            if *stopped || scan_ctl() == ScanCtl::Exit {
+            if *stopped || db.scan_control().ctl() == ScanCtl::Exit {
                 // C `periodicTask`'s loop condition (`dbScan.c:801`): the
                 // facility's own stop ends the thread, not only the
                 // owner handle's drop.
@@ -1386,7 +1525,7 @@ fn periodic_loop(db: Arc<PvDatabase>, duty: PeriodicDuty, stop: Arc<ScanStop>, d
         //
         // A panicking record costs this tick, not the rate's thread —
         // the same isolation the scanOnce worker gives its tails.
-        if scan_is_running() {
+        if db.scan_control().is_running() {
             run_isolated(FACILITY, || {
                 driver.drive(async {
                     periodic_pass(&db, &duty);
@@ -1403,29 +1542,32 @@ fn periodic_loop(db: Arc<PvDatabase>, duty: PeriodicDuty, stop: Arc<ScanStop>, d
             db.record_scan_overrun(scan_type);
         }
         if let Some(warning) = outcome.warning {
-            crate::runtime::log::errlog_printf(&warning);
+            crate::runtime::log::errlog_vprintf(format_args!("{warning}"));
         }
     }
 }
 
 impl ScanScheduler {
     fn new(db: Arc<PvDatabase>, driver: TickDriver) -> Self {
-        Self { db, driver }
+        let is_first = db.scan_control().try_claim();
+        Self {
+            db,
+            driver,
+            is_first,
+        }
     }
 
     /// Run the PINI=YES pass (unless the IOC init path already ran it —
     /// see the exactly-once gate below) and all periodic scan tasks.
-    /// Never returns; dropping the future stops every scan thread (see
-    /// `ScanStopGuard`).
+    /// Never returns; dropping the future stops and joins every scan thread
+    /// (see [`ScanThreads`]).
     ///
     /// If another `ScanScheduler` has already started for the same DB
     /// (e.g. an IOC entry point and an embedded harness both starting a
     /// [`ScanOwner`]), this call parks as a non-owner and spawns no
     /// duplicate scan tasks.
     async fn run(&self) {
-        let is_first = self.db.try_claim_scan_start();
-
-        if !is_first {
+        if !self.is_first {
             // Another ScanScheduler already owns the periodic tasks for this DB.
             // Avoid spawning duplicates; just park this future.
             std::future::pending::<()>().await;
@@ -1451,6 +1593,10 @@ impl ScanScheduler {
             self.db
                 .pini_process(crate::server::record::PiniMode::Yes)
                 .await;
+            // C `dbCaRun`, which follows `initialProcess` and `scanRun`. The
+            // `IocApplication` path ran PINI in its build and runs this pass
+            // itself, after starting this owner.
+            self.db.process_cp_links_on_connect().await;
         }
         // Publish completion — `PvDatabase::wait_for_pini` subscribers
         // (anything ordering itself "after PINI") unblock here.
@@ -1470,7 +1616,6 @@ impl ScanScheduler {
             stopped: Mutex::new(false),
             wake: Condvar::new(),
         });
-        let guard = ScanStopGuard(Arc::clone(&stop));
         let driver = &self.driver;
         // Each rate is a [`MandatoryThread`]: C's `spawnPeriodic` waits on
         // `startStopEvent`, which only `periodicTask` posts, so a rate that
@@ -1501,7 +1646,7 @@ impl ScanScheduler {
         // C `scanInit`: `spawnHelpers()` and only then `spawnPeriodic(i)` for
         // each rate (`dbScan.c:279-281`) — a leader must not open a group
         // before there is a pool to wake.
-        let pool = spawn_helpers(
+        let helpers = spawn_helpers(
             &self.db,
             passes.clone(),
             &lengths,
@@ -1510,7 +1655,8 @@ impl ScanScheduler {
             CONFIGURED_RESERVE.load(Ordering::Relaxed).max(0) as usize,
             &rate_threads(),
         );
-        let helper_guard = pool.as_ref().map(|p| HelperStopGuard(Arc::clone(p)));
+        let pool = helpers.as_ref().map(|h| Arc::clone(&h.pool));
+        let mut leaders = Vec::with_capacity(scans.len());
         for (ind, scan_type) in scans.into_iter().enumerate() {
             if let Some(period) = scan_type.interval() {
                 let db = Arc::clone(&self.db);
@@ -1523,30 +1669,38 @@ impl ScanScheduler {
                     pass: Arc::clone(&passes[ind]),
                     pool: pool.clone(),
                 };
-                MandatoryThread::new(
-                    periodic_thread_name(period),
-                    periodic_priority(ind),
-                    // dbScan.c:946 — `opts.stackSize = epicsThreadStackBig`.
-                    StackSizeClass::Big,
-                )
-                .spawn(move || {
-                    periodic_loop(db, duty, stop, driver);
-                });
+                leaders.push(
+                    MandatoryThread::new(
+                        periodic_thread_name(period),
+                        periodic_priority(ind),
+                        // dbScan.c:946 — `opts.stackSize = epicsThreadStackBig`.
+                        StackSizeClass::Big,
+                    )
+                    .spawn(move || {
+                        ON_SCAN_THREAD.set(true);
+                        periodic_loop(db, duty, stop, driver);
+                    }),
+                );
             }
         }
 
-        // The threads own the periodic work; this future only keeps the
-        // stop guard alive. Cancelling it (tokio::select! or runtime
-        // teardown) drops the guard, which trips the stop flag and wakes
-        // every scan thread — a thread mid-tick finishes that tick, then
-        // exits at the flag check.
-        let _guard = guard;
-        // C `scanStop` stops the helpers after the leaders (`dbScan.c:248`),
-        // and drop order here is that order: the pool outlives the flag that
-        // ends the rate threads.
-        let _helpers = helper_guard;
+        // The threads own the periodic work; this future only keeps them.
+        // Cancelling it (tokio::select! or runtime teardown) drops them,
+        // which stops and joins every one — see [`ScanThreads`].
+        let _threads = ScanThreads {
+            stop,
+            leaders,
+            helpers,
+        };
         std::future::pending::<()>().await;
     }
+}
+
+thread_local! {
+    /// Set on the owner, `scan-%g` and helper threads: a record they process
+    /// can end the IOC (`epicsExit` runs `iocShutdown` on its caller), and
+    /// the join chain from there would end at the caller itself.
+    static ON_SCAN_THREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Single owner of "this IOC scans": starts the periodic scan machinery
@@ -1557,26 +1711,27 @@ impl ScanScheduler {
 /// (`dbScan.c`, `iocInit.c`) — RSRV has no hand in scanning. The Rust
 /// analog of that owner is here:
 ///
-/// * [`crate::server::ioc_app::IocApplication::run`] starts one at the C
-///   `scanRun` point (after the PINI=RUN pass, before
-///   `initHookAfterDatabaseRunning`), so every `IocApplication`-built IOC
-///   scans no matter which protocol runner it hands off to.
-/// * Entry-point binaries that assemble an IOC without `IocApplication`
-///   (`softioc-rs`, `oracle-ioc`, `dual-ioc-rs`, `qsrv-rs`,
-///   `realtime-ca-ioc`, `realtime-pva-ioc`) start one themselves, right where
-///   their hand-rolled iocInit sequence ends.
+/// * Every IOC build — [`crate::server::ioc_app::IocApplication`], the
+///   entry-point binaries' [`crate::server::ioc_builder::IocBuilder::build_ioc`]
+///   and the bare shell's `iocBuild`/`iocInit` — starts one at its C
+///   `scanInit`/`initialProcess` point, with the gate closed; the
+///   lifecycle's `iocRun` (`scanRun`) opens it, so every IOC scans no
+///   matter which protocol runner it hands off to.
+/// * A database with no IOC lifecycle at all — an in-process test, an
+///   embedded harness — calls [`ScanOwner::start`], which runs the facility
+///   and touches no `iocState`.
 ///
 /// Protocol servers must NOT start scanning — that was the defect this
 /// type closes: the `ScanScheduler` used to be constructed and driven
 /// only inside the CA/PVA server run loops, so a PVA-only RTEMS target
 /// had every periodic `SCAN` field silently dead. Redundant starts stay
-/// harmless by construction: `PvDatabase::try_claim_scan_start` makes any
+/// harmless by construction: `ScanControl::try_claim` makes any
 /// second owner a parked non-owner, so an IOC plus an embedded harness
 /// (or two servers on one database) never double-scan.
 ///
 /// # Why a dedicated thread, not a spawned task
 ///
-/// The owner future parks forever holding the `ScanStopGuard`. On the
+/// The owner future parks forever holding the `ScanThreads`. On the
 /// exec backend (`EPICS_RS_BUILD_EXEC_BACKEND=thread` / RTEMS) a spawned task
 /// that returns
 /// `Pending` with its waker registered nowhere has no strong holder — the
@@ -1594,26 +1749,45 @@ impl ScanScheduler {
 /// # Teardown
 ///
 /// Dropping the handle wakes the owner thread, which drops the scheduler
-/// future — tripping the stop flag through the `ScanStopGuard` — and
-/// joins the owner thread (the `scan-%g` threads themselves exit within
-/// one tick, unjoined, exactly as under the previous server-driven
-/// cancellation).
+/// future — stopping and joining every `scan-%g` and helper thread through
+/// `ScanThreads` — and joins the owner thread, so no scan thread outlives
+/// the drop, as none outlives C's `scanStop`.
 pub struct ScanOwner {
+    /// The claimed database's own cell, present only for the claimant: a
+    /// parked owner has none to drive, and no owner holds another
+    /// database's.
+    ctl: Option<Arc<ScanControl>>,
     stop: Option<crate::runtime::sync::oneshot::Sender<()>>,
     join: Option<std::thread::JoinHandle<()>>,
 }
 
 impl ScanOwner {
-    /// Start the scan owner thread for `db`. See the type docs for who
-    /// calls this and why redundant calls are harmless.
+    /// Start the scan owner thread for a `db` with no IOC lifecycle: C's
+    /// `scanRun` and nothing of `iocRun`'s, so `iocState` is left alone. An
+    /// IOC reaches its owner through `Self::start_running` instead, from its
+    /// build. See the type docs for why redundant calls are harmless.
     pub fn start(db: Arc<PvDatabase>) -> Self {
-        // This is the port's `iocRun` point: `IocApplication` calls it
-        // exactly where C's `iocRun` calls `scanRun`, and the six binaries
-        // that build their database through a server builder call it as
-        // the last step of their own init. The transition itself belongs
-        // to the lifecycle owner, which is why it is not `scan_run()`
-        // here — see `ioc_app::note_scan_owner_started`.
-        crate::server::ioc_app::note_scan_owner_started();
+        // A process that entered `iocBuild_1` is an IOC, and its owner comes
+        // from the lifecycle's build; a bare start there would scan outside
+        // `iocPause`'s reach.
+        debug_assert_eq!(
+            crate::server::ioc_app::get_ioc_state(),
+            crate::server::ioc_app::IocState::Void,
+            "ScanOwner::start on an IOC process; use IocBuilder::build_ioc"
+        );
+        Self::spawn(db, true)
+    }
+
+    /// C `scanInit` for an IOC: the threads start with the gate as the
+    /// lifecycle left it, and only its `iocRun` (`scanRun`) opens it.
+    pub(crate) fn start_running(db: Arc<PvDatabase>) -> Self {
+        Self::spawn(db, false)
+    }
+
+    /// `run_scan` is C's `scanRun` for a database with no IOC lifecycle;
+    /// only the claimant performs it, so a redundant start cannot resume a
+    /// facility the live owner's lifecycle paused.
+    fn spawn(db: Arc<PvDatabase>, run_scan: bool) -> Self {
         let (stop_tx, stop_rx) = crate::runtime::sync::oneshot::channel::<()>();
         // The scan facility's one and only ambient capture, taken on the
         // caller's thread because neither the owner thread nor the `scan-%g`
@@ -1621,6 +1795,13 @@ impl ScanOwner {
         // scheduler, the PINI pass, every rate thread — is handed this
         // driver rather than asking again.
         let driver = TickDriver::capture();
+        let scheduler = ScanScheduler::new(db, driver.clone());
+        let ctl = scheduler
+            .is_first
+            .then(|| Arc::clone(scheduler.db.scan_control()));
+        if run_scan && let Some(ctl) = &ctl {
+            ctl.run();
+        }
         // Mandatory: this thread *is* "this IOC scans". `start` has no error
         // path back to its callers (`IocApplication::run` and the entry-point
         // binaries all take a `Self`), so a thread that cannot be created takes
@@ -1639,7 +1820,7 @@ impl ScanOwner {
             StackSizeClass::Medium,
         )
         .spawn(move || {
-            let scheduler = ScanScheduler::new(db, driver.clone());
+            ON_SCAN_THREAD.set(true);
             let owner = async move {
                 tokio::select! {
                     _ = scheduler.run() => {}
@@ -1652,6 +1833,7 @@ impl ScanOwner {
             driver.drive(owner);
         });
         Self {
+            ctl,
             stop: Some(stop_tx),
             join: Some(join),
         }
@@ -1663,14 +1845,18 @@ impl Drop for ScanOwner {
         // C `scanStop` sets `ctlExit` before it signals and joins
         // (`dbScan.c:159-176`), so a source that fires between the two
         // sees a stopped facility rather than a half-torn one.
-        scan_stop();
+        if let Some(ctl) = &self.ctl {
+            ctl.stop();
+        }
         if let Some(tx) = self.stop.take() {
             let _ = tx.send(());
         }
-        if let Some(join) = self.join.take() {
-            // Bounded: the send above wakes the parked owner future, the
-            // thread drops the scheduler (tripping the stop flag) and
-            // returns without waiting on the scan threads.
+        // Bounded by the in-flight sweeps: the send above wakes the parked
+        // owner future, whose drop joins the scan threads (`ScanThreads`).
+        // From one of those threads the join is skipped; the rest still stop.
+        if let Some(join) = self.join.take()
+            && !ON_SCAN_THREAD.get()
+        {
             let _ = join.join();
         }
     }
@@ -1696,7 +1882,7 @@ mod overrun_tests {
         for i in 1..=ticks {
             let now = base + sweep * i;
             if let Some(w) = tracker.after_scan(&mut next, now).warning {
-                warnings.push(w);
+                warnings.push(w.to_string());
             }
         }
         warnings
@@ -2186,9 +2372,9 @@ mod tests {
             let passes = passes_for(&rates);
             let driver = TickDriver::capture();
             let lengths: Vec<usize> = rates.iter().map(|s| db.scan_list_len(*s)).collect();
-            let pool = spawn_helpers(&db, passes.clone(), &lengths, &driver, 8, 0, &[])
+            let guard = spawn_helpers(&db, passes.clone(), &lengths, &driver, 8, 0, &[])
                 .expect("eight helpers");
-            let guard = HelperStopGuard(Arc::clone(&pool));
+            let pool = Arc::clone(&guard.pool);
 
             let stop = Arc::new(AtomicBool::new(false));
             let ind = rate(fast);
@@ -2318,7 +2504,7 @@ mod tests {
 
         impl Record for CountRecord {
             fn record_type(&self) -> &'static str {
-                "scan_live_count"
+                "scan_live_late"
             }
             fn process(&mut self) -> CaResult<ProcessOutcome> {
                 self.runs.fetch_add(1, Ordering::AcqRel);
@@ -2356,8 +2542,9 @@ mod tests {
             let release = Arc::new(AtomicBool::new(false));
             let runs = Arc::new(AtomicI32::new(0));
 
-            // `a_gate` sorts ahead of `z_late` at the same PHAS, so the walk
-            // reaches the gate first and the late record is still ahead of it.
+            // `scan_live_gate` sorts ahead of `scan_live_late` at the same
+            // PHAS, so the walk reaches the gate first and the late record is
+            // still ahead of it.
             db.add_record(
                 "a_gate",
                 Box::new(GateRecord {
@@ -2374,11 +2561,11 @@ mod tests {
             let driver = TickDriver::capture();
             let ind = rate(fast);
             let lengths: Vec<usize> = rates.iter().map(|s| db.scan_list_len(*s)).collect();
-            let pool = with_helpers.then(|| {
+            let guard = with_helpers.then(|| {
                 spawn_helpers(&db, passes.clone(), &lengths, &driver, 2, 0, &[])
                     .expect("two pool helpers")
             });
-            let guard = pool.clone().map(HelperStopGuard);
+            let pool = guard.as_ref().map(|g| Arc::clone(&g.pool));
 
             let duty = PeriodicDuty {
                 scan_type: fast,
@@ -2508,9 +2695,9 @@ mod tests {
             let lengths: Vec<usize> = rates.iter().map(|s| db.scan_list_len(*s)).collect();
             let mut rate_helpers = vec![0; rates.len()];
             rate_helpers[rate(slow)] = 1;
-            let pool = spawn_helpers(&db, passes.clone(), &lengths, &driver, 2, 0, &rate_helpers)
+            let guard = spawn_helpers(&db, passes.clone(), &lengths, &driver, 2, 0, &rate_helpers)
                 .expect("a pool");
-            let guard = HelperStopGuard(Arc::clone(&pool));
+            let pool = Arc::clone(&guard.pool);
 
             // Dedicated first, so helper 0 is the slow rate's own and 1 and 2
             // are the pool's.
@@ -2586,7 +2773,7 @@ mod tests {
             let mut rate_helpers = vec![0; rates.len()];
             rate_helpers[rate(fast)] = fast_threads;
             rate_helpers[rate(slow)] = slow_threads;
-            let pool = spawn_helpers(
+            let guard = spawn_helpers(
                 &db,
                 passes.clone(),
                 &lengths,
@@ -2596,7 +2783,7 @@ mod tests {
                 &rate_helpers,
             )
             .expect("a pool");
-            let guard = HelperStopGuard(Arc::clone(&pool));
+            let pool = Arc::clone(&guard.pool);
 
             let stop = Arc::new(AtomicBool::new(false));
             let threads: Vec<_> = [fast, slow]
@@ -2750,7 +2937,7 @@ mod tests {
     /// the C IOC measures on RTEMS 6 (`scan-10` 60 … `scan-0.1` 66).
     #[test]
     fn periodic_ladder_matches_dbscan() {
-        let expected: &[(ScanType, u8, &str)] = &[
+        let expected: &[(ScanType, u32, &str)] = &[
             (ScanType::SEC10, 60, "scan-10"),
             (ScanType::SEC5, 61, "scan-5"),
             (ScanType::SEC2, 62, "scan-2"),
@@ -2767,6 +2954,15 @@ mod tests {
             let period = scan_type.interval().expect("periodic rate has a period");
             assert_eq!(periodic_thread_name(period), name);
         }
+    }
+
+    /// A site menuScan period is not one of C's short decimals.
+    #[test]
+    fn periodic_thread_name_is_percent_g_of_any_period() {
+        let third = Duration::from_nanos(333_333_333);
+        assert_eq!(periodic_thread_name(third), "scan-0.333333");
+        let tiny = Duration::from_micros(10);
+        assert_eq!(periodic_thread_name(tiny), "scan-1e-05");
     }
 
     /// The whole ladder stays inside the scan band: above every CA
@@ -2868,7 +3064,7 @@ mod tests {
             let rec = db.get_record("SCAN:THREAD").unwrap();
             rec.write().common.scan = ScanType::SEC01;
         }
-        db.update_scan_index("SCAN:THREAD", ScanType::Passive, ScanType::SEC01, 0, 0);
+        db.update_scan_index(b"SCAN:THREAD", ScanType::Passive, ScanType::SEC01, 0, 0);
 
         let owner = ScanOwner::start(Arc::clone(&db));
 
@@ -3090,7 +3286,7 @@ mod tests {
     }
 
     /// Redundant-start boundary: a second `ScanOwner` on the same DB is a
-    /// parked non-owner (`try_claim_scan_start` dedup), and dropping it
+    /// parked non-owner (`ScanControl::try_claim` dedup), and dropping it
     /// must not disturb the first owner's scan threads.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_redundant_scan_owner_parks_and_its_drop_is_harmless() {
@@ -3118,5 +3314,129 @@ mod tests {
             |n| n == 1,
         )
         .await;
+    }
+
+    /// Parked-owner boundary: the second owner's drop leaves the live
+    /// owner's threads running past several ticks of the fastest rate,
+    /// where a stray stop would already have ended them.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_parked_owner_drop_leaves_the_live_owners_threads_running() {
+        let db = Arc::new(PvDatabase::new());
+        let first = ScanOwner::start(Arc::clone(&db));
+        wait_for_count(&db, "scan threads never started", |n| {
+            n >= 2 + periodic_scans().len()
+        })
+        .await;
+        let with_first = Arc::strong_count(&db) - 1;
+
+        drop(ScanOwner::start(Arc::clone(&db)));
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(Arc::strong_count(&db), with_first + 1);
+        assert_eq!(db.scan_control().ctl(), ScanCtl::Run);
+        drop(first);
+    }
+
+    /// Two databases, one owner each, both thread sets up. Returns B's
+    /// holder count with B's threads running.
+    async fn two_running_databases() -> (
+        Arc<PvDatabase>,
+        ScanOwner,
+        Arc<PvDatabase>,
+        ScanOwner,
+        usize,
+    ) {
+        let a = Arc::new(PvDatabase::new());
+        let b = Arc::new(PvDatabase::new());
+        let owner_a = ScanOwner::start(Arc::clone(&a));
+        let owner_b = ScanOwner::start(Arc::clone(&b));
+        for db in [&a, &b] {
+            wait_for_count(db, "scan threads never started", |n| {
+                n >= 2 + periodic_scans().len()
+            })
+            .await;
+        }
+        let with_b = Arc::strong_count(&b);
+        (a, owner_a, b, owner_b, with_b)
+    }
+
+    /// Cross-database boundary: dropping database A's owner stops A and
+    /// leaves B's threads running and B's cell as it was; B's own drop then
+    /// stops B only.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn one_databases_owner_drop_leaves_the_other_database_running() {
+        let (a, owner_a, b, owner_b, with_b) = two_running_databases().await;
+
+        drop(owner_a);
+        wait_for_count(&a, "A's threads outlived its owner", |n| n == 1).await;
+        assert_eq!(a.scan_control().ctl(), ScanCtl::Exit);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            Arc::strong_count(&b),
+            with_b,
+            "B's threads must keep running"
+        );
+        assert_eq!(b.scan_control().ctl(), ScanCtl::Run);
+
+        drop(owner_b);
+        wait_for_count(&b, "B's threads outlived its owner", |n| n == 1).await;
+        assert_eq!(b.scan_control().ctl(), ScanCtl::Exit);
+    }
+
+    /// Cross-database boundary: a paused B stays paused, not resumed or
+    /// stopped, when A's owner goes away.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn one_databases_owner_drop_leaves_the_other_cell_paused() {
+        let (a, owner_a, b, owner_b, with_b) = two_running_databases().await;
+        b.scan_control().pause();
+
+        drop(owner_a);
+        wait_for_count(&a, "A's threads outlived its owner", |n| n == 1).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(b.scan_control().ctl(), ScanCtl::Pause);
+        assert_eq!(Arc::strong_count(&b), with_b);
+        drop(owner_b);
+    }
+
+    /// Redundant-start boundary: a second owner on a facility its first
+    /// owner's lifecycle paused does not resume it — `scanRun` is the
+    /// claimant's alone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_redundant_start_does_not_resume_a_paused_facility() {
+        let db = Arc::new(PvDatabase::new());
+        let first = ScanOwner::start(Arc::clone(&db));
+        wait_for_count(&db, "scan threads never started", |n| {
+            n >= 2 + periodic_scans().len()
+        })
+        .await;
+        db.scan_control().pause();
+
+        let second = ScanOwner::start(Arc::clone(&db));
+        assert_eq!(db.scan_control().ctl(), ScanCtl::Pause);
+        drop(second);
+        assert_eq!(db.scan_control().ctl(), ScanCtl::Pause);
+        drop(first);
+    }
+
+    /// Live-owner boundary: with a parked owner present, dropping the live
+    /// one stops its threads, and the parked one keeps its scheduler.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_live_owner_drop_stops_its_threads_and_leaves_the_parked_owner() {
+        let db = Arc::new(PvDatabase::new());
+        let first = ScanOwner::start(Arc::clone(&db));
+        wait_for_count(&db, "scan threads never started", |n| {
+            n >= 2 + periodic_scans().len()
+        })
+        .await;
+        let parked = ScanOwner::start(Arc::clone(&db));
+
+        drop(first);
+        // Test handle + the parked owner's scheduler.
+        wait_for_count(&db, "scan threads still alive after live owner drop", |n| {
+            n == 2
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(Arc::strong_count(&db), 2);
+        drop(parked);
     }
 }

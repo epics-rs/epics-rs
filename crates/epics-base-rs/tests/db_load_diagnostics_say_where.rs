@@ -81,7 +81,12 @@ fn stderr_of(line: &str, db: Arc<PvDatabase>) -> String {
 
     let bridge = epics_base_rs::runtime::task::BlockingBridge::capture();
     let owned = line.to_string();
-    let ran = std::thread::spawn(move || IocShell::new(db, bridge).execute_line(&owned)).join();
+    let ran = std::thread::spawn(move || {
+        // A script line runs inside `iocshBody`, which may block (`iocsh.cpp:1122`).
+        epics_base_rs::runtime::task::set_thread_ok_to_block(true);
+        IocShell::new(db, bridge).execute_line(&owned)
+    })
+    .join();
 
     // Restore BEFORE anything can panic on the assertion, or the failure
     // report has nowhere to go.
@@ -112,16 +117,8 @@ fn strip_ansi(s: &str) -> String {
 /// The whole of C's answer to "where", on the file that produced the
 /// measurement.
 ///
-/// One deviation, and it is the flattening this port does before it parses:
-/// C's lexer reads a line and the parser consumes it, so C interleaves each
-/// line's read-time diagnostics with that line's parse-time ones, while
-/// `expand_includes` here expands the whole include tree first — so all four
-/// macro notices come out before the first refusal. Every line C writes is
-/// written, with the same bytes; only the grouping differs. Making them
-/// interleave would mean buffering the expander's output and flushing it as
-/// the install loop walks records, which is ordering by convention — the
-/// install loop is under no obligation to visit lines in file order — and this
-/// port would rather have the honest grouping than a fragile imitation.
+/// Each line's read-time notices sit between the previous line's refusals and
+/// its own, where C's lexer reads it; captured from `softIoc` R7.0.10.
 #[epics_macros_rs::epics_test]
 #[serial_test::serial(db_load_stderr)]
 async fn every_db_diagnostic_names_its_file_and_line() {
@@ -145,33 +142,33 @@ async fn every_db_diagnostic_names_its_file_and_line() {
 macLib: macro INP is undefined (expanding string   field(INP, \"$(INP) NPP\")
 )
 WARNING: 'compressTest.db' line 7 has undefined macros
-macLib: macro ALG is undefined (expanding string   field(ALG, \"$(ALG)\")
-)
-WARNING: 'compressTest.db' line 8 has undefined macros
-macLib: macro BALG is undefined (expanding string   field(BALG,\"$(BALG)\")
-)
-WARNING: 'compressTest.db' line 10 has undefined macros
-macLib: macro NSAM is undefined (expanding string   field(NSAM,\"$(NSAM)\")
-)
-WARNING: 'compressTest.db' line 11 has undefined macros
 comp.INP Has unexpanded macro
 ERROR: Can't set 'comp.INP' to '$(INP,undefined) NPP'  : Bad Field value
 ERROR:  at or before ')' in path \"{found_under}\"  file \"compressTest.db\" line 7
 
  7 |   field(INP, \"$(INP,undefined) NPP\")
 
+macLib: macro ALG is undefined (expanding string   field(ALG, \"$(ALG)\")
+)
+WARNING: 'compressTest.db' line 8 has undefined macros
 comp.ALG Has unexpanded macro
 ERROR: Can't set 'comp.ALG' to '$(ALG,undefined)'  : Bad Field value
     Did you mean \"Average\"?
 ERROR: 
  8 |   field(ALG, \"$(ALG,undefined)\")
 
+macLib: macro BALG is undefined (expanding string   field(BALG,\"$(BALG)\")
+)
+WARNING: 'compressTest.db' line 10 has undefined macros
 comp.BALG Has unexpanded macro
 ERROR: Can't set 'comp.BALG' to '$(BALG,undefined)'  : Bad Field value
     Did you mean \"FIFO Buffer\"?
 ERROR: 
  10 |   field(BALG,\"$(BALG,undefined)\")
 
+macLib: macro NSAM is undefined (expanding string   field(NSAM,\"$(NSAM)\")
+)
+WARNING: 'compressTest.db' line 11 has undefined macros
 comp.NSAM Has unexpanded macro
 ERROR: Can't set 'comp.NSAM' to '$(NSAM,undefined)'  : Bad Field value
 ERROR: 
@@ -218,27 +215,27 @@ async fn quiet_macro_warnings_drops_maclibs_notice_and_keeps_the_loaders() {
     let want = format!(
         "\
 WARNING: 'compressTest.db' line 7 has undefined macros
-WARNING: 'compressTest.db' line 8 has undefined macros
-WARNING: 'compressTest.db' line 10 has undefined macros
-WARNING: 'compressTest.db' line 11 has undefined macros
 comp.INP Has unexpanded macro
 ERROR: Can't set 'comp.INP' to '$(INP) NPP'  : Bad Field value
 ERROR:  at or before ')' in path \"{found_under}\"  file \"compressTest.db\" line 7
 
  7 |   field(INP, \"$(INP) NPP\")
 
+WARNING: 'compressTest.db' line 8 has undefined macros
 comp.ALG Has unexpanded macro
 ERROR: Can't set 'comp.ALG' to '$(ALG)'  : Bad Field value
     Did you mean \"N to 1 Average\"?
 ERROR: 
  8 |   field(ALG, \"$(ALG)\")
 
+WARNING: 'compressTest.db' line 10 has undefined macros
 comp.BALG Has unexpanded macro
 ERROR: Can't set 'comp.BALG' to '$(BALG)'  : Bad Field value
     Did you mean \"FIFO Buffer\"?
 ERROR: 
  10 |   field(BALG,\"$(BALG)\")
 
+WARNING: 'compressTest.db' line 11 has undefined macros
 comp.NSAM Has unexpanded macro
 ERROR: Can't set 'comp.NSAM' to '$(NSAM)'  : Bad Field value
 ERROR: 
@@ -304,11 +301,8 @@ async fn var_reaches_the_quiet_knob_the_loader_reads() {
 /// them apart — and the ` at or before` clause quotes that token rather than
 /// a column of this port's invention.
 ///
-/// One deviation is left:
-///
-/// * `WARNING: dbReadCOM: Parser stack dirty w/o error. 1` is absent. It
-///   counts the half-built objects left on C's `tempList`
-///   (`dbLexRoutines.c:303-305`); this parser has no such list.
+/// The abort falls inside `S1`'s body, so C's `tempList` still holds it and
+/// `dbReadCOM` follows with `Parser stack dirty` (`dbLexRoutines.c:303-306`).
 #[epics_macros_rs::epics_test]
 #[serial_test::serial(db_load_stderr)]
 async fn a_syntax_error_names_its_file_line_and_source() {
@@ -332,7 +326,72 @@ ERROR: syntax error
 
  3 |   qqq
 
+WARNING: dbReadCOM: Parser stack dirty w/o error. 1
 ERROR: Failed to load 'syn.db'
+"
+    );
+    assert_eq!(got, want, "\n--- got ---\n{got}\n--- want ---\n{want}");
+}
+
+/// Run `dbLoadRecords("p.db")` over `parent` beside `ADBase.template` (one
+/// `ai` record `CHILD`), with the directory as the include path.
+fn stderr_with_adbase(parent: &str) -> (String, String) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        dir.path().join("ADBase.template"),
+        "record(ai, \"CHILD\") {}\n",
+    )
+    .expect("write ADBase.template");
+    std::fs::write(dir.path().join("p.db"), parent).expect("write p.db");
+    let found_under = dir.path().display().to_string();
+
+    // SAFETY: the process-global env is why the callers are `serial`.
+    unsafe { std::env::set_var("EPICS_DB_INCLUDE_PATH", &found_under) };
+    let got = stderr_of("dbLoadRecords(\"p.db\")", Arc::new(PvDatabase::new()));
+    unsafe { std::env::remove_var("EPICS_DB_INCLUDE_PATH") };
+    (got, found_under)
+}
+
+/// C pushes the included file when the grammar reduces `include`, while the
+/// rest of the line is still in the lexer's buffer: a token there is located
+/// in the included file at its line 0, echoing the including line. Measured
+/// on `softIoc` R7.0.10.
+#[epics_macros_rs::epics_test]
+#[serial_test::serial(db_load_stderr)]
+async fn a_word_after_an_include_is_located_in_the_included_file() {
+    let (got, found_under) = stderr_with_adbase("include ADBase.template junk\n");
+    let want = format!(
+        "\
+ERROR: syntax error
+ at or before 'junk' in path \"{found_under}\"  file \"ADBase.template\" line 0
+ in path \"{found_under}\"  file \"p.db\" line 1
+
+ 0 | include ADBase.template junk
+
+ERROR: Failed to load 'p.db'
+"
+    );
+    assert_eq!(got, want, "\n--- got ---\n{got}\n--- want ---\n{want}");
+}
+
+/// The included file is read before the line after the include, so a record
+/// body opened on the include's line meets the included file's text first.
+/// Measured on `softIoc` R7.0.10.
+#[epics_macros_rs::epics_test]
+#[serial_test::serial(db_load_stderr)]
+async fn an_included_file_is_read_before_the_next_line() {
+    let (got, found_under) =
+        stderr_with_adbase("include ADBase.template record(ai, \"P\") {\n field(DESC, \"x\") }\n");
+    let want = format!(
+        "\
+ERROR: syntax error
+ at or before 'record' in path \"{found_under}\"  file \"ADBase.template\" line 1
+ in path \"{found_under}\"  file \"p.db\" line 1
+
+ 1 | record(ai, \"CHILD\") {{}}
+
+WARNING: dbReadCOM: Parser stack dirty w/o error. 1
+ERROR: Failed to load 'p.db'
 "
     );
     assert_eq!(got, want, "\n--- got ---\n{got}\n--- want ---\n{want}");
@@ -412,8 +471,8 @@ ERROR: Failed to load 'a.db'
 /// ```
 ///
 /// This port's file reader used to build a `MacroTable` per LINE, so the
-/// pair repeated three times for three lines; `expand_includes_mapped`
-/// now holds one for the whole include tree, which is why the count here
+/// pair repeated three times for three lines; the reader now holds one
+/// for the whole include tree, which is why the count here
 /// is C's.
 ///
 /// The load is driven by `dbLoadTemplate`, so the refusal is a ROW's, and C
@@ -470,4 +529,316 @@ line 2: '}}'
 "
     );
     assert_eq!(got, want, "\n--- got ---\n{got}\n--- want ---\n{want}");
+}
+
+/// Run `dbLoadRecords("<name>")` over `db` in a directory of its own that
+/// is the include path, prepared by `setup`; return what it wrote, the
+/// directory, and the records it left, sorted.
+async fn load_in_dir(
+    name: &str,
+    db: &[u8],
+    setup: impl FnOnce(&std::path::Path),
+) -> (String, String, Vec<String>) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(dir.path().join(name), db).expect("write the .db");
+    setup(dir.path());
+    let found_under = dir.path().display().to_string();
+    let pvdb = Arc::new(PvDatabase::new());
+
+    // SAFETY: the process-global env is why the callers are `serial`.
+    unsafe { std::env::set_var("EPICS_DB_INCLUDE_PATH", &found_under) };
+    let got = stderr_of(&format!("dbLoadRecords(\"{name}\")"), pvdb.clone());
+    unsafe { std::env::remove_var("EPICS_DB_INCLUDE_PATH") };
+    let mut records: Vec<String> = pvdb
+        .all_record_names()
+        .iter()
+        .map(|n| String::from_utf8_lossy(n.as_ref()).into_owned())
+        .collect();
+    records.sort();
+    (got, found_under, records)
+}
+
+/// A character no `INITIAL` rule of `dbLex.l` takes is a `yyerrorAbort`
+/// wherever the lexer meets it, not only after a field value: the rest of
+/// its line is still lexed, and records the grammar completes on it are
+/// created, but the next line is EOF and the load fails. Each case is one
+/// boundary of the rule; every expected text is `softIoc` R7.0.10's (`dbl`
+/// for the records), with its `"."` search path for the test's directory.
+#[epics_macros_rs::epics_test]
+#[serial_test::serial(db_load_stderr)]
+async fn an_initial_state_refusal_ends_the_load_after_its_line() {
+    let cases: &[(&str, &[u8], &str, &[&str])] = &[
+        // Alone on a line, at file scope: EOF follows, which the grammar
+        // accepts there.
+        (
+            "stray.db",
+            b"record(ai, \"A\") {}\n@\nrecord(ai, \"B\") {}\n",
+            "\
+ERROR: Invalid character '@'
+ at or before '@' in path \"{dir}\"  file \"stray.db\" line 2
+
+ 2 | @
+
+ERROR: Failed to load 'stray.db'
+",
+            &["A"],
+        ),
+        // Before a token: the record on the line is still completed.
+        (
+            "c3.db",
+            b"record(ai, \"A\") {}\nrecord(ai, @\"X\") {}\nrecord(ai, \"B\") {}\n",
+            "\
+ERROR: Invalid character '@'
+ at or before '@' in path \"{dir}\"  file \"c3.db\" line 2
+
+ 2 | record(ai, @\"X\") {}
+
+ERROR: Failed to load 'c3.db'
+",
+            &["A", "X"],
+        ),
+        // A string the newline ends: its own rule, `yytext` through the
+        // newline, and the grammar then meets EOF.
+        (
+            "c4.db",
+            b"record(ai, \"A\") {}\nrecord(ai, \"X) {}\nrecord(ai, \"B\") {}\n",
+            "\
+ERROR: Newline in string, closing quote missing
+ at or before '\"X) {}
+' in path \"{dir}\"  file \"c4.db\" line 2
+
+ 2 | record(ai, \"X) {}
+
+ERROR: syntax error
+
+ 2 | record(ai, \"X) {}
+
+ERROR: Failed to load 'c4.db'
+",
+            &["A"],
+        ),
+        // A string a backslash-newline ends matches neither string rule: the
+        // quote alone is refused, and the lexer goes on after it.
+        (
+            "c5.db",
+            b"record(ai, \"A\") {}\nrecord(ai, \"X\\\nrecord(ai, \"B\") {}\n",
+            "\
+ERROR: Invalid character '\"'
+ at or before '\"' in path \"{dir}\"  file \"c5.db\" line 2
+
+ 2 | record(ai, \"X\\
+
+ERROR: Invalid character '\\'
+
+ 2 | record(ai, \"X\\
+
+ERROR: syntax error
+
+ 2 | record(ai, \"X\\
+
+ERROR: Failed to load 'c5.db'
+",
+            &["A"],
+        ),
+        // A single quote delimits a string only in the `JSON` state.
+        (
+            "c6.db",
+            b"record(ai, \"A\") {}\nrecord(ai, 'X') {}\n",
+            "\
+ERROR: Invalid character '''
+ at or before ''' in path \"{dir}\"  file \"c6.db\" line 2
+
+ 2 | record(ai, 'X') {}
+
+ERROR: Invalid character '''
+
+ 2 | record(ai, 'X') {}
+
+ERROR: Failed to load 'c6.db'
+",
+            &["A", "X"],
+        ),
+        // Inside a record body.
+        (
+            "c7.db",
+            b"record(ai, \"A\") { @ field(DESC, \"x\") }\nrecord(ai, \"B\") {}\n",
+            "\
+ERROR: Invalid character '@'
+ at or before '@' in path \"{dir}\"  file \"c7.db\" line 1
+
+ 1 | record(ai, \"A\") { @ field(DESC, \"x\") }
+
+ERROR: Failed to load 'c7.db'
+",
+            &["A"],
+        ),
+        // `%` starts a token, which the grammar refuses at file scope.
+        (
+            "c8.db",
+            b"record(ai, \"A\") {}\n%foo\nrecord(ai, \"B\") {}\n",
+            "\
+ERROR: syntax error
+ at or before '%foo' in path \"{dir}\"  file \"c8.db\" line 2
+
+ 2 | %foo
+
+ERROR: Failed to load 'c8.db'
+",
+            &["A"],
+        ),
+        // So does a quoted string.
+        (
+            "c14.db",
+            b"record(ai, \"A\") {}\n\"X\" record(ai, \"B\") {}\n",
+            "\
+ERROR: syntax error
+ at or before '\"X\"' in path \"{dir}\"  file \"c14.db\" line 2
+
+ 2 | \"X\" record(ai, \"B\") {}
+
+ERROR: Failed to load 'c14.db'
+",
+            &["A"],
+        ),
+        // A character that does not print is named by its byte.
+        (
+            "c9.db",
+            b"record(ai, \"A\") {}\n\x01 record(ai, \"C\") {}\nrecord(ai, \"B\") {}\n",
+            "\
+ERROR: Invalid character 0x01
+ at or before '\x01' in path \"{dir}\"  file \"c9.db\" line 2
+
+ 2 | \x01 record(ai, \"C\") {}
+
+ERROR: Failed to load 'c9.db'
+",
+            &["A", "C"],
+        ),
+        // Every refusal on the line is reported, the position only once.
+        (
+            "c10.db",
+            b"record(ai, \"A\") {}\n@ @ record(ai, \"C\") {} $\nrecord(ai, \"B\") {}\n",
+            "\
+ERROR: Invalid character '@'
+ at or before '@' in path \"{dir}\"  file \"c10.db\" line 2
+
+ 2 | @ @ record(ai, \"C\") {} $
+
+ERROR: Invalid character '@'
+
+ 2 | @ @ record(ai, \"C\") {} $
+
+ERROR: Invalid character '$'
+
+ 2 | @ @ record(ai, \"C\") {} $
+
+ERROR: Failed to load 'c10.db'
+",
+            &["A", "C"],
+        ),
+        // A body left open by the EOF is a syntax error, and not a dirty
+        // parser stack.
+        (
+            "c11.db",
+            b"record(ai, \"A\") {\n  field(DESC, \"x\") @\n}\nrecord(ai, \"B\") {}\n",
+            "\
+ERROR: Invalid character '@'
+ at or before '@' in path \"{dir}\"  file \"c11.db\" line 2
+
+ 2 |   field(DESC, \"x\") @
+
+ERROR: syntax error
+
+ 2 |   field(DESC, \"x\") @
+
+ERROR: Failed to load 'c11.db'
+",
+            &["A"],
+        ),
+    ];
+    for (name, db, want, records) in cases {
+        let (got, dir, loaded) = load_in_dir(name, db, |_| {}).await;
+        let want = want.replace("{dir}", &dir);
+        assert_eq!(
+            got, want,
+            "{name}\n--- got ---\n{got}\n--- want ---\n{want}"
+        );
+        assert_eq!(loaded, *records, "{name}: records left");
+    }
+}
+
+/// `include sub/S.template` names `sub`: `/` is no bareword character, and
+/// is refused after the include is reduced, in the file it pushed. Measured
+/// on `softIoc` R7.0.10 with `sub` absent, then a directory, which `fopen`
+/// opens and the first read finds empty.
+#[epics_macros_rs::epics_test]
+#[serial_test::serial(db_load_stderr)]
+async fn a_slash_after_an_include_name_is_refused() {
+    let db = b"record(ai, \"A\") {}\ninclude sub/S.template\nrecord(ai, \"B\") {}\n";
+    let (got, dir, loaded) = load_in_dir("n2.db", db, |_| {}).await;
+    let want = format!(
+        "\
+ERROR: Can't open include file 'sub'
+ERROR:  at or before 'sub' in path \"{dir}\"  file \"n2.db\" line 2
+
+ 2 | include sub/S.template
+
+ERROR: Invalid character '/'
+
+ 2 | include sub/S.template
+
+ERROR: syntax error
+
+ 2 | include sub/S.template
+
+ERROR: Failed to load 'n2.db'
+"
+    );
+    assert_eq!(got, want, "\n--- got ---\n{got}\n--- want ---\n{want}");
+    assert_eq!(loaded, ["A"]);
+
+    let db = b"include sub/S.template\nrecord(ai, \"B\") {}\n";
+    let (got, dir, loaded) = load_in_dir("c2.db", db, |dir| {
+        std::fs::create_dir(dir.join("sub")).expect("mkdir sub");
+        std::fs::write(dir.join("sub/S.template"), "record(ai, \"S\") {}\n").expect("write S");
+    })
+    .await;
+    let want = format!(
+        "\
+ERROR: Invalid character '/'
+ at or before '/' in path \"{dir}\"  file \"sub\" line 0
+ in path \"{dir}\"  file \"c2.db\" line 1
+
+ 0 | include sub/S.template
+
+ERROR: syntax error
+
+ 0 | include sub/S.template
+
+ERROR: Failed to load 'c2.db'
+"
+    );
+    assert_eq!(got, want, "\n--- got ---\n{got}\n--- want ---\n{want}");
+    assert!(loaded.is_empty(), "records left: {loaded:?}");
+}
+
+/// A keyword is the whole bareword run, as flex's longest match makes it:
+/// `record.x` is refused as one token. Measured on `softIoc` R7.0.10.
+#[epics_macros_rs::epics_test]
+#[serial_test::serial(db_load_stderr)]
+async fn a_keyword_is_the_whole_bareword_run() {
+    let db = b"record(ai, \"A\") {}\nrecord.x(ai, \"B\") {}\n";
+    let (got, dir, loaded) = load_in_dir("kw.db", db, |_| {}).await;
+    let want = format!(
+        "\
+ERROR: syntax error
+ at or before 'record.x' in path \"{dir}\"  file \"kw.db\" line 2
+
+ 2 | record.x(ai, \"B\") {{}}
+
+ERROR: Failed to load 'kw.db'
+"
+    );
+    assert_eq!(got, want, "\n--- got ---\n{got}\n--- want ---\n{want}");
+    assert_eq!(loaded, ["A"]);
 }

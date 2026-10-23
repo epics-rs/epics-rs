@@ -37,13 +37,15 @@
 //! socket-per-NIC mapping (e.g. for diagnostics or NS-driven response
 //! correlation).
 
-// RTEMS-EXEC-MODEL-ALLOW(17): every test binds tokio::net UDP sockets, which
+// RTEMS-EXEC-MODEL-ALLOW(23): every test binds tokio::net UDP sockets, which
 // need a reactor the exec backend does not start; on the exec backend these
 // still run on the tokio driver `#[tokio::test]` builds, and pass. b3ab3ab8
 // added the three bundle-port tests without touching the count; all 17 were
-// re-run under `EPICS_RS_BUILD_EXEC_BACKEND=thread` before this bump. Each
-// keeps its own attribute rather than sharing a helper, so the count tracks
-// the test count and the next addition fails closed.
+// re-run under `EPICS_RS_BUILD_EXEC_BACKEND=thread` before this bump. The
+// three fanout-holder tests do not build there: `net::async_udp_v4` is itself
+// `#[cfg(tokio_backend)]`. Each keeps its own attribute rather than sharing
+// a helper, so the count tracks the test count and the next addition fails
+// closed.
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::Arc;
@@ -51,6 +53,8 @@ use std::sync::Arc;
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::UdpSocket;
 
+use super::fanout::PortOrigin;
+pub use super::fanout::PortUse;
 use super::iface_map::{IfaceInfo, IfaceMap};
 
 /// Metadata returned by [`AsyncUdpV4::recv_with_meta`].
@@ -60,8 +64,9 @@ pub struct RecvMeta {
     pub n: usize,
     /// Source address as seen on the wire.
     pub src: SocketAddr,
-    /// Destination IP — synthesized from the receiving socket's NIC IP.
-    /// `None` only if the receiving socket was bound to the wildcard.
+    /// Destination IP — the address the receiving socket is bound to, which
+    /// is the only one it takes datagrams for: the NIC's own, or for an
+    /// [`NicSocket::rx_only_bcast`] socket its broadcast.
     pub dst_ip: Option<Ipv4Addr>,
     /// Receiving interface index (kernel ifindex). `None` only if the
     /// platform did not surface an index for this interface.
@@ -94,6 +99,17 @@ pub struct NicSocket {
     pub rx_only_bcast: bool,
 }
 
+impl NicSocket {
+    /// The destination of every datagram this socket receives.
+    fn dest(&self) -> Option<Ipv4Addr> {
+        if self.rx_only_bcast {
+            self.broadcast
+        } else {
+            Some(self.iface_ip)
+        }
+    }
+}
+
 impl std::fmt::Debug for NicSocket {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("NicSocket")
@@ -118,14 +134,6 @@ impl std::fmt::Debug for NicSocket {
 /// Per-NIC UDP socket bundle. See module docs.
 pub struct AsyncUdpV4 {
     sockets: Vec<NicSocket>,
-    /// How this bundle's port was obtained, recorded at bind time.
-    ///
-    /// A socket joined to the bundle later ([`Self::ensure_iface_socket`])
-    /// inherits it rather than re-deriving it from the number: once the
-    /// kernel has answered a `bind(0)`, the number it handed back is
-    /// indistinguishable from one an operator configured, and only the
-    /// bundle still knows which it was.
-    port_use: PortUse,
 }
 
 impl AsyncUdpV4 {
@@ -135,30 +143,11 @@ impl AsyncUdpV4 {
     /// `broadcast=true` enables `SO_BROADCAST` (required for any
     /// `255.255.255.255` or per-subnet broadcast send).
     ///
-    /// Returns an error only when *every* attempted bind fails. A
-    /// single-NIC failure is logged at `debug` and skipped — partial
-    /// fanout is preferable to a hard error in transient
-    /// interface-flapping scenarios.
-    pub fn bind(port: u16, broadcast: bool) -> io::Result<Self> {
-        Self::bind_with_map(&IfaceMap::new()?, port, broadcast)
-    }
-
-    /// Like [`Self::bind`] but skips the loopback NIC. Use this when
-    /// the bound port is shared across processes (e.g. PVA UDP 5076)
-    /// and a co-bound loopback socket on another local process would
-    /// race with this one for incoming packets via SO_REUSEPORT
-    /// load-balancing on macOS / Linux.
-    ///
-    /// Concrete failure this avoids: a pva-rs *client* binding its
-    /// beacon-receive socket on `127.0.0.1:5076` while a pva-rs
-    /// *server* on the same host has its UDP responder bound on
-    /// `127.0.0.1:5076`. macOS distributes inbound `127.0.0.1:5076`
-    /// packets between them via SO_REUSEPORT, so SEARCH packets
-    /// destined to the server randomly land on the client's beacon
-    /// socket and are silently dropped (the beacon receiver only
-    /// processes BEACON, not SEARCH).
-    pub fn bind_non_loopback(port: u16, broadcast: bool) -> io::Result<Self> {
-        Self::bind_with_map_filtered(&IfaceMap::new()?, port, broadcast, true, None)
+    /// Any failed bind, a NIC's unicast or its broadcast-RX socket, fails
+    /// the whole call, as pvxs's one wildcard bind throws
+    /// (`udp_collector.cpp:151`).
+    pub fn bind(port: u16, port_use: PortUse, broadcast: bool) -> io::Result<Self> {
+        Self::bind_with_map(&IfaceMap::new()?, port, port_use, broadcast)
     }
 
     /// Like [`Self::bind`] but binds **only** the interfaces whose
@@ -178,80 +167,55 @@ impl AsyncUdpV4 {
     pub fn bind_on_interfaces(
         interfaces: &[Ipv4Addr],
         port: u16,
+        port_use: PortUse,
         broadcast: bool,
     ) -> io::Result<Self> {
-        Self::bind_with_map_filtered(&IfaceMap::new()?, port, broadcast, false, Some(interfaces))
+        Self::bind_with_map_filtered(
+            &IfaceMap::new()?,
+            port,
+            port_use,
+            broadcast,
+            Some(interfaces),
+        )
     }
 
     /// Like [`Self::bind`] but reuses an existing [`IfaceMap`] —
     /// useful when callers maintain a long-lived shared map.
-    pub fn bind_with_map(map: &IfaceMap, port: u16, broadcast: bool) -> io::Result<Self> {
-        Self::bind_with_map_filtered(map, port, broadcast, false, None)
+    pub fn bind_with_map(
+        map: &IfaceMap,
+        port: u16,
+        port_use: PortUse,
+        broadcast: bool,
+    ) -> io::Result<Self> {
+        Self::bind_with_map_filtered(map, port, port_use, broadcast, None)
     }
 
     fn bind_with_map_filtered(
         map: &IfaceMap,
         port: u16,
+        port_use: PortUse,
         broadcast: bool,
-        skip_loopback: bool,
         only: Option<&[Ipv4Addr]>,
     ) -> io::Result<Self> {
         let ifaces = select_ifaces(map, only);
         let mut sockets = Vec::with_capacity(ifaces.len() * 2);
         for info in ifaces {
-            if skip_loopback && info.ip.is_loopback() {
-                continue;
-            }
-            match bind_one(&info, port, broadcast) {
-                Ok(nic) => sockets.push(nic),
-                Err(e) => {
-                    tracing::debug!(
-                        target: "epics_base_rs::net",
-                        iface = %info.ip,
-                        port,
-                        error = %e,
-                        "skipping NIC: bind failed"
-                    );
-                }
-            }
-            // BSD-family oddity (macOS, *BSD): a UDP socket bound to a
-            // specific NIC unicast IP receives only unicasts to that
-            // IP — packets sent to the subnet broadcast address are
-            // delivered ONLY to a socket bound to either the broadcast
-            // address itself or to INADDR_ANY. Mirror EPICS-base rsrv
-            // (`caservertask.c:671-709`) and bind a second RX-only
-            // socket to each NIC's broadcast address so PVA/CA SEARCH
-            // bursts sent to e.g. `192.168.1.255:5076` reach the
-            // responder. Windows: Winsock delivers subnet broadcasts
-            // to the unicast-bound socket, so the extra bind is
-            // unnecessary and skipped. Loopback has no broadcast.
-            // Per-NIC failures are logged at debug; the unicast
-            // socket above is the load-bearing one.
-            #[cfg(not(target_os = "windows"))]
-            if let Some(bcast) = info.broadcast {
-                if !info.ip.is_loopback() && !bcast.is_unspecified() {
-                    match bind_one_at(
-                        &info,
-                        bcast,
-                        port,
-                        PortUse::from_caller(port),
-                        broadcast,
-                        true,
-                    ) {
-                        Ok(nic) => sockets.push(nic),
-                        Err(e) => {
-                            tracing::debug!(
-                                target: "epics_base_rs::net",
-                                iface = %info.ip,
-                                bcast = %bcast,
-                                port,
-                                error = %e,
-                                "skipping NIC bcast bind"
-                            );
-                        }
-                    }
-                }
-            }
+            sockets.push(bind_one_at(
+                &info,
+                info.ip,
+                port,
+                port_use,
+                PortOrigin::Configured,
+                broadcast,
+                false,
+            )?);
+            sockets.extend(bind_bcast_rx(
+                &info,
+                port,
+                port_use,
+                PortOrigin::Configured,
+                broadcast,
+            )?);
         }
         if sockets.is_empty() {
             return Err(io::Error::new(
@@ -259,32 +223,33 @@ impl AsyncUdpV4 {
                 "AsyncUdpV4: failed to bind any interface",
             ));
         }
-        Ok(Self {
-            sockets,
-            port_use: PortUse::from_caller(port),
-        })
+        Ok(Self { sockets })
     }
 
     /// Like [`Self::bind`] but every per-NIC socket binds to the *same*
     /// ephemeral port. The first up-non-loopback NIC picks the port
-    /// (kernel-assigned via `port=0`); remaining NICs reuse it via
-    /// `SO_REUSEADDR` (allowed because each socket binds a different
-    /// IP). NICs that fail to bind to the chosen port are logged at
-    /// `debug` and skipped.
+    /// (kernel-assigned via `port=0`); remaining NICs bind that number
+    /// (allowed without reuse options because each socket binds a different
+    /// IP). A NIC that fails the chosen port makes the whole bundle retry on
+    /// a fresh one.
     ///
     /// This is the right choice for protocols that embed the local
     /// reply port inside outgoing packets (PVA SEARCH, CA repeater
     /// register) — every NIC's reply port is identical, so an IOC
     /// replying to the source IP+port reaches the same logical socket
     /// regardless of which NIC it came back through.
-    pub fn bind_ephemeral_same_port(broadcast: bool) -> io::Result<Self> {
-        Self::bind_ephemeral_same_port_with_map(&IfaceMap::new()?, broadcast)
+    pub fn bind_ephemeral_same_port(port_use: PortUse, broadcast: bool) -> io::Result<Self> {
+        Self::bind_ephemeral_same_port_with_map(&IfaceMap::new()?, port_use, broadcast)
     }
 
     /// Like [`Self::bind_ephemeral_same_port`] but reuses a caller-
     /// provided [`IfaceMap`].
-    pub fn bind_ephemeral_same_port_with_map(map: &IfaceMap, broadcast: bool) -> io::Result<Self> {
-        Self::bind_ephemeral_same_port_inner(map, broadcast, None)
+    pub fn bind_ephemeral_same_port_with_map(
+        map: &IfaceMap,
+        port_use: PortUse,
+        broadcast: bool,
+    ) -> io::Result<Self> {
+        Self::bind_ephemeral_same_port_inner(map, port_use, broadcast, None)
     }
 
     /// Like [`Self::bind_ephemeral_same_port`] but binds **only** the
@@ -303,9 +268,15 @@ impl AsyncUdpV4 {
     /// a fixed interface set.
     pub fn bind_ephemeral_same_port_on_interfaces(
         interfaces: &[Ipv4Addr],
+        port_use: PortUse,
         broadcast: bool,
     ) -> io::Result<Self> {
-        Self::bind_ephemeral_same_port_inner(&IfaceMap::new()?, broadcast, Some(interfaces))
+        Self::bind_ephemeral_same_port_inner(
+            &IfaceMap::new()?,
+            port_use,
+            broadcast,
+            Some(interfaces),
+        )
     }
 
     /// How many distinct ephemeral ports the bundle will try before it accepts
@@ -316,6 +287,7 @@ impl AsyncUdpV4 {
 
     fn bind_ephemeral_same_port_inner(
         map: &IfaceMap,
+        port_use: PortUse,
         broadcast: bool,
         only: Option<&[Ipv4Addr]>,
     ) -> io::Result<Self> {
@@ -358,13 +330,22 @@ impl AsyncUdpV4 {
         // Every attempt is kept until the end: an attempt still holding its
         // colliding port is what stops the next `bind(0)` handing the same
         // number straight back.
+        let origin = PortOrigin::Chosen;
         let mut attempts: Vec<(Vec<NicSocket>, usize)> = Vec::new();
         let mut last_drop: Option<(Ipv4Addr, io::Error)> = None;
 
         for _ in 0..Self::BUNDLE_ATTEMPTS {
             let mut iter = up_first.iter();
             let first_info = iter.next().expect("checked non-empty");
-            let first = bind_one(first_info, 0, broadcast)?;
+            let first = bind_one_at(
+                first_info,
+                first_info.ip,
+                0,
+                port_use,
+                origin,
+                broadcast,
+                false,
+            )?;
             let chosen_port = first
                 .sock
                 .local_addr()
@@ -375,30 +356,54 @@ impl AsyncUdpV4 {
                 })?;
             let mut sockets = vec![first];
             let mut dropped = 0usize;
+            // A NIC is dropped when either of its sockets fails the chosen port,
+            // so a held broadcast address retries the bundle as a held unicast
+            // one does.
+            let mut drop_nic = |info: &IfaceInfo, e: io::Error| {
+                dropped += 1;
+                tracing::debug!(
+                    target: "epics_base_rs::net",
+                    iface = %info.ip,
+                    port = chosen_port,
+                    error = %e,
+                    "dropping NIC: same-port bind failed"
+                );
+                last_drop = Some((info.ip, e));
+            };
+            match bind_bcast_rx(first_info, chosen_port, port_use, origin, broadcast) {
+                Ok(rx) => sockets.extend(rx),
+                Err(e) => drop_nic(first_info, e),
+            }
             for info in iter {
-                // Exclusive: this port is ephemeral however non-zero it looks,
-                // so a number somebody already holds must be EADDRINUSE here
-                // rather than a silent join of their fanout group.
-                match bind_one_exclusive(info, chosen_port, broadcast) {
-                    Ok(nic) => sockets.push(nic),
-                    Err(e) => {
-                        dropped += 1;
-                        tracing::debug!(
-                            target: "epics_base_rs::net",
-                            iface = %info.ip,
-                            port = chosen_port,
-                            error = %e,
-                            "skipping NIC: same-port bind failed"
-                        );
-                        last_drop = Some((info.ip, e));
-                    }
+                // The caller's role, not the number: an `Exclusive` bundle's
+                // port is ephemeral however non-zero it looks, so a holder is
+                // EADDRINUSE here rather than a silent join of its fanout group.
+                let bound = bind_one_at(
+                    info,
+                    info.ip,
+                    chosen_port,
+                    port_use,
+                    origin,
+                    broadcast,
+                    false,
+                )
+                .and_then(|nic| {
+                    sockets.push(nic);
+                    sockets.extend(bind_bcast_rx(
+                        info,
+                        chosen_port,
+                        port_use,
+                        origin,
+                        broadcast,
+                    )?);
+                    Ok(())
+                });
+                if let Err(e) = bound {
+                    drop_nic(info, e);
                 }
             }
             if dropped == 0 {
-                return Ok(Self {
-                    sockets,
-                    port_use: PortUse::Exclusive,
-                });
+                return Ok(Self { sockets });
             }
             attempts.push((sockets, dropped));
         }
@@ -447,16 +452,18 @@ impl AsyncUdpV4 {
                 ),
             ));
         }
-        Ok(Self {
-            sockets,
-            port_use: PortUse::Exclusive,
-        })
+        Ok(Self { sockets })
     }
 
     /// Bind to a single specific interface IP. Useful when the caller
     /// has already decided which NIC should originate traffic (e.g.
     /// per-NIC SEARCH server responder tasks).
-    pub fn bind_single(iface_ip: Ipv4Addr, port: u16, broadcast: bool) -> io::Result<Self> {
+    pub fn bind_single(
+        iface_ip: Ipv4Addr,
+        port: u16,
+        port_use: PortUse,
+        broadcast: bool,
+    ) -> io::Result<Self> {
         let map = IfaceMap::new()?;
         let info = map
             .all()
@@ -468,11 +475,16 @@ impl AsyncUdpV4 {
                     format!("AsyncUdpV4: iface {iface_ip} not found"),
                 )
             })?;
-        let nic = bind_one(&info, port, broadcast)?;
-        Ok(Self {
-            sockets: vec![nic],
-            port_use: PortUse::from_caller(port),
-        })
+        let nic = bind_one_at(
+            &info,
+            info.ip,
+            port,
+            port_use,
+            PortOrigin::Configured,
+            broadcast,
+            false,
+        )?;
+        Ok(Self { sockets: vec![nic] })
     }
 
     /// Inspect the per-NIC sockets — diagnostics + response correlation.
@@ -598,97 +610,53 @@ impl AsyncUdpV4 {
         Ok(ok_count)
     }
 
-    /// Send a multicast datagram applying the pvxs per-endpoint options
-    /// (`evhelper.cpp:556-577`): the multicast TTL and the outgoing interface.
+    /// One send to a multicast group, as pvxs sends it from its wildcard
+    /// `searchTx4` (`client.cpp:1182-1194`): [`super::mcast_prep_v4`] with the
+    /// endpoint's TTL and `@iface`, then one `sendto`.
     ///
-    /// PIN-ONLY: `:556-577` opens `mcast_prep_sendto` (`:556-592`) at the pvxs
-    /// pin `b568e93` (1.5.1-42) and runs to its IPv4 `IP_MULTICAST_IF` log. At
-    /// this machine's pvxs HEAD `bd2243d` (1.5.2-26) the same span is
-    /// `:561-582`, because five lines land ahead of it — `:556` there is inside
-    /// `mcast_leave`. A repin to HEAD must add 5; leaving the number is what
-    /// makes it wrong.
+    /// The bundle has no wildcard socket, so the NIC socket transmits whose
+    /// address the egress interface owns: `iface` when the endpoint names
+    /// one, else the source the routing table picks for `dest` — the
+    /// interface a wildcard socket with `IP_MULTICAST_IF` `0.0.0.0` leaves
+    /// through. A bound source alone selects the egress on Linux for
+    /// multicast, so the two agree.
     ///
-    /// - **Outgoing interface** is selected structurally by sending from the
-    ///   NIC socket bound to `iface_ip` — each NIC socket is bound to its NIC's
-    ///   address, so source-address routing forces multicast egress out that
-    ///   interface, making an `IP_MULTICAST_IF` setsockopt redundant (it is not
-    ///   set). `iface_ip == None` fans the datagram out every eligible NIC,
-    ///   matching the modifier-less multicast/broadcast behaviour of
-    ///   [`Self::fanout_to`].
-    /// - **TTL** (`IP_MULTICAST_TTL`) is applied to each target NIC socket
-    ///   immediately before its send and re-applied on every call, so a
-    ///   previous endpoint's TTL never sticks to a later one (pvxs sets it
-    ///   per-send too).
-    ///
-    /// CONTRACT: `IP_MULTICAST_TTL` is per-socket sticky state, not a
-    /// per-datagram option, so the caller MUST be the sole multicast sender on
-    /// the selected NIC socket(s). The PVA beacon task satisfies this: it is
-    /// the only task that issues multicast sends on the responder sockets and
-    /// its send loop is sequential; every other send on those sockets is
-    /// unicast, which ignores `IP_MULTICAST_TTL`. Do not call this from
-    /// multiple tasks sharing a NIC socket without external serialisation.
-    ///
-    /// Returns the number of NIC sockets the datagram was sent on; errors only
-    /// when no eligible NIC sent it (e.g. `iface_ip` matched no bound NIC).
+    /// `IP_MULTICAST_TTL`/`_IF` are sticky per socket: the caller MUST be the
+    /// sole multicast sender on this bundle, which the SEARCH engine's one
+    /// send loop is.
     pub async fn send_multicast_v4(
         &self,
         buf: &[u8],
-        dest: SocketAddr,
+        dest: SocketAddrV4,
         ttl: u32,
-        iface_ip: Option<Ipv4Addr>,
+        iface: Ipv4Addr,
     ) -> io::Result<usize> {
-        let mut ok_count = 0usize;
-        let mut last_err: Option<io::Error> = None;
-        for nic in &self.sockets {
-            if nic.is_loopback || nic.rx_only_bcast {
-                continue;
-            }
-            if let Some(want) = iface_ip {
-                if nic.iface_ip != want {
-                    continue;
-                }
-            }
-            // Apply IP_MULTICAST_TTL on this NIC immediately before the send
-            // (re-applied every call; see the method contract). A failure here
-            // is non-fatal — the datagram still egresses, at the prior TTL.
-            if let Err(e) = nic.sock.set_multicast_ttl_v4(ttl) {
-                tracing::debug!(
-                    target: "epics_base_rs::net",
-                    iface_ip = %nic.iface_ip,
-                    ttl,
-                    error = %e,
-                    "per-endpoint set_multicast_ttl_v4 failed; sending at prior TTL"
-                );
-            }
-            match nic.sock.send_to(buf, dest).await {
-                Ok(_) => ok_count += 1,
-                Err(e) => {
-                    tracing::debug!(
-                        target: "epics_base_rs::net",
-                        iface_ip = %nic.iface_ip,
-                        %dest,
-                        ttl,
-                        error = %e,
-                        "multicast send failed"
-                    );
-                    last_err = Some(e);
-                }
-            }
-        }
-        if ok_count == 0 {
-            return Err(last_err.unwrap_or_else(|| {
+        let src = if iface.is_unspecified() {
+            routed_source_v4(dest)?
+        } else {
+            iface
+        };
+        let nic = self
+            .sockets
+            .iter()
+            .find(|n| !n.rx_only_bcast && n.iface_ip == src)
+            .ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::AddrNotAvailable,
-                    match iface_ip {
-                        Some(ip) => {
-                            format!("AsyncUdpV4: no eligible NIC bound to {ip} for multicast")
-                        }
-                        None => "AsyncUdpV4: multicast had no eligible NICs".to_string(),
-                    },
+                    format!("AsyncUdpV4: no NIC socket bound to {src} for multicast {dest}"),
                 )
-            }));
+            })?;
+        // pvxs logs a failed option and sends anyway.
+        if let Err(e) = super::mcast_prep_v4(&*nic.sock, ttl, iface) {
+            tracing::debug!(
+                target: "epics_base_rs::net",
+                iface_ip = %nic.iface_ip,
+                %dest,
+                error = %e,
+                "multicast TTL/IF prep failed"
+            );
         }
-        Ok(ok_count)
+        nic.sock.send_to(buf, SocketAddr::V4(dest)).await
     }
 
     /// Receive on whichever NIC's socket becomes ready first. Returns
@@ -702,7 +670,7 @@ impl AsyncUdpV4 {
         let mut futures = Vec::with_capacity(self.sockets.len());
         for nic in &self.sockets {
             let sock = nic.sock.clone();
-            let info = (nic.iface_ip, nic.ifindex);
+            let info = (nic.iface_ip, nic.ifindex, nic.dest());
             futures.push(Box::pin(async move {
                 let mut local = vec![0u8; 65535];
                 let r = sock.recv_from(&mut local).await;
@@ -719,11 +687,11 @@ impl AsyncUdpV4 {
         let (n, src) = res?;
         let copy_len = n.min(buf.len());
         buf[..copy_len].copy_from_slice(&local[..copy_len]);
-        let (iface_ip, ifindex) = info;
+        let (iface_ip, ifindex, dst_ip) = info;
         Ok(RecvMeta {
             n: copy_len,
             src,
-            dst_ip: Some(iface_ip),
+            dst_ip,
             ifindex: if ifindex == 0 { None } else { Some(ifindex) },
             iface_ip,
         })
@@ -947,7 +915,7 @@ impl AsyncUdpV4 {
         let mut futures = Vec::with_capacity(self.sockets.len());
         for nic in &self.sockets {
             let sock = nic.sock.clone();
-            let info = (nic.iface_ip, nic.ifindex);
+            let info = (nic.iface_ip, nic.ifindex, nic.dest());
             futures.push(Box::pin(async move {
                 let mut local = vec![0u8; 65535];
                 let r = recv_from_with_drop_count_socket(&sock, &mut local).await;
@@ -964,17 +932,31 @@ impl AsyncUdpV4 {
         let (n, src, drops) = res?;
         let copy_len = n.min(buf.len());
         buf[..copy_len].copy_from_slice(&local[..copy_len]);
-        let (iface_ip, ifindex) = info;
+        let (iface_ip, ifindex, dst_ip) = info;
         Ok((
             RecvMeta {
                 n: copy_len,
                 src,
-                dst_ip: Some(iface_ip),
+                dst_ip,
                 ifindex: if ifindex == 0 { None } else { Some(ifindex) },
                 iface_ip,
             },
             drops,
         ))
+    }
+}
+
+/// The source address the routing table picks for `dest`: `connect(2)` on a
+/// throwaway datagram socket, which sends nothing.
+fn routed_source_v4(dest: SocketAddrV4) -> io::Result<Ipv4Addr> {
+    let probe = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?;
+    probe.connect(dest)?;
+    match probe.local_addr()? {
+        SocketAddr::V4(a) => Ok(*a.ip()),
+        SocketAddr::V6(a) => Err(io::Error::new(
+            io::ErrorKind::AddrNotAvailable,
+            format!("v4 route probe returned {a}"),
+        )),
     }
 }
 
@@ -1149,119 +1131,6 @@ unsafe fn sockaddr_storage_to_socketaddr(
     }
 }
 
-impl AsyncUdpV4 {
-    /// Join a multicast group on every up, non-loopback NIC. Errors
-    /// per-NIC are logged at `debug` and not propagated unless every
-    /// join fails.
-    pub fn join_multicast_v4(&self, group: Ipv4Addr) -> io::Result<()> {
-        let mut ok = 0usize;
-        let mut last_err: Option<io::Error> = None;
-        for nic in &self.sockets {
-            if nic.is_loopback || nic.rx_only_bcast {
-                continue;
-            }
-            match nic.sock.join_multicast_v4(group, nic.iface_ip) {
-                Ok(()) => ok += 1,
-                Err(e) => {
-                    tracing::debug!(
-                        target: "epics_base_rs::net",
-                        iface_ip = %nic.iface_ip,
-                        %group,
-                        error = %e,
-                        "join_multicast_v4 failed"
-                    );
-                    last_err = Some(e);
-                }
-            }
-        }
-        if ok == 0 {
-            return Err(last_err.unwrap_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::Other,
-                    "AsyncUdpV4: join_multicast_v4 had no eligible NICs",
-                )
-            }));
-        }
-        Ok(())
-    }
-
-    /// Join `group` on **only** the bundle socket bound to `iface_ip`,
-    /// not on every NIC like [`Self::join_multicast_v4`].
-    ///
-    /// This is the per-interface multicast join pvxs performs when a
-    /// multicast endpoint carries an explicit `@iface` modifier
-    /// (`udp_collector.cpp:186-196`, `mcast_join` on the one chosen
-    /// interface) — the group is received on that NIC alone. Returns
-    /// [`io::ErrorKind::NotFound`] when no (non-`rx_only_bcast`) bundle
-    /// socket is bound to `iface_ip`; the caller decides whether to first
-    /// [`Self::ensure_iface_socket`] (server — pvxs adds listener
-    /// interfaces outside the configured set) or to skip (client).
-    pub fn join_multicast_v4_on(&self, group: Ipv4Addr, iface_ip: Ipv4Addr) -> io::Result<()> {
-        let nic = self
-            .sockets
-            .iter()
-            .find(|n| n.iface_ip == iface_ip && !n.rx_only_bcast)
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!("AsyncUdpV4: no socket bound to {iface_ip} to join {group}"),
-                )
-            })?;
-        nic.sock.join_multicast_v4(group, iface_ip)
-    }
-
-    /// Ensure the bundle has a (non-`rx_only_bcast`) socket bound to
-    /// `iface_ip` on `port`, binding and appending one if absent.
-    ///
-    /// This lets the server join a multicast group whose `@iface` lies
-    /// *outside* `EPICS_PVAS_INTF_ADDR_LIST`: pvxs `addGroups`
-    /// (`config.cpp:310-335`) pushes each beacon-destination join target
-    /// onto the listener interface set regardless of the configured
-    /// interface constraint, and `UDPCollector::addListener` opens a
-    /// collector socket on that interface. The newly-bound socket is
-    /// appended to `self.sockets`, so it participates in every subsequent
-    /// `recv*` call (the receive loop iterates the whole bundle).
-    ///
-    /// Returns `Ok(true)` when a socket was added, `Ok(false)` when one
-    /// was already present.
-    pub fn ensure_iface_socket(
-        &mut self,
-        iface_ip: Ipv4Addr,
-        port: u16,
-        broadcast: bool,
-    ) -> io::Result<bool> {
-        if self
-            .sockets
-            .iter()
-            .any(|n| n.iface_ip == iface_ip && !n.rx_only_bcast)
-        {
-            return Ok(false);
-        }
-        let map = IfaceMap::new()?;
-        // `select_ifaces` always yields one entry for a single-element
-        // list (synthesizing a unicast-only `IfaceInfo` when the OS did
-        // not enumerate the address), so `next()` is always `Some`.
-        let info = select_ifaces(&map, Some(&[iface_ip]))
-            .into_iter()
-            .next()
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::AddrNotAvailable,
-                    format!("AsyncUdpV4: cannot resolve interface {iface_ip}"),
-                )
-            })?;
-        // `port` here is whatever the bundle resolved to, which for an
-        // ephemeral bundle is the kernel's own answer — `bind_one`'s
-        // `port != 0` reading would call that shareable and hand this NIC's
-        // socket the fanout flags, letting a stranger's reuse group swallow
-        // the port the rest of the bundle owns exclusively. Inherit the
-        // bundle's recorded intent instead.
-        let nic = bind_one_at(&info, info.ip, port, self.port_use, broadcast, false)?;
-        self.sockets.push(nic);
-        Ok(true)
-    }
-}
-
 /// Build a [`socket2::SockRef`] borrowing `sock`'s file descriptor /
 /// SOCKET handle. Used to apply socket options after the
 /// `tokio::net::UdpSocket` is already constructed.
@@ -1306,76 +1175,45 @@ fn select_ifaces(map: &IfaceMap, only: Option<&[Ipv4Addr]>) -> Vec<IfaceInfo> {
     }
 }
 
-fn bind_one(info: &IfaceInfo, port: u16, broadcast: bool) -> io::Result<NicSocket> {
-    bind_one_at(
-        info,
-        info.ip,
-        port,
-        PortUse::from_caller(port),
-        broadcast,
-        false,
-    )
-}
-
-/// What the caller means the port to be, which is *not* the same question as
-/// whether the number is zero.
+/// The auxiliary broadcast-RX socket of one NIC, pushed onto `sockets`: the
+/// single owner of that rule, shared by the fixed-port and the ephemeral
+/// bind so the two cannot drift.
 ///
-/// The reuse flags used to be chosen by `port != 0`, and that reading is sound
-/// only for a number the caller supplied: 0 means "give me one nobody else
-/// has", anything else means "the well-known port every EPICS process
-/// co-binds". It is wrong for a number this module chose itself — the port the
-/// kernel handed back for the first NIC of an ephemeral bundle is still
-/// ephemeral however non-zero it looks, and binding the rest of the bundle
-/// with the fanout flags on let those sockets join a *stranger's* SO_REUSEPORT
-/// group. The kernel then load-balances that port's datagrams between the two
-/// bundles and half this client's SEARCH replies go to an unrelated process,
-/// with no error anywhere. Naming the intent removes the dual meaning.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum PortUse {
-    /// A well-known port (CA 5064, PVA 5076) several processes co-bind on
-    /// purpose: `SO_REUSEADDR` + `SO_REUSEPORT`, mirroring
-    /// `epicsSocketEnableAddressUseForDatagramFanout`.
-    Shared,
-    /// A port this socket must own outright. No reuse flags, so a number
-    /// somebody already holds is `EADDRINUSE` — a failure the caller can
-    /// retry — instead of a silent join.
-    Exclusive,
+/// A UDP socket bound to a specific NIC unicast IP receives only unicasts to
+/// that IP on BSD-family hosts *and* Linux — packets sent to the subnet
+/// broadcast address are delivered ONLY to a socket bound to the broadcast
+/// address itself or to INADDR_ANY. Mirror EPICS-base rsrv
+/// (`caservertask.c:671-709`) and bind a second RX-only socket to each NIC's
+/// [`IfaceInfo::rx_broadcast`] so PVA/CA SEARCH bursts sent to e.g.
+/// `192.168.1.255:5076` reach the responder; pvxs instead takes them on its
+/// wildcard collector (`udp_collector.cpp:140-151`). Windows: Winsock delivers subnet broadcasts to the
+/// unicast-bound socket, so the extra bind is unnecessary and skipped.
+/// Loopback has no broadcast. A failure is the caller's: pvxs's broadcast
+/// listener rides the collector's one wildcard socket, whose failed bind
+/// throws (`udp_collector.cpp:151`).
+#[cfg(not(target_os = "windows"))]
+fn bind_bcast_rx(
+    info: &IfaceInfo,
+    port: u16,
+    port_use: PortUse,
+    origin: PortOrigin,
+    broadcast: bool,
+) -> io::Result<Option<NicSocket>> {
+    let Some(bcast) = info.rx_broadcast() else {
+        return Ok(None);
+    };
+    bind_one_at(info, bcast, port, port_use, origin, broadcast, true).map(Some)
 }
 
-impl PortUse {
-    /// The old `port != 0` rule, valid where the number came from the caller.
-    pub fn from_caller(port: u16) -> Self {
-        if port == 0 {
-            Self::Exclusive
-        } else {
-            Self::Shared
-        }
-    }
-
-    /// Apply this port's reuse options to `sock`, before its `bind`.
-    ///
-    /// The two options are one set, not two decisions — see [`Self::Shared`] —
-    /// and applying them here is what stops a bind site from setting half of
-    /// it. Half reads as working on Linux, where `SO_REUSEADDR` alone already
-    /// lets a stranger co-bind a wildcard UDP port; on macOS and the BSDs an
-    /// exact-duplicate datagram bind needs `SO_REUSEPORT` and `SO_REUSEADDR`
-    /// alone is `EADDRINUSE`. The PVA v6 SEARCH responder set exactly that
-    /// half and lost its co-bind on Darwin only.
-    pub fn apply_reuse(self, sock: &socket2::Socket) -> io::Result<()> {
-        if self == Self::Shared {
-            sock.set_reuse_address(true)?;
-            #[cfg(unix)]
-            sock.set_reuse_port(true)?;
-        }
-        Ok(())
-    }
-}
-
-/// Bind `port` on one NIC and refuse to share it. Used for the second and
-/// later NICs of an ephemeral same-port bundle, where the number is non-zero
-/// but the intent is still exclusive ownership.
-fn bind_one_exclusive(info: &IfaceInfo, port: u16, broadcast: bool) -> io::Result<NicSocket> {
-    bind_one_at(info, info.ip, port, PortUse::Exclusive, broadcast, false)
+#[cfg(target_os = "windows")]
+fn bind_bcast_rx(
+    _info: &IfaceInfo,
+    _port: u16,
+    _port_use: PortUse,
+    _origin: PortOrigin,
+    _broadcast: bool,
+) -> io::Result<Option<NicSocket>> {
+    Ok(None)
 }
 
 /// Bind to an arbitrary IPv4 address while keeping the NIC metadata
@@ -1387,6 +1225,7 @@ fn bind_one_at(
     bind_ip: Ipv4Addr,
     port: u16,
     port_use: PortUse,
+    origin: PortOrigin,
     broadcast: bool,
     rx_only_bcast: bool,
 ) -> io::Result<NicSocket> {
@@ -1409,17 +1248,8 @@ fn bind_one_at(
     // TCP.) Skipping it on Windows breaks the co-bind this socket exists
     // to support.
     //
-    // Only for a *well-known* port — the co-bind case the flags exist
-    // for, and what C does: udpiiu.cpp:248 binds the client search socket
-    // to PORT_ANY and enables no reuse on it. A socket asking for an
-    // ephemeral port has nothing to share, and the flags then do harm:
-    // Linux may satisfy bind(0) with a port already held by a
-    // reuse-compatible socket, joining its SO_REUSEPORT group, after which
-    // the kernel load-balances arriving datagrams across the group — this
-    // socket's search replies can be delivered to the unrelated socket and
-    // dropped. With the flags off, bind(0) yields a port this socket
-    // exclusively owns.
-    port_use.apply_reuse(&sock)?;
+    // Which sockets get it is the caller's `PortUse`, not the number; when,
+    // relative to the bind below, is its `PortOrigin`.
     if broadcast {
         sock.set_broadcast(true)?;
     }
@@ -1431,7 +1261,10 @@ fn bind_one_at(
     }
     sock.set_nonblocking(true)?;
     let bind_addr: SocketAddr = SocketAddr::V4(SocketAddrV4::new(bind_ip, port));
-    sock.bind(&bind_addr.into())?;
+    #[cfg(test)]
+    tests::BEFORE_BIND
+        .with_borrow_mut(|hook| hook.as_mut().map(|h| h(bind_ip, port, rx_only_bcast)));
+    port_use.bind(&sock, bind_addr, origin)?;
     let std_sock: std::net::UdpSocket = sock.into();
     let tokio_sock = UdpSocket::from_std(std_sock)?;
     Ok(NicSocket {
@@ -1491,11 +1324,272 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::net::fanout::port_held;
+
+    type BindHook = Box<dyn FnMut(Ipv4Addr, u16, bool)>;
+
+    thread_local! {
+        /// Called with each address and port `bind_one_at` is about to bind,
+        /// and whether it is a broadcast-RX socket.
+        pub(super) static BEFORE_BIND: std::cell::RefCell<Option<BindHook>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    // The broadcast-RX tests below are unix-only: Winsock delivers subnet
+    // broadcasts to the unicast socket and rsrv binds no broadcast socket on
+    // WIN32 (caservertask.c:670-710), so there is no such bind to hold.
+
+    /// The broadcast-capable NICs, in the order the ephemeral bundle binds them.
+    #[cfg(not(windows))]
+    fn bcast_nics() -> Vec<Ipv4Addr> {
+        let map = IfaceMap::new().expect("iface map");
+        let mut ifaces = select_ifaces(&map, None);
+        ifaces.sort_by_key(|i| !i.up_non_loopback);
+        ifaces
+            .into_iter()
+            .filter_map(|i| i.rx_broadcast())
+            .collect()
+    }
+
+    /// A held NIC address fails a fixed-port bind rather than leaving that
+    /// NIC out, as pvxs's wildcard bind throws (`udp_collector.cpp:151`).
+    #[tokio::test]
+    async fn a_held_nic_address_fails_a_fixed_port_bind() {
+        let holder = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("holder");
+        let port = holder.local_addr().unwrap().port();
+        let err = AsyncUdpV4::bind(port, PortUse::Shared, false).err();
+        assert!(err.as_ref().is_some_and(port_held), "{err:?}");
+    }
+
+    /// The same for a held broadcast address.
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn a_held_broadcast_address_fails_a_fixed_port_bind() {
+        let bcast = *bcast_nics().first().expect(
+            "this host enumerates no broadcast-capable interface; the run cannot be made here",
+        );
+        let holder = std::net::UdpSocket::bind((bcast, 0)).expect("holder");
+        let port = holder.local_addr().unwrap().port();
+        let err = AsyncUdpV4::bind(port, PortUse::Shared, true).err();
+        assert!(
+            err.as_ref()
+                .is_some_and(|e| e.kind() == io::ErrorKind::AddrInUse),
+            "{err:?}"
+        );
+    }
+
+    /// Holds the `n`th broadcast address the bundle binds, at its port, as a
+    /// stranger would; returns the binds seen and leaves the hook set.
+    #[cfg(not(windows))]
+    fn hold_bcast_bind(n: usize) -> std::rc::Rc<std::cell::RefCell<Vec<(Ipv4Addr, u16)>>> {
+        let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let log = seen.clone();
+        let mut held = Vec::new();
+        BEFORE_BIND.set(Some(Box::new(move |bcast, port, rx_only_bcast| {
+            if !rx_only_bcast {
+                return;
+            }
+            log.borrow_mut().push((bcast, port));
+            if log.borrow().len() == n {
+                held.push(std::net::UdpSocket::bind((bcast, port)).expect("hold"));
+            }
+        })));
+        seen
+    }
+
+    /// A held broadcast address drops its NIC from the ephemeral attempt, so
+    /// the bundle moves to a port it holds in full.
+    #[cfg(not(windows))]
+    fn held_broadcast_retries_the_bundle(n: usize) {
+        assert!(
+            bcast_nics().len() >= n,
+            "this host has {} broadcast-capable NIC(s), {n} needed; the run cannot be made here",
+            bcast_nics().len()
+        );
+        let seen = hold_bcast_bind(n);
+        let sock = AsyncUdpV4::bind_ephemeral_same_port(PortUse::Exclusive, true);
+        BEFORE_BIND.take();
+        let sock = sock.expect("bundle");
+        let (bcast, held_port) = seen.borrow()[n - 1];
+        let port = sock.ifaces()[0].sock.local_addr().unwrap().port();
+        assert_ne!(port, held_port, "the bundle kept the port held on {bcast}");
+        assert!(
+            sock.ifaces()
+                .iter()
+                .any(|s| s.rx_only_bcast && s.sock.local_addr().unwrap().ip() == bcast),
+            "no broadcast-RX socket on {bcast}"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn a_held_broadcast_address_on_the_first_nic_retries_the_bundle() {
+        held_broadcast_retries_the_bundle(1);
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn a_held_broadcast_address_on_a_later_nic_retries_the_bundle() {
+        held_broadcast_retries_the_bundle(2);
+    }
+
+    /// Holds the address `at` returns for one of the bundle's binds, with the
+    /// fanout flags, just before that bind; `at` sees each bind's address,
+    /// port and broadcast-RX flag. Returns the port held and leaves the hook
+    /// set.
+    #[cfg(not(windows))]
+    fn fanout_hold_at(
+        mut at: impl FnMut(Ipv4Addr, u16, bool) -> Option<SocketAddr> + 'static,
+    ) -> std::rc::Rc<std::cell::Cell<Option<u16>>> {
+        let held_port = std::rc::Rc::new(std::cell::Cell::new(None));
+        let log = held_port.clone();
+        let mut held = None;
+        BEFORE_BIND.set(Some(Box::new(move |ip, port, rx_only_bcast| {
+            if held.is_some() {
+                return;
+            }
+            let Some(addr) = at(ip, port, rx_only_bcast) else {
+                return;
+            };
+            let s = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).unwrap();
+            s.set_reuse_address(true).unwrap();
+            #[cfg(unix)]
+            s.set_reuse_port(true).unwrap();
+            s.bind(&addr.into())
+                .unwrap_or_else(|e| panic!("fanout holder on {addr}: {e}"));
+            held = Some(s);
+            log.set(Some(port));
+        })));
+        held_port
+    }
+
+    /// A shared bundle's later binds are on the number it chose, so a fanout
+    /// holder there is `EADDRINUSE` and moves the bundle, never a group the
+    /// bundle silently joins.
+    #[cfg(not(windows))]
+    fn fanout_holder_moves_a_shared_bundle(
+        at: impl FnMut(Ipv4Addr, u16, bool) -> Option<SocketAddr> + 'static,
+    ) {
+        let held_port = fanout_hold_at(at);
+        let sock = AsyncUdpV4::bind_ephemeral_same_port(PortUse::Shared, true);
+        BEFORE_BIND.take();
+        let sock = sock.expect("bundle");
+        let held_port = held_port
+            .get()
+            .expect("the bundle never reached the bind the holder was set for");
+        let port = sock.ifaces()[0].sock.local_addr().unwrap().port();
+        assert_ne!(port, held_port, "the bundle joined a fanout holder's group");
+    }
+
+    /// Holds the `n`th broadcast address the bundle binds, at its port.
+    #[cfg(not(windows))]
+    fn at_nth_bcast(n: usize) -> impl FnMut(Ipv4Addr, u16, bool) -> Option<SocketAddr> {
+        assert!(
+            bcast_nics().len() >= n,
+            "this host has {} broadcast-capable NIC(s), {n} needed; the run cannot be made here",
+            bcast_nics().len()
+        );
+        let mut seen = 0;
+        move |ip, port, rx_only_bcast| {
+            seen += usize::from(rx_only_bcast);
+            (rx_only_bcast && seen == n).then(|| (ip, port).into())
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn a_fanout_holder_on_the_first_broadcast_address_moves_a_shared_bundle() {
+        fanout_holder_moves_a_shared_bundle(at_nth_bcast(1));
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn a_fanout_holder_on_a_later_broadcast_address_moves_a_shared_bundle() {
+        fanout_holder_moves_a_shared_bundle(at_nth_bcast(2));
+    }
+
+    /// Held on the second NIC's unicast address at the chosen number, just
+    /// before the bundle binds it there. Unix only: Windows sets the fanout
+    /// options before every bind, as C does, so the bundle joins the holder.
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn a_fanout_holder_on_a_later_nic_moves_a_shared_bundle() {
+        let map = IfaceMap::new().expect("iface map");
+        let mut ifaces = select_ifaces(&map, None);
+        ifaces.sort_by_key(|i| !i.up_non_loopback);
+        let second = ifaces.get(1).expect("a second NIC").ip;
+        fanout_holder_moves_a_shared_bundle(move |ip, port, rx_only_bcast| {
+            (ip == second && port != 0 && !rx_only_bcast).then(|| (ip, port).into())
+        });
+    }
+
+    /// A subnet-broadcast datagram reaches an ephemeral bundle as it reaches
+    /// a fixed-port one: pvxs registers a listener on each interface's
+    /// broadcast addresses at the port the interface resolved, `udp_port==0`
+    /// included (`server.cpp:421-437`). Linux delivers a subnet broadcast
+    /// only to a socket bound to the broadcast address or to the wildcard, so
+    /// a bundle of unicast-bound sockets alone never sees it.
+    #[tokio::test]
+    async fn an_ephemeral_bundle_receives_a_subnet_broadcast() {
+        let bundle = AsyncUdpV4::bind_ephemeral_same_port(PortUse::Exclusive, true)
+            .expect("ephemeral bundle");
+        receives_subnet_broadcasts(&bundle).await;
+    }
+
+    /// The configured-port half of the same rule: rsrv binds the broadcast
+    /// RX socket at `EPICS_CA_SERVER_PORT` (`caservertask.c:671-709`).
+    #[tokio::test]
+    async fn a_configured_port_bundle_receives_a_subnet_broadcast() {
+        // A number free now; another process may take it before the bind.
+        let bundle = (0..5)
+            .find_map(|_| {
+                let port = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
+                    .and_then(|s| s.local_addr())
+                    .expect("probe")
+                    .port();
+                AsyncUdpV4::bind(port, PortUse::Exclusive, true).ok()
+            })
+            .expect("a configured-port bundle on a free number");
+        receives_subnet_broadcasts(&bundle).await;
+    }
+
+    /// Send to every broadcast-capable interface's broadcast address at the
+    /// bundle's port, and require each datagram to reach the bundle.
+    async fn receives_subnet_broadcasts(bundle: &AsyncUdpV4) {
+        let map = IfaceMap::new().expect("iface map");
+        let targets: Vec<_> = map
+            .all()
+            .into_iter()
+            .filter(|i| i.rx_broadcast().is_some())
+            .collect();
+        assert!(
+            !targets.is_empty(),
+            "this host enumerates no broadcast-capable interface; the run cannot be made here"
+        );
+        let port = bundle.ifaces()[0].sock.local_addr().unwrap().port();
+        let sender = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).expect("sender");
+        sender.set_broadcast(true).expect("SO_BROADCAST");
+        for info in targets {
+            let bcast = info.rx_broadcast().unwrap();
+            sender
+                .send_to(b"bcast-search", (bcast, port))
+                .unwrap_or_else(|e| panic!("send to {bcast}:{port}: {e}"));
+            let mut buf = [0u8; 64];
+            let got = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                bundle.recv_from(&mut buf),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("a datagram to {bcast}:{port} never reached the bundle"))
+            .expect("recv");
+            assert_eq!(&buf[..got.0], b"bcast-search");
+        }
+    }
 
     #[tokio::test]
     async fn loopback_send_and_recv() {
-        let sender = AsyncUdpV4::bind(0, false).expect("sender bind");
-        let receiver = AsyncUdpV4::bind(0, false).expect("receiver bind");
+        let sender = AsyncUdpV4::bind(0, PortUse::Exclusive, false).expect("sender bind");
+        let receiver = AsyncUdpV4::bind(0, PortUse::Exclusive, false).expect("receiver bind");
 
         // Find the receiver's loopback bound port.
         let lo_addr = receiver
@@ -1527,7 +1621,7 @@ mod tests {
 
     #[tokio::test]
     async fn send_via_loopback_iface_ip() {
-        let sock = AsyncUdpV4::bind(0, false).expect("bind");
+        let sock = AsyncUdpV4::bind(0, PortUse::Exclusive, false).expect("bind");
         let lo_iface = sock
             .ifaces()
             .iter()
@@ -1535,7 +1629,7 @@ mod tests {
             .expect("loopback NIC must exist")
             .iface_ip;
 
-        let receiver = AsyncUdpV4::bind(0, false).expect("recv bind");
+        let receiver = AsyncUdpV4::bind(0, PortUse::Exclusive, false).expect("recv bind");
         let dest = receiver
             .ifaces()
             .iter()
@@ -1545,54 +1639,6 @@ mod tests {
 
         let n = sock.send_via(b"x", dest, lo_iface).await.expect("send_via");
         assert_eq!(n, 1);
-    }
-
-    /// Boundary — a NIC joined *after* the bundle was bound
-    /// ([`AsyncUdpV4::ensure_iface_socket`], which the PVA server calls for
-    /// each multicast beacon destination). It is handed the bundle's resolved
-    /// port, an ordinary non-zero number by then, so deriving the reuse flags
-    /// from it would re-open the hole on exactly the NICs that joined last.
-    /// The bundle's recorded `port_use` is what keeps them exclusive.
-    #[tokio::test]
-    async fn a_nic_joined_after_the_bind_inherits_the_bundle_port_use() {
-        let mut sock = AsyncUdpV4::bind_ephemeral_same_port_on_interfaces(
-            &[std::net::Ipv4Addr::LOCALHOST],
-            false,
-        )
-        .expect("bind loopback-only bundle");
-        let port = sock.ifaces()[0]
-            .sock
-            .local_addr()
-            .expect("local addr")
-            .port();
-
-        // The first up non-loopback NIC, if the host has one — that is the
-        // interface `join_beacon_multicast_groups` would add. With none, the
-        // check reduces to re-asserting loopback's exclusivity.
-        let extra = crate::net::iface_v4::enumerate()
-            .unwrap_or_default()
-            .into_iter()
-            .find(|i| i.is_up() && !i.is_loopback() && !i.ip.is_unspecified())
-            .map(|i| i.ip);
-        if let Some(ip) = extra {
-            sock.ensure_iface_socket(ip, port, false)
-                .expect("join the NIC to the bundle");
-        }
-
-        for n in sock.ifaces() {
-            let intruder =
-                Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).expect("socket");
-            intruder.set_reuse_address(true).expect("reuse addr");
-            #[cfg(unix)]
-            intruder.set_reuse_port(true).expect("reuse port");
-            let addr: SocketAddr = SocketAddr::V4(SocketAddrV4::new(n.iface_ip, port));
-            assert!(
-                intruder.bind(&addr.into()).is_err(),
-                "NIC {} joined the ephemeral bundle on port {port} with the fanout \
-                 flags on: a stranger can co-bind it and split the datagrams",
-                n.iface_ip
-            );
-        }
     }
 
     /// The bundle must OWN its ephemeral port on every NIC, not merely hold a
@@ -1610,7 +1656,8 @@ mod tests {
     /// bundle is the defect.
     #[tokio::test]
     async fn an_ephemeral_bundle_owns_its_port_on_every_nic() {
-        let sock = AsyncUdpV4::bind_ephemeral_same_port(false).expect("bind same-port");
+        let sock = AsyncUdpV4::bind_ephemeral_same_port(PortUse::Exclusive, false)
+            .expect("bind same-port");
         let nics = sock.ifaces();
         assert!(!nics.is_empty(), "at least one bound NIC");
         let port = nics[0].sock.local_addr().expect("local addr").port();
@@ -1641,18 +1688,19 @@ mod tests {
     async fn a_bundle_binds_one_socket_per_selected_nic() {
         let map = IfaceMap::new().expect("iface map");
         let expected = select_ifaces(&map, None).len();
-        let sock = AsyncUdpV4::bind_ephemeral_same_port(false).expect("bind same-port");
+        let sock = AsyncUdpV4::bind_ephemeral_same_port(PortUse::Exclusive, false)
+            .expect("bind same-port");
+        let covered = sock.ifaces().iter().filter(|n| !n.rx_only_bcast).count();
         assert_eq!(
-            sock.ifaces().len(),
-            expected,
-            "bundle covers {} of {expected} NICs",
-            sock.ifaces().len()
+            covered, expected,
+            "bundle covers {covered} of {expected} NICs"
         );
     }
 
     #[tokio::test]
     async fn bind_ephemeral_same_port_uses_one_port_across_nics() {
-        let sock = AsyncUdpV4::bind_ephemeral_same_port(false).expect("bind same-port");
+        let sock = AsyncUdpV4::bind_ephemeral_same_port(PortUse::Exclusive, false)
+            .expect("bind same-port");
         let ports: Vec<u16> = sock
             .ifaces()
             .iter()
@@ -1671,8 +1719,9 @@ mod tests {
     async fn bind_on_interfaces_loopback_only_binds_no_other_nic() {
         // EPICS_PVA*_INTF_ADDR_LIST=127.0.0.1 must restrict the bundle
         // to loopback — no non-loopback NIC may be bound.
-        let sock = AsyncUdpV4::bind_on_interfaces(&[Ipv4Addr::LOCALHOST], 0, true)
-            .expect("loopback-only bind");
+        let sock =
+            AsyncUdpV4::bind_on_interfaces(&[Ipv4Addr::LOCALHOST], 0, PortUse::Exclusive, true)
+                .expect("loopback-only bind");
         assert!(
             sock.ifaces().iter().all(|n| n.is_loopback),
             "loopback-only interface list bound a non-loopback NIC: {:?}",
@@ -1688,8 +1737,12 @@ mod tests {
     async fn bind_ephemeral_same_port_on_interfaces_loopback_only() {
         // Client active-search socket constrained to loopback: one
         // socket, loopback only, no non-loopback egress interface.
-        let sock = AsyncUdpV4::bind_ephemeral_same_port_on_interfaces(&[Ipv4Addr::LOCALHOST], true)
-            .expect("loopback-only ephemeral bind");
+        let sock = AsyncUdpV4::bind_ephemeral_same_port_on_interfaces(
+            &[Ipv4Addr::LOCALHOST],
+            PortUse::Exclusive,
+            true,
+        )
+        .expect("loopback-only ephemeral bind");
         assert!(
             sock.ifaces().iter().all(|n| n.is_loopback),
             "loopback-only search socket bound a non-loopback NIC: {:?}",
@@ -1704,71 +1757,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn join_multicast_v4_on_absent_iface_is_not_found() {
-        // `join_multicast_v4_on` joins one interface only; when no bundle
-        // socket is bound to that interface it must surface NotFound so the
-        // caller (server) can `ensure_iface_socket` first.
-        let sock = AsyncUdpV4::bind_on_interfaces(&[Ipv4Addr::LOCALHOST], 0, true)
-            .expect("loopback-only bind");
-        let group = Ipv4Addr::new(224, 0, 9, 9);
-        let absent = Ipv4Addr::new(203, 0, 113, 77);
-        let err = sock
-            .join_multicast_v4_on(group, absent)
-            .expect_err("absent interface must error");
-        assert_eq!(err.kind(), io::ErrorKind::NotFound);
-    }
-
-    #[tokio::test]
-    async fn ensure_iface_socket_adds_then_is_idempotent() {
-        // A bundle constrained to loopback (as under
-        // `EPICS_PVAS_INTF_ADDR_LIST=127.0.0.1`) has no external NIC
-        // socket. `ensure_iface_socket` must add one on demand (the pvxs
-        // `addGroups` "listener interface outside the configured set"
-        // behaviour) and be a no-op when the interface is already present.
-        let mut sock = AsyncUdpV4::bind_on_interfaces(&[Ipv4Addr::LOCALHOST], 0, true)
-            .expect("loopback-only bind");
-        assert!(
-            !sock
-                .ensure_iface_socket(Ipv4Addr::LOCALHOST, 0, true)
-                .expect("loopback already present"),
-            "loopback socket already in the bundle must not be re-added"
-        );
-
-        let before = sock.ifaces().len();
-        // Add a real external NIC (bindable, but outside the loopback
-        // bundle). An empty list is now the host's answer and nothing else
-        // — a failed enumeration errors out of `IfaceMap::new` instead of
-        // arriving here as "no NIC" — so the skip states a host fact.
-        let Some(nic) = IfaceMap::new()
-            .expect("getifaddrs must succeed on the host")
-            .up_non_loopback()
-            .into_iter()
-            .next()
-        else {
-            eprintln!("skipping: no external NIC here, so the add branch has no input");
-            return;
-        };
-        assert!(
-            sock.ensure_iface_socket(nic.ip, 0, true)
-                .expect("bind external NIC"),
-            "an external NIC outside the bundle must be added"
-        );
-        assert_eq!(
-            sock.ifaces().len(),
-            before + 1,
-            "exactly one listener socket appended"
-        );
-        assert!(
-            !sock
-                .ensure_iface_socket(nic.ip, 0, true)
-                .expect("now present"),
-            "second call for the same interface is a no-op"
-        );
-    }
-
-    #[tokio::test]
     async fn send_via_unknown_iface_returns_addr_not_available() {
-        let sock = AsyncUdpV4::bind(0, false).expect("bind");
+        let sock = AsyncUdpV4::bind(0, PortUse::Exclusive, false).expect("bind");
         let bogus = Ipv4Addr::new(203, 0, 113, 99);
         let dest = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9999));
         let err = sock
@@ -1780,47 +1770,55 @@ mod tests {
 
     #[tokio::test]
     async fn send_multicast_v4_unknown_iface_returns_addr_not_available() {
-        // An `@iface` that matches no bound NIC selects nothing → error,
-        // never a silent no-op (mirrors `send_via`'s unknown-iface contract).
-        let sock = AsyncUdpV4::bind(0, true).expect("bind");
+        let sock = AsyncUdpV4::bind(0, PortUse::Exclusive, true).expect("bind");
         let bogus = Ipv4Addr::new(203, 0, 113, 99);
-        let group = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(239, 1, 2, 3), 9999));
+        let group = SocketAddrV4::new(Ipv4Addr::new(239, 1, 2, 3), 9999);
         let err = sock
-            .send_multicast_v4(b"x", group, 1, Some(bogus))
+            .send_multicast_v4(b"x", group, 1, bogus)
             .await
             .expect_err("unknown iface must fail");
         assert_eq!(err.kind(), io::ErrorKind::AddrNotAvailable);
     }
 
+    /// A named `@iface` sends once, from that interface's socket, with the
+    /// endpoint's TTL and `IP_MULTICAST_IF` left on it.
     #[tokio::test]
-    async fn send_multicast_v4_no_iface_matches_fanout_nic_set() {
-        // `iface_ip == None` must target exactly the eligible NIC set that the
-        // proven `fanout_to` uses (non-loopback, non-rx-only) — adding only the
-        // per-NIC TTL setsockopt, which never changes which NICs are reached.
-        // Comparing the two best-effort counts is robust to a host NIC that
-        // can't route the group (both paths skip the same failures); asserting
-        // an absolute count would be flaky. On a loopback-only host both error.
-        let sock = AsyncUdpV4::bind(0, true).expect("bind");
-        let group = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(239, 1, 2, 3), 9999));
-        let mc = sock.send_multicast_v4(b"x", group, 1, None).await;
-        let fo = sock.fanout_to(b"x", group).await;
-        match (mc, fo) {
-            (Ok(a), Ok(b)) => assert_eq!(
-                a, b,
-                "send_multicast_v4(None) must reach the same NIC set as fanout_to"
-            ),
-            (Err(_), Err(_)) => {} // loopback-only host: no eligible NIC either way
-            (a, b) => {
-                panic!("send_multicast_v4 and fanout_to disagreed on eligibility: {a:?} vs {b:?}")
-            }
-        }
+    async fn send_multicast_v4_named_iface_sends_once_from_it() {
+        let rx = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).unwrap();
+        let group = Ipv4Addr::new(224, 0, 9, 42);
+        rx.join_multicast_v4(&group, &Ipv4Addr::LOCALHOST).unwrap();
+        rx.set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        let dest = SocketAddrV4::new(group, rx.local_addr().unwrap().port());
+
+        let sock = AsyncUdpV4::bind(0, PortUse::Exclusive, true).expect("bind");
+        let n = sock
+            .send_multicast_v4(b"m", dest, 5, Ipv4Addr::LOCALHOST)
+            .await
+            .unwrap();
+        assert_eq!(n, 1);
+        let lo = sock
+            .ifaces()
+            .iter()
+            .find(|n| n.iface_ip == Ipv4Addr::LOCALHOST)
+            .unwrap();
+        let s = socket2::SockRef::from(&*lo.sock);
+        assert_eq!(s.multicast_ttl_v4().unwrap(), 5);
+        assert_eq!(s.multicast_if_v4().unwrap(), Ipv4Addr::LOCALHOST);
+
+        let mut buf = [0u8; 8];
+        let (n, from) = rx.recv_from(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"m");
+        assert_eq!(from.ip(), std::net::IpAddr::V4(Ipv4Addr::LOCALHOST));
+        rx.set_nonblocking(true).unwrap();
+        assert!(rx.recv_from(&mut buf).is_err(), "exactly one datagram");
     }
 
     #[tokio::test]
     async fn pick_nic_loopback() {
         // `bind` ends up calling `tokio::net::UdpSocket::from_std`, which
         // requires a Tokio runtime — hence #[tokio::test].
-        let sock = AsyncUdpV4::bind(0, false).expect("bind");
+        let sock = AsyncUdpV4::bind(0, PortUse::Exclusive, false).expect("bind");
         let nic = sock.pick_nic(Ipv4Addr::LOCALHOST).expect("pick");
         assert!(nic.is_loopback || nic.iface_ip.is_loopback());
     }
@@ -1857,7 +1855,7 @@ mod tests {
     /// behaviour change.
     #[tokio::test]
     async fn enable_so_rxq_ovfl_is_no_op_success_off_linux() {
-        let sock = AsyncUdpV4::bind(0, false).expect("bind");
+        let sock = AsyncUdpV4::bind(0, PortUse::Exclusive, false).expect("bind");
         sock.enable_so_rxq_ovfl()
             .expect("enable_so_rxq_ovfl must succeed on every platform");
     }
@@ -1867,7 +1865,7 @@ mod tests {
     /// `recv_with_meta` and report `drop_count = 0` under normal load.
     #[tokio::test]
     async fn recv_with_meta_with_drops_returns_zero_under_normal_load() {
-        let server = AsyncUdpV4::bind(0, false).expect("server bind");
+        let server = AsyncUdpV4::bind(0, PortUse::Exclusive, false).expect("server bind");
         server.enable_so_rxq_ovfl().expect("enable counter");
         // Send to the server's LOOPBACK socket specifically. `bind(0,..)`
         // binds one socket per NIC on independent ephemeral ports, and the
@@ -1917,7 +1915,8 @@ mod tests {
         // `sockets[0]` would then never deliver off those platforms. (The
         // fan-in `recv_with_meta_with_drops` sibling can send to loopback
         // because it receives across all sockets.)
-        let server = AsyncUdpV4::bind_single(Ipv4Addr::LOCALHOST, 0, false).expect("server bind");
+        let server = AsyncUdpV4::bind_single(Ipv4Addr::LOCALHOST, 0, PortUse::Exclusive, false)
+            .expect("server bind");
         server.enable_so_rxq_ovfl().expect("enable counter");
         let dest = server.ifaces()[0].sock.local_addr().expect("loopback addr");
 

@@ -6,7 +6,7 @@
 //! has `scan == 0`), adds `CA_DBPROCESS` whenever the rights are not fully
 //! held while connected (`dbCa.c:1029` skips only when
 //! `hasReadAccess && hasWriteAccess`). The `dbCaTask` worker then runs
-//! `db_process(prec)` (`dbCa.c:1249-1257`); that process calls `dbGetLink`
+//! `db_process(prec)` (`dbCa.c:1314-1321`); that process calls `dbGetLink`
 //! → `dbCaGetLink`, which returns `-1` with `pca->sevr = INVALID_ALARM;
 //! pca->stat = LINK_ALARM` because `!pca->hasReadAccess` (`dbCa.c:430-434`)
 //! even though `pca->isConnected` is still TRUE, and the record commits
@@ -22,9 +22,27 @@
 
 use std::sync::Arc;
 
-use epics_base_rs::server::database::{LinkSet, PvDatabase};
+use epics_base_rs::server::database::{ExternalCpProcess, LinkRef, LinkSet, PvDatabase};
 use epics_base_rs::server::records::ai::AiRecord;
 use epics_base_rs::types::EpicsValue;
+
+/// One request taken by the link's worker, polled until it waits for the
+/// The process of `HOLDER`'s INP link, the one its worker processes for.
+fn holder_process(db: &PvDatabase) -> ExternalCpProcess {
+    let (_, _, inp) = db.record_link_fields("HOLDER").remove(0);
+    let inp = inp.external().unwrap();
+    ExternalCpProcess::new(LinkRef::new(inp.name, inp.open))
+}
+
+/// next: the only way a holder of an external CP link processes.
+fn process_holders(db: &PvDatabase) {
+    use std::future::Future as _;
+    let process = holder_process(db);
+    process.request();
+    let worker = std::pin::pin!(process.run_worker(|| Some(db.clone())));
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    assert!(worker.poll(&mut cx).is_pending());
+}
 
 /// An lset with a switchable READ gate, modelling `CaLink::value()`'s
 /// access-rights gate: while `readable` is false the value read reports
@@ -58,19 +76,24 @@ impl ReadGateLset {
 impl LinkSet for ReadGateLset {
     /// Always up: C's lset `isConnected` (`dbCa.c:604-612`) returns
     /// `pca->isConnected` alone — READ-access loss does not disconnect.
-    fn is_connected(&self, _: &str) -> bool {
+    fn is_connected(&self, _: LinkRef<'_>) -> bool {
         true
     }
 
-    async fn get_value(&self, _: &str) -> Option<EpicsValue> {
+    async fn get_value(&self, _: LinkRef<'_>) -> Option<EpicsValue> {
         self.readable().then(|| self.cached.clone())
     }
 
-    fn get_cached_value(&self, _: &str) -> Option<EpicsValue> {
+    fn get_cached_value(&self, _: LinkRef<'_>) -> Option<EpicsValue> {
         self.readable().then(|| self.cached.clone())
     }
 
-    async fn connect_link(&self, _: &str) {}
+    async fn connect_link(
+        &self,
+        _: LinkRef<'_>,
+        _: Option<epics_base_rs::server::database::CaLinkInit>,
+    ) {
+    }
 }
 
 fn alarm_of(db: &PvDatabase, name: &str) -> (u16, u16) {
@@ -88,11 +111,19 @@ async fn holder_db(lset: Arc<ReadGateLset>) -> PvDatabase {
     {
         let rec = db.get_record("HOLDER").unwrap();
         let mut inst = rec.write();
-        inst.common.inp = "ca://UP:PV CP".to_string();
-        inst.parsed_inp = epics_base_rs::server::record::parse_link_v2("ca://UP:PV CP");
+        inst.common.text.inp = "ca://UP:PV CP".into();
+        inst.install_link_cache(
+            "INP",
+            std::sync::Arc::new(epics_base_rs::server::record::parse_link_v2(
+                "ca://UP:PV CP",
+            )),
+        )
+        .expect("a common link");
     }
     db.initialize_link_locality().await;
     db.setup_cp_links().await;
+    // C `dbCaRun`: the CP workers run from here.
+    db.process_cp_links_on_connect().await;
     db
 }
 
@@ -115,7 +146,7 @@ async fn a_dispatch_on_a_read_denied_link_commits_link_invalid() {
     // write loss too (`dbCa.c:1029`), but `dbCaGetLink` does not consult
     // `hasWriteAccess`, so the dispatched holder reads a good value and
     // lands no alarm.
-    db.dispatch_external_cp_targets("UP:PV");
+    process_holders(&db);
     assert_eq!(
         db.get_pv("HOLDER").ok(),
         Some(EpicsValue::Double(42.5)),
@@ -129,7 +160,7 @@ async fn a_dispatch_on_a_read_denied_link_commits_link_invalid() {
 
     // READ access revoked, circuit still up.
     lset.set_readable(false);
-    db.dispatch_external_cp_targets("UP:PV");
+    process_holders(&db);
 
     assert_eq!(
         alarm_of(&db, "HOLDER"),
@@ -154,7 +185,7 @@ async fn the_link_alarm_clears_on_the_next_event_after_read_access_returns() {
     let db = holder_db(lset.clone()).await;
 
     lset.set_readable(false);
-    db.dispatch_external_cp_targets("UP:PV");
+    process_holders(&db);
     assert_eq!(
         alarm_of(&db, "HOLDER").1,
         3,
@@ -162,7 +193,7 @@ async fn the_link_alarm_clears_on_the_next_event_after_read_access_returns() {
     );
 
     lset.set_readable(true);
-    db.dispatch_external_cp_targets("UP:PV");
+    process_holders(&db);
     assert_eq!(
         alarm_of(&db, "HOLDER"),
         (0, 0),

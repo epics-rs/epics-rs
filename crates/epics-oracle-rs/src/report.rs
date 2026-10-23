@@ -14,6 +14,7 @@ use crate::catool::ToolError;
 use crate::diff::Observation;
 use crate::diff::{Difference, Verdict};
 use crate::surface::Coverage;
+use epics_libcom_rs::cfmt::CFloat;
 
 /// The minimal `.db` + operation sequence that reproduces one case.
 ///
@@ -483,7 +484,7 @@ impl Report {
             "  fields measured on BOTH sides: {}/{} = {:.1}%\n",
             fc.measured,
             fc.enumerated,
-            fc.percent()
+            CFloat(fc.percent())
         ));
         s.push_str(&format!(
             "  fields that errored (NOT coverage): {}\n\n",

@@ -9,6 +9,7 @@
 
 // RTEMS-EXEC-MODEL-ALLOW(1): checked - these run and pass in the exec-backend
 // suite.
+use epics_base_rs::types::RecordName;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
@@ -115,10 +116,11 @@ fn nturi_request(args: &[(&str, ScalarValue)]) -> (FieldDesc, PvField) {
                 "query".into(),
                 FieldDesc::Structure {
                     struct_id: "".into(),
-                    fields: query_desc,
+                    fields: query_desc.into(),
                 },
             ),
-        ],
+        ]
+        .into(),
     };
     (desc, PvField::Structure(root))
 }
@@ -327,7 +329,7 @@ fn direct_struct_request(args: &[(&str, ScalarValue)]) -> (FieldDesc, PvField) {
     s.fields = fields;
     let desc = FieldDesc::Structure {
         struct_id: String::new(),
-        fields: desc_fields,
+        fields: desc_fields.into(),
     };
     (desc, PvField::Structure(s))
 }
@@ -395,7 +397,10 @@ async fn add_rpc_service_rejects_colliding_registration() {
     // already-served namespace untouched — never a silent half-swap.
     let err = epics_pva_rs::service::add_rpc_service(&source, "counter", Counter::default())
         .expect_err("colliding registration must be rejected");
-    assert!(err.0.contains("counter:add"), "unexpected error: {err}");
+    assert!(
+        err.0.to_str_lossy().contains("counter:add"),
+        "unexpected error: {err}"
+    );
 
     // All original PVs are still present and the count is unchanged:
     // the rejected call rolled itself back, adding nothing.
@@ -408,10 +413,13 @@ async fn add_rpc_service_rejects_colliding_registration() {
         "counter:alias_add",
         "counter:alias_boom",
     ] {
-        assert!(source.has_pv(name).await, "{name} must remain registered");
+        assert!(
+            source.has_pv(name.as_bytes()).await,
+            "{name} must remain registered"
+        );
     }
     assert_eq!(
-        source.list_pvs().await.len(),
+        source.list_pvs().len(),
         7,
         "no extra PVs from the rejected call"
     );
@@ -428,33 +436,33 @@ async fn add_rpc_service_rejects_colliding_registration() {
 /// surface the server's data-phase status instead.
 struct FailAtDataSource;
 impl ChannelSource for FailAtDataSource {
-    async fn list_pvs(&self) -> Vec<String> {
+    fn list_pvs(&self) -> Vec<epics_base_rs::types::RecordName> {
         vec!["dut".into()]
     }
-    fn has_pv(&self, n: &str) -> impl std::future::Future<Output = bool> + Send {
-        let n = n.to_string();
+    fn has_pv(&self, n: &[u8]) -> impl std::future::Future<Output = bool> + Send {
+        let n = RecordName::from(n);
         async move { n == "dut" }
     }
-    async fn get_introspection(&self, _: &str) -> Option<FieldDesc> {
+    async fn get_introspection(&self, _: &[u8]) -> Option<FieldDesc> {
         Some(FieldDesc::Structure {
             struct_id: "epics:nt/NTScalar:1.0".into(),
-            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))],
+            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))].into(),
         })
     }
     // The data-phase failure: INIT negotiated a descriptor, but the
     // value read returns None at exec time.
-    async fn get_value(&self, _: &str) -> Option<PvField> {
+    async fn get_value(&self, _: &[u8]) -> Option<PvField> {
         None
     }
-    async fn put_value(&self, _: &str, _: PvField) -> Result<(), OpError> {
+    async fn put_value(&self, _: &[u8], _: PvField) -> Result<(), OpError> {
         Ok(())
     }
-    async fn is_writable(&self, _: &str) -> bool {
+    async fn is_writable(&self, _: &[u8]) -> bool {
         false
     }
     async fn subscribe(
         &self,
-        _: &str,
+        _: &[u8],
     ) -> Option<epics_pva_rs::server_native::MonitorStream<PvField>> {
         None
     }
@@ -502,31 +510,31 @@ async fn bfr13_client_get_surfaces_data_phase_error() {
 /// is expected.
 struct PanicSource;
 impl ChannelSource for PanicSource {
-    async fn list_pvs(&self) -> Vec<String> {
+    fn list_pvs(&self) -> Vec<epics_base_rs::types::RecordName> {
         vec!["boom".into()]
     }
-    fn has_pv(&self, n: &str) -> impl std::future::Future<Output = bool> + Send {
-        let n = n.to_string();
+    fn has_pv(&self, n: &[u8]) -> impl std::future::Future<Output = bool> + Send {
+        let n = RecordName::from(n);
         async move { n == "boom" }
     }
-    async fn get_introspection(&self, _: &str) -> Option<FieldDesc> {
+    async fn get_introspection(&self, _: &[u8]) -> Option<FieldDesc> {
         Some(FieldDesc::Structure {
             struct_id: "epics:nt/NTScalar:1.0".into(),
-            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))],
+            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))].into(),
         })
     }
-    async fn get_value(&self, _: &str) -> Option<PvField> {
+    async fn get_value(&self, _: &[u8]) -> Option<PvField> {
         panic!("get_value handler panicked on purpose");
     }
-    async fn put_value(&self, _: &str, _: PvField) -> Result<(), OpError> {
+    async fn put_value(&self, _: &[u8], _: PvField) -> Result<(), OpError> {
         panic!("put_value handler panicked on purpose");
     }
-    async fn is_writable(&self, _: &str) -> bool {
+    async fn is_writable(&self, _: &[u8]) -> bool {
         true
     }
     async fn subscribe(
         &self,
-        _: &str,
+        _: &[u8],
     ) -> Option<epics_pva_rs::server_native::MonitorStream<PvField>> {
         None
     }

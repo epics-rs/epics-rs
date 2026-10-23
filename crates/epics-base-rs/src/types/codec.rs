@@ -1,4 +1,5 @@
 use crate::error::{CaError, CaResult};
+use epics_libcom_rs::cfmt::CFloat;
 use std::time::SystemTime;
 
 use super::{DbFieldType, EpicsValue, PvString, WallTime, c_cast};
@@ -198,6 +199,30 @@ fn convert_value_to_dbr_string(
     })
 }
 
+/// C's `MAX_STRING_SIZE` buffer: at most 39 bytes, as `getStringString`
+/// copies (`dbConvert.c`), whatever the source holds. The one cut a
+/// `DBR_STRING` read of a string longer than a `DBF_STRING` applies — a
+/// db-link read and `dbgf`.
+pub(crate) fn cap_dbr_string(s: PvString) -> PvString {
+    const MAX: usize = 39;
+    if s.len() > MAX {
+        PvString::from_bytes(&s.as_bytes()[..MAX])
+    } else {
+        s
+    }
+}
+
+/// [`cap_dbr_string`] for each element of a `DBR_STRING` result.
+pub(crate) fn cap_dbr_strings(value: EpicsValue) -> EpicsValue {
+    match value {
+        EpicsValue::StringArray(a) => {
+            EpicsValue::StringArray(a.into_iter().map(cap_dbr_string).collect())
+        }
+        EpicsValue::String(s) => EpicsValue::String(cap_dbr_string(s)),
+        other => other,
+    }
+}
+
 /// The float/double rows of C's `DBR_STRING` column, **in both directions**.
 ///
 /// `getFloatString`/`getDoubleString` (`dbConvert.c:735`/`:772`),
@@ -249,6 +274,37 @@ fn enum_label(snapshot: &crate::server::snapshot::Snapshot, idx: u16) -> PvStrin
         .unwrap_or_default()
 }
 
+/// A fixed `char` buffer a cvtFast conversion writes into, as C's callers
+/// hand `cvtDoubleToString` their own `char *`: rendering into it allocates
+/// nothing. A write past `N` bytes fails and leaves the buffer short.
+pub(crate) struct StrBuf<const N: usize> {
+    buf: [u8; N],
+    len: usize,
+}
+
+impl<const N: usize> StrBuf<N> {
+    pub(crate) const fn new() -> Self {
+        Self {
+            buf: [0; N],
+            len: 0,
+        }
+    }
+
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        &self.buf[..self.len]
+    }
+}
+
+impl<const N: usize> std::fmt::Write for StrBuf<N> {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        let end = self.len + s.len();
+        let dst = self.buf.get_mut(self.len..end).ok_or(std::fmt::Error)?;
+        dst.copy_from_slice(s.as_bytes());
+        self.len = end;
+        Ok(())
+    }
+}
+
 /// Port of libCom `cvtDoubleToString` (cvtFast.c:111-190).
 ///
 /// `pub(crate)` so records that mirror C's `cvtDoubleToString(value, str,
@@ -257,17 +313,27 @@ fn enum_label(snapshot: &crate::server::snapshot::Snapshot, idx: u16) -> PvStrin
 /// wire encoder uses, instead of a divergent `format!` that rounds
 /// differently.
 pub(crate) fn cvt_double_to_string(val: f64, precision: u16) -> String {
+    let mut out = String::new();
+    write_cvt_double(&mut out, val, precision).expect("a String sink does not fail");
+    out
+}
+
+/// [`cvt_double_to_string`] into `out`.
+pub(crate) fn write_cvt_double(
+    out: &mut impl std::fmt::Write,
+    val: f64,
+    precision: u16,
+) -> std::fmt::Result {
     if val.is_nan() || precision > 8 || val > 1e7 || val < -1e7 {
         if precision > 8 || val > 1e16 || val < -1e16 {
             let p = precision.min(17) as usize;
-            return fmt_exp_c(val, p, p + 7);
+            return write!(out, "{:>w$.p$e}", CFloat(val), w = p + 7);
         }
-        return fmt_fixed_c(val, precision.min(3) as usize);
+        return write!(out, "{:.p$}", CFloat(val), p = precision.min(3) as usize);
     }
     let mut val = val;
-    let mut out = String::new();
     if val < 0.0 {
-        out.push('-');
+        out.write_char('-')?;
         val = -val;
     }
     let mut whole = val as i32;
@@ -279,25 +345,39 @@ pub(crate) fn cvt_double_to_string(val: f64, precision: u16) -> String {
         whole += 1;
         fraction -= fplace_full;
     }
-    push_fixed_digits(&mut out, whole, fraction, fplace_full, precision);
-    out
+    write_fixed_digits(out, whole, fraction, fplace_full, precision)
 }
 
 /// Port of libCom `cvtFloatToString` (cvtFast.c:32-109). The fast path runs
 /// in f32 to match the C float arithmetic; the overflow branches cast to
 /// double exactly as the C `sprintf((double) flt_value)` does.
-fn cvt_float_to_string(val: f32, precision: u16) -> String {
+pub(crate) fn cvt_float_to_string(val: f32, precision: u16) -> String {
+    let mut out = String::new();
+    write_cvt_float(&mut out, val, precision).expect("a String sink does not fail");
+    out
+}
+
+/// [`cvt_float_to_string`] into `out`.
+pub(crate) fn write_cvt_float(
+    out: &mut impl std::fmt::Write,
+    val: f32,
+    precision: u16,
+) -> std::fmt::Result {
     if val.is_nan() || precision > 8 || val > 1e7 || val < -1e7 {
         if precision > 8 || val >= 1e8 || val <= -1e8 {
             let p = precision.min(12) as usize;
-            return fmt_exp_c(val as f64, p, p + 6);
+            return write!(out, "{:>w$.p$e}", CFloat(val as f64), w = p + 6);
         }
-        return fmt_fixed_c(val as f64, precision.min(3) as usize);
+        return write!(
+            out,
+            "{:.p$}",
+            CFloat(val as f64),
+            p = precision.min(3) as usize
+        );
     }
     let mut val = val;
-    let mut out = String::new();
     if val < 0.0 {
-        out.push('-');
+        out.write_char('-')?;
         val = -val;
     }
     let mut whole = val as i32;
@@ -309,19 +389,18 @@ fn cvt_float_to_string(val: f32, precision: u16) -> String {
         whole += 1;
         fraction -= fplace_full;
     }
-    push_fixed_digits(&mut out, whole, fraction, fplace_full, precision);
-    out
+    write_fixed_digits(out, whole, fraction, fplace_full, precision)
 }
 
 /// Emit the whole-number then fractional digits, shared by the float/double
 /// fast paths (cvtFast.c:75-105 / :156-186).
-fn push_fixed_digits(
-    out: &mut String,
+fn write_fixed_digits(
+    out: &mut impl std::fmt::Write,
     mut whole: i32,
     mut fraction: i32,
     fplace_full: i32,
     precision: u16,
-) {
+) -> std::fmt::Result {
     let mut got_one = false;
     let mut iplace = 10_000_000i32;
     while iplace >= 1 {
@@ -329,58 +408,26 @@ fn push_fixed_digits(
             got_one = true;
             let number = whole / iplace;
             whole -= number * iplace;
-            out.push((b'0' + number as u8) as char);
+            out.write_char((b'0' + number as u8) as char)?;
         } else if got_one {
-            out.push('0');
+            out.write_char('0')?;
         }
         iplace /= 10;
     }
     if !got_one {
-        out.push('0');
+        out.write_char('0')?;
     }
     if precision > 0 {
-        out.push('.');
+        out.write_char('.')?;
         let mut fplace = fplace_full / 10;
         for _ in 0..precision {
             let number = fraction / fplace;
             fraction -= number * fplace;
-            out.push((b'0' + number as u8) as char);
+            out.write_char((b'0' + number as u8) as char)?;
             fplace /= 10;
         }
     }
-}
-
-/// C `sprintf("%.*f", precision, val)`, with glibc NaN/Inf spellings.
-fn fmt_fixed_c(val: f64, precision: usize) -> String {
-    if val.is_nan() {
-        return "nan".to_string();
-    }
-    if val.is_infinite() {
-        return if val < 0.0 { "-inf" } else { "inf" }.to_string();
-    }
-    format!("{val:.precision$}")
-}
-
-/// C `sprintf("%*.*e", width, precision, val)`: scientific notation with a
-/// signed, ≥2-digit exponent, right-justified in `width`. glibc NaN/Inf
-/// spellings.
-fn fmt_exp_c(val: f64, precision: usize, width: usize) -> String {
-    let body = if val.is_nan() {
-        "nan".to_string()
-    } else if val.is_infinite() {
-        if val < 0.0 { "-inf" } else { "inf" }.to_string()
-    } else {
-        // Rust `{:.*e}` rounds the mantissa half-to-even (matching glibc)
-        // and emits `<mantissa>e<exp>` with no exponent sign / leading
-        // zero; reformat the exponent to C's `e±dd`.
-        let raw = format!("{val:.precision$e}");
-        let (mantissa, exp) = raw.split_once('e').unwrap_or((raw.as_str(), "0"));
-        let exp_num: i32 = exp.parse().unwrap_or(0);
-        let sign = if exp_num < 0 { '-' } else { '+' };
-        format!("{mantissa}e{sign}{:02}", exp_num.abs())
-    };
-    // Right-justify in `width` (C `%*.*e` pads with leading spaces).
-    format!("{body:>width$}")
+    Ok(())
 }
 
 /// RISC alignment padding bytes required between metadata header and value.
@@ -666,6 +713,27 @@ pub fn encode_dbr_into(
     Ok(())
 }
 
+/// `dbGet` of a field log alone (`dbAccess.c:909`): the plain, STS and TIME
+/// classes, whose encode reads value, status, severity and time and no
+/// option of the channel.
+pub fn encode_log_dbr_into(
+    dst: &mut Vec<u8>,
+    dbr_type: u16,
+    value: &EpicsValue,
+    status: u16,
+    severity: u16,
+    time: WallTime,
+) -> CaResult<()> {
+    let native = super::native_type_for_dbr(dbr_type)?;
+    match dbr_type {
+        0..=6 => {}
+        7..=13 => write_sts_meta(dst, native, status, severity),
+        14..=20 => write_time_meta(dst, native, status, severity, time),
+        _ => return Err(CaError::UnsupportedType(dbr_type)),
+    }
+    convert_and_serialize_into(native, value, dst)
+}
+
 /// Append GR (graphic/display) metadata — the real snapshot values, not the
 /// zeroed layout `serialize_gr_ctrl` emits.
 fn write_gr_meta(
@@ -831,7 +899,7 @@ pub(crate) fn get_limits(
 /// The alarm four are the only group C guards — `finite(x) ? (epicsInt32) x
 /// : 0` (`:305-312`) — because they are the only limits it seeds non-finite
 /// (see [`LIMIT_SEED`]). `get_graphics` and `get_control` cast unguarded, so
-/// an infinite HOPR saturates here exactly as it would in C's `(epicsInt32)`.
+/// an infinite HOPR is `INT32_MIN` here exactly as in C's `(epicsInt32)` on x86-64.
 pub(crate) fn limits_as_integers(limits: [f64; 8]) -> [i32; 8] {
     let mut out = limits.map(c_cast::f64_to_i32);
     for i in ALARM_LIMITS {
@@ -1707,6 +1775,10 @@ mod r57_string_precision_tests {
         // NaN takes the `%.*f` branch (NaN compares false against the e-path
         // thresholds) → unpadded glibc "nan".
         assert_eq!(cvt_double_to_string(f64::NAN, 3), "nan");
+        // glibc prints a NaN's sign bit too.
+        assert_eq!(cvt_double_to_string(-f64::NAN, 3), "-nan");
+        assert_eq!(cvt_double_to_string(-f64::NAN, 10), "             -nan");
+        assert_eq!(cvt_float_to_string(-f32::NAN, 3), "-nan");
         // ±Inf exceeds 1e16 → "%*.*e" branch: glibc spelling right-justified
         // in width = precision + 7 (= 13 here), matching C `cvtDoubleToString`.
         assert_eq!(cvt_double_to_string(f64::INFINITY, 6), "          inf");
@@ -2182,14 +2254,14 @@ mod integer_limit_narrowing_tests {
     #[test]
     fn only_the_alarm_group_is_guarded_against_a_non_finite_limit() {
         // C's `finite` guard is in the `DBR_AL_LONG` arm alone. An infinite
-        // display or control limit reaches the unguarded `(epicsInt32)` cast,
-        // which this port resolves by saturation rather than C's UB.
+        // display or control limit reaches the unguarded `(epicsInt32)` cast
+        // (`dbAccess.c:226,266`): x86-64's INT_MIN for either sign.
         let mut limits = [f64::INFINITY; 8];
         limits[1] = f64::NEG_INFINITY;
         let out = limits_as_integers(limits);
-        assert_eq!(out[0], i32::MAX, "display limits are cast unguarded");
+        assert_eq!(out[0], i32::MIN, "display limits are cast unguarded");
         assert_eq!(out[1], i32::MIN);
         assert_eq!(&out[2..6], &[0, 0, 0, 0], "the alarm four are guarded");
-        assert_eq!(out[6], i32::MAX, "control limits are cast unguarded");
+        assert_eq!(out[6], i32::MIN, "control limits are cast unguarded");
     }
 }

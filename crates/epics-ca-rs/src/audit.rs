@@ -112,7 +112,7 @@ impl AuditSink {
                 .await;
             }
             AuditSink::Stderr => {
-                eprintln!("{line}");
+                epics_libcom_rs::stderr_println!("{line}");
             }
             AuditSink::Custom(w) => {
                 w.write_line(line).await;

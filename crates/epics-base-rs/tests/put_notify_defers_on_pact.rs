@@ -33,9 +33,9 @@
 //! R19-65 (the boundary set below): "PACT ends" is not one site. The deferral
 //! must be consumed by whatever performs the PACT→idle transition, so there is
 //! one test per release owner — `complete_async_record_inner`, the
-//! ODLY/`ReprocessAfter` continuation, and each SIM/SDLY release inside
-//! `check_simulation_mode` (simulated input, simulated output redirect, illegal
-//! SIMM) — each with a put parked on that window and each asserting the record
+//! ODLY/`ReprocessAfter` continuation, and each SIM/SDLY release (simulated
+//! input, simulated output, illegal SIMM) — each with a put parked on that
+//! window and each asserting the record
 //! is still usable afterwards. Before the fix only the first of those replayed;
 //! the others stranded the put forever AND bricked the record for every later
 //! put-notify.
@@ -76,7 +76,7 @@ impl Record for AsyncOnceRecord {
                 result: RecordProcessResult::AsyncPending,
                 actions: Vec::new(),
                 device_did_compute: false,
-                post_write_fields: Vec::new(),
+                status: Ok(()),
             })
         } else {
             Ok(ProcessOutcome::complete())
@@ -360,25 +360,19 @@ async fn process_notify_onto_an_owned_record_queues_instead_of_refusing() {
     );
 }
 
-/// The same ownership arm reached by a DBF LINK-field put.
+/// A DBF LINK-field put-notify onto a record another notify owns is written
+/// and answered at once: C `dbProcessNotify` handles link fields before
+/// `processNotifyCommon` (`dbNotify.c:331-345`) and never queues them.
 ///
-/// Link fields are deliberately kept out of the PACT arm — a bare `sub` with an
-/// empty `SNAM` parks PACT=TRUE forever (subRecord.c:119-122) and a link put
-/// parked there would never be written. That exclusion used to cover the WHOLE
-/// decision, so an owned record's link put fell through to the wait-set install
-/// and got refused.
-///
-/// Boundary: owned (`notify.is_some()`) but NOT PACT — the arm the link-field
-/// exclusion must not skip.
+/// Boundary: owned (`notify.is_some()`) but NOT PACT, so only ownership could
+/// have held the put.
 #[epics_macros_rs::epics_test]
-async fn link_field_put_notify_onto_an_owned_idle_record_queues_instead_of_refusing() {
+async fn link_field_put_notify_onto_an_owned_idle_record_is_written_at_once() {
     let db = Arc::new(PvDatabase::new());
     db.add_record("AI1", Box::new(AiRecord::new(0.0)))
         .await
         .unwrap();
 
-    // Own the record without making it PACT: this isolates the ownership arm
-    // from the PACT arm, which is exactly what the link-field rule splits.
     let (owner_tx, _owner_rx) = epics_base_rs::runtime::sync::oneshot::channel();
     {
         let rec = db.get_record("AI1").unwrap();
@@ -388,18 +382,16 @@ async fn link_field_put_notify_onto_an_owned_idle_record_queues_instead_of_refus
         assert!(!inst.is_processing(), "owned, but idle");
     }
 
-    let queued = db
+    let put = db
         .put_record_field_from_ca("AI1", "INP", EpicsValue::String("7".into()))
         .await
-        .expect("C queues a link-field put-notify onto an owned record; no refusal arm exists")
-        .into_handle()
-        .expect("a queued put-notify is async");
-    drop(queued);
+        .unwrap();
+    assert!(put.is_sync(), "a link put-notify is answered at once");
 
-    let rec = db.get_record("AI1").unwrap();
-    assert!(
-        !matches!(rec.read().record.get_field("INP"), Some(EpicsValue::String(ref s)) if s == "7"),
-        "C holds the queued value UNWRITTEN in the restartList node until the replay"
+    assert_eq!(
+        db.get_pv("AI1.INP").unwrap(),
+        EpicsValue::String("7".into()),
+        "the link text is written at once"
     );
 }
 
@@ -466,6 +458,153 @@ async fn deleting_a_record_releases_its_queued_put_notifies() {
     }
 }
 
+/// `ASY` taken by a process-notify that went async: the record's notify slot
+/// holds the wait-set and PACT is held for the device round-trip.
+async fn owned_async() -> (
+    Arc<PvDatabase>,
+    epics_base_rs::runtime::sync::oneshot::Receiver<()>,
+) {
+    let db = Arc::new(PvDatabase::new());
+    db.add_record(
+        "ASY",
+        Box::new(AsyncOnceRecord {
+            val: 5,
+            pending: true,
+            process_count: Arc::new(AtomicU32::new(0)),
+            seen_by_process: Arc::new(std::sync::Mutex::new(Vec::new())),
+        }),
+    )
+    .await
+    .unwrap();
+    let rx = db
+        .process_record_with_notify("ASY")
+        .await
+        .unwrap()
+        .into_handle()
+        .expect("the record went async under the notify");
+    (db, rx)
+}
+
+/// Await `rx`, failing rather than hanging; `true` when the completion fired.
+async fn ended(rx: epics_base_rs::runtime::sync::oneshot::Receiver<()>, site: &str) -> bool {
+    epics_base_rs::runtime::task::timeout(std::time::Duration::from_secs(5), rx)
+        .await
+        .unwrap_or_else(|_| panic!("{site}: the put-notify never ended"))
+        .is_ok()
+}
+
+/// Deleting the record under its ACTIVE put-notify must end it: the record
+/// never processes again, so nothing else would. The completion arrives as a
+/// dropped sender, the error every queued one gets.
+#[epics_macros_rs::epics_test]
+async fn deleting_a_record_ends_its_active_put_notify() {
+    let (db, rx) = owned_async().await;
+    assert!(db.remove_record("ASY").await);
+    assert!(!ended(rx, "deleted").await, "the put never completed");
+}
+
+/// The same through a delayed reprocess (scalcout `ODLY`), whose continuation
+/// looks the record up by name and so cannot find a deleted one.
+#[epics_macros_rs::epics_test]
+async fn deleting_a_record_in_its_odly_window_ends_its_put_notify() {
+    use epics_base_rs::server::records::scalcout::ScalcoutRecord;
+    let db = PvDatabase::new();
+    db.add_record("TGT1", Box::new(AiRecord::new(0.0)))
+        .await
+        .unwrap();
+    let mut sc = ScalcoutRecord::default();
+    sc.put_field("CALC", EpicsValue::String("42".into()))
+        .unwrap();
+    sc.special("CALC", true, &Default::default()).unwrap();
+    sc.oopt = 0;
+    sc.put_field("ODLY", EpicsValue::Double(0.3)).unwrap();
+    sc.put_field("OUT", EpicsValue::String("TGT1".into()))
+        .unwrap();
+    db.add_record("SC1", Box::new(sc)).await.unwrap();
+    let ProcessCompletion::Async(rx) = db.process_record_with_notify("SC1").await.unwrap() else {
+        panic!("ODLY must hold the notify");
+    };
+    assert!(db.remove_record("SC1").await);
+    assert!(!ended(rx, "ODLY").await, "the put never completed");
+}
+
+/// Deleting a record that JOINED another record's put-notify ends that
+/// notify: the deleted record will never leave, so the chain cannot settle.
+#[epics_macros_rs::epics_test]
+async fn deleting_a_joined_record_ends_the_chain_put_notify() {
+    let db = PvDatabase::new();
+    for name in ["ASY", "ASY2"] {
+        db.add_record(
+            name,
+            Box::new(AsyncOnceRecord {
+                val: 5,
+                pending: true,
+                process_count: Arc::new(AtomicU32::new(0)),
+                seen_by_process: Arc::new(std::sync::Mutex::new(Vec::new())),
+            }),
+        )
+        .await
+        .unwrap();
+    }
+    db.add_record("SRC", Box::new(AoRecord::new(1.0)))
+        .await
+        .unwrap();
+    db.put_pv_no_process("SRC.OUT", EpicsValue::String("ASY PP".into()))
+        .await
+        .unwrap();
+
+    db.put_record_field_from_ca("SRC", "FLNK", EpicsValue::String("ASY2".into()))
+        .await
+        .unwrap();
+    let ProcessCompletion::Async(rx) = db.process_record_with_notify("SRC").await.unwrap() else {
+        panic!("ASY and ASY2 joined the chain and hold it");
+    };
+    // ASY2 still holds the set, so only ending it, not dropping ASY's share,
+    // answers the client.
+    assert!(db.remove_record("ASY").await);
+    assert!(!ended(rx, "joined").await, "the chain never completed");
+    db.complete_async_record("ASY2").await.unwrap();
+}
+
+/// Boundary: the completion lands before the deletion. It answers success,
+/// and the deletion finds nothing left to end.
+#[epics_macros_rs::epics_test]
+async fn a_put_notify_completed_before_deletion_stays_a_success() {
+    let (db, rx) = owned_async().await;
+    db.complete_async_record("ASY").await.unwrap();
+    assert!(db.remove_record("ASY").await);
+    assert!(ended(rx, "completed").await, "it completed first");
+}
+
+/// Boundary: the deletion lands before the completion. The late completion
+/// finds the notify already ended and does not answer it a second time.
+#[epics_macros_rs::epics_test]
+async fn a_completion_after_deletion_does_not_answer_again() {
+    let (db, rx) = owned_async().await;
+    assert!(db.remove_record("ASY").await);
+    let _ = db.complete_async_record("ASY").await;
+    assert!(
+        !ended(rx, "deleted first").await,
+        "the deletion ended it first"
+    );
+}
+
+/// Completion racing deletion ends the notify exactly once, whichever wins.
+#[epics_macros_rs::epics_test]
+async fn completion_racing_deletion_ends_the_put_notify_once() {
+    use epics_base_rs::runtime::task::{CallbackPriority, spawn_background};
+    for _ in 0..200 {
+        let (db, rx) = owned_async().await;
+        let completer = db.clone();
+        let racer = spawn_background(CallbackPriority::Low, async move {
+            let _ = completer.complete_async_record("ASY").await;
+        });
+        assert!(db.remove_record("ASY").await);
+        racer.await.unwrap();
+        ended(rx, "racing").await;
+    }
+}
+
 /// Await a deferred put's callback, failing the test rather than hanging.
 async fn expect_callback(rx: epics_base_rs::runtime::sync::oneshot::Receiver<()>, site: &str) {
     epics_base_rs::runtime::task::timeout(std::time::Duration::from_secs(5), rx)
@@ -500,7 +639,7 @@ impl Record for OdlyRecord {
                     std::time::Duration::from_secs(100),
                 )],
                 device_did_compute: false,
-                post_write_fields: Vec::new(),
+                status: Ok(()),
             })
         } else {
             Ok(ProcessOutcome::complete())
@@ -597,8 +736,8 @@ async fn deferred_put_is_replayed_when_the_odly_continuation_releases_pact() {
 }
 
 /// `SDLY_AI`: SIMM=YES via SIML, SIOL=42, SDLY≥0 → the fresh cycle holds PACT
-/// and defers the SIOL round-trip. PACT is released inside
-/// `check_simulation_mode`, on the `Simulated` tail.
+/// and defers the SIOL round-trip. PACT is released on the continuation's
+/// `Simulated` tail.
 async fn sdly_input_record() -> PvDatabase {
     let db = PvDatabase::new();
     db.add_record("SW", Box::new(AoRecord::new(1.0)))
@@ -608,8 +747,8 @@ async fn sdly_input_record() -> PvDatabase {
         .await
         .unwrap();
     let mut ai = AiRecord::new(0.0);
-    ai.siml = "SW".to_string();
-    ai.siol = "SRC".to_string();
+    ai.siml = "SW".into();
+    ai.siol = "SRC".into();
     ai.sdly = 100.0; // async; the real timer cannot fire inside the test
     db.add_record("SIMAI", Box::new(ai)).await.unwrap();
     db
@@ -675,8 +814,8 @@ async fn deferred_put_is_replayed_when_the_sdly_input_continuation_releases_pact
     assert!(!rec.read().is_processing());
 }
 
-/// Boundary: PACT released by the SIM/SDLY OUTPUT continuation (the
-/// `RedirectOutputToSiol` arm), deferral PRESENT.
+/// Boundary: PACT released by the SIM/SDLY OUTPUT's completing pass, deferral
+/// PRESENT.
 #[epics_macros_rs::epics_test]
 async fn deferred_put_is_replayed_when_the_sdly_output_continuation_releases_pact() {
     let db = PvDatabase::new();
@@ -687,8 +826,8 @@ async fn deferred_put_is_replayed_when_the_sdly_output_continuation_releases_pac
         .await
         .unwrap();
     let mut ao = AoRecord::new(1.0);
-    ao.siml = "SW".to_string();
-    ao.siol = "SINK".to_string();
+    ao.siml = "SW".into();
+    ao.siol = "SINK".into();
     ao.sdly = 100.0;
     db.add_record("SIMAO", Box::new(ao)).await.unwrap();
 
@@ -709,18 +848,12 @@ async fn deferred_put_is_replayed_when_the_sdly_output_continuation_releases_pac
         .into_handle()
         .expect("a deferred put-notify hands back a receiver");
 
-    let mut v2 = epics_base_rs::server::database::ProcStack::new();
-    db.process_record_continuation("SIMAO", &mut v2)
-        .await
-        .unwrap();
+    db.complete_async_record("SIMAO").await.unwrap();
 
     await_replayed_value(&db, "SIMAO", 7.0).await;
 
-    let mut v3 = epics_base_rs::server::database::ProcStack::new();
-    db.process_record_continuation("SIMAO", &mut v3)
-        .await
-        .unwrap();
-    expect_callback(rx, "the simulated-output continuation").await;
+    db.complete_async_record("SIMAO").await.unwrap();
+    expect_callback(rx, "the simulated-output completing pass").await;
     assert!(!rec.read().is_processing());
 }
 
@@ -757,6 +890,7 @@ async fn deferred_put_is_replayed_when_the_illegal_simm_continuation_releases_pa
     let mut v2 = epics_base_rs::server::database::ProcStack::new();
     db.process_record_continuation("SIMAI", &mut v2)
         .await
+        .or_else(CaError::unless_process_status)
         .unwrap();
 
     // The put parked on that window is replayed even though the cycle ended in
@@ -793,5 +927,79 @@ async fn a_fire_and_forget_put_on_a_pact_record_still_writes_and_sets_rpro() {
     assert!(
         rpro(&f.db).await,
         "and marks it for the reprocess that carries the value to the device"
+    );
+}
+
+/// C `processRequest` (`dbNotify.c:213-231`, `:263-270`): queued on a PACT
+/// record it writes nothing, and its restart hands the record straight to the
+/// next queued put-notify.
+#[epics_macros_rs::epics_test]
+async fn an_unwritten_notify_waits_and_passes_the_record_on() {
+    use std::future::Future;
+    use std::task::Poll;
+
+    let f = busy_record().await;
+
+    let mut wait = Box::pin(f.db.notify_unwritten_from_client("ASY", "VAL"));
+    let parked = std::future::poll_fn(|cx| Poll::Ready(wait.as_mut().poll(cx).is_pending())).await;
+    assert!(parked, "the record is PACT: the wait queues");
+    let put =
+        f.db.put_record_field_from_ca("ASY", "VAL", EpicsValue::Long(7))
+            .await
+            .unwrap()
+            .into_handle()
+            .expect("queued behind the wait");
+
+    f.db.complete_async_record("ASY").await.unwrap();
+
+    let timeout = std::time::Duration::from_secs(5);
+    epics_base_rs::runtime::task::timeout(timeout, wait)
+        .await
+        .expect("the wait answers after the cycle")
+        .unwrap();
+    epics_base_rs::runtime::task::timeout(timeout, put)
+        .await
+        .expect("the put behind it replays")
+        .unwrap();
+    assert_eq!(val(&f.db).await, 7);
+    assert_eq!(f.seen.lock().unwrap().clone(), vec![5, 7]);
+}
+
+/// `dbNotify.c:248-250` on restart: a queued `processGetRequest` whose record
+/// is no longer Passive completes without processing and passes the record on.
+#[epics_macros_rs::epics_test]
+async fn a_queued_process_notify_skips_a_record_no_longer_passive() {
+    let f = busy_record().await;
+
+    let process =
+        f.db.process_record_with_notify("ASY")
+            .await
+            .unwrap()
+            .into_handle()
+            .expect("queued on the PACT record");
+    let put =
+        f.db.put_record_field_from_ca("ASY", "VAL", EpicsValue::Long(7))
+            .await
+            .unwrap()
+            .into_handle()
+            .expect("queued behind it");
+    f.db.get_record("ASY").unwrap().write().common.scan = ScanType::SEC1;
+
+    f.db.complete_async_record("ASY").await.unwrap();
+
+    let timeout = std::time::Duration::from_secs(5);
+    epics_base_rs::runtime::task::timeout(timeout, process)
+        .await
+        .expect("the process notify answers")
+        .unwrap();
+    // A replayed put that drove no process answers by dropping its sender.
+    let _ = epics_base_rs::runtime::task::timeout(timeout, put)
+        .await
+        .expect("the put behind it replays");
+    assert_eq!(val(&f.db).await, 7);
+    assert_eq!(
+        f.seen.lock().unwrap().clone(),
+        vec![5],
+        "neither the process notify nor the put to a non-Passive record processes"
     );
 }

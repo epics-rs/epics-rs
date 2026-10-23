@@ -9,6 +9,8 @@ repository.workspace = true
 
 [dependencies]
 epics-base-rs = { workspace = true }
+# `pvdata::fmt::format_g` is `cfmt::CFloat`'s `%g`.
+epics-libcom-rs = { workspace = true }
 epics-macros-rs = { workspace = true }
 # No `epics-rtems-boot`: this package produces no RTEMS binary. The boot shim
 # is a dependency of whichever package owns one, and `realtime-pva-ioc` moved
@@ -17,7 +19,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
 chrono = "0.4"
-serde_json = "1.0"
+serde_json = { workspace = true }
 thiserror = "2"
 hostname = "0.4"
 tokio-util = { version = "0.7", default-features = false }
@@ -138,21 +140,18 @@ pkcs12 = [
 
 # ── Host network stack (everything except the embedded targets) ─────────
 #
-# `socket2` and `if-addrs` are §8.1 hard blockers on `armv7-rtems-eabihf`:
-# socket2 fails with 20 errors (newlib has no `msghdr`/`recvmsg`/`IovLen`,
-# no `ip_mreqn`, no `SOCK_RAW`) and if-addrs with 2 (no `getifaddrs`/
-# `ifaddrs`). Neither symbol exists in `libc`'s VxWorks module either
+# `socket2` is a §8.1 hard blocker on `armv7-rtems-eabihf`: it fails with 20
+# errors (newlib has no `msghdr`/`recvmsg`/`IovLen`, no `ip_mreqn`, no
+# `SOCK_RAW`), and none of those exist in `libc`'s VxWorks module either
 # (confirmed by reading the pinned dependency's source), so the same split
-# applies to the `*-wrs-vxworks*` triples. Both are reached only from the
-# tokio async I/O layer — `server_native::{tcp,udp}` and `client_native` —
-# which neither embedded target uses: each gets a blocking thread-per-client
-# driver instead (§4, §9 phase 6 item 7). So they are host-only deps, the
-# same gate `epics-base-rs` applied to its own copies (§8.1.1). NOT solved
-# for either embedded target — see §8.1 for what an interface enumerator /
-# raw-libc sockopt subset would take.
+# applies to the `*-wrs-vxworks*` triples. It is reached only from the tokio
+# async I/O layer — `server_native::{tcp,udp}` and `client_native` — which
+# neither embedded target uses: each gets a blocking thread-per-client driver
+# instead (§4, §9 phase 6 item 7). So it is a host-only dep, the same gate
+# `epics-base-rs` applied to its own copy (§8.1.1). Interface enumeration is
+# epics-libcom-rs `net::iface_v4`'s.
 [target.'cfg(not(any(target_os = "rtems", target_os = "vxworks")))'.dependencies]
 socket2 = "0.5"
-if-addrs = "0.13"
 tokio = { version = "1", features = ["full"] }
 
 # RTEMS/VxWorks get tokio without `net`/`signal`/`process`: `net` pulls mio
@@ -212,6 +211,10 @@ source-guard = { path = "../source-guard" }
 # crate that derives the backend has the same hole, and a 300-line audit
 # copied once per crate is how copies of a rule come to disagree.
 rtems-exec-gate = { path = "../../tools/rtems-exec-gate" }
+# Dev-only, path-only: softIocPVX's CA port is probed and its RSRV steal
+# read the way softIoc's is.
+named-port = { path = "../named-port" }
+fact-budget = { path = "../fact-budget" }
 rcgen = "0.13"
 tempfile = "3"
 serial_test = "3"

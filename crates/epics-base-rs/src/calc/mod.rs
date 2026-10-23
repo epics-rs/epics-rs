@@ -5,7 +5,9 @@ pub use engine::cvt;
 pub use engine::error::{CalcError, calc_error_str};
 pub use engine::opcodes::{CoreOp, Opcode};
 pub use engine::random::seed_random_from_time;
-pub use engine::{CALC_NARGS, CalcResult, CompiledExpr, ExprKind, NumericInputs};
+pub use engine::{
+    CALC_NARGS, CalcResult, CompiledExpr, ExprKind, NumericInputs, Rpcl, infix_to_postfix_size,
+};
 
 pub use engine::StringInputs;
 pub use engine::opcodes::StringOp;
@@ -32,24 +34,24 @@ pub fn compile(expr: &str) -> CalcResult<CompiledExpr> {
     if expr.is_empty() {
         return Err(CalcError::NullArg);
     }
-    let tokens = engine::token::tokenize(expr, ExprKind::Numeric)?;
-    engine::postfix::compile(&tokens, ExprKind::Numeric)
+    engine::postfix::compile(expr, ExprKind::Numeric)
 }
 
-/// Evaluate a compiled expression with the given inputs.
-pub fn eval(expr: &CompiledExpr, inputs: &mut NumericInputs) -> CalcResult<f64> {
-    engine::numeric::eval(expr, inputs)
+/// Evaluate a compiled expression with the given inputs. `expr` is a
+/// [`CompiledExpr`] or a record's inline [`Rpcl`].
+pub fn eval(expr: &(impl AsRef<[u8]> + ?Sized), inputs: &mut NumericInputs) -> CalcResult<f64> {
+    engine::numeric::eval(expr.as_ref(), inputs)
 }
 
 /// [`eval`] on the caller's own arg block — C `calcPerform(&prec->a, &prec->val,
 /// rpcl)`, whose stores land in the record as the expression runs. `prev_val`
 /// is what the `VAL` token reads.
 pub fn eval_in_place(
-    expr: &CompiledExpr,
+    expr: &(impl AsRef<[u8]> + ?Sized),
     vars: &mut [f64; CALC_NARGS],
     prev_val: f64,
 ) -> CalcResult<f64> {
-    engine::numeric::eval_vars(expr, engine::NumericVars::all(vars, prev_val))
+    engine::numeric::eval_vars(expr.as_ref(), engine::NumericVars::all(vars, prev_val))
 }
 
 /// Compile and evaluate an expression in one step.
@@ -70,12 +72,14 @@ pub fn scalc_compile(expr: &str) -> CalcResult<CompiledExpr> {
     if expr.is_empty() {
         return Ok(CompiledExpr::empty(ExprKind::String));
     }
-    let tokens = engine::token::tokenize(expr, ExprKind::String)?;
-    engine::postfix::compile(&tokens, ExprKind::String)
+    engine::postfix::compile(expr, ExprKind::String)
 }
 
-pub fn scalc_eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> CalcResult<StackValue> {
-    engine::string::eval(expr, inputs)
+pub fn scalc_eval(
+    expr: &(impl AsRef<[u8]> + ?Sized),
+    inputs: &mut StringInputs,
+) -> CalcResult<StackValue> {
+    engine::string::eval(expr.as_ref(), inputs)
 }
 
 pub fn scalc(expr: &str, inputs: &mut StringInputs) -> CalcResult<StackValue> {
@@ -95,12 +99,13 @@ pub fn scalc(expr: &str, inputs: &mut StringInputs) -> CalcResult<StackValue> {
 /// [`StackValue`] cannot know which evaluator produced it, so there is no
 /// `scalc_result(&value)` for a caller to reach for and get wrong.
 pub fn scalc_perform(
-    expr: &CompiledExpr,
+    expr: &(impl AsRef<[u8]> + ?Sized),
     inputs: &mut StringInputs,
     precision: i16,
 ) -> CalcResult<ScalcResult> {
-    let top = scalc_eval(expr, inputs)?;
-    Ok(engine::string::epilogue(expr, &top, precision))
+    let code = expr.as_ref();
+    let top = engine::string::eval(code, inputs)?;
+    Ok(engine::string::epilogue(code, &top, precision))
 }
 
 /// Compile an infix expression for the **array** engine — synApps
@@ -114,12 +119,14 @@ pub fn acalc_compile(expr: &str) -> CalcResult<CompiledExpr> {
     if expr.is_empty() {
         return Ok(CompiledExpr::empty(ExprKind::Array));
     }
-    let tokens = engine::token::tokenize(expr, ExprKind::Array)?;
-    engine::postfix::compile(&tokens, ExprKind::Array)
+    engine::postfix::compile(expr, ExprKind::Array)
 }
 
-pub fn acalc_eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> CalcResult<ArrayStackValue> {
-    engine::array::eval(expr, inputs)
+pub fn acalc_eval(
+    expr: &(impl AsRef<[u8]> + ?Sized),
+    inputs: &mut ArrayInputs,
+) -> CalcResult<ArrayStackValue> {
+    engine::array::eval(expr.as_ref(), inputs)
 }
 
 pub fn acalc(expr: &str, inputs: &mut ArrayInputs) -> CalcResult<ArrayStackValue> {

@@ -26,6 +26,7 @@
 //! without `libusb`.
 
 use crate::error::{AsynError, AsynResult, AsynStatus};
+use crate::port::InterfaceMask;
 use crate::port::{PortDriver, PortDriverBase, PortFlags};
 use crate::user::AsynUser;
 
@@ -137,7 +138,7 @@ impl DrvAsynFtdiPort {
         mode: i32,
     ) -> AsynResult<Self> {
         let config = FtdiConfig::from_positional(vendor, product, baudrate, latency, mode);
-        let mut base = PortDriverBase::new(
+        let mut base = PortDriverBase::new_exact_flags(
             port_name,
             1,
             PortFlags {
@@ -145,9 +146,11 @@ impl DrvAsynFtdiPort {
                 can_block: true,
                 ..PortFlags::default()
             },
+            // asynCommon, asynOption and asynOctet (drvAsynFTDIPort.cpp:579-616).
+            InterfaceMask::COMMON | InterfaceMask::OPTION | InterfaceMask::OCTET,
+            InterfaceMask::OCTET,
         );
-        base.init_connected(false);
-        base.auto_connect = !no_auto_connect;
+        base.init_auto_connect(!no_auto_connect);
         // C passes `interruptProcess = 1` to `pasynOctetBase->initialize`
         // (drvAsynFTDIPort.cpp:616): every successful octet read on this port fans out to
         // its octet interrupt users, which is what drives a SCAN="I/O Intr"
@@ -197,12 +200,6 @@ impl PortDriver for DrvAsynFtdiPort {
         &mut self.base
     }
 
-    /// C drvAsynFTDIPort registers asynCommon, asynOption and asynOctet
-    /// (drvAsynFTDIPort.cpp:579-613).
-    fn capabilities(&self) -> Vec<crate::interfaces::Capability> {
-        crate::interfaces::octet_transport_capabilities()
-    }
-
     fn connect(&mut self, _user: &AsynUser) -> AsynResult<()> {
         if !Self::has_hw_support() {
             return Err(AsynError::Status {
@@ -230,6 +227,22 @@ impl PortDriver for DrvAsynFtdiPort {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// drvAsynFTDIPort.cpp:579-616: asynCommon, asynOption and asynOctet,
+    /// whose `interruptProcess = 1` makes asynOctet an interrupt source.
+    #[test]
+    fn the_port_registers_drv_asyn_ftdi_port_s_interfaces() {
+        let drv =
+            DrvAsynFtdiPort::configure("ftdi_masks", 0x0403, 0x6001, 9600, 1, 0, true, false, 0)
+                .unwrap();
+        assert_eq!(
+            (drv.base().interface_mask(), drv.base().interrupt_mask()),
+            (
+                InterfaceMask::COMMON | InterfaceMask::OPTION | InterfaceMask::OCTET,
+                InterfaceMask::OCTET
+            )
+        );
+    }
 
     #[test]
     fn mode_bit0_clear_selects_uart() {
@@ -274,8 +287,8 @@ mod tests {
         assert_eq!(drv.config().mode_raw, 1);
         assert_eq!(drv.priority(), 50);
         assert!(!drv.no_process_eos());
-        // no_auto_connect=true → base.auto_connect should be false
-        assert!(!drv.base().auto_connect);
+        // no_auto_connect=true → base.is_auto_connect() should be false
+        assert!(!drv.base().is_auto_connect());
         // no_process_eos=false → EOS interpose auto-installed (DRV-2 family,
         // C drvAsynFTDIPort.cpp:622-623).
         assert_eq!(drv.base().interpose_octet.len(), 1);
@@ -299,7 +312,7 @@ mod tests {
         let drv =
             DrvAsynFtdiPort::configure("ftdi0", 0x0403, 0x6014, 115_200, 16, 0, false, false, 0)
                 .unwrap();
-        assert!(drv.base().auto_connect);
+        assert!(drv.base().is_auto_connect());
     }
 
     // Only meaningful in a build without the hardware feature — with

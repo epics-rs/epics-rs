@@ -1,10 +1,19 @@
 use ad_core_rs::driver::{ColorMode, ImageMode};
+use ad_core_rs::ndarray::NDDataType;
 use ad_core_rs::plugin::channel::NDArrayOutput;
 use sim_detector::create_sim_detector;
 
 #[test]
 fn test_single_mode_one_frame() {
-    let rt = create_sim_detector("INT_SINGLE", 64, 64, 10_000_000, NDArrayOutput::new()).unwrap();
+    let rt = create_sim_detector(
+        &asyn_rs::registry::claim_port("INT_SINGLE").unwrap(),
+        64,
+        64,
+        NDDataType::UInt8 as i32,
+        10_000_000,
+        NDArrayOutput::new(),
+    )
+    .unwrap();
     let handle = rt.port_handle();
 
     handle
@@ -34,7 +43,15 @@ fn test_single_mode_one_frame() {
 
 #[test]
 fn test_mode_switch_during_continuous() {
-    let rt = create_sim_detector("INT_SWITCH", 32, 32, 10_000_000, NDArrayOutput::new()).unwrap();
+    let rt = create_sim_detector(
+        &asyn_rs::registry::claim_port("INT_SWITCH").unwrap(),
+        32,
+        32,
+        NDDataType::UInt8 as i32,
+        10_000_000,
+        NDArrayOutput::new(),
+    )
+    .unwrap();
     let handle = rt.port_handle();
 
     handle
@@ -84,7 +101,15 @@ fn test_mode_switch_during_continuous() {
 
 #[test]
 fn test_rgb1_mode_acquisition() {
-    let rt = create_sim_detector("INT_RGB", 16, 16, 10_000_000, NDArrayOutput::new()).unwrap();
+    let rt = create_sim_detector(
+        &asyn_rs::registry::claim_port("INT_RGB").unwrap(),
+        16,
+        16,
+        NDDataType::UInt8 as i32,
+        10_000_000,
+        NDArrayOutput::new(),
+    )
+    .unwrap();
     let handle = rt.port_handle();
 
     handle
@@ -111,4 +136,15 @@ fn test_rgb1_mode_acquisition() {
         .read_int32_blocking(rt.ad_params.base.array_counter, 0)
         .unwrap();
     assert_eq!(counter, 1);
+    // The frame's ColorMode attribute (simDetector.cpp:171) sizes it as RGB1.
+    let read = |idx| handle.read_int32_blocking(idx, 0).unwrap();
+    let b = &rt.ad_params.base;
+    assert_eq!(
+        (
+            read(b.array_size_x),
+            read(b.array_size_y),
+            read(b.array_size)
+        ),
+        (16, 16, 16 * 16 * 3)
+    );
 }

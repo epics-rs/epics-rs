@@ -75,7 +75,7 @@ async fn process(db: &Db) {
 }
 
 fn num(db: &Db, field: &str) -> f64 {
-    db.get_pv(&format!("SCO.{field}"))
+    db.get_pv(format!("SCO.{field}"))
         .unwrap_or_else(|e| panic!("SCO.{field}: {e}"))
         .to_f64()
         .expect("numeric")
@@ -83,7 +83,7 @@ fn num(db: &Db, field: &str) -> f64 {
 
 /// The channel exactly as a client reads it: a read-only scalar `DBF_STRING`.
 fn prev_str(db: &Db, field: &str) -> String {
-    match db.get_pv(&format!("SCO.{field}")).expect("prev string") {
+    match db.get_pv(format!("SCO.{field}")).expect("prev string") {
         EpicsValue::String(s) => s.as_str_lossy().into_owned(),
         other => panic!("SCO.{field} is {other:?}"),
     }

@@ -59,8 +59,9 @@ an inherent method, so the derive never has to assume a method exists.
 | Attribute | Required | Description |
 |-----------|----------|-------------|
 | `type = "..."` | Yes | DBR field type (see table below) |
-| `read_only` | No | Reject puts with `CaError::ReadOnlyField` |
+| `read_only` | No | a `SPC_NOMOD` member: `put_field` stores it and only `slot_ref` maps it; the database's NOMOD gate refuses a client put |
 | `menu_choices = SOME_CONST` | No | the choice strings of a `DBR_ENUM` menu field, emitted as `menu_field_choices` |
+| `link` | No | a `DBF_INLINK`/`OUTLINK`/`FWDLINK` field of `type = "String"`, lent through `link_text_ref` |
 
 ## Supported Field Types
 

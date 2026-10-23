@@ -178,39 +178,33 @@ pub struct MdnsAnnouncer {
 
 impl MdnsAnnouncer {
     /// Register `<instance>._epics-ca._tcp.local.` pointing at this
-    /// host's local IP and `tcp_port`.
+    /// host's local IP and the UDP search `port` a client sends SEARCH to.
     pub fn announce(
         instance: &str,
-        tcp_port: u16,
+        port: u16,
         txt: Vec<(String, String)>,
     ) -> Result<Self, mdns_sd::Error> {
         let daemon = ServiceDaemon::new()?;
-        let hostname = epics_base_rs::runtime::env::hostname();
+        // mDNS has no C counterpart and its records are text.
+        let hostname = epics_base_rs::runtime::env::hostname().map_or_else(
+            || "localhost".into(),
+            |h| String::from_utf8_lossy(&h).into_owned(),
+        );
         let host_target = format!("{hostname}.local.");
 
         // Discover routable IPv4 addresses on every up, non-loopback
         // interface so multi-homed IOCs announce all paths.
-        let ips: Vec<IpAddr> = if_addrs::get_if_addrs()
+        let ips: Vec<IpAddr> = epics_base_rs::net::iface_v4::enumerate()
             .unwrap_or_default()
             .into_iter()
-            .filter(|iface| !iface.is_loopback())
-            .filter_map(|iface| match iface.ip() {
-                IpAddr::V4(v4) => Some(IpAddr::V4(v4)),
-                _ => None,
-            })
+            .filter(|iface| iface.is_eligible())
+            .map(|iface| IpAddr::V4(iface.ip))
             .collect();
 
-        let info = ServiceInfo::new(
-            MDNS_TYPE,
-            instance,
-            &host_target,
-            &ips[..],
-            tcp_port,
-            &txt[..],
-        )?;
+        let info = ServiceInfo::new(MDNS_TYPE, instance, &host_target, &ips[..], port, &txt[..])?;
         let fullname = info.get_fullname().to_string();
         daemon.register(info)?;
-        tracing::info!(instance = %instance, port = tcp_port,
+        tracing::info!(instance = %instance, port,
             "mDNS announce registered ({fullname})");
         Ok(Self { daemon, fullname })
     }

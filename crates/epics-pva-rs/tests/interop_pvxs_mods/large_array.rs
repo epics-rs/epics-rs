@@ -18,6 +18,7 @@
 
 // RTEMS-EXEC-MODEL-ALLOW(1): not run by the default nextest profile - this file is a module of the `interop_pvxs` binary, which `.config/nextest.toml`'s default-filter excludes.
 
+use super::interop_helpers::PvxsOutput;
 use super::interop_helpers::{PVXGET, pvxs_command, pvxs_lib_dir, require_pvxs};
 
 use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
@@ -42,7 +43,7 @@ const N: usize = 100_000;
 fn build_large_array_pv() -> SharedPV {
     let desc = FieldDesc::Structure {
         struct_id: "epics:nt/NTScalarArray:1.0".into(),
-        fields: vec![("value".into(), FieldDesc::ScalarArray(ScalarType::Double))],
+        fields: vec![("value".into(), FieldDesc::ScalarArray(ScalarType::Double))].into(),
     };
     let values: Vec<ScalarValue> = (0..N)
         .map(|i| ScalarValue::Double(i as f64 * 0.5))
@@ -63,9 +64,7 @@ fn build_large_array_pv() -> SharedPV {
 /// numeric tokens in the output as a rough sanity bound.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn interop_large_array_a_pvxget_reads_huge_rust_array() {
-    let Some(pvxget) = require_pvxs(PVXGET) else {
-        return;
-    };
+    let pvxget = require_pvxs(PVXGET);
 
     let src = SharedSource::new();
     src.add("L:DBL", build_large_array_pv());
@@ -91,7 +90,7 @@ async fn interop_large_array_a_pvxget_reads_huge_rust_array() {
             .env(env_key(), lib)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .output()
+            .pvxs_output()
             .expect("pvxget exec")
     })
     .await
@@ -137,45 +136,12 @@ async fn interop_large_array_a_pvxget_reads_huge_rust_array() {
 /// in `client_native/server_conn.rs`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn interop_large_array_b_rust_client_reads_huge_pvxs_array() {
-    // The only absent-prerequisite skip on this path; everything past it
-    // is our own helper, so it panics rather than skipping.
-    if super::interop_helpers::require_cxx().is_none() {
-        return;
-    }
+    super::interop_helpers::require_cxx();
     let helper = super::interop_helpers::cpp_helper("reverse_server");
 
-    let port = {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        l.local_addr().unwrap().port()
-    };
     let ready = super::interop_helpers::ReadyFile::new("large_arr_ready");
 
-    let mut child = match std::process::Command::new(&helper)
-        .arg("--port")
-        .arg(port.to_string())
-        .arg("--ready")
-        .arg(ready.path())
-        .env(env_key(), pvxs_lib_dir())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
-        Ok(c) => c,
-        Err(e) => panic!("failed to spawn reverse_server: {e}"),
-    };
-    let mut up = false;
-    for _ in 0..50 {
-        if ready.is_up() {
-            up = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    if !up {
-        let _ = child.kill();
-        let _ = child.wait();
-        panic!("reverse_server not ready");
-    }
+    let (srv, port) = super::interop_helpers::start_cpp_server(&helper, &ready, &[]);
 
     let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
     let client = epics_pva_rs::client_native::PvaClient::builder()
@@ -186,14 +152,12 @@ async fn interop_large_array_b_rust_client_reads_huge_pvxs_array() {
     let decoded = match client.pvget("L:DBL").await {
         Ok(v) => v,
         Err(e) => {
-            let _ = child.kill();
-            let _ = child.wait();
+            drop(srv);
             panic!("pvget on L:DBL failed: {e:?}");
         }
     };
 
-    let _ = child.kill();
-    let _ = child.wait();
+    drop(srv);
 
     let PvField::Structure(s) = &decoded else {
         panic!("expected struct, got {decoded:?}");

@@ -61,11 +61,18 @@ impl PluginBaseParams {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use asyn_rs::port::InterfaceMask;
     use asyn_rs::port::PortFlags;
 
     #[test]
     fn test_create_plugin_base_params() {
-        let mut base = PortDriverBase::new("test", 1, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            "test",
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
+        );
         let params = PluginBaseParams::create(&mut base).unwrap();
         assert!(base.find_param("ENABLE_CALLBACKS").is_some());
         assert!(base.find_param("QUEUE_SIZE").is_some());

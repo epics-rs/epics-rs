@@ -10,7 +10,7 @@
 //! the TCP-circuit SEARCH handler needs exactly these three entry points
 //! (`parse_search_request`, `matched_cids_for_requester`,
 //! `build_search_response_proto`) while `udp` itself is host-only —
-//! `tokio::net::UdpSocket`, `socket2`, `if-addrs`. Keeping the protocol
+//! `tokio::net::UdpSocket`, `socket2`. Keeping the protocol
 //! here is what lets `tcp` compile for `armv7-rtems-eabihf`; `udp`
 //! re-exports every item so its own call sites are unchanged.
 //!
@@ -25,11 +25,12 @@ use std::io::Cursor;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use crate::proto::{
-    ByteOrder, Command, PvaHeader, ReadExt, WriteExt, decode_size, decode_string,
+    ByteOrder, Command, PvaHeader, ReadExt, WriteExt, decode_size, decode_string_bytes,
     encode_string_into, ip_from_bytes, ip_to_bytes,
 };
 
 use super::source::DynSource;
+use epics_base_rs::types::RecordName;
 
 // exposed pub(crate) so the TCP-circuit SEARCH handler in
 // tcp.rs can reuse this struct + the parser below. The fields are
@@ -44,7 +45,7 @@ use super::source::DynSource;
 // one in here would make us answer strictly fewer TCP-circuit SEARCHes than
 // pvxs does. `tcp.rs` states the same conclusion at its call site.
 //
-// `protocols`, `reply_addr`, `reply_port`, `unicast` and `consumed` are read
+// `protocols`, `reply_addr`, `reply_port` and `consumed` are read
 // only on the UDP paths. The parser fills them for every caller because it is
 // one parser, not two — which is also why an RTEMS build that has no UDP
 // responder wired yet reports them as never read.
@@ -52,7 +53,7 @@ use super::source::DynSource;
 pub(crate) struct SearchRequest {
     pub(crate) seq: u32,
     pub(crate) byte_order: ByteOrder,
-    pub(crate) queries: Vec<(u32, String)>,
+    pub(crate) queries: Vec<(u32, RecordName)>,
     /// Reply destination announced inside the SEARCH payload (the
     /// 16-byte address + 2-byte port fields). `None` means the address
     /// was the unspecified sentinel (`0.0.0.0` / `::`), in which case
@@ -65,11 +66,6 @@ pub(crate) struct SearchRequest {
     /// (`udp_collector.cpp:367-370`).
     pub(crate) reply_addr: Option<IpAddr>,
     pub(crate) reply_port: u16,
-    /// True when the SEARCH header had the Unicast flag (`0x80`,
-    /// `pva_search_flags::Unicast`) set. pvxs uses this as a marker
-    /// that the forwarder must clear before relaying via the loopback
-    /// ORIGIN_TAG channel (`udp_collector.cpp:391`).
-    pub(crate) unicast: bool,
     /// True when the SEARCH header had the `MustReply` flag (`0x01`,
     /// `pva_search_flags::MustReply`) set — pvlist-style discovery
     /// probes set this so every reachable server answers even with
@@ -117,7 +113,8 @@ pub(crate) fn parse_search_request(frame: &[u8]) -> Option<SearchRequest> {
     let mut p = Cursor::new(payload);
     let seq = p.get_u32(order).ok()?;
     let flags = p.get_u8().ok()?;
-    let unicast = flags & 0x80 != 0;
+    // The Unicast flag (`0x80`) is not read: pvxs decides forwarding by
+    // destination and only clears the flag on the way (`udp_collector.cpp:391`).
     // `pva_search_flags::MustReply = 0x01`. pvxs `udp_collector.cpp:363`
     // mirrors the field into `SearchMsg::mustReply`; pvlist relies on
     // this to enumerate reachable servers regardless of name matches.
@@ -163,7 +160,7 @@ pub(crate) fn parse_search_request(frame: &[u8]) -> Option<SearchRequest> {
     }
     let n = p.get_u16(order).ok()? as usize;
     // cap pre-alloc against attacker-announced
-    // count. Each (cid u32, String) consumes >= 5 wire bytes; in
+    // count. Each (cid u32, name) consumes >= 5 wire bytes; in
     // practice n is u16-bounded so the worst case is ~1.5MB but
     // capping at remaining-bytes keeps the small-datagram common
     // case tight.
@@ -171,8 +168,8 @@ pub(crate) fn parse_search_request(frame: &[u8]) -> Option<SearchRequest> {
     let mut queries = Vec::with_capacity(n.min(remaining));
     for _ in 0..n {
         let cid = p.get_u32(order).ok()?;
-        let name = decode_string(&mut p, order).ok().flatten()?;
-        queries.push((cid, name));
+        let name = decode_string_bytes(&mut p, order).ok().flatten()?;
+        queries.push((cid, RecordName::from(name)));
     }
     Some(SearchRequest {
         seq,
@@ -180,7 +177,6 @@ pub(crate) fn parse_search_request(frame: &[u8]) -> Option<SearchRequest> {
         queries,
         reply_addr,
         reply_port,
-        unicast,
         must_reply,
         protocols,
         consumed: PvaHeader::SIZE + payload_len,

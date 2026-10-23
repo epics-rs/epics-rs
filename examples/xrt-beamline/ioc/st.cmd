@@ -12,36 +12,36 @@ epicsEnvSet("XRT_SIZE_Y",     "128")
 epicsEnvSet("XRT_MAX_MEMORY", "50000000")
 
 # ===== Undulator motors =====
-# simMotorCreate(port, lowLimit, highLimit, pollMs)
-simMotorCreate("und_gap", 5, 200, 100)
-simMotorCreate("und_x", -5, 5, 100)
-simMotorCreate("und_z", -5, 5, 100)
+# simMotorCreate(port, lowLimit, highLimit, pollMs), limits in steps
+simMotorCreate("und_gap", 5000, 200000, 100)
+simMotorCreate("und_x", -5000, 5000, 100)
+simMotorCreate("und_z", -5000, 5000, 100)
 
 # ===== DCM motors =====
-simMotorCreate("dcm_theta", 4, 80, 100)
-simMotorCreate("dcm_theta2", -100, 100, 100)
-simMotorCreate("dcm_y", 0, 50, 100)
-simMotorCreate("dcm_chi1", -5, 5, 100)
-simMotorCreate("dcm_chi2", -5, 5, 100)
-simMotorCreate("dcm_z", -200, 200, 100)
+simMotorCreate("dcm_theta", 4000, 80000, 100)
+simMotorCreate("dcm_theta2", -100000, 100000, 100)
+simMotorCreate("dcm_y", 0, 50000, 100)
+simMotorCreate("dcm_chi1", -5000, 5000, 100)
+simMotorCreate("dcm_chi2", -5000, 5000, 100)
+simMotorCreate("dcm_z", -200000, 200000, 100)
 
 # ===== HFM motors =====
-simMotorCreate("hfm_pitch", 1, 10, 100)
-simMotorCreate("hfm_roll", -5, 5, 100)
-simMotorCreate("hfm_yaw", -5, 5, 100)
-simMotorCreate("hfm_x", -10, 10, 100)
-simMotorCreate("hfm_y", -10, 10, 100)
-simMotorCreate("hfm_z", -100, 100, 100)
+simMotorCreate("hfm_pitch", 1000, 10000, 100)
+simMotorCreate("hfm_roll", -5000, 5000, 100)
+simMotorCreate("hfm_yaw", -5000, 5000, 100)
+simMotorCreate("hfm_x", -10000, 10000, 100)
+simMotorCreate("hfm_y", -10000, 10000, 100)
+simMotorCreate("hfm_z", -100000, 100000, 100)
 simMotorCreate("hfm_rmaj", 100000, 50000000, 100)
 simMotorCreate("hfm_rmin", 10, 2000000000, 100)
 
 # ===== VFM motors =====
-simMotorCreate("vfm_pitch", 1, 10, 100)
-simMotorCreate("vfm_roll", -5, 5, 100)
-simMotorCreate("vfm_yaw", -5, 5, 100)
-simMotorCreate("vfm_x", -10, 10, 100)
-simMotorCreate("vfm_y", -10, 10, 100)
-simMotorCreate("vfm_z", -100, 100, 100)
+simMotorCreate("vfm_pitch", 1000, 10000, 100)
+simMotorCreate("vfm_roll", -5000, 5000, 100)
+simMotorCreate("vfm_yaw", -5000, 5000, 100)
+simMotorCreate("vfm_x", -10000, 10000, 100)
+simMotorCreate("vfm_y", -10000, 10000, 100)
+simMotorCreate("vfm_z", -100000, 100000, 100)
 simMotorCreate("vfm_rmaj", 100000, 50000000, 100)
 simMotorCreate("vfm_rmin", 10, 2000000000, 100)
 
@@ -99,7 +99,10 @@ epicsEnvSet("EPICS_DB_INCLUDE_PATH", "$(XRT_BEAMLINE)/db:$(ADCORE)/db")
 dbLoadRecords("$(XRT_BEAMLINE)/db/xrt_detector.template", "P=$(PREFIX),R=cam1:,IOC=bl:,BL=bl:,PORT=XRT")
 
 # Load standard areaDetector plugins
-< $(ADCORE)/ioc/commonPlugins.cmd
+# image1, which commonPlugins.cmd leaves to the st.cmd as C's does
+NDStdArraysConfigure("IMAGE1", $(QSIZE), 0, "$(PORT)", 0)
+dbLoadRecords("NDStdArrays.template", "P=$(PREFIX),R=image1:,PORT=IMAGE1,NDARRAY_PORT=$(PORT),TYPE=$(TYPE=Int8),FTVL=$(FTVL=UCHAR),NELEMENTS=$(NELEMENTS)")
+< $(ADCORE)/iocBoot/commonPlugins.cmd
 
 # Restore top-level prefix
 epicsEnvSet("PREFIX", "bl:")

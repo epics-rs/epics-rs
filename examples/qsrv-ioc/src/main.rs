@@ -36,14 +36,14 @@ use std::time::Duration;
 
 use epics_base_rs::error::CaResult;
 use epics_base_rs::server::database::PvDatabase;
-use epics_base_rs::server::ioc_builder::IocBuilder;
+use epics_base_rs::server::ioc_builder::{BareIoc, IocBuilder};
 use epics_base_rs::types::EpicsValue;
-use epics_bridge_rs::qsrv::{BridgeProvider, QsrvPvStore};
+use epics_bridge_rs::qsrv::{BridgeProvider, QsrvMount, QsrvPvStore};
 #[cfg(tokio_backend)]
 use epics_ca_rs::server::CaServer;
 #[cfg(tokio_backend)]
 use epics_pva_rs::server::PvaServer;
-use epics_pva_rs::server_native::ChannelSource;
+use epics_pva_rs::server_native::{ChannelSource, CompositeSource};
 
 #[cfg(tokio_backend)]
 #[epics_base_rs::epics_main]
@@ -62,24 +62,22 @@ async fn main() -> CaResult<()> {
     // pvxs `PickOne` semantics (config.cpp:402-408): the server-specific
     // `EPICS_PVAS_SERVER_PORT` wins over the shared `EPICS_PVA_SERVER_PORT`,
     // and `0` means "bind an ephemeral port". Not the CA rule above — pvxs has
-    // no 5000 floor and no out-of-range diagnostic.
+    // no 5000 floor and no out-of-range diagnostic. For the banner only: the
+    // server is handed `None` and reads the same variables itself.
     let pva_port: u16 = epics_pva_rs::config::env::pvas_server_port();
 
-    epics_base_rs::runtime::env::set_default("QSRV_IOC", env!("CARGO_MANIFEST_DIR"));
+    epics_base_rs::runtime::env::set_default_path("QSRV_IOC", env!("CARGO_MANIFEST_DIR"));
 
-    // Parse st.cmd or fall back to defaults
-    let (db, group_file) = if args.len() > 1 && !args[1].starts_with('-') {
-        let script = std::fs::read_to_string(&args[1])
-            .unwrap_or_else(|e| panic!("cannot read {}: {e}", args[1]));
-        parse_and_build(&script).await?
-    } else {
-        let macros: HashMap<String, String> = HashMap::new();
-        let db_path = format!("{}/db/qsrv_demo.db", env!("CARGO_MANIFEST_DIR"));
-        let ioc = IocBuilder::new().db_file(&db_path, &macros)?;
-        let (db, _) = ioc.build().await?;
-        let group_path = format!("{}/db/group.json", env!("CARGO_MANIFEST_DIR"));
-        (db, Some(group_path))
+    // With no script the demo runs its own `ioc/st.cmd`, which is where the
+    // `P` its database needs is set.
+    let script_path = match args.get(1) {
+        Some(arg) if !arg.starts_with('-') => arg.clone(),
+        _ => format!("{}/ioc/st.cmd", env!("CARGO_MANIFEST_DIR")),
     };
+    let script = std::fs::read_to_string(&script_path)
+        .unwrap_or_else(|e| panic!("cannot read {script_path}: {e}"));
+    let (ioc, group_file) = parse_and_build(&script).await?;
+    let db = Arc::clone(ioc.database());
 
     // ── QSRV provider (group PVs, PVA-only) ──
     let provider = BridgeProvider::new(db.clone());
@@ -91,36 +89,49 @@ async fn main() -> CaResult<()> {
     let provider = Arc::new(provider);
     let store = Arc::new(QsrvPvStore::new(reactor.clone(), provider));
 
-    let pv_list = store.list_pvs().await;
-    eprintln!("qsrv-ioc: dual-protocol IOC");
-    eprintln!("  CA  port: {ca_port}");
-    eprintln!("  PVA port: {pva_port}");
-    eprintln!("  PVs ({}):", pv_list.len());
-    for pv in &pv_list {
-        eprintln!("    {pv}");
-    }
-
-    // ── Simulator ──
-    spawn_simulator(&reactor, db.clone());
-
-    // ── Scan start (C iocInit owns it, the servers do not scan) ──
-    // One core-owned scan owner covers both front-ends; held to the end
-    // of main so periodic SCAN fields stay live while the IOC serves.
-    let _scan_owner = epics_base_rs::server::scan::ScanOwner::start(db.clone());
-
     // ── Build both servers from the same database ──
     // One policy cell for both protocols, so an `asInit` from the shell
     // (or a future ACF reload) gates CA and PVA together.
     let acf = epics_base_rs::server::access_security::new_acf_cell(None);
+    // Singles on `qsrvSingle`, groups on `qsrvGroup`, as every QSRV IOC
+    // mounts them.
+    let composite = CompositeSource::new();
+    QsrvMount {
+        store,
+        acf: acf.clone(),
+    }
+    .install_channel_sources(&db, &composite)
+    .map_err(epics_base_rs::error::CaError::InvalidValue)?;
+
+    let pv_list = composite.list_pvs();
+    epics_base_rs::stderr_println!("qsrv-ioc: dual-protocol IOC");
+    epics_base_rs::stderr_println!("  CA  port: {ca_port}");
+    epics_base_rs::stderr_println!("  PVA port: {pva_port}");
+    epics_base_rs::stderr_println!("  PVs ({}):", pv_list.len());
+    for pv in &pv_list {
+        epics_base_rs::stderr_println!("    {pv}");
+    }
+
+    // ── Simulator ──
+    // Off to pair with a C softIocPVA, where nothing writes the records.
+    if std::env::var_os("QSRV_IOC_NO_SIMULATOR").is_none() {
+        spawn_simulator(&reactor, db.clone());
+    }
+
+    // ── Scan start (C iocInit owns it, the servers do not scan) ──
+    // One core-owned scan owner covers both front-ends; held to the end
+    // of main so periodic SCAN fields stay live while the IOC serves.
+    let _scan_owner = ioc.run().await;
+
     let ca_server =
         CaServer::from_parts(db.clone(), ca_port, None, acf.clone(), None, None).await?;
-    let pva_server = PvaServer::from_parts(db, pva_port, acf, None, None);
+    let pva_server = PvaServer::from_parts(db, None, acf, None, None);
 
     // CA runs in background, PVA runs with iocsh (shell exit stops everything)
     let ca_handle = reactor.clone().spawn(async move { ca_server.run().await });
 
     let result = pva_server
-        .run_with_source_and_shell(store, |_shell| {
+        .run_with_source_and_shell(composite, |_shell| {
             // iocsh commands (dbl, dbgf, dbpf, etc.) are built-in
         })
         .await;
@@ -129,12 +140,22 @@ async fn main() -> CaResult<()> {
     result
 }
 
-/// Parse a simplified st.cmd — returns shared PvDatabase + optional group file.
-async fn parse_and_build(script: &str) -> CaResult<(Arc<PvDatabase>, Option<String>)> {
+/// Parse a simplified st.cmd — returns the built IOC + optional group file.
+async fn parse_and_build(script: &str) -> CaResult<(BareIoc, Option<String>)> {
     let mut macros: HashMap<String, String> = HashMap::new();
     // Seed QSRV_IOC so $(QSRV_IOC) expands in st.cmd
     macros.insert("QSRV_IOC".into(), env!("CARGO_MANIFEST_DIR").into());
-    let mut ioc = IocBuilder::new();
+    // A st.cmd goes on past a failed `dbLoadRecords`, unlike `softIoc -d`.
+    // softIocPVX's two link sets: dbCa, which every C IOC links, and pvxs's
+    // `lsetPVX`. Without them a bare remote link or a `pva://` one is dead.
+    let reactor =
+        epics_base_rs::runtime::task::Reactor::current().expect("main runs on the IOC's reactor");
+    let mut ioc = IocBuilder::new()
+        .boot_past_failed_loads()
+        .register_link_type("ca", move |db| {
+            epics_ca_rs::calink::calink_link_set_install(db, reactor)
+        })
+        .register_link_type("pva", epics_bridge_rs::qsrv::pvalink_link_set_install);
     let mut group_file: Option<String> = None;
 
     for raw_line in script.lines() {
@@ -173,8 +194,7 @@ async fn parse_and_build(script: &str) -> CaResult<(Arc<PvDatabase>, Option<Stri
         }
     }
 
-    let (db, _) = ioc.build().await?;
-    Ok((db, group_file))
+    Ok((ioc.build_ioc().await?, group_file))
 }
 
 fn spawn_simulator(reactor: &epics_base_rs::runtime::task::Reactor, db: Arc<PvDatabase>) {
@@ -244,10 +264,9 @@ fn expand_macros(s: &str, macros: &HashMap<String, String>) -> String {
 /// backend.
 #[cfg(exec_backend)]
 fn main() -> CaResult<()> {
-    eprintln!(
+    epics_base_rs::runtime::task::refuse_backend(
         "qsrv-ioc serves CA and PVA through the async servers; this build \
          selects the reactor-free backend (EPICS_RS_BUILD_EXEC_BACKEND=thread), \
-         which does not have them."
-    );
-    Ok(())
+         which does not have them.",
+    )
 }

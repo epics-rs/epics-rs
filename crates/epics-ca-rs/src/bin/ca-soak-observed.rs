@@ -8,7 +8,7 @@
 
 #[cfg(not(feature = "observability"))]
 fn main() {
-    eprintln!("ca-soak-observed requires --features observability");
+    epics_libcom_rs::stderr_println!("ca-soak-observed requires --features observability");
     std::process::exit(2);
 }
 

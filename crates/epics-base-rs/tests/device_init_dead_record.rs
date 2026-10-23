@@ -30,6 +30,8 @@
 //! record kept processing with PACT=0 and drivers worked around it with an
 //! inert `read()`.
 
+mod probe_rows;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -81,17 +83,20 @@ async fn build() -> (Arc<PvDatabase>, Arc<AtomicU32>, Arc<AtomicU32>) {
     let live_reads = Arc::new(AtomicU32::new(0));
     let (d, l) = (Arc::clone(&dead_reads), Arc::clone(&live_reads));
     let (db, _) = IocBuilder::new()
-        .register_dynamic_device_support(move |ctx: &DeviceSupportContext| match ctx.dtyp {
-            "probeDead" => Some(Box::new(Probe {
-                outcome: DeviceInitOutcome::dead(),
-                reads: Arc::clone(&d),
-            }) as Box<dyn DeviceSupport>),
-            "probeLive" => Some(Box::new(Probe {
-                outcome: DeviceInitOutcome::Live,
-                reads: Arc::clone(&l),
-            }) as Box<dyn DeviceSupport>),
-            _ => None,
-        })
+        .register_dynamic_device_support(
+            &probe_rows::devices(&["ai"]),
+            move |ctx: &DeviceSupportContext| match ctx.dtyp {
+                "probeDead" => Some(Box::new(Probe {
+                    outcome: DeviceInitOutcome::dead(),
+                    reads: Arc::clone(&d),
+                }) as Box<dyn DeviceSupport>),
+                "probeLive" => Some(Box::new(Probe {
+                    outcome: DeviceInitOutcome::ok(),
+                    reads: Arc::clone(&l),
+                }) as Box<dyn DeviceSupport>),
+                _ => None,
+            },
+        )
         .db_string(
             &format!(
                 r#"record(ai, "{DEAD}") {{ field(DTYP, "probeDead") }}

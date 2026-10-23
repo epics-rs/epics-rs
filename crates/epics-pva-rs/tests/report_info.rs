@@ -19,6 +19,7 @@
 #![allow(clippy::manual_async_fn)]
 #![cfg(feature = "client")]
 
+use epics_base_rs::types::RecordName;
 use epics_pva_rs::server_native::MonitorStream;
 use std::sync::Arc;
 use std::time::Duration;
@@ -35,25 +36,25 @@ const INFO: &str = "owner=test-source pid=4242";
 struct InfoSource;
 
 impl ChannelSource for InfoSource {
-    fn list_pvs(&self) -> impl std::future::Future<Output = Vec<String>> + Send {
-        async { vec!["dut".into()] }
+    fn list_pvs(&self) -> Vec<epics_base_rs::types::RecordName> {
+        vec!["dut".into()]
     }
-    fn has_pv(&self, n: &str) -> impl std::future::Future<Output = bool> + Send {
-        let n = n.to_string();
+    fn has_pv(&self, n: &[u8]) -> impl std::future::Future<Output = bool> + Send {
+        let n = RecordName::from(n);
         async move { n == "dut" }
     }
     fn get_introspection(
         &self,
-        _: &str,
+        _: &[u8],
     ) -> impl std::future::Future<Output = Option<FieldDesc>> + Send {
         async {
             Some(FieldDesc::Structure {
                 struct_id: "epics:nt/NTScalar:1.0".into(),
-                fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Int))],
+                fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Int))].into(),
             })
         }
     }
-    fn get_value(&self, _: &str) -> impl std::future::Future<Output = Option<PvField>> + Send {
+    fn get_value(&self, _: &[u8]) -> impl std::future::Future<Output = Option<PvField>> + Send {
         async {
             let mut s = PvStructure::new("epics:nt/NTScalar:1.0");
             s.fields
@@ -63,27 +64,27 @@ impl ChannelSource for InfoSource {
     }
     fn put_value(
         &self,
-        _: &str,
+        _: &[u8],
         _: PvField,
     ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
         async { Err("read-only".into()) }
     }
-    fn is_writable(&self, _: &str) -> impl std::future::Future<Output = bool> + Send {
+    fn is_writable(&self, _: &[u8]) -> impl std::future::Future<Output = bool> + Send {
         async { false }
     }
     fn subscribe(
         &self,
-        _: &str,
+        _: &[u8],
     ) -> impl std::future::Future<Output = Option<MonitorStream<PvField>>> + Send {
         async { None }
     }
     /// The hook under test: attach per-channel info for the served PV.
     fn channel_report_info(
         &self,
-        name: &str,
+        name: &[u8],
         _ctx: epics_pva_rs::server_native::ChannelContext,
     ) -> impl std::future::Future<Output = Option<String>> + Send {
-        let attach = name == "dut";
+        let attach = name == b"dut";
         async move { attach.then(|| INFO.to_string()) }
     }
 }
@@ -135,25 +136,25 @@ async fn default_source_leaves_report_info_none() {
     #[derive(Clone)]
     struct PlainSource;
     impl ChannelSource for PlainSource {
-        fn list_pvs(&self) -> impl std::future::Future<Output = Vec<String>> + Send {
-            async { vec!["dut".into()] }
+        fn list_pvs(&self) -> Vec<epics_base_rs::types::RecordName> {
+            vec!["dut".into()]
         }
-        fn has_pv(&self, n: &str) -> impl std::future::Future<Output = bool> + Send {
-            let n = n.to_string();
+        fn has_pv(&self, n: &[u8]) -> impl std::future::Future<Output = bool> + Send {
+            let n = RecordName::from(n);
             async move { n == "dut" }
         }
         fn get_introspection(
             &self,
-            _: &str,
+            _: &[u8],
         ) -> impl std::future::Future<Output = Option<FieldDesc>> + Send {
             async {
                 Some(FieldDesc::Structure {
                     struct_id: "epics:nt/NTScalar:1.0".into(),
-                    fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Int))],
+                    fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Int))].into(),
                 })
             }
         }
-        fn get_value(&self, _: &str) -> impl std::future::Future<Output = Option<PvField>> + Send {
+        fn get_value(&self, _: &[u8]) -> impl std::future::Future<Output = Option<PvField>> + Send {
             async {
                 let mut s = PvStructure::new("epics:nt/NTScalar:1.0");
                 s.fields
@@ -163,17 +164,17 @@ async fn default_source_leaves_report_info_none() {
         }
         fn put_value(
             &self,
-            _: &str,
+            _: &[u8],
             _: PvField,
         ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
             async { Err("read-only".into()) }
         }
-        fn is_writable(&self, _: &str) -> impl std::future::Future<Output = bool> + Send {
+        fn is_writable(&self, _: &[u8]) -> impl std::future::Future<Output = bool> + Send {
             async { false }
         }
         fn subscribe(
             &self,
-            _: &str,
+            _: &[u8],
         ) -> impl std::future::Future<Output = Option<MonitorStream<PvField>>> + Send {
             async { None }
         }

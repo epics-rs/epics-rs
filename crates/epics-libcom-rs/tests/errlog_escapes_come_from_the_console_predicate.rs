@@ -25,9 +25,11 @@
 use std::path::{Path, PathBuf};
 
 /// The errlog entry points whose argument is the console's bytes.
-const ENTRY_POINTS: [&str; 4] = [
+const ENTRY_POINTS: [&str; 6] = [
     "errlog_printf(",
+    "errlog_vprintf(",
     "errlog_sev_printf(",
+    "errlog_sev_vprintf(",
     "errlog_message(",
     "errlog_printf_no_console(",
 ];

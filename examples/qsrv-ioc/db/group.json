@@ -19,7 +19,7 @@
         },
         "version": {
             "+type": "const",
-            "+value": 1
+            "+const": 1
         }
     }
 }

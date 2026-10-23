@@ -1,0 +1,7 @@
+$ snc syncq_elem_twice.st
+syncq_elem_twice.st:8: warning: 'v[0]' already sync'd
+syncq_elem_twice.st:8: warning: 'v[0]' already syncq'd
+$ snc +W syncq_elem_twice.st
+syncq_elem_twice.st:8: warning: 'v[0]' already sync'd
+syncq_elem_twice.st:8: warning: 'v[0]' already syncq'd
+$ snc -w syncq_elem_twice.st

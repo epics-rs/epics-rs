@@ -14,10 +14,10 @@
 //! record/alias/PV population, which is a number no C `dbsr` has ever shown.
 //!
 //! Deliberately not ported, because nothing in this workspace calls them:
-//! `dbUnregisterServer`, `dbServerClient` and `dbServerStats` (C's iocStats
-//! hook), and the `initialized` phase with its `dbInitServers` transition —
-//! the port's servers are stood up by the protocol runner, which has no
-//! separate "built but not started" step for `dbInitServers` to mark. The
+//! `dbUnregisterServer` and `dbServerStats` (C's iocStats hook), and the
+//! `initialized` phase. `dbInitServers`'s bind is
+//! [`crate::server::ioc_app::IocApplication::register_server_init`], run at
+//! the same point of `iocBuild`; nothing reads the phase it would mark. The
 //! `paused` phase IS ported: `iocPause` reaches it (see
 //! [`crate::server::ioc_app::ioc_pause`]), so a `Server state: paused` line
 //! now names a phase this IOC can be in.
@@ -33,6 +33,10 @@ use std::sync::{Mutex, OnceLock};
 /// installed on the thread.
 pub type ReportFn = Box<dyn Fn(u32, &dyn Fn(&str)) + Send + Sync>;
 
+/// C `dbServer.client` (`dbServer.h:74`): the client whose request the
+/// calling thread is running, named as the layer names it, or `None`.
+pub type ClientFn = fn() -> Option<String>;
+
 /// One registered protocol server layer — C `struct dbServer`
 /// (`dbServer.h:73-113`), less the members no caller here uses.
 pub struct DbServer {
@@ -41,6 +45,8 @@ pub struct DbServer {
     pub name: &'static str,
     /// C `dbServer.report`, called by `dbsr` only while the set is running.
     pub report: Option<ReportFn>,
+    /// C `dbServer.client`, asked by [`db_server_client`].
+    pub client: Option<ClientFn>,
 }
 
 /// The phase the whole server set is in — C's `state` and the `stateNames[]`
@@ -88,7 +94,7 @@ fn registry() -> &'static Mutex<Registry> {
 /// character after is the end or a space. So `EPICS_IOC_IGNORE_SERVERS=qsrv2`
 /// does not suppress `qsrv`, and `...=rsrv qsrv2` suppresses both.
 fn ignored_by_env(name: &str) -> bool {
-    let Ok(ignore) = std::env::var("EPICS_IOC_IGNORE_SERVERS") else {
+    let Some(ignore) = crate::runtime::env::get_lossy("EPICS_IOC_IGNORE_SERVERS") else {
         return false;
     };
     ignore.split(' ').any(|tok| tok == name)
@@ -112,18 +118,18 @@ fn admit(reg: &mut Registry, server: DbServer) -> bool {
         return false;
     }
     if server.name.contains(' ') {
-        eprintln!("dbRegisterServer: Bad server name '{}'", server.name);
+        crate::stderr_println!("dbRegisterServer: Bad server name '{}'", server.name);
         return false;
     }
     if ignored_by_env(server.name) {
-        eprintln!(
+        crate::stderr_println!(
             "dbRegisterServer: Ignoring '{}', per environment",
             server.name
         );
         return true;
     }
     if reg.servers.iter().any(|s| s.name == server.name) {
-        eprintln!("dbRegisterServer: Can't redefine '{}'.", server.name);
+        crate::stderr_println!("dbRegisterServer: Can't redefine '{}'.", server.name);
         return false;
     }
     reg.servers.push(server);
@@ -148,7 +154,8 @@ pub fn db_stop_servers() {
     registry().lock().unwrap().state = ServerState::Stopped;
 }
 
-/// How many times a protocol server layer has begun serving in this process.
+/// How many times a protocol server layer has begun serving in this process,
+/// in all and per layer.
 ///
 /// C needs no such counter. `dbInitServers()` binds every registered layer in
 /// `iocBuild` (`iocInit.c:222`) and `dbRunServers()` starts them in `iocRun`
@@ -156,55 +163,121 @@ pub fn db_stop_servers() {
 /// `iocInit()` is done the sockets are up and RSRV's `casr` is on the command
 /// table — the next line of the startup script cannot see a half-started IOC.
 /// The port hands that work to a protocol runner the lifecycle SPAWNS, so the
-/// same proof has to travel back: [`crate::server::ioc_app`] samples this
-/// counter before it starts the runner and does not let `iocInit` return until
-/// the runner has moved it.
+/// same proof has to travel back: [`crate::server::ioc_app`] samples these
+/// counters before it starts the runner and does not let `iocInit` return until
+/// the runner has moved them.
 ///
-/// A counter and not a flag, so a second IOC in one process waits for its own
-/// layer rather than reading the previous one's announcement.
-fn serving() -> &'static (std::sync::atomic::AtomicU64, tokio::sync::Notify) {
-    static SERVING: OnceLock<(std::sync::atomic::AtomicU64, tokio::sync::Notify)> = OnceLock::new();
-    SERVING.get_or_init(|| {
-        (
-            std::sync::atomic::AtomicU64::new(0),
-            tokio::sync::Notify::new(),
-        )
+/// Counters and not flags, so a second IOC in one process waits for its own
+/// layers rather than reading the previous one's announcements.
+#[derive(Default)]
+struct Counts {
+    any: u64,
+    layers: Vec<(&'static str, u64)>,
+}
+
+impl Counts {
+    fn layer(&self, name: &str) -> u64 {
+        self.layers
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map_or(0, |&(_, count)| count)
+    }
+}
+
+fn serving() -> &'static (Mutex<Counts>, tokio::sync::Notify) {
+    static SERVING: OnceLock<(Mutex<Counts>, tokio::sync::Notify)> = OnceLock::new();
+    SERVING.get_or_init(Default::default)
+}
+
+/// The counters to wait past: one per layer in `layers`, and the count of
+/// every layer's. Sample it BEFORE the runner is started.
+pub struct ServingMark(Counts);
+
+/// Sample the counters [`serving_after`] waits past, for `layers`.
+pub fn serving_mark(layers: impl IntoIterator<Item = &'static str>) -> ServingMark {
+    let now = serving().0.lock().unwrap();
+    ServingMark(Counts {
+        any: now.any,
+        layers: layers
+            .into_iter()
+            .map(|name| (name, now.layer(name)))
+            .collect(),
     })
 }
 
-/// The generation to wait past — sample it BEFORE the runner is started.
-pub fn serving_generation() -> u64 {
-    serving().0.load(std::sync::atomic::Ordering::Acquire)
-}
-
-/// Announce that this layer has bound, registered and begun serving: the
-/// port's stand-in for `rsrv_run` having returned (`caservertask.c:766-771`).
+/// Announce that `layer` has bound, registered and begun serving: the port's
+/// stand-in for `rsrv_run` having returned (`caservertask.c:766-771`).
 ///
 /// **The single owner is each protocol server's serve entry** — the one
 /// function that starts accepting, `CaServer::run` and the PVA server's
-/// `run_with_source_inner` bind callback. Announcing there and nowhere else is
-/// what keeps "a layer is serving" and "the generation moved" from coming
+/// `run_with_source_inner` start callback. Announcing there and nowhere else is
+/// what keeps "a layer is serving" and "its counter moved" from coming
 /// apart: a caller cannot start a server by another route, because there is no
-/// other route to accepting a client.
-pub fn announce_serving() {
-    serving()
-        .0
-        .fetch_add(1, std::sync::atomic::Ordering::Release);
+/// other route to accepting a client. The one other announcement is that same
+/// entry's when pvxs's registrar bound no server: the layer's `iocRun` work is
+/// then done with nothing to serve, as pvxs's start hook returns.
+pub fn announce_serving(layer: &'static str) {
+    {
+        let mut now = serving().0.lock().unwrap();
+        now.any += 1;
+        match now.layers.iter_mut().find(|(n, _)| *n == layer) {
+            Some((_, count)) => *count += 1,
+            None => now.layers.push((layer, 1)),
+        }
+    }
     serving().1.notify_waiters();
 }
 
-/// Resolve once [`announce_serving`] has been called since `generation` was
-/// sampled. Returns immediately if it already has.
-pub async fn serving_after(generation: u64) {
+/// Resolve once some layer, and every layer `mark` names, has called
+/// [`announce_serving`] since `mark` was sampled. Returns immediately if they
+/// already have.
+pub async fn serving_after(ServingMark(mark): &ServingMark) {
     loop {
-        // Registered before the load, so an announcement between the two is
+        // Registered before the read, so an announcement between the two is
         // delivered rather than missed.
         let notified = serving().1.notified();
-        if serving_generation() != generation {
-            return;
+        {
+            let now = serving().0.lock().unwrap();
+            if now.any != mark.any
+                && (mark.layers.iter()).all(|&(name, count)| now.layer(name) != count)
+            {
+                return;
+            }
         }
         notified.await;
     }
+}
+
+/// Until `mark` is passed (`None`; see [`serving_after`]), or `runner` ends
+/// first (its output). A shell started beside a runner waits here, so its
+/// first prompt comes after the bind as C's `iocsh` after `iocInit`.
+pub async fn serving_or_ended<F: std::future::Future + Unpin>(
+    mark: &ServingMark,
+    runner: &mut F,
+) -> Option<F::Output> {
+    tokio::select! {
+        biased;
+        out = runner => Some(out),
+        () = serving_after(mark) => None,
+    }
+}
+
+/// C `dbServerClient` (`dbServer.c:114-128`): the first registered layer's
+/// name for the client the calling thread serves, asked only while the set is
+/// running.
+pub fn db_server_client() -> Option<String> {
+    client_of(&registry().lock().unwrap())
+}
+
+/// [`db_server_client`] without the lock.
+fn client_of(reg: &Registry) -> Option<String> {
+    if reg.state != ServerState::Running {
+        return None;
+    }
+    reg.servers
+        .iter()
+        .filter_map(|s| s.client)
+        .find_map(|client| client())
 }
 
 /// C `dbsr` (`dbServer.c:95-112`), verbatim in shape: the no-layers line and
@@ -278,6 +351,7 @@ mod tests {
                 report: Some(Box::new(|_level, o: &dyn Fn(&str)| {
                     o("Channel Access Server");
                 })),
+                client: None,
             }],
             state: ServerState::Paused,
         };
@@ -305,6 +379,7 @@ mod tests {
                         o("    detail");
                     }
                 })),
+                client: None,
             }],
             state: ServerState::Registering,
         };
@@ -341,6 +416,28 @@ mod tests {
         );
     }
 
+    /// The first layer that names a client wins, and none is asked outside
+    /// the running phase — C `dbServer.c:118-127`.
+    #[test]
+    fn the_client_is_the_first_layer_s_answer_while_running() {
+        let layer = |name, client: ClientFn| DbServer {
+            name,
+            report: None,
+            client: Some(client),
+        };
+        let mut reg = Registry {
+            servers: vec![
+                layer("rsrv", || None),
+                layer("qsrv2", || Some("q2:a@p".into())),
+                layer("other", || Some("other".into())),
+            ],
+            state: ServerState::Paused,
+        };
+        assert_eq!(client_of(&reg), None);
+        reg.state = ServerState::Running;
+        assert_eq!(client_of(&reg).as_deref(), Some("q2:a@p"));
+    }
+
     /// A name with a space is refused, as is a duplicate — and the phase gate
     /// closes registration once the servers are running.
     #[test]
@@ -353,7 +450,8 @@ mod tests {
             &mut reg,
             DbServer {
                 name: "rsrv",
-                report: None
+                report: None,
+                client: None
             }
         ));
         assert!(
@@ -361,7 +459,8 @@ mod tests {
                 &mut reg,
                 DbServer {
                     name: "rsrv",
-                    report: None
+                    report: None,
+                    client: None
                 }
             ),
             "a duplicate name is refused"
@@ -371,7 +470,8 @@ mod tests {
                 &mut reg,
                 DbServer {
                     name: "two words",
-                    report: None
+                    report: None,
+                    client: None
                 }
             ),
             "a name with a space is refused"
@@ -382,10 +482,30 @@ mod tests {
                 &mut reg,
                 DbServer {
                     name: "qsrv2",
-                    report: None
+                    report: None,
+                    client: None
                 }
             ),
             "registration closes once the set is running"
         );
+    }
+
+    /// Passed only once every named layer has announced since the mark, so
+    /// one layer up — or the other's announcement from before it — is not
+    /// enough.
+    #[test]
+    fn a_mark_waits_for_every_layer_it_names() {
+        let passed = |mark: &ServingMark| {
+            let wait = std::pin::pin!(serving_after(mark));
+            wait.poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
+                .is_ready()
+        };
+        announce_serving("mark-b");
+        let mark = serving_mark(["mark-a", "mark-b"]);
+        assert!(!passed(&mark));
+        announce_serving("mark-a");
+        assert!(!passed(&mark), "mark-b announced before the mark");
+        announce_serving("mark-b");
+        assert!(passed(&mark));
     }
 }

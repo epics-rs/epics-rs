@@ -1,0 +1,31 @@
+[package]
+name = "epics-stream-rs"
+version.workspace = true
+edition.workspace = true
+description = "Rust port of PSI StreamDevice: protocol parser, buffers and the bus/converter/core boundaries"
+# A port of StreamDevice, which is LGPL-3.0-or-later (LICENSE.LESSER,
+# with the GPL text it extends in LICENSE).
+license = "LGPL-3.0-or-later"
+authors.workspace = true
+repository.workspace = true
+
+# Library import name kept as `stream_rs` so consumers continue to write
+# `use stream_rs::...` even though the crates.io package is
+# `epics-stream-rs` (the bare `stream-rs` name is taken on crates.io by an
+# unrelated project).
+[lib]
+name = "stream_rs"
+path = "src/lib.rs"
+
+[dependencies]
+asyn-rs = { workspace = true }
+chrono = "0.4"
+epics-base-rs = { workspace = true }
+epics-libcom-rs = { workspace = true }
+libc = "0.2"
+parking_lot = "0.12"
+
+[dev-dependencies]
+# The C PCRE, the oracle the tests/pcre rigs hold crate::pcre to.
+stream-pcre-sys = { workspace = true }
+tempfile = "3"

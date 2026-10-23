@@ -1,0 +1,111 @@
+rec0: ADAM_4015.proto queryAll(1,2,3,4,5,6,7,8,9) P
+queryAll {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 1000; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "#1";
+    in ">%(2:all_rtd0)f%(2:all_rtd1)f%(2:all_rtd2)f%(2:all_rtd3)f%(2:all_rtd4)f%(2:all_rtd5)f";
+}
+rec1: ADAM_4015.proto queryChan(1,2,3,4,5,6,7,8,9) P
+queryChan {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 1000; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "#1";
+    in ">%f";
+}
+rec2: ADAM_4015.proto queryModel(1,2,3,4,5,6,7,8,9) P
+queryModel {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 1000; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "$1M";
+    in "!1%s";
+}
+rec3: ADAM_4015.proto queryFW(1,2,3,4,5,6,7,8,9) P
+queryFW {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 1000; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "$1F";
+    in "!1%#s";
+}
+rec4: ADAM_4015.proto queryBaud(1,2,3,4,5,6,7,8,9) P
+queryBaud {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 1000; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "$12";
+    in "!1%*2s%{03|04|05|06|07|08}%*2s";
+}
+rec5: ADAM_4015.proto queryChanType(1,2,3,4,5,6,7,8,9) P
+queryChanType {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 1000; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "$18C2";
+    in "!1C2R%2s";
+}
+rec6: ADAM_4015.proto setChanType(1,2,3,4,5,6,7,8,9) P
+setChanType {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 1000; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "$17C2R%2s";
+}

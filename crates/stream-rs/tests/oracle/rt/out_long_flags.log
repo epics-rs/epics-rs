@@ -1,0 +1,14 @@
+StreamCore::startProtocol(rec, startMode=StartNormal)
+StreamCore::evalCommand(rec): activeCommand = out
+StreamCore::formatOutput(rec): format = %+05d
+StreamCore::printValue(rec, %d, -7 = 0xfffffffffffffff9): "-0007"
+StreamCore::formatOutput(rec): format = %-4d
+StreamCore::printValue(rec, %d, -7 = 0xfffffffffffffff9): "-0007|-7  "
+StreamCore::formatOutput(rec): format = %x
+StreamCore::printValue(rec, %x, 4294967289 = 0xfffffff9): "-0007|-7  |fffffff9"
+StreamCore::evalOut: outputLine = "-0007|-7  |fffffff9<0d><0a>"
+StreamCore::evalOut(rec): lockRequest(5000)
+StreamCore::lockCallback(rec, StreamIoSuccess)
+StreamCore::writeCallback(rec, StreamIoSuccess)
+StreamCore::evalCommand(rec): activeCommand = end
+StreamCore::finishProtocol(rec, Success) bus owner

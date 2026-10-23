@@ -223,7 +223,7 @@ record(waveform, "REG:P:WF") {
 # regression is a secondary/record-specific menu field losing its DBR_ENUM
 # typing or its choice labels.
 record(dfanout, "REG:R:DF") {
-    field(DESC, "record-specific DBF_MENU (SELM) as DBR_ENUM")
+    field(DESC, "record DBF_MENU (SELM) as DBR_ENUM")
     field(SELM, "2")
 }
 
@@ -244,7 +244,7 @@ record(mbbo, "REG:L:MBBO") {
 # 0. UTAG is set in the db here (0x12345678); the low 32 bits land in the int32
 # userTag wire field. CA has no userTag wire slot, so this is PVA-only.
 record(ai, "REG:Q:AI") {
-    field(DESC, "record UTAG served as PVA timeStamp.userTag")
+    field(DESC, "record UTAG as PVA timeStamp.userTag")
     field(VAL,  "1")
     field(PINI, "YES")
     field(UTAG, "305419896")
@@ -254,11 +254,11 @@ record(ai, "REG:Q:AI") {
 # The v0.20.0 regression: a caput to a SCAN=Passive motor's VAL did not move
 # it (the I/O-Intr-vs-Passive dbPutField processing gate). Pins "caput to a
 # Passive motor VAL actually drives the move; RBV converges, DMOV cycles".
-# Device support (sim driver + poll loop) is supplied by the harness, keyed on
-# DTYP "simMotor".
+# The harness creates the sim axis at port $(MPORT), address 0.
 record(motor, "REG:D:MTR") {
     field(DESC, "sim motor move-on-caput")
-    field(DTYP, "simMotor")
+    field(DTYP, "asynMotor")
+    field(OUT, "@asyn($(MPORT=REG_MTR),0)")
     field(SCAN, "Passive")
     field(VELO, "20.0")
     field(ACCL, "0.2")

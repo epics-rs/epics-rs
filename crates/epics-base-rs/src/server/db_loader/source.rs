@@ -7,10 +7,10 @@
 //! diagnostic can name the file, the line and the source text while the
 //! call site that raised it names none of them.
 //!
-//! This port has no line-at-a-time lexer: `expand_includes` flattens the
-//! whole include tree into one string before the parser sees a character,
-//! so a line number in that text is NOT a line number in any file the
-//! operator wrote. [`DbSource`] is what makes it one again — the flattened
+//! This port's parser reads one flattened text, which the reader
+//! (`reader.rs`) grows a line at a time from the whole include tree, so a
+//! line number in that text is NOT a line number in any file the operator
+//! wrote. [`DbSource`] is what makes it one again — the flattened
 //! text plus, per flattened line, the include stack that was open at it.
 //! Without the map the port could still print *a* number, and printing the
 //! wrong line is worse for the operator than printing none.
@@ -57,13 +57,33 @@ pub struct DbSource {
     lines: Vec<String>,
     /// The stack open at each line, innermost first.
     frames: Vec<Arc<[DbIncludeFrame]>>,
+    /// Each record body left open across a line end, as the lines of its
+    /// `record` keyword and its closing `}`.
+    open_bodies: Vec<(u32, u32)>,
 }
 
 impl DbSource {
     /// Build from the per-line pairs the include expander emits.
     pub fn new(lines: Vec<String>, frames: Vec<Arc<[DbIncludeFrame]>>) -> Self {
         debug_assert_eq!(lines.len(), frames.len());
-        Self { lines, frames }
+        Self {
+            lines,
+            frames,
+            open_bodies: Vec::new(),
+        }
+    }
+
+    pub(super) fn body_spans(&mut self, start: u32, end: u32) {
+        if start < end {
+            self.open_bodies.push((start, end));
+        }
+    }
+
+    /// Whether the grammar is inside a record body at the end of `line`.
+    pub(super) fn body_open_after(&self, line: u32) -> bool {
+        self.open_bodies
+            .iter()
+            .any(|&(start, end)| start <= line && line < end)
     }
 
     /// A single un-included file: every line carries the same one frame,
@@ -79,7 +99,7 @@ impl DbSource {
                 }])
             })
             .collect();
-        Self { lines, frames }
+        Self::new(lines, frames)
     }
 
     /// The stack and the source text at a 1-based flattened line, or
@@ -92,6 +112,16 @@ impl DbSource {
 
     pub fn is_empty(&self) -> bool {
         self.lines.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.lines.len()
+    }
+
+    /// Append the next line the reader handed the parser.
+    pub(super) fn push(&mut self, text: String, frames: Arc<[DbIncludeFrame]>) {
+        self.lines.push(text);
+        self.frames.push(frames);
     }
 }
 

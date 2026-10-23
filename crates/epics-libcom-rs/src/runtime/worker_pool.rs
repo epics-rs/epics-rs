@@ -93,8 +93,10 @@ use std::sync::mpsc::{Receiver, Sender, SyncSender, channel, sync_channel};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::thread::{self, JoinHandle};
 
-use crate::runtime::log::{ErrlogSevEnum, errlog_sev_printf};
-use crate::runtime::task::{InheritedRuntime, StackSizeClass, ThreadPriority, enter_ioc_thread};
+use crate::runtime::log::{ErrlogSevEnum, errlog_sev_vprintf};
+use crate::runtime::task::{
+    InheritedRuntime, StackSizeClass, StackSpec, ThreadPriority, enter_ioc_thread,
+};
 
 /// One member of a worker set: how its thread is named, sized and banded.
 #[derive(Clone, Copy, Debug)]
@@ -348,9 +350,9 @@ impl Worker {
             // The joiner learns *that* the job did not run; only here is the
             // *reason* known, and a joiner that reports its own loss ("the pump
             // panicked") would otherwise name the wrong cause.
-            errlog_sev_printf(
+            errlog_sev_vprintf(
                 ErrlogSevEnum::Major,
-                &format!(
+                format_args!(
                     "{} worker pool: set {} took no job — {NEVER_DISPATCHED}.\n",
                     self.inner.name_prefix, self.set.index
                 ),
@@ -381,9 +383,9 @@ impl Worker {
             finish_job(&self.inner, &self.set);
             // Nobody joins a detached job, so `errlog` is the only place this
             // can be told; silence here is the loss this pool exists to stop.
-            errlog_sev_printf(
+            errlog_sev_vprintf(
                 ErrlogSevEnum::Major,
-                &format!("{label}: {NEVER_DISPATCHED}. This connection is being torn down.\n"),
+                format_args!("{label}: {NEVER_DISPATCHED}. This connection is being torn down.\n"),
             );
         }
     }
@@ -420,9 +422,9 @@ impl Job {
 /// lost pump: through `errlog`, which reaches the console whatever the log
 /// configuration is — including an RTEMS console with the in-tree subscriber.
 fn announce_panic(label: &str) {
-    errlog_sev_printf(
+    errlog_sev_vprintf(
         ErrlogSevEnum::Major,
-        &format!(
+        format_args!(
             "{label}: the connection thread panicked; this connection is being \
              torn down. Other connections are unaffected.\n"
         ),
@@ -432,9 +434,9 @@ fn announce_panic(label: &str) {
 /// Announce a worker thread that left without being asked to. One record per
 /// set, on the first death, naming what the pool lost.
 fn announce_worker_death(prefix: &str, index: usize, roles: usize) {
-    errlog_sev_printf(
+    errlog_sev_vprintf(
         ErrlogSevEnum::Major,
-        &format!(
+        format_args!(
             "{prefix} worker pool: a thread of set {index} exited unexpectedly. \
              The set's {roles} threads are being retired and its slot returned; \
              other connections are unaffected.\n"
@@ -740,9 +742,9 @@ fn resolve_reservation_budget(raw: Option<&str>, default: usize) -> usize {
     match raw.trim().parse::<usize>() {
         Ok(mb) if mb > 0 => mb.saturating_mul(1 << 20),
         _ => {
-            errlog_sev_printf(
+            errlog_sev_vprintf(
                 ErrlogSevEnum::Minor,
-                &format!(
+                format_args!(
                     "{POOL_RESERVATION_ENV}={raw:?} is not a positive whole number of MiB; \
                      keeping the built-in worker-pool reservation budget\n"
                 ),
@@ -1023,7 +1025,7 @@ fn decide_reservation_budget(
 /// Say what the boot-time check concluded, and hand back the budget it adopts.
 fn announce_reservation_budget(verdict: BudgetVerdict) -> usize {
     if let Some((severity, message)) = verdict.notice() {
-        errlog_sev_printf(severity, &format!("{message}\n"));
+        errlog_sev_vprintf(severity, format_args!("{message}\n"));
     }
     verdict.budget()
 }
@@ -1122,8 +1124,10 @@ static PROCESS_RESERVATION: LazyLock<Reservation> = LazyLock::new(|| {
 
 /// What one thread of `stack` reserves — the whole per-thread formula, in one
 /// place, so a pool worker and a fixed IOC thread cost the account the same.
-fn thread_reservation_bytes(stack: StackSizeClass) -> usize {
-    stack.bytes() + per_thread_overhead(ThreadMemoryTarget::current()) + PER_THREAD_OBJECT_ARENA
+fn thread_reservation_bytes(stack: impl Into<StackSpec>) -> usize {
+    stack.into().bytes()
+        + per_thread_overhead(ThreadMemoryTarget::current())
+        + PER_THREAD_OBJECT_ARENA
 }
 
 /// What one thread of `role` reserves.
@@ -1229,7 +1233,7 @@ pub struct ThreadCharge {
 impl ThreadCharge {
     /// Charge one fixed thread of `stack`. Never refuses — see
     /// `Reservation::charge`.
-    pub fn fixed(stack: StackSizeClass) -> Self {
+    pub fn fixed(stack: impl Into<StackSpec>) -> Self {
         let bytes = thread_reservation_bytes(stack);
         PROCESS_RESERVATION.charge(bytes);
         Self { bytes }
@@ -2629,6 +2633,32 @@ mod tests {
             before,
             "and must be back where it started once the thread is gone"
         );
+    }
+
+    /// A sized thread charges the bytes its spec asks for, not its declared
+    /// class: 500000 against Small's 512 KiB tells the two apart.
+    #[test]
+    fn a_sized_thread_charges_its_spec_not_its_class() {
+        use crate::runtime::task::{MandatoryThread, StackSpec};
+
+        let before = PROCESS_RESERVATION.held();
+        let spec = StackSpec::Bytes(500_000);
+        let expect = thread_reservation_bytes(spec);
+        assert_ne!(expect, thread_reservation_bytes(StackSizeClass::Small));
+        let (tx, rx) = channel();
+        MandatoryThread::new("charged-sized", ThreadPriority::Low, StackSizeClass::Small)
+            .try_spawn_sized(spec, move || {
+                let _ = tx.send(PROCESS_RESERVATION.held());
+            })
+            .expect("the host can create one thread")
+            .join()
+            .expect("the thread ends cleanly");
+        assert_eq!(
+            rx.recv().expect("the thread read the account"),
+            before + expect,
+            "a Bytes spawn charges its bytes"
+        );
+        assert_eq!(PROCESS_RESERVATION.held(), before);
     }
 
     /// # Invariant

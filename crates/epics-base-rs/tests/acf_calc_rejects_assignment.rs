@@ -40,7 +40,7 @@ fn an_acf_rule_calc_that_stores_is_refused() {
             .unwrap_or_else(|| panic!("CALC(\"{expr}\") stores, so C refuses the file"));
         let msg = err.to_string();
         assert!(
-            msg.contains("assignment operator"),
+            msg.contains("Assignment operator used in CALC expression"),
             "CALC(\"{expr}\"): the rejection must name the reason C names \
              (asLibRoutines.c:1423), got {msg:?}"
         );

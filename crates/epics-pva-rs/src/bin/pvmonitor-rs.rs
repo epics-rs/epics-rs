@@ -110,20 +110,15 @@ async fn main() {
             match PvRequestExpr::parse_pvxs_compat(trimmed) {
                 Ok(req) => Some(req),
                 Err(e) => {
-                    eprintln!("error: invalid pvRequest {:?}: {e}", args.request);
+                    epics_libcom_rs::stderr_println!(
+                        "error: invalid pvRequest {:?}: {e}",
+                        args.request
+                    );
                     std::process::exit(1);
                 }
             }
         }
     };
-
-    // pvxs `-v` prints the effective client config once, before any
-    // subscription is started (tools/monitor.cpp:97-98). It is a
-    // diagnostic, not an output-format switch — the value formatter
-    // stays under `-M`.
-    if args.verbose > 0 {
-        cli::print_effective_config();
-    }
 
     // One client for the whole command, shared by every monitor task —
     // not one PvaClient per PV. pvxs builds a single client::Context and
@@ -135,6 +130,14 @@ async fn main() {
     let client = PvaClient::builder()
         .timeout(epics_pva_rs::cli::timeout_duration(args.timeout))
         .build();
+
+    // pvxs `-v` prints the context's effective config once, before any
+    // subscription is started (tools/monitor.cpp:111-114). It is a
+    // diagnostic, not an output-format switch — the value formatter
+    // stays under `-M`.
+    if args.verbose > 0 {
+        cli::print_effective_config(&client);
+    }
 
     let mut handles = Vec::new();
 
@@ -197,14 +200,14 @@ async fn main() {
                     print!("{output}");
                 }
                 MonitorEvent::Connected { peer } => {
-                    eprintln!("{pv_name} Connected to {peer}");
+                    epics_libcom_rs::stderr_println!("{pv_name} Connected to {peer}");
                 }
                 MonitorEvent::Disconnected => {
-                    eprintln!("{pv_name} Disconnected");
+                    epics_libcom_rs::stderr_println!("{pv_name} Disconnected");
                 }
                 MonitorEvent::Finished => {
                     if verbose {
-                        eprintln!("{pv_name} Finished");
+                        epics_libcom_rs::stderr_println!("{pv_name} Finished");
                     }
                 }
             };
@@ -221,7 +224,7 @@ async fn main() {
                 .await;
 
             if let Err(e) = result {
-                eprintln!("{pv_name}: {e}");
+                epics_libcom_rs::stderr_println!("{pv_name}: {e}");
             }
         });
         handles.push(handle);

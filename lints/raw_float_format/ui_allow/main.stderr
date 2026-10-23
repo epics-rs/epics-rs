@@ -1,0 +1,13 @@
+error: `y` is a `f64` formatted with Rust's float spelling
+  --> $DIR/main.rs:4:31
+   |
+LL |     let _ = format!("{x} {}", y);
+   |                               ^
+   |
+   = help: format `CFloat(..)` (`.g()` for %g) as the C text does, or allow the argument in dylint.toml with the C reason
+   = note: `#[deny(raw_float_format)]` on by default
+
+error: dylint.toml allows `z` in $DIR/main.rs, which formats no float there
+
+error: aborting due to 2 previous errors
+

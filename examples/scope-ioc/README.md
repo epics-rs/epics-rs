@@ -6,7 +6,8 @@ example.
 
 Generates a 1 kHz sine waveform (1000 points) with configurable noise,
 vertical gain, time/volts per division, trigger delay, and voltage offset.
-All readback records update via I/O Intr scanning.
+Readback records update via I/O Intr scanning; the fixed time base is read
+once at init.
 
 ## Devices
 
@@ -18,7 +19,7 @@ An asyn PortDriver that simulates a digital oscilloscope:
 - **Waveform**: 1000-point buffer covering `NUM_DIVISIONS * TimePerDiv` seconds
 - **Background task**: recomputes waveform at the configured `UpdateTime` interval
 - **Noise**: additive uniform noise with configurable amplitude
-- **Vertical gain**: x1 / x2 / x5 / x10 (rescales volts-per-division choices)
+- **Vertical gain**: 1 / 10 / 100 (rescales the volts-per-division choices)
 - **Statistics**: min, max, mean computed per waveform update
 
 ## PV Reference
@@ -34,9 +35,9 @@ Default prefix: `SCOPE:scopeSim:`
 | `VoltOffset` | ao | Voltage offset (V) |
 | `TriggerDelay` | ao | Trigger delay (s) |
 | `NoiseAmplitude` | ao | Noise amplitude (V) |
-| `TimePerDivSelect` | mbbo | Time per division (0.001 - 1.0 ms) |
-| `VertGainSelect` | mbbo | Vertical gain (x1 / x2 / x5 / x10) |
-| `VoltsPerDivSelect` | mbbo | Volts per division (auto-scaled by gain) |
+| `TimePerDivSelect` | mbbo | Time per division (values in µs) |
+| `VertGainSelect` | mbbo | Vertical gain (1 / 10 / 100) |
+| `VoltsPerDivSelect` | mbbo | Volts per division (driver table in mV, scaled by gain) |
 
 ### Readback (input records, I/O Intr)
 
@@ -56,12 +57,12 @@ Default prefix: `SCOPE:scopeSim:`
 | `MaxValue_RBV` | ai | Waveform maximum |
 | `MeanValue_RBV` | ai | Waveform mean |
 
-### Waveform (I/O Intr)
+### Waveforms
 
 | PV | Type | Description |
 |----|------|-------------|
-| `Waveform_RBV` | waveform | Waveform data (DOUBLE, 1000 elements) |
-| `TimeBase_RBV` | waveform | Time base (DOUBLE, 1000 elements) |
+| `Waveform_RBV` | waveform | Waveform data (DOUBLE, 1000 elements, I/O Intr) |
+| `TimeBase_RBV` | waveform | Time base (DOUBLE, 1000 elements, Passive) |
 
 ## Build and Run
 
@@ -92,8 +93,8 @@ camonitor SCOPE:scopeSim:MinValue_RBV SCOPE:scopeSim:MaxValue_RBV SCOPE:scopeSim
 # Add noise
 caput SCOPE:scopeSim:NoiseAmplitude 0.2
 
-# Change vertical gain to x10
-caput SCOPE:scopeSim:VertGainSelect 3
+# Change vertical gain to 10
+caput SCOPE:scopeSim:VertGainSelect 10
 
 # Read waveform
 caget -# SCOPE:scopeSim:Waveform_RBV

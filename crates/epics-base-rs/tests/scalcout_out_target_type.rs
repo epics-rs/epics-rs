@@ -33,13 +33,13 @@ fn scalcout_with_out(out: &str) -> ScalcoutRecord {
     let mut sc = ScalcoutRecord::new();
     sc.put_field("CALC", EpicsValue::String("AA".into()))
         .unwrap();
-    sc.special("CALC", true).unwrap();
+    sc.special("CALC", true, &Default::default()).unwrap();
     sc.put_field("AA", EpicsValue::String("calc-str".into()))
         .unwrap();
     sc.put_field("DOPT", EpicsValue::Short(1)).unwrap(); // Use OCAL
     sc.put_field("OCAL", EpicsValue::String("BB".into()))
         .unwrap();
-    sc.special("OCAL", true).unwrap();
+    sc.special("OCAL", true, &Default::default()).unwrap();
     sc.put_field("BB", EpicsValue::String("ocal-str".into()))
         .unwrap();
     sc.put_field("OUT", EpicsValue::String(out.into())).unwrap();
@@ -107,7 +107,7 @@ async fn r14_61_numeric_target_still_receives_oval() {
     // OCAL = "3+4" so OVAL is a defined 7 while OSV stays a numeric string.
     sc.put_field("OCAL", EpicsValue::String("3+4".into()))
         .unwrap();
-    sc.special("OCAL", true).unwrap();
+    sc.special("OCAL", true, &Default::default()).unwrap();
     db.add_record("SC_NUM", Box::new(sc)).await.unwrap();
 
     let mut visited = epics_base_rs::server::database::ProcStack::new();

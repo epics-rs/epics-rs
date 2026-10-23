@@ -1,0 +1,18 @@
+# USdigital T7 single-axis inclinometer RS232 support
+# 
+# This code is based on support for the X3, which is 3-axis.  I left it this way because
+# there is a possibility that USdigital will make a 3-axis version of the T7.  USdigital
+# no longer sells the X3.
+#
+# Hex 010180 is sent to the device.  It will respond with with an echo of the received command,
+# followed by three 4-byte angles.  The single-axis T7's angle will be in the third word.  This
+# is followed by 2 bytes for the temperature and 1 byte for the checksum which is ignored for now.
+#
+# kag 22-NOV-2013  Initial version
+#
+
+extraInput=ignore;
+get_all {
+   out "\x01\x01\x80";
+   in "%*r%*r%*r%(\$1:A1_raw.VAL)4r%(\$1:A2_raw.VAL)4r%(\$1:Angle_raw.VAL)4r%(\$1:T_raw.VAL)2r%(\$1:CS_raw.VAL)r";
+}

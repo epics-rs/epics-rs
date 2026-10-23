@@ -1,0 +1,5 @@
+_main_ invalid_twice.proto line 2: Unexpected end of file (looking for '}')
+_main_ invalid_twice.proto line 1: in protocol 'p'
+_main_ while reading protocol 'p' for 'rec0'
+_main_ Protocol file 'invalid_twice.proto' is invalid (see above)
+_main_ while reading protocol 'p' for 'rec1'

@@ -1,0 +1,5 @@
+_main_ No converter registered for format '%q'
+_main_ no_converter.proto line 2: in format string: "%q"
+_main_ no_converter.proto line 2: in command 'out'
+_main_ no_converter.proto line 1: in protocol 'p'
+_main_ while compiling protocol 'p' for 'rec0'

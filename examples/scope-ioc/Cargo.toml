@@ -12,6 +12,7 @@ ioc = ["dep:epics-ca-rs", "dep:epics-bridge-rs", "asyn-rs/epics"]
 asyn-rs = { workspace = true }
 parking_lot = "0.12"
 epics-base-rs = { workspace = true }
+epics-libcom-rs = { workspace = true }
 epics-ca-rs = { workspace = true, optional = true }
 epics-bridge-rs = { workspace = true, optional = true }
 

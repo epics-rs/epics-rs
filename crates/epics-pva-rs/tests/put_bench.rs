@@ -24,6 +24,8 @@
 //! immediately (search_engine.rs `SearchReason::Initial`), so on
 //! localhost that phase is RTT-bound and small. The CREATE_CHANNEL cost
 //! IS measured (it is the per-channel connect work).
+
+#![allow(clippy::disallowed_macros, reason = "tests may keep eprintln!")]
 // The tests that drive a live server are `tokio_backend`-only, so on
 // `exec_backend` the fixtures and imports they share go unreferenced while the
 // rest of this file still runs. The default build lints it in full.
@@ -32,11 +34,12 @@
 
 // RTEMS-EXEC-MODEL-ALLOW(1): checked - these run and pass in the exec-backend
 // suite.
+use epics_base_rs::types::RecordName;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::sync::Mutex;
+use parking_lot::Mutex;
 
 use epics_pva_rs::client_native::context::PvaClient;
 use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
@@ -48,14 +51,14 @@ use epics_pva_rs::server_native::{ChannelSource, OpError, PvaServerConfig};
 
 #[derive(Clone)]
 struct BenchSource {
-    values: Arc<Mutex<HashMap<String, PvField>>>,
+    values: Arc<Mutex<HashMap<RecordName, PvField>>>,
 }
 
 impl BenchSource {
     fn with_scalars(names: &[String], v: f64) -> Self {
         let mut m = HashMap::with_capacity(names.len());
         for n in names {
-            m.insert(n.clone(), make_nt_scalar(v));
+            m.insert(RecordName::from(n.as_str()), make_nt_scalar(v));
         }
         Self {
             values: Arc::new(Mutex::new(m)),
@@ -73,57 +76,56 @@ fn make_nt_scalar(v: f64) -> PvField {
 fn nt_scalar_desc() -> FieldDesc {
     FieldDesc::Structure {
         struct_id: "epics:nt/NTScalar:1.0".into(),
-        fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))],
+        fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))].into(),
     }
 }
 
 impl ChannelSource for BenchSource {
-    fn list_pvs(&self) -> impl std::future::Future<Output = Vec<String>> + Send {
-        let values = self.values.clone();
-        async move { values.lock().await.keys().cloned().collect() }
+    fn list_pvs(&self) -> Vec<RecordName> {
+        self.values.lock().keys().cloned().collect()
     }
-    fn has_pv(&self, name: &str) -> impl std::future::Future<Output = bool> + Send {
+    fn has_pv(&self, name: &[u8]) -> impl std::future::Future<Output = bool> + Send {
         let values = self.values.clone();
-        let name = name.to_string();
-        async move { values.lock().await.contains_key(&name) }
+        let name = RecordName::from(name);
+        async move { values.lock().contains_key(&name) }
     }
     fn get_introspection(
         &self,
-        name: &str,
+        name: &[u8],
     ) -> impl std::future::Future<Output = Option<FieldDesc>> + Send {
         let values = self.values.clone();
-        let name = name.to_string();
+        let name = RecordName::from(name);
         async move {
-            if values.lock().await.contains_key(&name) {
+            if values.lock().contains_key(&name) {
                 Some(nt_scalar_desc())
             } else {
                 None
             }
         }
     }
-    fn get_value(&self, name: &str) -> impl std::future::Future<Output = Option<PvField>> + Send {
+    fn get_value(&self, name: &[u8]) -> impl std::future::Future<Output = Option<PvField>> + Send {
         let values = self.values.clone();
-        let name = name.to_string();
-        async move { values.lock().await.get(&name).cloned() }
+        let name = RecordName::from(name);
+        async move { values.lock().get(&name).cloned() }
     }
     fn put_value(
         &self,
-        name: &str,
+        name: &[u8],
         value: PvField,
     ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
         let values = self.values.clone();
-        let name = name.to_string();
+        let name = RecordName::from(name);
         async move {
-            values.lock().await.insert(name, value);
+            values.lock().insert(name, value);
             Ok(())
         }
     }
-    async fn is_writable(&self, _name: &str) -> bool {
+    async fn is_writable(&self, _name: &[u8]) -> bool {
         true
     }
     async fn subscribe(
         &self,
-        _name: &str,
+        _name: &[u8],
     ) -> Option<epics_pva_rs::server_native::MonitorStream<PvField>> {
         // No monitors in this benchmark.
         None

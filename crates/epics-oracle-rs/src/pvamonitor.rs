@@ -24,10 +24,11 @@
 //!   Measured on the read phase's two contracts, which is not the same thing:
 //!   nothing here says `REC.EGU`'s *monitor* behaves. A real gap, and a future
 //!   phase.
-//! - **9 record types whose `VAL` is `DBF_NOACCESS`** (`aai`, `aao`, `compress`,
-//!   `histogram`, `lsi`, `lso`, `printf`, `subArray`, `waveform`). pvxs refuses
-//!   an NT of `Null`, so those channels are outside the enumerated surface
-//!   already ([`crate::surface`]) and there is nothing to subscribe to.
+//! - **a `VAL` that is `DBF_NOACCESS` with no `cvt_dbaddr` re-typing it.** pvxs
+//!   refuses an NT of `Null`, so the channel is outside the enumerated surface
+//!   already ([`crate::surface`]) and there is nothing to subscribe to. None in
+//!   today's spec: the `aai`/`waveform`/`compress`/`printf` buffers are
+//!   `SPC_DBADDR` and served ([`crate::dbd::FieldDef::is_ca_observable`]).
 //! - **`sel`, whose `VAL` is `special(SPC_NOMOD)`** — the `.dbd` states no
 //!   client may write it, so no client can drive it. See [`val_status`].
 //! - **QSRV2 group PVs** (`dbLoadGroup` JSON), exactly as in the read phase:
@@ -42,9 +43,11 @@
 //! - [`Drive::Passive`] — `record(t, "ORACLE:MON:T") {}`. A put to `VAL` must
 //!   process the record itself (`VAL` is `pp(TRUE)`, and `dbPutField` processes
 //!   a Passive record), and processing must post.
-//! - [`Drive::Scanned`] — the same record with `field(SCAN, ".1 second")`.
-//!   Processing is then the scan's job, not the put's, so a missing event can
-//!   only be a *posting* failure.
+//! - [`Drive::Scanned`] — the same record scanned on the named event
+//!   `SCAN_EVENT`, which the harness posts after each put by processing the
+//!   `event` record `TRIGGER_PV`. The put does not process a non-Passive
+//!   record (`dbAccess.c:1267-1269`), so processing is the scan's job, not the
+//!   put's, and a missing event can only be a *posting* failure.
 //!
 //! One reproducer alone conflates two defects. A Passive record that posts
 //! nothing may have failed to process OR failed to post, and the harness cannot
@@ -53,36 +56,22 @@
 //! but posting on Scanned indicts the *put* path; silent on both indicts the
 //! *monitor* path.
 //!
-//! # Why `.1 second`, and why the reference decides who gets it
+//! # Why the harness posts the scan
 //!
-//! A scanned reproducer is only usable if the record's own scanning is quiet —
-//! an event this harness did not drive is an event it cannot attribute, and a
-//! record type whose `process` posts on every scan regardless of change makes
-//! the event count a function of wall-clock on BOTH sides, so a one-scan
-//! difference indicts neither server.
+//! A periodic scan cannot be attributed for a record type whose `process`
+//! posts on every pass regardless of change (`printfRecord.c:399-401` posts
+//! `VAL` unconditionally): its event count is then a function of wall-clock on
+//! both sides, and the two servers start their scan phases independently. Nine
+//! types did against `softIocPVX`, and a `.1 second` reproducer had to be
+//! withdrawn for each. A scan posted once per drive step processes each
+//! reproducer exactly as often on both sides, so every type keeps both
+//! reproducers and the count stays a property of the server.
 //!
-//! Which types those are is **measured, not listed**: before anything is
-//! driven, `undriven_events` watches the ground truth's scanned reproducer
-//! for `SCAN_QUIET_WINDOW`, and a reference that posts in that window
-//! withdraws the scanned case for that type. A hand-kept list is what this
-//! replaces, and it had gone wrong exactly the way a hand-kept list does:
-//! `event` and `sseq` were on it, `printf` was not, and
-//! `printfRecord.c:399-401` posts `VAL` unconditionally on every process — 41
-//! undriven events in 4s of `.1 second` scanning against `softIocPVX`, against
-//! `calc`'s 0. Its scanned case therefore scored DEFECT on a ±1 scan count in
-//! four runs out of five.
-//!
-//! Gating on the REFERENCE alone is what keeps this from excusing the port: a
-//! port that posts undriven where pvxs is quiet still has every one of those
-//! events compared, and still fails.
-//!
-//! `asyn` is the one exclusion that stays a name, because its reason is not
-//! measurable by watching a quiet server: its process drives device I/O against
-//! the deliberately disconnected `ORACLEASYN` port
-//! ([`crate::ORACLE_ASYN_PORT`]), which is the timing nondeterminism
-//! [`crate::puts_are_measurable`] already refuses. Every excluded type keeps
-//! its Passive reproducer, and both exclusions are counted and named in the
-//! report's denominator.
+//! `asyn` included: its `process` against the disconnected `ORACLEASYN` port
+//! ([`crate::ORACLE_ASYN_PORT`]) has `queueRequest` refuse at once
+//! (`asynManager.c:1551`, "port not connected") and completes with a
+//! `STATE_ALARM` (`asynRecord.c:342-358`), so it is no less deterministic than
+//! a soft record.
 //!
 //! # The drive must be proven, or agreement is a lie
 //!
@@ -143,13 +132,14 @@ use crate::ntshape::{NT_ENUM, NtShape};
 use crate::pvatool::{PvaEvent, PvaTools};
 use crate::report::{Counts, StaleRow};
 use crate::surface::{Coverage, Surface, ValStatus, drives_val, val_status};
+use epics_libcom_rs::cfmt::CFloat;
 
-/// The scan rate of the [`Drive::Scanned`] reproducer.
-///
-/// Fast enough that the next scan lands well inside `PUT_SPACING` (so a driven
-/// put is always picked up before the next one is issued), slow enough to stay
-/// far from the settle window.
-const SCAN_RATE: &str = ".1 second";
+/// The named event the [`Drive::Scanned`] reproducer is scanned on. Nothing
+/// but [`TRIGGER_PV`] posts it, so the reproducer never processes undriven.
+const SCAN_EVENT: &str = "ORACLE_MON";
+
+/// The `event` record whose processing posts [`SCAN_EVENT`].
+const TRIGGER_PV: &str = "ORACLE:MONTRIG";
 
 /// The driven sequence, and the repeat is the point of it — the same contract
 /// [`crate::runner::Runner::probe_monitor`] drives over CA. C suppresses a
@@ -159,13 +149,12 @@ const SCAN_RATE: &str = ".1 second";
 /// value agrees either way.
 const SEQ: [&str; 4] = ["1", "2", "2", "3"];
 
-/// How long between puts.
+/// How long between drive steps.
 ///
-/// Wider than the CA probe's 120ms because of [`Drive::Scanned`]: a put lands
-/// as an event only at the next scan, so puts spaced closer than [`SCAN_RATE`]
-/// could be coalesced into one scan and the count would become a function of
-/// timing rather than of the server. 4x the scan period, measured deterministic
-/// across two identical runs of all 28 scanned types.
+/// Wider than the CA probe's 120ms because of [`Drive::Scanned`]: posting the
+/// event queues the reproducer's processing on the scan callback thread, after
+/// the trigger put has returned, and the step must outlast that before the
+/// next put lands.
 const PUT_SPACING: Duration = Duration::from_millis(400);
 
 /// How long the subscription is held open after the last put.
@@ -173,14 +162,6 @@ const PUT_SPACING: Duration = Duration::from_millis(400);
 /// Not a nicety: a port that posts events C suppresses must be caught, so the
 /// window cannot close the instant the puts return.
 const MONITOR_SETTLE: Duration = Duration::from_millis(1000);
-
-/// How long the reference is watched, undriven, before its scanned reproducer is
-/// trusted.
-///
-/// Eight scan periods: a type that posts per scan shows ~8 events here, and a
-/// quiet one shows 0, so the two are never a coin flip. Paid once per record
-/// type, on the C side only.
-const SCAN_QUIET_WINDOW: Duration = Duration::from_millis(800);
 
 /// How long a subscription has to produce its seed events before the case is an
 /// ERROR. Generous because it covers a cold search on both PVs, and because a
@@ -191,18 +172,6 @@ const MONITOR_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// that has never processed, on both sides.
 const EPICS_EPOCH_POSIX_SECONDS: &str = "631152000";
 
-/// A record type whose reference server posted with nothing driving it,
-/// measured this run.
-///
-/// Its scanned reproducer is withdrawn: the event count on both sides is then a
-/// function of wall-clock, and a difference indicts neither server.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-pub struct SelfPosting {
-    pub record_type: String,
-    /// Post-seed events the reference posted in `SCAN_QUIET_WINDOW`.
-    pub undriven_events: usize,
-}
-
 /// Which reproducer drove a case's events.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -210,10 +179,13 @@ pub enum Drive {
     /// `record(t, "…") {}` — the put must process the record, and processing
     /// must post.
     Passive,
-    /// `field(SCAN, ".1 second")` — the scan processes, so only posting is
-    /// under test.
+    /// `SCAN` `Event` on `SCAN_EVENT`, posted by the harness — the scan
+    /// processes, so only posting is under test.
     Scanned,
 }
+
+/// Every record type gets both reproducers.
+const DRIVES: [Drive; 2] = [Drive::Passive, Drive::Scanned];
 
 impl Drive {
     pub fn as_str(self) -> &'static str {
@@ -235,28 +207,9 @@ impl Drive {
     fn fields(self) -> &'static [(&'static str, &'static str)] {
         match self {
             Self::Passive => &[],
-            Self::Scanned => &[("SCAN", SCAN_RATE)],
+            Self::Scanned => &[("SCAN", "Event"), ("EVNT", SCAN_EVENT)],
         }
     }
-}
-
-/// Whether a record type may be OFFERED a [`Drive::Scanned`] reproducer.
-///
-/// `false` for `asyn` alone, and only because its reason cannot be measured by
-/// watching a quiet server: its `process` drives device I/O against the
-/// disconnected `ORACLEASYN` port, which is the socket-timing nondeterminism
-/// [`crate::puts_are_measurable`] refuses for the same record type.
-///
-/// Self-posting is NOT decided here. A type whose own scanning posts undriven
-/// events is withdrawn by `undriven_events` measuring the reference, so this
-/// predicate never has to know which types those are — see the module docs.
-///
-/// This is not a silent blind spot: `asyn` keeps its [`Drive::Passive`]
-/// reproducer, the exclusion is counted in the report's denominator, and callers
-/// MUST surface it rather than let a skipped reproducer read as a measured-clean
-/// one.
-pub fn scan_is_measurable(record_type: &str) -> bool {
-    record_type != "asyn"
 }
 
 /// The named contracts a monitored channel can differ on.
@@ -371,8 +324,6 @@ pub struct MonDenominator {
     pub excluded_nomod_val: Vec<String>,
     /// Record types whose `VAL` is a link or is otherwise not client-writable.
     pub excluded_unwritable_val: Vec<String>,
-    /// Record types with no [`Drive::Scanned`] reproducer, and why.
-    pub excluded_scanned: Vec<String>,
     /// Non-`VAL` channels, which this phase does not drive.
     pub excluded_non_val_channels: usize,
 }
@@ -466,14 +417,6 @@ impl MonReport {
                 d.excluded_unwritable_val.join(", ")
             );
         }
-        let _ = writeln!(
-            s,
-            "  no scanned reproducer      : {}",
-            d.excluded_scanned.len()
-        );
-        for why in &d.excluded_scanned {
-            let _ = writeln!(s, "                               {why}");
-        }
         s.push('\n');
 
         let cov = &self.case_coverage;
@@ -483,7 +426,7 @@ impl MonReport {
             "  cases measured on BOTH sides: {}/{} = {:.1}%",
             cov.measured,
             cov.enumerated,
-            cov.percent()
+            CFloat(cov.percent())
         );
         let _ = writeln!(s, "  cases that errored (NOT coverage): {}\n", cov.errored);
 
@@ -599,17 +542,6 @@ pub struct CaseRef {
     pub db: String,
 }
 
-/// Everything one run of this phase produced: the cases, and the scanned
-/// reproducers the reference itself withdrew.
-///
-/// The two travel together because the denominator cannot be known without the
-/// second — a withdrawn case is not a case that agreed.
-#[derive(Debug, Clone, Default)]
-pub struct MonProbe {
-    pub cases: Vec<MonCase>,
-    pub self_posting: Vec<SelfPosting>,
-}
-
 /// Boot the pair per record type and measure each reproducer's event stream.
 pub fn probe(
     tools: &PvxTools,
@@ -617,27 +549,20 @@ pub fn probe(
     surface: &Surface,
     record_types: &[String],
     allowlist: &mut Allowlist,
-) -> MonProbe {
-    let mut out = MonProbe::default();
+) -> Vec<MonCase> {
+    let mut out = Vec::new();
     for (i, rt) in record_types.iter().enumerate() {
         // A skip is loud and says WHICH rule excluded the type, so a shrunken
         // denominator can never be mistaken for a measured-clean one.
         if let Some(why) = val_status(surface, rt).why() {
-            eprintln!(
+            epics_base_rs::stderr_println!(
                 "[{}/{}] pva monitor: {rt} — EXCLUDED: {why}",
                 i + 1,
                 record_types.len()
             );
             continue;
         }
-        if !scan_is_measurable(rt) {
-            eprintln!(
-                "[{}/{}] pva monitor: {rt} — passive only (own scanning posts undriven events)",
-                i + 1,
-                record_types.len()
-            );
-        }
-        eprintln!("[{}/{}] pva monitor: {rt}", i + 1, record_types.len());
+        epics_base_rs::stderr_println!("[{}/{}] pva monitor: {rt}", i + 1, record_types.len());
         // `Drivable` was just proven, so VAL exists in the surface.
         let val_dbf = surface
             .fields_of(rt)
@@ -645,30 +570,9 @@ pub fn probe(
             .expect("val_status returned Drivable, so VAL is in the surface")
             .field
             .dbf;
-        let (cases, self_posting) = probe_type(tools, workdir, rt, val_dbf, allowlist);
-        if let Some(sp) = self_posting {
-            eprintln!(
-                "[{}/{}] pva monitor: {rt} — scanned reproducer withdrawn: the reference posted \
-                 {} undriven event(s) in {}ms",
-                i + 1,
-                record_types.len(),
-                sp.undriven_events,
-                SCAN_QUIET_WINDOW.as_millis()
-            );
-            out.self_posting.push(sp);
-        }
-        out.cases.extend(cases);
+        out.extend(probe_type(tools, workdir, rt, val_dbf, allowlist));
     }
     out
-}
-
-/// The reproducers this record type gets.
-fn drives_for(record_type: &str) -> Vec<Drive> {
-    if scan_is_measurable(record_type) {
-        vec![Drive::Passive, Drive::Scanned]
-    } else {
-        vec![Drive::Passive]
-    }
 }
 
 fn write_db(workdir: &Path, name: &str, text: &str) -> Result<PathBuf, String> {
@@ -685,14 +589,10 @@ fn probe_type(
     record_type: &str,
     val_dbf: DbfType,
     allowlist: &mut Allowlist,
-) -> (Vec<MonCase>, Option<SelfPosting>) {
-    let drives = drives_for(record_type);
-    let db_text: String = drives
-        .iter()
-        .map(|d| crate::record_stmt_fields(record_type, &d.pv(record_type), d.fields()))
-        .collect();
+) -> Vec<MonCase> {
+    let db_text = reproducer_db(record_type);
 
-    let refs: Vec<CaseRef> = drives
+    let refs: Vec<CaseRef> = DRIVES
         .iter()
         .map(|d| CaseRef {
             record_type: record_type.to_string(),
@@ -706,11 +606,11 @@ fn probe_type(
 
     let db = match write_db(workdir, &format!("pva_mon_{record_type}"), &db_text) {
         Ok(p) => p,
-        Err(e) => return (errored_cases(&refs, &unattributed("write-db", &e)), None),
+        Err(e) => return errored_cases(&refs, &unattributed("write-db", &e)),
     };
     let pair = match PvaPair::boot(tools, &db, &pvs[0]) {
         Ok(p) => p,
-        Err(e) => return (errored_cases(&refs, &e.tool_errors("boot")), None),
+        Err(e) => return errored_cases(&refs, &e.tool_errors("boot")),
     };
 
     let c = PvaTools::new(tools, pair.c.port(), Side::C);
@@ -726,91 +626,48 @@ fn probe_type(
     let shape = match c.pvxinfo(&pvs[0]).map(|b| NtShape::observed(&b)) {
         Ok(Some(s)) => s,
         Ok(None) => {
-            return (
-                errored_cases(
-                    &refs,
-                    &[ToolError {
-                        side: Side::C,
-                        tool: "pvxinfo".into(),
-                        message: "ground truth's pvxinfo declared no parseable NT shape".into(),
-                    }],
-                ),
-                None,
+            return errored_cases(
+                &refs,
+                &[ToolError {
+                    side: Side::C,
+                    tool: "pvxinfo".into(),
+                    message: "ground truth's pvxinfo declared no parseable NT shape".into(),
+                }],
             );
         }
-        Err(e) => return (errored_cases(&refs, &[e]), None),
+        Err(e) => return errored_cases(&refs, &[e]),
     };
-
-    // Ask the GROUND TRUTH whether its scanned reproducer is attributable at all,
-    // before anything is driven. A record type whose `process` posts on every
-    // scan regardless of change (`printfRecord.c:399-401` posts VAL
-    // unconditionally; `event` and `sseq` do the same) makes the event count a
-    // function of wall-clock on both sides, and the two servers start their scan
-    // phases independently — so ±1 scan is not a property of either. Gating on
-    // the reference excuses no port: one that posts where pvxs is quiet has
-    // every such event compared, and fails.
-    let mut refs = refs;
-    let mut self_posting = None;
-    let mut withdrawn: Vec<MonCase> = Vec::new();
-    if let Some(i) = refs.iter().position(|cr| cr.drive == Drive::Scanned) {
-        match undriven_events(&c, &refs[i].pv) {
-            Ok(0) => {}
-            Ok(n) => {
-                refs.remove(i);
-                self_posting = Some(SelfPosting {
-                    record_type: record_type.to_string(),
-                    undriven_events: n,
-                });
-            }
-            // Not measurable is not the same as quiet: a case whose gate could
-            // not be read has not been measured, and must never read as agreed.
-            Err(e) => {
-                let cr = refs.remove(i);
-                withdrawn = errored_cases(&[cr], &[e]);
-            }
-        }
-    }
-    let pvs: Vec<String> = refs.iter().map(|cr| cr.pv.clone()).collect();
 
     // Two independent servers on two ports with no shared state: observing them
     // concurrently changes nothing either one posts, and halves a phase whose
     // wall-clock is settle-bound.
+    let scanned = Drive::Scanned.pv(record_type);
     let (obs_c, obs_r) = std::thread::scope(|s| {
-        let hc = s.spawn(|| observe(&c, &pvs, &shape));
-        let hr = s.spawn(|| observe(&r, &pvs, &shape));
+        let hc = s.spawn(|| observe(&c, &pvs, &scanned, &shape));
+        let hr = s.spawn(|| observe(&r, &pvs, &scanned, &shape));
         (
             hc.join().expect("C monitor lane panicked"),
             hr.join().expect("Rust monitor lane panicked"),
         )
     });
 
-    let mut cases: Vec<MonCase> = refs
-        .iter()
+    refs.iter()
         .enumerate()
         .map(|(i, cr)| adjudicate(cr, &obs_c[i], &obs_r[i], allowlist))
-        .collect();
-    cases.extend(withdrawn);
-    (cases, self_posting)
+        .collect()
 }
 
-/// How many events the reference posted for `pv` with nothing driving it.
-fn undriven_events(c: &PvaTools, pv: &str) -> Result<usize, ToolError> {
-    let pvs = [pv.to_string()];
-    let events = c.pvxmonitor(&pvs, SCAN_QUIET_WINDOW, MONITOR_CONNECT_TIMEOUT, |_| {})?;
-    Ok(undriven_count(pv, &events))
-}
-
-/// The post-seed events in a quiet observation.
-///
-/// The seed is not one of them — it is the connection's own frame, posted by
-/// every server for every channel — so it is subtracted exactly as
-/// [`split_trace`] subtracts it.
-fn undriven_count(pv: &str, events: &[PvaEvent]) -> usize {
-    events
+/// Both reproducers of `record_type`, and the `event` record that scans one.
+fn reproducer_db(record_type: &str) -> String {
+    DRIVES
         .iter()
-        .filter(|e| e.pv == pv)
-        .count()
-        .saturating_sub(1)
+        .map(|d| crate::record_stmt_fields(record_type, &d.pv(record_type), d.fields()))
+        .chain([crate::record_stmt_fields(
+            "event",
+            TRIGGER_PV,
+            &[("VAL", SCAN_EVENT)],
+        )])
+        .collect()
 }
 
 /// How `pvxput` must be told to write `value` to a channel of this shape.
@@ -827,12 +684,15 @@ fn assignment(shape: &NtShape, value: &str) -> String {
 }
 
 /// Subscribe to every reproducer on one side, drive them all, and split the
-/// stream back out per PV.
-fn observe(t: &PvaTools, pvs: &[String], shape: &NtShape) -> Vec<MonObservation> {
+/// stream back out per PV. `scanned` is the reproducer [`TRIGGER_PV`] scans.
+fn observe(t: &PvaTools, pvs: &[String], scanned: &str, shape: &NtShape) -> Vec<MonObservation> {
     // The drive runs inside the subscription window, so its failures are
     // collected here rather than returned: a refused put is what turns a case
     // into an ERROR instead of a false AGREED.
     let drive_errors: RefCell<Vec<ToolError>> = RefCell::new(Vec::new());
+    // A trigger that failed left the scanned reproducer unprocessed, so it is
+    // that case's error even though the message names another PV.
+    let trigger_errors: RefCell<Vec<ToolError>> = RefCell::new(Vec::new());
     let drive = |t: &PvaTools| {
         for v in SEQ {
             for pv in pvs {
@@ -840,15 +700,18 @@ fn observe(t: &PvaTools, pvs: &[String], shape: &NtShape) -> Vec<MonObservation>
                     drive_errors.borrow_mut().push(e);
                 }
             }
-            // Space the puts so a server that posts per change has time to emit
-            // each one, and so a scanned reproducer's next scan lands between
-            // them rather than coalescing two.
+            if let Err(e) = t.pvxput(&format!("{TRIGGER_PV}.PROC"), "1") {
+                trigger_errors.borrow_mut().push(e);
+            }
+            // Space the steps so a server that posts per change has time to
+            // emit each one before the next put lands.
             std::thread::sleep(PUT_SPACING);
         }
     };
 
     let events = t.pvxmonitor(pvs, MONITOR_SETTLE, MONITOR_CONNECT_TIMEOUT, drive);
     let drive_errors = drive_errors.into_inner();
+    let trigger_errors = trigger_errors.into_inner();
 
     match events {
         // The subscription never established: nothing was measured for any PV
@@ -872,6 +735,9 @@ fn observe(t: &PvaTools, pvs: &[String], shape: &NtShape) -> Vec<MonObservation>
                         .filter(|e| e.message.contains(pv.as_str()))
                         .cloned(),
                 );
+                if pv == scanned {
+                    o.errors.extend(trigger_errors.iter().cloned());
+                }
                 o
             })
             .collect(),
@@ -1000,7 +866,9 @@ pub fn adjudicate(
         record_type: &cr.record_type,
         field: "VAL",
         dbf: cr.val_dbf,
-        class: None,
+        // The drive is this phase's boundary class: only the scanned
+        // reproducer processes a record whose VAL put does not.
+        class: Some(cr.drive.as_str()),
     };
     // Record what this case looked at before the agreed early-out, so a row that
     // stopped firing reads as stale, not unexercised.
@@ -1073,13 +941,9 @@ fn render_updates(updates: &[String]) -> String {
 pub fn report(
     dbd_path: &str,
     surface: &Surface,
-    probe: MonProbe,
+    cases: Vec<MonCase>,
     allowlist: &Allowlist,
 ) -> MonReport {
-    let MonProbe {
-        cases,
-        self_posting,
-    } = probe;
     let measured = cases
         .iter()
         .filter(|c| c.verdict != Verdict::Errored)
@@ -1101,23 +965,6 @@ pub fn report(
         .iter()
         .filter(|rt| drives_val(surface, rt))
         .collect();
-    // Two reasons, both named at the point of use so a shrunken denominator can
-    // never be read as a measured-clean one: the rule (asyn, whose timing cannot
-    // be measured by watching a quiet server) and the measurement (a reference
-    // that posted undriven this run).
-    let excluded_scanned: Vec<String> = with_val
-        .iter()
-        .filter(|rt| !scan_is_measurable(rt))
-        .map(|rt| format!("{rt} — device I/O against a disconnected port"))
-        .chain(self_posting.iter().map(|sp| {
-            format!(
-                "{} — the reference posted {} undriven event(s) in {}ms",
-                sp.record_type,
-                sp.undriven_events,
-                SCAN_QUIET_WINDOW.as_millis()
-            )
-        }))
-        .collect();
     let val_channels = surface
         .covered_types
         .iter()
@@ -1128,19 +975,7 @@ pub fn report(
     // happened to produce: a `--record-types` filter must show as LOW coverage
     // rather than as a full sweep of a smaller world. Same rule as the read
     // phase's denominator.
-    // A withdrawn scanned reproducer leaves the denominator, because it is not a
-    // case that could have been measured — unlike a `--record-types` filter,
-    // which must stay in it and show as LOW coverage.
-    let candidates: usize = with_val
-        .iter()
-        .map(|rt| drives_for(rt).len())
-        .sum::<usize>()
-        .saturating_sub(
-            self_posting
-                .iter()
-                .filter(|sp| with_val.iter().any(|rt| **rt == sp.record_type))
-                .count(),
-        );
+    let candidates = with_val.len() * DRIVES.len();
 
     MonReport {
         denominator: MonDenominator {
@@ -1150,7 +985,6 @@ pub fn report(
             excluded_noaccess_val: of_status(ValStatus::NoChannel),
             excluded_nomod_val: of_status(ValStatus::NoMod),
             excluded_unwritable_val: of_status(ValStatus::NotWritable),
-            excluded_scanned,
             excluded_non_val_channels: surface.denominator().saturating_sub(val_channels),
         },
         case_coverage: Coverage {
@@ -1400,55 +1234,34 @@ mod tests {
         assert_eq!(assignment(&scalar, "2"), "2");
     }
 
-    /// `asyn` is the ONE exclusion that is still a name, and it keeps its passive
-    /// reproducer — the exclusion is of one reproducer, not of the record type.
-    /// The self-posting types are not here: they are withdrawn by measuring the
-    /// reference, so the predicate must offer them a scanned reproducer.
-    #[test]
-    fn only_asyn_is_excluded_by_rule_and_it_keeps_a_passive_reproducer() {
-        assert!(!scan_is_measurable("asyn"));
-        assert_eq!(drives_for("asyn"), [Drive::Passive]);
-        for rt in ["ai", "event", "sseq", "printf"] {
-            assert!(scan_is_measurable(rt), "{rt}");
-            assert_eq!(drives_for(rt), [Drive::Passive, Drive::Scanned], "{rt}");
-        }
-    }
-
-    /// The seed is not an undriven event: every server frames one for every
-    /// channel on connect, so counting it would withdraw every scanned
-    /// reproducer there is.
-    #[test]
-    fn a_quiet_reference_posts_only_its_seed() {
-        let ev = |pv: &str| PvaEvent {
-            pv: pv.to_string(),
-            body: String::new(),
-        };
-        assert_eq!(undriven_count("A", &[ev("A")]), 0);
-        assert_eq!(undriven_count("A", &[ev("A"), ev("A"), ev("A")]), 2);
-        // Another channel's events are not this one's, and a channel that never
-        // seeded has no events to subtract from.
-        assert_eq!(undriven_count("A", &[ev("A"), ev("B"), ev("B")]), 0);
-        assert_eq!(undriven_count("A", &[]), 0);
-    }
-
     /// Both reproducers live in one `.db` and one subscription, so their names
     /// must not collide.
     #[test]
     fn the_two_reproducers_are_different_records() {
         assert_ne!(Drive::Passive.pv("ai"), Drive::Scanned.pv("ai"));
-        assert!(Drive::Scanned.fields().iter().any(|(k, _)| *k == "SCAN"));
         assert!(Drive::Passive.fields().is_empty());
     }
 
-    /// A put spaced closer than the scan period could be coalesced into one
-    /// scan, making the event count a function of timing rather than of the
-    /// server.
+    /// The scanned reproducer processes only when the harness posts its event:
+    /// the trigger must post exactly the event it is scanned on, and nothing
+    /// else in the `.db` may scan periodically.
     #[test]
-    fn puts_are_spaced_wider_than_the_scan_period() {
-        assert_eq!(SCAN_RATE, ".1 second");
+    fn the_trigger_posts_the_event_the_scanned_reproducer_waits_on() {
+        let db = reproducer_db("printf");
         assert!(
-            PUT_SPACING >= Duration::from_millis(300),
-            "a put must not race the next scan: {PUT_SPACING:?}"
+            db.contains(&format!(
+                "record(printf, \"{}\") {{\n    field(SCAN, \"Event\")\n    \
+                 field(EVNT, \"{SCAN_EVENT}\")\n}}",
+                Drive::Scanned.pv("printf")
+            )),
+            "{db}"
         );
+        assert!(
+            db.contains(&format!(
+                "record(event, \"{TRIGGER_PV}\") {{\n    field(VAL, \"{SCAN_EVENT}\")\n}}"
+            )),
+            "{db}"
+        );
+        assert!(!db.contains("second"), "{db}");
     }
 }

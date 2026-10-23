@@ -1,8 +1,8 @@
 use crate::error::{CaError, CaResult};
+use crate::server::record::{CycleCell, CycleRead, CycleValue, OutView};
 use crate::server::record::{
     FieldMetadataOverride, MENU_SIMM, ProcessOutcome, Record, ValuePostGate,
 };
-use crate::server::records::convert_phase::ConvertPhase;
 use crate::types::{EpicsValue, PvString};
 
 /// Choice labels for the output-increment-format menu, in index order.
@@ -30,7 +30,7 @@ pub struct AoRecord {
     /// where VAL's own monitor mask is empty (`:535`), which is why it is a
     /// field and not a local: OROC can walk OVAL one step per cycle toward a
     /// VAL that has not moved since MLST.
-    pub omod: bool,
+    pub omod: u8,
     pub rbv: i32,  // readback value
     pub orbv: i32, // old readback value
     pub oval: f64,
@@ -54,11 +54,11 @@ pub struct AoRecord {
     pub aslo: f64,
     pub aoff: f64,
     // Output control
-    pub omsl: i16,   // 0=supervisory, 1=closed_loop
-    pub dol: String, // desired output location link
-    pub oif: i16,    // 0=Full, 1=Incremental
-    pub oroc: f64,   // output rate of change
-    pub pval: f64,   // previous value
+    pub omsl: i16,     // 0=supervisory, 1=closed_loop
+    pub dol: PvString, // desired output location link
+    pub oif: i16,      // 0=Full, 1=Incremental
+    pub oroc: f64,     // output rate of change
+    pub pval: f64,     // previous value
     // Invalid output
     pub ivoa: i16, // 0=Continue, 1=Don't drive, 2=Set to IVOV
     pub ivov: f64,
@@ -69,9 +69,10 @@ pub struct AoRecord {
     pub alst: f64,
     pub mlst: f64,
     // Runtime
-    /// C `prec->init` — see [`ConvertPhase`]. Set by `init_record` and by an
-    /// `SPC_LINCONV` put, cleared at the end of every `process`.
-    pub init: ConvertPhase,
+    /// C `prec->init`: nonzero while the next conversion is the initial one.
+    /// Set by `init_record` and by an `SPC_LINCONV` put, cleared at the end of
+    /// every `process`.
+    pub init: i16,
     /// Set by `convert()` when a `LINR >= 3` breakpoint-table conversion
     /// fails — the table could not be resolved, or the engineering value
     /// fell past an end of the table. C `aoRecord.c::convert` raises
@@ -105,8 +106,8 @@ pub struct AoRecord {
     skip_convert: bool,
     // Simulation
     pub simm: i16,
-    pub siml: String,
-    pub siol: String,
+    pub siml: PvString,
+    pub siol: PvString,
     pub sims: i16,
     pub sdly: f64,
 }
@@ -123,7 +124,7 @@ impl Default for AoRecord {
             drvl: 0.0,
             rval: 0,
             oraw: 0,
-            omod: false,
+            omod: 0,
             rbv: 0,
             orbv: 0,
             oval: 0.0,
@@ -136,7 +137,7 @@ impl Default for AoRecord {
             aslo: 0.0,
             aoff: 0.0,
             omsl: 0,
-            dol: String::new(),
+            dol: PvString::new(),
             oif: 0,
             oroc: 0.0,
             pval: 0.0,
@@ -147,7 +148,7 @@ impl Default for AoRecord {
             lalm: 0.0,
             alst: 0.0,
             mlst: 0.0,
-            init: ConvertPhase::default(),
+            init: 0,
             bpt_error: false,
             readback_bpt_error: false,
             bpt_registry: None,
@@ -155,8 +156,8 @@ impl Default for AoRecord {
             lbrk: 0,
             skip_convert: false,
             simm: 0,
-            siml: String::new(),
-            siol: String::new(),
+            siml: PvString::new(),
+            siol: PvString::new(),
             sims: 0,
             sdly: -1.0,
         }
@@ -199,7 +200,7 @@ impl AoRecord {
 
         // C `aoRecord.c:482-483`, in this order: the flag is the comparison
         // against the PREVIOUS oval, then oval takes the new value.
-        self.omod = self.oval != value;
+        self.omod = u8::from(self.oval != value);
         self.oval = value; // oval = rate-limited output value
 
         // convert(): engineering units to raw value
@@ -346,8 +347,87 @@ impl AoRecord {
 }
 
 impl Record for AoRecord {
+    // LINR/EGUF/EGUL reset the convert in `put_field`; menus are stored as
+    // `i16` and served as ENUM, so neither maps.
+    crate::slot_map!(crate::server::record::dbd_generated::slots::ao;
+        fields:
+        VAL => val,
+        OVAL => oval,
+        OROC => oroc,
+        PREC => prec,
+        EGU => egu,
+        ROFF => roff,
+        EOFF => eoff,
+        ESLO => eslo,
+        DRVH => drvh,
+        DRVL => drvl,
+        HOPR => hopr,
+        LOPR => lopr,
+        AOFF => aoff,
+        ASLO => aslo,
+        ADEL => adel,
+        MDEL => mdel,
+        RVAL => rval,
+        SDLY => sdly,
+        IVOV => ivov,
+        ORAW => oraw,
+        RBV => rbv,
+        ORBV => orbv,
+        PVAL => pval,
+        LALM => lalm,
+        ALST => alst,
+        MLST => mlst,
+        INIT => init,
+        OMOD => omod;
+        custom: DOL, OMSL, OIF, LINR, EGUF, EGUL, SIOL, SIML, SIMM, SIMS, IVOA;
+        spill: OUT, HIHI, LOLO, HIGH, LOW, HHSV, LLSV, HSV, LSV, HYST, PBRK, LBRK, OLDSIMM,
+            SSCN, SIMPVT);
+
+    fn held_pointer(&self, field: &str) -> Option<usize> {
+        match field {
+            // C `pbrk`, the table `cvtRawToEngBpt`/`cvtEngToRawBpt` found.
+            "PBRK" => self
+                .bpt_table
+                .as_ref()
+                .map(|t| std::sync::Arc::as_ptr(t) as usize),
+            _ => None,
+        }
+    }
+
+    fn acts_before_process(&self) -> bool {
+        false
+    }
+
+    fn cycle_hooks(&self) -> crate::server::record::CycleHooks {
+        crate::server::record::CycleHooks::NONE
+    }
+
+    fn has_array_monitor_post(&self) -> bool {
+        false
+    }
+
     fn record_type(&self) -> &'static str {
         "ao"
+    }
+
+    /// `aoRecord.c:152`
+    fn bad_init_ret_message(&self) -> Option<&'static str> {
+        Some("ao: init_record")
+    }
+
+    /// devaoStream.c reads and writes the `aoRecord` members itself.
+    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+        Some(self)
+    }
+
+    /// devAoSoft.c, devAoSoftRaw.c and devAoSoftCallback.c return `dbPutLink`'s status.
+    fn process_status_rule(&self) -> crate::server::record::ProcessStatusRule {
+        crate::server::record::ProcessStatusRule::io(crate::server::record::SoftStatus {
+            plain: true,
+            raw: true,
+            async_: true,
+        })
+        .with_dol(crate::server::record::DolStatus::UntilWrite)
     }
 
     /// C `aoRecord.c:181-184`: the `!dbLinkIsConstant(&prec->dol) && omsl ==
@@ -357,6 +437,15 @@ impl Record for AoRecord {
     /// (`:452-453`).
     fn fetches_dol_closed_loop(&self) -> bool {
         true
+    }
+
+    /// The closed-loop DOL is read at `DBR_DOUBLE` (`aoRecord.c:444`), so a source
+    /// that request cannot convert is a failed read.
+    fn input_link_request(&self, link_field: &str) -> crate::server::record::InputLinkRequest {
+        crate::server::record::InputLinkRequest::As(match link_field {
+            "DOL" => crate::server::record::LinkReadAs::Double,
+            _ => crate::server::record::LinkReadAs::Native,
+        })
     }
 
     /// `aoRecord.c:329-350` `get_control_double` lists `OVAL` and `PVAL`
@@ -384,6 +473,10 @@ impl Record for AoRecord {
         Some(EpicsValue::Long(self.rval))
     }
 
+    fn raw_soft_output_view(&self) -> Option<OutView<'_>> {
+        Some(OutView::Num(CycleValue::Long(self.rval)))
+    }
+
     /// C `aoRecord.c:112-113`:
     /// `if (recGblInitConstantLink(&prec->dol, DBF_DOUBLE, &prec->val))
     ///      prec->udf = isnan(prec->val);`
@@ -395,24 +488,38 @@ impl Record for AoRecord {
         )]
     }
 
-    /// C `aoRecord.c:156,160-161` — the derived half of the init tail, run
-    /// right after the constant load: `oval = pval = val`, then
-    /// `oraw = rval; orbv = rbv`. softIoc with `field(DOL,"5")` reports OVAL=5
-    /// at init.
-    fn init_record_tail(&mut self) {
-        self.oval = self.val;
-        self.pval = self.val;
-        self.oraw = self.rval;
-        self.orbv = self.rbv;
+    /// `devAoSoft` `init_record` returns 2; `devAoSoftRaw` has none.
+    fn soft_dset_init(&self) -> crate::server::device_support::DsetInit {
+        crate::server::device_support::DsetInit::DoNotConvert
     }
 
-    /// C `aoRecord.c:157-159` — `mlst = alst = lalm = val`, all three, which is
-    /// what the framework default would do anyway; spelled out because the
-    /// derived half above is this record's own.
-    fn seed_deadband_tracking(&mut self) {
+    /// C `aoRecord.c:132-150` `case(0)`: RVAL through the readback convert,
+    /// then `udf = isnan(value)`. A breakpoint failure `break`s with VAL and
+    /// UDF untouched and raises nothing at init.
+    fn dset_init_convert(&mut self) -> Option<bool> {
+        self.convert_readback();
+        if self.readback_bpt_error {
+            self.readback_bpt_error = false;
+            return None;
+        }
+        Some(self.val.is_nan())
+    }
+
+    /// C `aoRecord.c:155-161`: `oval = pval = val`, the deadband trackers,
+    /// then `oraw = rval; orbv = rbv` — all after `:152` returns
+    /// `S_dev_badInitRet` for a dset status other than 0 or 2. softIoc with
+    /// `field(DOL,"5")` reports OVAL=5 at init.
+    fn seed_deadband_tracking(&mut self, dset_init: crate::server::device_support::DsetInit) {
+        if dset_init == crate::server::device_support::DsetInit::Failed {
+            return;
+        }
+        self.oval = self.val;
+        self.pval = self.val;
         self.mlst = self.val;
         self.alst = self.val;
         self.lalm = self.val;
+        self.oraw = self.rval;
+        self.orbv = self.rbv;
     }
 
     // C `aoRecord.c::process` IVOA=Set_output_to_IVOV (lines 207-213):
@@ -431,110 +538,78 @@ impl Record for AoRecord {
         Ok(())
     }
 
+    fn eoff_eslo_before_dset_init(&mut self) -> Option<(f64, f64)> {
+        let saved = (self.eoff, self.eslo);
+        // "for old device support that doesn't know about eoff"
+        if self.eslo == 1.0 && self.eoff == 0.0 {
+            self.eoff = self.egul;
+        }
+        Some(saved)
+    }
+
+    fn eoff_eslo_after_dset_init(&mut self, (eoff, eslo): (f64, f64)) {
+        if self.linr == 1 {
+            self.eoff = eoff;
+            self.eslo = eslo;
+        }
+    }
+
     fn init_record(&mut self, pass: u8) -> CaResult<()> {
-        if pass == 0 {
-            // Legacy compatibility: if eslo==1.0 && eoff==0.0, set eoff from egul
-            let saved_eoff = self.eoff;
-            let saved_eslo = self.eslo;
-
-            if self.eslo == 1.0 && self.eoff == 0.0 {
-                self.eoff = self.egul;
-            }
-
-            // For SLOPE mode, restore user-configured eoff/eslo
-            if self.linr == 1 {
-                self.eoff = saved_eoff;
-                self.eslo = saved_eslo;
-            }
-
-            // C `aoRecord.c:120`: `prec->init = TRUE;`
-            self.init = ConvertPhase::Initial;
+        if pass == 1 {
+            // C `aoRecord.c:120`, after pass 0 returned at :103:
+            // `prec->init = TRUE;`
+            self.init = 1;
         }
         Ok(())
     }
 
-    /// C `aoRecord.c::monitor` (`:531-549`) posts OVAL from INSIDE
-    /// `if (monitor_mask)` with **no test of OVAL's own value**:
-    ///
-    /// ```c
-    /// if(prec->omod) monitor_mask |= (DBE_VALUE|DBE_LOG);
-    /// if(monitor_mask) {
-    ///     prec->omod = FALSE;
-    ///     db_post_events(prec,&prec->oval,monitor_mask);
-    /// ```
-    ///
-    /// On a cycle whose only event is an alarm transition, `monitor_mask` is
-    /// the alarm bits alone and `omod` is false (the output did not move), so
-    /// C still sends OVAL to a `DBE_ALARM` subscriber. The port's aux post is
-    /// change-detected, so an unchanged OVAL reached nobody — this hook is the
-    /// unchanged-field arm, and it posts with the alarm bits, which is exactly
-    /// `monitor_mask` on such a cycle.
-    ///
-    /// The CHANGED arm needs nothing: the framework's aux mask is
-    /// `alarm_bits | DBE_VALUE | DBE_LOG`, and C's is
-    /// `monitor_mask | DBE_VALUE | DBE_LOG` where the deadband bits it adds
-    /// (`DBE_VALUE` from MDEL, `DBE_ARCHIVE` from ADEL) are already in that
-    /// pair. RVAL/RBV are NOT named here: C gates each on its own
-    /// `oraw != rval` / `orbv != rbv` test, so an unchanged one posts on no
-    /// cycle at all.
-    fn alarm_cycle_monitored_fields(&self) -> &'static [&'static str] {
-        &["OVAL"]
-    }
-
-    /// C `aoRecord.c:539-548` posts RVAL and RBV from INSIDE
-    /// `if (monitor_mask)`, each behind its own `oraw != rval` /
-    /// `orbv != rbv` test, with the forced `monitor_mask|DBE_VALUE|DBE_LOG`.
-    /// The default change-detected path has neither guard, so a cycle whose
-    /// monitor mask is empty — VAL unchanged, no alarm move, `omod` false —
-    /// posted an RVAL that C withholds until the next cycle that does fire.
-    /// Reachable from a client with `caput AO.ASLO` (or AOFF/LINR) followed by
-    /// `caput AO.PROC 1`: measured on softIoc R7.0.10-146, C emits no event
-    /// there and leaves ORAW at its previous value.
+    /// C `aoRecord.c::monitor` (`:535-548`): OVAL whenever the guard
+    /// `omod` widens fires, with that guard as its mask; RVAL and RBV inside
+    /// it, each behind its own `oraw != rval` / `orbv != rbv` test, with
+    /// `monitor_mask|DBE_VALUE|DBE_LOG`. Measured on softIoc R7.0.10: an
+    /// alarm-only cycle posts OVAL with `DBE_ALARM` alone, and a cycle that
+    /// moves nothing posts none of the three.
     fn fields_posted_with_value_mask(&self) -> &'static [(&'static str, ValuePostGate)] {
         &[
+            ("OVAL", ValuePostGate::Guarded),
             ("RVAL", ValuePostGate::OnChangeForced),
             ("RBV", ValuePostGate::OnChangeForced),
         ]
+    }
+
+    /// `monitor()` decides all three from the record's own `omod`, `oraw`
+    /// and `orbv`, so the framework keeps no published copy of them.
+    fn fields_posted_only_when_marked(&self) -> &'static [&'static str] {
+        &["OVAL", "RVAL", "RBV"]
     }
 
     /// C `aoRecord.c:535` — `omod` opens the block above without opening VAL's
     /// own post, which is the case OROC creates: VAL sits at the target while
     /// OVAL steps toward it, so VAL crosses no deadband and the output still
     /// has to reach its monitors.
-    fn take_secondary_value_mask(&mut self) -> crate::server::recgbl::EventMask {
-        if std::mem::take(&mut self.omod) {
-            crate::server::recgbl::EventMask::VALUE | crate::server::recgbl::EventMask::LOG
-        } else {
-            crate::server::recgbl::EventMask::NONE
-        }
-    }
-
+    ///
     /// C `if(prec->oraw != prec->rval) { db_post_events(...); prec->oraw =
     /// prec->rval; }` (`aoRecord.c:541-543`) and its RBV twin (`:545-548`),
     /// minus the post. `oraw`/`orbv` are written NOWHERE else — `convert()`
     /// used to assign `oraw = rval` eagerly, which made this comparison
     /// unable to ever be true.
-    fn take_secondary_value_change(&mut self, field: &str) -> bool {
-        match field {
-            "RVAL" if self.oraw != self.rval => {
-                self.oraw = self.rval;
-                true
-            }
-            "RBV" if self.orbv != self.rbv => {
-                self.orbv = self.rbv;
-                true
-            }
-            _ => false,
+    fn take_secondary_value_changes(
+        &mut self,
+        value_mask: crate::server::recgbl::EventMask,
+    ) -> crate::server::record::SecondaryTake {
+        // C clears `omod` only inside `if (monitor_mask)`, so the shut block
+        // leaves it untouched and the idle cycle stores nothing. One OR, so
+        // the idle exit is one branch.
+        if value_mask.bits() | u16::from(self.omod) == 0 {
+            return crate::server::record::SecondaryTake::NONE;
         }
-    }
-
-    /// C never calls `db_post_events` on `oraw`/`orbv` — they are bookkeeping
-    /// for the RVAL/RBV posts above, not fields any C `monitor()` emits. The
-    /// generic change-detection loop would post them, so they are excluded
-    /// from it here; a `caput` to either still posts through the put path, as
-    /// it does for every field.
-    fn event_posted_fields(&self) -> &'static [&'static str] {
-        &["ORAW", "ORBV"]
+        let widened = std::mem::take(&mut self.omod) != 0;
+        let rval = crate::server::record::SecondaryTake::advance(&mut self.oraw, self.rval);
+        let rbv = crate::server::record::SecondaryTake::advance(&mut self.orbv, self.rbv);
+        crate::server::record::SecondaryTake::new(
+            1 | u64::from(rval) << 1 | u64::from(rbv) << 2,
+            widened,
+        )
     }
 
     fn process(&mut self) -> CaResult<ProcessOutcome> {
@@ -558,7 +633,7 @@ impl Record for AoRecord {
         self.skip_convert = false;
         // C `aoRecord.c:237`: `prec->init = FALSE;` on the way out of EVERY
         // process, not just the first one.
-        self.init = ConvertPhase::Converted;
+        self.init = 0;
         Ok(ProcessOutcome::complete())
     }
 
@@ -628,6 +703,46 @@ impl Record for AoRecord {
         true
     }
 
+    fn link_text_ref(&self, link_field: &str) -> Option<&[u8]> {
+        match link_field {
+            "DOL" => Some(self.dol.as_bytes()),
+            "SIML" => Some(self.siml.as_bytes()),
+            "SIOL" => Some(self.siol.as_bytes()),
+            _ => None,
+        }
+    }
+
+    fn simm_cells(&self) -> Option<crate::server::record::SimmCells> {
+        Some(crate::server::record::SimmCells {
+            simm: self.simm,
+            sims: self.sims,
+            sdly: self.sdly,
+        })
+    }
+
+    fn cycle_cell(&self, cell: CycleCell) -> CycleRead {
+        match cell {
+            CycleCell::Val => CycleRead::Value(CycleValue::Double(self.val)),
+            CycleCell::Oval => CycleRead::Value(CycleValue::Double(self.oval)),
+            CycleCell::Mdel => CycleRead::Value(CycleValue::Double(self.mdel)),
+            CycleCell::Adel => CycleRead::Value(CycleValue::Double(self.adel)),
+            CycleCell::Mlst => CycleRead::Value(CycleValue::Double(self.mlst)),
+            CycleCell::Alst => CycleRead::Value(CycleValue::Double(self.alst)),
+            CycleCell::Lalm => CycleRead::Value(CycleValue::Double(self.lalm)),
+            _ => CycleRead::Absent,
+        }
+    }
+
+    fn put_cycle_cell(&mut self, cell: CycleCell, value: CycleValue) -> CaResult<()> {
+        match (cell, value) {
+            (CycleCell::Lalm, CycleValue::Double(v)) => self.lalm = v,
+            (CycleCell::Alst, CycleValue::Double(v)) => self.alst = v,
+            (CycleCell::Mlst, CycleValue::Double(v)) => self.mlst = v,
+            (cell, value) => return self.put_field(cell.name(), value.into()),
+        }
+        Ok(())
+    }
+
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
             "VAL" => Some(EpicsValue::Double(self.val)),
@@ -642,6 +757,7 @@ impl Record for AoRecord {
             "RBV" => Some(EpicsValue::Long(self.rbv)),
             "ORBV" => Some(EpicsValue::Long(self.orbv)),
             "OVAL" => Some(EpicsValue::Double(self.oval)),
+            "OMOD" => Some(EpicsValue::UChar(self.omod)),
             "LINR" => Some(EpicsValue::Short(self.linr)),
             "EGUF" => Some(EpicsValue::Double(self.eguf)),
             "EGUL" => Some(EpicsValue::Double(self.egul)),
@@ -662,7 +778,7 @@ impl Record for AoRecord {
             "LALM" => Some(EpicsValue::Double(self.lalm)),
             "ALST" => Some(EpicsValue::Double(self.alst)),
             "MLST" => Some(EpicsValue::Double(self.mlst)),
-            "INIT" => Some(self.init.as_field()),
+            "INIT" => Some(EpicsValue::Short(self.init)),
             "SIMM" => Some(EpicsValue::Short(self.simm)),
             "SIML" => Some(EpicsValue::String(self.siml.clone().into())),
             "SIOL" => Some(EpicsValue::String(self.siol.clone().into())),
@@ -687,7 +803,7 @@ impl Record for AoRecord {
             },
             "EGU" => match value {
                 EpicsValue::String(v) => {
-                    self.egu = v;
+                    self.egu.set_bytes(v.as_bytes());
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
@@ -768,7 +884,7 @@ impl Record for AoRecord {
             "LINR" => match value {
                 EpicsValue::Short(v) => {
                     self.linr = v;
-                    self.init = ConvertPhase::Initial;
+                    self.init = 1;
                     // A LINR change re-selects the breakpoint table (C
                     // `special_linconv`); drop the cached table + interval
                     // index so the next conversion resolves the new LINR.
@@ -781,7 +897,7 @@ impl Record for AoRecord {
             "EGUF" => match value {
                 EpicsValue::Double(v) => {
                     self.eguf = v;
-                    self.init = ConvertPhase::Initial;
+                    self.init = 1;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
@@ -789,7 +905,7 @@ impl Record for AoRecord {
             "EGUL" => match value {
                 EpicsValue::Double(v) => {
                     self.egul = v;
-                    self.init = ConvertPhase::Initial;
+                    self.init = 1;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
@@ -845,7 +961,7 @@ impl Record for AoRecord {
             },
             "DOL" => match value {
                 EpicsValue::String(v) => {
-                    self.dol = v.as_str_lossy().into_owned();
+                    self.dol = v;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
@@ -922,14 +1038,14 @@ impl Record for AoRecord {
             },
             "SIML" => match value {
                 EpicsValue::String(v) => {
-                    self.siml = v.as_str_lossy().into_owned();
+                    self.siml = v;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
             },
             "SIOL" => match value {
                 EpicsValue::String(v) => {
-                    self.siol = v.as_str_lossy().into_owned();
+                    self.siol = v;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),

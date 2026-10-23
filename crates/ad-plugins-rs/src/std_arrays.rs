@@ -5,11 +5,14 @@
 // its `build.rs` began deriving `tokio_backend`; nothing here builds a
 // CA server, and the reactor these obtain comes from `#[tokio::test]`
 // itself, which the backend does not remove.
+use asyn_rs::port::InterfaceMask;
 use std::sync::Arc;
 
 use ad_core_rs::ndarray::NDArray;
 use ad_core_rs::ndarray_pool::NDArrayPool;
-use ad_core_rs::plugin::runtime::{NDPluginProcess, PluginRuntimeHandle, ProcessResult};
+use ad_core_rs::plugin::runtime::{
+    ArraySource, NDPluginProcess, PluginRuntimeHandle, ProcessResult,
+};
 use ad_core_rs::plugin::wiring::WiringRegistry;
 use parking_lot::Mutex;
 
@@ -38,6 +41,15 @@ impl Default for StdArraysProcessor {
 }
 
 impl NDPluginProcess for StdArraysProcessor {
+    const ASYN_FLAGS: asyn_rs::port::PortFlags = ad_core_rs::plugin::runtime::ASYN_NONE;
+    // NDPluginStdArrays.cpp:324-328, the same mask for both.
+    const INTERFACE_MASK: InterfaceMask = InterfaceMask::INT8_ARRAY
+        .or(InterfaceMask::INT16_ARRAY)
+        .or(InterfaceMask::INT32_ARRAY)
+        .or(InterfaceMask::INT64_ARRAY)
+        .or(InterfaceMask::FLOAT32_ARRAY)
+        .or(InterfaceMask::FLOAT64_ARRAY);
+    const INTERRUPT_MASK: InterfaceMask = Self::INTERFACE_MASK;
     fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
         // The frame goes on as it is; the runtime files it in `latest_data`.
         ProcessResult::forward(array, vec![])
@@ -49,8 +61,8 @@ impl NDPluginProcess for StdArraysProcessor {
 
     /// C `NDPluginStdArrays.cpp:343` sets `NDArrayCallbacks = 0`: this plugin
     /// serves pixel data via the StdArray waveforms, not downstream callbacks.
-    fn does_array_callbacks(&self) -> bool {
-        false
+    fn array_callbacks_seed(&self) -> Option<bool> {
+        Some(false)
     }
 
     /// C `NDPluginStdArrays` passes `compressionAware=true`
@@ -69,10 +81,13 @@ impl NDPluginProcess for StdArraysProcessor {
 
 /// Create a StdArrays plugin runtime.
 pub fn create_std_arrays_runtime(
-    port_name: &str,
-    pool: Arc<NDArrayPool>,
-    ndarray_port: &str,
+    claim: &asyn_rs::registry::PortClaim,
+    max_memory: usize,
+    queue_size: i32,
+    blocking_callbacks: i32,
+    source: impl Into<ArraySource>,
     wiring: Arc<WiringRegistry>,
+    threads: ad_core_rs::plugin::runtime::PluginThreads,
 ) -> (
     PluginRuntimeHandle,
     Arc<Mutex<Option<Arc<NDArray>>>>,
@@ -82,12 +97,14 @@ pub fn create_std_arrays_runtime(
     let data_handle = processor.data_handle();
 
     let (handle, data_jh) = ad_core_rs::plugin::runtime::create_plugin_runtime(
-        port_name,
+        claim,
         processor,
-        pool,
-        1, // LatestOnly semantics
-        ndarray_port,
+        max_memory,
+        queue_size,
+        blocking_callbacks,
+        source,
         wiring,
+        threads,
     );
 
     (handle, data_handle, data_jh)
@@ -140,7 +157,15 @@ mod tests {
     fn test_std_arrays_runtime() {
         let pool = NDArrayPool::new(1_000_000);
         let wiring = Arc::new(WiringRegistry::new());
-        let (handle, data, _jh) = create_std_arrays_runtime("IMAGE1", pool, "", wiring);
+        let (handle, data, _jh) = create_std_arrays_runtime(
+            &asyn_rs::asyn_record::claim_port("IMAGE1").unwrap(),
+            pool.max_memory(),
+            1,
+            0,
+            "",
+            wiring,
+            ad_core_rs::plugin::runtime::DEFAULT_PLUGIN_THREADS,
+        );
 
         // Plugins default to disabled — enable for test
         handle
@@ -154,7 +179,13 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        rt.block_on(handle.array_sender().publish(make_array(42)));
+        rt.block_on(
+            handle.array_sender().publish(
+                ad_core_rs::ndarray_pool::DriverPool::standalone(0)
+                    .alloc_copy(&make_array(42))
+                    .unwrap(),
+            ),
+        );
         wait_until("StdArrays to store the published array", || {
             data.lock().as_ref().is_some_and(|a| a.unique_id == 42)
         });
@@ -166,7 +197,15 @@ mod tests {
         // constructor; the initial param a client reads must be 0, not 1.
         let pool = NDArrayPool::new(1_000_000);
         let wiring = Arc::new(WiringRegistry::new());
-        let (handle, _data, _jh) = create_std_arrays_runtime("IMAGE1", pool, "", wiring);
+        let (handle, _data, _jh) = create_std_arrays_runtime(
+            &asyn_rs::asyn_record::claim_port("IMAGE1").unwrap(),
+            pool.max_memory(),
+            1,
+            0,
+            "",
+            wiring,
+            ad_core_rs::plugin::runtime::DEFAULT_PLUGIN_THREADS,
+        );
 
         let val = handle
             .port_runtime()
@@ -180,7 +219,7 @@ mod tests {
     fn test_terminal_plugins_do_not_do_array_callbacks() {
         // C disables NDArrayCallbacks in the constructor of `NDPluginStdArrays.cpp` (`:343`),
         // `NDPluginAttribute.cpp` (`:203`), and `NDPluginFile.cpp` (`:948`, base of every
-        // file writer). Each Rust counterpart overrides `does_array_callbacks()` to false so
+        // file writer). Each Rust counterpart seeds `array_callbacks_seed()` with false so
         // the initial param reflects this.
         use crate::attribute::AttributeProcessor;
         use crate::file_hdf5::Hdf5FileProcessor;
@@ -191,17 +230,38 @@ mod tests {
         use crate::file_tiff::TiffFileProcessor;
         use crate::passthrough::PassthroughProcessor;
 
-        assert!(!StdArraysProcessor::new().does_array_callbacks());
-        assert!(!AttributeProcessor::new("attr", 1).does_array_callbacks());
-        assert!(!Hdf5FileProcessor::new().does_array_callbacks());
-        assert!(!JpegFileProcessor::new(85).does_array_callbacks());
-        assert!(!TiffFileProcessor::new().does_array_callbacks());
-        assert!(!NetcdfFileProcessor::new().does_array_callbacks());
-        assert!(!NexusFileProcessor::new().does_array_callbacks());
-        assert!(!MagickFileProcessor::new().does_array_callbacks());
+        assert_eq!(
+            StdArraysProcessor::new().array_callbacks_seed(),
+            Some(false)
+        );
+        assert_eq!(
+            AttributeProcessor::new(1).array_callbacks_seed(),
+            Some(false)
+        );
+        assert_eq!(Hdf5FileProcessor::new().array_callbacks_seed(), Some(false));
+        assert_eq!(
+            JpegFileProcessor::new(85).array_callbacks_seed(),
+            Some(false)
+        );
+        assert_eq!(TiffFileProcessor::new().array_callbacks_seed(), Some(false));
+        assert_eq!(
+            NetcdfFileProcessor::new().array_callbacks_seed(),
+            Some(false)
+        );
+        assert_eq!(
+            NexusFileProcessor::new().array_callbacks_seed(),
+            Some(false)
+        );
+        assert_eq!(
+            MagickFileProcessor::new().array_callbacks_seed(),
+            Some(false)
+        );
 
-        // A non-terminal plugin keeps the default: it does deliver downstream.
-        assert!(PassthroughProcessor::new("NDPluginProcess").does_array_callbacks());
+        // A plugin whose C constructor does not set it leaves it to the template.
+        assert_eq!(
+            PassthroughProcessor::new("NDPluginProcess").array_callbacks_seed(),
+            None
+        );
     }
 
     #[test]
@@ -222,7 +282,15 @@ mod tests {
 
         let pool = NDArrayPool::new(1_000_000);
         let wiring = Arc::new(WiringRegistry::new());
-        let (handle, data, _jh) = create_std_arrays_runtime("IMAGE1", pool, "", wiring);
+        let (handle, data, _jh) = create_std_arrays_runtime(
+            &asyn_rs::asyn_record::claim_port("IMAGE1").unwrap(),
+            pool.max_memory(),
+            1,
+            0,
+            "",
+            wiring,
+            ad_core_rs::plugin::runtime::DEFAULT_PLUGIN_THREADS,
+        );
         let dropped = handle.array_sender().dropped_arrays_counter().clone();
         handle
             .port_runtime()
@@ -235,7 +303,13 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        rt.block_on(handle.array_sender().publish(Arc::new(compressed)));
+        rt.block_on(
+            handle.array_sender().publish(
+                ad_core_rs::ndarray_pool::DriverPool::standalone(0)
+                    .alloc_copy(&compressed)
+                    .unwrap(),
+            ),
+        );
         wait_until("StdArrays to store the compressed frame", || {
             data.lock().as_ref().is_some_and(|a| a.unique_id == 7)
         });
@@ -283,7 +357,15 @@ mod tests {
 
         let pool = NDArrayPool::new(1_000_000);
         let wiring = Arc::new(WiringRegistry::new());
-        let (handle, _data, _jh) = create_std_arrays_runtime("IMAGE1", pool, "", wiring);
+        let (handle, _data, _jh) = create_std_arrays_runtime(
+            &asyn_rs::asyn_record::claim_port("IMAGE1").unwrap(),
+            pool.max_memory(),
+            1,
+            0,
+            "",
+            wiring,
+            ad_core_rs::plugin::runtime::DEFAULT_PLUGIN_THREADS,
+        );
 
         let port = handle.port_runtime().port_handle();
         port.write_int32_blocking(handle.plugin_params.enable_callbacks, 0, 1)
@@ -294,13 +376,41 @@ mod tests {
             .unwrap();
         params_applied(&handle);
 
-        let mut rx = port.interrupts().subscribe_async();
+        // The ArrayData waveform's binding, an asynInt8ArrayIn I/O Intr.
+        let std = port
+            .drv_user_create_blocking(&asyn_rs::port::DrvUserRequest::new("STD_ARRAY_DATA", 0))
+            .unwrap()
+            .reason;
+        let served = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen = served.clone();
+        let _binding = port
+            .interrupts()
+            .register_sync_callback(
+                asyn_rs::interrupt::InterruptFilter {
+                    reason: Some(std),
+                    addr: Some(0),
+                    iface: Some(asyn_rs::interfaces::InterfaceType::Int8Array),
+                    ..Default::default()
+                },
+                move |iv| {
+                    if matches!(iv.value, ParamValue::Int8Array(_)) {
+                        seen.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                },
+            )
+            .unwrap();
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
-        rt.block_on(handle.array_sender().publish(make_array(7)));
+        rt.block_on(
+            handle.array_sender().publish(
+                ad_core_rs::ndarray_pool::DriverPool::standalone(0)
+                    .alloc_copy(&make_array(7))
+                    .unwrap(),
+            ),
+        );
         // ArrayCounter==1 ⟹ the frame was processed and its param batch
         // (including the waveform interrupts) flushed.
         wait_until("StdArrays to process the frame", || {
@@ -308,24 +418,8 @@ mod tests {
                 .is_ok_and(|v| v == 1)
         });
 
-        // make_array(7) is a 4-element UInt8 array → the STD_ARRAY_DATA
-        // interrupt carries it as an Int8Array; the dimensions interrupt carries
-        // an Int32Array. Finding an Int8Array interrupt proves the waveform was
-        // served despite NDArrayCallbacks=0.
-        let mut served = false;
-        loop {
-            match rx.try_recv() {
-                Ok(v) => {
-                    if matches!(v.value, ParamValue::Int8Array(_)) {
-                        served = true;
-                    }
-                }
-                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
-                Err(_) => break,
-            }
-        }
         assert!(
-            served,
+            served.load(std::sync::atomic::Ordering::Relaxed),
             "StdArrays must serve STD_ARRAY_DATA with NDArrayCallbacks=0"
         );
     }
@@ -339,7 +433,15 @@ mod tests {
 
         let pool = NDArrayPool::new(1_000_000);
         let wiring = Arc::new(WiringRegistry::new());
-        let (handle, _data, _jh) = create_std_arrays_runtime("IMAGE1", pool, "", wiring);
+        let (handle, _data, _jh) = create_std_arrays_runtime(
+            &asyn_rs::asyn_record::claim_port("IMAGE1").unwrap(),
+            pool.max_memory(),
+            1,
+            0,
+            "",
+            wiring,
+            ad_core_rs::plugin::runtime::DEFAULT_PLUGIN_THREADS,
+        );
         let port = handle.port_runtime().port_handle();
         port.write_int32_blocking(handle.plugin_params.enable_callbacks, 0, 1)
             .unwrap();
@@ -355,7 +457,13 @@ mod tests {
             .build()
             .unwrap();
 
-        rt.block_on(handle.array_sender().publish(make_array(1)));
+        rt.block_on(
+            handle.array_sender().publish(
+                ad_core_rs::ndarray_pool::DriverPool::standalone(0)
+                    .alloc_copy(&make_array(1))
+                    .unwrap(),
+            ),
+        );
         wait_until("first frame to be served and counted", || {
             port.read_int32_blocking(handle.ndarray_params.array_counter, 0)
                 .is_ok_and(|v| v == 1)
@@ -364,7 +472,13 @@ mod tests {
             .read_int32_blocking(handle.ndarray_params.array_counter, 0)
             .unwrap();
 
-        rt.block_on(handle.array_sender().publish(make_array(2)));
+        rt.block_on(
+            handle.array_sender().publish(
+                ad_core_rs::ndarray_pool::DriverPool::standalone(0)
+                    .alloc_copy(&make_array(2))
+                    .unwrap(),
+            ),
+        );
         // The throttled frame leaves ArrayCounter unchanged, so wait on the
         // observable it DOES advance: DroppedArrays.
         wait_until("throttled frame to advance DroppedArrays", || {

@@ -1,0 +1,296 @@
+epics> DBF_UCHAR:          1 = 0x1   
+epics> DBF_UCHAR:          1 = 0x1   
+epics> DBF_STRING[0]: (empty)        
+epics> DBF_CHAR[0]: (empty)          
+epics> DBF_STRING:         ""        
+epics> DBF_STRING:         ""        
+epics> DBF_CHAR:           0 = 0x0   
+epics> DBF_CHAR[4]:        "xyz"     
+epics> DBF_STRING:         "xyz"     
+epics> DBF_CHAR[17]:       "longer_text_here"  
+epics> DBF_CHAR[6]:        "hello"   
+epics> DBF_STRING:         "hello"   
+epics> DBF_CHAR[3]:        "pq"      
+epics> DBF_CHAR[4]:        "abc"     
+epics> DBF_CHAR[11]:       "PF NPP NMS"        
+epics> DBF_STRING:         "PF NPP NMS"        
+epics> DBF_CHAR[4]:        "2.5"     
+epics> DBF_STRING:         "2.5"     
+epics> DBF_CHAR[3]:        "pq"      
+epics> DBF_CHAR[3]:        "pq"      
+epics> DBF_CHAR[3]:        "ai"      
+epics> PV 'AI.VAL$' not found
+epics> PV 'SI.val' not found
+epics> DBF_STRING[2]:      "ab"      "cd"      
+epics> DBF_CHAR[2]:        "ab"      
+epics> DBF_STRING:         "ab"      
+epics> DBF_CHAR:           97 = 0x61 = 'a'     
+epics> Record Address: 0x614d8f4b3c90 Field Address: 0x614d8f4c0680 Field Description: 0x614d8f46d3a0
+   No Elements: 41
+   Record Type: lsi
+    Field Type: 1 = DBF_CHAR
+    Field Size: 1
+       Special: 100
+DBR Field Type: 1 = DBR_CHAR
+epics> Record Address: 0x614d8f4b5930 Field Address: 0x614d8f4b5be0 Field Description: 0x614d8f49c3d0
+   No Elements: 40
+   Record Type: stringin
+    Field Type: 1 = DBF_CHAR
+    Field Size: 1
+       Special: 0
+DBR Field Type: 1 = DBR_CHAR
+epics> Record Address: 0x614d8f4b4600 Field Address: 0x614d8f4b48d0 Field Description: 0x614d8f470ad0
+   No Elements: 1024
+   Record Type: lso
+    Field Type: 14 = DBF_INLINK
+    Field Size: 1
+       Special: 0
+DBR Field Type: 1 = DBR_CHAR
+epics> Record Address: 0x614d8f4b5140 Field Address: 0x614d8f4c09c0 Field Description: 0x614d8f48bf50
+   No Elements: 41
+   Record Type: printf
+    Field Type: 1 = DBF_CHAR
+    Field Size: 1
+       Special: 2
+DBR Field Type: 1 = DBR_CHAR
+epics> status = 0, severity = 0
+units not returned
+precision not returned
+time = <undefined>
+enum strings not returned
+DBRgrLong not returned
+DBRgrDouble not returned
+DBRctrlLong not returned
+DBRctrlDouble not returned
+DBRalLong not returned
+DBRalDouble not returned
+DBF_CHAR[0]: (empty)          
+DBF_STRING[3]:      "112"     "113"     "0"       
+DBF_CHAR[3]:        "pq"      
+DBF_UCHAR[3]:       112 = 0x70          113 = 0x71          0 = 0x0   
+DBF_SHORT[3]:       112 = 0x70          113 = 0x71          0 = 0x0   
+DBF_USHORT[3]:      112 = 0x70          113 = 0x71          0 = 0x0   
+DBF_LONG[3]:        112 = 0x70          113 = 0x71          0 = 0x0   
+DBF_ULONG[3]:       112 = 0x70          113 = 0x71          0 = 0x0   
+DBF_INT64[3]:       112 = 0x70          113 = 0x71          0 = 0x0   
+DBF_UINT64[3]:      112 = 0x70          113 = 0x71          0 = 0x0   
+DBF_FLOAT[3]:       112       113       0         
+DBF_DOUBLE[3]:      112       113       0         
+DBF_ENUM[3]:        112       113       0         
+epics> status = 0, severity = 0
+units not returned
+precision not returned
+time = <undefined>
+enum strings not returned
+DBRgrLong not returned
+DBRgrDouble not returned
+DBRctrlLong not returned
+DBRctrlDouble not returned
+DBRalLong not returned
+DBRalDouble not returned
+DBF_CHAR[0]: (empty)          
+DBF_STRING[40]:     "104"     "101"     "108"     "108"     "111"     "0"       
+"0"       "0"       "0"       "0"       "0"       "0"       "0"       "0"       
+"0"       "0"       "0"       "0"       "0"       "0"       "0"       "0"       
+"0"       "0"       "0"       "0"       "0"       "0"       "0"       "0"       
+"0"       "0"       "0"       "0"       "0"       "0"       "0"       "0"       
+"0"       "0"       
+DBF_CHAR[6]:        "hello"   
+DBF_UCHAR[40]:      104 = 0x68          101 = 0x65          108 = 0x6c          
+108 = 0x6c          111 = 0x6f          0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   
+0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   
+0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   
+0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   
+0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   
+DBF_SHORT[40]:      104 = 0x68          101 = 0x65          108 = 0x6c          
+108 = 0x6c          111 = 0x6f          0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   
+0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   
+0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   
+0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   
+0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   
+DBF_USHORT[40]:     104 = 0x68          101 = 0x65          108 = 0x6c          
+108 = 0x6c          111 = 0x6f          0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   
+0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   
+0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   
+0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   
+0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   
+DBF_LONG[40]:       104 = 0x68          101 = 0x65          108 = 0x6c          
+108 = 0x6c          111 = 0x6f          0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   
+0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   
+0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   
+0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   
+0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   
+DBF_ULONG[40]:      104 = 0x68          101 = 0x65          108 = 0x6c          
+108 = 0x6c          111 = 0x6f          0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   
+0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   
+0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   
+0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   
+0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   
+DBF_INT64[40]:      104 = 0x68          101 = 0x65          108 = 0x6c          
+108 = 0x6c          111 = 0x6f          0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   
+0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   
+0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   
+0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   
+0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   
+DBF_UINT64[40]:     104 = 0x68          101 = 0x65          108 = 0x6c          
+108 = 0x6c          111 = 0x6f          0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   
+0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   
+0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   
+0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   
+0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   0 = 0x0   
+DBF_FLOAT[40]:      104       101       108       108       111       0         
+0         0         0         0         0         0         0         0         
+0         0         0         0         0         0         0         0         
+0         0         0         0         0         0         0         0         
+0         0         0         0         0         0         0         0         
+0         0         
+DBF_DOUBLE[40]:     104       101       108       108       111       0         
+0         0         0         0         0         0         0         0         
+0         0         0         0         0         0         0         0         
+0         0         0         0         0         0         0         0         
+0         0         0         0         0         0         0         0         
+0         0         
+DBF_ENUM[40]:       104       101       108       108       111       0         
+0         0         0         0         0         0         0         0         
+0         0         0         0         0         0         0         0         
+0         0         0         0         0         0         0         0         
+0         0         0         0         0         0         0         0         
+0         0         
+epics> status = 0, severity = 0
+units not returned
+precision not returned
+time = <undefined>
+enum strings not returned
+DBRgrLong not returned
+DBRgrDouble not returned
+DBRctrlLong not returned
+DBRctrlDouble not returned
+DBRalLong not returned
+DBRalDouble not returned
+DBF_CHAR[0]: (empty)          
+DBF_STRING:         "PF NPP NMS"        
+DBF_CHAR[11]:       "PF NPP NMS"        
+DBF_UCHAR[11]:      80 = 0x50 70 = 0x46 32 = 0x20 78 = 0x4e 80 = 0x50 80 = 0x50 
+32 = 0x20 78 = 0x4e 77 = 0x4d 83 = 0x53 0 = 0x0   
+DBF_SHORT[1024]:    failed.   
+DBF_USHORT[1024]:   failed.   
+DBF_LONG[800]:      failed.   
+DBF_ULONG[800]:     failed.   
+DBF_INT64[400]:     failed.   
+DBF_UINT64[400]:    failed.   
+DBF_FLOAT[800]:     failed.   
+DBF_DOUBLE:         nan       
+DBF_ENUM[1024]:     failed.   
+epics> status = 17, severity = 3
+units = ""
+precision not returned
+time = <undefined>
+enum strings not returned
+grLong: 0 .. 0
+grDouble: 0 .. 0
+ctrlLong: 0 .. 0
+ctrlDouble: 0 .. 0
+alLong: 0 < 0 .. 0 < 0
+alDouble: 0 < 0 .. 0 < 0
+DBF_CHAR[0]: (empty)          
+DBF_STRING:         "ai"      
+DBF_CHAR[3]:        "ai"      
+DBF_UCHAR[3]:       97 = 0x61 105 = 0x69          0 = 0x0   
+DBF_SHORT[40]:      failed.   
+DBF_USHORT[40]:     failed.   
+DBF_LONG[40]:       failed.   
+DBF_ULONG[40]:      failed.   
+DBF_INT64[40]:      failed.   
+DBF_UINT64[40]:     failed.   
+DBF_FLOAT[40]:      failed.   
+DBF_DOUBLE[40]:     failed.   
+DBF_ENUM[40]:       failed.   
+epics> status = 0, severity = 0
+units = ""
+precision not returned
+time = <undefined>
+enum strings not returned
+grLong: 0 .. 0
+grDouble: 0 .. 0
+ctrlLong: 0 .. 0
+ctrlDouble: 0 .. 0
+DBRalLong not returned
+DBRalDouble not returned
+DBF_CHAR[0]: (empty)          
+DBF_STRING[2]:      "97"      "98"      
+DBF_CHAR[2]:        "ab"      
+DBF_UCHAR[2]:       97 = 0x61 98 = 0x62 
+DBF_SHORT[2]:       97 = 0x61 98 = 0x62 
+DBF_USHORT[2]:      97 = 0x61 98 = 0x62 
+DBF_LONG[2]:        97 = 0x61 98 = 0x62 
+DBF_ULONG[2]:       97 = 0x61 98 = 0x62 
+DBF_INT64[2]:       97 = 0x61 98 = 0x62 
+DBF_UINT64[2]:      97 = 0x61 98 = 0x62 
+DBF_FLOAT[2]:       97        98        
+DBF_DOUBLE[2]:      97        98        
+DBF_ENUM[2]:        97        98        
+epics> Put as DBR_STRING Failed.
+Cvt to DBR_CHAR failed.
+Cvt to DBR_UCHAR failed.
+Cvt to DBR_SHORT failed.
+Cvt to DBR_USHORT failed.
+Cvt to DBR_LONG failed.
+Cvt to DBR_ULONG failed.
+Cvt to DBR_INT64 failed.
+Cvt to DBR_UINT64 failed.
+Cvt to DBR_FLOAT failed.
+Cvt to DBR_DOUBLE failed.
+Cvt to DBR_ENUM failed.
+epics> Put as DBR_STRING Ok, result as DBF_CHAR[6]:        "Aello"   
+Put as DBR_CHAR   Ok, result as DBF_CHAR[6]:        "Aello"   
+Put as DBR_UCHAR  Ok, result as DBF_CHAR[6]:        "Aello"   
+Put as DBR_SHORT  Ok, result as DBF_CHAR[6]:        "Aello"   
+Put as DBR_USHORT Ok, result as DBF_CHAR[6]:        "Aello"   
+Put as DBR_LONG   Ok, result as DBF_CHAR[6]:        "Aello"   
+Put as DBR_ULONG  Ok, result as DBF_CHAR[6]:        "Aello"   
+Put as DBR_INT64  Ok, result as DBF_CHAR[6]:        "Aello"   
+Put as DBR_UINT64 Ok, result as DBF_CHAR[6]:        "Aello"   
+Put as DBR_FLOAT  Ok, result as DBF_CHAR[6]:        "Aello"   
+Put as DBR_DOUBLE Ok, result as DBF_CHAR[6]:        "Aello"   
+Put as DBR_ENUM   Ok, result as DBF_CHAR[6]:        "Aello"   
+epics> DBF_STRING:         "Aello"   
+epics> Put as DBR_STRING Ok, result as DBF_CHAR[2]:        "B"       
+Put as DBR_CHAR   Ok, result as DBF_CHAR[2]:        "B"       
+Put as DBR_UCHAR  Ok, result as DBF_CHAR[2]:        "B"       
+Put as DBR_SHORT  Ok, result as DBF_CHAR[2]:        "B"       
+Put as DBR_USHORT Ok, result as DBF_CHAR[2]:        "B"       
+Put as DBR_LONG   Ok, result as DBF_CHAR[2]:        "B"       
+Put as DBR_ULONG  Ok, result as DBF_CHAR[2]:        "B"       
+Put as DBR_INT64  Ok, result as DBF_CHAR[2]:        "B"       
+Put as DBR_UINT64 Ok, result as DBF_CHAR[2]:        "B"       
+Put as DBR_FLOAT  Ok, result as DBF_CHAR[2]:        "B"       
+Put as DBR_DOUBLE Ok, result as DBF_CHAR[2]:        "B"       
+Put as DBR_ENUM   Ok, result as DBF_CHAR[2]:        "B"       
+epics> DBF_STRING:         "B"       
+epics> Put as DBR_STRING Ok, result as DBF_CHAR[11]:       "SI NPP NMS"        
+Cvt to DBR_CHAR failed.
+Cvt to DBR_UCHAR failed.
+Cvt to DBR_SHORT failed.
+Cvt to DBR_USHORT failed.
+Cvt to DBR_LONG failed.
+Cvt to DBR_ULONG failed.
+Cvt to DBR_INT64 failed.
+Cvt to DBR_UINT64 failed.
+Cvt to DBR_FLOAT failed.
+Cvt to DBR_DOUBLE failed.
+Cvt to DBR_ENUM failed.
+epics> Put as DBR_STRING Failed.
+Cvt to DBR_CHAR failed.
+Cvt to DBR_UCHAR failed.
+Cvt to DBR_SHORT failed.
+Cvt to DBR_USHORT failed.
+Cvt to DBR_LONG failed.
+Cvt to DBR_ULONG failed.
+Cvt to DBR_INT64 failed.
+Cvt to DBR_UINT64 failed.
+Cvt to DBR_FLOAT failed.
+Cvt to DBR_DOUBLE failed.
+Cvt to DBR_ENUM failed.
+epics> epics> DBF_CHAR[3]:        "xy"      
+epics> DBF_STRING[3]:      "xy"      "cd"      ""        
+epics> 

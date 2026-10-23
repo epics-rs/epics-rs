@@ -44,8 +44,7 @@ fn create_monitor_set_after_ioc_init_starts_a_saving_set() {
         let builder = holder.lock().unwrap().into_builder();
         let mgr = Arc::new(builder.build().await);
         assert!(mgr.set_names().is_empty());
-        let reactor = epics_base_rs::runtime::task::Reactor::current().unwrap();
-        let task = mgr.clone().start(&reactor, db.clone());
+        let task = mgr.clone().start(db.clone());
         holder.lock().unwrap().manager = Some(mgr);
         (
             epics_base_rs::runtime::task::BlockingBridge::capture(),
@@ -57,20 +56,13 @@ fn create_monitor_set_after_ioc_init_starts_a_saving_set() {
     find(&cmds, "create_monitor_set")
         .handler
         .call(
-            &[
-                ArgValue::String("settings.req".to_string()),
-                ArgValue::Int(1),
-            ],
+            &[ArgValue::String("settings.req".into()), ArgValue::Int(1)],
             &ctx,
         )
         .expect("create_monitor_set after iocInit is accepted");
 
     let mgr = holder.lock().unwrap().manager.clone().unwrap();
     assert_eq!(mgr.set_names(), vec!["settings.req".to_string()]);
-    assert!(
-        holder.lock().unwrap().monitor_sets.is_empty(),
-        "a set added to the running manager is not queued for a build that already happened"
-    );
 
     // The set's task ticks on its own; C's `create_data_set` starts the
     // save task the same way.
@@ -86,7 +78,7 @@ fn create_monitor_set_after_ioc_init_starts_a_saving_set() {
 }
 
 #[test]
-fn create_monitor_set_after_ioc_init_reports_an_unloadable_request_file() {
+fn create_monitor_set_after_ioc_init_keeps_no_unloadable_set() {
     let dir = tempfile::tempdir().unwrap();
     let rt = tokio::runtime::Runtime::new().unwrap();
     let mut cfg = AutosaveStartupConfig::new();
@@ -102,22 +94,16 @@ fn create_monitor_set_after_ioc_init_reports_an_unloadable_request_file() {
     });
     let ctx = CommandContext::new(db, bridge);
 
-    let err = match find(&cmds, "create_monitor_set").handler.call(
-        &[
-            ArgValue::String("missing.req".to_string()),
-            ArgValue::Int(1),
-        ],
-        &ctx,
-    ) {
-        Err(e) => e,
-        Ok(_) => panic!("a request file that cannot be found is the caller's error"),
-    };
-    assert!(err.contains("missing.req"), "{err}");
+    // C's wrapper ignores the status, and `readReqFile` has printed its
+    // line; the freed list leaves nothing for save_restoreShow (save_restore.c:2460).
+    find(&cmds, "create_monitor_set")
+        .handler
+        .call(
+            &[ArgValue::String("missing.req".into()), ArgValue::Int(1)],
+            &ctx,
+        )
+        .expect("C's command never fails");
     let mgr = holder.lock().unwrap().manager.clone().unwrap();
     assert!(mgr.set_names().is_empty());
-    assert_eq!(
-        rt.block_on(mgr.status_all()).len(),
-        1,
-        "listed by fdblist as an error"
-    );
+    assert!(rt.block_on(mgr.status_all()).is_empty());
 }

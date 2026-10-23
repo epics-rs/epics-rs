@@ -10,6 +10,8 @@ is three steps and the only prerequisite is a Rust toolchain (pinned in
 | [`setup.sh`](./setup.sh)   | Install `rustup` if missing and resolve the pinned toolchain (channel + `clippy`/`rustfmt`). |
 | [`build.sh`](./build.sh)   | Build the whole workspace in release mode (`cargo build --release --workspace`). |
 | [`run-ioc.sh`](./run-ioc.sh) | Build and run one of the bundled example IOCs (defaults to `mini-beamline`). |
+| [`pgo-train.sh`](./pgo-train.sh) | Train the PGO profile for the shipped Linux x86_64 IOCs (`realtime-ca-ioc`, `realtime-pva-ioc`, `softioc-rs`); writes `target/pgo/merged.profdata`. Needs the `llvm-tools` rustup component and a C compiler. |
+| [`pgo-build.sh`](./pgo-build.sh) | Release-build those IOCs with that profile; refuses a profile older than the sources. |
 
 ## Quick start
 

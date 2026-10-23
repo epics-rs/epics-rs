@@ -1,0 +1,11 @@
+[package]
+name = "fact-budget"
+version.workspace = true
+edition.workspace = true
+description = "Test-only: the one budget a test may put on a fact it expects to happen, and the causal barrier an absence claim closes on"
+license-file = "LICENSE"
+authors.workspace = true
+repository.workspace = true
+# Never published. Every consumer takes it as a `path`-only dev-dependency,
+# which `cargo package` drops from the uploaded manifest.
+publish = false

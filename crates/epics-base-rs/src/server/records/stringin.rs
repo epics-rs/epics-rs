@@ -1,4 +1,5 @@
 use crate::error::{CaError, CaResult};
+use crate::server::record::{CycleCell, CycleRead};
 use crate::server::record::{MENU_POST, MENU_YES_NO, ProcessOutcome, Record};
 use crate::types::{EpicsValue, PvString};
 
@@ -6,16 +7,12 @@ use crate::types::{EpicsValue, PvString};
 /// buffers in C `stringinRecord.c`; every copy truncates at 40.
 const MAX_STRING_SIZE: usize = 40;
 
-/// Truncate `s` to at most `MAX_STRING_SIZE - 1` bytes. C
+/// `s` cut to at most `MAX_STRING_SIZE - 1` bytes. C
 /// `strncpy(dst, src, sizeof(prec->val))` copies 39 payload bytes + an
 /// implicit NUL byte for byte with no UTF-8 awareness, so the cut is on
 /// a raw byte boundary and a non-UTF-8 VAL keeps its bytes verbatim.
-fn truncate_string(s: PvString) -> PvString {
-    let max = MAX_STRING_SIZE - 1;
-    if s.len() <= max {
-        return s;
-    }
-    PvString::from_bytes(s.as_bytes()[..max].to_vec())
+fn truncated(s: &[u8]) -> &[u8] {
+    &s[..s.len().min(MAX_STRING_SIZE - 1)]
 }
 
 /// Stringin record — a 40-byte (`MAX_STRING_SIZE`) string input.
@@ -28,8 +25,11 @@ pub struct StringinRecord {
     pub val: PvString,
     pub oval: PvString,
     pub simm: i16,
-    pub siml: String,
-    pub siol: String,
+    pub siml: PvString,
+    pub siol: PvString,
+    /// The SIOL read's buffer (`dbGetLink(&prec->siol, DBR_STRING,
+    /// prec->sval)`, stringinRecord.c:208), copied to VAL on success.
+    pub sval: PvString,
     pub sims: i16,
     pub sdly: f64,
     /// `menu(stringinPOST)` Post Value Monitors (0=On Change, 1=Always).
@@ -47,8 +47,9 @@ impl Default for StringinRecord {
             val: PvString::new(),
             oval: PvString::new(),
             simm: 0,
-            siml: String::new(),
-            siol: String::new(),
+            siml: PvString::new(),
+            siol: PvString::new(),
+            sval: PvString::new(),
             sims: 0,
             sdly: -1.0,
             mpst: 0,
@@ -60,15 +61,46 @@ impl Default for StringinRecord {
 impl StringinRecord {
     pub fn new(val: &str) -> Self {
         Self {
-            val: truncate_string(PvString::from(val)),
+            val: PvString::from(truncated(val.as_bytes())),
             ..Default::default()
         }
     }
 }
 
 impl Record for StringinRecord {
+    crate::slot_map!(crate::server::record::dbd_generated::slots::stringin;
+        fields:
+        VAL => val,
+        SVAL => sval,
+        SDLY => sdly,
+        OVAL => oval;
+        custom: MPST, APST, SIOL, SIML, SIMM, SIMS;
+        spill: INP, OLDSIMM, SSCN, SIMPVT);
+
+    fn acts_before_process(&self) -> bool {
+        false
+    }
+
+    fn cycle_hooks(&self) -> crate::server::record::CycleHooks {
+        crate::server::record::CycleHooks::NONE
+    }
+
     fn record_type(&self) -> &'static str {
         "stringin"
+    }
+
+    /// devstringinStream.c reads and writes the `stringinRecord` members itself.
+    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+        Some(self)
+    }
+
+    /// devSiSoft.c returns `dbGetLink`'s status.
+    fn process_status_rule(&self) -> crate::server::record::ProcessStatusRule {
+        crate::server::record::ProcessStatusRule::io(crate::server::record::SoftStatus {
+            plain: true,
+            raw: false,
+            async_: false,
+        })
     }
 
     /// C reads INP (`devSiSoft.c:53`) and SIOL (`stringinRecord.c:208`) with
@@ -79,6 +111,23 @@ impl Record for StringinRecord {
             "INP" | "SIOL" => crate::server::record::LinkReadAs::String,
             _ => crate::server::record::LinkReadAs::Native,
         })
+    }
+
+    /// `devSiSoft.c:53` reads straight into VAL: the `putStringString` row
+    /// `set_val` reaches for a String, without its field lookups.
+    fn soft_input_read(
+        &mut self,
+        value: Option<EpicsValue>,
+        _dpvt: &mut crate::server::device_support::Dpvt,
+    ) -> CaResult<()> {
+        match value {
+            Some(EpicsValue::String(s)) => {
+                self.val.set_bytes(truncated(s.as_bytes()));
+                Ok(())
+            }
+            Some(value) => self.set_val(value),
+            None => Ok(()),
+        }
     }
 
     /// `SIMM` is `DBF_MENU menu(menuYesNo)` (`stringinRecord.dbd.pod`): the
@@ -112,7 +161,7 @@ impl Record for StringinRecord {
     fn monitor_value_changed(&mut self) -> Option<bool> {
         let changed = self.oval != self.val;
         if changed {
-            self.oval = self.val.clone();
+            self.oval.clone_from(&self.val);
         }
         Some(changed)
     }
@@ -158,8 +207,66 @@ impl Record for StringinRecord {
         false
     }
 
+    /// `monitor()` posts VAL alone (`stringinRecord.c:174-188`); OVAL is
+    /// its private copy.
+    fn process_posted_fields(&self) -> Option<crate::server::record::DeclaredFields> {
+        Some(
+            &const {
+                crate::server::record::declared_set(
+                    crate::server::record::dbd_generated::STRINGIN_FIELDS,
+                    ["VAL"],
+                )
+            },
+        )
+    }
+
     fn process(&mut self) -> CaResult<ProcessOutcome> {
         Ok(ProcessOutcome::complete())
+    }
+
+    fn link_text_ref(&self, link_field: &str) -> Option<&[u8]> {
+        match link_field {
+            "SIML" => Some(self.siml.as_bytes()),
+            "SIOL" => Some(self.siol.as_bytes()),
+            _ => None,
+        }
+    }
+
+    fn simm_cells(&self) -> Option<crate::server::record::SimmCells> {
+        Some(crate::server::record::SimmCells {
+            simm: self.simm,
+            sims: self.sims,
+            sdly: self.sdly,
+        })
+    }
+
+    fn cycle_cell(&self, cell: CycleCell) -> CycleRead {
+        match cell {
+            CycleCell::Val | CycleCell::Oval => CycleRead::ByName,
+            _ => CycleRead::Absent,
+        }
+    }
+
+    fn val(&self) -> Option<EpicsValue> {
+        Some(EpicsValue::String(self.val.clone()))
+    }
+
+    /// A string VAL is never undefined by value; the default asks [`Self::val`]
+    /// for a copy to say so.
+    fn value_is_undefined(&self) -> bool {
+        false
+    }
+
+    fn has_sval(&self) -> bool {
+        true
+    }
+
+    /// C `strcpy(prec->val, prec->sval)` (`stringinRecord.c:213`); SVAL is
+    /// already cut at the C buffer size, so the copy is exact and allocates
+    /// nothing once VAL has the capacity.
+    fn land_sval(&mut self) -> CaResult<()> {
+        self.val.clone_from(&self.sval);
+        Ok(())
     }
 
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
@@ -169,6 +276,7 @@ impl Record for StringinRecord {
             "SIMM" => Some(EpicsValue::Short(self.simm)),
             "SIML" => Some(EpicsValue::String(self.siml.clone().into())),
             "SIOL" => Some(EpicsValue::String(self.siol.clone().into())),
+            "SVAL" => Some(EpicsValue::String(self.sval.clone())),
             "SIMS" => Some(EpicsValue::Short(self.sims)),
             "SDLY" => Some(EpicsValue::Double(self.sdly)),
             "MPST" => Some(EpicsValue::Short(self.mpst)),
@@ -177,19 +285,26 @@ impl Record for StringinRecord {
         }
     }
 
+    // C `stringinRecord.c:117` copies VAL after `:112-115` returns a nonzero dset status.
+    fn seed_deadband_tracking(&mut self, dset_init: crate::server::device_support::DsetInit) {
+        if dset_init != crate::server::device_support::DsetInit::Failed {
+            self.oval.clone_from(&self.val);
+        }
+    }
+
     fn put_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
         match name {
             "VAL" => match value {
                 // C truncates every VAL copy at MAX_STRING_SIZE (40).
                 EpicsValue::String(s) => {
-                    self.val = truncate_string(s);
+                    self.val.set_bytes(truncated(s.as_bytes()));
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("VAL".into())),
             },
             "OVAL" => match value {
                 EpicsValue::String(s) => {
-                    self.oval = truncate_string(s);
+                    self.oval.set_bytes(truncated(s.as_bytes()));
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("OVAL".into())),
@@ -203,17 +318,24 @@ impl Record for StringinRecord {
             },
             "SIML" => match value {
                 EpicsValue::String(s) => {
-                    self.siml = s.as_str_lossy().into_owned();
+                    self.siml = s;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("SIML".into())),
             },
             "SIOL" => match value {
                 EpicsValue::String(s) => {
-                    self.siol = s.as_str_lossy().into_owned();
+                    self.siol = s;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("SIOL".into())),
+            },
+            "SVAL" => match value {
+                EpicsValue::String(s) => {
+                    self.sval.set_bytes(truncated(s.as_bytes()));
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch("SVAL".into())),
             },
             "SIMS" => match value {
                 EpicsValue::Short(v) => {
@@ -262,6 +384,29 @@ mod tests {
         assert_eq!(rec.val.len(), 39, "VAL capped at MAX_STRING_SIZE-1");
     }
 
+    /// The soft read stores what `set_val` stores, at every length either
+    /// side of the 39-byte cap and for raw bytes.
+    #[test]
+    fn soft_input_read_stores_what_set_val_stores() {
+        let texts: [&[u8]; 6] = [
+            b"",
+            b"train",
+            &[b'a'; 39],
+            &[b'b'; 40],
+            &[b'c'; 45],
+            &[0xff, 0x00, 0x80],
+        ];
+        for text in texts {
+            let value = EpicsValue::String(PvString::from_bytes(text.to_vec()));
+            let mut read = StringinRecord::new("old");
+            read.soft_input_read(Some(value.clone()), &mut Default::default())
+                .unwrap();
+            let mut put = StringinRecord::new("old");
+            put.set_val(value).unwrap();
+            assert_eq!(read.val, put.val, "{text:?}");
+        }
+    }
+
     /// A 39-char string is kept whole.
     #[test]
     fn val_at_limit_kept_whole() {
@@ -280,7 +425,7 @@ mod tests {
         rec.put_field("MPST", EpicsValue::Short(1)).unwrap();
         rec.put_field("APST", EpicsValue::Short(0)).unwrap();
         assert_eq!(rec.get_field("MPST"), Some(EpicsValue::Short(1)));
-        let inst = RecordInstance::new("SI:MPST".into(), rec);
+        let inst = RecordInstance::new("SI:MPST", rec);
         let snap = inst.snapshot_for_field("MPST").unwrap();
         assert_eq!(snap.value, EpicsValue::Enum(1));
         assert_eq!(

@@ -1,0 +1,63 @@
+# MPC_Stream_Ethernet.proto
+
+# StreamDevice protocol file for Gamma MPC pumps using Ethernet
+
+# Mark Rivers
+# January 23, 2026
+
+ReplyTimeout = 2000;
+WriteTimeout = 1000;
+
+readString {
+   out "cmd \$1 \$2";
+   in  "OK 00 %s";
+   ExtraInput = Ignore;
+}
+
+writeString {
+   out "cmd \$1 \$2";
+   in  "OK 00 %s";
+   ExtraInput = Ignore;
+}
+
+readFloat {
+   out "cmd \$1 \$2";
+   in  "OK 00 %f";
+   ExtraInput = Ignore;
+}
+
+writeFloat {
+   out "cmd \$1 \$2 %f";
+   in  "OK 00";
+   ExtraInput = Ignore;
+}
+
+readInt {
+   out "cmd \$1 \$2";
+   in  "OK 00 %d";
+   ExtraInput = Ignore;
+}
+
+writeInt {
+   out "cmd \$1 \$2,%d";
+   in  "OK 00";
+   ExtraInput = Ignore;
+}
+
+writeHVOnOff {
+   out "cmd %{37|38} \$1";
+   in  "OK 00";
+   ExtraInput = Ignore;
+}
+
+readAutoRestart {
+   out "cmd 34 \$1";
+   in  "OK 00 %{NO|YES}";
+   ExtraInput = Ignore;
+}
+
+writeAutoRestart {
+   out "cmd 33 \$1,%{N|Y}";
+   in  "OK 00";
+   ExtraInput = Ignore;
+}

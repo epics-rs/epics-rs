@@ -234,13 +234,6 @@ fn test_val_truncated_to_39_visible_bytes() {
 }
 
 #[test]
-fn test_oval_is_read_only() {
-    let mut rec = TimestampRecord::default();
-    let result = rec.put_field("OVAL", EpicsValue::String("test".into()));
-    assert!(result.is_err());
-}
-
-#[test]
 fn test_unknown_field() {
     let rec = TimestampRecord::default();
     assert!(rec.get_field("NONEXISTENT").is_none());
@@ -273,16 +266,19 @@ fn test_field_list() {
 // ============================================================
 use epics_base_rs::server::record::{EPICS_TIME_EVENT_DEVICE_TIME, ProcessContext};
 
-fn ctx_with_tse(tse: i16) -> ProcessContext<'static> {
+fn ctx_with_tse(tse: i16) -> ProcessContext {
     ProcessContext {
-        udf: false,
+        udf: 0,
         udfs: epics_base_rs::server::record::AlarmSeverity::Invalid,
         nsev: epics_base_rs::server::record::AlarmSeverity::NoAlarm,
         phas: 0,
         tse,
-        time: std::time::SystemTime::UNIX_EPOCH,
-        dtyp: "",
+        time: epics_base_rs::types::WallTime::UNIX_EPOCH,
+        soft: None,
         callback_priority: epics_base_rs::runtime::task::CallbackPriority::Low,
+        scan: epics_base_rs::server::record::ScanType::Passive,
+        proc_field: 0,
+        tpro: 0,
     }
 }
 

@@ -23,11 +23,12 @@
 // CA server, and the reactor these obtain comes from `#[tokio::test]`
 // itself, which the backend does not remove.
 
+use asyn_rs::port::InterfaceMask;
 use std::sync::Arc;
 
 use ad_core_rs::codec::CodecName;
 use ad_core_rs::ndarray::{NDArray, NDDataType, NDDimension};
-use ad_core_rs::ndarray_pool::NDArrayPool;
+use ad_core_rs::ndarray_pool::{DriverPool, NDArrayPool, PublishedArray};
 use ad_core_rs::plugin::file_base::NDFileMode;
 use ad_core_rs::plugin::runtime::{
     NDPluginProcess, PluginRuntimeHandle, ProcessResult, create_plugin_runtime,
@@ -39,9 +40,8 @@ use ad_plugins_rs::fft::FFTProcessor;
 use ad_plugins_rs::file_tiff::TiffFileProcessor;
 use ad_plugins_rs::process::{ProcessConfig, ProcessProcessor};
 use ad_plugins_rs::roi::create_roi_runtime;
-use ad_plugins_rs::roi_stat::{ROIStatProcessor, ROIStatROI};
+use ad_plugins_rs::roi_stat::create_roi_stat_runtime;
 use ad_plugins_rs::stats::create_stats_runtime;
-use ad_plugins_rs::time_series::TsReceiverRegistry;
 use ad_plugins_rs::transform::{TransformProcessor, TransformType};
 
 const WIDTH: usize = 512;
@@ -59,7 +59,7 @@ const FRAMES: usize = 48;
 /// mode is not the alternative: its publish path awaits per-frame completion
 /// (`channel.rs:194-208`), which serialises the producer and hides the pool
 /// entirely. `drive` asserts the drop count is zero.
-const QUEUE: usize = FRAMES * 4;
+const QUEUE: i32 = FRAMES as i32 * 4;
 
 /// A few milliseconds of real, unshareable CPU per frame.
 fn burn(array: &NDArray) -> u64 {
@@ -78,6 +78,9 @@ struct Unlocked {
 }
 
 impl NDPluginProcess for Unlocked {
+    const ASYN_FLAGS: asyn_rs::port::PortFlags = ad_core_rs::plugin::runtime::ASYN_CANBLOCK;
+    const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+    const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS;
     fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
         let acc = burn(array);
         *self.sink.lock() = acc;
@@ -86,8 +89,8 @@ impl NDPluginProcess for Unlocked {
     fn plugin_type(&self) -> &str {
         "Unlocked"
     }
-    fn does_array_callbacks(&self) -> bool {
-        false
+    fn array_callbacks_seed(&self) -> Option<bool> {
+        Some(false)
     }
 }
 
@@ -98,6 +101,9 @@ struct Locked {
 }
 
 impl NDPluginProcess for Locked {
+    const ASYN_FLAGS: asyn_rs::port::PortFlags = ad_core_rs::plugin::runtime::ASYN_CANBLOCK;
+    const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+    const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS;
     fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
         let mut sink = self.sink.lock();
         *sink = burn(array);
@@ -106,15 +112,15 @@ impl NDPluginProcess for Locked {
     fn plugin_type(&self) -> &str {
         "Locked"
     }
-    fn does_array_callbacks(&self) -> bool {
-        false
+    fn array_callbacks_seed(&self) -> Option<bool> {
+        Some(false)
     }
 }
 
 /// Build the frames once, outside any timed region: the fill below costs about
 /// as much as a plugin's own work, and generating frames inside the clock would
 /// put that cost on the publisher thread where no worker can overlap it.
-fn frames() -> Vec<Arc<NDArray>> {
+fn frames() -> Vec<PublishedArray> {
     let mut seed = NDArray::new(
         vec![NDDimension::new(WIDTH), NDDimension::new(HEIGHT)],
         NDDataType::UInt16,
@@ -128,11 +134,12 @@ fn frames() -> Vec<Arc<NDArray>> {
         x ^= x << 17;
         seed.data.set_from_f64(i, (x % 4096) as f64);
     }
+    let pool = DriverPool::standalone(0);
     (0..FRAMES as i32)
         .map(|id| {
-            let mut arr = seed.clone();
+            let mut arr = pool.alloc_copy(&seed).unwrap();
             arr.unique_id = id;
-            Arc::new(arr)
+            arr.share()
         })
         .collect()
 }
@@ -157,7 +164,7 @@ fn set_threads(handle: &PluginRuntimeHandle, n: i32) {
 /// from the first publish to full quiescence.
 fn drive(
     handle: &PluginRuntimeHandle,
-    frames: &[Arc<NDArray>],
+    frames: &[PublishedArray],
     threads: i32,
 ) -> std::time::Duration {
     set_threads(handle, threads);
@@ -166,7 +173,7 @@ fn drive(
         .read_int32_blocking(handle.plugin_params.dropped_arrays, 0)
         .unwrap();
     let sender = handle.array_sender().clone();
-    let frames: Vec<Arc<NDArray>> = frames.to_vec();
+    let frames: Vec<PublishedArray> = frames.to_vec();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -209,28 +216,32 @@ fn measure_pool_throughput() {
     let frames = frames();
 
     let (unlocked, _jh1) = create_plugin_runtime(
-        "POOL_UNLOCKED",
+        &asyn_rs::asyn_record::claim_port("POOL_UNLOCKED").unwrap(),
         Unlocked {
             sink: parking_lot::Mutex::new(0),
         },
-        pool.clone(),
+        pool.max_memory(),
         QUEUE,
+        0,
         "",
         wiring.clone(),
+        ad_core_rs::plugin::runtime::DEFAULT_PLUGIN_THREADS,
     );
     drive(&unlocked, &frames, 1); // warm up: thread spawn, first-touch page faults
     let u1 = drive(&unlocked, &frames, 1);
     let u4 = drive(&unlocked, &frames, 4);
 
     let (locked, _jh2) = create_plugin_runtime(
-        "POOL_LOCKED",
+        &asyn_rs::asyn_record::claim_port("POOL_LOCKED").unwrap(),
         Locked {
             sink: parking_lot::Mutex::new(0),
         },
-        pool.clone(),
+        pool.max_memory(),
         QUEUE,
+        0,
         "",
         wiring.clone(),
+        ad_core_rs::plugin::runtime::DEFAULT_PLUGIN_THREADS,
     );
     drive(&locked, &frames, 1);
     let l1 = drive(&locked, &frames, 1);
@@ -258,18 +269,18 @@ fn measure_pool_throughput() {
 fn measure_shipped_plugin_throughput() {
     let wiring = Arc::new(WiringRegistry::new());
     let pool = NDArrayPool::new(512_000_000);
-    let ts_registry = TsReceiverRegistry::new();
     let mut rows: Vec<(&str, std::time::Duration, std::time::Duration)> = Vec::new();
     let frames = frames();
 
     // Control: C releases at NDPluginStats.cpp:479, and so do we.
     let (stats, _sink, stats_params, _j) = create_stats_runtime(
-        "POOL_STATS",
-        pool.clone(),
+        &asyn_rs::asyn_record::claim_port("POOL_STATS").unwrap(),
+        pool.max_memory(),
         QUEUE,
+        0,
         "",
         wiring.clone(),
-        &ts_registry,
+        ad_core_rs::plugin::runtime::DEFAULT_PLUGIN_THREADS,
     );
     let sp = stats.port_runtime().port_handle();
     sp.write_int32_blocking(stats_params.compute_statistics, 0, 1)
@@ -286,8 +297,15 @@ fn measure_shipped_plugin_throughput() {
     ));
 
     // C releases at NDPluginROI.cpp:140.
-    let (roi, roi_params, _j) =
-        create_roi_runtime("POOL_ROI", pool.clone(), QUEUE, "", wiring.clone());
+    let (roi, roi_params, _j) = create_roi_runtime(
+        &asyn_rs::asyn_record::claim_port("POOL_ROI").unwrap(),
+        pool.max_memory(),
+        QUEUE,
+        0,
+        "",
+        wiring.clone(),
+        ad_core_rs::plugin::runtime::DEFAULT_PLUGIN_THREADS,
+    );
     let rp = roi.port_runtime().port_handle();
     // An unconfigured ROI extracts nothing, which measures nothing.
     for (dim, extent) in [(0, WIDTH), (1, HEIGHT)] {
@@ -299,29 +317,38 @@ fn measure_shipped_plugin_throughput() {
     drive(&roi, &frames, 1);
     rows.push(("ROI", drive(&roi, &frames, 1), drive(&roi, &frames, 4)));
 
-    // C releases at NDPluginROIStat.cpp:267.
-    let quadrant = |x: usize, y: usize| ROIStatROI {
-        enabled: true,
-        offset: [x, y],
-        size: [WIDTH / 2, HEIGHT / 2],
-        bgd_width: 0,
-    };
-    let (roi_stat, _j) = create_plugin_runtime(
-        "POOL_ROISTAT",
-        ROIStatProcessor::new(
-            vec![
-                quadrant(0, 0),
-                quadrant(WIDTH / 2, 0),
-                quadrant(0, HEIGHT / 2),
-                quadrant(WIDTH / 2, HEIGHT / 2),
-            ],
-            16,
-        ),
-        pool.clone(),
+    // C releases at NDPluginROIStat.cpp:267. Four quadrants, one per address,
+    // set through the port as a database sets them.
+    let (roi_stat, roi_stat_params, _j) = create_roi_stat_runtime(
+        &asyn_rs::asyn_record::claim_port("POOL_ROISTAT").unwrap(),
+        pool.max_memory(),
         QUEUE,
+        0,
         "",
         wiring.clone(),
+        4,
+        ad_core_rs::plugin::runtime::DEFAULT_PLUGIN_THREADS,
     );
+    let sp = roi_stat.port_runtime().port_handle();
+    let quadrants = [
+        (0, 0),
+        (WIDTH / 2, 0),
+        (0, HEIGHT / 2),
+        (WIDTH / 2, HEIGHT / 2),
+    ];
+    for (addr, (x, y)) in quadrants.into_iter().enumerate() {
+        let p = &roi_stat_params;
+        for (reason, value) in [
+            (p.use_, 1),
+            (p.dim0_min, x),
+            (p.dim1_min, y),
+            (p.dim0_size, WIDTH / 2),
+            (p.dim1_size, HEIGHT / 2),
+        ] {
+            sp.write_int32_blocking(reason, addr as i32, value as i32)
+                .unwrap();
+        }
+    }
     drive(&roi_stat, &frames, 1);
     rows.push((
         "ROIStat",
@@ -329,19 +356,21 @@ fn measure_shipped_plugin_throughput() {
         drive(&roi_stat, &frames, 4),
     ));
 
-    // C releases around every codec call (NDPluginCodec.cpp:556, :596).
+    // C releases around every codec call (NDPluginCodec.cpp:689-756).
     let (codec, _j) = create_plugin_runtime(
-        "POOL_CODEC",
+        &asyn_rs::asyn_record::claim_port("POOL_CODEC").unwrap(),
         // Zlib rather than LZ4: LZ4 finishes a frame this size in well under
         // the harness's resolution, so the row would report noise.
         CodecProcessor::new(CodecMode::Compress {
             codec: CodecName::Zlib,
             quality: 85,
         }),
-        pool.clone(),
+        pool.max_memory(),
         QUEUE,
+        0,
         "",
         wiring.clone(),
+        ad_core_rs::plugin::runtime::DEFAULT_PLUGIN_THREADS,
     );
     drive(&codec, &frames, 1);
     rows.push((
@@ -362,12 +391,14 @@ fn measure_shipped_plugin_throughput() {
         })
         .collect();
     let (bad_pixel, _j) = create_plugin_runtime(
-        "POOL_BADPIX",
+        &asyn_rs::asyn_record::claim_port("POOL_BADPIX").unwrap(),
         BadPixelProcessor::new(pixels),
-        pool.clone(),
+        pool.max_memory(),
         QUEUE,
+        0,
         "",
         wiring.clone(),
+        ad_core_rs::plugin::runtime::DEFAULT_PLUGIN_THREADS,
     );
     drive(&bad_pixel, &frames, 1);
     rows.push((
@@ -378,12 +409,14 @@ fn measure_shipped_plugin_throughput() {
 
     // C releases at NDPluginTransform.cpp:500.
     let (transform, _j) = create_plugin_runtime(
-        "POOL_TRANSFORM",
+        &asyn_rs::asyn_record::claim_port("POOL_TRANSFORM").unwrap(),
         TransformProcessor::new(TransformType::Rot90CW),
-        pool.clone(),
+        pool.max_memory(),
         QUEUE,
+        0,
         "",
         wiring.clone(),
+        ad_core_rs::plugin::runtime::DEFAULT_PLUGIN_THREADS,
     );
     drive(&transform, &frames, 1);
     rows.push((
@@ -394,19 +427,21 @@ fn measure_shipped_plugin_throughput() {
 
     // C releases at NDPluginFFT.cpp:334.
     let (fft, _j) = create_plugin_runtime(
-        "POOL_FFT",
+        &asyn_rs::asyn_record::claim_port("POOL_FFT").unwrap(),
         FFTProcessor::new(),
-        pool.clone(),
+        pool.max_memory(),
         QUEUE,
+        0,
         "",
         wiring.clone(),
+        ad_core_rs::plugin::runtime::DEFAULT_PLUGIN_THREADS,
     );
     drive(&fft, &frames, 1);
     rows.push(("FFT", drive(&fft, &frames, 1), drive(&fft, &frames, 4)));
 
     // C releases at NDPluginProcess.cpp:139.
     let (process, _j) = create_plugin_runtime(
-        "POOL_PROCESS",
+        &asyn_rs::asyn_record::claim_port("POOL_PROCESS").unwrap(),
         ProcessProcessor::new(ProcessConfig {
             enable_offset_scale: true,
             offset: -1.0,
@@ -416,10 +451,12 @@ fn measure_shipped_plugin_throughput() {
             high_clip_value: 60000.0,
             ..ProcessConfig::default()
         }),
-        pool.clone(),
+        pool.max_memory(),
         QUEUE,
+        0,
         "",
         wiring.clone(),
+        ad_core_rs::plugin::runtime::DEFAULT_PLUGIN_THREADS,
     );
     drive(&process, &frames, 1);
     rows.push((
@@ -445,8 +482,16 @@ fn measure_shipped_plugin_throughput() {
         c.file_base.auto_increment = true;
         c.file_base.set_mode(NDFileMode::Single);
     }
-    let (tiff, _j) =
-        create_plugin_runtime("POOL_TIFF", tiff, pool.clone(), QUEUE, "", wiring.clone());
+    let (tiff, _j) = create_plugin_runtime(
+        &asyn_rs::asyn_record::claim_port("POOL_TIFF").unwrap(),
+        tiff,
+        pool.max_memory(),
+        QUEUE,
+        0,
+        "",
+        wiring.clone(),
+        ad_core_rs::plugin::runtime::DEFAULT_PLUGIN_THREADS,
+    );
     drive(&tiff, &frames, 1);
     let held = (
         "TIFF file (ctrl held)",

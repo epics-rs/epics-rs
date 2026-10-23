@@ -21,8 +21,8 @@
 
 use std::sync::Arc;
 
-use crate::error::{CaError, CaResult};
-use crate::runtime::log::{ErrlogSevEnum, errlog_sev_printf};
+use crate::error::{CaError, CaResult, LinkRefusal};
+use crate::runtime::log::{ErrlogSevEnum, errlog_sev_vprintf};
 use crate::server::database::filters::sync::{DbState, db_state_registry};
 use crate::server::device_support::{
     DeviceInitOutcome, DeviceReadOutcome, DeviceSupport, DeviceUdf,
@@ -44,8 +44,8 @@ pub struct DbStateDeviceSupport {
 impl DbStateDeviceSupport {
     /// Construct from the record's INST_IO `INP` and `OUT`
     /// ([`DeviceSupportContext`](crate::server::ioc_app::DeviceSupportContext)).
-    /// The state name is resolved in [`init`](DbStateDeviceSupport::init),
-    /// where the record type selects `INP` (bi) or `OUT` (bo).
+    /// The state name is resolved by `add_record`, where the record type
+    /// selects `INP` (bi) or `OUT` (bo).
     pub fn new(inp: &str, out: &str) -> Self {
         Self {
             inp: inp.to_string(),
@@ -60,30 +60,46 @@ impl DeviceSupport for DbStateDeviceSupport {
         "Db State"
     }
 
+    /// `add_record`'s `prec->dpvt = dbStateFind(...)` (`devBiDbState.c:34`).
+    fn holds_dpvt(&self) -> bool {
+        self.state.is_some()
+    }
+
+    /// `devBiDbState`/`devBoDbState` carry no `init_record` entry
+    /// (`devBoDbState.c:73`), so bo never runs its status-0 convert.
+    fn has_init_record(&self) -> bool {
+        false
+    }
+
     fn init(&mut self, record: &mut dyn Record) -> CaResult<DeviceInitOutcome> {
         // C registers a SEPARATE dset per record type (devBiDbState for bi,
-        // devBoDbState for bo); both carry DTYP "Db State". The bi dset reads
-        // the state name from INP, the bo dset from OUT. The Rust dynamic
+        // devBoDbState for bo); both carry DTYP "Db State". The Rust dynamic
         // factory builds one device for the DTYP regardless of record type, so
-        // gate the record type here and pick the matching instio source.
+        // gate the record type here.
         let rt = record.record_type();
-        let raw = match rt {
-            "bi" => self.inp.as_str(),
-            "bo" => self.out.as_str(),
-            other => {
-                return Err(CaError::InvalidValue(format!(
-                    "DTYP='Db State': unsupported record type '{other}' (use bi or bo)"
-                )));
-            }
-        };
+        if !matches!(rt, "bi" | "bo") {
+            return Err(CaError::InvalidValue(format!(
+                "DTYP='Db State': unsupported record type '{rt}' (use bi or bo)"
+            )));
+        }
+        let _ = self.add_record(record);
+        Ok(DeviceInitOutcome::ok())
+    }
 
+    fn add_record(&mut self, record: &mut dyn Record) -> Result<(), LinkRefusal> {
+        let record_type = record.record_type();
         // C `add_record` reads `inp/out.value.instio.string` (the post-`@`
         // content). An empty string leaves `dpvt = NULL` and the record never
         // resolves a state — read/write no-op.
+        let raw = if record_type == "bo" {
+            &self.out
+        } else {
+            &self.inp
+        };
         let name = raw.strip_prefix('@').unwrap_or(raw);
         if name.is_empty() {
             self.state = None;
-            return Ok(DeviceInitOutcome::Live);
+            return Ok(());
         }
 
         // C `add_record`: `dbStateFind`, and if absent AND non-empty, log an
@@ -94,19 +110,19 @@ impl DeviceSupport for DbStateDeviceSupport {
         self.state = Some(match registry.find(name) {
             Some(s) => s,
             None => {
-                let devsup = if rt == "bi" {
-                    "devBiDbState"
-                } else {
+                let devsup = if record_type == "bo" {
                     "devBoDbState"
+                } else {
+                    "devBiDbState"
                 };
-                errlog_sev_printf(
+                errlog_sev_vprintf(
                     ErrlogSevEnum::Info,
-                    &format!("{devsup}: Creating new db state '{name}'\n"),
+                    format_args!("{devsup}: Creating new db state '{name}'\n"),
                 );
                 registry.get_or_create(name)
             }
         });
-        Ok(DeviceInitOutcome::Live)
+        Ok(())
     }
 
     fn read(&mut self, record: &mut dyn Record) -> CaResult<DeviceReadOutcome> {

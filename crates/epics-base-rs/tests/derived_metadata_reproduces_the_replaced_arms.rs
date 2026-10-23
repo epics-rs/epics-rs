@@ -1,4 +1,4 @@
-//! The derived record-level metadata cache serves what the hand-written
+//! The derived record-level metadata serves what the hand-written
 //! `match rtype` arms served.
 //!
 //! `populate_display_info` and `populate_control_info` used to name thirteen
@@ -16,7 +16,10 @@
 //! arm's precision, which the arm hard-coded to 0 and the declaration says is
 //! not supplied at all.
 
-use epics_base_rs::server::record::{Record, RecordInstance};
+use std::sync::Arc;
+
+use epics_base_rs::server::database::PvDatabase;
+use epics_base_rs::server::record::{Record, RecordCell};
 use epics_base_rs::server::records::ai::AiRecord;
 use epics_base_rs::server::records::ao::AoRecord;
 use epics_base_rs::server::records::calc::CalcRecord;
@@ -32,19 +35,24 @@ use epics_base_rs::types::EpicsValue;
 /// A `.db` record with its metadata fields set, through the two homes the port
 /// has: the record's own cell where it models one, the `declared_overrides`
 /// tail where it does not.
-fn load<R: Record + 'static>(mut rec: R, fields: &[(&str, EpicsValue)]) -> RecordInstance {
+fn load<R: Record + 'static>(mut rec: R, fields: &[(&str, EpicsValue)]) -> Arc<RecordCell> {
     let mut unmodeled = Vec::new();
     for (name, value) in fields {
         if rec.put_field(name, value.clone()).is_err() {
             unmodeled.push((*name, value.clone()));
         }
     }
-    let mut inst = RecordInstance::new("T:REC".to_string(), rec);
-    for (name, value) in unmodeled {
-        inst.put_common_field_db_load(name, value)
-            .unwrap_or_else(|e| panic!("field({name}) failed to load: {e:?}"));
-    }
-    inst
+    epics_base_rs::runtime::task::block_on_sync(async {
+        let db = PvDatabase::new();
+        db.add_record("T:REC", Box::new(rec)).await.unwrap();
+        for (name, value) in unmodeled {
+            db.put_pv_no_process(format!("T:REC.{name}"), value)
+                .await
+                .unwrap_or_else(|e| panic!("field({name}) failed to put: {e:?}"));
+        }
+        db.get_record("T:REC").unwrap()
+    })
+    .expect("a plain test thread")
 }
 
 /// EGU/PREC/HOPR/LOPR, the four the display arms read, at values no default
@@ -78,8 +86,9 @@ fn int64_fields() -> Vec<(&'static str, EpicsValue)> {
     integer_operator_fields(EpicsValue::Int64(10), EpicsValue::Int64(-10))
 }
 
-fn units(inst: &RecordInstance, field: &str) -> String {
-    inst.snapshot_for_field(field)
+fn units(rec: &RecordCell, field: &str) -> String {
+    rec.read()
+        .snapshot_for_field(field)
         .unwrap_or_else(|| panic!("{field} has no snapshot"))
         .units()
         .unwrap_or_else(|| panic!("{field} serves no units leaf"))
@@ -87,22 +96,25 @@ fn units(inst: &RecordInstance, field: &str) -> String {
         .into_owned()
 }
 
-fn precision(inst: &RecordInstance, field: &str) -> Option<i16> {
-    inst.snapshot_for_field(field)
+fn precision(rec: &RecordCell, field: &str) -> Option<i16> {
+    rec.read()
+        .snapshot_for_field(field)
         .unwrap_or_else(|| panic!("{field} has no snapshot"))
         .precision()
 }
 
 /// `(lower, upper)`.
-fn display(inst: &RecordInstance, field: &str) -> (f64, f64) {
-    inst.snapshot_for_field(field)
+fn display(rec: &RecordCell, field: &str) -> (f64, f64) {
+    rec.read()
+        .snapshot_for_field(field)
         .unwrap_or_else(|| panic!("{field} has no snapshot"))
         .display_limits()
         .unwrap_or_else(|| panic!("{field} serves no display limits"))
 }
 
-fn control(inst: &RecordInstance, field: &str) -> (f64, f64) {
-    inst.snapshot_for_field(field)
+fn control(rec: &RecordCell, field: &str) -> (f64, f64) {
+    rec.read()
+        .snapshot_for_field(field)
         .unwrap_or_else(|| panic!("{field} has no snapshot"))
         .control_limits()
         .unwrap_or_else(|| panic!("{field} serves no control limits"))

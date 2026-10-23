@@ -1526,7 +1526,7 @@ pub fn parse_value_format(arg: Option<&str>) -> Option<ValueFormat> {
         "tree" => ValueFormat::Tree,
         "delta" => ValueFormat::Delta,
         other => {
-            eprintln!("Warning: ignoring unknown format '{other}'");
+            epics_libcom_rs::stderr_println!("Warning: ignoring unknown format '{other}'");
             ValueFormat::Delta
         }
     })
@@ -2319,9 +2319,10 @@ mod tests {
                 "attribute".into(),
                 FieldDesc::StructureArray {
                     struct_id: "epics:nt/NTAttribute:1.0".into(),
-                    fields: vec![("name".into(), FieldDesc::Scalar(ScalarType::String))],
+                    fields: vec![("name".into(), FieldDesc::Scalar(ScalarType::String))].into(),
                 },
-            )],
+            )]
+            .into(),
         };
         let mut elem = PvStructure::new("epics:nt/NTAttribute:1.0");
         elem.set(
@@ -2359,7 +2360,8 @@ mod tests {
             fields: vec![
                 ("value".into(), FieldDesc::Scalar(ScalarType::Double)),
                 ("name".into(), FieldDesc::Scalar(ScalarType::String)),
-            ],
+            ]
+            .into(),
         };
         let desc = FieldDesc::Structure {
             struct_id: "epics:nt/NTNDArray:1.0".into(),
@@ -2369,7 +2371,8 @@ mod tests {
                     struct_id: String::new(),
                     variants: vec![("s".into(), member)],
                 },
-            )],
+            )]
+            .into(),
         };
         let mut inner = PvStructure::new("epics:nt/NTAttribute:1.0");
         inner.set("value", PvField::Scalar(ScalarValue::Double(1.5)));
@@ -2420,7 +2423,7 @@ mod tests {
     fn raw_any_member_prints_through_the_raw_writer() {
         let desc = FieldDesc::Structure {
             struct_id: String::new(),
-            fields: vec![("p".into(), FieldDesc::Variant)],
+            fields: vec![("p".into(), FieldDesc::Variant)].into(),
         };
         let mut top = PvStructure::new("");
         top.set(
@@ -2456,7 +2459,8 @@ mod tests {
                         ],
                     },
                 ),
-            ],
+            ]
+            .into(),
         };
 
         // Describe mode (show_value=false, pvinfo): `any`/`any[]` are
@@ -2533,10 +2537,12 @@ mod tests {
                             ),
                             ("nanoseconds".into(), FieldDesc::Scalar(ScalarType::Int)),
                             ("userTag".into(), FieldDesc::Scalar(ScalarType::Int)),
-                        ],
+                        ]
+                        .into(),
                     },
                 ),
-            ],
+            ]
+            .into(),
         };
         let mut s = PvStructure::new("epics:nt/NTScalar:1.0");
         s.set("value", PvField::Scalar(ScalarValue::Double(value)));
@@ -2965,7 +2971,7 @@ mod tests {
     fn nt_table(labels: &[&str], columns: &[(&str, Vec<ScalarValue>)]) -> (FieldDesc, PvField) {
         let desc = FieldDesc::Structure {
             struct_id: "epics:nt/NTTable:1.0".into(),
-            fields: vec![],
+            fields: vec![].into(),
         };
         let mut value = PvStructure::new("");
         for (name, cells) in columns {
@@ -3293,17 +3299,18 @@ mod tests {
                     "alarm".to_string(),
                     FieldDesc::Structure {
                         struct_id: "alarm_t".into(),
-                        fields: alarm_fields,
+                        fields: alarm_fields.into(),
                     },
                 ),
                 (
                     "timeStamp".to_string(),
                     FieldDesc::Structure {
                         struct_id: "time_t".into(),
-                        fields: ts_fields,
+                        fields: ts_fields.into(),
                     },
                 ),
-            ],
+            ]
+            .into(),
         };
         let mut alarm = PvStructure::new("alarm_t");
         alarm.set("severity", PvField::Scalar(ScalarValue::Int(0)));
@@ -3381,7 +3388,7 @@ mod tests {
     fn nt_scalar_array(value: PvField, alarm: Option<PvField>) -> (FieldDesc, PvField) {
         let desc = FieldDesc::Structure {
             struct_id: "epics:nt/NTScalarArray:1.0".into(),
-            fields: vec![],
+            fields: vec![].into(),
         };
         let mut s = PvStructure::new("epics:nt/NTScalarArray:1.0");
         s.set("value", value);
@@ -3464,7 +3471,7 @@ mod tests {
     fn nt_generic_value_scalar_array_uses_nt_branch() {
         let desc = FieldDesc::Structure {
             struct_id: String::new(),
-            fields: vec![],
+            fields: vec![].into(),
         };
         let mut s = PvStructure::new("");
         s.set(
@@ -3479,7 +3486,7 @@ mod tests {
     fn info_formatting_includes_struct_id() {
         let desc = FieldDesc::Structure {
             struct_id: "epics:nt/NTScalar:1.0".into(),
-            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))],
+            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))].into(),
         };
         let out = format_info(&desc);
         assert!(out.contains("epics:nt/NTScalar:1.0"));
@@ -3552,7 +3559,7 @@ mod tests {
     fn datafmt_hex_escapes_are_lowercase_like_pvxs() {
         let desc = FieldDesc::Structure {
             struct_id: String::new(),
-            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::String))],
+            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::String))].into(),
         };
         let mut s = PvStructure::new("");
         s.set(
@@ -3633,10 +3640,11 @@ mod tests {
                     "attribute".into(),
                     FieldDesc::StructureArray {
                         struct_id: "epics:nt/NTAttribute:1.0".into(),
-                        fields: elem,
+                        fields: elem.into(),
                     },
                 ),
-            ],
+            ]
+            .into(),
         };
         let mut attr = PvStructure::new("epics:nt/NTAttribute:1.0");
         attr.fields.push((
@@ -3757,7 +3765,7 @@ mod tests {
     fn pvxs_tree_scalar_array_uses_limit() {
         let desc = FieldDesc::Structure {
             struct_id: "x".into(),
-            fields: vec![("value".into(), FieldDesc::ScalarArray(ScalarType::Int))],
+            fields: vec![("value".into(), FieldDesc::ScalarArray(ScalarType::Int))].into(),
         };
         let mut s = PvStructure::new("x");
         s.set(

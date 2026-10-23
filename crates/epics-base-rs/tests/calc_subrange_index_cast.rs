@@ -7,25 +7,11 @@
 //! `epics_base_rs::types::c_cast`, which is the single owner of what a
 //! double→int conversion means in this port.
 //!
-//! **There is no C value to be faithful to here.** An out-of-range double→int
-//! cast is UB, and the two targets EPICS actually ships on disagree on the same
-//! `dbConvert.c` / `aCalcPerform.c` source:
-//!
-//! ```text
-//! x86-64   cvttsd2si  ->  out of range = INT_MIN,    NaN = INT_MIN
-//! aarch64  fcvtzs     ->  out of range = SATURATES,  NaN = 0
-//! ```
-//!
-//! so `AA[2,3e9]` selects NOTHING on an x86 IOC and the whole tail on a
-//! Raspberry Pi / Zynq IOC. The port takes the clean value (saturate, NaN → 0 —
-//! CBUG-E2), and these tests pin THAT, not either compiled C.
-//!
-//! So what is asserted here is the invariant, not a C transcript: a bound too
-//! large to be an index selects as much as there is, a NaN bound is zero, and an
-//! absurd pass count terminates. The in-range cases ARE straight C parity (both
-//! targets agree inside the int range), and their values came from
-//! `aCalcPerform.c` + `aCalcPostfix.c` + `calcUtil.c` compiled against base's
-//! libCom on this host, arraySize 8, AA = [10,20,...,80].
+//! An out-of-range double→int cast is UB in C; the port takes the x86-64
+//! `cvttsd2si` value (`INT_MIN`, NaN included) through `c_cast`, so `AA[2,3e9]`
+//! selects NOTHING, as on softIoc. Every expected buffer below is oracleStdIoc
+//! (softIoc R7.0.10-146-g8f5015b66, acalcout/scalcout) output, arraySize 8,
+//! AA = [10,20,...,80].
 
 use epics_base_rs::calc::{ArrayInputs, ArrayStackValue, StackValue, StringInputs, acalc, scalc};
 
@@ -59,30 +45,27 @@ fn an_in_range_bound_selects_the_named_elements() {
     assert_eq!(buf("AA[-2,-1]"), [70.0, 80.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
 }
 
-/// The boundary the cast decides. `3e9` is past `INT32_MAX` but a perfectly good
-/// "to the end" bound, and the owner saturates, so the selection runs to the end
-/// of the array. (An x86 C IOC answers the EMPTY array here, because `INT32_MIN`
-/// wraps past the start. That is the UB divergence, not the contract.)
+/// The boundary the cast decides. `3e9` is past `INT32_MAX`, so the end bound is
+/// `INT32_MIN` and the selection is EMPTY; the largest bound the int still
+/// holds runs to the end.
 #[test]
-fn an_end_bound_too_large_to_index_selects_to_the_end() {
+fn an_end_bound_past_int_max_selects_nothing() {
     let tail = [30.0, 40.0, 50.0, 60.0, 70.0, 80.0, 0.0, 0.0];
-    assert_eq!(buf("AA[2,3e9]"), tail);
+    assert_eq!(buf("AA[2,3e9]"), [0.0; SZ]);
     assert_eq!(
         buf("AA[2,1e10]"),
-        tail,
+        [0.0; SZ],
         "and it does not matter HOW far past"
     );
     assert_eq!(
         buf("AA[2,2147483647]"),
         tail,
-        "the largest bound the int still holds — the saturated value must land \
-         in the same place, or the rule has a seam at the boundary"
+        "the largest bound the int holds"
     );
 }
 
-/// NaN is not an index. The owner answers 0, so a NaN start bound is `AA[0,...]` —
-/// which is where an x86 C IOC lands too, by the other route (`INT32_MIN`, wrapped,
-/// then clamped up by `myMAX(...,0)`).
+/// NaN is not an index. The cast answers `INT32_MIN`, which the start bound's
+/// `myMAX(...,0)` clamps up to `AA[0,...]`.
 ///
 /// The NaN has to arrive through an input: `0/0` is NOT one. Division by zero in
 /// aCalc is `myMAXFLOAT` (`aCalcPerform.c:690-695`), a huge FINITE value, which is
@@ -97,13 +80,18 @@ fn a_nan_start_bound_is_zero() {
     );
 }
 
-/// The far side of the same boundary: a START bound past the end selects nothing —
-/// because there is nothing there, not because the cast wrapped. `0/0` is C's
-/// `myMAXFLOAT` and so belongs here, not with the NaN.
+/// The far side of the same boundary: a START bound past `INT32_MAX` is
+/// `INT32_MIN` too, and selects nothing. `0/0` is C's `myMAXFLOAT`, a huge
+/// FINITE value, which the same cast sends to `INT32_MIN`, and the start then
+/// clamps to 0.
 #[test]
-fn a_start_bound_past_the_end_selects_nothing() {
+fn a_start_bound_past_int_max_is_int_min() {
     assert_eq!(buf("AA[3e9,3e9]"), [0.0; SZ]);
-    assert_eq!(buf("AA[0/0,3]"), [0.0; SZ], "myMAXFLOAT is past the end");
+    assert_eq!(
+        buf("AA[0/0,3]"),
+        [10.0, 20.0, 30.0, 40.0, 0.0, 0.0, 0.0, 0.0],
+        "myMAXFLOAT is INT32_MIN, clamped to 0"
+    );
 }
 
 /// sCalc's `[` narrows its bounds with the same `(int)`
@@ -121,8 +109,8 @@ fn the_string_subrange_bound_takes_the_same_cast() {
     );
     assert_eq!(
         scalc("AA[1,3e9]", &mut inp).unwrap(),
-        StackValue::Str("bcdef".into()),
-        "an end bound too large to index runs to the end of the string"
+        StackValue::Str("".into()),
+        "an end bound past INT32_MAX is INT32_MIN: the empty string"
     );
     inp.num_vars[0] = f64::NAN;
     assert_eq!(
@@ -153,8 +141,8 @@ fn an_uncountable_nsmooth_pass_count_converges_instead_of_looping() {
     let converged = eval("NSMOO(AA,10000)", inp.clone());
     assert_eq!(
         eval("NSMOO(AA,1e30)", inp.clone()),
-        converged,
-        "a count no int can hold must give the value the passes converge to"
+        [10.0, 20.0, 30.0, 40.0, 5.0, 6.0, 7.0, 8.0],
+        "a count no int can hold is INT_MIN: no passes, the input back"
     );
     assert_eq!(
         eval("NSMOO(AA,2e9)", inp),

@@ -109,8 +109,8 @@ fn compressor_records_front_every_codec_the_port_implements() {
     for (ordinal, codec) in &codecs {
         assert_eq!(
             codec.ordinal(),
-            *ordinal,
-            "CodecName::from_ordinal({ordinal}) is {codec:?}, whose ordinal is {}",
+            Some(*ordinal),
+            "CodecName::from_ordinal({ordinal}) is {codec:?}, whose ordinal is {:?}",
             codec.ordinal()
         );
     }

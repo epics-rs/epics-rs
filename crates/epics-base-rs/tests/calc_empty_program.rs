@@ -129,6 +129,7 @@ fn calc_alarms_every_process_on_an_empty_or_broken_calc() {
         let mut rec = CalcRecord::default();
         rec.calc = expr.into();
         rec.init_record(0).unwrap();
+        rec.init_record(1).unwrap();
         rec.val = 42.0;
 
         rec.process().unwrap();
@@ -154,6 +155,7 @@ fn calcout_alarms_every_process_on_an_empty_or_broken_calc() {
         let mut rec = CalcoutRecord::default();
         rec.calc = expr.into();
         rec.init_record(0).unwrap();
+        rec.init_record(1).unwrap();
         rec.val = 42.0;
 
         rec.process().unwrap();
@@ -175,6 +177,7 @@ fn swait_alarms_every_process_on_an_empty_or_broken_calc() {
         let mut rec = SwaitRecord::default();
         rec.calc = expr.into();
         rec.init_record(0).unwrap();
+        rec.init_record(1).unwrap();
         rec.val = 42.0;
 
         rec.process().unwrap();
@@ -197,6 +200,7 @@ fn scalcout_alarms_and_takes_the_error_sentinel_on_an_empty_calc() {
         let mut rec = ScalcoutRecord::default();
         rec.calc = expr.into();
         rec.init_record(0).unwrap();
+        rec.init_record(1).unwrap();
         rec.process().unwrap();
 
         assert!(
@@ -211,11 +215,13 @@ fn scalcout_alarms_and_takes_the_error_sentinel_on_an_empty_calc() {
     let mut rec = ScalcoutRecord::default();
     rec.calc = "".into();
     rec.init_record(0).unwrap();
+    rec.init_record(1).unwrap();
     assert_eq!(rec.clcv, 0, "sCalcPostfix(\"\") returns 0, not -1");
 
     let mut rec = ScalcoutRecord::default();
     rec.calc = "1+".into();
     rec.init_record(0).unwrap();
+    rec.init_record(1).unwrap();
     assert_eq!(rec.clcv, -1);
 }
 
@@ -227,6 +233,7 @@ fn acalcout_alarms_every_process_on_an_empty_or_broken_calc() {
         let mut rec = AcalcoutRecord::default();
         rec.calc = expr.into();
         rec.init_record(0).unwrap();
+        rec.init_record(1).unwrap();
 
         rec.process().unwrap();
         assert!(
@@ -246,6 +253,7 @@ fn a_valid_calc_is_untouched() {
     rec.calc = "A+1".into();
     rec.vars[0] = 41.0;
     rec.init_record(0).unwrap();
+    rec.init_record(1).unwrap();
     rec.process().unwrap();
     assert_eq!(rec.val, 42.0);
     assert!(!alarmed(&mut rec));

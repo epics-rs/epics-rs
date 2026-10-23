@@ -1,15 +1,14 @@
-//! `last_posted` — the value a field last published — advances on every
-//! value-class post whether or not the field has a subscriber.
+//! A field's next transition reaches a subscriber that joined after posts it
+//! never saw.
 //!
-//! C `db_post_events` (`dbEvent.c:876-906`) is a no-op on an empty `mlis`, and
-//! the record's own state (`motorRecord.cc:2603-2606` `if (pmr->dmov == TRUE)`,
-//! `MARKED(M_DMOV)`) advances regardless, so a later subscriber sees the next
-//! transition. The framework's change detector advanced `last_posted` on a
-//! move-start notify with no subscriber but not on the completion walk (it
-//! walked subscribed fields only) nor on an out-of-band post to a field with
-//! no subscriber bucket, so the cache kept the move-start 0 while DMOV read 1
-//! and the next subscriber's move-start 0 compared equal and was dropped —
-//! ophyd `EpicsMotor` waits for a 1→0→1 DMOV and never finished its move.
+//! C `db_post_events` (`dbEvent.c:876-906`) is a no-op on an empty `mlis`, so a
+//! post with no subscriber moves no published state. What reaches the late
+//! subscriber is the record: motor posts DMOV on `MARKED(M_DMOV)`
+//! (`motorRecord.cc:3628-3629`), whatever it compares to, so the mover here
+//! claims DMOV through `fields_posted_only_when_marked` and marks it on the
+//! completion pass. Compared against a `last_posted` that the unwatched posts
+//! never advanced, the next move-start 0 would be dropped — ophyd
+//! `EpicsMotor` waits for a 1→0→1 DMOV and never finished its move.
 //!
 //! One case per boundary: no bucket, bucket emptied by `remove_subscriber`,
 //! and an out-of-band post with no bucket; the control keeps a subscriber
@@ -28,7 +27,16 @@ use epics_base_rs::types::{DbFieldType, EpicsValue};
 /// completes (the completion walk).
 struct Mover {
     dmov: i16,
+    /// `MARKED(M_DMOV)`: the completion pass marks DMOV, and `monitor()`
+    /// posts it whatever it compares to (`motorRecord.cc:3628-3629`).
+    marked: u64,
 }
+
+static MOVER_POSTS: [(epics_base_rs::server::record::FieldIx, CyclePostMask); 1] =
+    epics_base_rs::server::record::declared_post_table(
+        MOVER_FIELDS,
+        [("DMOV", CyclePostMask::ValueLog)],
+    );
 
 static MOVER_FIELDS: &[FieldDesc] = &[
     FieldDesc::new("VAL", DbFieldType::Double, false),
@@ -43,16 +51,16 @@ impl Record for Mover {
         if self.dmov == 1 {
             self.dmov = 0;
             Ok(ProcessOutcome {
-                result: RecordProcessResult::AsyncPendingNotify(vec![(
-                    "DMOV".to_string(),
-                    EpicsValue::Short(0),
-                )]),
+                result: RecordProcessResult::AsyncPendingNotify(vec![
+                    const { declared_field_ix(MOVER_FIELDS, "DMOV") },
+                ]),
                 actions: Vec::new(),
                 device_did_compute: false,
-                post_write_fields: Vec::new(),
+                status: Ok(()),
             })
         } else {
             self.dmov = 1;
+            self.marked = 1;
             Ok(ProcessOutcome::complete())
         }
     }
@@ -76,11 +84,17 @@ impl Record for Mover {
     fn declared_fields(&self) -> &'static [FieldDesc] {
         MOVER_FIELDS
     }
+    fn fields_posted_only_when_marked(&self) -> &'static [&'static str] {
+        &["DMOV"]
+    }
+    fn take_cycle_posted_fields(&mut self) -> CycleMarks {
+        CycleMarks::of(&MOVER_POSTS, u128::from(std::mem::take(&mut self.marked)))
+    }
 }
 
 async fn mover_db() -> PvDatabase {
     let db = PvDatabase::new();
-    db.add_record("M", Box::new(Mover { dmov: 1 }))
+    db.add_record("M", Box::new(Mover { dmov: 1, marked: 0 }))
         .await
         .unwrap();
     db
@@ -115,7 +129,7 @@ fn subscribe(db: &PvDatabase, record: &str, field: &str, sid: u32) -> EventReade
 fn drain(rx: &mut EventReader) -> Vec<EpicsValue> {
     let mut out = Vec::new();
     while let Ok(event) = rx.try_recv() {
-        out.push(event.snapshot.value.clone());
+        out.push(event.value().as_value().cloned().unwrap());
     }
     out
 }
@@ -153,7 +167,10 @@ async fn move_with_emptied_bucket_then_subscribe_sees_move_start() {
     let mut first = subscribe(&db, "M", "DMOV", 1);
     move_once(&db).await;
     assert_eq!(drain(&mut first), ZERO_THEN_ONE);
-    db.get_record("M").unwrap().write().remove_subscriber(1);
+    db.get_record("M")
+        .unwrap()
+        .write()
+        .remove_subscriber(first.id());
     move_once(&db).await;
     let mut rx = subscribe(&db, "M", "DMOV", 2);
     move_once(&db).await;
@@ -179,16 +196,15 @@ async fn post_with_no_bucket_then_subscribe_sees_move_start() {
     );
 }
 
-/// The same defect on a stock record: aCalcout's ODLY cycle posts DLYA=1
-/// through `AsyncPendingNotify` and its continuation clears DLYA through the
-/// completion walk.
+/// The same defect on a stock record: aCalcout's ODLY cycle and its
+/// continuation post DLYA as process marks.
 #[epics_macros_rs::epics_test]
 async fn acalcout_unwatched_odly_then_subscribe_sees_dlya_rise() {
     let db = PvDatabase::new();
     let mut ac = AcalcoutRecord::default();
     ac.put_field("CALC", EpicsValue::String("A".into()))
         .unwrap();
-    ac.special("CALC", true).unwrap();
+    ac.special("CALC", true, &Default::default()).unwrap();
     ac.put_field("OOPT", EpicsValue::Short(0)).unwrap();
     ac.put_field("ODLY", EpicsValue::Double(100.0)).unwrap();
     db.add_record("AC", Box::new(ac)).await.unwrap();

@@ -1,0 +1,53 @@
+# Runtime cases for run-rt.sh and tests/runtime.rs, tab separated:
+# case  record  VAL  device-table  options
+# The device table is request=>reply pairs (Python escapes), '-' for no
+# device listening; pairs are separated by ';;'. Options: '-' or a comma list the rs bus mock reads.
+out_literal	longout	0	HELLO\r\n=>	-
+out_long	longout	42	SET 42\r\n=>	-
+out_long_flags	longout	-7	-0007|-7  |fffffffffffffff9\r\n=>	-
+out_double	ao	3.25	V 3.250 3.250000e+00\r\n=>	-
+out_string	stringout	abc	S=abc;       abc\r\n=>	-
+out_two	longout	5	A5\r\n=>;;B\r\n=>	-
+out_codes	longout	0	a b\x02c\r\n=>	-
+out_offline	longout	0	-	lock=fail
+out_format_error	stringout	abc	-	-
+in_long	longin	0	GET\r\n=>VAL 42\r\n	-
+in_mismatch	longin	0	GET\r\n=>VAL abc\r\n	-
+in_literal_mismatch	longin	0	GET\r\n=>NO 1\r\n	-
+in_surplus	longin	0	GET\r\n=>VAL 42 x\r\n	-
+in_short	longin	0	GET\r\n=>VAL 4\r\n	-
+in_noreply	longin	0	GET\r\n=>	-
+in_readtimeout	longin	0	GET\r\n=>12	-
+in_double	ai	0	GET\r\n=>V=3.5\r\n	-
+in_string	stringin	0	GET\r\n=>N hello\r\n	-
+in_empty_split	stringin	0	GET\r\n=>\r\n	-
+in_mismatch_handler	longin	0	GET\r\n=>B 7\r\n	-
+in_mismatch_handler_fail	longin	0	GET\r\n=>C 7\r\n	-
+in_skip	longin	0	GET\r\n=>1,2\r\n	-
+in_compare	longin	5	GET\r\n=>X5 Y6\r\n	-
+in_compare_fail	longin	5	GET\r\n=>X4 Y6\r\n	-
+in_whitespace	longin	0	GET\r\n=>A  \tB9\r\n	-
+in_maxinput	longin	0	GET\r\n=>12345\r\n	-
+in_unsupported	longin	0	GET\r\n=>1.5\r\n	-
+in_default	longin	0	GET\r\n=>Qx\r\n	-
+in_two_lines	longin	0	GET\r\n=>A1\r\nB2\r\n	-
+wait_two	longout	0	A\r\n=>;;B\r\n=>	-
+exec_ok	longout	3	-	-
+exec_fail	longout	3	-	-
+exec_after_out	longout	0	A\r\n=>;;B\r\n=>	-
+connect_disconnect	longout	0	A\r\n=>;;B\r\n=>	-
+h_replytimeout	longin	0	GET\r\n=>;;TO\r\n=>	-
+h_readtimeout	longin	0	GET\r\n=>12;;RT\r\n=>	-
+h_mismatch_out	longin	0	GET\r\n=>X\r\n;;MM\r\n=>	-
+h_init	longin	0	GET\r\n=>5\r\n;;I\r\n=>	init
+h_extra_ignore	longin	0	GET\r\n=>42 x\r\n	-
+h_twice_noreply	longin	0	GET\r\n=>	twice,deadtime=1
+h_handler_fails	longin	0	GET\r\n=>;;TO\r\n=>	deadtime=-1
+h_twice_mismatch	longin	0	GET\r\n=>X\r\n	twice
+h_thrice_noreply	longin	0	GET\r\n=>	thrice,deadtime=1
+r_out_val	longout	7	V=7\r\n=>	-
+r_in_val	longin	0	GET\r\n=>V=8\r\n	-
+r_in_val_mismatch	longin	0	GET\r\n=>V=x\r\n	-
+r_in_compare	longin	3	GET\r\n=>V=4\r\n	-
+a_intr	longin	0	@=>V=5\r\n	intr,init
+a_intr_mismatch	longin	0	@=>X\r\nV=6\r\n	intr,init

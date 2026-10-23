@@ -25,11 +25,10 @@
 //! [`cmd_db_pvd_dump`] for what the port measures instead.
 
 use super::registry::*;
-use crate::server::record::dbd_generated::RECORD_TYPES;
 use crate::server::record::{
     Asl, FieldDeclaration, FieldDesc, HwLink, HwLinkKind, ParsedLink, Special,
 };
-use crate::types::DbfCode;
+use crate::types::{DbfCode, c_parse};
 
 /// Register the `dbStaticIocRegister.c` command set on `registry`.
 pub(crate) fn register(registry: &mut CommandRegistry) {
@@ -59,7 +58,7 @@ pub(crate) fn register(registry: &mut CommandRegistry) {
 /// behaviour, and the rule is defined by `iocsh.cpp`, not by either caller.
 fn check_pdbbase(arg: &ArgValue) -> Result<(), String> {
     if let ArgValue::String(pdbbase) = arg
-        && !(pdbbase.is_empty() || pdbbase.starts_with('0') || pdbbase == "pdbbase")
+        && !(pdbbase.is_empty() || pdbbase.starts_with(b"0") || pdbbase == "pdbbase")
     {
         return Err(format!("Expecting 'pdbbase' got '{pdbbase}'."));
     }
@@ -111,15 +110,16 @@ fn print_escaped(s: &str) -> String {
 /// [`super::commands`] holds the same walk for its own commands. It is six
 /// lines and it is C's iteration order, not a shared policy, so it is stated
 /// where it is used rather than exported.
-fn record_names_by_type(ctx: &CommandContext) -> Vec<String> {
-    let mut names = ctx.block_on(ctx.db().all_record_names());
-    let rank = |name: &String| {
+fn record_names_by_type(ctx: &CommandContext) -> Vec<crate::types::RecordName> {
+    let mut names = ctx.db().all_record_names();
+    let record_types = crate::server::record::record_types();
+    let rank = |name: &crate::types::RecordName| {
         let record_type = ctx
             .db()
             .get_record(name)
             .map(|rec| rec.read().record.record_type().to_string())
             .unwrap_or_default();
-        match RECORD_TYPES.iter().position(|t| *t == record_type) {
+        match record_types.iter().position(|t| *t == record_type) {
             Some(i) => (0usize, i, String::new()),
             None => (1usize, 0, record_type),
         }
@@ -131,9 +131,10 @@ fn record_names_by_type(ctx: &CommandContext) -> Vec<String> {
 /// C's `*`/empty sentinel for a record-type argument: both mean "every type"
 /// (`dbWriteRecordFP`, `dbStaticLib.c:801-804`; `dbDumpDevice`,
 /// `dbStaticLib.c:3434-3437`).
-fn type_filter(arg: &ArgValue) -> Option<&str> {
+fn type_filter(arg: &ArgValue) -> Option<std::borrow::Cow<'_, str>> {
     match arg {
-        ArgValue::String(s) if !s.is_empty() && s != "*" => Some(s.as_str()),
+        // Matched against the record-type names, all text.
+        ArgValue::String(s) if !s.is_empty() && s != "*" => Some(s.to_str_lossy()),
         _ => None,
     }
 }
@@ -182,13 +183,14 @@ fn cmd_db_dump_record() -> CommandDef {
         |args: &[ArgValue], ctx: &CommandContext| {
             check_pdbbase(&args[0])?;
             let wanted = type_filter(&args[1]);
+            let wanted = wanted.as_deref();
             let level = match args[2] {
                 ArgValue::Int(n) => n,
                 _ => 0,
             };
 
             let names = record_names_by_type(ctx);
-            let record_type_of = |name: &String| {
+            let record_type_of = |name: &crate::types::RecordName| {
                 ctx.db()
                     .get_record(name)
                     .map(|rec| rec.read().record.record_type().to_string())
@@ -200,7 +202,7 @@ fn cmd_db_dump_record() -> CommandDef {
             // generated table plus whatever a runtime registration added, which
             // is exactly the set a loaded record can carry.
             if let Some(wanted) = wanted
-                && !RECORD_TYPES.contains(&wanted)
+                && !crate::server::record::record_types().contains(&wanted)
                 && !names
                     .iter()
                     .any(|name| record_type_of(name).as_deref() == Some(wanted))
@@ -256,7 +258,9 @@ fn c_link_type_number(t: crate::server::record::DbLinkType) -> i32 {
         L::AbIo => 4,
         L::GpibIo => 5,
         L::BitbusIo => 6,
+        L::MacroLink => 7,
         L::JsonLink => 8,
+        L::PnLink => 9,
         L::DbLink => 10,
         L::CaLink => 11,
         L::InstIo => 12,
@@ -291,7 +295,7 @@ fn c_special_name(code: i16) -> Option<&'static str> {
 /// C's `pdbFldDes->special`, the `%hd` `dbDumpField` and `dbWriteRecordTypeFP`
 /// both print.
 fn c_special_code(special: Special) -> i16 {
-    special as i16
+    special.code()
 }
 
 /// The lines C's `dbDumpField` prints for one field descriptor
@@ -302,9 +306,10 @@ fn c_special_code(special: Special) -> i16 {
 /// `papFldDes`. It cannot be the caller's iteration position: the port drops
 /// C's `DBF_NOACCESS` internals, which are interleaved with the rest from
 /// `MLOK` at 13 onwards, so the index must come from
-/// [`record_declaration_order`](crate::server::record::dbd_generated::record_declaration_order),
-/// and is `None` for a record type registered at runtime, whose declaration
-/// order the generator never saw.
+/// [`record_declaration_order`](crate::server::record::dbd_generated::record_declaration_order)
+/// or a contributed crate's ([`crate::server::record::register_contributed_dbd`]),
+/// and is `None` for a record type registered at runtime with no generated
+/// table, whose declaration order the generator never saw.
 fn dump_field_lines(desc: &FieldDesc, ind_record_type: Option<usize>) -> Vec<String> {
     let special = c_special_code(desc.special);
     let mut lines = vec![format!("    {}", desc.name)];
@@ -343,11 +348,7 @@ fn dump_field_lines(desc: &FieldDesc, ind_record_type: Option<usize>) -> Vec<Str
 /// Unlike `dbDumpField`'s plain `strcmp`, this one takes the `NULL`/`""`/`"*"`
 /// sentinel (`:907-910`): all three dump every menu.
 ///
-/// The report is complete for the menus `epics-base-rs` declares. A downstream
-/// crate's `.dbd` menus are generated into that crate's own `MENUS` and are not
-/// visible from here, because a record type registers its FIELDS with the
-/// process (`register_declared_fields`) and its menus have no such funnel;
-/// C has one `pdbbase->menuList` for every loaded `.dbd`.
+/// A downstream crate's menus appear once it registered its generated `DBD`.
 fn cmd_db_dump_menu() -> CommandDef {
     CommandDef::new(
         "dbDumpMenu",
@@ -373,9 +374,9 @@ fn cmd_db_dump_menu() -> CommandDef {
                 ArgValue::String(s) if !s.is_empty() && s != "*" => Some(s.clone()),
                 _ => None,
             };
-            for (name, idents, values) in crate::server::record::dbd_generated::MENUS {
+            for (name, idents, values) in crate::server::record::menus() {
                 if let Some(w) = wanted.as_deref()
-                    && *name != w
+                    && name.as_bytes() != w
                 {
                     continue;
                 }
@@ -416,8 +417,8 @@ fn cmd_db_dump_menu() -> CommandDef {
 /// The remaining columns are `.dbd` facts and print unchanged.
 ///
 /// Everything else C prints comes out of
-/// [`record_declaration_order`](crate::server::record::dbd_generated::record_declaration_order),
-/// which is C's `papFldDes` order — `.dbd` declaration order with dbCommon
+/// [`record_declaration_order`](crate::server::record::dbd_generated::record_declaration_order)
+/// (or a contributed crate's generated twin), which is C's `papFldDes` order — `.dbd` declaration order with dbCommon
 /// spliced in at the record's `include` and the `DBF_NOACCESS` internals kept —
 /// so `no_fields`, every `index`, the `sortind` permutation, `link_ind` and
 /// `indvalFlddes` are C's own numbers rather than an index into one of the two
@@ -447,9 +448,9 @@ fn cmd_db_dump_record_type() -> CommandDef {
                 ArgValue::String(s) => Some(s.clone()),
                 _ => None,
             };
-            for record_type in RECORD_TYPES {
+            for record_type in crate::server::record::record_types() {
                 if let Some(w) = wanted.as_deref()
-                    && *record_type != w
+                    && record_type.as_bytes() != w
                 {
                     continue;
                 }
@@ -477,13 +478,13 @@ fn cmd_db_dump_record_type() -> CommandDef {
 fn dump_record_type_lines(record_type: &str) -> Vec<String> {
     use crate::server::record::dbd_generated as dbd;
 
-    let Some(decl) = dbd::record_declaration_order(record_type) else {
+    let Some(decl) = crate::server::record::record_declaration_order(record_type) else {
         return Vec::new();
     };
     // The port keeps dbCommon separate from a record's own fields and drops the
     // `DBF_NOACCESS` internals from both, so a name in `decl` may have no
     // descriptor. Those are exactly C's internals, which are never links.
-    let own = dbd::record_fields(record_type).unwrap_or(&[]);
+    let own = crate::server::record::record_fields(record_type).unwrap_or(&[]);
     let declared_dbf = |name: &str| {
         dbd::DB_COMMON_FIELDS
             .iter()
@@ -507,7 +508,7 @@ fn dump_record_type_lines(record_type: &str) -> Vec<String> {
         format!(
             "name({record_type}) no_fields({}) no_prompt({}) no_links({})",
             decl.len(),
-            dbd::record_no_prompt(record_type).unwrap_or(0),
+            crate::server::record::record_no_prompt(record_type).unwrap_or(0),
             link_ind.len()
         ),
         "index name\tsortind sortname".to_string(),
@@ -615,23 +616,21 @@ fn cmd_db_dump_field() -> CommandDef {
             let wanted_type = name_arg(&args[1]);
             let wanted_field = name_arg(&args[2]);
 
-            for record_type in RECORD_TYPES {
+            for record_type in crate::server::record::record_types() {
                 if let Some(wanted) = wanted_type.as_deref()
-                    && *record_type != wanted
+                    && record_type.as_bytes() != wanted
                 {
                     continue;
                 }
                 // C's trailing space before the newline.
                 ctx.println(&format!("recordtype({record_type}) "));
                 let common = crate::server::record::dbd_generated::DB_COMMON_FIELDS;
-                let own =
-                    crate::server::record::dbd_generated::record_fields(record_type).unwrap_or(&[]);
+                let own = crate::server::record::record_fields(record_type).unwrap_or(&[]);
                 let decl =
-                    crate::server::record::dbd_generated::record_declaration_order(record_type)
-                        .unwrap_or(&[]);
+                    crate::server::record::record_declaration_order(record_type).unwrap_or(&[]);
                 for desc in common.iter().chain(own.iter()) {
                     if let Some(wanted) = wanted_field.as_deref()
-                        && desc.name != wanted
+                        && desc.name.as_bytes() != wanted
                     {
                         continue;
                     }
@@ -662,18 +661,11 @@ fn cmd_db_dump_field() -> CommandDef {
 /// each record type. C `dbDumpDevice` (`dbStaticLib.c:3429-3486`), registered
 /// at `dbStaticIocRegister.c:270`.
 ///
-/// C prints five values per device. Two are `.dbd` declarations the port
-/// carries — `choice` (the `DTYP` string) and `link_type` — and are printed on
-/// C's lines. The other three are C addresses: `pdset` and `pdsxt` are the
-/// device support function tables, and `device name` is the C symbol naming
-/// `pdset`, which the generator never sees because a port device support is a
-/// Rust type rather than a linker symbol.
-///
-/// A record type whose device menu was contributed at runtime
-/// ([`register_device_menu`](crate::server::record::register_device_menu),
-/// how `asyn-rs` adds its `DTYP`s) has choices but no declared link type: the
-/// registry carries names only. Those print the `choice` line alone rather than
-/// a guessed `link_type`.
+/// Every row is a [`DevSup`](crate::server::record::DevSup), base's from the
+/// generated tables and the rest as registered, so each prints C's full
+/// block. The addresses are the row's own: `pdset` its dset, `func N` that
+/// slot's entry in the dset's table, `pdsxt` one shared extension table; a
+/// slot or `pdsxt` C leaves NULL prints `(nil)`.
 fn cmd_db_dump_device() -> CommandDef {
     CommandDef::new(
         "dbDumpDevice",
@@ -696,26 +688,19 @@ fn cmd_db_dump_device() -> CommandDef {
         |args: &[ArgValue], ctx: &CommandContext| {
             check_pdbbase(&args[0])?;
             let wanted = type_filter(&args[1]);
-            for record_type in RECORD_TYPES {
-                if let Some(wanted) = wanted
-                    && *record_type != wanted
+            for record_type in crate::server::record::record_types() {
+                if let Some(wanted) = wanted.as_deref()
+                    && record_type != wanted
                 {
                     continue;
                 }
-                let declared = crate::server::record::dbd_generated::device_menu(record_type)
-                    .unwrap_or_default();
-                let contributed = crate::server::record::contributed_device_menu(record_type);
-                if declared.is_empty() && contributed.is_empty() {
-                    continue;
-                }
+                let declared = crate::server::record::dbd_generated::devices(record_type)
+                    .unwrap_or_default()
+                    .iter();
+                let contributed = crate::server::record::contributed_device_rows(record_type);
                 ctx.println(&format!("recordtype({record_type})"));
-                for choice in declared.iter().copied().chain(contributed) {
-                    ctx.println(&format!("\tchoice:    {choice}"));
-                    if let Some(link_type) =
-                        crate::server::record::dbd_generated::device_link_type(record_type, choice)
-                    {
-                        ctx.println(&format!("\tlink_type: {}", c_link_type_number(link_type)));
-                    }
+                for row in declared.chain(contributed) {
+                    print_dev_sup(ctx, row);
                 }
                 if wanted.is_some() {
                     break;
@@ -724,6 +709,47 @@ fn cmd_db_dump_device() -> CommandDef {
             Ok(CommandOutcome::Continue)
         },
     )
+}
+
+/// One `devSup` as `dbDumpDevice` prints it (`dbStaticLib.c:3458-3483`).
+fn print_dev_sup(ctx: &CommandContext, row: &'static crate::server::record::DevSup) {
+    /// C's `devSoft_DSXT` and the `do_nothing` both its hooks point at.
+    static DSXT: u8 = 0;
+    static DO_NOTHING: u8 = 0;
+    const NAMES: [&str; 4] = [
+        " - report()",
+        " - init()",
+        " - init_record()",
+        " - get_ioint_info()",
+    ];
+    let dset = &row.dset;
+    ctx.println(&format!("    device name:   {}", row.name));
+    ctx.println(&format!("\tchoice:    {}", row.choice));
+    ctx.println(&format!(
+        "\tlink_type: {}",
+        c_link_type_number(row.link_type)
+    ));
+    ctx.println(&format!("\tpdset:     {:p}", dset));
+    ctx.println(&format!("\t    number: {}", dset.number()));
+    for i in 0..dset.number() {
+        let func = match (i, dset.init()) {
+            (1, Some(init)) => format!("{:p}", init as *const ()),
+            (1, None) => "(nil)".to_string(),
+            _ => match dset.funcs().iter().find(|&&slot| slot == i) {
+                Some(slot) => format!("{:p}", slot),
+                None => "(nil)".to_string(),
+            },
+        };
+        let name = NAMES.get(usize::from(i)).copied().unwrap_or("");
+        ctx.println(&format!("\t    func {i}: {func}{name}"));
+    }
+    if row.has_dsxt() {
+        ctx.println(&format!("\tpdsxt:     {:p}", &DSXT));
+        ctx.println(&format!("\t    add_record: {:p}", &DO_NOTHING));
+        ctx.println(&format!("\t    del_record: {:p}", &DO_NOTHING));
+    } else {
+        ctx.println("\tpdsxt:     (nil)");
+    }
 }
 
 /// `dbDumpDriver pdbbase` — C `dbDumpDriver` (`dbStaticLib.c:3488-3495`) over
@@ -773,8 +799,8 @@ fn cmd_db_dump_driver() -> CommandDef {
 /// `link(<key>,<jlif>)` per declaration — BOTH columns, because both are what
 /// the `.dbd` line said: `dbLinkType` stores `name` and `jlif_name` verbatim
 /// (`dbLexRoutines.c:883-900`) and never resolves the symbol, exactly as it
-/// never resolves a `registrar()` name. The port's build-time declarations
-/// come from `PORTED_JSON_LINK_TYPES`, which carries the pair.
+/// never resolves a `registrar()` name. The list read is the database's own
+/// ([`PvDatabase::link_list`](crate::server::database::PvDatabase)).
 ///
 /// C's list is operative rather than descriptive: `dbFindLinkSup`
 /// (`dbJLink.c:262`) looks a `{…}` link's leading map key up in it, so a type
@@ -799,8 +825,9 @@ fn cmd_db_dump_driver() -> CommandDef {
 /// * `trace` (`lnkTraceIf`, `lnkDebug.c:1039`) — the same wrapper, differing
 ///   from `debug` only in its `alloc`; absent for the same reason.
 ///
-/// `pva` comes from pvxs (`ioc/pvxs7x.dbd:2`, `link("pva", "lsetPVX")`), so its
-/// second column is quoted from there. `ca` is this port's own extension with
+/// `pva` comes from pvxs (`ioc/pvxs7x.dbd:2`, `link("pva", "lsetPVX")`), so it
+/// is listed only by a binary that declares it, with its second column quoted
+/// from there. `ca` is this port's own extension with
 /// no upstream `link()` line at all, and `lnkCaIf` is this port's own symbol
 /// name for it.
 fn cmd_db_dump_link() -> CommandDef {
@@ -816,7 +843,7 @@ fn cmd_db_dump_link() -> CommandDef {
         ),
         |args: &[ArgValue], ctx: &CommandContext| {
             check_pdbbase(&args[0])?;
-            for sup in link_sup_list().lock().unwrap().entries() {
+            for sup in ctx.db().link_list().entries() {
                 ctx.println(&format!("link({},{})", sup.key, sup.jlif_name));
             }
             Ok(CommandOutcome::Continue)
@@ -933,54 +960,6 @@ fn registrar_list() -> &'static std::sync::Mutex<DeclarationList<String>> {
         }
         std::sync::Mutex::new(list)
     })
-}
-
-/// One `link(<key>, <jlif>)` declaration as this process holds it — the port's
-/// `pdbbase->linkList` node. Owns its strings because a runtime
-/// `dbLoadDatabase` contributes them.
-#[derive(Clone, PartialEq, Eq)]
-struct LinkDeclaration {
-    key: String,
-    jlif_name: String,
-}
-
-impl DbdDeclaration for LinkDeclaration {
-    fn key(&self) -> &str {
-        &self.key
-    }
-}
-
-/// The port's `pdbbase->linkList`, under the same two-block rule as
-/// [`registrar_list`]: `dbdExpand.pl` sorts the build's `link()` lines
-/// (`DBD/Output.pm:92-97`) and a runtime `.dbd` appends in its own order.
-fn link_sup_list() -> &'static std::sync::Mutex<DeclarationList<LinkDeclaration>> {
-    static LIST: std::sync::OnceLock<std::sync::Mutex<DeclarationList<LinkDeclaration>>> =
-        std::sync::OnceLock::new();
-    LIST.get_or_init(|| {
-        let mut list = DeclarationList::default();
-        for sup in crate::server::record::PORTED_JSON_LINK_TYPES {
-            list.declare_built_in(LinkDeclaration {
-                key: sup.key.to_string(),
-                jlif_name: sup.jlif_name.to_string(),
-            });
-        }
-        std::sync::Mutex::new(list)
-    })
-}
-
-/// Record the `link()` declarations one `dbLoadDatabase` read, as
-/// [`add_loaded_registrars`] does for `registrar()`. A key the build already
-/// declares is dropped, which is C's gpHash test.
-pub(super) fn add_loaded_link_types(types: &[crate::server::db_loader::DbdLinkType]) {
-    let mut list = link_sup_list().lock().unwrap();
-    for t in types {
-        if !t.key.is_empty() {
-            list.declare_loaded(LinkDeclaration {
-                key: t.key.clone(),
-                jlif_name: t.lset.clone(),
-            });
-        }
-    }
 }
 
 /// The `registrar()` lines this crate's own compiled-in feature set declares —
@@ -1239,9 +1218,14 @@ fn cmd_db_pvd_dump() -> CommandDef {
                 _ => false,
             };
 
-            let mut names = ctx.block_on(ctx.db().all_record_names());
+            let mut names = ctx.db().all_record_names();
             names.extend(ctx.db().all_alias_names());
-            names.extend(ctx.block_on(ctx.db().all_simple_pv_names()));
+            names.extend(
+                ctx.db()
+                    .all_simple_pv_names()
+                    .into_iter()
+                    .map(crate::types::RecordName::from),
+            );
             names.sort();
 
             ctx.println(&format!(
@@ -1255,7 +1239,7 @@ fn cmd_db_pvd_dump() -> CommandDef {
                     let mut line = String::from("         ");
                     for name in row {
                         line.push_str("  ");
-                        line.push_str(name);
+                        line.push_str(&name.to_str_lossy());
                     }
                     ctx.println(&line);
                 }
@@ -1391,8 +1375,13 @@ fn device_config_lines(ctx: &CommandContext) -> Vec<String> {
         // read go through. Both answer `Soft Timestamp` for `DTYP` and
         // `LINEAR` for `LINR`, but only this one renders `EGUF` the way C's
         // `cvt(` column does.
-        let field_string =
-            |field: &str| super::commands::db_get_string_field(&inst, field).unwrap_or_default();
+        // Display only: a menu choice and two numbers.
+        let field_string = |field: &str| {
+            String::from_utf8_lossy(
+                &super::commands::db_get_string_field(&inst, field).unwrap_or_default(),
+            )
+            .into_owned()
+        };
 
         // C `cvt(<EGUL>,<EGUF>)`, and only when `LINR` reads exactly `LINEAR`
         // (`dbStaticLib.c:3632-3647`). A record type with no `LINR` field gets
@@ -1463,11 +1452,19 @@ fn cmd_dbhcr() -> CommandDef {
 /// One `record(...) { ... }` block — the body of C's inner `dbFirstRecord`
 /// loop (`dbStaticLib.c:826-866`), returned as lines so the walk is testable
 /// without an output capture.
-fn dump_one_record(ctx: &CommandContext, name: &str, record_type: &str, level: i64) -> Vec<String> {
+fn dump_one_record(
+    ctx: &CommandContext,
+    name: &[u8],
+    record_type: &str,
+    level: i64,
+) -> Vec<String> {
     let Some(rec) = ctx.db().get_record(name) else {
         return Vec::new();
     };
-    let mut lines = vec![format!("record({record_type},\"{name}\") {{")];
+    let mut lines = vec![format!(
+        "record({record_type},\"{}\") {{",
+        String::from_utf8_lossy(name)
+    )];
     let inst = rec.read();
 
     let mut descs: Vec<&crate::server::record::FieldDesc> =
@@ -1495,14 +1492,17 @@ fn dump_one_record(ctx: &CommandContext, name: &str, record_type: &str, level: i
         lines.push(format!(
             "\tfield({},\"{}\")",
             desc.name,
-            print_escaped(&value.to_string())
+            // `dbGetString` (`dbStaticLib.c:850`).
+            print_escaped(&String::from_utf8_lossy(
+                &crate::server::iocsh::db_get_string(&inst, desc, &value)
+            ))
         ));
     }
 
     // C's `infoList` is an ELLLIST in declaration order
     // (`dbStaticLib.c:855-864`); the port's `info` is a HashMap with no order
     // to report, so one record's tags come out sorted by tag name.
-    let mut tags: Vec<(&String, &String)> = inst.info.iter().collect();
+    let mut tags: Vec<(&String, &String)> = inst.info().iter().collect();
     tags.sort();
     for (key, value) in tags {
         lines.push(format!("\tinfo(\"{key}\",\"{}\")", print_escaped(value)));
@@ -1546,78 +1546,33 @@ fn is_default_value(
             // (`dbStaticRun.c:330-344`).
             match desc.menu.and_then(|m| m.iter().position(|c| *c == init)) {
                 Some(index) => u64::from(*v) == index as u64,
-                None => init.parse::<u16>().map(|def| *v == def).unwrap_or(false),
+                None => c_parse::epics_parse_uint16(init) == Some(*v),
             }
         }
-        V::Char(v) => int_is_default(u64::from(*v), initial),
-        V::UChar(v) => int_is_default(u64::from(*v), initial),
-        V::UShort(v) => int_is_default(u64::from(*v), initial),
-        V::ULong(v) => int_is_default(u64::from(*v), initial),
-        V::UInt64(v) => int_is_default(*v, initial),
-        V::Short(v) => signed_is_default(i64::from(*v), initial),
-        V::Long(v) => signed_is_default(i64::from(*v), initial),
-        V::Int64(v) => signed_is_default(*v, initial),
-        V::Float(v) => float_is_default(f64::from(*v), initial),
-        V::Double(v) => float_is_default(*v, initial),
+        V::Char(_)
+        | V::UChar(_)
+        | V::Short(_)
+        | V::UShort(_)
+        | V::Long(_)
+        | V::ULong(_)
+        | V::Int64(_)
+        | V::UInt64(_)
+        | V::Float(_)
+        | V::Double(_) => {
+            let Some(init) = initial else {
+                return value.to_f64() == Some(0.0);
+            };
+            // `epicsParse*(initial, &def, 0, NULL)` at the field's width
+            // (`dbStaticRun.c:245-327`).
+            c_parse::NumericField::of(value.db_field_type())
+                .and_then(|target| c_parse::parse_auto_base_units_null(target, init))
+                .is_some_and(|def| def == *value)
+        }
         // C's `default:` arm answers TRUE — an array or any type it has no
         // comparison for is treated as still holding its default
         // (`dbStaticRun.c:365-366`).
         _ => true,
     }
-}
-
-fn int_is_default(value: u64, initial: Option<&str>) -> bool {
-    match initial {
-        // C parses with base 0, so `0x10` and `020` are accepted
-        // (`epicsParseUInt32(pflddes->initial, &def, 0, NULL)`).
-        Some(init) => parse_c_unsigned(init)
-            .map(|def| value == def)
-            .unwrap_or(false),
-        None => value == 0,
-    }
-}
-
-fn signed_is_default(value: i64, initial: Option<&str>) -> bool {
-    match initial {
-        Some(init) => parse_c_signed(init)
-            .map(|def| value == def)
-            .unwrap_or(false),
-        None => value == 0,
-    }
-}
-
-fn float_is_default(value: f64, initial: Option<&str>) -> bool {
-    match initial {
-        Some(init) => init
-            .trim()
-            .parse::<f64>()
-            .map(|def| value == def)
-            .unwrap_or(false),
-        None => value == 0.0,
-    }
-}
-
-/// C's `epicsParseUInt*(s, &v, 0, NULL)` — base 0, so a `0x`/`0X` prefix is
-/// hex, a leading `0` is octal, anything else decimal.
-fn parse_c_unsigned(s: &str) -> Option<u64> {
-    let s = s.trim();
-    if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
-        return u64::from_str_radix(hex, 16).ok();
-    }
-    if s.len() > 1 && s.starts_with('0') {
-        return u64::from_str_radix(&s[1..], 8).ok();
-    }
-    s.parse::<u64>().ok()
-}
-
-fn parse_c_signed(s: &str) -> Option<i64> {
-    let s = s.trim();
-    if let Some(rest) = s.strip_prefix('-') {
-        return parse_c_unsigned(rest)
-            .and_then(|v| i64::try_from(v).ok())
-            .map(|v| -v);
-    }
-    parse_c_unsigned(s.strip_prefix('+').unwrap_or(s)).and_then(|v| i64::try_from(v).ok())
 }
 
 #[cfg(test)]
@@ -1688,19 +1643,37 @@ variable(seqDLYprecision,int)
     /// leading key in the very list `dbDumpLink` prints — so the report and
     /// the parser cannot be allowed to drift here either. Every reported type
     /// must load, and the two C types this port refuses must not be reported
-    /// as available.
+    /// as available. `pva` is on both sides of that line: absent and refused
+    /// until the binary declares it, then last, where pvxs 1.5.3's
+    /// `softIocPVX.dbd:18997-19002` puts it, after `trace`.
     #[test]
     fn db_dump_link_lists_exactly_the_types_a_link_field_accepts() {
-        use crate::server::record::check_json_link_text;
-        let (_db, ctx) = make_ctx();
+        let (db, ctx) = make_ctx();
+        let check_json_link_text = |text: &str| {
+            crate::server::record::check_json_link_text_in(
+                text,
+                crate::server::record::LinkFieldType::In,
+                crate::server::record::LinkLookup::Database(&db.link_list()),
+            )
+        };
+        assert_eq!(
+            run(&ctx, "dbDumpLink", &["pdbbase"]).unwrap(),
+            "link(ca,lnkCaIf)\n\
+             link(calc,lnkCalcIf)\n\
+             link(const,lnkConstIf)\n\
+             link(state,lnkStateIf)\n"
+        );
+        assert!(check_json_link_text("{pva:\"X\"}").is_err());
+
+        db.declare_link_type("pva");
         let printed = run(&ctx, "dbDumpLink", &["pdbbase"]).unwrap();
         assert_eq!(
             printed,
             "link(ca,lnkCaIf)\n\
              link(calc,lnkCalcIf)\n\
              link(const,lnkConstIf)\n\
-             link(pva,lsetPVX)\n\
-             link(state,lnkStateIf)\n"
+             link(state,lnkStateIf)\n\
+             link(pva,lsetPVX)\n"
         );
         for text in [
             "{const:1}",
@@ -1726,6 +1699,36 @@ variable(seqDLYprecision,int)
         }
     }
 
+    /// A runtime `.dbd` carrying pvxs's `link("pva", "lsetPVX")` declares the
+    /// type and binds no support, so `{pva:…}` is refused as not loaded — the
+    /// second of `dbjl_map_key`'s two refusals (`dbJLink.c:270-275`). Measured
+    /// on softIoc R7.0.10-146-g8f5015b66 from the same two lines.
+    #[test]
+    fn a_loaded_pva_link_line_declares_but_does_not_bind_the_type() {
+        use std::io::Write;
+        let (db, ctx) = make_ctx();
+        let mut tmp = tempfile::Builder::new().suffix(".dbd").tempfile().unwrap();
+        writeln!(tmp, "link(\"pva\", \"lsetPVX\")").unwrap();
+        run(&ctx, "dbLoadDatabase", &[tmp.path().to_str().unwrap()]).unwrap();
+
+        let refusal = crate::server::record::check_json_link_text_in(
+            "{pva:\"X\"}",
+            crate::server::record::LinkFieldType::In,
+            crate::server::record::LinkLookup::Database(&db.link_list()),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            refusal.contains("dbJLinkInit: Support for Link type 'pva' not loaded"),
+            "{refusal}"
+        );
+        assert!(
+            run(&ctx, "dbDumpLink", &["pdbbase"])
+                .unwrap()
+                .ends_with("link(state,lnkStateIf)\nlink(pva,lsetPVX)\n")
+        );
+    }
+
     /// A `link()` line read at run time appends after the build's block and
     /// keeps the `jlif` name it declared — `dbLinkType` stores both strings
     /// verbatim (`dbLexRoutines.c:893-894`) and resolves neither.
@@ -1734,8 +1737,8 @@ variable(seqDLYprecision,int)
         use std::io::Write;
         let (_db, ctx) = make_ctx();
         let mut tmp = tempfile::Builder::new().suffix(".dbd").tempfile().unwrap();
-        // Sorts ahead of every built-in key, so only the two-block rule can
-        // put it last.
+        // Sorts ahead of every built-in key, so only insertion order can put
+        // it last.
         writeln!(tmp, "link(aaa, jlifAaa)").unwrap();
         run(&ctx, "dbLoadDatabase", &[tmp.path().to_str().unwrap()]).unwrap();
 
@@ -1744,7 +1747,6 @@ variable(seqDLYprecision,int)
             "link(ca,lnkCaIf)\n\
              link(calc,lnkCalcIf)\n\
              link(const,lnkConstIf)\n\
-             link(pva,lsetPVX)\n\
              link(state,lnkStateIf)\n\
              link(aaa,jlifAaa)\n"
         );
@@ -1760,7 +1762,7 @@ variable(seqDLYprecision,int)
 
         struct Probe;
         impl DriverSupport for Probe {
-            fn report(&self, _level: i32) -> Option<String> {
+            fn report(&self, _level: i32) -> Option<Vec<u8>> {
                 Some("probe".into())
             }
         }
@@ -1779,7 +1781,7 @@ variable(seqDLYprecision,int)
     fn run(ctx: &CommandContext, name: &str, tokens: &[&str]) -> Result<String, String> {
         let reg = registry();
         let cmd = reg.get(name).unwrap();
-        let tokens: Vec<String> = tokens.iter().map(|t| t.to_string()).collect();
+        let tokens: Vec<IocshString> = tokens.iter().map(|t| IocshString::from(*t)).collect();
         let args = super::super::registry::parse_args(&tokens, &cmd.args).unwrap();
         let mut outcome = Ok(());
         let printed = capture(ctx, || {
@@ -1846,7 +1848,7 @@ variable(seqDLYprecision,int)
         let all = run(&ctx, "dbDumpRecordType", &["pdbbase"]).unwrap();
         assert_eq!(
             all.lines().filter(|l| l.starts_with("name(")).count(),
-            RECORD_TYPES.len()
+            crate::server::record::record_types().len()
         );
     }
 
@@ -1857,7 +1859,7 @@ variable(seqDLYprecision,int)
     #[test]
     fn dump_record_type_sort_and_links_hold_for_every_type() {
         use crate::server::record::dbd_generated as dbd;
-        for record_type in RECORD_TYPES {
+        for record_type in dbd::RECORD_TYPES {
             let lines = dump_record_type_lines(record_type);
             let decl = dbd::record_declaration_order(record_type).unwrap();
             let rows = &lines[2..2 + decl.len()];
@@ -1939,7 +1941,7 @@ variable(seqDLYprecision,int)
         assert_eq!(all, star);
         assert_eq!(
             all.lines().filter(|l| l.starts_with("menu(")).count(),
-            crate::server::record::dbd_generated::MENUS.len()
+            crate::server::record::menus().len()
         );
     }
 
@@ -1972,11 +1974,9 @@ variable(seqDLYprecision,int)
         write!(tmp.as_file(), "{body}").unwrap();
         let reg = registry();
         let cmd = reg.get("dbLoadRecords").unwrap();
-        let args = super::super::registry::parse_args(
-            &[tmp.path().to_string_lossy().to_string()],
-            &cmd.args,
-        )
-        .unwrap();
+        let args =
+            super::super::registry::parse_args(&[tmp.path().to_string_lossy().into()], &cmd.args)
+                .unwrap();
         cmd.handler.call(&args, ctx).unwrap();
     }
 
@@ -1997,6 +1997,21 @@ variable(seqDLYprecision,int)
             "a non-default field is printed at level 0 — got:\n{out}"
         );
         assert!(out.contains("\n}\n"), "C closes the block — got:\n{out}");
+    }
+
+    /// A real field prints as `dbGetString`'s `realToString`
+    /// (`dbStaticLib.c:233`), not as the `.db` text.
+    #[test]
+    fn dump_record_prints_a_real_as_real_to_string() {
+        let (_db, ctx) = make_ctx();
+        load(
+            &ctx,
+            "record(ao,\"AO:BIG\") { field(DRVH,\"1e20\") field(DRVL,\"0.5\") }\n",
+        );
+
+        let out = run(&ctx, "dbDumpRecord", &["pdbbase"]).unwrap();
+        assert!(out.contains("\tfield(DRVH,\"1.0e+20\")\n"), "{out}");
+        assert!(out.contains("\tfield(DRVL,\"0.5\")\n"), "{out}");
     }
 
     /// C's level gate: level 0 prints only fields differing from the `.dbd`
@@ -2084,15 +2099,30 @@ variable(seqDLYprecision,int)
         assert!(out.contains("\tinfo(\"Q:group\",\"grp\")\n"), "got:\n{out}");
     }
 
-    /// `dbDumpDevice`'s two `.dbd` lines, byte for byte
-    /// (`dbStaticLib.c:3447-3448`).
+    /// `dbDumpDevice`'s devSup block (`dbStaticLib.c:3458-3483`): a dset
+    /// slot C leaves NULL prints `(nil)`, as does a non-CONSTANT row's
+    /// `pdsxt`.
     #[test]
-    fn dump_device_prints_the_choice_and_link_type() {
+    fn dump_device_prints_the_devsup_block() {
         let (_db, ctx) = make_ctx();
         let out = run(&ctx, "dbDumpDevice", &["pdbbase", "ai"]).unwrap();
         assert!(out.starts_with("recordtype(ai)\n"), "got:\n{out}");
-        assert!(out.contains("\tchoice:    Soft Channel\n"), "got:\n{out}");
-        assert!(out.contains("\tlink_type: 0\n"), "got:\n{out}");
+        assert!(out.contains("    device name:   devAiSoft\n\tchoice:    Soft Channel\n\tlink_type: 0\n\tpdset:     0x"), "got:\n{out}");
+        assert!(out.contains("\t    number: 6\n\t    func 0: (nil) - report()\n\t    func 1: (nil) - init()\n\t    func 2: 0x"), "got:\n{out}");
+        assert!(
+            out.contains(
+                "    device name:   devAiGeneralTime\n\tchoice:    General Time\n\tlink_type: 12\n"
+            ),
+            "got:\n{out}"
+        );
+        assert!(out.ends_with("\tpdsxt:     (nil)\n"), "got:\n{out}");
+        // devAiSoftCallback's `init` (devAiSoftCallback.c:151) is the one
+        // the dset pass runs: its slot is the init slot's address.
+        let callback = out
+            .split("    device name:   ")
+            .find(|row| row.starts_with("devAiSoftCallback\n"))
+            .unwrap();
+        assert!(callback.contains("\t    func 1: 0x"), "got:\n{callback}");
         // C breaks out of the record-type walk once the named type is done
         // (`dbStaticLib.c:3484`).
         assert!(!out.contains("recordtype(bi)"), "got:\n{out}");
@@ -2137,15 +2167,14 @@ variable(seqDLYprecision,int)
 
         let mut registry: std::collections::HashMap<
             String,
-            Arc<crate::server::record::SubroutineFn>,
+            Arc<crate::server::record::Subroutine>,
         > = std::collections::HashMap::new();
         for name in ["mySubZebra", "mySubAlpha"] {
             registry.insert(
                 name.to_string(),
-                Arc::new(
-                    Box::new(|_r: &mut dyn crate::server::record::Record| Ok(0i64))
-                        as crate::server::record::SubroutineFn,
-                ),
+                Arc::new(crate::server::record::Subroutine::Plain(Box::new(
+                    |_r: &mut dyn crate::server::record::Record| Ok(0i64),
+                ))),
             );
         }
         ctx.block_on(db.install_subroutine_registry(registry));
@@ -2280,7 +2309,7 @@ variable(seqDLYprecision,int)
         let cmd = reg.get("dbPvdTableSize").unwrap();
 
         let outcome = |tokens: &[&str]| {
-            let tokens: Vec<String> = tokens.iter().map(|t| t.to_string()).collect();
+            let tokens: Vec<IocshString> = tokens.iter().map(|t| IocshString::from(*t)).collect();
             let args = super::super::registry::parse_args(&tokens, &cmd.args).unwrap();
             let mut failed = false;
             let printed = capture(&ctx, || {
@@ -2597,9 +2626,9 @@ variable(seqDLYprecision,int)
         let (_db, ctx) = make_ctx();
         let reg = registry();
         let cmd = reg.get("dbPutAttribute").unwrap();
-        let tokens: Vec<String> = ["ai", "MYATTR", "hello"]
+        let tokens: Vec<IocshString> = ["ai", "MYATTR", "hello"]
             .iter()
-            .map(|t| t.to_string())
+            .map(|t| t.to_string().into())
             .collect();
         let args = super::super::registry::parse_args(&tokens, &cmd.args).unwrap();
         capture(&ctx, || {
@@ -2792,7 +2821,7 @@ variable(seqDLYprecision,int)
     fn a_hardware_links_type_word_is_its_bus() {
         let word = |text: &str| {
             crate::server::record::parse_link_field(text, crate::server::record::LinkFieldType::In)
-                .link_type_after_init(text)
+                .link_type_after_init(text, crate::server::record::LinkFieldType::In)
                 .c_name()
         };
 
@@ -2822,7 +2851,7 @@ variable(seqDLYprecision,int)
     #[test]
     fn pdbbase_argument_refuses_anything_else() {
         assert!(check_pdbbase(&ArgValue::String("pdbbase".into())).is_ok());
-        assert!(check_pdbbase(&ArgValue::String(String::new())).is_ok());
+        assert!(check_pdbbase(&ArgValue::String(Default::default())).is_ok());
         assert!(check_pdbbase(&ArgValue::String("0".into())).is_ok());
         assert!(check_pdbbase(&ArgValue::Missing).is_ok());
         assert_eq!(
@@ -2862,6 +2891,7 @@ variable(seqDLYprecision,int)
             dbf_type: DbFieldType::Long,
             declared_dbf: DbfCode::Long,
             runtime_typed: false,
+            long_string: false,
             read_only: false,
             special: Special::None,
             declared_special: Special::None,
@@ -2870,6 +2900,7 @@ variable(seqDLYprecision,int)
             size: 0,
             extra: None,
             menu,
+            menu_name: None,
             initial,
             interest: 0,
             prop: false,
@@ -2908,6 +2939,30 @@ variable(seqDLYprecision,int)
         assert!(is_default_value(
             &desc(Some("020"), None),
             &EpicsValue::Long(16)
+        ));
+
+        // `epicsParse*` is libcom's at the field's width: a negative into
+        // an unsigned field wraps, a FLOAT `initial` narrows to float, and
+        // the glibc `0b` prefix counts.
+        assert!(is_default_value(
+            &desc(Some("-1"), None),
+            &EpicsValue::UChar(255)
+        ));
+        assert!(is_default_value(
+            &desc(Some("-1"), None),
+            &EpicsValue::Char(0xff)
+        ));
+        assert!(is_default_value(
+            &desc(Some("0.1"), None),
+            &EpicsValue::Float(0.1)
+        ));
+        assert!(is_default_value(
+            &desc(Some("0b11"), None),
+            &EpicsValue::Long(3)
+        ));
+        assert!(is_default_value(
+            &desc(Some("0x1"), Some(&["NO", "YES"])),
+            &EpicsValue::Enum(1)
         ));
 
         // A menu `initial` resolves against the choice list first

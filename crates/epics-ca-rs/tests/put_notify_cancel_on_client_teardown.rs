@@ -27,10 +27,6 @@
 //! Ports are always ephemeral (`:0`) — never the real 5064, per the
 //! `build() ⟹ listening` port-ownership rule.
 
-// RTEMS-EXEC-MODEL-ALLOW(1): measured, not argued — the 1 ungated case here
-// (the blocking driver's) runs and passes under
-// `EPICS_RS_BUILD_EXEC_BACKEND=thread`.
-
 use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};

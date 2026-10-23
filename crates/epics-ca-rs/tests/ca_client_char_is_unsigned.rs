@@ -79,7 +79,7 @@ async fn pair() -> (CaClient, CaChannel, CaChannel) {
     let src = client.create_channel(BYTES_PV);
     let dst = client.create_channel(LONGS_PV);
     for ch in [&src, &dst] {
-        ch.wait_connected(budget::FACT_BUDGET)
+        ch.wait_connected(fact_budget::FACT_BUDGET)
             .await
             .expect("connect");
     }
@@ -121,7 +121,7 @@ async fn a_plain_get_of_a_char_waveform_re_puts_unsigned() {
 async fn a_single_element_get_takes_the_same_carrier() {
     let (_client, src, _dst) = pair().await;
     let (_, value) = src
-        .get_with_timeout_count(budget::FACT_BUDGET, 1u32)
+        .get_with_timeout_count(fact_budget::FACT_BUDGET, 1u32)
         .await
         .expect("one-element get");
     assert_eq!(
@@ -136,7 +136,7 @@ async fn a_single_element_get_takes_the_same_carrier() {
 async fn a_monitor_of_a_char_waveform_re_puts_unsigned() {
     let (_client, src, dst) = pair().await;
     let mut mon = src.subscribe().await.expect("subscribe");
-    let snap = tokio::time::timeout(budget::FACT_BUDGET, mon.recv())
+    let snap = tokio::time::timeout(fact_budget::FACT_BUDGET, mon.recv())
         .await
         .expect("monitor event within 3s")
         .expect("monitor stream open")
@@ -191,6 +191,3 @@ async fn caget_still_renders_the_signed_reading() {
         "the -S long-string form still recognises the wire byte carrier"
     );
 }
-
-#[path = "common/budget.rs"]
-mod budget;

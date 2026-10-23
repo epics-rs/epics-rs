@@ -1,0 +1,5 @@
+_main_ field_unclosed.proto line 2: Missing ')' after field name
+_main_ field_unclosed.proto line 2: in format string: "%(VAL"
+_main_ field_unclosed.proto line 2: in command 'out'
+_main_ field_unclosed.proto line 1: in protocol 'p'
+_main_ while compiling protocol 'p' for 'rec0'

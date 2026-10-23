@@ -8,10 +8,12 @@ use rand::rngs::StdRng;
 use asyn_rs::port_handle::PortHandle;
 
 use ad_core_rs::driver::{ADStatus, ImageMode};
-use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDimension};
+use ad_core_rs::ndarray::{NDDataBuffer, NDDimension};
+use ad_core_rs::ndarray_pool::DriverPool;
 use ad_core_rs::params::ADBaseParams;
-use ad_core_rs::plugin::channel::{ArrayPublisher, QueuedArrayCounter};
+use ad_core_rs::plugin::channel::ArrayPublisher;
 use ad_core_rs::runtime as rt;
+use ad_core_rs::timestamp::EpicsTimestamp;
 
 use crate::physics::{self, MovingDotImageConfig};
 
@@ -35,25 +37,19 @@ pub(crate) struct AcquisitionContext {
     pub ad: ADBaseParams,
     pub dot: MovingDotParams,
     pub image_config: MovingDotImageConfig,
-    pub queued_counter: Arc<QueuedArrayCounter>,
+    pub pool: DriverPool,
 }
 
 impl AcquisitionContext {
-    /// Drain in-flight arrays (if configured) and transition to Idle.
-    async fn end_acquisition(&self, wait_for_plugins: bool) {
-        if wait_for_plugins {
-            self.queued_counter.wait_until_zero(Duration::from_secs(5));
-        }
+    /// Transition to Idle. Storing ADAcquire=0 is what clears ADAcquireBusy,
+    /// held while ADWaitForPlugins waits on the queued arrays
+    /// (asynNDArrayDriver.cpp:636-663).
+    async fn end_acquisition(&self) {
         if let Err(e) = self
             .port_handle
             .set_params_and_notify(
                 0,
                 vec![
-                    asyn_rs::request::ParamSetValue::new(
-                        self.ad.acquire_busy,
-                        0,
-                        ParamValue::Int32(0),
-                    ),
                     asyn_rs::request::ParamSetValue::new(
                         self.ad.status,
                         0,
@@ -64,7 +60,7 @@ impl AcquisitionContext {
             )
             .await
         {
-            eprintln!("set_params_and_notify error (end_acquisition): {e}");
+            epics_libcom_rs::stderr_println!("set_params_and_notify error (end_acquisition): {e}");
         }
     }
 }
@@ -137,7 +133,7 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
             )
             .await
         {
-            eprintln!("set_params_and_notify error (acquire start): {e}");
+            epics_libcom_rs::stderr_println!("set_params_and_notify error (acquire start): {e}");
         }
 
         let mut num_counter = 0;
@@ -193,14 +189,22 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
 
             // Build NDArray from f64 data
             let dims = vec![NDDimension::new(height), NDDimension::new(width)];
-            let mut frame = NDArray::with_data(dims, NDDataBuffer::F64(img_data));
+            // As C simDetector, the last image is released and the next is
+            // allocated in its place under one lock (simDetector.cpp:694-699);
+            // it stays there through the exposure wait. A refused wrap has
+            // printed the pool's limit line.
+            let Some(frame) = ctx.pool.owner().replace_array(0, || {
+                ctx.pool.alloc_with(dims, NDDataBuffer::F64(img_data)).ok()
+            }) else {
+                continue;
+            };
 
             // Exposure time delay with stop interruption
             let elapsed = start_time.elapsed().as_secs_f64();
             let delay = (config.acquire_time - elapsed).max(MIN_DELAY_SECS);
             match wait_for_stop(&mut ctx.acq_rx, Duration::from_secs_f64(delay)).await {
                 WaitOutcome::Stop => {
-                    ctx.end_acquisition(config.wait_for_plugins).await;
+                    ctx.end_acquisition().await;
                     break;
                 }
                 WaitOutcome::Shutdown => break, // asyn port torn down; skip writeback
@@ -211,8 +215,14 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
             num_counter += 1;
             array_counter += 1;
 
-            frame.unique_id = array_counter;
-            frame.update_time_stamps_now();
+            // C updateTimeStamps (asynNDArrayDriver.cpp:832-836): the frame and
+            // the callbacks after it carry the port's updated stamp.
+            let stamp: EpicsTimestamp = ctx
+                .port_handle
+                .update_time_stamp()
+                .await
+                .unwrap_or_else(|_| std::time::SystemTime::now())
+                .into();
 
             // C `simDetector::computeImage` publishes the converted array's
             // size beside the frame it belongs to (simDetector.cpp:709-712):
@@ -254,34 +264,41 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
                         asyn_rs::request::ParamSetValue::new(
                             ctx.ad.base.timestamp_rbv,
                             0,
-                            ParamValue::Float64(frame.timestamp.as_f64()),
+                            ParamValue::Float64(stamp.as_f64()),
                         ),
                         asyn_rs::request::ParamSetValue::new(
                             ctx.ad.base.epics_ts_sec,
                             0,
-                            ParamValue::Int32(frame.timestamp.sec as i32),
+                            ParamValue::Int32(stamp.sec as i32),
                         ),
                         asyn_rs::request::ParamSetValue::new(
                             ctx.ad.base.epics_ts_nsec,
                             0,
-                            ParamValue::Int32(frame.timestamp.nsec as i32),
+                            ParamValue::Int32(stamp.nsec as i32),
                         ),
                     ],
                 )
                 .await
             {
-                eprintln!("set_params_and_notify error (frame update): {e}");
+                epics_libcom_rs::stderr_println!("set_params_and_notify error (frame update): {e}");
             }
 
+            // Stamped in place in pArrays[0] (simDetector.cpp:824-825).
+            let Ok(frame) = ctx.pool.owner().refill(0, frame, |frame| {
+                frame.unique_id = array_counter;
+                frame.update_time_stamps(stamp);
+            }) else {
+                continue;
+            };
             if config.array_callbacks {
-                ctx.publisher.publish(Arc::new(frame)).await;
+                ctx.publisher.publish(frame).await;
             }
 
             // Check stop conditions
             if config.image_mode == ImageMode::Single
                 || (config.image_mode == ImageMode::Multiple && num_counter >= config.num_images)
             {
-                ctx.end_acquisition(config.wait_for_plugins).await;
+                ctx.end_acquisition().await;
                 break;
             }
 
@@ -291,7 +308,7 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
             if period_delay > 0.0 {
                 match wait_for_stop(&mut ctx.acq_rx, Duration::from_secs_f64(period_delay)).await {
                     WaitOutcome::Stop => {
-                        ctx.end_acquisition(config.wait_for_plugins).await;
+                        ctx.end_acquisition().await;
                         break;
                     }
                     WaitOutcome::Shutdown => break, // asyn port torn down; skip writeback

@@ -27,7 +27,8 @@
 //! to a `Soft Timestamp` stringin's `INP` format is not picked up — a
 //! narrow divergence for an uncommon edit.
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use crate::types::WallTime;
+use std::time::SystemTime;
 
 use crate::error::{CaError, CaResult};
 use crate::server::device_support::{
@@ -71,17 +72,17 @@ const STRFTIME_PREFIX_BUF: usize = 256;
 /// a date. Saturating pinned it to `0` — C's *uninitialized* value — so a
 /// running IOC whose RTC never started answered `<undefined>` where C answers
 /// a date, and the `ai` path read `0.0` where C reads ~4.29e9.
-fn epics_time_parts(ts: SystemTime) -> (u32, u32) {
+pub(crate) fn epics_time_parts(ts: WallTime) -> (u32, u32) {
     // C's uninitialized `epicsTimeStamp` is the literal `{0, 0}`; this port
     // carries it as `UNIX_EPOCH`, and the `secPastEpoch == 0 && nsec == 0`
     // test below is C's own check for it (`epicsTime.cpp:176`). A sentinel,
     // not a boundary of the conversion.
-    if ts == UNIX_EPOCH {
+    if ts == WallTime::UNIX_EPOCH {
         return (0, 0);
     }
-    // `unwrap_or_default` collapses a pre-1970 stamp to the Unix epoch; that
-    // is this port's own limit and predates the wrap below.
-    let dur = ts.duration_since(UNIX_EPOCH).unwrap_or_default();
+    // A `WallTime` holds no pre-1970 stamp; that is this port's own limit
+    // and predates the wrap below.
+    let dur = ts.since_unix_epoch();
     (
         dur.as_secs().wrapping_sub(EPICS_EPOCH_OFFSET_SECS) as u32,
         dur.subsec_nanos(),
@@ -188,15 +189,26 @@ fn push_truncated(out: &mut String, s: &str, buf_len_left: usize) -> usize {
 /// never raises an alarm from it, and neither does this port.
 ///
 /// `dbpr`'s `TIME` row is the second C caller (`dbTest.c:1228-1231`), with the
-/// same 40-byte buffer, which is why this is `pub(crate)` rather than private
-/// to the soft timestamp device: two renderers of one C routine would be two
-/// answers to "what does an unset stamp look like".
-pub(crate) fn epics_time_to_strftime(format: &str, ts: SystemTime) -> String {
+/// same 40-byte buffer, and sscan's saveData the third (its scan stamps), which
+/// is why this is shared rather than private to the soft timestamp device: two
+/// renderers of one C routine would be two answers to "what does an unset
+/// stamp look like".
+pub fn epics_time_to_strftime(format: &str, ts: WallTime) -> String {
+    epics_time_to_strftime_in(STRINGIN_VAL_BYTES, format, ts)
+}
+
+/// [`epics_time_to_strftime`] into a caller's `char[buf_length]`, for C
+/// callers with another buffer (NDPluginOverlay passes 63): the result is
+/// at most `buf_length - 1` bytes.
+pub fn epics_time_to_strftime_in(buf_length: usize, format: &str, ts: WallTime) -> String {
     let (sec_past_epoch, nsec) = epics_time_parts(ts);
     let mut out = String::new();
-    // C `bufLength` = `sizeof prec->val` = STRINGIN_VAL_BYTES; `bufLenLeft`
-    // counts the NUL slot. `bufLength == 0` cannot occur here.
-    let mut buf_len_left = STRINGIN_VAL_BYTES;
+    // C `epicsTime.cpp:171`.
+    if buf_length == 0 {
+        return out;
+    }
+    // `bufLenLeft` counts the NUL slot.
+    let mut buf_len_left = buf_length;
 
     // C `epicsTime.cpp:176`: an epoch (uninitialized) stamp formats to the
     // literal sentinel.
@@ -205,7 +217,7 @@ pub(crate) fn epics_time_to_strftime(format: &str, ts: SystemTime) -> String {
         return out;
     }
 
-    let dt: DateTime<Local> = ts.into();
+    let dt: DateTime<Local> = SystemTime::from(ts).into();
     let mut rest = format;
     // C `epicsTime.cpp:185`: `while (*pFmt != '\0' && bufLenLeft > 1)`.
     while !rest.is_empty() && buf_len_left > 1 {
@@ -300,7 +312,7 @@ pub struct SoftTimestampDeviceSupport {
     /// from `prec->tse` via `recGblGetTimeStamp`; `read()` resolves the same
     /// way through [`get_time_stamp`]`(tse, time)`.
     tse: i16,
-    time: SystemTime,
+    time: WallTime,
 }
 
 impl SoftTimestampDeviceSupport {
@@ -313,7 +325,7 @@ impl SoftTimestampDeviceSupport {
         Self {
             format,
             tse: 0,
-            time: SystemTime::UNIX_EPOCH,
+            time: WallTime::UNIX_EPOCH,
         }
     }
 }
@@ -335,7 +347,12 @@ impl DeviceSupport for SoftTimestampDeviceSupport {
                 "DTYP='Soft Timestamp': unsupported record type '{rt}' (use ai or stringin)"
             )));
         }
-        Ok(DeviceInitOutcome::Live)
+        Ok(DeviceInitOutcome::ok())
+    }
+
+    // devTimestamp.c `{6, NULL, initAllow, NULL, NULL}`.
+    fn has_init_record(&self) -> bool {
+        false
     }
 
     fn read(&mut self, record: &mut dyn Record) -> CaResult<DeviceReadOutcome> {
@@ -394,16 +411,19 @@ mod tests {
     /// A `ProcessContext` carrying an explicit device-time stamp with
     /// `tse = -2` (`epicsTimeEventDeviceTime`), so `read()` resolves the
     /// stamp to exactly `time` via `get_time_stamp(-2, time)`.
-    fn ctx_device_time(time: SystemTime) -> ProcessContext<'static> {
+    fn ctx_device_time(time: WallTime) -> ProcessContext {
         ProcessContext {
-            udf: false,
+            udf: 0,
             udfs: AlarmSeverity::Invalid,
             nsev: AlarmSeverity::NoAlarm,
             phas: 0,
             tse: -2,
             time,
-            dtyp: "",
+            soft: None,
             callback_priority: crate::runtime::task::CallbackPriority::Low,
+            scan: crate::server::record::ScanType::Passive,
+            proc_field: 0,
+            tpro: 0,
         }
     }
 
@@ -413,28 +433,28 @@ mod tests {
     /// `epics_time_to_strftime` answered "<undefined>" for a running clock.
     #[test]
     fn epics_time_parts_wraps_both_ends_and_keeps_the_unset_sentinel() {
-        assert_eq!(epics_time_parts(SystemTime::UNIX_EPOCH), (0, 0));
-        let at = SystemTime::UNIX_EPOCH + Duration::from_secs(EPICS_EPOCH_OFFSET_SECS);
+        assert_eq!(epics_time_parts(WallTime::UNIX_EPOCH), (0, 0));
+        let at = WallTime::UNIX_EPOCH + Duration::from_secs(EPICS_EPOCH_OFFSET_SECS);
         assert_eq!(epics_time_parts(at).0, 0);
-        let before = SystemTime::UNIX_EPOCH + Duration::from_secs(EPICS_EPOCH_OFFSET_SECS - 1);
+        let before = WallTime::UNIX_EPOCH + Duration::from_secs(EPICS_EPOCH_OFFSET_SECS - 1);
         assert_eq!(epics_time_parts(before).0, u32::MAX);
         let last =
-            SystemTime::UNIX_EPOCH + Duration::from_secs(EPICS_EPOCH_OFFSET_SECS + u32::MAX as u64);
+            WallTime::UNIX_EPOCH + Duration::from_secs(EPICS_EPOCH_OFFSET_SECS + u32::MAX as u64);
         assert_eq!(epics_time_parts(last).0, u32::MAX);
-        let past = SystemTime::UNIX_EPOCH
+        let past = WallTime::UNIX_EPOCH
             + Duration::from_secs(EPICS_EPOCH_OFFSET_SECS + u32::MAX as u64 + 1);
         assert_eq!(epics_time_parts(past).0, 0);
     }
 
     #[test]
     fn a_pre_1990_clock_formats_as_a_date_not_the_undefined_sentinel() {
-        let before = SystemTime::UNIX_EPOCH + Duration::from_secs(EPICS_EPOCH_OFFSET_SECS - 1);
+        let before = WallTime::UNIX_EPOCH + Duration::from_secs(EPICS_EPOCH_OFFSET_SECS - 1);
         assert_ne!(epics_time_to_strftime("%Y-%m-%d", before), "<undefined>");
     }
 
     /// Unix 1_000_000_000 (2001-09-09 UTC) + 0.25 s.
-    fn fixed_device_time() -> SystemTime {
-        SystemTime::UNIX_EPOCH
+    fn fixed_device_time() -> WallTime {
+        WallTime::UNIX_EPOCH
             + Duration::from_secs(1_000_000_000)
             + Duration::from_nanos(250_000_000)
     }
@@ -483,7 +503,7 @@ mod tests {
     fn stringin_epoch_is_undefined() {
         let mut dev = SoftTimestampDeviceSupport::new("@%Y-%m-%d %H:%M:%S");
         let mut rec = StringinRecord::new("");
-        dev.set_process_context(&ctx_device_time(SystemTime::UNIX_EPOCH));
+        dev.set_process_context(&ctx_device_time(WallTime::UNIX_EPOCH));
         dev.read(&mut rec).unwrap();
         match rec.get_field("VAL") {
             Some(EpicsValue::String(s)) => {
@@ -547,7 +567,7 @@ mod tests {
     /// rounding = 3). Exercise both widths against the C divisor algorithm.
     #[test]
     fn strftime_fractional_seconds_round() {
-        let t = SystemTime::UNIX_EPOCH
+        let t = WallTime::UNIX_EPOCH
             + Duration::from_secs(1_000_000_000)
             + Duration::from_nanos(250_000_000);
         // width 3: 250_000_000 → 250
@@ -556,6 +576,18 @@ mod tests {
         assert!(epics_time_to_strftime("%S.%9f", t).ends_with(".250000000"));
         // width 1: round(2.5) → 3 (0.25 s to 1 digit, C +div/2 rounds up)
         assert!(epics_time_to_strftime("%S.%1f", t).ends_with(".3"));
+    }
+
+    /// The caller's buffer bounds the result to `buf_length - 1` bytes: six
+    /// 9-digit fields fit 63 and the seventh becomes the overflow stars.
+    #[test]
+    fn strftime_in_bounds_to_the_callers_buffer() {
+        let t = fixed_device_time();
+        let fmt = "%9f".repeat(7);
+        let wide = epics_time_to_strftime_in(63, &fmt, t);
+        assert_eq!(wide, format!("{}{}", "250000000".repeat(6), "*".repeat(8)));
+        assert_eq!(epics_time_to_strftime(&fmt, t).len(), 39);
+        assert_eq!(epics_time_to_strftime_in(0, &fmt, t), "");
     }
 
     /// C `epicsTimeToStrftime` writes into a fixed 40-byte buffer, so its
@@ -604,7 +636,7 @@ mod tests {
     /// does not fit → `****` (capped to `bufLenLeft - 1 = 4`).
     #[test]
     fn strftime_fractional_field_overflow_emits_stars() {
-        let t = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000_000);
+        let t = WallTime::UNIX_EPOCH + Duration::from_secs(1_000_000_000);
         let prefix = "x".repeat(35);
         let out = epics_time_to_strftime(&format!("{prefix}%9f"), t);
         assert_eq!(out, format!("{prefix}****"));
@@ -617,7 +649,7 @@ mod tests {
     /// (here a fresh 40-byte buffer holds all 16 chars).
     #[test]
     fn strftime_prefix_too_long_emits_invalid_format() {
-        let t = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000_000);
+        let t = WallTime::UNIX_EPOCH + Duration::from_secs(1_000_000_000);
         let out = epics_time_to_strftime(&format!("{}%f", "a".repeat(256)), t);
         assert_eq!(out, "<invalid format>");
     }
@@ -628,7 +660,7 @@ mod tests {
     /// so C's `::strftime` writes NOTHING — no truncated `<inv…` fragment.
     #[test]
     fn strftime_invalid_format_omitted_whole_when_no_room() {
-        let t = SystemTime::UNIX_EPOCH
+        let t = WallTime::UNIX_EPOCH
             + Duration::from_secs(1_000_000_000)
             + Duration::from_nanos(250_000_000);
         let fmt = format!("{}%1f{}%f", "x".repeat(35), "a".repeat(256));

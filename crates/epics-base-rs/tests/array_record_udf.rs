@@ -75,6 +75,7 @@ async fn failed_sim_read_still_clears_udf_on_the_array_kinds() {
         let mut visited = epics_base_rs::server::database::ProcStack::new();
         db.process_record_with_links(rec, &mut visited)
             .await
+            .or_else(epics_base_rs::error::CaError::unless_process_status)
             .unwrap();
 
         let common = &handle.read().common;

@@ -1,10 +1,11 @@
+use asyn_rs::port::InterfaceMask;
 use std::sync::Arc;
 
 use ad_core_rs::color::NDColorMode;
 use ad_core_rs::error::ADResult;
 use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDimension};
 use ad_core_rs::ndarray_pool::NDArrayPool;
-use ad_core_rs::plugin::runtime::{NDPluginProcess, ProcessResult};
+use ad_core_rs::plugin::runtime::{NDPluginProcess, ParamUpdate, ProcessResult};
 use parking_lot::Mutex;
 
 /// Transform types matching C++ `NDPluginTransformType_t`.
@@ -475,6 +476,8 @@ mod simd_kernels {
 pub struct TransformProcessor {
     transform: Mutex<TransformType>,
     transform_type_idx: Option<usize>,
+    /// The base `NDArraySizeX/Y/Z`, which Transform sets from its output.
+    array_size: [usize; 3],
 }
 
 impl TransformProcessor {
@@ -482,11 +485,18 @@ impl TransformProcessor {
         Self {
             transform: Mutex::new(transform),
             transform_type_idx: None,
+            array_size: [0; 3],
         }
     }
 }
 
 impl NDPluginProcess for TransformProcessor {
+    const ASYN_FLAGS: asyn_rs::port::PortFlags = ad_core_rs::plugin::runtime::ASYN_MULTIDEVICE;
+    // NDPluginTransform.cpp:594-595, the same mask for both.
+    const INTERFACE_MASK: InterfaceMask = InterfaceMask::INT32_ARRAY
+        .or(InterfaceMask::FLOAT64_ARRAY)
+        .or(InterfaceMask::GENERIC_POINTER);
+    const INTERRUPT_MASK: InterfaceMask = Self::INTERFACE_MASK;
     fn process_array(&self, array: &Arc<NDArray>, pool: &NDArrayPool) -> ProcessResult {
         // C reads the transform type under the port lock and releases it
         // before `transformImage` (NDPluginTransform.cpp:500). A guard passed
@@ -494,7 +504,22 @@ impl NDPluginProcess for TransformProcessor {
         // hold across the whole rotation.
         let transform = *self.transform.lock();
         match apply_transform(pool, array, transform) {
-            Ok(out) => ProcessResult::arrays(vec![Arc::new(out)]),
+            Ok(out) => {
+                // NDPluginTransform.cpp:509-513: X/Y index the output by the
+                // input's xDim/yDim, and Z is 3 for any 3-D output.
+                let info = array.info();
+                let size = |axis: usize| out.dims.get(axis).map_or(0, |d| d.size) as i32;
+                let [x, y, z] = self.array_size;
+                let updates = vec![
+                    ParamUpdate::int32(x, size(info.x_dim)),
+                    ParamUpdate::int32(y, size(info.y_dim)),
+                    ParamUpdate::int32(z, if out.dims.len() < 3 { 0 } else { 3 }),
+                ];
+                ProcessResult {
+                    param_updates: updates,
+                    ..ProcessResult::arrays(vec![Arc::new(out)])
+                }
+            }
             Err(e) => {
                 // C's copy() returning NULL ends the frame without output.
                 tracing::warn!(error = %e, "transform output allocation failed; dropping frame");
@@ -507,13 +532,21 @@ impl NDPluginProcess for TransformProcessor {
         "NDPluginTransform"
     }
 
+    /// NDPluginTransform.cpp:613
+    fn array_callbacks_seed(&self) -> Option<bool> {
+        Some(true)
+    }
+
     fn register_params(
         &mut self,
         base: &mut asyn_rs::port::PortDriverBase,
     ) -> asyn_rs::error::AsynResult<()> {
         use asyn_rs::param::ParamType;
-        base.create_param("TRANSFORM_TYPE", ParamType::Int32)?;
-        self.transform_type_idx = base.find_param("TRANSFORM_TYPE");
+        let transform_type = base.create_param("TRANSFORM_TYPE", ParamType::Int32)?;
+        base.set_int32_param(transform_type, 0, *self.transform.lock() as i32)?;
+        self.transform_type_idx = Some(transform_type);
+        self.array_size =
+            ad_core_rs::params::ndarray_driver::NDArrayDriverParams::array_size_reasons(base)?;
         Ok(())
     }
 
@@ -532,7 +565,76 @@ impl NDPluginProcess for TransformProcessor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// NDPluginTransform.cpp:509-513 sets X/Y from the rotated output and
+    /// Z as 0 or 3, never the total ArraySize.
+    #[test]
+    fn the_array_sizes_describe_the_output() {
+        use ad_core_rs::ndarray::{NDDataType, NDDimension};
+        let mono = NDArray::new(
+            vec![NDDimension::new(8), NDDimension::new(6)],
+            NDDataType::UInt8,
+        );
+        let sizes = crate::test_util::array_sizes(
+            "TRANS_SIZES",
+            TransformProcessor::new(TransformType::Rot90CW),
+            &[mono],
+        );
+        assert_eq!(sizes, [[6, 8, 0, 0]]);
+    }
+
+    /// C NDPluginTransform has no writeInt32 override, so NDPluginDriver's
+    /// failure reaches the record.
+    #[test]
+    fn a_refused_base_write_stays_refused() {
+        use ad_core_rs::plugin::runtime::WriteVerdict;
+        let proc = TransformProcessor::new(TransformType::None);
+        let mut base = asyn_rs::port::PortDriverBase::new(
+            "T",
+            1,
+            Default::default(),
+            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
+            asyn_rs::port::InterfaceMask::UNMIGRATED_INTERRUPTS,
+        );
+        let clamp = WriteVerdict::Refuse {
+            keep: 1,
+            message: String::new(),
+        };
+        assert_eq!(
+            proc.validate_int32(
+                0,
+                0,
+                98,
+                clamp.clone(),
+                &mut ad_core_rs::plugin::runtime::WritePort::new(&mut base)
+            )
+            .verdict,
+            clamp
+        );
+    }
     use ad_core_rs::ndarray::NDDataType;
+
+    #[test]
+    fn test_register_params_seeds_the_processor_transform() {
+        // The param reads the type the processor applies; the IOC builds
+        // TransformNone as NDPluginTransform.cpp:609 seeds it.
+        use asyn_rs::port::InterfaceMask;
+        use asyn_rs::port::{PortDriverBase, PortFlags};
+        for t in [TransformType::None, TransformType::Rot90CW] {
+            let mut base = PortDriverBase::new(
+                "TRANS_INIT",
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_INTERRUPTS,
+            );
+            let mut proc = TransformProcessor::new(t);
+            ad_core_rs::params::ndarray_driver::NDArrayDriverParams::create(&mut base).unwrap();
+            proc.register_params(&mut base).unwrap();
+            let reason = base.find_param("TRANSFORM_TYPE").unwrap();
+            assert_eq!(base.get_int32_param(reason, 0).unwrap(), t as i32);
+        }
+    }
 
     fn pool() -> std::sync::Arc<NDArrayPool> {
         NDArrayPool::new(0)
@@ -626,15 +728,7 @@ mod tests {
     #[cfg(feature = "simd")]
     #[test]
     fn transpose_lanes_match_the_per_pixel_mapping_on_every_level() {
-        use fearless_simd::Level;
-        let top = ad_core_rs::simd::level();
-        let mut levels = vec![top, Level::baseline()];
-        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        {
-            levels.extend(top.as_avx2().map(Level::Avx2));
-            levels.extend(top.as_sse4_2().map(Level::Sse4_2));
-            levels.extend(top.as_sse2().map(Level::Sse2));
-        }
+        let levels = ad_core_rs::simd::levels();
         let modes = [
             (NDColorMode::Mono, 1),
             (NDColorMode::RGB1, 3),

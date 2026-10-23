@@ -29,7 +29,7 @@
 //! processGroups
 //! ```
 
-// RTEMS-EXEC-MODEL-ALLOW(1): checked - these run and pass in the exec-backend
+// RTEMS-EXEC-MODEL-ALLOW(3): checked - these run and pass in the exec-backend
 // suite.
 
 use std::sync::Arc;
@@ -70,11 +70,11 @@ pub fn db_load_group_command(provider: Arc<BridgeProvider>) -> CommandDef {
         "dbLoadGroup <jsonFilename> [<macros>]",
         move |args: &[ArgValue], ctx: &CommandContext| {
             let filename = match args.first() {
-                Some(ArgValue::String(s)) => s.clone(),
+                Some(ArgValue::String(s)) => s.to_str()?.to_owned(),
                 _ => return Err("dbLoadGroup: missing filename".into()),
             };
             let macros_str = match args.get(1) {
-                Some(ArgValue::String(s)) => s.clone(),
+                Some(ArgValue::String(s)) => s.to_str()?.to_owned(),
                 _ => String::new(),
             };
 
@@ -83,31 +83,49 @@ pub fn db_load_group_command(provider: Arc<BridgeProvider>) -> CommandDef {
             // groups; `-file.json` removes the groups a previous
             // `dbLoadGroup(file.json, macros)` of the matching identity
             // placed. Removal is identity-based (raw filename + raw
-            // macros), so it never touches the filesystem.
+            // macros), so it never touches the filesystem. pvxs prints
+            // nothing on any success path.
             if let Some(rest) = filename.strip_prefix('-') {
                 if rest == "*" {
-                    let n = provider.clear_group_files();
-                    ctx.println(&format!(
-                        "dbLoadGroup: cleared all file groups ({n} removed)"
-                    ));
+                    provider.clear_group_files();
                 } else {
-                    let n = provider.remove_group_file(rest, &macros_str);
-                    ctx.println(&format!("dbLoadGroup: removed '{rest}' ({n} group(s))"));
+                    provider.remove_group_file(rest, &macros_str);
                 }
                 return Ok(CommandOutcome::Continue);
             }
 
             match apply_group_file(&provider, &filename, &macros_str) {
-                Ok(total) => {
-                    ctx.println(&format!(
-                        "dbLoadGroup: loaded '{filename}' ({total} groups total)"
-                    ));
-                    Ok(CommandOutcome::Continue)
+                Ok(_) => Ok(CommandOutcome::Continue),
+                // pvxs's bare `fprintf` plus `iocshSetError`
+                // (groupsourcehooks.cpp:47, :149-151).
+                Err(GroupFileError::Open(line)) => {
+                    ctx.eprintln(&line);
+                    Ok(CommandOutcome::Failed)
                 }
-                Err(e) => Err(e),
+                Err(e) => Err(e.to_string()),
             }
         },
     )
+}
+
+/// Why [`apply_group_file`] loaded nothing; pvxs treats the two apart.
+#[derive(Debug)]
+pub(crate) enum GroupFileError {
+    /// The file could not be read: `dbLoadGroup` prints and the IOC goes on
+    /// (groupsourcehooks.cpp:149-151).
+    Open(String),
+    /// The file did not parse: `loadConfigFiles` throws out of the noexcept
+    /// init hook (groupconfigprocessor.cpp:121-123, iochooks.cpp:328), so the
+    /// IOC terminates. Carries pvxs's `what()` text.
+    Parse(String),
+}
+
+impl std::fmt::Display for GroupFileError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Open(m) | Self::Parse(m) => f.write_str(m),
+        }
+    }
 }
 
 /// Apply one `dbLoadGroup(filename, macros)` to `provider`: read the file,
@@ -126,9 +144,9 @@ pub(crate) fn apply_group_file(
     provider: &BridgeProvider,
     filename: &str,
     macros: &str,
-) -> Result<usize, String> {
-    let raw =
-        std::fs::read_to_string(filename).map_err(|e| format!("dbLoadGroup '{filename}': {e}"))?;
+) -> Result<usize, GroupFileError> {
+    let raw = std::fs::read_to_string(filename)
+        .map_err(|_| GroupFileError::Open(format!("Error opening \"{filename}\"")))?;
     let expanded = if macros.is_empty() {
         raw
     } else {
@@ -174,7 +192,15 @@ pub(crate) fn apply_group_file(
     };
     provider
         .load_group_file_tracked(filename, macros, &expanded)
-        .map_err(|e| format!("dbLoadGroup '{filename}' failed: {e}"))?;
+        .map_err(|e| {
+            let cause = match e {
+                crate::error::BridgeError::GroupConfigError(m) => m,
+                e => e.to_string(),
+            };
+            GroupFileError::Parse(format!(
+                "Error reading group definition file \"{filename}\"\n{cause}"
+            ))
+        })?;
     Ok(provider.group_count())
 }
 
@@ -318,20 +344,12 @@ pub fn process_groups_command(provider: Arc<BridgeProvider>) -> CommandDef {
 
 /// The live channel and client counts pvxs `qStats` reports: it guards on its
 /// `server()` singleton and sums `conn.channels.size()` over
-/// `report.connections` (singlesourcehooks.cpp:88-99). `None` when there is no
-/// running server to ask — before the listeners bind, and on the thread-backend
-/// build, where the server's singleton does not exist at all.
+/// `report.connections` (singlesourcehooks.cpp:88-99). `None` before the
+/// listeners bind.
 fn live_channels_and_clients() -> Option<(u64, usize)> {
-    #[cfg(tokio_backend)]
-    {
-        let report = epics_pva_rs::server::iocsh::pvxs_report()?.report();
-        let channels = report.peers.iter().map(|(_, p)| p.channels).sum();
-        Some((channels, report.peer_count))
-    }
-    #[cfg(not(tokio_backend))]
-    {
-        None
-    }
+    let report = epics_pva_rs::server::iocsh::pvxs_report()?.report();
+    let channels = report.peers.iter().map(|(_, p)| p.channels).sum();
+    Some((channels, report.peer_count))
 }
 
 /// `qsrvStats [<recordOrGroupName>]` — print summary diagnostics for
@@ -352,7 +370,7 @@ pub fn qsrv_stats_command(provider: Arc<BridgeProvider>) -> CommandDef {
             let groups = provider.groups();
             match args.first() {
                 Some(ArgValue::String(name)) if !name.is_empty() => {
-                    if let Some(def) = groups.get(name) {
+                    if let Some(def) = name.to_str().ok().and_then(|name| groups.get(name)) {
                         ctx.println(&format!(
                             "Group '{}' (atomic={}, struct_id={:?}): {} member(s)",
                             def.name,
@@ -364,7 +382,7 @@ pub fn qsrv_stats_command(provider: Arc<BridgeProvider>) -> CommandDef {
                             ctx.println(&format!(
                                 "  {} <- {} (mapping={:?}, put_order={}, triggers={:?})",
                                 m.field_name,
-                                m.channel,
+                                String::from_utf8_lossy(&m.channel),
                                 m.mapping,
                                 m.put_order
                                     .map(|p| p.to_string())
@@ -379,14 +397,13 @@ pub fn qsrv_stats_command(provider: Arc<BridgeProvider>) -> CommandDef {
                     }
                 }
                 _ => {
-                    let created = provider.op_stats().channels_created;
                     match live_channels_and_clients() {
                         Some((channels, clients)) => ctx.println(&format!(
-                            "qsrvStats: {} group(s), {channels} channel(s) on {clients} client(s), {created} created (cumulative)",
+                            "qsrvStats: {} group(s), {channels} channel(s) on {clients} client(s)",
                             groups.len(),
                         )),
                         None => ctx.println(&format!(
-                            "qsrvStats: {} group(s), {created} channel(s) created (cumulative); pvAccess server not yet started",
+                            "qsrvStats: {} group(s); pvAccess server not yet started",
                             groups.len(),
                         )),
                     }
@@ -428,12 +445,10 @@ pub fn pvxsl_command(provider: Arc<BridgeProvider>) -> CommandDef {
                 Some(ArgValue::Int(n)) => *n,
                 _ => 0,
             };
-            let db = provider.database().clone();
-            let mut names = ctx.block_on(async {
-                let mut n = db.all_record_names().await;
-                n.extend(db.all_alias_names());
-                n
-            });
+            let db = provider.database();
+            let mut names = db.all_record_names();
+            names.extend(db.all_alias_names());
+            let mut names: Vec<String> = names.iter().map(|n| n.to_string()).collect();
             names.sort();
             names.dedup();
             for line in pvxsl_lines(&names, detail) {
@@ -500,11 +515,11 @@ pub fn pvxgl_command(provider: Arc<BridgeProvider>) -> CommandDef {
                 _ => 0,
             };
             let pattern = match args.get(1) {
-                Some(ArgValue::String(s)) => s.as_str(),
-                _ => "",
+                Some(ArgValue::String(s)) => s.to_str_lossy(),
+                _ => "".into(),
             };
             let groups = provider.groups();
-            for line in pvxgl_lines(&groups, level, pattern) {
+            for line in pvxgl_lines(&groups, level, &pattern) {
                 ctx.println(&line);
             }
             Ok(CommandOutcome::Continue)
@@ -536,7 +551,7 @@ fn pvxgl_lines(
     let mut names: Vec<&String> = groups.keys().collect();
     names.sort();
     for name in names {
-        if !pattern.is_empty() && !glob_match(name, pattern) {
+        if !pattern.is_empty() && !glob_match(name.as_bytes(), pattern.as_bytes()) {
             continue;
         }
         out.push(name.clone());
@@ -557,7 +572,7 @@ fn pvxgl_lines(
                     let chan = if m.channel.is_empty() {
                         String::new()
                     } else {
-                        format!(" chan={}", m.channel)
+                        format!(" chan={}", String::from_utf8_lossy(&m.channel))
                     };
                     let targets = def.resolved_trigger_targets(idx);
                     let trig = if targets.is_empty() {
@@ -583,33 +598,31 @@ fn pvxgl_lines(
 }
 
 /// Port of EPICS Base `epicsStrGlobMatch` (`misc/epicsString.c`):
-/// `*` matches any run of characters, `?` matches exactly one, all
-/// other characters are literal. Used by `pvxgl` to filter group names,
+/// `*` matches any run of bytes, `?` exactly one byte (C walks `char`s),
+/// all other bytes are literal. Used by `pvxgl` to filter group names,
 /// matching pvxs `epicsStrGlobMatch(groupName, pattern)`.
-fn glob_match(s: &str, pattern: &str) -> bool {
-    let text: Vec<char> = s.chars().collect();
-    let pat: Vec<char> = pattern.chars().collect();
+fn glob_match(text: &[u8], pat: &[u8]) -> bool {
     let mut i = 0usize; // index into text
     let mut p = 0usize; // index into pattern
-    let mut mp: Option<usize> = None; // pattern resume pos after a '*'
-    let mut cp = 0usize; // text resume pos for that '*'
+    let mut mp: Option<usize> = None; // pattern resume pos after a b'*'
+    let mut cp = 0usize; // text resume pos for that b'*'
 
-    while i < text.len() && p < pat.len() && pat[p] != '*' {
-        if pat[p] != text[i] && pat[p] != '?' {
+    while i < text.len() && p < pat.len() && pat[p] != b'*' {
+        if pat[p] != text[i] && pat[p] != b'?' {
             return false;
         }
         p += 1;
         i += 1;
     }
     while i < text.len() {
-        if p < pat.len() && pat[p] == '*' {
+        if p < pat.len() && pat[p] == b'*' {
             p += 1;
             if p >= pat.len() {
                 return true;
             }
             mp = Some(p);
             cp = i + 1;
-        } else if p < pat.len() && (pat[p] == text[i] || pat[p] == '?') {
+        } else if p < pat.len() && (pat[p] == text[i] || pat[p] == b'?') {
             p += 1;
             i += 1;
         } else if let Some(m) = mp {
@@ -620,7 +633,7 @@ fn glob_match(s: &str, pattern: &str) -> bool {
             return false;
         }
     }
-    while p < pat.len() && pat[p] == '*' {
+    while p < pat.len() && pat[p] == b'*' {
         p += 1;
     }
     p >= pat.len()
@@ -678,31 +691,18 @@ pub fn register_qsrv_runtime_commands(provider: Arc<BridgeProvider>) -> Vec<Comm
     ]
 }
 
-/// QSRV2-gated runtime-command installer. pvxs registers the QSRV command
-/// surface — `pvxsl` (`single_enable()`, singlesourcehooks.cpp:162-166),
-/// `pvxgl` / `dbLoadGroup` (`group_enable()`, groupsourcehooks.cpp:233-245)
-/// — only inside `if(enableQ)` in `pvxsBaseRegistrar()`
-/// (iochooks.cpp:492-496), where `enableQ` is the one `enable2()` decision
-/// that also gates `addSource()`. When QSRV2 is disabled (`PVXS_QSRV_ENABLE=NO`
-/// or `EPICS_IOC_IGNORE_SERVERS=qsrv2`), none of those commands exist.
-///
-/// This is the single owner of that gate for the runtime (post-iocInit)
-/// command set: when `enabled` is false it returns an empty set, so a
-/// disabled IOC exposes no `processGroups` / `qsrvStats` / `pvxsl` / `pvxgl`
-/// / `resetGroups` control surface (`pvxsl` reads the database directly and
-/// `resetGroups` mutates the group registry — both must be absent when the
-/// QSRV2 sources are not served). It is bound to the same `qsrv2_on` decision
-/// that gates serving and group loading, so the whole QSRV surface follows
-/// one decision rather than each call site re-deciding.
+/// [`register_qsrv_runtime_commands`] less what `enable2()` gates: pvxs
+/// registers `pvxsl` (`single_enable()`, singlesourcehooks.cpp:162-166) and
+/// `pvxgl` (`group_enable()`, groupsourcehooks.cpp:233-245) only inside
+/// `if(enableQ)` (iochooks.cpp:503-507). The rest are this port's own.
 pub fn register_qsrv_runtime_commands_if_enabled(
     enabled: bool,
     provider: Arc<BridgeProvider>,
 ) -> Vec<CommandDef> {
-    if enabled {
-        register_qsrv_runtime_commands(provider)
-    } else {
-        Vec::new()
-    }
+    register_qsrv_runtime_commands(provider)
+        .into_iter()
+        .filter(|cmd| enabled || !matches!(cmd.name.as_str(), "pvxsl" | "pvxgl"))
+        .collect()
 }
 
 #[cfg(test)]
@@ -711,6 +711,13 @@ mod tests {
     use std::sync::Arc;
 
     use epics_base_rs::server::database::PvDatabase;
+
+    /// A path as typed into an iocsh line. C's scanner takes an unquoted
+    /// backslash as an escape (`iocsh.cpp:275`), so a native Windows
+    /// redirect target loses its separators; forward slashes survive.
+    fn script_token(p: &std::path::Path) -> String {
+        p.display().to_string().replace('\\', "/")
+    }
 
     #[tokio::test]
     async fn db_load_group_then_process_succeeds() {
@@ -744,6 +751,57 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// softIocPVX 1.5.3 on `dbLoadGroup("nosuch.json")`: stderr is exactly
+    /// `Error opening "nosuch.json"` and the line is marked failed.
+    #[test]
+    fn db_load_group_on_a_missing_file_prints_pvxs_line() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let db = Arc::new(PvDatabase::new());
+        let bridge = {
+            let _guard = rt.enter();
+            epics_base_rs::runtime::task::BlockingBridge::capture()
+        };
+        let shell = epics_base_rs::server::iocsh::IocShell::new(db.clone(), bridge);
+        shell.register(db_load_group_command(Arc::new(BridgeProvider::new(db))));
+        let tmpdir = tempfile::tempdir().expect("fixture root");
+        let missing = script_token(&tmpdir.path().join("nosuch.json"));
+        let err = tmpdir.path().join("err");
+        let outcome = shell.execute_line(format!(
+            "dbLoadGroup(\"{missing}\") 2> {}",
+            script_token(&err)
+        ));
+        assert!(matches!(outcome, Ok(CommandOutcome::Failed)));
+        assert_eq!(
+            std::fs::read_to_string(&err).unwrap(),
+            format!("Error opening \"{missing}\"\n")
+        );
+    }
+
+    /// softIocPVX 1.5.3 prints nothing for `dbLoadGroup("good.json")`,
+    /// `dbLoadGroup("-good.json")` or `dbLoadGroup("-*")`.
+    #[test]
+    fn db_load_group_prints_nothing_on_success() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let db = Arc::new(PvDatabase::new());
+        let bridge = {
+            let _guard = rt.enter();
+            epics_base_rs::runtime::task::BlockingBridge::capture()
+        };
+        let shell = epics_base_rs::server::iocsh::IocShell::new(db.clone(), bridge);
+        shell.register(db_load_group_command(Arc::new(BridgeProvider::new(db))));
+        let tmpdir = tempfile::tempdir().expect("fixture root");
+        let good = tmpdir.path().join("good.json");
+        std::fs::write(&good, r#"{"G":{"a":{"+channel":"A.VAL"}}}"#).unwrap();
+        let good = script_token(&good);
+        for arg in [good.clone(), format!("-{good}"), "-*".into()] {
+            let out = tmpdir.path().join("out");
+            let outcome =
+                shell.execute_line(format!("dbLoadGroup(\"{arg}\") > {}", script_token(&out)));
+            assert!(matches!(outcome, Ok(CommandOutcome::Continue)), "{arg}");
+            assert_eq!(std::fs::read_to_string(&out).unwrap(), "", "{arg}");
+        }
+    }
+
     #[test]
     fn register_qsrv_commands_includes_pvxs_list_commands() {
         let db = Arc::new(PvDatabase::new());
@@ -760,12 +818,8 @@ mod tests {
         assert!(names.contains(&"resetGroups"));
     }
 
-    /// pvxs gates `single_enable()` / `group_enable()` command registration
-    /// behind `enable2()` (iochooks.cpp:492-496). A QSRV2-enabled IOC
-    /// installs the full runtime set; a disabled IOC
-    /// (`PVXS_QSRV_ENABLE=NO` / `EPICS_IOC_IGNORE_SERVERS=qsrv2`) installs
-    /// none of it — no `processGroups`/`qsrvStats`/`pvxsl`/`pvxgl`/
-    /// `resetGroups` control surface.
+    /// `enable2()` gates `pvxsl` and `pvxgl` (iochooks.cpp:503-507) and
+    /// nothing else of the runtime set.
     #[test]
     fn qsrv_runtime_commands_gated_on_qsrv2_enable() {
         let db = Arc::new(PvDatabase::new());
@@ -779,25 +833,30 @@ mod tests {
         assert!(names.contains(&"pvxsl"));
         assert!(names.contains(&"pvxgl"));
         assert!(names.contains(&"resetGroups"));
-        // `dbLoadGroup` is a base startup command, never in the runtime set.
+        // `dbLoadGroup` is a startup command, never in the runtime set.
         assert!(!names.contains(&"dbLoadGroup"));
 
         let disabled = register_qsrv_runtime_commands_if_enabled(false, provider);
-        assert!(disabled.is_empty());
+        let names: Vec<&str> = disabled.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["processGroups", "qsrvStats", "resetGroups"]);
     }
 
     #[test]
     fn glob_match_star_question_literal() {
         // EPICS `epicsStrGlobMatch` semantics.
-        assert!(glob_match("TEST:grp", "TEST:*"));
-        assert!(glob_match("TEST:grp", "*grp"));
-        assert!(glob_match("TEST:grp", "TEST:gr?"));
-        assert!(glob_match("TEST:grp", "*"));
-        assert!(glob_match("abc", "a*c"));
-        assert!(!glob_match("TEST:grp", "OTHER:*"));
-        assert!(!glob_match("TEST:grp", "TEST:gr"));
-        assert!(!glob_match("abc", "a?"));
-        assert!(glob_match("", "*"));
+        assert!(glob_match(b"TEST:grp", b"TEST:*"));
+        assert!(glob_match(b"TEST:grp", b"*grp"));
+        assert!(glob_match(b"TEST:grp", b"TEST:gr?"));
+        assert!(glob_match(b"TEST:grp", b"*"));
+        assert!(glob_match(b"abc", b"a*c"));
+        assert!(!glob_match(b"TEST:grp", b"OTHER:*"));
+        assert!(!glob_match(b"TEST:grp", b"TEST:gr"));
+        // `?` is one byte, as C `epicsStrGlobMatch` walks `char`s: a
+        // two-byte UTF-8 character needs two.
+        assert!(!glob_match("G:\u{b5}".as_bytes(), b"G:?"));
+        assert!(glob_match("G:\u{b5}".as_bytes(), b"G:??"));
+        assert!(!glob_match(b"abc", b"a?"));
+        assert!(glob_match(b"", b"*"));
     }
 
     /// Borrow a `Vec<String>` as `Vec<&str>` for exact-output assertions

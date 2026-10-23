@@ -8,6 +8,7 @@ use clap::{CommandFactory, FromArgMatches, Parser};
 use epics_base_rs::error::CaResult;
 use epics_base_rs::runtime::log::{ANSI_ESC_BLUE, ANSI_ESC_BOLD, ANSI_ESC_RESET, ERL_ERROR};
 use epics_base_rs::server::ioc_app::{IocInitDecision, IocRunFailure};
+use epics_base_rs::server::iocsh::registry::escape_arg;
 use epics_base_rs::server::iocsh::use_ansi_color;
 use epics_base_rs::server::records::{
     ai::AiRecord, ao::AoRecord, bi::BiRecord, bo::BoRecord, longin::LonginRecord,
@@ -242,7 +243,26 @@ fn steps_in_argv_order(matches: &clap::ArgMatches) -> Vec<Step> {
     ordered.into_iter().map(|(_, step)| step).collect()
 }
 
+/// What the IOC does once `iocInit` has returned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AfterStartup {
+    /// `iocsh(NULL)`, which returns at EOF and ends the process.
+    Shell,
+    /// No shell: serve until killed.
+    Serve,
+}
+
 impl Args {
+    /// C `softMain.cpp:137`: interactive by default, and `-S` is the only
+    /// thing that turns it off (`:202-203`).
+    fn after_startup(&self) -> AfterStartup {
+        if self.no_shell {
+            AfterStartup::Serve
+        } else {
+            AfterStartup::Shell
+        }
+    }
+
     /// [`clap::Parser::parse_from`] plus the argv order clap discards.
     ///
     /// The one thing overridden on the way in is what counts as an option's
@@ -447,21 +467,17 @@ fn parse_record_def(
     Ok((record_name, record))
 }
 
-/// C's `-d` as the iocsh line it already is: `softMain.cpp:194-197` prints
-/// exactly this text under `-v`, and calls `dbLoadRecords(optarg, macros)`.
+/// C's `-d`: `softMain.cpp:194-197` prints `dbLoadRecords("<f>", "<m>")`
+/// under `-v` and calls `dbLoadRecords(optarg, macros)`.
 ///
 /// `-m`'s string is handed through as ONE argument because C never parses
 /// it, and is omitted when empty for the same reason C's own spelling
 /// omits it.
-fn db_load_records_line(file: &str, macros: &str) -> String {
+fn db_load_records_call(file: &str, macros: &str, on_error: String) -> PlannedCommand {
     if macros.is_empty() {
-        format!("dbLoadRecords(\"{}\")", iocsh_quote(file))
+        PlannedCommand::call("dbLoadRecords", &[file], on_error)
     } else {
-        format!(
-            "dbLoadRecords(\"{}\", \"{}\")",
-            iocsh_quote(file),
-            iocsh_quote(macros)
-        )
+        PlannedCommand::call("dbLoadRecords", &[file, macros], on_error)
     }
 }
 
@@ -511,8 +527,24 @@ struct StartupPlan {
 /// distinction out of a match on the command's spelling.
 #[derive(Debug, PartialEq, Eq)]
 struct PlannedCommand {
+    /// C's `-v` text: the arguments quoted and otherwise raw.
+    shown: String,
+    /// What the startup shell runs.
     line: String,
     on_error: String,
+}
+
+impl PlannedCommand {
+    /// `name(args…)`, each argument reaching the function byte for byte.
+    fn call(name: &str, args: &[&str], on_error: String) -> Self {
+        let join =
+            |f: &dyn Fn(&str) -> String| args.iter().map(|a| f(a)).collect::<Vec<_>>().join(", ");
+        PlannedCommand {
+            shown: format!("{name}({})", join(&|a| format!("\"{a}\""))),
+            line: format!("{name}({})", join(&escape_arg)),
+            on_error,
+        }
+    }
 }
 
 /// Walk [`Args::steps`] the way C walks argv.
@@ -534,10 +566,11 @@ fn startup_plan(steps: &[Step], exit_db: &str) -> Result<StartupPlan, Failure> {
         }
         *loaded = true;
         if let Some(file) = dbd {
-            plan.lines.push(PlannedCommand {
-                line: format!("dbLoadDatabase(\"{}\")", iocsh_quote(file)),
-                on_error: format!("Failed to load DBD file: {file}"),
-            });
+            plan.lines.push(PlannedCommand::call(
+                "dbLoadDatabase",
+                &[file],
+                format!("Failed to load DBD file: {file}"),
+            ));
         }
     }
 
@@ -552,10 +585,8 @@ fn startup_plan(steps: &[Step], exit_db: &str) -> Result<StartupPlan, Failure> {
             }
             Step::Db(file) => {
                 lazy_dbd(&mut plan, dbd, &mut dbd_loaded);
-                plan.lines.push(PlannedCommand {
-                    line: db_load_records_line(file, &macros),
-                    on_error: String::new(),
-                });
+                plan.lines
+                    .push(db_load_records_call(file, &macros, String::new()));
                 plan.loaded_db = true;
             }
             Step::ExitDb(prefix) => {
@@ -567,10 +598,11 @@ fn startup_plan(steps: &[Step], exit_db: &str) -> Result<StartupPlan, Failure> {
                 // them, because those live on the database INSTANCE and
                 // only the loader fills it.
                 lazy_dbd(&mut plan, dbd, &mut dbd_loaded);
-                plan.lines.push(PlannedCommand {
-                    line: db_load_records_line(exit_db, &format!("IOC={prefix}")),
-                    on_error: String::new(),
-                });
+                plan.lines.push(db_load_records_call(
+                    exit_db,
+                    &format!("IOC={prefix}"),
+                    String::new(),
+                ));
                 plan.loads_exit_db = true;
                 plan.loaded_db = true;
             }
@@ -579,15 +611,17 @@ fn startup_plan(steps: &[Step], exit_db: &str) -> Result<StartupPlan, Failure> {
                 // macros as they stand HERE: a later `-m` cannot reach an
                 // ACF whose substitutions were already recorded.
                 if !macros.is_empty() {
-                    plan.lines.push(PlannedCommand {
-                        line: format!("asSetSubstitutions(\"{}\")", iocsh_quote(&macros)),
-                        on_error: String::new(),
-                    });
+                    plan.lines.push(PlannedCommand::call(
+                        "asSetSubstitutions",
+                        &[&macros],
+                        String::new(),
+                    ));
                 }
-                plan.lines.push(PlannedCommand {
-                    line: format!("asSetFilename(\"{}\")", iocsh_quote(file)),
-                    on_error: String::new(),
-                });
+                plan.lines.push(PlannedCommand::call(
+                    "asSetFilename",
+                    &[file],
+                    String::new(),
+                ));
                 // No `asInit` line follows, as none follows in C: `-a` is
                 // `asSetFilename` plus `asSetSubstitutions` and nothing more
                 // (`softMain.cpp:174-185`), and `iocInit` is what reads the
@@ -766,9 +800,9 @@ fn report_argv_error(e: clap::Error) -> std::process::ExitCode {
     } else {
         "option requires an argument"
     };
-    eprintln!("{arg0}: {what} -- '{}'", blamed_option(&e));
+    epics_libcom_rs::stderr_println!("{arg0}: {what} -- '{}'", blamed_option(&e));
     print!("{}", usage());
-    eprintln!("Unknown argument: -?");
+    epics_libcom_rs::stderr_println!("Unknown argument: -?");
     std::process::ExitCode::from(2)
 }
 
@@ -798,17 +832,6 @@ fn blamed_option(e: &clap::Error) -> String {
             },
             |c| c.to_string(),
         )
-}
-
-/// Escape what the iocsh tokenizer would otherwise read as structure
-/// (`iocsh.cpp:362-371`, and the port's own `registry` splitter, both of
-/// which unescape `\\` and `\"` inside a quoted argument).
-///
-/// In C a filename and a substitution string are function arguments and
-/// never text; here they travel as text for the length of one line, so
-/// they have to survive the trip unchanged.
-fn iocsh_quote(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 #[cfg(tokio_backend)]
@@ -848,6 +871,15 @@ async fn run_ioc_app(args: Args) -> Result<(), Failure> {
     // running a script or opening a shell — so declaring them here rather
     // than at the function head costs nothing and keeps one call site.
     app = epics_ca_rs::server::iocsh::register_rsrv_commands(app);
+    // C's dbCa is linked into every softIoc. The `ca` link set installs at
+    // `AfterCaLinkInit`; its client is made on the first link to a name the
+    // database does not serve, so a database with no such link starts no
+    // thread and opens no socket.
+    app = app.register_link_type("ca", {
+        let reactor = epics_base_rs::runtime::task::Reactor::current()
+            .expect("run_ioc_app is awaited on the IOC's reactor");
+        move |db| epics_ca_rs::calink::calink_link_set_install(db, reactor)
+    });
     if let Some(port) = args.port {
         app = app.port(port);
     }
@@ -878,7 +910,8 @@ async fn run_ioc_app(args: Args) -> Result<(), Failure> {
     // loaded nothing and ran no script; an interactive one always has
     // something to do, because the shell it is about to start is the thing
     // to do, and a script on its own is enough as well (`ranScript`, `:236`).
-    if args.no_shell && !loaded_db && args.startup_script.is_none() {
+    let after_startup = args.after_startup();
+    if after_startup == AfterStartup::Serve && !loaded_db && args.startup_script.is_none() {
         return Err(Failure::NothingToDo);
     }
     // Held for the life of the IOC: the loader opens it during the startup
@@ -890,7 +923,7 @@ async fn run_ioc_app(args: Args) -> Result<(), Failure> {
     };
     for command in &plan.lines {
         if args.verbose {
-            verbose_out(ANSI_ESC_BOLD, &command.line);
+            verbose_out(ANSI_ESC_BOLD, &command.shown);
         }
         app = app.startup_line(&command.line);
     }
@@ -914,9 +947,7 @@ async fn run_ioc_app(args: Args) -> Result<(), Failure> {
         app = app.startup_script(script);
     }
 
-    // C `softMain.cpp:137`: interactive by default, and `-S` is the only
-    // thing that turns it off (`:202-203`).
-    let interactive = !args.no_shell;
+    let interactive = after_startup == AfterStartup::Shell;
     // C `softMain.cpp:239`: `iocInit()` runs only when argv loaded a
     // database. Everything a running IOC has — the scan threads, PINI, and
     // RSRV, which starts inside `iocRun` — hangs off that call, so a
@@ -945,28 +976,30 @@ async fn run_ioc_app(args: Args) -> Result<(), Failure> {
         }
     });
     app.run_phased(
-        move |config: epics_base_rs::server::ioc_app::IocRunConfig| async move {
+        move |mut config: epics_base_rs::server::ioc_app::IocRunConfig| async move {
             let mut builder = epics_ca_rs::server::CaServerBuilder::serving(
                 config.db,
                 config.acf,
                 config.autosave_config,
                 config.autosave_manager,
             )
-            .port(config.port);
+            .port(config.port)
+            .bound_at_init(&mut config.servers);
             if let Some(tcp_port) = config.tcp_port {
                 builder = builder.tcp_port(tcp_port);
             }
             let server = server_options.apply(builder).build().await?;
-            if interactive {
-                server
-                    .run_with_shell(move |shell| {
-                        for cmd in config.shell_commands {
-                            shell.register(cmd);
-                        }
-                    })
-                    .await
-            } else {
-                server.run().await
+            match after_startup {
+                AfterStartup::Shell => {
+                    server
+                        .run_with_shell(move |shell| {
+                            for cmd in config.shell_commands {
+                                shell.register(cmd);
+                            }
+                        })
+                        .await
+                }
+                AfterStartup::Serve => server.run().await,
             }
         },
     )
@@ -1077,7 +1110,7 @@ impl Failure {
             print!("{}", usage());
         }
         if let Some(line) = self.rendered() {
-            eprintln!("{line}");
+            epics_libcom_rs::stderr_println!("{line}");
         }
         std::process::ExitCode::from(self.status())
     }
@@ -1188,7 +1221,9 @@ impl ServerOptions {
                 if let Some((k, v)) = kv.split_once('=') {
                     mdns_txt.push((k.to_string(), v.to_string()));
                 } else {
-                    eprintln!("warning: --mdns-txt expects KEY=VALUE, got {kv:?}; skipping");
+                    epics_libcom_rs::stderr_println!(
+                        "warning: --mdns-txt expects KEY=VALUE, got {kv:?}; skipping"
+                    );
                 }
             }
         }
@@ -1322,24 +1357,47 @@ impl ServerOptions {
 /// background worker, makes a wrong build a startup message.
 #[cfg(exec_backend)]
 fn main() -> std::process::ExitCode {
-    eprintln!(
+    epics_base_rs::runtime::task::refuse_backend(
         "softioc-rs: this build selects the reactor-free execution backend \
          (EPICS_RS_BUILD_EXEC_BACKEND=thread), and the async CA server front-end \
          needs a tokio reactor.\nRun `realtime-ca-ioc`, which serves CA through \
          the blocking driver on this backend, or unset that variable and rebuild \
-         softioc-rs."
-    );
-    std::process::ExitCode::FAILURE
+         softioc-rs.",
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        Args, CommandFactory, ERL_ERROR, Failure, SOFT_IOC_EXIT_DB, Step, blamed_option, copt,
-        db_load_records_line, parse_record_def, startup_plan, usage,
+        AfterStartup, Args, CommandFactory, ERL_ERROR, Failure, SOFT_IOC_EXIT_DB, Step,
+        blamed_option, copt, db_load_records_call, parse_record_def, startup_plan, usage,
     };
     #[cfg(tokio_backend)]
     use super::{ServerOptions, run_ioc_app};
+
+    /// A path as an unquoted iocsh token: C's out-of-quote backslash escape
+    /// (`iocsh.cpp:273-277`) eats a native Windows path's separators, so a
+    /// Windows st.cmd writes forward slashes.
+    #[cfg(tokio_backend)]
+    fn script_token(p: &std::path::Path) -> String {
+        p.display().to_string().replace('\\', "/")
+    }
+
+    /// `-S` alone picks the serving arm; without it (and with the ignored
+    /// `-s`) the shell's. `dash_s_keeps_serving_after_stdin_is_closed` then
+    /// only has to show that the serving arm outlives EOF.
+    #[test]
+    fn dash_s_selects_the_serving_arm() {
+        for (argv, arm) in [
+            (&["softioc-rs"][..], AfterStartup::Shell),
+            (&["softioc-rs", "-s"][..], AfterStartup::Shell),
+            (&["softioc-rs", "-S"][..], AfterStartup::Serve),
+            (&["softioc-rs", "--no-shell"][..], AfterStartup::Serve),
+        ] {
+            let args = Args::from_argv(argv).expect("parse argv");
+            assert_eq!(args.after_startup(), arm, "{argv:?}");
+        }
+    }
 
     #[cfg(tokio_backend)]
     /// `-d`/`--db` on a file that is not there is a failing `dbLoadRecords`,
@@ -1396,7 +1454,7 @@ mod tests {
             &script,
             format!(
                 "on error break\ndbDumpRegistrar pdbbase > {}\nnosuchcommand\n",
-                dump.display()
+                script_token(&dump)
             ),
         )
         .unwrap();
@@ -1562,21 +1620,16 @@ mod tests {
     /// empty.
     #[test]
     fn a_db_flag_is_c_s_db_load_records_call() {
-        assert_eq!(db_load_records_line("x.db", ""), "dbLoadRecords(\"x.db\")");
+        let shown = |f, m| db_load_records_call(f, m, String::new()).shown;
+        assert_eq!(shown("x.db", ""), "dbLoadRecords(\"x.db\")");
         assert_eq!(
-            db_load_records_line("x.db", "P=A,R=B"),
+            shown("x.db", "P=A,R=B"),
             "dbLoadRecords(\"x.db\", \"P=A,R=B\")"
         );
-    }
-
-    /// The line is text for exactly as long as it takes the shell to split
-    /// it, so a filename C would have passed as a pointer must come out
-    /// the other side unchanged.
-    #[test]
-    fn a_quote_in_a_filename_survives_the_line() {
         assert_eq!(
-            db_load_records_line(r#"od"d\.db"#, ""),
-            r#"dbLoadRecords("od\"d\\.db")"#
+            shown(r"C:\t\x.db", ""),
+            r#"dbLoadRecords("C:\t\x.db")"#,
+            "C prints optarg raw"
         );
     }
 
@@ -1596,7 +1649,10 @@ mod tests {
         let script = dir.path().join("st.cmd");
         std::fs::write(
             &script,
-            format!("on error break\ndbl > {}\nnosuchcommand\n", dump.display()),
+            format!(
+                "on error break\ndbl > {}\nnosuchcommand\n",
+                script_token(&dump)
+            ),
         )
         .expect("write script");
 
@@ -1668,7 +1724,7 @@ mod tests {
         let script = dir.path().join("st.cmd");
         std::fs::write(
             &script,
-            format!("epicsEnvShow PATH > {}\n", marker.display()),
+            format!("epicsEnvShow PATH > {}\n", script_token(&marker)),
         )
         .expect("write script");
         let script = script.display().to_string();
@@ -1701,7 +1757,7 @@ mod tests {
         assert_eq!(
             plan.lines
                 .iter()
-                .map(|c| c.line.as_str())
+                .map(|c| c.shown.as_str())
                 .collect::<Vec<_>>(),
             vec![
                 r#"dbLoadRecords("/x/softIocExit.db", "IOC=XT")"#,
@@ -1923,7 +1979,7 @@ mod tests {
             "/x/softIocExit.db",
         )
         .expect("a plan without -D");
-        let lines: Vec<&str> = plan.lines.iter().map(|c| c.line.as_str()).collect();
+        let lines: Vec<&str> = plan.lines.iter().map(|c| c.shown.as_str()).collect();
         assert_eq!(
             lines,
             [
@@ -1949,7 +2005,7 @@ mod tests {
             "/x/softIocExit.db",
         )
         .expect("both -D options precede the first -d");
-        let lines: Vec<&str> = plan.lines.iter().map(|c| c.line.as_str()).collect();
+        let lines: Vec<&str> = plan.lines.iter().map(|c| c.shown.as_str()).collect();
         assert_eq!(
             lines,
             [
@@ -1983,7 +2039,7 @@ mod tests {
             "/x/softIocExit.db",
         )
         .expect("a plan without -D");
-        let lines: Vec<&str> = plan.lines.iter().map(|c| c.line.as_str()).collect();
+        let lines: Vec<&str> = plan.lines.iter().map(|c| c.shown.as_str()).collect();
         assert_eq!(
             lines,
             [

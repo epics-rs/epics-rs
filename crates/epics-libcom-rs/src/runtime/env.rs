@@ -14,7 +14,9 @@
 //! `ENV_PARAM`s — C reads those with a plain `getenv` and its caller owns the
 //! fallback, so this port does too.
 
-use super::stdlib::epics_parse_double;
+use std::ffi::c_long;
+
+use super::stdlib::{epics_parse_double, scanf_long};
 
 /// One row of C's `ENV_PARAM` table (`envDefs.h:41-45`): a parameter name and
 /// the default compiled in from `configure/CONFIG_ENV`.
@@ -50,7 +52,10 @@ impl EnvParam {
     /// absence check: `caservertask.c:492-509` uses it to pick *which* of two
     /// parameters to resolve, so `FOO=` must read as "not configured".
     pub fn get(&self) -> Option<String> {
-        let v = std::env::var(self.name).unwrap_or_else(|_| self.default.to_string());
+        let v = match get_lossy(self.name) {
+            Some(v) => v,
+            None => self.default.to_string(),
+        };
         if v.is_empty() { None } else { Some(v) }
     }
 
@@ -62,13 +67,13 @@ impl EnvParam {
     /// C's stderr line first; an *unresolvable* one (empty value and empty
     /// default) prints nothing, because `envGetConfigParam` returned NULL before
     /// `sscanf` ever ran.
-    pub fn long(&self) -> Option<i64> {
+    pub fn long(&self) -> Option<c_long> {
         let text = self.get()?;
         let text = truncate_to_c_buffer(&text);
         match sscanf_long(text) {
             Some(v) => Some(v),
             None => {
-                eprintln!("Unable to find an integer in {}={text}", self.name);
+                crate::stderr_println!("Unable to find an integer in {}={text}", self.name);
                 None
             }
         }
@@ -83,10 +88,30 @@ impl EnvParam {
     ///
     /// i.e. a rejected value leaves the compiled default standing. The `50` in
     /// C's source is a hand-copy of the table; here it comes from the table.
-    pub fn long_or_default(&self) -> i64 {
+    pub fn long_or_default(&self) -> c_long {
         self.long()
             .or_else(|| sscanf_long(self.default))
             .unwrap_or(0)
+    }
+
+    /// C `envGetInetAddrConfigParam` (`envSubr.c:247-265`) — `aToIPAddr` with
+    /// port 0 over the resolved value's first 127 bytes, keeping the address.
+    ///
+    /// `None` is C's -1. A value that does not resolve also prints C's stderr
+    /// line first; an unresolvable parameter prints nothing, as for [`Self::long`].
+    pub fn inet_addr(&self) -> Option<std::net::Ipv4Addr> {
+        let text = self.get()?;
+        let text = truncate_to_c_buffer(&text);
+        match super::socket::a_to_ip_addr(text, 0) {
+            Some((addr, _)) => Some(*addr.ip()),
+            None => {
+                crate::stderr_println!(
+                    "Unable to find an IP address or valid host name in {}={text}",
+                    self.name
+                );
+                None
+            }
+        }
     }
 
     /// C `envGetDoubleConfigParam` (`envSubr.c:191-211`) — `epicsScanDouble` over
@@ -100,7 +125,7 @@ impl EnvParam {
     pub fn double(&self) -> Result<f64, EnvDoubleError> {
         let raw = self.get().ok_or(EnvDoubleError::Unresolvable)?;
         epics_parse_double(&raw).map_err(|_| {
-            eprintln!("Unable to find a real number in {}={raw}", self.name);
+            crate::stderr_println!("Unable to find a real number in {}={raw}", self.name);
             EnvDoubleError::Invalid
         })
     }
@@ -143,23 +168,23 @@ impl EnvParam {
     /// Setting "EPICS_CA_SERVER_PORT" = 5064
     /// ```
     pub fn inet_port(&self, fallback: u16) -> u16 {
-        let mut port = match self.long() {
+        let port = match self.long() {
             Some(v) => v,
             None => {
-                eprintln!("EPICS Environment \"{}\" integer fetch failed", self.name);
-                eprintln!("setting \"{}\" = {fallback}", self.name);
-                i64::from(fallback)
+                crate::stderr_println!("EPICS Environment \"{}\" integer fetch failed", self.name);
+                crate::stderr_println!("setting \"{}\" = {fallback}", self.name);
+                c_long::from(fallback)
             }
         };
 
-        if port <= i64::from(IPPORT_USERRESERVED) || port > i64::from(u16::MAX) {
-            eprintln!("EPICS Environment \"{}\" out of range", self.name);
-            port = i64::from(fallback);
-            eprintln!("Setting \"{}\" = {fallback}", self.name);
+        match u16::try_from(port) {
+            Ok(port) if u32::from(port) > IPPORT_USERRESERVED => port,
+            _ => {
+                crate::stderr_println!("EPICS Environment \"{}\" out of range", self.name);
+                crate::stderr_println!("Setting \"{}\" = {fallback}", self.name);
+                fallback
+            }
         }
-
-        // Range-checked above, so the cast cannot truncate.
-        port as u16
     }
 
     /// The compiled default read as a port, at compile time.
@@ -212,8 +237,18 @@ pub enum EnvDoubleError {
 /// pvxs `EPICS_PVA*` set, the port's own `EPICS_RS_*`); C reads those with
 /// `getenv` too and its caller owns the fallback. Every EPICS Base `ENV_PARAM`
 /// must go through [`super::env_table`].
-pub fn get(key: &str) -> Option<String> {
-    std::env::var(key).ok()
+///
+/// The value is C's bytes, not UTF-8 checked: a caller that carries it on (a
+/// path, a record's VAL) keeps every byte, and one that parses it as text
+/// says so with [`get_lossy`].
+pub fn get(key: impl AsRef<std::ffi::OsStr>) -> Option<std::ffi::OsString> {
+    std::env::var_os(key)
+}
+
+/// [`get`] for a caller that parses the value as text. A non-UTF-8 sequence
+/// becomes U+FFFD; every ASCII byte a C parser looks at is kept.
+pub fn get_lossy(key: impl AsRef<std::ffi::OsStr>) -> Option<String> {
+    get(key).map(|v| v.to_string_lossy().into_owned())
 }
 
 /// Lowest port number a configurable EPICS port may take.
@@ -233,36 +268,10 @@ fn truncate_to_c_buffer(raw: &str) -> &str {
     &raw[..end]
 }
 
-/// Parse the leading integer out of a string the way C `sscanf("%ld")`
-/// does: skip leading whitespace, accept an optional `+`/`-` sign, read
-/// the run of decimal digits, and ignore any trailing garbage suffix.
-///
-/// Returns `None` when no digit is found (C `sscanf` returns 0 matches).
-fn sscanf_long(text: &str) -> Option<i64> {
-    let bytes = text.as_bytes();
-    let mut i = 0;
-    // Skip leading whitespace (C `isspace`: space, \t, \n, \v, \f, \r).
-    while i < bytes.len() && crate::runtime::stdlib::c_isspace(bytes[i] as char) {
-        i += 1;
-    }
-    let mut neg = false;
-    if i < bytes.len() && (bytes[i] == b'+' || bytes[i] == b'-') {
-        neg = bytes[i] == b'-';
-        i += 1;
-    }
-    let start = i;
-    let mut value: i64 = 0;
-    while i < bytes.len() && bytes[i].is_ascii_digit() {
-        value = value
-            .saturating_mul(10)
-            .saturating_add((bytes[i] - b'0') as i64);
-        i += 1;
-    }
-    if i == start {
-        // No digits — sscanf matched nothing.
-        return None;
-    }
-    Some(if neg { -value } else { value })
+/// C `sscanf(text, "%ld", pLong) == 1` (`envSubr.c:314`), as libcom's glibc
+/// `%ld`.
+fn sscanf_long(text: &str) -> Option<c_long> {
+    scanf_long(text, 10).map(|(v, _)| v)
 }
 
 /// C `epicsPrtEnvParams` (`envSubr.c:383-392`) — every parameter EPICS Base
@@ -326,12 +335,13 @@ pub fn register_iocsh_env_vars() {
 /// # Safety
 /// Uses `std::env::set_var`, which is unsafe in multi-threaded programs. Call it
 /// from IOC startup or from a single known thread, not from arbitrary tasks.
-pub fn set(name: &str, value: &str) {
+pub fn set(name: impl AsRef<std::ffi::OsStr>, value: impl AsRef<std::ffi::OsStr>) {
     // SAFETY: as documented — startup or a single owning thread.
     unsafe { std::env::set_var(name, value) };
 }
 
-/// Set an environment variable only if it is not already set.
+/// Set an environment variable only if it is not already set. A path a
+/// startup script reads as `$(NAME)` goes through [`set_default_path`].
 ///
 /// # Safety
 /// Uses `std::env::set_var` which is unsafe in multi-threaded programs.
@@ -340,6 +350,21 @@ pub fn set_default(name: &str, value: &str) {
     if std::env::var_os(name).is_none() {
         // SAFETY: called during IOC startup, before multi-threaded operation.
         unsafe { std::env::set_var(name, value) };
+    }
+}
+
+/// [`set_default`] for a directory a startup script reads as `$(NAME)`, the
+/// envPaths `epicsEnvSet` of C. convertRelease.pl writes it with `UnixPath`,
+/// `/` for every `\` on Windows: iocsh and macLib take a `\` as an escape.
+pub fn set_default_path(name: &str, path: &str) {
+    set_default(name, &unix_path(path));
+}
+
+fn unix_path(path: &str) -> std::borrow::Cow<'_, str> {
+    if cfg!(windows) {
+        path.replace('\\', "/").into()
+    } else {
+        path.into()
     }
 }
 
@@ -358,14 +383,73 @@ pub fn set_default(name: &str, value: &str) {
 /// epics_base_rs::runtime::env::set_crate_path("MYIOC", env!("CARGO_MANIFEST_DIR"), "db");
 /// ```
 pub fn set_crate_path(name: &str, manifest_dir: &str, relative: &str) {
-    set_default(name, &format!("{manifest_dir}/{relative}"));
+    set_default_path(name, &format!("{manifest_dir}/{relative}"));
 }
 
-pub fn hostname() -> String {
-    hostname::get()
-        .ok()
-        .and_then(|s| s.into_string().ok())
-        .unwrap_or_else(|| "localhost".to_string())
+/// `gethostname`'s bytes. `None` is a failed call, whose fallback each
+/// caller picks (libca `<unknown host>`, pvxs `invalidhost.`, ca-gateway
+/// `gateway`); C never substitutes `localhost`.
+pub fn hostname() -> Option<Vec<u8>> {
+    host_bytes(hostname::get().ok()?)
+}
+
+fn host_bytes(name: std::ffi::OsString) -> Option<Vec<u8>> {
+    #[cfg(unix)]
+    let name = std::os::unix::ffi::OsStringExt::into_vec(name);
+    #[cfg(not(unix))]
+    let name = name.into_string().ok()?.into_bytes();
+    Some(name)
+}
+
+/// libca `localHostName` (localHostName.cpp:28-41): `gethostname` into a
+/// 128-byte cache, `<unknown host>` when it fails.
+pub fn ca_local_host_name() -> Vec<u8> {
+    let mut name = hostname().unwrap_or_else(|| b"<unknown host>".to_vec());
+    name.truncate(127);
+    name
+}
+
+/// C `osiGetUserName` into its callers' 256-byte buffer: the passwd name of
+/// the real uid (`posix/osdProcess.c:39`), never `$USER`. `None` is
+/// `osiGetUserNameFail`, whose fallback each caller picks (libca `""`, pvxs
+/// `"nobody"`). Windows and VxWorks are not ported and report a failure.
+pub fn user_name() -> Option<Vec<u8>> {
+    #[cfg(all(unix, not(epics_embedded_target)))]
+    let name = {
+        let mut buf = vec![0 as libc::c_char; 1024];
+        loop {
+            let mut pw = std::mem::MaybeUninit::<libc::passwd>::uninit();
+            let mut out: *mut libc::passwd = std::ptr::null_mut();
+            // SAFETY: `pw`, `buf` and `out` outlive the call; `buf.len()` is
+            // the buffer's real size.
+            let rc = unsafe {
+                libc::getpwuid_r(
+                    libc::getuid(),
+                    pw.as_mut_ptr(),
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                    &mut out,
+                )
+            };
+            if rc == libc::ERANGE && buf.len() < 1 << 20 {
+                buf.resize(buf.len() * 2, 0);
+                continue;
+            }
+            if rc != 0 || out.is_null() {
+                return None;
+            }
+            // SAFETY: a non-null `out` is `pw`, filled with pointers into `buf`.
+            break unsafe { std::ffi::CStr::from_ptr((*out).pw_name) }
+                .to_bytes()
+                .to_vec();
+        }
+    };
+    #[cfg(target_os = "rtems")]
+    let name = b"rtems".to_vec();
+    #[cfg(not(any(all(unix, not(epics_embedded_target)), target_os = "rtems")))]
+    let name: Vec<u8> = Vec::new();
+    // `osdProcess.c`: empty, or no room for the NUL in 256 bytes, fails.
+    (!name.is_empty() && name.len() + 1 < 256).then_some(name)
 }
 
 #[cfg(test)]
@@ -373,6 +457,26 @@ mod tests {
     use super::super::env_table::*;
     use super::*;
     use serial_test::serial;
+
+    /// Setting a non-UTF-8 host name needs root, so the conversion is tested
+    /// on its own.
+    #[cfg(unix)]
+    #[test]
+    fn host_bytes_keeps_a_non_utf8_host_name() {
+        use std::os::unix::ffi::OsStringExt;
+        let name = std::ffi::OsString::from_vec(b"h\xff".to_vec());
+        assert_eq!(host_bytes(name).as_deref(), Some(&b"h\xff"[..]));
+    }
+
+    #[test]
+    fn a_published_path_is_unix_path_on_this_os() {
+        let want = if cfg!(windows) {
+            "C:/a/b/db"
+        } else {
+            "C:\\a\\b/db"
+        };
+        assert_eq!(unix_path("C:\\a\\b/db"), want);
+    }
 
     /// A scratch parameter: the accessors are the unit under test, and the
     /// generated table is not the place to add fixtures.
@@ -400,13 +504,13 @@ mod tests {
     /// never doubted. Walking `ENV_PARAM_LIST` deletes the second list:
     /// whatever a test asserts on, the table has already covered.
     #[must_use]
-    struct SilentEnv(Vec<(&'static str, String)>);
+    struct SilentEnv(Vec<(&'static str, std::ffi::OsString)>);
 
     impl SilentEnv {
         fn take() -> Self {
             let saved = ENV_PARAM_LIST
                 .iter()
-                .filter_map(|p| std::env::var(p.name()).ok().map(|v| (p.name(), v)))
+                .filter_map(|p| std::env::var_os(p.name()).map(|v| (p.name(), v)))
                 .collect();
             for p in ENV_PARAM_LIST {
                 clear(*p);
@@ -429,6 +533,19 @@ mod tests {
         assert_eq!(get("_EPICS_RT_NONEXISTENT_VAR_12345"), None);
     }
 
+    #[cfg(unix)]
+    #[test]
+    #[serial(epics_env)]
+    fn get_returns_a_non_utf8_value_s_bytes() {
+        use std::os::unix::ffi::OsStrExt;
+        let raw = std::ffi::OsStr::from_bytes(b"a\xffb");
+        // SAFETY: see `clear`.
+        unsafe { std::env::set_var(SCRATCH.name(), raw) };
+        assert_eq!(get(SCRATCH.name()).as_deref(), Some(raw));
+        assert_eq!(get_lossy(SCRATCH.name()).as_deref(), Some("a\u{fffd}b"));
+        clear(SCRATCH);
+    }
+
     #[test]
     fn test_sscanf_long_lenient_parsing() {
         // C `sscanf("%ld")` semantics: leading whitespace skipped,
@@ -442,6 +559,11 @@ mod tests {
         assert_eq!(sscanf_long("not_a_number"), None);
         assert_eq!(sscanf_long(""), None);
         assert_eq!(sscanf_long("   "), None);
+        assert_eq!(sscanf_long("\u{a0}5064"), None);
+        // glibc's `%ld` is `strtol`, saturating at C `long`'s bounds.
+        if c_long::BITS == 64 {
+            assert_eq!(sscanf_long("-9223372036854775809"), Some(c_long::MIN));
+        }
     }
 
     /// C `sscanf` skips leading whitespace by `isspace`, which includes the
@@ -576,6 +698,16 @@ mod tests {
         assert_eq!(SCRATCH.bool(), None);
         clear(SCRATCH);
         assert_eq!(SCRATCH.bool(), None);
+        // Not UTF-8 is set and not `yes`; it never falls back to the default.
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let yes = EnvParam::new(SCRATCH.name(), "YES");
+            // SAFETY: see `clear`.
+            unsafe { std::env::set_var(yes.name(), std::ffi::OsStr::from_bytes(b"y\xffes")) };
+            assert_eq!(yes.bool(), Some(false));
+            clear(SCRATCH);
+        }
     }
 
     /// `long_or_default` is C's `long i = <default>; envGetLongConfigParam(...)`
@@ -614,10 +746,17 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
-    fn test_hostname() {
-        let h = hostname();
-        assert!(!h.is_empty());
+    fn hostname_is_the_gethostname_bytes() {
+        let mut buf = [0u8; 256];
+        // SAFETY: `buf` outlives the call and its length is passed.
+        assert_eq!(
+            unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) },
+            0
+        );
+        let len = buf.iter().position(|&b| b == 0).unwrap();
+        assert_eq!(hostname(), Some(buf[..len].to_vec()));
     }
 
     /// The row-by-row diff against the BUILT C.
@@ -695,5 +834,30 @@ mod tests {
                 "line {i}: C's iocshRegisterCommon publishes `{line}`"
             );
         }
+    }
+
+    #[cfg(all(unix, not(epics_embedded_target)))]
+    #[test]
+    #[serial(epics_env)]
+    fn user_name_is_the_passwd_name_not_user() {
+        use std::os::unix::ffi::OsStrExt;
+        let saved = std::env::var_os("USER");
+        // SAFETY: every test that mutates env is `#[serial(epics_env)]`.
+        unsafe { std::env::set_var("USER", std::ffi::OsStr::from_bytes(b"op\xff")) };
+        let got = user_name();
+        // SAFETY: same serial group.
+        unsafe {
+            match saved {
+                Some(v) => std::env::set_var("USER", v),
+                None => std::env::remove_var("USER"),
+            }
+        }
+        // SAFETY: getpwuid on the test thread; fields are copied before return.
+        let want = unsafe {
+            let pw = libc::getpwuid(libc::getuid());
+            assert!(!pw.is_null(), "test needs a passwd entry");
+            std::ffi::CStr::from_ptr((*pw).pw_name).to_bytes().to_vec()
+        };
+        assert_eq!(got, Some(want));
     }
 }

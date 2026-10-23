@@ -129,7 +129,7 @@ TransportCommand::CreateChannel
    │
    ▼ TCP connect to server_addr
 TcpStream::connect              ─────▶   accept(), keepalive on
-VERSION+HOST+CLIENT_NAME         ─────▶  cache client_minor_version
+VERSION+HOST+CLIENT_NAME         ─────▶  set the circuit minor
                                           state.hostname = peer.ip()
                                           (or client-supplied if env)
 CREATE_CHAN(cid, pvname)         ─────▶  alloc sid, look up PV
@@ -140,8 +140,8 @@ CREATE_CHAN(cid, sid, type, n)   ◀─────
    │
    ▼ ChannelCreated event
 ChannelInner.state = Connected
-broadcast ConnectionEvent::Connected
 broadcast AccessRightsChanged
+broadcast ConnectionEvent::Connected
 restore_for_channel(cid, sid)
    │  (re-issue EVENT_ADD for each
    │   live subscription — no-op on

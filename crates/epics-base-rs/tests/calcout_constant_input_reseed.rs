@@ -1,43 +1,29 @@
-//! R19-1 — a runtime put to a CONSTANT `INPn` must re-seed its value field.
+//! A runtime put to a calcout `INPn` loads nothing into the value field: C's
+//! `special()` calls `recGblInitConstantLink` (`calcoutRecord.c:373-374`), but
+//! `dbPutFieldLink` runs that pass before `dbAddLink` installs the new `lset`
+//! (`dbAccess.c:1181-1208`), so `dbLoadLink` returns `S_db_noLSET`. The status
+//! reads Constant for every put, and the value field is posted as it stands.
 //!
-//! A constant link delivers NOTHING at process time (`dbConstGetValue`,
-//! `dbConstLink.c:219-225`), so the ONLY way `field(INPB,"2")` ever reaches `B`
-//! is the init seed. Without a matching re-seed on a runtime put, `caput
-//! CO.INPB 7` stores the link text and `B` keeps its `.db` value forever — the
-//! put looks accepted and changes nothing.
+//! The pin is softIoc R7.0.10: each case under `testdata/calcout_c_stream` is
+//! one `.db`, the `steps.txt` it was driven with (one `camonitor -tn` per PV,
+//! then each `caput`), and the per-PV streams softIoc served, connect events
+//! included. The port must serve the same lines byte for byte.
 //!
-//! C's INTENT is explicit (`calcoutRecord.c:373-378`, `sCalcoutRecord.c:513-518`,
-//! `aCalcoutRecord.c:533-538`): `special()` re-runs `recGblInitConstantLink`,
-//! posts the value field with `DBE_VALUE`, and sets `INAV = CON`.
-//!
-//! C's compiled BEHAVIOUR does not do it — an ordering bug defeats the code:
-//! `dbPutFieldLink` (`dbAccess.c:1164-1176`) calls `dbRemoveLink` (which NULLs
-//! `plink->lset`, `dbLink.c:207`), then `dbPutSpecial(paddr, 1)`, and only then
-//! `dbAddLink` (`:1205`) installs the new lset. So inside `special()` the lset is
-//! still NULL, and `recGblInitConstantLink` -> `dbLoadLink` -> `S_db_noLSET`
-//! (`dbLink.c:241`, `recGbl.c:175`) returns FALSE without loading anything.
-//! Measured on softIoc 7.0.10.1-DEV: `caput -s CO.INPB 7` leaves INPB="7" and
-//! B=2. (Same root cause makes C's `dbLinkIsConstant` answer TRUE for a NULL
-//! lset, so a re-point to a real PV also leaves INBV stuck at "Constant".)
-//!
-//! Per the product policy this is Tier 2 with C WRONG: the port implements the
-//! INTENDED behaviour and does not reproduce the bug.
-//!
-//! Boundaries, one case each:
-//!   - the new link IS constant -> re-seed + post + the next calc uses it
-//!   - the new link is NOT constant -> no re-seed (the link read owns the value)
-//!   - a record type whose C `special()` has no such arm (calc: `special()` only
-//!     handles SPC_CALC, `calcRecord.c:139-157`) -> no re-seed
-//!   - sCalcout/aCalcout NON-numeric inputs, which C's `fieldIndex <= INPL`
-//!     guard excludes -> no re-seed
+//! The sCalcout, aCalcout and transform cases below still pin the framework
+//! re-seed (`special_reseed_input_links`), which their C `special()` does not
+//! perform either; that decision is deferred.
+
+use std::collections::HashMap;
 
 use epics_base_rs::server::database::PvDatabase;
+use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::recgbl::EventMask;
+use epics_base_rs::server::recgbl::alarm_condition_string;
+use epics_base_rs::server::record::MENU_ALARM_SEVR;
 use epics_base_rs::server::record::Record;
 use epics_base_rs::server::records::acalcout::AcalcoutRecord;
-use epics_base_rs::server::records::calc::CalcRecord;
-use epics_base_rs::server::records::calcout::CalcoutRecord;
 use epics_base_rs::server::records::scalcout::ScalcoutRecord;
+use epics_base_rs::server::snapshot::Snapshot;
 use epics_base_rs::types::{DbFieldType, EpicsValue};
 
 async fn field(db: &PvDatabase, rec: &str, f: &str) -> EpicsValue {
@@ -55,96 +41,120 @@ async fn put(db: &PvDatabase, rec: &str, f: &str, v: &str) {
         .unwrap();
 }
 
-async fn process(db: &PvDatabase, rec: &str) {
-    let mut visited = epics_base_rs::server::database::ProcStack::new();
-    db.process_record_with_links(rec, &mut visited)
+/// Render one monitor event as `camonitor -tn` prints it.
+fn camonitor_line(pv: &str, snap: &Snapshot, enums: &[String]) -> String {
+    let value = match &snap.value {
+        EpicsValue::Double(v) => {
+            assert!(v.fract() == 0.0, "the fixtures serve integral values");
+            format!("{}", *v as i64)
+        }
+        EpicsValue::Enum(i) => enums[*i as usize].clone(),
+        other => panic!("{pv}: no camonitor rendering for {other:?}"),
+    };
+    let stat = match snap.alarm.status {
+        0 => "",
+        s => alarm_condition_string(s),
+    };
+    let sevr = match snap.alarm.severity {
+        0 => "",
+        s => MENU_ALARM_SEVR[s as usize],
+    };
+    format!("{pv:<31} {value} {stat} {sevr}")
+}
+
+/// Drive `testdata/calcout_c_stream/<case>` through the port and compare the
+/// per-PV streams with what softIoc served.
+async fn softioc_pin(case: &str) {
+    let dir = format!(
+        "{}/tests/testdata/calcout_c_stream/{case}",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let read = |f: &str| std::fs::read_to_string(format!("{dir}/{f}")).unwrap();
+    let (db, _) = IocBuilder::new()
+        .db_string(&read("t.db"), &HashMap::new())
+        .unwrap()
+        .build()
         .await
         .unwrap();
+    let steps = read("steps.txt");
+    let mut lines = steps.lines();
+    let monitor = lines.next().unwrap().strip_prefix("monitor ").unwrap();
+    let mut subs = Vec::new();
+    for (sid, pv) in monitor.split_whitespace().enumerate() {
+        let (rec, field) = pv.split_once('.').unwrap();
+        let cell = db.get_record(rec).unwrap();
+        let connect = db.channel_snapshot_for_field(&cell, field, false).unwrap();
+        let enums: Vec<String> = connect
+            .enums
+            .as_ref()
+            .map(|e| e.strings.iter().map(|s| s.to_string()).collect())
+            .unwrap_or_default();
+        let rx = cell
+            .write()
+            .add_subscriber(
+                field,
+                sid as u32,
+                connect.value.db_field_type(),
+                (EventMask::VALUE | EventMask::ALARM).bits(),
+            )
+            .unwrap();
+        subs.push((pv, vec![camonitor_line(pv, &connect, &enums)], rx, enums));
+    }
+    for step in lines {
+        let mut words = step.split_whitespace();
+        assert_eq!(words.next(), Some("caput"));
+        let (rec, field) = words.next().unwrap().split_once('.').unwrap();
+        let value = match words.next().unwrap() {
+            "\"\"" => "",
+            v => v,
+        };
+        db.put_record_field_from_ca(rec, field, EpicsValue::String(value.into()))
+            .await
+            .unwrap();
+    }
+    let mut got = String::new();
+    for (pv, mut out, mut rx, enums) in subs {
+        while let Ok(ev) = rx.try_recv() {
+            let mut s = Snapshot::new(EpicsValue::Long(0), 0, 0, std::time::SystemTime::UNIX_EPOCH);
+            ev.write_log_over(&mut s);
+            out.push(camonitor_line(pv, &s, &enums));
+        }
+        for line in out {
+            got.push_str(&line);
+            got.push('\n');
+        }
+    }
+    let want = read("softioc.out");
+    assert!(!want.is_empty(), "{case}: softioc.out is empty");
+    assert_eq!(got, want, "{case}");
 }
 
-/// A calcout with `CALC="A+B"`, `INPA="1"`, `INPB="2"` — both inputs constant.
-async fn calcout_db() -> PvDatabase {
-    let db = PvDatabase::new();
-    let mut co = CalcoutRecord::default();
-    co.put_field("CALC", EpicsValue::String("A+B".into()))
-        .unwrap();
-    co.put_field("INPA", EpicsValue::String("1".into()))
-        .unwrap();
-    co.put_field("INPB", EpicsValue::String("2".into()))
-        .unwrap();
-    db.add_record("CO", Box::new(co)).await.unwrap();
-    db
-}
-
-/// The new link is CONSTANT: the value field takes the constant immediately —
-/// no process needed, exactly as the init seed does — and the next calculation
-/// uses it.
+/// `caput CO.INPB 7`: B keeps 2 and is posted, INBV posts Constant, and the
+/// next process computes with B = 2.
 #[epics_macros_rs::epics_test]
-async fn calcout_put_to_a_constant_inp_reseeds_the_value_field() {
-    let db = calcout_db().await;
-    assert_eq!(field(&db, "CO", "B").await, EpicsValue::Double(2.0));
-
-    put(&db, "CO", "INPB", "7").await;
-
-    assert_eq!(field(&db, "CO", "B").await, EpicsValue::Double(7.0));
-    process(&db, "CO").await;
-    assert_eq!(field(&db, "CO", "VAL").await, EpicsValue::Double(8.0));
+async fn calcout_put_of_a_constant_inp_posts_b_unloaded() {
+    softioc_pin("inp_constant_put").await;
 }
 
-/// C posts the re-seeded value field with a literal `DBE_VALUE`
-/// (`calcoutRecord.c:376`). Nothing else would: `B` is not `pp(TRUE)`, and the
-/// put was to `INPB`.
+/// `caput CO.INPB ""` then `caput CO.INPB 9`: each put posts B and INBV as
+/// they stand.
 #[epics_macros_rs::epics_test]
-async fn calcout_reseed_posts_the_value_field() {
-    let db = calcout_db().await;
-    let inst = db.get_record("CO").unwrap();
-    let mut b_rx = inst
-        .write()
-        .add_subscriber("B", 1, DbFieldType::Double, EventMask::VALUE.bits())
-        .expect("a B subscription must be accepted");
-
-    put(&db, "CO", "INPB", "7").await;
-
-    let event = b_rx.try_recv().expect("the re-seed must post B");
-    assert_eq!(event.snapshot.value, EpicsValue::Double(7.0));
+async fn calcout_put_of_an_empty_inp_posts_b_and_inbv() {
+    softioc_pin("inp_empty_put").await;
 }
 
-/// The new link is NOT constant: `recGblInitConstantLink` returns FALSE and
-/// touches nothing (C `dbLoadLink` is a constant-link-only lset entry). The
-/// value field keeps what it had until the LINK delivers — the process-time read
-/// owns it from here on.
+/// `caput CO.INPB SRC`: INBV reads Constant although SRC is local, and the
+/// next process reads SRC into B.
 #[epics_macros_rs::epics_test]
-async fn calcout_put_of_a_pv_link_does_not_reseed() {
-    let db = calcout_db().await;
-    let mut src = CalcRecord::new("0");
-    src.put_field("VAL", EpicsValue::Double(41.0)).unwrap();
-    db.add_record("SRC", Box::new(src)).await.unwrap();
-
-    put(&db, "CO", "INPB", "SRC").await;
-
-    // Not re-seeded — B still holds the old constant.
-    assert_eq!(field(&db, "CO", "B").await, EpicsValue::Double(2.0));
-    // And the link now owns it: the next process reads SRC.
-    process(&db, "CO").await;
-    assert_eq!(field(&db, "CO", "B").await, EpicsValue::Double(41.0));
+async fn calcout_put_of_a_pv_link_reads_constant_until_the_link_reads() {
+    softioc_pin("inp_pv_link_put").await;
 }
 
-/// C's `calcRecord::special` (`calcRecord.c:139-157`) handles ONLY `SPC_CALC` —
-/// calc's INPA..INPL are not `special(SPC_MOD)` at all, so a runtime put to a
-/// constant INPn re-seeds nothing. calc must NOT inherit calcout's behaviour.
+/// calc's `special()` has no INP arm (`calcRecord.c:139-157`): the put posts
+/// nothing on B.
 #[epics_macros_rs::epics_test]
-async fn calc_put_to_a_constant_inp_does_not_reseed() {
-    let db = PvDatabase::new();
-    let mut c = CalcRecord::new("A+B");
-    c.put_field("INPA", EpicsValue::String("1".into())).unwrap();
-    c.put_field("INPB", EpicsValue::String("2".into())).unwrap();
-    db.add_record("C1", Box::new(c)).await.unwrap();
-
-    put(&db, "C1", "INPB", "7").await;
-
-    assert_eq!(field(&db, "C1", "B").await, EpicsValue::Double(2.0));
-    process(&db, "C1").await;
-    assert_eq!(field(&db, "C1", "VAL").await, EpicsValue::Double(3.0));
+async fn calc_put_of_a_constant_inp_posts_nothing() {
+    softioc_pin("calc_inp_put").await;
 }
 
 /// sCalcout: the NUMERIC input re-seeds (C `sCalcoutRecord.c:514-516`), the
@@ -228,5 +238,34 @@ async fn transform_put_to_a_constant_inp_reseeds_and_posts_value_log() {
 
     assert_eq!(field(&db, "T", "B").await, EpicsValue::Double(7.0));
     let event = b_rx.try_recv().expect("the re-seed must post B");
-    assert_eq!(event.snapshot.value, EpicsValue::Double(7.0));
+    assert_eq!(
+        event.value().as_value().cloned().unwrap(),
+        EpicsValue::Double(7.0)
+    );
+}
+
+/// The value post follows the link the put left, as C's `plink->type ==
+/// CONSTANT` does: an empty link posts B as it stands, a PV link posts
+/// nothing, and a constant after the PV link posts again.
+#[epics_macros_rs::epics_test]
+async fn transform_reseed_post_follows_the_link_the_put_left() {
+    use epics_base_rs::server::records::transform::TransformRecord;
+
+    let db = PvDatabase::new();
+    db.add_record("T", Box::new(TransformRecord::default()))
+        .await
+        .unwrap();
+    let inst = db.get_record("T").unwrap();
+    let mut b_rx = inst
+        .write()
+        .add_subscriber("B", 1, DbFieldType::Double, EventMask::VALUE.bits())
+        .unwrap();
+    for text in ["7", "", "T.A", "3"] {
+        put(&db, "T", "INPB", text).await;
+    }
+    let mut got = Vec::new();
+    while let Ok(ev) = b_rx.try_recv() {
+        got.push(ev.value().as_value().cloned().unwrap().to_f64().unwrap());
+    }
+    assert_eq!(got, [7.0, 7.0, 3.0]);
 }

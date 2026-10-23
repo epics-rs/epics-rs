@@ -80,6 +80,19 @@ impl fmt::Display for ExceptionCode {
     }
 }
 
+/// The asyn status an octet-port failure other than a timeout returned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IoStatus {
+    /// `asynError`.
+    Error,
+    /// `asynOverflow`.
+    Overflow,
+    /// `asynDisconnected`.
+    Disconnected,
+    /// `asynDisabled`.
+    Disabled,
+}
+
 /// Errors produced by the Modbus protocol, framing, and driver layers.
 #[derive(Debug, thiserror::Error)]
 pub enum ModbusError {
@@ -103,6 +116,16 @@ pub enum ModbusError {
     /// A response frame carried a byte count inconsistent with the request.
     #[error("malformed response: {0}")]
     MalformedResponse(String),
+
+    /// A read reply carried a word (or, for Report Slave ID, byte) count other
+    /// than the request's.
+    #[error("expected {expected} words, actually received {received}")]
+    WordCount {
+        /// Count the request asked for.
+        expected: usize,
+        /// Count the reply carried.
+        received: usize,
+    },
 
     /// RTU CRC-16 check failed.
     #[error("RTU CRC check failed")]
@@ -149,9 +172,10 @@ pub enum ModbusError {
     #[error("poll cycle is not valid on an absolute-addressing port")]
     PollNotValidInAbsoluteMode,
 
-    /// I/O error from the underlying asyn octet port.
-    #[error("octet I/O error: {0}")]
-    Io(String),
+    /// I/O error from the underlying asyn octet port, with the status it
+    /// returned: C `doModbusIO` hands `writeRead`'s status to the records.
+    #[error("octet I/O error: {1}")]
+    Io(IoStatus, String),
 
     /// The driver timed out waiting for a response.
     #[error("Modbus I/O timed out")]

@@ -15,6 +15,8 @@
 
 use std::time::{Duration, Instant};
 
+use epics_libcom_rs::cfmt::CFloat;
+
 use windows_sys::Win32::Devices::Communication::{
     COMMTIMEOUTS, ClearCommBreak, DCB, EVENPARITY, GetCommState, NOPARITY, ODDPARITY, ONESTOPBIT,
     PURGE_RXCLEAR, PurgeComm, SetCommBreak, SetCommState, SetCommTimeouts, TWOSTOPBITS,
@@ -28,16 +30,17 @@ use windows_sys::Win32::Storage::FileSystem::{
 
 use crate::error::{AsynError, AsynResult, AsynStatus};
 use crate::interpose::{EomReason, OctetNext, OctetReadResult};
-use crate::port::{PortDriver, PortDriverBase, PortFlags};
+use crate::port::{InterfaceMask, PortDriver, PortDriverBase, PortFlags};
 use crate::trace::TraceMask;
 use crate::user::AsynUser;
-use crate::{asyn_trace, asyn_trace_io};
 
 use super::option_parse::{
     bad_number, break_action, option_key, option_value, parse_yn_option, sscanf_int,
 };
-use super::serial_config::{DataBits, FlowControl, Parity, SerialConfig, StopBits};
-use super::wait_millis;
+use super::serial_config::{
+    DataBits, FlowControl, Parity, SerialConfig, StopBits, win32_device_name,
+};
+use super::{last_error_code, transfer_failure, wait_millis};
 
 // --- DCB bitfield helpers ---
 //
@@ -82,20 +85,9 @@ mod dcb_bits {
     }
 }
 
-/// Build the wide (UTF-16, NUL-terminated) device name Win32 `CreateFileW`
-/// wants. C `drvAsynSerialPortConfigure` prepends `\\.\` unless the caller
-/// already gave a `\\.\`-prefixed device name (needed to reach `COM10` and
-/// above). Mirror that exactly.
+/// The wide (UTF-16, NUL-terminated) device name Win32 `CreateFileW` wants.
 fn device_to_wide(device: &str) -> Vec<u16> {
-    const PREFIX: &[u8] = br"\\.\";
-    let already_prefixed = device.len() >= PREFIX.len()
-        && device.as_bytes()[..PREFIX.len()].eq_ignore_ascii_case(PREFIX);
-    let full = if already_prefixed {
-        device.to_string()
-    } else {
-        format!(r"\\.\{device}")
-    };
-    full.encode_utf16().chain(std::iter::once(0)).collect()
+    device.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
 /// Apply the configured line state (baud/bits/parity/stop/flow) to a `DCB`.
@@ -243,8 +235,9 @@ impl SerialIoStateWin32 {
     /// `SetCommTimeouts` policy. `timeout == 0` returns immediately with
     /// whatever is already buffered; `timeout > 0` bounds the total read/write
     /// by that many milliseconds; `None` — C's negative timeout — waits for the
-    /// device with no bound at all.
-    fn apply_timeouts(&mut self, handle: HANDLE, timeout: Option<Duration>) -> AsynResult<()> {
+    /// device with no bound at all. The driver words a refusal
+    /// ([`DrvAsynSerialPort::set_comm_timeouts`]).
+    fn apply_timeouts(&mut self, handle: HANDLE, timeout: Option<Duration>) -> std::io::Result<()> {
         if self.last_timeout == Some(timeout) {
             return Ok(());
         }
@@ -290,26 +283,16 @@ impl SerialIoStateWin32 {
             }
         }
         if unsafe { SetCommTimeouts(handle, &ct) } == 0 {
-            return Err(io_err());
+            return Err(std::io::Error::last_os_error());
         }
         self.last_timeout = Some(timeout);
         Ok(())
     }
 }
 
-impl OctetNext for SerialIoStateWin32 {
-    fn read(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<OctetReadResult> {
+impl SerialIoStateWin32 {
+    fn recv(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<(usize, EomReason)> {
         let handle = self.handle_or_err()?;
-        // C readIt (drvAsynSerialPortWin32.c): reject maxchars == 0 before
-        // touching the device (same wording as the serial driver).
-        if buf.is_empty() {
-            return Err(AsynError::Status {
-                status: AsynStatus::Error,
-                message: "maxchars 0 Why <=0?".into(),
-            });
-        }
-        self.apply_timeouts(handle, user.timeout)?;
-
         let want = buf.len().min(u32::MAX as usize) as u32;
         let mut n_read: u32 = 0;
         let ok = unsafe {
@@ -324,28 +307,33 @@ impl OctetNext for SerialIoStateWin32 {
         if ok == 0 {
             // A broken device surfaces as a ReadFile error rather than a
             // 0-byte return, but C-Win32 readIt reports it with the handle
-            // still open — see `io_read_octet_eom` for why this backend does
+            // still open — see `io_read_octet` for why this backend does
             // not tear down on a failed read.
             return Err(io_err());
         }
         if n_read == 0 {
             // The comm timeout elapsed with no data. Unlike POSIX read()==0
             // (EOF/hangup) this is a timeout, so the connection stays open.
+            // C sets asynTimeout and no errorMessage (:643-644).
             return Err(AsynError::Status {
                 status: AsynStatus::Timeout,
-                message: "serial read timeout".into(),
+                message: String::new(),
             });
         }
         self.n_read += n_read as u64;
-        Ok(OctetReadResult {
-            nbytes_transferred: n_read as usize,
-            // C parity: CNT only when the requested count was reached.
-            eom_reason: if n_read as usize >= buf.len() {
-                EomReason::CNT
-            } else {
-                EomReason::empty()
-            },
-        })
+        // C parity: CNT only when the requested count was reached.
+        let eom = if n_read as usize >= buf.len() {
+            EomReason::CNT
+        } else {
+            EomReason::empty()
+        };
+        Ok((n_read as usize, eom))
+    }
+}
+
+impl OctetNext for SerialIoStateWin32 {
+    fn read(&mut self, user: &AsynUser, buf: &mut [u8]) -> OctetReadResult {
+        self.recv(user, buf).into()
     }
 
     fn write(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
@@ -354,7 +342,6 @@ impl OctetNext for SerialIoStateWin32 {
         if data.is_empty() {
             return Ok(0);
         }
-        self.apply_timeouts(handle, user.timeout)?;
 
         // Bound the TOTAL write by one deadline (matching the unix backend and
         // C writeIt's single pre-loop timer), while WriteFile's own comm
@@ -389,11 +376,12 @@ impl OctetNext for SerialIoStateWin32 {
                 break;
             }
             // WriteFile returned fewer than requested → its comm timeout fired,
-            // or the deadline passed. C writeIt breaks with asynTimeout here.
+            // or the deadline passed. C writeIt breaks with asynTimeout here and
+            // sets no errorMessage (:533-536).
             if n_written == 0 || deadline.is_some_and(|d| Instant::now() >= d) {
                 return Err(AsynError::Status {
                     status: AsynStatus::Timeout,
-                    message: "serial write timeout".into(),
+                    message: String::new(),
                 }
                 .with_partial_write(total));
             }
@@ -402,19 +390,6 @@ impl OctetNext for SerialIoStateWin32 {
     }
 
     fn flush(&mut self, _user: &mut AsynUser) -> AsynResult<()> {
-        // C-Win32 `flushIt` opens on the same `commHandle ==
-        // INVALID_HANDLE_VALUE` test as `getOption` (:97), `setOption` (:178),
-        // `writeIt` (:494) and `readIt` (:566), and REFUSES the flush
-        // (`drvAsynSerialPortWin32.c:668-672`) rather than reporting success
-        // over a device that is not there. Taking the same
-        // `handle_or_err` as `read` and `write` above is what keeps the closed
-        // handle from meaning "nothing to flush" here and "refuse" everywhere
-        // else on the same port.
-        //
-        // This does NOT hold for the POSIX backend and must not be flattened
-        // onto it: `drvAsynSerialPort.c::flushIt` (:986-1001) is
-        // `if (tty->fd >= 0) tcflush(...)` and always returns `asynSuccess`.
-        // The asymmetry between C's two device files is C's own.
         let handle = self.handle_or_err()?;
         // PurgeComm(PURGE_RXCLEAR) discards received-but-unread input — the
         // Win32 analogue of tcflush(TCIFLUSH).
@@ -456,8 +431,14 @@ pub struct DrvAsynSerialPort {
 impl DrvAsynSerialPort {
     /// Close the handle and mark the port disconnected so the actor's
     /// auto-reconnect re-opens it on the next request (C `closeConnection`).
-    fn drop_connection(&mut self) {
+    fn drop_connection(&mut self, user: &AsynUser) {
         if let Some(v) = self.io.handle_val.take() {
+            user.print(
+                TraceMask::FLOW,
+                file!(),
+                line!(),
+                format_args!("Close {} connection.\n", self.config.device),
+            );
             unsafe { CloseHandle(v as HANDLE) };
         }
         self.io.last_timeout = None;
@@ -467,8 +448,8 @@ impl DrvAsynSerialPort {
     /// Create a new serial port driver. Starts disconnected with
     /// `auto_connect = true` and `can_block = true`.
     pub fn new(port_name: &str, config_str: &str) -> AsynResult<Self> {
-        let config = SerialConfig::parse(config_str)?;
-        let mut base = PortDriverBase::new(
+        let config = SerialConfig::new(&win32_device_name(config_str));
+        let mut base = PortDriverBase::new_exact_flags(
             port_name,
             1,
             PortFlags {
@@ -476,9 +457,11 @@ impl DrvAsynSerialPort {
                 can_block: true,
                 ..PortFlags::default()
             },
+            // asynCommon, asynOption and asynOctet (drvAsynSerialPortWin32.c:768-799).
+            InterfaceMask::COMMON | InterfaceMask::OPTION | InterfaceMask::OCTET,
+            InterfaceMask::OCTET,
         );
-        base.init_connected(false);
-        base.auto_connect = true;
+        base.init_auto_connect(true);
         // C passes `interruptProcess = 1` to `pasynOctetBase->initialize`
         // (drvAsynSerialPortWin32.c:798-799): every successful octet read on this port fans out to
         // its octet interrupt users, which is what drives a SCAN="I/O Intr"
@@ -504,7 +487,7 @@ impl DrvAsynSerialPort {
     ) -> AsynResult<Self> {
         let mut driver = Self::new(port_name, config_str)?;
         if no_auto_connect {
-            driver.base.auto_connect = false;
+            driver.base.init_auto_connect(false);
         }
         if !no_process_eos {
             driver.install_interpose(Box::new(crate::interpose::eos::EosInterpose::default()));
@@ -548,15 +531,18 @@ impl DrvAsynSerialPort {
         Ok(())
     }
 
-    /// The disconnected gate both option entry points open with. C-Win32
-    /// `getOption` (`drvAsynSerialPortWin32.c:96-101`) and `setOption`
-    /// (`:180-185`) test `commHandle == INVALID_HANDLE_VALUE` *before* they
-    /// look at the key, so on a closed port EVERY key — baud/bits/parity/stop/
-    /// break as well as the flow-control set — reports `asynError` with the
-    /// message `"<device> disconnected:"`, and no key may be cached, defaulted
-    /// or stored. Calling this first is what makes "the handle is open" an
-    /// invariant for the rest of both functions rather than a per-key check.
-    fn check_option_connected(&self) -> AsynResult<()> {
+    /// The closed-handle gate all five entry points open with: C-Win32
+    /// `getOption`, `setOption`, `writeIt`, `readIt` and `flushIt` each test
+    /// `commHandle == INVALID_HANDLE_VALUE` first and answer asynError
+    /// `"<device> disconnected:"` (drvAsynSerialPortWin32.c:97-101, :178-182,
+    /// :494-498, :566-570, :668-672). They ask the handle, not the manager:
+    /// the enabled/connected gate is `queueRequest`'s.
+    ///
+    /// So on a closed port every option key is refused before it is looked
+    /// at, and a flush is refused rather than reported done — unlike the
+    /// POSIX twin, whose `flushIt` is `if (tty->fd >= 0) tcflush(...)` and
+    /// always succeeds (drvAsynSerialPort.c:986-1001).
+    fn require_handle(&self) -> AsynResult<()> {
         if self.io.handle_val.is_none() {
             return Err(AsynError::Status {
                 status: AsynStatus::Error,
@@ -567,17 +553,25 @@ impl DrvAsynSerialPort {
     }
 
     /// Read the device's DCB — used once per port, to seed [`Self::dcb`].
-    fn read_dcb(handle: HANDLE) -> AsynResult<DCB> {
+    /// A refusal is worded as C's `GetCommConfig` one, the read C makes on
+    /// every option call instead (drvAsynSerialPortWin32.c:102-107).
+    fn read_dcb(handle: HANDLE, device: &str) -> AsynResult<DCB> {
         let mut dcb: DCB = unsafe { std::mem::zeroed() };
         dcb.DCBlength = std::mem::size_of::<DCB>() as u32;
         if unsafe { GetCommState(handle, &mut dcb) } == 0 {
-            return Err(io_err());
+            return Err(AsynError::Status {
+                status: AsynStatus::Error,
+                message: format!(
+                    "{device} error calling GetCommConfig {}",
+                    last_error_code(&std::io::Error::last_os_error())
+                ),
+            });
         }
         Ok(dcb)
     }
 
     /// The cache, which both option entry points may assume exists because
-    /// their shared `check_option_connected` guard has already run.
+    /// their shared `require_handle` guard has already run.
     fn dcb_or_err(&self) -> AsynResult<&DCB> {
         self.dcb.as_ref().ok_or_else(|| AsynError::Status {
             status: AsynStatus::Error,
@@ -586,14 +580,41 @@ impl DrvAsynSerialPort {
     }
 
     /// Push the cache to the device — the Win32 twin of the POSIX backend's
-    /// `apply_options`, and the only place the cache reaches the line.
+    /// `apply_options`, and the only place the cache reaches the line. A
+    /// refusal reads as C's (drvAsynSerialPortWin32.c:345-351).
     fn apply_options(&self) -> AsynResult<()> {
         let handle = self.io.handle_or_err()?;
         let dcb = self.dcb_or_err()?;
         if unsafe { SetCommState(handle, dcb) } == 0 {
-            return Err(io_err());
+            return Err(AsynError::Status {
+                status: AsynStatus::Error,
+                message: format!(
+                    "{} error calling SetCommConfig {}",
+                    self.config.device,
+                    last_error_code(&std::io::Error::last_os_error())
+                ),
+            });
         }
         Ok(())
+    }
+
+    /// Program the request's timeout. C readIt answers a `SetCommTimeouts`
+    /// refusal with asynError and the link left open
+    /// (drvAsynSerialPortWin32.c:593-599). C never programs a negative
+    /// timeout (:577); this backend does (`apply_timeouts`), and prints it as -1.
+    fn set_comm_timeouts(&mut self, timeout: Option<Duration>) -> AsynResult<()> {
+        let handle = self.io.handle_or_err()?;
+        self.io
+            .apply_timeouts(handle, timeout)
+            .map_err(|e| AsynError::Status {
+                status: AsynStatus::Error,
+                message: format!(
+                    "Can't set \"{}\" timeout: {}, error={}",
+                    self.config.device,
+                    CFloat(timeout.map_or(-1.0, |t| t.as_secs_f64())),
+                    last_error_code(&e)
+                ),
+            })
     }
 
     /// Mutate the cache and push it, the single owner of a DCB update used by
@@ -630,21 +651,21 @@ impl PortDriver for DrvAsynSerialPort {
         &mut self.base
     }
 
-    /// C drvAsynSerialPortWin32 registers the same set as the POSIX serial
-    /// driver: asynCommon, asynOption, asynOctet.
-    fn capabilities(&self) -> Vec<crate::interfaces::Capability> {
-        crate::interfaces::octet_transport_capabilities()
-    }
-
-    fn connect(&mut self, _user: &AsynUser) -> AsynResult<()> {
+    fn connect(&mut self, user: &AsynUser) -> AsynResult<()> {
         // C connectIt: reject a connect on an already-open link rather than
         // leaking the first handle.
         if self.io.handle_val.is_some() {
             return Err(AsynError::Status {
                 status: AsynStatus::Error,
-                message: format!("{}: Link already open!", self.base.port_name),
+                message: format!("{}: Link already open!", self.config.device),
             });
         }
+        user.print(
+            TraceMask::FLOW,
+            file!(),
+            line!(),
+            format_args!("Open connection to {}\n", self.config.device),
+        );
 
         let wide = device_to_wide(&self.config.device);
         let handle = unsafe {
@@ -659,7 +680,17 @@ impl PortDriver for DrvAsynSerialPort {
             )
         };
         if handle == INVALID_HANDLE_VALUE {
-            return Err(io_err());
+            // C formats `strerror(errno)` here (drvAsynSerialPortWin32.c:437-441),
+            // but CreateFile sets GetLastError, not errno; the reason is that.
+            let e = std::io::Error::last_os_error();
+            return Err(AsynError::Status {
+                status: AsynStatus::Error,
+                message: format!(
+                    "{} Can't open  {}",
+                    self.config.device,
+                    super::errno_text(&e)
+                ),
+            });
         }
         self.io.handle_val = Some(handle as isize);
         self.io.last_timeout = None;
@@ -673,8 +704,14 @@ impl PortDriver for DrvAsynSerialPort {
         let setup = (|| -> AsynResult<()> {
             // Clear a BREAK possibly left asserted by a prior ioc termination.
             unsafe { ClearCommBreak(handle) };
+            // C returns a bare asynError here and keeps the handle open, so
+            // every later connect fails "Link already open!" (:449-450). The
+            // close below is not copied from C; the empty text is.
             if unsafe { FlushFileBuffers(handle) } == 0 {
-                return Err(io_err());
+                return Err(AsynError::Status {
+                    status: AsynStatus::Error,
+                    message: String::new(),
+                });
             }
             // Apply the configured line state at connect (like the POSIX
             // backend), rather than leaving the DCB at its open default and
@@ -684,7 +721,7 @@ impl PortDriver for DrvAsynSerialPort {
             // seeds the cache. Every later connect pushes the cache unchanged,
             // which is what lets an option the spec cannot express survive a
             // reconnect.
-            let device = Self::read_dcb(handle)?;
+            let device = Self::read_dcb(handle, &self.config.device)?;
             self.dcb = Some(line_state_for_connect(self.dcb, device, &self.config));
             self.apply_options()?;
             // Discard bytes buffered before the port was configured, so the
@@ -698,34 +735,28 @@ impl PortDriver for DrvAsynSerialPort {
             return Err(e);
         }
 
+        user.print(
+            TraceMask::FLOW,
+            file!(),
+            line!(),
+            format_args!("Opened connection to {}\n", self.config.device),
+        );
         self.base.set_connected(true);
-        asyn_trace!(
-            Some(self.base.trace),
-            &self.base.port_name,
-            TraceMask::FLOW,
-            "connected to {} at {} baud",
-            self.config.device,
-            self.dcb.map(|d| d.BaudRate).unwrap_or(self.config.baud)
-        );
         Ok(())
     }
 
-    fn disconnect(&mut self, _user: &AsynUser) -> AsynResult<()> {
-        asyn_trace!(
-            Some(self.base.trace),
-            &self.base.port_name,
+    fn disconnect(&mut self, user: &AsynUser) -> AsynResult<()> {
+        user.print(
             TraceMask::FLOW,
-            "disconnect"
+            file!(),
+            line!(),
+            format_args!("{} disconnect\n", self.config.device),
         );
-        if let Some(v) = self.io.handle_val.take() {
-            unsafe { CloseHandle(v as HANDLE) };
-        }
-        self.io.last_timeout = None;
-        self.base.set_connected(false);
+        self.drop_connection(user);
         Ok(())
     }
 
-    fn report(&self, out: &mut dyn std::fmt::Write, level: i32) {
+    fn report(&mut self, out: &mut dyn std::fmt::Write, level: i32) {
         use std::fmt::Write as _;
         let _ = writeln!(
             out,
@@ -740,25 +771,18 @@ impl PortDriver for DrvAsynSerialPort {
         if level >= 1 {
             let _ = writeln!(
                 out,
-                "                commHandle: {:?}",
+                "            commHandle: {:?}",
                 self.io.handle().unwrap_or(std::ptr::null_mut())
             );
             let _ = writeln!(out, "    Characters written: {}", self.io.n_written);
             let _ = writeln!(out, "       Characters read: {}", self.io.n_read);
-            // The level is passed through, as C's `asynPortDriver::report`
-            // passes it to `reportParams` (asynPortDriver.cpp:3693).
-            self.base.report_params(out, level);
         }
-    }
-
-    fn read_octet(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
-        self.io_read_octet_eom(user, buf).map(|(n, _eom)| n)
     }
 
     /// The raw device read — the **bottom** of the port's octet chain, C
     /// `drvAsynSerialPortWin32.c::readIt` below the interposes the manager
     /// installed on top of it. The chain is run by the port
-    /// ([`crate::port::octet_read_chain`]), not from here.
+    /// (`crate::port::octet_read_chain`), not from here.
     ///
     /// A failed read leaves the handle open. C-Win32 `readIt` reaches no
     /// `closeConnection` on any exit — the file has exactly two call sites,
@@ -770,55 +794,118 @@ impl PortDriver for DrvAsynSerialPort {
     /// twin sees those as a short `read()` and reserves its errno branch for a
     /// dead device, which is why it does close on both directions
     /// (`drvAsynSerialPort.c:959`).
-    fn io_read_octet_eom(
-        &mut self,
-        user: &AsynUser,
-        buf: &mut [u8],
-    ) -> AsynResult<(usize, EomReason)> {
-        self.base.check_ready()?;
-        let result = self.io.read(user, buf)?;
-        asyn_trace_io!(
-            Some(self.base.trace),
-            &self.base.port_name,
-            TraceMask::IO_DRIVER,
-            &buf[..result.nbytes_transferred],
-            "read"
+    fn io_read_octet(&mut self, user: &AsynUser, buf: &mut [u8]) -> OctetReadResult {
+        user.print(
+            TraceMask::FLOW,
+            file!(),
+            line!(),
+            format_args!("{} read.\n", self.config.device),
         );
-        Ok((result.nbytes_transferred, result.eom_reason))
+        if let Err(e) = self.require_handle() {
+            return OctetReadResult::failed(e);
+        }
+        if buf.is_empty() {
+            return OctetReadResult::failed(AsynError::Status {
+                status: AsynStatus::Error,
+                message: format!("{} maxchars 0 Why <=0?", self.config.device),
+            });
+        }
+        if let Err(e) = self.set_comm_timeouts(user.timeout) {
+            return OctetReadResult::failed(e);
+        }
+        let mut result = self.io.read(user, buf);
+        result.status = result
+            .status
+            .map_err(|e| transfer_failure(e, &self.config.device, "read", last_error_code));
+        let n_read = result.nbytes_transferred;
+        if n_read > 0 {
+            let label = format!("{} read {n_read}\n", self.config.device);
+            user.print_io(
+                TraceMask::IO_DRIVER,
+                &buf[..n_read],
+                &label,
+                file!(),
+                line!(),
+            );
+        }
+        // C's closing line prints the status as its int (:651-652), on every
+        // exit but the refusals before the loop.
+        let status = result
+            .status
+            .as_ref()
+            .map_or_else(|e| e.status(), |()| AsynStatus::Success);
+        user.print(
+            TraceMask::FLOW,
+            file!(),
+            line!(),
+            format_args!(
+                "{} read {n_read}, return {}\n",
+                self.config.device, status as i32
+            ),
+        );
+        result
     }
 
     fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
-        self.base.check_ready()?;
-        asyn_trace_io!(
-            Some(self.base.trace),
-            &self.base.port_name,
-            TraceMask::IO_DRIVER,
-            data,
-            "write"
+        user.print(
+            TraceMask::FLOW,
+            file!(),
+            line!(),
+            format_args!("{} write.\n", self.config.device),
         );
-        match self.io.write(user, data) {
-            Ok(n) => Ok(n),
-            Err(e) => {
-                if e.is_fatal_transport() && self.base.is_connected() {
-                    asyn_trace!(
-                        Some(self.base.trace),
-                        &self.base.port_name,
-                        TraceMask::FLOW,
-                        "write error, disconnecting: {e}"
-                    );
-                    self.drop_connection();
-                }
-                Err(e)
-            }
+        let label = format!("{} write {}\n", self.config.device, data.len());
+        user.print_io(TraceMask::IO_DRIVER, data, &label, file!(), line!());
+        self.require_handle()?;
+        // C returns before the loop, and its closing line (:499-502).
+        if data.is_empty() {
+            return Ok(0);
         }
+        self.set_comm_timeouts(user.timeout)?;
+        let result = self.io.write(user, data).map_err(|e| {
+            // A failed WriteFile is the one place C closes (:519-526).
+            if e.is_fatal_transport() && self.base.is_connected() {
+                self.drop_connection(user);
+            }
+            transfer_failure(e, &self.config.device, "write", last_error_code)
+        });
+        let (sent, status) = match &result {
+            Ok(n) => (*n, AsynStatus::Success),
+            Err(e) => (e.partial_write().unwrap_or(0), e.status()),
+        };
+        user.print(
+            TraceMask::FLOW,
+            file!(),
+            line!(),
+            format_args!(
+                "wrote {sent} to {}, return {}\n",
+                self.config.device,
+                status.str_status()
+            ),
+        );
+        result
     }
 
     fn io_flush(&mut self, user: &mut AsynUser) -> AsynResult<()> {
-        self.io.flush(user)
+        user.print(
+            TraceMask::FLOW,
+            file!(),
+            line!(),
+            format_args!("{} flush\n", self.config.device),
+        );
+        self.require_handle()?;
+        self.io
+            .flush(user)
+            .map_err(|e| transfer_failure(e, &self.config.device, "flush", last_error_code))
     }
 
-    fn set_option(&mut self, _user: &mut AsynUser, key: &str, value: &str) -> AsynResult<()> {
+    fn set_option(&mut self, user: &mut AsynUser, key: &str, value: &str) -> AsynResult<()> {
         use dcb_bits::*;
+        user.print(
+            TraceMask::FLOW,
+            file!(),
+            line!(),
+            format_args!("{} setOption key {key} val {value}\n", self.base.port_name),
+        );
 
         // C-Win32 setOption's opening guard (drvAsynSerialPortWin32.c:178-182):
         // a closed handle errors for every key, before any value is parsed or
@@ -826,7 +913,7 @@ impl PortDriver for DrvAsynSerialPort {
         // termios whether or not the port is open (R7-48) — Win32 refuses the
         // key outright, so the cache below is only ever reached with the port
         // open.
-        self.check_option_connected()?;
+        self.require_handle()?;
 
         let key = option_key(key);
         // C-Win32 runs every option value through `epicsStrCaseCmp` too
@@ -960,14 +1047,23 @@ impl PortDriver for DrvAsynSerialPort {
                 // where the tests reach it without a COM port.
                 let action = break_action(value, self.io.break_active)?;
                 let handle = self.io.handle_or_err()?;
+                // C answers a refused SetCommBreak/ClearCommBreak with the
+                // sscanf text "Bad number" (:323-326, :331-335), which names a
+                // fault the value does not have. Not copied: the call is named.
+                let refused = |call: &str| AsynError::Status {
+                    status: AsynStatus::Error,
+                    message: format!(
+                        "{} {call} failed: {}",
+                        self.config.device,
+                        last_error_code(&std::io::Error::last_os_error())
+                    ),
+                };
                 if action.assert_break {
-                    // C: FlushFileBuffers before asserting the break so queued
-                    // data is transmitted first.
-                    if unsafe { FlushFileBuffers(handle) } == 0 {
-                        return Err(io_err());
-                    }
+                    // C flushes queued data out before the break and ignores
+                    // the flush's own result (:322).
+                    unsafe { FlushFileBuffers(handle) };
                     if unsafe { SetCommBreak(handle) } == 0 {
-                        return Err(io_err());
+                        return Err(refused("SetCommBreak"));
                     }
                     self.io.break_active = true;
                 }
@@ -976,7 +1072,7 @@ impl PortDriver for DrvAsynSerialPort {
                 }
                 if action.clear_break {
                     if unsafe { ClearCommBreak(handle) } == 0 {
-                        return Err(io_err());
+                        return Err(refused("ClearCommBreak"));
                     }
                     self.io.break_active = false;
                 }
@@ -997,13 +1093,13 @@ impl PortDriver for DrvAsynSerialPort {
         Ok(())
     }
 
-    fn get_option(&self, key: &str) -> AsynResult<String> {
+    fn get_option(&self, _user: &AsynUser, key: &str) -> AsynResult<String> {
         use dcb_bits::*;
 
         // C-Win32 getOption's opening guard (drvAsynSerialPortWin32.c:96-101):
         // a closed handle errors for every key before the key is inspected —
         // there is no disconnected readback, cached or defaulted.
-        self.check_option_connected()?;
+        self.require_handle()?;
 
         // Every key is answered from the cache, never by re-reading the line —
         // the POSIX backend's rule (`getOption` never calls `tcgetattr`), and
@@ -1043,12 +1139,7 @@ impl PortDriver for DrvAsynSerialPort {
             // `tty->break_active ? "on" : "off"`
             // (drvAsynSerialPortWin32.c:147-150).
             "break" => Ok(if self.io.break_active { "on" } else { "off" }.to_string()),
-            _ => self
-                .base
-                .options
-                .get(&key)
-                .cloned()
-                .ok_or_else(|| AsynError::OptionNotFound(key.clone())),
+            _ => Err(AsynError::OptionNotFound(key.clone())),
         }
     }
 }
@@ -1067,36 +1158,41 @@ impl Drop for DrvAsynSerialPort {
 mod tests {
     use super::*;
 
+    /// drvAsynSerialPortWin32.c:768-799: asynCommon, asynOption and asynOctet,
+    /// whose `interruptProcess = 1` makes asynOctet an interrupt source.
+    #[test]
+    fn the_port_registers_drv_asyn_serial_port_win32_s_interfaces() {
+        let drv = DrvAsynSerialPort::new("serial_masks", r"\\.\COM3").unwrap();
+        assert_eq!(
+            (drv.base().interface_mask(), drv.base().interrupt_mask()),
+            (
+                InterfaceMask::COMMON | InterfaceMask::OPTION | InterfaceMask::OCTET,
+                InterfaceMask::OCTET
+            )
+        );
+    }
+
     #[test]
     fn parse_extracts_device() {
-        let cfg = SerialConfig::parse(r"\\.\COM3").unwrap();
+        let cfg = SerialConfig::new(r"\\.\COM3");
         assert_eq!(cfg.device, r"\\.\COM3");
         assert_eq!(cfg.baud, 9600);
     }
 
+    /// The port keeps C's prefixed name (drvAsynSerialPortWin32.c:753-762) and
+    /// opens exactly that, NUL-terminated.
     #[test]
-    fn parse_rejects_empty() {
-        assert!(SerialConfig::parse("").is_err());
-        assert!(SerialConfig::parse("   ").is_err());
-    }
-
-    #[test]
-    fn device_to_wide_prepends_prefix_once() {
-        // A bare COM name gets the \\.\ prefix (needed for COM10+).
-        let w = device_to_wide("COM3");
-        let s = String::from_utf16(&w[..w.len() - 1]).unwrap();
-        assert_eq!(s, r"\\.\COM3");
+    fn the_port_keeps_and_opens_the_prefixed_name() {
+        let drv = DrvAsynSerialPort::new("s_name", "COM3").unwrap();
+        assert_eq!(drv.config.device, r"\\.\COM3");
+        let w = device_to_wide(&drv.config.device);
+        assert_eq!(String::from_utf16(&w[..w.len() - 1]).unwrap(), r"\\.\COM3");
         assert_eq!(*w.last().unwrap(), 0, "must be NUL-terminated");
-
-        // An already-prefixed name is left as-is (no double prefix).
-        let w2 = device_to_wide(r"\\.\COM10");
-        let s2 = String::from_utf16(&w2[..w2.len() - 1]).unwrap();
-        assert_eq!(s2, r"\\.\COM10");
     }
 
     #[test]
     fn apply_config_sets_dcb_fields() {
-        let mut cfg = SerialConfig::parse("COM1").unwrap();
+        let mut cfg = SerialConfig::new("COM1");
         cfg.baud = 115200;
         cfg.data_bits = DataBits::Seven;
         cfg.parity = Parity::Even;
@@ -1141,16 +1237,11 @@ mod tests {
         assert_eq!(drv.base().interpose_octet.len(), 0);
     }
 
-    /// C-Win32 `flushIt` (`drvAsynSerialPortWin32.c:668-672`) guards on the
-    /// closed handle exactly as the other four entry points do, so a flush over
-    /// an absent device is `asynError`, not success. The port used to fall
-    /// through to `Ok(())`, which made `TMOD=Flush` on a port whose `COM` device
-    /// is gone indistinguishable from a flush that really ran.
-    ///
-    /// Deliberately not mirrored in `serial_port.rs`: the POSIX C twin
-    /// (`drvAsynSerialPort.c:986-1001`) is lenient by design.
+    /// C-Win32 `readIt`, `writeIt` and `flushIt` refuse a closed handle with
+    /// asynError `"<device> disconnected:"` (drvAsynSerialPortWin32.c:566-570,
+    /// :494-498, :668-672) — a flush is refused, not reported done.
     #[test]
-    fn flush_on_a_closed_handle_is_refused() {
+    fn a_closed_handle_refuses_read_write_and_flush_in_cs_words() {
         let mut drv = DrvAsynSerialPort::new("s_flush_disc", "COM1").unwrap();
         assert!(
             drv.io.handle_val.is_none(),
@@ -1158,14 +1249,18 @@ mod tests {
         );
 
         let mut user = AsynUser::default();
-        let err = drv
-            .io_flush(&mut user)
-            .expect_err("a flush with no handle must not report success");
-        assert_eq!(err.status(), AsynStatus::Disconnected);
+        let mut buf = [0u8; 8];
+        let read = drv.io_read_octet(&user, &mut buf).status.unwrap_err();
+        let write = drv.write_octet(&mut user, b"x").unwrap_err();
+        let flush = drv.io_flush(&mut user).unwrap_err();
+        for e in [read, write, flush] {
+            assert_eq!(e.status(), AsynStatus::Error, "got {e:?}");
+            assert_eq!(e.message(), r"\\.\COM1 disconnected:");
+        }
     }
 
     /// R7-50: C-Win32 guards getOption AND setOption on the closed handle
-    /// (`drvAsynSerialPortWin32.c:96-101,180-185`) *before* the key is
+    /// (`drvAsynSerialPortWin32.c:96-101,178-182`) *before* the key is
     /// inspected, so every key — not just the flow-control subset — reports
     /// asynError "<device> disconnected:" while the port is closed, and no key
     /// may be stored to the cached config.
@@ -1181,7 +1276,7 @@ mod tests {
             "baud", "bits", "parity", "stop", "clocal", "crtscts", "ixon", "ixoff", "ixany",
             "break",
         ] {
-            match drv.get_option(key) {
+            match drv.get_option(&AsynUser::default(), key) {
                 Err(AsynError::Status { status, message }) => {
                     assert_eq!(status, AsynStatus::Error, "get_option({key}) status");
                     assert!(
@@ -1236,7 +1331,7 @@ mod tests {
     fn options_the_configure_string_cannot_express_survive_a_reconnect() {
         use dcb_bits::*;
 
-        let mut config = SerialConfig::parse("COM3").unwrap();
+        let mut config = SerialConfig::new("COM3");
         config.flow_control = FlowControl::Software;
 
         // First connect: the device's DCB with the configure string folded in.
@@ -1266,53 +1361,116 @@ mod tests {
         );
     }
 
+    /// Opens `path` as the port's handle, the way `connect` leaves it, with
+    /// the user's timeout marked as programmed: a disk file takes no
+    /// `COMMTIMEOUTS`, so the request then reaches `ReadFile`/`WriteFile`.
+    fn open_file_as_port(drv: &mut DrvAsynSerialPort, file: std::fs::File, user: &AsynUser) {
+        use std::os::windows::io::IntoRawHandle;
+        drv.io.handle_val = Some(file.into_raw_handle() as isize);
+        drv.io.last_timeout = Some(user.timeout);
+        drv.base.set_connected(true);
+    }
+
+    fn scratch_file(tag: &str) -> std::path::PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("asyn-serial-win32-{tag}-{}", std::process::id()));
+        std::fs::write(&path, b"").unwrap();
+        path
+    }
+
     /// C-Win32 `readIt` never closes the handle: the file's only two
     /// `closeConnection` call sites are the explicit disconnect
-    /// (`drvAsynSerialPortWin32.c:470`) and `writeIt` (`:525`), and `readIt`'s
-    /// `ReadFile` error branch at `:618-625` sets `errorMessage`, assigns
-    /// `asynError` and breaks. `writeIt` does close, so the two directions are asserted
-    /// together — the asymmetry is the point.
-    ///
-    /// The port publishes `connected` with no handle so the failure comes from
-    /// the device layer rather than from `check_ready`, which is the shape a
-    /// failing `ReadFile` has and needs no COM port.
+    /// (`drvAsynSerialPortWin32.c:470`) and `writeIt` (`:525`). A failed
+    /// `ReadFile` is `"%s read error: %ld"` with the port still connected
+    /// (:618-625); a failed `WriteFile` is `"%s write error: %ld"` and closes
+    /// (:519-526). Both are `ERROR_ACCESS_DENIED` (5) here: a write-only
+    /// handle refuses the read and a read-only one the write.
     #[test]
     fn a_failed_read_keeps_the_port_open_while_a_failed_write_closes_it() {
+        let path = scratch_file("rw");
         let mut drv = DrvAsynSerialPort::new("s_read_err", "COM1").unwrap();
-        drv.base.set_connected(true);
-        assert!(drv.io.handle_val.is_none());
+        let mut user = AsynUser::default();
 
-        let user = AsynUser::default();
+        let write_only = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        open_file_as_port(&mut drv, write_only, &user);
         let mut buf = [0u8; 8];
-        let err = drv
-            .io_read_octet_eom(&user, &mut buf)
-            .expect_err("a read with no handle must fail");
+        let err = drv.io_read_octet(&user, &mut buf).status.unwrap_err();
+        assert_eq!(err.status(), AsynStatus::Error, "got {err:?}");
+        assert_eq!(err.message(), r"\\.\COM1 read error: 5");
         assert!(
-            err.is_fatal_transport(),
-            "the branch under test only ever ran for a fatal error"
-        );
-        assert!(
-            drv.base.is_connected(),
+            drv.base.is_connected() && drv.io.handle_val.is_some(),
             "C-Win32 readIt reports the error with the port still connected"
         );
+        drv.disconnect(&user).unwrap();
 
-        // Still reaching the device rather than the base gate: the second read
-        // carries the device layer's message, not `port ... not connected`.
-        let again = drv
-            .io_read_octet_eom(&user, &mut buf)
-            .expect_err("a second read must still reach the device");
+        let read_only = std::fs::File::open(&path).unwrap();
+        open_file_as_port(&mut drv, read_only, &user);
+        let err = drv.write_octet(&mut user, b"x").unwrap_err();
+        assert_eq!(err.status(), AsynStatus::Error, "got {err:?}");
+        assert_eq!(err.message(), r"\\.\COM1 write error: 5");
+        assert_eq!(err.partial_write(), Some(0));
         assert!(
-            again.to_string().contains("serial port not open"),
-            "expected the device-layer refusal, got {again}"
-        );
-
-        // The write half keeps C's teardown (`:525`).
-        let mut wuser = AsynUser::default();
-        drv.write_octet(&mut wuser, b"x")
-            .expect_err("a write with no handle must fail");
-        assert!(
-            !drv.base.is_connected(),
+            !drv.base.is_connected() && drv.io.handle_val.is_none(),
             "C-Win32 writeIt closes the connection on a failed WriteFile"
         );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// C-Win32 `readIt` answers a read that saw no byte with asynTimeout and
+    /// no errorMessage (:643-644) — an empty file at EOF is such a read — and
+    /// refuses `maxchars == 0` with the device named (:571-575).
+    #[test]
+    fn a_timeout_sets_no_error_message() {
+        let path = scratch_file("eof");
+        let mut drv = DrvAsynSerialPort::new("s_timeout", "COM1").unwrap();
+        let user = AsynUser::default();
+        open_file_as_port(&mut drv, std::fs::File::open(&path).unwrap(), &user);
+
+        let mut buf = [0u8; 8];
+        let err = drv.io_read_octet(&user, &mut buf).status.unwrap_err();
+        assert_eq!(err.status(), AsynStatus::Timeout, "got {err:?}");
+        assert_eq!(err.message(), "");
+        assert!(drv.base.is_connected());
+
+        let err = drv.io_read_octet(&user, &mut []).status.unwrap_err();
+        assert_eq!(err.status(), AsynStatus::Error, "got {err:?}");
+        assert_eq!(err.message(), r"\\.\COM1 maxchars 0 Why <=0?");
+
+        drv.disconnect(&user).unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// C-Win32 words a refused `SetCommTimeouts` as `"Can't set \"%s\"
+    /// timeout: %f, error=%ld"` and a refused `PurgeComm` as `"%s flush
+    /// error: %ld"`, and neither closes the link (:593-599, :673-679). A disk
+    /// file refuses both.
+    #[test]
+    fn refused_comm_calls_keep_the_link_and_read_as_c() {
+        let path = scratch_file("comm");
+        let mut drv = DrvAsynSerialPort::new("s_comm", "COM1").unwrap();
+        let mut user = AsynUser::default();
+        open_file_as_port(&mut drv, std::fs::File::open(&path).unwrap(), &user);
+        drv.io.last_timeout = None;
+
+        let mut buf = [0u8; 8];
+        let err = drv.io_read_octet(&user, &mut buf).status.unwrap_err();
+        assert_eq!(err.status(), AsynStatus::Error, "got {err:?}");
+        let msg = err.message();
+        assert!(
+            msg.starts_with(r#"Can't set "\\.\COM1" timeout: 1.000000, error="#),
+            "got {msg}"
+        );
+        let err = drv.write_octet(&mut user, b"x").unwrap_err();
+        assert_eq!(err.message(), msg, "the write programs the same timeouts");
+        let err = drv.io_flush(&mut user).unwrap_err();
+        assert!(
+            err.message().starts_with(r"\\.\COM1 flush error: "),
+            "got {}",
+            err.message()
+        );
+        assert!(drv.base.is_connected() && drv.io.handle_val.is_some());
+
+        drv.disconnect(&user).unwrap();
+        let _ = std::fs::remove_file(&path);
     }
 }

@@ -23,6 +23,7 @@ use std::sync::{Arc, Mutex};
 
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
+use epics_base_rs::server::record::{DbLinkType, DevSup, Dset, register_device_row};
 
 fn listen() -> Arc<Mutex<Vec<String>>> {
     let heard = Arc::new(Mutex::new(Vec::new()));
@@ -38,7 +39,29 @@ fn heard(sink: &Arc<Mutex<Vec<String>>>) -> String {
     sink.lock().expect("sink").join("\n")
 }
 
+/// `device(<type>, INST_IO, devAsynInt32, "asynInt32")` loaded with no dset
+/// registered behind it: asyn's `.dbd` on an IOC that does not link asyn.
+static DECLARED_ONLY: [DevSup; 2] = [
+    DevSup {
+        name: "devAsynInt32",
+        choice: "asynInt32",
+        link_type: DbLinkType::Constant,
+        dset: Dset::new(6, &[], false),
+    },
+    DevSup {
+        name: "devNobody",
+        choice: "nobodyRegisteredThis",
+        link_type: DbLinkType::Constant,
+        dset: Dset::new(6, &[], false),
+    },
+];
+
 async fn ioc(db_text: &str) -> Arc<PvDatabase> {
+    for rtype in ["ai", "ao", "aai", "aao", "calc"] {
+        for row in &DECLARED_ONLY {
+            register_device_row(rtype, row);
+        }
+    }
     IocBuilder::new()
         .db_string(db_text, &HashMap::new())
         .unwrap()

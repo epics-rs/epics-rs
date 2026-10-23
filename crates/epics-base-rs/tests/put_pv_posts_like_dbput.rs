@@ -32,9 +32,13 @@
 //! `put_pv_and_post`.
 
 use epics_base_rs::server::database::PvDatabase;
+use std::sync::Arc;
+
 use epics_base_rs::server::event_queue::EventReader;
 use epics_base_rs::server::ioc_builder::IocBuilder;
+use epics_base_rs::server::pv::MonitorEvent;
 use epics_base_rs::server::recgbl::EventMask;
+use epics_base_rs::server::record::RecordCell;
 use epics_base_rs::types::{DbFieldType, EpicsValue};
 
 const DB: &str = r#"
@@ -53,17 +57,38 @@ async fn build() -> std::sync::Arc<PvDatabase> {
         .0
 }
 
-fn subscribe(db: &PvDatabase, rec: &str, field: &str, dbf: DbFieldType) -> EventReader {
-    let r = db.get_record(rec).unwrap();
-    let mut inst = r.write();
-    inst.add_subscriber(field, 1, dbf, EventMask::VALUE.bits())
-        .unwrap_or_else(|| panic!("{rec}.{field} subscription accepted"))
+/// A monitor and the field its client reads a by-reference log from.
+struct Mon {
+    rx: EventReader,
+    rec: Arc<RecordCell>,
+    field: String,
 }
 
-fn drain(rx: &mut EventReader) -> Vec<EpicsValue> {
+impl Mon {
+    fn try_recv(&mut self) -> Option<(EpicsValue, MonitorEvent)> {
+        let ev = self.rx.try_recv().ok()?;
+        let value = ev.delivered_value(&self.rec.read(), &self.field).unwrap();
+        Some((value, ev))
+    }
+}
+
+fn subscribe(db: &PvDatabase, rec: &str, field: &str, dbf: DbFieldType) -> Mon {
+    let r = db.get_record(rec).unwrap();
+    let rx = r
+        .write()
+        .add_subscriber(field, 1, dbf, EventMask::VALUE.bits())
+        .unwrap_or_else(|_| panic!("{rec}.{field} subscription accepted"));
+    Mon {
+        rx,
+        rec: r,
+        field: field.to_string(),
+    }
+}
+
+fn drain(rx: &mut Mon) -> Vec<EpicsValue> {
     let mut out = Vec::new();
-    while let Ok(ev) = rx.try_recv() {
-        out.push(ev.snapshot.value.clone());
+    while let Some((value, _)) = rx.try_recv() {
+        out.push(value);
     }
     out
 }

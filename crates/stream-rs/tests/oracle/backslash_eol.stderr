@@ -1,0 +1,4 @@
+_main_ backslash_eol.proto line 2: Backslash at end of line: "abc\
+_main_ backslash_eol.proto line 2: after command 'out'
+_main_ backslash_eol.proto line 1: in protocol 'p'
+_main_ while reading protocol 'p' for 'rec0'

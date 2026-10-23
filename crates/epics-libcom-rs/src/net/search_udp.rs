@@ -14,8 +14,8 @@
 //! the address list, not through a socket per NIC — the per-NIC bundle is an
 //! epics-rs elaboration over libca that buys accurate `RecvMeta.iface_ip` and
 //! a `255.255.255.255` fanout. Neither is a parity requirement, and neither is
-//! reachable on the embedded targets anyway: `tokio::net`, `socket2` and
-//! `if-addrs` build for none of them.
+//! reachable on the embedded targets anyway: `tokio::net` and `socket2`
+//! build for neither of them.
 //!
 //! The one thing the bundle bought that the target still needs is *reaching
 //! every subnet's broadcast address*. That comes from
@@ -39,7 +39,7 @@
 //! One thread per search engine, and a CA client has one.
 
 use std::io;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 
 /// One received SEARCH datagram, and what the receiving path knows about it.
 ///
@@ -63,6 +63,12 @@ pub struct SearchDatagram {
     /// datagram's drop counter is not per-NIC attributable" rather than
     /// naming a NIC the platform never told us about.
     pub iface_ip: Option<Ipv4Addr>,
+    /// The v4 address the datagram was sent to and the index of the interface
+    /// it arrived on (0: not reported), when the receive path reports them
+    /// (`IP_PKTINFO`, or the bound address of the per-NIC bundle's socket):
+    /// pvxs's `origDest` and `dstif`, which decide a forward. `None` on the
+    /// embedded targets' plain `recv_from` and on v6.
+    pub pktinfo: Option<(Ipv4Addr, u32)>,
     /// The receiving NIC's kernel drop counter (`SO_RXQ_OVFL`), or 0 where the
     /// platform has no such counter.
     pub drops: u32,
@@ -86,33 +92,6 @@ impl SearchUdpSocket {
         pump_priority: crate::runtime::task::ThreadPriority,
     ) -> io::Result<Self> {
         sys::Sock::bind_ephemeral(broadcast, pump_name, pump_priority).map(Self)
-    }
-
-    /// Bind a **beacon listener** on a fixed port, alongside whatever server
-    /// already holds it.
-    ///
-    /// Separate constructor rather than a port argument on
-    /// [`Self::bind_ephemeral`], because the two differ in more than the port:
-    /// a listener on a well-known port must share it (`SO_REUSEADDR` +
-    /// `SO_REUSEPORT`), and it is the only shape that has multicast groups to
-    /// join afterwards. pvxs binds this one wildcard
-    /// (`udp_collector.cpp:140`) so multicast reaches it, and receives
-    /// multicast only for groups explicitly joined via
-    /// [`Self::join_multicast_v4`].
-    pub fn bind_beacon(
-        port: u16,
-        pump_name: &str,
-        pump_priority: crate::runtime::task::ThreadPriority,
-    ) -> io::Result<Self> {
-        sys::Sock::bind_beacon(port, pump_name, pump_priority).map(Self)
-    }
-
-    /// Join an IPv4 multicast group on `iface` (`IP_ADD_MEMBERSHIP`).
-    ///
-    /// `iface` is `0.0.0.0` to let the routing table choose, which is what a
-    /// single wildcard socket has to do.
-    pub fn join_multicast_v4(&self, group: Ipv4Addr, iface: Ipv4Addr) -> io::Result<()> {
-        self.0.join_multicast_v4(group, iface)
     }
 
     /// `SO_RCVBUF`. Best-effort on every platform: a kernel is free to clamp.
@@ -168,6 +147,60 @@ impl SearchUdpSocket {
     ) -> io::Result<usize> {
         self.0.fanout_to(buf, dest, ifaces).await
     }
+
+    /// One send to a multicast group, pvxs `mcast_prep_sendto` then `sendto`
+    /// (`client.cpp:1182-1194`): `ttl` and the egress `iface` of the
+    /// endpoint, `0.0.0.0` leaving the choice to the routing table.
+    pub async fn send_multicast_v4(
+        &self,
+        buf: &[u8],
+        dest: SocketAddrV4,
+        ttl: u32,
+        iface: Ipv4Addr,
+    ) -> io::Result<usize> {
+        self.0.send_multicast_v4(buf, dest, ttl, iface).await
+    }
+}
+
+/// A client's IPv4 beacon listener: **one wildcard socket** on a fixed port,
+/// on every target.
+///
+/// pvxs's `UDPCollector` (`udp_collector.cpp:124-151`): bound to the
+/// wildcard because only a wildcard (or group) bound socket receives a
+/// joined group's datagrams, and shared with whatever server holds the port
+/// (`SO_REUSEADDR` + `SO_REUSEPORT`). Its own type rather than a
+/// [`SearchUdpSocket`] constructor: the host SEARCH socket is a per-NIC
+/// bundle, and a bundle bound to unicast addresses can join a group but
+/// never receive it.
+pub struct BeaconUdpSocket(sys::Beacon);
+
+impl BeaconUdpSocket {
+    /// Bind `0.0.0.0:port`. `pump_name`/`pump_priority` describe the
+    /// `exec_backend` receive thread, as on [`SearchUdpSocket::bind_ephemeral`].
+    pub fn bind(
+        port: u16,
+        pump_name: &str,
+        pump_priority: crate::runtime::task::ThreadPriority,
+    ) -> io::Result<Self> {
+        sys::Beacon::bind(port, pump_name, pump_priority).map(Self)
+    }
+
+    /// Join an IPv4 multicast group on the interface whose address is
+    /// `iface` (`IP_ADD_MEMBERSHIP`); `0.0.0.0` lets the routing table
+    /// choose, as pvxs's `INADDR_ANY` join does.
+    pub fn join_multicast_v4(&self, group: Ipv4Addr, iface: Ipv4Addr) -> io::Result<()> {
+        self.0.join_multicast_v4(group, iface)
+    }
+
+    /// The one bound address.
+    pub fn local_addrs(&self) -> Vec<SocketAddr> {
+        self.0.local_addrs()
+    }
+
+    /// The next datagram, with its `IP_PKTINFO` where the platform reports it.
+    pub async fn recv(&self, buf: &mut [u8]) -> io::Result<SearchDatagram> {
+        self.0.recv(buf).await
+    }
 }
 
 /// A client's IPv6 UDP SEARCH or beacon socket, on **every** target.
@@ -209,7 +242,7 @@ impl SearchUdpSocketV6 {
     /// Bind a v6 beacon listener on `[::]:port`, sharing the port with
     /// whatever server already holds it (`SO_REUSEADDR` + `SO_REUSEPORT`).
     ///
-    /// The v6 counterpart of [`SearchUdpSocket::bind_beacon`], and shared for
+    /// The v6 counterpart of [`BeaconUdpSocket::bind`], and shared for
     /// the same reason: pvxs puts every UDP socket through
     /// `epicsSocketEnableAddressUseForDatagramFanout`
     /// (`udp_collector.cpp:136`), which has no `_WIN32` carve-out.
@@ -235,6 +268,21 @@ impl SearchUdpSocketV6 {
         self.0.set_multicast_hops_v6(hops)
     }
 
+    /// [`SearchUdpSocket::send_multicast_v4`]'s v6 half: hop limit and egress
+    /// interface index, `0` leaving the choice to the routing table.
+    pub async fn send_multicast_v6(
+        &self,
+        buf: &[u8],
+        dest: SocketAddrV6,
+        hops: u32,
+        index: u32,
+    ) -> io::Result<usize> {
+        if let Err(e) = self.0.prep_v6(hops, index) {
+            prep_failed(&e, SocketAddr::V6(dest));
+        }
+        self.0.send_to(buf, SocketAddr::V6(dest)).await
+    }
+
     /// Every local address this socket bound — one entry, both arms.
     pub fn local_addrs(&self) -> Vec<SocketAddr> {
         self.0.local_addrs()
@@ -251,6 +299,17 @@ impl SearchUdpSocketV6 {
     }
 }
 
+/// pvxs logs a failed multicast option and sends anyway
+/// (`evhelper.cpp:588-606`).
+fn prep_failed(e: &io::Error, dest: SocketAddr) {
+    tracing::debug!(
+        target: "epics_base_rs::net",
+        %dest,
+        error = %e,
+        "multicast TTL/IF prep failed"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Host: the per-NIC bundle, unchanged.
 // ---------------------------------------------------------------------------
@@ -258,7 +317,7 @@ impl SearchUdpSocketV6 {
 #[cfg(tokio_backend)]
 mod sys {
     use super::{SearchDatagram, SocketAddr, io};
-    use crate::net::async_udp_v4::AsyncUdpV4;
+    use crate::net::async_udp_v4::{AsyncUdpV4, PortUse};
 
     pub(super) struct Sock(AsyncUdpV4);
 
@@ -277,34 +336,8 @@ mod sys {
             // The exec arm has one port by construction; binding the bundle
             // this way makes `local_addrs().first()` a fact about the socket
             // on both arms rather than about which NIC happens to be first.
-            AsyncUdpV4::bind_ephemeral_same_port(broadcast).map(Self)
-        }
-
-        pub(super) fn bind_beacon(
-            port: u16,
-            pump_name: &str,
-            pump_priority: crate::runtime::task::ThreadPriority,
-        ) -> io::Result<Self> {
-            let _ = (pump_name, pump_priority);
-            // Skips the loopback NIC, which the bundle can do and one wildcard
-            // socket cannot: a local PVA server's UDP responder already holds
-            // `127.0.0.1:<port>` with `SO_REUSEPORT`, and a co-bound client
-            // listener there would take half its inbound SEARCHes through the
-            // kernel's REUSEPORT balancing. Beacons arrive on NIC subnet
-            // broadcasts, never on the loopback address, so nothing is lost.
-            AsyncUdpV4::bind_non_loopback(port, true).map(Self)
-        }
-
-        pub(super) fn join_multicast_v4(
-            &self,
-            group: std::net::Ipv4Addr,
-            iface: std::net::Ipv4Addr,
-        ) -> io::Result<()> {
-            if iface.is_unspecified() {
-                self.0.join_multicast_v4(group)
-            } else {
-                self.0.join_multicast_v4_on(group, iface)
-            }
+            // No reuse options, as pvxs `searchTx4` and libca `udpiiu`.
+            AsyncUdpV4::bind_ephemeral_same_port(PortUse::Exclusive, broadcast).map(Self)
         }
 
         pub(super) fn set_recv_buffer_size(&self, size: usize) -> io::Result<()> {
@@ -329,6 +362,7 @@ mod sys {
                 n: meta.n,
                 src: meta.src,
                 iface_ip: Some(meta.iface_ip),
+                pktinfo: meta.dst_ip.map(|d| (d, meta.ifindex.unwrap_or(0))),
                 drops,
             })
         }
@@ -370,6 +404,88 @@ mod sys {
             }
             Ok(ok)
         }
+
+        pub(super) async fn send_multicast_v4(
+            &self,
+            buf: &[u8],
+            dest: std::net::SocketAddrV4,
+            ttl: u32,
+            iface: std::net::Ipv4Addr,
+        ) -> io::Result<usize> {
+            self.0.send_multicast_v4(buf, dest, ttl, iface).await
+        }
+    }
+
+    pub(super) struct Beacon(tokio::net::UdpSocket);
+
+    impl Beacon {
+        pub(super) fn bind(
+            port: u16,
+            pump_name: &str,
+            pump_priority: crate::runtime::task::ThreadPriority,
+        ) -> io::Result<Self> {
+            // No pump: the reactor is the pump.
+            let _ = (pump_name, pump_priority);
+            use socket2::{Domain, Protocol, Socket, Type};
+            let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+            crate::net::fanout::PortUse::Shared.bind(
+                &sock,
+                SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, port)),
+                crate::net::fanout::PortOrigin::Configured,
+            )?;
+            sock.set_broadcast(true)?;
+            sock.set_nonblocking(true)?;
+            let sock = tokio::net::UdpSocket::from_std(sock.into())?;
+            #[cfg(any(unix, windows))]
+            crate::net::udp_rx::enable(&sock, false)?;
+            Ok(Self(sock))
+        }
+
+        pub(super) fn join_multicast_v4(
+            &self,
+            group: std::net::Ipv4Addr,
+            iface: std::net::Ipv4Addr,
+        ) -> io::Result<()> {
+            self.0.join_multicast_v4(group, iface)
+        }
+
+        pub(super) fn local_addrs(&self) -> Vec<SocketAddr> {
+            self.0.local_addr().into_iter().collect()
+        }
+
+        #[cfg(any(unix, windows))]
+        pub(super) async fn recv(&self, buf: &mut [u8]) -> io::Result<SearchDatagram> {
+            loop {
+                self.0.readable().await?;
+                match self.0.try_io(tokio::io::Interest::READABLE, || {
+                    crate::net::udp_rx::recv(&self.0, buf)
+                }) {
+                    Ok(d) => {
+                        return Ok(SearchDatagram {
+                            n: d.len,
+                            src: d.src,
+                            iface_ip: None,
+                            pktinfo: d.v4_pktinfo(),
+                            drops: d.drops,
+                        });
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+
+        #[cfg(not(any(unix, windows)))]
+        pub(super) async fn recv(&self, buf: &mut [u8]) -> io::Result<SearchDatagram> {
+            let (n, src) = self.0.recv_from(buf).await?;
+            Ok(SearchDatagram {
+                n,
+                src,
+                iface_ip: None,
+                pktinfo: None,
+                drops: 0,
+            })
+        }
     }
 
     pub(super) struct SockV6(std::sync::Arc<tokio::net::UdpSocket>);
@@ -397,10 +513,11 @@ mod sys {
         ) -> io::Result<Self> {
             let _ = (pump_name, pump_priority);
             let sock = new_v6_socket()?;
-            sock.set_reuse_address(true)?;
-            #[cfg(unix)]
-            sock.set_reuse_port(true)?;
-            sock.bind(&v6_bind_addr(port).into())?;
+            crate::net::fanout::PortUse::Shared.bind(
+                &sock,
+                v6_bind_addr(port),
+                crate::net::fanout::PortOrigin::Configured,
+            )?;
             Self::adopt(sock)
         }
 
@@ -422,6 +539,10 @@ mod sys {
             socket2::SockRef::from(&*self.0).set_multicast_hops_v6(hops)
         }
 
+        pub(super) fn prep_v6(&self, hops: u32, index: u32) -> io::Result<()> {
+            crate::net::mcast_prep_v6(&*self.0, hops, index)
+        }
+
         pub(super) fn local_addrs(&self) -> Vec<SocketAddr> {
             self.0.local_addr().into_iter().collect()
         }
@@ -435,6 +556,7 @@ mod sys {
                 // socket reports no receiving NIC, the same `None` the exec
                 // arm reports for the same reason.
                 iface_ip: None,
+                pktinfo: None,
                 drops: 0,
             })
         }
@@ -474,6 +596,8 @@ mod sys {
 #[cfg(exec_backend)]
 mod sys {
     use super::{Ipv4Addr, SearchDatagram, SocketAddr, io};
+    #[cfg(unix)]
+    use crate::net::fanout::{PortOrigin, bind_fanout};
     use crate::runtime::task::{StackSizeClass, ThreadPriority, spawn_dedicated_thread};
     use std::net::UdpSocket;
     use std::sync::Arc;
@@ -489,12 +613,18 @@ mod sys {
     /// the workspace.
     const RECV_BUF: usize = 64 * 1024;
 
+    /// A v4 `IP_PKTINFO`: the destination and the arrival interface index.
+    type PktInfo = (Ipv4Addr, u32);
+
+    /// One datagram the pump read: bytes, source, `IP_PKTINFO`.
+    type Pumped = (Vec<u8>, SocketAddr, Option<PktInfo>);
+
     pub(super) struct Sock {
         /// Shared with the pump thread. `Arc`, not `try_clone`: a `dup(2)` on
         /// a libbsd socket fails `ENXIO` on `armv7-rtems-eabihf`.
         socket: Arc<UdpSocket>,
         /// Datagrams the pump has read, awaiting the engine.
-        rx: tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<(Vec<u8>, SocketAddr)>>,
+        rx: tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<Pumped>>,
         /// Set by `Drop`; the pump observes it between `recv_from` calls.
         stop: Arc<AtomicBool>,
         /// The pump thread, joined by `Drop`. `Option` only so `Drop` can
@@ -515,25 +645,7 @@ mod sys {
             Self::with_pump(socket, pump_name, pump_priority)
         }
 
-        pub(super) fn bind_beacon(
-            port: u16,
-            pump_name: &str,
-            pump_priority: ThreadPriority,
-        ) -> io::Result<Self> {
-            // Wildcard, which is what pvxs binds (`udp_collector.cpp:140`) so
-            // that joined multicast groups reach it. The host arm skips the
-            // loopback NIC instead; one socket cannot, and on a target with a
-            // single non-loopback NIC there is nothing to skip.
-            let socket = bind_shared_port(port)?;
-            socket.set_broadcast(true)?;
-            Self::with_pump(socket, pump_name, pump_priority)
-        }
-
-        pub(super) fn join_multicast_v4(&self, group: Ipv4Addr, iface: Ipv4Addr) -> io::Result<()> {
-            self.socket.join_multicast_v4(&group, &iface)
-        }
-
-        /// The half both constructors share: give the socket its stop-poll
+        /// The half every constructor shares: give the socket its stop-poll
         /// cadence and start the one thread that reads it.
         fn with_pump(
             socket: UdpSocket,
@@ -547,6 +659,8 @@ mod sys {
             // `ENOPROTOOPT`, and this socket never sets one: a UDP `send_to`
             // does not block on a peer.
             socket.set_read_timeout(Some(PUMP_WAKE_INTERVAL))?;
+            #[cfg(all(not(epics_embedded_target), any(unix, windows)))]
+            crate::net::udp_rx::enable(&socket, socket.local_addr()?.is_ipv6())?;
             let socket = Arc::new(socket);
 
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -610,7 +724,7 @@ mod sys {
         }
 
         pub(super) async fn recv(&self, buf: &mut [u8]) -> io::Result<SearchDatagram> {
-            let Some((bytes, src)) = self.rx.lock().await.recv().await else {
+            let Some((bytes, src, pktinfo)) = self.rx.lock().await.recv().await else {
                 return Err(io::Error::new(
                     io::ErrorKind::BrokenPipe,
                     "SEARCH receive pump stopped",
@@ -623,6 +737,7 @@ mod sys {
                 n,
                 src,
                 iface_ip: None,
+                pktinfo,
                 drops: 0,
             })
         }
@@ -683,6 +798,19 @@ mod sys {
             }
             Ok(ok)
         }
+
+        pub(super) async fn send_multicast_v4(
+            &self,
+            buf: &[u8],
+            dest: std::net::SocketAddrV4,
+            ttl: u32,
+            iface: Ipv4Addr,
+        ) -> io::Result<usize> {
+            if let Err(e) = crate::net::mcast_prep_v4(&*self.socket, ttl, iface) {
+                super::prep_failed(&e, SocketAddr::V4(dest));
+            }
+            self.socket.send_to(buf, dest)
+        }
     }
 
     impl Drop for Sock {
@@ -709,6 +837,33 @@ mod sys {
             if let Some(pump) = self.pump.take() {
                 let _ = pump.join();
             }
+        }
+    }
+
+    /// The beacon listener, over the same pump.
+    pub(super) struct Beacon(Sock);
+
+    impl Beacon {
+        pub(super) fn bind(
+            port: u16,
+            pump_name: &str,
+            pump_priority: ThreadPriority,
+        ) -> io::Result<Self> {
+            let socket = bind_shared_port(port)?;
+            socket.set_broadcast(true)?;
+            Sock::with_pump(socket, pump_name, pump_priority).map(Self)
+        }
+
+        pub(super) fn join_multicast_v4(&self, group: Ipv4Addr, iface: Ipv4Addr) -> io::Result<()> {
+            self.0.socket.join_multicast_v4(&group, &iface)
+        }
+
+        pub(super) fn local_addrs(&self) -> Vec<SocketAddr> {
+            self.0.local_addrs()
+        }
+
+        pub(super) async fn recv(&self, buf: &mut [u8]) -> io::Result<SearchDatagram> {
+            self.0.recv(buf).await
         }
     }
 
@@ -761,6 +916,10 @@ mod sys {
             )
         }
 
+        pub(super) fn prep_v6(&self, hops: u32, index: u32) -> io::Result<()> {
+            crate::net::mcast_prep_v6(&*self.0.socket, hops, index)
+        }
+
         pub(super) fn local_addrs(&self) -> Vec<SocketAddr> {
             self.0.local_addrs()
         }
@@ -775,11 +934,11 @@ mod sys {
     }
 
     /// An `AF_INET6` datagram socket bound to `[::]:port`, with `IPV6_V6ONLY`
-    /// — and, for a shared listener, `SO_REUSEADDR`/`SO_REUSEPORT` — set
-    /// **before** the bind, which is the only point at which they take effect.
+    /// set **before** the bind, which is the only point at which it takes
+    /// effect, and for a shared listener the reuse options ordered by
+    /// [`bind_fanout`].
     ///
-    /// Hand-rolled for that ordering, the same reason and the same sequence as
-    /// [`bind_shared_port`]. `IPV6_V6ONLY` is not optional here: without it a
+    /// Hand-rolled for that ordering, the same reason as [`bind_shared_port`]. `IPV6_V6ONLY` is not optional here: without it a
     /// dual-stack bind would take the v4-mapped copy of traffic the v4 SEARCH
     /// socket is already receiving, and the engine would see every reply twice.
     #[cfg(unix)]
@@ -794,26 +953,30 @@ mod sys {
         // SAFETY: `fd` is a valid, exclusively-owned socket fd just returned.
         let socket = unsafe { UdpSocket::from_raw_fd(fd) };
         set_int_opt(&socket, sockopt::IPPROTO_IPV6, sockopt::IPV6_V6ONLY, 1)?;
-        if share {
-            set_int_opt(&socket, libc::SOL_SOCKET, libc::SO_REUSEADDR, 1)?;
-            set_int_opt(&socket, libc::SOL_SOCKET, libc::SO_REUSEPORT, 1)?;
-        }
         // Zeroed rather than field-by-field: `sin6_len` exists on the BSD
         // targets and not on Linux, and all-zero is valid for both.
         // SAFETY: `sockaddr_in6` is plain-old-data.
         let mut sin6: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
         sin6.sin6_family = libc::AF_INET6 as libc::sa_family_t;
         sin6.sin6_port = port.to_be();
-        // SAFETY: `sin6` is fully initialized and the length is exact.
-        let rc = unsafe {
-            libc::bind(
-                fd,
-                std::ptr::addr_of!(sin6).cast(),
-                std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
-            )
+        let bind = || {
+            // SAFETY: `sin6` is fully initialized and the length is exact.
+            let rc = unsafe {
+                libc::bind(
+                    fd,
+                    std::ptr::addr_of!(sin6).cast(),
+                    std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+                )
+            };
+            if rc != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
         };
-        if rc != 0 {
-            return Err(io::Error::last_os_error());
+        if share {
+            bind_fanout(port, PortOrigin::Configured, || set_fanout(&socket), bind)?;
+        } else {
+            bind()?;
         }
         Ok(socket)
     }
@@ -854,17 +1017,18 @@ mod sys {
         out
     }
 
-    /// Read datagrams until asked to stop or the receiver is gone.
+    /// Read datagrams until asked to stop or the receiver is gone; a recv
+    /// error is reported and the loop goes on, as libca's does.
     fn pump(
         socket: &UdpSocket,
         stop: &AtomicBool,
-        tx: &tokio::sync::mpsc::UnboundedSender<(Vec<u8>, SocketAddr)>,
+        tx: &tokio::sync::mpsc::UnboundedSender<Pumped>,
     ) {
         let mut buf = vec![0u8; RECV_BUF];
         while !stop.load(Ordering::Acquire) {
-            match socket.recv_from(&mut buf) {
-                Ok((n, src)) => {
-                    if tx.send((buf[..n].to_vec(), src)).is_err() {
+            match recv_with_pktinfo(socket, &mut buf) {
+                Ok((n, src, pktinfo)) => {
+                    if tx.send((buf[..n].to_vec(), src, pktinfo)).is_err() {
                         return;
                     }
                 }
@@ -884,16 +1048,34 @@ mod sys {
                 {
                     continue;
                 }
-                Err(e) => {
-                    tracing::warn!(
-                        target: "epics_base_rs::net",
-                        error = %e,
-                        "SEARCH receive pump stopping"
-                    );
-                    return;
-                }
+                // `udpiiu.cpp:434`, and the loop goes on.
+                Err(e) => crate::runtime::log::errlog_vprintf(format_args!(
+                    "CAC: UDP recv {} was \"{}\"\n",
+                    crate::runtime::log::erl_error(),
+                    crate::net::sock_err_string(&e)
+                )),
             }
         }
+    }
+
+    /// One datagram and its v4 `IP_PKTINFO`, through the one receive path
+    /// that reads it where the build has it.
+    #[cfg(all(not(epics_embedded_target), any(unix, windows)))]
+    fn recv_with_pktinfo(
+        socket: &UdpSocket,
+        buf: &mut [u8],
+    ) -> io::Result<(usize, SocketAddr, Option<PktInfo>)> {
+        let d = crate::net::udp_rx::recv(socket, buf)?;
+        Ok((d.len, d.src, d.v4_pktinfo()))
+    }
+
+    #[cfg(not(all(not(epics_embedded_target), any(unix, windows))))]
+    fn recv_with_pktinfo(
+        socket: &UdpSocket,
+        buf: &mut [u8],
+    ) -> io::Result<(usize, SocketAddr, Option<PktInfo>)> {
+        let (n, src) = socket.recv_from(buf)?;
+        Ok((n, src, None))
     }
 
     /// A read-timeout expiry, which is a wake and not an error.
@@ -919,10 +1101,9 @@ mod sys {
     /// Bind the wildcard address on a well-known port that a server on this
     /// host already holds.
     ///
-    /// Hand-rolled because `SO_REUSEADDR`/`SO_REUSEPORT` have to be set
-    /// *before* the bind and `std::net::UdpSocket::bind` binds as it
-    /// constructs. Same sequence, and the same reason, as the blocking CA
-    /// server's `bind_udp_search_socket`.
+    /// Hand-rolled because on a configured number `SO_REUSEADDR`/`SO_REUSEPORT`
+    /// have to be set *before* the bind ([`bind_fanout`]) and
+    /// `std::net::UdpSocket::bind` binds as it constructs.
     #[cfg(unix)]
     fn bind_shared_port(port: u16) -> io::Result<UdpSocket> {
         use std::os::fd::FromRawFd;
@@ -934,26 +1115,39 @@ mod sys {
         // Owned immediately, so every early return below closes it via `Drop`.
         // SAFETY: `fd` is a valid, exclusively-owned socket fd just returned.
         let socket = unsafe { UdpSocket::from_raw_fd(fd) };
-        set_int_opt(&socket, libc::SOL_SOCKET, libc::SO_REUSEADDR, 1)?;
-        set_int_opt(&socket, libc::SOL_SOCKET, libc::SO_REUSEPORT, 1)?;
         // Zeroed rather than field-by-field: `sin_len` exists on the BSD
         // targets and not on Linux, and all-zero is valid for both.
         // SAFETY: `sockaddr_in` is plain-old-data.
         let mut sin: libc::sockaddr_in = unsafe { std::mem::zeroed() };
         sin.sin_family = libc::AF_INET as libc::sa_family_t;
         sin.sin_port = port.to_be();
-        // SAFETY: `sin` is fully initialized and the length is exact.
-        let rc = unsafe {
-            libc::bind(
-                fd,
-                std::ptr::addr_of!(sin).cast(),
-                std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
-            )
-        };
-        if rc != 0 {
-            return Err(io::Error::last_os_error());
-        }
+        bind_fanout(
+            port,
+            PortOrigin::Configured,
+            || set_fanout(&socket),
+            || {
+                // SAFETY: `sin` is fully initialized and the length is exact.
+                let rc = unsafe {
+                    libc::bind(
+                        fd,
+                        std::ptr::addr_of!(sin).cast(),
+                        std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+                    )
+                };
+                if rc != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            },
+        )?;
         Ok(socket)
+    }
+
+    /// `SO_REUSEADDR` + `SO_REUSEPORT`, both or the error.
+    #[cfg(unix)]
+    fn set_fanout(socket: &UdpSocket) -> io::Result<()> {
+        set_int_opt(socket, libc::SOL_SOCKET, libc::SO_REUSEADDR, 1)?;
+        set_int_opt(socket, libc::SOL_SOCKET, libc::SO_REUSEPORT, 1)
     }
 
     #[cfg(not(unix))]
@@ -1053,13 +1247,74 @@ mod tests {
                 .expect("an IPv4 SEARCH address")
                 .port()
         };
-        let beacon = SearchUdpSocket::bind_beacon(port, "test-BEACON", ThreadPriority::Medium)
+        let beacon = BeaconUdpSocket::bind(port, "test-BEACON", ThreadPriority::Medium)
             .expect("beacon bind");
         assert!(
             beacon.local_addrs().iter().any(|a| a.port() == port),
             "a beacon listener must bind the port it was given; got {:?}",
             beacon.local_addrs()
         );
+    }
+
+    /// A group joined on an interface reaches the beacon socket, loopback
+    /// included, as on pvxs's wildcard collector: a socket bound to a NIC's
+    /// unicast address takes the membership but never the group's datagrams.
+    #[epics_macros_rs::epics_test]
+    async fn a_joined_group_reaches_the_beacon_socket() {
+        let group = Ipv4Addr::new(224, 0, 9, 41);
+        let beacon =
+            BeaconUdpSocket::bind(0, "test-BEACON", ThreadPriority::Medium).expect("beacon bind");
+        let port = beacon.local_addrs()[0].port();
+        beacon
+            .join_multicast_v4(group, Ipv4Addr::LOCALHOST)
+            .expect("join on loopback");
+        let tx = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("tx");
+        socket2::SockRef::from(&tx)
+            .set_multicast_if_v4(&Ipv4Addr::LOCALHOST)
+            .expect("multicast if");
+        tx.set_multicast_loop_v4(true).expect("multicast loop");
+        tx.send_to(b"BEACON", (group, port)).expect("send");
+        let mut buf = [0u8; 64];
+        let dg =
+            crate::runtime::task::timeout(std::time::Duration::from_secs(5), beacon.recv(&mut buf))
+                .await
+                .expect("the group's datagram arrives")
+                .expect("recv");
+        assert_eq!(&buf[..dg.n], b"BEACON");
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            dg.pktinfo.map(|p| p.0),
+            Some(group),
+            "IP_PKTINFO destination"
+        );
+    }
+
+    /// The search socket sets no reuse option, as pvxs `searchTx4` and libca
+    /// `udpiiu`: a fanout socket cannot join its port and take its replies.
+    #[epics_macros_rs::epics_test]
+    async fn a_fanout_socket_cannot_join_the_search_port() {
+        let sock = bind();
+        let addrs: Vec<SocketAddr> = sock
+            .local_addrs()
+            .into_iter()
+            .filter(|a| a.is_ipv4())
+            .collect();
+        assert!(!addrs.is_empty(), "an IPv4 SEARCH address");
+        for addr in addrs {
+            let s = socket2::Socket::new(
+                socket2::Domain::IPV4,
+                socket2::Type::DGRAM,
+                Some(socket2::Protocol::UDP),
+            )
+            .unwrap();
+            s.set_reuse_address(true).unwrap();
+            #[cfg(unix)]
+            s.set_reuse_port(true).unwrap();
+            assert!(
+                s.bind(&addr.into()).is_err(),
+                "a fanout socket joined {addr}"
+            );
+        }
     }
 
     /// Round-trip one datagram through the arm this build selected — the
@@ -1089,17 +1344,11 @@ mod tests {
 
     // ── IPv6 ────────────────────────────────────────────────────────────
 
-    /// A machine with no IPv6 stack is a normal machine, and a CI runner is
-    /// often one. Every v6 case below skips on that machine rather than
-    /// failing, so the suite asserts about v6 exactly where v6 exists.
-    fn bind_v6_or_skip() -> Option<SearchUdpSocketV6> {
-        match SearchUdpSocketV6::bind_search("test-PVAC-UDP6", ThreadPriority::Medium) {
-            Ok(s) => Some(s),
-            Err(e) => {
-                eprintln!("skipping: no usable IPv6 stack here ({e})");
-                None
-            }
-        }
+    /// The v6 cases need an IPv6 stack and a routable `::1`; a host without
+    /// them fails here, because an early return would score as a pass.
+    fn bind_v6() -> SearchUdpSocketV6 {
+        SearchUdpSocketV6::bind_search("test-PVAC-UDP6", ThreadPriority::Medium)
+            .expect("these tests need an IPv6 stack (and `::1` on loopback)")
     }
 
     /// The v6 counterpart of [`binds_and_reports_a_local_address`], and the
@@ -1107,9 +1356,7 @@ mod tests {
     /// used to be "no socket exists", by construction.
     #[epics_macros_rs::epics_test]
     async fn v6_binds_and_reports_a_local_address() {
-        let Some(sock) = bind_v6_or_skip() else {
-            return;
-        };
+        let sock = bind_v6();
         let addrs = sock.local_addrs();
         assert!(!addrs.is_empty(), "a bound v6 SEARCH socket has an address");
         for a in &addrs {
@@ -1122,19 +1369,13 @@ mod tests {
     /// selected — the reactor on one arm, the shared pump thread on the other.
     #[epics_macros_rs::epics_test]
     async fn v6_round_trips_a_datagram_to_itself() {
-        let Some(sock) = bind_v6_or_skip() else {
-            return;
-        };
+        let sock = bind_v6();
         let port = sock.local_addrs()[0].port();
         let dest = SocketAddr::from((Ipv6Addr::LOCALHOST, port));
 
-        if let Err(e) = sock.send_to(b"PVA-SEARCH6", dest).await {
-            // A v6 socket can bind while `::1` is unroutable (a container with
-            // IPv6 compiled in and no loopback route). That is the same "no
-            // usable v6 here" condition the binder reports, one step later.
-            eprintln!("skipping: v6 loopback is not routable here ({e})");
-            return;
-        }
+        sock.send_to(b"PVA-SEARCH6", dest)
+            .await
+            .expect("`::1` must be routable on this host");
         let mut buf = [0u8; 64];
         let dg =
             crate::runtime::task::timeout(std::time::Duration::from_secs(5), sock.recv(&mut buf))
@@ -1156,10 +1397,6 @@ mod tests {
     /// must still be *bindable* in the v4 family (a dual-stack `[::]` bind
     /// reserves both, so this is `EADDRINUSE` when the option is lost), and a
     /// v4 datagram delivered to it must leave the v6 socket silent.
-    ///
-    /// The v4 side is a plain `std` socket rather than a [`SearchUdpSocket`]
-    /// because [`SearchUdpSocket::bind_beacon`] deliberately skips the
-    /// loopback NIC, so nothing sent to `127.0.0.1` can reach it.
     #[epics_macros_rs::epics_test]
     async fn v6_socket_does_not_take_v4_mapped_traffic() {
         // The v4 bind below can fail for two unrelated reasons: the v6 socket
@@ -1171,9 +1408,7 @@ mod tests {
         const PORTS: usize = 8;
         let mut held = None;
         for attempt in 1..=PORTS {
-            let Some(v6) = bind_v6_or_skip() else {
-                return;
-            };
+            let v6 = bind_v6();
             let port = v6.local_addrs()[0].port();
             match std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, port)) {
                 Ok(v4) => {

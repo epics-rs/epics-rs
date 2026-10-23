@@ -1,0 +1,15 @@
+# Digitel_stream.proto
+
+# Stream protocol file for Digital 500/1500 ion pump controllers
+
+# Mark Rivers
+# May 16, 2024
+
+ExtraInput = Ignore;
+ReadTimeout = 1000;
+
+readVI {
+   out "RD";
+   in "%*s";
+   in "%*9c%fV%(\$1_Current)fI%*7c";
+}

@@ -1,0 +1,16 @@
+rec: l.proto p NOBUS
+active command=none flags=0x0000
+ {
+  extraInput    = error;
+  lockTimeout   = 0; # ms
+  readTimeout   = 0; # ms
+  replyTimeout  = 0; # ms
+  writeTimeout  = 0; # ms
+  pollPeriod    = 0; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+}
+

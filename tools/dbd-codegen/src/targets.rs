@@ -50,6 +50,10 @@ pub const BASE: Target = Target {
     base_path: "crate",
 };
 
+/// How a crate outside this workspace names base: through the `epics-rs`
+/// umbrella, the one crate such a repository depends on.
+pub const EXTERNAL_BASE_PATH: &str = "epics_rs::base";
+
 /// Every target, base first. Base must be first: the others are generated
 /// against its `dbCommon` and its menus.
 pub const TARGETS: &[Target] = &[
@@ -75,6 +79,12 @@ pub const TARGETS: &[Target] = &[
     Target {
         dbd_dir: "crates/std-rs/dbd",
         out_file: "crates/std-rs/src/records/dbd_generated.rs",
+        bpt_out_file: None,
+        base_path: "epics_base_rs",
+    },
+    Target {
+        dbd_dir: "crates/sscan-rs/dbd",
+        out_file: "crates/sscan-rs/src/records/dbd_generated.rs",
         bpt_out_file: None,
         base_path: "epics_base_rs",
     },

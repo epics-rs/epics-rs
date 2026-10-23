@@ -5,97 +5,97 @@
 # Required macros: P (detector prefix)
 
 # StdArrays (image data)
-file NDStdArrays_settings.req, P=$(P), R=image1:
+file "NDStdArrays_settings.req", P=$(P), R=image1:
 
 # File saving plugins
-file NDFileNetCDF_settings.req, P=$(P), R=netCDF1:
-file NDFileTIFF_settings.req,   P=$(P), R=TIFF1:
-file NDFileJPEG_settings.req,   P=$(P), R=JPEG1:
-file NDFileNexus_settings.req,  P=$(P), R=Nexus1:
-file NDFileHDF5_settings.req,   P=$(P), R=HDF1:
+file "NDFileNetCDF_settings.req", P=$(P), R=netCDF1:
+file "NDFileTIFF_settings.req",   P=$(P), R=TIFF1:
+file "NDFileJPEG_settings.req",   P=$(P), R=JPEG1:
+file "NDFileNexus_settings.req",  P=$(P), R=Nexus1:
+file "NDFileHDF5_settings.req",   P=$(P), R=HDF1:
 #file NDFileMagick_settings.req, P=$(P), R=Magick1:
 
 # ROI plugins
-file NDROI_settings.req,       P=$(P), R=ROI1:
-file NDROI_settings.req,       P=$(P), R=ROI2:
-file NDROI_settings.req,       P=$(P), R=ROI3:
-file NDROI_settings.req,       P=$(P), R=ROI4:
+file "NDROI_settings.req",       P=$(P), R=ROI1:
+file "NDROI_settings.req",       P=$(P), R=ROI2:
+file "NDROI_settings.req",       P=$(P), R=ROI3:
+file "NDROI_settings.req",       P=$(P), R=ROI4:
 
 # Processing (with helper TIFF for dark/flat field loading)
-file NDProcess_settings.req,   P=$(P), R=Proc1:
-file NDFileTIFF_settings.req,  P=$(P), R=Proc1:TIFF:
+file "NDProcess_settings.req",   P=$(P), R=Proc1:
+file "NDFileTIFF_settings.req",  P=$(P), R=Proc1:TIFF:
 
 # Scatter/Gather
-file NDScatter_settings.req,   P=$(P), R=Scatter1:
-file NDGather_settings.req,    P=$(P), R=Gather1:
-file NDGatherN_settings.req,   P=$(P), R=Gather1:, N=1
-file NDGatherN_settings.req,   P=$(P), R=Gather1:, N=2
-file NDGatherN_settings.req,   P=$(P), R=Gather1:, N=3
-file NDGatherN_settings.req,   P=$(P), R=Gather1:, N=4
-file NDGatherN_settings.req,   P=$(P), R=Gather1:, N=5
-file NDGatherN_settings.req,   P=$(P), R=Gather1:, N=6
-file NDGatherN_settings.req,   P=$(P), R=Gather1:, N=7
-file NDGatherN_settings.req,   P=$(P), R=Gather1:, N=8
+file "NDScatter_settings.req",   P=$(P), R=Scatter1:
+file "NDGather_settings.req",    P=$(P), R=Gather1:
+file "NDGatherN_settings.req",   P=$(P), R=Gather1:, N=1
+file "NDGatherN_settings.req",   P=$(P), R=Gather1:, N=2
+file "NDGatherN_settings.req",   P=$(P), R=Gather1:, N=3
+file "NDGatherN_settings.req",   P=$(P), R=Gather1:, N=4
+file "NDGatherN_settings.req",   P=$(P), R=Gather1:, N=5
+file "NDGatherN_settings.req",   P=$(P), R=Gather1:, N=6
+file "NDGatherN_settings.req",   P=$(P), R=Gather1:, N=7
+file "NDGatherN_settings.req",   P=$(P), R=Gather1:, N=8
 
 # Statistics plugins
-file NDStats_settings.req,     P=$(P), R=Stats1:
-file NDStats_settings.req,     P=$(P), R=Stats2:
-file NDStats_settings.req,     P=$(P), R=Stats3:
-file NDStats_settings.req,     P=$(P), R=Stats4:
-file NDStats_settings.req,     P=$(P), R=Stats5:
+file "NDStats_settings.req",     P=$(P), R=Stats1:
+file "NDStats_settings.req",     P=$(P), R=Stats2:
+file "NDStats_settings.req",     P=$(P), R=Stats3:
+file "NDStats_settings.req",     P=$(P), R=Stats4:
+file "NDStats_settings.req",     P=$(P), R=Stats5:
 
 # ROI statistics
-file NDROIStat_settings.req,   P=$(P), R=ROIStat1:
-file NDROIStatN_settings.req,  P=$(P), R=ROIStat1:1:
-file NDROIStatN_settings.req,  P=$(P), R=ROIStat1:2:
-file NDROIStatN_settings.req,  P=$(P), R=ROIStat1:3:
-file NDROIStatN_settings.req,  P=$(P), R=ROIStat1:4:
-file NDROIStatN_settings.req,  P=$(P), R=ROIStat1:5:
-file NDROIStatN_settings.req,  P=$(P), R=ROIStat1:6:
-file NDROIStatN_settings.req,  P=$(P), R=ROIStat1:7:
-file NDROIStatN_settings.req,  P=$(P), R=ROIStat1:8:
+file "NDROIStat_settings.req",   P=$(P), R=ROIStat1:
+file "NDROIStatN_settings.req",  P=$(P), R=ROIStat1:1:
+file "NDROIStatN_settings.req",  P=$(P), R=ROIStat1:2:
+file "NDROIStatN_settings.req",  P=$(P), R=ROIStat1:3:
+file "NDROIStatN_settings.req",  P=$(P), R=ROIStat1:4:
+file "NDROIStatN_settings.req",  P=$(P), R=ROIStat1:5:
+file "NDROIStatN_settings.req",  P=$(P), R=ROIStat1:6:
+file "NDROIStatN_settings.req",  P=$(P), R=ROIStat1:7:
+file "NDROIStatN_settings.req",  P=$(P), R=ROIStat1:8:
 
 # Transform
-file NDTransform_settings.req, P=$(P), R=Trans1:
+file "NDTransform_settings.req", P=$(P), R=Trans1:
 
 # Overlays
-file NDOverlay_settings.req,   P=$(P), R=Over1:
-file NDOverlayN_settings.req,  P=$(P), R=Over1:1:
-file NDOverlayN_settings.req,  P=$(P), R=Over1:2:
-file NDOverlayN_settings.req,  P=$(P), R=Over1:3:
-file NDOverlayN_settings.req,  P=$(P), R=Over1:4:
-file NDOverlayN_settings.req,  P=$(P), R=Over1:5:
-file NDOverlayN_settings.req,  P=$(P), R=Over1:6:
-file NDOverlayN_settings.req,  P=$(P), R=Over1:7:
-file NDOverlayN_settings.req,  P=$(P), R=Over1:8:
+file "NDOverlay_settings.req",   P=$(P), R=Over1:
+file "NDOverlayN_settings.req",  P=$(P), R=Over1:1:
+file "NDOverlayN_settings.req",  P=$(P), R=Over1:2:
+file "NDOverlayN_settings.req",  P=$(P), R=Over1:3:
+file "NDOverlayN_settings.req",  P=$(P), R=Over1:4:
+file "NDOverlayN_settings.req",  P=$(P), R=Over1:5:
+file "NDOverlayN_settings.req",  P=$(P), R=Over1:6:
+file "NDOverlayN_settings.req",  P=$(P), R=Over1:7:
+file "NDOverlayN_settings.req",  P=$(P), R=Over1:8:
 
 # Color conversion
-file NDColorConvert_settings.req, P=$(P), R=CC1:
-file NDColorConvert_settings.req, P=$(P), R=CC2:
+file "NDColorConvert_settings.req", P=$(P), R=CC1:
+file "NDColorConvert_settings.req", P=$(P), R=CC2:
 
 # Circular buffer
-file NDCircularBuff_settings.req, P=$(P), R=CB1:
+file "NDCircularBuff_settings.req", P=$(P), R=CB1:
 
 # Attributes
-file NDAttribute_settings.req,  P=$(P), R=Attr1:
-file NDAttributeN_settings.req, P=$(P), R=Attr1:1:
-file NDAttributeN_settings.req, P=$(P), R=Attr1:2:
-file NDAttributeN_settings.req, P=$(P), R=Attr1:3:
-file NDAttributeN_settings.req, P=$(P), R=Attr1:4:
-file NDAttributeN_settings.req, P=$(P), R=Attr1:5:
-file NDAttributeN_settings.req, P=$(P), R=Attr1:6:
-file NDAttributeN_settings.req, P=$(P), R=Attr1:7:
-file NDAttributeN_settings.req, P=$(P), R=Attr1:8:
+file "NDAttribute_settings.req",  P=$(P), R=Attr1:
+file "NDAttributeN_settings.req", P=$(P), R=Attr1:1:
+file "NDAttributeN_settings.req", P=$(P), R=Attr1:2:
+file "NDAttributeN_settings.req", P=$(P), R=Attr1:3:
+file "NDAttributeN_settings.req", P=$(P), R=Attr1:4:
+file "NDAttributeN_settings.req", P=$(P), R=Attr1:5:
+file "NDAttributeN_settings.req", P=$(P), R=Attr1:6:
+file "NDAttributeN_settings.req", P=$(P), R=Attr1:7:
+file "NDAttributeN_settings.req", P=$(P), R=Attr1:8:
 
 # FFT
-file NDFFT_settings.req,       P=$(P), R=FFT1:
+file "NDFFT_settings.req",       P=$(P), R=FFT1:
 
 # Codec
-file NDCodec_settings.req,     P=$(P), R=Codec1:
-file NDCodec_settings.req,     P=$(P), R=Codec2:
+file "NDCodec_settings.req",     P=$(P), R=Codec1:
+file "NDCodec_settings.req",     P=$(P), R=Codec2:
 
 # Bad pixel
-file NDBadPixel_settings.req,  P=$(P), R=BadPix1:
+file "NDBadPixel_settings.req",  P=$(P), R=BadPix1:
 
 # PVA
-file NDPva_settings.req,       P=$(P), R=Pva1:
+file "NDPva_settings.req",       P=$(P), R=Pva1:

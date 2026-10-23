@@ -1,0 +1,72 @@
+# Protocol file for the ADAM 4018 thermocouple module
+
+OutTerminator = CR;
+InTerminator = CR;
+
+queryAll {
+  out "#\$1";
+  in ">%(\$2:ai0)f%(\$2:ai1)f%(\$2:ai2)f%(\$2:ai3)f%(\$2:ai4)f%(\$2:ai5)f%(\$2:ai6)f%(\$2:ai7)f";
+}
+
+# Read module name
+# $01M
+# !01408
+queryModel {
+  out "$\$1M";
+  in "!\$1%s";
+}
+
+# Read firmware version
+#  $01F
+#  !01D1.8
+queryFW {
+  out "$\$1F";
+  in "!\$1%s";
+}
+
+# Read input type
+queryInput {
+  out "$\$12";
+  in "!\$1%{00|01|02|03|04|05|06|0E|0F|10|11|12|13|14}%*2s%*2s"
+}
+
+# Read baud
+queryBaud {
+  out "$\$12";
+  in "!\$1%*2s%{03|04|05|06|07|08}%*2s"
+}
+
+# Set input type
+setInput {
+  out "\%\$1\$1%{00|01|02|03|04|05|06|0E|0F|10|11|12|13|14}%(\$2:baud){03|04|05|06|07|08}00";
+}
+
+### Features not implemented
+
+# Read full configuration status
+# $012
+# !01000600
+
+# The last 8 bits of the configuration status have the following meaning:
+# bit 0: \ Data format (11=unused for model 4018)
+# bit 1: /  00=Engineering units, 01=% of FSR, 10=2's complement of hexadecimal
+# bit 2: not used
+# bit 3: not used
+# bit 4: not used
+# bit 5: not used
+# bit 6: Checksum status (0= disabled, 1=enabled)
+# bit 7: Integration time (0=50ms for 60 Hz power, 1=60ms for 50 Hz power)
+
+# Read channel status
+# $016
+# !01FF
+
+# Enable/disable channels for multiplexing. NOTE: Disabling channels results in spaces in the response string.
+# $015F0 (turn off channels 0-3)
+# $015FE (turn off channel 0)
+# $0150F (turn off channels 4-7)
+# !01 (acknowledge)
+
+# Read CJC status
+# $013
+# >+0022.2

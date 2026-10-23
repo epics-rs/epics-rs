@@ -26,6 +26,44 @@ pub enum ADError {
 
     #[error("asyn error: {0}")]
     Asyn(#[from] AsynError),
+
+    /// A failure C reports itself: `lines` are what it prints, in order, and
+    /// `message` is what it leaves in `NDFileWriteMessage`.
+    #[error("{message}")]
+    Reported { lines: Vec<String>, message: String },
+
+    /// A writer call after which C's writer has dropped the capture itself,
+    /// setting NDFileCapture and NDWriteFile to 0, and holds no open file, so
+    /// no `closeFileBase` follows (NDFileHDF5.cpp:192-203, :1519-1557).
+    #[error("{0}")]
+    Aborted(Box<ADError>),
+}
+
+impl ADError {
+    /// The console lines C prints for this failure; none unless `Reported`.
+    pub fn lines(&self) -> &[String] {
+        match self {
+            Self::Reported { lines, .. } => lines,
+            Self::Aborted(e) => e.lines(),
+            _ => &[],
+        }
+    }
+
+    pub fn is_aborted(&self) -> bool {
+        matches!(self, Self::Aborted(_))
+    }
+
+    /// The same failure with its lines dropped, once they have been printed.
+    pub fn without_lines(self) -> Self {
+        match self {
+            Self::Reported { message, .. } => Self::Reported {
+                lines: Vec::new(),
+                message,
+            },
+            Self::Aborted(e) => Self::Aborted(Box::new(e.without_lines())),
+            e => e,
+        }
+    }
 }
 
 pub type ADResult<T> = Result<T, ADError>;

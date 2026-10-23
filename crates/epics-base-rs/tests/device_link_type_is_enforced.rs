@@ -12,10 +12,9 @@
 //!
 //! C does NOT run this rule at db-load. `dbPutString` on a link field parses
 //! the text and stores it, and nothing more (`dbStaticLib.c:2626-2634`); the
-//! `dbCanSetLink` branch beside it is the *after*-init path autosave restore
-//! takes. The rule runs once, at `iocInit`, from `dbInitRecordLinks`
-//! (`dbStaticLib.c:2222`), which prints one line per refusal and then returns
-//! 0 unconditionally.
+//! `dbCanSetLink` branch beside it is the *after*-init path. The rule runs
+//! once, at `iocInit`, from `dbInitRecordLinks` (`dbStaticLib.c:2222`), which
+//! prints one line per refusal and then returns 0 unconditionally.
 //!
 //! ```text
 //! record(ai,"T:R1"){ field(DTYP,"Soft Timestamp") field(INP,"5")           }
@@ -87,9 +86,9 @@ fn link_text(db: &PvDatabase, field: &str) -> String {
         .unwrap_or_else(|| panic!("{REC} must survive a refused link, as it does in C"));
     let inst = rec.read();
     match field {
-        "INP" => inst.common.inp.clone(),
-        "SDIS" => inst.common.sdis.clone(),
-        "FLNK" => inst.common.flnk.clone(),
+        "INP" => inst.common.text.inp.to_string(),
+        "SDIS" => inst.common.text.sdis.to_string(),
+        "FLNK" => inst.common.text.flnk.to_string(),
         other => panic!("no accessor for {other}"),
     }
 }
@@ -229,8 +228,7 @@ async fn an_unspelled_dtyp_still_binds_the_first_declared_device() {
 
 /// C applies the SAME rule to a link written at runtime — `dbPutFieldLink`
 /// calls `dbCanSetLink` (`dbAccess.c:1132`), and so does `dbPutString` once the
-/// links are initialized, which is the arm autosave restore takes
-/// (`dbStaticLib.c:2634-2642`). Both RETURN the status, so unlike the `iocInit`
+/// links are initialized (`dbStaticLib.c:2634-2642`). Both RETURN the status, so unlike the `iocInit`
 /// pass a runtime assignment really is refused and the link is left as it was.
 /// C prints nothing on that path; the message below is the port's own.
 ///
@@ -253,17 +251,17 @@ async fn a_runtime_put_of_a_link_the_device_cannot_take_is_refused_too() {
         .await
         .unwrap();
 
-    let rec = database.get_record("AI:RT").unwrap();
-    let mut inst = rec.write();
-    let err = inst
-        .put_common_field("INP", EpicsValue::String("5".into()))
+    let err = database
+        .put_pv_no_process("AI:RT.INP", EpicsValue::String("5".into()))
+        .await
         .expect_err("an INST_IO device support cannot take a constant INP at runtime");
     assert!(
         err.to_string().contains("can't initialize link type"),
         "{err}"
     );
     assert_eq!(
-        inst.common.inp, "@instio parm",
+        database.get_record("AI:RT").unwrap().read().common.text.inp,
+        "@instio parm",
         "a refused put must leave the link exactly as it was — C's does"
     );
 }
@@ -291,18 +289,18 @@ async fn the_verdict_does_not_depend_on_the_order_the_db_spells_the_fields() {
     assert_eq!(link_text(&db, "INP"), "@");
 }
 
-/// The declaration is the `.dbd`'s, and where there is no `.dbd` there is no
-/// declaration to enforce. A DTYP registered at runtime by a downstream crate
-/// (`asynInt32` on an `ai`) appears in no vendored `device()` line, so the port
-/// has no `link_type` for it and invents none — it must not touch the link on a
-/// rule it cannot state.
+/// Every DTYP a `.db` can name has a `device()` line and so a link type: one
+/// no loaded line declares (`asynInt32` on an IOC without asyn) is refused
+/// before any link rule could apply.
 #[epics_macros_rs::epics_test]
-async fn a_dtyp_no_vendored_dbd_declares_carries_no_rule() {
-    let db = loads("    field(DTYP, \"asynInt32\")\n    field(INP, \"@asyn(PORT,0)VALUE\")")
-        .await
-        .expect("no vendored device() declares asynInt32, so there is no link type to enforce");
+async fn a_dtyp_no_device_line_declares_does_not_load() {
+    let built =
+        loads("    field(DTYP, \"asynInt32\")\n    field(INP, \"@asyn(PORT,0)VALUE\")").await;
+    assert!(
+        built.is_err(),
+        "no loaded device() declares asynInt32, so `dbPutString` refuses the DTYP"
+    );
     assert_eq!(refusal("asynInt32", "INP", "@asyn(PORT,0)VALUE"), None);
-    assert_eq!(link_text(&db, "INP"), "@asyn(PORT,0)VALUE");
 }
 
 /// The pass rewrites link text, so it owns re-deriving whatever a record
@@ -341,7 +339,7 @@ async fn a_refused_link_leaves_no_stale_classification_behind() {
         inst.record.get_field("INPA"),
         Some(epics_base_rs::types::EpicsValue::String("".into()))
     );
-    assert_eq!(inst.common.out, "");
+    assert_eq!(inst.common.text.out, "");
     // calcout's `INAV`/`OUTV` menu is `{Ext PV NC, Ext PV OK, Local PV,
     // Constant}` (`calcoutRecord.dbd`), so `Constant` is index 3.
     assert_eq!(
@@ -353,5 +351,154 @@ async fn a_refused_link_leaves_no_stale_classification_behind() {
         inst.record.get_field("OUTV"),
         Some(epics_base_rs::types::EpicsValue::Enum(3)),
         "OUTV must be Constant — calcout captures the common OUT in init_links"
+    );
+}
+
+/// A record type with no `device()` line has no `devSup`, so its INP/OUT
+/// expects CONSTANT as every other link field does (`dbStaticLib.c:2187-2193`).
+/// The C `softIoc` on `record(compress,"T:C1"){ field(INP,"@instio parm") }`:
+///
+/// ```text
+/// ERROR: T:C1.INP: can't initialize link type CONSTANT with "@instio parm" (type INST_IO)
+/// ```
+#[epics_macros_rs::epics_test]
+async fn a_device_link_of_a_type_without_device_support_is_held_to_constant() {
+    let line = link_type_refusal("T:C1", "compress", None, "INP", "@instio parm")
+        .expect("compress has no device support: C refuses a hardware INP");
+    assert_eq!(
+        line,
+        "T:C1.INP: can't initialize link type CONSTANT with \"@instio parm\" (type INST_IO)"
+    );
+    let (db, _) = IocBuilder::new()
+        .db_string(
+            "record(compress, \"T:C1\") {\n    field(INP, \"@instio parm\")\n}\n",
+            &HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    assert_eq!(db.get_record("T:C1").unwrap().read().common.text.inp, "");
+}
+
+/// The ten-record transcript above, heard where C prints it: `iocInit`'s
+/// refusal lines go through errlog, so an errlog listener receives each one.
+#[epics_macros_rs::epics_test]
+async fn the_refusals_print_through_errlog_at_ioc_init() {
+    use epics_base_rs::runtime::log::{errlog_add_listener, errlog_flush, errlog_strip_ansi};
+    use std::sync::Mutex;
+
+    let heard = Arc::new(Mutex::new(Vec::<String>::new()));
+    let sink = Arc::clone(&heard);
+    errlog_add_listener(move |m| {
+        let m = errlog_strip_ansi(m);
+        if m.contains(": T:") {
+            sink.lock().unwrap().push(m);
+        }
+    });
+    // `build` ends in `ioc_init`.
+    IocBuilder::new()
+        .db_string(
+            r##"
+record(ai,"T:R1"){ field(DTYP,"Soft Timestamp") field(INP,"5")           }
+record(ai,"T:R2"){ field(DTYP,"Soft Timestamp") field(INP,"OTHER.VAL")   }
+record(ai,"T:R3"){ field(DTYP,"Soft Timestamp") field(INP,"")            }
+record(ai,"T:R4"){ field(DTYP,"Soft Channel")   field(INP,"@instio parm")}
+record(ai,"T:R5"){ field(DTYP,"Soft Timestamp") field(INP,"#C0 S0 @x")   }
+record(ai,"T:N1"){                              field(INP,"@instio parm")}
+record(ai,"T:N2"){ field(DTYP,"Soft Channel")   field(SDIS,"@instio parm")}
+record(ai,"T:N3"){ field(DTYP,"Soft Channel")   field(FLNK,"@instio parm")}
+record(ai,"T:A1"){ field(DTYP,"Soft Timestamp") field(INP,"@instio parm")}
+record(ai,"T:A2"){ field(DTYP,"Soft Channel")   field(INP,"5")           }
+"##,
+            &HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    errlog_flush();
+    let want = [
+        r#"T:R1.INP: can't initialize link type INST_IO with "5" (type CONSTANT)"#,
+        r#"T:R2.INP: can't initialize link type INST_IO with "OTHER.VAL" (type PV_LINK)"#,
+        r#"T:R3.INP: can't initialize link type INST_IO with "" (type CONSTANT)"#,
+        r#"T:R4.INP: can't initialize link type CONSTANT with "@instio parm" (type INST_IO)"#,
+        r##"T:R5.INP: can't initialize link type INST_IO with "#C0 S0 @x" (type VME_IO)"##,
+        r#"T:N1.INP: can't initialize link type CONSTANT with "@instio parm" (type INST_IO)"#,
+        r#"T:N2.SDIS: can't initialize link type CONSTANT with "@instio parm" (type INST_IO)"#,
+        r#"T:N3.FLNK: can't initialize link type CONSTANT with "@instio parm" (type INST_IO)"#,
+    ]
+    .map(|line| format!("ERROR: {line}\n"));
+    assert_eq!(*heard.lock().unwrap(), want);
+}
+
+/// `iocInit` walks the records type-major (`iterateRecords`, `iocInit.c:484`)
+/// over the name-sorted `recordTypeList`, load order within a type, so its
+/// lines come out in that order and not the `.db`'s. softIoc R7.0.10 on the DB
+/// below prints, after the load's own six CP lines, exactly `want`.
+#[epics_macros_rs::epics_test]
+async fn the_ioc_init_lines_follow_cs_record_type_order() {
+    use epics_base_rs::runtime::log::{errlog_add_listener, errlog_flush, errlog_strip_ansi};
+    use std::sync::Mutex;
+
+    let heard = Arc::new(Mutex::new(Vec::<String>::new()));
+    let sink = Arc::clone(&heard);
+    errlog_add_listener(move |m| {
+        let m = errlog_strip_ansi(m);
+        if m.contains("Discarding") || m.contains("can't initialize") {
+            sink.lock().unwrap().push(m);
+        }
+    });
+    // `build` is the load and then `ioc_init`.
+    IocBuilder::new()
+        .db_string(
+            r#"
+record(seq, "S1") { field(LNK1, "R:S CP") }
+record(ao, "A1") { field(OUT, "X:Y CP") }
+record(ai, "I1") { field(DTYP, "Soft Timestamp") field(INP, "5") }
+record(calcout, "C1") { field(OUT, "E:F CP") }
+record(ao, "A2") { field(OUT, "X:Z CP") }
+record(waveform, "W1") { field(DTYP, "Soft Channel") field(INP, "@w") }
+record(bo, "B1") { field(OUT, "B:B CP") }
+record(aSub, "U1") { field(OUTA, "U:U CP") }
+record(ai, "I2") { field(INP, "@x") }
+"#,
+            &HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    errlog_flush();
+    let cp = |from: &str, to: &str| {
+        format!("WARNING: Discarding CP/CPP modifier in CA output link from {from} to {to}.\n")
+    };
+    let load = [
+        cp("S1.LNK1", "R:S"),
+        cp("A1.OUT", "X:Y"),
+        cp("C1.OUT", "E:F"),
+        cp("A2.OUT", "X:Z"),
+        cp("B1.OUT", "B:B"),
+        cp("U1.OUTA", "U:U"),
+    ];
+    let ioc_init = [
+        cp("U1.OUTA", "U:U"),
+        r#"ERROR: I1.INP: can't initialize link type INST_IO with "5" (type CONSTANT)"#.to_string()
+            + "\n",
+        r#"ERROR: I2.INP: can't initialize link type CONSTANT with "@x" (type INST_IO)"#
+            .to_string()
+            + "\n",
+        cp("A1.OUT", "X:Y"),
+        cp("A2.OUT", "X:Z"),
+        cp("B1.OUT", "B:B"),
+        cp("C1.OUT", "E:F"),
+        cp("S1.LNK1", "R:S"),
+        r#"ERROR: W1.INP: can't initialize link type CONSTANT with "@w" (type INST_IO)"#
+            .to_string()
+            + "\n",
+    ];
+    assert_eq!(
+        *heard.lock().unwrap(),
+        [load.to_vec(), ioc_init.to_vec()].concat()
     );
 }

@@ -1,0 +1,3 @@
+Terminator = CR LF;
+ReplyTimeout = 200;
+p { out "GET"; in "%d"; }

@@ -1,0 +1,2 @@
+Terminator = CR LF;
+pi { out "W%d"; in "%d"; @init { out "I"; in "%d"; } }

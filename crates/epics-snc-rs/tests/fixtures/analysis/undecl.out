@@ -1,0 +1,7 @@
+$ snc undecl.st
+$ snc +W undecl.st
+undecl.st:5: warning: treating undeclared object 'nope' as foreign
+undecl.st:6: warning: treating undeclared object 'undef1' as foreign
+undecl.st:8: warning: treating undeclared object 'exit' as foreign
+undecl.st:9: warning: treating undeclared object 'sizeof' as foreign
+$ snc -w undecl.st

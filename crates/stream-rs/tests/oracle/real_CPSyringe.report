@@ -1,0 +1,179 @@
+rec0: CPSyringe.proto getString(1,2,3,4,5,6,7,8,9) P
+getString {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 3000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 500; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "1?";
+    in "\x0d\x0a%s\x0d\x0a%*[><:NE]";
+}
+rec1: CPSyringe.proto setString(1,2,3,4,5,6,7,8,9) P
+setString {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 3000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 500; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "1 %s";
+    in "\x0d\x0a%*[><:NE]";
+}
+rec2: CPSyringe.proto setNoneString(1,2,3,4,5,6,7,8,9) P
+setNoneString {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 3000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 500; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "%s";
+    in "\x0d\x0a%*[><:NE]";
+}
+rec3: CPSyringe.proto getInt(1,2,3,4,5,6,7,8,9) P
+getInt {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 3000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 500; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "1?";
+    in "\x0d\x0a%d\x0d\x0a%*[><:NE]";
+}
+rec4: CPSyringe.proto setInt(1,2,3,4,5,6,7,8,9) P
+setInt {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 3000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 500; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "1 %d";
+    in "\x0d\x0a%*[><:NE]";
+}
+rec5: CPSyringe.proto getFloat(1,2,3,4,5,6,7,8,9) P
+getFloat {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 3000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 500; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "1?";
+    in "\x0d\x0a%f\x0d\x0a%*[><:NE]";
+}
+rec6: CPSyringe.proto getFloatEGU(1,2,3,4,5,6,7,8,9) P
+getFloatEGU {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 3000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 500; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "\r";
+  separator     = "";
+  @Mismatch {
+    in "NA";
+  }
+
+    out "1?";
+    in "\x0d\x0a%f %(EGU)s\x0d\x0a%*[><:NE]";
+}
+rec7: CPSyringe.proto setFloat(1,2,3,4,5,6,7,8,9) P
+setFloat {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 3000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 500; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "1 %.3f %(EGU)s";
+    in "\x0d\x0a%*[><:NE]";
+}
+rec8: CPSyringe.proto setNone(1,2,3,4,5,6,7,8,9) P
+setNone {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 3000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 500; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "1";
+    in "\x0d\x0a%*[><:NE]";
+}
+rec9: CPSyringe.proto reverseDirection(1,2,3,4,5,6,7,8,9) P
+reverseDirection {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 3000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 500; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "dir rev";
+    in "\x0d\x0a%*[><:NE]";
+}
+rec10: CPSyringe.proto getRun(1,2,3,4,5,6,7,8,9) P
+getRun {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 3000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 500; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "run?";
+    in "\x0d\x0a%[><:NE]";
+}

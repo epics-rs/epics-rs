@@ -18,7 +18,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use epics_base_rs::server::database::{LinkPutOp, LinkSet, PvDatabase};
+use epics_base_rs::server::database::{LinkPutOp, LinkRef, LinkSet, PvDatabase};
 use epics_base_rs::server::recgbl::alarm_status;
 use epics_base_rs::server::record::AlarmSeverity;
 use epics_base_rs::server::records::ao::AoRecord;
@@ -30,16 +30,16 @@ struct FailingLset;
 
 #[async_trait::async_trait]
 impl LinkSet for FailingLset {
-    fn is_connected(&self, _: &str) -> bool {
+    fn is_connected(&self, _: LinkRef<'_>) -> bool {
         false
     }
-    fn get_cached_value(&self, _: &str) -> Option<EpicsValue> {
+    fn get_cached_value(&self, _: LinkRef<'_>) -> Option<EpicsValue> {
         None
     }
-    async fn get_value(&self, name: &str) -> Option<EpicsValue> {
-        self.get_cached_value(name)
+    async fn get_value(&self, link: LinkRef<'_>) -> Option<EpicsValue> {
+        self.get_cached_value(link)
     }
-    async fn put_value(&self, _: &str, _: EpicsValue, _: LinkPutOp) -> Result<(), String> {
+    async fn put_value(&self, _: LinkRef<'_>, _: EpicsValue, _: LinkPutOp) -> Result<(), String> {
         Err("not connected".to_string())
     }
 }
@@ -51,17 +51,26 @@ struct OkLset {
 
 #[async_trait::async_trait]
 impl LinkSet for OkLset {
-    fn is_connected(&self, _: &str) -> bool {
+    fn is_connected(&self, _: LinkRef<'_>) -> bool {
         true
     }
-    fn get_cached_value(&self, _: &str) -> Option<EpicsValue> {
+    fn get_cached_value(&self, _: LinkRef<'_>) -> Option<EpicsValue> {
         None
     }
-    async fn get_value(&self, name: &str) -> Option<EpicsValue> {
-        self.get_cached_value(name)
+    async fn get_value(&self, link: LinkRef<'_>) -> Option<EpicsValue> {
+        self.get_cached_value(link)
     }
-    async fn put_value(&self, name: &str, _: EpicsValue, _: LinkPutOp) -> Result<(), String> {
-        self.puts.lock().unwrap().push(name.to_string());
+    async fn put_value(
+        &self,
+        link: LinkRef<'_>,
+        _: EpicsValue,
+        _: LinkPutOp,
+    ) -> Result<(), String> {
+        let name = link.name;
+        self.puts
+            .lock()
+            .unwrap()
+            .push(String::from_utf8_lossy(name).into_owned());
         Ok(())
     }
 }
@@ -72,10 +81,11 @@ async fn add_ao_with_out(db: &PvDatabase, name: &str, out: &str) {
     db.add_record(name, Box::new(AoRecord::new(3.0)))
         .await
         .unwrap();
+    db.put_pv_no_process(format!("{name}.OUT"), EpicsValue::String(out.into()))
+        .await
+        .unwrap();
     let rec = db.get_record(name).expect("just added");
     let mut inst = rec.write();
-    inst.put_common_field("OUT", EpicsValue::String(out.into()))
-        .unwrap();
     inst.common.udf = 0;
 }
 
@@ -90,11 +100,14 @@ async fn alarm_of(db: &PvDatabase, name: &str) -> (u16, AlarmSeverity) {
 #[epics_macros_rs::epics_test]
 async fn r14_62_failing_local_out_put_raises_link_invalid_same_cycle() {
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     add_ao_with_out(&db, "AO_BADOUT", "NO_SUCH_TARGET").await;
 
     let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("AO_BADOUT", &mut visited)
         .await
+        .or_else(epics_base_rs::error::CaError::unless_process_status)
         .unwrap();
 
     assert_eq!(
@@ -111,6 +124,8 @@ async fn r14_62_failing_local_out_put_raises_link_invalid_same_cycle() {
 #[epics_macros_rs::epics_test]
 async fn r14_62_failing_external_out_put_raises_link_invalid() {
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     db.register_link_set("ca", Arc::new(FailingLset)).await;
 
     add_ao_with_out(&db, "AO_BADCA", "ca://REMOTE:OUT").await;
@@ -118,6 +133,7 @@ async fn r14_62_failing_external_out_put_raises_link_invalid() {
     let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("AO_BADCA", &mut visited)
         .await
+        .or_else(epics_base_rs::error::CaError::unless_process_status)
         .unwrap();
 
     assert_eq!(
@@ -135,18 +151,21 @@ async fn r14_62_failing_external_out_put_raises_link_invalid() {
 #[epics_macros_rs::epics_test]
 async fn r14_62_failing_siol_sim_write_raises_link_invalid() {
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     db.add_record("SIM_ON", Box::new(AoRecord::new(1.0)))
         .await
         .unwrap();
 
     let mut ao = AoRecord::new(55.0);
-    ao.siml = "SIM_ON".to_string(); // nonzero → SIMM=YES this cycle
-    ao.siol = "NO_SUCH_SIOL".to_string(); // no local record, no link set
+    ao.siml = "SIM_ON".into(); // nonzero → SIMM=YES this cycle
+    ao.siol = "NO_SUCH_SIOL".into(); // no local record, no link set
     db.add_record("AO_BADSIOL", Box::new(ao)).await.unwrap();
 
     let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("AO_BADSIOL", &mut visited)
         .await
+        .or_else(epics_base_rs::error::CaError::unless_process_status)
         .unwrap();
 
     assert_eq!(
@@ -164,13 +183,17 @@ async fn r14_62_failing_siol_sim_write_raises_link_invalid() {
 async fn r14_62_successful_put_next_cycle_clears_the_link_alarm() {
     let puts = Arc::new(Mutex::new(Vec::new()));
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     db.register_link_set("ca", Arc::new(FailingLset)).await;
+    db.process_cp_links_on_connect().await;
 
     add_ao_with_out(&db, "AO_RECOVER", "ca://REMOTE:OUT").await;
 
     let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("AO_RECOVER", &mut visited)
         .await
+        .or_else(epics_base_rs::error::CaError::unless_process_status)
         .unwrap();
     assert_eq!(
         alarm_of(&db, "AO_RECOVER").await,
@@ -186,6 +209,7 @@ async fn r14_62_successful_put_next_cycle_clears_the_link_alarm() {
         }),
     )
     .await;
+    db.process_cp_links_on_connect().await;
 
     let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("AO_RECOVER", &mut visited)
@@ -215,6 +239,8 @@ async fn r14_62_successful_put_next_cycle_clears_the_link_alarm() {
 #[epics_macros_rs::epics_test]
 async fn r14_62_successful_local_out_put_raises_no_alarm() {
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     db.add_record("AO_GOOD_DEST", Box::new(AoRecord::new(0.0)))
         .await
         .unwrap();

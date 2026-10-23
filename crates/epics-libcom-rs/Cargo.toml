@@ -9,6 +9,8 @@ repository.workspace = true
 
 [dependencies]
 parking_lot = "0.12"
+# `runtime::task::enter_ioc_thread` builds a thread's park state at entry.
+parking_lot_core = "0.9"
 tracing = "0.1"
 # `runtime::general_time` formats an `epicsTimeStamp` the way C's
 # `epicsTimeToStrftime` does; `runtime::log` timestamps every errlog line the
@@ -31,15 +33,14 @@ hostname = "0.4"
 # executor) but must still type-check for `--lib`.
 [target.'cfg(not(any(target_os = "rtems", target_os = "vxworks")))'.dependencies]
 tokio = { version = "1", features = ["full"] }
-# `socket2` + `if-addrs` back the async UDP stack (`net::async_udp_v4` /
+# `socket2` backs the async UDP stack (`net::async_udp_v4` /
 # `net::iface_map`). Host-only for the same reason the whole socket half of
-# `net` is: they do not build for armv7-rtems-eabihf or the `*-wrs-vxworks*`
+# `net` is: it does not build for armv7-rtems-eabihf or the `*-wrs-vxworks*`
 # triples, and the embedded CA server uses the separate S1 raw-libc socket
 # driver instead. The module gate in `net/mod.rs` matches this table
 # (`epics_embedded_target`, the `build.rs`-emitted cfg `Cargo.toml` target
 # tables cannot express directly).
 socket2 = { version = "0.5", features = ["all"] }
-if-addrs = "0.13"
 
 [target.'cfg(any(target_os = "rtems", target_os = "vxworks"))'.dependencies]
 tokio = { version = "1", default-features = false, features = [
@@ -64,15 +65,28 @@ tokio = { version = "1", default-features = false, features = [
 # and `recvmsg`/cmsg parsing in `net::async_udp_v4`, `getifaddrs` in
 # `net::iface_map`, `SCHED_FIFO` in `runtime::task`, `PTHREAD_PRIO_INHERIT` in
 # `runtime::sync`); this gate governs only whether libc is linked at all.
-# Windows still skips it entirely.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# `runtime::socket::poll_ready`'s `WSAPoll`; `net::win_adapters`'s
+# `GetAdaptersAddresses`; `runtime::task::current_thread_stack_low`'s
+# `GetCurrentThreadStackLimits`. libc is `runtime::crt_errno`'s CRT `strerror`.
+[target.'cfg(windows)'.dependencies]
+libc = "0.2"
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+    "Win32_System_Threading",
+] }
 
 # VxWorks only: `runtime::task::enter_ioc_thread` announces each IOC thread to
 # the statistics funnel's thread census. VxWorks 7 gives an RTP no task
 # enumerator at all (`taskIdListGet` and `taskEach` are kernel-mode only), so
 # unlike RTEMS — where `rtems_task_iterate` walks the kernel's own table — the
-# list has to be built as the threads start.
+# list has to be built as the threads start. `current_thread_stack_low` reads
+# the task's stack end from the `TASK_DESC` this package binds.
 #
 # Target-gated rather than a plain dependency, and the gate is doing real work:
 # on RTEMS `epics-rtems-boot`'s build script emits an *image* link contract

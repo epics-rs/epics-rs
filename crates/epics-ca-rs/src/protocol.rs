@@ -37,8 +37,9 @@ pub const CA_MINIMUM_SUPPORTED_VERSION: u16 = 4;
 /// C `CA_VSUPPORTED` (`caProto.h:35`), and it gates four handlers:
 /// `tcp_version_action` (`camessage.c:366`), `udp_version_action` (`:2098`),
 /// `search_reply_udp` (`:2151`) and `search_reply_tcp` (`:2238`). All four
-/// read `mp->m_count` — the version the message in hand declares — and all
-/// four answer `RSRV_ERROR`, which stops the server reading from that peer.
+/// read `mp->m_count` — the version the message in hand declares, see
+/// [`declared_minor`] — and all four answer `RSRV_ERROR`, which stops the
+/// server reading from that peer.
 ///
 /// It takes the header rather than a number on purpose. The other version a
 /// CA server holds is the one its circuit negotiated
@@ -47,7 +48,20 @@ pub const CA_MINIMUM_SUPPORTED_VERSION: u16 = 4;
 /// signature makes unwritable: a SEARCH may arrive on a circuit whose
 /// handshake said something else entirely, and C answers the frame.
 pub fn declares_supported_version(hdr: &CaHeader) -> bool {
-    hdr.count >= CA_MINIMUM_SUPPORTED_VERSION
+    declared_minor(hdr) >= CA_MINIMUM_SUPPORTED_VERSION
+}
+
+/// The minor version a VERSION or SEARCH declares: `msg.m_count`, which an
+/// extended header carries in its annex (`camessage.c:2464-2471`).
+pub fn declared_minor(hdr: &CaHeader) -> u16 {
+    minor_from(hdr.actual_count())
+}
+
+/// C's `unsigned minor_version_number` (`server.h:100`) as the `u16` kept
+/// here. Every `CA_Vxx` test is `>=` a constant below 14, so saturating
+/// answers each one as the full value does.
+pub fn minor_from(version: u32) -> u16 {
+    u16::try_from(version).unwrap_or(u16::MAX)
 }
 
 /// **The one owner of "is this a CA opcode a TCP circuit may carry?"**
@@ -153,166 +167,9 @@ pub const CA_DO_REPLY: u16 = 10;
 /// suppress per-request NOT_FOUND replies.
 pub const CA_DONT_REPLY: u16 = 5;
 
-// ECA status codes — DEFMSG(severity, msg_no) encoding per caerr.h.
-// Values match epics-base verbatim so the wire protocol is interoperable.
-pub const CA_K_INFO: u32 = 3;
-pub const CA_K_ERROR: u32 = 2;
-pub const CA_K_SUCCESS: u32 = 1;
-pub const CA_K_WARNING: u32 = 0;
-pub const CA_K_SEVERE: u32 = 4;
-pub const CA_K_FATAL: u32 = CA_K_ERROR | CA_K_SEVERE; // 6
-
-pub const fn defmsg(sev: u32, num: u32) -> u32 {
-    ((num << 3) & 0x0000FFF8) | (sev & 0x00000007)
-}
-
-// Full ECA table — see caerr.h for canonical definitions.
-pub const ECA_NORMAL: u32 = defmsg(CA_K_SUCCESS, 0);
-pub const ECA_MAXIOC: u32 = defmsg(CA_K_ERROR, 1);
-pub const ECA_UKNHOST: u32 = defmsg(CA_K_ERROR, 2);
-pub const ECA_UKNSERV: u32 = defmsg(CA_K_ERROR, 3);
-pub const ECA_SOCK: u32 = defmsg(CA_K_ERROR, 4);
-pub const ECA_CONN: u32 = defmsg(CA_K_WARNING, 5);
-pub const ECA_ALLOCMEM: u32 = defmsg(CA_K_WARNING, 6);
-pub const ECA_UKNCHAN: u32 = defmsg(CA_K_WARNING, 7);
-pub const ECA_UKNFIELD: u32 = defmsg(CA_K_WARNING, 8);
-pub const ECA_TOLARGE: u32 = defmsg(CA_K_WARNING, 9);
-pub const ECA_TIMEOUT: u32 = defmsg(CA_K_WARNING, 10);
-pub const ECA_NOSUPPORT: u32 = defmsg(CA_K_WARNING, 11);
-pub const ECA_STRTOBIG: u32 = defmsg(CA_K_WARNING, 12);
-pub const ECA_DISCONNCHID: u32 = defmsg(CA_K_ERROR, 13);
-pub const ECA_BADTYPE: u32 = defmsg(CA_K_ERROR, 14);
-pub const ECA_CHIDNOTFND: u32 = defmsg(CA_K_INFO, 15);
-pub const ECA_CHIDRETRY: u32 = defmsg(CA_K_INFO, 16);
-pub const ECA_INTERNAL: u32 = defmsg(CA_K_FATAL, 17);
-pub const ECA_DBLCLFAIL: u32 = defmsg(CA_K_WARNING, 18);
-pub const ECA_GETFAIL: u32 = defmsg(CA_K_WARNING, 19);
-pub const ECA_PUTFAIL: u32 = defmsg(CA_K_WARNING, 20);
-pub const ECA_ADDFAIL: u32 = defmsg(CA_K_WARNING, 21);
-pub const ECA_BADCOUNT: u32 = defmsg(CA_K_WARNING, 22);
-pub const ECA_BADSTR: u32 = defmsg(CA_K_ERROR, 23);
-pub const ECA_DISCONN: u32 = defmsg(CA_K_WARNING, 24);
-pub const ECA_DBLCHNL: u32 = defmsg(CA_K_WARNING, 25);
-pub const ECA_EVDISALLOW: u32 = defmsg(CA_K_ERROR, 26);
-pub const ECA_BUILDGET: u32 = defmsg(CA_K_WARNING, 27);
-pub const ECA_NEEDSFP: u32 = defmsg(CA_K_WARNING, 28);
-pub const ECA_OVEVFAIL: u32 = defmsg(CA_K_WARNING, 29);
-pub const ECA_BADMONID: u32 = defmsg(CA_K_ERROR, 30);
-pub const ECA_NEWADDR: u32 = defmsg(CA_K_WARNING, 31);
-pub const ECA_NEWCONN: u32 = defmsg(CA_K_INFO, 32);
-pub const ECA_NOCACTX: u32 = defmsg(CA_K_WARNING, 33);
-pub const ECA_DEFUNCT: u32 = defmsg(CA_K_FATAL, 34);
-pub const ECA_EMPTYSTR: u32 = defmsg(CA_K_WARNING, 35);
-pub const ECA_NOREPEATER: u32 = defmsg(CA_K_WARNING, 36);
-pub const ECA_NOCHANMSG: u32 = defmsg(CA_K_WARNING, 37);
-pub const ECA_DLCKREST: u32 = defmsg(CA_K_WARNING, 38);
-pub const ECA_SERVBEHIND: u32 = defmsg(CA_K_WARNING, 39);
-pub const ECA_NOCAST: u32 = defmsg(CA_K_WARNING, 40);
-pub const ECA_BADMASK: u32 = defmsg(CA_K_ERROR, 41);
-pub const ECA_IODONE: u32 = defmsg(CA_K_INFO, 42);
-pub const ECA_IOINPROGRESS: u32 = defmsg(CA_K_INFO, 43);
-pub const ECA_BADSYNCGRP: u32 = defmsg(CA_K_ERROR, 44);
-pub const ECA_PUTCBINPROG: u32 = defmsg(CA_K_ERROR, 45);
-pub const ECA_NORDACCESS: u32 = defmsg(CA_K_WARNING, 46);
-pub const ECA_NOWTACCESS: u32 = defmsg(CA_K_WARNING, 47);
-pub const ECA_ANACHRONISM: u32 = defmsg(CA_K_ERROR, 48);
-pub const ECA_NOSEARCHADDR: u32 = defmsg(CA_K_WARNING, 49);
-pub const ECA_NOCONVERT: u32 = defmsg(CA_K_WARNING, 50);
-pub const ECA_BADCHID: u32 = defmsg(CA_K_ERROR, 51);
-pub const ECA_BADFUNCPTR: u32 = defmsg(CA_K_ERROR, 52);
-pub const ECA_ISATTACHED: u32 = defmsg(CA_K_WARNING, 53);
-pub const ECA_UNAVAILINSERV: u32 = defmsg(CA_K_WARNING, 54);
-pub const ECA_CHANDESTROY: u32 = defmsg(CA_K_WARNING, 55);
-pub const ECA_BADPRIORITY: u32 = defmsg(CA_K_ERROR, 56);
-pub const ECA_NOTTHREADED: u32 = defmsg(CA_K_ERROR, 57);
-pub const ECA_16KARRAYCLIENT: u32 = defmsg(CA_K_WARNING, 58);
-pub const ECA_CONNSEQTMO: u32 = defmsg(CA_K_WARNING, 59);
-pub const ECA_UNRESPTMO: u32 = defmsg(CA_K_WARNING, 60);
-
-/// Extract the message number (caerr.h MSG_NO_OF_STATUS).
-pub const fn eca_msg_no(status: u32) -> u32 {
-    (status >> 3) & 0x1FFF
-}
-
-/// Extract severity bits (caerr.h SEVERITY_OF_STATUS).
-pub const fn eca_severity(status: u32) -> u32 {
-    status & 0x7
-}
-
-/// Human-readable text for an ECA status, mirroring libca `ca_message`.
-pub fn eca_message(status: u32) -> &'static str {
-    let msg_no = eca_msg_no(status) as usize;
-    ECA_MESSAGE_TEXT
-        .get(msg_no)
-        .copied()
-        .unwrap_or("Unknown ECA status")
-}
-
-/// Strings copied verbatim from `epics-base/modules/ca/src/client/access.cpp`
-/// `ca_message_text[]`.
-pub const ECA_MESSAGE_TEXT: &[&str] = &[
-    "Normal successful completion",
-    "Maximum simultaneous IOC connections exceeded",
-    "Unknown internet host",
-    "Unknown internet service",
-    "Unable to allocate a new socket",
-    "Unable to connect to internet host or service",
-    "Unable to allocate additional dynamic memory",
-    "Unknown IO channel",
-    "Record field specified inappropriate for channel specified",
-    "The requested data transfer is greater than available memory or EPICS_CA_MAX_ARRAY_BYTES",
-    "User specified timeout on IO operation expired",
-    "Sorry, that feature is planned but not supported at this time",
-    "The supplied string is unusually large",
-    "The request was ignored because the specified channel is disconnected",
-    "The data type specified is invalid",
-    "Remote Channel not found",
-    "Unable to locate all user specified channels",
-    "Channel Access Internal Failure",
-    "The requested local DB operation failed",
-    "Channel read request failed",
-    "Channel write request failed",
-    "Channel subscription request failed",
-    "Invalid element count requested",
-    "Invalid string",
-    "Virtual circuit disconnect",
-    "Identical process variable names on multiple servers",
-    "Request inappropriate within subscription (monitor) update callback",
-    "Database value get for that channel failed during channel search",
-    "Unable to initialize without the vxWorks VX_FP_TASK task option set",
-    "Event queue overflow has prevented first pass event after event add",
-    "Bad event subscription (monitor) identifier",
-    "Remote channel has new network address",
-    "New or resumed network connection",
-    "Specified task isn't a member of a CA context",
-    "Attempt to use defunct CA feature failed",
-    "The supplied string is empty",
-    "Unable to spawn the CA repeater thread- auto reconnect will fail",
-    "No channel id match for search reply- search reply ignored",
-    "Resetting dead connection- will try to reconnect",
-    "Server (IOC) has fallen behind or is not responding- still waiting",
-    "No internet interface with broadcast available",
-    "Invalid event selection mask",
-    "IO operations have completed",
-    "IO operations are in progress",
-    "Invalid synchronous group identifier",
-    "Put callback timed out",
-    "Read access denied",
-    "Write access denied",
-    "Requested feature is no longer supported",
-    "Empty PV search address list",
-    "No reasonable data conversion between client and server types",
-    "Invalid channel identifier",
-    "Invalid function pointer",
-    "Thread is already attached to a client context",
-    "Not supported by attached service",
-    "User destroyed channel",
-    "Invalid channel priority",
-    "Preemptive callback not enabled - additional threads may not join context",
-    "Client's protocol revision does not support transfers exceeding 16k bytes",
-    "Virtual circuit connection sequence aborted",
-    "Virtual circuit unresponsive",
-];
+// The caerr.h codes and `ca_message` table, kept with the database that
+// reports them too.
+pub use epics_base_rs::error::eca::*;
 
 /// The absolute ceiling on a single inbound CA message body, in bytes.
 ///
@@ -694,9 +551,24 @@ pub fn build_put_frame(
     hdr.set_payload_size(body.len(), count, peer_minor)
         .map_err(|_| CaError::BadCount)?;
 
-    let mut frame = hdr.to_bytes_extended();
-    frame.extend_from_slice(&body);
-    Ok(frame)
+    Ok([&hdr.to_bytes_extended()[..], &body[..]].concat())
+}
+
+/// An encoded CA header, 16 or 24 bytes, held by value: framing copies it
+/// into the frame's own buffer, and a heap copy of 24 bytes per message is
+/// an allocation C's `cas_copy_in_header` never makes.
+#[derive(Debug, Clone, Copy)]
+pub struct HeaderBytes {
+    buf: [u8; 24],
+    len: u8,
+}
+
+impl std::ops::Deref for HeaderBytes {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        &self.buf[..usize::from(self.len)]
+    }
 }
 
 /// 16-byte CA message header (big-endian), with optional extended fields.
@@ -815,16 +687,21 @@ impl CaHeader {
     }
 
     /// Serialize header, including extended fields if present.
-    pub fn to_bytes_extended(&self) -> Vec<u8> {
-        let mut buf = self.to_bytes().to_vec();
+    pub fn to_bytes_extended(&self) -> HeaderBytes {
+        let mut out = HeaderBytes {
+            buf: [0u8; 24],
+            len: 16,
+        };
+        out.buf[..16].copy_from_slice(&self.to_bytes());
         if self.is_extended() {
             // SAFETY: is_extended() guarantees extended_postsize.is_some()
-            buf.extend_from_slice(&self.extended_postsize.unwrap().to_be_bytes());
+            out.buf[16..20].copy_from_slice(&self.extended_postsize.unwrap().to_be_bytes());
             // SAFETY: extended_count is always set alongside extended_postsize
             // in both set_payload_size() and from_bytes_extended()
-            buf.extend_from_slice(&self.extended_count.unwrap_or(0).to_be_bytes());
+            out.buf[20..24].copy_from_slice(&self.extended_count.unwrap_or(0).to_be_bytes());
+            out.len = 24;
         }
-        buf
+        out
     }
 
     pub fn from_bytes(buf: &[u8]) -> CaResult<Self> {
@@ -914,7 +791,12 @@ pub fn align8(size: usize) -> usize {
 
 /// Build a padded, null-terminated, 8-byte aligned payload from a string
 pub fn pad_string(s: &str) -> Vec<u8> {
-    let mut bytes = s.as_bytes().to_vec();
+    pad_bytes(s.as_bytes())
+}
+
+/// [`pad_string`] for a payload that is bytes, not text.
+pub fn pad_bytes(s: &[u8]) -> Vec<u8> {
+    let mut bytes = s.to_vec();
     bytes.push(0); // null terminator
     let padded_len = align8(bytes.len());
     bytes.resize(padded_len, 0);

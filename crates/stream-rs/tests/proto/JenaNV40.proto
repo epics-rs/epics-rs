@@ -1,0 +1,36 @@
+# Protocol file for Piezosystems Jena NV 40/1 CLE
+# http://www.piezojena.com/en/site/piezo-controller-and-amplifier__183/
+
+############  SVN Repository information  #############
+# $Date$
+# $Author$
+# $Revision$
+# $HeadURL$
+# $Id$
+#######################################################
+
+OutTerminator = CR;
+InTerminator = CR LF;
+
+readError {
+  out "err";
+  in "err,%s";
+}
+
+writeValue {
+  out "wr,%0.2f";
+}
+
+readValue {
+  out "rd";
+  in "rd,%f";
+}
+
+closedLoop {
+  out "%{ol|cl}";
+}
+
+remoteControl {
+  out "%{i0|i1}";
+}
+

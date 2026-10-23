@@ -1,0 +1,5 @@
+extraInput=ignore;
+get_all {
+   out "\x00\xE1";
+   in "%(\$1:A1_raw.VAL)4r%(\$1:A2_raw.VAL)4r%(\$1:A3_raw.VAL)4r%(\$1:T_raw.VAL)2r%(\$1:CS_raw.VAL)r";
+}

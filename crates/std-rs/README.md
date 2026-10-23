@@ -10,7 +10,7 @@ No C dependencies. Just `cargo build`.
 
 The `std` module is a foundational synApps package providing PID feedback control, rate-limited outputs, formatted timestamps, sequence programs, and dozens of beamline utility databases. It's used as a base layer by virtually every synApps IOC.
 
-std-rs ports the C synApps `std` module to native Rust, including the three core records (`epid`, `throttle`, `timestamp`), four device support implementations, native Rust async replacements for two SNL state machines (`delayDo`, `femto`), and 51 database templates ready to load with `dbLoadRecords`, plus 31 autosave `.req` files.
+std-rs ports the C synApps `std` module to native Rust, including the three core records (`epid`, `throttle`, `timestamp`), four device support implementations, two SNL programs (`delayDo`, `femto`) compiled from the upstream `.st` by snc-rs and run on `epics-seq-rs`, and 51 database templates ready to load with `dbLoadRecords`, plus 31 autosave `.req` files.
 
 ## Features
 
@@ -37,7 +37,7 @@ Rate-limiting output forwarder:
 - Rate limit RMAX (units/sec)
 - Minimum delay RMIN between writes
 - SYNC input for forced re-sync to current INP value
-- Async delayed reprocess via `ReprocessAfter` action
+- DLY cooldown via the `ValuePutAfter` action, never a process cycle
 
 ### timestamp Record
 Wall-clock timestamp string with 11 format options:
@@ -56,7 +56,7 @@ Wall-clock timestamp string with 11 format options:
 | **Sec Past Epoch** | ai | Unix epoch seconds, `devTimeOfDay.c`'s `devAiTodSeconds` |
 
 ### SNL Programs (Native Rust async)
-The synApps `std` module ships with two SNL (State Notation Language) state machines that std-rs reimplements as native Rust async tasks:
+The synApps `std` module ships with two SNL (State Notation Language) programs. std-rs keeps the upstream `.st` unchanged in `src/snl/` and compiles it with snc-rs at build time:
 
 - **femto** — Femto FEMTO amplifier gain control state machine. Manages cascaded transimpedance amplifier gain selection with auto-ranging based on signal level.
 - **delayDo** — Generic delayed action state machine. Triggers a write after a configurable delay, with abort/restart support.
@@ -92,8 +92,8 @@ std-rs/
 │   ├── records/dbd_generated.rs     # the field tables generated from the .dbd set
 │   ├── seq_runner.rs                # the SNL program launcher, C's `seq()` stand-in
 │   └── snl/
-│       ├── delay_do.rs              # delayDo state machine
-│       └── femto.rs                 # Femto amplifier control
+│       ├── delayDo.st, delay_do.rs  # upstream delayDo.st + its companion
+│       └── femto.st, femto.rs       # upstream femto.st + its companion (powers table)
 ├── db/                              # 51 database templates + their .req files
 └── ui/                              # PyDM screens
 ```
@@ -102,7 +102,7 @@ std-rs/
 
 ```toml
 [dependencies]
-epics-rs = { version = "0.31", features = ["std"] }
+epics-rs = { version = "0.32", features = ["std"] }
 ```
 
 ### Register All Record Types
@@ -149,7 +149,7 @@ camonitor PID:CVAL PID:OVAL
 cargo nextest run -p std-rs
 ```
 
-Test coverage: PID computation correctness, anti-windup, output deadband, MaxMin tracking, throttle rate limiting, sync input behavior, timestamp format generation, delayDo state transitions, femto auto-ranging.
+Test coverage: PID computation correctness, anti-windup, output deadband, MaxMin tracking, throttle rate limiting, sync input behavior, timestamp format generation, delayDo and femto driven through their databases.
 
 ## Dependencies
 

@@ -1,18 +1,21 @@
 mod command_planner;
 pub mod dbd_generated;
 mod field_access;
+pub(crate) use field_access::motor_failed_dset_init;
 mod state_machine;
 mod status_update;
 
 use epics_base_rs::error::CaResult;
 use epics_base_rs::server::record::{
-    FieldDesc, ParsedLink, ProcessAction, ProcessActions, ProcessOutcome, Record,
-    RecordProcessResult, ResolvedInputLinks, parse_link_v2,
+    CycleMarks, CyclePostMask, FieldDesc, FieldIx, MonitorValueClasses, MonitorValueGate,
+    ParsedLink, ProcessAction, ProcessActions, ProcessOutcome, Record, ResolvedInputLinks,
+    parse_link_v2,
 };
 use epics_base_rs::types::EpicsValue;
 
 use crate::coordinate;
 use crate::device_state::*;
+use crate::device_support::{DialLimitReset, LimitBuild};
 use crate::fields::*;
 use crate::flags::*;
 
@@ -38,21 +41,131 @@ pub struct MotorRecord {
     pub alarm: AlarmFields,
     /// Pending event for next process() call
     pending_event: Option<MotorEvent>,
+    /// The axis's asyn user, which also carries `pmr->name`.
+    trace: std::sync::Arc<crate::trace::MotorTrace>,
     /// Track which field was last written (for process)
     last_write: Option<CommandSource>,
-    /// One-shot request from a runtime JVEL put: re-emit the jog command
-    /// with the new JVEL/JAR if a jog is active when the put's process
-    /// pass runs (C special() motorRecordJVEL, motorRecord.cc:3059-3072).
-    jog_retune_pending: bool,
+    /// Where `special()`'s driver commands go, from the device init on.
+    port: Option<crate::device_support::CommandPort>,
     /// Shared state mailbox for device communication
     device_state: Option<SharedDeviceState>,
-    /// Last seen status sequence number
-    last_seen_seq: u64,
-    /// Whether initial readback has been performed
+    /// Whether C `init_record` reaches its tail: it returns before it with
+    /// no dset or a failed dset init (motorRecord.cc:612-651).
     initialized: bool,
     /// Monotonic counter for delay request IDs
     next_delay_id: u64,
 }
+
+/// C `CALLBACK_VALUE`: why a pass reaches do_work.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProcReason {
+    /// A put or scan with no device callback to read.
+    NothingDone,
+    /// A device callback, or the settle delay's ACK (C 1280-1293).
+    CallbackData,
+}
+
+/// One row per [`m`] bit: C `monitor()`'s `monitor_mask | DBE_VAL_LOG`
+/// posts, then the literal `DBE_VAL_LOG` ones.
+static MONITOR_POSTS: [(FieldIx, CyclePostMask); 57] =
+    epics_base_rs::server::record::declared_post_table(
+        dbd_generated::MOTOR_FIELDS,
+        MONITOR_POSTS_NAMED,
+    );
+
+const MONITOR_POSTS_NAMED: [(&str, CyclePostMask); 57] = {
+    use CyclePostMask::{MonitorValueLog as M, ValueLog as L};
+    [
+        ("VAL", M),
+        ("DVAL", M),
+        ("HLM", M),
+        ("LLM", M),
+        ("DMOV", M),
+        ("SPMG", M),
+        ("RCNT", M),
+        ("MRES", M),
+        ("ERES", M),
+        ("UEIP", M),
+        ("STOP", M),
+        ("LVIO", M),
+        ("RVAL", M),
+        ("RLV", M),
+        ("OFF", M),
+        ("RBV", M),
+        ("DHLM", M),
+        ("DLLM", M),
+        ("DRBV", M),
+        ("MOVN", M),
+        ("HLS", M),
+        ("LLS", M),
+        ("RRBV", M),
+        ("MSTA", M),
+        ("ATHM", M),
+        ("TDIR", M),
+        ("MIP", M),
+        ("DIFF", M),
+        ("RDIF", M),
+        ("RHLS", M),
+        ("RLLS", M),
+        ("UEIP", L),
+        ("SBAS", M),
+        ("SREV", M),
+        ("UREV", M),
+        ("VELO", M),
+        ("VBAS", M),
+        ("MISS", M),
+        ("STUP", M),
+        ("JOGF", M),
+        ("JOGR", M),
+        ("HOMF", M),
+        ("HOMR", M),
+        ("RHLM", M),
+        ("RLLM", M),
+        ("DMOV", L),
+        ("VBAS", L),
+        ("SBAS", L),
+        ("VELO", L),
+        ("DLLM", L),
+        ("DHLM", L),
+        ("HLM", L),
+        ("LLM", L),
+        ("STUP", L),
+        ("CNEN", M),
+        ("HLM", L),
+        ("LLM", L),
+    ]
+};
+
+/// C `monitor()`'s fields in its order, RBV aside: the five above its short
+/// circuit (3509-3549), then the rest (3553-3643), then CNEN, which posts only
+/// when the MSTA block derives a change.
+static MONITOR_FIELDS: [&str; 44] = [
+    "RRBV", "DRBV", "DIFF", "RDIF", "MSTA", "VAL", "DVAL", "RVAL", "TDIR", "MIP", "HLM", "LLM",
+    "SPMG", "RCNT", "RLV", "OFF", "DHLM", "DLLM", "HLS", "RHLS", "RLLS", "LLS", "ATHM", "MRES",
+    "ERES", "UEIP", "LVIO", "STOP", "SBAS", "SREV", "UREV", "VELO", "VBAS", "MISS", "MOVN", "DMOV",
+    "STUP", "JOGF", "JOGR", "HOMF", "HOMR", "RHLM", "RLLM", "CNEN",
+];
+
+/// The fields C posts outside `monitor()`: devMotorAsyn's RMP/REP/RVEL
+/// (devMotorAsyn.c:456-473), `range_check` and the PID clamp
+/// (motorRecord.cc:4377, 3025), and the literal posts of `special()` and
+/// `process()`. C posts no other field from a process.
+const CHANGE_POSTED: [&str; 25] = [
+    "ACCL", "ACCS", "BACC", "BVEL", "DCOF", "FOFF", "FRAC", "HVEL", "ICOF", "JVEL", "NTMF", "PCOF",
+    "RDBD", "REP", "RMP", "RVEL", "S", "SBAK", "SET", "SMAX", "SYNC", "TWF", "TWR", "URIP", "VMAX",
+];
+
+/// [`MONITOR_FIELDS`] in their post order, then every other motor field but
+/// RBV, the deadband field, and [`CHANGE_POSTED`]: CDIR, LVAL and the other
+/// fields C never posts stay silent however a process changes them.
+static POSTED_ONLY_WHEN_MARKED: std::sync::LazyLock<Vec<&'static str>> =
+    std::sync::LazyLock::new(|| {
+        let never = dbd_generated::MOTOR_FIELDS.iter().map(|field| field.name);
+        let never = never.filter(|name| {
+            *name != "RBV" && !CHANGE_POSTED.contains(name) && !MONITOR_FIELDS.contains(name)
+        });
+        MONITOR_FIELDS.iter().copied().chain(never).collect()
+    });
 
 impl Default for MotorRecord {
     fn default() -> Self {
@@ -71,10 +184,10 @@ impl Default for MotorRecord {
             links: LinkFields::default(),
             alarm: AlarmFields::default(),
             pending_event: None,
+            trace: Default::default(),
             last_write: None,
-            jog_retune_pending: false,
+            port: None,
             device_state: None,
-            last_seen_seq: 0,
             initialized: false,
             next_delay_id: 0,
         }
@@ -104,17 +217,199 @@ impl MotorRecord {
         self.device_state = Some(state);
     }
 
-    /// Set a pending event for the next process() call.
-    pub fn set_event(&mut self, event: MotorEvent) {
-        self.pending_event = Some(event);
+    /// Bind the axis's asyn user; its record name is the one console lines
+    /// carry.
+    pub fn set_trace(&mut self, trace: std::sync::Arc<crate::trace::MotorTrace>) {
+        self.trace = trace;
     }
 
-    /// Clear any pending write command source.
-    ///
-    /// Called by device support init() so that pass0-restored field values
-    /// are not interpreted as move commands during PINI processing.
-    pub fn clear_last_write(&mut self) {
-        self.last_write = None;
+    pub(crate) fn trace(&self) -> &crate::trace::MotorTrace {
+        &self.trace
+    }
+
+    /// C 1335: the movn-block NTM stop — "We're going in the wrong
+    /// direction. Readback problem?"
+    pub(crate) fn report_ntm_stop(&self) {
+        println!("{}:tdir = {}", self.trace.record(), self.stat.tdir);
+    }
+
+    /// C syncTargetPosition (4414-4458): the readback chain re-derived
+    /// (with no initcall gate on RDBL), then the targets synced to it. A
+    /// failed RDBL read leaves the readbacks as they were and syncs the
+    /// targets to them anyway. DIFF and RDIF wait for the next callback.
+    pub(crate) fn sync_target_position(&mut self) {
+        if !self.derive_readback(self.conv.urip) {
+            println!(
+                "{}: syncTargetPosition: error reading RDBL link.",
+                self.trace.record()
+            );
+        }
+        self.pos.rbv = coordinate::dial_to_user(self.pos.drbv, self.conv.dir, self.pos.off);
+        self.mark(m::RRBV | m::DRBV | m::RBV);
+        self.sync_targets();
+    }
+
+    /// Set a pending event for the next process() call.
+    /// The port `special()` sends through from now on.
+    pub fn set_command_port(&mut self, port: crate::device_support::CommandPort) {
+        self.port = Some(port);
+    }
+
+    /// C `special()`'s `build_trans` and `SEND_MSG`: queued at put time,
+    /// with no process. A record with no device support has nowhere to
+    /// send. Returns false when the device refused a command, which sends
+    /// nothing (`if (rtnval == OK) SEND_MSG()`).
+    pub(crate) fn send_special(&mut self, commands: Vec<MotorCommand>) -> bool {
+        if self.port.is_none() {
+            return true;
+        }
+        let Some(commands) = self.transaction(commands) else {
+            return false;
+        };
+        if let Some(port) = &self.port {
+            port.send(commands, false);
+        }
+        true
+    }
+
+    /// C `set_dial_highlimit`/`set_dial_lowlimit` (4236-4325): send the
+    /// dial limit, then, built or not, set the raw limit to what was sent
+    /// and the one user limit it maps to (HLM for a high dial limit under
+    /// DIR=Pos, LLM under DIR=Neg) from the dial limit as a refusing device
+    /// may have reset it.
+    pub(crate) fn set_dial_limit(&mut self, high: bool) {
+        let dial = if high {
+            self.limits.dhlm
+        } else {
+            self.limits.dllm
+        };
+        let raw = dial / self.conv.mres;
+        let command = self.dial_limit_command(high, dial);
+        let raw_high = matches!(command, MotorCommand::SetHighLimit { .. });
+        self.send_special(vec![command]);
+        if raw_high {
+            self.limits.rhlm = raw;
+            self.mark(m::RHLM);
+        } else {
+            self.limits.rllm = raw;
+            self.mark(m::RLLM);
+        }
+        let dial = if high {
+            self.limits.dhlm
+        } else {
+            self.limits.dllm
+        };
+        let user = coordinate::dial_to_user(dial, self.conv.dir, self.pos.off);
+        if high == (self.conv.dir == MotorDir::Pos) {
+            self.limits.hlm = user;
+            self.mark(m::HLM);
+        } else {
+            self.limits.llm = user;
+            self.mark(m::LLM);
+        }
+        self.mark(if high { m::DHLM } else { m::DLLM });
+    }
+
+    /// C `build_trans` per command, the one place a device's verdict is
+    /// asked, once per command. A deferred command (devEMC18011.cc:233-240,
+    /// another motor selected) is not built and gives back a retry
+    /// (`if (rcnt > 0) rcnt--`, unmarked), ahead of any limit verdict. The
+    /// built ones still go out (each is sent by its own
+    /// motor_end_trans_com, :405-414), and a last command that deferred
+    /// leaves the node INFO, which sends no message (motordrvCom.cc:441): a
+    /// status query after them. A refused soft limit (devMM4000.cc:316-336)
+    /// may reset one dial limit and makes the call ERROR: `None`.
+    fn build(&mut self, commands: Vec<MotorCommand>) -> Option<Vec<MotorCommand>> {
+        let Some(port) = &self.port else {
+            return Some(commands);
+        };
+        let mut built = Vec::with_capacity(commands.len());
+        let mut last_deferred = false;
+        for command in commands {
+            last_deferred = port.defers(&command);
+            if last_deferred {
+                self.retry.rcnt = (self.retry.rcnt - 1).max(0);
+                continue;
+            }
+            if let LimitBuild::Refused(reset) = port.build_limit(&command, self.conv.mres) {
+                match reset {
+                    Some(DialLimitReset::Dhlm(dial)) => self.limits.dhlm = dial,
+                    Some(DialLimitReset::Dllm(dial)) => self.limits.dllm = dial,
+                    None => {}
+                }
+                return None;
+            }
+            built.push(command);
+        }
+        if last_deferred {
+            built.push(MotorCommand::Poll);
+        }
+        Some(built)
+    }
+
+    /// `commands` as C `build_trans` builds them from the record: led by
+    /// the record's fields, which a device reads at any of them, and each move
+    /// preceded by the record's CDIR and by the PREM and POST it reads
+    /// (devIM483PL.cc:191-205), when either is set; JOG_VELOCITY reads
+    /// neither. A record's init, process
+    /// and `special()` puts all send through it. `None` is a refusal
+    /// ([`build`](Self::build)): nothing to send.
+    pub(crate) fn transaction(&mut self, commands: Vec<MotorCommand>) -> Option<Vec<MotorCommand>> {
+        let commands = self.build(commands)?;
+        let prem = &self.links.prem;
+        // C `if (strlen(mr->post) != 0) postmsgptr = &mr->post`: the field,
+        // not its text, so the device sends what POST holds when it is done.
+        let post = (!self.links.post.is_empty()).then(|| self.links.post.clone());
+        let built = |command: &MotorCommand| {
+            matches!(
+                command,
+                MotorCommand::MoveAbsolute { .. }
+                    | MotorCommand::MoveRelative { .. }
+                    | MotorCommand::MoveVelocity { .. }
+                    | MotorCommand::JogVelocity { .. }
+                    | MotorCommand::Home { .. }
+            )
+        };
+        if !commands.iter().any(built) {
+            return Some(commands);
+        }
+        let strings = !prem.is_empty() || post.is_some();
+        let mut out = Vec::with_capacity(commands.len() + 3);
+        out.push(MotorCommand::RecordFields(crate::flags::RecordFields {
+            velocity: self.raw_rate(self.vel.velo),
+            srev: self.conv.srev,
+        }));
+        for command in commands {
+            if built(&command) {
+                out.push(MotorCommand::MoveDirection {
+                    forward: self.stat.cdir != 0,
+                });
+                if strings && !matches!(command, MotorCommand::JogVelocity { .. }) {
+                    out.push(MotorCommand::MoveStrings {
+                        prem: prem.clone(),
+                        post: post.clone(),
+                    });
+                }
+            }
+            out.push(command);
+        }
+        Some(out)
+    }
+
+    /// C `init_record` got past the device init (motorRecord.cc:646-651),
+    /// and so runs to its closing `monitor()`: devMotorAsyn's `bad:` arm
+    /// returns 0, so a record it parks still gets there. A failed dset init
+    /// returns before the ERES seed (692-696) and the limit reset (717-718).
+    pub(crate) fn finish_init(&mut self) {
+        self.initialized = true;
+        if self.conv.eres == 0.0 {
+            self.conv.eres = self.conv.mres;
+            self.mark(m::ERES);
+        }
+    }
+
+    pub fn set_event(&mut self, event: MotorEvent) {
+        self.pending_event = Some(event);
     }
 
     /// C do_work collection gate (motorRecord.cc:1994): `omsl ==
@@ -129,10 +424,8 @@ impl MotorRecord {
     /// True when a position field (VAL/DVAL/RVAL/RLV) was written during
     /// pass0 — i.e. autosave restored a saved position.
     ///
-    /// Device support `init()` uses this to decide whether to reseed the
-    /// controller with the restored DVAL. It MUST be queried before
-    /// [`clear_last_write`](Self::clear_last_write), which device support
-    /// calls later in `init()`.
+    /// It reads true only before [`initial_readback`](Self::initial_readback),
+    /// which drops the write.
     ///
     /// This is the correct "was a position restored" signal: a genuine
     /// restored position of exactly `0.0` is indistinguishable from the
@@ -154,13 +447,112 @@ impl MotorRecord {
         self.conv.rdbl_error = error;
     }
 
+    /// C `MARK` / `MARK_AUX`: post these fields at the next `monitor()`.
+    #[inline]
+    pub(crate) fn mark(&mut self, bits: u64) {
+        debug_assert_eq!(bits & !(m::MMAP | m::NMAP), 0, "not a C mark");
+        self.internal.mmap |= bits as u32;
+        self.internal.nmap |= (bits >> 32) as u32;
+    }
+
+    /// DMOV as C writes it: marked where it changes (`if (pmr->dmov) { dmov
+    /// = FALSE; MARK(M_DMOV); }`).
+    pub(crate) fn set_dmov(&mut self, dmov: bool) {
+        if (self.stat.dmov != 0) != dmov {
+            self.stat.dmov = i16::from(dmov);
+            self.mark(m::DMOV);
+        }
+    }
+
+    /// MOVN as `process_motor_info` posts it, on change (3746-3748).
+    pub(crate) fn set_movn(&mut self, movn: bool) {
+        if (self.stat.movn != 0) != movn {
+            self.stat.movn = i16::from(movn);
+            self.mark(m::MOVN);
+        }
+    }
+
+    /// The collection's `if (val != lval) MARK(M_VAL)` (2204-2206, 2302).
+    pub(crate) fn mark_val_collected(&mut self) {
+        if self.pos.val != self.internal.lval {
+            self.mark(m::VAL);
+        }
+    }
+
+    /// C `UNMARK`.
+    #[inline]
+    pub(crate) fn unmark(&mut self, bits: u64) {
+        self.internal.mmap &= !(bits as u32);
+        self.internal.nmap &= !((bits >> 32) as u32);
+    }
+
+    /// C init_record's tail (motorRecord.cc:720-746), after the device
+    /// readback it reads DRBV from, ending in `monitor()`: no client hears
+    /// that post, but it derives CNEN from MSTA and clears every mark.
+    pub(crate) fn init_tail(&mut self) {
+        // C 721-723: `dmov = TRUE; movn = FALSE` — DMOV starts done
+        // no matter what the load wrote. In particular this
+        // neutralizes any `special()` pass-0 blink a load-time /
+        // restore write to a drive field may have left behind.
+        self.stat.dmov = 1;
+        self.stat.movn = 0;
+        self.mark(m::DMOV | m::MOVN | m::SPMG | m::DIFF | m::RDIF | m::MSTA);
+        // C 734-743: LVIO starts clear; with soft limits enabled
+        // (the dial pair not both 0), an initial dial readback
+        // outside the dial window by more than one MRES, or an
+        // inverted pair, raises it. The slop is the SIGNED
+        // resolution (C verbatim — a negative MRES narrows the
+        // window).
+        self.limits.lvio = 0;
+        let limits_disabled = self.limits.dhlm == self.limits.dllm && self.limits.dllm == 0.0;
+        if !limits_disabled
+            && (self.pos.drbv > self.limits.dhlm + self.conv.mres
+                || self.pos.drbv < self.limits.dllm - self.conv.mres
+                || self.limits.dllm > self.limits.dhlm)
+        {
+            self.limits.lvio = 1;
+        }
+        let _ = self.take_monitor_marks();
+    }
+
+    /// The marks `monitor()` posts from, cleared as its `UNMARK_ALL` does
+    /// (motorRecord.cc:3645), with each switch mark carrying the raw switch
+    /// `monitor()` posts beside it (3576-3589).
+    fn take_monitor_marks(&mut self) -> u64 {
+        let mmap = std::mem::take(&mut self.internal.mmap);
+        let nmap = std::mem::take(&mut self.internal.nmap);
+        // The short circuit (3552) reads both whole words, past the upper
+        // block's UNMARKs (3509-3549).
+        self.internal.monitor_lower_marked = mmap & !((m::UPPER | m::RBV) as u32) != 0 || nmap != 0;
+        let mut bits = (u64::from(mmap) & m::MMAP | u64::from(nmap) << 32 & m::NMAP) & !m::RBV;
+        if std::mem::take(&mut self.internal.ueip_posted) {
+            bits |= m::UEIP_POSTED;
+        }
+        let same = (self.conv.dir == MotorDir::Pos) == (self.conv.mres >= 0.0);
+        if bits & m::HLS != 0 {
+            bits |= if same { m::RHLS } else { m::RLLS };
+        }
+        if bits & m::LLS != 0 {
+            bits |= if same { m::RLLS } else { m::RHLS };
+        }
+        // The MSTA block's position-maintenance readback (3541-3548).
+        if bits & m::MSTA != 0 && self.stat.msta.contains(MstaFlags::GAIN_SUPPORT) {
+            let pos_maint = self.stat.msta.contains(MstaFlags::POSITION);
+            if pos_maint != self.ctrl.cnen {
+                self.ctrl.cnen = pos_maint;
+                bits |= m::CNEN;
+            }
+        }
+        bits
+    }
+
     /// Fire the readback output link (RLNK) with the current RBV.
     ///
     /// C `motorRecord.cc:1495` calls `dbPutLink(&rlnk, DBR_DOUBLE, &rbv, 1)`
-    /// unconditionally just before `process_exit` on every process pass, so a
-    /// record wired through RLNK re-processes whenever the motor record does.
-    /// We mirror that by emitting a `WriteDbLink` on every process cycle,
-    /// including the move-start `AsyncPendingNotify` (DMOV 1→0) pass: C fires
+    /// just before `process_exit` on every pass that does not jump there, so
+    /// a record wired through RLNK re-processes whenever the motor record
+    /// does. We mirror that by emitting a `WriteDbLink` on every such cycle,
+    /// including the move-start (DMOV 1→0) pass: C fires
     /// `dbPutLink` before `monitor()` (motorRecord.cc:1507) and before the
     /// `recGblFwdLink` gate (motorRecord.cc:1509), so it runs even while the
     /// move is still pending. A `dbPutLink` processes a PP readback target even
@@ -183,6 +575,12 @@ impl Record for MotorRecord {
         "motor"
     }
 
+    /// `motorRecord.cc:1495`: `status = dbPutLink(&pmr->rlnk, ...)` is what
+    /// `process()` returns.
+    fn process_status_rule(&self) -> epics_base_rs::server::record::ProcessStatusRule {
+        epics_base_rs::server::record::ProcessStatusRule::ZERO.with_status_links(&["RLNK"])
+    }
+
     fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
         Some(self)
     }
@@ -192,7 +590,7 @@ impl Record for MotorRecord {
     }
 
     fn is_put_complete(&self) -> bool {
-        self.stat.dmov
+        self.stat.dmov != 0
     }
 
     // C RSET per-field metadata (motorRecord.cc get_units 3156-3208,
@@ -206,16 +604,8 @@ impl Record for MotorRecord {
     }
 
     fn process(&mut self) -> CaResult<ProcessOutcome> {
-        // Clear the one-pass DIFF/RDIF mark before any `process_motor_info`
-        // can set it this cycle (it runs from `determine_event` below and
-        // from `do_process`). The post-process snapshot reads it through
-        // `force_posted_fields`; a pass that does not recompute DIFF/RDIF
-        // (no CALLBACK_DATA) leaves it false and does not force-post.
-        self.internal.diff_rdif_marked = false;
-        // If wired to device state, determine event from shared mailbox.
-        // An event that survived a put-owned pass is a still-pending
-        // signal: this pass consumes it before pulling a new one from
-        // the mailbox (one signal, one pass — never overwrite).
+        // If wired to device state, determine event from shared mailbox;
+        // an injected event is not overwritten.
         if self.pending_event.is_none() && self.device_state.is_some() {
             if let Some(event) = self.determine_event() {
                 self.pending_event = Some(event);
@@ -223,9 +613,6 @@ impl Record for MotorRecord {
         }
 
         let effects = self.do_process();
-        // DMOV=0 means a move started (or sub-step pulse).
-        // Flush DMOV=0 even if no commands were emitted (sub-step case).
-        let move_started = !self.stat.dmov;
 
         // Write effects to shared mailbox for DeviceSupport.write() to consume.
         // If a previous batch has not been consumed yet (two process() cycles
@@ -233,77 +620,28 @@ impl Record for MotorRecord {
         // than overwriting — otherwise the earlier move command is lost.
         if let Some(state) = self.device_state.clone() {
             let actions = self.effects_to_actions(&effects);
-            match state.lock() {
-                Ok(mut ds) => match ds.pending_actions.take() {
+            if let Ok(mut ds) = state.lock() {
+                ds.set_comm_alarm(self.internal.comm_alarm);
+                match ds.pending_actions.take() {
                     Some(mut prev) => {
-                        tracing::warn!("motor: pending_actions not yet consumed — merging batches");
                         prev.merge_newer(actions);
                         ds.pending_actions = Some(prev);
                     }
                     None => ds.pending_actions = Some(actions),
-                },
-                Err(e) => {
-                    tracing::error!("device state lock poisoned in process: {e}");
                 }
             }
         }
 
-        if move_started && !self.internal.dmov_notified {
-            // First DMOV 1→0 transition: flush immediately so monitors see
-            // the transition before the move completes.
-            self.internal.dmov_notified = true;
-            use epics_base_rs::types::EpicsValue;
-            let fields = vec![
-                ("DMOV".to_string(), EpicsValue::Short(0)),
-                ("MOVN".to_string(), EpicsValue::Short(1)),
-                ("VAL".to_string(), EpicsValue::Double(self.pos.val)),
-                ("DVAL".to_string(), EpicsValue::Double(self.pos.dval)),
-                ("RVAL".to_string(), EpicsValue::Int64(self.pos.rval)),
-                ("RBV".to_string(), EpicsValue::Double(self.pos.rbv)),
-                ("DRBV".to_string(), EpicsValue::Double(self.pos.drbv)),
-                // C do_work move block (motorRecord.cc:2248-2256) recomputes
-                // diff=dval-drbv + MARK(M_DIFF) and rdif=NINT(diff/mres) +
-                // MARK(M_RDIF) before too_small/LVIO, so monitor() posts the
-                // new full-distance following error on the move-start pass.
-                // `plan_absolute_move` already refreshed pos.diff/pos.rdif.
-                ("DIFF".to_string(), EpicsValue::Double(self.pos.diff)),
-                ("RDIF".to_string(), EpicsValue::Int64(self.pos.rdif)),
-                // C do_work marks M_MIP on every move dispatch and
-                // M_RCNT when the retry count resets (motorRecord.cc:
-                // 1929-1932), so the move-start monitor() pass posts
-                // both.
-                (
-                    "MIP".to_string(),
-                    EpicsValue::Short(self.stat.mip.bits() as i16),
-                ),
-                ("RCNT".to_string(), EpicsValue::Short(self.retry.rcnt)),
-            ];
-            // C fires `dbPutLink(&rlnk, ...)` (motorRecord.cc:1495) on this
-            // move-start pass too — before `monitor()` and the `recGblFwdLink`
-            // gate — so the RLNK readback target still re-processes while the
-            // move is pending.
-            let mut actions = Vec::new();
-            self.push_readback_link_write(&mut actions);
-            Ok(ProcessOutcome {
-                result: RecordProcessResult::AsyncPendingNotify(fields),
-                actions,
-                device_did_compute: false,
-                // DMOV stays a `process()` store: C reads it back at
-                // `motorRecord.cc:1509-1510` to gate `recGblFwdLink`, so it is
-                // an input to a later decision in the same cycle, not a
-                // completion flag published after the writes.
-                post_write_fields: Vec::new(),
-            })
-        } else {
-            // Ongoing motion or idle: full snapshot so all changed fields
-            // (RBV, DRBV, MSTA, limits, etc.) get posted as monitors.
-            if !move_started {
-                self.internal.dmov_notified = false;
-            }
-            let mut outcome = ProcessOutcome::complete();
+        // Every pass, the move-start one included, ends in C process_exit
+        // (motorRecord.cc:1503-1510): alarm_sub and monitor()'s
+        // recGblResetAlarms run whatever DMOV is; only recGblFwdLink, and with
+        // it put-notify completion, waits for DMOV (should_fire_forward_link).
+        self.internal.monitor_due = true;
+        let mut outcome = ProcessOutcome::complete();
+        if !effects.process_exit {
             self.push_readback_link_write(&mut outcome.actions);
-            Ok(outcome)
         }
+        Ok(outcome)
     }
 
     /// C process_exit (motorRecord.cc:1509-1510): `if (dmov != 0)
@@ -314,7 +652,7 @@ impl Record for MotorRecord {
     /// standard.") Reading DMOV directly at FLNK time IS the C gate by
     /// construction — there is no per-path suppression state to track.
     fn should_fire_forward_link(&self) -> bool {
-        self.stat.dmov
+        self.stat.dmov != 0
     }
 
     /// Input links the framework must resolve via `dbGetLink` BEFORE each
@@ -345,7 +683,7 @@ impl Record for MotorRecord {
         // a CALLBACK_DATA poll mid-move (motorRecord.cc:1487-1492). Gating on
         // DMOV mirrors that dominant condition and stops a device poll from
         // re-reading DOL and clobbering the in-flight target every cycle.
-        if self.stat.dmov && self.closed_loop_dol_collection() {
+        if self.stat.dmov != 0 && self.closed_loop_dol_collection() {
             actions.push(ProcessAction::ReadDbLink {
                 link_field: "DOL",
                 target_field: "VAL",
@@ -368,8 +706,8 @@ impl Record for MotorRecord {
     /// this cycle — the analogue of C inspecting
     /// `RTN_SUCCESS(dbGetLink(&pmr->rdbl, ...))` in `process_motor_info`
     /// (motorRecord.cc:3687-3698). A failed RDBL read latches
-    /// `rdbl_error`; the completion/planner paths stop an in-flight
-    /// motion and refuse new ones while it is set.
+    /// `rdbl_error`; while it is set, process_motor_info stops an
+    /// in-flight motion and the planner refuses new ones.
     ///
     /// The report is C's status, so every RDBL form C calls successful is
     /// present in it — an empty link and a constant one included
@@ -385,7 +723,7 @@ impl Record for MotorRecord {
         // The outcome is latched here — gated exactly like the
         // pre_process_actions request — and applied to the framework's
         // CommonFields.udf in check_alarms (the C alarm_sub consumer).
-        if self.stat.dmov && self.closed_loop_dol_collection() {
+        if self.stat.dmov != 0 && self.closed_loop_dol_collection() {
             self.internal.dol_udf = Some(!resolved.contains("DOL"));
         }
         if self.conv.urip && !self.conv.ueip {
@@ -403,6 +741,10 @@ impl Record for MotorRecord {
 
     fn declared_fields(&self) -> &'static [FieldDesc] {
         dbd_generated::MOTOR_FIELDS
+    }
+
+    fn declared_dbaddr_fields(&self) -> Option<&'static [&'static str]> {
+        Some(dbd_generated::MOTOR_DBADDR)
     }
 
     fn declared_noaccess_fields(&self) -> &'static [&'static str] {
@@ -432,15 +774,23 @@ impl Record for MotorRecord {
     /// fields); a drive put to a processing-disabled motor blinks DMOV
     /// low and it stays low until the record next processes, where C
     /// keeps DMOV=1. Known divergence.
-    fn special(&mut self, field: &str, after: bool) -> CaResult<()> {
+    fn special(
+        &mut self,
+        field: &str,
+        after: bool,
+        _common: &epics_base_rs::server::record::CommonFields,
+    ) -> CaResult<()> {
         if after {
             return Ok(());
         }
         if ["VAL", "DVAL", "RVAL", "RLV", "TWF", "TWR"]
             .iter()
             .any(|f| field.eq_ignore_ascii_case(f))
+            && self.stat.dmov != 0
         {
-            self.stat.dmov = false;
+            // C 2603-2606 posts the blink itself.
+            self.stat.dmov = 0;
+            self.internal.put_posted |= m::PUT_DMOV;
         }
         Ok(())
     }
@@ -453,6 +803,9 @@ impl Record for MotorRecord {
     /// `field_access::motor_sync_speed_at_init` and
     /// `field_access::motor_sync_limits_at_init`.
     fn init_record(&mut self, pass: u8) -> CaResult<()> {
+        if pass == 0 {
+            self.internal.vers = field_access::MOTOR_RECORD_VERSION;
+        }
         if pass == 1 {
             // C init_record runs check_speed_and_resolution (641) with the
             // resolution triple first (3905-3927), then the speed pairs,
@@ -467,32 +820,6 @@ impl Record for MotorRecord {
             // RDBD >= |MRES|, against the reconciled resolution. The RDBD
             // put handler stays inert during load.
             self.enforce_min_retry_deadband();
-            // C 692-696: a zero ERES (unset, or loaded as 0) is seeded
-            // from the reconciled MRES.
-            if self.conv.eres == 0.0 {
-                self.conv.eres = self.conv.mres;
-            }
-            // C 721-723: `dmov = TRUE; movn = FALSE` — DMOV starts done
-            // no matter what the load wrote. In particular this
-            // neutralizes any `special()` pass-0 blink a load-time /
-            // restore write to a drive field may have left behind.
-            self.stat.dmov = true;
-            self.stat.movn = false;
-            // C 734-743: LVIO starts clear; with soft limits enabled
-            // (the dial pair not both 0), an initial dial readback
-            // outside the dial window by more than one MRES, or an
-            // inverted pair, raises it. The slop is the SIGNED
-            // resolution (C verbatim — a negative MRES narrows the
-            // window).
-            self.limits.lvio = false;
-            let limits_disabled = self.limits.dhlm == self.limits.dllm && self.limits.dllm == 0.0;
-            if !limits_disabled
-                && (self.pos.drbv > self.limits.dhlm + self.conv.mres
-                    || self.pos.drbv < self.limits.dllm - self.conv.mres
-                    || self.limits.dllm > self.limits.dhlm)
-            {
-                self.limits.lvio = true;
-            }
             self.internal.init_invariants_synced = true;
         }
         Ok(())
@@ -505,52 +832,84 @@ impl Record for MotorRecord {
     /// MDEL/ADEL monitor deadband applies to the readback (RBV), not the
     /// VAL setpoint. C `monitor()` gates RBV value/archive monitors on
     /// MDEL/ADEL; VAL is a setpoint that only changes on a move command.
-    fn monitor_deadband_value(&self) -> Option<f64> {
-        Some(self.pos.rbv)
+    fn monitor_deadband_value(&self) -> Option<epics_base_rs::server::record::AlarmLimit> {
+        Some(epics_base_rs::server::record::AlarmLimit::Double(
+            self.pos.rbv,
+        ))
     }
 
     /// The deadband gates RBV's monitor delivery (C motorRecord.cc
-    /// 3468-3507); with this, the framework routes VAL through generic
-    /// change-detection — posted only when the setpoint actually moved
-    /// (C M_VAL mark semantics), not on every readback poll.
+    /// 3468-3507), not VAL's.
     fn monitor_deadband_field(&self) -> &'static str {
         "RBV"
     }
 
-    /// C `monitor()` posts every field in its list on a cycle whose
-    /// alarm transition fired, even when unmarked — `local_mask =
-    /// monitor_mask | (MARKED(x) ? DBE_VAL_LOG : 0)` is non-zero for
-    /// unmarked fields once `monitor_mask != 0` (motorRecord.cc
-    /// 3456-3646), so a `DBE_ALARM`-only subscriber on any of them
-    /// observes the alarm moment. The list is C's posting order, minus
-    /// RBV (the deadband-gated field, delivered by the deadband
-    /// trigger with the same alarm bits) and CNEN (C posts it only on
-    /// an actual EA_POSITION-driven change, which generic
-    /// change-detection covers). Both raw limit-switch mirrors RHLS
-    /// and RLLS are listed: C's M_HLS and M_LLS branches each post one
-    /// of them, and on an alarm cycle both branches run.
-    fn alarm_cycle_monitored_fields(&self) -> &'static [&'static str] {
-        &[
-            "RRBV", "DRBV", "DIFF", "RDIF", "MSTA", "VAL", "DVAL", "RVAL", "TDIR", "MIP", "HLM",
-            "LLM", "SPMG", "RCNT", "RLV", "OFF", "DHLM", "DLLM", "HLS", "RHLS", "RLLS", "LLS",
-            "ATHM", "MRES", "ERES", "UEIP", "LVIO", "STOP", "SBAS", "SREV", "UREV", "VELO", "VBAS",
-            "MISS", "MOVN", "DMOV", "STUP", "JOGF", "JOGR", "HOMF", "HOMR", "RHLM", "RLLM",
-        ]
+    /// C `monitor()` posts every field it lists with `monitor_mask` on an
+    /// alarm move, marked or not, but the group below its short circuit
+    /// only when one of them is marked (motorRecord.cc:3550-3551). RBV is
+    /// the deadband field and CNEN posts only when the MSTA block derives it.
+    fn alarm_cycle_monitored_fields(&self) -> epics_base_rs::server::record::DeclaredFields {
+        static MONITORED: [FieldIx; 44] = epics_base_rs::server::record::declared_set(
+            dbd_generated::MOTOR_FIELDS,
+            MONITOR_FIELDS,
+        );
+        if self.internal.monitor_lower_marked {
+            &MONITORED[..43]
+        } else {
+            &MONITORED[..5]
+        }
     }
 
-    /// C `process_motor_info` (motorRecord.cc:3764-3767) MARKs M_DIFF /
-    /// M_RDIF unconditionally every CALLBACK_DATA pass, and `monitor()`
-    /// (3522-3531) posts both with `monitor_mask | DBE_VAL_LOG`. So on a
-    /// cycle that ran `process_motor_info`, DIFF and RDIF re-post even when
-    /// their value did not change — a `camonitor DIFF` on an axis parked at
-    /// a constant non-zero following error gets an event each poll. Gated on
-    /// the one-pass `diff_rdif_marked` mark so a non-CALLBACK_DATA pass (a
-    /// put that ran `do_work`, not `process_motor_info`) does not over-post.
-    fn force_posted_fields(&self) -> &'static [&'static str] {
-        if self.internal.diff_rdif_marked {
-            &["DIFF", "RDIF"]
+    /// C `monitor()` posts from `mmap`/`nmap`, never on a value change.
+    fn fields_posted_only_when_marked(&self) -> &'static [&'static str] {
+        &POSTED_ONLY_WHEN_MARKED
+    }
+
+    /// The cycle's `monitor()` drains the marks; a put drains the literal
+    /// posts its `special()` made.
+    fn take_cycle_posted_fields(&mut self) -> CycleMarks {
+        let bits = if std::mem::take(&mut self.internal.monitor_due) {
+            self.take_monitor_marks()
         } else {
-            &[]
+            std::mem::take(&mut self.internal.put_posted)
+        };
+        CycleMarks::of(&MONITOR_POSTS, u128::from(bits))
+    }
+
+    /// C `monitor()`'s RBV (motorRecord.cc:3468-3507): posted only when
+    /// marked, through MDEL/ADEL unless both are zero.
+    fn monitor_value_classes(
+        &mut self,
+        _gate: MonitorValueGate,
+        last_posted: &mut [f64; 2],
+    ) -> MonitorValueClasses {
+        let marked = self.internal.mmap & m::RBV as u32 != 0;
+        self.unmark(m::RBV);
+        let (mdel, adel, rbv) = (self.disp.mdel, self.disp.adel, self.pos.rbv);
+        let crossed = |del: f64, last: &mut f64| {
+            del == 0.0
+                || ((*last - rbv).abs() > del && {
+                    *last = rbv;
+                    true
+                })
+        };
+        let (value, archive) = if !marked {
+            (false, false)
+        } else if mdel == 0.0 && adel == 0.0 {
+            (true, true)
+        } else {
+            // C reads and writes the record's own MLST/ALST.
+            (
+                crossed(mdel, &mut self.disp.mlst),
+                crossed(adel, &mut self.disp.alst),
+            )
+        };
+        *last_posted = [self.disp.mlst, self.disp.alst];
+        MonitorValueClasses {
+            value,
+            archive,
+            hash_changed: false,
+            marked: false,
         }
     }
 
@@ -561,13 +920,11 @@ impl Record for MotorRecord {
     /// for any non-ON put by the time this gate runs, so the post-clamp value
     /// is the deterministic discriminator. Every other pp(TRUE) field
     /// reprocesses normally (default membership test).
-    fn processes_after_put(&self, field: &str) -> bool {
+    fn processes_after_put(&self, field: &str, pp: bool) -> bool {
         if field.eq_ignore_ascii_case("STUP") {
             return self.stat.stup == 1;
         }
-        self.process_passive_fields()
-            .iter()
-            .any(|f| f.eq_ignore_ascii_case(field))
+        pp
     }
 
     /// C never derives the motor's UDF from VAL. `motorRecord.cc` touches
@@ -579,15 +936,57 @@ impl Record for MotorRecord {
     /// divergence that both fabricates UDF on a transient NaN VAL and, on a
     /// no-DOL-read pass, clobbers the legitimate closed-loop DOL outcome.
     /// Opt out so motor UDF is owned solely by the DOL channel
-    /// (`dol_udf` → check_alarms) and the init clear in `initial_readback`.
+    /// (`dol_udf` → check_alarms) and the init clear in
+    /// `post_init_finalize_undef`.
     fn clears_udf(&self) -> bool {
         false
+    }
+
+    /// alarm_sub (3372) is motor's only UDF_ALARM raise, at INVALID and on
+    /// `udf == TRUE`; the framework's truthy UDFS check is not C's.
+    fn raises_udf_alarm(&self) -> bool {
+        false
+    }
+
+    /// The rest of C init_record after the device's init, when it gets
+    /// there: its tail and `monitor()` (`MotorRecord::init_tail`), and
+    /// 677-681: a CONSTANT .dol, an unset one included, leaves the record
+    /// defined. A DB_LINK / CA DOL stays undefined until the closed-loop
+    /// collection's first read (1994-2005).
+    fn post_init_finalize_undef(&mut self, udf: &mut u8) -> CaResult<()> {
+        if !self.initialized {
+            return Ok(());
+        }
+        self.init_tail();
+        if matches!(
+            parse_link_v2(&self.links.dol),
+            ParsedLink::None | ParsedLink::Constant(_)
+        ) {
+            *udf = 0;
+        }
+        Ok(())
+    }
+
+    /// C `init_record` ends in `monitor()`, whose `recGblResetAlarms`
+    /// (motorRecord.cc:3466) leaves `NO_ALARM`.
+    fn init_resets_alarms(&self) -> bool {
+        self.initialized
     }
 
     /// C `alarm_sub()` (motorRecord.cc:3367-3406) — motor-specific alarm
     /// severities, raised into `nsta`/`nsev` before the framework's
     /// `evaluate_alarms`.
     fn check_alarms(&mut self, common: &mut epics_base_rs::server::record::CommonFields) {
+        self.alarm_sub(common);
+        // No later alarm displaces an INVALID one: a COMM_ALARM nsta here
+        // is the stat this pass commits.
+        self.internal.comm_alarm =
+            common.nsta == epics_base_rs::server::recgbl::alarm_status::COMM_ALARM;
+    }
+}
+
+impl MotorRecord {
+    fn alarm_sub(&mut self, common: &mut epics_base_rs::server::record::CommonFields) {
         use epics_base_rs::server::recgbl::{alarm_status, rec_gbl_set_sevr};
         use epics_base_rs::server::record::AlarmSeverity;
 
@@ -601,7 +1000,8 @@ impl Record for MotorRecord {
         }
 
         // C 3372-3376: an undefined VAL short-circuits every other check.
-        if common.udf != 0 {
+        // C tests `udf == TRUE`, so a put byte of 2 or 255 is defined.
+        if epics_base_rs::server::recgbl::udf_alarm_active(common.udf, true) {
             rec_gbl_set_sevr(common, alarm_status::UDF_ALARM, AlarmSeverity::Invalid);
             return;
         }
@@ -613,11 +1013,11 @@ impl Record for MotorRecord {
         // and a DVAL outside the dial soft limits alarms too.
         let hlsv = AlarmSeverity::from_u16(self.limits.hlsv as u16);
         if hlsv != AlarmSeverity::NoAlarm {
-            if self.limits.hls || self.pos.dval > self.limits.dhlm {
+            if self.limits.hls != 0 || self.pos.dval > self.limits.dhlm {
                 rec_gbl_set_sevr(common, alarm_status::HIGH_ALARM, hlsv);
                 return;
             }
-            if self.limits.lls || self.pos.dval < self.limits.dllm {
+            if self.limits.lls != 0 || self.pos.dval < self.limits.dllm {
                 rec_gbl_set_sevr(common, alarm_status::LOW_ALARM, hlsv);
                 return;
             }
@@ -648,9 +1048,21 @@ impl Record for MotorRecord {
 
 #[cfg(test)]
 mod tests {
-    use epics_base_rs::server::record::FieldDeclaration;
+    use epics_base_rs::server::record::{FieldDeclaration, field_at};
 
     use super::*;
+
+    /// A put processes the record exactly where motorRecord.dbd says
+    /// pp(TRUE): PCOF/ICOF/DCOF/JVEL send from special() without one.
+    #[test]
+    fn the_puts_that_process_are_the_dbd_pp_set() {
+        let dbd: Vec<&str> = dbd_generated::MOTOR_FIELDS
+            .iter()
+            .filter(|f| f.pp)
+            .map(|f| f.name)
+            .collect();
+        assert_eq!(MotorRecord::new().process_passive_fields(), dbd);
+    }
 
     #[test]
     fn test_set_mode_updates_offset() {
@@ -659,14 +1071,15 @@ mod tests {
         rec.pos.dval = 5.0;
         rec.conv.set = true;
         rec.put_field("VAL", EpicsValue::Double(100.0)).unwrap();
+        let effects = rec.plan_motion(CommandSource::Val);
         // Offset should be updated, DVAL unchanged
         assert_eq!(rec.pos.dval, 5.0);
         assert_eq!(rec.pos.off, 95.0); // 100 - 1*5
-        // C 2206-2227: the FOFF=Variable redefinition completes on the
-        // spot — no controller command is dispatched (LOAD_POS belongs
-        // to the Frozen/DVAL/RVAL paths) and DMOV stays TRUE.
-        assert_eq!(rec.last_write, None);
-        assert!(rec.stat.dmov);
+        // C 2206-2227: the FOFF=Variable redefinition completes in the
+        // collection — no controller command is dispatched (LOAD_POS
+        // belongs to the Frozen/DVAL/RVAL paths) and DMOV stays TRUE.
+        assert!(effects.commands.is_empty());
+        assert!(rec.stat.dmov != 0);
         assert!(rec.stat.mip.is_empty());
     }
 
@@ -676,7 +1089,7 @@ mod tests {
         assert!(rec.should_fire_forward_link());
 
         // C motorRecord.cc:1509-1510: DMOV is the only FLNK gate.
-        rec.stat.dmov = false;
+        rec.stat.dmov = 0;
         assert!(!rec.should_fire_forward_link());
     }
 
@@ -689,18 +1102,21 @@ mod tests {
     fn test_stup_processes_after_put_only_when_on() {
         // STUP == ON -> reprocess.
         let mut on = MotorRecord::new();
+        on.internal.init_invariants_synced = true;
         on.put_field("STUP", EpicsValue::Short(1)).unwrap();
         assert_eq!(on.stat.stup, 1);
-        assert!(on.processes_after_put("STUP"));
+        assert!(on.processes_after_put("STUP", true));
 
         // STUP == BUSY -> clamped to OFF, no reprocess (C return ERROR).
         let mut off = MotorRecord::new();
+        off.internal.init_invariants_synced = true;
         off.put_field("STUP", EpicsValue::Short(2)).unwrap();
         assert_eq!(off.stat.stup, 0);
-        assert!(!off.processes_after_put("STUP"));
+        assert!(!off.processes_after_put("STUP", true));
 
-        // A non-pp(TRUE) config field never reprocesses (default membership).
-        assert!(!off.processes_after_put("VELO"));
+        // Every other field takes the declared pp bit.
+        assert!(off.processes_after_put("VAL", true));
+        assert!(!off.processes_after_put("VELO", false));
     }
 
     // C motorRecord.cc:1495 — every process pass fires the RLNK readback
@@ -708,7 +1124,7 @@ mod tests {
     #[test]
     fn rlnk_readback_link_fired_with_rbv_each_process() {
         let mut rec = MotorRecord::new();
-        rec.links.rlnk = "readback_sink.PROC".to_string();
+        rec.links.rlnk = "readback_sink.PROC".into();
         rec.pos.rbv = 12.5;
         let outcome = rec.process().unwrap();
         let rbv = rec.pos.rbv;
@@ -727,21 +1143,15 @@ mod tests {
     // C motorRecord.cc:1495 fires `dbPutLink(&rlnk, ...)` on the move-start
     // pass too — before `monitor()` (motorRecord.cc:1507) and the
     // `recGblFwdLink` gate (motorRecord.cc:1509) — so the RLNK readback
-    // target re-processes even while the move is still pending. The framework
-    // executes the emitted WriteDbLink on the AsyncPendingNotify branch.
+    // target re-processes even while the move is still pending.
     #[test]
-    fn rlnk_readback_link_fired_on_move_start_async_pending() {
+    fn rlnk_readback_link_fired_on_move_start() {
         let mut rec = MotorRecord::new();
-        rec.links.rlnk = "readback_sink.PROC".to_string();
-        // Enter a move: DMOV goes true→false. The first process() of a fresh
-        // move returns the intermediate DMOV=0 notification.
+        rec.links.rlnk = "readback_sink.PROC".into();
         rec.put_field("VAL", EpicsValue::Double(10.0)).unwrap();
         rec.set_event(MotorEvent::UserWrite(CommandSource::Val));
         let outcome = rec.process().unwrap();
-        assert!(
-            matches!(outcome.result, RecordProcessResult::AsyncPendingNotify(_)),
-            "first process() of a fresh move must be the move-start notification"
-        );
+        assert!(rec.stat.dmov == 0, "the pass started the move");
         let rbv = rec.pos.rbv;
         assert!(
             outcome.actions.iter().any(|a| matches!(
@@ -751,7 +1161,7 @@ mod tests {
                     value: EpicsValue::Double(v),
                 } if *v == rbv
             )),
-            "the move-start AsyncPendingNotify cycle must still emit the RLNK readback write"
+            "the move-start cycle must still emit the RLNK readback write"
         );
     }
 
@@ -772,29 +1182,35 @@ mod tests {
         );
     }
 
-    // C do_work marks M_MIP on the move dispatch and M_RCNT on the retry
-    // counter reset (motorRecord.cc:1929-1932); monitor() posts both on
-    // the move-start pass.
+    // C do_work marks M_MIP on the move dispatch (2461-2462) and M_RCNT
+    // when the reset clears a nonzero count (2352-2356); monitor() posts
+    // both on the move-start pass.
     #[test]
     fn move_start_notify_carries_mip_and_rcnt() {
         let mut rec = MotorRecord::new();
+        rec.retry.rcnt = 2;
         rec.put_field("VAL", EpicsValue::Double(10.0)).unwrap();
         rec.set_event(MotorEvent::UserWrite(CommandSource::Val));
-        let outcome = rec.process().unwrap();
-        let RecordProcessResult::AsyncPendingNotify(fields) = outcome.result else {
-            panic!("first process() of a fresh move must be the move-start notification");
-        };
-        let mip = rec.stat.mip.bits() as i16;
+        rec.process().unwrap();
+        assert!(rec.stat.dmov == 0, "the pass started the move");
+        let fields: Vec<(&str, EpicsValue)> = rec
+            .take_cycle_posted_fields()
+            .map(|(ix, _)| {
+                let name = field_at(dbd_generated::MOTOR_FIELDS, ix).unwrap().name;
+                (name, rec.get_field(name).unwrap())
+            })
+            .collect();
+        let mip = rec.stat.mip.bits();
         assert!(
             fields
                 .iter()
-                .any(|(n, v)| n == "MIP" && *v == EpicsValue::Short(mip)),
+                .any(|(n, v)| *n == "MIP" && *v == EpicsValue::UShort(mip)),
             "move-start notify must carry MIP: {fields:?}"
         );
         assert!(
             fields
                 .iter()
-                .any(|(n, v)| n == "RCNT" && *v == EpicsValue::Short(rec.retry.rcnt)),
+                .any(|(n, v)| *n == "RCNT" && *v == EpicsValue::Short(rec.retry.rcnt)),
             "move-start notify must carry RCNT: {fields:?}"
         );
     }
@@ -807,7 +1223,10 @@ mod tests {
         let mut rec = MotorRecord::new();
         rec.pos.rbv = 7.25;
         assert_eq!(rec.monitor_deadband_field(), "RBV");
-        assert_eq!(rec.monitor_deadband_value(), Some(7.25));
+        assert_eq!(
+            rec.monitor_deadband_value(),
+            Some(epics_base_rs::server::record::AlarmLimit::Double(7.25))
+        );
     }
 
     // C motorRecord.cc:3687 — URIP=Yes pulls the readback from the RDBL link
@@ -816,7 +1235,7 @@ mod tests {
     fn urip_pulls_rdbl_link_before_process() {
         let mut rec = MotorRecord::new();
         rec.conv.urip = true;
-        rec.links.rdbl = "ext_readback.RBV".to_string();
+        rec.links.rdbl = "ext_readback.RBV".into();
         let actions = rec.pre_process_actions();
         assert!(
             actions.iter().any(|a| matches!(
@@ -835,7 +1254,7 @@ mod tests {
         let mut rec = MotorRecord::new();
         // Link configured, but URIP=No — C reads RRBV from the controller.
         rec.conv.urip = false;
-        rec.links.rdbl = "ext_readback.RBV".to_string();
+        rec.links.rdbl = "ext_readback.RBV".into();
         let actions = rec.pre_process_actions();
         assert!(
             !actions.iter().any(|a| matches!(
@@ -856,7 +1275,7 @@ mod tests {
         let mut rec = MotorRecord::new();
         rec.conv.urip = true;
         rec.conv.ueip = true;
-        rec.links.rdbl = "ext_readback.RBV".to_string();
+        rec.links.rdbl = "ext_readback.RBV".into();
         let actions = rec.pre_process_actions();
         assert!(
             !actions.iter().any(|a| matches!(
@@ -888,8 +1307,8 @@ mod tests {
     fn closed_loop_db_dol_drives_val() {
         let mut rec = MotorRecord::new();
         rec.links.omsl = 1; // menuOmsl: closed_loop
-        rec.links.dol = "setpoint_src.VAL".to_string(); // resolves to a DB link
-        assert!(rec.stat.dmov, "record starts done");
+        rec.links.dol = "setpoint_src.VAL".into(); // resolves to a DB link
+        assert!(rec.stat.dmov != 0, "record starts done");
         assert!(
             has_dol_read(&rec.pre_process_actions()),
             "CLOSED_LOOP with a DB DOL must read DOL into VAL"
@@ -900,7 +1319,7 @@ mod tests {
     fn supervisory_omsl_ignores_dol() {
         let mut rec = MotorRecord::new();
         rec.links.omsl = 0; // supervisory
-        rec.links.dol = "setpoint_src.VAL".to_string();
+        rec.links.dol = "setpoint_src.VAL".into();
         assert!(
             !has_dol_read(&rec.pre_process_actions()),
             "supervisory OMSL must not read DOL"
@@ -915,8 +1334,8 @@ mod tests {
         use epics_base_rs::server::record::CommonFields;
         let mut rec = MotorRecord::new();
         rec.links.omsl = 1; // closed_loop
-        rec.links.dol = "setpoint_src.VAL".to_string();
-        assert!(rec.stat.dmov, "record starts done");
+        rec.links.dol = "setpoint_src.VAL".into();
+        assert!(rec.stat.dmov != 0, "record starts done");
         let mut common = CommonFields::default();
 
         // Failed read: the resolved report omits DOL.
@@ -940,49 +1359,23 @@ mod tests {
         );
     }
 
-    // R61: a settled-idle record keeps the poller alive (Start), never Stop.
-    // C asynMotorController::asynMotorPoller (asynMotorController.cpp:615-696)
-    // is a while(1) that never stops idle polling, so the MIP_EXTERNAL detector
-    // and the idle-poll button resume keep firing. Pre-R61 the settled pass
-    // emitted PollDirective::Stop, stranding both end-to-end.
+    // A request_poll forces the post; otherwise a held button strands on a
+    // stationary axis whose status never changes. A settled pass asks for
+    // nothing.
     #[test]
-    fn settled_idle_keeps_poller_alive_not_stopped() {
+    fn request_poll_forces_poll_directive() {
         let mut rec = MotorRecord::new();
-        rec.stat.dmov = true;
-        // No commands, no schedule_delay, no request_poll / status_refresh.
-        let effects = ProcessEffects::default();
-        let actions = rec.effects_to_actions(&effects);
-        assert_eq!(
-            actions.poll,
-            PollDirective::Start,
-            "a settled idle record must keep the poller alive, not stop it"
-        );
-    }
-
-    // An explicit refresh request (request_poll / status_refresh — STUP,
-    // implicit GET_INFO, settle-resume) must emit PollDirective::Refresh, the
-    // forced-post directive (C motorUpdateStatus_ forces statusChanged_=1), not
-    // the deduped keep-alive Start — otherwise STUP=BUSY strands on a stationary
-    // axis whose status never changes.
-    #[test]
-    fn refresh_request_forces_poll_directive() {
-        let mut rec = MotorRecord::new();
-        let status_refresh = ProcessEffects {
-            status_refresh: true,
-            ..Default::default()
-        };
-        assert_eq!(
-            rec.effects_to_actions(&status_refresh).poll,
-            PollDirective::Refresh,
-            "status_refresh must force a poll"
+        rec.stat.dmov = 1;
+        assert!(
+            !rec.effects_to_actions(&ProcessEffects::default())
+                .force_poll
         );
         let request_poll = ProcessEffects {
             request_poll: true,
             ..Default::default()
         };
-        assert_eq!(
-            rec.effects_to_actions(&request_poll).poll,
-            PollDirective::Refresh,
+        assert!(
+            rec.effects_to_actions(&request_poll).force_poll,
             "request_poll must force a poll"
         );
     }
@@ -1006,7 +1399,7 @@ mod tests {
     fn constant_dol_clears_udf_at_init() {
         use epics_base_rs::server::record::CommonFields;
         let mut rec = MotorRecord::new();
-        rec.links.dol = String::new(); // unset DOL == CONSTANT
+        rec.links.dol = "".into(); // unset DOL == CONSTANT
         let status = asyn_rs::interfaces::motor::MotorStatus {
             position: 0.0,
             encoder_position: 0.0,
@@ -1015,14 +1408,38 @@ mod tests {
             ..Default::default()
         };
         rec.initial_readback(&status);
-        assert_eq!(
-            rec.internal.dol_udf,
-            Some(false),
-            "init arms the UDF clear for a CONSTANT DOL"
-        );
-        let mut common = CommonFields::default(); // udf == true (dbCommon default)
-        rec.check_alarms(&mut common);
-        assert!(common.udf == 0, "CONSTANT DOL motor is defined after init");
+        let mut udf = CommonFields::default().udf; // dbCommon default
+        rec.post_init_finalize_undef(&mut udf).unwrap();
+        assert_eq!(udf, 0, "CONSTANT DOL motor is defined after init");
+    }
+
+    // C init_record returns before its tail with no dset or a failed dset
+    // init (612-651): no UDF clear.
+    #[test]
+    fn a_record_whose_init_returns_early_stays_undefined() {
+        let mut rec = MotorRecord::new();
+        let mut udf = 1;
+        rec.post_init_finalize_undef(&mut udf).unwrap();
+        assert_eq!(udf, 1);
+        assert!(!rec.init_resets_alarms());
+    }
+
+    // C init_record's closing monitor() copies EA_POSITION into CNEN for a
+    // GAIN_SUPPORT axis (3541-3548), so an idle axis shows it unprocessed.
+    #[test]
+    fn init_copies_cnen_from_msta() {
+        let mut rec = MotorRecord::new();
+        rec.init_record(1).unwrap();
+        let status = asyn_rs::interfaces::motor::MotorStatus {
+            done: true,
+            powered: true,
+            gain_support: true,
+            ..Default::default()
+        };
+        rec.initial_readback(&status);
+        rec.post_init_finalize_undef(&mut 1).unwrap();
+        assert!(rec.ctrl.cnen, "CNEN follows EA_POSITION at init");
+        assert_eq!(rec.internal.mmap, 0, "init monitor() drains the marks");
     }
 
     // C leaves udf TRUE for a non-CONSTANT .dol (init_record only clears for
@@ -1033,7 +1450,7 @@ mod tests {
         use epics_base_rs::server::record::CommonFields;
         let mut rec = MotorRecord::new();
         rec.links.omsl = 1; // closed_loop
-        rec.links.dol = "setpoint_src.VAL".to_string(); // DB_LINK
+        rec.links.dol = "setpoint_src.VAL".into(); // DB_LINK
         let status = asyn_rs::interfaces::motor::MotorStatus {
             position: 0.0,
             encoder_position: 0.0,
@@ -1042,15 +1459,10 @@ mod tests {
             ..Default::default()
         };
         rec.initial_readback(&status);
-        assert_ne!(
-            rec.internal.dol_udf,
-            Some(false),
-            "a DB_LINK DOL is not cleared at init"
-        );
-        let mut common = CommonFields::default(); // udf == true
-        rec.check_alarms(&mut common);
-        assert!(
-            common.udf != 0,
+        let mut udf = CommonFields::default().udf;
+        rec.post_init_finalize_undef(&mut udf).unwrap();
+        assert_eq!(
+            udf, 1,
             "DB_LINK DOL motor stays undefined until the first DOL read"
         );
     }
@@ -1061,7 +1473,7 @@ mod tests {
     fn closed_loop_constant_dol_not_reread() {
         let mut rec = MotorRecord::new();
         rec.links.omsl = 1;
-        rec.links.dol = "5.0".to_string(); // CONSTANT, not a DB link
+        rec.links.dol = "5.0".into(); // CONSTANT, not a DB link
         assert!(
             !has_dol_read(&rec.pre_process_actions()),
             "a constant DOL must not be re-read each pass"
@@ -1074,8 +1486,8 @@ mod tests {
     fn closed_loop_dol_not_read_mid_move() {
         let mut rec = MotorRecord::new();
         rec.links.omsl = 1;
-        rec.links.dol = "setpoint_src.VAL".to_string();
-        rec.stat.dmov = false; // a move is in flight
+        rec.links.dol = "setpoint_src.VAL".into();
+        rec.stat.dmov = 0; // a move is in flight
         assert!(
             !has_dol_read(&rec.pre_process_actions()),
             "DOL must not be re-read while a move is in flight"
@@ -1087,7 +1499,7 @@ mod tests {
     #[test]
     fn test_flnk_fires_on_idle_pass_with_dmov_true() {
         let mut rec = MotorRecord::new();
-        assert!(rec.stat.dmov);
+        assert!(rec.stat.dmov != 0);
         let _ = rec.process();
         assert!(
             rec.should_fire_forward_link(),
@@ -1098,11 +1510,12 @@ mod tests {
     #[test]
     fn test_flnk_fires_on_motion_completion_transition() {
         let mut rec = MotorRecord::new();
+        rec.conv.mres = 1.0;
         // Enter a move: DMOV goes true→false.
         rec.put_field("VAL", EpicsValue::Double(10.0)).unwrap();
         rec.set_event(MotorEvent::UserWrite(CommandSource::Val));
         let _ = rec.process();
-        assert!(!rec.stat.dmov); // moving
+        assert!(rec.stat.dmov == 0); // moving
         assert!(!rec.should_fire_forward_link()); // suppressed while moving
 
         // Driver reports completion; next process finalizes DMOV false→true.
@@ -1116,7 +1529,7 @@ mod tests {
             },
         ));
         let _ = rec.process();
-        assert!(rec.stat.dmov); // completed
+        assert!(rec.stat.dmov != 0); // completed
         assert!(
             rec.should_fire_forward_link(),
             "FLNK must fire on the DMOV false→true completion transition"

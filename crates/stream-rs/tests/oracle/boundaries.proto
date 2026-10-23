@@ -1,0 +1,4 @@
+# Edges the other cases leave open, compiled by C and rs alike.
+max { wait 4294967295; }
+closing { max}
+params { out "\$1" "\$2"; }

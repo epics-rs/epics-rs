@@ -1,0 +1,949 @@
+rec0: PTC10.proto getName(1,2,3,4,5,6,7,8,9) P
+getName {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    out "1.Name?";
+    in "%#s";
+}
+rec1: PTC10.proto setOutputLevel(1,2,3,4,5,6,7,8,9) P
+setOutputLevel {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    out "1.Value %f";
+}
+rec2: PTC10.proto getOutputLevel(1,2,3,4,5,6,7,8,9) P
+getOutputLevel {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    out "1?";
+    in "%f";
+}
+rec3: PTC10.proto getTecCurrent(1,2,3,4,5,6,7,8,9) P
+getTecCurrent {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    out "1.Current?";
+    in "%{1 mA|100 \xb5A|10 \xb5A|Auto}";
+}
+rec4: PTC10.proto setTecCurrent(1,2,3,4,5,6,7,8,9) P
+setTecCurrent {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    out "1.Current %{\"1 mA\"|\"100 \xb5A\"|\"10 \xb5A\"|Auto}";
+}
+rec5: PTC10.proto getTecSensor(1,2,3,4,5,6,7,8,9) P
+getTecSensor {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    out "1.Sensor?";
+    in "%{Therm|RTD|LM135|AD590}";
+}
+rec6: PTC10.proto setTecSensor(1,2,3,4,5,6,7,8,9) P
+setTecSensor {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    out "1.Sensor %{Therm|RTD|LM135|AD590}";
+}
+rec7: PTC10.proto getTecUnits(1,2,3,4,5,6,7,8,9) P
+getTecUnits {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    out "1.Units?";
+    in "%{\xea|V|mA}";
+}
+rec8: PTC10.proto getTecIOtype(1,2,3,4,5,6,7,8,9) P
+getTecIOtype {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    out "1.IOtype?";
+    in "%{Set out|Meas out}";
+}
+rec9: PTC10.proto setTecIOtype(1,2,3,4,5,6,7,8,9) P
+setTecIOtype {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    out "1.IOtype %{\x22Set out\x22|\x22Meas out\x22}";
+}
+rec10: PTC10.proto getTecRange(1,2,3,4,5,6,7,8,9) P
+getTecRange {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    out "1.Range?";
+    in "%{3V 5A|6V 5A|9V 5A|12V 5A|Auto}";
+}
+rec11: PTC10.proto setTecRange(1,2,3,4,5,6,7,8,9) P
+setTecRange {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    out "1.Range %{\"3V 5A\"|\"6V 5A\"|\"9V 5A\"|\"12V 5A\"|Auto}";
+}
+rec12: PTC10.proto getTecSlew(1,2,3,4,5,6,7,8,9) P
+getTecSlew {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    out "1.Slew?";
+    in "%f";
+}
+rec13: PTC10.proto setTecSlew(1,2,3,4,5,6,7,8,9) P
+setTecSlew {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    out "1.Slew %f";
+}
+rec14: PTC10.proto getRtdSensor(1,2,3,4,5,6,7,8,9) P
+getRtdSensor {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    out "1.Sensor?";
+    in "%{Diode|ROX|RTD|Thermistor|AD590}";
+}
+rec15: PTC10.proto setRtdSensor(1,2,3,4,5,6,7,8,9) P
+setRtdSensor {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    out "1.Sensor %{Diode|ROX|RTD|Thermistor|AD590}";
+}
+rec16: PTC10.proto getRtdRange(1,2,3,4,5,6,7,8,9) P
+getRtdRange {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    out "1.Range?";
+    in "%{Auto|10\xea|30\xea|100\xea|300\xea|1k\xea|3k\xea|10k\xea|30k\xea|100k\xea|300k\xea|2.5V}";
+}
+rec17: PTC10.proto setRtdRange(1,2,3,4,5,6,7,8,9) P
+setRtdRange {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    out "1.Range %{Auto|10\xea|30\xea|100\xea|300\xea|1k\xea|3k\xea|10k\xea|30k\xea|100k\xea|300k\xea|2.5V}";
+}
+rec18: PTC10.proto getRtdUnits(1,2,3,4,5,6,7,8,9) P
+getRtdUnits {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    out "1.Units?";
+    in "%{\xea|V|mA}";
+}
+rec19: PTC10.proto getRtdCurrent(1,2,3,4,5,6,7,8,9) P
+getRtdCurrent {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    out "1.Current?";
+    in "%{Forward|Reverse|AC|Off}";
+}
+rec20: PTC10.proto setRtdCurrent(1,2,3,4,5,6,7,8,9) P
+setRtdCurrent {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    out "1.Current %{Forward|Reverse|AC|Off}";
+}
+rec21: PTC10.proto getRtdPower(1,2,3,4,5,6,7,8,9) P
+getRtdPower {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    out "1.Power?";
+    in "%{Auto|Low|High}";
+}
+rec22: PTC10.proto setRtdPower(1,2,3,4,5,6,7,8,9) P
+setRtdPower {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    out "1.Power %{Auto|Low|High}";
+}
+rec23: PTC10.proto getTcSensor(1,2,3,4,5,6,7,8,9) P
+getTcSensor {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    out "1.Sensor?";
+    in "%{B|E|J|K|N|R|S|T}";
+}
+rec24: PTC10.proto setTcSensor(1,2,3,4,5,6,7,8,9) P
+setTcSensor {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    out "1.Sensor %{B|E|J|K|N|R|S|T}";
+}
+rec25: PTC10.proto getIOtype(1,2,3,4,5,6,7,8,9) P
+getIOtype {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    out "1.IOtype?";
+    in "%{Input|Set out|Meas out}";
+}
+rec26: PTC10.proto setIOtype(1,2,3,4,5,6,7,8,9) P
+setIOtype {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    out "1.IOtype %{Input|\x22Set out\x22|\x22Meas out\x22}";
+\}
+
+rec27: PTC10.proto setOff(1,2,3,4,5,6,7,8,9) P
+setOff {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    out "1.off";
+}
+rec28: PTC10.proto getLowLimit(1,2,3,4,5,6,7,8,9) P
+getLowLimit {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    out "1.Lowlmt?";
+    in "%f";
+}
+rec29: PTC10.proto setLowLimit(1,2,3,4,5,6,7,8,9) P
+setLowLimit {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    out "1.Lowlmt %f";
+}
+rec30: PTC10.proto getHighLimit(1,2,3,4,5,6,7,8,9) P
+getHighLimit {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    out "1.Hilmt?";
+    in "%f";
+}
+rec31: PTC10.proto setHighLimit(1,2,3,4,5,6,7,8,9) P
+setHighLimit {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    out "1.Hilmt %f";
+}
+rec32: PTC10.proto getSetpoint(1,2,3,4,5,6,7,8,9) P
+getSetpoint {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    out "1.pid.Setpoint?";
+    in "%f";
+}
+rec33: PTC10.proto setSetpoint(1,2,3,4,5,6,7,8,9) P
+setSetpoint {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    out "1.pid.Setpoint %f";
+}
+rec34: PTC10.proto getRampRate(1,2,3,4,5,6,7,8,9) P
+getRampRate {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    out "1.pid.Ramp?";
+    in "%f";
+}
+rec35: PTC10.proto setRampRate(1,2,3,4,5,6,7,8,9) P
+setRampRate {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    out "1.pid.Ramp %f";
+}
+rec36: PTC10.proto getRampTemp(1,2,3,4,5,6,7,8,9) P
+getRampTemp {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    out "1.pid.RampT?";
+    in "%f";
+}
+rec37: PTC10.proto getPidP(1,2,3,4,5,6,7,8,9) P
+getPidP {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    out "1.pid.P?";
+    in "%f";
+}
+rec38: PTC10.proto setPidP(1,2,3,4,5,6,7,8,9) P
+setPidP {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    out "1.pid.P %f";
+}
+rec39: PTC10.proto getPidI(1,2,3,4,5,6,7,8,9) P
+getPidI {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    out "1.pid.I?";
+    in "%f";
+}
+rec40: PTC10.proto setPidI(1,2,3,4,5,6,7,8,9) P
+setPidI {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    out "1.pid.I %f";
+}
+rec41: PTC10.proto getPidD(1,2,3,4,5,6,7,8,9) P
+getPidD {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    out "1.pid.D?";
+    in "%f";
+}
+rec42: PTC10.proto setPidD(1,2,3,4,5,6,7,8,9) P
+setPidD {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    out "1.pid.D %f";
+}
+rec43: PTC10.proto getPidInput(1,2,3,4,5,6,7,8,9) P
+getPidInput {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    out "1.pid.input?";
+    in "%s";
+}
+rec44: PTC10.proto setPidInput(1,2,3,4,5,6,7,8,9) P
+setPidInput {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    out "1.pid.input %s";
+}
+rec45: PTC10.proto getPidMode(1,2,3,4,5,6,7,8,9) P
+getPidMode {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    out "1.pid.Mode?";
+    in "%{Off|On}";
+}
+rec46: PTC10.proto setPidMode(1,2,3,4,5,6,7,8,9) P
+setPidMode {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    out "1.pid.Mode %{Off|On}";
+}
+rec47: PTC10.proto getTuneLag(1,2,3,4,5,6,7,8,9) P
+getTuneLag {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    out "1.tune.Lag?";
+    in "%f";
+}
+rec48: PTC10.proto setTuneLag(1,2,3,4,5,6,7,8,9) P
+setTuneLag {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    out "1.tune.Lag %f";
+}
+rec49: PTC10.proto getTuneStep(1,2,3,4,5,6,7,8,9) P
+getTuneStep {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    out "1.tune.StepY?";
+    in "%f";
+}
+rec50: PTC10.proto setTuneStep(1,2,3,4,5,6,7,8,9) P
+setTuneStep {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    out "1.tune.StepY %f";
+}
+rec51: PTC10.proto getTuneMode(1,2,3,4,5,6,7,8,9) P
+getTuneMode {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    out "1.tune.Mode?";
+    in "%{Off|Auto|Step|Relay}";
+}
+rec52: PTC10.proto setTuneMode(1,2,3,4,5,6,7,8,9) P
+setTuneMode {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    out "1.tune.Mode %{Off|Auto|Step|Relay}";
+}
+rec53: PTC10.proto getTuneType(1,2,3,4,5,6,7,8,9) P
+getTuneType {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    out "1.tune.Type?";
+    in "%{Cons|Moderate|Aggr|Auto}";
+}
+rec54: PTC10.proto setTuneType(1,2,3,4,5,6,7,8,9) P
+setTuneType {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    out "1.tune.Type %{Cons|Moderate|Aggr|Auto}";
+}
+rec55: PTC10.proto setOutputEnable(1,2,3,4,5,6,7,8,9) P
+setOutputEnable {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    out "outputEnable %{Off|On}";
+}
+rec56: PTC10.proto getOutputEnable(1,2,3,4,5,6,7,8,9) P
+getOutputEnable {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    out "outputEnable?";
+    in "%{Off|On}";
+}
+rec57: PTC10.proto getOutputNames(1,2,3,4,5,6,7,8,9) P
+getOutputNames {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    out "getOutput.names?";
+    in "";
+}
+rec58: PTC10.proto getOutputUnits(1,2,3,4,5,6,7,8,9) P
+getOutputUnits {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    out "getOutput.units?";
+    in "";
+}
+rec59: PTC10.proto getOutput(1,2,3,4,5,6,7,8,9) P
+getOutput {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    out "getOutput?";
+    in "";
+}
+rec60: PTC10.proto readoutInitial(1,2,3,4,5,6,7,8,9) P
+readoutInitial {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    out "system.com.verbose medium";
+}

@@ -16,8 +16,8 @@ pub struct FilterMaterial {
     ///
     /// `double` in C, not `float`: the absorption/transmission maths reads the
     /// separate `extern double matdensity[]` array (`chantler.h:7`,
-    /// `chantler.c:8`) — `absLen = 1/(matdensity[i]*mu)` in `pf4.st:644` and
-    /// `filterDrive.st:299` — never the `float density` field of C's
+    /// `chantler.c:8`) — `absLen = 1/(matdensity[i]*mu)` in `pf4.st:658` and
+    /// `filterDrive.st:300` — never the `float density` field of C's
     /// `filterMaterial` struct, which no computation reads. `kev`/`mu` below
     /// stay `f32` because those *are* `float` in C's struct (`chantler.h:13-14`).
     pub density: f64,
@@ -1195,7 +1195,7 @@ pub const FILTER_MATERIALS: &[FilterMaterial] = &[
 /// Look up a filter material by element symbol.
 ///
 /// Case-sensitive: both C lookups compare with `strcmp`
-/// (`pf4.st:627`, `filterDrive.st:275`), so `"cu"` is not `"Cu"` and takes the
+/// (`pf4.st:638`, `filterDrive.st:276`), so `"cu"` is not `"Cu"` and takes the
 /// material-not-found path.
 pub fn find_material(name: &str) -> Option<&'static FilterMaterial> {
     FILTER_MATERIALS.iter().find(|m| m.name == name)
@@ -1203,7 +1203,7 @@ pub fn find_material(name: &str) -> Option<&'static FilterMaterial> {
 
 /// Index of the first tabulated energy strictly above `energy_kev`.
 ///
-/// C `filterDrive.st:286-288` and `pf4.st:634-636`:
+/// C `filterDrive.st:287-289` and `pf4.st:645-647`:
 /// `for (j=0; j<numEntries; j++) if (keV < filtermat[i].keV[j]) break;`
 /// Returns `kev.len()` when no tabulated energy is above `energy_kev`.
 fn first_energy_above(kev: &[f32], energy_kev: f64) -> usize {
@@ -1214,7 +1214,7 @@ fn first_energy_above(kev: &[f32], energy_kev: f64) -> usize {
 
 /// Linearly interpolate the mass-attenuation coefficient at a given energy.
 ///
-/// Reproduces C `calcTrans` (`filterDrive.st:286-298`): `j` is the first node
+/// Reproduces C `calcTrans` (`filterDrive.st:287-299`): `j` is the first node
 /// *above* `energy_kev`, the interpolation runs on `[j-1, j]`, and both `j < 1`
 /// (below the first node) and `j >= numEntries` (at or above the last node) are
 /// rejected — so an energy exactly equal to the last tabulated node is out of
@@ -1222,34 +1222,69 @@ fn first_energy_above(kev: &[f32], energy_kev: f64) -> usize {
 ///
 /// Returns `None` if `energy_kev` is outside the tabulated range.
 pub fn interpolate_mu(mat: &FilterMaterial, energy_kev: f64) -> Option<f64> {
+    interpolate(mat, energy_kev).map(|(_, _, mu)| mu)
+}
+
+/// [`interpolate_mu`] with the `j` and `frac` it ran on.
+fn interpolate(mat: &FilterMaterial, energy_kev: f64) -> Option<(usize, f64, f64)> {
     let kev = mat.kev;
     let mu = mat.mu;
     let j = first_energy_above(kev, energy_kev);
-    // C filterDrive.st:289 — `if ((j < 1) | (j >= numEntries)) return 0.;`
+    // C filterDrive.st:290 — `if ((j < 1) | (j >= numEntries)) return 0.;`
     if j < 1 || j >= kev.len() {
         return None;
     }
-    let x0 = kev[j - 1] as f64;
-    let x1 = kev[j] as f64;
-    let y0 = mu[j - 1] as f64;
-    let y1 = mu[j] as f64;
-    let frac = (energy_kev - x0) / (x1 - x0);
-    Some(y0 + frac * (y1 - y0))
+    // Both table differences are `float - float` in C, rounded to float
+    // before they meet a double.
+    let frac = (energy_kev - kev[j - 1] as f64) / (kev[j] - kev[j - 1]) as f64;
+    Some((
+        j,
+        frac,
+        mu[j - 1] as f64 + frac * (mu[j] - mu[j - 1]) as f64,
+    ))
 }
 
-/// Compute the X-ray transmission through a filter.
+/// C `calcTrans`'s values (`filterDrive.st:287-302`), which its debug lines
+/// print.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Attenuation {
+    /// The first node above the energy: the interpolation runs on `[j-1, j]`.
+    pub j: usize,
+    pub frac: f64,
+    pub mu: f64,
+    pub abs_len_um: f64,
+    pub transmission: f64,
+}
+
+/// [`transmission`] with the values C's `calcTrans` computes on the way.
+pub fn attenuation(
+    mat: &FilterMaterial,
+    energy_kev: f64,
+    thickness_um: f64,
+) -> Option<Attenuation> {
+    let (j, frac, mu) = interpolate(mat, energy_kev)?;
+    let abs_len_um = 1.0 / (mat.density * mu) * 1.0e4;
+    Some(Attenuation {
+        j,
+        frac,
+        mu,
+        abs_len_um,
+        transmission: (-(thickness_um / abs_len_um)).exp(),
+    })
+}
+
+/// Compute the X-ray transmission through `thickness_um` microns of a filter,
+/// or `None` if the energy is out of range.
 ///
-/// `thickness_cm` is the filter thickness in centimetres.
-/// Returns `exp(-mu/rho * rho * thickness)`, or `None` if the energy is out of range.
-pub fn transmission(mat: &FilterMaterial, energy_kev: f64, thickness_cm: f64) -> Option<f64> {
-    let mu = interpolate_mu(mat, energy_kev)?;
-    let rho = mat.density;
-    Some((-mu * rho * thickness_cm).exp())
+/// C `calcTrans` (`filterDrive.st:297-301`) goes through the absorption length
+/// in microns, and the result keeps that rounding order.
+pub fn transmission(mat: &FilterMaterial, energy_kev: f64, thickness_um: f64) -> Option<f64> {
+    attenuation(mat, energy_kev, thickness_um).map(|a| a.transmission)
 }
 
 /// Absorption length in microns, for pf4's `OtherAbsorptionLength`.
 ///
-/// **DEVIATION from C, deliberate — CBUG-B1.** C (`pf4.st:634-643`) runs the same
+/// **C defect, fixed in the `pf4.st` copy — CBUG-B1.** Upstream C (`pf4.st:634-643`) runs the same
 /// bracketing loop as [`interpolate_mu`], leaving `j` at the first node *strictly
 /// above* the energy, and then interpolates on `[j, j+1]` instead of `[j-1, j]`:
 ///
@@ -1266,22 +1301,21 @@ pub fn transmission(mat: &FilterMaterial, energy_kev: f64, thickness_cm: f64) ->
 /// (for Pb, whose table fills every slot, past the array itself — CBUG-B2).
 ///
 /// The same module contains the correct version of the same computation over the
-/// same table: `filterDrive.st:288-298` (`calcTrans`) — which is
+/// same table: `filterDrive.st:289-299` (`calcTrans`) — which is
 /// [`interpolate_mu`]. There is only one interpolation here now, so the `[j, j+1]`
 /// bracket and the out-of-bounds `j+1` are both unrepresentable.
 ///
 /// Measured against the shipped Chantler table, C's version is +0.7% to +3.5% off
 /// at ordinary energies and +7.4% just below a Pb absorption edge.
 ///
-/// **DEVIATION from C, deliberate — CBUG-B4.** `None` means *no absorption data
+/// **C defect, fixed in the `pf4.st` copy — CBUG-B4.** `None` means *no absorption data
 /// at this energy*, and it is a distinct value from any absorption length. C
-/// returns `0.` for it (`:637-639`), which `RecalcFilters` (`:696`) then feeds
-/// to `exp(-x*1000./absLen)` = `exp(-inf)` = `0.0` — reporting the blade as
-/// perfectly opaque, silently. `0.` is C's "no data" sentinel and its only
-/// consumer is a divisor that cannot tell it from a real length. See
-/// [`crate::snl::pf4::calc_blade_transmission`] for what the port does instead.
+/// returns `0.` for it (`:651-653`), which upstream `RecalcFilters` fed to
+/// `exp(-x*1000./absLen)` = `exp(-inf)` = `0.0` — reporting the blade as
+/// perfectly opaque, silently. The `.st` copy's `RecalcFilters` reports such
+/// a blade and leaves it out.
 pub fn other_absorption_length_um(mat: &FilterMaterial, energy_kev: f64) -> Option<f64> {
-    // C pf4.st:644-645 — absLen = 1/(matdensity[i]*mu), cm -> microns.
+    // C pf4.st:658-659 — absLen = 1/(matdensity[i]*mu), cm -> microns.
     interpolate_mu(mat, energy_kev).map(|mu| (1.0 / (mat.density * mu)) * 1.0e4)
 }
 
@@ -1296,8 +1330,8 @@ mod tests {
         assert!((cu.density - 8.96).abs() < 0.01);
     }
 
-    // R6-63: C matches species names with strcmp (pf4.st:627,
-    // filterDrive.st:275), so a name differing only in case is "not found".
+    // R6-63: C matches species names with strcmp (pf4.st:638,
+    // filterDrive.st:276), so a name differing only in case is "not found".
     #[test]
     fn test_r6_63_find_material_is_case_sensitive() {
         assert!(find_material("Cu").is_some());
@@ -1308,7 +1342,7 @@ mod tests {
     // R6-73: density is C's `double matdensity[]` (chantler.c:8), so every
     // tabulated value must be the exact double literal — an `f32` field widened
     // back to `f64` carries the single-precision rounding into
-    // `1/(matdensity[i]*mu)` (pf4.st:644, filterDrive.st:299).
+    // `1/(matdensity[i]*mu)` (pf4.st:658, filterDrive.st:300).
     #[test]
     fn test_r6_73_density_is_the_exact_c_double() {
         // Values whose f32 image is *not* the double: the boundary of the bug.
@@ -1373,7 +1407,7 @@ mod tests {
     #[test]
     fn test_transmission_cu() {
         let cu = find_material("Cu").unwrap();
-        let t = transmission(cu, 10.0, 0.001).expect("10 keV in range");
+        let t = transmission(cu, 10.0, 10.0).expect("10 keV in range");
         // Transmission should be between 0 and 1
         assert!(t > 0.0 && t < 1.0, "t = {t}");
     }
@@ -1388,6 +1422,26 @@ mod tests {
         );
     }
 
+    /// `calcTrans` values read back from a C filterDrive IOC (`caget -g17`).
+    #[test]
+    fn transmission_is_c_calc_trans_to_the_bit() {
+        for (name, kev, um, c) in [
+            ("Mo", 20.0, 10.0, 0.7911141839734291),
+            ("Cu", 20.0, 20.0, 0.5478998747777004),
+            ("C", 20.0, 100.0, 0.9926070572696039),
+            ("Mo", 8.9, 10.0, 0.3055005520281409),
+            ("Cu", 8.9, 20.0, 0.5034056004194204),
+            ("C", 8.9, 100.0, 0.9469568639522092),
+        ] {
+            let mat = find_material(name).unwrap();
+            assert_eq!(
+                transmission(mat, kev, um),
+                Some(c),
+                "{um} um {name} at {kev} keV"
+            );
+        }
+    }
+
     /// Relative agreement with a value produced by the C function itself.
     /// The `keV`/`mu` tables are `float` in both languages and `matdensity` is
     /// `double` in both (R6-73), so only the last bits of the float tables can
@@ -1398,7 +1452,7 @@ mod tests {
     }
 
     // R6-67: `interpolate_mu` must bracket as C `calcTrans` does
-    // (filterDrive.st:286-298) — `j` = first node above the energy,
+    // (filterDrive.st:287-299) — `j` = first node above the energy,
     // interpolation on `[j-1, j]`. Expected values from the C function compiled
     // against `chantler.c`.
     #[test]
@@ -1427,7 +1481,7 @@ mod tests {
     fn test_r6_67_interpolate_mu_rejects_j_lt_1_and_j_ge_num_entries() {
         let cu = find_material("Cu").unwrap();
         let n = cu.kev.len();
-        // C filterDrive.st:289 rejects j < 1, i.e. any energy below the first
+        // C filterDrive.st:290 rejects j < 1, i.e. any energy below the first
         // node — including one just below it.
         assert!(interpolate_mu(cu, (cu.kev[0] as f64) - 1e-9).is_none());
         // ... and j >= numEntries, which includes the last node *exactly*: the
@@ -1497,7 +1551,7 @@ mod tests {
     }
 
     /// CBUG-B4 — "no absorption data" is `None`, not the `0.` that C returns
-    /// (`pf4.st:637-639`) and then divides by. This test used to assert `0.0`.
+    /// (`pf4.st:651-653`) and then divides by. This test used to assert `0.0`.
     #[test]
     fn test_b4_no_data_is_none_not_a_zero_length() {
         let cu = find_material("Cu").unwrap();

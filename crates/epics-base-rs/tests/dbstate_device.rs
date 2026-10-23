@@ -90,14 +90,11 @@ record(bi, "DBST_BI") {
     }
 }
 
-/// C registers a Db State dset only for `bi`/`bo`; an `ai` with
-/// `DTYP="Db State"` has no matching support. The Rust device's record-type
-/// gate Errs in `init()`, so `wire_device_to_record` flags the record INVALID
-/// at build time — proving the device attached and gated rather than being
-/// silently accepted as a soft channel.
+/// C registers a Db State dset only for `bi`/`bo`, so `ai`'s device menu
+/// has no `Db State` and the `.db` does not load (`dbStaticRun.c:499`).
 #[epics_macros_rs::epics_test]
-async fn db_state_wrong_record_type_is_invalid() {
-    let (db, _) = IocBuilder::new()
+async fn db_state_wrong_record_type_is_refused_at_load() {
+    let built = IocBuilder::new()
         .db_string(
             r#"
 record(ai, "DBST_AI") {
@@ -109,16 +106,8 @@ record(ai, "DBST_AI") {
         )
         .unwrap()
         .build()
-        .await
-        .unwrap();
-
-    let ai = db.get_record("DBST_AI").expect("ai exists");
-    let inst = ai.read();
-    assert_eq!(
-        inst.common.sevr,
-        AlarmSeverity::Invalid,
-        "ai with DTYP=Db State must be INVALID (no Db State device support for ai)"
-    );
+        .await;
+    assert!(built.is_err(), "ai has no Db State device support");
 }
 
 /// An INST_IO link with no state name leaves C's `dpvt` NULL, and `read_bi`'s
@@ -147,6 +136,7 @@ record(bi, "DBST_NONAME") {
         let mut v = epics_base_rs::server::database::ProcStack::new();
         db.process_record_with_links("DBST_NONAME", &mut v)
             .await
+            .or_else(epics_base_rs::error::CaError::unless_process_status)
             .unwrap();
     }
 

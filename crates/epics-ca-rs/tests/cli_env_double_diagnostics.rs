@@ -6,8 +6,8 @@
 //!
 //! ```text
 //! Unable to find a real number in EPICS_CA_CONN_TMO=abc     <- envSubr.c
-//! EPICS "EPICS_CA_CONN_TMO" double fetch failed             <- cac.cpp:192
-//! Defaulting "EPICS_CA_CONN_TMO" = 30.000000                <- cac.cpp:193
+//! EPICS "EPICS_CA_CONN_TMO" was not a positive real number  <- cac.cpp:193
+//! Defaulting "EPICS_CA_CONN_TMO" = 30.000000                <- cac.cpp:194
 //! ```
 //!
 //! and, for the search period (`udpiiu.cpp:86-89`):
@@ -22,14 +22,12 @@
 //! reject, `0x10` → 16, `1e400` → reject) are pinned by the per-boundary
 //! unit tests in `client::transport` and `server::tcp`.
 
-mod common;
-
 use std::process::Command;
 
 // Both are used only by the one `softioc-rs` case below, which the
 // reactor-free backend does not build.
 #[cfg(tokio_backend)]
-use common::LineCollector;
+use c_ca_tools::LineCollector;
 #[cfg(tokio_backend)]
 use std::process::Stdio;
 
@@ -53,7 +51,7 @@ fn conn_tmo_reject_prints_cs_three_lines() {
     let err = caget_stderr("EPICS_CA_CONN_TMO", "abc");
     for line in [
         "Unable to find a real number in EPICS_CA_CONN_TMO=abc",
-        "EPICS \"EPICS_CA_CONN_TMO\" double fetch failed",
+        "EPICS \"EPICS_CA_CONN_TMO\" was not a positive real number",
         "Defaulting \"EPICS_CA_CONN_TMO\" = 30.000000",
     ] {
         assert!(err.contains(line), "missing {line:?} in stderr:\n{err}");
@@ -67,7 +65,7 @@ fn conn_tmo_erange_prints_the_same_lines() {
     let err = caget_stderr("EPICS_CA_CONN_TMO", "1e400");
     assert!(
         err.contains("Unable to find a real number in EPICS_CA_CONN_TMO=1e400")
-            && err.contains("EPICS \"EPICS_CA_CONN_TMO\" double fetch failed"),
+            && err.contains("EPICS \"EPICS_CA_CONN_TMO\" was not a positive real number"),
         "stderr:\n{err}"
     );
 }
@@ -80,13 +78,10 @@ fn conn_tmo_erange_prints_the_same_lines() {
 fn conn_tmo_inf_parses_but_is_refused_like_c() {
     let err = caget_stderr("EPICS_CA_CONN_TMO", "inf");
     assert!(
-        !err.contains("double fetch failed") && !err.contains("Unable to find a real number"),
+        !err.contains("Unable to find a real number"),
         "inf is a valid double for strtod; no parse diagnostic is due:\n{err}"
     );
-    assert!(
-        err.contains("\"EPICS_CA_CONN_TMO\" = inf is not a positive period"),
-        "a non-finite period is refused out loud, as C refuses it:\n{err}"
-    );
+    assert_refused(&err);
     assert!(
         !err.contains("cannot convert float seconds to Duration"),
         "the from_secs_f64 panic must be gone:\n{err}"
@@ -100,7 +95,7 @@ fn conn_tmo_inf_parses_but_is_refused_like_c() {
 fn conn_tmo_finite_enormous_is_obeyed_silently() {
     let err = caget_stderr("EPICS_CA_CONN_TMO", "1e300");
     assert!(
-        !err.contains("is not a positive period") && !err.contains("double fetch failed"),
+        !err.contains("was not a positive real number"),
         "1e300 is finite and positive, so C obeys it:\n{err}"
     );
     assert!(
@@ -184,30 +179,47 @@ fn max_search_period_below_lower_limit_is_named() {
 #[test]
 fn beacon_period_reject_is_diagnosed_once_per_process() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_softioc-rs"))
-        .args(["-S", "--pv", "R16-18:PV:double:1.0"])
+        .args(["-S", "--port", "0", "--pv", "R16-18:PV:double:1.0"])
         // Keep the IOC off the network: loopback interface, loopback beacon
         // target, and a port the harness picks nothing else on.
         .env("EPICS_CAS_INTF_ADDR_LIST", "127.0.0.1")
         .env("EPICS_CAS_BEACON_ADDR_LIST", "127.0.0.1")
-        .env("EPICS_CAS_SERVER_PORT", "0")
         .env("EPICS_CAS_BEACON_PERIOD", "garbage")
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn softioc-rs");
 
-    // Startup is what prints, and the "CA server:" banner is emitted after
-    // the one-shot env resolution (`addr_list::from_env` in `run()`) — every
-    // startup point that historically duplicated the diagnostic precedes it.
-    // Wait for the banner itself (a fixed sleep races startup under load),
-    // then take the IOC down and judge everything it wrote.
+    // Startup is what prints. The "CA server:" banner is written in
+    // `bind_sockets`, after its env resolution but before `run()`'s, so the
+    // banner alone does not cover every startup point that historically
+    // duplicated the diagnostic. A read answered on the banner's port does:
+    // `run()` resolves before it starts the search responder. Neither wait is
+    // a fixed sleep, which races startup under load.
     let err_lines = LineCollector::spawn(child.stderr.take().expect("piped stderr"));
     assert!(
-        err_lines.wait_for(budget::FACT_BUDGET, |t| {
+        err_lines.wait_for(fact_budget::FACT_BUDGET, |t| {
             t.contains("CA server: UDP search on port")
         }),
         "softioc-rs never printed its startup banner; stderr: {:?}",
         err_lines.text()
+    );
+    let banner = err_lines.text();
+    let port = banner
+        .split_once("CA server: UDP search on port ")
+        .and_then(|(_, rest)| rest.split(',').next())
+        .and_then(|p| p.parse::<u16>().ok())
+        .expect("the banner names the search port");
+    let read = Command::new(env!("CARGO_BIN_EXE_caget-rs"))
+        .args(["-w", "10", "R16-18:PV"])
+        .env("EPICS_CA_AUTO_ADDR_LIST", "NO")
+        .env("EPICS_CA_ADDR_LIST", format!("127.0.0.1:{port}"))
+        .output()
+        .expect("run caget-rs");
+    assert!(
+        read.status.success(),
+        "softioc-rs never served R16-18:PV: {}",
+        String::from_utf8_lossy(&read.stderr)
     );
     let _ = child.kill();
     let _ = child.wait();
@@ -226,22 +238,24 @@ fn beacon_period_reject_is_diagnosed_once_per_process() {
     }
 }
 
-/// R16-19: a non-positive `EPICS_CA_CONN_TMO` is refused, and SAID so.
-///
-/// This is the port's one documented deviation on this knob. C stores the raw
-/// value (`cac.cpp:188-194`) and its connection watchdog then fires on every
-/// check — the compiled `camonitor` wrote 177_182 stderr lines in 3 s with
-/// `=-5`. The port keeps the 30 s default instead, and tells the operator that
-/// the value they set is not the one in force. The test stays bounded: `caget`
-/// with `-w 0.1` never reaches a circuit, so nothing can flood.
+/// R16-19: a non-positive `EPICS_CA_CONN_TMO` is refused, and SAID so, by the
+/// same two lines as a failed fetch (`cac.cpp:189-195`). The test stays
+/// bounded: `caget` with `-w 0.1` never reaches a circuit, so nothing can
+/// flood.
 #[test]
 fn conn_tmo_non_positive_is_refused_out_loud() {
     for value in ["-5", "0"] {
-        let err = caget_stderr("EPICS_CA_CONN_TMO", value);
-        assert!(
-            err.contains("\"EPICS_CA_CONN_TMO\"") && err.contains("not a positive period"),
-            "EPICS_CA_CONN_TMO={value} must be diagnosed, not silently overridden:\n{err}"
-        );
+        assert_refused(&caget_stderr("EPICS_CA_CONN_TMO", value));
+    }
+}
+
+/// C `cac::cac`'s refusal (`cac.cpp:193-194`).
+fn assert_refused(err: &str) {
+    for line in [
+        "EPICS \"EPICS_CA_CONN_TMO\" was not a positive real number",
+        "Defaulting \"EPICS_CA_CONN_TMO\" = 30.000000",
+    ] {
+        assert!(err.contains(line), "missing {line:?} in stderr:\n{err}");
     }
 }
 
@@ -250,10 +264,7 @@ fn conn_tmo_non_positive_is_refused_out_loud() {
 fn conn_tmo_positive_period_is_silent() {
     let err = caget_stderr("EPICS_CA_CONN_TMO", "10.5");
     assert!(
-        !err.contains("not a positive period") && !err.contains("double fetch failed"),
+        !err.contains("was not a positive real number"),
         "10.5 s is a valid period; no diagnostic is due:\n{err}"
     );
 }
-
-#[cfg(tokio_backend)]
-use common::budget;

@@ -1,28 +1,71 @@
 pub(crate) mod breakpoint;
+mod ca_client;
+mod ca_link;
+pub mod channel_io;
+pub mod char_view;
+#[cfg(test)]
+mod cycle_plan_tests;
 pub mod db_access;
+pub mod dbr_delivery;
 mod field_io;
 pub mod filters;
+mod io_intr_turn;
+mod link_check;
 mod link_put_queue;
 mod link_set;
 mod links;
 mod processing;
+#[cfg(test)]
+mod reads_leak_tests;
 pub(crate) use processing::{AlarmPosts, alarm_field_posts};
 mod record_lock;
+mod record_table;
 pub(crate) mod scan_index;
 mod snapshot;
+mod subroutine_context;
 
-pub use field_io::ProcessMode;
-pub(crate) use link_set::MetadataPlan;
+pub use ca_client::{
+    CaClientContext, CaClientService, ClientChannel, ClientFuture, ClientMonitor, Connection,
+    InProcessChannel, InProcessEvents, InProcessSubscription, PutCompletion,
+};
+pub use ca_link::CA_LINK_EVENT_MASK;
+pub use field_io::{
+    HeldPuts, HeldRecord, LockedRecord, ProcessMode, PutSplit, RestoreTarget, UnheldLinkPut,
+};
+pub(crate) use field_io::{
+    PutSrc, db_access_debug_putf, render_for_string_target, set_db_access_debug_putf,
+};
+pub use link_put_queue::CpWorker;
+pub(crate) use link_put_queue::{LinkId, LinkInstall};
 pub use link_set::{
-    DynLinkSet, LinkBacking, LinkDbfType, LinkDiagnostics, LinkMetadata, LinkPutOp, LinkSet,
-    LinkSetRegistry, PostBacking, PutAdmission, RemoteAlarm,
+    DynLinkSet, LinkBacking, LinkDbfType, LinkDiagnostics, LinkForward, LinkForwardRefused,
+    LinkHolder, LinkMetadata, LinkOpen, LinkPutDone, LinkPutOp, LinkRef, LinkSerial, LinkSet,
+    LinkSetRegistry, PutAdmission, RemoteAlarm, link_put_convert, report_put_not_issued,
 };
+#[cfg(test)]
+pub(crate) use links::ExternalDone;
 pub(crate) use links::{
-    multi_output_dispatch_owned, posts_software_event, reads_sell, resolves_subroutine_from_link,
+    LinkAlarm, ProcessTargetGate, inherit_sevr_msg, multi_out_rows, multi_output_dispatch_owned,
+    posts_software_event, reads_sell, resolves_subroutine_from_link,
 };
-pub use processing::{AsyncDbHandle, AsyncToken, InputLinkTexts, ProcStack};
-pub(crate) use record_lock::{LockRecord, SetGuard};
-pub use record_lock::{LockSetInfo, LockSetReport, ManyRecordWriteGuard, RecordWriteGuard};
+pub use processing::{
+    AsyncDbHandle, AsyncToken, CaLinkInit, DbAddr, DeviceDone, DeviceDoneSource, ExternalCpProcess,
+    FieldPut, HeldInstance, InitHold, InputLinkTexts, PostItem, PostRule, ProcStack,
+    ProcessCallback, TokenWatch, hop_floor,
+};
+pub(crate) use processing::{NotifiedRead, ReadPolicy, seed_record_constants};
+#[cfg(feature = "test-hooks")]
+pub use record_lock::fresh_hold_hook;
+pub(crate) use record_lock::{
+    CycleHints, FrameGate, InFrame, InitPass, LockRecord, SetGuard, owe_callback, owe_cvt,
+};
+pub use record_lock::{
+    LockSetInfo, LockSetReport, ManyRecordWriteGuard, RecordWriteGuard, in_sync_driver_wait,
+    scan_lock_held, sync_driver_wait,
+};
+pub(crate) use record_table::RecordIdx;
+pub(crate) use subroutine_context::RecordDb;
+pub use subroutine_context::SubroutineContext;
 
 use crate::error::{CaError, CaResult};
 use arc_swap::{ArcSwap, ArcSwapOption};
@@ -32,7 +75,7 @@ use std::sync::Arc;
 
 use crate::server::pv::ProcessVariable;
 use crate::server::record::{Record, RecordCell, RecordInstance};
-use crate::types::EpicsValue;
+use crate::types::{EpicsValue, PvString, RecordName};
 
 /// What a `.db` definition carries into the creation sink alongside the record
 /// itself: the `dbCommon` fields `db_loader::apply_fields` could not route to
@@ -65,28 +108,58 @@ impl RecordLoad {
 /// "TEMP.EGU" → ("TEMP", "EGU")
 /// "TEMP"     → ("TEMP", "VAL")
 ///
-/// The split is on the LAST `.`, where C `dbFindRecordPart`
-/// (`dbChannel.c:180-200`) takes the FIRST one via `strchr`. That difference
-/// is unobservable, and it is the record-name grammar that makes it so: C
-/// `dbRecordNameValidate` (`dbLexRoutines.c:1085-1119`) aborts the load with
-/// `yyerrorAbort` on a `.` anywhere in a record or alias name, and the port
-/// refuses the same names, so the base half can never itself contain a dot
-/// and the two splits can only differ on a name that no IOC can hold.
+/// The record half is [`DbNameParts`]' record part, to the first `.` as C
+/// `dbFindRecordPart` (`dbChannel.c:180-200`) has it; the field half is the
+/// rest unread, for the caller's own field lookup. A last-`.` split tore a
+/// filter such as `{"d":1.5}` apart, so a name like `REC.VAL{"d":1.5}`
+/// found no record.
 ///
-/// Measured, not reasoned: a `.db` naming records `OTHER:PV` and `A.B` is
-/// refused at load by both, so the `A.B.C` case cannot be built at all. The
-/// one shape that does load — `OTHER:PV` present, a link reading
-/// `OTHER:PV.1:X` — hangs C's `iocInit` (reproduced three times on softIoc
-/// R7.0.10-146, always at "Starting iocInit"), while the port loads and
-/// alarms; that is an upstream defect the port has no path to.
-///
-/// This is the channel-name half of the rule. Link text is split by
-/// [`crate::server::record::DbLink`], which follows C exactly and cuts at the
-/// first `.` before requiring the remainder to be a field identifier.
-pub fn parse_pv_name(name: &str) -> (&str, &str) {
-    match name.rsplit_once('.') {
-        Some((base, field)) => (base, field),
+/// The record half is bytes, as `dbNameToAddr` hashes it. Every field name is
+/// an ASCII identifier, so a field part that is not UTF-8 names none and is
+/// given back as U+FFFD, which no field lookup matches.
+pub fn parse_pv_name<N: AsRef<[u8]> + ?Sized>(name: &N) -> (&[u8], &str) {
+    let name = name.as_ref();
+    let record = DbNameParts::of(name).record;
+    match name.get(record.len() + 1..) {
+        Some(rest) => (record, std::str::from_utf8(rest).unwrap_or("\u{fffd}")),
         None => (name, "VAL"),
+    }
+}
+
+/// C `dbNameToAddr`'s reading of a name (`dbAccess.c:666-683`): the record
+/// part runs to the first `.` (`dbFindRecordPart`), the field part is the C
+/// identifier after it, empty meaning `VAL` (`dbFindFieldPart`), and the one
+/// modifier read is the single character after that, so `LSI.VAL$x` and
+/// `LSI.$` are both `VAL$` and an undotted `LSI$` is a record name.
+pub struct DbNameParts<'a> {
+    pub record: &'a [u8],
+    pub field: &'a str,
+    pub tail: &'a [u8],
+}
+
+impl<'a> DbNameParts<'a> {
+    pub fn of(pname: &'a [u8]) -> Self {
+        let Some(dot) = pname.iter().position(|&c| c == b'.') else {
+            return Self {
+                record: pname,
+                field: "",
+                tail: b"",
+            };
+        };
+        let (record, rest) = (&pname[..dot], &pname[dot + 1..]);
+        let len = match rest.first() {
+            Some(&c) if c == b'_' || c.is_ascii_alphabetic() => rest
+                .iter()
+                .position(|&c| c != b'_' && !c.is_ascii_alphanumeric())
+                .unwrap_or(rest.len()),
+            _ => 0,
+        };
+        Self {
+            record,
+            // An identifier: ASCII by the scan above.
+            field: std::str::from_utf8(&rest[..len]).unwrap_or_default(),
+            tail: &rest[len..],
+        }
     }
 }
 
@@ -122,8 +195,6 @@ pub(crate) use tsel_stamp::TselStamp;
 /// `fetch_values` first), and let the device-time override at the stamp point
 /// win over a TSEL C gives priority to.
 mod tsel_stamp {
-    use std::time::SystemTime;
-
     use crate::server::record::CommonFields;
 
     /// The TSEL half of C `recGblGetTimeStampSimm`, read but not yet stored.
@@ -139,17 +210,51 @@ mod tsel_stamp {
         /// and that `TSE` itself is not touched. There is no assignment to
         /// `prec->tse` anywhere in epics-base; the flag that suppresses the
         /// lookup lives in `plink->flags`, not in a field clients can read.
-        Time(SystemTime, u64),
+        Time(crate::types::WallTime, u64),
         /// Every other `TSEL` (`recGbl.c:322`): `dbGetLink(&prec->tsel,
         /// DBR_SHORT, &prec->tse, 0, 0)`.
         Tse(i16),
+        /// The `dbGetLink` of a non-`.TIME` TSEL failed: `TSE` keeps its own
+        /// value and the stamp raises `setLinkAlarm`, at the stamp point
+        /// because that is where C's read is.
+        Failed,
+        /// This pass calls no `recGblGetTimeStamp`: a
+        /// [`CycleHooks::withholds_cycle_stamp`](crate::server::record::CycleHooks::withholds_cycle_stamp)
+        /// type whose pass did not ask. `TSEL` was not read and nothing is
+        /// stored.
+        Withheld,
     }
 
     impl TselStamp {
         /// C `recGblGetTimeStampSimm`'s body: store what `TSEL` yielded, then
-        /// resolve `TSE`→`TIME`. `is_soft` indicates a Soft Channel device
-        /// type.
-        pub(crate) fn stamp(self, name: &str, common: &mut CommonFields, is_soft: bool) {
+        /// resolve `TSE`→`TIME`. `simm_set` answers C's `simm != menuSimmNO`
+        /// and is called only on the `TSE == -2` arm, so a record that never
+        /// uses device time pays nothing for it: with no SIOL to take a stamp
+        /// from (`siol == NULL`, every output record) a simulating `SIMM`
+        /// stamps the current time (`recGbl.c:331-342`). `false` is
+        /// [`Self::Withheld`], which stores nothing.
+        #[inline(always)]
+        pub(crate) fn stamp(
+            self,
+            name: &[u8],
+            common: &mut CommonFields,
+            simm_set: impl FnOnce() -> bool,
+        ) -> bool {
+            let begun = common.begin_stamp();
+            self.stamp_begun(begun, name, common, simm_set)
+        }
+
+        /// [`Self::stamp`] for a cycle that opened its stamp earlier, so a
+        /// device or INP-source time could land in between as C's `readValue`
+        /// does after `process()` took `timeLast`.
+        #[inline(always)]
+        pub(crate) fn stamp_begun(
+            self,
+            _begun: crate::server::record::StampBegun,
+            name: &[u8],
+            common: &mut CommonFields,
+            simm_set: impl FnOnce() -> bool,
+        ) -> bool {
             match self {
                 TselStamp::Time(time, utag) => {
                     common.time = time;
@@ -158,17 +263,35 @@ mod tsel_stamp {
                     // the event lookup does not run. Writing `TSE = -2` to get
                     // the same effect made the record report a value its `.db`
                     // never declared, and overwrote one that did.
-                    return;
+                    return true;
                 }
+                TselStamp::Withheld => return false,
                 TselStamp::None => {}
-                TselStamp::Tse(tse) => common.tse = tse,
+                TselStamp::Tse(tse) => common.set_tse(tse),
+                TselStamp::Failed => {
+                    crate::server::recgbl::rec_gbl_set_link_alarm(common, "TSEL");
+                }
             }
-            apply_timestamp(name, common, is_soft);
+            match common.stamp_mode() {
+                crate::server::record::StampMode::Plain => {
+                    common.time = crate::runtime::general_time::get_current();
+                }
+                crate::server::record::StampMode::DeviceTime => device_time(common, simm_set),
+                // A TSEL link may just have loaded any TSE, -2 included.
+                crate::server::record::StampMode::Event
+                | crate::server::record::StampMode::FromTsel => {
+                    if common.tse() == crate::server::record::EPICS_TIME_EVENT_DEVICE_TIME {
+                        device_time(common, simm_set);
+                    } else {
+                        apply_timestamp(name, common);
+                    }
+                }
+            }
+            true
         }
     }
 
-    /// Apply timestamp to a record based on its TSE field.
-    /// `is_soft` indicates a Soft Channel device type.
+    /// Apply timestamp to a record based on its TSE field, `TSE != -2`.
     ///
     /// The second half of C `recGblGetTimeStampSimm` (recGbl.c:324-342). The
     /// TSE constants are defined in `epicsTime.h:102-104`:
@@ -188,19 +311,32 @@ mod tsel_stamp {
     /// number with no provider to answer it — is not a stamp: C writes nothing
     /// into `precord->time` and errlogs, so a misconfigured record holds its
     /// stale stamp rather than timestamping as if healthy.
-    fn apply_timestamp(name: &str, common: &mut CommonFields, _is_soft: bool) {
-        // Single owner of TSE -> TIME resolution; device support that must
-        // format the record's resolved time during `read()` routes through the
-        // same helper so the two never drift (see `recgbl::get_time_stamp`).
-        // For TSE=-2 the helper returns `common.time` unchanged, preserving the
-        // device-time "leave it alone" semantics.
-        match crate::server::recgbl::get_time_stamp(common.tse, common.time) {
+    #[inline]
+    fn apply_timestamp(name: &[u8], common: &mut CommonFields) {
+        // `stamp` has taken `TSE == -2` already, so this is `get_time_stamp`'s
+        // other arm; the two share `recgbl::event_time` and cannot drift.
+        match crate::server::recgbl::event_time(common.tse()) {
             Some(t) => common.time = t,
-            None => crate::runtime::log::errlog_printf(&format!(
-                "recGblGetTimeStampSimm: epicsTimeGetEvent failed, {name}.TSE = {}\n",
-                common.tse
-            )),
+            None => tse_failed(name, common.tse()),
         }
+    }
+
+    /// `TSE == -2`: device support already wrote `time`; only a simulating
+    /// `SIMM` replaces it.
+    #[cold]
+    #[inline(never)]
+    fn device_time(common: &mut CommonFields, simm_set: impl FnOnce() -> bool) {
+        if simm_set() {
+            common.time = crate::types::WallTime::now();
+        }
+    }
+
+    #[cold]
+    fn tse_failed(name: &[u8], tse: i16) {
+        crate::runtime::log::errlog_vprintf(format_args!(
+            "recGblGetTimeStampSimm: epicsTimeGetEvent failed, {}.TSE = {tse}\n",
+            String::from_utf8_lossy(name)
+        ));
     }
 }
 
@@ -209,17 +345,6 @@ pub enum PvEntry {
     Simple(Arc<ProcessVariable>),
     Record(Arc<RecordCell>),
 }
-
-/// Callback for resolving external PV names (CA/PVA links).
-/// Returns the *cached* value of the external PV, or `None` if unavailable.
-///
-/// **Sync**, for the same reason [`LinkSet::get_cached_value`] is: this runs
-/// on the record-processing thread with the record's L1 gate held, and C's
-/// `dbCaGetLink` likewise only reads `pca->pgetNative` under `pca->lock` —
-/// it never waits for the wire (`dbCa.c:419-506`). A resolver that cannot
-/// answer from cache must stage the open on its own executor and return
-/// `None` (C's `!pca->isConnected` arm, `dbCa.c:430-435`).
-pub type ExternalPvResolver = Arc<dyn Fn(&str) -> Option<EpicsValue> + Send + Sync>;
 
 /// Async hook invoked by [`PvDatabase::has_name`] when a name is not yet
 /// in the database. Used by the CA gateway and similar proxy components
@@ -245,7 +370,7 @@ pub type ExternalPvResolver = Arc<dyn Fn(&str) -> Option<EpicsValue> + Send + Sy
 /// `gateAs::findEntry`.
 pub type SearchResolver = Arc<
     dyn Fn(
-            String,
+            RecordName,
             Option<std::net::SocketAddr>,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>
         + Send
@@ -274,7 +399,7 @@ pub type SearchResolver = Arc<
 /// gateway-managed and bypass it.
 pub type ExistenceGate = Arc<
     dyn Fn(
-            String,
+            RecordName,
             Option<std::net::SocketAddr>,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>
         + Send
@@ -309,18 +434,113 @@ pub type ExistenceGate = Arc<
 /// `get_record` first OR run the canonical-normalisation snippet
 /// at function entry. Direct `inner.records` access is reserved
 /// for the alias-management primitives listed above.
-/// One CP/CPP edge in the `PvDatabaseInner::cp_links` index: the record
-/// to (re)process when the source record changes.
+/// One CP/CPP edge in the `PvDatabaseInner::external_cp_links` index: the
+/// record to (re)process when the link's channel posts.
 ///
 /// `passive_only` distinguishes CPP from CP. C adds the `CA_DBPROCESS`
 /// action for a CP link unconditionally, but for a CPP link only when the
 /// link-holding record's `SCAN` is Passive (`dbCa.c:825`, `:959`, `:1034`). CP
-/// edges clear the flag; CPP edges set it, and `dispatch_cp_targets`
+/// edges clear the flag; CPP edges set it, and `process_one_cp_target`
 /// honours it.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct CpTarget {
-    pub record: String,
+    pub record: RecordName,
     pub passive_only: bool,
+}
+
+/// What one CP/CPP link watches: the channel it names, CPP's gate, and
+/// the link, whose own channel's events process its holder.
+#[derive(Clone, Debug)]
+pub(crate) struct CpSource {
+    pub(crate) record: RecordName,
+    pub(crate) passive_only: bool,
+    pub(crate) link: LinkSerial,
+}
+
+/// The CP/CPP edges, each owned by the link that makes it: C gives every
+/// link its own `caLink`, so an edge is keyed by its holder and link field
+/// and [`Self::set_link`] replaces it — a repeated registration or a relink
+/// moves the edge, never adds a second.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct CpRegistry {
+    /// Edges fired when the source posts.
+    by_source: HashMap<RecordName, Vec<CpTarget>>,
+    /// (holder, link field) → that link's edge.
+    by_link: HashMap<(RecordName, String), CpSource>,
+    /// The link's serial → its holder: what the link's own channel processes
+    /// (`dbCa.c:958-962`).
+    by_serial: HashMap<LinkSerial, CpTarget>,
+    /// iocInit's link pass has run: from here a relink adds its own link,
+    /// as C `dbAddLink` does once `initDatabase` has run.
+    links_initialized: bool,
+}
+
+impl CpRegistry {
+    pub(crate) fn targets(&self, source: &[u8]) -> Option<&Vec<CpTarget>> {
+        self.by_source.get(source)
+    }
+
+    /// The holder `link`'s events process, while `link` is a CP/CPP link.
+    pub(crate) fn link_target(&self, link: LinkSerial) -> Option<&CpTarget> {
+        self.by_serial.get(&link)
+    }
+
+    pub(crate) fn sources(&self) -> impl Iterator<Item = &RecordName> {
+        self.by_source.keys()
+    }
+
+    pub(crate) fn links_initialized(&self) -> bool {
+        self.links_initialized
+    }
+
+    pub(crate) fn mark_links_initialized(&mut self) {
+        self.links_initialized = true;
+    }
+
+    /// The one writer: the link `field` of `holder` now carries `edge`, or
+    /// none.
+    pub(crate) fn set_link(&mut self, holder: &[u8], field: &str, edge: Option<CpSource>) {
+        let key = (RecordName::from(holder), field.to_string());
+        if let Some(old) = self.by_link.remove(&key) {
+            self.by_serial.remove(&old.link);
+            if let Some(edges) = self.by_source.get_mut(&old.record) {
+                let is_old =
+                    |t: &CpTarget| *t.record == *holder && t.passive_only == old.passive_only;
+                if let Some(i) = edges.iter().position(is_old) {
+                    edges.remove(i);
+                }
+                if edges.is_empty() {
+                    self.by_source.remove(&old.record);
+                }
+            }
+        }
+        if let Some(edge) = edge {
+            let target = CpTarget {
+                record: key.0.clone(),
+                passive_only: edge.passive_only,
+            };
+            self.by_source
+                .entry(edge.record.clone())
+                .or_default()
+                .push(target.clone());
+            self.by_serial.insert(edge.link, target);
+            self.by_link.insert(key, edge);
+        }
+    }
+
+    /// Every edge `name` holds or sources.
+    pub(crate) fn remove_record(&mut self, name: &[u8]) {
+        self.by_source.remove(name);
+        for edges in self.by_source.values_mut() {
+            edges.retain(|e| *e.record != *name);
+        }
+        self.by_source.retain(|_, edges| !edges.is_empty());
+        self.by_link
+            .retain(|(holder, _), edge| **holder != *name && *edge.record != *name);
+        let by_link = &self.by_link;
+        self.by_serial
+            .retain(|serial, _| by_link.values().any(|edge| edge.link == *serial));
+    }
 }
 
 /// The scan index — one independently locked bucket per [`crate::server::record::ScanList`].
@@ -355,34 +575,53 @@ pub struct CpTarget {
 ///
 /// The key also carries the instance it names. A sweep otherwise hands the
 /// frame a `&str` and the frame hashes it back into the records map once per
-/// record per cycle, re-deriving what the list already knew. `Weak` and not
-/// `Arc` so a key left behind by a removal keeps nothing alive; a sweep that
-/// cannot upgrade falls back to the name.
+/// record per cycle, re-deriving what the list already knew. It is held
+/// STRONGLY: a key leaving the bucket and its record being destroyed are one
+/// operation (`remove_record_entry` takes the key out as it destroys the
+/// instance), and a handle that outlives its key is caught by `is_destroyed`
+/// under the data lock the frame takes anyway. A `Weak` here was a second,
+/// weaker encoding of the same fact, and it cost a `compare_exchange` loop per
+/// record per scan cycle to decode — 6% of the server's cycles.
 ///
 /// `Ord`/`Eq` are the four sort fields alone — the handle is what the key
 /// names, not part of which key it is — so the ordering contract above is
 /// unchanged and a key built for a lookup need not carry one.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 struct ScanKey {
     phas: i16,
-    /// Position in [`RECORD_TYPE_ORDER`](crate::server::record::dbd_generated::RECORD_TYPE_ORDER). A record type no
-    /// vendored `.dbd` declares sorts after every one that is declared, which
-    /// is where C puts it too — a module `.dbd` is included after `base.dbd`,
-    /// so its types join `recordTypeList` behind base's.
-    record_type: u32,
+    /// The type's name: C's `recordTypeList` is name-sorted (`dbdExpand.pl`
+    /// writes the expanded `.dbd` sorted, `DBD/Output.pm:61`), so a type
+    /// registered at runtime sorts among the declared ones as there.
+    record_type: &'static str,
     load_order: u64,
     /// An `Arc` and not a `String` because the cursor hands this name out once
     /// per record per scan cycle, and a `String` there made every sweep
     /// allocate — twice, since the cursor step clones the key as well.
-    /// `Ord` on `Arc<str>` is `str`'s, so the sort rule above is unchanged.
-    name: Arc<str>,
-    /// The instance `name` resolves to — see the type doc.
-    handle: std::sync::Weak<RecordCell>,
+    /// `Ord` on the bytes is `str`'s on a UTF-8 name, so the sort rule above
+    /// is unchanged.
+    name: RecordName,
+    /// The instance `name` resolves to — see the type doc. `None` only for a
+    /// key built before its record was registered, or for a lookup key.
+    handle: Option<Arc<RecordCell>>,
 }
 
 impl ScanKey {
-    fn sort_fields(&self) -> (i16, u32, u64, &str) {
+    fn sort_fields(&self) -> (i16, &'static str, u64, &[u8]) {
         (self.phas, self.record_type, self.load_order, &self.name)
+    }
+}
+
+// Hand-written because the handle is an `Arc<RecordCell>`, and printing a
+// record cell would take its lock from inside a formatter.
+impl std::fmt::Debug for ScanKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScanKey")
+            .field("phas", &self.phas)
+            .field("record_type", &self.record_type)
+            .field("load_order", &self.load_order)
+            .field("name", &self.name)
+            .field("handle", &self.handle.is_some())
+            .finish()
     }
 }
 
@@ -409,20 +648,16 @@ impl Ord for ScanKey {
 impl ScanKey {
     fn new(
         phas: i16,
-        record_type: &str,
+        record_type: &'static str,
         load_order: u64,
-        name: &str,
-        handle: std::sync::Weak<RecordCell>,
+        name: impl Into<RecordName>,
+        handle: Option<Arc<RecordCell>>,
     ) -> Self {
-        use crate::server::record::dbd_generated::RECORD_TYPE_ORDER;
         Self {
             phas,
-            record_type: RECORD_TYPE_ORDER
-                .iter()
-                .position(|t| *t == record_type)
-                .unwrap_or(RECORD_TYPE_ORDER.len()) as u32,
+            record_type,
             load_order,
-            name: Arc::from(name),
+            name: name.into(),
             handle,
         }
     }
@@ -453,7 +688,7 @@ impl ScanKey {
 /// two facts — what it points at, where it was declared — are this struct.
 struct AliasNode {
     /// The canonical record name the alias resolves to.
-    target: String,
+    target: RecordName,
     /// Load sequence, from the same counter as [`RecordCell::load_order`].
     order: u64,
 }
@@ -462,9 +697,27 @@ struct AliasNode {
 pub struct DbNode {
     /// The name this node is reached by — an alias node carries the ALIAS
     /// name, which is what C prints from `dbGetRecordName`.
-    pub name: String,
+    pub name: RecordName,
     /// The record an alias node stands for, or `None` for a record node.
-    pub alias_of: Option<String>,
+    pub alias_of: Option<RecordName>,
+}
+
+/// C `afterIocRunning.c`'s `cmdList` and `initEndFlag` (`:36-37`) as one
+/// value: lines queue until the first `initHookAfterIocRunning` has run them,
+/// and never after.
+enum AfterIocRunning {
+    Queuing(std::collections::VecDeque<Vec<u8>>),
+    Ran,
+}
+
+/// Why [`PvDatabase::queue_after_ioc_running`] did not queue a line, in C
+/// `afterIocRunningFunc`'s order of asking (`afterIocRunning.c:75-86`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AfterIocRunningRefusal {
+    /// The queue has already run (`initEndFlag`).
+    AfterIocInit,
+    /// No command, or an empty one.
+    Empty,
 }
 
 struct PvDatabaseInner {
@@ -485,7 +738,15 @@ struct PvDatabaseInner {
     /// the ones that await today, so a new `.await` in an existing body cannot
     /// re-open it.
     simple_pvs:
-        crate::runtime::sync::PriorityInheritanceMutex<HashMap<String, Arc<ProcessVariable>>>,
+        crate::runtime::sync::PriorityInheritanceMutex<HashMap<RecordName, Arc<ProcessVariable>>>,
+    /// Moved by every `simple_pvs` insert and remove, after it, through
+    /// [`PvDatabase::insert_simple_pv`] / [`PvDatabase::take_simple_pv`]: a
+    /// simple PV spelled `REC.FLD` shadows that field, so a cached link
+    /// address must not outlive one appearing.
+    simple_pvs_revision: std::sync::atomic::AtomicU64,
+    /// [`AsyncDbHandle::db_get`]'s last fresh read of each name it was asked
+    /// for: what it serves while that record's lock set is held elsewhere.
+    db_get_last: parking_lot::Mutex<HashMap<Box<[u8]>, crate::server::snapshot::Snapshot>>,
     /// Wake-up for servers holding channels on this database: something was
     /// removed, re-check what you serve. Carries no name — the receiver
     /// tests the target it already holds
@@ -501,7 +762,10 @@ struct PvDatabaseInner {
     /// chain — the cycle guard, the scan key, the lock-set lookup — carries a
     /// share of it rather than a copy. A name-keyed map that owned `String`s
     /// made a scan step allocate the name of every record it touched.
-    records: RecursiveReadLock<HashMap<Arc<str>, Arc<RecordCell>>>,
+    records: RecursiveReadLock<HashMap<RecordName, Arc<RecordCell>>>,
+    /// Every record registered, by [`RecordIdx`]: where a resolved forward
+    /// link finds its target without the name map or a count.
+    record_table: record_table::RecordTable,
     /// Scan index: maps scan list → sorted set of [`ScanKey`].
     ///
     /// C parity (`dbScan.c:1052-1095`): `buildScanLists` walks record types in
@@ -536,34 +800,26 @@ struct PvDatabaseInner {
     /// A sequence is now a field of the node it belongs to, so neither is
     /// representable.
     load_order_counter: std::sync::atomic::AtomicU64,
-    /// CP/CPP link index: maps source_record → target edges to process when
-    /// the source changes. Each edge carries the CP-vs-CPP distinction (see
-    /// [`CpTarget`]).
-    ///
-    /// Read-modify-write cell with **two writers that share no other gate**:
-    /// `register_cp_link` (`links.rs:2918`) takes no
-    /// [`Self::registration_mutex`], `remove_record` (`mod.rs:2056`) does. The
-    /// `RwLock`'s write exclusion was the only thing serialising them, so the
-    /// [`SnapshotCell`] writer gate here is required, not defensive.
-    cp_links: SnapshotCell<HashMap<String, Vec<CpTarget>>>,
-    /// External (CA/PVA) CP/CPP link index: maps the *external PV name*
-    /// (the cross-IOC source, e.g. `OTHER:PV` from `INP="OTHER:PV CP"`)
-    /// → holder edges to process when that remote PV changes. The local
-    /// [`Self::cp_links`] index is keyed by a local source RECORD that
-    /// processes here; a cross-IOC source never processes locally, so its
-    /// only trigger is the calink/pvalink CA monitor callback, which calls
-    /// [`PvDatabase::dispatch_external_cp_targets`]. Parity with C
+    /// CP/CPP link index: maps the PV a link set serves (`OTHER:PV` from
+    /// `INP="OTHER:PV CP"`, a local record's name included, since C makes
+    /// every CP/CPP link a CA link) → holder edges to process when that
+    /// channel posts. The only trigger is the calink/pvalink monitor
+    /// callback, which requests it through an [`ExternalCpProcess`] — C
     /// `dbCa.c:958-962` `eventCallback` adding `CA_DBPROCESS`.
     ///
-    /// Read-modify-write cell; sole writer `register_external_cp_link`
-    /// (`links.rs:2968`) merges into an existing edge list, so concurrent
-    /// registrations need the [`SnapshotCell`] writer gate.
-    external_cp_links: SnapshotCell<HashMap<String, Vec<CpTarget>>>,
+    /// Read-modify-write cell with **two writers that share no other gate**:
+    /// `CpRegistry::set_link` takes no [`Self::registration_mutex`],
+    /// `remove_record` does, so the [`SnapshotCell`] writer gate is required.
+    external_cp_links: SnapshotCell<CpRegistry>,
+    /// C `dbCaRun`'s gate over the CP/CPP workers.
+    ca_run: std::sync::Arc<processing::CaRunGate>,
+    /// The I/O Intr pumps' turns a local CA link's first event waits for.
+    io_intr_turns: io_intr_turn::IoIntrTurns,
     /// Alias map: alternate-name → the [`AliasNode`] it names. Mirrors
     /// epics-base PR #336 (alias name validation + parsing). `find_entry` and
     /// related lookups consult this map after the canonical record
     /// table so an alias resolves transparently to its target.
-    aliases: RecursiveReadLock<HashMap<String, AliasNode>>,
+    aliases: RecursiveReadLock<HashMap<RecordName, AliasNode>>,
     /// Single gate that serializes
     /// every `add_pv` / `add_pv_with_hook` / `add_record` /
     /// `add_alias` / `remove_record` / `remove_simple_pv` /
@@ -597,7 +853,10 @@ struct PvDatabaseInner {
     /// Acquired ONLY through [`PvDatabase::lock_registration`], never
     /// directly — that funnel is what turns a re-entrant take into a named
     /// panic instead of a parked thread. See [`RegistrationGate`].
-    registration_mutex: crate::runtime::sync::PriorityInheritanceMutex<()>,
+    ///
+    /// Unlisted: C has no such gate (its record load is single-threaded), so
+    /// `epicsMutexShowAll` has no entry for it.
+    registration_mutex: crate::runtime::sync::UnlistedPriorityInheritanceMutex<()>,
     /// The IOC lifecycle phase — the port's `iocInit` boundary. See
     /// [`DbInitPhase`], [`PvDatabase::begin_load`],
     /// [`PvDatabase::schedule_record_init`] and [`PvDatabase::ioc_init`].
@@ -607,7 +866,7 @@ struct PvDatabaseInner {
     /// released by [`PvDatabase::add_loaded_record`] the moment that name lands
     /// in `records`, which is what makes "the init observes a registered
     /// record" hold by construction rather than by scheduler timing.
-    record_init_waiting: std::sync::Mutex<HashMap<String, Vec<RecordInit>>>,
+    record_init_waiting: std::sync::Mutex<HashMap<RecordName, Vec<RecordInit>>>,
     /// Records whose device-support binding and `init_record` passes are OWED
     /// to [`PvDatabase::ioc_init`] because they were created during the LOAD
     /// phase — C's `dbLoadRecords` links a record into `pdbbase` at once but
@@ -627,35 +886,29 @@ struct PvDatabaseInner {
     /// empty assignments here makes the distinction exact rather than
     /// approximate. Consumed and cleared by
     /// [`PvDatabase::db_init_record_links`], the way C frees the text.
-    empty_link_assignments: std::sync::Mutex<HashMap<String, Vec<String>>>,
-    /// Lines queued by the iocsh `afterIocRunning <command>` directive
-    /// (epics-base PR #558). Drained by the IOC application after PINI
-    /// completes, then re-executed through a fresh IocShell so the
-    /// commands run with the database in its post-init state.
-    after_ioc_running: std::sync::Mutex<Vec<String>>,
-    /// Optional resolver for external PVs (ca://, pva:// links).
-    ///
-    /// Whole-value replace: the only writer stores a complete new value
-    /// ([`PvDatabase::set_external_resolver`]), so an
-    /// [`ArcSwapOption`] store IS the mutation and no writer gate is
-    /// needed. Readers take the `Arc` with no lock at all.
-    external_resolver: ArcSwapOption<ExternalPvResolver>,
+    empty_link_assignments: std::sync::Mutex<HashMap<RecordName, Vec<String>>>,
+    /// Claimed by the one [`PvDatabase::db_init_record_links`] pass.
+    links_prepared: std::sync::atomic::AtomicBool,
+    /// The iocsh `afterIocRunning` queue; see [`AfterIocRunning`].
+    after_ioc_running: std::sync::Mutex<AfterIocRunning>,
     /// Optional async resolver invoked on `has_name` misses (e.g. CA gateway).
     ///
-    /// Whole-value replace, as [`Self::external_resolver`] (§3 row L8g).
+    /// Whole-value replace: the only writer stores a complete new value, so
+    /// an [`ArcSwapOption`] store IS the mutation and no writer gate is
+    /// needed. Readers take the `Arc` with no lock at all (§3 row L8g).
     search_resolver: ArcSwapOption<SearchResolver>,
     /// Optional per-request gate consulted before a *cached* simple PV is
     /// advertised as existing (e.g. CA gateway host/state admission). See
     /// [`ExistenceGate`]. `None` for a plain IOC (short-circuit unchanged).
     ///
-    /// Whole-value replace, as [`Self::external_resolver`] (§3 row L8h).
+    /// Whole-value replace, as [`Self::search_resolver`] (§3 row L8h).
     existence_gate: ArcSwapOption<ExistenceGate>,
     /// The database debugger, installed by the first `dbb` and removed when
     /// its last breakpoint goes — C's `lset_stack_count`, which `dbProcess`
     /// tests before it calls either breakpoint hook (`dbAccess.c:504`,
     /// `:614`).
     ///
-    /// Whole-value replace, as [`Self::external_resolver`]: a database nobody
+    /// Whole-value replace, as [`Self::search_resolver`]: a database nobody
     /// is debugging pays one relaxed atomic load per processed record where C
     /// pays one comparison, and the mechanism stays testable and removable
     /// instead of welded into `process_record_with_links_body` as a pair of
@@ -678,8 +931,7 @@ struct PvDatabaseInner {
     /// `false` with a live table.
     debugging: std::sync::atomic::AtomicBool,
     /// Per-scheme link sets — pluggable backends for `pva://` /
-    /// `ca://` link resolution. Consulted before the legacy
-    /// [`ExternalPvResolver`] in `resolve_external_pv`.
+    /// `ca://` link resolution, the only route `resolve_external_pv` takes.
     /// Mirrors the C-EPICS lset abstraction.
     ///
     /// Read-modify-write cell (`register_link_set` inserts one scheme into
@@ -689,6 +941,9 @@ struct PvDatabaseInner {
     /// deliberate discipline documented at `links.rs:951-952` — so a coherent
     /// snapshot is what the read paths already assumed.
     link_sets: SnapshotCell<link_set::LinkSetRegistry>,
+    /// The `ca` scheme's entry in `link_sets`, which the network lset
+    /// registered under `ca` sits behind.
+    ca_links: Arc<ca_link::CaLinks>,
     /// Pending external OUT-link writes — the `dbCa` `workList` analogue.
     /// Record processing stages a write here and returns; the queue's single
     /// owner task performs the `ca://`/`pva://` network write off the
@@ -698,7 +953,9 @@ struct PvDatabaseInner {
     /// True once the ScanScheduler has been started for this DB.
     /// Prevents duplicate scan tasks when multiple protocol servers (CA + PVA)
     /// both try to start scanning on the same DB.
-    scan_started: std::sync::atomic::AtomicBool,
+    /// This database's `scanCtl` and the scan-start claim; see
+    /// [`ScanControl`](crate::server::scan::ScanControl).
+    scan_ctl: Arc<crate::server::scan::ScanControl>,
     /// True once PINI processing has completed. Non-owner schedulers await
     /// this before running their hooks, preserving the "PINI before hooks"
     /// ordering contract.
@@ -719,18 +976,21 @@ struct PvDatabaseInner {
     /// C materialises the list once the `.dbd` is read: `dbReadCOM`'s tail
     /// (`dbLexRoutines.c:311-331`) gives every record type `RTYP` = its own
     /// name and `VERS` = `"none specified"`, and `dbPutRecordAttribute`
-    /// (`dbStaticLib.c:1232-1277`) adds or overwrites from there. Both maps
+    /// (`dbStaticLib.c:1232-1277`) adds or overwrites from there. A type
+    /// holds an entry here once `dbPutAttribute` first touched it, starting
+    /// from that seed; a type without one answers [`seeded_record_attribute`].
+    /// Both maps
     /// are `BTreeMap`s because C keeps the inner list in `strcmp` order and
     /// walks it in that order in `dbGetAttributePart` and
     /// `dbDumpRecordType`; sorting is the container's job here rather than an
     /// insertion dance.
     ///
-    /// A leaf lock: no other lock is taken while it is held, and it is taken
-    /// while a record read guard is live (`PvDatabase::get_pv`), never the
-    /// reverse.
-    record_attributes: crate::runtime::sync::PriorityInheritanceMutex<
-        std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
-    >,
+    /// A published snapshot: a name lookup reads it under a record's hold and
+    /// on the search side, so a reader takes no lock. Writers serialise on
+    /// [`Self::record_attributes_write`].
+    record_attributes: ArcSwap<RecordAttributes>,
+    /// Unlisted: C's `attributeList` is written without a lock.
+    record_attributes_write: crate::runtime::sync::UnlistedPriorityInheritanceMutex<()>,
     /// Subroutine functions by name, retained at runtime so the processing
     /// path can re-resolve an aSub's subroutine when its name changes
     /// (C `aSubRecord.c::fetch_values` `registryFunctionFind`, LFLG=READ /
@@ -742,7 +1002,7 @@ struct PvDatabaseInner {
     /// (§3 row L8j). `OnceLock` was rejected: install is a `pub async fn` that
     /// tests and a second `iocInit` may call again, and `OnceLock` would
     /// silently drop the second registry instead of replacing it.
-    subroutine_registry: ArcSwap<HashMap<String, Arc<crate::server::record::SubroutineFn>>>,
+    subroutine_registry: ArcSwap<HashMap<String, Arc<crate::server::record::Subroutine>>>,
     /// C's process-global device support table, seen through
     /// `dbDTYPtoDevSup`: the lookup `doInitRecord0` makes to fill
     /// `precord->dset` BEFORE it calls `prset->init_record(precord, 0)`
@@ -772,6 +1032,10 @@ struct PvDatabaseInner {
     /// value was already `Arc`-shared, so the cell replaces the outer lock
     /// with nothing at all on the read side.
     breaktable_registry: SnapshotCell<crate::server::cvt_bpt::BreakTableRegistry>,
+    /// `pdbbase->linkList`. Read with no lock because a link put asks it with
+    /// the record held; written only by a `.dbd` load or a binary's
+    /// declaration.
+    link_list: SnapshotCell<crate::server::record::LinkList>,
 }
 
 thread_local! {
@@ -1019,70 +1283,61 @@ pub(crate) enum SelmKind {
     Dfanout,
 }
 
+/// The link slots a fanout, dfanout or seq has: `LNK0..LNKF`, `OUTA..OUTP`.
+pub(crate) const SELM_SLOTS: usize = 16;
+
 /// Result of resolving a SELM/SELN selection.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct SelmResult {
-    /// 0-based link indices to drive (into the LNK0../OUTA.. array).
-    pub indices: Vec<usize>,
+    /// Bit `i` drives link slot `i`: a selection is resolved every cycle, so
+    /// it is held in place rather than in a list.
+    pub selected: u16,
     /// `Some` when C would raise an alarm for an out-of-range
     /// `SELN`/`OFFS`/`SHFT`. C uses `recGblSetSevr(prec, SOFT_ALARM,
     /// INVALID_ALARM)` in every such path.
     pub alarm: Option<(u16, crate::server::record::AlarmSeverity)>,
 }
 
-/// Convert a link value to `epicsUInt16` with C `dbGetLink(.., DBR_USHORT,
-/// ..)` semantics, for the fanout/dfanout/seq `SELL`→`SELN` read — so a
-/// constant, DB, CA, or PVA link source all convert by the one rule C applies
-/// through `dbFastGetConvertRoutine`.
-///
-/// # The source type decides the rule, because in C it decides the routine
-///
-/// `dbFastGetConvertRoutine` is a 2-D table indexed by *both* the source DBF
-/// and the destination DBR (`dbConvert.c:1571-1638`): a `DBF_LONG` source
-/// reaches `getLongUshort`, a `DBF_DOUBLE` source reaches `getDoubleUshort`.
-/// They are different functions, and C gives them different semantics:
-///
-/// * **Integer source** — `(epicsUInt16)(epicsInt32)v`. Conversion of an
-///   out-of-range *integer* to an unsigned type is **defined** in C
-///   (C17 6.3.1.3p2: reduce modulo `USHRT_MAX + 1`). Every compiler and
-///   every target agrees, so this is a real contract and the port keeps it:
-///   `SELL` pointing at a `DBF_LONG` field holding `-1` gives `SELN = 65535`.
-/// * **Float source** — `(epicsUInt16)d`. Conversion of an out-of-range
-///   *float* is **undefined** (C17 6.3.1.4p1), so compiled C is not
-///   single-valued: x86-64 wraps, aarch64 saturates. What the port does about
-///   that is [`crate::types::c_cast`]'s call — the single owner of the policy —
-///   and deliberately not restated here.
-///
-/// Both rules already live in [`EpicsValue::convert_to`], the single
-/// value-coercion owner: it takes the integer view (`as_int_i64`) when the
-/// source has one and falls back to `c_cast` only for a genuine float. So this
-/// is a thin projection onto that owner, NOT a second conversion table.
-///
-/// The previous revision called `c_cast::f64_to_u16(value.to_f64())` directly,
-/// bypassing the owner — which silently applied the float rule to integer
-/// sources too, losing the one wrap C actually defines.
-pub(crate) fn dbr_ushort_cast(value: &EpicsValue) -> u16 {
-    match value.convert_to(crate::types::DbFieldType::UShort) {
-        EpicsValue::UShort(v) => v,
-        // A link that delivers an array converts element-wise; C's
-        // `dbGetLink(.., &prec->seln, 0, 0)` requests ONE element, so SELN
-        // takes the first (an empty array leaves it 0).
-        EpicsValue::UShortArray(v) => v.first().copied().unwrap_or(0),
-        // `convert_to(UShort)` returns no other variant.
-        _ => 0,
+impl SelmResult {
+    /// The selected slots, ascending, as C's loops drive them.
+    pub(crate) fn indices(self) -> SelectedSlots {
+        SelectedSlots(self.selected)
     }
 }
+
+/// The set bits of a selection, lowest first. Exact-size, so seq's group
+/// list is sized once rather than grown slot by slot.
+pub(crate) struct SelectedSlots(u16);
+
+impl Iterator for SelectedSlots {
+    type Item = usize;
+
+    fn next(&mut self) -> Option<usize> {
+        if self.0 == 0 {
+            return None;
+        }
+        let i = self.0.trailing_zeros() as usize;
+        self.0 &= self.0 - 1;
+        Some(i)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let n = self.0.count_ones() as usize;
+        (n, Some(n))
+    }
+}
+
+impl ExactSizeIterator for SelectedSlots {}
 
 /// Select which link indices are active based on SELM/SELN, applying
 /// the record-type-specific `OFFS`/`SHFT` bias.
 ///
-/// SELM: 0 = All, 1 = Specified, 2 = Mask. `count` is the number of
-/// link slots (16 for fanout/dfanout/seq).
+/// SELM: 0 = All, 1 = Specified, 2 = Mask, over [`SELM_SLOTS`] link slots.
 ///
 /// `seln` is the native `DBF_USHORT` value: C declares `SELN` as
 /// `epicsUInt16`, so every comparison below is unsigned, matching C's
 /// selection arithmetic — never `-1`. What an out-of-range `SELL` converts
-/// *to* is [`dbr_ushort_cast`]'s decision, not this function's.
+/// *to* is the `DBR_USHORT` link read's decision, not this function's.
 ///
 /// C references:
 /// * fanout — `fanoutRecord.c:106-141`
@@ -1094,23 +1349,23 @@ pub(crate) fn select_link_indices_ex(
     seln: u16,
     offs: i16,
     shft: i16,
-    count: usize,
 ) -> SelmResult {
     use crate::server::recgbl::alarm_status::SOFT_ALARM;
     use crate::server::record::AlarmSeverity;
 
+    let count = SELM_SLOTS;
     let invalid = || SelmResult {
-        indices: Vec::new(),
+        selected: 0,
         alarm: Some((SOFT_ALARM, AlarmSeverity::Invalid)),
     };
-    let ok = |indices: Vec<usize>| SelmResult {
-        indices,
+    let ok = |selected: u16| SelmResult {
+        selected,
         alarm: None,
     };
 
     match selm {
         // All — every slot.
-        0 => ok((0..count).collect()),
+        0 => ok(u16::MAX),
         // Specified.
         1 => match kind {
             SelmKind::FanoutSeq => {
@@ -1122,7 +1377,7 @@ pub(crate) fn select_link_indices_ex(
                 if i < 0 || i >= count as i32 {
                     invalid()
                 } else {
-                    ok(vec![i as usize])
+                    ok(1 << i)
                 }
             }
             SelmKind::Dfanout => {
@@ -1136,9 +1391,9 @@ pub(crate) fn select_link_indices_ex(
                 if seln_i > count as i32 {
                     invalid()
                 } else if seln_i == 0 {
-                    ok(Vec::new())
+                    ok(0)
                 } else {
-                    ok(vec![(seln_i - 1) as usize])
+                    ok(1 << (seln_i - 1))
                 }
             }
         },
@@ -1160,7 +1415,8 @@ pub(crate) fn select_link_indices_ex(
                 // dfanout Mask has no SHFT.
                 SelmKind::Dfanout => seln as u32,
             };
-            ok((0..count).filter(|i| mask & (1 << i) != 0).collect())
+            // Bits shifted past the last slot drive nothing.
+            ok(mask as u16)
         }
         // Any other SELM value → C `default:` raises INVALID.
         _ => invalid(),
@@ -1207,22 +1463,48 @@ impl RecordAttributeError {
     }
 }
 
-/// C `dbReadCOM`'s tail (`dbLexRoutines.c:311-331`): once the `.dbd` is read,
-/// every record type it declared carries `RTYP` = its own name and `VERS` =
-/// `"none specified"`. The port's `.dbd` is the generated table, which is
-/// complete before the first `dbLoadRecords`, so the seed happens at
-/// construction instead of after a read.
-fn seeded_record_attributes()
--> std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>> {
-    crate::server::record::dbd_generated::RECORD_TYPES
-        .iter()
-        .map(|t| {
-            let mut attrs = std::collections::BTreeMap::new();
-            attrs.insert("RTYP".to_string(), (*t).to_string());
-            attrs.insert("VERS".to_string(), "none specified".to_string());
-            ((*t).to_string(), attrs)
+type RecordAttributes =
+    std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>;
+
+/// C `dbReadCOM`'s tail (`dbLexRoutines.c:311-331`): every record type a
+/// `.dbd` declared carries `RTYP` = its own name and `VERS` =
+/// `"none specified"`. The port's types come from the generated table and
+/// from other crates' registrations, so the seed is answered for a type with
+/// no table entry rather than written for a list of types up front.
+fn seeded_record_attribute<'a>(record_type: &'a str, name: &str) -> Option<&'a str> {
+    match name {
+        "RTYP" => Some(record_type),
+        "VERS" => Some("none specified"),
+        _ => None,
+    }
+}
+
+/// [`seeded_record_attribute`]'s whole list, for the entry a first
+/// `dbPutAttribute` on `record_type` creates.
+fn seeded_record_attributes(record_type: &str) -> std::collections::BTreeMap<String, String> {
+    ["RTYP", "VERS"]
+        .into_iter()
+        .filter_map(|name| {
+            let value = seeded_record_attribute(record_type, name)?;
+            Some((name.to_string(), value.to_string()))
         })
         .collect()
+}
+
+/// Raised before the first breakpoint table or TPRO lands in any database,
+/// never lowered: the process frame's one test for both debug hooks, so a
+/// process nobody debugs pays a single relaxed load per record.
+static DEBUG_ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// [`DEBUG_ARMED`]'s one writer, called before a breakpoint table or a TPRO
+/// is written.
+pub(crate) fn arm_debugging() {
+    DEBUG_ARMED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline]
+pub(crate) fn debug_armed() -> bool {
+    DEBUG_ARMED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 impl PvDatabase {
@@ -1257,39 +1539,58 @@ impl PvDatabase {
 
     pub fn new() -> Self {
         Self {
-            inner: Arc::new(PvDatabaseInner {
-                simple_pvs: crate::runtime::sync::PriorityInheritanceMutex::new(HashMap::new()),
-                pv_destroyed_tx: tokio::sync::broadcast::channel(16).0,
-                external_resolver: ArcSwapOption::empty(),
-                breakpoints: ArcSwapOption::empty(),
-                debugging: std::sync::atomic::AtomicBool::new(false),
-                search_resolver: ArcSwapOption::empty(),
-                existence_gate: ArcSwapOption::empty(),
-                link_sets: SnapshotCell::new(link_set::LinkSetRegistry::new()),
-                link_puts: Arc::new(link_put_queue::LinkPutQueue::default()),
-                records: RecursiveReadLock::new(HashMap::new()),
-                scan_index: scan_index::ScanIndex::new(),
-                load_order_counter: std::sync::atomic::AtomicU64::new(0),
-                cp_links: SnapshotCell::new(HashMap::new()),
-                external_cp_links: SnapshotCell::new(HashMap::new()),
-                aliases: RecursiveReadLock::new(HashMap::new()),
-                registration_mutex: crate::runtime::sync::PriorityInheritanceMutex::new(()),
-                init_phase: std::sync::Mutex::new(DbInitPhase::Unloaded),
-                record_init_waiting: std::sync::Mutex::new(HashMap::new()),
-                empty_link_assignments: std::sync::Mutex::new(HashMap::new()),
-                after_ioc_running: std::sync::Mutex::new(Vec::new()),
-                scan_started: std::sync::atomic::AtomicBool::new(false),
-                pini_done: std::sync::atomic::AtomicBool::new(false),
-                pini_notify: tokio::sync::Notify::new(),
-                record_locks: record_lock::RecordLockRegistry::default(),
-                record_attributes: crate::runtime::sync::PriorityInheritanceMutex::new(
-                    seeded_record_attributes(),
-                ),
-                subroutine_registry: ArcSwap::from_pointee(HashMap::new()),
-                device_support_resolver: ArcSwapOption::empty(),
-                breaktable_registry: SnapshotCell::new(
-                    crate::server::cvt_bpt::BreakTableRegistry::new(),
-                ),
+            inner: Arc::new_cyclic(|weak| {
+                let ca_run: Arc<processing::CaRunGate> = Default::default();
+                let ca_links = Arc::new(ca_link::CaLinks::new(weak.clone(), ca_run.clone()));
+                let mut link_sets = link_set::LinkSetRegistry::new();
+                link_sets.register("ca", ca_links.clone());
+                PvDatabaseInner {
+                    simple_pvs: crate::runtime::sync::PriorityInheritanceMutex::new(
+                        HashMap::new(),
+                        crate::runtime::sync::CMutex::PvdBucket,
+                    ),
+                    simple_pvs_revision: std::sync::atomic::AtomicU64::new(0),
+                    db_get_last: parking_lot::Mutex::new(HashMap::new()),
+                    pv_destroyed_tx: tokio::sync::broadcast::channel(16).0,
+                    breakpoints: ArcSwapOption::empty(),
+                    debugging: std::sync::atomic::AtomicBool::new(false),
+                    search_resolver: ArcSwapOption::empty(),
+                    existence_gate: ArcSwapOption::empty(),
+                    link_sets: SnapshotCell::new(link_sets),
+                    ca_links,
+                    link_puts: Arc::new(link_put_queue::LinkPutQueue::default()),
+                    records: RecursiveReadLock::new(HashMap::new()),
+                    record_table: record_table::RecordTable::default(),
+                    scan_index: scan_index::ScanIndex::new(),
+                    load_order_counter: std::sync::atomic::AtomicU64::new(0),
+                    external_cp_links: SnapshotCell::new(CpRegistry::default()),
+                    ca_run,
+                    io_intr_turns: Default::default(),
+                    aliases: RecursiveReadLock::new(HashMap::new()),
+                    registration_mutex: crate::runtime::sync::UnlistedPriorityInheritanceMutex::new(
+                        (),
+                    ),
+                    init_phase: std::sync::Mutex::new(DbInitPhase::Unloaded),
+                    record_init_waiting: std::sync::Mutex::new(HashMap::new()),
+                    empty_link_assignments: std::sync::Mutex::new(HashMap::new()),
+                    links_prepared: std::sync::atomic::AtomicBool::new(false),
+                    after_ioc_running: std::sync::Mutex::new(AfterIocRunning::Queuing(
+                        std::collections::VecDeque::new(),
+                    )),
+                    scan_ctl: Arc::new(crate::server::scan::ScanControl::new()),
+                    pini_done: std::sync::atomic::AtomicBool::new(false),
+                    pini_notify: tokio::sync::Notify::new(),
+                    record_locks: record_lock::RecordLockRegistry::default(),
+                    record_attributes: ArcSwap::from_pointee(RecordAttributes::new()),
+                    record_attributes_write:
+                        crate::runtime::sync::UnlistedPriorityInheritanceMutex::new(()),
+                    subroutine_registry: ArcSwap::from_pointee(HashMap::new()),
+                    device_support_resolver: ArcSwapOption::empty(),
+                    breaktable_registry: SnapshotCell::new(
+                        crate::server::cvt_bpt::BreakTableRegistry::new(),
+                    ),
+                    link_list: SnapshotCell::new(crate::server::record::LinkList::base()),
+                }
             }),
         }
     }
@@ -1298,7 +1599,7 @@ impl PvDatabase {
     /// set or create one attribute of one record type.
     ///
     /// C's `!pdbbase` arm is unreachable here — the record-type set is the
-    /// generated `dbd_generated::RECORD_TYPES` table, which exists before any
+    /// generated table plus every registered type, which exist before any
     /// database is loaded — so `S_db_notFound` has no site.
     ///
     /// `name` and `value` are `Option` because C's are `const char *` that
@@ -1321,7 +1622,7 @@ impl PvDatabase {
             return Err(RecordAttributeError::BadField);
         };
         let value = value.unwrap_or("");
-        if !crate::server::record::dbd_generated::RECORD_TYPES.contains(&record_type) {
+        if !crate::server::db_loader::record_type_visible(record_type) {
             return Err(RecordAttributeError::RecordTypeNotFound);
         }
         // C truncates by byte (`strncpy` then `[MAX_STRING_SIZE-1] = 0`),
@@ -1329,12 +1630,12 @@ impl PvDatabase {
         // keeps the same 39 for every name iocsh can pass and never produces
         // a value that is not a string.
         let truncated: String = value.chars().take(MAX_ATTRIBUTE_LEN).collect();
-        self.inner
-            .record_attributes
-            .lock()
-            .entry(record_type.to_string())
-            .or_default()
+        let _write = self.inner.record_attributes_write.lock();
+        let mut next = RecordAttributes::clone(&self.inner.record_attributes.load());
+        next.entry(record_type.to_string())
+            .or_insert_with(|| seeded_record_attributes(record_type))
             .insert(name.to_string(), truncated);
+        self.inner.record_attributes.store(Arc::new(next));
         Ok(())
     }
 
@@ -1345,24 +1646,33 @@ impl PvDatabase {
     /// The caller owes the shadowing test: C reaches this only after the
     /// record type's declared field list has missed, so a type that declares
     /// a field of the same name (`motor.VERS`) hides the attribute.
+    ///
+    /// `record_type` is a record's own type, so it is one the IOC knows.
     pub fn record_type_attribute(&self, record_type: &str, name: &str) -> Option<String> {
-        self.inner
-            .record_attributes
-            .lock()
-            .get(record_type)?
-            .get(name)
-            .cloned()
+        match self.inner.record_attributes.load().get(record_type) {
+            Some(attrs) => attrs.get(name).cloned(),
+            None => seeded_record_attribute(record_type, name).map(str::to_string),
+        }
+    }
+
+    /// [`Self::record_type_attribute`]'s existence half, copying nothing.
+    pub(crate) fn has_record_type_attribute(&self, record_type: &str, name: &str) -> bool {
+        match self.inner.record_attributes.load().get(record_type) {
+            Some(attrs) => attrs.contains_key(name),
+            None => seeded_record_attribute(record_type, name).is_some(),
+        }
     }
 
     /// One record type's whole attribute list in C's `strcmp` order — the
     /// order `dbPutRecordAttribute` inserts in and `dbDumpRecordType` prints.
     pub fn record_type_attributes(&self, record_type: &str) -> Vec<(String, String)> {
-        self.inner
-            .record_attributes
-            .lock()
-            .get(record_type)
-            .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
-            .unwrap_or_default()
+        match self.inner.record_attributes.load().get(record_type) {
+            Some(attrs) => attrs.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            None if crate::server::db_loader::record_type_visible(record_type) => {
+                seeded_record_attributes(record_type).into_iter().collect()
+            }
+            None => Vec::new(),
+        }
     }
 
     /// Merge `tables` into the shared breakpoint-table registry (C `bptList`
@@ -1430,7 +1740,7 @@ impl PvDatabase {
     /// IocApp/IocBuilder registry. See `Self::find_subroutine_named`.
     pub async fn install_subroutine_registry(
         &self,
-        registry: HashMap<String, Arc<crate::server::record::SubroutineFn>>,
+        registry: HashMap<String, Arc<crate::server::record::Subroutine>>,
     ) {
         self.inner.subroutine_registry.store(Arc::new(registry));
     }
@@ -1449,12 +1759,26 @@ impl PvDatabase {
             .store(Some(Arc::new(resolver)));
     }
 
-    /// How many records hold device support — the `iocInit: N records, M with
-    /// device support` count. Derived from the records themselves rather than
-    /// tallied by a wiring pass, because there is no longer a wiring pass:
-    /// the bind happens at each record's creation.
+    /// C `dbDTYPtoDevSup` for a device-link put: a fresh device object for
+    /// `ctx`, built from the table [`Self::install_device_support_resolver`]
+    /// installed, or `None` when none serves it.
+    pub(crate) fn resolve_device_support(
+        &self,
+        ctx: &crate::server::ioc_app::DeviceSupportContext,
+    ) -> Option<Box<dyn crate::server::device_support::DeviceSupport>> {
+        self.inner
+            .device_support_resolver
+            .load()
+            .as_deref()
+            .and_then(|resolve| resolve(ctx))
+    }
+
+    /// How many records hold device support. Derived from the records
+    /// themselves rather than tallied by a wiring pass, because there is no
+    /// longer a wiring pass: the bind happens at each record's creation.
+    #[cfg(test)]
     pub(crate) async fn records_with_device_support(&self) -> usize {
-        let names = self.all_record_names().await;
+        let names = self.all_record_names();
         names
             .iter()
             .filter_map(|name| self.get_record(name))
@@ -1469,7 +1793,7 @@ impl PvDatabase {
     pub(crate) fn find_subroutine_named(
         &self,
         name: &str,
-    ) -> Option<Arc<crate::server::record::SubroutineFn>> {
+    ) -> Option<Arc<crate::server::record::Subroutine>> {
         self.inner.subroutine_registry.load().get(name).cloned()
     }
 
@@ -1500,20 +1824,11 @@ impl PvDatabase {
             .collect()
     }
 
-    /// Atomically claim the right to start the scan scheduler for this DB.
-    /// Returns `true` on the first call, `false` on subsequent calls.
-    /// Used by `ScanScheduler::run` to prevent duplicate scan tasks
-    /// when multiple protocol servers (CA + PVA) both try to start scanning.
-    pub fn try_claim_scan_start(&self) -> bool {
-        self.inner
-            .scan_started
-            .compare_exchange(
-                false,
-                true,
-                std::sync::atomic::Ordering::AcqRel,
-                std::sync::atomic::Ordering::Acquire,
-            )
-            .is_ok()
+    /// This database's scan control cell: C's one `scanCtl`, scoped to the
+    /// database so one process can run several without any of them
+    /// reaching another's facility.
+    pub fn scan_control(&self) -> &Arc<crate::server::scan::ScanControl> {
+        &self.inner.scan_ctl
     }
 
     /// Mark PINI processing complete. Wakes any non-owner scan schedulers
@@ -1595,7 +1910,7 @@ impl PvDatabase {
     /// [`Self::find_entry_from`] and [`Self::has_name_from`] so the
     /// "cached simple PV ⇒ exists" short-circuit is closed uniformly on
     /// both the create and search paths.
-    async fn simple_pv_gate_denies(&self, name: &str, peer: Option<std::net::SocketAddr>) -> bool {
+    async fn simple_pv_gate_denies(&self, name: &[u8], peer: Option<std::net::SocketAddr>) -> bool {
         let Some(gate) = self.inner.existence_gate.load_full() else {
             return false;
         };
@@ -1603,24 +1918,14 @@ impl PvDatabase {
         // Strip the channel-filter suffix exactly as the lookups do
         // (CA-FR-8) so the gate sees the same record-path key the
         // simple-PV map and the gateway cache are keyed on.
-        let record_path = filters::split_channel_name(name).record_path;
+        let record_path = RecordName::from(filters::split_channel_name(name).record_path);
         // Own statement: the `!Send` guard must be down before the gate's
         // `.await` below (see the `simple_pvs` field doc).
-        let known = self
-            .inner
-            .simple_pvs
-            .lock()
-            .contains_key(record_path.as_str());
+        let known = self.inner.simple_pvs.lock().contains_key(&record_path);
         if !known {
             return false;
         }
         !gate(record_path, peer).await
-    }
-
-    /// Set an external PV resolver for CA/PVA link resolution.
-    /// The resolver is called synchronously from link reads.
-    pub async fn set_external_resolver(&self, resolver: ExternalPvResolver) {
-        self.inner.external_resolver.store(Some(Arc::new(resolver)));
     }
 
     /// The database debugger, or `None` when nothing is being debugged.
@@ -1631,7 +1936,8 @@ impl PvDatabase {
         self.inner.breakpoints.load_full()
     }
 
-    /// [`Self::breakpoints`] for the two hooks in the process frame: C's
+    /// [`Self::breakpoints`] for the two hooks in the process frame, behind
+    /// [`debug_armed`]: C's
     /// `if (lset_stack_count)` first, and the table only if it answers yes.
     /// See [`PvDatabaseInner::debugging`].
     pub(crate) fn breakpoints_if_debugging(&self) -> Option<Arc<breakpoint::BreakpointTable>> {
@@ -1657,6 +1963,7 @@ impl PvDatabase {
             return existing;
         }
         // Raised before the table lands — see [`PvDatabaseInner::debugging`].
+        arm_debugging();
         self.inner
             .debugging
             .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1695,11 +2002,22 @@ impl PvDatabase {
 
     /// Register a [`LinkSet`] under `scheme` (e.g. `"pva"` /
     /// `"ca"`). The lset is consulted for `ParsedLink::Pva` /
-    /// `ParsedLink::Ca` link reads/writes before falling back to
-    /// the legacy [`ExternalPvResolver`]. Subsequent calls for the
-    /// same scheme replace the previous binding.
+    /// `ParsedLink::Ca` link reads/writes. A later call for the same
+    /// scheme replaces it for reads and writes, but a forward link already
+    /// opened keeps the first lset's handle: its slot is set once.
+    ///
+    /// The `ca` scheme is this database's own link set, which serves every
+    /// name the database does: an lset registered as `ca` becomes its
+    /// network half, reached only for the names it does not.
     pub async fn register_link_set(&self, scheme: &str, lset: link_set::DynLinkSet) {
-        self.inner.link_sets.update(|r| r.register(scheme, lset));
+        if scheme == "ca" {
+            self.inner.ca_links.set_network(lset);
+        } else {
+            self.inner.link_sets.update(|r| r.register(scheme, lset));
+        }
+        // A forward link loaded after `iocInit` with no lset in place is
+        // opened now.
+        self.open_unopened_forwards();
     }
 
     /// Look up the lset for `scheme`, if any.
@@ -1713,135 +2031,6 @@ impl PvDatabase {
         let mut s = self.inner.link_sets.load().schemes();
         s.sort();
         s
-    }
-
-    /// Wait for the CA links to local records to report
-    /// `init_ready() == true` — connected, first monitor event cached,
-    /// attribute fetch complete. Mirrors `dbCa: iocInit wait for local CA
-    /// links to connect` (epics-base PR #768) as extended by #856's
-    /// `testInitReady` all-conditions gate. The working set is
-    /// exactly `Self::external_link_targets`: only the CA facility's
-    /// local-target links — `pva://` links and non-local CA links connect
-    /// in the background and are never waited on (pvxs parity).
-    ///
-    /// Polls every 100 ms. Returns:
-    /// * `Ok(connected_count)` — the number of links that ended up
-    ///   connected. May be smaller than the total when the timeout
-    ///   expired before everyone was ready.
-    /// * The total link count — i.e. the size of the working set
-    ///   that was checked. `(connected, total)` lets the caller log
-    ///   "M/N CA links connected".
-    ///
-    /// Pure no-op when no CA link set is registered, or when its
-    /// `link_names()` has no local-target link yet (e.g. lazy-open lsets
-    /// that haven't observed any record link — record processing creates
-    /// the entries on first read, after iocInit returns).
-    pub async fn wait_for_external_links(&self, timeout: std::time::Duration) -> (usize, usize) {
-        // Collect (lset, name) pairs once. `link_names()` may grow
-        // as record processing opens new links, but iocInit's wait
-        // is bounded by the records loaded *before* Phase 3 — every
-        // such link is already opened by the time wire_device_support
-        // and setup_cp_links return.
-        let targets = self.external_link_targets().await;
-        let total = targets.len();
-        if total == 0 {
-            return (0, 0);
-        }
-        // `std::time::Instant`, not `crate::runtime::task::Instant`: the sleep
-        // below is the background timer, which measures on std's clock on both
-        // backends. Reading the deadline off tokio's clock made the two
-        // disagree — under `start_paused` tokio's clock advances only when the
-        // runtime decides to, while the timer thread follows the real one, so
-        // the loop could sleep against one clock and expire against another.
-        let deadline = std::time::Instant::now() + timeout;
-        loop {
-            let mut connected = 0usize;
-            for (lset, name) in &targets {
-                // `init_ready`, not `is_connected`: C `testInitReady`
-                // (`dbCa.c:835` at `ef4829829`, epics-base #856 — post-
-                // `R7.0.10` and in no tag) releases iocInit only when the
-                // link's monitor AND attribute-fetch actions have all
-                // completed, not on the bare connection edge.
-                if lset.init_ready(name) {
-                    connected += 1;
-                }
-            }
-            if connected == total {
-                return (connected, total);
-            }
-            if std::time::Instant::now() >= deadline {
-                return (connected, total);
-            }
-            crate::runtime::task::sleep_background(std::time::Duration::from_millis(100)).await;
-        }
-    }
-
-    /// Snapshot the `(lset, link_name)` pairs the iocInit external-link
-    /// wait reasons over. Shared by [`Self::wait_for_external_links`] and
-    /// [`Self::unconnected_external_links`] so both see the identical
-    /// working set.
-    ///
-    /// C parity: the iocInit connection-wait is a property of the CA link
-    /// facility (dbCa) alone. The whole connection-wait is post-`R7.0.10`
-    /// and in no tag, so these numbers are `717d69e1f`'s, not the pin's —
-    /// at the pin `dbCaRun` is `dbCa.c:357-363` and does not spin at all.
-    /// `dbCaRun` (`dbCa.c:370-380`) spins at `:376-378` on
-    /// `initOutstanding`, which `dbCaAddLinkCallbackOpt` increments
-    /// (`dbCa.c:408-409`) for every link that arrives carrying the
-    /// `DBCA_CALLBACK_INIT_WAITING` bit. `dbInitLink` passes that bit — as
-    /// part of `DBCA_CALLBACK_INIT_START` (0xf, `dbCaPvt.h:118`) — only for
-    /// a CA link whose target is a LOCAL record (dbLink.c:128, :130):
-    ///   int isLocal = dbChannelTest(pvname) == 0;
-    ///   dbCaAddLinkCallbackOpt(..., isLocal ? DBCA_CALLBACK_INIT_START : 0)
-    ///
-    /// **Unreleased upstream.** None of that exists at the reference pin.
-    /// R7.0.10 carries the REVERT of the first attempt (3f382f6b6), so its
-    /// `dbLink.c:128` is a bare `dbCaAddLink(NULL, plink, dbfType);` and its
-    /// `dbCa.c` has no `initOutstanding` at all; the wait re-landed in
-    /// 717d69e1f and ef4829829, which are in no tag. This function
-    /// therefore tracks epics-base HEAD, not the pin — a C IOC built from
-    /// R7.0.10 does not wait for local CA links.
-    ///
-    /// No other external facility waits: pvxs pvalink's `linkGlobal_t::init`
-    /// (ioc/pvalink.cpp) only calls `chan->open()` per channel — it opens
-    /// in the background and never blocks iocInit. So the wait targets
-    /// exactly the CA link set's local-target links; a non-local CA link
-    /// (e.g. areaDetector's `ShutterStatusEPICS_RBV.INP = "test CP MS"`
-    /// placeholder) and every `pva://` link connect asynchronously and are
-    /// never held by iocInit, like C.
-    async fn external_link_targets(&self) -> Vec<(link_set::DynLinkSet, String)> {
-        // Only the CA facility participates — look it up directly rather
-        // than iterating every registered scheme. `has_name_no_resolve`
-        // is the `dbChannelTest` twin (target is a local record).
-        let Some(ca_lset) = self.inner.link_sets.load().get("ca") else {
-            return Vec::new();
-        };
-        let mut targets: Vec<(link_set::DynLinkSet, String)> = Vec::new();
-        for n in ca_lset.link_names() {
-            if self.has_name_no_resolve(&n) {
-                targets.push((ca_lset.clone(), n));
-            }
-        }
-        targets
-    }
-
-    /// Names of the waited-on CA links (local-target, per
-    /// `Self::external_link_targets`) that are opened but not yet
-    /// connected. iocInit calls this after
-    /// [`Self::wait_for_external_links`] times out so the
-    /// "M/N connected" diagnostic can name the `N-M` it proceeded
-    /// without, instead of leaving the operator to run `dbcar`.
-    /// `pva://` links are not in this set — they never block iocInit.
-    pub async fn unconnected_external_links(&self) -> Vec<String> {
-        let mut names = Vec::new();
-        for (lset, name) in self.external_link_targets().await {
-            // Same predicate as the wait loop, so the M/N accounting and
-            // this diagnostic agree on which links held iocInit.
-            if !lset.init_ready(&name) {
-                names.push(name);
-            }
-        }
-        names
     }
 
     /// Every link field the record HAS, with its raw text and the link-field
@@ -1869,11 +2058,11 @@ impl PvDatabase {
     /// `.db` spelled it or not (`dbStaticLib.c:2185-2212`).
     fn link_field_texts(
         inst: &RecordInstance,
-    ) -> Vec<(String, String, crate::server::record::LinkFieldType)> {
+    ) -> Vec<(String, PvString, crate::server::record::LinkFieldType)> {
         use crate::server::record::LinkFieldType;
         use crate::types::DbfLinkClass;
         let record_type = inst.record.record_type();
-        let mut out: Vec<(String, String, LinkFieldType)> = Vec::new();
+        let mut out: Vec<(String, PvString, LinkFieldType)> = Vec::new();
         // `dbCommon` first, then the record's own, which is C's `papFldDes`
         // order; a record type that redeclares a `dbCommon` field keeps the
         // first entry, since that is the one `declared_field` resolves.
@@ -1890,21 +2079,39 @@ impl PvDatabase {
             // `INP`/`OUT`/`TSEL`/`SDIS`/`FLNK` live on `CommonFields` as raw
             // String and are absent from `field_list()`, so the declaration
             // says they exist and only the instance can say what they hold.
+            // A link the type leaves to the framework (mca's SIML/SIOL) keeps
+            // its text on the instance, not the rset: `link_text` reads both.
             let raw = match inst.common_link_text(desc.name) {
-                Some(raw) => raw.to_string(),
-                None => match inst.record.get_field(desc.name) {
-                    Some(EpicsValue::String(s)) => s.as_str_lossy().into_owned(),
-                    // Declared but not served by this instance's rset — a
-                    // downstream type whose generated table outruns its
-                    // `get_field`. C would have the `dbFldDes` and an empty
-                    // link; the port has no text to offer, so the field is
-                    // simply absent rather than reported as an empty link.
-                    _ => continue,
+                Some(raw) => raw.into(),
+                None => match inst.link_text(desc.name) {
+                    Some(text) => text,
+                    None if inst.record.get_field(desc.name).is_some() => PvString::new(),
+                    // Declared but held by no owner — a downstream type whose
+                    // generated table outruns its `get_field`. C would have
+                    // the `dbFldDes` and an empty link; the port has no text
+                    // to offer, so the field is simply absent rather than
+                    // reported as an empty link.
+                    None => continue,
                 },
             };
             out.push((desc.name.to_string(), raw, ftype));
         }
         out
+    }
+
+    /// The parse each link field of `inst` holds, for a field with text: the
+    /// one an lset is addressed through ([`LinkRef`]).
+    pub(crate) fn installed_links(
+        inst: &RecordInstance,
+    ) -> Vec<(String, Arc<crate::server::record::ParsedLink>)> {
+        Self::link_field_texts(inst)
+            .into_iter()
+            .filter(|(_, raw, _)| !raw.is_empty())
+            .filter_map(|(field, _, _)| {
+                let link = inst.stored_link_shared(&field)?.clone();
+                Some((field, link))
+            })
+            .collect()
     }
 
     /// Enumerate every link-shaped field on `record_name`. Returns
@@ -1923,7 +2130,11 @@ impl PvDatabase {
     /// setup, the init open pass, `dbcaxr`, the pvalink install scan — then
     /// sees one consistent answer to "is this link local or external"
     /// instead of each re-deriving it. `link_string` is still the verbatim
-    /// field text.
+    /// field text. An external link the record holds with no lset — removed,
+    /// or left so by its `openLink` — is the [`ParsedLink::Removed`] the
+    /// record holds, which no consumer opens, scans or counts.
+    ///
+    /// [`ParsedLink::Removed`]: crate::server::record::ParsedLink::Removed
     ///
     /// Each field is parsed for ITS OWN link-field type: C `dbPutFieldLink`
     /// passes `pfldDes->field_type` to `dbParseLink` (`dbAccess.c:1094`), which
@@ -1934,42 +2145,74 @@ impl PvDatabase {
     /// Returns an empty Vec when the record doesn't exist.
     pub fn record_link_fields(
         &self,
-        record_name: &str,
-    ) -> Vec<(String, String, crate::server::record::ParsedLink)> {
+        record_name: impl AsRef<[u8]>,
+    ) -> Vec<(String, PvString, crate::server::record::ParsedLink)> {
+        let record_name = record_name.as_ref();
         let rec = match self.get_record(record_name) {
             Some(r) => r,
             None => return Vec::new(),
         };
-        let mut out: Vec<(String, String, crate::server::record::ParsedLink)> =
-            Self::link_field_texts(&rec.read())
-                .into_iter()
-                .filter(|(_, raw, _)| !raw.is_empty())
-                .map(|(field, raw, ftype)| {
-                    let parsed = crate::server::record::parse_link_field(&raw, ftype);
-                    (field, raw, parsed)
+        // The texts leave the hold before any is parsed. An external link
+        // the record holds is reported as held: the parse is the `caLink`,
+        // and a copy of the text would be another link to its lset.
+        let (texts, held) = {
+            let inst = rec.read();
+            let texts = Self::link_field_texts(&inst);
+            let held: Vec<_> = texts
+                .iter()
+                .map(|(field, _, _)| {
+                    inst.stored_link(field)
+                        .filter(|l| {
+                            l.external().is_some()
+                                || matches!(l, crate::server::record::ParsedLink::Removed(_))
+                        })
+                        .cloned()
                 })
-                .filter(|(_, _, parsed)| !matches!(parsed, crate::server::record::ParsedLink::None))
                 .collect();
+            (texts, held)
+        };
+        let (mut out, ftypes): (
+            Vec<(String, PvString, crate::server::record::ParsedLink)>,
+            Vec<_>,
+        ) = texts
+            .into_iter()
+            .zip(held)
+            .filter(|((_, raw, _), _)| !raw.is_empty())
+            .map(|((field, raw, ftype), held)| {
+                let parsed = crate::server::record::parse_link_field(&raw, ftype);
+                ((field, raw, parsed), (ftype, held))
+            })
+            .filter(|((_, _, parsed), _)| {
+                !matches!(parsed, crate::server::record::ParsedLink::None)
+            })
+            .unzip();
         // Apply C `dbInitLink`'s locality fallthrough once, here, so no
         // consumer re-derives it. Done after dropping the record-instance
         // guard: the locality query reads the database's record map, and
         // this is the only place that would otherwise hold an instance lock
         // across it.
-        for entry in &mut out {
-            entry.2 = self.db_init_link_locality(std::mem::replace(
-                &mut entry.2,
-                crate::server::record::ParsedLink::None,
-            ));
+        for (entry, (ftype, held)) in out.iter_mut().zip(ftypes) {
+            entry.2 = self.db_init_link_locality(
+                std::mem::replace(&mut entry.2, crate::server::record::ParsedLink::None),
+                ftype,
+            );
+            // A held external link stays external, as C decides locality
+            // once (`dbLink.c:96-100`); a removed one replaces only an
+            // external view, since a removed local link keeps its parse here
+            // for the lock-set walk.
+            if let Some(held) = held
+                && (held.external().is_some() || entry.2.external().is_some())
+            {
+                entry.2 = held;
+            }
         }
         out
     }
 
-    /// Resolve an external PV name. Dispatches through the
-    /// `(scheme, name)` lset if one is registered; otherwise falls
-    /// back to the legacy [`ExternalPvResolver`] closure. `name`
-    /// may be the bare PV name (in which case `pva://` is assumed
-    /// when an lset is registered for that scheme) or a fully
-    /// scheme-prefixed string.
+    /// Resolve an external PV name through the one lset its scheme names:
+    /// `pva` for `pva://`, `ca` for `ca://` and a bare name. No other lset
+    /// is asked — C picks one lset per link and never searches across them
+    /// (`dbLink.c:107-130`).
     ///
     /// # Cached read, then a staged open — C `dbCaGetLink`
     ///
@@ -1987,110 +2230,126 @@ impl PvDatabase {
     /// C's open happens at record init rather than at
     /// first read, but in both designs the connect runs on the link task and
     /// the reading record takes LINK/INVALID until the cache is warm.
-    pub(crate) fn resolve_external_pv(&self, name: &str) -> Option<EpicsValue> {
-        // Try lsets first. We accept both "scheme://body" and the
-        // bare body (stored in ParsedLink::Pva/Ca after the
-        // dispatch in record/link.rs). `Any` tries every registered
-        // lset in turn; the first one with a cached value wins.
-        let (target, body) = Self::split_external_link_name(name);
-        for lset in link_put_queue::resolve_lsets(&self.inner, &target) {
-            if let Some(v) = lset.get_cached_value(body) {
-                return Some(v);
-            }
+    pub(crate) fn resolve_external_pv(
+        &self,
+        link: crate::server::record::ExternalRef<'_>,
+    ) -> Option<EpicsValue> {
+        // Try lsets first: the scheme's one lset, `ca` for a bare name.
+        let (scheme, lref) = Self::external_link_ref(link);
+        if let Some(v) =
+            link_put_queue::find_lset(&self.inner, scheme, |lset| lset.get_cached_value(lref))
+        {
+            return Some(v);
         }
-        self.stage_external_link_open_by_name(name);
-        // Fall through to legacy resolver, which is addressed with the
-        // caller's string verbatim (scheme prefix and all).
-        let resolver = self
-            .inner
-            .external_resolver
-            .load_full()
-            .map(|r| (*r).clone());
-        match resolver {
-            Some(r) => r(name),
-            None => None,
-        }
+        self.stage_external_link_open(link);
+        None
     }
 
     /// Split an external link's boundary name
     /// ([`crate::server::record::ParsedLink::external_pv_name`]) into the
-    /// work-queue target plus the name the lset is addressed with.
+    /// scheme of its one lset plus the name that lset is addressed with.
     ///
     /// Single owner of the `ca://` / `pva://` prefix convention: the
     /// cache-miss stage in `resolve_external_pv` and the iocInit
     /// open pass ([`PvDatabase::setup_external_link_opens`]) must derive
-    /// the same [`link_put_queue::LinkKey`] from the same link, or the
+    /// the same [`link_put_queue::Channel`] from the same link, or the
     /// queue's once-per-link open would fire twice under two spellings.
-    fn split_external_link_name(name: &str) -> (link_put_queue::LinkTarget, &str) {
-        if let Some(rest) = name.strip_prefix("pva://") {
-            (link_put_queue::LinkTarget::Scheme("pva".to_string()), rest)
-        } else if let Some(rest) = name.strip_prefix("ca://") {
-            (link_put_queue::LinkTarget::Scheme("ca".to_string()), rest)
+    fn split_external_link_name(name: &[u8]) -> (&'static str, &[u8]) {
+        if let Some(rest) = name.strip_prefix(b"pva://") {
+            ("pva", rest)
         } else {
-            (link_put_queue::LinkTarget::Any, name)
+            ("ca", name.strip_prefix(b"ca://").unwrap_or(name))
         }
     }
 
-    /// Stage the open of the external link named `name` — the boundary
-    /// form of [`Self::stage_external_link_open`], which splits the
-    /// scheme prefix and applies the "an lset must exist" gate.
-    ///
-    /// The gate matters because the queue's open state is terminal: an
-    /// open staged while no lset is registered would be serviced against
-    /// an empty lset list and marked `Done`, burning the link's one and
-    /// only connect. Returns true when this call is the one that staged
-    /// it (false when already staged, or when no lset addresses it).
-    pub(crate) fn stage_external_link_open_by_name(&self, name: &str) -> bool {
-        let (target, body) = Self::split_external_link_name(name);
-        if link_put_queue::resolve_lsets(&self.inner, &target).is_empty() {
-            return false;
-        }
-        self.stage_external_link_open(target, body)
+    /// `link` as the one lset its scheme names addresses it
+    /// ([`Self::split_external_link_name`]).
+    pub(crate) fn external_link_ref(
+        link: crate::server::record::ExternalRef<'_>,
+    ) -> (&'static str, LinkRef<'_>) {
+        let (scheme, body) = Self::split_external_link_name(link.name);
+        (scheme, LinkRef::new(body, link.open))
     }
 
-    /// How many staged writes to the external link `link_name` a later write
-    /// on the same link overwrote before it reached the wire — C's
-    /// `pca->nNoWrite`, which `dbcar` prints beside the link
-    /// (`dbCaTest.c:111-116`).
+    /// Whether `scheme`'s lset can take a link to `body`: the `ca` set only
+    /// for a name it can connect ([`ca_link::CaLinks::addresses`]).
+    pub(crate) fn link_addressable(&self, scheme: &str, body: &[u8]) -> bool {
+        match scheme {
+            "ca" => self.inner.ca_links.addresses(body),
+            s => self.inner.link_sets.load().get_ref(s).is_some(),
+        }
+    }
+
+    /// How many staged writes from `record`'s link `field` to the external
+    /// link `link_name` a later write on the same link overwrote before it
+    /// reached the wire — C's `pca->nNoWrite`, which `dbcar` prints beside
+    /// the link (`dbCaTest.c:111-116`).
     ///
     /// `link_name` is the link string as a record carries it, with or
     /// without a `ca://` / `pva://` prefix; it is split by
     /// `Self::split_external_link_name`, the same owner of that convention
     /// the write path stages under, so the two cannot key the counter
-    /// differently.
-    ///
-    /// C keeps this per `caLink`, i.e. per link FIELD: two records whose OUT
-    /// links name one PV have two `caLink`s and two counters. This port keeps
-    /// one queue entry per `(scheme, PV name)`, so both fields report the
-    /// shared count — the same aliasing `LinkSet` already applies to the
-    /// link's cache and connection state.
-    pub fn external_link_puts_coalesced_for(&self, link_name: &str) -> u64 {
-        let (target, body) = Self::split_external_link_name(link_name);
+    /// differently. C keeps the count per `caLink`, i.e. per link field, and
+    /// so does the queue: two records whose OUT links name one PV have two
+    /// counters.
+    pub fn external_link_puts_coalesced_for(
+        &self,
+        record: impl AsRef<[u8]>,
+        field: &str,
+        link_name: impl AsRef<[u8]>,
+    ) -> u64 {
+        let Some(rec) = self.get_record(record) else {
+            return 0;
+        };
+        let (scheme, body) = Self::split_external_link_name(link_name.as_ref());
         self.inner
             .link_puts
-            .coalesced_for(&link_put_queue::LinkKey {
-                target,
-                name: body.to_string(),
-            })
+            .coalesced_for(rec.index(), field, scheme, body)
     }
 
     /// C `dbCaLinkInit` (`dbCa.c:322-346`), which `iocBuild` calls before it
     /// announces `initHookAfterCaLinkInit`: the `dbCaLink` worker exists from
-    /// init, not from the first external link put. Otherwise an IOC whose
-    /// output links are all local has no `dbCaLink` task where C always has
-    /// one — visible in `taskwdShow`.
+    /// init, and only a build or this call starts it — never record
+    /// processing, which would spawn it under the record's hold. A database
+    /// no build has initialised calls it itself, as a C test calls
+    /// `testIocInitOk`; until then its external opens and puts wait queued.
     ///
     /// Returns false, having started nothing, when this database captured no
     /// reactor: the owner's network work has nowhere to run, which is the same
-    /// condition [`Self::stage_external_link_open`] already refuses on.
-    pub(crate) fn ca_link_init(&self) -> bool {
+    /// condition an external link open already refuses on.
+    pub fn ca_link_init(&self) -> bool {
         if self.inner.link_puts.network().is_none() {
             return false;
         }
-        self.inner
+        if let Some(started) = self
+            .inner
             .link_puts
-            .ensure_owner(std::sync::Arc::downgrade(&self.inner));
+            .start_owner(std::sync::Arc::downgrade(&self.inner))
+        {
+            started.wait();
+        }
         true
+    }
+
+    /// Run a link's [`ExternalCpProcess::run_worker`] on the `dbCaLink`
+    /// thread, where C `dbCaTask` runs `CA_DBPROCESS` (`dbCa.c:1314-1321`).
+    pub fn spawn_cp_worker(
+        &self,
+        worker: impl std::future::Future<Output = ()> + Send + 'static,
+    ) -> CpWorker {
+        self.inner.link_puts.spawn_cp_worker(worker)
+    }
+
+    /// C `dbCaLinkInitIsolated`'s half beyond [`Self::ca_link_init`]: a CA
+    /// link reaches only the names this database serves.
+    pub(crate) fn ca_link_isolate(&self) {
+        self.inner.ca_links.isolate();
+    }
+
+    /// C `dbCaShutdown` (`dbCa.c:324-333`), from `iocShutdown` before
+    /// `initHookAfterStopLinks`: the `dbCaLink` worker drains and is joined.
+    pub(crate) fn ca_link_shutdown(&self) {
+        self.inner.link_puts.shutdown();
     }
 
     /// Single owner of the "this external link needs opening" transition —
@@ -2101,13 +2360,26 @@ impl PvDatabase {
     /// Every caller routes through here so the open runs on the link work
     /// owner and nowhere else; no path may call
     /// [`link_set::LinkSet::connect_link`] directly from a record-processing
-    /// thread. Cheap and idempotent: the queue drops a repeat stage for a
-    /// link it has already opened.
+    /// thread. Once the queue holds the link's open, whoever staged it, the
+    /// link's latch says so, and from then on a cycle that misses reads the
+    /// latch and nothing else — C stages one `CA_CONNECT` per `caLink`.
     ///
-    /// Private to the `database` module, and reached only through
-    /// [`Self::stage_external_link_open_by_name`], so no caller can skip the
-    /// scheme split or the lset gate and mint a `LinkKey` of its own shape.
-    fn stage_external_link_open(&self, target: link_put_queue::LinkTarget, name: &str) -> bool {
+    /// Gated on an lset existing for the link: the queue's open state is
+    /// terminal, so an open staged while no lset is registered would be
+    /// serviced against an empty lset list and marked `Done`, burning the
+    /// link's one connect. Returns true when this call is the one that staged
+    /// it (false when already staged, or when nothing could open it).
+    pub(crate) fn stage_external_link_open(
+        &self,
+        link: crate::server::record::ExternalRef<'_>,
+    ) -> bool {
+        if link.open.is_set() || link.open.is_removed() {
+            return false;
+        }
+        let (scheme, body) = Self::split_external_link_name(link.name);
+        if !self.link_addressable(scheme, body) {
+            return false;
+        }
         // Nothing is staged that no owner can perform. A database built with
         // no tokio runtime captured no reactor, and `connect_link` has nowhere
         // to run (see `LinkPutQueue::network`) — so refuse here rather than
@@ -2118,13 +2390,25 @@ impl PvDatabase {
         if self.inner.link_puts.network().is_none() {
             return false;
         }
-        self.inner
-            .link_puts
-            .ensure_owner(std::sync::Arc::downgrade(&self.inner));
-        self.inner.link_puts.stage_open(link_put_queue::LinkKey {
-            target,
-            name: name.to_string(),
-        })
+        // C `dbInitLink` adds a local CA link with `DBCA_CALLBACK_INIT_START`
+        // (`dbLink.c:127-129`), which `dbCaRun` waits for. Registered as the
+        // open is queued, so nothing the open does can report it first.
+        //
+        // Deviation: C's `dbChannelTest` passes a local name whose filter
+        // chain `dbChannelCreate` refuses, and `dbCaRun` then waits forever
+        // for a channel that never connects (C bug: iocInit hangs). Such a
+        // link is not waited for.
+        let local_ca = scheme == "ca"
+            && self.has_name_no_resolve(body)
+            && filters::split_channel_name(body)
+                .json_suffix
+                .is_none_or(|json| filters::try_parse_filter_chain(&json).is_ok());
+        let staged = self.inner.link_puts.stage_open(
+            link_put_queue::Channel::new(scheme, body, link.open),
+            || local_ca.then(|| self.inner.ca_run.register()).flatten(),
+        );
+        link.open.set();
+        staged
     }
 
     /// Number of external-link opens the work owner has completed —
@@ -2145,11 +2429,33 @@ impl PvDatabase {
     /// cross-namespace check is atomic with the insert and the lock
     /// order across all add_*/remove_* methods is identical (no
     /// cross-namespace deadlock).
-    pub async fn add_pv(&self, name: &str, initial: EpicsValue) -> CaResult<()> {
+    fn insert_simple_pv(&self, name: RecordName, pv: Arc<ProcessVariable>) {
+        self.inner.simple_pvs.lock().insert(name, pv);
+        self.inner
+            .simple_pvs_revision
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+    }
+
+    fn take_simple_pv(&self, name: &[u8]) -> Option<Arc<ProcessVariable>> {
+        let removed = self.inner.simple_pvs.lock().remove(name);
+        self.inner
+            .simple_pvs_revision
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+        removed
+    }
+
+    pub(crate) fn simple_pvs_revision(&self) -> u64 {
+        self.inner
+            .simple_pvs_revision
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub async fn add_pv(&self, name: impl AsRef<[u8]>, initial: EpicsValue) -> CaResult<()> {
         let _gate = self.lock_registration("add_pv");
-        self.check_name_free(name)?;
-        let pv = Arc::new(ProcessVariable::new(name.to_string(), initial));
-        self.inner.simple_pvs.lock().insert(name.to_string(), pv);
+        let name = RecordName::from(name.as_ref());
+        self.check_name_free(&name)?;
+        let pv = Arc::new(ProcessVariable::new(name.clone(), initial));
+        self.insert_simple_pv(name, pv);
         Ok(())
     }
 
@@ -2166,7 +2472,7 @@ impl PvDatabase {
     /// Returns `Err` on duplicate name (see [`Self::add_pv`]).
     pub async fn add_pv_with_hook(
         &self,
-        name: &str,
+        name: impl AsRef<[u8]>,
         initial: EpicsValue,
         hook: crate::server::pv::WriteHook,
     ) -> CaResult<()> {
@@ -2181,7 +2487,7 @@ impl PvDatabase {
     /// cannot observe the PV without its access hook bound.
     pub async fn add_pv_with_hooks(
         &self,
-        name: &str,
+        name: impl AsRef<[u8]>,
         initial: EpicsValue,
         write_hook: crate::server::pv::WriteHook,
         access_hook: Option<crate::server::pv::AccessHook>,
@@ -2201,15 +2507,16 @@ impl PvDatabase {
     /// None` is identical to [`Self::add_pv_with_hooks`].
     pub async fn add_pv_with_hooks_full(
         &self,
-        name: &str,
+        name: impl AsRef<[u8]>,
         initial: EpicsValue,
         write_hook: crate::server::pv::WriteHook,
         access_hook: Option<crate::server::pv::AccessHook>,
         read_hook: Option<crate::server::pv::ReadHook>,
     ) -> CaResult<()> {
         let _gate = self.lock_registration("add_pv_with_hooks_full");
-        self.check_name_free(name)?;
-        let pv = Arc::new(ProcessVariable::new(name.to_string(), initial));
+        let name = RecordName::from(name.as_ref());
+        self.check_name_free(&name)?;
+        let pv = Arc::new(ProcessVariable::new(name.clone(), initial));
         pv.set_write_hook(write_hook);
         if let Some(access) = access_hook {
             pv.set_access_hook(access);
@@ -2217,7 +2524,7 @@ impl PvDatabase {
         if let Some(read) = read_hook {
             pv.set_read_hook(read);
         }
-        self.inner.simple_pvs.lock().insert(name.to_string(), pv);
+        self.insert_simple_pv(name, pv);
         Ok(())
     }
 
@@ -2230,13 +2537,14 @@ impl PvDatabase {
     /// (otherwise a re-add of the same alias name would fail with
     /// "already registered as an alias" even though its target is
     /// gone).
-    pub async fn remove_simple_pv(&self, name: &str) -> Option<Arc<ProcessVariable>> {
+    pub async fn remove_simple_pv(&self, name: impl AsRef<[u8]>) -> Option<Arc<ProcessVariable>> {
+        let name = name.as_ref();
         let _gate = self.lock_registration("remove_simple_pv");
         // Simple PVs cannot be alias targets (aliases point at
         // records), but a stale alias whose name MATCHES this PV
         // would have been rejected at add_alias time. No alias
         // cleanup needed for simple-PV removal.
-        let removed = self.inner.simple_pvs.lock().remove(name);
+        let removed = self.take_simple_pv(name);
         if let Some(pv) = &removed {
             // Removal IS destruction: this funnel is `destroy`'s only
             // caller, so a PV cannot leave the directory while a server
@@ -2258,9 +2566,9 @@ impl PvDatabase {
     /// every call site.
     pub async fn add_simple_pv(&self, pv: ProcessVariable) -> CaResult<()> {
         let _gate = self.lock_registration("add_simple_pv");
-        self.check_name_free(&pv.name)?;
+        self.check_name_free(pv.name.as_bytes())?;
         let name = pv.name.clone();
-        self.inner.simple_pvs.lock().insert(name, Arc::new(pv));
+        self.insert_simple_pv(name, Arc::new(pv));
         Ok(())
     }
 
@@ -2335,6 +2643,16 @@ impl PvDatabase {
         matches!(*self.inner.init_phase.lock().unwrap(), DbInitPhase::Running)
     }
 
+    /// Is a load under way that `iocInit` has not yet finished? A CA client
+    /// in the IOC cannot connect to the IOC's own records then, because the
+    /// server is not up; a database built without a load never waits.
+    pub fn ioc_init_pending(&self) -> bool {
+        matches!(
+            *self.inner.init_phase.lock().unwrap(),
+            DbInitPhase::Loading(_) | DbInitPhase::Initialising(_)
+        )
+    }
+
     /// Schedule a record's link-status classification — the port's
     /// `init_record` tail (C `checkLinks`).
     ///
@@ -2348,7 +2666,7 @@ impl PvDatabase {
     ///
     /// A record's first classification is issued from `set_async_context`,
     /// which [`Self::add_loaded_record`] calls *before* it inserts the record
-    /// into `records` — the handle has to exist for `run_init_passes` to use
+    /// into `records` — the handle has to exist for `run_init_pass0` to use
     /// it. So on the spawn-at-once paths the init would race its own record's
     /// registration and could post fields for a record the database does not
     /// have yet.
@@ -2369,7 +2687,7 @@ impl PvDatabase {
     /// same code path on every backend.
     pub(crate) fn schedule_record_init(
         &self,
-        record: &str,
+        record: &[u8],
         init: impl std::future::Future<Output = ()> + Send + 'static,
     ) {
         if !self.inner.records.read().contains_key(record) {
@@ -2377,7 +2695,7 @@ impl PvDatabase {
                 .record_init_waiting
                 .lock()
                 .unwrap()
-                .entry(record.to_string())
+                .entry(RecordName::from(record))
                 .or_default()
                 .push(Box::pin(init));
             return;
@@ -2406,7 +2724,7 @@ impl PvDatabase {
 
     /// Release every init parked for `record` — called by the one site that
     /// registers the name, immediately after the insert that makes it real.
-    fn release_record_inits(&self, record: &str) {
+    fn release_record_inits(&self, record: &[u8]) {
         let parked = self
             .inner
             .record_init_waiting
@@ -2444,12 +2762,10 @@ impl PvDatabase {
             }
         };
         // C `iocBuild` calls `dbCaLinkInit()` between its two halves
-        // (`iocInit.c:216`), so the `dbCaLink` worker is up before the record
-        // init passes of `iocBuild_2` — and before anything they wire can
-        // stage a link. Here rather than in `ioc_app`'s lifecycle because this
-        // barrier is the one point every bring-up path crosses: the
-        // `IocApplication` walk and `CaServer::run` both reach it, and only
-        // one of them runs that lifecycle.
+        // (`iocInit.c:216`), before the record init passes of `iocBuild_2`;
+        // every `IocBuilder` build path does so there. The `ca_link_init`
+        // below starts the worker for a database that reaches this barrier
+        // with no build behind it.
         // C's `initDatabase` per-record init pass — bind each LOAD-deferred
         // record's dset and run its `init_record`. The build lifecycle drains
         // this explicitly BEFORE `setup_io_intr` (C's `scanInit`), so a record's
@@ -2458,22 +2774,17 @@ impl PvDatabase {
         // bare shell). Idempotent — each record's debt is claimed once. Before
         // `ca_link_init` to keep the order the eager path had, where the init
         // passes ran at load, ahead of the link worker.
-        self.drain_deferred_record_inits();
-        self.ca_link_init();
-        // C's `dbInitRecordLinks`: every link is typed, checked and opened at
-        // `iocInit`, not at `dbLoadRecords`. That is where a `{state:"NAME"}`
-        // link's `dbStateCreate` happens — so its state exists from `iocInit`
-        // onward whether or not anything ever reads it — and it is also where
-        // a link the record's device support cannot take is refused, with the
-        // record kept. Measured on softIoc R7.0.10: `dbStateShowAll 1` prints
-        // nothing after `dbLoadRecords` alone and lists every name any link
-        // mentions after `iocInit`, all FALSE, with nothing processed.
         //
-        // Creating a state on first use alone — which the link read/write
-        // owner still does, because a `dbLoadRecords` AFTER `iocInit` opens
-        // its links then too — agrees on every value but left the registry
-        // empty until a link was touched.
-        self.db_init_record_links().await;
+        // The drain opens with C's `dbInitRecordLinks`: every link is typed
+        // and checked at `iocInit`, not at `dbLoadRecords`, and a link the
+        // record's device support cannot take is refused, with the record
+        // kept. Its `doResolveLinks` then opens each link, which is where a
+        // `{state:"NAME"}` link's `dbStateCreate` happens. Measured on softIoc
+        // R7.0.10: `dbStateShowAll 1` prints nothing after `dbLoadRecords`
+        // alone and lists every name any link mentions after `iocInit`, all
+        // FALSE, with nothing processed.
+        self.drain_deferred_record_inits(&|line| crate::stderr_println!("{line}"));
+        self.ca_link_init();
         // The pass is done and every link's text is final, so the phase becomes
         // terminal here — and what the pass queued joins the load's own
         // backlog, behind it, so a record classified twice publishes the later
@@ -2486,6 +2797,9 @@ impl PvDatabase {
                 owed.extend(queued);
             }
         }
+        // Every link's text is final. After the switch, so a record added
+        // concurrently is either swept here or initialises its own forwards.
+        self.init_forward_links();
         // Sequential, in issue order: each classification is a short read of a
         // now-immutable record set, and C's `init_record` pass is a loop too.
         for init in owed {
@@ -2496,6 +2810,9 @@ impl PvDatabase {
         // init pass for the same reason C runs it after `prepareLinks`: the link
         // fields must have their final text before the graph is read.
         self.build_lock_sets();
+        // C `scanInit` (`iocInit.c:186`), whose `buildScanLists` creates the
+        // events every `SCAN = "Event"` record names.
+        self.build_event_table();
     }
 
     /// C `dbInitRecordLinks` (`dbStaticLib.c:2171-2233`), which C runs once per
@@ -2515,43 +2832,31 @@ impl PvDatabase {
     /// bad links: eight `ERROR:` lines at `iocInit`, ten names in `dbl` before
     /// and after, and `iocRun: All initialization complete`.
     ///
-    /// The jlink `open` half rides here too, because in C it is the same pass:
-    /// `dbSetLink` (`:2225`) is what calls a jlink's `open`, and it is reached
-    /// only by a link that passed the check. So a `{state:…}` link on a field
-    /// whose device support refuses `JSON_LINK` never creates its `dbState` —
-    /// `lnkState_open` (`lnkState.c:110-116`) is `dbStateCreate`, find-or-create
-    /// (`dbState.c:50-66`), and it is not called at all.
+    /// A link refused here is emptied before `doResolveLinks` opens it, so a
+    /// `{state:…}` link on a field whose device support refuses `JSON_LINK`
+    /// never creates its `dbState`.
     ///
-    /// C runs this pass BEFORE `init_record`; this port runs the init passes
-    /// first — at load for a programmatic / `dbCreateRecord` record, and at the
-    /// barrier just above (`init_deferred_record` draining
-    /// `drain_deferred_record_inits`, which runs `init_deferred_record` for
-    /// every record that owes one) for a record loaded during the LOAD phase — so
-    /// the port's order is still init-then-link, and that ordering IS
-    /// observable. Measured against softIoc R7.0.10 on
-    /// `record(calcout,"X"){field(INPA,"@instio p") field(OUT,"@instio q")}`:
-    /// C reads `INAV`/`OUTV` as `Constant`, this port read `Ext PV NC`, because
-    /// calcout had classified both at init from text this pass then replaced.
-    /// A record's cached link status is therefore re-derived where the text
-    /// changes (see [`Self::set_link_text`]) and once per record at the end of
-    /// the loop, which is the same seam a runtime re-point uses. What is NOT
-    /// closed is the ORDER of the two passes: device support reads the refused
-    /// text at `init_record` where C reads the emptied link, because this pass
-    /// runs after the deferred-init drain rather than before it. Closing it
-    /// means running this pass ahead of that drain, a reordering the eager
-    /// (`IocBuilder`, non-LOAD `dbLoadRecords`) callers would have to follow too.
-    async fn db_init_record_links(&self) {
-        use crate::runtime::log::ERL_ERROR;
-        use crate::server::record::{
-            DbLinkType, ParsedLink, declared_link_type, link_type_refusal,
-        };
+    /// C runs this pass (`prepareLinks`, `iocInit.c:175`) after
+    /// `initHookAfterInitDevSup` and before `initDatabase`, so its refusals
+    /// print ahead of every `init_record` report and device support reads the
+    /// emptied link. [`Self::drain_deferred_record_inits`] runs it first for
+    /// that reason; it runs once, whichever barrier gets there. A record a
+    /// programmatic / `dbCreateRecord` caller initialised at creation has
+    /// already classified its links, so its cached link status is re-derived
+    /// where the text changes (see [`Self::set_link_text`]) and once per record
+    /// at the end of the loop, the seam a runtime re-point uses.
+    fn db_init_record_links(&self) {
+        if self
+            .inner
+            .links_prepared
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            return;
+        }
+        use crate::server::record::{DbLinkType, declared_link_type, link_type_refusal};
         let empty_assigned =
             std::mem::take(&mut *self.inner.empty_link_assignments.lock().unwrap());
-        let states = crate::server::database::filters::sync::db_state_registry();
-        for name in self.all_record_names().await {
-            let Some(rec) = self.get_record(&name) else {
-                continue;
-            };
+        for (name, rec) in self.iterate_records() {
             let (record_type, dtyp, fields) = {
                 let inst = rec.read();
                 (
@@ -2569,10 +2874,18 @@ impl PvDatabase {
                     || assigned_empty.is_some_and(|fields| fields.iter().any(|f| f == &field));
                 let mut refused = false;
                 if assigned {
-                    if let Some(line) =
-                        link_type_refusal(&name, &record_type, Some(&dtyp), &field, &text)
-                    {
-                        eprintln!("{ERL_ERROR}: {line}");
+                    crate::server::record::warn_discarded_cp(&name, &field, ftype, text.as_bytes());
+                    if let Some(line) = link_type_refusal(
+                        &name.to_str_lossy(),
+                        &record_type,
+                        Some(&dtyp),
+                        &field,
+                        &text,
+                    ) {
+                        crate::runtime::log::errlog_vprintf(format_args!(
+                            "{}: {line}\n",
+                            crate::runtime::log::erl_error()
+                        ));
                         refused = true;
                     }
                 }
@@ -2580,14 +2893,11 @@ impl PvDatabase {
                     let empty = declared_link_type(&record_type, Some(&dtyp), &field)
                         .map_or("", DbLinkType::empty_link_text);
                     if empty != text {
-                        Self::set_link_text(&mut rec.write(), &field, empty);
+                        let after = Self::set_link_text(&rec, &field, empty);
+                        if let Some(work) = after {
+                            work.run(self);
+                        }
                     }
-                    continue;
-                }
-                if let ParsedLink::State(state) =
-                    crate::server::record::parse_link_field(&text, ftype)
-                {
-                    states.get_or_create(&state.name);
                 }
             }
             // The record's links are final from here on. `init_links` is the
@@ -2605,22 +2915,62 @@ impl PvDatabase {
     /// same split [`Self::link_field_texts`] reads it from. Only ever used to
     /// install the empty link of a declared type, so a rejected put would mean
     /// the two owners disagree about which fields are links.
-    fn set_link_text(inst: &mut RecordInstance, field: &str, text: &str) {
+    ///
+    /// Returns the work the field's `special()` left for after the hold.
+    fn set_link_text(
+        rec: &RecordCell,
+        field: &str,
+        text: &str,
+    ) -> Option<crate::server::record::AfterGate> {
         let value = EpicsValue::String(text.into());
-        let put = if inst.common_link_text(field).is_some() {
-            inst.put_common_field_db_load(field, value).map(|_| ())
-        } else {
-            inst.record.put_field(field, value)
-        };
-        debug_assert!(put.is_ok(), "{field} is a link field with no writer");
+        // Both parses are made before the write guard and both old ones
+        // dropped after it.
+        let mut common = crate::server::record::PreparedCommonLink::for_put(field, &value);
+        let declared =
+            crate::server::record::PreparedLink::for_put(rec.rdes().fields, field, &value);
+        let after = Self::set_link_text_held(&mut rec.write(), field, value, &mut common, declared);
+        drop(common);
+        after
+    }
+
+    fn set_link_text_held(
+        inst: &mut RecordInstance,
+        field: &str,
+        value: EpicsValue,
+        common: &mut Option<crate::server::record::PreparedCommonLink>,
+        declared: Option<crate::server::record::PreparedLink>,
+    ) -> Option<crate::server::record::AfterGate> {
         // C brackets every link write with the special pair — `dbPutSpecial`
         // pass 0 then pass 1 around `dbSetLink` (`dbAccess.c:1174,1178`) — and
         // pass 1 is where a record re-derives what it caches from a link's
         // text: calcout `INAV..INUV`, transform's and (a)scalcout's link
-        // tables. Neither writer above runs it, and this pass is the LAST
-        // writer of every link field's text, so without it the classification
-        // the record made at load stands against text that no longer exists.
-        let _ = inst.record.special(field, true);
+        // tables. This pass is the LAST writer of every link field's text, so
+        // without it the classification the record made at load stands against
+        // text that no longer exists. The common-field writer runs pass 1
+        // itself; the declared-field writers do not.
+        let put = if inst.common_link_text(field).is_some() {
+            // A type that declares the field itself (throttle's OUT) owns the
+            // text, and `dbCommon` keeps the loader's mirror of it.
+            let owned = match declared {
+                Some(link) if inst.record.implements_field(field) => {
+                    inst.put_link_field(link, value.clone())
+                }
+                _ => Ok(()),
+            };
+            owned.and(
+                inst.put_common_field_db_load_prepared(field, value, common)
+                    .map(|_| ()),
+            )
+        } else {
+            let put = match declared {
+                Some(link) => inst.put_link_field(link, value),
+                None => inst.put_declared_field(field, value),
+            };
+            let _ = inst.record.special(field, true, &inst.common);
+            put
+        };
+        debug_assert!(put.is_ok(), "{field} is a link field with no writer");
+        inst.record.take_after_gate()
     }
 
     /// **The only entry point that can serve a link-backed field's metadata.**
@@ -2667,6 +3017,7 @@ impl PvDatabase {
             field,
             string_view,
             &mut std::collections::HashSet::new(),
+            ReadPolicy::Wait,
         )
     }
 
@@ -2680,48 +3031,70 @@ impl PvDatabase {
     /// arms while a cycle stops. `db_target_metadata` passes its caller's set
     /// through to here, so one guard spans the whole resolve exactly as C's
     /// does.
+    ///
+    /// `policy` says how each record on the way is taken. Under
+    /// [`ReadPolicy::NoWait`] none is waited for, so a resolve from inside a
+    /// record's own processing cannot close a cycle with another holder.
     pub(crate) fn channel_snapshot_for_field_guarded(
         &self,
         record: &Arc<RecordCell>,
         field: &str,
         string_view: bool,
-        visited: &mut std::collections::HashSet<String>,
+        visited: &mut std::collections::HashSet<RecordName>,
+        policy: ReadPolicy<'_>,
     ) -> Option<crate::server::snapshot::Snapshot> {
+        if let Some(own) = policy.own(record)
+            && !string_view
+        {
+            return crate::server::record::record_instance::own_field_snapshot(
+                own,
+                record.rdes().meta,
+                field,
+            );
+        }
         // 1. Under a short read lock: is this field link-backed at all, and if
         //    so what does its link field currently say. Nothing is resolved
         //    here — resolving needs the target's lock.
-        let link = {
-            let inst = record.read();
+        // A field no link backs is served under that same lock.
+        let link = match policy.read(record, |inst| {
             match inst.link_backed_metadata_field_of(field) {
-                None => {
-                    return inst.channel_snapshot_for_field(
-                        field,
-                        string_view,
-                        LinkBacking::none(),
-                    );
-                }
-                Some(link_field) => inst.link_text(&link_field).map(|text| (link_field, text)),
+                None => std::ops::ControlFlow::Break(inst.channel_snapshot_for_field(
+                    field,
+                    string_view,
+                    LinkBacking::none(),
+                )),
+                Some(link_field) => std::ops::ControlFlow::Continue(
+                    inst.stored_link_shared(&link_field)
+                        .cloned()
+                        .map(|link| (link_field, link)),
+                ),
             }
+        })? {
+            std::ops::ControlFlow::Continue(link) => link,
+            std::ops::ControlFlow::Break(served) => return served,
         };
 
         // 2. No record lock held. A link that resolves to nothing — CONSTANT,
         //    an unresolvable target, or one the visited guard refused — leaves
         //    the map empty, which serves each slot's C seed.
         let mut resolved = HashMap::new();
-        if let Some((link_field, text)) = link {
-            let parsed = crate::server::record::parse_link_v2(&text);
-            if let Some(meta) = self.link_metadata(&parsed, visited) {
+        if let Some((link_field, parsed)) = link {
+            if let Some(meta) = self.link_metadata_through(&parsed, visited, policy) {
                 resolved.insert(link_field, meta);
             }
         }
 
         // 3. Re-lock and build with what was just resolved. The borrow ends
         //    with this call, so there is nowhere to keep it.
-        record.read().channel_snapshot_for_field(
-            field,
-            string_view,
-            LinkBacking::resolved(&resolved),
-        )
+        policy
+            .read(record, |inst| {
+                inst.channel_snapshot_for_field(
+                    field,
+                    string_view,
+                    LinkBacking::resolved(&resolved),
+                )
+            })
+            .flatten()
     }
 
     /// Every link-backed field's metadata for one record, resolved once with
@@ -2736,101 +3109,6 @@ impl PvDatabase {
         record: &Arc<RecordCell>,
     ) -> HashMap<String, LinkMetadata> {
         self.resolve_link_backed_metadata_with(record, &InputLinkTexts::none())
-    }
-
-    /// [`Self::resolve_link_backed_metadata`] for a POSTER — a process cycle,
-    /// the async-completion tail, the simulation tail, or one of the two
-    /// out-of-band field posters. All of them resolve so a monitor snapshot
-    /// can carry the LINK's units/precision/limits instead of the record's
-    /// own.
-    ///
-    /// Which is why this door may ask a question the serve door must not: a
-    /// poster's result reaches a consumer only through
-    /// `RecordInstance::make_monitor_snapshot`, and every caller of that sits
-    /// inside a `self.subscribers.get(field)` hit
-    /// (`notify_from_snapshot`, `notify_field_with_origin`,
-    /// `notify_record_alarm`), so a record nothing is subscribed to has no
-    /// reader for what this would resolve. C pays nothing here either way —
-    /// its five metadata slots are `dbDb_lset` entries (`dbDbLink.c:414-415`)
-    /// reached from `dbGet`, so a link-backed slot is resolved when a
-    /// CONSUMER asks the link, never from `dbProcess`.
-    ///
-    /// A serve caller (`read_group`, `read_member`) must keep to
-    /// [`Self::resolve_link_backed_metadata`]: it resolves for the client in
-    /// front of it, about which the record's own subscriber list says nothing.
-    ///
-    /// Measured, 2000 `calc` records at 10 Hz each with one set `INPA`: 5.76
-    /// us of CPU per process cycle through the ungated door, 3.01 through this
-    /// one. The same record in C costs 0.45 us.
-    pub(crate) fn resolve_link_backed_metadata_for_posts(
-        &self,
-        record: &Arc<RecordCell>,
-    ) -> PostBacking {
-        self.resolve_link_backed_metadata_for_posts_with(record, &InputLinkTexts::none())
-    }
-
-    /// [`Self::resolve_link_backed_metadata_for_posts`] for the cycle that has
-    /// already read this record's link fields — see
-    /// [`Self::resolve_link_backed_metadata_with`].
-    pub(crate) fn resolve_link_backed_metadata_for_posts_with(
-        &self,
-        record: &Arc<RecordCell>,
-        prefetched: &InputLinkTexts,
-    ) -> PostBacking {
-        // Nothing to resolve and no lock taken — the same two answers the
-        // ungated door gives, and both of them are answers, not declines.
-        if prefetched.none_set() {
-            return PostBacking::empty();
-        }
-        let plan = Self::plan_link_backed_metadata_for_posts(&record.read(), prefetched);
-        self.resolve_link_backed_metadata_plan(plan)
-    }
-
-    /// The first half of [`Self::resolve_link_backed_metadata_for_posts_with`]:
-    /// everything it asks of THIS record, under the caller's acquisition of
-    /// it. The process cycle asks from inside its entry guard, so the gate
-    /// costs it no second acquisition; the other posters ask under a read
-    /// lock of their own.
-    pub(crate) fn plan_link_backed_metadata_for_posts(
-        inst: &crate::server::record::RecordInstance,
-        prefetched: &InputLinkTexts,
-    ) -> MetadataPlan {
-        if prefetched.none_set() || inst.link_backed_metadata_links().is_empty() {
-            return MetadataPlan::Empty;
-        }
-        // **The gate, and the only place it is asked** — inside the one
-        // acquisition the text read below needs anyway. A poster's result
-        // reaches a consumer only through
-        // `RecordInstance::make_monitor_snapshot`, and every caller of
-        // that sits inside a `self.subscribers.get(field)` hit, so with
-        // nobody subscribed the walk is work no one can read. C pays
-        // nothing here either way: its five metadata slots are
-        // `dbDb_lset` entries (`dbDbLink.c:414-415`) reached from `dbGet`,
-        // so a link-backed slot is resolved when a CONSUMER asks the link,
-        // never from `dbProcess`.
-        //
-        // The answer is a DECLINE, not an empty map. A subscriber can
-        // arrive between a poster's read lock and the post's write lock, and
-        // the post must be able to tell that its backing was never looked up —
-        // otherwise that one event carries the record's own C seed where
-        // the link's metadata belongs.
-        if inst.subscribers.is_empty() {
-            return MetadataPlan::Declined;
-        }
-        MetadataPlan::Links(Self::link_backed_metadata_texts(inst, prefetched))
-    }
-
-    /// The second half: the walk, with NO lock on the record held — it
-    /// reaches for each TARGET's lock, and a self-link's target is this
-    /// record.
-    pub(crate) fn resolve_link_backed_metadata_plan(&self, plan: MetadataPlan) -> PostBacking {
-        match plan {
-            MetadataPlan::Empty => PostBacking::empty(),
-            MetadataPlan::Declined => PostBacking::declined(),
-            MetadataPlan::Links(links) => {
-                PostBacking::resolved(self.walk_link_backed_metadata(links))
-            }
-        }
     }
 
     /// [`Self::resolve_link_backed_metadata`] for a caller that has already
@@ -2910,7 +3188,11 @@ impl PvDatabase {
     /// under the same `registration_mutex` hold, eliminating the
     /// TOCTOU window where `remove_record` could land between them
     /// and leave a phantom scan entry.
-    pub async fn add_record(&self, name: &str, record: Box<dyn Record>) -> CaResult<()> {
+    pub async fn add_record(
+        &self,
+        name: impl AsRef<[u8]>,
+        record: Box<dyn Record>,
+    ) -> CaResult<()> {
         self.add_loaded_record(name, record, RecordLoad::default())
             .await
     }
@@ -2932,24 +3214,56 @@ impl PvDatabase {
     /// Taking the loaded fields here is what makes C's ordering hold by
     /// construction: there is no window in which the init passes can observe a
     /// record whose `.db` fields have not landed, because the record is not
-    /// reachable until they have. `RecordInstance::run_init_passes` is
-    /// crate-private for the same reason — the sink is the only caller.
+    /// reachable until they have. `RecordInstance::run_init_pass0` is
+    /// crate-private for the same reason.
+    ///
+    /// A field the load refuses costs the field, not the record (C
+    /// `dbRecordField`'s `yyerror(NULL)`): its line is printed, the record is
+    /// added with the field at its default, and the call returns `Err`.
     pub async fn add_loaded_record(
         &self,
-        name: &str,
+        name: impl AsRef<[u8]>,
         record: Box<dyn Record>,
         load: RecordLoad,
     ) -> CaResult<()> {
+        let mut refused = None;
+        let mut entry = crate::server::db_loader::EntryMessage::default();
+        self.add_loaded_record_reporting(name, record, load, &mut entry, |field, diagnostic| {
+            diagnostic.print();
+            refused.get_or_insert_with(|| field.to_string());
+        })
+        .await?;
+        match refused {
+            Some(field) => Err(CaError::InvalidValue(format!(
+                "field {field} refused at load"
+            ))),
+            None => Ok(()),
+        }
+    }
+
+    /// [`Self::add_loaded_record`] with each refused field's C line handed to
+    /// `refused` with the field's name; `Err` only when the record itself could
+    /// not be created.
+    pub(crate) async fn add_loaded_record_reporting(
+        &self,
+        name: impl AsRef<[u8]>,
+        record: Box<dyn Record>,
+        load: RecordLoad,
+        entry: &mut crate::server::db_loader::EntryMessage,
+        mut refused: impl FnMut(&str, crate::server::db_loader::DbDiagnostic),
+    ) -> CaResult<()> {
+        let name = RecordName::from(name.as_ref());
         // A record created after `iocInit` needs a lock set, and its links —
         // in both directions — may merge it into existing ones. `None` while
         // the database is still loading, which is every ordinary
         // `dbLoadRecords`: `build_lock_sets` builds the whole graph at
         // `iocInit` instead. Declared ABOVE the gate: the relink takes lock
         // sets, which sit above L46, so it must run once the gate is down.
-        let _relink = self.lock_set_membership_change(name);
+        let relink = self.lock_set_membership_change(&name);
         let gate = self.lock_registration("add_loaded_record");
-        self.check_name_free(name)?;
-        let mut instance = RecordInstance::new_boxed(name.to_string(), record);
+        self.check_name_free(&name)?;
+        let mut instance = RecordInstance::new_boxed(name.clone(), record);
+        links::check_record_links(&instance)?;
         // Hand the record a cycle-free handle to its own database so it can
         // post out-of-band field updates / wire completion-driven re-entry
         // (asyn TRACE callback, sseq WAITn) without owning the database.
@@ -2959,7 +3273,7 @@ impl PvDatabase {
         // do not need it.
         instance
             .record
-            .set_async_context(name.to_string(), self.async_handle());
+            .set_async_context(name.clone(), self.async_handle());
 
         // Hand the record the current breakpoint-table registry snapshot so a
         // LINR>=3 ai/ao record can resolve its table lazily at convert time.
@@ -2999,7 +3313,6 @@ impl PvDatabase {
         // that registry is complete only once the builder has run every
         // registration — after the `.db` text was parsed. C has no such
         // ordering, since every `.dbd` is loaded before any `.db`.
-        let mut refused: Option<String> = None;
         // C's `plink->text` for the empty assignment — see
         // `PvDatabaseInner::empty_link_assignments`. Taken from the load's own
         // field list because that is the only place the distinction between
@@ -3007,42 +3320,50 @@ impl PvDatabase {
         let mut empty_links: Vec<String> = Vec::new();
         for (field, value) in load.common_fields {
             if let crate::types::EpicsValue::String(text) = &value {
-                if text.as_str_lossy().is_empty()
-                    && instance.common_link_text(&field.to_uppercase()).is_some()
-                {
+                if text.is_empty() && instance.common_link_text(&field.to_uppercase()).is_some() {
                     empty_links.push(field.to_uppercase());
                 }
             }
             if let crate::types::EpicsValue::String(text) = &value {
                 if let Some(refusal) = crate::server::db_loader::menu_value_refusal(
                     instance.record.record_type(),
-                    name,
+                    &name.to_str_lossy(),
                     &field,
                     &text.as_str_lossy(),
                 ) {
-                    if let Some(notice) = refusal.notice {
-                        eprintln!("{notice}");
+                    let stored = refusal.stored;
+                    refused(
+                        &field,
+                        crate::server::db_loader::DbDiagnostic {
+                            message: refusal.line(entry),
+                            notice: refusal.notice,
+                            suggestion: refusal.suggestion,
+                        },
+                    );
+                    if !stored {
+                        continue;
                     }
-                    eprintln!("{}", refusal.line);
-                    // C follows the refusal with `dbPutStringSuggest`, which
-                    // proposes the closest choice or prints nothing
-                    // (`dbLexRoutines.c:1414`). It reaches the operator through
-                    // errlog rather than stderr, so C's own output shows the
-                    // proposals batched at the end; one stream puts each under
-                    // the line it explains.
-                    if let Some(suggestion) = refusal.suggestion {
-                        eprintln!("{suggestion}");
-                    }
-                    refused.get_or_insert(format!("{name}.{field}"));
-                    continue;
                 }
             }
+            // C prints the `.db` text; a numeric field's was converted on the way
+            // in, so this is its `DBR_STRING` form.
+            let text = crate::server::record::record_instance::value_as_dbr_string(&value)
+                .map(|s| s.as_str_lossy().into_owned())
+                .unwrap_or_default();
             if let Err(e) = instance.put_common_field_db_load(&field, value) {
-                eprintln!("put_common_field({field}) failed for {name}: {e}");
+                let line = crate::server::db_loader::field_refusal_line(
+                    entry,
+                    instance.record.as_ref(),
+                    &name.to_str_lossy(),
+                    &field,
+                    &text,
+                    &e,
+                );
+                refused(&field, crate::server::db_loader::DbDiagnostic::new(line));
             }
-        }
-        if let Some(what) = refused {
-            return Err(CaError::BadChoice(what));
+            // An unpublished record has no async context yet; its init passes
+            // classify what this load set.
+            drop(instance.record.take_after_gate());
         }
         // `info(...)` tags land before `init_record`, so device support that
         // reads them at init sees the values.
@@ -3062,8 +3383,12 @@ impl PvDatabase {
                 .empty_link_assignments
                 .lock()
                 .unwrap()
-                .insert(name.to_string(), empty_links);
+                .insert(name.clone(), empty_links);
         }
+
+        // After the load, so the cell starts on the loaded `PRIO`.
+        instance.device_done = crate::server::database::DeviceDone::new(self, &instance);
+        instance.set_record_db(RecordDb::of(self));
 
         // C `doInitRecord0` (`iocInit.c:530-536`) binds the dset and only then
         // calls `init_record(pass 0)`. Both lines are here, in that order,
@@ -3081,40 +3406,9 @@ impl PvDatabase {
         // AFTER `dbLoadRecords(NDStats.template)`). The record is still
         // published below so a name check, an alias and `dbInitRecordLinks` all
         // see it; only its device-support binding and passes wait for the
-        // barrier's drain of the records that owe an init. Outside the LOAD phase —
-        // programmatic creation, `dbCreateRecord` after `iocInit` — there is no
-        // barrier to defer to, so the record is initialised in place, as before.
+        // barrier's drain of the records that owe an init. Outside the LOAD
+        // phase the debt is paid below, once the record is published.
         let defer = self.is_load_deferring();
-        if !defer {
-            crate::server::ioc_app::attach_device_support(
-                &mut instance,
-                name,
-                self.inner.device_support_resolver.load().as_deref(),
-            );
-            // C `registryFunctionFind` reads a process-global registry from
-            // inside `init_record` pass 1, so the record is handed the registry
-            // rather than resolved against it from out here: the lookup's
-            // failure is an early return that the init tail must not run past,
-            // and only the init owner can honour that.
-            instance.arm_init_subroutines(self.inner.subroutine_registry.load_full());
-            instance.run_init_passes(name);
-
-            // The init-seed owner: every CONSTANT link the record declares
-            // (`Record::constant_init_links`) is loaded into its value field
-            // ONCE, here — a constant delivers NOTHING at process time
-            // (`dbConstLink.c:219-225`). `add_record` is the creation sink every
-            // path funnels through, so this covers a record built
-            // programmatically as well as one loaded from a .db;
-            // `IocBuilder`/`dbLoadRecords` call the owner again after
-            // `init_record(1)`, once the record's final NELM/FTVL buffer exists
-            // for an array constant to land in. Seeding twice is a no-op — both
-            // run before any client put.
-            super::database::processing::seed_constant_links(&mut instance);
-        }
-
-        let scan = instance.common.scan;
-        let phas = instance.common.phas;
-        let record_type = instance.record.record_type();
         // The record's load sequence — C `pnewnode->order =
         // pdbentry->pdbbase->no_records++` (`dbStaticLib.c:1704`) — drawn here,
         // where the node is built, so it is born with the record. Drawn before
@@ -3123,55 +3417,51 @@ impl PvDatabase {
             .inner
             .load_order_counter
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let rec_arc = Arc::new(RecordCell::new(instance, seq, defer));
+        let index = self.inner.record_table.reserve();
+        let rec_arc = RecordCell::new(instance, seq, true, Some(index));
+        self.inner.record_table.publish(index, rec_arc.clone());
         // C `createLockRecord` allocates the `lockRecord` INTO the record:
         // the registry's answer for this name is this record's own cell,
         // adopted before the record is reachable by anyone.
-        self.inner.record_locks.adopt(name, rec_arc.lock_record());
+        self.inner.record_locks.adopt(&name, rec_arc.lock_record());
         self.inner
             .records
             .write()
-            .insert(Arc::from(name), rec_arc.clone());
+            .insert(name.clone(), rec_arc.clone());
         // The record is reachable from this line on, so anything its
         // `set_async_context` parked above may now run. This is the only
         // release site because this is the only site that registers the name.
-        self.release_record_inits(name);
+        self.release_record_inits(&name);
 
         if defer {
             // The dset binding, init passes, scan-index insert and the
             // `recGblInitSimm`/`wdogInit` tail are all owed to `ioc_init`. The
-            // record carries that debt itself (`RecordCell::init_owed`, set
-            // from `defer` above), so the barrier finds it by walking the
-            // database it is already going to walk.
+            // record carries that debt itself (`RecordCell::init_owed`), so the
+            // barrier finds it by walking the database it is already going to
+            // walk.
             return Ok(());
         }
 
-        self.add_to_scan_list(scan, phas, record_type, seq, name);
-
-        // Registration is complete and the name is published, so the gate has
-        // nothing left to serialize. It is released HERE, before the tail
-        // below, and that is load-bearing rather than tidy:
-        // `recGblInitSimm` can swap SCAN, and a scan change is applied by
-        // `update_scan_index`, which takes this same `registration_mutex`
-        // itself as the single owner of a scan-index transition. Holding it
-        // across the call is a self-deadlock on a non-reentrant mutex — the
-        // record only has to carry a constant SIML and a periodic SCAN to
-        // reach it.
+        // Outside the LOAD phase — programmatic creation, `dbCreateRecord`
+        // after `iocInit` — there is no barrier to defer to, so the record
+        // pays its debt now, through the barrier's own code. Its pass-1 link
+        // reads take other records' locks, which sit above L46, so the gate
+        // and the lock-set relink go first. Until pass 1 ends the record is
+        // reachable in its LOAD-phase state (UDF, INVALID, PACT 0), as a C
+        // record is between `dbLoadRecords` and `iocInit`; a put landing then
+        // is overwritten by the init that follows it, as there. Unlike C, the
+        // CA server is already up during that window.
         drop(gate);
-
-        // The rest of C's `init_record` pass 1, which needs the record
-        // REGISTERED and so cannot run with `run_init_passes` above:
-        // `recGblInitSimm` plus its `recGblInitConstantLink(&siol, …, &sval)`
-        // (recGbl.c:439-446, from e.g. aiRecord.c:101), then `wdogInit`
-        // (histogramRecord.c:168). C reaches both through `iterateRecords`
-        // (`iocInit.c:562-586`), which visits every record in the database
-        // whatever created it; here they sat on the loader callers instead, so
-        // an inline or `dbCreateRecord` record got neither. Both are no-ops for
-        // a record type that declares no SIMM / no SDEL. Running them outside
-        // the gate is also what C does: `iterateRecords` is a separate pass
-        // over an already-built database, holding no registration lock.
-        self.rec_gbl_init_simm(&rec_arc);
-        self.arm_watchdog(name);
+        drop(relink);
+        self.init_owed_records(vec![(name.clone(), rec_arc.clone())], &|line| {
+            crate::stderr_println!("{line}")
+        });
+        // A record added after `iocInit` initialises its own forward links;
+        // one added before is swept by the barrier.
+        if self.ioc_is_running() {
+            self.open_record_links(&rec_arc);
+            self.init_record_forwards(&rec_arc);
+        }
         Ok(())
     }
 
@@ -3186,19 +3476,75 @@ impl PvDatabase {
         )
     }
 
-    /// Run every record's OWED init — C's `initDatabase` per-record pass — for
-    /// the records the LOAD phase deferred, in database load order.
+    /// Run every record's OWED init — C's `initDatabase` — for the records the
+    /// LOAD phase deferred.
     ///
-    /// The walk is C's `initDatabase` walk: every record, in load order, each
-    /// asked whether its init is still owed. [`RecordCell::claim_owed_init`]
-    /// hands that debt to exactly one caller, so a second call is a no-op —
-    /// the build lifecycle calls this BEFORE `setup_io_intr`, and
-    /// [`Self::ioc_init`] calls it again as a catch-all.
-    pub(crate) fn drain_deferred_record_inits(&self) {
-        for (name, rec_arc) in self.records_in_load_order() {
-            if rec_arc.claim_owed_init() {
-                self.init_deferred_record(&name, &rec_arc);
+    /// C's `initDatabase` is three whole-database walks, `doInitRecord0`, then
+    /// `doResolveLinks`, then `doInitRecord1` (`iocInit.c:576-578`), each in
+    /// `iterateRecords` order, so every pass-0 report precedes every pass-1
+    /// report and a record's pass 1 runs after every record's pass 0.
+    /// [`RecordCell::claim_owed_init`] hands each debt to exactly one caller,
+    /// so a second call is a no-op — the build lifecycle calls this BEFORE
+    /// `setup_io_intr`, and [`Self::ioc_init`] calls it again as a catch-all.
+    ///
+    /// `err` is the building thread's stderr, where aSubRecord.c's epicsStdio
+    /// lines go.
+    pub(crate) fn drain_deferred_record_inits(&self, err: &dyn Fn(&str)) {
+        self.db_init_record_links();
+        let records = self.iterate_records();
+        self.init_owed_records(records.clone(), err);
+        for (_, rec_arc) in &records {
+            self.open_record_links(rec_arc);
+        }
+    }
+
+    /// [`Self::drain_deferred_record_inits`] over `records`: the debt of each
+    /// one this call claims is paid in C's three walks.
+    fn init_owed_records(&self, records: Vec<(RecordName, Arc<RecordCell>)>, err: &dyn Fn(&str)) {
+        let resolver = self.inner.device_support_resolver.load();
+        let owed: Vec<_> = records
+            .into_iter()
+            .filter(|(_, rec_arc)| rec_arc.claim_owed_init())
+            .map(|(name, rec_arc)| {
+                let mut guard = rec_arc.write();
+                let instance = &mut *guard;
+                crate::server::ioc_app::attach_device_support(
+                    instance,
+                    &name.to_str_lossy(),
+                    resolver.as_deref(),
+                );
+                instance.arm_init_subroutines(self.inner.subroutine_registry.load_full());
+                let (reached, owed) = instance.run_init_pass0(&name.to_str_lossy());
+                let guard = self.pay_device_init(&rec_arc, guard, owed, &name.to_str_lossy(), err);
+                // The load has moved the type selectors since the cell was
+                // built, and an `add_record` below may ask this record's `$`.
+                rec_arc.settle_addr_facts(&guard);
+                drop(guard);
+                (name, rec_arc, reached)
+            })
+            .collect();
+        // A record created before any load opens its links at the barrier
+        // ([`Self::drain_deferred_record_inits`]), once its lsets exist.
+        let open_links = !matches!(
+            *self.inner.init_phase.lock().unwrap(),
+            DbInitPhase::Unloaded
+        );
+        for (name, rec_arc, reached) in &owed {
+            if *reached {
+                let add_record_input =
+                    crate::server::builtin_devices::soft_callback::add_record_input_of(
+                        self, rec_arc, None,
+                    );
+                rec_arc
+                    .write()
+                    .run_add_record(&name.to_str_lossy(), add_record_input);
             }
+            if open_links {
+                self.open_record_links(rec_arc);
+            }
+        }
+        for (name, rec_arc, reached) in &owed {
+            self.init_deferred_record(name, rec_arc, *reached, err);
         }
     }
 
@@ -3207,16 +3553,15 @@ impl PvDatabase {
     /// merge arm of the iocsh loader uses this to tell a record it must init in
     /// place (created before the load, already live) from one the barrier will
     /// init against the final merged fields.
-    pub(crate) fn record_init_deferred(&self, name: &str) -> bool {
+    pub(crate) fn record_init_deferred(&self, name: &[u8]) -> bool {
         self.get_record(name).is_some_and(|rec| rec.init_owed())
     }
 
-    /// Run the OWED init half of [`Self::add_loaded_record`] for a record whose
-    /// creation was deferred to `iocInit` (the LOAD-phase arm). The record is
-    /// already published, its `.db` load applied and its load-order sequence
-    /// assigned; what runs here is C's `doInitRecord0`/`init_record` half —
-    /// bind the dset, arm subroutines, run the passes, seed constant links —
-    /// then the scan-index insert, the `recGblInitSimm`/`wdogInit` tail, and
+    /// Run the rest of the OWED init half of [`Self::add_loaded_record`] for a
+    /// record whose creation was deferred to `iocInit` (the LOAD-phase arm),
+    /// once [`Self::drain_deferred_record_inits`] has run pass 0 and
+    /// `add_record` over every owed record: pass 1 when pass 0 `reached` the
+    /// record's body, the constant-link seed, then the scan-index insert, the `recGblInitSimm`/`wdogInit` tail, and
     /// the checkLinks / constant-INP seed the two loaders used to run right
     /// after `add_loaded_record`. All in the same order the eager path ran them
     /// across `add_loaded_record` and its caller.
@@ -3230,18 +3575,23 @@ impl PvDatabase {
     /// `recGblInitSimm` reaches `update_scan_index`, which takes the gate
     /// itself, so it runs after the write lock is dropped, exactly as the eager
     /// arm runs it after its `drop(gate)`.
-    fn init_deferred_record(&self, name: &str, rec_arc: &Arc<RecordCell>) {
+    fn init_deferred_record(
+        &self,
+        name: &RecordName,
+        rec_arc: &Arc<RecordCell>,
+        reached: bool,
+        err: &dyn Fn(&str),
+    ) {
+        let mut init_reads = reached.then(|| self.read_init_links(rec_arc));
         let (scan, phas, record_type) = {
             let mut guard = rec_arc.write();
+            if let Some(reads) = &mut init_reads {
+                let owed = guard.run_init_pass1(&name.to_str_lossy(), reads, err);
+                guard = self.pay_device_init(rec_arc, guard, owed, &name.to_str_lossy(), err);
+            }
             let instance = &mut *guard;
-            crate::server::ioc_app::attach_device_support(
-                instance,
-                name,
-                self.inner.device_support_resolver.load().as_deref(),
-            );
-            instance.arm_init_subroutines(self.inner.subroutine_registry.load_full());
-            instance.run_init_passes(name);
             super::database::processing::seed_constant_links(instance);
+            rec_arc.settle_addr_facts(instance);
             (
                 instance.common.scan,
                 instance.common.phas,
@@ -3264,6 +3614,77 @@ impl PvDatabase {
         self.rec_gbl_init_constant_links(rec_arc);
     }
 
+    /// Run the dset init an init pass left owed with `guard`'s borrow let go
+    /// and the record lent through an [`InitHold`], as a cycle lends it
+    /// around `read_begin`, then the rest of that pass; hand the borrow back.
+    /// With nothing owed, `guard` is returned as it is.
+    pub(crate) fn pay_device_init<'r>(
+        &self,
+        rec: &'r Arc<RecordCell>,
+        guard: crate::server::record::RecordMut<'r>,
+        owed: Option<crate::server::device_support::OwedDeviceInit>,
+        name: &str,
+        err: &dyn Fn(&str),
+    ) -> crate::server::record::RecordMut<'r> {
+        let Some(mut owed) = owed else {
+            return guard;
+        };
+        drop(guard);
+        {
+            let _init = InitPass::enter();
+            let outcome = owed.init_held(&mut InitHold::new(self, rec));
+            let gate = FrameGate::of_instance(self, rec);
+            let frame = gate.frame(rec);
+            let mut instance = frame.write();
+            owed.finish(&mut instance, outcome, name, err);
+            field_io::emit_cycle_posts(&mut instance);
+        }
+        rec.write()
+    }
+
+    /// The answers to `rec_arc`'s [`Record::init_link_reads`], read with no
+    /// lock of its own held, so a link to the record itself reads it too.
+    ///
+    /// [`Record::init_link_reads`]: crate::server::record::Record::init_link_reads
+    pub(crate) fn read_init_links(
+        &self,
+        rec_arc: &Arc<RecordCell>,
+    ) -> crate::server::record::InitLinkReads {
+        let links: Vec<_> = {
+            let instance = rec_arc.read();
+            instance
+                .record
+                .init_link_reads()
+                .iter()
+                .map(|&(field, read_as)| {
+                    // The link the record holds; a field that is not one of
+                    // its links is read from its text.
+                    let held = instance.stored_link_shared(field).cloned();
+                    let text = held.is_none().then(|| instance.link_text(field)).flatten();
+                    (field, text, read_as, held)
+                })
+                .collect()
+        };
+        crate::server::record::InitLinkReads::new(
+            links
+                .into_iter()
+                .map(|(field, text, read_as, held)| {
+                    let read = match held {
+                        Some(link) => self.read_link_at_init(rec_arc, &link, read_as),
+                        None => self.read_link_at_init(
+                            rec_arc,
+                            &crate::server::record::parse_link_v2(
+                                text.as_ref().map_or(&b""[..], |t| t.as_bytes()),
+                            ),
+                            read_as,
+                        ),
+                    };
+                    (field, read)
+                })
+                .collect(),
+        )
+    }
+
     /// Verify that `name` is not currently registered in any of the
     /// three namespaces. Caller MUST hold `registration_mutex` so the
     /// peek-then-insert sequence is atomic — without that, two tasks
@@ -3273,8 +3694,8 @@ impl PvDatabase {
     /// makes no suspension point inside the `registration_mutex` hold — which
     /// is what lets that gate become a `PriorityInheritanceMutex` whose `!Send`
     /// guard may not cross an `.await`.
-    fn check_name_free(&self, name: &str) -> CaResult<()> {
-        let kind = if self.inner.simple_pvs.lock().contains_key(name) {
+    fn check_name_free(&self, name: &[u8]) -> CaResult<()> {
+        let kind = if self.simple_pv_named(name) {
             Some("simple PV")
         } else if self.inner.records.read().contains_key(name) {
             Some("record")
@@ -3287,7 +3708,10 @@ impl PvDatabase {
             return Err(CaError::DbParseError {
                 line: 0,
                 token: String::new(),
-                message: format!("name '{name}' is already registered as a {kind}"),
+                message: format!(
+                    "name '{}' is already registered as a {kind}",
+                    String::from_utf8_lossy(name)
+                ),
             });
         }
         Ok(())
@@ -3303,7 +3727,8 @@ impl PvDatabase {
     /// Live subscribers on the removed record drop their `Sender` clone
     /// when the `RecordInstance` is dropped — they observe `Closed` on
     /// next recv, matching the existing dbEvent cancel flow.
-    pub async fn remove_record(&self, name: &str) -> bool {
+    pub async fn remove_record(&self, name: impl AsRef<[u8]>) -> bool {
+        let name = name.as_ref();
         // C `dbDeleteRecord` frees the record's `lockRecord`, so the set it
         // was in loses a member and may fall apart into several. Declared
         // first so it drops last: the relink runs once the record is out of
@@ -3327,7 +3752,7 @@ impl PvDatabase {
     /// [`Self::remove_record`] under its gates: the entry out of every map
     /// and index, the record destroyed. The removed cell, for the sweep the
     /// caller runs once the gates are down.
-    fn remove_record_entry(&self, name: &str) -> Option<Arc<RecordCell>> {
+    fn remove_record_entry(&self, name: &[u8]) -> Option<Arc<RecordCell>> {
         // The record's data — its SCAN for the index sweep, `destroy()` at
         // the end — is behind its lock set, which is taken ABOVE L46 in the
         // acquisition order. So the set is taken first, off the handle, and
@@ -3348,27 +3773,15 @@ impl PvDatabase {
                 break (rec_arc, record_gate, gate);
             }
         };
-        // 1) Remove from main map; keep scan + phas for scan-index cleanup.
+        // 1) Remove from main map.
         self.inner.records.write().remove(name);
-        let scan = {
-            let inst = rec_arc.read();
-            inst.common.scan
-        };
 
-        // 2) Drop from scan index if it was scheduled.
-        self.delete_from_scan_list(scan, name);
+        // 2) Drop the CP/CPP edges the record held.
+        self.inner
+            .external_cp_links
+            .update(|cp| cp.remove_record(name));
 
-        // 3) Drop from CP-link tables. Removed both as source (channel
-        // change → trigger targets) and as target (other channels'
-        // CP lists may still reference this name).
-        self.inner.cp_links.update(|cp| {
-            cp.remove(name);
-            for targets in cp.values_mut() {
-                targets.retain(|t| t.record != name);
-            }
-        });
-
-        // 4) Purge aliases that pointed AT the
+        // 3) Purge aliases that pointed AT the
         // removed record. Otherwise `find_pv("ALT")` returns None
         // (target gone) but `add_pv("ALT", ...)` still fails with
         // "already registered as an alias" — orphan blocks reuse.
@@ -3378,19 +3791,29 @@ impl PvDatabase {
         self.inner
             .aliases
             .write()
-            .retain(|_alias, node| node.target != name);
+            .retain(|_alias, node| *node.target != *name);
 
-        // Same rule as `remove_simple_pv`: removal IS destruction. The
-        // record's own `Arc` outlives the map entry for as long as a CA
-        // channel holds it, so without the mark a downstream monitor would
-        // keep serving a record the database no longer has.
-        rec_arc.write().destroy();
-        self.signal_destroyed();
+        self.destroy_record(&rec_arc, name);
         Some(rec_arc)
     }
 
+    /// The finalizer of a removed record, and the only one: the record
+    /// table keeps the cell for the IOC's life (C never frees a record), so
+    /// what a dropped cell used to let go of — its scan-list key, monitors,
+    /// lent link addresses, queued put-notifies — is released here.
+    ///
+    /// Same rule as `remove_simple_pv`: removal IS destruction. The cell
+    /// outlives the map entry, so without the mark a downstream monitor or a
+    /// bound forward would keep serving a record the database no longer has.
+    fn destroy_record(&self, rec: &RecordCell, name: &[u8]) {
+        let scan = rec.read().common.scan;
+        self.delete_from_scan_list(scan, name);
+        rec.write().destroy();
+        self.signal_destroyed();
+    }
+
     /// Internal: synchronous lookup without invoking the search resolver.
-    async fn find_entry_no_resolve(&self, name: &str) -> Option<PvEntry> {
+    async fn find_entry_no_resolve(&self, name: &[u8]) -> Option<PvEntry> {
         // a channel name may carry a `.{"arr":...}` filter
         // suffix. Strip it before lookup — the suffix is a per-channel
         // filter spec, not part of the PV identity. `split_channel_name`
@@ -3408,7 +3831,7 @@ impl PvDatabase {
             .inner
             .simple_pvs
             .lock()
-            .get(record_path.as_str())
+            .get(record_path.as_slice())
             .cloned();
         if let Some(pv) = simple {
             return Some(PvEntry::Simple(pv));
@@ -3420,7 +3843,7 @@ impl PvDatabase {
         // to a canonical record name. Look up the real record after
         // translating the base.
         if let Some(target) = self.alias_target(base) {
-            if let Some(rec) = self.inner.records.read().get(target.as_str()) {
+            if let Some(rec) = self.inner.records.read().get(&*target) {
                 return Some(PvEntry::Record(rec.clone()));
             }
         }
@@ -3439,7 +3862,12 @@ impl PvDatabase {
     /// simple PV or the alias-mapped record depending on lookup
     /// order. Now we run the same cross-namespace `check_name_free`
     /// guard the other add_* paths use.
-    pub async fn add_alias(&self, alias: &str, target: &str) -> CaResult<()> {
+    pub async fn add_alias(
+        &self,
+        alias: impl AsRef<[u8]>,
+        target: impl AsRef<[u8]>,
+    ) -> CaResult<()> {
+        let (alias, target) = (alias.as_ref(), target.as_ref());
         // A link naming `alias` resolved to nothing until now, so the alias
         // can turn a dangling link into a real edge and merge two sets.
         // Declared above the gate so the relink, which takes lock sets, runs
@@ -3448,7 +3876,8 @@ impl PvDatabase {
         let _gate = self.lock_registration("add_alias");
         if !self.inner.records.read().contains_key(target) {
             return Err(CaError::ChannelNotFound(format!(
-                "alias target '{target}' is not a registered record"
+                "alias target '{}' is not a registered record",
+                String::from_utf8_lossy(target)
             )));
         }
         self.check_name_free(alias)?;
@@ -3462,9 +3891,9 @@ impl PvDatabase {
             .load_order_counter
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.inner.aliases.write().insert(
-            alias.to_string(),
+            RecordName::from(alias),
             AliasNode {
-                target: target.to_string(),
+                target: RecordName::from(target),
                 order,
             },
         );
@@ -3482,15 +3911,52 @@ impl PvDatabase {
         self.inner.breaktable_registry.load_full()
     }
 
+    /// Declare and bind the JSON link type `key`: the binary's own `link()`
+    /// line and its `registryJLinkAdd`, ahead of any `.db` this database
+    /// loads. It appends: C's expanded `.dbd` sorts by jlif
+    /// (`DBD/Output.pm:92-95`), which puts pvxs's `lsetPVX` after every base
+    /// `lnk…If` (pvxs 1.5.3 `softIocPVX.dbd:18997-19002`). Reached only
+    /// through `register_link_type`, which carries the type's link set too.
+    ///
+    /// # Panics
+    ///
+    /// When this port implements no JSON link type `key`: a declaration names a
+    /// jlif the binary carries, and there is none to carry.
+    pub(crate) fn declare_link_type(&self, key: &str) {
+        let jlif = crate::server::record::implemented_jlif(key)
+            .unwrap_or_else(|| panic!("this port implements no JSON link type '{key}'"));
+        self.inner.link_list.update(|list| {
+            list.declare(key, jlif);
+            list.bind(key);
+        });
+    }
+
+    /// The `link()` lines one `dbLoadDatabase` read, through C's
+    /// `dbLinkType`, which declares and binds nothing: support is bound only
+    /// by registration (`registryJLinks.c:16-23`), so a loaded
+    /// `link("pva", "lsetPVX")` leaves `{pva:…}` refused as not loaded.
+    pub(crate) fn add_loaded_link_types(&self, types: &[crate::server::db_loader::DbdLinkType]) {
+        self.inner.link_list.update(|list| {
+            for t in types.iter().filter(|t| !t.key.is_empty()) {
+                list.declare(&t.key, &t.lset);
+            }
+        });
+    }
+
+    /// This database's `linkList`, as a lock-free snapshot.
+    pub(crate) fn link_list(&self) -> arc_swap::Guard<Arc<crate::server::record::LinkList>> {
+        self.inner.link_list.load()
+    }
+
     /// Resolve an alias to its target record name, or `None` when the
     /// name is not an alias.
-    pub fn resolve_alias(&self, name: &str) -> Option<String> {
-        self.alias_target(name)
+    pub fn resolve_alias(&self, name: impl AsRef<[u8]>) -> Option<RecordName> {
+        self.alias_target(name.as_ref())
     }
 
     /// The record name the alias node `name` points at, or `None` when the
     /// name is not an alias. The one reader of an alias node's target.
-    fn alias_target(&self, name: &str) -> Option<String> {
+    fn alias_target(&self, name: &[u8]) -> Option<RecordName> {
         self.inner
             .aliases
             .read()
@@ -3498,100 +3964,154 @@ impl PvDatabase {
             .map(|node| node.target.clone())
     }
 
-    /// Queue an iocsh command line for post-PINI execution.
-    /// Mirrors epics-base PR #558 — `afterIocRunning <command>` lets
-    /// the startup script schedule actions that run after iocInit
-    /// completes (when the record set is fully wired up).
-    pub fn queue_after_ioc_running(&self, line: impl Into<String>) {
-        self.inner
-            .after_ioc_running
-            .lock()
-            .unwrap()
-            .push(line.into());
+    /// Queue an `afterIocRunning` line for the `iocRun` that ends `iocInit`.
+    pub fn queue_after_ioc_running(
+        &self,
+        line: impl Into<Vec<u8>>,
+    ) -> Result<(), AfterIocRunningRefusal> {
+        match &mut *self.inner.after_ioc_running.lock().unwrap() {
+            AfterIocRunning::Ran => Err(AfterIocRunningRefusal::AfterIocInit),
+            AfterIocRunning::Queuing(queue) => {
+                let line = line.into();
+                if line.is_empty() {
+                    return Err(AfterIocRunningRefusal::Empty);
+                }
+                queue.push_back(line);
+                Ok(())
+            }
+        }
     }
 
-    /// Drain the post-PINI iocsh command queue. Called by
-    /// `IocApplication::run` after PINI processing.
-    pub fn take_after_ioc_running(&self) -> Vec<String> {
-        std::mem::take(&mut *self.inner.after_ioc_running.lock().unwrap())
+    /// C `afterIocRunningHook` (`afterIocRunning.c:46-55`): each queued line
+    /// to `run` in order — a line one of them queues as well — then the queue
+    /// closed, as `initEndFlag = 1` closes it.
+    pub fn drain_after_ioc_running(&self, mut run: impl FnMut(Vec<u8>)) {
+        loop {
+            let next = match &mut *self.inner.after_ioc_running.lock().unwrap() {
+                AfterIocRunning::Queuing(queue) => queue.pop_front(),
+                AfterIocRunning::Ran => None,
+            };
+            let Some(line) = next else { break };
+            run(line);
+        }
+        *self.inner.after_ioc_running.lock().unwrap() = AfterIocRunning::Ran;
     }
 
-    /// Internal: synchronous existence check without resolver.
-    fn has_name_no_resolve(&self, name: &str) -> bool {
-        // strip the channel-filter suffix before lookup so a
-        // filtered channel (`SP.{"arr":...}` / `REC.{"dbnd":{"d":0.5}}`)
-        // resolves to its underlying PV at UDP-search time. This is the
-        // search-side twin of `find_entry_no_resolve`; without it a
-        // filtered SimplePv never answers a SEARCH and the client never
-        // reaches CREATE_CHAN. See that function for the full rationale.
-        let record_path = filters::split_channel_name(name).record_path;
-        if self
-            .inner
-            .simple_pvs
-            .lock()
-            .contains_key(record_path.as_str())
-        {
+    /// C `dbDbInitLink`'s `dbChannelCreate` succeeding (`dbDbLink.c:94`): a
+    /// local record that names `field`. Otherwise `dbInitLink` falls through
+    /// to CA (`dbLink.c:128`), `SRC.desc` and `SRC.NOSUCH` alike. Registry
+    /// facts only, as the holder may be held while this is asked.
+    pub(crate) fn has_db_link_target(&self, record: &[u8], field: &str) -> bool {
+        if self.simple_pv_named(record) {
             return true;
         }
-        // C's search-side test is `dbChannelTest` (`dbChannel.c:441-464`),
-        // which resolves the FIELD too — `REC.NOSUCH` answers "does not
-        // exist" rather than drawing the client into a CREATE_CHAN it must
-        // then refuse (pvxs#193). Validate an explicit suffix; a bare name
-        // binds `VAL`, which every record type declares, so the record's
-        // existence alone answers it — that also keeps this function
-        // lock-free per record for the DB-link locality callers, which
-        // pass suffix-less record names.
-        let (base, explicit_field) = match record_path.rsplit_once('.') {
-            Some((base, field)) => (base, Some(field)),
-            None => (record_path.as_str(), None),
+        self.record_or_alias(record)
+            .is_some_and(|rec| self.names_field(&rec, field))
+    }
+
+    /// `dbChannelCreate`'s field half for `rec`: `pvNameLookup` finds `field`
+    /// (`dbChannel.c:313-330`) and, with the `$` modifier, the field takes it
+    /// (`dbChannel.c:486-503`). A declared `DBF_NOACCESS` name is found, as
+    /// `dbNameToAddr` finds `MLOK`. Registry facts only: the search side and
+    /// a caller under a put gate ask it, so it takes no record lock.
+    pub(crate) fn channel_field_found(
+        &self,
+        rec: &RecordCell,
+        field: &str,
+        string_view: bool,
+    ) -> bool {
+        if !string_view {
+            return self.names_field(rec, field);
+        }
+        let addr = crate::server::record::record_instance::FieldAddr::resolve_in(rec, field);
+        filters::spells_a_field(field)
+            && match addr.desc {
+                Some(d) => rec.takes_string_view(d),
+                None if addr.declared => false,
+                // `dbGetAttributePart`'s descriptor is a `DBF_STRING`.
+                None => self.has_record_type_attribute(rec.rdes().record_type, field),
+            }
+    }
+
+    /// `dbNameToAddr`'s field half for `rec`: a declared name, else an
+    /// attribute (`dbGetAttributePart`), both compared as written.
+    pub(crate) fn names_field(&self, rec: &RecordCell, field: &str) -> bool {
+        rec.declares_name(field) || self.has_record_type_attribute(rec.rdes().record_type, field)
+    }
+
+    /// Synchronous existence check without resolver, taking no record lock:
+    /// a simple PV, or a channel [`Self::channel_test`] finds.
+    pub fn has_name_no_resolve(&self, name: &[u8]) -> bool {
+        // A filtered simple PV (`SP.{"arr":...}`) answers by its base name.
+        self.simple_pv_named(&filters::split_channel_name(name).record_path)
+            || self.channel_test(name)
+    }
+
+    /// C `dbChannelTest` (`dbChannel.c:331-342`), records and aliases only,
+    /// taking no record lock so an lset's [`LinkSet::open_link`] may ask it
+    /// under a put's hold: the record name up to the first `.`, then the
+    /// field name's identifier prefix (`dbStaticLib.c:1800-1802`); what
+    /// follows is not read, so `R.VAL$garbage` is found and refused at
+    /// create.
+    pub fn channel_test(&self, name: &[u8]) -> bool {
+        let (base, rest) = match name.iter().position(|&b| b == b'.') {
+            Some(dot) => (&name[..dot], &name[dot + 1..]),
+            None => (name, &b""[..]),
         };
-        let rec = self.inner.records.read().get(base).cloned().or_else(|| {
-            // Alias entry exists and points to a live record
-            // (epics-base PR #336).
-            let target = self.alias_target(base);
-            target.and_then(|t| self.inner.records.read().get(t.as_str()).cloned())
-        });
-        let Some(rec) = rec else {
+        let Some(rec) = self.record_or_alias(base) else {
+            return false;
+        };
+        let len = match rest.first() {
+            Some(c) if c.is_ascii_alphabetic() || *c == b'_' => rest
+                .iter()
+                .position(|c| !(c.is_ascii_alphanumeric() || *c == b'_'))
+                .unwrap_or(rest.len()),
+            // An absent field name binds `VAL`.
+            _ => return true,
+        };
+        // The identifier prefix is ASCII by construction.
+        self.names_field(&rec, std::str::from_utf8(&rest[..len]).unwrap_or_default())
+    }
+
+    fn record_or_alias(&self, name: &[u8]) -> Option<Arc<RecordCell>> {
+        self.inner.records.read().get(name).cloned().or_else(|| {
+            let target = self.alias_target(name);
+            target.and_then(|t| self.inner.records.read().get(&*t).cloned())
+        })
+    }
+
+    fn simple_pv_named(&self, name: &[u8]) -> bool {
+        self.inner.simple_pvs.lock().contains_key(name)
+    }
+
+    /// The simple PV registered as `name`.
+    pub(crate) fn simple_pv_bytes(&self, name: &[u8]) -> Option<Arc<ProcessVariable>> {
+        self.inner.simple_pvs.lock().get(name).cloned()
+    }
+
+    /// `dbChannelCreate`'s existence half, which also judges the `$`
+    /// modifier against the field (`dbChannel.c:486-503`); the search side,
+    /// `dbChannelTest`, does not.
+    pub(crate) fn channel_create_found(&self, name: &[u8]) -> bool {
+        // A filtered channel (`REC.{"dbnd":{"d":0.5}}`) resolves to its
+        // underlying PV, as in `find_entry_no_resolve`.
+        let record_path = filters::split_channel_name(name).record_path;
+        if self.simple_pv_named(&record_path) {
+            return true;
+        }
+        let (base, explicit_field) = match record_path.iter().rposition(|&b| b == b'.') {
+            Some(dot) => (&record_path[..dot], Some(parse_pv_name(&record_path).1)),
+            None => (record_path.as_slice(), None),
+        };
+        let Some(rec) = self.record_or_alias(base) else {
             return false;
         };
         let Some(field) = explicit_field else {
             return true;
         };
-        let instance = rec.read();
-        // Trailing `$` is the long-string modifier, part of the channel
-        // syntax (`dbChannel.c:486-505`): eligible only on a `DBF_STRING`
-        // or link field, and `dbChannelTest` refuses it anywhere else.
         match field.strip_suffix('$') {
-            Some(core) => instance
-                .resolve_string_view_field(&core.to_ascii_uppercase())
-                .is_some(),
-            None => {
-                // Existence is the DECLARED-name question, not the
-                // has-a-value question: `dbNameToAddr` resolves any field
-                // the `.dbd` declares — including `DBF_NOACCESS` ones like
-                // `MLOK` — so pvxs answers the SEARCH for them and refuses
-                // at CREATE instead (measured against `softIocPVX`:
-                // `pvxget ORACLE:AI.MLOK` → `Refused to create Channel`).
-                // Three name sources, matching the port's field model:
-                // `resolve_field` (valued fields, incl. common/virtual ones
-                // like `RTYP`/`TIME` that C answers from dbStaticLib),
-                // `field_desc` (declared-but-valueless record fields), and
-                // the `DBF_NOACCESS` internals the generated tables drop —
-                // record-own (`BPTR`, from `record_noaccess_fields`) and
-                // `dbCommon` (`MLOK`) alike.
-                let upper = field.to_ascii_uppercase();
-                instance.resolve_field(&upper).is_some()
-                    || instance.field_desc(&upper).is_some()
-                    || instance.resolves_noaccess_name(&upper)
-                    // ... and the record type's attributes, which
-                    // `pvNameLookup` reaches through `dbGetAttributePart`
-                    // once the declared list has missed
-                    // (`dbChannel.c:326-327`). Shadowing needs no test
-                    // here: a declared name has already answered above.
-                    || self
-                        .record_type_attribute(instance.record.record_type(), &upper)
-                        .is_some()
-            }
+            Some(core) => self.channel_field_found(&rec, core, true),
+            None => self.names_field(&rec, field),
         }
     }
 
@@ -3600,7 +4120,7 @@ impl PvDatabase {
     /// If the name is not found and a search resolver is installed,
     /// the resolver is invoked once. If the resolver returns true, the
     /// database is re-checked.
-    pub async fn find_entry(&self, name: &str) -> Option<PvEntry> {
+    pub async fn find_entry(&self, name: impl AsRef<[u8]>) -> Option<PvEntry> {
         self.find_entry_from(name, None).await
     }
 
@@ -3610,9 +4130,10 @@ impl PvDatabase {
     /// host-scoped `.pvlist` admission.
     pub async fn find_entry_from(
         &self,
-        name: &str,
+        name: impl AsRef<[u8]>,
         peer: Option<std::net::SocketAddr>,
     ) -> Option<PvEntry> {
+        let name = name.as_ref();
         if let Some(entry) = self.find_entry_no_resolve(name).await {
             // A cached simple PV must still pass the per-request
             // existence gate (CA gateway host/state admission). When the
@@ -3627,11 +4148,8 @@ impl PvDatabase {
             return Some(entry);
         }
         // Try the search resolver
-        let resolver = self.inner.search_resolver.load_full().map(|r| (*r).clone());
-        if let Some(r) = resolver {
-            if r(name.to_string(), peer).await {
-                return self.find_entry_no_resolve(name).await;
-            }
+        if self.search_resolver_admits(name, peer).await {
+            return self.find_entry_no_resolve(name).await;
         }
         None
     }
@@ -3642,7 +4160,7 @@ impl PvDatabase {
     /// the resolver is invoked. The resolver may populate the database
     /// (e.g., subscribe to an upstream IOC and add a placeholder PV) and
     /// return true; this method then re-checks.
-    pub async fn has_name(&self, name: &str) -> bool {
+    pub async fn has_name(&self, name: impl AsRef<[u8]>) -> bool {
         self.has_name_from(name, None).await
     }
 
@@ -3650,7 +4168,12 @@ impl PvDatabase {
     /// socket address into the search resolver. The CA UDP search
     /// responder passes the datagram source address so the gateway can
     /// apply host-scoped `.pvlist` admission.
-    pub async fn has_name_from(&self, name: &str, peer: Option<std::net::SocketAddr>) -> bool {
+    pub async fn has_name_from(
+        &self,
+        name: impl AsRef<[u8]>,
+        peer: Option<std::net::SocketAddr>,
+    ) -> bool {
+        let name = name.as_ref();
         if self.has_name_no_resolve(name) {
             // Same per-request gate as `find_entry_from`: a cached simple
             // PV the gateway's host/state admission denies must answer
@@ -3660,18 +4183,27 @@ impl PvDatabase {
             }
             return true;
         }
-        let resolver = self.inner.search_resolver.load_full().map(|r| (*r).clone());
-        if let Some(r) = resolver {
-            if r(name.to_string(), peer).await {
-                return self.has_name_no_resolve(name);
-            }
+        if self.search_resolver_admits(name, peer).await {
+            return self.has_name_no_resolve(name);
         }
         false
     }
 
+    /// Ask the installed [`SearchResolver`] to make `name` resolvable.
+    async fn search_resolver_admits(
+        &self,
+        name: &[u8],
+        peer: Option<std::net::SocketAddr>,
+    ) -> bool {
+        let Some(resolver) = self.inner.search_resolver.load_full().map(|r| (*r).clone()) else {
+            return false;
+        };
+        resolver(name.into(), peer).await
+    }
+
     /// Look up a simple PV by name (backward-compatible).
-    pub async fn find_pv(&self, name: &str) -> Option<Arc<ProcessVariable>> {
-        self.inner.simple_pvs.lock().get(name).cloned()
+    pub fn find_pv(&self, name: impl AsRef<[u8]>) -> Option<Arc<ProcessVariable>> {
+        self.inner.simple_pvs.lock().get(name.as_ref()).cloned()
     }
 
     /// Get a record Arc by name. Alias-aware (epics-base PR #336):
@@ -3684,16 +4216,17 @@ impl PvDatabase {
     /// Use [`Self::get_record_no_resolve`] when the caller already
     /// holds a canonical name and wants to suppress the alias path
     /// (e.g. to detect alias collisions during builder wiring).
-    pub fn get_record(&self, name: &str) -> Option<Arc<RecordCell>> {
+    pub fn get_record(&self, name: impl AsRef<[u8]>) -> Option<Arc<RecordCell>> {
+        let name = name.as_ref();
         if let Some(rec) = self.inner.records.read().get(name).cloned() {
             return Some(rec);
         }
         let target = self.alias_target(name)?;
-        self.inner.records.read().get(target.as_str()).cloned()
+        self.inner.records.read().get(&*target).cloned()
     }
 
     /// The record behind `name` AND the canonical name it is registered
-    /// under — the one place a caller's `&str` becomes the shared `Arc<str>`
+    /// under — the one place a caller's name becomes the shared [`RecordName`]
     /// that a process chain then carries from hop to hop.
     ///
     /// The records map is asked first and the alias table only on a miss. A
@@ -3709,7 +4242,11 @@ impl PvDatabase {
     /// [`Self::get_record`] is (epics-base PR #336) — and the name it returns
     /// for an alias is the TARGET's, which is what `visited` must key on if
     /// alias and canonical are not to count as two different records.
-    pub(crate) fn lookup_record(&self, name: &str) -> Option<(Arc<str>, Arc<RecordCell>)> {
+    pub(crate) fn lookup_record(
+        &self,
+        name: impl AsRef<[u8]>,
+    ) -> Option<(RecordName, Arc<RecordCell>)> {
+        let name = name.as_ref();
         {
             let records = self.inner.records.read();
             if let Some((canonical, rec)) = records.get_key_value(name) {
@@ -3718,15 +4255,22 @@ impl PvDatabase {
         }
         let target = self.alias_target(name)?;
         let records = self.inner.records.read();
-        let (canonical, rec) = records.get_key_value(target.as_str())?;
+        let (canonical, rec) = records.get_key_value(&*target)?;
         Some((canonical.clone(), rec.clone()))
+    }
+
+    /// The record registered at `index` — a removed one too, which its own
+    /// `is_destroyed` refuses.
+    #[inline(always)]
+    pub(crate) fn record_at(&self, index: RecordIdx) -> Option<&Arc<RecordCell>> {
+        self.inner.record_table.get(index)
     }
 
     /// Strict variant of [`Self::get_record`] — does NOT consult the
     /// alias table. Returns `Some` only when a canonical record with
     /// that exact name exists.
-    pub fn get_record_no_resolve(&self, name: &str) -> Option<Arc<RecordCell>> {
-        self.inner.records.read().get(name).cloned()
+    pub fn get_record_no_resolve(&self, name: impl AsRef<[u8]>) -> Option<Arc<RecordCell>> {
+        self.inner.records.read().get(name.as_ref()).cloned()
     }
 
     /// Every record name, in **database load order** — the single owner of
@@ -3754,19 +4298,37 @@ impl PvDatabase {
     /// scan-index's secondary sort key), so this ordering and the scan lists'
     /// ordering are the same fact, not two. A record cannot be missing one: it
     /// is a field of its cell, set where the cell is built.
-    pub async fn all_record_names(&self) -> Vec<String> {
+    pub fn all_record_names(&self) -> Vec<RecordName> {
         // One map, one guard: the sequence travels with the record, so the
         // snapshot and the sort key come from the same read and there is no
         // second structure to order a lock against.
-        let mut names: Vec<(u64, String)> = {
+        let mut names: Vec<(u64, RecordName)> = {
             let records = self.inner.records.read();
             records
                 .iter()
-                .map(|(name, rec)| (rec.load_order(), name.to_string()))
+                .map(|(name, rec)| (rec.load_order(), name.clone()))
                 .collect()
         };
         names.sort_unstable();
         names.into_iter().map(|(_order, name)| name).collect()
+    }
+
+    /// C's `iterateRecords` (`iocInit.c:484-505`): type-major over
+    /// `recordTypeList`, which is name-sorted (see `ScanKey::record_type`),
+    /// each type's records in load order (`dbStaticLib.c:1446`). An `iocInit`
+    /// pass that prints walks this, so its lines come out in C's order.
+    pub(crate) async fn iterate_record_names(&self) -> Vec<RecordName> {
+        let mut names: Vec<(&'static str, RecordName)> = self
+            .all_record_names()
+            .into_iter()
+            .filter_map(|name| {
+                let record_type = self.get_record(&name)?.read().record.record_type();
+                Some((record_type, name))
+            })
+            .collect();
+        // Stable, so load order holds within a type.
+        names.sort_by_key(|(record_type, _)| *record_type);
+        names.into_iter().map(|(_, name)| name).collect()
     }
 
     /// Every node C's `dbFirstRecord` / `dbNextRecord` walk visits — the
@@ -3792,7 +4354,7 @@ impl PvDatabase {
                     (
                         rec.load_order(),
                         DbNode {
-                            name: name.to_string(),
+                            name: name.clone(),
                             alias_of: None,
                         },
                     )
@@ -3822,7 +4384,7 @@ impl PvDatabase {
     /// Mirrors the alias-half of base's `dbFirstRecord` iteration —
     /// `dbgrep` / `dbglob` / `dbsr` walk both record names and
     /// aliases when matching a glob.
-    pub fn all_alias_names(&self) -> Vec<String> {
+    pub fn all_alias_names(&self) -> Vec<RecordName> {
         self.inner.aliases.read().keys().cloned().collect()
     }
 
@@ -3830,12 +4392,13 @@ impl PvDatabase {
     /// stable output; empty when the record has no aliases. Used by
     /// `dbpr` to surface alias-form names so admins can see how
     /// clients may reach the record.
-    pub fn aliases_for_record(&self, canonical: &str) -> Vec<String> {
+    pub fn aliases_for_record(&self, canonical: impl AsRef<[u8]>) -> Vec<RecordName> {
+        let canonical = canonical.as_ref();
         let aliases = self.inner.aliases.read();
-        let mut hits: Vec<String> = aliases
+        let mut hits: Vec<RecordName> = aliases
             .iter()
             .filter_map(|(alias, node)| {
-                if node.target == canonical {
+                if *node.target == *canonical {
                     Some(alias.clone())
                 } else {
                     None
@@ -3847,7 +4410,7 @@ impl PvDatabase {
     }
 
     /// Get all simple PV names.
-    pub async fn all_simple_pv_names(&self) -> Vec<String> {
+    pub fn all_simple_pv_names(&self) -> Vec<RecordName> {
         self.inner.simple_pvs.lock().keys().cloned().collect()
     }
 }
@@ -3910,6 +4473,26 @@ mod channel_view_door_tests {
 mod tests {
     use super::*;
 
+    /// C lists one lock of what `PvDatabase` holds directly, `dbPvd`'s
+    /// (`dbPvdLib.c:119`): the registration gate and the attribute writer
+    /// have no C mutex, so every entry this file creates is `simple_pvs`'.
+    #[test]
+    fn the_database_lists_only_its_dbpvd_lock() {
+        let db = PvDatabase::new();
+        let shown = crate::runtime::sync::mutex_report(false).shown;
+        let pvd = db.inner.simple_pvs.registered_addr();
+        let pvd_line = shown
+            .iter()
+            .find(|e| e.addr() == pvd)
+            .expect("simple_pvs is listed")
+            .line();
+        let extra: Vec<_> = shown
+            .iter()
+            .filter(|e| e.file() == file!() && e.line() != pvd_line)
+            .collect();
+        assert!(extra.is_empty(), "{extra:?}");
+    }
+
     /// C `recGblGetTimeStampSimm` (recGbl.c:310-343) maps TSE values
     /// to epicsTime sources via the constants in `epicsTime.h:102-104`.
     /// The Rust port previously misread TSE=-1 as "device-provided
@@ -3918,20 +4501,20 @@ mod tests {
     /// unconditionally; only TSE=-2 (epicsTimeEventDeviceTime) leaves
     /// `precord->time` untouched.
     ///
-    /// Regression: a stale device write (any non-epoch SystemTime)
+    /// Regression: a stale device write (any non-epoch crate::types::WallTime)
     /// suppressed every BestTime refresh thereafter.
     #[test]
     fn apply_timestamp_tse_minus_one_always_overwrites_with_best_time() {
         use crate::server::record::CommonFields;
-        use std::time::{Duration, SystemTime};
+        use std::time::Duration;
 
         // Pre-populate `time` with a stale but non-epoch sentinel.
-        let stale = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let stale = crate::types::WallTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
         let mut common = CommonFields::default();
-        common.tse = -1;
+        common.set_tse(-1);
         common.time = stale;
 
-        TselStamp::None.stamp("REC", &mut common, false);
+        TselStamp::None.stamp(b"REC", &mut common, || false);
 
         // BestTime must have run unconditionally — `common.time` is
         // no longer the stale sentinel.
@@ -3949,14 +4532,14 @@ mod tests {
     #[test]
     fn apply_timestamp_tse_minus_two_preserves_device_provided_time() {
         use crate::server::record::CommonFields;
-        use std::time::{Duration, SystemTime};
+        use std::time::Duration;
 
-        let device_time = SystemTime::UNIX_EPOCH + Duration::from_secs(2_000_000);
+        let device_time = crate::types::WallTime::UNIX_EPOCH + Duration::from_secs(2_000_000);
         let mut common = CommonFields::default();
-        common.tse = -2;
+        common.set_tse(-2);
         common.time = device_time;
 
-        TselStamp::None.stamp("REC", &mut common, false);
+        TselStamp::None.stamp(b"REC", &mut common, || false);
 
         assert_eq!(
             common.time, device_time,
@@ -3975,7 +4558,7 @@ mod tests {
         use crate::server::record::CommonFields;
         use std::io::Write;
         use std::sync::{Arc, Mutex};
-        use std::time::{Duration, SystemTime};
+        use std::time::Duration;
         use tracing_subscriber::fmt::MakeWriter;
 
         #[derive(Clone, Default)]
@@ -4005,12 +4588,12 @@ mod tests {
             .finish();
         let _guard = tracing::subscriber::set_default(subscriber);
 
-        let stale = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let stale = crate::types::WallTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
         let mut common = CommonFields::default();
-        common.tse = -3;
+        common.set_tse(-3);
         common.time = stale;
 
-        TselStamp::None.stamp("X", &mut common, false);
+        TselStamp::None.stamp(b"X", &mut common, || false);
 
         assert_eq!(
             common.time, stale,
@@ -4027,39 +4610,39 @@ mod tests {
     fn select_link_indices_fanout_all_specified_mask() {
         use crate::server::record::AlarmSeverity;
         // All — every slot.
-        let r = select_link_indices_ex(SelmKind::FanoutSeq, 0, 0, 0, 0, 16);
-        assert_eq!(r.indices, (0..16).collect::<Vec<_>>());
+        let r = select_link_indices_ex(SelmKind::FanoutSeq, 0, 0, 0, 0);
+        assert_eq!(r.indices().collect::<Vec<_>>(), (0..16).collect::<Vec<_>>());
         assert!(r.alarm.is_none());
 
         // Specified, 0-based: SELN=0 selects LNK0 (C parity, fanout).
-        let r = select_link_indices_ex(SelmKind::FanoutSeq, 1, 0, 0, 0, 16);
-        assert_eq!(r.indices, vec![0]);
+        let r = select_link_indices_ex(SelmKind::FanoutSeq, 1, 0, 0, 0);
+        assert_eq!(r.indices().collect::<Vec<_>>(), vec![0]);
         // Specified with OFFS bias: SELN=2 + OFFS=3 → index 5.
-        let r = select_link_indices_ex(SelmKind::FanoutSeq, 1, 2, 3, 0, 16);
-        assert_eq!(r.indices, vec![5]);
+        let r = select_link_indices_ex(SelmKind::FanoutSeq, 1, 2, 3, 0);
+        assert_eq!(r.indices().collect::<Vec<_>>(), vec![5]);
         // Out-of-range Specified → INVALID alarm, no links.
-        let r = select_link_indices_ex(SelmKind::FanoutSeq, 1, 20, 0, 0, 16);
-        assert!(r.indices.is_empty());
+        let r = select_link_indices_ex(SelmKind::FanoutSeq, 1, 20, 0, 0);
+        assert_eq!(r.selected, 0);
         assert_eq!(r.alarm, Some((15, AlarmSeverity::Invalid)));
         // Negative resolved index (SELN + negative OFFS) → INVALID.
-        let r = select_link_indices_ex(SelmKind::FanoutSeq, 1, 0, -1, 0, 16);
+        let r = select_link_indices_ex(SelmKind::FanoutSeq, 1, 0, -1, 0);
         assert_eq!(r.alarm, Some((15, AlarmSeverity::Invalid)));
 
         // Mask: SELN=0b101 → bits 0 and 2.
-        let r = select_link_indices_ex(SelmKind::FanoutSeq, 2, 5, 0, 0, 16);
-        assert_eq!(r.indices, vec![0, 2]);
+        let r = select_link_indices_ex(SelmKind::FanoutSeq, 2, 5, 0, 0);
+        assert_eq!(r.indices().collect::<Vec<_>>(), vec![0, 2]);
         // Mask with SHFT: SELN=0b101 >> 1 = 0b10 → bit 1.
-        let r = select_link_indices_ex(SelmKind::FanoutSeq, 2, 5, 0, 1, 16);
-        assert_eq!(r.indices, vec![1]);
+        let r = select_link_indices_ex(SelmKind::FanoutSeq, 2, 5, 0, 1);
+        assert_eq!(r.indices().collect::<Vec<_>>(), vec![1]);
         // Mask with negative SHFT: SELN=0b101 << 1 = 0b1010 → bits 1,3.
-        let r = select_link_indices_ex(SelmKind::FanoutSeq, 2, 5, 0, -1, 16);
-        assert_eq!(r.indices, vec![1, 3]);
+        let r = select_link_indices_ex(SelmKind::FanoutSeq, 2, 5, 0, -1);
+        assert_eq!(r.indices().collect::<Vec<_>>(), vec![1, 3]);
         // SHFT out of [-15,15] → INVALID.
-        let r = select_link_indices_ex(SelmKind::FanoutSeq, 2, 5, 0, 16, 16);
+        let r = select_link_indices_ex(SelmKind::FanoutSeq, 2, 5, 0, 16);
         assert_eq!(r.alarm, Some((15, AlarmSeverity::Invalid)));
 
         // Unknown SELM → INVALID.
-        let r = select_link_indices_ex(SelmKind::FanoutSeq, 9, 0, 0, 0, 16);
+        let r = select_link_indices_ex(SelmKind::FanoutSeq, 9, 0, 0, 0);
         assert_eq!(r.alarm, Some((15, AlarmSeverity::Invalid)));
     }
 
@@ -4067,50 +4650,21 @@ mod tests {
     fn select_link_indices_dfanout_specified_is_one_based() {
         use crate::server::record::AlarmSeverity;
         // dfanout Specified is 1-based: SELN=1 → OUTA (index 0).
-        let r = select_link_indices_ex(SelmKind::Dfanout, 1, 1, 0, 0, 16);
-        assert_eq!(r.indices, vec![0]);
+        let r = select_link_indices_ex(SelmKind::Dfanout, 1, 1, 0, 0);
+        assert_eq!(r.indices().collect::<Vec<_>>(), vec![0]);
         // SELN=2 → OUTB (index 1).
-        let r = select_link_indices_ex(SelmKind::Dfanout, 1, 2, 0, 0, 16);
-        assert_eq!(r.indices, vec![1]);
+        let r = select_link_indices_ex(SelmKind::Dfanout, 1, 2, 0, 0);
+        assert_eq!(r.indices().collect::<Vec<_>>(), vec![1]);
         // SELN=0 → drive nothing, NO alarm.
-        let r = select_link_indices_ex(SelmKind::Dfanout, 1, 0, 0, 0, 16);
-        assert!(r.indices.is_empty());
+        let r = select_link_indices_ex(SelmKind::Dfanout, 1, 0, 0, 0);
+        assert_eq!(r.selected, 0);
         assert!(r.alarm.is_none());
         // SELN > 16 → INVALID.
-        let r = select_link_indices_ex(SelmKind::Dfanout, 1, 17, 0, 0, 16);
+        let r = select_link_indices_ex(SelmKind::Dfanout, 1, 17, 0, 0);
         assert_eq!(r.alarm, Some((15, AlarmSeverity::Invalid)));
         // dfanout Mask has no SHFT — SHFT arg ignored.
-        let r = select_link_indices_ex(SelmKind::Dfanout, 2, 5, 0, 7, 16);
-        assert_eq!(r.indices, vec![0, 2]);
-    }
-
-    /// `SELN` is unsigned, and the rule that makes it unsigned depends on the
-    /// SOURCE type — because in C the source type picks the conversion routine.
-    #[test]
-    fn seln_cast_follows_the_source_type() {
-        // Integer source -> `getLongUshort`, `(epicsUInt16)(epicsInt32)v`.
-        // C DEFINES this (C17 6.3.1.3p2, modulo 2^16), so we reproduce it.
-        assert_eq!(dbr_ushort_cast(&EpicsValue::Long(-1)), 65535);
-        assert_eq!(dbr_ushort_cast(&EpicsValue::Long(65536)), 0);
-        assert_eq!(dbr_ushort_cast(&EpicsValue::Short(-1)), 65535);
-        assert_eq!(dbr_ushort_cast(&EpicsValue::Int64(-1)), 65535);
-        assert_eq!(dbr_ushort_cast(&EpicsValue::Long(3)), 3);
-
-        // Float source -> `getDoubleUshort`, `(epicsUInt16)d`. C leaves this
-        // UNDEFINED (C17 6.3.1.4p1), and whatever `types::c_cast` decides to do
-        // about that is a SEPARATE question from this one — the point here is
-        // only that the float source takes the float rule and the integer
-        // source does not.
-        assert_eq!(
-            dbr_ushort_cast(&EpicsValue::Double(-1.0)),
-            crate::types::c_cast::f64_to_u16(-1.0)
-        );
-        assert_eq!(
-            dbr_ushort_cast(&EpicsValue::Double(65536.0)),
-            crate::types::c_cast::f64_to_u16(65536.0)
-        );
-        // In range: no policy in play, both rules truncate toward zero.
-        assert_eq!(dbr_ushort_cast(&EpicsValue::Double(3.7)), 3);
+        let r = select_link_indices_ex(SelmKind::Dfanout, 2, 5, 0, 7);
+        assert_eq!(r.indices().collect::<Vec<_>>(), vec![0, 2]);
     }
 
     /// Whatever produced it, a `SELN` of 65535 selects nothing under Specified
@@ -4122,22 +4676,21 @@ mod tests {
         // fanout/seq Specified: C `i = (epicsUInt16)seln + offs` = 65535 →
         // out of range → INVALID. A signed read would clamp to 0 and wrongly
         // drive link 0.
-        let r = select_link_indices_ex(SelmKind::FanoutSeq, 1, seln_max, 0, 0, 16);
-        assert!(r.indices.is_empty());
+        let r = select_link_indices_ex(SelmKind::FanoutSeq, 1, seln_max, 0, 0);
+        assert_eq!(r.selected, 0);
         assert_eq!(r.alarm, Some((15, AlarmSeverity::Invalid)));
         // fanout/seq Mask: 65535 → all 16 low bits set → every link. A signed
         // read would produce an empty mask.
-        let r = select_link_indices_ex(SelmKind::FanoutSeq, 2, seln_max, 0, 0, 16);
-        assert_eq!(r.indices, (0..16).collect::<Vec<_>>());
+        let r = select_link_indices_ex(SelmKind::FanoutSeq, 2, seln_max, 0, 0);
+        assert_eq!(r.indices().collect::<Vec<_>>(), (0..16).collect::<Vec<_>>());
         // dfanout Specified: 65535 > count → INVALID. A signed read would see
         // -1 ≤ 0 → drive nothing, with no alarm.
-        let r = select_link_indices_ex(SelmKind::Dfanout, 1, seln_max, 0, 0, 16);
-        assert!(r.indices.is_empty());
+        let r = select_link_indices_ex(SelmKind::Dfanout, 1, seln_max, 0, 0);
+        assert_eq!(r.selected, 0);
         assert_eq!(r.alarm, Some((15, AlarmSeverity::Invalid)));
     }
 
-    /// Lset that flips to "connected" after a configurable delay.
-    /// Drives the wait_for_external_links time-budget tests below.
+    /// Lset that flips to "connected" at `connect_at`.
     struct DelayedConnectLset {
         names: Vec<String>,
         connect_at: crate::runtime::task::Instant,
@@ -4145,157 +4698,47 @@ mod tests {
 
     #[async_trait::async_trait]
     impl link_set::LinkSet for DelayedConnectLset {
-        fn is_connected(&self, _: &str) -> bool {
+        fn is_connected(&self, _: link_set::LinkRef<'_>) -> bool {
             crate::runtime::task::Instant::now() >= self.connect_at
         }
-        fn get_cached_value(&self, _: &str) -> Option<EpicsValue> {
+        fn get_cached_value(&self, _: link_set::LinkRef<'_>) -> Option<EpicsValue> {
             None
         }
-        async fn get_value(&self, name: &str) -> Option<EpicsValue> {
-            self.get_cached_value(name)
+        async fn get_value(&self, link: link_set::LinkRef<'_>) -> Option<EpicsValue> {
+            self.get_cached_value(link)
         }
-        fn link_names(&self) -> Vec<String> {
-            self.names.clone()
+        fn link_names(&self) -> Vec<crate::types::RecordName> {
+            self.names.iter().map(|n| n.as_str().into()).collect()
         }
     }
 
+    /// C's `pdbentry->message` is one per `record()` block: a dbCommon field
+    /// refused in the creation sink prints what the record's own fields of
+    /// the same block left there.
     #[epics_macros_rs::epics_test]
-    async fn wait_for_external_links_returns_zero_zero_when_no_lsets() {
+    async fn a_common_field_refusal_reads_the_block_s_message() {
         let db = PvDatabase::new();
-        let (c, t) = db
-            .wait_for_external_links(std::time::Duration::from_millis(50))
-            .await;
-        assert_eq!((c, t), (0, 0));
-    }
-
-    #[epics_macros_rs::epics_test]
-    async fn wait_for_external_links_connected_quickly() {
-        let db = PvDatabase::new();
-        // Local-target forced-CA links (dbChannelTest==0 → isLocal): these
-        // get DBCA_CALLBACK_INIT_START, so iocInit waits for them.
-        db.add_pv("pv:A", EpicsValue::Long(0)).await.unwrap();
-        db.add_pv("pv:B", EpicsValue::Long(0)).await.unwrap();
-        let lset = Arc::new(DelayedConnectLset {
-            names: vec!["pv:A".to_string(), "pv:B".to_string()],
-            connect_at: crate::runtime::task::Instant::now(),
-        });
-        // Registered under "ca": the iocInit wait is CA-facility only, so
-        // the working set comes from the "ca" link set (these forced-CA
-        // local-target links), never from a "pva" set.
-        db.register_link_set("ca", lset).await;
-        let (c, t) = db
-            .wait_for_external_links(std::time::Duration::from_secs(1))
-            .await;
-        assert_eq!((c, t), (2, 2));
-    }
-
-    #[epics_macros_rs::epics_test]
-    async fn wait_for_external_links_returns_partial_on_timeout() {
-        let db = PvDatabase::new();
-        // Local target so the link is in the init-wait set (dbLink.c:130);
-        // connect-time well past the budget below, so the wait must return
-        // (0, 1) instead of blocking.
-        db.add_pv("slow:pv", EpicsValue::Long(0)).await.unwrap();
-        let lset = Arc::new(DelayedConnectLset {
-            names: vec!["slow:pv".to_string()],
-            connect_at: crate::runtime::task::Instant::now() + std::time::Duration::from_secs(60),
-        });
-        db.register_link_set("ca", lset).await;
-        let started = crate::runtime::task::Instant::now();
-        let (c, t) = db
-            .wait_for_external_links(std::time::Duration::from_millis(250))
-            .await;
-        let elapsed = started.elapsed();
-        assert_eq!((c, t), (0, 1));
+        let mut entry = crate::server::db_loader::EntryMessage::default();
+        entry.cant_set_line("P", "SCAN", "Bogus", Some("using menu menuScan"), "x");
+        let mut lines = Vec::new();
+        db.add_loaded_record_reporting(
+            "P",
+            Box::new(crate::server::records::ai::AiRecord::new(0.0)),
+            RecordLoad::from_common_fields(vec![(
+                "DISV".to_string(),
+                EpicsValue::String("x".into()),
+            )]),
+            &mut entry,
+            |_, d| lines.push(d.message),
+        )
+        .await
+        .unwrap();
+        assert_eq!(lines.len(), 1, "{lines:?}");
         assert!(
-            elapsed >= std::time::Duration::from_millis(200),
-            "wait must consume at least the configured budget, got {:?}",
-            elapsed
-        );
-        assert!(
-            elapsed < std::time::Duration::from_secs(2),
-            "wait must not exceed the budget by much, got {:?}",
-            elapsed
-        );
-    }
-
-    /// C parity (dbLink.c:130): a link whose target is NOT a local record
-    /// (`dbChannelTest != 0`) gets no DBCA_CALLBACK_INIT_START, so iocInit
-    /// must not block on it. An areaDetector `test CP MS` placeholder — a CP
-    /// link to a PV that exists nowhere — must drop straight through, leaving
-    /// the link to connect (or dangle) asynchronously and silently, like C.
-    #[epics_macros_rs::epics_test]
-    async fn wait_for_external_links_skips_nonlocal_targets() {
-        let db = PvDatabase::new();
-        // "test" has no local record and would never connect.
-        let lset = Arc::new(DelayedConnectLset {
-            names: vec!["test".to_string()],
-            connect_at: crate::runtime::task::Instant::now() + std::time::Duration::from_secs(60),
-        });
-        db.register_link_set("ca", lset).await;
-        let started = crate::runtime::task::Instant::now();
-        let (c, t) = db
-            .wait_for_external_links(std::time::Duration::from_secs(10))
-            .await;
-        // Non-local target is excluded from the wait set entirely, so the
-        // call returns (0, 0) immediately rather than blocking the budget.
-        assert_eq!((c, t), (0, 0));
-        assert!(
-            started.elapsed() < std::time::Duration::from_secs(1),
-            "non-local link must not be waited on, got {:?}",
-            started.elapsed()
-        );
-        // And it is reported as unconnected by neither path (silent, like C).
-        assert!(db.unconnected_external_links().await.is_empty());
-    }
-
-    /// Lset that is connected but whose post-connect init actions (the
-    /// metadata fetch) never complete: `init_ready` stays false.
-    struct ConnectedMetaPendingLset {
-        names: Vec<String>,
-    }
-
-    #[async_trait::async_trait]
-    impl link_set::LinkSet for ConnectedMetaPendingLset {
-        fn is_connected(&self, _: &str) -> bool {
-            true
-        }
-        fn init_ready(&self, _: &str) -> bool {
-            false
-        }
-        fn get_cached_value(&self, _: &str) -> Option<EpicsValue> {
-            None
-        }
-        async fn get_value(&self, name: &str) -> Option<EpicsValue> {
-            self.get_cached_value(name)
-        }
-        fn link_names(&self) -> Vec<String> {
-            self.names.clone()
-        }
-    }
-
-    /// epics-base #856 (ef4829829, "dbCa: iocInit wait for all
-    /// conditions"): a connected link whose attribute fetch has not
-    /// completed still holds iocInit — the wait polls `init_ready`
-    /// (C `testInitReady`'s three-bit gate), not `is_connected` alone,
-    /// and the timeout diagnostic names the link it proceeded without.
-    #[epics_macros_rs::epics_test]
-    async fn wait_for_external_links_holds_until_init_ready() {
-        let db = PvDatabase::new();
-        db.add_pv("meta:pending", EpicsValue::Long(0))
-            .await
-            .unwrap();
-        let lset = Arc::new(ConnectedMetaPendingLset {
-            names: vec!["meta:pending".to_string()],
-        });
-        db.register_link_set("ca", lset).await;
-        let (c, t) = db
-            .wait_for_external_links(std::time::Duration::from_millis(250))
-            .await;
-        assert_eq!((c, t), (0, 1));
-        assert_eq!(
-            db.unconnected_external_links().await,
-            vec!["meta:pending".to_string()]
+            lines[0]
+                .ends_with("Can't set 'P.DISV' to 'x' using menu menuScan : No digits to convert"),
+            "{}",
+            lines[0]
         );
     }
 
@@ -4367,10 +4810,68 @@ mod tests {
         assert!(!db.has_name("WF.NOSUCH").await);
         assert!(db.has_name("ALIAS_NAME.EGU").await);
         assert!(!db.has_name("ALIAS_NAME.NOSUCH").await);
-        // `$` re-views a DBF_STRING/link field as a char array; anything
-        // else is `S_dbLib_fieldNotFound` (`dbChannel.c:486-505`).
+        // `dbChannelTest` stops at the `$` modifier: whether the field takes
+        // it is `dbChannelCreate`'s question (`dbChannel.c:486-505`), so the
+        // search answers for VAL$ on a DOUBLE as softIocPVX does.
         assert!(db.has_name("TARGET.EGU$").await);
-        assert!(!db.has_name("TARGET.VAL$").await);
+        assert!(db.has_name("TARGET.VAL$").await);
+        assert!(db.has_name("WF.VAL$").await);
+        assert!(!db.has_name("TARGET.NOSUCH$").await);
+        // Nor does it read past the field name's identifier prefix.
+        assert!(db.has_name("TARGET.VAL$garbage").await);
+        assert!(db.has_name("TARGET.VAL.{bad").await);
+        assert!(db.has_name("TARGET.1abc").await);
+        assert!(!db.has_name("TARGET.NOSUCH$garbage").await);
+        db.add_record(
+            "WS",
+            Box::new(crate::server::records::waveform::WaveformRecord::new(
+                2,
+                crate::types::DbFieldType::String,
+            )),
+        )
+        .await
+        .unwrap();
+        assert!(db.has_name("WS.VAL$").await);
+        assert!(!db.has_name("TARGET.egu").await);
+    }
+
+    /// The search side answers from registry facts while another thread
+    /// holds the record, as C's `dbChannelTest` takes no record lock.
+    #[epics_macros_rs::epics_test]
+    async fn the_search_answers_while_the_record_is_held() {
+        let db = PvDatabase::new();
+        db.add_record(
+            "TARGET",
+            Box::new(crate::server::records::ai::AiRecord::new(42.0)),
+        )
+        .await
+        .unwrap();
+        let rec = db.get_record("TARGET").unwrap();
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let _guard = rec.write();
+            held_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        held_rx.recv().unwrap();
+        let (answer_tx, answer_rx) = std::sync::mpsc::channel();
+        let asker = {
+            let db = db.clone();
+            std::thread::spawn(move || {
+                let answers: Vec<bool> =
+                    ["TARGET.VAL", "TARGET.MLOK", "TARGET.EGU$", "TARGET.NOSUCH"]
+                        .iter()
+                        .map(|name| db.has_name_no_resolve(name.as_bytes()))
+                        .collect();
+                answer_tx.send(answers).unwrap();
+            })
+        };
+        let answers = answer_rx.recv_timeout(std::time::Duration::from_secs(2));
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        asker.join().unwrap();
+        assert_eq!(answers, Ok(vec![true, true, true, false]));
     }
 
     #[epics_macros_rs::epics_test]
@@ -4452,8 +4953,9 @@ mod tests {
         let b = db.get_record("CYC:B").unwrap();
         assert_eq!(
             (Arc::strong_count(&a), Arc::strong_count(&b)),
-            (3, 3),
-            "the map, this test and the other record's handle each hold the cell"
+            (4, 4),
+            "the map, the record table, this test and the other record's handle \
+             each hold the cell"
         );
         let (weak_a, weak_b) = (Arc::downgrade(&a), Arc::downgrade(&b));
         drop((a, b, db));
@@ -4484,13 +4986,13 @@ mod tests {
         let src = db.get_record("REL:SRC").unwrap();
         assert_eq!(
             Arc::strong_count(&src),
-            3,
-            "the map, the reader's handle, this test"
+            4,
+            "the map, the record table, the reader's handle, this test"
         );
         assert!(db.remove_record("REL:SRC").await);
         assert_eq!(
             Arc::strong_count(&src),
-            1,
+            2,
             "the reader's handle outlived the removal"
         );
     }
@@ -4568,40 +5070,6 @@ mod tests {
     }
 
     #[epics_macros_rs::epics_test]
-    async fn register_cp_link_normalises_alias_to_canonical() {
-        // Regression: CP link registration must store the
-        // canonical record names. dispatch_cp_targets looks up by
-        // canonical, so an alias-keyed entry is functionally dead.
-        let db = PvDatabase::new();
-        db.add_record(
-            "SRC_REAL",
-            Box::new(crate::server::records::ai::AiRecord::new(0.0)),
-        )
-        .await
-        .unwrap();
-        db.add_record(
-            "DST_REAL",
-            Box::new(crate::server::records::ai::AiRecord::new(0.0)),
-        )
-        .await
-        .unwrap();
-        db.add_alias("SRC_ALIAS", "SRC_REAL").await.unwrap();
-        db.add_alias("DST_ALIAS", "DST_REAL").await.unwrap();
-
-        // Register using the alias forms (CP edge: passive_only = false).
-        db.register_cp_link("SRC_ALIAS", "DST_ALIAS", false).await;
-
-        // Lookup must succeed via the canonical source name.
-        let targets = db.get_cp_targets("SRC_REAL");
-        assert_eq!(targets.len(), 1);
-        assert_eq!(targets[0].record, "DST_REAL");
-        assert!(!targets[0].passive_only);
-        // Alias-keyed lookup must NOT have been registered.
-        let alias_lookup = db.get_cp_targets("SRC_ALIAS");
-        assert!(alias_lookup.is_empty());
-    }
-
-    #[epics_macros_rs::epics_test]
     async fn aliases_for_record_returns_sorted_targets_only() {
         let db = PvDatabase::new();
         db.add_record(
@@ -4647,7 +5115,7 @@ mod tests {
         aliases.sort();
         assert_eq!(aliases, vec!["ALIAS_A".to_string(), "ALIAS_B".to_string()]);
         // Canonical names are NOT returned here.
-        assert!(!aliases.contains(&"TARGET".to_string()));
+        assert!(!aliases.iter().any(|a| a == "TARGET"));
     }
 
     #[epics_macros_rs::epics_test]
@@ -4768,8 +5236,12 @@ mod tests {
         db.add_pv("A", EpicsValue::Double(1.0)).await.unwrap();
         // Same name as simple_pv — every namespace must see it.
         assert!(db.add_pv("A", EpicsValue::Double(2.0)).await.is_err());
-        let noop_hook: crate::server::pv::WriteHook =
-            std::sync::Arc::new(|_v, _ctx| Box::pin(async { Ok(()) }));
+        let noop_hook: crate::server::pv::WriteHook = std::sync::Arc::new(|_v, _ctx| {
+            Box::pin(async {
+                let sent: crate::server::pv::WriteForward = Box::new(|_| Ok(()));
+                Ok(sent)
+            })
+        });
         assert!(
             db.add_pv_with_hook("A", EpicsValue::Double(2.0), noop_hook)
                 .await
@@ -4829,7 +5301,7 @@ mod tests {
         db.add_pv("ALT1", EpicsValue::Double(0.0)).await.unwrap();
         db.add_pv("ALT2", EpicsValue::Double(0.0)).await.unwrap();
         // The unrelated alias must survive.
-        assert_eq!(db.resolve_alias("KEEPER"), Some("OTHER".to_string()));
+        assert_eq!(db.resolve_alias("KEEPER"), Some("OTHER".into()));
     }
 
     /// The node list is C's `recList`: records and aliases in ONE sequence,
@@ -4928,25 +5400,25 @@ mod tests {
         db.add_record("EAGER", Box::new(AiRecord::new(0.0)))
             .await
             .unwrap();
-        assert!(!db.record_init_deferred("EAGER"));
+        assert!(!db.record_init_deferred(b"EAGER"));
 
         db.begin_load().unwrap();
         db.add_record("OWED", Box::new(AiRecord::new(0.0)))
             .await
             .unwrap();
-        assert!(db.record_init_deferred("OWED"));
-        assert!(!db.record_init_deferred("EAGER"));
+        assert!(db.record_init_deferred(b"OWED"));
+        assert!(!db.record_init_deferred(b"EAGER"));
 
         let owed = db.get_record("OWED").expect("the record is published");
-        db.drain_deferred_record_inits();
-        assert!(!db.record_init_deferred("OWED"));
+        db.drain_deferred_record_inits(&|line| eprintln!("{line}"));
+        assert!(!db.record_init_deferred(b"OWED"));
         assert!(
             !owed.claim_owed_init(),
             "the barrier's claim was not the only one"
         );
 
-        db.drain_deferred_record_inits();
-        assert!(!db.record_init_deferred("OWED"));
+        db.drain_deferred_record_inits(&|line| eprintln!("{line}"));
+        assert!(!db.record_init_deferred(b"OWED"));
     }
 
     /// `add_alias` must reject collisions with
@@ -5058,8 +5530,9 @@ mod tests {
     /// replaced spelled, and the names they did NOT spell.
     ///
     /// The old lists were `COMMON_LINK_FIELDS`, `Record::multi_input_links`
-    /// and `links::CP_INPUT_LINK_FIELDS`; the third is deleted, so its content
-    /// is repeated here as the oracle rather than read from it. It carried one
+    /// and `links::CP_INPUT_LINK_FIELDS`; the first and third are deleted, so
+    /// their content is repeated here as the oracle rather than read from it.
+    /// The third carried one
     /// hard-won fact worth keeping visible — `SVL` and not `SGNL`, because
     /// `histogramRecord.dbd.pod:212` declares `field(SVL,DBF_INLINK)` while
     /// `SGNL` (:202) is the `DBF_DOUBLE` the link reads INTO. The declaration
@@ -5090,7 +5563,7 @@ mod tests {
         // SGNL is the value, not the link — the bug the old list carried.
         assert_eq!(dbf_link_class("histogram", "SGNL"), None);
 
-        for (field, _) in crate::server::record::record_instance::COMMON_LINK_FIELDS {
+        for field in ["INP", "OUT", "TSEL", "SDIS", "FLNK"] {
             assert!(
                 dbf_link_class("ai", field).is_some() || dbf_link_class("ao", field).is_some(),
                 "{field} was a COMMON_LINK_FIELDS name and must still resolve"
@@ -5161,12 +5634,12 @@ mod tests {
 
     /// `record_link_fields` must surface a record's device-support `INP`
     /// link. An `ai`'s `INP` is a `DBF_INLINK` field stored in
-    /// `common.inp` — it is not a `DbFieldType::String` entry in
+    /// `common.text.inp` — it is not a `DbFieldType::String` entry in
     /// `field_list()` — so the earlier `field_list()` scan filtered by
     /// `String` silently dropped it. The pvalink install scan walks this
     /// method, so a Passive `ai` carrying a CP/CPP pvalink `INP` never had
     /// its monitor opened at iocInit. Enumerating the canonical
-    /// `common.inp` storage fixes it; C `dbpvar`/`dbcar` likewise dump
+    /// `common.text.inp` storage fixes it; C `dbpvar`/`dbcar` likewise dump
     /// every link field including device-support INP/OUT.
     #[epics_macros_rs::epics_test]
     async fn record_link_fields_surfaces_device_support_inp() {
@@ -5177,7 +5650,7 @@ mod tests {
         // A `pva` link set has to be installed for a `pva://` link to survive
         // `db_init_link_locality`, which refuses a link whose scheme nothing
         // can service. This test is about the ENUMERATION reaching
-        // `common.inp`, so it installs the lset the link names rather than
+        // `common.text.inp`, so it installs the lset the link names rather than
         // asserting the refusal.
         db.register_link_set(
             "pva",
@@ -5190,11 +5663,11 @@ mod tests {
         db.add_record("AI", Box::new(AiRecord::new(0.0)))
             .await
             .unwrap();
-        // Device-support INP lives in `common.inp` (DBF_INLINK), the
+        // Device-support INP lives in `common.text.inp` (DBF_INLINK), the
         // exact storage a `field_list()` String scan cannot reach.
         {
             let rec = db.get_record("AI").unwrap();
-            rec.write().common.inp = "pva://mini:current?proc=CP".to_string();
+            rec.write().common.text.inp = "pva://mini:current?proc=CP".into();
         }
 
         let links = db.record_link_fields("AI");
@@ -5249,6 +5722,48 @@ mod tests {
             );
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
+    }
+
+    /// C `dbCaLinkInit` waits for `dbCaTask` to start (`dbCa.c:355-357`):
+    /// the `dbCaLink` owner has registered by the time `ca_link_init`
+    /// returns, so its first poll is not left to land in record processing.
+    #[cfg(tokio_backend)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ca_link_init_returns_with_the_owner_registered() {
+        let db = PvDatabase::new();
+        assert!(db.ca_link_init(), "precondition: a captured reactor");
+        let out = std::cell::RefCell::new(String::new());
+        crate::runtime::taskwd::taskwd_show(1, &|line| {
+            out.borrow_mut().push_str(line);
+            out.borrow_mut().push('\n');
+        });
+        let out = out.into_inner();
+        assert!(
+            out.contains("dbCaLink"),
+            "the owner was not registered when ca_link_init returned:\n{out}"
+        );
+    }
+
+    /// C `dbCaShutdown` then a rebuild's `dbCaLinkInit` (`dbCa.c:324-355`):
+    /// the stopped worker is gone from the watchdog table and the rebuild
+    /// starts a fresh one.
+    #[cfg(tokio_backend)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_rebuild_after_ca_link_shutdown_gets_a_fresh_worker() {
+        fn up() -> bool {
+            let up = std::cell::Cell::new(false);
+            crate::runtime::taskwd::taskwd_show(1, &|line| {
+                up.set(up.get() || line.contains("dbCaLink"))
+            });
+            up.get()
+        }
+        let db = PvDatabase::new();
+        assert!(db.ca_link_init());
+        assert!(up());
+        db.ca_link_shutdown();
+        assert!(!up(), "the stopped worker is still registered");
+        assert!(db.ca_link_init());
+        assert!(up(), "the rebuild started no worker");
     }
 
     /// The other boundary: a database that captured no reactor has nowhere to

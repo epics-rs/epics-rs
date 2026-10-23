@@ -1,0 +1,2 @@
+AsynDriverInterface::asynReadHandler(rec, buffer="1.5<0d>", received=4 eomReason=NONE) ioAction=AsyncRead
+AsynDriverInterface::asynReadHandler(rec) readMore=0, ioAction=None 

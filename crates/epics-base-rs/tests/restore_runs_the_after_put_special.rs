@@ -1,13 +1,14 @@
-//! The autosave-restore write must run BOTH `special()` passes, as every
-//! other `dbPut` route does.
+//! `put_pv_no_process`, the `dbPutField` analogue without its process, must
+//! run BOTH `special()` passes, as every other `dbPut` route does. (A boot
+//! restore is not this route: it is C's static `dbPutString`, which runs
+//! neither; see `autosave_restore_is_a_static_put.rs`.)
 //!
 //! C line numbers below resolve at epics-base tag `R7.0.10`, not at this
 //! machine's working tree (`R7.0.10-146-g8f5015b66`), where PR #944 puts
 //! `dbPut`'s header 3 lines lower and its body, from the first `if (special)`
 //! on, 5 lower.
 //!
-//! C's autosave `reboot_restore` writes through `dbPutField`, and both of
-//! that function's branches run the pair. For an ordinary field
+//! Both of C `dbPutField`'s branches run the pair. For an ordinary field
 //! (`dbAccess.c` `dbPut():1345-1348`, `:1399-1403` with the status adopted
 //! at `:1404`; the block is quoted below with the `:1398` comment above it):
 //!
@@ -33,9 +34,9 @@
 //! registry — and `dbPut` ADOPTS its status, so an unresolvable name is a
 //! failed put and not a silent one.
 //!
-//! `put_pv_no_process` ran only the before pass, so a restored CALC left the
-//! record evaluating the OLD expression and a restored SNAM left it running
-//! the OLD routine, with the restore reporting success either way.
+//! `put_pv_no_process` ran only the before pass, so a CALC it wrote left the
+//! record evaluating the OLD expression and a SNAM left it running the OLD
+//! routine, with the put reporting success either way.
 //!
 //! Boundaries, one case each: the record's own half of the after pass (CALC ->
 //! RPCL), the registry half (SNAM -> subroutine), and the status the after
@@ -45,18 +46,18 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use epics_base_rs::server::database::PvDatabase;
-use epics_base_rs::server::record::{Record, SubroutineFn};
+use epics_base_rs::server::record::{Record, Subroutine};
 use epics_base_rs::server::records::calc::CalcRecord;
 use epics_base_rs::server::records::sub_record::SubRecord;
 use epics_base_rs::types::EpicsValue;
 
 /// A `sub` subroutine that writes `marker` into VAL, so VAL names which
 /// routine actually ran.
-fn writes_val(marker: f64) -> Arc<SubroutineFn> {
-    Arc::new(Box::new(move |rec: &mut dyn Record| {
+fn writes_val(marker: f64) -> Arc<Subroutine> {
+    Arc::new(Subroutine::Plain(Box::new(move |rec: &mut dyn Record| {
         rec.put_field("VAL", EpicsValue::Double(marker))?;
         Ok(0_i64)
-    }) as SubroutineFn)
+    })))
 }
 
 async fn process(db: &PvDatabase, name: &str) {
@@ -111,7 +112,7 @@ async fn a_restored_calc_recompiles_the_expression() {
 #[epics_macros_rs::epics_test]
 async fn a_restored_snam_rebinds_the_subroutine() {
     let db = PvDatabase::new();
-    let mut registry: HashMap<String, Arc<SubroutineFn>> = HashMap::new();
+    let mut registry: HashMap<String, Arc<Subroutine>> = HashMap::new();
     registry.insert("fnA".into(), writes_val(1.0));
     registry.insert("fnB".into(), writes_val(2.0));
     db.install_subroutine_registry(registry.clone()).await;
@@ -151,7 +152,7 @@ async fn a_restored_snam_rebinds_the_subroutine() {
 #[epics_macros_rs::epics_test]
 async fn a_restored_unregistered_snam_fails_the_put() {
     let db = PvDatabase::new();
-    let mut registry: HashMap<String, Arc<SubroutineFn>> = HashMap::new();
+    let mut registry: HashMap<String, Arc<Subroutine>> = HashMap::new();
     registry.insert("fnA".into(), writes_val(1.0));
     db.install_subroutine_registry(registry.clone()).await;
 

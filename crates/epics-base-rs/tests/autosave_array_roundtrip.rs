@@ -6,10 +6,8 @@
 //! Correctness only: no synApps autosave source exists on this machine,
 //! so nothing here is a claim about what C's `dbrestore.c` does.
 
-use epics_base_rs::server::autosave::format::CompatMode;
 use epics_base_rs::server::autosave::save_file::{
-    SaveEntry, parse_save_value, read_save_file, value_to_save_str, value_to_save_str_c,
-    write_save_file_with_mode,
+    SaveEntry, parse_save_value, read_save_file, value_to_save_str, write_save_file,
 };
 use epics_base_rs::types::EpicsValue;
 
@@ -37,14 +35,14 @@ async fn a_comma_inside_a_c_array_element_is_not_a_separator() {
     let path = dir.path().join("wfs.sav");
 
     let value = string_array(&["a,b", "c"]);
-    write_save_file_with_mode(
+    write_save_file(
         &path,
         &[SaveEntry {
             pv_name: "SR:WFS".into(),
-            value: value_to_save_str_c(&value),
+            value: value_to_save_str(&value),
             connected: true,
+            array_fprintfs: Vec::new(),
         }],
-        CompatMode::CRead,
     )
     .await
     .unwrap();
@@ -74,7 +72,7 @@ async fn a_bracket_inside_an_element_is_not_the_terminator() {
 /// Every nasty element, alone and in every pair — the property the
 /// round trip has to hold: what is written is what is read.
 #[epics_macros_rs::epics_test]
-async fn every_element_survives_the_native_round_trip() {
+async fn every_element_survives_the_round_trip() {
     for a in NASTY {
         for b in NASTY {
             for elems in [vec![*a], vec![*a, *b], vec![*a, *b, "tail"]] {
@@ -82,11 +80,13 @@ async fn every_element_survives_the_native_round_trip() {
                 let text = value_to_save_str(&value);
                 let parsed = parse_save_value(&text, &string_array(&[]))
                     .unwrap_or_else(|| panic!("{elems:?} did not parse from {text}"));
-                assert_eq!(
-                    elements_of(&parsed),
-                    elems.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
-                    "round trip through {text}"
-                );
+                // One element is written as a scalar, and C reads an empty
+                // one back as no element (dbrestore.c:478-482).
+                let expected: Vec<String> = match elems.as_slice() {
+                    [""] => Vec::new(),
+                    _ => elems.iter().map(|s| s.to_string()).collect(),
+                };
+                assert_eq!(elements_of(&parsed), expected, "round trip through {text}");
             }
         }
     }
@@ -100,14 +100,14 @@ async fn every_element_survives_a_c_format_save_file() {
     let path = dir.path().join("nasty.sav");
 
     let value = string_array(NASTY);
-    write_save_file_with_mode(
+    write_save_file(
         &path,
         &[SaveEntry {
             pv_name: "SR:WFS".into(),
-            value: value_to_save_str_c(&value),
+            value: value_to_save_str(&value),
             connected: true,
+            array_fprintfs: Vec::new(),
         }],
-        CompatMode::CRead,
     )
     .await
     .unwrap();
@@ -120,26 +120,26 @@ async fn every_element_survives_a_c_format_save_file() {
     );
 }
 
-/// An empty array and an array of one empty element are different
-/// things and must stay different.
+/// C writes an empty array and an array of one empty element alike, as
+/// the scalar "" (save_restore.c:1853-1860), and reads that back as no
+/// element (dbrestore.c:478-482).
 #[epics_macros_rs::epics_test]
-async fn an_empty_array_is_not_an_array_holding_an_empty_element() {
-    let empty =
-        parse_save_value(&value_to_save_str(&string_array(&[])), &string_array(&[])).unwrap();
-    assert!(elements_of(&empty).is_empty());
-
-    let one =
-        parse_save_value(&value_to_save_str(&string_array(&[""])), &string_array(&[])).unwrap();
-    assert_eq!(elements_of(&one), vec![String::new()]);
+async fn an_empty_element_is_written_as_an_empty_array() {
+    for elems in [&[][..], &[""][..]] {
+        let text = value_to_save_str(&string_array(elems));
+        assert_eq!(text, "");
+        let parsed = parse_save_value(&text, &string_array(&[])).unwrap();
+        assert!(elements_of(&parsed).is_empty(), "{elems:?}");
+    }
 }
 
-/// Numeric arrays keep the text they always had — the quoting rule
-/// triggers on the array punctuation, which a number never contains.
+/// A numeric array is written in C's form, and the `[..]` form of a file
+/// an older autosave-rs wrote still reads.
 #[epics_macros_rs::epics_test]
-async fn numeric_array_text_is_unchanged() {
+async fn numeric_array_text() {
     assert_eq!(
         value_to_save_str(&EpicsValue::LongArray(vec![1, 2, 3].into())),
-        "[1,2,3]"
+        r#"@array@ { "1" "2" "3" }"#
     );
     let parsed = parse_save_value("[1,2,3]", &EpicsValue::LongArray(vec![].into())).unwrap();
     assert_eq!(parsed, EpicsValue::LongArray(vec![1, 2, 3].into()));

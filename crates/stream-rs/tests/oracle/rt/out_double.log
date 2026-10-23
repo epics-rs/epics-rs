@@ -1,0 +1,12 @@
+StreamCore::startProtocol(rec, startMode=StartNormal)
+StreamCore::evalCommand(rec): activeCommand = out
+StreamCore::formatOutput(rec): format = %.3f
+StreamCore::printValue(rec, %f, 3.25000): "V 3.250"
+StreamCore::formatOutput(rec): format = %e
+StreamCore::printValue(rec, %e, 3.25000): "V 3.250 3.250000e+00"
+StreamCore::evalOut: outputLine = "V 3.250 3.250000e+00<0d><0a>"
+StreamCore::evalOut(rec): lockRequest(5000)
+StreamCore::lockCallback(rec, StreamIoSuccess)
+StreamCore::writeCallback(rec, StreamIoSuccess)
+StreamCore::evalCommand(rec): activeCommand = end
+StreamCore::finishProtocol(rec, Success) bus owner

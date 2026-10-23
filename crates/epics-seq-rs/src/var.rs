@@ -1,0 +1,709 @@
+//! Program variables: what snc-rs declares in `struct seqg_vars`.
+//!
+//! Each variable is one [`SeqVar`], a lock of its own around a heap value,
+//! so a state set and a pv callback touch it without a data race and with
+//! C's non-safe visibility: a write is seen by the next read on any
+//! thread. Locks are per variable, never nested: snc-rs evaluates every
+//! operand of an assignment before it takes the target's lock (`x = x + 1`
+//! is a `get` and then a `set`, `x += e` evaluates `e` first), so no
+//! [`Place::modify`] closure ever reaches another variable.
+//!
+//! A multi-PV array (`assign x to {"a", "b"}`) splits its outer dimension
+//! into separate cells, `[SeqVar<T>; N]`, so each channel owns one cell.
+
+use std::any::Any;
+use std::ffi::c_char;
+use std::marker::PhantomData;
+
+use epics_base_rs::types::{EpicsValue, PvString};
+use parking_lot::Mutex;
+
+use crate::types::{CharPtr, SeqString};
+
+/// The value a variable holds before `seqg_init` runs: C's `calloc` (`+r`)
+/// or static zero (`-r`).
+pub trait Zeroed: Sized {
+    fn zeroed() -> Self;
+
+    /// The zero value built where it will stay, so a `double x[65536]` is
+    /// never a stack temporary.
+    fn zeroed_box() -> Box<Self> {
+        Box::new(Self::zeroed())
+    }
+}
+
+macro_rules! zeroed_scalar {
+    ($($t:ty = $z:expr),* $(,)?) => {
+        $(impl Zeroed for $t {
+            fn zeroed() -> Self {
+                $z
+            }
+        })*
+    };
+}
+
+zeroed_scalar!(
+    i8 = 0,
+    u8 = 0,
+    i16 = 0,
+    u16 = 0,
+    i32 = 0,
+    u32 = 0,
+    i64 = 0,
+    u64 = 0,
+    f32 = 0.0,
+    f64 = 0.0,
+    SeqString = SeqString::new(),
+    CharPtr = None,
+);
+
+impl<T: Zeroed, const N: usize> Zeroed for [T; N] {
+    fn zeroed() -> Self {
+        std::array::from_fn(|_| T::zeroed())
+    }
+
+    fn zeroed_box() -> Box<Self> {
+        let elems: Box<[T]> = (0..N).map(|_| T::zeroed()).collect();
+        match elems.try_into() {
+            Ok(b) => b,
+            Err(_) => unreachable!("the iterator yields exactly N elements"),
+        }
+    }
+}
+
+impl<T: Zeroed> Zeroed for SeqVar<T> {
+    fn zeroed() -> Self {
+        SeqVar(Mutex::new(T::zeroed_box()))
+    }
+}
+
+/// The element a channel's cell transfers, which [`crate::SeqProgram::validate`]
+/// matches against the table's [`PrimType`](crate::PrimType).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ElemKind {
+    I8,
+    U8,
+    I16,
+    U16,
+    I32,
+    U32,
+    I64,
+    U64,
+    F32,
+    F64,
+    Str,
+}
+
+/// The kind of the host C's `char`.
+pub const C_CHAR_KIND: ElemKind = if (c_char::MIN as i32) < 0 {
+    ElemKind::I8
+} else {
+    ElemKind::U8
+};
+
+/// A type a channel can transfer element by element.
+pub trait Prim: Copy + Zeroed + Send + Sync + 'static {
+    const KIND: ElemKind;
+
+    /// Element `i` of `value` (a scalar has only element 0), converted as
+    /// a C assignment converts it: an integer of the same width keeps its
+    /// bits, as C's `memcpy` from the buffer does. `None` past the end, or
+    /// between a string and a number, which a request of the channel's
+    /// own type never delivers.
+    fn from_value(value: &EpicsValue, i: usize) -> Option<Self>;
+
+    /// `elems` as one value of this type, losslessly: a scalar variant for
+    /// one element, an array otherwise. Narrowing to the request type is
+    /// the pv layer's.
+    fn to_value(elems: &[Self]) -> EpicsValue;
+}
+
+/// A numeric element of an [`EpicsValue`], before the cast to the
+/// variable's type.
+enum Num {
+    I(i64),
+    U(u64),
+    F(f64),
+}
+
+/// `Char` is `epicsInt8` and `UChar` `epicsUInt8`, as base defines them.
+fn num_at(value: &EpicsValue, i: usize) -> Option<Num> {
+    use EpicsValue::*;
+    let scalar = |n| (i == 0).then_some(n);
+    match value {
+        Char(v) => scalar(Num::I(*v as i8 as i64)),
+        UChar(v) => scalar(Num::U(*v as u64)),
+        Short(v) => scalar(Num::I(*v as i64)),
+        UShort(v) | Enum(v) | EnumWithChoices { index: v, .. } => scalar(Num::U(*v as u64)),
+        Long(v) => scalar(Num::I(*v as i64)),
+        ULong(v) => scalar(Num::U(*v as u64)),
+        Int64(v) => scalar(Num::I(*v)),
+        UInt64(v) => scalar(Num::U(*v)),
+        Float(v) => scalar(Num::F(*v as f64)),
+        Double(v) => scalar(Num::F(*v)),
+        CharArray(a) => a.get(i).map(|v| Num::I(*v as i8 as i64)),
+        UCharArray(a) => a.get(i).map(|v| Num::U(*v as u64)),
+        ShortArray(a) => a.get(i).map(|v| Num::I(*v as i64)),
+        UShortArray(a) | EnumArray(a) => a.get(i).map(|v| Num::U(*v as u64)),
+        LongArray(a) => a.get(i).map(|v| Num::I(*v as i64)),
+        ULongArray(a) => a.get(i).map(|v| Num::U(*v as u64)),
+        Int64Array(a) => a.get(i).map(|v| Num::I(*v)),
+        UInt64Array(a) => a.get(i).map(|v| Num::U(*v)),
+        FloatArray(a) => a.get(i).map(|v| Num::F(*v as f64)),
+        DoubleArray(a) => a.get(i).map(|v| Num::F(*v)),
+        String(_) | StringArray(_) => None,
+    }
+}
+
+macro_rules! prim_num {
+    ($($t:ty => $k:ident, $scalar:ident, $array:ident;)*) => {
+        $(impl Prim for $t {
+            const KIND: ElemKind = ElemKind::$k;
+
+            fn from_value(value: &EpicsValue, i: usize) -> Option<Self> {
+                Some(match num_at(value, i)? {
+                    Num::I(v) => v as $t,
+                    Num::U(v) => v as $t,
+                    Num::F(v) => v as $t,
+                })
+            }
+
+            fn to_value(elems: &[Self]) -> EpicsValue {
+                match elems {
+                    [v] => EpicsValue::$scalar(*v as _),
+                    _ => EpicsValue::$array(elems.iter().map(|&v| v as _).collect()),
+                }
+            }
+        })*
+    };
+}
+
+prim_num!(
+    i8 => I8, Char, CharArray;
+    u8 => U8, UChar, UCharArray;
+    i16 => I16, Short, ShortArray;
+    u16 => U16, UShort, UShortArray;
+    i32 => I32, Long, LongArray;
+    u32 => U32, ULong, ULongArray;
+    i64 => I64, Int64, Int64Array;
+    u64 => U64, UInt64, UInt64Array;
+    f32 => F32, Float, FloatArray;
+    f64 => F64, Double, DoubleArray;
+);
+
+impl Prim for SeqString {
+    const KIND: ElemKind = ElemKind::Str;
+
+    fn from_value(value: &EpicsValue, i: usize) -> Option<Self> {
+        let bytes = match value {
+            EpicsValue::String(s) if i == 0 => s.as_bytes(),
+            EpicsValue::StringArray(a) => a.get(i)?.as_bytes(),
+            _ => return None,
+        };
+        let mut s = SeqString::new();
+        s.set(bytes);
+        Some(s)
+    }
+
+    fn to_value(elems: &[Self]) -> EpicsValue {
+        let pv = |s: &SeqString| PvString::from_bytes(s.as_bytes());
+        match elems {
+            [s] => EpicsValue::String(pv(s)),
+            _ => EpicsValue::StringArray(elems.iter().map(pv).collect()),
+        }
+    }
+}
+
+/// Something read and written as a `T`: a variable, or an element of one.
+/// Generated code calls the same-named inherent methods of [`SeqVar`] and
+/// [`At`], so it imports no trait; C library shims that write through a
+/// pointer (`strcpy`, `sprintf`) take a `&impl Place<_>`.
+pub trait Place<T> {
+    /// Run `f` on the value under the variable's lock. `f` must not touch
+    /// another program variable.
+    fn modify<R>(&self, f: impl FnOnce(&mut T) -> R) -> R;
+
+    fn get(&self) -> T
+    where
+        T: Clone,
+    {
+        self.modify(|v| v.clone())
+    }
+
+    fn set(&self, value: T) {
+        self.modify(|v| *v = value)
+    }
+}
+
+/// One program variable.
+pub struct SeqVar<T>(Mutex<Box<T>>);
+
+impl<T> SeqVar<T> {
+    pub fn new(value: T) -> Self {
+        SeqVar(Mutex::new(Box::new(value)))
+    }
+
+    /// [`Place::modify`].
+    pub fn modify<R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
+        f(&mut self.0.lock())
+    }
+
+    pub fn get(&self) -> T
+    where
+        T: Clone,
+    {
+        self.modify(|v| v.clone())
+    }
+
+    pub fn set(&self, value: T) {
+        self.modify(|v| *v = value)
+    }
+}
+
+impl<A: Indexed> SeqVar<A> {
+    /// C's `a[index]`.
+    pub fn at(&self, index: usize) -> At<'_, Self, A> {
+        At::new(self, index)
+    }
+}
+
+impl<T> Place<T> for SeqVar<T> {
+    fn modify<R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
+        SeqVar::modify(self, f)
+    }
+}
+
+impl<T: Clone> Clone for SeqVar<T> {
+    fn clone(&self) -> Self {
+        SeqVar(Mutex::new(self.0.lock().clone()))
+    }
+}
+
+impl<T: std::fmt::Debug> std::fmt::Debug for SeqVar<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.lock().fmt(f)
+    }
+}
+
+/// What C subscripts: an array, or a `string` as its `char` buffer.
+pub trait Indexed {
+    type Elem;
+
+    /// Run `f` on element `index`; an index past the end panics.
+    fn with_elem<R>(&mut self, index: usize, f: impl FnOnce(&mut Self::Elem) -> R) -> R;
+}
+
+impl<T, const N: usize> Indexed for [T; N] {
+    type Elem = T;
+
+    fn with_elem<R>(&mut self, index: usize, f: impl FnOnce(&mut T) -> R) -> R {
+        f(&mut self[index])
+    }
+}
+
+impl Indexed for SeqString {
+    type Elem = c_char;
+
+    fn with_elem<R>(&mut self, index: usize, f: impl FnOnce(&mut c_char) -> R) -> R {
+        let b = &mut self.as_buffer_mut()[index];
+        let mut c = *b as c_char;
+        let r = f(&mut c);
+        *b = c as u8;
+        r
+    }
+}
+
+/// Element `index` of what `parent` holds: C's `a[i]` or `s[i]`, and
+/// `a[i][j]` is `a.at(i).at(j)`. An index past the end panics where C
+/// would read or write outside the variable.
+pub struct At<'p, P: ?Sized, A> {
+    parent: &'p P,
+    index: usize,
+    _array: PhantomData<fn() -> A>,
+}
+
+impl<'p, P: ?Sized, A> At<'p, P, A> {
+    fn new(parent: &'p P, index: usize) -> Self {
+        At {
+            parent,
+            index,
+            _array: PhantomData,
+        }
+    }
+}
+
+impl<A: Indexed, P: Place<A> + ?Sized> At<'_, P, A> {
+    /// [`Place::modify`].
+    pub fn modify<R>(&self, f: impl FnOnce(&mut A::Elem) -> R) -> R {
+        self.parent.modify(|a| a.with_elem(self.index, f))
+    }
+
+    pub fn get(&self) -> A::Elem
+    where
+        A::Elem: Clone,
+    {
+        self.modify(|v| v.clone())
+    }
+
+    pub fn set(&self, value: A::Elem) {
+        self.modify(|v| *v = value)
+    }
+}
+
+impl<A: Indexed<Elem: Indexed>, P: Place<A> + ?Sized> At<'_, P, A> {
+    pub fn at(&self, index: usize) -> At<'_, Self, A::Elem> {
+        At::new(self, index)
+    }
+}
+
+impl<A: Indexed, P: Place<A> + ?Sized> Place<A::Elem> for At<'_, P, A> {
+    fn modify<R>(&self, f: impl FnOnce(&mut A::Elem) -> R) -> R {
+        At::modify(self, f)
+    }
+}
+
+/// The variable a channel is assigned to, as the pv layer sees it: C's
+/// `offset` into the variable block, plus the copy C does with `memcpy`.
+///
+/// Every transfer converts element by element through [`EpicsValue`]; none
+/// copies bytes, so the request type and the variable type may differ in
+/// width.
+pub trait ChanCell: Sync {
+    fn kind(&self) -> ElemKind;
+
+    /// Elements the variable holds (the declared array length, 1 for a
+    /// scalar).
+    fn count(&self) -> u32;
+
+    /// The first `count` elements, as `pvPut` sends them.
+    fn load(&self, count: u32) -> EpicsValue;
+
+    /// Write the first `count` elements of `value`, as a get or monitor
+    /// delivers them; elements past what `value` holds are left alone.
+    fn store(&self, value: &EpicsValue, count: u32);
+
+    /// Copy the first `count` elements from the same channel's cell in
+    /// another instance of the variables (safe mode's buffer to state set
+    /// copy, `dbCount` elements as `seq_task.c:139` copies), leaving the
+    /// rest alone.
+    fn copy_from(&self, src: &dyn ChanCell, count: u32);
+
+    fn as_any(&self) -> &dyn Any;
+}
+
+impl<T: Prim> ChanCell for SeqVar<T> {
+    fn kind(&self) -> ElemKind {
+        T::KIND
+    }
+
+    fn count(&self) -> u32 {
+        1
+    }
+
+    fn load(&self, count: u32) -> EpicsValue {
+        self.modify(|v| T::to_value(&std::slice::from_ref(v)[..count as usize]))
+    }
+
+    fn store(&self, value: &EpicsValue, count: u32) {
+        if count > 0
+            && let Some(v) = T::from_value(value, 0)
+        {
+            self.set(v);
+        }
+    }
+
+    fn copy_from(&self, src: &dyn ChanCell, count: u32) {
+        if count > 0 {
+            let v = same_cell(self, src).get();
+            self.set(v);
+        }
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+impl<T: Prim, const N: usize> ChanCell for SeqVar<[T; N]> {
+    fn kind(&self) -> ElemKind {
+        T::KIND
+    }
+
+    fn count(&self) -> u32 {
+        N as u32
+    }
+
+    fn load(&self, count: u32) -> EpicsValue {
+        self.modify(|a| T::to_value(&a[..count as usize]))
+    }
+
+    fn store(&self, value: &EpicsValue, count: u32) {
+        self.modify(|a| {
+            for (i, elem) in a.iter_mut().take(count as usize).enumerate() {
+                let Some(v) = T::from_value(value, i) else {
+                    break;
+                };
+                *elem = v;
+            }
+        })
+    }
+
+    fn copy_from(&self, src: &dyn ChanCell, count: u32) {
+        let n = (count as usize).min(N);
+        let src = same_cell(self, src).0.lock();
+        self.modify(|a| a[..n].copy_from_slice(&src[..n]));
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+/// `src` as the cell type it must be: the same channel's cell in another
+/// instance of the variables.
+fn same_cell<'a, C: ChanCell + 'static>(_: &C, src: &'a dyn ChanCell) -> &'a C {
+    src.as_any()
+        .downcast_ref()
+        .expect("copy_from takes the same channel's cell")
+}
+
+/// `struct seqg_vars`: the variable block snc-rs generates.
+///
+/// `Clone` is safe mode's per-state-set copy of the shared buffer.
+pub trait ProgramVars: Clone + Send + Sync + 'static {
+    /// Every variable zero, before `seqg_init` assigns the initializers.
+    fn zeroed() -> Self;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_large_array_is_built_on_the_heap() {
+        let v = <SeqVar<[f64; 65536]>>::zeroed();
+        assert_eq!(v.at(65535).get(), 0.0);
+    }
+
+    #[test]
+    fn a_two_dimensional_element_reads_back_what_was_set() {
+        let v = <SeqVar<[[f64; 3]; 3]>>::zeroed();
+        v.at(1).at(2).set(4.5);
+        assert_eq!(v.get()[1], [0.0, 0.0, 4.5]);
+        v.at(1).at(2).modify(|x| *x += 1.0);
+        assert_eq!(v.at(1).at(2).get(), 5.5);
+    }
+
+    #[test]
+    fn a_string_character_reads_and_writes_as_a_char() {
+        let s = <SeqVar<SeqString>>::zeroed();
+        s.modify(|v| v.set(b"idle"));
+        assert_eq!(s.at(0).get(), b'i' as c_char);
+        s.at(1).set(b'c' as c_char);
+        assert_eq!(s.get().as_bytes(), b"icle");
+        let a = <SeqVar<[SeqString; 2]>>::zeroed();
+        a.at(1).modify(|v| v.set(b"ab"));
+        assert_eq!(a.at(1).at(1).get(), b'b' as c_char);
+    }
+
+    #[test]
+    #[should_panic]
+    fn a_string_subscript_past_the_buffer_panics() {
+        let s = <SeqVar<SeqString>>::zeroed();
+        s.at(crate::types::MAX_STRING_SIZE).get();
+    }
+
+    #[test]
+    #[should_panic]
+    fn a_subscript_past_the_end_panics() {
+        let v = <SeqVar<[i32; 4]>>::zeroed();
+        v.at(4).get();
+    }
+
+    /// Narrowing to the put type is the pv layer's, so an unsigned value
+    /// goes out unsigned.
+    #[test]
+    fn load_sends_the_variable_s_own_type() {
+        assert_eq!(SeqVar::new(-3i8).load(1), EpicsValue::Char(0xfd));
+        assert_eq!(SeqVar::new(200u8).load(1), EpicsValue::UChar(200));
+        assert_eq!(SeqVar::new(-7i16).load(1), EpicsValue::Short(-7));
+        assert_eq!(SeqVar::new(0xffffu16).load(1), EpicsValue::UShort(0xffff));
+        assert_eq!(SeqVar::new(-9i32).load(1), EpicsValue::Long(-9));
+        assert_eq!(SeqVar::new(u32::MAX).load(1), EpicsValue::ULong(u32::MAX));
+        assert_eq!(SeqVar::new(1.5f32).load(1), EpicsValue::Float(1.5));
+        assert_eq!(SeqVar::new(2.5f64).load(1), EpicsValue::Double(2.5));
+        let mut s = SeqString::new();
+        s.set(b"idle");
+        assert_eq!(
+            SeqVar::new(s).load(1),
+            EpicsValue::String(PvString::from_bytes(*b"idle"))
+        );
+    }
+
+    #[test]
+    fn load_sends_the_first_count_elements() {
+        let a = SeqVar::new([1i16, 2, 3, 4]);
+        assert_eq!(a.load(3), EpicsValue::ShortArray(vec![1, 2, 3].into()));
+        assert_eq!(a.load(1), EpicsValue::Short(1));
+        assert_eq!(a.load(0), EpicsValue::ShortArray(Vec::new().into()));
+        // `c_char` is `u8` on aarch64 Linux.
+        let c = <SeqVar<[c_char; 3]>>::zeroed();
+        let zeros = vec![0, 0, 0].into();
+        let want = match C_CHAR_KIND {
+            ElemKind::I8 => EpicsValue::CharArray(zeros),
+            _ => EpicsValue::UCharArray(zeros),
+        };
+        assert_eq!(c.load(3), want);
+    }
+
+    #[test]
+    fn a_cell_reports_its_element_kind_and_count() {
+        assert_eq!(<SeqVar<i16>>::zeroed().kind(), ElemKind::I16);
+        assert_eq!(<SeqVar<[SeqString; 32]>>::zeroed().count(), 32);
+        assert_eq!(<SeqVar<[c_char; 64]>>::zeroed().kind(), C_CHAR_KIND);
+    }
+
+    #[test]
+    fn a_same_width_integer_keeps_its_bits() {
+        assert_eq!(u32::from_value(&EpicsValue::Long(-1), 0), Some(u32::MAX));
+        assert_eq!(i16::from_value(&EpicsValue::UShort(0xffff), 0), Some(-1));
+        assert_eq!(i8::from_value(&EpicsValue::UChar(0xff), 0), Some(-1));
+    }
+
+    /// `Char` is signed and `UChar` unsigned when widened.
+    #[test]
+    fn a_char_widens_by_its_signedness() {
+        assert_eq!(i32::from_value(&EpicsValue::Char(0xff), 0), Some(-1));
+        assert_eq!(i32::from_value(&EpicsValue::UChar(0xff), 0), Some(255));
+        let a = EpicsValue::CharArray(vec![1, 0x80].into());
+        assert_eq!(i32::from_value(&a, 1), Some(-128));
+    }
+
+    #[test]
+    fn a_float_truncates_into_an_integer() {
+        assert_eq!(i32::from_value(&EpicsValue::Double(2.7), 0), Some(2));
+        assert_eq!(f64::from_value(&EpicsValue::Enum(3), 0), Some(3.0));
+    }
+
+    #[test]
+    fn an_element_past_the_end_is_none() {
+        assert_eq!(f64::from_value(&EpicsValue::Double(1.0), 1), None);
+        let a = EpicsValue::LongArray(vec![1, 2].into());
+        assert_eq!(i32::from_value(&a, 1), Some(2));
+        assert_eq!(i32::from_value(&a, 2), None);
+    }
+
+    #[test]
+    fn a_string_and_a_number_do_not_convert() {
+        let s = EpicsValue::String(PvString::from_bytes(&b"1"[..]));
+        assert_eq!(i32::from_value(&s, 0), None);
+        assert_eq!(SeqString::from_value(&EpicsValue::Long(1), 0), None);
+    }
+
+    #[test]
+    fn a_string_element_is_cut_to_the_buffer() {
+        let a = EpicsValue::StringArray(
+            vec![
+                PvString::from_bytes(&b"a"[..]),
+                PvString::from_bytes(vec![b'x'; 64]),
+            ]
+            .into(),
+        );
+        let s = SeqString::from_value(&a, 1).unwrap();
+        assert_eq!(s.as_bytes().len(), crate::types::MAX_STRING_SIZE - 1);
+        assert_eq!(SeqString::from_value(&a, 0).unwrap().as_bytes(), b"a");
+    }
+
+    #[test]
+    fn one_element_is_a_scalar_and_more_an_array() {
+        assert_eq!(i8::to_value(&[-1]), EpicsValue::Char(0xff));
+        assert_eq!(u8::to_value(&[0xff]), EpicsValue::UChar(0xff));
+        assert_eq!(
+            i32::to_value(&[1, -2]),
+            EpicsValue::LongArray(vec![1, -2].into())
+        );
+        let mut s = SeqString::new();
+        s.set(b"idle");
+        assert_eq!(
+            SeqString::to_value(&[s]),
+            EpicsValue::String(PvString::from_bytes(&b"idle"[..]))
+        );
+        assert_eq!(
+            SeqString::to_value(&[s, s]),
+            EpicsValue::StringArray(vec![PvString::from_bytes(&b"idle"[..]); 2].into())
+        );
+    }
+
+    #[test]
+    fn a_value_round_trips_through_its_own_type() {
+        let v = [1.5f32, -2.0];
+        let back: Vec<f32> = (0..2)
+            .map(|i| f32::from_value(&f32::to_value(&v), i).unwrap())
+            .collect();
+        assert_eq!(back, v);
+        assert_eq!(
+            u64::from_value(&u64::to_value(&[u64::MAX]), 0),
+            Some(u64::MAX)
+        );
+    }
+
+    /// `ss_write_buffer` moves `dbCount` elements of what arrived.
+    #[test]
+    fn store_writes_the_first_count_elements_it_is_given() {
+        let a = SeqVar::new([9i32; 4]);
+        a.store(&EpicsValue::LongArray(vec![1, 2, 3].into()), 2);
+        assert_eq!(a.get(), [1, 2, 9, 9]);
+        a.store(&EpicsValue::LongArray(vec![5, 6, 7].into()), 4);
+        assert_eq!(a.get(), [5, 6, 7, 9]);
+    }
+
+    /// `pv_type_map` gets an unsigned variable as the signed type of its
+    /// width, and `ss_write_buffer` copies the bits.
+    #[test]
+    fn an_unsigned_variable_stores_the_bits_of_its_get_type() {
+        let c = SeqVar::new(0u8);
+        c.store(&EpicsValue::Char(0xff), 1);
+        assert_eq!(c.get(), 0xff);
+        let s = SeqVar::new([0u16; 2]);
+        s.store(&EpicsValue::ShortArray(vec![-1, i16::MIN].into()), 2);
+        assert_eq!(s.get(), [0xffff, 0x8000]);
+        let l = SeqVar::new(0u32);
+        l.store(&EpicsValue::Long(i32::MIN), 1);
+        assert_eq!(l.get(), 0x8000_0000);
+    }
+
+    /// Before connect `dbCount` is 0, and C's copy moves nothing.
+    #[test]
+    fn a_scalar_stores_only_with_a_count() {
+        let x = SeqVar::new(7i16);
+        x.store(&EpicsValue::Short(1), 0);
+        assert_eq!(x.get(), 7);
+        x.store(&EpicsValue::Double(2.9), 1);
+        assert_eq!(x.get(), 2);
+    }
+
+    #[test]
+    fn a_value_of_the_other_kind_stores_nothing() {
+        let s = SeqVar::new(SeqString::new());
+        s.store(&EpicsValue::Long(1), 1);
+        assert_eq!(s.get().as_bytes(), b"");
+        let a = SeqVar::new([3.0f64; 2]);
+        a.store(&EpicsValue::String(PvString::from_bytes(&b"1"[..])), 2);
+        assert_eq!(a.get(), [3.0; 2]);
+    }
+
+    /// A `+s` state set's elements past `dbCount` are its own.
+    #[test]
+    fn copy_from_copies_count_elements_and_keeps_the_rest() {
+        let buf = SeqVar::new([1u16, 2, 3, 4]);
+        let copy = SeqVar::new([9u16; 4]);
+        copy.copy_from(&buf, 2);
+        assert_eq!(copy.get(), [1, 2, 9, 9]);
+        let x = SeqVar::new(5.5f32);
+        let y = SeqVar::new(0.0f32);
+        y.copy_from(&x, 0);
+        assert_eq!(y.get(), 0.0);
+        y.copy_from(&x, 1);
+        assert_eq!(y.get(), 5.5);
+    }
+}

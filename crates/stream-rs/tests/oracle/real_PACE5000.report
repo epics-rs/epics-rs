@@ -1,0 +1,250 @@
+rec0: PACE5000.proto getUnits(1,2,3,4,5,6,7,8,9) P
+getUnits {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out ":UNIT:PRES?";
+    in ":UNIT:PRES %s";
+}
+rec1: PACE5000.proto setUnits(1,2,3,4,5,6,7,8,9) P
+setUnits {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out ":UNIT:PRES %s";
+}
+rec2: PACE5000.proto getControl(1,2,3,4,5,6,7,8,9) P
+getControl {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out ":OUTP:STAT?";
+    in ":OUTP:STAT %d";
+}
+rec3: PACE5000.proto setControl(1,2,3,4,5,6,7,8,9) P
+setControl {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out ":OUTP:STAT %d";
+}
+rec4: PACE5000.proto getSlewMode(1,2,3,4,5,6,7,8,9) P
+getSlewMode {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out ":SOUR:PRES:SLEW:MODE?";
+    in ":SOUR:PRES:SLEW:MODE %s";
+}
+rec5: PACE5000.proto setSlewMode(1,2,3,4,5,6,7,8,9) P
+setSlewMode {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out ":SOUR:PRES:SLEW:MODE %s";
+}
+rec6: PACE5000.proto getSlew(1,2,3,4,5,6,7,8,9) P
+getSlew {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out ":SOUR:PRES:SLEW?";
+    in ":SOUR:PRES:SLEW %f";
+}
+rec7: PACE5000.proto setSlew(1,2,3,4,5,6,7,8,9) P
+setSlew {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out ":SOUR:PRES:SLEW %f";
+}
+rec8: PACE5000.proto getEffort(1,2,3,4,5,6,7,8,9) P
+getEffort {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out ":SOUR:PRES:EFF?";
+    in ":SOUR:PRES:EFF %f";
+}
+rec9: PACE5000.proto getPressure(1,2,3,4,5,6,7,8,9) P
+getPressure {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out ":SENS:PRES?";
+    in ":SENS:PRES %f";
+}
+rec10: PACE5000.proto getSetpoint(1,2,3,4,5,6,7,8,9) P
+getSetpoint {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out ":SOUR:PRES:LEV:IMM:AMPL?";
+    in ":SOUR:PRES:LEV:IMM:AMPL %f";
+}
+rec11: PACE5000.proto setSetpoint(1,2,3,4,5,6,7,8,9) P
+setSetpoint {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out ":SOUR:PRES:LEV:IMM:AMPL %f";
+}
+rec12: PACE5000.proto getVent(1,2,3,4,5,6,7,8,9) P
+getVent {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out ":SOUR:PRES:LEV:IMM:AMPL:VENT?";
+    in ":SOUR:PRES:LEV:IMM:AMPL:VENT %d";
+}
+rec13: PACE5000.proto setVent(1,2,3,4,5,6,7,8,9) P
+setVent {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out ":SOUR:PRES:LEV:IMM:AMPL:VENT %d";
+}
+rec14: PACE5000.proto getError(1,2,3,4,5,6,7,8,9) P
+getError {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out ":SYST:ERR?";
+    in ":SYST:ERR %80c";
+}
+rec15: PACE5000.proto getModel(1,2,3,4,5,6,7,8,9) P
+getModel {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "*IDN?";
+    in "*IDN %80c";
+}

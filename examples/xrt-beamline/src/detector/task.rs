@@ -5,9 +5,10 @@ use std::time::Duration;
 use asyn_rs::port_handle::PortHandle;
 
 use ad_core_rs::driver::{ADStatus, ImageMode};
-use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDimension};
+use ad_core_rs::ndarray::{NDDataBuffer, NDDimension};
+use ad_core_rs::ndarray_pool::DriverPool;
 use ad_core_rs::params::ADBaseParams;
-use ad_core_rs::plugin::channel::{ArrayPublisher, QueuedArrayCounter};
+use ad_core_rs::plugin::channel::ArrayPublisher;
 use ad_core_rs::runtime as rt;
 
 use crate::beamline_sim::{self, SimConfig};
@@ -30,24 +31,19 @@ pub(crate) struct AcquisitionContext {
     pub ad: ADBaseParams,
     pub xrt: XrtDetectorParams,
     pub sim_config: SimConfig,
-    pub queued_counter: Arc<QueuedArrayCounter>,
+    pub pool: DriverPool,
 }
 
 impl AcquisitionContext {
-    async fn end_acquisition(&self, wait_for_plugins: bool) {
-        if wait_for_plugins {
-            self.queued_counter.wait_until_zero(Duration::from_secs(5));
-        }
+    /// Transition to Idle. Storing ADAcquire=0 is what clears ADAcquireBusy,
+    /// held while ADWaitForPlugins waits on the queued arrays
+    /// (asynNDArrayDriver.cpp:636-663).
+    async fn end_acquisition(&self) {
         if let Err(e) = self
             .port_handle
             .set_params_and_notify(
                 0,
                 vec![
-                    asyn_rs::request::ParamSetValue::new(
-                        self.ad.acquire_busy,
-                        0,
-                        ParamValue::Int32(0),
-                    ),
                     asyn_rs::request::ParamSetValue::new(
                         self.ad.status,
                         0,
@@ -58,7 +54,7 @@ impl AcquisitionContext {
             )
             .await
         {
-            eprintln!("set_params_and_notify error (end_acquisition): {e}");
+            epics_libcom_rs::stderr_println!("set_params_and_notify error (end_acquisition): {e}");
         }
     }
 }
@@ -128,7 +124,7 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
             )
             .await
         {
-            eprintln!("set_params_and_notify error (acquire start): {e}");
+            epics_libcom_rs::stderr_println!("set_params_and_notify error (acquire start): {e}");
         }
 
         let mut num_counter = 0;
@@ -179,7 +175,7 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
                 // Check for stop
                 match ctx.acq_rx.try_recv() {
                     Ok(AcqCommand::Stop) => {
-                        ctx.end_acquisition(config.wait_for_plugins).await;
+                        ctx.end_acquisition().await;
                         stopped = true;
                         break;
                     }
@@ -273,14 +269,33 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
             }
 
             let dims = vec![NDDimension::new(nx), NDDimension::new(nz)];
-            let mut frame = NDArray::with_data(dims, NDDataBuffer::U16(u16_data));
+            // As C simDetector, the last image is released and the next is
+            // allocated in its place under one lock (simDetector.cpp:694-699).
+            // A refused wrap has printed the pool's limit line.
+            let Some(frame) = ctx.pool.owner().replace_array(0, || {
+                ctx.pool.alloc_with(dims, NDDataBuffer::U16(u16_data)).ok()
+            }) else {
+                continue;
+            };
 
             // Update counters
             num_counter += 1;
             array_counter += 1;
 
-            frame.unique_id = array_counter;
-            frame.update_time_stamps_now();
+            // C updateTimeStamps (asynNDArrayDriver.cpp:832-836): the frame and
+            // the callbacks after it carry the port's updated stamp.
+            let stamp = ctx
+                .port_handle
+                .update_time_stamp()
+                .await
+                .unwrap_or_else(|_| std::time::SystemTime::now());
+            // Stamped in place in pArrays[0] (simDetector.cpp:824-828).
+            let Ok(frame) = ctx.pool.owner().refill(0, frame, |frame| {
+                frame.unique_id = array_counter;
+                frame.update_time_stamps(stamp.into());
+            }) else {
+                continue;
+            };
 
             // Update simulation readback PVs + frame counters
             if let Err(e) = ctx
@@ -378,18 +393,19 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
                 )
                 .await
             {
-                eprintln!("set_params_and_notify error (frame update): {e}");
+                epics_libcom_rs::stderr_println!("set_params_and_notify error (frame update): {e}");
             }
 
+            // Kept as pArrays[0], the PreAllocBuffers template, either way.
             if config.array_callbacks {
-                ctx.publisher.publish(Arc::new(frame)).await;
+                ctx.publisher.publish(frame).await;
             }
 
             // Check stop conditions
             if config.image_mode == ImageMode::Single
                 || (config.image_mode == ImageMode::Multiple && num_counter >= config.num_images)
             {
-                ctx.end_acquisition(config.wait_for_plugins).await;
+                ctx.end_acquisition().await;
                 break;
             }
 
@@ -399,7 +415,7 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
             if period_delay > 0.0 {
                 match wait_for_stop(&mut ctx.acq_rx, Duration::from_secs_f64(period_delay)).await {
                     WaitOutcome::Stop => {
-                        ctx.end_acquisition(config.wait_for_plugins).await;
+                        ctx.end_acquisition().await;
                         break;
                     }
                     WaitOutcome::Shutdown => break, // asyn port torn down; skip writeback

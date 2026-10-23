@@ -1,0 +1,144 @@
+rec0: MPC_Ethernet.proto readString(1,2,3,4,5,6,7,8,9) P
+readString {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 2000; # ms
+  writeTimeout  = 1000; # ms
+  pollPeriod    = 2000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "cmd 1 2";
+    in "OK 00 %s";
+}
+rec1: MPC_Ethernet.proto writeString(1,2,3,4,5,6,7,8,9) P
+writeString {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 2000; # ms
+  writeTimeout  = 1000; # ms
+  pollPeriod    = 2000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "cmd 1 2";
+    in "OK 00 %s";
+}
+rec2: MPC_Ethernet.proto readFloat(1,2,3,4,5,6,7,8,9) P
+readFloat {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 2000; # ms
+  writeTimeout  = 1000; # ms
+  pollPeriod    = 2000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "cmd 1 2";
+    in "OK 00 %f";
+}
+rec3: MPC_Ethernet.proto writeFloat(1,2,3,4,5,6,7,8,9) P
+writeFloat {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 2000; # ms
+  writeTimeout  = 1000; # ms
+  pollPeriod    = 2000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "cmd 1 2 %f";
+    in "OK 00";
+}
+rec4: MPC_Ethernet.proto readInt(1,2,3,4,5,6,7,8,9) P
+readInt {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 2000; # ms
+  writeTimeout  = 1000; # ms
+  pollPeriod    = 2000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "cmd 1 2";
+    in "OK 00 %d";
+}
+rec5: MPC_Ethernet.proto writeInt(1,2,3,4,5,6,7,8,9) P
+writeInt {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 2000; # ms
+  writeTimeout  = 1000; # ms
+  pollPeriod    = 2000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "cmd 1 2,%d";
+    in "OK 00";
+}
+rec6: MPC_Ethernet.proto writeHVOnOff(1,2,3,4,5,6,7,8,9) P
+writeHVOnOff {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 2000; # ms
+  writeTimeout  = 1000; # ms
+  pollPeriod    = 2000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "cmd %{37|38} 1";
+    in "OK 00";
+}
+rec7: MPC_Ethernet.proto readAutoRestart(1,2,3,4,5,6,7,8,9) P
+readAutoRestart {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 2000; # ms
+  writeTimeout  = 1000; # ms
+  pollPeriod    = 2000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "cmd 34 1";
+    in "OK 00 %{NO|YES}";
+}
+rec8: MPC_Ethernet.proto writeAutoRestart(1,2,3,4,5,6,7,8,9) P
+writeAutoRestart {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 2000; # ms
+  writeTimeout  = 1000; # ms
+  pollPeriod    = 2000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "cmd 33 1,%{N|Y}";
+    in "OK 00";
+}

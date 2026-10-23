@@ -24,7 +24,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use epics_base_rs::server::database::{LinkPutOp, LinkSet, PutAdmission, PvDatabase};
+use epics_base_rs::server::database::{LinkPutOp, LinkRef, LinkSet, PutAdmission, PvDatabase};
 use epics_base_rs::server::recgbl::alarm_status;
 use epics_base_rs::server::record::AlarmSeverity;
 use epics_base_rs::server::records::ao::AoRecord;
@@ -39,25 +39,34 @@ struct GateLset {
     /// is how the per-link independence boundary stays deterministic.
     gated: String,
     completed: Arc<Mutex<Vec<f64>>>,
+    /// Signalled after each push to `completed` (`notify_one` keeps the
+    /// permit, so a waiter that checks first and waits second misses none).
+    settled: Arc<tokio::sync::Notify>,
     entered: tokio::sync::mpsc::UnboundedSender<f64>,
     release: Arc<tokio::sync::Semaphore>,
 }
 
 #[async_trait::async_trait]
 impl LinkSet for GateLset {
-    fn is_connected(&self, _: &str) -> bool {
+    fn is_connected(&self, _: LinkRef<'_>) -> bool {
         true
     }
-    fn get_cached_value(&self, _: &str) -> Option<EpicsValue> {
+    fn get_cached_value(&self, _: LinkRef<'_>) -> Option<EpicsValue> {
         None
     }
-    async fn get_value(&self, name: &str) -> Option<EpicsValue> {
-        self.get_cached_value(name)
+    async fn get_value(&self, link: LinkRef<'_>) -> Option<EpicsValue> {
+        self.get_cached_value(link)
     }
-    async fn put_value(&self, name: &str, value: EpicsValue, _: LinkPutOp) -> Result<(), String> {
+    async fn put_value(
+        &self,
+        link: LinkRef<'_>,
+        value: EpicsValue,
+        _: LinkPutOp,
+    ) -> Result<(), String> {
+        let name = link.name;
         let v = value.to_f64().expect("tests only put doubles");
         let _ = self.entered.send(v);
-        if name == self.gated {
+        if name == self.gated.as_bytes() {
             self.release
                 .acquire()
                 .await
@@ -65,6 +74,7 @@ impl LinkSet for GateLset {
                 .forget();
         }
         self.completed.lock().unwrap().push(v);
+        self.settled.notify_one();
         Ok(())
     }
 }
@@ -90,19 +100,24 @@ impl RecordingLset {
 
 #[async_trait::async_trait]
 impl LinkSet for RecordingLset {
-    fn is_connected(&self, _: &str) -> bool {
+    fn is_connected(&self, _: LinkRef<'_>) -> bool {
         self.admission == PutAdmission::Connected
     }
-    fn put_admission(&self, _: &str) -> PutAdmission {
+    fn put_admission(&self, _: LinkRef<'_>) -> PutAdmission {
         self.admission
     }
-    fn get_cached_value(&self, _: &str) -> Option<EpicsValue> {
+    fn get_cached_value(&self, _: LinkRef<'_>) -> Option<EpicsValue> {
         None
     }
-    async fn get_value(&self, name: &str) -> Option<EpicsValue> {
-        self.get_cached_value(name)
+    async fn get_value(&self, link: LinkRef<'_>) -> Option<EpicsValue> {
+        self.get_cached_value(link)
     }
-    async fn put_value(&self, _: &str, value: EpicsValue, op: LinkPutOp) -> Result<(), String> {
+    async fn put_value(
+        &self,
+        _: LinkRef<'_>,
+        value: EpicsValue,
+        op: LinkPutOp,
+    ) -> Result<(), String> {
         self.writes
             .lock()
             .unwrap()
@@ -118,10 +133,11 @@ async fn add_ao(db: &PvDatabase, name: &str, out: &str, val: f64, notify: bool) 
     db.add_record(name, Box::new(AoRecord::new(0.0)))
         .await
         .unwrap();
+    db.put_pv_no_process(format!("{name}.OUT"), EpicsValue::String(out.into()))
+        .await
+        .unwrap();
     let rec = db.get_record(name).expect("just added");
     let mut inst = rec.write();
-    inst.put_common_field("OUT", EpicsValue::String(out.into()))
-        .unwrap();
     inst.common.udf = 0;
     inst.record
         .put_field("VAL", EpicsValue::Double(val))
@@ -167,6 +183,7 @@ async fn process(db: &PvDatabase, name: &str) {
     let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links(name, &mut visited)
         .await
+        .or_else(epics_base_rs::error::CaError::unless_process_status)
         .unwrap();
 }
 
@@ -185,20 +202,25 @@ async fn alarm_of(db: &PvDatabase, name: &str) -> (u16, AlarmSeverity) {
 #[epics_macros_rs::epics_test]
 async fn plain_put_returns_before_the_wire_write_completes() {
     let completed = Arc::new(Mutex::new(Vec::new()));
+    let settled = Arc::new(tokio::sync::Notify::new());
     let (entered, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
     let release = Arc::new(tokio::sync::Semaphore::new(0));
 
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     db.register_link_set(
         "ca",
         Arc::new(GateLset {
             gated: "REMOTE:OUT".to_string(),
             completed: Arc::clone(&completed),
+            settled: Arc::clone(&settled),
             entered,
             release: Arc::clone(&release),
         }),
     )
     .await;
+    db.process_cp_links_on_connect().await;
 
     add_ao(&db, "AO_ENQ", "ca://REMOTE:OUT", 3.5, false).await;
     process(&db, "AO_ENQ").await;
@@ -235,6 +257,8 @@ async fn plain_put_returns_before_the_wire_write_completes() {
 async fn disconnected_link_stages_nothing_and_alarms() {
     let writes = Arc::new(Mutex::new(Vec::new()));
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     db.register_link_set(
         "ca",
         Arc::new(RecordingLset {
@@ -244,6 +268,7 @@ async fn disconnected_link_stages_nothing_and_alarms() {
         }),
     )
     .await;
+    db.process_cp_links_on_connect().await;
 
     add_ao(&db, "AO_DOWN", "ca://REMOTE:OUT", 1.0, false).await;
     process(&db, "AO_DOWN").await;
@@ -276,20 +301,25 @@ async fn disconnected_link_stages_nothing_and_alarms() {
 #[epics_macros_rs::epics_test]
 async fn pending_put_is_overwritten_latest_wins() {
     let completed = Arc::new(Mutex::new(Vec::new()));
+    let settled = Arc::new(tokio::sync::Notify::new());
     let (entered, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
     let release = Arc::new(tokio::sync::Semaphore::new(0));
 
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     db.register_link_set(
         "ca",
         Arc::new(GateLset {
             gated: "REMOTE:OUT".to_string(),
             completed: Arc::clone(&completed),
+            settled: Arc::clone(&settled),
             entered,
             release: Arc::clone(&release),
         }),
     )
     .await;
+    db.process_cp_links_on_connect().await;
 
     add_ao(&db, "AO_COALESCE", "ca://REMOTE:OUT", 1.0, false).await;
     process(&db, "AO_COALESCE").await;
@@ -329,8 +359,11 @@ async fn pending_put_is_overwritten_latest_wins() {
 async fn per_link_put_ordering_is_preserved() {
     let writes = Arc::new(Mutex::new(Vec::new()));
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     db.register_link_set("ca", Arc::new(RecordingLset::connected(&writes)))
         .await;
+    db.process_cp_links_on_connect().await;
 
     add_ao(&db, "AO_ORDER", "ca://REMOTE:OUT", 1.0, false).await;
     for v in [1.0, 2.0, 3.0, 4.0] {
@@ -366,20 +399,25 @@ async fn per_link_put_ordering_is_preserved() {
 #[epics_macros_rs::epics_test]
 async fn async_put_completion_is_reported_through_the_notify_chain() {
     let completed = Arc::new(Mutex::new(Vec::new()));
+    let settled = Arc::new(tokio::sync::Notify::new());
     let (entered, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
     let release = Arc::new(tokio::sync::Semaphore::new(0));
 
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     db.register_link_set(
         "ca",
         Arc::new(GateLset {
             gated: "REMOTE:OUT".to_string(),
             completed: Arc::clone(&completed),
+            settled: Arc::clone(&settled),
             entered,
             release: Arc::clone(&release),
         }),
     )
     .await;
+    db.process_cp_links_on_connect().await;
 
     let mut notify_rx = add_ao_notify(&db, "AO_NOTIFY", "ca://REMOTE:OUT", 9.0).await;
     process(&db, "AO_NOTIFY").await;
@@ -433,6 +471,8 @@ async fn async_put_completion_is_reported_through_the_notify_chain() {
 async fn async_put_wire_failure_settles_the_chain_without_alarming() {
     let writes = Arc::new(Mutex::new(Vec::new()));
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     db.register_link_set(
         "ca",
         Arc::new(RecordingLset {
@@ -442,6 +482,7 @@ async fn async_put_wire_failure_settles_the_chain_without_alarming() {
         }),
     )
     .await;
+    db.process_cp_links_on_connect().await;
 
     let notify_rx = add_ao_notify(&db, "AO_NOTIFY_ERR", "ca://REMOTE:OUT", 4.0).await;
     process(&db, "AO_NOTIFY_ERR").await;
@@ -471,10 +512,13 @@ async fn async_put_wire_failure_settles_the_chain_without_alarming() {
 #[epics_macros_rs::epics_test]
 async fn a_blocked_link_does_not_stall_other_links() {
     let completed = Arc::new(Mutex::new(Vec::new()));
+    let settled = Arc::new(tokio::sync::Notify::new());
     let (entered, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
     let release = Arc::new(tokio::sync::Semaphore::new(0));
 
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     db.register_link_set(
         "ca",
         Arc::new(GateLset {
@@ -482,11 +526,13 @@ async fn a_blocked_link_does_not_stall_other_links() {
             // hands it over.
             gated: "SLOW:OUT".to_string(),
             completed: Arc::clone(&completed),
+            settled: Arc::clone(&settled),
             entered,
             release: Arc::clone(&release),
         }),
     )
     .await;
+    db.process_cp_links_on_connect().await;
 
     add_ao(&db, "AO_SLOW", "ca://SLOW:OUT", 1.0, false).await;
     add_ao(&db, "AO_FAST", "ca://FAST:OUT", 2.0, false).await;
@@ -500,11 +546,19 @@ async fn a_blocked_link_does_not_stall_other_links() {
         Some(2.0),
         "FAST:OUT reached the lset while SLOW:OUT was still in flight"
     );
-    for _ in 0..10_000 {
-        if completed.lock().unwrap().contains(&2.0) {
-            break;
+    let fast_done = async {
+        while !completed.lock().unwrap().contains(&2.0) {
+            settled.notified().await;
         }
-        epics_base_rs::runtime::task::yield_now().await;
+    };
+    if epics_base_rs::runtime::task::timeout(std::time::Duration::from_secs(30), fast_done)
+        .await
+        .is_err()
+    {
+        panic!(
+            "FAST:OUT not completed 30 s after it reached the lset; completed = {:?}",
+            completed.lock().unwrap()
+        );
     }
     let mid = completed.lock().unwrap().clone();
     assert_eq!(

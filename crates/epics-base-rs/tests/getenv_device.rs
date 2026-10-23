@@ -72,13 +72,11 @@ record(stringin, "GETENV_SI") {
     );
 }
 
-/// C registers a getenv dset only for `stringin`/`lsi`; the device's
-/// record-type gate Errs in `init()`, so `wire_device_to_record` flags an
-/// `ai` with `DTYP="getenv"` INVALID at build time — proving the device
-/// attached and gated rather than being silently accepted.
+/// C registers a getenv dset only for `stringin`/`lsi`, so `ai`'s device
+/// menu has no `getenv` and the `.db` does not load (`dbStaticRun.c:499`).
 #[epics_macros_rs::epics_test]
-async fn getenv_wrong_record_type_is_invalid() {
-    let (db, _) = IocBuilder::new()
+async fn getenv_wrong_record_type_is_refused_at_load() {
+    let built = IocBuilder::new()
         .db_string(
             r#"
 record(ai, "GETENV_AI") {
@@ -90,16 +88,8 @@ record(ai, "GETENV_AI") {
         )
         .unwrap()
         .build()
-        .await
-        .unwrap();
-
-    let ai = db.get_record("GETENV_AI").expect("ai exists");
-    let inst = ai.read();
-    assert_eq!(
-        inst.common.sevr,
-        AlarmSeverity::Invalid,
-        "ai with DTYP=getenv must be INVALID (no getenv device support for ai)"
-    );
+        .await;
+    assert!(built.is_err(), "ai has no getenv device support");
 }
 
 /// An unset env var: C raises UDF_ALARM at UDFS (default INVALID) and clears
@@ -204,4 +194,99 @@ record(stringin, "GETENV_UDFS") {
         "unset-var severity must follow the record's UDFS (MINOR), not a hardcoded \
          INVALID"
     );
+}
+
+/// C raises the unset-var alarm with `recGblSetSevrMsg(..., "No such ENV")`;
+/// softIoc R7.0.10 reads AMSG "No such ENV" on both a stringin and an lsi.
+#[epics_macros_rs::epics_test]
+async fn getenv_unset_var_sets_amsg_like_softioc() {
+    // SAFETY: nextest isolates each test in its own process (see module doc).
+    unsafe {
+        std::env::remove_var("GETENV_E2E_AMSG_UNSET");
+    }
+
+    let (db, _) = IocBuilder::new()
+        .db_string(
+            r#"
+record(stringin, "GETENV_AMSG_SI") {
+    field(DTYP, "getenv")
+    field(INP, "@GETENV_E2E_AMSG_UNSET")
+}
+record(lsi, "GETENV_AMSG_LSI") {
+    field(DTYP, "getenv")
+    field(INP, "@GETENV_E2E_AMSG_UNSET")
+    field(SIZV, "40")
+}
+"#,
+            &HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+
+    for name in ["GETENV_AMSG_SI", "GETENV_AMSG_LSI"] {
+        let mut visited = epics_base_rs::server::database::ProcStack::new();
+        db.process_record_with_links(name, &mut visited)
+            .await
+            .unwrap();
+        let rec = db.get_record(name).expect("record exists");
+        let inst = rec.read();
+        assert_eq!(inst.common.stat, alarm_status::UDF_ALARM, "{name} STAT");
+        assert_eq!(inst.common.amsg, "No such ENV", "{name} AMSG");
+    }
+}
+
+/// softIoc R7.0.10 after one process of each: a set variable leaves UDF 0 and
+/// an lsi LEN of `strlen` ("/home/stevek" → 12), an unset one UDF 1 and LEN 1
+/// (devEnviron.c:56-66, :109-117). Before the process both read UDF 1.
+#[epics_macros_rs::epics_test]
+async fn getenv_udf_and_len_match_softioc() {
+    // SAFETY: nextest isolates each test in its own process (see module doc).
+    unsafe {
+        std::env::set_var("GETENV_E2E_UDF_SET", "/home/stevek");
+        std::env::remove_var("GETENV_E2E_UDF_UNSET");
+    }
+
+    let (db, _) = IocBuilder::new()
+        .db_string(
+            r#"
+record(stringin, "SI") { field(DTYP, "getenv") field(INP, "@GETENV_E2E_UDF_SET") }
+record(lsi, "LI") { field(DTYP, "getenv") field(INP, "@GETENV_E2E_UDF_SET") field(SIZV, "64") }
+record(stringin, "SU") { field(DTYP, "getenv") field(INP, "@GETENV_E2E_UDF_UNSET") }
+record(lsi, "LU") { field(DTYP, "getenv") field(INP, "@GETENV_E2E_UDF_UNSET") }
+"#,
+            &HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+
+    for (name, udf, len) in [
+        ("SI", 0, None),
+        ("LI", 0, Some(12)),
+        ("SU", 1, None),
+        ("LU", 1, Some(1)),
+    ] {
+        assert_eq!(
+            db.get_record(name).unwrap().read().common.udf,
+            1,
+            "{name} UDF at init"
+        );
+        let mut visited = epics_base_rs::server::database::ProcStack::new();
+        db.process_record_with_links(name, &mut visited)
+            .await
+            .unwrap();
+        let rec = db.get_record(name).unwrap();
+        let inst = rec.read();
+        assert_eq!(inst.common.udf, udf, "{name} UDF");
+        if let Some(len) = len {
+            assert_eq!(
+                inst.record.get_field("LEN"),
+                Some(EpicsValue::ULong(len)),
+                "{name} LEN"
+            );
+        }
+    }
 }

@@ -156,7 +156,7 @@ pub fn build_backends(cfg: DiscoveryConfig) -> Vec<Box<dyn Backend>> {
 ///
 /// Returns `None` when the env var is unset or empty (no discovery).
 pub fn from_env() -> Option<DiscoveryConfig> {
-    let raw = epics_base_rs::runtime::env::get("EPICS_CA_DISCOVERY")?;
+    let raw = epics_base_rs::runtime::env::get_lossy("EPICS_CA_DISCOVERY")?;
     let mut items: Vec<DiscoveryConfig> = Vec::new();
     for token in raw.split_whitespace() {
         if let Some(cfg) = parse_token(token) {

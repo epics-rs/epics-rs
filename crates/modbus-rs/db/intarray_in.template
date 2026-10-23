@@ -1,5 +1,6 @@
 record(waveform,"$(P)$(R)") {
     field(DTYP,"asynInt32ArrayIn")
+    field(DESC, "$(DESC=)")
     field(INP,"@asyn($(PORT) $(OFFSET=0))MODBUS_DATA")
     field(SCAN,"$(SCAN)")
     field(FTVL,"LONG")

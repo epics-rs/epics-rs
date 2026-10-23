@@ -48,7 +48,7 @@ pub fn parse_or_exit_styled<T: clap::Parser>(style: UsageErrorStyle) -> T {
                 .then(|| c_option_error(&e, &cmd, &argv))
                 .flatten()
             {
-                Some(msg) => eprint!("{msg}"),
+                Some(msg) => epics_libcom_rs::stderr_print!("{msg}"),
                 None => {
                     let _ = e.print();
                 }
@@ -280,8 +280,8 @@ pub fn wait_timeout_duration(secs: f64) -> Duration {
 ///     PVXS analogue),
 ///   - the EPICS Base release the port targets
 ///     ([`epics_base_rs::EPICS_BASE_VERSION`], from
-///     `configure/CONFIG_BASE_VERSION`) — the `EPICS_VERSION_STRING`
-///     analogue, and
+///     `configure/CONFIG_BASE_VERSION`), printed `EPICS <ver>` as
+///     `EPICS_VERSION_STRING` is, and
 ///   - the PVA wire-protocol version it speaks
 ///     ([`crate::proto::PVA_VERSION`]) — the interop-critical fact a
 ///     "talks to pvxs/Java but not X" report needs, the analogue of
@@ -296,7 +296,7 @@ pub fn version_information() -> &'static str {
     static V: OnceLock<String> = OnceLock::new();
     V.get_or_init(|| {
         format!(
-            "epics-pva-rs {}\nEPICS Base {}\nPVA protocol version {}\n",
+            "epics-pva-rs {}\nEPICS {}\nPVA protocol version {}\n",
             crate::VERSION,
             epics_base_rs::EPICS_BASE_VERSION,
             crate::proto::PVA_VERSION
@@ -307,41 +307,31 @@ pub fn version_information() -> &'static str {
 /// Print the effective PVA client configuration, the shared `-v`
 /// ("make more noise") verbose path for the pvxs-compatible tools.
 ///
-/// pvxs routes `-v` through `verbose=true` and, before issuing any
-/// operation, prints `Effective config\n` followed by the client
-/// context configuration — `tools/get.cpp:99-100`,
-/// `tools/monitor.cpp:97-98`, `tools/put.cpp:109-110`,
-/// `tools/call.cpp:122-123`, and `tools/info.cpp:78-79`. Every one of
-/// those tools emits the same block, so it lives here as a single owner
-/// rather than being re-implemented (or, worse, overloaded onto the
-/// output formatter) per binary.
-///
-/// The configuration shown is the *effective* one. pvxs's
-/// `ContextImpl::effective` is the environment config with `expand()`
-/// applied (`src/client.cpp:542-547`), and `-v` prints that expanded config
-/// (`ctxt.config()`), not the raw environment. So `EPICS_PVA_ADDR_LIST`
-/// is the post-`expand()` SEARCH list — the auto-address-list broadcast
-/// fan-out folded in and the `AUTO_ADDR_LIST` flag cleared to `NO`
-/// (`config.cpp:640-644`) — exactly as the client will search.
-#[cfg(not(epics_embedded_target))]
-pub fn print_effective_config() {
-    print!("{}", effective_config_string());
+/// pvxs routes `-v` through `verbose=true` and, after building the
+/// context, prints `Effective config\n` followed by `ctxt.config()` —
+/// `tools/get.cpp:102-103`, `tools/monitor.cpp:113-114`,
+/// `tools/put.cpp:117-118`, `tools/call.cpp:125-126`, and
+/// `tools/info.cpp:81-82`. That is the context's own post-`expand()`
+/// config ([`crate::client_native::context::PvaClient::config`]), not a
+/// second read of the environment, so the environment's warnings print
+/// once. pvxs writes it to `std::cerr`.
+#[cfg(all(feature = "client", not(epics_embedded_target)))]
+pub fn print_effective_config(client: &crate::client_native::context::PvaClient) {
+    epics_libcom_rs::stderr_print!("{}", effective_config_string(client));
 }
 
 /// Render one resolved [`crate::config::env::Endpoint`] the way pvxs prints
-/// an effective address-list entry. `expand()` gives every entry the
-/// effective UDP port, so the address always carries `:port` — matching pvxs,
-/// which prints `:port` whenever it is non-zero (`SockAddr::operator<<`,
-/// `util.cpp:660-673`). A multicast entry additionally carries its
-/// `,ttl@iface` modifiers, exactly as pvxs `SockEndpoint::operator<<` prints
-/// them (`config.cpp:125-135`).
+/// an effective address-list entry: the address as `SockAddr` prints it
+/// (`:port` only when non-zero, `util.cpp:660-690`), and a multicast entry's
+/// `,ttl@iface` modifiers as `SockEndpoint::operator<<` prints them
+/// (`config.cpp:125-135`).
 #[cfg(not(epics_embedded_target))]
 fn format_endpoint(ep: &crate::config::env::Endpoint) -> String {
     use std::fmt::Write;
-    let mut s = ep.addr.to_string();
+    let mut s = crate::config::env::sock_addr_text(ep.addr);
     if ep.addr.ip().is_multicast() {
-        if let Some(ttl) = ep.ttl {
-            let _ = write!(s, ",{ttl}");
+        if ep.ttl != 0 {
+            let _ = write!(s, ",{}", ep.ttl);
         }
         if let Some(iface) = &ep.iface {
             let _ = write!(s, "@{iface}");
@@ -350,71 +340,72 @@ fn format_endpoint(ep: &crate::config::env::Endpoint) -> String {
     s
 }
 
-/// Render the `Effective config` block as a string (see
-/// [`print_effective_config`]). Split out so the verbose output is
-/// unit-testable without capturing process stdout.
-///
-/// Host-only: it renders the *post-`expand()`* config, and
-/// [`crate::config::env::Config`] does not exist on `epics_embedded_target`.
+/// pvxs `client::Config`'s `operator<<` (`config.cpp:653-663`): the sorted
+/// `updateDefs()` map (`config.cpp:613-622`), one `KEY=value` per line, each
+/// behind the stream's current `indent{}` (`util.cpp:128-139`): none for
+/// `-v`.
 #[cfg(not(epics_embedded_target))]
-pub fn effective_config_string() -> String {
-    use crate::config;
+fn client_config_lines(cfg: &crate::config::env::Config, indent: &str) -> String {
     use std::fmt::Write;
-
-    // Build and expand the client config exactly as the client Context does,
-    // so the readback shows the *effective* SEARCH configuration rather than
-    // the raw environment. pvxs builds `ContextImpl::effective` as the env
-    // config with `expand()` applied (`src/client.cpp:542-547`) and `-v` prints
-    // that effective config (`tools/get.cpp:99-100` prints `ctxt.config()`).
-    // `expand()` folds the auto-address-list broadcast fan-out into the
-    // address list and clears the flag (`config.cpp:640-644`).
-    let mut cfg = config::env::Config::from_client_env();
-    cfg.expand();
-
-    let addr_list = cfg
-        .address_list
-        .iter()
-        .map(format_endpoint)
-        .collect::<Vec<_>>()
-        .join(" ");
-    let name_servers = config::name_servers()
-        .iter()
-        .map(|a| a.to_string())
-        .collect::<Vec<_>>()
-        .join(" ");
-    let interfaces = config::list_intf_addresses()
+    let join = |eps: &[crate::config::env::Endpoint]| {
+        eps.iter()
+            .map(format_endpoint)
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let name_servers = cfg
+        .name_servers
         .iter()
         .map(|a| a.to_string())
         .collect::<Vec<_>>()
         .join(" ");
     let mut s = String::new();
-    let _ = writeln!(s, "Effective config");
-    // pvxs prints the effective Config as a sorted `updateDefs()` map
-    // (config.cpp:613-622, 653-663), so the keys come out alphabetically and use
-    // their canonical `EPICS_PVA_*` names.
-    let _ = writeln!(s, "  EPICS_PVA_ADDR_LIST={addr_list}");
-    // After `expand()` the auto flag is always cleared (`config.cpp:643`),
-    // so the effective config reports `NO` — pvxs prints the same, because
-    // it too renders the post-`expand()` config.
+    let _ = writeln!(s, "{indent}EPICS_PVA_ADDR_LIST={}", join(&cfg.address_list));
     let _ = writeln!(
         s,
-        "  EPICS_PVA_AUTO_ADDR_LIST={}",
+        "{indent}EPICS_PVA_AUTO_ADDR_LIST={}",
         if cfg.auto_addr_list { "YES" } else { "NO" }
     );
-    let _ = writeln!(s, "  EPICS_PVA_BROADCAST_PORT={}", config::broadcast_port());
-    // pvxs keeps the connection timeout as a double and prints it in the
-    // effective config (`config.cpp:211-227 parse_timeout`); the CLI
-    // readback previously omitted `EPICS_PVA_CONN_TMO` entirely.
-    let _ = writeln!(s, "  EPICS_PVA_CONN_TMO={}", config::conn_timeout_secs());
-    // pvxs names this key `EPICS_PVA_INTF_ADDR_LIST`, not the non-pvxs
-    // `interfaces=` the readback used before.
-    let _ = writeln!(s, "  EPICS_PVA_INTF_ADDR_LIST={interfaces}");
-    let _ = writeln!(s, "  EPICS_PVA_NAME_SERVERS={name_servers}");
-    let _ = writeln!(s, "  EPICS_PVA_SERVER_PORT={}", config::server_port());
+    let _ = writeln!(s, "{indent}EPICS_PVA_BROADCAST_PORT={}", cfg.udp_port);
+    let _ = writeln!(
+        s,
+        "{indent}EPICS_PVA_CONN_TMO={}",
+        crate::pvdata::fmt::format_g(cfg.conn_tmo(), 6)
+    );
+    let _ = writeln!(
+        s,
+        "{indent}EPICS_PVA_INTF_ADDR_LIST={}",
+        join(&cfg.interfaces)
+    );
+    let _ = writeln!(s, "{indent}EPICS_PVA_NAME_SERVERS={name_servers}");
+    let _ = writeln!(s, "{indent}EPICS_PVA_SERVER_PORT={}", cfg.tcp_port);
     s
 }
 
-/// Render the effective **server** (`EPICS_PVAS_*`) configuration block —
+/// Render the `Effective config` block as a string (see
+/// [`print_effective_config`]). Split out so the verbose output is
+/// unit-testable without capturing process stderr.
+///
+/// Host-only, as [`crate::config::env::Config`].
+#[cfg(all(feature = "client", not(epics_embedded_target)))]
+pub fn effective_config_string(client: &crate::client_native::context::PvaClient) -> String {
+    format!(
+        "Effective config\n{}",
+        client_config_lines(&client.config(), "")
+    )
+}
+
+/// The `-D` client block's lines: pvxs `target_information` reads a fresh
+/// `client::Config::fromEnv()` and `expand()`s it (`describe.cpp:115-120`),
+/// so this one does read the environment.
+#[cfg(not(epics_embedded_target))]
+pub fn env_client_config_lines(indent: &str) -> String {
+    let mut cfg = crate::config::env::Config::from_client_env();
+    cfg.expand_client();
+    client_config_lines(&cfg, indent)
+}
+
+/// The effective **server** (`EPICS_PVAS_*`) configuration lines —
 /// the server-side companion to `effective_config_string`, used by the
 /// `pvinfo -D` host-troubleshooting report.
 ///
@@ -430,66 +421,61 @@ pub fn effective_config_string() -> String {
 /// Keys and order mirror pvxs's sorted server def map. `EPICS_PVA_CONN_TMO`
 /// is intentionally absent: pvxs sets it in `updateDefs` but its server
 /// `operator<<` filters to the `EPICS_PVAS_` prefix, so it never appears in
-/// the server section. Values come from the same resolved
-/// [`crate::config`] server getters the PVA server itself reads — the
-/// server-precedence `EPICS_PVAS_*`-first variants (`pvas_server_port`,
-/// `server_broadcast_port`, `server_intf_addr_list`,
-/// `server_beacon_addr_list`, `server_ignore_addr_list`,
-/// `auto_beacon_addr_list_enabled`), not the client `server_port` whose
-/// `EPICS_PVA_SERVER_PORT`-first precedence is the opposite
-/// (`config.cpp:402-432` vs `568-578`).
+/// the server section. Values come from
+/// [`crate::config::env::Config::from_server_env`], which reads (and logs)
+/// the environment as `server::Config::fromEnv` does, then
+/// [`crate::config::env::Config::expand_server`].
 ///
-/// Known gap (shared with the client block): the address lists are shown
-/// as configured, not pvxs's post-`expand()` auto-beacon fan-out; that
-/// expansion needs a server `Config`/`expand()` value in the config
-/// module, which this CLI-scoped readback does not own.
-pub fn effective_server_config_string() -> String {
-    use crate::config;
+/// An invalid interface or ignore entry is pvxs `Config::fromEnv`'s throw,
+/// returned as its `what()`. Host-only, as [`effective_config_string`].
+#[cfg(not(epics_embedded_target))]
+pub fn env_server_config_lines(indent: &str) -> Result<String, String> {
+    let mut cfg = crate::config::env::Config::from_server_env()?;
+    let interfaces = cfg.expand_server();
+    Ok(server_config_lines(&cfg, &interfaces, indent))
+}
+
+/// pvxs `server::Config`'s `operator<<` (`config.cpp:531-545`): the sorted
+/// `updateDefs()` map, `EPICS_PVAS_*` keys only. `interfaces` is the text
+/// [`crate::config::env::Config::expand_server`] returned.
+#[cfg(not(epics_embedded_target))]
+fn server_config_lines(
+    cfg: &crate::config::env::Config,
+    interfaces: &[String],
+    indent: &str,
+) -> String {
     use std::fmt::Write;
-    let beacon = config::server_beacon_addr_list()
+    let join = |eps: &[crate::config::env::Endpoint]| {
+        eps.iter()
+            .map(format_endpoint)
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let ignore = cfg
+        .ignore_addrs
         .iter()
-        .map(|a| a.to_string())
-        .collect::<Vec<_>>()
-        .join(" ");
-    let interfaces = config::server_intf_addr_list()
-        .iter()
-        .map(|a| a.to_string())
-        .collect::<Vec<_>>()
-        .join(" ");
-    // pvxs joins ignore entries as `host:port` (`join_addr`); port 0 is
-    // the wildcard "any port from this IP" match.
-    let ignore = config::env::server_ignore_addr_list()
-        .iter()
-        .map(|(ip, port)| format!("{ip}:{port}"))
+        .map(|&(ip, port)| crate::config::env::sock_addr_text(std::net::SocketAddr::new(ip, port)))
         .collect::<Vec<_>>()
         .join(" ");
     let mut s = String::new();
-    let _ = writeln!(s, "Effective server config");
     let _ = writeln!(
         s,
-        "  EPICS_PVAS_AUTO_BEACON_ADDR_LIST={}",
-        if config::auto_beacon_addr_list_enabled() {
-            "YES"
-        } else {
-            "NO"
-        }
+        "{indent}EPICS_PVAS_AUTO_BEACON_ADDR_LIST={}",
+        if cfg.auto_beacon { "YES" } else { "NO" }
     );
-    let _ = writeln!(s, "  EPICS_PVAS_BEACON_ADDR_LIST={beacon}");
     let _ = writeln!(
         s,
-        "  EPICS_PVAS_BROADCAST_PORT={}",
-        config::server_broadcast_port()
+        "{indent}EPICS_PVAS_BEACON_ADDR_LIST={}",
+        join(&cfg.beacon_destinations)
     );
-    let _ = writeln!(s, "  EPICS_PVAS_IGNORE_ADDR_LIST={ignore}");
-    let _ = writeln!(s, "  EPICS_PVAS_INTF_ADDR_LIST={interfaces}");
-    // Server bind port uses pvxs server precedence (`EPICS_PVAS_SERVER_PORT`
-    // first), distinct from the client block's `EPICS_PVA_SERVER_PORT`-first
-    // `server_port`.
+    let _ = writeln!(s, "{indent}EPICS_PVAS_BROADCAST_PORT={}", cfg.udp_port);
+    let _ = writeln!(s, "{indent}EPICS_PVAS_IGNORE_ADDR_LIST={ignore}");
     let _ = writeln!(
         s,
-        "  EPICS_PVAS_SERVER_PORT={}",
-        config::env::pvas_server_port()
+        "{indent}EPICS_PVAS_INTF_ADDR_LIST={}",
+        interfaces.join(" ")
     );
+    let _ = writeln!(s, "{indent}EPICS_PVAS_SERVER_PORT={}", cfg.tcp_port);
     s
 }
 
@@ -520,76 +506,6 @@ pub fn resolve_host_ipv4(host: &str) -> Result<std::net::Ipv4Addr, String> {
             IpAddr::V6(_) => None,
         })
         .ok_or_else(|| format!("no IPv4 address for {host:?}"))
-}
-
-/// Resolve an endpoint `@iface` suffix to the interface's IPv4 address.
-/// Accepts either a literal IPv4 address (returned verbatim) or an OS
-/// interface name (`eth0`, `en0`, `lo0`), looked up via `getifaddrs`.
-///
-/// pvxs's `SockEndpoint` ctor accepts both an interface name and an
-/// interface IPv4 address, normalising the address back to a name
-/// through `IfaceMap::name_of` (`config.cpp:76-80`). Resolving the
-/// suffix only as a DNS host — as the cable tester previously did — made
-/// `pvxvct -B 224.0.1.1@en0` fail unless `en0` happened to exist in DNS.
-/// This is the single owner both tools share for `@iface` resolution.
-pub fn resolve_iface_ipv4(spec: &str) -> Result<std::net::Ipv4Addr, String> {
-    if let Ok(v4) = spec.parse::<std::net::Ipv4Addr>() {
-        return Ok(v4);
-    }
-    #[cfg(all(unix, not(epics_embedded_target)))]
-    {
-        iface_name_to_ipv4(spec)
-    }
-    // RTEMS and VxWorks are both `cfg(unix)`, but RTEMS's newlib exposes no
-    // `getifaddrs`/`ifaddrs`/`freeifaddrs` (design doc §8.1), and neither
-    // does VxWorks's `libc` module, so a name cannot be resolved on either.
-    // Same answer as any other non-getifaddrs host: say so and name the
-    // workaround, rather than guessing an address.
-    #[cfg(any(not(unix), epics_embedded_target))]
-    {
-        Err(format!(
-            "interface-name override {spec:?} requires a host with \
-             getifaddrs(3); pass the interface's IPv4 address instead"
-        ))
-    }
-}
-
-/// Look up an interface's first IPv4 address by name via `getifaddrs`.
-#[cfg(all(unix, not(epics_embedded_target)))]
-fn iface_name_to_ipv4(name: &str) -> Result<std::net::Ipv4Addr, String> {
-    use std::ffi::CStr;
-    use std::net::Ipv4Addr;
-
-    // SAFETY: getifaddrs allocates a linked list we free via
-    // freeifaddrs; every pointer is null-checked before deref.
-    unsafe {
-        let mut ifap: *mut libc::ifaddrs = std::ptr::null_mut();
-        if libc::getifaddrs(&mut ifap) != 0 {
-            return Err(format!(
-                "getifaddrs failed: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-        let mut cur = ifap;
-        let mut found: Option<Ipv4Addr> = None;
-        while !cur.is_null() {
-            let ifa = &*cur;
-            if !ifa.ifa_name.is_null() && !ifa.ifa_addr.is_null() {
-                let ifa_name = CStr::from_ptr(ifa.ifa_name).to_string_lossy();
-                let sa = &*ifa.ifa_addr;
-                if ifa_name == name && sa.sa_family as i32 == libc::AF_INET {
-                    let sin = &*(ifa.ifa_addr as *const libc::sockaddr_in);
-                    // s_addr is in network byte order.
-                    let addr = Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr));
-                    found = Some(addr);
-                    break;
-                }
-            }
-            cur = ifa.ifa_next;
-        }
-        libc::freeifaddrs(ifap);
-        found.ok_or_else(|| format!("interface {name:?} has no IPv4 address"))
-    }
 }
 
 #[cfg(test)]
@@ -700,8 +616,10 @@ mod tests {
     /// `pvcall`/`pvinfo`) prints on `-v`; asserting on the fixed keys
     /// keeps the check environment-independent.
     #[test]
+    #[cfg(feature = "client")]
     fn effective_config_emits_config_keys() {
-        let s = effective_config_string();
+        let s =
+            effective_config_string(&crate::client_native::context::PvaClient::builder().build());
         assert!(s.starts_with("Effective config\n"), "got: {s:?}");
         for key in [
             "EPICS_PVA_ADDR_LIST=",
@@ -733,6 +651,7 @@ mod tests {
     /// config.cpp:640-644). Serialised on `epics_env` because it mutates the
     /// process-global environment.
     #[test]
+    #[cfg(feature = "client")]
     #[serial_test::serial(epics_env)]
     fn effective_config_shows_expanded_addr_list_not_raw_env() {
         // SAFETY: std::env mutation is unsafe in edition 2024; the `epics_env`
@@ -742,27 +661,66 @@ mod tests {
             std::env::set_var("EPICS_PVA_AUTO_ADDR_LIST", "NO");
             std::env::remove_var("EPICS_PVA_BROADCAST_PORT");
         }
-        let s = effective_config_string();
+        let s =
+            effective_config_string(&crate::client_native::context::PvaClient::builder().build());
         // The configured address is rendered with its effective UDP port
         // (default 5076), proving the readback ran through `expand()` instead
         // of echoing the raw env string.
         assert!(
-            s.contains("  EPICS_PVA_ADDR_LIST=1.2.3.4:5076\n"),
+            s.contains("\nEPICS_PVA_ADDR_LIST=1.2.3.4:5076\n"),
             "expanded address list with effective port expected, got:\n{s}"
         );
         // AUTO_ADDR_LIST=NO disables broadcast fan-out, so the effective list
         // is exactly the one configured address.
-        assert!(s.contains("  EPICS_PVA_AUTO_ADDR_LIST=NO\n"), "got:\n{s}");
+        assert!(s.contains("\nEPICS_PVA_AUTO_ADDR_LIST=NO\n"), "got:\n{s}");
 
         // With AUTO_ADDR_LIST=YES the *raw* env says YES, but the effective
         // (post-`expand()`) config always reports NO — the parity fix.
         unsafe { std::env::set_var("EPICS_PVA_AUTO_ADDR_LIST", "YES") };
-        let s = effective_config_string();
+        let s =
+            effective_config_string(&crate::client_native::context::PvaClient::builder().build());
         assert!(
-            s.contains("  EPICS_PVA_AUTO_ADDR_LIST=NO\n"),
+            s.contains("\nEPICS_PVA_AUTO_ADDR_LIST=NO\n"),
             "post-expand AUTO_ADDR_LIST must read NO even when env=YES, got:\n{s}"
         );
 
+        unsafe {
+            std::env::remove_var("EPICS_PVA_ADDR_LIST");
+            std::env::remove_var("EPICS_PVA_AUTO_ADDR_LIST");
+        }
+    }
+
+    /// The `-v` block is the client's own config, pvxs `ctxt.config()`: a
+    /// builder override shows although the environment says otherwise, the
+    /// empty interface list reads as `expand()`'s wildcard, and
+    /// `EPICS_PVA_CONN_TMO` is `tcpTimeout/tmoScale` of the client's timeout.
+    #[test]
+    #[cfg(feature = "client")]
+    #[serial_test::serial(epics_env)]
+    fn effective_config_is_the_clients_not_the_environments() {
+        // SAFETY: std::env mutation is unsafe in edition 2024; the `epics_env`
+        // serial guard makes it race-free.
+        unsafe {
+            std::env::set_var("EPICS_PVA_ADDR_LIST", "1.2.3.4");
+            std::env::set_var("EPICS_PVA_AUTO_ADDR_LIST", "NO");
+            std::env::remove_var("EPICS_PVA_INTF_ADDR_LIST");
+        }
+        let client = crate::client_native::context::PvaClient::builder()
+            .addr_list(vec![crate::config::Endpoint::from(
+                "5.6.7.8:5076".parse::<std::net::SocketAddr>().unwrap(),
+            )])
+            .tcp_timeout(Duration::from_secs(4))
+            .build();
+        let s = effective_config_string(&client);
+        assert!(
+            s.contains("\nEPICS_PVA_ADDR_LIST=5.6.7.8:5076\n"),
+            "got:\n{s}"
+        );
+        assert!(
+            s.contains("\nEPICS_PVA_INTF_ADDR_LIST=0.0.0.0\n"),
+            "got:\n{s}"
+        );
+        assert!(s.contains("\nEPICS_PVA_CONN_TMO=3\n"), "got:\n{s}");
         unsafe {
             std::env::remove_var("EPICS_PVA_ADDR_LIST");
             std::env::remove_var("EPICS_PVA_AUTO_ADDR_LIST");
@@ -776,8 +734,7 @@ mod tests {
     /// `operator<<` filters to the `EPICS_PVAS_` prefix.
     #[test]
     fn effective_server_config_emits_pvas_keys_and_v_stays_client_only() {
-        let s = effective_server_config_string();
-        assert!(s.starts_with("Effective server config\n"), "got: {s:?}");
+        let s = env_server_config_lines("").unwrap();
         for key in [
             "EPICS_PVAS_AUTO_BEACON_ADDR_LIST=",
             "EPICS_PVAS_BEACON_ADDR_LIST=",
@@ -794,11 +751,16 @@ mod tests {
             "CONN_TMO must not appear in the server block: {s}"
         );
         // The client `-v` block is client-only: no EPICS_PVAS_ key.
-        let client = effective_config_string();
-        assert!(
-            !client.contains("EPICS_PVAS_"),
-            "the `-v` client block must not carry server keys: {client}"
-        );
+        #[cfg(feature = "client")]
+        {
+            let client = effective_config_string(
+                &crate::client_native::context::PvaClient::builder().build(),
+            );
+            assert!(
+                !client.contains("EPICS_PVAS_"),
+                "the `-v` client block must not carry server keys: {client}"
+            );
+        }
     }
 
     /// The shared `-V` text reports more than `<binary> <crate-version>`:
@@ -814,7 +776,7 @@ mod tests {
             "got: {v:?}"
         );
         assert!(
-            v.contains(&format!("EPICS Base {}", epics_base_rs::EPICS_BASE_VERSION)),
+            v.contains(&format!("\nEPICS {}\n", epics_base_rs::EPICS_BASE_VERSION)),
             "got: {v:?}"
         );
         assert!(
@@ -844,26 +806,6 @@ mod tests {
         );
         let lo = resolve_host_ipv4("localhost").expect("localhost resolves");
         assert!(lo.is_loopback(), "expected IPv4 loopback, got {lo}");
-    }
-
-    /// `resolve_iface_ipv4` accepts a literal interface IPv4 address
-    /// verbatim and, on Unix, resolves an interface *name* to its IPv4
-    /// address — the dual form pvxs's `SockEndpoint` ctor accepts
-    /// (`config.cpp:76-80`). The loopback interface is `lo` on Linux
-    /// and `lo0` on macOS/BSD; try both.
-    #[test]
-    fn resolve_iface_ipv4_literal_and_name() {
-        assert_eq!(
-            resolve_iface_ipv4("10.0.0.2").unwrap(),
-            std::net::Ipv4Addr::new(10, 0, 0, 2)
-        );
-        #[cfg(unix)]
-        {
-            let lo = resolve_iface_ipv4("lo").or_else(|_| resolve_iface_ipv4("lo0"));
-            if let Ok(v4) = lo {
-                assert!(v4.is_loopback(), "loopback iface IPv4 expected, got {v4}");
-            }
-        }
     }
 
     /// The two `getopt` failure lines every pvAccess tool prints for

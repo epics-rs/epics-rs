@@ -57,12 +57,14 @@ async fn ioc(db_text: &str) -> Arc<PvDatabase> {
         .0
 }
 
-/// A record asking for I/O Intr with no device support at all: C's first
-/// branch, byte for byte, and the demotion it announces.
+/// A record asking for I/O Intr with no device support at all — a calc, whose
+/// type declares no `device()` line (a soft ai has a dset in C, and is
+/// refused as `(no get_ioint_info)` instead): C's first branch, byte for
+/// byte, and the demotion it announces.
 #[epics_macros_rs::epics_test]
 async fn a_record_with_no_dset_is_refused_through_recgbl_record_error() {
     let sink = listen();
-    let db = ioc("record(ai, \"T:A\") { field(SCAN,\"I/O Intr\") }\n").await;
+    let db = ioc("record(calc, \"T:A\") { field(SCAN,\"I/O Intr\") }\n").await;
 
     let log = heard(&sink);
     assert!(
@@ -77,4 +79,31 @@ async fn a_record_with_no_dset_is_refused_through_recgbl_record_error() {
         EpicsValue::Enum(0),
         "the refused record is demoted to Passive"
     );
+}
+
+/// `buildScanLists` feeds `scanAdd` type-major over the name-sorted
+/// `recordTypeList` (`dbScan.c:1054-1076`), so the refusals come out in that
+/// order. softIoc R7.0.10 on the DB below prints A1, A2, B1, L1.
+#[epics_macros_rs::epics_test]
+async fn the_refusals_come_out_in_cs_record_type_order() {
+    let sink = listen();
+    ioc(r#"
+record(longin, "L1") { field(SCAN, "I/O Intr") }
+record(ai, "A1") { field(SCAN, "I/O Intr") }
+record(bi, "B1") { field(SCAN, "I/O Intr") }
+record(ai, "A2") { field(SCAN, "I/O Intr") }
+"#)
+    .await;
+    epics_base_rs::runtime::log::errlog_flush();
+    let log: Vec<String> = sink
+        .lock()
+        .expect("sink")
+        .iter()
+        .filter(|m| m.contains("scanAdd"))
+        .cloned()
+        .collect();
+    let want = ["A1", "A2", "B1", "L1"].map(|pv| {
+        format!("recGblRecordError: scanAdd: I/O Intr not valid (no get_ioint_info)  PV: {pv}\n")
+    });
+    assert_eq!(log, want);
 }

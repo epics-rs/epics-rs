@@ -23,9 +23,12 @@
 //! `dbGet` with `S_db_badChoice` (dbConvert.c:875-882), and the menu converter
 //! that owns every write to the field cannot store one.
 
+mod seeded;
+
 use epics_base_rs::server::db_loader::create_record;
 use epics_base_rs::server::record::RecordInstance;
 use epics_base_rs::types::EpicsValue;
+use seeded::Seeded;
 
 fn instance(record_type: &str) -> RecordInstance {
     let rec = create_record(record_type).expect("record type is registered");
@@ -90,12 +93,14 @@ fn r21_asub_ftype_label_put_resolves_against_the_dbd_menu() {
 /// still land: the label resolves, and the stored index renders as its choice.
 #[test]
 fn r21_common_menu_field_resolves_its_label_and_renders_its_choice() {
-    let mut inst = instance("ai");
-    inst.put_common_field(
+    let ai = Seeded::new("T:ai", create_record("ai").unwrap());
+    ai.put(
         "PRIO",
         EpicsValue::String(epics_base_rs::types::PvString::from("HIGH")),
     )
     .expect("HIGH is a menuPriority choice");
+    let rec = ai.cell();
+    let inst = rec.read();
     assert_eq!(inst.common.prio, 2);
     assert_eq!(dbr_string_of(&inst, "PRIO"), "HIGH");
 }

@@ -2,9 +2,13 @@
 mod access_commands;
 /// C `asInit` (`asDbLib.c:151-154`) with no shell around it — `iocBuild_2`
 /// is its other caller (`iocInit.c:187`).
-pub(crate) use access_commands::as_init;
+#[cfg(test)]
+pub(crate) use access_commands::AsInitOutcome;
+pub(crate) use access_commands::{as_init, as_shutdown};
 mod breakpoint_commands;
 mod commands;
+pub use commands::{DbLoadRecordsHook, db_load_records_hook, set_db_load_records_hook};
+pub(crate) use commands::{db_get_string, db_records_once_only, record_names_type_major};
 /// TAB completion for the interactive editor. Host-only, for the same
 /// reason `run_repl_interactive` is: it is built on `rustyline`.
 #[cfg(not(epics_embedded_target))]
@@ -51,14 +55,15 @@ pub fn add_registrars(names: &[String]) {
     dbstatic_commands::add_registrars(names);
 }
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, RwLock};
 
 use crate::runtime::log::{
     ANSI_ESC_BLUE, ANSI_ESC_BOLD, ANSI_ESC_RED, ANSI_ESC_RESET, ANSI_ESC_UNDERLINE,
 };
 use crate::server::database::PvDatabase;
+use epics_libcom_rs::cfmt::CFloat;
 use registry::*;
 
 /// Error-handling mode set by the `on error` command — C `OnError`
@@ -96,6 +101,15 @@ enum ErrorReaction {
     ResumeFailed,
     /// `on error break` / `halt`: `ret = -1` and out of the loop.
     Stop,
+}
+
+/// What a line calls once C's lookup and argument conversion have passed.
+enum Call {
+    IocshLoad,
+    IocshCmd,
+    On,
+    Help,
+    Registered(CommandDef, Vec<ArgValue>),
 }
 
 /// Whether a line reached a command function.
@@ -139,8 +153,8 @@ struct SourceFile {
 
 /// C `iocsh.cpp:1060-1063`: `strrchr(pathname, '/')`, and `'/'` only —
 /// C does not special-case a backslash even on Windows builds.
-fn script_basename(path: &str) -> &str {
-    match path.rfind('/') {
+fn script_basename(path: &[u8]) -> &[u8] {
+    match path.iter().rposition(|&b| b == b'/') {
         Some(i) => &path[i + 1..],
         None => path,
     }
@@ -183,14 +197,15 @@ impl IocshScope {
     /// A `<` include, an `iocshLoad` or the startup script — C's plain
     /// ctor default (`iocsh.cpp:995` `onerr(Continue)`) over the
     /// `filename` C derives from the path it opened (`:1060-1063`).
-    fn script(path: &str) -> Self {
+    fn script(path: &[u8]) -> Self {
         Self {
             on_error: OnError::Continue,
             errored: None,
             interactive: false,
             file_script: true,
             source: Some(SourceFile {
-                base: script_basename(path).to_string(),
+                // Display-only: `showError`'s `filename`.
+                base: String::from_utf8_lossy(script_basename(path)).into_owned(),
                 lineno: 0,
             }),
         }
@@ -258,7 +273,7 @@ thread_local! {
     /// which is what lets `epicsEnvSet` — an ordinary registered command
     /// with no shell handle — clear a macro that shadows the variable it
     /// just set.
-    static MACRO_SCOPE: std::cell::RefCell<Vec<HashMap<String, String>>> =
+    static MACRO_SCOPE: std::cell::RefCell<Vec<HashMap<Vec<u8>, Vec<u8>>>> =
         std::cell::RefCell::new(vec![HashMap::new()]);
 }
 
@@ -270,7 +285,7 @@ thread_local! {
 /// (`os/default/osdEnv.c:49`, `:61`), so an `iocshLoad("inner.cmd","PORT=OLD")`
 /// macro stops shadowing the environment the moment the loaded script
 /// sets `PORT` itself.
-pub(crate) fn iocsh_env_clear(name: &str) {
+pub(crate) fn iocsh_env_clear(name: &[u8]) {
     MACRO_SCOPE.with(|scope| {
         for frame in scope.borrow_mut().iter_mut() {
             frame.remove(name);
@@ -288,11 +303,20 @@ const MAX_SCRIPT_DEPTH: usize = 32;
 /// `iocshScope scope;`) — every exit path of the executors pops the
 /// scope via `Drop`, which is what makes the fresh `Continue` default
 /// hold for the caller's next line.
-struct ScopeGuard<'a>(&'a IocShell);
+///
+/// It also carries `iocshBody`'s ok-to-block bracket (`iocsh.cpp:1121-1122`,
+/// `:1326-1327`): a shell may wait for the errlog drain, so a line's errlog
+/// output comes out before the next line runs.
+struct ScopeGuard<'a> {
+    shell: &'a IocShell,
+    was_ok_to_block: bool,
+}
 
 impl Drop for ScopeGuard<'_> {
     fn drop(&mut self) {
-        self.0.scopes.borrow_mut().pop();
+        self.shell.scopes.borrow_mut().pop();
+        crate::runtime::log::errlog_flush();
+        crate::runtime::task::set_thread_ok_to_block(self.was_ok_to_block);
     }
 }
 
@@ -311,52 +335,42 @@ impl Drop for MacroScopeGuard {
     }
 }
 
-/// C `softMain` runs the startup script and the prompt as two STATEMENTS of one
-/// `main` — `iocsh(pathname)` at `softMain.cpp:231` returns before `iocsh(NULL)`
-/// at `:250` is reached — so no prompt can appear while a script line is still
-/// running, and nothing has to arrange that.
+/// softMain's one `iocsh(NULL)` (`softMain.cpp:250`) in the
+/// `IocApplication::run` that holds `_main_`. A protocol runner's shell started
+/// by an `iocInit` typed at the prompt is that same statement, queued behind
+/// the prompt already reading, so it ends with that one instead of opening a
+/// second. Outside a run a prompt is a `main`'s own `iocsh(NULL)`, which C
+/// reads at every call.
 ///
-/// Here the two are on different threads. `IocApplication::run` runs the script
-/// on its own `iocsh-startup` thread, and since the script's own `iocInit` line
-/// now starts the protocol runner (C `iocRun` -> `dbRunServers`), the runner's
-/// interactive shell exists while the script still has lines to run. This pair
-/// states the ordering C gets from statement order: while a startup script is
-/// in flight the count is non-zero and [`IocShell::run_repl`] waits before it
-/// reads its first line.
-///
-/// Zero by default, so every shell that is not under an `IocApplication`
-/// startup script — a `CaServerBuilder` binary, a test, the interactive tail —
-/// passes straight through.
-static STARTUP_SCRIPT_PHASE: (Mutex<usize>, std::sync::Condvar) =
-    (Mutex::new(0), std::sync::Condvar::new());
+/// Only `_main_` jobs open and close a run's span, so the queue's order puts
+/// every prompt the run queued inside it, however late that prompt runs.
+static MAIN_PROMPT: std::sync::Mutex<MainPrompt> = std::sync::Mutex::new(MainPrompt::NoRun);
 
-/// Hold the prompt for as long as the returned guard lives.
-///
-/// A guard rather than a begin/end pair because the phase has to end on every
-/// way out of the script — a load error, a `?`, a panic — and a REPL left
-/// waiting on a phase nobody ended is a wedged IOC.
-pub(crate) fn startup_script_phase() -> StartupScriptPhase {
-    *STARTUP_SCRIPT_PHASE.0.lock().unwrap() += 1;
-    StartupScriptPhase
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum MainPrompt {
+    NoRun,
+    Unopened,
+    Opened,
 }
 
-/// See [`startup_script_phase`].
-pub(crate) struct StartupScriptPhase;
+fn set_main_prompt(state: MainPrompt) {
+    *MAIN_PROMPT.lock().unwrap_or_else(|e| e.into_inner()) = state;
+}
 
-impl Drop for StartupScriptPhase {
-    fn drop(&mut self) {
-        let mut in_flight = STARTUP_SCRIPT_PHASE.0.lock().unwrap();
-        *in_flight -= 1;
-        if *in_flight == 0 {
-            STARTUP_SCRIPT_PHASE.1.notify_all();
-        }
+/// One run's [`MAIN_PROMPT`] span: a `_main_` job ahead of the run's first
+/// opens it and one behind its last closes it.
+pub(crate) struct SoftMainPromptSpan(());
+
+impl SoftMainPromptSpan {
+    pub(crate) fn open() -> std::io::Result<Self> {
+        crate::runtime::task::run_on_main_thread(|| set_main_prompt(MainPrompt::Unopened))?;
+        Ok(Self(()))
     }
 }
 
-fn await_startup_script_phase() {
-    let mut in_flight = STARTUP_SCRIPT_PHASE.0.lock().unwrap();
-    while *in_flight > 0 {
-        in_flight = STARTUP_SCRIPT_PHASE.1.wait(in_flight).unwrap();
+impl Drop for SoftMainPromptSpan {
+    fn drop(&mut self) {
+        let _ = crate::runtime::task::run_on_main_thread(|| set_main_prompt(MainPrompt::NoRun));
     }
 }
 
@@ -386,12 +400,26 @@ static COMMAND_REGISTRY: std::sync::OnceLock<Arc<RwLock<CommandRegistry>>> =
 /// The process's command table, built with the base command set on first use —
 /// C's `iocshRegisterCommon` plus the `*IocRegister.c` registrars, all of which
 /// have run before softMain reads a script.
-fn command_registry() -> &'static Arc<RwLock<CommandRegistry>> {
+pub(crate) fn command_registry() -> &'static Arc<RwLock<CommandRegistry>> {
     COMMAND_REGISTRY.get_or_init(|| {
         let mut registry = CommandRegistry::new();
         commands::register_builtins(&mut registry);
         Arc::new(RwLock::new(registry))
     })
+}
+
+/// C `iocshFree` (`iocsh.cpp:785-804`), from an isolated `iocShutdown`: the
+/// command and variable tables go back to what they are born holding — the
+/// base set, which C's next `registerRecordDeviceDriver` registers again
+/// through `iocshRegisterCommon` — so nothing a registrar of this IOC added
+/// is left for the next one.
+pub(crate) fn iocsh_free() {
+    vars::free();
+    let mut registry = CommandRegistry::new();
+    commands::register_builtins(&mut registry);
+    *command_registry()
+        .write()
+        .unwrap_or_else(|e| e.into_inner()) = registry;
 }
 
 /// Register `def` on the process's command table — C `iocshRegister`
@@ -450,7 +478,12 @@ impl IocShell {
     /// Enter one `iocshBody`-equivalent scope.
     fn enter_scope(&self, scope: IocshScope) -> ScopeGuard<'_> {
         self.scopes.borrow_mut().push(scope);
-        ScopeGuard(self)
+        let was_ok_to_block = crate::runtime::task::thread_is_ok_to_block();
+        crate::runtime::task::set_thread_ok_to_block(true);
+        ScopeGuard {
+            shell: self,
+            was_ok_to_block,
+        }
     }
 
     /// The innermost scope, `None` outside every `iocshBody` equivalent
@@ -494,18 +527,13 @@ impl IocShell {
     /// standing `NO_COLOR` deviation; C emits the escapes unconditionally
     /// (verified: `NO_COLOR=1 softIoc` still wrote them to a redirected
     /// stderr).
+    /// It goes to `epicsGetStderr()`, which a `2>` around an `iocshLoad` or
+    /// `iocshCmd` swaps for the inner body's diagnostics.
     fn show_error(&self, msg: &str) {
-        eprintln!("{}", self.format_error(msg));
-    }
-
-    /// [`Self::show_error`]'s text without its stream. C's `showError` writes
-    /// to `epicsGetStderr()`, which a `2>` redirect swaps, so a caller that
-    /// has to route the same framing through [`CommandContext::eprintln`]
-    /// needs the string and not the print.
-    fn format_error(&self, msg: &str) -> String {
         let scopes = self.scopes.borrow();
         let source = scopes.last().and_then(|scope| scope.source.as_ref());
-        format_show_error(source, msg, use_ansi_color())
+        self.ctx
+            .eprintln(&format_show_error(source, msg, use_ansi_color()));
     }
 
     /// Enter the scope of one nested script, refusing past
@@ -519,7 +547,7 @@ impl IocShell {
     /// chain of 400 scripts each including the next runs to the bottom
     /// and writes nothing to stderr. Matching that would trade a named
     /// refusal for a stack overflow, so the cap stays and says so.
-    fn enter_script(&self, path: &str) -> Result<ScopeGuard<'_>, String> {
+    fn enter_script(&self, path: &[u8]) -> Result<ScopeGuard<'_>, String> {
         let depth = self
             .scopes
             .borrow()
@@ -528,8 +556,9 @@ impl IocShell {
             .count();
         if depth >= MAX_SCRIPT_DEPTH {
             return Err(format!(
-                "'{path}': script include depth exceeds {MAX_SCRIPT_DEPTH} — \
-                 recursive '<' / iocshLoad?"
+                "'{}': script include depth exceeds {MAX_SCRIPT_DEPTH} — \
+                 recursive '<' / iocshLoad?",
+                String::from_utf8_lossy(path)
             ));
         }
         Ok(self.enter_scope(IocshScope::script(path)))
@@ -539,7 +568,7 @@ impl IocShell {
     /// enter an `iocshLoad`'s macro scope. The new frame starts as a copy
     /// of the visible set, so the loaded script still resolves everything
     /// the caller could.
-    fn push_macro_scope(&self, macros: &HashMap<String, String>) -> MacroScopeGuard {
+    fn push_macro_scope(&self, macros: &HashMap<Vec<u8>, Vec<u8>>) -> MacroScopeGuard {
         MACRO_SCOPE.with(|scope| {
             let mut scope = scope.borrow_mut();
             let mut frame = scope.last().cloned().unwrap_or_default();
@@ -570,19 +599,22 @@ impl IocShell {
     /// `showError` then framed as `ERROR <file> line <N>: …`; once the
     /// expander raised macLib's own notice the operator saw the same
     /// sentence twice, once framed and once not. The expander owns it.
-    fn expand_line(&self, raw: &str) -> Option<String> {
-        let expanded = MACRO_SCOPE.with(|scope| {
+    fn expand_line(&self, raw: &[u8]) -> Option<Vec<u8>> {
+        let (expanded, notices) = MACRO_SCOPE.with(|scope| {
             let scope = scope.borrow();
             let macros = scope.last().expect("macro scope stack is never empty");
-            crate::server::db_loader::expand_macros(
-                raw,
-                macros,
+            crate::server::db_loader::MacroTable::new(
+                crate::runtime::mac_lib::MacroDefs::from_byte_map(macros),
                 crate::server::db_loader::MacroExpandOptions {
                     env_fallback: true,
                     ..Default::default()
                 },
             )
+            .expand_bytes_deferred(raw)
         });
+        for notice in &notices {
+            crate::runtime::log::errlog_printf(notice);
+        }
         // C `macDefExpand` returns `NULL` on ANY negative length, so a
         // recursive reference fails the line exactly as an undefined one
         // does (`macCore.c:216-224`, `iocsh.cpp:1184-1187`).
@@ -606,17 +638,17 @@ impl IocShell {
     /// Supports C EPICS iocsh output redirection:
     /// - `command > file` — redirect stdout to file (overwrite)
     /// - `command >> file` — redirect stdout to file (append)
-    pub fn execute_line(&self, line: &str) -> CommandResult {
-        self.execute_line_dispatched(line).0
+    pub fn execute_line(&self, line: impl AsRef<[u8]>) -> CommandResult {
+        self.execute_line_dispatched(line.as_ref()).0
     }
 
     /// [`Self::execute_line`] with C's second fact about the line: whether it
     /// reached a command. Only the two `iocshBody` equivalents —
     /// [`Self::run_script`] and the `iocshCmd`/`iocshRun` entry — take it,
     /// because they are the only owners of `scope.errored`.
-    fn execute_line_dispatched(&self, line: &str) -> (CommandResult, Dispatch) {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
+    fn execute_line_dispatched(&self, line: &[u8]) -> (CommandResult, Dispatch) {
+        let line = line.trim_ascii();
+        if line.is_empty() || line.starts_with(b"#") {
             return (Ok(CommandOutcome::Continue), Dispatch::Nothing);
         }
         match self.expand_line(line) {
@@ -631,230 +663,211 @@ impl IocShell {
     /// [`Self::execute_line`] past the one macro expansion — everything
     /// here reads text C has already run through `macDefExpand`, so no
     /// fragment of it is expanded a second time.
-    fn execute_expanded_line(&self, line: &str) -> (CommandResult, Dispatch) {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
+    fn execute_expanded_line(&self, line: &[u8]) -> (CommandResult, Dispatch) {
+        let line = line.trim_ascii();
+        if line.is_empty() || line.starts_with(b"#") {
             return (Ok(CommandOutcome::Continue), Dispatch::Nothing);
         }
 
-        // L-5: C `split()` (`iocsh.cpp:362-371`) flags an unbalanced
-        // quote or a trailing backslash and returns BEFORE
-        // `openRedirect` runs, so a malformed line never creates —
-        // and never truncates — a redirect target. Linting here, ahead
-        // of `parse_redirect`, is what gives the port that ordering;
-        // it also covers the `<` / `iocshLoad` / `on` lines below,
-        // which C lints in the same pass.
-        if let Some(diag) = registry::lint_line(line) {
-            return (Err(diag.to_string()), Dispatch::Nothing);
+        // C `split` (`iocsh.cpp:255-371`) lifts the redirects off the line
+        // before anything reads `argv[0]`, so every command — the ones the
+        // port dispatches itself included — runs under them, and a malformed
+        // line is refused before `openRedirect` can create a target.
+        let registry::Split {
+            argv,
+            mut redirects,
+        } = match registry::split(line) {
+            Ok(split) => split,
+            Err(diag) => return (Err(diag.to_string()), Dispatch::Nothing),
+        };
+
+        // C `:1225-1227`: a line that splits to nothing at all — `()`, `,` —
+        // ends the body, as `exit` does.
+        if argv.is_empty() && redirects.is_empty() {
+            return (Ok(CommandOutcome::Exit), Dispatch::Nothing);
         }
 
-        // `< filename` include. C `iocsh.cpp:1233`
-        // `iocshBody(commandFile, NULL, macros)` re-enters on the same
-        // handle with the same macros, so the included script keeps the
-        // enclosing scope — here it simply stays on the current frame.
-        if let Some(rest) = line.strip_prefix('<') {
-            // C `:1224-1236` runs the include through its own `iocshBody` and
-            // then `if (iocshBody(...)) scope.errored = true;` — it never
+        // `< filename` with no command: C `:1233-1243` runs it as
+        // `iocshBody(commandFile, NULL, macros)` on the same handle with the
+        // same macros, under the line's other redirects — here it simply
+        // stays on the current frame.
+        if argv.is_empty()
+            && let Some(include) = redirects.remove(&0)
+        {
+            let Some(files) = self.open_redirects(&redirects) else {
+                return (Ok(CommandOutcome::Continue), Dispatch::Nothing);
+            };
+            // C `:1240` keeps the include's failure as a bare flag — the inner
+            // `iocshBody` has already printed whatever went wrong — and never
             // CLEARS the caller's flag, because no function of the caller's
             // own was called. Measured on `softIoc` R7.0.10: a `<` of a
             // script whose commands all succeed still leaves the caller
-            // waiting on the failure before it.
-            // C `:1233` keeps the include's failure as a bare flag — the
-            // inner `iocshBody` has already printed whatever went wrong, so
-            // handing its summary back as this line's diagnostic would say
-            // it twice. `Failed` is that flag. An unreported failure is the
+            // waiting on the failure before it. An unreported failure is the
             // one thing C cannot produce here, and it becomes this line's
             // diagnostic so it is still printed exactly once.
-            return match self.run_script(rest.trim()) {
+            return self.with_redirects(files, || match self.run_script(&include.path) {
                 Ok(()) => (Ok(CommandOutcome::Continue), Dispatch::Nothing),
                 Err(ScriptFailure::Reported(_)) => (Ok(CommandOutcome::Failed), Dispatch::Nothing),
                 Err(ScriptFailure::Unreported(msg)) => (Err(msg), Dispatch::Nothing),
-            };
+            });
         }
 
-        // Handle `iocshLoad <path> [macros]` (Issue #847): include with
-        // the macros pushed as a scope for the loaded script.
-        // Intercepting before registry lookup lets the loaded script's
-        // own lines re-enter `execute_line` (supporting `<` /
-        // `iocshLoad` / redirects / registered commands recursively).
-        // The path and macro string arrive already expanded.
-        {
-            let toks = tokenize(line);
-            match toks.first().map(|s| s.as_str()) {
-                // `iocshLoad`, `iocshCmd` and `iocshRun` are registered
-                // commands in C (`iocsh.cpp:1603-1605`), so they are
-                // dispatched: the flag is cleared before they run and set
-                // again only from the `iocshSetError` each one ends with.
-                Some("iocshLoad") => {
-                    let macros = toks
-                        .get(2)
-                        .map(|s| commands::parse_macro_string(s))
-                        .unwrap_or_default();
-                    // A NULL pathname skips the `IOCSH_STARTUP_SCRIPT`
-                    // record and reaches `iocshBody(NULL, NULL, macros)`
-                    // (`iocsh.cpp:1346-1352`), which is the stdin REPL —
-                    // measured: a bare `iocshLoad` under `</dev/null` reads
-                    // EOF at once, returns 0, and the enclosing script runs
-                    // on. Refusing the line here broke that under
-                    // `on error break`.
-                    let Some(path) = toks.get(1) else {
-                        let _scope = self.push_macro_scope(&macros);
-                        return match self.run_repl() {
-                            Ok(()) => (Ok(CommandOutcome::Continue), Dispatch::Ran),
-                            Err(msg) => (Err(msg), Dispatch::Ran),
-                        };
-                    };
-                    // `iocshLoadCallFunc` is `iocshSetError(iocshLoad(...))`
-                    // (`:1492-1495`) — the flag, not a second message, for
-                    // the same reason as `<` above.
-                    return match self.run_script_with_macros(path, &macros) {
-                        Ok(()) => (Ok(CommandOutcome::Continue), Dispatch::Ran),
-                        Err(ScriptFailure::Reported(_)) => {
-                            (Ok(CommandOutcome::Failed), Dispatch::Ran)
-                        }
-                        Err(ScriptFailure::Unreported(msg)) => (Err(msg), Dispatch::Ran),
-                    };
-                }
-                // `iocshCmd` and `iocshRun` are one entry point in C:
-                // `iocshCmd(cmd)` is literally `iocshRun(cmd, NULL)` and
-                // `iocshRun(cmd, macros)` is `iocshBody(NULL, cmd, macros)`
-                // (`iocsh.cpp:1335-1353` @R7.0.10). Both therefore run
-                // exactly ONE command line — `iocshBody` consumes the
-                // string in a single pass (`if (raw != NULL) break;`) and
-                // words are separated only by `" \t(),\r"`
-                // (`iocsh.cpp:271`). There is no `;` separator anywhere in
-                // that file, so `iocshRun("a; b")` looks up the single
-                // command `a;` and reports it unregistered.
-                //
-                // Both re-enter `execute_line`, so they must be
-                // dispatched here (the registry handler signature has
-                // no access to the shell).
-                Some("iocshCmd" | "iocshRun") => {
-                    // `iocshRun` returns 0 immediately for a NULL command
-                    // (`iocsh.cpp:1354-1360`), and `iocshCmd` is that same
-                    // call, so a line naming no command runs nothing and
-                    // does not fail. Reporting a usage line here instead
-                    // made `on error break` abandon the rest of the script.
-                    let Some(cmd) = toks.get(1) else {
-                        return (Ok(CommandOutcome::Continue), Dispatch::Ran);
-                    };
-                    // C `iocsh.cpp:1078-1080`: reaching `iocshBody` with a
-                    // command line rather than a file "implies 'on error
-                    // break'", and it is a scope of its own — the mode
-                    // never reaches the caller's next line.
-                    let _scope = self.enter_scope(IocshScope::command_line());
-                    let (outcome, dispatch) = self.execute_line_dispatched(cmd);
-                    let failure = match &outcome {
-                        Err(e) => Some(e.clone()),
-                        // The command reported for itself, as C's
-                        // `iocshSetError` callers do.
-                        Ok(CommandOutcome::Failed) => Some(String::new()),
-                        Ok(_) => None,
-                    };
-                    self.record_line_result(failure, dispatch);
-                    // C reaches the reaction on the loop pass after
-                    // the failing line, before `if (raw != NULL)
-                    // break;` ends the single-line loop, so the
-                    // implied Break still reports itself.
-                    let _ = self.react_to_error();
-                    return (outcome, Dispatch::Ran);
-                }
-                // `on error continue|break|halt|wait <delay>` —
-                // sets how the running script reacts to a failing
-                // line. Mirrors C `iocsh.cpp` `onCallFunc`.
-                Some("on") => {
-                    return (self.handle_on_command(&toks), Dispatch::Ran);
-                }
-                _ => {}
-            }
-        }
-
-        // Handle `> filename` / `>> filename` output redirection
-        let (cmd_line, redirect) = parse_redirect(line);
-
-        if let Some(redir) = redirect {
-            let result = self.execute_command(cmd_line, Some(&redir));
-            return result;
-        }
-
-        self.execute_command(cmd_line, None)
+        self.execute_command(&argv, &redirects)
     }
 
-    /// Execute a command, optionally redirecting output to a file.
+    /// C `iocshCmd(cmd)`: one command line run as an `iocshBody` of its own.
+    pub fn iocsh_cmd(&self, cmd: impl AsRef<[u8]>) -> CommandResult {
+        let cmd = cmd.as_ref();
+        // C `iocsh.cpp:1078-1080`: reaching `iocshBody` with a command line
+        // rather than a file "implies 'on error break'", and it is a scope
+        // of its own — the mode never reaches the caller's next line.
+        let _scope = self.enter_scope(IocshScope::command_line());
+        let (outcome, dispatch) = self.execute_line_dispatched(cmd);
+        let failure = match &outcome {
+            Err(e) => {
+                // `showError` with this scope's NULL filename: unframed.
+                self.show_error(e);
+                Some(e.clone())
+            }
+            // The command reported for itself, as C's `iocshSetError`
+            // callers do.
+            Ok(CommandOutcome::Failed) => Some(String::new()),
+            Ok(_) => None,
+        };
+        self.record_line_result(failure, dispatch);
+        // C reaches the reaction on the loop pass after the failing line,
+        // before `if (raw != NULL) break;` ends the single-line loop, so the
+        // implied Break still reports itself.
+        let _ = self.react_to_error();
+        // Everything is said; C's `iocshCmd` hands back only the status. An
+        // `exit` ended this one-line body, never the caller's.
+        match outcome {
+            Ok(CommandOutcome::Exit) => Ok(CommandOutcome::Continue),
+            other => other.or(Ok(CommandOutcome::Failed)),
+        }
+    }
+
+    /// [`Self::iocsh_cmd`] from inside a command `caller` is running on this
+    /// thread, writing where `caller` writes: C's `iocshCmd` reaches the
+    /// thread's streams, under whatever redirect the caller's line holds.
+    pub(crate) fn nested_iocsh_cmd(
+        &self,
+        caller: &CommandContext,
+        cmd: impl AsRef<[u8]>,
+    ) -> CommandResult {
+        caller.swap_streams(&self.ctx);
+        let result = self.iocsh_cmd(cmd);
+        caller.swap_streams(&self.ctx);
+        result
+    }
+
+    /// Run one split line under its redirects.
     fn execute_command(
         &self,
-        line: &str,
-        redirect: Option<&Redirect>,
+        tokens: &[IocshString],
+        redirects: &BTreeMap<u8, Redirect>,
     ) -> (CommandResult, Dispatch) {
-        let Some(redir) = redirect else {
-            return self.execute_command_inner(line);
-        };
-
-        // C `iocsh.cpp:401-428` (`startRedirect`) swaps exactly ONE stream
-        // per fd and leaves the others alone: `case 0` → thread stdin,
-        // `case 1` → thread stdout, `case 2` → thread stderr. fds 3-9 have
-        // no `case`, so C opens the file (`openRedirect`, `:378`) and swaps
-        // nothing — the file is created and stays empty. `stopRedirect`
-        // (`:429-451`) restores each swapped stream afterwards, which is what
-        // the scoped `with_*` helpers do here.
-        //
-        // Routing stdout into the fd-2 file would be worse than dropping the
-        // redirect: a `dbl 2>/dev/null` listing is stdout, and it would
-        // vanish. Each stream therefore has its own sink on `CommandContext`.
-
-        // C opens the file FIRST for every fd, including the ones it will not
-        // swap, and a failure aborts the command with `Can't open '%s'`
-        // (`iocsh.cpp:379-388`) rather than running it unredirected.
-        let file_result = if redir.fd == 0 {
-            File::open(&redir.path)
-        } else if redir.append {
-            std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&redir.path)
+        // C breaks out of the body on `exit` before `openRedirect`
+        // (`iocsh.cpp:1248`), so `exit > f` never creates `f`.
+        let exit = tokens.first().is_some_and(|t| t == "exit");
+        let files = if exit {
+            Vec::new()
         } else {
-            File::create(&redir.path)
-        };
-        let file = match file_result {
-            Ok(f) => f,
-            Err(e) => {
-                self.ctx.eprintln(&self.format_error(&format!(
-                    "Can't open '{}': {}",
-                    redir.path,
-                    c_strerror(&e)
-                )));
-                // C `:1245` skips the whole block that sets and clears
+            match self.open_redirects(redirects) {
+                Some(files) => files,
+                // C `:1254` skips the whole block that sets and clears
                 // `scope.errored` when `openRedirect` fails, so the line
                 // neither fails nor clears a pending error.
-                return (Ok(CommandOutcome::Continue), Dispatch::Nothing);
+                None => return (Ok(CommandOutcome::Continue), Dispatch::Nothing),
             }
         };
 
-        match redir.fd {
-            0 => self
-                .ctx
-                .with_input(file, || self.execute_command_inner(line)),
-            1 => self
-                .ctx
-                .with_output(file, || self.execute_command_inner(line)),
-            2 => self
-                .ctx
-                .with_error(file, || self.execute_command_inner(line)),
-            // fds 3-9: C's switch has no arm, so the file is open and every
-            // stream is untouched. Dropping `file` here closes it, as C's
-            // `stopRedirect` close does (`:448`).
-            _ => self.execute_command_inner(line),
-        }
-    }
-
-    fn execute_command_inner(&self, line: &str) -> (CommandResult, Dispatch) {
-        let tokens = tokenize(line);
         if tokens.is_empty() {
             return (Ok(CommandOutcome::Continue), Dispatch::Nothing);
         }
+        // C looks the command up and converts its arguments with the files
+        // open but not yet swapped in (`startRedirect` is `:1272`, after the
+        // `cvtArg` loop), so what it frames there reaches the console.
+        let call = match self.resolve_call(tokens) {
+            Ok(call) => call,
+            Err(refused) => return refused,
+        };
+        self.with_redirects(files, || self.run_call(call, tokens))
+    }
 
+    /// C `openRedirect` (`iocsh.cpp:376-397`): every fd's file, in fd order,
+    /// including the fds 3-9 it will not swap. A failure is `Can't open` and
+    /// no command; the files already open close as C's `stopRedirect` does.
+    fn open_redirects(&self, redirects: &BTreeMap<u8, Redirect>) -> Option<Vec<(u8, File)>> {
+        let mut files = Vec::with_capacity(redirects.len());
+        for (&fd, redir) in redirects {
+            let opened = registry::bytes_path(&redir.path)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
+                .and_then(|path| {
+                    if fd == 0 {
+                        File::open(path)
+                    } else if redir.append {
+                        std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(path)
+                    } else {
+                        File::create(path)
+                    }
+                });
+            match opened {
+                Ok(file) => files.push((fd, file)),
+                Err(e) => {
+                    self.show_error(&format!(
+                        "Can't open '{}': {}",
+                        String::from_utf8_lossy(&redir.path),
+                        c_strerror(&e)
+                    ));
+                    return None;
+                }
+            }
+        }
+        Some(files)
+    }
+
+    /// C `startRedirect`/`stopRedirect` (`iocsh.cpp:399-451`) around `f`:
+    /// `case 0`/`1`/`2` swap the thread's stdin, stdout and stderr and
+    /// restore them after; fds 3-9 have no `case`, so their file stays open
+    /// and swaps nothing.
+    fn with_redirects<R>(&self, mut files: Vec<(u8, File)>, f: impl FnOnce() -> R) -> R {
+        let Some((fd, file)) = files.pop() else {
+            return f();
+        };
+        use crate::runtime::stdio;
+        match fd {
+            0 => stdio::redirect_stdin(std::io::BufReader::new(file), || {
+                self.with_redirects(files, f)
+            }),
+            1 => stdio::redirect_stdout(file, || self.with_redirects(files, f)),
+            2 => stdio::redirect_stderr(file, || self.with_redirects(files, f)),
+            _ => {
+                let _held = file;
+                self.with_redirects(files, f)
+            }
+        }
+    }
+
+    /// The `registryFind` + `cvtArg` half of C `iocshBody` (`:1258-1291`):
+    /// what the line will call, or the refusal that stops it short of a call.
+    fn resolve_call(&self, tokens: &[IocshString]) -> Result<Call, (CommandResult, Dispatch)> {
         let cmd_name = &tokens[0];
-        let arg_tokens = &tokens[1..];
+        // `iocshLoad`, `iocshCmd`, `iocshRun`, `on` and `help` are registered
+        // commands in C (`iocsh.cpp:1603-1613`); the port runs them here
+        // because each needs the shell, which a registry handler cannot
+        // reach. Their arguments are strings or an argv, so none can fail
+        // conversion.
+        match cmd_name.as_bytes() {
+            b"iocshLoad" => return Ok(Call::IocshLoad),
+            b"iocshCmd" | b"iocshRun" => return Ok(Call::IocshCmd),
+            b"on" => return Ok(Call::On),
+            b"help" => return Ok(Call::Help),
+            _ => {}
+        }
 
         // C releases the command table before it calls: `registryFind` returns
         // the entry and `(*found->def.func)(&argBuf[0])` runs with nothing held
@@ -862,20 +875,16 @@ impl IocShell {
         // commands while it runs — `dbLoadDatabase` and every `.dbd` registrar
         // do — and with one process-wide table (see `COMMAND_REGISTRY`) it is
         // load-bearing here too: the script's `iocInit` line performs the build,
-        // and the build registers each link set's `caxr`/`dbcaxr`/… before that
+        // and the build registers each link set's `dbcaxr`/`pvxr`/… before that
         // line returns. Holding the read guard across the handler made that a
         // deadlock. `CommandDef` is `Arc`-backed so the clone is the lookup's
         // result, not a copy of the command.
-        let found = {
-            let registry = self.registry.read().unwrap();
-
-            // Special handling for help — needs access to the registry
-            if cmd_name == "help" {
-                return (self.execute_help(arg_tokens, &registry), Dispatch::Ran);
-            }
-
-            registry.get(cmd_name).cloned()
-        };
+        // Every registered name is text, so a non-UTF-8 one misses as C's
+        // `registryFind` would.
+        let found = cmd_name
+            .to_str()
+            .ok()
+            .and_then(|name| self.registry.read().unwrap().get(name).cloned());
 
         // C `iocsh.cpp:1301-1304`: the registry miss arm is
         // `showError(filename, lineno, ANSI_RED("Command '%s' not
@@ -901,16 +910,95 @@ impl IocShell {
         // registered.`, `dbl` runs, exit status 0.
         let Some(def) = found else {
             self.show_error(&format!("Command '{cmd_name}' not registered."));
-            return (Ok(CommandOutcome::Failed), Dispatch::Nothing);
+            return Err((Ok(CommandOutcome::Failed), Dispatch::Nothing));
         };
 
         // C `cvtArg` failing breaks out of the argument loop WITHOUT reaching
         // the call (`:1288-1291`), so the `:1251` set stands.
-        let args = match parse_args(arg_tokens, &def.args) {
-            Ok(args) => args,
-            Err(e) => return (Err(e), Dispatch::Nothing),
-        };
-        (def.handler.call(&args, &self.ctx), Dispatch::Ran)
+        match parse_args(&tokens[1..], &def.args) {
+            Ok(args) => Ok(Call::Registered(def, args)),
+            Err(e) => Err((Err(e), Dispatch::Nothing)),
+        }
+    }
+
+    /// The call itself (C `:1266-1286`), under whatever redirect the line
+    /// carries.
+    fn run_call(&self, call: Call, tokens: &[IocshString]) -> (CommandResult, Dispatch) {
+        match call {
+            // `iocshLoad`, `iocshCmd` and `iocshRun` are dispatched: the flag
+            // is cleared before they run and set again only from the
+            // `iocshSetError` each one ends with.
+            Call::IocshLoad => {
+                let macros = tokens
+                    .get(2)
+                    .map(|s| commands::parse_macro_string(s))
+                    .unwrap_or_default();
+                // A NULL pathname skips the `IOCSH_STARTUP_SCRIPT`
+                // record and reaches `iocshBody(NULL, NULL, macros)`
+                // (`iocsh.cpp:1346-1352`), which is the stdin REPL —
+                // measured: a bare `iocshLoad` under `</dev/null` reads
+                // EOF at once, returns 0, and the enclosing script runs
+                // on. Refusing the line here broke that under
+                // `on error break`.
+                let Some(path) = tokens.get(1) else {
+                    let _scope = self.push_macro_scope(&macros);
+                    return self.command_ran(self.run_repl().map(|()| CommandOutcome::Continue));
+                };
+                // `iocshLoadCallFunc` is `iocshSetError(iocshLoad(...))`
+                // (`:1492-1495`) — the flag, not a second message, for
+                // the same reason as `<` above.
+                self.command_ran(match self.run_script_with_macros(path, &macros) {
+                    Ok(()) => Ok(CommandOutcome::Continue),
+                    Err(ScriptFailure::Reported(_)) => Ok(CommandOutcome::Failed),
+                    Err(ScriptFailure::Unreported(msg)) => Err(msg),
+                })
+            }
+            // `iocshCmd` and `iocshRun` are one entry point in C:
+            // `iocshCmd(cmd)` is literally `iocshRun(cmd, NULL)` and
+            // `iocshRun(cmd, macros)` is `iocshBody(NULL, cmd, macros)`
+            // (`iocsh.cpp:1335-1353` @R7.0.10). Both therefore run
+            // exactly ONE command line — `iocshBody` consumes the
+            // string in a single pass (`if (raw != NULL) break;`) and
+            // words are separated only by `" \t(),\r"`
+            // (`iocsh.cpp:271`). There is no `;` separator anywhere in
+            // that file, so `iocshRun("a; b")` looks up the single
+            // command `a;` and reports it unregistered.
+            Call::IocshCmd => {
+                // `iocshRun` returns 0 immediately for a NULL command
+                // (`iocsh.cpp:1354-1360`), and `iocshCmd` is that same
+                // call, so a line naming no command runs nothing and
+                // does not fail. Reporting a usage line here instead
+                // made `on error break` abandon the rest of the script.
+                let Some(cmd) = tokens.get(1) else {
+                    return (Ok(CommandOutcome::Continue), Dispatch::Ran);
+                };
+                self.command_ran(self.iocsh_cmd(cmd))
+            }
+            // `on error continue|break|halt|wait <delay>` — sets how the
+            // running script reacts to a failing line. Mirrors C
+            // `iocsh.cpp` `onCallFunc`.
+            Call::On => self.command_ran(self.handle_on_command(tokens)),
+            // Special handling for help — needs access to the registry.
+            Call::Help => {
+                let registry = self.registry.read().unwrap();
+                self.command_ran(self.execute_help(&tokens[1..], &registry))
+            }
+            Call::Registered(def, args) => self.command_ran(def.handler.call(&args, &self.ctx)),
+        }
+    }
+
+    /// The one rule for a line's diagnostic. C frames with `showError`
+    /// (`ERROR <file> line <n>:`) only what `iocshBody` raises before it
+    /// calls a function (`iocsh.cpp:1272-1304`); once a command runs, what
+    /// it prints is its own text, bare and on the stream it was given. So a
+    /// command's `Err` is printed here, inside any redirect, and leaves as
+    /// `Failed`: an `Err` past dispatch is always the shell's own.
+    fn command_ran(&self, result: CommandResult) -> (CommandResult, Dispatch) {
+        let result = result.or_else(|msg| {
+            self.ctx.eprintln(&msg);
+            Ok(CommandOutcome::Failed)
+        });
+        (result, Dispatch::Ran)
     }
 
     /// Execute a script with the `iocshLoad` macros pushed as a scope,
@@ -926,10 +1014,10 @@ impl IocShell {
     /// enter [`Self::execute_script`] (C `iocshBody`) and never set it.
     pub fn execute_script_with_macros(
         &self,
-        path: &str,
-        macros: &HashMap<String, String>,
+        path: impl AsRef<[u8]>,
+        macros: &HashMap<Vec<u8>, Vec<u8>>,
     ) -> Result<(), String> {
-        self.run_script_with_macros(path, macros)
+        self.run_script_with_macros(path.as_ref(), macros)
             .map_err(|f| self.report_once(f))
     }
 
@@ -938,8 +1026,8 @@ impl IocShell {
     /// flag and prints nothing.
     fn run_script_with_macros(
         &self,
-        path: &str,
-        macros: &HashMap<String, String>,
+        path: &[u8],
+        macros: &HashMap<Vec<u8>, Vec<u8>>,
     ) -> Result<(), ScriptFailure> {
         set_startup_script_once(path);
         let _scope = self.push_macro_scope(macros);
@@ -963,8 +1051,9 @@ impl IocShell {
     /// [`Self::execute_script_with_macros`]. C `iocsh.cpp:1233` re-enters
     /// `iocshBody` on the same handle for a `<`, so the include keeps the
     /// enclosing scope and no macro map is threaded here.
-    pub fn execute_script(&self, path: &str) -> Result<(), String> {
-        self.run_script(path).map_err(|f| self.report_once(f))
+    pub fn execute_script(&self, path: impl AsRef<[u8]>) -> Result<(), String> {
+        self.run_script(path.as_ref())
+            .map_err(|f| self.report_once(f))
     }
 
     /// One command line run outside any script, with its status checked.
@@ -981,10 +1070,13 @@ impl IocShell {
     /// returned here has already been printed, either by the command
     /// itself (C `dbLoadRecords` writes its own two lines) or by the
     /// framing below.
-    pub fn execute_line_reported(&self, line: &str) -> Result<(), String> {
+    pub fn execute_line_reported(&self, line: impl AsRef<[u8]>) -> Result<(), String> {
+        let line = line.as_ref();
         match self.execute_expanded_line(line).0 {
             Ok(CommandOutcome::Continue | CommandOutcome::Exit) => Ok(()),
-            Ok(CommandOutcome::Failed) => Err(format!("'{line}' failed")),
+            Ok(CommandOutcome::Failed) => {
+                Err(format!("'{}' failed", String::from_utf8_lossy(line)))
+            }
             Err(e) => {
                 self.show_error(&e);
                 Err(e)
@@ -1013,7 +1105,7 @@ impl IocShell {
     /// echoed BEFORE expansion, the line is expanded exactly once, a
     /// failed expansion marks the script errored without executing the
     /// line, and the ECHO shows the EXPANDED text.
-    fn run_script(&self, path: &str) -> Result<(), ScriptFailure> {
+    fn run_script(&self, path: &[u8]) -> Result<(), ScriptFailure> {
         // The cap is this port's own failure — C has none, it runs out of
         // file descriptors — so nothing has printed it yet.
         let _depth = self.enter_script(path).map_err(ScriptFailure::Unreported)?;
@@ -1022,10 +1114,15 @@ impl IocShell {
         // there is no line yet — and returns a bare -1. Every other
         // diagnostic this loop raises is likewise printed where it happens,
         // so the returned string is only ever a summary for the caller.
-        let content = match std::fs::read_to_string(path) {
+        // Bytes, as C's `fgets` reads them: a line need not be UTF-8.
+        let read = registry::bytes_path(path)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
+            .and_then(std::fs::read);
+        let content = match read {
             Ok(content) => content,
             Err(e) => {
                 let reason = c_strerror(&e);
+                let path = String::from_utf8_lossy(path);
                 self.ctx
                     .eprintln(&paint_error(&format!("Can't open {path}: {reason}")));
                 return Err(ScriptFailure::Reported(format!(
@@ -1055,9 +1152,9 @@ impl IocShell {
             // Comments are echoed but never expanded — C's own comment
             // says this "avoids macLib errors from comments".
             // `#-` silent comments are not echoed (iocsh.cpp:1196-1204).
-            if raw.trim_start().starts_with('#') {
+            if raw.trim_ascii_start().starts_with(b"#") {
                 if let Some(echo) = script_echo(&raw, ANSI_ESC_BLUE, use_ansi_color()) {
-                    println!("{echo}");
+                    self.ctx.println_bytes(&echo);
                 }
                 continue;
             }
@@ -1068,7 +1165,7 @@ impl IocShell {
             let (outcome, dispatch) = match self.expand_line(&raw) {
                 Some(expanded) => {
                     if let Some(echo) = script_echo(&expanded, ANSI_ESC_BOLD, use_ansi_color()) {
-                        println!("{echo}");
+                        self.ctx.println_bytes(&echo);
                     }
                     self.execute_expanded_line(&expanded)
                 }
@@ -1094,9 +1191,12 @@ impl IocShell {
             if let Some(e) = &diagnostic {
                 self.show_error(e);
             }
-            let failure = line_failed.then(|| match &diagnostic {
-                Some(e) => format!("{path}:{line_num}: {e}"),
-                None => format!("{path}:{line_num}"),
+            let failure = line_failed.then(|| {
+                let path = String::from_utf8_lossy(path);
+                match &diagnostic {
+                    Some(e) => format!("{path}:{line_num}: {e}"),
+                    None => format!("{path}:{line_num}"),
+                }
             });
             self.record_line_result(failure, dispatch);
         }
@@ -1111,6 +1211,20 @@ impl IocShell {
             .unwrap_or(Ok(()))
     }
 
+    /// softMain's `iocsh(NULL)`: [`Self::run_repl`], except a second time in
+    /// one `IocApplication::run`, which C's one statement never reaches.
+    pub fn run_main_prompt(&self) -> Result<(), String> {
+        {
+            let mut prompt = MAIN_PROMPT.lock().unwrap_or_else(|e| e.into_inner());
+            match *prompt {
+                MainPrompt::Opened => return Ok(()),
+                MainPrompt::Unopened => *prompt = MainPrompt::Opened,
+                MainPrompt::NoRun => {}
+            }
+        }
+        self.run_repl()
+    }
+
     /// Run the interactive REPL. Blocks until exit or EOF.
     ///
     /// When stdin is not a terminal (piped input, `<script.cmd` shell
@@ -1119,10 +1233,6 @@ impl IocShell {
     /// PROMPT is not a terminal decoration in C and is not one here either,
     /// see `Self::run_repl_piped`.
     pub fn run_repl(&self) -> Result<(), String> {
-        // C's `iocsh(NULL)` is the statement after `iocsh(pathname)`; see
-        // [`STARTUP_SCRIPT_PHASE`] for why that ordering has to be waited for
-        // rather than assumed here.
-        await_startup_script_phase();
         // C `iocsh.cpp:1045-1050` sets `scope.interactive` from
         // `pathname == NULL` — reading stdin, terminal or not — so the
         // piped path below is the interactive scope too.
@@ -1180,7 +1290,6 @@ impl IocShell {
         rl.set_helper(Some(completion::IocshCompleter::new(
             self.registry.clone(),
             self.ctx.db().clone(),
-            self.ctx.bridge().clone(),
         )));
 
         // epics-base 8-D `c0da3dd` ANSI color: tint the prompt
@@ -1261,16 +1370,19 @@ impl IocShell {
         use std::io::{BufRead, Write};
         let (_, prompt) = iocsh_prompt();
         let stdin = std::io::stdin();
-        let mut handle = stdin.lock();
-        let mut line = String::new();
+        let mut line = Vec::new();
         loop {
             print!("{prompt}");
             let _ = std::io::stdout().flush();
             line.clear();
-            match handle.read_line(&mut line) {
+            // Locked for the read only — a match scrutinee would keep the
+            // lock through the arms — so a command that reads stdin takes the
+            // next script line from the same buffer, as from C's one `FILE`.
+            let read = stdin.lock().read_until(b'\n', &mut line);
+            match read {
                 Ok(0) => break, // EOF
                 Ok(_) => {
-                    let trimmed = line.trim();
+                    let trimmed = line.trim_ascii();
                     if trimmed.is_empty() {
                         continue;
                     }
@@ -1281,7 +1393,7 @@ impl IocShell {
                     }
                 }
                 Err(e) => {
-                    eprintln!("stdin read error: {e}");
+                    crate::stderr_println!("stdin read error: {e}");
                     break;
                 }
             }
@@ -1297,25 +1409,25 @@ impl IocShell {
     /// command outright in an interactive shell. Only an unrecognised
     /// mode word is an error: every other misuse prints the usage and
     /// leaves the line's status clean.
-    fn handle_on_command(&self, toks: &[String]) -> CommandResult {
+    fn handle_on_command(&self, toks: &[IocshString]) -> CommandResult {
         const USAGE: &str = "Usage: on error [continue | break | halt | wait <delay>]";
         let Some(scope) = self.current_scope() else {
             // Not called through an `iocshBody` equivalent.
             return Ok(CommandOutcome::Continue);
         };
         if scope.interactive {
-            eprintln!("Interactive shell, 'on error' ignored.");
+            self.ctx.eprintln("Interactive shell, 'on error' ignored.");
             return Ok(CommandOutcome::Continue);
         }
         if toks.len() < 3 || toks[1] != "error" {
-            eprintln!("{USAGE}");
+            self.ctx.eprintln(USAGE);
             return Ok(CommandOutcome::Continue);
         }
-        let mode = match toks[2].as_str() {
-            "continue" => OnError::Continue,
-            "break" => OnError::Break,
-            "halt" => OnError::Halt { timeout: 0.0 },
-            "wait" => {
+        let mode = match toks[2].as_bytes() {
+            b"continue" => OnError::Continue,
+            b"break" => OnError::Break,
+            b"halt" => OnError::Halt { timeout: 0.0 },
+            b"wait" => {
                 // C parses the delay with `epicsParseDouble` — fractional
                 // seconds are the documented spelling — and on a parse
                 // failure prints the usage plus a named diagnostic and
@@ -1323,17 +1435,20 @@ impl IocShell {
                 // C's 0.0, which is a plain halt.
                 let timeout = match toks.get(3) {
                     None => {
-                        eprintln!("{USAGE}");
+                        self.ctx.eprintln(USAGE);
                         0.0
                     }
-                    Some(delay) => match crate::runtime::stdlib::epics_scan_double(delay) {
-                        Some(secs) => secs,
-                        None => {
-                            eprintln!("{USAGE}");
-                            eprintln!("Invalid 'on error wait' delay '{delay}'.");
-                            5.0
+                    Some(delay) => {
+                        match crate::runtime::stdlib::epics_scan_double(&delay.to_str_lossy()) {
+                            Some(secs) => secs,
+                            None => {
+                                self.ctx.eprintln(USAGE);
+                                self.ctx
+                                    .eprintln(&format!("Invalid 'on error wait' delay '{delay}'."));
+                                5.0
+                            }
                         }
-                    },
+                    }
                 };
                 OnError::Halt { timeout }
             }
@@ -1405,11 +1520,14 @@ impl IocShell {
         match scope.on_error {
             OnError::Continue => ErrorReaction::Resume,
             OnError::Break => {
-                eprintln!("iocsh Error: Break");
+                self.ctx.eprintln("iocsh Error: Break");
                 ErrorReaction::Stop
             }
             OnError::Halt { timeout } if timeout > 0.0 && timeout.is_finite() => {
-                eprintln!("iocsh Error: Waiting {timeout:.1} sec ...");
+                self.ctx.eprintln(&format!(
+                    "iocsh Error: Waiting {:.1} sec ...",
+                    CFloat(timeout)
+                ));
                 // C `iocsh.cpp:1140` sleeps through `epicsThreadSleep`,
                 // so an `on error wait 1e300` continues at once instead
                 // of parking the script on a saturated `Duration::MAX`.
@@ -1417,7 +1535,7 @@ impl IocShell {
                 ErrorReaction::ResumeFailed
             }
             OnError::Halt { .. } => {
-                eprintln!("iocsh Error: Halt");
+                self.ctx.eprintln("iocsh Error: Halt");
                 // The shell thread is suspended, not merely blocked: the
                 // operator keeps a live IOC whose boot stopped where it
                 // broke, and `epicsThreadShowAll` says so where it stopped.
@@ -1435,7 +1553,11 @@ impl IocShell {
     /// an `iocshArgArgv` whose `av[0]` is the command name itself; the
     /// port hands this the token list with the name already removed, so
     /// the same test is `arg_tokens.is_empty()`.
-    fn execute_help(&self, arg_tokens: &[String], registry: &CommandRegistry) -> CommandResult {
+    fn execute_help(
+        &self,
+        arg_tokens: &[IocshString],
+        registry: &CommandRegistry,
+    ) -> CommandResult {
         let names = registry.list();
         if arg_tokens.is_empty() {
             self.ctx.println(&format_command_columns(&names));
@@ -1727,19 +1849,8 @@ fn paint_error_if(msg: &str, color: bool) -> String {
 }
 
 /// C `strerror(errno)`, which is what every open-failure diagnostic in
-/// `iocsh.cpp` interpolates. `io::Error`'s Display is the same sentence with
-/// ` (os error N)` appended, so the suffix comes off rather than the message
-/// being rebuilt from a table this port would then have to keep in step.
-fn c_strerror(e: &std::io::Error) -> String {
-    let text = e.to_string();
-    match e.raw_os_error() {
-        Some(errno) => text
-            .strip_suffix(&format!(" (os error {errno})"))
-            .unwrap_or(&text)
-            .to_string(),
-        None => text,
-    }
-}
+/// `iocsh.cpp` interpolates.
+pub use crate::runtime::crt_errno::strerror as c_strerror;
 
 /// Whether a script line should be echoed before execution. Mirrors C
 /// iocsh (`iocsh.cpp:1167-1204`): script lines are echoed, except a
@@ -1747,8 +1858,8 @@ fn c_strerror(e: &std::io::Error) -> String {
 /// is suppressed. A plain `#` comment is still echoed; only `#-` is quiet.
 /// Both kinds are skipped from execution (`execute_line`), so this gate
 /// affects echoing only.
-fn echoes_script_line(line: &str) -> bool {
-    !line.trim_start().starts_with("#-")
+fn echoes_script_line(line: &[u8]) -> bool {
+    !line.trim_ascii_start().starts_with(b"#-")
 }
 
 /// What a script line is echoed as, or `None` when C prints nothing for it.
@@ -1762,14 +1873,14 @@ fn echoes_script_line(line: &str) -> bool {
 /// C paints unconditionally; the port routes every escape it emits through
 /// [`use_ansi_color`], so `NO_COLOR` reaches the echo as it reaches the
 /// prompt and `showError`.
-fn script_echo(line: &str, escape: &str, color: bool) -> Option<String> {
+fn script_echo(line: &[u8], escape: &str, color: bool) -> Option<Vec<u8>> {
     if line.is_empty() || !echoes_script_line(line) {
         return None;
     }
     Some(if color {
-        format!("{escape}{line}{ANSI_ESC_RESET}")
+        [escape.as_bytes(), line, ANSI_ESC_RESET.as_bytes()].concat()
     } else {
-        line.to_string()
+        line.to_vec()
     })
 }
 
@@ -1779,10 +1890,12 @@ fn script_echo(line: &str, escape: &str, color: bool) -> Option<String> {
 /// script (or an inherited value from the parent environment) and a
 /// nested `iocshLoad` no longer overwrites it. Set before the file is
 /// even opened, like C — an unreadable path still lands here.
-fn set_startup_script_once(path: &str) {
-    if std::env::var_os("IOCSH_STARTUP_SCRIPT").is_none() {
+fn set_startup_script_once(path: &[u8]) {
+    if std::env::var_os("IOCSH_STARTUP_SCRIPT").is_none()
+        && let Ok(path) = registry::bytes_path(path)
+    {
         // SAFETY: same single-threaded-shell rationale as `epicsEnvSet`.
-        unsafe { std::env::set_var("IOCSH_STARTUP_SCRIPT", path) };
+        unsafe { std::env::set_var("IOCSH_STARTUP_SCRIPT", path.as_os_str()) };
     }
 }
 
@@ -1797,19 +1910,29 @@ fn set_startup_script_once(path: &str) {
 /// Returns `(physical_line_number, logical_line)` pairs. The line
 /// number is the 1-based index of the *first* physical line in the
 /// group, matching where a user would look for an error.
-pub(crate) fn join_backslash_continuations(input: &str) -> Vec<(usize, String)> {
+pub(crate) fn join_backslash_continuations(input: &[u8]) -> Vec<(usize, Vec<u8>)> {
     let mut out = Vec::new();
-    let mut current = String::new();
+    let mut current = Vec::new();
     let mut start_line: Option<usize> = None;
-    for (idx, line) in input.lines().enumerate() {
+    // `str::lines`' rule over bytes: split at `\n`, drop one `\r` before
+    // it, and no empty last line after a final `\n`.
+    let lines = (!input.is_empty())
+        .then(|| {
+            let input = input.strip_suffix(b"\n").unwrap_or(input);
+            input.split(|&b| b == b'\n')
+        })
+        .into_iter()
+        .flatten()
+        .map(|line| line.strip_suffix(b"\r").unwrap_or(line));
+    for (idx, line) in lines.enumerate() {
         let physical_no = idx + 1;
         if start_line.is_none() {
             start_line = Some(physical_no);
         }
-        if let Some(stripped) = line.strip_suffix('\\') {
-            current.push_str(stripped);
+        if let Some(stripped) = line.strip_suffix(b"\\") {
+            current.extend_from_slice(stripped);
         } else {
-            current.push_str(line);
+            current.extend_from_slice(line);
             out.push((
                 start_line.take().unwrap_or(physical_no),
                 std::mem::take(&mut current),
@@ -1833,107 +1956,74 @@ pub(crate) fn join_backslash_continuations(input: &str) -> Vec<(usize, String)> 
     out
 }
 
-struct Redirect {
-    path: String,
-    append: bool,
-    /// File descriptor target. C iocsh (iocsh.cpp:287-303) accepts
-    /// `1>` through `9>` (and `1>>` ... `9>>`). The Rust port only plumbs
-    /// the stdout sink (fd 1) — `with_output` captures `ctx.println` /
-    /// `print_fmt` writes. Tracking the fd here lets us recognize the C
-    /// syntax without erroring; fd≠1 (e.g. `2>`) leaves stdout untouched
-    /// (the fd-N stream is not plumbed) so `dbl 2>/dev/null` keeps its
-    /// stdout listing rather than misrouting it into the file.
-    fd: u8,
+/// A path as an unquoted iocsh token. The arg scanner honors C's
+/// out-of-quote backslash escape, which would eat the separators of
+/// a native Windows path — forward slashes survive the scanner and
+/// every Windows API accepts them (what a real Windows st.cmd
+/// writes too).
+#[cfg(test)]
+pub(crate) fn script_token(p: &std::path::Path) -> String {
+    p.display().to_string().replace('\\', "/")
 }
 
-/// Parse `>` / `>>` / `N>` / `N>>` redirect from a line.
-/// Returns (command_part, optional redirect).
-///
-/// C parity (iocsh.cpp:287-303): `1>file` through `9>file` and the
-/// double-`>>` (append) variants. Default fd when bare `>` is used is
-/// stdout (fd 1).
-fn parse_redirect(line: &str) -> (&str, Option<Redirect>) {
-    let bytes = line.as_bytes();
-    // C gates the whole redirect block on `!quote && !backslash`
-    // (`iocsh.cpp:273`), the same state that decides separators and
-    // quote termination — so a `>` inside either quote, or escaped, is
-    // ordinary data. [`registry::ShellScan`] is that state.
-    let mut scan = registry::ShellScan::default();
-
-    let mut i = 0;
-    while i < bytes.len() {
-        // C computes the gate from the state BEFORE the byte, then lets
-        // the byte update it (`iocsh.cpp:271-273`).
-        let syntax = scan.is_syntax();
-        scan.feed(bytes[i]);
-        match bytes[i] {
-            b'>' if syntax => {
-                // C parity: if the char before `>` is a single ASCII
-                // digit 1..9 AND that digit follows a separator (start
-                // of line, space, tab) — interpret as N>.
-                let (op_start, fd) = if i > 0 && bytes[i - 1].is_ascii_digit() {
-                    let d = bytes[i - 1];
-                    // Confirm the digit is at a token boundary: either
-                    // i==1 (digit is first non-empty char in line) or
-                    // the char before the digit is whitespace.
-                    let at_boundary =
-                        i == 1 || matches!(bytes[i - 2], b' ' | b'\t' | b'\r' | b'\n');
-                    if at_boundary && (b'1'..=b'9').contains(&d) {
-                        (i - 1, d - b'0')
-                    } else {
-                        (i, 1u8)
-                    }
-                } else {
-                    (i, 1u8)
-                };
-                let is_append = i + 1 < bytes.len() && bytes[i + 1] == b'>';
-                let cmd = line[..op_start].trim_end();
-                let skip = if is_append { 2 } else { 1 };
-                let path = line[i + skip..].trim();
-                if path.is_empty() {
-                    return (line, None);
-                }
-                return (
-                    cmd,
-                    Some(Redirect {
-                        // Already expanded once by `execute_line`, as
-                        // C's `split` sees a `macDefExpand`ed line.
-                        path: path.to_string(),
-                        append: is_append,
-                        fd,
-                    }),
-                );
-            }
-            // C `iocsh.cpp:279-285`: `<` selects `redirects[0]` with mode
-            // "r" — the stdin redirect. Gated on the same `!quote &&
-            // !backslash` state as `>`, so a `<` inside quotes is data.
-            b'<' if syntax => {
-                let cmd = line[..i].trim_end();
-                let path = line[i + 1..].trim();
-                if path.is_empty() {
-                    return (line, None);
-                }
-                return (
-                    cmd,
-                    Some(Redirect {
-                        path: path.to_string(),
-                        append: false,
-                        fd: 0,
-                    }),
-                );
-            }
-            _ => {}
-        }
-        i += 1;
+#[cfg(test)]
+impl IocShell {
+    /// `line > f` on this shell: what `f` got, and what reached C's raw
+    /// `stdout` (the console cell) meanwhile.
+    pub(crate) fn file_and_console(&self, line: &str) -> (String, String) {
+        self.fd_file_and_console(1, line)
     }
 
-    (line, None)
+    /// [`Self::file_and_console`] for `line 2> f` and C's raw `stderr`.
+    pub(crate) fn err_file_and_console(&self, line: &str) -> (String, String) {
+        self.fd_file_and_console(2, line)
+    }
+
+    fn fd_file_and_console(&self, fd: u8, line: &str) -> (String, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("f.txt");
+        let console = dir.path().join("console.txt");
+        let sink = std::fs::File::create(&console).unwrap();
+        let line = format!("{line} {fd}> {}", script_token(&file));
+        let _ = match fd {
+            1 => self
+                .ctx
+                .with_console(sink, std::io::stderr(), || self.execute_line(&line)),
+            _ => self
+                .ctx
+                .with_console(std::io::stdout(), sink, || self.execute_line(&line)),
+        };
+        let read = |p: &std::path::Path| std::fs::read_to_string(p).unwrap_or_default();
+        (read(&file), read(&console))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::server::records::ai::AiRecord;
+
+    /// One `iocsh(NULL)` per run: once it has opened, a later prompt — a
+    /// runner's, queued behind it on `_main_` — returns without reading. Run
+    /// over a stdin that never ends, so a read would hang instead of passing.
+    #[cfg(unix)]
+    #[test]
+    fn a_prompt_after_the_main_one_returns_without_reading() {
+        let mut fds = [0; 2];
+        // SAFETY: `fds` is a two-int out-param; dup2 onto 0 replaces this
+        // test process's stdin with the pipe's read end, kept open by `fds[1]`.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        assert_eq!(unsafe { libc::dup2(fds[0], 0) }, 0);
+
+        *MAIN_PROMPT.lock().unwrap() = MainPrompt::Opened;
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || tx.send(make_shell().run_main_prompt()).unwrap());
+        assert_eq!(
+            rx.recv_timeout(std::time::Duration::from_secs(10)),
+            Ok(Ok(())),
+            "the second prompt read stdin"
+        );
+    }
 
     /// `#-` silent comments are not echoed; plain `#` comments and
     /// commands are. Boundary cases: leading whitespace before `#-`, a
@@ -1942,17 +2032,17 @@ mod tests {
     #[test]
     fn echoes_script_line_suppresses_only_hash_dash() {
         // Silent comments — not echoed.
-        assert!(!echoes_script_line("#-"));
-        assert!(!echoes_script_line("#- a quiet note"));
-        assert!(!echoes_script_line("#-nospace"));
-        assert!(!echoes_script_line("   #- leading whitespace"));
+        assert!(!echoes_script_line(b"#-"));
+        assert!(!echoes_script_line(b"#- a quiet note"));
+        assert!(!echoes_script_line(b"#-nospace"));
+        assert!(!echoes_script_line(b"   #- leading whitespace"));
         // Plain comments — echoed.
-        assert!(echoes_script_line("#"));
-        assert!(echoes_script_line("# normal comment"));
-        assert!(echoes_script_line("# -space after hash"));
+        assert!(echoes_script_line(b"#"));
+        assert!(echoes_script_line(b"# normal comment"));
+        assert!(echoes_script_line(b"# -space after hash"));
         // Commands and blanks — echoed (unchanged behaviour).
-        assert!(echoes_script_line("dbLoadRecords(\"x.db\")"));
-        assert!(echoes_script_line(""));
+        assert!(echoes_script_line(b"dbLoadRecords(\"x.db\")"));
+        assert!(echoes_script_line(b""));
     }
 
     /// The echo bytes, measured against softIoc R7.0.10 running a script
@@ -1962,38 +2052,38 @@ mod tests {
     #[test]
     fn script_echo_paints_comments_blue_and_commands_bold() {
         assert_eq!(
-            script_echo("# plain comment", ANSI_ESC_BLUE, true).as_deref(),
-            Some("\x1b[34;1m# plain comment\x1b[0m")
+            script_echo(b"# plain comment", ANSI_ESC_BLUE, true).as_deref(),
+            Some("\x1b[34;1m# plain comment\x1b[0m".as_bytes())
         );
         assert_eq!(
-            script_echo("   # indented comment", ANSI_ESC_BLUE, true).as_deref(),
-            Some("\x1b[34;1m   # indented comment\x1b[0m")
+            script_echo(b"   # indented comment", ANSI_ESC_BLUE, true).as_deref(),
+            Some("\x1b[34;1m   # indented comment\x1b[0m".as_bytes())
         );
         assert_eq!(
-            script_echo("dbLoadRecords(\"x.db\")", ANSI_ESC_BOLD, true).as_deref(),
-            Some("\x1b[1mdbLoadRecords(\"x.db\")\x1b[0m")
+            script_echo(b"dbLoadRecords(\"x.db\")", ANSI_ESC_BOLD, true).as_deref(),
+            Some("\x1b[1mdbLoadRecords(\"x.db\")\x1b[0m".as_bytes())
         );
         // Leading whitespace is part of the painted text, not stripped.
         assert_eq!(
-            script_echo("   dbLoadRecords(\"x.db\")", ANSI_ESC_BOLD, true).as_deref(),
-            Some("\x1b[1m   dbLoadRecords(\"x.db\")\x1b[0m")
+            script_echo(b"   dbLoadRecords(\"x.db\")", ANSI_ESC_BOLD, true).as_deref(),
+            Some("\x1b[1m   dbLoadRecords(\"x.db\")\x1b[0m".as_bytes())
         );
         // C `:1200`'s `*line`: nothing for an empty line, bold for one that
         // holds only whitespace.
-        assert_eq!(script_echo("", ANSI_ESC_BOLD, true), None);
+        assert_eq!(script_echo(b"", ANSI_ESC_BOLD, true), None);
         assert_eq!(
-            script_echo("\t", ANSI_ESC_BOLD, true).as_deref(),
-            Some("\x1b[1m\t\x1b[0m")
+            script_echo(b"\t", ANSI_ESC_BOLD, true).as_deref(),
+            Some("\x1b[1m\t\x1b[0m".as_bytes())
         );
         // `#-` is silent whichever escape it is offered.
-        assert_eq!(script_echo("#- quiet", ANSI_ESC_BLUE, true), None);
-        assert_eq!(script_echo("   #- quiet", ANSI_ESC_BLUE, true), None);
+        assert_eq!(script_echo(b"#- quiet", ANSI_ESC_BLUE, true), None);
+        assert_eq!(script_echo(b"   #- quiet", ANSI_ESC_BLUE, true), None);
         // NO_COLOR leaves the same text unpainted, and suppresses nothing.
         assert_eq!(
-            script_echo("# plain comment", ANSI_ESC_BLUE, false).as_deref(),
-            Some("# plain comment")
+            script_echo(b"# plain comment", ANSI_ESC_BLUE, false).as_deref(),
+            Some("# plain comment".as_bytes())
         );
-        assert_eq!(script_echo("", ANSI_ESC_BOLD, false), None);
+        assert_eq!(script_echo(b"", ANSI_ESC_BOLD, false), None);
     }
 
     /// Both readers take the same prompt, and it is a prompt whether or not
@@ -2013,15 +2103,6 @@ mod tests {
             iocsh_prompt_if(false),
             ("epics> ".to_string(), "epics> ".to_string())
         );
-    }
-
-    /// A path as an unquoted iocsh token. The arg scanner honors C's
-    /// out-of-quote backslash escape, which would eat the separators of
-    /// a native Windows path — forward slashes survive the scanner and
-    /// every Windows API accepts them (what a real Windows st.cmd
-    /// writes too).
-    fn script_token(p: &std::path::Path) -> String {
-        p.display().to_string().replace('\\', "/")
     }
 
     /// C gates redirect detection on `!quote && !backslash`
@@ -2060,7 +2141,7 @@ mod tests {
 
         // Backslash half: C makes `echo a\>b` print `a>b`.
         let escaped = dir.path().join("escaped_target");
-        let line = format!("echo a\\>{}", escaped.display());
+        let line = format!("echo a\\>{}", script_token(&escaped));
         shell.execute_line(&line).expect("an escaped `>` is data");
         assert!(
             !escaped.exists(),
@@ -2102,16 +2183,16 @@ mod tests {
         let shell = make_shell();
         let dir = tempfile::tempdir().unwrap();
 
-        // `dbLoadTemplate` with an empty subFile diagnoses and returns
-        // (C `dbLoadTemplate.y:350-352`). The message is stderr, so `2>`
-        // must capture it.
+        // `epicsEnvSet` with no name diagnoses on the thread's stderr
+        // (`libComRegister.c`), so `2>` must capture it. Measured on
+        // `softIoc` R7.0.10: `epicsEnvSet 2> f` leaves the sentence in `f`.
         let err = dir.path().join("err.txt");
         shell
-            .execute_line(&format!("dbLoadTemplate(\"\") 2>{}", script_token(&err)))
+            .execute_line(format!("epicsEnvSet 2>{}", script_token(&err)))
             .expect("the redirect itself must not fail the line");
         assert_eq!(
             std::fs::read_to_string(&err).unwrap().trim(),
-            "must specify variable substitution file",
+            "Missing environment variable name argument.",
             "2> must capture the command's stderr"
         );
 
@@ -2120,7 +2201,7 @@ mod tests {
         // routing stdout there would lose the listing entirely.
         let err2 = dir.path().join("err2.txt");
         shell
-            .execute_line(&format!("dbl 2>{}", script_token(&err2)))
+            .execute_line(format!("dbl 2>{}", script_token(&err2)))
             .unwrap();
         assert_eq!(
             std::fs::read_to_string(&err2).unwrap(),
@@ -2131,7 +2212,7 @@ mod tests {
         // `>` still captures stdout, unchanged.
         let out = dir.path().join("out.txt");
         shell
-            .execute_line(&format!("dbl > {}", script_token(&out)))
+            .execute_line(format!("dbl > {}", script_token(&out)))
             .unwrap();
         assert!(
             std::fs::read_to_string(&out).unwrap().contains("TEST_REC"),
@@ -2149,30 +2230,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let f = dir.path().join("fd5.txt");
         shell
-            .execute_line(&format!("dbl 5>{}", script_token(&f)))
+            .execute_line(format!("dbl 5>{}", script_token(&f)))
             .unwrap();
         assert!(f.exists(), "C opens the file for every redirected fd");
         assert_eq!(std::fs::read_to_string(&f).unwrap(), "");
     }
 
-    /// `<file` is C's fd-0 redirect (`iocsh.cpp:279-285`, mode "r"), which the
-    /// port did not parse at all — the whole `< file` ran on as command text.
-    #[test]
-    fn stdin_redirect_is_parsed_as_fd_zero() {
-        let (cmd, redir) = parse_redirect("myCmd < /tmp/in.txt");
-        let redir = redir.expect("`<` is a redirect");
-        assert_eq!(cmd, "myCmd");
-        assert_eq!(redir.fd, 0);
-        assert_eq!(redir.path, "/tmp/in.txt");
-        assert!(!redir.append);
-
-        // Quoted `<` is data, the same gate `>` uses.
-        let (cmd, redir) = parse_redirect("epicsEnvSet(\"X\", 'a<b')");
-        assert!(redir.is_none(), "a quoted `<` is not a redirect");
-        assert_eq!(cmd, "epicsEnvSet(\"X\", 'a<b')");
-    }
-
-    fn make_shell() -> IocShell {
+    pub(super) fn make_shell() -> IocShell {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let db = Arc::new(PvDatabase::new());
         let bridge = {
@@ -2191,7 +2255,7 @@ mod tests {
     fn dump_registrar(shell: &IocShell) -> String {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         shell
-            .execute_line(&format!(
+            .execute_line(format!(
                 "dbDumpRegistrar pdbbase > {}",
                 script_token(tmp.path())
             ))
@@ -2236,12 +2300,12 @@ mod tests {
     fn a_shell_publishes_the_version_macros_a_db_can_expand() {
         let shell = make_shell();
         assert_eq!(
-            shell.expand_line("$(EPICS_VERSION_FULL)").unwrap(),
-            crate::runtime::version::EPICS_VERSION_FULL,
+            shell.expand_line(b"$(EPICS_VERSION_FULL)").unwrap(),
+            crate::runtime::version::EPICS_VERSION_FULL.as_bytes(),
         );
         assert_eq!(
-            shell.expand_line("${ARCH}").unwrap(),
-            crate::runtime::build_info::TARGET_ARCH,
+            shell.expand_line(b"${ARCH}").unwrap(),
+            crate::runtime::build_info::TARGET_ARCH.as_bytes(),
         );
     }
 
@@ -2367,11 +2431,11 @@ mod tests {
     /// directory. Only `/` — C does not special-case a backslash.
     #[test]
     fn script_basename_is_c_s_strrchr_slash() {
-        assert_eq!(script_basename("/tmp/x/sub/d.cmd"), "d.cmd");
-        assert_eq!(script_basename("d.cmd"), "d.cmd");
-        assert_eq!(script_basename("./d.cmd"), "d.cmd");
-        assert_eq!(script_basename("a\\b.cmd"), "a\\b.cmd");
-        assert_eq!(script_basename("dir/"), "");
+        assert_eq!(script_basename(b"/tmp/x/sub/d.cmd"), b"d.cmd");
+        assert_eq!(script_basename(b"d.cmd"), b"d.cmd");
+        assert_eq!(script_basename(b"./d.cmd"), b"d.cmd");
+        assert_eq!(script_basename(b"a\\b.cmd"), b"a\\b.cmd");
+        assert_eq!(script_basename(b"dir/"), b"");
     }
 
     #[test]
@@ -2431,7 +2495,7 @@ mod tests {
             std::env::remove_var("EPICS_RS_CHOSEN");
         }
         shell
-            .execute_line(&format!(
+            .execute_line(format!(
                 "iocshLoad(\"{}\",\"EPICS_RS_PORT=OLD\")",
                 inner.display()
             ))
@@ -2468,7 +2532,7 @@ mod tests {
             std::env::remove_var("EPICS_RS_SEEN");
         }
         shell
-            .execute_line(&format!(
+            .execute_line(format!(
                 "iocshLoad(\"{}\",\"EPICS_RS_GONE=OLD\")",
                 inner.display()
             ))
@@ -2834,13 +2898,13 @@ mod tests {
 
         let miss = dir.path().join("miss.txt");
         shell
-            .execute_line(&format!("help nosuchthing > {}", script_token(&miss)))
+            .execute_line(format!("help nosuchthing > {}", script_token(&miss)))
             .unwrap();
         assert_eq!(std::fs::read_to_string(&miss).unwrap(), "");
 
         let hit = dir.path().join("hit.txt");
         shell
-            .execute_line(&format!("help dbPvd* > {}", script_token(&hit)))
+            .execute_line(format!("help dbPvd* > {}", script_token(&hit)))
             .unwrap();
         let hit = std::fs::read_to_string(&hit).unwrap();
         assert!(hit.contains("dbPvdDump"), "glob must match: {hit}");
@@ -2851,7 +2915,7 @@ mod tests {
         // entry — C dedupes nothing.
         let twice = dir.path().join("twice.txt");
         shell
-            .execute_line(&format!("help dbPvdDump dbPvd* > {}", script_token(&twice)))
+            .execute_line(format!("help dbPvdDump dbPvd* > {}", script_token(&twice)))
             .unwrap();
         let twice = std::fs::read_to_string(&twice).unwrap();
         // Count the synopsis line, which is the only one ending in the
@@ -2875,7 +2939,7 @@ mod tests {
     #[test]
     fn a_failed_include_errors_the_line_without_a_second_message() {
         let shell = make_shell();
-        let (result, dispatch) = shell.execute_line_dispatched("< nonexistent_file.cmd");
+        let (result, dispatch) = shell.execute_line_dispatched(b"< nonexistent_file.cmd");
         assert!(
             matches!(result, Ok(CommandOutcome::Failed)),
             "a failed include is the errored flag, not a diagnostic"
@@ -2905,43 +2969,25 @@ mod tests {
             });
         assert!(result.is_err(), "an unopenable script is a failure");
 
-        // The reason is whatever this platform says about the open the shell
-        // just tried, taken from the same failure rather than spelled out:
-        // glibc's "No such file or directory" is not what Windows prints for
-        // a file that is not there. C's half of the line — the wording, the
-        // colour, the single unframed line — is what this compares.
-        let reason = c_strerror(&std::fs::File::open(&missing_path).expect_err("no such file"));
         let printed = std::fs::read_to_string(&captured).unwrap();
         assert_eq!(
             printed,
             format!(
                 "{}\n",
-                paint_error(&format!("Can't open {missing}: {reason}"))
+                paint_error(&format!("Can't open {missing}: No such file or directory"))
             ),
             "one line, C's wording, C's `strerror` with no Rust suffix"
         );
     }
 
-    /// The same `strerror` text C prints, which `io::Error` renders with a
-    /// ` (os error N)` tail C never has.
+    /// C's `strerror` for a failed open on every OS: no ` (os error N)` tail,
+    /// and on Windows the CRT's text, not "The system cannot find the file
+    /// specified."
     #[test]
-    fn c_strerror_drops_rusts_errno_suffix() {
-        let enoent = std::io::Error::from_raw_os_error(2);
-        assert!(enoent.to_string().ends_with(" (os error 2)"));
-        assert_eq!(
-            c_strerror(&enoent),
-            enoent.to_string().trim_end_matches(" (os error 2)")
-        );
-        // The sentence is the platform's, and only glibc's is the one C
-        // prints here: Windows spells this code "The system cannot find the
-        // file specified."
-        #[cfg(all(unix, target_env = "gnu"))]
+    fn c_strerror_is_cs_text_for_a_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let enoent = std::fs::File::open(dir.path().join("nope")).expect_err("no such file");
         assert_eq!(c_strerror(&enoent), "No such file or directory");
-
-        // Not an OS error, so there is no suffix to drop and the message
-        // must survive whole.
-        let other = std::io::Error::other("stream did not contain valid UTF-8");
-        assert_eq!(c_strerror(&other), "stream did not contain valid UTF-8");
     }
 
     /// epics-base#499: a self-including script must error out at the
@@ -2961,9 +3007,9 @@ mod tests {
         // `scope.errored`). What must hold is that the recursion
         // TERMINATES and the scope stack unwinds.
         let path = dir.path().join("self.cmd");
-        std::fs::write(&path, format!("< {}\n", path.display())).unwrap();
+        std::fs::write(&path, format!("< {}\n", script_token(&path))).unwrap();
         shell
-            .execute_script(&path.display().to_string())
+            .execute_script(path.display().to_string())
             .expect("the cap terminates the recursion; continue keeps ret 0");
         assert!(
             shell.scopes.borrow().is_empty(),
@@ -2973,7 +3019,7 @@ mod tests {
         let path2 = dir.path().join("self2.cmd");
         std::fs::write(&path2, format!("iocshLoad {}\n", script_token(&path2))).unwrap();
         shell
-            .execute_script(&path2.display().to_string())
+            .execute_script(path2.display().to_string())
             .expect("same for the iocshLoad spelling");
         assert!(
             shell.scopes.borrow().is_empty(),
@@ -2987,9 +3033,13 @@ mod tests {
         // (`iocsh.cpp:1233`). Carrying the message up is what used to print
         // it once per frame.
         let path3 = dir.path().join("self3.cmd");
-        std::fs::write(&path3, format!("on error break\n< {}\n", path3.display())).unwrap();
+        std::fs::write(
+            &path3,
+            format!("on error break\n< {}\n", script_token(&path3)),
+        )
+        .unwrap();
         let err = shell
-            .execute_script(&path3.display().to_string())
+            .execute_script(path3.display().to_string())
             .expect_err("break makes the cap's failure the script's result");
         assert_eq!(err, format!("{}:2", path3.display()), "got: {err}");
         assert!(
@@ -3007,7 +3057,7 @@ mod tests {
         let inner = dir.path().join("inner.cmd");
         std::fs::write(&inner, "#- inner\n").unwrap();
         let outer = dir.path().join("outer.cmd");
-        std::fs::write(&outer, format!("< {}\n", inner.display())).unwrap();
+        std::fs::write(&outer, format!("< {}\n", script_token(&inner))).unwrap();
         let outer_path = outer.display().to_string();
         shell
             .execute_script(&outer_path)
@@ -3049,7 +3099,7 @@ mod tests {
         );
 
         unsafe { std::env::remove_var("IOCSH_STARTUP_SCRIPT") };
-        shell.execute_script(&inner.display().to_string()).unwrap();
+        shell.execute_script(inner.display().to_string()).unwrap();
         assert!(
             std::env::var_os("IOCSH_STARTUP_SCRIPT").is_none(),
             "the iocshBody path ('<' includes) must not set the variable"
@@ -3085,7 +3135,7 @@ mod tests {
         let shell = make_shell();
         let tmpdir = tempfile::tempdir().expect("fixture root");
         let tmp = tmpdir.path().join("iocsh_test_dbl_redirect.txt");
-        let line = format!("dbl > {}", tmp.display());
+        let line = format!("dbl > {}", script_token(&tmp));
         let result = shell.execute_line(&line);
         assert!(matches!(result, Ok(CommandOutcome::Continue)));
         let content = std::fs::read_to_string(&tmp).unwrap();
@@ -3102,13 +3152,41 @@ mod tests {
         let tmpdir = tempfile::tempdir().expect("fixture root");
         let tmp = tmpdir.path().join("iocsh_test_append.txt");
         std::fs::write(&tmp, "existing\n").unwrap();
-        let line = format!("dbl >> {}", tmp.display());
+        let line = format!("dbl >> {}", script_token(&tmp));
         let result = shell.execute_line(&line);
         assert!(matches!(result, Ok(CommandOutcome::Continue)));
         let content = std::fs::read_to_string(&tmp).unwrap();
         assert!(content.starts_with("existing\n"));
         assert!(content.contains("TEST_REC"));
         std::fs::remove_file(&tmp).ok();
+    }
+
+    /// C `epicsStdio.h` makes each `printf` the thread's stdout, so `>`
+    /// reaches a print that has no `CommandContext`, in order with the
+    /// command's own lines; another thread's print stays on the console.
+    #[test]
+    fn a_redirect_reaches_a_print_with_no_context() {
+        let shell = make_shell();
+        shell.register(CommandDef::new(
+            "deepPrint",
+            vec![],
+            "deepPrint",
+            |_args: &[ArgValue], ctx: &CommandContext| {
+                ctx.println("one");
+                crate::epics_println!("two");
+                std::thread::spawn(|| crate::epics_println!("elsewhere"))
+                    .join()
+                    .unwrap();
+                ctx.println("three");
+                Ok(CommandOutcome::Continue)
+            },
+        ));
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out.txt");
+        shell
+            .execute_line(format!("deepPrint > {}", script_token(&out)))
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), "one\ntwo\nthree\n");
     }
 
     /// A `2>` (fd≠1) redirect must NOT capture the command's stdout. C
@@ -3122,7 +3200,7 @@ mod tests {
         let shell = make_shell();
         let tmpdir = tempfile::tempdir().expect("fixture root");
         let tmp = tmpdir.path().join("iocsh_test_fd2_redirect.txt");
-        let line = format!("dbl 2> {}", tmp.display());
+        let line = format!("dbl 2> {}", script_token(&tmp));
         let result = shell.execute_line(&line);
         assert!(matches!(result, Ok(CommandOutcome::Continue)));
         // The dbl listing is stdout; a 2> redirect must not divert it
@@ -3136,75 +3214,109 @@ mod tests {
         std::fs::remove_file(&tmp).ok();
     }
 
-    #[test]
-    fn test_parse_redirect() {
-        let (cmd, redir) = parse_redirect("dbl > /tmp/out.txt");
-        assert_eq!(cmd, "dbl");
-        let r = redir.unwrap();
-        assert_eq!(r.path, "/tmp/out.txt");
-        assert!(!r.append);
-        assert_eq!(r.fd, 1, "bare > defaults to fd 1");
+    type SplitParts = (Vec<String>, Vec<(u8, String, bool)>);
 
-        let (cmd, redir) = parse_redirect("dbl >> /tmp/out.txt");
-        assert_eq!(cmd, "dbl");
-        let r = redir.unwrap();
-        assert!(r.append);
-        assert_eq!(r.fd, 1);
-
-        let (cmd, redir) = parse_redirect("dbl");
-        assert_eq!(cmd, "dbl");
-        assert!(redir.is_none());
+    /// `line` through [`registry::split`]: the words, and each fd's
+    /// `(fd, path, append)`.
+    fn split_parts(line: &str) -> Result<SplitParts, &'static str> {
+        let split = registry::split(line.as_bytes())?;
+        Ok((
+            split.argv.iter().map(|w| w.to_string()).collect(),
+            split
+                .redirects
+                .iter()
+                .map(|(&fd, r)| (fd, String::from_utf8_lossy(&r.path).into_owned(), r.append))
+                .collect(),
+        ))
     }
 
-    /// C parity (iocsh.cpp:287-303): `1>file` and `1>>file` are
-    /// fd-numbered variants of `>` and `>>`, and `2>file` requests
-    /// stderr capture. The parser MUST accept these forms; bare `dbl
-    /// 2>err.log` should not error out the line.
+    /// C `split` (`iocsh.cpp:255-371`). The cases are softIoc R7.0.10's
+    /// files for the same lines.
     #[test]
-    fn test_parse_redirect_fd_numbered() {
-        // 1> equivalent to >
-        let (cmd, redir) = parse_redirect("dbl 1>/tmp/out.txt");
-        assert_eq!(cmd, "dbl");
-        let r = redir.unwrap();
-        assert_eq!(r.path, "/tmp/out.txt");
-        assert!(!r.append);
-        assert_eq!(r.fd, 1);
-
-        // 2> stderr
-        let (cmd, redir) = parse_redirect("dbl 2>/tmp/err.txt");
-        assert_eq!(cmd, "dbl");
-        let r = redir.unwrap();
-        assert_eq!(r.path, "/tmp/err.txt");
-        assert!(!r.append);
-        assert_eq!(r.fd, 2);
-
-        // 2>> stderr append
-        let (cmd, redir) = parse_redirect("dbl 2>>/tmp/err.txt");
-        assert_eq!(cmd, "dbl");
-        let r = redir.unwrap();
-        assert_eq!(r.path, "/tmp/err.txt");
-        assert!(r.append);
-        assert_eq!(r.fd, 2);
-
-        // Digit not at boundary — `cmd5>file` is NOT a fd-redirect;
-        // `5` is part of the previous token. Should parse as bare `>`
-        // with fd=1, path=file. (The cmd portion includes the trailing
-        // `5`; this is a syntax oddity but matches C behavior.)
-        let (cmd, redir) = parse_redirect("cmd5>file");
-        let r = redir.unwrap();
-        assert_eq!(r.fd, 1, "digit not at boundary is part of command");
-        assert_eq!(cmd, "cmd5");
-
-        // 9> high fd parses to fd=9
-        let (_cmd, redir) = parse_redirect("foo 9>x");
-        assert_eq!(redir.unwrap().fd, 9);
-
-        // `0>` does NOT parse as fd-numbered (C only accepts 1..9);
-        // it parses as bare `>` with fd=1 leaving `0` in cmd.
-        let (cmd, redir) = parse_redirect("foo 0>x");
-        let r = redir.unwrap();
-        assert_eq!(r.fd, 1);
-        assert_eq!(cmd, "foo 0");
+    fn split_lifts_every_redirect_wherever_it_sits() {
+        let words = |w: &[&str]| w.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let r = |fd, p: &str, a| (fd, p.to_string(), a);
+        for (line, argv, redirects) in [
+            (
+                "dbl > /tmp/out.txt",
+                words(&["dbl"]),
+                vec![r(1, "/tmp/out.txt", false)],
+            ),
+            (
+                "dbl >> /tmp/out.txt",
+                words(&["dbl"]),
+                vec![r(1, "/tmp/out.txt", true)],
+            ),
+            ("dbl", words(&["dbl"]), vec![]),
+            (
+                "dbl 2>>/tmp/err.txt",
+                words(&["dbl"]),
+                vec![r(2, "/tmp/err.txt", true)],
+            ),
+            (
+                "myCmd < /tmp/in.txt",
+                words(&["myCmd"]),
+                vec![r(0, "/tmp/in.txt", false)],
+            ),
+            (
+                "echo hi > a 2> b",
+                words(&["echo", "hi"]),
+                vec![r(1, "a", false), r(2, "b", false)],
+            ),
+            (
+                "> f echo hi",
+                words(&["echo", "hi"]),
+                vec![r(1, "f", false)],
+            ),
+            (
+                "echo > f hi",
+                words(&["echo", "hi"]),
+                vec![r(1, "f", false)],
+            ),
+            (
+                "echo hi > \"p 5.txt\"",
+                words(&["echo", "hi"]),
+                vec![r(1, "p 5.txt", false)],
+            ),
+            ("> f exit", words(&["exit"]), vec![r(1, "f", false)]),
+            (
+                "< inc.cmd > out",
+                words(&[]),
+                vec![r(0, "inc.cmd", false), r(1, "out", false)],
+            ),
+            // Any 1-9 directly before `>` names the fd, inside a word too.
+            ("echo a1>x", words(&["echo", "a"]), vec![r(1, "x", false)]),
+            ("cmd5>file", words(&["cmd"]), vec![r(5, "file", false)]),
+            (
+                "echo hi 12>x",
+                words(&["echo", "hi", "1"]),
+                vec![r(2, "x", false)],
+            ),
+            ("foo 0>x", words(&["foo", "0"]), vec![r(1, "x", false)]),
+            // A second name for one fd ends the scan and keeps the first.
+            (
+                "echo hi > a > b",
+                words(&["echo", "hi"]),
+                vec![r(1, "a", false)],
+            ),
+            // Quoted or escaped, an operator is data.
+            (
+                "epicsEnvSet(\"X\", 'a<b')",
+                words(&["epicsEnvSet", "X", "a<b"]),
+                vec![],
+            ),
+            ("echo a\\>b", words(&["echo", "a>b"]), vec![]),
+        ] {
+            assert_eq!(split_parts(line), Ok((argv, redirects)), "{line}");
+        }
+        for (line, diag) in [
+            ("echo hi >", "Invalid redirection."),
+            ("echo b ><x", "Invalid redirection."),
+            ("echo > \"abc", "Unbalanced quote."),
+            ("echo hi \\", "Trailing backslash."),
+        ] {
+            assert_eq!(split_parts(line), Err(diag), "{line}");
+        }
     }
 
     /// epics-base PR #812 — `dbCreateRecord pdbbase <type> <name>` creates a
@@ -3228,7 +3340,10 @@ mod tests {
         let shell = make_shell();
         // TEST_REC was added by make_shell() — re-creating must fail.
         let r = shell.execute_line("dbCreateRecord pdbbase ai TEST_REC");
-        assert!(r.is_err(), "duplicate name must return Err");
+        assert!(
+            matches!(r, Ok(CommandOutcome::Failed)),
+            "duplicate name must fail"
+        );
         // After the rejected call, the original record (val=42.0) is
         // still there, not overwritten. Verify with dbpr, which reads
         // the live record; `dbgf` cannot be the probe here because C
@@ -3244,14 +3359,20 @@ mod tests {
         // Space inside the name → validate_record_name returns Err.
         // Quote so the parser keeps the space as one argument.
         let r = shell.execute_line("dbCreateRecord pdbbase ai \"BAD NAME\"");
-        assert!(r.is_err(), "bad name must return Err");
+        assert!(
+            matches!(r, Ok(CommandOutcome::Failed)),
+            "bad name must fail"
+        );
     }
 
     #[test]
     fn test_execute_line_db_create_record_rejects_unknown_type() {
         let shell = make_shell();
         let r = shell.execute_line("dbCreateRecord pdbbase nonexistent NEW_REC");
-        assert!(r.is_err(), "unknown record type must return Err");
+        assert!(
+            matches!(r, Ok(CommandOutcome::Failed)),
+            "unknown record type must fail"
+        );
     }
 
     /// UI-105 / epics-base#498 — a failing db* command must trip
@@ -3313,9 +3434,9 @@ mod tests {
             "7 have a trailing space after backslash \\ \n",
             "8 not part of the string no. 7\n",
         );
-        let lines: Vec<String> = join_backslash_continuations(input)
+        let lines: Vec<String> = join_backslash_continuations(input.as_bytes())
             .into_iter()
-            .map(|(_, l)| l)
+            .map(|(_, l)| String::from_utf8(l).unwrap())
             .collect();
         assert_eq!(lines[0], "1 not a multiline string");
         assert_eq!(lines[1], "2 first multiline string");
@@ -3340,7 +3461,7 @@ mod tests {
     #[test]
     fn test_backslash_continuation_line_numbers() {
         let input = "a\nb \\\nc\nd\n";
-        let out = join_backslash_continuations(input);
+        let out = join_backslash_continuations(input.as_bytes());
         assert_eq!(
             out,
             vec![(1, "a".into()), (2, "b c".into()), (4, "d".into())]
@@ -3351,7 +3472,7 @@ mod tests {
     /// (matches `String::lines()` semantics).
     #[test]
     fn test_backslash_continuation_no_trailing_newline() {
-        let out = join_backslash_continuations("partial");
+        let out = join_backslash_continuations(b"partial");
         assert_eq!(out, vec![(1, "partial".into())]);
     }
 
@@ -3359,7 +3480,7 @@ mod tests {
     /// `str::lines()` strips the CR for us).
     #[test]
     fn test_backslash_continuation_crlf() {
-        let out = join_backslash_continuations("a \\\r\nb\r\n");
+        let out = join_backslash_continuations(b"a \\\r\nb\r\n");
         assert_eq!(out, vec![(1, "a b".into())]);
     }
 
@@ -3459,7 +3580,7 @@ mod tests {
         // inner2.cmd PORT=L0,SUBDIR=sub` leaves `$(SUBDIR)` undefined
         // inside the loaded script, while the quoted form defines it.
         shell
-            .execute_line(&format!(
+            .execute_line(format!(
                 "iocshLoad {} \"PORT=L0,SUBDIR=sub\"",
                 script_token(&loaded)
             ))
@@ -3476,13 +3597,13 @@ mod tests {
         )
         .unwrap();
         shell
-            .execute_line(&format!("iocshLoad {}", script_token(&env_only)))
+            .execute_line(format!("iocshLoad {}", script_token(&env_only)))
             .unwrap();
         assert_eq!(std::env::var("R3_ENV_ONLY").unwrap(), "/opt/myioc/db");
 
         // macros empty x env ref present x `<` include at top level.
         shell
-            .execute_line(&format!("< {}", script_token(&env_only)))
+            .execute_line(format!("< {}", script_token(&env_only)))
             .unwrap();
         assert_eq!(std::env::var("R3_ENV_ONLY").unwrap(), "/opt/myioc/db");
 
@@ -3507,7 +3628,7 @@ mod tests {
         // `iocsh.cpp:1184-1187` marks the scope errored and moves on, and
         // `ret` stays 0 under the default `continue`.
         shell
-            .execute_script(&after.display().to_string())
+            .execute_script(after.display().to_string())
             .expect("a skipped line leaves C's ret at 0");
         assert!(std::env::var("R3_AFTER").is_err());
 
@@ -3564,6 +3685,33 @@ mod tests {
         unsafe { std::env::remove_var("R3_PREFIX") };
     }
 
+    /// An escaped argument survives the shell's one expansion and its split
+    /// byte for byte, whichever structural byte it holds.
+    #[test]
+    #[serial_test::serial(epics_env)]
+    fn an_escaped_argument_reaches_the_command_unchanged() {
+        let shell = make_shell();
+        // SAFETY: serial(epics_env) serialises env-mutating tests.
+        unsafe { std::env::set_var("R3_ESCAPED", "expanded") };
+        for arg in [
+            r#"C:\Users\RUNNER~1\j.db"#,
+            r#"a b\t"c" 'd' $(R3_ESCAPED) ${R3_ESCAPED},(e)<f>2>g"#,
+            "P=A:,R=B é\t\\",
+            "",
+            "\\",
+        ] {
+            let line = format!("dbLoadRecords({}, x)", registry::escape_arg(arg));
+            let expanded = shell.expand_line(line.as_bytes()).unwrap();
+            assert_eq!(
+                registry::tokenize(&expanded),
+                vec!["dbLoadRecords", arg, "x"],
+                "{line}"
+            );
+            assert_eq!(registry::lint_line(&expanded), None, "{line}");
+        }
+        unsafe { std::env::remove_var("R3_ESCAPED") };
+    }
+
     /// A macro value carrying token separators is re-tokenized because
     /// the single expansion runs over the WHOLE line before `split`
     /// (C `iocsh.cpp:1184` then `:1215`). Guards against re-introducing
@@ -3574,7 +3722,7 @@ mod tests {
         let shell = make_shell();
         // SAFETY: serial(epics_env) serialises env-mutating tests.
         unsafe { std::env::set_var("R3_MULTIWORD", "dbpr TEST_REC 2") };
-        let expanded = shell.expand_line("$(R3_MULTIWORD) EXTRA").unwrap();
+        let expanded = shell.expand_line(b"$(R3_MULTIWORD) EXTRA").unwrap();
         assert_eq!(
             registry::tokenize(&expanded),
             vec!["dbpr", "TEST_REC", "2", "EXTRA"]
@@ -3627,7 +3775,7 @@ mod tests {
         // default `on error continue` (`iocsh.cpp:1037`), so the two are
         // asserted separately.
         let line_result =
-            shell.execute_line_reported(&format!("dbLoadRecords {}", script_token(&db_path)));
+            shell.execute_line_reported(format!("dbLoadRecords {}", script_token(&db_path)));
         let script_result = shell.execute_script(script_path.to_str().unwrap());
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_file(&script_path);
@@ -3668,7 +3816,7 @@ mod tests {
         let tmpdir = tempfile::tempdir().expect("fixture root");
         let tmp = tmpdir.path().join("iocsh_load_err.cmd");
         std::fs::write(&tmp, "nonexistent_cmd\ndbl\n").unwrap();
-        let result = shell.execute_line(&format!("iocshLoad {}", script_token(&tmp)));
+        let result = shell.execute_line(format!("iocshLoad {}", script_token(&tmp)));
         std::fs::remove_file(&tmp).ok();
         assert!(
             result.is_ok(),
@@ -3677,7 +3825,7 @@ mod tests {
 
         let brk = tmpdir.path().join("iocsh_load_err_break.cmd");
         std::fs::write(&brk, "on error break\nnonexistent_cmd\ndbl\n").unwrap();
-        let result = shell.execute_line(&format!("iocshLoad {}", script_token(&brk)));
+        let result = shell.execute_line(format!("iocshLoad {}", script_token(&brk)));
         std::fs::remove_file(&brk).ok();
         // `iocshSetError(iocshLoad(...))` sets the flag and prints nothing —
         // the loaded body already showed the failing line and the `Break`
@@ -3703,7 +3851,7 @@ mod tests {
         std::fs::write(&outer, format!("on error break\n< {missing}\n")).unwrap();
 
         let err = shell
-            .execute_script(&script_token(&outer))
+            .execute_script(script_token(&outer))
             .expect_err("break turns the failed include into the script's result");
         assert_eq!(err, format!("{}:2", script_token(&outer)));
     }
@@ -3714,13 +3862,23 @@ mod tests {
         // C accepts the call and lets the body diagnose it:
         // `dbStaticIocRegister.c:294-295` at `f4ccf7bc8` sets
         // `S_dbLib_recordNameMissing` and `:307-308` prints it on stderr
-        // and sets the shell error, which is what Err carries here. The
-        // command is in no release tag, so it is absent at the `R7.0.10`
-        // pin.
-        match shell.execute_line("dbCreateRecord pdbbase ai") {
-            Err(msg) => assert_eq!(msg, "33554465 Record name is required"),
-            Ok(_) => panic!("a missing record name must fail the command"),
-        }
+        // and sets the shell error. The command is in no release tag, so
+        // it is absent at the `R7.0.10` pin.
+        let dir = tempfile::tempdir().unwrap();
+        let captured = dir.path().join("captured.err");
+        let result = shell
+            .ctx
+            .with_error(std::fs::File::create(&captured).unwrap(), || {
+                shell.execute_line("dbCreateRecord pdbbase ai")
+            });
+        assert!(
+            matches!(result, Ok(CommandOutcome::Failed)),
+            "a missing record name must fail the command"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&captured).unwrap(),
+            "33554465 Record name is required\n"
+        );
     }
 
     /// `iocshCmd("dbl")` runs a single command line by
@@ -3817,7 +3975,7 @@ mod tests {
         let shell = make_shell();
         let tmpdir = tempfile::tempdir().expect("fixture root");
         let tmp = tmpdir.path().join("iocsh_dbsr_report.txt");
-        let line = format!("dbsr > {}", tmp.display());
+        let line = format!("dbsr > {}", script_token(&tmp));
         assert!(matches!(
             shell.execute_line(&line),
             Ok(CommandOutcome::Continue)
@@ -3903,13 +4061,13 @@ mod tests {
             &outer,
             format!(
                 "< {}\nnonexistent_cmd\ndbl > {}\n",
-                inner.display(),
-                out.display()
+                script_token(&inner),
+                script_token(&out)
             ),
         )
         .unwrap();
 
-        let result = shell.execute_script(&outer.display().to_string());
+        let result = shell.execute_script(outer.display().to_string());
         assert!(
             result.is_ok(),
             "the caller's own scope is `continue`, so C's ret stays 0"
@@ -3939,12 +4097,12 @@ mod tests {
             &script,
             format!(
                 "iocshRun \"nonexistent_cmd\"\nnonexistent_cmd\ndbl > {}\n",
-                after.display()
+                script_token(&after)
             ),
         )
         .unwrap();
 
-        let result = shell.execute_script(&script.display().to_string());
+        let result = shell.execute_script(script.display().to_string());
         assert!(
             result.is_ok(),
             "the enclosing script's scope is `continue`, so C's ret stays 0"
@@ -3969,13 +4127,13 @@ mod tests {
             &script,
             format!(
                 "on error wait 0.25\nnonexistent_cmd\ndbl > {}\n",
-                out.display()
+                script_token(&out)
             ),
         )
         .unwrap();
 
         let start = std::time::Instant::now();
-        let result = shell.execute_script(&script.display().to_string());
+        let result = shell.execute_script(script.display().to_string());
         let elapsed = start.elapsed();
         assert!(result.is_err(), "the failing line must still be reported");
         assert!(
@@ -3994,7 +4152,7 @@ mod tests {
         let script = dir.join("st.cmd");
         std::fs::write(&script, body).unwrap();
         let start = std::time::Instant::now();
-        let _ = shell.execute_script(&script.display().to_string());
+        let _ = shell.execute_script(script.display().to_string());
         start.elapsed()
     }
 
@@ -4034,7 +4192,7 @@ mod tests {
             dir.path(),
             &format!(
                 "on error wait {WAIT_UNIT}\nnonexistent_cmd\ndbl > {}\n# one\n",
-                out.display()
+                script_token(&out)
             ),
         );
         assert!(out.exists(), "'wait' continues the script after the stall");
@@ -4056,13 +4214,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("inner.txt");
         let inner = dir.path().join("inner.cmd");
-        std::fs::write(&inner, format!("dbl > {}\n", out.display())).unwrap();
+        std::fs::write(&inner, format!("dbl > {}\n", script_token(&out))).unwrap();
         let elapsed = timed_script(
             &shell,
             dir.path(),
             &format!(
                 "on error wait {WAIT_UNIT}\nnonexistent_cmd\n< {}\n",
-                inner.display()
+                script_token(&inner)
             ),
         );
         assert!(out.exists(), "the include itself must have run");
@@ -4102,7 +4260,7 @@ mod tests {
         let script = dir.path().join("st.cmd");
         std::fs::write(&script, "on error break\nnonexistent_cmd\n").unwrap();
         assert!(
-            shell.execute_script(&script.display().to_string()).is_err(),
+            shell.execute_script(script.display().to_string()).is_err(),
             "`break` on the file's last line must still set C's ret = -1"
         );
     }
@@ -4171,7 +4329,7 @@ mod tests {
             );
         }
 
-        let _scope = shell.enter_scope(IocshScope::script("st.cmd"));
+        let _scope = shell.enter_scope(IocshScope::script(b"st.cmd"));
         assert_eq!(shell.current_scope().unwrap().on_error, OnError::Continue);
 
         shell.execute_line("on error halt").unwrap();
@@ -4205,7 +4363,10 @@ mod tests {
         );
 
         assert!(
-            shell.execute_line("on error bogus").is_err(),
+            matches!(
+                shell.execute_line("on error bogus"),
+                Ok(CommandOutcome::Failed)
+            ),
             "an unrecognised mode is the one case C flags as an error"
         );
     }
@@ -4214,10 +4375,10 @@ mod tests {
     #[test]
     fn test_single_quote_tokenization() {
         assert_eq!(
-            tokenize("dbpf REC:VAL 'hello world'"),
+            tokenize(b"dbpf REC:VAL 'hello world'"),
             vec!["dbpf", "REC:VAL", "hello world"]
         );
-        assert_eq!(tokenize("cmd('a, b', c)"), vec!["cmd", "a, b", "c"]);
+        assert_eq!(tokenize(b"cmd('a, b', c)"), vec!["cmd", "a, b", "c"]);
     }
 
     /// L-5: an unbalanced quote / trailing backslash is flagged.

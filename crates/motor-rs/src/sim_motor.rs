@@ -1,29 +1,47 @@
-use asyn_rs::error::AsynResult;
-use asyn_rs::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind};
+use asyn_rs::error::{AsynError, AsynResult, AsynStatus};
+use asyn_rs::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind, PollFailure};
 use asyn_rs::user::AsynUser;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-/// Simulated motor for testing.
-/// Uses time-based linear interpolation to simulate motion.
+mod route;
+
+use route::{Demand, Reroute, Route};
+
+/// C `motorSimTask`'s period: it sleeps DELTA (0.1 s) after each step's
+/// work and passes the measured interval to `process`
+/// (motorSimDriver.cpp:255-270), 0.10018 s on the reference box. Being
+/// over DELTA keeps a step off a route that ends on the DELTA grid, where
+/// `routeDemand` would leave a residual velocity and no Done.
+const PERIOD: Duration = Duration::from_micros(100_180);
+
+/// Simulated motor: one C motorSim axis (motorSimDriver.cpp). The axis
+/// follows `route.c` paths, stepped every 0.1 s as `motorSimTask` steps it,
+/// and its status is the parameters the last step set.
 pub struct SimMotor {
-    position: f64,
-    encoder_position: f64,
-    target: f64,
-    velocity: f64,
-    moving: bool,
-    move_start: Option<Instant>,
-    start_position: f64,
+    route: Route,
+    /// `endpoint_`: where the route is heading, physical.
+    endpoint: Demand,
+    /// `nextpoint_`: where the axis is, physical.
+    nextpoint: Demand,
+    reroute: Reroute,
     high_limit: f64,
     low_limit: f64,
+    /// `home_`, physical.
+    home_position: f64,
+    /// User minus physical position, moved only by `set_position` (C
+    /// motorSimAxis `enc_offset_`).
+    offset: f64,
+    homing: bool,
     homed: bool,
-    powered: bool,
+    /// The controller's `movesDeferred_`.
+    defer: bool,
+    /// `deferred_position_` while `deferred_move_` is set, user.
+    deferred_position: Option<f64>,
+    /// The step clock: the last step ran at this instant.
+    last_step: Instant,
+    /// The axis parameters, as the last step or command wrote them.
+    posted: MotorStatus,
     closed_loop_enabled: bool,
-    /// If true, velocity move mode (JOG)
-    velocity_mode: bool,
-    velocity_direction: bool,
-    /// Deferred moves support
-    deferred: bool,
-    deferred_moves: Vec<(f64, f64, f64)>, // (position, velocity, acceleration)
     /// Profile move support
     profile_positions: Vec<f64>,
     profile_readbacks: Vec<f64>,
@@ -40,89 +58,207 @@ pub struct SimMotor {
 }
 
 impl SimMotor {
+    /// C motorSimController's axis defaults: hard limits ±10000 steps,
+    /// home and start 0 (motorSimDriver.cpp:31-34).
     pub fn new() -> Self {
-        Self {
-            position: 0.0,
-            encoder_position: 0.0,
-            target: 0.0,
-            velocity: 1.0,
-            moving: false,
-            move_start: None,
-            start_position: 0.0,
-            high_limit: 1000.0,
-            low_limit: -1000.0,
+        Self::starting_at(0.0, -10_000.0, 10_000.0)
+    }
+
+    /// C motorSimAxis's constructor: at rest at `start`, Amax = Vmax = 1.
+    fn starting_at(start: f64, low_limit: f64, high_limit: f64) -> Self {
+        let at = Demand {
+            t: 0.0,
+            p: start,
+            v: 0.0,
+        };
+        let mut motor = Self {
+            route: Route::new(at, 1.0, 1.0),
+            endpoint: at,
+            nextpoint: at,
+            reroute: Reroute::Calc,
+            high_limit,
+            low_limit,
+            home_position: 0.0,
+            offset: 0.0,
+            homing: false,
             homed: false,
-            powered: true,
+            defer: false,
+            deferred_position: None,
+            last_step: Instant::now(),
+            posted: MotorStatus::default(),
             closed_loop_enabled: false,
-            velocity_mode: false,
-            velocity_direction: true,
-            deferred: false,
-            deferred_moves: Vec::new(),
             profile_positions: Vec::new(),
             profile_readbacks: Vec::new(),
             pid_gains: Vec::new(),
             forwarded_high_limit: None,
             forwarded_low_limit: None,
-        }
+        };
+        motor.post(true);
+        motor
     }
 
     pub fn with_limits(mut self, low: f64, high: f64) -> Self {
         self.low_limit = low;
         self.high_limit = high;
+        self.post(self.posted.done);
         self
     }
 
-    pub fn with_position(mut self, pos: f64) -> Self {
-        self.position = pos;
-        self.encoder_position = pos;
-        self
+    pub fn with_position(self, pos: f64) -> Self {
+        let mut motor = Self::starting_at(pos, self.low_limit, self.high_limit);
+        motor.last_step = self.last_step;
+        motor
     }
 
-    /// Advance the simulation by checking elapsed time.
-    fn update(&mut self) {
-        if !self.moving {
+    /// Run every step `motorSimTask` would have run by `now`, on its own
+    /// clock: commands and polls do not move the step instants. Steps at
+    /// rest change nothing but the clock, so a long idle is skipped to its
+    /// last step.
+    fn advance_to(&mut self, now: Instant) {
+        let behind = now.saturating_duration_since(self.last_step);
+        let steps = (behind.as_nanos() / PERIOD.as_nanos()) as u32;
+        if steps == 0 {
             return;
         }
+        let delta = PERIOD.as_secs_f64();
+        let mut run = steps;
+        if self.at_rest() && steps > 1 {
+            self.nextpoint.t += delta * f64::from(steps - 1);
+            self.route.set_demand(self.nextpoint);
+            run = 1;
+        }
+        for _ in 0..run {
+            self.process(delta);
+        }
+        self.last_step += PERIOD * steps;
+    }
 
-        let elapsed = self
-            .move_start
-            .map(|s| s.elapsed().as_secs_f64())
-            .unwrap_or(0.0);
+    /// Stopped on its endpoint with nothing pending: a step moves only
+    /// the clock.
+    fn at_rest(&self) -> bool {
+        self.reroute == Reroute::Calc
+            && !self.homing
+            && self.nextpoint.v == 0.0
+            && self.endpoint.v == 0.0
+            && self.nextpoint.p == self.endpoint.p
+            && self.nextpoint.t >= self.endpoint.t
+    }
 
-        if self.velocity_mode {
-            let dir = if self.velocity_direction { 1.0 } else { -1.0 };
-            self.position = self.start_position + dir * self.velocity * elapsed;
-            self.encoder_position = self.position;
+    /// C `motorSimAxis::process` (motorSimDriver.cpp:398-480), less the
+    /// post-move delay this driver has no parameter for.
+    fn process(&mut self, delta: f64) {
+        let lastpos = self.nextpoint.p;
+        self.nextpoint.t += delta;
+        self.route
+            .find(self.reroute, &mut self.endpoint, &mut self.nextpoint);
+        self.reroute = Reroute::Calc;
 
-            // Check hardware limits
-            if self.position >= self.high_limit {
-                self.position = self.high_limit;
-                self.encoder_position = self.position;
-                self.moving = false;
-            } else if self.position <= self.low_limit {
-                self.position = self.low_limit;
-                self.encoder_position = self.position;
-                self.moving = false;
-            }
-        } else {
-            let distance = (self.target - self.start_position).abs();
-            let travel_time = if self.velocity > 0.0 {
-                distance / self.velocity
+        let home = self.home_position;
+        if self.homing && (lastpos - home) * (self.nextpoint.p - home) <= 0.0 {
+            // Crossed the home switch: return to it.
+            self.homing = false;
+            self.homed = true;
+            self.reroute = Reroute::New;
+            self.endpoint.p = home;
+            self.endpoint.v = 0.0;
+        }
+        let (p, v) = (self.nextpoint.p, self.nextpoint.v);
+        if (p > self.high_limit && v > 0.0) || (p < self.low_limit && v < 0.0) {
+            if self.homing {
+                let _ = self.set_velocity(-self.endpoint.v, 0.0);
             } else {
-                0.0
-            };
-
-            if elapsed >= travel_time {
-                self.position = self.target;
-                self.encoder_position = self.target;
-                self.moving = false;
-            } else {
-                let fraction = elapsed / travel_time;
-                self.position =
-                    self.start_position + (self.target - self.start_position) * fraction;
-                self.encoder_position = self.position;
+                self.reroute = Reroute::New;
+                self.endpoint.p = if v > 0.0 {
+                    self.high_limit
+                } else {
+                    self.low_limit
+                };
+                self.endpoint.v = 0.0;
             }
         }
+        let done = self.nextpoint.v == 0.0 && self.deferred_position.is_none();
+        self.post(done);
+    }
+
+    /// The parameters a step writes (motorSimDriver.cpp:470-478).
+    fn post(&mut self, done: bool) {
+        let p = self.nextpoint.p;
+        self.posted = MotorStatus {
+            position: p + self.offset,
+            encoder_position: p + self.offset,
+            // motorSim never sets motorActVelocity_, so RVEL stays 0.
+            direction: self.nextpoint.v > 0.0,
+            done,
+            high_limit: p >= self.high_limit,
+            // motorStatusHome_ is EA_HOME (bit 7); AtHome and HasEncoder
+            // are never set.
+            encoder_home: p == self.home_position,
+            homed: self.homed,
+            moving: !done,
+            msta_moving: !done,
+            low_limit: p <= self.low_limit,
+            ..MotorStatus::default()
+        };
+    }
+
+    /// C `motorSimAxis::setVelocity` (motorSimDriver.cpp:316-339): a new
+    /// endpoint the ramp from the current velocity reaches, with no end.
+    fn set_velocity(&mut self, velocity: f64, acceleration: f64) -> AsynResult<()> {
+        let p = self.nextpoint.p;
+        if (p > self.high_limit && velocity > 0.0) || (p < self.low_limit && velocity < 0.0) {
+            return Err(hard_limit());
+        }
+        let (mut amax, vmax) = self.route.params();
+        if acceleration != 0.0 {
+            amax = acceleration.abs();
+        }
+        // A refused routeSetParams keeps the old Amax; the ramp time still
+        // uses the asked-for one, as C's local `pars` does.
+        self.route.set_params(amax, vmax);
+        let delta_v = velocity - self.nextpoint.v;
+        let time = (delta_v / amax).abs();
+        self.endpoint.v = velocity;
+        self.endpoint.p = p + time * (self.nextpoint.v + 0.5 * delta_v);
+        self.reroute = Reroute::New;
+        Ok(())
+    }
+
+    /// C `motorSimAxis::move` (motorSimDriver.cpp:280-314); `position` is
+    /// user, relative already resolved.
+    fn start_move(&mut self, position: f64, velocity: f64, acceleration: f64) -> AsynResult<()> {
+        let p = self.nextpoint.p;
+        if (p >= self.high_limit && position > p) || (p <= self.low_limit && position < p) {
+            return Err(hard_limit());
+        }
+        if self.defer {
+            self.deferred_position = Some(position);
+        } else {
+            self.endpoint.p = position - self.offset;
+            self.endpoint.v = 0.0;
+        }
+        let (mut amax, mut vmax) = self.route.params();
+        if velocity != 0.0 {
+            vmax = velocity.abs();
+        }
+        if acceleration != 0.0 {
+            amax = acceleration.abs();
+        }
+        self.route.set_params(amax, vmax);
+        Ok(())
+    }
+
+    /// `asynMotorController::writeFloat64` clears Done after a move-class
+    /// call whatever it returned.
+    fn moved(&mut self, status: AsynResult<()>) -> AsynResult<()> {
+        self.posted.done = false;
+        status
+    }
+}
+
+fn hard_limit() -> AsynError {
+    AsynError::Status {
+        status: AsynStatus::Error,
+        message: String::new(),
     }
 }
 
@@ -141,17 +277,9 @@ impl AsynMotor for SimMotor {
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
-        if self.deferred {
-            self.deferred_moves.push((position, velocity, acceleration));
-            return Ok(());
-        }
-        self.target = position;
-        self.velocity = velocity.abs().max(0.001);
-        self.start_position = self.position;
-        self.moving = true;
-        self.velocity_mode = false;
-        self.move_start = Some(Instant::now());
-        Ok(())
+        self.advance_to(Instant::now());
+        let status = self.start_move(position, velocity, acceleration);
+        self.moved(status)
     }
 
     fn move_relative(
@@ -162,46 +290,33 @@ impl AsynMotor for SimMotor {
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
-        let target = self.position + distance;
-        if self.deferred {
-            // Honour deferred mode like move_absolute — queue the resolved
-            // absolute target instead of moving immediately.
-            self.deferred_moves.push((target, velocity, acceleration));
-            return Ok(());
-        }
-        self.target = target;
-        self.velocity = velocity.abs().max(0.001);
-        self.start_position = self.position;
-        self.moving = true;
-        self.velocity_mode = false;
-        self.move_start = Some(Instant::now());
-        Ok(())
+        self.advance_to(Instant::now());
+        let position = distance + self.endpoint.p + self.offset;
+        let status = self.start_move(position, velocity, acceleration);
+        self.moved(status)
     }
 
+    /// C `motorSimAxis::home`: run toward the home switch until a step
+    /// crosses it.
     fn home(
         &mut self,
         _user: &AsynUser,
         _min_velocity: f64,
         velocity: f64,
-        _acceleration: f64,
+        acceleration: f64,
         forward: bool,
     ) -> AsynResult<()> {
-        // Simulate homing by moving to 0
-        self.target = 0.0;
-        self.velocity = velocity.abs().max(0.001);
-        self.start_position = self.position;
-        self.moving = true;
-        self.velocity_mode = false;
-        self.move_start = Some(Instant::now());
-        self.homed = true;
-        let _ = forward;
-        Ok(())
+        self.advance_to(Instant::now());
+        let status = self.set_velocity(if forward { velocity } else { -velocity }, acceleration);
+        self.homing = true;
+        self.homed = false;
+        self.moved(status)
     }
 
-    fn stop(&mut self, _user: &AsynUser, _acceleration: f64) -> AsynResult<()> {
-        self.update();
-        self.moving = false;
-        self.target = self.position;
+    fn stop(&mut self, _user: &AsynUser, acceleration: f64) -> AsynResult<()> {
+        self.advance_to(Instant::now());
+        let _ = self.set_velocity(0.0, acceleration);
+        self.deferred_position = None;
         Ok(())
     }
 
@@ -225,28 +340,35 @@ impl AsynMotor for SimMotor {
         Ok(())
     }
 
+    /// C `motorSimController::writeInt32` for `motorDeferMoves_` and
+    /// `processDeferredMoves` (motorSimDriver.cpp:155-212).
+    /// motorSimController::writeInt32 (motorSimDriver.cpp:188-199) drops
+    /// processDeferredMoves()'s status: a deferred move into a hard limit
+    /// stays pending and the write still succeeds.
     fn set_deferred_moves(&mut self, _user: &AsynUser, defer: bool) -> AsynResult<()> {
-        if defer {
-            self.deferred = true;
-        } else {
-            self.deferred = false;
-            // Execute queued moves: use the last one's target position
-            if let Some(&(position, velocity, _acceleration)) = self.deferred_moves.last() {
-                self.target = position;
-                self.velocity = velocity.abs().max(0.001);
-                self.start_position = self.position;
-                self.moving = true;
-                self.velocity_mode = false;
-                self.move_start = Some(Instant::now());
+        self.advance_to(Instant::now());
+        if !defer && self.defer {
+            if let Some(position) = self.deferred_position {
+                let p = self.nextpoint.p;
+                let blocked =
+                    (p >= self.high_limit && position > p) || (p <= self.low_limit && position < p);
+                if !blocked {
+                    self.endpoint.p = position - self.offset;
+                    self.endpoint.v = 0.0;
+                    self.posted.done = false;
+                    self.deferred_position = None;
+                }
             }
-            self.deferred_moves.clear();
         }
+        self.defer = defer;
         Ok(())
     }
 
     fn set_position(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
-        self.position = position;
-        self.encoder_position = position;
+        self.advance_to(Instant::now());
+        self.offset = position - self.nextpoint.p;
+        // asynMotorController::writeFloat64 stores the parameter first.
+        self.posted.position = position;
         Ok(())
     }
 
@@ -255,15 +377,11 @@ impl AsynMotor for SimMotor {
         _user: &AsynUser,
         _min_velocity: f64,
         velocity: f64,
-        _acceleration: f64,
+        acceleration: f64,
     ) -> AsynResult<()> {
-        self.velocity = velocity.abs().max(0.001);
-        self.velocity_direction = velocity >= 0.0;
-        self.velocity_mode = true;
-        self.start_position = self.position;
-        self.moving = true;
-        self.move_start = Some(Instant::now());
-        Ok(())
+        self.advance_to(Instant::now());
+        let status = self.set_velocity(velocity, acceleration);
+        self.moved(status)
     }
 
     fn initialize_profile(&mut self, _user: &AsynUser, max_points: usize) -> AsynResult<()> {
@@ -283,21 +401,19 @@ impl AsynMotor for SimMotor {
 
     fn execute_profile(&mut self, _user: &AsynUser) -> AsynResult<()> {
         // Simulate: just move to the last position
+        self.advance_to(Instant::now());
         if let Some(&last) = self.profile_positions.last() {
-            self.target = last;
-            self.velocity = 1.0;
-            self.start_position = self.position;
-            self.moving = true;
-            self.velocity_mode = false;
-            self.move_start = Some(Instant::now());
+            self.endpoint.p = last - self.offset;
+            self.endpoint.v = 0.0;
+            self.posted.done = false;
         }
         self.profile_readbacks = self.profile_positions.clone();
         Ok(())
     }
 
     fn abort_profile(&mut self, _user: &AsynUser) -> AsynResult<()> {
-        self.moving = false;
-        self.target = self.position;
+        self.advance_to(Instant::now());
+        let _ = self.set_velocity(0.0, 0.0);
         Ok(())
     }
 
@@ -305,106 +421,210 @@ impl AsynMotor for SimMotor {
         Ok(self.profile_readbacks.clone())
     }
 
-    fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
-        self.update();
-        Ok(MotorStatus {
-            position: self.position,
-            encoder_position: self.encoder_position,
-            velocity: if self.moving { self.velocity } else { 0.0 },
-            done: !self.moving,
-            moving: self.moving,
-            high_limit: self.position >= self.high_limit,
-            low_limit: self.position <= self.low_limit,
-            home: self.position == 0.0,
-            // The sim tracks a real encoder image (encoder_position,
-            // set_encoder_position), so it reports the encoder present
-            // — otherwise the record demotes UEIP=Yes to No on the
-            // first poll (C 3671-3675) and the EA_HOME path is dead.
-            // The encoder index asserts at the same physical home spot
-            // as the switch.
-            has_encoder: true,
-            encoder_home: self.encoder_position == 0.0,
-            powered: self.powered,
-            problem: false,
-            direction: self.velocity_direction,
-            homed: self.homed,
-            ..MotorStatus::default()
-        })
+    /// C `motorSimAxis::poll` does nothing: the status is what the steps
+    /// posted.
+    fn poll(&mut self, _user: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
+        self.advance_to(Instant::now());
+        *status = self.posted.clone();
+        Ok(())
+    }
+
+    /// Unreachable: C `motorSimAxis::poll` has no failure path.
+    fn poll_failure(&self) -> PollFailure {
+        PollFailure::NONE
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
+
+    /// Run `motor` `n` steps of `motorSimTask` on.
+    fn step(motor: &mut SimMotor, n: u32) -> MotorStatus {
+        let now = motor.last_step + PERIOD * n;
+        motor.advance_to(now);
+        motor.posted.clone()
+    }
+
+    fn user() -> AsynUser {
+        AsynUser::new(0)
+    }
+
+    fn polled(motor: &mut SimMotor) -> MotorStatus {
+        let mut status = MotorStatus::default();
+        motor.poll(&user(), &mut status).unwrap();
+        status
+    }
 
     #[test]
     fn test_sim_motor_initial_state() {
-        let user = AsynUser::new(0);
         let mut motor = SimMotor::new();
-        let status = motor.poll(&user).unwrap();
+        let status = polled(&mut motor);
         assert_eq!(status.position, 0.0);
         assert!(status.done);
         assert!(!status.moving);
+        // motorSimDriver.cpp's poll never sets motorStatusPowerOn_: MSTA 2.
+        assert!(!status.powered);
     }
 
     #[test]
-    fn test_sim_motor_reports_encoder_and_home_index() {
-        let user = AsynUser::new(0);
+    fn test_sim_motor_reports_home_on_encoder_home_bit_only() {
         let mut motor = SimMotor::new();
-        let at_home = motor.poll(&user).unwrap();
-        assert!(at_home.has_encoder, "sim encoder is present");
-        assert!(at_home.encoder_home, "encoder index asserts at home");
-        assert!(at_home.home);
+        let at_home = polled(&mut motor);
+        assert!(at_home.encoder_home);
+        assert!(!at_home.home && !at_home.has_encoder && !at_home.direction);
 
-        motor.move_absolute(&user, 10.0, 0.0, 10000.0, 1.0).unwrap();
-        std::thread::sleep(Duration::from_millis(10));
-        let away = motor.poll(&user).unwrap();
-        assert!(away.has_encoder);
-        assert!(!away.encoder_home, "index drops off the home position");
-        assert!(!away.home);
+        motor
+            .move_absolute(&user(), 10.0, 0.0, 10.0, 100.0)
+            .unwrap();
+        let away = step(&mut motor, 1);
+        assert!(!away.encoder_home && !away.home);
+    }
+
+    /// Where a 5 steps/s² ramp from rest is after one step.
+    fn ramp_after_one_step() -> f64 {
+        let t = PERIOD.as_secs_f64();
+        0.5 * 5.0 * t * t
+    }
+
+    /// A 1-step move at 1 step/s and 5 steps/s² is the 1.2 s trapezoid:
+    /// done on the twelfth step, accelerating on the first.
+    #[test]
+    fn test_sim_motor_move_follows_the_ramp() {
+        let mut motor = SimMotor::new();
+        motor.move_absolute(&user(), 1.0, 0.0, 1.0, 5.0).unwrap();
+        assert!(!motor.posted.done, "the move clears Done at once");
+        let first = step(&mut motor, 1);
+        assert!(
+            (first.position - ramp_after_one_step()).abs() < 1e-12,
+            "{first:?}"
+        );
+        assert!(first.direction && first.moving);
+        let before_end = step(&mut motor, 10);
+        assert!(!before_end.done, "{before_end:?}");
+        let end = step(&mut motor, 1);
+        assert!(end.done && !end.moving, "{end:?}");
+        assert!((end.position - 1.0).abs() < 1e-12, "{end:?}");
     }
 
     #[test]
-    fn test_sim_motor_move_completes() {
-        let user = AsynUser::new(0);
+    fn test_sim_motor_stop_ramps_down() {
         let mut motor = SimMotor::new();
-        motor.move_absolute(&user, 10.0, 0.0, 10000.0, 1.0).unwrap(); // very fast
-        std::thread::sleep(Duration::from_millis(10));
-        let status = motor.poll(&user).unwrap();
-        assert!(status.done);
-        assert_eq!(status.position, 10.0);
-    }
-
-    #[test]
-    fn test_sim_motor_stop() {
-        let user = AsynUser::new(0);
-        let mut motor = SimMotor::new();
-        motor.move_absolute(&user, 1000.0, 0.0, 1.0, 1.0).unwrap(); // slow, long move
-        std::thread::sleep(Duration::from_millis(10));
-        motor.stop(&user, 1.0).unwrap();
-        let status = motor.poll(&user).unwrap();
-        assert!(status.done);
-        assert!(status.position < 1000.0);
+        motor.move_absolute(&user(), 1000.0, 0.0, 1.0, 5.0).unwrap();
+        step(&mut motor, 5);
+        motor.stop(&user(), 5.0).unwrap();
+        let ramping = step(&mut motor, 1);
+        assert!(!ramping.done, "{ramping:?}");
+        let stopped = step(&mut motor, 2);
+        assert!(stopped.done, "{stopped:?}");
+        // 0.2 s up (0.1), 0.3 s at 1 (0.3), 0.2 s down (0.1), less the
+        // steps' overrun of 0.1 s.
+        assert!((stopped.position - 0.5).abs() < 2e-3, "{stopped:?}");
     }
 
     #[test]
     fn test_sim_motor_set_position() {
-        let user = AsynUser::new(0);
         let mut motor = SimMotor::new();
-        motor.set_position(&user, 42.0).unwrap();
-        let status = motor.poll(&user).unwrap();
+        motor.set_position(&user(), 42.0).unwrap();
+        let status = polled(&mut motor);
         assert_eq!(status.position, 42.0);
+        // The switches stay physical, as motorSimAxis::setPosition moves
+        // only enc_offset_.
+        assert!(status.encoder_home);
+
+        motor
+            .move_absolute(&user(), 52.0, 0.0, 100.0, 1000.0)
+            .unwrap();
+        let status = step(&mut motor, 3);
+        assert_eq!(status.position, 52.0);
+        assert!(!status.encoder_home);
     }
 
+    /// C home: run at HVEL until a step crosses the switch, then route back
+    /// to it.
     #[test]
-    fn test_sim_motor_home() {
-        let user = AsynUser::new(0);
-        let mut motor = SimMotor::new().with_position(10.0);
-        motor.home(&user, 0.0, 10000.0, 1.0, true).unwrap();
-        std::thread::sleep(Duration::from_millis(10));
-        let status = motor.poll(&user).unwrap();
-        assert!(status.done);
+    fn test_sim_motor_home_crosses_the_switch_and_returns() {
+        let mut motor = SimMotor::new().with_position(1.0);
+        motor.home(&user(), 0.0, 1.0, 5.0, false).unwrap();
+        let mut status = step(&mut motor, 1);
+        let mut steps = 1;
+        while !status.done {
+            status = step(&mut motor, 1);
+            steps += 1;
+            assert!(steps < 100, "never homed: {status:?}");
+        }
         assert_eq!(status.position, 0.0);
+        assert!(status.encoder_home && status.homed);
+    }
+
+    /// A forward home with the switch behind runs into the hard limit and
+    /// reverses.
+    #[test]
+    fn test_sim_motor_home_reverses_at_the_limit() {
+        let mut motor = SimMotor::new().with_limits(-2.0, 2.0).with_position(1.0);
+        motor.home(&user(), 0.0, 1.0, 5.0, true).unwrap();
+        let mut status = step(&mut motor, 1);
+        let mut peak = status.position;
+        for _ in 0..200 {
+            if status.done {
+                break;
+            }
+            status = step(&mut motor, 1);
+            peak = peak.max(status.position);
+        }
+        assert!(status.done && status.homed, "{status:?}");
+        assert_eq!(status.position, 0.0);
+        assert!(peak > 2.0, "went past the limit before reversing: {peak}");
+    }
+
+    /// Clearing the defer flag with the deferred move blocked by a hard limit
+    /// succeeds and leaves the move pending, as motorSim's writeInt32 does.
+    #[test]
+    fn test_sim_motor_deferred_move_into_a_hard_limit_still_clears() {
+        let mut motor = SimMotor::new().with_limits(-2.0, 2.0).with_position(1.0);
+        motor.move_absolute(&user(), 3.0, 0.0, 1.0, 5.0).unwrap();
+        motor.set_deferred_moves(&user(), true).unwrap();
+        motor.move_absolute(&user(), 3.0, 0.0, 1.0, 5.0).unwrap();
+        let mut status = step(&mut motor, 1);
+        for _ in 0..100 {
+            if status.high_limit && motor.nextpoint.v == 0.0 {
+                break;
+            }
+            status = step(&mut motor, 1);
+        }
+        assert!(status.high_limit, "{status:?}");
+        assert!(motor.set_deferred_moves(&user(), false).is_ok());
+        assert_eq!(motor.deferred_position, Some(3.0));
+        assert!(
+            !step(&mut motor, 1).done,
+            "the blocked move is still pending"
+        );
+    }
+
+    /// motorSim posts no actual velocity (motorSimDriver.cpp:470-478 never
+    /// writes motorActVelocity_), moving or not.
+    #[test]
+    fn test_sim_motor_posts_no_velocity() {
+        let mut motor = SimMotor::new();
+        motor
+            .move_absolute(&user(), 100.0, 0.0, 10.0, 50.0)
+            .unwrap();
+        let status = step(&mut motor, 3);
+        assert!(status.moving && status.position > 0.0, "{status:?}");
+        assert_eq!(status.velocity, 0.0);
+    }
+
+    /// A long idle is skipped, not stepped, and leaves the axis where it was.
+    #[test]
+    fn test_sim_motor_idle_is_skipped() {
+        let mut motor = SimMotor::new().with_position(3.0);
+        let status = step(&mut motor, 1_000_000);
+        assert_eq!(status.position, 3.0);
+        motor.move_absolute(&user(), 4.0, 0.0, 1.0, 5.0).unwrap();
+        let first = step(&mut motor, 1);
+        assert!(
+            (first.position - 3.0 - ramp_after_one_step()).abs() < 1e-9,
+            "{first:?}"
+        );
     }
 }

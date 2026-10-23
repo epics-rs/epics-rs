@@ -141,7 +141,8 @@ fn struct_array_points() -> (FieldDesc, PvField) {
         fields: vec![
             ("x".into(), FieldDesc::Scalar(ScalarType::Int)),
             ("y".into(), FieldDesc::Scalar(ScalarType::String)),
-        ],
+        ]
+        .into(),
     };
     let desc = FieldDesc::Structure {
         struct_id: "test:points:1.0".into(),
@@ -154,7 +155,8 @@ fn struct_array_points() -> (FieldDesc, PvField) {
                     _ => unreachable!(),
                 },
             },
-        )],
+        )]
+        .into(),
     };
     let make = |x: i32, y: &str| PvStructure {
         struct_id: "point_t".into(),
@@ -182,7 +184,7 @@ fn struct_array_points() -> (FieldDesc, PvField) {
 fn variant_int() -> (FieldDesc, PvField) {
     let desc = FieldDesc::Structure {
         struct_id: "test:variant:1.0".into(),
-        fields: vec![("any".into(), FieldDesc::Variant)],
+        fields: vec![("any".into(), FieldDesc::Variant)].into(),
     };
     let root = PvField::Structure(PvStructure {
         struct_id: "test:variant:1.0".into(),
@@ -247,15 +249,18 @@ fn nested_struct() -> (FieldDesc, PvField) {
                                 fields: vec![
                                     ("count".into(), FieldDesc::Scalar(ScalarType::Long)),
                                     ("label".into(), FieldDesc::Scalar(ScalarType::String)),
-                                ],
+                                ]
+                                .into(),
                             },
                         ),
                         ("flag".into(), FieldDesc::Scalar(ScalarType::Boolean)),
-                    ],
+                    ]
+                    .into(),
                 },
             ),
             ("tags".into(), FieldDesc::ScalarArray(ScalarType::String)),
-        ],
+        ]
+        .into(),
     };
     let inner = PvField::Structure(PvStructure {
         struct_id: String::new(),

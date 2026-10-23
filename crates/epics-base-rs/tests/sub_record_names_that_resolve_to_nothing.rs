@@ -56,8 +56,11 @@ impl Captured {
     }
 
     /// Restore BEFORE anything can panic on an assertion, or the failure
-    /// report has nowhere to go.
+    /// report has nowhere to go. `SNAM is empty` is an `epicsPrintf` that
+    /// `build` (no `iocBuild`, so not ok-to-block) leaves to the errlog
+    /// worker; drain it while fd 2 still points here.
     fn finish(self) -> String {
+        epics_base_rs::runtime::log::errlog_flush();
         assert!(
             unsafe { libc::dup2(self.saved, 2) } >= 0,
             "restore fd 2 failed"
@@ -131,4 +134,66 @@ async fn an_unresolved_snam_and_inam_are_both_reported() {
         !out.contains("T:B.SNAM"),
         "C `subRecord.c:113` returns above the SNAM lookup, got {out:?}"
     );
+}
+
+/// An INAM routine that runs and fails is not reported: C calls it as
+/// `(*psubroutine)(prec)` (`subRecord.c:116`, `aSubRecord.c:143`) and drops
+/// the status. The one line left is C's own `SNAM is empty` (`:119`);
+/// softIocPVA 8f5015b66 with an aSub INAM `QSRV_image_demo` and a bare `sub`
+/// prints exactly that between its iocInit lines.
+#[epics_macros_rs::epics_test]
+async fn a_failing_inam_routine_prints_nothing() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let ran = Arc::new(AtomicUsize::new(0));
+    let (by_status, by_error) = (Arc::clone(&ran), Arc::clone(&ran));
+    let capture = Captured::start();
+    let built = IocBuilder::new()
+        .register_subroutine("initStatus", move |_| {
+            by_status.fetch_add(1, Ordering::SeqCst);
+            Ok(-1)
+        })
+        .register_subroutine("initError", move |_| {
+            by_error.fetch_add(1, Ordering::SeqCst);
+            Err(epics_base_rs::error::CaError::InvalidValue("init".into()))
+        })
+        .db_string(
+            r#"
+record(sub, "T:STATUS") { field(INAM, "initStatus") }
+record(aSub, "T:ERROR") { field(INAM, "initError") }
+"#,
+            &HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .await;
+    let out = capture.finish();
+    built.expect("a failing INAM routine does not fail the build");
+
+    assert_eq!(ran.load(Ordering::SeqCst), 2, "both INAM routines ran");
+    assert_eq!(
+        out, "T:STATUS.SNAM is empty\n",
+        "the whole stderr of the build"
+    );
+}
+
+/// A constant SUBL is loaded into SNAM before the SNAM lookup
+/// (`aSubRecord.c:126`, then `:150-160`), so the name it loads is the one
+/// reported. softIoc R7.0.10 with `field(SUBL, {const:"nope"})` prints
+/// `as.SNAM ERROR function 'nope' not found` at iocInit.
+#[epics_macros_rs::epics_test]
+async fn a_constant_subl_is_looked_up_at_init() {
+    let capture = Captured::start();
+    let built = IocBuilder::new()
+        .db_string(
+            r#"record(aSub, "T:SUBL") { field(SUBL, {const:"nope"}) }"#,
+            &HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .await;
+    let out = capture.finish();
+    built.expect("an unresolved SNAM is reported, not fatal");
+
+    assert_eq!(out, "T:SUBL.SNAM ERROR function 'nope' not found\n");
 }

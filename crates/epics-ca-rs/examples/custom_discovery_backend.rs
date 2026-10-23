@@ -165,7 +165,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let client = CaClient::new_with_config(config).await?;
     let (_dbf, value) = client.caget(&pv_name).await?;
-    println!("{pv_name} = {value}");
+    println!("{pv_name} = {}", value.text_g());
     Ok(())
 }
 
@@ -174,9 +174,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// example to demonstrate.
 #[cfg(exec_backend)]
 fn main() {
-    eprintln!(
+    epics_base_rs::runtime::task::refuse_backend(
         "custom_discovery_backend: needs the tokio backend; this build selects \
          EPICS_RS_BUILD_EXEC_BACKEND=thread, which has no reactor for a discovery backend to \
-         await on."
-    );
+         await on.",
+    )
 }

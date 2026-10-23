@@ -1,0 +1,4 @@
+p {
+  InTerminator = 300;
+  in "a";
+}

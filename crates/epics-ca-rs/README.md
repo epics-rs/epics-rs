@@ -73,9 +73,11 @@ does not want one does not compile it:
 - **Server hardening** — a structured audit log, per-client rate limiting with
   strikes, signed beacons, an introspection HTTP endpoint, and a drain grace
   period for shutdown.
-- **`calink`** — the `ca://` record-link resolver, which is what the
-  `client-core` feature exists for: an RTEMS build takes the client a record
-  link needs without the UDP discovery stack.
+- **`calink`** — the network half of CA record links (`ca://<pv>` or a
+  ` CA` modifier) to a PV the IOC's own database does not serve; a local
+  name is answered in process by `epics-base-rs`, as C dbCa does. This is
+  what the `client-core` feature exists for: an RTEMS build takes the client
+  a record link needs without the UDP discovery stack.
 
 ### CLI Tools
 - **caget-rs** — read PV value (single shot)
@@ -125,7 +127,7 @@ epics-ca-rs/src/
 │   ├── sync_group.rs       # SyncGroup — batched ops + collective wait
 │   ├── circuit_breaker.rs  # per-server backoff
 │   ├── state.rs            # connection state machine
-│   └── types.rs            # CaError, CaValue
+│   └── types.rs            # circuit identity, CaException
 ├── server/
 │   ├── mod.rs              # re-exports
 │   ├── ca_server.rs        # CaServer (top-level)
@@ -143,7 +145,7 @@ epics-ca-rs/src/
 │   ├── blocking.rs         # the blocking-front-end server path
 │   ├── introspection.rs    # the admin HTTP endpoint
 │   └── stats.rs            # the counters casr and Prometheus both read
-├── calink/                 # `ca://` record links (resolver + iocsh)
+├── calink/                 # the network half of CA links (resolver + dbcaxr)
 ├── discovery/              # mDNS, DNS-SD, DNS UPDATE, TSIG, zone files
 ├── tls/                    # CA over TLS (experimental)
 ├── cap_token.rs            # Ed25519 capability tokens
@@ -185,22 +187,25 @@ use epics_ca_rs::server::run_ca_ioc_app;
 async fn main() -> epics_base_rs::error::CaResult<()> {
     // `run_ca_ioc_app` runs C's `rsrvRegistrar` before the startup script,
     // which `IocApplication::run(run_ca_ioc)` cannot: it is dispatched after.
-    run_ca_ioc_app(IocApplication::new().record("TEMP", AiRecord::new())).await
+    run_ca_ioc_app(IocApplication::new().record("TEMP", AiRecord::new(25.0))).await
 }
 ```
 
 ### Client
 
 ```rust
+use std::time::Duration;
 use epics_ca_rs::client::CaClient;
 
 let client = CaClient::new().await?;
 let (dbf_type, value) = client.caget("TEMP").await?;
 client.caput("TEMP", "42.0").await?;
 
-let mut sub = client.camonitor("TEMP").await?;
-while let Some(event) = sub.recv().await {
-    println!("{:?}", event.value);
+let ch = client.create_channel("TEMP");
+ch.wait_connected(Duration::from_secs(3)).await?;
+let mut monitor = ch.subscribe().await?;
+while let Some(snap) = monitor.recv().await {
+    println!("{:?}", snap?.value);
 }
 ```
 
@@ -231,7 +236,9 @@ Test coverage: header encode/decode (golden packets vs `caget`), DBR encoding fo
 ## Dependencies
 
 - epics-base-rs — PvDatabase, records, EpicsValue, DBR codec, and the
-  `runtime`/`net` layer (this crate does not depend on tokio directly)
+  `runtime`/`net` layer
+- tokio — the full runtime on a host; RTEMS and VxWorks drop `net`,
+  `signal` and `process` and serve CA through the `std::net` blocking server
 - chrono, thiserror, parking_lot, arc-swap, dashmap — the always-on set
 - clap — the CLI tools
 - metrics, tracing — the facades the crate emits on with no exporter attached
@@ -242,7 +249,7 @@ tokio-rustls and x509-parser for `experimental-rust-tls`, ed25519-dalek for
 
 ## Requirements
 
-- Rust 1.94.0 (`rust-toolchain.toml`), edition 2024
+- Rust 1.99.1 (`rust-toolchain.toml`), edition 2024
 
 ## License
 

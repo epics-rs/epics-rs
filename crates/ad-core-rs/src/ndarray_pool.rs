@@ -138,34 +138,6 @@ impl NDArrayPool {
         data_type: NDDataType,
         data_size: usize,
     ) -> ADResult<NDArray> {
-        self.alloc_buffer(dims, data_type, data_size, None)
-    }
-
-    /// C++ `NDArrayPool::alloc` with `pData = NULL` followed by the caller's
-    /// copy into `pArray->pData`, which is how every C driver builds a frame:
-    /// the frame is charged and refused under the same `max_memory` rule as
-    /// [`alloc`](Self::alloc), and takes `data` as its buffer. C's unchecked
-    /// caller-supplied `pData` branch has no caller in ADCore or the drivers
-    /// and is not offered.
-    #[deprecated(
-        since = "0.32.1",
-        note = "alloc_with drops the free buffer it takes for the one passed in; alloc and fill the array in place"
-    )]
-    pub fn alloc_with(&self, dims: Vec<NDDimension>, data: NDDataBuffer) -> ADResult<NDArray> {
-        let data_type = data.data_type();
-        let data_size = data.len() * data_type.element_size();
-        self.alloc_buffer(dims, data_type, data_size, Some(data))
-    }
-
-    /// The allocation of [`alloc_sized`](Self::alloc_sized); `data`, when
-    /// given, is the buffer the slot is filled with instead of its own.
-    fn alloc_buffer(
-        &self,
-        dims: Vec<NDDimension>,
-        data_type: NDDataType,
-        data_size: usize,
-        data: Option<NDDataBuffer>,
-    ) -> ADResult<NDArray> {
         let element_size = data_type.element_size();
         if data_size % element_size != 0 {
             return Err(ADError::InvalidDimensions(format!(
@@ -209,9 +181,7 @@ impl NDArrayPool {
         };
 
         if let Some(mut reused) = reused {
-            if let Some(data) = data {
-                reused.data = data;
-            } else if reused.data.data_type() != data_type {
+            if reused.data.data_type() != data_type {
                 reused.data = NDDataBuffer::zeros(data_type, num_elements);
             } else {
                 reused.data.resize(num_elements);
@@ -277,7 +247,7 @@ impl NDArrayPool {
                 .fetch_add(needed_bytes as u64, Ordering::Relaxed);
         }
         self.num_alloc_buffers.fetch_add(1, Ordering::Relaxed);
-        let data = data.unwrap_or_else(|| NDDataBuffer::zeros(data_type, num_elements));
+        let data = NDDataBuffer::zeros(data_type, num_elements);
         Ok(self.adopt(dims, data, needed_bytes))
     }
 
@@ -556,19 +526,6 @@ impl DriverPool {
         data_size: usize,
     ) -> ADResult<DriverArray> {
         self.own(self.pool.alloc_sized(dims, data_type, data_size))
-    }
-
-    /// [`NDArrayPool::alloc_with`].
-    #[deprecated(
-        since = "0.32.1",
-        note = "alloc_with drops the free buffer it takes for the one passed in; alloc and fill the array in place"
-    )]
-    #[expect(
-        deprecated,
-        reason = "forwards to the deprecated NDArrayPool::alloc_with"
-    )]
-    pub fn alloc_with(&self, dims: Vec<NDDimension>, data: NDDataBuffer) -> ADResult<DriverArray> {
-        self.own(self.pool.alloc_with(dims, data))
     }
 
     /// [`NDArrayPool::alloc_copy`].
@@ -891,11 +848,9 @@ mod tests {
         assert!(alloc().is_ok());
     }
 
-    /// A frame takes a free buffer that holds it, as an alloc does, and is
-    /// filled with the caller's data.
+    /// A reused free buffer is tied to its pool and owner as a fresh one is.
     #[test]
-    #[expect(deprecated, reason = "pins alloc_with until it is removed in 0.33")]
-    fn a_frame_with_data_reuses_a_free_buffer_like_an_alloc() {
+    fn a_reused_free_buffer_is_tied_to_the_pool_and_owner() {
         let owner = ArrayOwner::new();
         let pool = NDArrayPool::for_driver(64, &owner);
         drop(
@@ -905,46 +860,13 @@ mod tests {
         assert_eq!((pool.num_alloc_buffers(), pool.num_free_buffers()), (1, 1));
 
         let frame = pool
-            .alloc_with(
-                vec![NDDimension::new(8)],
-                NDDataBuffer::from_vec::<u8>(vec![7; 8]),
-            )
+            .alloc(vec![NDDimension::new(8)], NDDataType::UInt8)
             .unwrap();
         assert_eq!((pool.num_alloc_buffers(), pool.num_free_buffers()), (1, 0));
         assert_eq!(pool.allocated_bytes(), 8);
-        assert!(matches!(frame.data.view(), NDDataView::U8(v) if v == [7; 8]));
         assert_eq!(frame.pool_id(), pool.id());
         assert!(Arc::ptr_eq(&frame.owner().unwrap(), &owner));
         drop(frame);
-    }
-
-    /// A frame over `max_memory` is refused as C's `alloc(..., NULL)` is
-    /// before the driver's copy (NDArrayPool.cpp:207-233), after evicting the
-    /// free buffers.
-    #[test]
-    #[expect(deprecated, reason = "pins alloc_with until it is removed in 0.33")]
-    fn a_frame_with_data_over_max_memory_is_refused() {
-        let pool = NDArrayPool::new(64);
-        drop(
-            pool.alloc(vec![NDDimension::new(50)], NDDataType::UInt8)
-                .unwrap(),
-        );
-        let refused = pool.alloc_with(
-            vec![NDDimension::new(100)],
-            NDDataBuffer::from_vec::<u8>(vec![0; 100]),
-        );
-        assert!(matches!(refused, Err(ADError::PoolExhausted(100, 64))));
-        assert_eq!(pool.allocated_bytes(), 0);
-        assert_eq!((pool.num_alloc_buffers(), pool.num_free_buffers()), (0, 0));
-
-        let frame = pool
-            .alloc_with(
-                vec![NDDimension::new(60)],
-                NDDataBuffer::from_vec::<u8>(vec![0; 60]),
-            )
-            .unwrap();
-        assert_eq!(frame.data_size, 60);
-        assert_eq!(pool.allocated_bytes(), 60);
     }
 
     #[test]
@@ -1170,33 +1092,6 @@ mod tests {
         assert_eq!(b.data_size, 150);
         assert_eq!(pool.num_alloc_buffers(), 2);
         assert_eq!(pool.allocated_bytes(), 250);
-    }
-
-    /// A frame takes the smallest free buffer that holds it and keeps that
-    /// buffer's `dataSize` (NDArrayPool.cpp:166-183).
-    #[test]
-    #[expect(deprecated, reason = "pins alloc_with until it is removed in 0.33")]
-    fn a_frame_with_data_takes_the_smallest_free_buffer_that_holds_it() {
-        let pool = NDArrayPool::new(1_000_000);
-        let big = pool
-            .alloc(vec![NDDimension::new(4000)], NDDataType::UInt8)
-            .unwrap();
-        let small = pool
-            .alloc(vec![NDDimension::new(1000)], NDDataType::UInt8)
-            .unwrap();
-        pool.release(big);
-        pool.release(small);
-        let w = pool
-            .alloc_with(
-                vec![NDDimension::new(800)],
-                NDDataBuffer::from_vec::<u8>(vec![0; 800]),
-            )
-            .unwrap();
-        assert_eq!(w.data_size, 1000);
-        assert_eq!(w.data.len(), 800);
-        assert_eq!(pool.num_alloc_buffers(), 2);
-        assert_eq!(pool.num_free_buffers(), 1);
-        assert_eq!(pool.allocated_bytes(), 5000);
     }
 
     #[test]

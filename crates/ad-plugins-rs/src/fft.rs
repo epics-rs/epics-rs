@@ -380,10 +380,11 @@ fn first_row_waveforms(
 /// adjacent elements instead of one element per row per column.
 ///
 /// A block's columns are strided through every row, so blocks cannot be
-/// handed out as disjoint slices of `data`. Each wave of up to `jobs` blocks
-/// is gathered and transformed into `cols`, one part per block, then every
-/// row takes the wave's columns back: one job per block, then one job per
-/// row.
+/// handed out as disjoint slices of `data`. One job takes a block at a time
+/// through `cols`, whose columns stay in cache. More jobs gather and
+/// transform each wave of blocks into `cols`, one part per block, then
+/// every row takes the wave's columns back: one job per block, then one
+/// job per row.
 fn fft_columns(
     fft: &Arc<dyn Fft<f64>>,
     data: &mut [Complex<f64>],
@@ -395,16 +396,43 @@ fn fft_columns(
     const COLS: usize = 8;
     const WAVE_ELEMENTS: usize = 1 << 20;
     let h = fft.len();
-    let blocks = w.div_ceil(COLS);
-    // A wave on the pool pays two hand-offs, so it gathers at least
-    // `WAVE_ELEMENTS` values; on this thread it gathers one block, whose
-    // columns stay in cache.
-    let wave = match jobs {
-        1 => 1,
-        _ => blocks.min(jobs.max(WAVE_ELEMENTS.div_ceil(COLS * h))),
+    // Column `k` of a block or wave, counted from its first, `c0`, sits at
+    // `k * h` of `cols`; the gather writes every column the transforms then
+    // read.
+    let gather = |src: &[Complex<f64>], c0: usize, cols: &mut [Complex<f64>]| {
+        let nc = cols.len() / h;
+        for (row, r) in src.chunks_exact(w).enumerate() {
+            for (k, &v) in r[c0..c0 + nc].iter().enumerate() {
+                cols[k * h + row] = v;
+            }
+        }
     };
-    // Column `j` of a wave, counted from its first, sits at `j * h`; the
-    // gather writes every column the transforms then read.
+    let scatter = |row: usize, r: &mut [Complex<f64>], c0: usize, c1: usize, cols: &[_]| {
+        for (k, v) in r[c0..c1].iter_mut().enumerate() {
+            *v = cols[k * h + row];
+        }
+    };
+    if jobs == 1 {
+        if job_bufs.is_empty() {
+            job_bufs.push(JobBufs::default());
+        }
+        let scratch = &mut job_bufs[0].scratch;
+        let cols = at_least(cols, COLS * h);
+        for c0 in (0..w).step_by(COLS) {
+            let c1 = w.min(c0 + COLS);
+            let cols = &mut cols[..(c1 - c0) * h];
+            gather(data, c0, cols);
+            run(&**fft, cols, scratch);
+            for (row, r) in data.chunks_exact_mut(w).enumerate() {
+                scatter(row, r, c0, c1, cols);
+            }
+        }
+        return;
+    }
+    // A wave on the pool pays two hand-offs, so it gathers at least
+    // `WAVE_ELEMENTS` values.
+    let blocks = w.div_ceil(COLS);
+    let wave = blocks.min(jobs.max(WAVE_ELEMENTS.div_ceil(COLS * h)));
     resize(cols, wave * COLS * h, Complex::new(0.0, 0.0), jobs);
     for b0 in (0..blocks).step_by(wave) {
         let c0 = b0 * COLS;
@@ -416,22 +444,12 @@ fn fft_columns(
             jobs,
             job_bufs,
             |job, i, cols| {
-                let c0 = c0 + i * COLS;
-                let nc = cols.len() / h;
-                for (row, r) in src.chunks_exact(w).enumerate() {
-                    for (k, &v) in r[c0..c0 + nc].iter().enumerate() {
-                        cols[k * h + row] = v;
-                    }
-                }
+                gather(src, c0 + i * COLS, cols);
                 run(&**fft, cols, &mut job.scratch);
             },
         );
         let cols = &*cols;
-        for_each_chunk(data, w, jobs, |row, r| {
-            for (j, v) in r[c0..c1].iter_mut().enumerate() {
-                *v = cols[j * h + row];
-            }
-        });
+        for_each_chunk(data, w, jobs, |row, r| scatter(row, r, c0, c1, cols));
     }
 }
 

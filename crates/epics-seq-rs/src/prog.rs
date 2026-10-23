@@ -1,6 +1,5 @@
 //! The program instance list (`seq_prog.c`), kept in the registry of
-//! [`traverse_sequencer_programs`](crate::cmd::traverse_sequencer_programs)
-//! and walked under its lock.
+//! [`traverse_sequencer_programs`] and walked under its lock.
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;

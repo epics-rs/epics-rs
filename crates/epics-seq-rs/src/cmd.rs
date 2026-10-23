@@ -25,7 +25,7 @@ use crate::var::ProgramVars;
 pub trait RegisteredProgram: Sync {
     fn prog_name(&self) -> &'static str;
 
-    /// [`seq`](crate::seq) on this program, which needs the table for the
+    /// [`seq`](fn@crate::seq) on this program, which needs the table for the
     /// instance's whole life.
     fn start(
         &'static self,

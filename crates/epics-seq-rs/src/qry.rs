@@ -1,8 +1,7 @@
 //! The query commands (`seq_qry.c`). A command finds its instance with
-//! [`seq_find_state_set`](crate::prog::seq_find_state_set) and calls the
-//! routine of the same name here through
-//! [`ProgInstance`](crate::pvt::ProgInstance); with no instance, it lists
-//! them all, as `seqQryFind` does.
+//! [`seq_find_state_set`] and calls the routine of the same name here
+//! through [`ProgInstance`]; with no instance, it lists them all, as
+//! `seqQryFind` does.
 //!
 //! C prints here and in `seq_cmd.c` with plain `printf`, and reads the
 //! pager's answer with `fgets(stdin)`: the process's own streams, which no

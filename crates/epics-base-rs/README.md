@@ -8,7 +8,9 @@ No C dependencies. No `libCom`. Just `cargo build`.
 
 ## Overview
 
-epics-base-rs is the foundation of the [epics-rs](https://github.com/epics-rs/epics-rs) workspace. It corresponds to the C EPICS Base modules `dbStatic`, `dbCommon`, `recCore`, `iocsh`, `asLib`, `autosave`, and `calc` — minus the wire protocol code (which lives in `epics-ca-rs` for Channel Access and `epics-pva-rs` for pvAccess).
+epics-base-rs is the foundation of the [epics-rs](https://github.com/epics-rs/epics-rs) workspace. It corresponds to the C EPICS Base modules `dbStatic`, `dbCommon`, `recCore`, `iocsh`, `asLib`, and synApps `autosave` and `calc` — minus the wire protocol code (which lives in `epics-ca-rs` for Channel Access and `epics-pva-rs` for pvAccess).
+It follows EPICS Base R7.0.10; `EPICS_BASE_VERSION` reports the vendored
+`envconfig/CONFIG_BASE_VERSION`.
 
 ```
 ┌──────────────────────────────────────────────┐
@@ -18,14 +20,14 @@ epics-base-rs is the foundation of the [epics-rs](https://github.com/epics-rs/ep
                  │
          ┌───────▼────────┐
          │   PvDatabase   │  ← record storage + processing
-         │ (Arc<RwLock>)  │
+         │  (Arc-shared)  │
          └───────┬────────┘
                  │
     ┌────────────┼──────────────┐
     ▼            ▼              ▼
 ┌────────┐  ┌──────────┐  ┌──────────┐
 │ Records│  │  Links   │  │ Subscr.  │
-│ (trait)│  │ (parsed) │  │ (mpsc)   │
+│ (trait)│  │ (parsed) │  │ (queue)  │
 └────────┘  └──────────┘  └──────────┘
 ```
 
@@ -64,6 +66,11 @@ names.
 ### Database & Processing
 - **PvDatabase** — Arc-shared record map with `add_record`, `get_record`, `process_record`, `process_record_with_links`, `put_record_field_from_ca`
 - **Link parsing** — DB/CA/PVA/Constant links, INP/OUT/FLNK/SDIS/TSEL
+- **Local CA links** — a CA, CP or CPP link to a record this database serves
+  is an in-process channel, as C keeps dbCa in base (`database/ca_link.rs`);
+  the `ca` link set in `epics-ca-rs` adds only the network half
+- **recDynLink** — `server::rec_dyn_link`, a record's own CA channels opened by
+  name at runtime, which sscan's and swait's links run on
 - **Scan engine** — Passive, I/O Intr, Event, periodic (10/5/2/1/0.5/0.2/0.1 Hz), with PHAS ordering
 - **Parallel scanning** — `scanParallelThreads`/`scanRateThreads` add helper
   threads that claim slots of the PHAS group a rate's own thread has published,
@@ -84,6 +91,9 @@ names.
 - **IocApplication** — st.cmd-style lifecycle (Phase 1: pre-init script, Phase 2: device wiring + autosave restore, Phase 3: protocol runner)
 - **iocsh** — interactive shell with command registration, st.cmd parser, expression evaluator
 - **Pluggable protocol runner** — CA, PVA, or both via `app.run(|config| async { ... })`
+- **Link types** — `IocApplication::register_link_type(key, installer)`
+  installs the link set for one JSON link type (`ca`, `pva`) at C's
+  `dbCaLinkInit`, before CP links are warmed
 
 ### Direct Database Access
 - **DbChannel** — in-process get/put without wire protocol round-trip (`get_f64`, `put_f64_process`, `put_f64_post`)
@@ -97,9 +107,9 @@ names.
 - **Per-instance overrides** — record `ASG` field links to ACF rule
 
 ### Calc Engine
-- **Numeric calc** — infix-to-postfix compilation, 16 input variables (A–P), full math library (sqrt, sin, log, abs, floor, etc.)
-- **String calc** — string concatenation, search, substring, format
-- **Array calc** — element-wise operations, statistics (mean, sigma, min, max, median)
+- **Numeric calc** — infix-to-postfix compilation, 21 input variables (A–U), full math library (sqrt, sin, log, abs, floor, etc.)
+- **String calc** — string concatenation, search, substring, format; inputs A–P and AA–LL
+- **Array calc** — element-wise operations, reductions (`AVG`, `STD`, `AMIN`, `AMAX`, `SUM`, `FWHM`), smoothing, derivatives, polynomial fits; inputs A–P and AA–LL
 
 ### Autosave
 - C-compatible iocsh commands: `set_requestfile_path`, `set_savefile_path`, `create_monitor_set`, `create_triggered_set`, `create_manual_set`, `set_pass0_restoreFile`, `set_pass1_restoreFile`, `save_restoreSet_status_prefix`, `manual_save`, `fdbrestore`, `save_restoreShow`
@@ -112,8 +122,10 @@ names.
 ### Runtime Facade
 - `epics_base_rs::runtime::sync` — `mpsc`, `oneshot`, `broadcast`, `Notify`,
   `RwLock`, `Mutex`, `Arc`, and the EPICS mutex registry
-- `epics_base_rs::runtime::task` — `spawn`, `sleep`, `sleep_until`, `interval`,
-  `timeout`, `MandatoryThread`, the EPICS priority bands
+- `epics_base_rs::runtime::task` — `Reactor` (`Reactor::current`,
+  `Reactor::spawn`), `spawn_background`, `spawn_blocking`, `sleep`,
+  `sleep_until`, `interval`, `timeout`, `MandatoryThread`, the EPICS priority
+  bands
 - `epics_base_rs::runtime::select` — async multiplexing
 
 `runtime` and `net` are re-exports of `epics-libcom-rs` (issue #55): the paths
@@ -160,7 +172,7 @@ epics-base-rs/src/
 ├── json5.rs                # the JSON5 subset `.db` link/info values use
 ├── reference.rs            # the C-source citations the parity tests read
 ├── types/
-│   ├── value.rs            # EpicsValue (12 variants: scalar + array)
+│   ├── value.rs            # EpicsValue (scalars, and arrays over SharedArray)
 │   ├── dbr.rs              # DbFieldType, DBR type ranges
 │   └── codec.rs            # DBR encoding/decoding (PLAIN/STS/TIME/GR/CTRL)
 ├── calc/                   # expression engine (numeric/string/array)
@@ -173,13 +185,16 @@ epics-base-rs/src/
     │   ├── field_io.rs     # get_pv, put_pv, put_record_field_from_ca
     │   ├── processing.rs   # process_record_with_links (full link chain)
     │   ├── links.rs        # DB/CA/PVA/Constant link resolution
+    │   ├── ca_link.rs      # the `ca` link set's in-process half
     │   ├── scan_index.rs   # SCAN scheduling + `post_event` (Passive/Periodic/IOIntr/Event)
     │   └── db_access.rs    # DbChannel, DbSubscription, DbMultiMonitor
     ├── db_loader/          # .db parser, macro expansion, info()
     ├── record/
     │   ├── record_trait.rs # Record trait, FieldDesc, ProcessOutcome
-    │   └── record_instance.rs  # CommonFields, snapshot_for_field, alarm eval
-    ├── records/            # 23 record type implementations
+    │   ├── common_fields.rs    # CommonFields
+    │   └── record_instance.rs  # RecordInstance, snapshot_for_field, alarm eval
+    ├── records/            # the 34 Base record types, the synApps six, asyn
+    ├── rec_dyn_link.rs     # recDynLink (C `recDynLink.c`)
     ├── snapshot.rs         # Snapshot, AlarmInfo, DisplayInfo, ControlInfo, EnumInfo
     ├── pv.rs               # ProcessVariable, MonitorEvent, Subscriber
     ├── recgbl/, recgbl.rs  # EventMask (VALUE/LOG/ALARM/PROPERTY), recGblXxx
@@ -208,7 +223,7 @@ use epics_base_rs::types::EpicsValue;
 async fn main() -> epics_base_rs::error::CaResult<()> {
     let (db, _autosave) = IocBuilder::new()
         .pv("MSG", EpicsValue::String("hello".into()))
-        .record("TEMP", AiRecord::new())
+        .record("TEMP", AiRecord::new(0.0))
         .build()
         .await?;
 
@@ -234,26 +249,50 @@ while let Some(Ok(snap)) = sub.recv_snapshot().await {
 
 ### Custom Record Type
 
-```rust
-use epics_base_rs::server::record::Record;
-use epics_macros_rs::EpicsRecord;
+A record type outside this crate implements `Record` by hand and declares its
+fields through `declared_fields` (`#[derive(EpicsRecord)]` maps members onto
+the `.dbd` tables this crate vendors):
 
-#[derive(EpicsRecord, Default)]
-#[record(type = "myrec")]
+```rust
+use epics_base_rs::error::{CaError, CaResult};
+use epics_base_rs::server::record::{FieldDesc, ProcessOutcome, Record};
+use epics_base_rs::types::{DbFieldType, EpicsValue};
+
+#[derive(Default)]
 pub struct MyRecord {
-    #[field(type = "Double")]
-    pub val: f64,
-    #[field(type = "String")]
-    pub desc: String,
+    val: f64,
 }
+
+static MY_FIELDS: &[FieldDesc] = &[FieldDesc::new("VAL", DbFieldType::Double, false)];
 
 impl Record for MyRecord {
+    fn record_type(&self) -> &'static str {
+        "myrec"
+    }
     fn process(&mut self) -> CaResult<ProcessOutcome> {
-        // your logic
         Ok(ProcessOutcome::complete())
     }
-    // ... rest auto-generated by derive
+    fn get_field(&self, name: &str) -> Option<EpicsValue> {
+        match name {
+            "VAL" => Some(EpicsValue::Double(self.val)),
+            _ => None,
+        }
+    }
+    fn put_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
+        match name {
+            "VAL" => {
+                self.val = value.to_f64().unwrap_or(self.val);
+                Ok(())
+            }
+            _ => Err(CaError::FieldNotFound(name.into())),
+        }
+    }
+    fn declared_fields(&self) -> &'static [FieldDesc] {
+        MY_FIELDS
+    }
 }
+
+// IocBuilder::new().register_record_type("myrec", || Box::new(MyRecord::default()))
 ```
 
 ## Testing
@@ -279,7 +318,7 @@ Test coverage: record processing, alarm evaluation, deadband filtering, link cha
 
 ## Requirements
 
-- Rust 1.94.0 (`rust-toolchain.toml`), edition 2024
+- Rust 1.99.1 (`rust-toolchain.toml`), edition 2024
 
 ## License
 

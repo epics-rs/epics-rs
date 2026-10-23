@@ -3,6 +3,7 @@ name = "epics-seq-rs"
 version.workspace = true
 edition.workspace = true
 description = "Rust port of the EPICS sequencer run-time (seq, pv) that snc-rs generated programs run on"
+readme = "README.md"
 license-file = "LICENSE"
 authors.workspace = true
 repository.workspace = true

@@ -98,7 +98,7 @@ pub(crate) fn start_acquisition_task(ctx: AcquisitionContext) -> std::thread::Jo
 }
 
 /// The image is computed into `raw`, C simDetector's pRaw_, with the slot's
-/// lock free for a port write below FIRST_AD_PARAM, which reads pArrays[0]
+/// lock free for a port write below FIRST_AD_PARAM, which reads `pArrays[0]`
 /// under it; the last image is then released and the next copied into its
 /// place (simDetector.cpp:694-699). `None` when the pool refused it, which
 /// empties the slot as C's refused alloc does; it has printed the pool's
@@ -362,7 +362,7 @@ mod tests {
         }
     }
 
-    /// dims[0] is SizeX, as ADSimDetector's, so a 640x480 frame reports
+    /// `dims[0]` is SizeX, as ADSimDetector's, so a 640x480 frame reports
     /// ArraySize0 640, and pixel (x, y) is the generator's row y, column x.
     #[test]
     fn a_frame_is_size_x_wide() {
@@ -405,7 +405,7 @@ mod tests {
 
     /// The image is computed outside the slot's lock and copied into the
     /// buffer the released last image leaves in the pool, so every frame
-    /// reuses one buffer, as C's convert into pArrays[0] does.
+    /// reuses one buffer, as C's convert into `pArrays[0]` does.
     #[test]
     fn each_image_reuses_the_released_buffer() {
         let pool = DriverPool::standalone(0);

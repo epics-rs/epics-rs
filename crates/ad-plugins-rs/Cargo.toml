@@ -55,7 +55,7 @@ source-guard = { path = "../source-guard" }
 tempfile = "3"
 # Independent TIFF decoder, used only to check the bytes our hand-written
 # encoder produces (src/file_tiff.rs). Not used by the writer itself.
-tiff = "0.9"
+tiff = "0.11"
 
 [features]
 default = ["parallel", "simd"]

@@ -120,6 +120,40 @@ struct Scratch {
     bufs: Buffers,
 }
 
+/// The input dims, height 0 for a 1-D frame, and the direction: what sizes
+/// a frame's [`Scratch`].
+type FrameShape = ([usize; 2], FFTDirection);
+
+/// Free [`Scratch`] sets, all grown for frames of `shape`.
+#[derive(Default)]
+struct FreeSets {
+    shape: Option<FrameShape>,
+    sets: Vec<Scratch>,
+}
+
+impl FreeSets {
+    /// A set for a frame of `shape`, free or new. A new shape hands back
+    /// the old shape's sets too, for the caller to drop unlocked.
+    fn take(&mut self, shape: FrameShape) -> (Scratch, Vec<Scratch>) {
+        let mut stale = Vec::new();
+        if self.shape != Some(shape) {
+            self.shape = Some(shape);
+            stale = std::mem::take(&mut self.sets);
+        }
+        (self.sets.pop().unwrap_or_default(), stale)
+    }
+
+    /// `set`, grown for a frame of `shape`, back on the list, or handed
+    /// back to drop if the frames have moved on to another shape.
+    fn give(&mut self, shape: FrameShape, set: Scratch) -> Option<Scratch> {
+        if self.shape != Some(shape) {
+            return Some(set);
+        }
+        self.sets.push(set);
+        None
+    }
+}
+
 /// The first `n` elements of `v`, which grows to `n` if shorter.
 fn at_least(v: &mut Vec<Complex<f64>>, n: usize) -> &mut [Complex<f64>] {
     if v.len() < n {
@@ -769,8 +803,10 @@ pub struct FFTProcessor {
     /// Free frame buffers. A frame takes a set for itself and gives it back:
     /// one shared set would serialise the NumThreads workers, and fresh
     /// buffers per frame, as C callocs them (NDPluginFFT.cpp:106-110), spend
-    /// more on faulting their pages in than on the transforms.
-    scratch: Mutex<Vec<Scratch>>,
+    /// more on faulting their pages in than on the transforms. C keeps no
+    /// frame buffer past its frame (:228-232), so a shape change drops the sets
+    /// grown for the last shape rather than keep them at its size.
+    scratch: Mutex<FreeSets>,
     params: FFTParamIndices,
 }
 
@@ -794,7 +830,7 @@ impl FFTProcessor {
             unique_id: AtomicI32::new(0),
             array_callbacks: ArrayCallbacks::new(true),
             planner: Mutex::new(FftPlanner::new()),
-            scratch: Mutex::new(Vec::new()),
+            scratch: Mutex::new(FreeSets::default()),
             params: FFTParamIndices::default(),
         }
     }
@@ -1011,7 +1047,12 @@ impl NDPluginProcess for FFTProcessor {
             )
         };
 
-        let mut scratch = self.scratch.lock().pop().unwrap_or_default();
+        let shape = (
+            [array.dims[0].size, array.dims.get(1).map_or(0, |d| d.size)],
+            frame.config.direction,
+        );
+        let (mut scratch, stale) = self.scratch.lock().take(shape);
+        drop(stale);
         let jobs = frame_jobs(&array.dims, frame.config.direction);
         load_f64(&array.data, jobs, &mut scratch.vals);
         let dims = frame.compute_fft(array, &scratch.vals, jobs, &mut scratch.bufs);
@@ -1086,7 +1127,8 @@ impl NDPluginProcess for FFTProcessor {
                 .get()
                 .then(|| pool_output(pool, array, dims, mags, jobs))
         });
-        self.scratch.lock().push(scratch);
+        let stale = self.scratch.lock().give(shape, scratch);
+        drop(stale);
         match output {
             Some(Ok(mut out)) => {
                 out.unique_id = self.unique_id.fetch_add(1, Ordering::Relaxed);
@@ -1519,6 +1561,64 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The bytes a free set holds.
+    fn set_bytes(s: &Scratch) -> usize {
+        let b = &s.bufs;
+        let complex = b.data.capacity()
+            + b.cols.capacity()
+            + (b.per_job.iter())
+                .map(|j| j.scratch.capacity() + j.row.capacity() + j.a.capacity() + j.b.capacity())
+                .sum::<usize>();
+        (s.vals.capacity() + b.out.capacity()) * 8 + complex * 16
+    }
+
+    /// A 16x16 frame after a 256x256 one runs in a set grown for 16x16, and
+    /// the free list keeps that set alone, not the 256x256 one beside it.
+    #[test]
+    fn a_shape_change_drops_the_last_shapes_buffers() {
+        let pool = NDArrayPool::new(0);
+        let frame = |w: usize, h: usize| {
+            Arc::new(NDArray::with_data(
+                vec![NDDimension::new(w), NDDimension::new(h)],
+                NDDataBuffer::U16((0..w * h).map(|i| (i % 251) as u16).collect()),
+            ))
+        };
+        for direction in [FFTDirection::Forward, FFTDirection::Inverse] {
+            let fft = FFTProcessor::with_config(FFTConfig {
+                direction,
+                ..FFTConfig::default()
+            });
+            drop(fft.process_array(&frame(16, 16), &pool));
+            let small = set_bytes(&fft.scratch.lock().sets[0]);
+            drop(fft.process_array(&frame(256, 256), &pool));
+            drop(fft.process_array(&frame(16, 16), &pool));
+            let free = fft.scratch.lock();
+            assert_eq!(free.sets.len(), 1, "{direction:?}");
+            assert_eq!(set_bytes(&free.sets[0]), small, "{direction:?}");
+        }
+    }
+
+    /// A set taken for one shape and given back after a frame of another
+    /// shape took its own is not kept: the list holds that shape's sets only.
+    #[test]
+    fn a_set_of_an_old_shape_is_not_given_back() {
+        let a = ([16, 16], FFTDirection::Forward);
+        let b = ([16, 16], FFTDirection::Inverse);
+        let mut free = FreeSets::default();
+        let (set_a, stale) = free.take(a);
+        assert!(stale.is_empty());
+        assert!(free.give(a, set_a).is_none());
+        let (set_a, _) = free.take(a);
+        let (set_b, stale) = free.take(b);
+        assert!(stale.is_empty());
+        assert!(free.give(a, set_a).is_some());
+        assert!(free.give(b, set_b).is_none());
+        assert_eq!(free.sets.len(), 1);
+        let (_, stale) = free.take(a);
+        assert_eq!(stale.len(), 1);
+        assert!(free.sets.is_empty());
     }
 
     fn pool() -> Arc<NDArrayPool> {

@@ -690,8 +690,13 @@ fn decode(bytes: &[u8], attributes: NDAttributeList, pool: &NDArrayPool) -> ADRe
     };
     // TIFFReadDirectory reads these too, and fails the open where an entry
     // does not read or its value does not set; readFile never looks at them.
-    for tag in [TAG_IMAGE_DEPTH, TAG_TILE_WIDTH, TAG_TILE_LENGTH] {
-        one(tag, long)?;
+    one(TAG_IMAGE_DEPTH, long)?;
+    // A TileWidth or TileLength makes the file tiled, and readFile's
+    // TIFFReadEncodedStrip fails on a tiled file.
+    for tag in [TAG_TILE_WIDTH, TAG_TILE_LENGTH] {
+        if one(tag, long)?.is_some() {
+            return Err(err("a tiled TIFF is not read"));
+        }
     }
     if one(TAG_TILE_DEPTH, long)? == Some(0) {
         return Err(err("bad value 0 for TileDepth"));
@@ -3040,6 +3045,10 @@ mod tests {
             ("extra_one_rgb", TagFile { extra: &[(TAG_EXTRA_SAMPLES, TYPE_SHORT, &[2])], ..rgb }, Some(RGB1)),
             ("toffs_ascii", TagFile { extra: &[(TAG_TILE_OFFSETS, TYPE_ASCII, &[8])], ..s }, None),
             ("tcounts_negative", TagFile { extra: &[(TAG_TILE_BYTE_COUNTS, TYPE_SSHORT, &[-1])], ..s }, None),
+            ("tiled_w", TagFile { extra: &[(TAG_TILE_WIDTH, TYPE_LONG, &[16])], ..s }, None),
+            ("tiled_l", TagFile { extra: &[(TAG_TILE_LENGTH, TYPE_LONG, &[16])], ..s }, None),
+            ("tiled_wl", TagFile { extra: &[(TAG_TILE_WIDTH, TYPE_LONG, &[16]), (TAG_TILE_LENGTH, TYPE_LONG, &[16])], ..s }, None),
+            ("tiled_w5", TagFile { extra: &[(TAG_TILE_WIDTH, TYPE_LONG, &[5])], ..s }, None),
         ];
         let wrong: Vec<_> = cases
             .iter()

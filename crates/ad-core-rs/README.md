@@ -1,7 +1,7 @@
 # ad-core-rs
 
 Pure Rust implementation of [EPICS areaDetector](https://github.com/areaDetector/areaDetector)
-core — N-dimensional array handling and the plugin framework.
+core (ADCore `R3-14-111-g6c53844e`) — N-dimensional array handling and the plugin framework.
 
 No C dependencies. Just `cargo build`.
 
@@ -12,8 +12,8 @@ No C dependencies. Just `cargo build`.
 | Crate | Description |
 |-------|-------------|
 | **ad-core-rs** (this crate) | Core types: NDArray, NDArrayPool, attributes, driver/plugin base classes |
-| **ad-plugins-rs** | 26 NDPlugin implementations: stats, ROI, process, transform, FFT, file I/O, etc. |
-| **examples/sim-detector** | Simulated areaDetector driver (4 SimModes, Mono/RGB1, ROI crop) |
+| **ad-plugins-rs** | 27 NDPlugin implementations: stats, ROI, process, transform, FFT, file I/O, etc. |
+| **examples/sim-detector** | Simulated areaDetector driver (4 SimModes, Mono/RGB1/RGB2/RGB3, ROI crop) |
 
 ## Features
 
@@ -24,7 +24,9 @@ No C dependencies. Just `cargo build`.
 - `NDColorMode` — Mono, Bayer, RGB1/2/3, YUV444/422
 - `ADDriverBase` — Base detector driver with channel-based plugin chain
 - `NDPluginProcess` trait — Pure plugin processing interface, `&self` so one
-  processor can run on `NumThreads` callback threads at once
+  processor can run on `NumThreads` callback threads at once; each plugin
+  declares C's `INTERFACE_MASK` and `INTERRUPT_MASK`, and `max_addr()` its
+  address count
 - `PluginRuntime` — Per-plugin data processing thread, with the frame
   throttler and the plugin-chain wiring
 - `FileBase` / `FileController` — the capture/stream/single file lifecycle every
@@ -41,13 +43,13 @@ No C dependencies. Just `cargo build`.
 
 ### Plugins
 
-The 26 plugin implementations live in `ad-plugins-rs`; its README has the
+The 27 plugin implementations live in `ad-plugins-rs`; its README has the
 table and the notes on rayon parallelism and the shared thread pool.
 
 ### examples/sim-detector
 
 - 4 simulation modes: LinearRamp, Peaks, Sine, OffsetNoise
-- Color modes: Mono, RGB1
+- Color modes: Mono, RGB1, RGB2, RGB3
 - ROI cropping with min_x/y, size_x/y
 - Actor-based acquisition with PortHandle I/O and channel-based start/stop
 - Single and Continuous image modes
@@ -68,21 +70,37 @@ cargo run -p sim-detector --features ioc --bin sim-ioc -- \
 ```bash
 epicsEnvSet("PREFIX", "SIM1:")
 epicsEnvSet("CAM",    "cam1:")
-epicsEnvSet("EPICS_DB_INCLUDE_PATH", "$(ADCORE)/ADApp/Db")
-simDetectorConfig("SIM1", 256, 256, 1, 0, 50000000)
-dbLoadRecords("$(ADSIMDETECTOR)/simDetectorApp/Db/simDetector.template", "P=$(PREFIX),R=$(CAM),PORT=SIM1,DTYP=asynSimDetector")
+epicsEnvSet("PORT",   "SIM1")
+epicsEnvSet("EPICS_DB_INCLUDE_PATH", "$(ADCORE)/db")
+simDetectorConfig("$(PORT)", 1024, 1024, 1, 0, 50000000)
+dbLoadRecords("$(ADSIMDETECTOR)/db/simDetector.template", "P=$(PREFIX),R=$(CAM),PORT=$(PORT),ADDR=0,TIMEOUT=1")
+< $(ADCORE)/iocBoot/commonPlugins.cmd
 iocInit()
 ```
 
 ### Library Usage
 
 ```rust
-use ad_core_rs::driver::ad_driver::ADDriverBase;
-use ad_core_rs::ndarray::{NDArray, NDDataType};
+use ad_core_rs::driver::ADDriverBase;
+use ad_core_rs::ndarray::{NDDataType, NDDimension};
+use ad_core_rs::plugin::runtime::ASYN_NONE;
+use asyn_rs::port::InterfaceMask;
 
-let mut driver = ADDriverBase::new("SIM1", 1, 50_000_000, ASYN_CANBLOCK).unwrap();
+// maxAddr, maxMemory, asynFlags, and the detector's own interface and
+// interrupt masks (simDetector adds none to ADDriver's). C's ADDriver takes
+// no sensor size: set ADMaxSizeX/Y afterwards.
+let mut driver = ADDriverBase::new(
+    "SIM1", 1, 50_000_000, ASYN_NONE, InterfaceMask::NONE, InterfaceMask::NONE,
+)?;
 driver.connect_downstream(stats_handle.array_sender().clone());
-driver.publish_array(Arc::new(array)).unwrap();
+
+let array = driver
+    .pool
+    .alloc(vec![NDDimension::new(64), NDDimension::new(64)], NDDataType::UInt8)?;
+// `None` while ArrayCallbacks is 0.
+if let Some(published) = driver.prepare_array(array)? {
+    driver.array_output.publish(published).await;
+}
 ```
 
 ## Testing
@@ -119,12 +137,12 @@ crates/ad-core-rs/
   doc/                  # the parity notes against C ADCore
 
 examples/sim-detector/  # the simulated driver and its sim-ioc binary
-crates/ad-plugins-rs/   # the 26 plugins
+crates/ad-plugins-rs/   # the 27 plugins
 ```
 
 ## Requirements
 
-- Rust 1.94.0 (`rust-toolchain.toml`), edition 2024
+- Rust 1.99.1 (`rust-toolchain.toml`), edition 2024
 
 ## License
 

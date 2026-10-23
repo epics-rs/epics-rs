@@ -34,6 +34,7 @@ const TAG_MIN_SAMPLE_VALUE: u16 = 280;
 const TAG_MAX_SAMPLE_VALUE: u16 = 281;
 const TAG_PLANAR_CONFIG: u16 = 284;
 const TAG_SOFTWARE: u16 = 305;
+const TAG_COLOR_MAP: u16 = 320;
 const TAG_TILE_WIDTH: u16 = 322;
 const TAG_TILE_LENGTH: u16 = 323;
 const TAG_TILE_OFFSETS: u16 = 324;
@@ -70,6 +71,7 @@ const TYPE_SLONG8: u16 = 17;
 const COMPRESSION_NONE: u16 = 1;
 const PHOTOMETRIC_MINISBLACK: u16 = 1;
 const PHOTOMETRIC_RGB: u16 = 2;
+const PHOTOMETRIC_PALETTE: u16 = 3;
 const PLANARCONFIG_CONTIG: u16 = 1;
 const PLANARCONFIG_SEPARATE: u16 = 2;
 const SAMPLEFORMAT_UINT: u16 = 1;
@@ -678,6 +680,28 @@ fn decode(bytes: &[u8], attributes: NDAttributeList, pool: &NDArrayPool) -> ADRe
     // (TIFFReadDirectory reads the tag with recover); refused here.
     let photometric =
         one(TAG_PHOTOMETRIC, short)?.ok_or_else(|| err("no PhotometricInterpretation"))?;
+    // TIFFReadDirectory reads a Palette file without a ColorMap as RGB with 3
+    // samples, else MinIsBlack, from 8 bits up, and fails it below 8. A
+    // ColorMap sets only after BitsPerSample, with 3 << bits values that read.
+    let colormap = || {
+        entries.get(&TAG_BITS_PER_SAMPLE) < entries.get(&TAG_COLOR_MAP)
+            && values(TAG_COLOR_MAP).ok().flatten().is_some_and(|v| {
+                Some(v.len() as u64) == 1u64.checked_shl(bits as u32).and_then(|n| n.checked_mul(3))
+                    && v.iter().all(|&c| c <= short)
+            })
+    };
+    let photometric = if photometric == u64::from(PHOTOMETRIC_PALETTE) && !colormap() {
+        if bits < 8 {
+            return Err(err("no ColorMap for a Palette image"));
+        }
+        u64::from(if samples_per_pixel == 3 {
+            PHOTOMETRIC_RGB
+        } else {
+            PHOTOMETRIC_MINISBLACK
+        })
+    } else {
+        photometric
+    };
     let planar_config = one(TAG_PLANAR_CONFIG, short)?.unwrap_or(u64::from(PLANARCONFIG_CONTIG));
     // _TIFFVSetField fails the open on a SampleFormat outside 1..=6, and sets
     // the sample format from DataType VOID..=IEEEFP as well; the later entry
@@ -3083,6 +3107,16 @@ mod tests {
             ("toffs_only", TagFile { omit: &[TAG_STRIP_OFFSETS], extra: &[(TAG_TILE_OFFSETS, TYPE_LONG, &[8, 12, 16])], ..s }, Some(GRAY)),
             ("toffs_first", TagFile { lead: &[(TAG_TILE_OFFSETS, TYPE_LONG, &[9, 13, 17])], ..s }, Some(GRAY)),
             ("tcounts_fix", TagFile { values: &[(TAG_STRIP_BYTE_COUNTS, &[4, 4, 2])], extra: &[(TAG_TILE_BYTE_COUNTS, TYPE_LONG, &[4, 4, 4])], ..s }, Some(GRAY)),
+            ("palette", TagFile { values: &[(TAG_PHOTOMETRIC, &[3])], ..s }, Some(GRAY)),
+            ("palette_rgb", TagFile { values: &[(TAG_PHOTOMETRIC, &[3])], ..rgb }, Some(RGB1)),
+            ("palette_u16", TagFile { bits: 16, values: &[(TAG_PHOTOMETRIC, &[3])], ..s }, Some(GRAY16)),
+            ("palette_rgb3", TagFile { separate: true, values: &[(TAG_PHOTOMETRIC, &[3])], ..rgb }, Some(RGB3)),
+            ("palette_bits4", TagFile { bits: 4, values: &[(TAG_PHOTOMETRIC, &[3])], ..s }, None),
+            ("palette_cmap", TagFile { values: &[(TAG_PHOTOMETRIC, &[3])], extra: &[(TAG_COLOR_MAP, TYPE_SHORT, &[0; 768])], ..s }, None),
+            ("palette_cmap_short", TagFile { values: &[(TAG_PHOTOMETRIC, &[3])], extra: &[(TAG_COLOR_MAP, TYPE_SHORT, &[0; 3])], ..s }, Some(GRAY)),
+            ("palette_cmap_ascii", TagFile { values: &[(TAG_PHOTOMETRIC, &[3])], extra: &[(TAG_COLOR_MAP, TYPE_ASCII, &[0; 768])], ..s }, Some(GRAY)),
+            ("palette_cmap_over", TagFile { values: &[(TAG_PHOTOMETRIC, &[3])], extra: &[(TAG_COLOR_MAP, TYPE_LONG, &[65536; 768])], ..s }, Some(GRAY)),
+            ("palette_cmap_first", TagFile { values: &[(TAG_PHOTOMETRIC, &[3])], lead: &[(TAG_COLOR_MAP, TYPE_SHORT, &[0; 768])], ..s }, Some(GRAY)),
             ("dt_int16", TagFile { bits: 16, extra: &[(TAG_DATA_TYPE, TYPE_SHORT, &[1])], ..s }, Some(INT16)),
             ("dt_void", TagFile { extra: &[(TAG_DATA_TYPE, TYPE_SHORT, &[0])], ..s }, None),
             ("dt_uint_over_int", TagFile { bits: 16, format: 2, extra: &[(TAG_DATA_TYPE, TYPE_SHORT, &[2])], ..s }, Some(GRAY16)),

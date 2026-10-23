@@ -22,14 +22,13 @@ row passes.
 
 ## Why a derivation and not a list
 
-`crates/asyn-rs/tests/epics_only_tests_declare_their_feature.rs` enforced this
-same rule from a hand-written list of three needles, for one crate and one
-feature. The list is the part that rots: the workspace has 131 gated module
-paths and 98 optional dependency declarations, and a needle list covers the ones
-somebody thought of. Both halves are read out of the sources here — the module
-tree under `src/lib.rs` for the requirement, the target's own attributes and
-manifest block for the declaration — so a module gated tomorrow is covered
-tomorrow.
+An `asyn-rs` test, since removed, enforced this same rule from a hand-written
+list of three needles, for one crate and one feature. The list is the part that
+rots: of the workspace's gated module paths and optional dependencies, a needle
+list covers only the ones somebody thought of. Both halves are read out of the
+sources here — the module tree under `src/lib.rs` for the requirement, the
+target's own attributes and manifest block for the declaration — so a module
+gated tomorrow is covered tomorrow.
 
 ## The axes it reasons over
 
@@ -68,7 +67,7 @@ cargo run -p target-cfg-gate --bin target-cfg-census   # one line per (target, g
 cargo nextest run -p target-cfg-gate                   # the gate itself
 ```
 
-18 tests. The gate over the real workspace is one of them; the rest pin the
+30 tests. The gate over the real workspace is one of them; the rest pin the
 predicate machinery it stands on — parsing, per-axis projection, implication,
 and the source scrub that keeps a path inside a string or a comment from
 counting as a reference.

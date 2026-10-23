@@ -1470,7 +1470,7 @@ mod tests {
         let mut src = NDArray::new(vec![NDDimension::new(2), NDDimension::new(2)], data_type);
         macro_rules! fill {
             ($variant:ident, $t:ty) => {
-                if let NDDataBuffer::$variant(ref mut v) = src.data {
+                if let NDDataViewMut::$variant(v) = src.data.view_mut() {
                     for e in v.iter_mut() {
                         *e = val as $t;
                     }

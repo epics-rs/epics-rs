@@ -57,19 +57,28 @@ impl NDDataType {
     }
 }
 
-/// Typed buffer for NDArray data.
-#[derive(Debug, Clone)]
-pub enum NDDataBuffer {
-    I8(Vec<i8>),
-    U8(Vec<u8>),
-    I16(Vec<i16>),
-    U16(Vec<u16>),
-    I32(Vec<i32>),
-    U32(Vec<u32>),
-    I64(Vec<i64>),
-    U64(Vec<u64>),
-    F32(Vec<f32>),
-    F64(Vec<f64>),
+/// The storage unit of an [`NDDataBuffer`]: 64 bytes aligned to 64, so its
+/// bytes are aligned for every element type they can be retyped to.
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+#[repr(C, align(64))]
+struct Chunk([u8; CHUNK]);
+
+const CHUNK: usize = 64;
+
+/// The chunks that hold `bytes`.
+fn chunks_for(bytes: usize) -> usize {
+    bytes.div_ceil(CHUNK)
+}
+
+/// NDArray data, C's `pData` plus `dataType`: untyped bytes and the element
+/// type they are read as, through [`view`](Self::view) or
+/// [`as_slice`](Self::as_slice). The bytes are not tied to one type, so a
+/// pooled buffer is reused for any element type it holds.
+pub struct NDDataBuffer {
+    data_type: NDDataType,
+    /// Elements in use: `len * element_size <= storage.len() * CHUNK`.
+    len: usize,
+    storage: Vec<Chunk>,
 }
 
 /// An [`NDDataBuffer`]'s elements read as its element type: C's `pData` cast
@@ -147,15 +156,8 @@ view_common!(NDDataView);
 view_common!(NDDataViewMut);
 
 mod sealed {
-    use super::{NDDataBuffer, NDDataView, NDDataViewMut};
-
-    /// What ties an element type to its [`NDDataView`] variant; outside
-    /// this crate no type can claim one.
-    pub trait Sealed: Sized {
-        fn of(view: NDDataView<'_>) -> Option<&[Self]>;
-        fn of_mut(view: NDDataViewMut<'_>) -> Option<&mut [Self]>;
-        fn wrap(v: Vec<Self>) -> NDDataBuffer;
-    }
+    /// Outside this crate no type can be an [`NDElement`](super::NDElement).
+    pub trait Sealed: bytemuck::Pod {}
 }
 
 /// One of the ten element types of an [`NDDataBuffer`], C's `NDDataType_t`.
@@ -164,26 +166,8 @@ pub trait NDElement: sealed::Sealed + crate::pixel_cast::PixelCast {
 }
 
 macro_rules! nd_element {
-    ($($t:ty => $variant:ident, $data_type:ident;)*) => {$(
-        impl sealed::Sealed for $t {
-            fn of(view: NDDataView<'_>) -> Option<&[Self]> {
-                match view {
-                    NDDataView::$variant(v) => Some(v),
-                    _ => None,
-                }
-            }
-
-            fn of_mut(view: NDDataViewMut<'_>) -> Option<&mut [Self]> {
-                match view {
-                    NDDataViewMut::$variant(v) => Some(v),
-                    _ => None,
-                }
-            }
-
-            fn wrap(v: Vec<Self>) -> NDDataBuffer {
-                NDDataBuffer::$variant(v)
-            }
-        }
+    ($($t:ty => $data_type:ident;)*) => {$(
+        impl sealed::Sealed for $t {}
 
         impl NDElement for $t {
             const DATA_TYPE: NDDataType = NDDataType::$data_type;
@@ -192,342 +176,183 @@ macro_rules! nd_element {
 }
 
 nd_element! {
-    i8 => I8, Int8;
-    u8 => U8, UInt8;
-    i16 => I16, Int16;
-    u16 => U16, UInt16;
-    i32 => I32, Int32;
-    u32 => U32, UInt32;
-    i64 => I64, Int64;
-    u64 => U64, UInt64;
-    f32 => F32, Float32;
-    f64 => F64, Float64;
+    i8 => Int8;
+    u8 => UInt8;
+    i16 => Int16;
+    u16 => UInt16;
+    i32 => Int32;
+    u32 => UInt32;
+    i64 => Int64;
+    u64 => UInt64;
+    f32 => Float32;
+    f64 => Float64;
 }
 
 /// An empty `UInt8` buffer: what [`NDArray`]'s destructor leaves behind once
 /// the real buffer has gone back to its pool. Allocates nothing.
 impl Default for NDDataBuffer {
     fn default() -> Self {
-        Self::U8(Vec::new())
+        Self::zeros(NDDataType::UInt8, 0)
+    }
+}
+
+/// The elements in use, in an allocation of their size.
+impl Clone for NDDataBuffer {
+    fn clone(&self) -> Self {
+        Self {
+            data_type: self.data_type,
+            len: self.len,
+            storage: self.storage[..chunks_for(self.total_bytes())].to_vec(),
+        }
+    }
+}
+
+/// As its [`view`](NDDataBuffer::view): `U16([1, 2])`.
+impl std::fmt::Debug for NDDataBuffer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.view().fmt(f)
     }
 }
 
 impl NDDataBuffer {
-    /// A buffer holding `v`.
+    /// A buffer holding a copy of `v`.
     pub fn from_vec<T: NDElement>(v: Vec<T>) -> Self {
-        T::wrap(v)
+        Self::from_slice(&v)
     }
 
     /// A buffer holding a copy of `v`.
     pub fn from_slice<T: NDElement>(v: &[T]) -> Self {
-        T::wrap(v.to_vec())
+        let mut buf = Self::zeros(T::DATA_TYPE, v.len());
+        buf.elements_mut().copy_from_slice(v);
+        buf
+    }
+
+    pub fn zeros(data_type: NDDataType, count: usize) -> Self {
+        Self {
+            data_type,
+            len: count,
+            storage: bytemuck::zeroed_vec(chunks_for(count * data_type.element_size())),
+        }
+    }
+
+    /// The elements in use as `T`, which the caller has matched to
+    /// `data_type`.
+    fn elements<T: NDElement>(&self) -> &[T] {
+        &bytemuck::cast_slice(&self.storage)[..self.len]
+    }
+
+    /// [`elements`](Self::elements) for writing.
+    fn elements_mut<T: NDElement>(&mut self) -> &mut [T] {
+        &mut bytemuck::cast_slice_mut(&mut self.storage)[..self.len]
     }
 
     /// The elements as their element type.
     pub fn view(&self) -> NDDataView<'_> {
-        match self {
-            Self::I8(v) => NDDataView::I8(v),
-            Self::U8(v) => NDDataView::U8(v),
-            Self::I16(v) => NDDataView::I16(v),
-            Self::U16(v) => NDDataView::U16(v),
-            Self::I32(v) => NDDataView::I32(v),
-            Self::U32(v) => NDDataView::U32(v),
-            Self::I64(v) => NDDataView::I64(v),
-            Self::U64(v) => NDDataView::U64(v),
-            Self::F32(v) => NDDataView::F32(v),
-            Self::F64(v) => NDDataView::F64(v),
+        match self.data_type {
+            NDDataType::Int8 => NDDataView::I8(self.elements()),
+            NDDataType::UInt8 => NDDataView::U8(self.elements()),
+            NDDataType::Int16 => NDDataView::I16(self.elements()),
+            NDDataType::UInt16 => NDDataView::U16(self.elements()),
+            NDDataType::Int32 => NDDataView::I32(self.elements()),
+            NDDataType::UInt32 => NDDataView::U32(self.elements()),
+            NDDataType::Int64 => NDDataView::I64(self.elements()),
+            NDDataType::UInt64 => NDDataView::U64(self.elements()),
+            NDDataType::Float32 => NDDataView::F32(self.elements()),
+            NDDataType::Float64 => NDDataView::F64(self.elements()),
         }
     }
 
     /// [`view`](Self::view) for writing the elements in place.
     pub fn view_mut(&mut self) -> NDDataViewMut<'_> {
-        match self {
-            Self::I8(v) => NDDataViewMut::I8(v),
-            Self::U8(v) => NDDataViewMut::U8(v),
-            Self::I16(v) => NDDataViewMut::I16(v),
-            Self::U16(v) => NDDataViewMut::U16(v),
-            Self::I32(v) => NDDataViewMut::I32(v),
-            Self::U32(v) => NDDataViewMut::U32(v),
-            Self::I64(v) => NDDataViewMut::I64(v),
-            Self::U64(v) => NDDataViewMut::U64(v),
-            Self::F32(v) => NDDataViewMut::F32(v),
-            Self::F64(v) => NDDataViewMut::F64(v),
+        match self.data_type {
+            NDDataType::Int8 => NDDataViewMut::I8(self.elements_mut()),
+            NDDataType::UInt8 => NDDataViewMut::U8(self.elements_mut()),
+            NDDataType::Int16 => NDDataViewMut::I16(self.elements_mut()),
+            NDDataType::UInt16 => NDDataViewMut::U16(self.elements_mut()),
+            NDDataType::Int32 => NDDataViewMut::I32(self.elements_mut()),
+            NDDataType::UInt32 => NDDataViewMut::U32(self.elements_mut()),
+            NDDataType::Int64 => NDDataViewMut::I64(self.elements_mut()),
+            NDDataType::UInt64 => NDDataViewMut::U64(self.elements_mut()),
+            NDDataType::Float32 => NDDataViewMut::F32(self.elements_mut()),
+            NDDataType::Float64 => NDDataViewMut::F64(self.elements_mut()),
         }
     }
 
     /// The elements as `T`, `None` unless `T` is the element type.
     pub fn as_slice<T: NDElement>(&self) -> Option<&[T]> {
-        T::of(self.view())
+        (T::DATA_TYPE == self.data_type).then(|| self.elements())
     }
 
     /// [`as_slice`](Self::as_slice) for writing.
     pub fn as_mut_slice<T: NDElement>(&mut self) -> Option<&mut [T]> {
-        T::of_mut(self.view_mut())
-    }
-
-    pub fn zeros(data_type: NDDataType, count: usize) -> Self {
-        match data_type {
-            NDDataType::Int8 => Self::I8(vec![0; count]),
-            NDDataType::UInt8 => Self::U8(vec![0; count]),
-            NDDataType::Int16 => Self::I16(vec![0; count]),
-            NDDataType::UInt16 => Self::U16(vec![0; count]),
-            NDDataType::Int32 => Self::I32(vec![0; count]),
-            NDDataType::UInt32 => Self::U32(vec![0; count]),
-            NDDataType::Int64 => Self::I64(vec![0; count]),
-            NDDataType::UInt64 => Self::U64(vec![0; count]),
-            NDDataType::Float32 => Self::F32(vec![0.0; count]),
-            NDDataType::Float64 => Self::F64(vec![0.0; count]),
-        }
+        (T::DATA_TYPE == self.data_type).then(|| self.elements_mut())
     }
 
     pub fn data_type(&self) -> NDDataType {
-        match self {
-            Self::I8(_) => NDDataType::Int8,
-            Self::U8(_) => NDDataType::UInt8,
-            Self::I16(_) => NDDataType::Int16,
-            Self::U16(_) => NDDataType::UInt16,
-            Self::I32(_) => NDDataType::Int32,
-            Self::U32(_) => NDDataType::UInt32,
-            Self::I64(_) => NDDataType::Int64,
-            Self::U64(_) => NDDataType::UInt64,
-            Self::F32(_) => NDDataType::Float32,
-            Self::F64(_) => NDDataType::Float64,
-        }
+        self.data_type
     }
 
     pub fn len(&self) -> usize {
-        match self {
-            Self::I8(v) => v.len(),
-            Self::U8(v) => v.len(),
-            Self::I16(v) => v.len(),
-            Self::U16(v) => v.len(),
-            Self::I32(v) => v.len(),
-            Self::U32(v) => v.len(),
-            Self::I64(v) => v.len(),
-            Self::U64(v) => v.len(),
-            Self::F32(v) => v.len(),
-            Self::F64(v) => v.len(),
-        }
+        self.len
     }
 
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        self.len == 0
     }
 
     pub fn total_bytes(&self) -> usize {
-        self.len() * self.data_type().element_size()
+        self.len * self.data_type.element_size()
     }
 
-    /// Capacity of the underlying Vec in bytes.
+    /// The bytes the allocation holds.
     pub fn capacity_bytes(&self) -> usize {
-        let cap = match self {
-            Self::I8(v) => v.capacity(),
-            Self::U8(v) => v.capacity(),
-            Self::I16(v) => v.capacity(),
-            Self::U16(v) => v.capacity(),
-            Self::I32(v) => v.capacity(),
-            Self::U32(v) => v.capacity(),
-            Self::I64(v) => v.capacity(),
-            Self::U64(v) => v.capacity(),
-            Self::F32(v) => v.capacity(),
-            Self::F64(v) => v.capacity(),
-        };
-        cap * self.data_type().element_size()
+        self.storage.capacity() * CHUNK
+    }
+
+    /// `len` elements of the element type, growing the storage only when it
+    /// is too small. Elements that were not in use keep whatever bytes the
+    /// storage held.
+    fn set_len(&mut self, len: usize) {
+        let chunks = chunks_for(len * self.data_type.element_size());
+        if chunks > self.storage.len() {
+            self.storage.resize(chunks, Chunk([0; CHUNK]));
+        }
+        self.len = len;
     }
 
     /// Resize the buffer, zeroing new elements if growing.
     pub fn resize(&mut self, new_len: usize) {
-        match self {
-            Self::I8(v) => v.resize(new_len, 0),
-            Self::U8(v) => v.resize(new_len, 0),
-            Self::I16(v) => v.resize(new_len, 0),
-            Self::U16(v) => v.resize(new_len, 0),
-            Self::I32(v) => v.resize(new_len, 0),
-            Self::U32(v) => v.resize(new_len, 0),
-            Self::I64(v) => v.resize(new_len, 0),
-            Self::U64(v) => v.resize(new_len, 0),
-            Self::F32(v) => v.resize(new_len, 0.0),
-            Self::F64(v) => v.resize(new_len, 0.0),
+        let old_bytes = self.total_bytes();
+        self.set_len(new_len);
+        if let Some(grown) = self.as_u8_slice_mut().get_mut(old_bytes..) {
+            grown.fill(0);
         }
     }
 
-    /// View the underlying data as a mutable byte slice, for payloads that
-    /// arrive as bytes (a decoded frame, a compressed stream).
+    /// The elements as bytes, for payloads that arrive as bytes (a decoded
+    /// frame, a compressed stream).
     pub fn as_u8_slice_mut(&mut self) -> &mut [u8] {
-        macro_rules! bytes_of {
-            ($v:expr) => {
-                // SAFETY: the Vec's elements are plain numbers with no padding,
-                // so its `len * size_of::<T>()` bytes are initialized and
-                // exclusively borrowed for the lifetime of `&mut self`.
-                unsafe {
-                    std::slice::from_raw_parts_mut(
-                        $v.as_mut_ptr() as *mut u8,
-                        $v.len() * std::mem::size_of_val(&$v[0]),
-                    )
-                }
-            };
-        }
-        match self {
-            Self::U8(v) => v.as_mut_slice(),
-            Self::I8(v) => {
-                if v.is_empty() {
-                    return &mut [];
-                }
-                bytes_of!(v)
-            }
-            Self::I16(v) => {
-                if v.is_empty() {
-                    return &mut [];
-                }
-                bytes_of!(v)
-            }
-            Self::U16(v) => {
-                if v.is_empty() {
-                    return &mut [];
-                }
-                bytes_of!(v)
-            }
-            Self::I32(v) => {
-                if v.is_empty() {
-                    return &mut [];
-                }
-                bytes_of!(v)
-            }
-            Self::U32(v) => {
-                if v.is_empty() {
-                    return &mut [];
-                }
-                bytes_of!(v)
-            }
-            Self::I64(v) => {
-                if v.is_empty() {
-                    return &mut [];
-                }
-                bytes_of!(v)
-            }
-            Self::U64(v) => {
-                if v.is_empty() {
-                    return &mut [];
-                }
-                bytes_of!(v)
-            }
-            Self::F32(v) => {
-                if v.is_empty() {
-                    return &mut [];
-                }
-                bytes_of!(v)
-            }
-            Self::F64(v) => {
-                if v.is_empty() {
-                    return &mut [];
-                }
-                bytes_of!(v)
-            }
-        }
+        let n = self.total_bytes();
+        &mut bytemuck::cast_slice_mut(&mut self.storage)[..n]
     }
 
-    /// View the underlying data as a byte slice.
+    /// The elements as bytes.
     pub fn as_u8_slice(&self) -> &[u8] {
-        match self {
-            Self::I8(v) => unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len()) },
-            Self::U8(v) => v.as_slice(),
-            Self::I16(v) => unsafe {
-                std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 2)
-            },
-            Self::U16(v) => unsafe {
-                std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 2)
-            },
-            Self::I32(v) => unsafe {
-                std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4)
-            },
-            Self::U32(v) => unsafe {
-                std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4)
-            },
-            Self::I64(v) => unsafe {
-                std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 8)
-            },
-            Self::U64(v) => unsafe {
-                std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 8)
-            },
-            Self::F32(v) => unsafe {
-                std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4)
-            },
-            Self::F64(v) => unsafe {
-                std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 8)
-            },
-        }
+        &bytemuck::cast_slice(&self.storage)[..self.total_bytes()]
     }
 
     /// Get element at index as f64.
     pub fn get_as_f64(&self, index: usize) -> Option<f64> {
-        match self {
-            Self::I8(v) => v.get(index).map(|&x| x as f64),
-            Self::U8(v) => v.get(index).map(|&x| x as f64),
-            Self::I16(v) => v.get(index).map(|&x| x as f64),
-            Self::U16(v) => v.get(index).map(|&x| x as f64),
-            Self::I32(v) => v.get(index).map(|&x| x as f64),
-            Self::U32(v) => v.get(index).map(|&x| x as f64),
-            Self::I64(v) => v.get(index).map(|&x| x as f64),
-            Self::U64(v) => v.get(index).map(|&x| x as f64),
-            Self::F32(v) => v.get(index).map(|&x| x as f64),
-            Self::F64(v) => v.get(index).copied(),
-        }
+        crate::with_buffer!(self, |v| v
+            .get(index)
+            .map(|&x| crate::pixel_cast::PixelCast::to_f64(x)))
     }
 
     /// Set element at index from f64 value.
     pub fn set_from_f64(&mut self, index: usize, value: f64) {
-        match self {
-            Self::I8(v) => {
-                if let Some(e) = v.get_mut(index) {
-                    *e = value as i8;
-                }
-            }
-            Self::U8(v) => {
-                if let Some(e) = v.get_mut(index) {
-                    *e = value as u8;
-                }
-            }
-            Self::I16(v) => {
-                if let Some(e) = v.get_mut(index) {
-                    *e = value as i16;
-                }
-            }
-            Self::U16(v) => {
-                if let Some(e) = v.get_mut(index) {
-                    *e = value as u16;
-                }
-            }
-            Self::I32(v) => {
-                if let Some(e) = v.get_mut(index) {
-                    *e = value as i32;
-                }
-            }
-            Self::U32(v) => {
-                if let Some(e) = v.get_mut(index) {
-                    *e = value as u32;
-                }
-            }
-            Self::I64(v) => {
-                if let Some(e) = v.get_mut(index) {
-                    *e = value as i64;
-                }
-            }
-            Self::U64(v) => {
-                if let Some(e) = v.get_mut(index) {
-                    *e = value as u64;
-                }
-            }
-            Self::F32(v) => {
-                if let Some(e) = v.get_mut(index) {
-                    *e = value as f32;
-                }
-            }
-            Self::F64(v) => {
-                if let Some(e) = v.get_mut(index) {
-                    *e = value;
-                }
-            }
-        }
+        crate::with_buffer_mut_typed!(self, |v: T| if let Some(e) = v.get_mut(index) {
+            *e = value as T;
+        })
     }
 
     /// Every element as f64, converted on the typed slice: the per-frame form
@@ -554,17 +379,17 @@ impl NDDataBuffer {
                     fearless_simd::dispatch!(simd::level(), s => simd::$k(s, $v, out))
                 };
             }
-            match self {
-                Self::I8(v) => kernel!(v, to_f64_i8),
-                Self::U8(v) => kernel!(v, to_f64_u8),
-                Self::I16(v) => kernel!(v, to_f64_i16),
-                Self::U16(v) => kernel!(v, to_f64_u16),
-                Self::I32(v) => kernel!(v, to_f64_i32),
-                Self::U32(v) => kernel!(v, to_f64_u32),
-                Self::I64(v) => kernel!(v, to_f64_i64),
-                Self::U64(v) => kernel!(v, to_f64_u64),
-                Self::F32(v) => kernel!(v, to_f64_f32),
-                Self::F64(v) => out.copy_from_slice(v),
+            match self.view() {
+                NDDataView::I8(v) => kernel!(v, to_f64_i8),
+                NDDataView::U8(v) => kernel!(v, to_f64_u8),
+                NDDataView::I16(v) => kernel!(v, to_f64_i16),
+                NDDataView::U16(v) => kernel!(v, to_f64_u16),
+                NDDataView::I32(v) => kernel!(v, to_f64_i32),
+                NDDataView::U32(v) => kernel!(v, to_f64_u32),
+                NDDataView::I64(v) => kernel!(v, to_f64_i64),
+                NDDataView::U64(v) => kernel!(v, to_f64_u64),
+                NDDataView::F32(v) => kernel!(v, to_f64_f32),
+                NDDataView::F64(v) => out.copy_from_slice(v),
             }
         }
         #[cfg(not(feature = "simd"))]
@@ -588,40 +413,34 @@ impl NDDataBuffer {
     /// the capacity suffices, its allocation: the in-place form of
     /// [`from_f64`](Self::from_f64) for a pooled output buffer.
     pub fn fill_from_f64(&mut self, values: &[f64]) {
+        self.set_len(values.len());
         #[cfg(feature = "simd")]
         {
             use crate::simd;
             macro_rules! kernel {
-                ($v:expr, $k:ident) => {{
-                    $v.resize(values.len(), 0 as _);
+                ($v:expr, $k:ident) => {
                     fearless_simd::dispatch!(simd::level(), s => simd::$k(s, values, $v))
-                }};
+                };
             }
-            match self {
-                Self::I8(v) => kernel!(v, from_f64_i8),
-                Self::U8(v) => kernel!(v, from_f64_u8),
-                Self::I16(v) => kernel!(v, from_f64_i16),
-                Self::U16(v) => kernel!(v, from_f64_u16),
-                Self::I32(v) => kernel!(v, from_f64_i32),
-                Self::U32(v) => kernel!(v, from_f64_u32),
-                Self::I64(v) => kernel!(v, from_f64_i64),
-                Self::U64(v) => kernel!(v, from_f64_u64),
-                Self::F32(v) => kernel!(v, from_f64_f32),
-                Self::F64(v) => {
-                    v.resize(values.len(), 0.0);
-                    v.copy_from_slice(values);
-                }
+            match self.view_mut() {
+                NDDataViewMut::I8(v) => kernel!(v, from_f64_i8),
+                NDDataViewMut::U8(v) => kernel!(v, from_f64_u8),
+                NDDataViewMut::I16(v) => kernel!(v, from_f64_i16),
+                NDDataViewMut::U16(v) => kernel!(v, from_f64_u16),
+                NDDataViewMut::I32(v) => kernel!(v, from_f64_i32),
+                NDDataViewMut::U32(v) => kernel!(v, from_f64_u32),
+                NDDataViewMut::I64(v) => kernel!(v, from_f64_i64),
+                NDDataViewMut::U64(v) => kernel!(v, from_f64_u64),
+                NDDataViewMut::F32(v) => kernel!(v, from_f64_f32),
+                NDDataViewMut::F64(v) => v.copy_from_slice(values),
             }
         }
         #[cfg(not(feature = "simd"))]
-        {
-            self.resize(values.len());
-            crate::with_buffer_mut_typed!(self, |v: T| {
-                for (o, &x) in v.iter_mut().zip(values) {
-                    *o = x as T;
-                }
-            });
-        }
+        crate::with_buffer_mut_typed!(self, |v: T| {
+            for (o, &x) in v.iter_mut().zip(values) {
+                *o = x as T;
+            }
+        });
     }
 
     /// Make this buffer a copy of `src`. A same-typed buffer is refilled in
@@ -629,18 +448,12 @@ impl NDDataBuffer {
     /// memcpy's into the buffer it already holds); a differently typed one is
     /// replaced by a clone of `src`.
     pub fn copy_from(&mut self, src: &NDDataBuffer) {
-        macro_rules! same {
-            ($($variant:ident),*) => {
-                match (self, src) {
-                    $((Self::$variant(dst), Self::$variant(s)) => {
-                        dst.clear();
-                        dst.extend_from_slice(s);
-                    })*
-                    (dst, s) => *dst = s.clone(),
-                }
-            };
+        if self.data_type != src.data_type {
+            *self = src.clone();
+            return;
         }
-        same!(I8, U8, I16, U16, I32, U32, I64, U64, F32, F64)
+        self.set_len(src.len);
+        self.as_u8_slice_mut().copy_from_slice(src.as_u8_slice());
     }
 }
 

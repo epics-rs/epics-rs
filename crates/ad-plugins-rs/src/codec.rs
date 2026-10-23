@@ -2529,8 +2529,10 @@ mod tests {
                 let (out, largest) = largest_allocation(|| decode(&frame));
                 assert_eq!(out.is_ok(), fits, "{name} into {dims:?}");
                 if !fits {
+                    // The image's own buffer, in whole storage chunks.
+                    let buffer = NDDataBuffer::zeros(NDDataType::UInt8, image).capacity_bytes();
                     assert!(
-                        largest <= image,
+                        largest <= buffer,
                         "{name} into {image} bytes allocated {largest}"
                     );
                 }

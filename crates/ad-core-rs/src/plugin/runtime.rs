@@ -2855,11 +2855,11 @@ macro_rules! impl_std_array_element {
             const IFACE: asyn_rs::interfaces::InterfaceType =
                 asyn_rs::interfaces::InterfaceType::$array;
             fn convert(data: &crate::ndarray::NDDataBuffer, buf: &mut [Self]) -> usize {
-                use crate::ndarray::NDDataBuffer;
-                match data {
-                    NDDataBuffer::$direct_variant(v) => copy_direct(v, buf),
-                    $( NDDataBuffer::$ccast_variant(v) => copy_ccast(v, buf), )*
-                    $( NDDataBuffer::$variant(v) => copy_convert(v, buf), )*
+                use crate::ndarray::NDDataView;
+                match data.view() {
+                    NDDataView::$direct_variant(v) => copy_direct(v, buf),
+                    $( NDDataView::$ccast_variant(v) => copy_ccast(v, buf), )*
+                    $( NDDataView::$variant(v) => copy_convert(v, buf), )*
                 }
             }
             fn param(elements: Vec<Self>) -> ParamValue {

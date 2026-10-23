@@ -2790,8 +2790,9 @@ impl PortDriverBase {
     /// A record drops a post while the gate is closed (devAsynXXXArray.cpp:
     /// 407-410) and C's edge sweep posts no array. For a post that holds the
     /// driver's state ([`Self::set_state_array_rule`]) that C loss is not
-    /// copied: it stays owed until one of `reason`/`addr` is posted open, and
-    /// the edge sweep posts what is still owed.
+    /// copied: while the gate is closed it is held, not posted, as C holds a
+    /// flagged scalar (asynPortDriver.cpp:838), and the edge sweep posts the
+    /// latest held unless one of `reason`/`addr` was posted open first.
     pub fn do_callbacks_array(
         &self,
         reason: usize,
@@ -2816,14 +2817,16 @@ impl PortDriverBase {
         if let Some(holds) = self.state_array_rules.get(reason).and_then(Option::as_ref) {
             let mut owed = self.owed_arrays.lock();
             let at = owed.iter().position(|&(r, a, _)| (r, a) == (reason, addr));
-            // Read before the post: a gate that opens during it may let a record
-            // take a post owed here, posted twice rather than lost.
-            match (self.interrupts.accepting(), at) {
-                (true, Some(i)) => drop(owed.remove(i)),
-                (true, None) => {}
-                (false, Some(i)) if holds() => owed[i].2 = value.clone(),
-                (false, None) if holds() => owed.push((reason, addr, value.clone())),
-                (false, _) => {}
+            if self.interrupts.accepting() {
+                if let Some(i) = at {
+                    owed.remove(i);
+                }
+            } else if holds() {
+                match at {
+                    Some(i) => owed[i].2 = value,
+                    None => owed.push((reason, addr, value)),
+                }
+                return Ok(());
             }
         }
         // C reads all three with its getters, reporting a bad param each time.
@@ -4385,6 +4388,46 @@ pub(crate) mod tests {
         );
         assert!(array_posts_a_record_takes(&[(1, false, false)], true).is_empty());
         assert_eq!(array_posts_a_record_takes(&[(1, false, true)], false), [1]);
+    }
+
+    /// A record whose own gate is open (another database's, `adapter.rs`
+    /// RecordGate) on a port whose gate is closed takes a state array once,
+    /// as it takes a flagged scalar once at the edge.
+    #[test]
+    fn a_record_with_an_open_gate_takes_a_state_array_once() {
+        use crate::interrupt::InterruptFilter;
+        use std::sync::Mutex;
+        let owner = InterruptGate::new();
+        let record_db = InterruptGate::opened();
+        let mut base = PortDriverBase::new(
+            "openrecord",
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
+        );
+        base.own_interrupts(owner.clone());
+        let axis = base.create_param("AXIS", ParamType::Int32Array).unwrap();
+        let level = base.create_param("LEVEL", ParamType::Int32).unwrap();
+        base.set_state_array_rule(axis, Arc::new(|| true));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let _record = base
+            .interrupts
+            .register_sync_callback(InterruptFilter::default(), move |iv| {
+                if record_db.is_open() {
+                    sink.lock().unwrap().push(format!("{:?}", iv.value));
+                }
+            })
+            .unwrap();
+        base.set_int32_param(level, 0, 7).unwrap();
+        base.call_param_callbacks(0).unwrap();
+        base.do_callbacks_array(axis, 0, ParamValue::Int32Array(Arc::from([1])))
+            .unwrap();
+        owner.set(true);
+        base.call_param_callbacks(0).unwrap();
+        base.post_owed_arrays();
+        assert_eq!(*seen.lock().unwrap(), ["Int32(7)", "Int32Array([1])"]);
     }
 
     struct TestDriver {

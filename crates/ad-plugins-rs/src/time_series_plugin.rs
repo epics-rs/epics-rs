@@ -334,7 +334,7 @@ impl TimeSeriesState {
     /// that C bug is not copied.
     fn acquire_reset(&mut self) -> Vec<ParamUpdate> {
         if let Some(circular) = &mut self.circular {
-            circular.data.as_u8_slice_mut().fill(0);
+            circular.data_mut().as_u8_slice_mut().fill(0);
         }
         self.restart_average();
         self.time_stamp.iter_mut().for_each(|v| *v = 0.0);
@@ -406,7 +406,7 @@ impl TimeSeriesState {
         };
         let updates = self.time_series_waveforms(circular);
         if array_callbacks.get() {
-            let values = circular.data.to_f64_vec();
+            let values = circular.data().to_f64_vec();
             self.post_time_series_arrays(&values, posts);
         }
         updates
@@ -441,7 +441,7 @@ impl TimeSeriesState {
         let pool = self.pool.current();
         let make = |dims: Vec<NDDimension>, values: &[f64]| -> Option<Arc<NDArray>> {
             let mut arr = pool.pool().alloc(dims, data_type).ok()?;
-            arr.data.fill_from_f64(values);
+            arr.data_mut().fill_from_f64(values);
             arr.unique_id = unique_id;
             arr.time_stamp = time_stamp;
             arr.timestamp = epics_ts;
@@ -462,7 +462,7 @@ impl TimeSeriesState {
     fn time_series_waveforms(&self, circular: &NDArray) -> Vec<ParamUpdate> {
         let at = |index| {
             circular
-                .data
+                .data()
                 .get_as_f64(index)
                 .expect("index inside the circular buffer")
         };
@@ -524,7 +524,7 @@ impl TimeSeriesState {
         if num_signals_in == 0 {
             return updates;
         }
-        let data = &array.data;
+        let data = array.data();
         // C reads `numTimes` time points; 1-D arrays are a single time point.
         let mut num_times = if array.dims.len() == 2 {
             array.dims[1].size
@@ -552,7 +552,7 @@ impl TimeSeriesState {
             for s in 0..self.num_signals {
                 let avg = averaged_value(self.average_store[s], self.num_averaged, self.data_type);
                 circular
-                    .data
+                    .data_mut()
                     .set_from_f64(s * ntp + self.current_time_point, avg);
                 self.average_store[s] = 0.0;
             }
@@ -721,7 +721,7 @@ impl NDPluginProcess for TimeSeriesProcessor {
 
         // C: reallocate when the data type or the input signal count changes.
         let num_signals_in = array.dims[0].size;
-        let dtype = array.data.data_type();
+        let dtype = array.data().data_type();
         if dtype != state.data_type || (num_signals_in as i64) != state.num_signals_in {
             state.data_type = dtype;
             state.num_signals_in = num_signals_in as i64;
@@ -814,7 +814,7 @@ pub(crate) fn time_series_point(
     let mut arr = pool
         .alloc(vec![NDDimension::new(values.len())], NDDataType::Float64)
         .ok()?;
-    if let NDDataViewMut::F64(v) = arr.data.view_mut() {
+    if let NDDataViewMut::F64(v) = arr.data_mut().view_mut() {
         v.copy_from_slice(values);
     }
     arr.unique_id = src.unique_id;
@@ -1046,7 +1046,7 @@ mod tests {
     }
 
     fn u16s(arr: &NDArray) -> Vec<u16> {
-        match arr.data.view() {
+        match arr.data().view() {
             NDDataView::U16(v) => v.to_vec(),
             _ => panic!("not UInt16"),
         }
@@ -1397,7 +1397,7 @@ mod tests {
                 .circular
                 .as_ref()
                 .unwrap()
-                .data
+                .data()
                 .get_as_f64(0)
                 .unwrap(),
             200.0
@@ -1408,7 +1408,7 @@ mod tests {
                 .circular
                 .as_ref()
                 .unwrap()
-                .data
+                .data()
                 .get_as_f64(ntp)
                 .unwrap(),
             200.0
@@ -1504,7 +1504,7 @@ mod tests {
                 .circular
                 .as_ref()
                 .unwrap()
-                .data
+                .data()
                 .get_as_f64(0)
                 .unwrap(),
             11.0
@@ -1515,7 +1515,7 @@ mod tests {
                 .circular
                 .as_ref()
                 .unwrap()
-                .data
+                .data()
                 .get_as_f64(ntp)
                 .unwrap(),
             22.0
@@ -1526,7 +1526,7 @@ mod tests {
                 .circular
                 .as_ref()
                 .unwrap()
-                .data
+                .data()
                 .get_as_f64(2 * ntp)
                 .unwrap(),
             33.0
@@ -1553,7 +1553,7 @@ mod tests {
                 .circular
                 .as_ref()
                 .unwrap()
-                .data
+                .data()
                 .get_as_f64(0)
                 .unwrap(),
             1.0
@@ -1565,7 +1565,7 @@ mod tests {
                 .circular
                 .as_ref()
                 .unwrap()
-                .data
+                .data()
                 .get_as_f64(ntp)
                 .unwrap(),
             2.0

@@ -1487,7 +1487,7 @@ mod tests {
             .remove(0);
         assert_eq!(first.pool_id(), pool.id());
         assert!(first.attributes.get("X").is_some());
-        let ptr = first.data.as_u8_slice().as_ptr();
+        let ptr = first.data().as_u8_slice().as_ptr();
         drop(first);
 
         let second = proc
@@ -1495,7 +1495,7 @@ mod tests {
             .output_arrays
             .remove(0);
         assert_eq!(
-            second.data.as_u8_slice().as_ptr(),
+            second.data().as_u8_slice().as_ptr(),
             ptr,
             "the second frame reuses the freed buffer"
         );

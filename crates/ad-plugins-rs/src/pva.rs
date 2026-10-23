@@ -227,7 +227,7 @@ fn ndarray_to_pv_field(array: &Arc<NDArray>) -> PvField {
             // keeps at the larger of the requested and the reused buffer's
             // size, so an over-allocating driver publishes a `compressedSize`
             // above `uncompressedSize` exactly as C does.
-            array.data_size as i64,
+            array.data_size() as i64,
             String::new(),
         ),
     };
@@ -310,7 +310,7 @@ macro_rules! pixel_owner {
     ($t:ty, $variant:ident) => {
         impl AsRef<[$t]> for Pixels<$t> {
             fn as_ref(&self) -> &[$t] {
-                match self.0.data.view() {
+                match self.0.data().view() {
                     NDDataView::$variant(v) => v,
                     _ => unreachable!("Pixels<T> is built from the matching NDDataBuffer variant"),
                 }
@@ -335,7 +335,7 @@ struct FrameBytes(Arc<NDArray>);
 
 impl AsRef<[u8]> for FrameBytes {
     fn as_ref(&self) -> &[u8] {
-        self.0.data.as_u8_slice()
+        self.0.data().as_u8_slice()
     }
 }
 
@@ -347,7 +347,7 @@ fn frame_pixels(array: &Arc<NDArray>) -> NdArrayBuffer {
     {
         PvArray::from_owner(Arc::new(Pixels(Arc::clone(array), PhantomData)))
     }
-    match array.data.view() {
+    match array.data().view() {
         NDDataView::I8(_) => NdArrayBuffer::Byte(own(array)),
         NDDataView::U8(_) => NdArrayBuffer::UByte(own(array)),
         NDDataView::I16(_) => NdArrayBuffer::Short(own(array)),
@@ -465,7 +465,7 @@ mod tests {
             NDDataType::UInt8,
         );
         arr.unique_id = 42;
-        if let NDDataViewMut::U8(buf) = arr.data.view_mut() {
+        if let NDDataViewMut::U8(buf) = arr.data_mut().view_mut() {
             for (i, v) in buf.iter_mut().enumerate() {
                 *v = i as u8;
             }
@@ -491,7 +491,7 @@ mod tests {
             vec![NDDimension::new(64), NDDimension::new(64)],
             NDDataType::UInt16,
         ));
-        let NDDataView::U16(pixels) = arr.data.view() else {
+        let NDDataView::U16(pixels) = arr.data().view() else {
             panic!("expected u16 pixels");
         };
         let frame_ptr = pixels.as_ptr();
@@ -519,7 +519,7 @@ mod tests {
     fn the_published_compressed_bytes_are_the_frame_buffer_itself() {
         let arr = NDArray::new(vec![NDDimension::new(64)], NDDataType::UInt16);
         let arr = Arc::new(crate::codec::compress_lz4(&arr).unwrap());
-        let frame_ptr = arr.data.as_u8_slice().as_ptr();
+        let frame_ptr = arr.data().as_u8_slice().as_ptr();
 
         let payload = ndarray_to_pv_field(&arr);
         let PvField::Structure(s) = &payload else {
@@ -575,17 +575,17 @@ mod tests {
     #[test]
     fn compressed_array_emits_ubyte_value_and_codec_parameters() {
         let mut arr = NDArray::new(vec![NDDimension::new(8)], NDDataType::UInt16);
-        if let NDDataViewMut::U16(buf) = arr.data.view_mut() {
+        if let NDDataViewMut::U16(buf) = arr.data_mut().view_mut() {
             for (i, v) in buf.iter_mut().enumerate() {
                 *v = (i * 1000) as u16;
             }
         }
-        let uncompressed_bytes = (arr.data.len() * 2) as i64; // 8 elems * 2 bytes
+        let uncompressed_bytes = (arr.data().len() * 2) as i64; // 8 elems * 2 bytes
 
         let compressed = crate::codec::compress_lz4(&arr).unwrap();
         let comp_size = compressed.codec.as_ref().unwrap().compressed_size as i64;
         assert!(
-            matches!(compressed.data.view(), NDDataView::U8(_)),
+            matches!(compressed.data().view(), NDDataView::U8(_)),
             "compressed buffer must hold raw bytes"
         );
 
@@ -669,7 +669,11 @@ mod tests {
         let arr = pool
             .alloc(vec![NDDimension::new(80)], NDDataType::UInt8)
             .unwrap();
-        assert_eq!(arr.data_size, 100, "pool must keep the reused buffer size");
+        assert_eq!(
+            arr.data_size(),
+            100,
+            "pool must keep the reused buffer size"
+        );
         assert!(arr.codec.is_none());
 
         let arr = Arc::new(arr);
@@ -700,7 +704,7 @@ mod tests {
         use ad_core_rs::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
 
         let mut arr = NDArray::new(vec![NDDimension::new(8)], NDDataType::UInt16);
-        if let NDDataViewMut::U16(buf) = arr.data.view_mut() {
+        if let NDDataViewMut::U16(buf) = arr.data_mut().view_mut() {
             for (i, v) in buf.iter_mut().enumerate() {
                 *v = (i * 1000) as u16;
             }

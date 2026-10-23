@@ -497,7 +497,7 @@ impl NDPluginProcess for ROIStatProcessor {
                 .zip(clamped.iter())
                 .map(|(roi, clamp)| match clamp {
                     Some((offset, size)) => Self::compute_roi_stats(
-                        &array.data,
+                        array.data(),
                         ndims,
                         array_size_x,
                         *offset,
@@ -527,11 +527,11 @@ impl NDPluginProcess for ROIStatProcessor {
             // faster from 60 us (u16 860x860 0.89x serial, f64 512x512 0.75x).
             if par_util::pool_wins(
                 total_elements,
-                15 + 38 * array.data.data_type().element_size(),
+                15 + 38 * array.data().data_type().element_size(),
                 60,
                 clamped.iter().flatten().count(),
             ) {
-                let data = &array.data;
+                let data = array.data();
                 par_util::map_indices(rois.len(), |i| match clamped[i] {
                     Some((offset, size)) => Self::compute_roi_stats(
                         data,
@@ -1136,7 +1136,7 @@ mod tests {
             vec![NDDimension::new(x), NDDimension::new(y)],
             NDDataType::Float64,
         );
-        if let NDDataViewMut::F64(v) = arr.data.view_mut() {
+        if let NDDataViewMut::F64(v) = arr.data_mut().view_mut() {
             for iy in 0..y {
                 for ix in 0..x {
                     v[iy * x + ix] = fill(ix, iy);
@@ -1443,7 +1443,7 @@ mod tests {
             vec![NDDimension::new(4), NDDimension::new(4)],
             NDDataType::UInt8,
         );
-        if let NDDataViewMut::U8(v) = arr.data.view_mut() {
+        if let NDDataViewMut::U8(v) = arr.data_mut().view_mut() {
             for (i, val) in v.iter_mut().enumerate() {
                 *val = (i + 1) as u8;
             }
@@ -1479,7 +1479,7 @@ mod tests {
 
     fn make_1d_array(n: usize, fill: impl Fn(usize) -> f64) -> NDArray {
         let mut arr = NDArray::new(vec![NDDimension::new(n)], NDDataType::Float64);
-        if let NDDataViewMut::F64(v) = arr.data.view_mut() {
+        if let NDDataViewMut::F64(v) = arr.data_mut().view_mut() {
             for (i, slot) in v.iter_mut().enumerate() {
                 *slot = fill(i);
             }

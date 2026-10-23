@@ -134,10 +134,10 @@ impl TaskState {
             }
         };
         compute::compute_frame(
-            &mut b.raw.data,
-            &mut b.background.data,
-            &mut b.ramp.data,
-            &mut b.peak.data,
+            b.raw.data_mut().view_mut(),
+            b.background.data_mut().view_mut(),
+            b.ramp.data_mut().view_mut(),
+            b.peak.data_mut().view_mut(),
             &mut self.sine_state,
             &layout,
             config.sim_mode,

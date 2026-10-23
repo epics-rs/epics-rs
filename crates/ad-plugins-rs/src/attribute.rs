@@ -638,7 +638,7 @@ mod tests {
             panic!("one TS point per frame, got {}", r.addressed.len());
         };
         assert_eq!(*addr, 1);
-        let NDDataView::F64(v) = ts.data.view() else {
+        let NDDataView::F64(v) = ts.data().view() else {
             panic!("TS point is Float64");
         };
         assert_eq!(v.len(), 16);

@@ -696,7 +696,7 @@ impl NDFileWriter for NexusWriter {
 
         // The frame bytes serialized explicitly little-endian (rust-hdf5
         // 0.2.15 records LE datatypes and copies write_chunk bytes verbatim).
-        let frame_bytes = nd_buffer_to_le_bytes(&array.data);
+        let frame_bytes = nd_buffer_to_le_bytes(array.data());
 
         if self.frame_count == 0 {
             // First frame: create a chunked dataset with leading frame dim.
@@ -729,7 +729,7 @@ impl NDFileWriter for NexusWriter {
             }
             macro_rules! create_typed {
                 ($group:expr, $name:expr) => {{
-                    match array.data.data_type() {
+                    match array.data().data_type() {
                         NDDataType::Int8 => create_image_ds!($group, i8, $name),
                         NDDataType::UInt8 => create_image_ds!($group, u8, $name),
                         NDDataType::Int16 => create_image_ds!($group, i16, $name),
@@ -1085,7 +1085,7 @@ mod tests {
             vec![NDDimension::new(4), NDDimension::new(4)],
             NDDataType::UInt8,
         );
-        if let NDDataViewMut::U8(v) = arr.data.view_mut() {
+        if let NDDataViewMut::U8(v) = arr.data_mut().view_mut() {
             for i in 0..16 {
                 v[i] = i as u8;
             }
@@ -1117,7 +1117,7 @@ mod tests {
             vec![NDDimension::new(4), NDDimension::new(4)],
             NDDataType::UInt8,
         );
-        if let NDDataViewMut::U8(v) = arr1.data.view_mut() {
+        if let NDDataViewMut::U8(v) = arr1.data_mut().view_mut() {
             for i in 0..16 {
                 v[i] = i as u8;
             }
@@ -1127,7 +1127,7 @@ mod tests {
             vec![NDDimension::new(4), NDDimension::new(4)],
             NDDataType::UInt8,
         );
-        if let NDDataViewMut::U8(v) = arr2.data.view_mut() {
+        if let NDDataViewMut::U8(v) = arr2.data_mut().view_mut() {
             for i in 0..16 {
                 v[i] = (i + 100) as u8;
             }
@@ -1253,7 +1253,7 @@ mod tests {
             vec![NDDimension::new(3), NDDimension::new(2)],
             NDDataType::UInt8,
         );
-        if let NDDataViewMut::U8(v) = arr.data.view_mut() {
+        if let NDDataViewMut::U8(v) = arr.data_mut().view_mut() {
             for (i, x) in v.iter_mut().enumerate() {
                 *x = i as u8;
             }
@@ -1431,7 +1431,7 @@ mod tests {
                 vec![NDDimension::new(3), NDDimension::new(2)],
                 NDDataType::UInt8,
             );
-            if let NDDataViewMut::U8(v) = arr.data.view_mut() {
+            if let NDDataViewMut::U8(v) = arr.data_mut().view_mut() {
                 for (i, x) in v.iter_mut().enumerate() {
                     *x = base + i as u8;
                 }
@@ -1478,7 +1478,7 @@ mod tests {
             vec![NDDimension::new(3), NDDimension::new(2)],
             NDDataType::UInt8,
         );
-        if let NDDataViewMut::U8(v) = arr.data.view_mut() {
+        if let NDDataViewMut::U8(v) = arr.data_mut().view_mut() {
             v.iter_mut().enumerate().for_each(|(i, x)| *x = i as u8);
         }
         writer
@@ -1540,7 +1540,7 @@ mod tests {
             let mut writer = NexusWriter::new();
             let mut arr = NDArray::new(vec![NDDimension::new(2), NDDimension::new(2)], dt);
             // Distinct, type-revealing values: negatives for signed types.
-            match arr.data.view_mut() {
+            match arr.data_mut().view_mut() {
                 NDDataViewMut::I8(v) => v.copy_from_slice(&[-1, 2, -3, 4]),
                 NDDataViewMut::U8(v) => v.copy_from_slice(&[1, 2, 3, 4]),
                 NDDataViewMut::I16(v) => v.copy_from_slice(&[-1, 2, -3, 4]),
@@ -1567,7 +1567,7 @@ mod tests {
             assert_eq!(read.len(), 4, "{:?}: element count", dt);
             for i in 0..4 {
                 assert_eq!(
-                    arr.data.get_as_f64(i),
+                    arr.data().get_as_f64(i),
                     read.get_as_f64(i),
                     "{:?}: element {} must round-trip",
                     dt,

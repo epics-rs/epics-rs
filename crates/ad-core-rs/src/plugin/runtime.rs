@@ -1714,7 +1714,7 @@ impl SharedProcessorInner {
             (
                 p.data_type,
                 0,
-                ParamValue::Int32(array.data.data_type() as i32),
+                ParamValue::Int32(array.data().data_type() as i32),
             ),
             (p.color_mode, 0, ParamValue::Int32(color_mode)),
             (
@@ -2019,7 +2019,7 @@ impl SharedProcessorInner {
         // the served output posts, so a throttled frame posts nothing (:58).
         if let (Some(param), Some(served)) = (self.std_array_data_param, output_arrays.first()) {
             let interrupts = self.port_handle.interrupts();
-            let data = &served.data;
+            let data = served.data();
             sets.extend(
                 [
                     std_array_post::<i8>(interrupts, param, data),
@@ -2373,7 +2373,7 @@ impl PluginPortDriver {
     fn read_served<T: StdArrayElement>(&self, buf: &mut [T]) -> usize {
         self.array_data
             .as_ref()
-            .and_then(|handle| handle.lock().as_ref().map(|a| T::convert(&a.data, buf)))
+            .and_then(|handle| handle.lock().as_ref().map(|a| T::convert(a.data(), buf)))
             .unwrap_or(0)
     }
 
@@ -5248,8 +5248,7 @@ mod tests {
             })
             .collect();
         let mut observer = port.interrupts().subscribe_async(256, 4096);
-        let mut array = NDArray::new(vec![NDDimension::new(data.len())], data.data_type());
-        array.data = data;
+        let array = NDArray::with_data(vec![NDDimension::new(data.len())], data);
         send_array(handle.array_sender(), published(Arc::new(array)));
         let counter = handle.ndarray_params.array_counter;
         wait_until("the frame to be counted", || {

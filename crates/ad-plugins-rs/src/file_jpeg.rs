@@ -38,7 +38,7 @@ impl NDFileWriter for JpegWriter {
     fn open_file(&mut self, path: &Path, mode: NDFileOpenMode, array: &NDArray) -> ADResult<()> {
         // NDFileJPEG.cpp:34-37
         mode.refuse_read_or_append("NDFileJPEG")?;
-        let dt = array.data.data_type();
+        let dt = array.data().data_type();
         if dt != NDDataType::UInt8 && dt != NDDataType::Int8 {
             return Err(ADError::UnsupportedConversion(
                 "JPEG only supports UInt8/Int8 data".into(),
@@ -100,7 +100,7 @@ impl NDFileWriter for JpegWriter {
         let width = info.x_size;
         let height = info.y_size;
 
-        let data: Vec<u8> = match src.data.view() {
+        let data: Vec<u8> = match src.data().view() {
             NDDataView::U8(v) => v.to_vec(),
             NDDataView::I8(v) => v.iter().map(|&b| b as u8).collect(),
             _ => {
@@ -374,7 +374,7 @@ mod tests {
             vec![NDDimension::new(8), NDDimension::new(8)],
             NDDataType::UInt8,
         );
-        if let NDDataViewMut::U8(v) = arr.data.view_mut() {
+        if let NDDataViewMut::U8(v) = arr.data_mut().view_mut() {
             for i in 0..64 {
                 v[i] = (i * 4) as u8;
             }
@@ -418,7 +418,7 @@ mod tests {
             vec![NDDimension::new(32), NDDimension::new(32)],
             NDDataType::UInt8,
         );
-        if let NDDataViewMut::U8(v) = arr.data.view_mut() {
+        if let NDDataViewMut::U8(v) = arr.data_mut().view_mut() {
             for i in 0..v.len() {
                 v[i] = (i % 256) as u8;
             }
@@ -521,7 +521,7 @@ mod tests {
             vec![NDDimension::new(8), NDDimension::new(8)],
             NDDataType::UInt8,
         );
-        if let NDDataViewMut::U8(v) = arr.data.view_mut() {
+        if let NDDataViewMut::U8(v) = arr.data_mut().view_mut() {
             // Use uniform value so JPEG compression is lossless at quality 100
             for i in 0..64 {
                 v[i] = 128;
@@ -572,7 +572,7 @@ mod tests {
             NDAttrSource::Driver,
             NDAttrValue::Int32(mode as i32),
         ));
-        if let NDDataViewMut::U8(v) = arr.data.view_mut() {
+        if let NDDataViewMut::U8(v) = arr.data_mut().view_mut() {
             for (i, x) in v.iter_mut().enumerate() {
                 *x = (i % 256) as u8;
             }

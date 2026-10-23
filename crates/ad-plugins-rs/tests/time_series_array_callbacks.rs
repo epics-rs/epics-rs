@@ -81,7 +81,7 @@ fn a_tsread_without_array_callbacks_takes_no_unique_id() {
     write(ts.ndarray_params.array_callbacks, 1);
     write(ts_read, 1);
     let posted = rx.blocking_recv().unwrap();
-    let NDDataView::F64(series) = posted.data.view() else {
+    let NDDataView::F64(series) = posted.data().view() else {
         panic!("not Float64");
     };
     assert_eq!(series[..2], [7.0, 9.0], "the withheld TSRead posted");

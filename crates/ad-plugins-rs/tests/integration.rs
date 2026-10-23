@@ -88,7 +88,7 @@ fn test_driver_to_stats_pipeline() {
         )
         .unwrap();
 
-    if let NDDataViewMut::U8(v) = arr.data.view_mut() {
+    if let NDDataViewMut::U8(v) = arr.data_mut().view_mut() {
         for i in 0..v.len() {
             v[i] = (i % 256) as u8;
         }
@@ -634,7 +634,7 @@ fn make_2d_u8(w: usize, h: usize) -> NDArray {
         vec![NDDimension::new(w), NDDimension::new(h)],
         NDDataType::UInt8,
     );
-    if let NDDataViewMut::U8(v) = arr.data.view_mut() {
+    if let NDDataViewMut::U8(v) = arr.data_mut().view_mut() {
         for i in 0..v.len() {
             v[i] = (i % 256) as u8;
         }
@@ -801,7 +801,7 @@ fn test_codec_compress_decompress_roundtrip() {
 
     let decompressed = decompress_lz4(&compressed).unwrap();
     assert!(decompressed.codec.is_none());
-    assert_eq!(decompressed.data.as_u8_slice(), arr.data.as_u8_slice());
+    assert_eq!(decompressed.data().as_u8_slice(), arr.data().as_u8_slice());
 }
 
 #[test]

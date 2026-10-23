@@ -1265,7 +1265,7 @@ impl Hdf5Writer {
         let data_type = array
             .codec
             .as_ref()
-            .map_or(array.data.data_type(), |c| c.original_data_type);
+            .map_or(array.data().data_type(), |c| c.original_data_type);
         posts.extend(self.cfg.overridden(&posts).nbit_readback(data_type));
         if !posts.is_empty() {
             self.cfg.store().update(|s| s.apply(&posts));
@@ -1954,7 +1954,7 @@ impl Hdf5Writer {
         let ds_data_type = array
             .codec
             .as_ref()
-            .map_or(array.data.data_type(), |c| c.original_data_type);
+            .map_or(array.data().data_type(), |c| c.original_data_type);
 
         // Full chunk geometry, `[fc, rc, cc]`: HDF5_nFramesChunks deep and
         // the row/column tile sizes. rust-hdf5 0.2.15
@@ -2459,7 +2459,7 @@ impl Hdf5Writer {
         let ds_data_type = array
             .codec
             .as_ref()
-            .map_or(array.data.data_type(), |c| c.original_data_type);
+            .map_or(array.data().data_type(), |c| c.original_data_type);
         let (shape, chunk, leading) = self.standard_layout(&frame_dims);
         // N-bit packing couples a reduced-precision datatype override with the
         // nbit filter (C narrows `this->datatype` then `H5Pset_nbit`).
@@ -2688,8 +2688,8 @@ impl Hdf5Writer {
         let elem_size = self.stored_elem_size;
         let frame_le = if chunk_bytes.is_none() {
             Some(widen_le(
-                nd_buffer_to_le_bytes(&array.data),
-                array.data.data_type(),
+                nd_buffer_to_le_bytes(array.data()),
+                array.data().data_type(),
                 elem_size,
             ))
         } else {
@@ -3419,7 +3419,7 @@ impl Hdf5Writer {
         Ok(Some(codec_chunk_bytes(
             codec,
             total_bytes,
-            array.data.as_u8_slice(),
+            array.data().as_u8_slice(),
         )))
     }
 
@@ -3501,8 +3501,8 @@ impl Hdf5Writer {
             // verbatim; serialize to LE explicitly (see `nd_buffer_to_le_bytes`) so
             // the file is portable.
             let frame_bytes = widen_le(
-                nd_buffer_to_le_bytes(&array.data),
-                array.data.data_type(),
+                nd_buffer_to_le_bytes(array.data()),
+                array.data().data_type(),
                 stored_elem_size,
             );
             match (grid, leading_coords) {
@@ -4559,7 +4559,7 @@ impl NDFileWriter for Hdf5Writer {
         self.frame_count += 1;
 
         let elapsed = start.elapsed().as_secs_f64();
-        let frame_bytes = array.data.as_u8_slice().len();
+        let frame_bytes = array.data().as_u8_slice().len();
         if self.cfg.store_performance {
             self.total_runtime += elapsed;
             self.total_bytes += frame_bytes as u64;
@@ -5898,7 +5898,7 @@ mod tests {
             vec![NDDimension::new(4), NDDimension::new(4)],
             NDDataType::UInt8,
         );
-        if let NDDataViewMut::U8(v) = arr.data.view_mut() {
+        if let NDDataViewMut::U8(v) = arr.data_mut().view_mut() {
             for i in 0..16 {
                 v[i] = i as u8;
             }
@@ -7145,7 +7145,7 @@ mod tests {
             vec![NDDimension::new(4), NDDimension::new(4)],
             NDDataType::UInt8,
         );
-        if let NDDataViewMut::U8(v) = arr.data.view_mut() {
+        if let NDDataViewMut::U8(v) = arr.data_mut().view_mut() {
             for i in 0..16 {
                 v[i] = i as u8;
             }
@@ -7180,7 +7180,7 @@ mod tests {
         );
         // Mark each frame distinctly so we can verify per-frame placement.
         for f in 0..3u8 {
-            if let NDDataViewMut::U8(v) = arr.data.view_mut() {
+            if let NDDataViewMut::U8(v) = arr.data_mut().view_mut() {
                 for x in v.iter_mut() {
                     *x = f;
                 }
@@ -7245,7 +7245,7 @@ mod tests {
             NDDataType::UInt16,
         );
         for f in 0..3u16 {
-            if let NDDataViewMut::U16(v) = arr.data.view_mut() {
+            if let NDDataViewMut::U16(v) = arr.data_mut().view_mut() {
                 for (i, x) in v.iter_mut().enumerate() {
                     *x = f * 1000 + i as u16;
                 }
@@ -7305,7 +7305,7 @@ mod tests {
             NDDataType::UInt16,
         );
         for f in 0..2u16 {
-            if let NDDataViewMut::U16(v) = arr.data.view_mut() {
+            if let NDDataViewMut::U16(v) = arr.data_mut().view_mut() {
                 for (i, x) in v.iter_mut().enumerate() {
                     *x = f * 100 + i as u16;
                 }
@@ -7353,7 +7353,7 @@ mod tests {
             vec![NDDimension::new(8), NDDimension::new(8)],
             NDDataType::UInt16,
         );
-        if let NDDataViewMut::U16(v) = arr.data.view_mut() {
+        if let NDDataViewMut::U16(v) = arr.data_mut().view_mut() {
             for (i, x) in v.iter_mut().enumerate() {
                 *x = i as u16;
             }
@@ -7399,7 +7399,7 @@ mod tests {
         );
         // 5 frames → bands [0,1], [2,3], [4] (partial).
         for f in 0..5u16 {
-            if let NDDataViewMut::U16(v) = arr.data.view_mut() {
+            if let NDDataViewMut::U16(v) = arr.data_mut().view_mut() {
                 for (i, x) in v.iter_mut().enumerate() {
                     *x = f * 1000 + i as u16;
                 }
@@ -7450,7 +7450,7 @@ mod tests {
         );
         // 3 frames → band [0,1] full, band [2] partial; 2x2 tiles each.
         for f in 0..3u16 {
-            if let NDDataViewMut::U16(v) = arr.data.view_mut() {
+            if let NDDataViewMut::U16(v) = arr.data_mut().view_mut() {
                 for (i, x) in v.iter_mut().enumerate() {
                     *x = f * 1000 + i as u16;
                 }
@@ -8414,11 +8414,10 @@ mod tests {
         writer.set_pos_name(1, "PosX");
         configure(&mut writer);
         let mk = |v: u8, (x, n): (i32, i32)| {
-            let mut arr = NDArray::new(
+            let mut arr = NDArray::with_data(
                 vec![NDDimension::new(4), NDDimension::new(4)],
-                NDDataType::UInt8,
+                NDDataBuffer::from_vec::<u8>(vec![v; 16]),
             );
-            arr.data = NDDataBuffer::from_vec::<u8>(vec![v; 16]);
             for (name, pos) in [("PosX", x), ("PosN", n)] {
                 arr.attributes.add(NDAttribute::new_static(
                     name,
@@ -10144,7 +10143,7 @@ mod tests {
                 NDDataType::UInt16,
             );
             for f in 0..frames {
-                if let NDDataViewMut::U16(v) = arr.data.view_mut() {
+                if let NDDataViewMut::U16(v) = arr.data_mut().view_mut() {
                     for (i, x) in v.iter_mut().enumerate() {
                         *x = f * 100 + i as u16;
                     }
@@ -10193,7 +10192,7 @@ mod tests {
                 let path = temp_path($name);
                 let mut writer = Hdf5Writer::new();
                 let mut arr = NDArray::new(vec![NDDimension::new(4)], $dt);
-                if let NDDataViewMut::$variant(v) = arr.data.view_mut() {
+                if let NDDataViewMut::$variant(v) = arr.data_mut().view_mut() {
                     let src: Vec<$ty> = $vals;
                     v.copy_from_slice(&src);
                 }
@@ -10288,7 +10287,7 @@ mod tests {
             vec![NDDimension::new(64), NDDimension::new(64)],
             NDDataType::UInt16,
         );
-        if let NDDataViewMut::U16(v) = arr.data.view_mut() {
+        if let NDDataViewMut::U16(v) = arr.data_mut().view_mut() {
             for i in 0..v.len() {
                 v[i] = (i % 256) as u16;
             }
@@ -10347,7 +10346,7 @@ mod tests {
             vec![NDDimension::new(32), NDDimension::new(32)],
             NDDataType::UInt8,
         );
-        if let NDDataViewMut::U8(v) = arr.data.view_mut() {
+        if let NDDataViewMut::U8(v) = arr.data_mut().view_mut() {
             for i in 0..v.len() {
                 v[i] = (i % 4) as u8;
             }
@@ -10379,7 +10378,7 @@ mod tests {
             vec![NDDimension::new(64), NDDimension::new(64)],
             NDDataType::UInt16,
         );
-        if let NDDataViewMut::U16(v) = arr.data.view_mut() {
+        if let NDDataViewMut::U16(v) = arr.data_mut().view_mut() {
             for i in 0..v.len() {
                 v[i] = (i % 8) as u16;
             }
@@ -10419,7 +10418,7 @@ mod tests {
             vec![NDDimension::new(64), NDDimension::new(64)],
             NDDataType::UInt8,
         );
-        if let NDDataViewMut::U8(v) = arr.data.view_mut() {
+        if let NDDataViewMut::U8(v) = arr.data_mut().view_mut() {
             for (i, e) in v.iter_mut().enumerate() {
                 *e = (i % 13) as u8;
             }
@@ -10478,7 +10477,7 @@ mod tests {
             vec![NDDimension::new(8), NDDimension::new(8)],
             NDDataType::UInt16,
         );
-        if let NDDataViewMut::U16(v) = arr.data.view_mut() {
+        if let NDDataViewMut::U16(v) = arr.data_mut().view_mut() {
             for (i, x) in v.iter_mut().enumerate() {
                 *x = (i as u16 * 7) & 0x3FF; // within the 10-bit range
             }
@@ -10760,7 +10759,7 @@ mod tests {
             writer.set_nbit_offset(0);
             let mut arr = NDArray::new(vec![NDDimension::new(4), NDDimension::new(4)], data_type);
             let want: Vec<f64> = (0..16).map(|i| -1.5e3 + i as f64 * 777.25).collect();
-            match arr.data.view_mut() {
+            match arr.data_mut().view_mut() {
                 NDDataViewMut::U16(v) => {
                     v.iter_mut().zip(0u16..).for_each(|(x, i)| *x = 0xFFFF - i)
                 }
@@ -10768,7 +10767,7 @@ mod tests {
                 NDDataViewMut::F64(v) => v.copy_from_slice(&want),
                 _ => unreachable!(),
             }
-            let written = arr.data.clone();
+            let written = arr.data().clone();
             writer
                 .open_file(&path, NDFileOpenMode::WRITE, &arr)
                 .unwrap();
@@ -10817,7 +10816,7 @@ mod tests {
             vec![NDDimension::new(8), NDDimension::new(8)],
             NDDataType::UInt16,
         );
-        if let NDDataViewMut::U16(v) = arr.data.view_mut() {
+        if let NDDataViewMut::U16(v) = arr.data_mut().view_mut() {
             for i in 0..v.len() {
                 v[i] = i as u16;
             }
@@ -10874,7 +10873,7 @@ mod tests {
             NDDataType::UInt16,
         );
         for f in 0..24u16 {
-            if let NDDataViewMut::U16(v) = arr.data.view_mut() {
+            if let NDDataViewMut::U16(v) = arr.data_mut().view_mut() {
                 for x in v.iter_mut() {
                     *x = f;
                 }
@@ -10922,7 +10921,7 @@ mod tests {
             NDDataType::UInt16,
         );
         for f in 0..6u16 {
-            if let NDDataViewMut::U16(v) = arr.data.view_mut() {
+            if let NDDataViewMut::U16(v) = arr.data_mut().view_mut() {
                 for x in v.iter_mut() {
                     *x = f;
                 }
@@ -10975,7 +10974,7 @@ mod tests {
             NDDataType::UInt16,
         );
         for f in 0..24u16 {
-            if let NDDataViewMut::U16(v) = arr.data.view_mut() {
+            if let NDDataViewMut::U16(v) = arr.data_mut().view_mut() {
                 for x in v.iter_mut() {
                     *x = f;
                 }
@@ -11032,7 +11031,7 @@ mod tests {
             NDDataType::UInt16,
         );
         for f in 0..6u16 {
-            if let NDDataViewMut::U16(v) = arr.data.view_mut() {
+            if let NDDataViewMut::U16(v) = arr.data_mut().view_mut() {
                 // Distinct per-element values prove tile reassembly, not just a
                 // constant: value = frame*100 + (row*4 + col).
                 for (i, x) in v.iter_mut().enumerate() {
@@ -11094,7 +11093,7 @@ mod tests {
             NDDataType::UInt16,
         );
         for f in 0..4u16 {
-            if let NDDataViewMut::U16(v) = arr.data.view_mut() {
+            if let NDDataViewMut::U16(v) = arr.data_mut().view_mut() {
                 for x in v.iter_mut() {
                     *x = f + 1; // non-zero so fill (0) is distinguishable
                 }
@@ -11235,7 +11234,7 @@ mod tests {
             NDDataType::UInt16,
         );
         for f in 0..6u16 {
-            if let NDDataViewMut::U16(v) = arr.data.view_mut() {
+            if let NDDataViewMut::U16(v) = arr.data_mut().view_mut() {
                 v.fill(f);
             }
             if f == 0 {
@@ -11437,7 +11436,7 @@ mod tests {
                 vec![NDDimension::new(2), NDDimension::new(2)],
                 NDDataType::UInt16,
             );
-            if let NDDataViewMut::U16(v) = arr.data.view_mut() {
+            if let NDDataViewMut::U16(v) = arr.data_mut().view_mut() {
                 for p in v.iter_mut() {
                     *p = val;
                 }
@@ -11728,7 +11727,7 @@ mod tests {
             vec![NDDimension::new(4), NDDimension::new(4)],
             NDDataType::UInt16,
         );
-        if let NDDataViewMut::U16(v) = arr.data.view_mut() {
+        if let NDDataViewMut::U16(v) = arr.data_mut().view_mut() {
             for (i, x) in v.iter_mut().enumerate() {
                 *x = i as u16;
             }
@@ -11814,7 +11813,7 @@ mod tests {
             vec![NDDimension::new(4), NDDimension::new(4)],
             NDDataType::UInt16,
         );
-        if let NDDataViewMut::U16(v) = arr.data.view_mut() {
+        if let NDDataViewMut::U16(v) = arr.data_mut().view_mut() {
             for (i, x) in v.iter_mut().enumerate() {
                 *x = (i * 3) as u16;
             }
@@ -12628,7 +12627,7 @@ mod tests {
     }
 
     fn u16_pixels(arr: &NDArray) -> Vec<u16> {
-        match arr.data.view() {
+        match arr.data().view() {
             NDDataView::U16(v) => v.to_vec(),
             _ => unreachable!("expected U16 buffer"),
         }

@@ -176,7 +176,7 @@ impl MagickWriter {
             array
         };
 
-        match src.data.view() {
+        match src.data().view() {
             NDDataView::U8(v) => {
                 if is_rgb {
                     image::RgbImage::from_raw(width, height, v.to_vec())
@@ -295,7 +295,7 @@ impl MagickWriter {
             }
             _ => Err(ADError::UnsupportedConversion(format!(
                 "NDFileMagick: unsupported data type {:?}, use UInt8, Int8, UInt16, Int16, or Float32",
-                src.data.data_type()
+                src.data().data_type()
             ))),
         }
     }
@@ -664,7 +664,7 @@ mod tests {
             vec![NDDimension::new(8), NDDimension::new(8)],
             NDDataType::UInt8,
         );
-        if let NDDataViewMut::U8(v) = arr.data.view_mut() {
+        if let NDDataViewMut::U8(v) = arr.data_mut().view_mut() {
             for i in 0..64 {
                 v[i] = (i * 4) as u8;
             }
@@ -678,7 +678,7 @@ mod tests {
 
         let read_back = image::open(&path).unwrap();
         assert_eq!(read_back.color(), image::ColorType::L8);
-        let NDDataView::U8(orig) = arr.data.view() else {
+        let NDDataView::U8(orig) = arr.data().view() else {
             unreachable!()
         };
         assert_eq!(read_back.as_bytes(), orig);
@@ -694,7 +694,7 @@ mod tests {
             vec![NDDimension::new(8), NDDimension::new(8)],
             NDDataType::UInt16,
         );
-        if let NDDataViewMut::U16(v) = arr.data.view_mut() {
+        if let NDDataViewMut::U16(v) = arr.data_mut().view_mut() {
             for i in 0..64 {
                 v[i] = (i * 1000) as u16;
             }
@@ -708,7 +708,7 @@ mod tests {
 
         let read_back = image::open(&path).unwrap();
         assert_eq!(read_back.color(), image::ColorType::L16);
-        let NDDataView::U16(orig) = arr.data.view() else {
+        let NDDataView::U16(orig) = arr.data().view() else {
             unreachable!()
         };
         assert_eq!(read_back.into_luma16().into_raw(), *orig);
@@ -736,7 +736,7 @@ mod tests {
             NDAttrSource::Driver,
             NDAttrValue::Int32(2), // RGB1
         ));
-        if let NDDataViewMut::U8(v) = arr.data.view_mut() {
+        if let NDDataViewMut::U8(v) = arr.data_mut().view_mut() {
             for i in 0..48 {
                 v[i] = (i * 5) as u8;
             }
@@ -771,7 +771,7 @@ mod tests {
             vec![NDDimension::new(4), NDDimension::new(4)],
             NDDataType::UInt16,
         );
-        if let NDDataViewMut::U16(v) = arr.data.view_mut() {
+        if let NDDataViewMut::U16(v) = arr.data_mut().view_mut() {
             for (i, x) in v.iter_mut().enumerate() {
                 *x = (i * 4000) as u16;
             }
@@ -789,7 +789,7 @@ mod tests {
             vec![NDDimension::new(2), NDDimension::new(2)],
             NDDataType::Float32,
         );
-        if let NDDataViewMut::F32(v) = arr.data.view_mut() {
+        if let NDDataViewMut::F32(v) = arr.data_mut().view_mut() {
             v[0] = 100.0;
             v[1] = 200.0;
             v[2] = 300.0;
@@ -815,7 +815,7 @@ mod tests {
             vec![NDDimension::new(64), NDDimension::new(64)],
             NDDataType::UInt8,
         );
-        if let NDDataViewMut::U8(v) = arr.data.view_mut() {
+        if let NDDataViewMut::U8(v) = arr.data_mut().view_mut() {
             for x in v.iter_mut() {
                 *x = 128; // uniform → highly compressible
             }

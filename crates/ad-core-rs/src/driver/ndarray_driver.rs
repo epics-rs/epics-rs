@@ -334,7 +334,7 @@ pub(crate) fn write_array_params(
     port_base.set_int32_param(params.n_dimensions, 0, array.dims.len() as i32)?;
 
     // G7: data type and color mode.
-    port_base.set_int32_param(params.data_type, 0, array.data.data_type() as i32)?;
+    port_base.set_int32_param(params.data_type, 0, array.data().data_type() as i32)?;
     port_base.set_int32_param(params.color_mode, 0, info.color_mode as i32)?;
 
     // G5: Bayer pattern, derived from the `bayerPattern` array attribute.
@@ -2062,10 +2062,10 @@ pub(crate) mod tests {
     /// publish, read as its current publish, on its one pool charge.
     #[test]
     fn a_persistent_slot_is_written_in_place_and_read_as_its_publish() {
-        use crate::ndarray::{NDDataBuffer, NDDataType, NDDataView, NDDimension};
+        use crate::ndarray::{NDDataType, NDDataView, NDDimension};
         let pool = crate::ndarray_pool::DriverPool::standalone(1_000_000);
         let owner = pool.owner().clone();
-        let f64s = |a: &NDArray| match a.data.view() {
+        let f64s = |a: &NDArray| match a.data().view() {
             NDDataView::F64(v) => v.to_vec(),
             other => panic!("{:?}", other.data_type()),
         };
@@ -2074,9 +2074,7 @@ pub(crate) mod tests {
                 .ok()
         }));
         let held = owner.persistent(0, |a| a.published()).unwrap();
-        owner.persistent(0, |a| {
-            a.refill().data = NDDataBuffer::from_vec::<f64>(vec![1.0, 2.0])
-        });
+        owner.persistent(0, |a| a.refill().data_mut().fill_from_f64(&[1.0, 2.0]));
         assert_eq!(f64s(&owner.array(0).unwrap()), [1.0, 2.0]);
         assert_eq!(f64s(held.array()), [0.0, 0.0]);
         assert_eq!(pool.num_alloc_buffers(), 1);

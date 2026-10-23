@@ -279,7 +279,7 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
             // A refused wrap has printed the pool's limit line.
             let Some(frame) = ctx.pool.owner().replace_array(0, || {
                 let mut frame = ctx.pool.alloc(dims, NDDataType::UInt16).ok()?;
-                let NDDataViewMut::U16(out) = frame.data.view_mut() else {
+                let NDDataViewMut::U16(out) = frame.data_mut().view_mut() else {
                     unreachable!("the frame was allocated as UInt16")
                 };
                 scale_into_u16(&accum, nx, nz, out);

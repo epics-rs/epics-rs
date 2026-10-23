@@ -2,7 +2,7 @@ use rand::Rng;
 use rand::rngs::StdRng;
 use std::f64::consts::PI;
 
-use ad_core_rs::ndarray::{NDDataBuffer, NDDataViewMut};
+use ad_core_rs::ndarray::NDDataViewMut;
 
 use crate::types::{SimMode, SineOperation};
 use ad_core_rs::color_layout::ColorLayout;
@@ -410,10 +410,10 @@ pub fn accumulate_sine<T: PixelCast>(
 /// element type once per frame; the four buffers are the one data type and
 /// length the task allocates them with.
 pub fn compute_frame(
-    raw: &mut NDDataBuffer,
-    background: &mut NDDataBuffer,
-    ramp_buf: &mut NDDataBuffer,
-    peak_buf: &mut NDDataBuffer,
+    raw: NDDataViewMut<'_>,
+    background: NDDataViewMut<'_>,
+    ramp_buf: NDDataViewMut<'_>,
+    peak_buf: NDDataViewMut<'_>,
     sine_state: &mut SineState,
     layout: &ColorLayout,
     sim_mode: SimMode,
@@ -428,12 +428,7 @@ pub fn compute_frame(
 ) {
     macro_rules! typed {
         ($($v:ident),+) => {
-            match (
-                raw.view_mut(),
-                background.view_mut(),
-                ramp_buf.view_mut(),
-                peak_buf.view_mut(),
-            ) {
+            match (raw, background, ramp_buf, peak_buf) {
                 $((
                     NDDataViewMut::$v(raw),
                     NDDataViewMut::$v(background),
@@ -748,10 +743,10 @@ mod tests {
         };
 
         compute_frame(
-            &mut raw,
-            &mut bg,
-            &mut ramp,
-            &mut peak,
+            raw.view_mut(),
+            bg.view_mut(),
+            ramp.view_mut(),
+            peak.view_mut(),
             &mut sine_state,
             &layout,
             SimMode::OffsetNoise,
@@ -855,10 +850,10 @@ mod tests {
                         let use_background = noise != 0.0 || offset != 0.0;
                         for frame in 0..3 {
                             compute_frame(
-                                &mut raw,
-                                &mut bg,
-                                &mut ramp,
-                                &mut peak_buf,
+                                raw.view_mut(),
+                                bg.view_mut(),
+                                ramp.view_mut(),
+                                peak_buf.view_mut(),
                                 &mut sine_state,
                                 &layout,
                                 sim_mode,

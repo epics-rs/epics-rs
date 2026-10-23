@@ -92,17 +92,20 @@ impl NDArrayPool {
     fn adopt(&self, dims: Vec<NDDimension>, data: NDDataBuffer, data_size: usize) -> NDArray {
         // The "Initialize fields" block of C++ NDArrayPool::alloc
         // (NDArrayPool.cpp:187-199) sets neither `epicsTS` nor `timeStamp`,
-        // and neither does `with_data`: the driver owns both and stamps them
+        // and neither does `NDArray::pooled`: the driver owns both and stamps them
         // together via asynNDArrayDriver::updateTimeStamps
         // (asynNDArrayDriver.cpp:832-836). Stamping only `epicsTS` here left
         // `timeStamp` at 0.0 (fresh buffer) or at the previous frame's value
         // (reused buffer), so the two published timestamps disagreed. See
         // NDArray::update_time_stamps.
-        let mut array = NDArray::with_data(dims, data);
-        array.unique_id = self.next_unique_id.fetch_add(1, Ordering::Relaxed);
-        array.data_size = data_size;
-        array.tie(PoolOnly(()), PoolTie::Charged(self.this.clone()));
-        array
+        NDArray::pooled(
+            PoolOnly(()),
+            dims,
+            data,
+            data_size,
+            self.next_unique_id.fetch_add(1, Ordering::Relaxed),
+            PoolTie::Charged(self.this.clone()),
+        )
     }
 
     /// The driver that owns the pool, `None` for an unowned pool or a driver
@@ -183,7 +186,9 @@ impl NDArrayPool {
 
         if let Some(reused) = reused {
             let mut array = self.adopt(dims, reused.data, reused.data_size);
-            array.data.retype(PoolOnly(()), data_type, num_elements);
+            array
+                .buffer_mut(PoolOnly(()))
+                .retype(PoolOnly(()), data_type, num_elements);
             return Ok(array);
         }
 
@@ -270,7 +275,7 @@ impl NDArrayPool {
     /// Tries the free list first (via alloc()), then copies data from source.
     pub fn alloc_copy(&self, source: &NDArray) -> ADResult<NDArray> {
         let mut copy = self.alloc_for(source)?;
-        crate::convert::convert_buffer_into(&source.data, &mut copy.data);
+        crate::convert::convert_buffer_into(source.data(), copy.buffer_mut(PoolOnly(())));
         copy.unique_id = source.unique_id;
         copy.copy_time_stamps_from(source);
         copy.attributes = source.attributes.clone();
@@ -285,13 +290,17 @@ impl NDArrayPool {
     /// copied, so such a frame is charged its payload.
     fn alloc_for(&self, source: &NDArray) -> ADResult<NDArray> {
         let dims = source.dims.clone();
-        let data_type = source.data.data_type();
+        let data_type = source.data().data_type();
         let Some(codec) = &source.codec else {
             return self.alloc(dims, data_type);
         };
         let elements: usize = dims.iter().map(|d| d.size).product();
         let uncompressed = elements * codec.original_data_type.element_size();
-        self.alloc_sized(dims, data_type, uncompressed.max(source.data.total_bytes()))
+        self.alloc_sized(
+            dims,
+            data_type,
+            uncompressed.max(source.data().total_bytes()),
+        )
     }
 
     /// Give an array back to the pool now.
@@ -374,15 +383,16 @@ impl NDArrayPool {
 
         if copy_data_type {
             let len = if copy_data {
-                src.data.len()
+                src.data().len()
             } else {
-                out.data.len()
+                out.data().len()
             };
-            out.data.retype(PoolOnly(()), src.data.data_type(), len);
+            out.buffer_mut(PoolOnly(()))
+                .retype(PoolOnly(()), src.data().data_type(), len);
         }
         if copy_data {
             // Output keeps its own type: convert pixel values.
-            crate::convert::convert_buffer_into(&src.data, &mut out.data);
+            crate::convert::convert_buffer_into(src.data(), out.buffer_mut(PoolOnly(())));
         }
 
         out.attributes.clear();
@@ -399,13 +409,13 @@ impl NDArrayPool {
                 "convert_type: cannot convert compressed (codec) data".into(),
             ));
         }
-        if src.data.data_type() == target_type {
+        if src.data().data_type() == target_type {
             return self.alloc_copy(src);
         }
         // Allocate the output through the pool so it counts against
         // allocated_bytes / num_alloc_buffers.
         let mut out = self.alloc(src.dims.clone(), target_type)?;
-        crate::convert::convert_buffer_into(&src.data, &mut out.data);
+        crate::convert::convert_buffer_into(src.data(), out.buffer_mut(PoolOnly(())));
         out.unique_id = src.unique_id;
         out.copy_time_stamps_from(src);
         out.attributes.copy_from(&src.attributes);
@@ -428,7 +438,7 @@ impl NDArrayPool {
     ) -> ADResult<NDArray> {
         let out_dims = crate::convert::output_dims(src, dims_out)?;
         let mut arr = self.alloc(out_dims, target_type)?;
-        crate::convert::convert_dims_into(src, dims_out, &mut arr.data)?;
+        crate::convert::convert_dims_into(src, dims_out, arr.buffer_mut(PoolOnly(())))?;
         arr.unique_id = src.unique_id;
         arr.copy_time_stamps_from(src);
         arr.attributes.copy_from(&src.attributes);
@@ -753,7 +763,7 @@ impl PersistentArray {
         if let Some(PoolTie::Charged(pool)) = array.array.pool_tie() {
             let charge = SharedCharge {
                 pool: pool.clone(),
-                data_size: array.array.data_size,
+                data_size: array.array.data_size(),
                 parked: Mutex::default(),
             };
             array
@@ -790,7 +800,7 @@ impl Drop for PersistentArray {
     fn drop(&mut self) {
         if let Some(PoolTie::Shared(charge)) = self.array.array.pool_tie() {
             let charge = Arc::clone(charge);
-            *charge.parked.lock() = std::mem::take(&mut self.array.array.data);
+            *charge.parked.lock() = std::mem::take(self.array.array.buffer_mut(PoolOnly(())));
         }
     }
 }
@@ -881,8 +891,24 @@ mod tests {
         let Ok(mut copy) = held.try_into_driver() else {
             panic!("the refill let go of the publish");
         };
-        copy.data.resize(3);
-        assert_eq!(copy.data.len(), 2);
+        copy.data_mut().resize(3);
+        assert_eq!(copy.data().len(), 2);
+    }
+
+    /// The in-place form of the buffer swaps [`NDArray`] refuses to compile:
+    /// a driver array and a persistent array's refill grow no further than
+    /// their charge.
+    #[test]
+    fn a_driver_array_and_a_refill_grow_no_further_than_their_charge() {
+        let pool = DriverPool::standalone(8);
+        let mut a = pool
+            .alloc(vec![NDDimension::new(2)], NDDataType::Int32)
+            .unwrap();
+        a.data_mut().resize(4);
+        assert_eq!(a.data().len(), 2);
+        let mut flat = PersistentArray::new(a);
+        flat.refill().data_mut().resize(4);
+        assert_eq!(flat.data().len(), 2);
     }
 
     /// A reused free buffer is tied to its pool and owner as a fresh one is.
@@ -1006,7 +1032,7 @@ mod tests {
         let mut source = pool
             .alloc(vec![NDDimension::new(4)], NDDataType::UInt8)
             .unwrap();
-        if let NDDataViewMut::U8(v) = source.data.view_mut() {
+        if let NDDataViewMut::U8(v) = source.data_mut().view_mut() {
             v[0] = 1;
             v[1] = 2;
             v[2] = 3;
@@ -1016,7 +1042,7 @@ mod tests {
         let copy = pool.alloc_copy(&source).unwrap();
         assert_eq!(copy.unique_id, source.unique_id);
         assert_eq!(copy.dims.len(), source.dims.len());
-        if let NDDataView::U8(v) = copy.data.view() {
+        if let NDDataView::U8(v) = copy.data().view() {
             assert_eq!(v, &[1, 2, 3, 4]);
         } else {
             panic!("wrong type");
@@ -1062,7 +1088,7 @@ mod tests {
         let arr2 = pool
             .alloc(vec![NDDimension::new(80)], NDDataType::UInt8)
             .unwrap();
-        assert_eq!(arr2.data.len(), 80);
+        assert_eq!(arr2.data().len(), 80);
     }
 
     #[test]
@@ -1087,7 +1113,7 @@ mod tests {
         let reused = pool
             .alloc(vec![NDDimension::new(900)], NDDataType::UInt8)
             .unwrap();
-        assert!(reused.data.capacity_bytes() >= 900);
+        assert!(reused.data().capacity_bytes() >= 900);
     }
 
     /// C++ finds a free buffer by its tracked `dataSize` (NDArrayPool.cpp:161-165),
@@ -1102,12 +1128,12 @@ mod tests {
         let b = pool
             .alloc(vec![NDDimension::new(400)], NDDataType::UInt16)
             .unwrap();
-        assert_eq!(b.data_size, 1000);
+        assert_eq!(b.data_size(), 1000);
         pool.release(b);
         let c = pool
             .alloc(vec![NDDimension::new(900)], NDDataType::UInt8)
             .unwrap();
-        assert_eq!(c.data_size, 1000);
+        assert_eq!(c.data_size(), 1000);
         assert_eq!(pool.num_alloc_buffers(), 1);
         assert_eq!(pool.allocated_bytes(), 1000);
     }
@@ -1121,15 +1147,15 @@ mod tests {
         let a = pool
             .alloc(vec![NDDimension::new(1000)], NDDataType::UInt16)
             .unwrap();
-        let ptr = a.data.as_u8_slice().as_ptr();
+        let ptr = a.data().as_u8_slice().as_ptr();
         pool.release(a);
 
         let b = pool
             .alloc(vec![NDDimension::new(250)], NDDataType::Float64)
             .unwrap();
-        assert_eq!(b.data.as_u8_slice().as_ptr(), ptr);
+        assert_eq!(b.data().as_u8_slice().as_ptr(), ptr);
         assert_eq!(
-            (b.data.data_type(), b.data.len()),
+            (b.data().data_type(), b.data().len()),
             (NDDataType::Float64, 250)
         );
         pool.release(b);
@@ -1138,9 +1164,9 @@ mod tests {
         let c = pool
             .alloc(vec![NDDimension::new(1500)], NDDataType::UInt8)
             .unwrap();
-        assert_eq!(c.data.as_u8_slice().as_ptr(), ptr);
+        assert_eq!(c.data().as_u8_slice().as_ptr(), ptr);
         assert_eq!(
-            (c.data.data_type(), c.data.len()),
+            (c.data().data_type(), c.data().len()),
             (NDDataType::UInt8, 1500)
         );
         assert_eq!(
@@ -1157,17 +1183,17 @@ mod tests {
         let mut a = pool
             .alloc(vec![NDDimension::new(8)], NDDataType::UInt16)
             .unwrap();
-        a.data
+        a.data_mut()
             .as_mut_slice::<u16>()
             .unwrap()
             .copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
-        let bytes = a.data.as_u8_slice().to_vec();
+        let bytes = a.data().as_u8_slice().to_vec();
         pool.release(a);
 
         let b = pool
             .alloc(vec![NDDimension::new(2)], NDDataType::Float64)
             .unwrap();
-        assert_eq!(b.data.as_u8_slice(), &bytes[..]);
+        assert_eq!(b.data().as_u8_slice(), &bytes[..]);
     }
 
     /// `copy` with `copy_data_type` retypes the output in its own buffer
@@ -1182,10 +1208,10 @@ mod tests {
         let out = pool
             .alloc(vec![NDDimension::new(16)], NDDataType::UInt8)
             .unwrap();
-        let ptr = out.data.as_u8_slice().as_ptr();
+        let ptr = out.data().as_u8_slice().as_ptr();
         let out = pool.copy(&src, Some(out), true, true, true).unwrap();
-        assert_eq!(out.data.as_u8_slice().as_ptr(), ptr);
-        assert_eq!(out.data.as_slice::<f64>(), Some(&[1.5, -2.0][..]));
+        assert_eq!(out.data().as_u8_slice().as_ptr(), ptr);
+        assert_eq!(out.data().as_slice::<f64>(), Some(&[1.5, -2.0][..]));
     }
 
     /// No buffer method takes a pooled buffer past the bytes its pool
@@ -1197,14 +1223,14 @@ mod tests {
         let mut a = pool
             .alloc(vec![NDDimension::new(4)], NDDataType::UInt8)
             .unwrap();
-        let ptr = a.data.as_u8_slice().as_ptr();
-        a.data.resize(16);
-        assert_eq!(a.data.len(), 4);
-        a.data.fill_from_f64(&[9.0; 16]);
-        assert_eq!(a.data.as_slice::<u8>(), Some(&[9u8; 4][..]));
-        assert_eq!(a.data.as_u8_slice().as_ptr(), ptr);
+        let ptr = a.data().as_u8_slice().as_ptr();
+        a.data_mut().resize(16);
+        assert_eq!(a.data().len(), 4);
+        a.data_mut().fill_from_f64(&[9.0; 16]);
+        assert_eq!(a.data().as_slice::<u8>(), Some(&[9u8; 4][..]));
+        assert_eq!(a.data().as_u8_slice().as_ptr(), ptr);
 
-        let mut copy = a.data.clone();
+        let mut copy = a.data().clone();
         copy.resize(16);
         assert_eq!(copy.len(), 16);
         let mut loose = NDDataBuffer::zeros(NDDataType::UInt8, 4);
@@ -1218,9 +1244,9 @@ mod tests {
         let mut c = pool
             .alloc(vec![NDDimension::new(80)], NDDataType::UInt8)
             .unwrap();
-        assert_eq!(c.data_size, 100);
-        c.data.resize(200);
-        assert_eq!(c.data.len(), 100);
+        assert_eq!(c.data_size(), 100);
+        c.data_mut().resize(200);
+        assert_eq!(c.data().len(), 100);
         assert_eq!(pool.allocated_bytes(), 4 + 100);
     }
 
@@ -1239,29 +1265,29 @@ mod tests {
         );
         let output = |n: usize, data_type: NDDataType| {
             let out = pool.alloc(vec![NDDimension::new(n)], data_type).unwrap();
-            let ptr = out.data.as_u8_slice().as_ptr();
+            let ptr = out.data().as_u8_slice().as_ptr();
             (out, ptr)
         };
 
         let (out, ptr) = output(4, NDDataType::UInt8);
         let out = pool.copy(&src_u8, Some(out), true, false, false).unwrap();
-        assert_eq!(out.data.as_slice::<u8>(), Some(&bytes[..4]));
-        assert_eq!(out.data.as_u8_slice().as_ptr(), ptr);
+        assert_eq!(out.data().as_slice::<u8>(), Some(&bytes[..4]));
+        assert_eq!(out.data().as_u8_slice().as_ptr(), ptr);
 
         let (out, ptr) = output(16, NDDataType::UInt8);
         let out = pool.copy(&src_f64, Some(out), true, false, true).unwrap();
-        assert_eq!(out.data.as_slice::<f64>(), Some(&[1.5, 2.5][..]));
-        assert_eq!(out.data.as_u8_slice().as_ptr(), ptr);
+        assert_eq!(out.data().as_slice::<f64>(), Some(&[1.5, 2.5][..]));
+        assert_eq!(out.data().as_u8_slice().as_ptr(), ptr);
 
         let (out, ptr) = output(4, NDDataType::UInt16);
         let out = pool.copy(&src_u8, Some(out), true, false, false).unwrap();
-        assert_eq!(out.data.as_slice::<u16>(), Some(&[1, 2, 3, 4][..]));
-        assert_eq!(out.data.as_u8_slice().as_ptr(), ptr);
+        assert_eq!(out.data().as_slice::<u16>(), Some(&[1, 2, 3, 4][..]));
+        assert_eq!(out.data().as_u8_slice().as_ptr(), ptr);
 
         let (out, _) = output(12, NDDataType::UInt8);
         let out = pool.copy(&src_f64, Some(out), false, false, true).unwrap();
-        assert_eq!(out.data.data_type(), NDDataType::Float64);
-        assert!(out.data.total_bytes() <= out.data_size);
+        assert_eq!(out.data().data_type(), NDDataType::Float64);
+        assert!(out.data().total_bytes() <= out.data_size());
 
         assert_eq!(pool.allocated_bytes(), 4 + 16 + 8 + 12);
     }
@@ -1281,18 +1307,18 @@ mod tests {
         );
 
         let out = pool.copy(&src, None, true, true, true).unwrap();
-        assert_eq!(out.data.as_slice::<u8>(), Some(&payload[..4]));
-        assert_eq!((out.data_size, pool.allocated_bytes()), (4, 4));
+        assert_eq!(out.data().as_slice::<u8>(), Some(&payload[..4]));
+        assert_eq!((out.data_size(), pool.allocated_bytes()), (4, 4));
 
         let copy = pool.alloc_copy(&src).unwrap();
-        assert_eq!(copy.data.as_slice::<u8>(), Some(&payload[..4]));
-        assert_eq!((copy.data_size, pool.allocated_bytes()), (4, 8));
+        assert_eq!(copy.data().as_slice::<u8>(), Some(&payload[..4]));
+        assert_eq!((copy.data_size(), pool.allocated_bytes()), (4, 8));
 
         let same = pool.convert_type(&src, NDDataType::UInt8).unwrap();
-        assert_eq!(same.data.as_slice::<u8>(), Some(&payload[..4]));
+        assert_eq!(same.data().as_slice::<u8>(), Some(&payload[..4]));
         let wide = pool.convert_type(&src, NDDataType::UInt16).unwrap();
-        assert_eq!(wide.data.as_slice::<u16>(), Some(&[1, 2, 3, 4][..]));
-        assert_eq!((wide.data_size, pool.allocated_bytes()), (8, 20));
+        assert_eq!(wide.data().as_slice::<u16>(), Some(&[1, 2, 3, 4][..]));
+        assert_eq!((wide.data_size(), pool.allocated_bytes()), (8, 20));
 
         let frame = |bytes: usize| {
             let mut a = NDArray::with_data(
@@ -1311,12 +1337,12 @@ mod tests {
         };
         let small = frame(50);
         let copy = pool.alloc_copy(&small).unwrap();
-        assert_eq!(copy.data.as_u8_slice(), small.data.as_u8_slice());
-        assert_eq!((copy.data_size, pool.allocated_bytes()), (200, 220));
+        assert_eq!(copy.data().as_u8_slice(), small.data().as_u8_slice());
+        assert_eq!((copy.data_size(), pool.allocated_bytes()), (200, 220));
         let big = frame(216);
         let copy = pool.copy(&big, None, true, true, true).unwrap();
-        assert_eq!(copy.data.as_u8_slice(), big.data.as_u8_slice());
-        assert_eq!((copy.data_size, pool.allocated_bytes()), (216, 436));
+        assert_eq!(copy.data().as_u8_slice(), big.data().as_u8_slice());
+        assert_eq!((copy.data_size(), pool.allocated_bytes()), (216, 436));
     }
 
     /// A buffer is not stretched past its `dataSize` whatever its capacity:
@@ -1327,13 +1353,13 @@ mod tests {
         let mut a = pool
             .alloc(vec![NDDimension::new(100)], NDDataType::UInt8)
             .unwrap();
-        a.data = NDDataBuffer::zeros(NDDataType::UInt8, 200);
-        a.data.resize(100);
+        *a.buffer_mut(PoolOnly(())) = NDDataBuffer::zeros(NDDataType::UInt8, 200);
+        a.data_mut().resize(100);
         pool.release(a);
         let b = pool
             .alloc(vec![NDDimension::new(150)], NDDataType::UInt8)
             .unwrap();
-        assert_eq!(b.data_size, 150);
+        assert_eq!(b.data_size(), 150);
         assert_eq!(pool.num_alloc_buffers(), 2);
         assert_eq!(pool.allocated_bytes(), 250);
     }
@@ -1416,7 +1442,7 @@ mod tests {
     fn test_convert_type_same_type() {
         let pool = NDArrayPool::new(1_000_000);
         let mut src = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
-        if let NDDataViewMut::U8(v) = src.data.view_mut() {
+        if let NDDataViewMut::U8(v) = src.data_mut().view_mut() {
             v[0] = 10;
             v[1] = 20;
             v[2] = 30;
@@ -1424,8 +1450,8 @@ mod tests {
         }
 
         let out = pool.convert_type(&src, NDDataType::UInt8).unwrap();
-        assert_eq!(out.data.data_type(), NDDataType::UInt8);
-        if let NDDataView::U8(v) = out.data.view() {
+        assert_eq!(out.data().data_type(), NDDataType::UInt8);
+        if let NDDataView::U8(v) = out.data().view() {
             assert_eq!(v, &[10, 20, 30, 40]);
         } else {
             panic!("wrong type");
@@ -1436,15 +1462,15 @@ mod tests {
     fn test_convert_type_u8_to_f32() {
         let pool = NDArrayPool::new(1_000_000);
         let mut src = NDArray::new(vec![NDDimension::new(3)], NDDataType::UInt8);
-        if let NDDataViewMut::U8(v) = src.data.view_mut() {
+        if let NDDataViewMut::U8(v) = src.data_mut().view_mut() {
             v[0] = 0;
             v[1] = 128;
             v[2] = 255;
         }
 
         let out = pool.convert_type(&src, NDDataType::Float32).unwrap();
-        assert_eq!(out.data.data_type(), NDDataType::Float32);
-        if let NDDataView::F32(v) = out.data.view() {
+        assert_eq!(out.data().data_type(), NDDataType::Float32);
+        if let NDDataView::F32(v) = out.data().view() {
             assert_eq!(v[0], 0.0);
             assert_eq!(v[1], 128.0);
             assert_eq!(v[2], 255.0);
@@ -1460,13 +1486,13 @@ mod tests {
     fn test_convert_type_u16_to_u8_wraps_like_a_c_cast() {
         let pool = NDArrayPool::new(1_000_000);
         let mut src = NDArray::new(vec![NDDimension::new(2)], NDDataType::UInt16);
-        if let NDDataViewMut::U16(v) = src.data.view_mut() {
+        if let NDDataViewMut::U16(v) = src.data_mut().view_mut() {
             v[0] = 100;
             v[1] = 300;
         }
 
         let out = pool.convert_type(&src, NDDataType::UInt8).unwrap();
-        if let NDDataView::U8(v) = out.data.view() {
+        if let NDDataView::U8(v) = out.data().view() {
             assert_eq!(v[0], 100);
             assert_eq!(v[1], 44, "300 % 256 == 44, not a clamp to 255");
         } else {
@@ -1482,7 +1508,7 @@ mod tests {
             vec![NDDimension::new(4), NDDimension::new(4)],
             NDDataType::UInt8,
         );
-        if let NDDataViewMut::U8(v) = arr.data.view_mut() {
+        if let NDDataViewMut::U8(v) = arr.data_mut().view_mut() {
             for i in 0..16 {
                 v[i] = i as u8;
             }
@@ -1513,7 +1539,7 @@ mod tests {
         let out = pool.convert(&src, &dims_out, NDDataType::UInt8).unwrap();
         assert_eq!(out.dims[0].size, 4);
         assert_eq!(out.dims[1].size, 4);
-        if let NDDataView::U8(v) = out.data.view() {
+        if let NDDataView::U8(v) = out.data().view() {
             for i in 0..16 {
                 assert_eq!(v[i], i as u8);
             }
@@ -1548,7 +1574,7 @@ mod tests {
         // Source layout (row-major, dim0=x fastest):
         //   row0: [0,1,2,3], row1: [4,5,6,7], row2: [8,9,10,11], row3: [12,13,14,15]
         // offset (1,1) -> src[1+1*4]=5, src[2+1*4]=6, src[1+2*4]=9, src[2+2*4]=10
-        if let NDDataView::U8(v) = out.data.view() {
+        if let NDDataView::U8(v) = out.data().view() {
             assert_eq!(v[0], 5);
             assert_eq!(v[1], 6);
             assert_eq!(v[2], 9);
@@ -1589,7 +1615,7 @@ mod tests {
         // top-right 2x2: sum = 2+3+6+7 = 18
         // bottom-left 2x2: sum = 8+9+12+13 = 42
         // bottom-right 2x2: sum = 10+11+14+15 = 50
-        if let NDDataView::U8(v) = out.data.view() {
+        if let NDDataView::U8(v) = out.data().view() {
             assert_eq!(v[0], 10);
             assert_eq!(v[1], 18);
             assert_eq!(v[2], 42);
@@ -1609,7 +1635,7 @@ mod tests {
         let mut src = NDArray::new(vec![NDDimension::new(2), NDDimension::new(2)], data_type);
         macro_rules! fill {
             ($variant:ident, $t:ty) => {
-                if let NDDataViewMut::$variant(v) = src.data.view_mut() {
+                if let NDDataViewMut::$variant(v) = src.data_mut().view_mut() {
                     for e in v.iter_mut() {
                         *e = val as $t;
                     }
@@ -1660,7 +1686,7 @@ mod tests {
         let out = pool
             .convert(&src, &bin_2x2_to_one(), NDDataType::UInt16)
             .unwrap();
-        match out.data.view() {
+        match out.data().view() {
             NDDataView::U16(v) => assert_eq!(v[0], 800, "C sums in u16: 200*4"),
             ref other => panic!("expected U16, got {:?}", other.data_type()),
         }
@@ -1676,7 +1702,7 @@ mod tests {
         let out = pool
             .convert(&src, &bin_2x2_to_one(), NDDataType::UInt8)
             .unwrap();
-        match out.data.view() {
+        match out.data().view() {
             NDDataView::U8(v) => assert_eq!(v[0], 144, "400 wraps mod 256 in u8"),
             ref other => panic!("expected U8, got {:?}", other.data_type()),
         }
@@ -1694,7 +1720,7 @@ mod tests {
             vec![NDDimension::new(1), NDDimension::new(1)],
             NDDataType::Int64,
         );
-        if let NDDataViewMut::I64(v) = src.data.view_mut() {
+        if let NDDataViewMut::I64(v) = src.data_mut().view_mut() {
             v[0] = value;
         }
         let dims_out = vec![
@@ -1712,7 +1738,7 @@ mod tests {
             },
         ];
         let out = pool.convert(&src, &dims_out, NDDataType::Int64).unwrap();
-        match out.data.view() {
+        match out.data().view() {
             NDDataView::I64(v) => assert_eq!(v[0], value, "2^53+1 kept exactly"),
             ref other => panic!("expected I64, got {:?}", other.data_type()),
         }
@@ -1726,7 +1752,7 @@ mod tests {
             vec![NDDimension::new(4), NDDimension::new(1)],
             NDDataType::UInt8,
         );
-        if let NDDataViewMut::U8(v) = src.data.view_mut() {
+        if let NDDataViewMut::U8(v) = src.data_mut().view_mut() {
             v[0] = 10;
             v[1] = 20;
             v[2] = 30;
@@ -1749,7 +1775,7 @@ mod tests {
         ];
 
         let out = pool.convert(&src, &dims_out, NDDataType::UInt8).unwrap();
-        if let NDDataView::U8(v) = out.data.view() {
+        if let NDDataView::U8(v) = out.data().view() {
             assert_eq!(v[0], 40);
             assert_eq!(v[1], 30);
             assert_eq!(v[2], 20);
@@ -1767,7 +1793,7 @@ mod tests {
             vec![NDDimension::new(2), NDDimension::new(2)],
             NDDataType::UInt16,
         );
-        if let NDDataViewMut::U16(v) = src.data.view_mut() {
+        if let NDDataViewMut::U16(v) = src.data_mut().view_mut() {
             // row0: [1, 2], row1: [3, 4]
             v[0] = 1;
             v[1] = 2;
@@ -1791,7 +1817,7 @@ mod tests {
         ];
 
         let out = pool.convert(&src, &dims_out, NDDataType::UInt16).unwrap();
-        if let NDDataView::U16(v) = out.data.view() {
+        if let NDDataView::U16(v) = out.data().view() {
             // Y reversed: row0 now has row1 data, row1 has row0 data
             assert_eq!(v[0], 3);
             assert_eq!(v[1], 4);
@@ -1823,10 +1849,10 @@ mod tests {
         ];
 
         let out = pool.convert(&src, &dims_out, NDDataType::Float32).unwrap();
-        assert_eq!(out.data.data_type(), NDDataType::Float32);
+        assert_eq!(out.data().data_type(), NDDataType::Float32);
         assert_eq!(out.dims[0].size, 2);
         assert_eq!(out.dims[1].size, 2);
-        if let NDDataView::F32(v) = out.data.view() {
+        if let NDDataView::F32(v) = out.data().view() {
             assert_eq!(v[0], 10.0); // 0+1+4+5
             assert_eq!(v[1], 18.0); // 2+3+6+7
         } else {
@@ -1846,7 +1872,7 @@ mod tests {
         src.dims[0].binning = 2;
         src.dims[1].offset = 20;
         src.dims[1].binning = 3;
-        if let NDDataViewMut::U8(v) = src.data.view_mut() {
+        if let NDDataViewMut::U8(v) = src.data_mut().view_mut() {
             for i in 0..16 {
                 v[i] = i as u8;
             }
@@ -1881,7 +1907,7 @@ mod tests {
         // 1D: 8 elements, offset=2, size=4, binning=2 -> 2 output elements
         let pool = NDArrayPool::new(1_000_000);
         let mut src = NDArray::new(vec![NDDimension::new(8)], NDDataType::UInt16);
-        if let NDDataViewMut::U16(v) = src.data.view_mut() {
+        if let NDDataViewMut::U16(v) = src.data_mut().view_mut() {
             for i in 0..8 {
                 v[i] = (i * 10) as u16;
             }
@@ -1898,7 +1924,7 @@ mod tests {
         let out = pool.convert(&src, &dims_out, NDDataType::UInt16).unwrap();
         assert_eq!(out.dims.len(), 1);
         assert_eq!(out.dims[0].size, 2);
-        if let NDDataView::U16(v) = out.data.view() {
+        if let NDDataView::U16(v) = out.data().view() {
             // offset=2: src[2]=20, src[3]=30 -> sum=50
             // next: src[4]=40, src[5]=50 -> sum=90
             assert_eq!(v[0], 50);
@@ -1920,7 +1946,7 @@ mod tests {
             ],
             NDDataType::UInt8,
         );
-        if let NDDataViewMut::U8(v) = src.data.view_mut() {
+        if let NDDataViewMut::U8(v) = src.data_mut().view_mut() {
             for i in 0..8 {
                 v[i] = (i + 1) as u8;
             }
@@ -1948,7 +1974,7 @@ mod tests {
         ];
 
         let out = pool.convert(&src, &dims_out, NDDataType::UInt8).unwrap();
-        if let NDDataView::U8(v) = out.data.view() {
+        if let NDDataView::U8(v) = out.data().view() {
             for i in 0..8 {
                 assert_eq!(v[i], (i + 1) as u8);
             }
@@ -2026,7 +2052,7 @@ mod tests {
         // 4x1, binning=2, reverse=true
         let pool = NDArrayPool::new(1_000_000);
         let mut src = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt16);
-        if let NDDataViewMut::U16(v) = src.data.view_mut() {
+        if let NDDataViewMut::U16(v) = src.data_mut().view_mut() {
             v[0] = 1;
             v[1] = 2;
             v[2] = 3;
@@ -2042,7 +2068,7 @@ mod tests {
 
         let out = pool.convert(&src, &dims_out, NDDataType::UInt16).unwrap();
         assert_eq!(out.dims[0].size, 2);
-        if let NDDataView::U16(v) = out.data.view() {
+        if let NDDataView::U16(v) = out.data().view() {
             // Without reverse: [1+2, 3+4] = [3, 7]
             // With reverse: output[0] reads from high end, output[1] from low end
             // eff_coords[0] for out_coord=0 with reverse => size-1-0 = 1 -> src[2..3] = 3+4 = 7
@@ -2092,7 +2118,7 @@ mod tests {
             .alloc(vec![NDDimension::new(333)], NDDataType::UInt16)
             .unwrap();
         // 333 * 2 = 666 — exact, no allocator capacity slack.
-        assert_eq!(a.data_size, 666);
+        assert_eq!(a.data_size(), 666);
         assert_eq!(pool.allocated_bytes(), 666);
     }
 
@@ -2133,7 +2159,7 @@ mod tests {
         ];
         let out = pool.convert(&src, &dims_out, NDDataType::UInt8).unwrap();
         assert_eq!(out.pool_id(), pool.id());
-        assert_eq!(out.data_size, 16);
+        assert_eq!(out.data_size(), 16);
         // convert allocated a fresh buffer through the pool.
         assert_eq!(pool.num_alloc_buffers(), before_alloc + 1);
         let bytes_with_out = pool.allocated_bytes();
@@ -2246,13 +2272,13 @@ mod tests {
     fn test_copy_allocates_and_copies() {
         let pool = NDArrayPool::new(1_000_000);
         let mut src = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
-        if let NDDataViewMut::U8(v) = src.data.view_mut() {
+        if let NDDataViewMut::U8(v) = src.data_mut().view_mut() {
             v.copy_from_slice(&[9, 8, 7, 6]);
         }
         let out = pool.copy(&src, None, true, true, true).unwrap();
         assert_eq!(out.pool_id(), pool.id());
         assert_eq!(out.dims.len(), 1);
-        if let NDDataView::U8(v) = out.data.view() {
+        if let NDDataView::U8(v) = out.data().view() {
             assert_eq!(v, &[9, 8, 7, 6]);
         } else {
             panic!("wrong type");
@@ -2336,7 +2362,7 @@ mod tests {
         let arr = pool
             .alloc(vec![NDDimension::new(100)], NDDataType::UInt8)
             .unwrap();
-        let ptr = arr.data.as_u8_slice().as_ptr();
+        let ptr = arr.data().as_u8_slice().as_ptr();
         let shared = Arc::new(arr);
         let other = Arc::clone(&shared);
         drop(shared);
@@ -2349,7 +2375,7 @@ mod tests {
         let again = pool
             .alloc(vec![NDDimension::new(100)], NDDataType::UInt8)
             .unwrap();
-        assert_eq!(again.data.as_u8_slice().as_ptr(), ptr);
+        assert_eq!(again.data().as_u8_slice().as_ptr(), ptr);
         assert_eq!(pool.num_free_buffers(), 0);
         assert_eq!(pool.num_alloc_buffers(), 1);
     }
@@ -2411,26 +2437,26 @@ mod tests {
         let src = make_4x4_u8();
 
         let first = pool.alloc_copy(&src).unwrap();
-        let ptr = first.data.as_u8_slice().as_ptr();
+        let ptr = first.data().as_u8_slice().as_ptr();
         drop(first);
         let copy = pool.alloc_copy(&src).unwrap();
-        assert_eq!(copy.data.as_u8_slice().as_ptr(), ptr);
-        assert_eq!(copy.data.as_u8_slice(), src.data.as_u8_slice());
+        assert_eq!(copy.data().as_u8_slice().as_ptr(), ptr);
+        assert_eq!(copy.data().as_u8_slice(), src.data().as_u8_slice());
         drop(copy);
 
         let converted = pool.convert_type(&src, NDDataType::UInt16).unwrap();
-        let ptr16 = converted.data.as_u8_slice().as_ptr();
+        let ptr16 = converted.data().as_u8_slice().as_ptr();
         assert_eq!(pool.num_alloc_buffers(), 2);
         drop(converted);
         let converted = pool.convert_type(&src, NDDataType::UInt16).unwrap();
-        assert_eq!(converted.data.as_u8_slice().as_ptr(), ptr16);
+        assert_eq!(converted.data().as_u8_slice().as_ptr(), ptr16);
         assert_eq!(pool.num_alloc_buffers(), 2);
         drop(converted);
 
         let dims_out: Vec<NDDimension> = src.dims.clone();
         let binned = pool.convert(&src, &dims_out, NDDataType::UInt8).unwrap();
-        assert_eq!(binned.data.as_u8_slice().as_ptr(), ptr);
-        assert_eq!(binned.data.as_u8_slice(), src.data.as_u8_slice());
+        assert_eq!(binned.data().as_u8_slice().as_ptr(), ptr);
+        assert_eq!(binned.data().as_u8_slice(), src.data().as_u8_slice());
         assert_eq!(pool.num_alloc_buffers(), 2);
     }
 
@@ -2442,7 +2468,7 @@ mod tests {
         let arr = pool
             .alloc_sized(dims.clone(), NDDataType::UInt8, 7)
             .unwrap();
-        assert_eq!(arr.data.as_u8_slice().len(), 7);
+        assert_eq!(arr.data().as_u8_slice().len(), 7);
         assert_eq!(arr.dims.len(), 2);
         assert_eq!(pool.allocated_bytes(), 7);
 

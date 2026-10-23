@@ -65,7 +65,7 @@ const QUEUE: i32 = FRAMES as i32 * 4;
 fn burn(array: &NDArray) -> u64 {
     let mut acc = 0u64;
     for _ in 0..96 {
-        for d in array.data.as_u8_slice() {
+        for d in array.data().as_u8_slice() {
             acc = acc.wrapping_add(*d as u64).rotate_left(1);
         }
     }
@@ -132,7 +132,7 @@ fn frames() -> Vec<PublishedArray> {
         x ^= x << 13;
         x ^= x >> 7;
         x ^= x << 17;
-        seed.data.set_from_f64(i, (x % 4096) as f64);
+        seed.data_mut().set_from_f64(i, (x % 4096) as f64);
     }
     let pool = DriverPool::standalone(0);
     (0..FRAMES as i32)

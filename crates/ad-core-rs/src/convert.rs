@@ -637,7 +637,7 @@ pub fn convert_dims_into(
     }
 
     out.resize(total_out);
-    crate::with_buffer!(&src.data, |v| bin_to_target!(v));
+    crate::with_buffer!(src.data(), |v| bin_to_target!(v));
     Ok(())
 }
 
@@ -710,7 +710,8 @@ mod tests {
                 NDDataType::UInt8,
             )
             .unwrap();
-        let (NDDataView::U8(typed), NDDataView::U8(dims)) = (typed.data.view(), dims.data.view())
+        let (NDDataView::U8(typed), NDDataView::U8(dims)) =
+            (typed.data().view(), dims.data().view())
         else {
             panic!("target type not honoured");
         };

@@ -301,8 +301,9 @@ impl TiffWriter {
         attributes: &NDAttributeList,
         layout: &TiffLayout,
     ) -> ADResult<Vec<u8>> {
-        let raw = array.data.as_u8_slice();
-        let (sample_format, bits_per_sample) = Self::sample_format_and_bits(array.data.data_type());
+        let raw = array.data().as_u8_slice();
+        let (sample_format, bits_per_sample) =
+            Self::sample_format_and_bits(array.data().data_type());
         let bytes_per_sample = usize::from(bits_per_sample) / 8;
 
         let writes = Self::strip_writes(layout, bytes_per_sample);
@@ -612,9 +613,13 @@ fn decode(bytes: &[u8], attributes: NDAttributeList) -> ADResult<NDArray> {
         raw.extend_from_slice(strip);
     }
 
-    let mut array = NDArray::new(dims, data_type);
-    array.data = crate::codec::buffer_from_bytes(&raw, data_type)
+    let data = crate::codec::buffer_from_bytes(&raw, data_type)
         .ok_or_else(|| err("strip data is not a whole number of samples"))?;
+    // `new` keeps `data_size` at the dims' bytes, C's pool alloc in readFile.
+    let mut array = NDArray::new(dims, data_type);
+    let mut buf = array.data_mut();
+    buf.resize(data.len());
+    buf.as_u8_slice_mut().copy_from_slice(data.as_u8_slice());
     array.attributes = attributes;
     TiffWriter::attach_color_mode(&mut array, color_mode);
     Ok(array)
@@ -1498,7 +1503,7 @@ mod tests {
             vec![NDDimension::new(4), NDDimension::new(4)],
             NDDataType::UInt8,
         );
-        if let NDDataViewMut::U8(v) = arr.data.view_mut() {
+        if let NDDataViewMut::U8(v) = arr.data_mut().view_mut() {
             for i in 0..16 {
                 v[i] = i as u8;
             }
@@ -1551,7 +1556,7 @@ mod tests {
             vec![NDDimension::new(4), NDDimension::new(4)],
             NDDataType::UInt8,
         );
-        if let NDDataViewMut::U8(v) = arr.data.view_mut() {
+        if let NDDataViewMut::U8(v) = arr.data_mut().view_mut() {
             for i in 0..16 {
                 v[i] = (i * 10) as u8;
             }
@@ -1564,7 +1569,7 @@ mod tests {
 
         let read_back = writer.read_file().unwrap();
         if let (NDDataView::U8(orig), NDDataView::U8(read)) =
-            (arr.data.view(), read_back.data.view())
+            (arr.data().view(), read_back.data().view())
         {
             assert_eq!(orig, read);
         } else {
@@ -1584,7 +1589,7 @@ mod tests {
             vec![NDDimension::new(4), NDDimension::new(4)],
             NDDataType::UInt16,
         );
-        if let NDDataViewMut::U16(v) = arr.data.view_mut() {
+        if let NDDataViewMut::U16(v) = arr.data_mut().view_mut() {
             for i in 0..16 {
                 v[i] = (i * 1000) as u16;
             }
@@ -1597,7 +1602,7 @@ mod tests {
 
         let read_back = writer.read_file().unwrap();
         if let (NDDataView::U16(orig), NDDataView::U16(read)) =
-            (arr.data.view(), read_back.data.view())
+            (arr.data().view(), read_back.data().view())
         {
             assert_eq!(orig, read);
         } else {
@@ -1618,7 +1623,7 @@ mod tests {
             NDDataType::UInt8,
         );
         arr.unique_id = 77;
-        if let NDDataViewMut::U8(v) = arr.data.view_mut() {
+        if let NDDataViewMut::U8(v) = arr.data_mut().view_mut() {
             for (i, item) in v.iter_mut().enumerate() {
                 *item = i as u8;
             }
@@ -1673,7 +1678,7 @@ mod tests {
         let ad_core_rs::plugin::runtime::Published::Read(read) = &out.publish else {
             panic!("ReadFile publishes its array: {:?}", out.publish);
         };
-        match read.data.view() {
+        match read.data().view() {
             NDDataView::U8(v) => assert_eq!(v.len(), 12),
             other => panic!("unexpected data buffer: {other:?}"),
         }
@@ -1823,7 +1828,7 @@ mod tests {
             NDDataType::Int16,
         );
         TiffWriter::attach_color_mode(&mut arr, NDColorMode::RGB1);
-        if let NDDataViewMut::I16(v) = arr.data.view_mut() {
+        if let NDDataViewMut::I16(v) = arr.data_mut().view_mut() {
             for (i, item) in v.iter_mut().enumerate() {
                 *item = (i as i16) - 6;
             }
@@ -1860,7 +1865,7 @@ mod tests {
             NDDataType::UInt8,
         );
         TiffWriter::attach_color_mode(&mut arr, mode);
-        if let NDDataViewMut::U8(v) = arr.data.view_mut() {
+        if let NDDataViewMut::U8(v) = arr.data_mut().view_mut() {
             for y in 0..h {
                 for x in 0..w {
                     for c in 0..3 {
@@ -1887,7 +1892,7 @@ mod tests {
             vec![NDDimension::new(w), NDDimension::new(h)],
             NDDataType::UInt8,
         );
-        if let NDDataViewMut::U8(v) = arr.data.view_mut() {
+        if let NDDataViewMut::U8(v) = arr.data_mut().view_mut() {
             v.iter_mut().enumerate().for_each(|(i, x)| *x = i as u8);
         }
         arr
@@ -2076,8 +2081,8 @@ mod tests {
             Some(NDColorMode::RGB3 as i64)
         );
         assert_eq!(
-            read_back.data.as_u8_slice(),
-            rgb_array(NDColorMode::RGB3, w, h).data.as_u8_slice(),
+            read_back.data().as_u8_slice(),
+            rgb_array(NDColorMode::RGB3, w, h).data().as_u8_slice(),
             "the RGB2 pixels must come back as the same image in RGB3 layout"
         );
         std::fs::remove_file(&path).ok();
@@ -2100,7 +2105,7 @@ mod tests {
             vec![NDDimension::new(4), NDDimension::new(4)],
             NDDataType::UInt8,
         );
-        if let NDDataViewMut::U8(v) = arr.data.view_mut() {
+        if let NDDataViewMut::U8(v) = arr.data_mut().view_mut() {
             for (i, item) in v.iter_mut().enumerate() {
                 *item = i as u8;
             }

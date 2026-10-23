@@ -21,7 +21,7 @@ use asyn_rs::port::InterfaceMask;
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use ad_core_rs::ndarray::{NDArray, NDDataBuffer};
+use ad_core_rs::ndarray::{NDArray, NDDataMut};
 use ad_core_rs::ndarray_pool::NDArrayPool;
 use ad_core_rs::plugin::runtime::{NDPluginProcess, ProcessResult};
 use parking_lot::Mutex;
@@ -171,7 +171,7 @@ impl BadPixelProcessor {
     #[allow(clippy::too_many_arguments)]
     fn apply_corrections(
         list: &BadPixelList,
-        data: &mut NDDataBuffer,
+        mut data: NDDataMut<'_>,
         width: usize,
         height: usize,
         offset_x: i64,
@@ -352,7 +352,7 @@ impl NDPluginProcess for BadPixelProcessor {
         };
         Self::apply_corrections(
             &list,
-            &mut out.data,
+            out.data_mut(),
             width,
             height,
             offset_x,
@@ -436,7 +436,7 @@ mod tests {
             vec![NDDimension::new(x), NDDimension::new(y)],
             NDDataType::Float64,
         );
-        if let NDDataViewMut::F64(v) = arr.data.view_mut() {
+        if let NDDataViewMut::F64(v) = arr.data_mut().view_mut() {
             for iy in 0..y {
                 for ix in 0..x {
                     v[iy * x + ix] = fill(ix, iy);
@@ -447,7 +447,7 @@ mod tests {
     }
 
     fn get_pixel(arr: &NDArray, x: usize, y: usize, width: usize) -> f64 {
-        arr.data.get_as_f64(y * width + x).unwrap()
+        arr.data().get_as_f64(y * width + x).unwrap()
     }
 
     fn set(x: i64, y: i64, value: f64) -> BadPixel {
@@ -502,7 +502,7 @@ mod tests {
             NDAttrSource::Driver,
             NDAttrValue::Int32(NDColorMode::RGB1 as i32),
         ));
-        if let NDDataViewMut::F64(v) = arr.data.view_mut() {
+        if let NDDataViewMut::F64(v) = arr.data_mut().view_mut() {
             v.iter_mut().for_each(|x| *x = 100.0);
         }
 
@@ -515,9 +515,9 @@ mod tests {
         let result = proc.process_array(&Arc::new(arr), &pool);
         let out = &result.output_arrays[0];
 
-        assert_eq!(out.data.get_as_f64(1), Some(7.0), "corrected element 1");
+        assert_eq!(out.data().get_as_f64(1), Some(7.0), "corrected element 1");
         assert_eq!(
-            out.data.get_as_f64(3),
+            out.data().get_as_f64(3),
             Some(100.0),
             "element 3 must be untouched — that is where the physical-index bug wrote"
         );
@@ -780,7 +780,7 @@ mod tests {
             vec![NDDimension::new(4), NDDimension::new(4)],
             NDDataType::UInt8,
         );
-        if let NDDataViewMut::U8(v) = arr.data.view_mut() {
+        if let NDDataViewMut::U8(v) = arr.data_mut().view_mut() {
             for val in v.iter_mut() {
                 *val = 100;
             }
@@ -817,14 +817,14 @@ mod tests {
         assert_eq!(first.pool_id(), pool.id());
         assert!((get_pixel(&first, 1, 1, 4) - 0.0).abs() < 1e-10);
         assert!((get_pixel(&first, 0, 0, 4) - 100.0).abs() < 1e-10);
-        let NDDataView::F64(v) = first.data.view() else {
+        let NDDataView::F64(v) = first.data().view() else {
             panic!("expected F64 buffer");
         };
         let ptr = v.as_ptr();
         drop(first);
 
         let second = proc.process_array(&arr, &pool).output_arrays.remove(0);
-        let NDDataView::F64(v) = second.data.view() else {
+        let NDDataView::F64(v) = second.data().view() else {
             panic!("expected F64 buffer");
         };
         assert_eq!(v.as_ptr(), ptr, "the second frame reuses the freed buffer");

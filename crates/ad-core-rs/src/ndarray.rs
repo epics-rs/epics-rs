@@ -550,6 +550,37 @@ impl NDArrayInfo {
 /// zero), so a frame published as `Arc<NDArray>` recycles itself once the last
 /// consumer lets go. A [`Clone`] is an ordinary heap array: it owes nothing to
 /// the pool and never enters its free list or its accounting.
+///
+/// Its buffer is written in place and never swapped for another, so a pooled
+/// array stays within what its pool charged:
+///
+/// ```compile_fail,E0616
+/// use ad_core_rs::ndarray::{NDDataBuffer, NDDataType, NDDimension};
+/// use ad_core_rs::ndarray_pool::DriverPool;
+///
+/// let pool = DriverPool::standalone(8);
+/// let mut a = pool.alloc(vec![NDDimension::new(2)], NDDataType::Int32).unwrap();
+/// a.data = NDDataBuffer::zeros(NDDataType::Int32, 4);
+/// ```
+///
+/// ```compile_fail,E0616
+/// use ad_core_rs::ndarray::{NDDataBuffer, NDDataType, NDDimension};
+/// use ad_core_rs::ndarray_pool::{DriverPool, PersistentArray};
+///
+/// let pool = DriverPool::standalone(8);
+/// let array = pool.alloc(vec![NDDimension::new(2)], NDDataType::Int32).unwrap();
+/// let mut flat = PersistentArray::new(array);
+/// flat.refill().data = NDDataBuffer::zeros(NDDataType::Int32, 4);
+/// ```
+///
+/// ```compile_fail,E0616
+/// use ad_core_rs::ndarray::{NDDataType, NDDimension};
+/// use ad_core_rs::ndarray_pool::DriverPool;
+///
+/// let pool = DriverPool::standalone(8);
+/// let mut a = pool.alloc(vec![NDDimension::new(2)], NDDataType::Int32).unwrap();
+/// a.data_size = 16;
+/// ```
 #[derive(Debug)]
 pub struct NDArray {
     pub unique_id: i32,
@@ -557,7 +588,9 @@ pub struct NDArray {
     /// Separate double-precision timestamp (C++ `double timeStamp`), independent of `epicsTS`.
     pub time_stamp: f64,
     pub dims: Vec<NDDimension>,
-    pub data: NDDataBuffer,
+    /// Replaced only by the pool ([`Self::buffer_mut`]); everyone else writes
+    /// it in place through [`Self::data_mut`].
+    data: NDDataBuffer,
     pub attributes: NDAttributeList,
     pub codec: Option<Codec>,
     /// The pool that allocated this array (C++ `pNDArrayPool`), `None` for an
@@ -566,7 +599,50 @@ pub struct NDArray {
     /// Requested byte count at allocation time (C++ `dataSize`). This is the exact
     /// `num_elements * element_size` requested, NOT the allocator-rounded Vec capacity.
     /// Pool memory accounting adds/subtracts this exact value.
-    pub data_size: usize,
+    data_size: usize,
+}
+
+/// [`NDArray::data_mut`]: an array's buffer to write in place, a pooled
+/// array's up to its pool charge. Nothing swaps the buffer for another
+/// through it, which would take the array out of its pool's accounting.
+pub struct NDDataMut<'a>(&'a mut NDDataBuffer);
+
+impl<'a> NDDataMut<'a> {
+    pub fn view_mut(self) -> NDDataViewMut<'a> {
+        self.0.view_mut()
+    }
+
+    pub fn as_mut_slice<T: NDElement>(self) -> Option<&'a mut [T]> {
+        self.0.as_mut_slice()
+    }
+
+    pub fn as_u8_slice_mut(self) -> &'a mut [u8] {
+        self.0.as_u8_slice_mut()
+    }
+
+    pub fn resize(&mut self, new_len: usize) {
+        self.0.resize(new_len);
+    }
+
+    pub fn set_from_f64(&mut self, index: usize, value: f64) {
+        self.0.set_from_f64(index, value);
+    }
+
+    pub fn fill_from_f64(&mut self, values: &[f64]) {
+        self.0.fill_from_f64(values);
+    }
+
+    pub(crate) fn copy_from(&mut self, src: &NDDataBuffer) {
+        self.0.copy_from(src);
+    }
+}
+
+impl std::ops::Deref for NDDataMut<'_> {
+    type Target = NDDataBuffer;
+
+    fn deref(&self) -> &NDDataBuffer {
+        self.0
+    }
 }
 
 /// How an array belongs to its pool.
@@ -671,6 +747,43 @@ impl NDArray {
     /// no pool or that pool is gone (C++ `pNDArrayPool`).
     pub fn pool_id(&self) -> u64 {
         self.pool().map_or(0, |pool| pool.id())
+    }
+
+    pub fn data(&self) -> &NDDataBuffer {
+        &self.data
+    }
+
+    /// The buffer to write in place; a pooled array's grows no further than
+    /// its pool charged for it.
+    pub fn data_mut(&mut self) -> NDDataMut<'_> {
+        NDDataMut(&mut self.data)
+    }
+
+    /// The bytes its pool charged for it (C++ `dataSize`); for an array off
+    /// any pool, what it was built with.
+    pub fn data_size(&self) -> usize {
+        self.data_size
+    }
+
+    /// The buffer itself, for the pool to fill or take back.
+    pub(crate) fn buffer_mut(&mut self, _: PoolOnly) -> &mut NDDataBuffer {
+        &mut self.data
+    }
+
+    /// An array of the pool's, its buffer charged `data_size` bytes.
+    pub(crate) fn pooled(
+        token: PoolOnly,
+        dims: Vec<NDDimension>,
+        data: NDDataBuffer,
+        data_size: usize,
+        unique_id: i32,
+        tie: PoolTie,
+    ) -> Self {
+        let mut array = Self::with_data(dims, data);
+        array.unique_id = unique_id;
+        array.data_size = data_size;
+        array.tie(token, tie);
+        array
     }
 
     /// Tie the array to its pool and charge its buffer what that pool

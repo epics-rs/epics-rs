@@ -129,7 +129,7 @@ fn compute_image(
     let dims = vec![NDDimension::new(width), NDDimension::new(height)];
     pool.owner().replace_array(0, || {
         let mut frame = pool.alloc(dims, NDDataType::Float64).ok()?;
-        let NDDataViewMut::F64(img) = frame.data.view_mut() else {
+        let NDDataViewMut::F64(img) = frame.data_mut().view_mut() else {
             unreachable!("the frame was allocated as Float64")
         };
         img.copy_from_slice(raw);
@@ -394,8 +394,8 @@ mod tests {
             true,
             &mut StdRng::seed_from_u64(3),
         );
-        let NDDataView::F64(got) = frame.data.view() else {
-            panic!("{:?}", frame.data.data_type());
+        let NDDataView::F64(got) = frame.data().view() else {
+            panic!("{:?}", frame.data().data_type());
         };
         for y in 0..height {
             for x in 0..width {
@@ -421,7 +421,7 @@ mod tests {
                 &mut raw,
             )
             .unwrap();
-            frame.data.as_u8_slice().as_ptr()
+            frame.data().as_u8_slice().as_ptr()
         };
         let first = image();
         assert_eq!([image(), image()], [first; 2]);

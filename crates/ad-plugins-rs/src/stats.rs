@@ -1880,7 +1880,7 @@ impl NDPluginProcess for StatsProcessor {
         let cfg = *self.config.lock();
 
         let mut result = if cfg.do_compute_statistics {
-            compute_stats(&array.data, &array.dims, cfg.bgd_width)
+            compute_stats(array.data(), &array.dims, cfg.bgd_width)
         } else {
             StatsResult::default()
         };
@@ -1899,7 +1899,7 @@ impl NDPluginProcess for StatsProcessor {
             _ => array.dims[1].size,
         };
         let projection = if ndims <= 2 && (cfg.do_compute_centroid || cfg.do_compute_profiles) {
-            project(&array.data, size_x, size_y, cfg.centroid_threshold)
+            project(array.data(), size_x, size_y, cfg.centroid_threshold)
         } else {
             None
         };
@@ -1917,7 +1917,7 @@ impl NDPluginProcess for StatsProcessor {
                 // calculation independent, and that C defect is not copied.
                 Some(p) => profiles_from(
                     p,
-                    &array.data,
+                    array.data(),
                     centroid.centroid_x,
                     centroid.centroid_y,
                     cfg.cursor_x,
@@ -1952,7 +1952,7 @@ impl NDPluginProcess for StatsProcessor {
         // Histogram computation
         if cfg.do_compute_histogram {
             let (histogram, below, above, entropy) =
-                compute_histogram(&array.data, cfg.hist_size, cfg.hist_min, cfg.hist_max);
+                compute_histogram(array.data(), cfg.hist_size, cfg.hist_min, cfg.hist_max);
             result.histogram = histogram;
             result.hist_below = below;
             result.hist_above = above;
@@ -1965,7 +1965,7 @@ impl NDPluginProcess for StatsProcessor {
         if cfg.do_compute_profiles && projection.is_some() {
             let cx = cfg.cursor_x.min(size_x - 1);
             let cy = cfg.cursor_y.min(size_y - 1);
-            result.cursor_value = array.data.get_as_f64(cy * size_x + cx).unwrap_or(0.0);
+            result.cursor_value = array.data().get_as_f64(cy * size_x + cx).unwrap_or(0.0);
         }
 
         // C sets each group only under its Compute* flag
@@ -2351,8 +2351,10 @@ mod tests {
         use ad_core_rs::plugin::runtime::NDPluginProcess;
 
         let processor = StatsProcessor::new();
-        let mut arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
-        arr.data = NDDataBuffer::from_vec::<u8>(vec![1, 2, 3, 4]);
+        let mut arr = NDArray::with_data(
+            vec![NDDimension::new(4)],
+            NDDataBuffer::from_vec::<u8>(vec![1, 2, 3, 4]),
+        );
         arr.unique_id = 42;
         arr.timestamp = ad_core_rs::timestamp::EpicsTimestamp {
             sec: 100,
@@ -2366,7 +2368,7 @@ mod tests {
             panic!("one TS point per frame, got {}", r.addressed.len());
         };
         assert_eq!(*addr, 1);
-        let NDDataView::F64(v) = ts.data.view() else {
+        let NDDataView::F64(v) = ts.data().view() else {
             panic!("TS point is Float64");
         };
         assert_eq!(v.len(), 23);
@@ -3159,7 +3161,7 @@ mod tests {
         let pool = NDArrayPool::new(1_000_000);
 
         let mut arr = NDArray::new(vec![NDDimension::new(5)], NDDataType::UInt8);
-        if let NDDataViewMut::U8(v) = arr.data.view_mut() {
+        if let NDDataViewMut::U8(v) = arr.data_mut().view_mut() {
             v[0] = 10;
             v[1] = 20;
             v[2] = 30;
@@ -3209,7 +3211,7 @@ mod tests {
             vec![NDDimension::new(4), NDDimension::new(4)],
             NDDataType::UInt8,
         );
-        if let NDDataViewMut::U8(v) = arr.data.view_mut() {
+        if let NDDataViewMut::U8(v) = arr.data_mut().view_mut() {
             for (i, val) in v.iter_mut().enumerate() {
                 *val = (i % 8) as u8;
             }
@@ -3280,7 +3282,7 @@ mod tests {
             ],
             NDDataType::UInt8,
         );
-        if let NDDataViewMut::U8(v) = arr.data.view_mut() {
+        if let NDDataViewMut::U8(v) = arr.data_mut().view_mut() {
             for (i, val) in v.iter_mut().enumerate() {
                 *val = if i % 4 == 3 { 100 } else { 0 };
             }
@@ -3375,7 +3377,7 @@ mod tests {
         }
         let pool = NDArrayPool::new(1_000_000);
         let mut arr = NDArray::new(vec![NDDimension::new(5)], NDDataType::UInt8);
-        if let NDDataViewMut::U8(v) = arr.data.view_mut() {
+        if let NDDataViewMut::U8(v) = arr.data_mut().view_mut() {
             v.copy_from_slice(&[0, 10, 10, 0, 0]);
         }
 
@@ -3426,7 +3428,7 @@ mod tests {
             vec![NDDimension::new(4), NDDimension::new(4)],
             NDDataType::UInt8,
         );
-        if let NDDataViewMut::U8(v) = arr.data.view_mut() {
+        if let NDDataViewMut::U8(v) = arr.data_mut().view_mut() {
             for (i, val) in v.iter_mut().enumerate() {
                 *val = i as u8;
             }
@@ -3517,7 +3519,7 @@ mod tests {
             vec![NDDimension::new(4), NDDimension::new(4)],
             NDDataType::UInt8,
         );
-        if let NDDataViewMut::U8(v) = arr.data.view_mut() {
+        if let NDDataViewMut::U8(v) = arr.data_mut().view_mut() {
             for (i, val) in v.iter_mut().enumerate() {
                 *val = i as u8;
             }
@@ -3695,7 +3697,7 @@ mod tests {
             vec![NDDimension::new(4), NDDimension::new(2)],
             NDDataType::UInt8,
         );
-        if let NDDataViewMut::U8(v) = arr.data.view_mut() {
+        if let NDDataViewMut::U8(v) = arr.data_mut().view_mut() {
             v.copy_from_slice(&[0, 1, 3, 3, 9, 9, 9, 4]);
         }
 
@@ -3809,7 +3811,7 @@ mod tests {
             vec![NDDimension::new(4), NDDimension::new(4)],
             NDDataType::UInt8,
         );
-        if let NDDataViewMut::U8(v) = arr.data.view_mut() {
+        if let NDDataViewMut::U8(v) = arr.data_mut().view_mut() {
             for (i, val) in v.iter_mut().enumerate() {
                 *val = (i + 1) as u8;
             }

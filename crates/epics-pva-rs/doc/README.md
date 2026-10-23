@@ -21,7 +21,6 @@ usage (running a server, building a client) belongs in the top-level
 | [`06-state-machines.md`](06-state-machines.md) | Channel lifecycle, reconnect, monitor INIT/START/FINISH |
 | [`07-introspection-cache.md`](07-introspection-cache.md) | Per-connection FieldDesc cache, 0xFD/0xFE markers, pvAccessCPP compat |
 | [`08-environment.md`](08-environment.md) | All `EPICS_PVA*` / `EPICS_PVAS*` variables |
-| [`09-pvxs-parity.md`](09-pvxs-parity.md) | API parity matrix vs upstream pvxs |
 | [`functional-review-2026-05-20.md`](functional-review-2026-05-20.md) | Functional-review findings (with resolution status) vs upstream pvxs |
 | [`10-observability.md`](10-observability.md) | tracing events + metrics schema |
 | [`11-gateway.md`](11-gateway.md) | PVA-to-PVA gateway architecture (mirrors `pva2pva/p2pApp`) |
@@ -47,7 +46,7 @@ If you're new to the codebase:
   ([github.com/mdavidsaver/pvxs](https://github.com/mdavidsaver/pvxs));
   "p2pApp" refers to the legacy C++ PVA gateway in `pva2pva/p2pApp`.
 - "channel id" (cid) is client-allocated; "server id" (sid) is server-
-  allocated on `CMD_CREATE_CHANNEL`.
+  allocated on CREATE_CHANNEL (`Command::CreateChannel`).
 - `ioid` (operation id) is per-op (per get / put / monitor), client-
   allocated, scoped to its parent sid.
 

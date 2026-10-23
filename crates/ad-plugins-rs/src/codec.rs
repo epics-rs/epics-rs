@@ -24,7 +24,7 @@ use ad_core_rs::plugin::runtime::{
 
 use flate2::bufread::ZlibDecoder;
 use flate2::{Compress, Compression, FlushCompress, Status};
-use lz4_flex::block::{compress, compress_into, decompress_into, get_maximum_output_size};
+use lz4_flex::block::{compress_into, decompress_into, get_maximum_output_size};
 use parking_lot::Mutex;
 use rust_hdf5::format::messages::filter::{
     FILTER_BLOSC, Filter, FilterPipeline, apply_filters, reverse_filters_masked_into,
@@ -169,6 +169,32 @@ fn lz4_compress_bound(n: usize) -> usize {
     n + n / 255 + 16
 }
 
+/// LZ4 scratch kept across frames. lz4_flex compresses in place only with
+/// room for its own bound, which C's is smaller than, so a frame compresses
+/// aside first; a fresh frame-sized buffer would fault in every page again.
+/// Each frame in flight takes its own, so `NumThreads` workers never wait.
+#[derive(Default)]
+struct Lz4Scratch(Mutex<Vec<Vec<u8>>>);
+
+impl Lz4Scratch {
+    fn with<R>(&self, f: impl FnOnce(&mut Vec<u8>) -> R) -> R {
+        let mut buf = self.0.lock().pop().unwrap_or_default();
+        let r = f(&mut buf);
+        self.0.lock().push(buf);
+        r
+    }
+}
+
+/// LZ4-compress `input` into `scratch`, grown to lz4_flex's bound.
+fn lz4_compress_aside<'a>(input: &[u8], scratch: &'a mut Vec<u8>) -> &'a [u8] {
+    let room = get_maximum_output_size(input.len());
+    if scratch.len() < room {
+        scratch.resize(room, 0);
+    }
+    let n = compress_into(input, scratch).expect("room for lz4_flex's bound");
+    &scratch[..n]
+}
+
 /// [`codec_output_with`] for a `name`-coded input, as C's decoders use
 /// `allocArray(input)`: the input's dims and original element type, which
 /// `decode` fills in place, returning the length of the image it decoded.
@@ -205,12 +231,16 @@ fn decoded_output(
 /// The original data type ordinal is stored as an attribute so decompression can
 /// reconstruct the correct typed buffer.
 pub fn compress_lz4(src: &NDArray) -> Result<NDArray, CodecFailure> {
+    compress_lz4_in(src, &mut Vec::new())
+}
+
+/// [`compress_lz4`] through the processor's [`Lz4Scratch`].
+fn compress_lz4_in(src: &NDArray, scratch: &mut Vec<u8>) -> Result<NDArray, CodecFailure> {
     let raw = src.data().as_u8_slice();
     let original_data_type = src.data().data_type();
     let original_size = raw.len();
-    // C++ uses raw LZ4_compress_default (no size header). lz4_flex compresses
-    // in place only with room for its own bound, which C's is smaller than.
-    let compressed = compress(raw);
+    // C++ uses raw LZ4_compress_default (no size header).
+    let compressed = lz4_compress_aside(raw, scratch);
     let compressed_size = compressed.len();
 
     let codec = Codec {
@@ -236,7 +266,7 @@ pub fn compress_lz4(src: &NDArray) -> Result<NDArray, CodecFailure> {
     compressed_output(
         src,
         lz4_compress_bound(original_size),
-        &compressed,
+        compressed,
         codec,
         "Failed to allocate BZLZ4 output array",
     )
@@ -378,6 +408,15 @@ const LZ4HDF5_DEFAULT_BLOCK_SIZE: usize = 1 << 30;
 /// `LZ4HDF5_BLOCKSIZE`: 0 selects the default and a block larger than the data
 /// shrinks to it, as `lz4hdf5_compressBound` does (lz4hdf5.c:38-47).
 pub fn compress_lz4hdf5(src: &NDArray, block_size: usize) -> Result<NDArray, CodecFailure> {
+    compress_lz4hdf5_in(src, block_size, &mut Vec::new())
+}
+
+/// [`compress_lz4hdf5`] through the processor's [`Lz4Scratch`].
+fn compress_lz4hdf5_in(
+    src: &NDArray,
+    block_size: usize,
+    scratch: &mut Vec<u8>,
+) -> Result<NDArray, CodecFailure> {
     let raw = src.data().as_u8_slice();
     let data_type = src.data().data_type();
     let original_size = raw.len();
@@ -407,7 +446,10 @@ pub fn compress_lz4hdf5(src: &NDArray, block_size: usize) -> Result<NDArray, Cod
         bound,
         codec,
         "Failed to allocate LZ4HDF5 output array",
-        |dst| encode_lz4hdf5_into(raw, block_size, dst).ok_or("Internal LZ4HDF5 error".into()),
+        |dst| {
+            encode_lz4hdf5_into(raw, block_size, dst, scratch)
+                .ok_or("Internal LZ4HDF5 error".into())
+        },
     )?;
 
     let compressed_size = arr.data().len();
@@ -422,7 +464,12 @@ pub fn compress_lz4hdf5(src: &NDArray, block_size: usize) -> Result<NDArray, Cod
 
 /// Write the HDF5 LZ4 container of `raw` into `dst`, returning its length;
 /// `None` when it does not fit.
-fn encode_lz4hdf5_into(raw: &[u8], block_size: usize, dst: &mut [u8]) -> Option<usize> {
+fn encode_lz4hdf5_into(
+    raw: &[u8],
+    block_size: usize,
+    dst: &mut [u8],
+    scratch: &mut Vec<u8>,
+) -> Option<usize> {
     // HDF5 LZ4 header: 8-byte total uncompressed size, 4-byte block size.
     let header = dst.get_mut(..12)?;
     header[..8].copy_from_slice(&(raw.len() as u64).to_be_bytes());
@@ -432,14 +479,13 @@ fn encode_lz4hdf5_into(raw: &[u8], block_size: usize, dst: &mut [u8]) -> Option<
     for block in raw.chunks(block_size) {
         let n = block.len();
         let (frame_len, payload) = dst.get_mut(pos..)?.split_at_mut_checked(4)?;
-        // lz4_flex compresses in place only with room for its own bound; a
-        // block near the end of C's bound compresses aside.
+        // A block near the end of C's bound compresses aside.
         let clen = if payload.len() >= get_maximum_output_size(n) {
             compress_into(block, payload).ok()?
         } else {
-            let comp = compress(block);
+            let comp = lz4_compress_aside(block, scratch);
             if comp.len() < n {
-                payload.get_mut(..comp.len())?.copy_from_slice(&comp);
+                payload.get_mut(..comp.len())?.copy_from_slice(comp);
             }
             comp.len()
         };
@@ -1717,6 +1763,7 @@ struct CodecState {
 pub struct CodecProcessor {
     state: Mutex<CodecState>,
     params: CodecParamIndices,
+    lz4_scratch: Lz4Scratch,
 }
 
 impl CodecProcessor {
@@ -1735,6 +1782,7 @@ impl CodecProcessor {
                 lz4hdf5_block_size: 0,
             }),
             params: CodecParamIndices::default(),
+            lz4_scratch: Lz4Scratch::default(),
         }
     }
 
@@ -1858,16 +1906,20 @@ impl NDPluginProcess for CodecProcessor {
             // errorMessage at each rejection, NDPluginCodec.cpp:140, :166,
             // :201, :235); the caller must not invent one.
             CodecMode::Compress { codec, .. } => match codec {
-                CodecName::LZ4 => CodecOutcome::from(compress_lz4(array)),
+                CodecName::LZ4 => CodecOutcome::from(
+                    self.lz4_scratch
+                        .with(|scratch| compress_lz4_in(array, scratch)),
+                ),
                 CodecName::JPEG => match compress_jpeg(array, jpeg_quality) {
                     Ok(out) => CodecOutcome::Converted(out),
                     Err(e) => CodecOutcome::Failed(e.message()),
                 },
                 CodecName::Zlib => CodecOutcome::from(compress_zlib(array, zlib_clevel)),
                 CodecName::Blosc => CodecOutcome::from(compress_blosc(array, &blosc_config)),
-                CodecName::LZ4HDF5 => {
-                    CodecOutcome::from(compress_lz4hdf5(array, lz4hdf5_block_size))
-                }
+                CodecName::LZ4HDF5 => CodecOutcome::from(
+                    self.lz4_scratch
+                        .with(|scratch| compress_lz4hdf5_in(array, lz4hdf5_block_size, scratch)),
+                ),
                 CodecName::BSLZ4 => CodecOutcome::from(compress_bslz4(array)),
                 // `None` is matched by the first arm above, and
                 // `from_ordinal` never selects an `Other` name.
@@ -2124,6 +2176,7 @@ impl NDPluginProcess for CodecProcessor {
 mod tests {
     use super::*;
     use ad_core_rs::ndarray::{NDDataView, NDDataViewMut};
+    use lz4_flex::block::compress;
 
     #[test]
     fn test_register_params_seeds_the_c_constructor_values() {
@@ -4362,6 +4415,43 @@ mod tests {
             let mut more = c.clone();
             more.dims = vec![NDDimension::new(64), NDDimension::new(128)];
             assert!(decompress_any(&more).is_err(), "too short: {name:?}");
+        }
+    }
+
+    /// Steady LZ4 and LZ4HDF5 frames compress aside in the one scratch the
+    /// processor keeps, so no frame-sized buffer is allocated per frame.
+    #[test]
+    fn steady_lz4_frames_reuse_the_processors_scratch() {
+        let pool = NDArrayPool::new(0);
+        let mut src = pool
+            .alloc(
+                vec![NDDimension::new(512), NDDimension::new(512)],
+                NDDataType::UInt16,
+            )
+            .unwrap();
+        if let NDDataViewMut::U16(v) = src.data_mut().view_mut() {
+            for (i, x) in v.iter_mut().enumerate() {
+                *x = (i % 509) as u16;
+            }
+        }
+        let src = Arc::new(src);
+        for codec in [CodecName::LZ4, CodecName::LZ4HDF5] {
+            let proc = CodecProcessor::new(CodecMode::Compress {
+                codec: codec.clone(),
+                quality: 0,
+            });
+            let scratch = |p: &CodecProcessor| {
+                let held = p.lz4_scratch.0.lock();
+                assert!(held.len() <= 1, "{codec:?}: {} scratches", held.len());
+                held.first().map(|b| (b.as_ptr(), b.capacity()))
+            };
+            drop(proc.process_array(&src, &pool));
+            let first = scratch(&proc);
+            assert!(first.is_some(), "{codec:?}: no scratch kept");
+            for _ in 0..3 {
+                drop(proc.process_array(&src, &pool));
+                assert_eq!(scratch(&proc), first, "{codec:?}");
+            }
         }
     }
 

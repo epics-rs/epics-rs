@@ -22,28 +22,27 @@ Provides the PVs expected by [ophyd](https://github.com/bluesky/ophyd)'s test su
 |----|-------------|
 | `XF:31IDA-BI{Dev:1}E-I` .. `{Dev:6}E-I` | Simulated current sensors |
 
-### Area Detector (MovingDot)
+### Area Detector (SimDetector)
 
-A MovingDot 2D area detector using the ADDriver pattern with standard areaDetector plugins.
+The [`sim-detector`](../sim-detector) driver, configured by
+`simDetectorConfig("SIM", 640, 480, 1, 0, 50000000)`, with ADSimDetector's
+`simDetector.template`, an `image1` NDStdArrays plugin and ADCore's
+`commonPlugins.cmd`.
 
 | PV | Description |
 |----|-------------|
 | `XF:31IDA-BI{Cam:Tbl}:cam1:Acquire` | Start/stop acquisition |
 | `XF:31IDA-BI{Cam:Tbl}:cam1:AcquireTime` | Exposure time (s) |
 | `XF:31IDA-BI{Cam:Tbl}:cam1:ImageMode` | Single / Multiple / Continuous |
-| `XF:31IDA-BI{Cam:Tbl}:image1:ArrayData` | Image data waveform |
+| `XF:31IDA-BI{Cam:Tbl}:image1:ArrayData` | Image data waveform (`FTVL=SHORT`, 307200 elements) |
 
-Plugins are loaded twice — under both `XF:31IDA-BI{Cam:Tbl}:` and `ADSIM:` prefixes for ophyd test compatibility.
+The detector and plugin records load twice, under the `XF:31IDA-BI{Cam:Tbl}:`
+and `ADSIM:` prefixes, for ophyd test compatibility. The second set of
+Configure lines fails as in C, because the ports already exist; only the
+records load under the new prefix.
 
-The MovingDot acquisition task is fully async. A driver author only needs three types from `ad_core_rs::plugin::channel`:
-
-| Type | Purpose |
-|------|---------|
-| `PortHandle` | Read/write parameters via `read_int32().await`, `set_params_and_notify().await` |
-| `ArrayPublisher` | Publish a generated frame to downstream plugins: `publisher.publish(frame).await` |
-| `DriverPool` | Frames plugins receive; their queued count holds ADAcquireBusy under WaitForPlugins |
-
-The acquisition loop runs inside a `current_thread` tokio runtime created by the task thread. All I/O is async and reliable — there are no lossy or blocking APIs in the data path.
+The library also carries a MovingDot driver (`ophyd_test_ioc::sim_detector::create_moving_dot`,
+`db/sim_cam.template`); the binary does not load it.
 
 ## Build and Run
 
@@ -54,6 +53,8 @@ cargo build --release -p ophyd-test-ioc --features ioc
 
 ## Architecture
 
-All records use standard asyn DTYPs (`asynInt32`, `asynFloat64`, etc.) with `@asyn(PORT,ADDR,TIMEOUT)DRVINFO` links, handled by the universal asyn device support factory. No custom device support types are needed.
-
-CP-linked records (MotorXPos, MotorYPos, BeamCurrent) use the 2-stage pattern: a Soft Channel link receiver forwards to the asyn record via `OUT PP`, separating CP link processing from asyn I/O.
+Motors are `motor.template` records (`DTYP asynMotor`) on `simMotorCreate`
+ports. Sensors are Soft Channel `ai` records from `db/sensor.template`.
+Detector and plugin records use the standard asyn DTYPs (`asynInt32`,
+`asynFloat64`, etc.) with `@asyn(PORT,ADDR,TIMEOUT)DRVINFO` links, handled by
+the universal asyn device support factory.

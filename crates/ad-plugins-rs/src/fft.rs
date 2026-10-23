@@ -11,6 +11,7 @@ use parking_lot::Mutex;
 use rustfft::num_complex::Complex;
 use rustfft::{Fft, FftPlanner};
 
+#[cfg(feature = "parallel")]
 use crate::par_util;
 
 /// FFT direction (forward or inverse transform).
@@ -72,12 +73,13 @@ fn pool_output(
     src: &NDArray,
     dims: Vec<NDDimension>,
     values: &[f64],
+    jobs: usize,
 ) -> ADResult<NDArray> {
     let mut arr = pool.alloc(dims, NDDataType::Float64)?;
     let NDDataBuffer::F64(out) = &mut arr.data else {
         unreachable!("the output was allocated as Float64");
     };
-    to_f64_into(out, values, jobs_for(values.len()));
+    to_f64_into(out, values, jobs);
     arr.timestamp = src.timestamp;
     arr.time_stamp = ad_core_rs::timestamp::EpicsTimestamp::now().as_f64();
     arr.attributes = src.attributes.clone();
@@ -124,11 +126,24 @@ impl Plan {
     }
 }
 
-/// The pool jobs a transform over `elements` values may run as: 1, in order
-/// on this thread, unless [`par_util::should_parallelize`] sends it to the
-/// shared pool.
-fn jobs_for(elements: usize) -> usize {
-    if par_util::should_parallelize(elements) {
+/// The fewest complex values a transform pass must cover for the pool to
+/// beat this thread: a pass handed to the pool pays for waking its workers
+/// and for moving the frame between their caches, which a smaller pass
+/// does not repay.
+const POOL_ELEMENTS: usize = 1 << 19;
+
+/// The pool jobs a frame's passes run as: one per pool thread when its
+/// transform passes cover [`POOL_ELEMENTS`], `w*h/2` padded values forward
+/// (rows in pairs, half the columns) and `w*h` inverse, else 1, in order on
+/// this thread. A 1-D frame is one row, one chunk, which leaves the pool
+/// only the conversions around it, and those lose more than they gain.
+fn frame_jobs(dims: &[NDDimension], direction: FFTDirection) -> usize {
+    let values = match (dims, direction) {
+        ([w, h], FFTDirection::Forward) => next_pow2(w.size) * next_pow2(h.size) / 2,
+        ([w, h], FFTDirection::Inverse) => w.size * h.size,
+        _ => 0,
+    };
+    if values >= POOL_ELEMENTS {
         #[cfg(feature = "parallel")]
         return par_util::thread_pool().current_num_threads();
     }
@@ -136,9 +151,10 @@ fn jobs_for(elements: usize) -> usize {
 }
 
 /// `f(state, i, chunk)` for chunk `i` of the `len`-element chunks of `out`:
-/// in order with one `state` when `jobs` is 1, else on the shared pool with
-/// a `state` from `init` per pool job. A chunk's result is the same
-/// whichever job computes it, so the output does not depend on `jobs`.
+/// in order with one `state` when `jobs` or the chunk count is 1, else on
+/// the shared pool, at most one job per chunk, with a `state` from `init`
+/// per pool job. A chunk's result is the same whichever job computes it,
+/// so the output does not depend on `jobs`.
 fn for_each_chunk<T: Send, S>(
     out: &mut [T],
     len: usize,
@@ -146,11 +162,13 @@ fn for_each_chunk<T: Send, S>(
     init: impl Fn() -> S + Sync + Send,
     f: impl Fn(&mut S, usize, &mut [T]) + Sync + Send,
 ) {
-    if jobs > 1 {
+    let chunks = out.len().div_ceil(len);
+    if jobs.min(chunks) > 1 {
         #[cfg(feature = "parallel")]
         return par_util::thread_pool().install(|| {
             use rayon::prelude::*;
             out.par_chunks_mut(len)
+                .with_min_len(chunks.div_ceil(jobs))
                 .enumerate()
                 .for_each_init(&init, |s, (i, c)| f(s, i, c));
         });
@@ -170,7 +188,12 @@ fn resize<T: Copy + Send + Sync>(buf: &mut Vec<T>, n: usize, fill: T, jobs: usiz
         return par_util::thread_pool().install(|| {
             use rayon::prelude::*;
             let more = n - buf.len();
-            buf.par_extend((0..more).into_par_iter().map(|_| fill));
+            buf.par_extend(
+                (0..more)
+                    .into_par_iter()
+                    .with_min_len(more.div_ceil(jobs))
+                    .map(|_| fill),
+            );
         });
     }
     buf.resize(n, fill);
@@ -192,10 +215,8 @@ fn to_f64_into<T: PixelCast + Sync>(out: &mut [f64], v: &[T], jobs: usize) {
     );
 }
 
-/// The samples of `data` as `f64` into `vals`, on the pool for a frame
-/// [`jobs_for`] sends there.
-fn load_f64(data: &NDDataBuffer, vals: &mut Vec<f64>) {
-    let jobs = jobs_for(data.len());
+/// The samples of `data` as `f64` into `vals`, as `jobs` pool jobs.
+fn load_f64(data: &NDDataBuffer, jobs: usize, vals: &mut Vec<f64>) {
     resize(vals, data.len(), 0.0, jobs);
     ad_core_rs::with_buffer!(data, |v| to_f64_into(vals, v, jobs))
 }
@@ -287,9 +308,16 @@ fn fft_columns(
     cols: &mut Vec<Complex<f64>>,
 ) {
     const COLS: usize = 8;
+    const WAVE_ELEMENTS: usize = 1 << 20;
     let h = fft.len();
     let blocks = w.div_ceil(COLS);
-    let wave = jobs.min(blocks);
+    // A wave on the pool pays two hand-offs, so it gathers at least
+    // `WAVE_ELEMENTS` values; on this thread it gathers one block, whose
+    // columns stay in cache.
+    let wave = match jobs {
+        1 => 1,
+        _ => blocks.min(jobs.max(WAVE_ELEMENTS.div_ceil(COLS * h))),
+    };
     // Column `j` of a wave, counted from its first, sits at `j * h`; the
     // gather writes every column the transforms then read.
     resize(cols, wave * COLS * h, Complex::new(0.0, 0.0), jobs);
@@ -336,10 +364,11 @@ fn fft_columns(
 pub fn fft_1d_rows(src: &NDArray, suppress_dc: bool) -> Option<NDArray> {
     let mut planner = FftPlanner::<f64>::new();
     let mut s = Scratch::default();
-    load_f64(&src.data, &mut s.vals);
+    let jobs = frame_jobs(&src.dims, FFTDirection::Forward);
+    load_f64(&src.data, jobs, &mut s.vals);
     let dims = fft_1d_rows_with(
         |n| planner.plan_fft_forward(n),
-        jobs_for,
+        jobs,
         src,
         &s.vals,
         suppress_dc,
@@ -350,12 +379,11 @@ pub fn fft_1d_rows(src: &NDArray, suppress_dc: bool) -> Option<NDArray> {
 
 /// [`fft_1d_rows`] on `vals`, the samples of `src` as `f64`, into
 /// `bufs.out`, returning the spectrum's dims; row 0's bins are left in
-/// `bufs.data`. The forward plan for the padded width comes from `plan`
-/// and the pool jobs for a transform over a given number of values from
-/// `jobs`.
+/// `bufs.data`. The forward plan for the padded width comes from `plan`,
+/// and every pass runs as `jobs` pool jobs.
 fn fft_1d_rows_with(
     plan: impl FnOnce(usize) -> Arc<dyn Fft<f64>>,
-    jobs: fn(usize) -> usize,
+    jobs: usize,
     src: &NDArray,
     vals: &[f64],
     suppress_dc: bool,
@@ -391,9 +419,8 @@ fn fft_1d_rows_with(
     } else {
         vec![NDDimension::new(n_freq)]
     };
-    let row_jobs = jobs(height * padded);
     let magnitudes = &mut bufs.out;
-    resize(magnitudes, n_freq * height, 0.0, row_jobs);
+    resize(magnitudes, n_freq * height, 0.0, jobs);
 
     // The rows are real, so each transform carries two of them; an odd
     // height leaves the last chunk one row. The first chunk keeps row 0's
@@ -408,7 +435,7 @@ fn fft_1d_rows_with(
     for_each_chunk(
         magnitudes,
         2 * n_freq,
-        row_jobs,
+        jobs,
         || {
             let plan = Plan::new(fft.clone());
             (
@@ -455,10 +482,11 @@ fn fft_1d_rows_with(
 pub fn fft_2d(src: &NDArray, suppress_dc: bool) -> Option<NDArray> {
     let mut planner = FftPlanner::<f64>::new();
     let mut s = Scratch::default();
-    load_f64(&src.data, &mut s.vals);
+    let jobs = frame_jobs(&src.dims, FFTDirection::Forward);
+    load_f64(&src.data, jobs, &mut s.vals);
     let dims = fft_2d_with(
         |n| planner.plan_fft_forward(n),
-        jobs_for,
+        jobs,
         src,
         &s.vals,
         suppress_dc,
@@ -472,7 +500,7 @@ pub fn fft_2d(src: &NDArray, suppress_dc: bool) -> Option<NDArray> {
 /// nFreqY rows of `bufs.data` are the spectrum's bins.
 fn fft_2d_with(
     mut plan: impl FnMut(usize) -> Arc<dyn Fft<f64>>,
-    jobs: fn(usize) -> usize,
+    jobs: usize,
     src: &NDArray,
     vals: &[f64],
     suppress_dc: bool,
@@ -511,15 +539,14 @@ fn fft_2d_with(
     // rows zero as the transform of zeros. A reused `data` holds an earlier
     // frame there.
     let zero = Complex::new(0.0, 0.0);
-    let col_jobs = jobs(n_freq_x * h);
     let data = &mut bufs.data;
-    resize(data, n_freq_x * h, zero, col_jobs);
+    resize(data, n_freq_x * h, zero, jobs);
     let (rows_in, padding) = data.split_at_mut(src_h * n_freq_x);
-    for_each_chunk(padding, n_freq_x, col_jobs, || (), |(), _, r| r.fill(zero));
+    for_each_chunk(padding, n_freq_x, jobs, || (), |(), _, r| r.fill(zero));
     for_each_chunk(
         rows_in,
         2 * n_freq_x,
-        jobs(src_h * w),
+        jobs,
         || (Plan::new(rows.clone()), vec![zero; w]),
         |(plan, row_buf), pair, bins| {
             if bins.len() == n_freq_x {
@@ -534,15 +561,15 @@ fn fft_2d_with(
             unpack_pair(row_buf, a, b);
         },
     );
-    fft_columns(&cols, data, n_freq_x, col_jobs, &mut bufs.cols);
+    fft_columns(&cols, data, n_freq_x, jobs, &mut bufs.cols);
 
     let data = &*data;
     let magnitudes = &mut bufs.out;
-    resize(magnitudes, n_freq_x * n_freq_y, 0.0, col_jobs);
+    resize(magnitudes, n_freq_x * n_freq_y, 0.0, jobs);
     for_each_chunk(
         magnitudes,
         n_freq_x,
-        col_jobs,
+        jobs,
         || (),
         |(), fy, mags| {
             magnitudes_into(
@@ -561,11 +588,11 @@ fn fft_2d_with(
 }
 
 /// The inverse transform of each `width`-wide row of `vals`, scaled by
-/// `1/width`, into `bufs.out`, with the inverse plan from `plan` and the
-/// pool jobs as [`fft_1d_rows_with`] takes them.
+/// `1/width`, into `bufs.out`, with the inverse plan from `plan` and every
+/// pass as `jobs` pool jobs.
 fn fft_1d_rows_inverse_with(
     plan: impl FnOnce(usize) -> Arc<dyn Fft<f64>>,
-    jobs: fn(usize) -> usize,
+    jobs: usize,
     src: &NDArray,
     vals: &[f64],
     suppress_dc: bool,
@@ -592,15 +619,14 @@ fn fft_1d_rows_inverse_with(
     // An inverse transform of a real-valued spectrum yields signed real
     // samples: take the real part, not the modulus, so negative samples
     // survive a forward->inverse round trip.
-    let row_jobs = jobs(width * height);
     let samples = &mut bufs.out;
-    resize(samples, width * height, 0.0, row_jobs);
+    resize(samples, width * height, 0.0, jobs);
 
     let zero = Complex::new(0.0, 0.0);
     for_each_chunk(
         samples,
         width,
-        row_jobs,
+        jobs,
         || (Plan::new(fft.clone()), vec![zero; width]),
         |(plan, row_buf), row, out| {
             load_row(row_buf, vals, row, width);
@@ -621,7 +647,7 @@ fn fft_1d_rows_inverse_with(
 /// `1/(w*h)`, into `bufs.out`, as [`fft_1d_rows_inverse_with`] runs.
 fn fft_2d_inverse_with(
     mut plan: impl FnMut(usize) -> Arc<dyn Fft<f64>>,
-    jobs: fn(usize) -> usize,
+    jobs: usize,
     src: &NDArray,
     vals: &[f64],
     suppress_dc: bool,
@@ -645,7 +671,6 @@ fn fft_2d_inverse_with(
     // Every row loads in full, so a reused `data` keeps nothing of an
     // earlier frame.
     let zero = Complex::new(0.0, 0.0);
-    let jobs = jobs(w * h);
     let data = &mut bufs.data;
     resize(data, w * h, zero, jobs);
     for_each_chunk(data, w, jobs, || (), |(), row, r| load_row(r, vals, row, w));
@@ -885,7 +910,8 @@ impl FFTFrame<'_> {
     /// `bufs.out`, returning the output's dims.
     ///
     /// `vals` is the frame's samples as `f64`, converted once per frame and
-    /// shared with [`first_row_waveforms`].
+    /// shared with [`first_row_waveforms`], and every pass runs as `jobs`
+    /// pool jobs.
     ///
     /// The rank is taken from the input array's dimension count, matching C
     /// `NDPluginFFT::processCallbacks` (NDPluginFFT.cpp:298-315): `ndims==1`
@@ -895,43 +921,29 @@ impl FFTFrame<'_> {
         &self,
         src: &NDArray,
         vals: &[f64],
+        jobs: usize,
         bufs: &mut Buffers,
     ) -> Option<Vec<NDDimension>> {
         let suppress_dc = self.config.suppress_dc;
 
         match (src.dims.len(), self.config.direction) {
-            (1, FFTDirection::Forward) => fft_1d_rows_with(
-                |n| self.plan_forward(n),
-                jobs_for,
-                src,
-                vals,
-                suppress_dc,
-                bufs,
-            ),
+            (1, FFTDirection::Forward) => {
+                fft_1d_rows_with(|n| self.plan_forward(n), jobs, src, vals, suppress_dc, bufs)
+            }
             (1, FFTDirection::Inverse) => fft_1d_rows_inverse_with(
                 |n| self.plan_inverse(n),
-                jobs_for,
+                jobs,
                 src,
                 vals,
                 suppress_dc,
                 bufs,
             ),
-            (2, FFTDirection::Forward) => fft_2d_with(
-                |n| self.plan_forward(n),
-                jobs_for,
-                src,
-                vals,
-                suppress_dc,
-                bufs,
-            ),
-            (2, FFTDirection::Inverse) => fft_2d_inverse_with(
-                |n| self.plan_inverse(n),
-                jobs_for,
-                src,
-                vals,
-                suppress_dc,
-                bufs,
-            ),
+            (2, FFTDirection::Forward) => {
+                fft_2d_with(|n| self.plan_forward(n), jobs, src, vals, suppress_dc, bufs)
+            }
+            (2, FFTDirection::Inverse) => {
+                fft_2d_inverse_with(|n| self.plan_inverse(n), jobs, src, vals, suppress_dc, bufs)
+            }
             _ => None,
         }
     }
@@ -1005,8 +1017,9 @@ impl NDPluginProcess for FFTProcessor {
         };
 
         let mut scratch = self.scratch.lock().pop().unwrap_or_default();
-        load_f64(&array.data, &mut scratch.vals);
-        let dims = frame.compute_fft(array, &scratch.vals, &mut scratch.bufs);
+        let jobs = frame_jobs(&array.dims, frame.config.direction);
+        load_f64(&array.data, jobs, &mut scratch.vals);
+        let dims = frame.compute_fft(array, &scratch.vals, jobs, &mut scratch.bufs);
         let mut updates = Vec::new();
         // C `createAxisArrays` posts with the change itself, whatever the frame
         // then computes (NDPluginFFT.cpp:118, :328-331).
@@ -1076,7 +1089,7 @@ impl NDPluginProcess for FFTProcessor {
             // `if (arrayCallbacks)` (NDPluginFFT.cpp:209-220).
             self.array_callbacks
                 .get()
-                .then(|| pool_output(pool, array, dims, mags))
+                .then(|| pool_output(pool, array, dims, mags, jobs))
         });
         self.scratch.lock().push(scratch);
         match output {
@@ -1191,7 +1204,7 @@ mod tests {
 
         let pool = NDArrayPool::new(0);
         let before = ad_core_rs::timestamp::EpicsTimestamp::now().as_f64();
-        let out = pool_output(&pool, &src, src.dims.clone(), &[0.0; 8]).unwrap();
+        let out = pool_output(&pool, &src, src.dims.clone(), &[0.0; 8], 1).unwrap();
 
         assert_eq!(out.timestamp, src.timestamp);
         assert!(out.time_stamp >= before, "timeStamp is the wall clock");
@@ -1260,14 +1273,6 @@ mod tests {
         }
     }
 
-    fn serial(_: usize) -> usize {
-        1
-    }
-
-    fn three(_: usize) -> usize {
-        3
-    }
-
     fn bits(v: &[f64]) -> Vec<u64> {
         v.iter().map(|x| x.to_bits()).collect()
     }
@@ -1309,8 +1314,7 @@ mod tests {
     /// into waves of blocks and the magnitudes into rows; each runs the
     /// serial arithmetic, so the output is the serial one bit for bit, and
     /// the 2-D inverse is the whole-frame pass it replaced. Odd and even
-    /// heights, non-power-of-two widths, and `jobs_for`, which takes the
-    /// 100-wide frames to the whole pool.
+    /// heights and non-power-of-two widths.
     #[test]
     fn pooled_transforms_are_bit_identical_to_serial() {
         let mut planner = FftPlanner::<f64>::new();
@@ -1324,7 +1328,7 @@ mod tests {
                 NDDataBuffer::F64(vals.clone()),
             );
             for suppress_dc in [false, true] {
-                let mut rows_1d = |jobs: fn(usize) -> usize| {
+                let mut rows_1d = |jobs: usize| {
                     let mut bufs = Buffers::default();
                     let dims = fft_1d_rows_with(
                         |n| planner.plan_fft_forward(n),
@@ -1336,10 +1340,9 @@ mod tests {
                     );
                     out_bits(dims, bufs)
                 };
-                let want = rows_1d(serial);
-                assert_eq!(rows_1d(three), want, "1d {w}x{h}");
-                assert_eq!(rows_1d(jobs_for), want, "1d {w}x{h}");
-                let mut inverse_1d = |jobs: fn(usize) -> usize| {
+                let want = rows_1d(1);
+                assert_eq!(rows_1d(3), want, "1d {w}x{h}");
+                let mut inverse_1d = |jobs: usize| {
                     let mut bufs = Buffers::default();
                     let dims = fft_1d_rows_inverse_with(
                         |n| planner.plan_fft_inverse(n),
@@ -1351,13 +1354,12 @@ mod tests {
                     );
                     out_bits(dims, bufs)
                 };
-                let want = inverse_1d(serial);
-                assert_eq!(inverse_1d(three), want, "1d inverse {w}x{h}");
-                assert_eq!(inverse_1d(jobs_for), want, "1d inverse {w}x{h}");
+                let want = inverse_1d(1);
+                assert_eq!(inverse_1d(3), want, "1d inverse {w}x{h}");
                 if h == 1 {
                     continue;
                 }
-                let mut fft_2d = |jobs: fn(usize) -> usize| {
+                let mut fft_2d = |jobs: usize| {
                     let mut bufs = Buffers::default();
                     let dims = fft_2d_with(
                         |n| planner.plan_fft_forward(n),
@@ -1369,10 +1371,9 @@ mod tests {
                     );
                     out_bits(dims, bufs)
                 };
-                let want = fft_2d(serial);
-                assert_eq!(fft_2d(three), want, "2d {w}x{h}");
-                assert_eq!(fft_2d(jobs_for), want, "2d {w}x{h}");
-                let mut inverse_2d = |jobs: fn(usize) -> usize| {
+                let want = fft_2d(1);
+                assert_eq!(fft_2d(3), want, "2d {w}x{h}");
+                let mut inverse_2d = |jobs: usize| {
                     let mut bufs = Buffers::default();
                     let dims = fft_2d_inverse_with(
                         |n| planner.plan_fft_inverse(n),
@@ -1384,9 +1385,8 @@ mod tests {
                     );
                     out_bits(dims, bufs)
                 };
-                let want = inverse_2d(serial);
-                assert_eq!(inverse_2d(three), want, "2d inverse {w}x{h}");
-                assert_eq!(inverse_2d(jobs_for), want, "2d inverse {w}x{h}");
+                let want = inverse_2d(1);
+                assert_eq!(inverse_2d(3), want, "2d inverse {w}x{h}");
                 assert_eq!(
                     want.1,
                     whole_frame_inverse(&mut planner, &vals, (w, h), suppress_dc),
@@ -1396,11 +1396,48 @@ mod tests {
         }
     }
 
-    /// The inverse runs `fft_columns` over the full, unpadded width: a last
-    /// block of 5 columns, alone in a wave of 2 and in a wave of 3 blocks.
+    /// A pass of one chunk stays on the calling thread whatever its jobs:
+    /// the pool could only hand the chunk to one worker and wait for it.
+    #[test]
+    fn a_lone_chunk_runs_on_the_calling_thread() {
+        let caller = std::thread::current().id();
+        for_each_chunk(
+            &mut [0u8; 4],
+            4,
+            8,
+            || (),
+            |(), _, _| assert_eq!(std::thread::current().id(), caller),
+        );
+    }
+
+    /// The pool takes a frame from `POOL_ELEMENTS` values per transform
+    /// pass: half the padded frame forward, the frame inverse, never a 1-D
+    /// frame.
+    #[test]
+    fn frame_jobs_pools_from_the_transform_values() {
+        #[cfg(feature = "parallel")]
+        let pool = par_util::thread_pool().current_num_threads();
+        #[cfg(not(feature = "parallel"))]
+        let pool = 1;
+        let dims = |d: &[usize]| d.iter().map(|&n| NDDimension::new(n)).collect::<Vec<_>>();
+        let (fwd, inv) = (FFTDirection::Forward, FFTDirection::Inverse);
+        assert_eq!(frame_jobs(&dims(&[1 << 24]), fwd), 1);
+        assert_eq!(frame_jobs(&dims(&[1 << 24]), inv), 1);
+        assert_eq!(frame_jobs(&dims(&[1024, 512]), fwd), 1);
+        assert_eq!(frame_jobs(&dims(&[1024, 1024]), fwd), pool);
+        assert_eq!(frame_jobs(&dims(&[1000, 600]), fwd), pool);
+        assert_eq!(frame_jobs(&dims(&[1023, 512]), inv), 1);
+        assert_eq!(frame_jobs(&dims(&[1024, 512]), inv), pool);
+        assert_eq!(frame_jobs(&dims(&[1024, 512, 2]), fwd), 1);
+    }
+
+    /// The inverse runs `fft_columns` over the full, unpadded width: six
+    /// blocks, the last of 5 columns, one per wave on this thread, in waves
+    /// of 4 and 2 (2 jobs, a wave gathering at least `WAVE_ELEMENTS`), of 5
+    /// and 1, and in one wave.
     #[test]
     fn pooled_columns_are_bit_identical_to_serial() {
-        let (w, h) = (21, 6);
+        let (w, h) = (45, 1 << 15);
         let fft = FftPlanner::<f64>::new().plan_fft_inverse(h);
         let data: Vec<Complex<f64>> = (0..w * h)
             .map(|i| Complex::new(((i * 7919) % 251) as f64, ((i * 104729) % 97) as f64))
@@ -1414,7 +1451,8 @@ mod tests {
         };
         let want = columns(1);
         assert_eq!(columns(2), want);
-        assert_eq!(columns(3), want);
+        assert_eq!(columns(5), want);
+        assert_eq!(columns(6), want);
     }
 
     /// The pooled conversion casts each sample as `to_f64_vec` does, over
@@ -1435,7 +1473,7 @@ mod tests {
             let want = bits(&data.to_f64_vec());
             for start in [9, n + 9] {
                 let mut vals = vec![1.0; start];
-                load_f64(&data, &mut vals);
+                load_f64(&data, 3, &mut vals);
                 assert_eq!(bits(&vals), want, "{:?} from {start}", data.data_type());
             }
             let mut out = vec![0.0; n];

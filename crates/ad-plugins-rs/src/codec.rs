@@ -1100,6 +1100,11 @@ fn bslz4_frame_bound(nbyte: usize) -> usize {
     4 + get_maximum_output_size(nbyte)
 }
 
+thread_local! {
+    /// [`compress_bslz4`]'s frame staging, taken for a frame and put back.
+    static BSLZ4_STAGING: std::cell::Cell<Vec<u8>> = const { std::cell::Cell::new(Vec::new()) };
+}
+
 /// LZ4-decode and bit-untranspose one frame's payload (library
 /// `bshuf_decompress_lz4_block`, bitshuffle.c:78) into `dst`, its block.
 fn bshuf_decompress_lz4_block(
@@ -1263,23 +1268,19 @@ pub fn compress_bslz4(src: &NDArray) -> Result<NDArray, CodecFailure> {
     };
 
     // lz4_flex compresses only into room for a frame's bound, so the frames
-    // go to staging from the input's pool, charged and reused, first.
+    // go to staging first: off the pool, as C stages each frame in malloc'd
+    // scratch (bitshuffle.c:42-45), and kept for this thread's next frame.
     let room = blocked.len() / block_bytes * bslz4_frame_bound(block_bytes)
         + match blocked.len() % block_bytes {
             0 => 0,
             n => bslz4_frame_bound(n),
         };
-    let mut staging = src
-        .pool()
-        .unwrap_or_else(|| NDArrayPool::new(0))
-        .alloc_sized(vec![NDDimension::new(room)], NDDataType::UInt8, room)
-        .map_err(|_| CodecFailure::from("Failed to allocate BZLZ4 output array"))?;
-    let runs = bslz4_compress_blocks(
-        blocked,
-        block_bytes,
-        elem_size,
-        staging.data_mut().as_u8_slice_mut(),
-    );
+    let mut staging = BSLZ4_STAGING.take();
+    if staging.len() < room {
+        staging = vec![0; room];
+    }
+    let staged = &mut staging[..room];
+    let runs = bslz4_compress_blocks(blocked, block_bytes, elem_size, staged);
     let compressed_size = runs.iter().map(|&(_, len)| len).sum::<usize>() + leftover.len();
     // C allocates the input's size (NDPluginCodec.cpp:708) and writes past it
     // for a stream that does not shrink; that one is charged its own size.
@@ -1291,10 +1292,12 @@ pub fn compress_bslz4(src: &NDArray) -> Result<NDArray, CodecFailure> {
         "Failed to allocate BZLZ4 output array",
         |dst| {
             let dst = &mut dst[..compressed_size];
-            bslz4_write_runs(staging.data().as_u8_slice(), &runs, leftover, dst);
+            bslz4_write_runs(staged, &runs, leftover, dst);
             Ok(compressed_size)
         },
-    )?;
+    );
+    BSLZ4_STAGING.set(staging);
+    let arr = arr?;
 
     let compressed_size = arr.data().len();
     tracing::debug!(
@@ -2961,12 +2964,13 @@ mod tests {
         }
     }
 
-    /// BSLZ4 stages its frames in an array from the input's pool that holds
-    /// every frame's lz4_flex bound, charged, then gathers them into C's
-    /// allocation; a later frame reuses both: raw elements only, one block in
-    /// one run, and runs on the pool with a partial block, compressible or not.
+    /// BSLZ4 stages its frames off the pool, in the thread's buffer that
+    /// holds every frame's lz4_flex bound, then gathers them into C's
+    /// allocation, the only charge; a later frame reuses both: raw elements
+    /// only, one block in one run, and runs on the pool with a partial block,
+    /// compressible or not.
     #[test]
-    fn bslz4_stages_its_frames_in_a_reused_pool_array() {
+    fn bslz4_stages_its_frames_in_a_reused_thread_buffer() {
         #[cfg(feature = "parallel")]
         let threads = crate::par_util::thread_pool().current_num_threads();
         #[cfg(not(feature = "parallel"))]
@@ -3000,16 +3004,50 @@ mod tests {
             src.data_mut()
                 .as_u8_slice_mut()
                 .copy_from_slice(arr.data().as_u8_slice());
+            let staging = || {
+                let v = BSLZ4_STAGING.take();
+                let held = (v.as_ptr(), v.len());
+                BSLZ4_STAGING.set(v);
+                held
+            };
             let before = pool.allocated_bytes();
             let out = compress_bslz4(&src).unwrap();
             let raw = src.data().as_u8_slice();
             let c_size = raw.len().max(out.data().len());
             let charged = pool.allocated_bytes();
-            assert_eq!((charged - before) as usize, c_size + room);
+            assert_eq!((charged - before) as usize, c_size);
             assert_eq!(out.data().as_u8_slice(), serial_bslz4(raw, 2), "{room}");
+            let staged = staging();
+            assert!(staged.1 >= room, "{room}");
             drop(out);
             drop(compress_bslz4(&src).unwrap());
             assert_eq!(pool.allocated_bytes(), charged, "{room}");
+            assert_eq!(staging(), staged, "{room}");
+        }
+    }
+
+    /// C's pool holds the input and its output, the input's size, while
+    /// BSLZ4 runs, and the output alone after: a pool of exactly those
+    /// compresses, frame after frame.
+    #[test]
+    fn bslz4_fits_a_pool_of_the_input_and_cs_output() {
+        for count in [4096, 300003, 1 << 20, 2048 * 2048] {
+            let bytes = count * 2;
+            let pool = NDArrayPool::new(2 * bytes);
+            let mut src = pool
+                .alloc(vec![NDDimension::new(count)], NDDataType::UInt16)
+                .unwrap();
+            if let NDDataViewMut::U16(v) = src.data_mut().view_mut() {
+                for (i, x) in v.iter_mut().enumerate() {
+                    *x = (i % 1000) as u16;
+                }
+            }
+            for _ in 0..2 {
+                let out = compress_bslz4(&src).unwrap_or_else(|e| panic!("{count}: {e}"));
+                assert!(out.data().len() <= bytes, "{count}");
+                assert_eq!(pool.allocated_bytes() as usize, 2 * bytes, "{count}");
+            }
+            assert_eq!(pool.allocated_bytes() as usize, 2 * bytes, "{count}");
         }
     }
 
@@ -4604,8 +4642,7 @@ mod tests {
             let in_place = 12 + 8 * 4 + 7 * 1024 + get_maximum_output_size(1024);
             assert_eq!(charged, (lz4_bound(n) + 12 + n / 1024 * 4).max(in_place));
             let (charged, len) = charge(u16, &|a| compress_bslz4(a).unwrap());
-            // Its frames' staging, one block, is charged too.
-            assert_eq!(charged, n.max(len) + 4 + get_maximum_output_size(n));
+            assert_eq!(charged, n.max(len));
             assert_eq!(len > n, incompressible);
             let (charged, len) = charge(u16, &|a| {
                 compress_blosc(a, &BloscConfig::default()).unwrap()

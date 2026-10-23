@@ -7,8 +7,9 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread::{self, ThreadId};
 
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 
 /// Types of asyn exceptions (port-state changes).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,6 +60,10 @@ pub struct ExceptionManager {
     /// nothing; an edit copies it only while an announce still holds it.
     callbacks: Mutex<Arc<Vec<CallbackEntry>>>,
     next_id: AtomicU64,
+    /// The threads announcing on this list, once per nested announce: C
+    /// `dpCommon.exceptionActive` (asynManager.c:621, :634).
+    active: Mutex<Vec<ThreadId>>,
+    idle: Condvar,
 }
 
 impl ExceptionManager {
@@ -66,6 +71,8 @@ impl ExceptionManager {
         Self {
             callbacks: Mutex::new(Arc::default()),
             next_id: AtomicU64::new(1),
+            active: Mutex::default(),
+            idle: Condvar::new(),
         }
     }
 
@@ -83,9 +90,23 @@ impl ExceptionManager {
         id
     }
 
-    /// Remove a previously registered callback.
+    /// Remove a previously registered callback. While another thread
+    /// announces on this list it waits for that announcement to end, as C
+    /// `exceptionCallbackRemove` waits out `exceptionActive`
+    /// (asynManager.c:1456-1461); an announcing thread removes at once.
     pub fn remove_callback(&self, id: ExceptionCallbackId) {
+        let me = thread::current().id();
+        let mut active = self.active.lock();
+        while !active.is_empty() && !active.contains(&me) {
+            self.idle.wait(&mut active);
+        }
         Arc::make_mut(&mut self.callbacks.lock()).retain(|e| e.id != id);
+    }
+
+    /// This list is announcing on the current thread until the scope drops.
+    pub(crate) fn announcing(&self) -> Announcing<'_> {
+        self.active.lock().push(thread::current().id());
+        Announcing(self)
     }
 
     /// How many callbacks are registered — C's `exceptionUsers`, the count
@@ -102,9 +123,27 @@ impl ExceptionManager {
     /// [`Self::remove_callback`] (or re-enter `announce`) without deadlocking
     /// on the non-reentrant mutex.
     pub fn announce(&self, event: &ExceptionEvent<'_>) {
+        let _active = self.announcing();
         let snapshot = Arc::clone(&self.callbacks.lock());
         for entry in snapshot.iter() {
             (entry.callback)(event);
+        }
+    }
+}
+
+/// An announcement in progress on an [`ExceptionManager`], from
+/// [`ExceptionManager::announcing`].
+pub(crate) struct Announcing<'a>(&'a ExceptionManager);
+
+impl Drop for Announcing<'_> {
+    fn drop(&mut self) {
+        let me = thread::current().id();
+        let mut active = self.0.active.lock();
+        if let Some(i) = active.iter().position(|t| *t == me) {
+            active.swap_remove(i);
+        }
+        if active.is_empty() {
+            self.0.idle.notify_all();
         }
     }
 }
@@ -183,6 +222,63 @@ mod tests {
         mgr.remove_callback(id);
         mgr.announce(&event);
         assert_eq!(count.load(Ordering::Relaxed), 1); // unchanged
+    }
+
+    /// C `exceptionCallbackRemove` waits out `exceptionActive`
+    /// (asynManager.c:1456-1461): a removal during another thread's
+    /// announcement returns after every callback of it has run.
+    #[test]
+    fn a_removal_waits_for_another_threads_announcement() {
+        let mgr = Arc::new(ExceptionManager::new());
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let entered_tx = parking_lot::Mutex::new(entered_tx);
+        let first = mgr.add_callback(move |_| {
+            let _ = entered_tx.lock().send(());
+        });
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let d = Arc::clone(&done);
+        mgr.add_callback(move |_| {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            d.store(true, Ordering::Release);
+        });
+
+        let m = Arc::clone(&mgr);
+        let announcer = std::thread::spawn(move || {
+            m.announce(&ExceptionEvent {
+                port_name: "p",
+                exception: AsynException::Connect,
+                addr: -1,
+            })
+        });
+        entered_rx.recv().unwrap();
+        mgr.remove_callback(first);
+        assert!(done.load(Ordering::Acquire));
+        announcer.join().unwrap();
+    }
+
+    /// A callback removing one from its own list does not wait for itself.
+    #[test]
+    fn a_callback_removes_from_its_own_list_at_once() {
+        let mgr = Arc::new(ExceptionManager::new());
+        let count = Arc::new(AtomicUsize::new(0));
+        let c = Arc::clone(&count);
+        let victim = mgr.add_callback(move |_| {
+            c.fetch_add(1, Ordering::Relaxed);
+        });
+        let m = Arc::downgrade(&mgr);
+        mgr.add_callback(move |_| {
+            if let Some(m) = m.upgrade() {
+                m.remove_callback(victim);
+            }
+        });
+        let event = ExceptionEvent {
+            port_name: "p",
+            exception: AsynException::Enable,
+            addr: -1,
+        };
+        mgr.announce(&event);
+        mgr.announce(&event);
+        assert_eq!(count.load(Ordering::Relaxed), 1);
     }
 
     #[test]

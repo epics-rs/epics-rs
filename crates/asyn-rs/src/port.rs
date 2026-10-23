@@ -772,7 +772,10 @@ impl ExceptionAnnouncer {
             addr,
         };
         let users = self.users(addr, false);
-        if let Some(users) = users {
+        // The IOC-wide list is part of this `dpCommon`'s announcement, so a
+        // user leaving the port's list waits for it too.
+        let _active = users.as_deref().map(ExceptionManager::announcing);
+        if let Some(users) = &users {
             users.announce(&event);
         }
         let sink = self.shared.sink.lock().clone();
@@ -3946,6 +3949,29 @@ pub(crate) mod tests {
         announcer.announce(AsynException::Connect, -1);
         assert!(waiter2.wait(std::time::Duration::from_secs(1)));
         assert_eq!(announcer.user_count(-1), 0);
+    }
+
+    /// C `waitConnect` returns through `exceptionCallbackRemove`, which waits
+    /// out the announcement (asynManager.c:1456-1461, :3360), so a waiter
+    /// returns only once the IOC-wide list has heard the connect too.
+    #[test]
+    fn a_connect_waiter_returns_after_the_ioc_wide_list_heard_the_connect() {
+        let ioc = Arc::new(ExceptionManager::new());
+        let announcer = ExceptionAnnouncer::new("cwait_sink", false);
+        *announcer.shared.sink.lock() = Some(Arc::clone(&ioc));
+        let heard = Arc::new(AtomicBool::new(false));
+        let h = Arc::clone(&heard);
+        ioc.add_callback(move |_| {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            h.store(true, Ordering::Release);
+        });
+
+        let waiter = crate::runtime::port::ConnectWaiter::arm(&announcer);
+        let port = announcer.clone();
+        let actor = std::thread::spawn(move || port.announce(AsynException::Connect, -1));
+        assert!(waiter.wait(std::time::Duration::from_secs(5)));
+        assert!(heard.load(Ordering::Acquire));
+        actor.join().unwrap();
     }
     use epics_libcom_rs::runtime::interrupt_accept::InterruptGate;
 

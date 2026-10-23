@@ -195,7 +195,10 @@ impl ConnectWaiter {
     }
 
     /// Block until the connect exception arrives or `timeout` elapses.
-    /// `true` = connected.
+    /// `true` = connected. Dropping the callback on the way out waits for the
+    /// rest of that announcement, so every subscriber has heard the connect
+    /// by the time this returns, as C's `exceptionCallbackRemove` after the
+    /// wait (asynManager.c:3360).
     pub fn wait(self, timeout: std::time::Duration) -> bool {
         self.rx.recv_timeout(timeout).is_ok()
     }

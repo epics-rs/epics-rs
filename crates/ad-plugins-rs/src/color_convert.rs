@@ -264,7 +264,9 @@ fn demosaic<T: BayerPixel>(src: &[T], w: usize, h: usize, phase: BayerPhase, out
     let row = |y: usize, out_row: &mut [T]| demosaic_row(src, w, h, phase, y, out_row);
 
     #[cfg(feature = "parallel")]
-    if par_util::should_parallelize(n) && w > 0 {
+    // About 800 ps per pixel serially, u8 and u16 alike; the split measured
+    // faster from 250 us (u8 512x512 0.83-1.70x serial, 608x608 0.76x).
+    if par_util::pool_wins(n, 800, 250, h) && w > 0 {
         par_util::thread_pool().install(|| {
             out.par_chunks_mut(w * 3)
                 .enumerate()

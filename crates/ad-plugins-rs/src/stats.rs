@@ -1016,7 +1016,15 @@ fn stats_of<T: StatsElem + Send + Sync>(
     let n = v.len() as f64;
     let (range, variance);
     #[cfg(feature = "parallel")]
-    if par_util::should_parallelize(v.len()) {
+    // Both passes take 170 ps + 55 ps per element byte serially; the split
+    // measured faster from 600 us (u16 1448x1448 0.85-1.17x serial, f64
+    // 1024x1024 0.81x).
+    if par_util::pool_wins(
+        v.len(),
+        170 + 55 * size_of::<T>(),
+        600,
+        v.len().div_ceil(PAR_CHUNK),
+    ) {
         range = par_util::thread_pool().install(|| {
             v.par_chunks(PAR_CHUNK)
                 .map(T::range)
@@ -1290,7 +1298,15 @@ fn project_of<T: StatsElem + Sync>(
 ) -> Projection {
     let v = &v[..x_size * y_size];
     #[cfg(feature = "parallel")]
-    if par_util::should_parallelize(v.len()) {
+    // About 320 ps per element serially for every type; the split measured
+    // faster from 450 us (u16 1024x1024 0.92-0.98x serial, 1214x1214 0.89x;
+    // u8 1024x1024 1.67x on a loaded box).
+    if par_util::pool_wins(
+        v.len(),
+        320,
+        450,
+        y_size.div_ceil((PAR_CHUNK / x_size).max(1)),
+    ) {
         let band = (PAR_CHUNK / x_size).max(1) * x_size;
         return par_util::thread_pool().install(|| {
             v.par_chunks(band)
@@ -1617,7 +1633,9 @@ fn histogram_of<T: StatsElem + Sync>(
 ) -> HistCounts {
     let map = SlotMap::new::<T>(hist_size, hist_min, hist_max);
     #[cfg(feature = "parallel")]
-    if par_util::should_parallelize(v.len()) {
+    // At least 500 ps per element serially (u16; u8 870, f64 2000); two
+    // chunks of real work already win (u16 362x362 0.97x serial, u8 0.77x).
+    if par_util::pool_wins(v.len(), 500, 60, v.len().div_ceil(PAR_CHUNK)) {
         return par_util::thread_pool().install(|| {
             v.par_chunks(PAR_CHUNK)
                 .fold(

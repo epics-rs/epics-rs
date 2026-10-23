@@ -525,7 +525,14 @@ impl NDPluginProcess for ROIStatProcessor {
                 })
                 .sum();
 
-            if par_util::should_parallelize(total_elements) {
+            // 15 ps + 38 ps per element byte serially; the split measured
+            // faster from 100 us (u16 1024x1024 1.07x serial, 1214x1214 0.59x).
+            if par_util::pool_wins(
+                total_elements,
+                15 + 38 * array.data.data_type().element_size(),
+                100,
+                clamped.iter().flatten().count(),
+            ) {
                 let data = &array.data;
                 par_util::thread_pool().install(|| {
                     rois.par_iter()

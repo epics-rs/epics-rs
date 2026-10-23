@@ -4,6 +4,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Minimum element count to justify rayon overhead.
+#[deprecated(since = "0.32.1", note = "the pool gate is `pool_wins`")]
 pub const PAR_THRESHOLD: usize = 4096;
 
 /// Number of CPU cores reserved for driver threads, tokio runtime, etc.
@@ -12,14 +13,36 @@ pub const PAR_THRESHOLD: usize = 4096;
 const RESERVED_CORES: usize = 2;
 
 /// Returns true if the data size warrants parallel processing.
-///
-/// The whole question, not the size half of it. Without the `parallel` feature
-/// there is no pool to run on, so the answer is no whatever the size — and a
-/// caller that had to pair this with its own `#[cfg]` fallback was carrying
-/// the other half itself. One of them (`process::apply_element_ops`) then left
-/// its element count with no reader at all in a serial build.
+#[deprecated(
+    since = "0.32.1",
+    note = "an element count alone pools passes that lose to serial; use `pool_wins`"
+)]
+#[allow(deprecated)]
 pub fn should_parallelize(num_elements: usize) -> bool {
     cfg!(feature = "parallel") && num_elements >= PAR_THRESHOLD
+}
+
+/// Whether to split a pass over `elements` elements, at `ps_per_element`
+/// picoseconds each serially, in `chunks` chunks across the pool.
+///
+/// C runs these passes serially, so the split must never lose to that: a
+/// lone chunk has nothing to split, and a pass shorter than `min_us`, the
+/// serial time from which the split measured faster at the calling site,
+/// loses to handing its chunks to sleeping workers. Always false without
+/// the `parallel` feature, so a caller needs no `#[cfg]` fallback of its own.
+///
+/// Unit tests split every pass of two or more chunks, so test-sized frames
+/// still reach the pooled paths; the `--no-default-features` run covers the
+/// serial ones.
+pub fn pool_wins(elements: usize, ps_per_element: usize, min_us: usize, chunks: usize) -> bool {
+    cfg!(feature = "parallel")
+        && chunks >= 2
+        && (cfg!(test) || takes_at_least(elements, ps_per_element, min_us))
+}
+
+fn takes_at_least(elements: usize, ps_per_element: usize, min_us: usize) -> bool {
+    (elements as u64).saturating_mul(ps_per_element as u64)
+        >= (min_us as u64).saturating_mul(1_000_000)
 }
 
 /// Shared rayon ThreadPool.
@@ -64,4 +87,25 @@ pub fn thread_pool() -> &'static rayon::ThreadPool {
             .build()
             .expect("failed to create rayon thread pool")
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{pool_wins, takes_at_least};
+
+    #[test]
+    fn pool_wins_takes_two_chunks() {
+        let parallel = cfg!(feature = "parallel");
+        assert_eq!(pool_wins(1, 1, usize::MAX, 2), parallel);
+        assert!(!pool_wins(usize::MAX, 1, 0, 1));
+        assert!(!pool_wins(usize::MAX, 1, 0, 0));
+    }
+
+    #[test]
+    fn takes_at_least_compares_the_serial_time() {
+        // 1_000_000 elements at 100 ps: 100 us serially.
+        assert!(takes_at_least(1_000_000, 100, 100));
+        assert!(!takes_at_least(999_999, 100, 100));
+        assert!(takes_at_least(usize::MAX, usize::MAX, 1 << 40));
+    }
 }

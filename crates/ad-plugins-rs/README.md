@@ -117,7 +117,7 @@ To override the thread count, call `set_num_threads()` before the first array is
 ad_plugins_rs::par_util::set_num_threads(4);
 ```
 
-A minimum element threshold (`PAR_THRESHOLD = 4096`) prevents rayon overhead from dominating on small arrays. Below this threshold, the sequential path is used automatically.
+A pass is split only when it has at least two chunks and its estimated serial time reaches the point from which the split measured faster at that site (`par_util::pool_wins`); below that, the sequential path is used, as C does for every frame.
 
 To disable parallelism entirely:
 

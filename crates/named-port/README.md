@@ -3,15 +3,16 @@
 Test-only. One rule for every test that has to **name** the port its subject
 binds, and a retry for the race that rule exposes.
 
-Never published (`publish = false`); every consumer takes it as a `path`-only
-dev-dependency, which `cargo package` drops from the uploaded manifest.
+Never published (`publish = false`). The published crates that use it take it
+as a `path`-only dev-dependency, which `cargo package` drops from the uploaded
+manifest; the unpublished `c-ca-tools` and `epics-oracle-rs` take it as a
+plain one.
 
 ## Why a test would name a port at all
 
 Most tests do not have to. The process that binds asks the kernel for `0` and
-reports back what it got, so no number was ever guessed — `epics-oracle-rs`'s
-Rust side and the workspace's in-process servers work that way, and they need
-nothing from this crate.
+reports back what it got, so no number was ever guessed — the workspace's
+in-process servers work that way, and they need nothing from this crate.
 
 A few cannot, and they are the callers here: either the property under test
 *is* that a named number is honoured (an st.cmd line, an
@@ -56,8 +57,13 @@ only on evidence that names the port, and each caller names its own:
 
 - the asyn port object is absent after `drvAsynIPServerPortConfigure`, which
   the handler unregisters *only* on a failed bind;
-- `realtime-ca-ioc` prints `cannot start the CA TCP server on port <p>:
-  Address already in use` and exits 1;
+- `softioc-rs` and `realtime-ca-ioc` print C's `cas WARNING: Configured TCP
+  port was unavailable.` when they fall back from a taken TCP port, or name the
+  port and the held-port error when a bind they cannot fall back from fails
+  (`verdict::rs_ioc_port_was_taken`);
+- `qsrv-rs` warns `Server unable to bind port <p>, falling back to …`, or exits
+  with the held-port error for its UDP search port
+  (`verdict::qsrv_rs_port_was_taken`);
 - C `softIoc` prints `cas WARNING: Configured TCP port was unavailable.` and
   then `CAS: No TCP server started` — measured against R7.0.10, where
   `rsrv_init` reaches `cantProceed` and the process *suspends* rather than
@@ -65,10 +71,28 @@ only on evidence that names the port, and each caller names its own:
 
 Anything else the subject does is a failure and must reach the test as one.
 
+## What else is here
+
+- `on_a_named_port_from(pick, attempt)` with `free_tcp_with_udp_successor`,
+  for a PVA server that searches on `port + 1`.
+- `tcp_port_is_held` / `udp_port_is_held`: the kernel's answer, the evidence a
+  closure needs before it returns `None`.
+- `HeldPort`: a number a test holds from first bind to last, for a subject that
+  binds or dials it itself.
+- `verdict`: the console readers for the evidence listed above, and
+  `softioc_verdict` for C `softIoc`.
+- `port_holders` (Linux): the UDP sockets bound to a port and the TCP sockets
+  listening on it, read with one `sock_diag` dump rather than `/proc/net`.
+- `getsockname_einval_shim`: builds an `LD_PRELOAD` shim that fails
+  `getsockname` with `EINVAL` on a listening socket, as RTEMS does, so a host
+  run reaches `verdict::LOCAL_ADDR_FAILED`.
+
 ## Consumers
 
-`epics-ca-rs` (`softioc_spawn_verdict`, `realtime_ca_ioc_boots`), `c-ca-tools`
-and `asyn-rs` (`ip_server_port_accepts`).
+`epics-ca-rs` (`softioc_spawn_verdict`, `realtime_ca_ioc_boots` and the other
+`softioc_*` tests), `epics-pva-rs` (`server_lifecycle` and the pvxs interop
+tests), `epics-bridge-rs` (`qsrv_rs_resolves_a_pva_link`), `c-ca-tools`,
+`asyn-rs` (`ip_server_port_accepts`) and `epics-oracle-rs` (`port_holders`).
 
 ## Testing
 
@@ -76,8 +100,10 @@ and `asyn-rs` (`ip_server_port_accepts`).
 cargo nextest run -p named-port
 ```
 
-Three tests, one per boundary of the search: a win ends it, every attempt gets
-its own candidate, and the cap is reached loudly.
+24 tests: the search's boundaries (a win ends it, every attempt gets its own
+candidate, the cap is reached loudly), what each `HeldPort` hold refuses, each
+verdict against its measured console line, and `port_holders` under socket
+churn.
 
 ## License
 

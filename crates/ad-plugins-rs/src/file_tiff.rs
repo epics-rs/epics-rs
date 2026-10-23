@@ -543,13 +543,14 @@ fn decode(bytes: &[u8], attributes: NDAttributeList, pool: &NDArrayPool) -> ADRe
     let big_endian = match bytes.get(0..2) {
         Some(b"II") => false,
         Some(b"MM") => true,
-        _ => return Err(err("not a classic TIFF")),
+        _ => return Err(err("not a TIFF")),
     };
+    // An offset read from a BigTIFF can be anywhere up to u64::MAX.
     let read_u16 = |off: usize| -> ADResult<u16> {
         bytes
-            .get(off..off + 2)
-            .map(|b| {
-                let b = [b[0], b[1]];
+            .get(off..)
+            .and_then(|b| b.first_chunk())
+            .map(|&b| {
                 if big_endian {
                     u16::from_be_bytes(b)
                 } else {
@@ -560,9 +561,9 @@ fn decode(bytes: &[u8], attributes: NDAttributeList, pool: &NDArrayPool) -> ADRe
     };
     let read_u32 = |off: usize| -> ADResult<u32> {
         bytes
-            .get(off..off + 4)
-            .map(|b| {
-                let b = [b[0], b[1], b[2], b[3]];
+            .get(off..)
+            .and_then(|b| b.first_chunk())
+            .map(|&b| {
                 if big_endian {
                     u32::from_be_bytes(b)
                 } else {
@@ -571,18 +572,48 @@ fn decode(bytes: &[u8], attributes: NDAttributeList, pool: &NDArrayPool) -> ADRe
             })
             .ok_or_else(|| err("truncated"))
     };
+    let read_u64 = |off: usize| -> ADResult<u64> {
+        bytes
+            .get(off..)
+            .and_then(|b| b.first_chunk())
+            .map(|&b| {
+                if big_endian {
+                    u64::from_be_bytes(b)
+                } else {
+                    u64::from_le_bytes(b)
+                }
+            })
+            .ok_or_else(|| err("truncated"))
+    };
 
-    if bytes.len() < 8 || read_u16(2)? != 42 {
-        return Err(err("not a classic TIFF"));
-    }
+    // A BigTIFF widens the IFD offset, the entry count, and each entry's
+    // count and value field to 8 bytes.
+    let big = match read_u16(2)? {
+        42 => false,
+        43 if read_u16(4)? == 8 && read_u16(6)? == 0 => true,
+        _ => return Err(err("not a TIFF version 42, or 43 with 8-byte offsets")),
+    };
+    let field = if big { 8 } else { 4 };
+    let word = |off: usize| -> ADResult<usize> {
+        let v = if big {
+            read_u64(off)?
+        } else {
+            u64::from(read_u32(off)?)
+        };
+        usize::try_from(v).map_err(|_| err("truncated"))
+    };
 
     // The entry of each tag; a repeated tag keeps its first, as
     // TIFFReadDirectory ignores the later ones.
-    let ifd = read_u32(4)? as usize;
-    let entry_count = read_u16(ifd)? as usize;
+    let ifd = word(if big { 8 } else { 4 })?;
+    let (entry_count, first) = if big {
+        (word(ifd)?, ifd + 8)
+    } else {
+        (usize::from(read_u16(ifd)?), ifd + 2)
+    };
     let mut entries: BTreeMap<u16, usize> = BTreeMap::new();
     for i in 0..entry_count {
-        let entry = ifd + 2 + 12 * i;
+        let entry = first + (4 + 2 * field) * i;
         entries.entry(read_u16(entry)?).or_insert(entry);
     }
     // An entry's type, value size and values' bytes, for a type its reader
@@ -595,13 +626,13 @@ fn decode(bytes: &[u8], attributes: NDAttributeList, pool: &NDArrayPool) -> ADRe
             };
             let kind = read_u16(entry + 2)?;
             let size = size(kind).ok_or_else(|| err(&format!("tag {tag} has type {kind}")))?;
-            let len = (read_u32(entry + 4)? as usize)
+            let len = word(entry + 4)?
                 .checked_mul(size)
                 .ok_or_else(|| err("truncated"))?;
-            let at = if len <= 4 {
-                entry + 8
+            let at = if len <= field {
+                entry + 4 + field
             } else {
-                read_u32(entry + 8)? as usize
+                word(entry + 4 + field)?
             };
             let raw = bytes
                 .get(at..)
@@ -2803,7 +2834,9 @@ mod tests {
     /// image whose sample bytes run `(j+1)*7` from offset 8, 16 0xee bytes,
     /// the out-of-line tag values, then the IFD. `types` rewrites a tag's
     /// entry type and `values` its values, `omit` leaves tags out; `lead`
-    /// entries go ahead of the rest and `extra` entries after them.
+    /// entries go ahead of the rest and `extra` entries after them. `big`
+    /// writes a BigTIFF, its data from offset 16, and `big_endian` an "MM"
+    /// file; `patch` then overwrites single bytes.
     #[derive(Clone, Copy)]
     struct TagFile {
         height: u32,
@@ -2817,6 +2850,9 @@ mod tests {
         omit: &'static [u16],
         lead: &'static [(u16, u16, &'static [i64])],
         extra: &'static [(u16, u16, &'static [i64])],
+        big: bool,
+        big_endian: bool,
+        patch: &'static [(usize, u8)],
     }
 
     impl Default for TagFile {
@@ -2833,6 +2869,9 @@ mod tests {
                 omit: &[],
                 lead: &[],
                 extra: &[],
+                big: false,
+                big_endian: false,
+                patch: &[],
             }
         }
     }
@@ -2840,6 +2879,15 @@ mod tests {
     impl TagFile {
         fn file(&self) -> Vec<u8> {
             let width = 4;
+            let (header, field) = if self.big { (16, 8) } else { (8, 4) };
+            let put = |v: u64, size: usize| {
+                if self.big_endian {
+                    v.to_be_bytes()[8 - size..].to_vec()
+                } else {
+                    v.to_le_bytes()[..size].to_vec()
+                }
+            };
+            let word = |v: usize| put(v as u64, field);
             let samples = u32::from(self.samples);
             let bytes = u32::from(self.bits / 8);
             let rows = self.rows.min(self.height).max(1);
@@ -2852,7 +2900,7 @@ mod tests {
             let (mut offsets, mut counts) = (Vec::new(), Vec::new());
             for plane in 0..planes {
                 for first in (0..self.height).step_by(rows as usize) {
-                    offsets.push(8 + data.len() as i64);
+                    offsets.push((header + data.len()) as i64);
                     let start = data.len();
                     for row in first..(first + rows).min(self.height) {
                         for x in 0..row_samples {
@@ -2913,9 +2961,13 @@ mod tests {
                 .chain(tags)
                 .chain(self.extra.iter().map(entry))
                 .collect();
-            let arrays_at = 8 + data.len();
+            let arrays_at = header + data.len();
             let mut arrays = Vec::new();
-            let mut ifd = (tags.len() as u16).to_le_bytes().to_vec();
+            let mut ifd = if self.big {
+                word(tags.len())
+            } else {
+                put(tags.len() as u64, 2)
+            };
             for (tag, kind, values) in tags {
                 let size = match kind {
                     TYPE_BYTE | TYPE_SBYTE | TYPE_ASCII => 1,
@@ -2923,31 +2975,35 @@ mod tests {
                     TYPE_LONG | TYPE_SLONG | TYPE_FLOAT => 4,
                     _ => 8,
                 };
-                let raw: Vec<u8> = values
-                    .iter()
-                    .flat_map(|v| v.to_le_bytes()[..size].to_vec())
-                    .collect();
-                ifd.extend(tag.to_le_bytes());
-                ifd.extend(kind.to_le_bytes());
-                ifd.extend((values.len() as u32).to_le_bytes());
-                if raw.len() <= 4 {
+                let raw: Vec<u8> = values.iter().flat_map(|&v| put(v as u64, size)).collect();
+                ifd.extend(put(tag.into(), 2));
+                ifd.extend(put(kind.into(), 2));
+                ifd.extend(word(values.len()));
+                if raw.len() <= field {
                     ifd.extend(&raw);
-                    ifd.extend(std::iter::repeat_n(0, 4 - raw.len()));
+                    ifd.extend(std::iter::repeat_n(0, field - raw.len()));
                 } else {
-                    ifd.extend(((arrays_at + arrays.len()) as u32).to_le_bytes());
+                    ifd.extend(word(arrays_at + arrays.len()));
                     arrays.extend(raw);
                     if arrays.len() % 2 == 1 {
                         arrays.push(0);
                     }
                 }
             }
-            ifd.extend(0u32.to_le_bytes());
-            let mut file = b"II".to_vec();
-            file.extend(42u16.to_le_bytes());
-            file.extend(((arrays_at + arrays.len()) as u32).to_le_bytes());
+            ifd.extend(word(0));
+            let mut file = if self.big_endian { b"MM" } else { b"II" }.to_vec();
+            if self.big {
+                file.extend([put(43, 2), put(8, 2), put(0, 2)].concat());
+            } else {
+                file.extend(put(42, 2));
+            }
+            file.extend(word(arrays_at + arrays.len()));
             file.extend(data);
             file.extend(arrays);
             file.extend(ifd);
+            for &(at, byte) in self.patch {
+                file[at] = byte;
+            }
             file
         }
     }
@@ -2977,6 +3033,7 @@ mod tests {
         const GRAY16_H4: &str =
             "UInt16 4,4 070e151c232a31383f464d545b626970777e858c939aa1a8afb6bdc4cbd2d9e0";
         const GRAY16: &str = "UInt16 4,3 070e151c232a31383f464d545b626970777e858c939aa1a8";
+        const BE_GRAY16: &str = "UInt16 4,3 0e071c152a233831463f544d625b70697e778c859a93a8a1";
         const RGB1_16: &str = "UInt16 3,4,3 070e151c232a31383f464d545b626970777e858c939aa1a8afb6bdc4cbd2d9e0e7eef5fc030a11181f262d343b424950575e656c737a81888f969da4abb2b9c0c7ced5dce3eaf1f8";
         const RGB1: &str =
             "UInt8 3,4,3 070e151c232a31383f464d545b626970777e858c939aa1a8afb6bdc4cbd2d9e0e7eef5fc";
@@ -2984,6 +3041,7 @@ mod tests {
             "UInt8 4,3,3 071c31465b70859aafc4d9ee0e23384d62778ca1b6cbe0f5152a3f54697e93a8bdd2e7fc";
         const INT16: &str = "Int16 4,3 070e151c232a31383f464d545b626970777e858c939aa1a8";
         const RGB1_I16: &str = "Int16 3,4,3 070e151c232a31383f464d545b626970777e858c939aa1a8afb6bdc4cbd2d9e0e7eef5fc030a11181f262d343b424950575e656c737a81888f969da4abb2b9c0c7ced5dce3eaf1f8";
+        const TYPE_IFD8: u16 = 18;
         let s = TagFile::default();
         let rgb = TagFile { samples: 3, ..s };
         #[rustfmt::skip]
@@ -3125,6 +3183,31 @@ mod tests {
             ("dt_int_rgb", TagFile { bits: 16, rows: 2, extra: &[(TAG_DATA_TYPE, TYPE_SHORT, &[1, 1, 1])], ..rgb }, Some(RGB1_I16)),
             ("dt_first", TagFile { bits: 16, lead: &[(TAG_DATA_TYPE, TYPE_SHORT, &[1])], ..s }, Some(GRAY16)),
             ("tcounts_only", TagFile { omit: &[TAG_STRIP_BYTE_COUNTS], extra: &[(TAG_TILE_BYTE_COUNTS, TYPE_LONG, &[4, 4, 4])], ..s }, Some(GRAY)),
+            ("big_gray", TagFile { big: true, ..s }, Some(GRAY)),
+            ("big_rgb", TagFile { big: true, ..rgb }, Some(RGB1)),
+            ("big_rgb3", TagFile { big: true, separate: true, ..rgb }, Some(RGB3)),
+            ("big_u16", TagFile { big: true, bits: 16, ..s }, Some(GRAY16)),
+            ("big_int16", TagFile { big: true, bits: 16, format: 2, ..s }, Some(INT16)),
+            ("big_rows2", TagFile { big: true, height: 4, rows: 2, ..s }, Some(GRAY_H4)),
+            ("big_offs_short3", TagFile { big: true, types: &[(TAG_STRIP_OFFSETS, TYPE_SHORT)], ..s }, Some(GRAY)),
+            ("big_offs_long8", TagFile { big: true, types: &[(TAG_STRIP_OFFSETS, TYPE_LONG8), (TAG_STRIP_BYTE_COUNTS, TYPE_LONG8)], ..s }, Some(GRAY)),
+            ("big_one_strip_long8", TagFile { big: true, rows: 3, types: &[(TAG_STRIP_OFFSETS, TYPE_LONG8), (TAG_STRIP_BYTE_COUNTS, TYPE_LONG8)], ..s }, Some(GRAY)),
+            ("big_offs_ifd8", TagFile { big: true, types: &[(TAG_STRIP_OFFSETS, TYPE_IFD8)], ..s }, None),
+            ("be_big_gray", TagFile { big: true, big_endian: true, ..s }, Some(GRAY)),
+            ("be_big_u16", TagFile { big: true, big_endian: true, bits: 16, ..s }, Some(BE_GRAY16)),
+            ("be_big_rows2", TagFile { big: true, big_endian: true, height: 4, rows: 2, ..s }, Some(GRAY_H4)),
+            ("be_big_offs_long8", TagFile { big: true, big_endian: true, types: &[(TAG_STRIP_OFFSETS, TYPE_LONG8), (TAG_STRIP_BYTE_COUNTS, TYPE_LONG8)], ..s }, Some(GRAY)),
+            ("be_big_offs_short3", TagFile { big: true, big_endian: true, types: &[(TAG_STRIP_OFFSETS, TYPE_SHORT)], ..s }, Some(GRAY)),
+            ("be_big_ifd_hi", TagFile { big: true, big_endian: true, patch: &[(8, 1)], ..s }, None),
+            ("be_u16", TagFile { big_endian: true, bits: 16, ..s }, Some(BE_GRAY16)),
+            ("big_smin_double", TagFile { big: true, extra: &[(TAG_SMIN_SAMPLE_VALUE, TYPE_DOUBLE, &[0])], ..s }, Some(GRAY)),
+            ("big_version44", TagFile { big: true, patch: &[(2, 44)], ..s }, None),
+            ("big_offsize4", TagFile { big: true, patch: &[(4, 4)], ..s }, None),
+            ("big_unused", TagFile { big: true, patch: &[(6, 1)], ..s }, None),
+            // big_gray's IFD is at 68, its entry n at 76 + 20n.
+            ("big_ifd_hi", TagFile { big: true, patch: &[(12, 1)], ..s }, None),
+            ("big_w_count_hi", TagFile { big: true, patch: &[(84, 1)], ..s }, None),
+            ("big_offs_hi", TagFile { big: true, patch: &[(192, 1)], ..s }, None),
         ];
         let wrong: Vec<_> = cases
             .iter()

@@ -42,7 +42,7 @@ Source ────→ DCM ───────→ HFM ───────→
 | Element | Position | Function |
 |---------|----------|----------|
 | **Undulator** | 0 m | X-ray source. Gap → photon energy |
-| **DCM Si(111)** | 25 m | Energy selection. Bragg angle θ=12° → 9509 eV. Fixed exit offset 15 mm (+z) |
+| **DCM Si(111)** | 25 m | Energy selection. Bragg angle θ=14.31° → 8 keV at startup. Fixed exit offset 15 mm (+z) |
 | **HFM** | 27 m | Horizontal focusing. pitch=3 mrad, positionRoll=π/2 |
 | **VFM** | 30 m | Vertical focusing. pitch=3 mrad, positionRoll=π |
 | **Sample** | 33 m | AreaDetector screen |
@@ -61,8 +61,9 @@ The meridional bending radius R for each mirror is determined by the Coddington 
 - q: mirror → sample distance
 - α: grazing angle
 
-Each mirror focuses in one direction only (meridional), so the sagittal radius r
-is set to ∞ (r_minor = 1e9) to disable sagittal focusing.
+Each mirror focuses in one direction only (meridional): the trace models it as
+a meridionally bent flat (`BentFlatSurface`), so the `rmin` motors do not enter
+the trace.
 
 | Mirror | p | q | α | R (meridional) | Demag (q/p) |
 |--------|---|---|---|----------------|-------------|
@@ -76,11 +77,14 @@ Beam size at sample (demagnification):
 
 ## Motors (25 total)
 
+Defaults are the startup positions `ioc/st.cmd` sets with `dbpf` for 8 keV;
+motors it does not set start at 0.
+
 ### Undulator (3)
 
 | Motor | PV | Default | Unit | Description |
 |-------|----|---------|------|-------------|
-| und_gap | `bl:und:gap` | 15 | mm | Gap → photon energy |
+| und_gap | `bl:und:gap` | 6.1 | mm | Gap → photon energy |
 | und_x | `bl:und:x` | 0 | mm | Horizontal position |
 | und_z | `bl:und:z` | 0 | mm | Vertical position |
 
@@ -88,7 +92,7 @@ Beam size at sample (demagnification):
 
 | Motor | PV | Default | Unit | Description |
 |-------|----|---------|------|-------------|
-| dcm_theta | `bl:dcm:theta` | 12 | deg | Bragg angle → energy selection |
+| dcm_theta | `bl:dcm:theta` | 14.31 | deg | Bragg angle → energy selection |
 | dcm_theta2 | `bl:dcm:theta2` | 0 | arcsec | 2nd crystal fine adjust |
 | dcm_y | `bl:dcm:y` | 15 | mm | Crystal gap (fixed exit offset) |
 | dcm_chi1 | `bl:dcm:chi1` | 0 | mrad | 1st crystal roll |
@@ -105,8 +109,8 @@ Beam size at sample (demagnification):
 | hfm_x | `bl:hfm:x` | 0 | mm | Horizontal translation |
 | hfm_y | `bl:hfm:y` | 0 | mm | Vertical translation |
 | hfm_z | `bl:hfm:z` | 0 | mm | Longitudinal translation |
-| hfm_rmaj | `bl:hfm:rmaj` | 5e6 | mm | Meridional bending radius |
-| hfm_rmin | `bl:hfm:rmin` | 50 | mm | Sagittal radius |
+| hfm_rmaj | `bl:hfm:rmaj` | 3272727 | mm | Meridional bending radius |
+| hfm_rmin | `bl:hfm:rmin` | 0 | mm | Sagittal radius |
 
 ### VFM (8)
 
@@ -118,8 +122,8 @@ Beam size at sample (demagnification):
 | vfm_x | `bl:vfm:x` | 0 | mm | Horizontal translation |
 | vfm_y | `bl:vfm:y` | 0 | mm | Vertical translation |
 | vfm_z | `bl:vfm:z` | 0 | mm | Longitudinal translation |
-| vfm_rmaj | `bl:vfm:rmaj` | 5e6 | mm | Meridional bending radius |
-| vfm_rmin | `bl:vfm:rmin` | 50 | mm | Sagittal radius |
+| vfm_rmaj | `bl:vfm:rmaj` | 1818182 | mm | Meridional bending radius |
+| vfm_rmin | `bl:vfm:rmin` | 0 | mm | Sagittal radius |
 
 ## Simulation Readback PVs
 
@@ -137,15 +141,15 @@ Beam size at sample (demagnification):
 
 ## Detector Acquisition Task API
 
-The XRT detector's acquisition task is fully async. A driver author only needs three types from `ad_core_rs::plugin::channel`:
+The XRT detector's acquisition task is fully async. A driver author only needs three types:
 
 | Type | Purpose |
 |------|---------|
-| `PortHandle` | Read/write parameters via `read_int32().await`, `set_params_and_notify().await` |
-| `ArrayPublisher` | Publish a generated frame to downstream plugins: `publisher.publish(frame).await` |
-| `DriverPool` | Frames plugins receive; their queued count holds ADAcquireBusy under WaitForPlugins |
+| `asyn_rs::port_handle::PortHandle` | Read/write parameters via `read_int32().await`, `set_params_and_notify().await` |
+| `ad_core_rs::plugin::channel::ArrayPublisher` | Publish a generated frame to downstream plugins: `publisher.publish(frame).await` |
+| `ad_core_rs::ndarray_pool::DriverPool` | Frames plugins receive; their queued count holds ADAcquireBusy under WaitForPlugins |
 
-The acquisition loop runs inside a `current_thread` tokio runtime created by the task thread. All I/O is async and reliable — there are no lossy or blocking APIs in the data path.
+The acquisition loop runs inside a `current_thread` tokio runtime created by the task thread (`ad_core_rs::runtime::run_thread_named`). All I/O is async and reliable — there are no lossy or blocking APIs in the data path.
 
 ## Build & Run
 

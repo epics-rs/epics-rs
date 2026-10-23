@@ -23,6 +23,7 @@ const TAG_IMAGE_LENGTH: u16 = 257;
 const TAG_BITS_PER_SAMPLE: u16 = 258;
 const TAG_COMPRESSION: u16 = 259;
 const TAG_PHOTOMETRIC: u16 = 262;
+const TAG_FILL_ORDER: u16 = 266;
 const TAG_IMAGE_DESCRIPTION: u16 = 270;
 const TAG_MAKE: u16 = 271;
 const TAG_MODEL: u16 = 272;
@@ -918,6 +919,10 @@ fn decode(bytes: &[u8], attributes: NDAttributeList, pool: &NDArrayPool) -> ADRe
         counts => counts,
     };
     let estimate = (scanline * (height / strips_per_plane)) as u64;
+    // TIFFFillStrip reverses the bits of each raw strip byte where FillOrder
+    // is LSB2MSB (tif_read.c:619-621). A FillOrder that does not read or set
+    // leaves MSB2LSB: TIFFReadDirectory ignores that failure (:3804).
+    let reverse_bits = one(TAG_FILL_ORDER, short).ok().flatten() == Some(2);
     let mut total = 0;
     for strip in 0..num_strips {
         // TIFFReadEncodedStrip: the strip's rows from the geometry, capped at
@@ -935,7 +940,11 @@ fn decode(bytes: &[u8], attributes: NDAttributeList, pool: &NDArrayPool) -> ADRe
             )));
         }
         let start = offset as usize;
-        image[total..total + len].copy_from_slice(&bytes[start..start + len]);
+        let strip_bytes = &mut image[total..total + len];
+        strip_bytes.copy_from_slice(&bytes[start..start + len]);
+        if reverse_bits {
+            strip_bytes.iter_mut().for_each(|b| *b = b.reverse_bits());
+        }
         total += len;
     }
     if big_endian != cfg!(target_endian = "big") {
@@ -3057,6 +3066,13 @@ mod tests {
             "UInt16 4,4 070e151c232a31383f464d545b626970777e858c939aa1a8afb6bdc4cbd2d9e0";
         const GRAY16: &str = "UInt16 4,3 070e151c232a31383f464d545b626970777e858c939aa1a8";
         const BE_GRAY16: &str = "UInt16 4,3 0e071c152a233831463f544d625b70697e778c859a93a8a1";
+        // FillOrder 2: each byte of GRAY, GRAY16, BE_GRAY16 and RGB3
+        // bit-reversed.
+        const LSB_GRAY: &str = "UInt8 4,3 e070a838c4548c1cfc62b22a";
+        const LSB_GRAY16: &str = "UInt16 4,3 e070a838c4548c1cfc62b22ada46960eee7ea131c9598515";
+        const LSB_BE_GRAY16: &str = "UInt16 4,3 70e038a854c41c8c62fc2ab246da0e967eee31a159c91585";
+        const LSB_RGB3: &str =
+            "UInt8 4,3,3 e0388c62da0ea159f5239b7770c41cb246ee31856dd307afa854fc2a967ec915bd4be73f";
         const RGB1_16: &str = "UInt16 3,4,3 070e151c232a31383f464d545b626970777e858c939aa1a8afb6bdc4cbd2d9e0e7eef5fc030a11181f262d343b424950575e656c737a81888f969da4abb2b9c0c7ced5dce3eaf1f8";
         const RGB1: &str =
             "UInt8 3,4,3 070e151c232a31383f464d545b626970777e858c939aa1a8afb6bdc4cbd2d9e0e7eef5fc";
@@ -3232,6 +3248,19 @@ mod tests {
             ("be_big_offs_short3", TagFile { big: true, big_endian: true, types: &[(TAG_STRIP_OFFSETS, TYPE_SHORT)], ..s }, Some(GRAY)),
             ("be_big_ifd_hi", TagFile { big: true, big_endian: true, patch: &[(8, 1)], ..s }, None),
             ("be_u16", TagFile { big_endian: true, bits: 16, ..s }, Some(BE_GRAY16)),
+            ("fill_lsb", TagFile { extra: &[(TAG_FILL_ORDER, TYPE_SHORT, &[2])], ..s }, Some(LSB_GRAY)),
+            ("fill_lsb_u16", TagFile { bits: 16, extra: &[(TAG_FILL_ORDER, TYPE_SHORT, &[2])], ..s }, Some(LSB_GRAY16)),
+            ("be_fill_lsb_u16", TagFile { big_endian: true, bits: 16, extra: &[(TAG_FILL_ORDER, TYPE_SHORT, &[2])], ..s }, Some(LSB_BE_GRAY16)),
+            ("big_fill_lsb", TagFile { big: true, extra: &[(TAG_FILL_ORDER, TYPE_SHORT, &[2])], ..s }, Some(LSB_GRAY)),
+            ("fill_lsb_rgb3", TagFile { separate: true, extra: &[(TAG_FILL_ORDER, TYPE_SHORT, &[2])], ..rgb }, Some(LSB_RGB3)),
+            ("fill_lsb_byte", TagFile { extra: &[(TAG_FILL_ORDER, TYPE_BYTE, &[2])], ..s }, Some(LSB_GRAY)),
+            ("fill_lsb_long8", TagFile { extra: &[(TAG_FILL_ORDER, TYPE_LONG8, &[2])], ..s }, Some(LSB_GRAY)),
+            ("fill_msb", TagFile { extra: &[(TAG_FILL_ORDER, TYPE_SHORT, &[1])], ..s }, Some(GRAY)),
+            ("fill_3", TagFile { extra: &[(TAG_FILL_ORDER, TYPE_SHORT, &[3])], ..s }, Some(GRAY)),
+            ("fill_two", TagFile { extra: &[(TAG_FILL_ORDER, TYPE_SHORT, &[2, 2])], ..s }, Some(GRAY)),
+            ("fill_ascii", TagFile { extra: &[(TAG_FILL_ORDER, TYPE_ASCII, &[2])], ..s }, Some(GRAY)),
+            ("fill_negative", TagFile { extra: &[(TAG_FILL_ORDER, TYPE_SSHORT, &[-2])], ..s }, Some(GRAY)),
+            ("fill_over_short", TagFile { extra: &[(TAG_FILL_ORDER, TYPE_LONG, &[65538])], ..s }, Some(GRAY)),
             ("big_smin_double", TagFile { big: true, extra: &[(TAG_SMIN_SAMPLE_VALUE, TYPE_DOUBLE, &[0])], ..s }, Some(GRAY)),
             ("big_version44", TagFile { big: true, patch: &[(2, 44)], ..s }, None),
             ("big_offsize4", TagFile { big: true, patch: &[(4, 4)], ..s }, None),

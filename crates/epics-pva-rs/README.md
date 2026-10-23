@@ -60,7 +60,6 @@ epics-pva-rs/src/
 ├── pv_request.rs       # pvRequest builders (field-selection structs)
 ├── client.rs           # thin re-export of client_native (PvaClient)
 ├── client_native/      # native pvAccess client runtime
-│   ├── decode.rs       #   frame parsing
 │   ├── server_conn.rs  #   persistent TCP virtual circuit
 │   ├── search.rs       #   UDP search broadcast / reply
 │   ├── search_engine.rs#   beacon-driven discovery
@@ -73,7 +72,8 @@ epics-pva-rs/src/
 │   ├── pva_server.rs   #   PvaServer / PvaServerBuilder wrapper
 │   └── native_source.rs#   PvDatabaseSource (PvDatabase -> ChannelSource)
 ├── server_native/      # native pvAccess server runtime
-│   ├── runtime.rs      #   PvaServer, PvaServerConfig, run_pva_server
+│   ├── runtime.rs      #   PvaServer, run_pva_server
+│   ├── config.rs       #   PvaServerConfig
 │   ├── tcp.rs / udp.rs #   TCP virtual circuits / UDP search responder
 │   ├── source.rs       #   ChannelSource trait
 │   ├── composite.rs    #   CompositeSource (multi-source fan-in)
@@ -218,11 +218,13 @@ pvlist-rs -w 5
 
 ```rust
 use epics_pva_rs::client::PvaClient;
+use epics_pva_rs::pvdata::PvField;
 
 let client = PvaClient::new()?;
-let pv = client.get("MY:PV").await?;
-if let Some(val) = pv.get_value() {
-    println!("{val}");
+if let PvField::Structure(s) = client.pvget("MY:PV").await? {
+    if let Some(val) = s.get_value() {
+        println!("{val}");
+    }
 }
 ```
 
@@ -250,11 +252,12 @@ A PVA server is built from a `PvDatabase` via `PvaServerBuilder` and run with
 `PvaServer::run`, or with a custom `ChannelSource` via `run_with_source`:
 
 ```rust
+use epics_base_rs::types::EpicsValue;
 use epics_pva_rs::server::PvaServer;
 
 let server = PvaServer::builder()
     .port(5075)
-    .pv("MY:PV", EpicsValue::from(0.0))
+    .pv("MY:PV", EpicsValue::Double(0.0))
     .build()        // async, returns CaResult<PvaServer>
     .await?;
 server.run().await?;
@@ -273,7 +276,8 @@ cargo test -p epics-pva-rs
 ## Dependencies
 
 - epics-base-rs — `EpicsValue`, `PvDatabase`, and the `runtime`/`net` layer
-  (the tokio dependency is that crate's, not this one's)
+- tokio — the full runtime on a host; RTEMS and VxWorks drop `net`,
+  `signal` and `process`
 - epics-macros-rs — `#[pva_service]`, `#[derive(NTScalar)]`, `#[derive(NTTable)]`
 - bytes — refcounted byte buffers for zero-copy monitor fan-out
 - chrono, thiserror, parking_lot, dashmap, futures-util, tokio-util
@@ -283,7 +287,7 @@ cargo test -p epics-pva-rs
 
 ## Requirements
 
-- Rust 1.94.0 (`rust-toolchain.toml`), edition 2024
+- Rust 1.99.1 (`rust-toolchain.toml`), edition 2024
 
 ## License
 

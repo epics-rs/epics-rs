@@ -280,8 +280,13 @@ fn to_f64_into<T: PixelCast + Sync>(out: &mut [f64], v: &[T], jobs: usize) {
     });
 }
 
-/// The samples of `data` as `f64` into `vals`, as `jobs` pool jobs.
+/// The samples of `data` as `f64` into `vals`, as `jobs` pool jobs. One
+/// job converts through `copy_to_f64`'s SIMD kernels, which cast each
+/// sample as [`to_f64_into`] does in a quarter of its instructions (u16).
 fn load_f64(data: &NDDataBuffer, jobs: usize, vals: &mut Vec<f64>) {
+    if jobs == 1 {
+        return data.copy_to_f64(vals);
+    }
     resize(vals, data.len(), 0.0, jobs);
     ad_core_rs::with_buffer!(data, |v| to_f64_into(vals, v, jobs))
 }
@@ -1502,11 +1507,11 @@ mod tests {
         assert_eq!(columns(6), want);
     }
 
-    /// The pooled conversion casts each sample as `to_f64_vec` does, over
-    /// several chunks and a short last one, into a reused buffer shorter and
-    /// longer than the frame.
+    /// The conversion casts each sample as `to_f64_vec` does, on one job
+    /// and pooled over several chunks and a short last one, into a reused
+    /// buffer shorter and longer than the frame.
     #[test]
-    fn pooled_conversion_matches_to_f64_vec() {
+    fn conversion_matches_to_f64_vec() {
         let n = 3 * (1 << 16) + 5;
         let ints = (0..n as i64).map(|i| (i * 7919) % 70001 - 35000);
         for data in [
@@ -1518,10 +1523,15 @@ mod tests {
             NDDataBuffer::F64(ints.clone().map(|i| i as f64 / 7.0).collect()),
         ] {
             let want = bits(&data.to_f64_vec());
-            for start in [9, n + 9] {
+            for (jobs, start) in [(1, 9), (1, n + 9), (3, 9), (3, n + 9)] {
                 let mut vals = vec![1.0; start];
-                load_f64(&data, 3, &mut vals);
-                assert_eq!(bits(&vals), want, "{:?} from {start}", data.data_type());
+                load_f64(&data, jobs, &mut vals);
+                assert_eq!(
+                    bits(&vals),
+                    want,
+                    "{:?} from {start} in {jobs} jobs",
+                    data.data_type()
+                );
             }
             let mut out = vec![0.0; n];
             ad_core_rs::with_buffer!(&data, |v| to_f64_into(&mut out, v, 3));

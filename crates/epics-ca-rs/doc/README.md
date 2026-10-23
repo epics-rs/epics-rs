@@ -26,7 +26,6 @@ the crate or trying to understand a runtime issue. End-user usage
 | [`11-tls-design.md`](11-tls-design.md) | CA over TLS (encryption + mTLS auth), design and migration plan |
 | [`12-discovery.md`](12-discovery.md) | Service discovery via mDNS + DNS-SD, BIND zone setup, custom backends |
 | [`../TESTING.md`](../TESTING.md) | How to run unit, interop, stress, and soak tests |
-| [`../STABILITY_PLAN.md`](../../../Documents/STABILITY_PLAN.md) | (Out-of-tree) the plan that tracked the P1–P12 stability work |
 
 ## Reading order
 
@@ -64,5 +63,6 @@ When changing CA behaviour:
    architecture-level invariants change.
 2. Add or extend a test under `crates/epics-ca-rs/tests/` if behaviour
    is observable.
-3. Verify against a real `softIoc` via the interop suite
-   (`cargo test -p epics-ca-rs --tests -- --test-threads=1`).
+3. Verify against a real `softIoc` via the interop suites, which are
+   `#[ignore]`d and filtered out of the default profile
+   (`cargo nextest run -p epics-ca-rs --profile interop --run-ignored all`).

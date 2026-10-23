@@ -11,7 +11,7 @@ use ad_core_rs::ndarray::{NDArray, NDDataType, NDDimension};
 use ad_core_rs::ndarray_pool::NDArrayPool;
 use ad_core_rs::plugin::file_base::{NDFileOpenMode, NDFileWriter};
 use ad_core_rs::plugin::file_controller::{FileControl, FilePluginController};
-use ad_core_rs::plugin::runtime::{NDPluginProcess, PluginAttributes, ProcessResult};
+use ad_core_rs::plugin::runtime::{NDPluginProcess, PluginAttributes, PluginPool, ProcessResult};
 use epics_libcom_rs::cfmt::CFloat;
 use parking_lot::Mutex;
 
@@ -453,13 +453,13 @@ impl NDFileWriter for TiffWriter {
         Ok(())
     }
 
-    fn read_file(&mut self) -> ADResult<NDArray> {
+    fn read_file(&mut self, pool: &NDArrayPool) -> ADResult<NDArray> {
         let path = self
             .current_path
             .as_ref()
             .ok_or_else(|| ADError::UnsupportedConversion("no file open".into()))?;
         let bytes = std::fs::read(path)?;
-        decode(&bytes, self.plugin_attributes.clone())
+        decode(&bytes, self.plugin_attributes.clone(), pool)
     }
 
     fn close_file(&mut self) -> ADResult<()> {
@@ -484,10 +484,11 @@ impl NDFileWriter for TiffWriter {
 /// RGB/SEPARATE/3 → RGB3 `[x, y, 3]` — a planar file always comes back as RGB3,
 /// even when written from an RGB2 array, because the strips are read in index
 /// order and that order is plane R, plane G, plane B. Anything else is an error.
-/// Strips are concatenated in index order into the array buffer (:513-524).
-/// The image starts from `attributes`, the plugin's set C `readFile` gets
-/// ahead of ColorMode (NDFileTIFF.cpp:540-543).
-fn decode(bytes: &[u8], attributes: NDAttributeList) -> ADResult<NDArray> {
+/// The image is allocated from `pool` and its strips are read into it in
+/// index order (:515-533); C dereferences a refused alloc, here the read
+/// fails. The image starts from `attributes`, the plugin's set C `readFile`
+/// gets ahead of ColorMode (NDFileTIFF.cpp:540-543).
+fn decode(bytes: &[u8], attributes: NDAttributeList, pool: &NDArrayPool) -> ADResult<NDArray> {
     let err = |m: &str| ADError::UnsupportedConversion(format!("TIFF decode error: {m}"));
 
     let read_u16 = |off: usize| -> ADResult<u16> {
@@ -604,22 +605,31 @@ fn decode(bytes: &[u8], attributes: NDAttributeList) -> ADResult<NDArray> {
     if offsets.len() != counts.len() {
         return Err(err("StripOffsets/StripByteCounts length mismatch"));
     }
-    let mut raw: Vec<u8> = Vec::new();
+    let mut array = pool.alloc(dims, data_type)?;
+    let image = array.data_mut().as_u8_slice_mut();
+    let size = image.len();
+    let mut total = 0;
     for (offset, byte_count) in offsets.iter().zip(counts) {
         let (start, len) = (*offset as usize, *byte_count as usize);
         let strip = bytes
             .get(start..start + len)
             .ok_or_else(|| err("strip extends past the end of the file"))?;
-        raw.extend_from_slice(strip);
+        image
+            .get_mut(total..total + len)
+            .ok_or_else(|| {
+                err(&format!(
+                    "file size too large ={}, must be <= {size}",
+                    total + len
+                ))
+            })?
+            .copy_from_slice(strip);
+        total += len;
     }
-
-    let data = crate::codec::buffer_from_bytes(&raw, data_type)
-        .ok_or_else(|| err("strip data is not a whole number of samples"))?;
-    // `new` keeps `data_size` at the dims' bytes, C's pool alloc in readFile.
-    let mut array = NDArray::new(dims, data_type);
-    let mut buf = array.data_mut();
-    buf.resize(data.len());
-    buf.as_u8_slice_mut().copy_from_slice(data.as_u8_slice());
+    if total != size {
+        return Err(err(&format!(
+            "strip data is {total} bytes, the image {size}"
+        )));
+    }
     array.attributes = attributes;
     TiffWriter::attach_color_mode(&mut array, color_mode);
     Ok(array)
@@ -694,6 +704,10 @@ impl NDPluginProcess for TiffFileProcessor {
 
     fn bind_attributes(&mut self, attributes: PluginAttributes) {
         self.attributes = Some(attributes);
+    }
+
+    fn bind_pool(&mut self, pool: PluginPool) {
+        self.ctrl.get_mut().bind_pool(pool);
     }
 
     fn plugin_type(&self) -> &str {
@@ -1567,7 +1581,7 @@ mod tests {
             .unwrap();
         writer.write_file(&Arc::new(arr.clone())).unwrap();
 
-        let read_back = writer.read_file().unwrap();
+        let read_back = writer.read_file(&NDArrayPool::new(0)).unwrap();
         if let (NDDataView::U8(orig), NDDataView::U8(read)) =
             (arr.data().view(), read_back.data().view())
         {
@@ -1600,7 +1614,7 @@ mod tests {
             .unwrap();
         writer.write_file(&Arc::new(arr.clone())).unwrap();
 
-        let read_back = writer.read_file().unwrap();
+        let read_back = writer.read_file(&NDArrayPool::new(0)).unwrap();
         if let (NDDataView::U16(orig), NDDataView::U16(read)) =
             (arr.data().view(), read_back.data().view())
         {
@@ -1683,6 +1697,56 @@ mod tests {
             other => panic!("unexpected data buffer: {other:?}"),
         }
 
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// C readFile takes the image from the plugin's `pNDArrayPool`
+    /// (NDFileTIFF.cpp:515), so the read frame is charged to that pool.
+    #[test]
+    fn a_read_file_allocates_the_image_from_the_plugin_pool() {
+        let path = write_tiff("tiff_read_pool", &mono_array(4, 3));
+        let pool = ad_core_rs::ndarray_pool::DriverPool::standalone(0);
+        let mut proc = TiffFileProcessor::new();
+        proc.bind_pool(ad_core_rs::plugin::runtime::PluginPool::new(pool.clone()));
+
+        let (out, _base) = crate::test_util::read_file(&mut proc, &path);
+
+        let ad_core_rs::plugin::runtime::Published::Read(read) = &out.publish else {
+            panic!("ReadFile publishes its array: {:?}", out.publish);
+        };
+        assert_eq!(read.pool_id(), pool.id());
+        assert_eq!(pool.allocated_bytes(), 12);
+        assert_eq!(
+            read.data().as_u8_slice(),
+            mono_array(4, 3).data().as_u8_slice()
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A pool over its maxMemory refuses the image. C goes on to dereference
+    /// the NULL (NDFileTIFF.cpp:517); here readFile fails and readFileBase
+    /// reports it, with nothing published.
+    #[test]
+    fn a_read_file_the_pool_refuses_publishes_nothing() {
+        let path = write_tiff("tiff_read_refused", &mono_array(4, 3));
+        let pool = ad_core_rs::ndarray_pool::DriverPool::standalone(11);
+        let mut proc = TiffFileProcessor::new();
+        proc.bind_pool(ad_core_rs::plugin::runtime::PluginPool::new(pool.clone()));
+
+        let (out, _base) = crate::test_util::read_file(&mut proc, &path);
+
+        assert!(
+            matches!(out.publish, ad_core_rs::plugin::runtime::Published::Nothing),
+            "a refused read publishes nothing: {:?}",
+            out.publish
+        );
+        let line = format!("NDPluginFile::readFileBase Error  file {}", path.display());
+        assert!(
+            out.trace.iter().any(|(_, l)| l.starts_with(&line)),
+            "{:?}",
+            out.trace
+        );
+        assert_eq!(pool.allocated_bytes(), 0);
         std::fs::remove_file(&path).ok();
     }
 
@@ -2064,7 +2128,7 @@ mod tests {
                 &NDArray::new(vec![], NDDataType::UInt8),
             )
             .unwrap();
-        let read_back = writer.read_file().unwrap();
+        let read_back = writer.read_file(&NDArrayPool::new(0)).unwrap();
         writer.close_file().unwrap();
 
         assert_eq!(

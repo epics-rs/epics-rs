@@ -16,7 +16,7 @@ use crate::par_util;
 use rayon::prelude::*;
 
 use ad_core_rs::codec::{Codec, CodecName, CodecStatus};
-use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDataType, NDDimension};
+use ad_core_rs::ndarray::{NDArray, NDDataType, NDDimension};
 use ad_core_rs::ndarray_pool::NDArrayPool;
 use ad_core_rs::plugin::runtime::{
     NDPluginProcess, ParamUpdate, ProcessResult, WriteOutcome, WritePort, WriteVerdict,
@@ -56,20 +56,6 @@ fn image_bytes(src: &NDArray, data_type: NDDataType) -> Option<usize> {
     src.dims
         .iter()
         .try_fold(data_type.element_size(), |n, d| n.checked_mul(d.size))
-}
-
-/// Reconstruct an `NDDataBuffer` from raw bytes and a target data type.
-///
-/// The byte slice is reinterpreted as the target type using native endianness.
-/// Returns `None` if the byte count is not a multiple of the element size.
-pub(crate) fn buffer_from_bytes(bytes: &[u8], data_type: NDDataType) -> Option<NDDataBuffer> {
-    let elem_size = data_type.element_size();
-    if bytes.len() % elem_size != 0 {
-        return None;
-    }
-    let mut buf = NDDataBuffer::zeros(data_type, bytes.len() / elem_size);
-    buf.as_u8_slice_mut().copy_from_slice(bytes);
-    Some(buf)
 }
 
 /// The `errorMessage` a codec reports when it produces no array
@@ -2183,7 +2169,7 @@ impl NDPluginProcess for CodecProcessor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ad_core_rs::ndarray::{NDDataView, NDDataViewMut};
+    use ad_core_rs::ndarray::{NDDataBuffer, NDDataViewMut};
     use lz4_flex::block::compress;
 
     #[test]
@@ -2909,10 +2895,9 @@ mod tests {
                 (s >> 33) as u8 & (0xFF >> (k / 3001 % 8))
             })
             .collect();
-        NDArray::with_data(
-            vec![NDDimension::new(count)],
-            buffer_from_bytes(&bytes, data_type).unwrap(),
-        )
+        let mut array = NDArray::new(vec![NDDimension::new(count)], data_type);
+        array.data_mut().as_u8_slice_mut().copy_from_slice(&bytes);
+        array
     }
 
     /// The pre-pool encoder: blocks one after another into one buffer, as
@@ -3007,10 +2992,9 @@ mod tests {
                     s as u8
                 })
                 .collect();
-            NDArray::with_data(
-                vec![NDDimension::new(count)],
-                buffer_from_bytes(&bytes, NDDataType::UInt16).unwrap(),
-            )
+            let mut array = NDArray::new(vec![NDDimension::new(count)], NDDataType::UInt16);
+            array.data_mut().as_u8_slice_mut().copy_from_slice(&bytes);
+            array
         };
         let pooled = bslz4_pool_sized_array(NDDataType::UInt16, 8 * threads + 1);
         let blocks = (8 * threads + 1) * frame(8192) + frame(80);
@@ -4401,50 +4385,6 @@ mod tests {
     fn test_processor_plugin_type() {
         let proc = CodecProcessor::new(CodecMode::Decompress);
         assert_eq!(proc.plugin_type(), "NDPluginCodec");
-    }
-
-    // ---- buffer_from_bytes tests ----
-
-    #[test]
-    fn test_buffer_from_bytes_u8() {
-        let data = vec![1u8, 2, 3, 4];
-        let buf = buffer_from_bytes(&data, NDDataType::UInt8).unwrap();
-        assert_eq!(buf.data_type(), NDDataType::UInt8);
-        assert_eq!(buf.len(), 4);
-        assert_eq!(buf.as_u8_slice(), &[1, 2, 3, 4]);
-    }
-
-    #[test]
-    fn test_buffer_from_bytes_u16() {
-        let original = vec![1000u16, 2000, 3000];
-        let bytes: Vec<u8> = original.iter().flat_map(|v| v.to_ne_bytes()).collect();
-        let buf = buffer_from_bytes(&bytes, NDDataType::UInt16).unwrap();
-        assert_eq!(buf.data_type(), NDDataType::UInt16);
-        assert_eq!(buf.len(), 3);
-        if let NDDataView::U16(v) = buf.view() {
-            assert_eq!(v, original);
-        } else {
-            panic!("wrong buffer type");
-        }
-    }
-
-    #[test]
-    fn test_buffer_from_bytes_bad_alignment() {
-        // 3 bytes can't form a u16 array
-        let data = vec![0u8; 3];
-        assert!(buffer_from_bytes(&data, NDDataType::UInt16).is_none());
-    }
-
-    #[test]
-    fn test_buffer_from_bytes_f64_roundtrip() {
-        let original = vec![1.5f64, -2.7, 3.14159];
-        let bytes: Vec<u8> = original.iter().flat_map(|v| v.to_ne_bytes()).collect();
-        let buf = buffer_from_bytes(&bytes, NDDataType::Float64).unwrap();
-        if let NDDataView::F64(v) = buf.view() {
-            assert_eq!(v, original);
-        } else {
-            panic!("wrong buffer type");
-        }
     }
 
     #[test]

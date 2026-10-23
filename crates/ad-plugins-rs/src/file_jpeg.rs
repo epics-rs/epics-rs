@@ -127,7 +127,7 @@ impl NDFileWriter for JpegWriter {
     }
 
     /// C `readFile` returns asynError (NDFileJPEG.cpp:194-198).
-    fn read_file(&mut self) -> ADResult<NDArray> {
+    fn read_file(&mut self, _pool: &NDArrayPool) -> ADResult<NDArray> {
         Err(ADError::UnsupportedConversion(
             "NDFileJPEG cannot read".into(),
         ))
@@ -224,6 +224,10 @@ impl NDPluginProcess for JpegFileProcessor {
 
     fn bind_attributes(&mut self, attributes: ad_core_rs::plugin::runtime::PluginAttributes) {
         self.attributes = Some(attributes);
+    }
+
+    fn bind_pool(&mut self, pool: ad_core_rs::plugin::runtime::PluginPool) {
+        self.ctrl.get_mut().bind_pool(pool);
     }
 
     fn plugin_type(&self) -> &str {

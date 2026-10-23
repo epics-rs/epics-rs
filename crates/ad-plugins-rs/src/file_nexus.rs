@@ -24,7 +24,7 @@ use ad_core_rs::plugin::file_base::{NDFileOpenMode, NDFileWriter};
 use ad_core_rs::plugin::file_controller::{
     FileControl, FilePluginController, SettingsStore, WriterSettings,
 };
-use ad_core_rs::plugin::runtime::{NDPluginProcess, PluginAttributes, ProcessResult};
+use ad_core_rs::plugin::runtime::{NDPluginProcess, PluginAttributes, PluginPool, ProcessResult};
 use parking_lot::Mutex;
 
 use rust_hdf5::{H5Dataset, H5File};
@@ -853,7 +853,7 @@ impl NDFileWriter for NexusWriter {
 
     /// Unreachable through `readFileBase`, whose open is refused first; C's
     /// `readFile` is a stub that fails (NDFileNexus.cpp:115-130).
-    fn read_file(&mut self) -> ADResult<NDArray> {
+    fn read_file(&mut self, _pool: &NDArrayPool) -> ADResult<NDArray> {
         Err(ADError::UnsupportedConversion(
             "NDFileNexus cannot read".into(),
         ))
@@ -1006,6 +1006,10 @@ impl NDPluginProcess for NexusFileProcessor {
 
     fn bind_attributes(&mut self, attributes: PluginAttributes) {
         self.attributes = Some(attributes);
+    }
+
+    fn bind_pool(&mut self, pool: PluginPool) {
+        self.ctrl.get_mut().bind_pool(pool);
     }
 
     fn plugin_type(&self) -> &str {

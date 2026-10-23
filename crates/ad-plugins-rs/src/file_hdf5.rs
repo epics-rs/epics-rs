@@ -16,7 +16,8 @@ use ad_core_rs::plugin::file_controller::{
 };
 use ad_core_rs::plugin::runtime::{
     NDPluginProcess, ParamChangeResult, ParamChangeValue, ParamUpdate, PluginAttributes,
-    PluginParamSnapshot, PortPost, ProcessResult, WriteOutcome, WritePort, WriteVerdict,
+    PluginParamSnapshot, PluginPool, PortPost, ProcessResult, WriteOutcome, WritePort,
+    WriteVerdict,
 };
 use asyn_rs::port::InterfaceMask;
 use asyn_rs::port::PortDriverBase;
@@ -4569,7 +4570,7 @@ impl NDFileWriter for Hdf5Writer {
     }
 
     /// C `readFile` returns asynError (NDFileHDF5.cpp:1634-1638).
-    fn read_file(&mut self) -> ADResult<NDArray> {
+    fn read_file(&mut self, _pool: &NDArrayPool) -> ADResult<NDArray> {
         Err(ADError::UnsupportedConversion(
             "NDFileHDF5 cannot read".into(),
         ))
@@ -5504,6 +5505,10 @@ impl NDPluginProcess for Hdf5FileProcessor {
 
     fn bind_attributes(&mut self, attributes: PluginAttributes) {
         self.attributes = Some(attributes);
+    }
+
+    fn bind_pool(&mut self, pool: PluginPool) {
+        self.ctrl.get_mut().bind_pool(pool);
     }
 
     /// C appends `H5get_libversion` (NDFileHDF5.cpp:2388-2392); rust-hdf5 has

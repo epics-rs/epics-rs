@@ -6,12 +6,13 @@ use parking_lot::{Mutex, MutexGuard};
 
 use crate::error::{ADError, ADResult};
 use crate::ndarray::{NDArray, NDDataType, NDDimension};
+use crate::ndarray_pool::DriverPool;
 
 use super::file_base::{
     FileIo, FlushStep, FrameStatus, NDFileMode, NDFileWriter, NDPluginFileBase, read_file_base,
 };
 use super::runtime::{
-    AttributeView, ParamPost, ParamUpdate, ProcessResult, WriteOutcome, WriteVerdict,
+    AttributeView, ParamPost, ParamUpdate, PluginPool, ProcessResult, WriteOutcome, WriteVerdict,
 };
 use asyn_rs::trace::TraceMask;
 
@@ -79,6 +80,8 @@ pub struct FilePluginController<W: NDFileWriter> {
     /// The `getAttributes` view of the callback or write running now, from
     /// its [`ParamPost`]; the writer and each hand-on read it.
     view: Option<AttributeView>,
+    /// C `pNDArrayPool`, which `readFile` allocates from.
+    pool: PluginPool,
 }
 
 impl<W: NDFileWriter> FilePluginController<W> {
@@ -112,7 +115,15 @@ impl<W: NDFileWriter> FilePluginController<W> {
             latest_array: None,
             port_name: String::new(),
             view: None,
+            pool: PluginPool::new(DriverPool::standalone(0)),
         }
+    }
+
+    /// Take the plugin's pool, as its
+    /// [`NDPluginProcess::bind_pool`](super::runtime::NDPluginProcess::bind_pool)
+    /// gets it; until then, a standalone one.
+    pub fn bind_pool(&mut self, pool: PluginPool) {
+        self.pool = pool;
     }
 
     /// Set this plugin's asyn port name (used for FilePluginDestination
@@ -1002,7 +1013,9 @@ impl<W: NDFileWriter, P: PortLock<FilePluginController<W>>> FileControl<W> for P
             }
             let path = PathBuf::from(c.file_base.open_file_name());
             let layout = NDArray::new(vec![NDDimension::new(1)], NDDataType::UInt8);
-            let result = PortIo::new(self).io(|w| read_file_base(w, &path, &layout).map(Arc::new));
+            let pool = c.pool.current();
+            let result = PortIo::new(self)
+                .io(|w| read_file_base(w, &path, &layout, pool.pool()).map(Arc::new));
             let c = self.controller();
             let mut out = WriteOutcome::from(WriteVerdict::Accept(0));
             return match result {
@@ -1373,7 +1386,7 @@ mod tests {
             }
             Ok(())
         }
-        fn read_file(&mut self) -> ADResult<NDArray> {
+        fn read_file(&mut self, _pool: &crate::ndarray_pool::NDArrayPool) -> ADResult<NDArray> {
             if self.readable {
                 return Ok(array(77));
             }
@@ -3151,7 +3164,7 @@ mod tests {
             self.0.wait(); // released
             Ok(())
         }
-        fn read_file(&mut self) -> ADResult<NDArray> {
+        fn read_file(&mut self, _pool: &crate::ndarray_pool::NDArrayPool) -> ADResult<NDArray> {
             Ok(array(0))
         }
         fn close_file(&mut self) -> ADResult<()> {

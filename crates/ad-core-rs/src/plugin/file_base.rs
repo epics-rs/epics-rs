@@ -22,6 +22,7 @@ use crate::attributes::{NDAttribute, NDAttributeList};
 use crate::error::{ADError, ADResult};
 use crate::finalize::Finalize;
 use crate::ndarray::NDArray;
+use crate::ndarray_pool::NDArrayPool;
 
 /// File write modes matching C++ NDFileMode_t.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,7 +84,9 @@ pub trait NDFileWriter: Send + Sync {
     /// `reserve()` available) so a writer that materialises the file later
     /// can hold it without copying.
     fn write_file(&mut self, array: &Arc<NDArray>) -> ADResult<()>;
-    fn read_file(&mut self) -> ADResult<NDArray>;
+    /// Read the open file into an array from `pool`, the plugin's
+    /// `pNDArrayPool` C `readFile` allocates from (NDFileTIFF.cpp:515).
+    fn read_file(&mut self, pool: &NDArrayPool) -> ADResult<NDArray>;
     fn close_file(&mut self) -> ADResult<()>;
     fn supports_multiple_arrays(&self) -> bool {
         true
@@ -285,10 +288,11 @@ pub(crate) fn read_file_base<W: NDFileWriter + ?Sized>(
     writer: &mut W,
     path: &Path,
     layout: &NDArray,
+    pool: &NDArrayPool,
 ) -> ADResult<NDArray> {
     const BASE: &str = "readFileBase";
     let read = |w: &mut W| {
-        w.read_file().map_err(|e| {
+        w.read_file(pool).map_err(|e| {
             let message = format!("Error  file {}, status={WRITER_ERROR}", path.display());
             base_failure(e.lines(), BASE, message)
         })
@@ -1189,7 +1193,7 @@ mod tests {
             self.writes += 1;
             Ok(())
         }
-        fn read_file(&mut self) -> ADResult<NDArray> {
+        fn read_file(&mut self, _pool: &NDArrayPool) -> ADResult<NDArray> {
             Err(crate::error::ADError::UnsupportedConversion(
                 "not implemented".into(),
             ))
@@ -1411,8 +1415,8 @@ mod tests {
         fn write_file(&mut self, a: &Arc<NDArray>) -> ADResult<()> {
             self.0.write_file(a)
         }
-        fn read_file(&mut self) -> ADResult<NDArray> {
-            self.0.read_file()
+        fn read_file(&mut self, pool: &NDArrayPool) -> ADResult<NDArray> {
+            self.0.read_file(pool)
         }
         fn close_file(&mut self) -> ADResult<()> {
             self.0.close_file()

@@ -1059,14 +1059,15 @@ fn bshuf_untrans_bit_elem(input: &[u8], size: usize, elem_size: usize) -> Vec<u8
 }
 
 /// Bit-transpose and LZ4-block-compress one block (a multiple of 8
-/// elements) and append its frame `[u32 nbytes_BE][lz4]` to `out` (library
-/// `bshuf_compress_lz4_block`, bitshuffle.c:32).
+/// elements) and write its frame `[u32 nbytes_BE][lz4]` at the start of
+/// `out`, which holds its [`bslz4_frame_bound`], returning the frame's length
+/// (library `bshuf_compress_lz4_block`, bitshuffle.c:32).
 fn bshuf_compress_lz4_block(
-    out: &mut Vec<u8>,
+    out: &mut [u8],
     block: &[u8],
     elem_size: usize,
     scratch: &mut BshufScratch,
-) {
+) -> usize {
     let nbyte = block.len();
     let mut shuffled = std::mem::take(&mut scratch.c);
     bshuf_trans_bit_elem_into(
@@ -1076,13 +1077,18 @@ fn bshuf_compress_lz4_block(
         nbyte / elem_size,
         elem_size,
     );
-    let start = out.len();
-    out.resize(start + 4 + get_maximum_output_size(nbyte), 0);
-    let clen = compress_into(&shuffled[..nbyte], &mut out[start + 4..])
-        .expect("get_maximum_output_size bounds the block");
-    out[start..start + 4].copy_from_slice(&(clen as u32).to_be_bytes());
-    out.truncate(start + 4 + clen);
+    let (len, lz4) = out.split_at_mut(4);
+    let clen =
+        compress_into(&shuffled[..nbyte], lz4).expect("out holds the frame's lz4_flex bound");
+    len.copy_from_slice(&(clen as u32).to_be_bytes());
     scratch.c = shuffled;
+    4 + clen
+}
+
+/// The most an `nbyte`-byte block's frame takes: lz4_flex compresses only
+/// into room for its own bound.
+fn bslz4_frame_bound(nbyte: usize) -> usize {
+    4 + get_maximum_output_size(nbyte)
 }
 
 /// LZ4-decode and bit-untranspose one frame's payload (library
@@ -1110,64 +1116,76 @@ fn bshuf_decompress_lz4_block(
 }
 
 /// Compress `blocked` (whole blocks of `block_bytes`, then the partial
-/// block) into runs of frames, in block order. C runs these blocks as one
+/// block) into runs of frames in `staging`, which holds every frame's bound,
+/// returning each run's start and length, in block order. C runs these
+/// blocks as one
 /// OpenMP loop when built with it (`bshuf_blocked_wrap_fun`,
 /// bitshuffle_core.c:1689), which ADSupport is not.
-fn bslz4_compress_blocks(blocked: &[u8], block_bytes: usize, elem_size: usize) -> Vec<Vec<u8>> {
-    let frame_bound = 4 + get_maximum_output_size(block_bytes);
-    let compress_run = |run: &[u8], scratch: &mut BshufScratch| {
-        let mut out = Vec::with_capacity(run.len().div_ceil(block_bytes) * frame_bound);
-        for block in run.chunks(block_bytes) {
-            bshuf_compress_lz4_block(&mut out, block, elem_size, scratch);
-        }
-        out
+fn bslz4_compress_blocks(
+    blocked: &[u8],
+    block_bytes: usize,
+    elem_size: usize,
+    staging: &mut [u8],
+) -> Vec<(usize, usize)> {
+    let compress_run = |run: &[u8], slot: &mut [u8], scratch: &mut BshufScratch| {
+        run.chunks(block_bytes).fold(0, |len, block| {
+            len + bshuf_compress_lz4_block(&mut slot[len..], block, elem_size, scratch)
+        })
     };
     #[cfg(feature = "parallel")]
     if par_util::should_parallelize(blocked.len() / elem_size) && blocked.len() > block_bytes {
         let pool = par_util::thread_pool();
-        // A few runs per worker: a buffer per block cost about as much to
-        // free across threads as to compress (4096² u16).
+        // A few runs per worker, each into a slot of its frames' bounds.
         let runs = 4 * pool.current_num_threads();
-        let run_bytes = blocked.len().div_ceil(block_bytes).div_ceil(runs) * block_bytes;
+        let run_blocks = blocked.len().div_ceil(block_bytes).div_ceil(runs);
+        let slot_bytes = run_blocks * bslz4_frame_bound(block_bytes);
         return pool.install(|| {
             blocked
-                .par_chunks(run_bytes)
+                .par_chunks(run_blocks * block_bytes)
+                .zip(staging.par_chunks_mut(slot_bytes))
+                .enumerate()
                 .map_init(
                     || BshufScratch::new(block_bytes),
-                    |scratch, run| compress_run(run, scratch),
+                    |scratch, (k, (run, slot))| (k * slot_bytes, compress_run(run, slot, scratch)),
                 )
                 .collect()
         });
     }
-    vec![compress_run(blocked, &mut BshufScratch::new(block_bytes))]
+    vec![(
+        0,
+        compress_run(blocked, staging, &mut BshufScratch::new(block_bytes)),
+    )]
 }
 
-/// Write `runs` back to back, then the raw `leftover`, into `dst`; on the
-/// pool each run is also freed by the thread that copies it.
-fn bslz4_write_runs(runs: Vec<Vec<u8>>, leftover: &[u8], dst: &mut [u8]) {
+/// Write the `runs` of `staging`, each a start and length, back to back,
+/// then the raw `leftover`, into `dst`.
+fn bslz4_write_runs(staging: &[u8], runs: &[(usize, usize)], leftover: &[u8], dst: &mut [u8]) {
     #[cfg(feature = "parallel")]
     let parallel = par_util::should_parallelize(dst.len()) && runs.len() > 1;
     let (mut framed, tail) = dst.split_at_mut(dst.len() - leftover.len());
     tail.copy_from_slice(leftover);
     let slots: Vec<&mut [u8]> = runs
         .iter()
-        .map(|run| {
-            let (slot, rest) = std::mem::take(&mut framed).split_at_mut(run.len());
+        .map(|&(_, len)| {
+            let (slot, rest) = std::mem::take(&mut framed).split_at_mut(len);
             framed = rest;
             slot
         })
         .collect();
+    let copy = |&(start, len): &(usize, usize), slot: &mut [u8]| {
+        slot.copy_from_slice(&staging[start..start + len]);
+    };
     #[cfg(feature = "parallel")]
     if parallel {
         par_util::thread_pool().install(|| {
-            runs.into_par_iter()
+            runs.par_iter()
                 .zip(slots)
-                .for_each(|(run, slot)| slot.copy_from_slice(&run));
+                .for_each(|(run, slot)| copy(run, slot));
         });
         return;
     }
     for (run, slot) in runs.iter().zip(slots) {
-        slot.copy_from_slice(run);
+        copy(run, slot);
     }
 }
 
@@ -1226,37 +1244,57 @@ pub fn compress_bslz4(src: &NDArray) -> Result<NDArray, CodecFailure> {
     // shuffle, no frame).
     let (blocked, leftover) = raw[..total_elems * elem_size]
         .split_at((total_elems - total_elems % BSHUF_BLOCKED_MULT) * elem_size);
-    let runs = bslz4_compress_blocks(blocked, block_bytes, elem_size);
-
-    let compressed_size = runs.iter().map(Vec::len).sum::<usize>() + leftover.len();
     let codec = Codec {
         name: CodecName::BSLZ4,
-        compressed_size,
+        compressed_size: 0,
         level: Codec::UNSET,
         shuffle: Codec::UNSET,
         compressor: Codec::UNSET,
         original_data_type: data_type,
     };
 
-    tracing::debug!(
-        original_size = raw.len(),
-        compressed_size,
-        ratio = raw.len() as f64 / compressed_size.max(1) as f64,
-        "BSLZ4 compress"
+    // lz4_flex compresses only into room for a frame's bound, so the frames
+    // go to staging from the input's pool, charged and reused, first.
+    let room = blocked.len() / block_bytes * bslz4_frame_bound(block_bytes)
+        + match blocked.len() % block_bytes {
+            0 => 0,
+            n => bslz4_frame_bound(n),
+        };
+    let mut staging = src
+        .pool()
+        .unwrap_or_else(|| NDArrayPool::new(0))
+        .alloc_sized(vec![NDDimension::new(room)], NDDataType::UInt8, room)
+        .map_err(|_| CodecFailure::from("Failed to allocate BZLZ4 output array"))?;
+    let runs = bslz4_compress_blocks(
+        blocked,
+        block_bytes,
+        elem_size,
+        staging.data_mut().as_u8_slice_mut(),
     );
+    let compressed_size = runs.iter().map(|&(_, len)| len).sum::<usize>() + leftover.len();
     // C allocates the input's size (NDPluginCodec.cpp:708) and writes past it
     // for a stream that does not shrink; that one is charged its own size.
-    encoded_output(
+    let arr = encoded_output(
         src,
         raw.len().max(compressed_size),
         codec,
         // C's own text, typo included (NDPluginCodec.cpp:711).
         "Failed to allocate BZLZ4 output array",
         |dst| {
-            bslz4_write_runs(runs, leftover, &mut dst[..compressed_size]);
+            let dst = &mut dst[..compressed_size];
+            bslz4_write_runs(staging.data().as_u8_slice(), &runs, leftover, dst);
             Ok(compressed_size)
         },
-    )
+    )?;
+
+    let compressed_size = arr.data().len();
+    tracing::debug!(
+        original_size = raw.len(),
+        compressed_size,
+        ratio = raw.len() as f64 / compressed_size.max(1) as f64,
+        "BSLZ4 compress"
+    );
+    Ok(arr)
 }
 
 /// Decompress a Bitshuffle + LZ4 (`bslz4`) NDArray.
@@ -2914,6 +2952,58 @@ mod tests {
         }
     }
 
+    /// BSLZ4 stages its frames in an array from the input's pool that holds
+    /// every frame's lz4_flex bound, charged, then gathers them into C's
+    /// allocation; a later frame reuses both: raw elements only, one block in
+    /// one run, and runs on the pool with a partial block, compressible or not.
+    #[test]
+    fn bslz4_stages_its_frames_in_a_reused_pool_array() {
+        #[cfg(feature = "parallel")]
+        let threads = crate::par_util::thread_pool().current_num_threads();
+        #[cfg(not(feature = "parallel"))]
+        let threads = 1usize;
+        let frame = |n: usize| 4 + get_maximum_output_size(n);
+        let noise = |count: usize| {
+            let mut s = 0x2545_F491_4F6C_DD1Du64;
+            let bytes: Vec<u8> = (0..count * 2)
+                .map(|_| {
+                    s ^= s << 13;
+                    s ^= s >> 7;
+                    s ^= s << 17;
+                    s as u8
+                })
+                .collect();
+            NDArray::with_data(
+                vec![NDDimension::new(count)],
+                buffer_from_bytes(&bytes, NDDataType::UInt16).unwrap(),
+            )
+        };
+        let pooled = bslz4_pool_sized_array(NDDataType::UInt16, 8 * threads + 1);
+        let blocks = (8 * threads + 1) * frame(8192) + frame(80);
+        for (arr, room) in [
+            (noise(5), 0),
+            (noise(4096), frame(8192)),
+            (noise(pooled.data().len()), blocks),
+            (pooled, blocks),
+        ] {
+            let pool = NDArrayPool::new(0);
+            let mut src = pool.alloc(arr.dims.clone(), NDDataType::UInt16).unwrap();
+            src.data_mut()
+                .as_u8_slice_mut()
+                .copy_from_slice(arr.data().as_u8_slice());
+            let before = pool.allocated_bytes();
+            let out = compress_bslz4(&src).unwrap();
+            let raw = src.data().as_u8_slice();
+            let c_size = raw.len().max(out.data().len());
+            let charged = pool.allocated_bytes();
+            assert_eq!((charged - before) as usize, c_size + room);
+            assert_eq!(out.data().as_u8_slice(), serial_bslz4(raw, 2), "{room}");
+            drop(out);
+            drop(compress_bslz4(&src).unwrap());
+            assert_eq!(pool.allocated_bytes(), charged, "{room}");
+        }
+    }
+
     #[test]
     fn bslz4_corrupt_frames_on_the_pool_report_cs_blosc_text() {
         let arr = bslz4_pool_sized_array(NDDataType::UInt16, 9);
@@ -4466,7 +4556,8 @@ mod tests {
             let in_place = 12 + 8 * 4 + 7 * 1024 + get_maximum_output_size(1024);
             assert_eq!(charged, (lz4_bound(n) + 12 + n / 1024 * 4).max(in_place));
             let (charged, len) = charge(u16, &|a| compress_bslz4(a).unwrap());
-            assert_eq!(charged, n.max(len));
+            // Its frames' staging, one block, is charged too.
+            assert_eq!(charged, n.max(len) + 4 + get_maximum_output_size(n));
             assert_eq!(len > n, incompressible);
             let (charged, len) = charge(u16, &|a| {
                 compress_blosc(a, &BloscConfig::default()).unwrap()

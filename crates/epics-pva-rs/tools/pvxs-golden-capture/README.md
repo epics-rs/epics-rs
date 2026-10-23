@@ -28,9 +28,9 @@ halves hold:
 2. **Distinct coverage.** The fixture must lock a wire shape no
    existing fixture or parity test already pins. A variant that only
    re-exercises a shape another test owns is not added — e.g. extra
-   Cached TypeID permutations are already covered by
-   `tests/parity/testxcode_port.rs::pvxs_typestore_*`, so they are
-   not duplicated here.
+   Cached TypeID (`0xFD`/`0xFE`) permutations are already covered by
+   `tests/interop_pvxs_mods/type_cache.rs` and the type-cache tests in
+   `src/decode.rs`, so they are not duplicated here.
 
 A corollary on builders likely to diverge (NTTable, NTURI, and other
 multi-substructure `nt::*` builders): the pvxs-side setup is involved
@@ -78,9 +78,10 @@ capturing against a new pvxs commit.
 
 ## What's not captured
 
-- `unspecified_address` fixtures — use a separate Rust encoder
-  (`encode_unspec_addr`-family) not `to_wire`, so they live as
-  inline assertions in `unspecified_address.rs`.
+- `unspecified_address` cases — pin the address decoder
+  (`ip_from_bytes` / `ip_from_bytes_allow_unspec`), not a `to_wire`
+  output, so they live as inline assertions in
+  `tests/pva_cases/unspecified_address.rs`.
 - `monitor_data` fixtures — exercise `encode_pv_field_with_bitset`,
   which has no clean pvxs single-call equivalent (the leading
   BitSet header is what pvxs emits; the value-only portion is what

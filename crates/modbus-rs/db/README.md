@@ -24,11 +24,11 @@ Common macros across templates:
   `POLL_DELAY` / `ENABLE_HISTOGRAM` / `READ_HISTOGRAM` /
   `HISTOGRAM_BIN_TIME` / `HISTOGRAM_TIME_AXIS` — driver statistics and the
   read-time histogram.
+- `MODBUS_READ` (`poll_trigger.template`) — writing it runs one poll cycle
+  before the write completes; C only wakes the poller.
 
-## Note on the C `=N` string length
+## `=N` string length
 
-Upstream modbus allows a `drvInfo` suffix like `ZSTRING_HIGH=20` to cap the
-string length. `epics-modbus-rs` drops the `=N` suffix (see `ioc.rs`): a
-string record's length comes from its own record buffer (`NELM`).
-Templates that relied on `=N` shorter than `NELM` should set `NELM` to
-the intended length.
+A string data type takes an optional `=N` suffix (`ZSTRING_HIGH=20`) that caps
+the record's octet length, as in C. The suffix is refused on a non-string type
+or when `N` is not a non-negative integer, and record init then fails.

@@ -604,6 +604,14 @@ pub struct NDArray {
 /// [`NDArray::data_mut`]: an array's buffer to write in place, a pooled
 /// array's up to its pool charge. Nothing swaps the buffer for another
 /// through it, which would take the array out of its pool's accounting.
+///
+/// ```compile_fail,E0594
+/// # use ad_core_rs::ndarray::{NDDataBuffer, NDDataType, NDDimension};
+/// # use ad_core_rs::ndarray_pool::DriverPool;
+/// # let pool = DriverPool::standalone(8);
+/// # let mut a = pool.alloc(vec![NDDimension::new(2)], NDDataType::Int32).unwrap();
+/// *a.fill().data_mut() = NDDataBuffer::zeros(NDDataType::Int32, 2);
+/// ```
 pub struct NDDataMut<'a>(&'a mut NDDataBuffer);
 
 impl<'a> NDDataMut<'a> {

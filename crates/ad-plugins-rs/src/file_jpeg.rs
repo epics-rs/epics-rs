@@ -15,7 +15,7 @@ use ad_core_rs::plugin::runtime::{NDPluginProcess, ProcessResult};
 use jpeg_encoder::{ColorType as JpegColorType, Encoder as JpegEncoder};
 use parking_lot::Mutex;
 
-/// JPEG file writer using `jpeg-encoder` for encoding and `jpeg-decoder` for decoding.
+/// JPEG file writer using `jpeg-encoder`.
 pub struct JpegWriter {
     current_path: Option<PathBuf>,
     pub(crate) quality: WriterSettings<u8>,
@@ -534,8 +534,8 @@ mod tests {
         writer.write_file(&Arc::new(arr)).unwrap();
         writer.close_file().unwrap();
 
-        let (info, pixels) = decode(&path);
-        assert_eq!(info.pixel_format, jpeg_decoder::PixelFormat::L8);
+        let (dims, pixels) = decode(&path);
+        assert_eq!(dims, [1, 8, 8]);
         // With uniform input at max quality, decoded values should be close
         for &px in pixels.iter() {
             assert!(
@@ -547,12 +547,26 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
-    /// The file as an independent decoder reads it.
-    fn decode(path: &Path) -> (jpeg_decoder::ImageInfo, Vec<u8>) {
+    /// The file as an independent decoder reads it: `[components, width,
+    /// height]` and the pixels, gray for a 1-component image.
+    fn decode(path: &Path) -> (Vec<usize>, Vec<u8>) {
+        use zune_jpeg::zune_core::bytestream::ZCursor;
+        use zune_jpeg::zune_core::colorspace::ColorSpace;
+
         let bytes = std::fs::read(path).unwrap();
-        let mut decoder = jpeg_decoder::Decoder::new(&bytes[..]);
+        let mut decoder = zune_jpeg::JpegDecoder::new(ZCursor::new(&bytes[..]));
+        decoder.decode_headers().unwrap();
+        let info = decoder.info().unwrap();
+        if info.components == 1 {
+            decoder.set_options(decoder.options().jpeg_set_out_colorspace(ColorSpace::Luma));
+        }
         let pixels = decoder.decode().unwrap();
-        (decoder.info().unwrap(), pixels)
+        let dims = vec![
+            info.components as usize,
+            info.width as usize,
+            info.height as usize,
+        ];
+        (dims, pixels)
     }
 
     /// Write an RGB-mode array to JPEG and return the decoded
@@ -583,14 +597,9 @@ mod tests {
             .unwrap();
         writer.write_file(&Arc::new(arr)).unwrap();
         writer.close_file().unwrap();
-        let (info, _) = decode(&path);
+        let (dims, _) = decode(&path);
         std::fs::remove_file(&path).ok();
-        let components = match info.pixel_format {
-            jpeg_decoder::PixelFormat::L8 => 1,
-            jpeg_decoder::PixelFormat::RGB24 => 3,
-            other => panic!("unexpected {other:?}"),
-        };
-        vec![components, info.width as usize, info.height as usize]
+        dims
     }
 
     #[test]

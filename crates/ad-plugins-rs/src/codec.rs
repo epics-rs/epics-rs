@@ -48,16 +48,14 @@ pub fn original_data_type(array: &NDArray) -> NDDataType {
     }
 }
 
-/// The bytes of the image `src` decodes to: its dims of its original element
-/// type, the output C's `allocArray(input)` gives every decompressor
+/// The bytes of the image `src` decodes to: its dims as `data_type`, the
+/// output C's `allocArray(input, data_type)` gives every decompressor
 /// (NDPluginCodec.cpp:64-84). A frame decoding to more or fewer is refused.
 /// `None` when the dims overflow.
-fn image_bytes(src: &NDArray) -> Option<usize> {
+fn image_bytes(src: &NDArray, data_type: NDDataType) -> Option<usize> {
     src.dims
         .iter()
-        .try_fold(original_data_type(src).element_size(), |n, d| {
-            n.checked_mul(d.size)
-        })
+        .try_fold(data_type.element_size(), |n, d| n.checked_mul(d.size))
 }
 
 /// Reconstruct an `NDDataBuffer` from raw bytes and a target data type.
@@ -80,25 +78,9 @@ pub type CodecFailure = Cow<'static, str>;
 
 /// C's `allocArray` (NDPluginCodec.cpp:64-84): an output from the input's
 /// pool (`input->pNDArrayPool`, or a throwaway pool for a frame that has
-/// none), carrying `dims` and the input's identity, whose payload is `bytes`
-/// read as `data_type`. `alloc_failure` is the text C reports when the pool
-/// cannot supply it.
-fn codec_output(
-    src: &NDArray,
-    dims: Vec<NDDimension>,
-    data_type: NDDataType,
-    bytes: &[u8],
-    alloc_failure: &'static str,
-) -> Result<NDArray, CodecFailure> {
-    codec_output_with(src, dims, data_type, bytes.len(), alloc_failure, |dst| {
-        dst.copy_from_slice(bytes);
-        Ok(())
-    })
-}
-
-/// [`codec_output`] for a producer that writes the `len` output bytes in
-/// place, so a decoder fills the pooled array itself instead of a buffer
-/// that is then copied.
+/// none), carrying `dims` and the input's identity, whose `len` bytes of
+/// `data_type` `fill` writes in place. `alloc_failure` is the text C reports
+/// when the pool cannot supply it.
 fn codec_output_with(
     src: &NDArray,
     dims: Vec<NDDimension>,
@@ -196,15 +178,16 @@ fn lz4_compress_aside<'a>(input: &[u8], scratch: &'a mut Vec<u8>) -> &'a [u8] {
 }
 
 /// [`codec_output_with`] for a `name`-coded input, as C's decoders use
-/// `allocArray(input)`: the input's dims and original element type, which
+/// `allocArray(input, data_type)`: the input's dims as `data_type`, which
 /// `decode` fills in place, returning the length of the image it decoded.
 /// An image of any length but the array's fails. C fails a longer one too,
-/// but succeeds on a short Zlib, Blosc or LZ4HDF5 image and hands on the
-/// reused buffer's stale bytes past it (NDPluginCodec.cpp:413, :517, :684);
-/// that C defect is not copied.
+/// but succeeds on a short Zlib, Blosc, LZ4HDF5 or JPEG image and hands on
+/// the reused buffer's stale bytes past it (NDPluginCodec.cpp:413, :517,
+/// :684, :304-314); that C defect is not copied.
 fn decoded_output(
     src: &NDArray,
     name: CodecName,
+    data_type: NDDataType,
     decode_failure: &'static str,
     alloc_failure: &'static str,
     decode: impl FnOnce(&mut [u8]) -> Option<usize>,
@@ -215,8 +198,8 @@ fn decoded_output(
     codec_output_with(
         src,
         src.dims.clone(),
-        original_data_type(src),
-        image_bytes(src).ok_or(decode_failure)?,
+        data_type,
+        image_bytes(src, data_type).ok_or(decode_failure)?,
         alloc_failure,
         |dst| match decode(dst) {
             Some(n) if n == dst.len() => Ok(()),
@@ -282,6 +265,7 @@ pub fn decompress_lz4(src: &NDArray) -> Result<NDArray, CodecFailure> {
     decoded_output(
         src,
         CodecName::LZ4,
+        original_data_type(src),
         "Failed to LZ4 decompress",
         "Failed to allocate LZ4 output array",
         |dst| decompress_into(src.data().as_u8_slice(), dst).ok(),
@@ -357,6 +341,7 @@ pub fn decompress_zlib(src: &NDArray) -> Result<NDArray, CodecFailure> {
     decoded_output(
         src,
         CodecName::Zlib,
+        original_data_type(src),
         "Failed to Zlib decompress",
         "Failed to allocate zlib output array",
         |dst| decode_zlib_into(src, dst),
@@ -510,6 +495,7 @@ pub fn decompress_lz4hdf5(src: &NDArray) -> Result<NDArray, CodecFailure> {
     decoded_output(
         src,
         CodecName::LZ4HDF5,
+        original_data_type(src),
         "Failed to LZ4 decompress",
         "Failed to allocate LZ4HDF5 output array",
         |dst| decode_lz4hdf5_into(src, dst),
@@ -1327,6 +1313,7 @@ pub fn decompress_bslz4(src: &NDArray) -> Result<NDArray, CodecFailure> {
     decoded_output(
         src,
         CodecName::BSLZ4,
+        original_data_type(src),
         // C's own text (NDPluginCodec.cpp): the BSLZ4 branch reports as Blosc.
         "Failed to Blosc decompress",
         "Failed to allocate BSLZ4 output array",
@@ -1522,8 +1509,8 @@ impl JpegCompressError {
 
 /// Decompress a JPEG-compressed NDArray.
 ///
-/// Uses jpeg-decoder to decode the JPEG data back to pixel data.
-/// Reconstructs proper dimensions and color layout (mono or RGB1).
+/// zune-jpeg decodes into C's `allocArray(input, NDUInt8)` (NDPluginCodec.cpp
+/// :291), under the image's own dims and color layout (mono or RGB1).
 ///
 /// A decoded JPEG is always 8-bit mono or 8-bit RGB1 (C comment at
 /// NDPluginCodec.cpp:268-272), whatever the layout of the array that was
@@ -1536,14 +1523,21 @@ impl JpegCompressError {
 pub fn decompress_jpeg(src: &NDArray) -> Result<NDArray, CodecFailure> {
     use ad_core_rs::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
 
-    let (dims, color_mode, pixels) = decode_jpeg(src).ok_or("Error decoding JPEG")?;
-    let mut arr = codec_output(
+    let mut layout = None;
+    let mut arr = decoded_output(
         src,
-        dims,
+        CodecName::JPEG,
         NDDataType::UInt8,
-        &pixels,
+        "Error decoding JPEG",
         "Failed to allocate JPEG output array",
+        |dst| {
+            let (dims, color_mode, len) = decode_jpeg_into(src.data().as_u8_slice(), dst)?;
+            layout = Some((dims, color_mode));
+            Some(len)
+        },
     )?;
+    let (dims, color_mode) = layout.ok_or("Error decoding JPEG")?;
+    arr.dims = dims;
     arr.attributes.add(NDAttribute::new_static(
         "ColorMode",
         "Color Mode",
@@ -1553,39 +1547,34 @@ pub fn decompress_jpeg(src: &NDArray) -> Result<NDArray, CodecFailure> {
     Ok(arr)
 }
 
-/// The decoded pixels of a JPEG frame, with their dims and layout.
-fn decode_jpeg(
-    src: &NDArray,
-) -> Option<(Vec<NDDimension>, ad_core_rs::color::NDColorMode, Vec<u8>)> {
+/// Decode the JPEG stream `jpeg` into `dst`, returning the image's dims,
+/// layout and length; `None` when it is malformed, longer than `dst`, or
+/// neither 1- nor 3-component.
+fn decode_jpeg_into(
+    jpeg: &[u8],
+    dst: &mut [u8],
+) -> Option<(Vec<NDDimension>, ad_core_rs::color::NDColorMode, usize)> {
     use ad_core_rs::color::NDColorMode;
+    use zune_jpeg::zune_core::bytestream::ZCursor;
+    use zune_jpeg::zune_core::colorspace::ColorSpace;
+    use zune_jpeg::zune_core::options::DecoderOptions;
 
-    if src.codec.as_ref().map(|c| &c.name) != Some(&CodecName::JPEG) {
-        return None;
-    }
-
-    let compressed = src.data().as_u8_slice();
-    let mut decoder = jpeg_decoder::Decoder::new(compressed);
-    decoder.read_info().ok()?;
-    let metadata = decoder.info()?;
-    // C decodes into the image (NDPluginCodec.cpp:283), writing a larger
-    // JPEG's rows past it and leaving a smaller one's stale tail
-    // (:304-314); either is refused before its planes exist.
-    let decoded = (metadata.width as usize * metadata.height as usize)
-        .checked_mul(metadata.pixel_format.pixel_bytes())?;
-    if decoded != image_bytes(src)? {
-        return None;
-    }
-    let pixels = decoder.decode().ok()?;
-
-    let width = metadata.width as usize;
-    let height = metadata.height as usize;
-
-    let (dims, color_mode) = match metadata.pixel_format {
-        jpeg_decoder::PixelFormat::L8 => (
+    // zune's default caps an image at 16384 a side; JPEG allows 65535.
+    let options = DecoderOptions::default()
+        .set_max_width(usize::MAX)
+        .set_max_height(usize::MAX);
+    let mut decoder = zune_jpeg::JpegDecoder::new_with_options(ZCursor::new(jpeg), options);
+    decoder.decode_headers().ok()?;
+    let info = decoder.info()?;
+    let (width, height) = (info.width as usize, info.height as usize);
+    let (colorspace, dims, color_mode) = match info.components {
+        1 => (
+            ColorSpace::Luma,
             vec![NDDimension::new(width), NDDimension::new(height)],
             NDColorMode::Mono,
         ),
-        jpeg_decoder::PixelFormat::RGB24 => (
+        3 => (
+            ColorSpace::RGB,
             vec![
                 NDDimension::new(3),
                 NDDimension::new(width),
@@ -1595,8 +1584,10 @@ fn decode_jpeg(
         ),
         _ => return None,
     };
-
-    Some((dims, color_mode, pixels))
+    decoder.set_options(decoder.options().jpeg_set_out_colorspace(colorspace));
+    let len = decoder.output_buffer_size()?;
+    decoder.decode_into(dst).ok()?;
+    Some((dims, color_mode, len))
 }
 
 /// Blosc compression settings.
@@ -1684,6 +1675,7 @@ pub fn decompress_blosc(src: &NDArray) -> Result<NDArray, CodecFailure> {
     decoded_output(
         src,
         CodecName::Blosc,
+        original_data_type(src),
         "Failed to Blosc decompress",
         "Failed to allocate Blosc output array",
         |dst| decode_blosc_into(src, dst),
@@ -4452,6 +4444,59 @@ mod tests {
                 drop(proc.process_array(&src, &pool));
                 assert_eq!(scratch(&proc), first, "{codec:?}");
             }
+        }
+    }
+
+    /// The JPEG decoder writes into the pool's free buffer too, as C's
+    /// `allocArray(input, NDUInt8)` (NDPluginCodec.cpp:291) under the input's
+    /// dims: an image longer or shorter than them fails.
+    #[test]
+    fn the_jpeg_decoder_writes_into_the_input_dims_pool_buffer() {
+        use ad_core_rs::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
+        use ad_core_rs::color::NDColorMode;
+
+        for (dims, mode) in [
+            (vec![64, 64], NDColorMode::Mono),
+            (vec![3, 64, 64], NDColorMode::RGB1),
+        ] {
+            let sizes = |a: &NDArray| a.dims.iter().map(|d| d.size).collect::<Vec<_>>();
+            let pool = NDArrayPool::new(0);
+            let mut src = pool
+                .alloc(
+                    dims.iter().map(|&d| NDDimension::new(d)).collect(),
+                    NDDataType::Int8,
+                )
+                .unwrap();
+            src.attributes.add(NDAttribute::new_static(
+                "ColorMode",
+                "Color Mode",
+                NDAttrSource::Driver,
+                NDAttrValue::Int32(mode as i32),
+            ));
+            for (i, b) in src.data_mut().as_u8_slice_mut().iter_mut().enumerate() {
+                *b = (i / 64 * 3) as u8;
+            }
+            let compressed = compress_jpeg(&src, 90).unwrap();
+            let n = src.data().as_u8_slice().len();
+
+            let mut stale = pool
+                .alloc(vec![NDDimension::new(n / 8)], NDDataType::Float64)
+                .unwrap();
+            stale.data_mut().as_u8_slice_mut().fill(0xAB);
+            let ptr = stale.data().as_u8_slice().as_ptr();
+            drop(stale);
+            let out = decompress_jpeg(&compressed).unwrap();
+            assert_eq!(out.data().as_u8_slice().as_ptr(), ptr, "{mode:?}");
+            assert_eq!(out.data().data_type(), NDDataType::UInt8);
+            assert_eq!((sizes(&out), out.data().len()), (dims.clone(), n));
+
+            let last = dims.len() - 1;
+            let mut fewer = compressed.clone();
+            fewer.dims[last] = NDDimension::new(32);
+            assert!(decompress_jpeg(&fewer).is_err(), "too long: {mode:?}");
+            let mut more = compressed.clone();
+            more.dims[last] = NDDimension::new(128);
+            assert!(decompress_jpeg(&more).is_err(), "too short: {mode:?}");
         }
     }
 

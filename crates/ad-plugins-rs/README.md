@@ -47,7 +47,7 @@ No C dependencies. Pure Rust with real encoding libraries (JPEG, TIFF, LZ4, FFT)
 | Plugin | Description |
 |--------|-------------|
 | **NDFileHDF5** | HDF5 file writer via `rust-hdf5`, with the custom-layout XML engine of C's `NDFileHDF5` |
-| **NDFileJPEG** | JPEG encoding/decoding via jpeg-encoder/jpeg-decoder |
+| **NDFileJPEG** | JPEG encoding via jpeg-encoder |
 | **NDFileTIFF** | TIFF encoding/decoding via the `image` crate |
 | **NDFileNetCDF** | netCDF-4 writer, through `rust-hdf5` |
 | **NDFileNexus** | NeXus file writer |

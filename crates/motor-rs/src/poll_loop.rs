@@ -434,7 +434,7 @@ impl SharedControllerPoll {
             poll.drain_on_port(&held, driver.base_mut());
         });
         let op = asyn_rs::request::RequestOp::WithDriver(call);
-        queue.flush_queued = handle.try_submit(op, AsynUser::default()).is_ok();
+        queue.flush_queued = handle.submit_unanswered(op, AsynUser::default()).is_ok();
     }
 
     /// Apply on the port's thread, under the lock, what was set off it.

@@ -145,8 +145,6 @@ jobs:
       # Compiles libs, bins, AND test targets — the surest catch for
       # platform-specific source that isn't `#[cfg]`-gated.
       - name: Build (workspace + tests)
-        # No --verbose: with it, three macos-x86_64 runs stopped logging
-        # mid-build at 39-42 min and sat there until the job timeout.
         run: cargo build --workspace --tests
 
       # `ci` profile (.config/nextest.toml) adds retries for the

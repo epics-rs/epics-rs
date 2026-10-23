@@ -377,12 +377,18 @@ struct FFTParamIndices {
 /// by releasing at NDPluginFFT.cpp:334.
 struct FFTState {
     config: FFTConfig,
-    /// Running average magnitude buffer.
-    avg_buffer: Option<Vec<f64>>,
-    /// Number of frames accumulated so far.
-    avg_count: usize,
-    /// Cached dimensions to detect changes.
-    cached_dims: Vec<usize>,
+    /// C `FFTAbsValue_`: the running average of the output.
+    average: Vec<f64>,
+    /// C `numAveraged`: the weight, `1/num_averaged`, the next frame enters
+    /// the average at.
+    num_averaged: usize,
+    /// C `numAverage_`: the NumAverage the average last restarted for.
+    averaged_for: usize,
+    /// The ResetAverage param, which C reads and clears at the next frame.
+    reset_average: bool,
+    /// C `nTimeXIn_` and `nTimeYIn_`, with the direction, that the average
+    /// holds frames of.
+    averaged_shape: Option<(usize, usize, FFTDirection)>,
     /// Seconds per input time point (C++ `timePerPoint_`); scales the time
     /// and frequency axis waveforms.
     time_per_point: f64,
@@ -415,9 +421,11 @@ impl FFTProcessor {
         Self {
             state: Mutex::new(FFTState {
                 config,
-                avg_buffer: None,
-                avg_count: 0,
-                cached_dims: Vec::new(),
+                average: Vec::new(),
+                num_averaged: 1,
+                averaged_for: 0,
+                reset_average: false,
+                averaged_shape: None,
                 time_per_point: 1.0,
                 axes_for: None,
             }),
@@ -457,50 +465,49 @@ impl FFTState {
         changed
     }
 
-    /// Check if dimensions changed and reset averaging state if so.
+    /// Restart the average on a new input size, C's `sizeChanged`
+    /// (NDPluginFFT.cpp:317-322), or a new direction. C zeroes
+    /// `FFTAbsValue_` there (:111-115) but keeps `numAveraged`, so the next
+    /// frames average against zeros; that C bug is not copied.
     fn check_dims_changed(&mut self, dims: &[NDDimension]) {
-        let current: Vec<usize> = dims.iter().map(|d| d.size).collect();
-        if current != self.cached_dims {
-            self.cached_dims = current;
-            self.avg_buffer = None;
-            self.avg_count = 0;
+        let shape = (
+            dims[0].size,
+            dims.get(1).map_or(1, |d| d.size),
+            self.config.direction,
+        );
+        if self.averaged_shape != Some(shape) {
+            self.averaged_shape = Some(shape);
+            self.num_averaged = 1;
         }
     }
 
-    /// Apply magnitude averaging using exponential moving average (matching C++).
-    ///
-    /// C++: `FFTAbsValue_[j] = FFTAbsValue_[j] * oldFraction + new[j] * newFraction`
-    /// where `oldFraction = 1 - 1/numAveraged`, `newFraction = 1/numAveraged`.
-    ///
-    /// `magnitudes` is updated in place to the averaged values, so the
-    /// spectrum is what goes downstream.
-    fn apply_averaging(&mut self, magnitudes: &mut [f64]) {
-        let num_avg = self.config.num_average;
-        if num_avg <= 1 {
-            return;
+    /// C `doArrayCallbacks`' average (NDPluginFFT.cpp:188-208): a reset or a
+    /// new NumAverage restarts it, `values` enter at weight `1/numAveraged`
+    /// and become the average, and the count C then posts as NumAveraged
+    /// returns with whether a reset was consumed.
+    fn average(&mut self, values: &mut [f64]) -> (usize, bool) {
+        let reset = std::mem::take(&mut self.reset_average);
+        if reset || self.config.num_average != self.averaged_for {
+            self.averaged_for = self.config.num_average;
+            self.num_averaged = 1;
         }
-
-        let buf = self
-            .avg_buffer
-            .get_or_insert_with(|| vec![0.0; magnitudes.len()]);
-
-        // Reset if buffer size changed
-        if buf.len() != magnitudes.len() {
-            *buf = vec![0.0; magnitudes.len()];
-            self.avg_count = 0;
+        let n = self.num_averaged;
+        if n < self.config.num_average {
+            self.num_averaged += 1;
         }
-
-        self.avg_count += 1;
-        // Cap at num_average for the weighting
-        let n = self.avg_count.min(num_avg) as f64;
-        let new_fraction = 1.0 / n;
-        let old_fraction = 1.0 - new_fraction;
-
-        // C++ exponential moving average
-        for (b, m) in buf.iter_mut().zip(magnitudes.iter_mut()) {
-            *b = *b * old_fraction + *m * new_fraction;
-            *m = *b;
+        if n > 1 {
+            let new_fraction = 1.0 / n as f64;
+            let old_fraction = 1.0 - new_fraction;
+            for (a, v) in self.average.iter_mut().zip(values) {
+                *a = *a * old_fraction + *v * new_fraction;
+                *v = *a;
+            }
+        } else if self.num_averaged > 1 {
+            // Only a frame weighted below 1 reads the average.
+            self.average.clear();
+            self.average.extend_from_slice(values);
         }
+        (self.num_averaged, reset)
     }
 }
 
@@ -745,7 +752,7 @@ impl NDPluginProcess for FFTProcessor {
         // drop the state lock: everything from `compute_fft` to the axis
         // waveforms below reads only the snapshot, so a param write lands
         // while the transform runs instead of queueing behind it.
-        let (frame, avg_count, post_axes) = {
+        let (frame, post_axes) = {
             let mut state = self.state.lock();
             state.check_dims_changed(&array.dims);
             let post_axes = state.axes_changed(&array.dims);
@@ -755,17 +762,13 @@ impl NDPluginProcess for FFTProcessor {
                     time_per_point: state.time_per_point,
                     planner: &self.planner,
                 },
-                state.avg_count,
                 post_axes,
             )
         };
 
         let vals = array.data.to_f64_vec();
-        let result = frame.compute_fft(array, &vals);
+        let mut result = frame.compute_fft(array, &vals);
         let mut updates = Vec::new();
-        if let Some(idx) = self.params.num_averaged {
-            updates.push(ParamUpdate::int32(idx, avg_count as i32));
-        }
         // C `createAxisArrays` posts with the change itself, whatever the frame
         // then computes (NDPluginFFT.cpp:118, :328-331).
         if post_axes {
@@ -776,10 +779,6 @@ impl NDPluginProcess for FFTProcessor {
         // these are the time series and the real/imaginary/abs spectrum
         // (C++ doFFTCallbacks).
         // The inverse transform has no spectrum to publish.
-        //
-        // `apply_averaging` advances the EMA state, so it must be invoked at
-        // most once per frame. The averaged FFTAbsValue waveform and the
-        // averaged NDArray output therefore share a single averaging pass.
         if frame.config.direction == FFTDirection::Forward {
             let suppress_dc = frame.config.suppress_dc;
             if let Some((time_series, real, imag)) =
@@ -797,20 +796,32 @@ impl NDPluginProcess for FFTProcessor {
             }
         }
 
+        // The average is the one part of the frame that cannot run released:
+        // C re-takes the lock for it (NDPluginFFT.cpp:373) and reads
+        // NumAverage and ResetAverage there (:188-190), not before the
+        // transform. It advances once per frame, so the FFTAbsValue waveform
+        // and the output array below share the one pass.
+        let (num_averaged, reset) = {
+            let values = match &mut result {
+                Some(NDArray {
+                    data: NDDataBuffer::F64(values),
+                    ..
+                }) => values.as_mut_slice(),
+                _ => &mut [],
+            };
+            self.state.lock().average(values)
+        };
+        if let Some(idx) = self.params.num_averaged {
+            updates.push(ParamUpdate::int32(idx, num_averaged as i32));
+        }
+        if let Some(idx) = self.params.reset_average
+            && reset
+        {
+            updates.push(ParamUpdate::int32(idx, 0));
+        }
+
         match result {
-            Some(mut out) => {
-                // The EMA accumulator is the one part of the frame that cannot
-                // run released: it is shared mutable state advanced once per
-                // frame. C re-takes the lock for exactly this
-                // (NDPluginFFT.cpp:373) and re-reads NumAverage inside
-                // `doArrayCallbacks` (:189-203) rather than trusting the value
-                // it snapshotted before the transform, so re-read it here too.
-                if let NDDataBuffer::F64(ref mut mags) = out.data {
-                    let mut state = self.state.lock();
-                    if state.config.num_average > 1 {
-                        state.apply_averaging(mags);
-                    }
-                }
+            Some(out) => {
                 // FFTAbsValue waveform mirrors the (possibly averaged) NDArray
                 // magnitude buffer — for 1D forward this is the half-spectrum
                 // magnitude that the NDArray output already carries.
@@ -909,10 +920,7 @@ impl NDPluginProcess for FFTProcessor {
         } else if Some(reason) == self.params.num_average {
             state.config.num_average = params.value.as_i32().max(0) as usize;
         } else if Some(reason) == self.params.reset_average {
-            if params.value.as_i32() != 0 {
-                state.avg_buffer = None;
-                state.avg_count = 0;
-            }
+            state.reset_average = params.value.as_i32() != 0;
         } else if Some(reason) == self.params.time_per_point {
             // Scales the FFTTimeAxis / FFTFreqAxis waveforms.
             let v = params.value.as_f64();
@@ -1267,10 +1275,12 @@ mod tests {
                 v[i] = 1.0;
             }
         }
-        let _ = proc.process_array(&Arc::new(arr1), &pool);
-        assert_eq!(proc.state.lock().avg_count, 1);
+        let arr1 = Arc::new(arr1);
+        let _ = proc.process_array(&arr1, &pool);
+        let _ = proc.process_array(&arr1, &pool);
+        assert_eq!(proc.state.lock().num_averaged, 3);
 
-        // Frame 2: width=4 — dimension change should reset
+        // Frame 3: width=4 — dimension change should reset
         let mut arr2 = NDArray::new(vec![NDDimension::new(4)], NDDataType::Float64);
         if let NDDataBuffer::F64(ref mut v) = arr2.data {
             for i in 0..4 {
@@ -1278,8 +1288,8 @@ mod tests {
             }
         }
         let _ = proc.process_array(&Arc::new(arr2), &pool);
-        // After dimension change, avg_count should be 1 (reset + one new frame)
-        assert_eq!(proc.state.lock().avg_count, 1);
+        // Restarted at weight 1, so the next frame enters at 1/2.
+        assert_eq!(proc.state.lock().num_averaged, 2);
     }
 
     #[test]
@@ -1421,6 +1431,75 @@ mod tests {
         let last = port.read_int32_blocking(read, 0).unwrap();
         assert_eq!(averaged[1], Some(NDAttrValue::Int32(last)));
         assert_ne!(averaged[0], averaged[1]);
+    }
+
+    /// NumAveraged per frame as C's cbAD oracle posts it (NDPluginFFT.cpp:
+    /// 188-203), each with whether the frame came out alone (weight 1): a
+    /// reset or a new NumAverage restarts at weight 1 and posts 2, the count
+    /// climbs to NumAverage, and NumAverage <= 1 posts 1. Both are read at
+    /// the frame, so a reset cancelled or a NumAverage restored before it
+    /// restarts nothing.
+    #[test]
+    fn num_averaged_follows_c() {
+        use crate::test_util::{publish, with_attributes_file};
+        use ad_core_rs::attributes::NDAttrValue;
+        let xml = r#"<Attributes>
+            <Attribute name="Averaged" type="PARAM" source="FFT_NUM_AVERAGED" datatype="INT"/>
+        </Attributes>"#;
+        let (handle, mut rx, _jh) = with_attributes_file("FFT_NAVG", FFTProcessor::new(), xml);
+        let port = handle.port_runtime().port_handle();
+        let reason = |name| {
+            port.drv_user_create_blocking(&asyn_rs::port::DrvUserRequest::new(name, 0))
+                .unwrap()
+                .reason
+        };
+        let (avg, reset) = (reason("FFT_NUM_AVERAGE"), reason("FFT_RESET_AVERAGE"));
+        let mut level = 0.0;
+        let mut run = |writes: &[(usize, i32)], width: usize, frames: usize| {
+            for &(r, v) in writes {
+                port.write_int32_blocking(r, 0, v).unwrap();
+            }
+            assert!(handle.wait_params_applied(std::time::Duration::from_secs(10)));
+            (0..frames)
+                .map(|_| {
+                    // A constant frame's DC magnitude is its level.
+                    level += 1.0;
+                    let mut arr = NDArray::new(vec![NDDimension::new(width)], NDDataType::Float64);
+                    if let NDDataBuffer::F64(ref mut v) = arr.data {
+                        v.fill(level);
+                    }
+                    publish(&handle, &arr);
+                    let out = rx.blocking_recv().unwrap();
+                    let n = match out.attributes.get("Averaged").map(|a| &a.value) {
+                        Some(NDAttrValue::Int32(n)) => *n,
+                        other => panic!("Averaged = {other:?}"),
+                    };
+                    (n, out.data.get_as_f64(0) == Some(level))
+                })
+                .collect::<Vec<_>>()
+        };
+        let (t, f) = (true, false);
+        // The template's PINI writes.
+        assert_eq!(run(&[(avg, 1), (reset, 1)], 8, 3), [(1, t); 3]);
+        assert_eq!(
+            run(&[(avg, 4)], 8, 6),
+            [(2, t), (3, f), (4, f), (4, f), (4, f), (4, f)]
+        );
+        assert_eq!(run(&[(reset, 1)], 8, 3), [(2, t), (3, f), (4, f)]);
+        assert_eq!(
+            port.read_int32_blocking(reset, 0).unwrap(),
+            0,
+            "C clears it (:192)"
+        );
+        assert_eq!(run(&[(avg, 2)], 8, 3), [(2, t), (2, f), (2, f)]);
+        assert_eq!(run(&[(avg, 4)], 8, 3), [(2, t), (3, f), (4, f)]);
+        assert_eq!(run(&[(reset, 1), (reset, 0)], 8, 2), [(4, f); 2]);
+        assert_eq!(run(&[(avg, 3), (avg, 4)], 8, 2), [(4, f); 2]);
+        assert_eq!(run(&[(avg, 0)], 8, 3), [(1, t); 3]);
+        assert_eq!(run(&[(avg, 4)], 8, 3), [(2, t), (3, f), (4, f)]);
+        // C posts 4, 4 here: it zeroes FFTAbsValue_ on the new size (:111-115)
+        // but keeps numAveraged, so the frames average against zeros.
+        assert_eq!(run(&[], 4, 2), [(2, t), (3, f)]);
     }
 
     /// The id comes off the plugin's own counter and runs 0, 1, 2 — C's

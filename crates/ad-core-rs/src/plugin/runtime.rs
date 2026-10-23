@@ -5292,16 +5292,21 @@ mod tests {
         use crate::ndarray::NDDataBuffer;
         use asyn_rs::interfaces::InterfaceType::{Float64Array, Int32Array};
         for (port, data, int32, float64) in [
-            ("STDU8", NDDataBuffer::U8(vec![255]), "[255]", "[255.0]"),
+            (
+                "STDU8",
+                NDDataBuffer::from_vec::<u8>(vec![255]),
+                "[255]",
+                "[255.0]",
+            ),
             (
                 "STDU16",
-                NDDataBuffer::U16(vec![65535]),
+                NDDataBuffer::from_vec::<u16>(vec![65535]),
                 "[65535]",
                 "[65535.0]",
             ),
             (
                 "STDU32",
-                NDDataBuffer::U32(vec![u32::MAX]),
+                NDDataBuffer::from_vec::<u32>(vec![u32::MAX]),
                 "[-1]",
                 "[4294967295.0]",
             ),
@@ -5330,7 +5335,7 @@ mod tests {
     fn a_std_arrays_frame_with_no_bound_interface_posts_nothing() {
         let (posts, observed) = std_array_posts(
             "STDNONE",
-            crate::ndarray::NDDataBuffer::U8(vec![255]),
+            crate::ndarray::NDDataBuffer::from_vec::<u8>(vec![255]),
             &[],
             Sweep::First,
         );
@@ -5346,7 +5351,7 @@ mod tests {
         use asyn_rs::interfaces::InterfaceType::Int32Array;
         let (posts, observed) = std_array_posts(
             "STDSWEEP",
-            crate::ndarray::NDDataBuffer::U8(vec![255]),
+            crate::ndarray::NDDataBuffer::from_vec::<u8>(vec![255]),
             &[Int32Array],
             Sweep::AfterTheFrame,
         );

@@ -72,6 +72,138 @@ pub enum NDDataBuffer {
     F64(Vec<f64>),
 }
 
+/// An [`NDDataBuffer`]'s elements read as its element type: C's `pData` cast
+/// by `dataType`.
+#[derive(Debug, Clone, Copy)]
+pub enum NDDataView<'a> {
+    I8(&'a [i8]),
+    U8(&'a [u8]),
+    I16(&'a [i16]),
+    U16(&'a [u16]),
+    I32(&'a [i32]),
+    U32(&'a [u32]),
+    I64(&'a [i64]),
+    U64(&'a [u64]),
+    F32(&'a [f32]),
+    F64(&'a [f64]),
+}
+
+/// [`NDDataView`] for writing.
+#[derive(Debug)]
+pub enum NDDataViewMut<'a> {
+    I8(&'a mut [i8]),
+    U8(&'a mut [u8]),
+    I16(&'a mut [i16]),
+    U16(&'a mut [u16]),
+    I32(&'a mut [i32]),
+    U32(&'a mut [u32]),
+    I64(&'a mut [i64]),
+    U64(&'a mut [u64]),
+    F32(&'a mut [f32]),
+    F64(&'a mut [f64]),
+}
+
+macro_rules! view_common {
+    ($view:ident) => {
+        impl $view<'_> {
+            pub fn data_type(&self) -> NDDataType {
+                match self {
+                    Self::I8(_) => NDDataType::Int8,
+                    Self::U8(_) => NDDataType::UInt8,
+                    Self::I16(_) => NDDataType::Int16,
+                    Self::U16(_) => NDDataType::UInt16,
+                    Self::I32(_) => NDDataType::Int32,
+                    Self::U32(_) => NDDataType::UInt32,
+                    Self::I64(_) => NDDataType::Int64,
+                    Self::U64(_) => NDDataType::UInt64,
+                    Self::F32(_) => NDDataType::Float32,
+                    Self::F64(_) => NDDataType::Float64,
+                }
+            }
+
+            pub fn len(&self) -> usize {
+                match self {
+                    Self::I8(v) => v.len(),
+                    Self::U8(v) => v.len(),
+                    Self::I16(v) => v.len(),
+                    Self::U16(v) => v.len(),
+                    Self::I32(v) => v.len(),
+                    Self::U32(v) => v.len(),
+                    Self::I64(v) => v.len(),
+                    Self::U64(v) => v.len(),
+                    Self::F32(v) => v.len(),
+                    Self::F64(v) => v.len(),
+                }
+            }
+
+            pub fn is_empty(&self) -> bool {
+                self.len() == 0
+            }
+        }
+    };
+}
+
+view_common!(NDDataView);
+view_common!(NDDataViewMut);
+
+mod sealed {
+    use super::{NDDataBuffer, NDDataView, NDDataViewMut};
+
+    /// What ties an element type to its [`NDDataView`] variant; outside
+    /// this crate no type can claim one.
+    pub trait Sealed: Sized {
+        fn of(view: NDDataView<'_>) -> Option<&[Self]>;
+        fn of_mut(view: NDDataViewMut<'_>) -> Option<&mut [Self]>;
+        fn wrap(v: Vec<Self>) -> NDDataBuffer;
+    }
+}
+
+/// One of the ten element types of an [`NDDataBuffer`], C's `NDDataType_t`.
+pub trait NDElement: sealed::Sealed + crate::pixel_cast::PixelCast {
+    const DATA_TYPE: NDDataType;
+}
+
+macro_rules! nd_element {
+    ($($t:ty => $variant:ident, $data_type:ident;)*) => {$(
+        impl sealed::Sealed for $t {
+            fn of(view: NDDataView<'_>) -> Option<&[Self]> {
+                match view {
+                    NDDataView::$variant(v) => Some(v),
+                    _ => None,
+                }
+            }
+
+            fn of_mut(view: NDDataViewMut<'_>) -> Option<&mut [Self]> {
+                match view {
+                    NDDataViewMut::$variant(v) => Some(v),
+                    _ => None,
+                }
+            }
+
+            fn wrap(v: Vec<Self>) -> NDDataBuffer {
+                NDDataBuffer::$variant(v)
+            }
+        }
+
+        impl NDElement for $t {
+            const DATA_TYPE: NDDataType = NDDataType::$data_type;
+        }
+    )*};
+}
+
+nd_element! {
+    i8 => I8, Int8;
+    u8 => U8, UInt8;
+    i16 => I16, Int16;
+    u16 => U16, UInt16;
+    i32 => I32, Int32;
+    u32 => U32, UInt32;
+    i64 => I64, Int64;
+    u64 => U64, UInt64;
+    f32 => F32, Float32;
+    f64 => F64, Float64;
+}
+
 /// An empty `UInt8` buffer: what [`NDArray`]'s destructor leaves behind once
 /// the real buffer has gone back to its pool. Allocates nothing.
 impl Default for NDDataBuffer {
@@ -81,6 +213,58 @@ impl Default for NDDataBuffer {
 }
 
 impl NDDataBuffer {
+    /// A buffer holding `v`.
+    pub fn from_vec<T: NDElement>(v: Vec<T>) -> Self {
+        T::wrap(v)
+    }
+
+    /// A buffer holding a copy of `v`.
+    pub fn from_slice<T: NDElement>(v: &[T]) -> Self {
+        T::wrap(v.to_vec())
+    }
+
+    /// The elements as their element type.
+    pub fn view(&self) -> NDDataView<'_> {
+        match self {
+            Self::I8(v) => NDDataView::I8(v),
+            Self::U8(v) => NDDataView::U8(v),
+            Self::I16(v) => NDDataView::I16(v),
+            Self::U16(v) => NDDataView::U16(v),
+            Self::I32(v) => NDDataView::I32(v),
+            Self::U32(v) => NDDataView::U32(v),
+            Self::I64(v) => NDDataView::I64(v),
+            Self::U64(v) => NDDataView::U64(v),
+            Self::F32(v) => NDDataView::F32(v),
+            Self::F64(v) => NDDataView::F64(v),
+        }
+    }
+
+    /// [`view`](Self::view) for writing the elements in place.
+    pub fn view_mut(&mut self) -> NDDataViewMut<'_> {
+        match self {
+            Self::I8(v) => NDDataViewMut::I8(v),
+            Self::U8(v) => NDDataViewMut::U8(v),
+            Self::I16(v) => NDDataViewMut::I16(v),
+            Self::U16(v) => NDDataViewMut::U16(v),
+            Self::I32(v) => NDDataViewMut::I32(v),
+            Self::U32(v) => NDDataViewMut::U32(v),
+            Self::I64(v) => NDDataViewMut::I64(v),
+            Self::U64(v) => NDDataViewMut::U64(v),
+            Self::F32(v) => NDDataViewMut::F32(v),
+            Self::F64(v) => NDDataViewMut::F64(v),
+        }
+    }
+
+    /// The elements as `T`, `None` unless `T` is the element type.
+    pub fn as_slice<T: NDElement>(&self) -> Option<&[T]> {
+        T::of(self.view())
+    }
+
+    /// [`as_slice`](Self::as_slice) for writing.
+    pub fn as_mut_slice<T: NDElement>(&mut self) -> Option<&mut [T]> {
+        T::of_mut(self.view_mut())
+    }
+
     pub fn zeros(data_type: NDDataType, count: usize) -> Self {
         match data_type {
             NDDataType::Int8 => Self::I8(vec![0; count]),
@@ -430,10 +614,14 @@ impl NDDataBuffer {
             }
         }
         #[cfg(not(feature = "simd"))]
-        crate::with_buffer_mut_typed!(self, |v: T| {
-            v.clear();
-            v.extend(values.iter().map(|&x| x as T));
-        });
+        {
+            self.resize(values.len());
+            crate::with_buffer_mut_typed!(self, |v: T| {
+                for (o, &x) in v.iter_mut().zip(values) {
+                    *o = x as T;
+                }
+            });
+        }
     }
 
     /// Make this buffer a copy of `src`. A same-typed buffer is refilled in
@@ -909,7 +1097,7 @@ mod tests {
 
     #[test]
     fn test_buffer_as_u8_slice() {
-        let buf = NDDataBuffer::U8(vec![1, 2, 3]);
+        let buf = NDDataBuffer::from_vec::<u8>(vec![1, 2, 3]);
         assert_eq!(buf.as_u8_slice(), &[1, 2, 3]);
     }
 
@@ -934,7 +1122,7 @@ mod tests {
             vec![NDDimension::new(10), NDDimension::new(20)],
             NDDataType::UInt8,
         );
-        arr.data = NDDataBuffer::U8(vec![0; 100]);
+        arr.data = NDDataBuffer::from_vec::<u8>(vec![0; 100]);
         assert!(arr.validate().is_err());
     }
 
@@ -1108,7 +1296,7 @@ mod tests {
 
     #[test]
     fn as_u8_slice_mut_writes_the_elements_in_place() {
-        let mut buf = NDDataBuffer::U16(vec![0, 0]);
+        let mut buf = NDDataBuffer::from_vec::<u16>(vec![0, 0]);
         buf.as_u8_slice_mut().copy_from_slice(
             &1u16
                 .to_ne_bytes()
@@ -1116,11 +1304,11 @@ mod tests {
                 .chain(2u16.to_ne_bytes())
                 .collect::<Vec<_>>(),
         );
-        let NDDataBuffer::U16(v) = &buf else {
+        let NDDataView::U16(v) = buf.view() else {
             panic!("the variant does not change");
         };
         assert_eq!(v, &[1, 2]);
-        let mut empty = NDDataBuffer::F64(vec![]);
+        let mut empty = NDDataBuffer::from_vec::<f64>(vec![]);
         assert!(empty.as_u8_slice_mut().is_empty());
     }
 

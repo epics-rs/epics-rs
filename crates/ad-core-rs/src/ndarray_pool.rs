@@ -830,6 +830,7 @@ impl std::ops::Deref for PersistentArray {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ndarray::{NDDataView, NDDataViewMut};
 
     /// A refill is never refused, held publish or not, and the pool counts
     /// the persistent array's one buffer throughout, as C's `pFlatField`.
@@ -904,11 +905,14 @@ mod tests {
         assert_eq!((pool.num_alloc_buffers(), pool.num_free_buffers()), (1, 1));
 
         let frame = pool
-            .alloc_with(vec![NDDimension::new(8)], NDDataBuffer::U8(vec![7; 8]))
+            .alloc_with(
+                vec![NDDimension::new(8)],
+                NDDataBuffer::from_vec::<u8>(vec![7; 8]),
+            )
             .unwrap();
         assert_eq!((pool.num_alloc_buffers(), pool.num_free_buffers()), (1, 0));
         assert_eq!(pool.allocated_bytes(), 8);
-        assert!(matches!(&frame.data, NDDataBuffer::U8(v) if v == &vec![7; 8]));
+        assert!(matches!(frame.data.view(), NDDataView::U8(v) if v == [7; 8]));
         assert_eq!(frame.pool_id(), pool.id());
         assert!(Arc::ptr_eq(&frame.owner().unwrap(), &owner));
         drop(frame);
@@ -925,13 +929,19 @@ mod tests {
             pool.alloc(vec![NDDimension::new(50)], NDDataType::UInt8)
                 .unwrap(),
         );
-        let refused = pool.alloc_with(vec![NDDimension::new(100)], NDDataBuffer::U8(vec![0; 100]));
+        let refused = pool.alloc_with(
+            vec![NDDimension::new(100)],
+            NDDataBuffer::from_vec::<u8>(vec![0; 100]),
+        );
         assert!(matches!(refused, Err(ADError::PoolExhausted(100, 64))));
         assert_eq!(pool.allocated_bytes(), 0);
         assert_eq!((pool.num_alloc_buffers(), pool.num_free_buffers()), (0, 0));
 
         let frame = pool
-            .alloc_with(vec![NDDimension::new(60)], NDDataBuffer::U8(vec![0; 60]))
+            .alloc_with(
+                vec![NDDimension::new(60)],
+                NDDataBuffer::from_vec::<u8>(vec![0; 60]),
+            )
             .unwrap();
         assert_eq!(frame.data_size, 60);
         assert_eq!(pool.allocated_bytes(), 60);
@@ -1037,7 +1047,7 @@ mod tests {
         let mut source = pool
             .alloc(vec![NDDimension::new(4)], NDDataType::UInt8)
             .unwrap();
-        if let NDDataBuffer::U8(ref mut v) = source.data {
+        if let NDDataViewMut::U8(v) = source.data.view_mut() {
             v[0] = 1;
             v[1] = 2;
             v[2] = 3;
@@ -1047,7 +1057,7 @@ mod tests {
         let copy = pool.alloc_copy(&source).unwrap();
         assert_eq!(copy.unique_id, source.unique_id);
         assert_eq!(copy.dims.len(), source.dims.len());
-        if let NDDataBuffer::U8(ref v) = copy.data {
+        if let NDDataView::U8(v) = copy.data.view() {
             assert_eq!(v, &[1, 2, 3, 4]);
         } else {
             panic!("wrong type");
@@ -1151,9 +1161,8 @@ mod tests {
         let mut a = pool
             .alloc(vec![NDDimension::new(100)], NDDataType::UInt8)
             .unwrap();
-        if let NDDataBuffer::U8(ref mut v) = a.data {
-            v.reserve_exact(200);
-        }
+        a.data = NDDataBuffer::zeros(NDDataType::UInt8, 200);
+        a.data.resize(100);
         pool.release(a);
         let b = pool
             .alloc(vec![NDDimension::new(150)], NDDataType::UInt8)
@@ -1178,7 +1187,10 @@ mod tests {
         pool.release(big);
         pool.release(small);
         let w = pool
-            .alloc_with(vec![NDDimension::new(800)], NDDataBuffer::U8(vec![0; 800]))
+            .alloc_with(
+                vec![NDDimension::new(800)],
+                NDDataBuffer::from_vec::<u8>(vec![0; 800]),
+            )
             .unwrap();
         assert_eq!(w.data_size, 1000);
         assert_eq!(w.data.len(), 800);
@@ -1265,7 +1277,7 @@ mod tests {
     fn test_convert_type_same_type() {
         let pool = NDArrayPool::new(1_000_000);
         let mut src = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
-        if let NDDataBuffer::U8(ref mut v) = src.data {
+        if let NDDataViewMut::U8(v) = src.data.view_mut() {
             v[0] = 10;
             v[1] = 20;
             v[2] = 30;
@@ -1274,7 +1286,7 @@ mod tests {
 
         let out = pool.convert_type(&src, NDDataType::UInt8).unwrap();
         assert_eq!(out.data.data_type(), NDDataType::UInt8);
-        if let NDDataBuffer::U8(ref v) = out.data {
+        if let NDDataView::U8(v) = out.data.view() {
             assert_eq!(v, &[10, 20, 30, 40]);
         } else {
             panic!("wrong type");
@@ -1285,7 +1297,7 @@ mod tests {
     fn test_convert_type_u8_to_f32() {
         let pool = NDArrayPool::new(1_000_000);
         let mut src = NDArray::new(vec![NDDimension::new(3)], NDDataType::UInt8);
-        if let NDDataBuffer::U8(ref mut v) = src.data {
+        if let NDDataViewMut::U8(v) = src.data.view_mut() {
             v[0] = 0;
             v[1] = 128;
             v[2] = 255;
@@ -1293,7 +1305,7 @@ mod tests {
 
         let out = pool.convert_type(&src, NDDataType::Float32).unwrap();
         assert_eq!(out.data.data_type(), NDDataType::Float32);
-        if let NDDataBuffer::F32(ref v) = out.data {
+        if let NDDataView::F32(v) = out.data.view() {
             assert_eq!(v[0], 0.0);
             assert_eq!(v[1], 128.0);
             assert_eq!(v[2], 255.0);
@@ -1309,13 +1321,13 @@ mod tests {
     fn test_convert_type_u16_to_u8_wraps_like_a_c_cast() {
         let pool = NDArrayPool::new(1_000_000);
         let mut src = NDArray::new(vec![NDDimension::new(2)], NDDataType::UInt16);
-        if let NDDataBuffer::U16(ref mut v) = src.data {
+        if let NDDataViewMut::U16(v) = src.data.view_mut() {
             v[0] = 100;
             v[1] = 300;
         }
 
         let out = pool.convert_type(&src, NDDataType::UInt8).unwrap();
-        if let NDDataBuffer::U8(ref v) = out.data {
+        if let NDDataView::U8(v) = out.data.view() {
             assert_eq!(v[0], 100);
             assert_eq!(v[1], 44, "300 % 256 == 44, not a clamp to 255");
         } else {
@@ -1331,7 +1343,7 @@ mod tests {
             vec![NDDimension::new(4), NDDimension::new(4)],
             NDDataType::UInt8,
         );
-        if let NDDataBuffer::U8(ref mut v) = arr.data {
+        if let NDDataViewMut::U8(v) = arr.data.view_mut() {
             for i in 0..16 {
                 v[i] = i as u8;
             }
@@ -1362,7 +1374,7 @@ mod tests {
         let out = pool.convert(&src, &dims_out, NDDataType::UInt8).unwrap();
         assert_eq!(out.dims[0].size, 4);
         assert_eq!(out.dims[1].size, 4);
-        if let NDDataBuffer::U8(ref v) = out.data {
+        if let NDDataView::U8(v) = out.data.view() {
             for i in 0..16 {
                 assert_eq!(v[i], i as u8);
             }
@@ -1397,7 +1409,7 @@ mod tests {
         // Source layout (row-major, dim0=x fastest):
         //   row0: [0,1,2,3], row1: [4,5,6,7], row2: [8,9,10,11], row3: [12,13,14,15]
         // offset (1,1) -> src[1+1*4]=5, src[2+1*4]=6, src[1+2*4]=9, src[2+2*4]=10
-        if let NDDataBuffer::U8(ref v) = out.data {
+        if let NDDataView::U8(v) = out.data.view() {
             assert_eq!(v[0], 5);
             assert_eq!(v[1], 6);
             assert_eq!(v[2], 9);
@@ -1438,7 +1450,7 @@ mod tests {
         // top-right 2x2: sum = 2+3+6+7 = 18
         // bottom-left 2x2: sum = 8+9+12+13 = 42
         // bottom-right 2x2: sum = 10+11+14+15 = 50
-        if let NDDataBuffer::U8(ref v) = out.data {
+        if let NDDataView::U8(v) = out.data.view() {
             assert_eq!(v[0], 10);
             assert_eq!(v[1], 18);
             assert_eq!(v[2], 42);
@@ -1509,8 +1521,8 @@ mod tests {
         let out = pool
             .convert(&src, &bin_2x2_to_one(), NDDataType::UInt16)
             .unwrap();
-        match out.data {
-            NDDataBuffer::U16(ref v) => assert_eq!(v[0], 800, "C sums in u16: 200*4"),
+        match out.data.view() {
+            NDDataView::U16(v) => assert_eq!(v[0], 800, "C sums in u16: 200*4"),
             ref other => panic!("expected U16, got {:?}", other.data_type()),
         }
     }
@@ -1525,8 +1537,8 @@ mod tests {
         let out = pool
             .convert(&src, &bin_2x2_to_one(), NDDataType::UInt8)
             .unwrap();
-        match out.data {
-            NDDataBuffer::U8(ref v) => assert_eq!(v[0], 144, "400 wraps mod 256 in u8"),
+        match out.data.view() {
+            NDDataView::U8(v) => assert_eq!(v[0], 144, "400 wraps mod 256 in u8"),
             ref other => panic!("expected U8, got {:?}", other.data_type()),
         }
     }
@@ -1543,7 +1555,7 @@ mod tests {
             vec![NDDimension::new(1), NDDimension::new(1)],
             NDDataType::Int64,
         );
-        if let NDDataBuffer::I64(ref mut v) = src.data {
+        if let NDDataViewMut::I64(v) = src.data.view_mut() {
             v[0] = value;
         }
         let dims_out = vec![
@@ -1561,8 +1573,8 @@ mod tests {
             },
         ];
         let out = pool.convert(&src, &dims_out, NDDataType::Int64).unwrap();
-        match out.data {
-            NDDataBuffer::I64(ref v) => assert_eq!(v[0], value, "2^53+1 kept exactly"),
+        match out.data.view() {
+            NDDataView::I64(v) => assert_eq!(v[0], value, "2^53+1 kept exactly"),
             ref other => panic!("expected I64, got {:?}", other.data_type()),
         }
     }
@@ -1575,7 +1587,7 @@ mod tests {
             vec![NDDimension::new(4), NDDimension::new(1)],
             NDDataType::UInt8,
         );
-        if let NDDataBuffer::U8(ref mut v) = src.data {
+        if let NDDataViewMut::U8(v) = src.data.view_mut() {
             v[0] = 10;
             v[1] = 20;
             v[2] = 30;
@@ -1598,7 +1610,7 @@ mod tests {
         ];
 
         let out = pool.convert(&src, &dims_out, NDDataType::UInt8).unwrap();
-        if let NDDataBuffer::U8(ref v) = out.data {
+        if let NDDataView::U8(v) = out.data.view() {
             assert_eq!(v[0], 40);
             assert_eq!(v[1], 30);
             assert_eq!(v[2], 20);
@@ -1616,7 +1628,7 @@ mod tests {
             vec![NDDimension::new(2), NDDimension::new(2)],
             NDDataType::UInt16,
         );
-        if let NDDataBuffer::U16(ref mut v) = src.data {
+        if let NDDataViewMut::U16(v) = src.data.view_mut() {
             // row0: [1, 2], row1: [3, 4]
             v[0] = 1;
             v[1] = 2;
@@ -1640,7 +1652,7 @@ mod tests {
         ];
 
         let out = pool.convert(&src, &dims_out, NDDataType::UInt16).unwrap();
-        if let NDDataBuffer::U16(ref v) = out.data {
+        if let NDDataView::U16(v) = out.data.view() {
             // Y reversed: row0 now has row1 data, row1 has row0 data
             assert_eq!(v[0], 3);
             assert_eq!(v[1], 4);
@@ -1675,7 +1687,7 @@ mod tests {
         assert_eq!(out.data.data_type(), NDDataType::Float32);
         assert_eq!(out.dims[0].size, 2);
         assert_eq!(out.dims[1].size, 2);
-        if let NDDataBuffer::F32(ref v) = out.data {
+        if let NDDataView::F32(v) = out.data.view() {
             assert_eq!(v[0], 10.0); // 0+1+4+5
             assert_eq!(v[1], 18.0); // 2+3+6+7
         } else {
@@ -1695,7 +1707,7 @@ mod tests {
         src.dims[0].binning = 2;
         src.dims[1].offset = 20;
         src.dims[1].binning = 3;
-        if let NDDataBuffer::U8(ref mut v) = src.data {
+        if let NDDataViewMut::U8(v) = src.data.view_mut() {
             for i in 0..16 {
                 v[i] = i as u8;
             }
@@ -1730,7 +1742,7 @@ mod tests {
         // 1D: 8 elements, offset=2, size=4, binning=2 -> 2 output elements
         let pool = NDArrayPool::new(1_000_000);
         let mut src = NDArray::new(vec![NDDimension::new(8)], NDDataType::UInt16);
-        if let NDDataBuffer::U16(ref mut v) = src.data {
+        if let NDDataViewMut::U16(v) = src.data.view_mut() {
             for i in 0..8 {
                 v[i] = (i * 10) as u16;
             }
@@ -1747,7 +1759,7 @@ mod tests {
         let out = pool.convert(&src, &dims_out, NDDataType::UInt16).unwrap();
         assert_eq!(out.dims.len(), 1);
         assert_eq!(out.dims[0].size, 2);
-        if let NDDataBuffer::U16(ref v) = out.data {
+        if let NDDataView::U16(v) = out.data.view() {
             // offset=2: src[2]=20, src[3]=30 -> sum=50
             // next: src[4]=40, src[5]=50 -> sum=90
             assert_eq!(v[0], 50);
@@ -1769,7 +1781,7 @@ mod tests {
             ],
             NDDataType::UInt8,
         );
-        if let NDDataBuffer::U8(ref mut v) = src.data {
+        if let NDDataViewMut::U8(v) = src.data.view_mut() {
             for i in 0..8 {
                 v[i] = (i + 1) as u8;
             }
@@ -1797,7 +1809,7 @@ mod tests {
         ];
 
         let out = pool.convert(&src, &dims_out, NDDataType::UInt8).unwrap();
-        if let NDDataBuffer::U8(ref v) = out.data {
+        if let NDDataView::U8(v) = out.data.view() {
             for i in 0..8 {
                 assert_eq!(v[i], (i + 1) as u8);
             }
@@ -1875,7 +1887,7 @@ mod tests {
         // 4x1, binning=2, reverse=true
         let pool = NDArrayPool::new(1_000_000);
         let mut src = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt16);
-        if let NDDataBuffer::U16(ref mut v) = src.data {
+        if let NDDataViewMut::U16(v) = src.data.view_mut() {
             v[0] = 1;
             v[1] = 2;
             v[2] = 3;
@@ -1891,7 +1903,7 @@ mod tests {
 
         let out = pool.convert(&src, &dims_out, NDDataType::UInt16).unwrap();
         assert_eq!(out.dims[0].size, 2);
-        if let NDDataBuffer::U16(ref v) = out.data {
+        if let NDDataView::U16(v) = out.data.view() {
             // Without reverse: [1+2, 3+4] = [3, 7]
             // With reverse: output[0] reads from high end, output[1] from low end
             // eff_coords[0] for out_coord=0 with reverse => size-1-0 = 1 -> src[2..3] = 3+4 = 7
@@ -2095,13 +2107,13 @@ mod tests {
     fn test_copy_allocates_and_copies() {
         let pool = NDArrayPool::new(1_000_000);
         let mut src = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
-        if let NDDataBuffer::U8(ref mut v) = src.data {
+        if let NDDataViewMut::U8(v) = src.data.view_mut() {
             v.copy_from_slice(&[9, 8, 7, 6]);
         }
         let out = pool.copy(&src, None, true, true, true).unwrap();
         assert_eq!(out.pool_id(), pool.id());
         assert_eq!(out.dims.len(), 1);
-        if let NDDataBuffer::U8(ref v) = out.data {
+        if let NDDataView::U8(v) = out.data.view() {
             assert_eq!(v, &[9, 8, 7, 6]);
         } else {
             panic!("wrong type");

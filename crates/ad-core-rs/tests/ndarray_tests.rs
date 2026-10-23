@@ -10,7 +10,9 @@
 //! - NDArray copy/clone behavior
 
 use ad_core_rs::attributes::{NDAttrSource, NDAttrValue, NDAttribute, NDAttributeList};
-use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDataType, NDDimension};
+use ad_core_rs::ndarray::{
+    NDArray, NDDataBuffer, NDDataType, NDDataView, NDDataViewMut, NDDimension,
+};
 use ad_core_rs::ndarray_pool::NDArrayPool;
 
 // ---------------------------------------------------------------------------
@@ -378,7 +380,7 @@ fn buffer_is_empty() {
 #[test]
 fn buffer_direct_vec_access() {
     let mut arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
-    if let NDDataBuffer::U8(ref mut v) = arr.data {
+    if let NDDataViewMut::U8(v) = arr.data.view_mut() {
         v[0] = 10;
         v[1] = 20;
         v[2] = 30;
@@ -580,7 +582,7 @@ fn pool_alloc_copy_preserves_data_and_unique_id() {
     let mut source = pool
         .alloc(vec![NDDimension::new(4)], NDDataType::UInt8)
         .unwrap();
-    if let NDDataBuffer::U8(ref mut v) = source.data {
+    if let NDDataViewMut::U8(v) = source.data.view_mut() {
         v[0] = 1;
         v[1] = 2;
         v[2] = 3;
@@ -591,7 +593,7 @@ fn pool_alloc_copy_preserves_data_and_unique_id() {
     // C's NDArrayPool::copy carries uniqueId across (NDArrayPool.cpp:283).
     assert_eq!(copy.unique_id, source.unique_id);
     assert_eq!(copy.dims.len(), source.dims.len());
-    if let NDDataBuffer::U8(ref v) = copy.data {
+    if let NDDataView::U8(v) = copy.data.view() {
         assert_eq!(v, &[1, 2, 3, 4]);
     } else {
         panic!("wrong data type in copy");
@@ -629,7 +631,7 @@ fn validate_fails_for_mismatched_buffer() {
         NDDataType::UInt8,
     );
     // Replace buffer with wrong size
-    arr.data = NDDataBuffer::U8(vec![0; 100]);
+    arr.data = NDDataBuffer::from_vec::<u8>(vec![0; 100]);
     assert!(arr.validate().is_err());
 }
 

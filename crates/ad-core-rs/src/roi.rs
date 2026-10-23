@@ -101,7 +101,7 @@ pub fn crop_roi(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ndarray::{NDDataBuffer, NDDataType, NDDimension};
+    use crate::ndarray::{NDDataBuffer, NDDataType, NDDataView, NDDimension};
 
     fn make_mono_array(size_x: usize, size_y: usize, data: NDDataBuffer) -> NDArray {
         let dims = vec![NDDimension::new(size_x), NDDimension::new(size_y)];
@@ -129,9 +129,9 @@ mod tests {
             size_y: 3,
         };
         let data: Vec<f64> = (0..12).map(|x| x as f64).collect();
-        let arr = make_mono_array(4, 3, NDDataBuffer::F64(data.clone()));
+        let arr = make_mono_array(4, 3, NDDataBuffer::from_vec::<f64>(data.clone()));
         let result = crop_roi(&NDArrayPool::new(0), &arr, &layout, 0, 0, 4, 3).unwrap();
-        if let NDDataBuffer::F64(v) = &result.data {
+        if let NDDataView::F64(v) = result.data.view() {
             assert_eq!(v, &data);
         }
     }
@@ -144,9 +144,9 @@ mod tests {
             size_y: 4,
         };
         let data: Vec<f64> = (0..16).map(|x| x as f64).collect();
-        let arr = make_mono_array(4, 4, NDDataBuffer::F64(data));
+        let arr = make_mono_array(4, 4, NDDataBuffer::from_vec::<f64>(data));
         let result = crop_roi(&NDArrayPool::new(0), &arr, &layout, 1, 1, 2, 2).unwrap();
-        if let NDDataBuffer::F64(v) = &result.data {
+        if let NDDataView::F64(v) = result.data.view() {
             assert_eq!(v, &[5.0, 6.0, 9.0, 10.0]);
         }
         assert_eq!(result.dims.len(), 2);
@@ -165,9 +165,9 @@ mod tests {
             size_y: 2,
         };
         let data: Vec<u8> = (0..12).collect();
-        let arr = make_rgb1_array(2, 2, NDDataBuffer::U8(data.clone()));
+        let arr = make_rgb1_array(2, 2, NDDataBuffer::from_vec::<u8>(data.clone()));
         let result = crop_roi(&NDArrayPool::new(0), &arr, &layout, 0, 0, 2, 2).unwrap();
-        if let NDDataBuffer::U8(v) = &result.data {
+        if let NDDataView::U8(v) = result.data.view() {
             assert_eq!(v, &data);
         }
     }
@@ -188,9 +188,9 @@ mod tests {
                 data[base + 2] = (x * 10 + y + 200) as u8;
             }
         }
-        let arr = make_rgb1_array(3, 3, NDDataBuffer::U8(data));
+        let arr = make_rgb1_array(3, 3, NDDataBuffer::from_vec::<u8>(data));
         let result = crop_roi(&NDArrayPool::new(0), &arr, &layout, 1, 1, 2, 2).unwrap();
-        if let NDDataBuffer::U8(v) = &result.data {
+        if let NDDataView::U8(v) = result.data.view() {
             assert_eq!(v.len(), 12);
             assert_eq!(v[0], 11);
             assert_eq!(v[1], 111);
@@ -209,7 +209,7 @@ mod tests {
             size_y: 4,
         };
         let data: Vec<u8> = (0..16).collect();
-        let arr = make_mono_array(4, 4, NDDataBuffer::U8(data));
+        let arr = make_mono_array(4, 4, NDDataBuffer::from_vec::<u8>(data));
         let result = crop_roi(&NDArrayPool::new(0), &arr, &layout, 2, 2, 10, 10).unwrap();
         assert_eq!(result.dims[0].size, 2);
         assert_eq!(result.dims[1].size, 2);
@@ -232,7 +232,7 @@ mod tests {
             };
             let n = src_layout.num_elements() as u16;
             let mut src = NDArray::new(src_layout.make_dims(), NDDataType::UInt16);
-            src.data = NDDataBuffer::U16((0..n).collect());
+            src.data = NDDataBuffer::from_vec::<u16>((0..n).collect());
             let pool = NDArrayPool::new(0);
             for (min_x, min_y, size_x, size_y) in [(1, 2, 3, 2), (2, 1, 3, 2), (0, 0, 5, 4)] {
                 let dst_layout = ColorLayout {
@@ -250,7 +250,7 @@ mod tests {
                     }
                 }
                 let out = crop_roi(&pool, &src, &src_layout, min_x, min_y, size_x, size_y).unwrap();
-                let NDDataBuffer::U16(got) = &out.data else {
+                let NDDataView::U16(got) = out.data.view() else {
                     panic!("{:?}", out.data.data_type());
                 };
                 assert_eq!(got, &want, "{mode:?} ({min_x},{min_y}) {size_x}x{size_y}");
@@ -267,7 +267,7 @@ mod tests {
             size_x: 4,
             size_y: 4,
         };
-        let arr = make_mono_array(4, 4, NDDataBuffer::U16((0..16).collect()));
+        let arr = make_mono_array(4, 4, NDDataBuffer::from_vec::<u16>((0..16).collect()));
         for (min_x, size_x) in [(0, 4), (1, 2)] {
             let pool = NDArrayPool::new(0);
             let first = crop_roi(&pool, &arr, &layout, min_x, 0, size_x, 4).unwrap();
@@ -288,9 +288,13 @@ mod tests {
             size_y: 2,
         };
         let big = (1u64 << 53) + 1;
-        let arr = make_mono_array(2, 2, NDDataBuffer::U64(vec![1, big, 3, u64::MAX]));
+        let arr = make_mono_array(
+            2,
+            2,
+            NDDataBuffer::from_vec::<u64>(vec![1, big, 3, u64::MAX]),
+        );
         let out = crop_roi(&NDArrayPool::new(0), &arr, &layout, 1, 0, 1, 2).unwrap();
-        let NDDataBuffer::U64(v) = &out.data else {
+        let NDDataView::U64(v) = out.data.view() else {
             panic!("{:?}", out.data.data_type());
         };
         assert_eq!(v, &[big, u64::MAX]);
@@ -306,7 +310,7 @@ mod tests {
             size_x: 4,
             size_y: 4,
         };
-        let mut arr = make_rgb1_array(4, 4, NDDataBuffer::U8(vec![0; 48]));
+        let mut arr = make_rgb1_array(4, 4, NDDataBuffer::from_vec::<u8>(vec![0; 48]));
         for (d, (offset, binning)) in arr.dims.iter_mut().zip([(1, 1), (8, 2), (4, 3)]) {
             d.offset = offset;
             d.binning = binning;
@@ -337,7 +341,7 @@ mod tests {
             size_x: 4,
             size_y: 4,
         };
-        let mut arr = make_mono_array(4, 4, NDDataBuffer::U8(vec![0; 16]));
+        let mut arr = make_mono_array(4, 4, NDDataBuffer::from_vec::<u8>(vec![0; 16]));
         arr.codec = Some(crate::codec::Codec {
             name: crate::codec::CodecName::LZ4,
             compressed_size: 10,

@@ -1,5 +1,5 @@
 use crate::error::{ADError, ADResult};
-use crate::ndarray::{NDArray, NDDataBuffer, NDDataType, NDDimension};
+use crate::ndarray::{NDArray, NDDataBuffer, NDDataType, NDDataView, NDDataViewMut, NDDimension};
 use crate::ndarray_pool::NDArrayPool;
 
 /// Color mode for NDArray interpretation.
@@ -83,17 +83,17 @@ fn output(
 /// type, so a variant mismatch cannot happen.
 macro_rules! same_type {
     ($src:expr, $dst:expr, |$v:ident, $out:ident| $body:expr) => {
-        match ($src, $dst) {
-            (NDDataBuffer::I8($v), NDDataBuffer::I8($out)) => $body,
-            (NDDataBuffer::U8($v), NDDataBuffer::U8($out)) => $body,
-            (NDDataBuffer::I16($v), NDDataBuffer::I16($out)) => $body,
-            (NDDataBuffer::U16($v), NDDataBuffer::U16($out)) => $body,
-            (NDDataBuffer::I32($v), NDDataBuffer::I32($out)) => $body,
-            (NDDataBuffer::U32($v), NDDataBuffer::U32($out)) => $body,
-            (NDDataBuffer::I64($v), NDDataBuffer::I64($out)) => $body,
-            (NDDataBuffer::U64($v), NDDataBuffer::U64($out)) => $body,
-            (NDDataBuffer::F32($v), NDDataBuffer::F32($out)) => $body,
-            (NDDataBuffer::F64($v), NDDataBuffer::F64($out)) => $body,
+        match (($src).view(), ($dst).view_mut()) {
+            (NDDataView::I8($v), NDDataViewMut::I8($out)) => $body,
+            (NDDataView::U8($v), NDDataViewMut::U8($out)) => $body,
+            (NDDataView::I16($v), NDDataViewMut::I16($out)) => $body,
+            (NDDataView::U16($v), NDDataViewMut::U16($out)) => $body,
+            (NDDataView::I32($v), NDDataViewMut::I32($out)) => $body,
+            (NDDataView::U32($v), NDDataViewMut::U32($out)) => $body,
+            (NDDataView::I64($v), NDDataViewMut::I64($out)) => $body,
+            (NDDataView::U64($v), NDDataViewMut::U64($out)) => $body,
+            (NDDataView::F32($v), NDDataViewMut::F32($out)) => $body,
+            (NDDataView::F64($v), NDDataViewMut::F64($out)) => $body,
             _ => unreachable!("the output was allocated in the source type"),
         }
     };
@@ -101,8 +101,8 @@ macro_rules! same_type {
 
 /// The 8-bit output slice of a conversion whose output is always `UInt8`.
 fn u8_slice(arr: &mut NDArray) -> &mut [u8] {
-    match &mut arr.data {
-        NDDataBuffer::U8(v) => v.as_mut_slice(),
+    match arr.data.view_mut() {
+        NDDataViewMut::U8(v) => v,
         _ => unreachable!("the output was allocated as UInt8"),
     }
 }
@@ -367,11 +367,11 @@ pub fn rgb1_to_yuv444(pool: &NDArrayPool, src: &NDArray) -> ADResult<NDArray> {
         NDDimension::new(y),
     ];
     let mut arr = output(pool, src, dims, src.data.data_type())?;
-    match (&src.data, &mut arr.data) {
-        (NDDataBuffer::U8(v), NDDataBuffer::U8(out)) => {
+    match (src.data.view(), arr.data.view_mut()) {
+        (NDDataView::U8(v), NDDataViewMut::U8(out)) => {
             yuv444_forward(&v[..n * 3], &mut out[..n * 3], U8_HALF, U8_MAX);
         }
-        (NDDataBuffer::U16(v), NDDataBuffer::U16(out)) => {
+        (NDDataView::U16(v), NDDataViewMut::U16(out)) => {
             yuv444_forward(&v[..n * 3], &mut out[..n * 3], U16_HALF, U16_MAX);
         }
         _ => {
@@ -689,11 +689,11 @@ pub fn yuv444_to_rgb1(pool: &NDArrayPool, src: &NDArray) -> ADResult<NDArray> {
         NDDimension::new(y),
     ];
     let mut arr = output(pool, src, dims, src.data.data_type())?;
-    match (&src.data, &mut arr.data) {
-        (NDDataBuffer::U8(v), NDDataBuffer::U8(out)) => {
+    match (src.data.view(), arr.data.view_mut()) {
+        (NDDataView::U8(v), NDDataViewMut::U8(out)) => {
             yuv444_inverse(&v[..n * 3], &mut out[..n * 3], U8_HALF, U8_MAX);
         }
-        (NDDataBuffer::U16(v), NDDataBuffer::U16(out)) => {
+        (NDDataView::U16(v), NDDataViewMut::U16(out)) => {
             yuv444_inverse(&v[..n * 3], &mut out[..n * 3], U16_HALF, U16_MAX);
         }
         _ => {
@@ -722,8 +722,8 @@ pub fn rgb1_to_yuv422(pool: &NDArrayPool, src: &NDArray) -> ADResult<NDArray> {
         ));
     }
 
-    let v = match &src.data {
-        NDDataBuffer::U8(v) => v,
+    let v = match src.data.view() {
+        NDDataView::U8(v) => v,
         _ => {
             return Err(ADError::UnsupportedConversion(
                 "rgb1_to_yuv422 only supports UInt8".into(),
@@ -760,8 +760,8 @@ pub fn yuv422_to_rgb1(pool: &NDArrayPool, src: &NDArray) -> ADResult<NDArray> {
         ));
     }
 
-    let v = match &src.data {
-        NDDataBuffer::U8(v) => v,
+    let v = match src.data.view() {
+        NDDataView::U8(v) => v,
         _ => {
             return Err(ADError::UnsupportedConversion(
                 "yuv422_to_rgb1 only supports UInt8".into(),
@@ -800,8 +800,8 @@ pub fn rgb1_to_yuv411(pool: &NDArrayPool, src: &NDArray) -> ADResult<NDArray> {
         ));
     }
 
-    let v = match &src.data {
-        NDDataBuffer::U8(v) => v,
+    let v = match src.data.view() {
+        NDDataView::U8(v) => v,
         _ => {
             return Err(ADError::UnsupportedConversion(
                 "rgb1_to_yuv411 only supports UInt8".into(),
@@ -836,8 +836,8 @@ pub fn yuv411_to_rgb1(pool: &NDArrayPool, src: &NDArray) -> ADResult<NDArray> {
         ));
     }
 
-    let v = match &src.data {
-        NDDataBuffer::U8(v) => v,
+    let v = match src.data.view() {
+        NDDataView::U8(v) => v,
         _ => {
             return Err(ADError::UnsupportedConversion(
                 "yuv411_to_rgb1 only supports UInt8".into(),
@@ -1663,7 +1663,7 @@ mod tests {
             vec![NDDimension::new(2), NDDimension::new(2)],
             NDDataType::UInt8,
         );
-        if let NDDataBuffer::U8(ref mut v) = arr.data {
+        if let NDDataViewMut::U8(v) = arr.data.view_mut() {
             v[0] = 10;
             v[1] = 20;
             v[2] = 30;
@@ -1674,7 +1674,7 @@ mod tests {
         assert_eq!(rgb.dims[0].size, 3);
         assert_eq!(rgb.dims[1].size, 2);
         assert_eq!(rgb.dims[2].size, 2);
-        if let NDDataBuffer::U8(ref v) = rgb.data {
+        if let NDDataView::U8(v) = rgb.data.view() {
             // First pixel: R=10, G=10, B=10
             assert_eq!(v[0], 10);
             assert_eq!(v[1], 10);
@@ -1696,7 +1696,7 @@ mod tests {
             ],
             NDDataType::UInt8,
         );
-        if let NDDataBuffer::U8(ref mut v) = arr.data {
+        if let NDDataViewMut::U8(v) = arr.data.view_mut() {
             // Pixel 0: R=255, G=0, B=0
             v[0] = 255;
             v[1] = 0;
@@ -1709,7 +1709,7 @@ mod tests {
         let mono = rgb1_to_mono(&pool(), &arr).unwrap();
         assert_eq!(mono.dims.len(), 2);
         assert_eq!(mono.dims[0].size, 2);
-        if let NDDataBuffer::U8(ref v) = mono.data {
+        if let NDDataView::U8(v) = mono.data.view() {
             // C (R+G+B)/3 truncated, NOT luminance: (255+0+0)/3 = 85.
             assert_eq!(v[0], 85);
             assert_eq!(v[1], 85); // (0+255+0)/3 = 85
@@ -1728,7 +1728,7 @@ mod tests {
             ],
             NDDataType::UInt8,
         );
-        if let NDDataBuffer::U8(ref mut v) = arr.data {
+        if let NDDataViewMut::U8(v) = arr.data.view_mut() {
             // pixel 0: R=10, G=20, B=30; pixel 1: R=40, G=50, B=60
             v[0] = 10;
             v[1] = 20;
@@ -1754,7 +1754,9 @@ mod tests {
         // RGB3 → RGB1 (roundtrip)
         let rgb1_back =
             convert_rgb_layout(&pool(), &rgb3, NDColorMode::RGB3, NDColorMode::RGB1).unwrap();
-        if let (NDDataBuffer::U8(orig), NDDataBuffer::U8(back)) = (&arr.data, &rgb1_back.data) {
+        if let (NDDataView::U8(orig), NDDataView::U8(back)) =
+            (arr.data.view(), rgb1_back.data.view())
+        {
             assert_eq!(orig, back);
         } else {
             panic!("wrong type");
@@ -1764,7 +1766,7 @@ mod tests {
     #[test]
     fn test_convert_data_type_u8_to_u16() {
         let mut arr = NDArray::new(vec![NDDimension::new(3)], NDDataType::UInt8);
-        if let NDDataBuffer::U8(ref mut v) = arr.data {
+        if let NDDataViewMut::U8(v) = arr.data.view_mut() {
             v[0] = 10;
             v[1] = 128;
             v[2] = 255;
@@ -1773,7 +1775,7 @@ mod tests {
             .convert_type(&arr, NDDataType::UInt16)
             .unwrap();
         assert_eq!(result.data.data_type(), NDDataType::UInt16);
-        if let NDDataBuffer::U16(ref v) = result.data {
+        if let NDDataView::U16(v) = result.data.view() {
             assert_eq!(v[0], 10);
             assert_eq!(v[1], 128);
             assert_eq!(v[2], 255);
@@ -1785,7 +1787,7 @@ mod tests {
     #[test]
     fn test_convert_data_type_f32_to_u8_wraps_like_a_c_cast() {
         let mut arr = NDArray::new(vec![NDDimension::new(3)], NDDataType::Float32);
-        if let NDDataBuffer::F32(ref mut v) = arr.data {
+        if let NDDataViewMut::F32(v) = arr.data.view_mut() {
             v[0] = -10.0;
             v[1] = 128.7;
             v[2] = 300.0;
@@ -1793,7 +1795,7 @@ mod tests {
         let result = NDArrayPool::new(0)
             .convert_type(&arr, NDDataType::UInt8)
             .unwrap();
-        if let NDDataBuffer::U8(ref v) = result.data {
+        if let NDDataView::U8(v) = result.data.view() {
             assert_eq!(v[0], 246); // (epicsUInt8)-10
             assert_eq!(v[1], 128); // truncated
             assert_eq!(v[2], 44); // (epicsUInt8)300
@@ -1857,7 +1859,7 @@ mod tests {
             ],
             NDDataType::UInt8,
         );
-        if let NDDataBuffer::U8(ref mut v) = arr.data {
+        if let NDDataViewMut::U8(v) = arr.data.view_mut() {
             v[0] = 100;
             v[1] = 150;
             v[2] = 200;
@@ -1876,7 +1878,8 @@ mod tests {
         assert_eq!(yuv.dims[0].size, 3);
 
         let back = yuv444_to_rgb1(&pool(), &yuv).unwrap();
-        if let (NDDataBuffer::U8(orig), NDDataBuffer::U8(result)) = (&arr.data, &back.data) {
+        if let (NDDataView::U8(orig), NDDataView::U8(result)) = (arr.data.view(), back.data.view())
+        {
             for i in 0..orig.len() {
                 assert!(
                     (orig[i] as i16 - result[i] as i16).unsigned_abs() <= 2,
@@ -1901,7 +1904,7 @@ mod tests {
             ],
             NDDataType::UInt8,
         );
-        if let NDDataBuffer::U8(ref mut v) = arr.data {
+        if let NDDataViewMut::U8(v) = arr.data.view_mut() {
             let colors: [u8; 24] = [
                 100, 150, 200, 50, 100, 50, 255, 0, 0, 0, 255, 0, 128, 128, 128, 200, 100, 50, 0,
                 0, 255, 255, 255, 0,
@@ -1928,7 +1931,7 @@ mod tests {
             ],
             NDDataType::UInt8,
         );
-        if let NDDataBuffer::U8(ref mut v) = arr.data {
+        if let NDDataViewMut::U8(v) = arr.data.view_mut() {
             let colors: [u8; 24] = [
                 100, 150, 200, 50, 100, 50, 255, 0, 0, 0, 255, 0, 128, 128, 128, 200, 100, 50, 0,
                 0, 255, 255, 255, 0,
@@ -1951,12 +1954,12 @@ mod tests {
             vec![NDDimension::new(2), NDDimension::new(1)],
             NDDataType::UInt16,
         );
-        if let NDDataBuffer::U16(ref mut v) = arr.data {
+        if let NDDataViewMut::U16(v) = arr.data.view_mut() {
             v[0] = 1000;
             v[1] = 2000;
         }
         let rgb = mono_to_rgb1(&pool(), &arr).unwrap();
-        if let NDDataBuffer::U16(ref v) = rgb.data {
+        if let NDDataView::U16(v) = rgb.data.view() {
             assert_eq!(v[0], 1000);
             assert_eq!(v[1], 1000);
             assert_eq!(v[2], 1000);

@@ -75,6 +75,7 @@ const PLANARCONFIG_SEPARATE: u16 = 2;
 const SAMPLEFORMAT_UINT: u16 = 1;
 const SAMPLEFORMAT_INT: u16 = 2;
 const SAMPLEFORMAT_IEEEFP: u16 = 3;
+const SAMPLEFORMAT_VOID: u16 = 4;
 const SAMPLEFORMAT_COMPLEXIEEEFP: u16 = 6;
 
 /// The image geometry C derives in `NDFileTIFF::openFile` (NDFileTIFF.cpp:
@@ -678,16 +679,30 @@ fn decode(bytes: &[u8], attributes: NDAttributeList, pool: &NDArrayPool) -> ADRe
     let photometric =
         one(TAG_PHOTOMETRIC, short)?.ok_or_else(|| err("no PhotometricInterpretation"))?;
     let planar_config = one(TAG_PLANAR_CONFIG, short)?.unwrap_or(u64::from(PLANARCONFIG_CONTIG));
-    // _TIFFVSetField fails the open on a SampleFormat outside 1..=6. Without
-    // the tag, C's sampleFormat is left uninitialized; UINT here, as its 0
-    // branch (:457-463) intends.
+    // _TIFFVSetField fails the open on a SampleFormat outside 1..=6, and sets
+    // the sample format from DataType VOID..=IEEEFP as well; the later entry
+    // of the two wins. Without either, C's sampleFormat is left
+    // uninitialized; UINT here, as its 0 branch (:457-463) intends.
     let sample_format = match per_sample(TAG_SAMPLE_FORMAT)? {
         Some(v) if !(SAMPLEFORMAT_UINT..=SAMPLEFORMAT_COMPLEXIEEEFP).contains(&(v as u16)) => {
             return Err(err(&format!("bad value {v} for SampleFormat")));
         }
-        Some(v) => v,
-        None => u64::from(SAMPLEFORMAT_UINT),
+        v => v,
     };
+    let data_type_format = match per_sample(TAG_DATA_TYPE)? {
+        None => None,
+        Some(0) => Some(SAMPLEFORMAT_VOID),
+        Some(1) => Some(SAMPLEFORMAT_INT),
+        Some(2) => Some(SAMPLEFORMAT_UINT),
+        Some(3) => Some(SAMPLEFORMAT_IEEEFP),
+        Some(v) => return Err(err(&format!("bad value {v} for DataType"))),
+    };
+    let sample_format = if entries.get(&TAG_DATA_TYPE) > entries.get(&TAG_SAMPLE_FORMAT) {
+        data_type_format.map(u64::from)
+    } else {
+        sample_format
+    }
+    .unwrap_or(u64::from(SAMPLEFORMAT_UINT));
     // TIFFReadDirectory reads these too, and fails the open where an entry
     // does not read or its value does not set; readFile never looks at them.
     one(TAG_IMAGE_DEPTH, long)?;
@@ -703,12 +718,6 @@ fn decode(bytes: &[u8], attributes: NDAttributeList, pool: &NDArrayPool) -> ADRe
     }
     for tag in [TAG_MIN_SAMPLE_VALUE, TAG_MAX_SAMPLE_VALUE] {
         per_sample(tag)?;
-    }
-    // _TIFFVSetField maps DataType VOID..=IEEEFP and refuses the rest.
-    if let Some(v) = per_sample(TAG_DATA_TYPE)?
-        && v > 3
-    {
-        return Err(err(&format!("bad value {v} for DataType")));
     }
     // setExtraSamples: no more than one per sample, each a known kind or
     // Corel's 999.
@@ -2950,6 +2959,7 @@ mod tests {
         const RGB3: &str =
             "UInt8 4,3,3 071c31465b70859aafc4d9ee0e23384d62778ca1b6cbe0f5152a3f54697e93a8bdd2e7fc";
         const INT16: &str = "Int16 4,3 070e151c232a31383f464d545b626970777e858c939aa1a8";
+        const RGB1_I16: &str = "Int16 3,4,3 070e151c232a31383f464d545b626970777e858c939aa1a8afb6bdc4cbd2d9e0e7eef5fc030a11181f262d343b424950575e656c737a81888f969da4abb2b9c0c7ced5dce3eaf1f8";
         let s = TagFile::default();
         let rgb = TagFile { samples: 3, ..s };
         #[rustfmt::skip]
@@ -3073,6 +3083,11 @@ mod tests {
             ("toffs_only", TagFile { omit: &[TAG_STRIP_OFFSETS], extra: &[(TAG_TILE_OFFSETS, TYPE_LONG, &[8, 12, 16])], ..s }, Some(GRAY)),
             ("toffs_first", TagFile { lead: &[(TAG_TILE_OFFSETS, TYPE_LONG, &[9, 13, 17])], ..s }, Some(GRAY)),
             ("tcounts_fix", TagFile { values: &[(TAG_STRIP_BYTE_COUNTS, &[4, 4, 2])], extra: &[(TAG_TILE_BYTE_COUNTS, TYPE_LONG, &[4, 4, 4])], ..s }, Some(GRAY)),
+            ("dt_int16", TagFile { bits: 16, extra: &[(TAG_DATA_TYPE, TYPE_SHORT, &[1])], ..s }, Some(INT16)),
+            ("dt_void", TagFile { extra: &[(TAG_DATA_TYPE, TYPE_SHORT, &[0])], ..s }, None),
+            ("dt_uint_over_int", TagFile { bits: 16, format: 2, extra: &[(TAG_DATA_TYPE, TYPE_SHORT, &[2])], ..s }, Some(GRAY16)),
+            ("dt_int_rgb", TagFile { bits: 16, rows: 2, extra: &[(TAG_DATA_TYPE, TYPE_SHORT, &[1, 1, 1])], ..rgb }, Some(RGB1_I16)),
+            ("dt_first", TagFile { bits: 16, lead: &[(TAG_DATA_TYPE, TYPE_SHORT, &[1])], ..s }, Some(GRAY16)),
             ("tcounts_only", TagFile { omit: &[TAG_STRIP_BYTE_COUNTS], extra: &[(TAG_TILE_BYTE_COUNTS, TYPE_LONG, &[4, 4, 4])], ..s }, Some(GRAY)),
         ];
         let wrong: Vec<_> = cases

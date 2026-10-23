@@ -2833,9 +2833,9 @@ mod tests {
     }
 
     /// Each file reads as C `readFile` reads it with ADSupport's libtiff
-    /// 4.0.6: `None` where the open fails, else C's type, dims and buffer.
-    /// The `le_tt_*` files are reviewer6's; the rest cover the readers'
-    /// other types, ranges and counts.
+    /// 4.0.6: `None` where the open or a strip read fails, else C's type, dims
+    /// and buffer. The `le_tt_*` files are reviewer6's; the rest cover the
+    /// readers' other types, ranges and counts.
     #[test]
     fn tag_entries_read_as_libtiff_reads_them() {
         const GRAY: &str = "UInt8 4,3 070e151c232a31383f464d54";
@@ -2895,7 +2895,7 @@ mod tests {
             ("bps_over_short", TagFile { types: &[(TAG_BITS_PER_SAMPLE, TYPE_LONG)], values: &[(TAG_BITS_PER_SAMPLE, &[65544])], ..s }, None),
             ("pc_over_short", TagFile { types: &[(TAG_PLANAR_CONFIG, TYPE_LONG)], values: &[(TAG_PLANAR_CONFIG, &[65537])], ..s }, None),
             ("w_two", TagFile { values: &[(TAG_IMAGE_WIDTH, &[4, 4])], ..s }, None),
-                        ("spp_two", TagFile { values: &[(TAG_SAMPLES_PER_PIXEL, &[1, 1])], ..s }, None),
+            ("spp_two", TagFile { values: &[(TAG_SAMPLES_PER_PIXEL, &[1, 1])], ..s }, None),
             ("spp0", TagFile { values: &[(TAG_SAMPLES_PER_PIXEL, &[0])], ..s }, None),
             ("bps_one_rgb", TagFile { values: &[(TAG_BITS_PER_SAMPLE, &[8])], ..rgb }, Some(RGB1)),
             ("bps_two_rgb", TagFile { values: &[(TAG_BITS_PER_SAMPLE, &[8, 8])], ..rgb }, None),
@@ -2906,6 +2906,17 @@ mod tests {
             ("dup_pm", TagFile { extra: &[(TAG_PHOTOMETRIC, TYPE_SHORT, &[2])], ..s }, Some(GRAY)),
             ("dup_w", TagFile { extra: &[(TAG_IMAGE_WIDTH, TYPE_LONG, &[5])], ..s }, Some(GRAY)),
             ("dup_sf", TagFile { bits: 16, extra: &[(TAG_SAMPLE_FORMAT, TYPE_SHORT, &[2])], ..s }, Some(GRAY16)),
+            ("comp_lzw", TagFile { values: &[(TAG_COMPRESSION, &[5])], ..s }, None),
+            ("comp_packbits", TagFile { values: &[(TAG_COMPRESSION, &[32773])], ..s }, None),
+            ("comp_unknown", TagFile { values: &[(TAG_COMPRESSION, &[12345])], ..s }, None),
+            ("comp_byte", TagFile { types: &[(TAG_COMPRESSION, TYPE_BYTE)], ..s }, Some(GRAY)),
+            ("comp_ascii", TagFile { types: &[(TAG_COMPRESSION, TYPE_ASCII)], ..s }, None),
+            ("comp_negative", TagFile { types: &[(TAG_COMPRESSION, TYPE_SSHORT)], values: &[(TAG_COMPRESSION, &[-1])], ..s }, None),
+            ("comp_two", TagFile { values: &[(TAG_COMPRESSION, &[1, 1])], ..s }, Some(GRAY)),
+            ("comp_three_rgb", TagFile { values: &[(TAG_COMPRESSION, &[1, 1, 1])], ..rgb }, Some(RGB1)),
+            ("comp_two_rgb", TagFile { values: &[(TAG_COMPRESSION, &[1, 1])], ..rgb }, None),
+            ("comp_mixed_rgb", TagFile { values: &[(TAG_COMPRESSION, &[1, 1, 5])], ..rgb }, None),
+            ("comp_lzw_rgb", TagFile { values: &[(TAG_COMPRESSION, &[5, 5, 5])], ..rgb }, None),
         ];
         let wrong: Vec<_> = cases
             .iter()

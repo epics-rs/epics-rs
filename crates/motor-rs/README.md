@@ -1,6 +1,6 @@
 # motor-rs
 
-Pure Rust implementation of the [EPICS motor record](https://github.com/epics-modules/motor) — complete motor control with position tracking, velocity management, limit enforcement, backlash compensation, and motion state machine.
+Pure Rust implementation of the [EPICS motor record](https://github.com/epics-modules/motor) (motor R7-4-5) — complete motor control with position tracking, velocity management, limit enforcement, backlash compensation, and motion state machine.
 
 No C dependencies. Just `cargo build`.
 
@@ -25,8 +25,10 @@ No C dependencies. Just `cargo build`.
 - SYNC trigger, RVEL actual velocity
 - Raw fields (RVAL/RRBV/RMP/REP/RDIF/RVEL/LRVL) are DBF_LONG as in motorRecord.dbd
 - Device support via asyn motor interface (move, home, moveToHome, stop, profile)
+- Model-1 drivers (`MotorBuilder::model1` on a `Model1Motor`, `register_model1_device`)
+- The controller's own asyn port, as `asynMotorController`'s (`devices::register_controller_port`)
 - Builder pattern for easy motor setup
-- SimMotor for testing (time-based linear interpolation)
+- SimMotor: one motorSim axis on `route.c`'s path, stepped every 0.1 s
 
 ## Benchmarks
 
@@ -50,9 +52,13 @@ motor-rs/
     coordinate.rs       # Dial ↔ user ↔ raw coordinate conversion (raw is i64)
     device_state.rs     # Shared mailbox between record, device support, poll loop
     device_support.rs   # MotorDeviceSupport — bridges record to AsynMotor drivers
-    poll_loop.rs        # Async per-axis polling task for motor status
-    builder.rs          # MotorBuilder — fluent API for motor assembly
-    sim_motor.rs        # SimMotor — simulated motor for testing
+    poll_loop.rs        # MotorPollLoop — the controller's motorPoller thread
+    builder.rs          # MotorBuilder, ControllerBuilder — axis and poller assembly
+    controller_port.rs  # the controller's asyn parameter port
+    devices.rs          # the motor device() rows and the axes their DTYPs reach
+    trace.rs            # the asyn user a motor's diagnostics print through
+    sim_motor.rs        # SimMotor — one motorSim axis
+    sim_motor/route.rs  #   motorSim's route.c path
     ioc.rs              # `simMotorCreate` and the dynamic device support
     record/dbd_generated.rs  # the field table generated from motorRecord.dbd
   benches/
@@ -66,17 +72,32 @@ motor-rs/
 
 ```rust
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-use motor_rs::{MotorBuilder, SimMotor};
+use asyn_rs::interfaces::motor::AsynMotor;
+use asyn_rs::registry::open_owner;
+use motor_rs::builder::{AxisSetup, MotorBuilder};
+use motor_rs::devices::{register_axis, register_controller_port};
+use motor_rs::sim_motor::SimMotor;
+use motor_rs::trace::TraceUser;
 
-let sim = Arc::new(Mutex::new(SimMotor::new()));
-let setup = MotorBuilder::new(sim)
-    .addr(0)
+register_controller_port(&open_owner(), "SIM", 1, ())?;
+let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(SimMotor::new()));
+let AxisSetup { axis, poll_loop, .. } = MotorBuilder::new(motor)
+    .trace_user(TraceUser::Asyn { port: "SIM".into(), addr: 0 })
     // one call sets both the moving and the idle interval; set them apart with
     // `moving_poll_interval` / `idle_poll_interval`
     .poll_interval(Duration::from_millis(100))
-    .build();
+    .build_axis();
+register_axis(axis)?;
+// Starts the motorPoller thread.
+poll_loop.start();
 ```
+
+A record then reaches the axis with `DTYP "asynMotor"` and
+`OUT "@asyn(SIM,0)"`; register `motor_rs::motor_record_factory()` and
+`devices::devices()` / `devices::device_support_factory()` on the
+`IocBuilder`.
 
 ## Testing
 
@@ -93,13 +114,14 @@ NTM), and simulated motor behaviour.
 
 - epics-base-rs — Record trait, DeviceSupport trait
 - epics-ca-rs — the iocsh side of `simMotorCreate`
+- epics-libcom-rs — `cfmt::CFloat`, C's float formatting
 - asyn-rs — AsynMotor interface, async runtime facade
 - bitflags — MipFlags, MstaFlags
-- tokio, tracing
+- tokio
 
 ## Requirements
 
-- Rust 1.94.0 (`rust-toolchain.toml`), edition 2024
+- Rust 1.99.1 (`rust-toolchain.toml`), edition 2024
 
 ## License
 

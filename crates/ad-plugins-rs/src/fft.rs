@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use ad_core_rs::error::ADResult;
 use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDataType, NDDimension};
 use ad_core_rs::ndarray_pool::NDArrayPool;
+use ad_core_rs::pixel_cast::PixelCast;
 use ad_core_rs::plugin::runtime::{ArrayCallbacks, NDPluginProcess, ParamUpdate, ProcessResult};
 use parking_lot::Mutex;
 use rustfft::num_complex::Complex;
@@ -58,38 +59,49 @@ pub fn next_pow2(n: usize) -> usize {
     p
 }
 
-/// The Float64 spectrum of a transform, on the heap, not the pool: C computes
-/// into its own buffers and allocates the output only inside
-/// `if (arrayCallbacks)` (NDPluginFFT.cpp:209-212), in [`pool_output`]. The
-/// caller writes every element.
-fn float64_spectrum(dims: Vec<NDDimension>) -> NDArray {
-    NDArray::new(dims, NDDataType::Float64)
-}
-
-/// The output array for `spectrum`, as C's gated block (NDPluginFFT.cpp:212-218):
+/// The output array for `values`, as C's gated block (NDPluginFFT.cpp:212-218):
 /// a pool `alloc`, the averaged values copied in, and `src`'s attributes. C
-/// stamps it with `getTimeStamp(&epicsTS)`, the port timestamp
-/// `beginProcessCallbacks` set from the input's epicsTS (NDPluginFFT.cpp:216,
-/// :295; NDPluginDriver.cpp:232), and `timeStamp` with the wall clock
+/// computes into its own buffers and allocates the output only inside
+/// `if (arrayCallbacks)` (:209-212), and stamps it with `getTimeStamp(&epicsTS)`,
+/// the port timestamp `beginProcessCallbacks` set from the input's epicsTS
+/// (:216, :295; NDPluginDriver.cpp:232), and `timeStamp` with the wall clock
 /// (:217-218), so the pair disagrees by design. `unique_id` stays at the pool
 /// default: [`FFTProcessor`] owns that counter.
-fn pool_output(pool: &NDArrayPool, src: &NDArray, spectrum: &NDArray) -> ADResult<NDArray> {
-    let mut arr = pool.alloc(spectrum.dims.clone(), NDDataType::Float64)?;
-    if let NDDataBuffer::F64(values) = &spectrum.data {
-        f64_slice(&mut arr).copy_from_slice(values);
-    }
+fn pool_output(
+    pool: &NDArrayPool,
+    src: &NDArray,
+    dims: Vec<NDDimension>,
+    values: &[f64],
+) -> ADResult<NDArray> {
+    let mut arr = pool.alloc(dims, NDDataType::Float64)?;
+    let NDDataBuffer::F64(out) = &mut arr.data else {
+        unreachable!("the output was allocated as Float64");
+    };
+    to_f64_into(out, values, jobs_for(values.len()));
     arr.timestamp = src.timestamp;
     arr.time_stamp = ad_core_rs::timestamp::EpicsTimestamp::now().as_f64();
     arr.attributes = src.attributes.clone();
     Ok(arr)
 }
 
-/// The Float64 payload of an array made by [`float64_spectrum`] or [`pool_output`].
-fn f64_slice(arr: &mut NDArray) -> &mut [f64] {
-    match &mut arr.data {
-        NDDataBuffer::F64(v) => v.as_mut_slice(),
-        _ => unreachable!("the output was allocated as Float64"),
-    }
+/// One frame's working buffers. [`FFTProcessor`] hands a frame the set an
+/// earlier frame used, so a frame does not fault in fresh frame-sized pages.
+#[derive(Default)]
+struct Buffers {
+    /// The transform's complex working array.
+    data: Vec<Complex<f64>>,
+    /// The gathered columns of [`fft_columns`].
+    cols: Vec<Complex<f64>>,
+    /// The spectrum, or the inverse transform's samples.
+    out: Vec<f64>,
+}
+
+/// [`Buffers`] and the frame's samples as `f64`, apart so a transform reads
+/// the samples while it writes the buffers.
+#[derive(Default)]
+struct Scratch {
+    vals: Vec<f64>,
+    bufs: Buffers,
 }
 
 /// A rustfft plan with its scratch, so a frame's transforms allocate the
@@ -148,19 +160,43 @@ fn for_each_chunk<T: Send, S>(
     }
 }
 
-/// `n` complex zeros, written by the pool when `jobs` is above 1. A fresh
-/// buffer pays its page faults on first touch, which on one thread cost
-/// more than the transforms the pool runs over it.
-fn zeroed(n: usize, jobs: usize) -> Vec<Complex<f64>> {
-    let zero = Complex::new(0.0, 0.0);
-    if jobs > 1 {
+/// `buf` resized to `n` elements, new ones `fill`, written by the pool when
+/// `jobs` is above 1. New pages fault in on first touch, which on one thread
+/// costs more than the transforms the pool runs over them.
+fn resize<T: Copy + Send + Sync>(buf: &mut Vec<T>, n: usize, fill: T, jobs: usize) {
+    if jobs > 1 && n > buf.len() {
         #[cfg(feature = "parallel")]
         return par_util::thread_pool().install(|| {
             use rayon::prelude::*;
-            (0..n).into_par_iter().map(|_| zero).collect()
+            let more = n - buf.len();
+            buf.par_extend((0..more).into_par_iter().map(|_| fill));
         });
     }
-    vec![zero; n]
+    buf.resize(n, fill);
+}
+
+/// `v` as `f64` into `out`, each sample cast as `to_f64_vec` casts it.
+fn to_f64_into<T: PixelCast + Sync>(out: &mut [f64], v: &[T], jobs: usize) {
+    const CHUNK: usize = 1 << 16;
+    for_each_chunk(
+        out,
+        CHUNK,
+        jobs,
+        || (),
+        |(), i, out| {
+            for (o, &x) in out.iter_mut().zip(&v[i * CHUNK..]) {
+                *o = x.to_f64();
+            }
+        },
+    );
+}
+
+/// The samples of `data` as `f64` into `vals`, on the pool for a frame
+/// [`jobs_for`] sends there.
+fn load_f64(data: &NDDataBuffer, vals: &mut Vec<f64>) {
+    let jobs = jobs_for(data.len());
+    resize(vals, data.len(), 0.0, jobs);
+    ad_core_rs::with_buffer!(data, |v| to_f64_into(vals, v, jobs))
 }
 
 /// Row `row` of the `width`-wide samples as complex values, zero-extended
@@ -216,15 +252,23 @@ fn magnitudes_into(out: &mut [f64], bins: &[Complex<f64>], n: f64) {
 ///
 /// A block's columns are strided through every row, so blocks cannot be
 /// handed out as disjoint slices of `data`. Each wave of up to `jobs` blocks
-/// is gathered and transformed into a buffer per block, then every row takes
-/// the wave's columns back: one job per block, then one job per row.
-fn fft_columns(fft: &Arc<dyn Fft<f64>>, data: &mut [Complex<f64>], w: usize, jobs: usize) {
+/// is gathered and transformed into `cols`, one part per block, then every
+/// row takes the wave's columns back: one job per block, then one job per
+/// row.
+fn fft_columns(
+    fft: &Arc<dyn Fft<f64>>,
+    data: &mut [Complex<f64>],
+    w: usize,
+    jobs: usize,
+    cols: &mut Vec<Complex<f64>>,
+) {
     const COLS: usize = 8;
     let h = fft.len();
     let blocks = w.div_ceil(COLS);
     let wave = jobs.min(blocks);
-    // Column `j` of a wave, counted from its first, sits at `j * h`.
-    let mut cols = zeroed(wave * COLS * h, jobs);
+    // Column `j` of a wave, counted from its first, sits at `j * h`; the
+    // gather writes every column the transforms then read.
+    resize(cols, wave * COLS * h, Complex::new(0.0, 0.0), jobs);
     for b0 in (0..blocks).step_by(wave) {
         let c0 = b0 * COLS;
         let c1 = w.min(c0 + wave * COLS);
@@ -245,7 +289,7 @@ fn fft_columns(fft: &Arc<dyn Fft<f64>>, data: &mut [Complex<f64>], w: usize, job
                 plan.run(cols);
             },
         );
-        let cols = &cols;
+        let cols = &*cols;
         for_each_chunk(
             data,
             w,
@@ -267,26 +311,31 @@ fn fft_columns(fft: &Arc<dyn Fft<f64>>, data: &mut [Complex<f64>], w: usize, job
 /// Magnitudes are normalized by the padded length.
 pub fn fft_1d_rows(src: &NDArray, suppress_dc: bool) -> Option<NDArray> {
     let mut planner = FftPlanner::<f64>::new();
-    let vals = src.data.to_f64_vec();
-    fft_1d_rows_with(
+    let mut s = Scratch::default();
+    load_f64(&src.data, &mut s.vals);
+    let dims = fft_1d_rows_with(
         |n| planner.plan_fft_forward(n),
         jobs_for,
         src,
-        &vals,
+        &s.vals,
         suppress_dc,
-    )
+        &mut s.bufs,
+    )?;
+    Some(NDArray::with_data(dims, NDDataBuffer::F64(s.bufs.out)))
 }
 
-/// [`fft_1d_rows`] on `vals`, the samples of `src` as `f64`, with the
-/// forward plan for the padded width from `plan` and the pool jobs for a
-/// transform over a given number of values from `jobs`.
+/// [`fft_1d_rows`] on `vals`, the samples of `src` as `f64`, into
+/// `bufs.out`, returning the spectrum's dims. The forward plan for the
+/// padded width comes from `plan` and the pool jobs for a transform over a
+/// given number of values from `jobs`.
 fn fft_1d_rows_with(
     plan: impl FnOnce(usize) -> Arc<dyn Fft<f64>>,
     jobs: fn(usize) -> usize,
     src: &NDArray,
     vals: &[f64],
     suppress_dc: bool,
-) -> Option<NDArray> {
+    bufs: &mut Buffers,
+) -> Option<Vec<NDDimension>> {
     if src.dims.is_empty() {
         return None;
     }
@@ -317,8 +366,9 @@ fn fft_1d_rows_with(
     } else {
         vec![NDDimension::new(n_freq)]
     };
-    let mut arr = float64_spectrum(dims);
-    let magnitudes = f64_slice(&mut arr);
+    let row_jobs = jobs(height * padded);
+    let magnitudes = &mut bufs.out;
+    resize(magnitudes, n_freq * height, 0.0, row_jobs);
 
     // The rows are real, so each transform carries two of them; an odd
     // height leaves the last chunk one row.
@@ -326,7 +376,7 @@ fn fft_1d_rows_with(
     for_each_chunk(
         magnitudes,
         2 * n_freq,
-        jobs(height * padded),
+        row_jobs,
         || {
             let plan = Plan::new(fft.clone());
             (
@@ -359,32 +409,35 @@ fn fft_1d_rows_with(
         },
     );
 
-    Some(arr)
+    Some(dims)
 }
 
 /// Compute 2D FFT magnitude using separable row-then-column FFT via rustfft.
 pub fn fft_2d(src: &NDArray, suppress_dc: bool) -> Option<NDArray> {
     let mut planner = FftPlanner::<f64>::new();
-    let vals = src.data.to_f64_vec();
-    fft_2d_with(
+    let mut s = Scratch::default();
+    load_f64(&src.data, &mut s.vals);
+    let dims = fft_2d_with(
         |n| planner.plan_fft_forward(n),
         jobs_for,
         src,
-        &vals,
+        &s.vals,
         suppress_dc,
-    )
+        &mut s.bufs,
+    )?;
+    Some(NDArray::with_data(dims, NDDataBuffer::F64(s.bufs.out)))
 }
 
-/// [`fft_2d`] on `vals`, the samples of `src` as `f64`, with the forward
-/// plans for the padded width and height from `plan` and the pool jobs as
-/// [`fft_1d_rows_with`] takes them.
+/// [`fft_2d`] as [`fft_1d_rows_with`] runs [`fft_1d_rows`], with the
+/// forward plans for the padded width and height from `plan`.
 fn fft_2d_with(
     mut plan: impl FnMut(usize) -> Arc<dyn Fft<f64>>,
     jobs: fn(usize) -> usize,
     src: &NDArray,
     vals: &[f64],
     suppress_dc: bool,
-) -> Option<NDArray> {
+    bufs: &mut Buffers,
+) -> Option<Vec<NDDimension>> {
     if src.dims.len() < 2 {
         return None;
     }
@@ -413,12 +466,16 @@ fn fft_2d_with(
     // The rows are real, so each row transform carries two of them, and
     // only bins below nFreqX reach the output, so the column transforms run
     // over those bins alone: `data` is nFreqX wide and h tall, its padding
-    // rows zero as the transform of zeros.
+    // rows zero as the transform of zeros. A reused `data` holds an earlier
+    // frame there.
     let zero = Complex::new(0.0, 0.0);
     let col_jobs = jobs(n_freq_x * h);
-    let mut data = zeroed(n_freq_x * h, col_jobs);
+    let data = &mut bufs.data;
+    resize(data, n_freq_x * h, zero, col_jobs);
+    let (rows_in, padding) = data.split_at_mut(src_h * n_freq_x);
+    for_each_chunk(padding, n_freq_x, col_jobs, || (), |(), _, r| r.fill(zero));
     for_each_chunk(
-        &mut data[..src_h * n_freq_x],
+        rows_in,
         2 * n_freq_x,
         jobs(src_h * w),
         || (Plan::new(rows.clone()), vec![zero; w]),
@@ -435,11 +492,10 @@ fn fft_2d_with(
             unpack_pair(row_buf, a, b);
         },
     );
-    fft_columns(&cols, &mut data, n_freq_x, col_jobs);
+    fft_columns(&cols, data, n_freq_x, col_jobs, &mut bufs.cols);
 
-    let dims = vec![NDDimension::new(n_freq_x), NDDimension::new(n_freq_y)];
-    let mut arr = float64_spectrum(dims);
-    let magnitudes = f64_slice(&mut arr);
+    let magnitudes = &mut bufs.out;
+    resize(magnitudes, n_freq_x * n_freq_y, 0.0, col_jobs);
     for (fy, mags) in magnitudes.chunks_exact_mut(n_freq_x).enumerate() {
         magnitudes_into(
             mags,
@@ -452,7 +508,7 @@ fn fft_2d_with(
         magnitudes[0] = 0.0;
     }
 
-    Some(arr)
+    Some(vec![NDDimension::new(n_freq_x), NDDimension::new(n_freq_y)])
 }
 
 /// FFT processing engine with cached planner and optional magnitude averaging.
@@ -520,6 +576,11 @@ pub struct FFTProcessor {
     /// for the plan lookup itself (one or two per frame), never across a
     /// transform.
     planner: Mutex<FftPlanner<f64>>,
+    /// Free frame buffers. A frame takes a set for itself and gives it back:
+    /// one shared set would serialise the NumThreads workers, and fresh
+    /// buffers per frame, as C callocs them (NDPluginFFT.cpp:106-110), spend
+    /// more on faulting their pages in than on the transforms.
+    scratch: Mutex<Vec<Scratch>>,
     params: FFTParamIndices,
 }
 
@@ -543,6 +604,7 @@ impl FFTProcessor {
             unique_id: AtomicI32::new(0),
             array_callbacks: ArrayCallbacks::new(true),
             planner: Mutex::new(FftPlanner::new()),
+            scratch: Mutex::new(Vec::new()),
             params: FFTParamIndices::default(),
         }
     }
@@ -649,7 +711,8 @@ impl FFTFrame<'_> {
         self.planner.lock().plan_fft_inverse(len)
     }
 
-    /// Compute FFT using cached planner for plan reuse across frames.
+    /// Compute FFT using cached planner for plan reuse across frames, into
+    /// `bufs.out`, returning the output's dims.
     ///
     /// `vals` is the frame's samples as `f64`, converted once per frame and
     /// shared with [`FFTFrame::compute_row_spectrum`].
@@ -658,18 +721,35 @@ impl FFTFrame<'_> {
     /// `NDPluginFFT::processCallbacks` (NDPluginFFT.cpp:298-315): `ndims==1`
     /// drives a 1-D FFT, `ndims==2` a full 2-D FFT, and any other rank is
     /// rejected (C prints an error and returns with no output).
-    fn compute_fft(&self, src: &NDArray, vals: &[f64]) -> Option<NDArray> {
+    fn compute_fft(
+        &self,
+        src: &NDArray,
+        vals: &[f64],
+        bufs: &mut Buffers,
+    ) -> Option<Vec<NDDimension>> {
         let suppress_dc = self.config.suppress_dc;
 
         match (src.dims.len(), self.config.direction) {
-            (1, FFTDirection::Forward) => {
-                fft_1d_rows_with(|n| self.plan_forward(n), jobs_for, src, vals, suppress_dc)
+            (1, FFTDirection::Forward) => fft_1d_rows_with(
+                |n| self.plan_forward(n),
+                jobs_for,
+                src,
+                vals,
+                suppress_dc,
+                bufs,
+            ),
+            (1, FFTDirection::Inverse) => {
+                self.compute_fft_1d_rows_inverse(src, vals, suppress_dc, bufs)
             }
-            (1, FFTDirection::Inverse) => self.compute_fft_1d_rows_inverse(src, vals, suppress_dc),
-            (2, FFTDirection::Forward) => {
-                fft_2d_with(|n| self.plan_forward(n), jobs_for, src, vals, suppress_dc)
-            }
-            (2, FFTDirection::Inverse) => self.compute_fft_2d_inverse(src, vals, suppress_dc),
+            (2, FFTDirection::Forward) => fft_2d_with(
+                |n| self.plan_forward(n),
+                jobs_for,
+                src,
+                vals,
+                suppress_dc,
+                bufs,
+            ),
+            (2, FFTDirection::Inverse) => self.compute_fft_2d_inverse(src, vals, suppress_dc, bufs),
             _ => None,
         }
     }
@@ -752,7 +832,8 @@ impl FFTFrame<'_> {
         src: &NDArray,
         vals: &[f64],
         suppress_dc: bool,
-    ) -> Option<NDArray> {
+        bufs: &mut Buffers,
+    ) -> Option<Vec<NDDimension>> {
         if src.dims.is_empty() {
             return None;
         }
@@ -774,8 +855,8 @@ impl FFTFrame<'_> {
         // An inverse transform of a real-valued spectrum yields signed real
         // samples: take the real part, not the modulus, so negative samples
         // survive a forward->inverse round trip.
-        let mut arr = float64_spectrum(src.dims.clone());
-        let samples = f64_slice(&mut arr);
+        let samples = &mut bufs.out;
+        resize(samples, width * height, 0.0, jobs_for(width * height));
 
         let mut row_buf = vec![Complex::new(0.0, 0.0); width];
         for (row, out) in samples.chunks_exact_mut(width).take(height).enumerate() {
@@ -789,7 +870,7 @@ impl FFTFrame<'_> {
             }
         }
 
-        Some(arr)
+        Some(src.dims.clone())
     }
 
     fn compute_fft_2d_inverse(
@@ -797,7 +878,8 @@ impl FFTFrame<'_> {
         src: &NDArray,
         vals: &[f64],
         suppress_dc: bool,
-    ) -> Option<NDArray> {
+        bufs: &mut Buffers,
+    ) -> Option<Vec<NDDimension>> {
         if src.dims.len() < 2 {
             return None;
         }
@@ -813,7 +895,11 @@ impl FFTFrame<'_> {
         let cols = self.plan_inverse(h);
         let scale = 1.0 / (w * h) as f64;
 
-        let mut data = vec![Complex::new(0.0, 0.0); w * h];
+        // Every row loads in full, so a reused `data` keeps nothing of an
+        // earlier frame.
+        let jobs = jobs_for(w * h);
+        let data = &mut bufs.data;
+        resize(data, w * h, Complex::new(0.0, 0.0), jobs);
         for (row, r) in data.chunks_exact_mut(w).enumerate() {
             load_row(r, vals, row, w);
         }
@@ -822,16 +908,16 @@ impl FFTFrame<'_> {
             data[0] = Complex::new(0.0, 0.0);
         }
 
-        fft_columns(&cols, &mut data, w, jobs_for(w * h));
-        rows.run(&mut data);
+        fft_columns(&cols, data, w, jobs, &mut bufs.cols);
+        rows.run(data);
 
         // Inverse transform yields signed real samples: keep the real part.
-        let dims = vec![NDDimension::new(w), NDDimension::new(h)];
-        let mut arr = float64_spectrum(dims);
-        for (s, c) in f64_slice(&mut arr).iter_mut().zip(&data) {
+        let samples = &mut bufs.out;
+        resize(samples, w * h, 0.0, jobs);
+        for (s, c) in samples.iter_mut().zip(&*data) {
             *s = c.re * scale;
         }
-        Some(arr)
+        Some(vec![NDDimension::new(w), NDDimension::new(h)])
     }
 }
 
@@ -877,8 +963,9 @@ impl NDPluginProcess for FFTProcessor {
             )
         };
 
-        let vals = array.data.to_f64_vec();
-        let mut result = frame.compute_fft(array, &vals);
+        let mut scratch = self.scratch.lock().pop().unwrap_or_default();
+        load_f64(&array.data, &mut scratch.vals);
+        let dims = frame.compute_fft(array, &scratch.vals, &mut scratch.bufs);
         let mut updates = Vec::new();
         // C `createAxisArrays` posts with the change itself, whatever the frame
         // then computes (NDPluginFFT.cpp:118, :328-331).
@@ -893,7 +980,7 @@ impl NDPluginProcess for FFTProcessor {
         if frame.config.direction == FFTDirection::Forward {
             let suppress_dc = frame.config.suppress_dc;
             if let Some((time_series, real, imag)) =
-                frame.compute_row_spectrum(array, &vals, suppress_dc)
+                frame.compute_row_spectrum(array, &scratch.vals, suppress_dc)
             {
                 if let Some(idx) = self.params.time_series {
                     updates.push(ParamUpdate::float64_array(idx, time_series));
@@ -913,12 +1000,9 @@ impl NDPluginProcess for FFTProcessor {
         // transform. It advances once per frame, so the FFTAbsValue waveform
         // and the output array below share the one pass.
         let (num_averaged, reset) = {
-            let values = match &mut result {
-                Some(NDArray {
-                    data: NDDataBuffer::F64(values),
-                    ..
-                }) => values.as_mut_slice(),
-                _ => &mut [],
+            let values = match dims {
+                Some(_) => scratch.bufs.out.as_mut_slice(),
+                None => &mut [],
             };
             self.state.lock().average(values)
         };
@@ -931,34 +1015,34 @@ impl NDPluginProcess for FFTProcessor {
             updates.push(ParamUpdate::int32(idx, 0));
         }
 
-        match result {
-            Some(out) => {
-                // FFTAbsValue waveform mirrors the (possibly averaged) NDArray
-                // magnitude buffer — for 1D forward this is the half-spectrum
-                // magnitude that the NDArray output already carries.
-                if frame.config.direction == FFTDirection::Forward {
-                    if let (Some(idx), NDDataBuffer::F64(mags)) = (self.params.abs_value, &out.data)
-                        && !mags.is_empty()
-                    {
-                        updates.push(ParamUpdate::float64_array(idx, mags.clone()));
-                    }
-                }
-                // C allocates, copies and numbers the output only
-                // `if (arrayCallbacks)` (NDPluginFFT.cpp:209-220).
-                if !self.array_callbacks.get() {
-                    return ProcessResult::sink(updates);
-                }
-                let mut out = match pool_output(pool, array, &out) {
-                    Ok(out) => out,
-                    Err(e) => {
-                        tracing::warn!(error = %e, "FFT output allocation failed; dropping frame");
-                        return ProcessResult::sink(updates);
-                    }
-                };
+        let output = dims.and_then(|dims| {
+            let mags = &scratch.bufs.out;
+            // FFTAbsValue waveform mirrors the (possibly averaged) NDArray
+            // magnitude buffer — for 1D forward this is the half-spectrum
+            // magnitude that the NDArray output already carries.
+            if frame.config.direction == FFTDirection::Forward
+                && let Some(idx) = self.params.abs_value
+                && !mags.is_empty()
+            {
+                updates.push(ParamUpdate::float64_array(idx, mags.clone()));
+            }
+            // C allocates, copies and numbers the output only
+            // `if (arrayCallbacks)` (NDPluginFFT.cpp:209-220).
+            self.array_callbacks
+                .get()
+                .then(|| pool_output(pool, array, dims, mags))
+        });
+        self.scratch.lock().push(scratch);
+        match output {
+            Some(Ok(mut out)) => {
                 out.unique_id = self.unique_id.fetch_add(1, Ordering::Relaxed);
                 let mut r = ProcessResult::arrays(vec![Arc::new(out)]);
                 r.param_updates = updates;
                 r
+            }
+            Some(Err(e)) => {
+                tracing::warn!(error = %e, "FFT output allocation failed; dropping frame");
+                ProcessResult::sink(updates)
             }
             None => ProcessResult::sink(updates),
         }
@@ -1061,7 +1145,7 @@ mod tests {
 
         let pool = NDArrayPool::new(0);
         let before = ad_core_rs::timestamp::EpicsTimestamp::now().as_f64();
-        let out = pool_output(&pool, &src, &float64_spectrum(src.dims.clone())).unwrap();
+        let out = pool_output(&pool, &src, src.dims.clone(), &[0.0; 8]).unwrap();
 
         assert_eq!(out.timestamp, src.timestamp);
         assert!(out.time_stamp >= before, "timeStamp is the wall clock");
@@ -1138,11 +1222,14 @@ mod tests {
         3
     }
 
-    fn f64_bits(arr: Option<NDArray>) -> Vec<u64> {
-        match &arr.unwrap().data {
-            NDDataBuffer::F64(v) => v.iter().map(|x| x.to_bits()).collect(),
-            _ => unreachable!(),
-        }
+    fn bits(v: &[f64]) -> Vec<u64> {
+        v.iter().map(|x| x.to_bits()).collect()
+    }
+
+    /// The dims a transform returned and the bits it wrote to `bufs.out`.
+    fn out_bits(dims: Option<Vec<NDDimension>>, bufs: Buffers) -> (Vec<usize>, Vec<u64>) {
+        let dims = dims.unwrap().iter().map(|d| d.size).collect();
+        (dims, bits(&bufs.out))
     }
 
     /// The pool cuts the rows into pair chunks and the columns into waves of
@@ -1163,13 +1250,16 @@ mod tests {
             );
             for suppress_dc in [false, true] {
                 let mut rows_1d = |jobs: fn(usize) -> usize| {
-                    f64_bits(fft_1d_rows_with(
+                    let mut bufs = Buffers::default();
+                    let dims = fft_1d_rows_with(
                         |n| planner.plan_fft_forward(n),
                         jobs,
                         &arr,
                         &vals,
                         suppress_dc,
-                    ))
+                        &mut bufs,
+                    );
+                    out_bits(dims, bufs)
                 };
                 let want = rows_1d(serial);
                 assert_eq!(rows_1d(three), want, "1d {w}x{h}");
@@ -1178,13 +1268,16 @@ mod tests {
                     continue;
                 }
                 let mut fft_2d = |jobs: fn(usize) -> usize| {
-                    f64_bits(fft_2d_with(
+                    let mut bufs = Buffers::default();
+                    let dims = fft_2d_with(
                         |n| planner.plan_fft_forward(n),
                         jobs,
                         &arr,
                         &vals,
                         suppress_dc,
-                    ))
+                        &mut bufs,
+                    );
+                    out_bits(dims, bufs)
                 };
                 let want = fft_2d(serial);
                 assert_eq!(fft_2d(three), want, "2d {w}x{h}");
@@ -1204,7 +1297,7 @@ mod tests {
             .collect();
         let columns = |jobs| {
             let mut d = data.clone();
-            fft_columns(&fft, &mut d, w, jobs);
+            fft_columns(&fft, &mut d, w, jobs, &mut Vec::new());
             d.iter()
                 .map(|c| (c.re.to_bits(), c.im.to_bits()))
                 .collect::<Vec<_>>()
@@ -1212,6 +1305,80 @@ mod tests {
         let want = columns(1);
         assert_eq!(columns(2), want);
         assert_eq!(columns(3), want);
+    }
+
+    /// The pooled conversion casts each sample as `to_f64_vec` does, over
+    /// several chunks and a short last one, into a reused buffer shorter and
+    /// longer than the frame.
+    #[test]
+    fn pooled_conversion_matches_to_f64_vec() {
+        let n = 3 * (1 << 16) + 5;
+        let ints = (0..n as i64).map(|i| (i * 7919) % 70001 - 35000);
+        for data in [
+            NDDataBuffer::U16(ints.clone().map(|i| i as u16).collect()),
+            NDDataBuffer::I32(ints.clone().map(|i| i as i32 * 977).collect()),
+            // Past 2^53, so the cast rounds.
+            NDDataBuffer::I64(ints.clone().map(|i| (i << 40) | 1).collect()),
+            NDDataBuffer::F32(ints.clone().map(|i| i as f32 / 3.0).collect()),
+            NDDataBuffer::F64(ints.clone().map(|i| i as f64 / 7.0).collect()),
+        ] {
+            let want = bits(&data.to_f64_vec());
+            for start in [9, n + 9] {
+                let mut vals = vec![1.0; start];
+                load_f64(&data, &mut vals);
+                assert_eq!(bits(&vals), want, "{:?} from {start}", data.data_type());
+            }
+            let mut out = vec![0.0; n];
+            ad_core_rs::with_buffer!(&data, |v| to_f64_into(&mut out, v, 3));
+            assert_eq!(bits(&out), want, "{:?} in 3 jobs", data.data_type());
+        }
+    }
+
+    /// A processor's second frame, on the buffers its first frame filled,
+    /// is a fresh processor's bit for bit. The 2-D forward pair pads to the
+    /// same 128x64, so the second frame's padding rows must read zero, not
+    /// the first frame's rows.
+    #[test]
+    fn reused_frame_buffers_keep_nothing_of_the_last_frame() {
+        let frame = |w: usize, h: usize, seed: usize| {
+            let dims = if h > 1 { vec![w, h] } else { vec![w] };
+            Arc::new(NDArray::with_data(
+                dims.into_iter().map(NDDimension::new).collect(),
+                NDDataBuffer::U16(
+                    (0..w * h)
+                        .map(|i| ((i * 7919 + seed) % 4093) as u16 + 1)
+                        .collect(),
+                ),
+            ))
+        };
+        let pool = NDArrayPool::new(0);
+        let out = |proc: &FFTProcessor, arr: &Arc<NDArray>| {
+            let r = proc.process_array(arr, &pool);
+            match &r.output_arrays[0].data {
+                NDDataBuffer::F64(v) => bits(v),
+                _ => unreachable!(),
+            }
+        };
+        for direction in [FFTDirection::Forward, FFTDirection::Inverse] {
+            let config = FFTConfig {
+                direction,
+                ..FFTConfig::default()
+            };
+            for (first, second) in [
+                (frame(100, 64, 1), frame(97, 33, 2)),
+                (frame(250, 1, 1), frame(129, 1, 2)),
+            ] {
+                let reused = FFTProcessor::with_config(config);
+                out(&reused, &first);
+                let fresh = FFTProcessor::with_config(config);
+                assert_eq!(
+                    out(&reused, &second),
+                    out(&fresh, &second),
+                    "{direction:?} {:?}",
+                    second.dims
+                );
+            }
+        }
     }
 
     fn pool() -> Arc<NDArrayPool> {

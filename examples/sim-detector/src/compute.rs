@@ -769,9 +769,9 @@ mod tests {
     }
 
     /// FNV-1a over the little-endian bytes of every frame of each data type,
-    /// mode, colour layout and background setting, from a fixed seed; the
-    /// constants were captured on 65b35bc41b75, before compute_frame went
-    /// typed.
+    /// mode, colour layout and background setting, from a fixed seed, with
+    /// float elements rounded to 1e-3; the constants were captured on
+    /// 65b35bc41b75, before compute_frame went typed.
     #[test]
     fn frame_output_is_pinned_for_a_fixed_seed() {
         use ad_core_rs::ndarray::NDDataType;
@@ -866,13 +866,23 @@ mod tests {
                                 frame == 0,
                                 &mut rng,
                             );
-                            with_buffer!(&raw, |v| {
-                                for x in v {
-                                    for b in x.to_le_bytes() {
-                                        hash = (hash ^ b as u64).wrapping_mul(0x100_0000_01b3);
-                                    }
+                            let mut feed = |bytes: &[u8]| {
+                                for &b in bytes {
+                                    hash = (hash ^ b as u64).wrapping_mul(0x100_0000_01b3);
                                 }
-                            });
+                            };
+                            // Rounded to 1e-3, far above the ULPs by which
+                            // libm sin differs between MSVC and glibc.
+                            let rounded = |x: f64| ((x * 1e3).round() as i64).to_le_bytes();
+                            match &raw {
+                                NDDataBuffer::F32(v) => {
+                                    v.iter().for_each(|&x| feed(&rounded(x as f64)))
+                                }
+                                NDDataBuffer::F64(v) => v.iter().for_each(|&x| feed(&rounded(x))),
+                                raw => with_buffer!(raw, |v| {
+                                    v.iter().for_each(|x| feed(&x.to_le_bytes()))
+                                }),
+                            }
                         }
                     }
                 }
@@ -912,14 +922,14 @@ mod tests {
             0x53d95fa64d936de8,
             0x7d1b2b6ed82b2fb8,
             0x036b906df6c72c83,
-            0x62a1cf2ab29e8ac4,
-            0x0dfb3d95af05f7a2,
-            0x2f2633d671c24cfc,
-            0x47305d355a34b9ae,
-            0x3edabf1f7aee0aad,
-            0xa5aaf36d71b5afd6,
-            0x3d7d4e94b9758062,
-            0xd5bb530fe70435e0,
+            0xca35e2f113a75a5f,
+            0x5bf5ef9a8060787f,
+            0xd1af93081ac432c3,
+            0xac16ce73fb1655d0,
+            0x2c32ffc0d2f1c153,
+            0xeea53f08450e5a1c,
+            0xeb6b3c1bc822339f,
+            0x5c2fea1952e0f9bd,
         ];
         assert_eq!(got.len(), want.len());
         let changed: Vec<_> = got

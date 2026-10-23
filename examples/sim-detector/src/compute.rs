@@ -6,7 +6,7 @@ use ad_core_rs::ndarray::NDDataBuffer;
 
 use crate::types::{SimMode, SineOperation};
 use ad_core_rs::color_layout::ColorLayout;
-use ad_core_rs::pixel_cast::{PixelCast, with_buffer, with_buffer_mut};
+use ad_core_rs::pixel_cast::PixelCast;
 
 const MAX_PEAK_SIGMA: i32 = 4;
 
@@ -83,55 +83,45 @@ impl SineState {
 }
 
 /// Fill background buffer with offset + noise.
-pub fn fill_background(buf: &mut NDDataBuffer, offset: f64, noise: f64, rng: &mut StdRng) {
-    with_buffer_mut!(buf, |v| {
-        if noise == 0.0 {
-            for elem in v.iter_mut() {
-                *elem = PixelCast::from_f64(offset);
-            }
-        } else {
-            for elem in v.iter_mut() {
-                let n: f64 = rng.random::<f64>() * noise;
-                *elem = PixelCast::from_f64(n + offset);
-            }
+pub fn fill_background<T: PixelCast>(v: &mut [T], offset: f64, noise: f64, rng: &mut StdRng) {
+    if noise == 0.0 {
+        for elem in v.iter_mut() {
+            *elem = T::from_f64(offset);
         }
-    });
+    } else {
+        for elem in v.iter_mut() {
+            let n: f64 = rng.random::<f64>() * noise;
+            *elem = T::from_f64(n + offset);
+        }
+    }
 }
 
-/// Apply background to raw buffer using circular copy from random start position.
-pub fn apply_background(raw: &mut NDDataBuffer, background: &NDDataBuffer, rng: &mut StdRng) {
-    // Read background as f64
-    let bg_f64: Vec<f64> = with_buffer!(background, |v| {
-        v.iter().map(|x| PixelCast::to_f64(*x)).collect()
-    });
-    let n = bg_f64.len();
+/// Apply background to raw buffer using circular copy from random start
+/// position: C's two memcpy runs (simDetector.cpp:79-85).
+pub fn apply_background<T: Copy>(raw: &mut [T], background: &[T], rng: &mut StdRng) {
+    let n = background.len();
     if n == 0 {
         return;
     }
     let start = (rng.random::<f64>() * n as f64) as usize % n;
-    with_buffer_mut!(raw, |raw_v| {
-        for (i, elem) in raw_v.iter_mut().enumerate() {
-            let bg_idx = (start + i) % n;
-            *elem = PixelCast::from_f64(bg_f64[bg_idx]);
-        }
-    });
+    let (head, tail) = raw.split_at_mut(n - start);
+    head.copy_from_slice(&background[start..]);
+    tail.copy_from_slice(&background[..start]);
 }
 
 /// Zero the raw buffer.
-pub fn zero_buffer(buf: &mut NDDataBuffer) {
-    with_buffer_mut!(buf, |v| {
-        for elem in v.iter_mut() {
-            *elem = PixelCast::from_f64(0.0);
-        }
-    });
+pub fn zero_buffer<T: PixelCast>(v: &mut [T]) {
+    for elem in v.iter_mut() {
+        *elem = T::from_f64(0.0);
+    }
 }
 
 /// Accumulate linear ramp into raw/ramp buffer.
 /// If reset is true, recompute the base ramp pattern; otherwise, increment it.
 /// After computation, if use_background is true, add ramp_buf values to raw_buf.
-pub fn accumulate_linear_ramp(
-    raw: &mut NDDataBuffer,
-    ramp_buf: &mut NDDataBuffer,
+pub fn accumulate_linear_ramp<T: PixelCast>(
+    raw: &mut [T],
+    ramp_buf: &mut [T],
     layout: &ColorLayout,
     gains: &Gains,
     reset: bool,
@@ -207,36 +197,26 @@ pub fn accumulate_linear_ramp(
     }
 
     if use_background {
-        with_buffer_mut!(ramp_buf, |data| {
-            fill_ramp(
-                data, layout, size_x, size_y, inc_mono, inc_red, inc_green, inc_blue, gain_x,
-                gain_y, reset,
-            );
-        });
-        // Add ramp to raw: read ramp as f64 vec, then add to raw
-        let ramp_f64: Vec<f64> = with_buffer!(&*ramp_buf, |v| {
-            v.iter().map(|x| PixelCast::to_f64(*x)).collect()
-        });
-        with_buffer_mut!(raw, |data| {
-            for (elem, &rv) in data.iter_mut().zip(ramp_f64.iter()) {
-                *elem = PixelCast::from_f64(PixelCast::to_f64(*elem) + rv);
-            }
-        });
+        fill_ramp(
+            ramp_buf, layout, size_x, size_y, inc_mono, inc_red, inc_green, inc_blue, gain_x,
+            gain_y, reset,
+        );
+        for (elem, rv) in raw.iter_mut().zip(ramp_buf.iter()) {
+            *elem = T::from_f64(elem.to_f64() + rv.to_f64());
+        }
     } else {
-        with_buffer_mut!(raw, |data| {
-            fill_ramp(
-                data, layout, size_x, size_y, inc_mono, inc_red, inc_green, inc_blue, gain_x,
-                gain_y, reset,
-            );
-        });
+        fill_ramp(
+            raw, layout, size_x, size_y, inc_mono, inc_red, inc_green, inc_blue, gain_x, gain_y,
+            reset,
+        );
     }
 }
 
 /// Accumulate Gaussian peaks into raw buffer.
 /// peak_buf is used as a cache for the 2D Gaussian template.
-pub fn accumulate_peaks(
-    raw: &mut NDDataBuffer,
-    peak_buf: &mut NDDataBuffer,
+pub fn accumulate_peaks<T: PixelCast>(
+    raw: &mut [T],
+    peak_buf: &mut [T],
     layout: &ColorLayout,
     peak: &PeakParams,
     gains: &Gains,
@@ -251,90 +231,76 @@ pub fn accumulate_peaks(
 
     if reset {
         // Compute 2D Gaussian template in peak_buf (stored in first rows of maxSize buffer)
-        with_buffer_mut!(peak_buf, |data| {
-            for i in 0..peak_full_width_y {
-                for j in 0..peak_full_width_x {
-                    let idx = (i * size_x + j) as usize;
-                    let gauss_y =
-                        (-((i - peak_full_width_y / 2) as f64 / peak.width_y as f64).powi(2) / 2.0)
-                            .exp();
-                    let gauss_x =
-                        (-((j - peak_full_width_x / 2) as f64 / peak.width_x as f64).powi(2) / 2.0)
-                            .exp();
-                    if idx < data.len() {
-                        data[idx] = PixelCast::from_f64(gains.gain * gauss_x * gauss_y);
-                    }
+        for i in 0..peak_full_width_y {
+            for j in 0..peak_full_width_x {
+                let idx = (i * size_x + j) as usize;
+                let gauss_y = (-((i - peak_full_width_y / 2) as f64 / peak.width_y as f64).powi(2)
+                    / 2.0)
+                    .exp();
+                let gauss_x = (-((j - peak_full_width_x / 2) as f64 / peak.width_x as f64).powi(2)
+                    / 2.0)
+                    .exp();
+                if idx < peak_buf.len() {
+                    peak_buf[idx] = T::from_f64(gains.gain * gauss_x * gauss_y);
                 }
             }
-        });
+        }
     }
 
-    // Read peak template as f64 for stamping
-    let peak_f64: Vec<f64> = with_buffer!(&*peak_buf, |v| {
-        v.iter().map(|x| PixelCast::to_f64(*x)).collect()
-    });
-
     // Stamp peaks into raw
-    with_buffer_mut!(raw, |raw_v| {
-        for i in 0..peak.num_y {
-            for j in 0..peak.num_x {
-                let gain_variation = if peak.height_variation != 0.0 {
-                    1.0 + (peak.height_variation / 100.0) * (rng.random::<f64>() - 0.5)
-                } else {
-                    1.0
-                };
+    for i in 0..peak.num_y {
+        for j in 0..peak.num_x {
+            let gain_variation = if peak.height_variation != 0.0 {
+                1.0 + (peak.height_variation / 100.0) * (rng.random::<f64>() - 0.5)
+            } else {
+                1.0
+            };
 
-                let offset_y = i * peak.step_y + peak.start_y;
-                let offset_x = j * peak.step_x + peak.start_x;
+            let offset_y = i * peak.step_y + peak.start_y;
+            let offset_x = j * peak.step_x + peak.start_x;
 
-                for k in 0..peak_full_width_y {
-                    let y_out = offset_y + k - peak_full_width_y / 2;
-                    if y_out < 0 || y_out >= size_y {
+            for k in 0..peak_full_width_y {
+                let y_out = offset_y + k - peak_full_width_y / 2;
+                if y_out < 0 || y_out >= size_y {
+                    continue;
+                }
+                for l in 0..peak_full_width_x {
+                    let x_out = offset_x + l - peak_full_width_x / 2;
+                    if x_out < 0 || x_out >= size_x {
                         continue;
                     }
-                    for l in 0..peak_full_width_x {
-                        let x_out = offset_x + l - peak_full_width_x / 2;
-                        if x_out < 0 || x_out >= size_x {
-                            continue;
-                        }
-                        let peak_idx = (k * size_x + l) as usize;
-                        let pv = peak_f64[peak_idx];
+                    let peak_idx = (k * size_x + l) as usize;
+                    let pv = peak_buf[peak_idx].to_f64();
 
-                        match layout.color_mode {
-                            ad_core_rs::driver::ColorMode::Mono => {
-                                let raw_idx = layout.index(x_out as usize, y_out as usize, 0);
-                                raw_v[raw_idx] = PixelCast::from_f64(
-                                    PixelCast::to_f64(raw_v[raw_idx]) + gain_variation * pv,
-                                );
-                            }
-                            _ => {
-                                let ri = layout.index(x_out as usize, y_out as usize, 0);
-                                let gi = layout.index(x_out as usize, y_out as usize, 1);
-                                let bi = layout.index(x_out as usize, y_out as usize, 2);
-                                raw_v[ri] = PixelCast::from_f64(
-                                    PixelCast::to_f64(raw_v[ri])
-                                        + gains.gain_red * gain_variation * pv,
-                                );
-                                raw_v[gi] = PixelCast::from_f64(
-                                    PixelCast::to_f64(raw_v[gi])
-                                        + gains.gain_green * gain_variation * pv,
-                                );
-                                raw_v[bi] = PixelCast::from_f64(
-                                    PixelCast::to_f64(raw_v[bi])
-                                        + gains.gain_blue * gain_variation * pv,
-                                );
-                            }
+                    match layout.color_mode {
+                        ad_core_rs::driver::ColorMode::Mono => {
+                            let raw_idx = layout.index(x_out as usize, y_out as usize, 0);
+                            raw[raw_idx] = T::from_f64(raw[raw_idx].to_f64() + gain_variation * pv);
+                        }
+                        _ => {
+                            let ri = layout.index(x_out as usize, y_out as usize, 0);
+                            let gi = layout.index(x_out as usize, y_out as usize, 1);
+                            let bi = layout.index(x_out as usize, y_out as usize, 2);
+                            raw[ri] = T::from_f64(
+                                raw[ri].to_f64() + gains.gain_red * gain_variation * pv,
+                            );
+                            raw[gi] = T::from_f64(
+                                raw[gi].to_f64() + gains.gain_green * gain_variation * pv,
+                            );
+                            raw[bi] = T::from_f64(
+                                raw[bi].to_f64() + gains.gain_blue * gain_variation * pv,
+                            );
                         }
                     }
                 }
             }
         }
-    });
+    }
 }
 
 /// Accumulate sine wave pattern into raw buffer.
-pub fn accumulate_sine(
-    raw: &mut NDDataBuffer,
+pub fn accumulate_sine<T: PixelCast>(
+    raw: &mut [T],
     layout: &ColorLayout,
     state: &mut SineState,
     sine: &SineParams,
@@ -406,50 +372,84 @@ pub fn accumulate_sine(
     }
 
     // Apply to image
-    with_buffer_mut!(raw, |data| {
-        for y in 0..size_y {
-            match layout.color_mode {
-                ad_core_rs::driver::ColorMode::Mono => {
-                    for x in 0..size_x {
-                        let idx = layout.index(x, y, 0);
-                        let val = gains.gain * (state.y_sine1[y] + state.x_sine1[x]);
-                        data[idx] = PixelCast::from_f64(PixelCast::to_f64(data[idx]) + val);
-                    }
+    for y in 0..size_y {
+        match layout.color_mode {
+            ad_core_rs::driver::ColorMode::Mono => {
+                for x in 0..size_x {
+                    let idx = layout.index(x, y, 0);
+                    let val = gains.gain * (state.y_sine1[y] + state.x_sine1[x]);
+                    raw[idx] = T::from_f64(raw[idx].to_f64() + val);
                 }
-                _ => {
-                    for x in 0..size_x {
-                        let ri = layout.index(x, y, 0);
-                        let gi = layout.index(x, y, 1);
-                        let bi = layout.index(x, y, 2);
-                        data[ri] = PixelCast::from_f64(
-                            PixelCast::to_f64(data[ri])
-                                + gains.gain * gains.gain_red * state.x_sine1[x],
-                        );
-                        data[gi] = PixelCast::from_f64(
-                            PixelCast::to_f64(data[gi])
-                                + gains.gain * gains.gain_green * state.y_sine1[y],
-                        );
-                        data[bi] = PixelCast::from_f64(
-                            PixelCast::to_f64(data[bi])
-                                + gains.gain
-                                    * gains.gain_blue
-                                    * (state.x_sine2[x] + state.y_sine2[y])
-                                    / 2.0,
-                        );
-                    }
+            }
+            _ => {
+                for x in 0..size_x {
+                    let ri = layout.index(x, y, 0);
+                    let gi = layout.index(x, y, 1);
+                    let bi = layout.index(x, y, 2);
+                    raw[ri] = T::from_f64(
+                        raw[ri].to_f64() + gains.gain * gains.gain_red * state.x_sine1[x],
+                    );
+                    raw[gi] = T::from_f64(
+                        raw[gi].to_f64() + gains.gain * gains.gain_green * state.y_sine1[y],
+                    );
+                    raw[bi] = T::from_f64(
+                        raw[bi].to_f64()
+                            + gains.gain * gains.gain_blue * (state.x_sine2[x] + state.y_sine2[y])
+                                / 2.0,
+                    );
                 }
             }
         }
-    });
+    }
 }
 
 /// Compute a single frame based on the current config and sim mode.
 /// This is the main pipeline function called from the acquisition loop.
+///
+/// Like C's `computeArray<epicsType>` (simDetector.cpp:649-680) it picks the
+/// element type once per frame; the four buffers are the one data type and
+/// length the task allocates them with.
 pub fn compute_frame(
     raw: &mut NDDataBuffer,
     background: &mut NDDataBuffer,
     ramp_buf: &mut NDDataBuffer,
     peak_buf: &mut NDDataBuffer,
+    sine_state: &mut SineState,
+    layout: &ColorLayout,
+    sim_mode: SimMode,
+    gains: &Gains,
+    peak: &PeakParams,
+    sine: &SineParams,
+    offset: f64,
+    noise: f64,
+    use_background: bool,
+    reset: bool,
+    rng: &mut StdRng,
+) {
+    macro_rules! typed {
+        ($($v:ident),+) => {
+            match (raw, background, ramp_buf, peak_buf) {
+                $((
+                    NDDataBuffer::$v(raw),
+                    NDDataBuffer::$v(background),
+                    NDDataBuffer::$v(ramp_buf),
+                    NDDataBuffer::$v(peak_buf),
+                ) => compute_typed(
+                    raw, background, ramp_buf, peak_buf, sine_state, layout, sim_mode, gains,
+                    peak, sine, offset, noise, use_background, reset, rng,
+                ),)+
+                _ => unreachable!("sim buffers of different data types"),
+            }
+        };
+    }
+    typed!(I8, U8, I16, U16, I32, U32, I64, U64, F32, F64)
+}
+
+fn compute_typed<T: PixelCast>(
+    raw: &mut [T],
+    background: &mut [T],
+    ramp_buf: &mut [T],
+    peak_buf: &mut [T],
     sine_state: &mut SineState,
     layout: &ColorLayout,
     sim_mode: SimMode,
@@ -496,6 +496,7 @@ mod tests {
     use super::*;
     use ad_core_rs::driver::ColorMode;
     use ad_core_rs::ndarray::NDDataBuffer;
+    use ad_core_rs::pixel_cast::with_buffer;
     use rand::SeedableRng;
 
     fn default_gains() -> Gains {
@@ -519,52 +520,46 @@ mod tests {
 
     #[test]
     fn test_fill_background_offset_only() {
-        let mut buf = NDDataBuffer::F64(vec![0.0; 10]);
+        let mut buf = vec![0.0; 10];
         let mut rng = StdRng::seed_from_u64(42);
         fill_background(&mut buf, 5.0, 0.0, &mut rng);
-        if let NDDataBuffer::F64(v) = &buf {
-            for &x in v {
-                assert_eq!(x, 5.0);
-            }
+        for &x in &buf {
+            assert_eq!(x, 5.0);
         }
     }
 
     #[test]
     fn test_fill_background_with_noise() {
-        let mut buf = NDDataBuffer::F64(vec![0.0; 100]);
+        let mut buf = vec![0.0; 100];
         let mut rng = StdRng::seed_from_u64(42);
         fill_background(&mut buf, 10.0, 5.0, &mut rng);
-        if let NDDataBuffer::F64(v) = &buf {
-            let min = v.iter().cloned().fold(f64::INFINITY, f64::min);
-            let max = v.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-            assert!(min >= 10.0);
-            assert!(max <= 15.0);
-        }
+        let min = buf.iter().cloned().fold(f64::INFINITY, f64::min);
+        let max = buf.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        assert!(min >= 10.0);
+        assert!(max <= 15.0);
     }
 
     #[test]
     fn test_linear_ramp_mono_u8_reset() {
         let layout = mono_layout(4, 3);
         let n = layout.num_elements();
-        let mut raw = NDDataBuffer::U8(vec![0; n]);
-        let mut ramp = NDDataBuffer::U8(vec![0; n]);
+        let mut raw = vec![0u8; n];
+        let mut ramp = vec![0u8; n];
         let gains = default_gains();
         accumulate_linear_ramp(&mut raw, &mut ramp, &layout, &gains, true, false);
-        if let NDDataBuffer::U8(v) = &raw {
-            // pixel(x,y) = gain * (gainX*x + gainY*y) = 1*(1*x+1*y) = x+y
-            assert_eq!(v[0], 0); // (0,0)
-            assert_eq!(v[1], 1); // (1,0)
-            assert_eq!(v[4], 1); // (0,1)
-            assert_eq!(v[5], 2); // (1,1)
-        }
+        // pixel(x,y) = gain * (gainX*x + gainY*y) = 1*(1*x+1*y) = x+y
+        assert_eq!(raw[0], 0); // (0,0)
+        assert_eq!(raw[1], 1); // (1,0)
+        assert_eq!(raw[4], 1); // (0,1)
+        assert_eq!(raw[5], 2); // (1,1)
     }
 
     #[test]
     fn test_linear_ramp_mono_f64_increment() {
         let layout = mono_layout(2, 2);
         let n = layout.num_elements();
-        let mut raw = NDDataBuffer::F64(vec![0.0; n]);
-        let mut ramp = NDDataBuffer::F64(vec![0.0; n]);
+        let mut raw = vec![0.0; n];
+        let mut ramp = vec![0.0; n];
         let gains = Gains {
             gain: 3.0,
             gain_x: 1.0,
@@ -575,20 +570,18 @@ mod tests {
         accumulate_linear_ramp(&mut raw, &mut ramp, &layout, &gains, true, false);
         // Frame 2: increment
         accumulate_linear_ramp(&mut raw, &mut ramp, &layout, &gains, false, false);
-        if let NDDataBuffer::F64(v) = &raw {
-            // (0,0): reset=0, +3 = 3
-            assert_eq!(v[0], 3.0);
-            // (1,0): reset=3, +3 = 6
-            assert_eq!(v[1], 6.0);
-        }
+        // (0,0): reset=0, +3 = 3
+        assert_eq!(raw[0], 3.0);
+        // (1,0): reset=3, +3 = 6
+        assert_eq!(raw[1], 6.0);
     }
 
     #[test]
     fn test_peaks_gaussian_symmetry() {
         let layout = mono_layout(64, 64);
         let n = layout.num_elements();
-        let mut raw = NDDataBuffer::F64(vec![0.0; n]);
-        let mut peak_buf = NDDataBuffer::F64(vec![0.0; n]);
+        let mut raw = vec![0.0f64; n];
+        let mut peak_buf = vec![0.0; n];
         let mut rng = StdRng::seed_from_u64(42);
         let gains = default_gains();
         let peak = PeakParams {
@@ -611,22 +604,20 @@ mod tests {
             true,
             &mut rng,
         );
-        if let NDDataBuffer::F64(v) = &raw {
-            // Center should have max value
-            let center = layout.index(32, 32, 0);
-            let left = layout.index(31, 32, 0);
-            let right = layout.index(33, 32, 0);
-            assert!(v[center] > 0.0);
-            // Should be symmetric
-            assert!((v[left] - v[right]).abs() < 1e-10);
-        }
+        // Center should have max value
+        let center = layout.index(32, 32, 0);
+        let left = layout.index(31, 32, 0);
+        let right = layout.index(33, 32, 0);
+        assert!(raw[center] > 0.0);
+        // Should be symmetric
+        assert!((raw[left] - raw[right]).abs() < 1e-10);
     }
 
     #[test]
     fn test_sine_mono_f64() {
         let layout = mono_layout(32, 32);
         let n = layout.num_elements();
-        let mut raw = NDDataBuffer::F64(vec![0.0; n]);
+        let mut raw = vec![0.0; n];
         let mut state = SineState::new();
         let gains = default_gains();
         let sine = SineParams {
@@ -654,19 +645,17 @@ mod tests {
             y_op: SineOperation::Add,
         };
         accumulate_sine(&mut raw, &layout, &mut state, &sine, &gains, true);
-        if let NDDataBuffer::F64(v) = &raw {
-            // Should have non-zero values
-            let max = v.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-            assert!(max > 0.0);
-        }
+        // Should have non-zero values
+        let max = raw.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        assert!(max > 0.0);
     }
 
     #[test]
     fn test_sine_phase_continuity() {
         let layout = mono_layout(16, 16);
         let n = layout.num_elements();
-        let mut raw1 = NDDataBuffer::F64(vec![0.0; n]);
-        let mut raw2 = NDDataBuffer::F64(vec![0.0; n]);
+        let mut raw1 = vec![0.0; n];
+        let mut raw2 = vec![0.0; n];
         let mut state = SineState::new();
         let gains = default_gains();
         let sine = SineParams {
@@ -703,9 +692,7 @@ mod tests {
         assert_eq!(counter_after_1, 16.0);
         assert_eq!(counter_after_2, 32.0);
         // Frames should be different (phase shifted)
-        if let (NDDataBuffer::F64(v1), NDDataBuffer::F64(v2)) = (&raw1, &raw2) {
-            assert_ne!(v1, v2);
-        }
+        assert_ne!(raw1, raw2);
     }
 
     #[test]
@@ -778,6 +765,115 @@ mod tests {
             for &x in v.iter() {
                 assert!(x >= 10.0 && x <= 15.0, "value {} out of range", x);
             }
+        }
+    }
+
+    /// FNV-1a over every frame of each mode, colour layout and background
+    /// setting, from a fixed seed; the constants pin the output of the code
+    /// this test was first run against.
+    #[test]
+    fn frame_output_is_pinned_for_a_fixed_seed() {
+        use ad_core_rs::ndarray::NDDataType;
+
+        let gains = Gains {
+            gain: 2.5,
+            gain_x: 1.5,
+            gain_y: 0.75,
+            gain_red: 1.0,
+            gain_green: 0.5,
+            gain_blue: 0.25,
+        };
+        let peak = PeakParams {
+            start_x: 6,
+            start_y: 5,
+            width_x: 2,
+            width_y: 1,
+            num_x: 3,
+            num_y: 2,
+            step_x: 11,
+            step_y: 9,
+            height_variation: 20.0,
+        };
+        let wave = |amplitude, frequency, phase| SineWave {
+            amplitude,
+            frequency,
+            phase,
+        };
+        let sine = SineParams {
+            x_sine1: wave(40.0, 2.0, 10.0),
+            x_sine2: wave(15.0, 5.0, 90.0),
+            y_sine1: wave(30.0, 1.0, 45.0),
+            y_sine2: wave(10.0, 3.0, 0.0),
+            x_op: SineOperation::Add,
+            y_op: SineOperation::Multiply,
+        };
+        let mut got = Vec::new();
+        for data_type in [NDDataType::UInt16, NDDataType::Float64] {
+            for sim_mode in [
+                SimMode::LinearRamp,
+                SimMode::Peaks,
+                SimMode::Sine,
+                SimMode::OffsetNoise,
+            ] {
+                let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+                for color_mode in [ColorMode::Mono, ColorMode::RGB1, ColorMode::RGB2] {
+                    for (offset, noise) in [(0.0, 0.0), (100.0, 0.0), (100.0, 50.0)] {
+                        let layout = ColorLayout {
+                            color_mode,
+                            size_x: 37,
+                            size_y: 23,
+                        };
+                        let n = layout.num_elements();
+                        let mut raw = NDDataBuffer::zeros(data_type, n);
+                        let mut bg = NDDataBuffer::zeros(data_type, n);
+                        let mut ramp = NDDataBuffer::zeros(data_type, n);
+                        let mut peak_buf = NDDataBuffer::zeros(data_type, n);
+                        let mut sine_state = SineState::new();
+                        let mut rng = StdRng::seed_from_u64(7);
+                        let use_background = noise != 0.0 || offset != 0.0;
+                        for frame in 0..3 {
+                            compute_frame(
+                                &mut raw,
+                                &mut bg,
+                                &mut ramp,
+                                &mut peak_buf,
+                                &mut sine_state,
+                                &layout,
+                                sim_mode,
+                                &gains,
+                                &peak,
+                                &sine,
+                                offset,
+                                noise,
+                                use_background,
+                                frame == 0,
+                                &mut rng,
+                            );
+                            with_buffer!(&raw, |v| {
+                                for x in v.iter() {
+                                    for b in PixelCast::to_f64(*x).to_bits().to_le_bytes() {
+                                        hash = (hash ^ b as u64).wrapping_mul(0x100_0000_01b3);
+                                    }
+                                }
+                            });
+                        }
+                    }
+                }
+                got.push((data_type, sim_mode, hash));
+            }
+        }
+        let want: [u64; 8] = [
+            0x0f2eed4c8942e4e8,
+            0x802acb8de313cade,
+            0x7482418e09d121f2,
+            0xb019ed4c3d931256,
+            0x2041c44a8fcb961c,
+            0xf66b4f1efc7ad1d4,
+            0x27ed9937a9f91186,
+            0xf73f3b068564f35f,
+        ];
+        for (&(data_type, sim_mode, hash), &want) in got.iter().zip(want.iter()) {
+            assert_eq!(hash, want, "{data_type:?} {sim_mode:?}");
         }
     }
 }

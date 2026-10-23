@@ -16,9 +16,10 @@ pymodbus.simulator                 # listens on 127.0.0.1:502
 # or:  diagslave -m tcp
 ```
 
-Then run the IOC:
+Then run the IOC from this directory (`ioc/st.cmd` is relative):
 
 ```sh
+cd examples/modbus-ioc
 cargo run --release -p modbus-ioc --bin modbus-ioc --features ioc -- ioc/st.cmd
 ```
 

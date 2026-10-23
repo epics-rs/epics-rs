@@ -292,9 +292,10 @@ mod claim {
 /// plugins may submit rayon work concurrently; shared pools keep that from
 /// over-subscribing the box. [`thread_pool`] hands a pass the pool of the
 /// domain its caller runs in, whose cache holds the frame the caller just
-/// touched: on a two-socket box fed new frames, 24 workers there beat 94
-/// across both sockets at every pooled size measured, by up to 7x. Only a
-/// frame re-read every call, cached in both sockets, ran faster on the 94.
+/// touched: on a two-socket box fed new frames back-to-back or 1-10 ms
+/// apart, 24 workers there beat 94 across both sockets in 29 of 39 cells
+/// measured, by up to 5.8x (u16 histogram 4096x4096). The 94 won by 2x on
+/// u16 bayer 2048x2048 back-to-back and by under 30% in the other nine.
 #[cfg(feature = "parallel")]
 static POOLS: OnceLock<Pools> = OnceLock::new();
 

@@ -68,10 +68,12 @@ caget REG:E:MBBO   caput REG:D:MTR 5.0   pvget REG:Q:AI   ...
 
 These tests run **automatically on every push** — no opt-in needed:
 
-- `rust.yml` → `cargo nextest run --workspace` (Linux, default profile)
-- `cross-platform.yml` → `cargo nextest run --workspace --profile ci` across the
-  Windows / macOS / Linux × x64 / arm matrix; the `ci` profile retries
-  timing-flaky network tests twice.
+- `rust.yml` → `cargo nextest run --profile ci --workspace --exclude epics-oracle-rs`
+  (Linux; again with `--all-features`)
+- `cross-platform.yml` → the same command across the Windows / macOS / Linux ×
+  x64 / arm matrix.
+
+The `ci` profile retries timing-flaky network tests twice.
 
 `examples/*` are workspace members, so `--workspace` picks this crate up. The
 suite needs no external C tools, so it is **not** gated behind

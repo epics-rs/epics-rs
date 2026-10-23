@@ -453,10 +453,12 @@ fn fft_2d_with(
     let w = next_pow2(src_w);
     let h = next_pow2(src_h);
 
-    // C++: nFreqX = paddedX/2, nFreqY = paddedY/2; normalize by padded N*M
+    // C++: nFreqX = paddedX/2, nFreqY = paddedY/2 but at least 1
+    // (NDPluginFFT.cpp:102), so a one-row frame is that row's spectrum;
+    // normalize by padded N*M.
     let n_freq_x = w / 2;
-    let n_freq_y = h / 2;
-    if n_freq_x == 0 || n_freq_y == 0 {
+    let n_freq_y = (h / 2).max(1);
+    if n_freq_x == 0 {
         return None;
     }
 
@@ -2217,6 +2219,33 @@ mod tests {
         // Time series is the raw input row.
         assert_eq!(ts.len(), n);
         assert!((ts[0] - 1.0).abs() < 1e-9);
+    }
+
+    /// C clamps nFreqY to 1 (NDPluginFFT.cpp:102): a one-row 2-D frame is
+    /// an nFreqX x 1 spectrum, the 1-D spectrum of its row.
+    #[test]
+    fn a_one_row_2d_frame_is_its_rows_spectrum() {
+        let row: Vec<f64> = (0..6).map(|i| ((i * 7919) % 251) as f64).collect();
+        let frame = |dims: Vec<usize>| {
+            NDArray::with_data(
+                dims.into_iter().map(NDDimension::new).collect(),
+                NDDataBuffer::F64(row.clone()),
+            )
+        };
+        let pool = NDArrayPool::new(0);
+        let r = FFTProcessor::new().process_array(&Arc::new(frame(vec![6, 1])), &pool);
+        let out = &r.output_arrays[0];
+        let dims: Vec<usize> = out.dims.iter().map(|d| d.size).collect();
+        assert_eq!(dims, [4, 1]);
+        let (NDDataBuffer::F64(got), Some(NDDataBuffer::F64(want))) = (
+            &out.data,
+            fft_1d_rows(&frame(vec![6]), false).map(|a| a.data.clone()),
+        ) else {
+            panic!("expected F64 spectra");
+        };
+        for (g, w) in got.iter().zip(&want) {
+            assert!((g - w).abs() <= 1e-12 * w.abs().max(1.0), "{g} vs {w}");
+        }
     }
 
     /// C posts FFTAbsValue as the first row of the spectrum,

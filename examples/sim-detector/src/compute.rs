@@ -496,6 +496,7 @@ mod tests {
     use super::*;
     use ad_core_rs::driver::ColorMode;
     use ad_core_rs::ndarray::NDDataBuffer;
+    use ad_core_rs::pixel_cast::with_buffer;
     use rand::SeedableRng;
 
     fn default_gains() -> Gains {
@@ -767,9 +768,10 @@ mod tests {
         }
     }
 
-    /// FNV-1a over the bytes of every frame of each data type, mode, colour
-    /// layout and background setting, from a fixed seed; the constants were
-    /// captured on 65b35bc41b75, before compute_frame went typed.
+    /// FNV-1a over the little-endian bytes of every frame of each data type,
+    /// mode, colour layout and background setting, from a fixed seed; the
+    /// constants were captured on 65b35bc41b75, before compute_frame went
+    /// typed.
     #[test]
     fn frame_output_is_pinned_for_a_fixed_seed() {
         use ad_core_rs::ndarray::NDDataType;
@@ -864,9 +866,13 @@ mod tests {
                                 frame == 0,
                                 &mut rng,
                             );
-                            for &b in raw.as_u8_slice() {
-                                hash = (hash ^ b as u64).wrapping_mul(0x100_0000_01b3);
-                            }
+                            with_buffer!(&raw, |v| {
+                                for x in v {
+                                    for b in x.to_le_bytes() {
+                                        hash = (hash ^ b as u64).wrapping_mul(0x100_0000_01b3);
+                                    }
+                                }
+                            });
                         }
                     }
                 }

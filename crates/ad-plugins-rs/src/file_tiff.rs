@@ -611,9 +611,14 @@ fn decode(bytes: &[u8], attributes: NDAttributeList, pool: &NDArrayPool) -> ADRe
     } else {
         (usize::from(read_u16(ifd)?), ifd + 2)
     };
+    // TIFFFetchDirectory takes 1 to 4096 entries, all inside the file.
+    let entry_size = 4 + 2 * field;
+    if !(1..=4096).contains(&entry_count) || first + entry_size * entry_count > bytes.len() {
+        return Err(err("bad directory"));
+    }
     let mut entries: BTreeMap<u16, usize> = BTreeMap::new();
     for i in 0..entry_count {
-        let entry = first + (4 + 2 * field) * i;
+        let entry = first + entry_size * i;
         entries.entry(read_u16(entry)?).or_insert(entry);
     }
     // An entry's type, value size and values' bytes, for a type its reader
@@ -2836,7 +2841,8 @@ mod tests {
     /// entry type and `values` its values, `omit` leaves tags out; `lead`
     /// entries go ahead of the rest and `extra` entries after them. `big`
     /// writes a BigTIFF, its data from offset 16, and `big_endian` an "MM"
-    /// file; `patch` then overwrites single bytes.
+    /// file; `patch` then overwrites single bytes and `cut` drops the last
+    /// bytes.
     #[derive(Clone, Copy)]
     struct TagFile {
         height: u32,
@@ -2853,6 +2859,7 @@ mod tests {
         big: bool,
         big_endian: bool,
         patch: &'static [(usize, u8)],
+        cut: usize,
     }
 
     impl Default for TagFile {
@@ -2872,6 +2879,7 @@ mod tests {
                 big: false,
                 big_endian: false,
                 patch: &[],
+                cut: 0,
             }
         }
     }
@@ -3004,6 +3012,7 @@ mod tests {
             for &(at, byte) in self.patch {
                 file[at] = byte;
             }
+            file.truncate(file.len() - self.cut);
             file
         }
     }
@@ -3042,6 +3051,10 @@ mod tests {
         const INT16: &str = "Int16 4,3 070e151c232a31383f464d545b626970777e858c939aa1a8";
         const RGB1_I16: &str = "Int16 3,4,3 070e151c232a31383f464d545b626970777e858c939aa1a8afb6bdc4cbd2d9e0e7eef5fc030a11181f262d343b424950575e656c737a81888f969da4abb2b9c0c7ced5dce3eaf1f8";
         const TYPE_IFD8: u16 = 18;
+        // An unknown tag, repeated to fill a directory past the 11 base tags.
+        const UNKNOWN: (u16, u16, &[i64]) = (65000, TYPE_SHORT, &[0]);
+        static TO_4096: [(u16, u16, &[i64]); 4085] = [UNKNOWN; 4085];
+        static TO_4097: [(u16, u16, &[i64]); 4086] = [UNKNOWN; 4086];
         let s = TagFile::default();
         let rgb = TagFile { samples: 3, ..s };
         #[rustfmt::skip]
@@ -3208,6 +3221,14 @@ mod tests {
             ("big_ifd_hi", TagFile { big: true, patch: &[(12, 1)], ..s }, None),
             ("big_w_count_hi", TagFile { big: true, patch: &[(84, 1)], ..s }, None),
             ("big_offs_hi", TagFile { big: true, patch: &[(192, 1)], ..s }, None),
+            ("dir_no_next", TagFile { cut: 4, ..s }, Some(GRAY)),
+            ("dir_cut", TagFile { extra: &[UNKNOWN], cut: 5, ..s }, None),
+            ("dir_4096", TagFile { extra: &TO_4096, ..s }, Some(GRAY)),
+            ("dir_4097", TagFile { extra: &TO_4097, ..s }, None),
+            ("big_dir_no_next", TagFile { big: true, cut: 8, ..s }, Some(GRAY)),
+            ("big_dir_cut", TagFile { big: true, extra: &[UNKNOWN], cut: 9, ..s }, None),
+            ("big_dir_4096", TagFile { big: true, extra: &TO_4096, ..s }, Some(GRAY)),
+            ("big_dir_4097", TagFile { big: true, extra: &TO_4097, ..s }, None),
         ];
         let wrong: Vec<_> = cases
             .iter()

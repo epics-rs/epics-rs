@@ -1,12 +1,6 @@
 use asyn_rs::port::InterfaceMask;
 use std::sync::Arc;
 
-// Not gated on `parallel`: `should_parallelize` is the whole decision now
-// and this file asks it on both arms.
-use crate::par_util;
-#[cfg(feature = "parallel")]
-use rayon::prelude::*;
-
 use ad_core_rs::error::ADResult;
 use ad_core_rs::ndarray::{NDArray, NDDataType};
 use ad_core_rs::ndarray_pool::NDArrayPool;
@@ -516,12 +510,6 @@ impl ProcessState {
     }
 }
 
-/// Elements per parallel chunk of the element-wise pass: large enough that
-/// the per-chunk dispatch is noise, small enough to split a frame across the
-/// pool.
-#[cfg(feature = "parallel")]
-const PAR_CHUNK: usize = 1 << 16;
-
 /// Stages 1-4 of one frame with every switch resolved: each stage is present
 /// or absent, and the two correction buffers are the slices the stage reads
 /// at the same index as the value it corrects. One such set describes the
@@ -544,7 +532,7 @@ struct ElementOps<'a> {
 
 impl ElementOps<'_> {
     /// The same stages over `len` elements from `start`.
-    #[cfg(any(feature = "simd", feature = "parallel"))]
+    #[cfg(feature = "simd")]
     fn slice(&self, start: usize, len: usize) -> ElementOps<'_> {
         ElementOps {
             bg: self.bg.map(|bg| &bg[start..start + len]),
@@ -807,9 +795,8 @@ impl ProcessFrame {
     /// with the state lock released -- which is the whole point of taking the
     /// snapshot, since this is the frame-sized loop.
     fn apply_element_ops(&self, values: &mut [f64]) {
-        let n = values.len();
         // Stages 1-4: element-wise operations (background, flat field, offset+scale, clipping)
-        // These can be combined into a single pass and parallelized.
+        // These can be combined into a single pass.
         let needs_element_ops = self.config.enable_background
             || self.config.enable_flat_field
             || self.config.enable_offset_scale
@@ -854,19 +841,7 @@ impl ProcessFrame {
                     .then_some((self.config.low_clip_thresh, self.config.low_clip_value)),
             };
 
-            if par_util::should_parallelize(n) {
-                #[cfg(feature = "parallel")]
-                par_util::thread_pool().install(|| {
-                    values
-                        .par_chunks_mut(PAR_CHUNK)
-                        .enumerate()
-                        .for_each(|(k, chunk)| {
-                            ops.slice(k * PAR_CHUNK, chunk.len()).apply(chunk);
-                        });
-                });
-            } else {
-                ops.apply(values);
-            }
+            ops.apply(values);
         }
     }
 

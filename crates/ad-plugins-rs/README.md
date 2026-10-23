@@ -97,16 +97,15 @@ with `threadsafe`, `all_filters` and `parallel`.
 
 ### Parallel Processing
 
-The `parallel` feature (enabled by default) uses [rayon](https://docs.rs/rayon) to parallelize CPU-heavy image processing in 4 plugins:
+The `parallel` feature (enabled by default) uses [rayon](https://docs.rs/rayon) to parallelize CPU-heavy image processing in 3 plugins:
 
 | Plugin | Parallelized Operations |
 |--------|------------------------|
 | **NDROIStat** | Per-ROI stats computation (`par_iter` over ROI regions) |
 | **NDStats** | Basic stats (fold+reduce), centroid (fold+reduce), histogram (par_chunks + merge) |
 | **NDColorConvert** | Bayer demosaic (`bayer_to_rgb1` row-parallel) |
-| **NDProcess** | Stages 1–4: background, flat field, offset/scale, clipping (element-wise `par_iter_mut`) |
 
-Not parallelized: FFT (rustfft internal SIMD), recursive filter (IIR dependency chain), profiles (memory access pattern), Overlay/Transform (lightweight).
+Not parallelized: FFT (rustfft internal SIMD), recursive filter (IIR dependency chain), profiles (memory access pattern), NDProcess (memory-bound element-wise pass), Overlay/Transform (lightweight).
 
 **Thread pool management:**
 

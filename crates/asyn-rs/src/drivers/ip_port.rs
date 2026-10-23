@@ -3977,14 +3977,18 @@ mod tests {
     /// C `connectIt` bounds a TCP connect by `pasynBase->autoConnectTimeout`
     /// (drvAsynIPPort.c:546-555), 0.5 s unless `asynSetAutoConnectTimeout`
     /// moved it, and on expiry reports the errno `connect()` left
-    /// (:534-539, :568-571). TEST-NET-1 is unroutable, so the poll expires;
-    /// the windows open 50 ms early because `poll` may wake a hair short.
+    /// (:534-539, :568-571). The held port leaves the handshake unanswered
+    /// on loopback, so the poll is what ends it, whatever routes the host
+    /// has; the windows open 50 ms early because `poll` may wake a hair
+    /// short.
     #[test]
     fn a_tcp_connect_expires_at_the_auto_connect_timeout_in_c_s_words() {
         use crate::runtime::config::set_auto_connect_timeout;
 
+        let held = named_port::HeldPort::unanswered_tcp();
+        let device = format!("127.0.0.1:{}", held.port);
         let attempt = || {
-            let mut drv = DrvAsynIPPort::new("iptest", "192.0.2.1:9").unwrap();
+            let mut drv = DrvAsynIPPort::new("iptest", &device).unwrap();
             let start = std::time::Instant::now();
             let err = drv.connect(&AsynUser::default()).unwrap_err();
             (start.elapsed(), err)
@@ -3997,10 +4001,7 @@ mod tests {
         assert_eq!(err.status(), AsynStatus::Error);
         assert_eq!(
             err.message(),
-            format!(
-                "Can't connect to 192.0.2.1:9: {}",
-                connect_in_progress_text()
-            )
+            format!("Can't connect to {device}: {}", connect_in_progress_text())
         );
 
         set_auto_connect_timeout(1.0);
@@ -4012,10 +4013,7 @@ mod tests {
         );
         assert_eq!(
             err.message(),
-            format!(
-                "Can't connect to 192.0.2.1:9: {}",
-                connect_in_progress_text()
-            )
+            format!("Can't connect to {device}: {}", connect_in_progress_text())
         );
     }
 

@@ -54,6 +54,7 @@ pub mod verdict;
 use std::net::{Ipv4Addr, SocketAddr, TcpListener};
 
 use epics_libcom_rs::net::port_held;
+use epics_libcom_rs::runtime::socket::{Readiness, poll_ready};
 use socket2::{Domain, Socket, Type};
 
 /// Build `shim/getsockname_einval.c` into `dir` and return the `.so`: under
@@ -371,6 +372,34 @@ impl HeldPort {
         held
     }
 
+    /// A TCP number on loopback that a connect to stays in progress for 2 s
+    /// or more, so a shorter deadline of the connector's own is what ends
+    /// it. Linux: a `listen(0)` hold whose one queued connection fills the
+    /// accept queue, which drops every later SYN (`tcp_conn_request`).
+    /// Darwin and the BSDs: the closed hold left unconnected, which drops
+    /// the SYN (`BSD_PCB_LOOKUP`). Windows: the closed hold, refused only
+    /// after the connector has retried its SYN for 2 s (2.00-2.05 s on
+    /// windows-latest and windows-11-arm).
+    pub fn unanswered_tcp() -> Self {
+        if !cfg!(target_os = "linux") {
+            return Self::closed(Type::STREAM);
+        }
+        let hold = Socket::new(Domain::IPV4, Type::STREAM, None).expect("open an unanswered hold");
+        let mut held = Self::bind_on(hold, Ipv4Addr::LOCALHOST);
+        held.holds[0].listen(0).expect("listen on the hold");
+        let filler = Socket::new(Domain::IPV4, Type::STREAM, None).expect("open the filler");
+        filler
+            .connect(&SocketAddr::from((Ipv4Addr::LOCALHOST, held.port)).into())
+            .expect("connect the filler");
+        // The queue is full once the listener has the filler, which can be
+        // after the filler's connect returns.
+        let queued =
+            poll_ready(&held.holds[0], Readiness::Readable, 10_000).expect("poll the hold");
+        assert!(queued, "the filler never reached the accept queue");
+        held.holds.push(filler);
+        held
+    }
+
     fn closed(ty: Type) -> Self {
         let hold = Socket::new(Domain::IPV4, ty, None).expect("open a closed hold");
         #[cfg(windows)]
@@ -581,6 +610,20 @@ mod tests {
                     .is_err(),
                 "{ip:?}"
             );
+        }
+    }
+
+    /// A connect to the unanswered hold is still in progress at its own
+    /// deadline, a second one too.
+    #[test]
+    fn an_unanswered_hold_leaves_a_connect_in_progress() {
+        let held = HeldPort::unanswered_tcp();
+        let at = SocketAddr::from((Ipv4Addr::LOCALHOST, held.port));
+        for _ in 0..2 {
+            let e =
+                std::net::TcpStream::connect_timeout(&at, std::time::Duration::from_millis(300))
+                    .unwrap_err();
+            assert_eq!(e.kind(), std::io::ErrorKind::TimedOut, "{e}");
         }
     }
 

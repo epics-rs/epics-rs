@@ -2404,6 +2404,22 @@ mod tests {
         assert_eq!(decompressed.data.as_u8_slice(), original.as_slice());
     }
 
+    /// The frame is c-blosc's, which C `blosc_decompress_ctx` reads: its one
+    /// block starts past its bstarts entry, where rust-hdf5 0.7.8 put the
+    /// codec stream straight after the header.
+    #[test]
+    fn blosc_output_is_a_c_blosc_frame() {
+        let arr = NDArray::new(vec![NDDimension::new(256)], NDDataType::UInt16);
+        let compressed = compress_blosc(&arr, &BloscConfig::default()).unwrap();
+        let frame = compressed.data.as_u8_slice();
+        let word = |at: usize| u32::from_le_bytes(frame[at..at + 4].try_into().unwrap()) as usize;
+        // nbytes, blocksize, cbytes, bstarts[0]
+        assert_eq!(
+            [word(4), word(8), word(12), word(16)],
+            [512, 512, frame.len(), 20]
+        );
+    }
+
     // ---- LZ4 tests ----
 
     #[test]

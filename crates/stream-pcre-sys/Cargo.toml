@@ -2,7 +2,7 @@
 name = "stream-pcre-sys"
 version.workspace = true
 edition.workspace = true
-description = "PCRE 8.45 (PCRE1), vendored and built 8-bit without UTF-8, for epics-stream-rs's %/regexp/ converter"
+description = "Vendored C PCRE 8.45 (PCRE1), built 8-bit without UTF-8: the test oracle for epics-stream-rs's Rust PCRE port (a dev-dependency only)"
 # PCRE's own licence (pcre/LICENCE); only the vendored C is in this package.
 license = "BSD-3-Clause"
 readme = "README.md"

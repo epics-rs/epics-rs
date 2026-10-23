@@ -109,7 +109,7 @@ missing build into 835 ERRORs and a 75.3 % coverage number that reads like a
 port defect. Nothing is ever skipped when a prerequisite is absent — a silently
 skipped oracle is the false-clean we are escaping.
 
-`cargo nextest run -p epics-oracle-rs` runs 219 tests, and every one of them
+`cargo nextest run -p epics-oracle-rs` runs 248 tests, and every one of them
 tests the **harness**, never the port — nothing in them asserts a value the
 port reports, so they keep passing while its field tables are regenerated
 underneath them. The unit half (dbd parsing, case generation, adjudication,
@@ -127,19 +127,34 @@ DBR_GR_DOUBLE", released in 1.5.3, moved 63 `pva-read` channels from EXPECTED
 DEVIATION to AGREED and retired an allowlist row. Run the lane against an older
 `softIocPVX` and those 63 come back as DEFECTs against a port that is correct.
 
+### Features
+
+`scaler` (default) adds scaler-rs's `scaler` record and its `Asyn Scaler` soft
+port to `oracle-ioc` (`--scaler-soft`), and builds `tests/scaler_oracle.rs`,
+which diffs the control scaler of `scaler-c8.db` against the C
+`oracleScalerIoc` — `EPICS_ORACLE_SCALER_IOC_BIN`, default
+`/home/stevek/work/epics-modules/oracle-ioc/bin/linux-x86_64/oracleScalerIoc`.
+Without it, `oracle-ioc` has neither. `oracle-ioc` also registers `swait` and
+optics-rs's `table`, which the fat dbd does not declare.
+
 ## Port discipline (this has bitten the repo before)
 
 Every port is taken **by binding**, never by hard-coding and never by
 probe-then-rebind.
 
-- **Rust side:** true bind-`:0`-and-read-back. `CaServer::from_parts(db, 0, ..)`
-  binds the sockets and *then* reports the port it got; `oracle-ioc` prints it as
-  `ORACLE_IOC_PORT <n>` and the harness reads it back.
+- **Both sides** start from `ioc::claim_port`: a number in 20000–29999, a
+  range the kernel never hands to `bind(0)`, free on *both* UDP and TCP, and
+  held under a lock file until the IOC is gone so no other oracle process takes
+  it. On Linux the harness refuses a host whose `ip_local_port_range` overlaps
+  that range.
+- **Rust side:** claim-and-read-back. `oracle-ioc --port <n>` binds the claimed
+  number during iocInit and prints the port it holds as `ORACLE_IOC_PORT <n>`
+  (`ORACLE_IOC_PVA_PORT` under `--pva`), and the harness checks it against the
+  claim.
 - **C side:** `softIoc` takes its port from the environment and cannot inherit a
-  pre-bound fd, so bind-read-back is **not available**. The substitute is
-  allocate-then-**verify**: find a number free on *both* UDP and TCP by binding
-  it, then scan the IOC's own startup output and treat any bind complaint as a
-  boot failure to retry on a fresh port.
+  pre-bound fd, so read-back is **not available**. The substitute is
+  claim-then-**verify**: scan the IOC's own startup output and treat any bind
+  complaint as a boot failure to retry on a fresh port.
 
 That verification is load-bearing. Booting `softIoc` on a taken port does **not**
 fail — it prints `cas WARNING: Configured TCP port was unavailable ... two or

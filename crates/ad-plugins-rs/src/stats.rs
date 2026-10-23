@@ -1636,9 +1636,16 @@ fn histogram_of<T: StatsElem + Sync>(
 ) -> HistCounts {
     let map = SlotMap::new::<T>(hist_size, hist_min, hist_max);
     #[cfg(feature = "parallel")]
-    // At least 500 ps per element serially (u16; u8 870, f64 2000); two
-    // chunks of real work already win (u16 362x362 0.97x serial, u8 0.77x).
-    if par_util::pool_wins(v.len(), 500, 60, v.len().div_ceil(PAR_CHUNK)) {
+    // At least 500 ps per element serially through the table (u16; u8 870
+    // where values crowd few bins), 1300 through the formula (f32, i32; f64
+    // 2000); the split measured faster from 60 us (u16 362x362 0.95x serial,
+    // u8 0.68x, f64 300x300 0.86x).
+    if par_util::pool_wins(
+        v.len(),
+        if T::TABLE_LEN.is_some() { 500 } else { 1300 },
+        60,
+        v.len().div_ceil(PAR_CHUNK),
+    ) {
         return par_util::thread_pool().install(|| {
             v.par_chunks(PAR_CHUNK)
                 .fold(

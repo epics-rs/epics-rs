@@ -429,13 +429,13 @@ impl FFTProcessor {
     }
 
     /// C `createAxisArrays`' two posts (NDPluginFFT.cpp:253-254) for an
-    /// input `n_x` wide, padded as the transform pads it: state posts.
+    /// input `n_x` wide, padded as the transform pads it.
     fn axis_posts(&self, frame: &FFTFrame<'_>, n_x: usize) -> Vec<ParamUpdate> {
         let n_time = next_pow2(n_x);
         let time = (self.params.time_axis)
-            .map(|idx| ParamUpdate::state_float64_array(idx, frame.time_axis(n_time)));
+            .map(|idx| ParamUpdate::float64_array(idx, frame.time_axis(n_time)));
         let freq = (self.params.freq_axis)
-            .map(|idx| ParamUpdate::state_float64_array(idx, frame.freq_axis(n_time / 2)));
+            .map(|idx| ParamUpdate::float64_array(idx, frame.freq_axis(n_time / 2)));
         time.into_iter().chain(freq).collect()
     }
 }
@@ -880,6 +880,15 @@ impl NDPluginProcess for FFTProcessor {
         self.params.abs_value = base.find_param("FFT_ABS_VALUE");
         self.params.time_axis = base.find_param("FFT_TIME_AXIS");
         self.params.freq_axis = base.find_param("FFT_FREQ_AXIS");
+        // C posts the axes next only on another size or TimePerPoint change
+        // (:118, :330), so a first frame that beat `interruptAccept` left every
+        // record without them.
+        for axis in [self.params.time_axis, self.params.freq_axis]
+            .into_iter()
+            .flatten()
+        {
+            base.set_state_array_rule(axis, Arc::new(|| true));
+        }
         Ok(())
     }
 

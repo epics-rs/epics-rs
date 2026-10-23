@@ -901,7 +901,6 @@ mod tests {
                         reason,
                         addr,
                         value,
-                        ..
                     } => Some(ParamUpdate::float64_array_addr(reason, addr, value)),
                     _ => None,
                 })

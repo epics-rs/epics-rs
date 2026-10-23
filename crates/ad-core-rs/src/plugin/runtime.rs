@@ -136,9 +136,6 @@ pub enum ParamUpdate {
         reason: usize,
         addr: i32,
         value: Vec<f64>,
-        /// An array holding the plugin's state, such as an axis, rather than
-        /// a frame's data; see [`PortDriverBase::do_callbacks_state_array`].
-        state: bool,
     },
     /// C `callParamCallbacks(addr)` where it stands.
     Callbacks { addr: i32 },
@@ -183,7 +180,6 @@ impl ParamUpdate {
             reason,
             addr: 0,
             value,
-            state: false,
         }
     }
     /// Create a Float64Array update at a specific addr.
@@ -192,16 +188,6 @@ impl ParamUpdate {
             reason,
             addr,
             value,
-            state: false,
-        }
-    }
-    /// Create a state Float64Array update at addr 0.
-    pub fn state_float64_array(reason: usize, value: Vec<f64>) -> Self {
-        Self::Float64Array {
-            reason,
-            addr: 0,
-            value,
-            state: true,
         }
     }
     /// Create an Octet (string) update at addr 0.
@@ -250,15 +236,11 @@ impl ParamUpdate {
                 reason,
                 addr,
                 value,
-                state,
-            } => {
-                let value = ParamValue::Float64Array(value.clone().into());
-                if *state {
-                    ParamSetValue::state_array(*reason, *addr, value)
-                } else {
-                    ParamSetValue::array(*reason, *addr, value)
-                }
-            }
+            } => ParamSetValue::array(
+                *reason,
+                *addr,
+                ParamValue::Float64Array(value.clone().into()),
+            ),
             Self::Callbacks { addr } => ParamSetValue::callbacks(*addr),
         }
     }
@@ -619,8 +601,6 @@ pub enum SideParam {
         reason: usize,
         addr: i32,
         value: Vec<f64>,
-        /// As [`ParamUpdate::Float64Array`]'s.
-        state: bool,
     },
     /// C `callParamCallbacks(addr)`, at once.
     Callbacks { addr: i32 },
@@ -660,12 +640,10 @@ impl From<ParamUpdate> for SideParam {
                 reason,
                 addr,
                 value,
-                state,
             } => Self::Float64Array {
                 reason,
                 addr,
                 value,
-                state,
             },
             ParamUpdate::Callbacks { addr } => Self::Callbacks { addr },
         }
@@ -863,14 +841,7 @@ fn set_side(base: &mut PortDriverBase, p: SideParam) -> AsynResult<()> {
             reason,
             addr,
             value,
-            state: false,
         } => base.do_callbacks_array(reason, addr, ParamValue::Float64Array(value.into())),
-        SideParam::Float64Array {
-            reason,
-            addr,
-            value,
-            state: true,
-        } => base.do_callbacks_state_array(reason, addr, ParamValue::Float64Array(value.into())),
         SideParam::Callbacks { addr } => base.call_param_callbacks(addr),
     }
 }
@@ -1149,6 +1120,7 @@ trait ValidateWrite: Send + Sync {
         base: &PortDriverBase,
     ) -> WriteOutcome<String>;
     fn posts_before_write(&self, reason: usize, value: i32) -> bool;
+    fn edge_posts(&self) -> Vec<ParamUpdate>;
 }
 
 impl<P: NDPluginProcess> ValidateWrite for P {
@@ -1195,6 +1167,10 @@ impl<P: NDPluginProcess> ValidateWrite for P {
     }
     fn posts_before_write(&self, reason: usize, value: i32) -> bool {
         NDPluginProcess::posts_before_write(self, reason, value)
+    }
+    fn edge_posts(&self) -> Vec<ParamUpdate> {
+        #[allow(deprecated)]
+        NDPluginProcess::edge_posts(self)
     }
 }
 
@@ -1366,6 +1342,15 @@ pub trait NDPluginProcess: Send + Sync + 'static {
     /// Return param updates to be written back to the port driver.
     fn on_param_change(&self, _reason: usize, _params: &PluginParamSnapshot) -> ParamChangeResult {
         ParamChangeResult::empty()
+    }
+
+    /// The arrays posted again when the port's interrupts open
+    /// ([`PortDriver::interrupts_opened`]).
+    #[deprecated(
+        note = "mark the reason with `PortDriverBase::set_state_array_rule`; removed in 0.33"
+    )]
+    fn edge_posts(&self) -> Vec<ParamUpdate> {
+        Vec::new()
     }
 
     /// Return a handle to the latest NDArray data for array reads.
@@ -1688,7 +1673,7 @@ impl SharedProcessorInner {
         }
         (cur_dims != self.dims_prev).then(|| {
             self.dims_prev = cur_dims.clone();
-            asyn_rs::request::ParamSetValue::state_array(
+            asyn_rs::request::ParamSetValue::array(
                 self.ndarray_params.array_dimensions,
                 0,
                 ParamValue::Int32Array(cur_dims.into()),
@@ -2445,6 +2430,10 @@ impl PluginPortDriver {
         if let Some(seed) = processor.array_callbacks_seed() {
             base.set_int32_param(ndarray_params.array_callbacks, 0, seed as i32)?;
         }
+        // NDDimensions posts only when the dims change (NDPluginDriver.cpp:
+        // 245-246), so a first frame before the gate left Dimensions_RBV
+        // empty until they changed.
+        base.set_state_array_rule(ndarray_params.array_dimensions, Arc::new(|| true));
         // Create STD_ARRAY_DATA param for StdArrays plugins (triggers I/O Intr on ArrayData waveform)
         let std_array_data_param = if array_data.is_some() {
             Some(base.create_param("STD_ARRAY_DATA", asyn_rs::param::ParamType::GenericPointer)?)
@@ -2917,6 +2906,12 @@ impl PortDriver for PluginPortDriver {
 
     fn base_mut(&mut self) -> &mut PortDriverBase {
         &mut self.base
+    }
+
+    fn interrupts_opened(&mut self) {
+        for post in self.validator.edge_posts() {
+            let _ = set_side(&mut self.base, post.into());
+        }
     }
 
     fn io_write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {

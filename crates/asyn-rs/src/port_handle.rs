@@ -1329,7 +1329,8 @@ impl PortHandle {
     /// it (iocInit.c:259-260). Either is counted on the port's
     /// [`InterruptManager::edge_sweeps`] until it has run or is dropped
     /// unrun. The state arrays a closed gate dropped are posted in the same
-    /// hold, after the sweep ([`crate::port::PortDriverBase::do_callbacks_state_array`]).
+    /// hold, after the sweep ([`crate::port::PortDriverBase::do_callbacks_array`]),
+    /// and then [`PortDriver::interrupts_opened`] runs.
     pub(crate) fn boot_param_callbacks(&self) -> AsynResult<()> {
         // C sweeps `addr` in `0..maxAddr`; a single-device port is `maxAddr == 1`.
         let max_addr = self.max_addr.max(1);
@@ -1340,6 +1341,8 @@ impl PortHandle {
                 let _ = base.call_param_callbacks(addr);
             }
             base.post_owed_arrays();
+            #[allow(deprecated)]
+            driver.interrupts_opened();
             drop(owed);
         });
         let op = RequestOp::WithDriverAfterQueue(call);

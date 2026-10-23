@@ -536,6 +536,11 @@ pub fn c_str(data: &[u8]) -> &[u8] {
 /// callbacks'.
 pub type OctetWriteRule = Arc<dyn Fn(&mut PortDriverBase, i32, &[u8]) + Send + Sync>;
 
+/// Whether an array post of one reason holds the driver's state, as an axis
+/// does, rather than a frame's data; read at each post, so a reason can hold
+/// state from some point on. See [`PortDriverBase::do_callbacks_array`].
+pub type StateArrayRule = Arc<dyn Fn() -> bool + Send + Sync>;
+
 /// The C class whose `writeOctet` [`PortDriverBase::write_octet`] stands
 /// for, as its closing trace line and error message name it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -680,8 +685,10 @@ pub struct PortDriverBase {
     /// until the driver updates or sets it.
     time_stamp: SystemTime,
     /// The state arrays a closed gate dropped, by `(reason, addr)`; see
-    /// [`Self::do_callbacks_state_array`].
-    owed_arrays: Vec<(usize, i32, ParamValue)>,
+    /// [`Self::do_callbacks_array`].
+    owed_arrays: Mutex<Vec<(usize, i32, ParamValue)>>,
+    /// By reason, as `int32_rules`.
+    state_array_rules: Vec<Option<StateArrayRule>>,
     /// By reason; empty until a rule is registered, so a port without one
     /// pays a bounds check per store.
     int32_rules: Vec<Option<Int32StoreRule>>,
@@ -879,7 +886,8 @@ impl PortDriverBase {
                 + Duration::from_secs(
                     epics_libcom_rs::runtime::general_time::EPICS_EPOCH_UNIX_SECS,
                 ),
-            owed_arrays: Vec::new(),
+            owed_arrays: Mutex::default(),
+            state_array_rules: Vec::new(),
             int32_rules: Vec::new(),
             octet_write_rules: Vec::new(),
             octet_writer: OctetWriter::ASYN_PORT_DRIVER,
@@ -2246,6 +2254,15 @@ impl PortDriverBase {
         self.int32_rules[reason] = Some(rule);
     }
 
+    /// Hold `reason`'s array posts while `rule` says they hold the driver's
+    /// state, replacing any rule registered for it.
+    pub fn set_state_array_rule(&mut self, reason: usize, rule: StateArrayRule) {
+        if self.state_array_rules.len() <= reason {
+            self.state_array_rules.resize(reason + 1, None);
+        }
+        self.state_array_rules[reason] = Some(rule);
+    }
+
     /// Run `rule` on every client `writeOctet` of `reason`, replacing any rule
     /// registered for it.
     pub fn set_write_octet_rule(&mut self, reason: usize, rule: OctetWriteRule) {
@@ -2574,11 +2591,6 @@ impl PortDriverBase {
                 addr,
                 ref value,
             } => self.do_callbacks_array(reason, addr, value.clone()),
-            P::StateArray {
-                reason,
-                addr,
-                ref value,
-            } => self.do_callbacks_state_array(reason, addr, value.clone()),
             P::Callbacks { addr } => self.call_param_callbacks(addr),
         }
     }
@@ -2774,6 +2786,12 @@ impl PortDriverBase {
     /// and the param's status and alarm. The value is not stored and no other
     /// param is flushed, as [`Self::call_param_callbacks`] would; that flush
     /// posts no such value, so this is its only route.
+    ///
+    /// A record drops a post while the gate is closed (devAsynXXXArray.cpp:
+    /// 407-410) and C's edge sweep posts no array. For a post that holds the
+    /// driver's state ([`Self::set_state_array_rule`]) that C loss is not
+    /// copied: it stays owed until one of `reason`/`addr` is posted open, and
+    /// the edge sweep posts what is still owed.
     pub fn do_callbacks_array(
         &self,
         reason: usize,
@@ -2795,6 +2813,19 @@ impl PortDriverBase {
                 });
             }
         };
+        if let Some(holds) = self.state_array_rules.get(reason).and_then(Option::as_ref) {
+            let mut owed = self.owed_arrays.lock();
+            let at = owed.iter().position(|&(r, a, _)| (r, a) == (reason, addr));
+            // Read before the post: a gate that opens during it may let a record
+            // take a post owed here, posted twice rather than lost.
+            match (self.interrupts.accepting(), at) {
+                (true, Some(i)) => drop(owed.remove(i)),
+                (true, None) => {}
+                (false, Some(i)) if holds() => owed[i].2 = value.clone(),
+                (false, None) if holds() => owed.push((reason, addr, value.clone())),
+                (false, _) => {}
+            }
+        }
         // C reads all three with its getters, reporting a bad param each time.
         let status = self
             .get_param_status(reason, addr)
@@ -2816,39 +2847,14 @@ impl PortDriverBase {
         Ok(())
     }
 
-    /// [`Self::do_callbacks_array`] of an array holding the driver's state,
-    /// as an axis does. A record drops a post while the gate is closed
-    /// (devAsynXXXArray.cpp:407-410) and C's edge sweep posts no array; that
-    /// C loss is not copied: the post stays owed until one here is posted
-    /// open, and the edge sweep posts what is still owed.
-    pub fn do_callbacks_state_array(
-        &mut self,
-        reason: usize,
-        addr: i32,
-        value: ParamValue,
-    ) -> AsynResult<()> {
-        let owed = self
-            .owed_arrays
-            .iter()
-            .position(|&(r, a, _)| (r, a) == (reason, addr));
-        // Read before the post: a gate that opens during it may let a record
-        // take a post owed here, posted twice rather than lost.
-        match (self.interrupts.accepting(), owed) {
-            (true, Some(i)) => drop(self.owed_arrays.remove(i)),
-            (true, None) => {}
-            (false, Some(i)) => self.owed_arrays[i].2 = value.clone(),
-            (false, None) => self.owed_arrays.push((reason, addr, value.clone())),
-        }
-        self.do_callbacks_array(reason, addr, value)
-    }
-
-    /// The edge sweep's posts of what [`Self::do_callbacks_state_array`]
-    /// owes; kept for the next edge while the gate is closed again.
-    pub(crate) fn post_owed_arrays(&mut self) {
+    /// The edge sweep's posts of what [`Self::do_callbacks_array`] owes;
+    /// kept for the next edge while the gate is closed again.
+    pub(crate) fn post_owed_arrays(&self) {
         if !self.interrupts.accepting() {
             return;
         }
-        for (reason, addr, value) in std::mem::take(&mut self.owed_arrays) {
+        let owed = std::mem::take(&mut *self.owed_arrays.lock());
+        for (reason, addr, value) in owed {
             let _ = self.do_callbacks_array(reason, addr, value);
         }
     }
@@ -3142,6 +3148,13 @@ fn read_array_not_implemented() -> AsynError {
 pub trait PortDriver: Any + Send + Sync {
     fn base(&self) -> &PortDriverBase;
     fn base_mut(&mut self) -> &mut PortDriverBase;
+
+    /// Runs on the port at each interrupt edge, after the parameter sweep
+    /// and the owed state arrays ([`PortDriverBase::set_state_array_rule`]).
+    #[deprecated(
+        note = "mark the reason with `PortDriverBase::set_state_array_rule`; removed in 0.33"
+    )]
+    fn interrupts_opened(&mut self) {}
 
     // --- AsynCommon ---
 
@@ -4310,11 +4323,11 @@ pub(crate) mod tests {
     }
 
     /// The values a record takes from `posts` of one array, each `(value,
-    /// gate open, state post)`, then the edge sweep's posts, with the gate
-    /// closed (`false`) or open at that sweep.
+    /// gate open, its rule's answer)`, then the edge sweep's posts, with the
+    /// gate closed (`false`) or open at that sweep.
     fn array_posts_a_record_takes(posts: &[(i32, bool, bool)], sweep_open: bool) -> Vec<i32> {
         use crate::interrupt::InterruptFilter;
-        use std::sync::{Arc, Mutex};
+        use std::sync::Mutex;
 
         let gate = InterruptGate::new();
         let mut base = PortDriverBase::new(
@@ -4326,6 +4339,9 @@ pub(crate) mod tests {
         );
         base.own_interrupts(gate.clone());
         let axis = base.create_param("AXIS", ParamType::Int32Array).unwrap();
+        let holds = Arc::new(AtomicBool::new(false));
+        let rule = holds.clone();
+        base.set_state_array_rule(axis, Arc::new(move || rule.load(Ordering::Relaxed)));
         let seen = Arc::new(Mutex::new(Vec::new()));
         let (sink, record_gate) = (seen.clone(), gate.clone());
         // A record's callback returns while the gate is closed.
@@ -4339,12 +4355,9 @@ pub(crate) mod tests {
             .unwrap();
         for &(v, open, state) in posts {
             gate.set(open);
-            let value = ParamValue::Int32Array(Arc::from([v]));
-            if state {
-                base.do_callbacks_state_array(axis, 0, value).unwrap();
-            } else {
-                base.do_callbacks_array(axis, 0, value).unwrap();
-            }
+            holds.store(state, Ordering::Relaxed);
+            base.do_callbacks_array(axis, 0, ParamValue::Int32Array(Arc::from([v])))
+                .unwrap();
         }
         gate.set(sweep_open);
         base.post_owed_arrays();
@@ -4356,8 +4369,8 @@ pub(crate) mod tests {
     }
 
     /// Boundaries of what a state array owes the edge: a dropped post, a
-    /// delivered one, a delivered one after a drop, two drops, a plain
-    /// post's drop, and a sweep the gate closed again before.
+    /// delivered one, a delivered one after a drop, two drops, a drop its
+    /// rule says holds no state, and a sweep the gate closed again before.
     #[test]
     fn the_edge_posts_a_state_array_only_as_a_closed_gate_dropped_it() {
         assert_eq!(array_posts_a_record_takes(&[(1, false, true)], true), [1]);

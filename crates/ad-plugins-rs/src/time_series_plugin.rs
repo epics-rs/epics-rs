@@ -29,6 +29,7 @@
 //! array per signal at `addr == signal` (NDPluginTimeSeries.cpp:341-385).
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDataType, NDDimension};
@@ -187,6 +188,12 @@ pub struct TimeSeriesProcessor {
     /// uniqueId they take happen only while it is set (C :341-385).
     array_callbacks: ArrayCallbacks,
     attributes: Option<PluginAttributes>,
+    /// Set by the first frame, before its axis post: TS_TIME_AXIS holds state
+    /// from then on. C posts the axis next only on a size, type or setting
+    /// change (:417-422), so a first frame that beat `interruptAccept` left
+    /// every record without it; an axis from a write before any frame stays
+    /// C's, which a closed gate drops for good.
+    framed: Arc<AtomicBool>,
 }
 
 /// C `getAttributes(pArray->pAttributeList)` on every post
@@ -260,6 +267,7 @@ impl TimeSeriesProcessor {
             state: Mutex::new(TimeSeriesState::new(max_signals)),
             array_callbacks: ArrayCallbacks::new(true),
             attributes: None,
+            framed: Arc::default(),
         }
     }
 }
@@ -302,8 +310,6 @@ impl TimeSeriesState {
     /// `i * averagingTimeActual_`; Circular mode ends at 0 with
     /// `-(numTimePoints_-1-i) * averagingTimeActual_`. Returns the `TS_TIME_AXIS`
     /// update (C `doCallbacksFloat64Array(timeAxis_, ..., P_TSTimeAxis, 0)`).
-    /// A state post from the first frame on (:422): one before it is C's,
-    /// which a closed gate drops for good.
     fn create_axis_array(&self) -> Vec<ParamUpdate> {
         let axis: Vec<f64> = (0..self.num_time_points)
             .map(|i| match self.acquire_mode {
@@ -313,12 +319,7 @@ impl TimeSeriesState {
                 }
             })
             .collect();
-        let post = if self.num_signals_in < 0 {
-            ParamUpdate::float64_array
-        } else {
-            ParamUpdate::state_float64_array
-        };
-        vec![post(self.p.ts_time_axis, axis)]
+        vec![ParamUpdate::float64_array(self.p.ts_time_axis, axis)]
     }
 
     /// C `acquireReset` (NDPluginTimeSeries.cpp:137-145): zero the circular buffer
@@ -705,6 +706,7 @@ impl NDPluginProcess for TimeSeriesProcessor {
             state.data_type = dtype;
             state.num_signals_in = num_signals_in as i64;
             state.num_signals = num_signals_in.min(state.max_signals);
+            self.framed.store(true, Ordering::Release);
             updates.extend(state.allocate_arrays());
         }
 
@@ -762,6 +764,11 @@ impl NDPluginProcess for TimeSeriesProcessor {
         state.p.ts_elapsed_time = base.create_param("TS_ELAPSED_TIME", ParamType::Float64)?;
         state.p.ts_acquire_mode = base.create_param("TS_ACQUIRE_MODE", ParamType::Int32)?;
         state.p.ts_time_axis = base.create_param("TS_TIME_AXIS", ParamType::Float64Array)?;
+        let framed = self.framed.clone();
+        base.set_state_array_rule(
+            state.p.ts_time_axis,
+            Arc::new(move || framed.load(Ordering::Acquire)),
+        );
         state.p.ts_timestamp = base.create_param("TS_TIMESTAMP", ParamType::Float64Array)?;
         // Per-signal parameter (NDPluginTimeSeries.cpp:82); read at addr == signal.
         state.p.ts_time_series = base.create_param("TS_TIME_SERIES", ParamType::Float64Array)?;
@@ -1053,7 +1060,6 @@ mod tests {
                 reason: r,
                 addr: a,
                 value,
-                ..
             } if *r == reason && *a == addr => Some(value.clone()),
             _ => None,
         })
@@ -1252,7 +1258,6 @@ mod tests {
                 reason: r,
                 addr: a,
                 value,
-                ..
             } if *r == reason && *a == addr => Some(value.clone()),
             _ => None,
         })
@@ -1357,7 +1362,6 @@ mod tests {
                     reason,
                     addr,
                     value,
-                    ..
                 } if *reason == proc.state.lock().p.ts_time_series && *addr == 0 => {
                     Some(value.clone())
                 }

@@ -3,6 +3,7 @@ use crate::ndarray::NDArray;
 use crate::ndarray_pool::NDArrayPool;
 
 use crate::color_layout::ColorLayout;
+use crate::convert::output_dims;
 use crate::driver::ColorMode;
 
 /// Crop a region of interest from the source array.
@@ -50,16 +51,30 @@ pub fn crop_roi(
         size_x,
         size_y,
     };
-    let dims = dst_layout.make_dims();
     let data_type = source_data.data_type();
 
-    let mut result = pool.alloc(dims, data_type)?;
-
-    // Fast path: full-frame copy (no actual crop needed)
+    // Fast path: full-frame copy (no actual crop needed). The dims are the
+    // plain ones, as C convert's same-type copy returns before its dims
+    // epilogue (NDArrayPool.cpp:662-672).
     if min_x == 0 && min_y == 0 && size_x == src_layout.size_x && size_y == src_layout.size_y {
+        let mut result = pool.alloc(dst_layout.make_dims(), data_type)?;
         result.data.copy_from(source_data);
         return Ok(result);
     }
+
+    // `output_dims` adds the source's offsets and multiplies its binning in
+    // on every dim, C convert's epilogue (NDArrayPool.cpp:719-723).
+    let (x_dim, y_dim) = match src_layout.color_mode {
+        crate::driver::ColorMode::Mono => (0, 1),
+        crate::driver::ColorMode::RGB1 => (1, 2),
+        crate::driver::ColorMode::RGB2 => (0, 2),
+        crate::driver::ColorMode::RGB3 => (0, 1),
+        _ => (0, 1),
+    };
+    let mut dims_out = dst_layout.make_dims();
+    dims_out[x_dim].offset = min_x;
+    dims_out[y_dim].offset = min_y;
+    let mut result = pool.alloc(output_dims(source, &dims_out)?, data_type)?;
 
     // One run per row of the region: all three colours of it in RGB1, one
     // colour plane's row in RGB2 and RGB3. The output is the source's data
@@ -78,21 +93,6 @@ pub fn crop_roi(
             let d = dst_layout.index(0, y, c) * es;
             dst[d..d + run * es].copy_from_slice(&src[s..s + run * es]);
         }
-    }
-
-    // Update output dims to track cumulative offset from source
-    let (x_dim, y_dim) = match src_layout.color_mode {
-        crate::driver::ColorMode::Mono => (0, 1),
-        crate::driver::ColorMode::RGB1 => (1, 2),
-        crate::driver::ColorMode::RGB2 => (0, 2),
-        crate::driver::ColorMode::RGB3 => (0, 1),
-        _ => (0, 1),
-    };
-    if x_dim < result.dims.len() {
-        result.dims[x_dim].offset = source.dims.get(x_dim).map(|d| d.offset).unwrap_or(0) + min_x;
-    }
-    if y_dim < result.dims.len() {
-        result.dims[y_dim].offset = source.dims.get(y_dim).map(|d| d.offset).unwrap_or(0) + min_y;
     }
 
     Ok(result)
@@ -294,6 +294,40 @@ mod tests {
             panic!("{:?}", out.data.data_type());
         };
         assert_eq!(v, &[big, u64::MAX]);
+    }
+
+    /// A crop of a binned, offset, reversed source carries them into every
+    /// dim as C convert's epilogue (NDArrayPool.cpp:719-723); the full frame
+    /// returns before it with plain dims, as C's same-type copy.
+    #[test]
+    fn a_crop_carries_the_source_binning() {
+        let layout = ColorLayout {
+            color_mode: ColorMode::RGB1,
+            size_x: 4,
+            size_y: 4,
+        };
+        let mut arr = make_rgb1_array(4, 4, NDDataBuffer::U8(vec![0; 48]));
+        for (d, (offset, binning)) in arr.dims.iter_mut().zip([(1, 1), (8, 2), (4, 3)]) {
+            d.offset = offset;
+            d.binning = binning;
+        }
+        arr.dims[2].reverse = true;
+        let pool = NDArrayPool::new(0);
+
+        let out = crop_roi(&pool, &arr, &layout, 1, 2, 2, 2).unwrap();
+        let got: Vec<_> = out
+            .dims
+            .iter()
+            .map(|d| (d.size, d.offset, d.binning, d.reverse))
+            .collect();
+        assert_eq!(got, [(3, 1, 1, false), (2, 9, 2, false), (2, 6, 3, true)]);
+
+        let full = crop_roi(&pool, &arr, &layout, 0, 0, 4, 4).unwrap();
+        assert!(
+            full.dims
+                .iter()
+                .all(|d| (d.offset, d.binning, d.reverse) == (0, 1, false))
+        );
     }
 
     #[test]

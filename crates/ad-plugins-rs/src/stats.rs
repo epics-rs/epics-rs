@@ -1593,6 +1593,9 @@ impl SlotMap {
         match self {
             Self::Formula(f) => T::formula_count(v, f, &mut acc.slots),
             Self::Table(table) => {
+                // Cut to the type's own length: every `table_index` is then in
+                // range by type, so the loop's lookups need no check, inlined or not.
+                let table = &table[..T::TABLE_LEN.expect("only a type with a table builds one")];
                 for &e in v {
                     acc.slots[table[e.table_index()] as usize] += 1;
                 }

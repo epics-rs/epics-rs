@@ -284,15 +284,20 @@ impl NDArrayPool {
         Ok(copy)
     }
 
-    /// An output for a copy of `source`, sized for its payload: C sizes it
-    /// by the dims, which a codec's bytes under the original dims do not
-    /// follow here.
+    /// An output for a copy of `source`: C's `alloc` of its dims and type
+    /// (NDArrayPool.cpp:280), for a codec frame the type it was compressed
+    /// from. C then cuts a frame larger than that (:298), as a codec's
+    /// overhead can make one (NDPluginCodec.cpp:466); that defect is not
+    /// copied, so such a frame is charged its payload.
     fn alloc_for(&self, source: &NDArray) -> ADResult<NDArray> {
-        self.alloc_sized(
-            source.dims.clone(),
-            source.data.data_type(),
-            source.data.total_bytes(),
-        )
+        let dims = source.dims.clone();
+        let data_type = source.data.data_type();
+        let Some(codec) = &source.codec else {
+            return self.alloc(dims, data_type);
+        };
+        let elements: usize = dims.iter().map(|d| d.size).product();
+        let uncompressed = elements * codec.original_data_type.element_size();
+        self.alloc_sized(dims, data_type, uncompressed.max(source.data.total_bytes()))
     }
 
     /// Give an array back to the pool now.
@@ -1242,12 +1247,13 @@ mod tests {
         assert_eq!(pool.allocated_bytes(), 4 + 16 + 8 + 12);
     }
 
-    /// A copy the pool allocates holds the source's payload and is charged
-    /// for it, also when the payload is not what the dims say (a codec's
-    /// bytes under the original dims), and `convert_type` fills only the
-    /// output it charged for.
+    /// A copy the pool allocates is C's `alloc` of the source's dims and type
+    /// (NDArrayPool.cpp:280): an uncompressed buffer longer than its dims is
+    /// cut at them on every path, and a codec frame is charged its
+    /// uncompressed size, or its payload when the codec overhead makes that
+    /// larger.
     #[test]
-    fn a_pool_made_copy_is_charged_for_what_it_holds() {
+    fn a_pool_made_copy_is_charged_as_c_allocates_it() {
         let pool = NDArrayPool::new(1_000_000);
         let payload: Vec<u8> = (1..=10).collect();
         let src = NDArray::with_data(
@@ -1256,16 +1262,42 @@ mod tests {
         );
 
         let out = pool.copy(&src, None, true, true, true).unwrap();
-        assert_eq!(out.data.as_slice::<u8>(), Some(&payload[..]));
-        assert_eq!((out.data_size, pool.allocated_bytes()), (10, 10));
+        assert_eq!(out.data.as_slice::<u8>(), Some(&payload[..4]));
+        assert_eq!((out.data_size, pool.allocated_bytes()), (4, 4));
 
         let copy = pool.alloc_copy(&src).unwrap();
-        assert_eq!(copy.data.as_slice::<u8>(), Some(&payload[..]));
-        assert_eq!((copy.data_size, pool.allocated_bytes()), (10, 20));
+        assert_eq!(copy.data.as_slice::<u8>(), Some(&payload[..4]));
+        assert_eq!((copy.data_size, pool.allocated_bytes()), (4, 8));
 
+        let same = pool.convert_type(&src, NDDataType::UInt8).unwrap();
+        assert_eq!(same.data.as_slice::<u8>(), Some(&payload[..4]));
         let wide = pool.convert_type(&src, NDDataType::UInt16).unwrap();
         assert_eq!(wide.data.as_slice::<u16>(), Some(&[1, 2, 3, 4][..]));
-        assert_eq!((wide.data_size, pool.allocated_bytes()), (8, 28));
+        assert_eq!((wide.data_size, pool.allocated_bytes()), (8, 20));
+
+        let frame = |bytes: usize| {
+            let mut a = NDArray::with_data(
+                vec![NDDimension::new(10), NDDimension::new(10)],
+                NDDataBuffer::from_vec((0..bytes).map(|i| i as u8).collect()),
+            );
+            a.codec = Some(Codec {
+                name: crate::codec::CodecName::Blosc,
+                compressed_size: bytes,
+                level: 5,
+                shuffle: 1,
+                compressor: 0,
+                original_data_type: NDDataType::UInt16,
+            });
+            a
+        };
+        let small = frame(50);
+        let copy = pool.alloc_copy(&small).unwrap();
+        assert_eq!(copy.data.as_u8_slice(), small.data.as_u8_slice());
+        assert_eq!((copy.data_size, pool.allocated_bytes()), (200, 220));
+        let big = frame(216);
+        let copy = pool.copy(&big, None, true, true, true).unwrap();
+        assert_eq!(copy.data.as_u8_slice(), big.data.as_u8_slice());
+        assert_eq!((copy.data_size, pool.allocated_bytes()), (216, 436));
     }
 
     /// A buffer is not stretched past its `dataSize` whatever its capacity:

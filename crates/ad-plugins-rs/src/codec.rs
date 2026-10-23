@@ -2766,12 +2766,12 @@ mod tests {
         assert_eq!(decompressed.data.as_u8_slice(), original.as_slice());
     }
 
-    /// Nine full blocks, a 40-element partial block and 3 raw elements of
-    /// `data_type`, with an entropy that changes every few thousand bytes
-    /// so the frames differ in length.
-    fn bslz4_pool_sized_array(data_type: NDDataType) -> NDArray {
+    /// `full_blocks` full blocks, a 40-element partial block and 3 raw
+    /// elements of `data_type`, with an entropy that changes every few
+    /// thousand bytes so the frames differ in length.
+    fn bslz4_pool_sized_array(data_type: NDDataType, full_blocks: usize) -> NDArray {
         let elem_size = data_type.element_size();
-        let count = 9 * bshuf_default_block_size(elem_size) + 40 + 3;
+        let count = full_blocks * bshuf_default_block_size(elem_size) + 40 + 3;
         let mut s = 0x9E37_79B9_7F4A_7C15u64;
         let bytes: Vec<u8> = (0..count * elem_size)
             .map(|k| {
@@ -2815,13 +2815,24 @@ mod tests {
 
     #[test]
     fn bslz4_on_the_pool_is_byte_identical_to_the_serial_encoder() {
+        // bslz4_compress_blocks cuts 4 runs per pool worker; 8 blocks per
+        // worker and one more put 2 or more blocks in a run.
+        #[cfg(feature = "parallel")]
+        let threads = crate::par_util::thread_pool().current_num_threads();
+        #[cfg(not(feature = "parallel"))]
+        let threads = 1usize;
+        let full_blocks = 8 * threads + 1;
+        assert!(
+            (full_blocks + 1).div_ceil(4 * threads) >= 2,
+            "a run must hold several blocks"
+        );
         for data_type in [
             NDDataType::UInt8,
             NDDataType::UInt16,
             NDDataType::UInt32,
             NDDataType::UInt64,
         ] {
-            let arr = bslz4_pool_sized_array(data_type);
+            let arr = bslz4_pool_sized_array(data_type, full_blocks);
             let raw = arr.data.as_u8_slice();
             assert_eq!(
                 crate::par_util::should_parallelize(arr.data.len()),
@@ -2842,7 +2853,7 @@ mod tests {
 
     #[test]
     fn bslz4_corrupt_frames_on_the_pool_report_cs_blosc_text() {
-        let arr = bslz4_pool_sized_array(NDDataType::UInt16);
+        let arr = bslz4_pool_sized_array(NDDataType::UInt16, 9);
         let good = compress_bslz4(&arr).unwrap();
         let bytes = good.data.as_u8_slice().to_vec();
         let second = 4 + u32::from_be_bytes(bytes[..4].try_into().unwrap()) as usize;

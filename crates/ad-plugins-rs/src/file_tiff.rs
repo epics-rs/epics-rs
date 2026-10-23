@@ -2234,155 +2234,326 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
-    /// The C comparison set's file: a 4x3 UInt8 image, pixels 0..12 in
-    /// strips of `rows` rows, `pad` 0xee bytes after them, then the strip
-    /// arrays and the IFD. `counts` is StripByteCounts as written (`None`
-    /// leaves the tag out); `overrides` replaces a tag's written value.
-    fn strip_file(
+    /// How a [`StripFile`] writes StripByteCounts.
+    #[derive(Clone, Copy)]
+    enum Counts {
+        /// Each strip's geometry length.
+        Geometry,
+        Given(&'static [u32]),
+        /// No StripByteCounts tag.
+        Missing,
+    }
+
+    /// A file of the C comparison set, laid out as reviewer6's generator
+    /// lays it out so that C's reads of those files pin this reader: the
+    /// strips from offset 8, `pad` 0xee bytes, the out-of-line tag arrays,
+    /// then the IFD. Sample `i` is `i*7+1`, `i*257+3` or `i*16843009+5`.
+    #[derive(Clone, Copy)]
+    struct StripFile {
+        width: u32,
+        height: u32,
         rows: u32,
-        counts: Option<&[u32]>,
+        counts: Counts,
         pad: usize,
-        overrides: &[(u16, u32)],
-    ) -> Vec<u8> {
-        let (width, height) = (4u32, 3u32);
-        let mut data = Vec::new();
-        let mut offsets = Vec::new();
-        for first in (0..height).step_by(rows as usize) {
-            offsets.push(8 + data.len() as u32);
-            let end = (first + rows).min(height);
-            data.extend((first * width..end * width).map(|p| p as u8));
-        }
-        data.extend(std::iter::repeat_n(0xee, pad));
-        let mut arrays = Vec::new();
-        let mut put = |values: &[u32]| match values {
-            [one] => *one,
-            _ => {
-                let at = 8 + (data.len() + arrays.len()) as u32;
-                arrays.extend(values.iter().flat_map(|v| v.to_le_bytes()));
-                at
+        samples: u16,
+        separate: bool,
+        bits: u16,
+        /// Cuts StripOffsets to this length, or extends it.
+        offsets_len: Option<usize>,
+        offsets: Option<&'static [u32]>,
+        /// Replaces a tag's written value.
+        overrides: &'static [(u16, u32)],
+        omit: &'static [u16],
+    }
+
+    impl Default for StripFile {
+        fn default() -> Self {
+            Self {
+                width: 4,
+                height: 3,
+                rows: 3,
+                counts: Counts::Geometry,
+                pad: 16,
+                samples: 1,
+                separate: false,
+                bits: 8,
+                offsets_len: None,
+                offsets: None,
+                overrides: &[],
+                omit: &[],
             }
+        }
+    }
+
+    impl StripFile {
+        fn short(&self, value: u16) -> [u8; 2] {
+            value.to_le_bytes()
+        }
+
+        fn long(&self, value: u32) -> [u8; 4] {
+            value.to_le_bytes()
+        }
+
+        fn file(&self) -> Vec<u8> {
+            let rows = match self.rows {
+                0 => self.height,
+                rows => rows.min(self.height).max(1),
+            };
+            let samples = u32::from(self.samples);
+            let (planes, row_samples) = if self.separate {
+                (samples, self.width)
+            } else {
+                (1, self.width * samples)
+            };
+            let mut data = Vec::new();
+            let (mut offsets, mut geometry) = (Vec::new(), Vec::new());
+            for plane in 0..planes {
+                for first in (0..self.height).step_by(rows as usize) {
+                    offsets.push(8 + data.len() as u32);
+                    let start = data.len();
+                    for row in first..(first + rows).min(self.height) {
+                        for x in 0..row_samples {
+                            let i = if self.separate {
+                                (row * self.width + x) * samples + plane
+                            } else {
+                                row * row_samples + x
+                            };
+                            match self.bits {
+                                8 => data.push((i * 7 + 1) as u8),
+                                16 => data.extend(self.short((i * 257 + 3) as u16)),
+                                _ => data.extend(self.long(i * 16843009 + 5)),
+                            }
+                        }
+                    }
+                    geometry.push((data.len() - start) as u32);
+                }
+            }
+            data.extend(std::iter::repeat_n(0xee, self.pad));
+            let mut offsets = self.offsets.map_or(offsets, <[u32]>::to_vec);
+            if let Some(len) = self.offsets_len {
+                let next = offsets[offsets.len() - 1] + 4;
+                offsets.resize(len, next);
+            }
+            let counts = match self.counts {
+                Counts::Geometry => Some(geometry),
+                Counts::Given(counts) => Some(counts.to_vec()),
+                Counts::Missing => None,
+            };
+            let arrays_at = 8 + data.len() as u32;
+            let mut arrays = Vec::new();
+            let mut put = |values: &[u32], kind: u16| match values {
+                [one] => *one,
+                _ => {
+                    let at = arrays_at + arrays.len() as u32;
+                    for &value in values {
+                        if kind == TYPE_SHORT {
+                            arrays.extend(self.short(value as u16));
+                        } else {
+                            arrays.extend(self.long(value));
+                        }
+                    }
+                    at
+                }
+            };
+            let offsets_at = put(&offsets, TYPE_LONG);
+            let counts_at = counts.as_deref().map(|c| put(c, TYPE_LONG));
+            let bits = put(
+                &vec![u32::from(self.bits); usize::from(self.samples)],
+                TYPE_SHORT,
+            );
+            if arrays.len() % 2 == 1 {
+                arrays.push(0);
+            }
+            let ifd = arrays_at + arrays.len() as u32;
+            let photometric = if self.samples == 3 {
+                PHOTOMETRIC_RGB
+            } else {
+                PHOTOMETRIC_MINISBLACK
+            };
+            let planar = if self.separate {
+                PLANARCONFIG_SEPARATE
+            } else {
+                PLANARCONFIG_CONTIG
+            };
+            let mut entries = vec![
+                (TAG_IMAGE_WIDTH, TYPE_LONG, 1, self.width),
+                (TAG_IMAGE_LENGTH, TYPE_LONG, 1, self.height),
+                (TAG_BITS_PER_SAMPLE, TYPE_SHORT, samples, bits),
+                (TAG_COMPRESSION, TYPE_SHORT, 1, 1),
+                (TAG_PHOTOMETRIC, TYPE_SHORT, 1, u32::from(photometric)),
+                (
+                    TAG_STRIP_OFFSETS,
+                    TYPE_LONG,
+                    offsets.len() as u32,
+                    offsets_at,
+                ),
+                (TAG_SAMPLES_PER_PIXEL, TYPE_SHORT, 1, samples),
+                (TAG_ROWS_PER_STRIP, TYPE_LONG, 1, self.rows),
+            ];
+            if let (Some(counts), Some(at)) = (&counts, counts_at) {
+                entries.push((TAG_STRIP_BYTE_COUNTS, TYPE_LONG, counts.len() as u32, at));
+            }
+            entries.push((TAG_PLANAR_CONFIG, TYPE_SHORT, 1, u32::from(planar)));
+            entries.push((TAG_SAMPLE_FORMAT, TYPE_SHORT, 1, 1));
+            entries.retain(|(tag, ..)| !self.omit.contains(tag));
+            let mut file = b"II".to_vec();
+            file.extend(self.short(42));
+            file.extend(self.long(ifd));
+            file.extend(data);
+            file.extend(arrays);
+            file.extend(self.short(entries.len() as u16));
+            for (tag, kind, n, value) in entries {
+                let value = self
+                    .overrides
+                    .iter()
+                    .find(|(t, _)| *t == tag)
+                    .map_or(value, |(_, v)| *v);
+                file.extend(self.short(tag));
+                file.extend(self.short(kind));
+                file.extend(self.long(n));
+                // A lone SHORT sits in the first half of the value field.
+                if kind == TYPE_SHORT && n == 1 {
+                    file.extend(self.short(value as u16));
+                    file.extend([0, 0]);
+                } else {
+                    file.extend(self.long(value));
+                }
+            }
+            file.extend(self.long(0));
+            file
+        }
+    }
+
+    /// The buffer as C's comparison reader prints it: hex, each sample
+    /// little-endian.
+    fn sample_hex(array: &NDArray) -> String {
+        let bytes: Vec<u8> = match array.data().view() {
+            NDDataView::U8(v) => v.to_vec(),
+            NDDataView::U16(v) => v.iter().flat_map(|s| s.to_le_bytes()).collect(),
+            NDDataView::U32(v) => v.iter().flat_map(|s| s.to_le_bytes()).collect(),
+            other => panic!("{other:?}"),
         };
-        let offsets_at = put(&offsets);
-        let counts_at = counts.map(&mut put);
-        if (data.len() + arrays.len()) % 2 == 1 {
-            arrays.push(0);
-        }
-        let ifd = 8 + (data.len() + arrays.len()) as u32;
-        let mut entries = vec![
-            (TAG_IMAGE_WIDTH, TYPE_LONG, 1, width),
-            (TAG_IMAGE_LENGTH, TYPE_LONG, 1, height),
-            (TAG_BITS_PER_SAMPLE, TYPE_SHORT, 1, 8),
-            (TAG_COMPRESSION, TYPE_SHORT, 1, 1),
-            (TAG_PHOTOMETRIC, TYPE_SHORT, 1, 1),
-            (
-                TAG_STRIP_OFFSETS,
-                TYPE_LONG,
-                offsets.len() as u32,
-                offsets_at,
-            ),
-            (TAG_SAMPLES_PER_PIXEL, TYPE_SHORT, 1, 1),
-            (TAG_ROWS_PER_STRIP, TYPE_LONG, 1, rows),
-        ];
-        if let (Some(counts), Some(at)) = (counts, counts_at) {
-            entries.push((TAG_STRIP_BYTE_COUNTS, TYPE_LONG, counts.len() as u32, at));
-        }
-        entries.push((TAG_PLANAR_CONFIG, TYPE_SHORT, 1, 1));
-        entries.push((TAG_SAMPLE_FORMAT, TYPE_SHORT, 1, 1));
-        let mut file = b"II".to_vec();
-        file.extend(42u16.to_le_bytes());
-        file.extend(ifd.to_le_bytes());
-        file.extend(data);
-        file.extend(arrays);
-        file.extend((entries.len() as u16).to_le_bytes());
-        for (tag, kind, n, value) in entries {
-            let value = overrides
-                .iter()
-                .find(|(t, _)| *t == tag)
-                .map_or(value, |(_, v)| *v);
-            file.extend(tag.to_le_bytes());
-            file.extend(kind.to_le_bytes());
-            file.extend(n.to_le_bytes());
-            file.extend(value.to_le_bytes());
-        }
-        file.extend(0u32.to_le_bytes());
-        file
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
     }
 
     /// C reads a compressed file through libtiff's codec; this reader has
     /// none, so it refuses one even when its strips fill the image.
     #[test]
     fn a_compressed_file_is_refused() {
-        let lzw = strip_file(3, Some(&[12]), 16, &[(TAG_COMPRESSION, 5)]);
-        let read = decode(&lzw, NDAttributeList::new(), &NDArrayPool::new(0));
-        assert!(
-            read.is_err(),
-            "{:?}",
-            read.map(|a| a.data().as_u8_slice().to_vec())
-        );
-        let none = strip_file(3, Some(&[12]), 16, &[]);
-        assert!(decode(&none, NDAttributeList::new(), &NDArrayPool::new(0)).is_ok());
+        let none = StripFile::default();
+        let lzw = StripFile {
+            overrides: &[(TAG_COMPRESSION, 5)],
+            ..none
+        };
+        let read = decode(&lzw.file(), NDAttributeList::new(), &NDArrayPool::new(0));
+        assert!(read.is_err(), "{:?}", read.map(|a| sample_hex(&a)));
+        assert!(decode(&none.file(), NDAttributeList::new(), &NDArrayPool::new(0)).is_ok());
     }
 
     /// Each file of the C comparison set reads as C `readFile` reads it with
-    /// libtiff 4.0.6 and 4.5.1 alike: `None` where C fails the read or the
-    /// open, else C's pixels.
+    /// ADSupport's libtiff 4.0.6: `None` where C fails the read or the open,
+    /// else C's buffer. libtiff 4.5.1 reads the same but for `huge_last_pad`,
+    /// whose count of over 1 MiB it trims to what the strip needs.
     #[test]
     fn a_strip_table_reads_as_libtiff_reads_it() {
-        let image: Vec<u8> = (0..12).collect();
-        let c = Some(image.as_slice());
+        use Counts::{Given, Missing};
+        const GRAY: &str = "01080f161d242b323940474e";
+        const GRAY_H5: &str = "01080f161d242b323940474e555c636a71787f86";
+        const GRAY_H4: &str = "01080f161d242b323940474e555c636a";
+        const GRAY16: &str = "03000401050206030704080509060a070b080c090d0a0e0b";
+        const GRAY32: &str = "05000000060101010702020208030303090404040a0505050b0606060c0707070d0808080e0909090f0a0a0a100b0b0b";
+        const RGB1: &str =
+            "01080f161d242b323940474e555c636a71787f868d949ba2a9b0b7bec5ccd3dae1e8eff6";
+        const RGB3: &str =
+            "01162b40556a7f94a9bed3e8081d32475c71869bb0c5daef0f24394e63788da2b7cce1f6";
+        let s = StripFile::default();
+        let one = StripFile { rows: 1, ..s };
+        let h5 = StripFile {
+            height: 5,
+            rows: 2,
+            ..s
+        };
+        let h4 = StripFile { height: 4, ..s };
+        let rgb = StripFile { samples: 3, ..s };
+        let planes = StripFile {
+            separate: true,
+            ..rgb
+        };
+        #[rustfmt::skip]
         let cases = [
-            ("ok1", strip_file(3, Some(&[12]), 16, &[]), c),
-            ("ok3", strip_file(1, Some(&[4, 4, 4]), 16, &[]), c),
-            ("over1", strip_file(3, Some(&[16]), 16, &[]), c),
-            ("over3_last", strip_file(1, Some(&[4, 4, 6]), 16, &[]), c),
+            ("ok1", StripFile { counts: Given(&[12]), ..s }, Some(GRAY)),
+            ("ok3", StripFile { counts: Given(&[4, 4, 4]), ..one }, Some(GRAY)),
+            ("over1", StripFile { counts: Given(&[16]), ..s }, Some(GRAY)),
+            ("over3_last", StripFile { counts: Given(&[4, 4, 6]), ..one }, Some(GRAY)),
+            ("short3_last", StripFile { counts: Given(&[4, 4, 2]), ..one }, None),
+            ("rps2", StripFile { rows: 2, counts: Given(&[8, 4]), ..s }, Some(GRAY)),
+            ("rps2_short", StripFile { rows: 2, counts: Given(&[8, 2]), ..s }, None),
+            ("rps10", StripFile { rows: 10, counts: Given(&[12]), ..s }, Some(GRAY)),
+            ("rps_absent", StripFile { omit: &[TAG_ROWS_PER_STRIP], ..s }, Some(GRAY)),
+            ("h4r3_ok", h4, Some(GRAY_H4)),
+            ("h4r3_last_short", StripFile { counts: Given(&[12, 3]), ..h4 }, None),
+            ("h5r2_ok", h5, Some(GRAY_H5)),
+            ("h5r2_same_last_over", StripFile { counts: Given(&[8, 8, 9]), ..h5 }, Some(GRAY_H5)),
+            ("h5r2_same_last_short", StripFile { counts: Given(&[8, 8, 3]), ..h5 }, None),
+            // "Bogus": one strip whose count is 0, short of the image or
+            // past the file is estimated from the geometry.
+            ("short1", StripFile { counts: Given(&[8]), ..s }, Some(GRAY)),
+            ("short1_nobytes", StripFile { counts: Given(&[8]), pad: 0, ..s }, Some(GRAY)),
+            ("over1_pasteof", StripFile { counts: Given(&[1000]), ..s }, Some(GRAY)),
+            ("c0_single", StripFile { counts: Given(&[0]), ..s }, Some(GRAY)),
+            ("single_off_past", StripFile { offsets: Some(&[100000]), ..s }, None),
+            // "Wrong": more than two contiguous strips, the first two
+            // counts differ and neither is 0. The estimate is the image's
+            // rows over the strip count, rounded down, for every strip.
+            ("short3_mid", StripFile { counts: Given(&[4, 2, 4]), ..one }, Some(GRAY)),
+            ("over3_first_short_mid", StripFile { counts: Given(&[6, 2, 4]), ..one }, Some(GRAY)),
+            ("h5r2_wrong", StripFile { counts: Given(&[8, 4, 4]), ..h5 }, None),
+            ("c0_first_multi", StripFile { counts: Given(&[0, 4, 4]), ..one }, None),
+            // The strip tables are cut or zero-filled to the strip count; a
+            // zero offset reads the header.
+            ("offs_short", StripFile { offsets_len: Some(2), ..one }, Some("01080f161d242b3249492a00")),
+            ("offs_long", StripFile { offsets_len: Some(5), ..one }, Some(GRAY)),
+            ("counts_short", StripFile { counts: Given(&[4, 4]), ..one }, None),
+            ("counts_long", StripFile { counts: Given(&[4, 4, 4, 99]), ..one }, Some(GRAY)),
+            ("counts_short_wrong", StripFile { counts: Given(&[6, 4]), ..one }, Some(GRAY)),
+            // The end-of-file check takes the count, not the rows' length.
+            ("huge_last_pad", StripFile { counts: Given(&[4, 4, 2000000]), pad: 5000, ..one }, None),
+            ("huge_last_nopad", StripFile { counts: Given(&[4, 4, 2000000]), ..one }, None),
+            // No StripByteCounts: estimated for one strip per plane, else
+            // the open fails.
+            ("nocounts1", StripFile { counts: Missing, ..s }, Some(GRAY)),
+            ("nocounts3", StripFile { counts: Missing, ..one }, None),
+            ("h5r2_nocounts", StripFile { counts: Missing, ..h5 }, None),
+            ("no_offsets", StripFile { omit: &[TAG_STRIP_OFFSETS], ..s }, None),
+            ("rps0", StripFile { rows: 0, counts: Given(&[12]), ..s }, None),
+            ("w0", StripFile { overrides: &[(TAG_IMAGE_WIDTH, 0)], ..s }, None),
+            ("h0", StripFile { overrides: &[(TAG_IMAGE_LENGTH, 0)], ..s }, None),
+            ("u16_ok", StripFile { bits: 16, ..one }, Some(GRAY16)),
+            ("u16_wrong", StripFile { bits: 16, counts: Given(&[8, 4, 8]), ..one }, Some(GRAY16)),
+            ("u16_short1", StripFile { bits: 16, counts: Given(&[20]), ..s }, Some(GRAY16)),
+            ("le_u32", StripFile { bits: 32, ..one }, Some(GRAY32)),
+            ("rgb1_ok", StripFile { rows: 1, ..rgb }, Some(RGB1)),
+            ("rgb1_wrong", StripFile { rows: 1, counts: Given(&[12, 6, 12]), ..rgb }, Some(RGB1)),
+            ("rgb1_short1", StripFile { counts: Given(&[30]), ..rgb }, Some(RGB1)),
+            ("rgb3_ok", planes, Some(RGB3)),
+            // Separate planes: one strip per plane is estimated with the
+            // plane's rows, and there is no "Wrong" re-estimate.
+            ("rgb3_nocounts", StripFile { counts: Missing, ..planes }, Some(RGB3)),
+            ("rgb3_mid_short", StripFile { counts: Given(&[12, 8, 12]), ..planes }, None),
+            ("rgb3_mid_over", StripFile { counts: Given(&[16, 8, 12]), ..planes }, None),
+            ("rgb3_r1_nocounts", StripFile { rows: 1, counts: Missing, ..planes }, None),
             (
-                "short3_last",
-                strip_file(1, Some(&[4, 4, 2]), 16, &[]),
-                None,
-            ),
-            ("rps2", strip_file(2, Some(&[8, 4]), 16, &[]), c),
-            ("rps2_short", strip_file(2, Some(&[8, 2]), 16, &[]), None),
-            // "Bogus": one strip, its count short of the image or past the file.
-            ("short1", strip_file(3, Some(&[8]), 16, &[]), c),
-            ("short1_nobytes", strip_file(3, Some(&[8]), 0, &[]), c),
-            ("over1_pasteof", strip_file(3, Some(&[1000]), 16, &[]), c),
-            // "Wrong": three strips, the first two counts differ.
-            ("short3_mid", strip_file(1, Some(&[4, 2, 4]), 16, &[]), c),
-            (
-                "over3_first_short_mid",
-                strip_file(1, Some(&[6, 2, 4]), 16, &[]),
-                c,
-            ),
-            // No StripByteCounts: estimated for one strip, refused for more.
-            ("nocounts1", strip_file(3, None, 16, &[]), c),
-            ("nocounts3", strip_file(1, None, 16, &[]), None),
-            (
-                "rps0",
-                strip_file(3, Some(&[12]), 16, &[(TAG_ROWS_PER_STRIP, 0)]),
-                None,
-            ),
-            (
-                "w0",
-                strip_file(3, Some(&[12]), 16, &[(TAG_IMAGE_WIDTH, 0)]),
-                None,
-            ),
-            (
-                "h0",
-                strip_file(3, Some(&[12]), 16, &[(TAG_IMAGE_LENGTH, 0)]),
+                "rgb3_r1_diff",
+                StripFile { rows: 1, counts: Given(&[4, 2, 4, 4, 4, 4, 4, 4, 4]), ..planes },
                 None,
             ),
         ];
         let wrong: Vec<_> = cases
             .iter()
             .filter_map(|(name, file, c)| {
-                let read = decode(file, NDAttributeList::new(), &NDArrayPool::new(0));
-                let rs = read.as_ref().ok().map(|a| a.data().as_u8_slice());
-                (rs != *c).then(|| {
-                    format!(
-                        "{name}: {:?}",
-                        read.map(|a| a.data().as_u8_slice().to_vec())
-                    )
-                })
+                let read = decode(&file.file(), NDAttributeList::new(), &NDArrayPool::new(0));
+                let rs = read.as_ref().ok().map(sample_hex);
+                (rs.as_deref() != *c).then(|| format!("{name}: {:?}", read.map(|a| sample_hex(&a))))
             })
             .collect();
         assert!(wrong.is_empty(), "{wrong:#?}");

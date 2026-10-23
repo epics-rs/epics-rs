@@ -230,7 +230,8 @@ struct TimeSeriesState {
     num_average: usize,
     /// C `numAveraged_`: input points accumulated so far for the in-progress point.
     num_averaged: usize,
-    /// C `averageStore_`: running per-signal sum (length `max_signals`).
+    /// C `averageStore_`: per-signal sum of the `num_averaged` samples
+    /// (length `max_signals`); `restart_average` empties the two together.
     average_store: Vec<f64>,
     /// C `timePerPoint_`.
     time_per_point: f64,
@@ -324,12 +325,16 @@ impl TimeSeriesState {
     }
 
     /// C `acquireReset` (NDPluginTimeSeries.cpp:137-145): zero the circular buffer
-    /// and timestamps, reset `currentTimePoint_`, restart `startTime_`. C does
-    /// **not** reset the averaging accumulator here.
+    /// and timestamps, reset `currentTimePoint_`, restart `startTime_`. C keeps
+    /// the point in progress, so samples from before an Acquire, AcquireMode,
+    /// NumPoints or input change land in point 0 of the new series, and a slot
+    /// above a shrunk signal count keeps its sum until the count grows back;
+    /// that C bug is not copied.
     fn acquire_reset(&mut self) -> Vec<ParamUpdate> {
         if let Some(circular) = &mut self.circular {
             circular.data.as_u8_slice_mut().fill(0);
         }
+        self.restart_average();
         self.time_stamp.iter_mut().for_each(|v| *v = 0.0);
         self.current_time_point = 0;
         self.start_time = Instant::now();
@@ -355,6 +360,11 @@ impl TimeSeriesState {
         updates
     }
 
+    fn restart_average(&mut self) {
+        self.num_averaged = 0;
+        self.average_store.fill(0.0);
+    }
+
     /// C `computeNumAverage` (NDPluginTimeSeries.cpp:97-113): derive `numAverage_`
     /// from the requested averaging time and the driver's time-per-point, then
     /// post the actual averaging time, the averaging count, and the rescaled axis.
@@ -368,7 +378,9 @@ impl TimeSeriesState {
             self.num_average = if n < 1 { 1 } else { n as usize };
             self.averaging_time_actual = self.time_per_point * self.num_average as f64;
         }
-        self.num_averaged = 0;
+        // C zeroes only numAveraged_ (:108), so the next point divides the
+        // old partial sum by the new count; that C bug is not copied.
+        self.restart_average();
         let mut updates = vec![
             ParamUpdate::float64(self.p.ts_averaging_time, self.averaging_time_actual),
             ParamUpdate::int32(self.p.ts_num_average, self.num_average as i32),
@@ -1609,6 +1621,150 @@ mod tests {
             _ => panic!("expected axis"),
         };
         assert_eq!(circ_axis, vec![-3.0, -2.0, -1.0, 0.0]);
+    }
+
+    /// A Fixed 8-point port on 8 signals at TimePerPoint 1, driven through
+    /// its writes and frames as the cbAD oracle drove C.
+    struct AverageRig {
+        proc: TimeSeriesProcessor,
+        base: PortDriverBase,
+        p: Params,
+        int32: bool,
+    }
+
+    impl AverageRig {
+        fn new(port: &str) -> Self {
+            let proc = make_proc(8, port);
+            let base = PortDriverBase::new(
+                &format!("{port}_B"),
+                9,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_INTERRUPTS,
+            );
+            let p = proc.state.lock().p.clone();
+            let mut rig = Self {
+                proc,
+                base,
+                p,
+                int32: false,
+            };
+            rig.int(rig.p.ts_num_points, 8);
+            rig.dbl(rig.p.ts_time_per_point, 1.0);
+            rig
+        }
+
+        fn int(&mut self, reason: usize, value: i32) -> WriteOutcome<i32> {
+            self.proc.validate_int32(
+                reason,
+                0,
+                value,
+                WriteVerdict::Accept(value),
+                &mut ad_core_rs::plugin::runtime::WritePort::new(&mut self.base),
+            )
+        }
+
+        fn dbl(&mut self, reason: usize, value: f64) {
+            self.proc
+                .validate_float64(reason, 0, value, WriteVerdict::Accept(value), &self.base);
+        }
+
+        /// One time point per frame, `v` on each of `signals`.
+        fn frames(&self, signals: usize, values: &[f64]) {
+            for &v in values {
+                let data = if self.int32 {
+                    NDDataBuffer::I32(vec![v as i32; signals])
+                } else {
+                    NDDataBuffer::F64(vec![v; signals])
+                };
+                let arr =
+                    NDArray::with_data(vec![NDDimension::new(signals), NDDimension::new(1)], data);
+                self.proc
+                    .process_array(&Arc::new(arr), &NDArrayPool::new(0));
+            }
+        }
+
+        /// TSRead's series for `addr`; empty when nothing posts there.
+        fn read(&mut self, addr: i32) -> Vec<f64> {
+            let out = self.int(self.p.ts_read, 1);
+            side_array(&out, self.p.ts_time_series, addr).unwrap_or_default()
+        }
+
+        /// Two of four samples of 10 in progress, then `reset`.
+        fn partial_then(&mut self, reset: impl FnOnce(&mut Self)) -> [Vec<f64>; 2] {
+            self.dbl(self.p.ts_averaging_time, 4.0);
+            self.int(self.p.ts_acquire, 1);
+            self.frames(8, &[10.0, 10.0]);
+            reset(self);
+            self.frames(8, &[50.0, 50.0]);
+            let first = self.read(0);
+            self.frames(8, &[50.0, 50.0]);
+            [first, self.read(0)]
+        }
+    }
+
+    /// The window `averageStore_`/`numAveraged_` restarts as one, whenever the
+    /// series or NumAverage does. C's values for each read, from the cbAD
+    /// oracle, are in the comments.
+    #[test]
+    fn the_average_restarts_with_its_window() {
+        // NumAverage 4 -> 2 after three samples of 10. C: [35], [35, 20].
+        let mut rig = AverageRig::new("TST_TS_W_NAVG");
+        rig.dbl(rig.p.ts_averaging_time, 4.0);
+        rig.int(rig.p.ts_acquire, 1);
+        rig.frames(8, &[10.0, 10.0, 10.0]);
+        rig.dbl(rig.p.ts_averaging_time, 2.0);
+        rig.frames(8, &[20.0, 20.0]);
+        assert_eq!(rig.read(0), [20.0]);
+        rig.frames(8, &[20.0, 20.0]);
+        assert_eq!(rig.read(0), [20.0, 20.0]);
+
+        // Acquire stop and start. C: [30], [30].
+        let mut rig = AverageRig::new("TST_TS_W_ACQ");
+        let (acquire, num_points, mode) =
+            (rig.p.ts_acquire, rig.p.ts_num_points, rig.p.ts_acquire_mode);
+        let reads = rig.partial_then(|r| {
+            r.int(acquire, 0);
+            r.int(acquire, 1);
+        });
+        assert_eq!(reads, [vec![], vec![50.0]]);
+
+        // NumPoints 8 -> 6. C: [30], [30].
+        let mut rig = AverageRig::new("TST_TS_W_NPTS");
+        let reads = rig.partial_then(|r| {
+            r.int(num_points, 6);
+        });
+        assert_eq!(reads, [vec![], vec![50.0]]);
+
+        // Circular mode, rotated oldest first. C: [0 x7, 30] both times.
+        let mut rig = AverageRig::new("TST_TS_W_MODE");
+        let reads = rig.partial_then(|r| {
+            r.int(mode, 1);
+        });
+        let mut last = vec![0.0; 8];
+        last[7] = 50.0;
+        assert_eq!(reads, [vec![0.0; 8], last]);
+
+        // Float64 -> Int32 frames. C: [30], [30].
+        let mut rig = AverageRig::new("TST_TS_W_TYPE");
+        let reads = rig.partial_then(|r| r.int32 = true);
+        assert_eq!(reads, [vec![], vec![50.0]]);
+
+        // 8 -> 4 -> 8 signals at NumAverage 2. C: [15]; [30] and [35];
+        // [30, 30] and [35, 30].
+        let mut rig = AverageRig::new("TST_TS_W_SIGS");
+        rig.dbl(rig.p.ts_averaging_time, 2.0);
+        rig.int(rig.p.ts_acquire, 1);
+        rig.frames(8, &[10.0]);
+        rig.frames(4, &[20.0]);
+        assert_eq!(rig.read(0), Vec::<f64>::new());
+        rig.frames(8, &[30.0, 30.0]);
+        assert_eq!((rig.read(0), rig.read(4)), (vec![30.0], vec![30.0]));
+        rig.frames(8, &[30.0, 30.0]);
+        assert_eq!(
+            (rig.read(0), rig.read(4)),
+            (vec![30.0, 30.0], vec![30.0, 30.0])
+        );
     }
 
     #[test]

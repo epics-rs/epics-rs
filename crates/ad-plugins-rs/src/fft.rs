@@ -494,21 +494,149 @@ fn fft_2d_with(
     );
     fft_columns(&cols, data, n_freq_x, col_jobs, &mut bufs.cols);
 
+    let data = &*data;
     let magnitudes = &mut bufs.out;
     resize(magnitudes, n_freq_x * n_freq_y, 0.0, col_jobs);
-    for (fy, mags) in magnitudes.chunks_exact_mut(n_freq_x).enumerate() {
-        magnitudes_into(
-            mags,
-            &data[fy * n_freq_x..(fy + 1) * n_freq_x],
-            (w * h) as f64,
-        );
-    }
+    for_each_chunk(
+        magnitudes,
+        n_freq_x,
+        col_jobs,
+        || (),
+        |(), fy, mags| {
+            magnitudes_into(
+                mags,
+                &data[fy * n_freq_x..(fy + 1) * n_freq_x],
+                (w * h) as f64,
+            );
+        },
+    );
 
     if suppress_dc {
         magnitudes[0] = 0.0;
     }
 
     Some(vec![NDDimension::new(n_freq_x), NDDimension::new(n_freq_y)])
+}
+
+/// The inverse transform of each `width`-wide row of `vals`, scaled by
+/// `1/width`, into `bufs.out`, with the inverse plan from `plan` and the
+/// pool jobs as [`fft_1d_rows_with`] takes them.
+fn fft_1d_rows_inverse_with(
+    plan: impl FnOnce(usize) -> Arc<dyn Fft<f64>>,
+    jobs: fn(usize) -> usize,
+    src: &NDArray,
+    vals: &[f64],
+    suppress_dc: bool,
+    bufs: &mut Buffers,
+) -> Option<Vec<NDDimension>> {
+    if src.dims.is_empty() {
+        return None;
+    }
+
+    let width = src.dims[0].size;
+    let height = if src.dims.len() >= 2 {
+        src.dims[1].size
+    } else {
+        1
+    };
+
+    if width == 0 {
+        return None;
+    }
+
+    let fft = plan(width);
+    let scale = 1.0 / width as f64;
+
+    // An inverse transform of a real-valued spectrum yields signed real
+    // samples: take the real part, not the modulus, so negative samples
+    // survive a forward->inverse round trip.
+    let row_jobs = jobs(width * height);
+    let samples = &mut bufs.out;
+    resize(samples, width * height, 0.0, row_jobs);
+
+    let zero = Complex::new(0.0, 0.0);
+    for_each_chunk(
+        samples,
+        width,
+        row_jobs,
+        || (Plan::new(fft.clone()), vec![zero; width]),
+        |(plan, row_buf), row, out| {
+            load_row(row_buf, vals, row, width);
+            if suppress_dc {
+                row_buf[0] = zero;
+            }
+            plan.run(row_buf);
+            for (s, c) in out.iter_mut().zip(&*row_buf) {
+                *s = c.re * scale;
+            }
+        },
+    );
+
+    Some(src.dims.clone())
+}
+
+/// The 2-D inverse transform of `vals`, columns then rows, scaled by
+/// `1/(w*h)`, into `bufs.out`, as [`fft_1d_rows_inverse_with`] runs.
+fn fft_2d_inverse_with(
+    mut plan: impl FnMut(usize) -> Arc<dyn Fft<f64>>,
+    jobs: fn(usize) -> usize,
+    src: &NDArray,
+    vals: &[f64],
+    suppress_dc: bool,
+    bufs: &mut Buffers,
+) -> Option<Vec<NDDimension>> {
+    if src.dims.len() < 2 {
+        return None;
+    }
+
+    let w = src.dims[0].size;
+    let h = src.dims[1].size;
+
+    if w == 0 || h == 0 {
+        return None;
+    }
+
+    let rows = plan(w);
+    let cols = plan(h);
+    let scale = 1.0 / (w * h) as f64;
+
+    // Every row loads in full, so a reused `data` keeps nothing of an
+    // earlier frame.
+    let zero = Complex::new(0.0, 0.0);
+    let jobs = jobs(w * h);
+    let data = &mut bufs.data;
+    resize(data, w * h, zero, jobs);
+    for_each_chunk(data, w, jobs, || (), |(), row, r| load_row(r, vals, row, w));
+
+    if suppress_dc {
+        data[0] = zero;
+    }
+
+    fft_columns(&cols, data, w, jobs, &mut bufs.cols);
+    for_each_chunk(
+        data,
+        w,
+        jobs,
+        || Plan::new(rows.clone()),
+        |plan, _, r| plan.run(r),
+    );
+
+    // Inverse transform yields signed real samples: keep the real part.
+    let data = &*data;
+    let samples = &mut bufs.out;
+    resize(samples, w * h, 0.0, jobs);
+    for_each_chunk(
+        samples,
+        w,
+        jobs,
+        || (),
+        |(), row, out| {
+            for (s, c) in out.iter_mut().zip(&data[row * w..]) {
+                *s = c.re * scale;
+            }
+        },
+    );
+    Some(vec![NDDimension::new(w), NDDimension::new(h)])
 }
 
 /// FFT processing engine with cached planner and optional magnitude averaging.
@@ -738,9 +866,14 @@ impl FFTFrame<'_> {
                 suppress_dc,
                 bufs,
             ),
-            (1, FFTDirection::Inverse) => {
-                self.compute_fft_1d_rows_inverse(src, vals, suppress_dc, bufs)
-            }
+            (1, FFTDirection::Inverse) => fft_1d_rows_inverse_with(
+                |n| self.plan_inverse(n),
+                jobs_for,
+                src,
+                vals,
+                suppress_dc,
+                bufs,
+            ),
             (2, FFTDirection::Forward) => fft_2d_with(
                 |n| self.plan_forward(n),
                 jobs_for,
@@ -749,7 +882,14 @@ impl FFTFrame<'_> {
                 suppress_dc,
                 bufs,
             ),
-            (2, FFTDirection::Inverse) => self.compute_fft_2d_inverse(src, vals, suppress_dc, bufs),
+            (2, FFTDirection::Inverse) => fft_2d_inverse_with(
+                |n| self.plan_inverse(n),
+                jobs_for,
+                src,
+                vals,
+                suppress_dc,
+                bufs,
+            ),
             _ => None,
         }
     }
@@ -825,99 +965,6 @@ impl FFTFrame<'_> {
             1.0
         };
         (0..n_time).map(|i| i as f64 * tpp).collect()
-    }
-
-    fn compute_fft_1d_rows_inverse(
-        &self,
-        src: &NDArray,
-        vals: &[f64],
-        suppress_dc: bool,
-        bufs: &mut Buffers,
-    ) -> Option<Vec<NDDimension>> {
-        if src.dims.is_empty() {
-            return None;
-        }
-
-        let width = src.dims[0].size;
-        let height = if src.dims.len() >= 2 {
-            src.dims[1].size
-        } else {
-            1
-        };
-
-        if width == 0 {
-            return None;
-        }
-
-        let mut plan = Plan::new(self.plan_inverse(width));
-        let scale = 1.0 / width as f64;
-
-        // An inverse transform of a real-valued spectrum yields signed real
-        // samples: take the real part, not the modulus, so negative samples
-        // survive a forward->inverse round trip.
-        let samples = &mut bufs.out;
-        resize(samples, width * height, 0.0, jobs_for(width * height));
-
-        let mut row_buf = vec![Complex::new(0.0, 0.0); width];
-        for (row, out) in samples.chunks_exact_mut(width).take(height).enumerate() {
-            load_row(&mut row_buf, vals, row, width);
-            if suppress_dc {
-                row_buf[0] = Complex::new(0.0, 0.0);
-            }
-            plan.run(&mut row_buf);
-            for (s, c) in out.iter_mut().zip(&row_buf) {
-                *s = c.re * scale;
-            }
-        }
-
-        Some(src.dims.clone())
-    }
-
-    fn compute_fft_2d_inverse(
-        &self,
-        src: &NDArray,
-        vals: &[f64],
-        suppress_dc: bool,
-        bufs: &mut Buffers,
-    ) -> Option<Vec<NDDimension>> {
-        if src.dims.len() < 2 {
-            return None;
-        }
-
-        let w = src.dims[0].size;
-        let h = src.dims[1].size;
-
-        if w == 0 || h == 0 {
-            return None;
-        }
-
-        let mut rows = Plan::new(self.plan_inverse(w));
-        let cols = self.plan_inverse(h);
-        let scale = 1.0 / (w * h) as f64;
-
-        // Every row loads in full, so a reused `data` keeps nothing of an
-        // earlier frame.
-        let jobs = jobs_for(w * h);
-        let data = &mut bufs.data;
-        resize(data, w * h, Complex::new(0.0, 0.0), jobs);
-        for (row, r) in data.chunks_exact_mut(w).enumerate() {
-            load_row(r, vals, row, w);
-        }
-
-        if suppress_dc {
-            data[0] = Complex::new(0.0, 0.0);
-        }
-
-        fft_columns(&cols, data, w, jobs, &mut bufs.cols);
-        rows.run(data);
-
-        // Inverse transform yields signed real samples: keep the real part.
-        let samples = &mut bufs.out;
-        resize(samples, w * h, 0.0, jobs);
-        for (s, c) in samples.iter_mut().zip(&*data) {
-            *s = c.re * scale;
-        }
-        Some(vec![NDDimension::new(w), NDDimension::new(h)])
     }
 }
 
@@ -1232,10 +1279,39 @@ mod tests {
         (dims, bits(&bufs.out))
     }
 
-    /// The pool cuts the rows into pair chunks and the columns into waves of
-    /// blocks; each runs the serial arithmetic, so the spectrum is the serial
-    /// one bit for bit. Odd and even heights, non-power-of-two widths, and
-    /// `jobs_for`, which takes the 100-wide frames to the whole pool.
+    /// The 2-D inverse as one serial pass: every row loaded, the columns,
+    /// then one `process` over the whole frame.
+    fn whole_frame_inverse(
+        planner: &mut FftPlanner<f64>,
+        vals: &[f64],
+        (w, h): (usize, usize),
+        suppress_dc: bool,
+    ) -> Vec<u64> {
+        let mut data = vec![Complex::new(0.0, 0.0); w * h];
+        for (row, r) in data.chunks_exact_mut(w).enumerate() {
+            load_row(r, vals, row, w);
+        }
+        if suppress_dc {
+            data[0] = Complex::new(0.0, 0.0);
+        }
+        fft_columns(
+            &planner.plan_fft_inverse(h),
+            &mut data,
+            w,
+            1,
+            &mut Vec::new(),
+        );
+        Plan::new(planner.plan_fft_inverse(w)).run(&mut data);
+        let scale = 1.0 / (w * h) as f64;
+        data.iter().map(|c| (c.re * scale).to_bits()).collect()
+    }
+
+    /// The pool cuts the rows into pair chunks or single rows, the columns
+    /// into waves of blocks and the magnitudes into rows; each runs the
+    /// serial arithmetic, so the output is the serial one bit for bit, and
+    /// the 2-D inverse is the whole-frame pass it replaced. Odd and even
+    /// heights, non-power-of-two widths, and `jobs_for`, which takes the
+    /// 100-wide frames to the whole pool.
     #[test]
     fn pooled_transforms_are_bit_identical_to_serial() {
         let mut planner = FftPlanner::<f64>::new();
@@ -1264,6 +1340,21 @@ mod tests {
                 let want = rows_1d(serial);
                 assert_eq!(rows_1d(three), want, "1d {w}x{h}");
                 assert_eq!(rows_1d(jobs_for), want, "1d {w}x{h}");
+                let mut inverse_1d = |jobs: fn(usize) -> usize| {
+                    let mut bufs = Buffers::default();
+                    let dims = fft_1d_rows_inverse_with(
+                        |n| planner.plan_fft_inverse(n),
+                        jobs,
+                        &arr,
+                        &vals,
+                        suppress_dc,
+                        &mut bufs,
+                    );
+                    out_bits(dims, bufs)
+                };
+                let want = inverse_1d(serial);
+                assert_eq!(inverse_1d(three), want, "1d inverse {w}x{h}");
+                assert_eq!(inverse_1d(jobs_for), want, "1d inverse {w}x{h}");
                 if h == 1 {
                     continue;
                 }
@@ -1282,6 +1373,26 @@ mod tests {
                 let want = fft_2d(serial);
                 assert_eq!(fft_2d(three), want, "2d {w}x{h}");
                 assert_eq!(fft_2d(jobs_for), want, "2d {w}x{h}");
+                let mut inverse_2d = |jobs: fn(usize) -> usize| {
+                    let mut bufs = Buffers::default();
+                    let dims = fft_2d_inverse_with(
+                        |n| planner.plan_fft_inverse(n),
+                        jobs,
+                        &arr,
+                        &vals,
+                        suppress_dc,
+                        &mut bufs,
+                    );
+                    out_bits(dims, bufs)
+                };
+                let want = inverse_2d(serial);
+                assert_eq!(inverse_2d(three), want, "2d inverse {w}x{h}");
+                assert_eq!(inverse_2d(jobs_for), want, "2d inverse {w}x{h}");
+                assert_eq!(
+                    want.1,
+                    whole_frame_inverse(&mut planner, &vals, (w, h), suppress_dc),
+                    "2d inverse {w}x{h} against one pass"
+                );
             }
         }
     }

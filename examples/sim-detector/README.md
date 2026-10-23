@@ -18,26 +18,26 @@ Generates synthetic images for testing detector pipelines without real hardware.
 ```
 SimDetector (PortDriver)
     │
-    ├── params.rs        35+ asyn parameters (gains, offsets, modes)
+    ├── params.rs        32 asyn parameters (gains, offsets, modes)
     ├── compute.rs       Pixel-level image generation per mode
     ├── task.rs          Acquisition thread (continuous frame generation)
     ├── types.rs         SimMode, SineOperation, DirtyFlags
-    └── ioc_support.rs   Device support bridge, 150+ PV mappings
+    └── ioc_support.rs   simDetectorConfig iocsh command
 ```
 
 The driver uses a dirty flag system to avoid recomputing caches unnecessarily. Changing a gain parameter only invalidates the gain cache, not the peak positions.
 
 ## Acquisition Task API
 
-Acquisition tasks are fully async. A driver author only needs three types from `ad_core_rs::plugin::channel`:
+Acquisition tasks are fully async. A driver author only needs three types:
 
 | Type | Purpose |
 |------|---------|
-| `PortHandle` | Read/write parameters via `read_int32().await`, `set_params_and_notify().await` |
-| `ArrayPublisher` | Publish a generated frame to downstream plugins: `publisher.publish(frame).await` |
-| `DriverPool` | Frames plugins receive; their queued count holds ADAcquireBusy under WaitForPlugins |
+| `asyn_rs::port_handle::PortHandle` | Read/write parameters via `read_int32().await`, `set_params_and_notify().await` |
+| `ad_core_rs::plugin::channel::ArrayPublisher` | Publish a generated frame to downstream plugins: `publisher.publish(frame).await` |
+| `ad_core_rs::ndarray_pool::DriverPool` | Frames plugins receive; their queued count holds ADAcquireBusy under WaitForPlugins |
 
-The acquisition loop runs inside a `current_thread` tokio runtime created by the task thread. All I/O is async and reliable — there are no lossy or blocking APIs in the data path.
+The acquisition loop runs inside a `current_thread` tokio runtime created by the task thread (`ad_core_rs::runtime::run_thread_named`). All I/O is async and reliable — there are no lossy or blocking APIs in the data path.
 
 ```rust
 async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
@@ -45,14 +45,14 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
         // Read config via PortHandle (async)
         let acquire_time = ctx.port_handle.read_float64(ctx.ad.acquire_time, 0).await?;
 
-        // Generate frame...
+        // Generate frame (a DriverArray from ctx.pool)...
 
         // Batch-update params via PortHandle (async, reliable)
         ctx.port_handle.set_params_and_notify(0, vec![...]).await?;
 
         // Publish frame to downstream plugins (concurrent fan-out)
         if config.array_callbacks {
-            ctx.publisher.publish(Arc::new(frame)).await;
+            ctx.publisher.publish(frame).await;
         }
     }
 }
@@ -85,7 +85,7 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
 | `SIM_XSINE1/2_FREQUENCY` | Float64 | X sine component frequencies |
 | `SIM_XSINE1/2_PHASE` | Float64 | X sine component phases |
 | `SIM_YSINE1/2_*` | Float64 | Y sine equivalents |
-| `SIM_XSINE_OPERATION` | Int32 | Add (0) or Multiply (1) |
+| `SIM_XSINE_OPERATION`, `SIM_YSINE_OPERATION` | Int32 | Add (0) or Multiply (1) |
 
 ### General
 
@@ -100,7 +100,7 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
 
 ```bash
 # Library only
-cargo build -p sim-detector --features ioc
+cargo build -p sim-detector --lib --features ioc
 
 # Full IOC with plugins
 cargo build --release -p sim-detector --features ioc --bin sim-ioc
@@ -117,11 +117,18 @@ cargo run -p sim-detector --example demo
 ```bash
 epicsEnvSet("PREFIX", "SIM1:")
 epicsEnvSet("CAM",    "cam1:")
+epicsEnvSet("PORT",   "SIM1")
+epicsEnvSet("QSIZE",  "20")
+epicsEnvSet("NELEMENTS", "1048576")
 
 # simDetectorConfig(portName, maxSizeX, maxSizeY, dataType, maxBuffers, maxMemory, priority, stackSize)
-simDetectorConfig("SIM1", 1024, 1024, 1, 0, 50000000)
+simDetectorConfig("$(PORT)", 1024, 1024, 1, 0, 50000000)
 
-dbLoadRecords("$(SIM_DETECTOR)/db/simDetector.template", "P=$(PREFIX),R=$(CAM),PORT=SIM1")
+dbLoadRecords("$(ADSIMDETECTOR)/db/simDetector.template", "P=$(PREFIX),R=$(CAM),PORT=$(PORT),ADDR=0,TIMEOUT=1")
+
+# image1, which commonPlugins.cmd leaves to the st.cmd
+NDStdArraysConfigure("IMAGE1", $(QSIZE), 0, "$(PORT)", 0)
+dbLoadRecords("NDStdArrays.template", "P=$(PREFIX),R=image1:,PORT=IMAGE1,NDARRAY_PORT=$(PORT),TYPE=$(TYPE=Int8),FTVL=$(FTVL=UCHAR),NELEMENTS=$(NELEMENTS)")
 
 # Standard areaDetector plugins
 < $(ADCORE)/iocBoot/commonPlugins.cmd
@@ -131,18 +138,16 @@ dbLoadRecords("$(SIM_DETECTOR)/db/simDetector.template", "P=$(PREFIX),R=$(CAM),P
 
 The sim-detector IOC includes full autosave support, matching the C EPICS autosave workflow. PV values are automatically saved to disk and restored on IOC restart.
 
-### Configuration in st.cmd
+### Configuration
 
 ```bash
-# Search paths for .req files (detector, plugins)
-set_requestfile_path("$(ADSIMDETECTOR)/db")
+# From commonPlugins.cmd: plugin .req search path, status PV prefix
 set_requestfile_path("$(ADCORE)/db")
-
-# Directory for .sav files
-set_savefile_path("$(ADSIMDETECTOR)/ioc/autosave")
-
-# Status PV prefix
 save_restoreSet_status_prefix("$(PREFIX)")
+
+# From st.cmd, after commonPlugins.cmd: detector .req path, .sav directory
+set_requestfile_path("$(ADSIMDETECTOR)/db")
+set_savefile_path("$(ADSIMDETECTOR)/ioc/autosave")
 
 # Restore saved values (pass0 = before device init, pass1 = after)
 set_pass0_restoreFile("simDetector_settings.req", "P=$(PREFIX),R=$(CAM)")
@@ -179,6 +184,9 @@ fdbrestore simDetector_settings.sav   # Restore from .sav file
 ## Verify
 
 ```bash
+# Plugins boot with EnableCallbacks 0
+caput SIM1:Stats1:EnableCallbacks 1
+
 # Set simulation mode to Peaks
 caput SIM1:cam1:SimMode 1
 
@@ -194,7 +202,7 @@ camonitor SIM1:Stats1:MeanValue_RBV
 
 A PyDM display at `opi/pydm/adViewer.py` shows the CA (`image1:ArrayData`)
 and PVA (`Pva1:Image`) plugin outputs side by side, with Start/Stop
-controls and per-plugin Enable toggles.
+controls and per-plugin Enable toggles. Both plugins boot disabled.
 
 ```bash
 pydm examples/sim-detector/opi/pydm/adViewer.py \
@@ -213,4 +221,4 @@ Macros:
 
 ## License
 
-MIT
+EPICS Open License, as the rest of epics-rs (see [LICENSE](../../LICENSE)).

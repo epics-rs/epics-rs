@@ -1136,6 +1136,27 @@ mod tests {
         assert!(empty.as_u8_slice_mut().is_empty());
     }
 
+    /// The storage still holds what a shrink dropped; growing back must not
+    /// show it.
+    #[test]
+    fn resize_zeroes_growth_after_a_shrink() {
+        let mut buf = NDDataBuffer::from_vec::<u16>(vec![7; 20]);
+        buf.resize(5);
+        buf.resize(20);
+        let v = buf.as_slice::<u16>().unwrap();
+        assert_eq!(v[..5], [7; 5]);
+        assert!(v[5..].iter().all(|&x| x == 0), "{v:?}");
+    }
+
+    #[test]
+    fn clone_copies_only_the_elements_in_use() {
+        let mut buf = NDDataBuffer::from_vec::<u16>(vec![3; 1000]);
+        buf.resize(4);
+        let c = buf.clone();
+        assert_eq!(c.as_slice::<u16>(), Some(&[3u16; 4][..]));
+        assert!(c.capacity_bytes() < buf.capacity_bytes());
+    }
+
     #[test]
     fn report_prints_the_time_stamp_as_c_percent_f() {
         let mut arr = NDArray::new(vec![NDDimension::new(2)], NDDataType::UInt8);

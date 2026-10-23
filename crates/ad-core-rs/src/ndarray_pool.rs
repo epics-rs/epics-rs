@@ -1118,6 +1118,27 @@ mod tests {
         );
     }
 
+    /// C's alloc hands a reused `pData` back as it was, only `dataType`
+    /// changes (NDArrayPool.cpp:177, :191): retyping clears nothing.
+    #[test]
+    fn a_retyped_buffer_keeps_its_previous_bytes() {
+        let pool = NDArrayPool::new(1_000_000);
+        let mut a = pool
+            .alloc(vec![NDDimension::new(8)], NDDataType::UInt16)
+            .unwrap();
+        a.data
+            .as_mut_slice::<u16>()
+            .unwrap()
+            .copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        let bytes = a.data.as_u8_slice().to_vec();
+        pool.release(a);
+
+        let b = pool
+            .alloc(vec![NDDimension::new(2)], NDDataType::Float64)
+            .unwrap();
+        assert_eq!(b.data.as_u8_slice(), &bytes[..]);
+    }
+
     /// `copy` with `copy_data_type` retypes the output in its own buffer
     /// (NDArrayPool.cpp:290-299).
     #[test]

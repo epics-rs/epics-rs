@@ -366,8 +366,8 @@ fn decode_zlib_into(src: &NDArray, dst: &mut [u8]) -> Option<usize> {
 // the framed length then equals the raw block length, which decompression uses
 // to detect and copy the block verbatim.
 
-/// Default LZ4HDF5 block size in bytes (HDF5 LZ4 filter `DEFAULT_BLOCK_SIZE`, 1 MiB).
-const LZ4HDF5_DEFAULT_BLOCK_SIZE: usize = 1 << 20;
+/// Default LZ4HDF5 block size in bytes, lz4hdf5.c:36 `DEFAULT_BLOCK_SIZE` (1 GiB).
+const LZ4HDF5_DEFAULT_BLOCK_SIZE: usize = 1 << 30;
 
 /// Compress an NDArray with the HDF5 LZ4 filter framing (`lz4hdf5`).
 ///
@@ -3608,9 +3608,8 @@ mod tests {
 
     #[test]
     fn test_lz4hdf5_multi_block_roundtrip() {
-        // A buffer larger than the default block size exercises the per-block
-        // container framing and a trailing partial block.
-        let block = LZ4HDF5_DEFAULT_BLOCK_SIZE;
+        // Per-block container framing and a trailing partial block.
+        let block = 4096;
         let count = block * 2 + block / 3 + 7; // 2.33 blocks of u8.
         let mut arr = NDArray::new(vec![NDDimension::new(count)], NDDataType::UInt8);
         if let NDDataViewMut::U8(v) = arr.data_mut().view_mut() {
@@ -3620,7 +3619,8 @@ mod tests {
         }
         let original = arr.data().as_u8_slice().to_vec();
 
-        let compressed = compress_lz4hdf5(&arr, 0).unwrap();
+        let compressed = compress_lz4hdf5(&arr, block).unwrap();
+        assert_eq!(lz4hdf5_header_block(&compressed), block as u32);
         let decompressed = decompress_lz4hdf5(&compressed).unwrap();
         assert_eq!(decompressed.data().as_u8_slice(), original.as_slice());
     }
@@ -3694,6 +3694,25 @@ mod tests {
             let decompressed = decompress_lz4hdf5(&compressed).unwrap();
             assert_eq!(decompressed.data().as_u8_slice(), original.as_slice());
         }
+    }
+
+    /// Under the 1 GiB default (lz4hdf5.c:36) a frame past 1 MiB is one block.
+    #[test]
+    fn lz4hdf5_default_block_holds_a_frame_up_to_1_gib() {
+        let n = 3 * (1 << 20) + 5;
+        let mut arr = NDArray::new(vec![NDDimension::new(n)], NDDataType::UInt8);
+        if let NDDataViewMut::U8(v) = arr.data_mut().view_mut() {
+            for (i, x) in v.iter_mut().enumerate() {
+                *x = (i.wrapping_mul(2_654_435_761) % 251) as u8;
+            }
+        }
+        let compressed = compress_lz4hdf5(&arr, 0).unwrap();
+        assert_eq!(lz4hdf5_header_block(&compressed), n as u32);
+        let bytes = compressed.data().as_u8_slice();
+        let clen = u32::from_be_bytes(bytes[12..16].try_into().unwrap()) as usize;
+        assert_eq!(16 + clen, bytes.len());
+        let decompressed = decompress_lz4hdf5(&compressed).unwrap();
+        assert_eq!(decompressed.data().as_u8_slice(), arr.data().as_u8_slice());
     }
 
     #[test]

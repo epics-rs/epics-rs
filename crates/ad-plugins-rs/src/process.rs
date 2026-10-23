@@ -1,6 +1,7 @@
 use asyn_rs::port::InterfaceMask;
 use std::sync::Arc;
 
+use crate::par_util;
 use ad_core_rs::error::ADResult;
 use ad_core_rs::ndarray::{NDArray, NDDataType};
 use ad_core_rs::ndarray_pool::NDArrayPool;
@@ -510,6 +511,9 @@ impl ProcessState {
     }
 }
 
+/// Elements per chunk of the pooled element-wise pass.
+const PAR_CHUNK: usize = 1 << 16;
+
 /// Stages 1-4 of one frame with every switch resolved: each stage is present
 /// or absent, and the two correction buffers are the slices the stage reads
 /// at the same index as the value it corrects. One such set describes the
@@ -532,7 +536,6 @@ struct ElementOps<'a> {
 
 impl ElementOps<'_> {
     /// The same stages over `len` elements from `start`.
-    #[cfg(feature = "simd")]
     fn slice(&self, start: usize, len: usize) -> ElementOps<'_> {
         ElementOps {
             bg: self.bg.map(|bg| &bg[start..start + len]),
@@ -841,7 +844,17 @@ impl ProcessFrame {
                     .then_some((self.config.low_clip_thresh, self.config.low_clip_value)),
             };
 
-            ops.apply(values);
+            // 330 ps per element serially from cache; the split measured
+            // faster from 1300 us (f64 2048x2048 0.88x serial, u16 1.00x;
+            // u16 1024x1024 1.10x), as the next pass reads back what other
+            // cores wrote.
+            if par_util::pool_wins(values.len(), 330, 1300, values.len().div_ceil(PAR_CHUNK)) {
+                par_util::for_each_chunk_mut(values, PAR_CHUNK, |k, chunk| {
+                    ops.slice(k * PAR_CHUNK, chunk.len()).apply(chunk)
+                });
+            } else {
+                ops.apply(values);
+            }
         }
     }
 
@@ -1515,6 +1528,50 @@ mod tests {
             assert_eq!(v[0], 10); // clipped up
             assert_eq!(v[1], 50); // unchanged
             assert_eq!(v[2], 100); // clipped down
+        }
+    }
+
+    /// Stages 1-4 over a frame of several pool chunks: each chunk takes the
+    /// background and flat-field values at its own offset in the frame.
+    #[test]
+    fn element_ops_over_pool_chunks_match_the_scalar_stages() {
+        let n = 2 * PAR_CHUNK + 5;
+        let at = |i: usize, m: usize| ((i * 7919) % m) as f64;
+        let bg: Vec<f64> = (0..n).map(|i| at(i, 13)).collect();
+        let ff: Vec<f64> = (0..n).map(|i| at(i, 5)).collect();
+        let input: Vec<f64> = (0..n).map(|i| 50.0 + at(i, 211)).collect();
+        let mut state = ProcessState::new(ProcessConfig {
+            enable_background: true,
+            enable_flat_field: true,
+            scale_flat_field: 3.0,
+            enable_offset_scale: true,
+            offset: 2.0,
+            scale: 1.5,
+            enable_high_clip: true,
+            high_clip_thresh: 300.0,
+            high_clip_value: 300.0,
+            enable_low_clip: true,
+            low_clip_thresh: 60.0,
+            low_clip_value: -1.0,
+            ..Default::default()
+        });
+        seed_background(&mut state, &make_f64_array(&bg));
+        seed_flat_field(&mut state, &make_f64_array(&ff));
+        let result = (state.process(&pool(), &make_f64_array(&input)))
+            .unwrap()
+            .unwrap();
+        let NDDataBuffer::F64(ref got) = result.data else {
+            panic!("expected F64 output");
+        };
+        for i in 0..n {
+            let mut v = input[i] - bg[i];
+            if ff[i] != 0.0 {
+                v = v * 3.0 / ff[i];
+            }
+            v = (v + 2.0) * 1.5;
+            v = if v > 300.0 { 300.0 } else { v };
+            v = if v < 60.0 { -1.0 } else { v };
+            assert_eq!(got[i], v, "element {i}");
         }
     }
 

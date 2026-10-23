@@ -491,21 +491,42 @@ impl NDFileWriter for TiffWriter {
 fn decode(bytes: &[u8], attributes: NDAttributeList, pool: &NDArrayPool) -> ADResult<NDArray> {
     let err = |m: &str| ADError::UnsupportedConversion(format!("TIFF decode error: {m}"));
 
+    // libtiff reads either byte order: the header and IFD in the file's,
+    // the samples swabbed to the host's (tif_postdecode).
+    let big_endian = match bytes.get(0..2) {
+        Some(b"II") => false,
+        Some(b"MM") => true,
+        _ => return Err(err("not a classic TIFF")),
+    };
     let read_u16 = |off: usize| -> ADResult<u16> {
         bytes
             .get(off..off + 2)
-            .map(|b| u16::from_le_bytes([b[0], b[1]]))
+            .map(|b| {
+                let b = [b[0], b[1]];
+                if big_endian {
+                    u16::from_be_bytes(b)
+                } else {
+                    u16::from_le_bytes(b)
+                }
+            })
             .ok_or_else(|| err("truncated"))
     };
     let read_u32 = |off: usize| -> ADResult<u32> {
         bytes
             .get(off..off + 4)
-            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .map(|b| {
+                let b = [b[0], b[1], b[2], b[3]];
+                if big_endian {
+                    u32::from_be_bytes(b)
+                } else {
+                    u32::from_le_bytes(b)
+                }
+            })
             .ok_or_else(|| err("truncated"))
     };
 
-    if bytes.len() < 8 || &bytes[0..2] != b"II" || read_u16(2)? != 42 {
-        return Err(err("not a little-endian classic TIFF"));
+    if bytes.len() < 8 || read_u16(2)? != 42 {
+        return Err(err("not a classic TIFF"));
     }
 
     // The reader only needs the integer tags; ASCII/DOUBLE entries are skipped.
@@ -676,6 +697,11 @@ fn decode(bytes: &[u8], attributes: NDAttributeList, pool: &NDArrayPool) -> ADRe
         let start = offset as usize;
         image[total..total + len].copy_from_slice(&bytes[start..start + len]);
         total += len;
+    }
+    if big_endian != cfg!(target_endian = "big") {
+        image
+            .chunks_exact_mut(data_type.element_size())
+            .for_each(<[u8]>::reverse);
     }
     array.attributes = attributes;
     TiffWriter::attach_color_mode(&mut array, color_mode);
@@ -2258,6 +2284,7 @@ mod tests {
         samples: u16,
         separate: bool,
         bits: u16,
+        big_endian: bool,
         /// Cuts StripOffsets to this length, or extends it.
         offsets_len: Option<usize>,
         offsets: Option<&'static [u32]>,
@@ -2277,6 +2304,7 @@ mod tests {
                 samples: 1,
                 separate: false,
                 bits: 8,
+                big_endian: false,
                 offsets_len: None,
                 offsets: None,
                 overrides: &[],
@@ -2287,11 +2315,19 @@ mod tests {
 
     impl StripFile {
         fn short(&self, value: u16) -> [u8; 2] {
-            value.to_le_bytes()
+            if self.big_endian {
+                value.to_be_bytes()
+            } else {
+                value.to_le_bytes()
+            }
         }
 
         fn long(&self, value: u32) -> [u8; 4] {
-            value.to_le_bytes()
+            if self.big_endian {
+                value.to_be_bytes()
+            } else {
+                value.to_le_bytes()
+            }
         }
 
         fn file(&self) -> Vec<u8> {
@@ -2396,7 +2432,7 @@ mod tests {
             entries.push((TAG_PLANAR_CONFIG, TYPE_SHORT, 1, u32::from(planar)));
             entries.push((TAG_SAMPLE_FORMAT, TYPE_SHORT, 1, 1));
             entries.retain(|(tag, ..)| !self.omit.contains(tag));
-            let mut file = b"II".to_vec();
+            let mut file = if self.big_endian { b"MM" } else { b"II" }.to_vec();
             file.extend(self.short(42));
             file.extend(self.long(ifd));
             file.extend(data);
@@ -2466,6 +2502,8 @@ mod tests {
             "01080f161d242b323940474e555c636a71787f868d949ba2a9b0b7bec5ccd3dae1e8eff6";
         const RGB3: &str =
             "01162b40556a7f94a9bed3e8081d32475c71869bb0c5daef0f24394e63788da2b7cce1f6";
+        const RGB1_16: &str = "03000401050206030704080509060a070b080c090d0a0e0b0f0c100d110e120f13101411151216131714181519161a171b181c191d1a1e1b1f1c201d211e221f2320242125222623";
+        const RGB3_16: &str = "0300060309060c090f0c120f151218151b181e1b211e2421040107040a070d0a100d1310161319161c191f1c221f2522050208050b080e0b110e141117141a171d1a201d23202623";
         let s = StripFile::default();
         let one = StripFile { rows: 1, ..s };
         let h5 = StripFile {
@@ -2475,6 +2513,10 @@ mod tests {
         };
         let h4 = StripFile { height: 4, ..s };
         let rgb = StripFile { samples: 3, ..s };
+        let be = StripFile {
+            big_endian: true,
+            ..s
+        };
         let planes = StripFile {
             separate: true,
             ..rgb
@@ -2532,6 +2574,13 @@ mod tests {
             ("u16_wrong", StripFile { bits: 16, counts: Given(&[8, 4, 8]), ..one }, Some(GRAY16)),
             ("u16_short1", StripFile { bits: 16, counts: Given(&[20]), ..s }, Some(GRAY16)),
             ("le_u32", StripFile { bits: 32, ..one }, Some(GRAY32)),
+            // A big-endian file's samples come back in the host's order.
+            ("be_ok", be, Some(GRAY)),
+            ("be_u16", StripFile { rows: 1, bits: 16, ..be }, Some(GRAY16)),
+            ("be_u16_short1", StripFile { bits: 16, counts: Given(&[20]), ..be }, Some(GRAY16)),
+            ("be_u32", StripFile { rows: 1, bits: 32, ..be }, Some(GRAY32)),
+            ("be_rgb1_u16", StripFile { samples: 3, rows: 2, bits: 16, ..be }, Some(RGB1_16)),
+            ("be_rgb3_u16", StripFile { samples: 3, separate: true, bits: 16, ..be }, Some(RGB3_16)),
             ("rgb1_ok", StripFile { rows: 1, ..rgb }, Some(RGB1)),
             ("rgb1_wrong", StripFile { rows: 1, counts: Given(&[12, 6, 12]), ..rgb }, Some(RGB1)),
             ("rgb1_short1", StripFile { counts: Given(&[30]), ..rgb }, Some(RGB1)),

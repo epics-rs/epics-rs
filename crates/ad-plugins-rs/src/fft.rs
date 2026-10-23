@@ -192,13 +192,12 @@ fn frame_jobs(dims: &[NDDimension], direction: FFTDirection) -> usize {
     1
 }
 
-/// `f(state, i, chunk)` for chunk `i` of the `len`-element chunks of `out`:
-/// in order with `states[0]` when `jobs` or the chunk count is 1, else on
-/// the shared pool as at most `jobs` runs of adjacent chunks, one per state.
-/// `states` grows to the job count and keeps its states for later passes.
-/// A chunk's result is the same whichever job computes it, so the output
-/// does not depend on `jobs`.
-fn for_each_chunk_with<T: Send, S: Default + Send>(
+/// `f(state, first, run)` for each run of adjacent `len`-element chunks of
+/// `out`, `first` the index of its first chunk: all of `out` with
+/// `states[0]` when `jobs` or the chunk count is 1, else on the shared pool
+/// as at most `jobs` runs, one per state. `states` grows to the job count
+/// and keeps its states for later passes.
+fn for_each_run_with<T: Send, S: Default + Send>(
     out: &mut [T],
     len: usize,
     jobs: usize,
@@ -210,11 +209,6 @@ fn for_each_chunk_with<T: Send, S: Default + Send>(
     if states.len() < jobs {
         states.resize_with(jobs, S::default);
     }
-    let run_chunks = |s: &mut S, first: usize, part: &mut [T]| {
-        for (i, c) in part.chunks_mut(len).enumerate() {
-            f(s, first + i, c);
-        }
-    };
     if jobs > 1 {
         #[cfg(feature = "parallel")]
         return par_util::thread_pool().install(|| {
@@ -223,10 +217,27 @@ fn for_each_chunk_with<T: Send, S: Default + Send>(
             out.par_chunks_mut(per_job * len)
                 .zip(states.par_iter_mut())
                 .enumerate()
-                .for_each(|(j, (part, s))| run_chunks(s, j * per_job, part));
+                .for_each(|(j, (run, s))| f(s, j * per_job, run));
         });
     }
-    run_chunks(&mut states[0], 0, out);
+    f(&mut states[0], 0, out);
+}
+
+/// `f(state, i, chunk)` for chunk `i` of the `len`-element chunks of `out`,
+/// as [`for_each_run_with`] splits them. A chunk's result is the same
+/// whichever job computes it, so the output does not depend on `jobs`.
+fn for_each_chunk_with<T: Send, S: Default + Send>(
+    out: &mut [T],
+    len: usize,
+    jobs: usize,
+    states: &mut Vec<S>,
+    f: impl Fn(&mut S, usize, &mut [T]) + Sync,
+) {
+    for_each_run_with(out, len, jobs, states, |s, first, run| {
+        for (i, c) in run.chunks_mut(len).enumerate() {
+            f(s, first + i, c);
+        }
+    });
 }
 
 /// [`for_each_chunk_with`] for a pass that keeps no state.
@@ -719,7 +730,9 @@ fn fft_2d_inverse_with(
     }
 
     fft_columns(&cols, data, w, jobs, &mut bufs.cols, &mut bufs.per_job);
-    for_each_chunk_with(data, w, jobs, &mut bufs.per_job, |job, _, r| {
+    // One rustfft call per run of rows: a call per row left 128x64 slower
+    // than one call over the frame.
+    for_each_run_with(data, w, jobs, &mut bufs.per_job, |job, _, r| {
         run(&*rows, r, &mut job.scratch)
     });
 

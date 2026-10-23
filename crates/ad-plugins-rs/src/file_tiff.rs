@@ -40,10 +40,16 @@ const TIFFTAG_EPICSTSNSEC: u16 = 65003;
 const TIFFTAG_FIRST_ATTRIBUTE: u16 = 65010;
 
 // TIFF field types.
+const TYPE_BYTE: u16 = 1;
 const TYPE_ASCII: u16 = 2;
 const TYPE_SHORT: u16 = 3;
 const TYPE_LONG: u16 = 4;
+const TYPE_SBYTE: u16 = 6;
+const TYPE_SSHORT: u16 = 8;
+const TYPE_SLONG: u16 = 9;
 const TYPE_DOUBLE: u16 = 12;
+const TYPE_LONG8: u16 = 16;
+const TYPE_SLONG8: u16 = 17;
 
 // libtiff constants, as passed by C.
 const COMPRESSION_NONE: u16 = 1;
@@ -529,43 +535,110 @@ fn decode(bytes: &[u8], attributes: NDAttributeList, pool: &NDArrayPool) -> ADRe
         return Err(err("not a classic TIFF"));
     }
 
-    // The reader only needs the integer tags; ASCII/DOUBLE entries are skipped.
+    // The entry of each tag; a repeated tag keeps its first, as
+    // TIFFReadDirectory ignores the later ones.
     let ifd = read_u32(4)? as usize;
     let entry_count = read_u16(ifd)? as usize;
-    let mut tags: BTreeMap<u16, Vec<u64>> = BTreeMap::new();
+    let mut entries: BTreeMap<u16, usize> = BTreeMap::new();
     for i in 0..entry_count {
         let entry = ifd + 2 + 12 * i;
-        let tag = read_u16(entry)?;
-        let size = match read_u16(entry + 2)? {
-            TYPE_SHORT => 2usize,
-            TYPE_LONG => 4,
-            _ => continue,
+        entries.entry(read_u16(entry)?).or_insert(entry);
+    }
+    // TIFFReadDirEntry*: every integer type reads, as long as no value is
+    // negative; any other type fails the open.
+    let values = |tag: u16| -> ADResult<Option<Vec<u64>>> {
+        let Some(&entry) = entries.get(&tag) else {
+            return Ok(None);
         };
-        let n = read_u32(entry + 4)? as usize;
-        let base = if n * size <= 4 {
+        let kind = read_u16(entry + 2)?;
+        let (size, signed) = match kind {
+            TYPE_BYTE => (1, false),
+            TYPE_SBYTE => (1, true),
+            TYPE_SHORT => (2, false),
+            TYPE_SSHORT => (2, true),
+            TYPE_LONG => (4, false),
+            TYPE_SLONG => (4, true),
+            TYPE_LONG8 => (8, false),
+            TYPE_SLONG8 => (8, true),
+            _ => return Err(err(&format!("tag {tag} has type {kind}"))),
+        };
+        let len = (read_u32(entry + 4)? as usize)
+            .checked_mul(size)
+            .ok_or_else(|| err("truncated"))?;
+        let at = if len <= 4 {
             entry + 8
         } else {
             read_u32(entry + 8)? as usize
         };
-        let mut values = Vec::with_capacity(n);
-        for k in 0..n {
-            values.push(match size {
-                2 => u64::from(read_u16(base + 2 * k)?),
-                _ => u64::from(read_u32(base + 4 * k)?),
-            });
+        let raw = bytes
+            .get(at..)
+            .and_then(|b| b.get(..len))
+            .ok_or_else(|| err("truncated"))?;
+        raw.chunks_exact(size)
+            .map(|v| {
+                let mut b = [0; 8];
+                let value = if big_endian {
+                    b[8 - size..].copy_from_slice(v);
+                    u64::from_be_bytes(b)
+                } else {
+                    b[..size].copy_from_slice(v);
+                    u64::from_le_bytes(b)
+                };
+                if signed && value >> (8 * size - 1) != 0 {
+                    return Err(err(&format!("tag {tag} has a negative value")));
+                }
+                Ok(value)
+            })
+            .collect::<ADResult<Vec<_>>>()
+            .map(Some)
+    };
+    // TIFFReadDirEntryShort/Long: one value, no greater than `max`.
+    let one = |tag: u16, max: u64| -> ADResult<Option<u64>> {
+        match values(tag)?.as_deref() {
+            None => Ok(None),
+            Some(&[v]) if v <= max => Ok(Some(v)),
+            Some(_) => Err(err(&format!("tag {tag} is not one value up to {max}"))),
         }
-        tags.insert(tag, values);
-    }
+    };
+    let short = u64::from(u16::MAX);
+    let long = u64::from(u32::MAX);
 
-    let scalar = |tag: u16| -> Option<u64> { tags.get(&tag).and_then(|v| v.first().copied()) };
-    let width = scalar(TAG_IMAGE_WIDTH).ok_or_else(|| err("no ImageWidth"))? as usize;
-    let height = scalar(TAG_IMAGE_LENGTH).ok_or_else(|| err("no ImageLength"))? as usize;
-    let bits = scalar(TAG_BITS_PER_SAMPLE).ok_or_else(|| err("no BitsPerSample"))?;
-    let samples_per_pixel = scalar(TAG_SAMPLES_PER_PIXEL).unwrap_or(1);
-    let photometric = scalar(TAG_PHOTOMETRIC).ok_or_else(|| err("no PhotometricInterpretation"))?;
-    let planar_config = scalar(TAG_PLANAR_CONFIG).unwrap_or(u64::from(PLANARCONFIG_CONTIG));
+    let width = one(TAG_IMAGE_WIDTH, long)?.ok_or_else(|| err("no ImageWidth"))? as usize;
+    let height = one(TAG_IMAGE_LENGTH, long)?.ok_or_else(|| err("no ImageLength"))? as usize;
+    let samples_per_pixel = match one(TAG_SAMPLES_PER_PIXEL, short)? {
+        Some(0) => return Err(err("bad value 0 for SamplesPerPixel")),
+        Some(n) => n,
+        None => 1,
+    };
+    // One value, or one per sample all alike (TIFFReadDirEntryPersampleShort).
+    let per_sample = |tag: u16| -> ADResult<Option<u64>> {
+        let Some(v) = values(tag)? else {
+            return Ok(None);
+        };
+        let samples = samples_per_pixel as usize;
+        match v[..] {
+            [one] if one <= short => Ok(Some(one)),
+            _ if v.len() >= samples
+                && v.iter().all(|&s| s <= short)
+                && v[..samples].iter().all(|&s| s == v[0]) =>
+            {
+                Ok(Some(v[0]))
+            }
+            _ => Err(err(&format!("tag {tag} is not one value per sample"))),
+        }
+    };
+    // C decodes through libtiff's codecs; with none here, a compressed strip
+    // would come back as its raw bytes.
+    let compression = per_sample(TAG_COMPRESSION)?.unwrap_or(u64::from(COMPRESSION_NONE));
+    if compression != u64::from(COMPRESSION_NONE) {
+        return Err(err(&format!("unsupported Compression={compression}")));
+    }
+    let bits = per_sample(TAG_BITS_PER_SAMPLE)?.ok_or_else(|| err("no BitsPerSample"))?;
+    let photometric =
+        one(TAG_PHOTOMETRIC, short)?.ok_or_else(|| err("no PhotometricInterpretation"))?;
+    let planar_config = one(TAG_PLANAR_CONFIG, short)?.unwrap_or(u64::from(PLANARCONFIG_CONTIG));
     // C: "Sample format is not defined! Default UINT is used." (:457-463)
-    let sample_format = match scalar(TAG_SAMPLE_FORMAT) {
+    let sample_format = match per_sample(TAG_SAMPLE_FORMAT)? {
         Some(0) | None => u64::from(SAMPLEFORMAT_UINT),
         Some(v) => v,
     };
@@ -617,18 +690,11 @@ fn decode(bytes: &[u8], attributes: NDAttributeList, pool: &NDArrayPool) -> ADRe
         }
     };
 
-    // C decodes through libtiff's codecs; with none here, a compressed strip
-    // would come back as its raw bytes.
-    let compression = scalar(TAG_COMPRESSION).unwrap_or(u64::from(COMPRESSION_NONE));
-    if compression != u64::from(COMPRESSION_NONE) {
-        return Err(err(&format!("unsupported Compression={compression}")));
-    }
-
     // libtiff refuses these at TIFFOpen (tif_dirread.c:3561, :3621, :4053).
     if width == 0 || height == 0 {
         return Err(err("no image"));
     }
-    let rows_per_strip = match scalar(TAG_ROWS_PER_STRIP) {
+    let rows_per_strip = match one(TAG_ROWS_PER_STRIP, long)? {
         Some(0) => return Err(err("bad value 0 for RowsPerStrip")),
         Some(rows) => (rows as usize).min(height),
         None => height,
@@ -643,14 +709,14 @@ fn decode(bytes: &[u8], attributes: NDAttributeList, pool: &NDArrayPool) -> ADRe
     let num_strips = strips_per_plane * planes;
     // One entry per strip of the geometry, cut or zero-filled, as
     // TIFFFetchStripThing leaves the tables.
-    let table = |tag: u16| {
-        tags.get(&tag).map(|v| {
+    let table = |tag: u16| -> ADResult<Option<Vec<u64>>> {
+        Ok(values(tag)?.map(|v| {
             (0..num_strips)
                 .map(|i| v.get(i).copied().unwrap_or(0))
-                .collect::<Vec<_>>()
-        })
+                .collect()
+        }))
     };
-    let offsets = table(TAG_STRIP_OFFSETS).ok_or_else(|| err("no StripOffsets"))?;
+    let offsets = table(TAG_STRIP_OFFSETS)?.ok_or_else(|| err("no StripOffsets"))?;
     let mut array = pool.alloc(dims, data_type)?;
     let image = array.data_mut().as_u8_slice_mut();
     let size = image.len();
@@ -662,7 +728,7 @@ fn decode(bytes: &[u8], attributes: NDAttributeList, pool: &NDArrayPool) -> ADRe
     // missing, when a single one is 0, past the file or short of the image,
     // or when the first two of more than two contiguous strips differ
     // (tif_dirread.c:3901-3976).
-    let counts = match table(TAG_STRIP_BYTE_COUNTS) {
+    let counts = match table(TAG_STRIP_BYTE_COUNTS)? {
         None if num_strips != planes => return Err(err("no StripByteCounts")),
         None => estimate(),
         Some(c)
@@ -2603,6 +2669,250 @@ mod tests {
                 let read = decode(&file.file(), NDAttributeList::new(), &NDArrayPool::new(0));
                 let rs = read.as_ref().ok().map(sample_hex);
                 (rs.as_deref() != *c).then(|| format!("{name}: {:?}", read.map(|a| sample_hex(&a))))
+            })
+            .collect();
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    const TYPE_RATIONAL: u16 = 5;
+    const TYPE_FLOAT: u16 = 11;
+
+    /// A file of reviewer6's tag-type set, written as their generator
+    /// writes it so that C's reads of those files pin this reader: a 4-wide
+    /// image whose sample bytes run `(j+1)*7` from offset 8, 16 0xee bytes,
+    /// the out-of-line tag values, then the IFD. `types` rewrites a tag's
+    /// entry type and `values` its values; `extra` entries follow the rest.
+    #[derive(Clone, Copy)]
+    struct TagFile {
+        height: u32,
+        rows: u32,
+        samples: u16,
+        separate: bool,
+        bits: u16,
+        format: u16,
+        types: &'static [(u16, u16)],
+        values: &'static [(u16, &'static [i64])],
+        extra: &'static [(u16, u16, &'static [i64])],
+    }
+
+    impl Default for TagFile {
+        fn default() -> Self {
+            Self {
+                height: 3,
+                rows: 1,
+                samples: 1,
+                separate: false,
+                bits: 8,
+                format: 1,
+                types: &[],
+                values: &[],
+                extra: &[],
+            }
+        }
+    }
+
+    impl TagFile {
+        fn file(&self) -> Vec<u8> {
+            let width = 4;
+            let samples = u32::from(self.samples);
+            let bytes = u32::from(self.bits / 8);
+            let rows = self.rows.min(self.height).max(1);
+            let (planes, row_samples) = if self.separate {
+                (samples, width)
+            } else {
+                (1, width * samples)
+            };
+            let mut data = Vec::new();
+            let (mut offsets, mut counts) = (Vec::new(), Vec::new());
+            for plane in 0..planes {
+                for first in (0..self.height).step_by(rows as usize) {
+                    offsets.push(8 + data.len() as i64);
+                    let start = data.len();
+                    for row in first..(first + rows).min(self.height) {
+                        for x in 0..row_samples {
+                            let i = if self.separate {
+                                (row * width + x) * samples + plane
+                            } else {
+                                row * row_samples + x
+                            };
+                            data.extend((0..bytes).map(|k| ((i * bytes + k + 1) * 7) as u8));
+                        }
+                    }
+                    counts.push((data.len() - start) as i64);
+                }
+            }
+            data.extend([0xee; 16]);
+            let photometric = if self.samples == 3 {
+                PHOTOMETRIC_RGB
+            } else {
+                PHOTOMETRIC_MINISBLACK
+            };
+            let planar = if self.separate {
+                PLANARCONFIG_SEPARATE
+            } else {
+                PLANARCONFIG_CONTIG
+            };
+            let bits = vec![i64::from(self.bits); usize::from(self.samples)];
+            let mut tags = vec![
+                (TAG_IMAGE_WIDTH, TYPE_LONG, vec![i64::from(width)]),
+                (TAG_IMAGE_LENGTH, TYPE_LONG, vec![i64::from(self.height)]),
+                (TAG_BITS_PER_SAMPLE, TYPE_SHORT, bits),
+                (TAG_COMPRESSION, TYPE_SHORT, vec![1]),
+                (TAG_PHOTOMETRIC, TYPE_SHORT, vec![i64::from(photometric)]),
+                (TAG_STRIP_OFFSETS, TYPE_LONG, offsets),
+                (
+                    TAG_SAMPLES_PER_PIXEL,
+                    TYPE_SHORT,
+                    vec![i64::from(self.samples)],
+                ),
+                (TAG_ROWS_PER_STRIP, TYPE_LONG, vec![i64::from(self.rows)]),
+                (TAG_STRIP_BYTE_COUNTS, TYPE_LONG, counts),
+                (TAG_PLANAR_CONFIG, TYPE_SHORT, vec![i64::from(planar)]),
+                (TAG_SAMPLE_FORMAT, TYPE_SHORT, vec![i64::from(self.format)]),
+            ];
+            for (tag, kind, values) in &mut tags {
+                if let Some(&(_, k)) = self.types.iter().find(|(t, _)| t == tag) {
+                    *kind = k;
+                }
+                if let Some(&(_, v)) = self.values.iter().find(|(t, _)| t == tag) {
+                    *values = v.to_vec();
+                }
+            }
+            tags.extend(self.extra.iter().map(|&(t, k, v)| (t, k, v.to_vec())));
+            let arrays_at = 8 + data.len();
+            let mut arrays = Vec::new();
+            let mut ifd = (tags.len() as u16).to_le_bytes().to_vec();
+            for (tag, kind, values) in tags {
+                let size = match kind {
+                    TYPE_BYTE | TYPE_SBYTE | TYPE_ASCII => 1,
+                    TYPE_SHORT | TYPE_SSHORT => 2,
+                    TYPE_LONG | TYPE_SLONG | TYPE_FLOAT => 4,
+                    _ => 8,
+                };
+                let raw: Vec<u8> = values
+                    .iter()
+                    .flat_map(|v| v.to_le_bytes()[..size].to_vec())
+                    .collect();
+                ifd.extend(tag.to_le_bytes());
+                ifd.extend(kind.to_le_bytes());
+                ifd.extend((values.len() as u32).to_le_bytes());
+                if raw.len() <= 4 {
+                    ifd.extend(&raw);
+                    ifd.extend(std::iter::repeat_n(0, 4 - raw.len()));
+                } else {
+                    ifd.extend(((arrays_at + arrays.len()) as u32).to_le_bytes());
+                    arrays.extend(raw);
+                    if arrays.len() % 2 == 1 {
+                        arrays.push(0);
+                    }
+                }
+            }
+            ifd.extend(0u32.to_le_bytes());
+            let mut file = b"II".to_vec();
+            file.extend(42u16.to_le_bytes());
+            file.extend(((arrays_at + arrays.len()) as u32).to_le_bytes());
+            file.extend(data);
+            file.extend(arrays);
+            file.extend(ifd);
+            file
+        }
+    }
+
+    /// A read as C's comparison reader prints it: the type, the dims, then
+    /// each sample's bytes little-endian.
+    fn c_read(array: &NDArray) -> String {
+        let bytes: Vec<u8> = match array.data().view() {
+            NDDataView::U8(v) => v.to_vec(),
+            NDDataView::U16(v) => v.iter().flat_map(|s| s.to_le_bytes()).collect(),
+            NDDataView::I16(v) => v.iter().flat_map(|s| s.to_le_bytes()).collect(),
+            other => panic!("{other:?}"),
+        };
+        let dims: Vec<_> = array.dims.iter().map(|d| d.size.to_string()).collect();
+        let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        format!("{:?} {} {hex}", array.data().data_type(), dims.join(","))
+    }
+
+    /// Each file reads as C `readFile` reads it with ADSupport's libtiff
+    /// 4.0.6: `None` where the open fails, else C's type, dims and buffer.
+    /// The `le_tt_*` files are reviewer6's; the rest cover the readers'
+    /// other types, ranges and counts.
+    #[test]
+    fn tag_entries_read_as_libtiff_reads_them() {
+        const GRAY: &str = "UInt8 4,3 070e151c232a31383f464d54";
+        const GRAY_H4: &str = "UInt8 4,4 070e151c232a31383f464d545b626970";
+        const GRAY16_H4: &str =
+            "UInt16 4,4 070e151c232a31383f464d545b626970777e858c939aa1a8afb6bdc4cbd2d9e0";
+        const GRAY16: &str = "UInt16 4,3 070e151c232a31383f464d545b626970777e858c939aa1a8";
+        const RGB1_16: &str = "UInt16 3,4,3 070e151c232a31383f464d545b626970777e858c939aa1a8afb6bdc4cbd2d9e0e7eef5fc030a11181f262d343b424950575e656c737a81888f969da4abb2b9c0c7ced5dce3eaf1f8";
+        const RGB1: &str =
+            "UInt8 3,4,3 070e151c232a31383f464d545b626970777e858c939aa1a8afb6bdc4cbd2d9e0e7eef5fc";
+        const RGB3: &str =
+            "UInt8 4,3,3 071c31465b70859aafc4d9ee0e23384d62778ca1b6cbe0f5152a3f54697e93a8bdd2e7fc";
+        const INT16: &str = "Int16 4,3 070e151c232a31383f464d545b626970777e858c939aa1a8";
+        let s = TagFile::default();
+        let rgb = TagFile { samples: 3, ..s };
+        #[rustfmt::skip]
+        let cases = [
+            ("le_tt_w_short", TagFile { types: &[(TAG_IMAGE_WIDTH, TYPE_SHORT)], ..s }, Some(GRAY)),
+            ("le_tt_h_short", TagFile { types: &[(TAG_IMAGE_LENGTH, TYPE_SHORT)], ..s }, Some(GRAY)),
+            ("le_tt_rps_short", TagFile { types: &[(TAG_ROWS_PER_STRIP, TYPE_SHORT)], ..s }, Some(GRAY)),
+            ("le_tt_offs_short3", TagFile { types: &[(TAG_STRIP_OFFSETS, TYPE_SHORT)], ..s }, Some(GRAY)),
+            ("le_tt_counts_short3", TagFile { types: &[(TAG_STRIP_BYTE_COUNTS, TYPE_SHORT)], ..s }, Some(GRAY)),
+            ("le_tt_both_short2", TagFile { height: 4, rows: 2, types: &[(TAG_STRIP_OFFSETS, TYPE_SHORT), (TAG_STRIP_BYTE_COUNTS, TYPE_SHORT)], ..s }, Some(GRAY_H4)),
+            ("le_tt_both_short2_u16", TagFile { height: 4, rows: 2, bits: 16, types: &[(TAG_STRIP_OFFSETS, TYPE_SHORT), (TAG_STRIP_BYTE_COUNTS, TYPE_SHORT)], ..s }, Some(GRAY16_H4)),
+            ("le_tt_counts_short1", TagFile { rows: 3, types: &[(TAG_STRIP_BYTE_COUNTS, TYPE_SHORT)], ..s }, Some(GRAY)),
+            ("le_tt_offs_short1", TagFile { rows: 3, types: &[(TAG_STRIP_OFFSETS, TYPE_SHORT)], ..s }, Some(GRAY)),
+            ("le_tt_bps_long", TagFile { bits: 16, types: &[(TAG_BITS_PER_SAMPLE, TYPE_LONG)], ..s }, Some(GRAY16)),
+            ("le_tt_bps_long_rgb", TagFile { bits: 16, rows: 2, types: &[(TAG_BITS_PER_SAMPLE, TYPE_LONG)], ..rgb }, Some(RGB1_16)),
+            ("le_tt_spp_long", TagFile { types: &[(TAG_SAMPLES_PER_PIXEL, TYPE_LONG)], ..rgb }, Some(RGB1)),
+            ("le_tt_pm_long", TagFile { types: &[(TAG_PHOTOMETRIC, TYPE_LONG)], ..s }, Some(GRAY)),
+            ("le_tt_pc_long", TagFile { separate: true, types: &[(TAG_PLANAR_CONFIG, TYPE_LONG)], ..rgb }, Some(RGB3)),
+            ("le_tt_sf_long", TagFile { bits: 16, format: 2, types: &[(TAG_SAMPLE_FORMAT, TYPE_LONG)], ..s }, Some(INT16)),
+            ("le_tt_comp_long", TagFile { types: &[(TAG_COMPRESSION, TYPE_LONG)], ..s }, Some(GRAY)),
+            ("le_tt_pm_byte", TagFile { types: &[(TAG_PHOTOMETRIC, TYPE_BYTE)], ..s }, Some(GRAY)),
+            ("le_tt_sf_sshort", TagFile { bits: 16, format: 2, types: &[(TAG_SAMPLE_FORMAT, TYPE_SSHORT)], ..s }, Some(INT16)),
+            ("le_tt_w_slong", TagFile { types: &[(TAG_IMAGE_WIDTH, TYPE_SLONG)], ..s }, Some(GRAY)),
+            ("le_tt_rps_byte", TagFile { types: &[(TAG_ROWS_PER_STRIP, TYPE_BYTE)], ..s }, Some(GRAY)),
+            ("le_tt_bps_byte", TagFile { bits: 16, types: &[(TAG_BITS_PER_SAMPLE, TYPE_BYTE)], ..s }, Some(GRAY16)),
+            ("w_sbyte", TagFile { types: &[(TAG_IMAGE_WIDTH, TYPE_SBYTE)], ..s }, Some(GRAY)),
+            ("w_slong8", TagFile { types: &[(TAG_IMAGE_WIDTH, TYPE_SLONG8)], ..s }, Some(GRAY)),
+            ("h_sshort", TagFile { types: &[(TAG_IMAGE_LENGTH, TYPE_SSHORT)], ..s }, Some(GRAY)),
+            ("h_long8", TagFile { types: &[(TAG_IMAGE_LENGTH, TYPE_LONG8)], ..s }, Some(GRAY)),
+            ("spp_sshort", TagFile { types: &[(TAG_SAMPLES_PER_PIXEL, TYPE_SSHORT)], ..rgb }, Some(RGB1)),
+            ("pc_byte", TagFile { separate: true, types: &[(TAG_PLANAR_CONFIG, TYPE_BYTE)], ..rgb }, Some(RGB3)),
+            ("offs_byte", TagFile { types: &[(TAG_STRIP_OFFSETS, TYPE_BYTE)], ..s }, Some(GRAY)),
+            ("offs_long8", TagFile { types: &[(TAG_STRIP_OFFSETS, TYPE_LONG8)], ..s }, Some(GRAY)),
+            ("counts_sbyte", TagFile { types: &[(TAG_STRIP_BYTE_COUNTS, TYPE_SBYTE)], ..s }, Some(GRAY)),
+            ("counts_slong8", TagFile { types: &[(TAG_STRIP_BYTE_COUNTS, TYPE_SLONG8)], ..s }, Some(GRAY)),
+            ("bps_sbyte_rgb", TagFile { types: &[(TAG_BITS_PER_SAMPLE, TYPE_SBYTE)], ..rgb }, Some(RGB1)),
+            ("w_ascii", TagFile { types: &[(TAG_IMAGE_WIDTH, TYPE_ASCII)], ..s }, None),
+            ("h_rational", TagFile { types: &[(TAG_IMAGE_LENGTH, TYPE_RATIONAL)], ..s }, None),
+            ("bps_double", TagFile { types: &[(TAG_BITS_PER_SAMPLE, TYPE_DOUBLE)], ..s }, None),
+            ("sf_float", TagFile { bits: 16, format: 2, types: &[(TAG_SAMPLE_FORMAT, TYPE_FLOAT)], ..s }, None),
+            ("w_negative", TagFile { types: &[(TAG_IMAGE_WIDTH, TYPE_SLONG)], values: &[(TAG_IMAGE_WIDTH, &[-4])], ..s }, None),
+            ("sf_negative", TagFile { bits: 16, types: &[(TAG_SAMPLE_FORMAT, TYPE_SSHORT)], values: &[(TAG_SAMPLE_FORMAT, &[-2])], ..s }, None),
+            ("offs_negative", TagFile { types: &[(TAG_STRIP_OFFSETS, TYPE_SLONG)], values: &[(TAG_STRIP_OFFSETS, &[8, -12, 16])], ..s }, None),
+            ("bps_over_short", TagFile { types: &[(TAG_BITS_PER_SAMPLE, TYPE_LONG)], values: &[(TAG_BITS_PER_SAMPLE, &[65544])], ..s }, None),
+            ("pc_over_short", TagFile { types: &[(TAG_PLANAR_CONFIG, TYPE_LONG)], values: &[(TAG_PLANAR_CONFIG, &[65537])], ..s }, None),
+            ("w_two", TagFile { values: &[(TAG_IMAGE_WIDTH, &[4, 4])], ..s }, None),
+                        ("spp_two", TagFile { values: &[(TAG_SAMPLES_PER_PIXEL, &[1, 1])], ..s }, None),
+            ("spp0", TagFile { values: &[(TAG_SAMPLES_PER_PIXEL, &[0])], ..s }, None),
+            ("bps_one_rgb", TagFile { values: &[(TAG_BITS_PER_SAMPLE, &[8])], ..rgb }, Some(RGB1)),
+            ("bps_two_rgb", TagFile { values: &[(TAG_BITS_PER_SAMPLE, &[8, 8])], ..rgb }, None),
+            ("bps_four_rgb", TagFile { values: &[(TAG_BITS_PER_SAMPLE, &[8, 8, 8, 16])], ..rgb }, Some(RGB1)),
+            ("bps_mixed_rgb", TagFile { values: &[(TAG_BITS_PER_SAMPLE, &[8, 8, 16])], ..rgb }, None),
+            ("sf_mixed_rgb", TagFile { values: &[(TAG_SAMPLE_FORMAT, &[1, 1, 2])], ..rgb }, None),
+            ("sf_three_rgb", TagFile { values: &[(TAG_SAMPLE_FORMAT, &[1, 1, 1])], ..rgb }, Some(RGB1)),
+            ("dup_pm", TagFile { extra: &[(TAG_PHOTOMETRIC, TYPE_SHORT, &[2])], ..s }, Some(GRAY)),
+            ("dup_w", TagFile { extra: &[(TAG_IMAGE_WIDTH, TYPE_LONG, &[5])], ..s }, Some(GRAY)),
+            ("dup_sf", TagFile { bits: 16, extra: &[(TAG_SAMPLE_FORMAT, TYPE_SHORT, &[2])], ..s }, Some(GRAY16)),
+        ];
+        let wrong: Vec<_> = cases
+            .iter()
+            .filter_map(|(name, file, c): &(_, _, Option<&str>)| {
+                let read = decode(&file.file(), NDAttributeList::new(), &NDArrayPool::new(0))
+                    .map(|a| c_read(&a));
+                (read.as_deref().ok() != *c).then(|| format!("{name}: {read:?}"))
             })
             .collect();
         assert!(wrong.is_empty(), "{wrong:#?}");

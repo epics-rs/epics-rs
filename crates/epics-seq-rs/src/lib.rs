@@ -5,9 +5,7 @@
 //! cpp and snc-rs on it and writes `$OUT_DIR/<stem>.rs`, named after the
 //! `.st` file as snc names its `.c`. A hand-written companion module
 //! includes that file with [`include_program!`] and supplies what the
-//! program's escaped C supplied in C. The same `build.rs` emits the
-//! crate's name → program table from its `src/snl/*.st` glob, so a
-//! `seq_runner.rs` name list is never edited by hand.
+//! program's escaped C supplied in C.
 //!
 //! # Execution
 //!
@@ -174,7 +172,7 @@
 //! companion holds one program, because each program defines its own
 //! `mod seqg`.
 //!
-//! None of the 16 `.st` programs moving onto this crate uses an SNL
+//! None of the 16 `.st` programs that run on this crate uses an SNL
 //! `struct`, a function definition, or escaped C inside a struct, so
 //! snc-rs refuses those with an error naming the line.
 //!
@@ -210,16 +208,13 @@
 //! `seq_ca.c`, and a program waits for its pvs to connect just as C's
 //! does.
 //!
-//! `SeqMacros` (`seq_mac.c`) is this crate's own. These parts of
-//! `epics_base_rs::server::snl` move into this crate in stage 2: the `seq`
-//! banner and thread naming, and the PINI gate of `spawn_program`. The
-//! gate is still needed. An in-process channel
-//! connects at once, whereas C's channel to its own IOC connects only
-//! once rsrv is up, after the PINI pass. So `seq` holds the program's
-//! first state until the pass is done. `PutQueue`, `StateSet`, `SeqPv` and the
-//! three-variant `PvStat` stay in base until the hand-written ports in
-//! std-rs, optics-rs and sscan-rs move to compiled `.st` files. They are
-//! then deleted, not kept as a second model.
+//! `SeqMacros` (`seq_mac.c`), the `seq` banner, thread naming and the PINI
+//! gate that `epics_base_rs::server::snl::spawn_program` gave the
+//! hand-written ports are this crate's own. The gate is needed because an
+//! in-process channel connects at once, whereas C's channel to its own IOC
+//! connects only once rsrv is up, after the PINI pass. So `seq` holds the
+//! program's first state until the pass is done. No program in this
+//! workspace runs on `server::snl` any more.
 //!
 //! # Locks
 //!
@@ -250,16 +245,15 @@
 //! one, as C's connection handler holds `sp->lock` across
 //! `pvVarMonitorOn`.
 //!
-//! # Stage 2
+//! # Modules
 //!
-//! Every `todo!()` body belongs to a stage-2 panel, one module per C file:
-//! `seq.rs` `seq_main.c`, `task.rs` `seq_task.c`, `ca.rs` `seq_ca.c`,
-//! `state_set.rs` `seq_if.c`, `queue.rs` `seq_queue.c`, `mac.rs`
-//! `seq_mac.c`, `prog.rs` `seq_prog.c`, `cmd.rs` `seq_cmd.c`, `qry.rs`
-//! `seq_qry.c`, `pv.rs` `pvCa.c`, plus [`ChanCell`]'s value transfer and
-//! the `printf` family in [`c`]. A null `%s` prints `(null)`, as glibc
-//! does. What one module calls in another is public and reached through
-//! [`pvt`]. Signatures change only through this contract.
+//! One module per C file: `seq.rs` `seq_main.c`, `task.rs` `seq_task.c`,
+//! `ca.rs` `seq_ca.c`, `state_set.rs` `seq_if.c`, `queue.rs`
+//! `seq_queue.c`, `mac.rs` `seq_mac.c`, `prog.rs` `seq_prog.c`, `cmd.rs`
+//! `seq_cmd.c`, `qry.rs` `seq_qry.c`, `pv.rs` `pvCa.c`. [`ChanCell`]
+//! carries the value transfer and [`c`] the `printf` family, where a null
+//! `%s` prints `(null)`, as glibc does. What one module calls in another
+//! is public and reached through [`pvt`].
 
 pub mod c;
 mod ca;

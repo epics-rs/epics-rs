@@ -3017,6 +3017,8 @@ mod tests {
             ("pc_byte", TagFile { separate: true, types: &[(TAG_PLANAR_CONFIG, TYPE_BYTE)], ..rgb }, Some(RGB3)),
             ("offs_byte", TagFile { types: &[(TAG_STRIP_OFFSETS, TYPE_BYTE)], ..s }, Some(GRAY)),
             ("offs_long8", TagFile { types: &[(TAG_STRIP_OFFSETS, TYPE_LONG8)], ..s }, Some(GRAY)),
+            ("offs_long8_max", TagFile { types: &[(TAG_STRIP_OFFSETS, TYPE_LONG8)], values: &[(TAG_STRIP_OFFSETS, &[8, 12, -1])], ..s }, None),
+            ("counts_long8_max", TagFile { types: &[(TAG_STRIP_BYTE_COUNTS, TYPE_LONG8)], values: &[(TAG_STRIP_BYTE_COUNTS, &[4, 4, -1])], ..s }, None),
             ("counts_sbyte", TagFile { types: &[(TAG_STRIP_BYTE_COUNTS, TYPE_SBYTE)], ..s }, Some(GRAY)),
             ("counts_slong8", TagFile { types: &[(TAG_STRIP_BYTE_COUNTS, TYPE_SLONG8)], ..s }, Some(GRAY)),
             ("bps_sbyte_rgb", TagFile { types: &[(TAG_BITS_PER_SAMPLE, TYPE_SBYTE)], ..rgb }, Some(RGB1)),

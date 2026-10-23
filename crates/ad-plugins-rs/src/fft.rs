@@ -10,6 +10,8 @@ use parking_lot::Mutex;
 use rustfft::num_complex::Complex;
 use rustfft::{Fft, FftPlanner};
 
+use crate::par_util;
+
 /// FFT direction (forward or inverse transform).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FFTDirection {
@@ -103,14 +105,62 @@ impl Plan {
         Self { fft, scratch }
     }
 
-    fn len(&self) -> usize {
-        self.fft.len()
-    }
-
-    /// Transform every chunk of [`Plan::len`] elements of `buf` in place.
+    /// Transform every chunk of `fft.len()` elements of `buf` in place.
     fn run(&mut self, buf: &mut [Complex<f64>]) {
         self.fft.process_with_scratch(buf, &mut self.scratch);
     }
+}
+
+/// The pool jobs a transform over `elements` values may run as: 1, in order
+/// on this thread, unless [`par_util::should_parallelize`] sends it to the
+/// shared pool.
+fn jobs_for(elements: usize) -> usize {
+    if par_util::should_parallelize(elements) {
+        #[cfg(feature = "parallel")]
+        return par_util::thread_pool().current_num_threads();
+    }
+    1
+}
+
+/// `f(state, i, chunk)` for chunk `i` of the `len`-element chunks of `out`:
+/// in order with one `state` when `jobs` is 1, else on the shared pool with
+/// a `state` from `init` per pool job. A chunk's result is the same
+/// whichever job computes it, so the output does not depend on `jobs`.
+fn for_each_chunk<T: Send, S>(
+    out: &mut [T],
+    len: usize,
+    jobs: usize,
+    init: impl Fn() -> S + Sync + Send,
+    f: impl Fn(&mut S, usize, &mut [T]) + Sync + Send,
+) {
+    if jobs > 1 {
+        #[cfg(feature = "parallel")]
+        return par_util::thread_pool().install(|| {
+            use rayon::prelude::*;
+            out.par_chunks_mut(len)
+                .enumerate()
+                .for_each_init(&init, |s, (i, c)| f(s, i, c));
+        });
+    }
+    let mut s = init();
+    for (i, c) in out.chunks_mut(len).enumerate() {
+        f(&mut s, i, c);
+    }
+}
+
+/// `n` complex zeros, written by the pool when `jobs` is above 1. A fresh
+/// buffer pays its page faults on first touch, which on one thread cost
+/// more than the transforms the pool runs over it.
+fn zeroed(n: usize, jobs: usize) -> Vec<Complex<f64>> {
+    let zero = Complex::new(0.0, 0.0);
+    if jobs > 1 {
+        #[cfg(feature = "parallel")]
+        return par_util::thread_pool().install(|| {
+            use rayon::prelude::*;
+            (0..n).into_par_iter().map(|_| zero).collect()
+        });
+    }
+    vec![zero; n]
 }
 
 /// Row `row` of the `width`-wide samples as complex values, zero-extended
@@ -163,23 +213,50 @@ fn magnitudes_into(out: &mut [f64], bins: &[Complex<f64>], n: f64) {
 /// The column transforms of the row-major `w`-wide complex array `data`,
 /// `COLS` columns at a time so every row is read and written in runs of
 /// adjacent elements instead of one element per row per column.
-fn fft_columns(plan: &mut Plan, data: &mut [Complex<f64>], w: usize) {
+///
+/// A block's columns are strided through every row, so blocks cannot be
+/// handed out as disjoint slices of `data`. Each wave of up to `jobs` blocks
+/// is gathered and transformed into a buffer per block, then every row takes
+/// the wave's columns back: one job per block, then one job per row.
+fn fft_columns(fft: &Arc<dyn Fft<f64>>, data: &mut [Complex<f64>], w: usize, jobs: usize) {
     const COLS: usize = 8;
-    let h = plan.len();
-    let mut cols = vec![Complex::new(0.0, 0.0); COLS * h];
-    for c0 in (0..w).step_by(COLS) {
-        let nc = COLS.min(w - c0);
-        for (row, r) in data.chunks_exact(w).enumerate() {
-            for (k, &v) in r[c0..c0 + nc].iter().enumerate() {
-                cols[k * h + row] = v;
-            }
-        }
-        plan.run(&mut cols[..nc * h]);
-        for (row, r) in data.chunks_exact_mut(w).enumerate() {
-            for (k, v) in r[c0..c0 + nc].iter_mut().enumerate() {
-                *v = cols[k * h + row];
-            }
-        }
+    let h = fft.len();
+    let blocks = w.div_ceil(COLS);
+    let wave = jobs.min(blocks);
+    // Column `j` of a wave, counted from its first, sits at `j * h`.
+    let mut cols = zeroed(wave * COLS * h, jobs);
+    for b0 in (0..blocks).step_by(wave) {
+        let c0 = b0 * COLS;
+        let c1 = w.min(c0 + wave * COLS);
+        let src = &*data;
+        for_each_chunk(
+            &mut cols[..(c1 - c0) * h],
+            COLS * h,
+            jobs,
+            || Plan::new(fft.clone()),
+            |plan, i, cols| {
+                let c0 = c0 + i * COLS;
+                let nc = cols.len() / h;
+                for (row, r) in src.chunks_exact(w).enumerate() {
+                    for (k, &v) in r[c0..c0 + nc].iter().enumerate() {
+                        cols[k * h + row] = v;
+                    }
+                }
+                plan.run(cols);
+            },
+        );
+        let cols = &cols;
+        for_each_chunk(
+            data,
+            w,
+            jobs,
+            || (),
+            |(), row, r| {
+                for (j, v) in r[c0..c1].iter_mut().enumerate() {
+                    *v = cols[j * h + row];
+                }
+            },
+        );
     }
 }
 
@@ -191,13 +268,21 @@ fn fft_columns(plan: &mut Plan, data: &mut [Complex<f64>], w: usize) {
 pub fn fft_1d_rows(src: &NDArray, suppress_dc: bool) -> Option<NDArray> {
     let mut planner = FftPlanner::<f64>::new();
     let vals = src.data.to_f64_vec();
-    fft_1d_rows_with(|n| planner.plan_fft_forward(n), src, &vals, suppress_dc)
+    fft_1d_rows_with(
+        |n| planner.plan_fft_forward(n),
+        jobs_for,
+        src,
+        &vals,
+        suppress_dc,
+    )
 }
 
 /// [`fft_1d_rows`] on `vals`, the samples of `src` as `f64`, with the
-/// forward plan for the padded width from `plan`.
+/// forward plan for the padded width from `plan` and the pool jobs for a
+/// transform over a given number of values from `jobs`.
 fn fft_1d_rows_with(
     plan: impl FnOnce(usize) -> Arc<dyn Fft<f64>>,
+    jobs: fn(usize) -> usize,
     src: &NDArray,
     vals: &[f64],
     suppress_dc: bool,
@@ -225,7 +310,7 @@ fn fft_1d_rows_with(
     if n_freq == 0 {
         return None;
     }
-    let mut plan = Plan::new(plan(padded));
+    let fft = plan(padded);
 
     let dims = if height > 1 {
         vec![NDDimension::new(n_freq), NDDimension::new(height)]
@@ -235,32 +320,44 @@ fn fft_1d_rows_with(
     let mut arr = float64_spectrum(dims);
     let magnitudes = f64_slice(&mut arr);
 
-    // The rows are real, so each transform carries two of them.
-    let mut row_buf = vec![Complex::new(0.0, 0.0); padded];
-    let mut a_bins = vec![Complex::new(0.0, 0.0); n_freq];
-    let mut b_bins = vec![Complex::new(0.0, 0.0); n_freq];
-    let mut pairs = magnitudes.chunks_exact_mut(2 * n_freq);
-    for (pair, mags) in (&mut pairs).enumerate() {
-        load_row_pair(&mut row_buf, vals, 2 * pair, width);
-        plan.run(&mut row_buf);
-        unpack_pair(&row_buf, &mut a_bins, &mut b_bins);
-        let (ma, mb) = mags.split_at_mut(n_freq);
-        magnitudes_into(ma, &a_bins, padded as f64);
-        magnitudes_into(mb, &b_bins, padded as f64);
-        if suppress_dc {
-            ma[0] = 0.0;
-            mb[0] = 0.0;
-        }
-    }
-    let last = pairs.into_remainder();
-    if !last.is_empty() {
-        load_row(&mut row_buf, vals, height - 1, width);
-        plan.run(&mut row_buf);
-        magnitudes_into(last, &row_buf[..n_freq], padded as f64);
-        if suppress_dc {
-            last[0] = 0.0;
-        }
-    }
+    // The rows are real, so each transform carries two of them; an odd
+    // height leaves the last chunk one row.
+    let zero = Complex::new(0.0, 0.0);
+    for_each_chunk(
+        magnitudes,
+        2 * n_freq,
+        jobs(height * padded),
+        || {
+            let plan = Plan::new(fft.clone());
+            (
+                plan,
+                vec![zero; padded],
+                vec![zero; n_freq],
+                vec![zero; n_freq],
+            )
+        },
+        |(plan, row_buf, a_bins, b_bins), pair, mags| {
+            if mags.len() == n_freq {
+                load_row(row_buf, vals, height - 1, width);
+                plan.run(row_buf);
+                magnitudes_into(mags, &row_buf[..n_freq], padded as f64);
+                if suppress_dc {
+                    mags[0] = 0.0;
+                }
+                return;
+            }
+            load_row_pair(row_buf, vals, 2 * pair, width);
+            plan.run(row_buf);
+            unpack_pair(row_buf, a_bins, b_bins);
+            let (ma, mb) = mags.split_at_mut(n_freq);
+            magnitudes_into(ma, a_bins, padded as f64);
+            magnitudes_into(mb, b_bins, padded as f64);
+            if suppress_dc {
+                ma[0] = 0.0;
+                mb[0] = 0.0;
+            }
+        },
+    );
 
     Some(arr)
 }
@@ -269,13 +366,21 @@ fn fft_1d_rows_with(
 pub fn fft_2d(src: &NDArray, suppress_dc: bool) -> Option<NDArray> {
     let mut planner = FftPlanner::<f64>::new();
     let vals = src.data.to_f64_vec();
-    fft_2d_with(|n| planner.plan_fft_forward(n), src, &vals, suppress_dc)
+    fft_2d_with(
+        |n| planner.plan_fft_forward(n),
+        jobs_for,
+        src,
+        &vals,
+        suppress_dc,
+    )
 }
 
 /// [`fft_2d`] on `vals`, the samples of `src` as `f64`, with the forward
-/// plans for the padded width and height from `plan`.
+/// plans for the padded width and height from `plan` and the pool jobs as
+/// [`fft_1d_rows_with`] takes them.
 fn fft_2d_with(
     mut plan: impl FnMut(usize) -> Arc<dyn Fft<f64>>,
+    jobs: fn(usize) -> usize,
     src: &NDArray,
     vals: &[f64],
     suppress_dc: bool,
@@ -302,29 +407,35 @@ fn fft_2d_with(
         return None;
     }
 
-    let mut rows = Plan::new(plan(w));
-    let mut cols = Plan::new(plan(h));
+    let rows = plan(w);
+    let cols = plan(h);
 
     // The rows are real, so each row transform carries two of them, and
     // only bins below nFreqX reach the output, so the column transforms run
     // over those bins alone: `data` is nFreqX wide and h tall, its padding
     // rows zero as the transform of zeros.
-    let mut data = vec![Complex::new(0.0, 0.0); n_freq_x * h];
-    let mut row_buf = vec![Complex::new(0.0, 0.0); w];
-    let mut pairs = data[..src_h * n_freq_x].chunks_exact_mut(2 * n_freq_x);
-    for (pair, bins) in (&mut pairs).enumerate() {
-        load_row_pair(&mut row_buf, vals, 2 * pair, src_w);
-        rows.run(&mut row_buf);
-        let (a, b) = bins.split_at_mut(n_freq_x);
-        unpack_pair(&row_buf, a, b);
-    }
-    let last = pairs.into_remainder();
-    if !last.is_empty() {
-        load_row(&mut row_buf, vals, src_h - 1, src_w);
-        rows.run(&mut row_buf);
-        last.copy_from_slice(&row_buf[..n_freq_x]);
-    }
-    fft_columns(&mut cols, &mut data, n_freq_x);
+    let zero = Complex::new(0.0, 0.0);
+    let col_jobs = jobs(n_freq_x * h);
+    let mut data = zeroed(n_freq_x * h, col_jobs);
+    for_each_chunk(
+        &mut data[..src_h * n_freq_x],
+        2 * n_freq_x,
+        jobs(src_h * w),
+        || (Plan::new(rows.clone()), vec![zero; w]),
+        |(plan, row_buf), pair, bins| {
+            if bins.len() == n_freq_x {
+                load_row(row_buf, vals, src_h - 1, src_w);
+                plan.run(row_buf);
+                bins.copy_from_slice(&row_buf[..n_freq_x]);
+                return;
+            }
+            load_row_pair(row_buf, vals, 2 * pair, src_w);
+            plan.run(row_buf);
+            let (a, b) = bins.split_at_mut(n_freq_x);
+            unpack_pair(row_buf, a, b);
+        },
+    );
+    fft_columns(&cols, &mut data, n_freq_x, col_jobs);
 
     let dims = vec![NDDimension::new(n_freq_x), NDDimension::new(n_freq_y)];
     let mut arr = float64_spectrum(dims);
@@ -552,11 +663,11 @@ impl FFTFrame<'_> {
 
         match (src.dims.len(), self.config.direction) {
             (1, FFTDirection::Forward) => {
-                fft_1d_rows_with(|n| self.plan_forward(n), src, vals, suppress_dc)
+                fft_1d_rows_with(|n| self.plan_forward(n), jobs_for, src, vals, suppress_dc)
             }
             (1, FFTDirection::Inverse) => self.compute_fft_1d_rows_inverse(src, vals, suppress_dc),
             (2, FFTDirection::Forward) => {
-                fft_2d_with(|n| self.plan_forward(n), src, vals, suppress_dc)
+                fft_2d_with(|n| self.plan_forward(n), jobs_for, src, vals, suppress_dc)
             }
             (2, FFTDirection::Inverse) => self.compute_fft_2d_inverse(src, vals, suppress_dc),
             _ => None,
@@ -699,7 +810,7 @@ impl FFTFrame<'_> {
         }
 
         let mut rows = Plan::new(self.plan_inverse(w));
-        let mut cols = Plan::new(self.plan_inverse(h));
+        let cols = self.plan_inverse(h);
         let scale = 1.0 / (w * h) as f64;
 
         let mut data = vec![Complex::new(0.0, 0.0); w * h];
@@ -711,7 +822,7 @@ impl FFTFrame<'_> {
             data[0] = Complex::new(0.0, 0.0);
         }
 
-        fft_columns(&mut cols, &mut data, w);
+        fft_columns(&cols, &mut data, w, jobs_for(w * h));
         rows.run(&mut data);
 
         // Inverse transform yields signed real samples: keep the real part.
@@ -1017,6 +1128,90 @@ mod tests {
         for (g, e) in got_2d.iter().zip(&want_2d) {
             assert!((g - e).abs() <= 1e-12 * e.abs().max(1.0), "2d {g} vs {e}");
         }
+    }
+
+    fn serial(_: usize) -> usize {
+        1
+    }
+
+    fn three(_: usize) -> usize {
+        3
+    }
+
+    fn f64_bits(arr: Option<NDArray>) -> Vec<u64> {
+        match &arr.unwrap().data {
+            NDDataBuffer::F64(v) => v.iter().map(|x| x.to_bits()).collect(),
+            _ => unreachable!(),
+        }
+    }
+
+    /// The pool cuts the rows into pair chunks and the columns into waves of
+    /// blocks; each runs the serial arithmetic, so the spectrum is the serial
+    /// one bit for bit. Odd and even heights, non-power-of-two widths, and
+    /// `jobs_for`, which takes the 100-wide frames to the whole pool.
+    #[test]
+    fn pooled_transforms_are_bit_identical_to_serial() {
+        let mut planner = FftPlanner::<f64>::new();
+        for (w, h) in [(37, 1), (5, 3), (13, 7), (200, 2), (100, 64), (100, 65)] {
+            let vals: Vec<f64> = (0..w * h)
+                .map(|i| ((i * 7919) % 251) as f64 - 120.0)
+                .collect();
+            let dims = if h > 1 { vec![w, h] } else { vec![w] };
+            let arr = NDArray::with_data(
+                dims.into_iter().map(NDDimension::new).collect(),
+                NDDataBuffer::F64(vals.clone()),
+            );
+            for suppress_dc in [false, true] {
+                let mut rows_1d = |jobs: fn(usize) -> usize| {
+                    f64_bits(fft_1d_rows_with(
+                        |n| planner.plan_fft_forward(n),
+                        jobs,
+                        &arr,
+                        &vals,
+                        suppress_dc,
+                    ))
+                };
+                let want = rows_1d(serial);
+                assert_eq!(rows_1d(three), want, "1d {w}x{h}");
+                assert_eq!(rows_1d(jobs_for), want, "1d {w}x{h}");
+                if h == 1 {
+                    continue;
+                }
+                let mut fft_2d = |jobs: fn(usize) -> usize| {
+                    f64_bits(fft_2d_with(
+                        |n| planner.plan_fft_forward(n),
+                        jobs,
+                        &arr,
+                        &vals,
+                        suppress_dc,
+                    ))
+                };
+                let want = fft_2d(serial);
+                assert_eq!(fft_2d(three), want, "2d {w}x{h}");
+                assert_eq!(fft_2d(jobs_for), want, "2d {w}x{h}");
+            }
+        }
+    }
+
+    /// The inverse runs `fft_columns` over the full, unpadded width: a last
+    /// block of 5 columns, alone in a wave of 2 and in a wave of 3 blocks.
+    #[test]
+    fn pooled_columns_are_bit_identical_to_serial() {
+        let (w, h) = (21, 6);
+        let fft = FftPlanner::<f64>::new().plan_fft_inverse(h);
+        let data: Vec<Complex<f64>> = (0..w * h)
+            .map(|i| Complex::new(((i * 7919) % 251) as f64, ((i * 104729) % 97) as f64))
+            .collect();
+        let columns = |jobs| {
+            let mut d = data.clone();
+            fft_columns(&fft, &mut d, w, jobs);
+            d.iter()
+                .map(|c| (c.re.to_bits(), c.im.to_bits()))
+                .collect::<Vec<_>>()
+        };
+        let want = columns(1);
+        assert_eq!(columns(2), want);
+        assert_eq!(columns(3), want);
     }
 
     fn pool() -> Arc<NDArrayPool> {

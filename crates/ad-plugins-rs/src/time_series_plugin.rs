@@ -29,6 +29,7 @@
 //! array per signal at `addr == signal` (NDPluginTimeSeries.cpp:341-385).
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDataType, NDDimension};
@@ -187,6 +188,12 @@ pub struct TimeSeriesProcessor {
     /// uniqueId they take happen only while it is set (C :341-385).
     array_callbacks: ArrayCallbacks,
     attributes: Option<PluginAttributes>,
+    /// Set by the first frame, before its axis post: TS_TIME_AXIS holds state
+    /// from then on. C posts the axis next only on a size, type or setting
+    /// change (:417-422), so a first frame that beat `interruptAccept` left
+    /// every record without it; an axis from a write before any frame stays
+    /// C's, which a closed gate drops for good.
+    framed: Arc<AtomicBool>,
 }
 
 /// C `getAttributes(pArray->pAttributeList)` on every post
@@ -261,6 +268,7 @@ impl TimeSeriesProcessor {
             state: Mutex::new(TimeSeriesState::new(max_signals)),
             array_callbacks: ArrayCallbacks::new(true),
             attributes: None,
+            framed: Arc::default(),
         }
     }
 }
@@ -704,6 +712,7 @@ impl NDPluginProcess for TimeSeriesProcessor {
             state.data_type = dtype;
             state.num_signals_in = num_signals_in as i64;
             state.num_signals = num_signals_in.min(state.max_signals);
+            self.framed.store(true, Ordering::Release);
             updates.extend(state.allocate_arrays());
         }
 
@@ -726,19 +735,6 @@ impl NDPluginProcess for TimeSeriesProcessor {
         let mut result = ProcessResult::sink(coalesce_updates(updates));
         result.addressed = posts;
         result
-    }
-
-    /// The axis the first frame posted (:422), again: C posts it next only
-    /// on a size, type or setting change, so a first frame that beat
-    /// `interruptAccept` left every record without it. C loses it the same
-    /// way when its first frame wins that race; that C bug is not copied.
-    /// Before any frame, nothing, as C's constructor axis (:160).
-    fn edge_posts(&self) -> Vec<ParamUpdate> {
-        let state = self.state.lock();
-        if state.num_signals_in < 0 {
-            return Vec::new();
-        }
-        state.create_axis_array()
     }
 
     fn bind_array_callbacks(&mut self, array_callbacks: ArrayCallbacks) {
@@ -774,6 +770,11 @@ impl NDPluginProcess for TimeSeriesProcessor {
         state.p.ts_elapsed_time = base.create_param("TS_ELAPSED_TIME", ParamType::Float64)?;
         state.p.ts_acquire_mode = base.create_param("TS_ACQUIRE_MODE", ParamType::Int32)?;
         state.p.ts_time_axis = base.create_param("TS_TIME_AXIS", ParamType::Float64Array)?;
+        let framed = self.framed.clone();
+        base.set_state_array_rule(
+            state.p.ts_time_axis,
+            Arc::new(move || framed.load(Ordering::Acquire)),
+        );
         state.p.ts_timestamp = base.create_param("TS_TIMESTAMP", ParamType::Float64Array)?;
         // Per-signal parameter (NDPluginTimeSeries.cpp:82); read at addr == signal.
         state.p.ts_time_series = base.create_param("TS_TIME_SERIES", ParamType::Float64Array)?;

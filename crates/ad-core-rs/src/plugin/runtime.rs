@@ -13,13 +13,14 @@
 //! value is written back, so the PV is honest about the accepted value rather
 //! than silently inert.
 
-// RTEMS-EXEC-MODEL-ALLOW(12): checked, not waived — all 12 ran and passed
+// RTEMS-EXEC-MODEL-ALLOW(13): checked, not waived — all 13 ran and passed
 // on the exec backend (measured on this tree:
 // `EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p ad-core-rs
-// --all-features`, 517/517). ad-core-rs became a census subject when its
+// --all-features`, 552/552). ad-core-rs became a census subject when its
 // `build.rs` began deriving `tokio_backend`; nothing here builds a CA
 // server, and the reactor these obtain comes from `#[tokio::test]`
-// itself, which the backend does not remove.
+// itself or, in `std_array_posts`, a current-thread runtime the test
+// builds, neither of which the backend removes.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -1169,6 +1170,7 @@ impl<P: NDPluginProcess> ValidateWrite for P {
         NDPluginProcess::posts_before_write(self, reason, value)
     }
     fn edge_posts(&self) -> Vec<ParamUpdate> {
+        #[allow(deprecated)]
         NDPluginProcess::edge_posts(self)
     }
 }
@@ -1344,8 +1346,10 @@ pub trait NDPluginProcess: Send + Sync + 'static {
     }
 
     /// The arrays posted again when the port's interrupts open
-    /// ([`PortDriver::interrupts_opened`]): an axis C builds from a frame,
-    /// which every record dropped if that frame came before the gate.
+    /// ([`PortDriver::interrupts_opened`]).
+    #[deprecated(
+        note = "mark the reason with `PortDriverBase::set_state_array_rule`; removed in 0.33"
+    )]
     fn edge_posts(&self) -> Vec<ParamUpdate> {
         Vec::new()
     }
@@ -1567,7 +1571,7 @@ struct SharedProcessorInner {
     prev_input_array: Option<PublishedArray>,
     /// Previous array dimensions, for firing an NDDimensions int32-array
     /// callback when dimensions change (C++ `dimsPrev_`, G8).
-    dims_prev: DimsPrev,
+    dims_prev: Vec<i32>,
     /// Source address selected via the NDArrayAddr PV (C++ `NDArrayAddr`, G6).
     nd_array_addr: i32,
     /// NumThreads as the port's write path accepted it.
@@ -1668,9 +1672,8 @@ impl SharedProcessorInner {
         {
             *slot = d.size as i32;
         }
-        let mut dims_prev = self.dims_prev.lock();
-        (cur_dims != *dims_prev).then(|| {
-            *dims_prev = cur_dims.clone();
+        (cur_dims != self.dims_prev).then(|| {
+            self.dims_prev = cur_dims.clone();
             asyn_rs::request::ParamSetValue::array(
                 self.ndarray_params.array_dimensions,
                 0,
@@ -2307,10 +2310,6 @@ pub const ASYN_MULTIDEVICE: PortFlags = PortFlags {
     ..ASYN_NONE
 };
 
-/// C `dimsPrev_`: written by the data side, read by the port at the
-/// interrupt edge.
-type DimsPrev = Arc<parking_lot::Mutex<Vec<i32>>>;
-
 /// PortDriver implementation for a plugin's control plane.
 #[allow(dead_code)]
 pub struct PluginPortDriver {
@@ -2345,9 +2344,6 @@ pub struct PluginPortDriver {
     /// A plugin built with blocking callbacks has not, so its configure-line
     /// queueSize stands unfloored until it first goes non-blocking.
     callback_threads: bool,
-    /// C `dimsPrev_`, which the frame's dimensions post writes and the
-    /// interrupt edge posts again.
-    dims_prev: DimsPrev,
 }
 
 impl PluginPortDriver {
@@ -2435,6 +2431,10 @@ impl PluginPortDriver {
         if let Some(seed) = processor.array_callbacks_seed() {
             base.set_int32_param(ndarray_params.array_callbacks, 0, seed as i32)?;
         }
+        // NDDimensions posts only when the dims change (NDPluginDriver.cpp:
+        // 245-246), so a first frame before the gate left Dimensions_RBV
+        // empty until they changed.
+        base.set_state_array_rule(ndarray_params.array_dimensions, Arc::new(|| true));
         // Create STD_ARRAY_DATA param for StdArrays plugins (triggers I/O Intr on ArrayData waveform)
         let std_array_data_param = if array_data.is_some() {
             Some(base.create_param("STD_ARRAY_DATA", asyn_rs::param::ParamType::GenericPointer)?)
@@ -2467,11 +2467,6 @@ impl PluginPortDriver {
             owner,
             pool: pool.clone(),
             callback_threads,
-            // NDPluginDriver.cpp:111.
-            dims_prev: Arc::new(parking_lot::Mutex::new(vec![
-                0;
-                crate::ndarray::ND_ARRAY_MAX_DIMS
-            ])),
         };
         Ok((driver, processor, pool))
     }
@@ -2914,18 +2909,7 @@ impl PortDriver for PluginPortDriver {
         &mut self.base
     }
 
-    /// NDDimensions posts only when the dims change (NDPluginDriver.cpp:
-    /// 245-246), so a first frame before the gate left Dimensions_RBV empty
-    /// until they changed. Zeros are the constructor's, never posted.
     fn interrupts_opened(&mut self) {
-        let dims = self.dims_prev.lock().clone();
-        if dims.iter().any(|&d| d != 0) {
-            let _ = self.base.do_callbacks_array(
-                self.ndarray_params.array_dimensions,
-                0,
-                ParamValue::Int32Array(dims.into()),
-            );
-        }
         for post in self.validator.edge_posts() {
             let _ = set_side(&mut self.base, post.into());
         }
@@ -3445,7 +3429,6 @@ pub fn create_plugin_runtime_with_output<P: NDPluginProcess>(
     let ndarray_params = driver.ndarray_params;
     let plugin_params = driver.plugin_params;
     let std_array_data_param = driver.std_array_data_param;
-    let dims_prev = driver.dims_prev.clone();
 
     // Create port runtime (actor thread for param I/O).
     //
@@ -3513,7 +3496,7 @@ pub fn create_plugin_runtime_with_output<P: NDPluginProcess>(
         array_callbacks,
         dropped_arrays: dropped_arrays_counter,
         prev_input_array: None,
-        dims_prev,
+        dims_prev: vec![0i32; crate::ndarray::ND_ARRAY_MAX_DIMS],
         nd_array_addr: source.addr,
         num_threads: PLUGIN_NUM_THREADS,
         threads,
@@ -5136,6 +5119,16 @@ mod tests {
         Vec<String>,
     );
 
+    /// When the port's interrupt edge sweep runs.
+    #[derive(Clone, Copy)]
+    enum Sweep {
+        /// The gate is open from the start.
+        First,
+        /// The gate opens before the frame, its sweep runs after the frame's
+        /// posts.
+        AfterTheFrame,
+    }
+
     /// What one frame of `data` through a StdArrays plugin posts on
     /// STD_ARRAY_DATA: each binding on `bound` records its post's interface
     /// and value, and an observer, which binds nothing, every post's
@@ -5144,7 +5137,9 @@ mod tests {
         port: &str,
         data: crate::ndarray::NDDataBuffer,
         bound: &[asyn_rs::interfaces::InterfaceType],
+        sweep: Sweep,
     ) -> StdArrayPosts {
+        use epics_libcom_rs::runtime::interrupt_accept::{EdgeDone, InterruptGate};
         fn shown(v: &ParamValue) -> String {
             match v {
                 ParamValue::Int8Array(a) => format!("Int8 {a:?}"),
@@ -5171,12 +5166,28 @@ mod tests {
             DEFAULT_PLUGIN_THREADS,
         );
         let port = handle.port_runtime().port_handle().clone();
-        claim
-            .publish(
-                port.clone(),
-                &epics_libcom_rs::runtime::interrupt_accept::InterruptGate::opened(),
-            )
-            .unwrap();
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let (gate, opener) = match sweep {
+            Sweep::First => {
+                let gate = InterruptGate::opened();
+                claim.publish(port.clone(), &gate).unwrap();
+                (gate, None)
+            }
+            Sweep::AfterTheFrame => {
+                let gate = InterruptGate::new();
+                // Runs ahead of the port's own edge callback, the gate open.
+                let held = release.clone();
+                gate.on_open(move || {
+                    held.wait();
+                    EdgeDone::Inline
+                });
+                claim.publish(port.clone(), &gate).unwrap();
+                let opening = gate.clone();
+                let opener = std::thread::spawn(move || opening.set(true));
+                wait_until("the gate to open", || gate.is_open());
+                (gate, Some(opener))
+            }
+        };
         enable_callbacks(&handle);
         let std = port
             .drv_user_create_blocking(&asyn_rs::port::DrvUserRequest::new("STD_ARRAY_DATA", 0))
@@ -5212,6 +5223,17 @@ mod tests {
         params_applied(&handle);
         // The flush is enqueued, not run: a round trip runs behind it.
         port.read_int32_blocking(counter, 0).unwrap();
+        if let Some(opener) = opener {
+            release.wait();
+            opener.join().unwrap();
+            tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap()
+                .block_on(gate.jobs_settled());
+            wait_until("the edge sweep", || {
+                port.interrupts().edge_sweeps().is_clear()
+            });
+        }
         let mut observed = Vec::new();
         loop {
             match observer.try_recv() {
@@ -5249,7 +5271,8 @@ mod tests {
                 "[4294967295.0]",
             ),
         ] {
-            let (posts, observed) = std_array_posts(port, data, &[Int32Array, Float64Array]);
+            let (posts, observed) =
+                std_array_posts(port, data, &[Int32Array, Float64Array], Sweep::First);
             assert_eq!(
                 posts,
                 [
@@ -5270,10 +5293,30 @@ mod tests {
     /// `arrayInterruptCallback` converts only for a node on its list.
     #[test]
     fn a_std_arrays_frame_with_no_bound_interface_posts_nothing() {
-        let (posts, observed) =
-            std_array_posts("STDNONE", crate::ndarray::NDDataBuffer::U8(vec![255]), &[]);
+        let (posts, observed) = std_array_posts(
+            "STDNONE",
+            crate::ndarray::NDDataBuffer::U8(vec![255]),
+            &[],
+            Sweep::First,
+        );
         assert!(posts.is_empty());
         assert_eq!(observed, ["dims"]);
+    }
+
+    /// A frame the open gate delivered before the port's edge sweep ran: the
+    /// sweep posts no dims of its own, whatever the frame left in
+    /// `dimsPrev_`.
+    #[test]
+    fn a_std_arrays_frame_before_the_edge_sweep_is_posted_once() {
+        use asyn_rs::interfaces::InterfaceType::Int32Array;
+        let (posts, observed) = std_array_posts(
+            "STDSWEEP",
+            crate::ndarray::NDDataBuffer::U8(vec![255]),
+            &[Int32Array],
+            Sweep::AfterTheFrame,
+        );
+        assert_eq!(posts, [(Some(Int32Array), "Int32 [255]".to_string())]);
+        assert_eq!(observed, ["dims", "Some(Int32Array)"]);
     }
 
     /// Sets its own STAMP to ten times the frame's id and forwards the frame.

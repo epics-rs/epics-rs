@@ -13,13 +13,18 @@
 use std::sync::{Arc, Barrier, Mutex};
 
 use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDimension};
-use ad_core_rs::plugin::runtime::{DEFAULT_PLUGIN_THREADS, NDPluginProcess, create_plugin_runtime};
+use ad_core_rs::ndarray_pool::NDArrayPool;
+use ad_core_rs::plugin::runtime::{
+    ASYN_NONE, DEFAULT_PLUGIN_THREADS, NDPluginProcess, ParamUpdate, ProcessResult,
+    create_plugin_runtime,
+};
 use ad_core_rs::plugin::wiring::WiringRegistry;
 use ad_plugins_rs::fft::FFTProcessor;
 use ad_plugins_rs::time_series_plugin::TimeSeriesProcessor;
+use asyn_rs::error::AsynResult;
 use asyn_rs::interrupt::InterruptFilter;
-use asyn_rs::param::ParamValue;
-use asyn_rs::port::DrvUserRequest;
+use asyn_rs::param::{ParamType, ParamValue};
+use asyn_rs::port::{DrvUserRequest, InterfaceMask, PortDriverBase, PortFlags};
 use epics_base_rs::runtime::task::test_block_on;
 use epics_libcom_rs::runtime::interrupt_accept::{EdgeDone, InterruptGate};
 
@@ -323,4 +328,43 @@ fn a_frame_before_the_edge_sweep_has_its_dimensions_posted_once() {
     let mut dims = vec![0.0; 10];
     dims[0] = 8.0;
     assert_eq!(posts, [("ARRAY_DIMENSIONS", dims)]);
+}
+
+/// A plugin from outside the tree that still overrides the deprecated
+/// `edge_posts`.
+#[derive(Default)]
+struct EdgePosting {
+    axis: usize,
+}
+
+impl NDPluginProcess for EdgePosting {
+    const ASYN_FLAGS: PortFlags = ASYN_NONE;
+    const INTERFACE_MASK: InterfaceMask = InterfaceMask::FLOAT64_ARRAY;
+    const INTERRUPT_MASK: InterfaceMask = Self::INTERFACE_MASK;
+    fn process_array(&self, _array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
+        ProcessResult::sink(vec![])
+    }
+    fn plugin_type(&self) -> &str {
+        "EdgePosting"
+    }
+    fn register_params(&mut self, base: &mut PortDriverBase) -> AsynResult<()> {
+        self.axis = base.create_param("EDGE_AXIS", ParamType::Float64Array)?;
+        Ok(())
+    }
+    fn edge_posts(&self) -> Vec<ParamUpdate> {
+        vec![ParamUpdate::float64_array(self.axis, vec![1.0, 2.0])]
+    }
+}
+
+/// The edge still posts a plugin's deprecated `edge_posts`, through
+/// `PortDriver::interrupts_opened`, until 0.33 removes both.
+#[test]
+fn the_edge_posts_what_a_plugin_s_deprecated_edge_posts_returns() {
+    let posts = array_posts_a_record_receives(
+        "EDGEPOSTS",
+        EdgePosting::default(),
+        &["EDGE_AXIS"],
+        Frame::None,
+    );
+    assert_eq!(posts, [("EDGE_AXIS", vec![1.0, 2.0])]);
 }

@@ -3016,6 +3016,7 @@ impl PortActor {
                 addr,
                 updates,
                 time_stamp,
+                gate,
             } => {
                 let base = self.driver.base_mut();
                 if let Some(ts) = time_stamp {
@@ -3035,21 +3036,25 @@ impl PortActor {
                 // at all (six joint angles written at addresses 0..6, one
                 // I/O Intr). Request address first, then each further address in
                 // the order the batch first wrote it.
-                let mut lists = vec![*addr];
-                for u in updates {
-                    if let Some(list) = u.list()
-                        && !lists.contains(&list)
-                    {
-                        lists.push(list);
-                    }
-                }
+                //
                 // One list that cannot be flushed must not strand the rest, for
                 // the same reason one bad update does not strand the good ones
                 // above; the first error still reaches whoever waits on the
                 // reply.
-                for list in lists {
+                let mut flush = |list| {
                     if let Err(e) = base.call_param_callbacks(list) {
                         failed.get_or_insert(e);
+                    }
+                };
+                match gate {
+                    // The section is still open: its end sends the gate back.
+                    Some(gate) if gate.park() => {}
+                    Some(gate) => gate.lists().for_each(flush),
+                    None => {
+                        flush(*addr);
+                        crate::request::further_lists(*addr, updates)
+                            .into_iter()
+                            .for_each(flush);
                     }
                 }
                 match failed {
@@ -5950,6 +5955,7 @@ mod tests {
                         0,
                         crate::param::ParamValue::Int32(42),
                     )],
+                    gate: None,
                 },
                 user,
             )
@@ -6039,6 +6045,7 @@ mod tests {
                         )
                     })
                     .collect(),
+                gate: None,
             },
             user,
         )
@@ -6094,6 +6101,7 @@ mod tests {
                         ParamValue::Float64Array(vec![4.0, 5.0].into()),
                     ),
                 ],
+                gate: None,
             },
             user,
         )
@@ -6152,6 +6160,7 @@ mod tests {
                     P::callbacks(1),
                     P::array(wave, 1, ParamValue::Float64Array(vec![3.0].into())),
                 ],
+                gate: None,
             },
             user,
         )
@@ -6197,6 +6206,7 @@ mod tests {
                         crate::param::ParamValue::Int32(n),
                     )],
                     time_stamp,
+                    gate: None,
                 },
                 AsynUser::new(0).with_timeout(Duration::from_secs(1)),
             )
@@ -6253,6 +6263,7 @@ mod tests {
                     addr: 0,
                     updates,
                     time_stamp: None,
+                    gate: None,
                 },
                 user,
             )
@@ -6321,6 +6332,7 @@ mod tests {
                 ParamSetValue::array(wf, 0, ParamValue::Float64Array(vec![1.5].into())),
             ],
             time_stamp: None,
+            gate: None,
         };
         send_and_wait(&tx, batch, user()).unwrap();
         assert_eq!(
@@ -6372,6 +6384,7 @@ mod tests {
                 ParamValue::Float64Array(vec![1.5].into()),
             )],
             time_stamp: None,
+            gate: None,
         };
         send_and_wait(&tx, batch, user).unwrap();
         assert_eq!(
@@ -6424,6 +6437,7 @@ mod tests {
             addr: 0,
             updates: vec![],
             time_stamp: None,
+            gate: None,
         };
         send_and_wait(&tx, flush, user()).unwrap();
         assert_eq!(*seen.lock(), vec![7]);

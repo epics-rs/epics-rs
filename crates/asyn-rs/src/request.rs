@@ -1316,6 +1316,9 @@ pub enum RequestOp {
         /// `beginProcessCallbacks` stamps the port with the frame's epicsTS
         /// (NDPluginDriver.cpp:232); `None` keeps the port's timestamp.
         time_stamp: Option<std::time::SystemTime>,
+        /// `Some`: the callbacks wait for the end of a section of the
+        /// caller's that follows the sets; `None` fires them at once.
+        gate: Option<CallbacksGate>,
     },
     /// C `setIntegerParam`/`setDoubleParam` alone: the values land in the
     /// store and are marked changed, and only a later `CallParamCallbacks`
@@ -1883,8 +1886,94 @@ impl Default for CancelToken {
     }
 }
 
+const SECTION_OPEN: u8 = 0;
+const SECTION_PARKED: u8 = 1;
+const SECTION_ENDED: u8 = 2;
+
+/// The callbacks of a [`RequestOp::CallParamCallbacks`] whose caller runs a
+/// section between the sets and them, as C runs the sets, the section and
+/// `callParamCallbacks` under one lock (NDPluginDriver.cpp:332, :539).
+/// Whichever of the actor (sets done) and the caller (section ended) comes
+/// second fires them, so a section that ends before the actor reaches the
+/// sets costs no further request.
+#[derive(Clone, Debug)]
+pub struct CallbacksGate(Arc<GateInner>);
+
+#[derive(Debug)]
+struct GateInner {
+    state: AtomicU8,
+    addr: i32,
+    /// Each further list the sets wrote, in the order they first wrote it.
+    further: Vec<i32>,
+}
+
+impl CallbacksGate {
+    pub(crate) fn new(addr: i32, updates: &[ParamSetValue]) -> Self {
+        Self(Arc::new(GateInner {
+            state: AtomicU8::new(SECTION_OPEN),
+            addr,
+            further: further_lists(addr, updates),
+        }))
+    }
+
+    pub(crate) fn addr(&self) -> i32 {
+        self.0.addr
+    }
+
+    /// The request's list, then each further one.
+    pub(crate) fn lists(&self) -> impl Iterator<Item = i32> + '_ {
+        std::iter::once(self.0.addr).chain(self.0.further.iter().copied())
+    }
+
+    /// The actor, sets done: `true` while the section is open, which leaves
+    /// the callbacks to its end.
+    pub(crate) fn park(&self) -> bool {
+        self.0
+            .state
+            .compare_exchange(
+                SECTION_OPEN,
+                SECTION_PARKED,
+                AtomicOrdering::AcqRel,
+                AtomicOrdering::Acquire,
+            )
+            .is_ok()
+    }
+
+    /// The caller, section ended: `true` when the actor parked the callbacks,
+    /// which this end then owes. Only the first end can be `true`.
+    pub(crate) fn end(&self) -> bool {
+        self.0.state.swap(SECTION_ENDED, AtomicOrdering::AcqRel) == SECTION_PARKED
+    }
+}
+
+/// Every list `updates` writes besides `addr`, in the order they first write
+/// it: what a bundled set-then-flush owes a flush beyond the request's own.
+pub(crate) fn further_lists(addr: i32, updates: &[ParamSetValue]) -> Vec<i32> {
+    let mut lists = Vec::new();
+    for list in updates.iter().filter_map(ParamSetValue::list) {
+        if list != addr && !lists.contains(&list) {
+            lists.push(list);
+        }
+    }
+    lists
+}
+
 #[cfg(test)]
 mod tests {
+    /// Exactly one of the actor and the caller fires a gate's callbacks: the
+    /// end after a park, the actor after an end.
+    #[test]
+    fn whichever_of_the_actor_and_the_caller_comes_second_fires() {
+        use super::CallbacksGate;
+        let parked = CallbacksGate::new(0, &[]);
+        assert!(parked.park());
+        assert!(parked.end());
+        assert!(!parked.end());
+        let ended = CallbacksGate::new(0, &[]);
+        assert!(!ended.end());
+        assert!(!ended.park());
+    }
+
     /// bab72deef: the entry the actor still holds for a request the timer took
     /// (C unlinks it, asynManager.c:664-674) must not claim the cell's next
     /// request — `begin_running` from `Done` would run that one twice.

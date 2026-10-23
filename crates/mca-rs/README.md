@@ -49,8 +49,8 @@ Each one is a C shape that cannot be reproduced without reproducing its defect:
   C's bare `default: break` and get no region sums, as in C.
 - **The cycle is the record's, the device calls are the driver's.** C calls
   `pdset->send_msg()` from the middle of `process()`. A port record cannot call
-  its device support from `process()`, so the driver's `read()` runs the
-  device half (`run_device_cycle`) against an `McaDset`: the record sends each
+  its device support from `process()`, so device support's `read_begin` runs
+  the device half (`McaRecord::begin_device_cycle`) against an `McaDset`: the record sends each
   message at C's site and decides what each answer and each failure (`NACK`)
   means. C's order is load-bearing and is kept — `ACQG` is forced to 1 when the start
   command goes out, so a device that finishes before the first status read still
@@ -116,7 +116,7 @@ record(mca, "MCA1") {
 cargo nextest run -p mca-rs
 ```
 
-63 tests. The invariants each file pins are in its name: the buffer width is the
+The invariants each test file pins are in its name: the buffer width is the
 capacity, the served spectrum length, `NORD` on a background write, `NMAX` as
 the channel capacity a client sees before acquisition, the `rset` metadata
 reaching the record, the simulation order and its menu carrier, and one
@@ -124,7 +124,7 @@ declaration per record type.
 
 ## Requirements
 
-- Rust 1.94.0 (`rust-toolchain.toml`), edition 2024
+- Rust 1.99.1 (`rust-toolchain.toml`), edition 2024
 
 ## License
 

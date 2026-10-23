@@ -88,7 +88,8 @@ fn pool_output(
 /// earlier frame used, so a frame does not fault in fresh frame-sized pages.
 #[derive(Default)]
 struct Buffers {
-    /// The transform's complex working array.
+    /// The transform's complex working array; after a forward transform it
+    /// starts with the first row's nFreqX bins.
     data: Vec<Complex<f64>>,
     /// The gathered columns of [`fft_columns`].
     cols: Vec<Complex<f64>>,
@@ -246,6 +247,29 @@ fn magnitudes_into(out: &mut [f64], bins: &[Complex<f64>], n: f64) {
     }
 }
 
+/// The waveforms C posts with a forward spectrum, the first row of a 2-D
+/// frame (NDPluginFFT.cpp:223-226): FFTTimeSeries, the input's first row
+/// zero-extended to nTimeX, and FFTReal and FFTImaginary, the transform's
+/// first-row `bins` with DC zeroed under `suppress_dc` (:137-141,
+/// :166-170). The time series is never DC-suppressed.
+fn first_row_waveforms(
+    vals: &[f64],
+    width: usize,
+    bins: &[Complex<f64>],
+    suppress_dc: bool,
+) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+    let mut time_series = vec![0.0; 2 * bins.len()];
+    let row = &vals[..width.min(vals.len())];
+    time_series[..row.len()].copy_from_slice(row);
+    let mut real: Vec<f64> = bins.iter().map(|c| c.re).collect();
+    let mut imag: Vec<f64> = bins.iter().map(|c| c.im).collect();
+    if suppress_dc {
+        real[0] = 0.0;
+        imag[0] = 0.0;
+    }
+    (time_series, real, imag)
+}
+
 /// The column transforms of the row-major `w`-wide complex array `data`,
 /// `COLS` columns at a time so every row is read and written in runs of
 /// adjacent elements instead of one element per row per column.
@@ -325,9 +349,10 @@ pub fn fft_1d_rows(src: &NDArray, suppress_dc: bool) -> Option<NDArray> {
 }
 
 /// [`fft_1d_rows`] on `vals`, the samples of `src` as `f64`, into
-/// `bufs.out`, returning the spectrum's dims. The forward plan for the
-/// padded width comes from `plan` and the pool jobs for a transform over a
-/// given number of values from `jobs`.
+/// `bufs.out`, returning the spectrum's dims; row 0's bins are left in
+/// `bufs.data`. The forward plan for the padded width comes from `plan`
+/// and the pool jobs for a transform over a given number of values from
+/// `jobs`.
 fn fft_1d_rows_with(
     plan: impl FnOnce(usize) -> Arc<dyn Fft<f64>>,
     jobs: fn(usize) -> usize,
@@ -371,8 +396,15 @@ fn fft_1d_rows_with(
     resize(magnitudes, n_freq * height, 0.0, row_jobs);
 
     // The rows are real, so each transform carries two of them; an odd
-    // height leaves the last chunk one row.
+    // height leaves the last chunk one row. The first chunk keeps row 0's
+    // bins, reusing `bufs.data`'s allocation.
     let zero = Complex::new(0.0, 0.0);
+    let first_row = Mutex::new(std::mem::take(&mut bufs.data));
+    let keep_first_row = |bins: &[Complex<f64>]| {
+        let mut first_row = first_row.lock();
+        first_row.clear();
+        first_row.extend_from_slice(bins);
+    };
     for_each_chunk(
         magnitudes,
         2 * n_freq,
@@ -390,6 +422,9 @@ fn fft_1d_rows_with(
             if mags.len() == n_freq {
                 load_row(row_buf, vals, height - 1, width);
                 plan.run(row_buf);
+                if pair == 0 {
+                    keep_first_row(&row_buf[..n_freq]);
+                }
                 magnitudes_into(mags, &row_buf[..n_freq], padded as f64);
                 if suppress_dc {
                     mags[0] = 0.0;
@@ -399,6 +434,9 @@ fn fft_1d_rows_with(
             load_row_pair(row_buf, vals, 2 * pair, width);
             plan.run(row_buf);
             unpack_pair(row_buf, a_bins, b_bins);
+            if pair == 0 {
+                keep_first_row(a_bins);
+            }
             let (ma, mb) = mags.split_at_mut(n_freq);
             magnitudes_into(ma, a_bins, padded as f64);
             magnitudes_into(mb, b_bins, padded as f64);
@@ -408,6 +446,7 @@ fn fft_1d_rows_with(
             }
         },
     );
+    bufs.data = first_row.into_inner();
 
     Some(dims)
 }
@@ -429,7 +468,8 @@ pub fn fft_2d(src: &NDArray, suppress_dc: bool) -> Option<NDArray> {
 }
 
 /// [`fft_2d`] as [`fft_1d_rows_with`] runs [`fft_1d_rows`], with the
-/// forward plans for the padded width and height from `plan`.
+/// forward plans for the padded width and height from `plan`; the first
+/// nFreqY rows of `bufs.data` are the spectrum's bins.
 fn fft_2d_with(
     mut plan: impl FnMut(usize) -> Arc<dyn Fft<f64>>,
     jobs: fn(usize) -> usize,
@@ -845,7 +885,7 @@ impl FFTFrame<'_> {
     /// `bufs.out`, returning the output's dims.
     ///
     /// `vals` is the frame's samples as `f64`, converted once per frame and
-    /// shared with [`FFTFrame::compute_row_spectrum`].
+    /// shared with [`first_row_waveforms`].
     ///
     /// The rank is taken from the input array's dimension count, matching C
     /// `NDPluginFFT::processCallbacks` (NDPluginFFT.cpp:298-315): `ndims==1`
@@ -894,54 +934,6 @@ impl FFTFrame<'_> {
             ),
             _ => None,
         }
-    }
-
-    /// Compute the 1D forward FFT of the first row of `src`, returning the
-    /// extracted time series and the half-spectrum complex values.
-    ///
-    /// This drives the C++ `FFTTimeSeries`/`FFTReal`/`FFTImaginary`/
-    /// `FFTAbsValue` waveform records, which in C++ are 1D arrays over the
-    /// first time axis. Returns `(time_series, real, imag)` where `time_series`
-    /// has `padded` elements (nTimeX) — C posts the zero-extended padded series
-    /// (NDPluginFFT.cpp: timeSeries is the nTimeX-long calloc buffer) — and
-    /// `real`/`imag` have `padded/2` elements (nFreqX). The DC bin is zeroed in
-    /// the two spectral arrays when `suppress_dc` is set (C++ behaviour); the
-    /// time series is never DC-suppressed.
-    fn compute_row_spectrum(
-        &self,
-        src: &NDArray,
-        vals: &[f64],
-        suppress_dc: bool,
-    ) -> Option<(Vec<f64>, Vec<f64>, Vec<f64>)> {
-        if src.dims.is_empty() {
-            return None;
-        }
-        let width = src.dims[0].size;
-        if width == 0 {
-            return None;
-        }
-        let padded = next_pow2(width);
-        let n_freq = padded / 2;
-        if n_freq == 0 {
-            return None;
-        }
-        let mut plan = Plan::new(self.plan_forward(padded));
-
-        // The first row, zero-extended to the padded length nTimeX. C posts the
-        // padded series (calloc'd to nTimeX, the input copied into [0,width)),
-        // so FFTTimeSeries and FFTTimeAxis are nTimeX long, not width long.
-        let mut row_buf = vec![Complex::new(0.0, 0.0); padded];
-        load_row(&mut row_buf, vals, 0, width);
-        let time_series: Vec<f64> = row_buf.iter().map(|c| c.re).collect();
-        plan.run(&mut row_buf);
-
-        let mut real: Vec<f64> = row_buf[..n_freq].iter().map(|c| c.re).collect();
-        let mut imag: Vec<f64> = row_buf[..n_freq].iter().map(|c| c.im).collect();
-        if suppress_dc {
-            real[0] = 0.0;
-            imag[0] = 0.0;
-        }
-        Some((time_series, real, imag))
     }
 
     /// Frequency-axis values for `n_freq` bins (C++ `createAxisArrays`):
@@ -1026,20 +1018,23 @@ impl NDPluginProcess for FFTProcessor {
         // these are the time series and the real/imaginary/abs spectrum
         // (C++ doFFTCallbacks).
         // The inverse transform has no spectrum to publish.
-        if frame.config.direction == FFTDirection::Forward {
-            let suppress_dc = frame.config.suppress_dc;
-            if let Some((time_series, real, imag)) =
-                frame.compute_row_spectrum(array, &scratch.vals, suppress_dc)
-            {
-                if let Some(idx) = self.params.time_series {
-                    updates.push(ParamUpdate::float64_array(idx, time_series));
-                }
-                if let Some(idx) = self.params.real {
-                    updates.push(ParamUpdate::float64_array(idx, real));
-                }
-                if let Some(idx) = self.params.imaginary {
-                    updates.push(ParamUpdate::float64_array(idx, imag));
-                }
+        if frame.config.direction == FFTDirection::Forward
+            && let Some(dims) = &dims
+        {
+            let (time_series, real, imag) = first_row_waveforms(
+                &scratch.vals,
+                array.dims[0].size,
+                &scratch.bufs.data[..dims[0].size],
+                frame.config.suppress_dc,
+            );
+            if let Some(idx) = self.params.time_series {
+                updates.push(ParamUpdate::float64_array(idx, time_series));
+            }
+            if let Some(idx) = self.params.real {
+                updates.push(ParamUpdate::float64_array(idx, real));
+            }
+            if let Some(idx) = self.params.imaginary {
+                updates.push(ParamUpdate::float64_array(idx, imag));
             }
         }
 
@@ -2269,6 +2264,69 @@ mod tests {
         let dims: Vec<usize> = out.dims.iter().map(|d| d.size).collect();
         assert_eq!(dims, [8, 4]);
         assert_eq!(abs, &spectrum[..8]);
+    }
+
+    /// C takes FFTReal and FFTImaginary of a 2-D frame from the first row of
+    /// the 2-D transform (NDPluginFFT.cpp:158-161, :225-226), not from a
+    /// transform of the first input row.
+    #[test]
+    fn real_and_imaginary_are_the_first_row_of_the_2d_transform() {
+        let (w, h) = (13, 6);
+        let vals: Vec<f64> = (0..w * h)
+            .map(|i| ((i * 7919) % 251) as f64 - 120.0)
+            .collect();
+        let (pw, ph) = (next_pow2(w), next_pow2(h));
+        let mut planner = FftPlanner::<f64>::new();
+        let mut data = vec![Complex::new(0.0, 0.0); pw * ph];
+        for (r, row) in data.chunks_exact_mut(pw).take(h).enumerate() {
+            load_row(row, &vals, r, w);
+            planner.plan_fft_forward(pw).process(row);
+        }
+        let col = planner.plan_fft_forward(ph);
+        let want: Vec<Complex<f64>> = (0..pw / 2)
+            .map(|fx| {
+                let mut column: Vec<_> = (0..ph).map(|r| data[r * pw + fx]).collect();
+                col.process(&mut column);
+                column[0]
+            })
+            .collect();
+
+        for suppress_dc in [false, true] {
+            let proc = fft_proc_with_params(FFTConfig {
+                suppress_dc,
+                ..FFTConfig::default()
+            });
+            let arr = NDArray::with_data(
+                vec![NDDimension::new(w), NDDimension::new(h)],
+                NDDataBuffer::F64(vals.clone()),
+            );
+            let u = proc
+                .process_array(&Arc::new(arr), &NDArrayPool::new(0))
+                .param_updates;
+            let real = find_array_update(&u, proc.params.real.unwrap()).unwrap();
+            let imag = find_array_update(&u, proc.params.imaginary.unwrap()).unwrap();
+            assert_eq!((real.len(), imag.len()), (pw / 2, pw / 2));
+            for (k, c) in want.iter().enumerate() {
+                let c = if suppress_dc && k == 0 {
+                    Complex::new(0.0, 0.0)
+                } else {
+                    *c
+                };
+                let tol = 1e-9 * c.norm().max(1.0);
+                assert!(
+                    (real[k] - c.re).abs() <= tol,
+                    "real[{k}] {} vs {}",
+                    real[k],
+                    c.re
+                );
+                assert!(
+                    (imag[k] - c.im).abs() <= tol,
+                    "imag[{k}] {} vs {}",
+                    imag[k],
+                    c.im
+                );
+            }
+        }
     }
 
     #[test]

@@ -310,8 +310,8 @@ macro_rules! pixel_owner {
     ($t:ty, $variant:ident) => {
         impl AsRef<[$t]> for Pixels<$t> {
             fn as_ref(&self) -> &[$t] {
-                match &self.0.data {
-                    NDDataBuffer::$variant(v) => v,
+                match self.0.data.view() {
+                    NDDataView::$variant(v) => v,
                     _ => unreachable!("Pixels<T> is built from the matching NDDataBuffer variant"),
                 }
             }

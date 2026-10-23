@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use ad_core_rs::color::NDColorMode;
 use ad_core_rs::error::ADResult;
-use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDimension};
+use ad_core_rs::ndarray::{NDArray, NDDataView, NDDataViewMut, NDDimension};
 use ad_core_rs::ndarray_pool::NDArrayPool;
 use ad_core_rs::plugin::runtime::{NDPluginProcess, ParamUpdate, ProcessResult};
 use parking_lot::Mutex;
@@ -170,8 +170,8 @@ pub fn apply_transform(
     let mut arr = pool.alloc(dims, src.data.data_type())?;
     macro_rules! same_type {
         ($($variant:ident),*) => {
-            match (&src.data, &mut arr.data) {
-                $((NDDataBuffer::$variant(v), NDDataBuffer::$variant(o)) => {
+            match (src.data.view(), arr.data.view_mut()) {
+                $((NDDataView::$variant(v), NDDataViewMut::$variant(o)) => {
                     geometry.transform_into(v, o)
                 })*
                 _ => unreachable!("the output was allocated in the source type"),
@@ -612,7 +612,7 @@ mod tests {
             clamp
         );
     }
-    use ad_core_rs::ndarray::{NDDataType, NDDataView, NDDataViewMut};
+    use ad_core_rs::ndarray::{NDDataBuffer, NDDataType};
 
     #[test]
     fn test_register_params_seeds_the_processor_transform() {

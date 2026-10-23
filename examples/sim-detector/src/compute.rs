@@ -2,7 +2,7 @@ use rand::Rng;
 use rand::rngs::StdRng;
 use std::f64::consts::PI;
 
-use ad_core_rs::ndarray::NDDataBuffer;
+use ad_core_rs::ndarray::{NDDataBuffer, NDDataViewMut};
 
 use crate::types::{SimMode, SineOperation};
 use ad_core_rs::color_layout::ColorLayout;
@@ -428,12 +428,17 @@ pub fn compute_frame(
 ) {
     macro_rules! typed {
         ($($v:ident),+) => {
-            match (raw, background, ramp_buf, peak_buf) {
+            match (
+                raw.view_mut(),
+                background.view_mut(),
+                ramp_buf.view_mut(),
+                peak_buf.view_mut(),
+            ) {
                 $((
-                    NDDataBuffer::$v(raw),
-                    NDDataBuffer::$v(background),
-                    NDDataBuffer::$v(ramp_buf),
-                    NDDataBuffer::$v(peak_buf),
+                    NDDataViewMut::$v(raw),
+                    NDDataViewMut::$v(background),
+                    NDDataViewMut::$v(ramp_buf),
+                    NDDataViewMut::$v(peak_buf),
                 ) => compute_typed(
                     raw, background, ramp_buf, peak_buf, sine_state, layout, sim_mode, gains,
                     peak, sine, offset, noise, use_background, reset, rng,

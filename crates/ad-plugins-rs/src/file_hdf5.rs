@@ -10193,7 +10193,7 @@ mod tests {
                 let path = temp_path($name);
                 let mut writer = Hdf5Writer::new();
                 let mut arr = NDArray::new(vec![NDDimension::new(4)], $dt);
-                if let NDDataBuffer::$variant(ref mut v) = arr.data {
+                if let NDDataViewMut::$variant(v) = arr.data.view_mut() {
                     let src: Vec<$ty> = $vals;
                     v.copy_from_slice(&src);
                 }
@@ -10207,7 +10207,7 @@ mod tests {
                 let ds = h5.dataset("entry/instrument/detector/data").unwrap();
                 let r = crate::test_util::read_native(&ds, None);
                 assert_eq!(r.data_type(), $dt, "type for {}", $name);
-                if let NDDataBuffer::$variant(ref v) = r {
+                if let NDDataView::$variant(v) = r.view() {
                     let src: Vec<$ty> = $vals;
                     assert_eq!(v, &src, "values for {}", $name);
                 } else {

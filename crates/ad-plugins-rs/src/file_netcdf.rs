@@ -776,10 +776,10 @@ mod tests {
             ($prefix:literal, $t:ty, $variant:ident, $dt:expr, $values:expr) => {{
                 let values: Vec<$t> = $values;
                 let mut arr = NDArray::new(vec![NDDimension::new(values.len())], $dt);
-                arr.data = NDDataBuffer::$variant(values.clone());
+                arr.data = NDDataBuffer::from_slice(&values);
                 let path = write_frames($prefix, NDFileMode::Single, &[arr]);
                 let back = read_back(&path);
-                let NDDataBuffer::$variant(got) = &back.data else {
+                let NDDataView::$variant(got) = back.data.view() else {
                     panic!("{} came back as {:?}", $prefix, back.data.data_type());
                 };
                 assert_eq!(got, &values, "{}", $prefix);

@@ -431,9 +431,9 @@ pub(crate) fn read_native(
     let shape = ds.shape();
     let stored = ds.datatype().unwrap();
     macro_rules! read_as {
-        ($($t:ty => $variant:ident),*) => {
+        ($($t:ty),*) => {
             $(if stored == <$t>::hdf5_type() {
-                return NDDataBuffer::$variant(match frames {
+                return NDDataBuffer::from_vec::<$t>(match frames {
                     Some(n) => {
                         let mut counts = shape.clone();
                         counts[0] = n;
@@ -444,7 +444,6 @@ pub(crate) fn read_native(
             })*
         };
     }
-    read_as!(i8 => I8, u8 => U8, i16 => I16, u16 => U16, i32 => I32, u32 => U32,
-        i64 => I64, u64 => U64, f32 => F32, f64 => F64);
+    read_as!(i8, u8, i16, u16, i32, u32, i64, u64, f32, f64);
     panic!("no NDArray type is stored as {stored:?}")
 }

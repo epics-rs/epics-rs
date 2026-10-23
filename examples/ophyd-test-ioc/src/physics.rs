@@ -145,8 +145,10 @@ pub fn poisson_sample(rng: &mut StdRng, lambda: f64) -> f64 {
     }
 }
 
-/// Generate a 2D moving dot image with configurable parameters.
+/// Generate a 2D moving dot image with configurable parameters into `img`,
+/// row-major `height * width`; every element is written.
 pub fn moving_dot_image_with_config(
+    img: &mut [f64],
     width: usize,
     height: usize,
     mtrx: f64,
@@ -156,15 +158,12 @@ pub fn moving_dot_image_with_config(
     shutter_open: bool,
     rng: &mut StdRng,
     config: &MovingDotImageConfig,
-) -> Vec<f64> {
-    let n = height * width;
-    let mut img = Vec::with_capacity(n);
-
+) {
     if !shutter_open {
-        for _ in 0..n {
-            img.push(poisson_sample(rng, config.background));
+        for v in img.iter_mut() {
+            *v = poisson_sample(rng, config.background);
         }
-        return img;
+        return;
     }
 
     let sigmax = config.sigma_x;
@@ -182,11 +181,9 @@ pub fn moving_dot_image_with_config(
             let gx = (-dx * dx / (2.0 * sigmax * sigmax)).exp();
             let signal = intensity * gx * gy;
             let bg = poisson_sample(rng, config.background);
-            img.push(signal + bg);
+            img[row * width + col] = signal + bg;
         }
     }
-
-    img
 }
 
 /// Generate a 2D moving dot image.
@@ -203,7 +200,9 @@ pub fn moving_dot_image(
     shutter_open: bool,
     rng: &mut StdRng,
 ) -> Vec<f64> {
+    let mut img = vec![0.0; width * height];
     moving_dot_image_with_config(
+        &mut img,
         width,
         height,
         mtrx,
@@ -213,7 +212,8 @@ pub fn moving_dot_image(
         shutter_open,
         rng,
         &MovingDotImageConfig::default(),
-    )
+    );
+    img
 }
 
 #[cfg(test)]
@@ -325,6 +325,22 @@ mod tests {
         // Dark frame should have only background noise (~1000)
         let mean: f64 = img.iter().sum::<f64>() / img.len() as f64;
         assert!((mean - 1000.0).abs() < 100.0, "dark mean={mean}");
+    }
+
+    /// Pins the image for a fixed seed, shutter open and closed, so the
+    /// in-place fill the detector task uses stays bit-identical.
+    #[test]
+    fn moving_dot_image_is_pinned_for_a_fixed_seed() {
+        let mut rng = StdRng::seed_from_u64(42);
+        let mut hash = 0xcbf2_9ce4_8422_2325u64;
+        for shutter_open in [true, false] {
+            let img = moving_dot_image(64, 48, 3.0, -2.0, 500.0, 0.1, shutter_open, &mut rng);
+            assert_eq!(img.len(), 64 * 48);
+            for b in img.iter().flat_map(|v| v.to_bits().to_le_bytes()) {
+                hash = (hash ^ b as u64).wrapping_mul(0x100_0000_01b3);
+            }
+        }
+        assert_eq!(hash, 0x2c64_0333_d0a9_2465, "{hash:#018x}");
     }
 
     #[test]

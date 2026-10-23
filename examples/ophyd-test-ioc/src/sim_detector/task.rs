@@ -8,8 +8,8 @@ use rand::rngs::StdRng;
 use asyn_rs::port_handle::PortHandle;
 
 use ad_core_rs::driver::{ADStatus, ImageMode};
-use ad_core_rs::ndarray::{NDDataBuffer, NDDimension};
-use ad_core_rs::ndarray_pool::DriverPool;
+use ad_core_rs::ndarray::{NDDataBuffer, NDDataType, NDDimension};
+use ad_core_rs::ndarray_pool::{DriverPool, PublishedArray};
 use ad_core_rs::params::ADBaseParams;
 use ad_core_rs::plugin::channel::ArrayPublisher;
 use ad_core_rs::runtime as rt;
@@ -97,8 +97,49 @@ pub(crate) fn start_acquisition_task(ctx: AcquisitionContext) -> std::thread::Jo
     rt::run_thread_named("MovingDotTask", move || acquisition_loop_async(ctx))
 }
 
+/// The image is computed into `raw`, C simDetector's pRaw_, with the slot's
+/// lock free for a port write below FIRST_AD_PARAM, which reads `pArrays[0]`
+/// under it; the last image is then released and the next copied into its
+/// place (simDetector.cpp:694-699). `None` when the pool refused it, which
+/// empties the slot as C's refused alloc does; it has printed the pool's
+/// limit line.
+fn compute_image(
+    pool: &DriverPool,
+    config: &MovingDotConfigSnapshot,
+    rng: &mut StdRng,
+    image_config: &MovingDotImageConfig,
+    raw: &mut Vec<f64>,
+) -> Option<PublishedArray> {
+    let width = config.size_x;
+    let height = config.size_y;
+    raw.resize(width * height, 0.0);
+    physics::moving_dot_image_with_config(
+        raw,
+        width,
+        height,
+        config.motor_x,
+        config.motor_y,
+        config.beam_current,
+        config.acquire_time,
+        config.shutter_open,
+        rng,
+        image_config,
+    );
+    // dims[0] is X, as ADSimDetector's mono xDim (simDetector.cpp:602, :632).
+    let dims = vec![NDDimension::new(width), NDDimension::new(height)];
+    pool.owner().replace_array(0, || {
+        let mut frame = pool.alloc(dims, NDDataType::Float64).ok()?;
+        let NDDataBuffer::F64(img) = &mut frame.data else {
+            unreachable!("the frame was allocated as Float64")
+        };
+        img.copy_from_slice(raw);
+        Some(frame)
+    })
+}
+
 async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
     let mut rng = StdRng::from_os_rng();
+    let mut raw = Vec::new();
 
     loop {
         // Wait for Start command
@@ -172,30 +213,11 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
                 };
             }
 
-            // Generate the image
-            let width = config.size_x;
-            let height = config.size_y;
-            let img_data = physics::moving_dot_image_with_config(
-                width,
-                height,
-                config.motor_x,
-                config.motor_y,
-                config.beam_current,
-                config.acquire_time,
-                config.shutter_open,
-                &mut rng,
-                &ctx.image_config,
-            );
-
-            // Build NDArray from f64 data
-            let dims = vec![NDDimension::new(height), NDDimension::new(width)];
-            // As C simDetector, the last image is released and the next is
-            // allocated in its place under one lock (simDetector.cpp:694-699);
-            // it stays there through the exposure wait. A refused wrap has
-            // printed the pool's limit line.
-            let Some(frame) = ctx.pool.owner().replace_array(0, || {
-                ctx.pool.alloc_with(dims, NDDataBuffer::F64(img_data)).ok()
-            }) else {
+            // Generate the image; it stays in pArrays[0] through the
+            // exposure wait.
+            let Some(frame) =
+                compute_image(&ctx.pool, &config, &mut rng, &ctx.image_config, &mut raw)
+            else {
                 continue;
             };
 
@@ -316,5 +338,91 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config(size_x: usize, size_y: usize) -> MovingDotConfigSnapshot {
+        MovingDotConfigSnapshot {
+            motor_x: 1.0,
+            motor_y: -1.0,
+            beam_current: 500.0,
+            shutter_open: true,
+            acquire_time: 0.1,
+            acquire_period: 0.1,
+            image_mode: ImageMode::Single,
+            num_images: 1,
+            array_callbacks: true,
+            wait_for_plugins: false,
+            size_x,
+            size_y,
+        }
+    }
+
+    /// `dims[0]` is SizeX, as ADSimDetector's, so a 640x480 frame reports
+    /// ArraySize0 640, and pixel (x, y) is the generator's row y, column x.
+    #[test]
+    fn a_frame_is_size_x_wide() {
+        let (width, height) = (6, 4);
+        let pool = DriverPool::standalone(0);
+        let mut rng = StdRng::seed_from_u64(3);
+        let frame = compute_image(
+            &pool,
+            &config(width, height),
+            &mut rng,
+            &MovingDotImageConfig::default(),
+            &mut Vec::new(),
+        )
+        .unwrap();
+
+        let sizes: Vec<_> = frame.dims.iter().map(|d| d.size).collect();
+        assert_eq!(sizes, [width, height]);
+        let info = frame.info();
+        assert_eq!((info.x_size, info.y_size), (width, height));
+
+        let want = physics::moving_dot_image(
+            width,
+            height,
+            1.0,
+            -1.0,
+            500.0,
+            0.1,
+            true,
+            &mut StdRng::seed_from_u64(3),
+        );
+        let NDDataBuffer::F64(got) = &frame.data else {
+            panic!("{:?}", frame.data.data_type());
+        };
+        for y in 0..height {
+            for x in 0..width {
+                assert_eq!(got[y * sizes[0] + x], want[y * width + x], "({x}, {y})");
+            }
+        }
+    }
+
+    /// The image is computed outside the slot's lock and copied into the
+    /// buffer the released last image leaves in the pool, so every frame
+    /// reuses one buffer, as C's convert into `pArrays[0]` does.
+    #[test]
+    fn each_image_reuses_the_released_buffer() {
+        let pool = DriverPool::standalone(0);
+        let mut rng = StdRng::seed_from_u64(3);
+        let mut raw = Vec::new();
+        let mut image = || {
+            let frame = compute_image(
+                &pool,
+                &config(6, 4),
+                &mut rng,
+                &MovingDotImageConfig::default(),
+                &mut raw,
+            )
+            .unwrap();
+            frame.data.as_u8_slice().as_ptr()
+        };
+        let first = image();
+        assert_eq!([image(), image()], [first; 2]);
     }
 }

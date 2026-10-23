@@ -8,7 +8,7 @@ use rand::rngs::StdRng;
 use asyn_rs::port_handle::PortHandle;
 
 use ad_core_rs::driver::{ADStatus, ImageMode};
-use ad_core_rs::ndarray::{NDDataBuffer, NDDimension};
+use ad_core_rs::ndarray::{NDDataBuffer, NDDataType, NDDimension};
 use ad_core_rs::ndarray_pool::DriverPool;
 use ad_core_rs::params::ADBaseParams;
 use ad_core_rs::plugin::channel::ArrayPublisher;
@@ -92,6 +92,22 @@ async fn wait_for_stop(
     }
 }
 
+/// Sum `bx` x `by` pixel blocks of the `width`-wide `img` into `out`
+/// (`out_w` wide), rounding photon counts to u16 (clamped to 0..65535).
+/// Every element of `out` is written. Unbinned, a block is one pixel.
+fn bin_into_u16(img: &[f64], width: usize, bx: usize, by: usize, out_w: usize, out: &mut [u16]) {
+    for (i, o) in out.iter_mut().enumerate() {
+        let (row, col) = (i / out_w, i % out_w);
+        let mut sum = 0.0;
+        for dy in 0..by {
+            for dx in 0..bx {
+                sum += img[(row * by + dy) * width + col * bx + dx];
+            }
+        }
+        *o = sum.round().clamp(0.0, 65535.0) as u16;
+    }
+}
+
 /// Start the acquisition task thread.
 pub(crate) fn start_acquisition_task(ctx: AcquisitionContext) -> std::thread::JoinHandle<()> {
     rt::run_thread_named("MovingDotTask", move || acquisition_loop_async(ctx))
@@ -99,6 +115,7 @@ pub(crate) fn start_acquisition_task(ctx: AcquisitionContext) -> std::thread::Jo
 
 async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
     let mut rng = StdRng::from_os_rng();
+    let mut img_data = Vec::new();
 
     loop {
         // Wait for Start command
@@ -173,7 +190,9 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
             // Generate the image
             let width = config.size_x;
             let height = config.size_y;
-            let mut img_data = physics::moving_dot_image_with_config(
+            img_data.resize(width * height, 0.0);
+            physics::moving_dot_image_with_config(
+                &mut img_data,
                 width,
                 height,
                 config.motor_x,
@@ -198,42 +217,20 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
                 }
             }
 
-            // Apply binning: sum bin_x * bin_y pixel blocks
-            let bx = config.bin_x;
-            let by = config.bin_y;
-            let (out_data, out_w, out_h) = if bx > 1 || by > 1 {
-                let bw = width / bx;
-                let bh = height / by;
-                let mut binned = vec![0.0f64; bw * bh];
-                for row in 0..bh {
-                    for col in 0..bw {
-                        let mut sum = 0.0;
-                        for dy in 0..by {
-                            for dx in 0..bx {
-                                sum += img_data[(row * by + dy) * width + col * bx + dx];
-                            }
-                        }
-                        binned[row * bw + col] = sum;
-                    }
-                }
-                (binned, bw, bh)
-            } else {
-                (img_data, width, height)
-            };
-
-            // Convert f64 photon counts to u16 (clamp to 0..65535)
-            let u16_data: Vec<u16> = out_data
-                .iter()
-                .map(|&v| v.round().clamp(0.0, 65535.0) as u16)
-                .collect();
-
+            let (bx, by) = (config.bin_x, config.bin_y);
+            let (out_w, out_h) = (width / bx, height / by);
             let dims = vec![NDDimension::new(out_w), NDDimension::new(out_h)];
             // As C simDetector, the last image is released and the next is
             // allocated in its place under one lock (simDetector.cpp:694-699);
             // it stays there through the exposure wait. A refused wrap has
             // printed the pool's limit line.
             let Some(frame) = ctx.pool.owner().replace_array(0, || {
-                ctx.pool.alloc_with(dims, NDDataBuffer::U16(u16_data)).ok()
+                let mut frame = ctx.pool.alloc(dims, NDDataType::UInt16).ok()?;
+                let NDDataBuffer::U16(out) = &mut frame.data else {
+                    unreachable!("the frame was allocated as UInt16")
+                };
+                bin_into_u16(&img_data, width, bx, by, out_w, out);
+                Some(frame)
             }) else {
                 continue;
             };
@@ -352,6 +349,39 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
                     WaitOutcome::Continue => {}
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Against the per-frame `Vec` binning it replaced: a reused frame
+    /// buffer comes back with the same counts, unbinned and binned.
+    #[test]
+    fn bin_into_u16_matches_the_old_binning() {
+        let img: Vec<f64> = (0..15).map(|i| i as f64 * 10.25 - 20.0).collect();
+        let mut clipped = img.clone();
+        clipped[7] = 70000.0;
+        for (src, bx, by, want) in [
+            (
+                &clipped,
+                1,
+                1,
+                &[
+                    0, 0, 1, 11, 21, 31, 42, 65535, 62, 72, 83, 93, 103, 113, 124,
+                ][..],
+            ),
+            (&img, 2, 1, &[0, 11, 73, 114, 175, 216]),
+            (&img, 2, 2, &[43, 125]),
+            (&img, 3, 2, &[95]),
+            (&img, 1, 3, &[94, 125, 155, 186, 217]),
+        ] {
+            let (out_w, out_h) = (5 / bx, 3 / by);
+            let mut out = vec![u16::MAX; out_w * out_h];
+            bin_into_u16(src, 5, bx, by, out_w, &mut out);
+            assert_eq!(out, want, "{bx}x{by}");
         }
     }
 }

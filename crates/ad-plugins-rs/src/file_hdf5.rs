@@ -8,7 +8,7 @@ use ad_core_rs::codec::{Codec, CodecName};
 use ad_core_rs::color::NDColorMode;
 use ad_core_rs::error::{ADError, ADResult};
 use ad_core_rs::finalize::Finalize;
-use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDataType};
+use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDataType, NDDataView};
 use ad_core_rs::ndarray_pool::NDArrayPool;
 use ad_core_rs::plugin::file_base::{FileAttributes, NDFileOpenMode, NDFileWriter};
 use ad_core_rs::plugin::file_controller::{
@@ -3757,17 +3757,17 @@ fn codec_chunk_bytes(codec: &Codec, uncompressed_total_bytes: usize, payload: &[
 /// element. Used for every typed-dataset chunk write where no typed
 /// chunked-write path exists in the crate.
 fn nd_buffer_to_le_bytes(buf: &NDDataBuffer) -> Vec<u8> {
-    match buf {
-        NDDataBuffer::I8(v) => v.iter().map(|&x| x as u8).collect(),
-        NDDataBuffer::U8(v) => v.clone(),
-        NDDataBuffer::I16(v) => v.iter().flat_map(|&x| x.to_le_bytes()).collect(),
-        NDDataBuffer::U16(v) => v.iter().flat_map(|&x| x.to_le_bytes()).collect(),
-        NDDataBuffer::I32(v) => v.iter().flat_map(|&x| x.to_le_bytes()).collect(),
-        NDDataBuffer::U32(v) => v.iter().flat_map(|&x| x.to_le_bytes()).collect(),
-        NDDataBuffer::I64(v) => v.iter().flat_map(|&x| x.to_le_bytes()).collect(),
-        NDDataBuffer::U64(v) => v.iter().flat_map(|&x| x.to_le_bytes()).collect(),
-        NDDataBuffer::F32(v) => v.iter().flat_map(|&x| x.to_le_bytes()).collect(),
-        NDDataBuffer::F64(v) => v.iter().flat_map(|&x| x.to_le_bytes()).collect(),
+    match buf.view() {
+        NDDataView::I8(v) => v.iter().map(|&x| x as u8).collect(),
+        NDDataView::U8(v) => v.to_vec(),
+        NDDataView::I16(v) => v.iter().flat_map(|&x| x.to_le_bytes()).collect(),
+        NDDataView::U16(v) => v.iter().flat_map(|&x| x.to_le_bytes()).collect(),
+        NDDataView::I32(v) => v.iter().flat_map(|&x| x.to_le_bytes()).collect(),
+        NDDataView::U32(v) => v.iter().flat_map(|&x| x.to_le_bytes()).collect(),
+        NDDataView::I64(v) => v.iter().flat_map(|&x| x.to_le_bytes()).collect(),
+        NDDataView::U64(v) => v.iter().flat_map(|&x| x.to_le_bytes()).collect(),
+        NDDataView::F32(v) => v.iter().flat_map(|&x| x.to_le_bytes()).collect(),
+        NDDataView::F64(v) => v.iter().flat_map(|&x| x.to_le_bytes()).collect(),
     }
 }
 
@@ -5733,7 +5733,7 @@ impl NDPluginProcess for Hdf5FileProcessor {
 mod tests {
     use super::*;
     use crate::test_util::opened;
-    use ad_core_rs::ndarray::NDDimension;
+    use ad_core_rs::ndarray::{NDDataViewMut, NDDimension};
     use ad_core_rs::plugin::file_base::NDFileMode;
 
     /// C names the HDF5 library it links (NDFileHDF5.cpp:2388-2392,
@@ -5898,7 +5898,7 @@ mod tests {
             vec![NDDimension::new(4), NDDimension::new(4)],
             NDDataType::UInt8,
         );
-        if let NDDataBuffer::U8(ref mut v) = arr.data {
+        if let NDDataViewMut::U8(v) = arr.data.view_mut() {
             for i in 0..16 {
                 v[i] = i as u8;
             }
@@ -6132,7 +6132,7 @@ mod tests {
         // C prints the JPEG gate line in openFile, before the refusal.
         let src = NDArray::with_data(
             vec![NDDimension::new(8), NDDimension::new(8)],
-            NDDataBuffer::U8(vec![7; 64]),
+            NDDataBuffer::from_vec::<u8>(vec![7; 64]),
         );
         let jpeg = crate::codec::compress_jpeg(&src, 90).unwrap();
         let jpeg = with_color_mode(jpeg, NDColorMode::RGB1);
@@ -7145,7 +7145,7 @@ mod tests {
             vec![NDDimension::new(4), NDDimension::new(4)],
             NDDataType::UInt8,
         );
-        if let NDDataBuffer::U8(ref mut v) = arr.data {
+        if let NDDataViewMut::U8(v) = arr.data.view_mut() {
             for i in 0..16 {
                 v[i] = i as u8;
             }
@@ -7180,7 +7180,7 @@ mod tests {
         );
         // Mark each frame distinctly so we can verify per-frame placement.
         for f in 0..3u8 {
-            if let NDDataBuffer::U8(ref mut v) = arr.data {
+            if let NDDataViewMut::U8(v) = arr.data.view_mut() {
                 for x in v.iter_mut() {
                     *x = f;
                 }
@@ -7245,7 +7245,7 @@ mod tests {
             NDDataType::UInt16,
         );
         for f in 0..3u16 {
-            if let NDDataBuffer::U16(ref mut v) = arr.data {
+            if let NDDataViewMut::U16(v) = arr.data.view_mut() {
                 for (i, x) in v.iter_mut().enumerate() {
                     *x = f * 1000 + i as u16;
                 }
@@ -7305,7 +7305,7 @@ mod tests {
             NDDataType::UInt16,
         );
         for f in 0..2u16 {
-            if let NDDataBuffer::U16(ref mut v) = arr.data {
+            if let NDDataViewMut::U16(v) = arr.data.view_mut() {
                 for (i, x) in v.iter_mut().enumerate() {
                     *x = f * 100 + i as u16;
                 }
@@ -7353,7 +7353,7 @@ mod tests {
             vec![NDDimension::new(8), NDDimension::new(8)],
             NDDataType::UInt16,
         );
-        if let NDDataBuffer::U16(ref mut v) = arr.data {
+        if let NDDataViewMut::U16(v) = arr.data.view_mut() {
             for (i, x) in v.iter_mut().enumerate() {
                 *x = i as u16;
             }
@@ -7399,7 +7399,7 @@ mod tests {
         );
         // 5 frames → bands [0,1], [2,3], [4] (partial).
         for f in 0..5u16 {
-            if let NDDataBuffer::U16(ref mut v) = arr.data {
+            if let NDDataViewMut::U16(v) = arr.data.view_mut() {
                 for (i, x) in v.iter_mut().enumerate() {
                     *x = f * 1000 + i as u16;
                 }
@@ -7450,7 +7450,7 @@ mod tests {
         );
         // 3 frames → band [0,1] full, band [2] partial; 2x2 tiles each.
         for f in 0..3u16 {
-            if let NDDataBuffer::U16(ref mut v) = arr.data {
+            if let NDDataViewMut::U16(v) = arr.data.view_mut() {
                 for (i, x) in v.iter_mut().enumerate() {
                     *x = f * 1000 + i as u16;
                 }
@@ -8418,7 +8418,7 @@ mod tests {
                 vec![NDDimension::new(4), NDDimension::new(4)],
                 NDDataType::UInt8,
             );
-            arr.data = NDDataBuffer::U8(vec![v; 16]);
+            arr.data = NDDataBuffer::from_vec::<u8>(vec![v; 16]);
             for (name, pos) in [("PosX", x), ("PosN", n)] {
                 arr.attributes.add(NDAttribute::new_static(
                     name,
@@ -10144,7 +10144,7 @@ mod tests {
                 NDDataType::UInt16,
             );
             for f in 0..frames {
-                if let NDDataBuffer::U16(ref mut v) = arr.data {
+                if let NDDataViewMut::U16(v) = arr.data.view_mut() {
                     for (i, x) in v.iter_mut().enumerate() {
                         *x = f * 100 + i as u16;
                     }
@@ -10288,7 +10288,7 @@ mod tests {
             vec![NDDimension::new(64), NDDimension::new(64)],
             NDDataType::UInt16,
         );
-        if let NDDataBuffer::U16(ref mut v) = arr.data {
+        if let NDDataViewMut::U16(v) = arr.data.view_mut() {
             for i in 0..v.len() {
                 v[i] = (i % 256) as u16;
             }
@@ -10347,7 +10347,7 @@ mod tests {
             vec![NDDimension::new(32), NDDimension::new(32)],
             NDDataType::UInt8,
         );
-        if let NDDataBuffer::U8(ref mut v) = arr.data {
+        if let NDDataViewMut::U8(v) = arr.data.view_mut() {
             for i in 0..v.len() {
                 v[i] = (i % 4) as u8;
             }
@@ -10379,7 +10379,7 @@ mod tests {
             vec![NDDimension::new(64), NDDimension::new(64)],
             NDDataType::UInt16,
         );
-        if let NDDataBuffer::U16(ref mut v) = arr.data {
+        if let NDDataViewMut::U16(v) = arr.data.view_mut() {
             for i in 0..v.len() {
                 v[i] = (i % 8) as u16;
             }
@@ -10419,7 +10419,7 @@ mod tests {
             vec![NDDimension::new(64), NDDimension::new(64)],
             NDDataType::UInt8,
         );
-        if let NDDataBuffer::U8(ref mut v) = arr.data {
+        if let NDDataViewMut::U8(v) = arr.data.view_mut() {
             for (i, e) in v.iter_mut().enumerate() {
                 *e = (i % 13) as u8;
             }
@@ -10478,7 +10478,7 @@ mod tests {
             vec![NDDimension::new(8), NDDimension::new(8)],
             NDDataType::UInt16,
         );
-        if let NDDataBuffer::U16(ref mut v) = arr.data {
+        if let NDDataViewMut::U16(v) = arr.data.view_mut() {
             for (i, x) in v.iter_mut().enumerate() {
                 *x = (i as u16 * 7) & 0x3FF; // within the 10-bit range
             }
@@ -10536,7 +10536,7 @@ mod tests {
                 NDDataType::UInt16,
                 20,
                 0,
-                NDDataBuffer::U16(vec![0xFFFF, 1, 0x8000, 0]),
+                NDDataBuffer::from_vec::<u16>(vec![0xFFFF, 1, 0x8000, 0]),
                 513.0,
                 [1, 2, 0],
             ),
@@ -10544,7 +10544,7 @@ mod tests {
                 NDDataType::Int16,
                 16,
                 4,
-                NDDataBuffer::I16(vec![-3, 1, i16::MIN, 0]),
+                NDDataBuffer::from_vec::<i16>(vec![-3, 1, i16::MIN, 0]),
                 -2.0,
                 [0xFE, 0xFF, 0xFF],
             ),
@@ -10685,7 +10685,7 @@ mod tests {
     #[test]
     fn a_swmr_file_stores_the_nbit_datatype_under_its_filter() {
         use rust_hdf5::format::messages::filter::FILTER_NBIT;
-        let data = NDDataBuffer::U16(vec![0xFFFF, 1, 0x8008, 0x3FF]);
+        let data = NDDataBuffer::from_vec::<u16>(vec![0xFFFF, 1, 0x8008, 0x3FF]);
         for (precision, offset, size) in [(10, 3, 2), (20, 0, 3)] {
             let what = format!("precision {precision} offset {offset}");
             let path = temp_path("hdf5_swmr_nbit");
@@ -10760,14 +10760,12 @@ mod tests {
             writer.set_nbit_offset(0);
             let mut arr = NDArray::new(vec![NDDimension::new(4), NDDimension::new(4)], data_type);
             let want: Vec<f64> = (0..16).map(|i| -1.5e3 + i as f64 * 777.25).collect();
-            match arr.data {
-                NDDataBuffer::U16(ref mut v) => {
+            match arr.data.view_mut() {
+                NDDataViewMut::U16(v) => {
                     v.iter_mut().zip(0u16..).for_each(|(x, i)| *x = 0xFFFF - i)
                 }
-                NDDataBuffer::F32(ref mut v) => {
-                    v.iter_mut().zip(&want).for_each(|(x, w)| *x = *w as f32)
-                }
-                NDDataBuffer::F64(ref mut v) => v.copy_from_slice(&want),
+                NDDataViewMut::F32(v) => v.iter_mut().zip(&want).for_each(|(x, w)| *x = *w as f32),
+                NDDataViewMut::F64(v) => v.copy_from_slice(&want),
                 _ => unreachable!(),
             }
             let written = arr.data.clone();
@@ -10793,10 +10791,10 @@ mod tests {
                 "{what}"
             );
             assert_eq!(filters[0].cd_values[1], 1, "{what}: need_not_compress");
-            let back = match written {
-                NDDataBuffer::U16(v) => ds.read_raw::<u16>().unwrap() == v,
-                NDDataBuffer::F32(v) => ds.read_raw::<f32>().unwrap() == v,
-                NDDataBuffer::F64(v) => ds.read_raw::<f64>().unwrap() == v,
+            let back = match written.view() {
+                NDDataView::U16(v) => ds.read_raw::<u16>().unwrap() == v,
+                NDDataView::F32(v) => ds.read_raw::<f32>().unwrap() == v,
+                NDDataView::F64(v) => ds.read_raw::<f64>().unwrap() == v,
                 _ => unreachable!(),
             };
             assert!(back, "{what}: values round-trip");
@@ -10819,7 +10817,7 @@ mod tests {
             vec![NDDimension::new(8), NDDimension::new(8)],
             NDDataType::UInt16,
         );
-        if let NDDataBuffer::U16(ref mut v) = arr.data {
+        if let NDDataViewMut::U16(v) = arr.data.view_mut() {
             for i in 0..v.len() {
                 v[i] = i as u16;
             }
@@ -10876,7 +10874,7 @@ mod tests {
             NDDataType::UInt16,
         );
         for f in 0..24u16 {
-            if let NDDataBuffer::U16(ref mut v) = arr.data {
+            if let NDDataViewMut::U16(v) = arr.data.view_mut() {
                 for x in v.iter_mut() {
                     *x = f;
                 }
@@ -10924,7 +10922,7 @@ mod tests {
             NDDataType::UInt16,
         );
         for f in 0..6u16 {
-            if let NDDataBuffer::U16(ref mut v) = arr.data {
+            if let NDDataViewMut::U16(v) = arr.data.view_mut() {
                 for x in v.iter_mut() {
                     *x = f;
                 }
@@ -10977,7 +10975,7 @@ mod tests {
             NDDataType::UInt16,
         );
         for f in 0..24u16 {
-            if let NDDataBuffer::U16(ref mut v) = arr.data {
+            if let NDDataViewMut::U16(v) = arr.data.view_mut() {
                 for x in v.iter_mut() {
                     *x = f;
                 }
@@ -11034,7 +11032,7 @@ mod tests {
             NDDataType::UInt16,
         );
         for f in 0..6u16 {
-            if let NDDataBuffer::U16(ref mut v) = arr.data {
+            if let NDDataViewMut::U16(v) = arr.data.view_mut() {
                 // Distinct per-element values prove tile reassembly, not just a
                 // constant: value = frame*100 + (row*4 + col).
                 for (i, x) in v.iter_mut().enumerate() {
@@ -11096,7 +11094,7 @@ mod tests {
             NDDataType::UInt16,
         );
         for f in 0..4u16 {
-            if let NDDataBuffer::U16(ref mut v) = arr.data {
+            if let NDDataViewMut::U16(v) = arr.data.view_mut() {
                 for x in v.iter_mut() {
                     *x = f + 1; // non-zero so fill (0) is distinguishable
                 }
@@ -11237,7 +11235,7 @@ mod tests {
             NDDataType::UInt16,
         );
         for f in 0..6u16 {
-            if let NDDataBuffer::U16(ref mut v) = arr.data {
+            if let NDDataViewMut::U16(v) = arr.data.view_mut() {
                 v.fill(f);
             }
             if f == 0 {
@@ -11439,7 +11437,7 @@ mod tests {
                 vec![NDDimension::new(2), NDDimension::new(2)],
                 NDDataType::UInt16,
             );
-            if let NDDataBuffer::U16(ref mut v) = arr.data {
+            if let NDDataViewMut::U16(v) = arr.data.view_mut() {
                 for p in v.iter_mut() {
                     *p = val;
                 }
@@ -11730,7 +11728,7 @@ mod tests {
             vec![NDDimension::new(4), NDDimension::new(4)],
             NDDataType::UInt16,
         );
-        if let NDDataBuffer::U16(ref mut v) = arr.data {
+        if let NDDataViewMut::U16(v) = arr.data.view_mut() {
             for (i, x) in v.iter_mut().enumerate() {
                 *x = i as u16;
             }
@@ -11816,7 +11814,7 @@ mod tests {
             vec![NDDimension::new(4), NDDimension::new(4)],
             NDDataType::UInt16,
         );
-        if let NDDataBuffer::U16(ref mut v) = arr.data {
+        if let NDDataViewMut::U16(v) = arr.data.view_mut() {
             for (i, x) in v.iter_mut().enumerate() {
                 *x = (i * 3) as u16;
             }
@@ -12625,13 +12623,13 @@ mod tests {
         let data: Vec<u16> = (0..(y * x) as u16).collect();
         NDArray::with_data(
             vec![NDDimension::new(y), NDDimension::new(x)],
-            NDDataBuffer::U16(data),
+            NDDataBuffer::from_vec::<u16>(data),
         )
     }
 
     fn u16_pixels(arr: &NDArray) -> Vec<u16> {
-        match &arr.data {
-            NDDataBuffer::U16(v) => v.clone(),
+        match arr.data.view() {
+            NDDataView::U16(v) => v.to_vec(),
             _ => unreachable!("expected U16 buffer"),
         }
     }
@@ -12913,7 +12911,7 @@ mod tests {
                 let data: Vec<u16> = (0..20u16).map(|i| i + f * 100).collect();
                 NDArray::with_data(
                     vec![NDDimension::new(4), NDDimension::new(5)],
-                    NDDataBuffer::U16(data),
+                    NDDataBuffer::from_vec::<u16>(data),
                 )
             })
             .collect();
@@ -12958,7 +12956,7 @@ mod tests {
         let mono: Vec<u8> = (0..64u16).map(|i| (i * 3) as u8).collect();
         let src = NDArray::with_data(
             vec![NDDimension::new(8), NDDimension::new(8)],
-            NDDataBuffer::U8(mono),
+            NDDataBuffer::from_vec::<u8>(mono),
         );
         let comp = crate::codec::compress_jpeg(&src, 90).expect("jpeg encode");
         assert_eq!(comp.codec.as_ref().unwrap().name, CodecName::JPEG);
@@ -13026,7 +13024,7 @@ mod tests {
         let mut writer = Hdf5Writer::new();
         let src = NDArray::with_data(
             vec![NDDimension::new(8), NDDimension::new(8)],
-            NDDataBuffer::U8(vec![7; 64]),
+            NDDataBuffer::from_vec::<u8>(vec![7; 64]),
         );
         let comp = crate::codec::compress_jpeg(&src, 90).expect("jpeg encode");
         let comp = with_color_mode(comp, NDColorMode::RGB1);

@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use ad_core_rs::color::{NDColorMode, convert_rgb_layout};
 use ad_core_rs::error::{ADError, ADResult};
-use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDataType};
+use ad_core_rs::ndarray::{NDArray, NDDataType, NDDataView};
 use ad_core_rs::ndarray_pool::NDArrayPool;
 use ad_core_rs::plugin::file_base::{NDFileOpenMode, NDFileWriter};
 use ad_core_rs::plugin::file_controller::{
@@ -100,9 +100,9 @@ impl NDFileWriter for JpegWriter {
         let width = info.x_size;
         let height = info.y_size;
 
-        let data: Vec<u8> = match &src.data {
-            NDDataBuffer::U8(v) => v.clone(),
-            NDDataBuffer::I8(v) => v.iter().map(|&b| b as u8).collect(),
+        let data: Vec<u8> = match src.data.view() {
+            NDDataView::U8(v) => v.to_vec(),
+            NDDataView::I8(v) => v.iter().map(|&b| b as u8).collect(),
             _ => {
                 return Err(ADError::UnsupportedConversion(
                     "JPEG only supports UInt8/Int8".into(),
@@ -255,7 +255,7 @@ impl NDPluginProcess for JpegFileProcessor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ad_core_rs::ndarray::{NDDataBuffer, NDDimension};
+    use ad_core_rs::ndarray::{NDDataViewMut, NDDimension};
     use std::sync::atomic::{AtomicU32, Ordering};
 
     static TEST_COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -374,7 +374,7 @@ mod tests {
             vec![NDDimension::new(8), NDDimension::new(8)],
             NDDataType::UInt8,
         );
-        if let NDDataBuffer::U8(ref mut v) = arr.data {
+        if let NDDataViewMut::U8(v) = arr.data.view_mut() {
             for i in 0..64 {
                 v[i] = (i * 4) as u8;
             }
@@ -418,7 +418,7 @@ mod tests {
             vec![NDDimension::new(32), NDDimension::new(32)],
             NDDataType::UInt8,
         );
-        if let NDDataBuffer::U8(ref mut v) = arr.data {
+        if let NDDataViewMut::U8(v) = arr.data.view_mut() {
             for i in 0..v.len() {
                 v[i] = (i % 256) as u8;
             }
@@ -521,7 +521,7 @@ mod tests {
             vec![NDDimension::new(8), NDDimension::new(8)],
             NDDataType::UInt8,
         );
-        if let NDDataBuffer::U8(ref mut v) = arr.data {
+        if let NDDataViewMut::U8(v) = arr.data.view_mut() {
             // Use uniform value so JPEG compression is lossless at quality 100
             for i in 0..64 {
                 v[i] = 128;
@@ -572,7 +572,7 @@ mod tests {
             NDAttrSource::Driver,
             NDAttrValue::Int32(mode as i32),
         ));
-        if let NDDataBuffer::U8(ref mut v) = arr.data {
+        if let NDDataViewMut::U8(v) = arr.data.view_mut() {
             for (i, x) in v.iter_mut().enumerate() {
                 *x = (i % 256) as u8;
             }

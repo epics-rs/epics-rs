@@ -84,9 +84,9 @@ pub(crate) fn buffer_from_bytes(bytes: &[u8], data_type: NDDataType) -> Option<N
                     bytes.len(),
                 );
             }
-            NDDataBuffer::I8(v)
+            NDDataBuffer::from_vec::<i8>(v)
         }
-        NDDataType::UInt8 => NDDataBuffer::U8(bytes.to_vec()),
+        NDDataType::UInt8 => NDDataBuffer::from_vec::<u8>(bytes.to_vec()),
         NDDataType::Int16 => {
             let mut v = vec![0i16; count];
             unsafe {
@@ -96,7 +96,7 @@ pub(crate) fn buffer_from_bytes(bytes: &[u8], data_type: NDDataType) -> Option<N
                     bytes.len(),
                 );
             }
-            NDDataBuffer::I16(v)
+            NDDataBuffer::from_vec::<i16>(v)
         }
         NDDataType::UInt16 => {
             let mut v = vec![0u16; count];
@@ -107,7 +107,7 @@ pub(crate) fn buffer_from_bytes(bytes: &[u8], data_type: NDDataType) -> Option<N
                     bytes.len(),
                 );
             }
-            NDDataBuffer::U16(v)
+            NDDataBuffer::from_vec::<u16>(v)
         }
         NDDataType::Int32 => {
             let mut v = vec![0i32; count];
@@ -118,7 +118,7 @@ pub(crate) fn buffer_from_bytes(bytes: &[u8], data_type: NDDataType) -> Option<N
                     bytes.len(),
                 );
             }
-            NDDataBuffer::I32(v)
+            NDDataBuffer::from_vec::<i32>(v)
         }
         NDDataType::UInt32 => {
             let mut v = vec![0u32; count];
@@ -129,7 +129,7 @@ pub(crate) fn buffer_from_bytes(bytes: &[u8], data_type: NDDataType) -> Option<N
                     bytes.len(),
                 );
             }
-            NDDataBuffer::U32(v)
+            NDDataBuffer::from_vec::<u32>(v)
         }
         NDDataType::Int64 => {
             let mut v = vec![0i64; count];
@@ -140,7 +140,7 @@ pub(crate) fn buffer_from_bytes(bytes: &[u8], data_type: NDDataType) -> Option<N
                     bytes.len(),
                 );
             }
-            NDDataBuffer::I64(v)
+            NDDataBuffer::from_vec::<i64>(v)
         }
         NDDataType::UInt64 => {
             let mut v = vec![0u64; count];
@@ -151,7 +151,7 @@ pub(crate) fn buffer_from_bytes(bytes: &[u8], data_type: NDDataType) -> Option<N
                     bytes.len(),
                 );
             }
-            NDDataBuffer::U64(v)
+            NDDataBuffer::from_vec::<u64>(v)
         }
         NDDataType::Float32 => {
             let mut v = vec![0f32; count];
@@ -162,7 +162,7 @@ pub(crate) fn buffer_from_bytes(bytes: &[u8], data_type: NDDataType) -> Option<N
                     bytes.len(),
                 );
             }
-            NDDataBuffer::F32(v)
+            NDDataBuffer::from_vec::<f32>(v)
         }
         NDDataType::Float64 => {
             let mut v = vec![0f64; count];
@@ -173,7 +173,7 @@ pub(crate) fn buffer_from_bytes(bytes: &[u8], data_type: NDDataType) -> Option<N
                     bytes.len(),
                 );
             }
-            NDDataBuffer::F64(v)
+            NDDataBuffer::from_vec::<f64>(v)
         }
     })
 }
@@ -2192,6 +2192,7 @@ impl NDPluginProcess for CodecProcessor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ad_core_rs::ndarray::{NDDataView, NDDataViewMut};
 
     #[test]
     fn test_register_params_seeds_the_c_constructor_values() {
@@ -2264,7 +2265,7 @@ mod tests {
             vec![NDDimension::new(width), NDDimension::new(height)],
             NDDataType::UInt8,
         );
-        if let NDDataBuffer::U8(ref mut v) = arr.data {
+        if let NDDataViewMut::U8(v) = arr.data.view_mut() {
             for i in 0..v.len() {
                 v[i] = (i % 256) as u8;
             }
@@ -2289,7 +2290,7 @@ mod tests {
             NDAttrSource::Driver,
             NDAttrValue::Int32(2), // RGB1
         ));
-        if let NDDataBuffer::U8(ref mut v) = arr.data {
+        if let NDDataViewMut::U8(v) = arr.data.view_mut() {
             for i in 0..v.len() {
                 v[i] = (i % 256) as u8;
             }
@@ -2305,7 +2306,7 @@ mod tests {
     #[test]
     fn compressors_record_type_in_codec_not_an_attribute() {
         let mut arr = NDArray::new(vec![NDDimension::new(8)], NDDataType::UInt16);
-        if let NDDataBuffer::U16(ref mut v) = arr.data {
+        if let NDDataViewMut::U16(v) = arr.data.view_mut() {
             for (i, x) in v.iter_mut().enumerate() {
                 *x = (i * 7) as u16;
             }
@@ -2345,7 +2346,7 @@ mod tests {
         // C records the real level/shuffle/compressor in the codec
         // (NDPluginCodec.cpp:400-402), not zeros.
         let mut arr = NDArray::new(vec![NDDimension::new(8)], NDDataType::UInt16);
-        if let NDDataBuffer::U16(ref mut v) = arr.data {
+        if let NDDataViewMut::U16(v) = arr.data.view_mut() {
             for (i, x) in v.iter_mut().enumerate() {
                 *x = (i * 7) as u16;
             }
@@ -2370,7 +2371,7 @@ mod tests {
             vec![NDDimension::new(100), NDDimension::new(20)],
             NDDataType::UInt16,
         );
-        if let NDDataBuffer::U16(ref mut v) = arr.data {
+        if let NDDataViewMut::U16(v) = arr.data.view_mut() {
             for (i, x) in v.iter_mut().enumerate() {
                 *x = (i * 37 % 65521) as u16;
             }
@@ -2401,7 +2402,7 @@ mod tests {
             shuffle: 1,
         };
         let mut arr = NDArray::new(vec![NDDimension::new(256)], NDDataType::UInt16);
-        if let NDDataBuffer::U16(ref mut v) = arr.data {
+        if let NDDataViewMut::U16(v) = arr.data.view_mut() {
             for (i, x) in v.iter_mut().enumerate() {
                 *x = (i * 13 % 65521) as u16;
             }
@@ -2651,7 +2652,7 @@ mod tests {
             vec![NDDimension::new(8), NDDimension::new(8)],
             NDDataType::UInt16,
         );
-        if let NDDataBuffer::U16(ref mut v) = arr.data {
+        if let NDDataViewMut::U16(v) = arr.data.view_mut() {
             for i in 0..v.len() {
                 v[i] = (i * 100) as u16;
             }
@@ -2682,7 +2683,7 @@ mod tests {
     #[test]
     fn test_lz4_roundtrip_f64() {
         let mut arr = NDArray::new(vec![NDDimension::new(16)], NDDataType::Float64);
-        if let NDDataBuffer::F64(ref mut v) = arr.data {
+        if let NDDataViewMut::F64(v) = arr.data.view_mut() {
             for i in 0..v.len() {
                 v[i] = i as f64 * 1.5;
             }
@@ -2703,7 +2704,7 @@ mod tests {
             NDDataType::UInt8,
         );
         // All zeros = very compressible
-        if let NDDataBuffer::U8(ref mut v) = arr.data {
+        if let NDDataViewMut::U8(v) = arr.data.view_mut() {
             for x in v.iter_mut() {
                 *x = 0;
             }
@@ -2822,7 +2823,7 @@ mod tests {
             vec![NDDimension::new(64), NDDimension::new(64)],
             NDDataType::UInt8,
         );
-        if let NDDataBuffer::U8(ref mut v) = arr.data {
+        if let NDDataViewMut::U8(v) = arr.data.view_mut() {
             for (i, x) in v.iter_mut().enumerate() {
                 *x = (i % 251) as u8;
             }
@@ -2845,7 +2846,7 @@ mod tests {
             vec![NDDimension::new(100), NDDimension::new(20)],
             NDDataType::UInt16,
         );
-        if let NDDataBuffer::U16(ref mut v) = arr.data {
+        if let NDDataViewMut::U16(v) = arr.data.view_mut() {
             for (i, x) in v.iter_mut().enumerate() {
                 *x = (i * 37 % 65521) as u16;
             }
@@ -2865,7 +2866,7 @@ mod tests {
     #[test]
     fn test_bslz4_roundtrip_f64_with_negatives() {
         let mut arr = NDArray::new(vec![NDDimension::new(73)], NDDataType::Float64);
-        if let NDDataBuffer::F64(ref mut v) = arr.data {
+        if let NDDataViewMut::F64(v) = arr.data.view_mut() {
             for (i, x) in v.iter_mut().enumerate() {
                 *x = (i as f64 - 36.0) * 2.5;
             }
@@ -2887,7 +2888,7 @@ mod tests {
         // 2.5 blocks worth of i32 elements.
         let count = block * 2 + block / 2 + 3;
         let mut arr = NDArray::new(vec![NDDimension::new(count)], NDDataType::Int32);
-        if let NDDataBuffer::I32(ref mut v) = arr.data {
+        if let NDDataViewMut::I32(v) = arr.data.view_mut() {
             for (i, x) in v.iter_mut().enumerate() {
                 *x = (i as i32).wrapping_mul(2_654_435_761u32 as i32);
             }
@@ -2994,7 +2995,7 @@ mod tests {
             let mut bad = good.clone();
             let mut v = bytes.clone();
             edit(&mut v);
-            bad.data = NDDataBuffer::U8(v);
+            bad.data = NDDataBuffer::from_vec::<u8>(v);
             decompress_bslz4(&bad).map(|_| ()).unwrap_err()
         };
         // A block that fails to decode while its neighbours succeed.
@@ -3049,7 +3050,7 @@ mod tests {
             vec![NDDimension::new(32), NDDimension::new(32)],
             NDDataType::UInt16,
         );
-        if let NDDataBuffer::U16(ref mut v) = arr.data {
+        if let NDDataViewMut::U16(v) = arr.data.view_mut() {
             for (i, x) in v.iter_mut().enumerate() {
                 *x = (i * 11) as u16;
             }
@@ -3058,7 +3059,7 @@ mod tests {
 
         // A genuine BSLZ4 frame, then corrupt the compressed payload.
         let mut compressed = compress_bslz4(&arr).unwrap();
-        if let NDDataBuffer::U8(ref mut v) = compressed.data {
+        if let NDDataViewMut::U8(v) = compressed.data.view_mut() {
             for b in v.iter_mut() {
                 *b = 0xFF;
             }
@@ -3091,7 +3092,7 @@ mod tests {
             vec![NDDimension::new(32), NDDimension::new(32)],
             NDDataType::UInt16,
         );
-        if let NDDataBuffer::U16(ref mut v) = arr.data {
+        if let NDDataViewMut::U16(v) = arr.data.view_mut() {
             for (i, x) in v.iter_mut().enumerate() {
                 *x = (i * 11) as u16;
             }
@@ -3192,7 +3193,7 @@ mod tests {
             NDAttrSource::Driver,
             NDAttrValue::Int32(mode as i32),
         ));
-        if let NDDataBuffer::U8(ref mut v) = arr.data {
+        if let NDDataViewMut::U8(v) = arr.data.view_mut() {
             for y in 0..h {
                 for x in 0..w {
                     for c in 0..3 {
@@ -3287,7 +3288,7 @@ mod tests {
             vec![NDDimension::new(8), NDDimension::new(8)],
             NDDataType::Int8,
         );
-        if let NDDataBuffer::I8(ref mut v) = arr.data {
+        if let NDDataViewMut::I8(v) = arr.data.view_mut() {
             for (i, x) in v.iter_mut().enumerate() {
                 *x = (i as i32 - 32) as i8;
             }
@@ -3526,7 +3527,7 @@ mod tests {
             vec![NDDimension::new(16), NDDimension::new(16)],
             NDDataType::UInt16,
         );
-        if let NDDataBuffer::U16(ref mut v) = arr.data {
+        if let NDDataViewMut::U16(v) = arr.data.view_mut() {
             for (i, x) in v.iter_mut().enumerate() {
                 *x = (i * 257 % 65521) as u16;
             }
@@ -3547,7 +3548,7 @@ mod tests {
     #[test]
     fn test_zlib_roundtrip_f64_with_negatives() {
         let mut arr = NDArray::new(vec![NDDimension::new(64)], NDDataType::Float64);
-        if let NDDataBuffer::F64(ref mut v) = arr.data {
+        if let NDDataViewMut::F64(v) = arr.data.view_mut() {
             for (i, x) in v.iter_mut().enumerate() {
                 *x = (i as f64 - 32.0) * 3.25;
             }
@@ -3581,7 +3582,7 @@ mod tests {
             vec![NDDimension::new(32), NDDimension::new(32)],
             NDDataType::UInt16,
         );
-        if let NDDataBuffer::U16(ref mut v) = arr.data {
+        if let NDDataViewMut::U16(v) = arr.data.view_mut() {
             for (i, x) in v.iter_mut().enumerate() {
                 *x = (i * 13) as u16;
             }
@@ -3613,7 +3614,7 @@ mod tests {
             vec![NDDimension::new(64), NDDimension::new(64)],
             NDDataType::UInt8,
         );
-        if let NDDataBuffer::U8(ref mut v) = arr.data {
+        if let NDDataViewMut::U8(v) = arr.data.view_mut() {
             for (i, x) in v.iter_mut().enumerate() {
                 *x = (i % 251) as u8;
             }
@@ -3636,7 +3637,7 @@ mod tests {
             vec![NDDimension::new(80), NDDimension::new(40)],
             NDDataType::UInt16,
         );
-        if let NDDataBuffer::U16(ref mut v) = arr.data {
+        if let NDDataViewMut::U16(v) = arr.data.view_mut() {
             for (i, x) in v.iter_mut().enumerate() {
                 *x = (i * 37 % 65521) as u16;
             }
@@ -3657,7 +3658,7 @@ mod tests {
     #[test]
     fn test_lz4hdf5_roundtrip_f64_with_negatives() {
         let mut arr = NDArray::new(vec![NDDimension::new(97)], NDDataType::Float64);
-        if let NDDataBuffer::F64(ref mut v) = arr.data {
+        if let NDDataViewMut::F64(v) = arr.data.view_mut() {
             for (i, x) in v.iter_mut().enumerate() {
                 *x = (i as f64 - 48.0) * 1.75;
             }
@@ -3677,7 +3678,7 @@ mod tests {
         let block = LZ4HDF5_DEFAULT_BLOCK_SIZE;
         let count = block * 2 + block / 3 + 7; // 2.33 blocks of u8.
         let mut arr = NDArray::new(vec![NDDimension::new(count)], NDDataType::UInt8);
-        if let NDDataBuffer::U8(ref mut v) = arr.data {
+        if let NDDataViewMut::U8(v) = arr.data.view_mut() {
             for (i, x) in v.iter_mut().enumerate() {
                 *x = (i.wrapping_mul(2_654_435_761) % 251) as u8;
             }
@@ -3710,7 +3711,7 @@ mod tests {
             vec![NDDimension::new(48), NDDimension::new(48)],
             NDDataType::UInt16,
         );
-        if let NDDataBuffer::U16(ref mut v) = arr.data {
+        if let NDDataViewMut::U16(v) = arr.data.view_mut() {
             for (i, x) in v.iter_mut().enumerate() {
                 *x = (i * 7) as u16;
             }
@@ -3746,7 +3747,7 @@ mod tests {
         // lz4hdf5_compressBound (lz4hdf5.c:38-47): 0 is the default, and a block
         // larger than the data shrinks to it.
         let mut arr = NDArray::new(vec![NDDimension::new(1000)], NDDataType::UInt16);
-        if let NDDataBuffer::U16(ref mut v) = arr.data {
+        if let NDDataViewMut::U16(v) = arr.data.view_mut() {
             for (i, x) in v.iter_mut().enumerate() {
                 *x = (i * 13 % 997) as u16;
             }
@@ -3796,7 +3797,7 @@ mod tests {
             assert_eq!(proc.state.lock().zlib_clevel, stored);
         }
         let mut arr = NDArray::new(vec![NDDimension::new(65536)], NDDataType::UInt8);
-        if let NDDataBuffer::U8(ref mut v) = arr.data {
+        if let NDDataViewMut::U8(v) = arr.data.view_mut() {
             for (i, x) in v.iter_mut().enumerate() {
                 *x = (i / 7 % 13) as u8;
             }
@@ -4099,9 +4100,7 @@ mod tests {
         let pool = NDArrayPool::new(1_000_000);
         let arr = make_u8_array(16, 16);
         let mut corrupted = compress_lz4(&arr).unwrap();
-        if let NDDataBuffer::U8(ref mut v) = corrupted.data {
-            v.truncate(3);
-        }
+        corrupted.data.resize(3);
         let proc = processor_with_params(CodecMode::Decompress);
         let corrupted = Arc::new(corrupted);
         let result = proc.process_array(&corrupted, &pool);
@@ -4188,9 +4187,7 @@ mod tests {
 
         // Decompress: a truncated payload is a decoder failure.
         let mut corrupted = compress_lz4(&make_u8_array(16, 16)).unwrap();
-        if let NDDataBuffer::U8(ref mut v) = corrupted.data {
-            v.truncate(3);
-        }
+        corrupted.data.resize(3);
         let proc = processor_with_params(CodecMode::Decompress);
         let result = proc.process_array(&Arc::new(corrupted), &pool);
         assert_eq!(
@@ -4234,7 +4231,7 @@ mod tests {
             vec![NDDimension::new(128), NDDimension::new(128)],
             NDDataType::UInt8,
         );
-        if let NDDataBuffer::U8(ref mut v) = arr.data {
+        if let NDDataViewMut::U8(v) = arr.data.view_mut() {
             for x in v.iter_mut() {
                 *x = 0;
             }
@@ -4277,7 +4274,7 @@ mod tests {
         let buf = buffer_from_bytes(&bytes, NDDataType::UInt16).unwrap();
         assert_eq!(buf.data_type(), NDDataType::UInt16);
         assert_eq!(buf.len(), 3);
-        if let NDDataBuffer::U16(v) = buf {
+        if let NDDataView::U16(v) = buf.view() {
             assert_eq!(v, original);
         } else {
             panic!("wrong buffer type");
@@ -4296,7 +4293,7 @@ mod tests {
         let original = vec![1.5f64, -2.7, 3.14159];
         let bytes: Vec<u8> = original.iter().flat_map(|v| v.to_ne_bytes()).collect();
         let buf = buffer_from_bytes(&bytes, NDDataType::Float64).unwrap();
-        if let NDDataBuffer::F64(v) = buf {
+        if let NDDataView::F64(v) = buf.view() {
             assert_eq!(v, original);
         } else {
             panic!("wrong buffer type");
@@ -4313,7 +4310,7 @@ mod tests {
                 NDDataType::UInt8,
             )
             .unwrap();
-        if let NDDataBuffer::U8(ref mut v) = src.data {
+        if let NDDataViewMut::U8(v) = src.data.view_mut() {
             for (i, x) in v.iter_mut().enumerate() {
                 *x = (i % 7) as u8;
             }

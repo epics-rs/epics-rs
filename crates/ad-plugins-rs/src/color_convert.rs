@@ -8,7 +8,7 @@ use parking_lot::Mutex;
 
 use ad_core_rs::color::{self, NDBayerPattern, NDColorMode};
 use ad_core_rs::error::{ADError, ADResult};
-use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDimension};
+use ad_core_rs::ndarray::{NDArray, NDDataView, NDDataViewMut, NDDimension};
 use ad_core_rs::ndarray_pool::NDArrayPool;
 use ad_core_rs::plugin::runtime::{NDPluginProcess, ProcessResult};
 
@@ -54,7 +54,7 @@ pub fn bayer_to_rgb1(
         r_col_even,
     };
 
-    if !matches!(src.data, NDDataBuffer::U8(_) | NDDataBuffer::U16(_)) {
+    if !matches!(src.data.view(), NDDataView::U8(_) | NDDataView::U16(_)) {
         return Ok(None);
     }
     // C allocates the RGB1 output through the pool
@@ -65,9 +65,9 @@ pub fn bayer_to_rgb1(
         NDDimension::new(h),
     ];
     let mut arr = pool.alloc(dims, src.data.data_type())?;
-    match (&src.data, &mut arr.data) {
-        (NDDataBuffer::U8(v), NDDataBuffer::U8(out)) => demosaic(v, w, h, phase, out),
-        (NDDataBuffer::U16(v), NDDataBuffer::U16(out)) => demosaic(v, w, h, phase, out),
+    match (src.data.view(), arr.data.view_mut()) {
+        (NDDataView::U8(v), NDDataViewMut::U8(out)) => demosaic(v, w, h, phase, out),
+        (NDDataView::U16(v), NDDataViewMut::U16(out)) => demosaic(v, w, h, phase, out),
         _ => unreachable!("the output was allocated in the source type"),
     }
     arr.unique_id = src.unique_id;
@@ -945,7 +945,7 @@ fn false_color_mono_to_rgb1(
     let h = src.dims[1].size;
     let n = w * h;
 
-    if !matches!(src.data, NDDataBuffer::U8(_) | NDDataBuffer::I8(_)) {
+    if !matches!(src.data.view(), NDDataView::U8(_) | NDDataView::I8(_)) {
         return Ok(None);
     }
     // C allocates the RGB1 output through the pool (NDPluginColorConvert.cpp:93).
@@ -956,8 +956,8 @@ fn false_color_mono_to_rgb1(
     ];
     let mut arr = pool.alloc(dims, src.data.data_type())?;
     // Map each sample through the LUT by its low byte, keeping the input type.
-    match (&src.data, &mut arr.data) {
-        (NDDataBuffer::U8(src_slice), NDDataBuffer::U8(out)) => {
+    match (src.data.view(), arr.data.view_mut()) {
+        (NDDataView::U8(src_slice), NDDataViewMut::U8(out)) => {
             for i in 0..n {
                 let [r, g, b] = lut[src_slice[i] as usize];
                 out[i * 3] = r;
@@ -965,7 +965,7 @@ fn false_color_mono_to_rgb1(
                 out[i * 3 + 2] = b;
             }
         }
-        (NDDataBuffer::I8(src_slice), NDDataBuffer::I8(out)) => {
+        (NDDataView::I8(src_slice), NDDataViewMut::I8(out)) => {
             for i in 0..n {
                 let [r, g, b] = lut[src_slice[i] as u8 as usize];
                 out[i * 3] = r as i8;
@@ -1204,7 +1204,7 @@ impl NDPluginProcess for ColorConvertProcessor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ad_core_rs::ndarray::NDDataType;
+    use ad_core_rs::ndarray::{NDDataBuffer, NDDataType};
 
     fn pool() -> Arc<NDArrayPool> {
         NDArrayPool::new(0)
@@ -1265,7 +1265,7 @@ mod tests {
             vec![NDDimension::new(4), NDDimension::new(4)],
             NDDataType::UInt8,
         );
-        if let NDDataBuffer::U8(ref mut v) = arr.data {
+        if let NDDataViewMut::U8(v) = arr.data.view_mut() {
             // Simple pattern: all pixels = 128
             for i in 0..16 {
                 v[i] = 128;
@@ -1284,7 +1284,7 @@ mod tests {
     // RGB1 pixel (x,y) channel c lives at out[(y*w + x)*3 + c].
     fn rgb1_pixel(arr: &NDArray, w: usize, x: usize, y: usize) -> [u8; 3] {
         let i = (y * w + x) * 3;
-        if let NDDataBuffer::U8(ref v) = arr.data {
+        if let NDDataView::U8(v) = arr.data.view() {
             [v[i], v[i + 1], v[i + 2]]
         } else {
             panic!("expected UInt8 RGB1 output");
@@ -1301,7 +1301,7 @@ mod tests {
             vec![NDDimension::new(4), NDDimension::new(4)],
             NDDataType::UInt8,
         );
-        if let NDDataBuffer::U8(ref mut v) = arr.data {
+        if let NDDataViewMut::U8(v) = arr.data.view_mut() {
             for (i, p) in v.iter_mut().enumerate() {
                 *p = 10 + i as u8;
             }
@@ -1338,7 +1338,7 @@ mod tests {
             vec![NDDimension::new(4), NDDimension::new(4)],
             NDDataType::UInt8,
         );
-        if let NDDataBuffer::U8(ref mut v) = arr.data {
+        if let NDDataViewMut::U8(v) = arr.data.view_mut() {
             v.iter_mut().for_each(|p| *p = 100);
         }
         let rgb = bayer_to_rgb1(&pool(), &arr, NDBayerPattern::RGGB)
@@ -1368,7 +1368,7 @@ mod tests {
             vec![NDDimension::new(3), NDDimension::new(3)],
             NDDataType::UInt8,
         );
-        if let NDDataBuffer::U8(ref mut v) = arr.data {
+        if let NDDataViewMut::U8(v) = arr.data.view_mut() {
             // row0: 200 40 200 / row1: 80 128 80 / row2: 200 40 200
             v.copy_from_slice(&[200, 40, 200, 80, 128, 80, 200, 40, 200]);
         }
@@ -1530,10 +1530,10 @@ mod tests {
                     dims[1].offset = off.1;
                     let u16s = NDArray::with_data(
                         dims.clone(),
-                        NDDataBuffer::U16(vals.iter().map(|&v| v as u16).collect()),
+                        NDDataBuffer::from_vec::<u16>(vals.iter().map(|&v| v as u16).collect()),
                     );
                     let got = bayer_to_rgb1(&pool(), &u16s, pattern).unwrap().unwrap();
-                    let NDDataBuffer::U16(got) = &got.data else {
+                    let NDDataView::U16(got) = got.data.view() else {
                         panic!("u16 in, u16 out");
                     };
                     assert_eq!(got.len(), want.len(), "{w}x{h} {off:?} {pattern:?}");
@@ -1550,10 +1550,10 @@ mod tests {
                     );
                     let u8s = NDArray::with_data(
                         dims,
-                        NDDataBuffer::U8(vals.iter().map(|&v| v as u8).collect()),
+                        NDDataBuffer::from_vec::<u8>(vals.iter().map(|&v| v as u8).collect()),
                     );
                     let got = bayer_to_rgb1(&pool(), &u8s, pattern).unwrap().unwrap();
-                    let NDDataBuffer::U8(got) = &got.data else {
+                    let NDDataView::U8(got) = got.data.view() else {
                         panic!("u8 in, u8 out");
                     };
                     assert!(
@@ -1608,7 +1608,7 @@ mod tests {
             vec![NDDimension::new(4), NDDimension::new(4)],
             NDDataType::UInt8,
         );
-        if let NDDataBuffer::U8(ref mut v) = arr.data {
+        if let NDDataViewMut::U8(v) = arr.data.view_mut() {
             for i in 0..16 {
                 v[i] = 128;
             }
@@ -1634,7 +1634,7 @@ mod tests {
             vec![NDDimension::new(4), NDDimension::new(4)],
             NDDataType::UInt8,
         );
-        if let NDDataBuffer::U8(ref mut v) = arr.data {
+        if let NDDataViewMut::U8(v) = arr.data.view_mut() {
             for i in 0..16 {
                 v[i] = (i * 17) as u8; // 0, 17, 34, ... 255
             }
@@ -1650,7 +1650,7 @@ mod tests {
 
         // false_color=1 selects the Rainbow LUT (NDPluginColorConvert.cpp:62-66).
         // Pixel 0 (value=0) -> Rainbow[0]=(0,0,0); the old jet LUT gave B=127 here.
-        if let NDDataBuffer::U8(ref v) = out.data {
+        if let NDDataView::U8(v) = out.data.view() {
             assert_eq!([v[0], v[1], v[2]], RAINBOW_COLOR_MAP[0]);
             assert_eq!([v[0], v[1], v[2]], [0, 0, 0]);
             // Last pixel (value=255) -> Rainbow[255]=(255,255,255).
@@ -1676,14 +1676,14 @@ mod tests {
             vec![NDDimension::new(2), NDDimension::new(1)],
             NDDataType::UInt8,
         );
-        if let NDDataBuffer::U8(ref mut v) = arr.data {
+        if let NDDataViewMut::U8(v) = arr.data.view_mut() {
             v[0] = 0;
             v[1] = 192;
         }
 
         let result = proc.process_array(&Arc::new(arr), &pool);
         let out = &result.output_arrays[0];
-        if let NDDataBuffer::U8(ref v) = out.data {
+        if let NDDataView::U8(v) = out.data.view() {
             // false_color=2 selects Iron (NDPluginColorConvert.cpp:68-72).
             assert_eq!([v[0], v[1], v[2]], IRON_COLOR_MAP[0]);
             assert_eq!([v[3], v[4], v[5]], IRON_COLOR_MAP[192]);
@@ -1714,14 +1714,14 @@ mod tests {
             vec![NDDimension::new(2), NDDimension::new(1)],
             NDDataType::Int8,
         );
-        if let NDDataBuffer::I8(ref mut v) = arr.data {
+        if let NDDataViewMut::I8(v) = arr.data.view_mut() {
             v[0] = 0;
             v[1] = -64; // (unsigned char)(-64) == 192
         }
 
         let result = proc.process_array(&Arc::new(arr), &pool);
         let out = &result.output_arrays[0];
-        let NDDataBuffer::I8(ref v) = out.data else {
+        let NDDataView::I8(v) = out.data.view() else {
             panic!("Int8 input must stay Int8 (C allocates with pArray->dataType)");
         };
         let e0 = IRON_COLOR_MAP[0];
@@ -1755,14 +1755,14 @@ mod tests {
             vec![NDDimension::new(2), NDDimension::new(1)],
             NDDataType::UInt16,
         );
-        if let NDDataBuffer::U16(ref mut v) = arr.data {
+        if let NDDataViewMut::U16(v) = arr.data.view_mut() {
             v[0] = 1000;
             v[1] = 2000;
         }
 
         let result = proc.process_array(&Arc::new(arr), &pool);
         let out = &result.output_arrays[0];
-        let NDDataBuffer::U16(ref v) = out.data else {
+        let NDDataView::U16(v) = out.data.view() else {
             panic!("expected UInt16 output");
         };
         assert_eq!(v[..6], [1000, 1000, 1000, 2000, 2000, 2000]);
@@ -1787,7 +1787,7 @@ mod tests {
             ],
             NDDataType::UInt8,
         );
-        if let NDDataBuffer::U8(ref mut v) = arr.data {
+        if let NDDataViewMut::U8(v) = arr.data.view_mut() {
             for i in 0..v.len() {
                 v[i] = (i % 256) as u8;
             }
@@ -1823,7 +1823,7 @@ mod tests {
             ],
             NDDataType::UInt8,
         );
-        if let NDDataBuffer::U8(ref mut v) = arr.data {
+        if let NDDataViewMut::U8(v) = arr.data.view_mut() {
             for i in 0..v.len() {
                 v[i] = 128;
             }
@@ -1926,7 +1926,7 @@ mod tests {
             NDDataType::UInt8,
         );
         arr.unique_id = 42;
-        if let NDDataBuffer::U8(ref mut v) = arr.data {
+        if let NDDataViewMut::U8(v) = arr.data.view_mut() {
             for i in 0..16 {
                 v[i] = i as u8;
             }
@@ -1941,10 +1941,10 @@ mod tests {
         assert!(!Arc::ptr_eq(out, &arr));
         assert_eq!(out.pool_id(), pool.id());
         assert_eq!(out.unique_id, 42);
-        let NDDataBuffer::U8(v) = &out.data else {
+        let NDDataView::U8(v) = out.data.view() else {
             panic!("expected U8 buffer");
         };
-        assert_eq!(v.as_slice(), (0..16).collect::<Vec<u8>>().as_slice());
+        assert_eq!(v, (0..16).collect::<Vec<u8>>().as_slice());
     }
 
     fn set_color_mode_attr(arr: &mut NDArray, mode: NDColorMode) {
@@ -1972,7 +1972,7 @@ mod tests {
             NDDataType::UInt8,
         );
         set_color_mode_attr(&mut arr, NDColorMode::Bayer);
-        if let NDDataBuffer::U8(ref mut v) = arr.data {
+        if let NDDataViewMut::U8(v) = arr.data.view_mut() {
             for i in 0..16 {
                 v[i] = 128;
             }
@@ -2002,7 +2002,7 @@ mod tests {
             NDDataType::UInt8,
         );
         set_color_mode_attr(&mut arr, NDColorMode::RGB1);
-        if let NDDataBuffer::U8(ref mut v) = arr.data {
+        if let NDDataViewMut::U8(v) = arr.data.view_mut() {
             for i in 0..v.len() {
                 v[i] = (i % 256) as u8;
             }
@@ -2040,7 +2040,7 @@ mod tests {
             NDDataType::UInt8,
         );
         set_color_mode_attr(&mut arr, NDColorMode::YUV422);
-        if let NDDataBuffer::U8(ref mut v) = arr.data {
+        if let NDDataViewMut::U8(v) = arr.data.view_mut() {
             // UYVY pattern: U Y0 V Y1
             let uyvy: [u8; 16] = [
                 128, 100, 128, 150, 128, 200, 128, 50, 128, 128, 128, 128, 128, 64, 128, 192,
@@ -2070,7 +2070,7 @@ mod tests {
             vec![NDDimension::new(4), NDDimension::new(2)],
             NDDataType::UInt8,
         );
-        if let NDDataBuffer::U8(ref mut v) = arr.data {
+        if let NDDataViewMut::U8(v) = arr.data.view_mut() {
             for i in 0..8 {
                 v[i] = (i * 30) as u8;
             }
@@ -2102,7 +2102,7 @@ mod tests {
             NDDataType::UInt8,
         );
         set_color_mode_attr(&mut arr, NDColorMode::YUV444);
-        if let NDDataBuffer::U8(ref mut v) = arr.data {
+        if let NDDataViewMut::U8(v) = arr.data.view_mut() {
             for i in 0..v.len() {
                 v[i] = 128;
             }
@@ -2157,7 +2157,7 @@ mod tests {
             vec![NDDimension::new(4), NDDimension::new(4)],
             NDDataType::UInt8,
         );
-        if let NDDataBuffer::U8(ref mut v) = arr.data {
+        if let NDDataViewMut::U8(v) = arr.data.view_mut() {
             v.fill(128);
         }
 
@@ -2165,7 +2165,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(first.pool_id(), pool.id());
-        let NDDataBuffer::U8(v) = &first.data else {
+        let NDDataView::U8(v) = first.data.view() else {
             panic!("expected U8 output");
         };
         assert_eq!(v.len(), 48);
@@ -2175,7 +2175,7 @@ mod tests {
         let second = bayer_to_rgb1(&pool, &arr, NDBayerPattern::RGGB)
             .unwrap()
             .unwrap();
-        let NDDataBuffer::U8(v) = &second.data else {
+        let NDDataView::U8(v) = second.data.view() else {
             panic!("expected U8 output");
         };
         assert_eq!(v.as_ptr(), ptr, "the second frame reuses the freed buffer");

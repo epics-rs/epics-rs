@@ -1316,7 +1316,7 @@ mod tests {
             WriteVerdict::Accept(1)
         );
     }
-    use ad_core_rs::ndarray::{NDDataBuffer, NDDimension};
+    use ad_core_rs::ndarray::{NDDataView, NDDataViewMut, NDDimension};
 
     #[test]
     fn test_register_params_seeds_the_c_constructor_values() {
@@ -1375,7 +1375,7 @@ mod tests {
 
     fn make_array(vals: &[u8]) -> NDArray {
         let mut arr = NDArray::new(vec![NDDimension::new(vals.len())], NDDataType::UInt8);
-        if let NDDataBuffer::U8(ref mut v) = arr.data {
+        if let NDDataViewMut::U8(v) = arr.data.view_mut() {
             v.copy_from_slice(vals);
         }
         arr
@@ -1396,7 +1396,7 @@ mod tests {
 
     fn make_f64_array(vals: &[f64]) -> NDArray {
         let mut arr = NDArray::new(vec![NDDimension::new(vals.len())], NDDataType::Float64);
-        if let NDDataBuffer::F64(ref mut v) = arr.data {
+        if let NDDataViewMut::F64(v) = arr.data.view_mut() {
             v.copy_from_slice(vals);
         }
         arr
@@ -1414,7 +1414,7 @@ mod tests {
         seed_background(&mut state, &bg_arr);
 
         let result = state.process(&pool(), &input).unwrap().unwrap();
-        if let NDDataBuffer::U8(ref v) = result.data {
+        if let NDDataView::U8(v) = result.data.view() {
             assert_eq!(v[0], 5);
             assert_eq!(v[1], 5);
             assert_eq!(v[2], 5);
@@ -1440,7 +1440,7 @@ mod tests {
         // Size mismatch → background ignored → output unchanged; valid recomputed
         // false at process time.
         assert!(!state.config.valid_background);
-        if let NDDataBuffer::U8(ref v) = result.data {
+        if let NDDataView::U8(v) = result.data.view() {
             assert_eq!(v, &[15, 25, 35]);
         } else {
             panic!("expected U8 output");
@@ -1462,7 +1462,7 @@ mod tests {
         seed_flat_field(&mut state, &ff_arr);
 
         let result = state.process(&pool(), &input).unwrap().unwrap();
-        if let NDDataBuffer::U8(ref v) = result.data {
+        if let NDDataView::U8(v) = result.data.view() {
             assert_eq!(v[0], 100); // 100*100/100
             assert_eq!(v[1], 50); //  100*100/200
             assert_eq!(v[2], 200); // 100*100/50
@@ -1485,7 +1485,7 @@ mod tests {
         });
         seed_flat_field(&mut state, &ff_arr);
         let result = state.process(&pool(), &input).unwrap().unwrap();
-        if let NDDataBuffer::U8(ref v) = result.data {
+        if let NDDataView::U8(v) = result.data.view() {
             assert_eq!(v, &[0, 0, 0]);
         } else {
             panic!("expected U8 output");
@@ -1503,7 +1503,7 @@ mod tests {
         });
 
         let result = state.process(&pool(), &input).unwrap().unwrap();
-        if let NDDataBuffer::U8(ref v) = result.data {
+        if let NDDataView::U8(v) = result.data.view() {
             // C++: value = (value + offset) * scale
             assert_eq!(v[0], 30); // (10+5)*2
             assert_eq!(v[1], 50); // (20+5)*2
@@ -1525,7 +1525,7 @@ mod tests {
         });
 
         let result = state.process(&pool(), &input).unwrap().unwrap();
-        if let NDDataBuffer::U8(ref v) = result.data {
+        if let NDDataView::U8(v) = result.data.view() {
             assert_eq!(v[0], 10); // clipped up
             assert_eq!(v[1], 50); // unchanged
             assert_eq!(v[2], 100); // clipped down
@@ -1561,7 +1561,7 @@ mod tests {
         let result = (state.process(&pool(), &make_f64_array(&input)))
             .unwrap()
             .unwrap();
-        let NDDataBuffer::F64(ref got) = result.data else {
+        let NDDataView::F64(got) = result.data.view() else {
             panic!("expected F64 output");
         };
         for i in 0..n {
@@ -1593,7 +1593,7 @@ mod tests {
             ..Default::default()
         });
         let result = state.process(&pool(), &input).unwrap().unwrap();
-        if let NDDataBuffer::F64(ref v) = result.data {
+        if let NDDataView::F64(v) = result.data.view() {
             assert_eq!(v[0], 999.0);
         } else {
             panic!("expected F64 output");
@@ -1639,7 +1639,7 @@ mod tests {
         // data   = 0 + 1*100 + 0*0 = 100
         // filter = 0 + 0.5*100 + 0.5*0(orig data) = 50
         let result = state.process(&pool(), &input2).unwrap().unwrap();
-        if let NDDataBuffer::U8(ref v) = result.data {
+        if let NDDataView::U8(v) = result.data.view() {
             // Output is data = O1*filter = 1*100 = 100
             assert_eq!(v[0], 100);
             assert_eq!(v[1], 100);
@@ -1673,7 +1673,7 @@ mod tests {
         let input = make_array(&[10, 20, 30]);
         let result = proc.process_array(&Arc::new(input), &pool);
         assert_eq!(result.output_arrays.len(), 1);
-        if let NDDataBuffer::U8(ref v) = result.output_arrays[0].data {
+        if let NDDataView::U8(v) = result.output_arrays[0].data.view() {
             assert_eq!(v[0], 22); // (10+1)*2 = 22 (C++: offset first, then scale)
         }
     }
@@ -2267,7 +2267,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(!state.config.auto_offset_scale_pending); // one-shot consumed
-        if let NDDataBuffer::U8(v) = &out1.data {
+        if let NDDataView::U8(v) = out1.data.view() {
             assert_eq!(v, &[10, 20, 30]); // trigger frame NOT transformed
         } else {
             panic!("expected u8 output");
@@ -2283,7 +2283,7 @@ mod tests {
             .process(&pool(), &make_f64_array(&[10.0, 20.0, 30.0]))
             .unwrap()
             .unwrap();
-        if let NDDataBuffer::U8(v) = &out2.data {
+        if let NDDataView::U8(v) = out2.data.view() {
             assert_eq!(v[0], 0); // (10-10)*12.75 = 0
             assert_eq!(v[2], 255); // (30-10)*12.75 = 255
         } else {
@@ -2426,11 +2426,11 @@ mod tests {
         });
 
         let result = state.process(&pool(), &input).unwrap().unwrap();
-        let NDDataBuffer::F64(ref v) = result.data else {
+        let NDDataView::F64(v) = result.data.view() else {
             panic!("expected an F64 output buffer, got {:?}", result.data);
         };
         assert_eq!(
-            v.as_slice(),
+            v,
             [5.0, 5.0, 5.0],
             "RC1=RC2=0 makes C's reset `filter[i] = rOffset`; O2=0 drops the NaN \
              data term. Every element is rOffset — 0.0 * NaN must not be summed in"
@@ -2440,7 +2440,7 @@ mod tests {
         // fully finite frame still comes out clean.
         let clean = make_f64_array(&[7.0, 8.0, 9.0]);
         let result = state.process(&pool(), &clean).unwrap().unwrap();
-        let NDDataBuffer::F64(ref v) = result.data else {
+        let NDDataView::F64(v) = result.data.view() else {
             panic!("expected an F64 output buffer");
         };
         assert!(
@@ -2462,7 +2462,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(first.pool_id(), pool.id());
-        let NDDataBuffer::F32(v) = &first.data else {
+        let NDDataView::F32(v) = first.data.view() else {
             panic!("expected F32 output");
         };
         assert_eq!(v, &[1.0, 2.0, 3.0]);
@@ -2475,7 +2475,7 @@ mod tests {
             .process(&pool, &make_array(&[4, 5, 6]))
             .unwrap()
             .unwrap();
-        let NDDataBuffer::F32(v) = &second.data else {
+        let NDDataView::F32(v) = second.data.view() else {
             panic!("expected F32 output");
         };
         assert_eq!(v, &[4.0, 5.0, 6.0]);
@@ -2589,7 +2589,7 @@ mod tests {
         let out = proc.process_array(&Arc::new(input), &pool);
         assert_eq!(out.output_arrays.len(), 1);
         let arr = &out.output_arrays[0];
-        let NDDataBuffer::U8(v) = &arr.data else {
+        let NDDataView::U8(v) = arr.data.view() else {
             panic!("expected the input's UInt8 type");
         };
         assert_eq!(v, &[10, 20, 30]);
@@ -2602,7 +2602,7 @@ mod tests {
             ..Default::default()
         });
         let out = proc.process_array(&Arc::new(make_array(&[10, 20, 30])), &pool);
-        let NDDataBuffer::F64(v) = &out.output_arrays[0].data else {
+        let NDDataView::F64(v) = out.output_arrays[0].data.view() else {
             panic!("expected Float64 output");
         };
         assert_eq!(v, &[10.0, 20.0, 30.0]);

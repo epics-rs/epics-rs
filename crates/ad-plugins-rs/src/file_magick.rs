@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use ad_core_rs::color::{NDColorMode, convert_rgb_layout};
 use ad_core_rs::error::{ADError, ADResult};
-use ad_core_rs::ndarray::{NDArray, NDDataBuffer};
+use ad_core_rs::ndarray::{NDArray, NDDataView};
 use ad_core_rs::ndarray_pool::NDArrayPool;
 use ad_core_rs::plugin::file_base::{NDFileOpenMode, NDFileWriter};
 use ad_core_rs::plugin::file_controller::{
@@ -176,23 +176,23 @@ impl MagickWriter {
             array
         };
 
-        match &src.data {
-            NDDataBuffer::U8(v) => {
+        match src.data.view() {
+            NDDataView::U8(v) => {
                 if is_rgb {
-                    image::RgbImage::from_raw(width, height, v.clone())
+                    image::RgbImage::from_raw(width, height, v.to_vec())
                         .map(DynamicImage::ImageRgb8)
                         .ok_or_else(|| {
                             ADError::UnsupportedConversion("RGB8 buffer size mismatch".into())
                         })
                 } else {
-                    image::GrayImage::from_raw(width, height, v.clone())
+                    image::GrayImage::from_raw(width, height, v.to_vec())
                         .map(DynamicImage::ImageLuma8)
                         .ok_or_else(|| {
                             ADError::UnsupportedConversion("Gray8 buffer size mismatch".into())
                         })
                 }
             }
-            NDDataBuffer::I8(v) => {
+            NDDataView::I8(v) => {
                 let u8_data: Vec<u8> = v.iter().map(|&b| b as u8).collect();
                 if is_rgb {
                     image::RgbImage::from_raw(width, height, u8_data)
@@ -208,12 +208,12 @@ impl MagickWriter {
                         })
                 }
             }
-            NDDataBuffer::U16(v) => {
+            NDDataView::U16(v) => {
                 if is_rgb {
                     image::ImageBuffer::<image::Rgb<u16>, Vec<u16>>::from_raw(
                         width,
                         height,
-                        v.clone(),
+                        v.to_vec(),
                     )
                     .map(DynamicImage::ImageRgb16)
                     .ok_or_else(|| {
@@ -223,7 +223,7 @@ impl MagickWriter {
                     image::ImageBuffer::<image::Luma<u16>, Vec<u16>>::from_raw(
                         width,
                         height,
-                        v.clone(),
+                        v.to_vec(),
                     )
                     .map(DynamicImage::ImageLuma16)
                     .ok_or_else(|| {
@@ -231,7 +231,7 @@ impl MagickWriter {
                     })
                 }
             }
-            NDDataBuffer::I16(v) => {
+            NDDataView::I16(v) => {
                 let u16_data: Vec<u16> = v.iter().map(|&b| b as u16).collect();
                 if is_rgb {
                     image::ImageBuffer::<image::Rgb<u16>, Vec<u16>>::from_raw(
@@ -251,7 +251,7 @@ impl MagickWriter {
                     })
                 }
             }
-            NDDataBuffer::F32(v) => {
+            NDDataView::F32(v) => {
                 // Scale by the actual data range, not a fixed [0,1] clamp
                 // (C++ NDFileMagick scales by the image's min/max range).
                 let mut min = f32::INFINITY;
@@ -500,7 +500,7 @@ impl NDPluginProcess for MagickFileProcessor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ad_core_rs::ndarray::{NDDataType, NDDimension};
+    use ad_core_rs::ndarray::{NDDataType, NDDataViewMut, NDDimension};
     use std::sync::atomic::{AtomicU32, Ordering};
 
     static TEST_COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -664,7 +664,7 @@ mod tests {
             vec![NDDimension::new(8), NDDimension::new(8)],
             NDDataType::UInt8,
         );
-        if let NDDataBuffer::U8(ref mut v) = arr.data {
+        if let NDDataViewMut::U8(v) = arr.data.view_mut() {
             for i in 0..64 {
                 v[i] = (i * 4) as u8;
             }
@@ -678,10 +678,10 @@ mod tests {
 
         let read_back = image::open(&path).unwrap();
         assert_eq!(read_back.color(), image::ColorType::L8);
-        let NDDataBuffer::U8(orig) = &arr.data else {
+        let NDDataView::U8(orig) = arr.data.view() else {
             unreachable!()
         };
-        assert_eq!(read_back.as_bytes(), &orig[..]);
+        assert_eq!(read_back.as_bytes(), orig);
         std::fs::remove_file(&path).ok();
     }
 
@@ -694,7 +694,7 @@ mod tests {
             vec![NDDimension::new(8), NDDimension::new(8)],
             NDDataType::UInt16,
         );
-        if let NDDataBuffer::U16(ref mut v) = arr.data {
+        if let NDDataViewMut::U16(v) = arr.data.view_mut() {
             for i in 0..64 {
                 v[i] = (i * 1000) as u16;
             }
@@ -708,7 +708,7 @@ mod tests {
 
         let read_back = image::open(&path).unwrap();
         assert_eq!(read_back.color(), image::ColorType::L16);
-        let NDDataBuffer::U16(orig) = &arr.data else {
+        let NDDataView::U16(orig) = arr.data.view() else {
             unreachable!()
         };
         assert_eq!(read_back.into_luma16().into_raw(), *orig);
@@ -736,7 +736,7 @@ mod tests {
             NDAttrSource::Driver,
             NDAttrValue::Int32(2), // RGB1
         ));
-        if let NDDataBuffer::U8(ref mut v) = arr.data {
+        if let NDDataViewMut::U8(v) = arr.data.view_mut() {
             for i in 0..48 {
                 v[i] = (i * 5) as u8;
             }
@@ -771,7 +771,7 @@ mod tests {
             vec![NDDimension::new(4), NDDimension::new(4)],
             NDDataType::UInt16,
         );
-        if let NDDataBuffer::U16(ref mut v) = arr.data {
+        if let NDDataViewMut::U16(v) = arr.data.view_mut() {
             for (i, x) in v.iter_mut().enumerate() {
                 *x = (i * 4000) as u16;
             }
@@ -789,7 +789,7 @@ mod tests {
             vec![NDDimension::new(2), NDDimension::new(2)],
             NDDataType::Float32,
         );
-        if let NDDataBuffer::F32(ref mut v) = arr.data {
+        if let NDDataViewMut::F32(v) = arr.data.view_mut() {
             v[0] = 100.0;
             v[1] = 200.0;
             v[2] = 300.0;
@@ -815,7 +815,7 @@ mod tests {
             vec![NDDimension::new(64), NDDimension::new(64)],
             NDDataType::UInt8,
         );
-        if let NDDataBuffer::U8(ref mut v) = arr.data {
+        if let NDDataViewMut::U8(v) = arr.data.view_mut() {
             for x in v.iter_mut() {
                 *x = 128; // uniform → highly compressible
             }

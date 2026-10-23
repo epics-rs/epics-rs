@@ -15,7 +15,7 @@ use asyn_rs::port::InterfaceMask;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
-use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDataType};
+use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDataType, NDDataView, NDDataViewMut};
 use ad_core_rs::ndarray_pool::NDArrayPool;
 use ad_core_rs::plugin::runtime::{NDPluginProcess, PortPost, ProcessResult};
 use asyn_rs::trace::TraceMask;
@@ -347,17 +347,17 @@ fn frame_pixels(array: &Arc<NDArray>) -> NdArrayBuffer {
     {
         PvArray::from_owner(Arc::new(Pixels(Arc::clone(array), PhantomData)))
     }
-    match &array.data {
-        NDDataBuffer::I8(_) => NdArrayBuffer::Byte(own(array)),
-        NDDataBuffer::U8(_) => NdArrayBuffer::UByte(own(array)),
-        NDDataBuffer::I16(_) => NdArrayBuffer::Short(own(array)),
-        NDDataBuffer::U16(_) => NdArrayBuffer::UShort(own(array)),
-        NDDataBuffer::I32(_) => NdArrayBuffer::Int(own(array)),
-        NDDataBuffer::U32(_) => NdArrayBuffer::UInt(own(array)),
-        NDDataBuffer::I64(_) => NdArrayBuffer::Long(own(array)),
-        NDDataBuffer::U64(_) => NdArrayBuffer::ULong(own(array)),
-        NDDataBuffer::F32(_) => NdArrayBuffer::Float(own(array)),
-        NDDataBuffer::F64(_) => NdArrayBuffer::Double(own(array)),
+    match array.data.view() {
+        NDDataView::I8(_) => NdArrayBuffer::Byte(own(array)),
+        NDDataView::U8(_) => NdArrayBuffer::UByte(own(array)),
+        NDDataView::I16(_) => NdArrayBuffer::Short(own(array)),
+        NDDataView::U16(_) => NdArrayBuffer::UShort(own(array)),
+        NDDataView::I32(_) => NdArrayBuffer::Int(own(array)),
+        NDDataView::U32(_) => NdArrayBuffer::UInt(own(array)),
+        NDDataView::I64(_) => NdArrayBuffer::Long(own(array)),
+        NDDataView::U64(_) => NdArrayBuffer::ULong(own(array)),
+        NDDataView::F32(_) => NdArrayBuffer::Float(own(array)),
+        NDDataView::F64(_) => NdArrayBuffer::Double(own(array)),
     }
 }
 
@@ -465,7 +465,7 @@ mod tests {
             NDDataType::UInt8,
         );
         arr.unique_id = 42;
-        if let NDDataBuffer::U8(ref mut buf) = arr.data {
+        if let NDDataViewMut::U8(buf) = arr.data.view_mut() {
             for (i, v) in buf.iter_mut().enumerate() {
                 *v = i as u8;
             }
@@ -491,7 +491,7 @@ mod tests {
             vec![NDDimension::new(64), NDDimension::new(64)],
             NDDataType::UInt16,
         ));
-        let NDDataBuffer::U16(pixels) = &arr.data else {
+        let NDDataView::U16(pixels) = arr.data.view() else {
             panic!("expected u16 pixels");
         };
         let frame_ptr = pixels.as_ptr();
@@ -575,7 +575,7 @@ mod tests {
     #[test]
     fn compressed_array_emits_ubyte_value_and_codec_parameters() {
         let mut arr = NDArray::new(vec![NDDimension::new(8)], NDDataType::UInt16);
-        if let NDDataBuffer::U16(ref mut buf) = arr.data {
+        if let NDDataViewMut::U16(buf) = arr.data.view_mut() {
             for (i, v) in buf.iter_mut().enumerate() {
                 *v = (i * 1000) as u16;
             }
@@ -585,7 +585,7 @@ mod tests {
         let compressed = crate::codec::compress_lz4(&arr).unwrap();
         let comp_size = compressed.codec.as_ref().unwrap().compressed_size as i64;
         assert!(
-            matches!(compressed.data, NDDataBuffer::U8(_)),
+            matches!(compressed.data.view(), NDDataView::U8(_)),
             "compressed buffer must hold raw bytes"
         );
 
@@ -700,7 +700,7 @@ mod tests {
         use ad_core_rs::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
 
         let mut arr = NDArray::new(vec![NDDimension::new(8)], NDDataType::UInt16);
-        if let NDDataBuffer::U16(ref mut buf) = arr.data {
+        if let NDDataViewMut::U16(buf) = arr.data.view_mut() {
             for (i, v) in buf.iter_mut().enumerate() {
                 *v = (i * 1000) as u16;
             }

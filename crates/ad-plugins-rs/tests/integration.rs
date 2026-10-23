@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use ad_core_rs::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
 use ad_core_rs::driver::ad_driver::ADDriverBase;
-use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDataType, NDDimension};
+use ad_core_rs::ndarray::{NDArray, NDDataType, NDDataViewMut, NDDimension};
 use ad_core_rs::ndarray_pool::NDArrayPool;
 use ad_core_rs::plugin::runtime::ASYN_CANBLOCK;
 use ad_core_rs::plugin::runtime::{NDPluginProcess, PluginRuntimeHandle};
@@ -88,7 +88,7 @@ fn test_driver_to_stats_pipeline() {
         )
         .unwrap();
 
-    if let NDDataBuffer::U8(ref mut v) = arr.data {
+    if let NDDataViewMut::U8(v) = arr.data.view_mut() {
         for i in 0..v.len() {
             v[i] = (i % 256) as u8;
         }
@@ -634,7 +634,7 @@ fn make_2d_u8(w: usize, h: usize) -> NDArray {
         vec![NDDimension::new(w), NDDimension::new(h)],
         NDDataType::UInt8,
     );
-    if let NDDataBuffer::U8(ref mut v) = arr.data {
+    if let NDDataViewMut::U8(v) = arr.data.view_mut() {
         for i in 0..v.len() {
             v[i] = (i % 256) as u8;
         }

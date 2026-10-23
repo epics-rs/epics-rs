@@ -429,14 +429,14 @@ mod tests {
         assert_eq!(out.trace.len(), 1);
         assert_eq!(proc.list.lock().pixels.len(), 1);
     }
-    use ad_core_rs::ndarray::{NDDataType, NDDimension};
+    use ad_core_rs::ndarray::{NDDataType, NDDataView, NDDataViewMut, NDDimension};
 
     fn make_2d_array(x: usize, y: usize, fill: impl Fn(usize, usize) -> f64) -> NDArray {
         let mut arr = NDArray::new(
             vec![NDDimension::new(x), NDDimension::new(y)],
             NDDataType::Float64,
         );
-        if let NDDataBuffer::F64(ref mut v) = arr.data {
+        if let NDDataViewMut::F64(v) = arr.data.view_mut() {
             for iy in 0..y {
                 for ix in 0..x {
                     v[iy * x + ix] = fill(ix, iy);
@@ -502,7 +502,7 @@ mod tests {
             NDAttrSource::Driver,
             NDAttrValue::Int32(NDColorMode::RGB1 as i32),
         ));
-        if let NDDataBuffer::F64(ref mut v) = arr.data {
+        if let NDDataViewMut::F64(v) = arr.data.view_mut() {
             v.iter_mut().for_each(|x| *x = 100.0);
         }
 
@@ -780,7 +780,7 @@ mod tests {
             vec![NDDimension::new(4), NDDimension::new(4)],
             NDDataType::UInt8,
         );
-        if let NDDataBuffer::U8(ref mut v) = arr.data {
+        if let NDDataViewMut::U8(v) = arr.data.view_mut() {
             for val in v.iter_mut() {
                 *val = 100;
             }
@@ -817,14 +817,14 @@ mod tests {
         assert_eq!(first.pool_id(), pool.id());
         assert!((get_pixel(&first, 1, 1, 4) - 0.0).abs() < 1e-10);
         assert!((get_pixel(&first, 0, 0, 4) - 100.0).abs() < 1e-10);
-        let NDDataBuffer::F64(v) = &first.data else {
+        let NDDataView::F64(v) = first.data.view() else {
             panic!("expected F64 buffer");
         };
         let ptr = v.as_ptr();
         drop(first);
 
         let second = proc.process_array(&arr, &pool).output_arrays.remove(0);
-        let NDDataBuffer::F64(v) = &second.data else {
+        let NDDataView::F64(v) = second.data.view() else {
             panic!("expected F64 buffer");
         };
         assert_eq!(v.as_ptr(), ptr, "the second frame reuses the freed buffer");

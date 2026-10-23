@@ -323,7 +323,7 @@ mod tests {
         );
     }
     use ad_core_rs::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
-    use ad_core_rs::ndarray::{NDDataBuffer, NDDataType, NDDimension};
+    use ad_core_rs::ndarray::{NDDataType, NDDataView, NDDimension};
 
     fn make_array_with_attr(name: &str, value: f64, uid: i32) -> NDArray {
         let mut arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
@@ -638,7 +638,7 @@ mod tests {
             panic!("one TS point per frame, got {}", r.addressed.len());
         };
         assert_eq!(*addr, 1);
-        let NDDataBuffer::F64(v) = &ts.data else {
+        let NDDataView::F64(v) = ts.data.view() else {
             panic!("TS point is Float64");
         };
         assert_eq!(v.len(), 16);

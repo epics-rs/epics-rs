@@ -712,7 +712,7 @@ impl NDPluginProcess for TiffFileProcessor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ad_core_rs::ndarray::NDDataBuffer;
+    use ad_core_rs::ndarray::{NDDataView, NDDataViewMut};
     use ad_core_rs::plugin::file_base::NDFileMode;
     // The tests verify the bytes this module writes with an INDEPENDENT TIFF
     // decoder (the `tiff` crate), not with our own reader.
@@ -1498,7 +1498,7 @@ mod tests {
             vec![NDDimension::new(4), NDDimension::new(4)],
             NDDataType::UInt8,
         );
-        if let NDDataBuffer::U8(v) = &mut arr.data {
+        if let NDDataViewMut::U8(v) = arr.data.view_mut() {
             for i in 0..16 {
                 v[i] = i as u8;
             }
@@ -1551,7 +1551,7 @@ mod tests {
             vec![NDDimension::new(4), NDDimension::new(4)],
             NDDataType::UInt8,
         );
-        if let NDDataBuffer::U8(v) = &mut arr.data {
+        if let NDDataViewMut::U8(v) = arr.data.view_mut() {
             for i in 0..16 {
                 v[i] = (i * 10) as u8;
             }
@@ -1563,7 +1563,9 @@ mod tests {
         writer.write_file(&Arc::new(arr.clone())).unwrap();
 
         let read_back = writer.read_file().unwrap();
-        if let (NDDataBuffer::U8(orig), NDDataBuffer::U8(read)) = (&arr.data, &read_back.data) {
+        if let (NDDataView::U8(orig), NDDataView::U8(read)) =
+            (arr.data.view(), read_back.data.view())
+        {
             assert_eq!(orig, read);
         } else {
             panic!("data type mismatch on roundtrip");
@@ -1582,7 +1584,7 @@ mod tests {
             vec![NDDimension::new(4), NDDimension::new(4)],
             NDDataType::UInt16,
         );
-        if let NDDataBuffer::U16(v) = &mut arr.data {
+        if let NDDataViewMut::U16(v) = arr.data.view_mut() {
             for i in 0..16 {
                 v[i] = (i * 1000) as u16;
             }
@@ -1594,7 +1596,9 @@ mod tests {
         writer.write_file(&Arc::new(arr.clone())).unwrap();
 
         let read_back = writer.read_file().unwrap();
-        if let (NDDataBuffer::U16(orig), NDDataBuffer::U16(read)) = (&arr.data, &read_back.data) {
+        if let (NDDataView::U16(orig), NDDataView::U16(read)) =
+            (arr.data.view(), read_back.data.view())
+        {
             assert_eq!(orig, read);
         } else {
             panic!("data type mismatch on roundtrip");
@@ -1614,7 +1618,7 @@ mod tests {
             NDDataType::UInt8,
         );
         arr.unique_id = 77;
-        if let NDDataBuffer::U8(v) = &mut arr.data {
+        if let NDDataViewMut::U8(v) = arr.data.view_mut() {
             for (i, item) in v.iter_mut().enumerate() {
                 *item = i as u8;
             }
@@ -1669,8 +1673,8 @@ mod tests {
         let ad_core_rs::plugin::runtime::Published::Read(read) = &out.publish else {
             panic!("ReadFile publishes its array: {:?}", out.publish);
         };
-        match &read.data {
-            NDDataBuffer::U8(v) => assert_eq!(v.len(), 12),
+        match read.data.view() {
+            NDDataView::U8(v) => assert_eq!(v.len(), 12),
             other => panic!("unexpected data buffer: {other:?}"),
         }
 
@@ -1819,7 +1823,7 @@ mod tests {
             NDDataType::Int16,
         );
         TiffWriter::attach_color_mode(&mut arr, NDColorMode::RGB1);
-        if let NDDataBuffer::I16(v) = &mut arr.data {
+        if let NDDataViewMut::I16(v) = arr.data.view_mut() {
             for (i, item) in v.iter_mut().enumerate() {
                 *item = (i as i16) - 6;
             }
@@ -1856,7 +1860,7 @@ mod tests {
             NDDataType::UInt8,
         );
         TiffWriter::attach_color_mode(&mut arr, mode);
-        if let NDDataBuffer::U8(v) = &mut arr.data {
+        if let NDDataViewMut::U8(v) = arr.data.view_mut() {
             for y in 0..h {
                 for x in 0..w {
                     for c in 0..3 {
@@ -1883,7 +1887,7 @@ mod tests {
             vec![NDDimension::new(w), NDDimension::new(h)],
             NDDataType::UInt8,
         );
-        if let NDDataBuffer::U8(v) = &mut arr.data {
+        if let NDDataViewMut::U8(v) = arr.data.view_mut() {
             v.iter_mut().enumerate().for_each(|(i, x)| *x = i as u8);
         }
         arr
@@ -2096,7 +2100,7 @@ mod tests {
             vec![NDDimension::new(4), NDDimension::new(4)],
             NDDataType::UInt8,
         );
-        if let NDDataBuffer::U8(v) = &mut arr.data {
+        if let NDDataViewMut::U8(v) = arr.data.view_mut() {
             for (i, item) in v.iter_mut().enumerate() {
                 *item = i as u8;
             }

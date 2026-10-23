@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDimension};
+use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDataView, NDDimension};
 use ad_core_rs::ndarray_pool::NDArrayPool;
 use ad_core_rs::plugin::channel::ndarray_channel;
 use ad_core_rs::plugin::runtime::{DEFAULT_PLUGIN_THREADS, create_plugin_runtime};
@@ -50,7 +50,10 @@ fn a_tsread_without_array_callbacks_takes_no_unique_id() {
     let sender = ts.array_sender().clone();
     let publish = |v: f64| {
         let sender = sender.clone();
-        let frame = NDArray::with_data(vec![NDDimension::new(1)], NDDataBuffer::F64(vec![v]));
+        let frame = NDArray::with_data(
+            vec![NDDimension::new(1)],
+            NDDataBuffer::from_vec::<f64>(vec![v]),
+        );
         std::thread::spawn(move || {
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -78,7 +81,7 @@ fn a_tsread_without_array_callbacks_takes_no_unique_id() {
     write(ts.ndarray_params.array_callbacks, 1);
     write(ts_read, 1);
     let posted = rx.blocking_recv().unwrap();
-    let NDDataBuffer::F64(series) = &posted.data else {
+    let NDDataView::F64(series) = posted.data.view() else {
         panic!("not Float64");
     };
     assert_eq!(series[..2], [7.0, 9.0], "the withheld TSRead posted");
@@ -124,7 +127,10 @@ fn a_tsread_allocates_from_the_pool_the_last_frame_brought() {
     assert!(Arc::ptr_eq(&read(), ts.own_pool().pool()));
 
     let camera = ad_core_rs::ndarray_pool::DriverPool::standalone(0);
-    let frame = NDArray::with_data(vec![NDDimension::new(1)], NDDataBuffer::F64(vec![1.0]));
+    let frame = NDArray::with_data(
+        vec![NDDimension::new(1)],
+        NDDataBuffer::from_vec::<f64>(vec![1.0]),
+    );
     let frame = camera.alloc_copy(&frame).unwrap();
     let sender = ts.array_sender().clone();
     std::thread::spawn(move || {

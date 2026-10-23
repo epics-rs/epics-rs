@@ -1129,14 +1129,14 @@ mod tests {
             assert_eq!(base.get_string_param(proc.params.name, addr).unwrap(), b"");
         }
     }
-    use ad_core_rs::ndarray::{NDDataType, NDDimension};
+    use ad_core_rs::ndarray::{NDDataType, NDDataViewMut, NDDimension};
 
     fn make_2d_array(x: usize, y: usize, fill: impl Fn(usize, usize) -> f64) -> NDArray {
         let mut arr = NDArray::new(
             vec![NDDimension::new(x), NDDimension::new(y)],
             NDDataType::Float64,
         );
-        if let NDDataBuffer::F64(ref mut v) = arr.data {
+        if let NDDataViewMut::F64(v) = arr.data.view_mut() {
             for iy in 0..y {
                 for ix in 0..x {
                     v[iy * x + ix] = fill(ix, iy);
@@ -1443,7 +1443,7 @@ mod tests {
             vec![NDDimension::new(4), NDDimension::new(4)],
             NDDataType::UInt8,
         );
-        if let NDDataBuffer::U8(ref mut v) = arr.data {
+        if let NDDataViewMut::U8(v) = arr.data.view_mut() {
             for (i, val) in v.iter_mut().enumerate() {
                 *val = (i + 1) as u8;
             }
@@ -1479,7 +1479,7 @@ mod tests {
 
     fn make_1d_array(n: usize, fill: impl Fn(usize) -> f64) -> NDArray {
         let mut arr = NDArray::new(vec![NDDimension::new(n)], NDDataType::Float64);
-        if let NDDataBuffer::F64(ref mut v) = arr.data {
+        if let NDDataViewMut::F64(v) = arr.data.view_mut() {
             for (i, slot) in v.iter_mut().enumerate() {
                 *slot = fill(i);
             }
@@ -1729,56 +1729,56 @@ mod tests {
         check_roi_stats_against_reference(
             "i8",
             |i| (seq(i) % 256) as u8 as i8,
-            NDDataBuffer::I8,
+            NDDataBuffer::from_vec::<i8>,
             |e| e as f64,
         );
         check_roi_stats_against_reference(
             "u8",
             |i| (seq(i) % 256) as u8,
-            NDDataBuffer::U8,
+            NDDataBuffer::from_vec::<u8>,
             |e| e as f64,
         );
         check_roi_stats_against_reference(
             "i16",
             |i| (seq(i) % 65536) as u16 as i16,
-            NDDataBuffer::I16,
+            NDDataBuffer::from_vec::<i16>,
             |e| e as f64,
         );
         check_roi_stats_against_reference(
             "u16",
             |i| (seq(i) % 65536) as u16,
-            NDDataBuffer::U16,
+            NDDataBuffer::from_vec::<u16>,
             |e| e as f64,
         );
         check_roi_stats_against_reference(
             "i32",
             |i| seq(i) as i32 - 500_000,
-            NDDataBuffer::I32,
+            NDDataBuffer::from_vec::<i32>,
             |e| e as f64,
         );
-        check_roi_stats_against_reference("u32", seq, NDDataBuffer::U32, |e| e as f64);
+        check_roi_stats_against_reference("u32", seq, NDDataBuffer::from_vec::<u32>, |e| e as f64);
         check_roi_stats_against_reference(
             "i64",
             |i| seq(i) as i64 - 500_000,
-            NDDataBuffer::I64,
+            NDDataBuffer::from_vec::<i64>,
             |e| e as f64,
         );
         check_roi_stats_against_reference(
             "u64",
             |i| seq(i) as u64,
-            NDDataBuffer::U64,
+            NDDataBuffer::from_vec::<u64>,
             |e| e as f64,
         );
         check_roi_stats_against_reference(
             "f32",
             |i| seq(i) as f32 * 0.37 - 100.0,
-            NDDataBuffer::F32,
+            NDDataBuffer::from_vec::<f32>,
             |e| e as f64,
         );
         check_roi_stats_against_reference(
             "f64",
             |i| seq(i) as f64 * 0.37 - 100.0,
-            NDDataBuffer::F64,
+            NDDataBuffer::from_vec::<f64>,
             |e| e,
         );
     }
@@ -1787,7 +1787,7 @@ mod tests {
     /// reading past it.
     #[test]
     fn roi_stats_of_a_rectangle_past_the_buffer_are_zero() {
-        let data = NDDataBuffer::U8((0..12).collect());
+        let data = NDDataBuffer::from_vec::<u8>((0..12).collect());
         let r = ROIStatProcessor::compute_roi_stats(&data, 2, 4, [2, 1], [3, 2], 0);
         assert_eq!(r.total, 0.0);
         assert_eq!(r.max, 0.0);

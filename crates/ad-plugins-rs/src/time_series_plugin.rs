@@ -32,7 +32,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
-use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDataType, NDDimension};
+use ad_core_rs::ndarray::{
+    NDArray, NDDataBuffer, NDDataType, NDDataView, NDDataViewMut, NDDimension,
+};
 use ad_core_rs::ndarray_pool::{DriverPool, NDArrayPool};
 use ad_core_rs::plugin::runtime::{
     ArrayCallbacks, NDPluginProcess, ParamUpdate, PluginAttributes, PluginPool, ProcessResult,
@@ -98,17 +100,17 @@ impl Params {
 /// `epicsFloat64` before accumulating: `averageStore_[signal] += (epicsFloat64)*pIn`).
 #[inline]
 fn sample_f64(data: &NDDataBuffer, idx: usize) -> f64 {
-    match data {
-        NDDataBuffer::I8(v) => v[idx] as f64,
-        NDDataBuffer::U8(v) => v[idx] as f64,
-        NDDataBuffer::I16(v) => v[idx] as f64,
-        NDDataBuffer::U16(v) => v[idx] as f64,
-        NDDataBuffer::I32(v) => v[idx] as f64,
-        NDDataBuffer::U32(v) => v[idx] as f64,
-        NDDataBuffer::I64(v) => v[idx] as f64,
-        NDDataBuffer::U64(v) => v[idx] as f64,
-        NDDataBuffer::F32(v) => v[idx] as f64,
-        NDDataBuffer::F64(v) => v[idx],
+    match data.view() {
+        NDDataView::I8(v) => v[idx] as f64,
+        NDDataView::U8(v) => v[idx] as f64,
+        NDDataView::I16(v) => v[idx] as f64,
+        NDDataView::U16(v) => v[idx] as f64,
+        NDDataView::I32(v) => v[idx] as f64,
+        NDDataView::U32(v) => v[idx] as f64,
+        NDDataView::I64(v) => v[idx] as f64,
+        NDDataView::U64(v) => v[idx] as f64,
+        NDDataView::F32(v) => v[idx] as f64,
+        NDDataView::F64(v) => v[idx],
     }
 }
 
@@ -812,7 +814,7 @@ pub(crate) fn time_series_point(
     let mut arr = pool
         .alloc(vec![NDDimension::new(values.len())], NDDataType::Float64)
         .ok()?;
-    if let NDDataBuffer::F64(v) = &mut arr.data {
+    if let NDDataViewMut::F64(v) = arr.data.view_mut() {
         v.copy_from_slice(values);
     }
     arr.unique_id = src.unique_id;
@@ -866,7 +868,10 @@ mod tests {
         };
         write(reason("TS_NUM_POINTS"), 2);
         write(reason("TS_ACQUIRE"), 1);
-        let frame = NDArray::with_data(vec![NDDimension::new(1)], NDDataBuffer::F64(vec![1.0]));
+        let frame = NDArray::with_data(
+            vec![NDDimension::new(1)],
+            NDDataBuffer::from_vec::<f64>(vec![1.0]),
+        );
         publish(&handle, &frame);
         write(reason("TS_READ"), 1);
         publish(&handle, &frame);
@@ -1034,15 +1039,15 @@ mod tests {
         }
         let arr = NDArray::with_data(
             vec![NDDimension::new(2), NDDimension::new(3)],
-            NDDataBuffer::U16(vec![1, 10, 2, 20, 3, 30]),
+            NDDataBuffer::from_vec::<u16>(vec![1, 10, 2, 20, 3, 30]),
         );
         let res = proc.process_array(&Arc::new(arr), &NDArrayPool::new(0));
         (proc, res)
     }
 
     fn u16s(arr: &NDArray) -> Vec<u16> {
-        match &arr.data {
-            NDDataBuffer::U16(v) => v.clone(),
+        match arr.data.view() {
+            NDDataView::U16(v) => v.to_vec(),
             _ => panic!("not UInt16"),
         }
     }
@@ -1085,7 +1090,7 @@ mod tests {
     fn three_points() -> Arc<NDArray> {
         Arc::new(NDArray::with_data(
             vec![NDDimension::new(2), NDDimension::new(3)],
-            NDDataBuffer::U16(vec![1, 10, 2, 20, 3, 30]),
+            NDDataBuffer::from_vec::<u16>(vec![1, 10, 2, 20, 3, 30]),
         ))
     }
 
@@ -1379,7 +1384,7 @@ mod tests {
         // 2 signals, 3 time points, every sample 200. Layout signal-fastest.
         let arr = NDArray::with_data(
             vec![NDDimension::new(2), NDDimension::new(3)],
-            NDDataBuffer::U8(vec![200; 6]),
+            NDDataBuffer::from_vec::<u8>(vec![200; 6]),
         );
         let res = proc.process_array(&Arc::new(arr), &pool);
 
@@ -1426,7 +1431,7 @@ mod tests {
         // 1 signal, 3 time points: 10, 20, 30.
         let arr = NDArray::with_data(
             vec![NDDimension::new(1), NDDimension::new(3)],
-            NDDataBuffer::F64(vec![10.0, 20.0, 30.0]),
+            NDDataBuffer::from_vec::<f64>(vec![10.0, 20.0, 30.0]),
         );
         let res = proc.process_array(&Arc::new(arr), &pool);
 
@@ -1449,7 +1454,7 @@ mod tests {
         // 1 signal, 5 time points: 1..=5 into a 3-slot ring.
         let arr = NDArray::with_data(
             vec![NDDimension::new(1), NDDimension::new(5)],
-            NDDataBuffer::F64(vec![1.0, 2.0, 3.0, 4.0, 5.0]),
+            NDDataBuffer::from_vec::<f64>(vec![1.0, 2.0, 3.0, 4.0, 5.0]),
         );
         proc.process_array(&Arc::new(arr), &pool);
 
@@ -1486,7 +1491,7 @@ mod tests {
         // 1-D array of 3 elements => 3 signals, 1 time point.
         let arr = NDArray::with_data(
             vec![NDDimension::new(3)],
-            NDDataBuffer::F64(vec![11.0, 22.0, 33.0]),
+            NDDataBuffer::from_vec::<f64>(vec![11.0, 22.0, 33.0]),
         );
         proc.process_array(&Arc::new(arr), &pool);
 
@@ -1537,7 +1542,7 @@ mod tests {
         // 4 input signals but max_signals == 2: only the first 2 are kept.
         let arr = NDArray::with_data(
             vec![NDDimension::new(4), NDDimension::new(1)],
-            NDDataBuffer::F64(vec![1.0, 2.0, 3.0, 4.0]),
+            NDDataBuffer::from_vec::<f64>(vec![1.0, 2.0, 3.0, 4.0]),
         );
         proc.process_array(&Arc::new(arr), &pool);
 
@@ -1579,7 +1584,7 @@ mod tests {
                 NDDimension::new(2),
                 NDDimension::new(2),
             ],
-            NDDataBuffer::F64(vec![0.0; 8]),
+            NDDataBuffer::from_vec::<f64>(vec![0.0; 8]),
         );
         let stamp = EpicsTimestamp { sec: 7, nsec: 9 };
         arr.timestamp = stamp;
@@ -1673,9 +1678,9 @@ mod tests {
         fn frames(&self, signals: usize, values: &[f64]) {
             for &v in values {
                 let data = if self.int32 {
-                    NDDataBuffer::I32(vec![v as i32; signals])
+                    NDDataBuffer::from_vec::<i32>(vec![v as i32; signals])
                 } else {
-                    NDDataBuffer::F64(vec![v; signals])
+                    NDDataBuffer::from_vec::<f64>(vec![v; signals])
                 };
                 let arr =
                     NDArray::with_data(vec![NDDimension::new(signals), NDDimension::new(1)], data);

@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use ad_core_rs::attributes::NDAttributeList;
 use ad_core_rs::error::{ADError, ADResult};
-use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDataType};
+use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDataType, NDDataView};
 use ad_core_rs::ndarray_pool::NDArrayPool;
 use ad_core_rs::plugin::file_base::{NDFileOpenMode, NDFileWriter};
 use ad_core_rs::plugin::file_controller::{
@@ -35,17 +35,17 @@ use rust_hdf5::{H5Dataset, H5File};
 /// host-endian `as_u8_slice()` bytes is only correct on a little-endian host.
 /// This makes the on-disk bytes match the declared LE datatype on every host.
 fn nd_buffer_to_le_bytes(buf: &NDDataBuffer) -> Vec<u8> {
-    match buf {
-        NDDataBuffer::I8(v) => v.iter().map(|&x| x as u8).collect(),
-        NDDataBuffer::U8(v) => v.clone(),
-        NDDataBuffer::I16(v) => v.iter().flat_map(|&x| x.to_le_bytes()).collect(),
-        NDDataBuffer::U16(v) => v.iter().flat_map(|&x| x.to_le_bytes()).collect(),
-        NDDataBuffer::I32(v) => v.iter().flat_map(|&x| x.to_le_bytes()).collect(),
-        NDDataBuffer::U32(v) => v.iter().flat_map(|&x| x.to_le_bytes()).collect(),
-        NDDataBuffer::I64(v) => v.iter().flat_map(|&x| x.to_le_bytes()).collect(),
-        NDDataBuffer::U64(v) => v.iter().flat_map(|&x| x.to_le_bytes()).collect(),
-        NDDataBuffer::F32(v) => v.iter().flat_map(|&x| x.to_le_bytes()).collect(),
-        NDDataBuffer::F64(v) => v.iter().flat_map(|&x| x.to_le_bytes()).collect(),
+    match buf.view() {
+        NDDataView::I8(v) => v.iter().map(|&x| x as u8).collect(),
+        NDDataView::U8(v) => v.to_vec(),
+        NDDataView::I16(v) => v.iter().flat_map(|&x| x.to_le_bytes()).collect(),
+        NDDataView::U16(v) => v.iter().flat_map(|&x| x.to_le_bytes()).collect(),
+        NDDataView::I32(v) => v.iter().flat_map(|&x| x.to_le_bytes()).collect(),
+        NDDataView::U32(v) => v.iter().flat_map(|&x| x.to_le_bytes()).collect(),
+        NDDataView::I64(v) => v.iter().flat_map(|&x| x.to_le_bytes()).collect(),
+        NDDataView::U64(v) => v.iter().flat_map(|&x| x.to_le_bytes()).collect(),
+        NDDataView::F32(v) => v.iter().flat_map(|&x| x.to_le_bytes()).collect(),
+        NDDataView::F64(v) => v.iter().flat_map(|&x| x.to_le_bytes()).collect(),
     }
 }
 
@@ -1040,7 +1040,7 @@ impl NDPluginProcess for NexusFileProcessor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ad_core_rs::ndarray::NDDimension;
+    use ad_core_rs::ndarray::{NDDataViewMut, NDDimension};
 
     fn temp_path(prefix: &str) -> PathBuf {
         use std::sync::atomic::{AtomicU32, Ordering};
@@ -1085,7 +1085,7 @@ mod tests {
             vec![NDDimension::new(4), NDDimension::new(4)],
             NDDataType::UInt8,
         );
-        if let NDDataBuffer::U8(ref mut v) = arr.data {
+        if let NDDataViewMut::U8(v) = arr.data.view_mut() {
             for i in 0..16 {
                 v[i] = i as u8;
             }
@@ -1117,7 +1117,7 @@ mod tests {
             vec![NDDimension::new(4), NDDimension::new(4)],
             NDDataType::UInt8,
         );
-        if let NDDataBuffer::U8(ref mut v) = arr1.data {
+        if let NDDataViewMut::U8(v) = arr1.data.view_mut() {
             for i in 0..16 {
                 v[i] = i as u8;
             }
@@ -1127,7 +1127,7 @@ mod tests {
             vec![NDDimension::new(4), NDDimension::new(4)],
             NDDataType::UInt8,
         );
-        if let NDDataBuffer::U8(ref mut v) = arr2.data {
+        if let NDDataViewMut::U8(v) = arr2.data.view_mut() {
             for i in 0..16 {
                 v[i] = (i + 100) as u8;
             }
@@ -1253,7 +1253,7 @@ mod tests {
             vec![NDDimension::new(3), NDDimension::new(2)],
             NDDataType::UInt8,
         );
-        if let NDDataBuffer::U8(ref mut v) = arr.data {
+        if let NDDataViewMut::U8(v) = arr.data.view_mut() {
             for (i, x) in v.iter_mut().enumerate() {
                 *x = i as u8;
             }
@@ -1431,7 +1431,7 @@ mod tests {
                 vec![NDDimension::new(3), NDDimension::new(2)],
                 NDDataType::UInt8,
             );
-            if let NDDataBuffer::U8(ref mut v) = arr.data {
+            if let NDDataViewMut::U8(v) = arr.data.view_mut() {
                 for (i, x) in v.iter_mut().enumerate() {
                     *x = base + i as u8;
                 }
@@ -1478,7 +1478,7 @@ mod tests {
             vec![NDDimension::new(3), NDDimension::new(2)],
             NDDataType::UInt8,
         );
-        if let NDDataBuffer::U8(ref mut v) = arr.data {
+        if let NDDataViewMut::U8(v) = arr.data.view_mut() {
             v.iter_mut().enumerate().for_each(|(i, x)| *x = i as u8);
         }
         writer
@@ -1540,17 +1540,17 @@ mod tests {
             let mut writer = NexusWriter::new();
             let mut arr = NDArray::new(vec![NDDimension::new(2), NDDimension::new(2)], dt);
             // Distinct, type-revealing values: negatives for signed types.
-            match arr.data {
-                NDDataBuffer::I8(ref mut v) => v.copy_from_slice(&[-1, 2, -3, 4]),
-                NDDataBuffer::U8(ref mut v) => v.copy_from_slice(&[1, 2, 3, 4]),
-                NDDataBuffer::I16(ref mut v) => v.copy_from_slice(&[-1, 2, -3, 4]),
-                NDDataBuffer::U16(ref mut v) => v.copy_from_slice(&[1, 2, 3, 4]),
-                NDDataBuffer::I32(ref mut v) => v.copy_from_slice(&[-1, 2, -3, 4]),
-                NDDataBuffer::U32(ref mut v) => v.copy_from_slice(&[1, 2, 3, 4]),
-                NDDataBuffer::I64(ref mut v) => v.copy_from_slice(&[-1, 2, -3, 4]),
-                NDDataBuffer::U64(ref mut v) => v.copy_from_slice(&[1, 2, 3, 4]),
-                NDDataBuffer::F32(ref mut v) => v.copy_from_slice(&[-1.5, 2.5, -3.5, 4.5]),
-                NDDataBuffer::F64(ref mut v) => v.copy_from_slice(&[-1.5, 2.5, -3.5, 4.5]),
+            match arr.data.view_mut() {
+                NDDataViewMut::I8(v) => v.copy_from_slice(&[-1, 2, -3, 4]),
+                NDDataViewMut::U8(v) => v.copy_from_slice(&[1, 2, 3, 4]),
+                NDDataViewMut::I16(v) => v.copy_from_slice(&[-1, 2, -3, 4]),
+                NDDataViewMut::U16(v) => v.copy_from_slice(&[1, 2, 3, 4]),
+                NDDataViewMut::I32(v) => v.copy_from_slice(&[-1, 2, -3, 4]),
+                NDDataViewMut::U32(v) => v.copy_from_slice(&[1, 2, 3, 4]),
+                NDDataViewMut::I64(v) => v.copy_from_slice(&[-1, 2, -3, 4]),
+                NDDataViewMut::U64(v) => v.copy_from_slice(&[1, 2, 3, 4]),
+                NDDataViewMut::F32(v) => v.copy_from_slice(&[-1.5, 2.5, -3.5, 4.5]),
+                NDDataViewMut::F64(v) => v.copy_from_slice(&[-1.5, 2.5, -3.5, 4.5]),
             }
 
             writer

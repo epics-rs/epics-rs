@@ -10,7 +10,7 @@ use std::sync::Arc;
 #[cfg(feature = "parallel")]
 use crate::par_util;
 
-use ad_core_rs::ndarray::{NDArray, NDDataBuffer};
+use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDataView};
 use ad_core_rs::ndarray_pool::NDArrayPool;
 use ad_core_rs::plugin::runtime::{
     ArraySource, NDPluginProcess, ParamUpdate, PluginParamSnapshot, PluginRuntimeHandle,
@@ -151,17 +151,17 @@ pub fn compute_stats(
     dims: &[ad_core_rs::ndarray::NDDimension],
     bgd_width: usize,
 ) -> StatsResult {
-    match data {
-        NDDataBuffer::I8(v) => stats_of(v, dims, bgd_width),
-        NDDataBuffer::U8(v) => stats_of(v, dims, bgd_width),
-        NDDataBuffer::I16(v) => stats_of(v, dims, bgd_width),
-        NDDataBuffer::U16(v) => stats_of(v, dims, bgd_width),
-        NDDataBuffer::I32(v) => stats_of(v, dims, bgd_width),
-        NDDataBuffer::U32(v) => stats_of(v, dims, bgd_width),
-        NDDataBuffer::I64(v) => stats_of(v, dims, bgd_width),
-        NDDataBuffer::U64(v) => stats_of(v, dims, bgd_width),
-        NDDataBuffer::F32(v) => stats_of(v, dims, bgd_width),
-        NDDataBuffer::F64(v) => stats_of(v, dims, bgd_width),
+    match data.view() {
+        NDDataView::I8(v) => stats_of(v, dims, bgd_width),
+        NDDataView::U8(v) => stats_of(v, dims, bgd_width),
+        NDDataView::I16(v) => stats_of(v, dims, bgd_width),
+        NDDataView::U16(v) => stats_of(v, dims, bgd_width),
+        NDDataView::I32(v) => stats_of(v, dims, bgd_width),
+        NDDataView::U32(v) => stats_of(v, dims, bgd_width),
+        NDDataView::I64(v) => stats_of(v, dims, bgd_width),
+        NDDataView::U64(v) => stats_of(v, dims, bgd_width),
+        NDDataView::F32(v) => stats_of(v, dims, bgd_width),
+        NDDataView::F64(v) => stats_of(v, dims, bgd_width),
     }
 }
 
@@ -2314,7 +2314,7 @@ mod tests {
             WriteVerdict::Accept(1)
         );
     }
-    use ad_core_rs::ndarray::{NDDataType, NDDimension};
+    use ad_core_rs::ndarray::{NDDataType, NDDataViewMut, NDDimension};
 
     #[test]
     fn test_runtime_leaves_the_controls_to_the_database() {
@@ -2352,7 +2352,7 @@ mod tests {
 
         let processor = StatsProcessor::new();
         let mut arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
-        arr.data = NDDataBuffer::U8(vec![1, 2, 3, 4]);
+        arr.data = NDDataBuffer::from_vec::<u8>(vec![1, 2, 3, 4]);
         arr.unique_id = 42;
         arr.timestamp = ad_core_rs::timestamp::EpicsTimestamp {
             sec: 100,
@@ -2366,7 +2366,7 @@ mod tests {
             panic!("one TS point per frame, got {}", r.addressed.len());
         };
         assert_eq!(*addr, 1);
-        let NDDataBuffer::F64(v) = &ts.data else {
+        let NDDataView::F64(v) = ts.data.view() else {
             panic!("TS point is Float64");
         };
         assert_eq!(v.len(), 23);
@@ -2379,7 +2379,7 @@ mod tests {
     #[test]
     fn test_compute_stats_u8() {
         let dims = vec![NDDimension::new(5)];
-        let data = NDDataBuffer::U8(vec![10, 20, 30, 40, 50]);
+        let data = NDDataBuffer::from_vec::<u8>(vec![10, 20, 30, 40, 50]);
         let stats = compute_stats(&data, &dims, 0);
         assert_eq!(stats.min, 10.0);
         assert_eq!(stats.max, 50.0);
@@ -2391,7 +2391,7 @@ mod tests {
     #[test]
     fn test_compute_stats_sigma() {
         let dims = vec![NDDimension::new(8)];
-        let data = NDDataBuffer::F64(vec![2.0, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0]);
+        let data = NDDataBuffer::from_vec::<f64>(vec![2.0, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0]);
         let stats = compute_stats(&data, &dims, 0);
         assert!((stats.mean - 5.0).abs() < 1e-10);
         assert!((stats.sigma - 2.0).abs() < 1e-10);
@@ -2400,7 +2400,7 @@ mod tests {
     #[test]
     fn test_compute_stats_u16() {
         let dims = vec![NDDimension::new(3)];
-        let data = NDDataBuffer::U16(vec![100, 200, 300]);
+        let data = NDDataBuffer::from_vec::<u16>(vec![100, 200, 300]);
         let stats = compute_stats(&data, &dims, 0);
         assert_eq!(stats.min, 100.0);
         assert_eq!(stats.max, 300.0);
@@ -2410,7 +2410,7 @@ mod tests {
     #[test]
     fn test_compute_stats_f64() {
         let dims = vec![NDDimension::new(3)];
-        let data = NDDataBuffer::F64(vec![1.5, 2.5, 3.5]);
+        let data = NDDataBuffer::from_vec::<f64>(vec![1.5, 2.5, 3.5]);
         let stats = compute_stats(&data, &dims, 0);
         assert!((stats.min - 1.5).abs() < 1e-10);
         assert!((stats.max - 3.5).abs() < 1e-10);
@@ -2420,7 +2420,7 @@ mod tests {
     #[test]
     fn test_compute_stats_single_element() {
         let dims = vec![NDDimension::new(1)];
-        let data = NDDataBuffer::I32(vec![42]);
+        let data = NDDataBuffer::from_vec::<i32>(vec![42]);
         let stats = compute_stats(&data, &dims, 0);
         assert_eq!(stats.min, 42.0);
         assert_eq!(stats.max, 42.0);
@@ -2431,7 +2431,7 @@ mod tests {
 
     #[test]
     fn test_compute_stats_empty() {
-        let data = NDDataBuffer::U8(vec![]);
+        let data = NDDataBuffer::from_vec::<u8>(vec![]);
         let stats = compute_stats(&data, &[], 0);
         assert_eq!(stats.num_elements, 0);
     }
@@ -2440,7 +2440,7 @@ mod tests {
     fn test_compute_stats_min_max_position() {
         let dims = vec![NDDimension::new(4), NDDimension::new(4)];
         // 4x4 array: min at [0], max at [15]
-        let data = NDDataBuffer::U8((1..=16).collect());
+        let data = NDDataBuffer::from_vec::<u8>((1..=16).collect());
         let stats = compute_stats(&data, &dims, 0);
         assert_eq!(stats.min_x, 0); // index 0 -> x=0, y=0
         assert_eq!(stats.min_y, 0);
@@ -2625,46 +2625,56 @@ mod tests {
         check_kernel_against_reference(
             "i8",
             |i| (seq(i) % 256) as u8 as i8,
-            NDDataBuffer::I8,
+            NDDataBuffer::from_vec::<i8>,
             1e-12,
         );
-        check_kernel_against_reference("u8", |i| (seq(i) % 256) as u8, NDDataBuffer::U8, 1e-12);
+        check_kernel_against_reference(
+            "u8",
+            |i| (seq(i) % 256) as u8,
+            NDDataBuffer::from_vec::<u8>,
+            1e-12,
+        );
         check_kernel_against_reference(
             "i16",
             |i| (seq(i) % 65536) as u16 as i16,
-            NDDataBuffer::I16,
+            NDDataBuffer::from_vec::<i16>,
             1e-12,
         );
         check_kernel_against_reference(
             "u16",
             |i| (seq(i) % 65536) as u16,
-            NDDataBuffer::U16,
+            NDDataBuffer::from_vec::<u16>,
             1e-12,
         );
         check_kernel_against_reference(
             "i32",
             |i| seq(i) as i32 - 500_000,
-            NDDataBuffer::I32,
+            NDDataBuffer::from_vec::<i32>,
             1e-12,
         );
-        check_kernel_against_reference("u32", seq, NDDataBuffer::U32, 1e-12);
+        check_kernel_against_reference("u32", seq, NDDataBuffer::from_vec::<u32>, 1e-12);
         check_kernel_against_reference(
             "i64",
             |i| seq(i) as i64 - 500_000,
-            NDDataBuffer::I64,
+            NDDataBuffer::from_vec::<i64>,
             1e-12,
         );
-        check_kernel_against_reference("u64", |i| seq(i) as u64, NDDataBuffer::U64, 1e-12);
+        check_kernel_against_reference(
+            "u64",
+            |i| seq(i) as u64,
+            NDDataBuffer::from_vec::<u64>,
+            1e-12,
+        );
         check_kernel_against_reference(
             "f32",
             |i| seq(i) as f32 * 0.37 - 100.0,
-            NDDataBuffer::F32,
+            NDDataBuffer::from_vec::<f32>,
             1e-9,
         );
         check_kernel_against_reference(
             "f64",
             |i| seq(i) as f64 * 0.37 - 100.0,
-            NDDataBuffer::F64,
+            NDDataBuffer::from_vec::<f64>,
             1e-12,
         );
     }
@@ -2681,7 +2691,7 @@ mod tests {
         v[9] = 60000;
         v[2 * PAR_CHUNK_OR_LARGE + 7] = 60000;
         let dims = vec![NDDimension::new(n)];
-        let s = compute_stats(&NDDataBuffer::U16(v), &dims, 0);
+        let s = compute_stats(&NDDataBuffer::from_vec::<u16>(v), &dims, 0);
         assert_eq!((s.min, s.min_x), (1.0, 5));
         assert_eq!((s.max, s.max_x), (60000.0, 9));
     }
@@ -2696,9 +2706,17 @@ mod tests {
     #[test]
     fn nan_follows_the_strict_compare_rule() {
         let dims = vec![NDDimension::new(4)];
-        let s = compute_stats(&NDDataBuffer::F64(vec![3.0, f64::NAN, 1.0, 5.0]), &dims, 0);
+        let s = compute_stats(
+            &NDDataBuffer::from_vec::<f64>(vec![3.0, f64::NAN, 1.0, 5.0]),
+            &dims,
+            0,
+        );
         assert_eq!((s.min, s.min_x, s.max, s.max_x), (1.0, 2, 5.0, 3));
-        let s = compute_stats(&NDDataBuffer::F64(vec![f64::NAN, 1.0, 5.0]), &dims, 0);
+        let s = compute_stats(
+            &NDDataBuffer::from_vec::<f64>(vec![f64::NAN, 1.0, 5.0]),
+            &dims,
+            0,
+        );
         assert!(s.min.is_nan() && s.max.is_nan());
         assert_eq!((s.min_x, s.max_x), (0, 0));
     }
@@ -2706,7 +2724,7 @@ mod tests {
     #[test]
     fn test_compute_stats_net_no_bgd() {
         let dims = vec![NDDimension::new(4), NDDimension::new(4)];
-        let data = NDDataBuffer::U8((1..=16).collect());
+        let data = NDDataBuffer::from_vec::<u8>((1..=16).collect());
         let stats = compute_stats(&data, &dims, 0);
         // With bgd_width=0, net should equal total
         assert_eq!(stats.net, stats.total);
@@ -2719,7 +2737,7 @@ mod tests {
         let mut pixels = vec![10u16; 16];
         // Put a bright spot at (2,2) = index 10
         pixels[2 * 4 + 2] = 110;
-        let data = NDDataBuffer::U16(pixels);
+        let data = NDDataBuffer::from_vec::<u16>(pixels);
         let stats = compute_stats(&data, &dims, 1);
 
         // With bgd_width=1, all edge pixels (1 pixel from each edge) are used for background.
@@ -2763,7 +2781,7 @@ mod tests {
             pixels[i] = 100;
         }
         let total_expected: f64 = pixels.iter().map(|&p| p as f64).sum();
-        let data = NDDataBuffer::U16(pixels);
+        let data = NDDataBuffer::from_vec::<u16>(pixels);
         let stats = compute_stats(&data, &dims, 1);
 
         // C++ strip sum (bgd_width=1):
@@ -2800,7 +2818,7 @@ mod tests {
     fn test_compute_stats_bgd_1d() {
         // 1-D, 8 elements: [10, 20, 30, 40, 50, 60, 70, 80], bgd_width=2.
         let dims = vec![NDDimension::new(8)];
-        let data = NDDataBuffer::U16(vec![10, 20, 30, 40, 50, 60, 70, 80]);
+        let data = NDDataBuffer::from_vec::<u16>(vec![10, 20, 30, 40, 50, 60, 70, 80]);
         let stats = compute_stats(&data, &dims, 2);
 
         // Single dimension: low strip indices 0,1 -> 10,20;
@@ -2831,7 +2849,7 @@ mod tests {
             NDDimension::new(2),
             NDDimension::new(2),
         ];
-        let data = NDDataBuffer::U8(vec![1u8; 8]);
+        let data = NDDataBuffer::from_vec::<u8>(vec![1u8; 8]);
         let stats = compute_stats(&data, &dims, 1);
         assert!(
             stats.net.abs() < 1e-9,
@@ -2843,7 +2861,7 @@ mod tests {
 
     #[test]
     fn test_centroid_uniform() {
-        let data = NDDataBuffer::U8(vec![1; 16]);
+        let data = NDDataBuffer::from_vec::<u8>(vec![1; 16]);
         let c = compute_centroid(&data, 4, 4, 0.0);
         assert!((c.centroid_x - 1.5).abs() < 1e-10);
         assert!((c.centroid_y - 1.5).abs() < 1e-10);
@@ -2853,7 +2871,7 @@ mod tests {
     fn test_centroid_corner() {
         let mut d = vec![0u8; 16];
         d[0] = 255;
-        let data = NDDataBuffer::U8(d);
+        let data = NDDataBuffer::from_vec::<u8>(d);
         let c = compute_centroid(&data, 4, 4, 0.0);
         assert!((c.centroid_x - 0.0).abs() < 1e-10);
         assert!((c.centroid_y - 0.0).abs() < 1e-10);
@@ -2864,7 +2882,7 @@ mod tests {
         // 4x4 image: background of 5, bright spot of 100 at (2,2)
         let mut pixels = vec![5u8; 16];
         pixels[2 * 4 + 2] = 100;
-        let data = NDDataBuffer::U8(pixels);
+        let data = NDDataBuffer::from_vec::<u8>(pixels);
 
         // With threshold=50, only the bright pixel should be counted
         let c = compute_centroid(&data, 4, 4, 50.0);
@@ -2876,7 +2894,7 @@ mod tests {
     #[test]
     fn test_centroid_higher_moments_symmetric() {
         // Symmetric distribution: skewness should be ~0, eccentricity ~0 for uniform
-        let data = NDDataBuffer::U8(vec![1; 16]);
+        let data = NDDataBuffer::from_vec::<u8>(vec![1; 16]);
         let c = compute_centroid(&data, 4, 4, 0.0);
         // Symmetric -> skewness ~0
         assert!(c.skewness_x.abs() < 1e-10);
@@ -2894,17 +2912,20 @@ mod tests {
         for (name, data) in [
             (
                 "u16",
-                NDDataBuffer::U16((0..n).map(|i| (i % 2) as u16).collect()),
+                NDDataBuffer::from_vec::<u16>((0..n).map(|i| (i % 2) as u16).collect()),
             ),
             (
                 "i32",
-                NDDataBuffer::I32((0..n).map(|i| (i % 2) as i32).collect()),
+                NDDataBuffer::from_vec::<i32>((0..n).map(|i| (i % 2) as i32).collect()),
             ),
             (
                 "i64",
-                NDDataBuffer::I64((0..n).map(|i| (i % 2) as i64).collect()),
+                NDDataBuffer::from_vec::<i64>((0..n).map(|i| (i % 2) as i64).collect()),
             ),
-            ("f64", NDDataBuffer::F64((0..n).map(zeros_ones).collect())),
+            (
+                "f64",
+                NDDataBuffer::from_vec::<f64>((0..n).map(zeros_ones).collect()),
+            ),
         ] {
             // Min = Max = Size = 1: scale 0/0, every pixel below.
             let (hist, below, above, _) = compute_histogram(&data, 1, 1.0, 1.0);
@@ -2917,10 +2938,10 @@ mod tests {
             assert_eq!((hist.len(), below, above), (0, 0.0, n as f64), "{name}");
         }
         // t >= 2^31 is INT_MIN in C, so a far-above pixel counts below.
-        let data = NDDataBuffer::U16(vec![30000; 5]);
+        let data = NDDataBuffer::from_vec::<u16>(vec![30000; 5]);
         let (_, below, above, _) = compute_histogram(&data, 100_000, 0.0, 1.0);
         assert_eq!((below, above), (5.0, 0.0));
-        let data = NDDataBuffer::F64([vec![3e9; 9], vec![f64::NAN; 9]].concat());
+        let data = NDDataBuffer::from_vec::<f64>([vec![3e9; 9], vec![f64::NAN; 9]].concat());
         let (hist, below, above, _) = compute_histogram(&data, 3, 0.0, 1.0);
         assert_eq!((hist, below, above), (vec![0.0; 3], 18.0, 0.0));
     }
@@ -2937,13 +2958,16 @@ mod tests {
         let counted: Vec<_> = [
             (
                 "f32",
-                NDDataBuffer::F32(cycle(n).map(|v| v as f32).collect()),
+                NDDataBuffer::from_vec::<f32>(cycle(n).map(|v| v as f32).collect()),
             ),
-            ("f64", NDDataBuffer::F64(cycle(n).map(f64::from).collect())),
-            ("i32", NDDataBuffer::I32(cycle(n).collect())),
+            (
+                "f64",
+                NDDataBuffer::from_vec::<f64>(cycle(n).map(f64::from).collect()),
+            ),
+            ("i32", NDDataBuffer::from_vec::<i32>(cycle(n).collect())),
             (
                 "u32",
-                NDDataBuffer::U32(cycle(n).map(|v| v as u32).collect()),
+                NDDataBuffer::from_vec::<u32>(cycle(n).map(|v| v as u32).collect()),
             ),
         ]
         .into_iter()
@@ -2959,7 +2983,7 @@ mod tests {
     #[test]
     fn test_histogram_basic() {
         // 10 values: 0..9, hist range [0, 9], 10 bins
-        let data = NDDataBuffer::F64((0..10).map(|x| x as f64).collect());
+        let data = NDDataBuffer::from_vec::<f64>((0..10).map(|x| x as f64).collect());
         let (hist, below, above, entropy) = compute_histogram(&data, 10, 0.0, 9.0);
         assert_eq!(hist.len(), 10);
         assert_eq!(below, 0.0);
@@ -2974,7 +2998,7 @@ mod tests {
 
     #[test]
     fn test_histogram_below_above() {
-        let data = NDDataBuffer::F64(vec![-1.0, 0.5, 1.5, 3.0]);
+        let data = NDDataBuffer::from_vec::<f64>(vec![-1.0, 0.5, 1.5, 3.0]);
         let (hist, below, above, _entropy) = compute_histogram(&data, 2, 0.0, 2.0);
         assert_eq!(below, 1.0); // -1.0 is below
         assert_eq!(above, 1.0); // 3.0 is above
@@ -2984,7 +3008,7 @@ mod tests {
 
     #[test]
     fn test_histogram_single_value() {
-        let data = NDDataBuffer::F64(vec![5.0; 100]);
+        let data = NDDataBuffer::from_vec::<f64>(vec![5.0; 100]);
         let (hist, below, above, entropy) = compute_histogram(&data, 10, 0.0, 10.0);
         assert_eq!(below, 0.0);
         assert_eq!(above, 0.0);
@@ -3006,7 +3030,7 @@ mod tests {
                 pixels[iy * 8 + ix] = iy as f64;
             }
         }
-        let data = NDDataBuffer::F64(pixels);
+        let data = NDDataBuffer::from_vec::<f64>(pixels);
 
         let profiles = compute_profiles(
             &data, 8, 8, 0.0, // threshold
@@ -3067,7 +3091,7 @@ mod tests {
                 pixels[iy * 8 + ix] = iy as f64;
             }
         }
-        let data = NDDataBuffer::F64(pixels);
+        let data = NDDataBuffer::from_vec::<f64>(pixels);
 
         let profiles = compute_profiles(
             &data, 8, 8, 0.0,   // threshold
@@ -3107,7 +3131,7 @@ mod tests {
         // 4x4 image: all 1.0 except one bright pixel at (2,1) = 10.0
         let mut pixels = vec![1.0f64; 16];
         pixels[1 * 4 + 2] = 10.0;
-        let data = NDDataBuffer::F64(pixels);
+        let data = NDDataBuffer::from_vec::<f64>(pixels);
 
         let profiles = compute_profiles(
             &data, 4, 4, 5.0, // threshold
@@ -3135,7 +3159,7 @@ mod tests {
         let pool = NDArrayPool::new(1_000_000);
 
         let mut arr = NDArray::new(vec![NDDimension::new(5)], NDDataType::UInt8);
-        if let NDDataBuffer::U8(ref mut v) = arr.data {
+        if let NDDataViewMut::U8(v) = arr.data.view_mut() {
             v[0] = 10;
             v[1] = 20;
             v[2] = 30;
@@ -3185,7 +3209,7 @@ mod tests {
             vec![NDDimension::new(4), NDDimension::new(4)],
             NDDataType::UInt8,
         );
-        if let NDDataBuffer::U8(ref mut v) = arr.data {
+        if let NDDataViewMut::U8(v) = arr.data.view_mut() {
             for (i, val) in v.iter_mut().enumerate() {
                 *val = (i % 8) as u8;
             }
@@ -3256,7 +3280,7 @@ mod tests {
             ],
             NDDataType::UInt8,
         );
-        if let NDDataBuffer::U8(ref mut v) = arr.data {
+        if let NDDataViewMut::U8(v) = arr.data.view_mut() {
             for (i, val) in v.iter_mut().enumerate() {
                 *val = if i % 4 == 3 { 100 } else { 0 };
             }
@@ -3351,7 +3375,7 @@ mod tests {
         }
         let pool = NDArrayPool::new(1_000_000);
         let mut arr = NDArray::new(vec![NDDimension::new(5)], NDDataType::UInt8);
-        if let NDDataBuffer::U8(ref mut v) = arr.data {
+        if let NDDataViewMut::U8(v) = arr.data.view_mut() {
             v.copy_from_slice(&[0, 10, 10, 0, 0]);
         }
 
@@ -3402,7 +3426,7 @@ mod tests {
             vec![NDDimension::new(4), NDDimension::new(4)],
             NDDataType::UInt8,
         );
-        if let NDDataBuffer::U8(ref mut v) = arr.data {
+        if let NDDataViewMut::U8(v) = arr.data.view_mut() {
             for (i, val) in v.iter_mut().enumerate() {
                 *val = i as u8;
             }
@@ -3493,7 +3517,7 @@ mod tests {
             vec![NDDimension::new(4), NDDimension::new(4)],
             NDDataType::UInt8,
         );
-        if let NDDataBuffer::U8(ref mut v) = arr.data {
+        if let NDDataViewMut::U8(v) = arr.data.view_mut() {
             for (i, val) in v.iter_mut().enumerate() {
                 *val = i as u8;
             }
@@ -3671,7 +3695,7 @@ mod tests {
             vec![NDDimension::new(4), NDDimension::new(2)],
             NDDataType::UInt8,
         );
-        if let NDDataBuffer::U8(ref mut v) = arr.data {
+        if let NDDataViewMut::U8(v) = arr.data.view_mut() {
             v.copy_from_slice(&[0, 1, 3, 3, 9, 9, 9, 4]);
         }
 
@@ -3785,7 +3809,7 @@ mod tests {
             vec![NDDimension::new(4), NDDimension::new(4)],
             NDDataType::UInt8,
         );
-        if let NDDataBuffer::U8(ref mut v) = arr.data {
+        if let NDDataViewMut::U8(v) = arr.data.view_mut() {
             for (i, val) in v.iter_mut().enumerate() {
                 *val = (i + 1) as u8;
             }
@@ -4014,64 +4038,70 @@ mod tests {
         check_projection_against_reference(
             "i8",
             |i| (seq(i) % 256) as u8 as i8,
-            NDDataBuffer::I8,
+            NDDataBuffer::from_vec::<i8>,
             |e| e as f64,
             1e-9,
         );
         check_projection_against_reference(
             "u8",
             |i| (seq(i) % 256) as u8,
-            NDDataBuffer::U8,
+            NDDataBuffer::from_vec::<u8>,
             |e| e as f64,
             1e-9,
         );
         check_projection_against_reference(
             "i16",
             |i| (seq(i) % 65536) as u16 as i16,
-            NDDataBuffer::I16,
+            NDDataBuffer::from_vec::<i16>,
             |e| e as f64,
             1e-9,
         );
         check_projection_against_reference(
             "u16",
             |i| (seq(i) % 65536) as u16,
-            NDDataBuffer::U16,
+            NDDataBuffer::from_vec::<u16>,
             |e| e as f64,
             1e-9,
         );
         check_projection_against_reference(
             "i32",
             |i| seq(i) as i32 - 500_000,
-            NDDataBuffer::I32,
+            NDDataBuffer::from_vec::<i32>,
             |e| e as f64,
             1e-9,
         );
-        check_projection_against_reference("u32", seq, NDDataBuffer::U32, |e| e as f64, 1e-9);
+        check_projection_against_reference(
+            "u32",
+            seq,
+            NDDataBuffer::from_vec::<u32>,
+            |e| e as f64,
+            1e-9,
+        );
         check_projection_against_reference(
             "i64",
             |i| seq(i) as i64 - 500_000,
-            NDDataBuffer::I64,
+            NDDataBuffer::from_vec::<i64>,
             |e| e as f64,
             1e-9,
         );
         check_projection_against_reference(
             "u64",
             |i| seq(i) as u64,
-            NDDataBuffer::U64,
+            NDDataBuffer::from_vec::<u64>,
             |e| e as f64,
             1e-9,
         );
         check_projection_against_reference(
             "f32",
             |i| seq(i) as f32 * 0.37 - 100.0,
-            NDDataBuffer::F32,
+            NDDataBuffer::from_vec::<f32>,
             |e| e as f64,
             1e-9,
         );
         check_projection_against_reference(
             "f64",
             |i| seq(i) as f64 * 0.37 - 100.0,
-            NDDataBuffer::F64,
+            NDDataBuffer::from_vec::<f64>,
             |e| e,
             1e-9,
         );
@@ -4084,7 +4114,7 @@ mod tests {
     fn projection_leaves_nan_out_of_the_threshold_sums() {
         let mut pixels = vec![2.0f32; 4 * 3];
         pixels[1 * 4 + 2] = f32::NAN;
-        let data = NDDataBuffer::F32(pixels);
+        let data = NDDataBuffer::from_vec::<f32>(pixels);
         let c = compute_centroid(&data, 4, 3, 0.0);
         assert_eq!(c.centroid_total, 22.0);
         assert!((c.centroid_x - 16.0 / 11.0).abs() < 1e-12);
@@ -4183,7 +4213,7 @@ mod tests {
         assert!(want_below > 0.0 && want_above > 0.0 && want.iter().any(|&c| c > 0.0));
 
         let (got, below, above, _) =
-            compute_histogram(&NDDataBuffer::F64(vals.clone()), bins, lo, hi);
+            compute_histogram(&NDDataBuffer::from_vec::<f64>(vals.clone()), bins, lo, hi);
         assert_eq!(
             (got, below, above),
             (want.clone(), want_below, want_above),
@@ -4193,7 +4223,8 @@ mod tests {
         let f32s: Vec<f32> = vals.iter().map(|&v| v as f32).collect();
         let as_f64: Vec<f64> = f32s.iter().map(|&v| v as f64).collect();
         let (want, want_below, want_above) = reference_histogram(&as_f64, bins, lo, hi);
-        let (got, below, above, _) = compute_histogram(&NDDataBuffer::F32(f32s), bins, lo, hi);
+        let (got, below, above, _) =
+            compute_histogram(&NDDataBuffer::from_vec::<f32>(f32s), bins, lo, hi);
         assert_eq!((got, below, above), (want, want_below, want_above), "f32");
 
         let ints: Vec<i32> = vec![i32::MIN, -4, -3, -2, 0, 4, 5, 6, i32::MAX];
@@ -4205,7 +4236,8 @@ mod tests {
             .collect();
         let as_f64: Vec<f64> = ints.iter().map(|&v| v as f64).collect();
         let (want, want_below, want_above) = reference_histogram(&as_f64, bins, lo, hi);
-        let (got, below, above, _) = compute_histogram(&NDDataBuffer::I32(ints), bins, lo, hi);
+        let (got, below, above, _) =
+            compute_histogram(&NDDataBuffer::from_vec::<i32>(ints), bins, lo, hi);
         assert_eq!((got, below, above), (want, want_below, want_above), "i32");
     }
 
@@ -4214,56 +4246,56 @@ mod tests {
         check_histogram_against_reference(
             "i8",
             |i| (seq(i) % 256) as u8 as i8,
-            NDDataBuffer::I8,
+            NDDataBuffer::from_vec::<i8>,
             |e| e as f64,
         );
         check_histogram_against_reference(
             "u8",
             |i| (seq(i) % 256) as u8,
-            NDDataBuffer::U8,
+            NDDataBuffer::from_vec::<u8>,
             |e| e as f64,
         );
         check_histogram_against_reference(
             "i16",
             |i| (seq(i) % 65536) as u16 as i16,
-            NDDataBuffer::I16,
+            NDDataBuffer::from_vec::<i16>,
             |e| e as f64,
         );
         check_histogram_against_reference(
             "u16",
             |i| (seq(i) % 65536) as u16,
-            NDDataBuffer::U16,
+            NDDataBuffer::from_vec::<u16>,
             |e| e as f64,
         );
         check_histogram_against_reference(
             "i32",
             |i| seq(i) as i32 - 500_000,
-            NDDataBuffer::I32,
+            NDDataBuffer::from_vec::<i32>,
             |e| e as f64,
         );
-        check_histogram_against_reference("u32", seq, NDDataBuffer::U32, |e| e as f64);
+        check_histogram_against_reference("u32", seq, NDDataBuffer::from_vec::<u32>, |e| e as f64);
         check_histogram_against_reference(
             "i64",
             |i| seq(i) as i64 - 500_000,
-            NDDataBuffer::I64,
+            NDDataBuffer::from_vec::<i64>,
             |e| e as f64,
         );
         check_histogram_against_reference(
             "u64",
             |i| seq(i) as u64,
-            NDDataBuffer::U64,
+            NDDataBuffer::from_vec::<u64>,
             |e| e as f64,
         );
         check_histogram_against_reference(
             "f32",
             |i| seq(i) as f32 * 0.37 - 100.0,
-            NDDataBuffer::F32,
+            NDDataBuffer::from_vec::<f32>,
             |e| e as f64,
         );
         check_histogram_against_reference(
             "f64",
             |i| seq(i) as f64 * 0.37 - 100.0,
-            NDDataBuffer::F64,
+            NDDataBuffer::from_vec::<f64>,
             |e| e,
         );
     }

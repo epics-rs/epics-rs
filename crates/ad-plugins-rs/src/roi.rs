@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDataType, NDDimension};
+use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDataType, NDDataViewMut, NDDimension};
 use ad_core_rs::ndarray_pool::NDArrayPool;
 use ad_core_rs::plugin::runtime::{
     ArraySource, NDPluginProcess, ParamUpdate, PluginParamSnapshot, ProcessResult,
@@ -222,7 +222,7 @@ fn convert_roi(
     let result = if scaled {
         pool.convert(src, dims_out, NDDataType::Float64)
             .and_then(|mut scratch| {
-                if let NDDataBuffer::F64(v) = &mut scratch.data {
+                if let NDDataViewMut::F64(v) = scratch.data.view_mut() {
                     for x in v.iter_mut() {
                         *x /= config.scale;
                     }
@@ -759,6 +759,7 @@ pub fn create_roi_runtime(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ad_core_rs::ndarray::NDDataView;
 
     /// `"%s:%s: function=%d %s, value=%d\n"` (NDPluginROI.cpp:271-273).
     #[test]
@@ -901,7 +902,7 @@ mod tests {
             vec![NDDimension::new(8), NDDimension::new(8)],
             NDDataType::UInt8,
         );
-        if let NDDataBuffer::U8(v) = &mut arr.data {
+        if let NDDataViewMut::U8(v) = arr.data.view_mut() {
             for (i, x) in v.iter_mut().enumerate() {
                 *x = i as u8;
             }
@@ -931,7 +932,7 @@ mod tests {
             vec![NDDimension::new(4), NDDimension::new(4)],
             NDDataType::UInt8,
         );
-        if let NDDataBuffer::U8(ref mut v) = arr.data {
+        if let NDDataViewMut::U8(v) = arr.data.view_mut() {
             for i in 0..16 {
                 v[i] = i as u8;
             }
@@ -973,7 +974,7 @@ mod tests {
         // and the stale min = 2 is ignored.
         assert_eq!(roi.dims[0].size, 4, "disabled axis keeps its full size");
         assert_eq!(roi.dims[1].size, 4);
-        if let NDDataBuffer::U8(ref v) = roi.data {
+        if let NDDataView::U8(v) = roi.data.view() {
             // Row 0 of the source, unbinned and unoffset: 0,1,2,3.
             assert_eq!(&v[0..4], &[0, 1, 2, 3], "disabled axis must not bin-sum");
         } else {
@@ -990,7 +991,7 @@ mod tests {
             roi.dims[0].size, 2,
             "enabled axis with bin=2 halves the axis"
         );
-        if let NDDataBuffer::U8(ref v) = roi.data {
+        if let NDDataView::U8(v) = roi.data.view() {
             // Row 0 binned by 2: 0+1 = 1, 2+3 = 5.
             assert_eq!(&v[0..2], &[1, 5], "enabled axis bin-sums");
         } else {
@@ -1075,7 +1076,7 @@ mod tests {
         let roi = extract_roi_2d(&pool(), &arr, &config).unwrap();
         assert_eq!(roi.dims[0].size, 2);
         assert_eq!(roi.dims[1].size, 2);
-        if let NDDataBuffer::U8(ref v) = roi.data {
+        if let NDDataView::U8(v) = roi.data.view() {
             // row 1, cols 1-2: [5,6], row 2, cols 1-2: [9,10]
             assert_eq!(v[0], 5);
             assert_eq!(v[1], 6);
@@ -1108,7 +1109,7 @@ mod tests {
         let roi = extract_roi_2d(&pool(), &arr, &config).unwrap();
         assert_eq!(roi.dims[0].size, 2);
         assert_eq!(roi.dims[1].size, 2);
-        if let NDDataBuffer::U8(ref v) = roi.data {
+        if let NDDataView::U8(v) = roi.data.view() {
             // top-left 2x2: sum = 0+1+4+5 = 10 (C++ sums, not averages)
             assert_eq!(v[0], 10);
         }
@@ -1136,7 +1137,7 @@ mod tests {
         };
 
         let roi = extract_roi_2d(&pool(), &arr, &config).unwrap();
-        if let NDDataBuffer::U8(ref v) = roi.data {
+        if let NDDataView::U8(v) = roi.data.view() {
             assert_eq!(v[0], 3);
             assert_eq!(v[1], 2);
             assert_eq!(v[2], 1);
@@ -1195,7 +1196,7 @@ mod tests {
         config.scale = 2.0;
 
         let roi = extract_roi_2d(&pool(), &arr, &config).unwrap();
-        if let NDDataBuffer::U8(ref v) = roi.data {
+        if let NDDataView::U8(v) = roi.data.view() {
             // C++: scale is a divisor
             assert_eq!(v[0], 0); // 0 / 2 = 0
             assert_eq!(v[1], 0); // 1 / 2 = 0.5 → 0
@@ -1501,7 +1502,7 @@ mod tests {
             vec![NDDimension::new(8), NDDimension::new(8)],
             NDDataType::UInt8,
         );
-        if let NDDataBuffer::U8(ref mut v) = arr.data {
+        if let NDDataViewMut::U8(v) = arr.data.view_mut() {
             for i in 0..64 {
                 v[i] = 1;
             }
@@ -1537,7 +1538,7 @@ mod tests {
         // min_y = 5 - 4/2 = 3, clamped to min(3, 8-4)=3
         // So ROI covers x=[4..8), y=[3..7) and the peak at (6,5) should be inside
         // In the ROI, the peak is at local (6-4, 5-3) = (2, 2)
-        if let NDDataBuffer::U8(ref v) = roi.data {
+        if let NDDataView::U8(v) = roi.data.view() {
             assert_eq!(v[2 * 4 + 2], 255); // peak at local (2,2)
         }
     }
@@ -1599,21 +1600,25 @@ mod tests {
             };
             let ints = !f.iter().any(|v| v.is_nan());
             let mut cases = vec![
-                cast(NDDataBuffer::F64(f.clone())),
-                cast(NDDataBuffer::F32(f.iter().map(|&v| v as f32).collect())),
+                cast(NDDataBuffer::from_vec::<f64>(f.clone())),
+                cast(NDDataBuffer::from_vec::<f32>(
+                    f.iter().map(|&v| v as f32).collect(),
+                )),
             ];
             if ints {
-                cases.push(cast(NDDataBuffer::U8(f.iter().map(|&v| v as u8).collect())));
-                cases.push(cast(NDDataBuffer::I16(
+                cases.push(cast(NDDataBuffer::from_vec::<u8>(
+                    f.iter().map(|&v| v as u8).collect(),
+                )));
+                cases.push(cast(NDDataBuffer::from_vec::<i16>(
                     f.iter().map(|&v| v as i16).collect(),
                 )));
-                cases.push(cast(NDDataBuffer::U32(
+                cases.push(cast(NDDataBuffer::from_vec::<u32>(
                     f.iter().map(|&v| v as u32).collect(),
                 )));
-                cases.push(cast(NDDataBuffer::I64(
+                cases.push(cast(NDDataBuffer::from_vec::<i64>(
                     f.iter().map(|&v| v as i64).collect(),
                 )));
-                cases.push(cast(NDDataBuffer::U64(
+                cases.push(cast(NDDataBuffer::from_vec::<u64>(
                     f.iter().map(|&v| v as u64).collect(),
                 )));
             }
@@ -1650,7 +1655,7 @@ mod tests {
         let roi = extract_roi_2d(&pool(), &arr, &config).unwrap();
         // offset clamps to 3, size clamps to 4-3 = 1.
         assert_eq!(roi.dims[0].size, 1);
-        if let NDDataBuffer::U8(ref v) = roi.data {
+        if let NDDataView::U8(v) = roi.data.view() {
             assert_eq!(v[0], 3); // last column of row 0
         }
     }
@@ -1681,7 +1686,7 @@ mod tests {
         let roi = extract_roi_2d(&pool(), &arr, &config).unwrap();
         // bin clamps to size 2 => out_x = 2/2 = 1.
         assert_eq!(roi.dims[0].size, 1);
-        if let NDDataBuffer::U8(ref v) = roi.data {
+        if let NDDataView::U8(v) = roi.data.view() {
             // sum of the 2-pixel bin: 0 + 1 = 1
             assert_eq!(v[0], 1);
         }
@@ -1704,7 +1709,7 @@ mod tests {
             NDAttrSource::Driver,
             NDAttrValue::Int32(ad_core_rs::color::NDColorMode::RGB1 as i32),
         ));
-        if let NDDataBuffer::U8(ref mut v) = arr.data {
+        if let NDDataViewMut::U8(v) = arr.data.view_mut() {
             for y in 0..2 {
                 for x in 0..2 {
                     for c in 0..3 {
@@ -1751,7 +1756,7 @@ mod tests {
         assert_eq!(roi.dims[0].size, 3);
         assert_eq!(roi.dims[1].size, 1);
         assert_eq!(roi.dims[2].size, 2);
-        if let NDDataBuffer::U8(ref v) = roi.data {
+        if let NDDataView::U8(v) = roi.data.view() {
             // pixel (x=1,y=0) channels => 10,11,12
             assert_eq!(&v[0..3], &[10, 11, 12]);
             // pixel (x=1,y=1) channels => 110,111,112
@@ -1801,7 +1806,7 @@ mod tests {
         assert_eq!(roi.dims[1].size, 2);
         assert_eq!(roi.dims[2].size, 2);
         // Values preserved through the widening conversion: pixel (0,0) = 0,1,2.
-        if let NDDataBuffer::U16(ref v) = roi.data {
+        if let NDDataView::U16(v) = roi.data.view() {
             assert_eq!(&v[0..3], &[0, 1, 2]);
         } else {
             panic!("not u16");
@@ -1855,7 +1860,7 @@ mod tests {
             .unwrap();
         assert_eq!(cm, NDColorMode::Mono as i64);
         // Channel-1 value of pixel (x,y) = 100*y + 10*x + 1, in [x,y] order.
-        if let NDDataBuffer::U8(ref v) = roi.data {
+        if let NDDataView::U8(v) = roi.data.view() {
             assert_eq!(v, &[1, 11, 101, 111]);
         } else {
             panic!("not u8");
@@ -1875,7 +1880,7 @@ mod tests {
             vec![NDDimension::new(3), NDDimension::new(3)],
             NDDataType::UInt8,
         );
-        if let NDDataBuffer::U8(ref mut v) = arr.data {
+        if let NDDataViewMut::U8(v) = arr.data.view_mut() {
             v.iter_mut().for_each(|p| *p = 100);
         }
 
@@ -1895,7 +1900,7 @@ mod tests {
         }
 
         let roi = extract_roi_2d(&pool(), &arr, &config).unwrap();
-        if let NDDataBuffer::U8(ref v) = roi.data {
+        if let NDDataView::U8(v) = roi.data.view() {
             assert_eq!(v[0], 132, "900 % 256 == 132 (C wraps), not 255");
         } else {
             panic!("not u8");
@@ -1911,7 +1916,7 @@ mod tests {
             vec![NDDimension::new(3), NDDimension::new(3)],
             NDDataType::UInt8,
         );
-        if let NDDataBuffer::U8(ref mut v) = arr.data {
+        if let NDDataViewMut::U8(v) = arr.data.view_mut() {
             v.iter_mut().for_each(|p| *p = 100);
         }
 
@@ -1932,7 +1937,7 @@ mod tests {
         }
 
         let roi = extract_roi_2d(&pool(), &arr, &config).unwrap();
-        if let NDDataBuffer::U8(ref v) = roi.data {
+        if let NDDataView::U8(v) = roi.data.view() {
             assert_eq!(v[0], 100, "900/9 via the Float64 path");
         } else {
             panic!("not u8");
@@ -1947,7 +1952,7 @@ mod tests {
             vec![NDDimension::new(2), NDDimension::new(1)],
             NDDataType::UInt16,
         );
-        if let NDDataBuffer::U16(ref mut v) = arr.data {
+        if let NDDataViewMut::U16(v) = arr.data.view_mut() {
             v[0] = 300;
             v[1] = 70;
         }
@@ -1975,7 +1980,7 @@ mod tests {
 
         let roi = extract_roi_2d(&pool(), &arr, &config).unwrap();
         assert_eq!(roi.data.data_type(), NDDataType::UInt8);
-        if let NDDataBuffer::U8(ref v) = roi.data {
+        if let NDDataView::U8(v) = roi.data.view() {
             assert_eq!(v[0], 44, "(epicsUInt8)300 == 44");
             assert_eq!(v[1], 70);
         } else {
@@ -1992,7 +1997,7 @@ mod tests {
             vec![NDDimension::new(3), NDDimension::new(3)],
             NDDataType::UInt8,
         );
-        if let NDDataBuffer::U8(ref mut v) = arr.data {
+        if let NDDataViewMut::U8(v) = arr.data.view_mut() {
             v.iter_mut().for_each(|p| *p = 100);
         }
 
@@ -2012,7 +2017,7 @@ mod tests {
         }
 
         let roi = extract_roi_2d(&pool(), &arr, &config).unwrap();
-        if let NDDataBuffer::U16(ref v) = roi.data {
+        if let NDDataView::U16(v) = roi.data.view() {
             assert_eq!(v[0], 900, "the bin sum accumulates in UInt16");
         } else {
             panic!("not u16");

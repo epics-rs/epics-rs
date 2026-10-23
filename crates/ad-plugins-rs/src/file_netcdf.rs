@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use ad_core_rs::attributes::{NDAttrSource, NDAttrValue, NDAttributeList};
 use ad_core_rs::error::{ADError, ADResult};
-use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDataType};
+use ad_core_rs::ndarray::{NDArray, NDDataType, NDDataView};
 use ad_core_rs::ndarray_pool::NDArrayPool;
 use ad_core_rs::plugin::file_base::{FileAttributes, NDFileOpenMode, NDFileWriter};
 use ad_core_rs::plugin::file_controller::{FileControl, FilePluginController};
@@ -426,17 +426,17 @@ impl OpenFile {
             .append(&[array.timestamp.nsec as i32])
             .map_err(map_h5)?;
         let ds = &self.array_data;
-        match &array.data {
-            NDDataBuffer::I8(v) => ds.append(v),
-            NDDataBuffer::U8(v) => ds.append(v),
-            NDDataBuffer::I16(v) => ds.append(v),
-            NDDataBuffer::U16(v) => ds.append(v),
-            NDDataBuffer::I32(v) => ds.append(v),
-            NDDataBuffer::U32(v) => ds.append(v),
-            NDDataBuffer::I64(v) => ds.append(v),
-            NDDataBuffer::U64(v) => ds.append(v),
-            NDDataBuffer::F32(v) => ds.append(v),
-            NDDataBuffer::F64(v) => ds.append(v),
+        match array.data.view() {
+            NDDataView::I8(v) => ds.append(v),
+            NDDataView::U8(v) => ds.append(v),
+            NDDataView::I16(v) => ds.append(v),
+            NDDataView::U16(v) => ds.append(v),
+            NDDataView::I32(v) => ds.append(v),
+            NDDataView::U32(v) => ds.append(v),
+            NDDataView::I64(v) => ds.append(v),
+            NDDataView::U64(v) => ds.append(v),
+            NDDataView::F32(v) => ds.append(v),
+            NDDataView::F64(v) => ds.append(v),
         }
         .map_err(map_h5)?;
         // C writes every attribute variable out of the sticky list
@@ -607,7 +607,7 @@ impl NDPluginProcess for NetcdfFileProcessor {
 mod tests {
     use super::*;
     use ad_core_rs::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
-    use ad_core_rs::ndarray::NDDimension;
+    use ad_core_rs::ndarray::{NDDataBuffer, NDDataViewMut, NDDimension};
     use ad_core_rs::plugin::file_base::{NDFileMode, NDPluginFileBase};
     use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -651,7 +651,7 @@ mod tests {
             dims.iter().map(|&d| NDDimension::new(d)).collect(),
             NDDataType::UInt8,
         );
-        if let NDDataBuffer::U8(v) = &mut arr.data {
+        if let NDDataViewMut::U8(v) = arr.data.view_mut() {
             for i in 0..n {
                 v[i] = fill(i);
             }
@@ -735,7 +735,8 @@ mod tests {
         let arr = make_u8(&[4, 4], |i| (i * 10) as u8);
         let path = write_frames("nc_u8", NDFileMode::Single, std::slice::from_ref(&arr));
         let back = read_back(&path);
-        let (NDDataBuffer::U8(want), NDDataBuffer::U8(got)) = (&arr.data, &back.data) else {
+        let (NDDataView::U8(want), NDDataView::U8(got)) = (arr.data.view(), back.data.view())
+        else {
             panic!("expected UInt8 on both sides");
         };
         assert_eq!(want, got);
@@ -748,14 +749,15 @@ mod tests {
             vec![NDDimension::new(4), NDDimension::new(4)],
             NDDataType::UInt16,
         );
-        if let NDDataBuffer::U16(v) = &mut arr.data {
+        if let NDDataViewMut::U16(v) = arr.data.view_mut() {
             for i in 0..16 {
                 v[i] = (i * 1000) as u16;
             }
         }
         let path = write_frames("nc_u16", NDFileMode::Single, std::slice::from_ref(&arr));
         let back = read_back(&path);
-        let (NDDataBuffer::U16(want), NDDataBuffer::U16(got)) = (&arr.data, &back.data) else {
+        let (NDDataView::U16(want), NDDataView::U16(got)) = (arr.data.view(), back.data.view())
+        else {
             panic!("expected UInt16 on both sides");
         };
         assert_eq!(want, got);
@@ -833,7 +835,7 @@ mod tests {
         // read_file returns the first frame, as the netCDF-3 reader returned
         // record 0.
         let back = read_back(&path);
-        let NDDataBuffer::U8(v) = &back.data else {
+        let NDDataView::U8(v) = back.data.view() else {
             panic!("expected U8 data");
         };
         assert_eq!(v.len(), 16);
@@ -847,7 +849,7 @@ mod tests {
         assert_eq!(ds.shape(), vec![3, 4, 4]);
         for (k, frame) in frames.iter().enumerate() {
             let got = ds.read_slice::<u8>(&[k, 0, 0], &[1, 4, 4]).unwrap();
-            let NDDataBuffer::U8(want) = &frame.data else {
+            let NDDataView::U8(want) = frame.data.view() else {
                 unreachable!()
             };
             assert_eq!(&got, want, "frame {k}");
@@ -1380,7 +1382,7 @@ mod tests {
         let ds = file.dataset(VAR_NAME).unwrap();
         assert_eq!(ds.max_shape().unwrap()[0], None);
         for (k, frame) in frames.iter().enumerate() {
-            let NDDataBuffer::U8(want) = &frame.data else {
+            let NDDataView::U8(want) = frame.data.view() else {
                 unreachable!()
             };
             assert_eq!(&ds.read_slice::<u8>(&[k, 0], &[1, 4]).unwrap(), want);
@@ -1407,7 +1409,9 @@ mod tests {
 
         let path = write_frames("nc_big_single", NDFileMode::Single, &[mk(0)]);
         let back = read_back(&path);
-        let (NDDataBuffer::U8(want), NDDataBuffer::U8(got)) = (&mk(0).data, &back.data) else {
+        let sent = mk(0);
+        let (NDDataView::U8(want), NDDataView::U8(got)) = (sent.data.view(), back.data.view())
+        else {
             panic!("expected UInt8 on both sides");
         };
         assert_eq!(want, got);
@@ -1418,7 +1422,8 @@ mod tests {
         let ds = file.dataset(VAR_NAME).unwrap();
         for (record, seed) in [(0usize, 0u8), (1, 77)] {
             let got = ds.read_slice::<u8>(&[record, 0], &[1, n]).unwrap();
-            let NDDataBuffer::U8(want) = &mk(seed).data else {
+            let sent = mk(seed);
+            let NDDataView::U8(want) = sent.data.view() else {
                 unreachable!()
             };
             assert_eq!(&got, want, "record {record}");

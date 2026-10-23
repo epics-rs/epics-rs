@@ -496,7 +496,6 @@ mod tests {
     use super::*;
     use ad_core_rs::driver::ColorMode;
     use ad_core_rs::ndarray::NDDataBuffer;
-    use ad_core_rs::pixel_cast::with_buffer;
     use rand::SeedableRng;
 
     fn default_gains() -> Gains {
@@ -768,9 +767,9 @@ mod tests {
         }
     }
 
-    /// FNV-1a over every frame of each mode, colour layout and background
-    /// setting, from a fixed seed; the constants pin the output of the code
-    /// this test was first run against.
+    /// FNV-1a over the bytes of every frame of each data type, mode, colour
+    /// layout and background setting, from a fixed seed; the constants were
+    /// captured on 65b35bc41b75, before compute_frame went typed.
     #[test]
     fn frame_output_is_pinned_for_a_fixed_seed() {
         use ad_core_rs::ndarray::NDDataType;
@@ -808,7 +807,18 @@ mod tests {
             y_op: SineOperation::Multiply,
         };
         let mut got = Vec::new();
-        for data_type in [NDDataType::UInt16, NDDataType::Float64] {
+        for data_type in [
+            NDDataType::Int8,
+            NDDataType::UInt8,
+            NDDataType::Int16,
+            NDDataType::UInt16,
+            NDDataType::Int32,
+            NDDataType::UInt32,
+            NDDataType::Int64,
+            NDDataType::UInt64,
+            NDDataType::Float32,
+            NDDataType::Float64,
+        ] {
             for sim_mode in [
                 SimMode::LinearRamp,
                 SimMode::Peaks,
@@ -816,7 +826,12 @@ mod tests {
                 SimMode::OffsetNoise,
             ] {
                 let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-                for color_mode in [ColorMode::Mono, ColorMode::RGB1, ColorMode::RGB2] {
+                for color_mode in [
+                    ColorMode::Mono,
+                    ColorMode::RGB1,
+                    ColorMode::RGB2,
+                    ColorMode::RGB3,
+                ] {
                     for (offset, noise) in [(0.0, 0.0), (100.0, 0.0), (100.0, 50.0)] {
                         let layout = ColorLayout {
                             color_mode,
@@ -849,31 +864,64 @@ mod tests {
                                 frame == 0,
                                 &mut rng,
                             );
-                            with_buffer!(&raw, |v| {
-                                for x in v.iter() {
-                                    for b in PixelCast::to_f64(*x).to_bits().to_le_bytes() {
-                                        hash = (hash ^ b as u64).wrapping_mul(0x100_0000_01b3);
-                                    }
-                                }
-                            });
+                            for &b in raw.as_u8_slice() {
+                                hash = (hash ^ b as u64).wrapping_mul(0x100_0000_01b3);
+                            }
                         }
                     }
                 }
                 got.push((data_type, sim_mode, hash));
             }
         }
-        let want: [u64; 8] = [
-            0x0f2eed4c8942e4e8,
-            0x802acb8de313cade,
-            0x7482418e09d121f2,
-            0xb019ed4c3d931256,
-            0x2041c44a8fcb961c,
-            0xf66b4f1efc7ad1d4,
-            0x27ed9937a9f91186,
-            0xf73f3b068564f35f,
+        let want: [u64; 40] = [
+            0xc97b119a694258bd,
+            0xbbdf15884d5e9e80,
+            0x385c02c2d10c58f1,
+            0xaae31296df5f3e7f,
+            0x777602a3524536e0,
+            0xd92cc1873286d76c,
+            0xb90fa7459d871835,
+            0x1328dc445c3810e1,
+            0x4efd80c4f4f52a7a,
+            0xc439defc49616cc8,
+            0x4d96db12d50f2361,
+            0x5dc6777e6e1057cb,
+            0x4efd80c4f4f52a7a,
+            0xc439defc49616cc8,
+            0x2d6b3f1fe5d40c38,
+            0x5dc6777e6e1057cb,
+            0xb74ba4766fe9e502,
+            0x0a3a576d20708608,
+            0x9186c412ba4ad8b1,
+            0xe2c746cf5cd8ef73,
+            0xb74ba4766fe9e502,
+            0x0a3a576d20708608,
+            0x6f33abc825c6e4f8,
+            0xe2c746cf5cd8ef73,
+            0xcfe87e6f5208ff72,
+            0x53d95fa64d936de8,
+            0x95a4ed7692a46a39,
+            0x036b906df6c72c83,
+            0xcfe87e6f5208ff72,
+            0x53d95fa64d936de8,
+            0x7d1b2b6ed82b2fb8,
+            0x036b906df6c72c83,
+            0x62a1cf2ab29e8ac4,
+            0x0dfb3d95af05f7a2,
+            0x2f2633d671c24cfc,
+            0x47305d355a34b9ae,
+            0x3edabf1f7aee0aad,
+            0xa5aaf36d71b5afd6,
+            0x3d7d4e94b9758062,
+            0xd5bb530fe70435e0,
         ];
-        for (&(data_type, sim_mode, hash), &want) in got.iter().zip(want.iter()) {
-            assert_eq!(hash, want, "{data_type:?} {sim_mode:?}");
-        }
+        assert_eq!(got.len(), want.len());
+        let changed: Vec<_> = got
+            .iter()
+            .zip(want)
+            .filter(|((_, _, hash), want)| hash != want)
+            .map(|(&(data_type, sim_mode, _), _)| (data_type, sim_mode))
+            .collect();
+        assert!(changed.is_empty(), "{changed:?}");
     }
 }

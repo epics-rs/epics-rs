@@ -240,6 +240,20 @@ fn for_each_chunk_with<T: Send, S: Default + Send>(
     });
 }
 
+/// [`for_each_run_with`] for a pass that keeps no state: an elementwise
+/// pass, which split per chunk would pay a loop setup and a scalar tail per
+/// chunk.
+fn for_each_run<T: Send>(
+    out: &mut [T],
+    len: usize,
+    jobs: usize,
+    f: impl Fn(usize, &mut [T]) + Sync,
+) {
+    for_each_run_with(out, len, jobs, &mut Vec::new(), |(), first, run| {
+        f(first, run)
+    });
+}
+
 /// [`for_each_chunk_with`] for a pass that keeps no state.
 fn for_each_chunk<T: Send>(
     out: &mut [T],
@@ -273,7 +287,7 @@ fn resize<T: Copy + Send + Sync>(buf: &mut Vec<T>, n: usize, fill: T, jobs: usiz
 /// `v` as `f64` into `out`, each sample cast as `to_f64_vec` casts it.
 fn to_f64_into<T: PixelCast + Sync>(out: &mut [f64], v: &[T], jobs: usize) {
     const CHUNK: usize = 1 << 16;
-    for_each_chunk(out, CHUNK, jobs, |i, out| {
+    for_each_run(out, CHUNK, jobs, |i, out| {
         for (o, &x) in out.iter_mut().zip(&v[i * CHUNK..]) {
             *o = x.to_f64();
         }
@@ -600,7 +614,7 @@ fn fft_2d_with(
     let data = &mut bufs.data;
     resize(data, n_freq_x * h, zero, jobs);
     let (rows_in, padding) = data.split_at_mut(src_h * n_freq_x);
-    for_each_chunk(padding, n_freq_x, jobs, |_, r| r.fill(zero));
+    for_each_run(padding, n_freq_x, jobs, |_, r| r.fill(zero));
     for_each_chunk_with(
         rows_in,
         2 * n_freq_x,
@@ -632,12 +646,8 @@ fn fft_2d_with(
     let data = &*data;
     let magnitudes = &mut bufs.out;
     resize(magnitudes, n_freq_x * n_freq_y, 0.0, jobs);
-    for_each_chunk(magnitudes, n_freq_x, jobs, |fy, mags| {
-        magnitudes_into(
-            mags,
-            &data[fy * n_freq_x..(fy + 1) * n_freq_x],
-            (w * h) as f64,
-        );
+    for_each_run(magnitudes, n_freq_x, jobs, |fy, mags| {
+        magnitudes_into(mags, &data[fy * n_freq_x..], (w * h) as f64);
     });
 
     if suppress_dc {
@@ -745,7 +755,7 @@ fn fft_2d_inverse_with(
     let data = &*data;
     let samples = &mut bufs.out;
     resize(samples, w * h, 0.0, jobs);
-    for_each_chunk(samples, w, jobs, |row, out| {
+    for_each_run(samples, w, jobs, |row, out| {
         for (s, c) in out.iter_mut().zip(&data[row * w..]) {
             *s = c.re * scale;
         }

@@ -9,17 +9,20 @@ Just `cargo build`.
 - **Channel Access** — client & server (UDP name resolution + TCP circuit, beacons, repeater)
 - **pvAccess** — client & server (search engine, monitor/get/put/RPC, ORIGIN_TAG forwarding)
 - **QSRV bridge** — records as NTScalar/NTEnum/NTNDArray and Group PVs (C++ QSRV JSON compatible), `pva://` / `ca://` database links (pvalink/calink)
-- **IOC runtime** — 35 base record types, .db loader, link chains, scan scheduling, ACF access security, iocsh, autosave, calc engine
+- **IOC runtime** — 34 base record types, .db loader, link chains, scan scheduling, ACF access security, iocsh, autosave, calc engine
 - **asyn** — actor-based async port driver framework
 - **motor** — 9-phase state machine, coordinate transforms, backlash compensation
 - **areaDetector** — NDArray, driver base, 26 plugins (Stats/ROI/FFT/file writers/PVA push/…)
-- **synApps modules** — std (epid/throttle/timestamp), scaler, optics, mca
+- **synApps modules** — std (epid/throttle/timestamp), scaler, optics, mca, sscan (sscan/scanparm records, saveData)
+- **StreamDevice** — `.proto` protocol files on asyn, with PCRE 8.45 ported to Rust for `%/regexp/`
+- **Sequencer** — snc compiles an unchanged `.st` program to Rust at build time; seq runs it
 - **Drivers** — MQTT broker bridge, Modbus TCP/RTU/ASCII
 - **Targets** — Linux/macOS/Windows (x86_64 + arm64), RTEMS 7 and 6, VxWorks 7, Linux PREEMPT_RT
 
 ## Installation
 
-All crates are published on [crates.io](https://crates.io/crates/epics-rs).
+Every crate in the [Workspace](#workspace) table except `epics-oracle-rs` is
+published on [crates.io](https://crates.io/crates/epics-rs).
 The umbrella crate pulls in what you select by feature:
 
 ```toml
@@ -46,11 +49,13 @@ use epics_rs::asyn;        // port driver framework
 | `std` | Standard records (epid, throttle, timestamp) | no |
 | `scaler` | Scaler record (64-channel counter) | no |
 | `optics` | Optics (table, monochromator, slit, filter, BPM) | no |
+| `mca` | mca record (multichannel analyzer) | no |
 | `full` | Everything above | no |
 
 `calc`, `autosave`, and `busy` are always available through `epics-base-rs`.
-The `mqtt-rs`, `epics-modbus-rs`, and `mca-rs` drivers are not surfaced
-through the umbrella crate — depend on them directly when needed.
+`sscan-rs`, `epics-stream-rs`, `epics-seq-rs`/`epics-snc-rs`, `mqtt-rs` and
+`epics-modbus-rs` are not surfaced through the umbrella crate — depend on
+them directly when needed.
 
 You can also depend on sub-crates directly:
 
@@ -72,7 +77,7 @@ epics-ca-rs   = "0.32"  # just Channel Access
 | `epics-macros-rs` | `#[derive(EpicsRecord)]` proc macro |
 | `epics-tools-rs` | Operational tooling (procserv-rs) |
 | `epics-rtems-boot` | RTEMS boot shim + link contract |
-| `epics-oracle-rs` | Differential oracle vs the C `softIoc` (local harness, needs a C EPICS tree) |
+| `epics-oracle-rs` | Differential oracle vs the C `softIoc` (local harness, needs a C EPICS tree; not published) |
 | `asyn-rs` | Async device I/O framework (port driver model) |
 | `motor-rs` | Motor record + SimMotor |
 | `ad-core-rs` | areaDetector core (NDArray, NDArrayPool, driver base) |
@@ -81,6 +86,11 @@ epics-ca-rs   = "0.32"  # just Channel Access
 | `scaler-rs` | Scaler record (64-channel counter) |
 | `optics-rs` | Optics (table, monochromator, slit, filter, BPM) |
 | `mca-rs` | Multichannel analyzer record |
+| `sscan-rs` | synApps sscan R2-12 (sscan and scanparm records, saveData's MDA writer, `scanProg.st`) |
+| `epics-stream-rs` | StreamDevice (imported as `stream_rs`) |
+| `stream-pcre-sys` | C PCRE 8.45, the test oracle for `epics-stream-rs`'s Rust PCRE |
+| `epics-snc-rs` | Sequencer R2-2-9 SNL compiler: `.st` → Rust from `build.rs`, and the `snc-rs` CLI |
+| `epics-seq-rs` | Sequencer R2-2-9 run-time that snc-rs programs run on |
 | `mqtt-rs` | MQTT broker bridge (FLAT/JSON payloads) |
 | `epics-modbus-rs` | Modbus TCP/RTU/ASCII driver |
 
@@ -89,7 +99,7 @@ Examples under `examples/`: `scope-ioc` (oscilloscope simulator),
 simulation), `xrt-beamline` (ray tracing), `qsrv-ioc` (Group PV demo),
 `mqtt-ioc`, `modbus-ioc`, `ophyd-test-ioc` (bluesky/ophyd test PVs),
 `regression-ioc` (end-to-end wire-behavior pins), `rt-probe` (PREEMPT_RT
-measurement). Each has its own README; build everything with
+measurement). Each except `rt-probe` has its own README; build everything with
 `cargo build --release --workspace` and run e.g.
 
 ```bash
@@ -122,7 +132,7 @@ pvget-rs TEMP        pvput-rs TEMP 42.0      pvmonitor-rs TEMP     pvinfo-rs TEM
 ```
 
 Also shipped: `ca-repeater-rs`, `ca-gateway-rs`, `pva-gateway-rs`,
-`dual-gateway-rs`, `qsrv-rs`, `procserv-rs`, `pvlist-rs`, `pvcall-rs`.
+`dual-gateway-rs`, `qsrv-rs`, `procserv-rs`, `pvlist-rs`, `pvcall-rs`, `snc-rs`.
 
 ### Client library
 
@@ -150,14 +160,23 @@ stays uninitialised, as in C), and the protocol runner is pluggable:
 
 ```rust
 use epics_rs::base::server::ioc_app::IocApplication;
+use epics_rs::base::server::record::{DbLinkType, DevSup, Dset};
 use epics_bridge_rs::qsrv::run_ca_pva_qsrv_ioc_app;   // or epics_rs::ca::server::run_ca_ioc_app
+
+// The `device(ai, CONSTANT, devAiMyDriver, "myDriver")` line of a C .dbd.
+static MY_DRIVER: DevSup = DevSup {
+    name: "devAiMyDriver",
+    choice: "myDriver",
+    link_type: DbLinkType::Constant,
+    dset: Dset::new(6, &[2, 3, 4], false),
+};
 
 // The `_app` entry point, not `IocApplication::run(runner)`: it runs the
 // protocol registrar before the startup script, so `casr`/`pvxsr` and the
 // `dbsr` server layer are there from the script's first line, as in C.
 run_ca_pva_qsrv_ioc_app(                          // CA + PVA with QSRV bridge
     IocApplication::new()
-        .register_device_support("myDriver", || Box::new(MyDeviceSupport::new()))
+        .register_device_support("ai", &MY_DRIVER, || Box::new(MyDeviceSupport::new()))
         .startup_script("ioc/st.cmd"),
 )
 .await?;
@@ -253,20 +272,19 @@ deployment"). Measured on a real PREEMPT_RT kernel, PI collapses the
 record-gate priority inversion to its critical-section bound: worst case
 24.9 ms to 10.1 ms on the measured guest.
 
-## Release binaries for Linux x86_64 (PGO)
+## Optional PGO build (Linux x86_64)
 
-The shipped `realtime-ca-ioc`, `realtime-pva-ioc` and `softioc-rs` binaries
-for `x86_64-unknown-linux-gnu` are built with profile-guided optimization:
+Release builds are plain. `realtime-ca-ioc`, `realtime-pva-ioc` and
+`softioc-rs` for `x86_64-unknown-linux-gnu` can be built with profile-guided
+optimization:
 
 ```bash
 scripts/pgo-train.sh   # needs `rustup component add llvm-tools`
 scripts/pgo-build.sh   # target/x86_64-unknown-linux-gnu/release/
 ```
 
-The profile is a release artifact, regenerated at each tag and never
-committed: a profile older than the sources builds without error and without
-the gain, so `pgo-build.sh` refuses one. Every other build stays plain —
-dev, test, RTEMS and VxWorks images, and the benchmark builds, whose
+A profile older than the sources builds without error and without the gain,
+so `pgo-build.sh` refuses one. Benchmark builds stay plain: their
 instruction-count anchors assume the plain layout.
 
 ## Architecture
@@ -335,7 +353,8 @@ See [`CHANGELOG.md`](./CHANGELOG.md) for the release-by-release audit trail.
 
 ## Requirements
 
-- Rust 1.85+ (edition 2024)
+- Rust 1.99.1, pinned in [`rust-toolchain.toml`](rust-toolchain.toml) (edition 2024)
+- RTEMS and VxWorks builds: a nightly toolchain with `rust-src` (see above)
 
 ## Related projects
 
@@ -361,7 +380,9 @@ Final responsibility for correctness of the port remains with the maintainers.
 ## License
 
 This software is distributed under the [EPICS Open License](LICENSE), the same
-license used by EPICS Base and most EPICS community modules.
+license used by EPICS Base and most EPICS community modules. Two crates
+differ: `epics-stream-rs` is LGPL-3.0-or-later, as StreamDevice is, and
+`stream-pcre-sys` is BSD-3-Clause, PCRE's licence.
 
 This repository also reimplements and, in a few places, bundles material from
 EPICS-related upstream projects. See [`THIRD_PARTY_LICENSES`](THIRD_PARTY_LICENSES)

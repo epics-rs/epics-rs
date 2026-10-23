@@ -3,7 +3,8 @@
 ## v0.32.0 — 2026-10-22
 
 Minor release; the pinned toolchain moves 1.99.0 → 1.99.1. The record
-cycle, CA, PVA and asyn follow C and pvxs; sscan and StreamDevice are ported.
+cycle, CA, PVA and asyn follow C and pvxs; sscan, StreamDevice and the
+sequencer are ported.
 
 ### Breaking
 
@@ -28,6 +29,7 @@ cycle, CA, PVA and asyn follow C and pvxs; sscan and StreamDevice are ported.
 - `sscan-rs`: synApps sscan R2-12, with the sscan and scanparm records, saveData's MDA writer and `scanProg.st`.
 - `epics-stream-rs` (imported as `stream_rs`; `stream-rs` is taken on crates.io): StreamDevice, with PCRE 8.45 ported to Rust for `%/regexp/`.
 - `epics_base_rs::server::rec_dyn_link`: recDynLink, which sscan's and swait's links run on.
+- `epics-snc-rs` and `epics-seq-rs`: the sequencer R2-2-9, snc at build time and seq at run time, so an unchanged upstream .st builds from `build.rs`; std's delayDo and femto, optics' twelve programs, sscan's `scanProg.st` and usb-ctr's `USBCTR_SNL.st` now run on it.
 
 ### Highlights
 

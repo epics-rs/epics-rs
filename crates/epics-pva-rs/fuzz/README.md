@@ -32,10 +32,10 @@ enough to fit in a per-PR check.
 
 Each target hits a distinct decode pivot:
 - header is the very first byte the network can drive
-- search-response was hardened in A-G2 (cids cap)
+- search-response caps its cid pre-allocation at what the payload can hold
 - type-desc has the deepest recursion (Structure inside StructureArray
   inside Union); compound-cycle bugs would surface here
-- pv-field is the value path, which P-G22 / safe_capacity guards
+- pv-field is the value path, whose array allocations `safe_capacity` bounds
 - op-response stitches header + descriptor + value, so it's the
   end-to-end equivalent of "send a malformed frame to the client"
 

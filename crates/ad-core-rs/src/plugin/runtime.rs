@@ -5048,7 +5048,7 @@ mod tests {
             let mut frame = DriverPool::standalone(0)
                 .alloc_copy(&raw_test_array(7))
                 .unwrap();
-            frame.codec = Some(level_five_lz4());
+            frame.fill().set_codec(Some(level_five_lz4()));
             send_array(handle.array_sender(), frame.share());
 
             let received = downstream_rx.blocking_recv().unwrap();

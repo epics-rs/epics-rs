@@ -138,7 +138,7 @@ fn frames() -> Vec<PublishedArray> {
     (0..FRAMES as i32)
         .map(|id| {
             let mut arr = pool.alloc_copy(&seed).unwrap();
-            arr.unique_id = id;
+            arr.fill().set_unique_id(id);
             arr.share()
         })
         .collect()

@@ -17,7 +17,6 @@ use crate::driver::ndarray_driver::{
     ArrayOwner, ND_ARRAY_DRIVER_INTERFACES, ND_ARRAY_DRIVER_INTERRUPTS, handle_write_int32,
     init_read_only_params, trace_write_int32,
 };
-use crate::ndarray::NDArray;
 use crate::ndarray_pool::{DriverArray, DriverPool, PublishedArray};
 use crate::params::ad_driver::ADDriverParams;
 use crate::plugin::channel::{NDArrayOutput, NDArraySender};
@@ -144,7 +143,7 @@ impl ADDriverBase {
         self.owner
             .attributes()
             .lock()
-            .attach(&self.port_base, &mut array);
+            .attach(&self.port_base, array.fill().attributes_mut());
 
         // G5/G6/G7: write all per-array parameters (size, dims, type, color,
         // Bayer, timestamps, codec).
@@ -288,11 +287,11 @@ impl ADDriverBase {
 
     /// C++ `asynNDArrayDriver::getAttributes`, for a driver that fills the
     /// array's attribute list itself before publishing.
-    pub fn attach_attributes(&mut self, array: &mut NDArray) {
+    pub fn attach_attributes(&mut self, attributes: &mut crate::attributes::NDAttributeList) {
         self.owner
             .attributes()
             .lock()
-            .attach(&self.port_base, array);
+            .attach(&self.port_base, attributes);
     }
 
     /// Store `ADAcquire`; its rule keeps `ADAcquireBusy` in step.
@@ -356,6 +355,7 @@ mod tests {
         assert_c_read_only_block, assert_fresh_pool_stats, assert_ndarray_data_ahead_of_params,
         record_posts,
     };
+    use crate::ndarray::NDArray;
     use crate::plugin::runtime::ASYN_CANBLOCK;
     use asyn_rs::param::ParamType;
     use asyn_rs::param::ParamValue;

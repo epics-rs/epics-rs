@@ -882,7 +882,7 @@ mod tests {
     /// An array of a driver no test reads.
     fn make_test_array(id: i32) -> PublishedArray {
         let mut arr = owned_array_mut(&DriverPool::standalone(0));
-        arr.unique_id = id;
+        arr.fill().set_unique_id(id);
         arr.share()
     }
 

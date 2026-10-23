@@ -558,16 +558,15 @@ impl NDArrayInfo {
 /// use ad_core_rs::ndarray::{NDDataBuffer, NDDataType, NDDimension};
 /// use ad_core_rs::ndarray_pool::DriverPool;
 ///
-/// let pool = DriverPool::standalone(8);
-/// let mut a = pool.alloc(vec![NDDimension::new(2)], NDDataType::Int32).unwrap();
+/// # let pool = DriverPool::standalone(8);
+/// # let mut a = pool.alloc(vec![NDDimension::new(2)], NDDataType::Int32).unwrap();
 /// a.data = NDDataBuffer::zeros(NDDataType::Int32, 4);
 /// ```
 ///
 /// ```compile_fail,E0616
 /// use ad_core_rs::ndarray::{NDDataBuffer, NDDataType, NDDimension};
-/// use ad_core_rs::ndarray_pool::{DriverPool, PersistentArray};
-///
-/// let pool = DriverPool::standalone(8);
+/// # use ad_core_rs::ndarray_pool::{DriverPool, PersistentArray};
+/// # let pool = DriverPool::standalone(8);
 /// let array = pool.alloc(vec![NDDimension::new(2)], NDDataType::Int32).unwrap();
 /// let mut flat = PersistentArray::new(array);
 /// flat.refill().data = NDDataBuffer::zeros(NDDataType::Int32, 4);
@@ -577,8 +576,8 @@ impl NDArrayInfo {
 /// use ad_core_rs::ndarray::{NDDataType, NDDimension};
 /// use ad_core_rs::ndarray_pool::DriverPool;
 ///
-/// let pool = DriverPool::standalone(8);
-/// let mut a = pool.alloc(vec![NDDimension::new(2)], NDDataType::Int32).unwrap();
+/// # let pool = DriverPool::standalone(8);
+/// # let mut a = pool.alloc(vec![NDDimension::new(2)], NDDataType::Int32).unwrap();
 /// a.data_size = 16;
 /// ```
 #[derive(Debug)]
@@ -641,6 +640,121 @@ impl std::ops::Deref for NDDataMut<'_> {
     type Target = NDDataBuffer;
 
     fn deref(&self) -> &NDDataBuffer {
+        self.0
+    }
+}
+
+/// A pool-owned array to write in place: [`DriverArray::fill`] and
+/// [`PersistentArray::refill`]. It never yields `&mut NDArray`, so the
+/// array cannot be replaced or swapped out of its pool charge.
+///
+/// ```compile_fail,E0594
+/// # use ad_core_rs::ndarray::{NDArray, NDDataType, NDDimension};
+/// # use ad_core_rs::ndarray_pool::{DriverPool, PersistentArray};
+/// # let pool = DriverPool::standalone(8);
+/// # let mut a = pool.alloc(vec![NDDimension::new(2)], NDDataType::Int32).unwrap();
+/// # let mut other = NDArray::new(vec![NDDimension::new(1000)], NDDataType::Int32);
+/// *a = other;
+/// ```
+///
+/// ```compile_fail,E0596
+/// # use ad_core_rs::ndarray::{NDArray, NDDataType, NDDimension};
+/// # use ad_core_rs::ndarray_pool::{DriverPool, PersistentArray};
+/// # let pool = DriverPool::standalone(8);
+/// # let mut a = pool.alloc(vec![NDDimension::new(2)], NDDataType::Int32).unwrap();
+/// # let mut other = NDArray::new(vec![NDDimension::new(1000)], NDDataType::Int32);
+/// std::mem::swap(&mut *a, &mut other);
+/// ```
+///
+/// ```compile_fail,E0594
+/// # use ad_core_rs::ndarray::{NDArray, NDDataType, NDDimension};
+/// # use ad_core_rs::ndarray_pool::{DriverPool, PersistentArray};
+/// # let pool = DriverPool::standalone(8);
+/// # let mut a = pool.alloc(vec![NDDimension::new(2)], NDDataType::Int32).unwrap();
+/// # let mut other = NDArray::new(vec![NDDimension::new(1000)], NDDataType::Int32);
+/// let mut flat = PersistentArray::new(a);
+/// *flat.refill() = other;
+/// ```
+///
+/// ```compile_fail,E0596
+/// # use ad_core_rs::ndarray::{NDArray, NDDataType, NDDimension};
+/// # use ad_core_rs::ndarray_pool::{DriverPool, PersistentArray};
+/// # let pool = DriverPool::standalone(8);
+/// # let mut a = pool.alloc(vec![NDDimension::new(2)], NDDataType::Int32).unwrap();
+/// # let mut other = NDArray::new(vec![NDDimension::new(1000)], NDDataType::Int32);
+/// let mut flat = PersistentArray::new(a);
+/// std::mem::swap(&mut *flat.refill(), &mut other);
+/// ```
+///
+/// ```compile_fail,E0594
+/// # use ad_core_rs::ndarray::{NDArray, NDDataType, NDDimension};
+/// # use ad_core_rs::ndarray_pool::{DriverPool, PersistentArray};
+/// # let pool = DriverPool::standalone(8);
+/// # let mut a = pool.alloc(vec![NDDimension::new(2)], NDDataType::Int32).unwrap();
+/// # let mut other = NDArray::new(vec![NDDimension::new(1000)], NDDataType::Int32);
+/// # let owner = pool.owner().clone();
+/// let _ = owner.refill(0, a.share(), |a| **a = other);
+/// ```
+///
+/// ```compile_fail,E0596
+/// # use ad_core_rs::ndarray::{NDArray, NDDataType, NDDimension};
+/// # use ad_core_rs::ndarray_pool::{DriverPool, PersistentArray};
+/// # let pool = DriverPool::standalone(8);
+/// # let mut a = pool.alloc(vec![NDDimension::new(2)], NDDataType::Int32).unwrap();
+/// # let mut other = NDArray::new(vec![NDDimension::new(1000)], NDDataType::Int32);
+/// # let owner = pool.owner().clone();
+/// let _ = owner.refill(0, a.share(), |a| std::mem::swap(&mut **a, &mut other));
+/// ```
+///
+/// [`DriverArray::fill`]: crate::ndarray_pool::DriverArray::fill
+/// [`PersistentArray::refill`]: crate::ndarray_pool::PersistentArray::refill
+pub struct NDArrayMut<'a>(&'a mut NDArray);
+
+impl<'a> NDArrayMut<'a> {
+    pub(crate) fn new(_: PoolOnly, array: &'a mut NDArray) -> Self {
+        Self(array)
+    }
+
+    pub fn set_unique_id(&mut self, unique_id: i32) {
+        self.0.unique_id = unique_id;
+    }
+
+    /// C's `epicsTS` alone; [`NDArray::update_time_stamps`] sets both.
+    pub fn set_timestamp(&mut self, timestamp: EpicsTimestamp) {
+        self.0.timestamp = timestamp;
+    }
+
+    /// C's `timeStamp` alone, as a driver with its own clock sets it.
+    pub fn set_time_stamp(&mut self, time_stamp: f64) {
+        self.0.time_stamp = time_stamp;
+    }
+
+    /// [`NDArray::update_time_stamps`].
+    pub fn update_time_stamps(&mut self, epics_ts: EpicsTimestamp) {
+        self.0.update_time_stamps(epics_ts);
+    }
+
+    pub fn set_dims(&mut self, dims: Vec<NDDimension>) {
+        self.0.dims = dims;
+    }
+
+    pub fn set_codec(&mut self, codec: Option<Codec>) {
+        self.0.codec = codec;
+    }
+
+    pub fn attributes_mut(&mut self) -> &mut NDAttributeList {
+        &mut self.0.attributes
+    }
+
+    pub fn data_mut(&mut self) -> NDDataMut<'_> {
+        self.0.data_mut()
+    }
+}
+
+impl std::ops::Deref for NDArrayMut<'_> {
+    type Target = NDArray;
+
+    fn deref(&self) -> &NDArray {
         self.0
     }
 }

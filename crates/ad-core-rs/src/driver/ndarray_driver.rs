@@ -14,7 +14,7 @@ use crate::attributes::{
     NDAttributeFunctionRegistry, ParamAttributeSource, PvAttrDbrType,
 };
 use crate::color::NDColorMode;
-use crate::ndarray::NDArray;
+use crate::ndarray::{NDArray, NDArrayMut};
 use crate::ndarray_pool::{DriverArray, DriverPool, NDArrayPool, PersistentArray, PublishedArray};
 use crate::params::ndarray_driver::NDArrayDriverParams;
 use crate::plugin::channel::{NDArrayOutput, NDArraySender, QueuedArrayCounter};
@@ -720,13 +720,17 @@ impl DriverAttributes {
     }
 
     /// C++ `asynNDArrayDriver::getAttributes(pArray->pAttributeList)`:
-    /// re-evaluate every attribute and merge the values onto `array`. An empty
-    /// set leaves the array untouched, so a plain array is never deep-copied
-    /// through `Arc::make_mut`.
-    pub fn attach(&mut self, port_base: &PortDriverBase, array: &mut NDArray) {
+    /// re-evaluate every attribute and merge the values onto an array's
+    /// `attributes`. An empty set leaves them untouched, so a plain array is
+    /// never deep-copied through `Arc::make_mut`.
+    pub fn attach(
+        &mut self,
+        port_base: &PortDriverBase,
+        attributes: &mut crate::attributes::NDAttributeList,
+    ) {
         if !self.list.is_empty() {
             let fresh = self.update(port_base);
-            array.attributes.copy_from(&fresh);
+            attributes.copy_from(&fresh);
         }
     }
 
@@ -1411,7 +1415,7 @@ impl ArrayOwner {
         &self,
         addr: usize,
         array: PublishedArray,
-        change: impl FnOnce(&mut NDArray),
+        change: impl FnOnce(&mut NDArrayMut<'_>),
     ) -> crate::error::ADResult<PublishedArray> {
         let mut arrays = self.arrays.lock();
         let slot = Self::slot(&mut arrays, addr);
@@ -1427,7 +1431,7 @@ impl ArrayOwner {
                 }
             },
         };
-        change(&mut array);
+        change(&mut array.fill());
         let array = array.share();
         *slot = Some(Held::Shared(array.array().clone()));
         Ok(array)
@@ -1443,10 +1447,14 @@ impl ArrayOwner {
     /// C++ `getAttributes(pArray->pAttributeList)` from a driver's own task
     /// (simDetector.cpp:828), which holds the driver lock: the set is
     /// re-evaluated on the port's actor, where its `PARAM` values live, and
-    /// merged onto `array`. An empty set or a stopped port leaves it alone.
-    pub async fn get_attributes(&self, array: &mut NDArray) -> AsynResult<()> {
+    /// merged onto an array's `attributes`. An empty set or a stopped port
+    /// leaves them alone.
+    pub async fn get_attributes(
+        &self,
+        attributes: &mut crate::attributes::NDAttributeList,
+    ) -> AsynResult<()> {
         if let Some(fresh) = self.evaluate_attributes().await? {
-            array.attributes.copy_from(&fresh);
+            attributes.copy_from(&fresh);
         }
         Ok(())
     }
@@ -1640,7 +1648,7 @@ impl NDArrayDriverBase {
         self.owner
             .attributes
             .lock()
-            .attach(&self.port_base, &mut array);
+            .attach(&self.port_base, array.fill().attributes_mut());
 
         // G5/G6/G7: write all per-array parameters (size, dims, type, color,
         // Bayer, timestamps, codec).
@@ -1743,7 +1751,7 @@ impl NDArrayDriverBase {
     /// when there is one; `timeStamp` is always derived from `epicsTS` — the
     /// two cannot disagree. `NDArrayPool::alloc` sets neither; this is the
     /// only place that sets them for a newly produced frame.
-    pub fn update_time_stamps(&mut self, array: &mut NDArray) {
+    pub fn update_time_stamps(&mut self, array: &mut NDArrayMut<'_>) {
         array.update_time_stamps(self.port_base.update_time_stamp().into());
     }
 
@@ -2103,7 +2111,7 @@ pub(crate) mod tests {
         let mut reader = None;
         let image = owner
             .refill(0, image, |array| {
-                array.unique_id = 7;
+                array.set_unique_id(7);
                 let owner = owner.clone();
                 reader = Some(std::thread::spawn(move || {
                     owner.array(0).map(|a| a.unique_id)
@@ -2889,11 +2897,11 @@ pub(crate) mod tests {
                 crate::ndarray::NDDataType::UInt16,
             )
             .unwrap();
-        arr.time_stamp = 100.5;
-        arr.timestamp = crate::timestamp::EpicsTimestamp {
+        arr.fill().set_time_stamp(100.5);
+        arr.fill().set_timestamp(crate::timestamp::EpicsTimestamp {
             sec: 1234,
             nsec: 5678,
-        };
+        });
         drv.prepare_array(arr).unwrap();
 
         assert_eq!(
@@ -2949,15 +2957,15 @@ pub(crate) mod tests {
                 crate::ndarray::NDDataType::UInt8,
             )
             .unwrap();
-        arr.codec = Some(crate::codec::Codec {
+        arr.fill().set_codec(Some(crate::codec::Codec {
             name: crate::codec::CodecName::BSLZ4,
             compressed_size: 9,
             level: 0,
             shuffle: 0,
             compressor: 0,
             original_data_type: crate::ndarray::NDDataType::UInt8,
-        });
-        arr.attributes.add(NDAttribute {
+        }));
+        arr.fill().attributes_mut().add(NDAttribute {
             name: "bayerPattern".into(),
             description: String::new(),
             source: NDAttrSource::Driver,

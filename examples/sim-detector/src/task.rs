@@ -134,10 +134,10 @@ impl TaskState {
             }
         };
         compute::compute_frame(
-            b.raw.data_mut().view_mut(),
-            b.background.data_mut().view_mut(),
-            b.ramp.data_mut().view_mut(),
-            b.peak.data_mut().view_mut(),
+            b.raw.fill().data_mut().view_mut(),
+            b.background.fill().data_mut().view_mut(),
+            b.ramp.fill().data_mut().view_mut(),
+            b.peak.fill().data_mut().view_mut(),
             &mut self.sine_state,
             &layout,
             config.sim_mode,
@@ -379,10 +379,10 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
 
             // simTask stamps pArrays[0] in place (simDetector.cpp:824-828).
             let Ok(frame) = ctx.pool.owner().refill(0, frame, |frame| {
-                frame.unique_id = array_counter;
+                frame.set_unique_id(array_counter);
                 frame.update_time_stamps(stamp);
                 if let Some(attributes) = &attributes {
-                    frame.attributes.copy_from(attributes);
+                    frame.attributes_mut().copy_from(attributes);
                 }
             }) else {
                 continue;

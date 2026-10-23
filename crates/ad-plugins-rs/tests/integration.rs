@@ -88,7 +88,7 @@ fn test_driver_to_stats_pipeline() {
         )
         .unwrap();
 
-    if let NDDataViewMut::U8(v) = arr.data_mut().view_mut() {
+    if let NDDataViewMut::U8(v) = arr.fill().data_mut().view_mut() {
         for i in 0..v.len() {
             v[i] = (i % 256) as u8;
         }

@@ -7,7 +7,7 @@ use crate::attributes::NDAttributeList;
 use crate::codec::Codec;
 use crate::driver::ndarray_driver::ArrayOwner;
 use crate::error::{ADError, ADResult};
-use crate::ndarray::{NDArray, NDDataBuffer, NDDataType, NDDimension, PoolTie};
+use crate::ndarray::{NDArray, NDArrayMut, NDDataBuffer, NDDataType, NDDimension, PoolTie};
 
 /// If a free-list buffer is more than this ratio larger than needed, discard
 /// it and allocate fresh to avoid wasting memory.
@@ -611,7 +611,7 @@ impl DriverPool {
         }
         let mut copy = self.alloc_copy(&array)?;
         if let Some(attributes) = attributes {
-            copy.attributes.copy_from(attributes);
+            copy.array.attributes.copy_from(attributes);
         }
         Ok(copy.into())
     }
@@ -632,6 +632,11 @@ pub struct DriverArray {
 }
 
 impl DriverArray {
+    /// The array to fill in place.
+    pub fn fill(&mut self) -> NDArrayMut<'_> {
+        NDArrayMut::new(PoolOnly(()), &mut self.array)
+    }
+
     /// Hand the array over for publishing; nothing mutates it after this.
     pub fn share(self) -> PublishedArray {
         PublishedArray {
@@ -646,12 +651,6 @@ impl std::ops::Deref for DriverArray {
 
     fn deref(&self) -> &NDArray {
         &self.array
-    }
-}
-
-impl std::ops::DerefMut for DriverArray {
-    fn deref_mut(&mut self) -> &mut NDArray {
-        &mut self.array
     }
 }
 
@@ -774,9 +773,9 @@ impl PersistentArray {
     }
 
     /// The buffer to refill.
-    pub fn refill(&mut self) -> &mut NDArray {
+    pub fn refill(&mut self) -> NDArrayMut<'_> {
         self.shown = None;
-        &mut self.array
+        self.array.fill()
     }
 
     /// The array to publish: the same one until the next refill.
@@ -834,12 +833,12 @@ mod tests {
                 pool.allocated_bytes(),
             )
         };
-        flat.refill().unique_id = 1;
+        flat.refill().set_unique_id(1);
         let first = flat.published();
         assert!(Arc::ptr_eq(first.array(), flat.published().array()));
         assert_eq!(first.pool_id(), pool.id());
 
-        flat.refill().unique_id = 2;
+        flat.refill().set_unique_id(2);
         assert_eq!(first.unique_id, 1);
         assert_eq!(flat.published().unique_id, 2);
         assert_eq!(counts(&pool), (1, 0, 8));
@@ -863,7 +862,7 @@ mod tests {
         let pool = DriverPool::standalone(8);
         let alloc = || pool.alloc(vec![NDDimension::new(2)], NDDataType::Int32);
         let mut current = PersistentArray::new(alloc().unwrap());
-        current.refill().unique_id = 1;
+        current.refill().set_unique_id(1);
         let held = current.published();
         assert_eq!(held.unique_id, 1);
         assert_eq!((pool.num_alloc_buffers(), pool.allocated_bytes()), (1, 8));
@@ -887,11 +886,11 @@ mod tests {
                 .unwrap(),
         );
         let held = flat.published();
-        flat.refill().unique_id = 1;
+        flat.refill().set_unique_id(1);
         let Ok(mut copy) = held.try_into_driver() else {
             panic!("the refill let go of the publish");
         };
-        copy.data_mut().resize(3);
+        copy.fill().data_mut().resize(3);
         assert_eq!(copy.data().len(), 2);
     }
 
@@ -904,7 +903,7 @@ mod tests {
         let mut a = pool
             .alloc(vec![NDDimension::new(2)], NDDataType::Int32)
             .unwrap();
-        a.data_mut().resize(4);
+        a.fill().data_mut().resize(4);
         assert_eq!(a.data().len(), 2);
         let mut flat = PersistentArray::new(a);
         flat.refill().data_mut().resize(4);

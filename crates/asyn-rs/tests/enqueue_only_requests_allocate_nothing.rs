@@ -1,0 +1,156 @@
+//! A request nobody waits on — `set_params_and_notify` and a
+//! `CallbacksGate` section, a plugin's per-frame post — allocates nothing on
+//! the posting thread: no reply channel and no cancel token, since nothing
+//! answers it and nothing can cancel it or time it out.
+
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use asyn_rs::param::{ParamType, ParamValue};
+use asyn_rs::port::{InterfaceMask, PortDriver, PortDriverBase, PortFlags};
+use asyn_rs::request::ParamSetValue;
+use asyn_rs::runtime::{RuntimeConfig, create_port_runtime_unclaimed};
+use epics_libcom_rs::runtime::interrupt_accept::InterruptGate;
+
+static ALLOCS: AtomicUsize = AtomicUsize::new(0);
+
+thread_local! {
+    static COUNTING: Cell<bool> = const { Cell::new(false) };
+}
+
+struct Counting;
+
+// SAFETY: forwards every call to `System` unchanged; the flag is a
+// const-initialised thread-local `Cell`, which never allocates.
+unsafe impl GlobalAlloc for Counting {
+    unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+        if COUNTING.try_with(Cell::get).unwrap_or(false) {
+            ALLOCS.fetch_add(1, Ordering::SeqCst);
+        }
+        unsafe { System.alloc(l) }
+    }
+    unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
+        unsafe { System.dealloc(p, l) }
+    }
+    unsafe fn realloc(&self, p: *mut u8, l: Layout, n: usize) -> *mut u8 {
+        if COUNTING.try_with(Cell::get).unwrap_or(false) {
+            ALLOCS.fetch_add(1, Ordering::SeqCst);
+        }
+        unsafe { System.realloc(p, l, n) }
+    }
+}
+
+#[global_allocator]
+static A: Counting = Counting;
+
+fn counted<R>(f: impl FnOnce() -> R) -> (R, usize) {
+    let a0 = ALLOCS.load(Ordering::SeqCst);
+    COUNTING.with(|c| c.set(true));
+    let r = f();
+    COUNTING.with(|c| c.set(false));
+    (r, ALLOCS.load(Ordering::SeqCst) - a0)
+}
+
+struct Device {
+    base: PortDriverBase,
+}
+
+impl PortDriver for Device {
+    fn base(&self) -> &PortDriverBase {
+        &self.base
+    }
+    fn base_mut(&mut self) -> &mut PortDriverBase {
+        &mut self.base
+    }
+}
+
+/// A CANBLOCK port with one Int32 parameter, and a count of its posts.
+fn port(name: &str) -> (asyn_rs::runtime::PortRuntimeHandle, usize, Arc<AtomicUsize>) {
+    let mut base = PortDriverBase::new(
+        name,
+        1,
+        PortFlags {
+            can_block: true,
+            ..PortFlags::default()
+        },
+        InterfaceMask::UNMIGRATED_ALL,
+        InterfaceMask::UNMIGRATED_INTERRUPTS,
+    );
+    base.own_interrupts(InterruptGate::opened());
+    let reason = base.create_param("VAL", ParamType::Int32).unwrap();
+    let (runtime, _actor) =
+        create_port_runtime_unclaimed(Device { base }, RuntimeConfig::default()).unwrap();
+    let posts = Arc::new(AtomicUsize::new(0));
+    let seen = posts.clone();
+    let sub = runtime
+        .port_handle()
+        .interrupts()
+        .register_sync_callback(
+            asyn_rs::interrupt::InterruptFilter {
+                reason: Some(reason),
+                addr: Some(0),
+                ..Default::default()
+            },
+            move |_| {
+                seen.fetch_add(1, Ordering::SeqCst);
+            },
+        )
+        .unwrap();
+    std::mem::forget(sub);
+    (runtime, reason, posts)
+}
+
+fn set(reason: usize, v: i32) -> Vec<ParamSetValue> {
+    vec![ParamSetValue::new(reason, 0, ParamValue::Int32(v))]
+}
+
+const N: i32 = 256;
+
+#[test]
+fn set_params_and_notify_allocates_nothing_on_the_posting_thread() {
+    let (runtime, reason, posts) = port("enqNotify");
+    let handle = runtime.port_handle();
+    let mut allocs = 0;
+    for i in 1..=2 * N {
+        let updates = set(reason, i);
+        let (r, a) = counted(|| handle.set_params_and_notify_blocking(0, updates));
+        r.unwrap();
+        // The read queues behind the post, so the actor has run it.
+        assert_eq!(handle.read_int32_blocking(reason, 0).unwrap(), i);
+        if i > N {
+            allocs += a;
+        }
+    }
+    assert_eq!(posts.load(Ordering::SeqCst), 2 * N as usize);
+    assert_eq!(allocs, 0, "{N} posts after {N} warm-up ones");
+    runtime.shutdown();
+}
+
+/// The actor reaches each section's sets before it ends, so every end is
+/// the held one that sends the callbacks on: both requests are counted.
+#[test]
+fn a_held_callbacks_gate_section_allocates_nothing_on_the_posting_thread() {
+    let (runtime, reason, posts) = port("enqGate");
+    let handle = runtime.port_handle();
+    let mut gate = handle.callbacks_gate();
+    let mut allocs = 0;
+    for i in 1..=2 * N {
+        let updates = set(reason, i);
+        let g = &mut gate;
+        let (after, opened) = counted(move || g.open(0, None, updates).unwrap());
+        assert_eq!(handle.read_int32_blocking(reason, 0).unwrap(), i);
+        assert_eq!(posts.load(Ordering::SeqCst), i as usize - 1, "held");
+        let (r, ended) = counted(|| after.end());
+        r.unwrap();
+        // Any queued request runs after the held callbacks.
+        handle.read_int32_blocking(reason, 0).unwrap();
+        assert_eq!(posts.load(Ordering::SeqCst), i as usize, "fired at the end");
+        if i > N {
+            allocs += opened + ended;
+        }
+    }
+    assert_eq!(allocs, 0, "{N} sections after {N} warm-up ones");
+    runtime.shutdown();
+}

@@ -766,6 +766,14 @@ impl PortHandle {
         })
     }
 
+    /// [`Self::try_submit`] for a request whose outcome nobody reads: C
+    /// `queueRequest` with no `timeoutUser`. It carries no reply channel and
+    /// no cancel token.
+    pub fn submit_unanswered(&self, op: RequestOp, user: AsynUser) -> AsynResult<()> {
+        crate::port_actor::queue_request_gate(&self.gate, &op, &user, self.multi_device)?;
+        self.send(ActorMessage::unanswered(op, user))
+    }
+
     /// The one gate every blocking entry point on this handle passes through.
     ///
     /// Refuses a re-entrant call from the port's own actor thread (which could
@@ -1350,7 +1358,7 @@ impl PortHandle {
         });
         let op = RequestOp::WithDriverAfterQueue(call);
         if self.can_block {
-            self.try_submit(op, AsynUser::default())?;
+            self.submit_unanswered(op, AsynUser::default())?;
         } else {
             self.submit_blocking(op, AsynUser::default())?;
         }
@@ -1497,9 +1505,7 @@ impl PortHandle {
     }
 
     fn enqueue_now(&self, op: RequestOp, addr: i32) -> AsynResult<()> {
-        let user = AsynUser::new(0).with_addr(addr);
-        let (reply_tx, _) = oneshot::channel();
-        self.send(ActorMessage::new(op, user, CancelToken::new(), reply_tx))
+        self.submit_unanswered(op, AsynUser::new(0).with_addr(addr))
     }
 
     /// C `queueRequest`'s `ellAdd` + `epicsEventSignal` (asynManager.c:1615,
@@ -1873,11 +1879,10 @@ impl PortHandle {
     /// exception callback, running on that port's actor, and C's callers
     /// ignore the status (drvLove.c:686).
     pub fn exception_disconnect(&self, addr: i32) -> AsynResult<()> {
-        self.try_submit(
+        self.submit_unanswered(
             RequestOp::ExceptionDisconnect,
             AsynUser::default().with_addr(addr),
         )
-        .map(drop)
     }
 
     /// [`Self::exception_disconnect`] waiting for C's status: an already-down

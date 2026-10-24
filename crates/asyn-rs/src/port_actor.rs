@@ -590,7 +590,9 @@ fn lock_port(
 pub(crate) struct ActorMessage {
     pub op: RequestOp,
     pub user: AsynUser,
-    pub cancel: CancelToken,
+    /// How a waiter takes the request off the queue; a request nobody waits
+    /// on ([`Reply::Nobody`]) has none and always runs.
+    pub cancel: Option<CancelToken>,
     pub reply: Reply,
     pub seq: u64,
     pub priority: QueuePriority,
@@ -608,6 +610,8 @@ pub(crate) enum Reply {
     /// A waiter that runs the claimed request itself, with the actor lent
     /// to it ([`Lend`]).
     Lend(oneshot::Sender<AsynResult<Claimed>>),
+    /// Nobody: an enqueue-only request.
+    Nobody,
 }
 
 impl ActorMessage {
@@ -617,7 +621,7 @@ impl ActorMessage {
         cancel: CancelToken,
         reply: oneshot::Sender<AsynResult<RequestResult>>,
     ) -> Self {
-        Self::answering(op, user, cancel, Reply::Result(reply))
+        Self::answering(op, user, Some(cancel), Reply::Result(reply))
     }
 
     /// A request whose waiter runs it with the actor lent ([`Lend`]).
@@ -627,10 +631,16 @@ impl ActorMessage {
         cancel: CancelToken,
         reply: oneshot::Sender<AsynResult<Claimed>>,
     ) -> Self {
-        Self::answering(op, user, cancel, Reply::Lend(reply))
+        Self::answering(op, user, Some(cancel), Reply::Lend(reply))
     }
 
-    fn answering(op: RequestOp, user: AsynUser, cancel: CancelToken, reply: Reply) -> Self {
+    /// A request nobody waits on: nothing can cancel it or time it out, so
+    /// it carries neither a reply channel nor a token, and allocates nothing.
+    pub(crate) fn unanswered(op: RequestOp, user: AsynUser) -> Self {
+        Self::answering(op, user, None, Reply::Nobody)
+    }
+
+    fn answering(op: RequestOp, user: AsynUser, cancel: Option<CancelToken>, reply: Reply) -> Self {
         let priority = request_priority(&op, &user);
         Self {
             op,
@@ -654,7 +664,7 @@ impl ActorMessage {
         user.block_token = Some(cell.block_token());
         Self {
             user,
-            cancel: cell.token().clone(),
+            cancel: Some(cell.token().clone()),
             reply: Reply::Cell,
             seq,
             priority: request.priority,
@@ -677,23 +687,27 @@ impl ActorMessage {
             (_, Reply::Lend(reply)) => {
                 let _ = reply.send(Err(e));
             }
-            (_, Reply::Cell) => {}
+            (_, Reply::Cell | Reply::Nobody) => {}
         }
     }
 
     /// The device-not-connected exit, which C sends to the request's
     /// `timeoutUser` (asynManager.c:877-888).
     fn time_out(self, port: String) {
-        if !matches!(self.op, RequestOp::Cell(_)) {
-            self.cancel.time_out_if_queued();
+        if !matches!(self.op, RequestOp::Cell(_))
+            && let Some(cancel) = &self.cancel
+        {
+            cancel.time_out_if_queued();
         }
         self.refuse(AsynError::QueueTimeout { port });
     }
 
-    /// C `timeoutUser != 0`: a waiter's reply channel always is one.
+    /// C `timeoutUser != 0` (asynManager.c:886): a waiter's reply channel
+    /// always is one, and a request nobody waits on has none.
     fn timeout_user(&self) -> bool {
         match &self.op {
             RequestOp::Cell(cell) => cell.timeout_user(),
+            _ if matches!(self.reply, Reply::Nobody) => false,
             RequestOp::WithDriverAfterQueue(_) => true,
             _ => true,
         }
@@ -703,9 +717,9 @@ impl ActorMessage {
     fn claim(&self) -> Claim {
         match &self.op {
             RequestOp::Cell(cell) => cell.claim(self.seq),
-            RequestOp::WithDriverAfterQueue(_) if self.cancel.begin_running() => Claim::Run,
+            RequestOp::WithDriverAfterQueue(_) if self.begin_running() => Claim::Run,
             RequestOp::WithDriverAfterQueue(_) => Claim::Left,
-            _ if self.cancel.begin_running() => Claim::Run,
+            _ if self.begin_running() => Claim::Run,
             _ => Claim::Left,
         }
     }
@@ -715,9 +729,19 @@ impl ActorMessage {
     fn is_gone(&self) -> bool {
         match &self.op {
             RequestOp::Cell(cell) => cell.is_gone(self.seq),
-            RequestOp::WithDriverAfterQueue(_) => self.cancel.is_timed_out(),
-            _ => self.cancel.is_timed_out(),
+            RequestOp::WithDriverAfterQueue(_) => self.is_timed_out(),
+            _ => self.is_timed_out(),
         }
+    }
+
+    /// `Queued -> Running` on the token; without one nothing could have
+    /// taken the request off the queue.
+    fn begin_running(&self) -> bool {
+        self.cancel.as_ref().is_none_or(CancelToken::begin_running)
+    }
+
+    fn is_timed_out(&self) -> bool {
+        self.cancel.as_ref().is_some_and(CancelToken::is_timed_out)
     }
 }
 
@@ -738,11 +762,13 @@ async fn sleep_until_opt(deadline: Option<Instant>) {
 /// dispatch scope, on every exit path (reply, early return, panic). This is the
 /// C `callbackActive -> idle` transition: once the port thread finishes the
 /// callback, a pending `cancelRequest` reports `wasQueued==0` (asynManager.c:1647-1661).
-struct FinishGuard(CancelToken);
+struct FinishGuard(Option<CancelToken>);
 
 impl Drop for FinishGuard {
     fn drop(&mut self) {
-        self.0.finish();
+        if let Some(cancel) = &self.0 {
+            cancel.finish();
+        }
     }
 }
 
@@ -2200,7 +2226,7 @@ impl PortActor {
             Claim::Run => {}
             Claim::Gone => return None,
             Claim::Left => {
-                let e = if msg.cancel.is_timed_out() {
+                let e = if msg.is_timed_out() {
                     AsynError::QueueTimeout {
                         port: self.driver.base().port_name.to_string(),
                     }
@@ -4038,7 +4064,7 @@ mod tests {
             ActorMessage {
                 op: RequestOp::Int32Read,
                 user: AsynUser::new(0),
-                cancel: CancelToken::new(),
+                cancel: Some(CancelToken::new()),
                 reply: Reply::Result(reply),
                 seq,
                 priority: QueuePriority::Medium,
@@ -4305,7 +4331,7 @@ mod tests {
             ActorMessage {
                 op: RequestOp::Int32Read,
                 user: AsynUser::new(0),
-                cancel: CancelToken::new(),
+                cancel: Some(CancelToken::new()),
                 reply: Reply::Result(reply),
                 seq,
                 priority,
@@ -5409,6 +5435,33 @@ mod tests {
                 .contains("port dev_gate or device 1 not connected"),
             "got {err}"
         );
+    }
+
+    /// Boundary 4 with no `timeoutUser`: C's `:886` diverts only a request
+    /// that has one, so a request nobody waits on runs on the down device.
+    #[test]
+    fn a_request_nobody_waits_on_runs_on_a_disconnected_device() {
+        let mut drv = multi_device_driver(true);
+        drv.base.init_auto_connect(false);
+        drv.base.init_connected(true);
+        drv.base.device_state(1).put_auto_connect(false);
+        drv.base.device_state(1).put_connected(false);
+        let tx = spawn_actor(drv);
+
+        let write = RequestOp::Int32Write { value: 9 };
+        tx.send(ActorMessage::unanswered(
+            write,
+            AsynUser::new(0).with_addr(1),
+        ))
+        .unwrap();
+        // Device 0's read queues behind the write.
+        send_and_wait(&tx, RequestOp::Int32Read, AsynUser::new(0).with_addr(0)).unwrap();
+        let (val_tx, val_rx) = std::sync::mpsc::channel();
+        let read = DriverCall::new(move |d| {
+            let _ = val_tx.send(d.base().params.get_int32(0, 1));
+        });
+        send_and_wait(&tx, RequestOp::WithDriver(read), AsynUser::new(0)).unwrap();
+        assert_eq!(val_rx.recv().unwrap().unwrap(), 9);
     }
 
     /// R15-47, boundary 5: the two **port**-level refusals are unchanged on a

@@ -56,9 +56,8 @@
 //!   runtime on target only.
 //! * **A blocking write needs a deadline, not a per-syscall timeout.**
 //!   `SO_SNDTIMEO` bounds each `write` syscall, so a peer that accepts one byte
-//!   per tick never trips it and holds the pump thread indefinitely — and a
-//!   target that does not implement the option at all (VxWorks 7) has no bound
-//!   whatever. [`write_frame_deadline`] therefore waits for writability against
+//!   per tick never trips it and holds the pump thread indefinitely.
+//!   [`write_frame_deadline`] therefore waits for writability against
 //!   its own deadline and sets no socket option.
 //!
 //! # Lifecycle: a pump you cannot spawn without holding the thing that ends it
@@ -730,7 +729,7 @@ impl tokio::io::AsyncWrite for ChannelWriter {
 /// is stated for that same reason — except that one is still *required*,
 /// because `FIONREAD` is defined in neither newlib module.
 ///
-/// Every other Unix — the hosted hosts and `*-wrs-vxworks*` — takes `libc`'s.
+/// Every other Unix — the hosted hosts — takes `libc`'s.
 #[cfg(target_os = "rtems")]
 const POLLOUT_EVENT: libc::c_short = 0x0004;
 #[cfg(target_os = "rtems")]
@@ -756,9 +755,6 @@ const SEND_DONTWAIT: libc::c_int = libc::MSG_DONTWAIT;
 ///
 /// C reaches the same place the same way: `setNonBlock(fd, 1)` at connect under
 /// `USE_POLL` (`drvAsynIPPort.c:536`), with a poll on reads as well as writes.
-/// Which is also the evidence that the call is available on the embedded
-/// targets — it is `ioctl(FIONBIO)`, the one socket control C already relies on
-/// there, not one of the options VxWorks answers `ENOPROTOOPT` to.
 ///
 /// Windows keeps blocking sockets and its `SO_SNDTIMEO`/`SO_RCVTIMEO`, which it
 /// does implement; the `not(unix)` arms of both waits are built on them.
@@ -1018,12 +1014,10 @@ fn write_some(sock: &TcpStream, buf: &[u8]) -> io::Result<usize> {
 ///
 /// It used to lean on the caller having set `SO_SNDTIMEO`, which was the only
 /// thing that returned control to this loop. That made the bound conditional on
-/// a socket option, and VxWorks 7 does not implement it — `setsockopt` returns
-/// `ENOPROTOOPT`, so on that target the deadline was silently absent and a peer
-/// that accepted the connection and then stopped reading parked the pump with
-/// nothing entitled to reclaim it. An invariant that one target can switch off
-/// is not an invariant; the wait is the caller's own now, and `SO_SNDTIMEO` is
-/// not set anywhere in this module.
+/// a socket option: where it was not armed, a peer that accepted the connection
+/// and then stopped reading parked the pump with nothing entitled to reclaim
+/// it. The wait is the caller's own now, and `SO_SNDTIMEO` is not set anywhere
+/// in this module.
 ///
 /// A partial write on expiry needs no repair: the caller ends the pump and the
 /// connection is torn down, so nothing is ever written to this socket again.
@@ -1305,13 +1299,9 @@ pub fn drive_socket_blocking(
     stream.set_read_timeout(Some(config.read_timeout))?;
     // No SO_SNDTIMEO, on purpose. It was set here once, and it was the send
     // deadline's only way of regaining control — which made the deadline
-    // conditional on an option VxWorks 7 does not implement (`ENOPROTOOPT`,
-    // errno 42, measured on target). Setting it fatally aborted every CA client
-    // circuit the instant its dial succeeded; setting it best-effort left the
-    // writer pump able to park with nothing to reclaim it. Neither is a bound.
-    // `write_frame_deadline` now waits for writability against its own
-    // deadline, so the guarantee is the same on a target that implements every
-    // socket option and on one that implements none.
+    // conditional on a socket option. `write_frame_deadline` now waits for
+    // writability against its own deadline, so the guarantee does not depend
+    // on which socket options the target implements.
 
     // Borrow the circuit's two pump workers as one set, or refuse. Roster order
     // is [reader, writer], the order `acquire` returns them.
@@ -1604,11 +1594,9 @@ mod tests {
 
     /// The same bound, on a socket carrying **no `SO_SNDTIMEO` at all**.
     ///
-    /// This is the VxWorks 7 boundary: `setsockopt(SO_SNDTIMEO)` is
-    /// unimplemented there and returns `ENOPROTOOPT`, so no caller can arm the
-    /// option however hard it tries. The two cases above cover "the option
-    /// took"; this one covers "it did not", which is the only case where the
-    /// deadline had nothing to regain control on.
+    /// The two cases above cover "the option took"; this one covers "it did
+    /// not", which is the only case where the deadline had nothing to regain
+    /// control on.
     ///
     /// The write runs on its own thread and the assertion is on a bounded
     /// `recv`, because the failure being excluded is a park with no end: a

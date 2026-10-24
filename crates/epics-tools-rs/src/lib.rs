@@ -49,8 +49,8 @@
 //!   `execvp(3)` and POSIX signals, and declares it in its build
 //!   system as `PROD_HOST`. The module is gated on
 //!   `procserv_host_platform`, an allowlist emitted by `build.rs`,
-//!   not on `cfg(unix)` — RTEMS and VxWorks are unix-family with no
-//!   second process to supervise, and a unix target that is not on
+//!   not on `cfg(unix)` — RTEMS is unix-family with no second
+//!   process to supervise, and a unix target that is not on
 //!   the list is refused at build time rather than compiled away.
 //!   Cross-platform support (ConPTY on Windows) is future work; there
 //!   the module compiles away so workspace builds succeed and the
@@ -95,8 +95,8 @@
 //!
 //! A row reading *no settled pin* means no revision has been agreed for that
 //! tree: say which revision you read, and do not take its `HEAD` for the pin.
-//! Citations into non-EPICS sources (libc, RTEMS, `rtems-libbsd`, VxWorks,
-//! vendored third-party) are outside this table and carry no pin.
+//! Citations into non-EPICS sources (libc, RTEMS, `rtems-libbsd`, vendored
+//! third-party) are outside this table and carry no pin.
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
 

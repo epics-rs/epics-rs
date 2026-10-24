@@ -10,8 +10,8 @@
 //! cases down with it.
 //!
 //! The predicate here is `not(epics_embedded_target)` instead, which is what
-//! [`ArgValue`] itself is gated on: the iocsh registry is host-and-VxWorks-
-//! and-RTEMS-absent, not reactor-dependent, so a host `exec_backend` build
+//! [`ArgValue`] itself is gated on: the iocsh registry is absent on RTEMS,
+//! not reactor-dependent, so a host `exec_backend` build
 //! keeps both it and this.
 //!
 //! `crate::ioc` is named in a code span rather than linked for the same

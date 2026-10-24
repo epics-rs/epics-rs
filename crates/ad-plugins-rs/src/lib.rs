@@ -41,8 +41,8 @@
 //!
 //! A row reading *no settled pin* means no revision has been agreed for that
 //! tree: say which revision you read, and do not take its `HEAD` for the pin.
-//! Citations into non-EPICS sources (libc, RTEMS, `rtems-libbsd`, VxWorks,
-//! vendored third-party) are outside this table and carry no pin.
+//! Citations into non-EPICS sources (libc, RTEMS, `rtems-libbsd`, vendored
+//! third-party) are outside this table and carry no pin.
 
 #![allow(
     clippy::approx_constant,
@@ -96,7 +96,7 @@ pub mod pva;
 
 // The moved code's own requirement, and nothing else: `ArgValue` comes from
 // `epics-base-rs`, an unconditional dependency, and its own gate is the target
-// — the iocsh registry is absent on RTEMS and VxWorks, not reactor-dependent.
+// — the iocsh registry is absent on RTEMS, not reactor-dependent.
 // So neither `ioc` nor `tokio_backend` belongs here. Carrying `ioc` over from
 // the module this came from left the three boundary cases unselected in the
 // default configuration, which was the same mistake one layer smaller.

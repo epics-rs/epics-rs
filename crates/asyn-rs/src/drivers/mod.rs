@@ -15,17 +15,13 @@ pub mod vxi11;
 // per-platform gating — the build selects one, like C's `OS_CLASS` Makefile
 // switch.
 //
-// Both embedded targets take the POSIX backend, and neither needs a gate here:
-// what a target can differ about is the termios ABI and the individual
-// facilities, and `serial_port::platform` owns both. C asyn agrees on the
-// shape — `drvAsynSerialPort.c` carries no `__rtems__` branch at all, so RTEMS
-// takes the plain POSIX path there too.
+// RTEMS takes the POSIX backend and needs no gate here: what a target can
+// differ about is the termios ABI, and `serial_port::platform` owns it. C asyn
+// agrees on the shape — `drvAsynSerialPort.c` carries no `__rtems__` branch at
+// all, so RTEMS takes the plain POSIX path there too.
 //
-// VxWorks does *not* take the transport C uses: C predates VxWorks 7's POSIX
-// termios and drives the line through `ioctl(SIO_HW_OPTS_SET)`
-// (`drvAsynSerialPort.c:114`) on a fake one-field struct (`:55-62`). RTEMS's
-// `libc` binding is wrong rather than merely incomplete, so the ABI is declared
-// in asyn-rs. The evidence for both decisions is on `serial_port::platform`.
+// RTEMS's `libc` binding is wrong rather than merely incomplete, so the ABI is
+// declared in asyn-rs. The evidence is on `serial_port::platform`.
 #[cfg(unix)]
 pub mod serial_port;
 

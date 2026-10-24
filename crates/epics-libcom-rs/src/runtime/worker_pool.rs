@@ -39,14 +39,13 @@
 //!
 //! # The bound is memory, not just a count
 //!
-//! A count bound cannot know when the target is out of thread memory: on
-//! `x86_64-wrs-vxworks` the CA pool's count bound (141, derived from the
-//! descriptor budget) was never reached, because the process hit a reserved
-//! address-space ceiling at 46 concurrent clients first — and what happened
-//! there was not a refusal. `pthread_create` began to fail, then a `std` mutex
-//! lock returned `EINVAL` and killed a worker, then an allocation of 64 bytes
-//! failed and took the whole RTP down with signal 6. A bound that is reached
-//! *after* the target has run out is not an admission gate.
+//! A count bound cannot know when the target is out of thread memory: each
+//! pool's is derived from another resource (descriptors for the CA server, an
+//! operator's `max_connections` for the PVA server), and past the memory wall
+//! what happens is not a refusal — `pthread_create` fails partway through a
+//! set, and the allocations that would have carried a refusal fail with it. A
+//! bound that is reached *after* the target has run out is not an admission
+//! gate.
 //!
 //! So every set's memory is reserved from one **process-wide** budget before a
 //! thread is created (`Reservation::try_reserve`, [`POOL_RESERVATION_ENV`]),
@@ -75,8 +74,8 @@
 //! # A worker that dies retires its set
 //!
 //! That accounting is exact only while every dispatched job comes back, and a
-//! worker *thread* can die where the job's `catch_unwind` does not reach — on
-//! target it did, at the memory wall, in a `std` mutex that returned `EINVAL`.
+//! worker *thread* can die where the job's `catch_unwind` does not reach — a
+//! `std` mutex lock that fails panics outside it.
 //! So the set's slot is released by the thread's destructor (`WorkerExit`),
 //! not by a code path that a panic can skip: any exit that was not asked for
 //! marks the set dead, stops its siblings, and gives the slot back to `created`
@@ -226,10 +225,6 @@ struct PoolInner {
     /// for every production pool, so a release cannot land anywhere but where
     /// its reservation came from.
     reservation: &'static Reservation,
-    /// The object-arena gate — [`materialise_set_mutex`] in every production
-    /// pool. A field so a test can make the target refuse, which is the one
-    /// thing a host cannot be made to do.
-    materialise: fn(&Mutex<SetState>) -> bool,
     reg: Mutex<Registry>,
 }
 
@@ -450,13 +445,11 @@ fn announce_worker_death(prefix: &str, index: usize, roles: usize) {
 ///
 /// `catch_unwind` around the job body does not make the *thread* unwind-proof:
 /// dropping the panic payload after the joiner is gone, and the two mutex takes
-/// in the return path, all sit outside it. On VxWorks 7 the second of those is
-/// not hypothetical — a `std` mutex lock at the memory wall returns `EINVAL`
-/// and `std` panics, killing the worker between `catch_unwind` and
-/// `finish_job`. The set then had `running == 1` forever with no thread to
-/// settle it: never idle, never re-leased, its slot held against the pool's
-/// bound for the life of the process (`BUSY=2 SETS=50 WORKERS=100 CONNS=0`
-/// measured on target).
+/// in the return path, all sit outside it. A `std` mutex lock that fails
+/// panics, killing the worker between `catch_unwind` and `finish_job`. The set
+/// then had `running == 1` forever with no thread to settle it: never idle,
+/// never re-leased, its slot held against the pool's bound for the life of the
+/// process.
 ///
 /// So the accounting hangs off the thread's *destructor*, not off a code path:
 /// however the thread ends — `Stop`, a closed channel, or an unwind anywhere
@@ -594,26 +587,21 @@ pub const POOL_RESERVATION_ENV: &str = "EPICS_RS_POOL_RESERVATION_MB";
 
 /// Whose thread-memory measurements apply.
 ///
-/// Named targets and not an `embedded: bool`, because the bool was the defect:
-/// it said "not a host" where the numbers below mean "this target", so a figure
-/// measured on VxWorks was charged on RTEMS by default. Every arm below is an
-/// exhaustive `match`, so a fourth target cannot compile until someone decides
-/// what it costs — the decision is forced at the type rather than inherited from
-/// whichever target was measured first.
+/// Named targets and not an `embedded: bool`: the budget below means "this
+/// target", not "not a host", and the `match` on it is exhaustive, so a new
+/// embedded target cannot compile until someone decides what it gets rather
+/// than inheriting RTEMS's figure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ThreadMemoryTarget {
     /// Anything that is not an embedded target of this port.
     Host,
-    VxWorks,
     Rtems,
 }
 
 impl ThreadMemoryTarget {
     /// The target this build runs on.
     const fn current() -> Self {
-        if cfg!(target_os = "vxworks") {
-            ThreadMemoryTarget::VxWorks
-        } else if cfg!(target_os = "rtems") {
+        if cfg!(target_os = "rtems") {
             ThreadMemoryTarget::Rtems
         } else {
             ThreadMemoryTarget::Host
@@ -621,110 +609,22 @@ impl ThreadMemoryTarget {
     }
 }
 
-/// Address space one pool thread reserves **beyond its declared stack**.
-///
-/// Measured on `x86_64-wrs-vxworks`: three arms of one image differing only in
-/// the connection roster's [`StackSizeClass`] walled at 47 / 59 / 80 concurrent
-/// clients as the declared per-connection stack fell 3,145,728 → 2,097,152 →
-/// 1,048,576 B. Charging each thread its declared stack *plus a flat 1 MiB*
-/// puts all three walls at 246.4 / 247.5 / 251.7 MB — a 2.1 % spread — while
-/// charging the declared stack alone predicts a wall that never happened (the
-/// three-arm measurement is E8's, `caucus/58EWEJWV91/e8-poolprobe-0548dc61-1`
-/// §10).
-///
-/// It is **not** what the OS charges for a thread. A C RTP laddering bare
-/// pthreads on the same guest walls at exactly `n × declared stack` — 127 × 2
-/// MiB, 254 × 1 MiB, 509 × 512 KiB, each matching an `mmap` ceiling to the byte
-/// (§10.2). So the flat MiB is what a *Rust* thread reserves beyond its stack,
-/// consistent with a per-thread allocator arena and with E10's abort landing on
-/// a 64-byte allocation inside a freshly spawned thread. Charge it per thread
-/// for that reason; do not delete it on the theory that a thread costs only its
-/// stack, and do not read it as an address-space constant of the target.
-///
-/// RTEMS charges nothing beyond the declared stack, **measured** and not
-/// assumed: a 30-client ramp on the 256 MB `xilinx-zynq-a9` moved `MEM_FREE`
-/// 233,299,144 → 198,277,640, i.e. 1,167,383 B per client against 1,572,864 B of
-/// declared stack for the pair. The target spends *less* than the stacks it was
-/// asked for; there is no flat term to find, and adding VxWorks' one charged
-/// 3,670,016 B per client — 3.1× — which is why the 160 MiB budget refused at
-/// 30 clients on a target whose count cap is 141. "Conservative" was the wrong
-/// reading of that: over-charging by 3× is not one connection of margin, it is
-/// three quarters of the target's capacity.
-///
-/// A host is not charged, because a host's budget is unbounded anyway.
-const fn per_thread_overhead(target: ThreadMemoryTarget) -> usize {
-    match target {
-        ThreadMemoryTarget::VxWorks => 1 << 20,
-        ThreadMemoryTarget::Rtems | ThreadMemoryTarget::Host => 0,
-    }
-}
-
-/// RTP object-arena bytes one pool thread consumes — measured, and deliberately
-/// **not charged**, because a per-thread byte charge is the wrong shape for what
-/// was measured.
-///
-/// Every VxWorks pthread mutex materialises a kernel `SEMAPHORE` object on its
-/// *first lock*: `pthread_mutex_init` only stamps the magic, and
-/// `pthreadMutexInit` calls `semMCreate` from `pthread_mutex_lock`, returning
-/// `0x16` (`EINVAL`, not `ENOMEM`) when it comes back NULL — which `std`
-/// reports as "failed to lock mutex: invalid argument (os error 22)" and
-/// panics. That is the death this pool saw at the wall, and eager
-/// initialisation cannot avoid it. The objects come from the RTP object arena,
-/// which is **not** the address space charged above and not the allocator heap
-/// either, which is why the same wall shows as an `EINVAL` in one probe and as
-/// a failed 64-byte allocation in another.
-///
-/// E8's on-target `semMCreate` wrap then measured the exhaustion itself, on a
-/// cold 1024M guest: `semMCreate` returned NULL after 588 successful creations,
-/// at 49 sets / 98 workers / 48 connections — and creation **resumed past 1024**
-/// afterwards. So the arena has no fixed per-thread cost to charge: it is a
-/// transient rate limit, not a total, and a byte charge per thread cannot model
-/// a rate. It stays `0` for that reason rather than for want of a number.
-///
-/// What that exhaustion does to this pool is already closed on the other side:
-/// the `EINVAL` kills the worker, and the set it was holding is retired by
-/// [`WorkerExit`] instead of leaking (E8 saw the leak it fixes as
-/// `POOLPROBE BUSY=1 SETS=49 CONNS=0`).
-const PER_THREAD_OBJECT_ARENA: usize = 0;
-
 /// The budget when [`POOL_RESERVATION_ENV`] is unset.
 ///
 /// Unbounded on a host: the pool's own set counts are the bound there, and no
 /// host in this workspace has ever met a thread-memory wall.
 ///
-/// 160 MiB on an embedded target, chosen from where the measured target stopped
-/// *working*, not from where it stopped admitting. On the ~958 MB VxWorks guest
-/// the CA pool dies at **set 46** (~230 MiB reserved, at 5 MiB a set): a
-/// 64-byte allocation fails, the RTP takes signal 6 and is deleted, and no
-/// refusal is delivered at all. That figure is measured on this exact code, not
-/// inherited: with the budget raised to 320 MiB the same image on the same
-/// guest walks to set 46 and dies there, and with the default it refuses at set
-/// 32 and keeps serving. 160 MiB is 14 sets of headroom below that — what the
-/// margin buys is that the allocator and the object arena still work while the
-/// refusal is being written to the socket and the console.
-///
-/// The ceiling itself moves with the target's RAM, 1:1: an RTP is handed
-/// whatever is left after a fixed ~705 MB, measured as 254 MiB of usable address
-/// space on a ~958 MB guest and 764 MiB on a ~1470 MB one. So this constant is
-/// right for one box and mean to a bigger one — but it stays a constant, because
-/// nothing an RTP can call reports that ceiling. `sysctl`'s `HW_PHYSMEM` and
-/// `KERN_PHYSMEMTOP` answer `ENOENT`, `memFindMax`/`memInfoGet` describe a
-/// 256 KiB heap partition that sits flat while the process reserves a quarter of
-/// a gigabyte, `getrlimit` is in no RTP library, and `_SC_PHYS_PAGES` is not a
-/// constant the RTP `unistd.h` defines. An `mmap` ladder does find the ceiling
-/// exactly, but only by taking it, which in this process means another thread's
-/// allocation aborts. Hence the operator switch, and the arithmetic an
-/// operator needs for it: usable address space ≈ OS memory − 705 MB, and a CA
-/// set costs 5 MiB.
-///
-/// RTEMS takes the same 160 MiB, and there it is not a constant standing in for
-/// a measurement it cannot make: `malloc_free_space` answers on that target, so
-/// the boot check confirms or clamps this figure against the heap the guest
-/// actually has (see [`target_admits`]). It stays 160 MiB because that is what a
-/// 256 MB guest can confirm and a larger one should be allowed to exceed.
+/// 160 MiB on RTEMS, below the 233,299,144 B the 256 MB `xilinx-zynq-a9`
+/// guest has free at boot (`MEM_FREE`, measured), so the allocator still works
+/// while a refusal is being written to the socket and the console. It is not a
+/// constant standing in for a measurement the target cannot make:
+/// `malloc_free_space` answers there, so the boot check confirms or clamps this
+/// figure against the heap the guest actually has (see [`target_admits`]). It
+/// stays 160 MiB because that is what a 256 MB guest can confirm and a larger
+/// one should be allowed to exceed.
 const fn default_reservation_budget(target: ThreadMemoryTarget) -> usize {
     match target {
-        ThreadMemoryTarget::VxWorks | ThreadMemoryTarget::Rtems => 160 << 20,
+        ThreadMemoryTarget::Rtems => 160 << 20,
         ThreadMemoryTarget::Host => usize::MAX,
     }
 }
@@ -764,19 +664,16 @@ const RESERVATION_PROBE_FLOOR: usize = 8 << 20;
 
 /// One target's answer about a size, carrying the quantity that produced it.
 ///
-/// The basis travels *with* the answer because the boot notice has to name it:
-/// "would not reserve that much address space in one mapping" is true on
-/// VxWorks and false on RTEMS, where the same refusal comes from the malloc
-/// heap's free total. Two `cfg` cascades — one choosing the probe, one choosing
-/// the words — can drift apart and did, on target: the RTEMS guest was told
-/// about a mapping it had not made. One cascade returning both cannot drift.
+/// The basis travels *with* the answer because the boot notice has to name it.
+/// Two `cfg` cascades — one choosing the probe, one choosing the words — can
+/// drift apart; one cascade returning both cannot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct TargetAnswer {
     /// Whether the target would give the size it was asked about.
     granted: bool,
-    /// Reads after "this target", e.g. "would not reserve that much address
-    /// space in one mapping" — present on `granted` too, so a refusal at the
-    /// next step down still has words to use.
+    /// Reads after "this target", e.g. "has less than that free in the heap
+    /// its thread stacks come from" — present on `granted` too, so a refusal at
+    /// the next step down still has words to use.
     basis: &'static str,
 }
 
@@ -787,67 +684,20 @@ struct TargetAnswer {
 /// whatever quantity actually tracks the wall on each target — the resource
 /// differs, the veto does not.
 ///
-/// On VxWorks the basis is one anonymous `PROT_NONE` mapping, taken and released
-/// immediately. It is the only quantity in the RTP that tracks the wall this
-/// budget exists to stay under: an `mmap` ladder run at three stack classes and
-/// two guest sizes reports a ceiling equal to the `pthread_create` wall **to the
-/// byte**, while `memFindMax`, `memInfoGet`, `sysctl` `HW_PHYSMEM`,
-/// `sysconf(_SC_PHYS_PAGES)`, `getrlimit` and `rtpInfoGet` are each blind to
-/// it. One mapping under-reads that ceiling — 192 MiB confirms on a guest
-/// whose chunked ceiling is 254 MiB — so it is a *lower* bound, which is the
-/// safe direction for a veto: it can refuse a budget the target would in fact
-/// have honoured, never admit one it would not.
-///
 /// On RTEMS the basis is a *query*, not a taking: `malloc_free_space` reports
 /// the free total of the same heap RTEMS pthread stacks are allocated from, and
 /// it tracks — across a ramp that took the free total from 232.3 MB to 9.3 MB
-/// its gap to `MEM_BLK` widened only from 36,216 to 73,872 B, the opposite of
-/// VxWorks' `memFindMax` sitting flat while the process reserved a quarter of a
-/// gigabyte. Declared here rather than reached through `epics-rtems-boot`,
-/// because this crate's dependency on that package is `cfg(target_os =
-/// "vxworks")` by design — it must stay takeable by a consumer bringing its own
-/// boot glue — while the symbol itself is in `librtemscpu`, which every RTEMS
-/// image links.
+/// its gap to `MEM_BLK` widened only from 36,216 to 73,872 B. Declared here
+/// rather than reached through `epics-rtems-boot`, because this crate does not
+/// depend on that package — it must stay takeable by a consumer bringing its
+/// own boot glue — while the symbol itself is in `librtemscpu`, which every
+/// RTEMS image links.
 ///
-/// RTEMS needs this *more* than VxWorks, not less: `csrc/rtems_init.c:331` hands
+/// RTEMS needs this check: `csrc/rtems_init.c:331` hands
 /// `main` a fixed argv and `POSIX_Init` never calls `setenv`, so
 /// [`POOL_RESERVATION_ENV`] cannot be set on that target at all and the built-in
 /// default is the only budget it will ever run. A default nobody can override is
 /// a default that has to be checked.
-#[cfg(target_os = "vxworks")]
-fn target_admits(bytes: usize) -> Option<TargetAnswer> {
-    /// `sys/mman.h:66` — VxWorks requires this exact `fd` with `MAP_ANON`.
-    const MAP_ANON_FD: libc::c_int = -1;
-    const BASIS: &str = "would not reserve that much address space in one mapping";
-
-    // SAFETY: an anonymous `PROT_NONE` mapping of `bytes` at an address of the
-    // kernel's choosing. Nothing is read or written through the pointer: it is
-    // compared against `MAP_FAILED` and then unmapped exactly once, with the
-    // same length it was created with.
-    let addr = unsafe {
-        libc::mmap(
-            std::ptr::null_mut(),
-            bytes,
-            libc::PROT_NONE,
-            libc::MAP_PRIVATE | libc::MAP_ANON,
-            MAP_ANON_FD,
-            0,
-        )
-    };
-    if addr == libc::MAP_FAILED {
-        return Some(TargetAnswer {
-            granted: false,
-            basis: BASIS,
-        });
-    }
-    // SAFETY: `addr` came from the mapping above and is released once.
-    unsafe { libc::munmap(addr, bytes) };
-    Some(TargetAnswer {
-        granted: true,
-        basis: BASIS,
-    })
-}
-
 #[cfg(target_os = "rtems")]
 fn target_admits(bytes: usize) -> Option<TargetAnswer> {
     // RTEMS `rtems/malloc.h`, defined in `librtemscpu`: bytes free in the
@@ -862,7 +712,7 @@ fn target_admits(bytes: usize) -> Option<TargetAnswer> {
     })
 }
 
-#[cfg(not(any(target_os = "vxworks", target_os = "rtems")))]
+#[cfg(not(target_os = "rtems"))]
 fn target_admits(_bytes: usize) -> Option<TargetAnswer> {
     None
 }
@@ -969,11 +819,11 @@ impl BudgetVerdict {
 /// # The defect this closes
 ///
 /// [`POOL_RESERVATION_ENV`] is the operator's only escape hatch, and it took the
-/// operator at their word. Raised past what the address space can honour it does
+/// operator at their word. Raised past what the target can honour it does
 /// not raise the ceiling — it removes the refusal that was keeping the process
-/// under it: on the ~958 MB guest, `320` walks the CA pool to set 46 and the RTP
-/// takes signal 6 with no refusal delivered to anyone. A switch that can kill
-/// the IOC silently is worse than no switch.
+/// under it, and the pool walks the target past its wall with no refusal
+/// delivered to anyone. A switch that can kill the IOC silently is worse than
+/// no switch.
 ///
 /// # The rule
 ///
@@ -983,7 +833,7 @@ impl BudgetVerdict {
 /// step down. Halving is coarse on purpose — this is a veto, not a search, and
 /// an operator who wants a size between two halvings names it and has that
 /// confirmed. The descent terminates at [`RESERVATION_PROBE_FLOOR`], so its cost
-/// is `log2(requested / floor)` mappings, and only the first of them is paid
+/// is `log2(requested / floor)` probes, and only the first of them is paid
 /// when the configured value is honest.
 fn decide_reservation_budget(
     requested: usize,
@@ -991,7 +841,7 @@ fn decide_reservation_budget(
     mut admits: impl FnMut(usize) -> Option<TargetAnswer>,
 ) -> BudgetVerdict {
     if requested == usize::MAX {
-        // No wall to stay under, and no mapping of this size to ask about.
+        // No wall to stay under, and no size to ask the target about.
         return BudgetVerdict::Confirmed(requested);
     }
     let mut candidate = requested;
@@ -1103,7 +953,7 @@ impl Reservation {
 /// back.
 ///
 /// Process-wide and not per-pool because the resource is: a target that runs
-/// out of address space does not care which pool reserved it, and an IOC runs
+/// out of thread memory does not care which pool reserved it, and an IOC runs
 /// several (the CA server's, the CA client's, the PVA server's). A per-pool
 /// budget would let three pools each stay inside their own bound and still walk
 /// the process past the ceiling together.
@@ -1124,82 +974,19 @@ static PROCESS_RESERVATION: LazyLock<Reservation> = LazyLock::new(|| {
 
 /// What one thread of `stack` reserves — the whole per-thread formula, in one
 /// place, so a pool worker and a fixed IOC thread cost the account the same.
+///
+/// The declared stack and nothing beyond it, **measured** and not assumed: a
+/// 30-client ramp on the 256 MB `xilinx-zynq-a9` moved `MEM_FREE`
+/// 233,299,144 → 198,277,640, i.e. 1,167,383 B per client against 1,572,864 B
+/// of declared stack for the pair. RTEMS spends *less* than the stacks it was
+/// asked for; there is no flat term to add.
 fn thread_reservation_bytes(stack: impl Into<StackSpec>) -> usize {
     stack.into().bytes()
-        + per_thread_overhead(ThreadMemoryTarget::current())
-        + PER_THREAD_OBJECT_ARENA
 }
 
 /// What one thread of `role` reserves.
 fn thread_reservation(role: &WorkerRole) -> usize {
     thread_reservation_bytes(role.stack)
-}
-
-/// The target refused to materialise a kernel object a mutex needs.
-///
-/// # The defect this closes
-///
-/// A VxWorks pthread mutex has no kernel `SEMAPHORE` until its **first lock**:
-/// `pthread_mutex_init` only stamps the magic, and `pthreadMutexInit` calls
-/// `semMCreate` from inside `pthread_mutex_lock`. When that returns NULL the
-/// chain hands back `0x16` — `EINVAL`, not `ENOMEM` — and `std::sync::Mutex`
-/// turns it into "failed to lock mutex: invalid argument (os error 22)" and
-/// **panics**. Measured on target at 588 live semaphores with 49 sets / 98
-/// workers / 48 connections; the panicking worker took its set with it.
-///
-/// It is not a total. Creation resumed past 1,024 objects after that NULL, so
-/// the arena is a *transient* refusal and a byte or count budget is the wrong
-/// shape for it — there is no per-thread figure to add to
-/// `PER_THREAD_OBJECT_ARENA`, and a cap set at 588 would refuse connections a
-/// moment later than the target would have served them. What a transient
-/// refusal needs is for the *rate* of creation to bend to the target, which is
-/// what this gate does: the pool asks for the object at a point where "no"
-/// costs one refusal, and the client's retry is the pacing.
-///
-/// # Why this is not its own [`AcquireError`] variant
-///
-/// It rides as the payload of [`AcquireError::SpawnFailed`], whose meaning it
-/// shares exactly — *the target said no*, and the pool's own bounds were never
-/// reached. A consumer that needs to tell an arena refusal from a stack refusal
-/// downcasts, so the discriminator is a type rather than the message prose that
-/// [`AcquireError`] exists to stop consumers parsing.
-#[derive(Debug, Clone, Copy)]
-pub struct ObjectArenaExhausted {
-    /// How many objects the set needed — one per worker.
-    pub objects: usize,
-}
-
-impl std::fmt::Display for ObjectArenaExhausted {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "the target could not create the kernel mutex objects for a set of \
-             {} workers; this is transient, and a client that retries will be \
-             admitted once the target has objects again",
-            self.objects
-        )
-    }
-}
-
-impl std::error::Error for ObjectArenaExhausted {}
-
-/// The gate itself: materialise the set's own state mutex, on the thread that
-/// can still refuse.
-///
-/// Not a throwaway probe — this is the very mutex every worker in the set locks
-/// on entry and again in [`WorkerExit`], so taking its object here *removes* the
-/// failure site rather than sampling near it. `try_lock` and not `lock`: the
-/// mutex is one statement old and unreachable by any other thread, so `false`
-/// cannot mean contention, and `try_lock` reports the target's refusal as a
-/// value where `lock` would panic.
-///
-/// What it does not cover: the objects `std` materialises inside the *spawned*
-/// thread — the parker behind a blocking `recv`, above all — which no code on
-/// this side of `Builder::spawn` can take in advance. The gate narrows the
-/// window and paces the burst that opens it; it does not close it, and the
-/// set-retirement path in [`WorkerExit`] is what keeps the residue survivable.
-fn materialise_set_mutex(state: &Mutex<SetState>) -> bool {
-    state.try_lock().is_ok()
 }
 
 /// One thread's charge against the process account, held for exactly as long as
@@ -1215,9 +1002,9 @@ fn materialise_set_mutex(state: &Mutex<SetState>) -> bool {
 ///
 /// The budget was an account of *pool* threads only, while an IOC also runs
 /// fixed ones — the scan bands, the delayed-callback timer, the CA acceptor,
-/// the audit writer, the status pusher, the dial pool's workers. Measured at
-/// roughly 15 MiB on the VxWorks target: inside the headroom, and therefore
-/// invisible, which is not the same as accounted for. Two things go wrong while
+/// the audit writer, the status pusher, the dial pool's workers. Inside the
+/// headroom they are invisible, which is not the same as accounted for. Two
+/// things go wrong while
 /// it stays invisible. The pool believes it may take the whole budget when it
 /// may not, so the refusal lands later than the number says; and the moment a
 /// target has more fixed threads than this one — a second server, more scan
@@ -1271,11 +1058,9 @@ impl Drop for ThreadCharge {
 /// the one discriminator a consumer had was the message *prose*, and every
 /// consumer that branched on `kind()` silently answered the wrong question.
 /// Both server drivers did: the CA server reported both as one status on the
-/// wire — measured on VxWorks 7, where both gates were reached on one image
-/// with `available=48` on each — and the PVA server's `kind() == WouldBlock`
-/// arm reports an out-of-threads target as `max_connections reached`, naming a
-/// bound that never fired. That second one is by construction, not measured:
-/// the blocking PVA server has not been driven to its wall on this target.
+/// wire, and the PVA server's `kind() == WouldBlock` arm reports an
+/// out-of-threads target as `max_connections reached`, naming a bound that
+/// never fired.
 ///
 /// Naming the gate in the type is what makes that class of mistake unwritable:
 /// a consumer that wants "is this the connection limit" must now say so, and
@@ -1399,24 +1184,6 @@ impl<const N: usize> WorkerPool<N> {
         capacity: usize,
         reservation: &'static Reservation,
     ) -> Self {
-        Self::with_reservation_and_gate(
-            name_prefix,
-            roster,
-            capacity,
-            reservation,
-            materialise_set_mutex,
-        )
-    }
-
-    /// [`Self::with_reservation`] with the object-arena gate injected, so a host
-    /// test can exercise the refusal a target produces.
-    fn with_reservation_and_gate(
-        name_prefix: &'static str,
-        roster: [WorkerRole; N],
-        capacity: usize,
-        reservation: &'static Reservation,
-        materialise: fn(&Mutex<SetState>) -> bool,
-    ) -> Self {
         let set_reservation = roster.iter().map(thread_reservation).sum();
         Self {
             inner: Arc::new(PoolInner {
@@ -1425,7 +1192,6 @@ impl<const N: usize> WorkerPool<N> {
                 capacity,
                 set_reservation,
                 reservation,
-                materialise,
                 reg: Mutex::new(Registry {
                     idle: VecDeque::new(),
                     all: Vec::new(),
@@ -1567,17 +1333,6 @@ impl<const N: usize> WorkerPool<N> {
             }),
             joins: Mutex::new(Vec::with_capacity(N)),
         });
-
-        // The object-arena gate. Nothing has been created yet, so refusing here
-        // costs the caller a refusal and the target nothing.
-        if !(self.inner.materialise)(&set.state) {
-            let unspawned: usize = self.inner.roster.iter().map(thread_reservation).sum();
-            self.inner.reservation.release(unspawned);
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                ObjectArenaExhausted { objects: N },
-            ));
-        }
 
         let mut joins: Vec<JoinHandle<()>> = Vec::with_capacity(N);
         for (slot, rx) in receivers.into_iter().enumerate() {
@@ -1965,16 +1720,12 @@ mod tests {
     /// NOT: a worker's death leave its set counted busy for the life of the
     /// process.
     ///
-    /// Measured on `x86_64-wrs-vxworks` at the reservation wall: three worker
-    /// threads died across two sets and the pool reported `BUSY=2 SETS=50
-    /// WORKERS=100 CONNS=0` — two sets leased forever with no client attached,
-    /// so the connection bound was permanently 139 instead of 141 and every
-    /// further death cost another set
-    /// (on `caucus/58EWEJWV91/e8-poolprobe-0548dc61-1`).
+    /// Without it every such death leases a set forever with no client
+    /// attached, and the connection bound shrinks by one set each time.
     ///
-    /// The target's mechanism was a `std` mutex lock returning `EINVAL` inside
-    /// the loop's return path, which is not reproducible on demand. This
-    /// reproduces the *same* thread death at the *same* point deterministically:
+    /// A `std` mutex lock failing inside the loop's return path is not
+    /// reproducible on demand. This reproduces the *same* thread death at the
+    /// *same* point deterministically:
     /// the job's panic is caught, and then the payload is dropped on the worker
     /// thread — `let _ = done.send(outcome)` drops it there when the joiner is
     /// already gone — so the worker unwinds before it reaches `finish_job`.
@@ -2094,8 +1845,7 @@ mod tests {
         drop(pool);
     }
 
-    /// One set of [`roster2`] on a 64-bit host: two `Small` stacks and no
-    /// per-thread overhead charged off-target.
+    /// One set of [`roster2`] on a 64-bit host: two `Small` stacks.
     const HOST_SET: usize = 2 * 512 * 1024;
 
     /// # Invariant
@@ -2104,11 +1854,9 @@ mod tests {
     /// unspent. MUST NOT: a pool create a thread whose memory is not already
     /// reserved from the budget.
     ///
-    /// The defect: the pool's only bound was a *count*, so on
-    /// `x86_64-wrs-vxworks` the CA server walked to 41 concurrent clients and
-    /// the RTP died — a 64-byte allocation failed, `signal 6`, whole process
-    /// gone — with its count bound of 141 nowhere in sight. A bound reached
-    /// after the target has run out is not an admission gate.
+    /// The defect: the pool's only bound was a *count*, which knows nothing of
+    /// thread memory. A bound reached after the target has run out is not an
+    /// admission gate.
     ///
     /// The boundary is exact rather than narrative: a budget of two sets admits
     /// two and refuses the third, and the refusal costs no thread.
@@ -2260,52 +2008,31 @@ mod tests {
     /// charged to. MUST NOT: one target's measurement be charged to another by
     /// default.
     ///
-    /// The defect: both policy inputs took an `embedded: bool`, which says "not
-    /// a host" where the numbers mean "this target". VxWorks' flat 1 MiB per
-    /// thread was therefore charged on RTEMS, where a 30-client ramp spends
-    /// 1,167,383 B per client against 3,670,016 B charged — 3.1× — so the
-    /// 160 MiB budget refused at 30 clients on a target whose count cap is 141.
+    /// The defect: the policy input was an `embedded: bool`, which says "not a
+    /// host" where the numbers mean "this target".
     ///
-    /// The `match` on each figure is exhaustive, so a fourth target cannot
-    /// compile until someone decides what it costs.
+    /// The `match` on the figure is exhaustive, so a new target cannot compile
+    /// until someone decides what it gets.
     #[test]
     fn each_target_is_charged_the_figure_measured_on_it() {
-        for target in [
-            ThreadMemoryTarget::Host,
-            ThreadMemoryTarget::VxWorks,
-            ThreadMemoryTarget::Rtems,
-        ] {
-            let (overhead, budget) = (
-                per_thread_overhead(target),
-                default_reservation_budget(target),
-            );
+        for target in [ThreadMemoryTarget::Host, ThreadMemoryTarget::Rtems] {
+            let budget = default_reservation_budget(target);
             match target {
                 ThreadMemoryTarget::Host => {
-                    assert_eq!(overhead, 0);
                     assert_eq!(budget, usize::MAX, "a host meets no thread-memory wall");
                 }
-                ThreadMemoryTarget::VxWorks => {
-                    assert_eq!(
-                        overhead,
-                        1024 * 1024,
-                        "the flat per-thread reservation measured on VxWorks 7: \
-                         three stack classes, walls within 2.1 %"
-                    );
-                    assert_eq!(budget, 160 * 1024 * 1024);
-                }
-                ThreadMemoryTarget::Rtems => {
-                    assert_eq!(
-                        overhead, 0,
-                        "RTEMS spends less than the stacks it is asked for — \
-                         1,167,383 B per client against 1,572,864 B declared — \
-                         so there is no flat term to charge"
-                    );
-                    assert_eq!(budget, 160 * 1024 * 1024);
-                }
+                ThreadMemoryTarget::Rtems => assert_eq!(budget, 160 * 1024 * 1024),
             }
         }
+        assert_eq!(
+            thread_reservation_bytes(StackSizeClass::Small),
+            StackSizeClass::Small.bytes(),
+            "RTEMS spends less than the stacks it is asked for — 1,167,383 B per \
+             client against 1,572,864 B declared — so there is no flat term to \
+             charge"
+        );
 
-        let default = default_reservation_budget(ThreadMemoryTarget::VxWorks);
+        let default = default_reservation_budget(ThreadMemoryTarget::Rtems);
         assert_eq!(resolve_reservation_budget(None, default), default);
         assert_eq!(resolve_reservation_budget(Some("8"), default), 8 << 20);
         assert_eq!(resolve_reservation_budget(Some(" 12 "), default), 12 << 20);
@@ -2345,25 +2072,24 @@ mod tests {
     /// else be announced as unverified. MUST NOT: a configured budget reach the
     /// pool without either a confirmation or a notice.
     ///
-    /// The defect: `EPICS_RS_POOL_RESERVATION_MB` was the operator's only escape
-    /// hatch and was taken at face value. Raised past what the address space can
-    /// honour it does not add memory, it deletes the refusal that was keeping the
-    /// process below the wall — 320 MiB on the ~958 MB guest walks the CA pool to
-    /// set 46, and the RTP takes `signal 6` with no refusal delivered.
+    /// The defect: `EPICS_RS_POOL_RESERVATION_MB` was the operator's only
+    /// escape hatch and was taken at face value. Raised past what the target
+    /// can honour it does not add memory, it deletes the refusal that was
+    /// keeping the process below the wall.
     ///
     /// One case per boundary of the descent, not per story.
     #[test]
     fn a_configured_budget_is_confirmed_clamped_or_declared_unverifiable() {
-        // Host: no wall, and `usize::MAX` is not a mapping anyone can ask about,
+        // Host: no wall, and `usize::MAX` is not a size anyone can ask about,
         // so the probe is not even consulted.
         let mut asked = Vec::new();
         assert_eq!(
             decide_reservation_budget(usize::MAX, false, probe(&[], &mut asked)),
             BudgetVerdict::Confirmed(usize::MAX)
         );
-        assert!(asked.is_empty(), "no mapping is asked for on a host");
+        assert!(asked.is_empty(), "nothing is asked on a host");
 
-        // The target gives what was configured: one mapping, adopted as asked,
+        // The target gives what was configured: one probe, adopted as asked,
         // and nothing is said.
         let mut asked = Vec::new();
         assert_eq!(
@@ -2374,11 +2100,10 @@ mod tests {
             ),
             BudgetVerdict::Confirmed(160 << 20)
         );
-        assert_eq!(asked, vec![160 << 20], "an honest value costs one mapping");
+        assert_eq!(asked, vec![160 << 20], "an honest value costs one probe");
 
-        // The measured case: 320 MiB configured on the ~958 MB guest, whose
-        // single-mapping bound is between 192 and 256 MiB (§10.2/§10.3). The
-        // descent rejects 320 and adopts 160.
+        // A value the target cannot give: the descent rejects 320 and adopts
+        // 160.
         let mut asked = Vec::new();
         assert_eq!(
             decide_reservation_budget(
@@ -2570,10 +2295,10 @@ mod tests {
     ///
     /// The defect: the budget counted pool workers only, while the same target
     /// runs the scan bands, the callback timer, the CA acceptor, the audit
-    /// writer and the dial pool's workers — about 15 MiB on the VxWorks guest.
-    /// Being inside the headroom is not the same as being counted: the pool
-    /// believed it could take the whole budget, and nothing would have reported
-    /// the error growing on a target with more fixed threads.
+    /// writer and the dial pool's workers. Being inside the headroom is not the
+    /// same as being counted: the pool believed it could take the whole budget,
+    /// and nothing would have reported the error growing on a target with more
+    /// fixed threads.
     #[test]
     fn a_fixed_thread_charges_the_process_account_and_gives_it_back() {
         let before = PROCESS_RESERVATION.held();
@@ -2659,64 +2384,5 @@ mod tests {
             "a Bytes spawn charges its bytes"
         );
         assert_eq!(PROCESS_RESERVATION.held(), before);
-    }
-
-    /// # Invariant
-    ///
-    /// MUST: a target that cannot materialise a set's mutex object refuse the
-    /// connection. MUST NOT: the pool create a thread that will meet that
-    /// refusal as a `std` panic, or keep the memory of a set it did not build.
-    ///
-    /// The defect this pins: on VxWorks every pthread mutex materialises its
-    /// `SEMAPHORE` on first lock, so a freshly leased worker's first
-    /// `std::sync::Mutex::lock` panicked with `EINVAL` at 588 live objects and
-    /// took its set with it. A host cannot be made to exhaust that arena, so
-    /// the gate is injected — what is under test is the *refusal path*: no
-    /// thread, no leaked byte, no leaked slot, and a cause a consumer can
-    /// recognise by type.
-    #[test]
-    fn a_target_that_refuses_a_mutex_object_refuses_the_connection() {
-        static ARENA: Reservation = Reservation::new(8 * HOST_SET);
-        fn arena_empty(_: &Mutex<SetState>) -> bool {
-            false
-        }
-        let pool: WorkerPool<2> =
-            WorkerPool::with_reservation_and_gate("test-arena", roster2(), 8, &ARENA, arena_empty);
-        let before = ARENA.held();
-
-        let refused = pool.acquire().err().expect("the arena refuses the set");
-        let AcquireError::SpawnFailed(ref e) = refused else {
-            panic!("an arena refusal is the target saying no: {refused:?}");
-        };
-        let arena = e
-            .get_ref()
-            .and_then(|src| src.downcast_ref::<ObjectArenaExhausted>())
-            .expect("the cause must be recognisable by type, not by prose");
-        assert_eq!(arena.objects, 2, "one object per worker in the set");
-        assert_eq!(
-            e.kind(),
-            io::ErrorKind::WouldBlock,
-            "a transient refusal is retryable, and a client's retry is the pacing"
-        );
-
-        assert_eq!(pool.worker_count(), 0, "a refusal must create no thread");
-        assert_eq!(
-            ARENA.held(),
-            before,
-            "the set's memory must go back: it was reserved for threads that do \
-             not exist"
-        );
-
-        // And the slot: a refused grow must not consume capacity, or eight
-        // transient refusals would close a pool of eight for good.
-        let ok: WorkerPool<2> = WorkerPool::with_reservation_and_gate(
-            "test-arena-recovers",
-            roster2(),
-            1,
-            &ARENA,
-            materialise_set_mutex,
-        );
-        let _lease = ok.acquire().expect("a target with objects admits");
-        assert!(pool.acquire().is_err(), "still refusing");
     }
 }

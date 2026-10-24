@@ -8,12 +8,12 @@
 //!   embed in the datagrams they build ([`ORIGIN_TAG_MCAST_GROUP`]), and the
 //!   IPv4 interface enumeration every UDP search destination list is derived
 //!   from ([`iface_v4`]). No socket, no `tokio`, no `socket2` — compiles for
-//!   every target, RTEMS and VxWorks included. [`iface_v4`] reaches the two
-//!   embedded targets where `iface_map` cannot because it goes through
-//!   `getifaddrs`, which both of them ship.
+//!   every target, RTEMS included. [`iface_v4`] reaches the embedded target
+//!   where `iface_map` cannot because it goes through `getifaddrs`, which
+//!   RTEMS ships.
 //! * **Socket-bearing modules** — `async_udp_v4`, `iface_map`,
 //!   `loopback_mcast`. Built on `tokio::net` / `socket2`, neither
-//!   of which cross to `armv7-rtems-eabihf` or the `*-wrs-vxworks*` triples.
+//!   of which cross to `armv7-rtems-eabihf`.
 //!   They take two different predicates, and the difference is not
 //!   cosmetic: `async_udp_v4` awaits on `tokio::net`, so it is
 //!   `tokio_backend` — absent from a host `exec_backend` build too, whose

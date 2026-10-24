@@ -34,18 +34,7 @@
 //! The port's non-runs are the "will not run its cycle" shape, so they belong on
 //! C's `callNotifyCompletion = TRUE` side.
 //!
-//! Measured on x86_64-wrs-vxworks before the fix, while the port still refused
-//! the 17th hop (`RTEMS:E8:H` is an `ao` at the head of an 18-record FLNK
-//! chain):
-//!
-//! ```text
-//! [    0.1s] discrim SOLO   RTEMS:AO      =601.0 budget= 45s elapsed=  0.012s OK    (ao, no FLNK, VAL preset)
-//! [    0.1s] discrim SOLO   RTEMS:E8:L15  =602.0 budget= 45s elapsed=  0.004s OK    (calc, FLNK->L16, entry depth 0 so no bail)
-//! [   45.2s] discrim SOLO   RTEMS:E8:H    =603.0 budget= 45s elapsed= 45.016s LOST  (ao + 16-deep chain that BAILS)
-//! [   45.2s] discrim SOLO   RTEMS:E8:H    =604.0 budget= 20s elapsed=  0.025s OK    (same record, new connection)
-//! ```
-//!
-//! The fourth line is the tell: the leak is one-shot per record, because
+//! The leak is one-shot per record, because
 //! `join_put_notify` skips a target whose `notify` is already `Some` — so the
 //! record that stranded the first wait-set silently declines to join every
 //! later one.
@@ -80,8 +69,8 @@ where
 }
 
 /// `ao` head + `calc` FLNK chain — the shape of `RTEMS:E8:H` -> `RTEMS:E8:L*`
-/// on the VxWorks rig. A put to an `ao`'s VAL drives processing, which is what
-/// makes this reachable from `CA_PROTO_WRITE_NOTIFY`.
+/// in `realtime-ca-ioc`'s stack probe. A put to an `ao`'s VAL drives
+/// processing, which is what makes this reachable from `CA_PROTO_WRITE_NOTIFY`.
 async fn chain_db(len: usize) -> Arc<PvDatabase> {
     let mut db_text = String::from("record(ao, \"H\") { field(FLNK,\"L0\") }\n");
     for i in 0..len {

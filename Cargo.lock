@@ -1128,7 +1128,6 @@ version = "0.32.0"
 dependencies = [
  "chrono",
  "epics-macros-rs",
- "epics-rtems-boot",
  "hostname",
  "libc",
  "parking_lot",

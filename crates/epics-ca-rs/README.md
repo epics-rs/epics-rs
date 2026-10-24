@@ -237,8 +237,8 @@ Test coverage: header encode/decode (golden packets vs `caget`), DBR encoding fo
 
 - epics-base-rs — PvDatabase, records, EpicsValue, DBR codec, and the
   `runtime`/`net` layer
-- tokio — the full runtime on a host; RTEMS and VxWorks drop `net`,
-  `signal` and `process` and serve CA through the `std::net` blocking server
+- tokio — the full runtime on a host; RTEMS drops `net`, `signal` and
+  `process` and serves CA through the `std::net` blocking server
 - chrono, thiserror, parking_lot, arc-swap, dashmap — the always-on set
 - clap — the CLI tools
 - metrics, tracing — the facades the crate emits on with no exporter attached

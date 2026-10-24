@@ -69,8 +69,8 @@
 //!
 //! A row reading *no settled pin* means no revision has been agreed for that
 //! tree: say which revision you read, and do not take its `HEAD` for the pin.
-//! Citations into non-EPICS sources (libc, RTEMS, `rtems-libbsd`, VxWorks,
-//! vendored third-party) are outside this table and carry no pin.
+//! Citations into non-EPICS sources (libc, RTEMS, `rtems-libbsd`, vendored
+//! third-party) are outside this table and carry no pin.
 
 // The CA client, the discovery stack, and the CA-link resolver.
 //
@@ -82,10 +82,10 @@
 // consumer on the full set; an RTEMS image selects `client-core`
 // (`scripts/rtems-check.sh`).
 //
-// `hostname` stays gated on `epics_embedded_target` (RTEMS or VxWorks), not on
-// a feature: it is host-only for a reason that is a fact about the platform —
-// `getnameinfo` has no newlib backing on RTEMS and is absent from `libc`'s
-// VxWorks module too — and it has a consumer outside the client. What the
+// `hostname` stays gated on `epics_embedded_target` (RTEMS), not on a feature:
+// it is host-only for a reason that is a fact about the platform —
+// `getnameinfo` has no newlib backing on RTEMS — and it has a consumer outside
+// the client. What the
 // `client` feature owns is the client's *references* to it.
 //
 // `discovery` and `repeater` take `tokio_backend` for the reason spelled out
@@ -159,8 +159,8 @@ pub mod protocol;
 pub mod repeater;
 // The repeater's reactor-free half. Two clauses, and they answer different
 // questions. `not(epics_embedded_target)` is what the code itself needs: the
-// client table and the datagram rewrites want `socket2` (absent on RTEMS and
-// VxWorks) and no reactor, so the gate is the target's, never whatever gate
+// client table and the datagram rewrites want `socket2` (absent on RTEMS) and
+// no reactor, so the gate is the target's, never whatever gate
 // `repeater` happens to carry. `any(tokio_backend, test)` is the separate
 // question of whether anything can consume it — the module is `pub(crate)`,
 // so it is unreachable from outside, and `repeater` is its only caller. When

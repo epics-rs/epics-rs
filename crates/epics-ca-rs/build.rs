@@ -41,7 +41,7 @@
 //! for this crate's own compilation:
 //!
 //! ```text
-//! exec_backend  ⟺  epics_embedded_target (target_os in {"rtems", "vxworks"})
+//! exec_backend  ⟺  epics_embedded_target (target_os = "rtems")
 //!               ||  EPICS_RS_BUILD_EXEC_BACKEND=thread
 //! tokio_backend ⟺  otherwise
 //! ```
@@ -82,13 +82,12 @@ fn main() {
     println!("cargo::rustc-check-cfg=cfg(ca_udp_bcast)");
 
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
-    // The reactor-free targets: no tokio reactor exists on either, so every
+    // The reactor-free target: no tokio reactor exists there, so every
     // module gate above this crate's async front-end (`server/mod.rs`,
     // `server/udp.rs`, `server/tcp.rs`, `server/addr_list.rs`, `lib.rs`'s
     // `discovery`/`repeater`/`hostname`/`cli`/`copt`) gates on this one
-    // capability cfg instead of repeating `any(target_os = "rtems", target_os
-    // = "vxworks")`.
-    let embedded_target = matches!(target_os.as_str(), "rtems" | "vxworks");
+    // capability cfg instead of repeating the target predicate.
+    let embedded_target = target_os == "rtems";
     if embedded_target {
         println!("cargo::rustc-cfg=epics_embedded_target");
     }

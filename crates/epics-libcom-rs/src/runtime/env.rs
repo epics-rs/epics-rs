@@ -412,7 +412,7 @@ pub fn ca_local_host_name() -> Vec<u8> {
 /// C `osiGetUserName` into its callers' 256-byte buffer: the passwd name of
 /// the real uid (`posix/osdProcess.c:39`), never `$USER`. `None` is
 /// `osiGetUserNameFail`, whose fallback each caller picks (libca `""`, pvxs
-/// `"nobody"`). Windows and VxWorks are not ported and report a failure.
+/// `"nobody"`). Windows is not ported and reports a failure.
 pub fn user_name() -> Option<Vec<u8>> {
     #[cfg(all(unix, not(epics_embedded_target)))]
     let name = {

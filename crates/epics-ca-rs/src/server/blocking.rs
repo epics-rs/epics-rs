@@ -288,50 +288,27 @@ const CAS_CLIENT_POOL_CAPACITY: usize = 141;
 ///   `rsrv/caservertask.c:109-111` and at `epicsThreadPriorityCAServerLow`
 ///   (`:109`). It runs the full CA command dispatch into the database.
 ///
-///   **`Big` is C's *class*, but on VxWorks it is not C's *size*, and the
-///   difference is 95×.** [`StackSizeClass::bytes`] implements C's POSIX table
+///   **The class is `Medium`, not C's `Big`, decided from a measurement.**
+///   [`StackSizeClass::bytes`] implements C's POSIX table
 ///   (`libcom/src/osi/os/posix/osdThread.c:506-509`, `STACK_SIZE(f) = f *
-///   0x10000 * sizeof(void *)` over `{1, 2, 4}`), so `Big` is 2,097,152 B on a
-///   64-bit target. C on VxWorks uses an entirely different table
-///   (`libcom/src/osi/os/vxWorks/osdThread.c:63-64`, `{4000, 6000, 11000} *
-///   ARCH_STACK_FACTOR`, and `ARCH_STACK_FACTOR` is 2 for x86_64), so C's
-///   `epicsThreadStackBig` there is **22,000 B**.
+///   0x10000 * sizeof(void *)` over `{1, 2, 4}`), so `Medium` is 524,288 B on
+///   `armv7-rtems-eabihf`. The `CAS-client` high-water there measures
+///   **24,432 B**, converged over a 4-client/400-round and an
+///   8-client/500-round run and inclusive of a 16-deep inline FLNK chain: 21.5×
+///   headroom. That is the port's own cost — `park_on` pins each connection's
+///   async state machine onto this stack.
 ///
-///   We cannot follow C's VxWorks number: the `CAS-client` high-water MEASURED
-///   on `x86_64-wrs-vxworks` is **65,912 B**, three times C's whole `Big`
-///   allowance. That is the port's own cost — `park_on` pins each connection's
-///   async state machine onto this stack — and it is what the class table, not
-///   the class name, has to cover: 65,912 B proved invariant across payloads
-///   from 8 B to 1,048,576 B, the `DBR_DOUBLE`/`TIME`/`CTRL` reply shapes,
-///   `subArray`, `compress`, a 16-deep inline FLNK chain, and six monitors per
-///   connection.
+///   The engine, like C's `dbProcess`, puts no bound on FLNK depth:
+///   `processTarget` (`dbDbLink.c:427-436`) recurses until a record is already
+///   `pact`. The armv7 measurement puts one inline FLNK hop at ~1,934 B and the
+///   chainless floor at 8,960 B, so this high-water rises LINEARLY with the
+///   depth of the user's link graph, exactly as the C stack does. At ~1,934
+///   B/hop, `Medium` on armv7 covers roughly 266 hops of headroom; a DB whose
+///   chains approach that is the DB author's to re-measure, as it is under C.
 ///
-///   **The class is `Medium`, decided from a measurement on BOTH targets this
-///   roster serves.** The second one closed the gap that used to hold this at
-///   `Big`: `armv7-rtems-eabihf` measures **24,432 B**, converged over a
-///   4-client/400-round and an 8-client/500-round run, and inclusive of the
-///   inline FLNK chain. Headroom against `Medium`, which is pointer-width
-///   scaled (`STACK_SIZE(f) = f * 0x10000 * sizeof(void *)`):
-///
-///   | target | high-water | `Medium` | headroom |
-///   |---|---|---|---|
-///   | `x86_64-wrs-vxworks` | 65,912 B | 1,048,576 B | 15.9× |
-///   | `armv7-rtems-eabihf` | 24,432 B | 524,288 B | 21.5× |
-///
-///   Both numbers were taken with a 16-deep FLNK chain, and the engine, like
-///   C's `dbProcess`, puts no bound on that depth: `processTarget`
-///   (`dbDbLink.c:427-436`) recurses until a record is already `pact`. The
-///   armv7 measurement puts one inline FLNK hop at ~1,934 B and the chainless
-///   floor at 8,960 B, so this high-water rises LINEARLY with the depth of the
-///   user's link graph, exactly as the C stack does. At ~1,934 B/hop, `Medium`
-///   on armv7 covers roughly 266 hops of headroom and the x86_64 side about
-///   half that per byte of pointer width; a DB whose chains approach that is
-///   the DB author's to re-measure, as it is under C.
-///
-///   What the class buys: reservation, not usage, is the binding resource on
-///   VxWorks (a thread costs its declared stack plus ~1 MiB of reserved address
-///   space), and the measured wall moves **47 → 59** concurrent clients at
-///   `Medium`.
+///   What the class buys is reservation: every client set's declared stacks
+///   are charged against the worker-pool budget (`runtime::worker_pool`), so
+///   a smaller class admits more clients under the same budget.
 /// * `event` is the per-client monitor sender, C's `event_task`, created with
 ///   `epicsThreadGetStackSize(epicsThreadStackMedium)` (`db/dbEvent.c:1117`) —
 ///   because it formats and sends queued events rather than dispatching
@@ -339,12 +316,10 @@ const CAS_CLIENT_POOL_CAPACITY: usize = 141;
 ///   (`caservertask.c:560`, computed at `:1508`) so a client that stops
 ///   reading cannot starve command dispatch.
 ///
-///   This one stays at C's class on one measurement, not two: `CAS-event` on
-///   `armv7-rtems-eabihf` is **3,816 B** (137.4× headroom against that
-///   target's `Medium` of 524,288 B), and no `CAS-event` high-water has been
-///   measured on `x86_64-wrs-vxworks`. Dropping it to `Small` would be a
-///   one-target decision, and this role is not what moves the wall — the
-///   receiver's class is 4× larger in bytes reserved.
+///   This one stays at C's class: `CAS-event` on `armv7-rtems-eabihf` is
+///   **3,816 B** (137.4× headroom against that target's `Medium` of
+///   524,288 B), and dropping it below C's class would rest on that one
+///   measurement alone.
 fn client_roster() -> [WorkerRole; 2] {
     [
         WorkerRole {
@@ -1395,8 +1370,7 @@ fn handle_client_blocking(
     // `send` under `SEND_LOCK` for exactly as long, so the BEHAVIOUR here is
     // C-faithful and is deliberately left alone; only the rationale was wrong.
     // The bound, when one is wanted, is `EPICS_CAS_INACTIVITY_TMO` below —
-    // off by default, as in C. (Measured on rtems-libbsd only; the VxWorks
-    // stack is not readable from here and this was NOT transferred to it.)
+    // off by default, as in C. (Measured on rtems-libbsd.)
     stream.set_nodelay(true).map_err(CaError::Io)?;
     epics_base_rs::runtime::socket::enable_keepalive(&stream).map_err(CaError::Io)?;
     // `None` (no configured cap) leaves the socket in pure blocking mode — C
@@ -1995,12 +1969,11 @@ mod tests {
     /// thread-spawn gate produce the same refusal text.
     ///
     /// The two need opposite remedies — raise the bound versus give the target
-    /// memory — and on VxWorks 7 both walls were reached on the same image,
-    /// 96 concurrent with `EAGAIN` on a 1280M guest and 141 with the pool's own
-    /// capacity on a 2048M one, with `available=48` on both. The status
-    /// code cannot separate them (see [`refuse_client`]), so the diagnostic
-    /// must, and it must carry the *bound* — a capacity refusal that does not
-    /// say what the capacity is tells an operator nothing they can act on.
+    /// memory — and one image can reach either wall depending on how much
+    /// memory its target has. The status code cannot separate them (see
+    /// [`refuse_client`]), so the diagnostic must, and it must carry the
+    /// *bound* — a capacity refusal that does not say what the capacity is
+    /// tells an operator nothing they can act on.
     #[test]
     fn each_admission_gate_names_itself_and_its_remedy_in_the_refusal() {
         let at_capacity = refusal_frame_text(&AcquireError::AtCapacity {
@@ -2072,17 +2045,14 @@ mod tests {
     /// MUST: every refusal produce exactly one console record. MUST NOT: a
     /// refusal be sampled away, and MUST NOT: one refusal produce two records.
     ///
-    /// Both halves failed on target and both are asserted here, because either
-    /// one alone makes the console's refusal count a number an operator cannot
-    /// read. Measured on VxWorks 7 at the connection wall: 8 refusals
-    /// produced 4 `errlog` records and 8 `warn` records, and 4 refusals
-    /// produced 3 and 4 — so neither sink's line count was the refusal count,
-    /// and the `errlog` stream, which is the one an EPICS operator reads,
-    /// understated the wall by half with no notice that it had.
+    /// Both halves are asserted here, because either one alone makes the
+    /// console's refusal count a number an operator cannot read: a sampled
+    /// `errlog` stream, which is the one an EPICS operator reads, understates
+    /// the wall with no notice that it has.
     ///
     /// Seven is deliberate: it is not a power of two and it spans three of
-    /// them, so the schedule that produced the defect cannot satisfy this by
-    /// coincidence the way the measured runs' 4 and 8 nearly did.
+    /// them, so a power-of-two sampling schedule cannot satisfy this by
+    /// coincidence.
     #[test]
     fn every_refusal_produces_exactly_one_console_record() {
         const REFUSALS: usize = 7;
@@ -2261,10 +2231,9 @@ mod tests {
         // roles, not by naming the classes. Naming them is what this guard used
         // to do (`Big` for the receiver, from C's
         // `epicsThreadGetStackSize(epicsThreadStackBig)`,
-        // `caservertask.c:109-111`), and it was the wrong invariant: C's class
-        // NAMES do not carry C's VxWorks byte SIZES (C's `Big` there is
-        // 22,000 B, ours is 2,097,152 B), so the class has to be chosen from
-        // the measured high-water on every target this roster serves. The
+        // `caservertask.c:109-111`), and it was the wrong invariant: the class
+        // has to be chosen from the measured high-water on every target this
+        // roster serves, not copied from C's name. The
         // reasoning for the current choice is on `client_roster` itself. What
         // must not regress is a role with no class at all, which is two threads
         // per client at std's 2 MiB default.
@@ -4107,7 +4076,7 @@ mod tests {
     /// subscription in silence and the client kept the last value, believing
     /// it live.
     ///
-    /// This driver is the ONLY receive loop on RTEMS and VxWorks
+    /// This driver is the ONLY receive loop on RTEMS
     /// (`epics_embedded_target` compiles `server::tcp::handle_client` out), so
     /// a disconnect that leaks through the async sweep alone reaches no
     /// embedded client at all.

@@ -150,17 +150,12 @@ COMMON=(+"$TOOLCHAIN" check --locked --no-default-features "-Zbuild-std=std,pani
 # `net` socket half is gated off RTEMS, for instance — would be invisible here
 # exactly as `src/bin` was before this script existed.
 #
-# `asyn-rs` is listed for the reason the VxWorks gate states at length and this
-# target shares: C asyn names an RTOS explicitly in its transport
-# (`drvAsynIPPort.c:63/:75/:178`, `epicsInterruptibleSyscall.c:31` — vxWorks
-# there, but the RTEMS half of the same file set is `USE_SOCKTIMEOUT`,
-# `drvAsynIPPort.c:71-72`), so this is target code. And `epics-libcom-rs`'s
-# `runtime::socket` embedded arm — raw `libc` `socket`/`setsockopt`/`bind`/
-# `connect` — has asyn's two IP drivers as its only consumer, so without this
-# entry the seam is compiled for the triple and every caller of it is not.
-# Kept identical to the VxWorks gate's list on purpose: the two targets share
-# one embedded arm, and a crate checked on one but not the other would let a
-# break hide behind whichever gate was not run.
+# `asyn-rs` is listed because C asyn names RTEMS explicitly in its transport
+# (`USE_SOCKTIMEOUT`, `drvAsynIPPort.c:71-72`), so this is target code. And
+# `epics-libcom-rs`'s `runtime::socket` embedded arm — raw `libc`
+# `socket`/`setsockopt`/`bind`/`connect` — has asyn's two IP drivers as its
+# only consumer, so without this entry the seam is compiled for the triple and
+# every caller of it is not.
 CRATES=(epics-libcom-rs epics-base-rs epics-ca-rs epics-pva-rs epics-rtems-boot epics-bridge-rs asyn-rs)
 
 # Per-crate feature selection, on top of COMMON's `--no-default-features`.
@@ -301,10 +296,10 @@ fi
 # glob. Measured, not assumed: with the glob in place, a `[[bin]]` whose `path`
 # points outside `src/bin` (`src/canary_main.rs`) and a nested
 # `src/bin/<name>/main.rs` were both invisible — cargo declared two binaries
-# neither this script nor `vxworks-check.sh` named, and both gates still exited
-# 0. That is the break this census exists to prevent with one convention
-# removed: `realtime-ca-ioc` escaped a check that searched for a STRING, and
-# these escaped a check that searches a PATH. Asking cargo removes the search.
+# this script did not name, and it still exited 0. That is the break this census
+# exists to prevent with one convention removed: `realtime-ca-ioc` escaped a
+# check that searched for a STRING, and these escaped a check that searches a
+# PATH. Asking cargo removes the search.
 #
 # Keyed by cargo's bin NAME, which is what the `--bin` rows below take, so the
 # lists and the compile rows now name the same thing. The bridge's five

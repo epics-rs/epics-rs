@@ -63,7 +63,7 @@ mod sys {
     pub(super) const IPV6_MULTICAST_IF: i32 = libc::IPV6_MULTICAST_IF;
 
     /// The `struct in_addr` form, which every BSD-derived stack (RTEMS
-    /// libbsd, VxWorks, macOS) takes and Linux accepts beside `ip_mreqn`.
+    /// libbsd, macOS) takes and Linux accepts beside `ip_mreqn`.
     pub(super) fn set_if_v4<S: McastSocket>(sock: &S, iface: Ipv4Addr) -> io::Result<()> {
         setsockopt(
             sock,

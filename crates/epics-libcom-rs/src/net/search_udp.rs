@@ -654,10 +654,9 @@ mod sys {
         ) -> io::Result<Self> {
             // `SO_RCVTIMEO`, fatal — the same call and the same fatality the
             // blocking PVA server's UDP responder makes
-            // (`server_native::blocking`, `UDP_STOP_TICK`), which runs on both
-            // embedded targets. It is `SO_SNDTIMEO` that VxWorks rejects with
-            // `ENOPROTOOPT`, and this socket never sets one: a UDP `send_to`
-            // does not block on a peer.
+            // (`server_native::blocking`, `UDP_STOP_TICK`), which runs on the
+            // embedded target. This socket sets no `SO_SNDTIMEO`: a UDP
+            // `send_to` does not block on a peer.
             socket.set_read_timeout(Some(PUMP_WAKE_INTERVAL))?;
             #[cfg(all(not(epics_embedded_target), any(unix, windows)))]
             crate::net::udp_rx::enable(&socket, socket.local_addr()?.is_ipv6())?;

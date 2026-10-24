@@ -893,8 +893,8 @@ mod tests {
     /// not in the process registry every consumer resolves through.
     ///
     /// A real `EAGAIN` from `pthread_create`, not a stub: the child lowers
-    /// `RLIMIT_NPROC` to 1, which is the measured VxWorks failure (thread
-    /// creation refused under a resource limit) reproduced on the host. It has
+    /// `RLIMIT_NPROC` to 1: thread creation refused under a resource limit,
+    /// reproduced on the host. It has
     /// to be a child process because the limit is process-wide — a test that
     /// lowered it in-process would take every concurrently running test with
     /// it under a shared-process runner.

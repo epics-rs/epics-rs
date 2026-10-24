@@ -276,8 +276,8 @@ cargo test -p epics-pva-rs
 ## Dependencies
 
 - epics-base-rs — `EpicsValue`, `PvDatabase`, and the `runtime`/`net` layer
-- tokio — the full runtime on a host; RTEMS and VxWorks drop `net`,
-  `signal` and `process`
+- tokio — the full runtime on a host; RTEMS drops `net`, `signal` and
+  `process`
 - epics-macros-rs — `#[pva_service]`, `#[derive(NTScalar)]`, `#[derive(NTTable)]`
 - bytes — refcounted byte buffers for zero-copy monitor fan-out
 - chrono, thiserror, parking_lot, dashmap, futures-util, tokio-util

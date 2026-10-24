@@ -31,7 +31,7 @@
 /// The child is told which test it is through the environment and compares the
 /// value, so a child never re-executes a second time and two of these tests
 /// cannot be confused for one another.
-#[cfg(not(any(target_os = "rtems", target_os = "vxworks")))]
+#[cfg(not(target_os = "rtems"))]
 pub(crate) fn with_a_process_of_its_own(test: &str, body: impl FnOnce()) {
     const ROLE: &str = "EPICS_RS_FRESH_PROCESS";
     if std::env::var(ROLE).as_deref() == Ok(test) {
@@ -51,9 +51,9 @@ pub(crate) fn with_a_process_of_its_own(test: &str, body: impl FnOnce()) {
     );
 }
 
-/// The embedded targets have no process to spawn, so there a test is only as
+/// The embedded target has no process to spawn, so there a test is only as
 /// isolated as its runner makes it.
-#[cfg(any(target_os = "rtems", target_os = "vxworks"))]
+#[cfg(target_os = "rtems")]
 pub(crate) fn with_a_process_of_its_own(_test: &str, body: impl FnOnce()) {
     body();
 }

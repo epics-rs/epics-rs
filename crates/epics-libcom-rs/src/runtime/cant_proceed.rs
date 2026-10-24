@@ -102,18 +102,18 @@ mod tests {
     /// The owner path, both exits, measured on the **process**.
     ///
     /// A test that only asserted "it does not return" would pass against the
-    /// defect this closes: the four sites it replaces panicked, and on RTEMS
-    /// and VxWorks — both `panic = "unwind"` — a panicked thread leaves the
-    /// process running. So the child is re-executed and the parent asserts
-    /// what the operator actually observes: `SIGABRT` with the knob set, and a
-    /// live process with one parked thread without it.
+    /// defect this closes: the four sites it replaces panicked, and on RTEMS —
+    /// `panic = "unwind"` — a panicked thread leaves the process running. So
+    /// the child is re-executed and the parent asserts what the operator
+    /// actually observes: `SIGABRT` with the knob set, and a live process with
+    /// one parked thread without it.
     ///
     /// The knob is set on the child's environment rather than this process's,
     /// so the assertion does not depend on what the developer exported and
     /// cannot leak into another test.
     ///
-    /// Gated off the embedded targets: they have no process to spawn.
-    #[cfg(all(unix, not(target_os = "rtems"), not(target_os = "vxworks")))]
+    /// Gated off the embedded target: it has no process to spawn.
+    #[cfg(all(unix, not(target_os = "rtems")))]
     #[test]
     fn the_knob_decides_whether_the_process_or_one_thread_dies() {
         use std::os::unix::process::ExitStatusExt;

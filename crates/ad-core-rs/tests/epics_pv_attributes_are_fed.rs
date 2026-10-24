@@ -14,8 +14,8 @@
 // This file's other cases are pure record-layer `#[test]`s; only the one
 // gated below builds a real CA server, which the reactor-free
 // `exec_backend` — selected on a host build by
-// `EPICS_RS_BUILD_EXEC_BACKEND=thread`, and unconditionally on RTEMS and
-// VxWorks — does not have. Gated per item rather than per file so the
+// `EPICS_RS_BUILD_EXEC_BACKEND=thread`, and unconditionally on RTEMS
+// — does not have. Gated per item rather than per file so the
 // record-layer cases keep compiling in that configuration.
 #![cfg(feature = "ioc")]
 

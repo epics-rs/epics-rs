@@ -14,9 +14,7 @@
 //! ```
 //!
 //! Both buffers are live across that last copy, so a 1 MiB waveform costs
-//! 2 MiB at the moment of framing — per delivery, per subscriber. On
-//! `x86_64-wrs-vxworks` four clients monitoring one 1 MiB waveform aborted the
-//! RTP with `memory allocation of 1048576 bytes failed` and signal 6.
+//! 2 MiB at the moment of framing — per delivery, per subscriber.
 //!
 //! # What C does
 //!

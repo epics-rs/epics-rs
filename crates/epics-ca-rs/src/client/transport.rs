@@ -629,8 +629,7 @@ pub(super) enum WatchdogExpiry {
 /// Before this existed the name-service reader had no liveness rule at all — it
 /// wrote `CA_PROTO_ECHO` on a hardcoded 60 s tick and never looked for the
 /// reply, so a name server that accepted, kept reading and never answered was
-/// held indefinitely: ten consecutive censuses on one local port over ≈600 s,
-/// measured on VxWorks.
+/// held indefinitely.
 pub(super) struct CircuitWatchdog {
     idle: Duration,
     echo: Duration,
@@ -993,11 +992,11 @@ impl RecvBodyPolicy {
 ///   libbsd socket" half is withdrawn, see [`crate::server::blocking`]).
 ///
 /// The arm is chosen by the *backend*, not by the target. `exec_backend` is
-/// `epics_embedded_target` (`target_os` in `{"rtems", "vxworks"}`) **or**
+/// `epics_embedded_target` (`target_os = "rtems"`) **or**
 /// `EPICS_RS_BUILD_EXEC_BACKEND=thread` (`build.rs`), and what both share is
 /// that a future started through `runtime::task::spawn` runs with no tokio
-/// reactor entered — on RTEMS or VxWorks because there is none and
-/// `tokio::net` does not compile for either triple, on a host exec-model build
+/// reactor entered — on RTEMS because there is none and `tokio::net` does
+/// not compile for that triple, on a host exec-model build
 /// because the future lands on a callback-pool worker the runtime was never
 /// entered on. A `tokio::net::TcpStream::connect` there panics ("there is no
 /// reactor running") even though the process has a runtime elsewhere. Gating

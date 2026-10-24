@@ -74,5 +74,5 @@ chrt -f 70 target/release/rt-probe watch --ca-port 5164 --samples 2000
 
 ## Not covered
 
-No RTEMS or VxWorks build, and no C counterpart to compare against in the
+No RTEMS build, and no C counterpart to compare against in the
 same binary.

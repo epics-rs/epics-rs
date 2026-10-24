@@ -196,8 +196,7 @@ pub fn target_status_pvs(prefix: &str, started: Instant) -> Vec<StatusPv> {
             reading(fd_usage().map(|fd| fd.free() as f64))
         }),
         // Each field is read on its own: a target can measure one and not
-        // another (VxWorks' mimalloc reports committed bytes but has no
-        // free-run metric at all), and the three PVs say so independently
+        // another, and the three PVs say so independently
         // rather than all going `NaN` because one of them cannot be had.
         StatusPv::new(format!("{prefix}:MEM_FREE"), || {
             reading(mem_usage().free.map(|v| v as f64))

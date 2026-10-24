@@ -124,9 +124,7 @@
 //! configuration can select. Stage 4 added the derivation *with* the
 //! `rtems-exec-gate` census it owes (§6.3) rather than dodging the bill by
 //! adding the name alone, so the body below is host-compiled, host-linted and
-//! host-tested under `EPICS_RS_BUILD_EXEC_BACKEND=thread`. `target_os =
-//! "vxworks"` is bin-side plumbing only — `epics_embedded_target`, which is
-//! what makes `exec_backend` unconditional on the embedded triples, covers it.
+//! host-tested under `EPICS_RS_BUILD_EXEC_BACKEND=thread`.
 //!
 //! Coverage today, in full: `scripts/rtems-check.sh` compiles it for the
 //! target in both configurations; the host exec-backend selection compiles it
@@ -611,18 +609,6 @@ mod ioc {
         let boot_args: Vec<String> =
             unsafe { epics_rtems_boot::boot_args::apply_boot_env(std::env::args().skip(1)) };
 
-        // (0-reg) Announce this thread to the statistics funnel's thread
-        //     census. Every other IOC thread does this from
-        //     `runtime::task::enter_ioc_thread`, which `main` deliberately does
-        //     not call — it is the one thread that keeps the band the OS
-        //     started it with — so it is also the one thread that has to
-        //     register itself. Without this the census would be missing the
-        //     thread that owns the database.
-        //
-        //     No `#[cfg]`: the funnel is portable and every backend but
-        //     VxWorks' takes this as a no-op.
-        epics_rtems_boot::stats::register_task();
-
         // (0-cmd) The RTEMS operator commands — C `iocshRegisterRTEMS`
         //     ($EPICS_BASE/modules/libcom/RTEMS/posix/rtems_init.c:692-705 at
         //     R7.0.10). C registers `netstat`, `heapSpace`, `zoneset`, `rt` and
@@ -631,9 +617,9 @@ mod ioc {
         //     are registered.
         //
         //     `cfg!` and not `#[cfg]`: the call compiles on every target this
-        //     binary builds for, and the condition is C's own — `iocshRegisterRTEMS`
-        //     exists only in the RTEMS build of libCom, so a host or VxWorks
-        //     image must not grow the names.
+        //     binary builds for, and the condition is C's own —
+        //     `iocshRegisterRTEMS` exists only in the RTEMS build of libCom, so
+        //     a host image must not grow the names.
         //
         //     KNOWN, and not a defect in the registration: this target has no
         //     iocsh (`rustyline` does not build for RTEMS, see above), so
@@ -1081,7 +1067,7 @@ fn main() -> ExitCode {
     epics_base_rs::runtime::task::refuse_backend(
         "realtime-pva-ioc: built with the tokio task backend, which this entry point \
          does not start a runtime for.\n\
-         Build it for `armv7-rtems-eabihf` or a VxWorks target, or on a host \
+         Build it for `armv7-rtems-eabihf`, or on a host \
          rebuild with EPICS_RS_BUILD_EXEC_BACKEND=thread, which routes the \
          `runtime::task` seam to the same std-thread executor the target uses.",
     )
@@ -1153,10 +1139,9 @@ mod tests {
     /// A stack class says how much this thread takes. The charge is what makes
     /// the worker pool's budget know it was taken — without it the pool admits
     /// clients against a number that has never heard of the acceptor, the UDP
-    /// responder or the probe. Measured at roughly 15 MiB of fixed IOC threads
-    /// on the VxWorks target: inside the headroom, which is not the same as
-    /// accounted for, and the moment a target runs more fixed threads than
-    /// this one the error is no longer small and nothing reports that it grew.
+    /// responder or the probe. Inside the headroom is not the same as accounted
+    /// for: the moment a target runs more fixed threads than this one the error
+    /// grows and nothing reports that it did.
     ///
     /// The charge must be held *inside* the spawned body, not by the spawning
     /// function: a guard left on the calling thread is released the moment

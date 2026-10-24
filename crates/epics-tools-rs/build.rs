@@ -6,19 +6,17 @@
 //! `cfg(unix)` was the crate's gate, used to mean two things at once:
 //!
 //! 1. **"`libc` and `nix` are linked."** That is what `Cargo.toml`'s
-//!    `[target.'cfg(unix)'.dependencies]` means, and it is true on RTEMS and
-//!    VxWorks — both are `target_family = "unix"`.
+//!    `[target.'cfg(unix)'.dependencies]` means, and it is true on RTEMS,
+//!    which is `target_family = "unix"`.
 //! 2. **"there is a second process to supervise, reached through
 //!    `forkpty(3)`/`execvp(3)`, with a controlling terminal behind fd 0."**
-//!    That is false on both.
+//!    That is false there.
 //!
 //! Measured 2026-07-27. RTEMS's `fork()` is an inoperable stub that sets
 //! `ENOSYS` (`rtems/cpukit/posix/src/fork.c:48-50` (both `rtems` pins)), and its BSP archive
 //! `librtemscpu.a` defines `forkpty`, `openpty`, `execvp` and `posix_spawn`
 //! zero times each (control: `fork` and `tcgetattr` once each, 2360 `T`
-//! symbols in the archive). The whole VxWorks 7 SDK header tree
-//! (`wrsdk-vxworks7-qemu-1.17.0`) names `forkpty`/`openpty` in zero files
-//! (control: `tcsetattr` in two). C states the same restriction in its build
+//! symbols in the archive). C states the same restriction in its build
 //! system rather than in code — `PROD_HOST = procServ`
 //! (`epics-modules/procServ/Makefile.Epics.in:12`), which EPICS base defines
 //! as `product_only_for_host_type_systems`
@@ -27,7 +25,7 @@
 //!
 //! # Why an allowlist, not `all(unix, not(target_os = "rtems"), ...)`
 //!
-//! Excluding the two targets by name answers "is this RTEMS or VxWorks", which
+//! Excluding RTEMS by name answers "is this RTEMS", which
 //! goes stale the next time a unix-family RTOS triple appears — that target
 //! would inherit the hosted arm by default, which is the same defect with a
 //! different `target_os`. The allowlist answers "were this platform's process
@@ -46,16 +44,16 @@
 //!   where the IOC *is* the system has no second process to supervise. Left to
 //!   compile away it would offer an embedded consumer an empty API and imply a
 //!   port is merely missing; worse, until this script existed the only thing
-//!   stopping such a build was that `nix` happens not to compile for those
-//!   triples (30 errors for `armv7-rtems-eabihf`, 33 for `x86_64-wrs-vxworks`,
-//!   measured on this tree), all of them inside `nix::unistd` and none of them
-//!   saying anything about procServ. The refusal states the reason ourselves
-//!   instead of borrowing a dependency's accident.
+//!   stopping such a build was that `nix` happens not to compile for
+//!   `armv7-rtems-eabihf` (30 errors, measured on this tree), all of them
+//!   inside `nix::unistd` and none of them saying anything about procServ.
+//!   The refusal states the reason ourselves instead of borrowing a
+//!   dependency's accident.
 //!
 //! The refusal is unconditional on such a target — not conditioned on the
 //! `procserv` feature, which would be the narrower and more tempting rule.
-//! There is no configuration of this crate that builds for one of those
-//! triples: `tokio` with `features = ["full"]` is an unconditional dependency,
+//! There is no configuration of this crate that builds for such a triple:
+//! `tokio` with `features = ["full"]` is an unconditional dependency,
 //! and `--no-default-features -p epics-tools-rs` for `armv7-rtems-eabihf`
 //! fails with 89 errors inside `mio`/`nix` (measured on this tree). A
 //! feature-conditioned refusal would therefore not preserve a working

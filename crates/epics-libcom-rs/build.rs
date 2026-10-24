@@ -6,8 +6,8 @@
 //!
 //! * `exec_backend` — the std-thread background executor (callback pool +
 //!   delayed timer + scanOnce worker, `runtime::background`). This is the
-//!   only option on `epics_embedded_target` (RTEMS or VxWorks — no tokio
-//!   reactor on either), and — via `EPICS_RS_BUILD_EXEC_BACKEND=thread` — the
+//!   only option on `epics_embedded_target` (RTEMS — no tokio reactor
+//!   there), and — via `EPICS_RS_BUILD_EXEC_BACKEND=thread` — the
 //!   **host-selectable RTEMS execution model**: a real product mechanism for a
 //!   Linux (e.g. PREEMPT_RT) blocking-front-end deployment that wants the same
 //!   runtime-free spawn/timer backend the embedded build uses, driving async
@@ -43,11 +43,11 @@ fn main() {
     println!("cargo::rustc-check-cfg=cfg(epics_embedded_target)");
 
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
-    // The reactor-free targets: no tokio reactor exists on either, so both the
+    // The reactor-free target: no tokio reactor exists there, so both the
     // exec-model selection below and every dependency/socket-portability seam
     // above `epics-libcom-rs` gate on this one capability cfg instead of
-    // repeating `any(target_os = "rtems", target_os = "vxworks")`.
-    let embedded_target = matches!(target_os.as_str(), "rtems" | "vxworks");
+    // repeating the target predicate.
+    let embedded_target = target_os == "rtems";
     if embedded_target {
         println!("cargo::rustc-cfg=epics_embedded_target");
     }

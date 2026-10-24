@@ -142,30 +142,26 @@ pkcs12 = [
 #
 # `socket2` is a §8.1 hard blocker on `armv7-rtems-eabihf`: it fails with 20
 # errors (newlib has no `msghdr`/`recvmsg`/`IovLen`, no `ip_mreqn`, no
-# `SOCK_RAW`), and none of those exist in `libc`'s VxWorks module either
-# (confirmed by reading the pinned dependency's source), so the same split
-# applies to the `*-wrs-vxworks*` triples. It is reached only from the tokio
-# async I/O layer — `server_native::{tcp,udp}` and `client_native` — which
-# neither embedded target uses: each gets a blocking thread-per-client driver
-# instead (§4, §9 phase 6 item 7). So it is a host-only dep, the same gate
-# `epics-base-rs` applied to its own copy (§8.1.1). Interface enumeration is
-# epics-libcom-rs `net::iface_v4`'s.
-[target.'cfg(not(any(target_os = "rtems", target_os = "vxworks")))'.dependencies]
+# `SOCK_RAW`). It is reached only from the tokio async I/O layer —
+# `server_native::{tcp,udp}` and `client_native` — which the embedded target
+# does not use: it gets a blocking thread-per-client driver instead (§4, §9
+# phase 6 item 7). So it is a host-only dep, the same gate `epics-base-rs`
+# applied to its own copy (§8.1.1). Interface enumeration is epics-libcom-rs
+# `net::iface_v4`'s.
+[target.'cfg(not(target_os = "rtems"))'.dependencies]
 socket2 = "0.5"
 tokio = { version = "1", features = ["full"] }
 
-# RTEMS/VxWorks get tokio without `net`/`signal`/`process`: `net` pulls mio
-# (29 errors on RTEMS — no epoll/kqueue selector; mio's `selector/poll.rs`
-# exists but its cfg list does not name rtems, and the waker those targets
-# pair with needs a pipe rtems-libbsd `poll()` rejects) and `signal` pulls
-# signal-hook-registry (4 errors on
-# RTEMS — no `sa_sigaction`/`SA_RESTART`); neither crate carries VxWorks
-# target support either. Declared per-target rather than in the shared
-# table because Cargo *unions* a dependency's features across every matching
-# table: a shared `full` would silently re-add the features this drops.
-# Retained set mirrors `epics-base-rs` (§8.1.1) so the non-net tokio API
+# RTEMS gets tokio without `net`/`signal`/`process`: `net` pulls mio (29 errors
+# on RTEMS — no epoll/kqueue selector; mio's `selector/poll.rs` exists but its
+# cfg list does not name rtems, and the waker those targets pair with needs a
+# pipe rtems-libbsd `poll()` rejects) and `signal` pulls signal-hook-registry (4
+# errors on RTEMS — no `sa_sigaction`/`SA_RESTART`). Declared per-target rather
+# than in the shared table because Cargo *unions* a dependency's features across
+# every matching table: a shared `full` would silently re-add the features this
+# drops. Retained set mirrors `epics-base-rs` (§8.1.1) so the non-net tokio API
 # surface the always-compiled code uses still type-checks.
-[target.'cfg(any(target_os = "rtems", target_os = "vxworks"))'.dependencies]
+[target.'cfg(target_os = "rtems")'.dependencies]
 tokio = { version = "1", default-features = false, features = [
     "rt",
     "rt-multi-thread",

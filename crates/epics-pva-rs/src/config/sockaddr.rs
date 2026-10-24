@@ -148,19 +148,13 @@ fn resolve_error(name: &str, text: &str) -> String {
 #[cfg(unix)]
 fn gai_strerror(err: libc::c_int) -> String {
     let table: &[(libc::c_int, &str)] = &[
-        #[cfg(not(target_os = "vxworks"))]
         (libc::EAI_AGAIN, "temporary failure in name resolution"),
-        #[cfg(not(target_os = "vxworks"))]
         (libc::EAI_BADFLAGS, "invalid value for ai_flags"),
-        #[cfg(not(target_os = "vxworks"))]
         (libc::EAI_FAIL, "non-recoverable failure in name resolution"),
-        #[cfg(not(target_os = "vxworks"))]
         (libc::EAI_FAMILY, "ai_family not supported"),
-        #[cfg(not(target_os = "vxworks"))]
         (libc::EAI_MEMORY, "memory allocation failure"),
         #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
         (libc::EAI_NODATA, "no address associated with nodename"),
-        #[cfg(not(target_os = "vxworks"))]
         (
             libc::EAI_NONAME,
             "nodename nor servname provided, or not known",

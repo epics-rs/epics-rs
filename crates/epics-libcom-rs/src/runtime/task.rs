@@ -1472,14 +1472,6 @@ impl StackSizeClass {
     /// than on one word size: 512 KiB / 1 MiB / 2 MiB on a 64-bit host, and
     /// 256 KiB / 512 KiB / 1 MiB on `armv7-rtems-eabihf` — which is exactly
     /// what a C IOC asks `pthread_attr_setstacksize` for on that target.
-    ///
-    /// Read "on a 64-bit target" here before: it was wrong in the direction
-    /// that matters, because it invited a reader to assume the RTEMS numbers
-    /// were unverified. This crate is portable to 64-bit embedded targets
-    /// too — `x86_64-wrs-vxworks` — and pays for it: a 64-bit pointer doubles
-    /// every class in this table, so an `x86_64-wrs-vxworks` CA client thread
-    /// costs exactly 2× what the same thread costs on `armv7-rtems-eabihf`,
-    /// pointer width for pointer width, not a difference in the formula.
     pub fn bytes(self) -> usize {
         // STACK_SIZE(f) = f * 0x10000 * sizeof(void*)
         let unit = 0x10000usize * std::mem::size_of::<usize>();
@@ -1641,10 +1633,6 @@ pub fn current_thread_stack_low() -> Option<usize> {
             None
         }
     }
-    #[cfg(target_os = "vxworks")]
-    {
-        epics_rtems_boot::current_task_stack_low()
-    }
     #[cfg(windows)]
     {
         let (mut low, mut high) = (0, 0);
@@ -1663,7 +1651,6 @@ pub fn current_thread_stack_low() -> Option<usize> {
         target_os = "rtems",
         target_vendor = "apple",
         target_os = "openbsd",
-        target_os = "vxworks",
         windows
     )))]
     None
@@ -1967,13 +1954,6 @@ pub fn set_thread_ok_to_block(ok: bool) {
 /// [`RtPolicy::Disabled`] no scheduler call happens and there is no ordering
 /// to have — the hosted default, where the locks still exclude but do not
 /// prioritise ([`crate::runtime::sync::is_pi_mutex_active`]).
-/// A third thing on VxWorks, for the same reason as the name: an RTP cannot
-/// enumerate its own tasks, so the statistics funnel's thread census is built
-/// from what announces itself here. This is the seam because it is already the
-/// one every IOC thread passes through to take its band — "every thread that
-/// bands itself registers itself" adds a consequence to that invariant rather
-/// than a rule to remember at each spawn. A thread that starts outside it is
-/// invisible to that census, and the census output says so in its own header.
 pub fn enter_ioc_thread(priority: ThreadPriority) -> PriorityApplied {
     prepare_current_thread();
     band_and_register(priority)
@@ -1991,8 +1971,6 @@ fn prepare_current_thread() {
     name_current_thread();
     build_park_state();
     build_drive_state();
-    #[cfg(target_os = "vxworks")]
-    epics_rtems_boot::stats::register_task();
 }
 
 /// `parking_lot_core` builds a thread's park state on its first park, and
@@ -2470,11 +2448,6 @@ mod thread_registry {
             super::map_epics_priority_rtems(self.priority.value())
         }
 
-        #[cfg(target_os = "vxworks")]
-        fn mapped_os_priority(&self) -> i32 {
-            super::map_epics_priority_vxworks(self.priority.value())
-        }
-
         #[cfg(not(any(unix, epics_embedded_target)))]
         fn mapped_os_priority(&self) -> i32 {
             // No band is applied on these targets, so `Realtime` never occurs.
@@ -2826,17 +2799,6 @@ fn osd_priority_range() -> (i32, i32) {
     }
 }
 
-#[cfg(target_os = "vxworks")]
-fn osd_priority_range() -> (i32, i32) {
-    match RtPolicy::current() {
-        RtPolicy::Disabled => (0, 0),
-        RtPolicy::AllowRealtime => (
-            map_epics_priority_vxworks(0),
-            map_epics_priority_vxworks(99),
-        ),
-    }
-}
-
 #[cfg(not(any(target_os = "linux", epics_embedded_target)))]
 fn osd_priority_range() -> (i32, i32) {
     // No OS-scheduler priority API is wired here, so there is no band and no
@@ -2975,8 +2937,8 @@ extern "C" fn probe_thread(arg: *mut libc::c_void) -> *mut libc::c_void {
 /// past `max`, unclamped as C's is, and the scheduler refuses it.
 ///
 /// C parity: `epicsThreadGetPosixPriority` (`osdThread.c:129-144`) — the
-/// POSIX counterpart of the `epicsThreadGetOssPriorityValue` used on
-/// RTEMS/vxWorks (`RTEMS-score/osdThread.c:94`, `vxWorks/osdThread.c:99`).
+/// POSIX counterpart of the `epicsThreadGetOssPriorityValue` used on RTEMS
+/// (`RTEMS-score/osdThread.c:94`).
 ///
 /// **Hosted only.** RTEMS deliberately does not use this map — see
 /// `map_epics_priority_rtems` for the shape and the reason. The `test`
@@ -3071,34 +3033,6 @@ pub(crate) fn map_epics_priority_rtems(epics_priority: u32) -> i32 {
     RTEMS_MAXIMUM_PRIORITY - rtems_core_priority(epics_priority)
 }
 
-/// Map an EPICS priority onto a VxWorks **POSIX** SCHED_FIFO priority.
-///
-/// **Measurement-backed**, not derived: on the bring-up box (VxWorks 7,
-/// `x86_64-wrs-vxworks`), setting `posix = 56 + epics` — the identical POSIX
-/// value `map_epics_priority_rtems` computes for RTEMS — landed 11 of 11
-/// measured threads at `PriorityApplied::Realtime`, one scheduler call each.
-/// VxWorks's own POSIX layer then inverts that POSIX value into its native
-/// task-priority space, and the result observed there was `vx = 199 -
-/// epics`, exact: EPICS base's own vxWorks-port formula
-/// (`vxWorks/osdThread.c:99`, `oss = 199 - osiPriority`) — reached by a
-/// different route (we set the POSIX value; VxWorks inverts it, rather than
-/// us computing the native value directly as C's own port does).
-///
-/// Deliberately **not** implemented by calling `rtems_core_priority` /
-/// `map_epics_priority_rtems`: those compute an RTEMS **core** priority
-/// through `RTEMS_MAXIMUM_PRIORITY`, an RTEMS kernel constant measured on the
-/// RTEMS bring-up guest — machinery VxWorks has no equivalent of. The two
-/// happen to land on the same POSIX number; this restates the `56 + epics`
-/// arithmetic directly so this function cites no RTEMS-specific fact and a
-/// change to the RTEMS core-priority mechanism cannot silently move the
-/// VxWorks value with it.
-#[cfg(any(target_os = "vxworks", test))]
-pub(crate) fn map_epics_priority_vxworks(epics_priority: u32) -> i32 {
-    // C's own vxWorks `getOssPriorityValue` takes anything above 99 as 99
-    // (`vxWorks/osdThread.c:99-105`).
-    56 + epics_priority.min(99) as i32
-}
-
 /// C's refusal to create a thread whose priority maps past the SCHED_FIFO
 /// range: `setSchedulingPolicy`'s `pthread_attr_setschedparam` fails EINVAL,
 /// the attr keeps FIFO with `sched_priority` 0, and `pthread_create` refuses
@@ -3172,18 +3106,6 @@ fn set_fifo_priority_raw(oss: i32) -> i32 {
 /// toolchain has `sizeof(time_t) == 8`. Its `timespec` is therefore half the
 /// real width on this target, so the tail is carried as opaque bytes sized
 /// from the target compiler instead.
-///
-/// **RTEMS-only, deliberately not widened to VxWorks.** VxWorks is not
-/// newlib, and `libc` *does* declare `sched_param`/`SCHED_FIFO`/
-/// `pthread_setschedparam`/`pthread_self` for it — with a different
-/// `sched_param` layout (48 bytes, but `sched_priority: c_int` followed by a
-/// *typed* `sched_ss_low_priority`/two `timespec`s/`sched_ss_max_repl` tail,
-/// not this module's opaque bytes). Reusing this RTEMS-shaped struct for
-/// VxWorks was measured to "work" only because `SCHED_FIFO` never reads past
-/// `sched_priority` at offset 0 — the tail's true shape never mattered for
-/// that policy — which is exactly the kind of coincidence a struct-layout
-/// mismatch should not be allowed to depend on. VxWorks's `set_fifo_priority_raw`
-/// arm below therefore uses `libc::sched_param` directly.
 #[cfg(target_os = "rtems")]
 mod rtems_sched {
     use std::ffi::c_int;
@@ -3258,37 +3180,6 @@ fn set_fifo_priority_raw(oss: i32) -> i32 {
     }
 }
 
-/// VxWorks: `libc::sched_param` directly, not the RTEMS-shaped struct above.
-///
-/// Unlike RTEMS, `libc` declares this target's own `sched_param` — a
-/// `sched_priority: c_int` followed by a *typed* sporadic-server tail
-/// (`sched_ss_low_priority: c_int`, two `libc::timespec` fields,
-/// `sched_ss_max_repl: c_int`) — so there is nothing to hand-lay: the tail is
-/// zeroed rather than omitted because `SCHED_FIFO` never reads it, matching
-/// the RTEMS arm's own reasoning, but the fields are the platform's real
-/// fields at the platform's real offsets rather than opaque bytes sized by
-/// guesswork.
-#[cfg(target_os = "vxworks")]
-fn set_fifo_priority_raw(oss: i32) -> i32 {
-    let param = libc::sched_param {
-        sched_priority: oss,
-        sched_ss_low_priority: 0,
-        sched_ss_repl_period: libc::timespec {
-            tv_sec: 0,
-            tv_nsec: 0,
-        },
-        sched_ss_init_budget: libc::timespec {
-            tv_sec: 0,
-            tv_nsec: 0,
-        },
-        sched_ss_max_repl: 0,
-    };
-    // SAFETY: pthread_setschedparam operates on the calling thread with a
-    // stack-local sched_param of libc's own VxWorks width and a valid policy
-    // constant.
-    unsafe { libc::pthread_setschedparam(libc::pthread_self(), libc::SCHED_FIFO, &param) }
-}
-
 #[cfg(target_os = "linux")]
 fn apply_priority_impl(epics_priority: u32) -> PriorityApplied {
     let (min, max) = match permitted_fifo_range() {
@@ -3351,38 +3242,13 @@ fn apply_priority_impl(epics_priority: u32) -> PriorityApplied {
     }
 }
 
-/// **Measurement-backed** (VxWorks 7, `x86_64-wrs-vxworks` bring-up box): no
-/// range probe here either, and for the same reason as RTEMS —
-/// `pthread_setschedparam` performed no privilege check there, 11 of 11
-/// measured threads landed `PriorityApplied::Realtime`, and
-/// [`map_epics_priority_vxworks`]'s fixed image is inside the settable range
-/// by construction. There is nothing to discover on this target either.
-#[cfg(target_os = "vxworks")]
-fn apply_priority_impl(epics_priority: u32) -> PriorityApplied {
-    let oss = map_epics_priority_vxworks(epics_priority);
-    let rc = set_fifo_priority(oss);
-    if rc == 0 {
-        PriorityApplied::Realtime
-    } else {
-        tracing::debug!(
-            target: "epics_base_rs::runtime",
-            epics_priority,
-            oss,
-            errno = rc,
-            "SCHED_FIFO priority not applied; thread stays at default policy"
-        );
-        PriorityApplied::BestEffortFailed
-    }
-}
-
 #[cfg(not(any(target_os = "linux", epics_embedded_target)))]
 fn apply_priority_impl(_epics_priority: u32) -> PriorityApplied {
-    // No OS-scheduler priority API is wired on other targets. The three that
+    // No OS-scheduler priority API is wired on other targets. The two that
     // are wired each needed a *measured* target band before they could be:
-    // Linux probes for its settable ceiling at runtime, RTEMS's map is
+    // Linux probes for its settable ceiling at runtime, and RTEMS's map is
     // pinned against libbsd's network-thread band measured on the bring-up
-    // guest, and VxWorks's map is the RTEMS one's POSIX value, confirmed by
-    // measurement on its own bring-up box. No number here is guessable, so a
+    // guest. No number here is guessable, so a
     // new target gets `Unsupported` until somebody measures it rather than a
     // plausible-looking range.
     PriorityApplied::Unsupported
@@ -3459,9 +3325,8 @@ where
 /// C creates an IOC thread with `epicsThreadCreate(name, priority, stackSize,
 /// fn, arg)` — three attributes. This seam carried the first two and let the
 /// third fall through to whatever `std` picks, which is **2 MiB on RTEMS**:
-/// `std/src/sys/thread/unix.rs` gates its `DEFAULT_MIN_STACK_SIZE` on
-/// `not(any(l4re, vxworks, espidf, nuttx))`, and vxWorks got a 256 KiB
-/// carve-out where RTEMS did not.
+/// `std/src/sys/thread/unix.rs` carves a smaller `DEFAULT_MIN_STACK_SIZE` out
+/// for a few targets, and RTEMS is not one of them.
 ///
 /// That is invisible on the host, where a thread stack is lazily-committed
 /// virtual address space, and decisive on the target, where it is carved
@@ -3714,12 +3579,11 @@ where
 ///
 /// **An IOC that fails to start a mandatory thread MUST NOT continue serving.**
 /// A thread-local panic is not that: on a `panic = "unwind"` target — and RTEMS
-/// and VxWorks both default to unwind — `Builder::spawn(..).expect(..)` kills
-/// only the thread that called it. Measured on a VxWorks 7 RTP on a 1 GB guest:
-/// `EAGAIN` from the periodic-scan spawn panicked the `scan-owner` thread, the
-/// stop guard it held unwound and stopped the rates that *had* started, and the
-/// process went on answering CA with zero periodic scanning — a half-IOC whose
-/// records simply never process.
+/// defaults to unwind — `Builder::spawn(..).expect(..)` kills only the thread
+/// that called it. An `EAGAIN` from the periodic-scan spawn panics the
+/// `scan-owner` thread, the stop guard it holds unwinds and stops the rates
+/// that *had* started, and the process goes on answering CA with zero periodic
+/// scanning — a half-IOC whose records simply never process.
 ///
 /// C has no such state. `spawnPeriodic` (`dbScan.c:939-955`) calls
 /// `epicsThreadCreateOpt` and then `epicsEventWait(startStopEvent)`; the event
@@ -3872,8 +3736,8 @@ fn mandatory_thread_failure_message(name: &str, err: &std::io::Error) -> String 
 /// The one message that must survive cannot depend on winning the race it was
 /// printed to report. `eprintln!` needs no thread.
 ///
-/// (Not, as this once said, because `tracing` has no subscriber on RTEMS and
-/// VxWorks: `errlog`'s own `console_fallback` writes synchronously to stderr
+/// (Not, as this once said, because `tracing` has no subscriber on RTEMS:
+/// `errlog`'s own `console_fallback` writes synchronously to stderr
 /// when nothing is listening, so that reason does not hold on its own.)
 ///
 /// `abort` and not `exit`: unwinding would run every other thread's destructors
@@ -4175,11 +4039,11 @@ mod tests {
     /// Every thread this crate creates states a stack size.
     ///
     /// `std` gives RTEMS the generic 2 MiB `DEFAULT_MIN_STACK_SIZE`
-    /// (`std/src/sys/thread/unix.rs`: the carve-out list names vxworks, l4re,
-    /// espidf and nuttx — not rtems). On the host that is lazily-committed
-    /// address space and costs nothing measurable; on the target it is carved
-    /// eagerly out of a fixed pool, which is why an unset stack size is the
-    /// first ceiling the IOC hits rather than a rounding error.
+    /// (`std/src/sys/thread/unix.rs`: RTEMS is not on its carve-out list). On
+    /// the host that is lazily-committed address space and costs nothing
+    /// measurable; on the target it is carved eagerly out of a fixed pool,
+    /// which is why an unset stack size is the first ceiling the IOC hits
+    /// rather than a rounding error.
     ///
     /// `spawn_dedicated_thread` and [`MandatoryThread`] are enforced by their
     /// signatures — the class is a parameter, so a caller cannot omit it. This
@@ -4251,7 +4115,7 @@ mod tests {
     /// constructor reached through a `OnceLock` initialiser, so there is no
     /// error path back to whoever decided this IOC serves. They used to resolve
     /// the spawn `Result` with `.expect`, which on a `panic = "unwind"` target
-    /// (RTEMS and VxWorks both default to unwind) killed only the thread that
+    /// (RTEMS defaults to unwind) killed only the thread that
     /// happened to touch the facility first and left the IOC serving without
     /// the band, the timer or the `scanOnce` worker.
     ///
@@ -5379,29 +5243,6 @@ mod tests {
         );
     }
 
-    /// [`map_epics_priority_vxworks`] must land on the exact same POSIX
-    /// values as [`map_epics_priority_rtems`] — that equality is the
-    /// measured fact [`DEFAULT_POLICY`]'s doc cites, and this function
-    /// deliberately does not call into the RTEMS one (see its own doc), so
-    /// nothing else pins the two together if one of them drifts.
-    #[test]
-    fn vxworks_priority_map_matches_the_rtems_posix_values() {
-        for epics in 0..=255u32 {
-            assert_eq!(
-                map_epics_priority_vxworks(epics),
-                map_epics_priority_rtems(epics),
-                "EPICS {epics}: VxWorks and RTEMS must set the identical POSIX \
-                 SCHED_FIFO value"
-            );
-        }
-        // The measured endpoints, restated directly per this function's own
-        // doc rather than only via the equality above.
-        assert_eq!(map_epics_priority_vxworks(0), 56);
-        assert_eq!(map_epics_priority_vxworks(99), 155);
-        assert_eq!(map_epics_priority_vxworks(100), 155);
-        assert_eq!(map_epics_priority_vxworks(255), 155);
-    }
-
     /// The RTEMS map is not the hosted map with retuned endpoints, and the
     /// difference is exactly the reason the RTEMS arm exists.
     ///
@@ -5586,19 +5427,15 @@ mod tests {
         );
     }
 
-    /// The prologue must also announce the thread to the statistics funnel's
-    /// census, and that call has to be checked as text because nothing else can
-    /// check it: it is `#[cfg]`ed to VxWorks, so on the host and on RTEMS it
-    /// compiles away and deleting it breaks no build and no test. What it would
-    /// break is one target's task census, which would come back empty — an IOC
-    /// that reads as having no threads rather than as having a missing call.
+    /// The prologue must register the thread's row through the one place that
+    /// also bands it.
     ///
     /// Located inside the prologue's own body rather than anywhere in the file,
     /// because a registration that drifted out of the single thread-transition
     /// owner is the same defect as no registration: threads would start without
     /// passing it.
     #[test]
-    fn the_prologue_registers_the_thread_for_the_vxworks_census() {
+    fn the_prologue_registers_the_thread() {
         let src = production_scope(include_str!("task.rs"));
         let body_of = |signature: &str| -> &str {
             src.split_once(signature)
@@ -5613,18 +5450,6 @@ mod tests {
         for entry in [prologue, body_of("fn enter_process_thread(")] {
             assert!(entry.contains("prepare_current_thread();"), "{entry}");
         }
-        let prepare = body_of("fn prepare_current_thread(");
-        assert!(
-            prepare.contains("#[cfg(target_os = \"vxworks\")]"),
-            "the census registration must stay gated to the one OS whose \
-             backend needs it; `epics-rtems-boot` is a dependency of this \
-             package on that target only"
-        );
-        assert!(
-            prepare.contains("epics_rtems_boot::stats::register_task();"),
-            "VxWorks gives an RTP no task enumerator, so `dump_tasks` and \
-             `stack_report` list exactly what announced itself here"
-        );
         // The row half sits behind `band_and_register`, which is also what
         // `reband_current_thread` goes through, so the chain is checked in
         // two steps rather than one: the prologue reaches it, and it is what
@@ -6153,15 +5978,15 @@ mod tests {
     /// The bypass regression: a mandatory thread that cannot be created must
     /// take the **process** down, not the calling thread.
     ///
-    /// The defect this closes was measured on a VxWorks 7 RTP: `EAGAIN` from
-    /// the periodic-scan spawn panicked the `scan-owner` thread, and because
-    /// both RTEMS and VxWorks default to `panic = "unwind"`, the process
-    /// survived and went on serving CA with no periodic scanning at all. A test
+    /// The defect this closes: an `EAGAIN` from the periodic-scan spawn
+    /// panicked the `scan-owner` thread, and on a `panic = "unwind"` target
+    /// such as RTEMS the process survived and went on serving CA with no
+    /// periodic scanning at all. A test
     /// that only asserted "it panics" would have passed against that defect —
     /// so this one re-executes itself and asserts the *process* died.
     ///
-    /// Gated off the embedded targets: they have no process to spawn.
-    #[cfg(all(unix, not(target_os = "rtems"), not(target_os = "vxworks")))]
+    /// Gated off the embedded target: it has no process to spawn.
+    #[cfg(all(unix, not(target_os = "rtems")))]
     #[test]
     fn a_mandatory_thread_that_cannot_be_created_aborts_the_process() {
         use std::os::unix::process::ExitStatusExt;

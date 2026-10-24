@@ -32,8 +32,8 @@ mod tests {
     /// Both halves matter and neither is visible from a host test run, which
     /// is why they are pinned from source rather than exercised:
     ///
-    /// * **Allowlist, not exclusion list.** Naming `rtems`/`vxworks` in the
-    ///   predicate answers "is this one of the two targets we know about",
+    /// * **Allowlist, not exclusion list.** Naming `rtems` in the predicate
+    ///   answers "is this the target we know about",
     ///   and the next unix-family RTOS triple inherits the host arm — the
     ///   defect this gate replaced, which is how `console.rs` came to reach
     ///   `libc::termios` on a target whose binding for it is wrong.
@@ -89,12 +89,10 @@ mod tests {
         );
         // What separates an allowlist from an exclusion list: an exclusion
         // list has to NAME what it excludes. An allowlist never mentions it.
-        for excluded in ["rtems", "vxworks"] {
-            assert!(
-                !body.contains(&format!("{excluded:?}")),
-                "the predicate names {excluded}, so it is an exclusion list; \
-                 a target that is not on the allowlist must simply not be on it"
-            );
-        }
+        assert!(
+            !body.contains("\"rtems\""),
+            "the predicate names rtems, so it is an exclusion list; \
+             a target that is not on the allowlist must simply not be on it"
+        );
     }
 }

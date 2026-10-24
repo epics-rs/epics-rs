@@ -82,7 +82,7 @@ mod tests {
             "C's epicsTimeToStrftime width: {first:?}"
         );
         let rest: Vec<&str> = lines.collect();
-        if cfg!(any(target_os = "vxworks", target_os = "rtems")) {
+        if cfg!(target_os = "rtems") {
             assert_eq!(
                 rest,
                 ["IOC's OS Clock synchronization thread is not running."]

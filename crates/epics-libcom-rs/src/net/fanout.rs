@@ -28,7 +28,7 @@ pub enum PortUse {
     Exclusive,
 }
 
-#[cfg(not(any(target_os = "rtems", target_os = "vxworks")))]
+#[cfg(not(target_os = "rtems"))]
 impl PortUse {
     /// Bind `sock` on `addr` with this role's reuse options, ordered against
     /// the bind by [`bind_fanout`].

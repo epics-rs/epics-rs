@@ -9,13 +9,13 @@
 //!   included.
 //! * **Async I/O layer** — `accept`, `udp`, `runtime`. Built on
 //!   `tokio::net` (and, underneath it, mio) plus `socket2`.
-//!   None of those cross to `armv7-rtems-eabihf` or the `*-wrs-vxworks*`
-//!   triples (§8.1), so this layer is host-only; each embedded target gets a
-//!   blocking thread-per-client driver instead (design doc §4, §9 phase 6
+//!   None of those cross to `armv7-rtems-eabihf` (§8.1), so this layer is
+//!   host-only; the embedded target gets a blocking thread-per-client driver
+//!   instead (design doc §4, §9 phase 6
 //!   item 7), which sits on the protocol layer above. The gate is
-//!   `tokio_backend`: the layer needs a reactor, and the two embedded targets
-//!   plus a host `exec_backend` build are exactly the configurations that
-//!   have none.
+//!   `tokio_backend`: the layer needs a reactor, and the embedded target plus
+//!   a host `exec_backend` build are exactly the configurations that have
+//!   none.
 //!
 //! `accept` is the TCP side's only socket-bearing module; [`tcp`] and the
 //! protocol code behind it speak `AsyncRead`/`AsyncWrite` trait objects, so a
@@ -95,10 +95,10 @@ pub use op_handle::{
 // The config record lives in the ungated [`config`] module and compiles for
 // every target, so it is re-exported from there rather than from the host-only
 // [`runtime`] that also re-exports it. Routing it through `runtime` made
-// `server_native::PvaServerConfig` vanish on `armv7-rtems-eabihf` and the
-// `*-wrs-vxworks*` triples even though the type was right there, which forced
-// embedded callers onto `server_native::config::PvaServerConfig` and left every
-// doc reference to the short path unresolvable on those targets.
+// `server_native::PvaServerConfig` vanish on `armv7-rtems-eabihf` even though
+// the type was right there, which forced embedded callers onto
+// `server_native::config::PvaServerConfig` and left every doc reference to the
+// short path unresolvable on that target.
 pub use config::{DEFAULT_MAX_MESSAGE_SIZE, PvaServerConfig};
 pub use peers::{ChannelReport, MonitorReport, PeerEntry, PeerRegistry, PeerSnapshot};
 pub use report::{Liveness, LivenessGuard, ServerReport, ServerReportHandle};

@@ -579,7 +579,7 @@ pub fn clock_time_report(level: i32) -> String {
         "Program started at {}\n",
         format_time_sample(*PROGRAM_START)
     );
-    if cfg!(any(target_os = "vxworks", target_os = "rtems")) {
+    if cfg!(target_os = "rtems") {
         out.push_str("IOC's OS Clock synchronization thread is not running.\n");
     }
     out

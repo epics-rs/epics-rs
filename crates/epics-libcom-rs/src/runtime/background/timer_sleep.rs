@@ -46,12 +46,12 @@
 //! `Arc<Mutex<SleepState>>`, so leaving it queued keeps that cell and the OS
 //! mutex inside it alive for the entire remaining delay.
 //!
-//! That retention is not theoretical and not small. A `select!` arm holding a
-//! long-period `interval` tick re-arms a fresh `Sleep` on every loop iteration
-//! and drops it when another arm wins, so an uncancellable entry accumulates at
-//! the loop's iteration rate for the whole period. Measured on VxWorks 7 against
-//! the PVA search engine's 180 s `BEACON_CLEAN_INTERVAL` tick: ~124 live entries
-//! at ~184 B each, released in one batch every 180 s.
+//! That retention is not theoretical. A `select!` arm holding a long-period
+//! `interval` tick re-arms a fresh `Sleep` on every loop iteration and drops it
+//! when another arm wins, so an uncancellable entry accumulates at the loop's
+//! iteration rate for the whole period — for the PVA search engine's 180 s
+//! `BEACON_CLEAN_INTERVAL` tick, every entry since the last tick, released in
+//! one batch every 180 s.
 //!
 //! Cancellation is a property of the *wake* path only.
 //! [`TimerHandle::schedule`] — C `callbackRequestDelayed`

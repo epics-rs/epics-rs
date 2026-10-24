@@ -30,8 +30,8 @@ gate on a single uniform condition:
 - **`tokio_backend`** — the tokio runtime. The hosted default; you get this
   with no flags.
 - **`exec_backend`** — the std-thread background executor (callback pool +
-  delayed timer + scanOnce worker). Unconditional on RTEMS and VxWorks, which
-  have no tokio reactor.
+  delayed timer + scanOnce worker). Unconditional on RTEMS, which has no
+  tokio reactor.
 
 `EXEC_BACKEND` states which one a given build got, so a crate above can pin its
 own copy of the predicate to it with a `const _: () = assert!(…)` —
@@ -59,14 +59,14 @@ meant "everything on". Every `build.rs` that reads it also emits
 `cargo::rerun-if-env-changed`, so changing the value rebuilds what depends on
 it.
 
-## RTEMS and VxWorks
+## RTEMS
 
 The `net` module's socket-bearing submodules — `async_udp_v4` (`tokio_backend`
 only), `iface_map` and `loopback_mcast` (off every embedded target) — are
-host-only: `socket2` does not build for `armv7-rtems-eabihf` or the
-`*-wrs-vxworks*` triples, and the RTEMS CA server uses the separate raw-libc
-socket driver. The wire constants beside them stay on every target, because the PVA
-SEARCH decoder has to embed them on RTEMS too.
+host-only: `socket2` does not build for `armv7-rtems-eabihf`, and the RTEMS
+CA server uses the separate raw-libc socket driver. The wire constants beside
+them stay on every target, because the PVA SEARCH decoder has to embed them on
+RTEMS too.
 
 `./scripts/rtems-check.sh` compiles this crate for the target in both build
 configurations.

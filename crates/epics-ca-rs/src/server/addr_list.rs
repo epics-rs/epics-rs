@@ -354,9 +354,9 @@ fn parse_ipv4_list(list: &str, env_name: &str, default_port: u16) -> Vec<Ipv4Add
 /// C `osiSockDiscoverBroadcastAddresses` with a wildcard match address: one
 /// UDP destination per eligible interface.
 ///
-/// Every target, including RTEMS and VxWorks — the two used to take a stub that
-/// returned nothing, because the enumeration went through `if-addrs`, which
-/// builds for neither. It now goes through
+/// Every target, including RTEMS — it used to take a stub that returned
+/// nothing, because the enumeration went through `if-addrs`, which does not
+/// build for it. It now goes through
 /// [`epics_base_rs::net::iface_v4`], which reaches them via `getifaddrs`.
 /// That stub is why a target IOC could resolve a name only through an
 /// explicitly configured name server: with no interfaces there are no

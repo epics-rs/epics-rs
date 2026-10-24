@@ -9,7 +9,7 @@
 //! crate that gates on the pair derives it again from the same two inputs:
 //! `EPICS_RS_BUILD_EXEC_BACKEND` and the target OS. Reading the variable alone
 //! would be wrong on exactly the case the workspace predicate exists for: on
-//! RTEMS and VxWorks it is unset while `exec_backend` is ON.
+//! RTEMS it is unset while `exec_backend` is ON.
 //!
 //! It also compiles every `src/snl/*.st` with snc-rs to `$OUT_DIR/<stem>.rs`,
 //! which the companion calling `include_program!("<stem>")` includes.
@@ -19,7 +19,7 @@ fn main() {
     println!("cargo::rustc-check-cfg=cfg(epics_embedded_target)");
 
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
-    let embedded_target = matches!(target_os.as_str(), "rtems" | "vxworks");
+    let embedded_target = target_os == "rtems";
     if embedded_target {
         println!("cargo::rustc-cfg=epics_embedded_target");
     }

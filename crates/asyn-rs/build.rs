@@ -1,19 +1,12 @@
-//! Emits `epics_embedded_target` for the reactor-free triples (RTEMS,
-//! VxWorks).
+//! Emits `epics_embedded_target` for the reactor-free target (RTEMS).
 //!
 //! Same three lines as `epics-libcom-rs`, `epics-base-rs`, `epics-ca-rs`,
 //! `epics-pva-rs` and `epics-bridge-rs` already carry, and for the reason
 //! `epics-libcom-rs`'s own build script states: a seam above it gates on this
-//! one capability cfg instead of repeating
-//! `any(target_os = "rtems", target_os = "vxworks")` at each site. Here it
+//! one capability cfg instead of repeating the target predicate at each
+//! site. Here it
 //! selects which serial backend `drivers::mod` mounts — a `Cargo.toml` target
 //! table cannot express the predicate, and a module gate must.
-//!
-//! Note this is deliberately *not* the predicate for the AF_UNIX gate in
-//! `drivers::ip_port`. C turns AF_UNIX off on vxWorks alone
-//! (`drvAsynIPPort.c:63-65`, which excludes `_WIN32` and `vxWorks` but not
-//! `__rtems__`), so that site names `target_os = "vxworks"` directly. The two
-//! are different questions and share no predicate.
 
 fn main() {
     println!("cargo::rustc-check-cfg=cfg(epics_embedded_target)");
@@ -25,7 +18,7 @@ fn main() {
 
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     let target_family = std::env::var("CARGO_CFG_TARGET_FAMILY").unwrap_or_default();
-    let embedded_target = matches!(target_os.as_str(), "rtems" | "vxworks");
+    let embedded_target = target_os == "rtems";
     if embedded_target {
         println!("cargo::rustc-cfg=epics_embedded_target");
     }
@@ -38,7 +31,7 @@ fn main() {
     // A cfg set by a dependency's build script is not visible here, so the
     // fact arrives twice: from `EPICS_RS_BUILD_EXEC_BACKEND` and from the
     // target OS. The variable alone is the wrong predicate on exactly the case
-    // this cfg exists for: on RTEMS and VxWorks it is unset while
+    // this cfg exists for: on RTEMS it is unset while
     // `exec_backend` is ON.
     // Build-time backend selection, from the environment rather than from a
     // cargo feature: a feature that flips a backend is not additive, so
@@ -93,13 +86,13 @@ fn main() {
     // this list against the constants. Named once here so adding a target is
     // one edit rather than one per site, which can disagree.
     //
-    // macOS/iOS and the BSDs are the group C names; both embedded targets join
-    // it — VxWorks (`termios.h:22-52`) and RTEMS (`sys/_termios.h:186-221`)
-    // both define `B300 == 300`. Linux is the counter-example: there the codes
-    // are small encoded integers and `B9600 == 13`.
+    // macOS/iOS and the BSDs are the group C names; RTEMS joins it, since
+    // `sys/_termios.h:186-221` defines `B300 == 300`. Linux is the
+    // counter-example: there the codes are small encoded integers and
+    // `B9600 == 13`.
     if matches!(
         target_os.as_str(),
-        "macos" | "ios" | "freebsd" | "netbsd" | "openbsd" | "dragonfly" | "vxworks" | "rtems"
+        "macos" | "ios" | "freebsd" | "netbsd" | "openbsd" | "dragonfly" | "rtems"
     ) {
         println!("cargo::rustc-cfg=asyn_baud_code_is_rate");
     }
@@ -112,15 +105,9 @@ fn main() {
     // (`drvAsynIPPort.c:63-65`). Named here for the same reason C names it:
     // `drivers::ip_port` tests the condition wherever the answer shows — the
     // enum variant, each transport arm, the connect and its refusal — and so
-    // does C, in both cases because all of them must agree.
-    //
-    // NOT `epics_embedded_target`, and the difference is the point: that macro
-    // excludes `_WIN32` and `vxWorks` but says nothing about `__rtems__`, so
-    // RTEMS keeps AF_UNIX. VxWorks is the one embedded target that loses it,
-    // and `std` compiles `UnixStream` for the triple regardless — so without
-    // this the VxWorks build takes the unix arm, offers `unix://`, and fails
-    // at connect on a socket family C never offered there.
-    if unix && target_os != "vxworks" {
+    // does C, in both cases because all of them must agree. RTEMS keeps
+    // AF_UNIX: the macro says nothing about `__rtems__`.
+    if unix {
         println!("cargo::rustc-cfg=asyn_af_unix");
     }
 }

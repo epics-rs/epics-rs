@@ -5160,13 +5160,10 @@ impl PvDatabase {
     /// target is already counted in the wait-set — and nothing
     /// downstream will ever `leave` for it, because the only `leave`s are on
     /// paths that ran a cycle. The set never drains, the completion oneshot
-    /// never fires, and the client's `CA_PROTO_WRITE_NOTIFY` gets no reply
-    /// (measured on x86_64-wrs-vxworks while the port still refused entries
-    /// past a 16-hop depth bound: the first put into a longer chain never
-    /// replied over 90s, and `RTEMS:E8:L16` was left
-    /// holding a wait-set that could never drain — after which every later put
-    /// completed, because `join_put_notify`'s `notify.is_none()` guard stops a
-    /// record that already holds a stale set from joining a live one).
+    /// never fires, and the client's `CA_PROTO_WRITE_NOTIFY` gets no reply.
+    /// Only the first put strands a set: `join_put_notify`'s `notify.is_none()`
+    /// guard stops a record that already holds a stale set from joining a
+    /// live one, so every later put completes.
     ///
     /// C decides this per exit path with one flag and one finalizer
     /// (`dbAccess.c:494` `callNotifyCompletion = FALSE`, `:576` disabled,

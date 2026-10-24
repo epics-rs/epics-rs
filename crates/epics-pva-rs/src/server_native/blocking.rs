@@ -141,7 +141,7 @@
 //!
 //! Beacons and the per-NIC send bundle need the interface enumerator, and the
 //! loopback-multicast ORIGIN_TAG channel needs socket options, that do not
-//! cross to RTEMS or VxWorks (no `socket2` there), so an embedded build has no
+//! cross to RTEMS (no `socket2` there), so an embedded build has no
 //! ORIGIN_TAG: every datagram is `Direct`. A client that unicasts or broadcasts
 //! a SEARCH to this server's port is answered; one that relies on being told we
 //! exist is not, yet. The hosted build joins the group on its one search socket
@@ -557,11 +557,7 @@ pub(super) fn serve_connection_blocking(
         .set_read_timeout(Some(config.op_timeout))
         .map_err(PvaError::Io)?;
     let send_timeout = config.send_timeout;
-    // No SO_SNDTIMEO. It is not portable — VxWorks' socket stack does not
-    // implement it and returns ENOPROTOOPT (errno 42) on an otherwise-good
-    // accepted socket, which closed every VxWorks PVA connection before the
-    // first byte (SET_BYTE_ORDER) went out when it was propagated fatally
-    // (measured on target). It is also no longer needed on any target:
+    // No SO_SNDTIMEO: it is not needed on any target:
     // `blocking_io::write_frame_deadline` waits for writability against
     // `send_timeout` itself, so the per-frame bound is the same here as it is
     // for the blocking clients, and `handle_connection_io`'s

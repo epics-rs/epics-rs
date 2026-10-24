@@ -34,9 +34,8 @@ use crate::{asyn_trace, asyn_trace_io};
 /// - `UDP*` → UDP + `SO_BROADCAST` (C line 379-382, NOT multicast)
 /// - `UDP*&` → UDP + `SO_BROADCAST` + `SO_REUSEPORT` (C line 383-387)
 /// - `unix://path` → Unix domain socket. Present wherever C defines
-///   `HAS_AF_UNIX` — every unix but VxWorks, which `drvAsynIPPort.c:63-65`
-///   excludes by name. RTEMS keeps it; C excludes only `_WIN32` and
-///   `vxWorks`.
+///   `HAS_AF_UNIX` (`drvAsynIPPort.c:63-65`) — every unix, RTEMS included;
+///   C excludes only `_WIN32` and `vxWorks` by name.
 /// - `HTTP` → TCP + `FLAG_CONNECT_PER_TRANSACTION` (C line 368-371)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum IpProtocol {
@@ -299,7 +298,6 @@ enum IpIoInner {
 /// `newlib/rtems` glob collision that once made a bare `libc::MSG_DONTWAIT`
 /// ambiguous on `armv7-rtems-eabihf` was removed by the pinned `libc` fork in
 /// `6f64e70d`, so the bare name compiles and is correct there today.
-/// VxWorks 7 defines it at this same value (`libc` `src/vxworks/mod.rs:1031`).
 #[cfg(target_os = "rtems")]
 const SEND_DONTWAIT: libc::c_int = 0x0080;
 #[cfg(all(unix, not(target_os = "rtems")))]
@@ -319,13 +317,10 @@ const SEND_DONTWAIT: libc::c_int = libc::MSG_DONTWAIT;
 ///
 /// C parity, and why the write bound is not `SO_SNDTIMEO`: `drvAsynIPPort.c`
 /// compiles the `setsockopt(SO_SNDTIMEO)` block only under `USE_SOCKTIMEOUT`,
-/// which is `#if defined(__rtems__)` (`:71-72`). Every other target — vxWorks
-/// included, through its own `FAKE_POLL` (`:75-76`) — takes `USE_POLL` (`:74`),
-/// where `writeIt` polls `POLLOUT` for `writePollmsec` (`:682-701`) and then
-/// sends. This port armed `SO_SNDTIMEO` on all platforms instead, and VxWorks 7
-/// does not implement the option: `setsockopt` fails `ENOPROTOOPT` (errno 42,
-/// measured on target), so the `?` on it failed every asyn IP write there
-/// before a byte was sent.
+/// which is `#if defined(__rtems__)` (`:71-72`). Every other target takes
+/// `USE_POLL` (`:74`), where `writeIt` polls `POLLOUT` for `writePollmsec`
+/// (`:682-701`) and then sends. The poll is the bound on every target here, so
+/// the write path has one rule rather than an RTEMS branch.
 pub(super) trait WaitWritable {
     /// `None` is a wait with no deadline — C's negative `pasynUser->timeout`,
     /// which reaches `poll` as its own `-1` (drvAsynIPPort.c:662-664).
@@ -340,10 +335,10 @@ pub(super) trait WaitWritable {
 /// below is kept on top of it, not instead of it.
 ///
 /// It was instead of it, on the reasoning that a per-send flag leaves the file
-/// description alone and so leaves the `SO_RCVTIMEO` read bound — which VxWorks
-/// implements — in place. That traded a bound every target honours for one that
-/// only some do; the read side now polls as C's does ([`BoundNextRead`]), which
-/// is the price, and it is the smaller one.
+/// description alone and so leaves the `SO_RCVTIMEO` read bound in place. That
+/// traded a bound every target honours for a socket option; the read side now
+/// polls as C's does ([`BoundNextRead`]), which is the price, and it is the
+/// smaller one.
 ///
 /// The wait alone is not enough to make the deadline hold: a blocking `write` on
 /// a stream socket does not return a short count when the send buffer fills, it
@@ -828,8 +823,7 @@ impl IpIoState {
         // assuming the whole buffer went out.
         // No arm arms `SO_SNDTIMEO`: the deadline is enforced by the wait in
         // `write_with_retry`, which is what C does everywhere but RTEMS. See
-        // `WaitWritable` — VxWorks 7 rejects the option outright, so setting it
-        // here failed every write on that target before a byte was sent.
+        // `WaitWritable`.
         match inner {
             IpIoInner::Tcp(stream) => write_with_retry(stream, data, poll, None),
             IpIoInner::Udp(socket, peer) => {
@@ -3792,19 +3786,15 @@ mod tests {
 
     /// The write path bounds itself with a wait, and arms no `SO_SNDTIMEO`.
     ///
-    /// VxWorks 7 does not implement `SO_SNDTIMEO` — `setsockopt` fails with
-    /// `ENOPROTOOPT` (errno 42), measured on target — and this driver used to
-    /// arm the option on every write and propagate that failure with `?`, so
-    /// every asyn IP write there failed before a byte was sent. C never arms it
-    /// on VxWorks either: `drvAsynIPPort.c` compiles the option only under
-    /// `USE_SOCKTIMEOUT`, which is `#if defined(__rtems__)` (`:71-72`), while
-    /// vxWorks takes `USE_POLL` (`:74-76`) and bounds `writeIt` with
-    /// `poll(POLLOUT, writePollmsec)` (`:684-701`) instead.
+    /// This driver used to arm the option on every write and propagate a
+    /// `setsockopt` failure with `?`. C's write bound is
+    /// `poll(POLLOUT, writePollmsec)` (`:684-701`) under `USE_POLL`; it
+    /// compiles the option only under `USE_SOCKTIMEOUT`, which is
+    /// `#if defined(__rtems__)` (`drvAsynIPPort.c:71-72`).
     ///
-    /// Host proxy for a target-only failure: Linux implements the option, so
-    /// the pre-fix code also returned Timeout here. What fails before the fix
-    /// is the `write_timeout()` assertion — arming the option AT ALL is the
-    /// defect.
+    /// Linux implements the option, so the pre-fix code also returned Timeout
+    /// here. What fails before the fix is the `write_timeout()` assertion —
+    /// arming the option AT ALL is the defect.
     ///
     /// Darwin included, and it is the case that proves the mode is what carries
     /// the bound: there `SO_SNDTIMEO` is absent by this test's own construction
@@ -3883,8 +3873,8 @@ mod tests {
         assert_eq!(
             stream.write_timeout().unwrap(),
             None,
-            "the write path must not arm SO_SNDTIMEO — VxWorks 7 rejects it \
-             with ENOPROTOOPT and C only sets it under __rtems__"
+            "the write path must not arm SO_SNDTIMEO — C only sets it under \
+             __rtems__"
         );
 
         let _ = release.send(());

@@ -70,48 +70,92 @@ pub fn map_indices<R: Send>(n: usize, f: impl Fn(usize) -> R + Sync) -> Vec<R> {
         .collect()
 }
 
-/// `f` of each `len`-element chunk of `v`, in order, as [`map_indices`]
+/// The chunks a pass over a buffer splits into: the fewest that keep each
+/// within a maximum length, all a whole number of units and as equal as
+/// that allows.
+///
+/// Equal, so no chunk is a sliver: a fixed length leaves the remainder as a
+/// last chunk, and at 257x257 a 65536 split was 65536 elements and 513, a
+/// worker woken for 0.8% of the pass, 1.04-1.27x serial back-to-back for
+/// the histograms against 0.56-0.68x in halves.
+#[derive(Clone, Copy, Debug)]
+pub struct Split {
+    len: usize,
+    unit: usize,
+    units: usize,
+    chunks: usize,
+}
+
+impl Split {
+    /// `len` elements in units of `unit`, the last unit possibly short, cut
+    /// into chunks of at most `max_len` elements, or of one unit where a
+    /// unit is longer.
+    pub fn new(len: usize, unit: usize, max_len: usize) -> Self {
+        let unit = unit.max(1);
+        let units = len.div_ceil(unit);
+        Self {
+            len,
+            unit,
+            units,
+            chunks: units.div_ceil((max_len / unit).max(1)),
+        }
+    }
+
+    pub fn chunks(&self) -> usize {
+        self.chunks
+    }
+
+    /// The elements of chunk `i`: the first `units % chunks` chunks take
+    /// one unit more than the rest.
+    fn range(&self, i: usize) -> std::ops::Range<usize> {
+        let (q, r) = (self.units / self.chunks, self.units % self.chunks);
+        let start = i * q + i.min(r);
+        start * self.unit..self.len.min((start + q + usize::from(i < r)) * self.unit)
+    }
+}
+
+/// `f` of each chunk of `v` that `split` cuts, in order, as [`map_indices`]
 /// runs them.
-pub fn map_chunks<T: Sync, R: Send>(v: &[T], len: usize, f: impl Fn(&[T]) -> R + Sync) -> Vec<R> {
-    map_indices(v.len().div_ceil(len), |i| {
-        f(&v[i * len..v.len().min((i + 1) * len)])
-    })
+pub fn map_chunks<T: Sync, R: Send>(v: &[T], split: Split, f: impl Fn(&[T]) -> R + Sync) -> Vec<R> {
+    map_indices(split.chunks, |i| f(&v[split.range(i)]))
 }
 
 /// One `S` per thread that took chunks of `v`, each from `init()` and then
-/// `f(&mut s, chunk)` for every `len`-element chunk that thread claimed, as
+/// `f(&mut s, chunk)` for every chunk `split` cuts that thread claimed, as
 /// [`map_indices`] claims them.
 pub fn fold_chunks<T: Sync, S: Send>(
     v: &[T],
-    len: usize,
+    split: Split,
     init: impl Fn() -> S + Sync,
     f: impl Fn(&mut S, &[T]) + Sync,
 ) -> Vec<S> {
     let states = parking_lot::Mutex::new(Vec::new());
-    claim::run(v.len().div_ceil(len), &|claims| {
+    claim::run(split.chunks, &|claims| {
         let mut state = None;
         for i in claims {
-            f(
-                state.get_or_insert_with(&init),
-                &v[i * len..v.len().min((i + 1) * len)],
-            );
+            f(state.get_or_insert_with(&init), &v[split.range(i)]);
         }
         states.lock().extend(state);
     });
     states.into_inner()
 }
 
-/// `f(i, chunk)` for each `len`-element chunk `i` of `out`, as
-/// [`map_indices`] claims them.
-pub fn for_each_chunk_mut<T: Send>(out: &mut [T], len: usize, f: impl Fn(usize, &mut [T]) + Sync) {
-    let n = out.len();
+/// `f(start, chunk)` for each chunk of `out` that `split` cuts, `start` its
+/// first element's index in `out`, as [`map_indices`] claims them.
+pub fn for_each_chunk_mut<T: Send>(
+    out: &mut [T],
+    split: Split,
+    f: impl Fn(usize, &mut [T]) + Sync,
+) {
+    assert!(split.len <= out.len());
     let base = Disjoint(out.as_mut_ptr());
-    claim::run(n.div_ceil(len), &|claims| {
+    claim::run(split.chunks, &|claims| {
         for i in claims {
-            let start = i * len;
-            // SAFETY: `i` is claimed once, so its chunk is borrowed once.
-            f(i, unsafe {
-                std::slice::from_raw_parts_mut(base.at(start), len.min(n - start))
+            let range = split.range(i);
+            // SAFETY: `i` is claimed once and the chunks of a split are
+            // disjoint and inside `out`, so its chunk is borrowed once.
+            f(range.start, unsafe {
+                std::slice::from_raw_parts_mut(base.at(range.start), range.len())
             });
         }
     });
@@ -518,7 +562,7 @@ mod affinity {
 mod tests {
     #[cfg(feature = "parallel")]
     use super::{Pools, l3_domains};
-    use super::{pool_wins, takes_at_least};
+    use super::{Split, pool_wins, takes_at_least};
     #[cfg(feature = "parallel")]
     use std::path::Path;
 
@@ -628,6 +672,60 @@ mod tests {
         assert_eq!(pools.domains[1].cpus, [2, 3, 6, 9]);
     }
 
+    /// The chunk lengths of `split` over `len` elements in `unit`s, after
+    /// checking that they tile `0..len` in order, each starting on a unit.
+    fn lengths(split: Split, len: usize, unit: usize) -> Vec<usize> {
+        let mut at = 0;
+        let lens = (0..split.chunks())
+            .map(|i| {
+                let r = split.range(i);
+                assert_eq!((r.start, r.start % unit), (at, 0));
+                at = r.end;
+                r.len()
+            })
+            .collect();
+        assert_eq!(at, len);
+        lens
+    }
+
+    #[test]
+    fn a_split_cuts_the_fewest_equal_chunks_of_whole_units() {
+        // 257x257 in chunks of at most 65536: halves, not 65536 and 513.
+        assert_eq!(
+            lengths(Split::new(66049, 1, 1 << 16), 66049, 1),
+            [33025, 33024]
+        );
+        assert_eq!(
+            lengths(Split::new(4 << 16, 1, 1 << 16), 4 << 16, 1),
+            [1 << 16; 4]
+        );
+        assert_eq!(Split::new(1 << 16, 1, 1 << 16).chunks(), 1);
+        // 504 rows of 504, at most 130 to a chunk: four of 126, not 130 x 3 + 114.
+        assert_eq!(
+            lengths(Split::new(504 * 504, 504, 1 << 16), 504 * 504, 504),
+            [126 * 504; 4]
+        );
+        // A unit longer than the maximum goes alone, and a short last unit
+        // ends the last chunk.
+        assert_eq!(lengths(Split::new(10, 4, 3), 10, 4), [4, 4, 2]);
+        assert!(lengths(Split::new(0, 1, 7), 0, 1).is_empty());
+        for len in 0..120 {
+            for unit in 1..6 {
+                for max_len in 1..40 {
+                    let lens = lengths(Split::new(len, unit, max_len), len, unit);
+                    let per = (max_len / unit).max(1) * unit;
+                    // Each within the maximum, and one chunk fewer would not be.
+                    assert!(lens.iter().all(|&l| l <= per));
+                    assert!(lens.len() <= 1 || len > (lens.len() - 1) * per);
+                    // Within a unit of each other, a short last unit counted whole.
+                    let units: Vec<usize> = lens.iter().map(|l| l.div_ceil(unit)).collect();
+                    let (lo, hi) = (units.iter().min(), units.iter().max());
+                    assert!(lo.zip(hi).is_none_or(|(lo, hi)| hi - lo <= 1));
+                }
+            }
+        }
+    }
+
     #[test]
     fn map_indices_returns_every_index_in_order() {
         for n in [0, 1, 2, 1000] {
@@ -635,16 +733,18 @@ mod tests {
             assert_eq!(got, (0..n).map(|i| i * 3).collect::<Vec<_>>());
         }
         let v: Vec<u32> = (0..1000).collect();
-        let sums = super::map_chunks(&v, 7, |c| c.iter().sum::<u32>());
+        let split = Split::new(v.len(), 1, 7);
+        let sums = super::map_chunks(&v, split, |c| c.iter().sum::<u32>());
+        let each = || (0..split.chunks()).map(|i| split.range(i));
         assert_eq!(
             sums,
-            v.chunks(7).map(|c| c.iter().sum()).collect::<Vec<u32>>()
+            each().map(|r| v[r].iter().sum()).collect::<Vec<u32>>()
         );
-        let counts = super::fold_chunks(&v, 7, || 0usize, |n, c| *n += c.len());
+        let counts = super::fold_chunks(&v, split, || 0usize, |n, c| *n += c.len());
         assert_eq!(counts.iter().sum::<usize>(), 1000);
-        let mut out = vec![0usize; 1000];
-        super::for_each_chunk_mut(&mut out, 7, |i, c| c.fill(i));
-        assert!(out.iter().enumerate().all(|(k, &i)| i == k / 7));
+        let mut out = vec![usize::MAX; 1000];
+        super::for_each_chunk_mut(&mut out, split, |at, c| c.fill(at));
+        assert!(each().all(|r| out[r.clone()].iter().all(|&at| at == r.start)));
         let nested = super::map_indices(8, |i| {
             super::map_indices(8, |j| i * j).iter().sum::<usize>()
         });

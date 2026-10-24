@@ -266,9 +266,12 @@ fn demosaic<T: BayerPixel>(src: &[T], w: usize, h: usize, phase: BayerPhase, out
     // measured faster from 30 us at every frame gap (u16 200x200 0.74x
     // serial back-to-back, 0.97x 10 ms apart), but not at 128x128 10 ms
     // apart (1.12x), where it ends before a sleeping worker wakes.
-    if par_util::pool_wins(n, 800, 30, h) && w > 0 {
-        par_util::for_each_chunk_mut(out, w * 3, row);
-        return;
+    if w > 0 {
+        let split = par_util::Split::new(out.len(), w * 3, w * 3);
+        if par_util::pool_wins(n, 800, 30, split.chunks()) {
+            par_util::for_each_chunk_mut(out, split, |at, out_row| row(at / (w * 3), out_row));
+            return;
+        }
     }
     if w > 0 {
         for (y, out_row) in out.chunks_mut(w * 3).enumerate() {

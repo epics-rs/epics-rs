@@ -848,9 +848,10 @@ impl ProcessFrame {
             // faster from 1300 us (f64 2048x2048 0.88x serial, u16 1.00x;
             // u16 1024x1024 1.10x), as the next pass reads back what other
             // cores wrote.
-            if par_util::pool_wins(values.len(), 330, 1300, values.len().div_ceil(PAR_CHUNK)) {
-                par_util::for_each_chunk_mut(values, PAR_CHUNK, |k, chunk| {
-                    ops.slice(k * PAR_CHUNK, chunk.len()).apply(chunk)
+            let split = par_util::Split::new(values.len(), 1, PAR_CHUNK);
+            if par_util::pool_wins(values.len(), 330, 1300, split.chunks()) {
+                par_util::for_each_chunk_mut(values, split, |at, chunk| {
+                    ops.slice(at, chunk.len()).apply(chunk)
                 });
             } else {
                 ops.apply(values);

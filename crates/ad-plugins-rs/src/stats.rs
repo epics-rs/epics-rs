@@ -1014,21 +1014,18 @@ fn stats_of<T: StatsElem + Send + Sync>(
     let n = v.len() as f64;
     let (range, variance);
     #[cfg(feature = "parallel")]
+    let split = par_util::Split::new(v.len(), 1, PAR_CHUNK);
+    #[cfg(feature = "parallel")]
     // Both passes take 190 ps + 25 ps per element byte serially at these
     // sizes; the split measured faster from 80 us (u16 600x600 0.85x serial,
     // f64 512x512 0.83x, u8 724x724 0.55x).
-    if par_util::pool_wins(
-        v.len(),
-        190 + 25 * size_of::<T>(),
-        80,
-        v.len().div_ceil(PAR_CHUNK),
-    ) {
-        range = (par_util::map_chunks(v, PAR_CHUNK, T::range).into_iter())
+    if par_util::pool_wins(v.len(), 190 + 25 * size_of::<T>(), 80, split.chunks()) {
+        range = (par_util::map_chunks(v, split, T::range).into_iter())
             .reduce(merge_range)
             .expect("a non-empty slice has at least one chunk");
         let mean = range.total / n;
         variance =
-            (par_util::map_chunks(v, PAR_CHUNK, |c| T::variance(c, mean)).into_iter()).sum::<f64>();
+            (par_util::map_chunks(v, split, |c| T::variance(c, mean)).into_iter()).sum::<f64>();
     } else {
         range = T::range(v);
         variance = T::variance(v, range.total / n);
@@ -1290,19 +1287,15 @@ fn project_of<T: StatsElem + Sync>(
 ) -> Projection {
     let v = &v[..x_size * y_size];
     #[cfg(feature = "parallel")]
+    let split = par_util::Split::new(v.len(), x_size, PAR_CHUNK);
+    #[cfg(feature = "parallel")]
     // At least 280 ps per element serially (i8 at row widths a multiple of
     // 64; up to 480 elsewhere), but 10 ms apart the split loses below about
     // 250K elements whatever the type costs (u8 448x448 1.11x serial, f32
     // 1.16x, u16 480x480 1.03x); 71 us at 280 ps is 504x504, from which
     // every type measured faster (0.69-0.87x).
-    if par_util::pool_wins(
-        v.len(),
-        280,
-        71,
-        y_size.div_ceil((PAR_CHUNK / x_size).max(1)),
-    ) {
-        let band = (PAR_CHUNK / x_size).max(1) * x_size;
-        return (par_util::map_chunks(v, band, |band| project_band(band, x_size, threshold)))
+    if par_util::pool_wins(v.len(), 280, 71, split.chunks()) {
+        return (par_util::map_chunks(v, split, |band| project_band(band, x_size, threshold)))
             .into_iter()
             .reduce(Projection::append)
             .unwrap_or_else(|| Projection::zeroed(x_size, y_size));
@@ -1626,6 +1619,8 @@ fn histogram_of<T: StatsElem + Sync>(
 ) -> HistCounts {
     let map = SlotMap::new::<T>(hist_size, hist_min, hist_max);
     #[cfg(feature = "parallel")]
+    let split = par_util::Split::new(v.len(), 1, PAR_CHUNK);
+    #[cfg(feature = "parallel")]
     // At least 500 ps per element serially through the table (u16; u8 870
     // where values crowd few bins), 1300 through the formula (f32, i32; f64
     // 2000); the split measured faster from 60 us (u16 362x362 0.95x serial,
@@ -1634,11 +1629,11 @@ fn histogram_of<T: StatsElem + Sync>(
         v.len(),
         if T::TABLE_LEN.is_some() { 500 } else { 1300 },
         60,
-        v.len().div_ceil(PAR_CHUNK),
+        split.chunks(),
     ) {
         return (par_util::fold_chunks(
             v,
-            PAR_CHUNK,
+            split,
             || HistCounts::zeroed(hist_size),
             |acc, chunk| map.count(acc, chunk),
         ))

@@ -20,29 +20,29 @@ chrono = "0.4"
 # defaults from the host name, exactly as C's `iocshRegisterCommon` does.
 hostname = "0.4"
 
-# tokio: the hosted build uses the full runtime; the RTEMS/VxWorks build drops
-# the `net`, `signal`, and `process` features — the ones that pull `mio`,
+# tokio: the hosted build uses the full runtime; the RTEMS build drops the
+# `net`, `signal`, and `process` features — the ones that pull `mio`,
 # `signal-hook-registry`, and `socket2`, none of which build for
-# armv7-rtems-eabihf or the `*-wrs-vxworks*` triples. Declared per-target
-# rather than in shared `[dependencies]` because Cargo UNIONS a dependency's
-# features across all matching tables, so a shared `full` would re-add the
-# dropped features on either embedded target. The retained set
+# armv7-rtems-eabihf. Declared per-target rather than in shared
+# `[dependencies]` because Cargo UNIONS a dependency's features across all
+# matching tables, so a shared `full` would re-add the dropped features on the
+# embedded target. The retained set
 # (rt/rt-multi-thread/time/sync/macros/io/fs) keeps every non-net tokio API the
 # always-compiled code uses (Handle, block_in_place, select!, sync primitives)
 # compiling there; those paths are unused (the seam routes to the background
 # executor) but must still type-check for `--lib`.
-[target.'cfg(not(any(target_os = "rtems", target_os = "vxworks")))'.dependencies]
+[target.'cfg(not(target_os = "rtems"))'.dependencies]
 tokio = { version = "1", features = ["full"] }
 # `socket2` backs the async UDP stack (`net::async_udp_v4` /
 # `net::iface_map`). Host-only for the same reason the whole socket half of
-# `net` is: it does not build for armv7-rtems-eabihf or the `*-wrs-vxworks*`
-# triples, and the embedded CA server uses the separate S1 raw-libc socket
-# driver instead. The module gate in `net/mod.rs` matches this table
+# `net` is: it does not build for armv7-rtems-eabihf, and the embedded CA
+# server uses the separate S1 raw-libc socket driver instead. The module gate
+# in `net/mod.rs` matches this table
 # (`epics_embedded_target`, the `build.rs`-emitted cfg `Cargo.toml` target
 # tables cannot express directly).
 socket2 = { version = "0.5", features = ["all"] }
 
-[target.'cfg(any(target_os = "rtems", target_os = "vxworks"))'.dependencies]
+[target.'cfg(target_os = "rtems")'.dependencies]
 tokio = { version = "1", default-features = false, features = [
     "fs",
     "io-util",
@@ -80,22 +80,6 @@ windows-sys = { version = "0.61", features = [
     "Win32_Networking_WinSock",
     "Win32_System_Threading",
 ] }
-
-# VxWorks only: `runtime::task::enter_ioc_thread` announces each IOC thread to
-# the statistics funnel's thread census. VxWorks 7 gives an RTP no task
-# enumerator at all (`taskIdListGet` and `taskEach` are kernel-mode only), so
-# unlike RTEMS — where `rtems_task_iterate` walks the kernel's own table — the
-# list has to be built as the threads start. `current_thread_stack_low` reads
-# the task's stack end from the `TASK_DESC` this package binds.
-#
-# Target-gated rather than a plain dependency, and the gate is doing real work:
-# on RTEMS `epics-rtems-boot`'s build script emits an *image* link contract
-# (`rustc-link-arg`, the pre-group libraries) that propagates to every dependent
-# binary, and this package must stay takeable by a consumer that brings its own
-# boot glue. On VxWorks that same package compiles no C and emits no link
-# contract — the edge costs one module and nothing else.
-[target.'cfg(target_os = "vxworks")'.dependencies]
-epics-rtems-boot = { workspace = true }
 
 [dev-dependencies]
 # Dev-only and `path`-only, so `cargo package` drops it from the uploaded

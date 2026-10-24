@@ -3,16 +3,15 @@
 //!
 //! # Why this exists at all
 //!
-//! `mio` has no selector for either embedded triple. Measured against
-//! mio 1.2.3 with `-Zbuild-std`: `armv7-rtems-eabihf` and `x86_64-wrs-vxworks`
-//! both fail at `error[E0583]: file not found for module 'selector'`, because
-//! `mio/src/sys/unix/mod.rs` maps `target_os` to a selector file and neither
-//! target appears in any of its lists. Forcing mio's own escape hatches
-//! (`mio_unsupported_force_poll_poll`, `mio_unsupported_force_waker_pipe`)
-//! gets the two down to 8 and 9 errors respectively, all of them missing
-//! `libc` items (`accept4`, `SOCK_NONBLOCK`, `POLLRDNORM`, `sin_len`) — so the
-//! path through mio is a set of PRs across three upstream crates, not a build
-//! flag. Until those land this module is the readiness layer.
+//! `mio` has no selector for the embedded triple. Measured against mio 1.2.3
+//! with `-Zbuild-std`: `armv7-rtems-eabihf` fails at `error[E0583]: file not
+//! found for module 'selector'`, because `mio/src/sys/unix/mod.rs` maps
+//! `target_os` to a selector file and RTEMS appears in none of its lists.
+//! Forcing mio's own escape hatches (`mio_unsupported_force_poll_poll`,
+//! `mio_unsupported_force_waker_pipe`) gets it down to 8 errors, all of them
+//! missing `libc` items — so the path through mio is a set of PRs across three
+//! upstream crates, not a build flag. Until those land this module is the
+//! readiness layer.
 //!
 //! It is deliberately **not** a mio clone. It carries exactly what a PVA
 //! server connection needs: level-triggered read/write readiness on sockets,
@@ -265,13 +264,11 @@ pub enum Interest {
 /// The largest fd this module can wait on, as a bit index into the `select`
 /// fd set.
 ///
-/// `select` addresses fds by bit position, so the cost of a high fd is a
-/// larger bitmap and nothing else. 4096 covers both embedded triples with
-/// room: `x86_64-wrs-vxworks`'s limit is the VSB's `_WRS_CONFIG_FD_SET_SIZE`,
-/// 2048 in the SDK measured here, and RTEMS sizes its own set from
-/// `CONFIGURE_MAXIMUM_FILE_DESCRIPTORS`. An fd at or above this is refused at
-/// registration with `EMFILE` rather than silently dropped, because a dropped
-/// interest is a connection that hangs forever.
+/// `select` addresses fds by bit position, so the cost of a high fd is a larger
+/// bitmap and nothing else. 4096 covers the embedded triple with room: RTEMS
+/// sizes its own set from `CONFIGURE_MAXIMUM_FILE_DESCRIPTORS`. An fd at or
+/// above this is refused at registration with `EMFILE` rather than silently
+/// dropped, because a dropped interest is a connection that hangs forever.
 pub const FD_CAPACITY: usize = 4096;
 
 /// One thing to tell the kernel about one direction on one fd — libevent's

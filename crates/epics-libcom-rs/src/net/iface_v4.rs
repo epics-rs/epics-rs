@@ -1,5 +1,5 @@
 //! IPv4 interface enumeration, on every target the workspace builds for —
-//! RTEMS and VxWorks included.
+//! RTEMS included.
 //!
 //! # Why this exists
 //!
@@ -8,7 +8,7 @@
 //! broadcast address per up, non-loopback interface. Until this module existed
 //! there was no way to compute that list on `epics_embedded_target`, because
 //! the one enumerator in the workspace went through the `if-addrs` crate, which
-//! does not build for `armv7-rtems-eabihf` or the `*-wrs-vxworks*` triples. So
+//! does not build for `armv7-rtems-eabihf`. So
 //! `epics-ca-rs::server::addr_list` carried three `#[cfg(epics_embedded_target)]`
 //! stubs that returned "no interfaces", and a target IOC could reach a server
 //! only through an explicitly configured name server.
@@ -16,9 +16,8 @@
 //! It lives in `epics-libcom-rs` for the reason `runtime::socket` does:
 //! `epics-ca-rs` and `epics-pva-rs` both need it, neither may depend on the
 //! other, and this is the one crate both reach. It is also the first entry in
-//! `CRATES` in both `scripts/rtems-check.sh` and `scripts/vxworks-check.sh`, so
-//! the `unsafe` below is compiled for both embedded triples by gates that
-//! already run.
+//! `CRATES` in `scripts/rtems-check.sh`, so the `unsafe` below is compiled for
+//! the embedded triple by a gate that already runs.
 //!
 //! # `getifaddrs`, not `SIOCGIFCONF`
 //!
@@ -30,35 +29,33 @@
 //!   one-line `#include` of it.
 //! * `libcom/src/osi/osdNetIfConf.c` — `ioctl(SIOCGIFCONF)` walking a
 //!   `struct ifreq` array. Reached through `os/default/osdNetIntf.c`, which is
-//!   what RTEMS and vxWorks take: neither has an `osdNetIntf.c` of its own.
+//!   what RTEMS takes: it has no `osdNetIntf.c` of its own.
 //!
 //! The two compute the same list — same `IFF_UP` / `IFF_LOOPBACK` rejections,
 //! same `IFF_BROADCAST`-else-`IFF_POINTOPOINT` destination choice — and this
-//! module reproduces the `getifaddrs` one on all targets, including the two
+//! module reproduces the `getifaddrs` one on all targets, including RTEMS,
 //! where C takes the `SIOCGIFCONF` one.
 //!
-//! That is a deliberate deviation, and the reason is that both embedded targets
-//! *do* ship `getifaddrs`; C's selection predates that rather than reflecting
-//! it. Measured headers, not assumed:
+//! That is a deliberate deviation, and the reason is that RTEMS *does* ship
+//! `getifaddrs`; C's selection predates that rather than reflecting it.
+//! Measured headers, not assumed:
 //!
 //! | target | header | declared | defined in |
 //! |---|---|---|---|
 //! | **RTEMS 6** (`armv7-rtems-eabihf`) | `arm-rtems6/<bsp>/lib/include/ifaddrs.h` | yes | `libbsd.a` |
 //! | RTEMS 5 | `arm-rtems5/<bsp>/lib/include/ifaddrs.h` | yes | `libbsd.a` |
 //! | RTEMS 7 | `arm-rtems7/<bsp>/lib/include/ifaddrs.h` | yes | `libbsd.a` |
-//! | **VxWorks 7** (`*-wrs-vxworks`) | `vxsdk/sysroot/usr/h/public/net/ifaddrs.h` | yes | `libnet.a` |
 //!
-//! The two bold rows are the triples this workspace builds; the RTEMS 5 and 7
+//! The bold row is the triple this workspace builds; the RTEMS 5 and 7
 //! rows are there because the struct is unchanged across all three, so an RTEMS
 //! version bump is not a layout risk. "defined in" is `nm --defined-only`, not
 //! the header — a declaration the image cannot link is what a `cargo check`
 //! gate would have missed.
 //!
-//! Taking it avoids re-deriving the BSD `_IOWR` request encoding — on VxWorks
-//! that is a *different* encoding again (`VX_IOWR`, `net/ioctl.h`), so the
-//! `SIOCGIFCONF` route would have been two hand-built ioctl number schemes plus
-//! two `struct ifreq` layouts, where `getifaddrs` is one struct that all three
-//! platforms agree on byte for byte (see the `sys` module below).
+//! Taking it avoids re-deriving the BSD `_IOWR` request encoding and a
+//! hand-built `struct ifreq` layout, where `getifaddrs` is one struct that
+//! RTEMS and the hosted platforms agree on byte for byte (see the `sys` module
+//! below).
 //!
 //! # What is *not* here
 //!
@@ -71,12 +68,10 @@
 use std::io;
 use std::net::Ipv4Addr;
 
-/// Interface flags this module reads. Values are the BSD set, and are the same
-/// three-way agreement the struct layout is: `libc`'s newlib module has
+/// Interface flags this module reads. Values are the BSD set, and the same on
+/// every platform this module builds for: `libc`'s newlib module has
 /// `IFF_UP = 0x1`, `IFF_BROADCAST = 0x2`, `IFF_LOOPBACK = 0x8`,
-/// `IFF_POINTOPOINT = 0x10`, VxWorks' `net/if.h:192-196` has the same four
-/// values, and so does Linux. They are restated here rather than taken from
-/// `libc` because `libc` does not define them for VxWorks at all.
+/// `IFF_POINTOPOINT = 0x10`, and so does Linux.
 pub mod flags {
     /// Interface is administratively up. C skips everything without it
     /// (`osdNetIfAddrs.c:100`).
@@ -270,12 +265,11 @@ pub fn osi_local_addr() -> Ipv4Addr {
 mod sys {
     //! Unix, hosted and embedded alike: `getifaddrs(3)`.
     //!
-    //! # One struct for five platforms
+    //! # One struct for every platform
     //!
     //! [`IfAddrs`] is declared here rather than taken from `libc` because
-    //! `libc` does not have it on either embedded target: `src/unix/newlib`
-    //! declares no `ifaddrs` at all, and `src/vxworks/mod.rs` declares neither
-    //! the struct nor the function. Declaring it *only* there and using
+    //! `libc` does not have it on the embedded target: `src/unix/newlib`
+    //! declares no `ifaddrs` at all. Declaring it *only* there and using
     //! `libc::ifaddrs` elsewhere would mean two spellings of one walk — and two
     //! spellings is what the `libc` field name forces anyway, since Linux calls
     //! the sixth field `ifa_ifu` and BSD calls it `ifa_dstaddr`.
@@ -294,7 +288,6 @@ mod sys {
     //! |---|---|
     //! | Linux | `libc` `src/unix/linux_like/mod.rs:151` |
     //! | RTEMS 5 / 7 | `<bsp>/lib/include/ifaddrs.h` |
-    //! | VxWorks 7 | `usr/h/public/net/ifaddrs.h` (sixth field is a union of `ifu_broadaddr`/`ifu_dstaddr`, which is one pointer) |
 
     use super::{IfaceV4, flags};
     use std::ffi::CStr;
@@ -318,7 +311,7 @@ mod sys {
 
     /// Does this build's `libc` agree with [`IfAddrs`], field for field?
     ///
-    /// Only meaningful where `libc` has the struct — the embedded targets have
+    /// Only meaningful where `libc` has the struct — the embedded target has
     /// nothing to compare against, which is why the declaration exists. There
     /// the assertion below is skipped and the header table in the module note
     /// is the evidence.
@@ -342,14 +335,14 @@ mod sys {
     const _: () = assert!(
         LAYOUT_MATCHES_LIBC,
         "net::iface_v4's `struct ifaddrs` no longer matches this platform's \
-         `libc::ifaddrs`. The declaration exists because neither embedded \
-         target's `libc` has the struct; this assertion is what keeps it \
+         `libc::ifaddrs`. The declaration exists because the embedded \
+         target's `libc` lacks the struct; this assertion is what keeps it \
          honest on the platforms whose `libc` does. Re-derive the field order \
          from the platform header before changing it."
     );
 
-    // `libc` declares `getifaddrs` for hosted Unix but not for newlib/RTEMS or
-    // VxWorks. Declaring our own on every target would be a second, clashing
+    // `libc` declares `getifaddrs` for hosted Unix but not for newlib/RTEMS.
+    // Declaring our own on every target would be a second, clashing
     // declaration of one symbol (`clashing_extern_declarations`, and this
     // workspace builds with `-D warnings`), so the hosted arm calls `libc`'s
     // and casts the out-pointer — sound precisely because the assertion above
@@ -379,7 +372,7 @@ mod sys {
     #[cfg(epics_embedded_target)]
     unsafe fn get_ifaddrs(head: *mut *mut IfAddrs) -> libc::c_int {
         // SAFETY: `head` is a valid out-pointer, and the declaration matches
-        // `ifaddrs.h` on both embedded targets (module note).
+        // `ifaddrs.h` on RTEMS (module note).
         unsafe { getifaddrs_raw(head) }
     }
 
@@ -393,7 +386,7 @@ mod sys {
     ///
     /// Goes through `libc::sockaddr_in` rather than reading a family field off
     /// `sockaddr` directly, because the two families of platform disagree about
-    /// where that field is: BSD-derived stacks (macOS, RTEMS, VxWorks) put a
+    /// where that field is: BSD-derived stacks (macOS, RTEMS) put a
     /// one-byte `sa_len` first and the family second, Linux starts with a
     /// two-byte family. `libc`'s per-target `sockaddr_in` already encodes which
     /// — and on RTEMS that it is the *right* one is a build-stopping guard, not

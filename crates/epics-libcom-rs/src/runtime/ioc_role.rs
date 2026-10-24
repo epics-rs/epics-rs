@@ -15,14 +15,11 @@
 //! (`EPICS_THREAD_OPTS_INIT` is `{epicsThreadPriorityLow, …}`,
 //! `epicsThread.h:173`), and it is a default, not a decision.
 //!
-//! It was measured as a defect, not deduced. On the VxWorks bring-up rig,
-//! ramping CA connections to the admission wall froze `UPTIME` for the whole
-//! ramp and resumed it two seconds after the load stopped: the values were
-//! correct and the publisher never ran, so `CA_REFUSED_CNT` read `0.0` at the
-//! exact moment an operator needs it. The bring-up console reporter, which
-//! shares no lock with the publisher but shares its band, emitted 4 ticks in
-//! 444 s instead of ~44. Client service at `CaServerLow-4..CaServerLow`
-//! (16..20) starves anything at 10.
+//! Under SCHED_FIFO that default is a defect: client service at
+//! `CaServerLow-4..CaServerLow` (16..20) starves anything at 10, so while CA
+//! connections ramp to the admission wall the status publisher does not run
+//! and `CA_REFUSED_CNT` stops advancing at the exact moment an operator needs
+//! it.
 //!
 //! # The rule
 //!
@@ -43,13 +40,9 @@
 //! sits higher still at 91 (`epicsThread.h:86`), so this table is conservative
 //! relative to C in both directions.
 //!
-//! The bounded-work half of the rule is measured, not assumed, and it is why
-//! this table has two answers rather than one. On the same rig, the same ramp
-//! and the same guest, with the status pusher raised to `ScanLow`: 136 clients
-//! admitted before the pool's capacity refusal, identical to the pre-fix run,
-//! and `UPTIME` advancing 1 s/s throughout. With the bring-up console census
-//! raised alongside it: 87, twice, the 88th client's handshake exceeding a 15 s
-//! timeout. Its per-tick work is roughly a hundred lines onto a byte-serial
+//! The bounded-work half of the rule is why this table has two answers rather
+//! than one. The status pusher's per-tick work is a fixed set of readings. The
+//! bring-up console census's is a line per descriptor onto a byte-serial
 //! console, and above the serving threads that work *is* the load — an
 //! instrument that changes what it measures. `epicsThreadPriorityIocsh` (91)
 //! is not a counter-example: C's unbounded reports are typed by a human, once,
@@ -93,8 +86,8 @@ pub enum IocRole {
     /// operator surface: it exists only under the `bringup-probes` feature,
     /// no shipped image contains it, and its per-tick work is a census whose
     /// length is the descriptor table's. Raised to the operator surface's band
-    /// it cost 36% of the connection ceiling in two identical runs (see the
-    /// module docs), which is the instrument rewriting its own measurement.
+    /// it would run above client service and become the load it reports (see
+    /// the module docs) — the instrument rewriting its own measurement.
     /// The operator's diagnostic path on a shell-less target is
     /// [`IocRole::StatusPublisher`], and that one publishes at the wall.
     ConsoleCensus,
@@ -168,8 +161,8 @@ mod tests {
     /// table without this test failing to compile, which is the point of
     /// having the table at all. Adding a variant is a decision about whether
     /// its output is what an operator reads or an instrument that must not
-    /// disturb what it measures — see the module docs for the measurement
-    /// that made those two different answers.
+    /// disturb what it measures — see the module docs for why those are two
+    /// different answers.
     #[test]
     fn every_role_is_placed_on_a_stated_side_of_client_service() {
         for role in IocRole::ALL {
@@ -211,57 +204,28 @@ mod tests {
         assert_eq!(ThreadPriority::Low.value(), 10);
     }
 
-    /// The table's ordering must survive both embedded targets, whose maps are
-    /// not the same function.
-    ///
-    /// Both land on POSIX `56 + epics` — for RTEMS that is the tail of a
-    /// core-priority inversion through `RTEMS_MAXIMUM_PRIORITY`, for VxWorks it
-    /// is measured directly — so both are strictly increasing in the EPICS
-    /// value and the EPICS-space ordering survives unchanged. VxWorks then
-    /// inverts that POSIX value into its own task space as `vx = 199 - epics`,
-    /// where lower is more urgent, so the operator surface ends up at a
-    /// *smaller* native number than client service: the same ordering a third
-    /// time, through a third arithmetic.
+    /// The table's ordering must survive the RTEMS map, which is not the
+    /// hosted one: POSIX `56 + epics`, the tail of a core-priority inversion
+    /// through `RTEMS_MAXIMUM_PRIORITY`.
     #[test]
-    fn the_ordering_survives_both_embedded_priority_maps() {
-        use super::super::task::{map_epics_priority_rtems, map_epics_priority_vxworks};
+    fn the_ordering_survives_the_rtems_priority_map() {
+        use super::super::task::map_epics_priority_rtems;
 
         let service = ThreadPriority::CaServerHigh.value();
+        let service_os = map_epics_priority_rtems(service);
         for role in IocRole::ALL {
             let band = role.band().value();
             // Which side of client service this role is on is asserted above;
-            // here the only claim is that whichever side it is, both targets
-            // agree with the EPICS-space answer.
-            let above = band > service;
-
-            for (target, service_os, role_os) in [
-                (
-                    "RTEMS posix",
-                    map_epics_priority_rtems(service),
-                    map_epics_priority_rtems(band),
-                ),
-                (
-                    "VxWorks posix",
-                    map_epics_priority_vxworks(service),
-                    map_epics_priority_vxworks(band),
-                ),
-                // VxWorks's own POSIX layer inverts into native task
-                // priorities, measured as `vx = 199 - epics`; smaller is more
-                // urgent there, so negate to compare in the same direction.
-                (
-                    "VxWorks native",
-                    -(199 - service as i32),
-                    -(199 - band as i32),
-                ),
-            ] {
-                assert_eq!(
-                    role_os > service_os,
-                    above,
-                    "{role:?}: {target} puts it at {role_os} against client \
-                     service at {service_os}, which is the opposite order to \
-                     EPICS {band} against {service}",
-                );
-            }
+            // here the only claim is that RTEMS agrees with the EPICS-space
+            // answer.
+            let role_os = map_epics_priority_rtems(band);
+            assert_eq!(
+                role_os > service_os,
+                band > service,
+                "{role:?}: RTEMS posix puts it at {role_os} against client \
+                 service at {service_os}, which is the opposite order to \
+                 EPICS {band} against {service}",
+            );
         }
     }
 }

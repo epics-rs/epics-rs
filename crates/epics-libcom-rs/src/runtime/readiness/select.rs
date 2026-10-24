@@ -1,29 +1,17 @@
-//! `select(2)` backend — the one both embedded triples can take.
+//! `select(2)` backend.
 //!
-//! VxWorks 7 has no kqueue and no epoll: the SDK measured here declares
-//! neither (`HAVE_KQUEUE`/`HAVE_SYS_EVENT_H`/`HAVE_EPOLL` are all `#undef` in
-//! its bundled `pyconfig.h`, and no header declares `kqueue(`). Its `poll()`
-//! is not a second primitive either — `libunix.a(poll.o)` references exactly
-//! `bzero`, `errnoSet` and `select`, so poll is a wrapper that rebuilds fd
-//! sets on every call. `select` is therefore the native call there, and this
-//! backend calls it directly rather than paying for that translation.
-//!
-//! It is also what RTEMS takes until the kqueue backend lands, and what the
-//! host takes in tests — the same code on all three, so a host test exercises
-//! the bytes that run on target.
+//! It is what RTEMS takes until the kqueue backend lands, and what the host
+//! takes in tests — the same code on both, so a host test exercises the bytes
+//! that run on target.
 //!
 //! # `fd_set` is declared here, not imported
 //!
-//! `libc` has no `select` and no `fd_set` for `x86_64-wrs-vxworks` at all
-//! (`src/vxworks/mod.rs`: zero hits for either), so one of the two targets
-//! must bring its own regardless. Declaring it once here — as a bitmap of
-//! [`FD_CAPACITY`] bits, which is the layout `select` has taken since 4.2BSD —
-//! is what keeps this file free of a per-target `cfg` whose arms could drift.
-//! The buffer is deliberately larger than any of the three platforms' own
-//! `FD_SETSIZE` (VxWorks sizes it from the VSB's `_WRS_CONFIG_FD_SET_SIZE`,
-//! 2048 in the SDK measured here; Linux fixes it at 1024), because `select`
-//! only ever touches the words below `nfds`, so a longer buffer is always
-//! safe and a shorter one is what corrupts the stack.
+//! Declaring it once here — as a bitmap of [`FD_CAPACITY`] bits, which is the
+//! layout `select` has taken since 4.2BSD — is what keeps this file free of a
+//! per-target `cfg` whose arms could drift. The buffer is deliberately larger
+//! than the platforms' own `FD_SETSIZE` (Linux fixes it at 1024), because
+//! `select` only ever touches the words below `nfds`, so a longer buffer is
+//! always safe and a shorter one is what corrupts the stack.
 //!
 //! # The sets are kept, not rebuilt
 //!
@@ -131,8 +119,8 @@ struct TimeVal {
 }
 
 unsafe extern "C" {
-    /// POSIX `select(2)`. Present on every target this compiles for, but
-    /// absent from `libc`'s VxWorks module, so it is named here.
+    /// POSIX `select(2)`, declared against this file's own [`FdSet`] so no
+    /// target's `libc` binding of the set is needed.
     fn select(
         nfds: libc::c_int,
         readfds: *mut FdSet,
@@ -364,9 +352,9 @@ mod tests {
 
     #[test]
     fn the_buffer_is_at_least_every_platform_fd_setsize() {
-        // Linux 1024, the VxWorks SDK measured here 2048. A shorter buffer is
-        // what corrupts the stack, so this is a floor, not a preference.
-        const { assert!(FD_CAPACITY >= 2048) };
+        // Linux 1024. A shorter buffer is what corrupts the stack, so this is
+        // a floor, not a preference.
+        const { assert!(FD_CAPACITY >= 1024) };
         const { assert!(WORDS * WORD_BITS == FD_CAPACITY) };
     }
 

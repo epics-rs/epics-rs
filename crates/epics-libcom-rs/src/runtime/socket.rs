@@ -5,12 +5,12 @@
 //! # Why this exists, and why here
 //!
 //! `socket2` — the obvious way to set an option on an unbound socket — does not
-//! build for `armv7-rtems-eabihf` or the `*-wrs-vxworks*` triples (20 compile
-//! errors on the former: `ip_mreqn`, `IovLen`, and friends are Linux shapes the
-//! target's `libc` has no equivalent for). So every reactor-free driver that
-//! needed a pre-bind option grew its own raw-`libc` copy of the same twenty
-//! lines. At the time this module was written there were two, byte-for-byte
-//! alike in everything but their error strings:
+//! build for `armv7-rtems-eabihf` (20 compile errors: `ip_mreqn`, `IovLen`, and
+//! friends are Linux shapes the target's `libc` has no equivalent for). So
+//! every reactor-free driver that needed a pre-bind option grew its own
+//! raw-`libc` copy of the same twenty lines. At the time this module was
+//! written there were two, byte-for-byte alike in everything but their error
+//! strings:
 //!
 //! * `epics-ca-rs::server::blocking::bind_udp_search_socket`
 //! * `epics-pva-rs::server_native::blocking`'s UDP search responder
@@ -23,10 +23,9 @@
 //! reason.
 //!
 //! The second reason is coverage. `epics-libcom-rs` is the first entry in
-//! `CRATES` in both `scripts/rtems-check.sh` and `scripts/vxworks-check.sh`, so
-//! target-only `unsafe` placed here is compiled for both triples by the gates
-//! that already run. The same code in a crate outside those lists is compiled
-//! by nothing.
+//! `CRATES` in `scripts/rtems-check.sh`, so target-only `unsafe` placed here is
+//! compiled for the triple by the gate that already runs. The same code in a
+//! crate outside that list is compiled by nothing.
 //!
 //! # Why the option is ordered against the bind
 //!
@@ -43,18 +42,16 @@
 //! Option selection follows EPICS base (R7.0.10-146-g8f5015b66)
 //! `libcom/src/osi/os/default/osdSockAddrReuse.cpp`: the datagram-fanout helper
 //! sets `SO_REUSEPORT` (where defined) *and then* `SO_REUSEADDR`; the
-//! time-wait helper sets `SO_REUSEADDR` alone. Both `SO_REUSEPORT` constants
-//! exist on the two embedded targets (`0x0200` on newlib/RTEMS and on VxWorks),
-//! so neither takes the `#ifndef SO_REUSEPORT` fallback the C comment describes
-//! for older systems.
+//! time-wait helper sets `SO_REUSEADDR` alone. `SO_REUSEPORT` exists on
+//! newlib/RTEMS (`0x0200`), so the embedded target does not take the
+//! `#ifndef SO_REUSEPORT` fallback the C comment describes for older systems.
 //!
-//! Connect behaviour follows asyn (R4-46) `drvAsynIPPort.c`, whose three branches this
-//! module reproduces exactly:
+//! Connect behaviour follows asyn (R4-46) `drvAsynIPPort.c`; this module
+//! reproduces exactly the two of its branches its targets take:
 //!
 //! | target | connect | timeout honoured | C authority |
 //! |---|---|---|---|
 //! | hosted | non-blocking, then `poll(POLLOUT)` and `SO_ERROR` | yes | `:516-566` |
-//! | VxWorks | non-blocking, then `select()` via `FAKE_POLL` | yes | `:76`, `:139-171`, `:178` |
 //! | RTEMS | **blocking** | **no** | `:71-72` — `__rtems__` takes `USE_SOCKTIMEOUT`, and both `setNonBlock` and the poll block sit inside `#ifdef USE_POLL` |
 //!
 //! The RTEMS row is not an omission. C genuinely has no connect timeout there;
@@ -338,8 +335,8 @@ pub fn tcp_connect(
 /// Only the flag is set, which is all C sets. The idle/probe tuning the hosted
 /// CA driver adds through `socket2` (`epics-ca-rs::server::tcp`, 15 s + 5 s) is
 /// deliberately not reproduced: `TCP_KEEPIDLE` is a Linux spelling, BSD-derived
-/// stacks call it `TCP_KEEPALIVE`, and neither has been measured on RTEMS or
-/// VxWorks. A target's default idle is therefore what applies here, as it is in
+/// stacks call it `TCP_KEEPALIVE`, and neither has been measured on RTEMS. A
+/// target's default idle is therefore what applies here, as it is in
 /// C.
 pub fn enable_keepalive(sock: &TcpStream) -> io::Result<()> {
     sys::enable_keepalive(sock)
@@ -690,8 +687,8 @@ mod sys {
 
 #[cfg(epics_embedded_target)]
 mod sys {
-    //! RTEMS / VxWorks: raw `libc`, because `socket2` does not build for either
-    //! triple. Shapes follow `epics-ca-rs::server::blocking`, which is the
+    //! RTEMS: raw `libc`, because `socket2` does not build for the triple.
+    //! Shapes follow `epics-ca-rs::server::blocking`, which is the
     //! proven-on-target version of this sequence.
 
     use super::{SetupError, SetupStep, SocketOptions, TcpConnectError};
@@ -700,8 +697,8 @@ mod sys {
     use std::os::fd::{FromRawFd, RawFd};
     use std::time::Duration;
 
-    /// RTEMS takes C's `USE_BY` `gethostbyname` (osdSock.c:44-48) and VxWorks
-    /// its own; neither has been probed for the `errno` it leaves.
+    /// RTEMS takes C's `USE_BY` `gethostbyname` (osdSock.c:44-48); it has not
+    /// been probed for the `errno` it leaves.
     pub(super) fn host_to_ip_addr(name: &str) -> Result<Ipv4Addr, io::Error> {
         super::std_host_to_ip_addr(name)
     }
@@ -803,9 +800,9 @@ mod sys {
 
     /// Marshal an IPv4 `SocketAddr` into a `sockaddr_in`.
     ///
-    /// IPv4 only: both targets' asyn drivers are IPv4 in practice, and an
-    /// IPv6 address here is refused loudly rather than silently bound to the
-    /// wrong family. `sin_len` (present on VxWorks, absent on Linux) is left at
+    /// IPv4 only: the target's asyn drivers are IPv4 in practice, and an IPv6
+    /// address here is refused loudly rather than silently bound to the wrong
+    /// family. `sin_len`, where the target's `sockaddr_in` has one, is left at
     /// the zero the `zeroed()` gives it — the same choice
     /// `epics-ca-rs::server::blocking::bind_udp_search_socket` makes, and the
     /// `socklen_t` argument is what both stacks actually read.
@@ -879,37 +876,15 @@ mod sys {
         Ok(unsafe { TcpListener::from_raw_fd(owned.into_raw()) })
     }
 
-    // This module's target set is exactly {rtems, vxworks} — that is what
-    // `epics_embedded_target` means. Both `connect_fd` and `set_nonblocking`
-    // below are written as that closed pair rather than as a
-    // `vxworks`/`everything else` split, so adding a third embedded triple
-    // fails to compile *here*, at the decision, instead of silently taking
-    // whichever arm happened to be the fallback.
-    #[cfg(not(any(target_os = "rtems", target_os = "vxworks")))]
+    // This module's target set is exactly {rtems} — that is what
+    // `epics_embedded_target` means. `connect_fd` below is RTEMS's blocking
+    // connect, so a second embedded triple fails to compile *here*, at the
+    // decision, instead of silently inheriting C's no-deadline branch.
+    #[cfg(not(target_os = "rtems"))]
     compile_error!(
-        "epics_embedded_target gained a triple beyond rtems/vxworks: choose \
-         its connect_fd and set_nonblocking arms explicitly"
+        "epics_embedded_target gained a triple beyond rtems: choose its \
+         connect_fd arm explicitly"
     );
-
-    /// Put `fd` into non-blocking mode.
-    ///
-    /// C `drvAsynIPPort.c::setNonBlock` (`:176-200`) branches exactly here:
-    /// VxWorks uses `ioctl(fd, FIONBIO, &flags)` — note it passes the address
-    /// of the flag, not the flag itself — where a POSIX target uses `fcntl`.
-    /// Only the VxWorks arm exists: RTEMS takes the blocking `connect_fd`
-    /// below and never needs the socket switched, so an `fcntl` arm here
-    /// would be dead on every triple this module compiles for.
-    #[cfg(target_os = "vxworks")]
-    fn set_nonblocking(fd: RawFd, on: bool) -> io::Result<()> {
-        let mut flags: libc::c_int = i32::from(on);
-        // SAFETY: `fd` is a valid socket; FIONBIO reads one `int` through the
-        // pointer, which `flags` provides for the duration of the call.
-        let rc = unsafe { libc::ioctl(fd, libc::FIONBIO, &mut flags as *mut libc::c_int) };
-        if rc < 0 {
-            return Err(last_error());
-        }
-        Ok(())
-    }
 
     pub(super) fn tcp_connect(
         remote: SocketAddr,
@@ -940,7 +915,6 @@ mod sys {
     /// (`:540-567`). The transfer bound C keeps there is
     /// `SO_RCVTIMEO`/`SO_SNDTIMEO`, applied by the read/write path rather than
     /// here.
-    #[cfg(target_os = "rtems")]
     fn connect_fd(
         owned: &OwnedFd,
         remote: SocketAddr,
@@ -957,84 +931,6 @@ mod sys {
         };
         if rc != 0 {
             return Err(TcpConnectError::Connect(last_error()));
-        }
-        Ok(())
-    }
-
-    /// VxWorks: non-blocking connect bounded by `poll(POLLOUT)`, then
-    /// `SO_ERROR`.
-    ///
-    /// This is C's `USE_POLL` path (`drvAsynIPPort.c:515-567`). VxWorks takes
-    /// it via `FAKE_POLL`. C fakes `poll` with `select()` because its VxWorks
-    /// headers lack `poll`; the Rust `libc` binding for the triple exposes
-    /// `poll` directly, so the fake is unnecessary and the observable
-    /// behaviour is the same.
-    #[cfg(target_os = "vxworks")]
-    fn connect_fd(
-        owned: &OwnedFd,
-        remote: SocketAddr,
-        timeout: Duration,
-    ) -> Result<(), TcpConnectError> {
-        let sin = sockaddr_in(remote).map_err(TcpConnectError::Connect)?;
-        set_nonblocking(owned.0, true).map_err(SetupError::at(SetupStep::NonBlocking))?;
-        // SAFETY: `sin` is fully initialised and the length is its exact size.
-        let rc = unsafe {
-            libc::connect(
-                owned.0,
-                &sin as *const libc::sockaddr_in as *const libc::sockaddr,
-                std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
-            )
-        };
-        if rc != 0 {
-            let err = last_error();
-            let in_progress = matches!(
-                err.raw_os_error(),
-                Some(e) if e == libc::EINPROGRESS || e == libc::EWOULDBLOCK
-            );
-            if !in_progress {
-                return Err(TcpConnectError::Connect(err));
-            }
-            if let Err(cause) = await_connect(owned, timeout) {
-                return Err(TcpConnectError::Deferred {
-                    in_progress: err,
-                    cause,
-                });
-            }
-        }
-        set_nonblocking(owned.0, false).map_err(SetupError::at(SetupStep::NonBlocking))?;
-        Ok(())
-    }
-
-    /// The poll half of the VxWorks [`connect_fd`]: `Ok` once `SO_ERROR` is
-    /// clear.
-    #[cfg(target_os = "vxworks")]
-    fn await_connect(owned: &OwnedFd, timeout: Duration) -> io::Result<()> {
-        let ms = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
-        if !super::poll_ready(owned, super::Readiness::Writable, ms)? {
-            return Err(io::Error::new(io::ErrorKind::TimedOut, "connect timed out"));
-        }
-
-        // C reads SO_ERROR and treats a non-zero value as the connect failure
-        // (`:555-565`); poll reporting the fd ready says only that the attempt
-        // finished, not that it succeeded.
-        let mut so_error: libc::c_int = 0;
-        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
-        // SAFETY: `so_error`/`len` are live for the call and sized as SO_ERROR
-        // expects.
-        let rc = unsafe {
-            libc::getsockopt(
-                owned.0,
-                libc::SOL_SOCKET,
-                libc::SO_ERROR,
-                &mut so_error as *mut libc::c_int as *mut libc::c_void,
-                &mut len as *mut libc::socklen_t,
-            )
-        };
-        if rc != 0 {
-            return Err(last_error());
-        }
-        if so_error != 0 {
-            return Err(io::Error::from_raw_os_error(so_error));
         }
         Ok(())
     }

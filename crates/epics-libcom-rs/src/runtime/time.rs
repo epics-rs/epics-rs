@@ -34,7 +34,7 @@ pub fn now_mono() -> Instant {
 /// in place of the `checked_add` gives *"panic on thread `cbMedium` at
 /// runtime/time.rs: overflow when adding duration to instant"*, so the
 /// embedded timer path really does consume this sum and the guard is what
-/// keeps it off the console. VxWorks is still arithmetic-only.
+/// keeps it off the console.
 pub fn deadline_after(base: Instant, d: Duration) -> Instant {
     base.checked_add(d).unwrap_or_else(far_future)
 }

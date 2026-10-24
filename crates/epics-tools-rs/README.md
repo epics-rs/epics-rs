@@ -18,8 +18,8 @@ tell "`libc` and `nix` are linked" from "there is a second process to
 supervise behind `forkpty(3)`, with a controlling terminal on fd 0".
 The two failures therefore differ:
 
-- A unix target off the list (RTEMS, VxWorks — `fork(2)` is an `ENOSYS`
-  stub there) is **refused at build time** with a `cargo::error` naming
+- A unix target off the list (RTEMS — `fork(2)` is an `ENOSYS` stub
+  there) is **refused at build time** with a `cargo::error` naming
   the reason. An image where the IOC *is* the system has no second
   process to supervise, so compiling the module away would hand an
   embedded consumer an empty API and imply the port is merely missing.

@@ -37,7 +37,7 @@ pub mod sync {
 /// `pub use epics_libcom_rs::{net, runtime}` re-export (`lib.rs:123`) and is
 /// an OPTIONAL dependency behind `epics`. This module is not gated, so
 /// reaching the seam through the re-export made `--no-default-features` —
-/// which is the RTEMS and VxWorks target configuration — E0433 at this line.
+/// which is the RTEMS target configuration — E0433 at this line.
 /// `epics-libcom-rs` is not optional, for the reason its manifest entry
 /// already gives about `runtime::socket`.
 pub mod task {

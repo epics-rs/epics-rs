@@ -103,9 +103,9 @@ tokio = { version = "1", features = ["full", "test-util"] }
 # Tests only, and host-only. Production code reaches sockets through
 # `epics_libcom_rs::runtime::socket`; these are the tests that read an option
 # back off a bound socket (`SockRef::reuse_port`) to prove the seam set it,
-# which needs socket2's getters. They never build for the embedded triples —
+# which needs socket2's getters. They never build for the embedded triple —
 # socket2 does not compile there, which is why the seam exists.
-[target.'cfg(not(any(target_os = "rtems", target_os = "vxworks")))'.dev-dependencies]
+[target.'cfg(not(target_os = "rtems"))'.dev-dependencies]
 socket2 = { version = "0.5", features = ["all"] }
 criterion = { version = "0.5", features = ["html_reports"] }
 # Integration tests that drive the asyn record through a real CA server's

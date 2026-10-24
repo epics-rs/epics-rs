@@ -1290,13 +1290,15 @@ fn project_of<T: StatsElem + Sync>(
 ) -> Projection {
     let v = &v[..x_size * y_size];
     #[cfg(feature = "parallel")]
-    // About 320 ps per element serially (u8 470, f64 310); the split
-    // measured faster from 60 us (u16 470x470 0.83x serial, u8 430x430 0.74x,
-    // f64 512x512 0.85x).
+    // At least 280 ps per element serially (i8 at row widths a multiple of
+    // 64; up to 480 elsewhere), but 10 ms apart the split loses below about
+    // 250K elements whatever the type costs (u8 448x448 1.11x serial, f32
+    // 1.16x, u16 480x480 1.03x); 71 us at 280 ps is 504x504, from which
+    // every type measured faster (0.69-0.87x).
     if par_util::pool_wins(
         v.len(),
-        320,
-        60,
+        280,
+        71,
         y_size.div_ceil((PAR_CHUNK / x_size).max(1)),
     ) {
         let band = (PAR_CHUNK / x_size).max(1) * x_size;

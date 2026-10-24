@@ -120,12 +120,10 @@ pub struct Detailed(pub bool);
 /// `tokio_backend`, and structurally rather than by doc comment:
 /// [`SigInt::new`] spawns a task, so calling it with no reactor panics
 /// (standard `tokio::spawn` precondition). That is true of a host
-/// `exec_backend` build as much as of RTEMS or VxWorks, which is why the
-/// predicate is the backend and not the target — the embedded reason (tokio is
-/// built there without the `signal` feature; on RTEMS it pulls
-/// signal-hook-registry, which newlib cannot compile, design doc §8.1, and
-/// VxWorks drops it for the same dependency-availability reason) is a strictly
-/// narrower case of it.
+/// `exec_backend` build as much as of RTEMS, which is why the predicate is the
+/// backend and not the target — the embedded reason (tokio is built there
+/// without the `signal` feature; it pulls signal-hook-registry, which newlib
+/// cannot compile, design doc §8.1) is a strictly narrower case of it.
 #[cfg(tokio_backend)]
 pub struct SigInt {
     triggered: std::sync::Arc<tokio::sync::Notify>,

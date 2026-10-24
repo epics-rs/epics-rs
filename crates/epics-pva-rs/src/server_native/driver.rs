@@ -30,20 +30,6 @@
 //! CONNECTION_VALIDATION is 81 ms against 131 ms. Neither refused a
 //! connection.
 //!
-//! `x86_64-wrs-vxworks` separates them further, and there the difference is a
-//! ceiling rather than a cost. One `.vxe`, two runs differing only in the
-//! `EPICS_PVA_RS_DRIVER` the kernel shell `putenv`s before `rtpSp`: the
-//! blocking driver serves 18 held connections and refuses from the 19th on,
-//! the worker pool naming its own budget — each connection's thread set wants
-//! 6144 KiB, and 156 of 160 MiB are already reserved. The reactor driver held
-//! 64 with no refusal. `MEM_USED` (mimalloc's committed bytes, the one heap
-//! figure VxWorks answers) rises 17.12 MB → 42.80 MB across 14 of those
-//! blocking connections, 1.83 MB each, and does not move at all from 0 to 64
-//! on the reactor driver. Thirty serialised round-trips stay 7.2 s either way
-//! while both are still serving. The backend under the reactor driver there is
-//! `select` — `kqueue` is selected only on RTEMS — so this pair measures the
-//! driver alone.
-//!
 //! Whole-burst wall clocks are deliberately not quoted. qemu's SLIRP
 //! `hostfwd` drops about one connection in a few dozen under a concurrent
 //! burst — the host `connect` succeeds against qemu's own listener while

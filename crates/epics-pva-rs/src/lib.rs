@@ -61,8 +61,8 @@
 //!
 //! A row reading *no settled pin* means no revision has been agreed for that
 //! tree: say which revision you read, and do not take its `HEAD` for the pin.
-//! Citations into non-EPICS sources (libc, RTEMS, `rtems-libbsd`, VxWorks,
-//! vendored third-party) are outside this table and carry no pin.
+//! Citations into non-EPICS sources (libc, RTEMS, `rtems-libbsd`, vendored
+//! third-party) are outside this table and carry no pin.
 
 pub mod auth;
 pub mod channel_shape;

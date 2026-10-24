@@ -162,7 +162,7 @@ pub fn posix_groups() -> Vec<PvString> {
     #[cfg(not(local_account_db))]
     {
         // No local account database to enumerate — Windows, and every
-        // unix-family target without one (RTEMS, VxWorks). pvxs advertises no
+        // unix-family target without one (RTEMS). pvxs advertises no
         // roles rather than inventing them.
         Vec::new()
     }
@@ -223,7 +223,7 @@ pub fn osd_get_roles(account: &[u8]) -> Vec<PvString> {
     #[cfg(not(local_account_db))]
     {
         // No local group DB available (Windows LANMAN handled elsewhere;
-        // RTEMS / vxWorks): pvxs reports the account as its only role.
+        // RTEMS): pvxs reports the account as its only role.
         //
         // This arm is what RTEMS takes. Under the `cfg(not(unix))` it used to
         // carry it was unreachable there — RTEMS is `target_family = "unix"` —
@@ -267,7 +267,7 @@ mod tests {
         assert_eq!(
             prod.matches("#[cfg(unix)]").count(),
             0,
-            "a bare cfg(unix) arm captures RTEMS and VxWorks, which have libc \
+            "a bare cfg(unix) arm captures RTEMS, which has libc \
              but no passwd/group database — that is the defect"
         );
         assert_eq!(
@@ -294,7 +294,7 @@ mod tests {
     /// it assert something it does not mean: that *no rule anywhere* in the
     /// script may name RTEMS. `build.rs` has since acquired a second, unrelated
     /// rule — the `exec_backend` / `tokio_backend` task-backend decision, which
-    /// is `epics_embedded_target` (`target_os` in `{"rtems", "vxworks"}`) or
+    /// is `epics_embedded_target` (`target_os = "rtems"`) or
     /// `EPICS_RS_BUILD_EXEC_BACKEND=thread`, and therefore *must* name the
     /// target,
     /// exactly as `epics-base-rs`'s own `build.rs` does. A whole-file scan
@@ -341,13 +341,11 @@ mod tests {
         // never mentions them, which is precisely why the next unix-family
         // target without an account database is handled correctly by a rule
         // nobody had to remember to update.
-        for excluded in ["rtems", "vxworks"] {
-            assert!(
-                !body.contains(&format!("{excluded:?}")),
-                "the predicate names {excluded}, so it is an exclusion list; \
-                 a target that is not on the allowlist must simply not be on it"
-            );
-        }
+        assert!(
+            !body.contains("\"rtems\""),
+            "the predicate names rtems, so it is an exclusion list; \
+             a target that is not on the allowlist must simply not be on it"
+        );
     }
 
     #[cfg(unix)]

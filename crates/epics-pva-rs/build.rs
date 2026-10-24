@@ -27,13 +27,12 @@
 //! # Why an allowlist, not `all(unix, not(target_os = "rtems"))`
 //!
 //! Excluding RTEMS by name fixes the target we know about and silently
-//! mishandles the next one: VxWorks is `cfg(unix)` with no passwd database
-//! either, and any future non-hosted unix target would inherit the hosted arm
-//! by default — the same defect with a different `target_os`. An allowlist
-//! inverts that default. An unrecognised target gets the conservative arm, and
-//! conservative is the safe direction here: the fallback reports an account's
-//! own name as its only role, which can only *deny* a `member group:` ACF rule
-//! that would otherwise have matched, never grant one.
+//! mishandles the next one: any future non-hosted unix target would inherit the
+//! hosted arm by default — the same defect with a different `target_os`. An
+//! allowlist inverts that default. An unrecognised target gets the conservative
+//! arm, and conservative is the safe direction here: the fallback reports an
+//! account's own name as its only role, which can only *deny* a `member group:`
+//! ACF rule that would otherwise have matched, never grant one.
 //!
 //! Adding a target is a one-line change here, and it is a decision someone has
 //! to make deliberately rather than one that happens by inheritance.
@@ -66,8 +65,8 @@
 /// Targets whose libc is backed by a real passwd/group database.
 ///
 /// Every entry is a hosted unix with `getpwnam(3)`, `getgrgid(3)` and
-/// `getgrouplist(3)`. Deliberately absent: `rtems` and `vxworks` (unix-family,
-/// no account database), and anything not listed.
+/// `getgrouplist(3)`. Deliberately absent: `rtems` (unix-family, no account
+/// database), and anything not listed.
 const LOCAL_ACCOUNT_DB_TARGETS: &[&str] = &[
     "linux",
     "android",
@@ -88,7 +87,7 @@ const LOCAL_ACCOUNT_DB_TARGETS: &[&str] = &[
 // `epics-base-rs`'s `build.rs` defines this rule and this script repeats it,
 // for this crate's own compilation:
 //
-//     exec_backend  ⟺  epics_embedded_target (target_os in {"rtems", "vxworks"})
+//     exec_backend  ⟺  epics_embedded_target (target_os = "rtems")
 //                   ||  EPICS_RS_BUILD_EXEC_BACKEND=thread
 //     tokio_backend ⟺  otherwise
 //
@@ -157,7 +156,7 @@ fn main() {
     stamp_rustc_version();
 
     let os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
-    let embedded_target = matches!(os.as_str(), "rtems" | "vxworks");
+    let embedded_target = os == "rtems";
     if embedded_target {
         println!("cargo::rustc-cfg=epics_embedded_target");
     }

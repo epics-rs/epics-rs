@@ -26,11 +26,11 @@ pub mod operation;
 pub mod ops_v2;
 // The UDP SEARCH modules are compiled out on every embedded target: RTEMS
 // newlib lacks the `recvmsg`/`IP_PKTINFO` receive path and `local_addr()`
-// readback a UDP search needs, and VxWorks is excluded for the same reason
-// (`epics-libcom-rs::net`'s `AsyncUdpV4`/`socket2` stack builds for
-// neither), so an embedded build resolves PVs over TCP name servers alone
-// through `search_engine`'s `SearchTransport::NameServersOnly` seam. `search`
-// is the legacy standalone search path and `udp` is the client UDP manager.
+// readback a UDP search needs (`epics-libcom-rs::net`'s `AsyncUdpV4`/`socket2`
+// stack does not build for it), so an embedded build resolves PVs over TCP name
+// servers alone through `search_engine`'s `SearchTransport::NameServersOnly`
+// seam. `search` is the legacy standalone search path and `udp` is the client
+// UDP manager.
 //
 // The gate that states that is `tokio_backend`, not
 // `not(epics_embedded_target)` — the predicate `eb873800c` named as wrong

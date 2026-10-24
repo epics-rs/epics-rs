@@ -25,19 +25,16 @@
 //!
 //! # The reactor is ours, not mio's
 //!
-//! `tokio::net` cannot serve either embedded triple, and the obstacle is mio:
+//! `tokio::net` cannot serve the embedded triple, and the obstacle is mio:
 //! `mio-1.2.3/src/sys/unix/mod.rs:20-59` maps `target_os` to a selector
-//! implementation and names neither `rtems` nor `vxworks`, so an
-//! `os-poll`+`net` build fails with 29 errors on `armv7-rtems-eabihf` and 35 on
-//! `x86_64-wrs-vxworks` (`E0583`, no selector and no waker). Forcing its
-//! internal poll/pipe fallbacks (`--cfg mio_unsupported_force_poll_poll --cfg
-//! mio_unsupported_force_waker_pipe`) leaves 8 and 9, and `socket2` — which
-//! `tokio::net` also needs — adds 17 and 10 of its own. So the readiness
-//! primitive is [`epics_base_rs::runtime::readiness`]: `select(2)` everywhere,
-//! `kqueue(2)` on an RTEMS BSP whose version passes pvxs's "kqueue from 6.3"
-//! rule. VxWorks 7 stays on `select` because it has no kqueue at all — its own
-//! `poll()` is a `select()` wrapper (`libunix.a(poll.o)` references exactly
-//! `bzero`, `errnoSet` and `select`).
+//! implementation and does not name `rtems`, so an `os-poll`+`net` build fails
+//! with 29 errors on `armv7-rtems-eabihf` (`E0583`, no selector and no waker).
+//! Forcing its internal poll/pipe fallbacks (`--cfg
+//! mio_unsupported_force_poll_poll --cfg mio_unsupported_force_waker_pipe`)
+//! leaves 8, and `socket2` — which `tokio::net` also needs — adds 17 of its
+//! own. So the readiness primitive is [`epics_base_rs::runtime::readiness`]:
+//! `select(2)` everywhere, `kqueue(2)` on an RTEMS BSP whose version passes
+//! pvxs's "kqueue from 6.3" rule.
 //!
 //! # The protocol is untouched, again
 //!

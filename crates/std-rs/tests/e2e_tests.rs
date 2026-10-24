@@ -7,7 +7,7 @@
 // over the same record layer and go with the file rather than leaving it
 // half-gated. The reactor-free `exec_backend` — selected on a host build
 // by `EPICS_RS_BUILD_EXEC_BACKEND=thread`, and unconditionally on RTEMS
-// and VxWorks — has no `epics_ca_rs::server::CaServer` to build, so this
+// — has no `epics_ca_rs::server::CaServer` to build, so this
 // file has no subject there. `[[test]] required-features` cannot name a
 // build-script cfg, which is why the gate is here and not in
 // `Cargo.toml`.

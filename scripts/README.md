@@ -47,7 +47,7 @@ one of them is not optional:
 |--------|---------|
 | [`rtems-bsp.sh`](./rtems-bsp.sh) | **Required.** Build the BSP prefix an RTEMS image links against — RSB cross tools, kernel and libbsd from pinned upstream commits, RTEMS 7 by default (`--series 6` for the 6 branch). No release carries the libbsd/kernel fixes the image relies on, so the prefix is a source build and this is its one recorded recipe; source the `epics-rs-env.sh` it writes before any RTEMS build. |
 | [`rtems-check.sh`](./rtems-check.sh) | Type-check the RTEMS closure on a machine with no toolchain. |
-| [`embedded-image.sh`](./embedded-image.sh) | Build the deployable (`release-embedded`) RTEMS or VxWorks image. |
+| [`embedded-image.sh`](./embedded-image.sh) | Build the deployable (`release-embedded`) RTEMS image. |
 
 ## Real-hardware IOCs
 

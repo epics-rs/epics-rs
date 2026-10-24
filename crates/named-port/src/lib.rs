@@ -500,7 +500,8 @@ mod tests {
     use std::net::UdpSocket;
 
     /// UDP held on the numbers Windows' sequential `bind(0)` hands TCP next
-    /// does not starve the pick, as it did run 39804498678.
+    /// does not starve the pick, as it did run 39804498678. A number a
+    /// parallel test holds is as much the block as one this test holds.
     #[cfg(windows)]
     #[test]
     fn a_udp_block_on_the_next_tcp_numbers_does_not_starve_the_pick() {
@@ -510,10 +511,15 @@ mod tests {
             .unwrap()
             .port()
             + 1;
-        let block: Vec<UdpSocket> = (next..next.saturating_add(256))
-            .filter_map(|p| UdpSocket::bind(("0.0.0.0", p)).ok())
+        let _block: Vec<UdpSocket> = (next..next.saturating_add(256))
+            .filter_map(|p| match UdpSocket::bind(("0.0.0.0", p)) {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    assert!(port_held(&e), "UDP {p} refused but not held: {e}");
+                    None
+                }
+            })
             .collect();
-        assert!(block.len() > 200, "held only {} of 256", block.len());
         free_for_tcp_and_udp();
     }
 

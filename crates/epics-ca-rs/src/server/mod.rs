@@ -4,13 +4,13 @@ pub mod access_token;
 pub mod addr_list;
 // The async server front-end — the `tokio::net` accept/introspection
 // stack and the `CaServer` orchestrator (which also drives `tokio::signal` and
-// the `discovery` stack) — is host-only; its deps do not build for RTEMS or
-// VxWorks. The embedded build serves CA through the `std::net` `blocking`
+// the `discovery` stack) — is host-only; its deps do not build for RTEMS. The
+// embedded build serves CA through the `std::net` `blocking`
 // driver plus the runtime-agnostic shared logic in
 // `tcp`/`udp`/`beacon`/`monitor`/`stats`. The gate is `tokio_backend` — the accept loop
 // hands each client to `runtime::task::Reactor`, so it needs a build where
-// that seam is the tokio runtime, which excludes the two embedded targets and
-// a host `exec_backend` build alike.
+// that seam is the tokio runtime, which excludes the embedded target and a
+// host `exec_backend` build alike.
 pub mod beacon;
 pub mod blocking;
 pub mod blocking_serving;

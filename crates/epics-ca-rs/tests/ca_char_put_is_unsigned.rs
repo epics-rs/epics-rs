@@ -15,8 +15,8 @@
 //! `DBR_CHAR`) landed −56 −55 where a C IOC lands 200 201.
 //!
 //! Every case drives BOTH receive loops — the async host driver
-//! (`server::tcp::handle_client`) and the blocking driver the RTEMS and
-//! VxWorks images run (`server::blocking`) — because they share one write
+//! (`server::tcp::handle_client`) and the blocking driver the RTEMS image
+//! runs (`server::blocking`) — because they share one write
 //! head (`serve_write_head`) and a test that proved only one of them is what
 //! lets a shared-gate defect survive a review round.
 //!

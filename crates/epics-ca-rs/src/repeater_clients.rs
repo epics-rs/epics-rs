@@ -26,9 +26,9 @@
 //! nothing else.
 //!
 //! Here that reading was: `socket2` and `tokio`, both declared in `Cargo.toml`
-//! under `cfg(not(any(target_os = "rtems", target_os = "vxworks")))`, and no
-//! reactor. So this module carries the TARGET gate, `not(epics_embedded_target)`
-//! — on RTEMS and VxWorks neither crate exists, so there is nothing to build
+//! under `cfg(not(target_os = "rtems"))`, and no reactor. So this module
+//! carries the TARGET gate, `not(epics_embedded_target)` — on RTEMS neither
+//! crate exists, so there is nothing to build
 //! and no caller left to build it for — and it must never acquire a BACKEND
 //! gate. `tokio_backend` is what removes `repeater`; a host building
 //! `--all-features` has every dependency this module needs and no reactor for

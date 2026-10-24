@@ -1089,7 +1089,7 @@ impl CaServer {
         //
         // That runtime is tokio's, not the exec model's. `CaServer` is
         // `#[cfg(not(epics_embedded_target))]`, so nothing below ever compiles
-        // for RTEMS or VxWorks — the target reaches the network through
+        // for RTEMS — the target reaches the network through
         // `server::blocking` — and `runtime::task::Reactor` says in its own
         // docs that its exec-backend arm is the callback band and does not
         // make `tokio::net` work. Because that arm is a ZST whose `current()`

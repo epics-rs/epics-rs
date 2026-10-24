@@ -415,8 +415,8 @@ impl RecvAccumulator {
     }
 
     /// **The CA server's one TCP gate sequence**, run by the async loop
-    /// (`server::tcp::handle_client`) and by the blocking loop the RTEMS and
-    /// VxWorks drivers use (`server::blocking::serve_client`).
+    /// (`server::tcp::handle_client`) and by the blocking loop the RTEMS
+    /// driver uses (`server::blocking::serve_client`).
     ///
     /// Decides what the bytes at the parse cursor are, in C `camessage.c`'s
     /// order, and advances the cursor by exactly what it decided. A caller
@@ -597,8 +597,8 @@ impl RecvAccumulator {
     /// the message's real length on all of them; a clamped stand-in would
     /// hand the drain accounting a length shorter than the body it is
     /// draining. C's bound is 32 bits wide by construction, which is also
-    /// what keeps the add from wrapping where `usize` is 32 bits — RTEMS and
-    /// VxWorks, the two targets the blocking loop was written for.
+    /// what keeps the add from wrapping where `usize` is 32 bits — RTEMS, the
+    /// target the blocking loop was written for.
     fn message_len(hdr_size: usize, declared_body: usize) -> Option<usize> {
         const LIMIT: usize = u32::MAX as usize - (CaHeader::SIZE + EXTENDED_EXTRA);
         if declared_body >= LIMIT {

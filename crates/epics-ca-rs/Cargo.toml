@@ -53,21 +53,21 @@ opentelemetry_sdk = { version = "0.24", default-features = false, features = ["t
 opentelemetry-otlp = { version = "0.17", default-features = false, features = ["grpc-tonic", "trace"], optional = true }
 tracing-opentelemetry = { version = "0.25", optional = true }
 
-# Host-only dependencies — gated out for the embedded targets (RTEMS's
-# armv7-rtems-eabihf, and the `*-wrs-vxworks*` triples).
+# Host-only dependencies — gated out for the embedded target (RTEMS's
+# armv7-rtems-eabihf).
 #
 # The async CA front-end (`tokio::net` async server/client, the UDP net stack)
-# is host-only: its deps do not build for RTEMS or VxWorks, and the embedded
+# is host-only: its deps do not build for RTEMS, and the embedded
 # CA server uses the separate S1 `std::net` blocking driver
 # (`server::blocking`), not these.
 #
 # tokio: the hosted build uses the full runtime; the embedded build drops the
 # `net`, `signal`, and `process` features — the ones that pull `mio`,
 # `signal-hook-registry`, and `socket2` (0.6 transitively), none of which build
-# for armv7-rtems-eabihf or the `*-wrs-vxworks*` triples. Declared per-target
-# rather than in shared `[dependencies]` because Cargo UNIONS a dependency's
-# features across all matching tables, so a shared `full` would re-add the
-# dropped features on either embedded target. The retained set
+# for armv7-rtems-eabihf. Declared per-target rather than in shared
+# `[dependencies]` because Cargo UNIONS a dependency's features across all
+# matching tables, so a shared `full` would re-add the dropped features on the
+# embedded target. The retained set
 # (rt/rt-multi-thread/time/sync/macros/io/fs) keeps every non-net tokio API
 # the always-compiled shared code uses (Handle, block_in_place, select!, sync
 # primitives, tokio::io duplex/split) compiling there; those paths are unused
@@ -79,12 +79,12 @@ tracing-opentelemetry = { version = "0.25", optional = true }
 # goes host-only. The module gates (`server/mod.rs`, `server/udp.rs`, etc.) match
 # this table via the `build.rs`-emitted `epics_embedded_target` cfg, which
 # `Cargo.toml` target tables cannot reference directly (only built-in `cfg()`
-# predicates), hence spelling the target-OS pair out here.
-[target.'cfg(not(any(target_os = "rtems", target_os = "vxworks")))'.dependencies]
+# predicates), hence spelling the target OS out here.
+[target.'cfg(not(target_os = "rtems"))'.dependencies]
 tokio = { version = "1", features = ["full"] }
 socket2 = { version = "0.5", features = ["all"] }
 
-[target.'cfg(any(target_os = "rtems", target_os = "vxworks"))'.dependencies]
+[target.'cfg(target_os = "rtems")'.dependencies]
 tokio = { version = "1", default-features = false, features = [
     "fs",
     "io-util",

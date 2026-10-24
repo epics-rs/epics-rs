@@ -13,9 +13,9 @@ use std::time::{Duration, Instant};
 // It was host-only until `epics_base_rs::net::search_udp` existed, for two
 // reasons that were both about `AsyncUdpV4` rather than about UDP:
 //
-//   * `AsyncUdpV4` does not compile for either embedded target — it is built
-//     on `tokio::net` and `socket2`, and neither crosses
-//     to `armv7-rtems-eabihf` or the `*-wrs-vxworks*` triples.
+//   * `AsyncUdpV4` does not compile for the embedded target — it is built
+//     on `tokio::net` and `socket2`, and neither crosses to
+//     `armv7-rtems-eabihf`.
 //   * On any backend-free build the engine runs on a callback-pool worker
 //     (`runtime::task::spawn`), where `tokio::net::UdpSocket` panics — "there
 //     is no reactor running" — even when the process has a runtime somewhere
@@ -3455,9 +3455,7 @@ mod tests {
     /// `CircuitWatchdog::retire_bound()`, i.e. `echo_idle_secs()` of quiet plus
     /// `ECHO_TIMEOUT_SECS` for the `CA_PROTO_ECHO` probe to come back.
     ///
-    /// Measured before this rule existed, on a VxWorks target against exactly
-    /// this peer: ten consecutive descriptor censuses on one local port over
-    /// ≈600 s, one accept, dial-pool `attempts=1`. The reader
+    /// Before this rule existed the reader
     /// wrote `CA_PROTO_ECHO` on a hardcoded 60 s tick and never looked for the
     /// reply, so nothing could ever end the circuit short of TCP itself giving
     /// up — which a *silent but reachable* peer never makes happen.

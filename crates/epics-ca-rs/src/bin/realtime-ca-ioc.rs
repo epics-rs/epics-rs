@@ -59,15 +59,10 @@
 //!
 //! # Build configurations
 //!
-//! The real entry point is compiled for `target_os = "rtems"`, `target_os =
-//! "vxworks"`, or the host-selectable `EPICS_RS_BUILD_EXEC_BACKEND=thread`.
-//! RTEMS has no other option; on VxWorks this binary-level gate is necessary
-//! but not sufficient — `epics-base-rs/build.rs` still only sets the
-//! `exec_backend` cfg (the `runtime::task` seam's executor backend) for
-//! `target_os = "rtems"` or `EPICS_RS_BUILD_EXEC_BACKEND=thread`, so a VxWorks
-//! build also needs that variable, or the lib-side predicate this gate
-//! anticipates, until the `exec_backend` derivation itself recognizes
-//! `target_os = "vxworks"`. Under the hosted default (tokio backend) this
+//! The real entry point is compiled under `exec_backend` (the `runtime::task`
+//! seam's executor backend): `target_os = "rtems"`, which has no other option,
+//! or the host-selectable `EPICS_RS_BUILD_EXEC_BACKEND=thread`. Under the
+//! hosted default (tokio backend) this
 //! binary is still built — so it stays compiled and linted in the default test
 //! set — but refuses to run. The reason is narrower than it once read here,
 //! and worth stating exactly, because two of the three parts it used to name
@@ -238,9 +233,6 @@ mod demo_db {
     ///     C1..C8 one. The engine, like C's `dbProcess`, imposes no depth
     ///     bound, so a CA put to `H` processes `H` and all of `L1..L32`, and
     ///     the `CAS-client` high-water below is depth-inclusive for 32 hops.
-    ///     (The `x86_64-wrs-vxworks` numbers were MEASURED while the engine
-    ///     still bailed at its former 16-hop bound, `L15 = 1215.0`,
-    ///     `L16 = 0.0`; a 32-hop run has not been re-measured since.)
     ///   * `WFBIG` — 131,072 `DOUBLE`, a 1,048,576 B reply, 4× `WF`. `WF`
     ///     alone cannot say whether stack high-water scales with payload
     ///     size; two array sizes an octave apart can.
@@ -311,175 +303,6 @@ mod demo_db {
         "record(ai, \"RTEMS:E8:F7\") { field(PREC, \"3\") }\n",
         "record(ai, \"RTEMS:E8:F8\") { field(PREC, \"3\") }\n",
     );
-}
-
-/// E8 STACK PROBE, second half: link-time interposers that name the allocation
-/// behind the wall-abort mutex `EINVAL`.
-///
-/// The SDK's `pthreadLib.o` settles the chain statically —
-/// `pthread_mutex_lock+0x34` calls `pthreadMutexInitComplete`, which calls
-/// `pthreadMutexInit`, which calls `semMCreate` and, when that returns NULL,
-/// returns `0x16` = `EINVAL` rather than `ENOMEM`; `InitComplete` passes the
-/// code through and `pthread_mutex_lock` returns it verbatim, so std's
-/// `Mutex::lock` panics with "invalid argument (os error 22)". Note that
-/// `pthread_mutex_init` only *stamps* the `0xec542a37` magic and never calls
-/// `semMCreate` itself, so **every** VxWorks pthread mutex materialises its
-/// semaphore on first lock and an eager `init()` does not avoid this.
-///
-/// This proves the same chain on target. Built only when the linker is given
-/// `--wrap=semMCreate --wrap=pthread_mutex_lock`; without those flags the
-/// `__wrap_*` symbols are simply unreferenced.
-///
-/// Everything here is allocation-free and takes no std lock, because it runs
-/// *inside* the failing path: a `format!` would call the allocator that is
-/// already refusing, and an `eprintln!` would lock the very kind of object
-/// whose creation just failed.
-#[cfg(all(feature = "bringup-probes", target_os = "vxworks"))]
-mod mutex_alloc_probe {
-    use std::ffi::c_void;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    static SEM_OK: AtomicUsize = AtomicUsize::new(0);
-    static SEM_NULL: AtomicUsize = AtomicUsize::new(0);
-    static LOCK_FAIL: AtomicUsize = AtomicUsize::new(0);
-
-    /// How many of each event to print before going quiet. A wall event can
-    /// produce these in a tight loop and the console is a 115200-baud pipe.
-    const REPORT_CAP: usize = 24;
-
-    /// Fixed-buffer line writer: no allocator, no locks, one `write(2)`.
-    struct Line {
-        buf: [u8; 240],
-        n: usize,
-    }
-
-    impl Line {
-        const fn new() -> Self {
-            Self {
-                buf: [0; 240],
-                n: 0,
-            }
-        }
-
-        fn s(&mut self, t: &str) -> &mut Self {
-            for &b in t.as_bytes() {
-                if self.n < self.buf.len() {
-                    self.buf[self.n] = b;
-                    self.n += 1;
-                }
-            }
-            self
-        }
-
-        fn d(&mut self, mut v: usize) -> &mut Self {
-            let mut tmp = [0u8; 20];
-            let mut i = tmp.len();
-            loop {
-                i -= 1;
-                tmp[i] = b'0' + (v % 10) as u8;
-                v /= 10;
-                if v == 0 || i == 0 {
-                    break;
-                }
-            }
-            // SAFETY-free: the slice is ASCII digits by construction.
-            let digits = core::str::from_utf8(&tmp[i..]).unwrap_or("?");
-            self.s(digits)
-        }
-
-        fn h(&mut self, v: usize) -> &mut Self {
-            self.s("0x");
-            let mut started = false;
-            for shift in (0..16).rev() {
-                let nib = ((v >> (shift * 4)) & 0xf) as u8;
-                if nib != 0 || started || shift == 0 {
-                    started = true;
-                    let c = if nib < 10 {
-                        b'0' + nib
-                    } else {
-                        b'a' + nib - 10
-                    };
-                    if self.n < self.buf.len() {
-                        self.buf[self.n] = c;
-                        self.n += 1;
-                    }
-                }
-            }
-            self
-        }
-
-        fn emit(&mut self) {
-            self.s("\n");
-            unsafe {
-                libc::write(2, self.buf.as_ptr().cast::<c_void>(), self.n);
-            }
-        }
-    }
-
-    unsafe extern "C" {
-        fn __real_semMCreate(options: libc::c_int) -> *mut c_void;
-        fn __real_pthread_mutex_lock(m: *mut libc::pthread_mutex_t) -> libc::c_int;
-    }
-
-    /// The allocation that fails. `semMCreate` returning NULL is what turns
-    /// into `EINVAL` two frames up.
-    #[unsafe(no_mangle)]
-    pub unsafe extern "C" fn __wrap_semMCreate(options: libc::c_int) -> *mut c_void {
-        let sem = unsafe { __real_semMCreate(options) };
-        if sem.is_null() {
-            let n = SEM_NULL.fetch_add(1, Ordering::Relaxed);
-            if n < REPORT_CAP {
-                let mut l = Line::new();
-                l.s("MTXPROBE semMCreate=NULL nth_null=")
-                    .d(n + 1)
-                    .s(" succeeded_before=")
-                    .d(SEM_OK.load(Ordering::Relaxed))
-                    .s(" options=")
-                    .h(options as usize)
-                    .emit();
-            }
-        } else {
-            let ok = SEM_OK.fetch_add(1, Ordering::Relaxed) + 1;
-            // A running census on a milestone rather than from a call site: the
-            // console reporter lives in the rig patch, not in this file, and the
-            // trajectory up to the wall is the number the reservation budget
-            // needs. The first call reports unconditionally: silence must mean
-            // "no semaphores created", never "the --wrap flags did not take",
-            // and on the first run of this probe those two were indistinguishable.
-            if ok == 1 || ok % 512 == 0 {
-                let mut l = Line::new();
-                l.s("MTXPROBE semaphores_created=").d(ok).emit();
-            }
-        }
-        sem
-    }
-
-    /// The symptom. Reports the mutex address and the running semaphore count,
-    /// so a failing lock can be tied to the NULL that caused it.
-    #[unsafe(no_mangle)]
-    pub unsafe extern "C" fn __wrap_pthread_mutex_lock(
-        m: *mut libc::pthread_mutex_t,
-    ) -> libc::c_int {
-        let rc = unsafe { __real_pthread_mutex_lock(m) };
-        if rc != 0 {
-            let n = LOCK_FAIL.fetch_add(1, Ordering::Relaxed);
-            if n < REPORT_CAP {
-                let mut l = Line::new();
-                l.s("MTXPROBE lock rc=")
-                    .d(rc as usize)
-                    .s(" mutex=")
-                    .h(m as usize)
-                    .s(" nth_fail=")
-                    .d(n + 1)
-                    .s(" sem_ok=")
-                    .d(SEM_OK.load(Ordering::Relaxed))
-                    .s(" sem_null=")
-                    .d(SEM_NULL.load(Ordering::Relaxed))
-                    .emit();
-            }
-        }
-        rc
-    }
 }
 
 #[cfg(exec_backend)]
@@ -1040,18 +863,6 @@ mod ioc {
         let boot_args: Vec<String> =
             unsafe { epics_rtems_boot::boot_args::apply_boot_env(std::env::args().skip(1)) };
 
-        // (0-reg) Announce this thread to the statistics funnel's thread
-        //     census. Every other IOC thread does this from
-        //     `runtime::task::enter_ioc_thread`, which `main` deliberately does
-        //     not call — it is the one thread that keeps the band the OS
-        //     started it with — so it is also the one thread that has to
-        //     register itself. Without this the census would be missing the
-        //     thread that owns the database.
-        //
-        //     No `#[cfg]`: the funnel is portable and every backend but
-        //     VxWorks' takes this as a no-op.
-        epics_rtems_boot::stats::register_task();
-
         // (0-cmd) The RTEMS operator commands — C `iocshRegisterRTEMS`
         //     ($EPICS_BASE/modules/libcom/RTEMS/posix/rtems_init.c:692-705 at
         //     R7.0.10). C registers `netstat`, `heapSpace`, `zoneset`, `rt` and
@@ -1060,9 +871,9 @@ mod ioc {
         //     are registered.
         //
         //     `cfg!` and not `#[cfg]`: the call compiles on every target this
-        //     binary builds for, and the condition is C's own — `iocshRegisterRTEMS`
-        //     exists only in the RTEMS build of libCom, so a host or VxWorks
-        //     image must not grow the names.
+        //     binary builds for, and the condition is C's own —
+        //     `iocshRegisterRTEMS` exists only in the RTEMS build of libCom, so
+        //     a host image must not grow the names.
         //
         //     KNOWN, and not a defect in the registration: this target has no
         //     iocsh (`rustyline` does not build for RTEMS, see above), so
@@ -1459,7 +1270,7 @@ fn main() -> ExitCode {
     epics_base_rs::runtime::task::refuse_backend(
         "realtime-ca-ioc: built with the tokio task backend, which this entry point \
          does not start a runtime for.\n\
-         Build it for `armv7-rtems-eabihf` or a VxWorks target, or on a host \
+         Build it for `armv7-rtems-eabihf`, or on a host \
          rebuild with EPICS_RS_BUILD_EXEC_BACKEND=thread.",
     )
 }
@@ -1510,8 +1321,7 @@ mod tests {
     /// this thread takes; the charge is what makes the worker pool's budget
     /// know it was taken. Without it the pool admits clients against a number
     /// that has never heard of the acceptor, the name-search responder or the
-    /// probe — roughly 15 MiB of fixed IOC threads measured on the VxWorks
-    /// target, so the refusal lands later than the budget says it will.
+    /// probe, so the refusal lands later than the budget says it will.
     ///
     /// The charge must be held *inside* the spawned body, not by the spawning
     /// function: a guard left on the calling thread is released the moment

@@ -3,7 +3,7 @@
 //! `EPICS_CAS_RATE_LIMIT_MSGS_PER_SEC` / `_BURST` / `_STRIKES` are documented
 //! for the CA server with no host-only qualification, but the token draw lived
 //! in `server::tcp::handle_client`, which no reactor-free build compiles at
-//! all — so on RTEMS and VxWorks, where `server::blocking` is the only receive
+//! all — so on RTEMS, where `server::blocking` is the only receive
 //! loop, all three were inert. The gate now belongs to `RecvAccumulator`,
 //! which both loops parse through; this file measures that on both rather than
 //! reasoning from the shared type.
@@ -97,7 +97,7 @@ fn seed_db() -> Arc<PvDatabase> {
     db
 }
 
-/// The blocking driver — the one RTEMS and VxWorks run.
+/// The blocking driver — the one RTEMS runs.
 fn against_blocking(script: &[Vec<u8>]) -> Outcome {
     let server = Arc::new(
         BlockingCaServer::bind(

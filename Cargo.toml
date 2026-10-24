@@ -105,12 +105,12 @@ serde_json = { version = "1", features = ["float_roundtrip"] }
 lto = "fat"
 codegen-units = 1
 
-# Deployable-image profile for the embedded targets (RTEMS / VxWorks), where
+# Deployable-image profile for the embedded target (RTEMS), where
 # image size is a real resource: `cargo build --profile release-embedded ...`.
 # Only `strip` separates it from `release` now that `release` carries the same
 # LTO settings; the measured strip/LTO size matrix it reproduces (row 5: CA
-# −15.6/−18.9 %, PVA −19.7/−22.6 %) was taken against a no-LTO `--release`,
-# so those figures describe the old baseline, not the current one.
+# −15.6 %, PVA −19.7 %) was taken against a no-LTO `--release`, so those
+# figures describe the old baseline, not the current one.
 [profile.release-embedded]
 inherits = "release"
 strip = "symbols"
@@ -127,21 +127,13 @@ strip = "symbols"
 # is a patch and not a local type definition. `scripts/rtems-check.sh` fails
 # all six `image` targets without it.
 #
-# VxWorks 7 (x86_64-wrs-vxworks) needs nothing from here any more. std stopped
-# importing all three symbols the fork had shimmed: `pread`/`pwrite` (its own
-# vxworks arm in `sys/fd/unix.rs`, rust-lang/libc#5328), `killpg` (`mod unix`
-# is not compiled for the target) and `getentropy` (`sys/random/vxworks.rs`
-# calls `randSecure`/`randABytes`, both published). MEASURED:
-# `scripts/vxworks-check.sh` goes green against a stock 0.2.189 with this whole
-# block deleted.
-#
 # NOTE a manifest `[patch]` does NOT reach `-Zbuild-std`, which resolves std's
 # own libc from rust-src's lock; only a CONFIG-level patch does, and only at
 # the exact libc version that lock pins (both measured -- see
-# `scripts/libc-std-patch.sh`). The gates and `scripts/embedded-image.sh`
-# therefore derive a `--config` patch from this entry via that helper (a
-# clone of this rev, version-relabelled for the toolchain), keeping this
-# line the single source of truth for both resolutions.
+# `scripts/libc-std-patch.sh`). `scripts/embedded-image.sh` therefore derives
+# a `--config` patch from this entry via that helper (a clone of this rev,
+# version-relabelled for the toolchain), keeping this line the single source
+# of truth for both resolutions.
 #
 # Pinned by rev on upstream `libc-0.2` itself -- the `physwkim/libc` fork this
 # used to name is retired, both halves of it having landed or become moot. The

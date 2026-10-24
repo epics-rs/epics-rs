@@ -17,7 +17,7 @@ Just `cargo build`.
 - **StreamDevice** — `.proto` protocol files on asyn, with PCRE 8.45 ported to Rust for `%/regexp/`
 - **Sequencer** — snc compiles an unchanged `.st` program to Rust at build time; seq runs it
 - **Drivers** — MQTT broker bridge, Modbus TCP/RTU/ASCII
-- **Targets** — Linux/macOS/Windows (x86_64 + arm64), RTEMS 7 and 6, VxWorks 7, Linux PREEMPT_RT
+- **Targets** — Linux/macOS/Windows (x86_64 + arm64), RTEMS 7 and 6, Linux PREEMPT_RT
 
 ## Installation
 
@@ -223,33 +223,6 @@ wired in `.cargo/config.toml`, so plain `cargo build` is the whole interface.
 122.9 MB. Full build manual, including the PVA/QSRV image, in
 [`crates/epics-rtems-boot/README.md`](crates/epics-rtems-boot/README.md).
 
-## Build for VxWorks 7 (x86_64-wrs-vxworks)
-
-VxWorks 7 is the second embedded target, reached through the same
-`epics_embedded_target` cfg rather than a second OS special case. It is also
-tier-3, so it needs a nightly toolchain with `rust-src` and `-Zbuild-std`, but
-being a builtin triple it needs no custom spec:
-
-```bash
-# census, then type-check the whole VxWorks closure — no SDK needed
-./scripts/vxworks-check.sh
-
-# deployable RTP image (needs the Wind River SDK: wr-cc and the RTP libs)
-./scripts/embedded-image.sh vxworks ca
-```
-
-RTEMS pins `libc` to an upstream `rust-lang/libc` rev for the scalar-width
-and socket-layout fixes no published 0.2 release carries yet; VxWorks needs
-nothing from it. A manifest `[patch.crates-io]` does not reach `-Zbuild-std`,
-which resolves std against rust-src's own lock, so `scripts/libc-std-patch.sh`
-derives a config-level patch from that same pin — `vxworks-check.sh` and
-`embedded-image.sh` both call it, leaving the manifest line the single source
-of truth for what libc is compiled. That is what lets the closure be
-type-checked on a stock nightly, CI included; linking stays on a box with the
-SDK. Measured on target: 11/11 gate rows, CA and PVA round-trips over the
-wire, and a five-row strip/LTO size matrix covering both embedded targets and
-both binaries.
-
 ## Run on RT Linux (PREEMPT_RT)
 
 On a PREEMPT_RT kernel the ordinary host build is the whole build — real time
@@ -354,7 +327,7 @@ See [`CHANGELOG.md`](./CHANGELOG.md) for the release-by-release audit trail.
 ## Requirements
 
 - Rust 1.99.1, pinned in [`rust-toolchain.toml`](rust-toolchain.toml) (edition 2024)
-- RTEMS and VxWorks builds: a nightly toolchain with `rust-src` (see above)
+- RTEMS builds: a nightly toolchain with `rust-src` (see above)
 
 ## Related projects
 

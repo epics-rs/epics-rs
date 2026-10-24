@@ -15,7 +15,7 @@
 //! No-ops on every non-RTEMS target.
 //!
 //! Also emits `epics_embedded_target` (set when `CARGO_CFG_TARGET_OS` is
-//! `rtems` or `vxworks`) for this crate's own gates, which read it through
+//! `rtems`) for this crate's own gates, which read it through
 //! the `exec_backend`/`tokio_backend` pair below — a `cargo::rustc-cfg` set by a dependency's build script does not
 //! propagate to a dependent crate either, so each crate that reads the cfg
 //! emits its own copy, same as `epics-libcom-rs`/`epics-base-rs`/
@@ -41,7 +41,7 @@ fn main() {
     println!("cargo::rustc-check-cfg=cfg(exec_backend)");
     println!("cargo::rustc-check-cfg=cfg(tokio_backend)");
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
-    let embedded_target = matches!(target_os.as_str(), "rtems" | "vxworks");
+    let embedded_target = target_os == "rtems";
     if embedded_target {
         println!("cargo::rustc-cfg=epics_embedded_target");
     }

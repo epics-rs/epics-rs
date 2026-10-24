@@ -268,8 +268,8 @@ Tests cover: type conversion roundtrips, NormativeType structure building, pvReq
 
 - epics-base-rs — Record trait, PvDatabase, Snapshot, DbSubscription, and the
   `runtime` layer
-- tokio — the full runtime on a host; RTEMS and VxWorks drop `net`,
-  `signal` and `process`
+- tokio — the full runtime on a host; RTEMS drops `net`, `signal` and
+  `process`
 - epics-pva-rs — PvStructure, ScalarValue, FieldDesc (`qsrv-core`, `pvalink`,
   `pva-gateway`)
 - epics-ca-rs — the gateway's two CA sides (`ca-gateway`), the network half

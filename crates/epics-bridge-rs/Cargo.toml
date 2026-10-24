@@ -190,18 +190,15 @@ regex = { version = "1", optional = true }
 clap = { version = "4", features = ["derive"], optional = true }
 toml = { version = "0.8", optional = true }
 
-# tokio: the hosted build uses the full runtime; the embedded build (RTEMS or
-# VxWorks) drops the `net`, `signal`, and `process` features — the ones that
-# pull `mio`, `signal-hook-registry`, and `socket2`, none of which build for
-# armv7-rtems-eabihf or the `*-wrs-vxworks*` triples. Measured on RTEMS: with
+# tokio: the hosted build uses the full runtime; the embedded build (RTEMS)
+# drops the `net`, `signal`, and `process` features — the ones that pull `mio`,
+# `signal-hook-registry`, and `socket2`, none of which build for
+# armv7-rtems-eabihf. Measured on RTEMS: with
 # everything else at the zero-error state and only this dependency left
 # unsplit, the target build produces 58 errors — 31 in `mio` (`file not found
 # for module `selector``, `... `waker``, `unresolved import
 # `crate::sys::IoSourceState``), the rest in `socket2` (`unresolved import
-# `libc::SOCK_RAW``) and `signal-hook-registry`. Not separately measured on
-# VxWorks, but the same three deps are Linux/BSD-reactor-specific crates with
-# no `*-wrs-vxworks*` support either, so the split follows the same
-# dependency-availability rule, not a per-target error count.
+# `libc::SOCK_RAW``) and `signal-hook-registry`.
 #
 # Declared per-target rather than in shared `[dependencies]` because Cargo
 # UNIONS a dependency's features across all matching tables, so a shared `full`
@@ -213,10 +210,10 @@ toml = { version = "0.8", optional = true }
 # what keeps every mpsc channel and lock in the serving path legal on the
 # target — `park_on`'s contract names `tokio::sync` primitives as the ones a
 # future may await under it.
-[target.'cfg(not(any(target_os = "rtems", target_os = "vxworks")))'.dependencies]
+[target.'cfg(not(target_os = "rtems"))'.dependencies]
 tokio = { version = "1", features = ["full"] }
 
-[target.'cfg(any(target_os = "rtems", target_os = "vxworks"))'.dependencies]
+[target.'cfg(target_os = "rtems")'.dependencies]
 tokio = { version = "1", default-features = false, features = [
     "fs",
     "io-util",

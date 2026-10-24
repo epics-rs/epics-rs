@@ -67,8 +67,8 @@ fn code_lines(src: &'static str) -> impl Iterator<Item = (usize, &'static str)> 
 /// takes all three.
 ///
 /// `std` gives RTEMS the generic 2 MiB `DEFAULT_MIN_STACK_SIZE`
-/// (`std/src/sys/thread/unix.rs`: the carve-out list names vxworks, l4re,
-/// espidf and nuttx — not rtems). On the host that is lazily-committed
+/// (`std/src/sys/thread/unix.rs` carves a smaller one out for a few targets,
+/// and RTEMS is not one of them). On the host that is lazily-committed
 /// address space and costs nothing measurable; on the target it is carved
 /// eagerly out of a fixed pool, which is why an unset stack size is the
 /// first ceiling the IOC hits rather than a rounding error. `std` likewise
@@ -141,7 +141,7 @@ fn every_thread_in_this_crate_goes_through_mandatory_thread() {
 /// unwrap; `try_spawn` returns a `Result` precisely so a caller inside a
 /// fallible boot step can hand the failure to whoever decides that this IOC
 /// serves. Unwrapping *that* would restore the original defect: on a
-/// `panic = "unwind"` target — RTEMS and VxWorks both default to unwind — the
+/// `panic = "unwind"` target — RTEMS defaults to unwind — the
 /// panic kills only the calling thread, and the IOC goes on answering clients
 /// with the work that thread owned never running.
 #[test]

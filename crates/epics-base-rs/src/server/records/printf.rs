@@ -1180,7 +1180,7 @@ mod libc_differential {
     ///
     /// Reproducing it would be wrong beyond this host: the record's text
     /// is whatever `epicsSnprintf` -> `vsnprintf` gives (`osdStdio.c:29`),
-    /// which on the RTEMS and VxWorks targets is newlib, not glibc. So
+    /// which on the RTEMS target is newlib, not glibc. So
     /// `cfmt::CFloat` emits the C99 form and the differential skips these
     /// samples rather than pinning one libc's bug into the port.
     fn is_glibc_alt_g_carry_quirk(conv: u8, alt: bool, ours: &str, theirs: &str) -> bool {

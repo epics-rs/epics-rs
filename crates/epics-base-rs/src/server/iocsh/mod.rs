@@ -1238,8 +1238,8 @@ impl IocShell {
         // piped path below is the interactive scope too.
         let _scope = self.enter_scope(IocshScope::interactive());
         // The interactive rustyline editor is host-only (rustyline pulls `nix`,
-        // which does not build for RTEMS or VxWorks). On either embedded
-        // target the piped-stdin REPL is the only path until the embedded
+        // which does not build for RTEMS). On the embedded target the
+        // piped-stdin REPL is the only path until the embedded
         // iocsh wiring lands (a later increment).
         #[cfg(not(epics_embedded_target))]
         {

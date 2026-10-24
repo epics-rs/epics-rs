@@ -15,9 +15,9 @@
 //! `EPICS_RS_BUILD_EXEC_BACKEND`.
 //!
 //! * `exec_backend` — the std-thread background executor. The only option on
-//!   `epics_embedded_target` (RTEMS or VxWorks — no tokio reactor on
-//!   either), and — via `EPICS_RS_BUILD_EXEC_BACKEND=thread` — the
-//!   host-selectable RTEMS execution model.
+//!   `epics_embedded_target` (RTEMS — no tokio reactor there), and — via
+//!   `EPICS_RS_BUILD_EXEC_BACKEND=thread` — the host-selectable RTEMS execution
+//!   model.
 //! * `tokio_backend` — the tokio runtime. The hosted default (variable unset
 //!   or `tokio`, non-embedded target).
 //!
@@ -39,7 +39,7 @@ fn main() {
     println!("cargo::rustc-check-cfg=cfg(epics_embedded_target)");
 
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
-    let embedded_target = matches!(target_os.as_str(), "rtems" | "vxworks");
+    let embedded_target = target_os == "rtems";
     if embedded_target {
         println!("cargo::rustc-cfg=epics_embedded_target");
     }

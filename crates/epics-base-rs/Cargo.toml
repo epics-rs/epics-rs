@@ -39,13 +39,11 @@ epics-libcom-rs = { workspace = true }
 epics-rtems-boot = { workspace = true }
 serde_json = { workspace = true, features = ["preserve_order"] }
 
-# Host-only dependencies — gated out for the embedded targets (RTEMS's
-# armv7-rtems-eabihf, and the `*-wrs-vxworks*` triples).
+# Host-only dependencies — gated out for the embedded target (RTEMS's
+# armv7-rtems-eabihf).
 #
-# `rustyline` pulls `nix`, which does not build for either: no `sa_sigaction`
-# in the RTEMS libc, and `nix` carries no VxWorks target support at all (no
-# `armv7-rtems-eabihf`/`*-wrs-vxworks*` arm anywhere in its source — confirmed
-# by grepping the pinned dependency). It backs only the *interactive* iocsh
+# `rustyline` pulls `nix`, which does not build for it: no `sa_sigaction` in
+# the RTEMS libc. It backs only the *interactive* iocsh
 # line editor (`iocsh::Iocsh::run_repl_interactive`); the piped-stdin REPL
 # covers non-interactive use, and embedded-target iocsh wiring is a later
 # increment.
@@ -56,20 +54,20 @@ serde_json = { workspace = true, features = ["preserve_order"] }
 # tokio: the hosted build uses the full runtime; the embedded build drops the
 # `net`, `signal`, and `process` features — the ones that pull `mio`,
 # `signal-hook-registry`, and `socket2`, none of which build for
-# armv7-rtems-eabihf or the `*-wrs-vxworks*` triples. Declared per-target
-# rather than in shared `[dependencies]` because Cargo UNIONS a dependency's
-# features across all matching tables, so a shared `full` would re-add the
-# dropped features on either embedded target. The retained set
+# armv7-rtems-eabihf. Declared per-target rather than in shared
+# `[dependencies]` because Cargo UNIONS a dependency's features across all
+# matching tables, so a shared `full` would re-add the dropped features on the
+# embedded target. The retained set
 # (rt/rt-multi-thread/time/sync/macros/io/fs) keeps every non-net tokio API the
 # always-compiled base code uses (Handle, block_in_place, select!, sync
 # primitives) compiling there; those paths are unused there (the sans-io seam
 # routes to the background executor) but must still type-check for `--lib`.
-[target.'cfg(not(any(target_os = "rtems", target_os = "vxworks")))'.dependencies]
+[target.'cfg(not(target_os = "rtems"))'.dependencies]
 tokio = { version = "1", features = ["full"] }
 rustyline = "18"
 socket2 = { version = "0.5", features = ["all"] }
 
-[target.'cfg(any(target_os = "rtems", target_os = "vxworks"))'.dependencies]
+[target.'cfg(target_os = "rtems")'.dependencies]
 tokio = { version = "1", default-features = false, features = [
     "fs",
     "io-util",

@@ -9,14 +9,13 @@ non-RTEMS target it is empty and costs a host build nothing.
 This README is the build manual for the RTEMS target. The crate-level rustdoc
 (`src/lib.rs`) documents the boot/link contract itself.
 
-## Why an RTEMS-named crate has a VxWorks file in it
+## Why the stats funnel lives here
 
 `src/stats/` is the IOC statistics funnel — descriptor and heap usage for the
 status PVs, plus the console census (`rt top` / `rt stackuse` / a descriptor
-listing) that a target with no shell has no other way to produce. It is *not*
-RTEMS-specific: it has one backend per OS (`rtems.rs`, `vxworks.rs`,
-`unsupported.rs`) behind a single set of entry points, so `status_pv` and both
-IOC binaries have one uncfg'd call site each.
+listing) that a target with no shell has no other way to produce. It has one
+backend per OS (`rtems.rs`, `unsupported.rs`) behind a single set of entry
+points, so `status_pv` and both IOC binaries have one uncfg'd call site each.
 
 It lives here rather than in `epics-libcom-rs`, the workspace's os-portability
 crate, for one reason that is not a preference: the RTEMS backend's symbols

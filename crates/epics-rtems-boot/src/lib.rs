@@ -162,21 +162,13 @@
 //!
 //! A row reading *no settled pin* means no revision has been agreed for that
 //! tree: say which revision you read, and do not take its `HEAD` for the pin.
-//! Citations into non-EPICS sources (libc, RTEMS, `rtems-libbsd`, VxWorks,
-//! vendored third-party) are outside this table and carry no pin.
+//! Citations into non-EPICS sources (libc, RTEMS, `rtems-libbsd`, vendored
+//! third-party) are outside this table and carry no pin.
 
 pub mod boot_args;
 pub mod contract;
 pub mod shell;
 pub mod stats;
-
-/// The lowest address of the calling task's stack, from its `TASK_DESC`: a
-/// VxWorks RTP has no `pthread_getattr_np`, and the descriptor's binding is
-/// this crate's.
-#[cfg(target_os = "vxworks")]
-pub fn current_task_stack_low() -> Option<usize> {
-    stats::backend::current_task_stack_low()
-}
 
 /// Undefined symbol deliberately left in this crate's object graph when it is
 /// built for RTEMS without [`contract::BSP_PREFIX_ENV`].

@@ -106,11 +106,6 @@ const EXPECTED_FAILURES: &[(&str, &str)] = &[
         "sequencer/examples/parallel/control.st",
         "control.st:37: error[E0425]: cannot find function `pvPutCompleteArray` in this scope: not found in this scope",
     ),
-    // these wait for C's pointer operations
-    (
-        "sequencer/test/validate/sizeof.st",
-        "sizeof.st:21: error: snc-rs cannot compute this sizeof",
-    ),
     // C's void * and a function pointer have no Rust type
     (
         "sequencer/test/compiler/funcdef.st",

@@ -2135,8 +2135,7 @@ impl<'a> Gen<'a> {
         let ast = self.ast;
         let size = ast[ep]
             .child(child::FUNC_ARGS)
-            .and_then(|a| sizeof_type(ast, a))
-            .and_then(|t| type_size(ast, t));
+            .and_then(|a| self.operand_size(a));
         let size = size.unwrap_or_else(|| {
             self.snc.error_at_node(
                 &ast[ep],
@@ -2147,6 +2146,25 @@ impl<'a> Gen<'a> {
         Val {
             e: Expr::Atom(size.to_string()),
             ty: Ty::Int,
+        }
+    }
+
+    /// The size of `sizeof`'s operand: a type, or the type of an
+    /// expression, which C does not evaluate.
+    fn operand_size(&self, a: NodeId) -> Option<u64> {
+        let ast = self.ast;
+        if let Some(t) = sizeof_type(ast, a) {
+            return type_size(ast, t);
+        }
+        match ast[a].tag {
+            NodeTag::EParen => self.operand_size(ast[a].child(child::PAREN_EXPR)?),
+            // a `char` array, not the pointer it decays to
+            NodeTag::EString => None,
+            _ => match self.place_kind(a) {
+                Some((PlaceTy::Snl(t), _)) => type_size(ast, t),
+                Some((PlaceTy::Char, _)) => Some(1),
+                None => self.pointee(a).map(|_| 8),
+            },
         }
     }
 
@@ -3496,6 +3514,24 @@ mod tests {
         ] {
             assert!(code.contains(e), "{e}\n{code}");
         }
+    }
+
+    #[test]
+    fn sizeof_an_expression_is_the_size_of_its_type() {
+        // sizeof.st:21 sizeof(*p)
+        let (code, diag) = translate(
+            "program p\nchar *p;\nstring s;\ndouble d[3];\nint *ip;\nint n;\nss a {\nstate z {\n\
+             when () {\nn = sizeof(*p) + sizeof(s[1]) + sizeof(d[1]) + sizeof(*ip) + sizeof(ip+1);\n\
+             n = sizeof(\"ab\");\n} state z\n}\n}\n",
+        );
+        assert_eq!(
+            diag, "t.st:11: error: snc-rs cannot compute this sizeof\n",
+            "{code}"
+        );
+        assert!(
+            code.contains("seqg_var.n.set(1 + 1 + 8 + 4 + 8);"),
+            "{code}"
+        );
     }
 
     #[test]

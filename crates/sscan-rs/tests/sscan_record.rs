@@ -759,10 +759,11 @@ async fn the_null_array_post_reaches_only_detectors_without_buffers() {
 }
 
 /// Adding to the previous scan, C reads every array detector into one
-/// shared `dataBuffer`; a failed get (a STRING waveform read as DBR_FLOAT)
-/// leaves the previous detector's read there (sscanRecord.c:3777-3806).
+/// shared `dataBuffer`, and a failed get (a STRING waveform read as
+/// DBR_FLOAT) leaves the previous detector's read there to be summed
+/// (CBUG-AB5, sscanRecord.c:3777-3806). A failed get reads zeros here.
 #[epics_base_rs::epics_test]
-async fn a_failed_array_get_while_adding_keeps_the_shared_buffer() {
+async fn a_failed_array_get_while_adding_adds_nothing() {
     let db = ioc(r#"
 record(waveform, "W1") {
   field(FTVL, "DOUBLE")
@@ -803,7 +804,41 @@ record(sscan, "S") {
         start(&db, "S").await;
         finished(&db, "S").await;
         assert_eq!(arr(&db, "S.D01DA", 4), sum);
-        assert_eq!(arr(&db, "S.D02DA", 4), sum);
+        assert_eq!(arr(&db, "S.D02DA", 4), [0.0; 4]);
+    }
+}
+
+/// The same unchecked get without adding: C reads into the fill buffer, so a
+/// failed get leaves the data it held two scans before (CBUG-AB5,
+/// sscanRecord.c:3777, :3793-3796). A failed get reads zeros here.
+#[epics_base_rs::epics_test]
+async fn a_failed_array_get_reads_zeros_not_an_older_scan() {
+    let db = ioc(r#"
+record(waveform, "WS") {
+  field(FTVL, "STRING")
+  field(NELM, "4")
+}
+record(sscan, "S") {
+  field(MPTS, "4")
+  field(NPTS, "4")
+  field(ACQT, "1D ARRAY")
+  field(D01PV, "WS")
+}"#)
+    .await;
+    let strings = |s: [&str; 4]| {
+        EpicsValue::StringArray(s.map(epics_base_rs::types::PvString::from).to_vec().into())
+    };
+    connected(&db, "S", &["D01NV"]).await;
+    let scans = [
+        (["1", "2", "3", "4"], [1.0, 2.0, 3.0, 4.0]),
+        (["5", "6", "7", "8"], [5.0, 6.0, 7.0, 8.0]),
+        (["abc", "def", "ghi", "jkl"], [0.0; 4]),
+    ];
+    for (text, read) in scans {
+        put(&db, "WS", strings(text)).await;
+        start(&db, "S").await;
+        finished(&db, "S").await;
+        assert_eq!(arr(&db, "S.D01DA", 4), read, "{text:?}");
     }
 }
 

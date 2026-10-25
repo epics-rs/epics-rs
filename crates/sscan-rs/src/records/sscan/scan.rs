@@ -74,22 +74,24 @@ impl SscanRecord {
         self.link_get1(li)
     }
 
-    /// [`Self::input_get1`] of up to `n` elements.
-    fn input_get(
-        &mut self,
-        own: OwnFrame<'_>,
-        li: usize,
-        ty: DbFieldType,
-        n: usize,
-    ) -> Option<Vec<f64>> {
+    /// [`Self::input_get1`] of up to `n` elements. A failed get reads no
+    /// elements, so the caller's zero-fill past the read zeroes it all. C
+    /// ignores the status and leaves its buffer as it was, which a non-add
+    /// read keeps from two scans before and an add read sums from the
+    /// previous detector (CBUG-AB5, sscanRecord.c:3777-3806).
+    fn input_get(&mut self, own: OwnFrame<'_>, li: usize, ty: DbFieldType, n: usize) -> Vec<f64> {
         if self.lpvt[li].local.is_none() {
-            return self.links[li].get(n).map(<[f64]>::to_vec);
+            return self.links[li]
+                .get(n)
+                .map(<[f64]>::to_vec)
+                .unwrap_or_default();
         }
-        Some(match self.db_get(own, li, ty, n)?.value {
-            EpicsValue::DoubleArray(v) => v.iter().copied().collect(),
-            EpicsValue::FloatArray(v) => v.iter().map(|x| f64::from(*x)).collect(),
-            v => v.to_f64().into_iter().collect(),
-        })
+        match self.db_get(own, li, ty, n).map(|s| s.value) {
+            Some(EpicsValue::DoubleArray(v)) => v.iter().copied().collect(),
+            Some(EpicsValue::FloatArray(v)) => v.iter().map(|x| f64::from(*x)).collect(),
+            Some(v) => v.to_f64().into_iter().collect(),
+            None => Vec::new(),
+        }
     }
 
     /// The fly-or-array test C repeats: `p_sm == FLY || acqt == 1D_ARRAY`.
@@ -609,12 +611,11 @@ impl SscanRecord {
             let (sp, si) = (self.pos[i].sp, self.pos[i].si);
             if self.lpvt[li].nelem > 1 {
                 if self.nv[li] == PV_OK {
-                    if let Some(v) = self.input_get(own, li, DbFieldType::Double, npts) {
-                        let n = v.len();
-                        let buf = &mut self.pos_buf[i][fill];
-                        buf[..n].copy_from_slice(&v);
-                        buf[n..npts].fill(0.0);
-                    }
+                    let v = self.input_get(own, li, DbFieldType::Double, npts);
+                    let n = v.len();
+                    let buf = &mut self.pos_buf[i][fill];
+                    buf[..n].copy_from_slice(&v);
+                    buf[n..npts].fill(0.0);
                 } else {
                     for (j, x) in self.pos_buf[i][fill][..npts].iter_mut().enumerate() {
                         *x = sp + j as f64 * si;
@@ -641,12 +642,11 @@ impl SscanRecord {
                 self.det_buf[i].as_ref().expect("checked")[fill][..npts].to_vec()
             };
             if self.nv[li] == PV_OK {
-                if let Some(v) = self.input_get(own, li, DbFieldType::Float, npts) {
-                    for (dst, src) in read.iter_mut().zip(&v) {
-                        *dst = *src as f32;
-                    }
-                    read[v.len()..npts].fill(0.0);
+                let v = self.input_get(own, li, DbFieldType::Float, npts);
+                for (dst, src) in read.iter_mut().zip(&v) {
+                    *dst = *src as f32;
                 }
+                read[v.len()..npts].fill(0.0);
             } else {
                 read[..npts].fill(0.0);
             }

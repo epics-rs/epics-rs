@@ -1573,12 +1573,16 @@ impl<'a> Gen<'a> {
                 let Extra::Var(vp) = node.extra else {
                     unreachable!("unconnected E_VAR");
                 };
+                let name = ast[vp].name.as_deref().unwrap_or_default();
                 let ty = match ast[ast[vp].type_].kind {
                     TypeKind::EvFlag => Ty::Rt("EfId"),
+                    // seqCom.h:132-133 `#define ssId seqg_env`, `pVar seqg_var`
+                    TypeKind::None if name == "ssId" => return self.implicit("seqg_env"),
+                    TypeKind::None if name == "pVar" => return self.implicit("seqg_var"),
                     _ => escaped_value_ty(ast, ep, 0),
                 };
                 Val {
-                    e: Expr::atom(ast[vp].name.as_deref().unwrap_or_default()),
+                    e: Expr::atom(name),
                     ty,
                 }
             }
@@ -1775,23 +1779,25 @@ impl<'a> Gen<'a> {
             "ASYNC" => rt("seqg_rt::CompType::Async".into(), "CompType"),
             "NOEVFLAG" => rt("seqg_rt::NOEVFLAG".into(), "EfId"),
             "pvSevrOK" => rt("seqg_rt::PvSevr::OK".into(), "PvSevr"),
-            "seqg_var" => {
-                self.uses.var = true;
-                Val {
-                    e: Expr::atom(name),
-                    ty: Ty::Foreign,
-                }
-            }
-            "seqg_env" => Val {
-                e: self.env(),
-                ty: Ty::Foreign,
-            },
+            "seqg_var" | "seqg_env" => self.implicit(name),
             _ => match (name.strip_prefix("pvStat"), name.strip_prefix("pvSevr")) {
                 (Some(s), _) => rt(format!("seqg_rt::PvStat::{}", camel(s)), "PvStat"),
                 (_, Some(s)) => rt(format!("seqg_rt::PvSevr::{}", camel(s)), "PvSevr"),
                 _ => unreachable!("builtin constant {name}"),
             },
         }
+    }
+
+    /// `seqg_var` or `seqg_env`, the variables and the state set C code
+    /// reaches.
+    fn implicit(&mut self, name: &str) -> Val {
+        let e = if name == "seqg_env" {
+            self.env()
+        } else {
+            self.uses.var = true;
+            Expr::atom(name)
+        };
+        Val { e, ty: Ty::Foreign }
     }
 
     /// A function call: a builtin, `sizeof`, an SNL function, or a C
@@ -3567,6 +3573,24 @@ mod tests {
         for e in [
             "pvSetX(seqg_env, 1.5 as i32);",
             "seqg_var.x.set(twice(seqg_env, 2.5) + 1);",
+        ] {
+            assert!(code.contains(e), "{e}\n{code}");
+        }
+    }
+
+    #[test]
+    fn ssid_and_pvar_name_the_env_and_the_variables() {
+        // userfunc.st:31; seqCom.h:132-133 define them for the generated C
+        let (code, diag) = translate(
+            "program p\nint i;\nss a {\nstate s {\nwhen () {\n\
+             incr(ssId, &i);\nset_i(pVar, 1);\n} state s\n}\n}\n",
+        );
+        assert_eq!(diag, "");
+        let code = words(&code);
+        for e in [
+            "let seqg_var = seqg_env.var();",
+            "incr(seqg_env, &seqg_var.i);",
+            "set_i(seqg_var, 1);",
         ] {
             assert!(code.contains(e), "{e}\n{code}");
         }

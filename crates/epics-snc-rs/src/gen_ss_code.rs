@@ -2068,10 +2068,14 @@ impl<'a> Gen<'a> {
                 let v = self.expr(ap);
                 conv(v, &Ty::Num(t.into()))
             }
+            // a `char *` value is a `CDst` as a place is; C's write into a
+            // literal is undefined
             Some(CParam::Dst) => {
                 let v = self.expr(ap);
-                if matches!(v.ty, Ty::Ptr(_) | Ty::Str) {
-                    self.refuse(ap, "assignment through a pointer");
+                match &v.ty {
+                    Ty::Str => self.refuse(ap, "a write into a string literal"),
+                    Ty::Ptr(t) if t != C_CHAR => self.refuse(ap, "a cast between pointer types"),
+                    _ => {}
                 }
                 v.e
             }
@@ -3454,14 +3458,24 @@ mod tests {
     }
 
     #[test]
-    fn a_pointer_as_a_c_library_destination_is_refused() {
-        let (_, diag) = translate(
-            "program p\nchar *p;\nss s {\nstate z {\nwhen () {\nsprintf(p, \"x\");\n} state z\n}\n}\n",
+    fn a_char_pointer_is_a_c_library_destination() {
+        // XPS_trajectoryScan.st:165 sprintf(axisName[i], ...)
+        let (code, diag) = translate(
+            "program p\nchar *p;\nchar *cp[2];\nint *ip;\nss s {\nstate z {\nwhen () {\n\
+             sprintf(p, \"x\");\nstrcpy(cp[1], \"y\");\nsprintf(\"lit\", \"x\");\nsprintf(ip, \"x\");\n\
+             } state z\n}\n}\n",
         );
         assert_eq!(
             diag,
-            "t.st:6: error: snc-rs does not support assignment through a pointer\n"
+            "t.st:10: error: snc-rs does not support a write into a string literal\n\
+             t.st:11: error: snc-rs does not support a cast between pointer types\n"
         );
+        for e in [
+            "sprintf(seqg_var.p.get(), \"x\"",
+            "strcpy(seqg_var.cp.at(1).get(), \"y\")",
+        ] {
+            assert!(code.contains(e), "{e}\n{code}");
+        }
     }
 
     #[test]

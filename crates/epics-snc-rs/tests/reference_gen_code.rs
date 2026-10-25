@@ -108,10 +108,6 @@ const EXPECTED_FAILURES: &[(&str, &str)] = &[
     ),
     // these wait for C's pointer operations
     (
-        "motor/modules/motorNewport/newportApp/src/XPS_trajectoryScan.st",
-        "XPS_trajectoryScan.st:165: error: snc-rs does not support assignment through a pointer",
-    ),
-    (
         "sequencer/test/validate/sizeof.st",
         "sizeof.st:21: error: snc-rs cannot compute this sizeof",
     ),

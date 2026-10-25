@@ -113,5 +113,8 @@ async fn a_script_s_failed_ioc_init_reaches_the_shell() {
         matches!(outcome, Ok(RunOutcome::NeverInitialised)),
         "got {outcome:?}"
     );
-    assert!(built.load(Ordering::SeqCst), "the script's iocInit never built");
+    assert!(
+        built.load(Ordering::SeqCst),
+        "the script's iocInit never built"
+    );
 }

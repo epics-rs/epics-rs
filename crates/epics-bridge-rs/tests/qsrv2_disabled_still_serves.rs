@@ -91,10 +91,17 @@ record(ai, "LNK") { field(INP, {pva:"XA"}) field(SCAN, "1 second") }
         std::thread::sleep(Duration::from_millis(50));
     }
     let out = child.wait_with_output().unwrap();
-    (
+    let (stdout, stderr) = (
         String::from_utf8_lossy(&out.stdout).into_owned(),
         String::from_utf8_lossy(&out.stderr).into_owned(),
-    )
+    );
+    // The gated commands register at iocInit's link-set install and in the
+    // protocol runner, so their absence means nothing unless both ran.
+    assert!(
+        out.status.success() && stderr.contains("iocRun: All initialization complete\n"),
+        "the IOC never served\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    (stdout, stderr)
 }
 
 /// softIocPVX 1.5.3 with `PVXS_QSRV_ENABLE=NO` on the same db, `pvxsr 1`.

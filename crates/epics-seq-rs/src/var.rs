@@ -447,6 +447,19 @@ impl<T: Send + Sync> Run<T> for Fixed<T> {
     }
 }
 
+/// A run `malloc` made.
+struct Heap<T>(Mutex<Box<[T]>>);
+
+impl<T: Send> Run<T> for Heap<T> {
+    fn read(&self, f: &mut dyn FnMut(&[T])) {
+        f(&self.0.lock())
+    }
+
+    fn write(&self, f: &mut dyn FnMut(&mut [T])) {
+        f(&mut self.0.lock())
+    }
+}
+
 /// The elements of the array a pointer points at.
 struct Elems<A: 'static>(Ptr<A>);
 
@@ -559,6 +572,14 @@ impl<T> Ptr<T> {
         let size = std::mem::size_of::<T>() as isize;
         let t = self.0.as_ref()?;
         Some(t.base.wrapping_add_signed(t.index * size))
+    }
+}
+
+impl<T: Zeroed + Send + 'static> Ptr<T> {
+    /// A pointer to the first of `n` new zeroed elements.
+    pub(crate) fn alloc(n: usize) -> Self {
+        let run: Box<[T]> = (0..n).map(|_| T::zeroed()).collect();
+        Ptr::along(Arc::new(Heap(Mutex::new(run))), 0)
     }
 }
 

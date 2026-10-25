@@ -27,7 +27,7 @@ use epics_libcom_rs::cfmt::{self, Directive, Length, Spec};
 use crate::prog::seq_find_state_set;
 use crate::seq::SeqThreadId;
 use crate::types::{CharPtr, SeqString};
-use crate::var::{At, Place, SeqVar};
+use crate::var::{At, Place, Ptr, SeqVar, Zeroed};
 
 /// A variadic argument of `printf` / `sprintf`, after C's default argument
 /// promotions.
@@ -314,6 +314,13 @@ pub fn strcmp(a: impl CSrc, b: impl CSrc) -> c_int {
 /// `strlen`.
 pub fn strlen(s: impl CSrc) -> usize {
     s.with_c_bytes(<[u8]>::len)
+}
+
+/// `malloc`, as the `T *` the result is stored in: `bytes / sizeof(T)`
+/// elements, zeroed where C's are indeterminate. The memory lives while a
+/// pointer into it does, so SNL code has no `free` to call.
+pub fn malloc<T: Zeroed + Send + 'static>(bytes: usize) -> Ptr<T> {
+    Ptr::alloc(bytes / std::mem::size_of::<T>().max(1))
 }
 
 /// `strchr`: a pointer into `s` at its first `c`, at its terminator for 0.
@@ -1217,6 +1224,27 @@ mod tests {
     #[should_panic(expected = "write through a pointer to a string literal")]
     fn a_literal_destination_panics() {
         strcpy(CharPtr::from("ab"), "x");
+    }
+
+    /// XPS_trajectoryScan.st:163-165: `axisName[i] = malloc(NAME_LEN);`
+    /// then `sprintf(axisName[i], "%s.%s", ...)`.
+    #[test]
+    fn malloc_is_a_zeroed_run_its_pointers_share() {
+        let axis_name = <SeqVar<[CharPtr; 2]>>::zeroed();
+        axis_name.at(1).set(malloc(64));
+        let n = sprintf(axis_name.at(1).get(), "%s.%s", &["G1".into(), "P1".into()]);
+        assert_eq!(n, 5);
+        assert_eq!(axis_name.get()[1].to_c_vec(), b"G1.P1");
+        assert!(axis_name.at(0).get().is_null());
+        let d: Ptr<f64> = malloc(3 * 8);
+        d.offset(2).set(1.5);
+        assert_eq!((d.get(), d.offset(2).get()), (0.0, 1.5));
+    }
+
+    #[test]
+    #[should_panic(expected = "pointer past its object")]
+    fn past_a_malloc_panics() {
+        malloc::<i32>(8).offset(2).get();
     }
 
     /// editSseq.st:159-161: `s = strchr(recordName, '.'); *s = '\0';`.

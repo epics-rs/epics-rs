@@ -284,9 +284,12 @@ async fn cid_0_waits_for_a_packet_with_the_controller_number() {
 const DEBUG_CHILD: &str = "OXFORD_CS800_DEBUG_CHILD";
 
 /// At DEBUG 4 each state's first entry from another state prints the
-/// change. C tested `!strcmp`, true only once `current_state` already held
-/// the state's name, so it never printed one; had it, the state would have
-/// re-entered itself for good.
+/// change under a header naming the program's `name`, as a C IOC built
+/// from this .st prints it for a packet from the controller and one from
+/// another. C tested `!strcmp`,
+/// true only once `current_state` already held the state's name, so it
+/// never printed one; had it, the header would have read `(null)` for the
+/// `SNLtaskName` C never set.
 #[epics_base_rs::epics_test]
 async fn debug_4_traces_each_state_change() {
     if std::env::var_os(DEBUG_CHILD).is_none() {
@@ -308,11 +311,21 @@ async fn debug_4_traces_each_state_change() {
         );
         let changes: Vec<_> = stdout
             .lines()
-            .filter_map(|l| l.split_once("> state change: ").map(|(_, c)| c))
+            .filter_map(|l| l.split_once("> state change: "))
+            .map(|(header, change)| {
+                assert!(header.ends_with(",cs0,4"), "{header}");
+                change
+            })
             .collect();
         assert_eq!(
             changes,
-            ["idle -> validate", "validate -> process", "process -> idle"],
+            [
+                "idle -> validate",
+                "validate -> process",
+                "process -> idle",
+                "idle -> validate",
+                "validate -> idle",
+            ],
             "{stdout}"
         );
         return;
@@ -328,5 +341,5 @@ async fn debug_4_traces_each_state_change() {
     ioc.deliver(&Packet::new(&[(CTRLNUM, 113), (ALARMI, 5)]), 928)
         .await;
     assert!(eventually(|| ioc.str_of("ALARM") == "Temp Warning").await);
-    task::sleep(Duration::from_millis(250)).await;
+    ioc.deliver(&Packet::new(&[(CTRLNUM, 144)]), 928).await;
 }

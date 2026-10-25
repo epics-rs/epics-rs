@@ -203,6 +203,9 @@ ss cs800 {
   state startup {
     when () {
       sprintf(current_state, "startup");
+      /* C defect fixed: C never assigned SNLtaskName, which the
+       * DEBUG_PRINT2 header prints with %s. */
+      SNLtaskName = macValueGet("name");
       pvGet(s_binp);
       
       cid = atoi(macValueGet("CID"));

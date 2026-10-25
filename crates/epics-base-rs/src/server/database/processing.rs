@@ -4913,7 +4913,7 @@ impl PvDatabase {
                     super::PutSrc::Owned(value),
                     super::links::OutLinkSrc {
                         putf: src_putf,
-                        notify: Some(&waitset),
+                        notify: super::links::OutNotify::Callback(&waitset),
                         field: link_field,
                     },
                     &mut visited,
@@ -8526,7 +8526,7 @@ impl PvDatabase {
                 guard.release();
                 let src = super::links::OutLinkSrc {
                     putf: src_putf,
-                    notify: src_notify.as_ref(),
+                    notify: super::links::OutNotify::chain(src_notify.as_ref()),
                     field: "OUT",
                 };
                 if let Some((out, out_val)) = out_info {
@@ -8919,7 +8919,7 @@ impl PvDatabase {
         } = stage;
         let src = super::links::OutLinkSrc {
             putf,
-            notify: notify.as_ref(),
+            notify: super::links::OutNotify::chain(notify.as_ref()),
             field: "OUT",
         };
         let dispatched = match self.output_rest(
@@ -9692,7 +9692,7 @@ impl PvDatabase {
             super::PutSrc::Value(&value),
             super::links::OutLinkSrc {
                 putf: src_putf,
-                notify: src_notify.as_ref(),
+                notify: super::links::OutNotify::chain(src_notify.as_ref()),
                 field: link_field,
             },
             visited,
@@ -9947,7 +9947,7 @@ impl PvDatabase {
                             super::PutSrc::Owned(value),
                             super::links::OutLinkSrc {
                                 putf: src_putf,
-                                notify: Some(&waitset),
+                                notify: super::links::OutNotify::Callback(&waitset),
                                 field: link_field,
                             },
                             visited,
@@ -10270,7 +10270,7 @@ impl PvDatabase {
             // Phase 2 — async OUT writes, no record guard held.
             let src = super::links::OutLinkSrc {
                 putf: src_putf,
-                notify: src_notify.as_ref(),
+                notify: super::links::OutNotify::chain(src_notify.as_ref()),
                 field: "OUT",
             };
             // The completing pass's status reaches nobody: the put that started

@@ -199,7 +199,7 @@ pub(crate) struct LinkKey {
 /// stronger than C and is what makes "no pending put loses its
 /// classification silently" hold by construction rather than by review.
 enum PutCompletion {
-    /// A put-notify chain's callback: the oneshot the chain awaits.
+    /// A `dbCaPutLinkCallback` callback: the oneshot its writer awaits.
     Notify(Option<tokio::sync::oneshot::Sender<Result<(), String>>>),
     /// C `dbCaCallbackProcess` → `dbLinkAsyncComplete` (`dbCa.c:317-322`,
     /// `dbLink.c`): the `devXxxSoftCallback` record's completing pass, which
@@ -251,8 +251,8 @@ impl Drop for PutCompletion {
 pub(crate) enum PutWaiter<'a> {
     /// C `dbCaPutLink`: nobody.
     None,
-    /// A put-notify chain's `dbCaPutLinkCallback`: the receiver
-    /// [`LinkPutQueue::stage_put`] returns.
+    /// `dbCaPutLinkCallback`: the receiver [`LinkPutQueue::stage_put`]
+    /// returns.
     Notify,
     /// C `dbPutLinkAsync` from a `devXxxSoftCallback` (`dbCaPutAsync`,
     /// `dbCa.c:537-542`): the record's own completion, on the given band.
@@ -1187,7 +1187,7 @@ pub(super) fn resolve_lset(inner: &super::PvDatabaseInner, scheme: &str) -> Opti
 /// The failure is reported the way C reports a put it could not deliver — on
 /// the task, through `errlogPrintf` (`db/dbCa.c:1111-1114`
 /// (`dbCaTask`); epics-base R7.0.10) — and the completion is resolved so the
-/// put-notify chain unblocks with an error instead of waiting for a wire write
+/// writer unblocks with an error instead of waiting for a wire write
 /// that will never be attempted.
 fn refuse_for_want_of_a_reactor(key: &LinkKey) -> Written {
     let msg = format!(

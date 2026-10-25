@@ -921,9 +921,9 @@ impl PvaLink {
     /// `pvxs/ioc/pvalink.h:65`).
     ///
     /// `block` requests a completion-aware PUT (`record._options.block`)
-    /// — set when the originating record is in a put-notify /
-    /// blocking-put chain (pvxs `pvaPutValueAsync`); a plain OUT write
-    /// passes `false` (`pvaPutValue`).
+    /// — set for a `dbPutLinkAsync` write such as `Async Soft Channel`
+    /// (pvxs `pvaPutValueAsync`); a plain OUT write, put-notify chain
+    /// included, passes `false` (`pvaPutValue`).
     pub async fn put_out_str(
         &self,
         link_cfg: &PvaLinkConfig,

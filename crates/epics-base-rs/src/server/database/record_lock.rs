@@ -3759,7 +3759,7 @@ mod tests {
             EpicsValue::String("LF:NEXT".into()),
             super::super::links::OutLinkSrc {
                 putf: false,
-                notify: None,
+                notify: super::super::links::OutNotify::None,
                 field: "OUT",
             },
             &mut visited,

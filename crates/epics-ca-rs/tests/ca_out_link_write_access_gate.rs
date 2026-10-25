@@ -152,13 +152,16 @@ async fn admission_settling_to(
     }
 }
 
-/// Soft-Channel `ao` with `OUT` = the CA link and `VAL` = `val`. `notify`
-/// arms the put-notify wait-set, which is what selects the completion
-/// flavour (C `dbPutLinkAsync`) over the plain one.
-async fn add_ao(db: &PvDatabase, name: &str, val: f64, notify: bool) {
+/// `ao` with `OUT` = the CA link and `VAL` = `val`. `completion` makes it
+/// `Async Soft Channel`, C `devAoSoftCallback`, whose `dbPutLinkAsync` is
+/// the completion flavour; otherwise it is Soft Channel's plain `dbPutLink`.
+async fn add_ao(db: &PvDatabase, name: &str, val: f64, completion: bool) {
     db.add_record(name, Box::new(AoRecord::new(0.0)))
         .await
         .unwrap();
+    if completion {
+        db.get_record(name).expect("just added").write().common.dtyp = "Async Soft Channel".into();
+    }
     db.put_pv_no_process(
         format!("{name}.OUT"),
         EpicsValue::String(format!("ca://{PV}").into()),
@@ -171,15 +174,6 @@ async fn add_ao(db: &PvDatabase, name: &str, val: f64, notify: bool) {
     inst.record
         .put_field("VAL", EpicsValue::Double(val))
         .unwrap();
-    if notify {
-        // Leaked on purpose: the test inspects what the OUT write did to the
-        // record, and a live receiver keeps the completion `send` from
-        // observing a closed channel.
-        let (tx, rx) = epics_base_rs::runtime::sync::oneshot::channel();
-        std::mem::forget(rx);
-        inst.install_or_queue_notify(tx)
-            .expect("the record is free, so the wait-set installs");
-    }
 }
 
 async fn process(db: &PvDatabase, name: &str) {
@@ -389,12 +383,12 @@ async fn a_plain_out_write_to_a_write_denied_link_alarms_the_record() {
     );
 }
 
-/// Flavour two — completion put (C `dbCaPutLinkCallback` with a callback,
-/// the put-notify / blocking-put chain). The SAME predicate governs it, and
-/// it is the flavour that fails silently when the predicate is half
+/// Flavour two — completion put (C `dbCaPutAsync` from `devAoSoftCallback`,
+/// `dbCaPutLinkCallback` with a callback). The SAME predicate governs it,
+/// and it is the flavour that fails silently when the predicate is half
 /// implemented: the completion channel carries no status back to the
-/// record, so an admitted-then-refused write resolves the wait-set as a
-/// success and the chain reports done with the record still NO_ALARM.
+/// record, so an admitted-then-refused write completes the record as a
+/// success, still NO_ALARM.
 #[tokio::test(flavor = "multi_thread")]
 #[serial(epics_env)]
 async fn a_completion_out_write_to_a_write_denied_link_alarms_the_record() {
@@ -408,8 +402,8 @@ async fn a_completion_out_write_to_a_write_denied_link_alarms_the_record() {
     assert_eq!(
         alarm_of(&db, "HOLD:CB").await,
         (alarm_status::LINK_ALARM, AlarmSeverity::Invalid),
-        "the completion flavour refuses through the same gate — a \
-         put-notify chain must not report success on a denied write"
+        "the completion flavour refuses through the same gate — the \
+         record must not complete as a success on a denied write"
     );
     assert_eq!(
         db.external_link_puts_completed(),

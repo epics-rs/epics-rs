@@ -553,7 +553,7 @@ async fn ca_link_out_write_updates_remote_pv() {
 
 #[cfg(tokio_backend)]
 /// Gap 2 OUT write, completion-aware arm — a `LinkPutOp::Async` put
-/// (the put-notify / blocking-put chain case, C `dbCaPutLinkCallback`
+/// (the `Async Soft Channel` / sseq WAITn case, C `dbCaPutLinkCallback`
 /// → `ca_array_put_callback`) issues a CA WRITE_NOTIFY and waits for
 /// the server's put-completion reply, then the value lands on the
 /// upstream PV. Contrast with `ca_link_out_write_updates_remote_pv`,

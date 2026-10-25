@@ -159,12 +159,9 @@ mod demo_db {
         "  field(INP, \"ca://UPSTREAM:AI CP\")\n",
         "  field(PREC, \"3\") field(EGU, \"V\") field(SCAN, \"Passive\")\n",
         "}\n",
-        // The OUT link. One record covers both `LinkPutOp` flavours
-        // because the op is chosen by the *originating* write, not by the
-        // link: `Database::external_put_op` (`database/links.rs:1801-1806`)
-        // returns `Async` when the source record carries a put-notify
-        // wait-set and `Plain` otherwise. So `caput` exercises `put_nowait`
-        // and `caput -c` exercises `put`, through the same field.
+        // The OUT link. A Soft Channel ao puts it plain (`put_nowait`)
+        // for `caput` and `caput -c` alike: C `dbPutLink` on a CA link is
+        // `dbCaPutLink` (`dbCa.c:627-631`).
         "record(ao, \"RTEMS:CA:UPLNK\") {\n",
         "  field(OUT, \"ca://UPSTREAM:AO\")\n",
         "  field(PREC, \"3\") field(EGU, \"V\") field(OMSL, \"supervisory\")\n",

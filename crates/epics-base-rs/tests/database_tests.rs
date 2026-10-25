@@ -656,15 +656,12 @@ async fn test_pva_out_link_no_link_set_fails_gracefully() {
 }
 
 /// Boundary twin of `test_pva_out_link_writes_value_through_link_set`:
-/// when the originating record is part of a put-notify / blocking-put
-/// chain (it carries a completion wait-set), its external OUT-link
-/// write must be delivered as [`LinkPutOp::Async`] — the C
-/// `dbPutLinkAsync` / pvxs `pvaPutValueAsync` path. The plain-process
-/// twin asserts the `Plain` boundary; this asserts `Async`, so the
-/// notify→op mapping (`PvDatabase::external_put_op`) is pinned on both
-/// sides of its single branch.
+/// a record in a put-notify chain (it carries a completion wait-set) still
+/// writes its pva OUT link with [`LinkPutOp::Plain`]: a Soft Channel ao
+/// calls `dbPutLink`, which is pvxs `pvaPutValue` (`wait=false`); only
+/// `dbPutLinkAsync` reaches `pvaPutValueAsync`.
 #[epics_macros_rs::epics_test]
-async fn test_pva_out_link_put_notify_chain_uses_async_op() {
+async fn test_pva_out_link_put_notify_chain_puts_plain() {
     use std::sync::Mutex;
 
     use epics_base_rs::server::database::LinkPutOp;
@@ -701,7 +698,7 @@ async fn test_pva_out_link_put_notify_chain_uses_async_op() {
             .put_field("VAL", EpicsValue::Double(7.0))
             .unwrap();
         // Arm a put-notify wait-set: the source record is now in a
-        // blocking-put chain, so its OUT-link write must use Async.
+        // blocking-put chain.
         inst.install_or_queue_notify(tx)
             .expect("the record is free, so the wait-set installs");
     }
@@ -710,11 +707,8 @@ async fn test_pva_out_link_put_notify_chain_uses_async_op() {
     db.process_record_with_links("AO_PVAOUT_NOTIFY", &mut visited)
         .await
         .unwrap();
-    // The completion flavour stages and returns like the plain one (C
-    // `dbCaPutLinkCallback`, `dbCa.c:585-595`), so the wire write is observed
-    // through the `dbCaSync` barrier. This test asserts the OP FLAVOUR, not
-    // the timing — the timing boundary is
-    // `external_link_put_enqueue::async_put_completion_is_reported_through_the_notify_chain`.
+    // The put is staged, so the wire write is observed through the
+    // `dbCaSync` barrier.
     db.sync_external_link_puts().await;
 
     let captured = writes.lock().unwrap();
@@ -726,10 +720,8 @@ async fn test_pva_out_link_put_notify_chain_uses_async_op() {
     assert_eq!(captured[0].0, "REMOTE:OUT");
     assert_eq!(
         captured[0].2,
-        LinkPutOp::Async,
-        "an OUT-link write from a put-notify chain must be a \
-         completion-aware Async put (C dbPutLinkAsync / pvxs \
-         pvaPutValueAsync)"
+        LinkPutOp::Plain,
+        "a put-notify chain's dbPutLink is pvxs pvaPutValue"
     );
 }
 

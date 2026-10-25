@@ -1230,13 +1230,13 @@ impl LinkSet for CaLinkResolver {
         // `CA_PUT` dispatch). Only `dbCaPutLinkCallback`
         // (`putType = CA_PUT_CALLBACK`) issues `ca_array_put_callback`
         // and parks the originating record until completion. The
-        // database maps a plain record-processing OUT write to
-        // `LinkPutOp::Plain` and a put-notify / blocking-put chain
-        // write to `LinkPutOp::Async`, so the resolver must preserve
+        // database maps a plain OUT write (put-notify chain included) to
+        // `LinkPutOp::Plain` and a `dbPutLinkAsync` / sseq WAITn write
+        // to `LinkPutOp::Async`, so the resolver must preserve
         // the split: routing `Plain` through the fire-and-forget
         // `CA_PROTO_WRITE` (`put_nowait`) keeps a slow or hung remote
         // CA server from stalling normal record processing, while `Async`
-        // keeps the WRITE_NOTIFY completion the put-notify chain needs.
+        // keeps the WRITE_NOTIFY completion the writer waits on.
         let name = strip_ca_scheme(link.name);
         let Some(link) = self.open_link(link).await else {
             let reason = format!("CA link {} not open", String::from_utf8_lossy(name));

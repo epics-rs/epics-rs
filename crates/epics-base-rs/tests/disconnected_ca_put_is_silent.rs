@@ -144,14 +144,22 @@ fn a_link_that_drops_after_staging_says_nothing() {
 }
 
 /// Process `R1` (OUT `R2.CALC CA`, a local calc) with VAL `1+`, which R2
-/// refuses: as a plain put, or in a put callback chain when `notify`.
-async fn put_local_refused(notify: bool) {
+/// refuses: as a plain put, or as `Async Soft Channel`'s put callback
+/// (`dbPutLinkAsync`) when `callback`. A put-notify chain alone puts plain.
+async fn put_local_refused(callback: bool) {
+    let dtyp = if callback {
+        r#"field(DTYP, "Async Soft Channel") "#
+    } else {
+        ""
+    };
     let (db, _h) = IocBuilder::new()
         .db_string(
-            r#"
-record(calc, "R2") { }
-record(stringout, "R1") { field(OUT, "R2.CALC CA") }
-"#,
+            &format!(
+                r#"
+record(calc, "R2") {{ }}
+record(stringout, "R1") {{ {dtyp}field(OUT, "R2.CALC CA") }}
+"#
+            ),
             &HashMap::new(),
         )
         .unwrap()
@@ -173,18 +181,12 @@ record(stringout, "R1") { field(OUT, "R2.CALC CA") }
         assert!(std::time::Instant::now() < deadline, "R1.OUT connects");
         epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(5)).await;
     }
-    if notify {
-        db.put_record_field_from_ca("R1", "VAL", EpicsValue::String("1+".into()))
-            .await
-            .unwrap();
-    } else {
-        db.put_pv_no_process("R1", EpicsValue::String("1+".into()))
-            .await
-            .unwrap();
-        db.process_record_with_links("R1", &mut ProcStack::new())
-            .await
-            .unwrap();
-    }
+    db.put_pv_no_process("R1", EpicsValue::String("1+".into()))
+        .await
+        .unwrap();
+    db.process_record_with_links("R1", &mut ProcStack::new())
+        .await
+        .unwrap();
     db.sync_external_link_puts().await;
     errlog_flush();
 }

@@ -484,8 +484,35 @@ fn inherited(
 #[derive(Clone, Copy)]
 pub(crate) struct OutLinkSrc<'a> {
     pub putf: bool,
-    pub notify: Option<&'a Arc<NotifyWaitSet>>,
+    pub notify: OutNotify<'a>,
     pub field: &'static str,
+}
+
+/// The put-notify wait-set an OUT write carries.
+#[derive(Clone, Copy)]
+pub(crate) enum OutNotify<'a> {
+    None,
+    /// The chain the source record is in. A DB target joins it (dbNotify);
+    /// an external link's put stays plain: C `dbPutLink` is `dbCaPutLink`
+    /// (`dbCa.c:627-631`), and pvxs `pvaPutValue` does not wait.
+    Chain(&'a Arc<NotifyWaitSet>),
+    /// C `dbCaPutLinkCallback` (`sseqRecord.c:720`): the writer asked for the
+    /// external put's completion, which reports to the set too.
+    Callback(&'a Arc<NotifyWaitSet>),
+}
+
+impl<'a> OutNotify<'a> {
+    pub(crate) fn chain(set: Option<&'a Arc<NotifyWaitSet>>) -> Self {
+        set.map_or(Self::None, Self::Chain)
+    }
+
+    /// The set a DB target joins.
+    pub(crate) fn wait_set(self) -> Option<&'a Arc<NotifyWaitSet>> {
+        match self {
+            Self::None => None,
+            Self::Chain(set) | Self::Callback(set) => Some(set),
+        }
+    }
 }
 
 /// What [`PvDatabase::put_out_async`] did with the write.
@@ -506,7 +533,7 @@ pub(crate) enum AsyncPutStatus {
 pub(crate) enum ExternalDone<'a> {
     /// C `dbCaPutLink`.
     None,
-    /// The put-notify chain the source record is in: `dbCaPutLinkCallback`.
+    /// `dbCaPutLinkCallback`, reporting to the writer's wait-set.
     Notify(&'a Arc<NotifyWaitSet>),
     /// `dbCaPutAsync`, whose callback completes the record.
     Record(&'a super::DeviceDone),
@@ -526,8 +553,8 @@ impl OutLinkSrc<'_> {
     /// The completion this put's external staging reports to.
     fn external_done(&self) -> ExternalDone<'_> {
         match self.notify {
-            Some(notify) => ExternalDone::Notify(notify),
-            None => ExternalDone::None,
+            OutNotify::Callback(notify) => ExternalDone::Notify(notify),
+            OutNotify::None | OutNotify::Chain(_) => ExternalDone::None,
         }
     }
 
@@ -3486,7 +3513,7 @@ impl PvDatabase {
             let src = TargetSrc {
                 rec: source.map(|source| source.unframed()),
                 putf: src.putf,
-                notify: src.notify,
+                notify: src.notify.wait_set(),
             };
             return self.process_target_at(src, rec, gate, held, visited);
         }
@@ -3566,7 +3593,7 @@ impl PvDatabase {
         // its set is read.
         let src = OutLinkSrc {
             putf: false,
-            notify: None,
+            notify: OutNotify::None,
             field: "",
         };
         self.finish_db_link_write(write, out.staged, Some(frame), src, out.visited)?;
@@ -3757,8 +3784,9 @@ impl PvDatabase {
     ///   released at the end of this cycle exactly as it is for a plain put.
     ///
     /// `done` names who the completion is reported to, and so selects the
-    /// flavour: [`ExternalDone::None`] is the plain put; a put-notify chain
-    /// and a `devXxxSoftCallback` record ([`ExternalDone::Record`], whose
+    /// flavour: [`ExternalDone::None`] is the plain put, a put-notify chain's
+    /// included; an explicit `dbCaPutLinkCallback` and a
+    /// `devXxxSoftCallback` record ([`ExternalDone::Record`], whose
     /// completing pass `dbCaCallbackProcess` runs) take the completion one.
     pub(crate) fn write_external_pv(
         &self,
@@ -4450,7 +4478,7 @@ impl PvDatabase {
         let target_src = TargetSrc {
             rec: Some(src_rec.unframed()),
             putf: src.putf,
-            notify: src.notify,
+            notify: src.notify.wait_set(),
         };
         let status = self.process_target_at(target_src, &rec, gate, Some(held), visited);
         if status.is_err() {
@@ -4710,7 +4738,7 @@ impl PvDatabase {
         // which C `setLinkAlarm` reports in the record's AMSG.
         let out_src = OutLinkSrc {
             putf: src_putf,
-            notify: src_notify.as_ref(),
+            notify: OutNotify::chain(src_notify.as_ref()),
             field: "",
         };
 
@@ -5110,7 +5138,7 @@ impl PvDatabase {
                 super::PutSrc::Owned(EpicsValue::Double(new_dov)),
                 OutLinkSrc {
                     putf: src_putf,
-                    notify: src_notify.as_ref(),
+                    notify: OutNotify::chain(src_notify.as_ref()),
                     field: LNK_LINK_FIELDS[idx],
                 },
                 visited,
@@ -5902,7 +5930,7 @@ fn takes_chars(
 
 #[cfg(test)]
 mod out_link_put_fail_tests {
-    use super::OutLinkSrc;
+    use super::{OutLinkSrc, OutNotify};
     use crate::server::database::PvDatabase;
     use crate::server::record::{AlarmSeverity, DbLink, LinkProcessPolicy, MonitorSwitch};
     use crate::server::records::calc::CalcRecord;
@@ -5940,7 +5968,7 @@ mod out_link_put_fail_tests {
         );
         let src = OutLinkSrc {
             putf: false,
-            notify: None,
+            notify: OutNotify::None,
             field: "OUT",
         };
         let mut visited = crate::server::database::ProcStack::new();
@@ -5985,7 +6013,7 @@ mod out_link_put_fail_tests {
         );
         let src = OutLinkSrc {
             putf: false,
-            notify: None,
+            notify: OutNotify::None,
             field: "OUT",
         };
         let mut visited = crate::server::database::ProcStack::new();
@@ -6013,7 +6041,7 @@ mod out_link_put_fail_tests {
 
 #[cfg(test)]
 mod nonlocal_db_link_write_tests {
-    use super::OutLinkSrc;
+    use super::{OutLinkSrc, OutNotify};
     use crate::server::database::{LinkPutOp, LinkRef, LinkSet, PvDatabase};
     use crate::server::record::{AlarmSeverity, DbLink, LinkProcessPolicy, MonitorSwitch};
     use crate::server::records::calc::CalcRecord;
@@ -6055,7 +6083,7 @@ mod nonlocal_db_link_write_tests {
     fn out_src() -> OutLinkSrc<'static> {
         OutLinkSrc {
             putf: false,
-            notify: None,
+            notify: OutNotify::None,
             field: "OUT",
         }
     }

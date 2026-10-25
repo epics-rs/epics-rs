@@ -100,20 +100,19 @@ pub enum LinkDbfType {
 /// How an external OUT-link write should be delivered to the lset.
 ///
 /// Mirrors the C dbCore split between a plain link put and a
-/// put-notify-aware put: `dbPutLink` (synchronous, no completion
-/// callback) vs `dbPutLinkAsync` (issued from `dbNotify`, where the
-/// source record's processing is held until the downstream put
-/// completes). pvxs's pvalink lset realises the same split as
+/// completion-aware one: `dbPutLink` (no completion callback) vs
+/// `dbPutLinkAsync` (a `devXxxSoftCallback` record, held PACT until the
+/// downstream put completes) and `dbCaPutLinkCallback` (sseq WAITn).
+/// pvxs's pvalink lset realises the same split as
 /// `pvaPutValue` (plain, `wait=false`) vs `pvaPutValueAsync`
 /// (`wait=true`, which sets `record._options.block` so the PUT
 /// request carries the block option and the source record is parked
 /// in `after_put` until the server acknowledges completion) —
 /// `pvxs/ioc/pvalink_lset.cpp` `putValue` / `putValueAsync`.
 ///
-/// The database selects the op from the write context: a write that
-/// originates inside a put-notify / blocking-put chain (the source
-/// record carries a completion wait-set) uses [`Async`]; a plain
-/// record-processing OUT write uses [`Plain`].
+/// The database selects the op from the writer: those two use [`Async`];
+/// every other OUT write uses [`Plain`], one inside a put-notify chain
+/// included, as C `dbPutLink` is `dbCaPutLink` there (`dbCa.c:627-631`).
 ///
 /// [`Async`]: LinkPutOp::Async
 /// [`Plain`]: LinkPutOp::Plain
@@ -123,9 +122,9 @@ pub enum LinkPutOp {
     /// pvxs `pvaPutValue` (`wait=false`) / C `dbPutLink`.
     #[default]
     Plain,
-    /// Completion-aware put — the originating record is part of a
-    /// put-notify / blocking-put chain. Maps to pvxs `pvaPutValueAsync`
-    /// (`wait=true`, `record._options.block`) / C `dbPutLinkAsync`.
+    /// Completion-aware put — the writer waits for the downstream put.
+    /// Maps to pvxs `pvaPutValueAsync` (`wait=true`,
+    /// `record._options.block`) / C `dbPutLinkAsync`.
     Async,
 }
 
@@ -766,8 +765,8 @@ pub trait LinkSet: Send + Sync {
 
     /// Write `value` to `name` with the delivery semantics named by
     /// `op` ([`LinkPutOp::Plain`] for a fire-and-forget put,
-    /// [`LinkPutOp::Async`] for a put that is part of a put-notify /
-    /// blocking-put chain). Returns Err with a human-readable reason
+    /// [`LinkPutOp::Async`] for a put whose writer waits for its
+    /// completion). Returns Err with a human-readable reason
     /// on failure (denied, type-mismatch, no-such-pv, etc.). Default
     /// impl rejects all writes — read-only lsets keep the default.
     ///

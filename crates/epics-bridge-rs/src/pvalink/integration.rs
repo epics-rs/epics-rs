@@ -1339,9 +1339,8 @@ impl LinkSet for PvaLinkResolver {
         if !self.is_enabled() {
             return Err("pvalink disabled".into());
         }
-        // An `Async` op marks a put-notify / blocking-put chain: the
-        // source record's processing is held until the downstream put
-        // completes, so the PUT must carry the block option
+        // An `Async` op is a writer that waits for the downstream put
+        // (`dbPutLinkAsync`), so the PUT must carry the block option
         // (`record._options.block`) — pvxs `pvaPutValueAsync`. A plain
         // OUT write is fire-and-forget (`pvaPutValue`, block off).
         let block = matches!(op, LinkPutOp::Async);

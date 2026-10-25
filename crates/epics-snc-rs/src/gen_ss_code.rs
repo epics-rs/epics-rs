@@ -1511,8 +1511,16 @@ impl<'a> Gen<'a> {
         match node.tag {
             NodeTag::EParen => self.pointer(c(child::PAREN_EXPR)),
             NodeTag::EPre if sym == Tok::Ampersand => {
-                let place = self.place(c(child::PRE_OPERAND));
+                let operand = c(child::PRE_OPERAND);
+                if let Some((array, index)) = self.multi_elem(operand) {
+                    // C lays the cells out as one array: `&v[i]` is `v + i`
+                    let v = self.pointer(array);
+                    let n = self.expr(index);
+                    return v.method("offset", vec![offset(Tok::Add, n)]);
+                }
+                let place = self.place(operand);
                 if place.multi {
+                    // a `T (*)[N]`, and no `[T; N]` holds the cells
                     self.refuse(ep, "a pointer to a multi-PV array");
                 }
                 place.expr.method("ptr", Vec::new())
@@ -1550,15 +1558,26 @@ impl<'a> Gen<'a> {
             }
             _ if self.held_pointee(ep).is_none() && self.place_kind(ep).is_some() => {
                 let place = self.place(ep);
-                if place.multi {
-                    self.refuse(ep, "a pointer to a multi-PV array");
-                }
                 Expr::call("seqg_rt::Ptr::from", vec![Expr::unary("&", place.expr)])
             }
             _ => {
                 let v = self.expr(ep);
                 conv(v, &ty)
             }
+        }
+    }
+
+    /// The multi-PV array and the index of `ep`, if it subscripts one.
+    fn multi_elem(&self, ep: NodeId) -> Option<(NodeId, NodeId)> {
+        let node = &self.ast[ep];
+        match node.tag {
+            NodeTag::EParen => self.multi_elem(node.child(child::PAREN_EXPR)?),
+            NodeTag::ESubscr => {
+                let array = node.child(child::SUBSCR_OPERAND)?;
+                let (_, multi) = self.place_kind(array)?;
+                multi.then_some((array, node.child(child::SUBSCR_INDEX)?))
+            }
+            _ => None,
         }
     }
 
@@ -3672,23 +3691,32 @@ mod tests {
             "seqg_rt::CharPtr::from_bytes(\"x\".as_bytes())\n",
             "let seqg_rhs = seqg_var.s.at(1).ptr();",
             "seqg_var.p.set(seqg_var.c.ptr());",
-            "seqg_var.mp.set(seqg_var.m[1].ptr());",
+            "seqg_var.mp.set(seqg_rt::Ptr::from(&seqg_var.m).offset(1));",
         ] {
             assert!(code.contains(e), "{e} in {code}");
         }
     }
 
     #[test]
-    fn a_pointer_to_a_whole_multi_pv_array_is_refused() {
-        // its elements are separate cells, which no one Ptr moves along
-        let (_, diag) = translate(
-            "program p\nint m[2];\nassign m to {\"a\",\"b\"};\nint *mp;\nss a {\nstate z {\n\
-             when () {\nmp = m;\n} state z\n}\n}\n",
+    fn a_pointer_into_a_multi_pv_array_spans_its_cells() {
+        // reviewer2's mpv.st: &m[1] is m + 1, as C lays the cells out as
+        // one array; &m, a pointer to the whole array, has nothing to point at
+        let (code, diag) = translate(
+            "program p\nint m[2];\nassign m to {\"a\",\"b\"};\nint *mp;\nint (*ap)[2];\nint n;\n\
+             ss a {\nstate z {\nwhen () {\nmp = m;\nmp = &m[n];\nn = &m[1] - mp;\nap = &m;\n\
+             } state z\n}\n}\n",
         );
         assert_eq!(
             diag,
-            "t.st:8: error: snc-rs does not support a pointer to a multi-PV array\n"
+            "t.st:13: error: snc-rs does not support a pointer to a multi-PV array\n"
         );
+        for e in [
+            "seqg_var.mp.set(seqg_rt::Ptr::from(&seqg_var.m));",
+            "seqg_var.mp.set(seqg_rt::Ptr::from(&seqg_var.m).offset(seqg_var.n.get() as isize));",
+            "seqg_rt::Ptr::from(&seqg_var.m).offset(1).diff(&seqg_var.mp.get())",
+        ] {
+            assert!(code.contains(e), "{e}\n{code}");
+        }
     }
 
     #[test]

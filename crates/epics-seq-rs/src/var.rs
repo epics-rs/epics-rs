@@ -9,7 +9,9 @@
 //! [`Place::modify`] closure ever reaches another variable.
 //!
 //! A multi-PV array (`assign x to {"a", "b"}`) splits its outer dimension
-//! into separate cells, `[SeqVar<T>; N]`, so each channel owns one cell.
+//! into separate cells, `[SeqVar<T>; N]`, so each channel owns one cell. A
+//! [`Ptr`] into it, which C sees as one array, is the one thing that locks
+//! its cells together, in index order.
 
 use std::any::Any;
 use std::ffi::c_char;
@@ -460,6 +462,27 @@ impl<T: Send> Run<T> for Heap<T> {
     }
 }
 
+/// A multi-PV array's cells, read and written as one array through a copy
+/// taken under all their locks.
+struct Cells<T>(Box<[Arc<Mutex<Box<T>>>]>);
+
+impl<T: Clone + Send> Run<T> for Cells<T> {
+    fn read(&self, f: &mut dyn FnMut(&[T])) {
+        let cells: Vec<_> = self.0.iter().map(|c| c.lock()).collect();
+        let copy: Vec<T> = cells.iter().map(|v| T::clone(v)).collect();
+        f(&copy)
+    }
+
+    fn write(&self, f: &mut dyn FnMut(&mut [T])) {
+        let mut cells: Vec<_> = self.0.iter().map(|c| c.lock()).collect();
+        let mut copy: Vec<T> = cells.iter().map(|v| T::clone(v)).collect();
+        f(&mut copy);
+        for (cell, v) in cells.iter_mut().zip(copy) {
+            ***cell = v;
+        }
+    }
+}
+
 /// The elements of the array a pointer points at.
 struct Elems<A: 'static>(Ptr<A>);
 
@@ -618,6 +641,21 @@ impl From<&[u8]> for Ptr<c_char> {
 impl<A: Indexed<Elem: 'static> + Send + 'static> From<&SeqVar<A>> for Ptr<A::Elem> {
     fn from(a: &SeqVar<A>) -> Self {
         a.at(0).ptr()
+    }
+}
+
+/// C's decay of a multi-PV array, whose cells C lays out as one array: the
+/// pointer spans them all, so `&v[i]` is `v + i`.
+impl<T: Clone + Send + 'static, const N: usize> From<&[SeqVar<T>; N]> for Ptr<T> {
+    fn from(a: &[SeqVar<T>; N]) -> Self {
+        let cells = a.iter().map(|v| v.0.clone()).collect();
+        // element 0's own address, as `==` and `-` compare, which no copy has
+        let base = a.first().map_or(0, |v| &**v.0.lock() as *const T as usize);
+        Ptr(Some(Target {
+            run: Arc::new(Cells(cells)),
+            base,
+            index: 0,
+        }))
     }
 }
 
@@ -884,6 +922,21 @@ mod tests {
         p.set(b'c' as c_char);
         assert_eq!(p.offset(1).get(), b'l' as c_char);
         assert_eq!(s.get().as_bytes(), b"icle");
+    }
+
+    #[test]
+    fn a_pointer_into_a_multi_pv_array_moves_along_its_cells() {
+        // reviewer2's mpv.st: C lays `int v[4]; assign v to {...}` out as
+        // one array, so &v[0] + 1 is &v[1]
+        let v: [SeqVar<i32>; 4] = std::array::from_fn(|i| SeqVar::new(10 * i as i32));
+        let p = Ptr::from(&v);
+        assert!(p.offset(1) == Ptr::from(&v).offset(1));
+        assert_eq!(p.offset(1).get(), 10);
+        assert_eq!(Ptr::from(&v).offset(3).diff(&p), 3);
+        p.offset(2).set(7);
+        assert_eq!(v[2].get(), 7);
+        let w: [SeqVar<i32>; 4] = std::array::from_fn(|_| SeqVar::new(0));
+        assert!(p != Ptr::from(&w));
     }
 
     #[test]

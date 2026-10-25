@@ -173,7 +173,7 @@ fn stdin_is_the_shell_when_no_dash_s_is_given() {
         .env("NO_COLOR", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .expect("spawn softioc-rs");
     child
@@ -189,5 +189,11 @@ fn stdin_is_the_shell_when_no_dash_s_is_given() {
     assert!(
         stdout.contains("EOF:TYPED"),
         "the shell must have run `dbl`, got {stdout:?}"
+    );
+    // A `-d` that never reached iocInit also lists its records at a prompt.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("iocRun: All initialization complete\n"),
+        "the IOC never initialised: {stderr:?}"
     );
 }

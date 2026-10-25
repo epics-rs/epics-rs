@@ -575,6 +575,13 @@ impl<T> Ptr<T> {
     }
 }
 
+impl<A: Indexed> Ptr<A> {
+    /// C's `(*p)[index]`, an element of the array `p` points at.
+    pub fn at(&self, index: usize) -> At<'_, Self, A> {
+        At::new(self, index)
+    }
+}
+
 impl<T: Zeroed + Send + 'static> Ptr<T> {
     /// A pointer to the first of `n` new zeroed elements.
     pub(crate) fn alloc(n: usize) -> Self {
@@ -852,6 +859,19 @@ mod tests {
         assert_eq!(a.get(), [[0.0; 3], [0.0, 0.0, 7.0]]);
         // one past row 0 is row 1's first element, as in C
         assert_eq!(a.at(0).at(3).ptr(), p);
+    }
+
+    /// array.st:40 `(*a4ps[i])[j]`.
+    #[test]
+    fn an_element_of_the_array_a_pointer_points_at_is_its_place() {
+        let a = <SeqVar<[[i16; 3]; 2]>>::zeroed();
+        let p = a.at(1).ptr();
+        p.at(2).set(5);
+        assert_eq!(a.at(1).at(2).get(), 5);
+        assert_eq!(p.at(2).ptr(), a.at(1).at(2).ptr());
+        let s = <SeqVar<[[SeqString; 2]; 2]>>::zeroed();
+        let q = s.at(1).ptr();
+        assert_eq!(Ptr::from(&q.at(1)), Ptr::from(&s.at(1).at(1)));
     }
 
     #[test]

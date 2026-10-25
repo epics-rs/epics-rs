@@ -5,24 +5,23 @@
 //! C IOC (seq 2.2.9, asyn, calc) posted against the same mock and template.
 
 mod federal_mock;
+mod support;
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use asyn_rs::asyn_record::AsynRecord;
-use asyn_rs::manager::PortManager;
-use epics_base_rs::runtime::task::{self, BlockingBridge};
+use epics_base_rs::runtime::task;
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::database::db_access::DbSubscription;
 use epics_base_rs::server::ioc_builder::IocBuilder;
-use epics_base_rs::server::iocsh::IocShell;
-use epics_base_rs::server::iocsh::registry::CommandOutcome;
 use epics_base_rs::server::records::scalcout::ScalcoutRecord;
 use epics_base_rs::server::scan::ScanOwner;
 use epics_base_rs::types::EpicsValue;
 
 use federal_mock::Federal;
+use support::{eventually, sh};
 
 const P: &str = "fed:Fed:s1:";
 
@@ -30,26 +29,6 @@ struct Ioc {
     db: Arc<PvDatabase>,
     mock: Federal,
     _scan: ScanOwner,
-}
-
-/// `line` on a shell over `db` that carries the asyn commands and every
-/// registered one, run off the runtime's threads as st.cmd is.
-async fn sh(db: &Arc<PvDatabase>, line: &str) {
-    let db = db.clone();
-    let bridge = BlockingBridge::capture();
-    let owned = line.to_owned();
-    let result = task::spawn_blocking(move || {
-        let shell = IocShell::new(db, bridge);
-        asyn_rs::iocsh::register_asyn_commands_on_shell(&shell, PortManager::global());
-        shell.execute_line(&owned)
-    })
-    .await
-    .unwrap();
-    match result {
-        Ok(CommandOutcome::Continue) => {}
-        Ok(_) => panic!("{line}: failed"),
-        Err(e) => panic!("{line}: {e}"),
-    }
 }
 
 /// The mock answering `readings`, the template loaded with `P=fed:,S=s1`
@@ -123,17 +102,6 @@ fn posts(sub: &mut DbSubscription) -> Vec<f64> {
         values.extend(e.value().as_value().and_then(|v| v.to_f64()));
     }
     values
-}
-
-/// Poll `probe` for up to ten seconds: the program runs on its own thread.
-async fn eventually(mut probe: impl FnMut() -> bool) -> bool {
-    for _ in 0..1000 {
-        if probe() {
-            return true;
-        }
-        task::sleep(Duration::from_millis(10)).await;
-    }
-    false
 }
 
 /// Longer than one `get_readings` cycle over three probes and the 0.5 s

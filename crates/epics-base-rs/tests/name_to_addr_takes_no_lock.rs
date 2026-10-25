@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use epics_base_rs::error::{CaError, CaResult};
-use epics_base_rs::server::database::{AsyncDbHandle, PvDatabase};
+use epics_base_rs::server::database::{AsyncDbHandle, OwnRecord, PvDatabase};
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::record::{FieldDesc, ProcessOutcome, Record};
 use epics_base_rs::types::{DbFieldType, EpicsValue, RecordName};
@@ -47,7 +47,11 @@ impl Record for Scan {
             &self.pv,
             DbFieldType::Double,
             1,
-            Some((name.as_bytes(), self)),
+            Some(OwnRecord {
+                name: name.as_bytes(),
+                record: self,
+                common: None,
+            }),
         )
         .is_some()
         {

@@ -40,7 +40,7 @@ use epics_base_rs::runtime::task::{
 };
 use epics_base_rs::server::database::{
     AsyncDbHandle, DbAddr, DeviceDone, DeviceDoneSource, FieldPut, HeldInstance, InitHold,
-    ProcessCallback, UnheldLinkPut,
+    OwnRecord, ProcessCallback, UnheldLinkPut,
 };
 use epics_base_rs::server::device_support::{
     DeviceInitOutcome, DevicePost, DeviceReadOutcome, DeviceSupport, IoIntrCmd, ReadStart,
@@ -1031,8 +1031,15 @@ impl StreamHooks {
         let nelem = addr.no_elements as usize;
         let snap = if own {
             let own = self.shared.name.as_bytes();
-            self.with_record(|rec, _| db.db_get(&name, dbr, nelem, Some((own, &*rec))))
-                .flatten()
+            self.with_record(|rec, common| {
+                let own = OwnRecord {
+                    name: own,
+                    record: &*rec,
+                    common: Some(&*common),
+                };
+                db.db_get(&name, dbr, nelem, Some(own))
+            })
+            .flatten()
         } else {
             db.db_get(&name, dbr, nelem, None)
         };
@@ -1655,8 +1662,15 @@ impl StreamCoreHooks for StreamHooks {
         let db = self.shared.db.get()?;
         let own = self.shared.name.as_bytes();
         let resolve = |name: &[u8]| {
-            self.with_record(|record, _| db.name_to_dbaddr(name, Some((own, &*record))))
-                .unwrap_or_else(|| db.name_to_dbaddr(name, None))
+            self.with_record(|record, common| {
+                let own = OwnRecord {
+                    name: own,
+                    record: &*record,
+                    common: Some(&*common),
+                };
+                db.name_to_dbaddr(name, Some(own))
+            })
+            .unwrap_or_else(|| db.name_to_dbaddr(name, None))
         };
         if fieldname.contains(&b'.') {
             // record.FIELD (access to other record)

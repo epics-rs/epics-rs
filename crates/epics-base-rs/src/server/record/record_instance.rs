@@ -5984,8 +5984,8 @@ impl MetaFields {
 
 /// C's `dbGet` options — the rset slots, keyed by field — read from the
 /// record's fields on every call, as C calls the slots. A record inside its
-/// own processing serves them from `&dyn Record` ([`own_field_snapshot`]) as
-/// C's lock-free `dbGet` does.
+/// own processing serves them from `&dyn Record` and its dbCommon
+/// ([`own_field_snapshot`]) as C's lock-free `dbGet` does.
 pub(crate) trait FieldMetaSource {
     fn rec(&self) -> &dyn Record;
     /// [`MetaFields::of`] the record's type.
@@ -6736,58 +6736,286 @@ impl FieldMetaSource for RecordInstance {
     }
 }
 
-/// A record read from inside its own processing: its type's code and
-/// nothing behind its lock set.
-struct OwnRecord<'a>(&'a dyn Record, &'static MetaFields);
+/// `value` stamped with the alarm, time and tag of the record whose dbCommon
+/// is `common`.
+fn common_snapshot(common: &CommonFields, value: EpicsValue) -> super::super::snapshot::Snapshot {
+    let mut snap =
+        super::super::snapshot::Snapshot::new(value, common.stat, common.sevr as u16, common.time);
+    // Default the served `timeStamp.userTag` to the record's `utag`,
+    // mirroring pvxs `iocsource.cpp:245` (`auto utag = meta.utag;`).
+    // The 64-bit `epicsUTag` narrows to the int32 NT wire field by
+    // truncating to the low 32 bits — pvxs assigns the same uint64
+    // straight into the `Int32` `timeStamp.userTag`. A PVA reader's
+    // `Q:time:tag` split overrides this when configured, matching
+    // pvxs `if(info.nsecMask) utag = meta.time.nsec & info.nsecMask;`
+    // (:246-247 — the test and its assignment); CA serves it raw.
+    snap.user_tag = common.utag as i32;
+    // Carry the record's committed alarm message (`common.amsg`) so a
+    // PVA read serves `alarm.message` from the record's own amsg
+    // (pvxs `iocsource.cpp:230-236` prefers `meta.amsg`) rather than a
+    // string re-synthesized from the condition code. Empty for records
+    // that raise no message (C's plain `recGblSetSevr` clears namsg).
+    snap.alarm.amsg = String::from(&common.amsg);
+    snap
+}
 
-impl FieldMetaSource for OwnRecord<'_> {
+/// [`RecordInstance::has_device_list`] of `record_type`.
+fn has_device_list_of(record_type: &str) -> bool {
+    super::dbd_generated::device_menu(record_type).is_some()
+        || super::has_contributed_device_menu(record_type)
+}
+
+/// [`RecordInstance::device_choices`] of `record_type` with `DTYP` = `dtyp`.
+pub(crate) fn device_choices_of(record_type: &str, dtyp: &str) -> Option<Vec<PvString>> {
+    // Base's build-time menu (`epics-base-rs/dbd`), then the menus a
+    // downstream crate whose device support has no vendored `device()` line
+    // registered at runtime (asyn's `asynInt32`, `asynFloat64`, ...). C's
+    // `dbDeviceMenu` is the concatenation of every `device()` the loaded
+    // `.dbd` set declares, in load order — base first, then asyn — so the
+    // merge appends the contributed choices AFTER the declared ones.
+    // The C None-vs-empty distinction (`dbAccess.c:176-179` vs `:205`): the
+    // menu is present iff the loaded `.dbd` set declares ANY `device()` for
+    // this type. A type base declares none for but asyn does (structurally
+    // possible, though none of asyn's are such) is therefore present, not
+    // None; a type neither declares for (calc) stays None.
+    if !has_device_list_of(record_type) {
+        return None;
+    }
+    // `merged_device_menu` = declared + contributed, the SAME source the
+    // CA-put validation (`coerce_put_value`'s DTYP branch) resolves against,
+    // so a client can put exactly the DTYP names it can read here.
+    let mut names: Vec<PvString> = super::merged_device_menu(record_type)
+        .into_iter()
+        .map(PvString::from)
+        .collect();
+    if !dtyp.is_empty() && !names.iter().any(|n| n.as_str_lossy() == dtyp) {
+        names.push(PvString::from(dtyp));
+    }
+    Some(names)
+}
+
+/// The value of the `DTYP` field of a `record_type` record with `DTYP` =
+/// `dtyp`: the index of the bound device support in its device menu. An unset
+/// DTYP is index 0, exactly as in C.
+fn dtyp_index_of(record_type: &str, dtyp: &str) -> u16 {
+    if dtyp.is_empty() {
+        return 0;
+    }
+    // A record type with no device menu has no slot for any DTYP, so the
+    // index stays 0 — the same answer the old `unwrap_or(&[])` gave.
+    device_choices_of(record_type, dtyp)
+        .unwrap_or_default()
+        .iter()
+        .position(|c| c.as_str_lossy() == dtyp)
+        .unwrap_or(0) as u16
+}
+
+/// The value of the `dbCommon` field `field` of `record`, whose dbCommon is
+/// `common` — all but `PACT`, which lives on the instance.
+fn common_field_of(
+    record: &dyn Record,
+    common: &CommonFields,
+    field: CommonField,
+) -> Option<EpicsValue> {
+    match field {
+        CommonField::Sevr => Some(EpicsValue::Short(common.sevr as i16)),
+        CommonField::Stat => Some(EpicsValue::Short(common.stat as i16)),
+        CommonField::Nsev => Some(EpicsValue::Short(common.nsev as i16)),
+        CommonField::Nsta => Some(EpicsValue::Short(common.nsta as i16)),
+        // epics-base PR #568 / #566 — alarm message string.
+        CommonField::Amsg => Some(EpicsValue::String(String::from(&common.amsg).into())),
+        CommonField::Namsg => Some(EpicsValue::String(String::from(&common.namsg).into())),
+        CommonField::Acks => Some(EpicsValue::Short(common.acks as i16)),
+        // `ACKT` and `PINI` are `DBF_MENU` (`menuYesNo` /`menuPini`,
+        // `dbCommon.dbd.pod:335,169`), not `DBF_UCHAR`: they carry a menu
+        // index, which `promote_menu_value` lifts to `DBR_ENUM` with the
+        // menu's choice strings. Storing them as `Short` is what makes
+        // them eligible for that promotion — see `promote_menu_value`.
+        CommonField::Ackt => Some(EpicsValue::Short(if common.ackt { 1 } else { 0 })),
+        // DBF_UCHAR: served as UChar (declared type) so the raw put byte
+        // round-trips to the wire — see the DISP/TPRO comment above.
+        CommonField::Udf => Some(EpicsValue::UChar(common.udf)),
+        CommonField::Udfs => Some(EpicsValue::Short(common.udfs)),
+        CommonField::Scan => Some(EpicsValue::Enum(common.scan.to_u16())),
+        CommonField::Sscn => Some(EpicsValue::Enum(common.sscn.to_u16())),
+        // `OLDSIMM` is `DBF_MENU`/`menu(menuSimm)`, stored as the menu index
+        // and promoted to `DBR_ENUM` with the NO/YES/RAW labels by
+        // `promote_menu_value` (shared registry — the saved copy is ALWAYS
+        // menuSimm, unlike the live SIMM). Written only by the simulation
+        // owner (`rec_gbl_save_simm`); `special(SPC_NOMOD)` for clients.
+        CommonField::Oldsimm => Some(EpicsValue::Short(common.oldsimm)),
+        CommonField::Pini => Some(EpicsValue::Short(common.pini)),
+        // DISP/TPRO/RPRO/UDF are `DBF_UCHAR` in `dbCommon.dbd`. Serve them
+        // as `UChar` — their DECLARED type — so `project_to_declared_type`
+        // is identity and the raw put byte reaches the wire untouched (C
+        // stores the byte and `caget` renders `DBR_CHAR` signed: 255 → -1).
+        // Serving `Char` here instead routed the value through the lossy
+        // `Char → UChar` projection (signed −1 clamped to 0), so a
+        // `caput DISP 255` read back as 0 rather than C's -1. `BKPT` is
+        // `DBF_NOACCESS`: no `FieldDesc`, no projection, served `Char`.
+        CommonField::Tpro => Some(EpicsValue::UChar(common.tpro)),
+        CommonField::Bkpt => Some(EpicsValue::Char(common.bkpt.get())),
+        CommonField::Flnk => Some(EpicsValue::String(common.text.flnk.clone().into())),
+        // A record type whose C `.dbd` has no INP has no `.INP` channel
+        // either — C's dbChannel resolution is the dbd, so `dbgf HI.INP` on
+        // a histogram answers "PV 'HI.INP' not found". The port keeps INP on
+        // `CommonFields` for every record, so `declares_inp_link()` is what
+        // stands in for the dbd, and it must gate the read side as well as
+        // the write side (`put_common_field`) — otherwise the field is
+        // unloadable and unwritable yet still resolves as a channel.
+        CommonField::Inp if record.declares_inp_link() => {
+            Some(EpicsValue::String(common.text.inp.clone().into()))
+        }
+        CommonField::Out => Some(EpicsValue::String(common.text.out.clone().into())),
+        // C's DTYP is `DBF_DEVICE`: an epicsEnum16 index into the record
+        // type's device menu, NOT the name. The name is what this port
+        // stores and dispatches on; the index is what the wire carries.
+        CommonField::Dtyp => Some(EpicsValue::Enum(dtyp_index_of(
+            record.record_type(),
+            common.dtyp.as_str(),
+        ))),
+        CommonField::Tse => Some(EpicsValue::Short(common.tse())),
+        CommonField::Tsel => Some(EpicsValue::String(common.text.tsel.clone().into())),
+        // C `UTAG` is DBF_UINT64 — exposed natively as the unsigned
+        // 64-bit value variant so values above i64::MAX round-trip.
+        CommonField::Utag => Some(EpicsValue::UInt64(common.utag)),
+        CommonField::Asg => Some(EpicsValue::String(common.text.asg.clone().into())),
+        CommonField::Asl => Some(EpicsValue::Char(common.asl)),
+        CommonField::Desc => Some(EpicsValue::String(common.text.desc.clone())),
+        CommonField::Phas => Some(EpicsValue::Short(common.phas)),
+        CommonField::Evnt => Some(EpicsValue::String(common.text.evnt.clone())),
+        CommonField::Prio => Some(EpicsValue::Short(common.prio)),
+        CommonField::Disv => Some(EpicsValue::Short(common.disv)),
+        CommonField::Disa => Some(EpicsValue::Short(common.disa)),
+        CommonField::Sdis => Some(EpicsValue::String(common.text.sdis.clone().into())),
+        CommonField::Diss => Some(EpicsValue::Short(common.diss)),
+        CommonField::Hyst => Some(EpicsValue::Double(common.hyst)),
+        CommonField::Lcnt => Some(EpicsValue::Short(common.lcnt)),
+        CommonField::Disp => Some(EpicsValue::UChar(common.disp)),
+        CommonField::Putf => Some(EpicsValue::Char(if common.putf { 1 } else { 0 })),
+        CommonField::Rpro => Some(EpicsValue::UChar(common.rpro)),
+        // C `dbCommon.dbd`: `field(PROC,DBF_UCHAR)` — the raw put byte is
+        // retained in `prec->proc` and served back SIGNED as `DBR_CHAR`
+        // (`caput PROC 255` → `caget` = -1), exactly like DISP/RPRO. The
+        // `pp(TRUE)` force-process is orthogonal: writing PROC still
+        // reprocesses the record (put-path intercept), but the byte sticks.
+        CommonField::Proc => Some(EpicsValue::UChar(common.proc_field)),
+        // Analog alarm fields
+        CommonField::Hihi => common
+            .analog_alarm
+            .as_ref()
+            .map(|a| a.limit(AlarmLimitField::Hihi).to_epics_value()),
+        CommonField::High => common
+            .analog_alarm
+            .as_ref()
+            .map(|a| a.limit(AlarmLimitField::High).to_epics_value()),
+        CommonField::Low => common
+            .analog_alarm
+            .as_ref()
+            .map(|a| a.limit(AlarmLimitField::Low).to_epics_value()),
+        CommonField::Lolo => common
+            .analog_alarm
+            .as_ref()
+            .map(|a| a.limit(AlarmLimitField::Lolo).to_epics_value()),
+        CommonField::Hhsv => common
+            .analog_alarm
+            .as_ref()
+            .map(|a| EpicsValue::Short(a.hhsv)),
+        CommonField::Hsv => common
+            .analog_alarm
+            .as_ref()
+            .map(|a| EpicsValue::Short(a.hsv)),
+        CommonField::Lsv => common
+            .analog_alarm
+            .as_ref()
+            .map(|a| EpicsValue::Short(a.lsv)),
+        CommonField::Llsv => common
+            .analog_alarm
+            .as_ref()
+            .map(|a| EpicsValue::Short(a.llsv)),
+        _ => None,
+    }
+}
+
+/// A record read from inside its own processing: its type's code and the
+/// dbCommon its caller holds, nothing else behind its lock set.
+struct OwnView<'a> {
+    record: &'a dyn Record,
+    common: Option<&'a CommonFields>,
+    meta: &'static MetaFields,
+}
+
+impl OwnView<'_> {
+    /// C `dbGet` of `field` through `prec`: the type's own field, else its
+    /// dbCommon's, as [`FieldRead::table`] routes the instance read.
+    fn field(&self, field: &str) -> Option<EpicsValue> {
+        self.record
+            .get_field(field)
+            .or_else(|| common_field_of(self.record, self.common?, CommonField::by_name(field)?))
+    }
+}
+
+impl FieldMetaSource for OwnView<'_> {
     fn rec(&self) -> &dyn Record {
-        self.0
+        self.record
     }
     fn meta(&self) -> &'static MetaFields {
-        self.1
+        self.meta
     }
     fn read_field(&self, field: &str) -> Option<EpicsValue> {
-        self.0.get_field(field)
+        self.field(field)
     }
     fn enum_string_form(&self, field: &str) -> Option<EnumStringForm> {
-        // `DTYP` lives in dbCommon, behind the lock set.
-        enum_string_form_with(self.0, field, || None)
+        enum_string_form_with(self.record, field, || {
+            device_choices_of(self.record.record_type(), self.common?.dtyp.as_str())
+        })
     }
     fn metadata_at(&self, desc: &'static FieldDesc) -> Option<EpicsValue> {
-        self.0.get_field(desc.name)
+        self.field(desc.name)
     }
-    // dbCommon and the info tags are behind the lock set.
     fn description(&self) -> PvString {
-        PvString::default()
+        self.common
+            .map(|common| common.text.desc.clone())
+            .unwrap_or_default()
     }
+    // The info tags are behind the lock set.
     fn q_form_index(&self) -> Option<i16> {
         None
     }
 }
 
 /// C `dbGet` of `field` (canonical) of `record`, from inside that record's
-/// own processing: the value and the field's metadata from `record` itself,
-/// which needs no lock. What lives behind the lock set — dbCommon's `DESC`
-/// and alarm ladder, the info tags — reads as absent. `None` for a field the
-/// record type does not serve itself (dbCommon's). A link-backed field gets
-/// its C seeds: resolving its link would read through the lock set this
-/// record holds. `meta` is the record's [`RecordDesc::meta`].
+/// own processing: the value and the field's metadata from `record` and its
+/// dbCommon `common`, which need no lock. The info tags, behind the lock set,
+/// read as absent; so does dbCommon when the caller does not hold it. A
+/// link-backed field gets its C seeds: resolving its link would read through
+/// the lock set this record holds. `meta` is the record's
+/// [`RecordDesc::meta`].
 pub(crate) fn own_field_snapshot(
     record: &dyn Record,
+    common: Option<&CommonFields>,
     meta: &'static MetaFields,
     field: &str,
 ) -> Option<super::super::snapshot::Snapshot> {
-    let value = record.get_field(field)?;
+    let view = OwnView {
+        record,
+        common,
+        meta,
+    };
+    let value = view.field(field)?;
     let value = match declared_projection_of(declared_field_type_of(record, field), &value, || {
         record.field_is_long_string(field)
     }) {
         Some(declared) => value.into_type(declared),
         None => value,
     };
-    let mut snap =
-        super::super::snapshot::Snapshot::new(value, 0, 0, std::time::SystemTime::UNIX_EPOCH);
-    OwnRecord(record, meta).finish_metadata(field, LinkBacking::none(), &mut snap);
+    let mut snap = match common {
+        Some(common) => common_snapshot(common, value),
+        None => {
+            super::super::snapshot::Snapshot::new(value, 0, 0, std::time::SystemTime::UNIX_EPOCH)
+        }
+    };
+    view.finish_metadata(field, LinkBacking::none(), &mut snap);
     Some(snap)
 }
 
@@ -9444,9 +9672,7 @@ impl RecordInstance {
     }
 
     fn has_device_list(&self) -> bool {
-        let record_type = self.record.record_type();
-        super::dbd_generated::device_menu(record_type).is_some()
-            || super::has_contributed_device_menu(record_type)
+        has_device_list_of(self.record.record_type())
     }
 
     /// The choices this record's `DTYP` selects among — C's `dbDeviceMenu` for
@@ -9476,33 +9702,7 @@ impl RecordInstance {
     /// `record(calc,"X"){}` — whose record type has no `device()` line — served
     /// `value.choices = {0}[]` where QSRV2 omits the leaf entirely.
     pub(crate) fn device_choices(&self) -> Option<Vec<PvString>> {
-        let record_type = self.record.record_type();
-        // Base's build-time menu (`epics-base-rs/dbd`), then the menus a
-        // downstream crate whose device support has no vendored `device()` line
-        // registered at runtime (asyn's `asynInt32`, `asynFloat64`, ...). C's
-        // `dbDeviceMenu` is the concatenation of every `device()` the loaded
-        // `.dbd` set declares, in load order — base first, then asyn — so the
-        // merge appends the contributed choices AFTER the declared ones.
-        // The C None-vs-empty distinction (`dbAccess.c:176-179` vs `:205`): the
-        // menu is present iff the loaded `.dbd` set declares ANY `device()` for
-        // this type. A type base declares none for but asyn does (structurally
-        // possible, though none of asyn's are such) is therefore present, not
-        // None; a type neither declares for (calc) stays None.
-        if !self.has_device_list() {
-            return None;
-        }
-        // `merged_device_menu` = declared + contributed, the SAME source the
-        // CA-put validation (`coerce_put_value`'s DTYP branch) resolves against,
-        // so a client can put exactly the DTYP names it can read here.
-        let mut names: Vec<PvString> = super::merged_device_menu(record_type)
-            .into_iter()
-            .map(PvString::from)
-            .collect();
-        let dtyp = self.common.dtyp.as_str();
-        if !dtyp.is_empty() && !names.iter().any(|n| n.as_str_lossy() == dtyp) {
-            names.push(PvString::from(dtyp));
-        }
-        Some(names)
+        device_choices_of(self.record.record_type(), self.common.dtyp.as_str())
     }
 
     /// C `dbPutFieldLink`'s link-type gate (`dbAccess.c:1125-1137`): a link
@@ -9536,22 +9736,6 @@ impl RecordInstance {
             upper_field,
             text,
         )
-    }
-
-    /// The value of the `DTYP` field: the index of the bound device support in
-    /// [`Self::device_choices`]. An unset DTYP is index 0, exactly as in C.
-    pub(crate) fn dtyp_index(&self) -> u16 {
-        let dtyp = self.common.dtyp.as_str();
-        if dtyp.is_empty() {
-            return 0;
-        }
-        // A record type with no device menu has no slot for any DTYP, so the
-        // index stays 0 — the same answer the old `unwrap_or(&[])` gave.
-        self.device_choices()
-            .unwrap_or_default()
-            .iter()
-            .position(|c| c.as_str_lossy() == dtyp)
-            .unwrap_or(0) as u16
     }
 
     /// **The** owner of "what string does this enum-valued field render as" —
@@ -9933,28 +10117,7 @@ impl RecordInstance {
         value: EpicsValue,
         backing: LinkBacking<'_>,
     ) -> super::super::snapshot::Snapshot {
-        let mut snap = super::super::snapshot::Snapshot::new(
-            value,
-            self.common.stat,
-            self.common.sevr as u16,
-            self.common.time,
-        );
-        // Default the served `timeStamp.userTag` to the record's `utag`,
-        // mirroring pvxs `iocsource.cpp:245` (`auto utag = meta.utag;`).
-        // The 64-bit `epicsUTag` narrows to the int32 NT wire field by
-        // truncating to the low 32 bits — pvxs assigns the same uint64
-        // straight into the `Int32` `timeStamp.userTag`. A PVA reader's
-        // `Q:time:tag` split overrides this when configured, matching
-        // pvxs `if(info.nsecMask) utag = meta.time.nsec & info.nsecMask;`
-        // (:246-247 — the test and its assignment); CA serves it raw.
-        snap.user_tag = self.common.utag as i32;
-        // Carry the record's committed alarm message (`common.amsg`) so a
-        // PVA read serves `alarm.message` from the record's own amsg
-        // (pvxs `iocsource.cpp:230-236` prefers `meta.amsg`) rather than a
-        // string re-synthesized from the condition code. Empty for records
-        // that raise no message (C's plain `recGblSetSevr` clears namsg).
-        snap.alarm.amsg = String::from(&self.common.amsg);
-
+        let mut snap = common_snapshot(&self.common, value);
         self.finish_metadata(field, backing, &mut snap);
         snap
     }
@@ -10044,133 +10207,13 @@ impl RecordInstance {
     /// The value of the field [`Self::get_common_field`] answers as `field`.
     fn common_field(&self, field: CommonField) -> Option<EpicsValue> {
         match field {
-            CommonField::Sevr => Some(EpicsValue::Short(self.common.sevr as i16)),
-            CommonField::Stat => Some(EpicsValue::Short(self.common.stat as i16)),
-            CommonField::Nsev => Some(EpicsValue::Short(self.common.nsev as i16)),
-            CommonField::Nsta => Some(EpicsValue::Short(self.common.nsta as i16)),
-            // epics-base PR #568 / #566 — alarm message string.
-            CommonField::Amsg => Some(EpicsValue::String(String::from(&self.common.amsg).into())),
-            CommonField::Namsg => Some(EpicsValue::String(String::from(&self.common.namsg).into())),
-            CommonField::Acks => Some(EpicsValue::Short(self.common.acks as i16)),
-            // `ACKT` and `PINI` are `DBF_MENU` (`menuYesNo` /`menuPini`,
-            // `dbCommon.dbd.pod:335,169`), not `DBF_UCHAR`: they carry a menu
-            // index, which `promote_menu_value` lifts to `DBR_ENUM` with the
-            // menu's choice strings. Storing them as `Short` is what makes
-            // them eligible for that promotion — see `promote_menu_value`.
-            CommonField::Ackt => Some(EpicsValue::Short(if self.common.ackt { 1 } else { 0 })),
-            // DBF_UCHAR: served as UChar (declared type) so the raw put byte
-            // round-trips to the wire — see the DISP/TPRO comment above.
-            CommonField::Udf => Some(EpicsValue::UChar(self.common.udf)),
-            CommonField::Udfs => Some(EpicsValue::Short(self.common.udfs)),
-            CommonField::Scan => Some(EpicsValue::Enum(self.common.scan.to_u16())),
-            CommonField::Sscn => Some(EpicsValue::Enum(self.common.sscn.to_u16())),
-            // `OLDSIMM` is `DBF_MENU`/`menu(menuSimm)`, stored as the menu index
-            // and promoted to `DBR_ENUM` with the NO/YES/RAW labels by
-            // `promote_menu_value` (shared registry — the saved copy is ALWAYS
-            // menuSimm, unlike the live SIMM). Written only by the simulation
-            // owner (`rec_gbl_save_simm`); `special(SPC_NOMOD)` for clients.
-            CommonField::Oldsimm => Some(EpicsValue::Short(self.common.oldsimm)),
-            CommonField::Pini => Some(EpicsValue::Short(self.common.pini)),
-            // DISP/TPRO/RPRO/UDF are `DBF_UCHAR` in `dbCommon.dbd`. Serve them
-            // as `UChar` — their DECLARED type — so `project_to_declared_type`
-            // is identity and the raw put byte reaches the wire untouched (C
-            // stores the byte and `caget` renders `DBR_CHAR` signed: 255 → -1).
-            // Serving `Char` here instead routed the value through the lossy
-            // `Char → UChar` projection (signed −1 clamped to 0), so a
-            // `caput DISP 255` read back as 0 rather than C's -1. `BKPT` is
-            // `DBF_NOACCESS`: no `FieldDesc`, no projection, served `Char`.
-            CommonField::Tpro => Some(EpicsValue::UChar(self.common.tpro)),
-            CommonField::Bkpt => Some(EpicsValue::Char(self.common.bkpt.get())),
-            CommonField::Flnk => Some(EpicsValue::String(self.common.text.flnk.clone().into())),
-            // A record type whose C `.dbd` has no INP has no `.INP` channel
-            // either — C's dbChannel resolution is the dbd, so `dbgf HI.INP` on
-            // a histogram answers "PV 'HI.INP' not found". The port keeps INP on
-            // `CommonFields` for every record, so `declares_inp_link()` is what
-            // stands in for the dbd, and it must gate the read side as well as
-            // the write side (`put_common_field`) — otherwise the field is
-            // unloadable and unwritable yet still resolves as a channel.
-            CommonField::Inp if self.record.declares_inp_link() => {
-                Some(EpicsValue::String(self.common.text.inp.clone().into()))
-            }
-            CommonField::Out => Some(EpicsValue::String(self.common.text.out.clone().into())),
-            // C's DTYP is `DBF_DEVICE`: an epicsEnum16 index into the record
-            // type's device menu, NOT the name. The name is what this port
-            // stores and dispatches on; the index is what the wire carries.
-            CommonField::Dtyp => Some(EpicsValue::Enum(self.dtyp_index())),
-            CommonField::Tse => Some(EpicsValue::Short(self.common.tse())),
-            CommonField::Tsel => Some(EpicsValue::String(self.common.text.tsel.clone().into())),
-            // C `UTAG` is DBF_UINT64 — exposed natively as the unsigned
-            // 64-bit value variant so values above i64::MAX round-trip.
-            CommonField::Utag => Some(EpicsValue::UInt64(self.common.utag)),
-            CommonField::Asg => Some(EpicsValue::String(self.common.text.asg.clone().into())),
-            CommonField::Asl => Some(EpicsValue::Char(self.common.asl)),
-            CommonField::Desc => Some(EpicsValue::String(self.common.text.desc.clone())),
-            CommonField::Phas => Some(EpicsValue::Short(self.common.phas)),
-            CommonField::Evnt => Some(EpicsValue::String(self.common.text.evnt.clone())),
-            CommonField::Prio => Some(EpicsValue::Short(self.common.prio)),
-            CommonField::Disv => Some(EpicsValue::Short(self.common.disv)),
-            CommonField::Disa => Some(EpicsValue::Short(self.common.disa)),
-            CommonField::Sdis => Some(EpicsValue::String(self.common.text.sdis.clone().into())),
-            CommonField::Diss => Some(EpicsValue::Short(self.common.diss)),
-            CommonField::Hyst => Some(EpicsValue::Double(self.common.hyst)),
-            CommonField::Lcnt => Some(EpicsValue::Short(self.common.lcnt)),
-            CommonField::Disp => Some(EpicsValue::UChar(self.common.disp)),
-            CommonField::Putf => Some(EpicsValue::Char(if self.common.putf { 1 } else { 0 })),
-            CommonField::Rpro => Some(EpicsValue::UChar(self.common.rpro)),
             CommonField::Pact => Some(EpicsValue::Char(
                 (self.is_processing()
                     || (self.cold.cell.upgrade())
                         .is_some_and(|cell| cell.chain_pact.load(Ordering::Relaxed)))
                     as u8,
             )),
-            // C `dbCommon.dbd`: `field(PROC,DBF_UCHAR)` — the raw put byte is
-            // retained in `prec->proc` and served back SIGNED as `DBR_CHAR`
-            // (`caput PROC 255` → `caget` = -1), exactly like DISP/RPRO. The
-            // `pp(TRUE)` force-process is orthogonal: writing PROC still
-            // reprocesses the record (put-path intercept), but the byte sticks.
-            CommonField::Proc => Some(EpicsValue::UChar(self.common.proc_field)),
-            // Analog alarm fields
-            CommonField::Hihi => self
-                .common
-                .analog_alarm
-                .as_ref()
-                .map(|a| a.limit(AlarmLimitField::Hihi).to_epics_value()),
-            CommonField::High => self
-                .common
-                .analog_alarm
-                .as_ref()
-                .map(|a| a.limit(AlarmLimitField::High).to_epics_value()),
-            CommonField::Low => self
-                .common
-                .analog_alarm
-                .as_ref()
-                .map(|a| a.limit(AlarmLimitField::Low).to_epics_value()),
-            CommonField::Lolo => self
-                .common
-                .analog_alarm
-                .as_ref()
-                .map(|a| a.limit(AlarmLimitField::Lolo).to_epics_value()),
-            CommonField::Hhsv => self
-                .common
-                .analog_alarm
-                .as_ref()
-                .map(|a| EpicsValue::Short(a.hhsv)),
-            CommonField::Hsv => self
-                .common
-                .analog_alarm
-                .as_ref()
-                .map(|a| EpicsValue::Short(a.hsv)),
-            CommonField::Lsv => self
-                .common
-                .analog_alarm
-                .as_ref()
-                .map(|a| EpicsValue::Short(a.lsv)),
-            CommonField::Llsv => self
-                .common
-                .analog_alarm
-                .as_ref()
-                .map(|a| EpicsValue::Short(a.llsv)),
-            _ => None,
+            field => common_field_of(&*self.record, &self.common, field),
         }
     }
 
@@ -14157,7 +14200,10 @@ mod device_menu_marking_tests {
     #[test]
     fn dtyp_index_is_zero_when_the_record_type_has_no_device_menu() {
         let inst = RecordInstance::new("X", CalcRecord::default());
-        assert_eq!(inst.dtyp_index(), 0);
+        assert_eq!(
+            inst.common_field(CommonField::Dtyp),
+            Some(EpicsValue::Enum(0))
+        );
     }
 
     /// A DTYP put runs under the record's hold, so a menu choice must land as
@@ -14197,7 +14243,7 @@ mod device_menu_marking_tests {
     /// A downstream crate's registered device menu (asyn's) is merged AFTER the
     /// base-declared choices, matching a C fat softIoc that loaded `asyn.dbd`:
     /// `mbbo.DTYP` = the three base soft entries then `asynInt32`,
-    /// `asynUInt32Digital`, in that order. `dtyp_index` reads the merged list,
+    /// `asynUInt32Digital`, in that order. The `DTYP` read indexes the merged list,
     /// so an `mbbo` bound to `asynInt32` reports index 3 — the wire value C
     /// serves — instead of the appended-as-own-slot index the port gave before
     /// the menu was known.
@@ -14229,8 +14275,8 @@ mod device_menu_marking_tests {
 
         inst.common.dtyp = "asynInt32".into();
         assert_eq!(
-            inst.dtyp_index(),
-            3,
+            inst.common_field(CommonField::Dtyp),
+            Some(EpicsValue::Enum(3)),
             "an asyn DTYP indexes into the merged menu, not an appended own slot"
         );
     }

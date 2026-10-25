@@ -783,6 +783,16 @@ impl PostItem for (String, EpicsValue, PostRule) {
     }
 }
 
+/// The record a caller of [`AsyncDbHandle::db_get`] or
+/// [`AsyncDbHandle::name_to_dbaddr`] is inside: its name, its code, and its
+/// dbCommon when the caller holds it. C reads them all through `prec`.
+#[derive(Clone, Copy)]
+pub struct OwnRecord<'a> {
+    pub name: &'a [u8],
+    pub record: &'a dyn crate::server::record::Record,
+    pub common: Option<&'a crate::server::record::CommonFields>,
+}
+
 /// A cycle-free handle for driving async-side database updates from
 /// OUTSIDE a record's `process()` cycle.
 ///
@@ -1111,17 +1121,17 @@ impl AsyncDbHandle {
     /// field's metadata. `None` is a failed `dbGet`: no such field, or a value
     /// `dbr_type` cannot hold.
     ///
-    /// `own` is the calling record, `(name, itself)`, when it calls from
-    /// inside its own processing. C's `dbGet` takes no lock, so this never
-    /// waits for one: the caller's own fields are read from `own`, and
-    /// another record whose lock set is held elsewhere serves its last fresh
-    /// read here or at [`Self::name_to_addr`].
+    /// `own` is the calling record when it calls from inside its own
+    /// processing. C's `dbGet` takes no lock, so this never waits for one:
+    /// the caller's own fields are read from `own`, and another record whose
+    /// lock set is held elsewhere serves its last fresh read here or at
+    /// [`Self::name_to_addr`].
     pub fn db_get(
         &self,
         name: impl AsRef<[u8]>,
         dbr_type: crate::types::DbFieldType,
         count: usize,
-        own: Option<(&[u8], &dyn crate::server::record::Record)>,
+        own: Option<OwnRecord<'_>>,
     ) -> Option<crate::server::snapshot::Snapshot> {
         let mut snap = self.db()?.db_get_snapshot(name.as_ref(), own)?;
         snap.value = snap.value.get_convert(dbr_type).ok()?;
@@ -1139,7 +1149,7 @@ impl AsyncDbHandle {
     pub fn name_to_dbaddr(
         &self,
         name: impl AsRef<[u8]>,
-        own: Option<(&[u8], &dyn crate::server::record::Record)>,
+        own: Option<OwnRecord<'_>>,
     ) -> Option<DbAddr> {
         let db = self.db()?;
         let (base, field) = super::parse_pv_name(name.as_ref());
@@ -1155,7 +1165,7 @@ impl AsyncDbHandle {
         }
         let no_elements = cell.resolve_addr(&field)?;
         db.db_get_snapshot(&[record.as_bytes(), b".", field.as_bytes()].concat(), own);
-        let own = own.and_then(|(own, rec)| (own == record.as_bytes()).then_some(rec));
+        let own = own.and_then(|own| (own.name == record.as_bytes()).then_some(own.record));
         let field_type = cell.addressed_field_type(&field, own);
         Some(DbAddr {
             record,
@@ -13571,7 +13581,7 @@ impl PvDatabase {
     pub(crate) fn db_get_snapshot(
         &self,
         name: &[u8],
-        own: Option<(&[u8], &dyn crate::server::record::Record)>,
+        own: Option<OwnRecord<'_>>,
     ) -> Option<crate::server::snapshot::Snapshot> {
         // [`PvDatabase::get_pv`]'s order: a simple PV, then a record.
         if let Some(pv) = self.simple_pv_bytes(name) {
@@ -13580,9 +13590,9 @@ impl PvDatabase {
         let (base, field) = super::parse_pv_name(name);
         let cell = self.get_record(base)?;
         let field = cell.canonical_field(field);
-        let own = own.and_then(|(own, record)| Some((self.get_record(own)?, record)));
+        let own = own.and_then(|own| Some((self.get_record(own.name)?, own)));
         let policy = ReadPolicy::NoWait {
-            own: own.as_ref().map(|(cell, record)| (&**cell, *record)),
+            own: own.as_ref().map(|(cell, own)| (&**cell, *own)),
         };
         let fresh = self.channel_snapshot_for_field_guarded(
             &cell,
@@ -13611,7 +13621,7 @@ pub(crate) enum ReadPolicy<'a> {
     /// not read, and `own`, the record the caller is inside, is read from
     /// itself.
     NoWait {
-        own: Option<(&'a RecordCell, &'a dyn crate::server::record::Record)>,
+        own: Option<(&'a RecordCell, OwnRecord<'a>)>,
     },
 }
 
@@ -13630,11 +13640,11 @@ impl<'a> ReadPolicy<'a> {
     }
 
     /// The caller's own record, when `cell` is it.
-    pub(crate) fn own(self, cell: &RecordCell) -> Option<&'a dyn crate::server::record::Record> {
+    pub(crate) fn own(self, cell: &RecordCell) -> Option<OwnRecord<'a>> {
         match self {
             Self::NoWait {
-                own: Some((own, record)),
-            } if std::ptr::eq(own, cell) => Some(record),
+                own: Some((at, own)),
+            } if std::ptr::eq(at, cell) => Some(own),
             _ => None,
         }
     }

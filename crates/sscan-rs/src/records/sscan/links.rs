@@ -10,6 +10,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 
 use epics_base_rs::runtime::task::spawn_blocking_background;
+use epics_base_rs::server::database::OwnRecord;
 use epics_base_rs::server::snapshot::Snapshot;
 use epics_libcom_rs::cfmt::CFloat;
 
@@ -185,7 +186,12 @@ impl SscanRecord {
             self.pvn[li % NUM_PVS].as_bytes(),
             ty,
             n,
-            Some((self.name.as_bytes(), self as &dyn Record)),
+            // The record's code is not lent its dbCommon here.
+            Some(OwnRecord {
+                name: self.name.as_bytes(),
+                record: self,
+                common: None,
+            }),
         )
     }
 

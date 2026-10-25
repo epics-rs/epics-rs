@@ -21,3 +21,16 @@ record(ao, "c") { field(DTYP, "stream") field(OUT, "@redirect.proto bare R") }
         }
     });
 }
+
+/// `formatValue`'s `dbGet` of a dbCommon field of the record itself reads
+/// it through `prec`, as C's does.
+#[test]
+fn a_format_of_its_own_dbcommon_field_prints_it() {
+    epics_base_rs::runtime::task::test_block_on(async {
+        let db = ioc(r#"
+record(ao, "d") { field(DTYP, "stream") field(OUT, "@redirect.proto own_desc R") field(DESC, "beam") }
+"#)
+        .await;
+        assert_eq!(process(&db, "d", 1).await, ["beam"]);
+    });
+}

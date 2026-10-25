@@ -50,7 +50,7 @@ pub(crate) use links::{
 };
 pub use processing::{
     AsyncDbHandle, AsyncToken, CaLinkInit, DbAddr, DeviceDone, DeviceDoneSource, ExternalCpProcess,
-    FieldPut, HeldInstance, InitHold, InputLinkTexts, PostItem, PostRule, ProcStack,
+    FieldPut, HeldInstance, InitHold, InputLinkTexts, OwnRecord, PostItem, PostRule, ProcStack,
     ProcessCallback, TokenWatch, hop_floor,
 };
 pub(crate) use processing::{NotifiedRead, ReadPolicy, seed_record_constants};
@@ -3047,7 +3047,8 @@ impl PvDatabase {
             && !string_view
         {
             return crate::server::record::record_instance::own_field_snapshot(
-                own,
+                own.record,
+                own.common,
                 record.rdes().meta,
                 field,
             );

@@ -15,7 +15,7 @@
 use std::sync::{Arc, Mutex};
 
 use epics_base_rs::server::autosave::AutosaveStartupConfig;
-use epics_base_rs::server::ioc_app::IocApplication;
+use epics_base_rs::server::ioc_app::{IocApplication, RunOutcome};
 
 const CHILD: &str = "AUTOSAVE_NOACCESS_BOOT_RESTORE_DIR";
 
@@ -24,16 +24,18 @@ async fn child_ioc() {
     let Some(dir) = std::env::var_os(CHILD).map(std::path::PathBuf::from) else {
         return;
     };
-    IocApplication::new()
+    let outcome = IocApplication::new()
         .port(0)
         .autosave_startup(Arc::new(Mutex::new(AutosaveStartupConfig::new())))
         .startup_script(dir.join("st.cmd").to_str().unwrap())
-        .run(|_| async move {
+        .run_outcome(|_| async move {
             epics_base_rs::server::db_server::announce_serving("probe");
             Ok(())
         })
         .await
         .unwrap();
+    // pass 0's restore prints nothing, which a boot that never ran gives too.
+    assert_eq!(outcome, RunOutcome::Served);
 }
 
 /// The console's lines naming a restored field after a boot restore in

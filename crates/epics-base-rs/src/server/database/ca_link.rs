@@ -23,11 +23,11 @@ use super::channel_io::{self, ChannelTarget, DbAccessChannel};
 use super::dbr_delivery::{DeliveryStage, prepare_read, with_live_options};
 use super::filters::FilterChain;
 use super::link_set::{
-    DynLinkSet, LinkDbfType, LinkDiagnostics, LinkMetadata, LinkPutDone, LinkPutOp, LinkRef,
-    LinkSerial, LinkSet, PutAdmission,
+    DynLinkSet, EnumString, LinkDbfType, LinkDiagnostics, LinkMetadata, LinkPutDone, LinkPutOp,
+    LinkRef, LinkSerial, LinkSet, PutAdmission,
 };
 use super::{CaLinkInit, ExternalCpProcess, LinkHolder, PvDatabase, PvDatabaseInner};
-use crate::runtime::task::TaskHandle;
+use crate::runtime::task::{BlockingBridge, TaskHandle};
 use crate::server::event_queue::{
     AttachId, DeliveryContext, EvQue, EventReader, EventUser, no_context,
 };
@@ -35,8 +35,8 @@ use crate::server::pv::{MonitorEvent, PutStarted, SubscribeRefused, WriteContext
 use crate::server::record::ProcessCompletion;
 use crate::server::snapshot::Snapshot;
 use crate::types::{
-    DBR_CTRL_DOUBLE, DbFieldType, EpicsValue, RecordName, dbr_buffer_size, decode_dbr,
-    encode_dbr_into, native_type_for_dbr,
+    DBR_CTRL_DOUBLE, DBR_TIME_STRING, DbFieldType, EpicsValue, PvString, RecordName,
+    dbr_buffer_size, decode_dbr, encode_dbr_into, native_type_for_dbr,
 };
 
 /// dbCa's monitor mask, `ca_add_array_event`'s `DBE_VALUE | DBE_ALARM`
@@ -279,6 +279,13 @@ impl LinkSet for CaLinks {
             .flatten()
     }
 
+    fn get_cached_enum_string(&self, link: LinkRef<'_>) -> EnumString {
+        self.answer(link, LocalLink::enum_string, |n| {
+            Some(n.get_cached_enum_string(link))
+        })
+        .unwrap_or(EnumString::Pending)
+    }
+
     fn get_failure_disconn(&self, link: LinkRef<'_>) -> bool {
         self.answer(link, |_| false, |n| Some(n.get_failure_disconn(link)))
             .unwrap_or(false)
@@ -494,9 +501,16 @@ struct LocalState {
     taken: AtomicU64,
     /// The monitor has ended: no queued event will be taken.
     ended: AtomicBool,
-    /// The monitor's queue slot, read for its `npend`; set when the link
-    /// subscribes.
+    /// The native monitor's queue slot, read for its `npend`; set when the
+    /// link subscribes.
     queue: std::sync::OnceLock<(std::pin::Pin<Arc<EvQue>>, AttachId)>,
+    /// The `DBR_STRING` monitor's, set when [`LocalLink::monitor_string`]
+    /// subscribes it.
+    string_queue: std::sync::OnceLock<(std::pin::Pin<Arc<EvQue>>, AttachId)>,
+    /// C `pgetString`: the `DBR_STRING` monitor's last value.
+    string: ArcSwapOption<PvString>,
+    /// C `pvlOptInpString`: a read asked for the `DBR_STRING` monitor.
+    input_string: AtomicBool,
     /// `CA_GET_ATTRIBUTES`, answered once at the connect: a local channel
     /// connects once.
     meta: std::sync::OnceLock<LinkMetadata>,
@@ -526,10 +540,11 @@ impl LocalState {
     /// queued now has been taken.
     fn mark(&self) -> u64 {
         let _taking = self.delivery.lock();
-        let pending = self
-            .queue
-            .get()
-            .map_or(0, |(queue, id)| queue.npend(*id) as u64);
+        let pending: u64 = [&self.queue, &self.string_queue]
+            .into_iter()
+            .filter_map(|slot| slot.get())
+            .map(|(queue, id)| queue.npend(*id) as u64)
+            .sum();
         self.taken.load(Ordering::SeqCst) + pending
     }
 
@@ -552,7 +567,11 @@ impl LocalState {
 struct LocalLink {
     state: Arc<LocalState>,
     channel: Arc<LocalChannel>,
+    /// Where [`Self::monitor_string`] spawns, from the reading thread.
+    bridge: BlockingBridge,
     _monitor: AbortOnDrop,
+    /// C `evidString`, started by [`Self::monitor_string`].
+    string_monitor: std::sync::OnceLock<AbortOnDrop>,
     _process: super::CpWorker,
 }
 
@@ -578,6 +597,9 @@ impl LocalLink {
             taken: AtomicU64::new(0),
             ended: AtomicBool::new(false),
             queue: std::sync::OnceLock::new(),
+            string_queue: std::sync::OnceLock::new(),
+            string: ArcSwapOption::empty(),
+            input_string: AtomicBool::new(false),
             meta: std::sync::OnceLock::new(),
             inlink: link.is_input(),
             input_native: AtomicBool::new(link.is_input()),
@@ -600,7 +622,9 @@ impl LocalLink {
         Some(Self {
             state,
             channel,
+            bridge: bridge.clone(),
             _monitor: AbortOnDrop(monitor),
+            string_monitor: std::sync::OnceLock::new(),
             _process: process,
         })
     }
@@ -632,6 +656,33 @@ impl LocalLink {
         let value = self.with_value(|s| s.value.clone());
         self.state.note_read();
         value
+    }
+
+    /// `dbCaGetLink`'s `DBR_ENUM` → `DBR_STRING` branch (`dbCa.c:436-454`):
+    /// the `DBR_STRING` monitor's last value, the monitor added by the first
+    /// read that asks.
+    fn enum_string(&self) -> EnumString {
+        if self.channel.native_type() != DbFieldType::Enum {
+            return EnumString::NotServed;
+        }
+        if !self.is_connected() {
+            return EnumString::Pending;
+        }
+        let got = self.state.string.load_full();
+        self.monitor_string();
+        got.map_or(EnumString::Pending, |s| EnumString::Got((*s).clone()))
+    }
+
+    /// C `pvlOptInpString` with its `CA_MONITOR_STRING`
+    /// (`dbCa.c:1236-1248`): subscribe once.
+    fn monitor_string(&self) {
+        self.string_monitor.get_or_init(|| {
+            self.state.input_string.store(true, Ordering::Relaxed);
+            AbortOnDrop(
+                self.bridge
+                    .spawn(subscribe_string(self.channel.clone(), self.state.clone())),
+            )
+        });
     }
 
     /// `dbCaPutLinkCallback` converts to the channel's native type and
@@ -671,7 +722,7 @@ impl LocalLink {
             write_access: true,
             n_disconnect: 0,
             input_native: self.state.input_native.load(Ordering::Relaxed),
-            input_string: false,
+            input_string: self.state.input_string.load(Ordering::Relaxed),
             output_native: false,
             output_string: false,
         }
@@ -717,14 +768,10 @@ async fn subscribe(
     let attrs = (native != DbFieldType::String)
         .then(|| channel.read(DBR_CTRL_DOUBLE, 1))
         .flatten();
-    let labels = (native == DbFieldType::Enum)
-        .then(|| channel.read(native.ctrl_dbr_type(), 1))
-        .flatten();
     let _ = state.meta.set(LinkMetadata::from_ca_attributes(
         Some(native),
         Some(channel.element_count()),
         attrs.as_ref(),
-        labels.as_ref(),
     ));
     let db = if state.inlink {
         db
@@ -743,7 +790,7 @@ async fn subscribe(
             let _ = state
                 .queue
                 .set((monitor.reader.queue(), monitor.reader.id()));
-            run_monitor(monitor, state, first).await;
+            run_monitor(monitor, state, Feed::Native(first)).await;
         }
         // `dbCaTask`'s `ca_add_array_event` failure (`dbCa.c:1230-1233`):
         // the link stays without a value. Its init wait is released, where
@@ -759,6 +806,31 @@ async fn subscribe(
     }
 }
 
+/// `dbCaTask`'s `CA_MONITOR_STRING` for a local link (`dbCa.c:1236-1248`).
+async fn subscribe_string(channel: Arc<LocalChannel>, state: Arc<LocalState>) {
+    let Some(db) = channel.db() else { return };
+    match channel.subscribe(&db, DBR_TIME_STRING, CA_LINK_EVENT_MASK) {
+        Ok(monitor) => {
+            drop(db);
+            let _ = state
+                .string_queue
+                .set((monitor.reader.queue(), monitor.reader.id()));
+            run_monitor(monitor, state, Feed::String).await;
+        }
+        // `dbCaTask`'s `ca_add_array_event` failure: the string read keeps
+        // failing.
+        Err(e) => tracing::debug!("local CA link string subscribe refused: {e:?}"),
+    }
+}
+
+/// Which of dbCa's two monitors a local link's events come from.
+enum Feed {
+    /// `evidNative`, with what its first event owes besides its process.
+    Native(Option<FirstEvent>),
+    /// `evidString`.
+    String,
+}
+
 /// What a local link's first event owes besides its process.
 enum FirstEvent {
     /// `CA_INIT_READY`, which `dbCaRun` waits for.
@@ -769,12 +841,8 @@ enum FirstEvent {
 
 /// C `dbContext`'s event task handing each `dbSubscriptionIO` event to
 /// dbCa's `eventCallback`: refresh the cache, then add `CA_DBPROCESS`
-/// (`dbCa.c:891`, `:958-962`); after the first, what `first` owes.
-async fn run_monitor(
-    mut monitor: LocalMonitor,
-    state: Arc<LocalState>,
-    mut first: Option<FirstEvent>,
-) {
+/// (`dbCa.c:891`, `:958-962`); after a native monitor's first, what it owes.
+async fn run_monitor(mut monitor: LocalMonitor, state: Arc<LocalState>, mut feed: Feed) {
     // Each event is taken and handed on under `delivery`, never across a
     // suspension.
     while std::future::poll_fn(|cx| {
@@ -784,19 +852,39 @@ async fn run_monitor(
             std::task::Poll::Ready(None) => return std::task::Poll::Ready(false),
             std::task::Poll::Ready(Some(event)) => event,
         };
-        // dbCa's native monitor is of count 0 (`dbCa.c:1290-1293`).
-        match monitor.state_notify(event, 0) {
-            Some(snapshot) => {
-                state.cache.store(Some(Arc::new(snapshot)));
-                state.process.request();
+        match &mut feed {
+            Feed::Native(first) => {
+                // dbCa's native monitor is of count 0 (`dbCa.c:1290-1293`).
+                match monitor.state_notify(event, 0) {
+                    Some(snapshot) => {
+                        // A native ENUM event scans only while no string
+                        // monitor exists (`dbCa.c:932-933`).
+                        let scan = !(matches!(snapshot.value, EpicsValue::Enum(_))
+                            && state.input_string.load(Ordering::Relaxed));
+                        state.cache.store(Some(Arc::new(snapshot)));
+                        if scan {
+                            state.process.request();
+                        }
+                    }
+                    // `callStateNotify`'s `ECA_GETFAIL`: dbCa keeps the last value.
+                    None => {
+                        tracing::debug!("local CA link event not deliverable, keeping last value")
+                    }
+                }
+                match first.take() {
+                    Some(FirstEvent::InitReady) => state.process.request_init_ready(),
+                    Some(FirstEvent::Late(late)) => drop(late),
+                    None => {}
+                }
             }
-            // `callStateNotify`'s `ECA_GETFAIL`: dbCa keeps the last value.
-            None => tracing::debug!("local CA link event not deliverable, keeping last value"),
-        }
-        match first.take() {
-            Some(FirstEvent::InitReady) => state.process.request_init_ready(),
-            Some(FirstEvent::Late(late)) => drop(late),
-            None => {}
+            // `CA_MONITOR_STRING` asks for one element (`dbCa.c:1239`).
+            Feed::String => match monitor.state_notify(event, 1).map(|s| s.value) {
+                Some(EpicsValue::String(s)) => {
+                    state.string.store(Some(Arc::new(s)));
+                    state.process.request();
+                }
+                _ => tracing::debug!("local CA link string event not deliverable, keeping last"),
+            },
         }
         state.taken.fetch_add(1, Ordering::SeqCst);
         state.process.notify_settled();
@@ -804,7 +892,7 @@ async fn run_monitor(
     })
     .await
     {}
-    if let Some(FirstEvent::InitReady) = first {
+    if let Feed::Native(Some(FirstEvent::InitReady)) = feed {
         state.process.monitor_ended();
     }
     state.ended.store(true, Ordering::SeqCst);
@@ -1164,18 +1252,14 @@ impl From<DbFieldType> for LinkDbfType {
 
 impl LinkMetadata {
     /// dbCa's attribute cache from a channel's native type and count plus
-    /// two gets: `attrs`, the fixed `DBR_CTRL_DOUBLE` get
-    /// `getAttribEventCallback` caches (`dbCa.c:1042-1091`, issued for any
-    /// non-string channel, `:878-880`), the only source of limits,
-    /// precision and units; and `labels`, an enum channel's native
-    /// `DBR_CTRL_ENUM`, the only source of the choice table (C renders a
-    /// remote enum through a second `DBR_STRING` monitor instead). Alarm
+    /// `attrs`, the fixed `DBR_CTRL_DOUBLE` get `getAttribEventCallback`
+    /// caches (`dbCa.c:1042-1091`, issued for any non-string channel,
+    /// `:878-880`), the only source of limits, precision and units. Alarm
     /// limits are `(lolo, lo, hi, hihi)`, C `getAlarmLimits` (`dbCa.c:729`).
     pub fn from_ca_attributes(
         dbf: Option<DbFieldType>,
         element_count: Option<u32>,
         attrs: Option<&Snapshot>,
-        labels: Option<&Snapshot>,
     ) -> Self {
         let mut md = Self {
             dbf_type: dbf.map(LinkDbfType::from),
@@ -1202,16 +1286,6 @@ impl LinkMetadata {
             if let Some(c) = snap.control.as_ref() {
                 md.control_limits = Some((c.lower_ctrl_limit, c.upper_ctrl_limit));
             }
-        }
-        if let Some(e) = labels.and_then(|s| s.enums.as_ref())
-            && !e.strings.is_empty()
-        {
-            md.enum_choices = Some(
-                e.strings
-                    .iter()
-                    .map(|s| s.as_str_lossy().into_owned())
-                    .collect(),
-            );
         }
         md
     }
@@ -1258,8 +1332,7 @@ mod tests {
     #[test]
     fn ca_attributes_numeric_maps_all_fields() {
         let snap = ctrl_snapshot();
-        let md =
-            LinkMetadata::from_ca_attributes(Some(DbFieldType::Double), Some(1), Some(&snap), None);
+        let md = LinkMetadata::from_ca_attributes(Some(DbFieldType::Double), Some(1), Some(&snap));
         assert_eq!(md.dbf_type, Some(LinkDbfType::Double));
         assert_eq!(md.element_count, Some(1));
         assert_eq!(md.graphic_limits, Some((-50.0, 100.0)));
@@ -1277,7 +1350,7 @@ mod tests {
     /// record keeps its local default.
     #[test]
     fn ca_attributes_string_pv_has_no_limits() {
-        let md = LinkMetadata::from_ca_attributes(Some(DbFieldType::String), Some(1), None, None);
+        let md = LinkMetadata::from_ca_attributes(Some(DbFieldType::String), Some(1), None);
         assert_eq!(md.dbf_type, Some(LinkDbfType::String));
         assert_eq!(md.element_count, Some(1));
         assert_eq!(md.graphic_limits, None);
@@ -1287,32 +1360,10 @@ mod tests {
         assert_eq!(md.units, None);
     }
 
-    /// an enum channel's `DBR_CTRL_ENUM` reply carries the state-label
-    /// table; it lands in `enum_choices` so a `DBR_STRING`-requesting
-    /// reader (stringin/lsi INP, printf `%s`) can render the remote index
-    /// as its label — C `dbCa`'s `pgetString` monitor equivalent. An empty
-    /// table stays `None` (nothing to render through).
+    /// an enum target's fixed `DBR_CTRL_DOUBLE` reply carries its
+    /// precision and limits, zero as C's are.
     #[test]
-    fn ca_attributes_enum_ctrl_carries_the_choices() {
-        use crate::server::snapshot::EnumInfo;
-        let mut snap = Snapshot::new(EpicsValue::Enum(1), 0, 0, std::time::SystemTime::UNIX_EPOCH);
-        snap.enums = Some(EnumInfo::new(vec!["off".into(), "on".into()]));
-        let md =
-            LinkMetadata::from_ca_attributes(Some(DbFieldType::Enum), Some(1), None, Some(&snap));
-        assert_eq!(md.dbf_type, Some(LinkDbfType::Enum));
-        assert_eq!(
-            md.enum_choices,
-            Some(vec!["off".to_string(), "on".to_string()])
-        );
-
-        let empty = Snapshot::new(EpicsValue::Enum(0), 0, 0, std::time::SystemTime::UNIX_EPOCH);
-        let md =
-            LinkMetadata::from_ca_attributes(Some(DbFieldType::Enum), Some(1), None, Some(&empty));
-        assert_eq!(md.enum_choices, None);
-
-        // The two replies compose: the fixed DBR_CTRL_DOUBLE attribute get
-        // carries an enum target's precision/units/limits (all zero, as C's
-        // does) while the native DBR_CTRL_ENUM get carries the labels.
+    fn ca_attributes_enum_target_takes_the_double_attributes() {
         use crate::server::snapshot::DisplayInfo;
         let mut attrs = Snapshot::new(
             EpicsValue::Double(1.0),
@@ -1321,18 +1372,10 @@ mod tests {
             std::time::SystemTime::UNIX_EPOCH,
         );
         attrs.display = Some(DisplayInfo::default());
-        let md = LinkMetadata::from_ca_attributes(
-            Some(DbFieldType::Enum),
-            Some(1),
-            Some(&attrs),
-            Some(&snap),
-        );
+        let md = LinkMetadata::from_ca_attributes(Some(DbFieldType::Enum), Some(1), Some(&attrs));
+        assert_eq!(md.dbf_type, Some(LinkDbfType::Enum));
         assert_eq!(md.precision, Some(0));
         assert_eq!(md.graphic_limits, Some((0.0, 0.0)));
-        assert_eq!(
-            md.enum_choices,
-            Some(vec!["off".to_string(), "on".to_string()])
-        );
     }
 
     /// when the channel info fetch failed (`None` dbf /
@@ -1340,7 +1383,7 @@ mod tests {
     /// link reports "no metadata yet" rather than fabricating zeros.
     #[test]
     fn ca_attributes_no_info_no_ctrl_is_all_none() {
-        let md = LinkMetadata::from_ca_attributes(None, None, None, None);
+        let md = LinkMetadata::from_ca_attributes(None, None, None);
         assert_eq!(md, LinkMetadata::default());
     }
 
@@ -1360,8 +1403,7 @@ mod tests {
             precision: 0,
             ..Default::default()
         });
-        let md =
-            LinkMetadata::from_ca_attributes(Some(DbFieldType::Double), Some(1), Some(&snap), None);
+        let md = LinkMetadata::from_ca_attributes(Some(DbFieldType::Double), Some(1), Some(&snap));
         assert_eq!(md.units, None);
         assert_eq!(md.precision, Some(0));
     }

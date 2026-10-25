@@ -13,18 +13,18 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::DbFieldType;
-use crate::client::{CaChannel, CaClient, ConnFold};
+use crate::client::{CaChannel, CaClient, ConnFold, EnumReadback};
 use arc_swap::ArcSwap;
 use epics_base_rs::error::CaOp;
 use epics_base_rs::runtime::task;
 use epics_base_rs::server::database::{
-    CaLinkInit, CpWorker, ExternalCpProcess, LinkDiagnostics, LinkHolder, LinkMetadata,
+    CaLinkInit, CpWorker, EnumString, ExternalCpProcess, LinkDiagnostics, LinkHolder, LinkMetadata,
     LinkPutDone, LinkPutOp, LinkRef, LinkSerial, LinkSet, PutAdmission, PvDatabase,
     link_put_convert, report_put_not_issued,
 };
 use epics_base_rs::server::snapshot::Snapshot;
-use epics_base_rs::types::{DBR_CTRL_DOUBLE, DBR_CTRL_ENUM};
-use epics_base_rs::types::{EpicsValue, RecordName};
+use epics_base_rs::types::DBR_CTRL_DOUBLE;
+use epics_base_rs::types::{EpicsValue, PvString, RecordName};
 use parking_lot::RwLock;
 
 use epics_base_rs::server::database::CA_LINK_EVENT_MASK as CALINK_EVENT_MASK;
@@ -117,6 +117,10 @@ pub struct CaLink {
     /// input ([`Self::monitor_native`]). Dropping the `CaLink` stops the
     /// task and (via `MonitorHandle::drop`) unsubscribes the remote monitor.
     monitor: std::sync::OnceLock<AbortOnDrop>,
+    /// C `pgetString`: the last value of the `DBR_STRING` monitor.
+    string: Arc<ArcSwap<Option<PvString>>>,
+    /// C `evidString`, started by [`Self::monitor_string`].
+    string_monitor: std::sync::OnceLock<AbortOnDrop>,
     reactor: task::Reactor,
     pv_name: RecordName,
     /// Abort-on-drop handle for the connection-event watcher task.
@@ -230,6 +234,10 @@ struct LinkConnState {
     /// (`dbCa.c:847-849`), and the next `dbCaGetLink` re-sets it; this port
     /// leaves it set, so the two disagree only inside that window.
     used_input_native: AtomicBool,
+    /// C `pvlOptInpString` (`dbCa.c:441`): a read asked for the `DBR_STRING`
+    /// monitor of an ENUM channel. Left set across a type-changing
+    /// reconnect, as `used_input_native` is.
+    used_input_string: AtomicBool,
     /// C `CA_DBPROCESS` in `pca->link_action` (`dbCa.c:155`): requested by
     /// [`Self::request_process`], taken by [`run_processor`]. It owns the
     /// holders' dispatch, so nothing here can process them inline.
@@ -246,6 +254,7 @@ impl LinkConnState {
             n_disconnect: AtomicU64::new(0),
             connects_seen: AtomicU64::new(0),
             used_input_native: AtomicBool::new(false),
+            used_input_string: AtomicBool::new(false),
             process: ExternalCpProcess::new(link),
             db,
         }
@@ -310,6 +319,15 @@ impl LinkConnState {
 
     fn used_input_native(&self) -> bool {
         self.used_input_native.load(Ordering::Relaxed)
+    }
+
+    /// C setting `pvlOptInpString` (`dbCa.c:439-442`).
+    fn note_input_string(&self) {
+        self.used_input_string.store(true, Ordering::Relaxed);
+    }
+
+    fn used_input_string(&self) -> bool {
+        self.used_input_string.load(Ordering::Relaxed)
     }
 
     /// THE connection transition, run on every watcher wake — an event and
@@ -462,8 +480,9 @@ impl CaLink {
     /// fetch complete (the ATTRIB bit; `fetch_link_metadata` stores
     /// `Some` even when the CTRL get failed, exactly the
     /// action-completed edge `getAttribEventCallback` clears the bit
-    /// on). C's STRING bit has no twin here: this port keeps one native
-    /// monitor and renders strings from it.
+    /// on). C's STRING bit needs no twin: no read can ask for the string
+    /// monitor before the connect (`dbCa.c:430-435` fails first), so the
+    /// bit is clear when the link connects.
     pub fn init_ready(&self) -> bool {
         self.is_connected()
             && (self.monitor.get().is_none() || self.with_servable(|_| ()).is_some())
@@ -534,6 +553,38 @@ impl CaLink {
         });
     }
 
+    /// `dbCaGetLink`'s `DBR_ENUM` → `DBR_STRING` branch (`dbCa.c:436-454`),
+    /// behind its `!isConnected || !hasReadAccess` bail (`:430-435`): the
+    /// `DBR_STRING` monitor's last value, the monitor added by the first
+    /// read that asks.
+    fn enum_string(&self) -> EnumString {
+        match channel_native(&self.channel) {
+            Some((DbFieldType::Enum, _)) => {}
+            Some(_) => return EnumString::NotServed,
+            None => return EnumString::Pending,
+        }
+        if !self.connected.is_set() || !self.connected.has_read_access() {
+            return EnumString::Pending;
+        }
+        let got = Option::clone(&self.string.load());
+        self.monitor_string();
+        got.map_or(EnumString::Pending, EnumString::Got)
+    }
+
+    /// C `pvlOptInpString` with its `CA_MONITOR_STRING`
+    /// (`dbCa.c:1236-1248`): subscribe once.
+    fn monitor_string(&self) {
+        self.connected.note_input_string();
+        self.string_monitor.get_or_init(|| {
+            AbortOnDrop(self.reactor.spawn(run_string_monitor(
+                self.channel.clone(),
+                self.string.clone(),
+                self.connected.clone(),
+                self.pv_name.clone(),
+            )))
+        });
+    }
+
     /// This link's `dbcar` report state — C reading the `caLink` fields
     /// `dbCaTest.c:95-123` prints, minus the staged-write count, which in
     /// this port belongs to the database's link-put queue rather than to the
@@ -556,12 +607,7 @@ impl CaLink {
             write_access: self.connected.has_write_access(),
             n_disconnect: self.connected.disconnect_count(),
             input_native: self.connected.used_input_native(),
-            // C reaches `pvlOptInpString` only for a `DBR_ENUM` channel read
-            // as `DBR_STRING` (`dbCa.c:439-442`). This port keeps one native
-            // monitor per link and renders strings from it — `LinkSet` has no
-            // typed read for the lset to distinguish — so the column is never
-            // set here.
-            input_string: false,
+            input_string: self.connected.used_input_string(),
             // Both OUT bits are dead at the pin: `dbCa.c:541` and `:557` are
             // inside `/* Disabled by ANJ ... */`, so C never sets them and
             // `dbcar` always prints these two columns blank.
@@ -763,6 +809,8 @@ impl CaLinkResolver {
             meta,
             channel,
             monitor: std::sync::OnceLock::new(),
+            string: Arc::new(ArcSwap::from_pointee(None)),
+            string_monitor: std::sync::OnceLock::new(),
             reactor: reactor.clone(),
             pv_name,
             _conn_task: AbortOnDrop(conn_task),
@@ -891,11 +939,16 @@ fn note_monitor_value(
     // connected even if the `Connected` lifecycle event has not been observed
     // yet (race-free, mirrors `pvalink`'s callback).
     connected.mark_connected();
+    // A native ENUM event scans only while no string monitor exists
+    // (`dbCa.c:932-933`).
+    let scan = !(matches!(snapshot.value, EpicsValue::Enum(_)) && connected.used_input_string());
     cache.store(Arc::new(Some(CachedSnapshot {
         snapshot,
         native_count,
     })));
-    connected.request_process();
+    if scan {
+        connected.request_process();
+    }
 }
 
 /// Monitor task: subscribe, then drain the subscription, refresh the cache
@@ -959,6 +1012,49 @@ async fn run_monitor(
     // Subscription ended (channel dropped). Reflect the disconnect —
     // through the owner, so the CP holders are processed here too.
     connected.mark_disconnected();
+}
+
+/// C `dbCaTask`'s `CA_MONITOR_STRING` (`dbCa.c:1236-1248`): one element of
+/// `DBR_TIME_STRING`, each event stored as `pgetString` and processing the
+/// holder (`dbCa.c:927-929`).
+async fn run_string_monitor(
+    channel: Arc<CaChannel>,
+    string: Arc<ArcSwap<Option<PvString>>>,
+    connected: Arc<LinkConnState>,
+    pv_name: RecordName,
+) {
+    let mut monitor = match channel
+        .subscribe_with_mask_readback_count(
+            0.0,
+            CALINK_EVENT_MASK,
+            EnumReadback::Label,
+            false,
+            Some(1),
+        )
+        .await
+    {
+        Ok(monitor) => monitor,
+        Err(e) => {
+            tracing::debug!(pv = %pv_name, error = %e, "calink: string subscribe failed");
+            return;
+        }
+    };
+    while let Some(event) = monitor.recv().await {
+        match event {
+            Ok(snapshot) => match snapshot.value {
+                EpicsValue::String(s) => {
+                    string.store(Arc::new(Some(s)));
+                    connected.request_process();
+                }
+                // The channel reconnected as other than ENUM: C drops
+                // `pgetString` (`dbCa.c:835-859`).
+                _ => string.store(Arc::new(None)),
+            },
+            Err(e) => {
+                tracing::debug!(pv = %pv_name, error = %e, "calink: string monitor error ignored");
+            }
+        }
+    }
 }
 
 /// Connection-event watcher: keep `connected` in sync with the CA
@@ -1073,30 +1169,10 @@ async fn fetch_link_metadata(
             }
         }
     };
-    // The enum state-label table is this port's own cache and has no dbCa
-    // analogue on this path — C renders a remote enum as text through a
-    // second `DBR_STRING` monitor (`pgetString`), not through the attribute
-    // get. It needs the native `DBR_CTRL_ENUM` reply, which the fixed-DOUBLE
-    // get above cannot carry, so it rides its own request.
-    let labels = if dbf == Some(DbFieldType::Enum) {
-        async { channel.get_callback(DBR_CTRL_ENUM, 1)?.await }
-            .await
-            .inspect_err(|e| {
-                tracing::debug!(
-                    pv = %pv_name,
-                    error = %e,
-                    "calink: enum label get failed; serving no choice table"
-                );
-            })
-            .ok()
-    } else {
-        None
-    };
     meta.store(Arc::new(Some(LinkMetadata::from_ca_attributes(
         dbf,
         element_count,
         attrs.as_ref(),
-        labels.as_ref(),
     ))));
 }
 
@@ -1134,6 +1210,11 @@ impl LinkSet for CaLinkResolver {
     fn get_cached_value(&self, link: LinkRef<'_>) -> Option<EpicsValue> {
         let link = self.cached_link(link)?;
         link.read()
+    }
+
+    fn get_cached_enum_string(&self, link: LinkRef<'_>) -> EnumString {
+        self.cached_link(link)
+            .map_or(EnumString::Pending, |l| l.enum_string())
     }
 
     /// C `dbCaAddLink`'s `CA_CONNECT` work (`dbCa.c:1140-1159`): create the

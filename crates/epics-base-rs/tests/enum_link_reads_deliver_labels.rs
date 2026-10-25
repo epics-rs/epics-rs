@@ -14,13 +14,12 @@
 //! field coerce blind, so a bi/mbbi/menu source stored `"1"` where fixed C
 //! stores `"RUNNING"`. Boundary per read path, plus the numeric printf
 //! conversion that must KEEP the index, and the external-link half (the
-//! label table rides `LinkMetadata::enum_choices` — C `dbCa`'s second
-//! `DBR_STRING` monitor).
+//! lset's `DBR_STRING` monitor, C `dbCa`'s `pgetString`).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use epics_base_rs::server::database::{LinkMetadata, LinkPutOp, LinkRef, LinkSet, PvDatabase};
+use epics_base_rs::server::database::{EnumString, LinkPutOp, LinkRef, LinkSet, PvDatabase};
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::types::EpicsValue;
 
@@ -203,12 +202,11 @@ async fn stringin_siol_at_enum_source_delivers_the_label() {
     );
 }
 
-/// An external enum link set: the label table rides
-/// `LinkMetadata::enum_choices` (C `dbCa`'s second DBR_STRING monitor,
-/// `pgetString`) — a bare wire index still renders as its label.
+/// An external enum link set whose `DBR_STRING` monitor (C `dbCa`'s
+/// `pgetString`) stands at `string`.
 struct EnumLset {
     value: EpicsValue,
-    metadata: LinkMetadata,
+    string: EnumString,
     last_put: Arc<Mutex<Option<EpicsValue>>>,
 }
 
@@ -232,52 +230,55 @@ impl LinkSet for EnumLset {
         *self.last_put.lock().unwrap() = Some(value);
         Ok(())
     }
-    fn link_metadata(&self, _name: LinkRef<'_>) -> Option<LinkMetadata> {
-        Some(self.metadata.clone())
+    fn get_cached_enum_string(&self, _name: LinkRef<'_>) -> EnumString {
+        self.string.clone()
     }
 }
 
-/// stringin INP at a `ca://` enum channel: the wire value is a bare index;
-/// the cached CTRL label table renders it.
-#[epics_macros_rs::epics_test]
-async fn stringin_inp_at_external_enum_renders_via_cached_choices() {
-    let db = build(r#"record(stringin, "SIX") { field(INP, "ca://EXT:ENUM") }"#).await;
+async fn read_external_enum(rec: &str, string: EnumString) -> Arc<PvDatabase> {
+    let db = build(&format!(
+        r#"record(stringin, "{rec}") {{ field(INP, "ca://EXT:{rec}") field(VAL, "was") }}"#
+    ))
+    .await;
     db.register_link_set(
         "ca",
         Arc::new(EnumLset {
             value: EpicsValue::Enum(1),
-            metadata: LinkMetadata {
-                enum_choices: Some(vec!["off".into(), "on".into()]),
-                ..Default::default()
-            },
+            string,
             last_put: Arc::new(Mutex::new(None)),
         }),
     )
     .await;
     db.process_cp_links_on_connect().await;
-    process(&db, "SIX").await;
-    assert_eq!(
-        field_str(&db, "SIX", "VAL"),
-        "on",
-        "C dbCaGetLink(DBR_STRING) serves the enum label, not the index"
-    );
+    // A failed read is `devSiSoft`'s status, returned from `process`.
+    db.process_record_with_links(rec, &mut epics_base_rs::server::database::ProcStack::new())
+        .await
+        .or_else(epics_base_rs::error::CaError::unless_process_status)
+        .unwrap();
+    db
 }
 
-/// Same external read WITHOUT a cached label table: the index digits are
-/// all that can be rendered (C before its string monitor delivers).
+/// stringin INP at a `ca://` enum channel: the lset's string monitor serves
+/// the server's string, not the index.
 #[epics_macros_rs::epics_test]
-async fn stringin_inp_at_external_enum_without_choices_falls_back_to_digits() {
-    let db = build(r#"record(stringin, "SIY") { field(INP, "ca://EXT:ENUM2") }"#).await;
-    db.register_link_set(
-        "ca",
-        Arc::new(EnumLset {
-            value: EpicsValue::Enum(1),
-            metadata: LinkMetadata::default(),
-            last_put: Arc::new(Mutex::new(None)),
-        }),
-    )
-    .await;
-    db.process_cp_links_on_connect().await;
-    process(&db, "SIY").await;
+async fn stringin_inp_at_external_enum_reads_the_string_monitor() {
+    let db = read_external_enum("SIX", EnumString::Got("on".into())).await;
+    assert_eq!(field_str(&db, "SIX", "VAL"), "on");
+}
+
+/// Before the string monitor's first event the read fails, as C
+/// `dbCaGetLink`'s `!pca->gotInString` does (`dbCa.c:444-449`).
+#[epics_macros_rs::epics_test]
+async fn stringin_inp_at_external_enum_fails_until_the_string_arrives() {
+    let db = read_external_enum("SIP", EnumString::Pending).await;
+    assert_eq!(field_str(&db, "SIP", "VAL"), "was");
+    let stat = db.get_pv("SIP.STAT").unwrap().to_f64();
+    assert_eq!(stat, Some(14.0), "LINK");
+}
+
+/// An lset with no string monitor leaves the index digits.
+#[epics_macros_rs::epics_test]
+async fn stringin_inp_at_external_enum_not_served_renders_the_digits() {
+    let db = read_external_enum("SIY", EnumString::NotServed).await;
     assert_eq!(field_str(&db, "SIY", "VAL"), "1");
 }

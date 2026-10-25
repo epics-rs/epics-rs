@@ -403,12 +403,18 @@ pub struct LinkMetadata {
     /// `display.description` — carried so a link snapshot is complete;
     /// pvxs exposes it through the same `fld_meta` cache.
     pub description: Option<String>,
-    /// ENUM state labels of the remote channel, when it has any. The label
-    /// table a `DBR_STRING`-requesting reader (stringin/lsi INP, printf
-    /// `%s`) renders a remote enum index through — C `dbCa` keeps a second
-    /// `DBR_STRING` monitor (`pgetString`) for that read; here the labels
-    /// ride the same attribute fetch as the limits (CA: `DBR_CTRL_ENUM`).
-    pub enum_choices: Option<Vec<String>>,
+}
+
+/// What [`LinkSet::get_cached_enum_string`] answers for a link whose channel
+/// is a `DBR_ENUM`.
+#[derive(Clone, Debug, PartialEq)]
+pub enum EnumString {
+    /// The lset keeps no string form: the read renders the index.
+    NotServed,
+    /// The lset's `DBR_STRING` monitor has not delivered: the read fails.
+    Pending,
+    /// The server's string for the channel's state.
+    Got(crate::types::PvString),
 }
 
 /// Ungated remote alarm snapshot for a link — the remote
@@ -627,6 +633,15 @@ pub trait LinkSet: Send + Sync {
     fn get_cached_value(&self, link: LinkRef<'_>) -> Option<EpicsValue> {
         let _ = link;
         None
+    }
+
+    /// C `dbCaGetLink`'s `DBR_ENUM` → `DBR_STRING` branch (`dbCa.c:436-454`):
+    /// the last value of the link's `DBR_STRING` monitor, which the first
+    /// call adds. Asked once [`Self::get_cached_value`] has answered an
+    /// `EpicsValue::Enum`. MUST NOT perform I/O.
+    fn get_cached_enum_string(&self, link: LinkRef<'_>) -> EnumString {
+        let _ = link;
+        EnumString::NotServed
     }
 
     /// Whether this lset's `getValue` raised `"<field> Disconn"` on the

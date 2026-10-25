@@ -1648,19 +1648,18 @@ impl PvDatabase {
             return render.dbr_string(value);
         }
         let value = element_0(value)?;
-        // An external ENUM value crosses the wire as a bare index; the label
-        // table lives in the lset's cached metadata (CA: the one-shot
-        // `DBR_CTRL_ENUM` attribute fetch — C `dbCa` instead keeps a second
-        // `DBR_STRING` monitor for exactly this read, `dbCa.c` `pgetString`).
-        // An index past the cached table falls through to the digits, the
-        // same rule as [`value_as_dbr_string`]'s `EnumWithChoices` arm.
-        if let EpicsValue::Enum(idx) = &value
+        // An external ENUM read as `DBR_STRING` is the server's string, off
+        // the lset's `DBR_STRING` monitor; C `dbCaGetLink` fails the read
+        // until that monitor's first event (`dbCa.c:436-454`). An lset with
+        // no such monitor leaves the index digits.
+        if let EpicsValue::Enum(_) = value
             && let Some(external) = link.external()
-            && let Some(m) = self.external_link_metadata(external)
-            && let Some(choices) = m.enum_choices
-            && let Some(label) = choices.get(*idx as usize)
         {
-            return Some(PvString::from(label.as_str()));
+            match self.external_enum_string(external) {
+                super::EnumString::Got(s) => return Some(s),
+                super::EnumString::Pending => return None,
+                super::EnumString::NotServed => {}
+            }
         }
         crate::server::record::value_as_dbr_string(&value)
     }
@@ -2718,6 +2717,19 @@ impl PvDatabase {
         super::link_put_queue::find_lset(&self.inner, scheme, |lset| lset.link_metadata(lref))
     }
 
+    /// [`LinkSet::get_cached_enum_string`](super::LinkSet::get_cached_enum_string)
+    /// of an external link.
+    fn external_enum_string(
+        &self,
+        link: crate::server::record::ExternalRef<'_>,
+    ) -> super::EnumString {
+        let (scheme, lref) = Self::external_link_ref(link);
+        super::link_put_queue::find_lset(&self.inner, scheme, |lset| {
+            Some(lset.get_cached_enum_string(lref))
+        })
+        .unwrap_or(super::EnumString::NotServed)
+    }
+
     /// C `dbGetControlLimits` / `dbGetGraphicLimits` / `dbGetAlarmLimits` /
     /// `dbGetPrecision` / `dbGetUnits` (`dbLink.c:344-393`) — the five
     /// metadata slots a record fetches THROUGH one of its links.
@@ -2979,12 +2991,6 @@ impl PvDatabase {
             // `display.description` has no C lset slot — it is a pvxs-only
             // pvalink extra (`LinkMetadata::description`).
             description: None,
-            enum_choices: snapshot.enums.as_ref().map(|e| {
-                e.strings
-                    .iter()
-                    .map(|s| s.as_str_lossy().into_owned())
-                    .collect()
-            }),
         })
     }
 

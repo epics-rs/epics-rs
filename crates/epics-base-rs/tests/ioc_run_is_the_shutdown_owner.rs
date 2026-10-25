@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use epics_base_rs::runtime::exit::at_exit;
-use epics_base_rs::server::ioc_app::IocApplication;
+use epics_base_rs::server::ioc_app::{IocApplication, RunOutcome};
 
 #[epics_macros_rs::epics_test]
 async fn every_way_out_of_run_runs_the_shutdown_callbacks() {
@@ -32,10 +32,13 @@ async fn every_way_out_of_run_runs_the_shutdown_callbacks() {
     at_exit("mq4-normal-return", move || {
         counter.fetch_add(1, Ordering::SeqCst);
     });
-    IocApplication::new()
-        .run(|_config| async move { Ok(()) })
+    let outcome = IocApplication::new()
+        .run_outcome(|_config| async move { Ok(()) })
         .await
         .expect("an IOC with a runner that returns Ok must return Ok");
+    // An IOC that never initialised returns Ok without a runner, through
+    // the other exit.
+    assert_eq!(outcome, RunOutcome::Served);
     assert_eq!(
         ran.load(Ordering::SeqCst),
         1,

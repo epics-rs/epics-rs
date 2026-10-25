@@ -120,3 +120,30 @@ async fn a_multi_scan_reads_each_channel_that_is_on_in_its_own_mode() {
     ioc.step("init_dmm", 1.0, &RESET).await;
     assert_eq!(ioc.f64_of("init_dmm"), 0.0);
 }
+
+/// A `channels` macro past the program's 10 channels is cut to 10. C
+/// scanned an 11th relay through `ch_on_off[10]` and `ch_mode[10]`, and its
+/// `pvPut(ch_raw[10])` processed `conf_dcv` instead of a reading.
+#[epics_base_rs::epics_test]
+async fn a_channels_macro_past_ten_is_cut_to_ten() {
+    let ioc = boot(&EM, 11).await;
+    ioc.boot_commands().await;
+    assert_eq!(ioc.f64_of("channels"), 10.0);
+    ioc.step("dmm_chan", 2.0, &["rout:clos (@3)"]).await;
+    ioc.step("ch_mode_sel", 1.0, &[":sens:func 'curr'"]).await;
+    ioc.step("ch10_mode_sel", 1.0, &[]).await;
+    assert_eq!(ioc.str_of("ch10_units"), "AMP");
+    ioc.step("single_multi", 1.0, &[]).await;
+
+    let mut scan = vec![":sens:func 'volt'".to_string()];
+    for n in 1..=10 {
+        if n == 10 {
+            scan.push(":sens:func 'curr'".into());
+        }
+        scan.push(format!("rout:clos (@{n})"));
+        scan.push("*trg;fetch?".into());
+    }
+    ioc.read(&scan.iter().map(String::as_str).collect::<Vec<_>>())
+        .await;
+    assert_eq!(ioc.f64_of("Ch10_raw"), 10.1);
+}

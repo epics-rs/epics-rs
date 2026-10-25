@@ -166,6 +166,9 @@ ss mode_change {
             model[sizeof(model)-1] = 0;
             pvPut(model);
             channels = atoi(macValueGet("channels"));
+            /* C defect fixed: a channels macro past MAX_CHANNELS indexed
+            ** ch_mode, ch_on_off and ch_raw past their ends. */
+            if (channels > MAX_CHANNELS) channels = MAX_CHANNELS;
             pvPut(channels);
             if (strcmp(model, "6517A") == 0) {
                strncpy(close_format, "rout:clos (@%d)", sizeof(close_format));

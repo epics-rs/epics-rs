@@ -53,27 +53,19 @@ The 16 programs v0.32.0 moved onto the sequencer (`IN_SCOPE` in
 ## Not supported
 
 snc-rs stops with an error naming the line where C snc would emit C that has
-no Rust form. `EXPECTED_FAILURES` in `tests/reference_gen_code.rs` pins these
-upstream programs to fail:
+no Rust form yet: a non-`char` pointer, pointer arithmetic or assignment
+through a pointer, a `char *` into a variable, a struct definition, a
+struct, enum or union variable, a `typename` variable, a member of a seq
+run-time value, and an assignment to a foreign variable. Each needs a
+run-time type `epics-seq-rs` does not have yet. An array or `string`
+parameter of a function definition, which C passes as a pointer, is refused
+the same way.
 
-- struct definitions: sequencer `test/validate/structdef.st` and
-  `functionInStruct.st`
-- a struct variable: sequencer `test/validate/foreignTypes.st`
-- assignment through a pointer: calc `editSseq.st`, motorNewport
-  `XPS_trajectoryScan.st`
-- a `char *` that points into a variable: motorNewport
-  `MM4005_trajectoryScan.st`
-- assignment to a foreign variable: sequencer `test/validate/pvGet.st`
-- a member of a seq run-time value: sequencer
-  `examples/small/pvTimeStamp.st`
-- testing a value of unknown type: sequencer `examples/parallel/control.st`
-  (`pvPutCompleteArray` is defined nowhere)
-- an escaped-C `char` array passed by value, which rustc rejects (E0308):
-  ip `Keithley2kDMM.st`
-
-Pointer arithmetic, non-`char` pointer variables, `typename` variables, and
-an array or `string` parameter of a function definition, which C passes as a
-pointer, are refused the same way.
+`EXPECTED_FAILURES` in `tests/reference_gen_code.rs` pins every upstream
+program that does not build, with its first error; every other program
+type-checks or is rejected by analysis as C snc rejects it. Besides the
+refusals, sequencer `examples/parallel/control.st` calls
+`pvPutCompleteArray`, which is defined nowhere, so C cannot link it either.
 
 There are no cargo features.
 

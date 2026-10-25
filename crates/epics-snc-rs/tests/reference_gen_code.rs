@@ -76,32 +76,101 @@ const IN_SCOPE: [&str; 16] = [
 ];
 
 /// Programs that do not build, each with the first error it must fail
-/// with, so that a fix or a different failure shows.
+/// with, so that a fix or a different failure shows. Every other program
+/// type-checks or is rejected by analysis as C snc rejects it.
 const EXPECTED_FAILURES: &[(&str, &str)] = &[
-    // pvPutCompleteArray is defined nowhere in seq or base
+    // C snc rejects these with the same error
+    (
+        "sequencer/test/compiler/delay_in_action.st",
+        "delay_in_action.st:12: error: calling delay is only allowed inside a when condition",
+    ),
+    (
+        "sequencer/test/compiler/efNoInit.st",
+        "efNoInit.st:9: error: event flag 'ef' cannot be initialized",
+    ),
+    (
+        "sequencer/test/compiler/funcdefShadowGlobal.st",
+        "funcdefShadowGlobal.st:10: error: parameter 1 to 'pvPut' was not assigned to a pv",
+    ),
+    (
+        "sequencer/test/compiler/pvArray.st",
+        "pvArray.st:10: error: passing multi-PV array 'a' to function 'pvAssign' is no longer allowed",
+    ),
+    (
+        "sequencer/test/compiler/pvNotAssigned.st",
+        "pvNotAssigned.st:12: error: parameter 1 to 'pvGet' was not assigned to a pv",
+    ),
+    // C snc and cc accept it, but pvPutCompleteArray is defined nowhere in
+    // seq or base, so it does not link
     (
         "sequencer/examples/parallel/control.st",
-        "control.st:37: error: snc-rs does not support testing a value of unknown type",
+        "control.st:37: error[E0425]: cannot find function `pvPutCompleteArray` in this scope: not found in this scope",
+    ),
+    // these wait for a run-time pointer type
+    (
+        "calc/calcApp/src/editSseq.st",
+        "editSseq.st:161: error: snc-rs does not support assignment through a pointer",
     ),
     (
-        "sequencer/examples/small/pvTimeStamp.st",
-        "pvTimeStamp.st:10: error: snc-rs does not support a member of a seq run-time value",
-    ),
-    (
-        "sequencer/test/validate/pvGet.st",
-        "pvGet.st:26: error: snc-rs does not support assignment to a foreign variable",
+        "motor/modules/motorAerotech/aerotechApp/src/EnsembleTrajectoryScan.st",
+        "EnsembleTrajectoryScan.st:82: error: snc-rs does not support non-char pointer variable 'pstatus'",
     ),
     (
         "motor/modules/motorNewport/newportApp/src/MM4005_trajectoryScan.st",
         "MM4005_trajectoryScan.st:316: error: snc-rs does not support a char * that points into a variable",
     ),
     (
-        "calc/calcApp/src/editSseq.st",
-        "editSseq.st:161: error: snc-rs does not support assignment through a pointer",
-    ),
-    (
         "motor/modules/motorNewport/newportApp/src/XPS_trajectoryScan.st",
         "XPS_trajectoryScan.st:165: error: snc-rs does not support assignment through a pointer",
+    ),
+    (
+        "motor/modules/motorOms/omsApp/src/MAX_trajectoryScan.st",
+        "MAX_trajectoryScan.st:185: error: snc-rs does not support non-char pointer variable 'rttraj'",
+    ),
+    (
+        "sequencer/examples/small/decl.st",
+        "decl.st:13: error: snc-rs does not support non-char pointer variable 'complicated'",
+    ),
+    (
+        "sequencer/test/compiler/cast.st",
+        "cast.st:18: error: snc-rs does not support non-char pointer variable 'pai'",
+    ),
+    (
+        "sequencer/test/compiler/funcdef.st",
+        "funcdef.st:8: error: snc-rs does not support non-char pointer result of function 'f1'",
+    ),
+    (
+        "sequencer/test/compiler/type_expr.st",
+        "type_expr.st:13: error: snc-rs does not support non-char pointer variable 'p'",
+    ),
+    (
+        "sequencer/test/validate/array.st",
+        "array.st:30: error: snc-rs does not support non-char pointer variable 'a4ps'",
+    ),
+    (
+        "sequencer/test/validate/opttVar.st",
+        "opttVar.st:99: error: snc-rs does not support non-char pointer variable 'xp'",
+    ),
+    (
+        "sequencer/test/validate/sizeof.st",
+        "sizeof.st:19: error: snc-rs does not support a char * that points into a variable",
+    ),
+    (
+        "sequencer/test/validate/void.st",
+        "void.st:12: error: snc-rs does not support non-char pointer variable 'p'",
+    ),
+    // these wait for a run-time contract for SNL and foreign structs
+    (
+        "sequencer/examples/small/timer.st",
+        "timer.st:9: error: snc-rs does not support struct definitions",
+    ),
+    (
+        "sequencer/test/compiler/foreignTypes.st",
+        "foreignTypes.st:17: error: snc-rs does not support enum enum_test variable 'e0'",
+    ),
+    (
+        "sequencer/test/compiler/member.st",
+        "member.st:6: error: snc-rs does not support struct struct_t variable 's'",
     ),
     (
         "sequencer/test/validate/foreignTypes.st",
@@ -112,8 +181,35 @@ const EXPECTED_FAILURES: &[(&str, &str)] = &[
         "functionInStruct.st:9: error: snc-rs does not support struct definitions",
     ),
     (
+        "sequencer/test/validate/indirectCall.st",
+        "indirectCall.st:26: error: snc-rs does not support struct s variable 'gx'",
+    ),
+    (
         "sequencer/test/validate/structdef.st",
         "structdef.st:9: error: snc-rs does not support struct definitions",
+    ),
+    // these wait for a run-time timestamp with C's members, a foreign
+    // global SNL code writes, and a Zeroed pvStat
+    (
+        "sequencer/examples/small/pvTimeStamp.st",
+        "pvTimeStamp.st:10: error: snc-rs does not support a member of a seq run-time value",
+    ),
+    (
+        "sequencer/test/validate/pvGet.st",
+        "pvGet.st:26: error: snc-rs does not support assignment to a foreign variable",
+    ),
+    (
+        "sequencer/test/validate/pvGetCancel.st",
+        "pvGetCancel.st:25: error: snc-rs does not support typename pvStat variable 'status'",
+    ),
+    // `x != Default::default()` is ambiguous beside serde_json
+    (
+        "sequencer/test/validate/pvSyncDb.st",
+        "pvSync.st:78: error[E0283]: type annotations needed: cannot infer type",
+    ),
+    (
+        "sequencer/test/validate/pvSyncNoDb.st",
+        "pvSync.st:78: error[E0283]: type annotations needed: cannot infer type",
     ),
 ];
 
@@ -286,6 +382,10 @@ fn c_exports() -> HashSet<String> {
     names
 }
 
+/// Functions programs call that C defines nowhere, which a companion
+/// cannot supply either.
+const UNDEFINED: &[&str] = &["pvPutCompleteArray"];
+
 /// A companion for `foreign`: an arm for every escaped fragment that
 /// expands the SNL between them, and a placeholder for every foreign name
 /// `epics_seq_rs::c` does not supply. A value is a constant, a subscripted
@@ -303,7 +403,7 @@ fn stub_companion(foreign: &Foreign, c: &HashSet<String>) -> String {
          }\n",
     );
     for (name, argcs) in &foreign.funcs {
-        if c.contains(name) {
+        if c.contains(name) || UNDEFINED.contains(&name.as_str()) {
             continue;
         }
         let argc = *argcs.iter().next().unwrap();
@@ -628,6 +728,12 @@ fn upstream_programs_type_check() {
         }
         if !programs.iter().any(|p| rel(p) == st) {
             gate.push(format!("{st} is in scope and not in the corpus"));
+        }
+    }
+    // reference_analysis holds an analysis rejection to C snc's own
+    for (st, e) in &first_error {
+        if e != "rejected by analysis" && !EXPECTED_FAILURES.iter().any(|&(p, _)| p == st) {
+            gate.push(format!("{st} fails and is not pinned: {e}"));
         }
     }
     for &(st, want) in EXPECTED_FAILURES {

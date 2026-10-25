@@ -263,3 +263,20 @@ async fn cid_0_takes_the_controller_of_the_first_packet() {
         .await;
     assert_eq!(ioc.f64_of("TEMP.RVAL"), 29315.0);
 }
+
+/// A packet without the controller number leaves `CID=0` open and lands
+/// in no record. C took its NOT_FOUND for the number, so it took that
+/// packet (TEMP 111.11, "Stop Pressed") and then none with a number.
+#[epics_base_rs::epics_test]
+async fn cid_0_waits_for_a_packet_with_the_controller_number() {
+    let ioc = boot(0, Some("0")).await;
+    ioc.deliver(&Packet::new(&[(TEMP, 11111), (ALARMI, 1)]), 928)
+        .await;
+    assert_eq!(ioc.f64_of("TEMP.RVAL"), 0.0);
+    assert_eq!(ioc.str_of("ALARM"), "unset");
+
+    let numbered = Packet::new(&[(CTRLNUM, 113), (TEMP, 29315), (ALARMI, 5)]);
+    ioc.deliver(&numbered, 928).await;
+    assert!(eventually(|| ioc.str_of("ALARM") == "Temp Warning").await);
+    assert_eq!(ioc.f64_of("TEMP.RVAL"), 29315.0);
+}

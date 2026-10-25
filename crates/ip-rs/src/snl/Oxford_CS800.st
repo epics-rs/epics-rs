@@ -254,7 +254,9 @@ ss cs800 {
        * number since it is the only one.
        */
       s_cid = getParam(PARAM_CTRLNUM, param_id, param_value);
-      if (cid == 0) {
+      /* C defect fixed: C took NOT_FOUND for the number from a packet
+       * without CTRLNUM, and then matched only packets without one. */
+      if (cid == 0 && s_cid != NOT_FOUND) {
         cid = s_cid;
         printf("(%s) choosing controller ID: %d\n", macValueGet("name"), cid);
       }

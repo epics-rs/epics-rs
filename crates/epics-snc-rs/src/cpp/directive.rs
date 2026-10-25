@@ -462,8 +462,8 @@ impl Engine {
             return Some(id);
         }
         let on_disk = |e: &Engine, p: Vec<u8>| {
-            let disk = e.disk(&p);
-            disk.is_file().then_some((p, disk))
+            let disk = e.disk(&p).filter(|d| d.is_file())?;
+            Some((p, disk))
         };
         let mut found = None;
         let mut via_chain = false;

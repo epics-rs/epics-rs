@@ -151,14 +151,18 @@ impl Engine {
 
     /// Where a spelled path is on disk: one under the main file's spelled
     /// directory is under its real one, so `../h.h` from `../p.st` never
-    /// reaches the process's parent directory.
-    pub(super) fn disk(&self, spelled: &[u8]) -> PathBuf {
+    /// reaches the process's parent directory. When that directory is all
+    /// `../`, the one names are spelled from stands in for make's
+    /// `O.<arch>`, which holds no file here, so a name inside it (`./h.h`
+    /// from `-I.`) is on no disk.
+    pub(super) fn disk(&self, spelled: &[u8]) -> Option<PathBuf> {
+        let spelled = without_dot_dirs(spelled);
         let (dir, real) = &self.main_dir;
+        let absolute = is_absolute_path(&spelled);
         match spelled.strip_prefix(dir.as_slice()) {
-            Some(rest) if !(dir.is_empty() && is_absolute_path(spelled)) => {
-                to_path(&[real, rest].concat())
-            }
-            _ => to_path(spelled),
+            Some(rest) if !(dir.is_empty() && absolute) => Some(to_path(&[real, rest].concat())),
+            _ if !absolute && !dir.is_empty() && dir.chunks(3).all(|d| d == b"../") => None,
+            _ => Some(to_path(&spelled)),
         }
     }
 
@@ -542,6 +546,14 @@ pub(super) fn dir_prefix(path: &[u8]) -> Vec<u8> {
 
 pub(super) fn join(dir: &[u8], name: &[u8]) -> Vec<u8> {
     join_1(DOS_BASED, dir, name)
+}
+
+/// `path` without its `.` components, which the OS steps over.
+fn without_dot_dirs(path: &[u8]) -> Vec<u8> {
+    path.split(|&c| is_dir_separator_1(DOS_BASED, c))
+        .filter(|c| *c != b".")
+        .collect::<Vec<_>>()
+        .join(&b'/')
 }
 
 pub(super) fn to_path(b: &[u8]) -> PathBuf {

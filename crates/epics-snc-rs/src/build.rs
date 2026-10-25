@@ -150,8 +150,10 @@ struct Preprocessed {
 /// before snc as a failing `%.i: %.st` stops make.
 fn preprocess(snc: &mut Snc, st: &Path, name: &Path) -> Result<Preprocessed, Exit> {
     let text = snc.read_input(st)?;
-    // -I.. : the program's own directory, from O.<arch>.
-    let out = cpp::preprocess(st, name, &text, &[], &["..".into()]);
+    // RULES_SNCSEQ's -I. -I.. from O.<arch>: the build directory, so
+    // `"../h.h"` from an included file reaches the program's directory,
+    // then the program's directory itself.
+    let out = cpp::preprocess(st, name, &text, &[], &[".".into(), "..".into()]);
     for d in &out.diagnostics {
         snc.report(format_args!("{d}\n"));
     }
@@ -333,6 +335,32 @@ mod tests {
              ss s { state a { when () { printf(\"%s\\n\", \"../p.st\"); } exit } }\n"
         );
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn an_included_file_reaches_the_program_directory_from_the_build_directory() {
+        // pvSync.st:24's `#include "../pvSync.h"`, read through
+        // pvSyncDb.st's `#include "pvSync.st"`: gcc in O.<arch> finds it
+        // through -I. as ./../pvSync.h
+        let top = tempfile::tempdir().unwrap();
+        let src = top.path().join("src");
+        std::fs::create_dir(&src).unwrap();
+        std::fs::write(src.join("p.st"), "#include \"q.st\"\nprogram p\n").unwrap();
+        std::fs::write(
+            src.join("q.st"),
+            "#include \"../h.h\"\nss s { state a { when () {} exit } }\n",
+        )
+        .unwrap();
+        std::fs::write(src.join("h.h"), "%% int h;\n").unwrap();
+        let st = src.join("p.st");
+        let pre = preprocess(&mut Snc::capturing(), &st, &vpath_name(&st)).unwrap();
+        assert_eq!(
+            String::from_utf8(pre.text).unwrap(),
+            "# 1 \"../p.st\"\n# 1 \"../q.st\" 1\n# 1 \"./../h.h\" 1\n%% int h;\n\
+             # 2 \"../q.st\" 2\nss s { state a { when () {} exit } }\n# 2 \"../p.st\" 2\n\
+             program p\n"
+        );
+        assert_eq!(pre.files, [st, src.join("q.st"), src.join("h.h")]);
     }
 
     #[test]

@@ -3183,6 +3183,9 @@ impl PvDatabase {
                 Ok(r) => common_result = r,
                 Err(e) => status = Err(e),
             }
+            if instance.record.special_retypes(field) {
+                rec.settle_addr_facts(&instance);
+            }
         }
         self.remove_put_link(&instance, field, before);
         if status.is_ok() && link_put {

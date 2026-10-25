@@ -525,6 +525,10 @@ impl Record for MbboRecord {
         Ok(())
     }
 
+    fn special_retypes(&self, put_field: &str) -> bool {
+        crate::server::record::multibit_state_field(put_field)
+    }
+
     fn take_cycle_posted_fields(&mut self) -> crate::server::record::CycleMarks {
         const VAL_POST_NAMED: [(&str, crate::server::record::CyclePostMask); 1] =
             [("VAL", crate::server::record::CyclePostMask::ValueLog)];

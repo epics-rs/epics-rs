@@ -1143,7 +1143,7 @@ impl AsyncDbHandle {
     /// device keeps to reach it later. A `dbCommon` `DBF_NOACCESS` name
     /// (`TIME`) resolves, as in C, with no field type. Takes no lock: `own`
     /// is the calling record as for [`Self::db_get`], and another record's
-    /// runtime-typed field is read only while that record is free.
+    /// runtime-typed field has the type settled at its init.
     pub fn name_to_dbaddr(
         &self,
         name: impl AsRef<[u8]>,

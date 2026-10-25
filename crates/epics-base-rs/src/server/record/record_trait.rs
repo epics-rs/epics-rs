@@ -6501,6 +6501,15 @@ pub trait Record: RecordAny + Send + Sync + 'static {
         false
     }
 
+    /// True iff the C `special()` for a put to `put_field` changes the type
+    /// `cvt_dbaddr` gives a [`FieldDesc::runtime_typed`] field: `mbbo`'s
+    /// state fields, which move `sdef` and so VAL's type. The put owner
+    /// (`field_io`) then settles the record's address facts again
+    /// (`RecordCell::settle_addr_facts`). Default: false.
+    fn special_retypes(&self, _put_field: &str) -> bool {
+        false
+    }
+
     /// True iff the C `special()` for a put to `put_field` calls the
     /// record's `checkLink` before it acts on the link statuses — throttle's
     /// SYNC arm (`throttleRecord.c:381-386`). The put owner (`field_io`)

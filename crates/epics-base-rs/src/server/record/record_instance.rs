@@ -2518,6 +2518,11 @@ pub struct RecordCell {
     /// [`Self::string_typed`] so `dbNameToAddr` reads it with no lock, as C
     /// reads `prec->nelm`. The capacity fields are `SPC_NOMOD`.
     dbaddr_counts: arc_swap::ArcSwap<Vec<(u16, u32)>>,
+    /// The `field_type` `cvt_dbaddr` gives each [`FieldDesc::runtime_typed`]
+    /// field of `rdes.fields`, in order: settled with [`Self::string_typed`]
+    /// so `dbNameToAddr` types another thread's record with no lock, as C
+    /// reads `prec->ftvl` (`waveformRecord.c:184`).
+    runtime_types: arc_swap::ArcSwap<Vec<Option<DbFieldType>>>,
 }
 
 const _: () = assert!(std::mem::offset_of!(RecordCell, data) == 0);
@@ -2551,6 +2556,16 @@ fn string_typed_mask(inst: &RecordInstance) -> u64 {
             _ => mask,
         }
     })
+}
+
+/// [`RecordCell::runtime_types`] of `inst`.
+fn runtime_types_of(inst: &RecordInstance) -> Vec<Option<DbFieldType>> {
+    let rec = &*inst.record;
+    rec.field_list()
+        .iter()
+        .filter(|f| f.runtime_typed)
+        .map(|f| rec.get_field(f.name).map(|v| v.db_field_type()))
+        .collect()
 }
 
 /// A record type's declaration, C's `dbRecordType` behind `precord->rdes`:
@@ -3551,6 +3566,7 @@ impl RecordCell {
             lent: std::sync::atomic::AtomicU32::new(0),
             string_typed: std::sync::atomic::AtomicU64::new(string_typed_mask(&instance)),
             dbaddr_counts: arc_swap::ArcSwap::from_pointee(dbaddr_counts_of(&instance)),
+            runtime_types: arc_swap::ArcSwap::from_pointee(runtime_types_of(&instance)),
             data: LockSetGuarded(std::cell::UnsafeCell::new(instance)),
         }
     }
@@ -3598,15 +3614,16 @@ impl RecordCell {
             .swap(false, std::sync::atomic::Ordering::AcqRel)
     }
 
-    /// Re-read [`Self::string_typed`] and [`Self::dbaddr_counts`] from
-    /// `inst`, this cell's record, after a load or an `init_record` that may
-    /// have moved a type selector or a capacity.
+    /// Re-read [`Self::string_typed`], [`Self::dbaddr_counts`] and
+    /// [`Self::runtime_types`] from `inst`, this cell's record, after a load
+    /// or an `init_record` that may have moved a type selector or a capacity.
     pub(crate) fn settle_addr_facts(&self, inst: &RecordInstance) {
         self.string_typed.store(
             string_typed_mask(inst),
             std::sync::atomic::Ordering::Relaxed,
         );
         self.dbaddr_counts.store(Arc::new(dbaddr_counts_of(inst)));
+        self.runtime_types.store(Arc::new(runtime_types_of(inst)));
     }
 
     /// C `dbNameToAddr(name, &addr)` on this record succeeding, answered with
@@ -3632,7 +3649,7 @@ impl RecordCell {
 
     /// C `dbNameToAddr`'s `field_type` for `field`: the declaration, or the
     /// variant a runtime-typed field holds, read from `own` when the caller
-    /// holds this record and otherwise only while the record is free.
+    /// holds this record and otherwise from [`Self::runtime_types`].
     pub(crate) fn addressed_field_type(
         &self,
         field: &str,
@@ -3642,11 +3659,14 @@ impl RecordCell {
         if !desc.runtime_typed {
             return Some(desc.dbf_type);
         }
-        let value = match own {
-            Some(record) => record.get_field(field),
-            None => self.try_read()?.record.get_field(field),
-        };
-        value.map(|v| v.db_field_type())
+        match own {
+            Some(record) => record.get_field(field).map(|v| v.db_field_type()),
+            None => {
+                let mut runtime_typed = self.rdes.fields.iter().filter(|f| f.runtime_typed);
+                let at = runtime_typed.position(|f| f.name == desc.name)?;
+                self.runtime_types.load().get(at).copied().flatten()
+            }
+        }
     }
 
     /// [`Self::no_elements`] as C's `dbNameToAddr` RUNS it: the record's
@@ -14138,6 +14158,7 @@ mod record_cell_layout_tests {
             bkpt,
             string_typed,
             dbaddr_counts,
+            runtime_types,
         });
         packed_in_order(cell);
 

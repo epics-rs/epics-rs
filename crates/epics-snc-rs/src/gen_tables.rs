@@ -28,9 +28,9 @@ const NM_SS: &str = "seqg_ss";
 /// The function returning a `-r` program's one variable block.
 const NM_STATIC_VARS: &str = "seqg_static_vars";
 
-/// C `MAGIC` (`seq_release.h`): the table layout, which epics-seq-rs
-/// checks against its `SEQ_MAGIC`.
-const MAGIC: u32 = 2_002_009;
+/// C `MAGIC` (`seq_release.h`, which build.rs writes): the table layout,
+/// which epics-seq-rs checks against its `SEQ_MAGIC`.
+const MAGIC: &str = env!("EPICS_SNC_MAGIC");
 
 /// C `gen_tables`: all kinds of tables for the program `p`.
 pub fn gen_tables(snc: &mut Snc, ast: &Ast, p: &Program) -> Vec<Item> {
@@ -360,7 +360,7 @@ fn gen_prog_table(out: &mut Vec<Item>, ast: &Ast, p: &Program) {
         )
     };
     let fields = vec![
-        ("magic", Expr::Atom(MAGIC.to_string())),
+        ("magic", Expr::atom(MAGIC)),
         ("prog_name", Expr::str_lit(name)),
         ("chan", Expr::unary("&", Expr::atom(NM_CHANS))),
         ("ss", Expr::unary("&", Expr::atom(NM_STATESETS))),

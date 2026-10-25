@@ -139,6 +139,10 @@ fn vpath_name(st: &Path) -> PathBuf {
     name.into()
 }
 
+/// The sequencer's installed headers a program includes: build.rs's
+/// seq_release.h.
+const SNCSEQ_INCLUDE: &str = concat!(env!("OUT_DIR"), "/include");
+
 /// A program after cpp.
 struct Preprocessed {
     text: Vec<u8>,
@@ -152,8 +156,9 @@ fn preprocess(snc: &mut Snc, st: &Path, name: &Path) -> Result<Preprocessed, Exi
     let text = snc.read_input(st)?;
     // RULES_SNCSEQ's -I. -I.. from O.<arch>: the build directory, so
     // `"../h.h"` from an included file reaches the program's directory,
-    // then the program's directory itself.
-    let out = cpp::preprocess(st, name, &text, &[], &[".".into(), "..".into()]);
+    // then the program's directory itself; and, last, -I$(SNCSEQ)/include.
+    let dirs = [".".into(), "..".into(), SNCSEQ_INCLUDE.into()];
+    let out = cpp::preprocess(st, name, &text, &[], &dirs);
     for d in &out.diagnostics {
         snc.report(format_args!("{d}\n"));
     }
@@ -361,6 +366,25 @@ mod tests {
              program p\n"
         );
         assert_eq!(pre.files, [st, src.join("q.st"), src.join("h.h")]);
+    }
+
+    #[test]
+    fn a_program_includes_seq_release_h_for_magic() {
+        // EnsembleTrajectoryScan.st:33's `#include <seq_release.h>`, which
+        // C reaches through -I$(SNCSEQ)/include
+        let src = tempfile::tempdir().unwrap();
+        let st = src.path().join("p.st");
+        std::fs::write(
+            &st,
+            "#include <seq_release.h>\n#if MAGIC >= 2002000\nprogram new\n#else\nprogram old\n#endif\n",
+        )
+        .unwrap();
+        let pre = preprocess(&mut Snc::capturing(), &st, &vpath_name(&st)).unwrap();
+        let text = String::from_utf8(pre.text).unwrap();
+        assert!(text.contains("\nprogram new\n"), "{text}");
+        assert!(!text.contains("program old"), "{text}");
+        let header = Path::new(SNCSEQ_INCLUDE).join("seq_release.h");
+        assert_eq!(pre.files, [st, header]);
     }
 
     #[test]

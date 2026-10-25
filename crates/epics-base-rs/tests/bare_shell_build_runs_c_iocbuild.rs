@@ -173,8 +173,17 @@ async fn init_pause_run_is_the_full_c_sequence() {
 /// (`epics-ca-rs`'s `ca_server.rs`), both now routed here.
 #[epics_macros_rs::epics_test]
 async fn eltc_zero_silences_everything_the_build_says() {
-    let (_out, err) = run("eltc 0\niocInit\n");
+    let (out, err) = run("eltc 0\niocInit\n");
     assert_eq!(err, "", "eltc 0 leaves C's console empty");
+    // An empty console is also what an iocInit that never built leaves; the
+    // banner on stdout is the build's.
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(
+        lines.get(..2),
+        Some(&["eltc 0", "iocInit"][..]),
+        "stdout was {out:?}"
+    );
+    assert_banner(&lines[2..], &out);
 }
 
 /// `coreRelease` on its own still prints the same banner, so the assertion

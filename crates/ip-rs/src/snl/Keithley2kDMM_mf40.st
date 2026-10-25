@@ -335,6 +335,12 @@ ss mode_change {
                     mode = mode + 8;
                 }
                 */
+                /* C defect fixed: a numeric put can leave an mbbo past its
+                ** states, and a mode past NUM_FRONT_MODES indexed
+                ** unit_strings and dmm_modes past their ends. Such a mode
+                ** is ignored here and below; monitored mode PVs are read
+                ** once, as a put can change them between reads. */
+                if (mode >= NUM_FRONT_MODES) continue;
                 sprintf(ch_units, "%s", unit_strings[mode]);
                 sprintf(pvname, "%s%sch%d_units.VAL", P, Dmm, i+1);
                 pvAssign(ch_units, pvname);
@@ -343,15 +349,18 @@ ss mode_change {
         } state monitor_mode_changes
 
         when(efTestAndClear(ch_mode_sel_mon)) {
-            sprintf(dmm_units, "%s", unit_strings[ch_mode_sel]);
-            pvPut(dmm_units);
-            pvPut(dmm_modes[ch_mode_sel]);
-            previous_mode = ch_mode_sel;
-            /* If 4-wire mode was selected open all channels */
-            if (ch_mode_sel == 3) {
-                sprintf(ch_close, "rout:open:all");
-                pvPut(ch_close);
-                previous_chan = -1;
+            mode = ch_mode_sel;
+            if (mode < NUM_FRONT_MODES) {
+                sprintf(dmm_units, "%s", unit_strings[mode]);
+                pvPut(dmm_units);
+                pvPut(dmm_modes[mode]);
+                previous_mode = mode;
+                /* If 4-wire mode was selected open all channels */
+                if (mode == 3) {
+                    sprintf(ch_close, "rout:open:all");
+                    pvPut(ch_close);
+                    previous_chan = -1;
+                }
             }
         } state monitor_mode_changes
 
@@ -411,10 +420,11 @@ ss read_meter {
     }
     state read_channel {
         when (single_multi == 0) {
-            if (ch_mode_sel != previous_mode) {
-                sprintf(dmm_units, "%s", unit_strings[ch_mode_sel]);
+            mode = ch_mode_sel;
+            if (mode != previous_mode && mode < NUM_FRONT_MODES) {
+                sprintf(dmm_units, "%s", unit_strings[mode]);
                 pvPut(dmm_units);
-                pvPut(dmm_modes[ch_mode_sel]);
+                pvPut(dmm_modes[mode]);
             }
             /* Issue close channel if different */
             chan = dmm_chan;
@@ -426,7 +436,7 @@ ss read_meter {
                 pvPut(ch_close);
                 previous_chan = chan;
             }
-            previous_mode = ch_mode_sel;
+            previous_mode = mode;
             read_complete=0;
             pvPut(read_complete);
             efClear(read_complete_mon);
@@ -443,7 +453,7 @@ ss read_meter {
                 mode = mode + 8;
             }
 	    */
-            if (mode != previous_mode) {
+            if (mode != previous_mode && mode < NUM_FRONT_MODES) {
                 pvPut(dmm_modes[mode]);
                 previous_mode = mode;
             }

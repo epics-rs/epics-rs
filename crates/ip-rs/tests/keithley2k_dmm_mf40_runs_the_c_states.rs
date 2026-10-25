@@ -236,3 +236,37 @@ async fn a_channels_macro_past_forty_is_cut_to_forty() {
     ioc.step("ch40_mode_sel", 1.0, &[]).await;
     assert_eq!(ioc.str_of("ch40_units"), "VAC");
 }
+
+/// A numeric put past the ten modes (the mode mbbos define 10 and 8
+/// states) changes no units and configures nothing, and the meter reads on
+/// in the mode it has. C indexed `unit_strings` and `dmm_modes` past their
+/// ends; `ch2_mode_sel 12` crashed its IOC.
+#[epics_base_rs::epics_test]
+async fn a_mode_past_the_ten_is_ignored() {
+    let ioc = boot(4).await;
+    booted(&ioc).await;
+    ioc.step("ch_mode_sel", 3.0, &[":conf:fres", "rout:open:all"])
+        .await;
+    ioc.step("ch_mode_sel", 10.0, &[]).await;
+    assert_eq!(ioc.str_of("units"), "OHM");
+    ioc.read(&["rout:clos (@101)", "read?"]).await;
+    assert_eq!(ioc.f64_of("Dmm_raw"), 101.3);
+
+    ioc.step("ch_mode_sel", 1.0, &[":conf:volt:ac"]).await;
+    assert_eq!(ioc.str_of("units"), "VAC");
+    ioc.step("ch2_mode_sel", 12.0, &[]).await;
+    assert_eq!(ioc.str_of("ch2_units"), "VDC");
+    ioc.step("single_multi", 1.0, &[]).await;
+    ioc.read(&[
+        ":conf:volt:dc",
+        "read?",
+        "rout:clos (@102)",
+        "read?",
+        "rout:clos (@103)",
+        "read?",
+        "rout:clos (@104)",
+        "read?",
+    ])
+    .await;
+    assert_eq!(ioc.f64_of("Ch2_raw"), 102.0);
+}

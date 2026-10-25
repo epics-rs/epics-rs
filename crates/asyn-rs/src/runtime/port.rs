@@ -840,6 +840,109 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// A client that borrows the port back-to-back, as the T4U data thread's
+    /// 0.1 s UDP reads do, can leave the actor nothing to idle on; two of
+    /// them, each queued while the other holds the port, always do. C
+    /// `shutdownPort` waits for no idle queue (asynManager.c:2253-2310): the
+    /// stop is taken before the next request and the port is defunct.
+    #[test]
+    fn a_port_borrowed_back_to_back_stops_within_the_deadline() {
+        struct HeldPort {
+            base: PortDriverBase,
+        }
+        impl PortDriver for HeldPort {
+            fn base(&self) -> &PortDriverBase {
+                &self.base
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.base
+            }
+            fn write_int32(&mut self, _: &mut crate::user::AsynUser, _: i32) -> AsynResult<()> {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                Ok(())
+            }
+        }
+        let port = HeldPort {
+            base: TestPort::new("rt_borrowed").base,
+        };
+        let (handle, _jh) = create_port_runtime_unclaimed(port, RuntimeConfig::default())
+            .expect("the port runtime thread must start");
+        let clients: Vec<_> = (0..2)
+            .map(|_| {
+                let borrower = handle.port_handle().clone();
+                std::thread::spawn(move || while borrower.write_int32_blocking(0, 0, 1).is_ok() {})
+            })
+            .collect();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        let (done, stopped) = std::sync::mpsc::channel();
+        let stopping = handle.clone();
+        std::thread::spawn(move || {
+            stopping.shutdown_and_wait();
+            let _ = done.send(());
+        });
+        stopped
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("a port borrowed back-to-back must stop within the deadline");
+        assert!(handle.port_handle().is_defunct());
+        for client in clients {
+            client.join().unwrap();
+        }
+        let refused = handle.port_handle().write_int32_blocking(0, 0, 2);
+        assert_eq!(refused.unwrap_err().status(), AsynStatus::Disabled);
+    }
+
+    /// C's port thread skips every request on a disabled port
+    /// (asynManager.c:808-811), so the one queued behind the running write
+    /// when the stop is sent never runs.
+    #[test]
+    fn a_request_queued_when_the_stop_is_sent_never_runs() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct SlowPort {
+            base: PortDriverBase,
+            writes: Arc<AtomicUsize>,
+        }
+        impl PortDriver for SlowPort {
+            fn base(&self) -> &PortDriverBase {
+                &self.base
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.base
+            }
+            fn write_int32(&mut self, _: &mut crate::user::AsynUser, _: i32) -> AsynResult<()> {
+                self.writes.fetch_add(1, Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                Ok(())
+            }
+        }
+        let writes = Arc::new(AtomicUsize::new(0));
+        let flags = PortFlags {
+            can_block: true,
+            ..PortFlags::default()
+        };
+        let port = SlowPort {
+            base: TestPort::with_flags("rt_queued_at_stop", flags).base,
+            writes: writes.clone(),
+        };
+        let (handle, _jh) = create_port_runtime_unclaimed(port, RuntimeConfig::default())
+            .expect("the port runtime thread must start");
+        let write = |value| {
+            let port = handle.port_handle().clone();
+            std::thread::spawn(move || port.write_int32_blocking(0, 0, value))
+        };
+        let running = write(1);
+        while writes.load(Ordering::SeqCst) == 0 {
+            std::thread::yield_now();
+        }
+        let queued = write(2);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        handle.shutdown_and_wait();
+        assert!(running.join().unwrap().is_ok());
+        assert!(queued.join().unwrap().is_err());
+        assert_eq!(writes.load(Ordering::SeqCst), 1, "the queued write ran");
+    }
+
     #[test]
     fn port_runtime_event_subscription() {
         let (handle, _jh) =

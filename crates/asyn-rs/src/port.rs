@@ -1836,6 +1836,17 @@ impl PortDriverBase {
     /// the runtime can drive the same lifecycle via
     /// [`crate::manager::PortManager::shutdown_port`].
     pub fn shutdown_lifecycle(&mut self) -> AsynResult<()> {
+        self.enter_defunct(self.flags.destructible)
+    }
+
+    /// [`Self::shutdown_lifecycle`] for a port whose actor has stopped,
+    /// destructible or not: the stop was asked of the port's own runtime, and
+    /// a port with no actor serves nothing.
+    pub(crate) fn go_defunct(&mut self) {
+        let _ = self.enter_defunct(true);
+    }
+
+    fn enter_defunct(&mut self, destructible: bool) -> AsynResult<()> {
         // C holds `asynManagerLock` from the defunct check to the store
         // (asynManager.c:2264-2306), which is what [`DeviceTable::enable`]
         // takes: no enable can land between them.
@@ -1845,7 +1856,7 @@ impl PortDriverBase {
             // Idempotent — C asynManager.c:2268-2271 returns asynSuccess.
             return Ok(());
         }
-        if !self.flags.destructible {
+        if !destructible {
             return Err(AsynError::Status {
                 status: AsynStatus::Error,
                 message: "asynManager:shutdownPort: port does not support shutting down".into(),

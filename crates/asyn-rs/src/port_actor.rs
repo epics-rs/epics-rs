@@ -758,6 +758,44 @@ async fn sleep_until_opt(deadline: Option<Instant>) {
     }
 }
 
+/// The runtime's shutdown channel as the actor reads it. Only a `()` sent on
+/// it stops the port; its closing (every `PortRuntimeHandle` dropped) only
+/// means no stop can come.
+enum Stop {
+    Listening(mpsc::Receiver<()>),
+    Sent,
+    Unreachable,
+}
+
+impl Stop {
+    /// Whether a stop was sent — the one question [`PortActor::run_with_shutdown`]
+    /// asks before each piece of driver work.
+    fn sent(&mut self) -> bool {
+        if let Stop::Listening(rx) = self {
+            match rx.try_recv() {
+                Ok(()) => *self = Stop::Sent,
+                Err(mpsc::error::TryRecvError::Disconnected) => *self = Stop::Unreachable,
+                Err(mpsc::error::TryRecvError::Empty) => {}
+            }
+        }
+        matches!(self, Stop::Sent)
+    }
+
+    /// Ready once a stop is sent; never, once none can be.
+    async fn arrived(&mut self) {
+        if let Stop::Listening(rx) = self {
+            let next = match rx.recv().await {
+                Some(()) => Stop::Sent,
+                None => Stop::Unreachable,
+            };
+            *self = next;
+        }
+        if !matches!(self, Stop::Sent) {
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
 /// Marks a claimed request's cancel token `Done` when execution leaves the
 /// dispatch scope, on every exit path (reply, early return, panic). This is the
 /// C `callbackActive -> idle` transition: once the port thread finishes the
@@ -1351,7 +1389,12 @@ impl PortActor {
     /// shutdown signal — which conflated "the creator dropped its handle" with
     /// "shut this port down" and killed ports that the registry still held a
     /// live `PortHandle` for.
-    pub fn run_with_shutdown(self, mut shutdown_rx: mpsc::Receiver<()>) {
+    ///
+    /// A sent stop is taken before the next request whatever the traffic, and
+    /// the port is then defunct, as C `shutdownPort` leaves it
+    /// (asynManager.c:2253-2310): a request still queued never runs, and a
+    /// later one is refused. Only a request already running finishes first.
+    pub fn run_with_shutdown(self, shutdown_rx: mpsc::Receiver<()>) {
         // Publish our identity for the whole life of the actor thread: every
         // `PortDriver` method we dispatch below runs on this thread, so a
         // driver that calls back into its own port through a `PortHandle` can
@@ -1370,10 +1413,7 @@ impl PortActor {
         let mut actor = rt.block_on(async move {
             // The registration connect armed in `new`, ahead of every request.
             actor.registration_pass();
-            // Once every PortRuntimeHandle is gone no explicit shutdown can
-            // ever arrive, so the (now permanently ready) shutdown branch is
-            // disabled rather than spun on.
-            let mut can_be_shut_down = true;
+            let mut stop = Stop::Listening(shutdown_rx);
             loop {
                 // Drain all pending messages into the heap
                 actor.drain_channel();
@@ -1401,22 +1441,20 @@ impl PortActor {
                         // C `queueRequest`'s `epicsEventSignal`
                         // (asynManager.c:1628) for a queued cell.
                         _ = cells.pushed() => {}
-                        signal = shutdown_rx.recv(), if can_be_shut_down => {
-                            match signal {
-                                // Explicit shutdown.
-                                Some(()) => break,
-                                // Every PortRuntimeHandle was dropped. Not a
-                                // shutdown — keep serving whoever still holds
-                                // a PortHandle.
-                                None => can_be_shut_down = false,
-                            }
-                        }
+                        () = stop.arrived() => {}
                         _ = sleep_until_opt(retry_at) => {}
                     }
                     // Drain any more that arrived
                     actor.drain_channel();
                     actor.rescan_parked();
                     actor.drop_left();
+                }
+
+                // Asked here, not only when idle: a client that borrows the
+                // port back-to-back has queued its next request before the
+                // actor is back, so the queue never empties.
+                if stop.sent() {
+                    break;
                 }
 
                 // Run any due connect retry before servicing the queue: a
@@ -1429,9 +1467,16 @@ impl PortActor {
                     actor = lend.hand_off(actor, handoff).await;
                 }
 
+                // A stop sent while the request ran: C's port thread does no
+                // auto-connect on a disabled port (asynManager.c:808-811).
+                if stop.sent() {
+                    break;
+                }
+
                 // C `portThread`'s post-drain auto-connect, run on every wake.
                 actor.port_thread_auto_connect();
             }
+            actor.driver.base_mut().go_defunct();
             actor
         });
         let _ = actor.driver.shutdown();

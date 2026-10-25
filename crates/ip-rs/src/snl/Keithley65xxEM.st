@@ -259,7 +259,10 @@ ss read_meter {
                 pvPut(ch_close);
                 previous_chan = chan;
             }
-            previous_mode = ch_mode_sel;
+            /* C defect fixed: previous_mode was set to ch_mode_sel here,
+            ** before the test below, so a single read sent its mode command
+            ** and read at once; it now takes dmm_delay_read as a
+            ** multi-channel read does. */
             read_complete=0;
             pvPut(read_complete);
             efClear(read_complete_mon);

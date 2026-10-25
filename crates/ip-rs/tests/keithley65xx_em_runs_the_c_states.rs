@@ -7,9 +7,13 @@
 mod keithley;
 mod support;
 
+use std::time::Duration;
+
+use epics_base_rs::runtime::task;
 use epics_base_rs::types::{EpicsValue, PvString};
 
 use keithley::{Ioc, Meter, boot};
+use support::eventually;
 
 /// The 6517A behind `Dmm=E1:`.
 const EM: Meter = Meter {
@@ -146,4 +150,26 @@ async fn a_channels_macro_past_ten_is_cut_to_ten() {
     ioc.read(&scan.iter().map(String::as_str).collect::<Vec<_>>())
         .await;
     assert_eq!(ioc.f64_of("Ch10_raw"), 10.1);
+}
+
+/// A single read that sends a mode command reads through `dmm_delay_read`,
+/// 0.2 s on, as a multi-channel read does. C set `previous_mode` before its
+/// test for the delay, so it read at once: here after `init_dmm`, it sent
+/// `*trg;fetch?` 0 ms behind `:sens:func 'curr'`.
+#[epics_base_rs::epics_test]
+async fn a_single_read_after_a_mode_command_is_delayed() {
+    let ioc = boot(&EM, 4).await;
+    booted(&ioc).await;
+    ioc.step("dmm_chan", 2.0, &["rout:clos (@3)"]).await;
+    ioc.step("ch_mode_sel", 1.0, &[":sens:func 'curr'"]).await;
+    ioc.step("init_dmm", 1.0, &RESET).await;
+
+    ioc.put("done_read", EpicsValue::Double(1.0)).await;
+    assert!(eventually(|| ioc.mock.pending() >= 2).await);
+    task::sleep(Duration::from_millis(100)).await;
+    assert_eq!(ioc.mock.take(), [":sens:func 'curr'", "rout:clos (@3)"]);
+    ioc.commands(&["*trg;fetch?"]).await;
+    assert!(eventually(|| ioc.f64_of("done_read") == 0.0).await);
+    assert_eq!(ioc.f64_of("Dmm_raw"), 3.1);
+    assert_eq!(ioc.str_of("units"), "AMP");
 }

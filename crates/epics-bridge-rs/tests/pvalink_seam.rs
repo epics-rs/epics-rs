@@ -61,9 +61,11 @@ async fn pvalink_installs_at_iocinit_seam() {
     )
     .expect("write seam.db");
     let stcmd_path = dir.path().join("st.cmd");
+    // Without the `iocInit` the script is a custom `main`'s and the runner
+    // below never runs.
     std::fs::write(
         &stcmd_path,
-        format!("dbLoadRecords(\"{}\")\n", db_path.display()),
+        format!("dbLoadRecords(\"{}\")\niocInit\n", db_path.display()),
     )
     .expect("write st.cmd");
 

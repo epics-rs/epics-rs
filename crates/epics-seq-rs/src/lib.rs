@@ -78,7 +78,10 @@
 //!   is the place (`&seqg_var.x`); anything else is its value. A variadic
 //!   argument is `seqg_rt::c::CArg::from(e)` in a `&[...]` slice. See [`c`].
 //!   A run-time call's string parameter (`pvAssign`, `macValueGet`) is a
-//!   [`c::CSrc`] and takes its argument by the same rule. A foreign call's
+//!   [`c::CSrc`] and takes its argument by the same rule. A destination is
+//!   a [`c::CDst`], and a library function that returns or keeps a pointer
+//!   into its string (`strchr`, `epicsStrtok_r`) takes `impl Into<CharPtr>`,
+//!   which decays the place as C's prototype does. A foreign call's
 //!   result is cast `as _` where it is used (an assignment or `pvPut`
 //!   target, an initializer, a typed `seqg_env` parameter), which makes
 //!   C's implicit conversion explicit, so a companion function returns its

@@ -366,9 +366,13 @@ impl AttributeView {
     }
 }
 
+/// A frame's arrays, held inline: C's `endProcessCallbacks` takes one array
+/// per call, and a frame rarely makes more.
+pub type Frame<T> = smallvec::SmallVec<[T; 1]>;
+
 /// Result of processing one array: output arrays + param updates to write back.
 pub struct ProcessResult {
-    pub output_arrays: Vec<Arc<NDArray>>,
+    pub output_arrays: Frame<Arc<NDArray>>,
     pub param_updates: Vec<ParamUpdate>,
     /// When `true`, the output arrays are *scattered* — delivered to a single
     /// downstream consumer in round-robin order rather than broadcast to all.
@@ -396,7 +400,7 @@ impl ProcessResult {
     /// Convenience: sink plugin with only param updates, no output arrays.
     pub fn sink(param_updates: Vec<ParamUpdate>) -> Self {
         Self {
-            output_arrays: vec![],
+            output_arrays: Frame::new(),
             param_updates,
             scatter: false,
             addressed: vec![],
@@ -406,9 +410,9 @@ impl ProcessResult {
     }
 
     /// Convenience: transform plugin with output arrays but no param updates.
-    pub fn arrays(output_arrays: Vec<Arc<NDArray>>) -> Self {
+    pub fn arrays(output_arrays: impl Into<Frame<Arc<NDArray>>>) -> Self {
         Self {
-            output_arrays,
+            output_arrays: output_arrays.into(),
             param_updates: vec![],
             scatter: false,
             addressed: vec![],
@@ -422,7 +426,7 @@ impl ProcessResult {
     /// plugin was handed. No copy: the output is the input `Arc`.
     pub fn forward(input: &Arc<NDArray>, param_updates: Vec<ParamUpdate>) -> Self {
         Self {
-            output_arrays: vec![Arc::clone(input)],
+            output_arrays: [Arc::clone(input)].into(),
             param_updates,
             scatter: false,
             addressed: vec![],
@@ -434,7 +438,7 @@ impl ProcessResult {
     /// Convenience: no outputs, no param updates.
     pub fn empty() -> Self {
         Self {
-            output_arrays: vec![],
+            output_arrays: Frame::new(),
             param_updates: vec![],
             scatter: false,
             addressed: vec![],
@@ -448,7 +452,7 @@ impl ProcessResult {
     /// and reroute logic).
     pub fn scatter(input: &Arc<NDArray>) -> Self {
         Self {
-            output_arrays: vec![Arc::clone(input)],
+            output_arrays: [Arc::clone(input)].into(),
             param_updates: vec![],
             scatter: true,
             addressed: vec![],
@@ -1866,7 +1870,7 @@ impl SharedProcessorInner {
         .then(|| self.attributes.evaluate_after(begin, &result.param_updates))
         .flatten();
         let ready = self.delivery.end_process(
-            Frame::from_vec(result.output_arrays),
+            result.output_arrays,
             attributes.as_ref(),
             CopyArray::IfInput(array),
         );
@@ -2110,10 +2114,6 @@ impl SharedProcessorInner {
         }
     }
 }
-
-/// A frame's arrays, held inline: C's `endProcessCallbacks` takes one array
-/// per call, and a frame rarely makes more.
-type Frame<T> = smallvec::SmallVec<[T; 1]>;
 
 /// Output from processing: arrays to publish + param batch to flush.
 struct ProcessOutput {

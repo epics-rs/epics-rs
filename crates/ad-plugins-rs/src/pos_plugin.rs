@@ -728,7 +728,7 @@ impl NDPluginProcess for PosPluginProcessor {
         push_str(&mut updates, state.params.current_pos, current_pos);
 
         ProcessResult {
-            output_arrays: vec![Arc::new(out)],
+            output_arrays: [Arc::new(out)].into(),
             param_updates: updates,
             scatter: false,
             addressed: vec![],

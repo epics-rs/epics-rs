@@ -562,7 +562,7 @@ impl NDPluginProcess for ROIProcessor {
             Some(roi_arr) => {
                 self.push_array_sizes(&mut updates, &roi_arr, array.dims.len(), user_dims);
                 ProcessResult {
-                    output_arrays: vec![Arc::new(roi_arr)],
+                    output_arrays: [Arc::new(roi_arr)].into(),
                     param_updates: updates,
                     scatter: false,
                     addressed: vec![],

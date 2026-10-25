@@ -2352,6 +2352,37 @@ fn test_val_parked_during_move_dispatches_at_completion_as_a_retry() {
     assert_eq!(rec.retry.rcnt, 1);
 }
 
+/// A VAL put riding the callback pass that arms a retry: C maybeRetry
+/// (1077-1082) only arms MIP_RETRY, and the same pass's do_work (1489)
+/// collects the put, so its move block retries straight to the new DVAL.
+#[test]
+fn test_val_put_riding_a_retry_pass_retries_to_the_new_target() {
+    let mut rec = moving_to_50(3);
+    rec.internal.init_invariants_synced = true;
+    rec.put_field("VAL", EpicsValue::Double(80.0)).unwrap();
+    rec.set_event(MotorEvent::DeviceUpdate(status_at(4900.0, false)));
+    let e = rec.do_process();
+    assert!(moves_to(&e, 8000.0), "{:?}", e.commands);
+    assert!(!moves_to(&e, 5000.0), "{:?}", e.commands);
+    assert!(rec.stat.mip.contains(MipFlags::RETRY), "{:?}", rec.stat.mip);
+    assert_eq!(rec.retry.rcnt, 1);
+}
+
+#[test]
+fn test_sync_put_riding_a_retry_pass_still_retries() {
+    // C's move block (2455) dispatches the armed retry before the SYNC arm
+    // (2540), which needs MIP_DONE and leaves SYNC latched.
+    let mut rec = moving_to_50(3);
+    rec.internal.init_invariants_synced = true;
+    rec.put_field("SYNC", EpicsValue::Short(1)).unwrap();
+    rec.set_event(MotorEvent::DeviceUpdate(status_at(4900.0, false)));
+    let e = rec.do_process();
+    assert!(moves_to(&e, 5000.0), "{:?}", e.commands);
+    assert!(rec.stat.mip.contains(MipFlags::RETRY), "{:?}", rec.stat.mip);
+    assert_eq!(rec.retry.rcnt, 1);
+    assert_eq!(rec.get_field("SYNC"), Some(EpicsValue::Short(1)));
+}
+
 #[test]
 fn test_val_parked_during_backlash_leg_replays_at_its_end() {
     let (rec, effects) = parked_during_move(0, 1.0);

@@ -370,13 +370,20 @@ impl MotorRecord {
                     } else {
                         self.dispatch_latent_collection(&mut effects, reason);
                     }
+                } else if self.retry_armed() {
+                    self.dispatch_latent_collection(&mut effects, reason);
                 }
             }
             CommandSource::Sync => {
                 // C 2540-2544: the latched SYNC applies only when idle
                 // (`mip == MIP_DONE`); written during a motion it stays
                 // latched and finalize_motion consumes it at completion.
-                self.apply_latent_sync();
+                // An armed retry takes the move block ahead of it (2455).
+                if self.retry_armed() {
+                    self.dispatch_latent_collection(&mut effects, reason);
+                } else {
+                    self.apply_latent_sync();
+                }
             }
             CommandSource::Set => {
                 // C: the SET-mode redefinition dispatches through the
@@ -1066,7 +1073,9 @@ impl MotorRecord {
         effects: &mut ProcessEffects,
         reason: ProcReason,
     ) {
-        if self.stat.dmov == 0 || !self.can_accept_command() {
+        // `!dmov` enters the move block (2241), whose dispatch gate (2455)
+        // passes only maybeRetry's armed retry among the `!dmov` states.
+        if (self.stat.dmov == 0 && !self.retry_armed()) || !self.can_accept_command() {
             return;
         }
         // C closed-loop bypass (1994-2008): its else covers only the
@@ -1087,13 +1096,13 @@ impl MotorRecord {
         if self.collect_drive_fields() {
             return;
         }
-        // C move block entry (2241): `dval != ldvl || !dmov` — dmov is
-        // true past the gate above, so only a diverged DVAL enters: a
-        // drive field the collection just propagated, or a SET
-        // redefinition parked while a LOAD_POS was in flight (the set
+        // C move block entry (2241): `dval != ldvl || !dmov` — past the
+        // gate above `!dmov` is the armed retry, otherwise only a diverged
+        // DVAL enters: a drive field the collection just propagated, or a
+        // SET redefinition parked while a LOAD_POS was in flight (the set
         // test, 2257-2263, routes it to load_pos, which skips while
         // MIP_LOAD_P is set).
-        if self.pos.dval != self.internal.ldvl {
+        if self.stat.dmov == 0 || self.pos.dval != self.internal.ldvl {
             self.plan_absolute_move(effects);
             return;
         }
@@ -1961,6 +1970,12 @@ impl MotorRecord {
             }
             None => self.do_work(ProcReason::NothingDone),
         }
+    }
+
+    /// C `mip == MIP_RETRY`: maybeRetry (1077-1082) armed a retry that this
+    /// pass's move block owes.
+    pub(super) fn retry_armed(&self) -> bool {
+        self.stat.mip == MipFlags::RETRY
     }
 
     /// Whether a put left do_work to this pass: the src a field put

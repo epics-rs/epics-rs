@@ -681,8 +681,10 @@ impl MotorRecord {
             self.stat.mip = MipFlags::RETRY;
             self.mark(m::MIP);
             // Under Pause, do_work returns at 2237 and the armed retry
-            // waits for Go.
-            if self.can_accept_command() {
+            // waits for Go. A put riding this pass is collected first
+            // (2204-2235), so its do_work dispatches the retry to the new
+            // target.
+            if self.can_accept_command() && !self.put_rides() {
                 self.plan_absolute_move(effects);
             } else {
                 // C 1077-1078: DMOV FALSE, unposted, so Go's move block

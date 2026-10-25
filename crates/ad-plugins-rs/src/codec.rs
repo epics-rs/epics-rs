@@ -2078,16 +2078,16 @@ impl NDPluginProcess for CodecProcessor {
 
     /// C `NDPluginCodec::writeInt32` (NDPluginCodec.cpp:999-1031) clamps
     /// these and stores the clamp with success, so the readback shows it.
-    /// For a base class param it stores the written value over the base
-    /// clamp and drops the base status: `status = (asynStatus)
-    /// setIntegerParam(function, value);` (:1031).
+    /// For a base class param C stores the written value over the base
+    /// clamp and drops its refusal (:1031); not copied. A kept refusal prints
+    /// C's `if (status)` line (:1037-1041).
     fn validate_int32(
         &self,
         reason: usize,
         _addr: i32,
         value: i32,
-        _verdict: WriteVerdict<i32>,
-        _params: &mut WritePort<'_>,
+        verdict: WriteVerdict<i32>,
+        params: &mut WritePort<'_>,
     ) -> WriteOutcome<i32> {
         let p = &self.params;
         let r = Some(reason);
@@ -2100,8 +2100,14 @@ impl NDPluginProcess for CodecProcessor {
             value.max(0)
         } else if r == p.blosc_numthreads {
             value.max(1)
+        } else if let WriteVerdict::Refuse { .. } = verdict {
+            let name = params.params.param_name(reason).unwrap_or("");
+            return WriteOutcome::from(verdict).print(
+                asyn_rs::trace::TraceMask::ERROR,
+                format!("NDPluginCodec:writeInt32: function={reason} {name}, value={value}\n"),
+            );
         } else {
-            value
+            return verdict.into();
         };
         WriteVerdict::Accept(kept).into()
     }
@@ -3543,23 +3549,38 @@ mod tests {
         assert_eq!(v(p.blosc_numthreads, 0), Accept(1));
         assert_eq!(v(p.mode, -7), Accept(-7));
 
-        // NumThreads=98 over MaxThreads: the base clamps and fails, Codec
-        // stores 98 with success, as C's readback shows.
+        // NumThreads=98 over MaxThreads: the base clamps and fails. C
+        // stores 98 with success (:1031); the clamp and the failure stand.
         let clamp = ad_core_rs::plugin::runtime::WriteVerdict::Refuse {
             keep: 1,
             message: String::new(),
         };
-        assert_eq!(
-            proc.validate_int32(
-                threads,
-                0,
-                98,
-                clamp,
-                &mut ad_core_rs::plugin::runtime::WritePort::new(&mut base)
-            )
-            .verdict,
-            Accept(98)
+        let out = proc.validate_int32(
+            threads,
+            0,
+            98,
+            clamp.clone(),
+            &mut ad_core_rs::plugin::runtime::WritePort::new(&mut base),
         );
+        assert_eq!(out.verdict, clamp);
+        assert_eq!(
+            out.trace,
+            [(
+                asyn_rs::trace::TraceMask::ERROR,
+                format!("NDPluginCodec:writeInt32: function={threads} NUM_THREADS, value=98\n")
+            )]
+        );
+    }
+
+    /// NDPluginCodec.cpp:1031 drops the base refusal and stores the written
+    /// value; a Codec port returns the refusal and keeps the clamp.
+    #[test]
+    fn a_refused_base_write_fails() {
+        let (message, _, _) = crate::test_util::refused_base_write(
+            "CODEC_REFUSED",
+            CodecProcessor::new(CodecMode::Decompress),
+        );
+        assert_eq!(message, "");
     }
 
     #[test]

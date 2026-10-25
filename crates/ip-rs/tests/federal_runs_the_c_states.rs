@@ -137,7 +137,7 @@ async fn eventually(mut probe: impl FnMut() -> bool) -> bool {
 }
 
 /// Longer than one `get_readings` cycle over three probes and the 0.5 s
-/// `wait` (`Federal.st:65`, `:83`).
+/// `wait` (`Federal.st:65`, `:86`).
 async fn quiet() {
     task::sleep(Duration::from_millis(2000)).await;
 }
@@ -181,7 +181,7 @@ async fn each_reading_lands_in_its_probe_until_run_stops() {
 }
 
 /// A probe number past `num_probes` ends the cycle without a write
-/// (`Federal.st:75`); the next cycle starts on the following reading, which
+/// (`Federal.st:78`); the next cycle starts on the following reading, which
 /// C posted as probe_2 2.25.
 #[epics_base_rs::epics_test]
 async fn a_probe_past_num_probes_ends_the_cycle() {
@@ -196,4 +196,43 @@ async fn a_probe_past_num_probes_ends_the_cycle() {
     );
     assert_eq!(f64_of(&ioc, "probe_1"), 1.5);
     assert!(untouched(&ioc, 5), "probe_5 was written");
+}
+
+/// A probe number of 0 ends the cycle without a write, as one past
+/// `num_probes` does. C indexed `probe_[-1]`: it wrote the position below
+/// the array and put channel 6, `readback`, which the asyn record refused
+/// ("dbPut Attempt to modify noMod field PV: fed:Fed:s1:serial.AINP").
+#[epics_base_rs::epics_test]
+async fn a_probe_number_below_one_ends_the_cycle() {
+    let ioc = boot(&[(0, 7.0), (1, 1.5)]).await;
+    put(&ioc, "num_probes", 2.0).await;
+    put(&ioc, "run", 1.0).await;
+    assert!(
+        eventually(|| f64_of(&ioc, "probe_1") == 1.5 && ioc.mock.requests() >= 4).await,
+        "probe_1 {}, {} readings",
+        f64_of(&ioc, "probe_1"),
+        ioc.mock.requests()
+    );
+    assert!(untouched(&ioc, 2), "probe_2 was written");
+}
+
+/// With `num_probes` put past its DRVH of 10, a probe number of 11 ends the
+/// cycle without a write. C wrote `probe_[10]`, one past the array.
+#[epics_base_rs::epics_test]
+async fn a_probe_number_past_the_ten_channels_ends_the_cycle() {
+    let ioc = boot(&[(11, 5.5), (1, 1.5)]).await;
+    ioc.db
+        .put_record_field_from_ca(&format!("{P}num_probes"), "DRVH", EpicsValue::Double(20.0))
+        .await
+        .unwrap();
+    put(&ioc, "num_probes", 11.0).await;
+    assert_eq!(f64_of(&ioc, "num_probes"), 11.0);
+    put(&ioc, "run", 1.0).await;
+    assert!(
+        eventually(|| f64_of(&ioc, "probe_1") == 1.5 && ioc.mock.requests() >= 4).await,
+        "probe_1 {}, {} readings",
+        f64_of(&ioc, "probe_1"),
+        ioc.mock.requests()
+    );
+    assert!(untouched(&ioc, 10), "probe_10 was written");
 }

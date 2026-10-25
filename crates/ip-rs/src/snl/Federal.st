@@ -72,7 +72,10 @@ ss Federal_scan {
                   printf("Federal.st:  probe number: %d\n",probe_num);
                   printf("Federal.st:  position: %3.4f\n",position);
                }
-               if (probe_num > num_probes) break;
+               /* C defect fixed: a probe number below 1, or past the 10
+               ** probe_ channels once num_probes is put past its DRVH,
+               ** indexed probe_ out of bounds. */
+               if (probe_num < 1 || probe_num > num_probes || probe_num > 10) break;
                probe_num--;
                probe_[probe_num] = position;
                pvPut(probe_[probe_num]);

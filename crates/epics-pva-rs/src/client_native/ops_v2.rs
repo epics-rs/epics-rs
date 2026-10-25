@@ -4758,7 +4758,7 @@ fn typed_leaf_for(pv: &PvField, desc: Option<&FieldDesc>) -> PvaResult<Option<Pv
         },
         _ => return Ok(Some(pv.clone())),
     };
-    crate::pvdata::coerce_scalar(&sv, *t)
+    crate::pvdata::coerce_scalar(&sv, *t, crate::pvdata::ScalarCopy::In)
         .map(|v| Some(PvField::Scalar(v)))
         .ok_or_else(|| {
             PvaError::InvalidValue(format!(

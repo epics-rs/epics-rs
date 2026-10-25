@@ -270,7 +270,7 @@ impl Value {
             match &dst_desc {
                 FieldDesc::Scalar(t) => {
                     if let PvField::Scalar(sv) = src_field {
-                        if let Some(coerced) = coerce_scalar(sv, *t) {
+                        if let Some(coerced) = coerce_scalar(sv, *t, ScalarCopy::In) {
                             let _ = self.write_scalar(&path, coerced);
                         }
                     }
@@ -286,7 +286,7 @@ impl Value {
                     // than returning Ok after dropping the array.
                     let converted = elems
                         .iter()
-                        .map(|e| coerce_scalar(e, *t))
+                        .map(|e| coerce_scalar(e, *t, ScalarCopy::In))
                         .collect::<Option<Vec<_>>>()
                         .ok_or_else(|| ValueError::NoConvert {
                             path: path.clone(),
@@ -1111,10 +1111,23 @@ fn walk_leaf_paths(desc: &FieldDesc, prefix: &str) -> Vec<String> {
     out
 }
 
+/// Which way a scalar crosses a pvxs `Value`: `In` is `copyIn`, a store into
+/// a field (`set`, `assign`, a put); `Out` is `copyOut`, a read of one
+/// (`get_as`, pvxs `as<T>()`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ScalarCopy {
+    In,
+    Out,
+}
+
 /// Coerce one scalar value into another scalar type. Returns `None`
 /// for unsupported pairs. Currently covers numeric↔numeric, numeric↔string,
 /// string↔string, and bool↔bool.
-pub(crate) fn coerce_scalar(sv: &ScalarValue, target: ScalarType) -> Option<ScalarValue> {
+pub(crate) fn coerce_scalar(
+    sv: &ScalarValue,
+    target: ScalarType,
+    side: ScalarCopy,
+) -> Option<ScalarValue> {
     use ScalarValue::*;
     let as_i64: Option<i64> = match sv {
         Boolean(b) => Some(if *b { 1 } else { 0 }),
@@ -1167,8 +1180,11 @@ pub(crate) fn coerce_scalar(sv: &ScalarValue, target: ScalarType) -> Option<Scal
     Some(match target {
         // pvxs `copyIn` into a bool takes a bool, an integer or the exact
         // "true" / "false"; a real has no arm (`data.cpp:579-593`).
+        // `copyOut` casts it, `bool(src)` (`data.cpp:408`).
         ScalarType::Boolean => Boolean(match sv {
-            Float(_) | Double(_) => return None,
+            Float(_) | Double(_) if side == ScalarCopy::In => return None,
+            Float(x) => *x != 0.0,
+            Double(x) => *x != 0.0,
             String(s) => match s.as_str_lossy().as_ref() {
                 "true" => true,
                 "false" => false,
@@ -1220,7 +1236,7 @@ macro_rules! impl_from_scalar_int {
                     "u64" => ScalarType::ULong,
                     _ => return Err(()),
                 };
-                let coerced = coerce_scalar(&sv, target).ok_or(())?;
+                let coerced = coerce_scalar(&sv, target, ScalarCopy::Out).ok_or(())?;
                 match coerced {
                     ScalarValue::Byte(x) => Ok(x as $t),
                     ScalarValue::Short(x) => Ok(x as $t),
@@ -1241,7 +1257,7 @@ impl_from_scalar_int!(i8, i16, i32, i64, u8, u16, u32, u64);
 
 impl FromScalarValue for f32 {
     fn from_scalar(sv: ScalarValue) -> Result<Self, ()> {
-        let coerced = coerce_scalar(&sv, ScalarType::Float).ok_or(())?;
+        let coerced = coerce_scalar(&sv, ScalarType::Float, ScalarCopy::Out).ok_or(())?;
         if let ScalarValue::Float(f) = coerced {
             Ok(f)
         } else {
@@ -1252,7 +1268,7 @@ impl FromScalarValue for f32 {
 
 impl FromScalarValue for f64 {
     fn from_scalar(sv: ScalarValue) -> Result<Self, ()> {
-        let coerced = coerce_scalar(&sv, ScalarType::Double).ok_or(())?;
+        let coerced = coerce_scalar(&sv, ScalarType::Double, ScalarCopy::Out).ok_or(())?;
         if let ScalarValue::Double(f) = coerced {
             Ok(f)
         } else {
@@ -1263,7 +1279,7 @@ impl FromScalarValue for f64 {
 
 impl FromScalarValue for bool {
     fn from_scalar(sv: ScalarValue) -> Result<Self, ()> {
-        let coerced = coerce_scalar(&sv, ScalarType::Boolean).ok_or(())?;
+        let coerced = coerce_scalar(&sv, ScalarType::Boolean, ScalarCopy::Out).ok_or(())?;
         if let ScalarValue::Boolean(b) = coerced {
             Ok(b)
         } else {
@@ -1274,7 +1290,7 @@ impl FromScalarValue for bool {
 
 impl FromScalarValue for String {
     fn from_scalar(sv: ScalarValue) -> Result<Self, ()> {
-        let coerced = coerce_scalar(&sv, ScalarType::String).ok_or(())?;
+        let coerced = coerce_scalar(&sv, ScalarType::String, ScalarCopy::Out).ok_or(())?;
         if let ScalarValue::String(s) = coerced {
             Ok(s.as_str_lossy().into_owned())
         } else {
@@ -1287,7 +1303,7 @@ macro_rules! impl_into_scalar_int {
     ($($t:ty),*) => {
         $(impl IntoScalarValue for $t {
             fn into_scalar(self, target: ScalarType) -> Result<ScalarValue, ()> {
-                coerce_scalar(&ScalarValue::Long(self as i64), target).ok_or(())
+                coerce_scalar(&ScalarValue::Long(self as i64), target, ScalarCopy::In).ok_or(())
             }
         })*
     };
@@ -1297,31 +1313,31 @@ impl_into_scalar_int!(i8, i16, i32, i64, u8, u16, u32, u64);
 
 impl IntoScalarValue for f32 {
     fn into_scalar(self, target: ScalarType) -> Result<ScalarValue, ()> {
-        coerce_scalar(&ScalarValue::Float(self), target).ok_or(())
+        coerce_scalar(&ScalarValue::Float(self), target, ScalarCopy::In).ok_or(())
     }
 }
 
 impl IntoScalarValue for f64 {
     fn into_scalar(self, target: ScalarType) -> Result<ScalarValue, ()> {
-        coerce_scalar(&ScalarValue::Double(self), target).ok_or(())
+        coerce_scalar(&ScalarValue::Double(self), target, ScalarCopy::In).ok_or(())
     }
 }
 
 impl IntoScalarValue for bool {
     fn into_scalar(self, target: ScalarType) -> Result<ScalarValue, ()> {
-        coerce_scalar(&ScalarValue::Boolean(self), target).ok_or(())
+        coerce_scalar(&ScalarValue::Boolean(self), target, ScalarCopy::In).ok_or(())
     }
 }
 
 impl IntoScalarValue for &str {
     fn into_scalar(self, target: ScalarType) -> Result<ScalarValue, ()> {
-        coerce_scalar(&ScalarValue::String(self.into()), target).ok_or(())
+        coerce_scalar(&ScalarValue::String(self.into()), target, ScalarCopy::In).ok_or(())
     }
 }
 
 impl IntoScalarValue for String {
     fn into_scalar(self, target: ScalarType) -> Result<ScalarValue, ()> {
-        coerce_scalar(&ScalarValue::String(self.into()), target).ok_or(())
+        coerce_scalar(&ScalarValue::String(self.into()), target, ScalarCopy::In).ok_or(())
     }
 }
 
@@ -1332,13 +1348,28 @@ mod tests {
     /// A real stored into a string field is `SB()<<double` (`data.cpp:602`).
     #[test]
     fn a_real_coerces_to_the_stream_default_text() {
-        let text = |sv| match coerce_scalar(&sv, ScalarType::String) {
+        let text = |sv| match coerce_scalar(&sv, ScalarType::String, ScalarCopy::In) {
             Some(ScalarValue::String(s)) => s.as_str_lossy().into_owned(),
             other => panic!("{other:?}"),
         };
         assert_eq!(text(ScalarValue::Double(1e20)), "1e+20");
         assert_eq!(text(ScalarValue::Double(1.0 / 3.0)), "0.333333");
         assert_eq!(text(ScalarValue::Float(0.1)), "0.1");
+    }
+
+    /// A real read as a bool is `copyOut`'s `bool(src)` (`data.cpp:408`),
+    /// though `copyIn` will not store one (`data.cpp:579-593`).
+    #[test]
+    fn a_real_reads_as_a_bool_but_is_not_stored_into_one() {
+        let mut v = Value::create_from(NTScalar::new(ScalarType::Double).build());
+        v.set("value", 1.0f64).unwrap();
+        assert!(v.get_as::<bool>("value").unwrap());
+        v.set("value", f64::NAN).unwrap();
+        assert!(v.get_as::<bool>("value").unwrap());
+        v.set("value", 0.0f64).unwrap();
+        assert!(!v.get_as::<bool>("value").unwrap());
+        let mut b = Value::create_from(NTScalar::new(ScalarType::Boolean).build());
+        assert!(b.set("value", 1.0f64).is_err());
     }
     use crate::nt::NTScalar;
 

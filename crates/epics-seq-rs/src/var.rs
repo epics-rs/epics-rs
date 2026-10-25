@@ -567,11 +567,13 @@ impl<T> Ptr<T> {
         self.modify(|v| *v = value)
     }
 
-    /// The address of the element this points at, `None` for null.
-    fn addr(&self) -> Option<usize> {
+    /// C's `(uintptr_t) p`, as `%p` prints it: the address of the element
+    /// this points at, 0 for null.
+    pub fn addr(&self) -> usize {
         let size = std::mem::size_of::<T>() as isize;
-        let t = self.0.as_ref()?;
-        Some(t.base.wrapping_add_signed(t.index * size))
+        self.0
+            .as_ref()
+            .map_or(0, |t| t.base.wrapping_add_signed(t.index * size))
     }
 }
 
@@ -663,8 +665,8 @@ impl<T> PartialEq for Ptr<T> {
 impl<T> std::fmt::Debug for Ptr<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.addr() {
-            Some(a) => write!(f, "{a:#x}"),
-            None => f.write_str("null"),
+            0 => f.write_str("null"),
+            a => write!(f, "{a:#x}"),
         }
     }
 }

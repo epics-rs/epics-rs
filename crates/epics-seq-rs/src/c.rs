@@ -52,8 +52,9 @@ macro_rules! carg_from {
 }
 
 carg_from!(
-    i8 => Int as i64, i16 => Int as i64, i32 => Int as i64, i64 => Int as i64,
+    i8 => Int as i64, i16 => Int as i64, i32 => Int as i64, i64 => Int as i64, isize => Int as i64,
     u8 => UInt as u64, u16 => UInt as u64, u32 => UInt as u64, u64 => UInt as u64,
+    usize => UInt as u64,
     f32 => Double as f64, f64 => Double as f64,
 );
 
@@ -1741,6 +1742,17 @@ mod tests {
         let t = <SeqVar<[SeqString; 2]>>::zeroed();
         t.at(1).store(Scanned::Str(b"m1"));
         assert_eq!(t.at(1).to_c_vec(), b"m1");
+    }
+
+    /// array.st:46 `testDiag("a4ps[%d]=%p", i, a4ps[i])`.
+    #[test]
+    fn a_pointer_prints_its_address_with_p() {
+        let v = <SeqVar<[c_char; 24]>>::zeroed();
+        sprintf(&v, "%p", &[Ptr::<i32>::default().addr().into()]);
+        assert_eq!(text(&v), b"(nil)");
+        let x = SeqVar::new(1i32);
+        sprintf(&v, "%p", &[x.ptr().addr().into()]);
+        assert_eq!(text(&v), format!("{:#x}", x.ptr().addr()).as_bytes());
     }
 
     /// EnsembleTrajectoryScan.st:963 `atol(&reply[1])`.

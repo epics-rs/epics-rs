@@ -672,7 +672,8 @@ impl NDPluginProcess for CircularBuffProcessor {
     }
     /// C `NDPluginCircularBuff::writeOctet(NDCircBuffTriggerCalc)` stores "0"
     /// for an empty expression and fails the write with postfix's -1 for a bad
-    /// one (NDPluginCircularBuff.cpp:337-349, :362).
+    /// one (NDPluginCircularBuff.cpp:337-349, :362). NDPluginDriver's failure
+    /// carries the same errorMessage.
     fn validate_octet(
         &self,
         reason: usize,
@@ -683,7 +684,16 @@ impl NDPluginProcess for CircularBuffProcessor {
     ) -> ad_core_rs::plugin::runtime::WriteOutcome<String> {
         use ad_core_rs::plugin::runtime::WriteVerdict;
         if Some(reason) != self.params.trigger_calc {
-            return verdict.into();
+            return match verdict {
+                WriteVerdict::Refuse { keep, .. } => WriteVerdict::Refuse {
+                    keep,
+                    message: format!(
+                        "NDPluginCircularBuff:writeOctet: status=3, function={reason}, value={value}"
+                    ),
+                },
+                accepted => accepted,
+            }
+            .into();
         }
         if value.is_empty() {
             return WriteVerdict::Accept("0".to_string()).into();
@@ -933,6 +943,22 @@ impl NDPluginProcess for CircularBuffProcessor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// NDPluginDriver's FilePath refusal fails the write under this
+    /// plugin's errorMessage.
+    #[test]
+    fn a_refused_file_path_write_fails() {
+        let (message, function, value) = crate::test_util::refused_file_path_write(
+            "CIRC_BUFF_PATH",
+            CircularBuffProcessor::new(2, 1, TriggerCondition::default(), 100),
+        );
+        assert_eq!(
+            message,
+            format!(
+                "NDPluginCircularBuff:writeOctet: status=3, function={function}, value={value}"
+            )
+        );
+    }
 
     /// NDPluginCircularBuff.cpp:303 drops the base refusal; a CircularBuff port
     /// returns it.

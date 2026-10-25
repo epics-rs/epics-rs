@@ -2574,7 +2574,10 @@ impl PluginPortDriver {
     /// What C `asynNDArrayDriver::writeOctet` leaves for an octet write
     /// (asynNDArrayDriver.cpp:529-538): FilePath is normalized by
     /// `checkPath`, created to CreateDir's depth when missing, and
-    /// FilePathExists set. C's caller drops the status (NDPluginDriver.cpp:860).
+    /// FilePathExists set. A path still missing fails the write: C takes
+    /// that status from `checkPath` (:536) and then overwrites it with
+    /// callParamCallbacks' at :540 and again at NDPluginDriver.cpp:845, so
+    /// the write succeeds; not copied.
     fn base_octet(&self, reason: usize, value: &str) -> WriteOutcome<String> {
         let nd = &self.ndarray_params;
         if reason != nd.file_path || value.is_empty() {
@@ -2588,11 +2591,18 @@ impl PluginPortDriver {
                 crate::driver::ndarray_driver::NDArrayDriverBase::create_file_path(value, depth);
             exists = crate::driver::ndarray_driver::check_path_str(&mut path);
         }
-        WriteOutcome::from(WriteVerdict::Accept(path)).set_int32(
-            nd.file_path_exists,
-            0,
-            exists as i32,
-        )
+        let verdict = if exists {
+            WriteVerdict::Accept(path)
+        } else {
+            let name = self.base.params.param_name(reason).unwrap_or("");
+            WriteVerdict::Refuse {
+                keep: path,
+                message: format!(
+                    "NDPluginDriver::writeOctet: status=3, function={reason}, paramName={name}, value={value}"
+                ),
+            }
+        };
+        WriteOutcome::from(verdict).set_int32(nd.file_path_exists, 0, exists as i32)
     }
 
     /// Store what a write override set beside the written param, print its
@@ -3140,7 +3150,9 @@ impl PortDriver for PluginPortDriver {
             addressed,
         } = self
             .validator
-            .octet(reason, addr, &s, base.verdict, &self.base);
+            .octet(reason, addr, &s, base.verdict.clone(), &self.base);
+        let base_ok = matches!(base.verdict, WriteVerdict::Accept(_));
+        let verdict = verdict.under(base.verdict);
         let value = verdict.kept();
         self.base.set_string_param(reason, addr, &value)?;
         // The rest of `asynNDArrayDriver::writeOctet` (NDPluginDriver.cpp:839-841):
@@ -3150,7 +3162,9 @@ impl PortDriver for PluginPortDriver {
         {
             rule(&mut self.base, addr, value.as_bytes());
         }
-        if reason < self.first_plugin_param {
+        // C sets its errorMessage instead of this line on a failure
+        // (asynNDArrayDriver.cpp:542-549).
+        if reason < self.first_plugin_param && base_ok {
             self.base.trace_io_by(
                 crate::driver::ndarray_driver::ASYN_ND_ARRAY_DRIVER,
                 user,
@@ -4656,7 +4670,8 @@ mod tests {
             verdict.into()
         }
         /// Keeps and fails `bad`, as NDFileHDF5 keeps an XMLFileName it
-        /// cannot open; reverts `old`.
+        /// cannot open; reverts `old`; accepts any other param's write,
+        /// dropping the base status as NDFileNexus.cpp:801 does.
         fn validate_octet(
             &self,
             reason: usize,
@@ -4676,6 +4691,7 @@ mod tests {
                         .into_owned(),
                 ))
                 .settled(),
+                _ if reason != self.name => WriteVerdict::Accept(verdict.kept()).into(),
                 _ => verdict.into(),
             }
         }
@@ -4831,6 +4847,13 @@ mod tests {
         assert_eq!(read(), b"good\0");
         assert!(write("bad").is_err());
         assert_eq!(read(), b"bad\0");
+        // CreateDir 0 leaves the path missing.
+        let file_path = handle.ndarray_params.file_path;
+        let missing = std::env::temp_dir().join(format!("validate-{}/a", std::process::id()));
+        assert!(
+            rt.block_on(port.write_octet(file_path, 0, missing.to_str().unwrap().into()))
+                .is_err()
+        );
 
         params_applied(&handle);
         assert_eq!(
@@ -4843,7 +4866,8 @@ mod tests {
                 num_threads,
                 gain,
                 name,
-                name
+                name,
+                file_path
             ]
         );
         // C recreates the callback threads on every NumThreads write, a
@@ -7316,7 +7340,8 @@ mod tests {
 
     /// asynNDArrayDriver.cpp:529-538 inside the write: FilePath gains its
     /// separator, a missing directory is created to CreateDir's depth, and
-    /// FilePathExists is set before the write returns.
+    /// FilePathExists is set before the write returns. A path left missing
+    /// fails the write, which C's status overwrites hide (:540).
     #[test]
     fn a_file_path_write_checks_and_creates_the_path_as_c_write_octet_does() {
         let wiring = test_wiring();
@@ -7346,21 +7371,30 @@ mod tests {
         let checked = format!("{path}{}", std::path::MAIN_SEPARATOR);
         let write = |drv: &mut PluginPortDriver| {
             let mut user = AsynUser::new(nd.file_path);
-            drv.io_write_octet(&mut user, path.as_bytes()).unwrap();
+            let status = match drv.io_write_octet(&mut user, path.as_bytes()) {
+                Ok(_) => None,
+                Err(AsynError::Status { message, .. }) => Some(message),
+                Err(e) => panic!("{e}"),
+            };
             (
+                status,
                 String::from_utf8_lossy(drv.base.get_string_param(nd.file_path, 0).unwrap())
                     .into_owned(),
                 drv.base.get_int32_param(nd.file_path_exists, 0).unwrap(),
             )
         };
 
+        let refused = format!(
+            "NDPluginDriver::writeOctet: status=3, function={}, paramName=FILE_PATH, value={path}",
+            nd.file_path
+        );
         assert_eq!(
             write(&mut drv),
-            (checked.clone(), 0),
+            (Some(refused), checked.clone(), 0),
             "CreateDir 0 creates nothing"
         );
         drv.base.set_int32_param(nd.create_dir, 0, -2).unwrap();
-        assert_eq!(write(&mut drv), (checked.clone(), 1));
+        assert_eq!(write(&mut drv), (None, checked.clone(), 1));
         assert!(std::path::Path::new(&path).is_dir());
         let mut last = None;
         while let Ok(PluginParamMsg::Change(r, _, v)) = rx.try_recv() {

@@ -141,6 +141,35 @@ pub(crate) fn refused_base_write<P: ad_core_rs::plugin::runtime::NDPluginProcess
     }
 }
 
+/// A FilePath write that CreateDir 0 leaves missing, which NDPluginDriver
+/// refuses, through `processor`'s port: it must fail with FilePathExists 0.
+/// Returns the error message, the param written and the value.
+pub(crate) fn refused_file_path_write<P: ad_core_rs::plugin::runtime::NDPluginProcess>(
+    port: &str,
+    processor: P,
+) -> (String, usize, String) {
+    let (handle, _rx, _jh) = running(port, processor);
+    let nd = &handle.ndarray_params;
+    let path = std::env::temp_dir()
+        .join(format!("{port}-{}", std::process::id()))
+        .join("a")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let port = handle.port_runtime().port_handle();
+    let refused = port.submit_blocking(
+        asyn_rs::request::RequestOp::OctetWrite {
+            data: path.clone().into_bytes(),
+        },
+        asyn_rs::user::AsynUser::new(nd.file_path),
+    );
+    assert_eq!(port.read_int32_blocking(nd.file_path_exists, 0).unwrap(), 0);
+    match refused {
+        Err(asyn_rs::error::AsynError::Status { message, .. }) => (message, nd.file_path, path),
+        other => panic!("FilePath {path}: {other:?}"),
+    }
+}
+
 /// [`running`], registered with an open `interruptAccept` as after iocInit,
 /// so its posts reach interrupt subscribers.
 pub(crate) fn registered<P: ad_core_rs::plugin::runtime::NDPluginProcess>(

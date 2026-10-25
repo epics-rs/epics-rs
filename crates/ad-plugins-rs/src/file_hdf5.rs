@@ -5046,8 +5046,18 @@ impl Hdf5FileProcessor {
         verdict: WriteVerdict<String>,
         _params: &asyn_rs::port::PortDriverBase,
     ) -> WriteOutcome<String> {
+        let refused =
+            || format!("NDFileHDF5:writeOctet: status=3, function={reason}, value={value}");
         if Some(reason) != self.hdf5_params.layout_filename {
-            return verdict.into();
+            // NDPluginFile's failure carries the same errorMessage (:2111).
+            return match verdict {
+                WriteVerdict::Refuse { keep, .. } => WriteVerdict::Refuse {
+                    keep,
+                    message: refused(),
+                },
+                accepted => accepted,
+            }
+            .into();
         }
         let p = &self.hdf5_params;
         let verified = |out: WriteOutcome<String>, valid: bool, msg: &str| {
@@ -5067,9 +5077,7 @@ impl Hdf5FileProcessor {
         verified(
             WriteOutcome::from(WriteVerdict::Refuse {
                 keep: value.to_owned(),
-                message: format!(
-                    "NDFileHDF5:writeOctet: status=3, function={reason}, value={value}"
-                ),
+                message: refused(),
             }),
             false,
             fault.message(),
@@ -5737,6 +5745,18 @@ impl NDPluginProcess for Hdf5FileProcessor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// NDPluginDriver's FilePath refusal fails the write under this
+    /// plugin's errorMessage.
+    #[test]
+    fn a_refused_file_path_write_fails() {
+        let (message, function, value) =
+            crate::test_util::refused_file_path_write("HDF5_PATH", Hdf5FileProcessor::new());
+        assert_eq!(
+            message,
+            format!("NDFileHDF5:writeOctet: status=3, function={function}, value={value}")
+        );
+    }
     use crate::test_util::opened;
     use ad_core_rs::ndarray::{NDDataViewMut, NDDimension};
     use ad_core_rs::plugin::file_base::NDFileMode;

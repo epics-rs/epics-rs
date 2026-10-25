@@ -956,15 +956,27 @@ impl NDPluginProcess for NexusFileProcessor {
     /// C `NDFileNexus::writeOctet` (NDFileNexus.cpp:776-813) loads the
     /// template inside the write, from the path and file in the param
     /// library, so a capture opened next uses it; a file write in progress
-    /// does not hold the write up.
+    /// does not hold the write up. NDPluginFile's failure carries Nexus's
+    /// errorMessage: C overwrites that status with callParamCallbacks'
+    /// (:801), so the write succeeds; not copied.
     fn validate_octet(
         &self,
         reason: usize,
         _addr: i32,
-        _value: &str,
+        value: &str,
         verdict: ad_core_rs::plugin::runtime::WriteVerdict<String>,
         params: &asyn_rs::port::PortDriverBase,
     ) -> ad_core_rs::plugin::runtime::WriteOutcome<String> {
+        use ad_core_rs::plugin::runtime::WriteVerdict;
+        let verdict = match verdict {
+            WriteVerdict::Refuse { keep, .. } => WriteVerdict::Refuse {
+                keep,
+                message: format!(
+                    "NDFileNexus:writeOctet: status=3, function={reason}, value={value}"
+                ),
+            },
+            accepted => accepted,
+        };
         let out = ad_core_rs::plugin::runtime::WriteOutcome::from(verdict);
         let stored = |idx: Option<usize>| {
             if Some(reason) == idx {
@@ -1044,6 +1056,18 @@ impl NDPluginProcess for NexusFileProcessor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// NDPluginDriver's FilePath refusal fails the write under this
+    /// plugin's errorMessage.
+    #[test]
+    fn a_refused_file_path_write_fails() {
+        let (message, function, value) =
+            crate::test_util::refused_file_path_write("NEXUS_PATH", NexusFileProcessor::new());
+        assert_eq!(
+            message,
+            format!("NDFileNexus:writeOctet: status=3, function={function}, value={value}")
+        );
+    }
     use ad_core_rs::ndarray::{NDDataViewMut, NDDimension};
 
     fn temp_path(prefix: &str) -> PathBuf {

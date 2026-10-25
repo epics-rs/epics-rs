@@ -534,6 +534,7 @@ impl NDPluginProcess for PosPluginProcessor {
 
     /// C `NDPosPlugin::writeOctet(NDPos_Filename)` loads the positions inside
     /// the write and fails it on invalid XML (NDPosPlugin.cpp:295-315).
+    /// NDPluginDriver's failure carries the same errorMessage (:326).
     fn validate_octet(
         &self,
         reason: usize,
@@ -543,9 +544,18 @@ impl NDPluginProcess for PosPluginProcessor {
         _params: &asyn_rs::port::PortDriverBase,
     ) -> ad_core_rs::plugin::runtime::WriteOutcome<String> {
         use ad_core_rs::plugin::runtime::{WriteOutcome, WriteVerdict};
+        let refused =
+            || format!("NDPosPlugin:writeOctet: status=3, function={reason}, value={value}");
         let mut state = self.state.lock();
         if Some(reason) != state.params.filename {
-            return verdict.into();
+            return match verdict {
+                WriteVerdict::Refuse { keep, .. } => WriteVerdict::Refuse {
+                    keep,
+                    message: refused(),
+                },
+                accepted => accepted,
+            }
+            .into();
         }
         let set = |out: WriteOutcome<String>, i: Option<usize>, v: i32| match i {
             Some(i) => out.set_int32(i, 0, v),
@@ -564,9 +574,7 @@ impl NDPluginProcess for PosPluginProcessor {
             Err(_) => set(
                 WriteVerdict::Refuse {
                     keep: value.to_string(),
-                    message: format!(
-                        "NDPosPlugin:writeOctet: status=3, function={reason}, value={value}"
-                    ),
+                    message: refused(),
                 }
                 .into(),
                 valid,
@@ -822,6 +830,20 @@ impl NDPluginProcess for PosPluginProcessor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// NDPluginDriver's FilePath refusal fails the write under this
+    /// plugin's errorMessage.
+    #[test]
+    fn a_refused_file_path_write_fails() {
+        let (message, function, value) = crate::test_util::refused_file_path_write(
+            "POS_PATH",
+            PosPluginProcessor::new(PosMode::Discard),
+        );
+        assert_eq!(
+            message,
+            format!("NDPosPlugin:writeOctet: status=3, function={function}, value={value}")
+        );
+    }
 
     /// NDPosPlugin.cpp:260 drops the base refusal; a Pos port returns it.
     #[test]

@@ -283,7 +283,8 @@ impl NDPluginProcess for BadPixelProcessor {
     const INTERRUPT_MASK: InterfaceMask = Self::INTERFACE_MASK;
 
     /// C `NDPluginBadPixel::writeOctet` reads the file inside the write and
-    /// returns `readBadPixelFile`'s status (NDPluginBadPixel.cpp:319-322).
+    /// returns `readBadPixelFile`'s status (NDPluginBadPixel.cpp:319-322),
+    /// or NDPluginDriver's under its own errorMessage (:334).
     fn validate_octet(
         &self,
         reason: usize,
@@ -293,6 +294,15 @@ impl NDPluginProcess for BadPixelProcessor {
         _params: &asyn_rs::port::PortDriverBase,
     ) -> ad_core_rs::plugin::runtime::WriteOutcome<String> {
         use ad_core_rs::plugin::runtime::{WriteOutcome, WriteVerdict};
+        let verdict = match verdict {
+            WriteVerdict::Refuse { keep, .. } => WriteVerdict::Refuse {
+                keep,
+                message: format!(
+                    "NDPluginBadPixel:writeOctet: status=3, function={reason}, value={value}"
+                ),
+            },
+            accepted => accepted,
+        };
         if Some(reason) != self.file_name_idx || value.is_empty() {
             return verdict.into();
         }
@@ -386,6 +396,20 @@ impl NDPluginProcess for BadPixelProcessor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// NDPluginDriver's FilePath refusal fails the write under this
+    /// plugin's errorMessage.
+    #[test]
+    fn a_refused_file_path_write_fails() {
+        let (message, function, value) = crate::test_util::refused_file_path_write(
+            "BADPIX_PATH",
+            BadPixelProcessor::new(vec![]),
+        );
+        assert_eq!(
+            message,
+            format!("NDPluginBadPixel:writeOctet: status=3, function={function}, value={value}")
+        );
+    }
 
     /// NDPluginBadPixel.cpp:321 `status = this->readBadPixelFile(value);`
     /// and :290 `return asynError;` on a file that does not parse.

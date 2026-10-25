@@ -1053,6 +1053,20 @@ impl NDPluginProcess for TiffFileProcessor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// NDPluginDriver's FilePath refusal fails the write under this
+    /// plugin's errorMessage.
+    #[test]
+    fn a_refused_file_path_write_fails() {
+        let (message, function, value) =
+            crate::test_util::refused_file_path_write("TIFF_PATH", TiffFileProcessor::new());
+        assert_eq!(
+            message,
+            format!(
+                "NDPluginDriver::writeOctet: status=3, function={function}, paramName=FILE_PATH, value={value}"
+            )
+        );
+    }
     use ad_core_rs::ndarray::{NDDataView, NDDataViewMut};
     use ad_core_rs::plugin::file_base::NDFileMode;
     // The tests verify the bytes this module writes with an INDEPENDENT TIFF

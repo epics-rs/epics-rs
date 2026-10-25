@@ -53,6 +53,8 @@ async fn ioc_init(stem: &str) -> Arc<PvDatabase> {
 /// A TAP stream's plan, `ok` / `not ok` lines and `# ` diagnostics.
 struct Tap {
     plan: i32,
+    /// What follows the number: the description after ` - `, or a
+    /// `testSkip`'s `# SKIP <why>`.
     results: Vec<(bool, String)>,
     diags: Vec<String>,
 }
@@ -60,20 +62,38 @@ struct Tap {
 fn parse_tap(tap: &str) -> Tap {
     let mut plan = None;
     let mut results = Vec::new();
-    let mut diags = Vec::new();
+    let mut diags: Vec<String> = Vec::new();
+    // Whether the last line was a diagnostic's: `testDiag` is `printf("# ")`,
+    // the text, `putchar('\n')`, so a `\n` in the text, a last one too, puts
+    // the rest of it on lines of its own.
+    let mut in_diag = false;
     for line in tap.lines() {
         if let Some(n) = line.strip_prefix("1..") {
             plan = Some(n.parse().expect("plan"));
+            in_diag = false;
         } else if let Some(diag) = line.strip_prefix("# ") {
             diags.push(diag.to_owned());
-        } else {
-            let (ok, rest) = match line.strip_prefix("not ok ") {
-                Some(rest) => (false, rest),
-                None => (true, line.strip_prefix("ok ").expect("a result line")),
-            };
-            let (num, desc) = rest.trim_start().split_once(" - ").expect("num - desc");
+            in_diag = true;
+        } else if let Some((ok, rest)) = line
+            .strip_prefix("not ok ")
+            .map(|rest| (false, rest))
+            .or_else(|| line.strip_prefix("ok ").map(|rest| (true, rest)))
+        {
+            // `ok %2d - %s` and `testSkip`'s `ok %2d # SKIP %s`.
+            let (num, text) = rest.trim_start().split_once(' ').expect("num text");
+            let desc = text.strip_prefix("- ").unwrap_or(text);
+            assert!(
+                text.starts_with("- ") || text.starts_with("# SKIP "),
+                "{line}"
+            );
             assert_eq!(num.parse::<usize>(), Ok(results.len() + 1), "{line}");
             results.push((ok, desc.to_owned()));
+            in_diag = false;
+        } else {
+            assert!(in_diag, "{line:?} is no TAP line");
+            let diag = diags.last_mut().expect("a diagnostic");
+            diag.push('\n');
+            diag.push_str(line);
         }
     }
     Tap {
@@ -81,6 +101,19 @@ fn parse_tap(tap: &str) -> Tap {
         results,
         diags,
     }
+}
+
+/// `testDiag("a\n")`, `testDiag("b\nc")` and `testSkip(1, "why")` as C
+/// prints them.
+#[test]
+fn parse_tap_reads_multi_line_diagnostics_and_skips() {
+    let tap = parse_tap("1..2\n# a\n\nok  1 - x\n# b\nc\nok  2 # SKIP why\n");
+    assert_eq!(tap.plan, 2);
+    assert_eq!(tap.diags, ["a\n", "b\nc"]);
+    assert_eq!(
+        tap.results,
+        [(true, "x".to_owned()), (true, "# SKIP why".to_owned())]
+    );
 }
 
 /// Run `prog` as `<stem>.t` does and hold its report to `golden`.

@@ -152,19 +152,4 @@ impl Ioc {
             v => panic!("{pv}: {v:?}"),
         }
     }
-
-    /// Boot's commands, once `read_meter`'s reset has set the reading
-    /// format.
-    pub async fn boot_commands(&self) -> Vec<String> {
-        let mut got = Vec::new();
-        let reset = eventually(|| {
-            got.extend(self.mock.take());
-            got.iter().any(|c| c == "form:elem read")
-        })
-        .await;
-        assert!(reset, "{got:?}");
-        task::sleep(Duration::from_millis(250)).await;
-        got.extend(self.mock.take());
-        got
-    }
 }

@@ -7,9 +7,13 @@
 mod keithley;
 mod support;
 
+use std::time::Duration;
+
+use epics_base_rs::runtime::task;
 use epics_base_rs::types::{EpicsValue, PvString};
 
 use keithley::{Ioc, Meter, boot};
+use support::eventually;
 
 /// The 2700 behind `Dmm=D1:`.
 const DMM: Meter = Meter {
@@ -31,11 +35,25 @@ const DMM: Meter = Meter {
     read: "read?",
 };
 
+/// Boot's commands, once `read_meter`'s reset has set the reading format.
+async fn boot_commands(ioc: &Ioc) -> Vec<String> {
+    let mut got = Vec::new();
+    let reset = eventually(|| {
+        got.extend(ioc.mock.take());
+        got.iter().any(|c| c == "form:elem read")
+    })
+    .await;
+    assert!(reset, "{got:?}");
+    task::sleep(Duration::from_millis(250)).await;
+    got.extend(ioc.mock.take());
+    got
+}
+
 /// Boot with 4 channels: `read_meter` resets the meter through
 /// `init_string`, configures DC volts and closes channel 1, and 1 s on the
 /// reset sets the reading format through `init_string1`.
 async fn booted(ioc: &Ioc) {
-    let got = ioc.boot_commands().await;
+    let got = boot_commands(ioc).await;
     assert_eq!(
         got,
         [
@@ -134,7 +152,7 @@ async fn a_multi_scan_reads_each_channel_that_is_on_in_its_own_mode() {
 #[epics_base_rs::epics_test]
 async fn a_channels_macro_past_forty_is_cut_to_forty() {
     let ioc = boot(&DMM, 41).await;
-    ioc.boot_commands().await;
+    boot_commands(&ioc).await;
     assert_eq!(ioc.f64_of("channels"), 40.0);
     ioc.step("ch40_mode_sel", 1.0, &[]).await;
     assert_eq!(ioc.str_of("ch40_units"), "VAC");

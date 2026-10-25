@@ -219,7 +219,13 @@ ss read_meter {
             previous_mode = -1;
             previous_chan = -1;
             efClear(read_complete_mon);
-            pvPut(do_init);
+            /* C defect fixed: the template's reset runs on for 1.2 s past
+            ** its *rst (route:open:all, the bus trigger, zero check off,
+            ** the reading format), so a relay closed in that time was
+            ** opened again with previous_chan still naming it, and a read
+            ** taken then read a meter not yet set up. read_meter waits for
+            ** the whole reset, here and on init_dmm. */
+            pvPut(do_init, SYNC);
             efSet(ch_mode_sel_mon);
             efSet(dmm_chan_mon);
         } state wait_read
@@ -264,7 +270,7 @@ ss read_meter {
                 previous_chan = -1;
                 init_dmm = 0;
                 pvPut(init_dmm);
-                pvPut(do_init);
+                pvPut(do_init, SYNC);
             }
         } state wait_read
 

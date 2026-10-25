@@ -41,16 +41,12 @@ const RESET: [&str; 7] = [
     "form:elem read",
 ];
 
-/// Boot with 4 channels: `read_meter` sends the reset's `*rst`, then
-/// configures DC volts and closes channel 1 while the reset's delayed
-/// commands go out.
+/// Boot with 4 channels: `read_meter` resets the meter, and once the reset
+/// is done configures DC volts and closes channel 1.
 async fn booted(ioc: &Ioc) {
-    let got = ioc.boot_commands().await;
-    assert_eq!(got[0], "*rst", "{got:?}");
-    let (reset, mode): (Vec<_>, Vec<_>) =
-        got[1..].iter().partition(|c| RESET.contains(&c.as_str()));
-    assert_eq!(reset, RESET[1..], "{got:?}");
-    assert_eq!(mode, [":sens:func 'volt'", "rout:clos (@1)"], "{got:?}");
+    let mut boot = RESET.to_vec();
+    boot.extend([":sens:func 'volt'", "rout:clos (@1)"]);
+    ioc.commands(&boot).await;
 }
 
 /// Single-channel reads: each sends `*trg;fetch?` behind whatever relay
@@ -131,7 +127,7 @@ async fn a_multi_scan_reads_each_channel_that_is_on_in_its_own_mode() {
 #[epics_base_rs::epics_test]
 async fn a_channels_macro_past_ten_is_cut_to_ten() {
     let ioc = boot(&EM, 11).await;
-    ioc.boot_commands().await;
+    booted(&ioc).await;
     assert_eq!(ioc.f64_of("channels"), 10.0);
     ioc.step("dmm_chan", 2.0, &["rout:clos (@3)"]).await;
     ioc.step("ch_mode_sel", 1.0, &[":sens:func 'curr'"]).await;
@@ -248,9 +244,12 @@ async fn init_dmm_during_a_scan_waits_for_its_end() {
     assert_eq!(ioc.f64_of("init_dmm"), 0.0);
 }
 
-/// A read behind an `init_dmm` reset closes its relay after the reset's
-/// `*rst`. C's mode_change put the reset from its own thread, so a read
-/// read_meter took meanwhile closed the relay before it.
+/// A read behind an `init_dmm` reset closes its relay once the reset is
+/// done, and so does the read after it. C's mode_change put the reset from
+/// its own thread, so a read read_meter took meanwhile closed the relay
+/// first; and C went on while the reset ran, so its `route:open:all`
+/// opened the relay the read had closed and the next read went out with
+/// every relay open.
 #[epics_base_rs::epics_test]
 async fn a_read_behind_a_reset_closes_its_relay_after_it() {
     let ioc = boot(&EM, 4).await;
@@ -260,15 +259,21 @@ async fn a_read_behind_a_reset_closes_its_relay_after_it() {
     ioc.put("init_dmm", EpicsValue::Double(1.0)).await;
     ioc.step("done_read", 1.0, &[]).await;
     reset.release();
-    let got = ioc.boot_commands().await;
-    assert_eq!(got[0], "*rst", "{got:?}");
-    let (reset, read): (Vec<_>, Vec<_>) =
-        got[1..].iter().partition(|c| RESET.contains(&c.as_str()));
-    assert_eq!(reset, RESET[1..], "{got:?}");
-    assert_eq!(
-        read,
-        [":sens:func 'volt'", "rout:clos (@3)", "*trg;fetch?"],
-        "{got:?}"
-    );
+    let mut read = RESET.to_vec();
+    read.extend([":sens:func 'volt'", "rout:clos (@3)", "*trg;fetch?"]);
+    ioc.commands(&read).await;
+    assert!(eventually(|| ioc.f64_of("done_read") == 0.0).await);
     assert_eq!(ioc.f64_of("Dmm_raw"), 3.0);
+    ioc.read(&["*trg;fetch?"]).await;
+    assert_eq!(ioc.f64_of("Dmm_raw"), 3.0);
+}
+
+/// The first read after boot reads channel 1 through the relay boot
+/// closed, which C's reset had opened again 1 s on.
+#[epics_base_rs::epics_test]
+async fn the_first_read_reads_the_relay_boot_closed() {
+    let ioc = boot(&EM, 4).await;
+    booted(&ioc).await;
+    ioc.read(&["*trg;fetch?"]).await;
+    assert_eq!(ioc.f64_of("Dmm_raw"), 1.0);
 }

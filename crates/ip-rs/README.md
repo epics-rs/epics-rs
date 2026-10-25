@@ -1,7 +1,8 @@
 # ip-rs
 
 Rust port of the synApps [ip](https://github.com/epics-modules/ip) module's
-SNL programs. Each `src/snl/*.st` is the upstream file with its C defects
+SNL programs and of `devXxStrParm.c`, the generic octet device support their
+templates use. Each `src/snl/*.st` is the upstream file with its C defects
 fixed in place, each under a comment; `build.rs` compiles it with
 epics-snc-rs and it runs on epics-seq-rs.
 
@@ -29,11 +30,17 @@ seq &Federal, "P=xxx:,S=s1"
 The templates' records come from base, asyn (`asyn`) and calc
 (`scalcout`); the IOC registers those record types itself.
 
+`devXxStrParm` (`asyn <xx> stringParm`) is [`strparm`](src/strparm.rs): its
+`device()` lines of `ipSupport.dbd` are `strparm::DEVICE_ROWS`, served by
+`strparm::device_support_factory()` through
+`register_dynamic_device_support`.
+
 No cargo features.
 
 ## Not ported
 
-- The device supports in `ipApp/src/dev*.c`.
+- The other device supports in `ipApp/src/dev*.c`; the serial ones are in
+  epics-rs-iocs's `ip-devices`.
 - `ipApp/op` display screens and the `iocs/ipExample` IOC.
 
 ## Testing

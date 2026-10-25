@@ -2101,6 +2101,7 @@ version = "0.32.0"
 dependencies = [
  "asyn-rs",
  "epics-base-rs",
+ "epics-libcom-rs",
  "epics-seq-rs",
  "epics-snc-rs",
 ]

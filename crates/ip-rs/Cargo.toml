@@ -2,13 +2,15 @@
 name = "ip-rs"
 version.workspace = true
 edition.workspace = true
-description = "Rust port of the EPICS synApps ip module's SNL programs"
+description = "Rust port of the EPICS synApps ip module's SNL programs and devXxStrParm device support"
 license-file = "LICENSE"
 authors.workspace = true
 repository.workspace = true
 
 [dependencies]
+asyn-rs = { workspace = true }
 epics-base-rs = { workspace = true }
+epics-libcom-rs = { workspace = true }
 epics-seq-rs = { workspace = true }
 
 [build-dependencies]
@@ -16,5 +18,3 @@ epics-snc-rs = { workspace = true }
 
 [features]
 
-[dev-dependencies]
-asyn-rs = { workspace = true }

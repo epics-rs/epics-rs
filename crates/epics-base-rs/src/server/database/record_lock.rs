@@ -429,9 +429,9 @@ struct LockSet {
     /// outermost release runs whatever is left before the mutex goes.
     callbacks: std::sync::Mutex<std::collections::VecDeque<(Arc<RecordCell>, OwedCallback)>>,
     /// Reads of member records that found the set held ([`owe_read`]),
-    /// served by the outermost release, and the holder parked for a read of
-    /// its own ([`ReadPark`]), which serves them from where it waits.
-    reads: std::sync::Mutex<OwedReads>,
+    /// served by the outermost release, or by the holder from where it waits
+    /// for a read of its own ([`ReadWait`]).
+    reads: std::sync::Mutex<Vec<Arc<dyn OwedRead>>>,
 }
 
 /// [`LockSet::release_owed`]'s bits.
@@ -444,15 +444,11 @@ pub(crate) type OwedCallback = Box<dyn FnOnce() + Send>;
 /// A read of a member record that found its set held — C's lock-free
 /// `dbGet` (`dbAccess.c:909`) — run by a thread that holds the set.
 pub(crate) trait OwedRead: Send + Sync {
+    /// The record read.
+    fn cell(&self) -> &RecordCell;
     /// Read now. `own` is the serving thread's own record, borrowed by its
-    /// processing, when it serves from a [`ReadPark`].
+    /// processing, when it serves from a [`ReadWait`].
     fn serve(&self, own: Option<(&RecordCell, crate::server::record::OwnRecord<'_>)>);
-}
-
-#[derive(Default)]
-struct OwedReads {
-    queue: Vec<Arc<dyn OwedRead>>,
-    parked: Option<std::thread::Thread>,
 }
 
 // SAFETY: `held` is the one non-`Sync` field, and it is read or written only
@@ -675,50 +671,98 @@ pub(crate) fn owe_callback(cell: &Arc<RecordCell>, job: OwedCallback) {
     set.release_owed.fetch_or(OWED_CALLBACKS, Ordering::Relaxed);
 }
 
-/// Owe `read` to the set `cell` is in, held by another thread: its outermost
-/// release serves it, and a holder parked in a [`ReadPark`] is woken to
-/// serve it from there. A record a merge moves meanwhile is left to the
-/// reader's own retry.
-pub(crate) fn owe_read(cell: &RecordCell, read: Arc<dyn OwedRead>) {
-    let set = cell.lock_record().set();
-    let mut reads = set.reads.lock().unwrap_or_else(|e| e.into_inner());
-    reads.queue.push(read);
+/// Owe `read` to the set its record is in, held by another thread: its
+/// outermost release serves it, and a holder waiting in a [`ReadWait`] is
+/// handed the set to serve it from there. A record a merge moves meanwhile
+/// is left to the reader's own retry.
+pub(crate) fn owe_read(read: Arc<dyn OwedRead>) {
+    let set = read.cell().lock_record().set();
+    set.reads
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(read);
     set.release_owed.fetch_or(OWED_READS, Ordering::Release);
-    if let Some(parked) = &reads.parked {
-        parked.unpark();
-    }
-}
-
-/// Serve the reads owed to the set `own`'s record is in, which this thread
-/// holds: two readers each inside its own record and reading the other's
-/// would otherwise wait on each other.
-pub(crate) fn serve_owed_reads(own: (&RecordCell, crate::server::record::OwnRecord<'_>)) {
-    let set = own.0.lock_record().set();
-    debug_assert_eq!(set.owner.load(Ordering::Acquire), thread_key());
-    for read in set.take_reads() {
-        read.serve(Some(own));
-    }
-}
-
-/// This thread parked for a read while it holds `cell`'s set, so an
-/// [`owe_read`] to that set wakes it; given up when dropped.
-pub(crate) struct ReadPark(Set);
-
-impl ReadPark {
-    pub(crate) fn new(cell: &RecordCell) -> Self {
-        let set = cell.lock_record().set();
-        set.reads.lock().unwrap_or_else(|e| e.into_inner()).parked = Some(std::thread::current());
-        Self(set)
-    }
-}
-
-impl Drop for ReadPark {
-    fn drop(&mut self) {
-        self.0
-            .reads
+    let owner = set.owner.load(Ordering::Acquire);
+    let waits = WAITS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(wait) = waits.reading.iter().find(|w| w.key == owner) {
+        wait.owed
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .parked = None;
+            .push(set);
+        wait.thread.unpark();
+    }
+}
+
+/// A thread in a [`ReadWait`], and the sets it holds that were owed reads
+/// since it last served them.
+struct Waiter {
+    key: u64,
+    thread: std::thread::Thread,
+    read: Arc<dyn OwedRead>,
+    owed: std::sync::Mutex<Vec<Set>>,
+}
+
+/// The threads that wait while they may hold sets.
+struct Waits {
+    reading: Vec<Arc<Waiter>>,
+}
+
+static WAITS: std::sync::Mutex<Waits> = std::sync::Mutex::new(Waits {
+    reading: Vec::new(),
+});
+
+/// This thread waiting for `read`, which it owed: a read owed to any set it
+/// holds is served from here ([`Self::serve`]), its own record's or not, and
+/// whether owed before the wait began or after. Two holders reading each
+/// other's records would otherwise wait for good. Taken before `read` is
+/// owed; given up when dropped.
+pub(crate) struct ReadWait(Arc<Waiter>);
+
+impl ReadWait {
+    pub(crate) fn new(read: Arc<dyn OwedRead>) -> Self {
+        let key = thread_key();
+        let mut waits = WAITS.lock().unwrap_or_else(|e| e.into_inner());
+        // Every owed read's reader waits in a `ReadWait`, so the reads owed
+        // to this thread's sets before now are among theirs.
+        let owed = waits
+            .reading
+            .iter()
+            .map(|w| w.read.cell().lock_record().set())
+            .filter(|set| set.owner.load(Ordering::Acquire) == key)
+            .collect();
+        let wait = Arc::new(Waiter {
+            key,
+            thread: std::thread::current(),
+            read,
+            owed: std::sync::Mutex::new(owed),
+        });
+        waits.reading.push(Arc::clone(&wait));
+        Self(wait)
+    }
+
+    /// Serve the reads owed to the sets this thread holds. `own` is the
+    /// record the thread is inside, read through the view it lends.
+    pub(crate) fn serve(&self, own: Option<(&RecordCell, crate::server::record::OwnRecord<'_>)>) {
+        let sets = std::mem::take(&mut *self.0.owed.lock().unwrap_or_else(|e| e.into_inner()));
+        for set in sets {
+            // Released since it was owed: its next holder's release serves it.
+            if set.owner.load(Ordering::Acquire) != self.0.key {
+                continue;
+            }
+            for read in set.take_reads() {
+                read.serve(own);
+            }
+        }
+    }
+}
+
+impl Drop for ReadWait {
+    fn drop(&mut self) {
+        WAITS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .reading
+            .retain(|w| !Arc::ptr_eq(w, &self.0));
     }
 }
 
@@ -814,7 +858,7 @@ fn new_set(id: u64) -> Set {
         trace: AtomicUsize::new(0),
         owed: std::sync::Mutex::new(Vec::new()),
         callbacks: std::sync::Mutex::new(std::collections::VecDeque::new()),
-        reads: std::sync::Mutex::new(OwedReads::default()),
+        reads: std::sync::Mutex::new(Vec::new()),
     }))
 }
 
@@ -1124,7 +1168,7 @@ impl LockSet {
         }
         let mut reads = self.reads.lock().unwrap_or_else(|e| e.into_inner());
         self.release_owed.fetch_and(!OWED_READS, Ordering::Relaxed);
-        std::mem::take(&mut reads.queue)
+        std::mem::take(&mut *reads)
     }
 
     /// The outermost release: what the set was owed runs first, still under

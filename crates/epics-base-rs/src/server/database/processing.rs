@@ -13595,8 +13595,8 @@ impl PvDatabase {
     /// C's `dbGet` reads a record another thread holds without its lock; a
     /// record whose set is held elsewhere is read here by that holder, at its
     /// release ([`super::owe_read`]). While this thread waits it serves the
-    /// reads owed to its own record's set, so two records each reading the
-    /// other from inside its own processing do not wait on each other.
+    /// reads owed to every set it holds ([`super::ReadWait`]), so two holders
+    /// each reading the other's records do not wait on each other.
     pub(crate) fn db_get_snapshot(
         &self,
         name: &[u8],
@@ -13622,15 +13622,13 @@ impl PvDatabase {
             got: parking_lot::Mutex::new(None),
             reader: std::thread::current(),
         });
-        super::owe_read(&cell, read.clone());
-        let _park = own.map(|(cell, _)| super::ReadPark::new(cell));
+        let wait = super::ReadWait::new(read.clone());
+        super::owe_read(read.clone());
         loop {
             if let Some(got) = read.got.lock().take() {
                 return got;
             }
-            if let Some(own) = own {
-                super::serve_owed_reads(own);
-            }
+            wait.serve(own);
             // The holder can let the set go between its last look at what it
             // owed and its unlock.
             if let Some(got) = self.db_get_held(&cell, &read.field, own) {
@@ -13672,6 +13670,10 @@ struct OwedDbGet {
 }
 
 impl super::OwedRead for OwedDbGet {
+    fn cell(&self) -> &RecordCell {
+        &self.cell
+    }
+
     fn serve(&self, own: Option<(&RecordCell, OwnRecord<'_>)>) {
         let mut got = self.got.lock();
         // A record a merge moved off this set is left to the reader's retry.

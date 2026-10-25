@@ -399,3 +399,72 @@ async fn holders_borrowing_set_mates_without_a_view_do_not_wait_on_each_other() 
         );
     }
 }
+
+/// Two holders that lend no view, each reading the other's record: a waiter
+/// serves the reads owed to every set it holds, not only its own record's,
+/// or each waits for the other's release for good.
+#[epics_macros_rs::epics_test]
+async fn two_holders_reading_each_other_without_a_view_both_read() {
+    let db = ioc().await;
+    let both = Arc::new(std::sync::Barrier::new(2));
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let read = |me: &'static str, other: &'static str| {
+        let (h, both, done) = (db.async_handle(), both.clone(), done_tx.clone());
+        std::thread::spawn(move || {
+            let got = h.with_held(me, |_| {
+                both.wait();
+                h.db_get(other, DbFieldType::Double, 1, None)
+                    .map(|s| s.value)
+            });
+            done.send((me, got.flatten())).unwrap();
+        })
+    };
+    read("AI", "AO.HOPR");
+    read("AO", "AI.HOPR");
+    let wait = std::time::Duration::from_secs(10);
+    for _ in 0..2 {
+        let (me, got) = done_rx.recv_timeout(wait).expect("both holders read");
+        assert_eq!(got, Some(EpicsValue::Double(10.0)), "{me}");
+    }
+}
+
+/// A read owed to a holder's set before that holder began to wait is served
+/// from its wait too: AO's holder waits on AI, whose holder waits for M,
+/// whose holder waits on its read of AO.
+#[epics_macros_rs::epics_test]
+async fn a_holder_serves_a_read_owed_before_it_waits() {
+    let db = ioc().await;
+    let all = Arc::new(std::sync::Barrier::new(3));
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let ms = std::time::Duration::from_millis;
+    {
+        let (h, all, done) = (db.async_handle(), all.clone(), done_tx.clone());
+        std::thread::spawn(move || {
+            h.with_held("AI", |_| {
+                all.wait();
+                std::thread::sleep(ms(50));
+                h.with_record("M", |_| ());
+            });
+            done.send(("AI", Some(EpicsValue::Double(10.0)))).unwrap();
+        });
+    }
+    let read = |me: &'static str, other: &'static str, after| {
+        let (h, all, done) = (db.async_handle(), all.clone(), done_tx.clone());
+        std::thread::spawn(move || {
+            let got = h.with_held(me, |_| {
+                all.wait();
+                std::thread::sleep(ms(after));
+                h.db_get(other, DbFieldType::Double, 1, None)
+                    .map(|s| s.value)
+            });
+            done.send((me, got.flatten())).unwrap();
+        })
+    };
+    read("M", "AO.HOPR", 20);
+    read("AO", "AI.HOPR", 100);
+    let wait = std::time::Duration::from_secs(10);
+    for _ in 0..3 {
+        let (me, got) = done_rx.recv_timeout(wait).expect("all three finish");
+        assert_eq!(got, Some(EpicsValue::Double(10.0)), "{me}");
+    }
+}

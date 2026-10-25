@@ -390,6 +390,14 @@ impl Lend {
         Ok(f(actor))
     }
 
+    /// The driver as the holder of the port reaches it.
+    pub(crate) fn with_port_driver<R>(
+        &self,
+        f: impl FnOnce(&mut dyn PortDriver) -> R,
+    ) -> AsynResult<R> {
+        self.with(|actor| f(actor.driver.as_mut()))
+    }
+
     /// The driver as the holder of a `lock()` reaches it.
     pub(crate) fn with_driver<D: PortDriver, R>(
         &self,

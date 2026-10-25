@@ -289,12 +289,7 @@ impl<D: PortDriver> DriverHold<D> {
     }
 
     fn enter(port: &PortHandle) -> AsynResult<Holding> {
-        let (holding, ran) = port.lend_request(
-            "hold_driver_blocking",
-            RequestOp::WithDriver(DriverCall::new(|_| {})),
-            AsynUser::default(),
-        )?;
-        ran?;
+        let holding = port.hold("hold_driver_blocking")?;
         port.lend
             .with_driver::<D, _>(|_| ())?
             .ok_or_else(|| port.wrong_driver::<D>())?;
@@ -857,6 +852,17 @@ impl PortHandle {
         let holding = Holding::enter(&self.lend, self.actor);
         let ran = crate::port_actor::run_lent(&self.lend, claimed);
         Ok((holding, ran.map_err(through)))
+    }
+
+    /// This thread's hold of the port: a request that does nothing, lent.
+    fn hold(&self, what: &str) -> AsynResult<Holding> {
+        let (holding, ran) = self.lend_request(
+            what,
+            RequestOp::WithDriver(DriverCall::new(|_| {})),
+            AsynUser::default(),
+        )?;
+        ran?;
+        Ok(holding)
     }
 
     /// Submit a request and block until completion (for sync callers).
@@ -1555,6 +1561,18 @@ impl PortHandle {
         let (call, result) = self.driver_call(f);
         self.submit_blocking(RequestOp::WithDriver(call), AsynUser::default())?;
         self.driver_result::<D, R>(result)
+    }
+
+    /// C `lock()`, `f`, `unlock()` from a thread that is not the port's:
+    /// `f` runs here with the actor lent to this thread, so it may borrow
+    /// from its caller and is neither boxed nor sent. Refuses the port's own
+    /// actor thread like every blocking entry point.
+    pub fn lent_driver_blocking<R>(
+        &self,
+        f: impl FnOnce(&mut dyn PortDriver) -> R,
+    ) -> AsynResult<R> {
+        let _holding = self.hold("lent_driver_blocking")?;
+        self.lend.with_port_driver(f)
     }
 
     /// A driver thread's C `lock()`, held across several steps until the

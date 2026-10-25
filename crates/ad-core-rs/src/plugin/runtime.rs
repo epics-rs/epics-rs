@@ -269,22 +269,15 @@ impl PluginAttributes {
     /// `pending` are the updates the processor will return for this frame,
     /// which C has already set when it makes the call.
     pub fn get_attributes(&self, list: &mut NDAttributeList, pending: &[ParamUpdate]) {
-        self.0.get_attributes_blocking(list, || {
-            let mut sets = begin_now();
-            sets.extend(pending.iter().filter_map(ParamUpdate::stored));
-            sets
-        });
+        self.merge(list, None, pending);
     }
 
     /// The set evaluated now, `None` when it is empty. Inside
     /// `process_array` the frame's `beginProcessCallbacks` sets count as
     /// pending ahead of `pending`.
     pub fn evaluate(&self, pending: &[ParamUpdate]) -> Option<NDAttributeList> {
-        self.0.evaluate_attributes_blocking(|| {
-            let mut sets = begin_now();
-            sets.extend(pending.iter().filter_map(ParamUpdate::stored));
-            sets
-        })
+        let mut list = NDAttributeList::new();
+        self.merge(&mut list, None, pending).then_some(list)
     }
 
     /// [`Self::evaluate`] into `list`, cleared first, with `begin`, the
@@ -297,11 +290,20 @@ impl PluginAttributes {
         pending: &[ParamUpdate],
     ) -> bool {
         list.clear();
-        self.0.get_attributes_blocking(list, || {
-            let mut sets = begin.to_vec();
-            sets.extend(pending.iter().filter_map(ParamUpdate::stored));
-            sets
-        })
+        self.merge(list, Some(begin), pending)
+    }
+
+    /// [`Self::get_attributes`] with the sets [`with_sets`] lays out.
+    fn merge(
+        &self,
+        list: &mut NDAttributeList,
+        begin: Option<&[PendingParam]>,
+        pending: &[ParamUpdate],
+    ) -> bool {
+        !self.0.attributes().lock().list.is_empty()
+            && with_sets(begin, pending, |sets| {
+                self.0.get_attributes_blocking(list, sets)
+            })
     }
 
     /// [`Self::evaluate`] from inside a write, on the port's actor, where
@@ -512,6 +514,46 @@ fn begin_now() -> Vec<PendingParam> {
         let b = b.borrow();
         b.sets[b.top..].to_vec()
     })
+}
+
+/// `f` given what C has stored ahead of a `getAttributes`: `begin`, or
+/// without it the running frame's `beginProcessCallbacks` sets, then what
+/// `updates` store. Laid out in [`BEGIN`]'s storage, taken out while `f`
+/// runs and back once it returns or unwinds.
+fn with_sets<R>(
+    begin: Option<&[PendingParam]>,
+    updates: &[ParamUpdate],
+    f: impl FnOnce(&[PendingParam]) -> R,
+) -> R {
+    /// The taken stack and the `top` and length it goes back with.
+    struct Restore(Vec<PendingParam>, usize, usize);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            self.0.truncate(self.2);
+            BEGIN.with(|b| {
+                let b = &mut *b.borrow_mut();
+                b.sets = std::mem::take(&mut self.0);
+                b.top = self.1;
+            });
+        }
+    }
+    let mut stack = BEGIN.with(|b| {
+        let b = &mut *b.borrow_mut();
+        let sets = std::mem::take(&mut b.sets);
+        let len = sets.len();
+        Restore(sets, std::mem::take(&mut b.top), len)
+    });
+    let from = match begin {
+        Some(begin) => {
+            stack.0.extend_from_slice(begin);
+            stack.2
+        }
+        None => stack.1,
+    };
+    stack
+        .0
+        .extend(updates.iter().filter_map(ParamUpdate::stored));
+    f(&stack.0[from..])
 }
 
 fn with_frame<R>(begin: &[PendingParam], hand_on: Option<&HandOn>, f: impl FnOnce() -> R) -> R {

@@ -1570,27 +1570,16 @@ impl ArrayOwner {
     }
 
     /// C++ `getAttributes(pList)` from a plugin's `processCallbacks`, which
-    /// holds the port lock: the set re-evaluated on the port's actor, `None`
-    /// when it is empty or the port has stopped. `pending` are values the
-    /// plugin has set ahead of the call but not yet flushed, taken only for
-    /// a set to evaluate; a `PARAM` attribute reads them as C reads its own
+    /// holds the port lock: the set re-evaluated under the port, here, and
+    /// merged onto `list`; whether it was, which an empty set or a stopped
+    /// port is not. `pending` are values the plugin has set ahead of the call
+    /// but not yet flushed; a `PARAM` attribute reads them as C reads its own
     /// sets ([`DriverAttributes::update_with`]). Blocks the caller, which
     /// must not be the port's actor.
-    pub fn evaluate_attributes_blocking(
-        &self,
-        pending: impl FnOnce() -> Vec<PendingParam>,
-    ) -> Option<crate::attributes::NDAttributeList> {
-        let mut list = crate::attributes::NDAttributeList::new();
-        self.get_attributes_blocking(&mut list, pending)
-            .then_some(list)
-    }
-
-    /// [`Self::evaluate_attributes_blocking`] merged onto `list` in place;
-    /// whether the set was evaluated.
     pub fn get_attributes_blocking(
         &self,
         list: &mut crate::attributes::NDAttributeList,
-        pending: impl FnOnce() -> Vec<PendingParam>,
+        pending: &[PendingParam],
     ) -> bool {
         if self.attributes.lock().list.is_empty() {
             return false;
@@ -1598,28 +1587,15 @@ impl ArrayOwner {
         let Some(port) = self.port() else {
             return false;
         };
-        let pending = pending();
-        let attributes = self.attributes.clone();
-        // Lent to the call and taken back whether or not it ran.
-        let lent = Arc::new(parking_lot::Mutex::new((std::mem::take(list), false)));
-        let slot = lent.clone();
-        let call = asyn_rs::request::DriverCall::new(move |driver| {
-            let mut attributes = attributes.lock();
-            attributes.update_values(driver.base(), &pending);
-            let (list, merged) = &mut *slot.lock();
+        port.lent_driver_blocking(|driver| {
+            let mut attributes = self.attributes.lock();
+            attributes.update_values(driver.base(), pending);
             list.copy_from(&attributes.list);
-            *merged = true;
-        });
-        let _ = port.submit_blocking(
-            asyn_rs::request::RequestOp::WithDriver(call),
-            asyn_rs::user::AsynUser::default(),
-        );
-        let (taken, merged) = std::mem::take(&mut *lent.lock());
-        *list = taken;
-        merged
+        })
+        .is_ok()
     }
 
-    /// The store half of [`Self::evaluate_attributes_blocking`], for a
+    /// The store half of [`Self::get_attributes_blocking`], for a
     /// caller that evaluates later against what has been set by then. `None`
     /// when the set is empty or the port has stopped.
     pub fn param_reads_blocking(

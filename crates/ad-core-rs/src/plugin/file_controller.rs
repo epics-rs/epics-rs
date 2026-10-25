@@ -9,7 +9,8 @@ use crate::ndarray::{NDArray, NDDataType, NDDimension};
 use crate::ndarray_pool::DriverPool;
 
 use super::file_base::{
-    FileIo, FlushStep, FrameStatus, NDFileMode, NDFileWriter, NDPluginFileBase, read_file_base,
+    Deleted, FileIo, FlushStep, FrameStatus, NDFileMode, NDFileWriter, NDPluginFileBase,
+    read_file_base,
 };
 use super::runtime::{
     AttributeView, ParamPost, ParamUpdate, PluginPool, ProcessResult, WriteOutcome, WriteVerdict,
@@ -796,13 +797,15 @@ impl<W: NDFileWriter, P: PortLock<FilePluginController<W>>> FileControl<W> for P
         // `Ok(true)` only where C calls writeFileBase, which alone sets
         // WriteStatus/WriteMessage (NDPluginFile.cpp:745-785).
         let c = self.controller();
+        let mut deleted: Deleted = Ok(());
         let result: ADResult<bool> = match c.file_base.mode() {
             NDFileMode::Single => {
                 if c.auto_save {
                     let mut started = std::mem::take(&mut proc_result.param_updates);
                     started.extend(c.write_file_start());
                     post.post(started);
-                    let r = write_single(self, array, post);
+                    let r;
+                    (r, deleted) = write_single(self, array, post);
                     let c = self.controller();
                     c.push_num_captured_update(&mut proc_result.param_updates);
                     c.push_write_file_end(&mut proc_result.param_updates);
@@ -845,7 +848,8 @@ impl<W: NDFileWriter, P: PortLock<FilePluginController<W>>> FileControl<W> for P
                                 &mut proc_result.trace,
                                 &mut proc_result.param_updates,
                             );
-                            let r = NDPluginFileBase::flush_capture_io(
+                            let r;
+                            (r, deleted) = NDPluginFileBase::flush_capture_status_io(
                                 &mut PortIo::new(self),
                                 &latest,
                                 &mut posted,
@@ -887,7 +891,8 @@ impl<W: NDFileWriter, P: PortLock<FilePluginController<W>>> FileControl<W> for P
                     let c = self.controller();
                     c.record(&proc_result.param_updates);
                     c.record(&c.write_ok());
-                    let r = NDPluginFileBase::process_array_io(
+                    let r;
+                    (r, deleted) = NDPluginFileBase::process_array_status_io(
                         &mut PortIo::new(self),
                         array,
                         &mut |a| post.hand_on(a),
@@ -907,6 +912,7 @@ impl<W: NDFileWriter, P: PortLock<FilePluginController<W>>> FileControl<W> for P
                         && c.file_base.num_captured() as i64 >= i64::from(target)
                     {
                         if let Err(e) = NDPluginFileBase::close_stream_io(&mut PortIo::new(self)) {
+                            print_deleted(&mut proc_result.trace, &deleted);
                             self.controller().fail_cycle(&mut proc_result, &e);
                             return proc_result;
                         }
@@ -930,6 +936,9 @@ impl<W: NDFileWriter, P: PortLock<FilePluginController<W>>> FileControl<W> for P
         } else if let Err(err) = result {
             c.fail_cycle(&mut proc_result, &err);
         }
+        // processCallbacks ignores writeFileBase's status here, but not its
+        // line; Stream's count is the comment in `process_array_inner`.
+        print_deleted(&mut proc_result.trace, &deleted);
         proc_result
     }
 
@@ -1143,12 +1152,10 @@ fn act_int32<W: NDFileWriter, P: PortLock<FilePluginController<W>>>(
                 )
                 .settled();
         };
-        let (result, status_ok) = match c.file_base.mode() {
+        let (result, deleted) = match c.file_base.mode() {
             NDFileMode::Single => {
                 post.post(c.write_file_start());
-                let r = write_single(port, array, post);
-                let ok = r.is_ok();
-                (r, ok)
+                write_single(port, array, post)
             }
             NDFileMode::Capture => {
                 updates.extend(
@@ -1165,17 +1172,14 @@ fn act_int32<W: NDFileWriter, P: PortLock<FilePluginController<W>>>(
             }
             NDFileMode::Stream => {
                 c.record(&c.write_ok());
-                let r =
-                    NDPluginFileBase::process_array_io(&mut PortIo::new(port), array, &mut |a| {
-                        post.hand_on(a)
-                    });
-                let ok = r.is_ok();
-                (r, ok)
+                NDPluginFileBase::process_array_status_io(&mut PortIo::new(port), array, &mut |a| {
+                    post.hand_on(a)
+                })
             }
         };
         let c = port.controller();
         // C sets the flag back to 0, since this could be a busy record (:820).
-        let mut out = WriteOutcome::from(zeroed(status_ok));
+        let mut out = WriteOutcome::from(zeroed(deleted.is_ok()));
         out.trace = trace;
         match &result {
             Ok(()) => {
@@ -1191,6 +1195,7 @@ fn act_int32<W: NDFileWriter, P: PortLock<FilePluginController<W>>>(
                 c.push_file_base_readbacks(&mut updates);
             }
         }
+        print_deleted(&mut out.trace, &deleted);
         abort_on_writer_abort(port, &mut updates, &result);
         return out.set_updates(updates);
     }
@@ -1276,14 +1281,28 @@ fn write_single<W: NDFileWriter, P: PortLock<FilePluginController<W>>>(
     port: &mut P,
     array: Arc<NDArray>,
     post: &mut dyn ParamPost,
-) -> ADResult<()> {
+) -> (ADResult<()>, Deleted) {
     let c = port.controller();
-    c.file_base.count_single()?;
+    if let Err(e) = c.file_base.count_single() {
+        return (Err(e), Err(None));
+    }
     let mut set = Vec::new();
     c.push_num_captured_update(&mut set);
     c.record(&set);
-    c.file_base.ensure_directory()?;
-    NDPluginFileBase::process_array_io(&mut PortIo::new(port), array, &mut |a| post.hand_on(a))
+    if let Err(e) = c.file_base.ensure_directory() {
+        return (Err(e), Err(None));
+    }
+    NDPluginFileBase::process_array_status_io(&mut PortIo::new(port), array, &mut |a| {
+        post.hand_on(a)
+    })
+}
+
+/// The line C prints when writeFileBase cannot delete the driver's file
+/// (NDPluginFile.cpp:385-387).
+fn print_deleted(trace: &mut Vec<(TraceMask, String)>, deleted: &Deleted) {
+    if let Err(Some(line)) = deleted {
+        trace.push((TraceMask::ERROR, line.clone()));
+    }
 }
 
 /// The port's side of a writer's settings: a write lands here at once, never
@@ -3233,6 +3252,71 @@ mod tests {
         let out = c.write_int32(write_file, 1, WriteVerdict::Accept(1), &mut ());
         assert_eq!(out.verdict, WriteVerdict::Accept(0));
         assert_eq!(side_int(&out, p.write_status.unwrap()), Some(1));
+    }
+
+    /// writeFileBase's DeleteDriverFile step fails its status once the
+    /// write has landed (NDPluginFile.cpp:376-391): WriteFile fails, C says
+    /// why only when `remove` does, and WriteStatus stays the write's. An
+    /// empty Capture buffer leaves the status clean, so the step still runs.
+    #[test]
+    fn a_driver_file_left_undeleted_fails_write_file() {
+        let missing = std::env::temp_dir()
+            .join(format!("nodel-{}", std::process::id()))
+            .join("raw");
+        let missing = missing.to_str().unwrap().to_string();
+        let unremoved = format!(
+            "NDPluginFile::writeFileBase: error deleting file {missing}, error=No such file or directory\n"
+        );
+        let empty = "NDPluginFile::writeFileBase: ERROR, capture buffer is empty\n";
+        for (mode, frame, lines, status) in [
+            (
+                0,
+                with_str_attr(array(1), "DriverFileName", &missing),
+                vec![unremoved.as_str()],
+                0,
+            ),
+            (0, with_i32_attr(array(1), "DriverFileName", 7), vec![], 0),
+            (
+                1,
+                with_str_attr(array(1), "DriverFileName", &missing),
+                vec![empty, unremoved.as_str()],
+                1,
+            ),
+        ] {
+            let mut c = base_port();
+            let p = c.params;
+            c.store_int32(p.write_mode.unwrap(), WriteVerdict::Accept(mode).into());
+            c.file_base.delete_driver_file = true;
+            c.latest_array = Some(Arc::new(frame));
+            let out = write_file(&mut c);
+            assert_eq!(out.verdict, zeroed(false), "{lines:?}");
+            let refused = refused_line(p.write_file.unwrap(), 1);
+            let mut want = lines.clone();
+            want.push(&refused);
+            assert_eq!(out.trace, error_lines(&want));
+            assert_eq!(side_int(&out, p.write_status.unwrap()), Some(status));
+        }
+    }
+
+    /// processCallbacks drops writeFileBase's status (NDPluginFile.cpp:751),
+    /// not the line its DeleteDriverFile step prints.
+    #[test]
+    fn a_saved_frame_prints_why_its_driver_file_stays() {
+        let missing = std::env::temp_dir()
+            .join(format!("nosave-{}", std::process::id()))
+            .join("raw");
+        let missing = missing.to_str().unwrap().to_string();
+        let mut c = base_port();
+        c.auto_save = true;
+        c.file_base.delete_driver_file = true;
+        let frame = with_str_attr(array(2), "DriverFileName", &missing);
+        let result = c.process_array(&Arc::new(frame), &mut ());
+        assert_eq!(
+            result.trace,
+            error_lines(&[&format!(
+                "NDPluginFile::writeFileBase: error deleting file {missing}, error=No such file or directory\n"
+            )])
+        );
     }
 
     /// NDPluginFile.cpp:808-822: WriteFile writes inside the write, leaves

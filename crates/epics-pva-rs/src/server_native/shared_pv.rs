@@ -1095,9 +1095,9 @@ impl SharedPV {
     /// client-supplied (marked) timeStamp is left untouched.
     ///
     /// `desc` / `changed` use the wire bit numbering (pvData §5.4); the
-    /// "marked" test covers `[ts_bit, ts_bit + total_bits)` — the field's
-    /// own bit plus every descendant — matching pvxs `isMarked(true,
-    /// true)`. A stamped leaf is marked in `changed`, as pvxs's assignment
+    /// "marked" test covers the root bit (its only parent) and
+    /// `[ts_bit, ts_bit + total_bits)` — the field's own bit plus every
+    /// descendant — matching pvxs `isMarked(true, true)`. A stamped leaf is marked in `changed`, as pvxs's assignment
     /// marks it. Child leaves are rewritten in place, preserving their
     /// declared integer type so the merged value still fits the opened
     /// descriptor. Mailbox-only: a custom `on_put` handler owns its own
@@ -1124,9 +1124,10 @@ impl SharedPV {
         let Some(ts_desc @ FieldDesc::Structure { .. }) = ts_desc else {
             return;
         };
-        // Client marked the field or any descendant → keep its timestamp.
+        // Client marked the root, the field or any descendant → keep its
+        // timestamp.
         let total = ts_desc.total_bits();
-        if (0..total).any(|i| changed.get(ts_bit + i)) {
+        if changed.get(0) || (0..total).any(|i| changed.get(ts_bit + i)) {
             return;
         }
         // Stamp the two child leaves from the server's current POSIX time.
@@ -2754,6 +2755,23 @@ mod tests {
             secs, 12_345,
             "client-marked timeStamp must be preserved, not re-stamped"
         );
+    }
+
+    /// A PUT that marks the whole structure (bit 0) supplied a timeStamp:
+    /// pvxs `isMarked(true, true)` sees the marked parent and keeps it.
+    #[epics_macros_rs::epics_test]
+    async fn mailbox_put_root_marked_timestamp_is_preserved() {
+        use crate::proto::BitSet;
+        let pv = SharedPV::build_mailbox();
+        pv.open(nt_scalar_ts_desc(), nt_scalar_ts_value(0, 0, 0))
+            .unwrap();
+        let desc = nt_scalar_ts_desc();
+        let mut changed = BitSet::new();
+        changed.set(0);
+        pv.put_delta(&desc, &changed, nt_scalar_ts_value(11, 12_345, 0))
+            .expect("mailbox put ok");
+        let (secs, _nanos) = extract_timestamp(&pv.current().expect("has value"));
+        assert_eq!(secs, 12_345, "root-marked timeStamp must be preserved");
     }
 
     /// A value type with no `timeStamp` field is unaffected: the PUT

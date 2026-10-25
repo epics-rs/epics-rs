@@ -584,6 +584,104 @@ async fn fifo_size_replies_are_all_lost() {
     assert_eq!(s(&rig, "errMsg"), "no error");
 }
 
+/// Put `locate` and wait until its `!ALL P` is sent.
+async fn locate(rig: &Rig) {
+    let n = rig.hsc.seen().len();
+    put_hsc(rig, "locate", "1").await;
+    assert!(
+        eventually(|| rig.hsc.seen().len() > n).await,
+        "no locate after {:?}",
+        rig.hsc.seen()
+    );
+}
+
+/// A silent controller fails a locate's read with no reply. Two such
+/// locates in a row leave error 0; the third shows error 18.
+///
+/// C defect fixed: nothing enters C's `comm_error`, so a silent
+/// controller kept "no error".
+#[epics_base_rs::epics_test]
+async fn a_third_locate_without_a_reply_is_a_comm_error() {
+    let rig = boot(|_| {}).await;
+    rig.hsc.set_silent(true);
+    locate(&rig).await;
+    locate(&rig).await;
+    quiet().await;
+    assert_eq!(v(&rig, "error"), 0.0);
+    assert_eq!(s(&rig, "errMsg"), "no error");
+    locate(&rig).await;
+    assert!(eventually(|| v(&rig, "error") == 18.0).await);
+    assert_eq!(s(&rig, "errMsg"), "communications error");
+}
+
+/// A move to a silent controller polls without a reply until the error,
+/// which releases hBusy and the h_Busy busy record.
+///
+/// C defect fixed: C kept both busy and polled every 0.2 s.
+#[epics_base_rs::epics_test]
+async fn a_comm_error_releases_a_moving_axis() {
+    let rig = boot(|_| {}).await;
+    rig.hsc.set_silent(true);
+    put_hsc(&rig, "l", "1.5").await;
+    sent(&rig, "!H-1 M ").await;
+    let state = || ["error", "hBusy", "h_Busy"].map(|pv| v(&rig, pv));
+    assert!(
+        eventually(|| state() == [18.0, 0.0, 0.0]).await,
+        "error, hBusy, h_Busy {:?}",
+        state()
+    );
+    assert_eq!(s(&rig, "errMsg"), "communications error");
+    assert_eq!((v(&rig, "lRB"), v(&rig, "vBusy")), (1.0, 0.0));
+}
+
+/// Every init_limits read times out, so init ends in error 18 after one
+/// locate. The limits keep the template's values.
+///
+/// C defect fixed: C counted the timeouts but kept "no error".
+#[epics_base_rs::epics_test]
+async fn a_controller_silent_from_boot_is_a_comm_error() {
+    let rig = rig::start(
+        &xia_slit,
+        "xia_slit.db",
+        HV,
+        |hsc| {
+            h1(hsc);
+            hsc.set_silent(true);
+        },
+        IDS,
+    )
+    .await;
+    booted(&rig).await;
+    assert_eq!(rig.hsc.seen(), BOOT_SEEN);
+    for (pv, c) in [
+        ("error", 18.0),
+        ("hBusy", 0.0),
+        ("l.LOPR", -1.0),
+        ("l.HOPR", 10.0),
+    ] {
+        assert_eq!(v(&rig, pv), c, "{pv}");
+    }
+    assert_eq!(s(&rig, "errMsg"), "communications error");
+}
+
+/// One reply after the error clears it through the reply's `if (error)`.
+#[epics_base_rs::epics_test]
+async fn one_reply_clears_a_comm_error() {
+    let rig = boot(|_| {}).await;
+    rig.hsc.set_silent(true);
+    for _ in 0..3 {
+        locate(&rig).await;
+    }
+    assert!(eventually(|| v(&rig, "error") == 18.0).await);
+    rig.hsc.reply_to("!ALL P", "%H-1 1600 2000 DONE;");
+    rig.hsc.set_silent(false);
+    locate(&rig).await;
+    assert!(eventually(|| v(&rig, "error") == 0.0).await);
+    quiet().await;
+    assert_eq!(s(&rig, "errMsg"), "no error");
+    assert_eq!((v(&rig, "lRB"), v(&rig, "rRB")), (2.0, 3.0));
+}
+
 const CHILD: &str = "XIA_SLIT_DEBUG_CHILD";
 
 /// `DEBUG_PRINT1`'s header names the program (`seqPVmacros.h:228-231`).

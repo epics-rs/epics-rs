@@ -127,7 +127,7 @@ mod demo_db {
         "record(bo, \"RTEMS:BO\") { field(ZNAM, \"Off\") field(ONAM, \"On\") }\n",
     );
 
-    /// C6 PROBE (topology A): the 14 measurement-rig records, loaded on top of
+    /// C6 PROBE (topology A): the 15 measurement-rig records, loaded on top of
     /// [`DEMO_DB`] only under the `bringup-probes` feature (§11.7 item 3 —
     /// they are the measurement rig, not IOC content).
     ///
@@ -164,6 +164,15 @@ mod demo_db {
         // `dbCaPutLink` (`dbCa.c:627-631`).
         "record(ao, \"RTEMS:CA:UPLNK\") {\n",
         "  field(OUT, \"ca://UPSTREAM:AO\")\n",
+        "  field(PREC, \"3\") field(EGU, \"V\") field(OMSL, \"supervisory\")\n",
+        "  field(SCAN, \"Passive\")\n",
+        "}\n",
+        // The same OUT with a put callback: `devAoSoftCallback` writes with
+        // `dbPutLinkAsync` (`devAoSoftCallback.c:49`), a CA put with
+        // callback (`dbCaPutLinkCallback`, `dbCa.c:544`), and the record
+        // completes when it returns.
+        "record(ao, \"RTEMS:CA:UPLNKCB\") {\n",
+        "  field(DTYP, \"Async Soft Channel\") field(OUT, \"ca://UPSTREAM:AO\")\n",
         "  field(PREC, \"3\") field(EGU, \"V\") field(OMSL, \"supervisory\")\n",
         "  field(SCAN, \"Passive\")\n",
         "}\n",
@@ -629,6 +638,7 @@ mod ioc {
             "RTEMS:CA:DOWN",
             "RTEMS:CA:DOWN2",
             "RTEMS:CA:UPLNK",
+            "RTEMS:CA:UPLNKCB",
             "RTEMS:CA:FAST",
             "RTEMS:CA:C8",
             "RTEMS:CA:OTHER",
@@ -1653,7 +1663,7 @@ mod tests {
         }
     }
 
-    /// With the feature on, the rig is exactly the 14 records the C6
+    /// With the feature on, the rig is exactly the 15 records the C6
     /// measurement was built from, on top of the same clean demo set — so the
     /// bring-up image is one
     /// cargo flag away, not a code edit away.
@@ -1667,20 +1677,21 @@ mod tests {
             .expect("the demo + probe database must parse");
         // The demo half of this total has an owner already
         // (`the_default_database_is_clean_and_link_free`), so read it rather
-        // than restate it: this test is about the rig's own 14, and hard-coding
+        // than restate it: this test is about the rig's own 15, and hard-coding
         // the sum is what made adding `RTEMS:BO` to `DEMO_DB` fail here.
         let demo =
             epics_base_rs::server::db_loader::parse_db(crate::demo_db::DEMO_DB, &HashMap::new())
                 .expect("the demo database must parse");
         assert_eq!(
             recs.len(),
-            demo.len() + 14,
-            "the demo records plus the 14-record rig"
+            demo.len() + 15,
+            "the demo records plus the 15-record rig"
         );
         for name in [
             "RTEMS:CA:DOWN",
             "RTEMS:CA:DOWN2",
             "RTEMS:CA:UPLNK",
+            "RTEMS:CA:UPLNKCB",
             "RTEMS:CA:FAST",
             "RTEMS:CA:C1",
             "RTEMS:CA:C2",
@@ -1700,16 +1711,29 @@ mod tests {
         }
         // Both link spellings the C6 stage table asks for survive the split:
         // the bare ` CA`-modifier and the `ca://` scheme.
-        let inp = |name: &str| {
+        let field = |name: &str, field: &str| {
             recs.iter()
                 .find(|r| r.name == name)
-                .and_then(|r| r.fields.iter().find(|f| f.name == "INP"))
+                .and_then(|r| r.fields.iter().find(|f| f.name == field))
                 .map(|f| f.value.to_string())
         };
-        assert_eq!(inp("RTEMS:CA:DOWN").as_deref(), Some("UPSTREAM:AI CP"));
         assert_eq!(
-            inp("RTEMS:CA:DOWN2").as_deref(),
+            field("RTEMS:CA:DOWN", "INP").as_deref(),
+            Some("UPSTREAM:AI CP")
+        );
+        assert_eq!(
+            field("RTEMS:CA:DOWN2", "INP").as_deref(),
             Some("ca://UPSTREAM:AI CP")
+        );
+        // A CA OUT put both ways: plain from a Soft Channel ao, with a
+        // callback from an Async Soft Channel one.
+        for rec in ["RTEMS:CA:UPLNK", "RTEMS:CA:UPLNKCB"] {
+            assert_eq!(field(rec, "OUT").as_deref(), Some("ca://UPSTREAM:AO"));
+        }
+        assert_eq!(field("RTEMS:CA:UPLNK", "DTYP"), None);
+        assert_eq!(
+            field("RTEMS:CA:UPLNKCB", "DTYP").as_deref(),
+            Some("Async Soft Channel")
         );
     }
 }

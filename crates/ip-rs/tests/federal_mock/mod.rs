@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 //! A Federal ERO-1071 encoder reader, as `Federal.db` reads it: each STX the
 //! serial record writes gets the next reading, `<probe:02>` and eight blanks
 //! (`probe` takes `INT(AA)`) then the position in `AA[10,17]` (`position`),

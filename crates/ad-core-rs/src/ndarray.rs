@@ -791,7 +791,11 @@ impl Drop for NDArray {
         if let Some(PoolTie::Charged(pool)) = self.pool.take()
             && let Some(pool) = pool.upgrade()
         {
-            pool.recycle(std::mem::take(&mut self.data), self.data_size);
+            pool.recycle(
+                std::mem::take(&mut self.data),
+                std::mem::take(&mut self.dims),
+                self.data_size,
+            );
         }
     }
 }

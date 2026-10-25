@@ -27,10 +27,12 @@ pub(crate) struct PoolOnly(());
 
 /// A recycled buffer waiting in the free list, with the `data_size` the pool
 /// charged for it when it was allocated (C++ keeps the whole `NDArray`; only
-/// its buffer and its accounting are worth keeping).
+/// its buffer, its accounting and the room its dims took are worth keeping,
+/// the last standing in for C's fixed `dims[ND_ARRAY_MAX_DIMS]`).
 struct FreeBuffer {
     data: NDDataBuffer,
     data_size: usize,
+    dims: Vec<NDDimension>,
 }
 
 /// NDArray factory with free-list reuse and memory tracking.
@@ -142,6 +144,35 @@ impl NDArrayPool {
         data_type: NDDataType,
         data_size: usize,
     ) -> ADResult<NDArray> {
+        self.alloc_with_dims(|kept| *kept = dims, data_type, data_size)
+    }
+
+    /// [`alloc`](Self::alloc) of `dims` copied into the room a reused
+    /// array's dims took.
+    fn alloc_like(&self, dims: &[NDDimension], data_type: NDDataType) -> ADResult<NDArray> {
+        let num_elements: usize = dims.iter().map(|d| d.size).product();
+        self.alloc_sized_like(dims, data_type, num_elements * data_type.element_size())
+    }
+
+    /// [`alloc_sized`](Self::alloc_sized) of `dims` copied into the room a
+    /// reused array's dims took.
+    fn alloc_sized_like(
+        &self,
+        dims: &[NDDimension],
+        data_type: NDDataType,
+        data_size: usize,
+    ) -> ADResult<NDArray> {
+        self.alloc_with_dims(|kept| kept.extend_from_slice(dims), data_type, data_size)
+    }
+
+    /// The one allocation path: `set_dims` writes the new array's dims over
+    /// the cleared dims a reused array kept, or over empty ones.
+    fn alloc_with_dims(
+        &self,
+        set_dims: impl FnOnce(&mut Vec<NDDimension>),
+        data_type: NDDataType,
+        data_size: usize,
+    ) -> ADResult<NDArray> {
         let element_size = data_type.element_size();
         if data_size % element_size != 0 {
             return Err(ADError::InvalidDimensions(format!(
@@ -185,6 +216,9 @@ impl NDArrayPool {
         };
 
         if let Some(reused) = reused {
+            let mut dims = reused.dims;
+            dims.clear();
+            set_dims(&mut dims);
             let mut array = self.adopt(dims, reused.data, reused.data_size);
             array
                 .buffer_mut(PoolOnly(()))
@@ -251,6 +285,8 @@ impl NDArrayPool {
         }
         self.num_alloc_buffers.fetch_add(1, Ordering::Relaxed);
         let data = NDDataBuffer::zeros(data_type, num_elements);
+        let mut dims = Vec::new();
+        set_dims(&mut dims);
         Ok(self.adopt(dims, data, needed_bytes))
     }
 
@@ -289,14 +325,14 @@ impl NDArrayPool {
     /// overhead can make one (NDPluginCodec.cpp:466); that defect is not
     /// copied, so such a frame is charged its payload.
     fn alloc_for(&self, source: &NDArray) -> ADResult<NDArray> {
-        let dims = source.dims.clone();
+        let dims = &source.dims;
         let data_type = source.data().data_type();
         let Some(codec) = &source.codec else {
-            return self.alloc(dims, data_type);
+            return self.alloc_like(dims, data_type);
         };
         let elements: usize = dims.iter().map(|d| d.size).product();
         let uncompressed = elements * codec.original_data_type.element_size();
-        self.alloc_sized(
+        self.alloc_sized_like(
             dims,
             data_type,
             uncompressed.max(source.data().total_bytes()),
@@ -317,8 +353,12 @@ impl NDArrayPool {
     /// The destructor's half of [`release`](Self::release): put a buffer this
     /// pool charged for back on the free list. C++ release never trims it
     /// (NDArrayPool.cpp:360-366); only the next alloc evicts.
-    pub(crate) fn recycle(&self, data: NDDataBuffer, data_size: usize) {
-        self.free_list.lock().push(FreeBuffer { data, data_size });
+    pub(crate) fn recycle(&self, data: NDDataBuffer, dims: Vec<NDDimension>, data_size: usize) {
+        self.free_list.lock().push(FreeBuffer {
+            data,
+            data_size,
+            dims,
+        });
         self.num_free_buffers.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -377,7 +417,7 @@ impl NDArrayPool {
         out.unique_id = src.unique_id;
         out.copy_time_stamps_from(src);
         if copy_dimensions {
-            out.dims = src.dims.clone();
+            out.dims.clone_from(&src.dims);
         }
         out.codec = src.codec.as_ref().map(Codec::copied);
 
@@ -414,7 +454,7 @@ impl NDArrayPool {
         }
         // Allocate the output through the pool so it counts against
         // allocated_bytes / num_alloc_buffers.
-        let mut out = self.alloc(src.dims.clone(), target_type)?;
+        let mut out = self.alloc_like(&src.dims, target_type)?;
         crate::convert::convert_buffer_into(src.data(), out.buffer_mut(PoolOnly(())));
         out.unique_id = src.unique_id;
         out.copy_time_stamps_from(src);
@@ -738,7 +778,11 @@ impl SharedCharge {
 impl Drop for SharedCharge {
     fn drop(&mut self) {
         if let Some(pool) = self.pool.upgrade() {
-            pool.recycle(std::mem::take(self.parked.get_mut()), self.data_size);
+            pool.recycle(
+                std::mem::take(self.parked.get_mut()),
+                Vec::new(),
+                self.data_size,
+            );
         }
     }
 }

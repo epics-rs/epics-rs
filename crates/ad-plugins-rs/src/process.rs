@@ -952,9 +952,8 @@ impl NDPluginProcess for ProcessProcessor {
         .or(InterfaceMask::GENERIC_POINTER);
     const INTERRUPT_MASK: InterfaceMask = Self::INTERFACE_MASK;
 
-    /// C `NDPluginProcess::writeInt32` drops the base class status
-    /// (`status = (asynStatus) callParamCallbacks(addr);`, NDPluginProcess.cpp:318): a refused NDPluginDriver write keeps
-    /// its clamp and succeeds.
+    /// C `NDPluginProcess::writeInt32` drops the base refusal (NDPluginProcess.cpp:318); not copied.
+    /// A kept refusal carries the errorMessage C's `if (status)` sets (:320-323).
     ///
     /// SaveBackground/SaveFlatField save and clear themselves inside the
     /// write (:287-310); AutoOffsetScale is only stored, and the frame that
@@ -989,7 +988,16 @@ impl NDPluginProcess for ProcessProcessor {
             self.state.lock().config.auto_offset_scale_pending = value != 0;
             WriteOutcome::from(WriteVerdict::Accept(value)).settled()
         } else {
-            verdict.succeed().into()
+            match verdict {
+                WriteVerdict::Refuse { keep, .. } => WriteVerdict::Refuse {
+                    keep,
+                    message: format!(
+                        "NDPluginProcess:writeInt32: status=3, function={reason}, value={value}"
+                    ),
+                },
+                accepted => accepted,
+            }
+            .into()
         }
     }
     fn process_array(&self, array: &Arc<NDArray>, pool: &NDArrayPool) -> ProcessResult {
@@ -1288,32 +1296,16 @@ impl NDPluginProcess for ProcessProcessor {
 mod tests {
     use super::*;
 
-    /// `status = (asynStatus) callParamCallbacks(addr);` (NDPluginProcess.cpp:318).
+    /// NDPluginProcess.cpp:318 drops the base refusal; a Process port returns it.
     #[test]
-    fn a_refused_base_write_succeeds_as_c_write_int32_does() {
-        use ad_core_rs::plugin::runtime::WriteVerdict;
-        let proc = ProcessProcessor::new(ProcessConfig::default());
-        let mut base = asyn_rs::port::PortDriverBase::new(
-            "T",
-            1,
-            Default::default(),
-            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
-            asyn_rs::port::InterfaceMask::UNMIGRATED_INTERRUPTS,
+    fn a_refused_base_write_fails() {
+        let (message, function, value) = crate::test_util::refused_base_write(
+            "PROCESS_REFUSED",
+            ProcessProcessor::new(ProcessConfig::default()),
         );
-        let clamp = WriteVerdict::Refuse {
-            keep: 1,
-            message: String::new(),
-        };
         assert_eq!(
-            proc.validate_int32(
-                0,
-                0,
-                98,
-                clamp,
-                &mut ad_core_rs::plugin::runtime::WritePort::new(&mut base)
-            )
-            .verdict,
-            WriteVerdict::Accept(1)
+            message,
+            format!("NDPluginProcess:writeInt32: status=3, function={function}, value={value}")
         );
     }
     use ad_core_rs::ndarray::{NDDataView, NDDataViewMut, NDDimension};

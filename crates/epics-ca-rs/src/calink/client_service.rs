@@ -87,11 +87,11 @@ impl ClientChannel for NetChannel {
     }
 
     async fn get(&self, dbr_type: u16, count: u32) -> Result<Snapshot, String> {
-        let mut snapshot = self
+        let got = self
             .channel
-            .get_with_dbr_type(dbr_type, count)
-            .await
+            .get_callback(dbr_type, count)
             .map_err(|e| e.to_string())?;
+        let mut snapshot = got.await.map_err(|e| e.to_string())?;
         if let Some(base) = dbr_base(dbr_type) {
             snapshot.value = snapshot.value.convert_to(base);
         }

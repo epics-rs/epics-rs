@@ -2017,6 +2017,19 @@ impl CaChannel {
         }
     }
 
+    fn decode_raw_read_reply(reply: ReadReply) -> CaResult<Snapshot> {
+        match reply {
+            ReadReply::Raw {
+                data_type,
+                count,
+                data,
+            } => decode_dbr(data_type, &data, count as usize),
+            ReadReply::Plain { .. } => Err(CaError::Protocol(
+                "metadata read returned a plain scalar reply".into(),
+            )),
+        }
+    }
+
     /// Thin alias for the crate's put-framing owner,
     /// [`crate::protocol::build_put_frame`] (C
     /// `comQueSend::insertRequestWithPayLoad`). The coordinator path in
@@ -2770,15 +2783,52 @@ impl CaChannel {
         self.get_dbr_request(snap, dbr_type, count.into()).await
     }
 
+    /// `ca_array_get_callback` of exactly `dbr_type`, as
+    /// [`Self::get_with_dbr_type`] sends it: the request is sent when this
+    /// returns, and the returned future resolves with the server's answer —
+    /// with no deadline, as libca has none; a disconnect resolves it with
+    /// `CaError::Disconnected`.
+    pub fn get_callback(
+        &self,
+        dbr_type: u16,
+        count: impl Into<ReqCount>,
+    ) -> CaResult<impl std::future::Future<Output = CaResult<Snapshot>> + Send + 'static> {
+        let (ioid, reply_rx) = self.issue_read_notify(self.snapshot()?, dbr_type, count.into())?;
+        let reads = self.in_flight.reads.clone();
+        Ok(async move {
+            let reply = reply_rx.await;
+            reads.remove(&ioid);
+            Self::decode_raw_read_reply(reply.map_err(|_| CaError::Shutdown)??)
+        })
+    }
+
     /// Shared one-shot READ_NOTIFY body for the metadata/exact-type GET
-    /// paths: validate the requested element count, issue the request
-    /// with `request_type` verbatim, await the reply, and decode it.
+    /// paths: issue the request, await the reply for up to 30 s, and decode
+    /// it.
     async fn get_dbr_request(
         &self,
         snap: ChannelSnapshotPublic,
         request_type: u16,
         count: ReqCount,
     ) -> CaResult<Snapshot> {
+        let (ioid, reply_rx) = self.issue_read_notify(snap, request_type, count)?;
+        let result = epics_base_rs::runtime::task::timeout(Duration::from_secs(30), reply_rx).await;
+        self.in_flight.reads.remove(&ioid);
+        let reply = result
+            .map_err(|_| CaError::Timeout)?
+            .map_err(|_| CaError::Shutdown)??;
+        Self::decode_raw_read_reply(reply)
+    }
+
+    /// Validate the requested element count, register a raw read waiter and
+    /// send `request_type` verbatim as a `CA_PROTO_READ_NOTIFY`; the caller
+    /// owns the waiter's removal.
+    fn issue_read_notify(
+        &self,
+        snap: ChannelSnapshotPublic,
+        request_type: u16,
+        count: ReqCount,
+    ) -> CaResult<(u32, oneshot::Receiver<CaResult<ReadReply>>)> {
         // Resolve the request mode (`Fixed(0)` → native count; `Autosize`
         // passes its count through, including the `0` autosize request).
         let request_count = count.resolve(snap.element_count);
@@ -2814,23 +2864,7 @@ impl CaChannel {
             self.in_flight.reads.remove(&ioid);
             return Err(e);
         }
-
-        let result = epics_base_rs::runtime::task::timeout(Duration::from_secs(30), reply_rx).await;
-        self.in_flight.reads.remove(&ioid);
-        let reply = result
-            .map_err(|_| CaError::Timeout)?
-            .map_err(|_| CaError::Shutdown)??;
-
-        match reply {
-            ReadReply::Raw {
-                data_type,
-                count,
-                data,
-            } => decode_dbr(data_type, &data, count as usize),
-            ReadReply::Plain { .. } => Err(CaError::Protocol(
-                "metadata read returned a plain scalar reply".into(),
-            )),
-        }
+        Ok((ioid, reply_rx))
     }
 
     pub async fn put(&self, value: &EpicsValue) -> CaResult<()> {

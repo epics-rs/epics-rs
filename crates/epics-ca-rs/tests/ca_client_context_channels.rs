@@ -5,6 +5,7 @@
 #![cfg(tokio_backend)]
 #![cfg(feature = "client-core")]
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -13,8 +14,11 @@ use epics_base_rs::server::ioc_app::{IocApplication, RunOutcome};
 use epics_base_rs::server::records::ai::AiRecord;
 use epics_base_rs::types::{DBR_CTRL_DOUBLE, DBR_TIME_DOUBLE, EpicsValue};
 use epics_ca_rs::calink::{install_calink_resolver, register_calink_commands};
+use epics_ca_rs::protocol::{CA_PROTO_READ_NOTIFY, CA_PROTO_SEARCH, CaHeader};
 use epics_ca_rs::server::CaServer;
 use serial_test::serial;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 
 /// Run `db_text` through iocInit with the `ca` link set installed and the
 /// CA address list at `addr_list`, then hand the database to `body`.
@@ -187,6 +191,134 @@ async fn an_unserved_name_goes_to_the_network_context() {
         },
     )
     .await;
+    serving.join().unwrap();
+    // SAFETY: `#[serial(epics_env)]`.
+    unsafe {
+        std::env::remove_var("EPICS_CA_SERVER_PORT");
+    }
+}
+
+/// A proxy in front of a server's search port `udp` and circuit port `tcp`
+/// that relays both but swallows every `CA_PROTO_READ_NOTIFY` the client
+/// sends, so a get on a connected channel is never answered. Returns the
+/// proxy's search port.
+async fn read_swallowing_proxy(udp: u16, tcp: u16) -> u16 {
+    let search = UdpSocket::bind(("127.0.0.1", 0)).await.expect("proxy UDP");
+    let circuits = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("proxy TCP");
+    let search_port = search.local_addr().unwrap().port();
+    let circuit_port = circuits.local_addr().unwrap().port();
+    let server: SocketAddr = ([127, 0, 0, 1], udp).into();
+    tokio::spawn(async move {
+        let upstream = UdpSocket::bind(("127.0.0.1", 0))
+            .await
+            .expect("upstream UDP");
+        let mut buf = [0u8; 4096];
+        while let Ok((n, client)) = search.recv_from(&mut buf).await {
+            let _ = upstream.send_to(&buf[..n], server).await;
+            let Ok(Ok(n)) =
+                tokio::time::timeout(Duration::from_secs(1), upstream.recv(&mut buf)).await
+            else {
+                continue;
+            };
+            // The reply's data type carries the circuit port: make it ours.
+            let mut at = 0;
+            while at + CaHeader::SIZE <= n {
+                if u16::from_be_bytes([buf[at], buf[at + 1]]) == CA_PROTO_SEARCH {
+                    buf[at + 4..at + 6].copy_from_slice(&circuit_port.to_be_bytes());
+                }
+                at += CaHeader::SIZE + usize::from(u16::from_be_bytes([buf[at + 2], buf[at + 3]]));
+            }
+            let _ = search.send_to(&buf[..n], client).await;
+        }
+    });
+    tokio::spawn(async move {
+        while let Ok((client, _)) = circuits.accept().await {
+            let upstream = TcpStream::connect(("127.0.0.1", tcp))
+                .await
+                .expect("upstream TCP");
+            let ((mut cr, mut cw), (mut sr, mut sw)) = (client.into_split(), upstream.into_split());
+            tokio::spawn(async move { tokio::io::copy(&mut sr, &mut cw).await });
+            tokio::spawn(async move {
+                // Frames are scalar-sized: no extended header.
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                while let Ok(n @ 1..) = cr.read(&mut chunk).await {
+                    buf.extend_from_slice(&chunk[..n]);
+                    while buf.len() >= CaHeader::SIZE {
+                        let len =
+                            CaHeader::SIZE + usize::from(u16::from_be_bytes([buf[2], buf[3]]));
+                        if buf.len() < len {
+                            break;
+                        }
+                        let frame: Vec<u8> = buf.drain(..len).collect();
+                        let command = u16::from_be_bytes([frame[0], frame[1]]);
+                        if command != CA_PROTO_READ_NOTIFY && sw.write_all(&frame).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+            });
+        }
+    });
+    search_port
+}
+
+/// A get on a network channel is `ca_array_get_callback`, which has no
+/// deadline: one the server never answers is still waiting past the 30 s
+/// `CaChannel::get_with_dbr_type` gives up at, and ends with the disconnect.
+#[epics_macros_rs::epics_test]
+#[serial(epics_env)]
+async fn a_network_get_waits_for_its_answer_with_no_deadline() {
+    let (port_tx, port_rx) = std::sync::mpsc::channel();
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let serving = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("server runtime");
+        rt.block_on(async move {
+            let server = CaServer::builder()
+                .port(0)
+                .record("CCGET:AI", AiRecord::new(3.0))
+                .build()
+                .await
+                .expect("CA server");
+            port_tx
+                .send((server.udp_port(), server.tcp_port()))
+                .unwrap();
+            tokio::spawn(async move { server.run().await });
+            let _ = stop_rx.await;
+        });
+        rt.shutdown_timeout(Duration::from_secs(1));
+    });
+    let (udp, tcp) = port_rx.recv().expect("server ports");
+    let port = read_swallowing_proxy(udp, tcp).await;
+    // SAFETY: `#[serial(epics_env)]`.
+    unsafe {
+        std::env::set_var("EPICS_CA_AUTO_ADDR_LIST", "NO");
+        std::env::set_var("EPICS_CA_ADDR_LIST", format!("127.0.0.1:{port}"));
+        std::env::set_var("EPICS_CA_SERVER_PORT", port.to_string());
+    }
+    let db = Arc::new(PvDatabase::new());
+    let reactor = epics_base_rs::runtime::task::Reactor::current().expect("test runtime");
+    install_calink_resolver(&db, reactor).await;
+    let ai = db
+        .ca_client()
+        .create_channel("CCGET:AI")
+        .await
+        .expect("a network half is registered");
+    assert_eq!(
+        within("never connected", ai.next_connection()).await,
+        Some(Connection::Connected)
+    );
+    let mut got = ai.get(DBR_TIME_DOUBLE, 1);
+    let early = tokio::time::timeout(Duration::from_secs(31), &mut got).await;
+    assert!(early.is_err(), "the get ended unanswered: {early:?}");
+    stop_tx.send(()).unwrap();
+    let late = within("the disconnect did not end the get", got).await;
+    assert!(late.is_err(), "an unanswered get read {late:?}");
     serving.join().unwrap();
     // SAFETY: `#[serial(epics_env)]`.
     unsafe {

@@ -2034,7 +2034,7 @@ impl<'a> Gen<'a> {
                         if scans {
                             self.expr(a).e.into()
                         } else {
-                            Expr::call("seqg_rt::c::CArg::from", vec![self.arg_value(a)]).into()
+                            self.variadic_arg(a).into()
                         }
                     })
                     .collect();
@@ -2069,6 +2069,19 @@ impl<'a> Gen<'a> {
             }
             Some(CParam::Src) | None => self.arg_value(ap),
         }
+    }
+
+    /// A `printf`-like function's variadic argument as a `CArg`: a `char *`
+    /// the string it points to, another pointer its address, which is all
+    /// `%p` reads of it.
+    fn variadic_arg(&mut self, ap: NodeId) -> Expr {
+        let v = match self.pointee(ap) {
+            Some(t) if self.pointee_type(t) != C_CHAR => {
+                self.pointer(ap).method("addr", Vec::new())
+            }
+            _ => self.arg_value(ap),
+        };
+        Expr::call("seqg_rt::c::CArg::from", vec![v])
     }
 
     /// A C function's argument, passed by C's decay rule: a string or an
@@ -3676,6 +3689,27 @@ mod tests {
                 "{code}"
             );
         }
+    }
+
+    #[test]
+    fn a_variadic_pointer_is_its_address_unless_it_points_to_char() {
+        // array.st:46 testDiag("a4ps[%d]=%p", i, a4ps[i])
+        let (code, diag) = translate(
+            "program p\nstring s;\nint a[3];\nint *ip;\nchar *cp;\nint x;\nss a {\nstate z {\n\
+             when () {\nprintf(\"%p %p %p %p %s %s\", ip, a, &x, &a[1], s, cp);\n} state z\n}\n}\n",
+        );
+        assert_eq!(diag, "");
+        let args = [
+            "seqg_var.ip.get().addr()",
+            "seqg_rt::Ptr::from(&seqg_var.a).addr()",
+            "seqg_var.x.ptr().addr()",
+            "seqg_var.a.at(1).ptr().addr()",
+            "&seqg_var.s",
+            "seqg_var.cp.get()",
+        ]
+        .map(|a| format!("seqg_rt::c::CArg::from({a})"))
+        .join(", ");
+        assert!(code.contains(&format!("&[{args}]")), "{code}");
     }
 
     #[test]

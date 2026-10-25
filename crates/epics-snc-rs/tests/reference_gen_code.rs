@@ -116,10 +116,6 @@ const EXPECTED_FAILURES: &[(&str, &str)] = &[
         "XPS_trajectoryScan.st:165: error: snc-rs does not support assignment through a pointer",
     ),
     (
-        "sequencer/test/validate/array.st",
-        "array.st:46: error[E0277]: the trait bound `epics_seq_rs::c::CArg<'_>: From<Ptr<[SeqString; 5]>>` is not satisfied: the trait `From<Ptr<[SeqString; 5]>>` is not implemented for `epics_seq_rs::c::CArg<'_>`",
-    ),
-    (
         "sequencer/test/validate/sizeof.st",
         "sizeof.st:21: error: snc-rs cannot compute this sizeof",
     ),

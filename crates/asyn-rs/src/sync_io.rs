@@ -24,7 +24,8 @@ use epics_libcom_rs::cfmt::CFloat;
 pub struct SyncIOHandle {
     link: Arc<Link>,
     addr: i32,
-    timeout: Duration,
+    /// `None` is C's negative timeout: wait forever.
+    timeout: Option<Duration>,
 }
 
 /// Where a C SyncIO `connect` left its asynUser.
@@ -92,7 +93,7 @@ impl SyncIOHandle {
         Self {
             link: Arc::new(Link::Port(handle)),
             addr,
-            timeout,
+            timeout: Some(timeout),
         }
     }
 
@@ -143,7 +144,7 @@ impl SyncIOHandle {
             Self {
                 link: Arc::new(link),
                 addr,
-                timeout,
+                timeout: Some(timeout),
             },
             status,
         )
@@ -198,10 +199,10 @@ impl SyncIOHandle {
         self.user_with(reason, self.timeout)
     }
 
-    fn user_with(&self, reason: usize, timeout: Duration) -> AsynUser {
+    fn user_with(&self, reason: usize, timeout: Option<Duration>) -> AsynUser {
         let user = AsynUser::new(reason)
             .with_addr(self.addr)
-            .with_timeout(timeout);
+            .with_timeout_opt(timeout);
         match self.device() {
             Some(handle) => user.locking_port(handle),
             None => user,
@@ -212,6 +213,17 @@ impl SyncIOHandle {
     /// (asynOctetSyncIO.c:187, :213, :245, asynInt32SyncIO.c:139): every call
     /// through the copy passes it, and `self` keeps its own.
     pub fn with_timeout(&self, timeout: Duration) -> Self {
+        self.with_timeout_opt(Some(timeout))
+    }
+
+    /// [`Self::with_timeout`] with C's negative `timeout`: a read that waits
+    /// as long as the device takes, as `pasynOctetSyncIO->read(..., -1.0, ...)`
+    /// does.
+    pub fn waiting_forever(&self) -> Self {
+        self.with_timeout_opt(None)
+    }
+
+    fn with_timeout_opt(&self, timeout: Option<Duration>) -> Self {
         Self {
             link: Arc::clone(&self.link),
             addr: self.addr,
@@ -224,7 +236,7 @@ impl SyncIOHandle {
     /// value — accessor exists primarily for asyn upstream issue #220
     /// regression coverage (`pasynOctetSyncIO->read` mutated the
     /// caller's `pasynUser->timeout`; we cannot, by construction).
-    pub fn timeout(&self) -> Duration {
+    pub fn timeout(&self) -> Option<Duration> {
         self.timeout
     }
 
@@ -394,7 +406,7 @@ impl SyncIOHandle {
     /// C `pasynOctetSyncIO->flush` (asynOctetSyncIO.c:278-299), which passes
     /// 1 s whatever the user's timeout.
     pub fn flush(&self, reason: usize) -> AsynResult<()> {
-        let user = self.user_with(reason, Duration::from_secs(1));
+        let user = self.user_with(reason, Some(Duration::from_secs(1)));
         self.transfer(user, RequestOp::Flush, |_| {
             self.device_line(reason, format_args!("asynOctetSyncIO flush\n"));
         })?;
@@ -441,7 +453,11 @@ impl SyncIOHandle {
             _ => self.port()?,
         };
         let (addr, timeout) = (self.addr, self.timeout);
-        let user = move || AsynUser::new(reason).with_addr(addr).with_timeout(timeout);
+        let user = move || {
+            AsynUser::new(reason)
+                .with_addr(addr)
+                .with_timeout_opt(timeout)
+        };
         let trace = handle.trace().clone();
         let port = handle.port_name().to_owned();
         handle.lock_port_blocking(user(), move |calls| {
@@ -748,9 +764,10 @@ mod tests {
         assert_eq!(*seq.lock().unwrap(), vec!["flush", "write", "read"]);
     }
 
-    /// C SyncIO takes its timeout on every call, and `flush` its own 1 s
-    /// (asynOctetSyncIO.c:187, :213, :245, :285): the driver sees that call's
-    /// timeout, on the caller's thread under queueLockPort.
+    /// C SyncIO takes its timeout on every call, a negative one waiting
+    /// forever, and `flush` its own 1 s (asynOctetSyncIO.c:187, :213, :245,
+    /// :285): the driver sees that call's timeout, on the caller's thread under
+    /// queueLockPort.
     #[test]
     fn a_per_call_timeout_reaches_the_driver_on_the_caller() {
         use std::sync::{Arc, Mutex};
@@ -805,6 +822,7 @@ mod tests {
             .unwrap();
         sio.flush(0).unwrap();
         sio.write_octet(0, b"y").unwrap();
+        sio.waiting_forever().write_octet(0, b"z").unwrap();
 
         let caller = std::thread::current().name().map(str::to_owned);
         let secs = |s| Some(Duration::from_secs(s));
@@ -813,7 +831,8 @@ mod tests {
             [
                 ("write", secs(7), caller.clone()),
                 ("flush", secs(1), caller.clone()),
-                ("write", secs(3), caller),
+                ("write", secs(3), caller.clone()),
+                ("write", None, caller),
             ]
         );
     }

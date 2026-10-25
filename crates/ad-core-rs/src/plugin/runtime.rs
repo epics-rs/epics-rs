@@ -4229,8 +4229,8 @@ fn plugin_data_loop<P: NDPluginProcess>(
                             // runs on a callback thread. Only `driverCallback`'s
                             // blocking arm (`:419-422`) runs the work on the
                             // writer's own thread, which is the inline branch
-                            // below.
-                            if reason == process_plugin_reason && value.as_i32() != 0 {
+                            // below. Any value triggers it, 0 included (`:755`).
+                            if reason == process_plugin_reason {
                                 let cached = shared.lock().prev_input_array.clone();
                                 let blocking = blocking_mode.load(Ordering::Acquire);
                                 match cached {
@@ -9790,6 +9790,49 @@ mod tests {
             reprocessed.unique_id, 7,
             "ProcessPlugin re-emits last input"
         );
+    }
+
+    #[test]
+    fn test_process_plugin_zero_reprocesses_last_input() {
+        // C NDPluginDriver.cpp:755 re-injects on any ProcessPlugin write, so
+        // `caput ProcessPlugin 0` re-processes too.
+        let (downstream_sender, mut downstream_rx) = ndarray_channel("DOWNSTREAM", 10);
+        let mut output = NDArrayOutput::new();
+        output.add(downstream_sender);
+
+        let (handle, _data_jh) = create_plugin_runtime_with_output(
+            &asyn_rs::asyn_record::claim_port("PROCESS_PLUGIN_ZERO_TEST").unwrap(),
+            PassthroughProcessor,
+            1_000_000,
+            10,
+            0,
+            output,
+            "",
+            test_wiring(),
+            DEFAULT_PLUGIN_THREADS,
+        );
+        enable_callbacks(&handle);
+
+        send_array(handle.array_sender(), make_test_array(7));
+        assert_eq!(downstream_rx.blocking_recv().unwrap().unique_id, 7);
+
+        handle
+            .port_runtime()
+            .port_handle()
+            .write_int32_blocking(handle.plugin_params.process_plugin, 0, 0)
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let reprocessed = loop {
+            if let Some(msg) = downstream_rx.try_recv_msg() {
+                break msg;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "ProcessPlugin 0 re-emits last input"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        assert_eq!(reprocessed.array.array().unique_id, 7);
     }
 
     #[test]

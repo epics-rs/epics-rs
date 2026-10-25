@@ -27,7 +27,10 @@ const ACF: &str =
 
 /// Owner path: st.cmd `asSetFilename` + `asInit` → the parsed policy is
 /// live in `IocRunConfig.acf` — the very cell the protocol runner hands
-/// its servers — by the time the runner is entered.
+/// its servers — by the time the runner is entered. Had the script's
+/// `asInit` filled a shell-local copy, `iocInit`'s own `asInit` would find
+/// the cell empty and refuse (`asDbLib.c` `S_asLib_asNotActive`), and the
+/// runner would never be entered.
 #[epics_macros_rs::epics_test]
 async fn script_asinit_lands_in_the_run_config_cell() {
     let acf_file = tempfile::Builder::new().suffix(".acf").tempfile().unwrap();
@@ -36,6 +39,8 @@ async fn script_asinit_lands_in_the_run_config_cell() {
     let mut script = tempfile::Builder::new().suffix(".cmd").tempfile().unwrap();
     writeln!(script, "asSetFilename(\"{}\")", acf_file.path().display()).unwrap();
     writeln!(script, "asInit").unwrap();
+    // Without it the script is a custom `main`'s and the runner never runs.
+    writeln!(script, "iocInit").unwrap();
 
     IocApplication::new()
         .startup_script(script.path().to_str().unwrap())

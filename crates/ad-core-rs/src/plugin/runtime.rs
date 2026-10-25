@@ -564,10 +564,17 @@ impl<T: Clone> WriteVerdict<T> {
         }
     }
 
-    /// Keep the value and drop the failure, as a C override does when it
-    /// overwrites the base class status with `status = callParamCallbacks()`.
-    pub fn succeed(self) -> Self {
-        Self::Accept(self.kept())
+    /// The override's verdict over the base class's `base`: a base refusal
+    /// stands with its clamp, carrying the override's message if it refused
+    /// too. C overrides that overwrite the base status (e.g.
+    /// NDPluginStats.cpp:700) or store over its clamp (NDPluginCodec.cpp:1031)
+    /// let a refused write succeed; not copied.
+    fn under(self, base: Self) -> Self {
+        match (base, self) {
+            (Self::Refuse { keep, .. }, Self::Refuse { message, .. })
+            | (Self::Refuse { keep, message }, Self::Accept(_)) => Self::Refuse { keep, message },
+            (Self::Accept(_), own) => own,
+        }
     }
 
     fn into_result(self) -> AsynResult<()> {
@@ -1293,7 +1300,8 @@ pub trait NDPluginProcess: Send + Sync + 'static {
     /// write fails, and what else C sets and prints on the way. `verdict` is
     /// what C `NDPluginDriver::writeInt32` leaves for the base class params
     /// (`Accept(value)` for every other param), as the override that calls
-    /// it sees the status. `params` is the parameter library before the
+    /// it sees the status; a base refusal stands, with its clamp, whatever
+    /// the override returns. `params` is the parameter library before the
     /// store, which the override posts into only where C calls back in the
     /// middle of the write. `on_param_change` then sees the kept value. The default keeps
     /// the base verdict, as a plugin with no override does.
@@ -2962,8 +2970,7 @@ impl PortDriver for PluginPortDriver {
             self.base.trace_print(*mask, format_args!("{line}"));
         }
         // The thread pool runs what `createCallbackThreads` settled on
-        // (`numThreads_`), even where an override then stores another value
-        // in the param (NDPluginCodec.cpp:1031).
+        // (`numThreads_`).
         let p = &self.plugin_params;
         let runs = (reason == p.num_threads || reason == p.queue_size).then(|| base.verdict.kept());
         if self.validator.posts_before_write(reason, value) {
@@ -2981,10 +2988,11 @@ impl PortDriver for PluginPortDriver {
             reason,
             addr,
             value,
-            base.verdict,
+            base.verdict.clone(),
             &mut self.base,
             self.hand_on.get(),
         );
+        let verdict = verdict.under(base.verdict);
         let value = verdict.kept();
         let own = self.is_own(reason);
         let (at, zero) = self.int32_epilogue.stores(addr, own);
@@ -4548,10 +4556,9 @@ mod tests {
     }
 
     /// Clamps `LIMIT` to 0..=10 and reverts any negative `GAIN`, as C plugin
-    /// overrides do; mirrors `LIMIT` into `TWICE`; forgives a base refusal of
-    /// 999 as an override that overwrites the status does, and stores 998
-    /// over the base clamp as NDPluginCodec does; records what reached the
-    /// data plane.
+    /// overrides do; mirrors `LIMIT` into `TWICE`; accepts a base refusal of
+    /// 999 as a C override that overwrites the status does, and 998 over the
+    /// base clamp as NDPluginCodec does; records what reached the data plane.
     #[derive(Default)]
     struct ValidatingProcessor {
         addrs: usize,
@@ -4602,7 +4609,7 @@ mod tests {
             }
             if reason != self.limit {
                 return match value {
-                    999 => verdict.succeed().into(),
+                    999 => WriteVerdict::Accept(verdict.kept()).into(),
                     998 => WriteVerdict::Accept(value).into(),
                     _ => verdict.into(),
                 };
@@ -4733,6 +4740,27 @@ mod tests {
         }
     }
 
+    /// A base refusal stands, with its clamp, over every override verdict;
+    /// an accepted base write ends with the override's.
+    #[test]
+    fn an_override_cannot_drop_a_base_refusal() {
+        let refuse = |keep, message: &str| WriteVerdict::Refuse {
+            keep,
+            message: message.into(),
+        };
+        let base = refuse(4, "");
+        for own in [WriteVerdict::Accept(4), WriteVerdict::Accept(98)] {
+            assert_eq!(own.under(base.clone()), base);
+        }
+        assert_eq!(refuse(9, "own").under(base), refuse(4, "own"));
+        let accepted = WriteVerdict::Accept(5);
+        assert_eq!(
+            WriteVerdict::Accept(7).under(accepted.clone()),
+            WriteVerdict::Accept(7)
+        );
+        assert_eq!(refuse(9, "own").under(accepted), refuse(9, "own"));
+    }
+
     /// The port asks the plugin before it stores: a clamp is stored and
     /// fails, a revert keeps the old value, fails, and never reaches
     /// `on_param_change`.
@@ -4765,19 +4793,23 @@ mod tests {
         assert_eq!(port.read_int32_blocking(limit, 0).unwrap(), 10);
         assert_eq!(port.read_int32_blocking(twice, 0).unwrap(), 20);
 
-        // The base clamp reaches the override, which may keep its failure or
-        // drop it; the clamp is stored either way.
+        // The base clamp and failure stand, whether the override keeps the
+        // failure, accepts the clamp or accepts the written value.
         let num_threads = handle.plugin_params.num_threads;
-        assert!(port.write_int32_blocking(num_threads, 0, 50).is_err());
-        assert!(port.write_int32_blocking(num_threads, 0, 999).is_ok());
         let max = port
             .read_int32_blocking(handle.plugin_params.max_threads, 0)
             .unwrap();
-        assert_eq!(port.read_int32_blocking(num_threads, 0).unwrap(), max);
-        // An override that stores the written value over the clamp leaves
-        // the pool running the clamp, as C's `numThreads_` does.
-        assert!(port.write_int32_blocking(num_threads, 0, 998).is_ok());
-        assert_eq!(port.read_int32_blocking(num_threads, 0).unwrap(), 998);
+        for written in [50, 999, 998] {
+            assert!(
+                port.write_int32_blocking(num_threads, 0, written).is_err(),
+                "{written}"
+            );
+            assert_eq!(
+                port.read_int32_blocking(num_threads, 0).unwrap(),
+                max,
+                "{written}"
+            );
+        }
 
         assert!(port.write_float64_blocking(gain, 0, 2.0).is_ok());
         assert!(port.write_float64_blocking(gain, 0, -1.0).is_err());

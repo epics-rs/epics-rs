@@ -705,11 +705,11 @@ record(sscan, "S") {
   field(ATIME, "0.1")
 }"#;
 
-/// C's array posts name `posBufPtr[i].pBufA`/`pBufB`; `PnCA`'s address is
-/// `p_ca`, which nothing sets, so no post reaches it (sscanRecord.c:545,
-/// :1880, :2213-2219, :5373-5374).
+/// C's array posts name `posBufPtr[i].pBufA`/`pBufB`, and `PnCA`'s address
+/// is `p_ca`, which C never sets (CBUG-AB4, sscanRecord.c:545, :1880,
+/// :2212-2213, :5372-5373). Every post of the buffers reaches `PnCA` here.
 #[epics_base_rs::epics_test]
-async fn no_scan_or_preview_post_reaches_a_positioner_ca() {
+async fn every_scan_and_preview_post_reaches_a_positioner_ca() {
     let db = ioc(POSTED).await;
     connected(&db, "S", &["P1NV", "D01NV", "T1NV"]).await;
     let mut ra = DbSubscription::subscribe(&db, "S.P1RA").await.unwrap();
@@ -719,10 +719,15 @@ async fn no_scan_or_preview_post_reaches_a_positioner_ca() {
     events(&mut ca);
     start(&db, "S").await;
     finished(&db, "S").await;
+    sleep(Duration::from_millis(100)).await;
+    let scanned = events(&mut ra);
+    assert!(scanned > 0);
+    assert_eq!(events(&mut ca), scanned, "P1CA through the scan");
     put_field(&db, "S", "CMND", EpicsValue::Enum(2)).await;
     sleep(Duration::from_millis(100)).await;
-    assert!(events(&mut ra) > 0);
-    assert_eq!(events(&mut ca), 0);
+    let previewed = events(&mut ra);
+    assert!(previewed > 0);
+    assert_eq!(events(&mut ca), previewed, "P1CA through the preview");
 }
 
 /// C's `nullArray` post reaches only detectors without buffers; D01-D04

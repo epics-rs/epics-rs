@@ -1225,11 +1225,10 @@ impl SscanRecord {
     }
 
     /// C's posts of both buffers of every positioner and acquired detector,
-    /// then of `nullArray`. They reach `PnRA` but never `PnCA`, whose address
-    /// is `p_ca`, which C never sets (sscanRecord.c:545, :1880).
+    /// then of `nullArray`.
     pub(crate) fn post_arrays(&mut self, mask: EventMask) {
         for i in 0..NUM_POS {
-            self.post_mask(pf(i, p::RA), mask);
+            self.post_pos_buffers(i, mask);
         }
         for i in 0..NUM_DET {
             if self.acq[i] {
@@ -1238,6 +1237,14 @@ impl SscanRecord {
             }
         }
         self.post_null_served(mask);
+    }
+
+    /// C's post of positioner `i`'s buffers. C addresses `PnRA` at `pBufA`
+    /// but `PnCA` at `p_ca`, which it never sets, so no post reaches `PnCA`
+    /// (CBUG-AB4, sscanRecord.c:822, :1880); both are posted here.
+    pub(crate) fn post_pos_buffers(&mut self, i: usize, mask: EventMask) {
+        self.post_mask(pf(i, p::RA), mask);
+        self.post_mask(pf(i, p::CA), mask);
     }
 
     /// C's post of `nullArray`. It reaches a detector's `DnnDA`/`DnnCA` only

@@ -929,7 +929,7 @@ impl SscanRecord {
                     det[j] = det[j - 1];
                 }
             }
-            self.post(pf(i, p::RA));
+            self.post_pos_buffers(i, EventMask::VALUE);
             self.post(df(i, d::DA));
             self.post(df(i, d::CA));
             self.post_null_served(EventMask::VALUE);

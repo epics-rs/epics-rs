@@ -47,7 +47,7 @@ macro_rules! seqg_escaped {
             (&v.yMotName, "M_Y"),
         ] {
             let m = $env.mac_value_get(motor);
-            if p.is_none() || m.is_none() {
+            if p.is_null() || m.is_null() {
                 sprintf(name, "None", &[]);
             } else {
                 sprintf(name, "%s%s", &[CArg::from(p.clone()), CArg::from(m)]);

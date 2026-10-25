@@ -19,7 +19,7 @@ use std::sync::Arc;
 use epics_base_rs::types::{EpicsValue, PvString};
 use parking_lot::Mutex;
 
-use crate::types::{CharPtr, SeqString};
+use crate::types::SeqString;
 
 /// The value a variable holds before `seqg_init` runs: C's `calloc` (`+r`)
 /// or static zero (`-r`).
@@ -55,7 +55,6 @@ zeroed_scalar!(
     f32 = 0.0,
     f64 = 0.0,
     SeqString = SeqString::new(),
-    CharPtr = None,
 );
 
 impl<T: Zeroed, const N: usize> Zeroed for [T; N] {
@@ -434,6 +433,20 @@ impl<T: Send> Run<T> for Cell<T> {
     }
 }
 
+/// A read-only run: a string literal, or a string the run time hands out.
+struct Fixed<T>(Arc<[T]>);
+
+impl<T: Send + Sync> Run<T> for Fixed<T> {
+    fn read(&self, f: &mut dyn FnMut(&[T])) {
+        f(&self.0)
+    }
+
+    /// C's write to a string literal is undefined.
+    fn write(&self, _: &mut dyn FnMut(&mut [T])) {
+        panic!("write through a pointer to a string literal")
+    }
+}
+
 /// The elements of the array a pointer points at.
 struct Elems<A: 'static>(Ptr<A>);
 
@@ -497,25 +510,36 @@ impl<T> Ptr<T> {
         (&*t.run, i)
     }
 
-    fn read<R>(&self, f: impl FnOnce(&T) -> R) -> R {
+    /// Run `f` on the elements from this one to the end of its run, under
+    /// the lock of the variable it points into.
+    pub(crate) fn with_rest<R>(&self, f: impl FnOnce(&[T]) -> R) -> R {
         let (run, i) = self.target();
         let (mut f, mut r) = (Some(f), None);
         run.read(&mut |s| {
-            let v = s.get(i).expect("pointer past its object");
-            r = f.take().map(|f| f(v));
+            let rest = s.get(i..).expect("pointer past its object");
+            r = f.take().map(|f| f(rest));
         });
         r.expect("a run calls back once")
     }
 
-    /// [`Place::modify`]: C's `*p` written.
-    pub fn modify<R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
+    /// [`Self::with_rest`], written.
+    pub(crate) fn with_rest_mut<R>(&self, f: impl FnOnce(&mut [T]) -> R) -> R {
         let (run, i) = self.target();
         let (mut f, mut r) = (Some(f), None);
         run.write(&mut |s| {
-            let v = s.get_mut(i).expect("pointer past its object");
-            r = f.take().map(|f| f(v));
+            let rest = s.get_mut(i..).expect("pointer past its object");
+            r = f.take().map(|f| f(rest));
         });
         r.expect("a run calls back once")
+    }
+
+    fn read<R>(&self, f: impl FnOnce(&T) -> R) -> R {
+        self.with_rest(|s| f(s.first().expect("pointer past its object")))
+    }
+
+    /// [`Place::modify`]: C's `*p` written.
+    pub fn modify<R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
+        self.with_rest_mut(|s| f(s.first_mut().expect("pointer past its object")))
     }
 
     /// C's `*p` read.
@@ -535,6 +559,15 @@ impl<T> Ptr<T> {
         let size = std::mem::size_of::<T>() as isize;
         let t = self.0.as_ref()?;
         Some(t.base.wrapping_add_signed(t.index * size))
+    }
+}
+
+impl Ptr<c_char> {
+    /// A read-only C string of `bytes` and a terminating NUL: a string
+    /// literal, or a string the run time hands out.
+    pub fn from_bytes(bytes: &[u8]) -> Self {
+        let run: Arc<[c_char]> = bytes.iter().map(|&b| b as c_char).chain([0]).collect();
+        Ptr::along(Arc::new(Fixed(run)), 0)
     }
 }
 
@@ -790,6 +823,20 @@ mod tests {
     fn a_difference_across_variables_panics() {
         let (a, b) = (SeqVar::new([1i32, 2]), SeqVar::new([1i32, 2]));
         a.at(0).ptr().diff(&b.at(0).ptr());
+    }
+
+    #[test]
+    fn a_c_string_reads_up_to_its_terminator() {
+        let p = Ptr::from_bytes(b"ab");
+        assert_eq!(p.offset(1).get(), b'b' as c_char);
+        assert_eq!(p.offset(2).get(), 0);
+        assert_ne!(p, Ptr::from_bytes(b"ab"));
+    }
+
+    #[test]
+    #[should_panic(expected = "write through a pointer to a string literal")]
+    fn a_write_through_a_c_string_panics() {
+        Ptr::from_bytes(b"ab").set(0);
     }
 
     #[test]

@@ -245,7 +245,7 @@ pub(crate) fn name_motors<V: ProgramVars>(
     let p = env.mac_value_get("P");
     for (macro_name, name) in ["M_THETA", "M_Y", "M_Z"].into_iter().zip(names) {
         let m = env.mac_value_get(macro_name);
-        if p.is_none() || m.is_none() {
+        if p.is_null() || m.is_null() {
             strcpy(name, "??????");
         } else {
             sprintf(name, "%s%s", &[CArg::from(p.clone()), CArg::from(m)]);

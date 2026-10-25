@@ -379,7 +379,7 @@ mod tests {
             timestamp: WallTime::from_unix(secs, 0),
             status: PvStat::Hihi,
             severity: PvSevr::Major,
-            message: None,
+            message: crate::types::CharPtr::default(),
         }
     }
 

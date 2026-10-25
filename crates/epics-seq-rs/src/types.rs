@@ -1,8 +1,6 @@
 //! The value types of the snc→seq contract: `pvAlarm.h`, `pvType.h`,
 //! `seq_prim_types.h`, `seq_mask.h` and the scalar definitions of `seqCom.h`.
 
-use std::sync::Arc;
-
 /// `MAX_STRING_SIZE`: the bytes of an SNL `string`, terminating NUL included.
 pub const MAX_STRING_SIZE: usize = 40;
 
@@ -290,9 +288,10 @@ impl std::fmt::Debug for SeqString {
 }
 
 /// A C `char *` an SNL program holds: what `macValueGet`, `pvName` and
-/// `pvMessage` return, and the type of a `char *` program variable. `None`
-/// is the null pointer.
-pub type CharPtr = Option<Arc<[u8]>>;
+/// `pvMessage` return, and the type of a `char *` program variable. It
+/// points into a variable as C's does (`p = stringIn` sees later writes to
+/// `stringIn`), or into a read-only string ([`crate::Ptr::from_bytes`]).
+pub type CharPtr = crate::var::Ptr<std::ffi::c_char>;
 
 #[cfg(test)]
 mod tests {

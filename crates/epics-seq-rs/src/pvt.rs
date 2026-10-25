@@ -47,7 +47,7 @@ impl PvMeta {
             timestamp: epics_epoch(),
             status: PvStat::Ok,
             severity: PvSevr::None,
-            message: None,
+            message: CharPtr::default(),
         }
     }
 }

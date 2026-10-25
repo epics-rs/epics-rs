@@ -7,8 +7,6 @@
 // SNL calls these by their C names.
 #![allow(non_snake_case)]
 
-use std::sync::Arc;
-
 use crate::data::chantler::{FILTER_MATERIALS, attenuation};
 use epics_seq_rs::c::*;
 use epics_seq_rs::{CharPtr, Place};
@@ -44,7 +42,7 @@ fn cvtToBin<B: CBuf>(buff: &impl Place<B>, val: i32, nBits: i32) -> CharPtr {
         s.fill(b'*');
     }
     strcpy(buff, &s[..]);
-    Some(buff.modify(|b| Arc::from(b.bytes_mut().split(|&c| c == 0).next().unwrap_or(&[]))))
+    buff.modify(|b| CharPtr::from_bytes(b.bytes_mut().split(|&c| c == 0).next().unwrap_or(&[])))
 }
 
 /// `calcTrans` (`filterDrive.st:267-317`): the transmission of `thickness`
@@ -128,7 +126,7 @@ mod tests {
     /// `cvtToBin`'s result, and what it left in the buffer.
     fn bin(val: i32, nBits: i32) -> (String, String) {
         let buff = SeqVar::new(SeqString::new());
-        let r = cvtToBin(&buff, val, nBits).unwrap();
+        let r = cvtToBin(&buff, val, nBits).to_c_vec();
         let s = |b: &[u8]| String::from_utf8(b.to_vec()).unwrap();
         (s(&r), buff.modify(|b| s(b.as_bytes())))
     }

@@ -366,8 +366,13 @@ fn meta(status: PvStat, severity: PvSevr, message: &str, secs: u64) -> PvMeta {
         timestamp: WallTime::from_unix(secs, 0),
         status,
         severity,
-        message: Some(Arc::from(message.as_bytes())),
+        message: CharPtr::from_bytes(message.as_bytes()),
     }
+}
+
+/// A `char *` as its bytes, `None` for null.
+fn c_str(p: CharPtr) -> Option<Vec<u8>> {
+    (!p.is_null()).then(|| p.to_c_vec())
 }
 
 fn synced(prog: &Program<Vars>, ef: u32) -> Vec<ChId> {
@@ -378,12 +383,12 @@ fn synced(prog: &Program<Vars>, ef: u32) -> Vec<ChId> {
 fn an_unassigned_channel_reports_its_variable() {
     let p = reentrant(1);
     let s = ss(&p, 0);
-    assert_eq!(s.pv_name(W), None);
+    assert_eq!(c_str(s.pv_name(W)), None);
     assert_eq!(s.pv_count(W), 4);
     assert!(!s.pv_assigned(W));
     assert_eq!(s.pv_status(W), PvStat::Ok);
     assert_eq!(s.pv_severity(W), PvSevr::OK);
-    assert_eq!(s.pv_message(W).as_deref(), Some(&b""[..]));
+    assert_eq!(c_str(s.pv_message(W)).as_deref(), Some(&b""[..]));
     let before = WallTime::now();
     assert!(s.pv_time_stamp(W) >= before);
 }
@@ -395,12 +400,12 @@ fn an_assigned_channel_reports_the_pv() {
     p.chans[W.index()].db_count.store(2, Ordering::Relaxed);
     *p.chans[W.index()].var_lock.lock() = meta(PvStat::Hihi, PvSevr::Major, "hihi", 1_000_000_000);
     let s = ss(&p, 0);
-    assert_eq!(s.pv_name(W).as_deref(), Some(&b"xxx:w"[..]));
+    assert_eq!(c_str(s.pv_name(W)).as_deref(), Some(&b"xxx:w"[..]));
     assert_eq!(s.pv_count(W), 2);
     assert!(s.pv_assigned(W));
     assert_eq!(s.pv_status(W), PvStat::Hihi);
     assert_eq!(s.pv_severity(W), PvSevr::Major);
-    assert_eq!(s.pv_message(W).as_deref(), Some(&b"hihi"[..]));
+    assert_eq!(c_str(s.pv_message(W)).as_deref(), Some(&b"hihi"[..]));
     assert_eq!(s.pv_time_stamp(W), WallTime::from_unix(1_000_000_000, 0));
 }
 
@@ -414,7 +419,7 @@ fn safe_mode_reports_the_state_set_s_meta_data() {
     let s = ss(&p, 1);
     assert_eq!(s.pv_status(N), PvStat::Lolo);
     assert_eq!(s.pv_severity(N), PvSevr::Minor);
-    assert_eq!(s.pv_message(N).as_deref(), Some(&b"own"[..]));
+    assert_eq!(c_str(s.pv_message(N)).as_deref(), Some(&b"own"[..]));
     assert_eq!(s.pv_time_stamp(N), WallTime::from_unix(2, 0));
     assert_eq!(ss(&p, 0).pv_status(N), PvStat::Ok);
 }
@@ -495,8 +500,8 @@ fn delay_lowers_the_wakeup_to_the_earliest_unexpired_delay() {
 #[test]
 fn mac_value_get_reads_the_program_s_macros() {
     let s = ss(&reentrant(1), 0);
-    assert_eq!(s.mac_value_get("P").as_deref(), Some(&b"xxx:"[..]));
-    assert_eq!(s.mac_value_get("R"), None);
+    assert_eq!(c_str(s.mac_value_get("P")).as_deref(), Some(&b"xxx:"[..]));
+    assert_eq!(c_str(s.mac_value_get("R")), None);
 }
 
 #[test]
@@ -594,7 +599,7 @@ fn pv_get_q_takes_the_alarm_and_stamp_but_not_the_message() {
         assert_eq!(s.pv_status(Q), PvStat::Hihi);
         assert_eq!(s.pv_severity(Q), PvSevr::Major);
         assert_eq!(s.pv_time_stamp(Q), WallTime::from_unix(7, 0));
-        assert_eq!(s.pv_message(Q), None);
+        assert_eq!(c_str(s.pv_message(Q)), None);
     }
 }
 
@@ -665,8 +670,7 @@ fn meta_of(s: &StateSet<Vars>, ch: ChId) -> (PvStat, PvSevr, Option<String>) {
     (
         s.pv_status(ch),
         s.pv_severity(ch),
-        s.pv_message(ch)
-            .map(|m| String::from_utf8_lossy(&m).into_owned()),
+        c_str(s.pv_message(ch)).map(|m| String::from_utf8_lossy(&m).into_owned()),
     )
 }
 
@@ -1211,8 +1215,7 @@ fn pv_put_cancel_of_an_unassigned_channel_is_a_user_error_unless_safe() {
 }
 
 fn name_of(s: &StateSet<Vars>, ch: ChId) -> Option<String> {
-    s.pv_name(ch)
-        .map(|n| String::from_utf8_lossy(&n).into_owned())
+    c_str(s.pv_name(ch)).map(|n| String::from_utf8_lossy(&n).into_owned())
 }
 
 /// The channel counts again as `count` elements; `monitored` is the
@@ -1243,7 +1246,7 @@ fn pv_assign_of_a_null_name_unassigns() {
     assign(&p, N, "xxx:n", true);
     assign(&p, W, "xxx:w", false);
     let s = ss(&p, 0);
-    let null: CharPtr = None;
+    let null = CharPtr::default();
     assert_eq!(s.pv_assign(N, null.clone()), PvStat::Ok);
     assert_eq!(s.pv_assign(W, SeqVar::new(null)), PvStat::Ok);
     assert!(!s.pv_assigned(N) && !s.pv_assigned(W));

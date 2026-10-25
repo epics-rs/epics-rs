@@ -10,8 +10,8 @@
 //! good; and a monitor-on clears the flag without the decrement, counting
 //! the next event twice.
 
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, LazyLock};
 
 use epics_base_rs::runtime::log::{ErrlogSevEnum, errlog_sev_vprintf};
 use epics_base_rs::server::snapshot::Snapshot;
@@ -326,7 +326,7 @@ impl<V: ProgramVars> Program<V> {
             if let Some(value) = ev.value {
                 let elem = QueueElem {
                     value: value.value.clone(),
-                    meta: value_meta(value, None),
+                    meta: value_meta(value, CharPtr::default()),
                 };
                 if self.queues[def.queue_index as usize].put(elem) {
                     errlog_sev_vprintf(
@@ -340,11 +340,11 @@ impl<V: ProgramVars> Program<V> {
                 }
             }
         } else if let Some(value) = ev.value {
-            let mut meta = value_meta(value, None);
+            let mut meta = value_meta(value, CharPtr::default());
             if meta.severity != PvSevr::None {
-                static UNKNOWN: LazyLock<Arc<[u8]>> = LazyLock::new(|| Arc::from(&b"unknown"[..]));
                 let message = dbch.pvid.as_ref().and_then(|pvid| pvid.message());
-                meta.message = Some(message.map_or_else(|| UNKNOWN.clone(), Arc::from));
+                let message = message.as_deref().unwrap_or("unknown");
+                meta.message = CharPtr::from_bytes(message.as_bytes());
             }
             self.ss_write_buffer(
                 ch,
@@ -553,7 +553,7 @@ mod tests {
             timestamp: WallTime::from_unix(0, 0),
             status: PvStat::Ok,
             severity: PvSevr::None,
-            message: None,
+            message: CharPtr::default(),
         }
     }
 
@@ -877,14 +877,14 @@ mod tests {
         let p = prog(false);
         let message = || p.chans[0].var_lock.lock().message.clone();
         deliver(&p, PvEventType::Monitor, Some(&value(1.0, 0)));
-        assert_eq!(message(), None);
+        assert!(message().is_null());
         deliver(&p, PvEventType::Monitor, Some(&value(1.0, 2)));
-        assert_eq!(message().as_deref(), Some(&b"unknown"[..]));
+        assert_eq!(crate::c::CSrc::to_c_vec(&message()), b"unknown");
         // A refused get leaves its message in the pv.
         pvid(&p).get_callback(PvType::TimeDouble, 1, |_| {});
         let refused = pvid(&p).message().unwrap();
         deliver(&p, PvEventType::Monitor, Some(&value(1.0, 2)));
-        assert_eq!(message().as_deref(), Some(refused.as_bytes()));
+        assert_eq!(crate::c::CSrc::to_c_vec(&message()), refused.as_bytes());
     }
 
     #[test]

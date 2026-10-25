@@ -557,7 +557,7 @@ mod tests {
             WallTime::from_unix(EPICS_EPOCH_UNIX_SECS, 0)
         );
         assert_eq!(
-            (meta.status, meta.severity, meta.message.is_none()),
+            (meta.status, meta.severity, meta.message.is_null()),
             (PvStat::Ok, PvSevr::None, true)
         );
     }

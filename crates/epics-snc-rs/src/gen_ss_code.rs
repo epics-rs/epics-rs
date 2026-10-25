@@ -2266,7 +2266,7 @@ impl<'a> Gen<'a> {
             },
             Ty::Num(t) => Expr::binary(v.e, "!=", zero(is_float(&t))),
             Ty::Rt(r) => Expr::binary(rt_int(v.e, r), "!=", zero(false)),
-            Ty::CharPtr => v.e.method("is_some", Vec::new()),
+            Ty::CharPtr => Expr::unary("!", v.e.method("is_null", Vec::new())),
             Ty::Str | Ty::Ref => Expr::atom("true"),
             Ty::Foreign | Ty::Unit => Expr::binary(v.e, "!=", zero(false)),
         }
@@ -2284,7 +2284,7 @@ impl<'a> Gen<'a> {
             },
             Ty::Num(t) => Expr::binary(v.e, "==", zero(is_float(&t))),
             Ty::Rt(r) => Expr::binary(rt_int(v.e, r), "==", zero(false)),
-            Ty::CharPtr => v.e.method("is_none", Vec::new()),
+            Ty::CharPtr => v.e.method("is_null", Vec::new()),
             Ty::Str | Ty::Ref => Expr::atom("false"),
             Ty::Foreign | Ty::Unit => Expr::binary(v.e, "==", zero(false)),
         }
@@ -2414,18 +2414,22 @@ fn binop(op: Tok, l: Val, r: Val) -> Val {
                 };
             }
             if matches!(op, Tok::Eq | Tok::Ne) {
-                let method = if op == Tok::Eq { "is_none" } else { "is_some" };
-                if l.ty == Ty::CharPtr && is_null(&r) {
-                    return Val {
-                        e: l.e.method(method, Vec::new()),
+                let null_test = |p: Expr| {
+                    let e = p.method("is_null", Vec::new());
+                    Val {
+                        e: if op == Tok::Eq {
+                            e
+                        } else {
+                            Expr::unary("!", e)
+                        },
                         ty: Ty::Bool,
-                    };
+                    }
+                };
+                if l.ty == Ty::CharPtr && is_null(&r) {
+                    return null_test(l.e);
                 }
                 if r.ty == Ty::CharPtr && is_null(&l) {
-                    return Val {
-                        e: r.e.method(method, Vec::new()),
-                        ty: Ty::Bool,
-                    };
+                    return null_test(r.e);
                 }
             }
             let (a, b, _) = operands(l, r);
@@ -2713,12 +2717,9 @@ fn conv(v: Val, target: &Ty) -> Expr {
                     e @ Expr::Atom(_) => e.method("as_bytes", Vec::new()),
                     e => e,
                 };
-                Expr::call(
-                    "Some",
-                    vec![Expr::call("std::sync::Arc::from", vec![bytes])],
-                )
+                Expr::call("seqg_rt::CharPtr::from_bytes", vec![bytes])
             }
-            _ if is_null(&v) => Expr::atom("None"),
+            _ if is_null(&v) => Expr::call("seqg_rt::CharPtr::default", Vec::new()),
             _ => v.e,
         },
         _ => v.e,
@@ -3098,10 +3099,10 @@ mod tests {
         for line in [
             "(seqg_var.i.get() as u32) < 10u32",
             "seqg_var.i.get() as u32 == 0xFFFFFFFFu32",
-            "seqg_var.p.get().is_some()",
+            "!seqg_var.p.get().is_null()",
             "seqg_var.u.set(0xFFFFFFFFu32)",
             "seqg_var.d.set(3000000000i64 as f64)",
-            "seqg_var.p.set(None)",
+            "seqg_var.p.set(seqg_rt::CharPtr::default())",
             "seqg_var.d.set(10i64 as f64)",
             "seqg_var.d.set(0x7FFFFFFFFFFFFFFFi64 as f64)",
             "seqg_var.d.set(18446744073709551615u64 as f64)",
@@ -3136,7 +3137,7 @@ mod tests {
             "program p\nchar *m;\nss s {\nstate z {\nwhen () {\nprintf(\"%s\", m ? m : \"\");\n} state z\n}\n}\n",
         );
         assert_eq!(diag, "");
-        assert!(code.contains("Some(std::sync::Arc::from("), "{code}");
+        assert!(code.contains("seqg_rt::CharPtr::from_bytes("), "{code}");
     }
 
     #[test]

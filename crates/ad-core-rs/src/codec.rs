@@ -35,6 +35,18 @@ impl CodecName {
         }
     }
 
+    /// [`Self::as_str`] as the `CODEC` parameter's value, shared, so a
+    /// frame's `setStringParam(NDCodec, ...)` copies no bytes.
+    pub(crate) fn octet(&self) -> Arc<[u8]> {
+        static KNOWN: std::sync::LazyLock<[Arc<[u8]>; 7]> = std::sync::LazyLock::new(|| {
+            std::array::from_fn(|i| CodecName::from_ordinal(i as i32).as_str().as_bytes().into())
+        });
+        match self {
+            Self::Other(name) => Arc::clone(name).into(),
+            known => Arc::clone(&KNOWN[known.ordinal().expect("only Other has none") as usize]),
+        }
+    }
+
     /// Inverse of [`CodecName::as_str`]: C's `codec.name` string.
     pub fn from_name(name: &str) -> Self {
         match name {

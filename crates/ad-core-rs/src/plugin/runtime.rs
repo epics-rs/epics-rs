@@ -278,7 +278,7 @@ impl PluginAttributes {
     /// `process_array` the frame's `beginProcessCallbacks` sets count as
     /// pending ahead of `pending`.
     pub fn evaluate(&self, pending: &[ParamUpdate]) -> Option<NDAttributeList> {
-        let mut sets = BEGIN.with(|b| b.borrow().clone());
+        let mut sets = begin_now();
         sets.extend(pending.iter().filter_map(ParamUpdate::stored));
         self.0.evaluate_attributes_blocking(sets)
     }
@@ -306,7 +306,7 @@ impl PluginAttributes {
     /// `getAttributes` comes after sets it cannot make here (a file plugin's
     /// `openFile`). `None` when the set is empty.
     fn view(&self) -> Option<AttributeView> {
-        let begin = BEGIN.with(|b| b.borrow().clone());
+        let begin = begin_now();
         let reads = self.0.param_reads_blocking(begin.clone())?;
         Some(AttributeView::new(Arc::clone(&self.0), reads, begin))
     }
@@ -316,7 +316,7 @@ impl PluginAttributes {
         let attributes = self.0.attributes().lock();
         (!attributes.list.is_empty()).then(|| {
             let reads = attributes.param_reads(base, &[]);
-            let begin = BEGIN.with(|b| b.borrow().clone());
+            let begin = begin_now();
             AttributeView::new(Arc::clone(&self.0), reads, begin)
         })
     }
@@ -472,27 +472,56 @@ fn run_processor<P: NDPluginProcess + ?Sized>(
     result
 }
 
+/// The `beginProcessCallbacks` sets of every frame whose `process_array` is
+/// running on a thread, innermost last: a hand-on runs the next plugin's
+/// inside the caller's.
+struct BeginStack {
+    sets: Vec<PendingParam>,
+    /// Where the innermost frame's sets start.
+    top: usize,
+}
+
 thread_local! {
-    /// The frame's `beginProcessCallbacks` sets while its `process_array`
-    /// runs, for the processor's own `getAttributes` calls, which come before
-    /// the batch that stores them.
-    static BEGIN: std::cell::RefCell<Vec<PendingParam>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// For the processor's own `getAttributes` calls, which come before the
+    /// batch that stores the sets.
+    static BEGIN: std::cell::RefCell<BeginStack> = const {
+        std::cell::RefCell::new(BeginStack {
+            sets: Vec::new(),
+            top: 0,
+        })
+    };
     /// Where [`PortPost`] hands a frame on while `process_array` runs.
     static HAND_ON: std::cell::RefCell<Option<HandOn>> = const { std::cell::RefCell::new(None) };
 }
 
+/// The running frame's `beginProcessCallbacks` sets, none outside one.
+fn begin_now() -> Vec<PendingParam> {
+    BEGIN.with(|b| {
+        let b = b.borrow();
+        b.sets[b.top..].to_vec()
+    })
+}
+
 fn with_frame<R>(begin: &[PendingParam], hand_on: Option<&HandOn>, f: impl FnOnce() -> R) -> R {
-    struct Restore(Vec<PendingParam>, Option<HandOn>);
+    /// The enclosing frame's `top`.
+    struct Restore(usize, Option<HandOn>);
     impl Drop for Restore {
         fn drop(&mut self) {
-            BEGIN.with(|b| *b.borrow_mut() = std::mem::take(&mut self.0));
+            BEGIN.with(|b| {
+                let b = &mut *b.borrow_mut();
+                b.sets.truncate(b.top);
+                b.top = self.0;
+            });
             HAND_ON.with(|h| *h.borrow_mut() = self.1.take());
         }
     }
-    let _restore = Restore(
-        BEGIN.with(|b| b.replace(begin.to_vec())),
-        HAND_ON.with(|h| h.replace(hand_on.cloned())),
-    );
+    let enclosing = BEGIN.with(|b| {
+        let b = &mut *b.borrow_mut();
+        let top = b.sets.len();
+        b.sets.extend_from_slice(begin);
+        std::mem::replace(&mut b.top, top)
+    });
+    let _restore = Restore(enclosing, HAND_ON.with(|h| h.replace(hand_on.cloned())));
     f()
 }
 
@@ -950,7 +979,7 @@ impl PortPost {
     /// Reads the store on the port's actor, so it must be made before
     /// taking a lock the actor's writes take.
     pub fn of(attributes: Option<&PluginAttributes>) -> Self {
-        let begin = BEGIN.with(|b| b.borrow().clone());
+        let begin = begin_now();
         Self {
             port: attributes.and_then(|a| a.0.port()),
             read: begin.clone(),
@@ -1543,6 +1572,9 @@ impl SortBuffer {
     }
 }
 
+/// C `beginProcessCallbacks`' sets (NDPluginDriver.cpp:216-235).
+type BeginSets = [PendingParam; 11];
+
 /// Shared processor state protected by a mutex, accessible from both
 /// the data thread (non-blocking mode) and the caller thread (blocking mode).
 struct SharedProcessorInner {
@@ -1610,10 +1642,7 @@ impl SharedProcessorInner {
     ///
     /// It counts the frame and returns the rest of C's sets there, which
     /// [`Self::post_process`] stores and `getAttributes` reads before then.
-    fn cache_input_array(
-        &mut self,
-        array: &PublishedArray,
-    ) -> (Arc<NDArrayPool>, Vec<PendingParam>) {
+    fn cache_input_array(&mut self, array: &PublishedArray) -> (Arc<NDArrayPool>, BeginSets) {
         self.prev_input_array = Some(array.clone());
         let pool = self.delivery.adopt_pool(array.pool());
         self.array_counter += 1;
@@ -1629,7 +1658,7 @@ impl SharedProcessorInner {
         &mut self,
         array: &NDArray,
         callbacks: bool,
-    ) -> (Vec<PendingParam>, Option<NDAttributeList>) {
+    ) -> (BeginSets, Option<NDAttributeList>) {
         self.array_counter += 1;
         let begin = self.begin_sets(array);
         let attributes = callbacks
@@ -1694,7 +1723,7 @@ impl SharedProcessorInner {
 
     /// C `beginProcessCallbacks`' sets from `array` (NDPluginDriver.cpp:
     /// 216-235), ArrayCounter already counted.
-    fn begin_sets(&self, array: &NDArray) -> Vec<PendingParam> {
+    fn begin_sets(&self, array: &NDArray) -> BeginSets {
         use asyn_rs::param::ParamValue;
         let p = &self.ndarray_params;
         let attr = |name: &str| {
@@ -1707,14 +1736,14 @@ impl SharedProcessorInner {
         let color_mode = attr("ColorMode").unwrap_or(array.info().color_mode as i32);
         // An uncompressed array carries an empty codec name and a compressed
         // size equal to its byte count.
-        let (codec, compressed): (Arc<[u8]>, i32) = match &array.codec {
-            Some(codec) => (
-                codec.name.as_str().as_bytes().into(),
-                codec.compressed_size as i32,
+        let (codec, compressed) = match &array.codec {
+            Some(codec) => (codec.name.octet(), codec.compressed_size as i32),
+            None => (
+                crate::codec::CodecName::None.octet(),
+                array.info().total_bytes as i32,
             ),
-            None => (Arc::from([]), array.info().total_bytes as i32),
         };
-        vec![
+        [
             (p.array_counter, 0, ParamValue::Int32(self.array_counter)),
             (
                 p.n_dimensions,
@@ -3671,7 +3700,7 @@ struct WorkItem {
 struct DoneItem {
     msg: ArrayMessage,
     /// The result and begin sets, `None` for a frame the plugin refused.
-    processed: Option<(ProcessResult, Vec<PendingParam>)>,
+    processed: Option<(ProcessResult, BeginSets)>,
     elapsed_ms: f64,
 }
 

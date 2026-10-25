@@ -1164,6 +1164,9 @@ pub(crate) fn coerce_scalar(
     let as_f64: Option<f64> = match sv {
         Float(x) => Some(*x as f64),
         Double(x) => Some(*x),
+        // `double(src)` of the uint64 itself (`data.cpp:405`): through
+        // int64, past `i64::MAX` it goes negative.
+        ULong(x) => Some(*x as f64),
         _ => as_i64.map(|i| i as f64),
     };
     let as_string: std::string::String = match sv {
@@ -1302,7 +1305,7 @@ macro_rules! impl_into_scalar_int {
     ($($t:ty),*) => {
         $(impl IntoScalarValue for $t {
             fn into_scalar(self, target: ScalarType) -> Result<ScalarValue, ()> {
-                coerce_scalar(&ScalarValue::Long(self as i64), target, ScalarCopy::In).ok_or(())
+                coerce_scalar(&ScalarValue::from(self), target, ScalarCopy::In).ok_or(())
             }
         })*
     };
@@ -1389,6 +1392,31 @@ mod tests {
         d.set("value", "0x1p4 ").unwrap();
         assert_eq!(d.get_as::<f64>("value").unwrap(), 16.0);
         assert!(d.set("value", "1e-310").is_err());
+    }
+
+    /// A uint64 crosses to a double as `double(src)` both ways
+    /// (`copyOutScalar`, `data.cpp:405`; `copyInScalar`), and to a string as
+    /// `SB()<<src`: never through int64, where `u64::MAX` is -1.
+    #[test]
+    fn a_uint64_converts_to_double_and_string_unsigned() {
+        let big = u64::MAX as f64;
+        assert_eq!(
+            coerce_scalar(
+                &ScalarValue::ULong(u64::MAX),
+                ScalarType::Double,
+                ScalarCopy::Out
+            ),
+            Some(ScalarValue::Double(big))
+        );
+        let mut u = Value::create_from(NTScalar::new(ScalarType::ULong).build());
+        u.set("value", u64::MAX).unwrap();
+        assert_eq!(u.get_as::<f64>("value").unwrap(), big);
+        let mut d = Value::create_from(NTScalar::new(ScalarType::Double).build());
+        d.set("value", u64::MAX).unwrap();
+        assert_eq!(d.get_as::<f64>("value").unwrap(), big);
+        let mut s = Value::create_from(NTScalar::new(ScalarType::String).build());
+        s.set("value", u64::MAX).unwrap();
+        assert_eq!(s.get_as::<String>("value").unwrap(), u64::MAX.to_string());
     }
 
     /// A real read as a bool is `copyOut`'s `bool(src)` (`data.cpp:408`),

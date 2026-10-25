@@ -176,9 +176,12 @@
 //! companion holds one program, because each program defines its own
 //! `mod seqg`.
 //!
-//! None of the 16 `.st` programs that run on this crate uses an SNL
-//! `struct`, a function definition, or escaped C inside a struct, so
-//! snc-rs refuses those with an error naming the line.
+//! An SNL function definition is a Rust `fn` that takes the calling state
+//! set first, C's implicit `SS_ID`, then its parameters by value, each
+//! held in a [`SeqVar`] as a local is; a call converts every argument to
+//! its parameter's type as C's prototype does. snc-rs refuses an SNL
+//! `struct`, escaped C inside one, and a function's array or `string`
+//! parameter, with an error naming the line.
 //!
 //! # Options: `+r`, `+s` and the rest
 //!

@@ -7,6 +7,9 @@
 //! reading the message to work out which is guessing at something `run`
 //! already knows. These are the two sides of that boundary.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use epics_base_rs::error::CaError;
 use epics_base_rs::server::ioc_app::{IocApplication, IocRunFailure};
 
@@ -44,8 +47,15 @@ async fn an_unreadable_script_is_the_startup_script_phase() {
 /// A runner that never fails leaves no phase to report.
 #[epics_macros_rs::epics_test]
 async fn a_clean_run_reports_no_phase() {
+    // An IOC that never initialised is Ok with no runner at all.
+    let ran = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&ran);
     IocApplication::new()
-        .run_phased(|_config| async move { Ok(()) })
+        .run_phased(|_config| async move {
+            flag.store(true, Ordering::SeqCst);
+            Ok(())
+        })
         .await
         .expect("an IOC whose runner returns Ok must return Ok");
+    assert!(ran.load(Ordering::SeqCst), "the runner never ran");
 }

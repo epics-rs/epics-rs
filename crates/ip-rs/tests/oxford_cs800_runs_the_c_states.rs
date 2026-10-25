@@ -24,8 +24,14 @@ use support::{eventually, sh};
 const P: &str = "x:CS0:";
 const SP: &str = "x:CS:status_packet";
 
+const DEVICETYPE: u16 = 1000;
 const CTRLNUM: u16 = 1028;
+const SETPOINT: u16 = 1050;
 const TEMP: u16 = 1051;
+const RUNMODE: u16 = 1053;
+const PHASE: u16 = 1054;
+const ALARMI: u16 = 1065;
+const VACSENSOR: u16 = 2042;
 
 struct Ioc {
     db: Arc<PvDatabase>,
@@ -178,4 +184,45 @@ async fn a_disabled_program_takes_no_packet() {
         .await;
     assert_eq!(ioc.f64_of("TEMP.RVAL"), 0.0);
     assert_eq!(ioc.str_of("ALARM"), "unset");
+}
+
+/// A packet from the controller puts each parameter it carries into its
+/// record's RVAL, which the record converts (here TEMP's 0.01 K), and
+/// ALARMI's text into ALARM; one from another controller is dropped. C
+/// stored slot n at index n, past both 230-element arrays at slot 230, so
+/// VACSENSOR there never reached its record.
+#[epics_base_rs::epics_test]
+async fn a_packet_from_the_controller_lands_in_its_records() {
+    let ioc = boot(113, Some("0")).await;
+    let first = Packet::new(&[
+        (CTRLNUM, 113),
+        (SETPOINT, 10000),
+        (TEMP, 29315),
+        (RUNMODE, 3),
+        (PHASE, 2),
+        (ALARMI, 5),
+        (DEVICETYPE, 7),
+    ])
+    .at(230, VACSENSOR, 777);
+    ioc.deliver(&first, 928).await;
+    assert!(eventually(|| ioc.str_of("ALARM") == "Temp Warning").await);
+    assert_eq!(ioc.f64_of("SETPOINT"), 100.0);
+    assert_eq!(ioc.f64_of("TEMP.RVAL"), 29315.0);
+    assert_eq!(ioc.f64_of("TEMP"), 29315.0 * 0.01);
+    assert_eq!(ioc.f64_of("RUNMODE"), 3.0, "Run");
+    assert_eq!(ioc.f64_of("PHASE"), 2.0, "Plat");
+    assert_eq!(ioc.f64_of("ALARMI"), 5.0);
+    assert_eq!(ioc.f64_of("DEVICETYPE.RVAL"), 7.0);
+    assert_eq!(ioc.f64_of("CTRLNUM"), 113.0);
+    assert_eq!(ioc.f64_of("VACSENSOR.RVAL"), 777.0);
+
+    ioc.deliver(&Packet::new(&[(CTRLNUM, 144), (TEMP, 12345)]), 928)
+        .await;
+    assert_eq!(ioc.f64_of("TEMP.RVAL"), 29315.0);
+
+    let unknown = Packet::new(&[(CTRLNUM, 113), (TEMP, 22222), (ALARMI, 56)]);
+    ioc.deliver(&unknown, 928).await;
+    assert!(eventually(|| ioc.str_of("ALARM") == "not recognized").await);
+    assert_eq!(ioc.f64_of("TEMP.RVAL"), 22222.0);
+    assert_eq!(ioc.f64_of("SETPOINT"), 100.0);
 }

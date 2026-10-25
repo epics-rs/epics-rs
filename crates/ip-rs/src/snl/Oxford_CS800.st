@@ -236,8 +236,10 @@ ss cs800 {
       s_checksum = GETUINT16(s_binp, 924);
 
       for (i=4; i < STATUS_PACKET_VALID_LENGTH-4; i+=4) {
-        param_id[i/4] = GETUINT16(s_binp, i);
-        param_value[i/4] = GETUINT16(s_binp, i+2);
+        /* C defect fixed: C stored slot n at [n], n from 1 to 230, so the
+         * 230th parameter ran past both arrays and was never found. */
+        param_id[i/4 - 1] = GETUINT16(s_binp, i);
+        param_value[i/4 - 1] = GETUINT16(s_binp, i+2);
       }
 
       /*

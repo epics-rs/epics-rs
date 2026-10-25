@@ -1536,18 +1536,19 @@ impl ArrayOwner {
     /// C++ `getAttributes(pList)` from a plugin's `processCallbacks`, which
     /// holds the port lock: the set re-evaluated on the port's actor, `None`
     /// when it is empty or the port has stopped. `pending` are values the
-    /// plugin has set ahead of the call but not yet flushed; a `PARAM`
-    /// attribute reads them as C reads its own sets
-    /// ([`DriverAttributes::update_with`]). Blocks the caller, which must not
-    /// be the port's actor.
+    /// plugin has set ahead of the call but not yet flushed, taken only for
+    /// a set to evaluate; a `PARAM` attribute reads them as C reads its own
+    /// sets ([`DriverAttributes::update_with`]). Blocks the caller, which
+    /// must not be the port's actor.
     pub fn evaluate_attributes_blocking(
         &self,
-        pending: Vec<PendingParam>,
+        pending: impl FnOnce() -> Vec<PendingParam>,
     ) -> Option<crate::attributes::NDAttributeList> {
         if self.attributes.lock().list.is_empty() {
             return None;
         }
         let port = self.port()?;
+        let pending = pending();
         let attributes = self.attributes.clone();
         let fresh = Arc::new(parking_lot::Mutex::new(None));
         let slot = fresh.clone();
@@ -1567,11 +1568,15 @@ impl ArrayOwner {
     /// The store half of [`Self::evaluate_attributes_blocking`], for a
     /// caller that evaluates later against what has been set by then. `None`
     /// when the set is empty or the port has stopped.
-    pub fn param_reads_blocking(&self, pending: Vec<PendingParam>) -> Option<ParamReads> {
+    pub fn param_reads_blocking(
+        &self,
+        pending: impl FnOnce() -> Vec<PendingParam>,
+    ) -> Option<ParamReads> {
         if self.attributes.lock().list.is_empty() {
             return None;
         }
         let port = self.port()?;
+        let pending = pending();
         let attributes = self.attributes.clone();
         let taken = Arc::new(parking_lot::Mutex::new(None));
         let slot = taken.clone();

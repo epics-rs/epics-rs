@@ -278,9 +278,11 @@ impl PluginAttributes {
     /// `process_array` the frame's `beginProcessCallbacks` sets count as
     /// pending ahead of `pending`.
     pub fn evaluate(&self, pending: &[ParamUpdate]) -> Option<NDAttributeList> {
-        let mut sets = begin_now();
-        sets.extend(pending.iter().filter_map(ParamUpdate::stored));
-        self.0.evaluate_attributes_blocking(sets)
+        self.0.evaluate_attributes_blocking(|| {
+            let mut sets = begin_now();
+            sets.extend(pending.iter().filter_map(ParamUpdate::stored));
+            sets
+        })
     }
 
     /// [`Self::evaluate`] with `begin`, the frame's `beginProcessCallbacks`
@@ -290,9 +292,11 @@ impl PluginAttributes {
         begin: &[PendingParam],
         pending: &[ParamUpdate],
     ) -> Option<NDAttributeList> {
-        let mut sets = begin.to_vec();
-        sets.extend(pending.iter().filter_map(ParamUpdate::stored));
-        self.0.evaluate_attributes_blocking(sets)
+        self.0.evaluate_attributes_blocking(|| {
+            let mut sets = begin.to_vec();
+            sets.extend(pending.iter().filter_map(ParamUpdate::stored));
+            sets
+        })
     }
 
     /// [`Self::evaluate`] from inside a write, on the port's actor, where
@@ -306,9 +310,8 @@ impl PluginAttributes {
     /// `getAttributes` comes after sets it cannot make here (a file plugin's
     /// `openFile`). `None` when the set is empty.
     fn view(&self) -> Option<AttributeView> {
-        let begin = begin_now();
-        let reads = self.0.param_reads_blocking(begin.clone())?;
-        Some(AttributeView::new(Arc::clone(&self.0), reads, begin))
+        let reads = self.0.param_reads_blocking(begin_now)?;
+        Some(AttributeView::new(Arc::clone(&self.0), reads, begin_now()))
     }
 
     /// [`Self::view`] from inside a write, on the port's actor.

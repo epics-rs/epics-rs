@@ -74,7 +74,11 @@
 //!   `return`, an SNL function's argument), `&x` is `x.ptr()`
 //!   (`a.at(i).ptr()`) and an array or a `string` decays with
 //!   `Ptr::from(&a)`; a call without a prototype passes them as places
-//!   (see Calls).
+//!   (see Calls). `*p` and `p[i]` are places: `p.get()`, `p.set(e)`,
+//!   `p.offset(i).get()`. `p + n` is `p.offset(n)`, `p - q` is
+//!   `p.diff(&q)`, and `==` compares addresses, an array's or a `string`'s
+//!   too, as C's decay makes it. A read or write through null, outside the
+//!   variable, or into a literal panics where C's is undefined.
 //! - C semantics. A value assigned to, or passed as, a numeric of another
 //!   type is emitted `as _`. A C truth value is spelled out as `!= 0` or
 //!   `== 0`. Source parentheses and empty statements are dropped.

@@ -108,14 +108,6 @@ const EXPECTED_FAILURES: &[(&str, &str)] = &[
     ),
     // these wait for C's pointer operations
     (
-        "calc/calcApp/src/editSseq.st",
-        "editSseq.st:161: error: snc-rs does not support assignment through a pointer",
-    ),
-    (
-        "motor/modules/motorAerotech/aerotechApp/src/EnsembleTrajectoryScan.st",
-        "EnsembleTrajectoryScan.st:467: error[E0614]: type `Ptr<i32>` cannot be dereferenced: can't be dereferenced",
-    ),
-    (
         "motor/modules/motorNewport/newportApp/src/MM4005_trajectoryScan.st",
         "MM4005_trajectoryScan.st:499: error[E0277]: the trait bound `Ptr<i8>: From<{integer}>` is not satisfied: the trait `From<{integer}>` is not implemented for `Ptr<i8>`",
     ),
@@ -125,11 +117,7 @@ const EXPECTED_FAILURES: &[(&str, &str)] = &[
     ),
     (
         "sequencer/test/validate/array.st",
-        "array.st:42: error[E0614]: type `Ptr<[SeqString; 5]>` cannot be dereferenced: can't be dereferenced",
-    ),
-    (
-        "sequencer/test/validate/opttVar.st",
-        "opttVar.st:115: error: snc-rs does not support pointer arithmetic",
+        "array.st:46: error[E0277]: the trait bound `epics_seq_rs::c::CArg<'_>: From<Ptr<[SeqString; 5]>>` is not satisfied: the trait `From<Ptr<[SeqString; 5]>>` is not implemented for `epics_seq_rs::c::CArg<'_>`",
     ),
     (
         "sequencer/test/validate/sizeof.st",

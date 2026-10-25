@@ -536,39 +536,13 @@ struct Val {
     ty: Ty,
 }
 
-/// C's pointer `s + n` into a C string `s`, kept as `s` and the offset
-/// until it is read: a tail of a tail would stop at the first terminator,
-/// where C reads on.
-struct StrAt {
-    base: StrBase,
-    off: Option<Val>,
-}
-
-enum StrBase {
-    /// a `string` or `char` array variable, or an element of one
-    Buffer(Place),
-    /// a `char *` or a literal
-    Value(Val),
-}
-
-impl StrAt {
-    fn plus(self, n: Val) -> StrAt {
-        StrAt {
-            base: self.base,
-            off: Some(match self.off {
-                None => n,
-                Some(off) => binop(Tok::Add, off, n),
-            }),
-        }
-    }
-}
-
 /// What a place holds.
 #[derive(Clone, Copy)]
 enum PlaceTy {
     Snl(TypeId),
-    /// a character of a `string`
-    StrChar,
+    /// a `char` that a `string`'s subscript, or a `char *` that is not a
+    /// variable's, names
+    Char,
 }
 
 /// A variable or an element of one: the expression naming its `SeqVar`
@@ -1015,7 +989,7 @@ impl<'a> Gen<'a> {
                 }
                 _ => false,
             },
-            PlaceTy::StrChar => false,
+            PlaceTy::Char => false,
         };
         let store = if is_text && !place.multi {
             let v = self.expr(init);
@@ -1362,7 +1336,7 @@ impl<'a> Gen<'a> {
         let op = node.token.symbol;
         let lhs = node.child(child::BINOP_LEFT).expect("assignment target");
         let rhs = node.child(child::BINOP_RIGHT).expect("assigned value");
-        let Some(place) = self.store_place(lhs, op != Tok::Equal) else {
+        let Some(place) = self.store_place(lhs, op) else {
             self.expr(rhs);
             return;
         };
@@ -1377,11 +1351,11 @@ impl<'a> Gen<'a> {
         out.push(Stmt::Expr(modify(place.expr, body)));
     }
 
-    /// The place a store to `target` writes, `None` (refused) for anything
-    /// but an SNL variable. snc-rs's `char *` is a copy of the string, not a
-    /// pointer into it, so a store through a pointer and arithmetic on one
-    /// are refused. The companion's globals are not written from SNL code.
-    fn store_place(&mut self, target: NodeId, arith: bool) -> Option<Place> {
+    /// The place a store `op` (`=`, a compound assignment, `++` or `--`) to
+    /// `target` writes: an SNL variable, an element of one, or what a
+    /// pointer points to; `None` (refused) for anything else. The
+    /// companion's globals are not written from SNL code.
+    fn store_place(&mut self, target: NodeId, op: Tok) -> Option<Place> {
         if self.place_kind(target).is_none() {
             let mut ep = target;
             while self.ast[ep].tag == NodeTag::EParen {
@@ -1401,7 +1375,11 @@ impl<'a> Gen<'a> {
             return None;
         }
         let place = self.place(target);
-        if arith && matches!(self.place_value_ty(&place), Ty::Ptr(_)) {
+        let pointer_op = matches!(
+            op,
+            Tok::Equal | Tok::Addeq | Tok::Subeq | Tok::Incr | Tok::Decr
+        );
+        if !pointer_op && matches!(self.place_value_ty(&place), Ty::Ptr(_)) {
             self.refuse(target, "pointer arithmetic");
         }
         Some(place)
@@ -1410,89 +1388,193 @@ impl<'a> Gen<'a> {
     /// `ep` translated as a value stored into, or passed as, a `ty`: C's
     /// conversion on assignment.
     fn stored(&mut self, ep: NodeId, ty: &Ty) -> Expr {
-        match ty {
-            Ty::Ptr(elem) => self.ptr_value(ep, elem),
+        let v = match ty {
+            Ty::Ptr(_) if self.pointee(ep).is_some() => return self.pointer(ep),
+            _ => self.expr(ep),
+        };
+        conv(v, ty)
+    }
+
+    /// What `ep` points to where C reads it as a pointer: a pointer, an
+    /// array or `string` that decays, `&place`, a string literal, or
+    /// arithmetic on one of them; `None` for anything else. Nothing is
+    /// translated.
+    fn pointee(&self, ep: NodeId) -> Option<PlaceTy> {
+        let ast = self.ast;
+        let node = &ast[ep];
+        let c = |i| node.child(i);
+        let sym = node.token.symbol;
+        match node.tag {
+            NodeTag::EParen => self.pointee(c(child::PAREN_EXPR)?),
+            NodeTag::EString => Some(PlaceTy::Char),
+            NodeTag::EPre if sym == Tok::Ampersand => {
+                self.place_kind(c(child::PRE_OPERAND)?).map(|(t, _)| t)
+            }
+            NodeTag::EPre | NodeTag::EPost if matches!(sym, Tok::Incr | Tok::Decr) => {
+                self.held_pointee(c(0)?)
+            }
+            NodeTag::EBinop if is_assign(sym) => self.held_pointee(c(child::BINOP_LEFT)?),
+            NodeTag::EBinop if matches!(sym, Tok::Add | Tok::Sub) => {
+                let l = self.pointee(c(child::BINOP_LEFT)?);
+                let r = self.pointee(c(child::BINOP_RIGHT)?);
+                match (l, r) {
+                    (Some(t), None) => Some(t),
+                    (None, Some(t)) if sym == Tok::Add => Some(t),
+                    _ => None,
+                }
+            }
+            NodeTag::ETernop => self
+                .pointee(c(child::TERNOP_THEN)?)
+                .or_else(|| self.pointee(c(child::TERNOP_ELSE)?)),
+            NodeTag::ECast => {
+                let decl = c(child::CAST_TYPE)?;
+                match ast[ast[ast[decl].e_decl()?].type_].kind {
+                    TypeKind::Pointer { value_type } => self.snl_pointee(value_type),
+                    _ => None,
+                }
+            }
+            NodeTag::EFunc => self.result_pointee(c(child::FUNC_EXPR)?),
             _ => {
-                let v = self.expr(ep);
-                conv(v, ty)
+                let (ty, multi) = self.place_kind(ep)?;
+                if let PlaceTy::Snl(t) = ty
+                    && let TypeKind::Pointer { value_type } = ast[t].kind
+                {
+                    return self.snl_pointee(value_type);
+                }
+                self.elem_kind(ty, multi).map(|(t, _)| t)
             }
         }
     }
 
-    /// `ep` as C's pointer to `elem`, where one is stored or passed. `&x`
-    /// is its place's `ptr()`, and an array or a `string` decays with
+    /// What the pointer the place `ep` holds points to.
+    fn held_pointee(&self, ep: NodeId) -> Option<PlaceTy> {
+        match self.place_kind(ep)? {
+            (PlaceTy::Snl(t), _) => match self.ast[t].kind {
+                TypeKind::Pointer { value_type } => self.snl_pointee(value_type),
+                _ => None,
+            },
+            (PlaceTy::Char, _) => None,
+        }
+    }
+
+    /// A pointee of SNL type `t`, if a `seqg_rt::Ptr` can point to it.
+    fn snl_pointee(&self, t: TypeId) -> Option<PlaceTy> {
+        value_type(self.ast, t).ok().map(|_| PlaceTy::Snl(t))
+    }
+
+    /// What the result of a call to `callee` points to.
+    fn result_pointee(&self, callee: NodeId) -> Option<PlaceTy> {
+        let ast = self.ast;
+        let char_ptr = |ty: Ty| (ty == Ty::Ptr(C_CHAR.into())).then_some(PlaceTy::Char);
+        match (ast[callee].tag, &ast[callee].extra) {
+            (NodeTag::EBuiltin, Extra::Builtin(fi)) => {
+                char_ptr(builtin_type(FUNC_SYMBOLS[*fi].name))
+            }
+            (NodeTag::EVar, Extra::Var(vp)) => match ast[ast[*vp].type_].kind {
+                TypeKind::Function { return_type, .. } => match ast[return_type].kind {
+                    TypeKind::Pointer { value_type } => self.snl_pointee(value_type),
+                    _ => None,
+                },
+                TypeKind::None => char_ptr(prototype(ast[callee].token.text())?.1),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// The Rust type of what a pointer to `t` points to.
+    fn pointee_type(&self, t: PlaceTy) -> String {
+        match t {
+            PlaceTy::Snl(t) => value_type(self.ast, t).expect("a pointee has a Rust type"),
+            PlaceTy::Char => C_CHAR.into(),
+        }
+    }
+
+    /// `ep`, which [`Gen::pointee`] reads as a pointer, as a `seqg_rt::Ptr`.
+    /// `&x` is its place's `ptr()`, and an array or a `string` decays with
     /// `Ptr::from` to its first element: both point into the variable's
-    /// cell and see its later writes, as C's do.
-    fn ptr_value(&mut self, ep: NodeId, elem: &str) -> Expr {
+    /// cell and see its later writes, as C's do. `p + n` is `p.offset(n)`.
+    fn pointer(&mut self, ep: NodeId) -> Expr {
         let ast = self.ast;
         let node = &ast[ep];
         let c = |i| node.child(i).expect("expression operand");
+        let sym = node.token.symbol;
+        let ty = Ty::Ptr(self.pointee_type(self.pointee(ep).expect("a pointer")));
         match node.tag {
-            NodeTag::EParen => self.ptr_value(c(child::PAREN_EXPR), elem),
-            NodeTag::ETernop => {
-                let cond = self.truth(c(child::TERNOP_COND));
-                let a = self.ptr_value(c(child::TERNOP_THEN), elem);
-                let b = self.ptr_value(c(child::TERNOP_ELSE), elem);
-                Expr::If(
-                    Box::new(cond),
-                    vec![Stmt::Tail(a)],
-                    Some(Box::new(Expr::Block(vec![Stmt::Tail(b)]))),
-                )
-            }
-            NodeTag::EPre
-                if node.token.symbol == Tok::Ampersand
-                    && self.place_kind(c(child::PRE_OPERAND)).is_some() =>
-            {
+            NodeTag::EParen => self.pointer(c(child::PAREN_EXPR)),
+            NodeTag::EPre if sym == Tok::Ampersand => {
                 let place = self.place(c(child::PRE_OPERAND));
                 if place.multi {
                     self.refuse(ep, "a pointer to a multi-PV array");
                 }
                 place.expr.method("ptr", Vec::new())
             }
-            _ if self.decays(ep) => {
+            NodeTag::EBinop if matches!(sym, Tok::Add | Tok::Sub) => {
+                let (l, r) = (c(child::BINOP_LEFT), c(child::BINOP_RIGHT));
+                let (p, n) = if self.pointee(l).is_some() {
+                    (l, r)
+                } else {
+                    (r, l)
+                };
+                let p = self.pointer(p);
+                let n = self.expr(n);
+                p.method("offset", vec![offset(sym, n)])
+            }
+            NodeTag::ETernop => {
+                let cond = self.truth(c(child::TERNOP_COND));
+                let a = self.stored(c(child::TERNOP_THEN), &ty);
+                let b = self.stored(c(child::TERNOP_ELSE), &ty);
+                Expr::If(
+                    Box::new(cond),
+                    vec![Stmt::Tail(a)],
+                    Some(Box::new(Expr::Block(vec![Stmt::Tail(b)]))),
+                )
+            }
+            NodeTag::ECast => {
+                let operand = c(child::CAST_OPERAND);
+                match self.pointee(operand) {
+                    Some(t) if Ty::Ptr(self.pointee_type(t)) != ty => {
+                        self.refuse(ep, "a cast between pointer types");
+                        self.expr(operand).e
+                    }
+                    _ => self.stored(operand, &ty),
+                }
+            }
+            _ if self.held_pointee(ep).is_none() && self.place_kind(ep).is_some() => {
                 let place = self.place(ep);
                 if place.multi {
                     self.refuse(ep, "a pointer to a multi-PV array");
                 }
                 Expr::call("seqg_rt::Ptr::from", vec![Expr::unary("&", place.expr)])
             }
-            NodeTag::EBinop if matches!(node.token.symbol, Tok::Add | Tok::Sub) => {
-                self.refuse(ep, "pointer arithmetic");
-                self.expr(ep).e
-            }
             _ => {
                 let v = self.expr(ep);
-                conv(v, &Ty::Ptr(elem.into()))
+                conv(v, &ty)
             }
         }
     }
 
-    /// Whether `ep` is an array or a `string` variable or element, which C
-    /// reads as the address of its first element.
-    fn decays(&self, ep: NodeId) -> bool {
-        match self.place_kind(ep) {
-            Some((PlaceTy::Snl(t), _)) => matches!(
-                self.ast[t].kind,
-                TypeKind::Array { .. } | TypeKind::Prim(PrimType::String)
-            ),
-            _ => false,
+    /// The `+` or `-` `ep` as C's pointer arithmetic: `p + n` and `p - n`
+    /// a pointer, `p - q` the elements between; `None` when no operand is
+    /// a pointer.
+    fn pointer_arith(&mut self, ep: NodeId) -> Option<Val> {
+        let node = &self.ast[ep];
+        let l = node.child(child::BINOP_LEFT).expect("operand");
+        let r = node.child(child::BINOP_RIGHT).expect("operand");
+        if let Some(t) = self.pointee(ep) {
+            let ty = Ty::Ptr(self.pointee_type(t));
+            let e = self.pointer(ep);
+            return Some(Val { e, ty });
         }
-    }
-
-    /// Whether `ep` is a `string` or `char` array variable, which C reads
-    /// as the address of its first byte.
-    fn is_char_buffer(&self, ep: NodeId) -> bool {
-        let ast = self.ast;
-        match self.place_kind(ep) {
-            Some((PlaceTy::Snl(t), false)) => match &ast[t].kind {
-                TypeKind::Prim(PrimType::String) => true,
-                TypeKind::Array { elem_type, .. } => {
-                    ast[*elem_type].kind == TypeKind::Prim(PrimType::Char)
-                }
-                _ => false,
-            },
-            _ => false,
+        if node.token.symbol != Tok::Sub || self.pointee(l).is_none() || self.pointee(r).is_none() {
+            return None;
         }
+        let p = self.pointer(l);
+        let q = self.pointer(r);
+        Some(Val {
+            e: p.method("diff", vec![Expr::unary("&", q)]),
+            ty: Ty::Num("isize".into()),
+        })
     }
 
     fn refuse(&mut self, ep: NodeId, what: &str) {
@@ -1534,11 +1616,11 @@ impl<'a> Gen<'a> {
 
     /// `x++` or `--x` as a statement.
     fn incdec_stmt(&mut self, operand: NodeId, op: Tok, out: &mut Vec<Stmt>) {
-        let Some(place) = self.store_place(operand, true) else {
+        let Some(place) = self.store_place(operand, op) else {
             return;
         };
         let ty = self.place_value_ty(&place);
-        if !matches!(ty, Ty::Num(_)) {
+        if !matches!(ty, Ty::Num(_) | Ty::Ptr(_)) {
             out.push(Stmt::Expr(Expr::assign(
                 place.expr,
                 op_str(op),
@@ -1551,25 +1633,25 @@ impl<'a> Gen<'a> {
 
     /// `x++`, `++x`, `x--` or `--x` as a value.
     fn incdec_value(&mut self, operand: NodeId, op: Tok, pre: bool) -> Val {
-        let Some(place) = self.store_place(operand, true) else {
+        let Some(place) = self.store_place(operand, op) else {
             return Val {
                 e: Expr::atom("()"),
                 ty: Ty::Foreign,
             };
         };
         let ty = self.place_value_ty(&place);
-        if !matches!(ty, Ty::Num(_)) {
+        if !matches!(ty, Ty::Num(_) | Ty::Ptr(_)) {
             return raw_incdec(place.expr, op);
         }
         let step = Stmt::Expr(compound(op, &ty, int_one()));
         let body = if pre {
-            vec![step, Stmt::Tail(deref_v())]
+            vec![step, Stmt::Tail(current(&ty))]
         } else {
             vec![
                 Stmt::Let {
                     pat: "seqg_old".into(),
                     ty: None,
-                    init: Some(deref_v()),
+                    init: Some(current(&ty)),
                 },
                 step,
                 Stmt::Tail(Expr::atom("seqg_old")),
@@ -1589,7 +1671,7 @@ impl<'a> Gen<'a> {
         let op = node.token.symbol;
         let lhs = node.child(child::BINOP_LEFT).expect("assignment target");
         let rhs = node.child(child::BINOP_RIGHT).expect("assigned value");
-        let Some(place) = self.store_place(lhs, op != Tok::Equal) else {
+        let Some(place) = self.store_place(lhs, op) else {
             return self.expr(rhs);
         };
         let ty = self.place_value_ty(&place);
@@ -1613,7 +1695,7 @@ impl<'a> Gen<'a> {
             let v = self.hoisted(rhs, &mut stmts);
             let body = Expr::Block(vec![
                 Stmt::Expr(compound(op, &ty, v)),
-                Stmt::Tail(deref_v()),
+                Stmt::Tail(current(&ty)),
             ]);
             stmts.push(Stmt::Tail(modify(place.expr, body)));
         }
@@ -1656,15 +1738,13 @@ impl<'a> Gen<'a> {
                 }
             }
             NodeTag::ESubscr => {
-                // an element of something that is not an SNL array
-                let base = self.str_operand(c(child::SUBSCR_OPERAND));
+                // an element of something that is neither an SNL array nor
+                // a pointer
+                let base = self.expr(c(child::SUBSCR_OPERAND));
                 let index = self.expr(c(child::SUBSCR_INDEX));
-                match base {
-                    Ok(at) => self.char_at(at.plus(index)),
-                    Err(base) => Val {
-                        e: base.e.index(usize_index(index)),
-                        ty: escaped_value_ty(ast, ep, 0),
-                    },
+                Val {
+                    e: base.e.index(usize_index(index)),
+                    ty: escaped_value_ty(ast, ep, 0),
                 }
             }
             NodeTag::EConst => match node.extra {
@@ -1708,10 +1788,23 @@ impl<'a> Gen<'a> {
                             ty: Ty::Bool,
                         }
                     }
-                    Tok::Add => match self.add(ep) {
-                        Ok(at) => self.read_at(at),
-                        Err(v) => v,
-                    },
+                    Tok::Add | Tok::Sub if let Some(v) = self.pointer_arith(ep) => v,
+                    // C compares the addresses an array or a `string` decays to
+                    Tok::Eq | Tok::Ne
+                        if let Some(t) = self.pointee(lhs).or_else(|| self.pointee(rhs)) =>
+                    {
+                        let ty = Ty::Ptr(self.pointee_type(t));
+                        let mut side = |ep| match self.pointee(ep) {
+                            Some(_) => Val {
+                                e: self.pointer(ep),
+                                ty: ty.clone(),
+                            },
+                            None => self.expr(ep),
+                        };
+                        let l = side(lhs);
+                        let r = side(rhs);
+                        binop(sym, l, r)
+                    }
                     _ => {
                         let l = self.expr(lhs);
                         let r = self.expr(rhs);
@@ -1734,12 +1827,9 @@ impl<'a> Gen<'a> {
                             ty: Ty::Ref,
                         }
                     }
-                    Tok::Asterisk => match self.str_operand(operand) {
-                        Ok(at) => self.char_at(at),
-                        Err(v) => Val {
-                            e: Expr::unary("*", v.e),
-                            ty: Ty::Foreign,
-                        },
+                    Tok::Asterisk => Val {
+                        e: Expr::unary("*", self.expr(operand).e),
+                        ty: Ty::Foreign,
                     },
                     Tok::Not => Val {
                         e: self.not(operand),
@@ -2256,17 +2346,28 @@ impl<'a> Gen<'a> {
                 _ => None,
             },
             NodeTag::EParen => self.place_kind(node.child(child::PAREN_EXPR)?),
-            NodeTag::ESubscr => {
-                let (ty, multi) = self.place_kind(node.child(child::SUBSCR_OPERAND)?)?;
-                self.elem_kind(ty, multi).map(|(t, _)| (t, false))
-            }
-            // `*a` is `a[0]`
+            // `*a` is `a[0]`, and `p[i]` is `*(p + i)`
+            NodeTag::ESubscr => self.deref_kind(node.child(child::SUBSCR_OPERAND)?),
             NodeTag::EPre if node.token.symbol == Tok::Asterisk => {
-                let (ty, multi) = self.place_kind(node.child(child::PRE_OPERAND)?)?;
-                self.elem_kind(ty, multi).map(|(t, _)| (t, false))
+                self.deref_kind(node.child(child::PRE_OPERAND)?)
             }
             _ => None,
         }
+    }
+
+    /// What `*base` and `base[i]` name: an element of an array or `string`
+    /// place, else what a pointer `base` points to.
+    fn deref_kind(&self, base: NodeId) -> Option<(PlaceTy, bool)> {
+        match self.array_elem(base) {
+            Some(elem) => Some((elem.0, false)),
+            None => self.pointee(base).map(|t| (t, false)),
+        }
+    }
+
+    /// [`Gen::elem_kind`] of `ep`'s place, if it is an array or `string`.
+    fn array_elem(&self, ep: NodeId) -> Option<(PlaceTy, bool)> {
+        let (ty, multi) = self.place_kind(ep)?;
+        self.elem_kind(ty, multi)
     }
 
     /// What an element of a place holding `ty` holds, and whether it is
@@ -2277,7 +2378,7 @@ impl<'a> Gen<'a> {
         };
         match &self.ast[t].kind {
             TypeKind::Array { elem_type, .. } => Some((PlaceTy::Snl(*elem_type), multi)),
-            TypeKind::Prim(PrimType::String) => Some((PlaceTy::StrChar, false)),
+            TypeKind::Prim(PrimType::String) => Some((PlaceTy::Char, false)),
             _ => None,
         }
     }
@@ -2293,25 +2394,41 @@ impl<'a> Gen<'a> {
             },
             NodeTag::EParen => self.place(node.child(child::PAREN_EXPR).expect("operand")),
             NodeTag::ESubscr => {
-                let base = self.place(node.child(child::SUBSCR_OPERAND).expect("operand"));
-                let elem = self
-                    .elem_kind(base.ty, base.multi)
-                    .expect("subscripted place");
-                let index = self.expr(node.child(child::SUBSCR_INDEX).expect("subscript"));
-                index_place(&base, elem, index)
+                let index = node.child(child::SUBSCR_INDEX).expect("subscript");
+                self.deref(
+                    node.child(child::SUBSCR_OPERAND).expect("operand"),
+                    Some(index),
+                )
             }
-            NodeTag::EPre => {
-                let base = self.place(node.child(child::PRE_OPERAND).expect("operand"));
-                let elem = self
-                    .elem_kind(base.ty, base.multi)
-                    .expect("dereferenced place");
-                let index = Val {
+            NodeTag::EPre => self.deref(node.child(child::PRE_OPERAND).expect("operand"), None),
+            tag => unreachable!("place {}", tag.name()),
+        }
+    }
+
+    /// `base[index]`, or `*base` for no index: `at` of an array or
+    /// `string` place, else the [`seqg_rt::Ptr`] `base` is, moved by `index`.
+    fn deref(&mut self, base: NodeId, index: Option<NodeId>) -> Place {
+        if let Some(elem) = self.array_elem(base) {
+            let place = self.place(base);
+            let i = match index {
+                Some(i) => self.expr(i),
+                None => Val {
                     e: Expr::atom("0"),
                     ty: Ty::Int,
-                };
-                index_place(&base, elem, index)
-            }
-            tag => unreachable!("place {}", tag.name()),
+                },
+            };
+            return index_place(&place, elem, i);
+        }
+        let ty = self.pointee(base).expect("a dereferenced pointer");
+        let mut expr = self.pointer(base);
+        if let Some(i) = index {
+            let i = self.expr(i);
+            expr = expr.method("offset", vec![offset(Tok::Add, i)]);
+        }
+        Place {
+            expr,
+            ty,
+            multi: false,
         }
     }
 
@@ -2326,99 +2443,8 @@ impl<'a> Gen<'a> {
         }
     }
 
-    /// `ep`, `s + n` kept as a [`StrAt`] when `s` is a C string.
-    fn add(&mut self, ep: NodeId) -> Result<StrAt, Val> {
-        let node = &self.ast[ep];
-        let l = self.str_operand(node.child(child::BINOP_LEFT).expect("addend"));
-        let r = self.str_operand(node.child(child::BINOP_RIGHT).expect("addend"));
-        match (l, r) {
-            (Ok(at), Err(n)) | (Err(n), Ok(at)) if is_integer(&n.ty) => Ok(at.plus(n)),
-            (l, r) => {
-                let read = |v: Result<StrAt, Val>| v.map_or_else(|v| v, |at| self.read_at(at));
-                let (l, r) = (read(l), read(r));
-                Err(self.arith(ep, Tok::Add, l, r))
-            }
-        }
-    }
-
-    /// `ep` as a C string `+ n` can step into, a `char *`, a literal, a
-    /// `string` or `char` array variable or an earlier `s + n`; anything
-    /// else translated.
-    fn str_operand(&mut self, ep: NodeId) -> Result<StrAt, Val> {
-        let ast = self.ast;
-        let node = &ast[ep];
-        if self.is_char_buffer(ep) {
-            return Ok(StrAt {
-                base: StrBase::Buffer(self.place(ep)),
-                off: None,
-            });
-        }
-        let v = match node.tag {
-            NodeTag::EParen => {
-                return self.str_operand(node.child(child::PAREN_EXPR).expect("operand"));
-            }
-            NodeTag::EBinop if node.token.symbol == Tok::Add => match self.add(ep) {
-                Ok(at) => return Ok(at),
-                Err(v) => v,
-            },
-            _ => self.expr(ep),
-        };
-        match &v.ty {
-            Ty::Str => Ok(StrAt {
-                base: StrBase::Value(v),
-                off: None,
-            }),
-            Ty::Ptr(t) if t == C_CHAR => Ok(StrAt {
-                base: StrBase::Value(v),
-                off: None,
-            }),
-            _ => Err(v),
-        }
-    }
-
-    /// C's pointer `at` read as a string: one `tail` from its base.
-    fn read_at(&self, at: StrAt) -> Val {
-        let base = match at.base {
-            StrBase::Buffer(place) => self.read(place),
-            StrBase::Value(v) => v,
-        };
-        match at.off {
-            None => base,
-            Some(n) => Val {
-                e: Expr::call(
-                    "seqg_rt::c::tail",
-                    vec![base.e, conv(n, &Ty::Num("isize".into()))],
-                ),
-                ty: Ty::Ptr(C_CHAR.into()),
-            },
-        }
-    }
-
-    /// The character C's pointer `at` points to.
-    fn char_at(&self, at: StrAt) -> Val {
-        let off = at.off.unwrap_or(Val {
-            e: Expr::atom("0"),
-            ty: Ty::Int,
-        });
-        match at.base {
-            StrBase::Buffer(place) => {
-                let elem = self
-                    .elem_kind(place.ty, place.multi)
-                    .expect("a char buffer");
-                self.read(index_place(&place, elem, off))
-            }
-            StrBase::Value(v) => Val {
-                e: Expr::call(
-                    "seqg_rt::c::char_at",
-                    vec![v.e, conv(off, &Ty::Num("isize".into()))],
-                ),
-                ty: Ty::Num(C_CHAR.into()),
-            },
-        }
-    }
-
-    /// A binary arithmetic operator; C's other pointer arithmetic is
-    /// refused.
+    /// A binary arithmetic operator; pointer arithmetic
+    /// [`Gen::pointer_arith`] does not read (`p + q`) is refused.
     fn arith(&mut self, ep: NodeId, op: Tok, l: Val, r: Val) -> Val {
         let pointer = |ty: &Ty| matches!(ty, Ty::Ref | Ty::Ptr(_) | Ty::Str);
         if matches!(op, Tok::Add | Tok::Sub) && (pointer(&l.ty) || pointer(&r.ty)) {
@@ -2470,7 +2496,7 @@ impl<'a> Gen<'a> {
     fn place_value_ty(&self, place: &Place) -> Ty {
         match place.ty {
             _ if place.multi => Ty::Ref,
-            PlaceTy::StrChar => Ty::Num(C_CHAR.into()),
+            PlaceTy::Char => Ty::Num(C_CHAR.into()),
             PlaceTy::Snl(t) => self.value_ty(t),
         }
     }
@@ -2515,12 +2541,30 @@ fn usize_index(v: Val) -> Expr {
     }
 }
 
+/// `n` as the `isize` `Ptr::offset` takes for C's `p op n`.
+fn offset(op: Tok, n: Val) -> Expr {
+    let n = conv(n, &Ty::Num("isize".into()));
+    if op == Tok::Sub {
+        Expr::unary("-", n)
+    } else {
+        n
+    }
+}
+
 fn modify(place: Expr, body: Expr) -> Expr {
     place.method("modify", vec![Expr::Closure("v".into(), Box::new(body))])
 }
 
 fn deref_v() -> Expr {
     Expr::unary("*", Expr::atom("v"))
+}
+
+/// `*v` as a value of type `ty`, which a `Ptr` is only by a clone.
+fn current(ty: &Ty) -> Expr {
+    match ty {
+        Ty::Ptr(_) => Expr::atom("v").method("clone", Vec::new()),
+        _ => deref_v(),
+    }
 }
 
 fn int_one() -> Val {
@@ -2545,8 +2589,13 @@ fn raw_incdec(e: Expr, op: Tok) -> Val {
 /// The closure body of a compound assignment, `++` or `--` to `*v` of
 /// type `ty`: as C, `*v = (ty)(*v op v)`.
 fn compound(op: Tok, ty: &Ty, v: Val) -> Expr {
-    if !matches!(ty, Ty::Num(_)) {
-        return Expr::assign(deref_v(), op_str(op), v.e);
+    match ty {
+        Ty::Num(_) => {}
+        Ty::Ptr(_) => {
+            let step = offset(compound_binop(op), v);
+            return Expr::assign(deref_v(), "=", Expr::atom("v").method("offset", vec![step]));
+        }
+        _ => return Expr::assign(deref_v(), op_str(op), v.e),
     }
     let lhs = Val {
         e: deref_v(),
@@ -3327,17 +3376,25 @@ mod tests {
     }
 
     #[test]
-    fn pointer_arithmetic_and_stores_through_a_pointer_are_refused() {
-        let (_, diag) = translate(
-            "program p\nchar *p;\nstring s;\nss s1 {\nstate z {\nwhen () {\n\
-             p = s + 1;\n*p = 0;\np++;\n} state z\n}\n}\n",
+    fn a_store_through_a_pointer_writes_what_it_points_to() {
+        // editSseq.st:161 `*s = '\0'`, opttVar.st:115 `xp++`
+        let (code, diag) = translate(
+            "program p\nchar *p;\nstring s;\nint k;\nint n;\n%%int *fp;\nss s1 {\nstate z {\n\
+             when () {\n*p = 0;\np++;\np -= k;\nn = p - s;\nn = *p++;\n*fp = 1;\n} state z\n}\n}\n",
         );
         assert_eq!(
             diag,
-            "t.st:7: error: snc-rs does not support pointer arithmetic\n\
-             t.st:8: error: snc-rs does not support assignment through a pointer\n\
-             t.st:9: error: snc-rs does not support pointer arithmetic\n"
+            "t.st:15: error: snc-rs does not support assignment through a pointer\n"
         );
+        for e in [
+            "seqg_var.p.get().set(0);",
+            "seqg_var.p.modify(|v| *v = v.offset(1));",
+            "seqg_var.p.modify(|v| *v = v.offset(-(seqg_rhs as isize)));",
+            "seqg_var.p.get().diff(&seqg_rt::Ptr::from(&seqg_var.s)) as i32",
+            "let seqg_old = v.clone();",
+        ] {
+            assert!(code.contains(e), "{e}\n{code}");
+        }
     }
 
     #[test]
@@ -3599,19 +3656,20 @@ mod tests {
     }
 
     #[test]
-    fn a_string_plus_n_read_as_a_value_is_its_tail() {
+    fn a_pointer_plus_n_is_its_offset() {
         // sncqxbpm.st:110
         let (code, diag) = translate(
             "program p\nstring r;\nstring s;\nchar *p;\nchar buf[8];\nint n;\nss a {\nstate z {\n\
              when () {\nstrcpy(r, s+1);\nstrcpy(r, n+p);\nstrcpy(r, buf+n);\nstrcpy(r, \"abc\"+2);\n\
-             } state z\n}\n}\n",
+             strcpy(r, s-1);\n} state z\n}\n}\n",
         );
         assert_eq!(diag, "");
         for call in [
-            "seqg_rt::c::tail(&seqg_var.s, 1)",
-            "seqg_rt::c::tail(seqg_var.p.get(), seqg_var.n.get() as isize)",
-            "seqg_rt::c::tail(&seqg_var.buf, seqg_var.n.get() as isize)",
-            "seqg_rt::c::tail(\"abc\", 2)",
+            "seqg_rt::Ptr::from(&seqg_var.s).offset(1)",
+            "seqg_var.p.get().offset(seqg_var.n.get() as isize)",
+            "seqg_rt::Ptr::from(&seqg_var.buf).offset(seqg_var.n.get() as isize)",
+            "seqg_rt::CharPtr::from_bytes(\"abc\".as_bytes()).offset(2)",
+            "seqg_rt::Ptr::from(&seqg_var.s).offset(-1)",
         ] {
             assert!(
                 code.contains(&format!("strcpy(&seqg_var.r, {call})")),
@@ -3621,9 +3679,9 @@ mod tests {
     }
 
     #[test]
-    fn a_string_plus_offsets_is_read_once_at_their_sum() {
-        // reviewer4's tail.st: a tail of a tail stops at the first
-        // terminator, where C's s+1+2 reads on as s+3 does
+    fn a_pointer_plus_offsets_reads_on_past_a_terminator() {
+        // reviewer4's tail.st: C's s+1+2 reads on as s+3 does, past a
+        // terminator at s+1
         let (code, diag) = translate(
             "program p\nstring r;\nstring s;\nstring sa[3];\nchar cc[2][8];\nchar c;\nchar *p;\n\
              int k;\nss a {\nstate z {\nwhen () {\nstrcpy(r, s+1+2);\nstrcpy(r, sa[1]+2);\n\
@@ -3632,14 +3690,14 @@ mod tests {
         );
         assert_eq!(diag, "");
         for e in [
-            "strcpy(&seqg_var.r, seqg_rt::c::tail(&seqg_var.s, 1 + 2))",
-            "strcpy(&seqg_var.r, seqg_rt::c::tail(&seqg_var.sa.at(1), 2))",
-            "strcpy(&seqg_var.r, seqg_rt::c::tail(&seqg_var.cc.at(1), 2))",
-            "seqg_var.c.set(seqg_var.s.at(1).get())",
-            "seqg_var.c.set(seqg_var.s.at((1 + seqg_var.k.get()) as usize).get())",
-            "seqg_var.c.set(seqg_rt::c::char_at(seqg_var.p.get(), 1))",
-            "seqg_var.c.set(seqg_rt::c::char_at(seqg_var.p.get(), seqg_var.k.get() as isize))",
-            "strcpy(&seqg_var.r, seqg_rt::c::tail(&seqg_var.s, (seqg_var.k.get() + 1) as isize))",
+            "strcpy(&seqg_var.r, seqg_rt::Ptr::from(&seqg_var.s).offset(1).offset(2))",
+            "strcpy(&seqg_var.r, seqg_rt::Ptr::from(&seqg_var.sa.at(1)).offset(2))",
+            "strcpy(&seqg_var.r, seqg_rt::Ptr::from(&seqg_var.cc.at(1)).offset(2))",
+            "seqg_var.c.set(seqg_rt::Ptr::from(&seqg_var.s).offset(1).get())",
+            "seqg_var.c.set(seqg_rt::Ptr::from(&seqg_var.s).offset(1).offset(seqg_var.k.get() as isize).get())",
+            "seqg_var.c.set(seqg_var.p.get().offset(1).get())",
+            "seqg_var.c.set(seqg_var.p.get().offset(seqg_var.k.get() as isize).get())",
+            "strcpy(&seqg_var.r, seqg_rt::Ptr::from(&seqg_var.s).offset(seqg_var.k.get() as isize).offset(1))",
         ] {
             assert!(code.contains(e), "{e}\n{code}");
         }
@@ -3754,13 +3812,13 @@ mod tests {
     #[test]
     fn other_pointer_arithmetic_stays_refused() {
         let (_, diag) = translate(
-            "program p\nstring r;\nstring s;\nint a[2];\nint n;\nss b {\nstate z {\nwhen () {\n\
-             strcpy(r, s-1);\nn = a+1;\n} state z\n}\n}\n",
+            "program p\nstring r;\nstring s;\nchar *p;\nss b {\nstate z {\nwhen () {\n\
+             strcpy(r, s+s);\np *= 2;\n} state z\n}\n}\n",
         );
         assert_eq!(
             diag,
-            "t.st:9: error: snc-rs does not support pointer arithmetic\n\
-             t.st:10: error: snc-rs does not support pointer arithmetic\n"
+            "t.st:8: error: snc-rs does not support pointer arithmetic\n\
+             t.st:9: error: snc-rs does not support pointer arithmetic\n"
         );
     }
 

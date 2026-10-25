@@ -583,6 +583,19 @@ pub fn sprintf(dst: impl CDst, fmt: impl CSrc, args: &[CArg<'_>]) -> c_int {
     len
 }
 
+/// `epicsSnprintf`, C99's `snprintf`: at most `size - 1` bytes and the
+/// terminator, nothing for a `size` of 0, and bounded by the destination
+/// as `sprintf` is; the length returned is the whole text's.
+#[allow(non_snake_case)]
+pub fn epicsSnprintf(dst: impl CDst, size: usize, fmt: impl CSrc, args: &[CArg<'_>]) -> c_int {
+    let errno = io::Error::last_os_error();
+    let (text, len) = format(&fmt.to_c_vec(), args, &errno);
+    if let Some(room) = size.checked_sub(1) {
+        dst.with_c_dst(|b| put_terminated(b, 0, &text[..text.len().min(room)]));
+    }
+    len
+}
+
 /// A value `sscanf` converted, at the width of its C type.
 pub enum Scanned<'a> {
     Int(i64),
@@ -1515,6 +1528,21 @@ mod tests {
                 "{fmt}"
             );
         }
+    }
+
+    #[test]
+    fn epics_snprintf_keeps_size_less_one_and_returns_the_whole_length() {
+        // EnsembleTrajectoryScan.st:418 epicsSnprintf(buildMessage, MSGSIZE, ...)
+        let v = <SeqVar<[c_char; 8]>>::zeroed();
+        assert_eq!(epicsSnprintf(&v, 4, "m%d at %d", &[1.into(), 23.into()]), 8);
+        assert_eq!(text(&v), b"m1 ");
+        strcpy(&v, "keep");
+        assert_eq!(epicsSnprintf(&v, 0, "x", &[]), 1);
+        assert_eq!(text(&v), b"keep");
+        assert_eq!(epicsSnprintf(&v, 1, "x", &[]), 1);
+        assert_eq!(text(&v), b"");
+        assert_eq!(epicsSnprintf(&v, 40, "%s", &["abcdefghij".into()]), 10);
+        assert_eq!(text(&v), b"abcdefg");
     }
 
     #[test]

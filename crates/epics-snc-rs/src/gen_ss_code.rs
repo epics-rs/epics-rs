@@ -290,6 +290,7 @@ fn prototype(name: &str) -> Option<(&'static [CParam], Ty)> {
         "atan2" | "pow" => (&[Num("f64"), Num("f64")], num("f64")),
         "printf" => (&[Src], num("i32")),
         "sprintf" => (&[Dst, Src], num("i32")),
+        "epicsSnprintf" => (&[Dst, Num("usize"), Src], num("i32")),
         "sscanf" => (&[Src, Src], num("i32")),
         "strchr" => (&[CharPtr, Num("i32")], char_ptr()),
         "strstr" => (&[CharPtr, Src], char_ptr()),
@@ -3740,6 +3741,23 @@ mod tests {
                 "{code}"
             );
         }
+    }
+
+    #[test]
+    fn epics_snprintf_takes_its_size_as_size_t() {
+        // EnsembleTrajectoryScan.st:418
+        let (code, diag) = translate(
+            "program p\nchar m[40];\nint n;\nss a {\nstate z {\nwhen () {\n\
+             epicsSnprintf(m, n, \"%d\", n);\n} state z\n}\n}\n",
+        );
+        assert_eq!(diag, "");
+        assert!(
+            code.contains(
+                "epicsSnprintf(&seqg_var.m, seqg_var.n.get() as usize, \"%d\", \
+                 &[seqg_rt::c::CArg::from(seqg_var.n.get())]);"
+            ),
+            "{code}"
+        );
     }
 
     #[test]

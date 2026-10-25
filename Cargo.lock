@@ -2096,6 +2096,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ip-rs"
+version = "0.32.0"
+dependencies = [
+ "asyn-rs",
+ "epics-base-rs",
+ "epics-seq-rs",
+ "epics-snc-rs",
+]
+
+[[package]]
 name = "ipconfig"
 version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"

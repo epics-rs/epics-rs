@@ -1,0 +1,51 @@
+# ip-rs
+
+Rust port of the synApps [ip](https://github.com/epics-modules/ip) module's
+SNL programs. Each `src/snl/*.st` is the upstream file with its C defects
+fixed in place, each under a comment; `build.rs` compiles it with
+epics-snc-rs and it runs on epics-seq-rs.
+
+| Program | Rust module | Template |
+|---|---|---|
+| Federal ERO-1071 encoder reader | `snl::federal` | `db/Federal.db` |
+
+`db/` is vendored from `ipApp/Db` unchanged, so an `st.cmd` that loads
+`$(IP)/db/Federal.db` resolves when `IP` is set to [`IP_DIR`](src/lib.rs).
+
+## Usage
+
+[`register_ip_dbd`](src/lib.rs) does what `ipSupport.dbd`'s `registrar()`
+lines do: it registers each program and the shell's `seq` command, so the
+upstream `st.cmd` lines run as in C:
+
+```
+drvAsynIPPortConfigure("serial1", "<host>:<port>", 0, 0, 0)
+asynOctetSetOutputEos("serial1", 0, "\x02")
+dbLoadRecords("$(IP)/db/Federal.db", "P=xxx:,S=s1,PORT=serial1")
+iocInit
+seq &Federal, "P=xxx:,S=s1"
+```
+
+The templates' records come from base, asyn (`asyn`) and calc
+(`scalcout`); the IOC registers those record types itself.
+
+No cargo features.
+
+## Not ported
+
+- The device supports in `ipApp/src/dev*.c`.
+- `ipApp/op` display screens and the `iocs/ipExample` IOC.
+
+## Testing
+
+```bash
+cargo nextest run -p ip-rs
+```
+
+Each program runs on its template against a device mock over a
+`drvAsynIPPort`; the expected values are the ones the C IOC posted against
+the same mock and template.
+
+## License
+
+The synApps software license: [LICENSE](LICENSE).

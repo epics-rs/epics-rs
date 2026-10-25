@@ -1,0 +1,20 @@
+[package]
+name = "ip-rs"
+version.workspace = true
+edition.workspace = true
+description = "Rust port of the EPICS synApps ip module's SNL programs"
+license-file = "LICENSE"
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+epics-base-rs = { workspace = true }
+epics-seq-rs = { workspace = true }
+
+[build-dependencies]
+epics-snc-rs = { workspace = true }
+
+[features]
+
+[dev-dependencies]
+asyn-rs = { workspace = true }

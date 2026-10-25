@@ -19,6 +19,7 @@ default-members = [
     "crates/epics-seq-rs",
     "crates/stream-rs",
     "crates/optics-rs",
+    "crates/ip-rs",
     "crates/mca-rs",
     "crates/mqtt-rs",
     "crates/modbus-rs",

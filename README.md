@@ -53,9 +53,9 @@ use epics_rs::asyn;        // port driver framework
 | `full` | Everything above | no |
 
 `calc`, `autosave`, and `busy` are always available through `epics-base-rs`.
-`sscan-rs`, `epics-stream-rs`, `epics-seq-rs`/`epics-snc-rs`, `mqtt-rs` and
-`epics-modbus-rs` are not surfaced through the umbrella crate — depend on
-them directly when needed.
+`sscan-rs`, `ip-rs`, `epics-stream-rs`, `epics-seq-rs`/`epics-snc-rs`,
+`mqtt-rs` and `epics-modbus-rs` are not surfaced through the umbrella crate —
+depend on them directly when needed.
 
 You can also depend on sub-crates directly:
 
@@ -87,6 +87,7 @@ epics-ca-rs   = "0.32"  # just Channel Access
 | `optics-rs` | Optics (table, monochromator, slit, filter, BPM) |
 | `mca-rs` | Multichannel analyzer record |
 | `sscan-rs` | synApps sscan R2-12 (sscan and scanparm records, saveData's MDA writer, `scanProg.st`) |
+| `ip-rs` | synApps ip's SNL programs (`Federal.st`) |
 | `epics-stream-rs` | StreamDevice (imported as `stream_rs`) |
 | `stream-pcre-sys` | C PCRE 8.45, the test oracle for `epics-stream-rs`'s Rust PCRE |
 | `epics-snc-rs` | Sequencer R2-2-9 SNL compiler: `.st` → Rust from `build.rs`, and the `snc-rs` CLI |

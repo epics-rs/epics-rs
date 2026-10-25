@@ -182,7 +182,7 @@ mod claim {
     use std::any::Any;
     use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicIsize, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// The indices one participant claims, until none are left.
     pub struct Claims<'a> {
@@ -210,9 +210,6 @@ mod claim {
         /// Helpers admitted and not yet done, with `CLOSED` once the caller
         /// stops admitting them.
         inside: AtomicUsize,
-        /// Helpers still to spawn, below 0 once all are.
-        recruits: AtomicIsize,
-        pool: &'static rayon::ThreadPool,
         /// The caller's body, its lifetime erased: only an admitted helper
         /// calls it, and the caller does not return before every admitted
         /// helper is done.
@@ -233,25 +230,11 @@ mod claim {
             }
         }
 
-        /// Spawn up to two more helpers while more indices remain than one.
-        fn recruit(self: &Arc<Self>) {
-            for _ in 0..2 {
-                if self.next.load(Ordering::Relaxed) + 1 >= self.n
-                    || self.recruits.fetch_sub(1, Ordering::Relaxed) <= 0
-                {
-                    return;
-                }
-                let job = self.clone();
-                self.pool.spawn(move || job.help());
-            }
-        }
-
         fn help(self: Arc<Self>) {
             if self.inside.fetch_add(1, Ordering::AcqRel) & CLOSED != 0 {
                 self.inside.fetch_sub(1, Ordering::Release);
                 return;
             }
-            self.recruit();
             // SAFETY: admitted before `CLOSED`, so the caller waits for the
             // `fetch_sub` below before its body goes away.
             let body = unsafe { &*self.body };
@@ -303,12 +286,14 @@ mod claim {
             next: AtomicUsize::new(0),
             n,
             inside: AtomicUsize::new(0),
-            recruits: AtomicIsize::new(helpers as isize - 1),
-            pool,
             body: erased,
             panic: parking_lot::Mutex::new(None),
         });
-        {
+        // Every helper from the caller: helpers that each spawned two more
+        // kept node0 u8 histogram 2048x2048 back-to-back at 370-420 us, against
+        // 230-240 spawned here and 260 for rayon's own split; spawning four,
+        // eight or all from the first helper stayed at 370.
+        for _ in 0..helpers {
             let job = job.clone();
             pool.spawn(move || job.help());
         }
@@ -823,6 +808,11 @@ mod tests {
                     {
                         std::thread::sleep(std::time::Duration::from_millis(20));
                         helper.store(2, Ordering::SeqCst);
+                    }
+                    // Each helper holds its one index till then, so the
+                    // caller, which spawns them all first, still gets one.
+                    while helper.load(Ordering::SeqCst) != 2 {
+                        std::thread::yield_now();
                     }
                     return;
                 }

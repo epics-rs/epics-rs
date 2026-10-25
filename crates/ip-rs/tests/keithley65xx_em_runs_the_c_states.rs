@@ -173,3 +173,37 @@ async fn a_single_read_after_a_mode_command_is_delayed() {
     assert_eq!(ioc.f64_of("Dmm_raw"), 3.1);
     assert_eq!(ioc.str_of("units"), "AMP");
 }
+
+/// A numeric put past the four modes (the mode mbbos define four states)
+/// changes no units and configures nothing, and the meter reads on in the
+/// mode it has. C indexed `unit_strings` and `dmm_modes` past their ends:
+/// `ch_mode_sel 4` set `units` to "k:", and `ch2_mode_sel 6` crashed its
+/// IOC.
+#[epics_base_rs::epics_test]
+async fn a_mode_past_the_four_is_ignored() {
+    let ioc = boot(&EM, 4).await;
+    booted(&ioc).await;
+    ioc.step("dmm_chan", 2.0, &["rout:clos (@3)"]).await;
+    ioc.step("ch_mode_sel", 1.0, &[":sens:func 'curr'"]).await;
+    ioc.step("ch_mode_sel", 4.0, &[]).await;
+    assert_eq!(ioc.str_of("units"), "AMP");
+    ioc.read(&["*trg;fetch?"]).await;
+    assert_eq!(ioc.f64_of("Dmm_raw"), 3.1);
+
+    ioc.step("ch2_mode_sel", 6.0, &[]).await;
+    assert_eq!(ioc.str_of("ch2_units"), "VOLT");
+    ioc.step("single_multi", 1.0, &[]).await;
+    ioc.read(&[
+        ":sens:func 'volt'",
+        "rout:clos (@1)",
+        "*trg;fetch?",
+        "rout:clos (@2)",
+        "*trg;fetch?",
+        "rout:clos (@3)",
+        "*trg;fetch?",
+        "rout:clos (@4)",
+        "*trg;fetch?",
+    ])
+    .await;
+    assert_eq!(ioc.f64_of("Ch2_raw"), 2.0);
+}

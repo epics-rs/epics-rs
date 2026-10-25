@@ -4598,11 +4598,16 @@ fn resolve_enum_index(token: &str, choices: Option<&[String]>) -> PvaResult<i32>
             return Ok(i as i32);
         }
     }
-    token.trim().parse::<i32>().map_err(|_| {
-        PvaError::InvalidValue(format!(
-            "enum value '{token}' is neither a choice label nor an integer index"
-        ))
-    })
+    // `idxfld->putFrom(bare[0])`: pvData `parseToPOD` into the int32 index,
+    // base 0 and range checked.
+    crate::pvdata::convert::parse_to_i64(token)
+        .ok()
+        .and_then(|n| i32::try_from(n).ok())
+        .ok_or_else(|| {
+            PvaError::InvalidValue(format!(
+                "enum value '{token}' is neither a choice label nor an integer index"
+            ))
+        })
 }
 
 /// Build the `(value, changed-bits)` delta for a bare write to an `enum_t`
@@ -4790,11 +4795,15 @@ fn field_desc_at_path<'a>(desc: &'a FieldDesc, parts: &[&str]) -> Option<&'a Fie
 /// pvData `PVScalar::putFrom` coercion the JSON parser applies per token
 /// (parseinto.cpp:60-66, `valueAssign` → `castUnsafe`): a JSON number
 /// lands in any numeric type (float→int truncates, like a C++ static
-/// cast), a JSON bool maps to 0/1 for numerics, and a JSON string is
-/// parsed for a numeric/bool target or taken verbatim for a string.
+/// cast), and a JSON bool maps to 0/1 for numerics. A JSON string is
+/// `Value::from(std::string)` (pvxs `json.cpp:375`).
 fn json_scalar_to_value(st: ScalarType, j: &serde_json::Value) -> PvaResult<ScalarValue> {
     use ScalarType as T;
     use serde_json::Value as J;
+    if let J::String(s) = j {
+        return crate::pvdata::convert::scalar_from_str(st, s)
+            .map_err(|e| PvaError::InvalidValue(e.to_string()));
+    }
     // Any JSON scalar as a wide integer (i128 holds every i64/u64 exactly;
     // a float source truncates toward zero, matching `static_cast`).
     let as_int = || -> Option<i128> {
@@ -4805,7 +4814,6 @@ fn json_scalar_to_value(st: ScalarType, j: &serde_json::Value) -> PvaResult<Scal
                 .or_else(|| n.as_u64().map(|v| v as i128))
                 .or_else(|| n.as_f64().map(|f| f as i128)),
             J::Bool(b) => Some(*b as i128),
-            J::String(s) => s.trim().parse::<i128>().ok(),
             _ => None,
         }
     };
@@ -4813,7 +4821,6 @@ fn json_scalar_to_value(st: ScalarType, j: &serde_json::Value) -> PvaResult<Scal
         match j {
             J::Number(n) => n.as_f64(),
             J::Bool(b) => Some(if *b { 1.0 } else { 0.0 }),
-            J::String(s) => s.trim().parse::<f64>().ok(),
             _ => None,
         }
     };
@@ -4824,7 +4831,6 @@ fn json_scalar_to_value(st: ScalarType, j: &serde_json::Value) -> PvaResult<Scal
         T::Boolean => match j {
             J::Bool(b) => ScalarValue::Boolean(*b),
             J::Number(n) => ScalarValue::Boolean(n.as_f64().map(|f| f != 0.0).unwrap_or(false)),
-            J::String(s) => ScalarValue::parse(st, s).map_err(PvaError::InvalidValue)?,
             _ => {
                 return Err(PvaError::InvalidValue(format!(
                     "cannot assign JSON {j} to a bool field"
@@ -4842,7 +4848,6 @@ fn json_scalar_to_value(st: ScalarType, j: &serde_json::Value) -> PvaResult<Scal
         T::Float => ScalarValue::Float(as_float().ok_or_else(float_err)? as f32),
         T::Double => ScalarValue::Double(as_float().ok_or_else(float_err)?),
         T::String => match j {
-            J::String(s) => ScalarValue::String(s.clone().into()),
             J::Number(n) => ScalarValue::String(n.to_string().into()),
             J::Bool(b) => ScalarValue::String(b.to_string().into()),
             _ => {
@@ -5336,8 +5341,8 @@ fn build_put_union(variants: &[(String, FieldDesc)], value_str: &str) -> PvaResu
 
 /// Build a variant ("any") PUT value. The carried scalar type is
 /// inferred from the textual form — narrowest type wins: `bool` →
-/// `i64` → `f64` → `String`. An empty `value_str` produces the null
-/// variant (no embedded descriptor).
+/// `i64` → `f64` → `String`, the numbers read as pvxs `parseTo`. An empty
+/// `value_str` produces the null variant (no embedded descriptor).
 fn build_put_variant(value_str: &str) -> PvaResult<PvField> {
     let trimmed = value_str.trim();
     if trimmed.is_empty() {
@@ -5350,9 +5355,9 @@ fn build_put_variant(value_str: &str) -> PvaResult<PvField> {
         (ScalarType::Boolean, ScalarValue::Boolean(true))
     } else if trimmed.eq_ignore_ascii_case("false") {
         (ScalarType::Boolean, ScalarValue::Boolean(false))
-    } else if let Ok(i) = trimmed.parse::<i64>() {
+    } else if let Ok(i) = crate::pvdata::convert::parse_to_i64(trimmed) {
         (ScalarType::Long, ScalarValue::Long(i))
-    } else if let Ok(d) = trimmed.parse::<f64>() {
+    } else if let Ok(d) = crate::pvdata::convert::parse_to_f64(trimmed) {
         (ScalarType::Double, ScalarValue::Double(d))
     } else {
         (ScalarType::String, ScalarValue::String(trimmed.into()))
@@ -5811,6 +5816,28 @@ mod tests {
             assert!(!changed.get(intro.bit_for_path("alarm.severity").unwrap()));
         }
 
+        /// pvxs `put.cpp:135` parses the text with `parseTo` at base 0, and a
+        /// bool takes only "true" or "false".
+        #[test]
+        fn bare_token_parses_as_pvxs_put_does() {
+            for (tok, want) in [("010", 8), ("0x10", 16), (" 5", 5)] {
+                let intro = nt(ScalarType::Int);
+                let (value, _) = build_put_from_args(&intro, &t(&[tok]), None).unwrap();
+                assert_eq!(
+                    scalar_at(&value, &["value"]),
+                    &ScalarValue::Int(want),
+                    "{tok:?}"
+                );
+            }
+            for tok in ["1", "0"] {
+                let intro = nt(ScalarType::Boolean);
+                assert!(
+                    build_put_from_args(&intro, &t(&[tok]), None).is_err(),
+                    "{tok:?}"
+                );
+            }
+        }
+
         /// THE PVA-08 case: `a=b` where `a` is not a field and `.value`
         /// is a string scalar is a bare string value, not a field
         /// assignment — `pvput STR:PV a=b` writes the literal `"a=b"`
@@ -6118,6 +6145,19 @@ mod tests {
             let (_, changed) = build_put_from_args(&intro, &t(&["value= [10,20]"]), None).unwrap();
             assert!(changed.is_empty());
         }
+
+        /// A JSON string lands through `Value::from(std::string)`
+        /// (pvxs `json.cpp:375`), so it parses at base 0 too.
+        #[test]
+        fn json_string_parses_at_base_zero() {
+            let intro = nt(ScalarType::Double);
+            let (value, _) =
+                build_put_from_args(&intro, &t(&[r#"alarm={"severity":" 0x10"}"#]), None).unwrap();
+            assert_eq!(
+                scalar_at(&value, &["alarm", "severity"]),
+                &ScalarValue::Int(16)
+            );
+        }
     }
 
     /// NTEnum bare-token PUT (`build_put_from_args` plain value mode):
@@ -6319,6 +6359,15 @@ mod tests {
                 matches!(err, PvaError::InvalidValue(ref m) if m.contains("neither a choice label")),
                 "got: {err:?}"
             );
+        }
+
+        /// The integer fallback is `putFrom(bare[0])` (pvput.cpp:200), pvData
+        /// `parseToPOD` at base 0.
+        #[test]
+        fn integer_token_parses_at_base_zero() {
+            let intro = nt_enum();
+            let (value, _) = build_put_from_args(&intro, &t(&["010"]), None).unwrap();
+            assert_eq!(index_of(&value), 8);
         }
 
         /// An integer token still works with no snapshot (the fallback path
@@ -6644,6 +6693,22 @@ mod tests {
                 other => panic!("expected variant, got {other:?}"),
             }
             assert_round_trips(&FieldDesc::Variant, &v);
+        }
+    }
+
+    #[test]
+    fn put_variant_infers_through_parse_to() {
+        for (input, want) in [("010", 8), ("0x10", 16)] {
+            match build_put_value(&FieldDesc::Variant, input).unwrap() {
+                PvField::Variant(vv) => {
+                    assert_eq!(
+                        vv.value,
+                        PvField::Scalar(ScalarValue::Long(want)),
+                        "{input}"
+                    )
+                }
+                other => panic!("expected variant, got {other:?}"),
+            }
         }
     }
 

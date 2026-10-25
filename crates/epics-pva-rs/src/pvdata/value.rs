@@ -871,7 +871,9 @@ fn parse_path(path: &str) -> Result<Vec<PathSeg>, ValueError> {
             rest = r2;
         } else if let Some(r) = rest.strip_prefix('[') {
             let end = r.find(']').ok_or_else(nofield)?;
-            let idx: usize = r[..end].parse().map_err(|_| nofield())?;
+            // pvxs `parseTo<uint64_t>` (`data.cpp:932`).
+            let idx = crate::pvdata::convert::parse_to_u64(&r[..end]).map_err(|_| nofield())?;
+            let idx = usize::try_from(idx).map_err(|_| nofield())?;
             segs.push(PathSeg::Index(idx));
             rest = &r[end + 1..];
         } else {
@@ -1130,6 +1132,10 @@ pub(crate) fn coerce_scalar(
 ) -> Option<ScalarValue> {
     use ScalarValue::*;
     let as_i64: Option<i64> = match sv {
+        // The same parse on both sides (`data.cpp:442-463`, `:525`).
+        String(s) => {
+            return crate::pvdata::convert::scalar_from_str(target, &s.as_str_lossy()).ok();
+        }
         Boolean(b) => Some(if *b { 1 } else { 0 }),
         Byte(x) => Some(*x as i64),
         Short(x) => Some(*x as i64),
@@ -1144,8 +1150,6 @@ pub(crate) fn coerce_scalar(
         // overflows rather than saturating. See `pvdata::cpp_cast`.
         Float(x) => Some(crate::pvdata::cpp_cast::double_to_i64(*x as f64)),
         Double(x) => Some(crate::pvdata::cpp_cast::double_to_i64(*x)),
-        // pvxs `parseTo<int64_t>` on both sides (`data.cpp:448`, `:525`).
-        String(s) => crate::pvdata::convert::parse_to_i64(&s.as_str_lossy()).ok(),
     };
     // pvxs dispatches on the STORE's signedness (`data.cpp:551` vs `:565`):
     // an unsigned leaf casts the double to `uint64_t`, not to `int64_t`. The
@@ -1155,15 +1159,11 @@ pub(crate) fn coerce_scalar(
     let as_u64: Option<u64> = match sv {
         Float(x) => Some(crate::pvdata::cpp_cast::double_to_u64(*x as f64)),
         Double(x) => Some(crate::pvdata::cpp_cast::double_to_u64(*x)),
-        // An unsigned store parses with `parseTo<uint64_t>`, so `"-1"` wraps
-        // and `u64::MAX` spelled out is in range.
-        String(s) => crate::pvdata::convert::parse_to_u64(&s.as_str_lossy()).ok(),
         _ => as_i64.map(|i| i as u64),
     };
     let as_f64: Option<f64> = match sv {
         Float(x) => Some(*x as f64),
         Double(x) => Some(*x),
-        String(s) => crate::pvdata::convert::parse_to_f64(&s.as_str_lossy()).ok(),
         _ => as_i64.map(|i| i as f64),
     };
     let as_string: std::string::String = match sv {
@@ -1182,18 +1182,13 @@ pub(crate) fn coerce_scalar(
         String(s) => s.as_str_lossy().into_owned(),
     };
     Some(match target {
-        // pvxs `copyIn` into a bool takes a bool, an integer or the exact
-        // "true" / "false"; a real has no arm (`data.cpp:579-593`).
-        // `copyOut` casts it, `bool(src)` (`data.cpp:408`).
+        // pvxs `copyIn` into a bool takes a bool or an integer; a real has no
+        // arm (`data.cpp:579-593`). `copyOut` casts it, `bool(src)`
+        // (`data.cpp:408`).
         ScalarType::Boolean => Boolean(match sv {
             Float(_) | Double(_) if side == ScalarCopy::In => return None,
             Float(x) => *x != 0.0,
             Double(x) => *x != 0.0,
-            String(s) => match s.as_str_lossy().as_ref() {
-                "true" => true,
-                "false" => false,
-                _ => return None,
-            },
             _ => as_i64? != 0,
         }),
         ScalarType::Byte => Byte(as_i64? as i8),
@@ -1759,6 +1754,9 @@ mod tests {
             PvField::StructureArray(vec![Some(elem)]),
         );
         assert_eq!(v.get_as::<i32>("rows[0].a").unwrap(), 5);
+        // The subscript is `parseTo<uint64_t>` (pvxs `data.cpp:932`).
+        assert_eq!(v.get_as::<i32>("rows[0x0].a").unwrap(), 5);
+        assert_eq!(v.get_as::<i32>("rows[ 0].a").unwrap(), 5);
         // Out-of-range index is not reachable.
         assert!(v.lookup("rows[5].a").is_none());
     }

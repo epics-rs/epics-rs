@@ -1118,7 +1118,7 @@ impl PvaLink {
             return None;
         };
         match a.get_field("severity")? {
-            PvField::Scalar(sv) => Some(scalar_value_to_f64(sv) as i32),
+            PvField::Scalar(sv) => scalar_value_to_f64(sv).map(|f| f as i32),
             _ => None,
         }
     }
@@ -1144,7 +1144,7 @@ impl PvaLink {
         let severity = alarm
             .and_then(|a| a.get_field("severity"))
             .and_then(|sv| match sv {
-                PvField::Scalar(sv) => Some(scalar_value_to_f64(sv) as i32),
+                PvField::Scalar(sv) => scalar_value_to_f64(sv).map(|f| f as i32),
                 _ => None,
             })
             .unwrap_or(0);
@@ -1867,14 +1867,16 @@ fn extract_field<'v>(root: &'v PvField, path: &str) -> &'v PvField {
 
 fn scalar_as_f64(field: &PvField) -> Option<f64> {
     match field {
-        PvField::Scalar(sv) => Some(scalar_value_to_f64(sv)),
-        PvField::Structure(s) => s.get_value().map(scalar_value_to_f64),
+        PvField::Scalar(sv) => scalar_value_to_f64(sv),
+        PvField::Structure(s) => s.get_value().and_then(scalar_value_to_f64),
         _ => None,
     }
 }
 
-fn scalar_value_to_f64(v: &ScalarValue) -> f64 {
-    match v {
+/// pvxs `Value::as<double>()`: a string is `parseTo<double>`
+/// (`data.cpp:455`), and one that does not parse has no value.
+fn scalar_value_to_f64(v: &ScalarValue) -> Option<f64> {
+    Some(match v {
         ScalarValue::Boolean(b) => {
             if *b {
                 1.0
@@ -1892,8 +1894,10 @@ fn scalar_value_to_f64(v: &ScalarValue) -> f64 {
         ScalarValue::ULong(x) => *x as f64,
         ScalarValue::Float(x) => *x as f64,
         ScalarValue::Double(x) => *x,
-        ScalarValue::String(s) => s.as_str_lossy().parse().unwrap_or(0.0),
-    }
+        ScalarValue::String(s) => {
+            return epics_pva_rs::pvdata::convert::parse_to_f64(&s.as_str_lossy()).ok();
+        }
+    })
 }
 
 /// Map the cached NT value at the link's field path to a DBF type,
@@ -2056,6 +2060,15 @@ fn _suppress(_: &PvStructure) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// pvxs reads a string field as a double with `parseTo<double>`
+    /// (`data.cpp:455`); one that does not parse is no number at all.
+    #[test]
+    fn a_string_reads_as_parse_to_double() {
+        let s = |t: &str| PvField::Scalar(ScalarValue::String(t.into()));
+        assert_eq!(scalar_as_f64(&s(" 0x10")), Some(16.0));
+        assert_eq!(scalar_as_f64(&s("abc")), None);
+    }
 
     /// Scan-trigger overrun, producer half: a full scan-trigger queue
     /// does NOT silently drop the monitor event. `enqueue_scan_trigger`

@@ -224,32 +224,10 @@ impl ScalarValue {
         }
     }
 
-    /// Parse a string into a `ScalarValue` of the given type.
+    /// Parse a string into a `ScalarValue` of the given type, as pvxs
+    /// `Value::from(std::string)` does ([`super::convert::scalar_from_str`]).
     pub fn parse(scalar_type: ScalarType, s: &str) -> Result<Self, String> {
-        match scalar_type {
-            ScalarType::Boolean => match s {
-                "true" | "1" => Ok(Self::Boolean(true)),
-                "false" | "0" => Ok(Self::Boolean(false)),
-                _ => Err(format!("invalid boolean: {s}")),
-            },
-            ScalarType::Byte => s.parse::<i8>().map(Self::Byte).map_err(|e| e.to_string()),
-            ScalarType::Short => s.parse::<i16>().map(Self::Short).map_err(|e| e.to_string()),
-            ScalarType::Int => s.parse::<i32>().map(Self::Int).map_err(|e| e.to_string()),
-            ScalarType::Long => s.parse::<i64>().map(Self::Long).map_err(|e| e.to_string()),
-            ScalarType::UByte => s.parse::<u8>().map(Self::UByte).map_err(|e| e.to_string()),
-            ScalarType::UShort => s
-                .parse::<u16>()
-                .map(Self::UShort)
-                .map_err(|e| e.to_string()),
-            ScalarType::UInt => s.parse::<u32>().map(Self::UInt).map_err(|e| e.to_string()),
-            ScalarType::ULong => s.parse::<u64>().map(Self::ULong).map_err(|e| e.to_string()),
-            ScalarType::Float => s.parse::<f32>().map(Self::Float).map_err(|e| e.to_string()),
-            ScalarType::Double => s
-                .parse::<f64>()
-                .map(Self::Double)
-                .map_err(|e| e.to_string()),
-            ScalarType::String => Ok(Self::String(s.into())),
-        }
+        super::convert::scalar_from_str(scalar_type, s).map_err(|e| e.to_string())
     }
 }
 
@@ -311,5 +289,20 @@ mod tests {
             ScalarValue::Boolean(true)
         );
         assert!(ScalarValue::parse(ScalarType::Int, "abc").is_err());
+    }
+
+    /// pvxs `put.cpp:135` stores the text with `Value::from`: an integer is
+    /// `parseTo` at base 0, a bool only "true" or "false" (`data.cpp:525`,
+    /// `:585-589`).
+    #[test]
+    fn parse_reads_text_as_pvxs_copyin_does() {
+        let p = ScalarValue::parse;
+        assert_eq!(p(ScalarType::Int, "010"), Ok(ScalarValue::Int(8)));
+        assert_eq!(p(ScalarType::Int, "0x10"), Ok(ScalarValue::Int(16)));
+        assert_eq!(p(ScalarType::Int, " 5"), Ok(ScalarValue::Int(5)));
+        assert_eq!(p(ScalarType::UByte, "-1"), Ok(ScalarValue::UByte(255)));
+        assert_eq!(p(ScalarType::Double, " 2.5 "), Ok(ScalarValue::Double(2.5)));
+        assert!(p(ScalarType::Boolean, "1").is_err());
+        assert!(p(ScalarType::Boolean, "0").is_err());
     }
 }

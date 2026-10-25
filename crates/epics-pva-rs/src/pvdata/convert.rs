@@ -326,6 +326,33 @@ pub fn parse_to_f64(s: &str) -> Result<f64, NoConvert> {
     })
 }
 
+/// pvxs `Value::copyIn` / `copyOut` of a string as a scalar of type `target`
+/// (`data.cpp:525`, `:585-589`; `:442-463`): an integer is [`parse_to_i64`], an
+/// unsigned [`parse_to_u64`], both cut to the width; a real is
+/// [`parse_to_f64`]; a bool only the exact "true" or "false". Every text to
+/// scalar conversion of a pvData value goes through here.
+pub fn scalar_from_str(target: ScalarType, s: &str) -> Result<ScalarValue, NoConvert> {
+    use ScalarValue as V;
+    Ok(match target {
+        ScalarType::Boolean => match s {
+            "true" => V::Boolean(true),
+            "false" => V::Boolean(false),
+            _ => return Err(NoConvert::new("Unable to assign bool with String")),
+        },
+        ScalarType::Byte => V::Byte(parse_to_i64(s)? as i8),
+        ScalarType::Short => V::Short(parse_to_i64(s)? as i16),
+        ScalarType::Int => V::Int(parse_to_i64(s)? as i32),
+        ScalarType::Long => V::Long(parse_to_i64(s)?),
+        ScalarType::UByte => V::UByte(parse_to_u64(s)? as u8),
+        ScalarType::UShort => V::UShort(parse_to_u64(s)? as u16),
+        ScalarType::UInt => V::UInt(parse_to_u64(s)? as u32),
+        ScalarType::ULong => V::ULong(parse_to_u64(s)?),
+        ScalarType::Float => V::Float(parse_to_f64(s)? as f32),
+        ScalarType::Double => V::Double(parse_to_f64(s)?),
+        ScalarType::String => V::String(s.into()),
+    })
+}
+
 /// `parseTo` around its `std::stoll`/`std::stoull`/`std::stod` `scan`: `None` (ERANGE)
 /// is `std::out_of_range`, raised before the trailing check; nothing
 /// converted is `std::invalid_argument`.

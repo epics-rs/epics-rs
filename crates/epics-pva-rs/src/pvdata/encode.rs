@@ -1231,73 +1231,15 @@ fn encode_pv_field_generic(value: &PvField, desc: &FieldDesc, order: ByteOrder, 
     }
 }
 
-/// Coerce a [`ScalarValue`] to the wire scalar type `st`. Numeric kinds
-/// convert by `as`-cast; anything ↔ String routes through the textual
-/// form. Used by the generic encode fallback so the wire width always
-/// matches the descriptor's tag.
+/// Coerce a [`ScalarValue`] to the wire scalar type `st`, so the wire width
+/// always matches the descriptor's tag: read out as that type, as pvxs
+/// `Value::copyOut` does ([`super::coerce_scalar`]), and zero for a string
+/// that does not parse.
 fn coerce_scalar(v: &ScalarValue, st: ScalarType) -> ScalarValue {
     if v.scalar_type() == st {
         return v.clone();
     }
-    if st == ScalarType::String {
-        return ScalarValue::String(scalar_to_string(v).into());
-    }
-    if let ScalarValue::String(s) = v {
-        // String → numeric: parse, falling back to the zero value.
-        return ScalarValue::parse(st, &s.as_str_lossy()).unwrap_or_else(|_| zero_scalar(st));
-    }
-    // Numeric → numeric: route through f64 / i64 to preserve magnitude. The
-    // double → integer step uses C++ cast semantics, the same as every other
-    // leaf write (`cpp_cast`) — pvxs performs this coercion in
-    // `Value::copyIn` (`data.cpp:551-578`), so a value that does not fit must
-    // overflow the way the C++ cast does rather than saturate the way Rust's
-    // `as` does.
-    let as_f64 = scalar_as_f64(v);
-    use crate::pvdata::cpp_cast::{double_to_i64, double_to_u64};
-    match st {
-        ScalarType::Boolean => ScalarValue::Boolean(as_f64 != 0.0),
-        ScalarType::Byte => ScalarValue::Byte(double_to_i64(as_f64) as i8),
-        ScalarType::UByte => ScalarValue::UByte(double_to_u64(as_f64) as u8),
-        ScalarType::Short => ScalarValue::Short(double_to_i64(as_f64) as i16),
-        ScalarType::UShort => ScalarValue::UShort(double_to_u64(as_f64) as u16),
-        ScalarType::Int => ScalarValue::Int(double_to_i64(as_f64) as i32),
-        ScalarType::UInt => ScalarValue::UInt(double_to_u64(as_f64) as u32),
-        ScalarType::Long => ScalarValue::Long(double_to_i64(as_f64)),
-        ScalarType::ULong => ScalarValue::ULong(double_to_u64(as_f64)),
-        ScalarType::Float => ScalarValue::Float(as_f64 as f32),
-        ScalarType::Double => ScalarValue::Double(as_f64),
-        ScalarType::String => ScalarValue::String(scalar_to_string(v).into()),
-    }
-}
-
-/// Numeric magnitude of a scalar as `f64` (booleans → 0.0/1.0,
-/// strings → parsed or 0.0). Used only by [`coerce_scalar`].
-fn scalar_as_f64(v: &ScalarValue) -> f64 {
-    match v {
-        ScalarValue::Boolean(b) => {
-            if *b {
-                1.0
-            } else {
-                0.0
-            }
-        }
-        ScalarValue::Byte(x) => *x as f64,
-        ScalarValue::UByte(x) => *x as f64,
-        ScalarValue::Short(x) => *x as f64,
-        ScalarValue::UShort(x) => *x as f64,
-        ScalarValue::Int(x) => *x as f64,
-        ScalarValue::UInt(x) => *x as f64,
-        ScalarValue::Long(x) => *x as f64,
-        ScalarValue::ULong(x) => *x as f64,
-        ScalarValue::Float(x) => *x as f64,
-        ScalarValue::Double(x) => *x,
-        ScalarValue::String(s) => s.as_str_lossy().trim().parse().unwrap_or(0.0),
-    }
-}
-
-/// Textual form of a scalar — its `Display` impl.
-fn scalar_to_string(v: &ScalarValue) -> String {
-    format!("{v}")
+    super::coerce_scalar(v, st, super::ScalarCopy::Out).unwrap_or_else(|| zero_scalar(st))
 }
 
 /// Whether a runtime [`PvField`] value can be encoded under descriptor
@@ -3517,6 +3459,18 @@ mod tests {
         let dec = decode_pv_field(&desc, &mut cur, ByteOrder::Little).unwrap();
         assert_eq!(dec, PvField::Scalar(ScalarValue::Double(42.0)));
         assert_eq!(cur.remaining(), 0);
+    }
+
+    /// A string against an integer descriptor parses as pvxs `parseTo`.
+    #[test]
+    fn generic_string_against_an_integer_descriptor_parses_at_base_zero() {
+        let desc = FieldDesc::Scalar(ScalarType::Int);
+        let value = PvField::Scalar(ScalarValue::String("010".into()));
+        let mut buf = Vec::new();
+        encode_pv_field(&value, &desc, ByteOrder::Little, &mut buf);
+        let mut cur = Cursor::new(buf.as_slice());
+        let dec = decode_pv_field(&desc, &mut cur, ByteOrder::Little).unwrap();
+        assert_eq!(dec, PvField::Scalar(ScalarValue::Int(8)));
     }
 
     /// A bare structure value handed against a Union descriptor selects

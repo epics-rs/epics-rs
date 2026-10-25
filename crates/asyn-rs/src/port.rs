@@ -244,6 +244,39 @@ impl DeviceTable {
         Ok(())
     }
 
+    /// C `shutdownPort` (asynManager.c:2253-2310), the one way a port becomes
+    /// defunct: under the `devices` lock, refuse a port that is not
+    /// destructible, clear `enabled` on the port and on every device, set
+    /// `defunct`; then, unlocked, announce `asynExceptionShutdown` on this
+    /// thread. Idempotent.
+    pub(crate) fn shut_down(&self, destructible: bool) -> AsynResult<()> {
+        {
+            let devices = self.devices.lock();
+            if self.shared.defunct.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            if !destructible {
+                return Err(AsynError::Status {
+                    status: AsynStatus::Error,
+                    message: "asynManager:shutdownPort: port does not support shutting down".into(),
+                });
+            }
+            self.port.enabled.store(false, Ordering::Release);
+            // The invariant is `defunct ⟹ !enabled` on *every* dpCommon this
+            // port owns, not only the port's own. Clearing the device slots here
+            // is what makes it hold by construction: `locate_device` seeds a new
+            // slot from the port's now-false `enabled`, and `enable` refuses
+            // while defunct, so nothing can raise a slot back — and
+            // `dp_enabled` needs no defunct branch to answer correctly.
+            for ds in devices.values() {
+                ds.put_enabled(false);
+            }
+            self.shared.defunct.store(true, Ordering::Release);
+        }
+        self.announcer.announce(AsynException::Shutdown, -1);
+        Ok(())
+    }
+
     /// C `autoConnectAsyn` (asynManager.c:2318-2326): store, owe the port's
     /// connect timer to the actor when a disconnected dpCommon turns it on,
     /// then announce `asynExceptionAutoConnect` on this thread.
@@ -1836,51 +1869,7 @@ impl PortDriverBase {
     /// the runtime can drive the same lifecycle via
     /// [`crate::manager::PortManager::shutdown_port`].
     pub fn shutdown_lifecycle(&mut self) -> AsynResult<()> {
-        self.enter_defunct(self.flags.destructible)
-    }
-
-    /// [`Self::shutdown_lifecycle`] for a port whose actor has stopped,
-    /// destructible or not: the stop was asked of the port's own runtime, and
-    /// a port with no actor serves nothing.
-    pub(crate) fn go_defunct(&mut self) {
-        let _ = self.enter_defunct(true);
-    }
-
-    fn enter_defunct(&mut self, destructible: bool) -> AsynResult<()> {
-        // C holds `asynManagerLock` from the defunct check to the store
-        // (asynManager.c:2264-2306), which is what [`DeviceTable::enable`]
-        // takes: no enable can land between them.
-        let devices = Arc::clone(&self.device_states);
-        let devices = devices.lock();
-        if self.is_defunct() {
-            // Idempotent — C asynManager.c:2268-2271 returns asynSuccess.
-            return Ok(());
-        }
-        if !destructible {
-            return Err(AsynError::Status {
-                status: AsynStatus::Error,
-                message: "asynManager:shutdownPort: port does not support shutting down".into(),
-            });
-        }
-        self.enabled.store(false, Ordering::Release);
-        // The invariant is `defunct ⟹ !enabled` on *every* dpCommon this port
-        // owns, not only the port's own. Clearing the device slots here is what
-        // makes it hold by construction: [`Self::device_state`] seeds a new slot
-        // from the port's now-false `enabled`, and [`Self::set_addr_enabled`]
-        // refuses while defunct, so nothing can raise a slot back — and
-        // [`Self::dp_enabled`] needs no defunct branch to answer correctly.
-        // Without this, a slot that happened to exist before the shutdown kept
-        // `enabled = true`, so `isEnabled(ADDR)` answered true on a port that is
-        // gone while `isEnabled(-1)` answered false — the same read disagreeing
-        // with itself depending on whether anything had ever touched that
-        // address.
-        for ds in devices.values() {
-            ds.put_enabled(false);
-        }
-        self.shared.defunct.store(true, Ordering::Release);
-        drop(devices);
-        self.announce_exception(AsynException::Shutdown, -1);
-        Ok(())
+        self.device_table().shut_down(self.flags.destructible)
     }
 
     /// Check that port + device address are both ready — the whole of C's

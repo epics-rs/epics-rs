@@ -8,7 +8,7 @@ use tokio::sync::{broadcast, mpsc};
 
 use crate::error::{AsynError, AsynResult, AsynStatus};
 use crate::interrupt::InterruptManager;
-use crate::port::PortDriver;
+use crate::port::{DeviceTable, PortDriver};
 use crate::port_actor::PortActor;
 use crate::port_handle::PortHandle;
 use crate::registry::PortClaim;
@@ -36,7 +36,7 @@ pub struct PortRuntimeHandle {
     /// a `()` **sent** here — never on this channel closing, which merely means
     /// the last `PortRuntimeHandle` went away (see
     /// `PortActor::run_with_shutdown`).
-    shutdown_tx: Arc<std::sync::Mutex<Option<mpsc::Sender<()>>>>,
+    stop: Arc<StopRequest>,
     /// Receives a single () when the actor thread exits. Used by shutdown_and_wait().
     completion_rx: Arc<std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>>,
     port_name: String,
@@ -62,7 +62,7 @@ impl PortRuntimeHandle {
     ///
     /// Sends an explicit shutdown request; the actor thread exits after
     /// completing any in-progress request. Does not wait for the thread to
-    /// stop. This outranks reachability: the port stops even while other
+    /// stop, but the port is defunct when this returns. This outranks reachability: the port stops even while other
     /// `PortHandle`s (a registry entry, a device-support binding) could still
     /// submit to it, and those submissions then fail — which is the point of
     /// asking for a shutdown.
@@ -70,7 +70,7 @@ impl PortRuntimeHandle {
     /// Repeated calls are harmless: the request is already queued (or the actor
     /// has already gone), and both are a no-op.
     pub fn shutdown(&self) {
-        request_shutdown(&self.shutdown_tx);
+        self.stop.send();
     }
 
     /// Signal shutdown and wait for the actor thread to exit.
@@ -81,12 +81,7 @@ impl PortRuntimeHandle {
     /// because a caller who asked to wait has a reason to; the process-exit
     /// path bounds its wait instead (see `stop_port_actor`).
     pub fn shutdown_and_wait(&self) {
-        stop_port_actor(
-            &self.port_name,
-            &self.shutdown_tx,
-            &self.completion_rx,
-            None,
-        );
+        stop_port_actor(&self.port_name, &self.stop, &self.completion_rx, None);
     }
 
     /// Port name.
@@ -95,17 +90,28 @@ impl PortRuntimeHandle {
     }
 }
 
-/// Ask a port actor to stop. The one site that sends the request, so
+/// Asking a port actor to stop. The one way to send the request, so
 /// [`PortRuntimeHandle::shutdown`] and the process-exit callback cannot drift
 /// apart on what "ask" means.
-fn request_shutdown(shutdown_tx: &Arc<std::sync::Mutex<Option<mpsc::Sender<()>>>>) {
-    // Poison-tolerant: shutdown must stay infallible even if a thread panicked
-    // while holding the lock.
-    let guard = shutdown_tx.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(tx) = guard.as_ref() {
+///
+/// C `shutdownPort` disables the port on the caller's thread
+/// (asynManager.c:2285-2286), and its port thread then skips every request
+/// (:877). So the port is defunct here, before the actor hears of the stop:
+/// a request or connect the actor reaches afterwards is refused by its own
+/// gate, even when the stop lands while the actor is inside the driver.
+struct StopRequest {
+    devices: DeviceTable,
+    tx: mpsc::Sender<()>,
+}
+
+impl StopRequest {
+    fn send(&self) {
+        // Destructible or not: the stop was asked of the port's own runtime,
+        // and a port with no actor serves nothing.
+        let _ = self.devices.shut_down(true);
         // Capacity-1 channel: `Full` means a shutdown is already queued,
         // `Closed` means the actor has already stopped. Neither is an error.
-        let _ = tx.try_send(());
+        let _ = self.tx.try_send(());
     }
 }
 
@@ -113,12 +119,12 @@ fn request_shutdown(shutdown_tx: &Arc<std::sync::Mutex<Option<mpsc::Sender<()>>>
 /// stop sequence, shared by [`PortRuntimeHandle::shutdown_and_wait`] and by the
 /// port's process-exit callback.
 ///
-/// It takes the two channel ends rather than a `PortRuntimeHandle` on purpose.
-/// A `PortRuntimeHandle` carries a `PortHandle`, and a `PortHandle` kept alive
-/// keeps the port alive; the exit callback must be able to stop a port without
-/// having been the reason it was still running. These two ends carry no
-/// reachability: the actor stops on a `()` *sent* on the shutdown channel, never
-/// on it closing.
+/// It takes the stop request and the completion end rather than a
+/// `PortRuntimeHandle` on purpose. A `PortRuntimeHandle` carries a `PortHandle`,
+/// and a `PortHandle` kept alive keeps the port alive; the exit callback must be
+/// able to stop a port without having been the reason it was still running.
+/// Neither carries reachability: the actor stops on a `()` *sent* on the
+/// shutdown channel, never on it closing.
 ///
 /// `wait` bounds how long to wait for the actor thread. `None` blocks. The exit
 /// path passes a bound because the actor may be inside a driver call that
@@ -126,11 +132,11 @@ fn request_shutdown(shutdown_tx: &Arc<std::sync::Mutex<Option<mpsc::Sender<()>>>
 /// able to leave even when one of its ports will not.
 fn stop_port_actor(
     port_name: &str,
-    shutdown_tx: &Arc<std::sync::Mutex<Option<mpsc::Sender<()>>>>,
+    stop: &StopRequest,
     completion_rx: &Arc<std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>>,
     wait: Option<std::time::Duration>,
 ) {
-    request_shutdown(shutdown_tx);
+    stop.send();
     let rx = completion_rx
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -328,6 +334,8 @@ pub fn create_port_runtime_boxed(
     let connect_wait =
         connect_at_registration.then(|| ConnectWaiter::arm(&driver.base().announcer));
 
+    let devices = driver.base().device_table();
+
     // Actor channel
     let (tx, rx) = mpsc::unbounded_channel();
     let actor = PortActor::new(driver, rx);
@@ -402,7 +410,10 @@ pub fn create_port_runtime_boxed(
         port_handle,
         client,
         event_tx,
-        shutdown_tx: Arc::new(std::sync::Mutex::new(Some(shutdown_tx))),
+        stop: Arc::new(StopRequest {
+            devices,
+            tx: shutdown_tx,
+        }),
         completion_rx: Arc::new(std::sync::Mutex::new(Some(completion_rx))),
         port_name,
     };
@@ -424,19 +435,19 @@ pub fn create_port_runtime_boxed(
     // `asynExceptionShutdown` and leaves the destruction to the driver
     // (asynManager.c:2303-2307).
     //
-    // The callback holds the two channel ends, not the runtime handle: holding
-    // a `PortHandle` would keep the port reachable, and so alive, for the life
-    // of the process — turning every port ever created into a leak, and
-    // breaking the "last `PortHandle` dropped stops the port" contract above.
-    // These ends keep nothing alive, exactly as C's callback holds only the
-    // port *name* and looks it up at exit time (asynManager.c:2028-2045).
-    let exit_shutdown_tx = handle.shutdown_tx.clone();
+    // The callback holds the stop request and the completion end, not the
+    // runtime handle: holding a `PortHandle` would keep the port reachable, and
+    // so alive, for the life of the process — turning every port ever created
+    // into a leak, and breaking the "last `PortHandle` dropped stops the port"
+    // contract above. Neither keeps the port reachable, as C's callback holds
+    // only the port *name* and looks it up at exit time (asynManager.c:2028-2045).
+    let exit_stop = handle.stop.clone();
     let exit_completion_rx = handle.completion_rx.clone();
     let exit_port_name = handle.port_name.clone();
     epics_libcom_rs::runtime::exit::at_exit(format!("asynPort {exit_port_name}"), move || {
         stop_port_actor(
             &exit_port_name,
-            &exit_shutdown_tx,
+            &exit_stop,
             &exit_completion_rx,
             Some(PORT_EXIT_STOP_TIMEOUT),
         );
@@ -941,6 +952,93 @@ mod tests {
         assert!(running.join().unwrap().is_ok());
         assert!(queued.join().unwrap().is_err());
         assert_eq!(writes.load(Ordering::SeqCst), 1, "the queued write ran");
+    }
+
+    /// A stop sent while the retry timer's connect runs, with a write queued
+    /// while the port was up. C disables the port on the stopping thread
+    /// (asynManager.c:2285), so its port thread skips the write (:877) whatever
+    /// it was doing when the stop came.
+    #[test]
+    fn a_stop_sent_during_the_timer_connect_runs_no_queued_request() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        struct DropPort {
+            base: PortDriverBase,
+            writes: Arc<AtomicUsize>,
+            slow: Arc<AtomicBool>,
+            connecting: Arc<AtomicBool>,
+        }
+        impl PortDriver for DropPort {
+            fn base(&self) -> &PortDriverBase {
+                &self.base
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.base
+            }
+            fn connect(&mut self, _: &crate::user::AsynUser) -> AsynResult<()> {
+                if self.slow.load(Ordering::SeqCst) {
+                    self.connecting.store(true, Ordering::SeqCst);
+                    std::thread::sleep(std::time::Duration::from_millis(300));
+                }
+                self.base.set_connected(true);
+                Ok(())
+            }
+            fn write_int32(&mut self, _: &mut crate::user::AsynUser, v: i32) -> AsynResult<()> {
+                self.writes.fetch_add(1, Ordering::SeqCst);
+                if v == 1 {
+                    // The line drops under the first write, so the retry timer
+                    // owes a connect once it returns.
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    self.base.set_connected(false);
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }
+                Ok(())
+            }
+        }
+        let writes = Arc::new(AtomicUsize::new(0));
+        let slow = Arc::new(AtomicBool::new(false));
+        let connecting = Arc::new(AtomicBool::new(false));
+        let flags = PortFlags {
+            can_block: true,
+            ..PortFlags::default()
+        };
+        let mut base = TestPort::with_flags("rt_stop_in_timer_connect", flags).base;
+        base.init_auto_connect(true);
+        let port = DropPort {
+            base,
+            writes: writes.clone(),
+            slow: slow.clone(),
+            connecting: connecting.clone(),
+        };
+        let (handle, _jh) = create_port_runtime_unclaimed(port, RuntimeConfig::default())
+            .expect("the port runtime thread must start");
+        let write = |value| {
+            let port = handle.port_handle().clone();
+            std::thread::spawn(move || port.write_int32_blocking(0, 0, value))
+        };
+        let running = write(1);
+        while writes.load(Ordering::SeqCst) == 0 {
+            std::thread::yield_now();
+        }
+        let queued = write(2);
+        slow.store(true, Ordering::SeqCst);
+        let t0 = std::time::Instant::now();
+        while !connecting.load(Ordering::SeqCst) {
+            assert!(
+                t0.elapsed() < std::time::Duration::from_secs(3),
+                "no timer connect"
+            );
+            std::thread::yield_now();
+        }
+
+        handle.shutdown_and_wait();
+        let _ = running.join().unwrap();
+        let queued = queued.join().unwrap();
+        assert!(queued.is_err());
+        assert_eq!(
+            writes.load(Ordering::SeqCst),
+            1,
+            "the write queued when the stop was sent ran: {queued:?}"
+        );
     }
 
     #[test]

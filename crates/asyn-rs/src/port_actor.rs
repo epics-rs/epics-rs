@@ -768,8 +768,7 @@ enum Stop {
 }
 
 impl Stop {
-    /// Whether a stop was sent — the one question [`PortActor::run_with_shutdown`]
-    /// asks before each piece of driver work.
+    /// Whether a stop was sent, so [`PortActor::run_with_shutdown`] can leave.
     fn sent(&mut self) -> bool {
         if let Stop::Listening(rx) = self {
             match rx.try_recv() {
@@ -1390,10 +1389,10 @@ impl PortActor {
     /// "shut this port down" and killed ports that the registry still held a
     /// live `PortHandle` for.
     ///
-    /// A sent stop is taken before the next request whatever the traffic, and
-    /// the port is then defunct, as C `shutdownPort` leaves it
-    /// (asynManager.c:2253-2310): a request still queued never runs, and a
-    /// later one is refused. Only a request already running finishes first.
+    /// The port is defunct before the stop is sent (see
+    /// `runtime::port::StopRequest`), so no request or connect the actor
+    /// reaches after that gets past its gate; the `stop.sent()` checks below
+    /// only make the actor leave promptly, whatever the traffic.
     pub fn run_with_shutdown(self, shutdown_rx: mpsc::Receiver<()>) {
         // Publish our identity for the whole life of the actor thread: every
         // `PortDriver` method we dispatch below runs on this thread, so a
@@ -1467,8 +1466,6 @@ impl PortActor {
                     actor = lend.hand_off(actor, handoff).await;
                 }
 
-                // A stop sent while the request ran: C's port thread does no
-                // auto-connect on a disabled port (asynManager.c:808-811).
                 if stop.sent() {
                     break;
                 }
@@ -1476,7 +1473,6 @@ impl PortActor {
                 // C `portThread`'s post-drain auto-connect, run on every wake.
                 actor.port_thread_auto_connect();
             }
-            actor.driver.base_mut().go_defunct();
             actor
         });
         let _ = actor.driver.shutdown();

@@ -269,9 +269,11 @@ impl PluginAttributes {
     /// `pending` are the updates the processor will return for this frame,
     /// which C has already set when it makes the call.
     pub fn get_attributes(&self, list: &mut NDAttributeList, pending: &[ParamUpdate]) {
-        if let Some(fresh) = self.evaluate(pending) {
-            list.copy_from(&fresh);
-        }
+        self.0.get_attributes_blocking(list, || {
+            let mut sets = begin_now();
+            sets.extend(pending.iter().filter_map(ParamUpdate::stored));
+            sets
+        });
     }
 
     /// The set evaluated now, `None` when it is empty. Inside
@@ -285,14 +287,17 @@ impl PluginAttributes {
         })
     }
 
-    /// [`Self::evaluate`] with `begin`, the frame's `beginProcessCallbacks`
-    /// sets, ahead of `pending`, from outside its `process_array`.
+    /// [`Self::evaluate`] into `list`, cleared first, with `begin`, the
+    /// frame's `beginProcessCallbacks` sets, ahead of `pending`, from outside
+    /// its `process_array`; whether the set was evaluated.
     fn evaluate_after(
         &self,
+        list: &mut NDAttributeList,
         begin: &[PendingParam],
         pending: &[ParamUpdate],
-    ) -> Option<NDAttributeList> {
-        self.0.evaluate_attributes_blocking(|| {
+    ) -> bool {
+        list.clear();
+        self.0.get_attributes_blocking(list, || {
             let mut sets = begin.to_vec();
             sets.extend(pending.iter().filter_map(ParamUpdate::stored));
             sets
@@ -1592,6 +1597,9 @@ struct SharedProcessorInner {
     /// reads it ([`NDPluginProcess::READ_ATTRIBUTES`]).
     attributes: PluginAttributes,
     read_attributes: bool,
+    /// What `endProcessCallbacks`' `getAttributes` last evaluated into, kept
+    /// for the next frame's.
+    attribute_set: NDAttributeList,
     ndarray_params: NDArrayDriverParams,
     plugin_params: PluginBaseParams,
     port_handle: PortHandle,
@@ -1661,35 +1669,34 @@ impl SharedProcessorInner {
     /// (pArray, false, true)` for the array ReadFile publishes
     /// (NDPluginFile.cpp:187-193): count it and, when callbacks are on, the
     /// set it gets.
-    fn begin_published(
-        &mut self,
-        array: &NDArray,
-        callbacks: bool,
-    ) -> (BeginSets, Option<NDAttributeList>) {
+    fn begin_published(&mut self, array: &NDArray, callbacks: bool) -> (BeginSets, bool) {
         self.array_counter += 1;
         let begin = self.begin_sets(array);
-        let attributes = callbacks
-            .then(|| self.attributes.evaluate_after(&begin, &[]))
-            .flatten();
-        (begin, attributes)
+        let evaluated = callbacks
+            && self
+                .attributes
+                .evaluate_after(&mut self.attribute_set, &begin, &[]);
+        (begin, evaluated)
     }
 
     /// `beginProcessCallbacks` and `endProcessCallbacks` for what a write
     /// publishes.
     fn end_published(&mut self, batch: ParamBatch, published: Published) -> ProcessOutput {
         let deliver = self.array_callbacks.get();
-        let (arrays, begin, attributes) = match published {
-            Published::Nothing => (Frame::new(), None, None),
+        let (arrays, begin, evaluated) = match published {
+            Published::Nothing => (Frame::new(), None, false),
             Published::Read(array) => {
-                let (begin, attributes) = self.begin_published(&array, deliver);
+                let (begin, evaluated) = self.begin_published(&array, deliver);
                 (
                     smallvec::smallvec![Arc::clone(&array)],
                     Some((array, begin)),
-                    attributes,
+                    evaluated,
                 )
             }
         };
-        let ready = self.delivery.end_written(arrays, attributes.as_ref());
+        let ready = self
+            .delivery
+            .end_written(arrays, evaluated.then_some(&self.attribute_set));
         let mut output = self.build_publish_batch(
             batch,
             ready,
@@ -1864,14 +1871,17 @@ impl SharedProcessorInner {
         // route whenever we deliver downstream OR serve the StdArray waveforms.
         let produced = result.output_arrays.len();
         // `getAttributes` only past the NDArrayCallbacks return (:289).
-        let attributes = (self.array_callbacks.get()
+        let evaluated = self.array_callbacks.get()
             && self.read_attributes
-            && !result.output_arrays.is_empty())
-        .then(|| self.attributes.evaluate_after(begin, &result.param_updates))
-        .flatten();
+            && !result.output_arrays.is_empty()
+            && self.attributes.evaluate_after(
+                &mut self.attribute_set,
+                begin,
+                &result.param_updates,
+            );
         let ready = self.delivery.end_process(
             result.output_arrays,
-            attributes.as_ref(),
+            evaluated.then_some(&self.attribute_set),
             CopyArray::IfInput(array),
         );
         // A StdArrays frame that produced a waveform which the MaxByteRate
@@ -3589,6 +3599,7 @@ pub fn create_plugin_runtime_with_output<P: NDPluginProcess>(
         delivery,
         attributes: PluginAttributes(Arc::clone(own_pool.owner())),
         read_attributes: P::READ_ATTRIBUTES,
+        attribute_set: NDAttributeList::new(),
         ndarray_params,
         plugin_params,
         port_handle,

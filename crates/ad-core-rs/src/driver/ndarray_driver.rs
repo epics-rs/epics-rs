@@ -729,8 +729,8 @@ impl DriverAttributes {
         attributes: &mut crate::attributes::NDAttributeList,
     ) {
         if !self.list.is_empty() {
-            let fresh = self.update(port_base);
-            attributes.copy_from(&fresh);
+            self.update_values(port_base, &[]);
+            attributes.copy_from(&self.list);
         }
     }
 
@@ -934,8 +934,34 @@ impl DriverAttributes {
     /// attributes read whatever value a CA-monitor task last fed into their
     /// cell. `CONST` / `DRIVER` attributes are static.
     pub fn update(&mut self, port_base: &PortDriverBase) -> crate::attributes::NDAttributeList {
-        let reads = self.param_reads(port_base, &[]);
-        self.update_with(&reads, &[])
+        self.update_values(port_base, &[]);
+        self.list.clone()
+    }
+
+    /// [`Self::update`] in place, with `pending` read as
+    /// [`Self::update_with`] reads it.
+    pub fn update_values(&mut self, port_base: &PortDriverBase, pending: &[PendingParam]) {
+        for attr in self.list.iter() {
+            let Some(src) = attr.param_source() else {
+                continue;
+            };
+            let Some(index) = port_base.params.find_param(&src.param_name) else {
+                continue;
+            };
+            let stored = port_base
+                .params
+                .get_value(index, src.addr)
+                .ok()
+                .map(std::mem::discriminant);
+            let value = match latest_pending(pending, index, src.addr, stored) {
+                Some(value) => read_as(value, src.param_type),
+                None => Self::read_param_value(port_base, src),
+            };
+            if let Some(value) = value {
+                src.cell().set(value);
+            }
+        }
+        self.list.update_values();
     }
 
     /// The store half of [`Self::update`]: every `PARAM` attribute's read,
@@ -1063,15 +1089,25 @@ struct ParamRead {
 }
 
 impl ParamRead {
-    /// The latest pending set of this param that C's set would have stored.
     fn pending<'a>(&self, pending: &'a [PendingParam]) -> Option<&'a ParamValue> {
-        pending
-            .iter()
-            .rev()
-            .find(|(reason, addr, _)| *reason == self.index && *addr == self.addr)
-            .map(|(_, _, value)| value)
-            .filter(|value| Some(std::mem::discriminant(*value)) == self.stored)
+        latest_pending(pending, self.index, self.addr, self.stored)
     }
+}
+
+/// The latest pending set of a param that C's set would have stored: one of
+/// the `stored` value's type.
+fn latest_pending(
+    pending: &[PendingParam],
+    index: usize,
+    addr: i32,
+    stored: Option<std::mem::Discriminant<ParamValue>>,
+) -> Option<&ParamValue> {
+    pending
+        .iter()
+        .rev()
+        .find(|(reason, at, _)| *reason == index && *at == addr)
+        .map(|(_, _, value)| value)
+        .filter(|value| Some(std::mem::discriminant(*value)) == stored)
 }
 
 /// `value` through the getter `param_type` names; a type the getter cannot
@@ -1544,25 +1580,43 @@ impl ArrayOwner {
         &self,
         pending: impl FnOnce() -> Vec<PendingParam>,
     ) -> Option<crate::attributes::NDAttributeList> {
+        let mut list = crate::attributes::NDAttributeList::new();
+        self.get_attributes_blocking(&mut list, pending)
+            .then_some(list)
+    }
+
+    /// [`Self::evaluate_attributes_blocking`] merged onto `list` in place;
+    /// whether the set was evaluated.
+    pub fn get_attributes_blocking(
+        &self,
+        list: &mut crate::attributes::NDAttributeList,
+        pending: impl FnOnce() -> Vec<PendingParam>,
+    ) -> bool {
         if self.attributes.lock().list.is_empty() {
-            return None;
+            return false;
         }
-        let port = self.port()?;
+        let Some(port) = self.port() else {
+            return false;
+        };
         let pending = pending();
         let attributes = self.attributes.clone();
-        let fresh = Arc::new(parking_lot::Mutex::new(None));
-        let slot = fresh.clone();
+        // Lent to the call and taken back whether or not it ran.
+        let lent = Arc::new(parking_lot::Mutex::new((std::mem::take(list), false)));
+        let slot = lent.clone();
         let call = asyn_rs::request::DriverCall::new(move |driver| {
-            let base = driver.base();
             let mut attributes = attributes.lock();
-            let reads = attributes.param_reads(base, &pending);
-            *slot.lock() = Some(attributes.update_with(&reads, &pending));
+            attributes.update_values(driver.base(), &pending);
+            let (list, merged) = &mut *slot.lock();
+            list.copy_from(&attributes.list);
+            *merged = true;
         });
         let _ = port.submit_blocking(
             asyn_rs::request::RequestOp::WithDriver(call),
             asyn_rs::user::AsynUser::default(),
         );
-        fresh.lock().take()
+        let (taken, merged) = std::mem::take(&mut *lent.lock());
+        *list = taken;
+        merged
     }
 
     /// The store half of [`Self::evaluate_attributes_blocking`], for a

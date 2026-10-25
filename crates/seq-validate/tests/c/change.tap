@@ -1,51 +1,66 @@
 1..50
 ok  1 - state=zero, x=0
+# new random x=-2
 ok  2 - state=neg, x=-2
 ok  3 - state=neg, x=-1
 ok  4 - state=zero, x=0
+# new random x=1
 ok  5 - state=pos, x=1
 ok  6 - state=zero, x=0
+# new random x=2
 ok  7 - state=pos, x=2
 ok  8 - state=pos, x=1
 ok  9 - state=zero, x=0
+# new random x=0
 ok 10 - state=zero, x=0
+# new random x=-2
 ok 11 - state=neg, x=-2
 ok 12 - state=neg, x=-1
 ok 13 - state=zero, x=0
+# new random x=0
 ok 14 - state=zero, x=0
+# new random x=1
 ok 15 - state=pos, x=1
 ok 16 - state=zero, x=0
+# new random x=-3
 ok 17 - state=neg, x=-3
 ok 18 - state=neg, x=-2
 ok 19 - state=neg, x=-1
 ok 20 - state=zero, x=0
+# new random x=4
 ok 21 - state=pos, x=4
 ok 22 - state=pos, x=3
 ok 23 - state=pos, x=2
 ok 24 - state=pos, x=1
 ok 25 - state=zero, x=0
+# new random x=-4
 ok 26 - state=neg, x=-4
 ok 27 - state=neg, x=-3
 ok 28 - state=neg, x=-2
 ok 29 - state=neg, x=-1
 ok 30 - state=zero, x=0
+# new random x=-3
 ok 31 - state=neg, x=-3
 ok 32 - state=neg, x=-2
 ok 33 - state=neg, x=-1
 ok 34 - state=zero, x=0
+# new random x=2
 ok 35 - state=pos, x=2
 ok 36 - state=pos, x=1
 ok 37 - state=zero, x=0
+# new random x=-5
 ok 38 - state=neg, x=-5
 ok 39 - state=neg, x=-4
 ok 40 - state=neg, x=-3
 ok 41 - state=neg, x=-2
 ok 42 - state=neg, x=-1
 ok 43 - state=zero, x=0
+# new random x=4
 ok 44 - state=pos, x=4
 ok 45 - state=pos, x=3
 ok 46 - state=pos, x=2
 ok 47 - state=pos, x=1
 ok 48 - state=zero, x=0
+# new random x=-2
 ok 49 - state=neg, x=-2
 ok 50 - state=neg, x=-1

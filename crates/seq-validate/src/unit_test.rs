@@ -28,6 +28,8 @@ pub struct Report {
     /// `testPlan`'s argument; 0 before it is called.
     pub planned: c_int,
     pub results: Vec<TestResult>,
+    /// `testDiag`'s lines, without the `# `.
+    pub diags: Vec<String>,
     /// `testDone`'s return, once it is called.
     pub done: Option<c_int>,
 }
@@ -41,6 +43,7 @@ pub use self::{
 static REPORT: Mutex<Report> = Mutex::new(Report {
     planned: 0,
     results: Vec::new(),
+    diags: Vec::new(),
     done: None,
 });
 
@@ -52,8 +55,10 @@ pub fn report() -> Report {
 /// `testPlan`.
 pub fn test_plan(plan: c_int) {
     let mut r = REPORT.lock();
+    // C's resets its counts; a diagnostic is output, not a count.
     *r = Report {
         planned: plan,
+        diags: std::mem::take(&mut r.diags),
         ..Report::default()
     };
     if plan != 0 {
@@ -103,9 +108,10 @@ pub fn test_fail(fmt: impl CSrc, args: &[CArg<'_>]) {
 
 /// `testDiag`.
 pub fn test_diag(fmt: impl CSrc, args: &[CArg<'_>]) -> c_int {
-    let line = format!("# {}\n", format(fmt, args));
-    let _held = REPORT.lock();
-    stdout_bytes(line.as_bytes());
+    let diag = format(fmt, args);
+    let mut r = REPORT.lock();
+    stdout_bytes(format!("# {diag}\n").as_bytes());
+    r.diags.push(diag);
     0
 }
 

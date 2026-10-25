@@ -1,2 +1,24 @@
 1..1
+# start
+# passed 1000 runs
+# passed 2000 runs
+# passed 3000 runs
+# passed 4000 runs
+# passed 5000 runs
+# passed 6000 runs
+# passed 7000 runs
+# passed 8000 runs
+# passed 9000 runs
+# passed 10000 runs
+# passed 11000 runs
+# passed 12000 runs
+# passed 13000 runs
+# passed 14000 runs
+# passed 15000 runs
+# passed 16000 runs
+# passed 17000 runs
+# passed 18000 runs
+# passed 19000 runs
+# passed 20000 runs
 ok  1 - 40000 pvGets completed in time and results agree with predictions
+# exit

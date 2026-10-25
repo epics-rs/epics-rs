@@ -50,13 +50,22 @@ async fn ioc_init(stem: &str) -> Arc<PvDatabase> {
     db
 }
 
-/// The plan and the `ok` / `not ok` lines of a TAP stream.
-fn parse_tap(tap: &str) -> (i32, Vec<(bool, String)>) {
+/// A TAP stream's plan, `ok` / `not ok` lines and `# ` diagnostics.
+struct Tap {
+    plan: i32,
+    results: Vec<(bool, String)>,
+    diags: Vec<String>,
+}
+
+fn parse_tap(tap: &str) -> Tap {
     let mut plan = None;
     let mut results = Vec::new();
+    let mut diags = Vec::new();
     for line in tap.lines() {
         if let Some(n) = line.strip_prefix("1..") {
             plan = Some(n.parse().expect("plan"));
+        } else if let Some(diag) = line.strip_prefix("# ") {
+            diags.push(diag.to_owned());
         } else {
             let (ok, rest) = match line.strip_prefix("not ok ") {
                 Some(rest) => (false, rest),
@@ -67,7 +76,11 @@ fn parse_tap(tap: &str) -> (i32, Vec<(bool, String)>) {
             results.push((ok, desc.to_owned()));
         }
     }
-    (plan.expect("a plan line"), results)
+    Tap {
+        plan: plan.expect("a plan line"),
+        results,
+        diags,
+    }
 }
 
 /// Run `prog` as `<stem>.t` does and hold its report to `golden`.
@@ -107,8 +120,8 @@ async fn wait_for_exit(stem: &str, timeout: Duration) -> Report {
     }
 }
 
-/// C's text where the rs run-time fixes the C defect that printed it:
-/// `(stem, C's, rs's)`.
+/// C's text, in a description or a diagnostic, where the rs run-time fixes
+/// the C defect that printed it: `(stem, C's, rs's)`.
 const C_DEFECTS: &[(&str, &str, &str)] = &[
     // seq_if.c `completion_timeout` picks its message with `pvEventGet ?`,
     // a test of the constant 0, so a get's timeout says "put".
@@ -120,10 +133,15 @@ const C_DEFECTS: &[(&str, &str, &str)] = &[
 ];
 
 fn check(stem: &str, report: &Report, golden: &str) {
-    let (plan, mut c) = parse_tap(golden);
+    let Tap {
+        plan,
+        results: mut c,
+        diags: mut c_diags,
+    } = parse_tap(golden);
     for (_, c_text, rs_text) in C_DEFECTS.iter().filter(|(s, ..)| *s == stem) {
-        for (_, desc) in &mut c {
-            *desc = desc.replace(c_text, rs_text);
+        let texts = c.iter_mut().map(|(_, desc)| desc).chain(&mut c_diags);
+        for text in texts {
+            *text = text.replace(c_text, rs_text);
         }
     }
     assert_eq!(report.planned, plan, "{stem}: testPlan");
@@ -143,6 +161,12 @@ fn check(stem: &str, report: &Report, golden: &str) {
     }
     let testok1 = report.results.iter().filter(|r| r.desc.is_none()).count();
     assert_eq!(testok1, c_descs.len(), "{stem}: testOk1 results");
+    // Diagnostics as a multiset for the same reason; each is the same in
+    // every C run, rand()'s too, as nothing seeds it.
+    let mut rs_diags = report.diags.clone();
+    rs_diags.sort();
+    c_diags.sort();
+    assert_eq!(rs_diags, c_diags, "{stem}: testDiag");
     assert!(report.done.is_some(), "{stem}: testDone");
 }
 

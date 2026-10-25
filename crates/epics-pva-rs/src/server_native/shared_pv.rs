@@ -1090,19 +1090,20 @@ impl SharedPV {
     /// pvxs `SharedPV::buildMailbox` `onPut` timestamp-fill
     /// (`sharedpv.cpp:113-121`): when the merged value carries a
     /// top-level `timeStamp` structure that the client marked neither at
-    /// its own bit nor at any descendant, stamp `secondsPastEpoch` /
-    /// `nanoseconds` from the server's current POSIX time. A
-    /// client-supplied (marked) timeStamp is left untouched.
+    /// the root, at its own bit, nor at any descendant, stamp
+    /// `secondsPastEpoch` / `nanoseconds` from the server's current POSIX
+    /// time. A client-supplied (marked) timeStamp is left untouched.
     ///
     /// `desc` / `changed` use the wire bit numbering (pvData §5.4); the
     /// "marked" test covers the root bit (its only parent) and
     /// `[ts_bit, ts_bit + total_bits)` — the field's own bit plus every
-    /// descendant — matching pvxs `isMarked(true, true)`. A stamped leaf is marked in `changed`, as pvxs's assignment
-    /// marks it. Child leaves are rewritten in place, preserving their
-    /// declared integer type so the merged value still fits the opened
-    /// descriptor. Mailbox-only: a custom `on_put` handler owns its own
-    /// timestamp policy, exactly as pvxs installs this fill only in
-    /// `buildMailbox` (a full-value `post`/[`Self::put`] is not stamped).
+    /// descendant — matching pvxs `isMarked(true, true)`. A stamped leaf
+    /// is marked in `changed`, as pvxs's assignment marks it. Child
+    /// leaves are rewritten in place, preserving their declared integer
+    /// type so the merged value still fits the opened descriptor.
+    /// Mailbox-only: a custom `on_put` handler owns its own timestamp
+    /// policy, exactly as pvxs installs this fill only in `buildMailbox`
+    /// (a full-value `post`/[`Self::put`] is not stamped).
     fn fill_mailbox_timestamp(desc: &FieldDesc, changed: &mut BitSet, value: &mut PvField) {
         use crate::pvdata::ScalarValue;
         // Locate the top-level `timeStamp` field and its bit offset

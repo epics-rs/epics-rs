@@ -239,6 +239,7 @@ validate!(
     120
 );
 validate!(norace, norace::noraceTest, "norace", 60);
+validate!(optt_var, optt_var::opttVarTest, "opttVar", 30);
 validate!(
     pv_assign_stress,
     pv_assign_stress::pvAssignStressTest,

@@ -52,6 +52,7 @@ program!(exit_optx, "exitOptx");
 program!(local, "local");
 program!(monitor_evflag, "monitorEvflag", r#"#include <stdio.h>"# => {});
 program!(norace, "norace"; use crate::seq_snc::MAX_STRING_SIZE;);
+program!(optt_var, "opttVar"; use epics_seq_rs::c::{sprintf, strcmp};);
 program!(pv_assign_stress, "pvAssignStress");
 program!(pv_assign_subst, "pvAssignSubst"; use epics_seq_rs::c::strcmp;);
 program!(pv_get_async, "pvGetAsync");

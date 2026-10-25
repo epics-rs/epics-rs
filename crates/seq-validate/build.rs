@@ -55,6 +55,7 @@ fn seq_validate_programs() -> &'static [&'static str] {
         "local",
         "monitorEvflag",
         "norace",
+        "opttVar",
         "pvAssignStress",
         "pvAssignSubst",
         "pvGetAsync",

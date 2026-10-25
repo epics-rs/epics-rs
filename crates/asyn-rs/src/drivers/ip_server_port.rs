@@ -255,6 +255,31 @@ struct SlotFailure {
     error: AsynError,
 }
 
+/// A slot read that succeeded: the bytes it moved, and whether it was the
+/// peer's close.
+struct SlotRead {
+    n: usize,
+    /// C's `recv() == 0` on a stream (drvAsynIPPort.c:869-875): the read ran
+    /// `closeConnection`, as a failure's `closed` does, and is still
+    /// `asynSuccess`, with no bytes and END.
+    peer_closed: bool,
+}
+
+impl SlotRead {
+    /// C `readIt`'s eomReason (:869-882): END for the close, CNT when the
+    /// read filled the `maxchars` buffer.
+    fn eom(&self, maxchars: usize) -> EomReason {
+        let mut eom = EomReason::empty();
+        if self.peer_closed {
+            eom |= EomReason::END;
+        }
+        if self.n >= maxchars {
+            eom |= EomReason::CNT;
+        }
+        eom
+    }
+}
+
 impl SlotFailure {
     /// The socket survives — C's `asynTimeout` branch, and the pre-socket
     /// refusals (`maxchars == 0`, no client in the slot).
@@ -442,7 +467,7 @@ impl ClientSlot {
         buf: &mut [u8],
         timeout: Option<Duration>,
         device: &str,
-    ) -> Result<usize, SlotFailure> {
+    ) -> Result<SlotRead, SlotFailure> {
         // C readIt (drvAsynIPPort.c:787-791): reject maxchars == 0 before
         // touching the socket; an empty buffer would otherwise read Ok(0) and be
         // misclassified as a peer EOF, tearing down a healthy connection.
@@ -485,12 +510,15 @@ impl ClientSlot {
         match res {
             Ok(0) => {
                 self.clear();
-                Err(SlotFailure::closed(AsynError::Status {
-                    status: AsynStatus::Disconnected,
-                    message: format!("{device} peer closed"),
-                }))
+                Ok(SlotRead {
+                    n: 0,
+                    peer_closed: true,
+                })
             }
-            Ok(n) => Ok(n),
+            Ok(n) => Ok(SlotRead {
+                n,
+                peer_closed: false,
+            }),
             Err(e) => Err(self.classify_read_error(e, device, timeout)),
         }
     }
@@ -1538,17 +1566,12 @@ impl DrvAsynIPServerPort {
         buf: &mut [u8],
     ) -> AsynResult<(usize, EomReason)> {
         let arc = self.slot_arc(user.addr)?;
-        let n = arc
+        let read = arc
             .read_or_close(buf, user.timeout, &self.server_info)
             .map_err(|f| f.error)?;
         // C parity: CNT only when the requested count was reached; a short
         // read leaves the reason empty so the EOS interpose keeps reading.
-        let eom = if n >= buf.len() {
-            EomReason::CNT
-        } else {
-            EomReason::empty()
-        };
-        Ok((n, eom))
+        Ok((read.n, read.eom(buf.len())))
     }
 
     /// C `readIt` (drvAsynIPServerPort.c:166-250), the UDP server's read:
@@ -1816,10 +1839,14 @@ impl DrvAsynIPSubport {
     /// announces the drop once; the edge guard in `set_connected` is that one
     /// announcement.
     fn finish_slot_failure(&mut self, failure: SlotFailure) -> AsynError {
-        if failure.closed {
+        self.finish_slot_close(failure.closed);
+        failure.error
+    }
+
+    fn finish_slot_close(&mut self, closed: bool) {
+        if closed {
             self.base.set_connected(false);
         }
-        failure.error
     }
 }
 
@@ -1889,12 +1916,14 @@ impl PortDriver for DrvAsynIPSubport {
         Ok(())
     }
 
-    /// A slot read moves bytes or fails having moved none; CNT marks a
-    /// filled buffer (`read_or_close` refuses an empty one).
+    /// A slot read moves bytes or fails having moved none; a peer's close
+    /// is a read of none, and closes the slot as a failure can.
     fn io_read_octet(&mut self, user: &AsynUser, buf: &mut [u8]) -> OctetReadResult {
         match self.slot.read_or_close(buf, user.timeout, &self.host_info) {
-            Ok(n) if n == buf.len() => OctetReadResult::ok(n, EomReason::CNT),
-            Ok(n) => OctetReadResult::ok(n, EomReason::empty()),
+            Ok(read) => {
+                self.finish_slot_close(read.peer_closed);
+                OctetReadResult::ok(read.n, read.eom(buf.len()))
+            }
             Err(f) => OctetReadResult::failed(self.finish_slot_failure(f)),
         }
     }
@@ -1984,7 +2013,7 @@ mod tests {
     }
 
     /// Re-drive slot reads until the peer's abortive close (RST) becomes
-    /// **visible** to the server read, then return the teardown failure. Each
+    /// **visible** to the server read, then return the teardown read. Each
     /// `step` performs one read and reports whether the slot is now torn down
     /// (occupied cell cleared / child disconnected — the two are the same shared
     /// cell).
@@ -2003,7 +2032,7 @@ mod tests {
     ///   (`asynError`, :859) and a stream EOF `recv()==0` (`asynSuccess`+END,
     ///   :873). Linux delivers an abortive close as `ECONNRESET` (the port's
     ///   `asynError`); macOS/BSD can deliver the very same close as a plain
-    ///   `recv()==0` EOF (the port's `asynDisconnected`). So accept either.
+    ///   `recv()==0` EOF (`Ok(0)`). So accept either.
     ///
     /// Once the RST surfaces the read returns a fatal status, and by then
     /// `read_or_close` has already `clear()`ed the slot on *this* thread — inside
@@ -2016,26 +2045,29 @@ mod tests {
     ///
     /// The bounded deadline means a slot whose RST never surfaces still fails
     /// loudly rather than hanging.
-    fn read_until_slot_torn_down(mut step: impl FnMut() -> (AsynResult<usize>, bool)) -> AsynError {
+    fn read_until_slot_torn_down(
+        mut step: impl FnMut() -> (AsynResult<usize>, bool),
+    ) -> AsynResult<usize> {
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         loop {
             let (res, torn_down) = step();
             match res {
-                Ok(n) => panic!("a reset peer cannot deliver {n} bytes"),
                 // A retryable asynTimeout means the RST is not yet visible and the
                 // socket is still intact (C readIt :861-865). Never teardown.
-                Err(e) if e.status() == AsynStatus::Timeout => {}
-                // Any other status is C's teardown — fatal-errno asynError, or a
-                // recv()==0 EOF asynDisconnected. `read_or_close` clears the slot
-                // on this thread before returning, so it MUST be torn down now.
-                Err(e) => {
+                Err(ref e) if e.status() == AsynStatus::Timeout => {}
+                // Any other failure, or a read of nothing, is C's teardown —
+                // fatal-errno asynError, or a recv()==0 EOF. `read_or_close` clears
+                // the slot on this thread before returning, so it MUST be torn
+                // down now.
+                Ok(0) | Err(_) => {
                     assert!(
                         torn_down,
-                        "the read returned teardown status {e:?} but the slot is \
+                        "the read returned teardown {res:?} but the slot is \
                          still occupied — read_or_close must clear() before returning"
                     );
-                    return e;
+                    return res;
                 }
+                Ok(n) => panic!("a closed peer cannot deliver {n} bytes"),
             }
             assert!(
                 std::time::Instant::now() < deadline,
@@ -2441,16 +2473,16 @@ mod tests {
         // Re-drive the read past a not-yet-visible RST until the abortive close
         // surfaces. Each step reads then reports whether the slot is now free. The
         // helper accepts C's fatal-errno asynError (Linux ECONNRESET) or recv==0
-        // EOF asynDisconnected (macOS), never a retryable Timeout, and asserts the
-        // slot is torn down in the same step the fatal status appears (read_or_close
-        // clears it on this thread before returning).
-        let err = read_until_slot_torn_down(|| {
+        // EOF (macOS), never a retryable Timeout, and asserts the slot is torn
+        // down in the same step the teardown appears (read_or_close clears it on
+        // this thread before returning).
+        let res = read_until_slot_torn_down(|| {
             let res = srv.io_read_octet(&read_user, &mut buf).into_count();
             (res, !srv.slots[0].is_occupied())
         });
         assert!(
-            matches!(err.status(), AsynStatus::Error | AsynStatus::Disconnected),
-            "an abortive close is C's fatal-errno asynError or a recv==0 EOF, got {err:?}"
+            matches!(&res, Ok(0)) || matches!(&res, Err(e) if e.status() == AsynStatus::Error),
+            "an abortive close is C's fatal-errno asynError or a recv==0 EOF, got {res:?}"
         );
         // Guaranteed by the helper's exit condition; kept as an explicit statement
         // of the C invariant (closeConnection frees the slot, not just on EOF).
@@ -2625,7 +2657,7 @@ mod tests {
         drop(client);
         let read_user = AsynUser::default().with_timeout(Duration::from_millis(200));
         let mut buf = [0u8; 64];
-        read_until_slot_torn_down(|| {
+        let _ = read_until_slot_torn_down(|| {
             let res = child.io_read_octet(&read_user, &mut buf).into_count();
             (res, !child.base().is_connected())
         });
@@ -2634,6 +2666,58 @@ mod tests {
             [(AsynException::Connect, -1), (AsynException::Connect, -1)],
             "one connect, one disconnect"
         );
+    }
+
+    /// `read` until the peer's close is visible: the first outcome that is not
+    /// a retryable timeout.
+    fn read_past_timeouts(mut read: impl FnMut() -> OctetReadResult) -> OctetReadResult {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let r = read();
+            if !matches!(&r.status, Err(e) if e.status() == AsynStatus::Timeout) {
+                return r;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the close never surfaced"
+            );
+        }
+    }
+
+    /// C serves a client with a `drvAsynIPPort` child, whose `readIt` takes the
+    /// peer's FIN (`recv() == 0`) as `closeConnection` and still returns
+    /// `asynSuccess`, with no bytes and END (drvAsynIPPort.c:869-885). The read
+    /// failed with `asynDisconnected`, an error C does not report, so a program
+    /// that reads a line per request (asyn's ipSNCServer.st) took the close for
+    /// a read error.
+    #[test]
+    fn a_peer_close_is_a_successful_read_of_nothing_with_end() {
+        let mut config = IpServerConfig::parse("127.0.0.1:0 TCP").unwrap();
+        config.max_clients = 1;
+        let mut srv = DrvAsynIPServerPort::with_config("fin_is_end", config).unwrap();
+        srv.connect(&AsynUser::default()).unwrap();
+        let port = srv.local_port();
+        let mut child = srv.make_subport(0).unwrap();
+        let read_user = AsynUser::default().with_timeout(Duration::from_millis(200));
+        let mut buf = [0u8; 64];
+
+        let client = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        wait_for_slot(&srv, 0);
+        child.connect(&AsynUser::default()).unwrap();
+        drop(client);
+        let read = read_past_timeouts(|| child.io_read_octet(&read_user, &mut buf));
+        assert_eq!(read.unwrap(), (0, EomReason::END));
+        assert!(!child.base().is_connected());
+        assert!(!srv.slots[0].is_occupied());
+
+        // The parent's addressed read of the slot is the same read.
+        let client = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        wait_for_slot(&srv, 0);
+        drop(client);
+        let read_user = read_user.with_addr(0);
+        let read = read_past_timeouts(|| srv.io_read_octet(&read_user, &mut buf));
+        assert_eq!(read.unwrap(), (0, EomReason::END));
+        assert!(!srv.slots[0].is_occupied());
     }
 
     /// C's listener publishes the child's connect edge itself (`connectDevice`,
@@ -2779,15 +2863,15 @@ mod tests {
         // Same abortive-close portability as `a_fatal_read_error_frees_the_client_slot`:
         // re-drive the read past a not-yet-visible RST until the close surfaces
         // (the child's `is_connected` is the slot's own shared cell), and accept
-        // either C teardown status (fatal-errno asynError on Linux, recv==0 EOF
-        // asynDisconnected on macOS) — never a retryable Timeout.
-        let err = read_until_slot_torn_down(|| {
+        // either C teardown (fatal-errno asynError on Linux, recv==0 EOF on
+        // macOS) — never a retryable Timeout.
+        let res = read_until_slot_torn_down(|| {
             let res = child.io_read_octet(&read_user, &mut buf).into_count();
             (res, !child.base().is_connected())
         });
         assert!(
-            matches!(err.status(), AsynStatus::Error | AsynStatus::Disconnected),
-            "an abortive close is C's fatal-errno asynError or a recv==0 EOF, got {err:?}"
+            matches!(&res, Ok(0)) || matches!(&res, Err(e) if e.status() == AsynStatus::Error),
+            "an abortive close is C's fatal-errno asynError or a recv==0 EOF, got {res:?}"
         );
         // Guaranteed by the helper's exit condition; kept as an explicit statement
         // of the C invariant (closeConnection + exceptionDisconnect on the child).

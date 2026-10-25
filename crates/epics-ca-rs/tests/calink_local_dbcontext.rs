@@ -31,9 +31,11 @@ where
     let db_path = dir.path().join("local.db");
     std::fs::write(&db_path, db_text).expect("write db");
     let stcmd_path = dir.path().join("st.cmd");
+    // Without the `iocInit` the script is a custom `main`'s and the body
+    // never runs.
     std::fs::write(
         &stcmd_path,
-        format!("dbLoadRecords(\"{}\")\n", db_path.display()),
+        format!("dbLoadRecords(\"{}\")\niocInit\n", db_path.display()),
     )
     .expect("write st.cmd");
 

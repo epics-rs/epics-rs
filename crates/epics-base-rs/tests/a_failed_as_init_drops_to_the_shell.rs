@@ -19,7 +19,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use epics_base_rs::server::ioc_app::{IocApplication, IocInitDecision};
+use epics_base_rs::server::ioc_app::{IocApplication, IocInitDecision, RunOutcome};
 
 /// `interactive: true` for the same reason the skipped-arm test uses it:
 /// under a test harness stdin is already at EOF, so C's `iocsh(NULL)` returns
@@ -30,6 +30,10 @@ use epics_base_rs::server::ioc_app::{IocApplication, IocInitDecision};
 async fn a_failed_as_init_reaches_the_shell_and_serves_nothing() {
     let served = Arc::new(AtomicBool::new(false));
     let flag = Arc::clone(&served);
+    // Nothing is served by a build that never started either; this hook
+    // comes before `asInit`.
+    let built = Arc::new(AtomicBool::new(false));
+    let built_flag = Arc::clone(&built);
 
     let outcome = IocApplication::new()
         .port(0)
@@ -37,6 +41,9 @@ async fn a_failed_as_init_reaches_the_shell_and_serves_nothing() {
         // `iocBuild_2`'s `asInit()` is what fails on it.
         .startup_line(r#"asSetFilename("/no/such/directory/nope.acf")"#)
         .before_ioc_init(|| IocInitDecision::run(true))
+        .register_after_init_database(move |_db, _acf| async move {
+            built_flag.store(true, Ordering::SeqCst);
+        })
         .run(move |_config| async move {
             flag.store(true, Ordering::SeqCst);
             Ok(())
@@ -48,6 +55,7 @@ async fn a_failed_as_init_reaches_the_shell_and_serves_nothing() {
         "a failed asInit must reach the shell and end the way C's \
          epicsExit(0) does, got {outcome:?}"
     );
+    assert!(built.load(Ordering::SeqCst), "the build never started");
     assert!(
         !served.load(Ordering::SeqCst),
         "iocRun never runs after a failed iocBuild, so nothing may be served"
@@ -87,12 +95,23 @@ async fn a_script_s_failed_ioc_init_reaches_the_shell() {
         "asSetFilename(\"/no/such/directory/nope.acf\")\niocInit\n",
     )
     .unwrap();
+    // The build reached `asInit`, which comes after this hook; a script whose
+    // `iocInit` never built ends `NeverInitialised` the same way.
+    let built = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&built);
     let outcome = IocApplication::new()
         .port(0)
         .startup_script(script.to_str().unwrap())
         .before_ioc_init(|| IocInitDecision::skip(true))
-        .run(|_config| async { Ok(()) })
+        .register_after_init_database(move |_db, _acf| async move {
+            flag.store(true, Ordering::SeqCst);
+        })
+        .run_outcome(|_config| async { Ok(()) })
         .await;
 
-    assert!(outcome.is_ok(), "got {outcome:?}");
+    assert!(
+        matches!(outcome, Ok(RunOutcome::NeverInitialised)),
+        "got {outcome:?}"
+    );
+    assert!(built.load(Ordering::SeqCst), "the script's iocInit never built");
 }

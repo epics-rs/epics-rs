@@ -5,7 +5,9 @@
 use std::path::Path;
 
 /// The macros C's EXAMPLE_commonPlugins.cmd reads: its header list, then the
-/// module paths (`$(ADCORE)`, and `$(AUTOSAVE)` in its autosave block).
+/// module paths (`$(ADCORE)`, and `$(AUTOSAVE)` in its autosave block), and
+/// `$(CALC)`, which C reads only in a commented line (:211) and ours does not
+/// leave commented; the IOC's autosave defines it.
 const C_MACROS: &[&str] = &[
     "PREFIX",
     "PORT",
@@ -17,6 +19,7 @@ const C_MACROS: &[&str] = &[
     "MAX_THREADS",
     "ADCORE",
     "AUTOSAVE",
+    "CALC",
 ];
 
 #[test]

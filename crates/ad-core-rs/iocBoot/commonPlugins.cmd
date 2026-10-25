@@ -185,6 +185,10 @@ set_requestfile_path("./")
 set_requestfile_path("$(ADCORE)/db")
 set_requestfile_path("$(ADCORE)/iocBoot")
 set_requestfile_path("$(AUTOSAVE)/db")
+# C defect, not copied: NDStats_settings.req includes calc's sseq_settings.req
+# for the Reset sseqs, but EXAMPLE_commonPlugins.cmd:211 leaves this path
+# commented, so each Stats plugin's Reset sseqs go unsaved with an error.
+set_requestfile_path("$(CALC)/db")
 set_savefile_path("./autosave")
 set_pass0_restoreFile("auto_settings.sav")
 set_pass1_restoreFile("auto_settings.sav")

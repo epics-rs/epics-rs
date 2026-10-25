@@ -5238,24 +5238,15 @@ fn build_put_value(desc: &FieldDesc, value_str: &str) -> PvaResult<PvField> {
             }
             Ok(PvField::UnionArray(items))
         }
-        FieldDesc::Variant => build_put_variant(value_str),
+        FieldDesc::Variant => Ok(PvField::Variant(Box::new(build_put_variant(value_str)))),
         FieldDesc::VariantArray => {
-            // Comma-separated tokens, each inferred independently.
-            let mut items = Vec::new();
-            for tok in value_str
+            // Comma-separated tokens, each one Any.
+            let items = value_str
                 .split(',')
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
-            {
-                match build_put_variant(tok)? {
-                    PvField::Variant(vv) => items.push(Some(*vv)),
-                    other => {
-                        return Err(PvaError::InvalidValue(format!(
-                            "internal: build_put_variant yielded {other:?}"
-                        )));
-                    }
-                }
-            }
+                .map(|tok| Some(build_put_variant(tok)))
+                .collect();
             Ok(PvField::VariantArray(items))
         }
         FieldDesc::StructureArray { struct_id, fields } => {
@@ -5339,33 +5330,14 @@ fn build_put_union(variants: &[(String, FieldDesc)], value_str: &str) -> PvaResu
     )))
 }
 
-/// Build a variant ("any") PUT value. The carried scalar type is
-/// inferred from the textual form — narrowest type wins: `bool` →
-/// `i64` → `f64` → `String`, the numbers read as pvxs `parseTo`. An empty
-/// `value_str` produces the null variant (no embedded descriptor).
-fn build_put_variant(value_str: &str) -> PvaResult<PvField> {
-    let trimmed = value_str.trim();
-    if trimmed.is_empty() {
-        return Ok(PvField::Variant(Box::new(VariantValue {
-            desc: None,
-            value: PvField::Null,
-        })));
+/// Build a variant ("any") PUT value. pvxs `put.cpp:135` assigns the text
+/// with `fld.from(sv)`, and an Any assigned a string holds that string
+/// (`data.cpp:668-680`), verbatim.
+fn build_put_variant(value_str: &str) -> VariantValue {
+    VariantValue {
+        desc: Some(FieldDesc::Scalar(ScalarType::String)),
+        value: PvField::Scalar(ScalarValue::String(value_str.into())),
     }
-    let (st, sv) = if trimmed.eq_ignore_ascii_case("true") {
-        (ScalarType::Boolean, ScalarValue::Boolean(true))
-    } else if trimmed.eq_ignore_ascii_case("false") {
-        (ScalarType::Boolean, ScalarValue::Boolean(false))
-    } else if let Ok(i) = crate::pvdata::convert::parse_to_i64(trimmed) {
-        (ScalarType::Long, ScalarValue::Long(i))
-    } else if let Ok(d) = crate::pvdata::convert::parse_to_f64(trimmed) {
-        (ScalarType::Double, ScalarValue::Double(d))
-    } else {
-        (ScalarType::String, ScalarValue::String(trimmed.into()))
-    };
-    Ok(PvField::Variant(Box::new(VariantValue {
-        desc: Some(FieldDesc::Scalar(st)),
-        value: PvField::Scalar(sv),
-    })))
 }
 
 /// Build one element of a structure array. The token is routed
@@ -6672,54 +6644,29 @@ mod tests {
         assert_round_trips(&desc, &v);
     }
 
+    /// pvxs `put.cpp:135` stores the text with `fld.from(sv)`; an Any
+    /// assigned a string holds a string (`data.cpp:668-680`), verbatim.
     #[test]
-    fn put_variant_infers_scalar_type() {
-        for (input, expect_st, expect_val) in [
-            ("true", ScalarType::Boolean, ScalarValue::Boolean(true)),
-            ("-42", ScalarType::Long, ScalarValue::Long(-42)),
-            ("3.5", ScalarType::Double, ScalarValue::Double(3.5)),
-            (
-                "text",
-                ScalarType::String,
-                ScalarValue::String("text".into()),
-            ),
-        ] {
+    fn put_variant_stores_the_text_as_a_string() {
+        for input in ["true", "-42", "3.5", "text", "010", "0x10", " 5", ""] {
             let v = build_put_value(&FieldDesc::Variant, input).unwrap();
             match &v {
                 PvField::Variant(vv) => {
-                    assert_eq!(vv.desc, Some(FieldDesc::Scalar(expect_st)), "input {input}");
-                    assert_eq!(vv.value, PvField::Scalar(expect_val), "input {input}");
+                    assert_eq!(
+                        vv.desc,
+                        Some(FieldDesc::Scalar(ScalarType::String)),
+                        "input {input:?}"
+                    );
+                    assert_eq!(
+                        vv.value,
+                        PvField::Scalar(ScalarValue::String(input.into())),
+                        "input {input:?}"
+                    );
                 }
                 other => panic!("expected variant, got {other:?}"),
             }
             assert_round_trips(&FieldDesc::Variant, &v);
         }
-    }
-
-    #[test]
-    fn put_variant_infers_through_parse_to() {
-        for (input, want) in [("010", 8), ("0x10", 16)] {
-            match build_put_value(&FieldDesc::Variant, input).unwrap() {
-                PvField::Variant(vv) => {
-                    assert_eq!(
-                        vv.value,
-                        PvField::Scalar(ScalarValue::Long(want)),
-                        "{input}"
-                    )
-                }
-                other => panic!("expected variant, got {other:?}"),
-            }
-        }
-    }
-
-    #[test]
-    fn put_variant_empty_is_null() {
-        let v = build_put_value(&FieldDesc::Variant, "").unwrap();
-        match &v {
-            PvField::Variant(vv) => assert!(vv.desc.is_none()),
-            other => panic!("expected variant, got {other:?}"),
-        }
-        assert_round_trips(&FieldDesc::Variant, &v);
     }
 
     #[test]
@@ -6826,18 +6773,17 @@ mod tests {
         let v = build_put_value(&desc, "1, 2.5, hello").unwrap();
         match &v {
             PvField::VariantArray(items) => {
-                assert_eq!(items.len(), 3);
+                let texts: Vec<_> = items
+                    .iter()
+                    .map(|i| {
+                        let i = i.as_ref().unwrap();
+                        assert_eq!(i.desc, Some(FieldDesc::Scalar(ScalarType::String)));
+                        i.value.clone()
+                    })
+                    .collect();
                 assert_eq!(
-                    items[0].as_ref().unwrap().desc,
-                    Some(FieldDesc::Scalar(ScalarType::Long))
-                );
-                assert_eq!(
-                    items[1].as_ref().unwrap().desc,
-                    Some(FieldDesc::Scalar(ScalarType::Double))
-                );
-                assert_eq!(
-                    items[2].as_ref().unwrap().desc,
-                    Some(FieldDesc::Scalar(ScalarType::String))
+                    texts,
+                    ["1", "2.5", "hello"].map(|t| PvField::Scalar(ScalarValue::String(t.into())))
                 );
             }
             other => panic!("expected variant array, got {other:?}"),

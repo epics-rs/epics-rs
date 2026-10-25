@@ -106,18 +106,18 @@ const EXPECTED_FAILURES: &[(&str, &str)] = &[
         "sequencer/examples/parallel/control.st",
         "control.st:37: error[E0425]: cannot find function `pvPutCompleteArray` in this scope: not found in this scope",
     ),
-    // these wait for a run-time pointer type
+    // these wait for C's pointer operations
     (
         "calc/calcApp/src/editSseq.st",
         "editSseq.st:161: error: snc-rs does not support assignment through a pointer",
     ),
     (
         "motor/modules/motorAerotech/aerotechApp/src/EnsembleTrajectoryScan.st",
-        "EnsembleTrajectoryScan.st:82: error: snc-rs does not support non-char pointer variable 'pstatus'",
+        "EnsembleTrajectoryScan.st:184: error: snc-rs does not support a pointer that points into a variable",
     ),
     (
         "motor/modules/motorNewport/newportApp/src/MM4005_trajectoryScan.st",
-        "MM4005_trajectoryScan.st:316: error: snc-rs does not support a char * that points into a variable",
+        "MM4005_trajectoryScan.st:316: error: snc-rs does not support a pointer that points into a variable",
     ),
     (
         "motor/modules/motorNewport/newportApp/src/XPS_trajectoryScan.st",
@@ -125,41 +125,42 @@ const EXPECTED_FAILURES: &[(&str, &str)] = &[
     ),
     (
         "motor/modules/motorOms/omsApp/src/MAX_trajectoryScan.st",
-        "MAX_trajectoryScan.st:185: error: snc-rs does not support non-char pointer variable 'rttraj'",
-    ),
-    (
-        "sequencer/examples/small/decl.st",
-        "decl.st:13: error: snc-rs does not support non-char pointer variable 'complicated'",
-    ),
-    (
-        "sequencer/test/compiler/cast.st",
-        "cast.st:18: error: snc-rs does not support non-char pointer variable 'pai'",
-    ),
-    (
-        "sequencer/test/compiler/funcdef.st",
-        "funcdef.st:8: error: snc-rs does not support non-char pointer result of function 'f1'",
-    ),
-    (
-        "sequencer/test/compiler/type_expr.st",
-        "type_expr.st:13: error: snc-rs does not support non-char pointer variable 'p'",
+        "MAX_trajectoryScan.st:392: error: snc-rs does not support a pointer that points into a variable",
     ),
     (
         "sequencer/test/validate/array.st",
-        "array.st:30: error: snc-rs does not support non-char pointer variable 'a4ps'",
+        "array.st:31: error: snc-rs does not support a pointer that points into a variable",
     ),
     (
         "sequencer/test/validate/opttVar.st",
-        "opttVar.st:99: error: snc-rs does not support non-char pointer variable 'xp'",
+        "opttVar.st:103: error: snc-rs does not support a pointer that points into a variable",
     ),
     (
         "sequencer/test/validate/sizeof.st",
-        "sizeof.st:19: error: snc-rs does not support a char * that points into a variable",
+        "sizeof.st:19: error: snc-rs does not support a pointer that points into a variable",
+    ),
+    // C's void * and a function pointer have no Rust type
+    (
+        "sequencer/test/compiler/funcdef.st",
+        "funcdef.st:8: error: snc-rs does not support void pointer result of function 'f1'",
+    ),
+    (
+        "sequencer/test/compiler/type_expr.st",
+        "type_expr.st:13: error: snc-rs does not support void pointer variable 'p'",
     ),
     (
         "sequencer/test/validate/void.st",
-        "void.st:12: error: snc-rs does not support non-char pointer variable 'p'",
+        "void.st:12: error: snc-rs does not support void pointer variable 'p'",
     ),
     // these wait for a run-time contract for SNL and foreign structs
+    (
+        "sequencer/examples/small/decl.st",
+        "decl.st:20: error: snc-rs does not support typename TS_STAMP variable 'ts'",
+    ),
+    (
+        "sequencer/test/compiler/cast.st",
+        "cast.st:24: error: snc-rs does not support enum enum_test variable 'e'",
+    ),
     (
         "sequencer/examples/small/timer.st",
         "timer.st:9: error: snc-rs does not support struct definitions",

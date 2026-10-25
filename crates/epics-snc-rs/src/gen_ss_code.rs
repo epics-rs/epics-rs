@@ -518,7 +518,8 @@ enum Ty {
     Bool,
     /// a string literal
     Str,
-    CharPtr,
+    /// a `seqg_rt::Ptr` to this Rust type, C's `T *`
+    Ptr(String),
     /// `&place`: a string, an array, a multi-PV array, or C's `&x`
     Ref,
     /// a value of this `seqg_rt` type
@@ -1403,7 +1404,7 @@ impl<'a> Gen<'a> {
             return None;
         }
         let place = self.place(target);
-        if arith && self.place_value_ty(&place) == Ty::CharPtr {
+        if arith && matches!(self.place_value_ty(&place), Ty::Ptr(_)) {
             self.refuse(target, "pointer arithmetic");
         }
         Some(place)
@@ -1413,15 +1414,15 @@ impl<'a> Gen<'a> {
     /// type `ty`. snc-rs's `char *` holds a copy, so one that C would point
     /// into a variable, where it sees later writes, is refused.
     fn store_conv(&mut self, ep: NodeId, v: Val, ty: &Ty) -> Expr {
-        if *ty == Ty::CharPtr && self.points_into_variable(ep) {
-            self.refuse(ep, "a char * that points into a variable");
+        if matches!(ty, Ty::Ptr(_)) && self.points_into_variable(ep) {
+            self.refuse(ep, "a pointer that points into a variable");
         }
         conv(v, ty)
     }
 
     /// Whether C's value of `ep` is an address inside a variable: a
-    /// `string` or `char` array (decayed), `&x`, or such an address plus
-    /// `n`, chosen by `?:` or cast.
+    /// `string` or an array (decayed), `&x`, or such an address plus `n`,
+    /// chosen by `?:` or cast.
     fn points_into_variable(&self, ep: NodeId) -> bool {
         let node = &self.ast[ep];
         let c = |i| node.child(i).expect("expression operand");
@@ -1439,7 +1440,13 @@ impl<'a> Gen<'a> {
             NodeTag::EPre if node.token.symbol == Tok::Ampersand => {
                 self.place_kind(c(child::PRE_OPERAND)).is_some()
             }
-            _ => self.is_char_buffer(ep),
+            _ => match self.place_kind(ep) {
+                Some((PlaceTy::Snl(t), _)) => matches!(
+                    self.ast[t].kind,
+                    TypeKind::Array { .. } | TypeKind::Prim(PrimType::String)
+                ),
+                _ => false,
+            },
         }
     }
 
@@ -1561,7 +1568,7 @@ impl<'a> Gen<'a> {
         if op == Tok::Equal {
             let v = self.expr(rhs);
             let stored = Expr::atom("seqg_rhs");
-            let stored = if ty == Ty::CharPtr {
+            let stored = if matches!(ty, Ty::Ptr(_)) {
                 stored.method("clone", Vec::new())
             } else {
                 stored
@@ -1727,10 +1734,14 @@ impl<'a> Gen<'a> {
                 let cond = self.truth(c(child::TERNOP_COND));
                 let a = self.expr(c(child::TERNOP_THEN));
                 let b = self.expr(c(child::TERNOP_ELSE));
+                let ptr = [&a.ty, &b.ty]
+                    .into_iter()
+                    .find(|t| matches!(t, Ty::Ptr(_)))
+                    .cloned();
                 let (a, b, ty) = if is_numeric(&a.ty) && is_numeric(&b.ty) {
                     operands(a, b)
-                } else if a.ty == Ty::CharPtr || b.ty == Ty::CharPtr {
-                    (conv(a, &Ty::CharPtr), conv(b, &Ty::CharPtr), Ty::CharPtr)
+                } else if let Some(ty) = ptr {
+                    (conv(a, &ty), conv(b, &ty), ty)
                 } else {
                     (a.e, b.e, a.ty)
                 };
@@ -1934,7 +1945,7 @@ impl<'a> Gen<'a> {
             }
             Some(CParam::Dst) => {
                 let v = self.expr(ap);
-                if matches!(v.ty, Ty::CharPtr | Ty::Str) {
+                if matches!(v.ty, Ty::Ptr(_) | Ty::Str) {
                     self.refuse(ap, "assignment through a pointer");
                 }
                 v.e
@@ -2283,11 +2294,7 @@ impl<'a> Gen<'a> {
         match &ast[t].kind {
             TypeKind::Prim(PrimType::String) | TypeKind::Array { .. } => Ty::Ref,
             TypeKind::Prim(_) => Ty::Num(value_type(ast, t).expect("numeric type")),
-            TypeKind::Pointer { value_type }
-                if ast[*value_type].kind == TypeKind::Prim(PrimType::Char) =>
-            {
-                Ty::CharPtr
-            }
+            TypeKind::Pointer { value_type: p } => value_type(ast, *p).map_or(Ty::Foreign, Ty::Ptr),
             _ => Ty::Foreign,
         }
     }
@@ -2329,8 +2336,12 @@ impl<'a> Gen<'a> {
             },
             _ => self.expr(ep),
         };
-        match v.ty {
-            Ty::Str | Ty::CharPtr => Ok(StrAt {
+        match &v.ty {
+            Ty::Str => Ok(StrAt {
+                base: StrBase::Value(v),
+                off: None,
+            }),
+            Ty::Ptr(t) if t == C_CHAR => Ok(StrAt {
                 base: StrBase::Value(v),
                 off: None,
             }),
@@ -2351,7 +2362,7 @@ impl<'a> Gen<'a> {
                     "seqg_rt::c::tail",
                     vec![base.e, conv(n, &Ty::Num("isize".into()))],
                 ),
-                ty: Ty::CharPtr,
+                ty: Ty::Ptr(C_CHAR.into()),
             },
         }
     }
@@ -2382,7 +2393,7 @@ impl<'a> Gen<'a> {
     /// A binary arithmetic operator; C's other pointer arithmetic is
     /// refused.
     fn arith(&mut self, ep: NodeId, op: Tok, l: Val, r: Val) -> Val {
-        let pointer = |ty: &Ty| matches!(ty, Ty::Ref | Ty::CharPtr | Ty::Str);
+        let pointer = |ty: &Ty| matches!(ty, Ty::Ref | Ty::Ptr(_) | Ty::Str);
         if matches!(op, Tok::Add | Tok::Sub) && (pointer(&l.ty) || pointer(&r.ty)) {
             self.refuse(ep, "pointer arithmetic");
         }
@@ -2403,7 +2414,7 @@ impl<'a> Gen<'a> {
             },
             Ty::Num(t) => Expr::binary(v.e, "!=", zero(is_float(&t))),
             Ty::Rt(r) => Expr::binary(rt_int(v.e, r), "!=", zero(false)),
-            Ty::CharPtr => Expr::unary("!", v.e.method("is_null", Vec::new())),
+            Ty::Ptr(_) => Expr::unary("!", v.e.method("is_null", Vec::new())),
             Ty::Str | Ty::Ref => Expr::atom("true"),
             Ty::Foreign => foreign_truth(v.e, true),
             Ty::Unit => Expr::binary(v.e, "!=", zero(false)),
@@ -2422,7 +2433,7 @@ impl<'a> Gen<'a> {
             },
             Ty::Num(t) => Expr::binary(v.e, "==", zero(is_float(&t))),
             Ty::Rt(r) => Expr::binary(rt_int(v.e, r), "==", zero(false)),
-            Ty::CharPtr => v.e.method("is_null", Vec::new()),
+            Ty::Ptr(_) => v.e.method("is_null", Vec::new()),
             Ty::Str | Ty::Ref => Expr::atom("false"),
             Ty::Foreign => foreign_truth(v.e, false),
             Ty::Unit => Expr::binary(v.e, "==", zero(false)),
@@ -2526,6 +2537,7 @@ fn binop(op: Tok, l: Val, r: Val) -> Val {
                 && match (&l.ty, &r.ty) {
                     (Ty::Bool, Ty::Bool) => true,
                     (Ty::Rt(a), Ty::Rt(b)) => a == b,
+                    (Ty::Ptr(a), Ty::Ptr(b)) => a == b,
                     _ => false,
                 };
             if direct {
@@ -2546,10 +2558,10 @@ fn binop(op: Tok, l: Val, r: Val) -> Val {
                         ty: Ty::Bool,
                     }
                 };
-                if l.ty == Ty::CharPtr && is_null(&r) {
+                if matches!(l.ty, Ty::Ptr(_)) && is_null(&r) {
                     return null_test(l.e);
                 }
-                if r.ty == Ty::CharPtr && is_null(&l) {
+                if matches!(r.ty, Ty::Ptr(_)) && is_null(&l) {
                     return null_test(r.e);
                 }
                 if l.ty == Ty::Foreign && is_null(&r) {
@@ -2841,21 +2853,30 @@ fn conv(v: Val, target: &Ty) -> Expr {
             Ty::Bool if is_float(t) => v.e.cast("i32").cast(t),
             Ty::Bool => v.e.cast(t),
             Ty::Rt(r) => rt_int(v.e, r).cast("_"),
-            Ty::Ref | Ty::Str | Ty::CharPtr | Ty::Unit => v.e,
+            Ty::Ref | Ty::Str | Ty::Ptr(_) | Ty::Unit => v.e,
             Ty::Foreign => v.e.cast("_"),
         },
-        Ty::CharPtr => match v.ty {
-            Ty::Str => {
+        Ty::Ptr(t) => match v.ty {
+            Ty::Str if t == C_CHAR => {
                 let bytes = match v.e {
                     e @ Expr::Atom(_) => e.method("as_bytes", Vec::new()),
                     e => e,
                 };
                 Expr::call("seqg_rt::CharPtr::from_bytes", vec![bytes])
             }
-            _ if is_null(&v) => Expr::call("seqg_rt::CharPtr::default", Vec::new()),
+            _ if is_null(&v) => null_ptr(t),
             _ => v.e,
         },
         _ => v.e,
+    }
+}
+
+/// C's null pointer to a `t`.
+fn null_ptr(t: &str) -> Expr {
+    if t == C_CHAR {
+        Expr::call("seqg_rt::CharPtr::default", Vec::new())
+    } else {
+        Expr::call(format!("seqg_rt::Ptr::<{t}>::default"), Vec::new())
     }
 }
 
@@ -2982,7 +3003,7 @@ fn builtin_type(name: &str) -> Ty {
         | "pvArrayGetCancel" | "pvArrayPutCancel" | "pvSync" | "pvArraySync" => Ty::Unit,
         "pvSeverity" => Ty::Rt("PvSevr"),
         "pvCount" | "pvChannelCount" | "pvConnectCount" | "pvAssignCount" => Ty::Num("u32".into()),
-        "pvName" | "pvMessage" | "macValueGet" => Ty::CharPtr,
+        "pvName" | "pvMessage" | "macValueGet" => Ty::Ptr(C_CHAR.into()),
         "pvIndex" => Ty::Rt("ChId"),
         "pvTimeStamp" => Ty::Rt("WallTime"),
         _ => Ty::Rt("PvStat"),
@@ -3286,10 +3307,30 @@ mod tests {
         );
         assert_eq!(
             diag,
-            "t.st:7: error: snc-rs does not support a char * that points into a variable\n\
+            "t.st:7: error: snc-rs does not support a pointer that points into a variable\n\
              t.st:8: error: snc-rs does not support assignment through a pointer\n\
              t.st:9: error: snc-rs does not support pointer arithmetic\n"
         );
+    }
+
+    #[test]
+    fn a_pointer_is_tested_and_compared_as_c_s() {
+        // decl.st:69's `!complicated`
+        let (code, diag) = translate(
+            "program p\nint *p;\nint *q = 0;\ndouble **pd;\nint n;\nss s {\nstate z {\n\
+             when (!p && q != 0 && p == q) {\npd = 0;\np = n ? q : 0;\n} state z\n}\n}\n",
+        );
+        assert_eq!(diag, "");
+        let code = words(&code);
+        for e in [
+            "seqg_var.q.set(seqg_rt::Ptr::<i32>::default())",
+            "if seqg_var.p.get().is_null() && !seqg_var.q.get().is_null() \
+             && seqg_var.p.get() == seqg_var.q.get() {",
+            "seqg_var.pd.set(seqg_rt::Ptr::<seqg_rt::Ptr<f64>>::default())",
+            "if seqg_var.n.get() != 0 { seqg_var.q.get() } else { seqg_rt::Ptr::<i32>::default() }",
+        ] {
+            assert!(code.contains(e), "{e}\n{code}");
+        }
     }
 
     #[test]
@@ -3505,7 +3546,7 @@ mod tests {
         );
         let refused = |line| {
             format!(
-                "t.st:{line}: error: snc-rs does not support a char * that points into a variable\n"
+                "t.st:{line}: error: snc-rs does not support a pointer that points into a variable\n"
             )
         };
         assert_eq!(diag, [5, 11, 12, 13, 14, 15].map(refused).concat());

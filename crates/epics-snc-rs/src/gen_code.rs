@@ -156,9 +156,14 @@ pub(crate) fn value_type(ast: &Ast, t: crate::types::TypeId) -> Result<String, S
             PrimType::String => "seqg_rt::SeqString",
         }
         .to_owned(),
-        TypeKind::Pointer { value_type } => match ast[*value_type].kind {
+        TypeKind::Pointer { value_type: t } => match &ast[*t].kind {
             TypeKind::Prim(PrimType::Char) => "seqg_rt::CharPtr".to_owned(),
-            _ => return Err("non-char pointer".into()),
+            TypeKind::Void => return Err("void pointer".into()),
+            TypeKind::Function { .. } => return Err("function pointer".into()),
+            _ => format!(
+                "seqg_rt::Ptr<{}>",
+                value_type(ast, *t).map_err(|e| format!("pointer to {e}"))?
+            ),
         },
         TypeKind::Array {
             num_elems,
@@ -747,6 +752,33 @@ fn put(seqg_env: &seqg_rt::StateSet<seqg_vars>, v: f64) {
     }
 
     #[test]
+    fn a_pointer_is_a_ptr_to_its_pointee_s_type() {
+        // decl.st:13, array.st:30, opttVar.st:93; C's void * and function
+        // pointers have no Rust type to point to
+        let (mut snc, ast, prg) = analysed(
+            "program p\nint *(*(*complicated)[2][3])[1] = 0;\nstring (*a4ps[4])[5];\n\
+             char **xp;\nvoid *v;\nvoid (*f)(void);\nenum e *pe;\n\
+             ss s {\nstate z {\nwhen () {} state z\n}\n}\n",
+        );
+        snc.options.line = false;
+        let text = rust_out::print(&gen_var_struct(&mut snc, &ast, &prg));
+        for field in [
+            "pub complicated: seqg_rt::SeqVar<\
+             seqg_rt::Ptr<[[seqg_rt::Ptr<[seqg_rt::Ptr<i32>; 1]>; 3]; 2]>>,",
+            "pub a4ps: seqg_rt::SeqVar<[seqg_rt::Ptr<[seqg_rt::SeqString; 5]>; 4]>,",
+            "pub xp: seqg_rt::SeqVar<seqg_rt::Ptr<seqg_rt::CharPtr>>,",
+        ] {
+            assert!(text.contains(field), "{field}\n{text}");
+        }
+        assert_eq!(
+            String::from_utf8_lossy(snc.diagnostics()),
+            "t.st:5: error: snc-rs does not support void pointer variable 'v'\n\
+             t.st:6: error: snc-rs does not support function pointer variable 'f'\n\
+             t.st:7: error: snc-rs does not support pointer to enum e variable 'pe'\n"
+        );
+    }
+
+    #[test]
     fn line_comments_follow_option_l() {
         let (mut snc, ast, prg) = analysed(
             "program p\noption +r;\nint x;\nss s {\nstate z {\nwhen () {} state z\n}\n}\n",
@@ -797,7 +829,7 @@ fn put(seqg_env: &seqg_rt::StateSet<seqg_vars>, v: f64) {
     #[test]
     fn types_without_a_rust_form_are_refused_at_their_line() {
         let (mut snc, ast, prg) = analysed(
-            "program p\noption +r;\nint *ip;\nstruct S { int m; };\n\
+            "program p\noption +r;\nvoid *ip;\nstruct S { int m; };\n\
              typename T t[2];\nstruct S s;\n\
              ss s {\nstate z {\nwhen () {} state z\n}\n}\n",
         );
@@ -806,7 +838,7 @@ fn put(seqg_env: &seqg_rt::StateSet<seqg_vars>, v: f64) {
         gen_global_defns(&mut snc, &ast, &prg, defns);
         assert_eq!(
             String::from_utf8_lossy(snc.diagnostics()),
-            "t.st:3: error: snc-rs does not support non-char pointer variable 'ip'\n\
+            "t.st:3: error: snc-rs does not support void pointer variable 'ip'\n\
              t.st:5: error: snc-rs does not support typename T variable 't'\n\
              t.st:6: error: snc-rs does not support struct S variable 's'\n\
              t.st:4: error: snc-rs does not support struct definitions\n"

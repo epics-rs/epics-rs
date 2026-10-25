@@ -854,6 +854,22 @@ impl IocInitDecision {
     }
 }
 
+/// How an [`IocApplication::run_outcome`] that did not fail ended.
+///
+/// The two are one `Ok(())` to a C `main`, and stay one in
+/// [`IocApplication::run`]: a script that never says `iocInit` is a custom
+/// `main`'s `iocsh(st.cmd); iocsh(NULL)`, which exits 0 at the prompt's EOF
+/// without calling the protocol runner. Anything that asserts inside the
+/// runner has to tell them apart, or it passes without having run.
+#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunOutcome {
+    /// `iocRun` ran, so the protocol runner was started.
+    Served,
+    /// `iocInit` never completed, so the protocol runner was never called.
+    NeverInitialised,
+}
+
 /// Which phase of C softIoc's `main` a failed [`IocApplication::run_phased`]
 /// was in.
 ///
@@ -2855,7 +2871,16 @@ impl IocApplication {
         F: FnOnce(IocRunConfig) -> Fut + Send + 'static,
         Fut: std::future::Future<Output = CaResult<()>> + Send + 'static,
     {
-        self.run_phased(protocol_runner)
+        self.run_outcome(protocol_runner).await.map(|_| ())
+    }
+
+    /// [`Self::run`], reporting whether the protocol runner was ever called.
+    pub async fn run_outcome<F, Fut>(self, protocol_runner: F) -> CaResult<RunOutcome>
+    where
+        F: FnOnce(IocRunConfig) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = CaResult<()>> + Send + 'static,
+    {
+        self.run_with_exits(protocol_runner)
             .await
             .map_err(CaError::from)
     }
@@ -2871,6 +2896,16 @@ impl IocApplication {
         F: FnOnce(IocRunConfig) -> Fut + Send + 'static,
         Fut: std::future::Future<Output = CaResult<()>> + Send + 'static,
     {
+        self.run_with_exits(protocol_runner).await.map(|_| ())
+    }
+
+    /// The one entry to [`Self::run_to_completion`], so every public `run`
+    /// runs the exit callbacks.
+    async fn run_with_exits<F, Fut>(self, protocol_runner: F) -> Result<RunOutcome, IocRunFailure>
+    where
+        F: FnOnce(IocRunConfig) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = CaResult<()>> + Send + 'static,
+    {
         crate::runtime::task::adopt_current_runtime();
         super::shutdown_signal::set_application_owns();
         let result = self.run_to_completion(protocol_runner).await;
@@ -2880,9 +2915,12 @@ impl IocApplication {
     }
 
     /// The IOC lifecycle itself. Private, and reached only through
-    /// [`Self::run`], because leaving it by any route has to run the exit
-    /// callbacks and only that wrapper does.
-    async fn run_to_completion<F, Fut>(self, protocol_runner: F) -> Result<(), IocRunFailure>
+    /// [`Self::run_with_exits`], because leaving it by any route has to run
+    /// the exit callbacks and only that wrapper does.
+    async fn run_to_completion<F, Fut>(
+        self,
+        protocol_runner: F,
+    ) -> Result<RunOutcome, IocRunFailure>
     where
         F: FnOnce(IocRunConfig) -> Fut + Send + 'static,
         Fut: std::future::Future<Output = CaResult<()>> + Send + 'static,
@@ -3082,10 +3120,14 @@ impl IocApplication {
                 // An `iocInit` typed at the prompt started a runner, which
                 // queues a prompt of its own; stopped and joined here, it can
                 // queue none after `_prompt` closes.
-                if let Some(IocLifecycle::Running(running)) = take_lifecycle() {
-                    running.server.shut_down().await;
-                }
-                return ended;
+                let outcome = match take_lifecycle() {
+                    Some(IocLifecycle::Running(running)) => {
+                        running.server.shut_down().await;
+                        RunOutcome::Served
+                    }
+                    _ => RunOutcome::NeverInitialised,
+                };
+                return ended.map(|()| outcome);
             }
             SoftMainEnd::Failed(e) => return Err(e),
         };
@@ -3097,7 +3139,7 @@ impl IocApplication {
         // interactive `iocsh(NULL)` of `softMain.cpp:250`.
         //
         // Race it against SIGTERM/SIGINT so a `kill` stops the servers and
-        // reaches the exit callbacks; `run_phased` then re-raises the signal so
+        // reaches the exit callbacks; `run_with_exits` then re-raises the signal so
         // the process ends killed by it, as a C IOC does.
         use super::shutdown_signal::{ShutdownSignal, recv};
         let sigterm = recv(ShutdownSignal::Terminate);
@@ -3120,15 +3162,15 @@ impl IocApplication {
             }
         };
         match outcome {
-            Some(res) => res,
+            Some(res) => res.map(|()| RunOutcome::Served),
             // The signal arms dropped `ProtocolServer::wait` without taking the
             // outcome, so the task is still this value's to stop. Awaiting the
             // abort — rather than letting `Drop` fire it — is what keeps the
-            // process's exit callbacks, which `run_phased` runs the moment this
+            // process's exit callbacks, which `run_with_exits` runs the moment this
             // returns, from racing a server that is still on a socket.
             None => {
                 server.shut_down().await;
-                Ok(())
+                Ok(RunOutcome::Served)
             }
         }
     }

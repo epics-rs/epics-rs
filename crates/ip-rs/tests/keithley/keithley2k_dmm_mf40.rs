@@ -4,16 +4,13 @@
 //! are the ones a C IOC (seq 2.2.9, asyn, calc, ip's devXxStrParm) sent and
 //! posted against the same mock, template and puts.
 
-mod keithley;
-mod support;
-
 use std::time::Duration;
 
 use epics_base_rs::runtime::task;
 use epics_base_rs::types::{EpicsValue, PvString};
 
-use keithley::{Ioc, Meter, boot};
-use support::eventually;
+use crate::harness::{Ioc, Meter, boot};
+use crate::support::eventually;
 
 /// The 2700 behind `Dmm=D1:`.
 const DMM: Meter = Meter {

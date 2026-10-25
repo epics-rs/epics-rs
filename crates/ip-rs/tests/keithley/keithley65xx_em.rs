@@ -4,16 +4,13 @@
 //! 2.2.9, asyn, calc, ip's devXxStrParm) sent and posted against the same
 //! mock, template and puts.
 
-mod keithley;
-mod support;
-
 use std::time::Duration;
 
 use epics_base_rs::runtime::task;
 use epics_base_rs::types::{EpicsValue, PvString};
 
-use keithley::{Ioc, Meter, boot};
-use support::eventually;
+use crate::harness::{Ioc, Meter, boot};
+use crate::support::eventually;
 
 /// The 6517A behind `Dmm=E1:`.
 const EM: Meter = Meter {

@@ -1,7 +1,5 @@
-//! A Keithley program booted on its template against a [`mock::Keithley`],
+//! A Keithley program booted on its template against a [`Keithley`] mock,
 //! and the steps its tests drive it with.
-
-pub mod mock;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -15,8 +13,8 @@ use epics_base_rs::server::scan::ScanOwner;
 use epics_base_rs::types::EpicsValue;
 use ip_rs::strparm::{DEVICE_ROWS, device_support_factory};
 
+use crate::mock::Keithley;
 use crate::support::{eventually, sh};
-use mock::Keithley;
 
 /// One program and the meter it drives.
 pub struct Meter {

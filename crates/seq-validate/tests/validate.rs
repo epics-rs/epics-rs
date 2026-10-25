@@ -19,7 +19,7 @@ use epics_base_rs::server::record::Record;
 use epics_base_rs::types::EpicsValue;
 use epics_seq_rs::{ProgramVars, SeqProgram, seq};
 use seq_validate::support::exited;
-use seq_validate::unit_test::Report;
+use seq_validate::unit_test::{Report, TestResult};
 
 /// The `.db` beside the program's `.st`.
 fn db_path(stem: &str) -> String {
@@ -181,6 +181,29 @@ fn mask_addresses(diag: &str) -> String {
     masked
 }
 
+/// Programs whose numbers are what one state set saw of another's as the
+/// threads were scheduled, so they vary in C too: safeMonitor's `cnt` as
+/// `read` enters, and how many puts `write` makes before the `exit` (3 of
+/// 768 C runs, 384 at a time, differ). Their texts are held to C's with
+/// each number masked, the diagnostics as a set.
+const SCHEDULED: &[&str] = &["safeMonitor"];
+
+/// `text` with each number, `26.0` say, as `#`.
+fn mask_numbers(text: &str) -> String {
+    let mut masked = String::new();
+    let mut in_number = false;
+    for c in text.chars() {
+        let digit = c.is_ascii_digit() || (in_number && c == '.');
+        if !digit {
+            masked.push(c);
+        } else if !in_number {
+            masked.push('#');
+        }
+        in_number = digit;
+    }
+    masked
+}
+
 fn check(stem: &str, report: &Report, golden: &str) {
     let Tap {
         plan,
@@ -201,9 +224,17 @@ fn check(stem: &str, report: &Report, golden: &str) {
     // threads are scheduled, in C too (evflag's first round varies run to
     // run). C's `testOk1` description is the generated C expression, which
     // has no rs counterpart, so it only counts.
-    let mut c_descs: Vec<&str> = c.iter().map(|(_, d)| d.as_str()).collect();
+    let scheduled = SCHEDULED.contains(&stem);
+    let sampled = |text: &str| {
+        if scheduled {
+            mask_numbers(text)
+        } else {
+            text.to_owned()
+        }
+    };
+    let mut c_descs: Vec<String> = c.iter().map(|(_, d)| sampled(d)).collect();
     for desc in report.results.iter().filter_map(|r| r.desc.as_deref()) {
-        let desc = desc.lines().next().unwrap_or("");
+        let desc = sampled(desc.lines().next().unwrap_or(""));
         let at = c_descs.iter().position(|d| *d == desc);
         let at = at.unwrap_or_else(|| panic!("{stem}: {desc:?} is none of C's {c_descs:?}"));
         c_descs.swap_remove(at);
@@ -212,13 +243,55 @@ fn check(stem: &str, report: &Report, golden: &str) {
     assert_eq!(testok1, c_descs.len(), "{stem}: testOk1 results");
     // Diagnostics as a multiset for the same reason; each is the same in
     // every C run, rand()'s too, as nothing seeds it, but for a `%p`'s
-    // address, which is held only as an address.
-    let mut rs_diags: Vec<_> = report.diags.iter().map(|d| mask_addresses(d)).collect();
-    let mut c_diags: Vec<_> = c_diags.iter().map(|d| mask_addresses(d)).collect();
+    // address, which is held only as an address, and a [`SCHEDULED`]
+    // program's numbers.
+    let mut rs_diags: Vec<_> = report
+        .diags
+        .iter()
+        .map(|d| sampled(&mask_addresses(d)))
+        .collect();
+    let mut c_diags: Vec<_> = c_diags
+        .iter()
+        .map(|d| sampled(&mask_addresses(d)))
+        .collect();
     rs_diags.sort();
     c_diags.sort();
+    if scheduled {
+        rs_diags.dedup();
+        c_diags.dedup();
+    }
     assert_eq!(rs_diags, c_diags, "{stem}: testDiag");
     assert!(report.done.is_some(), "{stem}: testDone");
+}
+
+/// Two of the C safeMonitor runs that differ from the golden one: `read`
+/// late at its third entry, and `write` late from its second put, with 23
+/// puts to the golden's 24.
+#[test]
+fn check_takes_c_s_other_safe_monitor_runs() {
+    for run in [
+        include_str!("c/safeMonitor.read-late.tap"),
+        include_str!("c/safeMonitor.write-late.tap"),
+    ] {
+        let Tap {
+            plan,
+            results,
+            diags,
+        } = parse_tap(run);
+        let results = results.into_iter();
+        let report = Report {
+            planned: plan,
+            results: results
+                .map(|(ok, desc)| TestResult {
+                    ok,
+                    desc: Some(desc),
+                })
+                .collect(),
+            diags,
+            done: Some(0),
+        };
+        check("safeMonitor", &report, include_str!("c/safeMonitor.tap"));
+    }
 }
 
 macro_rules! validate {

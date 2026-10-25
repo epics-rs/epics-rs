@@ -1,0 +1,46 @@
+1..10
+# read: enter action block, cnt=1.0
+# write: pvPut(cnt=2.0)
+# write: pvPut(cnt=3.0)
+ok  1 - read: exit action block, on_entry=1.0==1.0=cnt
+# read: enter action block, cnt=3.0
+# write: pvPut(cnt=4.0)
+# write: pvPut(cnt=5.0)
+# write: pvPut(cnt=6.0)
+ok  2 - read: exit action block, on_entry=3.0==3.0=cnt
+# read: enter action block, cnt=6.0
+# write: pvPut(cnt=7.0)
+# write: pvPut(cnt=8.0)
+ok  3 - read: exit action block, on_entry=6.0==6.0=cnt
+# read: enter action block, cnt=8.0
+# write: pvPut(cnt=9.0)
+# write: pvPut(cnt=10.0)
+# write: pvPut(cnt=11.0)
+ok  4 - read: exit action block, on_entry=8.0==8.0=cnt
+# read: enter action block, cnt=11.0
+# write: pvPut(cnt=12.0)
+# write: pvPut(cnt=13.0)
+ok  5 - read: exit action block, on_entry=11.0==11.0=cnt
+# read: enter action block, cnt=13.0
+# write: pvPut(cnt=14.0)
+# write: pvPut(cnt=15.0)
+# write: pvPut(cnt=16.0)
+ok  6 - read: exit action block, on_entry=13.0==13.0=cnt
+# read: enter action block, cnt=16.0
+# write: pvPut(cnt=17.0)
+# write: pvPut(cnt=18.0)
+ok  7 - read: exit action block, on_entry=16.0==16.0=cnt
+# read: enter action block, cnt=18.0
+# write: pvPut(cnt=19.0)
+# write: pvPut(cnt=20.0)
+# write: pvPut(cnt=21.0)
+ok  8 - read: exit action block, on_entry=18.0==18.0=cnt
+# read: enter action block, cnt=21.0
+# write: pvPut(cnt=22.0)
+# write: pvPut(cnt=23.0)
+ok  9 - read: exit action block, on_entry=21.0==21.0=cnt
+# read: enter action block, cnt=23.0
+# write: pvPut(cnt=24.0)
+# write: pvPut(cnt=25.0)
+# write: pvPut(cnt=26.0)
+ok 10 - read: exit action block, on_entry=23.0==23.0=cnt

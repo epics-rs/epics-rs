@@ -316,6 +316,30 @@ pub fn strlen(s: impl CSrc) -> usize {
     s.with_c_bytes(<[u8]>::len)
 }
 
+/// `strchr`: a pointer into `s` at its first `c`, at its terminator for 0.
+pub fn strchr(s: impl Into<CharPtr>, c: c_int) -> CharPtr {
+    let s = s.into();
+    // C converts `c` to `char`.
+    let c = c as u8;
+    let at = s.with_c_bytes(|b| match c {
+        0 => Some(b.len()),
+        c => b.iter().position(|&x| x == c),
+    });
+    at.map_or_else(CharPtr::default, |i| s.offset(i as isize))
+}
+
+/// `strstr`: a pointer into `s` at the first `needle`, `s` itself for an
+/// empty one.
+pub fn strstr(s: impl Into<CharPtr>, needle: impl CSrc) -> CharPtr {
+    let needle = needle.to_c_vec();
+    let s = s.into();
+    let at = s.with_c_bytes(|b| match needle.len() {
+        0 => Some(0),
+        n => b.windows(n).position(|w| w == needle),
+    });
+    at.map_or_else(CharPtr::default, |i| s.offset(i as isize))
+}
+
 impl CArg<'_> {
     /// The argument as C reads an integer-class one; a pointer is its
     /// address.
@@ -1193,6 +1217,30 @@ mod tests {
     #[should_panic(expected = "write through a pointer to a string literal")]
     fn a_literal_destination_panics() {
         strcpy(CharPtr::from("ab"), "x");
+    }
+
+    /// editSseq.st:159-161: `s = strchr(recordName, '.'); *s = '\0';`.
+    #[test]
+    fn strchr_points_into_its_string() {
+        let v = <SeqVar<SeqString>>::zeroed();
+        strcpy(&v, "rec.VAL");
+        let s = strchr(&v, '.' as c_int);
+        assert_eq!(s, v.at(3).ptr());
+        s.set(0);
+        assert_eq!(v.get().as_bytes(), b"rec");
+        assert!(strchr(&v, '/' as c_int).is_null());
+        assert_eq!(strchr(&v, 0), v.at(3).ptr());
+        assert_eq!(strchr("a/b", '/' as c_int).to_c_vec(), b"/b");
+    }
+
+    #[test]
+    fn strstr_points_into_its_string() {
+        let w = <SeqVar<[SeqString; 2]>>::zeroed();
+        strcpy(w.at(1), "x:m1.VAL");
+        assert_eq!(strstr(&w.at(1), "m1"), w.at(1).at(2).ptr());
+        assert_eq!(strstr(&w.at(1), ""), w.at(1).at(0).ptr());
+        assert!(strstr(&w.at(1), "m2").is_null());
+        assert!(strstr(&w.at(0), "m1").is_null());
     }
 
     #[test]

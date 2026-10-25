@@ -141,6 +141,18 @@ impl Drop for ManagedIoc {
     }
 }
 
+/// A spawned child that is killed and reaped on every exit path, a failed
+/// assert's included: a child that serves until killed outlives the test
+/// otherwise.
+pub struct Reaped(pub Child);
+
+impl Drop for Reaped {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 impl ManagedIoc {
     pub fn ca_addr_list(&self) -> String {
         format!("127.0.0.1:{}", self.udp_port)

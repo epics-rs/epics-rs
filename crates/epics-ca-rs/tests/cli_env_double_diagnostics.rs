@@ -24,10 +24,10 @@
 
 use std::process::Command;
 
-// Both are used only by the one `softioc-rs` case below, which the
+// These are used only by the one `softioc-rs` case below, which the
 // reactor-free backend does not build.
 #[cfg(tokio_backend)]
-use c_ca_tools::LineCollector;
+use c_ca_tools::{LineCollector, Reaped};
 #[cfg(tokio_backend)]
 use std::process::Stdio;
 
@@ -178,17 +178,19 @@ fn max_search_period_below_lower_limit_is_named() {
 #[cfg(tokio_backend)]
 #[test]
 fn beacon_period_reject_is_diagnosed_once_per_process() {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_softioc-rs"))
-        .args(["-S", "--port", "0", "--pv", "R16-18:PV:double:1.0"])
-        // Keep the IOC off the network: loopback interface, loopback beacon
-        // target, and a port the harness picks nothing else on.
-        .env("EPICS_CAS_INTF_ADDR_LIST", "127.0.0.1")
-        .env("EPICS_CAS_BEACON_ADDR_LIST", "127.0.0.1")
-        .env("EPICS_CAS_BEACON_PERIOD", "garbage")
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn softioc-rs");
+    let mut child = Reaped(
+        Command::new(env!("CARGO_BIN_EXE_softioc-rs"))
+            .args(["-S", "--port", "0", "--pv", "R16-18:PV:double:1.0"])
+            // Keep the IOC off the network: loopback interface, loopback
+            // beacon target, and a port the harness picks nothing else on.
+            .env("EPICS_CAS_INTF_ADDR_LIST", "127.0.0.1")
+            .env("EPICS_CAS_BEACON_ADDR_LIST", "127.0.0.1")
+            .env("EPICS_CAS_BEACON_PERIOD", "garbage")
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn softioc-rs"),
+    );
 
     // Startup is what prints. The "CA server:" banner is written in
     // `bind_sockets`, after its env resolution but before `run()`'s, so the
@@ -196,7 +198,7 @@ fn beacon_period_reject_is_diagnosed_once_per_process() {
     // duplicated the diagnostic. A read answered on the banner's port does:
     // `run()` resolves before it starts the search responder. Neither wait is
     // a fixed sleep, which races startup under load.
-    let err_lines = LineCollector::spawn(child.stderr.take().expect("piped stderr"));
+    let err_lines = LineCollector::spawn(child.0.stderr.take().expect("piped stderr"));
     assert!(
         err_lines.wait_for(fact_budget::FACT_BUDGET, |t| {
             t.contains("CA server: UDP search on port")
@@ -221,8 +223,7 @@ fn beacon_period_reject_is_diagnosed_once_per_process() {
         "softioc-rs never served R16-18:PV: {}",
         String::from_utf8_lossy(&read.stderr)
     );
-    let _ = child.kill();
-    let _ = child.wait();
+    drop(child);
     let err = err_lines.into_text();
 
     for line in [

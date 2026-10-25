@@ -27,21 +27,10 @@
 #![cfg(tokio_backend)]
 
 use std::io::{BufRead, BufReader};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use c_ca_tools::LineCollector;
-
-/// A spawned child that is killed and reaped on every exit path, including a
-/// panicking assertion inside the test.
-struct Reaped(Child);
-
-impl Drop for Reaped {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
+use c_ca_tools::{LineCollector, Reaped};
 
 /// Start a real `softioc-rs` in its own process so the test can kill it and
 /// take the circuit down under a live monitor — an in-process `CaServer` keeps

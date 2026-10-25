@@ -2766,8 +2766,6 @@ fn parse_acf_in(sc: &mut AcfScanner) -> Parse<AccessSecurityConfig> {
         .asg
         .insert(b"DEFAULT".to_vec(), AccessSecurityGroup::default());
 
-    let mut current: CurrentRule = None;
-
     loop {
         let keyword = match read_token(sc) {
             Some(Token::Keyword(k)) => k,
@@ -2846,7 +2844,7 @@ fn parse_acf_in(sc: &mut AcfScanner) -> Parse<AccessSecurityConfig> {
                 };
                 sc.skip_ws_comments();
                 if sc.peek() == Some(b'{') {
-                    parse_asg_body(sc, &mut config, asg.as_deref(), &mut current)?;
+                    parse_asg_body(sc, &mut config, asg.as_deref())?;
                 }
             }
             // The other lexer keywords cannot start a `generic_item`.
@@ -3191,17 +3189,31 @@ fn is_acf_number(run: &[u8]) -> bool {
     !e.is_empty() && unsigned(e) == e.len()
 }
 
-/// asLib.y's `yyAsgRule`: the ASG and index of the last rule `asAsgAddRule`
-/// made in this parse, in any ASG. A rule with an unsupported access
-/// keyword makes none and leaves it where it was (CBUG-Q1).
-type CurrentRule = Option<(Vec<u8>, usize)>;
+/// What one RULE's clauses act on. C has one `yyAsgRule` for the whole file,
+/// and a RULE that makes no rule leaves it on the last one made, so an
+/// unsupported access keyword's clauses edit that rule, in any ASG (CBUG-Q1).
+enum RuleTarget {
+    /// The ASG and index of the rule `asAsgAddRule` made.
+    Made(Vec<u8>, usize),
+    /// An unsupported access keyword. C warns that it ignores the RULE, and
+    /// upstream `aslibtest.c` expects the rest of the file to load, so no
+    /// clause of it acts or fails.
+    Ignored,
+    /// A negative LEVEL or a refused ASG, which fail the parse anyway: C's
+    /// NULL rule, which every clause passes but `asAsgRuleDisable`.
+    Refused,
+}
 
-fn current_rule<'a>(
-    asgs: &'a mut HashMap<Vec<u8>, AccessSecurityGroup>,
-    current: &CurrentRule,
-) -> Option<&'a mut AccessRule> {
-    let (asg, index) = current.as_ref()?;
-    asgs.get_mut(asg)?.rules.get_mut(*index)
+impl RuleTarget {
+    fn rule<'a>(
+        &self,
+        asgs: &'a mut HashMap<Vec<u8>, AccessSecurityGroup>,
+    ) -> Option<&'a mut AccessRule> {
+        let RuleTarget::Made(asg, index) = self else {
+            return None;
+        };
+        asgs.get_mut(asg)?.rules.get_mut(*index)
+    }
 }
 
 /// asLib.y `asg_body`. `name` is `yyAsg`: `None` for a group `asAsgAdd`
@@ -3210,7 +3222,6 @@ fn parse_asg_body(
     sc: &mut AcfScanner,
     config: &mut AccessSecurityConfig,
     name: Option<&[u8]>,
-    current: &mut CurrentRule,
 ) -> Parse<()> {
     sc.next();
 
@@ -3227,7 +3238,7 @@ fn parse_asg_body(
             return Err(sc.reject());
         };
         if kw == b"RULE" {
-            parse_rule(sc, config, name, current)?;
+            parse_rule(sc, config, name)?;
         } else if let Some(index) = kw.strip_prefix(b"INP").and_then(parse_inp_index) {
             // `INP[A-U]` is one token, `tokenINP` (`asLib_lex.l:48-52`), whose
             // payload is the letter index; `asLib.y:237-243` reads the link.
@@ -3269,7 +3280,7 @@ fn shown(token: &[u8]) -> String {
 }
 
 /// asLib.y `rule_config`. Every clause, the head's TRAPWRITE included, goes to
-/// the rule `current` names, as C sends it to `yyAsgRule`.
+/// the rule `target` names, as C sends it to `yyAsgRule`.
 ///
 /// Each action runs where C's does: one C reduces on its last token says
 /// that token's line, before the next token is lexed.
@@ -3277,7 +3288,6 @@ fn parse_rule(
     sc: &mut AcfScanner,
     config: &mut AccessSecurityConfig,
     asg: Option<&[u8]>,
-    current: &mut CurrentRule,
 ) -> Parse<()> {
     // asLib.y `rule_head`: `'(' tokenINT64 ',' tokenSTRING [',' tokenSTRING] ')'`.
     // The lexer refused any integer `epicsParseInt64` cannot take.
@@ -3292,9 +3302,8 @@ fn parse_rule(
     expect(sc, b',')?;
 
     // C matches `NONE`/`READ`/`WRITE` with `strcmp` and calls
-    // `asAsgAddRule(yyAsg, access, (int)$1)`; any other string only warns,
-    // adds no rule and leaves `yyAsgRule` on the previous one (CBUG-Q1), as
-    // a negative LEVEL does.
+    // `asAsgAddRule(yyAsg, access, (int)$1)`; any other string only warns
+    // and adds no rule.
     let access_str = read_string(sc)?;
     let access = match access_str.as_slice() {
         b"WRITE" => Some(RuleAccess::Write),
@@ -3302,30 +3311,35 @@ fn parse_rule(
         b"NONE" => Some(RuleAccess::None),
         _ => None,
     };
-    if level_num < 0 {
+    let target = if level_num < 0 {
         sc.error(&format!("RULE: LEVEL must be positive: {level_num}"));
+        RuleTarget::Refused
     } else if let Some(access) = access {
         // `asAsgAddRule(NULL, ...)` returns NULL.
-        *current = asg.map(|asg| {
-            let rules = &mut config
-                .asg
-                .get_mut(asg)
-                .expect("parse_acf adds the ASG first")
-                .rules;
-            rules.push(AccessRule {
-                level: level_num as i32,
-                access,
-                ..AccessRule::default()
-            });
-            (asg.to_vec(), rules.len() - 1)
-        });
+        match asg {
+            Some(asg) => {
+                let rules = &mut config
+                    .asg
+                    .get_mut(asg)
+                    .expect("parse_acf adds the ASG first")
+                    .rules;
+                rules.push(AccessRule {
+                    level: level_num as i32,
+                    access,
+                    ..AccessRule::default()
+                });
+                RuleTarget::Made(asg.to_vec(), rules.len() - 1)
+            }
+            None => RuleTarget::Refused,
+        }
     } else {
         sc.warn(
             "Ignoring RULE that contains an unsupported keyword",
             sc.line,
             &access_str,
         );
-    }
+        RuleTarget::Ignored
+    };
 
     // `rule_log_option`, matched with `strcmp`.
     sc.skip_ws_comments();
@@ -3334,7 +3348,7 @@ fn parse_rule(
         let log_opt = read_string(sc)?;
         match log_opt.as_slice() {
             b"TRAPWRITE" => {
-                if let Some(rule) = current_rule(&mut config.asg, current) {
+                if let Some(rule) = target.rule(&mut config.asg) {
                     rule.trap = true;
                 }
             }
@@ -3349,9 +3363,9 @@ fn parse_rule(
         return Ok(());
     }
     sc.next();
-    // asLib.y `rule_list`: one or more items, no separator. With no current
-    // rule, C's clause helpers return 0 at once: a group is not looked up and
-    // a CALC is not compiled.
+    // asLib.y `rule_list`: one or more items, no separator. With no rule, C's
+    // clause helpers return 0 at once: a group is not looked up and a CALC is
+    // not compiled.
     let mut items = 0;
     loop {
         sc.skip_ws_comments();
@@ -3371,12 +3385,12 @@ fn parse_rule(
                     } else {
                         ("Host", &config.hag)
                     };
-                    if current.is_some() && !defined.contains_key(&name) {
+                    if matches!(target, RuleTarget::Made(..)) && !defined.contains_key(&name) {
                         sc.refuse(format!(
                             "No {kind} Access Group named '{}' defined",
                             String::from_utf8_lossy(&name)
                         ));
-                    } else if let Some(rule) = current_rule(&mut config.asg, current) {
+                    } else if let Some(rule) = target.rule(&mut config.asg) {
                         if kw == b"UAG" {
                             &mut rule.uag
                         } else {
@@ -3397,7 +3411,7 @@ fn parse_rule(
             // clause wins, as C `asAsgRuleCalc` overwrites.
             Some(Token::Keyword(kw)) if kw == b"CALC" => {
                 let expr = read_paren_name(sc)?;
-                if let Some(rule) = current_rule(&mut config.asg, current) {
+                if let Some(rule) = target.rule(&mut config.asg) {
                     match compile_rule_calc(&expr) {
                         Ok((compiled, used)) => {
                             rule.calc = Some(expr);
@@ -3411,7 +3425,7 @@ fn parse_rule(
             }
             // PR #563: METHOD("ca", "x509", ...); PR #563/#618:
             // AUTHORITY("CA Issuer", ...). C base reads either as the
-            // unsupported keyword below, so with no current rule it is refused.
+            // unsupported keyword below, so with no rule it is refused.
             Some(Token::Name(kw)) if kw == b"METHOD" || kw == b"AUTHORITY" => {
                 let items = read_token_list(sc, b'(', b')', ListKind::Generic)?;
                 // `rule_generic_block_elem` takes an optional `generic_block`
@@ -3420,14 +3434,15 @@ fn parse_rule(
                 if sc.peek() == Some(b'{') {
                     skip_generic_block(sc)?;
                 }
-                match current_rule(&mut config.asg, current) {
+                match target.rule(&mut config.asg) {
                     Some(rule) => if kw == b"METHOD" {
                         &mut rule.method
                     } else {
                         &mut rule.authority
                     }
                     .extend(items),
-                    None => no_rule_to_disable(sc, &kw),
+                    None if matches!(target, RuleTarget::Refused) => no_rule_to_disable(sc, &kw),
+                    None => {}
                 }
                 continue;
             }
@@ -3437,16 +3452,18 @@ fn parse_rule(
             Some(Token::Number(_)) | None => return Err(sc.reject()),
         };
         // C `asLib.y:300-306`: any other element disables the rule
-        // (`asAsgRuleDisable`), which fails on a NULL `yyAsgRule`.
+        // (`asAsgRuleDisable`), which fails on a NULL `yyAsgRule`. An ignored
+        // RULE has nothing to disable.
         skip_generic_elem(sc)?;
         sc.warn(
             "Ignoring RULE that contains an unsupported keyword",
             sc.line,
             &name,
         );
-        match current_rule(&mut config.asg, current) {
+        match target.rule(&mut config.asg) {
             Some(rule) => rule.ignore = true,
-            None => no_rule_to_disable(sc, &name),
+            None if matches!(target, RuleTarget::Refused) => no_rule_to_disable(sc, &name),
+            None => {}
         }
     }
 }
@@ -4853,40 +4870,46 @@ ASG(MIXED_CASE) {
         );
     }
 
-    /// A misspelled access keyword adds no rule, and its clauses go to the
-    /// last rule made anywhere above it, as C's `yyAsgRule` (CBUG-Q1). The
-    /// expected text is softIoc R7.0.10 `asprules` on each ACF.
+    /// A misspelled access keyword adds no rule and its clauses act on none.
+    /// C hands them to the last rule made anywhere above it (CBUG-Q1): softIoc
+    /// R7.0.10 `asprules` gives the first case `RULE(1,READ,NOTRAPWRITE) {
+    /// UAG(u) }`, the second `RULE(1,READ,TRAPWRITE)`, and disables the READ
+    /// rule in the third. The expected text is in `asprules` form with the
+    /// file's other rules as written.
     #[test]
-    fn an_unsupported_access_keyword_adds_no_rule_and_feeds_the_previous_one() {
+    fn an_unsupported_access_keywords_clauses_act_on_no_rule() {
+        let read = "ASG(DEFAULT)\nASG(g) {\n\tRULE(1,READ,NOTRAPWRITE)\n}\n";
         for (acf, asprules) in [
-            (
-                "UAG(u){x}\nASG(g){RULE(1,READ) RULE(1,FOO){UAG(u)}}",
-                "ASG(DEFAULT)\nASG(g) {\n\tRULE(1,READ,NOTRAPWRITE) {\n\t\tUAG(u)\n\t}\n}\n",
-            ),
-            (
-                "ASG(g){RULE(1,READ) RULE(1,FOO,TRAPWRITE)}",
-                "ASG(DEFAULT)\nASG(g) {\n\tRULE(1,READ,TRAPWRITE)\n}\n",
-            ),
+            ("UAG(u){x}\nASG(g){RULE(1,READ) RULE(1,FOO){UAG(u)}}", read),
+            ("ASG(g){RULE(1,READ) RULE(1,FOO,TRAPWRITE)}", read),
+            ("ASG(g){RULE(1,READ) RULE(1,FOO){FOO(x)}}", read),
+            ("ASG(g){RULE(1,READ) RULE(1,FOO){CALC(\"A\")}}", read),
+            ("ASG(g){RULE(1,READ) RULE(1,FOO){METHOD(\"x\")}}", read),
             (
                 "UAG(u){x}\nASG(A){RULE(1,READ)}\nASG(B){RULE(1,FOO){UAG(u)}}",
-                "ASG(A) {\n\tRULE(1,READ,NOTRAPWRITE) {\n\t\tUAG(u)\n\t}\n}\nASG(B)\nASG(DEFAULT)\n",
+                "ASG(A) {\n\tRULE(1,READ,NOTRAPWRITE)\n}\nASG(B)\nASG(DEFAULT)\n",
+            ),
+            (
+                "ASG(g){RULE(1,READ)}\nASG(h){RULE(1,FOO){UAG(nope)}}",
+                "ASG(DEFAULT)\nASG(g) {\n\tRULE(1,READ,NOTRAPWRITE)\n}\nASG(h)\n",
+            ),
+            (
+                "ASG(g){RULE(1,READ)}\nASG(h){RULE(1,FOO){CALC(\"A>\")}}",
+                "ASG(DEFAULT)\nASG(g) {\n\tRULE(1,READ,NOTRAPWRITE)\n}\nASG(h)\n",
             ),
             ("ASG(g){RULE(1,FOO){UAG(nope)}}", "ASG(DEFAULT)\nASG(g)\n"),
             (
-                "ASG(DEFAULT){RULE(1,FOO)}\nASG(DEFAULT){RULE(1,READ)}",
-                "ASG(DEFAULT) {\n\tRULE(1,READ,NOTRAPWRITE)\n}\n",
-            ),
-            (
-                "ASG(g){RULE(1,READ) RULE(1,FOO){FOO(x)}}",
-                "ASG(DEFAULT)\nASG(g) {\n}\n",
-            ),
-            (
-                "ASG(g){RULE(1,READ) RULE(1,FOO){CALC(\"A\")}}",
-                "ASG(DEFAULT)\nASG(g) {\n\tRULE(1,READ,NOTRAPWRITE) {\n\t\tCALC(\"A\") result=FALSE\n\t}\n}\n",
-            ),
-            (
                 "ASG(g){RULE(1,FOO){CALC(\"A>\")}}",
                 "ASG(DEFAULT)\nASG(g)\n",
+            ),
+            ("ASG(g){RULE(1,FOO){FOO(x)}}", "ASG(DEFAULT)\nASG(g)\n"),
+            (
+                "ASG(g){RULE(1,FOO){METHOD(\"x\")}}",
+                "ASG(DEFAULT)\nASG(g)\n",
+            ),
+            (
+                "ASG(DEFAULT){RULE(1,FOO)}\nASG(DEFAULT){RULE(1,READ)}",
+                "ASG(DEFAULT) {\n\tRULE(1,READ,NOTRAPWRITE)\n}\n",
             ),
         ] {
             let config =
@@ -4894,24 +4917,11 @@ ASG(MIXED_CASE) {
             let dump = config.dump_rules(None);
             assert_eq!(String::from_utf8(dump).unwrap(), asprules, "{acf}");
         }
-        // The READ rule now needs UAG(u): a stranger is denied.
+        // The READ rule still grants a stranger read.
         let config = parse_acf("UAG(u){x}\nASG(g){RULE(1,READ) RULE(1,FOO){UAG(u)}}").unwrap();
-        assert_eq!(
-            config.check_access("g", "h", "stranger"),
-            AccessLevel::NoAccess
-        );
-        assert_eq!(config.check_access("g", "h", "x"), AccessLevel::Read);
-        // `ascheck` refuses these: no rule to disable, or a clause reaching a
-        // previous rule that then fails as it would on that rule.
-        for acf in [
-            "ASG(g){RULE(1,FOO){METHOD(\"x\")}}",
-            "ASG(g){RULE(1,FOO){FOO(x)}}",
-            "ASG(g){RULE(1,FOO,BOGUS)}",
-            "ASG(g){RULE(1,READ)}\nASG(h){RULE(1,FOO){UAG(nope)}}",
-            "ASG(g){RULE(1,READ)}\nASG(h){RULE(1,FOO){CALC(\"A>\")}}",
-        ] {
-            assert!(parse_acf(format!("{acf}\n").as_bytes()).is_err(), "{acf}");
-        }
+        assert_eq!(config.check_access("g", "h", "stranger"), AccessLevel::Read);
+        // The log option is checked whatever the access keyword, as in C.
+        assert!(parse_acf("ASG(g){RULE(1,FOO,BOGUS)}\n").is_err());
     }
 
     // ----- RULE level validation -----

@@ -16,7 +16,7 @@
 //! byte short of it and keeps the terminator.
 
 use std::borrow::Cow;
-use std::ffi::{c_char, c_int};
+use std::ffi::{c_char, c_int, c_long};
 use std::io;
 use std::slice;
 use std::sync::Arc;
@@ -1160,6 +1160,11 @@ pub fn atoi(s: impl CSrc) -> c_int {
     s.with_c_bytes(|b| stdlib::atoi(b))
 }
 
+/// `atol`: glibc's `strtol(s, NULL, 10)`.
+pub fn atol(s: impl CSrc) -> c_long {
+    s.with_c_bytes(|b| stdlib::strtol(b, 10).0)
+}
+
 /// `epicsThreadSleep`; `secs` in seconds. A state set's sleep is a block
 /// point of its program's [`EventGate`](crate::pv::EventGate), and one that
 /// returns at once a pass, as its `when` waits are.
@@ -1738,9 +1743,22 @@ mod tests {
         assert_eq!(t.at(1).to_c_vec(), b"m1");
     }
 
+    /// EnsembleTrajectoryScan.st:963 `atol(&reply[1])`.
+    #[test]
+    fn atol_is_strtol() {
+        assert_eq!(atol(" -42abc"), -42);
+        assert_eq!(atol("x1"), 0);
+        assert_eq!(
+            atol("2147483648"),
+            c_long::try_from(2147483648_i64).unwrap_or(c_long::MAX)
+        );
+        let v = <SeqVar<[c_char; 8]>>::zeroed();
+        strcpy(&v, "#12");
+        assert_eq!(atol(v.at(1)), 12);
+    }
+
     #[test]
     fn atoi_is_strtol_cut_to_int() {
-        use std::ffi::c_long;
         assert_eq!(atoi(" -42abc"), -42);
         assert_eq!(atoi("x1"), 0);
         // A 64-bit `long` wraps when cut to int; a 32-bit one saturates.

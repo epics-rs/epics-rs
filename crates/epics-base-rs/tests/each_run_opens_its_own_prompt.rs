@@ -9,7 +9,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use epics_base_rs::server::ioc_app::{IocApplication, IocInitDecision};
+use epics_base_rs::server::ioc_app::{IocApplication, IocInitDecision, RunOutcome};
 use epics_base_rs::server::iocsh::registry::{
     ArgDesc, ArgType, ArgValue, CommandDef, CommandOutcome,
 };
@@ -56,14 +56,16 @@ async fn a_second_ioc_and_a_later_main_each_read_their_lines() {
         .run(|_config| async move { unreachable!("this IOC never runs iocInit") })
         .await
         .unwrap();
-    IocApplication::new()
+    let second = IocApplication::new()
         .port(0)
-        .run(|config| async move {
+        .run_outcome(|config| async move {
             epics_base_rs::server::db_server::announce_serving("probe");
             config.run_shell(Vec::new()).await
         })
         .await
         .unwrap();
+    // An IOC that never initialised reads `second` at its tail prompt too.
+    assert_eq!(second, RunOutcome::Served);
     // A `main`'s own `iocsh(NULL)` after both IOCs, on `_main_` as the
     // servers' `run_with_shell` puts it.
     let bridge = epics_base_rs::runtime::task::BlockingBridge::capture();

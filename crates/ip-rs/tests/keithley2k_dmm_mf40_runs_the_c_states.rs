@@ -31,23 +31,24 @@ const DMM: Meter = Meter {
     read: "read?",
 };
 
-/// Boot with 4 channels: `mode_change` configures DC volts and closes
-/// channel 1, `read_meter` resets the meter through `init_string` and, 1 s
-/// on, sets its reading format through `init_string1`. The two state sets
-/// race, in C too, so only each one's own order is fixed.
+/// Boot with 4 channels: `read_meter` resets the meter through
+/// `init_string`, configures DC volts and closes channel 1, and 1 s on the
+/// reset sets the reading format through `init_string1`.
 async fn booted(ioc: &Ioc) {
     let got = ioc.boot_commands().await;
-    let (reset, mode): (Vec<_>, Vec<_>) = got
-        .iter()
-        .partition(|c| *c == "*rst" || *c == "form:elem read");
-    assert_eq!(reset, ["*rst", "form:elem read"], "{got:?}");
-    assert_eq!(mode, [":conf:volt:dc", "rout:clos (@101)"], "{got:?}");
+    assert_eq!(
+        got,
+        [
+            "*rst",
+            ":conf:volt:dc",
+            "rout:clos (@101)",
+            "form:elem read"
+        ]
+    );
 }
 
 /// Single-channel reads: each sends `read?` behind whatever mode and relay
-/// changed since the last, and `Dmm_raw` takes the reading. The channel and
-/// mode are put first, as the boot race leaves `previous_mode` and
-/// `previous_chan` at either 0 or -1.
+/// changed since the last, and `Dmm_raw` takes the reading.
 #[epics_base_rs::epics_test]
 async fn single_reads_follow_the_selected_channel_and_mode() {
     let ioc = boot(&DMM, 4).await;
@@ -171,4 +172,75 @@ async fn a_mode_past_the_ten_is_ignored() {
     ])
     .await;
     assert_eq!(ioc.f64_of("Ch2_raw"), 102.0);
+}
+
+/// `init_dmm` during a scan waits for the scan to end. C's mode_change
+/// reset `scan_chan` at once, so the reading in flight landed in `Ch1_raw`
+/// and the scan read channel 2 again.
+#[epics_base_rs::epics_test]
+async fn init_dmm_during_a_scan_waits_for_its_end() {
+    let ioc = boot(&DMM, 4).await;
+    booted(&ioc).await;
+    ioc.step("ch_mode_sel", 1.0, &[":conf:volt:ac"]).await;
+    ioc.step("dmm_chan", 3.0, &["rout:clos (@104)"]).await;
+    ioc.step("single_multi", 1.0, &[]).await;
+    ioc.mock.hold_read(1);
+    ioc.step(
+        "done_read",
+        1.0,
+        &[
+            ":conf:volt:dc",
+            "rout:clos (@101)",
+            "read?",
+            "rout:clos (@102)",
+            "read?",
+        ],
+    )
+    .await;
+    ioc.step("init_dmm", 1.0, &[]).await;
+    ioc.mock.release_read();
+    ioc.commands(&[
+        "rout:clos (@103)",
+        "read?",
+        "rout:clos (@104)",
+        "read?",
+        "*rst",
+        "form:elem read",
+    ])
+    .await;
+    for n in 1..=4 {
+        assert_eq!(
+            ioc.f64_of(&format!("Ch{n}_raw")),
+            100.0 + n as f64,
+            "Ch{n}_raw"
+        );
+    }
+    assert_eq!(ioc.f64_of("done_read"), 0.0);
+    assert_eq!(ioc.f64_of("init_dmm"), 0.0);
+}
+
+/// A read behind an `init_dmm` reset closes its relay after the reset, and
+/// so does the read after it. C's mode_change put the reset from its own
+/// thread, so a read read_meter took meanwhile closed the relay first, and
+/// the next read went out with every relay open.
+#[epics_base_rs::epics_test]
+async fn a_read_behind_a_reset_closes_its_relay_after_it() {
+    let ioc = boot(&DMM, 4).await;
+    booted(&ioc).await;
+    ioc.step("dmm_chan", 2.0, &["rout:clos (@103)"]).await;
+    let reset = ioc.hold("init_string");
+    ioc.put("init_dmm", EpicsValue::Double(1.0)).await;
+    ioc.step("done_read", 1.0, &[]).await;
+    reset.release();
+    ioc.commands(&[
+        "*rst",
+        ":conf:volt:dc",
+        "rout:clos (@103)",
+        "read?",
+        "form:elem read",
+    ])
+    .await;
+    assert_eq!(ioc.f64_of("Dmm_raw"), 103.0);
+    ioc.read(&["read?"]).await;
+    assert_eq!(ioc.f64_of("Dmm_raw"), 103.0);
 }

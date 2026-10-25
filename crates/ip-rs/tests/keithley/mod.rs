@@ -82,7 +82,31 @@ pub async fn boot(meter: &Meter, channels: u32) -> Ioc {
     }
 }
 
+/// A record's lock set, held on a thread of its own until [`Self::release`].
+pub struct Held(std::sync::mpsc::Sender<()>);
+
+impl Held {
+    pub fn release(self) {
+        self.0.send(()).unwrap();
+    }
+}
+
 impl Ioc {
+    /// `{P}{Dmm}<record>`'s lock set, taken: a put of the program's to it
+    /// waits, and with it the state set that put it, until the release.
+    pub fn hold(&self, record: &str) -> Held {
+        let (db, record) = (self.db.clone(), format!("{}{record}", self.prefix));
+        let (locked, taken) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            let _guard = db.lock_record(&record);
+            locked.send(()).unwrap();
+            let _ = released.recv();
+        });
+        taken.recv().unwrap();
+        Held(release)
+    }
+
     /// A CA client's put to `{P}{Dmm}<pv>`, which processes the record.
     pub async fn put(&self, pv: &str, value: EpicsValue) {
         self.db

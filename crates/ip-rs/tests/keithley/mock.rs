@@ -2,15 +2,18 @@
 //! LF-terminated commands, and the model's read command answered with
 //! `<chan>.<mode>`, the relay last closed and the index into the model's
 //! `dmm_modes` last configured, so each reading names both. `*rst` and
-//! `rout:open:all` (or `route:open:all`) open every relay.
+//! `rout:open:all` (or `route:open:all`) open every relay. A test can hold
+//! one reading back, and with it every command behind it.
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 
 pub struct Keithley {
     host: String,
     commands: Arc<Mutex<Vec<String>>>,
+    /// How many more readings go out before one is held; `None` holds none.
+    hold: Arc<(Mutex<Option<usize>>, Condvar)>,
 }
 
 impl Keithley {
@@ -21,6 +24,8 @@ impl Keithley {
         let host = listener.local_addr().unwrap().to_string();
         let commands = Arc::new(Mutex::new(Vec::new()));
         let log = commands.clone();
+        let hold = Arc::new((Mutex::new(None), Condvar::new()));
+        let gate = hold.clone();
         std::thread::spawn(move || {
             let (mut chan, mut mode) = (0, 0);
             for conn in listener.incoming().flatten() {
@@ -38,6 +43,15 @@ impl Keithley {
                     }
                     let answer = cmd == read;
                     log.lock().unwrap().push(cmd);
+                    if answer {
+                        let (pass, released) = &*gate;
+                        let mut pass = pass.lock().unwrap();
+                        match *pass {
+                            Some(0) => drop(released.wait_while(pass, |p| p.is_some()).unwrap()),
+                            Some(n) => *pass = Some(n - 1),
+                            None => {}
+                        }
+                    }
                     if answer
                         && reply
                             .write_all(format!("{chan}.{mode}\n").as_bytes())
@@ -48,7 +62,22 @@ impl Keithley {
                 }
             }
         });
-        Keithley { host, commands }
+        Keithley {
+            host,
+            commands,
+            hold,
+        }
+    }
+
+    /// Answer the next `pass` readings, then hold the one after them until
+    /// [`release_read`](Self::release_read).
+    pub fn hold_read(&self, pass: usize) {
+        *self.hold.0.lock().unwrap() = Some(pass);
+    }
+
+    pub fn release_read(&self) {
+        *self.hold.0.lock().unwrap() = None;
+        self.hold.1.notify_all();
     }
 
     /// `host:port`, for `drvAsynIPPortConfigure`.

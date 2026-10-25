@@ -74,7 +74,6 @@ pub struct FilePluginController<W: NDFileWriter> {
     /// `stop_capture` / `abort_capture` may write this (B8).
     pub capture_active: bool,
     pub lazy_open: bool,
-    pub delete_driver_file: bool,
     pub latest_array: Option<Arc<NDArray>>,
     /// This plugin's asyn port name, for FilePluginDestination matching (G9).
     port_name: String,
@@ -112,7 +111,6 @@ impl<W: NDFileWriter> FilePluginController<W> {
             auto_save: false,
             capture_active: false,
             lazy_open: false,
-            delete_driver_file: false,
             latest_array: None,
             port_name: String::new(),
             view: None,
@@ -1012,7 +1010,8 @@ impl<W: NDFileWriter, P: PortLock<FilePluginController<W>>> FileControl<W> for P
         } else if Some(reason) == p.lazy_open {
             c.lazy_open = value != 0;
         } else if Some(reason) == p.delete_driver_file {
-            c.delete_driver_file = value != 0;
+            // Unlike LazyOpen, C reads this at each write (NDPluginFile.cpp:378).
+            c.file_base.delete_driver_file = value != 0;
         }
         out.set_updates(updates)
     }
@@ -1036,7 +1035,6 @@ fn start_capture<W: NDFileWriter, P: PortLock<FilePluginController<W>>>(
         c.file_base.register_init_frame(c.latest_array.as_deref());
     }
     c.file_base.lazy_open = c.lazy_open;
-    c.file_base.delete_driver_file = c.delete_driver_file;
     // C clears NDFullFileName as a capture starts (NDPluginFile.cpp:847).
     c.file_base.clear_full_file_name();
 
@@ -3295,6 +3293,30 @@ mod tests {
             want.push(&refused);
             assert_eq!(out.trace, error_lines(&want));
             assert_eq!(side_int(&out, p.write_status.unwrap()), Some(status));
+        }
+    }
+
+    /// A DeleteDriverFile write takes effect at the next write, with no
+    /// capture started in between (NDPluginFile.cpp:378).
+    #[test]
+    fn delete_driver_file_is_read_at_each_write() {
+        let missing = std::env::temp_dir()
+            .join(format!("nolatch-{}", std::process::id()))
+            .join("raw");
+        let missing = missing.to_str().unwrap().to_string();
+        let mut c = base_port();
+        let p = c.params;
+        c.latest_array = Some(Arc::new(with_str_attr(
+            array(1),
+            "DriverFileName",
+            &missing,
+        )));
+        for (delete, ok) in [(1, false), (0, true)] {
+            c.store_int32(
+                p.delete_driver_file.unwrap(),
+                WriteVerdict::Accept(delete).into(),
+            );
+            assert_eq!(write_file(&mut c).verdict, zeroed(ok), "{delete}");
         }
     }
 

@@ -122,6 +122,25 @@ pub(crate) fn running<P: ad_core_rs::plugin::runtime::NDPluginProcess>(
     start(&asyn_rs::asyn_record::claim_port(port).unwrap(), processor)
 }
 
+/// A NumThreads write over MaxThreads, which NDPluginDriver refuses, through
+/// `processor`'s port: it must fail and leave the clamp as the readback.
+/// Returns the error message, the param written and the value.
+pub(crate) fn refused_base_write<P: ad_core_rs::plugin::runtime::NDPluginProcess>(
+    port: &str,
+    processor: P,
+) -> (String, usize, i32) {
+    let (handle, _rx, _jh) = running(port, processor);
+    let p = &handle.plugin_params;
+    let port = handle.port_runtime().port_handle();
+    let max = port.read_int32_blocking(p.max_threads, 0).unwrap();
+    let refused = port.write_int32_blocking(p.num_threads, 0, max + 1);
+    assert_eq!(port.read_int32_blocking(p.num_threads, 0).unwrap(), max);
+    match refused {
+        Err(asyn_rs::error::AsynError::Status { message, .. }) => (message, p.num_threads, max + 1),
+        other => panic!("NumThreads {} over MaxThreads {max}: {other:?}", max + 1),
+    }
+}
+
 /// [`running`], registered with an open `interruptAccept` as after iocInit,
 /// so its posts reach interrupt subscribers.
 pub(crate) fn registered<P: ad_core_rs::plugin::runtime::NDPluginProcess>(

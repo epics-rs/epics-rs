@@ -661,10 +661,9 @@ impl NDPluginProcess for OverlayProcessor {
         self.slots.lock().len()
     }
 
-    /// C `NDPluginOverlay::writeInt32` drops the base class status
-    /// (`NDPluginDriver::writeInt32(pasynUser, value);`, NDPluginOverlay.cpp:508): a refused NDPluginDriver write keeps
-    /// its clamp and succeeds. A Position/Center/Size write sets the other
-    /// of Position/Center from the params and the freeze flag (:466-506).
+    /// C `NDPluginOverlay::writeInt32` drops the base refusal (NDPluginOverlay.cpp:508); not copied.
+    /// A Position/Center/Size write sets the other of Position/Center from
+    /// the params and the freeze flag (:466-506).
     fn validate_int32(
         &self,
         reason: usize,
@@ -673,7 +672,7 @@ impl NDPluginProcess for OverlayProcessor {
         verdict: ad_core_rs::plugin::runtime::WriteVerdict<i32>,
         params: &mut ad_core_rs::plugin::runtime::WritePort<'_>,
     ) -> ad_core_rs::plugin::runtime::WriteOutcome<i32> {
-        let outcome = ad_core_rs::plugin::runtime::WriteOutcome::from(verdict.succeed());
+        let outcome = ad_core_rs::plugin::runtime::WriteOutcome::from(verdict);
         let p = &self.params;
         for (x, pos, center, size) in [
             (true, p.position_x, p.center_x, p.size_x),
@@ -862,33 +861,14 @@ impl NDPluginProcess for OverlayProcessor {
 mod tests {
     use super::*;
 
-    /// `NDPluginDriver::writeInt32(pasynUser, value);` (NDPluginOverlay.cpp:508).
+    /// NDPluginOverlay.cpp:508 drops the base refusal; an Overlay port returns it.
     #[test]
-    fn a_refused_base_write_succeeds_as_c_write_int32_does() {
-        use ad_core_rs::plugin::runtime::WriteVerdict;
-        let proc = OverlayProcessor::new(8, vec![]);
-        let mut base = asyn_rs::port::PortDriverBase::new(
-            "T",
-            1,
-            Default::default(),
-            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
-            asyn_rs::port::InterfaceMask::UNMIGRATED_INTERRUPTS,
+    fn a_refused_base_write_fails() {
+        let (message, _, _) = crate::test_util::refused_base_write(
+            "OVERLAY_REFUSED",
+            OverlayProcessor::new(8, vec![]),
         );
-        let clamp = WriteVerdict::Refuse {
-            keep: 1,
-            message: String::new(),
-        };
-        assert_eq!(
-            proc.validate_int32(
-                0,
-                0,
-                98,
-                clamp,
-                &mut ad_core_rs::plugin::runtime::WritePort::new(&mut base)
-            )
-            .verdict,
-            WriteVerdict::Accept(1)
-        );
+        assert_eq!(message, "");
     }
     use ad_core_rs::ndarray::{NDDataType, NDDataView, NDDimension};
 

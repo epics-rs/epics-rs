@@ -1902,18 +1902,26 @@ impl NDPluginProcess for StatsProcessor {
         2
     }
 
-    /// C `NDPluginStats::writeInt32` drops the base class status
-    /// (`status = (asynStatus) callParamCallbacks();`, NDPluginStats.cpp:700): a refused NDPluginDriver write keeps
-    /// its clamp and succeeds.
+    /// C `NDPluginStats::writeInt32` drops the base refusal (NDPluginStats.cpp:700); not copied.
+    /// A kept refusal carries the errorMessage C's `if (status)` sets (:702-705).
     fn validate_int32(
         &self,
         reason: usize,
         _addr: i32,
-        _value: i32,
+        value: i32,
         verdict: ad_core_rs::plugin::runtime::WriteVerdict<i32>,
         params: &mut ad_core_rs::plugin::runtime::WritePort<'_>,
     ) -> ad_core_rs::plugin::runtime::WriteOutcome<i32> {
-        let verdict = verdict.succeed();
+        use ad_core_rs::plugin::runtime::WriteVerdict;
+        let verdict = match verdict {
+            WriteVerdict::Refuse { keep, .. } => WriteVerdict::Refuse {
+                keep,
+                message: format!(
+                    "NDPluginStats:writeInt32: status=3, function={reason}, value={value}"
+                ),
+            },
+            accepted => accepted,
+        };
         if reason == self.params.hist_size {
             let hist_x = self.hist_x(params, reason, f64::from(verdict.kept()));
             return ad_core_rs::plugin::runtime::WriteOutcome::from(verdict).set_updates(hist_x);
@@ -2352,32 +2360,14 @@ mod tests {
         assert_eq!(handle.port_runtime().port_handle().max_addr(), 2);
     }
 
-    /// `status = (asynStatus) callParamCallbacks();` (NDPluginStats.cpp:700).
+    /// NDPluginStats.cpp:700 drops the base refusal; a Stats port returns it.
     #[test]
-    fn a_refused_base_write_succeeds_as_c_write_int32_does() {
-        use ad_core_rs::plugin::runtime::WriteVerdict;
-        let proc = StatsProcessor::new();
-        let mut base = asyn_rs::port::PortDriverBase::new(
-            "T",
-            1,
-            Default::default(),
-            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
-            asyn_rs::port::InterfaceMask::UNMIGRATED_INTERRUPTS,
-        );
-        let clamp = WriteVerdict::Refuse {
-            keep: 1,
-            message: String::new(),
-        };
+    fn a_refused_base_write_fails() {
+        let (message, function, value) =
+            crate::test_util::refused_base_write("STATS_REFUSED", StatsProcessor::new());
         assert_eq!(
-            proc.validate_int32(
-                0,
-                0,
-                98,
-                clamp,
-                &mut ad_core_rs::plugin::runtime::WritePort::new(&mut base)
-            )
-            .verdict,
-            WriteVerdict::Accept(1)
+            message,
+            format!("NDPluginStats:writeInt32: status=3, function={function}, value={value}")
         );
     }
     use ad_core_rs::ndarray::{NDDataType, NDDataViewMut, NDDimension};

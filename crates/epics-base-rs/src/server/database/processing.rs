@@ -1133,7 +1133,9 @@ impl AsyncDbHandle {
     /// device keeps to reach it later. A `dbCommon` `DBF_NOACCESS` name
     /// (`TIME`) resolves, as in C, with no field type. Takes no lock: `own`
     /// is the calling record as for [`Self::db_get`], and another record's
-    /// runtime-typed field is read only while that record is free.
+    /// runtime-typed field is read only while that record is free. A free
+    /// record is read once, as at [`Self::name_to_addr`], so [`Self::db_get`]
+    /// of `record.field` has an answer while the record is busy later.
     pub fn name_to_dbaddr(
         &self,
         name: impl AsRef<[u8]>,
@@ -1152,6 +1154,7 @@ impl AsyncDbHandle {
             });
         }
         let no_elements = cell.resolve_addr(&field)?;
+        db.db_get_snapshot(&[record.as_bytes(), b".", field.as_bytes()].concat(), own);
         let own = own.and_then(|(own, rec)| (own == record.as_bytes()).then_some(rec));
         let field_type = cell.addressed_field_type(&field, own);
         Some(DbAddr {

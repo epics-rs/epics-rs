@@ -256,3 +256,30 @@ async fn db_get_of_a_record_held_elsewhere_serves_its_last_read() {
     assert_eq!(got.units().map(|u| u.to_string()), Some("mm".into()));
     assert!(unread.is_none());
 }
+
+/// C's `dbGet` reads through the `DBADDR` `dbNameToAddr` gave, so a field a
+/// device resolved with `name_to_dbaddr` (stream's `%(record.FIELD)`) is read
+/// while its record is held elsewhere, as one `name_to_addr` resolved is.
+#[epics_macros_rs::epics_test]
+async fn db_get_of_a_dbaddr_held_elsewhere_serves_its_last_read() {
+    let db = ioc().await;
+    let h = db.async_handle();
+    let addr = h.name_to_dbaddr("AI.HOPR", None).expect("resolves");
+    let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+    let holder = {
+        let h = db.async_handle();
+        std::thread::spawn(move || {
+            h.with_record("AI", |_| {
+                held_tx.send(()).unwrap();
+                done_rx.recv().unwrap();
+            });
+        })
+    };
+    held_rx.recv().unwrap();
+    let name = format!("{}.{}", addr.record.to_str_lossy(), addr.field);
+    let got = h.db_get(&name, DbFieldType::Double, 1, None);
+    done_tx.send(()).unwrap();
+    holder.join().unwrap();
+    assert_eq!(got.map(|s| s.value), Some(EpicsValue::Double(10.0)));
+}

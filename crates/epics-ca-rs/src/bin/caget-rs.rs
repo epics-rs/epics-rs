@@ -952,7 +952,7 @@ async fn main() {
                         req_type: rt,
                         snap: Box::new(snap),
                     }),
-                    Ok(Err(CaError::Timeout)) | Err(_) => {
+                    Err(_) => {
                         timed_out = true;
                         on_timeout()
                     }
@@ -1005,7 +1005,7 @@ async fn main() {
                         } else {
                             GetResult::Plain(snap.value)
                         }),
-                        Ok(Err(CaError::Timeout)) | Err(_) => {
+                        Err(_) => {
                             timed_out = true;
                             on_timeout()
                         }
@@ -1024,7 +1024,7 @@ async fn main() {
                     .await
                     {
                         Ok(Ok(snap)) => Ok(GetResult::Time(Box::new(snap))),
-                        Ok(Err(CaError::Timeout)) | Err(_) => {
+                        Err(_) => {
                             timed_out = true;
                             on_timeout()
                         }

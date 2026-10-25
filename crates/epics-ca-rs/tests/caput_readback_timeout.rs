@@ -25,6 +25,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use epics_base_rs::server::records::ai::AiRecord;
+use epics_base_rs::server::records::bo::BoRecord;
 use epics_ca_rs::protocol::{CA_PROTO_READ_NOTIFY, CA_PROTO_SEARCH, CaHeader};
 use epics_ca_rs::server::CaServer;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -214,5 +215,74 @@ async fn caput_readback_timeout_prints_the_new_line_and_exits_zero() {
         Some(0),
         "a readback timeout does NOT change caput's exit status (caput.c:239); \
          stderr: {stderr:?}"
+    );
+}
+
+/// Serve `record` as `name` behind the read-dropping proxy; the proxy's
+/// search port.
+async fn served_without_reads(
+    name: &str,
+    record: impl epics_base_rs::server::record::Record,
+) -> u16 {
+    let server = CaServer::builder()
+        .port(0)
+        .record(name, record)
+        .build()
+        .await
+        .expect("build CA server");
+    let (server_udp, server_tcp) = (server.udp_port(), server.tcp_port());
+    tokio::spawn(async move { server.run().await });
+    read_dropping_proxy(server_udp, server_tcp).await
+}
+
+/// Run `caput-rs args` against the proxy: its output and how long it took.
+async fn caput(search_port: u16, args: &[&str]) -> (std::process::Output, Duration) {
+    let started = std::time::Instant::now();
+    let out = Command::new(env!("CARGO_BIN_EXE_caput-rs"))
+        .args(args)
+        .env("EPICS_CA_ADDR_LIST", format!("127.0.0.1:{search_port}"))
+        .env("EPICS_CA_AUTO_ADDR_LIST", "NO")
+        .env("EPICS_CA_SERVER_PORT", search_port.to_string())
+        .output()
+        .await
+        .expect("run caput-rs");
+    (out, started.elapsed())
+}
+
+/// `-l`'s TIME-class readbacks are gets under the same
+/// `ca_pend_io(caTimeout)` as the plain one (caput.c:172, 186): unanswered,
+/// each ends at the `-w` window, not at a deadline of the client's own.
+#[tokio::test(flavor = "multi_thread")]
+async fn caput_long_readback_times_out_at_its_w() {
+    let search_port = served_without_reads("R918:LONG", AiRecord::new(1.0)).await;
+    let (out, took) = caput(search_port, &["-l", "-w", "2", "R918:LONG", "42"]).await;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("Read operation timed out: PV data was not read."),
+        "got stderr: {stderr:?}"
+    );
+    assert_eq!(out.status.code(), Some(0), "stderr: {stderr:?}");
+    assert!(
+        took < Duration::from_secs(20),
+        "two 2 s readbacks took {took:?}"
+    );
+}
+
+/// An ENUM field's menu read is `ca_array_get(DBR_GR_ENUM)` +
+/// `ca_pend_io(caTimeout)` (caput.c:459-465): unanswered, it aborts the put
+/// at the `-w` window.
+#[tokio::test(flavor = "multi_thread")]
+async fn caput_enum_menu_read_times_out_at_its_w() {
+    let search_port = served_without_reads("R918:ENUM", BoRecord::new(0)).await;
+    let (out, took) = caput(search_port, &["-w", "2", "R918:ENUM", "1"]).await;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("Read operation timed out: ENUM data was not read."),
+        "got stderr: {stderr:?}"
+    );
+    assert_eq!(out.status.code(), Some(1), "stderr: {stderr:?}");
+    assert!(
+        took < Duration::from_secs(20),
+        "a 2 s menu read took {took:?}"
     );
 }

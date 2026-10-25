@@ -266,8 +266,8 @@ async fn read_swallowing_proxy(udp: u16, tcp: u16) -> u16 {
 }
 
 /// A get on a network channel is `ca_array_get_callback`, which has no
-/// deadline: one the server never answers is still waiting past the 30 s
-/// `CaChannel::get_with_dbr_type` gives up at, and ends with the disconnect.
+/// deadline: one the server never answers is still waiting past 30 s, and
+/// ends with the disconnect.
 #[epics_macros_rs::epics_test]
 #[serial(epics_env)]
 async fn a_network_get_waits_for_its_answer_with_no_deadline() {

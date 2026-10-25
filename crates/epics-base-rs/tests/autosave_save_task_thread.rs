@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use epics_base_rs::runtime::task::{sleep, thread_by_name};
 use epics_base_rs::server::autosave::AutosaveStartupConfig;
-use epics_base_rs::server::ioc_app::IocApplication;
+use epics_base_rs::server::ioc_app::{IocApplication, RunOutcome};
 
 /// The save_restore thread's priority once it is `want`, or the last one
 /// seen after 30 s.
@@ -37,11 +37,11 @@ async fn run_ioc(after_init: &str, want: [u32; 2]) {
         d = d.display()
     );
     std::fs::write(d.join("st.cmd"), script).unwrap();
-    IocApplication::new()
+    let outcome = IocApplication::new()
         .port(0)
         .autosave_startup(Arc::new(Mutex::new(AutosaveStartupConfig::new())))
         .startup_script(d.join("st.cmd").to_str().unwrap())
-        .run(move |_| async move {
+        .run_outcome(move |_| async move {
             assert_eq!(priority_reaching(want[0]).await, Some(want[0]));
             epics_base_rs::server::db_server::announce_serving("probe");
             assert_eq!(priority_reaching(want[1]).await, Some(want[1]));
@@ -49,6 +49,7 @@ async fn run_ioc(after_init: &str, want: [u32; 2]) {
         })
         .await
         .unwrap();
+    assert_eq!(outcome, RunOutcome::Served);
 }
 
 #[epics_macros_rs::epics_test]

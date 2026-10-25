@@ -21,7 +21,7 @@
 // RTEMS-EXEC-MODEL-ALLOW(1): checked - these run and pass in the exec-backend
 // suite.
 
-use epics_base_rs::server::ioc_app::IocApplication;
+use epics_base_rs::server::ioc_app::{IocApplication, RunOutcome};
 use serial_test::serial;
 
 #[tokio::test(flavor = "multi_thread")]
@@ -72,10 +72,10 @@ async fn pvalink_installs_at_iocinit_seam() {
     // The seam under test: register the pvalink installer at IOC
     // construction. The custom runner below installs no link set, so
     // this is the only path that can register the `pva` scheme.
-    let result = IocApplication::new()
+    let outcome = IocApplication::new()
         .startup_script(stcmd_path.to_str().unwrap())
         .register_link_type("pva", epics_bridge_rs::qsrv::pvalink_link_set_install)
-        .run(|config| async move {
+        .run_outcome(|config| async move {
             // By here iocInit has fired the seam installer (which
             // registered the `pva` lset and pre-opened the CP link).
 
@@ -92,8 +92,9 @@ async fn pvalink_installs_at_iocinit_seam() {
 
             Ok(())
         })
-        .await;
-    result.expect("IOC run returns Ok after the seam assertions");
+        .await
+        .expect("IOC run returns Ok after the seam assertions");
+    assert_eq!(outcome, RunOutcome::Served);
 
     // Best-effort restore so a leaked `PVXS_QSRV_ENABLE=YES` does not
     // surprise a later `epics_env`-group test.

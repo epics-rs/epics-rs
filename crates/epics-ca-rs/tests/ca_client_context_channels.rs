@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use epics_base_rs::server::database::{Connection, PvDatabase};
-use epics_base_rs::server::ioc_app::IocApplication;
+use epics_base_rs::server::ioc_app::{IocApplication, RunOutcome};
 use epics_base_rs::server::records::ai::AiRecord;
 use epics_base_rs::types::{DBR_CTRL_DOUBLE, DBR_TIME_DOUBLE, EpicsValue};
 use epics_ca_rs::calink::{install_calink_resolver, register_calink_commands};
@@ -40,17 +40,18 @@ where
     )
     .expect("write st.cmd");
     let reactor = epics_base_rs::runtime::task::Reactor::current().expect("test runtime");
-    IocApplication::new()
+    let outcome = IocApplication::new()
         .startup_script(stcmd_path.to_str().unwrap())
         .register_link_type("ca", move |db| async move {
             register_calink_commands(install_calink_resolver(&db, reactor).await)
         })
-        .run(move |config| async move {
+        .run_outcome(move |config| async move {
             body(config.db.clone()).await;
             Ok(())
         })
         .await
         .expect("IOC run");
+    assert_eq!(outcome, RunOutcome::Served);
 }
 
 async fn within<T>(what: &str, fut: impl std::future::Future<Output = T>) -> T {

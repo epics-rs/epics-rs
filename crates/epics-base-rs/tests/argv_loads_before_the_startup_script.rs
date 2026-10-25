@@ -9,7 +9,7 @@
 //! `IocApplication` is where that order lives in this port, so these are its
 //! tests rather than the IOC binary's.
 
-use epics_base_rs::server::ioc_app::{IocApplication, IocRunFailure};
+use epics_base_rs::server::ioc_app::{IocApplication, IocRunFailure, RunOutcome};
 use epics_base_rs::types::EpicsValue;
 
 /// iocsh reads an unquoted `\` as an escape, as C `split()` does.
@@ -97,9 +97,9 @@ async fn a_queued_line_is_not_macro_expanded() {
 /// the protocol runner receives it, on the script route as on the builder's.
 #[epics_macros_rs::epics_test]
 async fn an_inline_pv_reaches_the_protocol_runner() {
-    IocApplication::new()
+    let outcome = IocApplication::new()
         .pv("ARGV:INLINE:PV", EpicsValue::Double(2.5))
-        .run_phased(|config| async move {
+        .run_outcome(|config| async move {
             assert!(
                 config.db.find_pv("ARGV:INLINE:PV").is_some(),
                 "the inline PV was created before the runner started"
@@ -108,4 +108,5 @@ async fn an_inline_pv_reaches_the_protocol_runner() {
         })
         .await
         .expect("the IOC ran");
+    assert_eq!(outcome, RunOutcome::Served);
 }

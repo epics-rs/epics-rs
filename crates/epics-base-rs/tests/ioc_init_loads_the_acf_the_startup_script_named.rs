@@ -11,7 +11,7 @@
 
 use std::io::Write;
 
-use epics_base_rs::server::ioc_app::IocApplication;
+use epics_base_rs::server::ioc_app::{IocApplication, RunOutcome};
 
 #[epics_macros_rs::epics_test]
 async fn a_startup_script_s_own_acf_is_live_by_the_time_the_server_starts() {
@@ -23,10 +23,10 @@ async fn a_startup_script_s_own_acf_is_live_by_the_time_the_server_starts() {
     .unwrap();
     let path = acf.path().to_string_lossy().to_string();
 
-    IocApplication::new()
+    let outcome = IocApplication::new()
         .port(0)
         .startup_line(&format!("asSetFilename(\"{path}\")"))
-        .run(|config| async move {
+        .run_outcome(|config| async move {
             assert!(
                 config.acf.load().is_some(),
                 "iocInit did not read the ACF the startup phase named"
@@ -35,6 +35,7 @@ async fn a_startup_script_s_own_acf_is_live_by_the_time_the_server_starts() {
         })
         .await
         .unwrap();
+    assert_eq!(outcome, RunOutcome::Served);
 }
 
 /// C `asDbLib.c:127`: a first `asInit` with no `asSetFilename` returns 0
@@ -42,12 +43,13 @@ async fn a_startup_script_s_own_acf_is_live_by_the_time_the_server_starts() {
 /// builds. The boundary that keeps the call above from failing every boot.
 #[epics_macros_rs::epics_test]
 async fn an_ioc_that_names_no_acf_still_builds() {
-    IocApplication::new()
+    let outcome = IocApplication::new()
         .port(0)
-        .run(|config| async move {
+        .run_outcome(|config| async move {
             assert!(config.acf.load().is_none(), "no ACF was ever named");
             Ok(())
         })
         .await
         .unwrap();
+    assert_eq!(outcome, RunOutcome::Served);
 }

@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use epics_base_rs::runtime::task::sleep;
 use epics_base_rs::server::autosave::AutosaveStartupConfig;
-use epics_base_rs::server::ioc_app::IocApplication;
+use epics_base_rs::server::ioc_app::{IocApplication, RunOutcome};
 
 const CHILD: &str = "AUTOSAVE_LONG_STRING_SAVE_SCRIPT";
 
@@ -58,11 +58,11 @@ async fn child_save() {
     };
     let script = std::path::PathBuf::from(script);
     let sav = script.with_file_name("sav").join("s.sav");
-    IocApplication::new()
+    let outcome = IocApplication::new()
         .port(0)
         .autosave_startup(Arc::new(Mutex::new(AutosaveStartupConfig::new())))
         .startup_script(script.to_str().unwrap())
-        .run(move |config| async move {
+        .run_outcome(move |config| async move {
             epics_base_rs::server::db_server::announce_serving("probe");
             let deadline = Instant::now() + Duration::from_secs(30);
             while !std::fs::read_to_string(&sav).is_ok_and(|t| t.ends_with("<END>\n")) {
@@ -74,6 +74,7 @@ async fn child_save() {
         })
         .await
         .unwrap();
+    assert_eq!(outcome, RunOutcome::Served);
 }
 
 #[test]

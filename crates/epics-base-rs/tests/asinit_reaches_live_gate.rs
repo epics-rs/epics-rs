@@ -19,7 +19,7 @@ use std::io::Write;
 use epics_base_rs::server::access_security::{
     AccessLevel, asg_change_generation, new_acf_cell, parse_acf,
 };
-use epics_base_rs::server::ioc_app::IocApplication;
+use epics_base_rs::server::ioc_app::{IocApplication, RunOutcome};
 
 /// UAG `ops` may write; everyone else reads only.
 const ACF: &str =
@@ -42,9 +42,9 @@ async fn script_asinit_lands_in_the_run_config_cell() {
     // Without it the script is a custom `main`'s and the runner never runs.
     writeln!(script, "iocInit").unwrap();
 
-    IocApplication::new()
+    let outcome = IocApplication::new()
         .startup_script(script.path().to_str().unwrap())
-        .run(|config| async move {
+        .run_outcome(|config| async move {
             let policy = config.acf.load_full().expect(
                 "asInit from the startup script must populate the IOC's \
                  live policy cell, not a shell-local copy",
@@ -67,6 +67,7 @@ async fn script_asinit_lands_in_the_run_config_cell() {
         })
         .await
         .unwrap();
+    assert_eq!(outcome, RunOutcome::Served);
 }
 
 /// Change-signal half: a post-boot `AcfCell::store` (what `asInit` and

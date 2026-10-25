@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use epics_base_rs::server::database::PvDatabase;
-use epics_base_rs::server::ioc_app::{IocApplication, IocInitDecision};
+use epics_base_rs::server::ioc_app::{IocApplication, IocInitDecision, RunOutcome};
 use epics_base_rs::types::{DbFieldType, EpicsValue};
 use epics_ca_rs::calink::{install_calink_resolver, register_calink_commands};
 use epics_seq_rs::pv::{PvEvent, PvEventType, PvSystem, PvVar};
@@ -115,9 +115,7 @@ where
     )
     .expect("write st.cmd");
     let reactor = epics_base_rs::runtime::task::Reactor::current().expect("test runtime");
-    let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let finished = ran.clone();
-    IocApplication::new()
+    let outcome = IocApplication::new()
         .startup_script(stcmd_path.to_str().unwrap())
         .register_link_type("ca", move |db| async move {
             register_calink_commands(install_calink_resolver(&db, reactor).await)
@@ -125,17 +123,13 @@ where
         // C's `-S`: no prompt, so a test's stdin EOF cannot end the IOC
         // under the body.
         .before_ioc_init(|| IocInitDecision::run(false))
-        .run(move |config| async move {
+        .run_outcome(move |config| async move {
             body(config.db.clone()).await;
-            finished.store(true, std::sync::atomic::Ordering::SeqCst);
             Ok(())
         })
         .await
         .expect("IOC run");
-    assert!(
-        ran.load(std::sync::atomic::Ordering::SeqCst),
-        "the body did not finish"
-    );
+    assert_eq!(outcome, RunOutcome::Served);
 }
 
 /// Served names: connect, get, a put the next get sees, a put callback that

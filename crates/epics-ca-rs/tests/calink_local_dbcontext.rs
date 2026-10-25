@@ -8,7 +8,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use epics_base_rs::server::database::{LinkPutOp, LinkRef, PvDatabase};
-use epics_base_rs::server::ioc_app::IocApplication;
+use epics_base_rs::server::ioc_app::{IocApplication, RunOutcome};
 use epics_base_rs::server::record::{OpenLatch, ParsedLink};
 use epics_base_rs::types::EpicsValue;
 use epics_ca_rs::calink::{CaLinkResolver, install_calink_resolver, register_calink_commands};
@@ -42,20 +42,21 @@ where
     let slot = Arc::new(OnceLock::new());
     let installed = slot.clone();
     let reactor = epics_base_rs::runtime::task::Reactor::current().expect("test runtime");
-    IocApplication::new()
+    let outcome = IocApplication::new()
         .startup_script(stcmd_path.to_str().unwrap())
         .register_link_type("ca", move |db| async move {
             let resolver = install_calink_resolver(&db, reactor).await;
             let _ = installed.set(resolver.clone());
             register_calink_commands(resolver)
         })
-        .run(move |config| async move {
+        .run_outcome(move |config| async move {
             let resolver = slot.get().expect("ca link set installed").clone();
             body(config.db.clone(), resolver).await;
             Ok(())
         })
         .await
         .expect("IOC run");
+    assert_eq!(outcome, RunOutcome::Served);
 }
 
 fn val(db: &PvDatabase, name: &str) -> Option<f64> {

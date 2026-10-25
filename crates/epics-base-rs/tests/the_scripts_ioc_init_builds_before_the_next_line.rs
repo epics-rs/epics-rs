@@ -21,7 +21,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use epics_base_rs::server::ioc_app::{IocApplication, IocState, get_ioc_state};
+use epics_base_rs::server::ioc_app::{IocApplication, IocState, RunOutcome, get_ioc_state};
 use epics_base_rs::server::iocsh::registry::{ArgValue, CommandDef, CommandOutcome};
 
 /// A startup command that records the IOC state at the moment it runs.
@@ -128,17 +128,18 @@ async fn an_application_without_a_script_is_built_by_run() {
     let builds = Arc::new(Mutex::new(0usize));
     let counter = builds.clone();
     let seen = Arc::new(Mutex::new(Vec::new()));
-    IocApplication::new()
+    let outcome = IocApplication::new()
         .port(0)
         .register_after_init(move || *counter.lock().unwrap() += 1)
         .register_startup_command(probe(seen.clone()))
         .startup_line("probeIocState")
-        .run(|_config| async move {
+        .run_outcome(|_config| async move {
             assert_eq!(get_ioc_state(), IocState::Running);
             Ok(())
         })
         .await
         .unwrap();
+    assert_eq!(outcome, RunOutcome::Served);
 
     assert_eq!(*builds.lock().unwrap(), 1);
     assert_eq!(*seen.lock().unwrap(), vec![IocState::Void]);
@@ -199,7 +200,7 @@ async fn ioc_run_before_anything_is_built_refuses_and_keeps_the_build() {
     let seen = Arc::new(Mutex::new(Vec::new()));
     let hooks = Arc::new(Mutex::new(0usize));
     let counter = hooks.clone();
-    IocApplication::new()
+    let outcome = IocApplication::new()
         .port(0)
         .register_after_init(move || *counter.lock().unwrap() += 1)
         .register_startup_command(probe_pair(seen.clone(), hooks.clone()))
@@ -207,12 +208,13 @@ async fn ioc_run_before_anything_is_built_refuses_and_keeps_the_build() {
             "run-first.cmd",
             &["iocRun", "probeBuiltState", "iocInit"],
         ))
-        .run(|_config| async move {
+        .run_outcome(|_config| async move {
             assert_eq!(get_ioc_state(), IocState::Running);
             Ok(())
         })
         .await
         .unwrap();
+    assert_eq!(outcome, RunOutcome::Served);
 
     assert_eq!(
         *seen.lock().unwrap(),

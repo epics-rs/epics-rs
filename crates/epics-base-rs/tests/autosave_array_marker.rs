@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use epics_base_rs::runtime::task::sleep;
 use epics_base_rs::server::autosave::AutosaveStartupConfig;
-use epics_base_rs::server::ioc_app::IocApplication;
+use epics_base_rs::server::ioc_app::{IocApplication, RunOutcome};
 use epics_base_rs::types::EpicsValue;
 
 const CHILD: &str = "AUTOSAVE_ARRAY_MARKER_SCRIPT";
@@ -31,11 +31,11 @@ async fn child_marker() {
     let Some(script) = std::env::var_os(CHILD) else {
         return;
     };
-    IocApplication::new()
+    let outcome = IocApplication::new()
         .port(0)
         .autosave_startup(Arc::new(Mutex::new(AutosaveStartupConfig::new())))
         .startup_script(script.to_str().unwrap())
-        .run(|config| async move {
+        .run_outcome(|config| async move {
             let db = config.db.clone();
             epics_base_rs::server::db_server::announce_serving("probe");
             let deadline = Instant::now() + Duration::from_secs(30);
@@ -52,6 +52,7 @@ async fn child_marker() {
         })
         .await
         .unwrap();
+    assert_eq!(outcome, RunOutcome::Served);
 }
 
 #[test]

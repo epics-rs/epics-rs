@@ -57,9 +57,10 @@ impl EpidSoftDeviceSupport {
         // A CONSTANT `INP` link is a literal value, not a PV to read —
         // there is nothing to feed back on, so PID is skipped and the
         // record is flagged SOFT/INVALID. The framework `check_alarms`
-        // hook raises the severity from this flag.
-        if epics_base_rs::server::record::link_field_type(&epid.inp)
-            == epics_base_rs::server::record::LinkType::Constant
+        // hook raises the severity from this flag. C's CONSTANT includes
+        // an empty INP (`dbStaticLib.c:2346-2349`).
+        if epics_base_rs::server::record::parse_link_v2(&epid.inp).db_link_type()
+            == epics_base_rs::server::record::DbLinkType::Constant
         {
             epid.inp_constant = true;
             return;

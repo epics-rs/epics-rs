@@ -219,7 +219,9 @@ record(throttle, "TEST:THR3") {
 #[tokio::test]
 async fn test_epid_pid_via_framework() {
     let db_str = r#"
+record(ao, "TEST:PID:CV") {}
 record(epid, "TEST:PID") {
+    field(INP, "TEST:PID:CV")
     field(STPL, "100")
     field(KP, "2.0")
     field(KI, "0")
@@ -290,7 +292,9 @@ record(epid, "TEST:PID") {
 #[tokio::test]
 async fn test_epid_pid_via_process_record_path() {
     let db_str = r#"
+record(ao, "TEST:PID2:CV") {}
 record(epid, "TEST:PID2") {
+    field(INP, "TEST:PID2:CV")
     field(STPL, "100")
     field(KP, "2.0")
     field(KI, "0")
@@ -368,7 +372,9 @@ record(epid, "TEST:PID2") {
 #[tokio::test]
 async fn test_epid_supervisory_empty_stpl_never_runs_do_pid() {
     let db_str = r#"
+record(ao, "TEST:PIDSUP:CV") {}
 record(epid, "TEST:PIDSUP") {
+    field(INP, "TEST:PIDSUP:CV")
     field(KP, "2.0")
     field(KI, "0")
     field(KD, "0")
@@ -459,7 +465,9 @@ async fn test_epid_closed_loop_working_stpl_runs_do_pid() {
 record(ao, "TEST:PIDSRC") {
     field(VAL, "100")
 }
+record(ao, "TEST:PIDCL:CV") {}
 record(epid, "TEST:PIDCL") {
+    field(INP, "TEST:PIDCL:CV")
     field(SMSL, "1")
     field(STPL, "TEST:PIDSRC.VAL")
     field(KP, "2.0")
@@ -1005,7 +1013,9 @@ async fn test_epid_non_val_put_does_not_process() {
 record(ao, "TEST:PIDNV:SRC") {
     field(VAL, "100")
 }
+record(ao, "TEST:PIDNV:CV") {}
 record(epid, "TEST:PIDNV") {
+    field(INP, "TEST:PIDNV:CV")
     field(SMSL, "1")
     field(STPL, "TEST:PIDNV:SRC.VAL")
     field(KP, "2.0")
@@ -1757,7 +1767,8 @@ record(epid, "EE") { field(SMSL, "closed_loop") field(KP, "1") field(INP, "CV") 
 #[tokio::test]
 async fn epid_skipped_cycle_raise_survives_process_local() {
     let db_str = r#"
-record(epid, "E") { field(KP, "1") }
+record(ao, "E:CV") {}
+record(epid, "E") { field(KP, "1") field(INP, "E:CV") }
 "#;
     let (name, factory) = std_rs::epid_record_factory();
     let (db, _) = epics_base_rs::server::ioc_builder::IocBuilder::new()
@@ -1786,7 +1797,9 @@ record(epid, "E") { field(KP, "1") }
 async fn an_epid_inside_mdt_returns_do_pids_status() {
     let db_str = r#"
 record(ao, "MDT:SRC") { field(VAL, "1") }
+record(ao, "MDT:CV") {}
 record(epid, "MDT:PID") {
+    field(INP, "MDT:CV")
     field(SMSL, "1")
     field(STPL, "MDT:SRC.VAL")
     field(MDT, "1000")

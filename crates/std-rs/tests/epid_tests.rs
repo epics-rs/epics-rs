@@ -10,6 +10,14 @@ fn defined_common() -> CommonFields {
     common.udf = 0;
     common
 }
+
+/// An epid with an INP to read: an empty INP is CONSTANT in C, and
+/// `devEpidSoft.c:110-112` then skips the PID.
+fn controlled() -> EpidRecord {
+    let mut rec = EpidRecord::default();
+    rec.inp = "SENSOR".into();
+    rec
+}
 use std_rs::device_support::epid_soft::EpidSoftDeviceSupport;
 
 // ============================================================
@@ -350,7 +358,7 @@ fn test_check_alarms_hook_maximizes_severity() {
 
 #[test]
 fn test_pid_p_only() {
-    let mut rec = EpidRecord::default();
+    let mut rec = controlled();
     rec.kp = 2.0;
     rec.ki = 0.0;
     rec.kd = 0.0;
@@ -487,7 +495,7 @@ fn test_pid_output_deadband() {
 
 #[test]
 fn test_pid_output_deadband_exceeded() {
-    let mut rec = EpidRecord::default();
+    let mut rec = controlled();
     rec.kp = 10.0;
     rec.ki = 0.0;
     rec.kd = 0.0;
@@ -558,7 +566,7 @@ fn test_pid_bumpless_turn_on() {
 fn test_maxmin_error_uses_cvlp_previous_value() {
     // Helper: one MaxMin cycle. cvlp = previous CVAL, cval = current.
     fn one_cycle(cvlp: f64, cval: f64) -> f64 {
-        let mut rec = EpidRecord::default();
+        let mut rec = controlled();
         rec.fmod = 1; // MaxMin
         rec.kp = 1.0;
         rec.fbon = 1;
@@ -597,7 +605,7 @@ fn test_maxmin_error_uses_cvlp_previous_value() {
 
 #[test]
 fn test_maxmin_mode() {
-    let mut rec = EpidRecord::default();
+    let mut rec = controlled();
     rec.fmod = 1; // MaxMin mode
     rec.kp = 1.0;
     rec.fbon = 1;
@@ -674,7 +682,7 @@ fn test_multi_output_links_gated_on_fbon_and_compute() {
     );
 
     // Feedback ON, dt >= mdt, non-constant INP → C reaches the OUTL write.
-    let mut on = EpidRecord::default();
+    let mut on = controlled();
     on.kp = 1.0;
     on.val = 100.0;
     on.cval = 90.0;
@@ -695,7 +703,7 @@ fn test_multi_output_links_gated_on_fbon_and_compute() {
 
     // Feedback OFF → C `:220` `if (fbon && ...)` is false, no OUTL write,
     // even though do_pid still computes/updates OVAL.
-    let mut off = EpidRecord::default();
+    let mut off = controlled();
     off.kp = 1.0;
     off.val = 100.0;
     off.cval = 90.0;
@@ -711,7 +719,7 @@ fn test_multi_output_links_gated_on_fbon_and_compute() {
     );
 
     // Sub-MDT cycle → C `:125` returns before the OUTL write.
-    let mut fast = EpidRecord::default();
+    let mut fast = controlled();
     fast.kp = 1.0;
     fast.val = 100.0;
     fast.cval = 90.0;
@@ -785,7 +793,7 @@ fn test_update_monitors_does_not_advance_val_deadband_baselines() {
 /// must hold the CVAL delta.
 #[test]
 fn test_maxmin_err_is_cval_delta() {
-    let mut rec = EpidRecord::default();
+    let mut rec = controlled();
     rec.fmod = 1; // MaxMin
     rec.kp = 1.0;
     rec.fbon = 1;
@@ -814,7 +822,7 @@ fn test_maxmin_err_is_cval_delta() {
 /// is in the else-branch; `pepid->err = e;` then writes 0.0.
 #[test]
 fn test_maxmin_err_zero_on_bumpless_edge() {
-    let mut rec = EpidRecord::default();
+    let mut rec = controlled();
     rec.fmod = 1; // MaxMin
     rec.kp = 1.0;
     rec.fbon = 1;
@@ -1539,7 +1547,7 @@ fn test_process_skips_do_pid_while_udf_set() {
 /// behaviour. epidRecord.c runs do_pid as soon as `udf==FALSE`.
 #[test]
 fn test_process_runs_do_pid_once_udf_cleared() {
-    let mut rec = EpidRecord::default();
+    let mut rec = controlled();
     rec.kp = 2.0;
     rec.val = 100.0;
     rec.cval = 10.0; // error = 90
@@ -1567,7 +1575,7 @@ fn test_process_runs_do_pid_once_udf_cleared() {
 /// `udf` is still the stale-TRUE from before the fetch.
 #[test]
 fn test_process_closed_loop_runs_do_pid_when_stpl_gave_value() {
-    let mut rec = EpidRecord::default();
+    let mut rec = controlled();
     rec.kp = 2.0;
     rec.smsl = 1; // closed-loop
     rec.val = 100.0; // STPL already fetched a defined setpoint

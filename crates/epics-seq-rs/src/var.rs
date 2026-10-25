@@ -269,9 +269,22 @@ impl<A: Indexed> SeqVar<A> {
     }
 }
 
+impl<T: Send + 'static> SeqVar<T> {
+    /// C's `&x`.
+    pub fn ptr(&self) -> Ptr<T> {
+        Ptr::along(Arc::new(Cell(self.0.clone())), 0)
+    }
+}
+
 impl<T> Place<T> for SeqVar<T> {
     fn modify<R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
         SeqVar::modify(self, f)
+    }
+}
+
+impl<T: Send + 'static> Addr<T> for SeqVar<T> {
+    fn ptr(&self) -> Ptr<T> {
+        SeqVar::ptr(self)
     }
 }
 
@@ -364,6 +377,154 @@ impl<A: Indexed<Elem: Indexed>, P: Place<A> + ?Sized> At<'_, P, A> {
 impl<A: Indexed, P: Place<A> + ?Sized> Place<A::Elem> for At<'_, P, A> {
     fn modify<R>(&self, f: impl FnOnce(&mut A::Elem) -> R) -> R {
         At::modify(self, f)
+    }
+}
+
+/// A [`Place`] C can take the address of.
+pub trait Addr<T>: Place<T> {
+    /// C's `&place`.
+    fn ptr(&self) -> Ptr<T>;
+}
+
+/// What a [`Ptr`] moves along: the run of `T`s it points into.
+trait Run<T>: Send + Sync {
+    fn read(&self, f: &mut dyn FnMut(&[T]));
+    fn write(&self, f: &mut dyn FnMut(&mut [T]));
+}
+
+/// A scalar variable's cell, a run of one.
+struct Cell<T>(Arc<Mutex<Box<T>>>);
+
+impl<T: Send> Run<T> for Cell<T> {
+    fn read(&self, f: &mut dyn FnMut(&[T])) {
+        f(std::slice::from_ref(&**self.0.lock()))
+    }
+
+    fn write(&self, f: &mut dyn FnMut(&mut [T])) {
+        f(std::slice::from_mut(&mut **self.0.lock()))
+    }
+}
+
+/// C's `T *`: null, or element `index` of a run. It keeps what it points
+/// into alive, so it never dangles. `p + n` may leave the run, as C's may;
+/// a read or write there panics where C's is undefined, as does one
+/// through null.
+pub struct Ptr<T: 'static>(Option<Target<T>>);
+
+struct Target<T: 'static> {
+    run: Arc<dyn Run<T>>,
+    /// The address of the run's element 0, which `==` compares.
+    base: usize,
+    index: isize,
+}
+
+impl<T> Ptr<T> {
+    fn along(run: Arc<dyn Run<T>>, index: isize) -> Self {
+        let mut base = 0;
+        run.read(&mut |r| base = r.as_ptr() as usize);
+        Ptr(Some(Target { run, base, index }))
+    }
+
+    pub fn is_null(&self) -> bool {
+        self.0.is_none()
+    }
+
+    /// The run and the element this points at, which must be inside it.
+    fn target(&self) -> (&dyn Run<T>, usize) {
+        let t = self.0.as_ref().expect("null pointer dereference");
+        let i = usize::try_from(t.index).expect("pointer before its object");
+        (&*t.run, i)
+    }
+
+    fn read<R>(&self, f: impl FnOnce(&T) -> R) -> R {
+        let (run, i) = self.target();
+        let (mut f, mut r) = (Some(f), None);
+        run.read(&mut |s| {
+            let v = s.get(i).expect("pointer past its object");
+            r = f.take().map(|f| f(v));
+        });
+        r.expect("a run calls back once")
+    }
+
+    /// [`Place::modify`]: C's `*p` written.
+    pub fn modify<R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
+        let (run, i) = self.target();
+        let (mut f, mut r) = (Some(f), None);
+        run.write(&mut |s| {
+            let v = s.get_mut(i).expect("pointer past its object");
+            r = f.take().map(|f| f(v));
+        });
+        r.expect("a run calls back once")
+    }
+
+    /// C's `*p` read.
+    pub fn get(&self) -> T
+    where
+        T: Clone,
+    {
+        self.read(T::clone)
+    }
+
+    pub fn set(&self, value: T) {
+        self.modify(|v| *v = value)
+    }
+
+    /// The address of the element this points at, `None` for null.
+    fn addr(&self) -> Option<usize> {
+        let size = std::mem::size_of::<T>() as isize;
+        let t = self.0.as_ref()?;
+        Some(t.base.wrapping_add_signed(t.index * size))
+    }
+}
+
+impl<T> Clone for Ptr<T> {
+    fn clone(&self) -> Self {
+        Ptr(self.0.as_ref().map(|t| Target {
+            run: t.run.clone(),
+            base: t.base,
+            index: t.index,
+        }))
+    }
+}
+
+impl<T> Default for Ptr<T> {
+    fn default() -> Self {
+        Ptr(None)
+    }
+}
+
+impl<T> Zeroed for Ptr<T> {
+    fn zeroed() -> Self {
+        Ptr(None)
+    }
+}
+
+/// C's `==`: the same element, or both null.
+impl<T> PartialEq for Ptr<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.addr() == other.addr()
+    }
+}
+
+impl<T> std::fmt::Debug for Ptr<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.addr() {
+            Some(a) => write!(f, "{a:#x}"),
+            None => f.write_str("null"),
+        }
+    }
+}
+
+impl<T> Place<T> for Ptr<T> {
+    fn modify<R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
+        Ptr::modify(self, f)
+    }
+}
+
+/// `&*p` is `p`.
+impl<T> Addr<T> for Ptr<T> {
+    fn ptr(&self) -> Ptr<T> {
+        self.clone()
     }
 }
 
@@ -490,6 +651,45 @@ mod tests {
         let y = x.clone();
         y.set(2);
         assert_eq!((x.get(), y.get()), (1, 2));
+    }
+
+    #[test]
+    fn a_pointer_to_a_variable_reads_and_writes_it() {
+        let x = SeqVar::new(1i32);
+        let p = SeqVar::new(Ptr::default());
+        p.set(x.ptr());
+        p.get().set(5);
+        assert_eq!(x.get(), 5);
+        x.set(7);
+        assert_eq!(p.get().get(), 7);
+        p.get().modify(|v| *v += 1);
+        assert_eq!(x.get(), 8);
+    }
+
+    #[test]
+    fn pointers_are_equal_at_one_variable_or_both_null() {
+        let (x, y) = (SeqVar::new(0.5f64), SeqVar::new(0.5f64));
+        assert_eq!(x.ptr(), x.ptr());
+        assert_ne!(x.ptr(), y.ptr());
+        assert_ne!(x.ptr(), Ptr::default());
+        assert_eq!(<Ptr<f64>>::zeroed(), Ptr::default());
+        assert!(<Ptr<f64>>::default().is_null() && !x.ptr().is_null());
+    }
+
+    /// Safe mode's copy keeps the pointer value, as `memcpy` does.
+    #[test]
+    fn a_copied_pointer_still_points_into_the_original() {
+        let x = SeqVar::new(1i32);
+        let p = SeqVar::new(x.ptr());
+        let copy = p.clone();
+        copy.get().set(2);
+        assert_eq!(x.get(), 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "null pointer dereference")]
+    fn a_null_pointer_dereference_panics() {
+        <Ptr<i32>>::default().get();
     }
 
     #[test]

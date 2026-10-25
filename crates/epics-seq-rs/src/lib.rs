@@ -279,7 +279,9 @@ pub use seq::{SeqThreadId, seq};
 pub use state_set::{CompleteFlags, StateSet};
 pub use task::seq_stop;
 pub use types::*;
-pub use var::{At, ChanCell, ElemKind, Indexed, Place, Prim, ProgramVars, SeqVar, Zeroed};
+pub use var::{
+    Addr, At, ChanCell, ElemKind, Indexed, Place, Prim, ProgramVars, Ptr, SeqVar, Zeroed,
+};
 
 /// Include the program snc-rs wrote for `<name>.st` to `$OUT_DIR/<name>.rs`.
 /// The companion's `seqg_escaped!` must be defined before this call.

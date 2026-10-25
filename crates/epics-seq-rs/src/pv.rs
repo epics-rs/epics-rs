@@ -13,8 +13,10 @@
 //! [`PvVar::create`], and a get's callback, or a put callback's when the
 //! record's processing ends there, runs before the call returns, so the
 //! caller holds no lock that callback takes. A network channel's request
-//! goes to the channel's task, and its completion runs on the database
-//! reactor, where C's runs on a CA auxiliary thread. A network channel's
+//! goes to the system's one request queue, which issues each in the order
+//! made, whatever its channel, as libca queues each on its circuit when it
+//! is called; its completion runs on the database reactor, where C's runs
+//! on a CA auxiliary thread. A network channel's
 //! monitor events and connection changes come from the reactor too; an
 //! in-process channel's monitor events come from the system's one queue,
 //! in post order, on its `CAC-event` thread. Either kind of monitor event
@@ -32,6 +34,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, OnceLock};
 use std::task::{Context, Poll, Waker};
 
@@ -87,6 +90,9 @@ pub struct PvEvent<'a> {
 pub struct PvSystem {
     ctx: CaClientContext,
     events: InProcessEvents,
+    /// The network channels' request queue, its [`Dispatcher`] started
+    /// with the first network channel.
+    requests: Arc<Mutex<Option<mpsc::UnboundedSender<Request>>>>,
 }
 
 impl PvSystem {
@@ -95,6 +101,7 @@ impl PvSystem {
         PvSystem {
             ctx: db.ca_client(),
             events: InProcessEvents::default(),
+            requests: Arc::default(),
         }
     }
 
@@ -104,10 +111,27 @@ impl PvSystem {
         PvStat::Ok
     }
 
-    /// `pvSysFlush`: send what the calling thread has queued. A request is
-    /// sent when it is issued, so nothing is ever queued.
+    /// `pvSysFlush`: send what the calling thread has queued. The
+    /// [`Dispatcher`] sends each request as it takes it, so nothing waits
+    /// for a flush.
     pub fn flush(&self) -> PvStat {
         PvStat::Ok
+    }
+
+    /// The network request queue; `None` when the database captured no
+    /// reactor to run its [`Dispatcher`] on.
+    fn requests(&self) -> Option<mpsc::UnboundedSender<Request>> {
+        let mut requests = self.requests.lock();
+        if requests.is_none() {
+            let (tx, rx) = mpsc::unbounded_channel();
+            let dispatcher = Dispatcher {
+                ctx: self.ctx.clone(),
+                chans: HashMap::new(),
+            };
+            self.ctx.spawn(dispatcher.run(rx))?;
+            *requests = Some(tx);
+        }
+        requests.clone()
     }
 
     /// The CA client context underneath.
@@ -604,7 +628,23 @@ impl Drop for AbortOnDrop {
     }
 }
 
+/// A network var's request to the [`Dispatcher`], under the var's key.
+type Request = (u64, Cmd);
+
 enum Cmd {
+    /// `ca_create_channel`.
+    Create {
+        name: Arc<str>,
+        shared: Arc<Shared>,
+        conn: ConnFn,
+    },
+    Chan(ChanCmd),
+    /// `ca_clear_channel`.
+    Clear,
+}
+
+/// A request to a created channel.
+enum ChanCmd {
     Get {
         id: u64,
         dbr: u16,
@@ -617,8 +657,6 @@ enum Cmd {
     },
     MonitorOn(Monitor),
     MonitorOff,
-    /// `ca_clear_channel`.
-    Clear,
 }
 
 /// Why [`PvVar::create`] fails: the only way it can.
@@ -634,8 +672,19 @@ pub struct PvVar {
 /// Where a var's requests run.
 enum Link {
     InProcess(InProcess),
-    /// A network channel's requests, run on its task in the order made.
-    Network(mpsc::UnboundedSender<Cmd>),
+    Network(Network),
+}
+
+/// A network var's way to its system's [`Dispatcher`].
+struct Network {
+    key: u64,
+    requests: mpsc::UnboundedSender<Request>,
+}
+
+impl Network {
+    fn send(&self, cmd: Cmd) {
+        let _ = self.requests.send((self.key, cmd));
+    }
 }
 
 /// An in-process channel, whose requests run on the caller's thread.
@@ -710,15 +759,7 @@ impl PvVar {
             });
             return Ok(PvVar { name, shared, link });
         }
-        let (cmds, rx) = mpsc::unbounded_channel();
-        let run = run(
-            sys.ctx.clone(),
-            name.clone(),
-            shared.clone(),
-            Arc::new(conn),
-            rx,
-        );
-        if sys.ctx.spawn(run).is_none() {
+        let Some(requests) = sys.requests() else {
             errlog_sev_printf(
                 ErrlogSevEnum::Major,
                 &format!(
@@ -727,8 +768,18 @@ impl PvVar {
                 ),
             );
             return Err(PvStat::Error);
-        }
-        let link = Link::Network(cmds);
+        };
+        static NEXT_KEY: AtomicU64 = AtomicU64::new(1);
+        let net = Network {
+            key: NEXT_KEY.fetch_add(1, Ordering::Relaxed),
+            requests,
+        };
+        net.send(Cmd::Create {
+            name: name.clone(),
+            shared: shared.clone(),
+            conn: Arc::new(conn),
+        });
+        let link = Link::Network(net);
         Ok(PvVar { name, shared, link })
     }
 
@@ -747,9 +798,7 @@ impl PvVar {
         // `ca_clear_channel`: the channel's monitor goes with it.
         match &self.link {
             Link::InProcess(l) => drop(l.monitor.lock().take()),
-            Link::Network(cmds) => {
-                let _ = cmds.send(Cmd::Clear);
-            }
+            Link::Network(net) => net.send(Cmd::Clear),
         }
         PvStat::Ok
     }
@@ -786,14 +835,20 @@ impl PvVar {
         self.shared.state.lock().monitor != 0
     }
 
-    /// A var whose channel never connects and whose requests go nowhere.
+    /// A network var whose requests go to `requests` under `key`.
     #[cfg(test)]
-    pub(crate) fn unconnected(name: &str) -> PvVar {
+    fn queued(name: &str, key: u64, requests: mpsc::UnboundedSender<Request>) -> PvVar {
         PvVar {
             name: Arc::from(name),
             shared: Arc::new(Shared::new()),
-            link: Link::Network(mpsc::unbounded_channel().0),
+            link: Link::Network(Network { key, requests }),
         }
+    }
+
+    /// A var whose channel never connects and whose requests go nowhere.
+    #[cfg(test)]
+    pub(crate) fn unconnected(name: &str) -> PvVar {
+        PvVar::queued(name, 0, mpsc::unbounded_channel().0)
     }
 
     /// [`Self::unconnected`] on `chan`, whose element count it reports.
@@ -873,9 +928,7 @@ impl PvVar {
         match &self.link {
             // `callReadNotify`: the callback runs before this returns.
             Link::InProcess(l) => self.shared.complete(id, l.chan.get(dbr, count).map(Some)),
-            Link::Network(cmds) => {
-                let _ = cmds.send(Cmd::Get { id, dbr, count });
-            }
+            Link::Network(net) => net.send(Cmd::Chan(ChanCmd::Get { id, dbr, count })),
         }
         PvStat::Ok
     }
@@ -895,9 +948,7 @@ impl PvVar {
                     return self.shared.refuse(Eca::PutFail, PUT_EXPR);
                 }
             }
-            Link::Network(cmds) => {
-                let _ = cmds.send(Cmd::Put { id: None, value });
-            }
+            Link::Network(net) => net.send(Cmd::Chan(ChanCmd::Put { id: None, value })),
         }
         PvStat::Ok
     }
@@ -933,12 +984,10 @@ impl PvVar {
                     return self.shared.refuse(eca, PUT_CALLBACK_EXPR);
                 }
             },
-            Link::Network(cmds) => {
-                let _ = cmds.send(Cmd::Put {
-                    id: Some(id),
-                    value,
-                });
-            }
+            Link::Network(net) => net.send(Cmd::Chan(ChanCmd::Put {
+                id: Some(id),
+                value,
+            })),
         }
         PvStat::Ok
     }
@@ -976,9 +1025,7 @@ impl PvVar {
         };
         match &self.link {
             Link::InProcess(l) => l.monitor_on(&self.shared, m),
-            Link::Network(cmds) => {
-                let _ = cmds.send(Cmd::MonitorOn(m));
-            }
+            Link::Network(net) => net.send(Cmd::Chan(ChanCmd::MonitorOn(m))),
         }
         PvStat::Ok
     }
@@ -991,9 +1038,7 @@ impl PvVar {
         if was_on {
             match &self.link {
                 Link::InProcess(l) => drop(l.monitor.lock().take()),
-                Link::Network(cmds) => {
-                    let _ = cmds.send(Cmd::MonitorOff);
-                }
+                Link::Network(net) => net.send(Cmd::Chan(ChanCmd::MonitorOff)),
             }
         }
         PvStat::Ok
@@ -1005,6 +1050,9 @@ impl Drop for PvVar {
     /// var may be dropped from anywhere; [`PvVar::destroy`] waits.
     fn drop(&mut self) {
         self.shared.close();
+        if let Link::Network(net) = &self.link {
+            net.send(Cmd::Clear);
+        }
     }
 }
 
@@ -1046,47 +1094,82 @@ async fn poll_once<F: Future + Unpin>(fut: &mut F) -> Option<F::Output> {
     .await
 }
 
-/// One channel's lifetime: `ca_create_channel`, then the requests in the
-/// order they were made, until the var is gone.
-async fn run(
+/// A system's network channels and their requests, issued one at a time in
+/// the order they were made, whatever the channel, as libca queues each on
+/// its circuit when it is called: a get made after a put to the same
+/// server reads what the put did.
+struct Dispatcher {
     ctx: CaClientContext,
-    name: Arc<str>,
-    shared: Arc<Shared>,
-    conn: ConnFn,
-    mut rx: mpsc::UnboundedReceiver<Cmd>,
-) {
-    let Some(chan) = ctx.create_network(&name).await else {
-        // A search nobody answers: the channel never connects, so every
-        // request was refused as disconnected; only monitors queue.
-        while rx.recv().await.is_some() {}
-        return;
-    };
-    serve(ctx, chan, shared, conn, rx).await;
+    chans: HashMap<u64, Served>,
 }
 
-/// The requests to `chan` in the order they were made, until the var is
-/// gone.
-async fn serve(
-    ctx: CaClientContext,
+/// A created network channel and the tasks delivering its events.
+struct Served {
     chan: Arc<dyn ClientChannel>,
     shared: Arc<Shared>,
-    conn: ConnFn,
-    mut rx: mpsc::UnboundedReceiver<Cmd>,
-) {
-    let _ = shared.chan.set(chan.clone());
-    // Held here, not by the connection task: once connected, a local
-    // channel's next connection change never comes and registers no waker,
-    // and the exec backend drops such a task with everything it owns.
-    let _connection = AbortOnDrop(ctx.spawn(connection_task(chan.clone(), shared.clone(), conn)));
-    let mut monitor: Option<AbortOnDrop> = None;
-    while let Some(cmd) = rx.recv().await {
+    _connection: AbortOnDrop,
+    monitor: Option<AbortOnDrop>,
+}
+
+impl Dispatcher {
+    async fn run(mut self, mut rx: mpsc::UnboundedReceiver<Request>) {
+        while let Some((key, cmd)) = rx.recv().await {
+            self.handle(key, cmd).await;
+        }
+    }
+
+    /// Issue one request; it is on its way when this returns.
+    async fn handle(&mut self, key: u64, cmd: Cmd) {
         match cmd {
-            Cmd::Get { id, dbr, count } => {
-                if !shared.is_pending(id) {
-                    continue;
+            Cmd::Create { name, shared, conn } => {
+                // A search nobody answers: the channel never connects, so
+                // every request is refused as disconnected; only monitors
+                // queue, and are dropped here.
+                if let Some(chan) = self.ctx.create_network(&name).await {
+                    self.attach(key, chan, shared, conn);
                 }
-                // Sent on the first poll, so a later put cannot overtake it;
-                // the answer is awaited off this task, so it holds up nothing.
+            }
+            Cmd::Chan(cmd) => {
+                if let Some(served) = self.chans.get_mut(&key) {
+                    served.serve(&self.ctx, cmd).await;
+                }
+            }
+            Cmd::Clear => drop(self.chans.remove(&key)),
+        }
+    }
+
+    fn attach(
+        &mut self,
+        key: u64,
+        chan: Arc<dyn ClientChannel>,
+        shared: Arc<Shared>,
+        conn: ConnFn,
+    ) {
+        let _ = shared.chan.set(chan.clone());
+        // Held here, not by the connection task: once connected, a local
+        // channel's next connection change never comes and registers no waker,
+        // and the exec backend drops such a task with everything it owns.
+        let connection = connection_task(chan.clone(), shared.clone(), conn);
+        let served = Served {
+            _connection: AbortOnDrop(self.ctx.spawn(connection)),
+            chan,
+            shared,
+            monitor: None,
+        };
+        self.chans.insert(key, served);
+    }
+}
+
+impl Served {
+    async fn serve(&mut self, ctx: &CaClientContext, cmd: ChanCmd) {
+        let (chan, shared) = (&self.chan, &self.shared);
+        match cmd {
+            ChanCmd::Get { id, dbr, count } => {
+                if !shared.is_pending(id) {
+                    return;
+                }
+                // Sent on the first poll; the answer is awaited off the
+                // dispatcher, so it holds up nothing.
                 let chan = chan.clone();
                 let mut got = Box::pin(async move { chan.get(dbr, count).await });
                 match poll_once(&mut got).await {
@@ -1097,9 +1180,9 @@ async fn serve(
                     }
                 }
             }
-            Cmd::Put { id, value } => {
+            ChanCmd::Put { id, value } => {
                 if id.is_some_and(|id| !shared.is_pending(id)) {
-                    continue;
+                    return;
                 }
                 match (chan.put(value, id.is_some()).await, id) {
                     (Ok(Some(done)), Some(id)) => {
@@ -1122,21 +1205,20 @@ async fn serve(
                     }
                 }
             }
-            Cmd::MonitorOn(m) => {
+            ChanCmd::MonitorOn(m) => {
                 if shared.state.lock().monitor != m.monid {
-                    continue;
+                    return;
                 }
                 let mask = (EventMask::VALUE | EventMask::ALARM).bits();
                 match chan.subscribe(type_to_ca(m.ty), m.count, mask).await {
                     Ok(sub) => {
                         let task = monitor_task(sub, shared.clone(), m);
-                        drop(monitor.replace(AbortOnDrop(ctx.spawn(task))));
+                        drop(self.monitor.replace(AbortOnDrop(ctx.spawn(task))));
                     }
-                    Err(e) => subscribe_refused(&shared, m.monid, &e),
+                    Err(e) => subscribe_refused(shared, m.monid, &e),
                 }
             }
-            Cmd::MonitorOff => drop(monitor.take()),
-            Cmd::Clear => break,
+            ChanCmd::MonitorOff => drop(self.monitor.take()),
         }
     }
 }
@@ -1170,15 +1252,10 @@ mod tests {
 
     use super::*;
 
-    /// A var whose run task is the returned receiver, never connected.
-    fn var() -> (PvVar, mpsc::UnboundedReceiver<Cmd>) {
-        let (cmds, rx) = mpsc::unbounded_channel();
-        let var = PvVar {
-            name: Arc::from("T"),
-            shared: Arc::new(Shared::new()),
-            link: Link::Network(cmds),
-        };
-        (var, rx)
+    /// A var whose dispatcher is the returned receiver, never connected.
+    fn var() -> (PvVar, mpsc::UnboundedReceiver<Request>) {
+        let (requests, rx) = mpsc::unbounded_channel();
+        (PvVar::queued("T", 1, requests), rx)
     }
 
     type Log = Arc<Mutex<Vec<String>>>;
@@ -1542,24 +1619,37 @@ mod tests {
         std::mem::take(&mut *seen.lock())
     }
 
-    /// Run `cmds` against a [`Refusing`] channel, connected.
-    fn serve_refused(var: &PvVar, rx: mpsc::UnboundedReceiver<Cmd>, cmds: Vec<Cmd>) -> Vec<String> {
+    /// Run what `var` queued, then `cmds`, against a [`Refusing`] channel,
+    /// connected.
+    fn serve_refused(
+        var: &PvVar,
+        mut rx: mpsc::UnboundedReceiver<Request>,
+        cmds: Vec<ChanCmd>,
+    ) -> Vec<String> {
         var.shared.state.lock().connected = true;
-        let Link::Network(sender) = &var.link else {
+        let Link::Network(net) = &var.link else {
             unreachable!("var() is a network var")
         };
-        for cmd in cmds.into_iter().chain([Cmd::Clear]) {
-            let _ = sender.send(cmd);
+        for cmd in cmds {
+            net.send(Cmd::Chan(cmd));
         }
         let db = PvDatabase::new();
+        let mut d = Dispatcher {
+            ctx: db.ca_client(),
+            chans: HashMap::new(),
+        };
+        d.attach(
+            net.key,
+            Arc::new(Refusing),
+            var.shared.clone(),
+            Arc::new(|_| {}),
+        );
         logged("refused", || {
-            epics_base_rs::runtime::task::test_block_on(serve(
-                db.ca_client(),
-                Arc::new(Refusing),
-                var.shared.clone(),
-                Arc::new(|_| {}),
-                rx,
-            ))
+            epics_base_rs::runtime::task::test_block_on(async {
+                while let Ok((key, cmd)) = rx.try_recv() {
+                    d.handle(key, cmd).await;
+                }
+            })
         })
     }
 
@@ -1585,7 +1675,7 @@ mod tests {
     #[test]
     fn a_refused_put_logs_the_libca_call() {
         let (var, rx) = var();
-        let put = Cmd::Put {
+        let put = ChanCmd::Put {
             id: None,
             value: EpicsValue::Double(1.0),
         };
@@ -1593,6 +1683,96 @@ mod tests {
             serve_refused(&var, rx, vec![put]),
             ["sevr=minor ca_array_put(typeToCA(type), count, var->chid, value): refused"]
         );
+    }
+
+    /// A channel that logs each get and put as it sends it, a put on its
+    /// second poll.
+    struct Recording {
+        name: &'static str,
+        log: Log,
+    }
+
+    #[async_trait::async_trait]
+    impl ClientChannel for Recording {
+        fn native_type(&self) -> Option<DbFieldType> {
+            Some(DbFieldType::Double)
+        }
+
+        fn element_count(&self) -> Option<u32> {
+            Some(1)
+        }
+
+        fn access(&self) -> (bool, bool) {
+            (true, true)
+        }
+
+        async fn next_connection(&self) -> Option<Connection> {
+            None
+        }
+
+        async fn get(&self, _: u16, _: u32) -> Result<Snapshot, String> {
+            self.log.lock().push(format!("get {}", self.name));
+            std::future::pending().await
+        }
+
+        async fn subscribe(
+            &self,
+            _: u16,
+            _: u32,
+            _: u16,
+        ) -> Result<Box<dyn ClientMonitor>, String> {
+            unreachable!()
+        }
+
+        async fn put(
+            &self,
+            _: EpicsValue,
+            _: bool,
+        ) -> Result<Option<epics_base_rs::server::database::PutCompletion>, String> {
+            let mut polled = false;
+            std::future::poll_fn(|cx| {
+                if std::mem::replace(&mut polled, true) {
+                    return Poll::Ready(());
+                }
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            })
+            .await;
+            self.log.lock().push(format!("put {}", self.name));
+            Ok(None)
+        }
+    }
+
+    /// pvGetSync's `pvPut(p, ASYNC)` then `pvGet(x, SYNC)`: the get reads
+    /// the record the put processed only if it leaves after the put.
+    #[test]
+    fn a_request_leaves_after_those_made_before_it_on_other_channels() {
+        let db = PvDatabase::new();
+        let mut d = Dispatcher {
+            ctx: db.ca_client(),
+            chans: HashMap::new(),
+        };
+        let (requests, mut rx) = mpsc::unbounded_channel();
+        let log = Log::default();
+        let [p, x] = [(1, "p"), (2, "x")].map(|(key, name)| {
+            let var = PvVar::queued(name, key, requests.clone());
+            var.shared.state.lock().connected = true;
+            let chan = Arc::new(Recording {
+                name,
+                log: log.clone(),
+            });
+            d.attach(key, chan, var.shared.clone(), Arc::new(|_| {}));
+            var
+        });
+        let put = p.put_callback(PvType::Double, 1, EpicsValue::Double(1.0), |_| {});
+        assert_eq!(put, PvStat::Ok);
+        assert_eq!(x.get_callback(PvType::Double, 1, |_| {}), PvStat::Ok);
+        epics_base_rs::runtime::task::test_block_on(async {
+            while let Ok((key, cmd)) = rx.try_recv() {
+                d.handle(key, cmd).await;
+            }
+        });
+        assert_eq!(*log.lock(), ["put p", "get x"]);
     }
 
     #[test]
@@ -1661,10 +1841,10 @@ mod tests {
             PvStat::Ok
         );
         let mut seen = Vec::new();
-        while let Ok(cmd) = rx.try_recv() {
+        while let Ok((_, cmd)) = rx.try_recv() {
             seen.push(match cmd {
-                Cmd::MonitorOn(m) => format!("on {}", m.monid),
-                Cmd::MonitorOff => "off".to_string(),
+                Cmd::Chan(ChanCmd::MonitorOn(m)) => format!("on {}", m.monid),
+                Cmd::Chan(ChanCmd::MonitorOff) => "off".to_string(),
                 _ => "other".to_string(),
             });
         }
@@ -1700,7 +1880,7 @@ mod tests {
     fn a_request_after_destroy_fails() {
         let (var, mut rx) = var();
         assert_eq!(var.destroy(), PvStat::Ok);
-        assert!(matches!(rx.try_recv(), Ok(Cmd::Clear)));
+        assert!(matches!(rx.try_recv(), Ok((_, Cmd::Clear))));
         let log = Log::default();
         assert_eq!(
             var.get_callback(PvType::TimeDouble, 1, record(&log, "get")),

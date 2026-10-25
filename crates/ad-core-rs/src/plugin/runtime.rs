@@ -2571,17 +2571,43 @@ impl PluginPortDriver {
         ))
     }
 
-    /// What C `asynNDArrayDriver::writeOctet` leaves for an octet write
-    /// (asynNDArrayDriver.cpp:529-538): FilePath is normalized by
-    /// `checkPath`, created to CreateDir's depth when missing, and
-    /// FilePathExists set. A path still missing fails the write: C takes
-    /// that status from `checkPath` (:536) and then overwrites it with
-    /// callParamCallbacks' at :540 and again at NDPluginDriver.cpp:845, so
-    /// the write succeeds; not copied.
-    fn base_octet(&self, reason: usize, value: &str) -> WriteOutcome<String> {
+    /// What C `NDPluginDriver::writeOctet` leaves for an octet write, which
+    /// the plugin's override (`validate_octet`) then sees.
+    ///
+    /// An NDArrayPort that `connectToArrayPort` cannot connect to fails the
+    /// write, as NDArrayAddr's does (NDPluginDriver.cpp:741): C drops that
+    /// status in writeOctet (:836), so the write succeeds; not copied.
+    ///
+    /// FilePath is normalized by `checkPath`, created to CreateDir's depth
+    /// when missing, and FilePathExists set (asynNDArrayDriver.cpp:529-538).
+    /// A path still missing fails the write: C takes that status from
+    /// `checkPath` (:536) and then overwrites it with callParamCallbacks' at
+    /// :540 and again at NDPluginDriver.cpp:845, so the write succeeds; not
+    /// copied.
+    fn base_octet(&self, reason: usize, value: &str) -> AsynResult<WriteOutcome<String>> {
+        let refused = |keep: String| {
+            let name = self.base.params.param_name(reason).unwrap_or("");
+            WriteVerdict::Refuse {
+                keep,
+                message: format!(
+                    "NDPluginDriver::writeOctet: status=3, function={reason}, paramName={name}, value={value}"
+                ),
+            }
+        };
+        let p = &self.plugin_params;
+        if reason == p.nd_array_port {
+            // connectToArrayPort reads list 0 (NDPluginDriver.cpp:591).
+            let nd_addr = self.base.get_int32_param(p.nd_array_addr, 0)?;
+            return Ok(match self.unresolved(value, nd_addr) {
+                Some(line) => {
+                    WriteOutcome::from(refused(value.to_string())).print(TraceMask::ERROR, line)
+                }
+                None => WriteVerdict::Accept(value.to_string()).into(),
+            });
+        }
         let nd = &self.ndarray_params;
         if reason != nd.file_path || value.is_empty() {
-            return WriteVerdict::Accept(value.to_string()).into();
+            return Ok(WriteVerdict::Accept(value.to_string()).into());
         }
         let mut path = value.to_string();
         let mut exists = crate::driver::ndarray_driver::check_path_str(&mut path);
@@ -2594,15 +2620,9 @@ impl PluginPortDriver {
         let verdict = if exists {
             WriteVerdict::Accept(path)
         } else {
-            let name = self.base.params.param_name(reason).unwrap_or("");
-            WriteVerdict::Refuse {
-                keep: path,
-                message: format!(
-                    "NDPluginDriver::writeOctet: status=3, function={reason}, paramName={name}, value={value}"
-                ),
-            }
+            refused(path)
         };
-        WriteOutcome::from(verdict).set_int32(nd.file_path_exists, 0, exists as i32)
+        Ok(WriteOutcome::from(verdict).set_int32(nd.file_path_exists, 0, exists as i32))
     }
 
     /// Store what a write override set beside the written param, print its
@@ -3128,19 +3148,10 @@ impl PortDriver for PluginPortDriver {
             .get_address(user.addr, reason)
             .unwrap_or_else(|_| asyn_rs::port::param_list(self.base.flags.multi_device, user.addr));
         let s = String::from_utf8_lossy(asyn_rs::port::c_str(data));
-        // C `writeOctet` ignores connectToArrayPort's status
-        // (NDPluginDriver.cpp:834-836): the write succeeds, the line is printed.
-        if reason == self.plugin_params.nd_array_port {
-            // connectToArrayPort reads list 0 (NDPluginDriver.cpp:591).
-            let nd_addr = self
-                .base
-                .get_int32_param(self.plugin_params.nd_array_addr, 0)?;
-            if let Some(line) = self.unresolved(&s, nd_addr) {
-                self.base
-                    .trace_print(TraceMask::ERROR, format_args!("{line}"));
-            }
+        let base = self.base_octet(reason, &s)?;
+        for (mask, line) in &base.trace {
+            self.base.trace_print(*mask, format_args!("{line}"));
         }
-        let base = self.base_octet(reason, &s);
         let WriteOutcome {
             verdict,
             mut side,
@@ -7566,12 +7577,18 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        // C `writeOctet` keeps callParamCallbacks' status
-        // (NDPluginDriver.cpp:845: `status = (asynStatus)callParamCallbacks(addr);`).
-        assert!(
-            rt.block_on(port.write_octet(p.nd_array_port, 0, b"NOPE".to_vec()))
-                .is_ok()
-        );
+        // An NDArrayPort write fails as an NDArrayAddr one does, which C's
+        // writeOctet hides by dropping connectToArrayPort's status (:836).
+        match rt.block_on(port.write_octet(p.nd_array_port, 0, b"NOPE".to_vec())) {
+            Err(AsynError::Status { message, .. }) => assert_eq!(
+                message,
+                format!(
+                    "NDPluginDriver::writeOctet: status=3, function={}, paramName=NDARRAY_PORT, value=NOPE",
+                    p.nd_array_port
+                )
+            ),
+            other => panic!("{other:?}"),
+        }
         let (data, status) = rt
             .block_on(port.read_octet(p.nd_array_port, 0, 16))
             .into_parts();
@@ -7597,7 +7614,7 @@ mod tests {
             .unwrap();
         assert!(
             rt.block_on(port.write_octet(p.nd_array_port, 0, b"REFUSE_NOGP".to_vec()))
-                .is_ok()
+                .is_err()
         );
         assert!(port.write_int32_blocking(p.nd_array_addr, 0, 2).is_err());
         asyn_rs::registry::unregister_port("REFUSE_NOGP");

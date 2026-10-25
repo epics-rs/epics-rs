@@ -1070,10 +1070,40 @@ pub fn pow(x: f64, y: f64) -> f64 {
     x.powf(y)
 }
 
+/// C's truth test of a value whose type only its expression knows (a
+/// foreign call's result): `v != 0`. The argument fixes `T`, which a bare
+/// `v != Default::default()` leaves to inference, and a second
+/// `PartialEq` impl for the type anywhere in the crate graph (serde_json's
+/// for `i32`) makes that ambiguous.
+pub fn truth<T: Default + PartialEq>(v: T) -> bool {
+    v != T::default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::var::Zeroed;
+
+    /// Zero is false, anything else true, `-0.0` and NaN as C compares
+    /// them; and it type-checks beside another `PartialEq` impl for `i32`.
+    #[test]
+    fn truth_is_c_s_test_against_zero() {
+        struct Other;
+        impl PartialEq<Other> for i32 {
+            fn eq(&self, _: &Other) -> bool {
+                false
+            }
+        }
+        let call = |v: c_int| v;
+        assert!(!truth(call(0)));
+        assert!(truth(call(-3)));
+        assert!(!truth(0.0f64));
+        assert!(!truth(-0.0f64));
+        assert!(truth(f64::NAN));
+        assert!(truth(0.5f32));
+        assert!(!truth(0u16));
+        assert!(truth(true));
+    }
 
     fn text<const N: usize>(v: &SeqVar<[c_char; N]>) -> Vec<u8> {
         v.to_c_vec()

@@ -91,11 +91,6 @@ const EXPECTED_FAILURES: &[(&str, &str)] = &[
         "sequencer/test/validate/pvGet.st",
         "pvGet.st:26: error: snc-rs does not support assignment to a foreign variable",
     ),
-    // the escaped `char pvname[]` buffer is passed by value
-    (
-        "ip/ipApp/src/Keithley2kDMM.st",
-        "Keithley2kDMM.st:277: error[E0277]: the trait bound `[i8; 256]: CDst` is not satisfied: the trait `CDst` is not implemented for `[i8; 256]`",
-    ),
     (
         "motor/modules/motorNewport/newportApp/src/MM4005_trajectoryScan.st",
         "MM4005_trajectoryScan.st:316: error: snc-rs does not support a char * that points into a variable",
@@ -293,9 +288,9 @@ fn c_exports() -> HashSet<String> {
 
 /// A companion for `foreign`: an arm for every escaped fragment that
 /// expands the SNL between them, and a placeholder for every foreign name
-/// `epics_seq_rs::c` does not supply. A value is a constant and a
-/// subscripted one a static array, as the epics-seq-rs contract has
-/// escaped-C globals.
+/// `epics_seq_rs::c` does not supply. A value is a constant, a subscripted
+/// one a static array, and an array passed whole a static reference to a
+/// `CDst` and `CSrc`, as the epics-seq-rs contract has escaped-C globals.
 fn stub_companion(foreign: &Foreign, c: &HashSet<String>) -> String {
     let mut s = String::from(
         "#![allow(dead_code, unused_imports, unused_macros, non_snake_case, non_upper_case_globals)]\n\
@@ -351,6 +346,19 @@ fn stub_companion(foreign: &Foreign, c: &HashSet<String>) -> String {
             let (mut ty, mut value) = (t.to_string(), format!("0 as {t}"));
             for _ in 0..dims {
                 (ty, value) = (format!("[{ty}; 256]"), format!("[{value}; 256]"));
+            }
+            if used < dims {
+                // an array SNL code passes whole, which C decays to a
+                // pointer the callee may write through
+                s += &format!(
+                    "pub struct {name}_buf;\n\
+                     impl CDst for {name}_buf {{ \
+                     fn with_c_dst<R>(&self, f: impl FnOnce(&mut [u8]) -> R) -> R {{ f(&mut []) }} }}\n\
+                     impl CSrc for {name}_buf {{ \
+                     fn with_c_buffer<R>(&self, f: impl FnOnce(&[u8]) -> R) -> R {{ f(&[]) }} }}\n\
+                     pub static {name}: &{name}_buf = &{name}_buf;\n"
+                );
+                continue;
             }
             let item = if dims > 0 { "static" } else { "const" };
             s += &format!("pub {item} {name}: {ty} = {value};\n");

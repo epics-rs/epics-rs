@@ -1619,7 +1619,6 @@ impl<'a> Gen<'a> {
                 let a = self.expr(c(child::TERNOP_THEN));
                 let b = self.expr(c(child::TERNOP_ELSE));
                 let (a, b, ty) = if is_numeric(&a.ty) && is_numeric(&b.ty) {
-                    self.refuse_unknown_with_int(ep, &a.ty, &b.ty);
                     operands(a, b)
                 } else if a.ty == Ty::CharPtr || b.ty == Ty::CharPtr {
                     (conv(a, &Ty::CharPtr), conv(b, &Ty::CharPtr), Ty::CharPtr)
@@ -2251,7 +2250,6 @@ impl<'a> Gen<'a> {
         if matches!(op, Tok::Add | Tok::Sub) && (pointer(&l.ty) || pointer(&r.ty)) {
             self.refuse(ep, "pointer arithmetic");
         }
-        self.refuse_unknown_with_int(ep, &l.ty, &r.ty);
         binop(op, l, r)
     }
 
@@ -2292,14 +2290,6 @@ impl<'a> Gen<'a> {
             Ty::Str | Ty::Ref => Expr::atom("false"),
             Ty::Foreign => Expr::binary(v.e, "==", Expr::atom(DEFAULT)),
             Ty::Unit => Expr::binary(v.e, "==", zero(false)),
-        }
-    }
-
-    /// An integer constant stays an untyped literal beside a value whose
-    /// type snc-rs does not know, which builds only if that is an integer.
-    fn refuse_unknown_with_int(&mut self, ep: NodeId, a: &Ty, b: &Ty) {
-        if matches!((a, b), (Ty::Int, Ty::Foreign) | (Ty::Foreign, Ty::Int)) {
-            self.refuse(ep, "an integer constant with a value of unknown type");
         }
     }
 
@@ -2425,6 +2415,20 @@ fn binop(op: Tok, l: Val, r: Val) -> Val {
                 }
                 if r.ty == Ty::CharPtr && is_null(&l) {
                     return null_test(r.e);
+                }
+                // a value of unknown type may be a pointer, which has no
+                // integer 0; rustc infers the default from the value's side
+                if l.ty == Ty::Foreign && is_null(&r) {
+                    return Val {
+                        e: Expr::binary(l.e, sym, Expr::atom(DEFAULT)),
+                        ty: Ty::Bool,
+                    };
+                }
+                if r.ty == Ty::Foreign && is_null(&l) {
+                    return Val {
+                        e: Expr::binary(r.e, sym, Expr::atom(DEFAULT)),
+                        ty: Ty::Bool,
+                    };
                 }
             }
             let (a, b, _) = operands(l, r);
@@ -3421,22 +3425,31 @@ mod tests {
     }
 
     #[test]
-    fn an_integer_constant_with_a_value_of_unknown_type_is_refused() {
-        // `h() * 2` builds only where the companion's h returns an integer;
-        // a use of h in escaped C declares no type, nor a typedef name x's
-        let (_, diag) = translate(
+    fn an_integer_constant_beside_a_value_of_unknown_type_stays_a_literal() {
+        // change.st:32's `rand() % 10`: rustc types the literal by the
+        // companion's h; a use of h in escaped C declares no type, nor a
+        // typedef name x's; a null pointer constant is the value's default
+        let (code, diag) = translate(
             "program p\n%%static int g(void) { return h(); }\n%%static char *c(void);\n\
              %%foo_t x;\nint y;\ndouble d;\nss a {\nstate s {\nwhen () {\ny = h() * 2;\n\
-             y = h() == 0;\ny = 1 << h();\ny = y ? 1 : h();\ny = x + 1;\ny = c() == 0;\n\
-             d = h() * 2.0;\ny = g() + 1;\n} state s\n}\n}\n",
+             y = h() == 0;\ny = 1 << h();\ny = y ? 1 : h();\ny = x + 1;\ny = 0 != c();\n\
+             d = h() * 2.0;\ny = g() + 1;\ny = h() < 3;\n} state s\n}\n}\n",
         );
-        let refused = |line| {
-            format!(
-                "t.st:{line}: error: snc-rs does not support an integer constant with a value of \
-                 unknown type\n"
-            )
-        };
-        assert_eq!(diag, [10, 11, 12, 13, 14, 15].map(refused).concat());
+        assert_eq!(diag, "");
+        let code = words(&code);
+        for e in [
+            "seqg_var.y.set((h() * 2) as _)",
+            "seqg_var.y.set((h() == Default::default()) as i32)",
+            "seqg_var.y.set(1 << h())",
+            "seqg_var.y.set( if seqg_var.y.get() != 0 { 1 } else { h() } as _, )",
+            "seqg_var.y.set((x + 1) as _)",
+            "seqg_var.y.set((c() != Default::default()) as i32)",
+            "seqg_var.d.set(h() as f64 * 2.0)",
+            "seqg_var.y.set(g() + 1)",
+            "seqg_var.y.set((h() < 3) as i32)",
+        ] {
+            assert!(code.contains(e), "{e}\n{code}");
+        }
     }
 
     #[test]

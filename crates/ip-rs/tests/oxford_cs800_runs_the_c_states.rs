@@ -226,3 +226,40 @@ async fn a_packet_from_the_controller_lands_in_its_records() {
     assert_eq!(ioc.f64_of("TEMP.RVAL"), 22222.0);
     assert_eq!(ioc.f64_of("SETPOINT"), 100.0);
 }
+
+/// Only a read of all 928 bytes is parsed. C tested NRRD, the count the
+/// status record asks for, which is always 928, so it took the 500 bytes of
+/// a short datagram (here TEMP 111.11) and the zeroed buffer of every read
+/// that timed out.
+#[epics_base_rs::epics_test]
+async fn a_short_packet_is_dropped() {
+    let ioc = boot(113, Some("0")).await;
+    ioc.deliver(&Packet::new(&[(CTRLNUM, 113), (TEMP, 11111)]), 500)
+        .await;
+    assert_eq!(ioc.f64_of("TEMP.RVAL"), 0.0);
+    assert_eq!(ioc.str_of("ALARM"), "unset");
+
+    let full = Packet::new(&[(CTRLNUM, 113), (TEMP, 29315), (ALARMI, 5)]);
+    ioc.deliver(&full, 928).await;
+    assert!(eventually(|| ioc.str_of("ALARM") == "Temp Warning").await);
+    assert_eq!(ioc.f64_of("TEMP.RVAL"), 29315.0);
+}
+
+/// With `CID=0` the program takes the controller number of the first
+/// packet, the first datagram here coming past the status record's first
+/// timed-out read. C parsed the zeroed buffer `startup` flags, took its
+/// NOT_FOUND for the number ("choosing controller ID: -1"), and so never
+/// took a packet.
+#[epics_base_rs::epics_test]
+async fn cid_0_takes_the_controller_of_the_first_packet() {
+    let ioc = boot(0, Some("0")).await;
+    task::sleep(Duration::from_millis(1500)).await;
+    let first = Packet::new(&[(CTRLNUM, 113), (TEMP, 29315), (ALARMI, 5)]);
+    ioc.deliver(&first, 928).await;
+    assert!(eventually(|| ioc.str_of("ALARM") == "Temp Warning").await);
+    assert_eq!(ioc.f64_of("CTRLNUM"), 113.0);
+
+    ioc.deliver(&Packet::new(&[(CTRLNUM, 144), (TEMP, 12345)]), 928)
+        .await;
+    assert_eq!(ioc.f64_of("TEMP.RVAL"), 29315.0);
+}

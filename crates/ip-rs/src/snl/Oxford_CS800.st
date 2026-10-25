@@ -134,7 +134,6 @@ char*   SNLtaskName;
 /**** 
  **** asyn record
  ****/
-PV(unsigned int, s_nrrd, "{SP}.NRRD", Monitor);       /* number bytes received */
 PVA(unsigned short, s_binp, STATUS_PACKET_VALID_LENGTH, "{SP}.BINP", EvFlag);    /* Binary input */
 
 
@@ -202,7 +201,6 @@ ss cs800 {
     when () {
       sprintf(current_state, "startup");
       pvGet(s_binp);
-      pvGet(s_nrrd);
       
       cid = atoi(macValueGet("CID"));
       efSet(s_binp_mon);
@@ -224,7 +222,13 @@ ss cs800 {
 
     when (disable) {} state ignore
 
-    when (efTestAndClear(s_binp_mon) && s_nrrd == STATUS_PACKET_VALID_LENGTH) {
+    /* C defect fixed: C tested s_nrrd, NRRD, the count the status record
+     * asks for, which is always 928, so short and timed-out reads were
+     * parsed too.  Only a read of all 928 bytes reaches the trailer, the
+     * rest of BINP arriving zeroed; NORD would come on its own monitor,
+     * stale against this BINP. */
+    when (efTestAndClear(s_binp_mon) &&
+          GETUINT16(s_binp, STATUS_PACKET_VALID_LENGTH-2) == 0xabaa) {
       /* interpret binary input buffer
 
          ignore ...

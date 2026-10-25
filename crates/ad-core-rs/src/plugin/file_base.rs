@@ -824,11 +824,21 @@ impl NDPluginFileBase {
         out: &NDArray,
         posted: &mut dyn FnMut(FlushStep<'_>),
     ) -> ADResult<()> {
+        Self::flush_capture_status_io(lock, out, posted).0
+    }
+
+    /// [`flush_capture_io`](Self::flush_capture_io), and whether C's
+    /// writeFileBase `status` ends in success ([`Self::write_capture`]).
+    pub(crate) fn flush_capture_status_io(
+        lock: &mut impl FileIo,
+        out: &NDArray,
+        posted: &mut dyn FnMut(FlushStep<'_>),
+    ) -> (ADResult<()>, bool) {
         let (result, status_ok) = Self::write_capture(lock, out, posted);
         if status_ok {
             lock.base().maybe_delete_driver_file(out);
         }
-        result
+        (result, status_ok)
     }
 
     /// The Capture arm of C `writeFileBase` (NDPluginFile.cpp:268-330): the

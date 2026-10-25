@@ -412,17 +412,22 @@ pub(crate) fn read_file<P: ad_core_rs::plugin::runtime::NDPluginProcess>(
 }
 
 /// C readFileBase's line for a writer whose `openFile` refuses
-/// NDFileModeRead (NDPluginFile.cpp:158-166).
+/// NDFileModeRead (NDPluginFile.cpp:158-166), then writeInt32's for the
+/// status it leaves (:867).
 pub(crate) fn read_refused_lines(
     path: &std::path::Path,
+    base: &asyn_rs::port::PortDriverBase,
 ) -> Vec<(asyn_rs::trace::TraceMask, String)> {
-    vec![(
-        asyn_rs::trace::TraceMask::ERROR,
+    let reason = base.find_param("READ_FILE").unwrap();
+    [
         format!(
             "NDPluginFile::readFileBase Error opening file {}, status=3\n",
             path.display()
         ),
-    )]
+        format!("NDPluginFile::writeInt32 error, status=3 function={reason}, value=1\n"),
+    ]
+    .map(|line| (asyn_rs::trace::TraceMask::ERROR, line))
+    .into()
 }
 
 /// The bits NDPluginFile opens a writer that supports multiple arrays with

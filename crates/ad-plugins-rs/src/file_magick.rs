@@ -554,7 +554,10 @@ mod tests {
         writer.close_file().unwrap();
         let mut proc = MagickFileProcessor::new();
         let (out, _base) = crate::test_util::read_file(&mut proc, &path);
-        assert_eq!(out.trace, crate::test_util::read_refused_lines(&path));
+        assert_eq!(
+            out.trace,
+            crate::test_util::read_refused_lines(&path, &_base)
+        );
         assert_eq!(out.publish, ad_core_rs::plugin::runtime::Published::Nothing);
         std::fs::remove_file(&path).ok();
     }

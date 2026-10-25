@@ -5875,7 +5875,10 @@ mod tests {
         writer.close_file().unwrap();
         let mut proc = Hdf5FileProcessor::new();
         let (out, _base) = crate::test_util::read_file(&mut proc, &path);
-        assert_eq!(out.trace, crate::test_util::read_refused_lines(&path));
+        assert_eq!(
+            out.trace,
+            crate::test_util::read_refused_lines(&path, &_base)
+        );
         assert_eq!(out.publish, ad_core_rs::plugin::runtime::Published::Nothing);
         // C also drops Capture and WriteFile (NDFileHDF5.cpp:192-196).
         let posted = |name: &str| {
@@ -6321,6 +6324,11 @@ mod tests {
         };
         let lines =
             |t: &[(TraceMask, String)]| t.iter().map(|(_, l)| l.clone()).collect::<Vec<_>>();
+        // NDPluginFile.cpp:867, for the status a failed ReadFile leaves.
+        let refused = format!(
+            "NDPluginFile::writeInt32 error, status=3 function={}, value=1\n",
+            idx(&base, "READ_FILE")
+        );
         let name = |base: &asyn_rs::port::PortDriverBase, n: &str| {
             octet(base, "FILE_NAME", n);
         };
@@ -6330,7 +6338,7 @@ mod tests {
         let out = int(&mut base, "READ_FILE", 1);
         assert_eq!(
             lines(&out.trace),
-            [OPEN.to_owned(), read_line("r.h5")],
+            [OPEN.to_owned(), read_line("r.h5"), refused.clone()],
             "C1"
         );
         let cannot = Some("XML description file cannot be opened".to_owned());
@@ -6338,7 +6346,11 @@ mod tests {
 
         std::fs::write(&lay, LAYOUT).unwrap();
         let out = int(&mut base, "READ_FILE", 1);
-        assert_eq!(lines(&out.trace), [read_line("r.h5")], "C2");
+        assert_eq!(
+            lines(&out.trace),
+            [read_line("r.h5"), refused.clone()],
+            "C2"
+        );
         assert_eq!(sides(&out.side), (Some(1), Some(String::new())), "C2");
 
         std::fs::remove_file(&lay).unwrap();
@@ -6356,7 +6368,7 @@ mod tests {
         let out = int(&mut base, "READ_FILE", 1);
         assert_eq!(
             lines(&out.trace),
-            [PARSE.to_owned(), read_line("nolay.h5")],
+            [PARSE.to_owned(), read_line("nolay.h5"), refused.clone()],
             "C4"
         );
         let parser = Some("XML description file parser error".to_owned());
@@ -6374,7 +6386,7 @@ mod tests {
 
         octet(&base, "HDF5_layoutFilename", "");
         let out = int(&mut base, "READ_FILE", 1);
-        assert_eq!(lines(&out.trace), [read_line("badlay.h5")], "C8");
+        assert_eq!(lines(&out.trace), [read_line("badlay.h5"), refused], "C8");
         let default = Some("Default layout selected".to_owned());
         assert_eq!(sides(&out.side), (Some(1), default), "C8");
         std::fs::remove_dir_all(&dir).ok();
@@ -6866,7 +6878,13 @@ mod tests {
             NDDataType::UInt8,
         )));
         let out = int("CAPTURE", 1);
-        assert_eq!(out.verdict, WriteVerdict::Accept(0));
+        assert_eq!(
+            out.verdict,
+            WriteVerdict::Refuse {
+                keep: 0,
+                message: String::new()
+            }
+        );
         let status = idx(&base, "WRITE_STATUS");
         assert!(out.side.iter().any(|p| matches!(p,
             ad_core_rs::plugin::runtime::SideParam::Int32 { reason, value: 1, .. } if *reason == status)));

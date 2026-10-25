@@ -1971,6 +1971,7 @@ fn prepare_current_thread() {
     name_current_thread();
     build_park_state();
     build_drive_state();
+    build_tokio_park_state();
 }
 
 /// `parking_lot_core` builds a thread's park state on its first park, and
@@ -2001,6 +2002,20 @@ fn build_park_state() {
 fn build_drive_state() {
     drop(current_thread_waker());
     let _ = RuntimeHandle::try_current();
+}
+
+/// tokio builds a thread's parker (an `Arc`) on its first wait outside a
+/// runtime's own park, which an unbounded channel's `try_recv` makes when it
+/// meets a send half done: a port actor's first such race, mid-cycle. A ready
+/// `blocking_recv` builds it here. A thread already in a tokio context may be
+/// driving one, where blocking panics; it is no fresh thread, so it is left.
+fn build_tokio_park_state() {
+    if RuntimeHandle::try_current().is_ok() {
+        return;
+    }
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let _ = tx.send(());
+    let _ = rx.blocking_recv();
 }
 
 /// C `epicsThreadSetPriority(epicsThreadGetIdSelf(), prio)` on a thread that

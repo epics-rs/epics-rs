@@ -38,21 +38,21 @@ dbLoadRecords("NDFileHDF5.template", "P=$(PREFIX),R=HDF1:,PORT=FileHDF1,NDARRAY_
 
 # ===== ROI plugins (4 instances) =====
 
-NDROIConfigure("ROI1", $(QSIZE), 0, "$(PORT)", 0)
+NDROIConfigure("ROI1", $(QSIZE), 0, "$(PORT)", 0, 0, 0, 0, 0, $(MAX_THREADS=5))
 dbLoadRecords("NDROI.template", "P=$(PREFIX),R=ROI1:,PORT=ROI1,NDARRAY_PORT=$(PORT)")
 
-NDROIConfigure("ROI2", $(QSIZE), 0, "$(PORT)", 0)
+NDROIConfigure("ROI2", $(QSIZE), 0, "$(PORT)", 0, 0, 0, 0, 0, $(MAX_THREADS=5))
 dbLoadRecords("NDROI.template", "P=$(PREFIX),R=ROI2:,PORT=ROI2,NDARRAY_PORT=$(PORT)")
 
-NDROIConfigure("ROI3", $(QSIZE), 0, "$(PORT)", 0)
+NDROIConfigure("ROI3", $(QSIZE), 0, "$(PORT)", 0, 0, 0, 0, 0, $(MAX_THREADS=5))
 dbLoadRecords("NDROI.template", "P=$(PREFIX),R=ROI3:,PORT=ROI3,NDARRAY_PORT=$(PORT)")
 
-NDROIConfigure("ROI4", $(QSIZE), 0, "$(PORT)", 0)
+NDROIConfigure("ROI4", $(QSIZE), 0, "$(PORT)", 0, 0, 0, 0, 0, $(MAX_THREADS=5))
 dbLoadRecords("NDROI.template", "P=$(PREFIX),R=ROI4:,PORT=ROI4,NDARRAY_PORT=$(PORT)")
 
 # ===== ROI statistics (8 ROIs) =====
 
-NDROIStatConfigure("ROISTAT1", $(QSIZE), 0, "$(PORT)", 0, 8, 0, 0, 0, 0)
+NDROIStatConfigure("ROISTAT1", $(QSIZE), 0, "$(PORT)", 0, 8, 0, 0, 0, 0, $(MAX_THREADS=5))
 dbLoadRecords("NDROIStat.template", "P=$(PREFIX),R=ROIStat1:,PORT=ROISTAT1,NCHANS=$(NCHANS),NDARRAY_PORT=$(PORT)")
 dbLoadRecords("NDROIStatN.template", "P=$(PREFIX),R=ROIStat1:1:,PORT=ROISTAT1,ADDR=0,TIMEOUT=1,NCHANS=$(NCHANS)")
 dbLoadRecords("NDROIStatN.template", "P=$(PREFIX),R=ROIStat1:2:,PORT=ROISTAT1,ADDR=1,TIMEOUT=1,NCHANS=$(NCHANS)")
@@ -89,39 +89,39 @@ dbLoadRecords("NDGatherN.template", "P=$(PREFIX),R=Gather1:,PORT=GATHER1,ADDR=7,
 
 # ===== Statistics plugins (5 instances) =====
 
-NDStatsConfigure("STATS1", $(QSIZE), 0, "$(PORT)", 0)
+NDStatsConfigure("STATS1", $(QSIZE), 0, "$(PORT)", 0, 0, 0, 0, 0, $(MAX_THREADS=5))
 dbLoadRecords("NDStats.template", "P=$(PREFIX),R=Stats1:,PORT=STATS1,NCHANS=$(NCHANS),XSIZE=$(XSIZE),YSIZE=$(YSIZE),HIST_SIZE=256,NDARRAY_PORT=$(PORT)")
 NDTimeSeriesConfigure("STATS1_TS", $(QSIZE), 0, "STATS1", 1, 23)
 dbLoadRecords("NDTimeSeries.template", "P=$(PREFIX),R=Stats1:TS:,PORT=STATS1_TS,ADDR=0,TIMEOUT=1,NDARRAY_PORT=STATS1,NDARRAY_ADDR=1,NCHANS=$(NCHANS),ENABLED=1")
 
-NDStatsConfigure("STATS2", $(QSIZE), 0, "$(PORT)", 0)
+NDStatsConfigure("STATS2", $(QSIZE), 0, "$(PORT)", 0, 0, 0, 0, 0, $(MAX_THREADS=5))
 dbLoadRecords("NDStats.template", "P=$(PREFIX),R=Stats2:,PORT=STATS2,NCHANS=$(NCHANS),XSIZE=$(XSIZE),YSIZE=$(YSIZE),HIST_SIZE=256,NDARRAY_PORT=$(PORT)")
 NDTimeSeriesConfigure("STATS2_TS", $(QSIZE), 0, "STATS2", 1, 23)
 dbLoadRecords("NDTimeSeries.template", "P=$(PREFIX),R=Stats2:TS:,PORT=STATS2_TS,ADDR=0,TIMEOUT=1,NDARRAY_PORT=STATS2,NDARRAY_ADDR=1,NCHANS=$(NCHANS),ENABLED=1")
 
-NDStatsConfigure("STATS3", $(QSIZE), 0, "$(PORT)", 0)
+NDStatsConfigure("STATS3", $(QSIZE), 0, "$(PORT)", 0, 0, 0, 0, 0, $(MAX_THREADS=5))
 dbLoadRecords("NDStats.template", "P=$(PREFIX),R=Stats3:,PORT=STATS3,NCHANS=$(NCHANS),XSIZE=$(XSIZE),YSIZE=$(YSIZE),HIST_SIZE=256,NDARRAY_PORT=$(PORT)")
 NDTimeSeriesConfigure("STATS3_TS", $(QSIZE), 0, "STATS3", 1, 23)
 dbLoadRecords("NDTimeSeries.template", "P=$(PREFIX),R=Stats3:TS:,PORT=STATS3_TS,ADDR=0,TIMEOUT=1,NDARRAY_PORT=STATS3,NDARRAY_ADDR=1,NCHANS=$(NCHANS),ENABLED=1")
 
-NDStatsConfigure("STATS4", $(QSIZE), 0, "$(PORT)", 0)
+NDStatsConfigure("STATS4", $(QSIZE), 0, "$(PORT)", 0, 0, 0, 0, 0, $(MAX_THREADS=5))
 dbLoadRecords("NDStats.template", "P=$(PREFIX),R=Stats4:,PORT=STATS4,NCHANS=$(NCHANS),XSIZE=$(XSIZE),YSIZE=$(YSIZE),HIST_SIZE=256,NDARRAY_PORT=$(PORT)")
 NDTimeSeriesConfigure("STATS4_TS", $(QSIZE), 0, "STATS4", 1, 23)
 dbLoadRecords("NDTimeSeries.template", "P=$(PREFIX),R=Stats4:TS:,PORT=STATS4_TS,ADDR=0,TIMEOUT=1,NDARRAY_PORT=STATS4,NDARRAY_ADDR=1,NCHANS=$(NCHANS),ENABLED=1")
 
-NDStatsConfigure("STATS5", $(QSIZE), 0, "$(PORT)", 0)
+NDStatsConfigure("STATS5", $(QSIZE), 0, "$(PORT)", 0, 0, 0, 0, 0, $(MAX_THREADS=5))
 dbLoadRecords("NDStats.template", "P=$(PREFIX),R=Stats5:,PORT=STATS5,NCHANS=$(NCHANS),XSIZE=$(XSIZE),YSIZE=$(YSIZE),HIST_SIZE=256,NDARRAY_PORT=$(PORT)")
 NDTimeSeriesConfigure("STATS5_TS", $(QSIZE), 0, "STATS5", 1, 23)
 dbLoadRecords("NDTimeSeries.template", "P=$(PREFIX),R=Stats5:TS:,PORT=STATS5_TS,ADDR=0,TIMEOUT=1,NDARRAY_PORT=STATS5,NDARRAY_ADDR=1,NCHANS=$(NCHANS),ENABLED=1")
 
 # ===== Transform plugin =====
 
-NDTransformConfigure("TRANS1", $(QSIZE), 0, "$(PORT)", 0)
+NDTransformConfigure("TRANS1", $(QSIZE), 0, "$(PORT)", 0, 0, 0, 0, 0, $(MAX_THREADS=5))
 dbLoadRecords("NDTransform.template", "P=$(PREFIX),R=Trans1:,PORT=TRANS1,NDARRAY_PORT=$(PORT)")
 
 # ===== Overlay plugin (with 8 overlays) =====
 
-NDOverlayConfigure("OVER1", $(QSIZE), 0, "$(PORT)", 0, 8, 0, 0, 0, 0)
+NDOverlayConfigure("OVER1", $(QSIZE), 0, "$(PORT)", 0, 8, 0, 0, 0, 0, $(MAX_THREADS=5))
 dbLoadRecords("NDOverlay.template", "P=$(PREFIX),R=Over1:,PORT=OVER1,NDARRAY_PORT=$(PORT)")
 dbLoadRecords("NDOverlayN.template", "P=$(PREFIX),R=Over1:1:,NAME=ROI1,SHAPE=1,O=Over1:,XPOS=$(PREFIX)ROI1:MinX_RBV,YPOS=$(PREFIX)ROI1:MinY_RBV,XSIZE=$(PREFIX)ROI1:SizeX_RBV,YSIZE=$(PREFIX)ROI1:SizeY_RBV,PORT=OVER1,ADDR=0,TIMEOUT=1")
 dbLoadRecords("NDOverlayN.template", "P=$(PREFIX),R=Over1:2:,NAME=ROI2,SHAPE=1,O=Over1:,XPOS=$(PREFIX)ROI2:MinX_RBV,YPOS=$(PREFIX)ROI2:MinY_RBV,XSIZE=$(PREFIX)ROI2:SizeX_RBV,YSIZE=$(PREFIX)ROI2:SizeY_RBV,PORT=OVER1,ADDR=1,TIMEOUT=1")
@@ -134,10 +134,10 @@ dbLoadRecords("NDOverlayN.template", "P=$(PREFIX),R=Over1:8:,NAME=Box2,SHAPE=1,O
 
 # ===== Color conversion plugins (2 instances) =====
 
-NDColorConvertConfigure("CC1", $(QSIZE), 0, "$(PORT)", 0)
+NDColorConvertConfigure("CC1", $(QSIZE), 0, "$(PORT)", 0, 0, 0, 0, 0, $(MAX_THREADS=5))
 dbLoadRecords("NDColorConvert.template", "P=$(PREFIX),R=CC1:,PORT=CC1,NDARRAY_PORT=$(PORT)")
 
-NDColorConvertConfigure("CC2", $(QSIZE), 0, "$(PORT)", 0)
+NDColorConvertConfigure("CC2", $(QSIZE), 0, "$(PORT)", 0, 0, 0, 0, 0, $(MAX_THREADS=5))
 dbLoadRecords("NDColorConvert.template", "P=$(PREFIX),R=CC2:,PORT=CC2,NDARRAY_PORT=$(PORT)")
 
 # ===== Circular buffer =====
@@ -162,20 +162,20 @@ dbLoadRecords("NDTimeSeries.template", "P=$(PREFIX),R=Attr1:TS:,PORT=ATTR1_TS,AD
 
 # ===== FFT =====
 
-NDFFTConfigure("FFT1", $(QSIZE), 0, "$(PORT)", 0)
+NDFFTConfigure("FFT1", $(QSIZE), 0, "$(PORT)", 0, 0, 0, 0, 0, 5)
 dbLoadRecords("NDFFT.template", "P=$(PREFIX),R=FFT1:,PORT=FFT1,NAME=FFT1,NCHANS=$(NCHANS),NDARRAY_PORT=$(PORT)")
 
 # ===== Codec plugins (2 instances) =====
 
-NDCodecConfigure("CODEC1", $(QSIZE), 0, "$(PORT)", 0)
+NDCodecConfigure("CODEC1", $(QSIZE), 0, "$(PORT)", 0, 0, 0, 0, 0, 5)
 dbLoadRecords("NDCodec.template", "P=$(PREFIX),R=Codec1:,PORT=CODEC1,NDARRAY_PORT=$(PORT)")
 
-NDCodecConfigure("CODEC2", $(QSIZE), 0, "$(PORT)", 0)
+NDCodecConfigure("CODEC2", $(QSIZE), 0, "$(PORT)", 0, 0, 0, 0, 0, 5)
 dbLoadRecords("NDCodec.template", "P=$(PREFIX),R=Codec2:,PORT=CODEC2,NDARRAY_PORT=$(PORT)")
 
 # ===== Bad pixel =====
 
-NDBadPixelConfigure("BADPIX1", $(QSIZE), 0, "$(PORT)", 0)
+NDBadPixelConfigure("BADPIX1", $(QSIZE), 0, "$(PORT)", 0, 0, 0, 0, 0, 5)
 dbLoadRecords("NDBadPixel.template", "P=$(PREFIX),R=BadPix1:,PORT=BADPIX1,NDARRAY_PORT=$(PORT)")
 
 # ===== Autosave =====

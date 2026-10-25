@@ -280,3 +280,53 @@ async fn cid_0_waits_for_a_packet_with_the_controller_number() {
     assert!(eventually(|| ioc.str_of("ALARM") == "Temp Warning").await);
     assert_eq!(ioc.f64_of("TEMP.RVAL"), 29315.0);
 }
+
+const DEBUG_CHILD: &str = "OXFORD_CS800_DEBUG_CHILD";
+
+/// At DEBUG 4 each state's first entry from another state prints the
+/// change. C tested `!strcmp`, true only once `current_state` already held
+/// the state's name, so it never printed one; had it, the state would have
+/// re-entered itself for good.
+#[epics_base_rs::epics_test]
+async fn debug_4_traces_each_state_change() {
+    if std::env::var_os(DEBUG_CHILD).is_none() {
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "debug_4_traces_each_state_change",
+                "--exact",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(DEBUG_CHILD, "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert!(
+            out.status.success(),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let changes: Vec<_> = stdout
+            .lines()
+            .filter_map(|l| l.split_once("> state change: ").map(|(_, c)| c))
+            .collect();
+        assert_eq!(
+            changes,
+            ["idle -> validate", "validate -> process", "process -> idle"],
+            "{stdout}"
+        );
+        return;
+    }
+    let ioc = boot(113, Some("0")).await;
+    task::sleep(Duration::from_millis(1500)).await;
+    ioc.db
+        .put_pv_and_post(format!("{P}DEBUG"), EpicsValue::Enum(4))
+        .await
+        .unwrap();
+    assert!(eventually(|| ioc.f64_of("DEBUG") == 4.0).await);
+    task::sleep(Duration::from_millis(250)).await;
+    ioc.deliver(&Packet::new(&[(CTRLNUM, 113), (ALARMI, 5)]), 928)
+        .await;
+    assert!(eventually(|| ioc.str_of("ALARM") == "Temp Warning").await);
+    task::sleep(Duration::from_millis(250)).await;
+}

@@ -54,6 +54,9 @@ option -w;  /* Suppress SNC warnings */
 #define DEBUGLEVEL_DEBUG              (4)
 #define NOT_FOUND                     (-1)
 
+/* C defect fixed: each state's first when tested !strcmp(current_state,
+ * <state>), true only once CHANGE_STATE had already run, so it never ran;
+ * it now runs on entry from another state. */
 #define CHANGE_STATE(_STATE_)    \
       DEBUG_PRINT2(DEBUGLEVEL_DEBUG, "state change: %s -> %s", current_state, _STATE_); \
       sprintf(current_state, _STATE_);
@@ -216,7 +219,7 @@ ss cs800 {
 
 
   state idle {
-    when (!strcmp(current_state, "idle")) {
+    when (strcmp(current_state, "idle")) {
       CHANGE_STATE("idle")
     } state idle
 
@@ -270,7 +273,7 @@ ss cs800 {
    * park here while user has disabled this software
    */
   state ignore {
-    when (!strcmp(current_state, "ignore")) {
+    when (strcmp(current_state, "ignore")) {
       CHANGE_STATE("ignore")
     } state ignore
 
@@ -281,7 +284,7 @@ ss cs800 {
 
 
   state validate { 
-    when (!strcmp(current_state, "validate")) {
+    when (strcmp(current_state, "validate")) {
       CHANGE_STATE("validate")
     } state validate
 
@@ -298,7 +301,7 @@ ss cs800 {
 
 
   state process { 
-    when (!strcmp(current_state, "process")) {
+    when (strcmp(current_state, "process")) {
       CHANGE_STATE("process")
     } state process
 

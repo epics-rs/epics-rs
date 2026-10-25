@@ -14,6 +14,7 @@
 use std::any::Any;
 use std::ffi::c_char;
 use std::marker::PhantomData;
+use std::sync::Arc;
 
 use epics_base_rs::types::{EpicsValue, PvString};
 use parking_lot::Mutex;
@@ -73,7 +74,7 @@ impl<T: Zeroed, const N: usize> Zeroed for [T; N] {
 
 impl<T: Zeroed> Zeroed for SeqVar<T> {
     fn zeroed() -> Self {
-        SeqVar(Mutex::new(T::zeroed_box()))
+        SeqVar(Arc::new(Mutex::new(T::zeroed_box())))
     }
 }
 
@@ -235,12 +236,13 @@ pub trait Place<T> {
     }
 }
 
-/// One program variable.
-pub struct SeqVar<T>(Mutex<Box<T>>);
+/// One program variable. Its cell is shared, so a pointer to it can hold
+/// it.
+pub struct SeqVar<T>(Arc<Mutex<Box<T>>>);
 
 impl<T> SeqVar<T> {
     pub fn new(value: T) -> Self {
-        SeqVar(Mutex::new(Box::new(value)))
+        SeqVar(Arc::new(Mutex::new(Box::new(value))))
     }
 
     /// [`Place::modify`].
@@ -273,9 +275,12 @@ impl<T> Place<T> for SeqVar<T> {
     }
 }
 
+/// A new cell, as safe mode's per-state-set copy is a new block: a
+/// pointer stored in the variable still points into the original, as C's
+/// `memcpy` leaves it.
 impl<T: Clone> Clone for SeqVar<T> {
     fn clone(&self) -> Self {
-        SeqVar(Mutex::new(self.0.lock().clone()))
+        SeqVar(Arc::new(Mutex::new(self.0.lock().clone())))
     }
 }
 
@@ -478,6 +483,14 @@ pub trait ProgramVars: Clone + Send + Sync + 'static {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_clone_is_a_cell_of_its_own() {
+        let x = SeqVar::new(1i32);
+        let y = x.clone();
+        y.set(2);
+        assert_eq!((x.get(), y.get()), (1, 2));
+    }
 
     #[test]
     fn a_large_array_is_built_on_the_heap() {

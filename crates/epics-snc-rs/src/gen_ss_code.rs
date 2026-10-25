@@ -29,6 +29,7 @@ const NM_EVENT: &str = "seqg_event";
 const NM_SS: &str = "seqg_ss";
 const ENV_TYPE: &str = "&seqg_rt::StateSet<seqg_vars>";
 const C_CHAR: &str = "std::ffi::c_char";
+const C_VOID: &str = "std::ffi::c_void";
 
 /// C's truth of a value of unknown type (`holds`) or its negation. The
 /// value may be a pointer, which has no integer 0, so `seqg_rt::c::truth`
@@ -552,6 +553,8 @@ enum PlaceTy {
     /// a `char` that a `string`'s subscript, or a `char *` that is not a
     /// variable's, names
     Char,
+    /// what a `void *` points to, which C does not read
+    Void,
 }
 
 /// A variable or an element of one: the expression naming its `SeqVar`
@@ -998,7 +1001,7 @@ impl<'a> Gen<'a> {
                 }
                 _ => false,
             },
-            PlaceTy::Char => false,
+            PlaceTy::Char | PlaceTy::Void => false,
         };
         let store = if is_text && !place.multi {
             let v = self.expr(init);
@@ -1388,8 +1391,11 @@ impl<'a> Gen<'a> {
             op,
             Tok::Equal | Tok::Addeq | Tok::Subeq | Tok::Incr | Tok::Decr
         );
-        if !pointer_op && matches!(self.place_value_ty(&place), Ty::Ptr(_)) {
+        let ty = self.place_value_ty(&place);
+        if !pointer_op && matches!(ty, Ty::Ptr(_)) {
             self.refuse(target, "pointer arithmetic");
+        } else if op != Tok::Equal && ty == Ty::Ptr(C_VOID.into()) {
+            self.refuse(target, "arithmetic on a void pointer");
         }
         Some(place)
     }
@@ -1398,8 +1404,12 @@ impl<'a> Gen<'a> {
     /// conversion on assignment.
     fn stored(&mut self, ep: NodeId, ty: &Ty) -> Expr {
         let v = match ty {
-            Ty::Ptr(_) if self.pointee(ep).is_some() => return self.pointer(ep),
-            _ => self.expr(ep),
+            Ty::Ptr(_) => self.pointer_val(ep),
+            _ => None,
+        };
+        let v = match v {
+            Some(v) => v,
+            None => self.expr(ep),
         };
         conv(v, ty)
     }
@@ -1432,9 +1442,10 @@ impl<'a> Gen<'a> {
                     _ => None,
                 }
             }
-            NodeTag::ETernop => self
-                .pointee(c(child::TERNOP_THEN)?)
-                .or_else(|| self.pointee(c(child::TERNOP_ELSE)?)),
+            NodeTag::ETernop => composite(
+                self.pointee(c(child::TERNOP_THEN)?),
+                self.pointee(c(child::TERNOP_ELSE)?),
+            ),
             NodeTag::ECast => {
                 let decl = c(child::CAST_TYPE)?;
                 match ast[ast[ast[decl].e_decl()?].type_].kind {
@@ -1462,13 +1473,16 @@ impl<'a> Gen<'a> {
                 TypeKind::Pointer { value_type } => self.snl_pointee(value_type),
                 _ => None,
             },
-            (PlaceTy::Char, _) => None,
+            (PlaceTy::Char | PlaceTy::Void, _) => None,
         }
     }
 
     /// A pointee of SNL type `t`, if a `seqg_rt::Ptr` can point to it.
     fn snl_pointee(&self, t: TypeId) -> Option<PlaceTy> {
-        value_type(self.ast, t).ok().map(|_| PlaceTy::Snl(t))
+        match self.ast[t].kind {
+            TypeKind::Void => Some(PlaceTy::Void),
+            _ => value_type(self.ast, t).ok().map(|_| PlaceTy::Snl(t)),
+        }
     }
 
     /// What the result of a call to `callee` points to.
@@ -1496,7 +1510,18 @@ impl<'a> Gen<'a> {
         match t {
             PlaceTy::Snl(t) => value_type(self.ast, t).expect("a pointee has a Rust type"),
             PlaceTy::Char => C_CHAR.into(),
+            PlaceTy::Void => C_VOID.into(),
         }
+    }
+
+    /// [`Gen::pointer`] of `ep` and its type, if [`Gen::pointee`] reads it
+    /// as a pointer.
+    fn pointer_val(&mut self, ep: NodeId) -> Option<Val> {
+        let ty = Ty::Ptr(self.pointee_type(self.pointee(ep)?));
+        Some(Val {
+            e: self.pointer(ep),
+            ty,
+        })
     }
 
     /// `ep`, which [`Gen::pointee`] reads as a pointer, as a `seqg_rt::Ptr`.
@@ -1533,6 +1558,9 @@ impl<'a> Gen<'a> {
                 } else {
                     (r, l)
                 };
+                if let Some(PlaceTy::Void) = self.pointee(p) {
+                    self.refuse(ep, "arithmetic on a void pointer");
+                }
                 let p = self.pointer(p);
                 let n = self.expr(n);
                 p.method("offset", vec![offset(sym, n)])
@@ -1549,13 +1577,22 @@ impl<'a> Gen<'a> {
             }
             NodeTag::ECast => {
                 let operand = c(child::CAST_OPERAND);
-                match self.pointee(operand) {
-                    Some(t) if Ty::Ptr(self.pointee_type(t)) != ty => {
+                let v = match self.pointer_val(operand) {
+                    Some(v) => v,
+                    None => self.expr(operand),
+                };
+                let void = Ty::Ptr(C_VOID.into());
+                match &v.ty {
+                    // C converts any pointer to and from `void *`
+                    Ty::Ptr(_) if v.ty != ty && v.ty != void && ty != void => {
                         self.refuse(ep, "a cast between pointer types");
-                        self.expr(operand).e
                     }
-                    _ => self.stored(operand, &ty),
+                    _ if is_integer(&v.ty) && !is_null(&v) => {
+                        self.refuse(ep, "a cast of an integer to a pointer");
+                    }
+                    _ => {}
                 }
+                conv(v, &ty)
             }
             _ if self.held_pointee(ep).is_none() && self.place_kind(ep).is_some() => {
                 let place = self.place(ep);
@@ -1596,6 +1633,9 @@ impl<'a> Gen<'a> {
         }
         if node.token.symbol != Tok::Sub || self.pointee(l).is_none() || self.pointee(r).is_none() {
             return None;
+        }
+        if let Some(PlaceTy::Void) = self.pointee(l) {
+            self.refuse(ep, "arithmetic on a void pointer");
         }
         let p = self.pointer(l);
         let q = self.pointer(r);
@@ -1819,12 +1859,12 @@ impl<'a> Gen<'a> {
                     Tok::Add | Tok::Sub if let Some(v) = self.pointer_arith(ep) => v,
                     // C compares the addresses an array or a `string` decays to
                     Tok::Eq | Tok::Ne
-                        if let Some(t) = self.pointee(lhs).or_else(|| self.pointee(rhs)) =>
+                        if let Some(t) = composite(self.pointee(lhs), self.pointee(rhs)) =>
                     {
                         let ty = Ty::Ptr(self.pointee_type(t));
-                        let mut side = |ep| match self.pointee(ep) {
-                            Some(_) => Val {
-                                e: self.pointer(ep),
+                        let mut side = |ep| match self.pointer_val(ep) {
+                            Some(v) => Val {
+                                e: conv(v, &ty),
                                 ty: ty.clone(),
                             },
                             None => self.expr(ep),
@@ -1880,9 +1920,11 @@ impl<'a> Gen<'a> {
                 let cond = self.truth(c(child::TERNOP_COND));
                 let a = self.expr(c(child::TERNOP_THEN));
                 let b = self.expr(c(child::TERNOP_ELSE));
+                let void = Ty::Ptr(C_VOID.into());
                 let ptr = [&a.ty, &b.ty]
                     .into_iter()
-                    .find(|t| matches!(t, Ty::Ptr(_)))
+                    .find(|t| **t == void)
+                    .or_else(|| [&a.ty, &b.ty].into_iter().find(|t| matches!(t, Ty::Ptr(_))))
                     .cloned();
                 let (a, b, ty) = if is_numeric(&a.ty) && is_numeric(&b.ty) {
                     operands(a, b)
@@ -2088,6 +2130,10 @@ impl<'a> Gen<'a> {
                 let v = self.expr(ap);
                 conv(v, &Ty::Num(t.into()))
             }
+            // C converts a `void *` to the `char *` parameter
+            Some(CParam::Src | CParam::Dst) if matches!(self.pointee(ap), Some(PlaceTy::Void)) => {
+                self.stored(ap, &Ty::Ptr(C_CHAR.into()))
+            }
             // a `char *` value is a `CDst` as a place is; C's write into a
             // literal is undefined
             Some(CParam::Dst) => {
@@ -2163,6 +2209,7 @@ impl<'a> Gen<'a> {
             _ => match self.place_kind(a) {
                 Some((PlaceTy::Snl(t), _)) => type_size(ast, t),
                 Some((PlaceTy::Char, _)) => Some(1),
+                Some((PlaceTy::Void, _)) => None,
                 None => self.pointee(a).map(|_| 8),
             },
         }
@@ -2484,6 +2531,9 @@ impl<'a> Gen<'a> {
             return index_place(&place, elem, i);
         }
         let ty = self.pointee(base).expect("a dereferenced pointer");
+        if let PlaceTy::Void = ty {
+            self.refuse(base, "a dereference of a void pointer");
+        }
         let mut expr = self.pointer(base);
         if let Some(i) = index {
             let i = self.expr(i);
@@ -2502,7 +2552,9 @@ impl<'a> Gen<'a> {
         match &ast[t].kind {
             TypeKind::Prim(PrimType::String) | TypeKind::Array { .. } => Ty::Ref,
             TypeKind::Prim(_) => Ty::Num(value_type(ast, t).expect("numeric type")),
-            TypeKind::Pointer { value_type: p } => value_type(ast, *p).map_or(Ty::Foreign, Ty::Ptr),
+            TypeKind::Pointer { value_type: p } => self
+                .snl_pointee(*p)
+                .map_or(Ty::Foreign, |t| Ty::Ptr(self.pointee_type(t))),
             _ => Ty::Foreign,
         }
     }
@@ -2561,6 +2613,7 @@ impl<'a> Gen<'a> {
         match place.ty {
             _ if place.multi => Ty::Ref,
             PlaceTy::Char => Ty::Num(C_CHAR.into()),
+            PlaceTy::Void => Ty::Unit,
             PlaceTy::Snl(t) => self.value_ty(t),
         }
     }
@@ -3005,9 +3058,23 @@ fn conv(v: Val, target: &Ty) -> Expr {
                 Expr::call("seqg_rt::CharPtr::from_bytes", vec![bytes])
             }
             _ if is_null(&v) => null_ptr(t),
+            // C converts any pointer to and from `void *`
+            Ty::Ptr(s) if s != *t && t == C_VOID => v.e.method("erase", Vec::new()),
+            Ty::Ptr(s) if s == C_VOID && t != C_VOID => {
+                v.e.method(format!("cast::<{t}>"), Vec::new())
+            }
             _ => v.e,
         },
         _ => v.e,
+    }
+}
+
+/// C's pointer type of a conditional or comparison of pointers to `a` and
+/// `b`, one of which may be a null constant: `void *` if either is one.
+fn composite(a: Option<PlaceTy>, b: Option<PlaceTy>) -> Option<PlaceTy> {
+    match (a, b) {
+        (Some(PlaceTy::Void), _) | (_, Some(PlaceTy::Void)) => Some(PlaceTy::Void),
+        (a, b) => a.or(b),
     }
 }
 
@@ -3754,6 +3821,47 @@ mod tests {
         ] {
             assert!(code.contains(e), "{e}\n{code}");
         }
+    }
+
+    #[test]
+    fn a_void_pointer_converts_to_and_from_a_typed_one() {
+        // void.st: void *p = &x; testOk1(*(int *)p == x)
+        let (code, diag) = translate(
+            "program p\nint x = 42;\nvoid *p = &x;\nint *q;\nint n;\nss a {\nstate z {\nwhen (p) {\n\
+             q = (int *)p;\nn = *(int *)p;\np = q;\np = 0;\np = (void *)&x;\nn = p == &x;\n\
+             printf(\"%p\", p);\nstrcpy(p, \"a\");\n} state z\n}\n}\n",
+        );
+        assert_eq!(diag, "");
+        for e in [
+            "seqg_var.p.set(seqg_var.x.ptr().erase());",
+            "!seqg_var.p.get().is_null()",
+            "seqg_var.q.set(seqg_var.p.get().cast::<i32>());",
+            "seqg_var.n.set(seqg_var.p.get().cast::<i32>().get());",
+            "seqg_var.p.set(seqg_var.q.get().erase());",
+            "seqg_var.p.set(seqg_rt::Ptr::<std::ffi::c_void>::default());",
+            "seqg_var.p.get() == seqg_var.x.ptr().erase()",
+            "seqg_rt::c::CArg::from(seqg_var.p.get().addr())",
+            "strcpy(seqg_var.p.get().cast::<std::ffi::c_char>(), \"a\")",
+        ] {
+            assert!(code.contains(e), "{e}\n{code}");
+        }
+    }
+
+    #[test]
+    fn a_void_pointer_neither_moves_nor_dereferences() {
+        // C has no `void` to read and no size to step by
+        let (_, diag) = translate(
+            "program p\nvoid *p;\nlong n;\nss a {\nstate z {\nwhen () {\n\
+             p = p + 1;\np++;\nn = *p;\nn = p - p;\np = (void *)n;\n} state z\n}\n}\n",
+        );
+        assert_eq!(
+            diag,
+            "t.st:7: error: snc-rs does not support arithmetic on a void pointer\n\
+             t.st:8: error: snc-rs does not support arithmetic on a void pointer\n\
+             t.st:9: error: snc-rs does not support a dereference of a void pointer\n\
+             t.st:10: error: snc-rs does not support arithmetic on a void pointer\n\
+             t.st:11: error: snc-rs does not support a cast of an integer to a pointer\n"
+        );
     }
 
     #[test]

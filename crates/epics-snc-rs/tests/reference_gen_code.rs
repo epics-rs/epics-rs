@@ -106,18 +106,15 @@ const EXPECTED_FAILURES: &[(&str, &str)] = &[
         "sequencer/examples/parallel/control.st",
         "control.st:37: error[E0425]: cannot find function `pvPutCompleteArray` in this scope: not found in this scope",
     ),
-    // C's void * and a function pointer have no Rust type
+    // a function pointer has no Rust type, nor has an integer cast to a
+    // pointer a cell to point to
     (
         "sequencer/test/compiler/funcdef.st",
-        "funcdef.st:8: error: snc-rs does not support void pointer result of function 'f1'",
+        "funcdef.st:34: error: snc-rs does not support function pointer variable 'f'",
     ),
     (
         "sequencer/test/compiler/type_expr.st",
-        "type_expr.st:13: error: snc-rs does not support void pointer variable 'p'",
-    ),
-    (
-        "sequencer/test/validate/void.st",
-        "void.st:12: error: snc-rs does not support void pointer variable 'p'",
+        "type_expr.st:13: error: snc-rs does not support a cast of an integer to a pointer",
     ),
     // these wait for a run-time contract for SNL and foreign structs
     (

@@ -14,7 +14,7 @@
 //! its cells together, in index order.
 
 use std::any::Any;
-use std::ffi::c_char;
+use std::ffi::{c_char, c_void};
 use std::marker::PhantomData;
 use std::sync::Arc;
 
@@ -420,6 +420,11 @@ pub trait Addr<T>: Place<T> {
 trait Run<T>: Send + Sync {
     fn read(&self, f: &mut dyn FnMut(&[T]));
     fn write(&self, f: &mut dyn FnMut(&mut [T]));
+
+    /// The typed pointer a `void *` was made from.
+    fn erased(&self) -> Option<&(dyn Any + Send + Sync)> {
+        None
+    }
 }
 
 /// A scalar variable's cell, a run of one.
@@ -480,6 +485,24 @@ impl<T: Clone + Send> Run<T> for Cells<T> {
         for (cell, v) in cells.iter_mut().zip(copy) {
             ***cell = v;
         }
+    }
+}
+
+/// What a `void *` points into: the typed [`Ptr`] it was made from, which
+/// only a cast back to its type reaches. C's `*p` of a `void *` is an error.
+struct Erased(Box<dyn Any + Send + Sync>);
+
+impl Run<c_void> for Erased {
+    fn read(&self, _: &mut dyn FnMut(&[c_void])) {
+        panic!("dereference of a void pointer")
+    }
+
+    fn write(&self, _: &mut dyn FnMut(&mut [c_void])) {
+        panic!("dereference of a void pointer")
+    }
+
+    fn erased(&self) -> Option<&(dyn Any + Send + Sync)> {
+        Some(&*self.0)
     }
 }
 
@@ -597,6 +620,33 @@ impl<T> Ptr<T> {
         self.0
             .as_ref()
             .map_or(0, |t| t.base.wrapping_add_signed(t.index * size))
+    }
+
+    /// C's conversion to `void *`: the same address, which [`Ptr::cast`]
+    /// turns back into this pointer.
+    pub fn erase(&self) -> Ptr<c_void> {
+        Ptr(self.0.as_ref().map(|_| Target {
+            run: Arc::new(Erased(Box::new(self.clone()))),
+            base: self.addr(),
+            index: 0,
+        }))
+    }
+}
+
+impl Ptr<c_void> {
+    /// C's conversion of a `void *` to a `T *`. Only the type it was made
+    /// from reads what it points to, so another type panics, as does a
+    /// `void *` moved by arithmetic, which C does not define.
+    pub fn cast<T: 'static>(&self) -> Ptr<T> {
+        let Some(t) = &self.0 else {
+            return Ptr(None);
+        };
+        assert_eq!(t.index, 0, "arithmetic on a void pointer");
+        t.run
+            .erased()
+            .and_then(|p| p.downcast_ref::<Ptr<T>>())
+            .expect("cast of a void pointer to another type")
+            .clone()
     }
 }
 
@@ -937,6 +987,32 @@ mod tests {
         assert_eq!(v[2].get(), 7);
         let w: [SeqVar<i32>; 4] = std::array::from_fn(|_| SeqVar::new(0));
         assert!(p != Ptr::from(&w));
+    }
+
+    #[test]
+    fn a_void_pointer_casts_back_to_the_pointer_it_was_made_from() {
+        // void.st: void *p = &x; *(int *)p == x
+        let x = SeqVar::new(42i32);
+        let v = x.ptr().erase();
+        assert!(v == x.ptr().erase());
+        assert_eq!(v.addr(), x.ptr().addr());
+        assert_eq!(v.cast::<i32>().get(), 42);
+        v.cast::<i32>().set(7);
+        assert_eq!(x.get(), 7);
+        assert!(Ptr::<i32>::default().erase().is_null());
+        assert!(Ptr::<std::ffi::c_void>::default().cast::<i32>().is_null());
+    }
+
+    #[test]
+    #[should_panic(expected = "cast of a void pointer to another type")]
+    fn a_void_pointer_cast_to_another_type_panics() {
+        SeqVar::new(42i32).ptr().erase().cast::<f64>();
+    }
+
+    #[test]
+    #[should_panic(expected = "dereference of a void pointer")]
+    fn a_void_pointer_does_not_dereference() {
+        SeqVar::new(42i32).ptr().erase().modify(|_| ());
     }
 
     #[test]

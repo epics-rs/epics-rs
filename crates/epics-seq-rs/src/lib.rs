@@ -55,8 +55,8 @@
 //!   `u8`, `short` and `int16_t` `i16`, `unsigned short` and `uint16_t`
 //!   `u16`, `int` and `int32_t` `i32`, `unsigned int` and `uint32_t` `u32`,
 //!   `long` `i64`, `unsigned long` `u64`, `float` `f32`, `double` `f64`,
-//!   `string` [`SeqString`], `char *` [`CharPtr`], another `T *`
-//!   [`Ptr<T>`]. `char` is written
+//!   `string` [`SeqString`], `char *` [`CharPtr`], `void *`
+//!   `Ptr<c_void>`, another `T *` [`Ptr<T>`]. `char` is written
 //!   `std::ffi::c_char` in full and the run-time types `seqg_rt::...`, so
 //!   a companion imports neither. The outer dimension of a multi-PV
 //!   array is split: `[SeqVar<T>; N]`. A block-local variable is a `let`
@@ -78,7 +78,11 @@
 //!   `p.offset(i).get()`. `p + n` is `p.offset(n)`, `p - q` is
 //!   `p.diff(&q)`, and `==` compares addresses, an array's or a `string`'s
 //!   too, as C's decay makes it. A read or write through null, outside the
-//!   variable, or into a literal panics where C's is undefined.
+//!   variable, or into a literal panics where C's is undefined. A
+//!   `void *` is a `Ptr<c_void>`: C's conversion to it is `p.erase()` and
+//!   from it `v.cast::<T>()`, which panics unless `T` is the type it was
+//!   made from. snc-rs refuses `*v` and arithmetic on it, as ISO C does,
+//!   and a cast of an integer to a pointer, which has no cell to point to.
 //! - C semantics. A value assigned to, or passed as, a numeric of another
 //!   type is emitted `as _`. A C truth value is spelled out as `!= 0` or
 //!   `== 0`. Source parentheses and empty statements are dropped.

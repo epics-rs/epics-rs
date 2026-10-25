@@ -1570,8 +1570,9 @@ struct SharedProcessorInner {
     /// (C++ `pPrevInputArray_`, G5). Released on `EnableCallbacks=0` (B6).
     prev_input_array: Option<PublishedArray>,
     /// Previous array dimensions, for firing an NDDimensions int32-array
-    /// callback when dimensions change (C++ `dimsPrev_`, G8).
-    dims_prev: Vec<i32>,
+    /// callback when dimensions change (C++ `dimsPrev_`, G8). The port
+    /// driver's array read serves the same cell.
+    dims_prev: Arc<parking_lot::Mutex<[i32; crate::ndarray::ND_ARRAY_MAX_DIMS]>>,
     /// Source address selected via the NDArrayAddr PV (C++ `NDArrayAddr`, G6).
     nd_array_addr: i32,
     /// NumThreads as the port's write path accepted it.
@@ -1665,15 +1666,16 @@ impl SharedProcessorInner {
         // compares element-wise over all 10 slots, and posts the full
         // 10-element array (NDPluginDriver.cpp:220-231) — so a caget reads
         // NORD=10 with trailing zeros, not `ndims`.
-        let mut cur_dims = vec![0i32; crate::ndarray::ND_ARRAY_MAX_DIMS];
+        let mut cur_dims = [0i32; crate::ndarray::ND_ARRAY_MAX_DIMS];
         for (slot, d) in cur_dims
             .iter_mut()
             .zip(array.dims.iter().take(crate::ndarray::ND_ARRAY_MAX_DIMS))
         {
             *slot = d.size as i32;
         }
-        (cur_dims != self.dims_prev).then(|| {
-            self.dims_prev = cur_dims.clone();
+        let mut dims_prev = self.dims_prev.lock();
+        (cur_dims != *dims_prev).then(|| {
+            *dims_prev = cur_dims;
             asyn_rs::request::ParamSetValue::array(
                 self.ndarray_params.array_dimensions,
                 0,
@@ -2362,6 +2364,8 @@ pub struct PluginPortDriver {
     owner: Arc<crate::driver::ndarray_driver::ArrayOwner>,
     /// C `pNDArrayPool`, for the base class's pool branch.
     pool: PluginPool,
+    /// C `dimsPrev_`, shared with the data side that updates it.
+    dims_prev: Arc<parking_lot::Mutex<[i32; crate::ndarray::ND_ARRAY_MAX_DIMS]>>,
     /// C `pThreads_.size() != 0`: whether `createCallbackThreads` has run.
     /// A plugin built with blocking callbacks has not, so its configure-line
     /// queueSize stands unfloored until it first goes non-blocking.
@@ -2488,6 +2492,7 @@ impl PluginPortDriver {
             hand_on: Arc::default(),
             owner,
             pool: pool.clone(),
+            dims_prev: Arc::default(),
             callback_threads,
         };
         Ok((driver, processor, pool))
@@ -3166,7 +3171,14 @@ impl PortDriver for PluginPortDriver {
         Ok(self.read_served(buf))
     }
 
-    fn read_int32_array(&mut self, _user: &AsynUser, buf: &mut [i32]) -> AsynResult<usize> {
+    fn read_int32_array(&mut self, user: &AsynUser, buf: &mut [i32]) -> AsynResult<usize> {
+        // C `NDPluginDriver::readInt32Array` (NDPluginDriver.cpp:878-882).
+        if user.reason == self.ndarray_params.array_dimensions {
+            let dims = self.dims_prev.lock();
+            let n = dims.len().min(buf.len());
+            buf[..n].copy_from_slice(&dims[..n]);
+            return Ok(n);
+        }
         Ok(self.read_served(buf))
     }
 
@@ -3463,6 +3475,7 @@ pub fn create_plugin_runtime_with_output<P: NDPluginProcess>(
     // (iocsh.cpp:995, :1123), leaving the C IOC serving without the port. We
     // deviate on purpose: see `port_runtime_unavailable`.
     let hand_on_cell = Arc::clone(&driver.hand_on);
+    let dims_prev = Arc::clone(&driver.dims_prev);
     let (port_runtime, _actor_jh) = create_port_runtime(claim, driver, threads.port_config())
         .unwrap_or_else(|e| port_runtime_unavailable(port_name, &e));
 
@@ -3518,7 +3531,7 @@ pub fn create_plugin_runtime_with_output<P: NDPluginProcess>(
         array_callbacks,
         dropped_arrays: dropped_arrays_counter,
         prev_input_array: None,
-        dims_prev: vec![0i32; crate::ndarray::ND_ARRAY_MAX_DIMS],
+        dims_prev,
         nd_array_addr: source.addr,
         num_threads: PLUGIN_NUM_THREADS,
         threads,
@@ -9833,6 +9846,41 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         };
         assert_eq!(reprocessed.array.array().unique_id, 7);
+    }
+
+    #[test]
+    fn test_dimensions_read_serves_the_last_input_dims() {
+        // C readInt32Array (NDPluginDriver.cpp:878-882) serves dimsPrev_, so
+        // a .PROC of Dimensions_RBV reads the last frame's dims.
+        let (handle, _data_jh) = create_plugin_runtime_with_output(
+            &asyn_rs::asyn_record::claim_port("DIMS_READ_TEST").unwrap(),
+            PassthroughProcessor,
+            1_000_000,
+            10,
+            0,
+            NDArrayOutput::new(),
+            "",
+            test_wiring(),
+            DEFAULT_PLUGIN_THREADS,
+        );
+        enable_callbacks(&handle);
+        let array = NDArray::new(
+            vec![NDDimension::new(3), NDDimension::new(5)],
+            NDDataType::UInt8,
+        );
+        send_array(handle.array_sender(), published(Arc::new(array)));
+        let port = handle.port_runtime().port_handle().clone();
+        let counter = handle.ndarray_params.array_counter;
+        wait_until("the frame to be counted", || {
+            port.read_int32_blocking(counter, 0).is_ok_and(|v| v == 1)
+        });
+        let dims = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(port.read_int32_array(handle.ndarray_params.array_dimensions, 0, 10))
+            .unwrap();
+        assert_eq!(&dims[..], &[3, 5, 0, 0, 0, 0, 0, 0, 0, 0]);
     }
 
     #[test]

@@ -221,6 +221,10 @@ enum CParam {
     Dst,
     /// a number, converted to this type
     Num(&'static str),
+    /// a `char *`, converted as C converts to a pointer type: `0` is null
+    CharPtr,
+    /// a pointer the callee writes through, passed as the place
+    Place,
 }
 
 /// The prototype in scope where SNL code calls a C function, by which gcc
@@ -271,8 +275,9 @@ fn c_prototype(ast: &Ast, name: &str) -> CProto {
 /// The prototype of a C library function `epics_seq_rs::c` supplies, by
 /// which C converts the arguments: its fixed parameters and its result.
 fn prototype(name: &str) -> Option<(&'static [CParam], Ty)> {
-    use CParam::{Dst, Num, Src};
+    use CParam::{CharPtr, Dst, Num, Place, Src};
     let num = |t: &str| Ty::Num(t.into());
+    let char_ptr = || Ty::Ptr(C_CHAR.into());
     Some(match name {
         "strcpy" | "strcat" => (&[Dst, Src], Ty::Unit),
         "strncpy" => (&[Dst, Src, Num("usize")], Ty::Unit),
@@ -286,6 +291,9 @@ fn prototype(name: &str) -> Option<(&'static [CParam], Ty)> {
         "printf" => (&[Src], num("i32")),
         "sprintf" => (&[Dst, Src], num("i32")),
         "sscanf" => (&[Src, Src], num("i32")),
+        "strchr" => (&[CharPtr, Num("i32")], char_ptr()),
+        "strstr" => (&[CharPtr, Src], char_ptr()),
+        "epicsStrtok_r" => (&[CharPtr, Src, Place], char_ptr()),
         _ => return None,
     })
 }
@@ -2067,7 +2075,8 @@ impl<'a> Gen<'a> {
                 }
                 v.e
             }
-            Some(CParam::Src) | None => self.arg_value(ap),
+            Some(CParam::CharPtr) => self.stored(ap, &Ty::Ptr(C_CHAR.into())),
+            Some(CParam::Src | CParam::Place) | None => self.arg_value(ap),
         }
     }
 
@@ -3688,6 +3697,24 @@ mod tests {
                 code.contains(&format!("strcpy(&seqg_var.r, {call})")),
                 "{code}"
             );
+        }
+    }
+
+    #[test]
+    fn a_char_pointer_parameter_converts_its_argument_as_c_does() {
+        // MM4005_trajectoryScan.st:499 epicsStrtok_r(0, ",", &tok_save)
+        let (code, diag) = translate(
+            "program p\nstring s;\nchar *p;\nchar *tok;\nss a {\nstate z {\nwhen () {\n\
+             p = epicsStrtok_r(0, \",\", &tok);\np = strchr(&s[2], ',');\n\
+             p = strstr(s, \"ab\");\n} state z\n}\n}\n",
+        );
+        assert_eq!(diag, "");
+        for stmt in [
+            "seqg_var.p.set(epicsStrtok_r(seqg_rt::CharPtr::default(), \",\", &seqg_var.tok));",
+            "seqg_var.p.set(strchr(seqg_var.s.at(2).ptr(), 44));",
+            "seqg_var.p.set(strstr(seqg_rt::Ptr::from(&seqg_var.s), \"ab\"));",
+        ] {
+            assert!(code.contains(stmt), "{stmt}\n{code}");
         }
     }
 

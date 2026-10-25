@@ -108,10 +108,6 @@ const EXPECTED_FAILURES: &[(&str, &str)] = &[
     ),
     // these wait for C's pointer operations
     (
-        "motor/modules/motorNewport/newportApp/src/MM4005_trajectoryScan.st",
-        "MM4005_trajectoryScan.st:499: error[E0277]: the trait bound `Ptr<i8>: From<{integer}>` is not satisfied: the trait `From<{integer}>` is not implemented for `Ptr<i8>`",
-    ),
-    (
         "motor/modules/motorNewport/newportApp/src/XPS_trajectoryScan.st",
         "XPS_trajectoryScan.st:165: error: snc-rs does not support assignment through a pointer",
     ),

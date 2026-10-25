@@ -480,7 +480,7 @@ pub(crate) fn run_lent(lend: &Lend, claimed: Claimed) -> AsynResult<RequestResul
     let Claimed { op, user, priority } = claimed;
     let mut access = Access::Lent(lend);
     access.with(|actor| actor.lent_gate(&op, &user, priority))??;
-    run_claimed(&mut access, &op, user)
+    run_claimed(&mut access, op, user)
 }
 
 /// A claimed request from the user's linkage to its block settlement — the
@@ -488,10 +488,10 @@ pub(crate) fn run_lent(lend: &Lend, claimed: Claimed) -> AsynResult<RequestResul
 /// actor.
 fn run_claimed(
     access: &mut Access<'_>,
-    op: &RequestOp,
+    op: RequestOp,
     mut user: AsynUser,
 ) -> AsynResult<RequestResult> {
-    let callback = PortActor::c_dispatch(op) != CDispatch::Direct;
+    let callback = PortActor::c_dispatch(&op) != CDispatch::Direct;
     // C runs a callback and a `lockPort` span under `synchronousLock`
     // (asynManager.c:830, :909, :1581, :1800); a direct manager call
     // takes no port lock.
@@ -510,8 +510,16 @@ fn run_claimed(
         actor.link_user(&mut user);
         (callback || matches!(op, RequestOp::LockPort(_))).then(|| actor.sync_lock.hold())
     })?;
-    let result = dispatch(access, &mut user, op);
+    let result = dispatch(access, &mut user, &op);
     drop(held);
+    if let RequestOp::CallParamCallbacks {
+        updates,
+        gate: Some(gate),
+        ..
+    } = op
+    {
+        gate.give_back(updates);
+    }
     if callback {
         access.with(|actor| actor.settle_block(&user))?;
     }
@@ -2326,7 +2334,7 @@ impl PortActor {
             }
             reply => reply,
         };
-        let result = run_claimed(&mut Access::Owned(self), &op, user);
+        let result = run_claimed(&mut Access::Owned(self), op, user);
         if let Reply::Result(reply) = reply {
             let _ = reply.send(result);
         }

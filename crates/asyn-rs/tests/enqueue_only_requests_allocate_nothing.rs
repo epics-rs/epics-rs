@@ -129,7 +129,8 @@ fn set_params_and_notify_allocates_nothing_on_the_posting_thread() {
 }
 
 /// The actor reaches each section's sets before it ends, so every end is
-/// the held one that sends the callbacks on: both requests are counted.
+/// the held one that sends the callbacks on: both requests are counted, and
+/// the sets, built in the `updates` the actor handed back.
 #[test]
 fn a_held_callbacks_gate_section_allocates_nothing_on_the_posting_thread() {
     let (runtime, reason, posts) = port("enqGate");
@@ -137,9 +138,12 @@ fn a_held_callbacks_gate_section_allocates_nothing_on_the_posting_thread() {
     let mut gate = handle.callbacks_gate();
     let mut allocs = 0;
     for i in 1..=2 * N {
-        let updates = set(reason, i);
         let g = &mut gate;
-        let (after, opened) = counted(move || g.open(0, None, updates).unwrap());
+        let (after, opened) = counted(move || {
+            let mut updates = g.updates();
+            updates.push(ParamSetValue::new(reason, 0, ParamValue::Int32(i)));
+            g.open(0, None, updates).unwrap()
+        });
         assert_eq!(handle.read_int32_blocking(reason, 0).unwrap(), i);
         assert_eq!(posts.load(Ordering::SeqCst), i as usize - 1, "held");
         let (r, ended) = counted(|| after.end());

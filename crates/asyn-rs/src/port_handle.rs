@@ -2217,6 +2217,12 @@ pub struct CallbacksGate {
 }
 
 impl CallbacksGate {
+    /// An empty `updates` for [`Self::open`]: the one an earlier section
+    /// left once the actor has run it, so a section's sets allocate nothing.
+    pub fn updates(&self) -> Vec<crate::request::ParamSetValue> {
+        self.sections.updates()
+    }
+
     /// Queue the sets ahead of anything the section causes; the callbacks
     /// fire once the returned [`CallbacksAfter`] ends.
     pub fn open(

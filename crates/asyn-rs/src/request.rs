@@ -1917,7 +1917,19 @@ impl SectionCallbacks {
             Self::Held(sections) => sections.held.lock().drain(..).for_each(flush),
         }
     }
+
+    /// The actor, done with the request: an open section's `updates` go back
+    /// to its caller's gate.
+    pub(crate) fn give_back(self, updates: Vec<ParamSetValue>) {
+        if let Self::Open { sections, .. } = self {
+            sections.give_back(updates);
+        }
+    }
 }
+
+/// The sections the actor may trail its caller by and still hand every
+/// `updates` back.
+const SPARE_UPDATES: usize = 4;
 
 /// One caller's sections, one open at a time. Whichever of the actor (sets
 /// done) and the caller (section ended) comes second fires the callbacks, so
@@ -1930,6 +1942,9 @@ pub struct Sections {
     word: AtomicU64,
     /// The lists whose callbacks the actor holds.
     held: Mutex<Vec<i32>>,
+    /// The `updates` of sections the actor has run, cleared, for the
+    /// caller's next ones.
+    spare: Mutex<Vec<Vec<ParamSetValue>>>,
 }
 
 impl Sections {
@@ -1950,6 +1965,20 @@ impl Sections {
     /// callbacks, which this end then owes.
     pub(crate) fn end(&self, seq: u64) -> bool {
         self.word.swap((seq + 1) << 1, AtomicOrdering::AcqRel) & 1 == 1
+    }
+
+    /// The caller: an empty `updates` for its next section, one the actor
+    /// handed back when there is one.
+    pub(crate) fn updates(&self) -> Vec<ParamSetValue> {
+        self.spare.lock().pop().unwrap_or_default()
+    }
+
+    fn give_back(&self, mut updates: Vec<ParamSetValue>) {
+        updates.clear();
+        let mut spare = self.spare.lock();
+        if spare.len() < SPARE_UPDATES {
+            spare.push(updates);
+        }
     }
 }
 

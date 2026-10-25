@@ -165,6 +165,22 @@ const C_DEFECTS: &[(&str, &str, &str)] = &[
     ),
 ];
 
+/// `diag` with each `%p`'s `0x<hex>` as `0x…`.
+fn mask_addresses(diag: &str) -> String {
+    let mut masked = String::new();
+    let mut rest = diag;
+    while let Some(at) = rest.find("0x") {
+        let digits = rest[at + 2..].trim_start_matches(|c: char| c.is_ascii_hexdigit());
+        masked.push_str(&rest[..at + 2]);
+        if digits.len() < rest.len() - at - 2 {
+            masked.push('…');
+        }
+        rest = digits;
+    }
+    masked.push_str(rest);
+    masked
+}
+
 fn check(stem: &str, report: &Report, golden: &str) {
     let Tap {
         plan,
@@ -195,8 +211,10 @@ fn check(stem: &str, report: &Report, golden: &str) {
     let testok1 = report.results.iter().filter(|r| r.desc.is_none()).count();
     assert_eq!(testok1, c_descs.len(), "{stem}: testOk1 results");
     // Diagnostics as a multiset for the same reason; each is the same in
-    // every C run, rand()'s too, as nothing seeds it.
-    let mut rs_diags = report.diags.clone();
+    // every C run, rand()'s too, as nothing seeds it, but for a `%p`'s
+    // address, which is held only as an address.
+    let mut rs_diags: Vec<_> = report.diags.iter().map(|d| mask_addresses(d)).collect();
+    let mut c_diags: Vec<_> = c_diags.iter().map(|d| mask_addresses(d)).collect();
     rs_diags.sort();
     c_diags.sort();
     assert_eq!(rs_diags, c_diags, "{stem}: testDiag");
@@ -218,6 +236,7 @@ macro_rules! validate {
     };
 }
 
+validate!(array, array::arrayTest, "array", 30);
 validate!(assign, assign::assignTest, "assign", 30);
 validate!(bittypes, bittypes::bittypesTest, "bittypes", 30);
 validate!(change, change::changeTest, "change", 30);
@@ -342,6 +361,7 @@ mod ioc {
         };
     }
 
+    validate_ioc!(array, array::arrayTest, "array", 30);
     validate_ioc!(bittypes, bittypes::bittypesTest, "bittypes", 30);
     validate_ioc!(evflag, evflag::evflagTest, "evflag", 60);
     validate_ioc!(

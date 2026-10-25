@@ -44,6 +44,7 @@ fn main() {
 
 fn seq_validate_programs() -> &'static [&'static str] {
     &[
+        "array",
         "assign",
         "bittypes",
         "change",

@@ -30,6 +30,7 @@ macro_rules! program {
     };
 }
 
+program!(array, "array");
 program!(assign, "assign");
 program!(bittypes, "bittypes");
 program!(change, "change",

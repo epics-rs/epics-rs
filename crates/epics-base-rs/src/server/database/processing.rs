@@ -13596,7 +13596,9 @@ impl PvDatabase {
     /// record whose set is held elsewhere is read here by that holder, at its
     /// release ([`super::owe_read`]). While this thread waits it serves the
     /// reads owed to every set it holds ([`super::ReadWait`]), so two holders
-    /// each reading the other's records do not wait on each other.
+    /// each reading the other's records do not wait on each other. A holder
+    /// that waits for a set this thread holds can do neither, and the read
+    /// fails ([`super::ReadWait::stuck`]).
     pub(crate) fn db_get_snapshot(
         &self,
         name: &[u8],
@@ -13625,7 +13627,8 @@ impl PvDatabase {
         let wait = super::ReadWait::new(read.clone());
         super::owe_read(read.clone());
         loop {
-            if let Some(got) = read.got.lock().take() {
+            // Taken, the read stays answered for `OwedRead::answered`.
+            if let Some(got) = read.got.lock().as_mut().map(Option::take) {
                 return got;
             }
             wait.serve(own);
@@ -13634,6 +13637,11 @@ impl PvDatabase {
             if let Some(got) = self.db_get_held(&cell, &read.field, own) {
                 *read.got.lock() = Some(None);
                 return got;
+            }
+            // Neither this thread nor that holder can let go first. C's
+            // `dbGet` reads the record unlocked, which no thread here may.
+            if wait.stuck() {
+                return None;
             }
             std::thread::park_timeout(std::time::Duration::from_millis(1));
         }
@@ -13672,6 +13680,19 @@ struct OwedDbGet {
 impl super::OwedRead for OwedDbGet {
     fn cell(&self) -> &RecordCell {
         &self.cell
+    }
+
+    fn answered(&self) -> bool {
+        self.got.lock().is_some()
+    }
+
+    fn claim(&self) -> bool {
+        let mut got = self.got.lock();
+        if got.is_some() {
+            return false;
+        }
+        *got = Some(None);
+        true
     }
 
     fn serve(&self, own: Option<(&RecordCell, OwnRecord<'_>)>) {

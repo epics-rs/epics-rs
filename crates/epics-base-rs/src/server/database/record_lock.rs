@@ -359,7 +359,8 @@ use crate::server::record::RecordCell;
 use crate::server::record::record_instance::{HeldMut, RecordRef};
 
 use crate::runtime::sync::{
-    CMutex, MutexInfo, PriorityInheritanceMutex, PriorityInheritanceMutexGuard, mutex_report,
+    CMutex, MutexInfo, PriorityInheritanceMutex, PriorityInheritanceMutexGuard,
+    UnlistedPriorityInheritanceMutex, mutex_report,
 };
 
 use super::PvDatabase;
@@ -449,6 +450,10 @@ pub(crate) trait OwedRead: Send + Sync {
     /// Read now. `own` is the serving thread's own record, borrowed by its
     /// processing, when it serves from a [`ReadWait`].
     fn serve(&self, own: Option<(&RecordCell, crate::server::record::OwnRecord<'_>)>);
+    /// Whether the read has its answer.
+    fn answered(&self) -> bool;
+    /// Answer the read with nothing, unless it has its answer already.
+    fn claim(&self) -> bool;
 }
 
 // SAFETY: `held` is the one non-`Sync` field, and it is read or written only
@@ -683,7 +688,7 @@ pub(crate) fn owe_read(read: Arc<dyn OwedRead>) {
         .push(read);
     set.release_owed.fetch_or(OWED_READS, Ordering::Release);
     let owner = set.owner.load(Ordering::Acquire);
-    let waits = WAITS.lock().unwrap_or_else(|e| e.into_inner());
+    let waits = WAITS.lock();
     if let Some(wait) = waits.reading.iter().find(|w| w.key == owner) {
         wait.owed
             .lock()
@@ -702,14 +707,83 @@ struct Waiter {
     owed: std::sync::Mutex<Vec<Set>>,
 }
 
+/// A thread waiting in [`LockSet::lock_taking`] for the set `taking`, null
+/// once it has it. It lives on that thread's stack, linked into
+/// [`Waits::taking`] for the wait only, so a wait allocates nothing.
+struct Taker {
+    key: u64,
+    taking: AtomicPtr<LockSet>,
+    /// The next linked taker, under [`WAITS`].
+    next: AtomicPtr<Taker>,
+}
+
+/// A [`Taker`] linked into [`Waits::taking`] while this lives.
+struct Linked<'a>(&'a Taker);
+
+impl<'a> Linked<'a> {
+    fn new(taker: &'a Taker) -> Self {
+        let waits = WAITS.lock();
+        taker
+            .next
+            .store(waits.taking.load(Ordering::Relaxed), Ordering::Relaxed);
+        waits
+            .taking
+            .store(std::ptr::from_ref(taker).cast_mut(), Ordering::Relaxed);
+        Self(taker)
+    }
+}
+
+impl Drop for Linked<'_> {
+    fn drop(&mut self) {
+        let waits = WAITS.lock();
+        let me = std::ptr::from_ref(self.0).cast_mut();
+        let mut link = &waits.taking;
+        while link.load(Ordering::Relaxed) != me {
+            // SAFETY: as in `Waits::takers`; this taker is linked, so the
+            // walk meets it before the end.
+            link = unsafe { &(*link.load(Ordering::Relaxed)).next };
+        }
+        link.store(self.0.next.load(Ordering::Relaxed), Ordering::Relaxed);
+    }
+}
+
 /// The threads that wait while they may hold sets.
 struct Waits {
     reading: Vec<Arc<Waiter>>,
+    /// The first linked [`Taker`].
+    taking: AtomicPtr<Taker>,
 }
 
-static WAITS: std::sync::Mutex<Waits> = std::sync::Mutex::new(Waits {
-    reading: Vec::new(),
-});
+impl Waits {
+    fn takers(&self) -> impl Iterator<Item = &Taker> {
+        let mut next = self.taking.load(Ordering::Relaxed);
+        std::iter::from_fn(move || {
+            // SAFETY: a taker unlinks under `WAITS` before its frame ends, and
+            // `self` is reached only through that lock.
+            let taker = unsafe { next.as_ref() }?;
+            next = taker.next.load(Ordering::Relaxed);
+            Some(taker)
+        })
+    }
+}
+
+/// Priority-inheriting, since a contended [`LockSet::lock_fresh`] takes it;
+/// built by [`new_set`], so no wait builds it.
+static WAITS: std::sync::LazyLock<UnlistedPriorityInheritanceMutex<Waits>> =
+    std::sync::LazyLock::new(|| {
+        UnlistedPriorityInheritanceMutex::new(Waits {
+            reading: Vec::new(),
+            taking: AtomicPtr::new(std::ptr::null_mut()),
+        })
+    });
+
+/// One link of the chain [`ReadWait::stuck`] follows.
+enum Hop<'a> {
+    /// A holder waiting for this set.
+    Takes(&'a Taker, Set),
+    /// A holder waiting for this read.
+    Reads(&'a Waiter),
+}
 
 /// This thread waiting for `read`, which it owed: a read owed to any set it
 /// holds is served from here ([`Self::serve`]), its own record's or not, and
@@ -721,7 +795,7 @@ pub(crate) struct ReadWait(Arc<Waiter>);
 impl ReadWait {
     pub(crate) fn new(read: Arc<dyn OwedRead>) -> Self {
         let key = thread_key();
-        let mut waits = WAITS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut waits = WAITS.lock();
         // Every owed read's reader waits in a `ReadWait`, so the reads owed
         // to this thread's sets before now are among theirs.
         let owed = waits
@@ -754,15 +828,75 @@ impl ReadWait {
             }
         }
     }
+
+    /// Whether the holder of the record read waits in
+    /// [`LockSet::lock_fresh`] for a set this thread holds, directly or
+    /// through holders that wait in turn: it can neither serve the read nor
+    /// let go, and the read is claimed, unanswered, for the caller to fail.
+    /// A holder waiting on a read of its own serves this one, so a chain
+    /// ends free at one, or at a read this thread serves.
+    pub(crate) fn stuck(&self) -> bool {
+        let me = self.0.key;
+        let waits = WAITS.lock();
+        let owner = |set: Set| set.owner.load(Ordering::Acquire);
+        let read_owner = |w: &Waiter| owner(w.read.cell().lock_record().set());
+        let mut chain = Vec::new();
+        let mut holder = read_owner(&self.0);
+        for _ in 0..waits.takers().count() {
+            let Some(taker) = waits.takers().find(|t| t.key == holder) else {
+                return false;
+            };
+            let set = taker.taking.load(Ordering::Acquire);
+            if set.is_null() {
+                return false;
+            }
+            // SAFETY: `lock_fresh` publishes its `&'static self`.
+            let set: Set = unsafe { &*set };
+            chain.push(Hop::Takes(taker, set));
+            holder = owner(set);
+            if holder == me {
+                break;
+            }
+            if let Some(reader) = waits.reading.iter().find(|w| w.key == holder) {
+                holder = read_owner(reader);
+                if reader.read.answered() || holder == me {
+                    return false;
+                }
+                chain.push(Hop::Reads(reader));
+            }
+        }
+        if holder != me {
+            return false;
+        }
+        // Read again from the last hop back: the last taker waits for a set
+        // this thread keeps, so it stays put, and so then does each holder
+        // it waits behind.
+        let mut next = me;
+        for hop in chain.iter().rev() {
+            next = match *hop {
+                Hop::Takes(taker, set) => {
+                    if !std::ptr::eq(taker.taking.load(Ordering::Acquire), set)
+                        || owner(set) != next
+                    {
+                        return false;
+                    }
+                    taker.key
+                }
+                Hop::Reads(reader) => {
+                    if read_owner(reader) != next || reader.read.answered() {
+                        return false;
+                    }
+                    reader.key
+                }
+            };
+        }
+        read_owner(&self.0) == next && self.0.read.claim()
+    }
 }
 
 impl Drop for ReadWait {
     fn drop(&mut self) {
-        WAITS
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .reading
-            .retain(|w| !Arc::ptr_eq(w, &self.0));
+        WAITS.lock().reading.retain(|w| !Arc::ptr_eq(w, &self.0));
     }
 }
 
@@ -841,6 +975,7 @@ const FIRST_SET_ID: u64 = 2;
 
 /// Mint one set. Every `LockSet` in the process comes from here.
 fn new_set(id: u64) -> Set {
+    std::sync::LazyLock::force(&WAITS);
     let lock = PriorityInheritanceMutex::new((), CMutex::LockSet);
     // The mutex names its own row, so no two sets can be confused for each
     // other and nothing has to be serialised against the process mutex list.
@@ -1065,7 +1200,10 @@ impl LockSet {
     /// Take the mutex on a thread that does not hold it and publish the hold.
     fn lock_fresh(&'static self, me: u64) {
         Self::debug_check_fresh();
-        let guard = self.lock.lock();
+        let guard = match self.lock.try_lock() {
+            Some(guard) => guard,
+            None => self.lock_taking(me),
+        };
         // SAFETY: this thread holds `lock`, so it is the only one allowed at
         // `held` (see the `Sync` impl).
         // `held` is `None` whenever the mutex is free (`unlock_outermost` takes it
@@ -1076,6 +1214,22 @@ impl LockSet {
         #[cfg(debug_assertions)]
         SETS_HELD.with(|n| n.set(n.get() + 1));
         self.admit_owed();
+    }
+
+    /// Wait for the mutex linked as a [`Taker`] of this set, for
+    /// [`ReadWait::stuck`].
+    #[cold]
+    #[inline(never)]
+    fn lock_taking(&'static self, me: u64) -> PriorityInheritanceMutexGuard<'static, ()> {
+        let taker = Taker {
+            key: me,
+            taking: AtomicPtr::new(std::ptr::from_ref(self).cast_mut()),
+            next: AtomicPtr::new(std::ptr::null_mut()),
+        };
+        let _linked = Linked::new(&taker);
+        let guard = self.lock.lock();
+        taker.taking.store(std::ptr::null_mut(), Ordering::Release);
+        guard
     }
 
     /// Run what [`owe_cvt`] left on this set. Called wherever a hold is taken

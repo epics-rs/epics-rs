@@ -468,3 +468,82 @@ async fn a_holder_serves_a_read_owed_before_it_waits() {
         assert_eq!(got, Some(EpicsValue::Double(10.0)), "{me}");
     }
 }
+
+/// One thread holds AI and takes AO's set; the other holds AO and reads AI.
+/// C's `dbGet` reads AI unlocked, so both finish. Here AI's holder waits on
+/// a set the reader holds and can serve nothing: the read is refused.
+#[epics_macros_rs::epics_test]
+async fn a_read_whose_holder_waits_on_the_reader_is_refused() {
+    let db = ioc().await;
+    let both = Arc::new(std::sync::Barrier::new(2));
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    {
+        let (h, both, done) = (db.async_handle(), both.clone(), done_tx.clone());
+        std::thread::spawn(move || {
+            h.with_own("AI", |_, _| {
+                both.wait();
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                h.with_record("AO", |_| ());
+            });
+            done.send(("AI", None)).unwrap();
+        });
+    }
+    {
+        let (h, both, done) = (db.async_handle(), both.clone(), done_tx.clone());
+        std::thread::spawn(move || {
+            let got = h.with_own("AO", |rec, own| {
+                both.wait();
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                h.db_get("AI.VAL", DbFieldType::Double, 1, Some(own.of(&*rec)))
+                    .map(|s| s.value)
+            });
+            done.send(("AO", got.flatten())).unwrap();
+        });
+    }
+    let wait = std::time::Duration::from_secs(10);
+    for _ in 0..2 {
+        let (me, got) = done_rx.recv_timeout(wait).expect("both threads finish");
+        assert_eq!(got, None, "{me}");
+    }
+}
+
+/// The holder of AI waits for M, whose holder waits for AO, which the reader
+/// of AI holds: a chain of takers ends at the reader, and the read fails.
+/// C's `dbGet` would read AI's 10 unlocked.
+#[epics_macros_rs::epics_test]
+async fn a_read_whose_holder_waits_behind_another_on_the_reader_is_refused() {
+    let db = ioc().await;
+    let all = Arc::new(std::sync::Barrier::new(3));
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let ms = std::time::Duration::from_millis;
+    let take = |me: &'static str, then: &'static str, after| {
+        let (h, all, done) = (db.async_handle(), all.clone(), done_tx.clone());
+        std::thread::spawn(move || {
+            h.with_held(me, |_| {
+                all.wait();
+                std::thread::sleep(ms(after));
+                h.with_record(then, |_| ());
+            });
+            done.send((me, None)).unwrap();
+        })
+    };
+    take("AI", "M", 30);
+    take("M", "AO", 60);
+    {
+        let (h, all, done) = (db.async_handle(), all.clone(), done_tx.clone());
+        std::thread::spawn(move || {
+            let got = h.with_held("AO", |_| {
+                all.wait();
+                std::thread::sleep(ms(100));
+                h.db_get("AI.HOPR", DbFieldType::Double, 1, None)
+                    .map(|s| s.value)
+            });
+            done.send(("AO", got.flatten())).unwrap();
+        });
+    }
+    let wait = std::time::Duration::from_secs(10);
+    for _ in 0..3 {
+        let (me, got) = done_rx.recv_timeout(wait).expect("all three finish");
+        assert_eq!(got, None, "{me}");
+    }
+}

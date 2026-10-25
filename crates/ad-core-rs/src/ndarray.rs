@@ -857,6 +857,12 @@ impl NDArray {
         }
     }
 
+    /// An array of nothing, off any pool: what a kept shared allocation holds
+    /// until its next share. Allocates nothing.
+    pub(crate) fn vacant() -> Self {
+        Self::with_data(Vec::new(), NDDataBuffer::default())
+    }
+
     /// The pool that allocated this array (C++ `pNDArrayPool`), `None` when it
     /// came from no pool or that pool is gone.
     pub fn pool(&self) -> Option<std::sync::Arc<NDArrayPool>> {

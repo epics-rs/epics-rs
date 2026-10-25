@@ -57,6 +57,10 @@ pub struct NDArrayPool {
     allocated_bytes: AtomicU64,
     next_unique_id: AtomicI32,
     free_list: Mutex<Vec<FreeBuffer>>,
+    /// The allocations published arrays were shared in, vacant since their
+    /// last holder let go: what C keeps of an `NDArray` object on its free
+    /// list (NDArrayPool.cpp:365) besides the buffer, for the next share.
+    spares: Mutex<Vec<Arc<NDArray>>>,
     num_alloc_buffers: AtomicU32,
     num_free_buffers: AtomicU32,
 }
@@ -85,6 +89,7 @@ impl NDArrayPool {
             allocated_bytes: AtomicU64::new(0),
             next_unique_id: AtomicI32::new(1),
             free_list: Mutex::new(Vec::new()),
+            spares: Mutex::new(Vec::new()),
             num_alloc_buffers: AtomicU32::new(0),
             num_free_buffers: AtomicU32::new(0),
         })
@@ -362,8 +367,34 @@ impl NDArrayPool {
         self.num_free_buffers.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// `array` shared, in a kept allocation when there is one.
+    pub(crate) fn shared(&self, array: NDArray) -> Arc<NDArray> {
+        let spare = self.spares.lock().pop();
+        match spare {
+            Some(mut spare) => match Arc::get_mut(&mut spare) {
+                Some(slot) => {
+                    *slot = array;
+                    spare
+                }
+                // Its last holder had not quite let go.
+                None => Arc::new(array),
+            },
+            None => Arc::new(array),
+        }
+    }
+
+    /// Keep a vacant `spare` for [`Self::shared`]: no more than the buffers
+    /// the pool has charged, one of which every share of it holds.
+    fn keep_spare(&self, spare: Arc<NDArray>) {
+        let mut spares = self.spares.lock();
+        if spares.len() < self.num_alloc_buffers() as usize {
+            spares.push(spare);
+        }
+    }
+
     /// Clear all entries from the free list.
     pub fn empty_free_list(&self) {
+        self.spares.lock().clear();
         let mut free = self.free_list.lock();
         let count = free.len() as u32;
         for buf in free.drain(..) {
@@ -680,7 +711,7 @@ impl DriverArray {
     /// Hand the array over for publishing; nothing mutates it after this.
     pub fn share(self) -> PublishedArray {
         PublishedArray {
-            array: Arc::new(self.array),
+            array: self.pool.shared(self.array),
             pool: self.pool,
         }
     }
@@ -726,16 +757,27 @@ impl PublishedArray {
     }
 
     /// Back to the driver to change, when this is the array's last holder.
-    pub fn try_into_driver(self) -> Result<DriverArray, PublishedArray> {
-        match Arc::try_unwrap(self.array) {
-            Ok(array) => Ok(DriverArray {
-                array,
-                pool: self.pool,
-            }),
-            Err(array) => Err(PublishedArray {
-                array,
-                pool: self.pool,
-            }),
+    pub fn try_into_driver(mut self) -> Result<DriverArray, PublishedArray> {
+        let Some(slot) = Arc::get_mut(&mut self.array) else {
+            return Err(self);
+        };
+        Ok(DriverArray {
+            array: std::mem::replace(slot, NDArray::vacant()),
+            pool: self.pool.clone(),
+        })
+    }
+}
+
+/// The last holder lets the array go as any drop does, and its pool keeps the
+/// allocation it was shared in.
+impl Drop for PublishedArray {
+    fn drop(&mut self) {
+        if Arc::strong_count(&self.array) == 1
+            && let Some(slot) = Arc::get_mut(&mut self.array)
+        {
+            drop(std::mem::replace(slot, NDArray::vacant()));
+            // The field's own drop, next, leaves the pool its one holder.
+            self.pool.keep_spare(Arc::clone(&self.array));
         }
     }
 }
@@ -852,7 +894,7 @@ impl PersistentArray {
                     copy.tie(PoolOnly(()), PoolTie::Shared(charge.clone()));
                 }
                 PublishedArray {
-                    array: Arc::new(copy),
+                    array: self.array.pool.shared(copy),
                     pool: self.array.pool.clone(),
                 }
             })
@@ -957,6 +999,66 @@ mod tests {
         };
         copy.fill().data_mut().resize(3);
         assert_eq!(copy.data().len(), 2);
+    }
+
+    /// C's last `release` puts the whole `NDArray` back on the free list
+    /// (NDArrayPool.cpp:362-365): the buffer is free once the last publish
+    /// goes, and the next share is in the allocation that publish held.
+    #[test]
+    fn the_last_publish_leaves_its_allocation_to_the_next_share() {
+        let pool = DriverPool::standalone(0);
+        let alloc = || {
+            pool.alloc(vec![NDDimension::new(2)], NDDataType::Int32)
+                .unwrap()
+        };
+        let first = alloc().share();
+        let held = first.clone();
+        let at = Arc::as_ptr(first.array());
+        drop(first);
+        assert_eq!(pool.num_free_buffers(), 0, "still held");
+        drop(held);
+        assert_eq!((pool.num_alloc_buffers(), pool.num_free_buffers()), (1, 1));
+
+        let next = alloc().share();
+        assert_eq!(Arc::as_ptr(next.array()), at);
+        assert_eq!((next.data().len(), next.pool_id()), (2, pool.id()));
+        assert_eq!(pool.num_free_buffers(), 0);
+    }
+
+    /// A last holder outside any publish frees the allocation; the buffer
+    /// still goes back.
+    #[test]
+    fn a_last_plain_holder_frees_the_allocation() {
+        let pool = DriverPool::standalone(0);
+        let published = pool
+            .alloc(vec![NDDimension::new(2)], NDDataType::Int32)
+            .unwrap()
+            .share();
+        let plain = Arc::clone(published.array());
+        drop(published);
+        drop(plain);
+        assert_eq!((pool.num_alloc_buffers(), pool.num_free_buffers()), (1, 1));
+        assert!(pool.spares.lock().is_empty());
+    }
+
+    /// Allocations a plugin made itself, which the pool never shares in, are
+    /// kept no further than the buffers the pool charged, and
+    /// `empty_free_list` lets them go with the buffers.
+    #[test]
+    fn the_pool_keeps_no_more_allocations_than_buffers() {
+        let pool = DriverPool::standalone(0);
+        for _ in 0..8 {
+            let own = Arc::new(
+                pool.pool()
+                    .alloc(vec![NDDimension::new(2)], NDDataType::Int32)
+                    .unwrap(),
+            );
+            drop(pool.publishable(own, None, false).unwrap());
+        }
+        assert_eq!(pool.num_alloc_buffers(), 1);
+        assert_eq!(pool.spares.lock().len(), 1);
+        pool.empty_free_list();
+        assert!(pool.spares.lock().is_empty());
     }
 
     /// The in-place form of the buffer swaps [`NDArray`] refuses to compile:

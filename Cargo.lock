@@ -2277,10 +2277,13 @@ dependencies = [
 name = "mca-rs"
 version = "0.32.0"
 dependencies = [
+ "asyn-rs",
  "chrono",
  "epics-base-rs",
  "epics-ca-rs",
  "epics-libcom-rs",
+ "epics-seq-rs",
+ "epics-snc-rs",
  "tokio",
 ]
 

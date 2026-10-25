@@ -1,0 +1,50 @@
+# The records of SIS38XX.template that SIS38XX_SNL.st reaches, with the
+# driver's HardwareAcquiring a soft bi and the Asyn record on no port, and
+# two soft mca records, each counting its processing in a calc.
+
+record(bi,"$(P)SNL_Connected") {
+  field(ZNAM, "Not connected")
+  field(ZSV,  "MAJOR")
+  field(ONAM, "Connected")
+  field(OSV,  "NO_ALARM")
+}
+
+record(busy,"$(P)Acquiring") {
+  field(ZNAM, "Done")
+  field(ONAM, "Acquiring")
+}
+
+record(bi,"$(P)HardwareAcquiring") {
+  field(ZNAM, "Done")
+  field(ONAM, "Acquiring")
+}
+
+record(bo,"$(P)DoReadAll") {
+  field(ZNAM, "Done")
+  field(ONAM, "Read")
+}
+
+record(asyn, "$(P)Asyn") {
+}
+
+record(mca, "$(P)$(R)1") {
+  field(DTYP, "Soft Channel")
+  field(NMAX, "4")
+  field(FLNK, "$(P)$(R)1:reads")
+}
+
+record(calc, "$(P)$(R)1:reads") {
+  field(INPA, "$(P)$(R)1:reads NPP")
+  field(CALC, "A+1")
+}
+
+record(mca, "$(P)$(R)2") {
+  field(DTYP, "Soft Channel")
+  field(NMAX, "4")
+  field(FLNK, "$(P)$(R)2:reads")
+}
+
+record(calc, "$(P)$(R)2:reads") {
+  field(INPA, "$(P)$(R)2:reads NPP")
+  field(CALC, "A+1")
+}

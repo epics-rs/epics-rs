@@ -53,6 +53,7 @@
 //! third-party) are outside this table and carry no pin.
 
 pub mod record;
+pub mod snl;
 pub mod soft;
 
 pub use record::McaRecord;
@@ -66,6 +67,14 @@ pub fn mca_record_factory() -> (&'static str, epics_base_rs::server::RecordFacto
     epics_base_rs::server::record::register_contributed_dbd(&record::dbd_generated::DBD);
     epics_base_rs::server::iocsh::vars::register_variable(record::debug_var());
     ("mca", Box::new(|| Box::new(McaRecord::default())))
+}
+
+/// The `registrar(SIS38XX_SNLRegistrar)` line of `SIS38XXSupport.dbd`:
+/// `SIS38XX_SNL` becomes startable by the shell's `seq` command, which the
+/// registration adds. The VME SIS3801/SIS3820 drivers that dbd registers
+/// too are not ported. Idempotent.
+pub fn register_sis38xx_dbd() {
+    snl::sis38xx_snl::SIS38XX_SNLRegistrar();
 }
 
 /// Register the `mca` record type in the global registry (legacy path; prefer

@@ -11,9 +11,15 @@ repository.workspace = true
 chrono = "0.4"
 epics-base-rs = { workspace = true }
 epics-libcom-rs = { workspace = true }
+epics-seq-rs = { workspace = true }
+
+[build-dependencies]
+epics-snc-rs = { workspace = true }
 
 [features]
 
 [dev-dependencies]
+# SIS38XX.template's Asyn record, whose TB1 SIS38XX_SNL.st monitors.
+asyn-rs = { workspace = true }
 epics-ca-rs = { workspace = true }
 tokio = { version = "1", features = ["full", "test-util"] }

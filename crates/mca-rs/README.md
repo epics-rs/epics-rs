@@ -32,6 +32,7 @@ resolution, so `dbd/cvt_dbaddr.types` records the served type and the
 | `record::roi` | `sum_ROIs` + the `PROCESS_ROI` macro | the region sums, net counts and preset-reached edge |
 | `record::dbd_generated` | `mcaRecord.dbd` | the generated field table |
 | `soft` | `devMCA_soft.c` | the `"Soft Channel"` device support |
+| `snl::sis38xx_snl` | `mcaApp/SISSrc/SIS38XX_SNL.st` | the upstream program, compiled by epics-snc-rs and run on epics-seq-rs; `register_sis38xx_dbd` makes it startable by `seq` (the VME SIS3801/SIS3820 drivers are not ported) |
 
 ## Three places the port is structurally different
 

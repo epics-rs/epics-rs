@@ -43,4 +43,6 @@ fn main() {
     } else {
         println!("cargo::rustc-cfg=tokio_backend");
     }
+
+    epics_snc_rs::build::compile_dir("src/snl");
 }

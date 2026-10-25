@@ -11,6 +11,7 @@ epics-snc-rs and it runs on epics-seq-rs.
 | Federal ERO-1071 encoder reader | `snl::federal` | `db/Federal.db` |
 | Keithley 2000/2700 DMM, 40-channel scanner | `snl::keithley2k_dmm_mf40` | `db/Keithley2kDMM_mf40.db` |
 | Keithley 6517A electrometer, 10-channel scanner | `snl::keithley65xx_em` | `db/Keithley65xxEM.db` |
+| Oxford Cryostream 800 controller | `snl::oxford_cs800` | `db/Oxford_CS800.db`, `db/Oxford_CS800_status.db` |
 
 `db/` is vendored from `ipApp/Db` unchanged, so an `st.cmd` that loads
 `$(IP)/db/Federal.db` resolves when `IP` is set to [`IP_DIR`](src/lib.rs).
@@ -31,6 +32,9 @@ seq &Federal, "P=xxx:,S=s1"
 
 The templates' records come from base, asyn (`asyn`) and calc
 (`scalcout`); the IOC registers those record types itself.
+`Oxford_CS800.db`'s command records are StreamDevice's (`stream`, from
+epics-stream-rs), reading `db/Oxford_CS800.proto` through
+`STREAM_PROTOCOL_PATH`.
 
 `devXxStrParm` (`asyn <xx> stringParm`) is [`strparm`](src/strparm.rs): its
 `device()` lines of `ipSupport.dbd` are `strparm::DEVICE_ROWS`, served by

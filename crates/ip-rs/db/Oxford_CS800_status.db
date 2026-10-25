@@ -1,0 +1,27 @@
+
+# file: Oxford_CS800_status.db
+# purpose: EPICS PV for UDP status packets from CS800 controllers
+
+# MACRO PARAMETERS
+#
+# MACRO         | EXAMPLE         | DEFINITION
+# ------------- | --------------- | ----------------------
+# P             | xxx:            | IOC prefix
+# R             | CS:             | CS800 shared asyn status database prefix
+# SP            | CS800_STATUS_IP | CS800 shared asyn status port
+
+record(asyn,"$(P)$(R)status_packet")
+{
+    field(DESC, "status updates from CS800s")
+    field(DTYP, "asynRecordDevice")
+    field(PORT, "$(SP)")
+    field(ADDR, 0)
+    field(OMAX, 1000)
+    field(IMAX, 1000)
+    field(NRRD, 928)
+    field(TMOD, "Read")
+    field(TMOT, 1.0)
+    field(IFMT, "Binary")
+    field(SCAN, ".1 second")
+    field(PINI, "YES")
+}

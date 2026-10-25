@@ -1,0 +1,866 @@
+
+# Oxford provides documentation on the protocol on request.
+# Units and conversion factors are deduced empirically.
+
+# MACRO PARAMETERS
+#
+# MACRO         | EXAMPLE     | DEFINITION
+# ------------- | ----------- | ----------------------
+# DISABLE_COMMS | 0           | (optional) comms are disabled (1) or not (0: default) on startup
+# P             | xxx:        | IOC prefix
+# R             | CS0:        | controller's database prefix
+# CP            | CS800_CMD0  | controller's asyn command port
+
+record(mbbo, "$(P)$(R)DEBUG")
+{
+  field(DESC, "SNL diagnostics level")
+  field(RVAL, 2)
+  field(ZRST, "off")
+  field(ONST, "error")
+  field(TWST, "warning")
+  field(THST, "info")
+  field(FRST, "debug")
+  field(PINI, "YES")
+}
+
+record(bo, "$(P)$(R)DISABLE") {
+  field(DESC, "Disable comms")
+  field(PINI, "YES")
+  field(VAL,  "$(DISABLE_COMMS=1)")
+  field(OMSL, "supervisory")
+  field(ZNAM, "Enabled")
+  field(ONAM, "Disabled")
+}
+
+#record(asyn,"$(P)$(R)command_port")
+#{
+#    field(DESC, "Commands to a CS800 controller")
+#    field(DTYP, "asynRecordDevice")
+#    field(PORT, "$(CP)")
+#    field(ADDR, 0)
+#    field(OMAX, 1000)
+#    field(IMAX, 1000)
+#    field(TMOD, "Write")
+#    field(TMOT, 1.0)
+#    field(OFMT, "Binary")
+#}
+
+#########################################################
+# status (input from controller on port 30304)
+
+# Param id 1000
+record(ai, "$(P)$(R)DEVICETYPE") {
+  field(DESC, "Cryo stream device type")
+  field(DTYP, "Raw Soft Channel")
+  field(PINI, "YES")
+}
+
+# Param id 1001
+record(ai, "$(P)$(R)DEVICESUBTYPE") {
+  field(DESC, "Cryo stream device sub type")
+  field(DTYP, "Raw Soft Channel")
+  field(PINI, "YES")
+}
+
+# Param id 1002
+record(ai, "$(P)$(R)DEVICEMINTEMP") {
+  field(DESC, "Device minimum temp")
+  field(DTYP, "Raw Soft Channel")
+  field(PINI, "YES")
+  field(LINR, "LINEAR")
+  field(ESLO, "0.01")
+  field(EOFF, "0")
+  field(PREC, 2)
+  field(EGU, "K")
+  field(LOPR, 80)
+  field(HOPR, 400)
+}
+
+# Param id 1003
+record(ai, "$(P)$(R)DEVICEMAXTEMP") {
+  field(DESC, "Device maximum temp")
+  field(DTYP, "Raw Soft Channel")
+  field(PINI, "YES")
+  field(LINR, "LINEAR")
+  field(ESLO, "0.01")
+  field(EOFF, "0")
+  field(PREC, 2)
+  field(EGU, "K")
+  field(LOPR, 80)
+  field(HOPR, 400)
+}
+
+# Param id 1004
+record(ai, "$(P)$(R)VER") {
+  field(DESC, "Software Version")
+  field(DTYP, "Raw Soft Channel")
+  field(PINI, "YES")
+}
+
+
+# Param id 1053
+record(mbbi, "$(P)$(R)RUNMODE") {
+  field(DESC, "Run Mode")
+  field(DTYP, "Raw Soft Channel")
+  field(PINI, "YES")
+  field(ZRVL, "0")
+  field(ONVL, "1")
+  field(TWVL, "2")
+  field(THVL, "3")
+  field(FRVL, "4")
+  field(FVVL, "5")
+  field(SXVL, "6")
+  field(ZRST, "Startup")
+  field(ONST, "Startup Fail")
+  field(TWST, "Startup OK")
+  field(THST, "Run")
+  field(FRST, "Setup")
+  field(FVST, "Shutdown OK")
+  field(SXST, "Shutdown Fail")
+}
+
+# param id 1054
+record(mbbi, "$(P)$(R)PHASE") {
+  field(DESC, "Phase ID")
+  field(DTYP, "Raw Soft Channel")
+  field(PINI, "YES")
+  field(ZRVL, "0")
+  field(ONVL, "1")
+  field(TWVL, "2")
+  field(THVL, "3")
+  field(FRVL, "4")
+  field(FVVL, "5")
+  field(SXVL, "6")
+  field(SVVL, "7")
+  field(EIVL, "8")
+  field(NIVL, "9")
+  field(TEVL, "10")
+  field(ZRST, "Ramp")
+  field(ONST, "Cool")
+  field(TWST, "Plat")
+  field(THST, "Hold")
+  field(FRST, "End")
+  field(FVST, "Purge")
+  field(SXST, "Delete Phase")
+  field(SVST, "Load Program")
+  field(EIST, "Save Program")
+  field(NIST, "Soak")
+  field(TEST, "Wait")
+}
+
+
+# Param id 1055
+record(ai, "$(P)$(R)RAMPRATE") {
+  field(DESC, "Ramp Rate")
+  field(DTYP, "Raw Soft Channel")
+  field(PINI, "YES")
+  field(LINR, "LINEAR")
+  # field(ESLO, "0.00547798886091")
+  # field(EOFF, "1")
+  # field(PREC, 2)
+  field(ESLO, "1")
+  field(EOFF, "0")
+  field(PREC, "0")
+  field(EGU, "K/hour")
+}
+
+# Param id 1056
+record(ai, "$(P)$(R)TARGETTEMP") {
+  field(DESC, "Target Temperature")
+  field(DTYP, "Raw Soft Channel")
+  field(PINI, "YES")
+  field(LINR, "LINEAR")
+  field(ESLO, "0.01")
+  field(EOFF, "0")
+  field(PREC, 2)
+  field(EGU, "K")
+  field(LOPR, 80)
+  field(HOPR, 400)
+}
+
+# Param id 1057
+record(ai, "$(P)$(R)EVAPTEMP") {
+  field(DESC, "Evap Temperature")
+  field(DTYP, "Raw Soft Channel")
+  field(PINI, "YES")
+  field(LINR, "LINEAR")
+  field(ESLO, "0.01")
+  field(EOFF, "0")
+  field(PREC, 2)
+  field(EGU, "K")
+  field(LOPR, 80)
+  field(HOPR, 400)
+}
+
+# Param id 1058
+record(ai, "$(P)$(R)SUCTTEMP") {
+  field(DESC, "Suct Temperature")
+  field(DTYP, "Raw Soft Channel")
+  field(PINI, "YES")
+  field(LINR, "LINEAR")
+  field(ESLO, "0.01")
+  field(EOFF, "0")
+  field(PREC, 2)
+  field(EGU, "K")
+  field(LOPR, 80)
+  field(HOPR, 400)
+}
+
+# Param id 1059
+record(ai, "$(P)$(R)REMAINING") {
+  field(DESC, "Time Remaining in Phase")
+  field(DTYP, "Raw Soft Channel")
+  field(PINI, "YES")
+  field(EGU, "min")
+}
+
+# Param id 1060
+record(ai, "$(P)$(R)GASFLOW") {
+  field(DESC, "Gas Flow")
+  field(DTYP, "Raw Soft Channel")
+  field(PINI, "YES")
+  field(LINR, "LINEAR")
+  field(ESLO, "0.1")
+  field(EOFF, "0")
+  field(PREC, "1")
+  field(EGU, "l/min")
+  field(LOPR, 0)
+  field(HOPR, 10)
+}
+
+# Param id 1061
+record(ai, "$(P)$(R)GASHEAT") {
+  field(DESC, "Gas Heater")
+  field(DTYP, "Raw Soft Channel")
+  field(PINI, "YES")
+  field(PREC, 0)
+  field(EGU, "%")
+  field(LOPR, 0)
+  field(HOPR, 100)
+}
+
+# Param id 1062
+record(ai, "$(P)$(R)EVAPHEAT") {
+  field(DESC, "Evap Heater")
+  field(DTYP, "Raw Soft Channel")
+  field(PINI, "YES")
+  field(LINR, "LINEAR")
+  field(PREC, 0)
+  field(EGU, "%")
+  field(LOPR, 0)
+  field(HOPR, 100)
+}
+
+# Param id 1063
+record(ai, "$(P)$(R)SUCTHEAT") {
+  field(DESC, "Suct Heater")
+  field(DTYP, "Raw Soft Channel")
+  field(PINI, "YES")
+  field(LINR, "LINEAR")
+  field(PREC, 0)
+  field(EGU, "%")
+  field(LOPR, 0)
+  field(HOPR, 100)
+}
+
+# Param id 1064
+record(ai, "$(P)$(R)BACKPRESS") {
+  field(DESC, "Back Pressure")
+  field(DTYP, "Raw Soft Channel")
+  field(PINI, "YES")
+  field(LINR, "LINEAR")
+  field(ESLO, "1.0")
+  field(EOFF, "0")
+  field(PREC, 0)
+  field(EGU, "mbar")
+  field(LOPR, 0)
+  field(HOPR, 1000.0)
+}
+
+# Param id 1066
+record(ai, "$(P)$(R)RUNTIME") {
+  field(DESC, "Pump Uptime")
+  field(DTYP, "Raw Soft Channel")
+  field(PINI, "YES")
+  field(EGU, "min")
+}
+
+# Param id 1028
+record(ai, "$(P)$(R)CTRLNUM") {
+  field(DESC, "Controller Number")
+  field(DTYP, "Raw Soft Channel")
+  field(PINI, "YES")
+}
+
+# Param id 1067
+record(ai, "$(P)$(R)EVAPADJUST") {
+  field(DESC, "Evap Vacuum Compensation")
+  field(DTYP, "Raw Soft Channel")
+  field(PINI, "YES")
+}
+
+# Param id 1068
+record(ai, "$(P)$(R)TURBOMODE") {
+  field(DESC, "Turbo Mode Readback")
+  field(DTYP, "Raw Soft Channel")
+  field(PINI, "YES")
+}
+
+# Param id 1103
+record(ai, "$(P)$(R)VALVEOPENING") {
+  field(DESC, "Flow Block Valve Opening")
+  field(DTYP, "Raw Soft Channel")
+  field(EGU,  "%")
+  field(LOPR,  0)
+  field(HOPR,  100)
+  field(PINI, "YES")
+  field(LINR, "LINEAR")
+  field(PREC, 0)
+}
+
+# Param id 1203
+record(ai, "$(P)$(R)LEVEL") {
+  field(DESC, "Liquid Nitrogen Level")
+  field(DTYP, "Raw Soft Channel")
+  field(EGU,  "%")
+  field(LOPR,  0)
+  field(HOPR,  100)
+  field(PINI, "YES")
+}
+
+# Param id 1050
+record(ai, "$(P)$(R)SETPOINT") {
+  field(DESC, "Set Point")
+  field(DTYP, "Raw Soft Channel")
+  field(PINI, "YES")
+  field(LINR, "LINEAR")
+  field(ESLO, "0.01")
+  field(EOFF, "0")
+  field(PREC, 2)
+  field(EGU, "K")
+  field(LOPR, 80)
+  field(HOPR, 400)
+}
+
+# Param id 1051
+record(ai, "$(P)$(R)TEMP") {
+  field(DESC, "Current Temperature")
+  field(DTYP, "Raw Soft Channel")
+  field(PINI, "YES")
+  field(LINR, "LINEAR")
+  field(ESLO, "0.01")
+  field(EOFF, "0")
+  field(PREC, 2)
+  field(EGU, "K")
+  field(LOPR, 80)
+  field(HOPR, 400)
+}
+
+# Param id 1052
+record(ai, "$(P)$(R)ERROR") {
+  field(DESC, "Gas Error (temperature)")
+  field(DTYP, "Raw Soft Channel")
+  field(PINI, "YES")
+  field(LINR, "LINEAR")
+  field(ESLO, "0.01")
+  field(EOFF, "0")
+  field(PREC, 2)
+  field(EGU, "K")
+}
+
+# Param id 2010
+record(ai, "$(P)$(R)COLDHEADTEMP") {
+  field(DTYP, "Raw Soft Channel")
+  field(PINI, "YES")
+  field(LINR, "LINEAR")
+  field(ESLO, "0.01")
+  field(EOFF, "0")
+  field(PREC, 2)
+  field(EGU, "K")
+}
+
+# Param id 2011
+record(ai, "$(P)$(R)SHIELDTEMP") {
+  field(DTYP, "Raw Soft Channel")
+  field(PINI, "YES")
+  field(LINR, "LINEAR")
+  field(ESLO, "0.01")
+  field(EOFF, "0")
+  field(PREC, 2)
+  field(EGU, "K")
+}
+
+# Param id 2012
+record(ai, "$(P)$(R)VACGAUGE") {
+  field(DTYP, "Raw Soft Channel")
+  field(PINI, "YES")
+  field(LINR, "LINEAR")
+  field(ESLO, "0.01")
+  field(EOFF, "0")
+  field(PREC, 2)
+  field(EGU, "K")
+}
+
+# Param id 2013
+record(ai, "$(P)$(R)NOZZLETEMP") {
+  field(DTYP, "Raw Soft Channel")
+  field(PINI, "YES")
+  field(LINR, "LINEAR")
+  field(ESLO, "0.01")
+  field(EOFF, "0")
+  field(PREC, 2)
+  field(EGU, "K")
+}
+
+# Param id 2014
+record(ai, "$(P)$(R)SAMPLEHEAT") {
+  field(DTYP, "Raw Soft Channel")
+  field(PINI, "YES")
+  field(LINR, "LINEAR")
+  field(ESLO, "0.01")
+  field(EOFF, "0")
+  field(PREC, 2)
+  field(EGU, "%")
+  field(LOPR, 0)
+  field(HOPR, 100)
+}
+
+# Param id 2015
+record(ai, "$(P)$(R)COLDHEADHEAT") {
+  field(DTYP, "Raw Soft Channel")
+  field(PINI, "YES")
+  field(LINR, "LINEAR")
+  field(PREC, 0)
+  field(EGU, "%")
+  field(LOPR, 0)
+  field(HOPR, 100)
+}
+
+# Param id 2016
+record(ai, "$(P)$(R)SHIELDHEAT") {
+  field(DTYP, "Raw Soft Channel")
+  field(PINI, "YES")
+  field(LINR, "LINEAR")
+  field(PREC, 0)
+  field(EGU, "%")
+  field(LOPR, 0)
+  field(HOPR, 100)
+}
+
+# Param id 2017
+record(ai, "$(P)$(R)NOZZLEHEAT") {
+  field(DTYP, "Raw Soft Channel")
+  field(PINI, "YES")
+  field(LINR, "LINEAR")
+  field(PREC, 0)
+  field(EGU, "%")
+  field(LOPR, 0)
+  field(HOPR, 100)
+}
+
+# Param id 2019
+record(ai, "$(P)$(R)AVGSAMPLEHEAT") {
+  field(DTYP, "Raw Soft Channel")
+  field(PINI, "YES")
+  field(LINR, "LINEAR")
+  field(PREC, 0)
+  field(EGU, "%")
+  field(LOPR, 0)
+  field(HOPR, 100)
+}
+
+# Param id 2020
+record(ai, "$(P)$(R)AVGNOZZLEHEAT") {
+  field(DTYP, "Raw Soft Channel")
+  field(PINI, "YES")
+  field(LINR, "LINEAR")
+  field(PREC, 0)
+  field(EGU, "%")
+  field(LOPR, 0)
+  field(HOPR, 100)
+}
+
+# Param id 2030
+record(ai, "$(P)$(R)SAMHOLDTEMP") {
+  field(DTYP, "Raw Soft Channel")
+  field(PINI, "YES")
+  field(LINR, "LINEAR")
+  field(ESLO, "0.01")
+  field(EOFF, "0")
+  field(PREC, 2)
+  field(EGU, "K")
+  field(LOPR, 80)
+  field(HOPR, 400)
+}
+
+# Param id 2031
+record(ai, "$(P)$(R)CRYOSTATTEMP") {
+  field(DTYP, "Raw Soft Channel")
+  field(PINI, "YES")
+  field(LINR, "LINEAR")
+  field(ESLO, "0.01")
+  field(EOFF, "0")
+  field(PREC, 2)
+  field(EGU, "K")
+  field(LOPR, 80)
+  field(HOPR, 400)
+}
+
+# Param id 2032
+record(ai, "$(P)$(R)SAMHOLDPRES") {
+  field(DTYP, "Raw Soft Channel")
+  field(PINI, "YES")
+  field(LINR, "LINEAR")
+  field(ESLO, "0.01")
+  field(EOFF, "0")
+  field(PREC, 2)
+  field(EGU, "K")
+}
+
+# Param id 2034
+record(ai, "$(P)$(R)ELAPSED") {
+  field(DTYP, "Raw Soft Channel")
+  field(PINI, "YES")
+  field(LINR, "LINEAR")
+  field(ESLO, "0.01")
+  field(EOFF, "0")
+  field(PREC, 2)
+  field(EGU, "K")
+}
+
+# Param id 2035
+record(ai, "$(P)$(R)SUCTSETTEMP") {
+  field(DTYP, "Raw Soft Channel")
+  field(PINI, "YES")
+  field(LINR, "LINEAR")
+  field(ESLO, "0.01")
+  field(EOFF, "0")
+  field(PREC, 2)
+  field(EGU, "K")
+}
+
+# Param id 2036
+record(ai, "$(P)$(R)NOZZLESETTEMP") {
+  field(DTYP, "Raw Soft Channel")
+  field(PINI, "YES")
+  field(LINR, "LINEAR")
+  field(ESLO, "0.01")
+  field(EOFF, "0")
+  field(PREC, 2)
+  field(EGU, "K")
+}
+
+# Param id 2041
+record(ai, "$(P)$(R)COLLARTEMP") {
+  field(DTYP, "Raw Soft Channel")
+  field(PINI, "YES")
+  field(LINR, "LINEAR")
+  field(ESLO, "0.01")
+  field(EOFF, "0")
+  field(PREC, 2)
+  field(EGU, "K")
+}
+
+# Param id 2042
+record(ai, "$(P)$(R)VACSENSOR") {
+  field(DTYP, "Raw Soft Channel")
+  field(PINI, "YES")
+}
+
+# Param id 1065
+record(ai, "$(P)$(R)ALARMI") {
+  # CS800 documentation is not specific about these codes.
+  field(DESC, "Alarm number")
+  field(DTYP, "Raw Soft Channel")
+  field(PINI, "YES")
+  field(HIGH, "1")
+  field(HSV,  "MAJOR")
+}
+
+record(stringin, "$(P)$(R)ALARM")
+{
+   field(DESC, "Alarm text")
+   field(VAL, "unset")
+}
+
+
+#########################################################
+# commands (output to controller on port 30305)
+
+
+record(ao, "$(P)$(R)RESTART") {
+  field(DESC, "Start/Restart program")
+  field(DTYP, "stream")
+  field(OUT, "@Oxford_CS800.proto restart($(P)$(R)) $(CP)")
+  field(SDIS, "$(P)$(R)DISABLE")
+}
+
+record(ao, "$(P)$(R)RAMP") {
+  field(DESC, "Start a ramp")
+  field(DTYP, "stream")
+  field(OUT, "@Oxford_CS800.proto ramp($(P)$(R)) $(CP)")
+  field(SDIS, "$(P)$(R)DISABLE")
+}
+
+record(ao, "$(P)$(R)RTEMP") {
+  field(DESC, "Ramp Target Temp")
+  field(DTYP, "Raw Soft Channel")
+  field(PINI, "YES")
+  field(LINR, "LINEAR")
+  field(ESLO, "0.01")
+  field(EOFF, "0")
+  field(PREC, 2)
+  field(VAL, 100)
+  field(EGU, "K")
+  field(DRVL, "1.00")
+  field(DRVH, "360.00")
+  field(FLNK, "$(P)$(R)RTEMPCH")
+}
+
+record(ao, "$(P)$(R)RTEMPH") {
+  field(DESC, "Ramp Target Temp Hi byte")
+  field(DTYP, "Raw Soft Channel")
+}
+
+record(ao, "$(P)$(R)RTEMPL") {
+  field(DESC, "Ramp Target Temp Lo byte")
+  field(DTYP, "Raw Soft Channel")
+}
+
+record(calcout, "$(P)$(R)RTEMPCH") {
+  field(CALC, "(A>>8>=C)?A>>8-C:A>>8")
+  field(INPA, "$(P)$(R)RTEMP.RVAL")
+  field(INPC, "128")
+  field(OUT, "$(P)$(R)RTEMPH PP")
+  field(FLNK, "$(P)$(R)RTEMPCL")
+}
+
+record(calcout, "$(P)$(R)RTEMPCL") {
+  field(CALC, "(A%B>=C)?A%B-B:A%B")
+  field(INPA, "$(P)$(R)RTEMP.RVAL")
+  field(INPB, "256")
+  field(INPC, "128")
+  field(OUT, "$(P)$(R)RTEMPL PP")
+}
+
+record(ao, "$(P)$(R)RRATE") {
+  field(DESC, "Set Ramp Rate")
+  field(DTYP, "Raw Soft Channel")
+  field(PINI, "YES")
+  field(EGU, "K/hour")
+  field(DRVL, "1")
+  field(DRVH, "360")
+  field(VAL, "360")
+  field(FLNK, "$(P)$(R)RRATECH")
+}
+
+record(calcout, "$(P)$(R)RRATECH") {
+  field(CALC, "(A>>8>=C)?A>>8-C:A>>8")
+  field(INPA, "$(P)$(R)RRATE.RVAL")
+  field(INPC, "128")
+  field(OUT, "$(P)$(R)RRATEH.VAL PP")
+  field(FLNK, "$(P)$(R)RRATECL")
+}
+
+record(ao, "$(P)$(R)RRATEH") {
+  field(DESC, "Ramp Target Temp Hi byte")
+  field(DTYP, "Raw Soft Channel")
+}
+
+record(ao, "$(P)$(R)RRATEL") {
+  field(DESC, "Ramp Target Temp Lo byte")
+  field(DTYP, "Raw Soft Channel")
+}
+
+record(calcout, "$(P)$(R)RRATECL") {
+  field(CALC, "(A%B>=C)?A%B-B:A%B")
+  field(INPA, "$(P)$(R)RRATE.RVAL")
+  field(INPB, "256")
+  field(INPC, "128")
+  field(OUT, "$(P)$(R)RRATEL.VAL PP")
+}
+
+record(ao, "$(P)$(R)PLAT") {
+  field(DESC, "Start a plat")
+  field(DTYP, "stream")
+  field(OUT, "@Oxford_CS800.proto plat($(P)$(R)) $(CP)")
+  field(SDIS, "$(P)$(R)DISABLE")
+}
+
+record(ao, "$(P)$(R)PTIME") {
+  field(DESC, "Plat Time")
+  field(DTYP, "Raw Soft Channel")
+  field(PINI, "YES")
+  field(EGU, "min")
+  field(DRVL, "1")
+  field(DRVH, "1440")
+  field(FLNK, "$(P)$(R)PTIMECH")
+}
+
+record(calcout, "$(P)$(R)PTIMECH") {
+  field(CALC, "(A>>8>=C)?A>>8-C:A>>8")
+  field(INPA, "$(P)$(R)PTIME.RVAL")
+  field(INPC, "128")
+  field(OUT, "$(P)$(R)PTIMEH.VAL PP")
+  field(FLNK, "$(P)$(R)PTIMECL")
+}
+
+record(calcout, "$(P)$(R)PTIMECL") {
+  field(CALC, "(A%B>=C)?A%B-B:A%B")
+  field(INPA, "$(P)$(R)PTIME.RVAL")
+  field(INPB, "256")
+  field(INPC, "128")
+  field(OUT, "$(P)$(R)PTIMEL.VAL PP")
+}
+
+record(ao, "$(P)$(R)PTIMEL") {
+  field(DESC, "Ramp Target Temp Lo byte")
+  field(DTYP, "Raw Soft Channel")
+}
+
+record(ao, "$(P)$(R)PTIMEH") {
+  field(DESC, "Ramp Target Temp Hi byte")
+  field(DTYP, "Raw Soft Channel")
+}
+
+record(ao, "$(P)$(R)HOLD") {
+  field(DESC, "Start a hold")
+  field(DTYP, "stream")
+  field(OUT, "@Oxford_CS800.proto hold($(P)$(R)) $(CP)")
+  field(SDIS, "$(P)$(R)DISABLE")
+}
+
+record(ao, "$(P)$(R)COOL") {
+  field(DESC, "Start a cool")
+  field(DTYP, "stream")
+  field(OUT, "@Oxford_CS800.proto cool($(P)$(R)) $(CP)")
+  field(SDIS, "$(P)$(R)DISABLE")
+}
+
+record(ao, "$(P)$(R)CTEMP") {
+  field(DESC, "Cool Temp")
+  field(DTYP, "Raw Soft Channel")
+  field(PINI, "YES")
+  field(LINR, "LINEAR")
+  field(ESLO, "0.01")
+  field(EOFF, "0")
+  field(PREC, 2)
+  field(EGU, "K")
+  field(VAL, 100)
+  field(DRVL, "80.00")
+  field(DRVH, "327.67")
+  field(FLNK, "$(P)$(R)CTEMPCH")
+}
+
+
+record(calcout, "$(P)$(R)CTEMPCH") {
+  field(CALC, "(A>>8>=C)?A>>8-C:A>>8")
+  field(INPA, "$(P)$(R)CTEMP.RVAL")
+  field(INPC, "128")
+  field(OUT, "$(P)$(R)CTEMPH.VAL PP")
+  field(FLNK, "$(P)$(R)CTEMPCL")
+}
+
+record(calcout, "$(P)$(R)CTEMPCL") {
+  field(CALC, "(A%B>=C)?A%B-B:A%B")
+  field(INPA, "$(P)$(R)CTEMP.RVAL")
+  field(INPB, "256")
+  field(INPC, "128")
+  field(OUT, "$(P)$(R)CTEMPL.VAL PP")
+}
+
+record(ao, "$(P)$(R)CTEMPL") {
+  field(DESC, "Ramp Target Temp Lo byte")
+  field(DTYP, "Raw Soft Channel")
+}
+
+record(ao, "$(P)$(R)CTEMPH") {
+  field(DESC, "Ramp Target Temp Hi byte")
+  field(DTYP, "Raw Soft Channel")
+}
+
+record(ao, "$(P)$(R)END") {
+  field(DTYP, "stream")
+  field(OUT, "@Oxford_CS800.proto end($(P)$(R)) $(CP)")
+  field(SDIS, "$(P)$(R)DISABLE") 
+}
+
+record(ao, "$(P)$(R)ERATE") {
+  field(DESC, "Set End Rate")
+  field(DTYP, "Raw Soft Channel")
+  field(PINI, "YES")
+  field(EGU, "K/hour")
+  field(DRVL, "1")
+  field(VAL, "360")
+  field(DRVH, "360")
+  field(FLNK, "$(P)$(R)ERATECH")
+}
+
+record(calcout, "$(P)$(R)ERATECH") {
+  field(CALC, "(A>>8>=C)?A>>8-C:A>>8")
+  field(INPA, "$(P)$(R)ERATE.RVAL")
+  field(INPC, "128")
+  field(OUT, "$(P)$(R)ERATEH.VAL PP")
+  field(FLNK, "$(P)$(R)ERATECL")
+}
+
+record(calcout, "$(P)$(R)ERATECL") {
+  field(CALC, "(A%B>=C)?A%B-B:A%B")
+  field(INPA, "$(P)$(R)ERATE.RVAL")
+  field(INPB, "256")
+  field(INPC, "128")
+  field(OUT, "$(P)$(R)ERATEL.VAL PP")
+}
+
+record(ao, "$(P)$(R)ERATEH") {
+  field(DESC, "Ramp Target Temp Hi byte")
+  field(DTYP, "Raw Soft Channel")
+}
+
+record(ao, "$(P)$(R)ERATEL") {
+  field(DESC, "Ramp Target Temp Lo byte")
+  field(DTYP, "Raw Soft Channel")
+}
+
+record(ao, "$(P)$(R)PURGE") {
+  field(DESC, "Start a Purge/Warm")
+  field(DTYP, "stream")
+  field(OUT, "@Oxford_CS800.proto purge($(P)$(R)) $(CP)")
+  field(SDIS, "$(P)$(R)DISABLE")
+}
+
+record(ao, "$(P)$(R)PAUSE") {
+  field(DESC, "Pause program")
+  field(DTYP, "stream")
+  field(OUT, "@Oxford_CS800.proto pause($(P)$(R)) $(CP)")
+  field(SDIS, "$(P)$(R)DISABLE")
+}
+
+record(ao, "$(P)$(R)RESUME") {
+  field(DESC, "Resume program")
+  field(DTYP, "stream")
+  field(OUT, "@Oxford_CS800.proto resume($(P)$(R)) $(CP)")
+  field(SDIS, "$(P)$(R)DISABLE")
+}
+
+record(ao, "$(P)$(R)STOP") {
+  field(DESC, "Stop program")
+  field(DTYP, "stream")
+  field(OUT, "@Oxford_CS800.proto stop($(P)$(R)) $(CP)")
+  field(SDIS, "$(P)$(R)DISABLE")
+}
+
+record(bo, "$(P)$(R)TURBO") {
+  field(DTYP, "Raw Soft Channel")
+  field(ZNAM, "Off")
+  field(ONAM, "On")
+  field(FLNK, "$(P)$(R)TURBOCMD")
+  field(RVAL, "0")
+  # field(PINI, "YES")
+}
+
+record(ao, "$(P)$(R)TURBOCMD") {
+  field(DTYP, "stream")
+  field(OUT, "@Oxford_CS800.proto turbo($(P)$(R)) $(CP)")
+  field(SDIS, "$(P)$(R)DISABLE")
+}

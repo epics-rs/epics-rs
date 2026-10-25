@@ -2104,6 +2104,7 @@ dependencies = [
  "epics-libcom-rs",
  "epics-seq-rs",
  "epics-snc-rs",
+ "epics-stream-rs",
 ]
 
 [[package]]

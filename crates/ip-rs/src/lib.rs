@@ -34,6 +34,7 @@ pub fn register_ip_dbd() {
     snl::federal::FederalRegistrar();
     snl::keithley2k_dmm_mf40::Keithley2kDMM_mf40Registrar();
     snl::keithley65xx_em::Keithley65xxEMRegistrar();
+    snl::oxford_cs800::Oxford_CS800Registrar();
 }
 
 /// The body `MPCConvert`, `TPG261Convert`, `TelevacConvert` and

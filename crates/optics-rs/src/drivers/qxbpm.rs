@@ -109,15 +109,17 @@ impl Default for CalibrationData {
     }
 }
 
+/// Full-scale current in amps of each gain range (`sncqxbpm.st:568-573`).
+const FULL_SCALE_AMPS: [f64; NUM_GAINS] = [350e-9, 700e-9, 1400e-9, 7e-6, 70e-6, 700e-6];
+
 /// Compute the default gain trim factors (from the original set_defaults).
 ///
 /// These are based on the full-scale current for each range divided by
 /// 10 VDC full-scale and 100 kHz/VDC.
 pub fn default_gain_trims() -> Vec<f64> {
-    let full_scale = [350e-9, 700e-9, 1400e-9, 7e-6, 70e-6, 700e-6];
     let mut trims = vec![0.0; NUM_GAINS * NUM_CHANNELS];
     for gain in 0..NUM_GAINS {
-        let factor = full_scale[gain] / 10.0 / 1e5;
+        let factor = FULL_SCALE_AMPS[gain] / 10.0 / 1e5;
         for ch in 0..NUM_CHANNELS {
             trims[gain * NUM_CHANNELS + ch] = factor;
         }
@@ -248,7 +250,7 @@ pub struct SimQxbpm {
     pub x_pos: f64,
     /// Simulated beam Y position.
     pub y_pos: f64,
-    /// Base intensity for current generation.
+    /// Raw count of a diode pair on the most sensitive range (gain 0).
     pub base_intensity: f64,
     /// Current gain range.
     pub gain: usize,
@@ -285,9 +287,12 @@ impl SimQxbpm {
     ///   X = GX * (B - D) / (B + D)  =>  B/D = (GX + X) / (GX - X)
     ///   Y = GY * (A - C) / (A + C)  =>  A/C = (GY + Y) / (GY - Y)
     ///
-    /// We use a base intensity to scale the diode readings.
+    /// We use a base intensity to scale the diode readings. A real
+    /// QxBPM's count tracks current over the range's full scale, so the
+    /// same beam reads fewer counts on a less sensitive range.
     pub fn generate_raw(&self) -> RawDiodeData {
-        let half = self.base_intensity;
+        let range = FULL_SCALE_AMPS[self.gain.min(NUM_GAINS - 1)];
+        let half = self.base_intensity * FULL_SCALE_AMPS[0] / range;
 
         // Compute B/D ratio from X position
         let x_clamped = self.x_pos.clamp(-self.gx + 0.01, self.gx - 0.01);
@@ -756,6 +761,20 @@ mod tests {
         assert!((raw.d as f64 - avg).abs() < avg * 0.1);
     }
 
+    /// The same beam reads the same current on every range that resolves
+    /// it: raw counts scale as 1 / full scale (`sncqxbpm.st:54-55`).
+    #[test]
+    fn test_sim_qxbpm_current_is_independent_of_gain() {
+        let mut sim = SimQxbpm::new(0.0, 0.0);
+        let at_gain0 = sim.read().currents.a;
+        sim.gain = 3;
+        let at_gain3 = sim.read().currents.a;
+        assert!(
+            (at_gain3 - at_gain0).abs() < at_gain0 * 1e-6,
+            "gain 0 {at_gain0} A, gain 3 {at_gain3} A"
+        );
+    }
+
     #[test]
     fn test_sim_qxbpm_not_low_current() {
         let sim = SimQxbpm::new(0.0, 0.0);
@@ -830,22 +849,15 @@ mod tests {
     }
 
     #[test]
-    fn test_sim_qxbpm_gain_change_affects_currents() {
+    fn test_sim_qxbpm_gain_change_scales_raw_counts() {
         let mut sim = SimQxbpm::new(0.0, 0.0);
-        let reading_g0 = sim.read();
-
+        let raw_g0 = sim.generate_raw().a as f64;
         sim.gain = 3;
-        let reading_g3 = sim.read();
-
-        // Different gain ranges have different trim factors, so currents should differ.
-        // Gain 0 trim = 350e-9 / 10 / 1e5 = 3.5e-13
-        // Gain 3 trim = 7e-6 / 10 / 1e5 = 7e-12
-        // Both are tiny but distinct, so compare the raw f64 values.
+        let raw_g3 = sim.generate_raw().a as f64;
+        // 7 uA full scale is 20x the 350 nA one.
         assert!(
-            (reading_g0.currents.a - reading_g3.currents.a).abs() > f64::EPSILON,
-            "changing gain should change reported current: g0={}, g3={}",
-            reading_g0.currents.a,
-            reading_g3.currents.a,
+            (raw_g0 / raw_g3 - 20.0).abs() < 0.01,
+            "gain 0 {raw_g0} counts, gain 3 {raw_g3} counts"
         );
     }
 

@@ -17,6 +17,7 @@ epics-libcom-rs = { workspace = true }
 epics-base-rs = { workspace = true, optional = true }
 epics-ca-rs = { workspace = true, optional = true }
 tokio = { version = "1", features = ["sync", "time", "rt", "macros"] }
+smallvec = "1.15"
 tracing = "0.1"
 thiserror = "2"
 # Same run-time level dispatch as ad-plugins-rs (`Level::new` + `dispatch!`):

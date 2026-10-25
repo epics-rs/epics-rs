@@ -1675,10 +1675,14 @@ impl SharedProcessorInner {
     fn end_published(&mut self, batch: ParamBatch, published: Published) -> ProcessOutput {
         let deliver = self.array_callbacks.get();
         let (arrays, begin, attributes) = match published {
-            Published::Nothing => (Vec::new(), None, None),
+            Published::Nothing => (Frame::new(), None, None),
             Published::Read(array) => {
                 let (begin, attributes) = self.begin_published(&array, deliver);
-                (vec![Arc::clone(&array)], Some((array, begin)), attributes)
+                (
+                    smallvec::smallvec![Arc::clone(&array)],
+                    Some((array, begin)),
+                    attributes,
+                )
             }
         };
         let ready = self.delivery.end_written(arrays, attributes.as_ref());
@@ -1815,7 +1819,14 @@ impl SharedProcessorInner {
     /// ExecutionTime C sets after `processCallbacks` (NDPluginDriver.cpp:
     /// 438, :537).
     fn unprocessed(&mut self, batch: ParamBatch, elapsed_ms: f64) -> ProcessOutput {
-        self.build_publish_batch(batch, Vec::new(), Vec::new(), None, Some(elapsed_ms), false)
+        self.build_publish_batch(
+            batch,
+            Frame::new(),
+            Vec::new(),
+            None,
+            Some(elapsed_ms),
+            false,
+        )
     }
 
     /// The completion half: route the produced arrays and build the param
@@ -1855,7 +1866,7 @@ impl SharedProcessorInner {
         .then(|| self.attributes.evaluate_after(begin, &result.param_updates))
         .flatten();
         let ready = self.delivery.end_process(
-            result.output_arrays,
+            Frame::from_vec(result.output_arrays),
             attributes.as_ref(),
             CopyArray::IfInput(array),
         );
@@ -1909,13 +1920,14 @@ impl SharedProcessorInner {
         mut batch: ParamBatch,
         entries: Vec<(i32, Vec<PublishedArray>)>,
     ) -> ProcessOutput {
-        let mut all_arrays = Vec::new();
+        let mut all_arrays = Frame::new();
         for (_unique_id, arrays) in entries {
             // Sort-buffer entries were admitted only while NDArrayCallbacks was
             // on (route_output_arrays runs past the delivery gate); the C++
             // sort thread delivers them regardless of the *current* flag, so
             // they always deliver here.
-            let output = self.build_publish_batch(batch, arrays, vec![], None, None, true);
+            let output =
+                self.build_publish_batch(batch, Frame::from_vec(arrays), vec![], None, None, true);
             all_arrays.extend(output.arrays);
             batch = output.batch;
         }
@@ -1924,7 +1936,7 @@ impl SharedProcessorInner {
             arrays: all_arrays,
             scatter: false,
             batch,
-            addressed: vec![],
+            addressed: Frame::new(),
         }
     }
 
@@ -2024,7 +2036,7 @@ impl SharedProcessorInner {
     fn build_publish_batch(
         &mut self,
         mut batch: ParamBatch,
-        output_arrays: Vec<PublishedArray>,
+        output_arrays: Frame<PublishedArray>,
         param_updates: Vec<ParamUpdate>,
         begin: Option<(&NDArray, &[PendingParam])>,
         elapsed_ms: Option<f64>,
@@ -2091,21 +2103,25 @@ impl SharedProcessorInner {
             // NDArrayCallbacks==0 suppresses downstream delivery (C++
             // endProcessCallbacks early-return); the metadata params above are
             // still published.
-            arrays: if deliver { output_arrays } else { Vec::new() },
+            arrays: if deliver { output_arrays } else { Frame::new() },
             scatter: false,
             batch,
-            addressed: vec![],
+            addressed: Frame::new(),
         }
     }
 }
 
+/// A frame's arrays, held inline: C's `endProcessCallbacks` takes one array
+/// per call, and a frame rarely makes more.
+type Frame<T> = smallvec::SmallVec<[T; 1]>;
+
 /// Output from processing: arrays to publish + param batch to flush.
 struct ProcessOutput {
-    arrays: Vec<PublishedArray>,
+    arrays: Frame<PublishedArray>,
     scatter: bool,
     batch: ParamBatch,
     /// `ProcessResult::addressed`, published before `arrays`.
-    addressed: Vec<(usize, PublishedArray)>,
+    addressed: Frame<(usize, PublishedArray)>,
 }
 
 impl ProcessOutput {
@@ -4491,7 +4507,7 @@ fn plugin_data_loop<P: NDPluginProcess>(
                                     || !result.addressed.is_empty()
                                 {
                                     let deliver = guard.array_callbacks.get();
-                                    let arrays = guard.delivery.publishable(result.output_arrays, None, CopyArray::Never);
+                                    let arrays = guard.delivery.publishable(Frame::from_vec(result.output_arrays), None, CopyArray::Never);
                                     let mut output = guard.build_publish_batch(ParamBatch::new(&callbacks_gate), arrays, result.param_updates, None, None, deliver);
                                     output.addressed = guard.delivery.publishable_addressed(result.addressed);
                                     Some(output)

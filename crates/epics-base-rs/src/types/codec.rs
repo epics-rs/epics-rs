@@ -199,6 +199,21 @@ fn convert_value_to_dbr_string(
     })
 }
 
+/// C `dbGet` of a channel's value as `target`: the `DBR_STRING` column
+/// through the field's own string source and precision, as the wire encode
+/// renders it, cut as `getStringString` copies; any other column the plain
+/// projection.
+pub(crate) fn snapshot_value_as(
+    snapshot: &crate::server::snapshot::Snapshot,
+    target: DbFieldType,
+) -> CaResult<EpicsValue> {
+    if target == DbFieldType::String {
+        convert_value_to_dbr_string(&snapshot.value, snapshot).map(cap_dbr_strings)
+    } else {
+        snapshot.value.get_convert(target)
+    }
+}
+
 /// C's `MAX_STRING_SIZE` buffer: at most 39 bytes, as `getStringString`
 /// copies (`dbConvert.c`), whatever the source holds. The one cut a
 /// `DBR_STRING` read of a string longer than a `DBF_STRING` applies — a

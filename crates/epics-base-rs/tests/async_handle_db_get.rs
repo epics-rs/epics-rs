@@ -37,6 +37,11 @@ record(waveform, "W") {
 record(stringin, "S") {
     field(VAL, "abc")
 }
+record(mbbi, "M") {
+    field(ZRST, "zero")
+    field(ONST, "one")
+    field(VAL, "1")
+}
 record(calc, "C") {
     field(INPA, "H.VAL")
     field(CALC, "A")
@@ -114,6 +119,18 @@ async fn db_get_fails_where_c_dbget_does() {
     );
     // `cvt_st_d` on unparseable text is a non-zero status.
     assert!(h.db_get("S.VAL", DbFieldType::Double, 1, None).is_none());
+}
+
+/// `DBR_STRING` renders an ENUM through the record's `get_enum_str` and a
+/// DOUBLE at its precision (`getEnumString`, `getDoubleString`,
+/// `dbConvert.c:833`, `:772`), not as the bare number.
+#[epics_macros_rs::epics_test]
+async fn db_get_as_a_string_renders_as_the_record_does() {
+    let db = ioc().await;
+    let h = db.async_handle();
+    let text = |name| h.db_get(name, DbFieldType::String, 1, None).unwrap().value;
+    assert_eq!(text("M.VAL"), EpicsValue::String("one".into()));
+    assert_eq!(text("AI.VAL"), EpicsValue::String("1.500".into()));
 }
 
 /// What `db_get` serves for `name` with no hold, to compare a held answer to.

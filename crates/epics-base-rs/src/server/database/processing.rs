@@ -1134,7 +1134,7 @@ impl AsyncDbHandle {
         own: Option<OwnRecord<'_>>,
     ) -> Option<crate::server::snapshot::Snapshot> {
         let mut snap = self.db()?.db_get_snapshot(name.as_ref(), own)?;
-        snap.value = snap.value.get_convert(dbr_type).ok()?;
+        snap.value = crate::types::codec::snapshot_value_as(&snap, dbr_type).ok()?;
         snap.value.truncate(count);
         Some(snap)
     }

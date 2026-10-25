@@ -782,9 +782,11 @@ fn ca_modifier_link_classifies_as_ca() {
 ///
 /// The holder record and its bare ` CP` INP link are loaded via
 /// `dbLoadRecords` from an st.cmd — the real iocInit path, where INP is set
-/// before `setup_cp_links` runs. A custom protocol runner (in place of
-/// `run_ca_ioc`) observes the warmed VAL and returns `Ok(())`, so `run`
-/// completes instead of serving forever.
+/// before `setup_cp_links` runs. The script ends in `iocInit`: without it,
+/// and with no `before_ioc_init` gate, `run` builds nothing and never calls
+/// the runner. A custom protocol runner (in place of `run_ca_ioc`) hands
+/// back the VAL it saw and returns `Ok(())`, so `run` completes instead of
+/// serving forever, and the test asserts on what it handed back.
 #[tokio::test(flavor = "multi_thread")]
 #[serial(epics_env)]
 async fn calink_warms_cp_holder_via_iocapplication_run_seam() {
@@ -822,9 +824,10 @@ async fn calink_warms_cp_holder_via_iocapplication_run_seam() {
     let stcmd_path = dir.path().join("st.cmd");
     std::fs::write(
         &stcmd_path,
-        format!("dbLoadRecords(\"{}\")\n", db_path.display()),
+        format!("dbLoadRecords(\"{}\")\niocInit\n", db_path.display()),
     )
     .expect("write st.cmd");
+    let (seen_tx, seen_rx) = std::sync::mpsc::channel();
 
     // The seam under test: register the calink installer at construction.
     // It fires at `AfterCaLinkInit`, before `setup_cp_links` — zero further
@@ -851,18 +854,21 @@ async fn calink_warms_cp_holder_via_iocapplication_run_seam() {
                     let inst = rec.read();
                     inst.record.val().and_then(|v| v.to_f64())
                 };
-                if v == Some(5.0) {
+                if v == Some(5.0) || std::time::Instant::now() >= deadline {
+                    seen_tx.send(v).unwrap();
                     return Ok(());
                 }
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "CP holder VAL must reach the warmed source value 5.0 via \
-                     the IocApplication::run seam (got {v:?}) — the installer \
-                     fired after setup_cp_links, or not at all"
-                );
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
         })
         .await;
-    result.expect("IOC run returns Ok once the CP holder warmed");
+    result.expect("IOC run returns Ok once the runner is done");
+    let seen = seen_rx.try_recv().expect("the IOC ran the protocol runner");
+    assert_eq!(
+        seen,
+        Some(5.0),
+        "CP holder VAL must reach the warmed source value 5.0 via the \
+         IocApplication::run seam — the installer fired after setup_cp_links, \
+         or not at all"
+    );
 }

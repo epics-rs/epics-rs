@@ -202,15 +202,6 @@ const EXPECTED_FAILURES: &[(&str, &str)] = &[
         "sequencer/test/validate/pvGetCancel.st",
         "pvGetCancel.st:25: error: snc-rs does not support typename pvStat variable 'status'",
     ),
-    // `x != Default::default()` is ambiguous beside serde_json
-    (
-        "sequencer/test/validate/pvSyncDb.st",
-        "pvSync.st:78: error[E0283]: type annotations needed: cannot infer type",
-    ),
-    (
-        "sequencer/test/validate/pvSyncNoDb.st",
-        "pvSync.st:78: error[E0283]: type annotations needed: cannot infer type",
-    ),
 ];
 
 /// Generated code collected in memory.

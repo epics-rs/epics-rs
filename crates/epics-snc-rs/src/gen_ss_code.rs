@@ -29,9 +29,15 @@ const NM_EVENT: &str = "seqg_event";
 const NM_SS: &str = "seqg_ss";
 const ENV_TYPE: &str = "&seqg_rt::StateSet<seqg_vars>";
 const C_CHAR: &str = "std::ffi::c_char";
-/// The zero of a value of unknown type: C's 0 for a number, the null
-/// pointer for a pointer.
-const DEFAULT: &str = "Default::default()";
+
+/// C's truth of a value of unknown type (`holds`) or its negation. The
+/// value may be a pointer, which has no integer 0, so `seqg_rt::c::truth`
+/// tests it against its `Default`; a bare `== Default::default()` is
+/// ambiguous where serde_json adds `impl PartialEq<Value> for i32`.
+fn foreign_truth(e: Expr, holds: bool) -> Expr {
+    let t = Expr::call("seqg_rt::c::truth", vec![e]);
+    if holds { t } else { Expr::unary("!", t) }
+}
 
 /// C `gen_ss_code`: the program init function, the program entry
 /// function, the functions of every state of every state set and the
@@ -2399,7 +2405,7 @@ impl<'a> Gen<'a> {
             Ty::Rt(r) => Expr::binary(rt_int(v.e, r), "!=", zero(false)),
             Ty::CharPtr => Expr::unary("!", v.e.method("is_null", Vec::new())),
             Ty::Str | Ty::Ref => Expr::atom("true"),
-            Ty::Foreign => Expr::binary(v.e, "!=", Expr::atom(DEFAULT)),
+            Ty::Foreign => foreign_truth(v.e, true),
             Ty::Unit => Expr::binary(v.e, "!=", zero(false)),
         }
     }
@@ -2418,7 +2424,7 @@ impl<'a> Gen<'a> {
             Ty::Rt(r) => Expr::binary(rt_int(v.e, r), "==", zero(false)),
             Ty::CharPtr => v.e.method("is_null", Vec::new()),
             Ty::Str | Ty::Ref => Expr::atom("false"),
-            Ty::Foreign => Expr::binary(v.e, "==", Expr::atom(DEFAULT)),
+            Ty::Foreign => foreign_truth(v.e, false),
             Ty::Unit => Expr::binary(v.e, "==", zero(false)),
         }
     }
@@ -2546,17 +2552,15 @@ fn binop(op: Tok, l: Val, r: Val) -> Val {
                 if r.ty == Ty::CharPtr && is_null(&l) {
                     return null_test(r.e);
                 }
-                // a value of unknown type may be a pointer, which has no
-                // integer 0; rustc infers the default from the value's side
                 if l.ty == Ty::Foreign && is_null(&r) {
                     return Val {
-                        e: Expr::binary(l.e, sym, Expr::atom(DEFAULT)),
+                        e: foreign_truth(l.e, op == Tok::Ne),
                         ty: Ty::Bool,
                     };
                 }
                 if r.ty == Ty::Foreign && is_null(&l) {
                     return Val {
-                        e: Expr::binary(r.e, sym, Expr::atom(DEFAULT)),
+                        e: foreign_truth(r.e, op == Tok::Ne),
                         ty: Ty::Bool,
                     };
                 }
@@ -3569,11 +3573,11 @@ mod tests {
         let code = words(&code);
         for e in [
             "seqg_var.y.set((h() * 2) as _)",
-            "seqg_var.y.set((h() == Default::default()) as i32)",
+            "seqg_var.y.set(!seqg_rt::c::truth(h()) as i32)",
             "seqg_var.y.set(1 << h())",
             "seqg_var.y.set( if seqg_var.y.get() != 0 { 1 } else { h() } as _, )",
             "seqg_var.y.set((x + 1) as _)",
-            "seqg_var.y.set((c() != Default::default()) as i32)",
+            "seqg_var.y.set(seqg_rt::c::truth(c()) as i32)",
             "seqg_var.d.set(h() as f64 * 2.0)",
             "seqg_var.y.set(g() + 1)",
             "seqg_var.y.set((h() < 3) as i32)",
@@ -3629,14 +3633,14 @@ mod tests {
         assert_eq!(diag, "");
         let code = words(&code);
         for e in [
-            "if h() != Default::default() {",
-            "if x != Default::default() {",
-            "while x != Default::default() {",
-            "seqg_var.y.set((x == Default::default()) as i32)",
-            "seqg_var.y.set((seqg_var.y.get() != 0 && x != Default::default()) as i32)",
-            "seqg_var.y.set( if x != Default::default() { 1 } else { 2 }, )",
-            "if x != Default::default() { h(); } else { h(); }",
-            "seqg_rt::ChId(0), // y 1, x != Default::default(), None,",
+            "if seqg_rt::c::truth(h()) {",
+            "if seqg_rt::c::truth(x) {",
+            "while seqg_rt::c::truth(x) {",
+            "seqg_var.y.set(!seqg_rt::c::truth(x) as i32)",
+            "seqg_var.y.set((seqg_var.y.get() != 0 && seqg_rt::c::truth(x)) as i32)",
+            "seqg_var.y.set( if seqg_rt::c::truth(x) { 1 } else { 2 }, )",
+            "if seqg_rt::c::truth(x) { h(); } else { h(); }",
+            "seqg_rt::ChId(0), // y 1, seqg_rt::c::truth(x), None,",
         ] {
             assert!(code.contains(e), "{e}\n{code}");
         }
@@ -3653,8 +3657,8 @@ mod tests {
         assert_eq!(diag, "");
         let code = words(&code);
         for e in [
-            "while x != Default::default() {",
-            "while h() != Default::default() {",
+            "while seqg_rt::c::truth(x) {",
+            "while seqg_rt::c::truth(h()) {",
         ] {
             assert!(code.contains(e), "{e}\n{code}");
         }

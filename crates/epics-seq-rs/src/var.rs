@@ -571,6 +571,38 @@ impl Ptr<c_char> {
     }
 }
 
+/// C's decay of a string literal (`&b"..."[..]` when it is not UTF-8).
+impl From<&str> for Ptr<c_char> {
+    fn from(s: &str) -> Self {
+        Ptr::from_bytes(s.as_bytes())
+    }
+}
+
+impl From<&[u8]> for Ptr<c_char> {
+    fn from(s: &[u8]) -> Self {
+        Ptr::from_bytes(s)
+    }
+}
+
+/// C's decay of an array variable to a pointer to its first element.
+impl<A: Indexed<Elem: 'static> + Send + 'static> From<&SeqVar<A>> for Ptr<A::Elem> {
+    fn from(a: &SeqVar<A>) -> Self {
+        a.at(0).ptr()
+    }
+}
+
+/// C's decay of an array element that is itself an array: a row of a
+/// two-dimensional array, or a `string` of an array of them.
+impl<A, P> From<&At<'_, P, A>> for Ptr<<A::Elem as Indexed>::Elem>
+where
+    A: Indexed<Elem: Indexed<Elem: 'static> + 'static> + 'static,
+    P: Addr<A> + ?Sized,
+{
+    fn from(row: &At<'_, P, A>) -> Self {
+        row.at(0).ptr()
+    }
+}
+
 impl<T> Clone for Ptr<T> {
     fn clone(&self) -> Self {
         Ptr(self.0.as_ref().map(|t| Target {
@@ -823,6 +855,20 @@ mod tests {
     fn a_difference_across_variables_panics() {
         let (a, b) = (SeqVar::new([1i32, 2]), SeqVar::new([1i32, 2]));
         a.at(0).ptr().diff(&b.at(0).ptr());
+    }
+
+    #[test]
+    fn an_array_decays_to_a_pointer_to_its_first_element() {
+        let a = SeqVar::new([1i32, 2, 3]);
+        assert_eq!(Ptr::from(&a), a.at(0).ptr());
+        let m = SeqVar::new([[1i32, 2], [3, 4]]);
+        let row = Ptr::from(&m.at(1));
+        assert_eq!(row, m.at(1).at(0).ptr());
+        assert_eq!(row.offset(1).get(), 4);
+        let s = SeqVar::new(SeqString::new());
+        Ptr::from(&s).set(b'x' as c_char);
+        assert_eq!(s.get().as_bytes(), b"x");
+        assert_eq!(Ptr::<c_char>::from("ab").offset(1).get(), b'b' as c_char);
     }
 
     #[test]

@@ -6810,6 +6810,15 @@ fn dtyp_index_of(record_type: &str, dtyp: &str) -> u16 {
         .unwrap_or(0) as u16
 }
 
+/// The PACT field of the instance whose flag is `pact` and whose cell is
+/// `cell`: its own PACT, or [`RecordCell::hold_chain_pact`]'s.
+pub(crate) fn pact_field(pact: &AtomicBool, cell: &std::sync::Weak<RecordCell>) -> bool {
+    pact.load(Ordering::Acquire)
+        || cell
+            .upgrade()
+            .is_some_and(|cell| cell.chain_pact.load(Ordering::Relaxed))
+}
+
 /// The value of the `dbCommon` field `field` of `record`, whose dbCommon is
 /// `common` — all but `PACT`, which lives on the instance.
 fn common_field_of(
@@ -6937,11 +6946,10 @@ fn common_field_of(
     }
 }
 
-/// A record read from inside its own processing: its type's code and the
-/// dbCommon its caller holds, nothing else behind its lock set.
+/// A record read from inside its own processing: its type's code and what
+/// its holder lent it, nothing else behind its lock set.
 struct OwnView<'a> {
-    record: &'a dyn Record,
-    common: Option<&'a CommonFields>,
+    own: crate::server::record::OwnRecord<'a>,
     meta: &'static MetaFields,
 }
 
@@ -6949,15 +6957,19 @@ impl OwnView<'_> {
     /// C `dbGet` of `field` through `prec`: the type's own field, else its
     /// dbCommon's, as [`FieldRead::table`] routes the instance read.
     fn field(&self, field: &str) -> Option<EpicsValue> {
-        self.record
+        let own = self.own;
+        own.record()
             .get_field(field)
-            .or_else(|| common_field_of(self.record, self.common?, CommonField::by_name(field)?))
+            .or_else(|| match CommonField::by_name(field)? {
+                CommonField::Pact => Some(EpicsValue::Char(own.pact() as u8)),
+                field => common_field_of(own.record(), own.common(), field),
+            })
     }
 }
 
 impl FieldMetaSource for OwnView<'_> {
     fn rec(&self) -> &dyn Record {
-        self.record
+        self.own.record()
     }
     fn meta(&self) -> &'static MetaFields {
         self.meta
@@ -6966,17 +6978,16 @@ impl FieldMetaSource for OwnView<'_> {
         self.field(field)
     }
     fn enum_string_form(&self, field: &str) -> Option<EnumStringForm> {
-        enum_string_form_with(self.record, field, || {
-            device_choices_of(self.record.record_type(), self.common?.dtyp.as_str())
+        let record = self.own.record();
+        enum_string_form_with(record, field, || {
+            device_choices_of(record.record_type(), self.own.common().dtyp.as_str())
         })
     }
     fn metadata_at(&self, desc: &'static FieldDesc) -> Option<EpicsValue> {
         self.field(desc.name)
     }
     fn description(&self) -> PvString {
-        self.common
-            .map(|common| common.text.desc.clone())
-            .unwrap_or_default()
+        self.own.common().text.desc.clone()
     }
     // The info tags are behind the lock set.
     fn q_form_index(&self) -> Option<i16> {
@@ -6984,24 +6995,19 @@ impl FieldMetaSource for OwnView<'_> {
     }
 }
 
-/// C `dbGet` of `field` (canonical) of `record`, from inside that record's
-/// own processing: the value and the field's metadata from `record` and its
-/// dbCommon `common`, which need no lock. The info tags, behind the lock set,
-/// read as absent; so does dbCommon when the caller does not hold it. A
-/// link-backed field gets its C seeds: resolving its link would read through
-/// the lock set this record holds. `meta` is the record's
-/// [`RecordDesc::meta`].
+/// C `dbGet` of `field` (canonical) of the record `own`, from inside that
+/// record's own processing: the value and the field's metadata from its code
+/// and what its holder lent it, which need no lock. The info tags, behind the
+/// lock set, read as absent. A link-backed field gets its C seeds: resolving
+/// its link would read through the lock set this record holds. `meta` is the
+/// record's [`RecordDesc::meta`].
 pub(crate) fn own_field_snapshot(
-    record: &dyn Record,
-    common: Option<&CommonFields>,
+    own: crate::server::record::OwnRecord<'_>,
     meta: &'static MetaFields,
     field: &str,
 ) -> Option<super::super::snapshot::Snapshot> {
-    let view = OwnView {
-        record,
-        common,
-        meta,
-    };
+    let view = OwnView { own, meta };
+    let record = own.record();
     let value = view.field(field)?;
     let value = match declared_projection_of(declared_field_type_of(record, field), &value, || {
         record.field_is_long_string(field)
@@ -7009,12 +7015,7 @@ pub(crate) fn own_field_snapshot(
         Some(declared) => value.into_type(declared),
         None => value,
     };
-    let mut snap = match common {
-        Some(common) => common_snapshot(common, value),
-        None => {
-            super::super::snapshot::Snapshot::new(value, 0, 0, std::time::SystemTime::UNIX_EPOCH)
-        }
-    };
+    let mut snap = common_snapshot(own.common(), value);
     view.finish_metadata(field, LinkBacking::none(), &mut snap);
     Some(snap)
 }
@@ -7375,11 +7376,11 @@ impl RecordInstance {
         &mut self,
     ) -> crate::error::CaResult<crate::server::record::ProcessOutcome> {
         use crate::server::record::CycleHooks;
-        if self
-            .monitor_plan
-            .hooks
-            .has(CycleHooks::CONTEXT.union(CycleHooks::PROCESS_POSTED))
-        {
+        if self.monitor_plan.hooks.has(
+            CycleHooks::CONTEXT
+                .union(CycleHooks::PROCESS_POSTED)
+                .union(CycleHooks::OWN_FRAME),
+        ) {
             return self.process_hooked();
         }
         self.process_record()
@@ -7396,9 +7397,36 @@ impl RecordInstance {
     #[inline(never)]
     fn process_hooked(&mut self) -> crate::error::CaResult<crate::server::record::ProcessOutcome> {
         self.push_process_context();
-        let result = self.process_record();
+        let result = if self.has_hook(crate::server::record::CycleHooks::OWN_FRAME) {
+            let (record, own) = self.split_own();
+            record.process_own(own)
+        } else {
+            self.process_record()
+        };
         self.drain_process_posts();
         result
+    }
+
+    /// The record's code, and the [`crate::server::record::OwnFrame`] its
+    /// holder, the caller, lends it.
+    pub(crate) fn split_own(&mut self) -> (&mut dyn Record, crate::server::record::OwnFrame<'_>) {
+        let own = crate::server::record::OwnFrame::new(
+            self.name.as_bytes(),
+            &self.common,
+            &self.pact,
+            &self.cold.cell,
+        );
+        (&mut *self.record, own)
+    }
+
+    /// The one [`Record::special`] call: [`Record::special_own`] for a type
+    /// that declares [`crate::server::record::CycleHooks::OWN_FRAME`].
+    pub(crate) fn special(&mut self, field: &str, after: bool) -> crate::error::CaResult<()> {
+        if self.has_hook(crate::server::record::CycleHooks::OWN_FRAME) {
+            let (record, own) = self.split_own();
+            return record.special_own(field, after, own);
+        }
+        self.record.special(field, after, &self.common)
     }
 
     /// The drain of what a processing step posted: a type without
@@ -8510,7 +8538,13 @@ impl RecordInstance {
         err: &dyn Fn(&str),
     ) -> Option<crate::server::device_support::OwedDeviceInit> {
         let _init = crate::server::database::InitPass::enter();
-        if let Err(e) = self.record.init_record_with_links(reads) {
+        let init = if self.has_hook(crate::server::record::CycleHooks::OWN_FRAME) {
+            let (record, own) = self.split_own();
+            record.init_record_own(reads, own)
+        } else {
+            self.record.init_record_with_links(reads)
+        };
+        if let Err(e) = init {
             crate::stderr_println!("init_record(1) failed for {name}: {e}");
         }
         reads.apply(&mut self.common);
@@ -10208,10 +10242,7 @@ impl RecordInstance {
     fn common_field(&self, field: CommonField) -> Option<EpicsValue> {
         match field {
             CommonField::Pact => Some(EpicsValue::Char(
-                (self.is_processing()
-                    || (self.cold.cell.upgrade())
-                        .is_some_and(|cell| cell.chain_pact.load(Ordering::Relaxed)))
-                    as u8,
+                pact_field(&self.pact, &self.cold.cell) as u8
             )),
             field => common_field_of(&*self.record, &self.common, field),
         }
@@ -11119,7 +11150,7 @@ impl RecordInstance {
                 let moved = self.set_scan(new_scan);
                 if !matches!(moved, ScanMove::Done(CommonFieldPutResult::NoChange)) {
                     self.record.on_put(&name);
-                    if let Err(e) = self.record.special(&name, true, &self.common) {
+                    if let Err(e) = self.special(&name, true) {
                         let _ = moved.unlent(self);
                         return Err(e);
                     }
@@ -11299,7 +11330,7 @@ impl RecordInstance {
                     if old_phas != v && self.common.scan.scan_list().is_some() {
                         let scan = self.common.scan;
                         self.record.on_put(&name);
-                        self.record.special(&name, true, &self.common)?;
+                        self.special(&name, true)?;
                         return Ok(ScanMove::Done(CommonFieldPutResult::PhasChanged {
                             scan,
                             old_phas,
@@ -11484,7 +11515,7 @@ impl RecordInstance {
         // `dbPutSpecial(paddr, 1)` status to the caller — the stored value
         // stays, but the monitor post and the process are skipped and the
         // client sees the failure. Never drop it.
-        let special = self.record.special(&name, true, &self.common);
+        let special = self.special(&name, true);
         match link {
             Some(link) if matches!(&*name, "INP" | "OUT") => {
                 self.rebind_device_link(bound, link, special)?

@@ -9,6 +9,8 @@ bare { out "%(src).1f"; }
 # formatValue: dbGet of the field, a CHAR array printed as one string
 own_egu { out "%(EGU)s"; }
 own_desc { out "%(DESC)s"; }
+# the record's own PACT: before Stream::process sets it, then after
+own_pact { out "%(PACT)d"; out "%(PACT)d"; }
 chars { out "%(w)s"; }
 
 # matchValue: dbPutField into another record, dbPut into this one or in @init

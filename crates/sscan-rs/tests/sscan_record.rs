@@ -136,6 +136,25 @@ async fn a_one_dimensional_scan_fills_positioner_and_detector_arrays() {
     assert_eq!(f64_of(&db, "S.EXSC"), 0.0);
 }
 
+/// C's `dbGet` of the scan's own dbCommon field reads it through `prec`.
+#[epics_base_rs::epics_test]
+async fn a_detector_on_the_scans_own_dbcommon_field_reads_it() {
+    let db = ioc(r#"record(sscan, "S") {
+  field(PRIO, "HIGH")
+  field(MPTS, "10")
+  field(NPTS, "3")
+  field(P1PV, "M")
+  field(P1SP, "1")
+  field(P1EP, "3")
+  field(D01PV, "S.PRIO")
+}"#)
+    .await;
+    connected(&db, "S", &["P1NV", "D01NV"]).await;
+    start(&db, "S").await;
+    finished(&db, "S").await;
+    assert_eq!(arr(&db, "S.D01DA", 3), [2.0, 2.0, 2.0]);
+}
+
 #[epics_base_rs::epics_test]
 async fn a_second_scan_reports_its_own_data() {
     let db = ioc(ONE_D).await;

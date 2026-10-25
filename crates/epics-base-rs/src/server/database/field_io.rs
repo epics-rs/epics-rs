@@ -896,7 +896,7 @@ fn special_after_put(
         let name = instance.name.clone();
         db.link_check_held(name.as_bytes(), instance);
     }
-    let mut status = instance.record.special(field, true, &instance.common);
+    let mut status = instance.special(field, true);
     collect_after_gate(instance, tail);
     collect_put_report(instance, status.is_err(), tail);
     // The record's half above and the registry half here are ONE C function,
@@ -3106,10 +3106,7 @@ impl PvDatabase {
                     gate_link(&mut instance, field, common, at, tail)
                 }
             })
-            .and_then(|()| {
-                let inst = &mut *instance;
-                inst.record.special(field, false, &inst.common)
-            })
+            .and_then(|()| instance.special(field, false))
             .and_then(|()| linconv_special(&mut instance, field, false, &mut burst));
         if let Err(e) = pass0 {
             self.remove_put_link(&instance, field, before);

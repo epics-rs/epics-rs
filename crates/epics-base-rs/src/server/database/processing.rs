@@ -130,8 +130,8 @@ use crate::server::record::record_instance::{
     ForwardTarget, FwdLink, FwdLinkRest, LinkScanMove, ScanAdd, ScanMove,
 };
 use crate::server::record::{
-    CycleHooks, CycleLink, InputFetchPolicy, NotifyWaitSet, PactExit, RawSoftEntry, RecordCell,
-    RecordInstance, RecordMut, SoftRead, SoftReading, StampPoint,
+    CycleHooks, CycleLink, InputFetchPolicy, NotifyWaitSet, OwnFrame, OwnRecord, PactExit,
+    RawSoftEntry, RecordCell, RecordInstance, RecordMut, SoftRead, SoftReading, StampPoint,
 };
 use crate::types::{DbFieldType, EpicsValue, PvString, RecordName};
 
@@ -783,16 +783,6 @@ impl PostItem for (String, EpicsValue, PostRule) {
     }
 }
 
-/// The record a caller of [`AsyncDbHandle::db_get`] or
-/// [`AsyncDbHandle::name_to_dbaddr`] is inside: its name, its code, and its
-/// dbCommon when the caller holds it. C reads them all through `prec`.
-#[derive(Clone, Copy)]
-pub struct OwnRecord<'a> {
-    pub name: &'a [u8],
-    pub record: &'a dyn crate::server::record::Record,
-    pub common: Option<&'a crate::server::record::CommonFields>,
-}
-
 /// A cycle-free handle for driving async-side database updates from
 /// OUTSIDE a record's `process()` cycle.
 ///
@@ -903,6 +893,21 @@ impl<'a> HeldInstance<'a> {
         let mut instance = self.rec.write();
         let instance = &mut *instance;
         f(&mut *instance.record, &mut instance.common)
+    }
+
+    /// The record, and the [`OwnFrame`] the hold lends its code, for `f`
+    /// alone.
+    ///
+    /// # Panics
+    ///
+    /// As [`Self::with`].
+    pub fn with_own<R>(
+        &self,
+        f: impl FnOnce(&mut dyn crate::server::record::Record, OwnFrame<'_>) -> R,
+    ) -> R {
+        let mut instance = self.rec.write();
+        let (record, own) = instance.split_own();
+        f(record, own)
     }
 
     /// [`Self::with`] with the record's bound device as well; `None` when
@@ -1165,7 +1170,7 @@ impl AsyncDbHandle {
         }
         let no_elements = cell.resolve_addr(&field)?;
         db.db_get_snapshot(&[record.as_bytes(), b".", field.as_bytes()].concat(), own);
-        let own = own.and_then(|own| (own.name == record.as_bytes()).then_some(own.record));
+        let own = own.and_then(|own| (own.name() == record.as_bytes()).then_some(own.record()));
         let field_type = cell.addressed_field_type(&field, own);
         Some(DbAddr {
             record,
@@ -1368,6 +1373,23 @@ impl AsyncDbHandle {
         let instance = &mut *instance;
         let r = f(&mut *instance.record, &mut instance.common);
         super::field_io::emit_cycle_posts(instance);
+        Some(r)
+    }
+
+    /// [`with_record`](Self::with_record) with the [`OwnFrame`] the hold
+    /// lends the record's code: sscan's link callbacks, which read PVs that
+    /// can be the scan's own fields (`sscanRecord.c:2752`). `None` if the
+    /// record or the database is gone.
+    pub fn with_own<R>(
+        &self,
+        name: impl AsRef<[u8]>,
+        f: impl FnOnce(&mut dyn crate::server::record::Record, OwnFrame<'_>) -> R,
+    ) -> Option<R> {
+        let rec = self.db()?.get_record(name.as_ref())?;
+        let mut instance = rec.write();
+        let (record, own) = instance.split_own();
+        let r = f(record, own);
+        super::field_io::emit_cycle_posts(&mut instance);
         Some(r)
     }
 
@@ -13590,7 +13612,7 @@ impl PvDatabase {
         let (base, field) = super::parse_pv_name(name);
         let cell = self.get_record(base)?;
         let field = cell.canonical_field(field);
-        let own = own.and_then(|own| Some((self.get_record(own.name)?, own)));
+        let own = own.and_then(|own| Some((self.get_record(own.name())?, own)));
         let policy = ReadPolicy::NoWait {
             own: own.as_ref().map(|(cell, own)| (&**cell, *own)),
         };

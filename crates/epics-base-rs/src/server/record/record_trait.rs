@@ -2656,12 +2656,81 @@ impl<'a> Pact<'a> {
     }
 }
 
+/// What a holder lends the code of the record it holds: the record's name,
+/// its dbCommon and its PACT, all of which C's code reaches through `prec`.
+/// Only a holder makes one, so a view of the record ([`OwnRecord`]) without
+/// them cannot be made.
+#[derive(Clone, Copy)]
+pub struct OwnFrame<'a> {
+    name: &'a [u8],
+    common: &'a CommonFields,
+    pact: &'a std::sync::atomic::AtomicBool,
+    cell: &'a std::sync::Weak<super::record_instance::RecordCell>,
+}
+
+impl<'a> OwnFrame<'a> {
+    pub(crate) fn new(
+        name: &'a [u8],
+        common: &'a CommonFields,
+        pact: &'a std::sync::atomic::AtomicBool,
+        cell: &'a std::sync::Weak<super::record_instance::RecordCell>,
+    ) -> Self {
+        Self {
+            name,
+            common,
+            pact,
+            cell,
+        }
+    }
+
+    /// The record's dbCommon.
+    pub fn common(self) -> &'a CommonFields {
+        self.common
+    }
+
+    /// The record this frame is lent for, whose code is `record`.
+    pub fn of(self, record: &'a dyn Record) -> OwnRecord<'a> {
+        OwnRecord {
+            frame: self,
+            record,
+        }
+    }
+}
+
+/// The record a caller of [`crate::server::database::AsyncDbHandle::db_get`]
+/// or [`crate::server::database::AsyncDbHandle::name_to_dbaddr`] is inside:
+/// its code and what its holder lent it ([`OwnFrame::of`]).
+#[derive(Clone, Copy)]
+pub struct OwnRecord<'a> {
+    frame: OwnFrame<'a>,
+    record: &'a dyn Record,
+}
+
+impl<'a> OwnRecord<'a> {
+    pub(crate) fn name(self) -> &'a [u8] {
+        self.frame.name
+    }
+
+    pub(crate) fn record(self) -> &'a dyn Record {
+        self.record
+    }
+
+    pub(crate) fn common(self) -> &'a CommonFields {
+        self.frame.common
+    }
+
+    /// The PACT field, as the record's instance reads it.
+    pub(crate) fn pact(self) -> bool {
+        super::record_instance::pact_field(self.frame.pact, self.frame.cell)
+    }
+}
+
 /// Which of the per-cycle hooks a type can answer with something other than
 /// the trait default. C has no such hooks (`dbCommon` is read as a struct
 /// member), so the cycle settles this once, in the plan, and a type that
 /// claims a bit not set here is never asked.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct CycleHooks(u16);
+pub struct CycleHooks(u32);
 
 impl Default for CycleHooks {
     fn default() -> Self {
@@ -2697,7 +2766,7 @@ impl CycleHooks {
     /// previous TIME. The stamp bit has no constant of its own: only the
     /// tail's owners stamp.
     pub const HAND_POSTED_OWN_STAMP: Self = Self(Self::HAND_POSTED.0 | Self::OWN_STAMP);
-    const OWN_STAMP: u16 = 256;
+    const OWN_STAMP: u32 = 256;
     /// [`Record::gate_after_pre_input_reads`]: outside [`Self::ALL`],
     /// declared by the type whose cycle hangs on a pre-input read.
     pub const PRE_INPUT_GATE: Self = Self(512);
@@ -2725,6 +2794,11 @@ impl CycleHooks {
     /// Outside [`Self::ALL`]: a type declares it. A type that checks later
     /// in `process()` returns [`ProcessAction::CheckLinks`] instead.
     pub const LINK_CHECK: Self = Self(32768);
+    /// [`Record::process_own`], [`Record::special_own`] and
+    /// [`Record::init_record_own`] in place of the calls without a frame: the
+    /// type's code reads its own record through what its holder lends it.
+    /// Outside [`Self::ALL`]: a type declares it.
+    pub const OWN_FRAME: Self = Self(65536);
     /// No hook acts: the stock record.
     pub const NONE: Self = Self(0);
     /// Every per-cycle hook is asked — the default, so a type that never says
@@ -2777,6 +2851,7 @@ const _: () = {
         CycleHooks::STAMP_REQUEST.0,
         CycleHooks::MONITOR_RESET.0,
         CycleHooks::LINK_CHECK.0,
+        CycleHooks::OWN_FRAME.0,
     ];
     let mut seen = 0;
     let mut i = 0;
@@ -3872,6 +3947,11 @@ pub trait Record: RecordAny + Send + Sync + 'static {
     /// side-effect actions for the framework to execute.
     fn process(&mut self) -> CaResult<ProcessOutcome> {
         Ok(ProcessOutcome::complete())
+    }
+
+    /// [`Self::process`], for a type that declares [`CycleHooks::OWN_FRAME`].
+    fn process_own(&mut self, _own: OwnFrame<'_>) -> CaResult<ProcessOutcome> {
+        self.process()
     }
 
     /// Optional: report whether this record's last `process()` call
@@ -5427,6 +5507,12 @@ pub trait Record: RecordAny + Send + Sync + 'static {
         Ok(())
     }
 
+    /// [`Self::init_record_with_links`], for a type that declares
+    /// [`CycleHooks::OWN_FRAME`].
+    fn init_record_own(&mut self, reads: &mut InitLinkReads, _own: OwnFrame<'_>) -> CaResult<()> {
+        self.init_record_with_links(reads)
+    }
+
     /// Did `init_record` leave the record PERMANENTLY ACTIVE — C's
     /// `prec->pact = TRUE` inside `init_record`, which is how a record type
     /// disables itself when it cannot possibly process?
@@ -6069,6 +6155,11 @@ pub trait Record: RecordAny + Send + Sync + 'static {
         _common: &crate::server::record::CommonFields,
     ) -> CaResult<()> {
         Ok(())
+    }
+
+    /// [`Self::special`], for a type that declares [`CycleHooks::OWN_FRAME`].
+    fn special_own(&mut self, field: &str, after: bool, own: OwnFrame<'_>) -> CaResult<()> {
+        self.special(field, after, own.common())
     }
 
     /// The period of this record's monitor watchdog, or `None` when it has

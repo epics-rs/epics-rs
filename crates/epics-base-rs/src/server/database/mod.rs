@@ -24,6 +24,7 @@ pub(crate) mod scan_index;
 mod snapshot;
 mod subroutine_context;
 
+pub use crate::server::record::OwnRecord;
 pub use ca_client::{
     CaClientContext, CaClientService, ClientChannel, ClientFuture, ClientMonitor, Connection,
     InProcessChannel, InProcessEvents, InProcessSubscription, PutCompletion,
@@ -51,7 +52,7 @@ pub(crate) use links::{
 };
 pub use processing::{
     AsyncDbHandle, AsyncToken, CaLinkInit, DbAddr, DeviceDone, DeviceDoneSource, ExternalCpProcess,
-    FieldPut, HeldInstance, InitHold, InputLinkTexts, OwnRecord, PostItem, PostRule, ProcStack,
+    FieldPut, HeldInstance, InitHold, InputLinkTexts, PostItem, PostRule, ProcStack,
     ProcessCallback, TokenWatch, hop_floor,
 };
 pub(crate) use processing::{NotifiedRead, ReadPolicy, seed_record_constants};
@@ -2967,7 +2968,7 @@ impl PvDatabase {
                 Some(link) => inst.put_link_field(link, value),
                 None => inst.put_declared_field(field, value),
             };
-            let _ = inst.record.special(field, true, &inst.common);
+            let _ = inst.special(field, true);
             put
         };
         debug_assert!(put.is_ok(), "{field} is a link field with no writer");
@@ -3048,8 +3049,7 @@ impl PvDatabase {
             && !string_view
         {
             return crate::server::record::record_instance::own_field_snapshot(
-                own.record,
-                own.common,
+                own,
                 record.rdes().meta,
                 field,
             );

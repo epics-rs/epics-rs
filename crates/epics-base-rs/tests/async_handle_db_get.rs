@@ -9,9 +9,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use epics_base_rs::server::database::{OwnRecord, PvDatabase};
+use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
-use epics_base_rs::server::record::{AlarmSeverity, Record};
+use epics_base_rs::server::record::AlarmSeverity;
 use epics_base_rs::server::snapshot::Snapshot;
 use epics_base_rs::types::{DbFieldType, EpicsValue};
 
@@ -157,23 +157,11 @@ fn metadata(s: &Snapshot) -> Meta {
     )
 }
 
-/// `name`'s record, from inside it, with no dbCommon in hand.
-fn own<'a>(name: &'a str, record: &'a dyn Record) -> Option<OwnRecord<'a>> {
-    Some(OwnRecord {
-        name: name.as_bytes(),
-        record,
-        common: None,
-    })
-}
-
 /// `db_get` of `name` from inside `own`'s processing, as `own` calls it.
 fn from_inside(db: &PvDatabase, own: &str, name: &str, ty: DbFieldType) -> Option<Snapshot> {
     let h = db.async_handle();
-    let mut got = None;
-    h.with_record(own, |rec| {
-        got = h.db_get(name, ty, 1, self::own(own, &*rec));
-    });
-    got
+    h.with_own(own, |rec, own| h.db_get(name, ty, 1, Some(own.of(&*rec))))
+        .flatten()
 }
 
 #[epics_macros_rs::epics_test]
@@ -191,23 +179,21 @@ async fn db_get_from_inside_a_record_serves_its_own_metadata() {
     assert_eq!(got.control_limits(), Some((-9.0, 9.0)));
 }
 
-/// C's `dbGet` reads the caller's dbCommon through `prec` as it reads the
-/// record's own fields.
+/// C's `dbGet` reads the caller's dbCommon and PACT through `prec` as it
+/// reads the record's own fields.
 #[epics_macros_rs::epics_test]
 async fn db_get_from_inside_a_record_reads_its_dbcommon() {
     let db = ioc().await;
     let h = db.async_handle();
-    let (sevr, desc) = h
-        .with_instance("AI", |rec, common| {
-            common.sevr = AlarmSeverity::Major;
-            let own = Some(OwnRecord {
-                name: b"AI",
-                record: &*rec,
-                common: Some(&*common),
-            });
+    h.with_instance("AI", |_, common| common.sevr = AlarmSeverity::Major);
+    db.get_record("AI").unwrap().read().enter_pact();
+    let (sevr, desc, pact) = h
+        .with_own("AI", |rec, own| {
+            let own = Some(own.of(&*rec));
             (
                 h.db_get("AI.SEVR", DbFieldType::Short, 1, own),
                 h.db_get("AI.DESC", DbFieldType::String, 1, own),
+                h.db_get("AI.PACT", DbFieldType::Short, 1, own),
             )
         })
         .expect("AI is loaded");
@@ -218,6 +204,7 @@ async fn db_get_from_inside_a_record_reads_its_dbcommon() {
         desc.map(|s| s.value),
         Some(EpicsValue::String("beam".into()))
     );
+    assert_eq!(pact.map(|s| s.value), Some(EpicsValue::Short(1)));
 }
 
 #[epics_macros_rs::epics_test]
@@ -237,16 +224,15 @@ async fn db_get_from_inside_a_record_sees_its_own_metadata_writes() {
 async fn db_get_from_inside_a_record_serves_metadata_it_wrote_in_place() {
     let db = ioc().await;
     let h = db.async_handle();
-    let mut got = None;
-    h.with_record("AI", |rec| {
+    let got = h.with_own("AI", |rec, own| {
         rec.put_field("EGU", EpicsValue::String("um".into()))
             .unwrap();
         rec.put_field("PREC", EpicsValue::Short(5)).unwrap();
         rec.put_field("HOPR", EpicsValue::Double(20.0)).unwrap();
         rec.put_field("LOPR", EpicsValue::Double(-20.0)).unwrap();
-        got = h.db_get("AI.VAL", DbFieldType::Double, 1, own("AI", &*rec));
+        h.db_get("AI.VAL", DbFieldType::Double, 1, Some(own.of(&*rec)))
     });
-    let got = got.expect("AI.VAL reads");
+    let got = got.flatten().expect("AI.VAL reads");
     assert_eq!(got.units().map(|u| u.to_string()), Some("um".into()));
     assert_eq!(got.precision(), Some(5));
     assert_eq!(got.graphic_limits(), Some((-20.0, 20.0)));
@@ -267,19 +253,19 @@ async fn db_get_from_inside_a_record_resolves_a_link_that_reaches_it() {
 async fn db_get_from_inside_a_record_does_not_lock_it_again() {
     let db = ioc().await;
     let h = db.async_handle();
-    let mut got = None;
-    h.with_record("H", |rec| {
+    let got = h.with_own("H", |rec, own| {
+        let own = Some(own.of(&*rec));
         let mine = h
-            .db_get("H.VAL", DbFieldType::Double, 1, own("H", &*rec))
+            .db_get("H.VAL", DbFieldType::Double, 1, own)
             .map(|s| s.value);
         // A link-backed field of another record whose link names this one:
         // resolving it locks H unless it reads H from itself.
         let other = h
-            .db_get("C.A", DbFieldType::Double, 1, own("H", &*rec))
+            .db_get("C.A", DbFieldType::Double, 1, own)
             .map(|s| s.value);
-        got = Some((mine, other, h.name_to_addr("H.VAL")));
+        (mine, other, h.name_to_addr("H.VAL"))
     });
-    let (mine, other, nelem) = got.expect("with_record ran");
+    let (mine, other, nelem) = got.expect("with_own ran");
     assert!(mine.is_some(), "the record's own field reads");
     assert_eq!(other, Some(EpicsValue::Double(0.0)));
     assert_eq!(nelem, Some(1));

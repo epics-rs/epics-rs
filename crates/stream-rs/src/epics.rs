@@ -40,7 +40,7 @@ use epics_base_rs::runtime::task::{
 };
 use epics_base_rs::server::database::{
     AsyncDbHandle, DbAddr, DeviceDone, DeviceDoneSource, FieldPut, HeldInstance, InitHold,
-    OwnRecord, ProcessCallback, UnheldLinkPut,
+    ProcessCallback, UnheldLinkPut,
 };
 use epics_base_rs::server::device_support::{
     DeviceInitOutcome, DevicePost, DeviceReadOutcome, DeviceSupport, IoIntrCmd, ReadStart,
@@ -55,8 +55,8 @@ use epics_base_rs::server::recgbl::{
     AlarmResetResult, EventMask, alarm_condition_string, get_time_stamp, rec_gbl_set_sevr,
 };
 use epics_base_rs::server::record::{
-    AlarmSeverity, CommonFields, EPICS_TIME_EVENT_DEVICE_TIME, HwLink, ParsedLink, Record,
-    ScanType, parse_link_v2,
+    AlarmSeverity, CommonFields, EPICS_TIME_EVENT_DEVICE_TIME, HwLink, OwnFrame, ParsedLink,
+    Record, ScanType, parse_link_v2,
 };
 use epics_base_rs::types::{DbFieldType, EpicsValue, PvString, RecordName, WallTime};
 use epics_libcom_rs::cfmt::CFloat;
@@ -456,6 +456,12 @@ impl RecordSlot {
                 f(record.as_mut(), common.as_mut())
             },
         })
+    }
+
+    /// The record and the frame its hold lends it; `None` for a borrowed
+    /// record, from which `scanDelete`'s abort formats nothing.
+    fn with_own<R>(&self, f: impl FnOnce(&mut dyn Record, OwnFrame<'_>) -> R) -> Option<R> {
+        self.held(|held| held.with_own(f))
     }
 
     /// The hold, for a `%(record.FIELD)` input's puts and processes; `None`
@@ -1030,16 +1036,9 @@ impl StreamHooks {
         let name = [addr.record.as_bytes(), b".", field.as_bytes()].concat();
         let nelem = addr.no_elements as usize;
         let snap = if own {
-            let own = self.shared.name.as_bytes();
-            self.with_record(|rec, common| {
-                let own = OwnRecord {
-                    name: own,
-                    record: &*rec,
-                    common: Some(&*common),
-                };
-                db.db_get(&name, dbr, nelem, Some(own))
-            })
-            .flatten()
+            (self.shared.slot)
+                .with_own(|rec, own| db.db_get(&name, dbr, nelem, Some(own.of(&*rec))))
+                .flatten()
         } else {
             db.db_get(&name, dbr, nelem, None)
         };
@@ -1662,15 +1661,9 @@ impl StreamCoreHooks for StreamHooks {
         let db = self.shared.db.get()?;
         let own = self.shared.name.as_bytes();
         let resolve = |name: &[u8]| {
-            self.with_record(|record, common| {
-                let own = OwnRecord {
-                    name: own,
-                    record: &*record,
-                    common: Some(&*common),
-                };
-                db.name_to_dbaddr(name, Some(own))
-            })
-            .unwrap_or_else(|| db.name_to_dbaddr(name, None))
+            (self.shared.slot)
+                .with_own(|record, own| db.name_to_dbaddr(name, Some(own.of(&*record))))
+                .unwrap_or_else(|| db.name_to_dbaddr(name, None))
         };
         if fieldname.contains(&b'.') {
             // record.FIELD (access to other record)

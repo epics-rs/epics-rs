@@ -11,9 +11,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use epics_base_rs::error::{CaError, CaResult};
-use epics_base_rs::server::database::{AsyncDbHandle, OwnRecord, PvDatabase};
+use epics_base_rs::server::database::{AsyncDbHandle, PvDatabase};
 use epics_base_rs::server::ioc_builder::IocBuilder;
-use epics_base_rs::server::record::{FieldDesc, ProcessOutcome, Record};
+use epics_base_rs::server::record::{CycleHooks, FieldDesc, OwnFrame, ProcessOutcome, Record};
 use epics_base_rs::types::{DbFieldType, EpicsValue, RecordName};
 
 static FIELDS: &[FieldDesc] = &[
@@ -29,7 +29,6 @@ static FIELDS: &[FieldDesc] = &[
 #[derive(Default)]
 struct Scan {
     handle: Option<AsyncDbHandle>,
-    name: String,
     val: f64,
     pv: String,
     cnt: i32,
@@ -40,24 +39,17 @@ impl Record for Scan {
     fn record_type(&self) -> &'static str {
         "scan"
     }
-    fn process(&mut self) -> CaResult<ProcessOutcome> {
+    fn process_own(&mut self, own: OwnFrame<'_>) -> CaResult<ProcessOutcome> {
         let h = self.handle.clone().expect("async context set");
-        let name = self.name.clone();
-        if h.db_get(
-            &self.pv,
-            DbFieldType::Double,
-            1,
-            Some(OwnRecord {
-                name: name.as_bytes(),
-                record: self,
-                common: None,
-            }),
-        )
-        .is_some()
+        if h.db_get(&self.pv, DbFieldType::Double, 1, Some(own.of(self)))
+            .is_some()
         {
             self.nrd += 1;
         }
         Ok(ProcessOutcome::complete())
+    }
+    fn cycle_hooks(&self) -> CycleHooks {
+        CycleHooks::ALL.union(CycleHooks::OWN_FRAME)
     }
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
@@ -88,8 +80,7 @@ impl Record for Scan {
         }
         Ok(())
     }
-    fn set_async_context(&mut self, name: RecordName, db: AsyncDbHandle) {
-        self.name = String::from_utf8_lossy(name.as_bytes()).into_owned();
+    fn set_async_context(&mut self, _name: RecordName, db: AsyncDbHandle) {
         self.handle = Some(db);
     }
     fn declared_fields(&self) -> &'static [FieldDesc] {

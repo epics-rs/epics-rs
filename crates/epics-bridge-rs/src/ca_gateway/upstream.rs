@@ -143,6 +143,15 @@ fn channel_placeholder(channel: &CaChannel) -> EpicsValue {
     }
 }
 
+/// The C gateway's `ca_array_get_callback` of a `class` of the native type
+/// (`gatePv.cc:954`, `:979`) and its `DBE_PROPERTY` event data (`:859`): no
+/// deadline, so it ends on the answer or a disconnect.
+async fn class_get(channel: &CaChannel, class: fn(&DbFieldType) -> u16) -> CaResult<Snapshot> {
+    channel
+        .get_callback(class(&channel.native_field_type()?), 0)?
+        .await
+}
+
 /// The shadow metadata a `DBR_CTRL_*` get carries (C `setPvData`).
 fn ctrl_metadata(snap: &Snapshot) -> epics_base_rs::server::pv::PvMetadata {
     epics_base_rs::server::pv::PvMetadata {
@@ -620,13 +629,10 @@ impl ChannelEventOwner {
         if self.ctrl_timeout.is_zero() {
             return None;
         }
-        epics_base_rs::runtime::task::timeout(
-            self.ctrl_timeout,
-            channel.get_with_metadata(DbrClass::Ctrl),
-        )
-        .await
-        .ok()
-        .and_then(Result::ok)
+        channel
+            .get_with_metadata(DbrClass::Ctrl, self.ctrl_timeout)
+            .await
+            .ok()
     }
 
     /// C `eventCB` / `propEventCB` on a pending life (gatePv.cc:1432-1441,
@@ -1044,23 +1050,21 @@ impl UpstreamManager {
         let initial_value = if !self.cache_mode.is_no_cache() {
             channel_placeholder(&channel)
         } else {
-            match epics_base_rs::runtime::task::timeout(Duration::from_millis(500), channel.get())
-                .await
-            {
-                Ok(Ok((_dbf, v))) => v,
-                Ok(Err(e)) => {
+            match channel.get_with_timeout(Duration::from_millis(500)).await {
+                Ok((_dbf, v)) => v,
+                Err(CaError::Timeout) => {
                     tracing::info!(
                         pv = upstream_name,
-                        error = %e,
-                        "ca-gateway-rs: DBR negotiation get failed; \
+                        "ca-gateway-rs: DBR negotiation get timed out; \
                          using upstream native type/count placeholder"
                     );
                     channel_placeholder(&channel)
                 }
-                Err(_) => {
+                Err(e) => {
                     tracing::info!(
                         pv = upstream_name,
-                        "ca-gateway-rs: DBR negotiation get timed out; \
+                        error = %e,
+                        "ca-gateway-rs: DBR negotiation get failed; \
                          using upstream native type/count placeholder"
                     );
                     channel_placeholder(&channel)
@@ -1117,7 +1121,7 @@ impl UpstreamManager {
         // In no-cache mode (C `-no_cache`), serve each downstream GET
         // from a FRESH upstream fetch instead of the shadow snapshot:
         // install a read hook that forwards to the shared upstream
-        // channel with a metadata-bearing `get_with_metadata(DbrClass::Time)`.
+        // channel with a metadata-bearing `DBR_TIME_*` [`class_get`].
         // C `-no_cache` reads issue `ca_array_get_callback(eventType(), ...)`
         // with `eventType()` a `DBR_TIME_*` class, and `getTimeCB` decodes
         // the event's status/severity/timestamp into `setEventData`
@@ -1133,7 +1137,7 @@ impl UpstreamManager {
             let ch = channel.clone();
             pv.set_read_hook(Arc::new(move || {
                 let ch = ch.clone();
-                Box::pin(async move { ch.get_with_metadata(DbrClass::Time).await })
+                Box::pin(async move { class_get(&ch, DbFieldType::time_dbr_type).await })
             }));
         }
 
@@ -1158,29 +1162,27 @@ impl UpstreamManager {
             // metadata too fast to time out.
             false
         } else {
-            match epics_base_rs::runtime::task::timeout(
-                self.metadata_seed_timeout,
-                channel.get_with_metadata(DbrClass::Ctrl),
-            )
-            .await
+            match channel
+                .get_with_metadata(DbrClass::Ctrl, self.metadata_seed_timeout)
+                .await
             {
-                Ok(Ok(meta_snap)) => {
+                Ok(meta_snap) => {
                     pv.set_metadata(ctrl_metadata(&meta_snap));
                     true
                 }
-                Ok(Err(e)) => {
+                Err(CaError::Timeout) => {
                     tracing::info!(
                         pv = upstream_name,
-                        error = %e,
-                        "ca-gateway-rs: initial CTRL metadata get failed; \
+                        "ca-gateway-rs: initial CTRL metadata get timed out; \
                          property monitor's first event will seed it"
                     );
                     false
                 }
-                Err(_) => {
+                Err(e) => {
                     tracing::info!(
                         pv = upstream_name,
-                        "ca-gateway-rs: initial CTRL metadata get timed out; \
+                        error = %e,
+                        "ca-gateway-rs: initial CTRL metadata get failed; \
                          property monitor's first event will seed it"
                     );
                     false
@@ -1514,7 +1516,7 @@ impl UpstreamManager {
     /// The subscription requests the `DBE_PROPERTY` mask (autosize count=0)
     /// and acts purely as a *trigger*: its delivered payload is the value
     /// type and carries no metadata, so each event drives a fresh
-    /// `get_with_metadata(DbrClass::Ctrl)` to read the new
+    /// `DBR_CTRL_*` [`class_get`] to read the new
     /// limits/precision/enum-labels. DBE_PROPERTY events are rare (metadata
     /// seldom changes), so the extra control get per event is cheap. The
     /// decoded CTRL snapshot carries the upstream status/severity and an
@@ -1527,7 +1529,7 @@ impl UpstreamManager {
     /// redundant ONLY when `seed_succeeded` — i.e. the connect-time control
     /// get in `ensure_subscribed` already seeded metadata. If that seed did
     /// NOT land (slow/failed 500 ms get), the first event is instead consumed
-    /// to seed: it drives the same `get_with_metadata(DbrClass::Ctrl)` the
+    /// to seed: it drives the same `DBR_CTRL_*` get the
     /// seed would have, closing the window where a stable PV's metadata would
     /// otherwise stay zeroed until a *second* property change that may never
     /// come. Every later event (including a reconnect's initial event, which
@@ -1638,7 +1640,7 @@ impl UpstreamManager {
                     // A property change fired: re-read the full control
                     // metadata (units/precision/limits/enum-labels + upstream
                     // status/severity) and refresh + fan out downstream.
-                    match channel.get_with_metadata(DbrClass::Ctrl).await {
+                    match class_get(&channel, DbFieldType::ctrl_dbr_type).await {
                         Ok(meta_snap) => {
                             // On a pending life it readies the PV instead,
                             // unless it is life 0's initial event: a pending
@@ -1869,9 +1871,9 @@ impl UpstreamManager {
             .map_err(|e| BridgeError::PutRejected(format!("upstream put: {e}")))
     }
 
-    /// Get the current value from upstream. Reuses the subscribed
-    /// channel when available; otherwise opens a transient one.
-    pub async fn get(&self, upstream_name: &str) -> BridgeResult<EpicsValue> {
+    /// Get the current value from upstream within `timeout`. Reuses the
+    /// subscribed channel when available; otherwise opens a transient one.
+    pub async fn get(&self, upstream_name: &str, timeout: Duration) -> BridgeResult<EpicsValue> {
         let channel_for_op = self
             .subs
             .lock()
@@ -1879,14 +1881,14 @@ impl UpstreamManager {
             .map(|s| s.channel.clone());
         if let Some(ch) = channel_for_op {
             let (_dbf, value) = ch
-                .get()
+                .get_with_timeout(timeout)
                 .await
                 .map_err(|e| BridgeError::PutRejected(format!("upstream get: {e}")))?;
             return Ok(value);
         }
         let channel = self.client.create_channel(upstream_name);
         let (_dbf, value) = channel
-            .get()
+            .get_with_timeout(timeout)
             .await
             .map_err(|e| BridgeError::PutRejected(format!("upstream get: {e}")))?;
         Ok(value)
@@ -3573,10 +3575,10 @@ ASG(NewGroup) {
             dones.push(done);
         }
 
-        let (_, value) = tokio::time::timeout(bound, other.get())
+        let (_, value) = other
+            .get_with_timeout(bound)
             .await
-            .expect("the other channel answers while the puts are held")
-            .expect("get");
+            .expect("the other channel answers while the puts are held");
         assert_eq!(value, EpicsValue::Double(2.0));
 
         for done in dones {

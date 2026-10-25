@@ -685,7 +685,7 @@ async fn p_array_exposes_gr_and_ctrl_limit_metadata() {
     // DBR_CTRL is the superset: it carries the graphic (display) limits AND
     // the control limits, so one GET pins both halves of the family.
     let snap = ch
-        .get_with_metadata(DbrClass::Ctrl)
+        .get_with_metadata(DbrClass::Ctrl, Duration::from_secs(30))
         .await
         .expect("DBR_CTRL get");
 

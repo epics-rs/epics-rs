@@ -96,7 +96,12 @@ async fn pair() -> (CaClient, CaChannel, CaChannel) {
 /// extension used to happen.
 async fn round_trip(dst: &CaChannel, value: &EpicsValue) -> Vec<i32> {
     dst.put(value).await.expect("put into LONG waveform");
-    match dst.get().await.expect("read back LONG waveform").1 {
+    match dst
+        .get_with_timeout(fact_budget::FACT_BUDGET)
+        .await
+        .expect("read back LONG waveform")
+        .1
+    {
         EpicsValue::LongArray(v) => v.to_vec(),
         other => panic!("expected a LONG waveform readback, got {other:?}"),
     }
@@ -106,7 +111,10 @@ async fn round_trip(dst: &CaChannel, value: &EpicsValue) -> Vec<i32> {
 #[serial]
 async fn a_plain_get_of_a_char_waveform_re_puts_unsigned() {
     let (_client, src, dst) = pair().await;
-    let (_, value) = src.get().await.expect("plain get");
+    let (_, value) = src
+        .get_with_timeout(fact_budget::FACT_BUDGET)
+        .await
+        .expect("plain get");
     assert_eq!(
         round_trip(&dst, &value).await.as_slice(),
         UNSIGNED,
@@ -155,7 +163,7 @@ async fn a_monitor_of_a_char_waveform_re_puts_unsigned() {
 async fn a_compound_char_get_re_puts_unsigned() {
     let (_client, src, dst) = pair().await;
     let snap = src
-        .get_with_metadata(DbrClass::Time)
+        .get_with_metadata(DbrClass::Time, fact_budget::FACT_BUDGET)
         .await
         .expect("DBR_TIME_CHAR get");
     assert_eq!(
@@ -172,7 +180,10 @@ async fn caget_still_renders_the_signed_reading() {
     use epics_ca_rs::cli::{CountPrefix, ValueFormat, format_value};
 
     let (_client, src, _dst) = pair().await;
-    let (_, value) = src.get().await.expect("plain get");
+    let (_, value) = src
+        .get_with_timeout(fact_budget::FACT_BUDGET)
+        .await
+        .expect("plain get");
 
     let fmt = ValueFormat::default();
     assert_eq!(

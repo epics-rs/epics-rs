@@ -38,7 +38,12 @@ async fn connect(client: &CaClient, name: &str) -> CaChannel {
 }
 
 async fn read(client: &CaClient, name: &str) -> EpicsValue {
-    connect(client, name).await.get().await.expect(name).1
+    connect(client, name)
+        .await
+        .get_with_timeout(fact_budget::FACT_BUDGET)
+        .await
+        .expect(name)
+        .1
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -95,7 +100,10 @@ async fn dollar_channels_serve_the_dbr_char_address() {
             written.len()
         );
     }
-    let snap = val.get_with_dbr_type(DBR_CHAR, 20).await.expect("get");
+    let snap = val
+        .get_with_dbr_type(DBR_CHAR, 20, fact_budget::FACT_BUDGET)
+        .await
+        .expect("get");
     let mut want = b"A".to_vec();
     want.resize(20, 0);
     assert_eq!(snap.value, EpicsValue::UCharArray(want.into()));

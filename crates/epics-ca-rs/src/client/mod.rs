@@ -278,6 +278,10 @@ pub struct DiagRecord {
 
 const EVENT_HISTORY_CAPACITY: usize = 256;
 const ONE_SHOT_CHANNEL_CACHE_CAPACITY: usize = 4096;
+/// The by-name one-shots' `caTimeout`: C `caget`/`caput` give the connect's
+/// `ca_pend_io` and each read's the same bound (`tool_lib.c:628`,
+/// `caget.c:234`, `caput.c:460`).
+const ONE_SHOT_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Default)]
 struct OneShotChannelCache {
@@ -1308,8 +1312,8 @@ impl CaClient {
 
     pub async fn caget(&self, pv_name: impl AsRef<[u8]>) -> CaResult<(DbFieldType, EpicsValue)> {
         let ch = self.create_channel(pv_name);
-        ch.wait_connected(Duration::from_secs(3)).await?;
-        let result = ch.get().await;
+        ch.wait_connected(ONE_SHOT_TIMEOUT).await?;
+        let result = ch.get_with_timeout(ONE_SHOT_TIMEOUT).await;
         let _ = self
             .coord_tx
             .send(CoordRequest::DropChannel { cid: ch.cid });
@@ -1320,18 +1324,15 @@ impl CaClient {
     ///
     /// Channels are cached by expanded PV name, so repeated calls avoid
     /// create/search/connect overhead and go straight through
-    /// [`Self::get_many`]'s batching, which coalesces same-server
+    /// [`Self::get_many_with_timeout`], which coalesces same-server
     /// `READ_NOTIFY` requests into a single writer enqueue. Cold or
     /// disconnected cached channels are connected and retried once.
     /// Results are returned in input order.
-    ///
-    /// A name not connected within 30 s gives its connect error; a read
-    /// ends on its answer or a disconnect, as [`CaChannel::get`] does.
     pub async fn caget_many<S>(&self, pv_names: &[S]) -> Vec<CaResult<(DbFieldType, EpicsValue)>>
     where
         S: AsRef<[u8]> + Sync,
     {
-        self.caget_many_within(pv_names, Duration::from_secs(30), None)
+        self.caget_many_with_timeout(pv_names, Duration::from_secs(30))
             .await
     }
 
@@ -1344,25 +1345,12 @@ impl CaClient {
     where
         S: AsRef<[u8]> + Sync,
     {
-        self.caget_many_within(pv_names, timeout, Some(timeout))
-            .await
-    }
-
-    async fn caget_many_within<S>(
-        &self,
-        pv_names: &[S],
-        connect: Duration,
-        read: Option<Duration>,
-    ) -> Vec<CaResult<(DbFieldType, EpicsValue)>>
-    where
-        S: AsRef<[u8]> + Sync,
-    {
         let channels: Vec<CaChannel> = pv_names
             .iter()
             .map(|name| self.cached_one_shot_channel(name.as_ref()))
             .collect();
 
-        let mut results = CaChannel::read_many(&channels, read).await;
+        let mut results = self.get_many_with_timeout(&channels, timeout).await;
 
         let retry_indices: Vec<usize> = results
             .iter()
@@ -1385,7 +1373,7 @@ impl CaClient {
 
         let connected = futures_util::future::join_all(retry_indices.iter().map(|&idx| {
             let channel = channels[idx].clone();
-            async move { (idx, channel.wait_connected(connect).await) }
+            async move { (idx, channel.wait_connected(timeout).await) }
         }))
         .await;
 
@@ -1401,7 +1389,7 @@ impl CaClient {
             }
         }
 
-        let read_results = CaChannel::read_many(&ready_channels, read).await;
+        let read_results = self.get_many_with_timeout(&ready_channels, timeout).await;
         for (idx, result) in ready_indices.into_iter().zip(read_results) {
             results[idx] = result;
         }
@@ -1409,22 +1397,14 @@ impl CaClient {
         results
     }
 
-    /// Bulk read for already-created channels.
+    /// Bulk read for already-created channels under one
+    /// `ca_pend_io(timeout)`.
     ///
-    /// Unlike spawning `ch.get()` N times, this path constructs every
-    /// request up front, groups requests by server, and enqueues one
+    /// Unlike spawning `ch.get_with_timeout()` N times, this path constructs
+    /// every request up front, groups requests by server, and enqueues one
     /// concatenated CA frame per server. That matches libca's bulk
     /// flush model more closely and avoids per-PV task scheduling.
-    /// Results are returned in channel order, each ending on its answer or
-    /// a disconnect, as [`CaChannel::get`] does.
-    pub async fn get_many(
-        &self,
-        channels: &[CaChannel],
-    ) -> Vec<CaResult<(DbFieldType, EpicsValue)>> {
-        CaChannel::get_many(channels).await
-    }
-
-    /// Bulk read for already-created channels with a caller-supplied timeout.
+    /// Results are returned in channel order.
     pub async fn get_many_with_timeout(
         &self,
         channels: &[CaChannel],
@@ -1436,9 +1416,9 @@ impl CaClient {
     /// Fire-and-forget write (CA_PROTO_WRITE). Matches C `caput` behavior.
     pub async fn caput(&self, pv_name: impl AsRef<[u8]>, value_str: &str) -> CaResult<()> {
         let ch = self.create_channel(pv_name);
-        ch.wait_connected(Duration::from_secs(3)).await?;
+        ch.wait_connected(ONE_SHOT_TIMEOUT).await?;
 
-        let (dbr_type, value) = caput_wire_value(&ch, value_str).await?;
+        let (dbr_type, value) = caput_wire_value(&ch, value_str, ONE_SHOT_TIMEOUT).await?;
         ch.put_as_dbr_nowait(dbr_type, &value).await?;
         let _ = self
             .coord_tx
@@ -1460,7 +1440,7 @@ impl CaClient {
         let timeout = crate::estdlib::duration_from_secs(timeout_secs);
         ch.wait_connected(timeout).await?;
 
-        let (dbr_type, value) = caput_wire_value(&ch, value_str).await?;
+        let (dbr_type, value) = caput_wire_value(&ch, value_str, timeout).await?;
         ch.put_as_dbr_with_timeout(dbr_type, &value, timeout)
             .await?;
         let _ = self
@@ -1633,7 +1613,7 @@ impl Drop for ChannelLifecycle {
 }
 
 /// Warm READ_NOTIFY cache: persistent ioid + reusable Sender slot used
-/// by the bulk read (`CaChannel::get_many`) to skip per-call `alloc_ioid` + DashMap
+/// by `get_many_with_timeout` to skip per-call `alloc_ioid` + DashMap
 /// insert/remove. The first successful default GET on a channel
 /// populates this; subsequent calls reuse `(ioid, sid, slot)` and only
 /// pay the actual `READ_NOTIFY` frame send + response decode.
@@ -1681,6 +1661,17 @@ impl Drop for PendingRead {
     fn drop(&mut self) {
         self.reads.remove(&self.ioid);
     }
+}
+
+/// `get` under `ca_pend_io(timeout)`; a [`PendingRead`] in it is withdrawn
+/// when the bound drops it.
+async fn within<T>(
+    timeout: Duration,
+    get: impl std::future::Future<Output = CaResult<T>>,
+) -> CaResult<T> {
+    epics_base_rs::runtime::task::timeout(timeout, get)
+        .await
+        .unwrap_or(Err(CaError::Timeout))
 }
 
 /// C `nciu::write` (`libca/nciu.cpp`) and its write-callback
@@ -1766,7 +1757,7 @@ pub struct CaChannel {
     coord_tx: mpsc::UnboundedSender<CoordRequest>,
     transport_tx: mpsc::UnboundedSender<TransportCommand>,
     /// Shared in-flight registry for reads and writes (Option C
-    /// Phase A). `ch.get()` / `ch.put()` insert their reply oneshots
+    /// Phase A). The gets and `ch.put()` insert their reply oneshots
     /// directly here, bypassing the coordinator's `tokio::select!`
     /// loop. The transport's per-server read loop fulfils them on
     /// `ReadResponse` / `WriteResponse` arrival.
@@ -1780,7 +1771,7 @@ pub struct CaChannel {
     conn_tx: state::ConnEventsView,
     /// Warm-read fast path. `None` until the first successful default
     /// GET; refilled (with a fresh Sender) on every subsequent
-    /// bulk read. See `CachedRead`.
+    /// `get_many_with_timeout` call. See `CachedRead`.
     ///
     /// `Arc<Mutex<...>>` so all clones of a `CaChannel` share the same
     /// cache slot — otherwise two clones would each pay the cold-path
@@ -1808,8 +1799,13 @@ pub struct CaChannel {
 /// `putString*` (`epicsParse*`) decides what it means and refuses what does
 /// not fit; an ENUM goes by menu name as a string, else as a `DBR_DOUBLE`
 /// number, each under its own wire type. The client never parses a number into
-/// the field's width.
-async fn caput_wire_value(ch: &CaChannel, token: &str) -> CaResult<(u16, EpicsValue)> {
+/// the field's width. The menu read is `ca_pend_io(timeout)`'s
+/// (`caput.c:458-460`).
+async fn caput_wire_value(
+    ch: &CaChannel,
+    token: &str,
+    timeout: Duration,
+) -> CaResult<(u16, EpicsValue)> {
     // C `EpicsStr`: one `DBR_STRING` is at most 39 bytes plus the NUL.
     const DBR_STRING_PAYLOAD_MAX: usize = 39;
     let native = ch.snapshot()?.native_type;
@@ -1817,7 +1813,7 @@ async fn caput_wire_value(ch: &CaChannel, token: &str) -> CaResult<(u16, EpicsVa
     escaped.truncate(DBR_STRING_PAYLOAD_MAX);
     if native == DbFieldType::Enum {
         let menu = ch
-            .get_with_metadata(DbrClass::Gr)
+            .get_with_metadata(DbrClass::Gr, timeout)
             .await?
             .enums
             .map(|e| e.strings)
@@ -2250,29 +2246,12 @@ impl CaChannel {
             .map_err(|_| CaError::Shutdown)
     }
 
-    /// `ca_array_get_callback` of the native type: ends on the server's
-    /// answer or a disconnect, with no deadline, as libca has none.
-    pub async fn get(&self) -> CaResult<(DbFieldType, EpicsValue)> {
-        self.read_plain(ReqCount::Fixed(0)).await
-    }
-
-    /// [`Self::get`] of each channel, with no deadline.
-    pub async fn get_many(channels: &[CaChannel]) -> Vec<CaResult<(DbFieldType, EpicsValue)>> {
-        Self::read_many(channels, None).await
-    }
-
-    /// [`Self::get_many`] under one `ca_pend_io(timeout)`: a read not
-    /// answered by then gives `CaError::Timeout`.
+    /// [`Self::get_with_timeout`] of each channel under one
+    /// `ca_pend_io(timeout)`: a read not answered by then gives
+    /// `CaError::Timeout`.
     pub async fn get_many_with_timeout(
         channels: &[CaChannel],
         timeout: Duration,
-    ) -> Vec<CaResult<(DbFieldType, EpicsValue)>> {
-        Self::read_many(channels, Some(timeout)).await
-    }
-
-    async fn read_many(
-        channels: &[CaChannel],
-        timeout: Option<Duration>,
     ) -> Vec<CaResult<(DbFieldType, EpicsValue)>> {
         // Per-PV state. Cold path = first call on a channel; allocates
         // a fresh ioid + ReadWaiter::OneShot. Warm path = subsequent
@@ -2552,19 +2531,14 @@ impl CaChannel {
         // Phase 2: scalar plain reads are decoded in the read loop, so
         // the hot path avoids allocating/copying one payload Vec per PV.
 
-        let deadline = timeout.map(epics_base_rs::runtime::task::deadline_from_now);
+        let deadline = epics_base_rs::runtime::task::deadline_from_now(timeout);
         for p in pending {
             let Pending {
                 index,
                 reply_rx,
                 kind,
             } = p;
-            let result = match deadline {
-                Some(deadline) => {
-                    epics_base_rs::runtime::task::timeout_at(deadline, reply_rx).await
-                }
-                None => Ok(reply_rx.await),
-            };
+            let result = epics_base_rs::runtime::task::timeout_at(deadline, reply_rx).await;
             let decoded: CaResult<(DbFieldType, EpicsValue)> = match result {
                 Ok(Ok(Ok(reply))) => Self::decode_plain_read_reply(reply),
                 Ok(Ok(Err(e))) => Err(e),
@@ -2695,8 +2669,9 @@ impl CaChannel {
         Ok(self.snapshot()?.element_count)
     }
 
-    /// [`Self::get`] under `ca_pend_io(timeout)`: an answer not in by then
-    /// gives `CaError::Timeout`.
+    /// `ca_array_get` of the native type under `ca_pend_io(timeout)`: an
+    /// answer not in by then gives `CaError::Timeout`. Every awaitable get
+    /// takes its bound; [`Self::get_callback`] is the one without.
     pub async fn get_with_timeout(&self, timeout: Duration) -> CaResult<(DbFieldType, EpicsValue)> {
         self.get_with_timeout_count(timeout, 0).await
     }
@@ -2722,13 +2697,12 @@ impl CaChannel {
         timeout: Duration,
         count: impl Into<ReqCount>,
     ) -> CaResult<(DbFieldType, EpicsValue)> {
-        epics_base_rs::runtime::task::timeout(timeout, self.read_plain(count.into()))
-            .await
-            .unwrap_or(Err(CaError::Timeout))
+        within(timeout, self.read_plain(count.into())).await
     }
 
-    /// The plain READ_NOTIFY of the native type, with no deadline.
-    async fn read_plain(&self, count: ReqCount) -> CaResult<(DbFieldType, EpicsValue)> {
+    /// The plain READ_NOTIFY of the native type, with no deadline: the
+    /// sync group's, whose bound is `ca_sg_block`'s.
+    pub(super) async fn read_plain(&self, count: ReqCount) -> CaResult<(DbFieldType, EpicsValue)> {
         let snap = self.snapshot()?;
         let native = snap.native_type as u16;
         let read = self.issue_read_notify(snap, native, count, ReadReplyMode::Plain)?;
@@ -2737,14 +2711,16 @@ impl CaChannel {
 
     /// Get a PV value with metadata. Use `DbrClass::Time` for timestamp + alarm,
     /// or `DbrClass::Ctrl` for full control metadata (units, limits, precision).
-    /// Pass `count` to limit the number of array elements (0 = all).
-    pub async fn get_with_metadata(&self, class: DbrClass) -> CaResult<Snapshot> {
-        self.get_with_metadata_count(class, 0).await
+    pub async fn get_with_metadata(
+        &self,
+        class: DbrClass,
+        timeout: Duration,
+    ) -> CaResult<Snapshot> {
+        self.get_with_metadata_count(class, 0, timeout).await
     }
 
-    /// Get a PV value with metadata, requesting at most `count` elements.
-    /// Pass 0 for the full element count. Like [`Self::get_callback`], it
-    /// ends on the answer or a disconnect, with no deadline.
+    /// Get a PV value with metadata, requesting at most `count` elements,
+    /// under `ca_pend_io(timeout)`. Pass 0 for the full element count.
     ///
     /// The wire request type is the `*_<native>` member of `class` —
     /// e.g. `DbrClass::Time` on a DOUBLE PV requests `DBR_TIME_DOUBLE`.
@@ -2756,6 +2732,7 @@ impl CaChannel {
         &self,
         class: DbrClass,
         count: impl Into<ReqCount>,
+        timeout: Duration,
     ) -> CaResult<Snapshot> {
         let snap = self.snapshot()?;
 
@@ -2775,13 +2752,12 @@ impl CaChannel {
             DbrClass::Plain => native.to_dbr_type() as u16,
         };
 
-        self.read_raw(snap, request_type, count.into())?.await
+        within(timeout, self.read_raw(snap, request_type, count.into())?).await
     }
 
     /// Get a PV value requesting an **exact** DBR type code (`0..=38`),
     /// sent verbatim over the wire without re-deriving the value type
-    /// from the channel's native type. Like [`Self::get_callback`], it ends
-    /// on the answer or a disconnect, with no deadline.
+    /// from the channel's native type, under `ca_pend_io(timeout)`.
     ///
     /// This mirrors C `caget -d`'s `pvs[n].dbrType = dbrType`
     /// (`caget.c:172`): `-d DBR_TIME_FLOAT` on a DOUBLE PV requests
@@ -2800,8 +2776,9 @@ impl CaChannel {
         &self,
         dbr_type: u16,
         count: impl Into<ReqCount>,
+        timeout: Duration,
     ) -> CaResult<Snapshot> {
-        self.get_callback(dbr_type, count)?.await
+        within(timeout, self.get_callback(dbr_type, count)?).await
     }
 
     /// `ca_array_get_callback` of exactly `dbr_type`, as
@@ -6838,9 +6815,9 @@ mod disconnect_transition_tests {
 // the exec backend's `std::time` one.
 #[cfg(all(test, tokio_backend))]
 mod get_deadline_tests {
-    //! A get has no deadline of its own (`ca_array_get_callback`): it ends
-    //! on the answer or a disconnect, and a caller's `ca_pend_io` bound is
-    //! the future being dropped.
+    //! Every awaitable get carries its caller's `ca_pend_io` bound;
+    //! `get_callback` (`ca_array_get_callback`) and the sync group's get
+    //! have none and end on the answer or a disconnect.
     use super::*;
     use epics_base_rs::runtime::task;
     use std::collections::HashSet;
@@ -6880,36 +6857,74 @@ mod get_deadline_tests {
 
     const AN_HOUR: Duration = Duration::from_secs(3600);
 
+    const BOUND: Duration = Duration::from_secs(2);
+
+    /// Each ends `Timeout` at its bound, not at an hour, and leaves no waiter.
     #[tokio::test(start_paused = true)]
-    async fn no_get_variant_times_out_by_itself() {
+    async fn every_awaitable_get_ends_at_its_bound() {
+        async fn ends<T: std::fmt::Debug>(
+            ch: &CaChannel,
+            what: &str,
+            get: impl std::future::Future<Output = CaResult<T>>,
+        ) {
+            let got = task::timeout(AN_HOUR, get).await;
+            assert!(matches!(got, Ok(Err(CaError::Timeout))), "{what}: {got:?}");
+            assert!(ch.in_flight.reads.is_empty(), "{what} left its waiter");
+        }
         let (ch, _rx) = connected();
-        assert!(task::timeout(AN_HOUR, ch.get()).await.is_err(), "get");
+        ends(&ch, "get_with_timeout", ch.get_with_timeout(BOUND)).await;
+        ends(
+            &ch,
+            "get_with_timeout_count",
+            ch.get_with_timeout_count(BOUND, 1),
+        )
+        .await;
+        ends(
+            &ch,
+            "get_with_metadata",
+            ch.get_with_metadata(DbrClass::Time, BOUND),
+        )
+        .await;
+        ends(
+            &ch,
+            "get_with_metadata_count",
+            ch.get_with_metadata_count(DbrClass::Time, 1, BOUND),
+        )
+        .await;
+        ends(
+            &ch,
+            "get_with_dbr_type",
+            ch.get_with_dbr_type(DBR_TIME_DOUBLE, 1, BOUND),
+        )
+        .await;
+        let many = task::timeout(
+            AN_HOUR,
+            CaChannel::get_many_with_timeout(std::slice::from_ref(&ch), BOUND),
+        )
+        .await
+        .expect("get_many_with_timeout ended");
+        assert!(matches!(many[..], [Err(CaError::Timeout)]), "{many:?}");
         assert!(
-            task::timeout(AN_HOUR, ch.get_with_metadata(DbrClass::Time))
-                .await
-                .is_err(),
-            "get_with_metadata"
-        );
-        assert!(
-            task::timeout(AN_HOUR, ch.get_with_dbr_type(DBR_TIME_DOUBLE, 1))
-                .await
-                .is_err(),
-            "get_with_dbr_type"
-        );
-        assert!(
-            task::timeout(AN_HOUR, CaChannel::get_many(std::slice::from_ref(&ch)))
-                .await
-                .is_err(),
-            "get_many"
+            ch.in_flight.reads.is_empty(),
+            "get_many_with_timeout left its waiter"
         );
     }
 
     #[tokio::test(start_paused = true)]
-    async fn an_answer_an_hour_late_still_ends_the_get() {
+    async fn the_callback_get_waits_until_a_disconnect() {
+        let (ch, _rx) = connected();
+        let mut get = Box::pin(ch.get_callback(DBR_TIME_DOUBLE, 1).expect("sent"));
+        assert!(task::timeout(AN_HOUR, &mut get).await.is_err());
+        drain_waiters_for_cids(&HashSet::from([ch.cid]), &ch.in_flight);
+        assert!(matches!(get.await, Err(CaError::Disconnected)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_answer_an_hour_late_still_ends_the_sync_group_get() {
         let (ch, _rx) = connected();
         let get = tokio::spawn({
             let ch = ch.clone();
-            async move { ch.get().await }
+            async move { ch.read_plain(ReqCount::Fixed(0)).await }
         });
         tokio::time::sleep(AN_HOUR).await;
         let reply = ReadReply::Plain {
@@ -6922,27 +6937,11 @@ mod get_deadline_tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_disconnect_ends_the_get() {
-        let (ch, _rx) = connected();
-        let get = tokio::spawn({
-            let ch = ch.clone();
-            async move { ch.get_with_metadata(DbrClass::Time).await }
-        });
-        tokio::time::sleep(AN_HOUR).await;
-        drain_waiters_for_cids(&HashSet::from([ch.cid]), &ch.in_flight);
-        assert!(matches!(get.await.unwrap(), Err(CaError::Disconnected)));
-    }
-
-    #[tokio::test(start_paused = true)]
     async fn a_dropped_get_withdraws_its_waiter() {
         let (ch, _rx) = connected();
         let get = ch.get_callback(DBR_TIME_DOUBLE, 1).expect("sent");
         assert_eq!(ch.in_flight.reads.len(), 1);
         drop(get);
-        assert!(ch.in_flight.reads.is_empty(), "get_callback");
-
-        let timed = ch.get_with_timeout(Duration::from_secs(1)).await;
-        assert!(matches!(timed, Err(CaError::Timeout)), "{timed:?}");
-        assert!(ch.in_flight.reads.is_empty(), "get_with_timeout");
+        assert!(ch.in_flight.reads.is_empty());
     }
 }

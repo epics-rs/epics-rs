@@ -77,7 +77,10 @@ async fn a_plain_get_and_monitor_read_val_past_len_to_its_nul() {
 
     for (name, want) in [("A.VAL", "abcdef".to_string()), ("B.VAL", "x".repeat(39))] {
         let ch = connect(&client, name).await;
-        let got = ch.get_with_dbr_type(DBR_STRING, 0).await.expect("get");
+        let got = ch
+            .get_with_dbr_type(DBR_STRING, 0, fact_budget::FACT_BUDGET)
+            .await
+            .expect("get");
         assert_eq!(text(name, got.value), want, "caget {name}");
         let mut mon = ch
             .subscribe_with_mask_readback_count(0.0, 0x5, EnumReadback::Native, false, None)
@@ -93,7 +96,7 @@ async fn a_plain_get_and_monitor_read_val_past_len_to_its_nul() {
 
     let chars = connect(&client, "A.VAL$")
         .await
-        .get_with_dbr_type(DBR_CHAR, 0)
+        .get_with_dbr_type(DBR_CHAR, 0, fact_budget::FACT_BUDGET)
         .await
         .expect("get A.VAL$");
     let (EpicsValue::CharArray(chars) | EpicsValue::UCharArray(chars)) = chars.value else {

@@ -42,7 +42,7 @@ use epics_base_rs::error::{CaError, CaResult};
 use epics_base_rs::runtime::task::TaskHandle as JoinHandle;
 use epics_base_rs::types::{DbFieldType, EpicsValue};
 
-use super::CaChannel;
+use super::{CaChannel, ReqCount};
 
 /// Result of a single scheduled get.
 type GetOutput = CaResult<(DbFieldType, EpicsValue)>;
@@ -133,7 +133,8 @@ impl SyncGroup {
     pub fn get(&mut self, ch: &CaChannel) {
         let reactor = ch.reactor().clone();
         let ch = ch.clone();
-        let handle = reactor.spawn(async move { Outcome::Get(ch.get().await) });
+        let handle =
+            reactor.spawn(async move { Outcome::Get(ch.read_plain(ReqCount::Fixed(0)).await) });
         self.ops.push(SyncOp {
             kind: OpKind::Get,
             handle,
@@ -282,6 +283,14 @@ impl SyncGroup {
     }
 }
 
+/// `ca_sg_delete` cancels the pending ops too (`CASG.cpp:44-45`): a get's
+/// only bound is `block`'s, so one left running would wait for ever.
+impl Drop for SyncGroup {
+    fn drop(&mut self) {
+        self.end_batch();
+    }
+}
+
 // Host/tokio-only: the shared `push_delayed_get` harness spawns
 // `tokio::time::sleep` through the `runtime::task` seam, which under
 // `exec_backend` lands on a background-executor worker with no tokio
@@ -309,6 +318,28 @@ mod tests {
                 done: None,
             });
         }
+    }
+
+    /// `ca_sg_delete`: what the dropped group still had in flight is
+    /// cancelled, not left to wait for an answer.
+    #[tokio::test]
+    async fn a_dropped_group_cancels_its_pending_ops() {
+        let (held, cancelled) = tokio::sync::oneshot::channel::<()>();
+        let reactor = epics_base_rs::runtime::task::Reactor::current()
+            .expect("the test driver enters an executor");
+        let handle = reactor.spawn(async move {
+            let _held = held;
+            std::future::pending::<Outcome>().await
+        });
+        let mut g = SyncGroup::new();
+        g.ops.push(SyncOp {
+            kind: OpKind::Get,
+            handle,
+            done: None,
+        });
+        drop(g);
+        let ended = tokio::time::timeout(Duration::from_secs(5), cancelled).await;
+        assert!(matches!(ended, Ok(Err(_))), "the op still runs: {ended:?}");
     }
 
     #[tokio::test]

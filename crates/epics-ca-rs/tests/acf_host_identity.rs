@@ -84,7 +84,10 @@ async fn claimed_host_name_matches_a_host_hag_and_grants_write() {
         .await
         .expect("HAG(ops) { opi-01.lab } must grant WRITE to a client claiming that name");
 
-    let (_ty, read) = ch.get().await.expect("get");
+    let (_ty, read) = ch
+        .get_with_timeout(fact_budget::FACT_BUDGET)
+        .await
+        .expect("get");
     assert_eq!(
         read,
         EpicsValue::Long(42),

@@ -84,7 +84,13 @@ fn puts_past_a_stalled_console(
                 _ => break,
             }
         }
-        Some((done, ch.get().await.map(|(_, v)| v).ok()))
+        Some((
+            done,
+            ch.get_with_timeout(fact_budget::FACT_BUDGET)
+                .await
+                .map(|(_, v)| v)
+                .ok(),
+        ))
     });
     drop(rt);
     let _ = child.kill();

@@ -22,8 +22,8 @@ use epics_base_rs::server::database::{
     LinkPutDone, LinkPutOp, LinkRef, LinkSerial, LinkSet, PutAdmission, PvDatabase,
     link_put_convert, report_put_not_issued,
 };
-use epics_base_rs::server::snapshot::{DbrClass, Snapshot};
-use epics_base_rs::types::DBR_CTRL_DOUBLE;
+use epics_base_rs::server::snapshot::Snapshot;
+use epics_base_rs::types::{DBR_CTRL_DOUBLE, DBR_CTRL_ENUM};
 use epics_base_rs::types::{EpicsValue, RecordName};
 use parking_lot::RwLock;
 
@@ -1061,7 +1061,7 @@ async fn fetch_link_metadata(
         // FALSE and every getter returns -1. Skipping it is that gate.
         None
     } else {
-        match channel.get_with_dbr_type(DBR_CTRL_DOUBLE, 1).await {
+        match async { channel.get_callback(DBR_CTRL_DOUBLE, 1)?.await }.await {
             Ok(snap) => Some(snap),
             Err(e) => {
                 tracing::debug!(
@@ -1079,8 +1079,7 @@ async fn fetch_link_metadata(
     // get. It needs the native `DBR_CTRL_ENUM` reply, which the fixed-DOUBLE
     // get above cannot carry, so it rides its own request.
     let labels = if dbf == Some(DbFieldType::Enum) {
-        channel
-            .get_with_metadata_count(DbrClass::Ctrl, 1)
+        async { channel.get_callback(DBR_CTRL_ENUM, 1)?.await }
             .await
             .inspect_err(|e| {
                 tracing::debug!(

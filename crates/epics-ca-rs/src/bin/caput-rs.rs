@@ -424,9 +424,7 @@ async fn main() {
     // exactly as C does (caput.c:461-465). The menu is empty for non-ENUM
     // fields, which makes `build_write_value` skip the ENUM path entirely.
     let enum_menu: Vec<epics_ca_rs::PvString> = if native_type == epics_ca_rs::DbFieldType::Enum {
-        let menu =
-            epics_base_rs::runtime::task::timeout(timeout, ch.get_with_metadata(DbrClass::Gr));
-        match menu.await.unwrap_or(Err(CaError::Timeout)) {
+        match ch.get_with_metadata(DbrClass::Gr, timeout).await {
             Ok(snap) => snap.enums.map(|e| e.strings).unwrap_or_default(),
             Err(CaError::Timeout) => {
                 epics_libcom_rs::stderr_println!(
@@ -453,29 +451,27 @@ async fn main() {
     // the `Old :` line reflects the actual pre-put state — the regular
     // path stays on the cheaper plain GET.
     let long_mode = args.long_mode > 0;
+    // Each is `ca_array_get` + `ca_pend_io(caTimeout)` (caput.c:172, 186).
     let read_display = move |ch: CaChannel| async move {
-        let read = async {
-            match (long_mode, enum_dbr) {
-                // Long mode + ENUM default: DBR_TIME_STRING (label + ts/alarm).
-                (true, Some(rt)) => ch
-                    .get_with_dbr_type(rt, 0)
-                    .await
-                    .map(|s| (s.value.clone(), Some(s))),
-                // Long mode, other fields: native DBR_TIME class.
-                (true, None) => ch
-                    .get_with_metadata(DbrClass::Time)
-                    .await
-                    .map(|s| (s.value.clone(), Some(s))),
-                // Plain + ENUM default: DBR_STRING (label only).
-                (false, Some(rt)) => ch.get_with_dbr_type(rt, 0).await.map(|s| (s.value, None)),
-                // Plain, other fields: native plain GET.
-                (false, None) => ch.get().await.map(|(_t, v)| (v, None)),
-            }
-        };
-        // `ca_array_get` + `ca_pend_io(caTimeout)` (caput.c:172, 186).
-        epics_base_rs::runtime::task::timeout(timeout, read)
-            .await
-            .unwrap_or(Err(CaError::Timeout))
+        match (long_mode, enum_dbr) {
+            // Long mode + ENUM default: DBR_TIME_STRING (label + ts/alarm).
+            (true, Some(rt)) => ch
+                .get_with_dbr_type(rt, 0, timeout)
+                .await
+                .map(|s| (s.value.clone(), Some(s))),
+            // Long mode, other fields: native DBR_TIME class.
+            (true, None) => ch
+                .get_with_metadata(DbrClass::Time, timeout)
+                .await
+                .map(|s| (s.value.clone(), Some(s))),
+            // Plain + ENUM default: DBR_STRING (label only).
+            (false, Some(rt)) => ch
+                .get_with_dbr_type(rt, 0, timeout)
+                .await
+                .map(|s| (s.value, None)),
+            // Plain, other fields: native plain GET.
+            (false, None) => ch.get_with_timeout(timeout).await.map(|(_t, v)| (v, None)),
+        }
     };
     // The readback's element count: C sets `reqElems = nElems =
     // ca_element_count(chid)` (`caput.c:142,154-155`) and hands that count to

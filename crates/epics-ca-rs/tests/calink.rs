@@ -540,7 +540,10 @@ async fn ca_link_out_write_updates_remote_pv() {
     ch.wait_connected(fact_budget::FACT_BUDGET)
         .await
         .expect("verify channel connects");
-    let (_dbf, read_back) = ch.get().await.expect("verify GET");
+    let (_dbf, read_back) = ch
+        .get_with_timeout(fact_budget::FACT_BUDGET)
+        .await
+        .expect("verify GET");
     assert_eq!(
         read_back.to_f64(),
         Some(88.0),
@@ -595,7 +598,10 @@ async fn ca_link_out_write_async_waits_for_completion() {
     ch.wait_connected(fact_budget::FACT_BUDGET)
         .await
         .expect("verify channel connects");
-    let (_dbf, read_back) = ch.get().await.expect("verify GET");
+    let (_dbf, read_back) = ch
+        .get_with_timeout(fact_budget::FACT_BUDGET)
+        .await
+        .expect("verify GET");
     assert_eq!(
         read_back.to_f64(),
         Some(42.0),

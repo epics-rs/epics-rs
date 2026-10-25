@@ -148,7 +148,7 @@ fn bench_bulk_caget(c: &mut Criterion) {
 }
 
 #[cfg(tokio_backend)]
-/// Bulk reads over persistent channels using the batched `get_many`
+/// Bulk reads over persistent channels using the batched `get_many_with_timeout`
 /// API. This is the closest Rust-side analogue to libca's "queue N
 /// reads, flush once, then collect completions" path.
 fn bench_bulk_get_many(c: &mut Criterion) {
@@ -181,7 +181,9 @@ fn bench_bulk_get_many(c: &mut Criterion) {
             let client = client.clone();
             let channels = channels.clone();
             async move {
-                let _ = client.get_many(&channels).await;
+                let _ = client
+                    .get_many_with_timeout(&channels, Duration::from_secs(30))
+                    .await;
             }
         });
     });
@@ -190,7 +192,7 @@ fn bench_bulk_get_many(c: &mut Criterion) {
 #[cfg(tokio_backend)]
 /// Bulk-read scaling bench: same in-process softIoc, vary N over
 /// {10, 20, 50, 100} to expose super-linear scaling on the server's
-/// response path. Measures the same `get_many` route as
+/// response path. Measures the same `get_many_with_timeout` route as
 /// `bench_bulk_get_many` so the only difference is N.
 fn bench_bulk_get_many_scaling(c: &mut Criterion) {
     let rt = make_runtime();
@@ -225,7 +227,9 @@ fn bench_bulk_get_many_scaling(c: &mut Criterion) {
                 let client = client.clone();
                 let subset = subset.clone();
                 async move {
-                    let _ = client.get_many(&subset).await;
+                    let _ = client
+                        .get_many_with_timeout(&subset, Duration::from_secs(30))
+                        .await;
                 }
             });
         });
@@ -236,7 +240,7 @@ fn bench_bulk_get_many_scaling(c: &mut Criterion) {
 #[cfg(tokio_backend)]
 /// Bulk reads by PV name. First warm call populates CaClient's
 /// one-shot channel cache; timed iterations should then take the same
-/// hot batched-read path as `get_many`.
+/// hot batched-read path as `get_many_with_timeout`.
 fn bench_bulk_caget_many(c: &mut Criterion) {
     let rt = make_runtime();
     let (_server, port) = rt.block_on(boot_softioc(100));

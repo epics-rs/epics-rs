@@ -67,7 +67,10 @@ async fn server_with_bi(pv: &'static str) -> (CaClient, epics_ca_rs::client::CaC
 
 /// Native readback as a plain integer, whatever ENUM carrier comes back.
 async fn read_index(ch: &epics_ca_rs::client::CaChannel) -> i64 {
-    let (_t, v) = ch.get().await.expect("readback");
+    let (_t, v) = ch
+        .get_with_timeout(fact_budget::FACT_BUDGET)
+        .await
+        .expect("readback");
     match v {
         EpicsValue::Enum(i) => i as i64,
         EpicsValue::EnumWithChoices { index, .. } => index as i64,

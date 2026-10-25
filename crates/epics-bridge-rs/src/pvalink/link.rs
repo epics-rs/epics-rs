@@ -857,7 +857,7 @@ impl PvaLink {
     /// Write a string value to the linked PV (OUT direction only),
     /// using THIS link's own `config` options. Convenience wrapper over
     /// the shared-channel staging path for direct callers and tests;
-    /// the record OUT-link dispatch uses [`Self::put_out_str`] to pass
+    /// the record OUT-link dispatch uses [`Self::put_out_field`] to pass
     /// each sibling's per-call options onto the shared owner.
     ///
     /// delegates to [`Self::write_with_block`] with `block=false`.

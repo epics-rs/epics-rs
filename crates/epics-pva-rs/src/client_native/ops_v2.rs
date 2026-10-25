@@ -4721,15 +4721,51 @@ fn assign_fields(
             }
             // Typed leaf: assign the original pvData payload directly,
             // bypassing `Display`/`ScalarValue::parse` so a typed array
-            // keeps its element type and byte content (pvxs `linkBuildPut`
-            // `value = tosend`, pvxs/ioc/pvalink_channel.cpp:147-159).
-            PutLeaf::Typed(pv) => {
-                assign_at_path(&mut value, &parts, pv.clone());
-            }
+            // keeps its element type and byte content.
+            PutLeaf::Typed(pv) => match typed_leaf_for(pv, field_desc_at_path(intro, &parts))? {
+                Some(pv) => assign_at_path(&mut value, &parts, pv),
+                None => continue,
+            },
         }
         changed.set(bit);
     }
     Ok((value, changed))
+}
+
+/// The leaf pvxs `linkBuildPut` assigns for a typed `pv` into a field of
+/// shape `desc` (`pvalink_channel.cpp:147-178`): an array field takes the
+/// array, a scalar field its first element, converted as `Value::copyIn`
+/// does (`data.cpp:535-593`). `None` for an empty array into a scalar
+/// field, which pvxs skips.
+fn typed_leaf_for(pv: &PvField, desc: Option<&FieldDesc>) -> PvaResult<Option<PvField>> {
+    let Some(FieldDesc::Scalar(t)) = desc else {
+        return Ok(Some(match (pv, desc) {
+            (PvField::Scalar(sv), Some(FieldDesc::ScalarArray(_))) => {
+                PvField::ScalarArray(vec![sv.clone()])
+            }
+            _ => pv.clone(),
+        }));
+    };
+    let sv = match pv {
+        PvField::Scalar(sv) => sv.clone(),
+        PvField::ScalarArray(items) => match items.first() {
+            Some(sv) => sv.clone(),
+            None => return Ok(None),
+        },
+        PvField::ScalarArrayTyped(arr) => match arr.get(0) {
+            Some(sv) => sv,
+            None => return Ok(None),
+        },
+        _ => return Ok(Some(pv.clone())),
+    };
+    crate::pvdata::coerce_scalar(&sv, *t)
+        .map(|v| Some(PvField::Scalar(v)))
+        .ok_or_else(|| {
+            PvaError::InvalidValue(format!(
+                "Unable to assign {t:?} with {:?}",
+                sv.scalar_type()
+            ))
+        })
 }
 
 /// The descriptor at a dotted field path inside `desc`, or `None` when a
@@ -6396,6 +6432,65 @@ mod tests {
                 encode_pv_field_with_bitset(&value, &intro, &changed, 0, order, &mut buf);
                 assert!(!buf.is_empty(), "typed delta encoded empty ({order:?})");
             }
+        }
+
+        /// A typed scalar converts into the leaf's type as pvxs
+        /// `Value::copyIn` does: a real into an int leaf truncates.
+        #[test]
+        fn typed_scalar_leaf_converts_to_the_leaf_type() {
+            let intro = FieldDesc::Structure {
+                struct_id: "epics:nt/NTScalar:1.0".into(),
+                fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Int))].into(),
+            };
+            let assignments = vec![(
+                "value".to_string(),
+                PutLeaf::Typed(PvField::Scalar(ScalarValue::Double(3.7))),
+            )];
+            let (value, _) = build_field_delta(&intro, &assignments).unwrap();
+            assert_eq!(
+                value_at_path(&value, &["value"]),
+                Some(PvField::Scalar(ScalarValue::Int(3)))
+            );
+        }
+
+        /// pvxs `linkBuildPut` writes an array's first element into a
+        /// scalar field and skips an empty one; a scalar into an array
+        /// field is a one-element array. A real into a bool has no
+        /// `copyIn` arm and is refused.
+        #[test]
+        fn typed_leaf_follows_link_build_put_shapes() {
+            let nt = |value: FieldDesc| FieldDesc::Structure {
+                struct_id: "epics:nt/NTScalar:1.0".into(),
+                fields: vec![("value".into(), value)].into(),
+            };
+            let put = |intro: &FieldDesc, pv: PvField| {
+                build_field_delta(intro, &[("value".to_string(), PutLeaf::Typed(pv))])
+            };
+            let int = nt(FieldDesc::Scalar(ScalarType::Int));
+            let arr = PvField::ScalarArrayTyped(crate::pvdata::TypedScalarArray::Double(
+                vec![2.5, 9.0].into(),
+            ));
+            let (value, changed) = put(&int, arr).unwrap();
+            assert_eq!(
+                value_at_path(&value, &["value"]),
+                Some(PvField::Scalar(ScalarValue::Int(2)))
+            );
+            assert!(changed.get(int.bit_for_path("value").unwrap()));
+            let empty = PvField::ScalarArrayTyped(crate::pvdata::TypedScalarArray::Double(
+                Vec::<f64>::new().into(),
+            ));
+            let (_, changed) = put(&int, empty).unwrap();
+            assert!(!changed.get(int.bit_for_path("value").unwrap()));
+
+            let dbl_arr = nt(FieldDesc::ScalarArray(ScalarType::Double));
+            let (value, _) = put(&dbl_arr, PvField::Scalar(ScalarValue::Double(3.7))).unwrap();
+            assert_eq!(
+                value_at_path(&value, &["value"]),
+                Some(PvField::ScalarArray(vec![ScalarValue::Double(3.7)]))
+            );
+
+            let boolean = nt(FieldDesc::Scalar(ScalarType::Boolean));
+            assert!(put(&boolean, PvField::Scalar(ScalarValue::Double(1.0))).is_err());
         }
 
         /// A typed leaf for a path absent from the prototype is rejected,

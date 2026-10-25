@@ -1114,7 +1114,7 @@ fn walk_leaf_paths(desc: &FieldDesc, prefix: &str) -> Vec<String> {
 /// Coerce one scalar value into another scalar type. Returns `None`
 /// for unsupported pairs. Currently covers numeric↔numeric, numeric↔string,
 /// string↔string, and bool↔bool.
-fn coerce_scalar(sv: &ScalarValue, target: ScalarType) -> Option<ScalarValue> {
+pub(crate) fn coerce_scalar(sv: &ScalarValue, target: ScalarType) -> Option<ScalarValue> {
     use ScalarValue::*;
     let as_i64: Option<i64> = match sv {
         Boolean(b) => Some(if *b { 1 } else { 0 }),
@@ -1165,7 +1165,17 @@ fn coerce_scalar(sv: &ScalarValue, target: ScalarType) -> Option<ScalarValue> {
         String(s) => s.as_str_lossy().into_owned(),
     };
     Some(match target {
-        ScalarType::Boolean => Boolean(as_i64? != 0),
+        // pvxs `copyIn` into a bool takes a bool, an integer or the exact
+        // "true" / "false"; a real has no arm (`data.cpp:579-593`).
+        ScalarType::Boolean => Boolean(match sv {
+            Float(_) | Double(_) => return None,
+            String(s) => match s.as_str_lossy().as_ref() {
+                "true" => true,
+                "false" => false,
+                _ => return None,
+            },
+            _ => as_i64? != 0,
+        }),
         ScalarType::Byte => Byte(as_i64? as i8),
         ScalarType::Short => Short(as_i64? as i16),
         ScalarType::Int => Int(as_i64? as i32),

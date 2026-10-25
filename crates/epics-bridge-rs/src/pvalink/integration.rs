@@ -1353,21 +1353,10 @@ impl LinkSet for PvaLinkResolver {
         })?;
         // the full string keys the per-link OUT config.
         let cfg = self.out_cfg_for(full);
-        // bypass the Display→string→parse round-trip for
-        // ARRAYS (where Display alloc is O(N_elements * digits) and
-        // pvput re-parses 25 MB strings on a 1 M-element waveform).
-        // SCALARS keep the string path so the text is coerced against
-        // the channel's introspected scalar type.
-        //
-        // classify via `is_array_value` — an
-        // exhaustive match with no wildcard arm — so a future
-        // `EpicsValue` array variant cannot silently miss this gate.
-        // The earlier inline `matches!` over a hard-coded subset
-        // omitted `Int64Array` (never covered) and `UInt64Array`
-        // (added with `DBF_UINT64` but never wired in), routing those
-        // through the string PUT path where the bracketed `Display`
-        // text is unparseable.
-        let array_path = is_array_value(&value);
+        // pvxs `pvaPutValueX` stages the DBR payload typed and
+        // `linkBuildPut` assigns it into the channel's field, which
+        // converts it (`pvalink_lset.cpp:608`, `pvalink_channel.cpp:147-178`).
+        let pv_field = crate::convert::epics_to_pv_field(&value);
         async {
             // Resolve the SHARED channel owner for this PV (the
             // registry no longer keys on the per-link OUT options),
@@ -1375,20 +1364,9 @@ impl LinkSet for PvaLinkResolver {
             // `field`/`proc`/`defer`/`retry` so sibling fields
             // coalesce into one upstream PUT.
             let link = self.opener.open(&cfg).await.map_err(|e| e.to_string())?;
-            if array_path {
-                let pv_field = crate::convert::epics_to_pv_field(&value);
-                link.put_out_field(&cfg, &pv_field, block)
-                    .await
-                    .map_err(|e| e.to_string())
-            } else {
-                // The channel parses this text back into its own type, where
-                // pvxs puts the value typed (`pvaPutValueX`,
-                // pvalink_lset.cpp:608), so a real is its round-trip digits.
-                let value_str = value.text_with(usize::MAX, |real, _| real.to_string());
-                link.put_out_str(&cfg, &value_str, block)
-                    .await
-                    .map_err(|e| e.to_string())
-            }
+            link.put_out_field(&cfg, &pv_field, block)
+                .await
+                .map_err(|e| e.to_string())
         }
         .await
     }
@@ -1831,49 +1809,6 @@ fn json_link_cfg(key: &str, direction: LinkDirection) -> Option<LinkCfg> {
     PvaLinkConfig::from_jlink_options(&pv, &options, direction)
         .ok()
         .map(|cfg| entry(cfg, direction))
-}
-
-/// True iff `value` is an array `EpicsValue` variant — the pvalink
-/// OUT dispatcher routes these through the typed `PvField` write path
-/// (`crate::convert::epics_to_pv_field` → `PvaLink::write_pv_field`)
-/// instead of the scalar `Display`→string→`pvput`-parse path.
-///
-/// This is the single classification gate for the
-/// OUT typed-array path. It is an EXHAUSTIVE match with no wildcard
-/// arm — every `EpicsValue` variant is named, so adding a future
-/// array variant to `EpicsValue` forces a compile error here until
-/// it is classified, which structurally prevents another
-/// missed-gate regression.
-fn is_array_value(value: &EpicsValue) -> bool {
-    match value {
-        EpicsValue::ShortArray(_)
-        | EpicsValue::FloatArray(_)
-        | EpicsValue::EnumArray(_)
-        | EpicsValue::DoubleArray(_)
-        | EpicsValue::LongArray(_)
-        | EpicsValue::CharArray(_)
-        | EpicsValue::Int64Array(_)
-        | EpicsValue::UInt64Array(_)
-        | EpicsValue::UShortArray(_)
-        | EpicsValue::ULongArray(_)
-        | EpicsValue::UCharArray(_)
-        | EpicsValue::StringArray(_) => true,
-        EpicsValue::String(_)
-        | EpicsValue::Short(_)
-        | EpicsValue::Float(_)
-        | EpicsValue::Enum(_)
-        // Transient NTEnum carrier is a scalar (single index + choices), not
-        // an array — routes through the scalar Display path like `Enum`.
-        | EpicsValue::EnumWithChoices { .. }
-        | EpicsValue::Char(_)
-        | EpicsValue::Long(_)
-        | EpicsValue::Double(_)
-        | EpicsValue::Int64(_)
-        | EpicsValue::UInt64(_)
-        | EpicsValue::UShort(_)
-        | EpicsValue::ULong(_)
-        | EpicsValue::UChar(_) => false,
-    }
 }
 
 /// Best-effort conversion. We coerce scalar values and 1-D scalar arrays;
@@ -4556,8 +4491,6 @@ mod tests {
     /// the OUT dispatcher's `array_path` match never listed it, so a
     /// valid int64 waveform value attempted to replay its bracketed
     /// `Display` string as a PVA array literal the parser rejects.
-    /// The `is_array_value` helper covers signed
-    /// and unsigned 64-bit arrays together.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn ex_r10_out_int64_array_uses_typed_path() {
         use epics_pva_rs::pvdata::ScalarType;
@@ -4568,6 +4501,63 @@ mod tests {
             &[-3, 0, i64::MAX],
         )
         .await;
+    }
+
+    #[cfg(tokio_backend)]
+    /// pvxs puts a scalar OUT write typed and converts it into the channel's
+    /// field (`Value::copyIn`): an ao's 3.7 lands in an int channel as 3.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn out_scalar_converts_into_the_channel_type() {
+        use crate::pvalink::link::PvaLink;
+        use epics_pva_rs::client::PvaClient;
+        use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
+        use epics_pva_rs::server_native::{PvaServer, SharedPV, SharedSource};
+
+        let pv = SharedPV::build_mailbox();
+        pv.open(
+            FieldDesc::Structure {
+                struct_id: "epics:nt/NTScalar:1.0".into(),
+                fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Int))].into(),
+            },
+            PvField::Structure(PvStructure {
+                struct_id: "epics:nt/NTScalar:1.0".into(),
+                fields: vec![("value".into(), PvField::Scalar(ScalarValue::Int(0)))],
+            }),
+        )
+        .unwrap();
+        let source = SharedSource::new();
+        source.add("INT:PV", pv.clone());
+        let server =
+            PvaServer::isolated(std::sync::Arc::new(source)).expect("test PVA server starts");
+        let resolver = PvaLinkResolver::new(crate::test_reactor());
+        let out_cfg = resolver.out_cfg_for("INT:PV");
+        let client = PvaClient::builder()
+            .server_addr(server.tcp_addr())
+            .timeout(std::time::Duration::from_secs(3))
+            .build();
+        resolver.registry.insert_for_test(
+            &out_cfg,
+            std::sync::Arc::new(PvaLink::for_test_with_client(
+                PvaLinkConfig::clone(&out_cfg),
+                client,
+            )),
+        );
+        LinkSet::put_value(
+            &resolver,
+            lref(b"pva://INT:PV"),
+            EpicsValue::Double(3.7),
+            LinkPutOp::Plain,
+        )
+        .await
+        .expect("a real into an int channel is put");
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        let PvField::Structure(s) = pv.current().expect("PV has a value") else {
+            panic!("expected structure value");
+        };
+        assert_eq!(
+            s.get_field("value"),
+            Some(&PvField::Scalar(ScalarValue::Int(3)))
+        );
     }
 
     #[cfg(tokio_backend)]

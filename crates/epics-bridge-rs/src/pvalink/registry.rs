@@ -54,8 +54,8 @@ const PVALINK_CLIENT_TIMEOUT: Duration = Duration::from_secs(5);
 /// value (keyed by its `field`) and emits one combined PUT with the
 /// process option resolved across all participating links
 /// (`pvxs/ioc/pvalink_channel.cpp:220-263`). The per-link options
-/// travel with each write via [`PvaLink::put_out_str`] /
-/// [`PvaLink::put_out_field`] rather than being baked into the channel
+/// travel with each write via [`PvaLink::put_out_field`] rather than
+/// being baked into the channel
 /// identity (see `link.rs`'s `Outbox`).
 ///
 /// INP per-link `field` / `sevr` / `time` divergence is likewise

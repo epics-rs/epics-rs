@@ -33,6 +33,9 @@ struct FreeBuffer {
     data: NDDataBuffer,
     data_size: usize,
     dims: Vec<NDDimension>,
+    /// Cleared by [`NDArrayPool::recycle`]: storage only, so a reused array
+    /// starts with no attributes.
+    attributes: NDAttributeList,
 }
 
 /// NDArray factory with free-list reuse and memory tracking.
@@ -96,7 +99,13 @@ impl NDArrayPool {
     }
 
     /// Wrap a buffer in an array that belongs to this pool.
-    fn adopt(&self, dims: Vec<NDDimension>, data: NDDataBuffer, data_size: usize) -> NDArray {
+    fn adopt(
+        &self,
+        dims: Vec<NDDimension>,
+        data: NDDataBuffer,
+        attributes: NDAttributeList,
+        data_size: usize,
+    ) -> NDArray {
         // The "Initialize fields" block of C++ NDArrayPool::alloc
         // (NDArrayPool.cpp:187-199) sets neither `epicsTS` nor `timeStamp`,
         // and neither does `NDArray::pooled`: the driver owns both and stamps them
@@ -109,6 +118,7 @@ impl NDArrayPool {
             PoolOnly(()),
             dims,
             data,
+            attributes,
             data_size,
             self.next_unique_id.fetch_add(1, Ordering::Relaxed),
             PoolTie::Charged(self.this.clone()),
@@ -224,7 +234,7 @@ impl NDArrayPool {
             let mut dims = reused.dims;
             dims.clear();
             set_dims(&mut dims);
-            let mut array = self.adopt(dims, reused.data, reused.data_size);
+            let mut array = self.adopt(dims, reused.data, reused.attributes, reused.data_size);
             array
                 .buffer_mut(PoolOnly(()))
                 .retype(PoolOnly(()), data_type, num_elements);
@@ -292,7 +302,7 @@ impl NDArrayPool {
         let data = NDDataBuffer::zeros(data_type, num_elements);
         let mut dims = Vec::new();
         set_dims(&mut dims);
-        Ok(self.adopt(dims, data, needed_bytes))
+        Ok(self.adopt(dims, data, NDAttributeList::new(), needed_bytes))
     }
 
     /// The refusal line C prints on the owning driver's `pasynUserSelf`
@@ -319,7 +329,7 @@ impl NDArrayPool {
         crate::convert::convert_buffer_into(source.data(), copy.buffer_mut(PoolOnly(())));
         copy.unique_id = source.unique_id;
         copy.copy_time_stamps_from(source);
-        copy.attributes = source.attributes.clone();
+        copy.attributes.clone_from(&source.attributes);
         copy.codec = source.codec.as_ref().map(Codec::copied);
         Ok(copy)
     }
@@ -358,11 +368,24 @@ impl NDArrayPool {
     /// The destructor's half of [`release`](Self::release): put a buffer this
     /// pool charged for back on the free list. C++ release never trims it
     /// (NDArrayPool.cpp:360-366); only the next alloc evicts.
-    pub(crate) fn recycle(&self, data: NDDataBuffer, dims: Vec<NDDimension>, data_size: usize) {
+    ///
+    /// The attributes go with it cleared. C keeps them live on the array and
+    /// hands them to the next alloc (NDArrayPool.cpp:202, `eraseNDAttributes`
+    /// off by default), so a reused array carries a previous frame's
+    /// attributes; that defect is not copied.
+    pub(crate) fn recycle(
+        &self,
+        data: NDDataBuffer,
+        dims: Vec<NDDimension>,
+        mut attributes: NDAttributeList,
+        data_size: usize,
+    ) {
+        attributes.clear();
         self.free_list.lock().push(FreeBuffer {
             data,
             data_size,
             dims,
+            attributes,
         });
         self.num_free_buffers.fetch_add(1, Ordering::Relaxed);
     }
@@ -823,6 +846,7 @@ impl Drop for SharedCharge {
             pool.recycle(
                 std::mem::take(self.parked.get_mut()),
                 Vec::new(),
+                NDAttributeList::new(),
                 self.data_size,
             );
         }
@@ -2666,5 +2690,32 @@ mod tests {
         d.offset = 1;
         let cropped = pool.convert(&src, &[d], NDDataType::UInt8).unwrap();
         assert_eq!(cropped.unique_id, 77);
+    }
+
+    /// A reused array starts with no attributes, and a copy onto it fills
+    /// the storage its previous ones left.
+    #[test]
+    fn a_reused_array_starts_bare_and_copies_into_the_storage_left() {
+        use crate::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
+        let pool = NDArrayPool::new(0);
+        let mut src = make_4x4_u8();
+        src.attributes.add(NDAttribute::new_static(
+            "Gain",
+            "detector gain",
+            NDAttrSource::Driver,
+            NDAttrValue::Float64(1.5),
+        ));
+        let first = pool.alloc_copy(&src).unwrap();
+        let name = first.attributes.get("Gain").unwrap().name.as_ptr();
+        drop(first);
+        let bare = pool
+            .alloc(src.dims.clone(), src.data().data_type())
+            .unwrap();
+        assert!(bare.attributes.is_empty());
+        drop(bare);
+        let copy = pool.alloc_copy(&src).unwrap();
+        let gain = copy.attributes.get("Gain").unwrap();
+        assert_eq!(gain.value, NDAttrValue::Float64(1.5));
+        assert_eq!(gain.name.as_ptr(), name);
     }
 }

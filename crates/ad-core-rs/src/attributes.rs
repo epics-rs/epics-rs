@@ -6,7 +6,7 @@
 /// property (a PV name, asyn drvInfo, function name, or constant string), so the
 /// variant holds that string rather than re-synthesizing it from the type.
 /// See [`NDAttrSource::source_string`].
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub enum NDAttrSource {
     Driver,
     Param {
@@ -20,6 +20,48 @@ pub enum NDAttrSource {
     /// Constant string from the XML `source` property (C++ `NDAttrSourceConst`).
     Constant(String),
     Undefined,
+}
+
+impl Clone for NDAttrSource {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Driver => Self::Driver,
+            Self::Param {
+                port_name,
+                param_name,
+            } => Self::Param {
+                port_name: port_name.clone(),
+                param_name: param_name.clone(),
+            },
+            Self::EpicsPV(s) => Self::EpicsPV(s.clone()),
+            Self::Function(s) => Self::Function(s.clone()),
+            Self::Constant(s) => Self::Constant(s.clone()),
+            Self::Undefined => Self::Undefined,
+        }
+    }
+
+    /// Into the strings already held, for a copy into a recycled attribute.
+    fn clone_from(&mut self, source: &Self) {
+        match (self, source) {
+            (
+                Self::Param {
+                    port_name,
+                    param_name,
+                },
+                Self::Param {
+                    port_name: from_port,
+                    param_name: from_param,
+                },
+            ) => {
+                port_name.clone_from(from_port);
+                param_name.clone_from(from_param);
+            }
+            (Self::EpicsPV(s), Self::EpicsPV(from))
+            | (Self::Function(s), Self::Function(from))
+            | (Self::Constant(s), Self::Constant(from)) => s.clone_from(from),
+            (this, source) => *this = source.clone(),
+        }
+    }
 }
 
 impl NDAttrSource {
@@ -59,7 +101,7 @@ pub enum NDAttrDataType {
 }
 
 /// Typed value stored in an NDAttribute.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub enum NDAttrValue {
     Int8(i8),
     UInt8(u8),
@@ -73,6 +115,34 @@ pub enum NDAttrValue {
     Float64(f64),
     String(String),
     Undefined,
+}
+
+impl Clone for NDAttrValue {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Int8(v) => Self::Int8(*v),
+            Self::UInt8(v) => Self::UInt8(*v),
+            Self::Int16(v) => Self::Int16(*v),
+            Self::UInt16(v) => Self::UInt16(*v),
+            Self::Int32(v) => Self::Int32(*v),
+            Self::UInt32(v) => Self::UInt32(*v),
+            Self::Int64(v) => Self::Int64(*v),
+            Self::UInt64(v) => Self::UInt64(*v),
+            Self::Float32(v) => Self::Float32(*v),
+            Self::Float64(v) => Self::Float64(*v),
+            Self::String(v) => Self::String(v.clone()),
+            Self::Undefined => Self::Undefined,
+        }
+    }
+
+    /// A string into the one already held, as C's `setValue` assigns
+    /// `string_` (NDAttribute.cpp:117).
+    fn clone_from(&mut self, source: &Self) {
+        match (self, source) {
+            (Self::String(s), Self::String(from)) => s.clone_from(from),
+            (this, source) => *this = source.clone(),
+        }
+    }
 }
 
 impl NDAttrValue {
@@ -610,7 +680,6 @@ fn epics_value_to_nd_attr(value: &epics_ca_rs::EpicsValue) -> NDAttrValue {
 }
 
 /// A named attribute attached to an NDArray.
-#[derive(Clone)]
 pub struct NDAttribute {
     pub name: String,
     pub description: String,
@@ -620,6 +689,27 @@ pub struct NDAttribute {
     /// value from it; when absent the attribute is a static value (Constant /
     /// Driver), and `update` is a no-op — matching C++ behavior.
     pub source_impl: Option<std::sync::Arc<dyn NDAttributeSource>>,
+}
+
+impl Clone for NDAttribute {
+    fn clone(&self) -> Self {
+        Self {
+            name: self.name.clone(),
+            description: self.description.clone(),
+            source: self.source.clone(),
+            value: self.value.clone(),
+            source_impl: self.source_impl.clone(),
+        }
+    }
+
+    /// Field by field into the strings already held.
+    fn clone_from(&mut self, source: &Self) {
+        self.name.clone_from(&source.name);
+        self.description.clone_from(&source.description);
+        self.source.clone_from(&source.source);
+        self.value.clone_from(&source.value);
+        self.source_impl.clone_from(&source.source_impl);
+    }
 }
 
 impl std::fmt::Debug for NDAttribute {
@@ -697,9 +787,42 @@ impl NDAttribute {
 }
 
 /// Collection of NDAttributes on an NDArray.
-#[derive(Debug, Clone, Default)]
+///
+/// A cleared or removed attribute keeps its storage for the next one into
+/// the list, as C's copy into a found attribute only sets its value
+/// (NDAttributeList.cpp:196-200); the pool's free list keeps a recycled
+/// array's (see `NDArrayPool::recycle`).
+#[derive(Default)]
 pub struct NDAttributeList {
-    attrs: Vec<NDAttribute>,
+    /// The list, then the storage of attributes since cleared or removed,
+    /// each without its live source: never more than the list has held.
+    slots: Vec<NDAttribute>,
+    /// How many of `slots` are the list.
+    live: usize,
+}
+
+impl Clone for NDAttributeList {
+    fn clone(&self) -> Self {
+        Self {
+            slots: self.attrs().to_vec(),
+            live: self.live,
+        }
+    }
+
+    fn clone_from(&mut self, source: &Self) {
+        self.clear();
+        for attr in source.iter() {
+            self.push_copy(attr);
+        }
+    }
+}
+
+impl std::fmt::Debug for NDAttributeList {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NDAttributeList")
+            .field("attrs", &self.attrs())
+            .finish()
+    }
 }
 
 impl NDAttributeList {
@@ -707,44 +830,76 @@ impl NDAttributeList {
         Self::default()
     }
 
+    fn attrs(&self) -> &[NDAttribute] {
+        &self.slots[..self.live]
+    }
+
+    fn find_mut(&mut self, name: &str) -> Option<&mut NDAttribute> {
+        self.slots[..self.live].iter_mut().find(|a| a.name == name)
+    }
+
     pub fn add(&mut self, attr: NDAttribute) {
-        if let Some(existing) = self.attrs.iter_mut().find(|a| a.name == attr.name) {
+        if let Some(existing) = self.find_mut(&attr.name) {
             *existing = attr;
+        } else if let Some(slot) = self.slots.get_mut(self.live) {
+            *slot = attr;
+            self.live += 1;
         } else {
-            self.attrs.push(attr);
+            self.slots.push(attr);
+            self.live += 1;
         }
     }
 
+    /// Append a copy of `attr`, into a kept slot's storage when there is one.
+    fn push_copy(&mut self, attr: &NDAttribute) {
+        if let Some(slot) = self.slots.get_mut(self.live) {
+            slot.clone_from(attr);
+        } else {
+            self.slots.push(attr.clone());
+        }
+        self.live += 1;
+    }
+
     pub fn get(&self, name: &str) -> Option<&NDAttribute> {
-        self.attrs.iter().find(|a| a.name == name)
+        self.attrs().iter().find(|a| a.name == name)
     }
 
     pub fn remove(&mut self, name: &str) -> bool {
-        let len_before = self.attrs.len();
-        self.attrs.retain(|a| a.name != name);
-        self.attrs.len() < len_before
+        let Some(at) = self.attrs().iter().position(|a| a.name == name) else {
+            return false;
+        };
+        self.slots[at..self.live].rotate_left(1);
+        self.live -= 1;
+        self.slots[self.live].source_impl = None;
+        true
     }
 
     pub fn clear(&mut self) {
-        self.attrs.clear();
+        for attr in &mut self.slots[..self.live] {
+            attr.source_impl = None;
+        }
+        self.live = 0;
     }
 
     pub fn iter(&self) -> impl Iterator<Item = &NDAttribute> {
-        self.attrs.iter()
+        self.attrs().iter()
     }
 
     pub fn len(&self) -> usize {
-        self.attrs.len()
+        self.live
     }
 
     pub fn is_empty(&self) -> bool {
-        self.attrs.is_empty()
+        self.live == 0
     }
 
     /// Merge attributes from another list: adds new ones, updates existing by name.
     pub fn copy_from(&mut self, other: &NDAttributeList) {
         for attr in other.iter() {
-            self.add(attr.clone());
+            match self.find_mut(&attr.name) {
+                Some(existing) => existing.clone_from(attr),
+                None => self.push_copy(attr),
+            }
         }
     }
 
@@ -754,7 +909,7 @@ impl NDAttributeList {
     /// the list is copied onto an outgoing NDArray so each attribute carries a
     /// fresh value. Static (Constant / Driver) attributes are unaffected.
     pub fn update_values(&mut self) {
-        for attr in self.attrs.iter_mut() {
+        for attr in &mut self.slots[..self.live] {
             attr.update();
         }
     }
@@ -1059,5 +1214,98 @@ mod tests {
         list.update_values();
         assert_eq!(list.get("live").unwrap().value, NDAttrValue::Int32(2));
         assert_eq!(list.get("frozen").unwrap().value, NDAttrValue::Int32(7));
+    }
+
+    fn named(name: &str, value: NDAttrValue) -> NDAttribute {
+        NDAttribute::new_static(name, "desc", NDAttrSource::Constant("c".into()), value)
+    }
+
+    #[test]
+    fn a_copy_onto_a_found_attribute_keeps_its_storage() {
+        let mut list = NDAttributeList::new();
+        list.add(named("Gain", NDAttrValue::String("low".into())));
+        let held = list.get("Gain").unwrap();
+        let (name, value) = (
+            held.name.as_ptr(),
+            held.value.as_string_typed().unwrap().as_ptr(),
+        );
+        let mut other = NDAttributeList::new();
+        other.add(named("Gain", NDAttrValue::String("mid".into())));
+        list.copy_from(&other);
+        let copied = list.get("Gain").unwrap();
+        assert_eq!(copied.value, NDAttrValue::String("mid".into()));
+        assert_eq!(copied.name.as_ptr(), name);
+        assert_eq!(copied.value.as_string_typed().unwrap().as_ptr(), value);
+    }
+
+    #[test]
+    fn a_cleared_list_reads_empty_and_lets_its_sources_go() {
+        let src = ParamAttributeSource::new("GAIN", 0, ParamAttrType::Int32);
+        let mut list = NDAttributeList::new();
+        list.add(NDAttribute::new_with_source(
+            "Gain",
+            "",
+            NDAttrSource::Driver,
+            src.clone(),
+        ));
+        assert_eq!(std::sync::Arc::strong_count(&src), 2);
+        list.clear();
+        assert!(list.is_empty());
+        assert!(list.get("Gain").is_none());
+        assert_eq!(list.iter().count(), 0);
+        assert_eq!(std::sync::Arc::strong_count(&src), 1);
+    }
+
+    /// Fresh attributes added after each clear, as a driver's on a reused
+    /// array, keep no more storage than the list has held.
+    #[test]
+    fn storage_never_exceeds_what_the_list_has_held() {
+        let mut list = NDAttributeList::new();
+        for frame in 0..8 {
+            list.clear();
+            for name in ["A", "B", "C"] {
+                list.add(named(name, NDAttrValue::Int32(frame)));
+            }
+        }
+        assert_eq!(list.slots.len(), 3);
+        assert!(list.remove("B"));
+        assert!(!list.remove("B"));
+        let names: Vec<_> = list.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, ["A", "C"]);
+        list.add(named("D", NDAttrValue::Int32(0)));
+        assert_eq!((list.len(), list.slots.len()), (3, 3));
+    }
+
+    /// Into an empty list, a copy takes the storage a clear left, first
+    /// cleared first.
+    #[test]
+    fn a_copy_into_a_cleared_list_reuses_its_storage() {
+        let mut list = NDAttributeList::new();
+        list.add(named("Aaa", NDAttrValue::Int32(1)));
+        list.add(named("Bbb", NDAttrValue::Int32(2)));
+        let ptrs: Vec<_> = list.iter().map(|a| a.name.as_ptr()).collect();
+        let mut other = NDAttributeList::new();
+        other.add(named("Ccc", NDAttrValue::Int32(3)));
+        other.add(named("Ddd", NDAttrValue::Int32(4)));
+        list.clear();
+        list.copy_from(&other);
+        let names: Vec<_> = list.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, ["Ccc", "Ddd"]);
+        let reused: Vec<_> = list.iter().map(|a| a.name.as_ptr()).collect();
+        assert_eq!(reused, ptrs);
+    }
+
+    #[test]
+    fn clone_from_replaces_the_set() {
+        let mut list = NDAttributeList::new();
+        list.add(named("Aaa", NDAttrValue::Int32(1)));
+        list.add(named("Bbb", NDAttrValue::Int32(2)));
+        let mut other = NDAttributeList::new();
+        other.add(named("Ccc", NDAttrValue::Float64(3.0)));
+        list.clone_from(&other);
+        let names: Vec<_> = list.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, ["Ccc"]);
+        assert_eq!(list.get("Ccc").unwrap().value, NDAttrValue::Float64(3.0));
+        assert!(list.clone().get("Ccc").is_some());
     }
 }

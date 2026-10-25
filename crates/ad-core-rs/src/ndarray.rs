@@ -794,6 +794,7 @@ impl Drop for NDArray {
             pool.recycle(
                 std::mem::take(&mut self.data),
                 std::mem::take(&mut self.dims),
+                std::mem::take(&mut self.attributes),
                 self.data_size,
             );
         }
@@ -907,11 +908,13 @@ impl NDArray {
         token: PoolOnly,
         dims: Vec<NDDimension>,
         data: NDDataBuffer,
+        attributes: NDAttributeList,
         data_size: usize,
         unique_id: i32,
         tie: PoolTie,
     ) -> Self {
         let mut array = Self::with_data(dims, data);
+        array.attributes = attributes;
         array.unique_id = unique_id;
         array.data_size = data_size;
         array.tie(token, tie);

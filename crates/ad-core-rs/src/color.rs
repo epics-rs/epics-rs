@@ -72,7 +72,7 @@ fn output(
     let mut arr = pool.alloc(dims, data_type)?;
     arr.unique_id = src.unique_id;
     arr.copy_time_stamps_from(src);
-    arr.attributes = src.attributes.clone();
+    arr.attributes.clone_from(&src.attributes);
     // C copies the frame onto it with `copy(pArray, pArrayOut, 0, 0)`.
     arr.codec = src.codec.as_ref().map(crate::codec::Codec::copied);
     Ok(arr)

@@ -9,7 +9,9 @@
 //! hands its input on, copied into a free buffer as C's
 //! `endProcessCallbacks` copies it (NDPluginDriver.cpp:285), to a plugin
 //! that only counts. Everything the publish sets off is counted, on
-//! every thread; only the driver's own fill of the frame is not.
+//! every thread; only the driver's own fill of the frame is not. A frame
+//! with driver attributes allocates nothing either, where C's copy news
+//! each one (NDArrayPool.cpp:301, NDAttribute.cpp:113).
 //!
 //! Each frame waits for both ports to apply its posts, as C's plugin thread
 //! writes them under the port lock before it takes the next array. A port
@@ -23,6 +25,7 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 use std::task::{Context, Waker};
 use std::time::Duration;
 
+use ad_core_rs::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
 use ad_core_rs::ndarray::{NDArray, NDDataType, NDDimension};
 use ad_core_rs::ndarray_pool::{DriverPool, NDArrayPool, PublishedArray};
 use ad_core_rs::plugin::channel::{ArrayPublisher, NDArrayOutput};
@@ -176,14 +179,26 @@ fn publish(publisher: &ArrayPublisher, frame: PublishedArray) {
 const WARM: usize = 64;
 const FRAMES: usize = 512;
 
+/// What a driver's `getAttributes` puts on each frame (simDetector.cpp:828).
+const DRIVER_ATTRIBUTES: [&str; 4] = ["ColorMode", "BayerPattern", "Gain", "Exposure"];
+
 #[test]
 fn a_steady_frame_through_two_plugins_allocates_nothing() {
+    let bare = steady_allocs(["ZALLOC_FWD", "ZALLOC_SINK"], &[]);
+    assert_eq!(bare, 0, "{FRAMES} bare frames after {WARM} warm-up ones");
+    let attributed = steady_allocs(["ZALLOC_AFWD", "ZALLOC_ASINK"], &DRIVER_ATTRIBUTES);
+    assert_eq!(
+        attributed, 0,
+        "{FRAMES} frames with driver attributes after {WARM} warm-up ones"
+    );
+}
+
+/// The allocations of `FRAMES` frames, each carrying `attributes`, through
+/// a fresh chain on `ports`.
+fn steady_allocs(ports: [&str; 2], attributes: &[&str]) -> usize {
     let wiring = Arc::new(WiringRegistry::new());
     let seen = Arc::new(AtomicUsize::new(0));
-    let claims = [
-        asyn_rs::asyn_record::claim_port("ZALLOC_FWD").unwrap(),
-        asyn_rs::asyn_record::claim_port("ZALLOC_SINK").unwrap(),
-    ];
+    let claims = ports.map(|port| asyn_rs::asyn_record::claim_port(port).unwrap());
     let (forward, _jf) = create_plugin_runtime(
         &claims[0],
         Forward,
@@ -240,7 +255,16 @@ fn a_steady_frame_through_two_plugins_allocates_nothing() {
                             NDDataType::UInt16,
                         )
                         .ok()?;
-                    frame.fill().set_unique_id(i as i32 + 1);
+                    let mut fill = frame.fill();
+                    fill.set_unique_id(i as i32 + 1);
+                    for (k, name) in attributes.iter().enumerate() {
+                        fill.attributes_mut().add(NDAttribute::new_static(
+                            *name,
+                            "driver attribute",
+                            NDAttrSource::Driver,
+                            NDAttrValue::Int32((i + k) as i32),
+                        ));
+                    }
                     Some(frame)
                 })
                 .unwrap()
@@ -255,6 +279,5 @@ fn a_steady_frame_through_two_plugins_allocates_nothing() {
         }
     }
     COUNTING.store(false, Ordering::SeqCst);
-    let allocs = ALLOCS.load(Ordering::SeqCst);
-    assert_eq!(allocs, 0, "{FRAMES} frames after {WARM} warm-up ones");
+    ALLOCS.load(Ordering::SeqCst)
 }

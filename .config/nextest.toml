@@ -317,6 +317,14 @@ test-group = 'ca_softioc'
 filter = 'package(epics-bridge-rs)'
 test-group = 'ioc_unthrottled'
 
+# 100000 gets and 40000 puts over CA: about a minute unoptimized, where the
+# default 120 s kill sits too close. The kill comes after the harness's own
+# 240 s deadline, so a hang fails with the program's report rather than a
+# bare SIGTERM. Sets no test group, so first-match leaves those alone.
+[[profile.default.overrides]]
+filter = 'package(seq-validate) & (test(=ioc::pv_get_async) | test(=ioc::pv_get_complete))'
+slow-timeout = { period = "60s", terminate-after = 5 }
+
 [test-groups]
 # PVA listener-binding tests serialise process-wide. With max-threads
 # higher than 1 we observed flakes in `stability` (auto-reconnect,

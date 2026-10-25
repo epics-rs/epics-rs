@@ -6,9 +6,10 @@
 //! array (decayed to a pointer) or `&x` is the place itself (`&seqg_var.x`,
 //! `&seqg_var.a.at(i)`); anything else is its value (`x.get()`), `as _`
 //! when numeric. So a string argument is a [`CSrc`] that may be a
-//! variable, and a destination is a `&impl Place<B>`. A shim copies each
-//! source variable out before it takes another lock, so no call holds two
-//! variables' locks at once, and `strcpy(x, x)` does not deadlock.
+//! variable, and a destination is a [`CDst`], which may also be a `char *`
+//! into one. A shim copies each source out before it takes the
+//! destination's lock, so no call holds two variables' locks at once, and
+//! `strcpy(x, x)` does not deadlock.
 //!
 //! Where C writes past the end of the destination, the copy stops one
 //! byte short of it and keeps the terminator.
@@ -215,9 +216,48 @@ impl CBuf for SeqString {
 
 impl<const N: usize> CBuf for [c_char; N] {
     fn bytes_mut(&mut self) -> &mut [u8] {
-        // SAFETY: as in `CSrc for [c_char; N]`; the slice borrows `self`
-        // mutably for its whole life.
-        unsafe { std::slice::from_raw_parts_mut(self.as_mut_ptr().cast::<u8>(), N) }
+        char_bytes_mut(self)
+    }
+}
+
+fn char_bytes_mut(s: &mut [c_char]) -> &mut [u8] {
+    // SAFETY: as in `char_bytes`; the slice borrows `s` mutably for its
+    // whole life.
+    unsafe { std::slice::from_raw_parts_mut(s.as_mut_ptr().cast(), s.len()) }
+}
+
+/// A C string written as a destination: a character buffer variable or
+/// element, or a `char *`, which writes from where it points to the end of
+/// what it points into.
+pub trait CDst {
+    /// Run `f` on the buffer under its variable's lock; `f` must not touch
+    /// another program variable.
+    fn with_c_dst<R>(&self, f: impl FnOnce(&mut [u8]) -> R) -> R;
+}
+
+impl<T: CDst + ?Sized> CDst for &T {
+    fn with_c_dst<R>(&self, f: impl FnOnce(&mut [u8]) -> R) -> R {
+        (**self).with_c_dst(f)
+    }
+}
+
+impl<B: CBuf> CDst for SeqVar<B> {
+    fn with_c_dst<R>(&self, f: impl FnOnce(&mut [u8]) -> R) -> R {
+        self.modify(|b| f(b.bytes_mut()))
+    }
+}
+
+impl<B: CBuf, const N: usize, P: Place<[B; N]> + ?Sized> CDst for At<'_, P, [B; N]> {
+    fn with_c_dst<R>(&self, f: impl FnOnce(&mut [u8]) -> R) -> R {
+        self.modify(|b| f(b.bytes_mut()))
+    }
+}
+
+/// The null pointer panics where C would write through it.
+impl CDst for CharPtr {
+    fn with_c_dst<R>(&self, f: impl FnOnce(&mut [u8]) -> R) -> R {
+        assert!(!self.is_null(), "null pointer passed as a C destination");
+        self.with_rest_mut(|s| f(char_bytes_mut(s)))
     }
 }
 
@@ -232,17 +272,16 @@ fn put_terminated(buf: &mut [u8], at: usize, src: &[u8]) {
 }
 
 /// `strcpy`: the bytes after the terminator keep what they held.
-pub fn strcpy<B: CBuf>(dst: &impl Place<B>, src: impl CSrc) {
+pub fn strcpy(dst: impl CDst, src: impl CSrc) {
     let src = src.to_c_vec();
-    dst.modify(|b| put_terminated(b.bytes_mut(), 0, &src))
+    dst.with_c_dst(|b| put_terminated(b, 0, &src))
 }
 
 /// `strncpy`: at most `n` bytes, NUL-padded to `n`, unterminated when
 /// `src` has `n` or more.
-pub fn strncpy<B: CBuf>(dst: &impl Place<B>, src: impl CSrc, n: usize) {
+pub fn strncpy(dst: impl CDst, src: impl CSrc, n: usize) {
     let s = src.to_c_vec();
-    dst.modify(|b| {
-        let buf = b.bytes_mut();
+    dst.with_c_dst(|buf| {
         let n = n.min(buf.len());
         let k = s.len().min(n);
         buf[..k].copy_from_slice(&s[..k]);
@@ -251,10 +290,9 @@ pub fn strncpy<B: CBuf>(dst: &impl Place<B>, src: impl CSrc, n: usize) {
 }
 
 /// `strcat`.
-pub fn strcat<B: CBuf>(dst: &impl Place<B>, src: impl CSrc) {
+pub fn strcat(dst: impl CDst, src: impl CSrc) {
     let src = src.to_c_vec();
-    dst.modify(|b| {
-        let buf = b.bytes_mut();
+    dst.with_c_dst(|buf| {
         let end = before_nul(buf).len();
         put_terminated(buf, end, &src)
     })
@@ -450,10 +488,10 @@ pub fn printf(fmt: impl CSrc, args: &[CArg<'_>]) -> c_int {
 
 /// `sprintf`, bounded by the destination; the length returned is C's, the
 /// text's whole length.
-pub fn sprintf<B: CBuf>(dst: &impl Place<B>, fmt: impl CSrc, args: &[CArg<'_>]) -> c_int {
+pub fn sprintf(dst: impl CDst, fmt: impl CSrc, args: &[CArg<'_>]) -> c_int {
     let errno = io::Error::last_os_error();
     let (text, len) = format(&fmt.to_c_vec(), args, &errno);
-    dst.modify(|b| put_terminated(b.bytes_mut(), 0, &text));
+    dst.with_c_dst(|b| put_terminated(b, 0, &text));
     len
 }
 
@@ -1125,6 +1163,39 @@ mod tests {
     }
 
     #[test]
+    fn a_char_pointer_writes_from_where_it_points_to_its_variable_s_end() {
+        let v = <SeqVar<[c_char; 8]>>::zeroed();
+        strcpy(&v, "abcdef");
+        strcpy(v.at(2).ptr(), "XY");
+        assert_eq!(&v.get().map(|c| c as u8), b"abXY\0f\0\0");
+        assert_eq!(sprintf(v.at(6).ptr(), "%d", &[123.into()]), 3);
+        assert_eq!(&v.get().map(|c| c as u8), b"abXY\0f1\0");
+        strcat(v.at(0).ptr(), "Z");
+        strncpy(v.at(5).ptr(), "q", 3);
+        assert_eq!(&v.get().map(|c| c as u8), b"abXYZq\0\0");
+    }
+
+    #[test]
+    fn a_source_inside_the_destination_is_read_first() {
+        let v = <SeqVar<[c_char; 8]>>::zeroed();
+        strcpy(&v, "abc");
+        strcat(v.at(0).ptr(), &v);
+        assert_eq!(text(&v), b"abcabc");
+    }
+
+    #[test]
+    #[should_panic(expected = "null pointer passed as a C destination")]
+    fn a_null_destination_panics() {
+        strcpy(CharPtr::default(), "x");
+    }
+
+    #[test]
+    #[should_panic(expected = "write through a pointer to a string literal")]
+    fn a_literal_destination_panics() {
+        strcpy(CharPtr::from("ab"), "x");
+    }
+
+    #[test]
     fn strcpy_into_a_too_small_buffer_keeps_its_terminator() {
         let v = <SeqVar<[c_char; 4]>>::zeroed();
         strcpy(&v, "abcdef");
@@ -1165,8 +1236,8 @@ mod tests {
         strcpy(&w, "m1");
         strcat(&w, &w);
         assert_eq!(w.to_c_vec(), b"m1m1");
-        strcpy(&v.at(0), &w);
-        strcpy(&v.at(1), v.at(0));
+        strcpy(v.at(0), &w);
+        strcpy(v.at(1), v.at(0));
         assert_eq!(strcmp(v.at(1), &w), 0);
         assert_eq!(strlen(v.at(1)), 4);
         let CArg::Str(Some(s)) = CArg::from(&v.at(1)) else {
@@ -1269,11 +1340,11 @@ mod tests {
         assert_eq!(sprintf(&v, "%d", &[12345.into()]), 5);
         assert_eq!(text(&v), b"123");
         let w = <SeqVar<[SeqString; 2]>>::zeroed();
-        strcpy(&w.at(0), "m1");
-        let n = sprintf(&w.at(1), "%s.%s", &[(&w.at(0)).into(), "RBV".into()]);
+        strcpy(w.at(0), "m1");
+        let n = sprintf(w.at(1), "%s.%s", &[(&w.at(0)).into(), "RBV".into()]);
         assert_eq!((n, w.at(1).to_c_vec()), (6, b"m1.RBV".to_vec()));
         // The format and the arguments are read before the destination.
-        assert_eq!(sprintf(&w.at(0), w.at(0), &[]), 2);
+        assert_eq!(sprintf(w.at(0), w.at(0), &[]), 2);
         assert_eq!(w.at(0).to_c_vec(), b"m1");
         assert_eq!(sprintf(&v, "ab%", &[]), -1);
         assert_eq!(text(&v), b"ab");
@@ -1514,7 +1585,7 @@ mod tests {
         assert_eq!(atof("-inf"), f64::NEG_INFINITY);
         assert_eq!(atof("e5"), 0.0);
         let v = <SeqVar<[SeqString; 2]>>::zeroed();
-        strcpy(&v.at(1), "R-2.25");
+        strcpy(v.at(1), "R-2.25");
         assert_eq!(atof(&b"R-2.25"[1..]), -2.25);
         assert_eq!(atof(v.at(1)), 0.0);
     }
@@ -1534,7 +1605,7 @@ mod tests {
     #[test]
     fn a_string_element_of_an_array_is_a_destination() {
         let v = <SeqVar<[SeqString; 3]>>::zeroed();
-        strcpy(&v.at(2), "Al");
+        strcpy(v.at(2), "Al");
         assert_eq!(v.get()[2].as_bytes(), b"Al");
     }
 

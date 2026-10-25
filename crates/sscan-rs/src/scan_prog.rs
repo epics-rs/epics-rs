@@ -8,7 +8,7 @@
 //! returns.
 
 use epics_seq_rs::c::*;
-use epics_seq_rs::{Place, SeqString, SeqVar};
+use epics_seq_rs::{SeqString, SeqVar};
 
 macro_rules! seqg_escaped {
     (r#"#include <string.h>"#) => {};
@@ -122,7 +122,7 @@ fn calc_cpt() -> i64 {
 
 /// `clocks2str`: seconds as `hh:mm:ss`, `infinite` past a year and nine
 /// days. The sign rides on the hours, so under an hour it is lost.
-fn clocks2str<B: CBuf>(isec: i64, str: &impl Place<B>) {
+fn clocks2str(isec: i64, str: impl CDst) {
     if isec > 32_000_000 {
         return strcpy(str, "infinite");
     }
@@ -314,7 +314,7 @@ mod tests {
         unsafe { std::env::set_var("TZ", "EST5EDT,M3.2.0,M11.1.0") };
     }
 
-    fn text<B: CSrc + Zeroed>(f: impl FnOnce(&SeqVar<B>)) -> String {
+    fn text<B: CSrc + CBuf + Zeroed>(f: impl FnOnce(&SeqVar<B>)) -> String {
         let v = <SeqVar<B>>::zeroed();
         f(&v);
         String::from_utf8(v.to_c_vec()).unwrap()

@@ -94,7 +94,7 @@ const EXPECTED_FAILURES: &[(&str, &str)] = &[
     // the escaped `char pvname[]` buffer is passed by value
     (
         "ip/ipApp/src/Keithley2kDMM.st",
-        "Keithley2kDMM.st:277: error[E0308]: mismatched types: expected `&_`, found `[i8; 256]`",
+        "Keithley2kDMM.st:277: error[E0277]: the trait bound `[i8; 256]: CDst` is not satisfied: the trait `CDst` is not implemented for `[i8; 256]`",
     ),
     (
         "motor/modules/motorNewport/newportApp/src/MM4005_trajectoryScan.st",

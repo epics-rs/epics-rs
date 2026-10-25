@@ -20,7 +20,7 @@ use epics_base_rs::server::autosave::manager::{AutosaveBuilder, AutosaveManager,
 use epics_base_rs::server::autosave::save_set::{SaveSetConfig, SaveStrategy};
 use epics_base_rs::server::autosave::settings::SrSettings;
 use epics_base_rs::server::database::PvDatabase;
-use epics_base_rs::server::ioc_app::IocApplication;
+use epics_base_rs::server::ioc_app::{IocApplication, RunOutcome};
 use epics_base_rs::server::records::ao::AoRecord;
 
 const CHILD: &str = "AUTOSAVE_CONNECT_LIST_CHILD";
@@ -301,11 +301,11 @@ async fn child_ioc() {
         ),
     )
     .unwrap();
-    IocApplication::new()
+    let outcome = IocApplication::new()
         .port(0)
         .autosave_startup(Arc::new(Mutex::new(AutosaveStartupConfig::new())))
         .startup_script(d.join("st.cmd").to_str().unwrap())
-        .run(|config| async move {
+        .run_outcome(|config| async move {
             let mgr = config.autosave_manager.unwrap();
             let set = mgr.sets()[0].0.clone();
             for _ in 0..100 {
@@ -319,6 +319,8 @@ async fn child_ioc() {
         })
         .await
         .unwrap();
+    // A set that never saw `iocInit` connects nothing either.
+    assert_eq!(outcome, RunOutcome::Served);
 }
 
 /// The st.cmd path makes its sets before `iocInit` too.

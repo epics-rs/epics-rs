@@ -1640,7 +1640,7 @@ impl SharedProcessorInner {
 
     /// `beginProcessCallbacks` and `endProcessCallbacks` for what a write
     /// publishes.
-    fn end_published(&mut self, published: Published) -> ProcessOutput {
+    fn end_published(&mut self, batch: ParamBatch, published: Published) -> ProcessOutput {
         let deliver = self.array_callbacks.get();
         let (arrays, begin, attributes) = match published {
             Published::Nothing => (Vec::new(), None, None),
@@ -1651,16 +1651,16 @@ impl SharedProcessorInner {
         };
         let ready = self.delivery.end_written(arrays, attributes.as_ref());
         let mut output = self.build_publish_batch(
+            batch,
             ready,
             Vec::new(),
-            false,
             begin
                 .as_ref()
                 .map(|(array, sets)| (&**array, sets.as_slice())),
             None,
             deliver,
         );
-        output.batch.merge(self.build_status_params_batch());
+        self.push_status_params(&mut output.batch.sets);
         output
     }
 
@@ -1767,26 +1767,27 @@ impl SharedProcessorInner {
     /// The returned output must be published and flushed by the caller in async context.
     fn process_and_publish<P: NDPluginProcess>(
         &mut self,
+        batch: ParamBatch,
         processor: &P,
         array: &PublishedArray,
     ) -> ProcessOutput {
         let t0 = std::time::Instant::now();
         if !processor.processing_required(array) {
-            return self.unprocessed(t0.elapsed().as_secs_f64() * 1000.0);
+            return self.unprocessed(batch, t0.elapsed().as_secs_f64() * 1000.0);
         }
         let (pool, begin) = self.cache_input_array(array);
         let t0 = std::time::Instant::now();
         let hand_on = self.hand_on();
         let result = run_processor(processor, array.array(), &pool, &begin, Some(&hand_on));
         let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
-        self.post_process(array, result, &begin, elapsed_ms)
+        self.post_process(batch, array, result, &begin, elapsed_ms)
     }
 
     /// A frame [`NDPluginProcess::processing_required`] refused: only the
     /// ExecutionTime C sets after `processCallbacks` (NDPluginDriver.cpp:
     /// 438, :537).
-    fn unprocessed(&mut self, elapsed_ms: f64) -> ProcessOutput {
-        self.build_publish_batch(Vec::new(), Vec::new(), false, None, Some(elapsed_ms), false)
+    fn unprocessed(&mut self, batch: ParamBatch, elapsed_ms: f64) -> ProcessOutput {
+        self.build_publish_batch(batch, Vec::new(), Vec::new(), None, Some(elapsed_ms), false)
     }
 
     /// The completion half: route the produced arrays and build the param
@@ -1795,6 +1796,7 @@ impl SharedProcessorInner {
     /// sort buffer is [`Delivery`]'s, which a WriteFile hand-on also reaches.
     fn post_process(
         &mut self,
+        batch: ParamBatch,
         array: &NDArray,
         result: ProcessResult,
         begin: &[PendingParam],
@@ -1840,14 +1842,15 @@ impl SharedProcessorInner {
             self.array_counter -= 1;
         }
         let mut output = self.build_publish_batch(
+            batch,
             ready,
             result.param_updates,
-            result.scatter,
             Some((array, begin)),
             Some(elapsed_ms),
             self.array_callbacks.get(),
         );
-        output.batch.merge(self.build_status_params_batch());
+        output.scatter = result.scatter;
+        self.push_status_params(&mut output.batch.sets);
         output.addressed = self.delivery.publishable_addressed(result.addressed);
         output
     }
@@ -1855,69 +1858,70 @@ impl SharedProcessorInner {
     /// A param batch carrying only the current DroppedArrays / queue counters,
     /// used when an array is dropped before processing (B5).
     fn dropped_arrays_only_batch(&self) -> ParamBatch {
-        self.build_status_params_batch()
+        let mut batch = ParamBatch::empty();
+        self.push_status_params(&mut batch.sets);
+        batch
     }
 
     /// Flush the sort buffer head-first while contiguous or stale (C++
     /// sortingTask periodic tick). Does NOT drain non-contiguous fresh arrays.
-    fn tick_sort_buffer(&mut self) -> ProcessOutput {
+    fn tick_sort_buffer(&mut self, batch: ParamBatch) -> ProcessOutput {
         let entries = self.delivery.drain_ready();
-        self.emit_drained(entries)
+        self.emit_drained(batch, entries)
     }
 
     /// Drain the entire sort buffer in uniqueId order (sort mode turned off).
-    fn flush_sort_buffer(&mut self) -> ProcessOutput {
+    fn flush_sort_buffer(&mut self, batch: ParamBatch) -> ProcessOutput {
         let entries = self.delivery.drain_all();
-        self.emit_drained(entries)
+        self.emit_drained(batch, entries)
     }
 
-    fn emit_drained(&mut self, entries: Vec<(i32, Vec<PublishedArray>)>) -> ProcessOutput {
+    fn emit_drained(
+        &mut self,
+        mut batch: ParamBatch,
+        entries: Vec<(i32, Vec<PublishedArray>)>,
+    ) -> ProcessOutput {
         let mut all_arrays = Vec::new();
-        let mut combined = ParamBatch::empty();
         for (_unique_id, arrays) in entries {
             // Sort-buffer entries were admitted only while NDArrayCallbacks was
             // on (route_output_arrays runs past the delivery gate); the C++
             // sort thread delivers them regardless of the *current* flag, so
             // they always deliver here.
-            let output = self.build_publish_batch(arrays, vec![], false, None, None, true);
+            let output = self.build_publish_batch(batch, arrays, vec![], None, None, true);
             all_arrays.extend(output.arrays);
-            combined.merge(output.batch);
+            batch = output.batch;
         }
-        combined.merge(self.build_sort_params_batch());
+        self.push_sort_params(&mut batch.sets);
         ProcessOutput {
             arrays: all_arrays,
             scatter: false,
-            batch: combined,
+            batch,
             addressed: vec![],
         }
     }
 
-    fn build_sort_params_batch(&self) -> ParamBatch {
+    fn push_sort_params(&self, sets: &mut Vec<asyn_rs::request::ParamSetValue>) {
         use asyn_rs::request::ParamSetValue;
         let counters = self.delivery.sort_counters();
-        let mut batch = ParamBatch {
-            time_stamp: None,
-            sets: vec![
-                ParamSetValue::new(
-                    self.plugin_params.disordered_arrays,
-                    0,
-                    ParamValue::Int32(counters.disordered_arrays),
-                ),
-                ParamSetValue::new(
-                    self.plugin_params.dropped_output_arrays,
-                    0,
-                    ParamValue::Int32(counters.dropped_output_arrays),
-                ),
-            ],
-        };
+        sets.extend([
+            ParamSetValue::new(
+                self.plugin_params.disordered_arrays,
+                0,
+                ParamValue::Int32(counters.disordered_arrays),
+            ),
+            ParamSetValue::new(
+                self.plugin_params.dropped_output_arrays,
+                0,
+                ParamValue::Int32(counters.dropped_output_arrays),
+            ),
+        ]);
         if let Some(free) = counters.sort_free {
-            batch.sets.push(ParamSetValue::new(
+            sets.push(ParamSetValue::new(
                 self.plugin_params.sort_free,
                 0,
                 ParamValue::Int32(free),
             ));
         }
-        batch
     }
 
     /// Build a param batch carrying the runtime status counters:
@@ -1959,10 +1963,10 @@ impl SharedProcessorInner {
         true
     }
 
-    fn build_status_params_batch(&self) -> ParamBatch {
+    fn push_status_params(&self, sets: &mut Vec<asyn_rs::request::ParamSetValue>) {
         use asyn_rs::request::ParamSetValue;
-        let mut batch = self.build_sort_params_batch();
-        batch.sets.push(ParamSetValue::new(
+        self.push_sort_params(sets);
+        sets.push(ParamSetValue::new(
             self.plugin_params.dropped_arrays,
             0,
             ParamValue::Int32(
@@ -1970,7 +1974,6 @@ impl SharedProcessorInner {
                     .load(std::sync::atomic::Ordering::Acquire),
             ),
         ));
-        batch
     }
 
     /// Build a ProcessOutput: fires direct interrupts (sync) and collects
@@ -1992,18 +1995,16 @@ impl SharedProcessorInner {
     /// value now, after any frame the plugin did not count.
     fn build_publish_batch(
         &mut self,
+        mut batch: ParamBatch,
         output_arrays: Vec<PublishedArray>,
         param_updates: Vec<ParamUpdate>,
-        scatter: bool,
         begin: Option<(&NDArray, &[PendingParam])>,
         elapsed_ms: Option<f64>,
         deliver: bool,
     ) -> ProcessOutput {
         use asyn_rs::request::ParamSetValue;
 
-        let mut sets: Vec<ParamSetValue> = Vec::new();
-        let mut time_stamp = None;
-
+        let sets = &mut batch.sets;
         if let Some((input, begin_sets)) = begin {
             let counter = self.ndarray_params.array_counter;
             sets.extend(
@@ -2019,7 +2020,7 @@ impl SharedProcessorInner {
             ));
             // `setTimeStamp(&pArray->epicsTS)` (:232), which the dimensions
             // post and every callback until the next frame carry.
-            time_stamp = Some(input.timestamp.to_system_time());
+            batch.time_stamp = Some(input.timestamp.to_system_time());
             sets.extend(self.dimensions(input));
         }
 
@@ -2063,8 +2064,8 @@ impl SharedProcessorInner {
             // endProcessCallbacks early-return); the metadata params above are
             // still published.
             arrays: if deliver { output_arrays } else { Vec::new() },
-            scatter,
-            batch: ParamBatch { sets, time_stamp },
+            scatter: false,
+            batch,
             addressed: vec![],
         }
     }
@@ -2198,9 +2199,13 @@ impl ParamBatch {
         }
     }
 
-    fn merge(&mut self, other: ParamBatch) {
-        self.time_stamp = other.time_stamp.or(self.time_stamp);
-        self.sets.extend(other.sets);
+    /// An empty batch in the `updates` `gate` hands out, which go back to
+    /// it once the actor has run the section they are stored in.
+    fn new(gate: &CallbacksGate) -> Self {
+        Self {
+            sets: gate.updates(),
+            time_stamp: None,
+        }
     }
 
     /// Store and fire the callbacks in one request, for a batch no delivery
@@ -3863,11 +3868,14 @@ async fn complete_frame(
         processed,
         elapsed_ms,
     } = item;
+    let batch = ParamBatch::new(callbacks_gate);
     let (output, senders) = {
         let mut guard = shared.lock();
         let output = match processed {
-            Some((result, begin)) => guard.post_process(&msg.array, result, &begin, elapsed_ms),
-            None => guard.unprocessed(elapsed_ms),
+            Some((result, begin)) => {
+                guard.post_process(batch, &msg.array, result, &begin, elapsed_ms)
+            }
+            None => guard.unprocessed(batch, elapsed_ms),
         };
         let senders = guard.senders_for(&output);
         (output, senders)
@@ -4105,9 +4113,10 @@ fn plugin_data_loop<P: NDPluginProcess>(
                             let _ = ack.send(());
                         }
                         Some(PluginParamMsg::Publish(published, addressed)) => {
+                            let batch = ParamBatch::new(&callbacks_gate);
                             let (po, senders) = {
                                 let mut guard = shared.lock();
-                                let mut po = guard.end_published(published);
+                                let mut po = guard.end_published(batch, published);
                                 po.addressed = guard.delivery.publishable_addressed(addressed);
                                 let senders = guard.senders_for(&po);
                                 (po, senders)
@@ -4338,8 +4347,11 @@ fn plugin_data_loop<P: NDPluginProcess>(
                                             Admission::Admit => {
                                                 let (po, senders) = {
                                                     let mut guard = shared.lock();
-                                                    let output = guard
-                                                        .process_and_publish(&*processor, &array);
+                                                    let output = guard.process_and_publish(
+                                                        ParamBatch::new(&callbacks_gate),
+                                                        &*processor,
+                                                        &array,
+                                                    );
                                                     let senders = guard.senders_for(&output);
                                                     (output, senders)
                                                 };
@@ -4398,7 +4410,8 @@ fn plugin_data_loop<P: NDPluginProcess>(
                                     let mut guard = shared.lock();
                                     let sort_time = guard.delivery.set_sort_mode(mode);
                                     if mode == 0 {
-                                        let output = guard.flush_sort_buffer();
+                                        let output = guard
+                                            .flush_sort_buffer(ParamBatch::new(&callbacks_gate));
                                         let senders = guard.senders_for(&output);
                                         sort_flush_active = false;
                                         Some((output, senders))
@@ -4465,7 +4478,7 @@ fn plugin_data_loop<P: NDPluginProcess>(
                                 {
                                     let deliver = guard.array_callbacks.get();
                                     let arrays = guard.delivery.publishable(result.output_arrays, None, CopyArray::Never);
-                                    let mut output = guard.build_publish_batch(arrays, result.param_updates, false, None, None, deliver);
+                                    let mut output = guard.build_publish_batch(ParamBatch::new(&callbacks_gate), arrays, result.param_updates, None, None, deliver);
                                     output.addressed = guard.delivery.publishable_addressed(result.addressed);
                                     Some(output)
                                 } else {
@@ -4487,7 +4500,7 @@ fn plugin_data_loop<P: NDPluginProcess>(
                     // staleness deadline — NOT the whole buffer.
                     let (output, senders) = {
                         let mut guard = shared.lock();
-                        let output = guard.tick_sort_buffer();
+                        let output = guard.tick_sort_buffer(ParamBatch::new(&callbacks_gate));
                         let senders = guard.senders_for(&output);
                         (output, senders)
                     };

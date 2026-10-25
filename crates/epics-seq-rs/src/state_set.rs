@@ -11,6 +11,7 @@ use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use epics_base_rs::runtime::log::{ErrlogSevEnum, errlog_sev_vprintf};
+use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::types::WallTime;
 use epics_libcom_rs::cfmt::CFloat;
 
@@ -434,6 +435,12 @@ impl<V: ProgramVars> StateSet<V> {
         }
         self.check_connected(ch);
         true
+    }
+
+    /// The database `seq` started this program on: where a companion makes
+    /// what C code makes in its own IOC, such as asynOctetSocket's port.
+    pub fn database(&self) -> &PvDatabase {
+        &self.prog.db
     }
 
     /// `seqg_var`: the variables this state set sees — the instance's

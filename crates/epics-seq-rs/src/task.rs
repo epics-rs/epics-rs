@@ -9,7 +9,6 @@ use std::task::{Context, Wake, Waker};
 use epics_base_rs::runtime::log::{ErrlogSevEnum, errlog_sev_vprintf};
 use epics_base_rs::runtime::task::{MandatoryThread, StackSizeClass, StackSpec, ThreadPriority};
 use epics_base_rs::runtime::taskwd::{CheckIn, taskwd_insert};
-use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::types::EpicsValue;
 
 use crate::program::{ProgOptions, StateOptions};
@@ -33,12 +32,12 @@ pub enum BufSrc<'a> {
 impl<V: ProgramVars> Program<V> {
     /// `sequencer`: the program's first thread, from `seqAddProg` to its
     /// end. `name` is that thread's, which the other state sets' extend.
-    pub(crate) fn sequencer(self: Arc<Self>, db: &PvDatabase, name: &str) {
+    pub(crate) fn sequencer(self: Arc<Self>, name: &str) {
         let _ = self.ss[0].thread_id.set(SeqThreadId::current());
         seq_add_prog(&self);
         self.pv_sys.attach();
         'run: {
-            if !self.wait_for_pini(db) {
+            if !self.wait_for_pini() {
                 break 'run;
             }
             if self.seq_connect(self.table.options.test(ProgOptions::CONN)) != PvStat::Ok {
@@ -122,7 +121,7 @@ impl<V: ProgramVars> Program<V> {
     /// first: the gate waits on the first state set's `syncSem`, which
     /// `seq_exit` signals, and a stray signal left there costs one more
     /// pass over a `when`, as any pv event does.
-    fn wait_for_pini(self: &Arc<Self>, db: &PvDatabase) -> bool {
+    fn wait_for_pini(self: &Arc<Self>) -> bool {
         struct Wakeup<V: 'static>(Arc<Program<V>>);
         impl<V: ProgramVars> Wake for Wakeup<V> {
             fn wake(self: Arc<Self>) {
@@ -131,7 +130,7 @@ impl<V: ProgramVars> Program<V> {
         }
         let waker = Waker::from(Arc::new(Wakeup(Arc::clone(self))));
         let mut cx = Context::from_waker(&waker);
-        let mut pini = pin!(db.wait_for_pini());
+        let mut pini = pin!(self.db.wait_for_pini());
         loop {
             if self.die.load(Ordering::Acquire) {
                 return false;
@@ -341,6 +340,7 @@ pub fn seq_stop(tid: SeqThreadId) {
 
 #[cfg(test)]
 mod tests {
+    use epics_base_rs::server::database::PvDatabase;
     use epics_base_rs::types::WallTime;
 
     use super::*;
@@ -522,23 +522,21 @@ mod tests {
     #[test]
     fn the_pini_gate_opens_at_once_after_pini() {
         let p = prog(VarModel::Reentrant, 1);
-        let db = PvDatabase::new();
-        db.mark_pini_done();
-        assert!(p.wait_for_pini(&db));
+        p.db.mark_pini_done();
+        assert!(p.wait_for_pini());
     }
 
     #[test]
     fn the_pini_gate_opens_when_pini_finishes() {
         let p = prog(VarModel::Reentrant, 1);
-        let db = PvDatabase::new();
         let marker = {
-            let db = db.clone();
+            let db = p.db.clone();
             std::thread::spawn(move || {
                 std::thread::sleep(std::time::Duration::from_millis(20));
                 db.mark_pini_done();
             })
         };
-        assert!(p.wait_for_pini(&db));
+        assert!(p.wait_for_pini());
         marker.join().unwrap();
     }
 
@@ -546,7 +544,6 @@ mod tests {
     #[test]
     fn a_stop_during_the_pini_gate_ends_it() {
         let p = prog(VarModel::Reentrant, 2);
-        let db = PvDatabase::new();
         let stopper = {
             let p = Arc::clone(&p);
             std::thread::spawn(move || {
@@ -555,7 +552,7 @@ mod tests {
                 p.ss_wakeup(0);
             })
         };
-        assert!(!p.wait_for_pini(&db));
+        assert!(!p.wait_for_pini());
         stopper.join().unwrap();
     }
 
@@ -593,7 +590,7 @@ mod tests {
         let db = live_db();
         db.mark_pini_done();
         let p = build_on(table, &db);
-        Arc::clone(&p).sequencer(&db, "t");
+        Arc::clone(&p).sequencer("t");
         let d = p.dynamic.lock();
         assert!(d.dbch(N).is_some());
         (bit_test(&d.ev_flags, 1), bit_test(&d.ev_flags, 2))
@@ -634,6 +631,37 @@ mod tests {
         })
     }
 
+    /// Each program's state sets reach the database `seq` started it on,
+    /// not the one the IOC's shared pv system was made over.
+    #[test]
+    fn a_state_set_reaches_the_database_seq_started_its_program_on() {
+        static SEEN: parking_lot::Mutex<Vec<(&str, bool)>> = parking_lot::Mutex::new(Vec::new());
+        fn look(ss: &StateSet<Vars>) {
+            let served = ss.database().get_pv("d1:n").is_ok();
+            SEEN.lock().push((ss.prog.table.prog_name, served));
+            ss.prog.die.store(true, Ordering::Release);
+        }
+        let on = |prog_name| {
+            &*Box::leak(Box::new(crate::program::SeqProgram {
+                prog_name,
+                entry_func: Some(look),
+                ..program(vec![], VarModel::Reentrant, "", 1)
+            }))
+        };
+        let other = live_db();
+        other.mark_pini_done();
+        crate::seq::seq(on("onServed"), "", 0, served_db()).expect("onServed starts");
+        crate::seq::seq(on("onOther"), "", 0, &other).expect("onOther starts");
+        let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+        while SEEN.lock().len() < 2 {
+            assert!(std::time::Instant::now() < deadline, "{:?}", SEEN.lock());
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let mut seen = SEEN.lock().clone();
+        seen.sort();
+        assert_eq!(seen, [("onOther", false), ("onServed", true)]);
+    }
+
     /// `sequencer` to its end over a one-state program named `pv`, found
     /// by its thread as a registered one is, whose `n` is on `pv`,
     /// monitored and synced to flag 1.
@@ -667,7 +695,7 @@ mod tests {
         }));
         crate::cmd::seq_register_sequencer_program(table);
         let p = build_on(table, served_db());
-        p.sequencer(served_db(), "t");
+        p.sequencer("t");
     }
 
     /// A put of `v` to `pv` from a client context of its own.

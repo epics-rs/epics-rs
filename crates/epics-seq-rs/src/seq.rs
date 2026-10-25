@@ -79,8 +79,8 @@ pub fn seq<V: ProgramVars>(
         let _ = started_tid.set(SeqThreadId::current());
         drop(started);
         let pv_sys = create_or_attach_pv_system(&db);
-        init.build(pv_sys, priority, stack_size)
-            .sequencer(&db, &thread_name);
+        init.build(pv_sys, db, priority, stack_size)
+            .sequencer(&thread_name);
     });
     if spawned.is_err() {
         errlog_sev_vprintf(
@@ -246,6 +246,7 @@ impl<V: ProgramVars> InitProg<V> {
     pub(crate) fn build(
         self,
         pv_sys: PvSystem,
+        db: PvDatabase,
         thread_priority: u32,
         stack_size: u32,
     ) -> Arc<Program<V>> {
@@ -293,6 +294,7 @@ impl<V: ProgramVars> InitProg<V> {
             stack_size,
             gate: pv_sys.gate(),
             pv_sys,
+            db,
             chans: self.chans.into(),
             queues: self.queues,
             ss,
@@ -418,9 +420,14 @@ pub(crate) mod fixture {
     }
 
     /// `table` built with no macros, its thread at priority 50 with a
-    /// 4096-byte stack, over a database that is gone.
+    /// 4096-byte stack, its pvs over a database that is gone.
     pub(crate) fn build(table: &'static SeqProgram<Vars>) -> Arc<Program<Vars>> {
-        build_on(table, &PvDatabase::new())
+        InitProg::new(table, SeqMacros::default()).unwrap().build(
+            PvSystem::create(&PvDatabase::new()),
+            PvDatabase::new(),
+            50,
+            4096,
+        )
     }
 
     /// [`build`] with its pvs on `db`.
@@ -428,9 +435,12 @@ pub(crate) mod fixture {
         table: &'static SeqProgram<Vars>,
         db: &PvDatabase,
     ) -> Arc<Program<Vars>> {
-        InitProg::new(table, SeqMacros::default())
-            .unwrap()
-            .build(PvSystem::create(db), 50, 4096)
+        InitProg::new(table, SeqMacros::default()).unwrap().build(
+            PvSystem::create(db),
+            db.clone(),
+            50,
+            4096,
+        )
     }
 }
 

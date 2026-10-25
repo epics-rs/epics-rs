@@ -761,6 +761,7 @@ mod tests {
             stack_size: 0,
             gate: Arc::default(),
             pv_sys: PvSystem::create(&PvDatabase::new()),
+            db: PvDatabase::new(),
             chans: table
                 .chan
                 .iter()

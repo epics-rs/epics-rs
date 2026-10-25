@@ -160,6 +160,15 @@ pub(super) fn program(table: &'static SeqProgram<Vars>) -> Arc<Program<Vars>> {
 }
 
 fn program_on(table: &'static SeqProgram<Vars>, db: &PvDatabase) -> Arc<Program<Vars>> {
+    program_over(table, PvSystem::create(db), db)
+}
+
+/// [`program_on`] with its pvs on `pv_sys`.
+fn program_over(
+    table: &'static SeqProgram<Vars>,
+    pv_sys: PvSystem,
+    db: &PvDatabase,
+) -> Arc<Program<Vars>> {
     let vars = match &table.vars {
         VarModel::Static(f) => VarBlock::Static(f()),
         VarModel::Reentrant | VarModel::Safe => VarBlock::Owned(Box::new(Vars::zeroed())),
@@ -175,7 +184,6 @@ fn program_on(table: &'static SeqProgram<Vars>, db: &PvDatabase) -> Arc<Program<
             synced_chans[c.ef_id.0 as usize].push(ChId(n as u32));
         }
     }
-    let pv_sys = PvSystem::create(db);
     Arc::new(Program {
         table,
         vars,
@@ -184,6 +192,7 @@ fn program_on(table: &'static SeqProgram<Vars>, db: &PvDatabase) -> Arc<Program<
         stack_size: 0,
         gate: pv_sys.gate(),
         pv_sys,
+        db: db.clone(),
         chans: table
             .chan
             .iter()
@@ -1928,7 +1937,11 @@ fn ef_test_in_safe_mode_reads_the_synced_channels() {
 #[test]
 fn pv_assign_create_failure_leaves_the_channel_anonymous() {
     // A database that is gone: every create fails, on either backend.
-    let p = program_on(table(VarModel::Reentrant, 0, 1), &PvDatabase::new());
+    let p = program_over(
+        table(VarModel::Reentrant, 0, 1),
+        PvSystem::create(&PvDatabase::new()),
+        pv_db(),
+    );
     assign(&p, W, "xxx:w", true);
     p.chans[W.index()].db_count.store(2, Ordering::Relaxed);
     let s = ss(&p, 0);

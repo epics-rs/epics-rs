@@ -5,6 +5,7 @@
 // its `build.rs` began deriving `tokio_backend`; nothing here builds a
 // CA server, and the reactor these obtain comes from `#[tokio::test]`
 // itself, which the backend does not remove.
+use std::any::TypeId;
 use std::sync::Arc;
 
 #[cfg(feature = "parallel")]
@@ -212,7 +213,7 @@ pub(crate) trait StatsElem: Copy + PartialOrd + 'static {
         project_row_pass(row, threshold, col_sum, col_thr)
     }
     /// `Some(n)` when the type has only `n` values, few enough that a
-    /// histogram maps them through a table of slots built once per frame;
+    /// histogram maps them through a table of slots, kept across frames;
     /// `None` for the wider types, which run the bin formula per element.
     const TABLE_LEN: Option<usize> = None;
     /// This value's index into that table, and the value at an index; both
@@ -1457,7 +1458,20 @@ pub fn compute_histogram(
     hist_min: f64,
     hist_max: f64,
 ) -> (Vec<f64>, f64, f64, f64) {
-    let counts = ad_core_rs::with_buffer!(data, |v| histogram_of(v, hist_size, hist_min, hist_max));
+    histogram(data, hist_size, hist_min, hist_max, &KeptTable::default())
+}
+
+/// [`compute_histogram`], through the slot table `kept` keeps.
+fn histogram(
+    data: &NDDataBuffer,
+    hist_size: usize,
+    hist_min: f64,
+    hist_max: f64,
+    kept: &KeptTable,
+) -> (Vec<f64>, f64, f64, f64) {
+    let counts = ad_core_rs::with_buffer!(data, |v| histogram_of(
+        v, hist_size, hist_min, hist_max, kept
+    ));
     let histogram: Vec<f64> = counts.bins().iter().map(|&c| c as f64).collect();
 
     // Compute entropy matching C++: -sum(count * ln(count)) / nElements
@@ -1516,7 +1530,60 @@ impl HistCounts {
 /// a table of every value's slot.
 enum SlotMap {
     Formula(Formula),
-    Table(Vec<u32>),
+    Table(Arc<SlotTable>),
+}
+
+/// Every value's slot, for the element type and the HIST_SIZE / HIST_MIN /
+/// HIST_MAX in `key`.
+struct SlotTable {
+    key: TableKey,
+    slots: Vec<u32>,
+}
+
+#[derive(PartialEq)]
+struct TableKey {
+    elem: TypeId,
+    hist_size: usize,
+    // Bits, so a NaN limit still finds its own table.
+    hist_min: u64,
+    hist_max: u64,
+}
+
+/// The slot table kept across frames. A frame gets it only under the key
+/// it was built for; any other key builds its own table, kept in its place.
+#[derive(Default)]
+struct KeptTable {
+    table: Mutex<Option<Arc<SlotTable>>>,
+}
+
+impl KeptTable {
+    fn get<T: StatsElem>(&self, len: usize, hist_size: usize, f: &Formula) -> Arc<SlotTable> {
+        let key = TableKey {
+            elem: TypeId::of::<T>(),
+            hist_size,
+            hist_min: f.hist_min.to_bits(),
+            hist_max: f.hist_max.to_bits(),
+        };
+        if let Some(kept) = &*self.table.lock()
+            && kept.key == key
+        {
+            return Arc::clone(kept);
+        }
+        // Built outside the lock: frames on the other NumThreads threads
+        // are not held while it is.
+        let slots = (0..len)
+            .map(
+                |i| match slot(T::table_value(i), f.hist_min, f.hist_max, f.scale, f.last) {
+                    Slot::Below => hist_size as u32,
+                    Slot::Above => hist_size as u32 + 1,
+                    Slot::Bin(bin) => bin as u32,
+                },
+            )
+            .collect();
+        let table = Arc::new(SlotTable { key, slots });
+        *self.table.lock() = Some(Arc::clone(&table));
+        table
+    }
 }
 
 /// The bin formula's constants for one histogram.
@@ -1547,27 +1614,17 @@ fn formula_count_pass<T: StatsElem>(v: &[T], f: &Formula, slots: &mut [u64]) {
 }
 
 impl SlotMap {
-    fn new<T: StatsElem>(hist_size: usize, hist_min: f64, hist_max: f64) -> Self {
+    fn new<T: StatsElem>(hist_size: usize, hist_min: f64, hist_max: f64, kept: &KeptTable) -> Self {
         let last = hist_size as i64 - 1;
-        let scale = last as f64 / (hist_max - hist_min);
+        let f = Formula {
+            hist_min,
+            hist_max,
+            scale: last as f64 / (hist_max - hist_min),
+            last,
+        };
         match T::TABLE_LEN {
-            Some(len) => Self::Table(
-                (0..len)
-                    .map(
-                        |i| match slot(T::table_value(i), hist_min, hist_max, scale, last) {
-                            Slot::Below => hist_size as u32,
-                            Slot::Above => hist_size as u32 + 1,
-                            Slot::Bin(bin) => bin as u32,
-                        },
-                    )
-                    .collect(),
-            ),
-            None => Self::Formula(Formula {
-                hist_min,
-                hist_max,
-                scale,
-                last,
-            }),
+            Some(len) => Self::Table(kept.get::<T>(len, hist_size, &f)),
+            None => Self::Formula(f),
         }
     }
 
@@ -1578,7 +1635,8 @@ impl SlotMap {
             Self::Table(table) => {
                 // Cut to the type's own length: every `table_index` is then in
                 // range by type, so the loop's lookups need no check, inlined or not.
-                let table = &table[..T::TABLE_LEN.expect("only a type with a table builds one")];
+                let table =
+                    &table.slots[..T::TABLE_LEN.expect("only a type with a table builds one")];
                 for &e in v {
                     acc.slots[table[e.table_index()] as usize] += 1;
                 }
@@ -1616,8 +1674,9 @@ fn histogram_of<T: StatsElem + Sync>(
     hist_size: usize,
     hist_min: f64,
     hist_max: f64,
+    kept: &KeptTable,
 ) -> HistCounts {
-    let map = SlotMap::new::<T>(hist_size, hist_min, hist_max);
+    let map = SlotMap::new::<T>(hist_size, hist_min, hist_max, kept);
     #[cfg(feature = "parallel")]
     let split = par_util::Split::new(v.len(), 1, PAR_CHUNK);
     #[cfg(feature = "parallel")]
@@ -1772,6 +1831,7 @@ pub struct StatsProcessor {
     params: NDStatsParams,
     /// Shared cell to export params after register_params is called.
     params_out: Arc<Mutex<NDStatsParams>>,
+    hist_table: KeptTable,
 }
 
 impl StatsProcessor {
@@ -1781,6 +1841,7 @@ impl StatsProcessor {
             config: Mutex::new(StatsConfig::default()),
             params: NDStatsParams::default(),
             params_out: Arc::new(Mutex::new(NDStatsParams::default())),
+            hist_table: KeptTable::default(),
         }
     }
 
@@ -1951,8 +2012,13 @@ impl NDPluginProcess for StatsProcessor {
 
         // Histogram computation
         if cfg.do_compute_histogram {
-            let (histogram, below, above, entropy) =
-                compute_histogram(array.data(), cfg.hist_size, cfg.hist_min, cfg.hist_max);
+            let (histogram, below, above, entropy) = histogram(
+                array.data(),
+                cfg.hist_size,
+                cfg.hist_min,
+                cfg.hist_max,
+                &self.hist_table,
+            );
             result.histogram = histogram;
             result.hist_below = below;
             result.hist_above = above;
@@ -3006,6 +3072,40 @@ mod tests {
         assert_eq!(above, 1.0); // 3.0 is above
         let total_in_bins: f64 = hist.iter().sum();
         assert!((total_in_bins - 2.0).abs() < 1e-10); // 0.5 and 1.5
+    }
+
+    /// Each step changes one part of the key; the table kept from the step
+    /// before would bin it wrong, or past the slots.
+    #[test]
+    fn a_changed_histogram_key_rebuilds_the_kept_table() {
+        let kept = KeptTable::default();
+        let u16s = NDDataBuffer::from_vec::<u16>((0..80).collect());
+        let i16s = NDDataBuffer::from_vec::<i16>((-40..40).collect());
+        let mut before = None;
+        for (what, data, size, lo, hi) in [
+            ("u16", &u16s, 8, 0.0, 70.0),
+            ("same key", &u16s, 8, 0.0, 70.0),
+            ("HIST_SIZE", &u16s, 4, 0.0, 70.0),
+            ("HIST_MIN", &u16s, 4, 10.0, 70.0),
+            ("HIST_MAX", &u16s, 4, 10.0, 40.0),
+            ("data type", &i16s, 4, 10.0, 40.0),
+            ("data type back", &u16s, 4, 10.0, 40.0),
+        ] {
+            assert_eq!(
+                histogram(data, size, lo, hi, &kept),
+                compute_histogram(data, size, lo, hi),
+                "{what}"
+            );
+            let table = kept
+                .table
+                .lock()
+                .clone()
+                .expect("a u16/i16 frame keeps its table");
+            if what == "same key" {
+                assert!(Arc::ptr_eq(&table, before.as_ref().unwrap()), "{what}");
+            }
+            before = Some(table);
+        }
     }
 
     #[test]

@@ -1839,7 +1839,7 @@ mod tests {
         strcpy(&v, "xy");
         assert_eq!(char_at(&v, 3), b'd' as c_char);
         assert_eq!(char_at(&v, 2), 0);
-        // snc-rs reads s+1+2 as tail(&s, 1 + 2), and s+1+6 as C does
+        // C's s+1+2 reads on past the terminator at s+1, as s+3 does
         assert_eq!(tail(&v, 1 + 2).to_c_vec(), b"def");
         strcpy(&v, "abcdef");
         assert_eq!(tail(&v, 1 + 6).to_c_vec(), b"");

@@ -689,6 +689,64 @@ seqg_escaped!(r#\"static int f(void) {\"#, r#\"return 1;\"#, r#\"}\"#);
     }
 
     #[test]
+    fn a_function_definition_takes_the_env_first() {
+        // evflagExt.st:50's fun; a parameter is a SeqVar local
+        let (mut snc, ast, prg) = analysed(
+            "program p\noption +r;\nevflag e;\nint x;\n\
+             int twice(int n) {\nreturn n * 2.5;\n}\n\
+             void fun(void) {\nefSet(e);\n}\n\
+             void put(double v) {\nx = v;\n}\n\
+             ss s {\nstate z {\nwhen () {} state z\n}\n}\n",
+        );
+        let defns = ast[prg.prog].child(child::PROG_DEFNS);
+        let text = rust_out::print(&gen_global_defns(&mut snc, &ast, &prg, defns));
+        assert_eq!(String::from_utf8_lossy(snc.diagnostics()), "");
+        assert_eq!(
+            text,
+            "\
+// t.st:3
+const e: seqg_rt::EfId = seqg_rt::EfId(1);
+
+// t.st:5
+fn twice(_seqg_env: &seqg_rt::StateSet<seqg_vars>, n: i32) -> i32 {
+    let n = seqg_rt::SeqVar::new(n);
+    // t.st:6
+    return (n.get() as f64 * 2.5) as i32;
+}
+
+// t.st:8
+fn fun(seqg_env: &seqg_rt::StateSet<seqg_vars>) {
+    // t.st:9
+    seqg_env.ef_set(e);
+}
+
+// t.st:11
+fn put(seqg_env: &seqg_rt::StateSet<seqg_vars>, v: f64) {
+    let seqg_var = seqg_env.var();
+    let v = seqg_rt::SeqVar::new(v);
+    // t.st:12
+    seqg_var.x.set(v.get() as i32);
+}
+"
+        );
+    }
+
+    #[test]
+    fn a_parameter_c_passes_as_a_pointer_is_refused() {
+        let (mut snc, ast, prg) = analysed(
+            "program p\noption +r;\nvoid f(int a[2], string s) {\n}\n\
+             ss s {\nstate z {\nwhen () {} state z\n}\n}\n",
+        );
+        let defns = ast[prg.prog].child(child::PROG_DEFNS);
+        gen_global_defns(&mut snc, &ast, &prg, defns);
+        assert_eq!(
+            String::from_utf8_lossy(snc.diagnostics()),
+            "t.st:3: error: snc-rs does not support array parameter 'a'\n\
+             t.st:3: error: snc-rs does not support string parameter 's'\n"
+        );
+    }
+
+    #[test]
     fn line_comments_follow_option_l() {
         let (mut snc, ast, prg) = analysed(
             "program p\noption +r;\nint x;\nss s {\nstate z {\nwhen () {} state z\n}\n}\n",

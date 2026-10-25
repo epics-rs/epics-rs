@@ -99,19 +99,82 @@ pub fn gen_ss_code(snc: &mut Snc, ast: &Ast, prg: &Program) -> Result<Vec<Item>,
     Ok(out)
 }
 
-/// C `gen_funcdef`. snc-rs refuses function definitions; the body is
-/// still translated for the diagnostics C gives it.
+/// C `gen_funcdef`: a function whose first parameter is the calling state
+/// set's `seqg_env`, C's implicit `SS_ID`. A parameter is a `SeqVar`
+/// local, as every SNL variable is, so the body reads it the same way.
 pub fn gen_funcdef(snc: &mut Snc, ast: &Ast, _prg: &Program, fp: NodeId) -> Vec<Item> {
     let decl = ast[fp].child(child::FUNCDEF_DECL).expect("funcdef decl");
-    snc.error_at_node(
-        &ast[decl],
-        format_args!("snc-rs does not support function definitions\n"),
-    );
+    let vp = ast[decl].e_decl().expect("funcdef decl var");
+    let name = ast[vp].name.as_deref().unwrap_or_default();
+    let TypeKind::Function {
+        return_type,
+        param_decls,
+    } = ast[ast[vp].type_].kind
+    else {
+        unreachable!("analysis reports a funcdef that is not a function");
+    };
     let mut g = Gen::new(snc, ast, Context::Func);
-    if let Some(block) = ast[fp].child(child::FUNCDEF_BLOCK) {
-        g.block_body(block, &None);
+    let mut params = Vec::new();
+    let mut body = Vec::new();
+    // the first is the implicit `seqg_env`, the env parameter
+    for pd in ast.list(param_decls).skip(1) {
+        let pv = ast[pd].e_decl().expect("parameter decl var");
+        let pname = ast[pv].name.as_deref().unwrap_or_default();
+        let ty = param_type(ast, ast[pv].type_).unwrap_or_else(|unsupported| {
+            g.snc.error_at_node(
+                &ast[pd],
+                format_args!("snc-rs does not support {unsupported} parameter '{pname}'\n"),
+            );
+            "()".into()
+        });
+        params.push(Param {
+            name: pname.into(),
+            ty,
+        });
+        body.push(Stmt::Let {
+            pat: pname.into(),
+            ty: None,
+            init: Some(Expr::call("seqg_rt::SeqVar::new", vec![Expr::atom(pname)])),
+        });
     }
-    Vec::new()
+    let ret = match ast[return_type].kind {
+        TypeKind::Void => None,
+        _ => Some(value_type(ast, return_type).unwrap_or_else(|unsupported| {
+            g.snc.error_at_node(
+                &ast[decl],
+                format_args!("snc-rs does not support {unsupported} result of function '{name}'\n"),
+            );
+            "()".into()
+        })),
+    };
+    g.ret = ret.is_some().then_some(return_type);
+    if let Some(block) = ast[fp].child(child::FUNCDEF_BLOCK) {
+        body.extend(g.block_body(block, &None));
+    }
+    let body = g.finish(body);
+    params.insert(0, g.env_param());
+    let mut out = Vec::new();
+    out.push(Item::Blank);
+    out.extend(line_comment(g.snc, &ast[decl]).map(Item::Comment));
+    out.push(Item::Fn(Fn {
+        public: false,
+        name: name.into(),
+        params,
+        ret,
+        body,
+    }));
+    out
+}
+
+/// The Rust type of a function parameter of SNL type `t`. C passes an
+/// array or a `string` as a pointer the callee may write through, which a
+/// Rust copy would not reach, so those have none.
+fn param_type(ast: &Ast, t: TypeId) -> Result<String, String> {
+    match ast[t].kind {
+        TypeKind::Array { .. } => Err("array".into()),
+        TypeKind::Prim(PrimType::String) => Err("string".into()),
+        _ => value_type(ast, t),
+    }
 }
 
 /// The number of fixed parameters of a variadic C library function that
@@ -508,6 +571,9 @@ struct Gen<'a> {
     uses: Uses,
     /// what a `break` or `continue` binds to, innermost last
     loops: Vec<Frame>,
+    /// the result type of the function definition being translated, if
+    /// it has one
+    ret: Option<TypeId>,
 }
 
 /// What a `break` or `continue` binds to.
@@ -840,6 +906,7 @@ impl<'a> Gen<'a> {
             has_env: true,
             uses: Uses::default(),
             loops: Vec::new(),
+            ret: None,
         }
     }
 
@@ -1168,9 +1235,13 @@ impl<'a> Gen<'a> {
                     return;
                 }
                 self.comment(sp, ctx, out);
-                let value = node
-                    .child(child::RETURN_EXPR)
-                    .map(|e| Box::new(self.expr(e).e));
+                let value = node.child(child::RETURN_EXPR).map(|e| {
+                    let v = self.expr(e);
+                    Box::new(match self.ret {
+                        Some(t) => self.store_conv(e, v, &self.value_ty(t)),
+                        None => v.e,
+                    })
+                });
                 out.push(Stmt::Expr(Expr::Return(value)));
             }
             NodeTag::TText => out.extend(self.stmts(&[sp], ctx)),
@@ -1741,6 +1812,37 @@ impl<'a> Gen<'a> {
         if type_is_function(self.snc, ast, callee) {
             // add arguments for implicit parameters
             out.push(self.env().into());
+        }
+        // an SNL function converts its arguments to its parameters' types,
+        // as its C prototype does
+        if let (NodeTag::EVar, Extra::Var(vp)) = (ast[callee].tag, &ast[callee].extra)
+            && let TypeKind::Function {
+                return_type,
+                param_decls,
+            } = ast[ast[*vp].type_].kind
+        {
+            // the first is the implicit `seqg_env`, passed above
+            let params: Vec<TypeId> = ast
+                .list(param_decls)
+                .skip(1)
+                .map(|pd| ast[ast[pd].e_decl().expect("parameter decl var")].type_)
+                .collect();
+            for (i, a) in args.into_iter().enumerate() {
+                let v = self.expr(a);
+                let e = match params.get(i) {
+                    Some(&t) => self.store_conv(a, v, &self.value_ty(t)),
+                    None => v.e,
+                };
+                out.push(e.into());
+            }
+            let ty = match ast[return_type].kind {
+                TypeKind::Void => Ty::Unit,
+                _ => self.value_ty(return_type),
+            };
+            return Val {
+                e: Expr::Call(Box::new(f.e), out),
+                ty,
+            };
         }
         let c_name = match (ast[callee].tag, &ast[callee].extra) {
             (NodeTag::EVar, Extra::Var(vp)) if ast[ast[*vp].type_].kind == TypeKind::None => {
@@ -3447,6 +3549,24 @@ mod tests {
             "seqg_var.d.set(h() as f64 * 2.0)",
             "seqg_var.y.set(g() + 1)",
             "seqg_var.y.set((h() < 3) as i32)",
+        ] {
+            assert!(code.contains(e), "{e}\n{code}");
+        }
+    }
+
+    #[test]
+    fn an_snl_function_call_converts_to_the_parameter_types() {
+        // funcdef.st:26's pvSetX(1.0) passes an int
+        let (code, diag) = translate(
+            "program p\nint x;\nvoid pvSetX(int val);\nss a {\nstate s {\nwhen () {\n\
+             pvSetX(1.5);\nx = twice(2.5) + 1;\n} state s\n}\n}\n\
+             int twice(double d) {\nreturn d;\n}\nvoid pvSetX(int val) {\nx = val;\n}\n",
+        );
+        assert_eq!(diag, "");
+        let code = words(&code);
+        for e in [
+            "pvSetX(seqg_env, 1.5 as i32);",
+            "seqg_var.x.set(twice(seqg_env, 2.5) + 1);",
         ] {
             assert!(code.contains(e), "{e}\n{code}");
         }

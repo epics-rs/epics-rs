@@ -71,8 +71,9 @@ upstream programs to fail:
 - an escaped-C `char` array passed by value, which rustc rejects (E0308):
   ip `Keithley2kDMM.st`
 
-Function definitions, pointer arithmetic, non-`char` pointer variables and
-`typename` variables are refused the same way.
+Pointer arithmetic, non-`char` pointer variables, `typename` variables, and
+an array or `string` parameter of a function definition, which C passes as a
+pointer, are refused the same way.
 
 There are no cargo features.
 

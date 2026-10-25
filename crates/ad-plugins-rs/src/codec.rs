@@ -1129,6 +1129,16 @@ fn bshuf_decompress_lz4_block(
     (n == Some(nbyte)).then_some(())
 }
 
+/// Whether [`bslz4_compress_blocks`] runs `blocked` bytes in blocks of
+/// `block_bytes` on the pool. 800 ps per byte serially; the split measured
+/// faster at u16 1024x1024 and 2048x2048 at every frame gap, node0 and both
+/// sockets (0.19-0.44x serial), and is taken from 1500 us, under a
+/// 1024x1024 u16 frame. Smaller frames were not measured.
+#[cfg(feature = "parallel")]
+fn bslz4_compress_pooled(blocked: usize, block_bytes: usize) -> bool {
+    par_util::pool_wins(blocked, 800, 1500, blocked.div_ceil(block_bytes))
+}
+
 /// Compress `blocked` (whole blocks of `block_bytes`, then the partial
 /// block) into runs of frames in `staging`, which holds every frame's bound,
 /// returning each run's start and length, in block order. C runs these
@@ -1147,7 +1157,7 @@ fn bslz4_compress_blocks(
         })
     };
     #[cfg(feature = "parallel")]
-    if par_util::should_parallelize(blocked.len() / elem_size) && blocked.len() > block_bytes {
+    if bslz4_compress_pooled(blocked.len(), block_bytes) {
         let pool = par_util::thread_pool();
         // A few runs per worker, each into a slot of its frames' bounds.
         let runs = 4 * pool.current_num_threads();
@@ -1174,8 +1184,10 @@ fn bslz4_compress_blocks(
 /// Write the `runs` of `staging`, each a start and length, back to back,
 /// then the raw `leftover`, into `dst`.
 fn bslz4_write_runs(staging: &[u8], runs: &[(usize, usize)], leftover: &[u8], dst: &mut [u8]) {
+    // There are several runs only when the blocks compressed on the pool,
+    // and the copy pooled with them where that was measured.
     #[cfg(feature = "parallel")]
-    let parallel = par_util::should_parallelize(dst.len()) && runs.len() > 1;
+    let parallel = runs.len() > 1;
     let (mut framed, tail) = dst.split_at_mut(dst.len() - leftover.len());
     tail.copy_from_slice(leftover);
     let slots: Vec<&mut [u8]> = runs
@@ -1211,8 +1223,11 @@ fn bslz4_decode_blocks(
     block_bytes: usize,
     elem_size: usize,
 ) -> Option<()> {
+    // 800 ps per byte serially, as compress; the split measured faster at
+    // u16 1024x1024 and 2048x2048 at every frame gap, node0 and both sockets
+    // (0.17-0.53x serial). Smaller frames were not measured.
     #[cfg(feature = "parallel")]
-    if par_util::should_parallelize(blocked.len() / elem_size) && blocked.len() > block_bytes {
+    if par_util::pool_wins(blocked.len(), 800, 1500, frames.len()) {
         return par_util::thread_pool().install(|| {
             frames
                 .par_iter()
@@ -2947,11 +2962,17 @@ mod tests {
         ] {
             let arr = bslz4_pool_sized_array(data_type, full_blocks);
             let raw = arr.data().as_u8_slice();
-            assert_eq!(
-                crate::par_util::should_parallelize(arr.data().len()),
-                cfg!(feature = "parallel"),
-                "{data_type:?}: the blocks must go to the pool when it exists"
-            );
+            #[cfg(feature = "parallel")]
+            {
+                let elem_size = data_type.element_size();
+                assert!(
+                    bslz4_compress_pooled(
+                        raw.len() - raw.len() % (BSHUF_BLOCKED_MULT * elem_size),
+                        bshuf_default_block_size(elem_size) * elem_size,
+                    ),
+                    "{data_type:?}: the blocks must go to the pool"
+                );
+            }
             let compressed = compress_bslz4(&arr).unwrap();
             let expected = serial_bslz4(raw, data_type.element_size());
             assert_eq!(compressed.data().as_u8_slice(), expected, "{data_type:?}");

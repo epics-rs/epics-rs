@@ -31,8 +31,8 @@ struct Ioc {
 }
 
 /// The template loaded with `P=k:,Dmm=D1:` past `iocInit`, and
-/// `seq &Keithley2kDMM_mf40, "P=k:,Dmm=D1:,channels=4,model=2700"`.
-async fn boot() -> Ioc {
+/// `seq &Keithley2kDMM_mf40, "P=k:,Dmm=D1:,channels=<channels>,model=2700"`.
+async fn boot(channels: u32) -> Ioc {
     let mock = Keithley2700::start();
     ip_rs::register_ip_dbd();
     let no_db = Arc::new(PvDatabase::new());
@@ -58,11 +58,8 @@ async fn boot() -> Ioc {
         .unwrap();
     db.ioc_init().await;
     let scan = ScanOwner::start(db.clone());
-    sh(
-        &db,
-        r#"seq &Keithley2kDMM_mf40, "P=k:,Dmm=D1:,channels=4,model=2700""#,
-    )
-    .await;
+    let seq = format!(r#"seq &Keithley2kDMM_mf40, "P=k:,Dmm=D1:,channels={channels},model=2700""#);
+    sh(&db, &seq).await;
     Ioc {
         db,
         mock,
@@ -118,20 +115,31 @@ impl Ioc {
     }
 }
 
-/// Boot's commands: `mode_change` configures DC volts and closes channel
-/// 1, `read_meter` resets the meter through `init_string` and, 1 s on, sets
-/// its reading format through `init_string1`. The two state sets race, in C
-/// too, so only each one's own order is fixed.
-async fn booted(ioc: &Ioc) {
-    assert!(eventually(|| ioc.mock.pending() >= 4).await);
+/// Boot's commands, once `read_meter`'s reset has set the reading format.
+async fn boot_commands(ioc: &Ioc) -> Vec<String> {
+    let mut got = Vec::new();
+    let reset = eventually(|| {
+        got.extend(ioc.mock.take());
+        got.iter().any(|c| c == "form:elem read")
+    })
+    .await;
+    assert!(reset, "{got:?}");
     task::sleep(Duration::from_millis(250)).await;
-    let (reset, mode): (Vec<_>, Vec<_>) = ioc
-        .mock
-        .take()
-        .into_iter()
-        .partition(|c| c == "*rst" || c == "form:elem read");
-    assert_eq!(reset, ["*rst", "form:elem read"]);
-    assert_eq!(mode, [":conf:volt:dc", "rout:clos (@101)"]);
+    got.extend(ioc.mock.take());
+    got
+}
+
+/// Boot with 4 channels: `mode_change` configures DC volts and closes
+/// channel 1, `read_meter` resets the meter through `init_string` and, 1 s
+/// on, sets its reading format through `init_string1`. The two state sets
+/// race, in C too, so only each one's own order is fixed.
+async fn booted(ioc: &Ioc) {
+    let got = boot_commands(ioc).await;
+    let (reset, mode): (Vec<_>, Vec<_>) = got
+        .iter()
+        .partition(|c| *c == "*rst" || *c == "form:elem read");
+    assert_eq!(reset, ["*rst", "form:elem read"], "{got:?}");
+    assert_eq!(mode, [":conf:volt:dc", "rout:clos (@101)"], "{got:?}");
 }
 
 /// Single-channel reads: each sends `read?` behind whatever mode and relay
@@ -140,7 +148,7 @@ async fn booted(ioc: &Ioc) {
 /// `previous_chan` at either 0 or -1.
 #[epics_base_rs::epics_test]
 async fn single_reads_follow_the_selected_channel_and_mode() {
-    let ioc = boot().await;
+    let ioc = boot(4).await;
     booted(&ioc).await;
     assert_eq!(ioc.str_of("model"), "2700");
     assert_eq!(ioc.f64_of("channels"), 4.0);
@@ -177,7 +185,7 @@ async fn single_reads_follow_the_selected_channel_and_mode() {
 /// volts, so the scan sends channel 1's mode and relay too.
 #[epics_base_rs::epics_test]
 async fn a_multi_scan_reads_each_channel_that_is_on_in_its_own_mode() {
-    let ioc = boot().await;
+    let ioc = boot(4).await;
     booted(&ioc).await;
     ioc.step("ch_mode_sel", 3.0, &[":conf:fres", "rout:open:all"])
         .await;
@@ -215,4 +223,16 @@ async fn a_multi_scan_reads_each_channel_that_is_on_in_its_own_mode() {
 
     ioc.step("init_dmm", 1.0, &["*rst", "form:elem read"]).await;
     assert_eq!(ioc.f64_of("init_dmm"), 0.0);
+}
+
+/// A `channels` macro past the program's 40 channels is cut to 40. C
+/// scanned a 41st relay through `ch_on_off[40]` and `ch_mode[40]`, and its
+/// `pvPut(ch_raw[40])` processed `conf_dcv` instead of a reading.
+#[epics_base_rs::epics_test]
+async fn a_channels_macro_past_forty_is_cut_to_forty() {
+    let ioc = boot(41).await;
+    boot_commands(&ioc).await;
+    assert_eq!(ioc.f64_of("channels"), 40.0);
+    ioc.step("ch40_mode_sel", 1.0, &[]).await;
+    assert_eq!(ioc.str_of("ch40_units"), "VAC");
 }

@@ -1,0 +1,144 @@
+//! A Keithley program booted on its template against a [`mock::Keithley`],
+//! and the steps its tests drive it with.
+
+pub mod mock;
+
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
+
+use epics_base_rs::runtime::task;
+use epics_base_rs::server::database::PvDatabase;
+use epics_base_rs::server::ioc_builder::IocBuilder;
+use epics_base_rs::server::records::scalcout::ScalcoutRecord;
+use epics_base_rs::server::scan::ScanOwner;
+use epics_base_rs::types::EpicsValue;
+use ip_rs::strparm::{DEVICE_ROWS, device_support_factory};
+
+use crate::support::{eventually, sh};
+use mock::Keithley;
+
+/// One program and the meter it drives.
+pub struct Meter {
+    /// The program, its template's stem too.
+    pub program: &'static str,
+    /// The `Dmm` macro.
+    pub dmm: &'static str,
+    /// The `model` macro.
+    pub model: &'static str,
+    /// The `conf_*` records' commands, in `dmm_modes` order.
+    pub modes: &'static [&'static str],
+    /// The `dmm_read` record's command.
+    pub read: &'static str,
+}
+
+pub struct Ioc {
+    db: Arc<PvDatabase>,
+    prefix: String,
+    pub mock: Keithley,
+    _scan: ScanOwner,
+}
+
+/// The template loaded with `P=k:,Dmm=<dmm>` past `iocInit`, and
+/// `seq &<program>, "P=k:,Dmm=<dmm>,channels=<channels>,model=<model>"`.
+pub async fn boot(meter: &Meter, channels: u32) -> Ioc {
+    let mock = Keithley::start(meter.modes, meter.read);
+    ip_rs::register_ip_dbd();
+    let no_db = Arc::new(PvDatabase::new());
+    let port = format!(
+        "drvAsynIPPortConfigure(\"serial1\", \"{}\", 0, 0, 0)",
+        mock.host_info()
+    );
+    sh(&no_db, &port).await;
+    let macros: HashMap<String, String> = [("P", "k:"), ("Dmm", meter.dmm), ("PORT", "serial1")]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    let (db, _) = IocBuilder::new()
+        .register_record_type("scalcout", || Box::new(ScalcoutRecord::default()))
+        .register_dynamic_device_support(&DEVICE_ROWS, device_support_factory())
+        .db_file(
+            &format!("{}/{}.db", ip_rs::IP_DB_DIR, meter.program),
+            &macros,
+        )
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    db.ioc_init().await;
+    let scan = ScanOwner::start(db.clone());
+    let seq = format!(
+        r#"seq &{}, "P=k:,Dmm={},channels={channels},model={}""#,
+        meter.program, meter.dmm, meter.model
+    );
+    sh(&db, &seq).await;
+    Ioc {
+        db,
+        prefix: format!("k:{}", meter.dmm),
+        mock,
+        _scan: scan,
+    }
+}
+
+impl Ioc {
+    /// A CA client's put to `{P}{Dmm}<pv>`, which processes the record.
+    pub async fn put(&self, pv: &str, value: EpicsValue) {
+        self.db
+            .put_record_field_from_ca(&format!("{}{pv}", self.prefix), "VAL", value)
+            .await
+            .unwrap();
+    }
+
+    /// `put`, then the commands the meter received for it: `expect` of
+    /// them, and none in the quarter second past the last.
+    pub async fn step(&self, pv: &str, value: f64, expect: &[&str]) {
+        self.put(pv, EpicsValue::Double(value)).await;
+        self.commands(expect).await;
+    }
+
+    pub async fn commands(&self, expect: &[&str]) {
+        assert!(
+            eventually(|| self.mock.pending() >= expect.len()).await,
+            "expected {expect:?}"
+        );
+        task::sleep(Duration::from_millis(250)).await;
+        assert_eq!(self.mock.take(), expect);
+    }
+
+    /// `done_read 1`: the read cycle, which ends with the program putting
+    /// `done_read` back to 0.
+    pub async fn read(&self, expect: &[&str]) {
+        self.step("done_read", 1.0, expect).await;
+        assert!(eventually(|| self.f64_of("done_read") == 0.0).await);
+    }
+
+    pub fn f64_of(&self, pv: &str) -> f64 {
+        self.db
+            .get_pv(format!("{}{pv}", self.prefix))
+            .unwrap()
+            .to_f64()
+            .unwrap()
+    }
+
+    pub fn str_of(&self, pv: &str) -> String {
+        match self.db.get_pv(format!("{}{pv}", self.prefix)).unwrap() {
+            EpicsValue::String(s) => s.as_str_lossy().into_owned(),
+            v => panic!("{pv}: {v:?}"),
+        }
+    }
+
+    /// Boot's commands, once `read_meter`'s reset has set the reading
+    /// format.
+    pub async fn boot_commands(&self) -> Vec<String> {
+        let mut got = Vec::new();
+        let reset = eventually(|| {
+            got.extend(self.mock.take());
+            got.iter().any(|c| c == "form:elem read")
+        })
+        .await;
+        assert!(reset, "{got:?}");
+        task::sleep(Duration::from_millis(250)).await;
+        got.extend(self.mock.take());
+        got
+    }
+}

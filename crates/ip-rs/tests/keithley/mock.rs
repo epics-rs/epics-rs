@@ -1,33 +1,22 @@
-//! A Keithley 2700 with a scanner card, as `Keithley2kDMM_mf40.db` drives it:
-//! LF-terminated commands, and `read?` answered with `<chan>.<mode>`, the
-//! relay last closed and the `dmm_modes` index last configured, so each
-//! reading names both. `*rst` and `rout:open:all` open every relay.
+//! A Keithley meter with a scanner card, as the ip templates drive it:
+//! LF-terminated commands, and the model's read command answered with
+//! `<chan>.<mode>`, the relay last closed and the index into the model's
+//! `dmm_modes` last configured, so each reading names both. `*rst` and
+//! `rout:open:all` (or `route:open:all`) open every relay.
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
 use std::sync::{Arc, Mutex};
 
-/// The `conf_*` records' commands, in `dmm_modes` order.
-const MODES: [&str; 10] = [
-    ":conf:volt:dc",
-    ":conf:volt:ac",
-    ":conf:res",
-    ":conf:fres",
-    ":conf:freq",
-    "conf:temp;:temp:tc:type j",
-    ":conf:temp;:temp:tc:type k",
-    ":conf:temp;:temp:tc:type t",
-    ":conf:curr:dc",
-    ":conf:curr:ac",
-];
-
-pub struct Keithley2700 {
+pub struct Keithley {
     host: String,
     commands: Arc<Mutex<Vec<String>>>,
 }
 
-impl Keithley2700 {
-    pub fn start() -> Keithley2700 {
+impl Keithley {
+    /// A meter whose `conf_*` commands are `modes`, in `dmm_modes` order,
+    /// and which answers `read`.
+    pub fn start(modes: &'static [&'static str], read: &'static str) -> Keithley {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let host = listener.local_addr().unwrap().to_string();
         let commands = Arc::new(Mutex::new(Vec::new()));
@@ -40,16 +29,16 @@ impl Keithley2700 {
                     let cmd = String::from_utf8(line).unwrap();
                     if cmd == "*rst" {
                         (chan, mode) = (0, 0);
-                    } else if cmd == "rout:open:all" {
+                    } else if cmd == "rout:open:all" || cmd == "route:open:all" {
                         chan = 0;
                     } else if let Some(n) = cmd.strip_prefix("rout:clos (@") {
                         chan = n.trim_end_matches(')').parse().unwrap();
-                    } else if let Some(m) = MODES.iter().position(|m| *m == cmd) {
+                    } else if let Some(m) = modes.iter().position(|m| *m == cmd) {
                         mode = m;
                     }
-                    let read = cmd == "read?";
+                    let answer = cmd == read;
                     log.lock().unwrap().push(cmd);
-                    if read
+                    if answer
                         && reply
                             .write_all(format!("{chan}.{mode}\n").as_bytes())
                             .is_err()
@@ -59,7 +48,7 @@ impl Keithley2700 {
                 }
             }
         });
-        Keithley2700 { host, commands }
+        Keithley { host, commands }
     }
 
     /// `host:port`, for `drvAsynIPPortConfigure`.

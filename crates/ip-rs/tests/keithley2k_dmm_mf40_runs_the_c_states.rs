@@ -1,140 +1,42 @@
 //! The compiled `Keithley2kDMM_mf40.st` on the shipped
-//! `Keithley2kDMM_mf40.db`, driving the [`Keithley2700`] mock through the
-//! template's devXxStrParm records. Each step's commands, and the values it
-//! leaves, are the ones a C IOC (seq 2.2.9, asyn, calc, ip's devXxStrParm)
-//! sent and posted against the same mock, template and puts.
+//! `Keithley2kDMM_mf40.db`, driving a 2700 mock through the template's
+//! devXxStrParm records. Each step's commands, and the values it leaves,
+//! are the ones a C IOC (seq 2.2.9, asyn, calc, ip's devXxStrParm) sent and
+//! posted against the same mock, template and puts.
 
-mod keithley2700_mock;
+mod keithley;
 mod support;
 
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::Duration;
-
-use epics_base_rs::runtime::task;
-use epics_base_rs::server::database::PvDatabase;
-use epics_base_rs::server::ioc_builder::IocBuilder;
-use epics_base_rs::server::records::scalcout::ScalcoutRecord;
-use epics_base_rs::server::scan::ScanOwner;
 use epics_base_rs::types::{EpicsValue, PvString};
-use ip_rs::strparm::{DEVICE_ROWS, device_support_factory};
 
-use keithley2700_mock::Keithley2700;
-use support::{eventually, sh};
+use keithley::{Ioc, Meter, boot};
 
-const P: &str = "k:D1:";
-
-struct Ioc {
-    db: Arc<PvDatabase>,
-    mock: Keithley2700,
-    _scan: ScanOwner,
-}
-
-/// The template loaded with `P=k:,Dmm=D1:` past `iocInit`, and
-/// `seq &Keithley2kDMM_mf40, "P=k:,Dmm=D1:,channels=<channels>,model=2700"`.
-async fn boot(channels: u32) -> Ioc {
-    let mock = Keithley2700::start();
-    ip_rs::register_ip_dbd();
-    let no_db = Arc::new(PvDatabase::new());
-    let port = format!(
-        "drvAsynIPPortConfigure(\"serial1\", \"{}\", 0, 0, 0)",
-        mock.host_info()
-    );
-    sh(&no_db, &port).await;
-    let macros: HashMap<String, String> = [("P", "k:"), ("Dmm", "D1:"), ("PORT", "serial1")]
-        .into_iter()
-        .map(|(k, v)| (k.to_string(), v.to_string()))
-        .collect();
-    let (db, _) = IocBuilder::new()
-        .register_record_type("scalcout", || Box::new(ScalcoutRecord::default()))
-        .register_dynamic_device_support(&DEVICE_ROWS, device_support_factory())
-        .db_file(
-            &format!("{}/Keithley2kDMM_mf40.db", ip_rs::IP_DB_DIR),
-            &macros,
-        )
-        .unwrap()
-        .build()
-        .await
-        .unwrap();
-    db.ioc_init().await;
-    let scan = ScanOwner::start(db.clone());
-    let seq = format!(r#"seq &Keithley2kDMM_mf40, "P=k:,Dmm=D1:,channels={channels},model=2700""#);
-    sh(&db, &seq).await;
-    Ioc {
-        db,
-        mock,
-        _scan: scan,
-    }
-}
-
-impl Ioc {
-    /// A CA client's put to `{P}{Dmm}<pv>`, which processes the record.
-    async fn put(&self, pv: &str, value: EpicsValue) {
-        self.db
-            .put_record_field_from_ca(&format!("{P}{pv}"), "VAL", value)
-            .await
-            .unwrap();
-    }
-
-    /// `put`, then the commands the meter received for it: `expect` of
-    /// them, and none in the quarter second past the last.
-    async fn step(&self, pv: &str, value: f64, expect: &[&str]) {
-        self.put(pv, EpicsValue::Double(value)).await;
-        self.commands(expect).await;
-    }
-
-    async fn commands(&self, expect: &[&str]) {
-        assert!(
-            eventually(|| self.mock.pending() >= expect.len()).await,
-            "expected {expect:?}"
-        );
-        task::sleep(Duration::from_millis(250)).await;
-        assert_eq!(self.mock.take(), expect);
-    }
-
-    /// `done_read 1`: the read cycle, which ends with the program putting
-    /// `done_read` back to 0.
-    async fn read(&self, expect: &[&str]) {
-        self.step("done_read", 1.0, expect).await;
-        assert!(eventually(|| self.f64_of("done_read") == 0.0).await);
-    }
-
-    fn f64_of(&self, pv: &str) -> f64 {
-        self.db
-            .get_pv(format!("{P}{pv}"))
-            .unwrap()
-            .to_f64()
-            .unwrap()
-    }
-
-    fn str_of(&self, pv: &str) -> String {
-        match self.db.get_pv(format!("{P}{pv}")).unwrap() {
-            EpicsValue::String(s) => s.as_str_lossy().into_owned(),
-            v => panic!("{pv}: {v:?}"),
-        }
-    }
-}
-
-/// Boot's commands, once `read_meter`'s reset has set the reading format.
-async fn boot_commands(ioc: &Ioc) -> Vec<String> {
-    let mut got = Vec::new();
-    let reset = eventually(|| {
-        got.extend(ioc.mock.take());
-        got.iter().any(|c| c == "form:elem read")
-    })
-    .await;
-    assert!(reset, "{got:?}");
-    task::sleep(Duration::from_millis(250)).await;
-    got.extend(ioc.mock.take());
-    got
-}
+/// The 2700 behind `Dmm=D1:`.
+const DMM: Meter = Meter {
+    program: "Keithley2kDMM_mf40",
+    dmm: "D1:",
+    model: "2700",
+    modes: &[
+        ":conf:volt:dc",
+        ":conf:volt:ac",
+        ":conf:res",
+        ":conf:fres",
+        ":conf:freq",
+        "conf:temp;:temp:tc:type j",
+        ":conf:temp;:temp:tc:type k",
+        ":conf:temp;:temp:tc:type t",
+        ":conf:curr:dc",
+        ":conf:curr:ac",
+    ],
+    read: "read?",
+};
 
 /// Boot with 4 channels: `mode_change` configures DC volts and closes
 /// channel 1, `read_meter` resets the meter through `init_string` and, 1 s
 /// on, sets its reading format through `init_string1`. The two state sets
 /// race, in C too, so only each one's own order is fixed.
 async fn booted(ioc: &Ioc) {
-    let got = boot_commands(ioc).await;
+    let got = ioc.boot_commands().await;
     let (reset, mode): (Vec<_>, Vec<_>) = got
         .iter()
         .partition(|c| *c == "*rst" || *c == "form:elem read");
@@ -148,7 +50,7 @@ async fn booted(ioc: &Ioc) {
 /// `previous_chan` at either 0 or -1.
 #[epics_base_rs::epics_test]
 async fn single_reads_follow_the_selected_channel_and_mode() {
-    let ioc = boot(4).await;
+    let ioc = boot(&DMM, 4).await;
     booted(&ioc).await;
     assert_eq!(ioc.str_of("model"), "2700");
     assert_eq!(ioc.f64_of("channels"), 4.0);
@@ -185,7 +87,7 @@ async fn single_reads_follow_the_selected_channel_and_mode() {
 /// volts, so the scan sends channel 1's mode and relay too.
 #[epics_base_rs::epics_test]
 async fn a_multi_scan_reads_each_channel_that_is_on_in_its_own_mode() {
-    let ioc = boot(4).await;
+    let ioc = boot(&DMM, 4).await;
     booted(&ioc).await;
     ioc.step("ch_mode_sel", 3.0, &[":conf:fres", "rout:open:all"])
         .await;
@@ -230,8 +132,8 @@ async fn a_multi_scan_reads_each_channel_that_is_on_in_its_own_mode() {
 /// `pvPut(ch_raw[40])` processed `conf_dcv` instead of a reading.
 #[epics_base_rs::epics_test]
 async fn a_channels_macro_past_forty_is_cut_to_forty() {
-    let ioc = boot(41).await;
-    boot_commands(&ioc).await;
+    let ioc = boot(&DMM, 41).await;
+    ioc.boot_commands().await;
     assert_eq!(ioc.f64_of("channels"), 40.0);
     ioc.step("ch40_mode_sel", 1.0, &[]).await;
     assert_eq!(ioc.str_of("ch40_units"), "VAC");
@@ -243,7 +145,7 @@ async fn a_channels_macro_past_forty_is_cut_to_forty() {
 /// ends; `ch2_mode_sel 12` crashed its IOC.
 #[epics_base_rs::epics_test]
 async fn a_mode_past_the_ten_is_ignored() {
-    let ioc = boot(4).await;
+    let ioc = boot(&DMM, 4).await;
     booted(&ioc).await;
     ioc.step("ch_mode_sel", 3.0, &[":conf:fres", "rout:open:all"])
         .await;

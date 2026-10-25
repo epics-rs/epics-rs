@@ -316,6 +316,41 @@ pub fn strlen(s: impl CSrc) -> usize {
     s.with_c_bytes(<[u8]>::len)
 }
 
+/// `epicsStrtok_r`. As C's, it ends the token by writing a NUL over the
+/// delimiter after it, in what `s` points into, and leaves `*lasts` past
+/// that NUL.
+#[allow(non_snake_case)]
+pub fn epicsStrtok_r(
+    s: impl Into<CharPtr>,
+    delim: impl CSrc,
+    lasts: &impl Place<CharPtr>,
+) -> CharPtr {
+    let delim = delim.to_c_vec();
+    let s = s.into();
+    let s = if s.is_null() { lasts.get() } else { s };
+    if s.is_null() {
+        return s;
+    }
+    let token = s.with_c_bytes(|b| {
+        let start = b.iter().take_while(|c| delim.contains(c)).count();
+        let end = b[start..].iter().position(|c| delim.contains(c));
+        (start < b.len()).then(|| (start, end.map(|e| start + e)))
+    });
+    let Some((start, end)) = token else {
+        lasts.set(CharPtr::default());
+        return CharPtr::default();
+    };
+    lasts.set(match end {
+        Some(e) => {
+            let d = s.offset(e as isize);
+            d.set(0);
+            d.offset(1)
+        }
+        None => CharPtr::default(),
+    });
+    s.offset(start as isize)
+}
+
 /// `malloc`, as the `T *` the result is stored in: `bytes / sizeof(T)`
 /// elements, zeroed where C's are indeterminate. The memory lives while a
 /// pointer into it does, so SNL code has no `free` to call.
@@ -1224,6 +1259,32 @@ mod tests {
     #[should_panic(expected = "write through a pointer to a string literal")]
     fn a_literal_destination_panics() {
         strcpy(CharPtr::from("ab"), "x");
+    }
+
+    /// MM4005_trajectoryScan.st:495-502: tokens of `stringIn`, which
+    /// `p` points into.
+    #[test]
+    fn epics_strtok_r_cuts_its_string_in_place() {
+        let string_in = <SeqVar<[c_char; 32]>>::zeroed();
+        strcpy(&string_in, ",15TQ,,1TH2.7,1TP2.65");
+        let tok_save = <SeqVar<CharPtr>>::zeroed();
+        let p = epicsStrtok_r(&string_in, ",", &tok_save);
+        assert_eq!(p, string_in.at(1).ptr());
+        assert_eq!(p.to_c_vec(), b"15TQ");
+        assert_eq!(text(&string_in), b",15TQ");
+        assert_eq!(tok_save.get(), string_in.at(6).ptr());
+        let p = epicsStrtok_r(CharPtr::default(), ",", &tok_save);
+        assert_eq!(atof(p.offset(3)), 2.7);
+        let p = epicsStrtok_r(CharPtr::default(), ",", &tok_save);
+        assert_eq!(p.to_c_vec(), b"1TP2.65");
+        assert!(tok_save.get().is_null());
+        assert!(epicsStrtok_r(CharPtr::default(), ",", &tok_save).is_null());
+        // only delimiters left: no token, and `*lasts` is cleared
+        strcpy(&string_in, "a,,");
+        assert_eq!(epicsStrtok_r(&string_in, ",", &tok_save).to_c_vec(), b"a");
+        assert!(!tok_save.get().is_null());
+        assert!(epicsStrtok_r(CharPtr::default(), ",", &tok_save).is_null());
+        assert!(tok_save.get().is_null());
     }
 
     /// XPS_trajectoryScan.st:163-165: `axisName[i] = malloc(NAME_LEN);`

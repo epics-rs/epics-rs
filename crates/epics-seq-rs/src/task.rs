@@ -57,9 +57,6 @@ impl<V: ProgramVars> Program<V> {
                 prog: Arc::clone(&self),
                 index: 0,
             };
-            // Each state set runs from here, or from its spawn, until its
-            // `ss_entry` ends.
-            self.gate.run(0);
             if let Some(entry) = self.table.entry_func {
                 entry(&ss0);
             }
@@ -72,7 +69,6 @@ impl<V: ProgramVars> Program<V> {
                 let ss_name = format!("{}_{nss}", &name[..len]);
                 let prog = Arc::clone(&self);
                 let thread_name = ss_name.clone();
-                self.gate.run(nss);
                 let spawned = MandatoryThread::new(
                     ss_name,
                     ThreadPriority::Custom(self.thread_priority),
@@ -88,7 +84,6 @@ impl<V: ProgramVars> Program<V> {
                         ErrlogSevEnum::Fatal,
                         format_args!("seq: epicsThreadCreate failed"),
                     );
-                    self.gate.stop(nss);
                     self.ss[nss].dead.signal();
                 }
             }
@@ -97,9 +92,7 @@ impl<V: ProgramVars> Program<V> {
                 ss.dead.wait();
             }
             if let Some(exit) = self.table.exit_func {
-                self.gate.run(0);
                 exit(&ss0);
-                self.gate.stop(0);
             }
         }
         self.seq_disconnect();
@@ -219,7 +212,6 @@ impl<V: ProgramVars> Program<V> {
             ss.current_state.store(cur as i32, Ordering::Relaxed);
         }
         drop(watched);
-        self.gate.stop(nss);
         if nss != 0 {
             ss.dead.signal();
         }
@@ -761,13 +753,12 @@ mod tests {
         assert_eq!(AT_ONCE_SEEN.load(Ordering::SeqCst), 4);
     }
 
-    static OWN_AT_ZERO: AtomicBool = AtomicBool::new(true);
-    static OWN_AFTER_SLEEP: AtomicBool = AtomicBool::new(false);
+    static OWN_AT_ZERO: AtomicBool = AtomicBool::new(false);
 
-    /// A zero sleep after a put does not block: the put's own monitor has
-    /// not landed after it, and a sleep that blocks lands it.
+    /// A put's own monitor has landed when the put returns, as `CAC-event`
+    /// runs above the state set: a zero sleep after it finds its flag up.
     #[test]
-    fn a_zero_sleep_after_a_put_leaves_its_own_monitor_held() {
+    fn a_zero_sleep_after_a_put_finds_its_own_monitor() {
         fn event(_: &StateSet<Vars>, _: &mut usize, _: &mut usize) -> bool {
             true
         }
@@ -777,16 +768,10 @@ mod tests {
             assert_eq!(ss.pv_put(N, crate::types::CompType::Default), PvStat::Ok);
             crate::c::epicsThreadSleep(0.0);
             OWN_AT_ZERO.store(ss.ef_test(EfId(1)), Ordering::SeqCst);
-            crate::c::epicsThreadSleep(0.05);
-            OWN_AFTER_SLEEP.store(ss.ef_test(EfId(1)), Ordering::SeqCst);
             ss.prog.die.store(true, Ordering::Release);
         }
         run_one_state("d4:n", event, action);
-        assert!(!OWN_AT_ZERO.load(Ordering::SeqCst), "at the zero sleep");
-        assert!(
-            OWN_AFTER_SLEEP.load(Ordering::SeqCst),
-            "at a sleep that blocks"
-        );
+        assert!(OWN_AT_ZERO.load(Ordering::SeqCst));
     }
 
     static PASS: AtomicU32 = AtomicU32::new(0);

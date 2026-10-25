@@ -500,9 +500,7 @@ impl<V: ProgramVars> StateSet<V> {
     /// `seq_pvGetTmo`; `tmo` in seconds. Its return is a delivery point of
     /// [`Program::gate`].
     pub fn pv_get_tmo(&self, ch: ChId, comp: CompType, tmo: f64) -> PvStat {
-        self.prog
-            .gate
-            .call(self.index, || self.get_tmo(ch, comp, tmo))
+        self.prog.gate.call(|| self.get_tmo(ch, comp, tmo))
     }
 
     /// [`Self::pv_get_tmo`]'s request.
@@ -621,11 +619,9 @@ impl<V: ProgramVars> StateSet<V> {
     }
 
     /// `seq_pvPutTmo`; `tmo` in seconds. Its return is a delivery point of
-    /// [`Program::gate`], which the put's own monitor does not pass.
+    /// [`Program::gate`], where the put's own monitor lands.
     pub fn pv_put_tmo(&self, ch: ChId, comp: CompType, tmo: f64) -> PvStat {
-        self.prog
-            .gate
-            .call(self.index, || self.put_tmo(ch, comp, tmo))
+        self.prog.gate.call(|| self.put_tmo(ch, comp, tmo))
     }
 
     /// [`Self::pv_put_tmo`]'s request.

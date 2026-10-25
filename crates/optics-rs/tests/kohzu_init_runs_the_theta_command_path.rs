@@ -761,10 +761,11 @@ fn trace_of(test: &str) -> Vec<String> {
 async fn debug_prints_c_lines() {
     if std::env::var_os(CHILD).is_none() {
         let trace = trace_of("debug_prints_c_lines");
-        // The monitor of waitForCmndEnter's own pvPut(kohzuMoving)
-        // (kohzuCtl.st:656) lands after waitForCmnd's whens are taken, as C's
-        // event task delivers it, so the pending yOffset_mon (:724) wins over
-        // kMbusy (:712).
+        // C's Linux run races the monitor of waitForCmndEnter's own
+        // pvPut(kohzuMoving) (kohzuCtl.st:656) against waitForCmnd's whens.
+        // This follows C's delivery on CAC-event above the state set
+        // (dbContext.cpp), RTEMS's outcome: it has landed, so kMbusy (:712)
+        // wins over the pending yOffset_mon (:724).
         assert_eq!(
             trace,
             [
@@ -798,6 +799,10 @@ async fn debug_prints_c_lines() {
                 "kohzuCtl:waitForCmndEnter:initSeqDone",
                 "kohzuCtl:waitForCmndEnter: kohzuMoving=1; kohzuDone=1",
                 "kohzuCtl:waitForCmndEnter: asserting 'done'.",
+                "kohzuCtl:waitForCmnd:kMbusy",
+                "kohzuCtl:busyChanged",
+                "kohzuCtl:waitForCmndEnter:initSeqDone",
+                "kohzuCtl:waitForCmndEnter: kohzuMoving=0; kohzuDone=0",
                 "kohzuCtl:waitForCmnd:yOffset_mon",
                 "kohzuCtl:calcMovements",
                 "kohzuCtl:moveKohzu",

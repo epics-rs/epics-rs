@@ -201,7 +201,7 @@ async fn a_served_name_is_an_in_process_channel() {
 
             // The first event is the value; a put is seen.
             assert_eq!(
-                ao.monitor_on(&sys.gate(), PvType::TimeDouble, 1, events.monitor("ao")),
+                ao.monitor_on(PvType::TimeDouble, 1, events.monitor("ao")),
                 PvStat::Ok
             );
             assert_eq!(

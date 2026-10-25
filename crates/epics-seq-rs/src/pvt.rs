@@ -322,8 +322,7 @@ pub struct Program<V: 'static> {
     pub pv_sys: PvSystem,
     /// The database `seq` started the program on.
     pub db: PvDatabase,
-    /// What the program's monitor events pass: each state set is in it
-    /// while it runs, so an event lands only while every one is blocked.
+    /// Where a state set takes in the monitor events queued.
     pub gate: Arc<EventGate>,
     pub chans: Box<[Chan<V>]>,
     pub queues: Box<[SeqQueue]>,

@@ -1377,8 +1377,8 @@ fn served_db() -> &'static PvDatabase {
             test_block_on(async move {
                 let db = PvDatabase::new();
                 for name in [
-                    "rv:a", "rv:b", "rv:c", "rv:d", "rv:u", "rv:e", "rv:f", "rv:g", "rv:h", "rv:i",
-                    "rv:j", "rv:k", "rv:l", "rv:m", "rv:n", "rv:o", "rv:p", "rv:q", "rv:r", "rv:s",
+                    "rv:a", "rv:b", "rv:c", "rv:d", "rv:u", "rv:e", "rv:f", "rv:g", "rv:h", "rv:j",
+                    "rv:k", "rv:l", "rv:n", "rv:o", "rv:t",
                 ] {
                     db.add_record(
                         name,
@@ -1585,14 +1585,13 @@ fn e2e_a_put_callback_behind_one_in_flight_is_refused_with_eca_timeout() {
 #[test]
 fn e2e_in_process_monitors_arrive_on_cac_event_in_post_order() {
     let sys = PvSystem::create(served_db());
-    let gate = sys.gate();
     let seen = Arc::new(Mutex::new(Vec::new()));
     let _pvs: Vec<PvVar> = ["rv:e", "rv:f"]
         .into_iter()
         .map(|name| {
             let pv = PvVar::create(&sys, name, |_| {}).unwrap();
             let log = Arc::clone(&seen);
-            let on = pv.monitor_on(&gate, crate::types::PvType::Double, 1, move |ev| {
+            let on = pv.monitor_on(crate::types::PvType::Double, 1, move |ev| {
                 let thread = std::thread::current().name().map(str::to_owned);
                 log.lock()
                     .push((name, thread, ev.value.map(|s| s.value.clone())));
@@ -1634,10 +1633,10 @@ fn e2e_a_post_under_a_held_seq_lock_lands_after_its_release() {
     until("the post", || s.var().w.get()[0] == 8.5);
 }
 
-// ---- the gate: monitors land only while every state set is blocked ----
+// ---- delivery: a monitor lands as it is taken, whatever the state sets do ----
 
 /// `ch` of state set 0 assigned to `name` and monitored, its first value
-/// in, and its event in state sets 0 and 1's masks.
+/// in, and its event in every state set's mask.
 fn monitored_on(p: &Arc<Program<Vars>>, ch: ChId, name: &str) {
     let s = ss(p, 0);
     assert_eq!(s.pv_assign(ch, name), PvStat::Ok);
@@ -1651,115 +1650,71 @@ fn monitored_on(p: &Arc<Program<Vars>>, ch: ChId, name: &str) {
     }
 }
 
-/// A put's own monitor has not landed when that put returns, as on C's
-/// several CPUs, nor while the state set runs on: the next put's return
-/// delivers it, and not that put's own, nor does a wait that finds
-/// `syncSem` raised; a wait that blocks does.
+/// A post lands in the shared variable on `CAC-event` and wakes the state
+/// set waiting for it while state set 0 runs on between requests, as C's
+/// `seq_mon_handler` writes it there (`seq_ca.c:180`): nothing waits for
+/// a state set to reach a point.
 #[test]
-fn e2e_an_own_put_monitor_lands_at_the_next_delivery_point() {
-    let p = program_on(table(VarModel::Reentrant, 0, 1), served_db());
-    let s = ss(&p, 0);
-    monitored_on(&p, W, "rv:h");
-    p.gate.run(0);
-    for (v, comp) in [(4.5, CompType::Default), (5.5, CompType::Sync)] {
-        while woken(&p, 0) {}
-        s.var().w.set([v, 0.0, 0.0, 0.0]);
-        assert_eq!(s.pv_put(W, comp), PvStat::Ok);
-        s.var().w.set([0.0; 4]);
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        assert_eq!(s.var().w.get()[0], 0.0, "{comp:?}: at its own return");
-        s.var().w.set([v + 10.0, 0.0, 0.0, 0.0]);
-        assert_eq!(s.pv_put(W, comp), PvStat::Ok);
-        assert_eq!(s.var().w.get()[0], v, "{comp:?}: at the next return");
-        assert!(p.sync_wait(0, 5.0), "{comp:?}: the first put's wakeup");
-        assert_eq!(s.var().w.get()[0], v, "{comp:?}: at a wait that passes");
-        assert!(p.sync_wait(0, 5.0), "{comp:?}: the second put's wakeup");
-        assert_eq!(
-            s.var().w.get()[0],
-            v + 10.0,
-            "{comp:?}: at a wait that blocks"
-        );
-    }
-    p.gate.stop(0);
-}
-
-/// Another client's post lands at the state set's next delivery point, a
-/// put's or a get's return or a wait that blocks, and not between two
-/// plain statements.
-#[test]
-fn e2e_another_clients_post_lands_at_the_next_delivery_point() {
-    let p = program_on(table(VarModel::Reentrant, 0, 1), served_db());
-    let s = ss(&p, 0);
-    monitored_on(&p, W, "rv:p");
-    assert_eq!(s.pv_assign(M, "rv:q"), PvStat::Ok);
-    until("connect", || s.pv_connected(M));
-    p.gate.run(0);
-    let points: [(f64, &dyn Fn()); 3] = [
-        (4.5, &|| {
-            assert_eq!(s.pv_put(M, CompType::Default), PvStat::Ok)
-        }),
-        (5.5, &|| assert_eq!(s.pv_get(M, CompType::Sync), PvStat::Ok)),
-        (6.5, &|| {
-            while woken(&p, 0) {}
-            assert!(p.sync_wait(0, 5.0))
-        }),
-    ];
-    let mut was = 1.5;
-    for (v, point) in points {
-        put_from_another_thread("rv:p", v);
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        assert_eq!(s.var().w.get()[0], was, "{v}: between statements");
-        point();
-        assert_eq!(s.var().w.get()[0], v);
-        was = v;
-    }
-    p.gate.stop(0);
-}
-
-/// Two posts while the state set runs both land at its block, before it
-/// runs on: its one evaluation after the wait sees the later value.
-#[test]
-fn e2e_two_monitors_held_while_running_land_before_one_evaluation() {
-    let p = program_on(table(VarModel::Reentrant, 0, 1), served_db());
-    let s = ss(&p, 0);
-    monitored_on(&p, W, "rv:i");
-    p.gate.run(0);
-    put_from_another_thread("rv:i", 4.5);
-    put_from_another_thread("rv:i", 6.5);
-    std::thread::sleep(std::time::Duration::from_millis(50));
-    assert_eq!(s.var().w.get()[0], 1.5, "landed while running");
-    assert!(p.sync_wait(0, 5.0));
-    assert_eq!(s.var().w.get()[0], 6.5);
-    assert!(!woken(&p, 0), "two posts, one wakeup");
-    p.gate.stop(0);
-}
-
-/// With two state sets running, the first to block lets nothing through;
-/// the last one does.
-#[test]
-fn e2e_a_monitor_waits_until_every_state_set_blocks() {
+fn e2e_a_post_lands_while_another_state_set_runs() {
     let p = program_on(table(VarModel::Reentrant, 0, 2), served_db());
     let s = ss(&p, 0);
     monitored_on(&p, W, "rv:j");
-    p.gate.run(0);
-    p.gate.run(1);
     let prog = Arc::clone(&p);
-    let ss1 = std::thread::spawn(move || prog.sync_wait(1, 5.0));
-    std::thread::sleep(std::time::Duration::from_millis(50));
+    let waiter = std::thread::spawn(move || {
+        let woke = prog.sync_wait(1, 5.0);
+        (woke, ss(&prog, 1).var().w.get()[0])
+    });
     put_from_another_thread("rv:j", 8.5);
-    std::thread::sleep(std::time::Duration::from_millis(50));
-    assert_eq!(s.var().w.get()[0], 1.5, "landed while state set 0 runs");
-    assert!(!ss1.is_finished());
-    assert!(p.sync_wait(0, 5.0));
-    assert_eq!(s.var().w.get()[0], 8.5);
-    assert!(ss1.join().unwrap());
-    p.gate.stop(0);
-    p.gate.stop(1);
+    until("the post, with no point reached", || {
+        s.var().w.get()[0] == 8.5
+    });
+    assert_eq!(waiter.join().unwrap(), (true, 8.5));
 }
 
-/// `seq_connect` returns with a monitored channel's first value in: no
-/// state set runs yet, and the first monitors queued at the creates land
-/// there, before the first state.
+/// A put's own monitor has landed when the put returns, as `CAC-event`
+/// runs above the state set: here that of another channel on the record.
+#[test]
+fn e2e_an_own_put_monitor_lands_at_the_put_return() {
+    let p = program_on(table(VarModel::Reentrant, 0, 1), served_db());
+    let s = ss(&p, 0);
+    assert_eq!(s.pv_assign(N, "rv:h"), PvStat::Ok);
+    until("first monitor", || {
+        p.dynamic.lock().got_monitor_count() == 1
+    });
+    assert_eq!(s.pv_assign(W, "rv:h"), PvStat::Ok);
+    until("connect", || s.pv_connected(W));
+    for (v, comp) in [(4, CompType::Default), (5, CompType::Sync)] {
+        s.var().w.set([f64::from(v), 0.0, 0.0, 0.0]);
+        assert_eq!(s.pv_put(W, comp), PvStat::Ok);
+        assert_eq!(s.var().n.get(), v, "{comp:?}");
+    }
+}
+
+/// Under `+s` a post lands in the shared buffer and marks the channel
+/// dirty as it is taken; a state set's own copy takes it at its next read
+/// (`ss_read_buffer_selective` in `efTestAndClear` here).
+#[test]
+fn e2e_under_safe_mode_a_post_reaches_a_state_set_at_its_read() {
+    let p = program_on(table(VarModel::Safe, 0, 1), served_db());
+    let s = ss(&p, 0);
+    assert_eq!(s.pv_assign(N, "rv:t"), PvStat::Ok);
+    until("first monitor", || {
+        p.dynamic.lock().got_monitor_count() == 1
+    });
+    assert!(s.ef_test_and_clear(EfId(1)));
+    let before = s.var().n.get();
+    put_from_another_thread("rv:t", 7.0);
+    until("the post", || bit_test(&p.dynamic.lock().ev_flags, 1));
+    assert_eq!(p.var().n.get(), 7);
+    assert!(p.ss[0].dirty[N.index()].load(Ordering::SeqCst));
+    assert_eq!(s.var().n.get(), before, "the copy before its read");
+    assert!(s.ef_test_and_clear(EfId(1)));
+    assert_eq!(s.var().n.get(), 7);
+}
+
+/// `seq_connect` returns with a monitored channel's first value in: the
+/// first monitors queued at the creates land there, before the first
+/// state.
 #[test]
 fn e2e_first_monitors_land_before_seq_connect_returns() {
     let p = program_on(table(VarModel::Reentrant, 0, 1), served_db());
@@ -1774,85 +1729,21 @@ fn e2e_first_monitors_land_before_seq_connect_returns() {
 
 /// `pvAssign` creates its pv under `dynamic`, and the first monitor is
 /// queued inside: nothing delivers it there, where `seq_mon_handler` would
-/// wait on the creating thread's own hold, and it lands at the state set's
-/// block.
+/// wait on the creating thread's own hold, and it lands once the hold is
+/// let go.
 #[test]
-fn e2e_a_first_monitor_queued_under_the_create_hold_lands_at_the_block() {
+fn e2e_a_first_monitor_queued_under_the_create_hold_lands_after_it() {
     let p = program_on(table(VarModel::Reentrant, 0, 1), served_db());
     p.chans[W.index()].monitored.store(true, Ordering::Relaxed);
-    set_mask(&p, 0, &[p.chans[W.index()].def.event_num]);
     let (tx, rx) = std::sync::mpsc::channel();
     let prog = Arc::clone(&p);
-    std::thread::spawn(move || {
-        prog.gate.run(0);
-        let assigned = ss(&prog, 0).pv_assign(W, "rv:l");
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        let running = prog.dynamic.lock().got_monitor_count();
-        while woken(&prog, 0) {}
-        let woke = prog.sync_wait(0, 5.0);
-        let blocked = prog.dynamic.lock().got_monitor_count();
-        prog.gate.stop(0);
-        tx.send((assigned, running, woke, blocked)).unwrap();
+    std::thread::spawn(move || tx.send(ss(&prog, 0).pv_assign(W, "rv:l")).unwrap());
+    let assigned = rx.recv_timeout(std::time::Duration::from_secs(10));
+    assert_eq!(assigned, Ok(PvStat::Ok), "deadlocked on its own hold");
+    until("the first monitor", || {
+        p.dynamic.lock().got_monitor_count() == 1
     });
-    let got = rx.recv_timeout(std::time::Duration::from_secs(10));
-    assert_eq!(
-        got,
-        Ok((PvStat::Ok, 0, true, 1)),
-        "deadlocked on its own hold"
-    );
     assert_eq!(ss(&p, 0).var().w.get()[0], 1.5);
-}
-
-/// A monitor turned off while its event is held: the event is dropped at
-/// the block, as `db_cancel_event` drops a queued one.
-#[test]
-fn e2e_a_held_event_of_a_monitor_turned_off_is_dropped() {
-    let p = program_on(table(VarModel::Reentrant, 0, 1), served_db());
-    let s = ss(&p, 0);
-    monitored_on(&p, W, "rv:m");
-    p.gate.run(0);
-    put_from_another_thread("rv:m", 8.5);
-    assert_eq!(s.pv_stop_monitor(W), PvStat::Ok);
-    s.var().w.set([3.0, 0.0, 0.0, 0.0]);
-    while woken(&p, 0) {}
-    assert!(!p.sync_wait(0, 0.1), "the dropped event's wakeup");
-    assert_eq!(s.var().w.get()[0], 3.0);
-    p.gate.stop(0);
-}
-
-/// A `when` wait that finds `syncSem` raised after no call is a pass that
-/// takes everything: a monitor held while the state set ran lands there.
-#[test]
-fn e2e_a_wait_that_finds_sync_sem_raised_lands_held_monitors() {
-    let p = program_on(table(VarModel::Reentrant, 0, 1), served_db());
-    let s = ss(&p, 0);
-    monitored_on(&p, W, "rv:r");
-    p.gate.run(0);
-    put_from_another_thread("rv:r", 7.5);
-    p.ss[0].sync_sem.signal();
-    assert!(p.sync_wait(0, 0.0));
-    assert_eq!(s.var().w.get()[0], 7.5);
-    p.gate.stop(0);
-}
-
-/// A wait with no time left after a put does not block: the put's own
-/// monitor has not landed after it, and a wait that blocks lands it.
-#[test]
-fn e2e_a_zero_wait_after_a_put_leaves_its_own_monitor_held() {
-    let p = program_on(table(VarModel::Reentrant, 0, 1), served_db());
-    let s = ss(&p, 0);
-    monitored_on(&p, W, "rv:s");
-    p.gate.run(0);
-    while woken(&p, 0) {}
-    s.var().w.set([4.5, 0.0, 0.0, 0.0]);
-    assert_eq!(s.pv_put(W, CompType::Default), PvStat::Ok);
-    s.var().w.set([0.0; 4]);
-    let woke = p.sync_wait(0, 0.0);
-    assert_eq!(s.var().w.get()[0], 0.0, "at the zero wait");
-    assert!(!woke);
-    assert!(p.sync_wait(0, 5.0));
-    assert_eq!(s.var().w.get()[0], 4.5, "at a wait that blocks");
-    p.gate.stop(0);
 }
 
 /// [`put_from_another_thread`] after 50 ms, while the caller waits.
@@ -1863,9 +1754,8 @@ fn put_from_another_thread_later(name: &'static str, v: f64) -> std::thread::Joi
     })
 }
 
-/// `wait_complete`'s wait on `syncSem` is a block point: a monitor posted
-/// while its SYNC put is outstanding lands there, though the put's return
-/// would not deliver it.
+/// A monitor posted while a SYNC put waits for its completion lands
+/// during that wait.
 #[test]
 fn e2e_monitors_land_while_a_sync_put_waits_for_completion() {
     let p = program_on(table(VarModel::Reentrant, 0, 1), served_db());
@@ -1873,17 +1763,16 @@ fn e2e_monitors_land_while_a_sync_put_waits_for_completion() {
     monitored_on(&p, W, "rv:n");
     assert_eq!(s.pv_assign(M, "rv:busy2"), PvStat::Ok);
     until("connect", || s.pv_connected(M));
-    p.gate.run(0);
     s.var().m[0].set(1);
     while woken(&p, 0) {}
     let post = put_from_another_thread_later("rv:n", 8.5);
     assert_eq!(s.pv_put_tmo(M, CompType::Sync, 0.2), PvStat::Timeout);
     post.join().unwrap();
     assert_eq!(s.var().w.get()[0], 8.5);
-    p.gate.stop(0);
 }
 
-/// So is `check_pending`'s wait for a put still outstanding on the channel.
+/// So does one posted while `check_pending` waits for a put still
+/// outstanding on the channel.
 #[test]
 fn e2e_monitors_land_while_a_sync_put_waits_for_one_pending() {
     let p = program_on(table(VarModel::Reentrant, 0, 1), served_db());
@@ -1891,7 +1780,6 @@ fn e2e_monitors_land_while_a_sync_put_waits_for_one_pending() {
     monitored_on(&p, W, "rv:o");
     assert_eq!(s.pv_assign(M, "rv:busy3"), PvStat::Ok);
     until("connect", || s.pv_connected(M));
-    p.gate.run(0);
     s.var().m[0].set(1);
     assert_eq!(s.pv_put_tmo(M, CompType::Async, 0.0), PvStat::Ok);
     while woken(&p, 0) {}
@@ -1899,7 +1787,6 @@ fn e2e_monitors_land_while_a_sync_put_waits_for_one_pending() {
     assert_eq!(s.pv_put_tmo(M, CompType::Sync, 0.2), PvStat::Timeout);
     post.join().unwrap();
     assert_eq!(s.var().w.get()[0], 8.5);
-    p.gate.stop(0);
 }
 
 #[test]

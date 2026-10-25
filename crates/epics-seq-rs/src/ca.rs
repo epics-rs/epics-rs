@@ -164,7 +164,7 @@ impl<V: ProgramVars> Program<V> {
         let def = self.chans[ch.index()].def;
         let status = if on {
             let prog = Arc::downgrade(self);
-            pvid.monitor_on(&self.gate, def.var_type.get_type(), def.count, move |ev| {
+            pvid.monitor_on(def.var_type.get_type(), def.count, move |ev| {
                 if let Some(prog) = prog.upgrade() {
                     prog.seq_mon_handler(ch, ev)
                 }

@@ -68,6 +68,13 @@
 //!   `x.modify(|v| *v += e)`. Every operand is evaluated before a lock is
 //!   taken, so `x = x + 1` is a `get` followed by a `set`, and `x += y`
 //!   reads `y` first. No code holds two variable locks at once.
+//! - Pointers. A [`Ptr`] points into a variable's cell, as C's points into
+//!   its memory, so it sees later writes and keeps the cell alive. Where C
+//!   converts a value to a pointer type (an assignment, an initializer, a
+//!   `return`, an SNL function's argument), `&x` is `x.ptr()`
+//!   (`a.at(i).ptr()`) and an array or a `string` decays with
+//!   `Ptr::from(&a)`; a call without a prototype passes them as places
+//!   (see Calls).
 //! - C semantics. A value assigned to, or passed as, a numeric of another
 //!   type is emitted `as _`. A C truth value is spelled out as `!= 0` or
 //!   `== 0`. Source parentheses and empty statements are dropped.

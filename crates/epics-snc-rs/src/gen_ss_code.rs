@@ -1007,7 +1007,6 @@ impl<'a> Gen<'a> {
             }
             return;
         }
-        let v = self.expr(init);
         let is_text = match place.ty {
             PlaceTy::Snl(t) => match &ast[t].kind {
                 TypeKind::Prim(PrimType::String) => true,
@@ -1019,13 +1018,14 @@ impl<'a> Gen<'a> {
             PlaceTy::StrChar => false,
         };
         let store = if is_text && !place.multi {
+            let v = self.expr(init);
             Expr::call(
                 "seqg_rt::c::strcpy",
                 vec![Expr::unary("&", place.expr), v.e],
             )
         } else {
             let ty = self.place_value_ty(&place);
-            let v = self.store_conv(init, v, &ty);
+            let v = self.stored(init, &ty);
             place.expr.method("set", vec![v])
         };
         out.push(Stmt::Expr(store));
@@ -1071,8 +1071,7 @@ impl<'a> Gen<'a> {
             };
             match init {
                 Some(init) if scalar && ast[init].tag != NodeTag::EInit => {
-                    let v = self.expr(init);
-                    let value = self.store_conv(init, v, &self.value_ty(var.type_));
+                    let value = self.stored(init, &self.value_ty(var.type_));
                     out.push(Stmt::Let {
                         pat,
                         ty,
@@ -1271,10 +1270,9 @@ impl<'a> Gen<'a> {
                 }
                 self.comment(sp, ctx, out);
                 let value = node.child(child::RETURN_EXPR).map(|e| {
-                    let v = self.expr(e);
                     Box::new(match self.ret {
-                        Some(t) => self.store_conv(e, v, &self.value_ty(t)),
-                        None => v.e,
+                        Some(t) => self.stored(e, &self.value_ty(t)),
+                        None => self.expr(e).e,
                     })
                 });
                 out.push(Stmt::Expr(Expr::Return(value)));
@@ -1370,8 +1368,7 @@ impl<'a> Gen<'a> {
         };
         let ty = self.place_value_ty(&place);
         if op == Tok::Equal {
-            let v = self.expr(rhs);
-            let v = self.store_conv(rhs, v, &ty);
+            let v = self.stored(rhs, &ty);
             out.push(Stmt::Expr(place.expr.method("set", vec![v])));
             return;
         }
@@ -1410,43 +1407,75 @@ impl<'a> Gen<'a> {
         Some(place)
     }
 
-    /// `v`, the value of `ep`, converted for a store into a variable of
-    /// type `ty`. snc-rs's `char *` holds a copy, so one that C would point
-    /// into a variable, where it sees later writes, is refused.
-    fn store_conv(&mut self, ep: NodeId, v: Val, ty: &Ty) -> Expr {
-        if matches!(ty, Ty::Ptr(_)) && self.points_into_variable(ep) {
-            self.refuse(ep, "a pointer that points into a variable");
+    /// `ep` translated as a value stored into, or passed as, a `ty`: C's
+    /// conversion on assignment.
+    fn stored(&mut self, ep: NodeId, ty: &Ty) -> Expr {
+        match ty {
+            Ty::Ptr(elem) => self.ptr_value(ep, elem),
+            _ => {
+                let v = self.expr(ep);
+                conv(v, ty)
+            }
         }
-        conv(v, ty)
     }
 
-    /// Whether C's value of `ep` is an address inside a variable: a
-    /// `string` or an array (decayed), `&x`, or such an address plus `n`,
-    /// chosen by `?:` or cast.
-    fn points_into_variable(&self, ep: NodeId) -> bool {
-        let node = &self.ast[ep];
+    /// `ep` as C's pointer to `elem`, where one is stored or passed. `&x`
+    /// is its place's `ptr()`, and an array or a `string` decays with
+    /// `Ptr::from` to its first element: both point into the variable's
+    /// cell and see its later writes, as C's do.
+    fn ptr_value(&mut self, ep: NodeId, elem: &str) -> Expr {
+        let ast = self.ast;
+        let node = &ast[ep];
         let c = |i| node.child(i).expect("expression operand");
         match node.tag {
-            NodeTag::EParen => self.points_into_variable(c(child::PAREN_EXPR)),
-            NodeTag::ECast => self.points_into_variable(c(child::CAST_OPERAND)),
+            NodeTag::EParen => self.ptr_value(c(child::PAREN_EXPR), elem),
             NodeTag::ETernop => {
-                self.points_into_variable(c(child::TERNOP_THEN))
-                    || self.points_into_variable(c(child::TERNOP_ELSE))
+                let cond = self.truth(c(child::TERNOP_COND));
+                let a = self.ptr_value(c(child::TERNOP_THEN), elem);
+                let b = self.ptr_value(c(child::TERNOP_ELSE), elem);
+                Expr::If(
+                    Box::new(cond),
+                    vec![Stmt::Tail(a)],
+                    Some(Box::new(Expr::Block(vec![Stmt::Tail(b)]))),
+                )
             }
-            NodeTag::EBinop if node.token.symbol == Tok::Add => {
-                self.points_into_variable(c(child::BINOP_LEFT))
-                    || self.points_into_variable(c(child::BINOP_RIGHT))
+            NodeTag::EPre
+                if node.token.symbol == Tok::Ampersand
+                    && self.place_kind(c(child::PRE_OPERAND)).is_some() =>
+            {
+                let place = self.place(c(child::PRE_OPERAND));
+                if place.multi {
+                    self.refuse(ep, "a pointer to a multi-PV array");
+                }
+                place.expr.method("ptr", Vec::new())
             }
-            NodeTag::EPre if node.token.symbol == Tok::Ampersand => {
-                self.place_kind(c(child::PRE_OPERAND)).is_some()
+            _ if self.decays(ep) => {
+                let place = self.place(ep);
+                if place.multi {
+                    self.refuse(ep, "a pointer to a multi-PV array");
+                }
+                Expr::call("seqg_rt::Ptr::from", vec![Expr::unary("&", place.expr)])
             }
-            _ => match self.place_kind(ep) {
-                Some((PlaceTy::Snl(t), _)) => matches!(
-                    self.ast[t].kind,
-                    TypeKind::Array { .. } | TypeKind::Prim(PrimType::String)
-                ),
-                _ => false,
-            },
+            NodeTag::EBinop if matches!(node.token.symbol, Tok::Add | Tok::Sub) => {
+                self.refuse(ep, "pointer arithmetic");
+                self.expr(ep).e
+            }
+            _ => {
+                let v = self.expr(ep);
+                conv(v, &Ty::Ptr(elem.into()))
+            }
+        }
+    }
+
+    /// Whether `ep` is an array or a `string` variable or element, which C
+    /// reads as the address of its first element.
+    fn decays(&self, ep: NodeId) -> bool {
+        match self.place_kind(ep) {
+            Some((PlaceTy::Snl(t), _)) => matches!(
+                self.ast[t].kind,
+                TypeKind::Array { .. } | TypeKind::Prim(PrimType::String)
+            ),
+            _ => false,
         }
     }
 
@@ -1566,14 +1595,13 @@ impl<'a> Gen<'a> {
         let ty = self.place_value_ty(&place);
         let mut stmts = Vec::new();
         if op == Tok::Equal {
-            let v = self.expr(rhs);
             let stored = Expr::atom("seqg_rhs");
             let stored = if matches!(ty, Ty::Ptr(_)) {
                 stored.method("clone", Vec::new())
             } else {
                 stored
             };
-            let v = self.store_conv(rhs, v, &ty);
+            let v = self.stored(rhs, &ty);
             stmts.push(Stmt::Let {
                 pat: "seqg_rhs".into(),
                 ty: None,
@@ -1879,10 +1907,9 @@ impl<'a> Gen<'a> {
                 .map(|pd| ast[ast[pd].e_decl().expect("parameter decl var")].type_)
                 .collect();
             for (i, a) in args.into_iter().enumerate() {
-                let v = self.expr(a);
                 let e = match params.get(i) {
-                    Some(&t) => self.store_conv(a, v, &self.value_ty(t)),
-                    None => v.e,
+                    Some(&t) => self.stored(a, &self.value_ty(t)),
+                    None => self.expr(a).e,
                 };
                 out.push(e.into());
             }
@@ -3307,7 +3334,7 @@ mod tests {
         );
         assert_eq!(
             diag,
-            "t.st:7: error: snc-rs does not support a pointer that points into a variable\n\
+            "t.st:7: error: snc-rs does not support pointer arithmetic\n\
              t.st:8: error: snc-rs does not support assignment through a pointer\n\
              t.st:9: error: snc-rs does not support pointer arithmetic\n"
         );
@@ -3535,21 +3562,40 @@ mod tests {
     }
 
     #[test]
-    fn a_char_ptr_pointing_into_a_variable_is_refused() {
-        // C's pointer sees later writes to the variable; snc-rs's char *
-        // would hold a copy
-        let (_, diag) = translate(
+    fn a_pointer_stored_from_a_variable_points_into_its_cell() {
+        // C's pointer sees later writes to the variable, as Ptr does
+        let (code, diag) = translate(
             "program p\nstring s;\nchar buf[8];\nchar c;\nchar *g = s;\nchar *p;\nchar *q;\n\
-             ss a {\nstate z {\nwhen () {\nchar *l = buf;\n\
-             p = s;\np = (c ? buf : \"x\");\nc = strlen(q = &s[1]);\np = &c;\n\
-             p = q;\np = \"lit\";\np = c ? q : \"\";\n} state z\n}\n}\n",
+             int m[2];\nassign m to {\"a\",\"b\"};\nint *mp;\nss a {\nstate z {\nwhen () {\n\
+             char *l = buf;\np = s;\np = (c ? buf : \"x\");\nc = strlen(q = &s[1]);\np = &c;\n\
+             mp = &m[1];\n} state z\n}\n}\n",
         );
-        let refused = |line| {
-            format!(
-                "t.st:{line}: error: snc-rs does not support a pointer that points into a variable\n"
-            )
-        };
-        assert_eq!(diag, [5, 11, 12, 13, 14, 15].map(refused).concat());
+        assert_eq!(diag, "");
+        for e in [
+            "seqg_var.g.set(seqg_rt::Ptr::from(&seqg_var.s));",
+            "seqg_rt::SeqVar::new(seqg_rt::Ptr::from(&seqg_var.buf));",
+            "seqg_var.p.set(seqg_rt::Ptr::from(&seqg_var.s));",
+            "seqg_rt::Ptr::from(&seqg_var.buf)\n",
+            "seqg_rt::CharPtr::from_bytes(\"x\".as_bytes())\n",
+            "let seqg_rhs = seqg_var.s.at(1).ptr();",
+            "seqg_var.p.set(seqg_var.c.ptr());",
+            "seqg_var.mp.set(seqg_var.m[1].ptr());",
+        ] {
+            assert!(code.contains(e), "{e} in {code}");
+        }
+    }
+
+    #[test]
+    fn a_pointer_to_a_whole_multi_pv_array_is_refused() {
+        // its elements are separate cells, which no one Ptr moves along
+        let (_, diag) = translate(
+            "program p\nint m[2];\nassign m to {\"a\",\"b\"};\nint *mp;\nss a {\nstate z {\n\
+             when () {\nmp = m;\n} state z\n}\n}\n",
+        );
+        assert_eq!(
+            diag,
+            "t.st:8: error: snc-rs does not support a pointer to a multi-PV array\n"
+        );
     }
 
     #[test]

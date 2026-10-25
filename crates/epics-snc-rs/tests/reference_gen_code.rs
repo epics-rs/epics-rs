@@ -113,31 +113,27 @@ const EXPECTED_FAILURES: &[(&str, &str)] = &[
     ),
     (
         "motor/modules/motorAerotech/aerotechApp/src/EnsembleTrajectoryScan.st",
-        "EnsembleTrajectoryScan.st:184: error: snc-rs does not support a pointer that points into a variable",
+        "EnsembleTrajectoryScan.st:467: error[E0614]: type `Ptr<i32>` cannot be dereferenced: can't be dereferenced",
     ),
     (
         "motor/modules/motorNewport/newportApp/src/MM4005_trajectoryScan.st",
-        "MM4005_trajectoryScan.st:316: error: snc-rs does not support a pointer that points into a variable",
+        "MM4005_trajectoryScan.st:499: error[E0277]: the trait bound `Ptr<i8>: From<{integer}>` is not satisfied: the trait `From<{integer}>` is not implemented for `Ptr<i8>`",
     ),
     (
         "motor/modules/motorNewport/newportApp/src/XPS_trajectoryScan.st",
         "XPS_trajectoryScan.st:165: error: snc-rs does not support assignment through a pointer",
     ),
     (
-        "motor/modules/motorOms/omsApp/src/MAX_trajectoryScan.st",
-        "MAX_trajectoryScan.st:392: error: snc-rs does not support a pointer that points into a variable",
-    ),
-    (
         "sequencer/test/validate/array.st",
-        "array.st:31: error: snc-rs does not support a pointer that points into a variable",
+        "array.st:42: error[E0614]: type `Ptr<[SeqString; 5]>` cannot be dereferenced: can't be dereferenced",
     ),
     (
         "sequencer/test/validate/opttVar.st",
-        "opttVar.st:103: error: snc-rs does not support a pointer that points into a variable",
+        "opttVar.st:115: error: snc-rs does not support pointer arithmetic",
     ),
     (
         "sequencer/test/validate/sizeof.st",
-        "sizeof.st:19: error: snc-rs does not support a pointer that points into a variable",
+        "sizeof.st:21: error: snc-rs cannot compute this sizeof",
     ),
     // C's void * and a function pointer have no Rust type
     (

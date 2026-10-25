@@ -277,6 +277,39 @@ string pvname;
 string close_format;
 int chan;
 
+/* C defect fixed: mode_change's init set what read_meter reads
+** (unit_strings, close_format, channels) while read_meter ran, so a
+** done_read restored to 1 could read before it: an empty rout:clos
+** and "(null)" units. The setup runs here, before either starts. */
+entry {
+    unit_strings[0] = "VDC";
+    unit_strings[1] = "VAC";
+    unit_strings[2] = "OHM";
+    unit_strings[3] = "OHM";
+    unit_strings[4] = "HZ";
+    unit_strings[5] = "DegC";
+    unit_strings[6] = "DegC";
+    unit_strings[7] = "DegC";
+    unit_strings[8] = "ADC";
+    unit_strings[9] = "AAC";
+    P = macValueGet("P");
+    Dmm = macValueGet("Dmm");
+    strncpy(model, macValueGet("model"), sizeof(model));
+    model[sizeof(model)-1] = 0;
+    pvPut(model);
+    channels = atoi(macValueGet("channels"));
+    /* C defect fixed: a channels macro past MAX_CHANNELS indexed
+    ** ch_mode, ch_on_off and ch_raw past their ends. */
+    if (channels > MAX_CHANNELS) channels = MAX_CHANNELS;
+    pvPut(channels);
+    if (strcmp(model, "2000") == 0) {
+       strncpy(close_format, "rout:clos (@%d)", sizeof(close_format));
+    } else {
+       strncpy(close_format, "rout:clos (@1%2.2d)", sizeof(close_format));
+    }
+    close_format[sizeof(close_format)-1] = 0;
+}
+
 ss mode_change {
     /* C defect fixed: mode was one variable both state sets wrote, so
     ** read_meter could configure a channel, or take the AC volts delay,
@@ -289,32 +322,6 @@ ss mode_change {
             efSet(ch_mode_mon);
             efSet(ch_mode_sel_mon);
             efSet(dmm_chan_mon);
-            unit_strings[0] = "VDC";
-            unit_strings[1] = "VAC";
-            unit_strings[2] = "OHM";
-            unit_strings[3] = "OHM";
-            unit_strings[4] = "HZ";
-            unit_strings[5] = "DegC";
-            unit_strings[6] = "DegC";
-            unit_strings[7] = "DegC";
-            unit_strings[8] = "ADC";
-            unit_strings[9] = "AAC";
-            P = macValueGet("P");
-            Dmm = macValueGet("Dmm");
-            strncpy(model, macValueGet("model"), sizeof(model));
-            model[sizeof(model)-1] = 0;
-            pvPut(model);
-            channels = atoi(macValueGet("channels"));
-            /* C defect fixed: a channels macro past MAX_CHANNELS indexed
-            ** ch_mode, ch_on_off and ch_raw past their ends. */
-            if (channels > MAX_CHANNELS) channels = MAX_CHANNELS;
-            pvPut(channels);
-            if (strcmp(model, "2000") == 0) {
-               strncpy(close_format, "rout:clos (@%d)", sizeof(close_format));
-            } else {
-               strncpy(close_format, "rout:clos (@1%2.2d)", sizeof(close_format));
-            }
-            close_format[sizeof(close_format)-1] = 0;
         } state monitor_mode_changes
     }
     state monitor_mode_changes {

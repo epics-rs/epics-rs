@@ -315,17 +315,19 @@ fn stub_companion(foreign: &Foreign, c: &HashSet<String>) -> String {
         let decl = foreign.decls.get(name);
         // a parameter its prototype types takes that type, as the call
         // converts to it
+        let variadic = decl.filter(|d| d.variadic);
         let typed = decl
             .and_then(|d| d.params.as_ref())
-            .filter(|p| p.len() == argc);
+            .filter(|p| p.len() == argc || variadic.is_some());
         let mut params: Vec<String> = (0..argc)
-            .map(|i| match typed.and_then(|p| p[i]) {
+            .map(|i| match typed.and_then(|p| p.get(i).copied().flatten()) {
                 Some(t) => format!("_: {t}"),
                 None => "_: impl Sized".into(),
             })
             .collect();
         // gen_ss_code passes a variadic function's rest as one slice
-        if let Some(fixed) = variadic_fixed_args(name) {
+        let escaped_fixed = variadic.and_then(|d| d.params.as_ref().map(Vec::len));
+        if let Some(fixed) = variadic_fixed_args(name).or(escaped_fixed) {
             params.truncate(fixed);
             params.push(if name.ends_with("scanf") {
                 "_: &[&dyn ScanTarget]".into()

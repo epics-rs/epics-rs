@@ -217,19 +217,37 @@ enum CParam {
     Num(&'static str),
 }
 
-/// The prototype in scope where SNL code calls C function `name`, by which
-/// gcc converts the arguments and types the call: the library's for one
-/// `epics_seq_rs::c` supplies, else the program's escaped-C declaration. A
-/// parameter or result that declaration does not spell in keywords is
-/// `None`.
-fn c_prototype(ast: &Ast, name: &str) -> (Vec<Option<CParam>>, Option<Ty>) {
+/// The prototype in scope where SNL code calls a C function, by which gcc
+/// converts the arguments and types the call.
+#[derive(Default)]
+struct CProto {
+    /// `None` for a parameter its declaration does not spell in keywords
+    params: Vec<Option<CParam>>,
+    /// `None` where its declaration does not spell it in keywords
+    ret: Option<Ty>,
+    /// [`variadic`]'s, for a variadic function
+    variadic: Option<(usize, bool)>,
+}
+
+/// [`CProto`] of C function `name`: the library's for one `epics_seq_rs::c`
+/// supplies, else the program's escaped-C declaration.
+fn c_prototype(ast: &Ast, name: &str) -> CProto {
+    let lib = variadic(name);
     if let Some((params, ret)) = prototype(name) {
-        return (params.iter().copied().map(Some).collect(), Some(ret));
+        return CProto {
+            params: params.iter().copied().map(Some).collect(),
+            ret: Some(ret),
+            variadic: lib,
+        };
     }
     let Some(decl) = escaped_decl(ast, name) else {
-        return (Vec::new(), None);
+        return CProto {
+            variadic: lib,
+            ..CProto::default()
+        };
     };
     let params = decl.params.unwrap_or_default();
+    let variadic = lib.or(decl.variadic.then_some((params.len(), false)));
     let ret = decl.ret.map(|t| {
         if t == "()" {
             Ty::Unit
@@ -237,10 +255,11 @@ fn c_prototype(ast: &Ast, name: &str) -> (Vec<Option<CParam>>, Option<Ty>) {
             Ty::Num(t.into())
         }
     });
-    (
-        params.into_iter().map(|p| p.map(CParam::Num)).collect(),
+    CProto {
+        params: params.into_iter().map(|p| p.map(CParam::Num)).collect(),
         ret,
-    )
+        variadic,
+    }
 }
 
 /// The prototype of a C library function `epics_seq_rs::c` supplies, by
@@ -659,14 +678,6 @@ fn escaped_fn_uses(ast: &Ast, name: &str) -> Vec<(Vec<u8>, Vec<u8>)> {
     uses
 }
 
-/// Whether the program's escaped C declares or defines `name` with a
-/// `...` parameter, which no Rust function the companion writes can take.
-fn escaped_variadic(ast: &Ast, name: &str) -> bool {
-    escaped_fn_uses(ast, name)
-        .iter()
-        .any(|(_, params)| params.trim_ascii_end().ends_with(b"..."))
-}
-
 /// A function's declaration in the program's escaped C, in the Rust types
 /// its keywords spell, each `None` where they spell none: the types the
 /// companion's function takes and returns.
@@ -674,6 +685,9 @@ pub struct CDecl {
     pub ret: Option<&'static str>,
     /// `None` for `()`, which declares no prototype
     pub params: Option<Vec<Option<&'static str>>>,
+    /// whether the prototype ends in `...`, whose arguments the call
+    /// passes after `params` as one `&[CArg]` slice
+    pub variadic: bool,
 }
 
 /// `name`'s declaration in the program's escaped C, by which gcc types and
@@ -686,8 +700,14 @@ pub fn escaped_decl(ast: &Ast, name: &str) -> Option<CDecl> {
         .filter_map(|(spec, params)| Some((decl_specs(spec)?, params)))
         .peekable();
     let ret = c_spec_type(&decls.peek()?.0);
-    let params = decls.find_map(|(_, params)| c_params(params));
-    Some(CDecl { ret, params })
+    let (params, variadic) = decls
+        .find_map(|(_, params)| c_params(params))
+        .map_or((None, false), |(p, v)| (Some(p), v));
+    Some(CDecl {
+        ret,
+        params,
+        variadic,
+    })
 }
 
 /// The Rust type of variable `name` by its first declaration in the
@@ -795,9 +815,10 @@ fn decl_specs(spec: &[u8]) -> Option<Vec<&str>> {
     (!words.is_empty() && words.iter().all(spec_word)).then_some(words)
 }
 
-/// The Rust type of each parameter a parameter list declares, or `None` for
-/// `()`, which declares no prototype.
-fn c_params(params: &[u8]) -> Option<Vec<Option<&'static str>>> {
+/// The Rust type of each parameter a parameter list declares before any
+/// `...`, and whether it ends in one; `None` for `()`, which declares no
+/// prototype.
+fn c_params(params: &[u8]) -> Option<(Vec<Option<&'static str>>, bool)> {
     let params = std::str::from_utf8(params).ok()?.trim();
     let mut depth = 0;
     let top_comma = |c: char| {
@@ -810,8 +831,15 @@ fn c_params(params: &[u8]) -> Option<Vec<Option<&'static str>>> {
     };
     match params {
         "" => None,
-        "void" => Some(Vec::new()),
-        _ => Some(params.split(top_comma).map(c_param_type).collect()),
+        "void" => Some((Vec::new(), false)),
+        _ => {
+            let mut params: Vec<&str> = params.split(top_comma).collect();
+            let variadic = params.last().is_some_and(|p| p.trim() == "...");
+            if variadic {
+                params.pop();
+            }
+            Some((params.into_iter().map(c_param_type).collect(), variadic))
+        }
     }
 }
 
@@ -1856,17 +1884,11 @@ impl<'a> Gen<'a> {
             }
             _ => None,
         };
-        let (params, ret) = c_name.map_or((Vec::new(), None), |name| c_prototype(ast, name));
-        let variadic = c_name.and_then(variadic);
-        if let Some(name) = c_name
-            && variadic.is_none()
-            && escaped_variadic(ast, name)
-        {
-            self.refuse(
-                ep,
-                &format!("calling the variadic escaped-C function '{name}'"),
-            );
-        }
+        let CProto {
+            params,
+            ret,
+            variadic,
+        } = c_name.map_or_else(CProto::default, |name| c_prototype(ast, name));
         match variadic {
             Some((fixed, scans)) if args.len() >= fixed => {
                 for (i, &a) in args[..fixed].iter().enumerate() {
@@ -3737,20 +3759,29 @@ mod tests {
     }
 
     #[test]
-    fn a_call_of_an_escaped_c_variadic_function_is_refused() {
+    fn a_call_of_an_escaped_c_variadic_function_passes_the_rest_as_cargs() {
         // XPS_trajectoryScan.st:143's printMessage; the look-alikes in a
         // comment and a literal declare nothing
-        let (_, diag) = translate(
+        let (code, diag) = translate(
             "program p\n%%static void printMessage(const char *pformat, ...);\n\
              %%static int twice(int x); /* twice(int, ...) */\n\
-             %%static const char *s = \"f(a, ...)\";\nint y;\nss a {\nstate s {\nwhen () {\n\
-             printMessage(\"%d\\n\", y);\ny = twice(y);\nf(y);\n} state s\n}\n}\n",
+             %%static void f(double d, ...);\n\
+             %%static const char *s = \"g(a, ...)\";\nint y;\nss a {\nstate s {\nwhen () {\n\
+             printMessage(\"%d\\n\", y);\ny = twice(y);\nf(y);\nf(y, y);\ng(y);\nprintf(\"%d\", y);\n\
+             } state s\n}\n}\n",
         );
-        assert_eq!(
-            diag,
-            "t.st:9: error: snc-rs does not support calling the variadic escaped-C function \
-             'printMessage'\n"
-        );
+        assert_eq!(diag, "");
+        let code = words(&code);
+        for line in [
+            "printMessage(\"%d\\n\", &[seqg_rt::c::CArg::from(seqg_var.y.get())]);",
+            "seqg_var.y.set(twice(seqg_var.y.get()));",
+            "f(seqg_var.y.get() as f64, &[]);",
+            "f(seqg_var.y.get() as f64, &[seqg_rt::c::CArg::from(seqg_var.y.get())]);",
+            "g(seqg_var.y.get());",
+            "printf(\"%d\", &[seqg_rt::c::CArg::from(seqg_var.y.get())]);",
+        ] {
+            assert!(code.contains(line), "{line} in {code}");
+        }
     }
 
     #[test]

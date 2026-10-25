@@ -29,6 +29,9 @@ const NM_EVENT: &str = "seqg_event";
 const NM_SS: &str = "seqg_ss";
 const ENV_TYPE: &str = "&seqg_rt::StateSet<seqg_vars>";
 const C_CHAR: &str = "std::ffi::c_char";
+/// The zero of a value of unknown type: C's 0 for a number, the null
+/// pointer for a pointer.
+const DEFAULT: &str = "Default::default()";
 
 /// C `gen_ss_code`: the program init function, the program entry
 /// function, the functions of every state of every state set and the
@@ -2252,11 +2255,11 @@ impl<'a> Gen<'a> {
         binop(op, l, r)
     }
 
-    /// `ep` as a Rust `bool`, as C tests it against zero, refused when its
-    /// type is unknown: a Rust value compares with `0` only if it is an
-    /// integer.
+    /// `ep` as a Rust `bool`, as C tests it against zero. A value of unknown
+    /// type is tested against its type's `Default`, which is C's zero for a
+    /// number and the null pointer for a pointer.
     fn truth(&mut self, ep: NodeId) -> Expr {
-        let v = self.tested(ep);
+        let v = self.expr(ep);
         let zero = |float: bool| Expr::atom(if float { "0.0" } else { "0" });
         match v.ty {
             Ty::Bool => v.e,
@@ -2268,13 +2271,14 @@ impl<'a> Gen<'a> {
             Ty::Rt(r) => Expr::binary(rt_int(v.e, r), "!=", zero(false)),
             Ty::CharPtr => Expr::unary("!", v.e.method("is_null", Vec::new())),
             Ty::Str | Ty::Ref => Expr::atom("true"),
-            Ty::Foreign | Ty::Unit => Expr::binary(v.e, "!=", zero(false)),
+            Ty::Foreign => Expr::binary(v.e, "!=", Expr::atom(DEFAULT)),
+            Ty::Unit => Expr::binary(v.e, "!=", zero(false)),
         }
     }
 
-    /// C's `!ep`, refused as [`Gen::truth`] refuses.
+    /// C's `!ep`, as [`Gen::truth`] tests it.
     fn not(&mut self, ep: NodeId) -> Expr {
-        let v = self.tested(ep);
+        let v = self.expr(ep);
         let zero = |float: bool| Expr::atom(if float { "0.0" } else { "0" });
         match v.ty {
             Ty::Bool => Expr::unary("!", v.e),
@@ -2286,18 +2290,9 @@ impl<'a> Gen<'a> {
             Ty::Rt(r) => Expr::binary(rt_int(v.e, r), "==", zero(false)),
             Ty::CharPtr => v.e.method("is_null", Vec::new()),
             Ty::Str | Ty::Ref => Expr::atom("false"),
-            Ty::Foreign | Ty::Unit => Expr::binary(v.e, "==", zero(false)),
+            Ty::Foreign => Expr::binary(v.e, "==", Expr::atom(DEFAULT)),
+            Ty::Unit => Expr::binary(v.e, "==", zero(false)),
         }
-    }
-
-    /// `ep` for [`Gen::truth`] and [`Gen::not`], refused when its type is
-    /// unknown.
-    fn tested(&mut self, ep: NodeId) -> Val {
-        let v = self.expr(ep);
-        if v.ty == Ty::Foreign {
-            self.refuse(ep, "testing a value of unknown type");
-        }
-        v
     }
 
     /// An integer constant stays an untyped literal beside a value whose
@@ -3026,6 +3021,11 @@ mod tests {
         )
     }
 
+    /// `code` with every run of whitespace one space.
+    fn words(code: &str) -> String {
+        code.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
     #[test]
     fn a_builtin_call_in_a_global_initializer_stops_as_c_asserts() {
         let (mut snc, ast, prg) = analysed(
@@ -3440,31 +3440,45 @@ mod tests {
     }
 
     #[test]
-    fn testing_a_value_of_unknown_type_is_refused() {
-        // control.st:37; `x != 0` builds only if the companion's x is an
-        // integer
-        let (_, diag) = translate(
+    fn a_value_of_unknown_type_is_tested_against_its_default() {
+        // control.st:37; the companion's x may be a number or a pointer
+        let (code, diag) = translate(
             "program p\n%%foo_t x;\nint y;\nassign y to \"y\";\nss a {\nstate s {\nwhen (h()) {\n\
              if (x) y = 1;\nwhile (x) y = 2;\ny = !x;\ny = y && x;\ny = x ? 1 : 2;\n\
              x ? h() : h();\ny = pvPutComplete(y, 1, x);\nif (y) y = 3;\n} state s\n}\n}\n",
         );
-        let refused = |line| {
-            format!("t.st:{line}: error: snc-rs does not support testing a value of unknown type\n")
-        };
-        assert_eq!(diag, [7, 8, 9, 10, 11, 12, 13, 14].map(refused).concat());
+        assert_eq!(diag, "");
+        let code = words(&code);
+        for e in [
+            "if h() != Default::default() {",
+            "if x != Default::default() {",
+            "while x != Default::default() {",
+            "seqg_var.y.set((x == Default::default()) as i32)",
+            "seqg_var.y.set((seqg_var.y.get() != 0 && x != Default::default()) as i32)",
+            "seqg_var.y.set( if x != Default::default() { 1 } else { 2 }, )",
+            "if x != Default::default() { h(); } else { h(); }",
+            "seqg_rt::ChId(0), // y 1, x != Default::default(), None,",
+        ] {
+            assert!(code.contains(e), "{e}\n{code}");
+        }
     }
 
     #[test]
-    fn a_for_condition_of_unknown_type_is_refused() {
-        // reviewer4: `for (;x;)` came out as `while x != 0`
-        let (_, diag) = translate(
+    fn a_for_condition_of_unknown_type_is_tested_against_its_default() {
+        // reviewer4: `for (;x;)` came out as `while x != 0`, which builds
+        // only for an integer x
+        let (code, diag) = translate(
             "program p\n%%foo_t x;\nint i;\nss a {\nstate s {\nwhen () {\n\
              for (;x;) i = 1;\nfor (i = 0; h(); i++) i = 2;\n} state s\n}\n}\n",
         );
-        let refused = |line| {
-            format!("t.st:{line}: error: snc-rs does not support testing a value of unknown type\n")
-        };
-        assert_eq!(diag, [7, 8].map(refused).concat());
+        assert_eq!(diag, "");
+        let code = words(&code);
+        for e in [
+            "while x != Default::default() {",
+            "while h() != Default::default() {",
+        ] {
+            assert!(code.contains(e), "{e}\n{code}");
+        }
     }
 
     #[test]

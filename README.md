@@ -87,7 +87,7 @@ epics-ca-rs   = "0.32"  # just Channel Access
 | `optics-rs` | Optics (table, monochromator, slit, filter, BPM) |
 | `mca-rs` | Multichannel analyzer record |
 | `sscan-rs` | synApps sscan R2-12 (sscan and scanparm records, saveData's MDA writer, `scanProg.st`) |
-| `ip-rs` | synApps ip's SNL programs (`Federal.st`) and `devXxStrParm` device support |
+| `ip-rs` | synApps ip's SNL programs and `devXxStrParm` device support |
 | `epics-stream-rs` | StreamDevice (imported as `stream_rs`) |
 | `stream-pcre-sys` | C PCRE 8.45, the test oracle for `epics-stream-rs`'s Rust PCRE |
 | `epics-snc-rs` | Sequencer R2-2-9 SNL compiler: `.st` → Rust from `build.rs`, and the `snc-rs` CLI |

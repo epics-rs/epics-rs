@@ -32,6 +32,7 @@ pub fn register_ip_dbd() {
     // C defect fixed: ipSupport.dbd has no registrar(FederalRegistrar), so a
     // C IOC built on it answers `seq &Federal` with "Can't find sequencer".
     snl::federal::FederalRegistrar();
+    snl::keithley2k_dmm_mf40::Keithley2kDMM_mf40Registrar();
 }
 
 /// The body `MPCConvert`, `TPG261Convert`, `TelevacConvert` and

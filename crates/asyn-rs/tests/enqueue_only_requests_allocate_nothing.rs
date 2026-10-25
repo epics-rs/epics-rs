@@ -212,3 +212,49 @@ fn a_backlog_of_sections_allocates_nothing_once_one_came_back() {
     );
     runtime.shutdown();
 }
+
+/// A section ended before the actor reaches its sets has its callbacks fired
+/// by the actor, and its `updates` are back on the gate by then: a caller
+/// those callbacks release builds its next section in them.
+#[test]
+fn an_ended_sections_updates_are_back_before_its_callbacks_fire() {
+    const MARK: i32 = 7;
+    let (runtime, reason, posts, stall) = port("enqBackFirst");
+    let handle = runtime.port_handle();
+    let fired = Arc::new(std::sync::Barrier::new(2));
+    let at_mark = fired.clone();
+    let sub = handle
+        .interrupts()
+        .register_sync_callback(
+            asyn_rs::interrupt::InterruptFilter {
+                reason: Some(reason),
+                addr: Some(0),
+                ..Default::default()
+            },
+            move |v| {
+                if matches!(v.value, ParamValue::Int32(MARK)) {
+                    at_mark.wait();
+                    at_mark.wait();
+                }
+            },
+        )
+        .unwrap();
+    let mut gate = handle.callbacks_gate();
+    let stalled = stall.lock().unwrap();
+    handle
+        .set_params_and_notify_blocking(0, set(reason, 0))
+        .unwrap();
+    while posts.load(Ordering::SeqCst) == 0 {
+        std::thread::yield_now();
+    }
+    let mut updates = gate.updates();
+    updates.push(ParamSetValue::new(reason, 0, ParamValue::Int32(MARK)));
+    gate.open(0, None, updates).unwrap().end().unwrap();
+    drop(stalled);
+    fired.wait();
+    let spare = gate.updates();
+    fired.wait();
+    assert!(spare.capacity() > 0, "the section's updates came back late");
+    drop(sub);
+    runtime.shutdown();
+}

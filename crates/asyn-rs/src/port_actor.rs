@@ -510,16 +510,16 @@ fn run_claimed(
         actor.link_user(&mut user);
         (callback || matches!(op, RequestOp::LockPort(_))).then(|| actor.sync_lock.hold())
     })?;
-    let result = dispatch(access, &mut user, &op);
+    let result = match op {
+        RequestOp::CallParamCallbacks {
+            addr,
+            updates,
+            time_stamp,
+            gate: Some(gate),
+        } => access.with(|actor| actor.post_section(addr, updates, time_stamp, gate))?,
+        op => dispatch(access, &mut user, &op),
+    };
     drop(held);
-    if let RequestOp::CallParamCallbacks {
-        updates,
-        gate: Some(gate),
-        ..
-    } = op
-    {
-        gate.give_back(updates);
-    }
     if callback {
         access.with(|actor| actor.settle_block(&user))?;
     }
@@ -1996,6 +1996,37 @@ impl PortActor {
             .admits(msg.user.block_token, self.dp_key(msg.user.addr))
     }
 
+    /// A [`RequestOp::CallParamCallbacks`] of a caller's section, as
+    /// [`Self::dispatch_io`] runs one, but its `updates` go back to the
+    /// caller once stored, before any callback fires: a caller those
+    /// callbacks release finds them there for its next section.
+    fn post_section(
+        &mut self,
+        addr: i32,
+        updates: Vec<crate::request::ParamSetValue>,
+        time_stamp: Option<SystemTime>,
+        gate: crate::request::SectionCallbacks,
+    ) -> AsynResult<RequestResult> {
+        let base = self.driver.base_mut();
+        if let Some(ts) = time_stamp {
+            base.set_time_stamp(ts);
+        }
+        let mut failed = set_params(base, &updates);
+        let fire = gate.owe(addr, &updates);
+        gate.give_back(updates);
+        if fire {
+            gate.fire(|list| {
+                if let Err(e) = base.call_param_callbacks(list) {
+                    failed.get_or_insert(e);
+                }
+            });
+        }
+        match failed {
+            Some(e) => Err(e),
+            None => Ok(RequestResult::write_ok()),
+        }
+    }
+
     /// C `portThread` after a callback (:931-934): the user's counted blocks
     /// become holders, and what the heap already took that they now hold back
     /// leaves it — re-tested through the gate, so a device block diverts only
@@ -3122,7 +3153,11 @@ impl PortActor {
                     }
                 };
                 match gate {
-                    Some(gate) => gate.run(*addr, updates, flush),
+                    Some(gate) => {
+                        if gate.owe(*addr, updates) {
+                            gate.fire(flush);
+                        }
+                    }
                     None => {
                         flush(*addr);
                         let mut further = Vec::new();

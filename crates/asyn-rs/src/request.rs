@@ -1900,27 +1900,31 @@ pub enum SectionCallbacks {
 }
 
 impl SectionCallbacks {
-    /// The actor, sets done: `flush` each list the request owes, the
-    /// request's first, unless an open section holds them.
-    pub(crate) fn run(&self, addr: i32, updates: &[ParamSetValue], flush: impl FnMut(i32)) {
+    /// The actor, sets done: record each list the request owes, the
+    /// request's first; whether they [`Self::fire`] now, which they do
+    /// unless an open section holds them.
+    pub(crate) fn owe(&self, addr: i32, updates: &[ParamSetValue]) -> bool {
         match self {
-            // Only the actor takes this lock, so firing under it waits on no
-            // one.
             Self::Open { sections, seq } => {
                 let mut lists = sections.held.lock();
                 lists.push(addr);
                 push_further_lists(addr, updates, &mut lists);
-                if !sections.hold(*seq) {
-                    lists.drain(..).for_each(flush);
-                }
+                !sections.hold(*seq)
             }
-            Self::Held(sections) => sections.held.lock().drain(..).for_each(flush),
+            Self::Held(_) => true,
         }
     }
 
-    /// The actor, done with the request: an open section's `updates` go back
-    /// to its caller's gate.
-    pub(crate) fn give_back(self, updates: Vec<ParamSetValue>) {
+    /// The actor: `flush` each list owed. Only the actor takes this lock, so
+    /// firing under it waits on no one.
+    pub(crate) fn fire(&self, flush: impl FnMut(i32)) {
+        let (Self::Open { sections, .. } | Self::Held(sections)) = self;
+        sections.held.lock().drain(..).for_each(flush);
+    }
+
+    /// The actor, sets done: an open section's `updates` go back to its
+    /// caller's gate.
+    pub(crate) fn give_back(&self, updates: Vec<ParamSetValue>) {
         if let Self::Open { sections, .. } = self {
             sections.give_back(updates);
         }

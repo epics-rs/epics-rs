@@ -10,6 +10,7 @@ epics-snc-rs and it runs on epics-seq-rs.
 |---|---|---|
 | Federal ERO-1071 encoder reader | `snl::federal` | `db/Federal.db` |
 | Keithley 2000/2700 DMM, 40-channel scanner | `snl::keithley2k_dmm_mf40` | `db/Keithley2kDMM_mf40.db` |
+| Keithley 6517A electrometer, 10-channel scanner | `snl::keithley65xx_em` | `db/Keithley65xxEM.db` |
 
 `db/` is vendored from `ipApp/Db` unchanged, so an `st.cmd` that loads
 `$(IP)/db/Federal.db` resolves when `IP` is set to [`IP_DIR`](src/lib.rs).

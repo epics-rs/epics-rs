@@ -54,7 +54,9 @@ pub async fn boot(meter: &Meter, channels: u32) -> Ioc {
         .into_iter()
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect();
+    let (asyn_name, asyn_factory) = asyn_rs::asyn_record::asyn_record_factory();
     let (db, _) = IocBuilder::new()
+        .register_record_type(asyn_name, move || asyn_factory())
         .register_record_type("scalcout", || Box::new(ScalcoutRecord::default()))
         .register_dynamic_device_support(&DEVICE_ROWS, device_support_factory())
         .db_file(

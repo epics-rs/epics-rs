@@ -33,6 +33,7 @@ pub fn register_ip_dbd() {
     // C IOC built on it answers `seq &Federal` with "Can't find sequencer".
     snl::federal::FederalRegistrar();
     snl::keithley2k_dmm_mf40::Keithley2kDMM_mf40Registrar();
+    snl::keithley65xx_em::Keithley65xxEMRegistrar();
 }
 
 /// The body `MPCConvert`, `TPG261Convert`, `TelevacConvert` and

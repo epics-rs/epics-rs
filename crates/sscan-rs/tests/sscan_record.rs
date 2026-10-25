@@ -624,6 +624,9 @@ record(sscan, "S") {
     assert!(f64_of(&db, "DET") > 0.0);
 }
 
+/// Each scan reads the other while both run: no deadlock, and no read
+/// fails — a failed `dbGet` leaves the detector at its last value, 0 at the
+/// first point.
 #[epics_base_rs::epics_test]
 async fn two_scans_reading_each_other_locally_do_not_deadlock() {
     let db = ioc(r#"record(sscan, "S1") {
@@ -633,6 +636,7 @@ async fn two_scans_reading_each_other_locally_do_not_deadlock() {
   field(P1SP, "0")
   field(P1EP, "1")
   field(D01PV, "S2.CPT")
+  field(D02PV, "S2.MPTS")
 }
 record(sscan, "S2") {
   field(PRIO, "HIGH")
@@ -642,14 +646,19 @@ record(sscan, "S2") {
   field(P1SP, "0")
   field(P1EP, "1")
   field(D01PV, "S1.CPT")
+  field(D02PV, "S1.MPTS")
 }"#)
     .await;
-    connected(&db, "S1", &["P1NV", "D01NV"]).await;
-    connected(&db, "S2", &["P1NV", "D01NV"]).await;
+    connected(&db, "S1", &["P1NV", "D01NV", "D02NV"]).await;
+    connected(&db, "S2", &["P1NV", "D01NV", "D02NV"]).await;
     start(&db, "S1").await;
     start(&db, "S2").await;
     finished(&db, "S1").await;
     finished(&db, "S2").await;
+    for scan in ["S1", "S2"] {
+        let mpts = arr(&db, &format!("{scan}.D02DA"), 2000);
+        assert!(mpts.iter().all(|v| *v == 2000.0), "{scan}.D02DA");
+    }
 }
 
 #[epics_base_rs::epics_test]

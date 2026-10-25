@@ -59,7 +59,8 @@ pub(crate) use processing::{NotifiedRead, ReadPolicy, seed_record_constants};
 #[cfg(feature = "test-hooks")]
 pub use record_lock::fresh_hold_hook;
 pub(crate) use record_lock::{
-    CycleHints, FrameGate, InFrame, InitPass, LockRecord, SetGuard, owe_callback, owe_cvt,
+    CycleHints, FrameGate, InFrame, InitPass, LockRecord, OwedRead, ReadPark, SetGuard,
+    owe_callback, owe_cvt, owe_read, serve_owed_reads,
 };
 pub use record_lock::{
     LockSetInfo, LockSetReport, ManyRecordWriteGuard, RecordWriteGuard, in_sync_driver_wait,
@@ -746,9 +747,6 @@ struct PvDatabaseInner {
     /// simple PV spelled `REC.FLD` shadows that field, so a cached link
     /// address must not outlive one appearing.
     simple_pvs_revision: std::sync::atomic::AtomicU64,
-    /// [`AsyncDbHandle::db_get`]'s last fresh read of each name it was asked
-    /// for: what it serves while that record's lock set is held elsewhere.
-    db_get_last: parking_lot::Mutex<HashMap<Box<[u8]>, crate::server::snapshot::Snapshot>>,
     /// Wake-up for servers holding channels on this database: something was
     /// removed, re-check what you serve. Carries no name — the receiver
     /// tests the target it already holds
@@ -1552,7 +1550,6 @@ impl PvDatabase {
                         crate::runtime::sync::CMutex::PvdBucket,
                     ),
                     simple_pvs_revision: std::sync::atomic::AtomicU64::new(0),
-                    db_get_last: parking_lot::Mutex::new(HashMap::new()),
                     pv_destroyed_tx: tokio::sync::broadcast::channel(16).0,
                     breakpoints: ArcSwapOption::empty(),
                     debugging: std::sync::atomic::AtomicBool::new(false),

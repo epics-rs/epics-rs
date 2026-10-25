@@ -1104,9 +1104,7 @@ impl AsyncDbHandle {
     /// Takes no record's lock set, as C's takes no lock: sscan resolves a PV
     /// name from `special` while it holds its own record
     /// (`sscanRecord.c:2335`), and two scans naming each other's fields at
-    /// once must not each wait on the other's set. A record that is free is
-    /// read once, so [`Self::db_get`] has an answer for the name while the
-    /// record is busy later.
+    /// once must not each wait on the other's set.
     pub fn name_to_addr(&self, name: impl AsRef<[u8]>) -> Option<u32> {
         let name = name.as_ref();
         let db = self.db()?;
@@ -1114,9 +1112,7 @@ impl AsyncDbHandle {
             return Some(pv.snapshot().value.count() as u32);
         }
         let (base, field) = super::parse_pv_name(name);
-        let count = db.get_record(base)?.resolve_addr(field)?;
-        db.db_get_snapshot(name, None);
-        Some(count)
+        db.get_record(base)?.resolve_addr(field)
     }
 
     /// C `dbGet(&addr, dbr_type, buf, &options, &count, NULL)` with
@@ -1127,10 +1123,9 @@ impl AsyncDbHandle {
     /// `dbr_type` cannot hold.
     ///
     /// `own` is the calling record when it calls from inside its own
-    /// processing. C's `dbGet` takes no lock, so this never waits for one:
-    /// the caller's own fields are read from `own`, and another record whose
-    /// lock set is held elsewhere serves its last fresh read here or at
-    /// [`Self::name_to_addr`].
+    /// processing, its fields read from `own`. C's `dbGet` takes no lock;
+    /// another record whose lock set is held elsewhere is read by its holder
+    /// as it lets the set go — see [`PvDatabase::db_get_snapshot`].
     pub fn db_get(
         &self,
         name: impl AsRef<[u8]>,
@@ -1148,9 +1143,7 @@ impl AsyncDbHandle {
     /// device keeps to reach it later. A `dbCommon` `DBF_NOACCESS` name
     /// (`TIME`) resolves, as in C, with no field type. Takes no lock: `own`
     /// is the calling record as for [`Self::db_get`], and another record's
-    /// runtime-typed field is read only while that record is free. A free
-    /// record is read once, as at [`Self::name_to_addr`], so [`Self::db_get`]
-    /// of `record.field` has an answer while the record is busy later.
+    /// runtime-typed field is read only while that record is free.
     pub fn name_to_dbaddr(
         &self,
         name: impl AsRef<[u8]>,
@@ -1169,7 +1162,6 @@ impl AsyncDbHandle {
             });
         }
         let no_elements = cell.resolve_addr(&field)?;
-        db.db_get_snapshot(&[record.as_bytes(), b".", field.as_bytes()].concat(), own);
         let own = own.and_then(|own| (own.name() == record.as_bytes()).then_some(own.record()));
         let field_type = cell.addressed_field_type(&field, own);
         Some(DbAddr {
@@ -13598,8 +13590,13 @@ mod owed_tests {
 }
 
 impl PvDatabase {
-    /// [`AsyncDbHandle::db_get`]'s read of `name`, before the conversion:
-    /// fresh when it can be read without waiting, else the last fresh read.
+    /// [`AsyncDbHandle::db_get`]'s read of `name`, before the conversion.
+    ///
+    /// C's `dbGet` reads a record another thread holds without its lock; a
+    /// record whose set is held elsewhere is read here by that holder, at its
+    /// release ([`super::owe_read`]). While this thread waits it serves the
+    /// reads owed to its own record's set, so two records each reading the
+    /// other from inside its own processing do not wait on each other.
     pub(crate) fn db_get_snapshot(
         &self,
         name: &[u8],
@@ -13611,26 +13608,93 @@ impl PvDatabase {
         }
         let (base, field) = super::parse_pv_name(name);
         let cell = self.get_record(base)?;
-        let field = cell.canonical_field(field);
+        let field = cell.canonical_field(field).into_owned();
+        cell.no_elements(&field)?;
         let own = own.and_then(|own| Some((self.get_record(own.name())?, own)));
-        let policy = ReadPolicy::NoWait {
-            own: own.as_ref().map(|(cell, own)| (&**cell, *own)),
-        };
-        let fresh = self.channel_snapshot_for_field_guarded(
-            &cell,
-            &field,
+        let own = own.as_ref().map(|(cell, own)| (&**cell, *own));
+        if let Some(read) = self.db_get_held(&cell, &field, own) {
+            return read;
+        }
+        let read = Arc::new(OwedDbGet {
+            db: Arc::downgrade(&self.inner),
+            cell: Arc::clone(&cell),
+            field,
+            got: parking_lot::Mutex::new(None),
+            reader: std::thread::current(),
+        });
+        super::owe_read(&cell, read.clone());
+        let _park = own.map(|(cell, _)| super::ReadPark::new(cell));
+        loop {
+            if let Some(got) = read.got.lock().take() {
+                return got;
+            }
+            if let Some(own) = own {
+                super::serve_owed_reads(own);
+            }
+            // The holder can let the set go between its last look at what it
+            // owed and its unlock.
+            if let Some(got) = self.db_get_held(&cell, &read.field, own) {
+                *read.got.lock() = Some(None);
+                return got;
+            }
+            std::thread::park_timeout(std::time::Duration::from_millis(1));
+        }
+    }
+
+    /// `field` of `cell` under a hold of its set, `None` while another thread
+    /// holds it. Held, a read that fails is the field's own answer.
+    fn db_get_held(
+        &self,
+        cell: &Arc<RecordCell>,
+        field: &str,
+        own: Option<(&RecordCell, OwnRecord<'_>)>,
+    ) -> Option<Option<crate::server::snapshot::Snapshot>> {
+        let _held = cell.lock_record().try_acquire()?;
+        Some(self.channel_snapshot_for_field_guarded(
+            cell,
+            field,
             false,
             &mut std::collections::HashSet::new(),
-            policy,
-        );
-        let mut last = self.inner.db_get_last.lock();
-        match fresh {
-            Some(snap) => {
-                last.insert(name.into(), snap.clone());
-                Some(snap)
-            }
-            None => last.get(name).cloned(),
+            ReadPolicy::NoWait { own },
+        ))
+    }
+}
+
+/// A [`PvDatabase::db_get_snapshot`] owed to the set of a record held
+/// elsewhere. `got` is `Some` once it is answered, by the set's holder or by
+/// the reader itself.
+struct OwedDbGet {
+    db: std::sync::Weak<super::PvDatabaseInner>,
+    cell: Arc<RecordCell>,
+    field: String,
+    got: parking_lot::Mutex<Option<Option<crate::server::snapshot::Snapshot>>>,
+    reader: std::thread::Thread,
+}
+
+impl super::OwedRead for OwedDbGet {
+    fn serve(&self, own: Option<(&RecordCell, OwnRecord<'_>)>) {
+        let mut got = self.got.lock();
+        // A record a merge moved off this set is left to the reader's retry.
+        if got.is_some() || !self.cell.lock_record().held_by_this_thread() {
+            return;
         }
+        let Some(inner) = self.db.upgrade() else {
+            return;
+        };
+        let read = PvDatabase { inner }.channel_snapshot_for_field_guarded(
+            &self.cell,
+            &self.field,
+            false,
+            &mut std::collections::HashSet::new(),
+            ReadPolicy::NoWait { own },
+        );
+        // Served from inside a holder's processing, a member that holder has
+        // borrowed does not read: the reader retries once the set is free.
+        if read.is_none() && own.is_some() {
+            return;
+        }
+        *got = Some(read);
+        self.reader.unpark();
     }
 }
 

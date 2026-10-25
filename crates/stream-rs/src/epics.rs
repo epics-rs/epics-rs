@@ -1035,13 +1035,11 @@ impl StreamHooks {
         };
         let name = [addr.record.as_bytes(), b".", field.as_bytes()].concat();
         let nelem = addr.no_elements as usize;
-        let snap = if own {
-            (self.shared.slot)
-                .with_own(|rec, own| db.db_get(&name, dbr, nelem, Some(own.of(&*rec))))
-                .flatten()
-        } else {
-            db.db_get(&name, dbr, nelem, None)
-        };
+        // The frame for another record's field too: it is how a dbGet that
+        // waits for that record serves the reads owed to this one.
+        let snap = (self.shared.slot)
+            .with_own(|rec, own| db.db_get(&name, dbr, nelem, Some(own.of(&*rec))))
+            .unwrap_or_else(|| db.db_get(&name, dbr, nelem, None));
         let Some(snap) = snap else {
             stream_error(&cmsg!(format!(
                 "{}: dbGet({record}.{field}, {}) failed\n",

@@ -271,58 +271,63 @@ async fn db_get_from_inside_a_record_does_not_lock_it_again() {
     assert_eq!(nelem, Some(1));
 }
 
+/// C's `dbGet` reads a record another thread holds; here its holder reads
+/// it as it lets the set go, so the read sees what the hold wrote and a field
+/// never named before reads too.
 #[epics_macros_rs::epics_test]
-async fn db_get_of_a_record_held_elsewhere_serves_its_last_read() {
+async fn db_get_of_a_record_held_elsewhere_reads_it_at_the_holders_release() {
     let db = ioc().await;
-    let h = db.async_handle();
-    assert_eq!(h.name_to_addr("AI.VAL"), Some(1));
     let (held_tx, held_rx) = std::sync::mpsc::channel();
-    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+    let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
     let holder = {
         let h = db.async_handle();
         std::thread::spawn(move || {
-            h.with_record("AI", |_| {
+            h.with_record("AI", |rec| {
                 held_tx.send(()).unwrap();
-                done_rx.recv().unwrap();
+                go_rx.recv().unwrap();
+                rec.put_field("VAL", EpicsValue::Double(7.5)).unwrap();
             });
         })
     };
     held_rx.recv().unwrap();
-    // The read `name_to_addr` took, not a wait for the holder.
-    let got = h.db_get("AI.VAL", DbFieldType::Double, 1, None);
-    // A field never read before has nothing to serve while AI is held.
-    let unread = h.db_get("AI.HOPR", DbFieldType::Double, 1, None);
-    done_tx.send(()).unwrap();
+    let reader = {
+        let h = db.async_handle();
+        std::thread::spawn(move || {
+            (
+                h.db_get("AI.VAL", DbFieldType::Double, 1, None),
+                h.db_get("AI.HOPR", DbFieldType::Double, 1, None),
+            )
+        })
+    };
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    go_tx.send(()).unwrap();
     holder.join().unwrap();
-    let got = got.expect("the last read is served");
-    assert_eq!(got.value, EpicsValue::Double(1.5));
-    assert_eq!(got.units().map(|u| u.to_string()), Some("mm".into()));
-    assert!(unread.is_none());
+    let (val, hopr) = reader.join().unwrap();
+    let val = val.expect("read at the release");
+    assert_eq!(val.value, EpicsValue::Double(7.5));
+    assert_eq!(val.units().map(|u| u.to_string()), Some("mm".into()));
+    assert_eq!(hopr.map(|s| s.value), Some(EpicsValue::Double(10.0)));
 }
 
-/// C's `dbGet` reads through the `DBADDR` `dbNameToAddr` gave, so a field a
-/// device resolved with `name_to_dbaddr` (stream's `%(record.FIELD)`) is read
-/// while its record is held elsewhere, as one `name_to_addr` resolved is.
+/// Two records each reading the other from inside its own hold: each
+/// serves the read the other owes it while it waits for its own.
 #[epics_macros_rs::epics_test]
-async fn db_get_of_a_dbaddr_held_elsewhere_serves_its_last_read() {
+async fn two_records_reading_each_other_from_their_own_holds_both_read() {
     let db = ioc().await;
-    let h = db.async_handle();
-    let addr = h.name_to_dbaddr("AI.HOPR", None).expect("resolves");
-    let (held_tx, held_rx) = std::sync::mpsc::channel();
-    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
-    let holder = {
-        let h = db.async_handle();
+    let both = Arc::new(std::sync::Barrier::new(2));
+    let read = |me: &'static str, other: &'static str| {
+        let (h, both) = (db.async_handle(), both.clone());
         std::thread::spawn(move || {
-            h.with_record("AI", |_| {
-                held_tx.send(()).unwrap();
-                done_rx.recv().unwrap();
-            });
+            h.with_own(me, |rec, own| {
+                both.wait();
+                h.db_get(other, DbFieldType::Double, 1, Some(own.of(&*rec)))
+                    .map(|s| s.value)
+            })
+            .flatten()
         })
     };
-    held_rx.recv().unwrap();
-    let name = format!("{}.{}", addr.record.to_str_lossy(), addr.field);
-    let got = h.db_get(&name, DbFieldType::Double, 1, None);
-    done_tx.send(()).unwrap();
-    holder.join().unwrap();
-    assert_eq!(got.map(|s| s.value), Some(EpicsValue::Double(10.0)));
+    let a = read("AI", "AO.HOPR");
+    let b = read("AO", "AI.HOPR");
+    assert_eq!(a.join().unwrap(), Some(EpicsValue::Double(10.0)));
+    assert_eq!(b.join().unwrap(), Some(EpicsValue::Double(10.0)));
 }

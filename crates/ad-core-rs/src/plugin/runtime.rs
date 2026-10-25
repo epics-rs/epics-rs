@@ -1900,8 +1900,7 @@ impl SharedProcessorInner {
 
     /// A param batch carrying only the current DroppedArrays / queue counters,
     /// used when an array is dropped before processing (B5).
-    fn dropped_arrays_only_batch(&self) -> ParamBatch {
-        let mut batch = ParamBatch::empty();
+    fn dropped_arrays_only_batch(&self, mut batch: ParamBatch) -> ParamBatch {
         self.push_status_params(&mut batch.sets);
         batch
     }
@@ -2218,8 +2217,8 @@ impl ProcessOutput {
     }
 }
 
-/// Collected param updates ready to be flushed to the actor.
-/// Produced by `build_publish_batch()`, consumed by async `flush()`.
+/// Collected param updates ready to be flushed to the actor, built only in
+/// the `updates` of [`ParamBatch::new`] and posted only through the gate.
 struct ParamBatch {
     /// In C call order, every address in one request: the actor flushes list
     /// 0 and then each further list in the order the batch first set it.
@@ -2229,13 +2228,6 @@ struct ParamBatch {
 }
 
 impl ParamBatch {
-    fn empty() -> Self {
-        Self {
-            sets: Vec::new(),
-            time_stamp: None,
-        }
-    }
-
     /// An empty batch in the `updates` `gate` hands out, which go back to
     /// it once the actor has run the section they are stored in.
     fn new(gate: &CallbacksGate) -> Self {
@@ -2245,17 +2237,12 @@ impl ParamBatch {
         }
     }
 
-    /// Store and fire the callbacks in one request, for a batch no delivery
-    /// comes between. Call from async context.
-    async fn flush(self, port: &PortHandle) {
-        flush_failed(match self.time_stamp {
-            Some(ts) => {
-                port.set_time_stamp_params_and_notify(0, ts, self.sets)
-                    .await
-            }
-            None if !self.sets.is_empty() => port.set_params_and_notify(0, self.sets).await,
-            None => Ok(()),
-        });
+    /// Store and fire the callbacks in one section, for a batch no delivery
+    /// comes between.
+    fn flush(self, gate: &mut CallbacksGate) {
+        if let Some(callbacks) = self.store(gate) {
+            flush_failed(callbacks.end());
+        }
     }
 
     /// The sets, queued ahead of a delivery; the callbacks fire when the
@@ -3676,22 +3663,21 @@ pub fn create_plugin_runtime_with_output<P: NDPluginProcess>(
 /// named `QUEUE_FREE` and the reconciled semantics are *free slots*, matching
 /// C++ `NDPluginDriverQueueFree = queueSize - pending()`.
 fn queue_status_batch(
+    mut batch: ParamBatch,
     plugin_params: &PluginBaseParams,
     max_capacity: usize,
     free: i32,
 ) -> ParamBatch {
     use asyn_rs::request::ParamSetValue;
-    ParamBatch {
-        time_stamp: None,
-        sets: vec![
-            ParamSetValue::new(
-                plugin_params.queue_size,
-                0,
-                ParamValue::Int32(max_capacity as i32),
-            ),
-            ParamSetValue::new(plugin_params.queue_use, 0, ParamValue::Int32(free)),
-        ],
-    }
+    batch.sets.extend([
+        ParamSetValue::new(
+            plugin_params.queue_size,
+            0,
+            ParamValue::Int32(max_capacity as i32),
+        ),
+        ParamSetValue::new(plugin_params.queue_use, 0, ParamValue::Int32(free)),
+    ]);
+    batch
 }
 
 /// One array handed to a callback thread.
@@ -4069,7 +4055,6 @@ fn plugin_data_loop<P: NDPluginProcess>(
                             // (NDPluginDriver.cpp:383-418): the producer ran
                             // them before `trySend`, which is where C runs
                             // them. Nothing is left to classify.
-                            let port = shared.lock().port_handle.clone();
                             // G2: update QueueSize/QueueFree from the channel
                             // depth (C++ NDPluginDriver.cpp:512-513). QueueFree
                             // = max_capacity - pending. Only flush when the
@@ -4078,14 +4063,19 @@ fn plugin_data_loop<P: NDPluginProcess>(
                             let free = max_cap.saturating_sub(array_rx.pending()) as i32;
                             let queue_batch = if last_queue_free != Some(free) {
                                 last_queue_free = Some(free);
-                                Some(queue_status_batch(&plugin_params, max_cap, free))
+                                Some(queue_status_batch(
+                                    ParamBatch::new(&callbacks_gate),
+                                    &plugin_params,
+                                    max_cap,
+                                    free,
+                                ))
                             } else {
                                 None
                             };
                             pool.dispatch(msg);
                             in_flight += 1;
                             if let Some(qb) = queue_batch {
-                                qb.flush(&port).await;
+                                qb.flush(&mut callbacks_gate);
                             }
                         }
                         None => break,
@@ -4111,11 +4101,10 @@ fn plugin_data_loop<P: NDPluginProcess>(
                 // drops every array — every array compressed on a non-aware
                 // plugin, say — would leave the readback reading 0 forever.
                 _ = admission.counted_drop() => {
-                    let (out, port) = {
-                        let guard = shared.lock();
-                        (guard.dropped_arrays_only_batch(), guard.port_handle.clone())
-                    };
-                    out.flush(&port).await;
+                    let out = shared
+                        .lock()
+                        .dropped_arrays_only_batch(ParamBatch::new(&callbacks_gate));
+                    out.flush(&mut callbacks_gate);
                 }
                 // C `driverCallback` republishes QueueFree after each
                 // `trySend` (`:447-448`). With a callback thread idle, C's
@@ -4128,10 +4117,13 @@ fn plugin_data_loop<P: NDPluginProcess>(
                         let free = max_cap.saturating_sub(array_rx.pending()) as i32;
                         if last_queue_free != Some(free) {
                             last_queue_free = Some(free);
-                            let port = shared.lock().port_handle.clone();
-                            queue_status_batch(&plugin_params, max_cap, free)
-                                .flush(&port)
-                                .await;
+                            queue_status_batch(
+                                ParamBatch::new(&callbacks_gate),
+                                &plugin_params,
+                                max_cap,
+                                free,
+                            )
+                            .flush(&mut callbacks_gate);
                         }
                     }
                 }
@@ -4350,14 +4342,10 @@ fn plugin_data_loop<P: NDPluginProcess>(
                                             // readback is owed (C `:387-390`
                                             // and `:436-441`, then
                                             // `callParamCallbacks` at `:751`).
-                                            let (out, port) = {
-                                                let guard = shared.lock();
-                                                (
-                                                    guard.dropped_arrays_only_batch(),
-                                                    guard.port_handle.clone(),
-                                                )
-                                            };
-                                            out.flush(&port).await;
+                                            let out = shared.lock().dropped_arrays_only_batch(
+                                                ParamBatch::new(&callbacks_gate),
+                                            );
+                                            out.flush(&mut callbacks_gate);
                                         }
                                     }
                                     Some(array) => {
@@ -4370,17 +4358,16 @@ fn plugin_data_loop<P: NDPluginProcess>(
                                         match admission.classify(&array) {
                                             Admission::Throttled => {}
                                             Admission::DropCompressed => {
-                                                let (out, port) = {
+                                                let out = {
                                                     let guard = shared.lock();
                                                     guard
                                                         .dropped_arrays
                                                         .fetch_add(1, Ordering::AcqRel);
-                                                    (
-                                                        guard.dropped_arrays_only_batch(),
-                                                        guard.port_handle.clone(),
-                                                    )
+                                                    guard.dropped_arrays_only_batch(ParamBatch::new(
+                                                        &callbacks_gate,
+                                                    ))
                                                 };
-                                                out.flush(&port).await;
+                                                out.flush(&mut callbacks_gate);
                                             }
                                             Admission::Admit => {
                                                 let po = shared.lock().process_and_publish(

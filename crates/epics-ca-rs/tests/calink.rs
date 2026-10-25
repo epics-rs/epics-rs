@@ -790,7 +790,7 @@ fn ca_modifier_link_classifies_as_ca() {
 #[tokio::test(flavor = "multi_thread")]
 #[serial(epics_env)]
 async fn calink_warms_cp_holder_via_iocapplication_run_seam() {
-    use epics_base_rs::server::ioc_app::IocApplication;
+    use epics_base_rs::server::ioc_app::{IocApplication, RunOutcome};
 
     let server = CaServer::builder()
         .port(0)
@@ -839,7 +839,7 @@ async fn calink_warms_cp_holder_via_iocapplication_run_seam() {
                 .expect("the test is awaited on the IOC's reactor");
             move |db| epics_ca_rs::calink::calink_link_set_install(db, reactor)
         })
-        .run(|config| async move {
+        .run_outcome(|config| async move {
             // By here iocInit has already run `setup_cp_links` and the
             // external-link wait. Poll the holder until the warm's monitor
             // event drives VAL to the source's 5.0 — with NO explicit
@@ -862,7 +862,8 @@ async fn calink_warms_cp_holder_via_iocapplication_run_seam() {
             }
         })
         .await;
-    result.expect("IOC run returns Ok once the runner is done");
+    let outcome = result.expect("IOC run returns Ok once the runner is done");
+    assert_eq!(outcome, RunOutcome::Served);
     let seen = seen_rx.try_recv().expect("the IOC ran the protocol runner");
     assert_eq!(
         seen,

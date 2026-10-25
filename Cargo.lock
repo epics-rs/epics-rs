@@ -13,7 +13,6 @@ dependencies = [
  "epics-libcom-rs",
  "fearless_simd 1.0.0",
  "fearless_simd_macros",
- "futures-util",
  "parking_lot",
  "source-guard",
  "thiserror 2.0.18",

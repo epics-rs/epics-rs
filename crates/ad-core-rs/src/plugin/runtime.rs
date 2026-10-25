@@ -49,7 +49,7 @@ use asyn_rs::param::ParamValue;
 
 use super::channel::{
     Admission, ArrayMessage, NDArrayOutput, NDArrayReceiver, NDArraySender, PublishOutcome,
-    WeakNDArraySender, ndarray_channel,
+    WeakNDArraySender, ndarray_channel, publish_each,
 };
 use super::params::PluginBaseParams;
 use super::wiring::WiringRegistry;
@@ -1791,10 +1791,6 @@ impl SharedProcessorInner {
         }
     }
 
-    fn senders_for(&self, output: &ProcessOutput) -> OutputSenders {
-        self.delivery.senders(!output.addressed.is_empty())
-    }
-
     /// Process array and return a `ProcessOutput`. Does NOT send to actor.
     /// The returned output must be published and flushed by the caller in async context.
     fn process_and_publish<P: NDPluginProcess>(
@@ -2112,46 +2108,34 @@ struct ProcessOutput {
     addressed: Vec<(usize, PublishedArray)>,
 }
 
-/// The downstream senders a `ProcessOutput` is published to, cloned under
-/// the shared lock and used after it is released.
-struct OutputSenders {
-    /// Address 0, where `endProcessCallbacks` delivers.
-    main: Vec<NDArraySender>,
-    /// Per address; filled only when the output has addressed arrays.
-    by_addr: Vec<Vec<NDArraySender>>,
-}
-
 impl ProcessOutput {
     /// The only way an output's arrays leave: store the batch, deliver the
     /// arrays, then fire the callbacks — C's order under the port lock
     /// (NDPluginDriver.cpp:332, :539), so whoever the delivery reaches reads
     /// this frame's params from the port.
     ///
-    /// Broadcast frames are published to every sender concurrently (independent
-    /// backpressure per sender). Scatter frames are routed to a single consumer
-    /// via `scatter_publish`, which advances the persistent `scatter_cursor`.
-    /// Arrays are published in order — the next array's fan-out starts only
-    /// after the previous one completes.
+    /// Broadcast frames are published to each sender in turn. Scatter frames
+    /// are routed to a single consumer via `scatter_publish`, which advances
+    /// the persistent `scatter_cursor`.
     async fn complete(
         self,
         callbacks_gate: &mut CallbacksGate,
-        senders: &OutputSenders,
+        delivery: &Delivery,
         scatter_cursor: &mut usize,
     ) {
         let callbacks = self.batch.store(callbacks_gate);
         for (addr, arr) in &self.addressed {
-            if let Some(subscribers) = senders.by_addr.get(*addr) {
-                let futs = subscribers.iter().map(|s| s.publish(arr.clone()));
-                futures_util::future::join_all(futs).await;
+            if let Some(subscribers) = delivery.senders(*addr) {
+                publish_each(&subscribers, arr.clone()).await;
             }
         }
-        let main = senders.main.as_slice();
-        for arr in &self.arrays {
-            if self.scatter {
-                Self::scatter_publish(arr, main, scatter_cursor).await;
-            } else {
-                let futs = main.iter().map(|s| s.publish(arr.clone()));
-                futures_util::future::join_all(futs).await;
+        if let Some(main) = delivery.senders(0) {
+            for arr in &self.arrays {
+                if self.scatter {
+                    Self::scatter_publish(arr, &main, scatter_cursor).await;
+                } else {
+                    publish_each(&main, arr.clone()).await;
+                }
             }
         }
         if let Some(callbacks) = callbacks {
@@ -2179,8 +2163,8 @@ impl ProcessOutput {
     /// (`setArrayInterrupt(0)`) and is therefore not a scatter target, so it
     /// must not consume a round-robin slot.
     async fn scatter_publish(arr: &PublishedArray, senders: &[NDArraySender], cursor: &mut usize) {
-        let active: Vec<&NDArraySender> = senders.iter().filter(|s| s.is_enabled()).collect();
-        let n = active.len();
+        let active = || senders.iter().filter(|s| s.is_enabled());
+        let n = active().count();
         if n == 0 {
             return;
         }
@@ -2188,7 +2172,12 @@ impl ProcessOutput {
             let target = *cursor % n;
             *cursor = cursor.wrapping_add(1);
             let is_last = attempt == n - 1;
-            match active[target].publish_scatter(arr.clone(), is_last).await {
+            let outcome = match active().nth(target) {
+                Some(node) => node.publish_scatter(arr.clone(), is_last).await,
+                // Disabled since it was counted.
+                None => PublishOutcome::Disabled,
+            };
+            match outcome {
                 // Delivered: done. (In blocking mode publish always delivers,
                 // so the loop breaks on the first attempt — matching C++ where
                 // a blocking scatter calls processCallbacks inline and breaks.)
@@ -3891,6 +3880,7 @@ fn spawn_worker_pool<P: NDPluginProcess>(
 /// output senders are [`Delivery`]'s.
 async fn complete_frame(
     shared: &Arc<parking_lot::Mutex<SharedProcessorInner>>,
+    delivery: &Delivery,
     item: DoneItem,
     callbacks_gate: &mut CallbacksGate,
     scatter_cursor: &mut usize,
@@ -3901,19 +3891,17 @@ async fn complete_frame(
         elapsed_ms,
     } = item;
     let batch = ParamBatch::new(callbacks_gate);
-    let (output, senders) = {
+    let output = {
         let mut guard = shared.lock();
-        let output = match processed {
+        match processed {
             Some((result, begin)) => {
                 guard.post_process(batch, &msg.array, result, &begin, elapsed_ms)
             }
             None => guard.unprocessed(batch, elapsed_ms),
-        };
-        let senders = guard.senders_for(&output);
-        (output, senders)
+        }
     };
     output
-        .complete(callbacks_gate, &senders, scatter_cursor)
+        .complete(callbacks_gate, delivery, scatter_cursor)
         .await;
     // msg dropped here → completion signaled (if tracked)
 }
@@ -4007,6 +3995,7 @@ fn plugin_data_loop<P: NDPluginProcess>(
         // The port's only `CallbacksGate`: every frame's sets and callbacks
         // go through it, one section at a time.
         let mut callbacks_gate = shared.lock().port_handle.callbacks_gate();
+        let delivery = Arc::clone(&shared.lock().delivery);
         // Barriers held until the array queue drains. A barrier acks only at
         // full quiescence — params applied AND no queued arrays — because a
         // param applied while an older array still waits in the queue would
@@ -4090,7 +4079,7 @@ fn plugin_data_loop<P: NDPluginProcess>(
                     match done {
                         Some(item) => {
                             in_flight -= 1;
-                            complete_frame(&shared, item, &mut callbacks_gate, &mut scatter_cursor)
+                            complete_frame(&shared, &delivery, item, &mut callbacks_gate, &mut scatter_cursor)
                                 .await;
                         }
                         // Every worker is gone without a reply: nothing can
@@ -4146,14 +4135,13 @@ fn plugin_data_loop<P: NDPluginProcess>(
                         }
                         Some(PluginParamMsg::Publish(published, addressed)) => {
                             let batch = ParamBatch::new(&callbacks_gate);
-                            let (po, senders) = {
+                            let po = {
                                 let mut guard = shared.lock();
                                 let mut po = guard.end_published(batch, published);
                                 po.addressed = guard.delivery.publishable_addressed(addressed);
-                                let senders = guard.senders_for(&po);
-                                (po, senders)
+                                po
                             };
-                            po.complete(&mut callbacks_gate, &senders, &mut scatter_cursor)
+                            po.complete(&mut callbacks_gate, &delivery, &mut scatter_cursor)
                                 .await;
                         }
                         Some(PluginParamMsg::Change(reason, addr, value)) => {
@@ -4240,6 +4228,7 @@ fn plugin_data_loop<P: NDPluginProcess>(
                                             in_flight -= 1;
                                             complete_frame(
                                                 &shared,
+                                                &delivery,
                                                 item,
                                                 &mut callbacks_gate,
                                                 &mut scatter_cursor,
@@ -4277,6 +4266,7 @@ fn plugin_data_loop<P: NDPluginProcess>(
                                         in_flight = in_flight.saturating_sub(1);
                                         complete_frame(
                                             &shared,
+                                            &delivery,
                                             item,
                                             &mut callbacks_gate,
                                             &mut scatter_cursor,
@@ -4377,19 +4367,14 @@ fn plugin_data_loop<P: NDPluginProcess>(
                                                 out.flush(&port).await;
                                             }
                                             Admission::Admit => {
-                                                let (po, senders) = {
-                                                    let mut guard = shared.lock();
-                                                    let output = guard.process_and_publish(
-                                                        ParamBatch::new(&callbacks_gate),
-                                                        &*processor,
-                                                        &array,
-                                                    );
-                                                    let senders = guard.senders_for(&output);
-                                                    (output, senders)
-                                                };
+                                                let po = shared.lock().process_and_publish(
+                                                    ParamBatch::new(&callbacks_gate),
+                                                    &*processor,
+                                                    &array,
+                                                );
                                                 po.complete(
                                                     &mut callbacks_gate,
-                                                    &senders,
+                                                    &delivery,
                                                     &mut scatter_cursor,
                                                 )
                                                 .await;
@@ -4442,11 +4427,8 @@ fn plugin_data_loop<P: NDPluginProcess>(
                                     let mut guard = shared.lock();
                                     let sort_time = guard.delivery.set_sort_mode(mode);
                                     if mode == 0 {
-                                        let output = guard
-                                            .flush_sort_buffer(ParamBatch::new(&callbacks_gate));
-                                        let senders = guard.senders_for(&output);
                                         sort_flush_active = false;
-                                        Some((output, senders))
+                                        Some(guard.flush_sort_buffer(ParamBatch::new(&callbacks_gate)))
                                     } else {
                                         sort_flush_active = sort_time > 0.0;
                                         if sort_flush_active {
@@ -4458,9 +4440,9 @@ fn plugin_data_loop<P: NDPluginProcess>(
                                         None
                                     }
                                 };
-                                if let Some((output, senders)) = flush_work {
+                                if let Some(output) = flush_work {
                                     output
-                                        .complete(&mut callbacks_gate, &senders, &mut scatter_cursor)
+                                        .complete(&mut callbacks_gate, &delivery, &mut scatter_cursor)
                                         .await;
                                 }
                             }
@@ -4501,10 +4483,10 @@ fn plugin_data_loop<P: NDPluginProcess>(
                                 addr,
                                 value,
                             };
-                            let (process_output, senders) = {
+                            let process_output = {
                                 let mut guard = shared.lock();
                                 let result = processor.on_param_change(reason, &snapshot);
-                                let output = if !result.output_arrays.is_empty()
+                                if !result.output_arrays.is_empty()
                                     || !result.param_updates.is_empty()
                                     || !result.addressed.is_empty()
                                 {
@@ -4515,12 +4497,10 @@ fn plugin_data_loop<P: NDPluginProcess>(
                                     Some(output)
                                 } else {
                                     None
-                                };
-                                let senders = output.as_ref().map(|o| guard.senders_for(o));
-                                (output, senders)
+                                }
                             };
-                            if let (Some(po), Some(senders)) = (process_output, senders) {
-                                po.complete(&mut callbacks_gate, &senders, &mut scatter_cursor)
+                            if let Some(po) = process_output {
+                                po.complete(&mut callbacks_gate, &delivery, &mut scatter_cursor)
                                     .await;
                             }
                         }
@@ -4530,14 +4510,11 @@ fn plugin_data_loop<P: NDPluginProcess>(
                 _ = sort_flush_interval.tick(), if sort_flush_active => {
                     // B3: drain head-first while contiguous or past the
                     // staleness deadline — NOT the whole buffer.
-                    let (output, senders) = {
-                        let mut guard = shared.lock();
-                        let output = guard.tick_sort_buffer(ParamBatch::new(&callbacks_gate));
-                        let senders = guard.senders_for(&output);
-                        (output, senders)
-                    };
+                    let output = shared
+                        .lock()
+                        .tick_sort_buffer(ParamBatch::new(&callbacks_gate));
                     output
-                        .complete(&mut callbacks_gate, &senders, &mut scatter_cursor)
+                        .complete(&mut callbacks_gate, &delivery, &mut scatter_cursor)
                         .await;
                 }
             }

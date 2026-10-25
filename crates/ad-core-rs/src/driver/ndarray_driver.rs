@@ -3094,7 +3094,7 @@ pub(crate) mod tests {
             .enable_all()
             .build()
             .unwrap();
-        let _ = rt.block_on(drv.array_output.publish(to_publish));
+        rt.block_on(drv.array_output.publish(to_publish));
 
         let received = receiver.blocking_recv().unwrap();
         assert_eq!(received.unique_id, id);

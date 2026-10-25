@@ -20,9 +20,9 @@ use crate::attributes::NDAttributeList;
 use crate::ndarray::NDArray;
 use crate::ndarray_pool::{DriverPool, NDArrayPool, PublishedArray};
 
-use super::super::channel::NDArrayOutput;
+use super::super::channel::{NDArrayOutput, NDArraySender, publish_each};
 use super::super::throttler::Throttler;
-use super::{ArrayCallbacks, CopyArray, OutputSenders, PluginPool, SortBuffer};
+use super::{ArrayCallbacks, CopyArray, PluginPool, SortBuffer};
 
 pub(super) struct Delivery {
     /// One output per port address: what C's asynGenericPointer interrupt
@@ -176,11 +176,12 @@ impl Delivery {
         if ready.is_empty() || !self.delivers() {
             return;
         }
-        let senders = self.senders(false);
+        let Some(senders) = self.senders(0) else {
+            return;
+        };
         park_on(async {
             for array in &ready {
-                let sends = senders.main.iter().map(|s| s.publish(array.clone()));
-                futures_util::future::join_all(sends).await;
+                publish_each(&senders, array.clone()).await;
             }
         });
     }
@@ -242,21 +243,11 @@ impl Delivery {
         self.state.lock().last_output_array.clone()
     }
 
-    /// The downstream senders, cloned so they are used with no lock held;
-    /// every address's only when `addressed`.
-    pub(super) fn senders(&self, addressed: bool) -> OutputSenders {
-        let by_addr = if addressed {
-            self.outputs
-                .iter()
-                .map(|o| o.lock().senders_clone())
-                .collect()
-        } else {
-            Vec::new()
-        };
-        OutputSenders {
-            main: self.outputs[0].lock().senders_clone(),
-            by_addr,
-        }
+    /// The senders registered at `addr` as they stand, used with no lock
+    /// held, as C's `doCallbacksGenericPointer` walks its list
+    /// (asynPortDriver.cpp:3353).
+    pub(super) fn senders(&self, addr: usize) -> Option<Arc<Vec<NDArraySender>>> {
+        Some(self.outputs.get(addr)?.lock().senders())
     }
 
     /// C `throttled(pArray)` for an output that is not an NDArray

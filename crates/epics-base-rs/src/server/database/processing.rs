@@ -13686,7 +13686,7 @@ impl super::OwedRead for OwedDbGet {
             &self.field,
             false,
             &mut std::collections::HashSet::new(),
-            ReadPolicy::NoWait { own },
+            ReadPolicy::Served { own },
         ));
         self.reader.unpark();
     }
@@ -13704,18 +13704,25 @@ pub(crate) enum ReadPolicy<'a> {
     NoWait {
         own: Option<(&'a RecordCell, OwnRecord<'a>)>,
     },
+    /// A read owed to a set, served by its holder for the reader
+    /// ([`OwedDbGet::serve`]): a record the holder has borrowed for writing
+    /// is refused, `own` aside, since the borrow is the holder's own and the
+    /// read is not.
+    Served {
+        own: Option<(&'a RecordCell, OwnRecord<'a>)>,
+    },
 }
 
 impl<'a> ReadPolicy<'a> {
     /// `f` on `cell`'s instance; `None` when the policy does not wait and
-    /// another thread holds the record.
+    /// another thread holds the record, or when a served read finds it
+    /// borrowed for writing.
     ///
     /// # Panics
     ///
     /// Under [`Self::NoWait`], if this thread holds the record for writing:
     /// C's `dbGet` reads the live field, which only the borrow's own view
-    /// (`own`) reaches, and a `None` here was a failed read or, served for a
-    /// waiting holder, one nobody answered.
+    /// (`own`) reaches, and a `None` here would be a failed read.
     pub(crate) fn read<R>(
         self,
         cell: &RecordCell,
@@ -13735,6 +13742,7 @@ impl<'a> ReadPolicy<'a> {
                     None
                 }
             },
+            Self::Served { .. } => cell.try_read().map(|inst| f(&inst)),
         }
     }
 
@@ -13742,6 +13750,9 @@ impl<'a> ReadPolicy<'a> {
     pub(crate) fn own(self, cell: &RecordCell) -> Option<OwnRecord<'a>> {
         match self {
             Self::NoWait {
+                own: Some((at, own)),
+            }
+            | Self::Served {
                 own: Some((at, own)),
             } if std::ptr::eq(at, cell) => Some(own),
             _ => None,

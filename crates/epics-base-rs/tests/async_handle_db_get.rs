@@ -362,7 +362,7 @@ async fn db_get_of_a_record_this_thread_borrows_without_its_view_is_refused() {
 
 /// Two holders each waiting for a member of the other's set that the other
 /// borrows without lending a view: neither could serve the other, and both
-/// waited for good. The holder that meets such a read now refuses it.
+/// waited for good. The holder serving such a read refuses it, and goes on.
 #[epics_macros_rs::epics_test]
 async fn holders_borrowing_set_mates_without_a_view_do_not_wait_on_each_other() {
     let db = ioc().await;
@@ -379,7 +379,7 @@ async fn holders_borrowing_set_mates_without_a_view_do_not_wait_on_each_other() 
                     })
                 })
             }));
-            done.send(got.map_err(panic_text)).unwrap();
+            done.send((other, got.map_err(panic_text))).unwrap();
         })
     };
     // H is AI's set-mate, AOR AO's.
@@ -389,9 +389,13 @@ async fn holders_borrowing_set_mates_without_a_view_do_not_wait_on_each_other() 
     let got: Vec<_> = (0..2)
         .map(|_| done_rx.recv_timeout(wait).expect("both holders finish"))
         .collect();
-    assert!(
-        got.iter()
-            .any(|g| g.as_ref().is_err_and(|m| m.contains("for writing"))),
-        "{got:?}"
-    );
+    // Refused while the holder borrows it, or read live once it does not.
+    for (other, g) in got {
+        let read = g.expect("no holder panics").flatten().flatten();
+        let live = db.get_pv(other).unwrap();
+        assert!(
+            read.as_ref().is_none_or(|s| s.value == live),
+            "{other} {read:?}"
+        );
+    }
 }

@@ -571,12 +571,14 @@ fn spawn_asg_inp_watcher(db: &std::sync::Arc<crate::server::database::PvDatabase
                     .as_ref()
                     .is_some_and(|cfg| watch.attach(&db, cfg));
                 drop(db);
-                cell.mark_served(true, load_ident(built_from.as_ref()));
-                drop(cell);
-                // C's `asComputeAllAsg` after the adds (asCa.c:204-205).
+                // C's `asComputeAllAsg` after the adds and before it signals
+                // `asCaTaskWait` (asCa.c:204-207): a waiter that wakes must
+                // not see the attach's change signal still to come.
                 if attached {
                     notify_asg_field_changed();
                 }
+                cell.mark_served(true, load_ident(built_from.as_ref()));
+                drop(cell);
 
                 let wake = tokio::select! {
                     r = acf_rx.recv() => match r {

@@ -7,7 +7,8 @@
 //! `&seqg_var.a.at(i)`); anything else is its value (`x.get()`), `as _`
 //! when numeric. So a string argument is a [`CSrc`] that may be a
 //! variable, and a destination is a [`CDst`], which may also be a `char *`
-//! into one. A shim copies each source out before it takes the
+//! into one; a character's place (`&seqg_var.s.at(i)`) is that `char *`
+//! for both. A shim copies each source out before it takes the
 //! destination's lock, so no call holds two variables' locks at once, and
 //! `strcpy(x, x)` does not deadlock.
 //!
@@ -27,7 +28,7 @@ use epics_libcom_rs::cfmt::{self, Directive, Length, Spec};
 use crate::prog::seq_find_state_set;
 use crate::seq::SeqThreadId;
 use crate::types::{CharPtr, SeqString};
-use crate::var::{At, Place, Ptr, SeqVar, Zeroed};
+use crate::var::{Addr, At, Indexed, Place, Ptr, SeqVar, Zeroed};
 
 /// A variadic argument of `printf` / `sprintf`, after C's default argument
 /// promotions.
@@ -91,6 +92,12 @@ impl<B: CSrc> From<&SeqVar<B>> for CArg<'_> {
 impl<B: CSrc, const N: usize, P: Place<[B; N]> + ?Sized> From<&At<'_, P, [B; N]>> for CArg<'_> {
     fn from(v: &At<'_, P, [B; N]>) -> Self {
         CArg::Str(Some(Cow::Owned(v.with_c_bytes(<[u8]>::to_vec))))
+    }
+}
+
+impl<A: Indexed<Elem = c_char> + 'static, P: Addr<A> + ?Sized> From<&At<'_, P, A>> for CArg<'_> {
+    fn from(v: &At<'_, P, A>) -> Self {
+        v.ptr().into()
     }
 }
 
@@ -203,6 +210,13 @@ impl<B: CSrc, const N: usize, P: Place<[B; N]> + ?Sized> CSrc for At<'_, P, [B; 
     }
 }
 
+/// A character's place, `&a[i]` or `&s[i]`, is C's `char *` to it.
+impl<A: Indexed<Elem = c_char> + 'static, P: Addr<A> + ?Sized> CSrc for At<'_, P, A> {
+    fn with_c_buffer<R>(&self, f: impl FnOnce(&[u8]) -> R) -> R {
+        self.ptr().with_c_buffer(f)
+    }
+}
+
 /// A C character buffer written as a destination.
 pub trait CBuf {
     fn bytes_mut(&mut self) -> &mut [u8];
@@ -250,6 +264,13 @@ impl<B: CBuf> CDst for SeqVar<B> {
 impl<B: CBuf, const N: usize, P: Place<[B; N]> + ?Sized> CDst for At<'_, P, [B; N]> {
     fn with_c_dst<R>(&self, f: impl FnOnce(&mut [u8]) -> R) -> R {
         self.modify(|b| f(b.bytes_mut()))
+    }
+}
+
+/// As its [`CSrc`].
+impl<A: Indexed<Elem = c_char> + 'static, P: Addr<A> + ?Sized> CDst for At<'_, P, A> {
+    fn with_c_dst<R>(&self, f: impl FnOnce(&mut [u8]) -> R) -> R {
+        self.ptr().with_c_dst(f)
     }
 }
 
@@ -1239,6 +1260,25 @@ mod tests {
         strcat(v.at(0).ptr(), "Z");
         strncpy(v.at(5).ptr(), "q", 3);
         assert_eq!(&v.get().map(|c| c as u8), b"abXYZq\0\0");
+    }
+
+    /// EnsembleTrajectoryScan.st:396, MM4005_trajectoryScan.st:417:
+    /// `&a[i]` passed with no prototype is the element's place,
+    /// `&seqg_var.a.at(i)`.
+    #[test]
+    fn a_character_s_place_is_a_char_pointer_to_it() {
+        let v = <SeqVar<[c_char; 8]>>::zeroed();
+        strcpy(&v, "ab");
+        assert_eq!(sprintf(v.at(2), "%d", &[45.into()]), 2);
+        assert_eq!(atoi(v.at(1)), 0);
+        assert_eq!(atoi(v.at(2)), 45);
+        let s = <SeqVar<SeqString>>::zeroed();
+        strcpy(&s, "xyz");
+        strcpy(s.at(1), "Q");
+        assert_eq!(s.to_c_vec(), b"xQ");
+        assert_eq!(strcmp(s.at(0), "xQ"), 0);
+        sprintf(&v, "<%s>", &[(&s.at(1)).into()]);
+        assert_eq!(text(&v), b"<Q>");
     }
 
     #[test]

@@ -50,6 +50,9 @@ record(calc, "H") {
     field(INPA, "AI.VAL")
     field(CALC, "A")
 }
+record(ai, "AOR") {
+    field(INP, "AO.VAL")
+}
 "#;
 
 async fn ioc() -> Arc<PvDatabase> {
@@ -330,4 +333,65 @@ async fn two_records_reading_each_other_from_their_own_holds_both_read() {
     let b = read("AO", "AI.HOPR");
     assert_eq!(a.join().unwrap(), Some(EpicsValue::Double(10.0)));
     assert_eq!(b.join().unwrap(), Some(EpicsValue::Double(10.0)));
+}
+
+/// The message of a thread's panic.
+fn panic_text(e: Box<dyn std::any::Any + Send>) -> String {
+    e.downcast_ref::<String>()
+        .cloned()
+        .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
+        .unwrap_or_default()
+}
+
+/// A record this thread holds for writing reads only through the view its
+/// borrower lends; read without it, it would read as nothing where C's
+/// `dbGet` reads the live field, so the read is refused at the call.
+#[epics_macros_rs::epics_test]
+async fn db_get_of_a_record_this_thread_borrows_without_its_view_is_refused() {
+    let db = ioc().await;
+    let h = db.async_handle();
+    let got = std::thread::spawn(move || {
+        h.with_instance("AI", |_, _| {
+            h.db_get("AI.VAL", DbFieldType::Double, 1, None)
+        })
+    })
+    .join();
+    let msg = panic_text(got.expect_err("the read is refused, not answered"));
+    assert!(msg.contains("AI"), "{msg}");
+}
+
+/// Two holders each waiting for a member of the other's set that the other
+/// borrows without lending a view: neither could serve the other, and both
+/// waited for good. The holder that meets such a read now refuses it.
+#[epics_macros_rs::epics_test]
+async fn holders_borrowing_set_mates_without_a_view_do_not_wait_on_each_other() {
+    let db = ioc().await;
+    let both = Arc::new(std::sync::Barrier::new(2));
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let read = |me: &'static str, mate: &'static str, other: &'static str| {
+        let (h, both, done) = (db.async_handle(), both.clone(), done_tx.clone());
+        std::thread::spawn(move || {
+            let got = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                h.with_own(me, |rec, own| {
+                    h.with_instance(mate, |_, _| {
+                        both.wait();
+                        h.db_get(other, DbFieldType::Double, 1, Some(own.of(&*rec)))
+                    })
+                })
+            }));
+            done.send(got.map_err(panic_text)).unwrap();
+        })
+    };
+    // H is AI's set-mate, AOR AO's.
+    read("AI", "H", "AOR.HOPR");
+    read("AO", "AOR", "H.HOPR");
+    let wait = std::time::Duration::from_secs(10);
+    let got: Vec<_> = (0..2)
+        .map(|_| done_rx.recv_timeout(wait).expect("both holders finish"))
+        .collect();
+    assert!(
+        got.iter()
+            .any(|g| g.as_ref().is_err_and(|m| m.contains("for writing"))),
+        "{got:?}"
+    );
 }

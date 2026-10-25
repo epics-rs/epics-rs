@@ -13681,19 +13681,13 @@ impl super::OwedRead for OwedDbGet {
         let Some(inner) = self.db.upgrade() else {
             return;
         };
-        let read = PvDatabase { inner }.channel_snapshot_for_field_guarded(
+        *got = Some(PvDatabase { inner }.channel_snapshot_for_field_guarded(
             &self.cell,
             &self.field,
             false,
             &mut std::collections::HashSet::new(),
             ReadPolicy::NoWait { own },
-        );
-        // Served from inside a holder's processing, a member that holder has
-        // borrowed does not read: the reader retries once the set is free.
-        if read.is_none() && own.is_some() {
-            return;
-        }
-        *got = Some(read);
+        ));
         self.reader.unpark();
     }
 }
@@ -13705,7 +13699,8 @@ pub(crate) enum ReadPolicy<'a> {
     Wait,
     /// [`AsyncDbHandle::db_get`]'s: a record whose set is held elsewhere is
     /// not read, and `own`, the record the caller is inside, is read from
-    /// itself.
+    /// itself. A record this thread holds for writing is read only through
+    /// that view: the borrow lent no other.
     NoWait {
         own: Option<(&'a RecordCell, OwnRecord<'a>)>,
     },
@@ -13713,7 +13708,14 @@ pub(crate) enum ReadPolicy<'a> {
 
 impl<'a> ReadPolicy<'a> {
     /// `f` on `cell`'s instance; `None` when the policy does not wait and
-    /// the record is busy.
+    /// another thread holds the record.
+    ///
+    /// # Panics
+    ///
+    /// Under [`Self::NoWait`], if this thread holds the record for writing:
+    /// C's `dbGet` reads the live field, which only the borrow's own view
+    /// (`own`) reaches, and a `None` here was a failed read or, served for a
+    /// waiting holder, one nobody answered.
     pub(crate) fn read<R>(
         self,
         cell: &RecordCell,
@@ -13721,7 +13723,18 @@ impl<'a> ReadPolicy<'a> {
     ) -> Option<R> {
         match self {
             Self::Wait => Some(f(&cell.read())),
-            Self::NoWait { .. } => cell.try_read().map(|inst| f(&inst)),
+            Self::NoWait { .. } => match cell.try_read() {
+                Some(inst) => Some(f(&inst)),
+                None => {
+                    assert!(
+                        !cell.lock_record().held_by_this_thread(),
+                        "{} read by a dbGet while this thread holds it for writing \
+                         and lent no view of it",
+                        cell.name()
+                    );
+                    None
+                }
+            },
         }
     }
 

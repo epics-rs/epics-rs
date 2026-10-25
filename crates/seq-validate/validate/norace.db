@@ -1,0 +1,24 @@
+record(stringout,"a") {
+    field(VAL,"aaaaaaaaaaaaaaaaaaaa")
+    field(OUT,"x CA")
+}
+record(stringout,"b") {
+    field(VAL,"bbbbbbbbbbbbbbbbbbbb")
+    field(OUT,"x CA")
+}
+record(stringout,"c") {
+    field(VAL,"cccccccccccccccccccc")
+    field(OUT,"x CA")
+}
+record(stringout,"x") {
+}
+record(seq,"s") {
+    field(PINI,"YES")
+    field(DLY1,"0.05")
+    field(LNK1,"a.PROC")
+    field(DLY2,"0.05")
+    field(LNK2,"b.PROC")
+    field(DLY3,"0.05")
+    field(LNK3,"c.PROC")
+    field(FLNK,"s.PROC CA")
+}

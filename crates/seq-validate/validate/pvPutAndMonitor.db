@@ -1,0 +1,4 @@
+record(longout,"counter") {
+    field(VAL,"0")
+    field(PINI,"YES")
+}

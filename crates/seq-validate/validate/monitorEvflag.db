@@ -1,0 +1,5 @@
+record(longout,"requested") {
+    field(OUT,"actual PP MS")
+}
+record(longin,"actual") {
+}

@@ -1,0 +1,6 @@
+1..5
+ok  1 - state local i == 3 >= 3
+ok  2 - state set local i==2
+ok  3 - state local i == 4 >= 3
+ok  4 - state set local i==2
+ok  5 - global i==1

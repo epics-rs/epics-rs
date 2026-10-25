@@ -1,0 +1,4 @@
+1..3
+ok  1 - status == pvStatERROR
+ok  2 - status == pvStatERROR
+ok  3 - status == pvStatERROR

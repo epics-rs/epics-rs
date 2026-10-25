@@ -3650,6 +3650,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
 
 [[package]]
+name = "seq-validate"
+version = "0.32.0"
+dependencies = [
+ "epics-base-rs",
+ "epics-ca-rs",
+ "epics-seq-rs",
+ "epics-snc-rs",
+ "parking_lot",
+ "serial_test",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "serde"
 version = "1.0.228"
 source = "registry+https://github.com/rust-lang/crates.io-index"

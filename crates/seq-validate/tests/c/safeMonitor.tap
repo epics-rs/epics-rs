@@ -1,0 +1,11 @@
+1..10
+ok  1 - read: exit action block, on_entry=1.0==1.0=cnt
+ok  2 - read: exit action block, on_entry=3.0==3.0=cnt
+ok  3 - read: exit action block, on_entry=5.0==5.0=cnt
+ok  4 - read: exit action block, on_entry=8.0==8.0=cnt
+ok  5 - read: exit action block, on_entry=10.0==10.0=cnt
+ok  6 - read: exit action block, on_entry=13.0==13.0=cnt
+ok  7 - read: exit action block, on_entry=15.0==15.0=cnt
+ok  8 - read: exit action block, on_entry=18.0==18.0=cnt
+ok  9 - read: exit action block, on_entry=20.0==20.0=cnt
+ok 10 - read: exit action block, on_entry=23.0==23.0=cnt

@@ -1,0 +1,20 @@
+record(bo,"pvPutAsync1") {
+    field(ZNAM,"Low")
+    field(ONAM,"High")
+    field(HIGH,"1")
+    field(OUT,"pvPutAsyncSeq.SELN PP")
+}
+record(bo,"pvPutAsync2") {
+    field(ZNAM,"Low")
+    field(ONAM,"High")
+    field(HIGH,"1")
+    field(OUT,"pvPutAsyncSeq.SELN PP")
+}
+record(seq,"pvPutAsyncSeq") {
+    field(SELM,"Specified")
+    field(DLY1,"2")
+    field(DOL1,"1")
+    field(LNK1,"pvPutAsyncRes CA")
+}
+record(longin,"pvPutAsyncRes") {
+}

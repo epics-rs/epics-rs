@@ -1,0 +1,25 @@
+1..24
+ok  1 - sizeof((i8)) == 1
+ok  2 - sizeof((ui8)) == 1
+ok  3 - sizeof((i16)) == 2
+ok  4 - sizeof((ui16)) == 2
+ok  5 - sizeof((i32)) == 4
+ok  6 - sizeof((ui32)) == 4
+ok  7 - pvstat == pvStatOK
+ok  8 - pvstat == pvStatOK
+ok  9 - i8 == seqg_vars_test.seqg_vars_conversion.xi8
+ok 10 - pvstat == pvStatOK
+ok 11 - pvstat == pvStatOK
+ok 12 - ui8 == seqg_vars_test.seqg_vars_conversion.xui8
+ok 13 - pvstat == pvStatOK
+ok 14 - pvstat == pvStatOK
+ok 15 - i16 == seqg_vars_test.seqg_vars_conversion.xi16
+ok 16 - pvstat == pvStatOK
+ok 17 - pvstat == pvStatOK
+ok 18 - ui16 == seqg_vars_test.seqg_vars_conversion.xui16
+ok 19 - pvstat == pvStatOK
+ok 20 - pvstat == pvStatOK
+ok 21 - i32 != seqg_vars_test.seqg_vars_conversion.xi32
+ok 22 - pvstat == pvStatOK
+ok 23 - pvstat == pvStatOK
+ok 24 - ui32 != seqg_vars_test.seqg_vars_conversion.xui32

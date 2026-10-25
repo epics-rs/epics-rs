@@ -328,7 +328,10 @@ impl<W: NDFileWriter> FilePluginController<W> {
             );
         }
         match self.file_base.mode() {
-            NDFileMode::Single => {
+            // C refuses a stop in Single mode as well, against its own
+            // comment that only capture=1 is the error (NDPluginFile.cpp:452);
+            // not copied, a stop is a no-op as with no array (:431).
+            NDFileMode::Single if value != 0 => {
                 return failed(
                     set_str(
                         out,
@@ -345,7 +348,7 @@ impl<W: NDFileWriter> FilePluginController<W> {
                 );
             }
             NDFileMode::Stream => out = set_int(out, p.write_file, (value != 0) as i32),
-            NDFileMode::Capture => {}
+            NDFileMode::Single | NDFileMode::Capture => {}
         }
         if lazy {
             out = set_str(out, p.write_message, "Lazy Open...");
@@ -3128,6 +3131,27 @@ mod tests {
                 "NDPluginFile::doCapture ERROR: No arrays collected: cannot allocate capture buffer\n",
                 &refused_line(c.params.capture.unwrap(), 1),
             ])
+        );
+    }
+
+    /// NDPluginFile.cpp:452 makes only capture=1 an error in Single mode; a
+    /// stop succeeds with no line and no WriteMessage, and a start still fails.
+    #[test]
+    fn a_stop_in_single_mode_succeeds() {
+        let mut c = write_port(0, NDFileMode::Single as i32);
+        c.latest_array = Some(Arc::new(array(1)));
+        let capture = c.params.capture.unwrap();
+        let out = c.write_int32(capture, 0, WriteVerdict::Accept(0), &mut ());
+        assert_eq!(out.verdict, WriteVerdict::Accept(0));
+        assert!(out.trace.is_empty(), "{:?}", out.trace);
+        assert_eq!(message(&c, &out), None);
+        assert!(!c.capture_active);
+
+        let out = capture_on(&mut c);
+        assert_eq!(out.verdict, zeroed(false));
+        assert_eq!(
+            message(&c, &out).as_deref(),
+            Some("ERROR: capture not supported in Single mode")
         );
     }
 

@@ -234,7 +234,7 @@ fn ack_at_from(
             // pvxs `else if(ackAny.as(sval))` (`servermon.cpp:560`) — the
             // same string the throwing `as<std::string>()` above already
             // produced. Only a `"N%"` percentage does anything here.
-            match pct.trim().parse::<f64>() {
+            match crate::pvdata::convert::parse_to_f64(pct) {
                 Ok(percent) => {
                     // pvxs `servermon.cpp:563` historically computed
                     // `clamp(percent,0,100) * limit` with NO `/ 100`, so any
@@ -11508,6 +11508,20 @@ mod tests {
             "percentage-form Crit message: {}",
             opts.diagnostics[0].message
         );
+    }
+
+    /// The percentage is `parseTo<double>` (`servermon.cpp:563`), so a hex
+    /// float is a percentage, not a Crit.
+    #[test]
+    fn monitor_ackany_percent_is_parse_to_double() {
+        let req = make_pipeline_request_ack(
+            PvField::Scalar(ScalarValue::Boolean(true)),
+            PvField::Scalar(ScalarValue::Int(16)),
+            PvField::Scalar(ScalarValue::String("0x19%".into())),
+        );
+        let opts = parsed_opts(&req);
+        assert_eq!(opts.ack_at, 4, "25% of 16");
+        assert!(opts.diagnostics.is_empty(), "{:?}", opts.diagnostics);
     }
 
     #[test]

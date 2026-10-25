@@ -466,69 +466,11 @@ fn parse_bool(name: &str, raw: &str) -> Option<bool> {
 /// (~1.845e19 s) even after the 4/3 `tmoScale`.
 const TIMEOUT_SECS_MAX: f64 = i64::MAX as f64;
 
-/// pvxs `parseTo<double>` (`util.cpp:769-783`): `std::stod` — which skips
-/// leading whitespace and accepts C99 hex-float syntax (`0x1.8p3`) — plus
-/// the extraneous-character check, which tolerates trailing whitespace and
-/// rejects any other trailing text. Returns `None` where `parseTo` throws
-/// `NoConvert`.
-fn parse_double_pvxs(raw: &str) -> Option<f64> {
-    let s = raw.trim();
-    if s.is_empty() {
-        return None;
-    }
-    let (neg, body) = match s.as_bytes()[0] {
-        b'-' => (true, &s[1..]),
-        b'+' => (false, &s[1..]),
-        _ => (false, s),
-    };
-    let v = if let Some(hex) = body.strip_prefix("0x").or_else(|| body.strip_prefix("0X")) {
-        parse_hex_float(hex)?
-    } else {
-        // Rust's f64 grammar covers the rest of stod's: decimal, exponent,
-        // `inf`/`infinity`/`nan` (case-insensitive). Overflowing text such
-        // as `1e400` yields `inf` here where stod throws out_of_range; both
-        // end at "keep the default" once the finite gate below runs.
-        body.parse::<f64>().ok()?
-    };
-    Some(if neg { -v } else { v })
-}
-
-/// The hex-float half of `std::stod`: `<hexdigits>[.<hexdigits>][p[+-]<dec>]`
-/// scaled by 2^exp. The binary exponent is optional (`strtod` subject
-/// sequence), so `0x10` is 16.0.
-fn parse_hex_float(s: &str) -> Option<f64> {
-    let (mantissa, exp) = match s.find(['p', 'P']) {
-        Some(i) => (&s[..i], Some(&s[i + 1..])),
-        None => (s, None),
-    };
-    let (int_part, frac_part) = match mantissa.find('.') {
-        Some(i) => (&mantissa[..i], &mantissa[i + 1..]),
-        None => (mantissa, ""),
-    };
-    if int_part.is_empty() && frac_part.is_empty() {
-        return None;
-    }
-    let mut v = 0.0f64;
-    for c in int_part.chars() {
-        v = v * 16.0 + f64::from(c.to_digit(16)?);
-    }
-    let mut scale = 1.0 / 16.0;
-    for c in frac_part.chars() {
-        v += f64::from(c.to_digit(16)?) * scale;
-        scale /= 16.0;
-    }
-    let e: i32 = match exp {
-        Some(e) => e.strip_prefix('+').unwrap_or(e).parse().ok()?,
-        None => 0,
-    };
-    Some(v * 2.0f64.powi(e))
-}
-
 /// The single owner of every PVA timeout/period env double, reproducing
 /// pvxs `parse_timeout` (`config.cpp:211-227`): parse with `parseTo<double>`
-/// (`parse_double_pvxs`), then REJECT a value that is non-finite, negative,
-/// or above `double(time_t::max)` — logging and leaving the destination at
-/// its default rather than saturating it. (This is deliberately unlike
+/// ([`crate::pvdata::convert::parse_to_f64`]), then REJECT a value that is
+/// non-finite, negative, or above `double(time_t::max)` — logging and
+/// leaving the destination at its default rather than saturating it. (This is deliberately unlike
 /// `epics-ca-rs`'s `envGetDoubleConfigParam`, which is epics-base's clamp
 /// semantics; pvxs governs here.)
 ///
@@ -546,7 +488,7 @@ fn parse_hex_float(s: &str) -> Option<f64> {
 /// pvxs's 40 s effective idle timeout, and the port's default 30 s × 4/3 is
 /// the same 40 s.
 pub fn parse_timeout_env(name: &str, raw: &str) -> Option<f64> {
-    match parse_double_pvxs(raw) {
+    match crate::pvdata::convert::parse_to_f64(raw).ok() {
         Some(v) if v.is_finite() && v > 0.0 && v <= TIMEOUT_SECS_MAX => Some(v),
         // pvxs takes zero without a word.
         Some(0.0) => None,
@@ -2640,6 +2582,10 @@ mod tests {
         assert_eq!(parse_timeout_env(N, "1e300"), None);
         assert_eq!(parse_timeout_env(N, "1e19"), None);
         assert_eq!(parse_timeout_env(N, "1e400"), None, "overflows to inf");
+        // stod's ERANGE also covers a tiny inexact result, and its skip is
+        // C `isspace`, not Unicode's.
+        assert_eq!(parse_timeout_env(N, "1e-310"), None);
+        assert_eq!(parse_timeout_env(N, "\u{a0}45"), None);
         // Non-finite / non-positive / garbage → keep default.
         assert_eq!(parse_timeout_env(N, "inf"), None);
         assert_eq!(parse_timeout_env(N, "nan"), None);

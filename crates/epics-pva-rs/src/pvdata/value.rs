@@ -1144,7 +1144,8 @@ pub(crate) fn coerce_scalar(
         // overflows rather than saturating. See `pvdata::cpp_cast`.
         Float(x) => Some(crate::pvdata::cpp_cast::double_to_i64(*x as f64)),
         Double(x) => Some(crate::pvdata::cpp_cast::double_to_i64(*x)),
-        String(s) => s.as_str_lossy().parse::<i64>().ok(),
+        // pvxs `parseTo<int64_t>` on both sides (`data.cpp:448`, `:525`).
+        String(s) => crate::pvdata::convert::parse_to_i64(&s.as_str_lossy()).ok(),
     };
     // pvxs dispatches on the STORE's signedness (`data.cpp:551` vs `:565`):
     // an unsigned leaf casts the double to `uint64_t`, not to `int64_t`. The
@@ -1154,12 +1155,15 @@ pub(crate) fn coerce_scalar(
     let as_u64: Option<u64> = match sv {
         Float(x) => Some(crate::pvdata::cpp_cast::double_to_u64(*x as f64)),
         Double(x) => Some(crate::pvdata::cpp_cast::double_to_u64(*x)),
+        // An unsigned store parses with `parseTo<uint64_t>`, so `"-1"` wraps
+        // and `u64::MAX` spelled out is in range.
+        String(s) => crate::pvdata::convert::parse_to_u64(&s.as_str_lossy()).ok(),
         _ => as_i64.map(|i| i as u64),
     };
     let as_f64: Option<f64> = match sv {
         Float(x) => Some(*x as f64),
         Double(x) => Some(*x),
-        String(s) => s.as_str_lossy().parse::<f64>().ok(),
+        String(s) => crate::pvdata::convert::parse_to_f64(&s.as_str_lossy()).ok(),
         _ => as_i64.map(|i| i as f64),
     };
     let as_string: std::string::String = match sv {
@@ -1355,6 +1359,41 @@ mod tests {
         assert_eq!(text(ScalarValue::Double(1e20)), "1e+20");
         assert_eq!(text(ScalarValue::Double(1.0 / 3.0)), "0.333333");
         assert_eq!(text(ScalarValue::Float(0.1)), "0.1");
+    }
+
+    /// A string read or stored as a number is pvxs `parseTo` on both sides:
+    /// base 0, C whitespace either side, glibc `strtod` with ERANGE refused.
+    #[test]
+    fn a_string_converts_through_parse_to_on_both_sides() {
+        // copyOut (`data.cpp:446-457`).
+        let mut v = Value::create_from(NTScalar::new(ScalarType::String).build());
+        for (s, want) in [("0x10", 16), (" 12\t", 12), ("010", 8)] {
+            v.set("value", s).unwrap();
+            assert_eq!(v.get_as::<i32>("value").unwrap(), want, "{s:?}");
+        }
+        v.set("value", "-1").unwrap();
+        assert_eq!(v.get_as::<u32>("value").unwrap(), u32::MAX);
+        v.set("value", "18446744073709551615").unwrap();
+        assert_eq!(v.get_as::<u64>("value").unwrap(), u64::MAX);
+        v.set("value", "0x1p4").unwrap();
+        assert_eq!(v.get_as::<f64>("value").unwrap(), 16.0);
+        for s in ["1e400", "1e-310"] {
+            v.set("value", s).unwrap();
+            assert!(v.get_as::<f64>("value").is_err(), "{s:?}");
+        }
+        v.set("value", "08").unwrap();
+        assert!(v.get_as::<i64>("value").is_err());
+        // copyIn (`copyInScalar`, `data.cpp:525`).
+        let mut i = Value::create_from(NTScalar::new(ScalarType::Int).build());
+        i.set("value", "0x10").unwrap();
+        assert_eq!(i.get_as::<i32>("value").unwrap(), 16);
+        let mut u = Value::create_from(NTScalar::new(ScalarType::ULong).build());
+        u.set("value", "18446744073709551615").unwrap();
+        assert_eq!(u.get_as::<u64>("value").unwrap(), u64::MAX);
+        let mut d = Value::create_from(NTScalar::new(ScalarType::Double).build());
+        d.set("value", "0x1p4 ").unwrap();
+        assert_eq!(d.get_as::<f64>("value").unwrap(), 16.0);
+        assert!(d.set("value", "1e-310").is_err());
     }
 
     /// A real read as a bool is `copyOut`'s `bool(src)` (`data.cpp:408`),

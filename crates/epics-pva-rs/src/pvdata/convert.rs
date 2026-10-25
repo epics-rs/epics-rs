@@ -28,7 +28,7 @@
 
 use std::borrow::Cow;
 
-use epics_base_rs::runtime::stdlib::{c_isspace, strtoll_errno, strtoull_errno};
+use epics_base_rs::runtime::stdlib::{c_isspace, strtod, strtoll_errno, strtoull_errno};
 
 use super::scalar::{ScalarType, ScalarValue};
 use super::structure::PvField;
@@ -316,7 +316,17 @@ pub fn parse_to_i64(s: &str) -> Result<i64, NoConvert> {
     parse_base0(s, "unsigned", |b| strtoll_errno(b, 0))
 }
 
-/// `parseTo` around its `std::stoll`/`std::stoull` `scan`: `None` (ERANGE)
+/// pvxs `parseTo<double>` (`util.cpp:768-783`) — `std::stod(s, &idx)`, which
+/// is glibc [`strtod`] (hex floats, `inf`/`nan`) with ERANGE, overflow or a
+/// tiny inexact result, as `std::out_of_range`; then the same trailing check.
+pub fn parse_to_f64(s: &str) -> Result<f64, NoConvert> {
+    parse_base0(s, "double", |b| {
+        let r = strtod(b);
+        (!r.erange).then_some((r.value, r.len))
+    })
+}
+
+/// `parseTo` around its `std::stoll`/`std::stoull`/`std::stod` `scan`: `None` (ERANGE)
 /// is `std::out_of_range`, raised before the trailing check; nothing
 /// converted is `std::invalid_argument`.
 fn parse_base0<T>(

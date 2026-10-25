@@ -1,5 +1,5 @@
 use epics_base_rs::types::{DbFieldType, EpicsValue};
-use epics_pva_rs::pvdata::convert::{parse_to_i64, parse_to_u64};
+use epics_pva_rs::pvdata::convert::{parse_to_f64, parse_to_i64, parse_to_u64};
 use epics_pva_rs::pvdata::{PvArray, PvField, ScalarType, ScalarValue, TypedScalarArray};
 
 /// Convert EPICS DBF type to PVA ScalarType.
@@ -164,12 +164,12 @@ pub fn scalar_to_epics_typed(
         DbFieldType::UInt64 => EpicsValue::UInt64(scalar_to_u64(val)?),
         DbFieldType::Short => EpicsValue::Short(scalar_to_i64(val)? as i16),
         DbFieldType::Char => EpicsValue::Char(scalar_to_i64(val)? as u8),
-        DbFieldType::UChar => EpicsValue::UChar(scalar_to_i64(val)? as u8),
+        DbFieldType::UChar => EpicsValue::UChar(scalar_to_uinteger(val)? as u8),
         DbFieldType::Enum => EpicsValue::Enum(scalar_to_i64(val)? as u16),
         // DBF_USHORT/DBF_ULONG narrow off the integer view (C static_cast
         // truncation, low 16/32 bits), mirroring the Short/Enum targets.
-        DbFieldType::UShort => EpicsValue::UShort(scalar_to_i64(val)? as u16),
-        DbFieldType::ULong => EpicsValue::ULong(scalar_to_i64(val)? as u32),
+        DbFieldType::UShort => EpicsValue::UShort(scalar_to_uinteger(val)? as u16),
+        DbFieldType::ULong => EpicsValue::ULong(scalar_to_uinteger(val)? as u32),
         DbFieldType::String => match val {
             ScalarValue::String(s) => EpicsValue::String(s.clone()),
             other => EpicsValue::String(other.to_string().into()),
@@ -179,11 +179,8 @@ pub fn scalar_to_epics_typed(
 
 /// Extract f64 from any ScalarValue.
 ///
-/// A `String` source is parsed strictly (leading/trailing whitespace
-/// tolerated to match `std::stod`); a non-numeric / out-of-range /
-/// trailing-garbage string returns [`ScalarConvertError`] instead of
-/// silently coercing to 0.0 — see pvxs `parseTo<double>`
-/// (`util.cpp:769`).
+/// A `String` source is pvxs `parseTo<double>` (`util.cpp:769`); a string
+/// it refuses returns [`ScalarConvertError`] instead of coercing to 0.0.
 fn scalar_to_f64(val: &ScalarValue) -> Result<f64, ScalarConvertError> {
     Ok(match val {
         ScalarValue::Double(v) => *v,
@@ -204,13 +201,10 @@ fn scalar_to_f64(val: &ScalarValue) -> Result<f64, ScalarConvertError> {
             }
         }
         ScalarValue::String(s) => {
-            s.as_str_lossy()
-                .trim()
-                .parse()
-                .map_err(|_| ScalarConvertError {
-                    value: s.as_str_lossy().into_owned(),
-                    target: "f64",
-                })?
+            parse_to_f64(&s.as_str_lossy()).map_err(|_| ScalarConvertError {
+                value: s.as_str_lossy().into_owned(),
+                target: "f64",
+            })?
         }
     })
 }
@@ -247,6 +241,16 @@ fn scalar_to_i64(val: &ScalarValue) -> Result<i64, ScalarConvertError> {
             })?
         }
     })
+}
+
+/// The unsigned narrow targets, pvxs `as<uint8/16/32_t>`
+/// (`iocsource.cpp:484-487`): a string is `parseTo<uint64_t>`, so `u64::MAX`
+/// spelled out is in range; every other source keeps the integer view.
+fn scalar_to_uinteger(val: &ScalarValue) -> Result<u64, ScalarConvertError> {
+    match val {
+        ScalarValue::String(_) => scalar_to_u64(val),
+        other => scalar_to_i64(other).map(|v| v as u64),
+    }
 }
 
 /// Extract u64 from any ScalarValue, preserving the full unsigned range
@@ -724,6 +728,28 @@ mod tests {
         assert!(
             scalar_to_epics_typed(&ScalarValue::String("\u{a0}5".into()), DbFieldType::Int64)
                 .is_err()
+        );
+    }
+
+    /// A real string PUT is `parseTo<double>` (glibc `stod`): hex floats,
+    /// ERANGE refused, C `isspace` only; an unsigned field parses unsigned.
+    #[test]
+    fn string_to_real_put_is_pvxs_parse_to_double() {
+        let put = |s: &str, t| scalar_to_epics_typed(&ScalarValue::String(s.into()), t);
+        assert_eq!(
+            put("0x1p4", DbFieldType::Double),
+            Ok(EpicsValue::Double(16.0))
+        );
+        assert_eq!(
+            put(" 2.5\t", DbFieldType::Float),
+            Ok(EpicsValue::Float(2.5))
+        );
+        for s in ["1e400", "1e-310", "\u{a0}5"] {
+            assert!(put(s, DbFieldType::Double).is_err(), "{s:?}");
+        }
+        assert_eq!(
+            put("18446744073709551615", DbFieldType::ULong),
+            Ok(EpicsValue::ULong(u32::MAX))
         );
     }
 

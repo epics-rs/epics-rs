@@ -295,7 +295,7 @@ fn ack_at_from_request(ack_any: Option<&crate::pvdata::ScalarValue>, queue_size:
             let s = s.as_str_lossy();
             if s.len() > 1
                 && let Some(pct) = s.strip_suffix('%')
-                && let Ok(percent) = pct.trim().parse::<f64>()
+                && let Ok(percent) = convert::parse_to_f64(pct)
                 && percent > 0.0
                 && percent <= 100.0
             {
@@ -7138,6 +7138,18 @@ mod tests {
             DEFAULT_PIPELINE_SIZE,
         );
         assert_eq!(f.ack_at, 4); // clamp to queue_size
+
+        // The percentage is `parseTo<double>` (clientmon.cpp:801): a hex
+        // float is 25%, so ackAt 2 of 8 rather than the 8/2 fallback.
+        let f = MonitorFlow::from_record_options(
+            &opts(&[
+                ("pipeline", "true"),
+                ("queueSize", "8"),
+                ("ackAny", "0x19%"),
+            ]),
+            DEFAULT_PIPELINE_SIZE,
+        );
+        assert_eq!(f.ack_at, 2);
     }
 
     /// The default (no-custom-request) path is unchanged: the builder

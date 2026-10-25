@@ -303,31 +303,47 @@ impl<T: std::fmt::Debug> std::fmt::Debug for SeqVar<T> {
     }
 }
 
-/// What C subscripts: an array, or a `string` as its `char` buffer.
+/// What C subscripts and points along: an array, or a `string` as its
+/// `char` buffer.
 pub trait Indexed {
     type Elem;
 
+    fn elems(&self) -> &[Self::Elem];
+
+    fn elems_mut(&mut self) -> &mut [Self::Elem];
+
     /// Run `f` on element `index`; an index past the end panics.
-    fn with_elem<R>(&mut self, index: usize, f: impl FnOnce(&mut Self::Elem) -> R) -> R;
+    fn with_elem<R>(&mut self, index: usize, f: impl FnOnce(&mut Self::Elem) -> R) -> R {
+        f(&mut self.elems_mut()[index])
+    }
 }
 
 impl<T, const N: usize> Indexed for [T; N] {
     type Elem = T;
 
-    fn with_elem<R>(&mut self, index: usize, f: impl FnOnce(&mut T) -> R) -> R {
-        f(&mut self[index])
+    fn elems(&self) -> &[T] {
+        self
+    }
+
+    fn elems_mut(&mut self) -> &mut [T] {
+        self
     }
 }
 
 impl Indexed for SeqString {
     type Elem = c_char;
 
-    fn with_elem<R>(&mut self, index: usize, f: impl FnOnce(&mut c_char) -> R) -> R {
-        let b = &mut self.as_buffer_mut()[index];
-        let mut c = *b as c_char;
-        let r = f(&mut c);
-        *b = c as u8;
-        r
+    fn elems(&self) -> &[c_char] {
+        let b = self.as_buffer();
+        // SAFETY: `c_char` is `i8` or `u8`, the size and alignment of `u8`,
+        // and every bit pattern is valid as either.
+        unsafe { std::slice::from_raw_parts(b.as_ptr().cast(), b.len()) }
+    }
+
+    fn elems_mut(&mut self) -> &mut [c_char] {
+        let b = self.as_buffer_mut();
+        // SAFETY: as in `elems`; the slice borrows `self` mutably.
+        unsafe { std::slice::from_raw_parts_mut(b.as_mut_ptr().cast(), b.len()) }
     }
 }
 
@@ -374,9 +390,22 @@ impl<A: Indexed<Elem: Indexed>, P: Place<A> + ?Sized> At<'_, P, A> {
     }
 }
 
+impl<A: Indexed<Elem: 'static> + 'static, P: Addr<A> + ?Sized> At<'_, P, A> {
+    /// C's `&a[i]`, and `a + i`: a pointer that moves along `a`.
+    pub fn ptr(&self) -> Ptr<A::Elem> {
+        Ptr::along(Arc::new(Elems(self.parent.ptr())), self.index as isize)
+    }
+}
+
 impl<A: Indexed, P: Place<A> + ?Sized> Place<A::Elem> for At<'_, P, A> {
     fn modify<R>(&self, f: impl FnOnce(&mut A::Elem) -> R) -> R {
         At::modify(self, f)
+    }
+}
+
+impl<A: Indexed<Elem: 'static> + 'static, P: Addr<A> + ?Sized> Addr<A::Elem> for At<'_, P, A> {
+    fn ptr(&self) -> Ptr<A::Elem> {
+        At::ptr(self)
     }
 }
 
@@ -405,6 +434,19 @@ impl<T: Send> Run<T> for Cell<T> {
     }
 }
 
+/// The elements of the array a pointer points at.
+struct Elems<A: 'static>(Ptr<A>);
+
+impl<A: Indexed + 'static> Run<A::Elem> for Elems<A> {
+    fn read(&self, f: &mut dyn FnMut(&[A::Elem])) {
+        self.0.read(|a| f(a.elems()))
+    }
+
+    fn write(&self, f: &mut dyn FnMut(&mut [A::Elem])) {
+        self.0.modify(|a| f(a.elems_mut()))
+    }
+}
+
 /// C's `T *`: null, or element `index` of a run. It keeps what it points
 /// into alive, so it never dangles. `p + n` may leave the run, as C's may;
 /// a read or write there panics where C's is undefined, as does one
@@ -427,6 +469,25 @@ impl<T> Ptr<T> {
 
     pub fn is_null(&self) -> bool {
         self.0.is_none()
+    }
+
+    /// C's `p + n`.
+    pub fn offset(&self, n: isize) -> Self {
+        let t = self.0.as_ref().expect("arithmetic on a null pointer");
+        Ptr(Some(Target {
+            run: t.run.clone(),
+            base: t.base,
+            index: t.index + n,
+        }))
+    }
+
+    /// C's `p - q`, in elements. Pointers into different objects panic,
+    /// where C's difference is undefined.
+    pub fn diff(&self, q: &Self) -> isize {
+        match (&self.0, &q.0) {
+            (Some(p), Some(q)) if p.base == q.base => p.index - q.index,
+            _ => panic!("difference of pointers into different objects"),
+        }
     }
 
     /// The run and the element this points at, which must be inside it.
@@ -684,6 +745,51 @@ mod tests {
         let copy = p.clone();
         copy.get().set(2);
         assert_eq!(x.get(), 2);
+    }
+
+    #[test]
+    fn a_pointer_moves_along_its_array() {
+        let a = SeqVar::new([1i32, 2, 3, 4]);
+        let p = a.at(1).ptr();
+        assert_eq!(p.get(), 2);
+        p.offset(2).set(9);
+        assert_eq!(a.get(), [1, 2, 3, 9]);
+        assert_eq!(p.offset(-1), a.at(0).ptr());
+        assert_eq!(a.at(4).ptr().diff(&p), 3);
+    }
+
+    #[test]
+    fn a_pointer_into_a_row_moves_along_the_row() {
+        let a = <SeqVar<[[f64; 3]; 2]>>::zeroed();
+        let p = a.at(1).at(0).ptr();
+        p.offset(2).set(7.0);
+        assert_eq!(a.get(), [[0.0; 3], [0.0, 0.0, 7.0]]);
+        // one past row 0 is row 1's first element, as in C
+        assert_eq!(a.at(0).at(3).ptr(), p);
+    }
+
+    #[test]
+    fn a_char_pointer_moves_along_a_string() {
+        let s = <SeqVar<SeqString>>::zeroed();
+        s.modify(|v| v.set(b"idle"));
+        let p = s.at(1).ptr();
+        p.set(b'c' as c_char);
+        assert_eq!(p.offset(1).get(), b'l' as c_char);
+        assert_eq!(s.get().as_bytes(), b"icle");
+    }
+
+    #[test]
+    #[should_panic(expected = "pointer past its object")]
+    fn a_pointer_past_its_array_panics() {
+        let a = SeqVar::new([1i32, 2]);
+        a.at(0).ptr().offset(2).get();
+    }
+
+    #[test]
+    #[should_panic(expected = "different objects")]
+    fn a_difference_across_variables_panics() {
+        let (a, b) = (SeqVar::new([1i32, 2]), SeqVar::new([1i32, 2]));
+        a.at(0).ptr().diff(&b.at(0).ptr());
     }
 
     #[test]

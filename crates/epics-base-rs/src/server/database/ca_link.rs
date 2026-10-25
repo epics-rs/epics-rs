@@ -33,9 +33,9 @@ use crate::server::event_queue::{
 };
 use crate::server::pv::{MonitorEvent, PutStarted, SubscribeRefused, WriteContext, WriteEnd};
 use crate::server::record::ProcessCompletion;
-use crate::server::snapshot::Snapshot;
+use crate::server::snapshot::{AlarmInfo, Snapshot};
 use crate::types::{
-    DBR_CTRL_DOUBLE, DBR_TIME_STRING, DbFieldType, EpicsValue, PvString, RecordName,
+    DBR_CTRL_DOUBLE, DBR_TIME_STRING, DbFieldType, EpicsValue, PvString, RecordName, WallTime,
     dbr_buffer_size, decode_dbr, encode_dbr_into, native_type_for_dbr,
 };
 
@@ -412,11 +412,7 @@ impl LinkSet for CaLinks {
     fn alarm_severity(&self, link: LinkRef<'_>) -> Option<i32> {
         self.answer(
             link,
-            |local| {
-                local
-                    .with_value(|s| s.alarm.severity as i32)
-                    .filter(|&s| s > 0)
-            },
+            |local| local.stamp().map(|s| s.severity as i32).filter(|&s| s > 0),
             |n| Some(n.alarm_severity(link)),
         )
         .flatten()
@@ -425,7 +421,7 @@ impl LinkSet for CaLinks {
     fn alarm_status(&self, link: LinkRef<'_>) -> Option<i32> {
         self.answer(
             link,
-            |local| local.with_value(|s| s.alarm.status as i32),
+            |local| local.stamp().map(|s| s.status as i32),
             |n| Some(n.alarm_status(link)),
         )
         .flatten()
@@ -441,8 +437,8 @@ impl LinkSet for CaLinks {
         self.answer(
             link,
             |local| {
-                local.with_value(|s| {
-                    let t = s.timestamp.since_unix_epoch();
+                local.stamp().map(|s| {
+                    let t = s.time.since_unix_epoch();
                     (t.as_secs() as i64, t.subsec_nanos() as i32, 0)
                 })
             },
@@ -489,10 +485,32 @@ impl LinkSet for CaLinks {
     }
 }
 
+/// The alarm and time of one event.
+#[derive(Clone, Copy)]
+struct LinkStamp {
+    status: u16,
+    severity: u16,
+    time: WallTime,
+}
+
+impl LinkStamp {
+    fn of(alarm: &AlarmInfo, time: WallTime) -> Self {
+        Self {
+            status: alarm.status,
+            severity: alarm.severity,
+            time,
+        }
+    }
+}
+
 /// What a local link's monitor task shares with the link: C `caLink`'s
 /// cached value and its `CA_DBPROCESS` request.
 struct LocalState {
     cache: ArcSwapOption<Snapshot>,
+    /// C `pca->stat`, `sevr` and `timeStamp`: every event of either monitor
+    /// overwrites them (`dbCa.c:1001-1003`), and `getAlarm` /
+    /// `getTimeStamp` serve the last (`dbCa.c:672-693`).
+    stamp: ArcSwapOption<LinkStamp>,
     process: ExternalCpProcess,
     /// Held while an event is taken off the queue, handed to `process` and
     /// counted, so [`Self::mark`] never sees one taken but not counted.
@@ -592,6 +610,7 @@ impl LocalLink {
         let bridge = db.inner.link_puts.network()?;
         let state = Arc::new(LocalState {
             cache: ArcSwapOption::empty(),
+            stamp: ArcSwapOption::empty(),
             process: ExternalCpProcess::awaiting_first_event(link),
             delivery: parking_lot::Mutex::new(()),
             taken: AtomicU64::new(0),
@@ -643,6 +662,10 @@ impl LocalLink {
 
     fn with_value<R>(&self, f: impl FnOnce(&Snapshot) -> R) -> Option<R> {
         self.state.cache.load().as_deref().map(f)
+    }
+
+    fn stamp(&self) -> Option<LinkStamp> {
+        self.state.stamp.load().as_deref().copied()
     }
 
     /// `dbCaGetLink` (`dbCa.c:419-506`), which marks a connected link a
@@ -861,6 +884,12 @@ async fn run_monitor(mut monitor: LocalMonitor, state: Arc<LocalState>, mut feed
                         // monitor exists (`dbCa.c:932-933`).
                         let scan = !(matches!(snapshot.value, EpicsValue::Enum(_))
                             && state.input_string.load(Ordering::Relaxed));
+                        // The stamp first, so a read that sees this value
+                        // sees its stamp.
+                        state.stamp.store(Some(Arc::new(LinkStamp::of(
+                            &snapshot.alarm,
+                            snapshot.timestamp,
+                        ))));
                         state.cache.store(Some(Arc::new(snapshot)));
                         if scan {
                             state.process.request();
@@ -878,8 +907,16 @@ async fn run_monitor(mut monitor: LocalMonitor, state: Arc<LocalState>, mut feed
                 }
             }
             // `CA_MONITOR_STRING` asks for one element (`dbCa.c:1239`).
-            Feed::String => match monitor.state_notify(event, 1).map(|s| s.value) {
-                Some(EpicsValue::String(s)) => {
+            Feed::String => match monitor.state_notify(event, 1) {
+                Some(Snapshot {
+                    value: EpicsValue::String(s),
+                    alarm,
+                    timestamp,
+                    ..
+                }) => {
+                    state
+                        .stamp
+                        .store(Some(Arc::new(LinkStamp::of(&alarm, timestamp))));
                     state.string.store(Some(Arc::new(s)));
                     state.process.request();
                 }

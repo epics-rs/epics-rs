@@ -145,10 +145,13 @@ char *P;
 char *Dmm;
 string pvname;
 string close_format;
-int mode;
 int chan;
 
 ss mode_change {
+    /* C defect fixed: mode was one variable both state sets wrote, so
+    ** read_meter could configure a channel, or take the delayed read, on
+    ** a mode mode_change had just loaded. Each has its own now. */
+    int mode;
     state init {
         when() {
             /* We set the following event flags to force these modes and
@@ -228,6 +231,7 @@ ss mode_change {
 }
 
 ss read_meter {
+    int mode;
     state init {
         when() {
             scan_chan = 0;

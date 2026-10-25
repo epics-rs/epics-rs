@@ -194,19 +194,28 @@ impl NDPluginProcess for AttributeProcessor {
         Ok(())
     }
 
-    /// C `NDPluginAttribute::writeInt32` drops the base class status
-    /// (`status = (asynStatus) callParamCallbacks();`, NDPluginAttribute.cpp:136): a refused NDPluginDriver write keeps
-    /// its clamp and succeeds. Reset zeros Val/ValSum on every channel inside
-    /// the write, whatever the value (:122-128).
+    /// C `NDPluginAttribute::writeInt32` drops the base refusal (NDPluginAttribute.cpp:136); not copied.
+    /// A kept refusal carries the errorMessage C's `if (status)` sets (:138-141).
+    /// Reset zeros Val/ValSum on every channel inside the write, whatever the
+    /// value (:122-128).
     fn validate_int32(
         &self,
         reason: usize,
         _addr: i32,
-        _value: i32,
+        value: i32,
         verdict: ad_core_rs::plugin::runtime::WriteVerdict<i32>,
         _params: &mut ad_core_rs::plugin::runtime::WritePort<'_>,
     ) -> ad_core_rs::plugin::runtime::WriteOutcome<i32> {
-        let out = ad_core_rs::plugin::runtime::WriteOutcome::from(verdict.succeed());
+        use ad_core_rs::plugin::runtime::{WriteOutcome, WriteVerdict};
+        let out = WriteOutcome::from(match verdict {
+            WriteVerdict::Refuse { keep, .. } => WriteVerdict::Refuse {
+                keep,
+                message: format!(
+                    "NDPluginAttribute::writeInt32: status=3, function={reason}, value={value}"
+                ),
+            },
+            accepted => accepted,
+        });
         if reason != self.params.reset {
             return out;
         }
@@ -294,32 +303,15 @@ mod tests {
         }
     }
 
-    /// `status = (asynStatus) callParamCallbacks();` (NDPluginAttribute.cpp:136).
+    /// NDPluginAttribute.cpp:136 drops the base refusal; an Attribute port
+    /// returns it.
     #[test]
-    fn a_refused_base_write_succeeds_as_c_write_int32_does() {
-        use ad_core_rs::plugin::runtime::WriteVerdict;
-        let proc = AttributeProcessor::new(8);
-        let mut base = asyn_rs::port::PortDriverBase::new(
-            "T",
-            1,
-            Default::default(),
-            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
-            asyn_rs::port::InterfaceMask::UNMIGRATED_INTERRUPTS,
-        );
-        let clamp = WriteVerdict::Refuse {
-            keep: 1,
-            message: String::new(),
-        };
+    fn a_refused_base_write_fails() {
+        let (message, function, value) =
+            crate::test_util::refused_base_write("ATTRIBUTE_REFUSED", AttributeProcessor::new(8));
         assert_eq!(
-            proc.validate_int32(
-                0,
-                0,
-                98,
-                clamp,
-                &mut ad_core_rs::plugin::runtime::WritePort::new(&mut base)
-            )
-            .verdict,
-            WriteVerdict::Accept(1)
+            message,
+            format!("NDPluginAttribute::writeInt32: status=3, function={function}, value={value}")
         );
     }
     use ad_core_rs::attributes::{NDAttrSource, NDAttrValue, NDAttribute};

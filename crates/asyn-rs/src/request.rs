@@ -1927,10 +1927,6 @@ impl SectionCallbacks {
     }
 }
 
-/// The sections the actor may trail its caller by and still hand every
-/// `updates` back.
-const SPARE_UPDATES: usize = 4;
-
 /// One caller's sections, one open at a time. Whichever of the actor (sets
 /// done) and the caller (section ended) comes second fires the callbacks, so
 /// a section that ends before the actor reaches its sets costs no further
@@ -1943,7 +1939,9 @@ pub struct Sections {
     /// The lists whose callbacks the actor holds.
     held: Mutex<Vec<i32>>,
     /// The `updates` of sections the actor has run, cleared, for the
-    /// caller's next ones.
+    /// caller's next ones. Every one is kept, so the list holds as many as
+    /// the actor has ever trailed by and a backlog that deep again allocates
+    /// none.
     spare: Mutex<Vec<Vec<ParamSetValue>>>,
 }
 
@@ -1975,10 +1973,7 @@ impl Sections {
 
     fn give_back(&self, mut updates: Vec<ParamSetValue>) {
         updates.clear();
-        let mut spare = self.spare.lock();
-        if spare.len() < SPARE_UPDATES {
-            spare.push(updates);
-        }
+        self.spare.lock().push(updates);
     }
 }
 

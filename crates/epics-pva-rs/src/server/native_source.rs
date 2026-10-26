@@ -1097,8 +1097,7 @@ fn record_snapshot(
     let mut snap = db.channel_snapshot_for_field(rec, field, false)?;
     // pvxs splits the `Q:time:tag` bits out of every read it serves
     // (`iocsource.cpp:239-248`); the record serves rsrv's raw stamp.
-    let nsec_mask = rec.read().qtime_nsec_mask();
-    epics_base_rs::server::snapshot::apply_nsec_mask(&mut snap, nsec_mask);
+    epics_base_rs::server::snapshot::apply_nsec_mask(&mut snap, rec.qtime_nsec_mask());
     render.read(&mut snap, filters);
     Some(snap)
 }
@@ -2082,7 +2081,7 @@ impl MetaDoor {
         render: ChannelRender,
         filters: FilterChain,
     ) -> Self {
-        let nsec_mask = rec.read().qtime_nsec_mask();
+        let nsec_mask = rec.qtime_nsec_mask();
         Self {
             db,
             rec,
@@ -5483,14 +5482,16 @@ ASG(DEFAULT) {
     /// once (pvxs `singlesrcsubscriptionctx.h:28-30`, `iocsource.cpp:239-248`).
     #[epics_macros_rs::epics_test]
     async fn a_qtime_tag_record_monitor_serves_the_split_stamp() {
-        use epics_base_rs::server::records::ai::AiRecord;
-
-        let db = Arc::new(PvDatabase::new());
-        db.add_record("AI:QTAG", Box::new(AiRecord::new(0.0)))
+        let (db, _) = epics_base_rs::server::ioc_builder::IocBuilder::new()
+            .db_string(
+                r#"record(ai, "AI:QTAG") { info(Q:time:tag, "nsec:lsb:20") }"#,
+                &HashMap::new(),
+            )
+            .unwrap()
+            .build()
             .await
             .unwrap();
         let rec = db.get_record("AI:QTAG").unwrap();
-        rec.write().set_info("Q:time:tag", "nsec:lsb:20");
         let source = PvDatabaseSource::new(db.clone());
         let ctx = make_ctx("localhost", "op", "ca");
         let checked = source
@@ -5539,6 +5540,96 @@ ASG(DEFAULT) {
             scalar(ts, "userTag"),
             ScalarValue::Int(t) if t as u32 == raw.subsec_nanos() & mask
         ));
+    }
+
+    /// pvxs reads a channel's `Q:time:tag` with no lock (`typeutils.cpp:79-88`),
+    /// so a monitor's door on a record another thread holds is built at once.
+    #[epics_macros_rs::epics_test]
+    async fn a_held_records_qtime_mask_is_read_without_its_lock() {
+        let (db, _) = epics_base_rs::server::ioc_builder::IocBuilder::new()
+            .db_string(
+                r#"record(ai, "AI:QHELD") { info(Q:time:tag, "nsec:lsb:20") }"#,
+                &HashMap::new(),
+            )
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        let rec = db.get_record("AI:QHELD").unwrap();
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        let holder = {
+            let h = db.async_handle();
+            std::thread::spawn(move || {
+                h.with_record("AI:QHELD", |_| {
+                    held_tx.send(()).unwrap();
+                    go_rx.recv().unwrap();
+                })
+            })
+        };
+        held_rx.recv().unwrap();
+        let door = std::thread::spawn(move || {
+            MetaDoor::new(
+                db,
+                rec,
+                "VAL".into(),
+                ChannelRender::Shaped(ChannelShape::Scalar),
+                FilterChain::new(),
+            )
+            .nsec_mask
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !door.is_finished() && std::time::Instant::now() < deadline {
+            epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let built = door.is_finished();
+        go_tx.send(()).unwrap();
+        holder.join().unwrap();
+        assert!(built, "MetaDoor::new waited for the record's holder");
+        assert_eq!(door.join().unwrap(), (1 << 20) - 1);
+    }
+
+    /// The mask the cell settled at load is the one the record's info tag
+    /// gives under its lock, on every boundary of pvxs's parse.
+    #[epics_macros_rs::epics_test]
+    async fn the_lock_free_qtime_mask_is_the_one_read_under_the_lock() {
+        let tags = [
+            "nsec:lsb:20",
+            "nsec:lsb: 4 ",
+            "nsec:lsb:31",
+            "nsec:lsb:0",
+            "nsec:lsb:64",
+            "NSEC:LSB:4",
+            "nsec:lsb:4x",
+            "nsec:lsb:2147483648",
+        ];
+        let mut text: String = tags
+            .iter()
+            .enumerate()
+            .map(|(i, tag)| format!("record(ai, \"Q{i}\") {{ info(Q:time:tag, \"{tag}\") }}\n"))
+            .collect();
+        text.push_str("record(ai, \"QNONE\") {}\n");
+        let (db, _) = epics_base_rs::server::ioc_builder::IocBuilder::new()
+            .db_string(&text, &HashMap::new())
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        for name in (0..tags.len())
+            .map(|i| format!("Q{i}"))
+            .chain(["QNONE".into()])
+        {
+            let rec = db.get_record(&name).unwrap();
+            assert_eq!(
+                rec.qtime_nsec_mask(),
+                rec.read().qtime_nsec_mask(),
+                "{name}"
+            );
+        }
+        assert_eq!(
+            db.get_record("Q0").unwrap().qtime_nsec_mask(),
+            (1 << 20) - 1
+        );
     }
 
     /// Every record monitor of one source attaches to its one `qsrvSingle`

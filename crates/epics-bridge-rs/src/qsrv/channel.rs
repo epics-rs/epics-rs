@@ -917,8 +917,7 @@ impl Channel for BridgeChannel {
                 field: self.field.clone(),
             })?;
         // pvxs's `Q:time:tag` split (`iocsource.cpp:239-248`).
-        let nsec_mask = rec.read().qtime_nsec_mask();
-        epics_base_rs::server::snapshot::apply_nsec_mask(&mut snapshot, nsec_mask);
+        epics_base_rs::server::snapshot::apply_nsec_mask(&mut snapshot, rec.qtime_nsec_mask());
 
         // Apply the channel-filter chain in READ context. pvxs wraps
         // every QSRV GET in a `LocalFieldLog` and runs the field-log

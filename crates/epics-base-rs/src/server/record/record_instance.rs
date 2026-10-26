@@ -2538,6 +2538,11 @@ pub struct RecordCell {
     /// as text; settled with [`Self::string_typed`], after the load has set
     /// the info tags.
     form_string: AtomicBool,
+    /// pvxs `MappingInfo::nsecMask` of `info(Q:time:tag)`
+    /// ([`RecordInstance::qtime_nsec_mask`]), which pvxs reads with no lock
+    /// once per channel (`typeutils.cpp:79-88`); settled with
+    /// [`Self::form_string`].
+    nsec_mask: std::sync::atomic::AtomicU64,
 }
 
 const _: () = assert!(std::mem::offset_of!(RecordCell, data) == 0);
@@ -3600,6 +3605,7 @@ impl RecordCell {
             form_string: AtomicBool::new(crate::server::database::char_view::form_string_of(
                 &instance,
             )),
+            nsec_mask: std::sync::atomic::AtomicU64::new(instance.qtime_nsec_mask()),
             data: LockSetGuarded(std::cell::UnsafeCell::new(instance)),
         }
     }
@@ -3648,9 +3654,10 @@ impl RecordCell {
     }
 
     /// Re-read [`Self::string_typed`], [`Self::dbaddr_counts`],
-    /// [`Self::runtime_types`], [`Self::long_string_size`] and
-    /// [`Self::form_string`] from `inst`, this cell's record, after a load or
-    /// an `init_record` that may have moved a type selector or a capacity.
+    /// [`Self::runtime_types`], [`Self::long_string_size`],
+    /// [`Self::form_string`] and [`Self::nsec_mask`] from `inst`, this cell's
+    /// record, after a load or an `init_record` that may have moved a type
+    /// selector or a capacity.
     pub(crate) fn settle_addr_facts(&self, inst: &RecordInstance) {
         use std::sync::atomic::Ordering::Relaxed;
         self.string_typed.store(string_typed_mask(inst), Relaxed);
@@ -3662,6 +3669,7 @@ impl RecordCell {
             crate::server::database::char_view::form_string_of(inst),
             Relaxed,
         );
+        self.nsec_mask.store(inst.qtime_nsec_mask(), Relaxed);
     }
 
     /// [`Self::long_string_size`]: a long-string field's `$` `no_elements`.
@@ -3673,6 +3681,11 @@ impl RecordCell {
     /// [`Self::form_string`]: the record carries `info(Q:form, "String")`.
     pub(crate) fn form_string(&self) -> bool {
         self.form_string.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The record's `Q:time:tag` mask ([`Self::nsec_mask`]), with no lock.
+    pub fn qtime_nsec_mask(&self) -> u64 {
+        self.nsec_mask.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// C `dbNameToAddr(name, &addr)` on this record succeeding, answered with
@@ -14217,6 +14230,7 @@ mod record_cell_layout_tests {
             cvt_pending_more,
             long_string_size,
             form_string,
+            nsec_mask,
         });
         packed_in_order(cell);
 

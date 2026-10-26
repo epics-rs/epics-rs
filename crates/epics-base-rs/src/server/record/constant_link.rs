@@ -16,7 +16,9 @@
 //!
 //! Both callers go through [`rec_gbl_init_constant_link`]: the parse, the DBF
 //! coercion and the bo boolean normalisation live here once, so the runtime
-//! re-seed cannot drift from the init seed.
+//! re-seed cannot drift from the init seed. A record whose C load sits after
+//! its dset init, and so cannot take the field-put seed, loads through
+//! [`load_constant_link_scalar`].
 
 use super::{ConstantInitLink, ParsedLink, Record, parse_link_v2};
 use crate::types::{DbFieldType, EpicsValue, PvString};
@@ -90,6 +92,19 @@ fn load_constant_link<R: Record + ?Sized>(
     };
     record.put_field(seed.target_field, value.clone()).ok()?;
     Some(value)
+}
+
+/// C `recGblInitConstantLink(plink, dbr_type, pvalue)` into a value the
+/// record stores itself (motor's DOL → VAL after its dset init): `None` where
+/// C stores nothing. A `type == CONSTANT` guard is the caller's.
+pub fn load_constant_link_scalar(link: &ParsedLink, dbr_type: DbFieldType) -> Option<EpicsValue> {
+    let ParsedLink::Constant(constant) = link else {
+        return None;
+    };
+    match constant_load_scalar(constant, dbr_type)? {
+        crate::types::c_parse::Converted::Stored(v) => Some(v.into_type(dbr_type)),
+        crate::types::c_parse::Converted::Unchanged => None,
+    }
 }
 
 /// The `special()` half: re-seed the input whose LINK field was just written,

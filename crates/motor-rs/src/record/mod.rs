@@ -9,9 +9,9 @@ use epics_base_rs::error::CaResult;
 use epics_base_rs::server::record::{
     CycleMarks, CyclePostMask, FieldDesc, FieldIx, MonitorValueClasses, MonitorValueGate,
     ParsedLink, ProcessAction, ProcessActions, ProcessOutcome, Record, ResolvedInputLinks,
-    parse_link_v2,
+    load_constant_link_scalar, parse_link_v2,
 };
-use epics_base_rs::types::EpicsValue;
+use epics_base_rs::types::{DbFieldType, EpicsValue};
 
 use crate::coordinate;
 use crate::device_state::*;
@@ -419,6 +419,23 @@ impl MotorRecord {
     /// CA DOL leaves the collection active even under closed loop.
     pub(crate) fn closed_loop_dol_collection(&self) -> bool {
         self.links.omsl == 1 && matches!(parse_link_v2(&self.links.dol), ParsedLink::Db(_))
+    }
+
+    /// The DOL under C init_record's `dol.type == CONSTANT` (677), the one
+    /// gate of the VAL seed and the UDF clear: an unset DOL is CONSTANT, a
+    /// `{const:…}` one a JSON_LINK.
+    fn constant_dol(&self) -> Option<ParsedLink> {
+        Some(parse_link_v2(&self.links.dol)).filter(ParsedLink::is_constant_type)
+    }
+
+    /// C init_record 680: `recGblInitConstantLink(&dol, DBF_DOUBLE, &val)`.
+    pub(crate) fn seed_val_from_dol(&mut self) {
+        let Some(dol) = self.constant_dol() else {
+            return;
+        };
+        if let Some(EpicsValue::Double(v)) = load_constant_link_scalar(&dol, DbFieldType::Double) {
+            self.pos.val = v;
+        }
     }
 
     /// True when a position field (VAL/DVAL/RVAL/RLV) was written during
@@ -959,7 +976,7 @@ impl Record for MotorRecord {
             return Ok(());
         }
         self.init_tail();
-        if parse_link_v2(&self.links.dol).is_constant_type() {
+        if self.constant_dol().is_some() {
             *udf = 0;
         }
         Ok(())

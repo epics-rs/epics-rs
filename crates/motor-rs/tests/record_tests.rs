@@ -6664,6 +6664,73 @@ fn test_rstm_always_restores_autosaved_dval() {
 }
 
 #[test]
+fn test_closed_loop_constant_dol_seeds_val_after_the_restore() {
+    // C init_record loads DOL into VAL (motorRecord.cc:677-681) after
+    // init_controller's restore, and closed loop keeps it (706-714).
+    use asyn_rs::interfaces::motor::MotorStatus;
+    let mut rec = MotorRecord::new();
+    rec.links.omsl = 1;
+    rec.links.dol = "5".into();
+    rec.conv.rstm = RestoreMode::Always;
+    rec.conv.mres = 1.0;
+    rec.pos.dval = 7.0; // autosaved
+    let status = MotorStatus {
+        done: true,
+        ..Default::default()
+    };
+    rec.initial_readback(&status);
+    assert_eq!((rec.pos.val, rec.pos.dval, rec.pos.rval), (5.0, 7.0, 0));
+    let i = &rec.internal;
+    assert_eq!((i.lval, i.ldvl, i.lrvl), (5.0, 7.0, 0));
+}
+
+#[test]
+fn test_init_restore_adopts_drive_values_only_off_closed_loop() {
+    // C init_record adopts VAL/DVAL/RVAL only off closed loop (706-714);
+    // the restore itself is the controller's position.
+    use asyn_rs::interfaces::motor::MotorStatus;
+    for (omsl, drive) in [(0, (7.0, 7.0, 7)), (1, (2.0, 7.0, 0))] {
+        let mut rec = MotorRecord::new();
+        rec.links.omsl = omsl;
+        rec.conv.rstm = RestoreMode::Always;
+        rec.conv.mres = 1.0;
+        rec.pos.val = 2.0; // autosaved
+        rec.pos.dval = 7.0;
+        let status = MotorStatus {
+            done: true,
+            ..Default::default()
+        };
+        let effects = rec.initial_readback(&status);
+        assert!(
+            effects
+                .commands
+                .iter()
+                .any(|c| matches!(c, MotorCommand::InitPosition { .. }))
+        );
+        assert_eq!((rec.pos.val, rec.pos.dval, rec.pos.rval), drive, "{omsl}");
+        let i = &rec.internal;
+        assert_eq!((i.lval, i.ldvl, i.lrvl), drive, "{omsl}");
+    }
+}
+
+#[test]
+fn test_closed_loop_empty_array_dol_leaves_val() {
+    // recGblInitConstantLink stores nothing for `[]`.
+    use asyn_rs::interfaces::motor::MotorStatus;
+    let mut rec = MotorRecord::new();
+    rec.links.omsl = 1;
+    rec.links.dol = "[]".into();
+    rec.conv.mres = 1.0;
+    rec.pos.val = 2.0;
+    let status = MotorStatus {
+        done: true,
+        ..Default::default()
+    };
+    rec.initial_readback(&status);
+    assert_eq!((rec.pos.val, rec.internal.lval), (2.0, 2.0));
+}
+
+#[test]
 fn test_rstm_near_zero_restores_when_driver_near_zero() {
     use asyn_rs::interfaces::motor::MotorStatus;
     let mut rec = MotorRecord::new();

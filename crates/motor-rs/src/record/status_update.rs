@@ -428,16 +428,8 @@ impl MotorRecord {
         }
 
         if restore {
-            // Adopt the autosaved DVAL: keep record coordinates and tell the
-            // driver to redefine its current position to that value.
-            self.pos.dval = autosaved_dval;
-            self.pos.val = coordinate::dial_to_user(autosaved_dval, self.conv.dir, self.pos.off);
-            if let Ok(rval) = coordinate::dial_to_raw(autosaved_dval, self.conv.mres) {
-                self.pos.rval = rval;
-            }
-            self.internal.ldvl = autosaved_dval;
-            self.internal.lval = self.pos.val;
-            self.internal.lrvl = self.pos.rval;
+            // Tell the driver to redefine its current position to the
+            // autosaved DVAL.
             effects.commands.push(MotorCommand::InitPosition {
                 position: self.raw_position(autosaved_dval),
             });
@@ -454,18 +446,28 @@ impl MotorRecord {
                     CFloat(rdbd),
                 ),
             );
-            if self.links.omsl == 1 {
-                // C init_record (705-714) skips the readback adoption under
-                // closed-loop OMSL — the DOL link owns the drive-value
-                // initialization — but still anchors the change-detection
-                // lasts (730-732).
-                self.internal.lval = self.pos.val;
-                self.internal.ldvl = self.pos.dval;
-                self.internal.lrvl = self.pos.rval;
+        }
+        // C init_record loads a CONSTANT DOL into VAL (677-681) and then
+        // adopts the readback into VAL/DVAL/RVAL unless closed-loop OMSL
+        // (706-714), where the drive values stay the DOL's. init_controller's
+        // restore has set the readback to the autosaved DVAL.
+        if self.links.omsl != 1 {
+            if restore {
+                self.pos.dval = autosaved_dval;
+                self.pos.val =
+                    coordinate::dial_to_user(autosaved_dval, self.conv.dir, self.pos.off);
+                if let Ok(rval) = coordinate::dial_to_raw(autosaved_dval, self.conv.mres) {
+                    self.pos.rval = rval;
+                }
             } else {
                 self.sync_positions();
             }
+        } else {
+            self.seed_val_from_dol();
         }
+        self.internal.lval = self.pos.val;
+        self.internal.ldvl = self.pos.dval;
+        self.internal.lrvl = self.pos.rval;
 
         effects
     }

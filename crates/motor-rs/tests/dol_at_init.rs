@@ -151,3 +151,50 @@ async fn only_a_constant_type_dol_clears_udf_at_init() {
     )
     .await;
 }
+
+/// C loads a CONSTANT DOL into VAL (motorRecord.cc:677-681) ahead of the
+/// readback adoption that overwrites it unless closed_loop (:706-714), and
+/// anchors LVAL on it (:730), so the first process moves nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_closed_loop_constant_dol_seeds_val() {
+    boot(
+        "VALDOL",
+        &[
+            ("VD:litcl", r#"field(DOL, "5") field(OMSL, "closed_loop")"#),
+            ("VD:lit", r#"field(DOL, "5")"#),
+        ],
+        |db| {
+            assert_eq!(num(db, "VD:litcl.VAL"), 5.0);
+            assert_eq!(num(db, "VD:litcl.DVAL"), 0.0, "no move");
+            assert_eq!(num(db, "VD:lit.VAL"), 0.0, "val = rbv at init");
+            for rec in ["VD:litcl", "VD:lit"] {
+                assert_eq!(udf(db, rec), 0, "{rec}");
+                assert_eq!(num(db, &format!("{rec}.SEVR")), 0.0, "{rec}");
+            }
+        },
+    )
+    .await;
+}
+
+/// Under closed_loop C adopts no drive value at init (:706-714), restore
+/// or not: init_controller's restore only sets the controller position.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_closed_loop_restore_keeps_the_drive_values() {
+    let restored =
+        r#"field(OMSL, "closed_loop") field(RSTM, "Always") field(VAL, "2") field(DVAL, "7")"#;
+    let with_dol = format!(r#"{restored} field(DOL, "5")"#);
+    boot(
+        "RSTDOL",
+        &[("RD:cl", restored), ("RD:cldol", &with_dol)],
+        |db| {
+            for (rec, val) in [("RD:cl", 2.0), ("RD:cldol", 5.0)] {
+                assert_eq!(num(db, &format!("{rec}.VAL")), val, "{rec}");
+                assert_eq!(num(db, &format!("{rec}.DVAL")), 7.0, "{rec}");
+                assert_eq!(num(db, &format!("{rec}.RVAL")), 0.0, "{rec}");
+                assert_eq!(num(db, &format!("{rec}.LVAL")), val, "{rec}");
+                assert_eq!(num(db, &format!("{rec}.LRVL")), 0.0, "{rec}");
+            }
+        },
+    )
+    .await;
+}

@@ -25,7 +25,9 @@ pub use alarm::{AlarmLimit, AlarmLimitField, AlarmSeverity, AnalogAlarmConfig};
 pub(crate) use common_fields::StampBegun;
 pub use common_fields::{BkptFlag, CommonFields, CommonText, StampMode, TimeLast};
 pub(crate) use constant_link::{constant_load_as, constant_load_scalar};
-pub use constant_link::{rec_gbl_init_constant_link, reseed_constant_input_link};
+pub use constant_link::{
+    load_constant_link_scalar, rec_gbl_init_constant_link, reseed_constant_input_link,
+};
 pub use contributed_dbd::{ContributedDbd, register_contributed_dbd};
 pub(crate) use contributed_dbd::{
     menus, record_declaration_order, record_fields, record_no_prompt, record_types,

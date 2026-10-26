@@ -5,7 +5,7 @@ use crate::server::record::{
     InputFetchPolicy, OutTarget, ProcessAction, ProcessActions, ProcessOutcome, Record,
     RecordProcessResult,
 };
-use crate::types::{DbFieldType, EpicsValue, PvString};
+use crate::types::{DbfCode, EpicsValue, PvString};
 
 use super::link_status::{
     LINK_CON, LINK_STATUS_CHOICES, LinkCheck, LinkCheckSpec, LinkCheckState, LinkRole, LinkRule,
@@ -1670,9 +1670,7 @@ impl Record for ScalcoutRecord {
     ) -> Option<crate::server::record::LinkReadAs> {
         use crate::server::record::LinkReadAs;
         Some(match source.field_type {
-            Some(DbFieldType::Char | DbFieldType::UChar) if source.element_count > 1 => {
-                LinkReadAs::Native
-            }
+            Some(DbfCode::Char | DbfCode::UChar) if source.element_count > 1 => LinkReadAs::Native,
             _ => LinkReadAs::String,
         })
     }
@@ -1828,11 +1826,7 @@ impl Record for ScalcoutRecord {
     ///
     /// - `DBF_STRING`/`ENUM`/`MENU`/`DEVICE`/`INLINK`/`OUTLINK`/`FWDLINK`
     ///   (:83-89, :131-134) — `DBR_STRING` from `OSV`, the OCAL string
-    ///   result. All seven classes are reported by
-    ///   [`OutTarget::puts_as_string`], which the target resolution settles:
-    ///   the port's `DbFieldType` is a DBR wire type and has no `Menu` or
-    ///   `Device` variant, so matching on it alone missed every menu target
-    ///   (`PRIO`, `STAT`, `SEVR`, `DISS`, `ACKT`, …) and `DTYP`.
+    ///   result.
     /// - `DBF_CHAR`/`DBF_UCHAR` with `n_elements > 1` (:92-96, :136-138) —
     ///   `DBF_CHAR` array of `min(n_elements, sizeof(sval)) = min(n, 40)`
     ///   bytes. C reads that buffer from `OSV` on the ASYNCHRONOUS branch
@@ -1851,11 +1845,17 @@ impl Record for ScalcoutRecord {
         if link_field != "OUT" {
             return staged;
         }
-        if target.puts_as_string {
-            return EpicsValue::String(self.osv.clone());
-        }
         match target.field_type {
-            Some(DbFieldType::Char) | Some(DbFieldType::UChar) if target.element_count > 1 => {
+            Some(
+                DbfCode::String
+                | DbfCode::Enum
+                | DbfCode::Menu
+                | DbfCode::Device
+                | DbfCode::Inlink
+                | DbfCode::Outlink
+                | DbfCode::Fwdlink,
+            ) => EpicsValue::String(self.osv.clone()),
+            Some(DbfCode::Char | DbfCode::UChar) if target.element_count > 1 => {
                 // `n_elements > sizeof(pscalcout->sval)` clamp — the C
                 // buffers are `char[SCALC_STRING_SIZE]` (40).
                 let n = target.element_count.min(SCALC_STRING_SIZE as i64) as usize;
@@ -2449,38 +2449,12 @@ mod tests {
         rec
     }
 
-    /// A target as `PvDatabase::resolve_out_target` would report it for a
-    /// STRING/ENUM/numeric field: those two DBR types are in C's string class
-    /// on their own. A `DBF_MENU`/`DBF_DEVICE` target is NOT expressible as a
-    /// `DbFieldType` — see [`out_target_menu`].
-    fn out_target(
-        field_type: Option<DbFieldType>,
-        element_count: i64,
-        is_ca_link: bool,
-    ) -> OutTarget {
+    /// A target as `PvDatabase::resolve_out_target` reports it.
+    fn out_target(field_type: Option<DbfCode>, element_count: i64, is_ca_link: bool) -> OutTarget {
         OutTarget {
             field_type,
             element_count,
             is_ca_link,
-            puts_as_string: matches!(
-                field_type,
-                Some(DbFieldType::String) | Some(DbFieldType::Enum)
-            ),
-            constant_type: false,
-            put_admitted: true,
-        }
-    }
-
-    /// A `DBF_MENU` target (`PRIO`, `STAT`, `SEVR`, `DISS`, `ACKT`, …) as the
-    /// resolver reports it: the menu INDEX is a short, so `field_type` is
-    /// `Short` — nothing in the DBR type says "menu". The class comes from
-    /// `puts_as_string`, which the target record settles.
-    fn out_target_menu() -> OutTarget {
-        OutTarget {
-            field_type: Some(DbFieldType::Short),
-            element_count: 1,
-            is_ca_link: false,
-            puts_as_string: true,
             constant_type: false,
             put_admitted: true,
         }
@@ -2494,11 +2468,7 @@ mod tests {
         let rec = three_buffer_scalcout();
         let staged = EpicsValue::Double(rec.oval);
         assert_eq!(
-            rec.multi_output_buffer(
-                "OUT",
-                staged,
-                &out_target(Some(DbFieldType::String), 1, false)
-            ),
+            rec.multi_output_buffer("OUT", staged, &out_target(Some(DbfCode::String), 1, false)),
             EpicsValue::String("ocal-str".into())
         );
     }
@@ -2510,27 +2480,20 @@ mod tests {
         let rec = three_buffer_scalcout();
         let staged = EpicsValue::Double(rec.oval);
         assert_eq!(
-            rec.multi_output_buffer(
-                "OUT",
-                staged,
-                &out_target(Some(DbFieldType::Enum), 1, false)
-            ),
+            rec.multi_output_buffer("OUT", staged, &out_target(Some(DbfCode::Enum), 1, false)),
             EpicsValue::String("ocal-str".into())
         );
     }
 
     /// R15-64 boundary: a `DBF_MENU` / `DBF_DEVICE` target — `PRIO`, `STAT`,
     /// `SEVR`, `DISS`, `ACKT`, `DTYP` — is in C's `DBR_STRING` case list
-    /// (`devsCalcoutSoft.c:128-130`) just like STRING and ENUM, and the port's
-    /// DBR-typed `field_type` (a menu index is a `Short`) cannot say so. The
-    /// class travels in `puts_as_string`; matching on `field_type` alone sent
-    /// the numeric OVAL to every menu target.
+    /// (`devsCalcoutSoft.c:128-130`) just like STRING and ENUM.
     #[test]
     fn r15_64_menu_target_gets_osv() {
         let rec = three_buffer_scalcout();
         let staged = EpicsValue::Double(rec.oval);
         assert_eq!(
-            rec.multi_output_buffer("OUT", staged, &out_target_menu()),
+            rec.multi_output_buffer("OUT", staged, &out_target(Some(DbfCode::Menu), 1, false)),
             EpicsValue::String("ocal-str".into()),
             "a DBF_MENU target takes DBR_STRING from OSV, not DBR_DOUBLE from OVAL"
         );
@@ -2543,11 +2506,7 @@ mod tests {
         let rec = three_buffer_scalcout();
         let staged = EpicsValue::Double(rec.oval);
         assert_eq!(
-            rec.multi_output_buffer(
-                "OUT",
-                staged,
-                &out_target(Some(DbFieldType::Double), 1, false)
-            ),
+            rec.multi_output_buffer("OUT", staged, &out_target(Some(DbfCode::Double), 1, false)),
             EpicsValue::Double(7.0)
         );
     }
@@ -2563,11 +2522,7 @@ mod tests {
         let mut want = b"calc-str".to_vec();
         want.resize(12, 0);
         assert_eq!(
-            rec.multi_output_buffer(
-                "OUT",
-                staged,
-                &out_target(Some(DbFieldType::Char), 12, false)
-            ),
+            rec.multi_output_buffer("OUT", staged, &out_target(Some(DbfCode::Char), 12, false)),
             EpicsValue::CharArray(want.into())
         );
     }
@@ -2582,11 +2537,7 @@ mod tests {
         let mut want = b"ocal-str".to_vec();
         want.resize(12, 0);
         assert_eq!(
-            rec.multi_output_buffer(
-                "OUT",
-                staged,
-                &out_target(Some(DbFieldType::Char), 12, true)
-            ),
+            rec.multi_output_buffer("OUT", staged, &out_target(Some(DbfCode::Char), 12, true)),
             EpicsValue::CharArray(want.into())
         );
     }
@@ -2602,11 +2553,7 @@ mod tests {
         let mut want = b"calc-str".to_vec();
         want.resize(12, 0);
         assert_eq!(
-            rec.multi_output_buffer(
-                "OUT",
-                staged,
-                &out_target(Some(DbFieldType::Char), 12, false)
-            ),
+            rec.multi_output_buffer("OUT", staged, &out_target(Some(DbfCode::Char), 12, false)),
             EpicsValue::CharArray(want.into())
         );
     }
@@ -2617,11 +2564,8 @@ mod tests {
     fn r14_61_char_array_target_clamps_to_40() {
         let rec = three_buffer_scalcout();
         let staged = EpicsValue::Double(rec.oval);
-        let out = rec.multi_output_buffer(
-            "OUT",
-            staged,
-            &out_target(Some(DbFieldType::UChar), 100, false),
-        );
+        let out =
+            rec.multi_output_buffer("OUT", staged, &out_target(Some(DbfCode::UChar), 100, false));
         match out {
             EpicsValue::CharArray(b) => assert_eq!(b.len(), 40),
             other => panic!("expected a CHAR array, got {other:?}"),
@@ -2638,7 +2582,7 @@ mod tests {
             rec.multi_output_buffer(
                 "OUT",
                 staged.clone(),
-                &out_target(Some(DbFieldType::Char), 1, false)
+                &out_target(Some(DbfCode::Char), 1, false)
             ),
             staged
         );
@@ -2653,7 +2597,7 @@ mod tests {
             rec.multi_output_buffer(
                 "OUT",
                 staged.clone(),
-                &out_target(Some(DbFieldType::Double), 1, false)
+                &out_target(Some(DbfCode::Double), 1, false)
             ),
             staged
         );

@@ -11,7 +11,7 @@ use crate::server::record::{
     CycleMarks, CyclePostMask, LinkReadAs, LinkType, OutTarget, PostStage, ProcessAction,
     ProcessActions, ProcessOutcome, Record, RecordProcessResult, parse_link_v2,
 };
-use crate::types::{DbFieldType, EpicsValue, PvString};
+use crate::types::{DbfCode, EpicsValue, PvString};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::Notify;
@@ -1655,8 +1655,7 @@ impl Record for SseqRecord {
     /// - `DBF_STRING`/`ENUM`/`MENU`/`DEVICE`/`INLINK`/`OUTLINK`/`FWDLINK`
     ///   (:644-661) — `DBR_STRING` into `s`/`STRn`, then `dov = atof(s)`. For an
     ///   `ENUM`/`MENU` source that is the state LABEL ("Busy"), so `DOn` becomes
-    ///   `atof("Busy") == 0`, NOT the state index. The seven classes are the same
-    ///   set [`OutTarget::puts_as_string`] reports for the destination switch.
+    ///   `atof("Busy") == 0`, NOT the state index.
     /// - `DBF_SHORT`..`DBF_DOUBLE` (:663-680) — `DBR_DOUBLE` into `dov`/`DOn`,
     ///   then `STRn` is re-rendered at the record's PREC.
     /// - `DBF_CHAR`/`DBF_UCHAR` (:682-700) — `min(n_elements, 40)` bytes into the
@@ -1687,22 +1686,25 @@ impl Record for SseqRecord {
         _link_field: &str,
         source: &OutTarget,
     ) -> Option<LinkReadAs> {
-        if source.puts_as_string {
-            return Some(LinkReadAs::String);
-        }
         match source.field_type? {
-            DbFieldType::String | DbFieldType::Enum => Some(LinkReadAs::String),
-            DbFieldType::Char | DbFieldType::UChar => Some(LinkReadAs::CharArrayAsString {
+            DbfCode::String
+            | DbfCode::Enum
+            | DbfCode::Menu
+            | DbfCode::Device
+            | DbfCode::Inlink
+            | DbfCode::Outlink
+            | DbfCode::Fwdlink => Some(LinkReadAs::String),
+            DbfCode::Char | DbfCode::UChar => Some(LinkReadAs::CharArrayAsString {
                 // C `if (n_elements>40) n_elements=40` against `char s[40]`.
                 max_elements: source.element_count.clamp(1, SSEQ_STRING_SIZE as i64) as usize,
             }),
-            DbFieldType::Short
-            | DbFieldType::UShort
-            | DbFieldType::Long
-            | DbFieldType::ULong
-            | DbFieldType::Float
-            | DbFieldType::Double => Some(LinkReadAs::Double),
-            DbFieldType::Int64 | DbFieldType::UInt64 => None,
+            DbfCode::Short
+            | DbfCode::UShort
+            | DbfCode::Long
+            | DbfCode::ULong
+            | DbfCode::Float
+            | DbfCode::Double => Some(LinkReadAs::Double),
+            DbfCode::Int64 | DbfCode::UInt64 | DbfCode::NoAccess => None,
         }
     }
 
@@ -1743,9 +1745,7 @@ impl Record for SseqRecord {
     /// choice, exactly as C's `switch (plinkGroup->lnk_field_type)`:
     ///
     /// - `DBF_STRING`/`ENUM`/`MENU`/`DEVICE`/`INLINK`/`OUTLINK`/`FWDLINK`
-    ///   (:715-736) — `DBR_STRING` from `s`/`STRn`. All seven classes are
-    ///   reported by [`OutTarget::puts_as_string`] (the port's `DbFieldType`
-    ///   is a DBR wire type, with no `Menu`/`Device` variant to match on).
+    ///   (:715-736) — `DBR_STRING` from `s`/`STRn`.
     /// - `DBF_SHORT`/`USHORT`/`LONG`/`ULONG`/`FLOAT`/`DOUBLE` (:737-758) —
     ///   `DBR_DOUBLE` from `dov`/`DOn`.
     /// - `DBF_CHAR`/`DBF_UCHAR` (:759-792) — `n_elements > 1` (the long-string
@@ -1763,14 +1763,15 @@ impl Record for SseqRecord {
             return None;
         };
         let step = &self.steps[i];
-        if target.puts_as_string {
-            return Some(EpicsValue::String(step.str_val.clone()));
-        }
         match target.field_type? {
-            DbFieldType::String | DbFieldType::Enum => {
-                Some(EpicsValue::String(step.str_val.clone()))
-            }
-            DbFieldType::Char | DbFieldType::UChar => {
+            DbfCode::String
+            | DbfCode::Enum
+            | DbfCode::Menu
+            | DbfCode::Device
+            | DbfCode::Inlink
+            | DbfCode::Outlink
+            | DbfCode::Fwdlink => Some(EpicsValue::String(step.str_val.clone())),
+            DbfCode::Char | DbfCode::UChar => {
                 if target.element_count > 1 {
                     // C puts `n` bytes straight out of the 40-byte `s`, so the
                     // string is NUL-padded out to the requested count.
@@ -1782,15 +1783,15 @@ impl Record for SseqRecord {
                     Some(EpicsValue::Double(step.dov))
                 }
             }
-            DbFieldType::Short
-            | DbFieldType::UShort
-            | DbFieldType::Long
-            | DbFieldType::ULong
-            | DbFieldType::Float
-            | DbFieldType::Double => Some(EpicsValue::Double(step.dov)),
-            // C's switch has no `DBF_INT64`/`DBF_UINT64` case → `default:
-            // break` → no put.
-            DbFieldType::Int64 | DbFieldType::UInt64 => None,
+            DbfCode::Short
+            | DbfCode::UShort
+            | DbfCode::Long
+            | DbfCode::ULong
+            | DbfCode::Float
+            | DbfCode::Double => Some(EpicsValue::Double(step.dov)),
+            // C's switch has no `DBF_INT64`/`DBF_UINT64` or `DBF_NOACCESS`
+            // case → `default: break` → no put.
+            DbfCode::Int64 | DbfCode::UInt64 | DbfCode::NoAccess => None,
         }
     }
 

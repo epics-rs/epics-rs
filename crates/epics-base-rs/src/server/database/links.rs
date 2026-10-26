@@ -3964,25 +3964,17 @@ impl PvDatabase {
         let external = |link: crate::server::record::ExternalRef<'_>| {
             let put_admitted = self.external_put_admitted(link).is_ok();
             match self.external_link_metadata(link) {
-                Some(m) => {
-                    let field_type = m.dbf_type.map(link_dbf_to_field_type);
-                    OutTarget {
-                        field_type,
-                        element_count: m.element_count.unwrap_or(1).max(1),
-                        is_ca_link: true,
-                        // A remote channel reports the DBR type its DBF class
-                        // is served as (`dbCaGetLinkDBFtype` → the channel's
-                        // type): a remote `DBF_MENU`/`DBF_DEVICE`/link field
-                        // arrives as `DBR_ENUM`/`DBR_STRING`, so the two wire
-                        // types ARE the string class over a CA link.
-                        puts_as_string: matches!(
-                            field_type,
-                            Some(DbFieldType::String) | Some(DbFieldType::Enum)
-                        ),
-                        constant_type: false,
-                        put_admitted,
-                    }
-                }
+                // A remote channel reports the DBR type its DBF class is
+                // served as (`dbCaGetLinkDBFtype` → the channel's type): a
+                // remote `DBF_MENU` or link field arrives as `DBF_ENUM` or
+                // `DBF_STRING`.
+                Some(m) => OutTarget {
+                    field_type: m.dbf_type.map(|t| link_dbf_to_field_type(t).dbf_code()),
+                    element_count: m.element_count.unwrap_or(1).max(1),
+                    is_ca_link: true,
+                    constant_type: false,
+                    put_admitted,
+                },
                 None => OutTarget {
                     is_ca_link: true,
                     constant_type: false,
@@ -4006,26 +3998,25 @@ impl PvDatabase {
                     LinkTarget::External => return external(db.external()),
                 };
                 let guard = target.read();
-                // `dbGetLinkDBFtype` / `dbGetNelements` of a `$` address: the
-                // `DBF_CHAR` view and its `no_elements`.
+                // `dbNameToAddr` of a `$` address: a string's `DBF_CHAR` view,
+                // or a link's own type, and its `no_elements`.
                 if addressed.string_view {
                     return match super::char_view::char_view(&guard, &addressed.field) {
                         Some(view) => OutTarget {
-                            field_type: Some(DbFieldType::Char),
+                            field_type: Some(view.field_type),
                             element_count: (view.no_elements as i64).max(1),
                             is_ca_link: false,
-                            puts_as_string: false,
                             constant_type: false,
                             put_admitted: true,
                         },
                         None => UNADDRESSED,
                     };
                 }
-                let field_type = crate::server::record::record_instance::addressed_field_type_of(
-                    guard.record.as_ref(),
+                let field_type = self.addressed_field_type(
+                    &target,
                     &addressed.field,
-                )
-                .or_else(|| self.attribute_field_type(&target, &addressed.field));
+                    Some(guard.record.as_ref()),
+                );
                 let element_count = match guard.record.get_field(&addressed.field) {
                     Some(v) if v.is_array() => guard
                         .record
@@ -4039,11 +4030,6 @@ impl PvDatabase {
                     field_type,
                     element_count: element_count.max(1),
                     is_ca_link: false,
-                    // C's `dbNameToAddr` gives the target field's DBF CLASS,
-                    // which includes `DBF_MENU` / `DBF_DEVICE` — classes the
-                    // port's DBR-typed `field_type` cannot name. The target
-                    // record classifies its own field.
-                    puts_as_string: guard.field_puts_as_string(&addressed.field),
                     constant_type: false,
                     put_admitted: true,
                 }
@@ -4057,10 +4043,9 @@ impl PvDatabase {
             // (`lnkState.c:126-135`): one `DBF_SHORT` element, and never a
             // string.
             crate::server::record::ParsedLink::State(_) => OutTarget {
-                field_type: Some(DbFieldType::Short),
+                field_type: Some(crate::types::DbfCode::Short),
                 element_count: 1,
                 is_ca_link: false,
-                puts_as_string: false,
                 constant_type: false,
                 put_admitted: true,
             },

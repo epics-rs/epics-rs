@@ -11,7 +11,7 @@ use crate::server::pv::{SubscribeRefused, Subscriber};
 use crate::server::recgbl::EventMask;
 use crate::server::snapshot::{EnumStringForm, PropertySupport};
 use crate::types::c_parse::Converted;
-use crate::types::{DbFieldType, EpicsValue, PvString, c_parse};
+use crate::types::{DbFieldType, DbfCode, EpicsValue, PvString, c_parse};
 
 use super::alarm::{AlarmLimit, AlarmLimitField, AlarmSeverity, AnalogAlarmConfig};
 use super::common_fields::{BkptFlag, CommonFields};
@@ -3702,10 +3702,11 @@ impl RecordCell {
     pub fn no_elements(&self, field: &str) -> Option<u32> {
         let named = |f: &&FieldDesc| f.name.eq_ignore_ascii_case(field);
         let Some(i) = self.rdes.fields.iter().position(|f| named(&f)) else {
-            return super::dbd_generated::DB_COMMON_FIELDS
+            return (super::dbd_generated::DB_COMMON_FIELDS
                 .iter()
                 .any(|f| named(&f))
-                .then_some(1);
+                || self.names_bare_noaccess(field))
+            .then_some(1);
         };
         let counts = self.dbaddr_counts.load();
         Some(
@@ -3716,26 +3717,37 @@ impl RecordCell {
         )
     }
 
-    /// C `dbNameToAddr`'s `field_type` for `field`: the declaration, or the
-    /// variant a runtime-typed field holds, read from `own` when the caller
-    /// holds this record and otherwise from [`Self::runtime_types`].
+    /// C `dbNameToAddr`'s `field_type` for `field`, the `dbfType` itself
+    /// ([`FieldDesc::addressed_dbf`]), or the variant a runtime-typed field
+    /// holds, read from `own` when the caller holds this record and otherwise
+    /// from [`Self::runtime_types`].
     pub(crate) fn addressed_field_type(
         &self,
         field: &str,
         own: Option<&dyn Record>,
-    ) -> Option<DbFieldType> {
-        let desc = field_desc_in(self.rdes.fields, field)?;
+    ) -> Option<DbfCode> {
+        let Some(desc) = field_desc_in(self.rdes.fields, field) else {
+            return self.names_bare_noaccess(field).then_some(DbfCode::NoAccess);
+        };
         if !desc.runtime_typed {
-            return Some(desc.dbf_type);
+            return Some(desc.addressed_dbf());
         }
-        match own {
+        let served = match own {
             Some(record) => record.get_field(field).map(|v| v.db_field_type()),
             None => {
                 let mut runtime_typed = self.rdes.fields.iter().filter(|f| f.runtime_typed);
                 let at = runtime_typed.position(|f| f.name == desc.name)?;
                 self.runtime_types.load().get(at).copied().flatten()
             }
-        }
+        };
+        served.map(DbFieldType::dbf_code)
+    }
+
+    /// A `DBF_NOACCESS` name the port carries with no [`FieldDesc`]: dbCommon's
+    /// `MLOK`/`MLIS`/`BKLNK`, a type's `calc.RPCL`. C has a `dbFldDes` for each
+    /// and `dbNameToAddr` resolves it, one `DBF_NOACCESS` element.
+    fn names_bare_noaccess(&self, field: &str) -> bool {
+        is_dbcommon_noaccess(field) || self.rdes.noaccess.contains(&field)
     }
 
     /// [`Self::no_elements`] as C's `dbNameToAddr` RUNS it: the record's
@@ -7225,14 +7237,18 @@ pub(crate) fn declared_field_type_of<R: Record + ?Sized>(
 }
 
 /// The `DBF_*` type a link to `field` addresses — C `dbNameToAddr`'s
-/// `field_type` once `cvt_dbaddr` has run: the declaration, or, for a
-/// runtime-typed field, the variant the record holds.
+/// `field_type` once `cvt_dbaddr` has run: [`FieldDesc::addressed_dbf`], or,
+/// for a runtime-typed or undeclared field, the variant the record holds.
 pub(crate) fn addressed_field_type_of<R: Record + ?Sized>(
     record: &R,
     field: &str,
-) -> Option<DbFieldType> {
-    declared_field_type_of(record, field)
-        .or_else(|| record.get_field(field).map(|v| v.db_field_type()))
+) -> Option<DbfCode> {
+    match field_desc_of(record, field) {
+        Some(desc) if !desc.runtime_typed => Some(desc.addressed_dbf()),
+        _ => record
+            .get_field(field)
+            .map(|v| v.db_field_type().dbf_code()),
+    }
 }
 
 /// The source record's part of a `DBR_STRING` link read — C's
@@ -9909,51 +9925,6 @@ impl RecordInstance {
     /// rendered as a number for a `DBF_MENU` and ONLY for a `DBF_MENU`.
     pub(crate) fn enum_string_form_for(&self, field: &str) -> Option<EnumStringForm> {
         enum_string_form_with(self.record.as_ref(), field, || self.device_choices())
-    }
-
-    /// Is `field` one of the DBF classes C's soft device support writes as
-    /// `DBR_STRING`?
-    ///
-    /// `devsCalcoutSoft.c:128-130` (and its async twin, :83-85) switches the
-    /// scalcout OUT put on the TARGET field's DBF type and sends `OSV` — the
-    /// string result — for seven of them:
-    ///
-    /// ```c
-    /// case DBF_STRING: case DBF_ENUM: case DBF_MENU: case DBF_DEVICE:
-    /// case DBF_INLINK: case DBF_OUTLINK: case DBF_FWDLINK:
-    ///     status = dbPutLink(&pscalcout->out, DBR_STRING, &pscalcout->osv, 1);
-    /// ```
-    ///
-    /// [`DbFieldType`] is the port's DBR *wire* type and cannot express
-    /// `DBF_MENU` / `DBF_DEVICE` — C's DBF class is not the DBR type. The
-    /// classification therefore lives here, with the record's field metadata,
-    /// where each class is already known:
-    ///
-    /// * `DBF_STRING` and the three link classes — the port stores links and
-    ///   `DTYP` (C's only `DBF_DEVICE` field) as strings;
-    /// * `DBF_ENUM` — an enum-typed field;
-    /// * `DBF_MENU` — a menu-index field, i.e. one this record resolves choice
-    ///   labels for ([`Self::menu_choices_for`]): `PRIO`, `STAT`, `SEVR`,
-    ///   `DISS`, `ACKT`, `SCAN`, `IVOA`, `OMSL`, … The index is stored as a
-    ///   short, so a same-named field that is NOT a menu index (scalcout's
-    ///   string `OSV` shares a name with the alarm-severity menu) is
-    ///   classified by its own type, not by the name collision.
-    ///
-    /// Everything else (`DBF_DOUBLE`, `DBF_LONG`, `DBF_CHAR`, …) falls to the
-    /// device support's `default:` arm.
-    ///
-    /// The question is about the target field's DECLARED class, so it is asked
-    /// of the declaration ([`Self::declared_field_type`]) and not of the
-    /// variant the record stores: C's `switch` is on `dbAddr.field_type`, which
-    /// `dbNameToAddr` took from the `dbFldDes`. `DBF_MENU` and `DBF_DEVICE` both
-    /// map to `DbFieldType::Enum` in the generated tables (`mapDBFToDBR`), and
-    /// the three link classes to `DbFieldType::String`, so the seven C arms are
-    /// exactly these two.
-    pub(crate) fn field_puts_as_string(&self, field: &str) -> bool {
-        let Some(declared) = self.declared_field_type(field) else {
-            return false;
-        };
-        matches!(declared, DbFieldType::String | DbFieldType::Enum)
     }
 
     /// The field's value as C `dbGetLink(plink, DBR_STRING, ...)` delivers it —

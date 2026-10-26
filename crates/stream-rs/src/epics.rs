@@ -58,7 +58,7 @@ use epics_base_rs::server::record::{
     AlarmSeverity, CommonFields, EPICS_TIME_EVENT_DEVICE_TIME, HwLink, OwnFrame, ParsedLink,
     Record, ScanType, parse_link_v2,
 };
-use epics_base_rs::types::{DbFieldType, EpicsValue, PvString, RecordName, WallTime};
+use epics_base_rs::types::{DbFieldType, DbfCode, EpicsValue, PvString, RecordName, WallTime};
 use epics_libcom_rs::cfmt::CFloat;
 use parking_lot::{Condvar, Mutex};
 
@@ -1021,10 +1021,7 @@ impl StreamHooks {
 
         // print (U)CHAR arrays as string
         let char_string = format.type_ == STRING_FORMAT
-            && matches!(
-                addr.field_type,
-                Some(DbFieldType::Char | DbFieldType::UChar)
-            );
+            && matches!(addr.field_type, DbfCode::Char | DbfCode::UChar);
         let dbr = match format.type_ {
             _ if char_string => DbFieldType::Char,
             UNSIGNED_FORMAT => DbFieldType::ULong,
@@ -1099,10 +1096,7 @@ impl StreamHooks {
         let record = addr.record.to_str_lossy();
         let field = addr.field.as_str();
         let nelem = addr.no_elements as usize;
-        let char_array = matches!(
-            addr.field_type,
-            Some(DbFieldType::Char | DbFieldType::UChar)
-        );
+        let char_array = matches!(addr.field_type, DbfCode::Char | DbfCode::UChar);
         let init_run = !db.interrupt_accept();
 
         let mut longs = Vec::new();

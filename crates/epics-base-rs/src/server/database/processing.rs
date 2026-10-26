@@ -812,9 +812,10 @@ pub struct DbAddr {
     pub record: RecordName,
     /// The field as the record type declares it: `pfldDes->name`.
     pub field: String,
-    /// `field_type`, after `cvt_dbaddr` and the `$` modifier; `None` for
-    /// `DBF_NOACCESS`.
-    pub field_type: Option<DbFieldType>,
+    /// `field_type`, after `cvt_dbaddr` and the `$` modifier: the `dbfType`
+    /// itself, so a menu is `DBF_MENU`, a link `DBF_INLINK`/`OUTLINK`/`FWDLINK`
+    /// and `TIME` `DBF_NOACCESS`.
+    pub field_type: crate::types::DbfCode,
     /// `no_elements`.
     pub no_elements: u32,
     /// The name carried `$`: `dbr_field_type` is `DBR_CHAR`, and the field
@@ -1164,10 +1165,10 @@ impl AsyncDbHandle {
     }
 
     /// C `dbNameToAddr(name, &addr)` on a record field, the `DBADDR` a
-    /// device keeps to reach it later. A `dbCommon` `DBF_NOACCESS` name
-    /// (`TIME`) resolves, as in C, with no field type. Takes no lock: `own`
-    /// is the calling record as for [`Self::db_get`], and another record's
-    /// runtime-typed field has the type settled at its init.
+    /// device keeps to reach it later. A `DBF_NOACCESS` name (`TIME`)
+    /// resolves, as in C. Takes no lock: `own` is the calling record as for
+    /// [`Self::db_get`], and another record's runtime-typed field has the
+    /// type settled at its init.
     pub fn name_to_dbaddr(
         &self,
         name: impl AsRef<[u8]>,
@@ -1178,22 +1179,12 @@ impl AsyncDbHandle {
         let char_view = parts.char_view();
         let (record, cell) = db.lookup_record(parts.record)?;
         let field = cell.canonical_field(parts.field_or_val()).into_owned();
-        if crate::server::record::record_instance::is_dbcommon_noaccess(&field) {
-            return (!char_view).then_some(DbAddr {
-                record,
-                field,
-                field_type: None,
-                no_elements: 1,
-                char_view,
-            });
-        }
         let no_elements = db.resolve_addr(&cell, &field)?;
         let own = own.and_then(|own| (own.name() == record.as_bytes()).then_some(own.record()));
         let (field_type, no_elements) = if char_view {
-            let (field_type, no_elements) = db.char_addressed(&cell, &field, own)?;
-            (Some(field_type), no_elements)
+            db.char_addressed(&cell, &field, own)?
         } else {
-            (db.addressed_field_type(&cell, &field, own), no_elements)
+            (db.addressed_field_type(&cell, &field, own)?, no_elements)
         };
         Some(DbAddr {
             record,
@@ -1240,10 +1231,7 @@ impl AsyncDbHandle {
     /// the link is constant / external / unresolvable, or the database is
     /// gone. (Distinct from the free `server::record::link_field_type`,
     /// which returns the link *class* `LinkType`, not the target's type.)
-    pub fn link_target_field_type(
-        &self,
-        link: impl AsRef<[u8]>,
-    ) -> Option<crate::types::DbFieldType> {
+    pub fn link_target_field_type(&self, link: impl AsRef<[u8]>) -> Option<crate::types::DbfCode> {
         match self.db() {
             Some(db) => db.link_target_field_type(link.as_ref()),
             None => None,
@@ -1254,7 +1242,7 @@ impl AsyncDbHandle {
     pub fn parsed_link_target_field_type(
         &self,
         link: &crate::server::record::ParsedLink,
-    ) -> Option<crate::types::DbFieldType> {
+    ) -> Option<crate::types::DbfCode> {
         self.db()?.parsed_link_target_field_type(link)
     }
 
@@ -4688,7 +4676,7 @@ impl PvDatabase {
     /// `CA`/`PVA` (external) link returns `None` — epics-base-rs has no
     /// client-side introspection of a remote field's type, so the caller
     /// renders those as the `DBF_unknown` sentinel.
-    pub(crate) fn link_target_field_type(&self, link: &[u8]) -> Option<crate::types::DbFieldType> {
+    pub(crate) fn link_target_field_type(&self, link: &[u8]) -> Option<crate::types::DbfCode> {
         self.parsed_link_target_field_type(&crate::server::record::parse_link_v2(link))
     }
 
@@ -4696,7 +4684,7 @@ impl PvDatabase {
     pub(crate) fn parsed_link_target_field_type(
         &self,
         link: &crate::server::record::ParsedLink,
-    ) -> Option<crate::types::DbFieldType> {
+    ) -> Option<crate::types::DbfCode> {
         let crate::server::record::ParsedLink::Db(db) = link else {
             return None;
         };

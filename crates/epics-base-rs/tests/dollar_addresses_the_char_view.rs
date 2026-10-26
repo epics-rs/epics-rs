@@ -13,7 +13,7 @@ use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::record::Record;
 use epics_base_rs::server::records::ai::AiRecord;
 use epics_base_rs::server::records::sseq::SseqRecord;
-use epics_base_rs::types::{DbFieldType, EpicsValue};
+use epics_base_rs::types::{DbFieldType, DbfCode, EpicsValue};
 
 const DB: &str = r#"
 record(ai, "AI") { field(DESC, "hello") }
@@ -60,11 +60,11 @@ async fn name_to_dbaddr_types_the_char_view() {
         h.name_to_dbaddr(pv, None)
             .map(|a| (a.field, a.field_type, a.no_elements))
     };
-    let char = Some(DbFieldType::Char);
+    let char = DbfCode::Char;
     assert_eq!(addr("AI.DESC$"), Some(("DESC".into(), char, 41)));
     assert_eq!(addr("AI.RTYP$"), Some(("RTYP".into(), char, 40)));
-    let inp = h.name_to_dbaddr("AI.INP", None).unwrap().field_type;
-    assert_eq!(addr("AI.INP$"), Some(("INP".into(), inp, 1024)));
+    assert_eq!(addr("AI.INP"), Some(("INP".into(), DbfCode::Inlink, 1)));
+    assert_eq!(addr("AI.INP$"), Some(("INP".into(), DbfCode::Inlink, 1024)));
     assert_eq!(addr("AI.VAL$"), None);
     assert_eq!(addr("AI.TIME$"), None);
 }
@@ -93,18 +93,18 @@ async fn has_pv_takes_the_char_view() {
 async fn a_link_to_a_char_view_is_a_char_link() {
     let db = ioc().await;
     let h = db.async_handle();
-    let char = Some(DbFieldType::Char);
+    let char = Some(DbfCode::Char);
     assert_eq!(h.link_target_field_type("AI.DESC$"), char);
     assert_eq!(h.link_target_field_type("AI.RTYP$"), char);
-    assert_eq!(
-        h.link_target_field_type("AI.INP$"),
-        h.link_target_field_type("AI.INP")
-    );
+    let inlink = Some(DbfCode::Inlink);
+    assert_eq!(h.link_target_field_type("AI.INP$"), inlink);
+    assert_eq!(h.link_target_field_type("AI.INP"), inlink);
     assert_eq!(h.link_target_field_type("AI.VAL$"), None);
     let get = |pv| db.get_pv(pv).unwrap();
     assert_eq!(get("SQ.DT1"), EpicsValue::Short(1));
     assert_eq!(get("SQ.DT2"), EpicsValue::Short(1));
-    assert_eq!(get("SQ.DT3"), get("SQ.DT5"));
+    assert_eq!(get("SQ.DT3"), EpicsValue::Short(14));
+    assert_eq!(get("SQ.DT5"), EpicsValue::Short(14));
     assert_eq!(get("SQ.DOL4V"), EpicsValue::Enum(0));
     assert_eq!(get("SQ.DT4"), EpicsValue::Short(-1));
 }

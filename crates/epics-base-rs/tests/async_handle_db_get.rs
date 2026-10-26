@@ -13,7 +13,7 @@ use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::record::AlarmSeverity;
 use epics_base_rs::server::snapshot::Snapshot;
-use epics_base_rs::types::{DbFieldType, EpicsValue};
+use epics_base_rs::types::{DbFieldType, DbfCode, EpicsValue};
 
 const DB: &str = r#"
 record(ai, "AI") {
@@ -551,7 +551,7 @@ async fn a_read_whose_holder_waits_behind_another_on_the_reader_is_refused() {
 
 /// `dbNameToAddr`'s `field_type` for `name` while another thread holds its
 /// record.
-fn typed_while_held(db: &PvDatabase, name: &'static str) -> Option<DbFieldType> {
+fn typed_while_held(db: &PvDatabase, name: &'static str) -> DbfCode {
     let (held_tx, held_rx) = std::sync::mpsc::channel();
     let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
     let h = db.async_handle();
@@ -575,7 +575,7 @@ fn typed_while_held(db: &PvDatabase, name: &'static str) -> Option<DbFieldType> 
 #[epics_macros_rs::epics_test]
 async fn name_to_dbaddr_types_a_field_of_a_record_held_elsewhere() {
     let db = ioc().await;
-    assert_eq!(typed_while_held(&db, "W.VAL"), Some(DbFieldType::Double));
+    assert_eq!(typed_while_held(&db, "W.VAL"), DbfCode::Double);
 }
 
 /// An mbbo's VAL is `DBF_USHORT` with no state defined and `DBF_ENUM` with
@@ -584,9 +584,9 @@ async fn name_to_dbaddr_types_a_field_of_a_record_held_elsewhere() {
 #[epics_macros_rs::epics_test]
 async fn name_to_dbaddr_types_an_mbbo_val_held_elsewhere_by_its_states() {
     let db = ioc().await;
-    assert_eq!(typed_while_held(&db, "MO.VAL"), Some(DbFieldType::UShort));
+    assert_eq!(typed_while_held(&db, "MO.VAL"), DbfCode::UShort);
     db.put_pv("MO.ZRST", EpicsValue::String("zero".into()))
         .await
         .unwrap();
-    assert_eq!(typed_while_held(&db, "MO.VAL"), Some(DbFieldType::Enum));
+    assert_eq!(typed_while_held(&db, "MO.VAL"), DbfCode::Enum);
 }

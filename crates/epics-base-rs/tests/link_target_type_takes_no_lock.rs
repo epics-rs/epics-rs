@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::records::scalcout::ScalcoutRecord;
-use epics_base_rs::types::{DbFieldType, EpicsValue};
+use epics_base_rs::types::{DbfCode, EpicsValue};
 
 // menu(scalcoutINAV) (sCalcoutRecord.dbd).
 const LOC: f64 = 2.0;
@@ -85,7 +85,7 @@ async fn a_held_target_is_typed_without_waiting_for_the_hold() {
     holder.join().unwrap();
     assert_eq!(
         typed.join().unwrap(),
-        [Some(DbFieldType::Double), Some(DbFieldType::Long)]
+        [Some(DbfCode::Double), Some(DbfCode::Long)]
     );
 }
 
@@ -142,5 +142,5 @@ async fn a_holder_typing_a_link_does_not_deadlock_with_the_targets_holder() {
     join_within(&x_holder, 20, "the holders deadlocked").await;
     join_within(&b_holder, 20, "the holders deadlocked").await;
     b_holder.join().unwrap();
-    assert_eq!(x_holder.join().unwrap(), Some(DbFieldType::Double));
+    assert_eq!(x_holder.join().unwrap(), Some(DbfCode::Double));
 }

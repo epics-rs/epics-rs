@@ -350,9 +350,9 @@ impl Record for LsiRecord {
         source: &crate::server::record::OutTarget,
     ) -> Option<crate::server::record::LinkReadAs> {
         use crate::server::record::LinkReadAs;
-        use crate::types::DbFieldType;
+        use crate::types::DbfCode;
         Some(match source.field_type {
-            Some(DbFieldType::Char | DbFieldType::UChar) => LinkReadAs::Native,
+            Some(DbfCode::Char | DbfCode::UChar) => LinkReadAs::Native,
             _ => LinkReadAs::String,
         })
     }

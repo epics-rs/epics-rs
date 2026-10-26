@@ -128,7 +128,7 @@ impl EnumSource {
                 let inst = record.read();
                 record
                     .addressed_field_type(field, Some(&*inst.record))
-                    .is_none_or(|t| t == DbFieldType::String)
+                    .is_none_or(|t| t.served_type() == Some(DbFieldType::String))
             }
             LongStringMode::DollarChar { .. } | LongStringMode::Text(_) => false,
         };

@@ -410,7 +410,7 @@ pub fn classify_link(
     // dbCaTask is paused until `dbCaRun` (dbCa.c:1173, iocInit.c:260), and
     // `special()` does not ask. Only `checkLinks` reads the connection.
     match local {
-        Some(ft) => (LINK_LOC, dbf_static_code(ft)),
+        Some(dbf) => (LINK_LOC, dbf as i16),
         None => (LINK_EXT_NC, DBF_UNKNOWN),
     }
 }

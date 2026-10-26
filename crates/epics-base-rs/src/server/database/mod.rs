@@ -4060,9 +4060,9 @@ impl PvDatabase {
         &self,
         rec: &RecordCell,
         field: &str,
-    ) -> Option<crate::types::DbFieldType> {
+    ) -> Option<crate::types::DbfCode> {
         (!rec.declares_name(field) && self.has_record_type_attribute(rec.rdes().record_type, field))
-            .then_some(crate::types::DbFieldType::String)
+            .then_some(crate::types::DbfCode::String)
     }
 
     /// [`RecordCell::addressed_field_type`], a record attribute included.
@@ -4071,7 +4071,7 @@ impl PvDatabase {
         rec: &RecordCell,
         field: &str,
         own: Option<&dyn Record>,
-    ) -> Option<crate::types::DbFieldType> {
+    ) -> Option<crate::types::DbfCode> {
         rec.addressed_field_type(field, own)
             .or_else(|| self.attribute_field_type(rec, field))
     }
@@ -4100,11 +4100,11 @@ impl PvDatabase {
         rec: &RecordCell,
         field: &str,
         own: Option<&dyn Record>,
-    ) -> Option<(crate::types::DbFieldType, u32)> {
+    ) -> Option<(crate::types::DbfCode, u32)> {
         let addr = char_view::CharAddr::of(self, rec, field)?;
         let field_type = match addr.source {
             char_view::CharSource::Link => self.addressed_field_type(rec, field, own)?,
-            _ => crate::types::DbFieldType::Char,
+            _ => crate::types::DbfCode::Char,
         };
         Some((field_type, addr.no_elements as u32))
     }

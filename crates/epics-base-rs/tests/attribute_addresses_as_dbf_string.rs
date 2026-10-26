@@ -47,14 +47,8 @@ async fn ioc() -> Arc<PvDatabase> {
 async fn a_link_to_an_attribute_is_a_string_link() {
     let db = ioc().await;
     let h = db.async_handle();
-    assert_eq!(
-        h.link_target_field_type("AI.RTYP"),
-        Some(DbFieldType::String)
-    );
-    assert_eq!(
-        h.link_target_field_type("AI.VERS"),
-        Some(DbFieldType::String)
-    );
+    assert_eq!(h.link_target_field_type("AI.RTYP"), Some(DbfCode::String));
+    assert_eq!(h.link_target_field_type("AI.VERS"), Some(DbfCode::String));
     assert_eq!(db.get_pv("SQ.DOL1V").unwrap(), EpicsValue::Enum(2));
     db.process_record("SQ").await.unwrap();
     let text = |pv| db.get_pv(pv).unwrap();
@@ -78,7 +72,7 @@ async fn name_to_addr_resolves_an_attribute() {
     let addr = h.name_to_dbaddr("AI.RTYP", None).unwrap();
     assert_eq!(
         (addr.field.as_str(), addr.field_type, addr.no_elements),
-        ("RTYP", Some(DbFieldType::String), 1)
+        ("RTYP", DbfCode::String, 1)
     );
     assert!(h.has_pv("AI.RTYP", None));
     let own = AiRecord::default();
@@ -124,17 +118,11 @@ async fn a_declared_field_hides_the_attribute() {
     db.put_record_type_attribute("ai", Some("XYZ"), Some("x"))
         .unwrap();
     let h = db.async_handle();
-    assert_eq!(
-        h.link_target_field_type("AI.PREC"),
-        Some(DbFieldType::Short)
-    );
+    assert_eq!(h.link_target_field_type("AI.PREC"), Some(DbfCode::Short));
     assert_eq!(
         h.name_to_dbaddr("AI.PREC", None).unwrap().field_type,
-        Some(DbFieldType::Short)
+        DbfCode::Short
     );
-    assert_eq!(
-        h.link_target_field_type("AI.XYZ"),
-        Some(DbFieldType::String)
-    );
+    assert_eq!(h.link_target_field_type("AI.XYZ"), Some(DbfCode::String));
     assert_eq!(h.name_to_addr("AI.XYZ"), Some(1));
 }

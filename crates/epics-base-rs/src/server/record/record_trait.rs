@@ -788,6 +788,23 @@ impl FieldDesc {
         self.no_access() && !matches!(self.declared_special, Special::DbAddr)
     }
 
+    /// C `dbEntryToAddr`'s `paddr->field_type` (`dbAccess.c:636-647`): the
+    /// declared `DBF_*` code, or on a `special(SPC_DBADDR)` row the type its
+    /// `cvt_dbaddr` overwrites it with — the `dbfType` itself, not its
+    /// `mapDBFToDBR` collapse, so a menu stays `DBF_MENU`, a link
+    /// `DBF_INLINK`/`OUTLINK`/`FWDLINK` and `TIME` `DBF_NOACCESS`. A
+    /// [`Self::runtime_typed`] row's placeholder is not its answer; the
+    /// record's stored variant is.
+    pub const fn addressed_dbf(&self) -> DbfCode {
+        // C tests `paddr->special` as just copied from `pflddes->special`
+        // (`dbAccess.c:638-641`), the DECLARED code: `lsi.VAL` declares
+        // `SPC_DBADDR` and resolves to `SPC_MOD`, and is `DBF_STRING`.
+        match self.declared_special {
+            Special::DbAddr => self.dbf_type.dbf_code(),
+            _ => self.declared_dbf,
+        }
+    }
+
     /// The width of one element as C's `paddr->field_size` holds it, for a
     /// field served as `served`.
     ///
@@ -923,9 +940,12 @@ pub fn seed_input_links(pairs: &[(&'static str, &'static str)]) -> Vec<ConstantI
 /// [`Record::multi_output_buffer`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OutTarget {
-    /// Target field's DBF type. `None` = unresolved (disconnected CA link,
-    /// or a name this IOC cannot resolve) — C's `field_type` initializer.
-    pub field_type: Option<DbFieldType>,
+    /// Target field's `dbfType` — C's `field_type`, the code its soft device
+    /// support switches on, so `DBF_MENU`, `DBF_DEVICE`, the link classes and
+    /// `DBF_NOACCESS` each have their own arm. `None` = unresolved
+    /// (disconnected CA link, or a name this IOC cannot resolve) — C's
+    /// `field_type` initializer.
+    pub field_type: Option<DbfCode>,
     /// Target field's element capacity — C `no_elements` / `dbCaGetNelements`.
     /// `1` when unresolved, matching C's `n_elements = 1` initializer.
     pub element_count: i64,
@@ -935,20 +955,6 @@ pub struct OutTarget {
     /// buffer choice on sync-vs-async (`devsCalcoutSoft.c:76`, gated on
     /// `plink->type == CA_LINK && pscalcout->wait`) reads this.
     pub is_ca_link: bool,
-    /// True when the target field is one of the seven DBF classes C's soft
-    /// device support puts as `DBR_STRING` — `DBF_STRING`, `DBF_ENUM`,
-    /// `DBF_MENU`, `DBF_DEVICE`, `DBF_INLINK`, `DBF_OUTLINK`, `DBF_FWDLINK`
-    /// (`devsCalcoutSoft.c:83-85`, `:128-130`).
-    ///
-    /// Carried here rather than re-derived from [`Self::field_type`] because
-    /// [`DbFieldType`] is the DBR *wire* type: it has no `Menu` or `Device`
-    /// variant, so a menu target (`PRIO`, `STAT`, `SEVR`, `DISS`, `ACKT`, …)
-    /// or `DTYP` is indistinguishable from a plain numeric/string field by
-    /// type alone. The classification is made once, at resolution, by the
-    /// side that holds the target's field metadata
-    /// (`RecordInstance::field_puts_as_string`); a record's
-    /// [`Record::multi_output_buffer`] just reads the answer.
-    pub puts_as_string: bool,
     /// C `plink->type == CONSTANT`, the test `tableRecord.c:2321` makes —
     /// not `dbLinkIsConstant`, which a removed link also answers: its type
     /// stays `PV_LINK` (`dbDbLink.c:132`) while it has no target.
@@ -968,7 +974,6 @@ impl OutTarget {
         field_type: None,
         element_count: 1,
         is_ca_link: false,
-        puts_as_string: false,
         constant_type: true,
         put_admitted: true,
     };

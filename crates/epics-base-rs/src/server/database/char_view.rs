@@ -37,14 +37,7 @@ use crate::types::{DbFieldType, DbfCode, EpicsValue};
 pub(crate) fn field_addr_types(fd: &FieldDesc, value: Option<&EpicsValue>) -> (DbfCode, DbfCode) {
     let field_type = match value {
         Some(v) if fd.runtime_typed => v.db_field_type().dbf_code(),
-        // C tests `paddr->special`, which `dbEntryToAddr` has just copied from
-        // `pflddes->special` (`dbAccess.c:638-641`) — the DECLARED code, not
-        // the one `cvt_dbaddr` then raises. `lsi.VAL` is the case in hand: it
-        // declares `SPC_DBADDR` and resolves to `SPC_MOD`, so reading the
-        // resolved code skipped the arm and labelled it `DBF_NOACCESS` where C
-        // says `DBF_STRING` (`lsiRecord.c::cvt_dbaddr`).
-        _ if fd.declared_special == Special::DbAddr => fd.dbf_type.dbf_code(),
-        _ => fd.declared_dbf,
+        _ => fd.addressed_dbf(),
     };
     (field_type, field_type.dbr_code())
 }
@@ -807,7 +800,10 @@ impl ChannelAddr {
                     Some(_) => CharSource::Link,
                     None => CharSource::Field,
                 };
-                (source, cell.addressed_field_type(field, None)?)
+                (
+                    source,
+                    cell.addressed_field_type(field, None)?.served_type()?,
+                )
             }
         };
         Some(Self {

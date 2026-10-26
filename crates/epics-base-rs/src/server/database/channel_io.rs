@@ -332,7 +332,7 @@ fn record_channel_shape(
         // whole buffer.
         return Some((DbFieldType::String, 1, LongStringMode::NativeString));
     }
-    let served = rec.addressed_field_type(field, None)?;
+    let served = rec.addressed_field_type(field, None)?.served_type()?;
     let count = rec.resolve_addr(field)?;
     let dbr_type =
         DbFieldType::from_u16(served.ca_wire_type()).expect("ca_wire_type is a CA DBF code");
@@ -832,7 +832,7 @@ record(state, "state") {}
                     inst.record.as_ref(),
                     field,
                 )
-                .or_else(|| inst.attribute(field).map(|_| DbFieldType::String));
+                .or_else(|| inst.attribute(field).map(|_| crate::types::DbfCode::String));
                 drop(inst);
                 if free != held {
                     differ.push(format!("{name}.{field}: {free:?} != {held:?}"));

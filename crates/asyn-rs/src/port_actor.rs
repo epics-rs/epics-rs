@@ -1169,6 +1169,12 @@ pub(crate) struct PortActor {
     /// is that "still queued, not yet eligible" half of C's queue list; the heap
     /// is the eligible half (R15-47).
     parked: Vec<ActorMessage>,
+    /// Requests a caller's section keeps out while it holds its callbacks
+    /// ([`Self::runs_while_a_section_holds`]), back in the heap at its end.
+    held_back: Vec<ActorMessage>,
+    /// A caller's section holds its callbacks: set when the actor stores the
+    /// sets of a section still open, cleared at the section's end.
+    section_held: bool,
     /// C `pport->queueStateChange` (asynManager.c:870, 1617): something happened
     /// that could make a parked request eligible, so the queue must be rescanned.
     /// Set by an arriving request and by a request that ran (either can enable a
@@ -1227,6 +1233,7 @@ impl Drop for PortActor {
             .into_iter()
             .chain(self.dequeued.take())
             .chain(std::mem::take(&mut self.parked))
+            .chain(std::mem::take(&mut self.held_back))
             .chain(std::mem::take(&mut self.pending_while_blocked));
         for msg in queued {
             if let RequestOp::Cell(_) = msg.op {
@@ -1266,6 +1273,8 @@ impl PortActor {
             dequeued: None,
             pending_while_blocked: Vec::new(),
             parked: Vec::new(),
+            held_back: Vec::new(),
+            section_held: false,
             rescan_parked: false,
             connect_failure_reported: false,
             woken: false,
@@ -1654,6 +1663,7 @@ impl PortActor {
             return;
         }
         self.parked.retain(|msg| !msg.is_gone());
+        self.held_back.retain(|msg| !msg.is_gone());
         self.pending_while_blocked.retain(|msg| !msg.is_gone());
         self.heap.retain(|msg| !msg.is_gone());
         self.woken = true;
@@ -1746,7 +1756,10 @@ impl PortActor {
                 out,
                 "    nDevices {} nQueued {} blocked:{}",
                 base.devices().len(),
-                self.heap.len() + self.pending_while_blocked.len() + self.parked.len(),
+                self.heap.len()
+                    + self.pending_while_blocked.len()
+                    + self.parked.len()
+                    + self.held_back.len(),
                 yn(self.cells.blocks().lock().any_held())
             );
             // C try-locks the two port mutexes from a *separate* report thread
@@ -1981,6 +1994,100 @@ impl PortActor {
         }
     }
 
+    /// Whether `op` runs while a caller's section holds its callbacks. The
+    /// section's thread holds C's lock from the sets to its
+    /// `callParamCallbacks` (NDPluginDriver.cpp:397-466, :525-539), so a
+    /// request that could store a param waits for the section's end. What
+    /// runs is that end, what C's manager does without the lock, and what
+    /// stores nothing: a read, which C's consumers make on the locking thread
+    /// itself, and a bare `callParamCallbacks`, which finds the section's
+    /// flags out of the store.
+    fn runs_while_a_section_holds(op: &RequestOp) -> bool {
+        match op {
+            RequestOp::CallParamCallbacks {
+                updates,
+                time_stamp,
+                gate,
+                ..
+            } => match gate {
+                Some(crate::request::SectionCallbacks::Held(_)) => true,
+                Some(crate::request::SectionCallbacks::Open { .. }) => false,
+                None => updates.is_empty() && time_stamp.is_none(),
+            },
+
+            RequestOp::SetEnable { .. }
+            | RequestOp::ExceptionDisconnect
+            | RequestOp::ExceptionConnect
+            | RequestOp::SetAutoConnect { .. }
+            | RequestOp::GetEnable
+            | RequestOp::GetAutoConnect
+            | RequestOp::GetConnected
+            | RequestOp::ConnectUser
+            | RequestOp::PushEchoInterpose
+            | RequestOp::PushDelayInterpose { .. }
+            | RequestOp::PushEosInterpose { .. }
+            | RequestOp::PushFlushInterpose { .. }
+            | RequestOp::SetTimeStampSource { .. }
+            | RequestOp::BlockProcess { .. }
+            | RequestOp::UnblockProcess { .. }
+            | RequestOp::ShutdownPort
+            | RequestOp::DrvUserCreate { .. }
+            | RequestOp::Report { .. }
+            | RequestOp::OctetRead { .. }
+            | RequestOp::OctetReadBinary { .. }
+            | RequestOp::Int32Read
+            | RequestOp::Int64Read
+            | RequestOp::Float64Read
+            | RequestOp::UInt32DigitalRead { .. }
+            | RequestOp::GetBoundsInt32
+            | RequestOp::GetBoundsInt64
+            | RequestOp::EnumRead
+            | RequestOp::Int32ArrayRead { .. }
+            | RequestOp::Float64ArrayRead { .. }
+            | RequestOp::Int8ArrayRead { .. }
+            | RequestOp::Int16ArrayRead { .. }
+            | RequestOp::Int64ArrayRead { .. }
+            | RequestOp::Float32ArrayRead { .. }
+            | RequestOp::GetOption { .. }
+            | RequestOp::GetInputEos
+            | RequestOp::GetOutputEos => true,
+
+            RequestOp::SetParams { .. }
+            | RequestOp::WithDriver(_)
+            | RequestOp::WithDriverAfterQueue(_)
+            | RequestOp::LockPort(_)
+            | RequestOp::Cell(_)
+            | RequestOp::CellInline(_)
+            | RequestOp::Connect
+            | RequestOp::Disconnect
+            | RequestOp::ConnectAddr
+            | RequestOp::DisconnectAddr
+            | RequestOp::OctetWrite { .. }
+            | RequestOp::OctetWriteRead { .. }
+            | RequestOp::OctetWriteBinary { .. }
+            | RequestOp::Int32Write { .. }
+            | RequestOp::Int64Write { .. }
+            | RequestOp::Float64Write { .. }
+            | RequestOp::UInt32DigitalWrite { .. }
+            | RequestOp::Flush
+            | RequestOp::NoIo
+            | RequestOp::EnumWrite { .. }
+            | RequestOp::Int32ArrayWrite { .. }
+            | RequestOp::Float64ArrayWrite { .. }
+            | RequestOp::Int8ArrayWrite { .. }
+            | RequestOp::Int16ArrayWrite { .. }
+            | RequestOp::Int64ArrayWrite { .. }
+            | RequestOp::Float32ArrayWrite { .. }
+            | RequestOp::SetOption { .. }
+            | RequestOp::SetInputEos { .. }
+            | RequestOp::SetOutputEos { .. }
+            | RequestOp::GpibUniversalCmd { .. }
+            | RequestOp::GpibAddressedCmd { .. }
+            | RequestOp::GpibIfc
+            | RequestOp::GpibRen { .. } => false,
+        }
+    }
+
     /// The `dpCommon` an `addr` names on THIS port — C `findDpCommon`
     /// through `locateDevice` (asynManager.c:538-545, :576).
     fn dp_key(&self, addr: i32) -> DpKey {
@@ -2024,6 +2131,13 @@ impl PortActor {
         gate.give_back(updates);
         if fire && let Some(e) = gate.fire(base) {
             failed.get_or_insert(e);
+        }
+        match gate {
+            crate::request::SectionCallbacks::Open { .. } => self.section_held = !fire,
+            crate::request::SectionCallbacks::Held(_) => {
+                self.section_held = false;
+                self.heap.extend(self.held_back.drain(..));
+            }
         }
         match failed {
             Some(e) => Err(e),
@@ -2097,6 +2211,7 @@ impl PortActor {
             .iter()
             .chain(&self.pending_while_blocked)
             .chain(&self.parked)
+            .chain(&self.held_back)
             .any(|msg| msg.user.block_token == Some(token))
     }
 
@@ -2191,6 +2306,10 @@ impl PortActor {
         // own timer here. A deadline, an `AQR` cancel and the dequeue below race
         // through one CAS on the token, and exactly one of them wins.
         if msg.is_gone() {
+            return None;
+        }
+        if self.section_held && !Self::runs_while_a_section_holds(&msg.op) {
+            self.held_back.push(msg);
             return None;
         }
 
@@ -3122,11 +3241,14 @@ impl PortActor {
                 self.driver.write_float32_array(user, data)?;
                 Ok(RequestResult::write_ok())
             }
+            RequestOp::CallParamCallbacks { gate: Some(_), .. } => {
+                unreachable!("run_claimed posts a section through post_section")
+            }
             RequestOp::CallParamCallbacks {
                 addr,
                 updates,
                 time_stamp,
-                gate,
+                gate: None,
             } => {
                 let base = self.driver.base_mut();
                 if let Some(ts) = time_stamp {
@@ -3151,26 +3273,15 @@ impl PortActor {
                 // the same reason one bad update does not strand the good ones
                 // above; the first error still reaches whoever waits on the
                 // reply.
-                match gate {
-                    Some(gate) => {
-                        if gate.owe(base, *addr, updates)
-                            && let Some(e) = gate.fire(base)
-                        {
-                            failed.get_or_insert(e);
-                        }
+                let mut flush = |list| {
+                    if let Err(e) = base.call_param_callbacks(list) {
+                        failed.get_or_insert(e);
                     }
-                    None => {
-                        let mut flush = |list| {
-                            if let Err(e) = base.call_param_callbacks(list) {
-                                failed.get_or_insert(e);
-                            }
-                        };
-                        flush(*addr);
-                        let mut further = Vec::new();
-                        crate::request::push_further_lists(*addr, updates, &mut further);
-                        further.into_iter().for_each(flush);
-                    }
-                }
+                };
+                flush(*addr);
+                let mut further = Vec::new();
+                crate::request::push_further_lists(*addr, updates, &mut further);
+                further.into_iter().for_each(flush);
                 match failed {
                     Some(e) => Err(e),
                     None => Ok(RequestResult::write_ok()),

@@ -5423,9 +5423,9 @@ mod tests {
         assert_eq!(*posts.lock(), [(0, 10), (1, 11)]);
     }
 
-    /// C's lock keeps any other `callParamCallbacks` out of a section: one
-    /// that runs inside it posts its own sets, not the section's, which wait
-    /// for its end.
+    /// C's lock keeps any other `callParamCallbacks` out of a section: a
+    /// bare one inside it posts none of the section's sets, and one carrying
+    /// sets of its own waits, sets and all, for the section's end.
     #[test]
     fn a_post_inside_a_section_leaves_the_sections_sets_to_its_end() {
         let (handle, posts, _sub) = gated_handle();
@@ -5433,13 +5433,25 @@ mod tests {
         let section = gate.open(0, None, vec![set_val(0, 60)]).unwrap();
         handle.call_param_callbacks_blocking(0).unwrap();
         handle
-            .set_params_and_notify_blocking(1, vec![set_val(1, 61)])
+            .submit_unanswered(
+                RequestOp::CallParamCallbacks {
+                    addr: 1,
+                    updates: vec![set_val(1, 61)],
+                    time_stamp: None,
+                    gate: None,
+                },
+                AsynUser::new(0).with_addr(1),
+            )
             .unwrap();
-        handle.read_int32_blocking(0, 0).unwrap();
-        assert_eq!(*posts.lock(), [(1, 61)], "posted the section's set");
+        assert_eq!(
+            handle.read_int32_blocking(0, 1).ok(),
+            None,
+            "stored inside the section"
+        );
+        assert!(posts.lock().is_empty(), "posted inside the section");
         section.end().unwrap();
         handle.read_int32_blocking(0, 0).unwrap();
-        assert_eq!(*posts.lock(), [(1, 61), (0, 60)]);
+        assert_eq!(*posts.lock(), [(0, 60), (1, 61)]);
     }
 
     /// A set the section stores unchanged raised no flag, so its end posts
@@ -5462,6 +5474,26 @@ mod tests {
         section.end().unwrap();
         handle.read_int32_blocking(0, 0).unwrap();
         assert_eq!(*posts.lock(), [(0, 70), (1, 71)]);
+    }
+
+    /// C's lock keeps a writer out of a section until its
+    /// `callParamCallbacks` has run (NDPluginDriver.cpp:466, :539): a write
+    /// to a param the section stored waits for the section's end, so the
+    /// section's value posts once and the writer's once after it.
+    #[test]
+    fn a_write_inside_a_section_posts_after_the_sections_value() {
+        let (handle, posts, _sub) = gated_handle();
+        let mut gate = handle.callbacks_gate();
+        let section = gate.open(0, None, vec![set_val(0, 90)]).unwrap();
+        handle
+            .submit_unanswered(RequestOp::Int32Write { value: 91 }, AsynUser::new(0))
+            .unwrap();
+        // The read's round trip ran behind the write.
+        assert_eq!(handle.read_int32_blocking(0, 0).unwrap(), 90);
+        assert!(posts.lock().is_empty(), "posted inside the section");
+        section.end().unwrap();
+        handle.read_int32_blocking(0, 0).unwrap();
+        assert_eq!(*posts.lock(), [(0, 90), (0, 91)]);
     }
 
     /// A section that ends before the actor reaches the sets leaves the

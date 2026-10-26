@@ -119,6 +119,21 @@ async fn a_multi_scan_reads_each_channel_that_is_on_in_its_own_mode() {
     assert_eq!(ioc.f64_of("init_dmm"), 0.0);
 }
 
+/// `ch10_mode_sel` offers coulombs as `ch1_mode_sel`..`ch9_mode_sel` do.
+/// C's template left its THST out, so channel 10 refused "COULOMB".
+#[epics_base_rs::epics_test]
+async fn channel_10_offers_coulombs_too() {
+    let ioc = boot(&EM, 10).await;
+    booted(&ioc).await;
+    ioc.put(
+        "ch10_mode_sel",
+        EpicsValue::String(PvString::from("COULOMB")),
+    )
+    .await;
+    assert_eq!(ioc.f64_of("ch10_mode_sel"), 3.0);
+    assert!(eventually(|| ioc.str_of("ch10_units") == "COULOMB").await);
+}
+
 /// A `channels` macro past the program's 10 channels is cut to 10. C
 /// scanned an 11th relay through `ch_on_off[10]` and `ch_mode[10]`, and its
 /// `pvPut(ch_raw[10])` processed `conf_dcv` instead of a reading.

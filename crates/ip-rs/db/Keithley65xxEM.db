@@ -346,6 +346,9 @@ grecord(mbbo,"$(P)$(Dmm)ch10_mode_sel") {
 	field(ZRST,"V DC")
 	field(ONST,"A DC")
 	field(TWST,"OHM 2W")
+# Upstream defect fixed: THST was left out of this record alone, so
+# channel 10 refused "COULOMB", which channels 1-9 offer.
+	field(THST,"COULOMB")
 #	field(FRST,"TEMP K")
 #	field(FVST,"HUMIDITY")
 }

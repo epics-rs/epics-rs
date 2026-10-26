@@ -22,8 +22,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use epics_base_rs::error::{CaError, CaResult};
+use epics_base_rs::error::{CaError, CaResult, DbResult};
 use epics_base_rs::server::database::PvDatabase;
+use epics_base_rs::server::device_support::Dpvt;
 use epics_base_rs::server::event_queue::EventReader;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::recgbl::EventMask;
@@ -206,10 +207,11 @@ impl Record for Throttle {
         &mut self,
         _link_field: &'static str,
         value: &EpicsValue,
-        failed: bool,
+        status: DbResult,
+        _dpvt: &mut Dpvt,
     ) -> ProcessActions {
         let mut actions = ProcessActions::new();
-        if failed {
+        if status.is_err() {
             self.sts = STS_ERR;
         } else {
             self.sts = STS_SUC;

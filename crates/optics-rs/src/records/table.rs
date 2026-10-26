@@ -2735,8 +2735,10 @@ impl Record for TableRecord {
         &mut self,
         _link_field: &'static str,
         _value: &EpicsValue,
-        failed: bool,
+        status: epics_base_rs::error::DbResult,
+        _dpvt: &mut epics_base_rs::server::device_support::Dpvt,
     ) -> ProcessActions {
+        let failed = status.is_err();
         let Resume {
             stage: Stage::Move { sv0x, mask },
             at,
@@ -4214,7 +4216,11 @@ mod tests {
                 .set_out_link_write_status(
                     link_field,
                     &value.clone(),
-                    fails.contains(&(puts.len() - 1)),
+                    match fails.contains(&(puts.len() - 1)) {
+                        true => Err(epics_base_rs::error::DbStatus::FAILED),
+                        false => Ok(()),
+                    },
+                    &mut epics_base_rs::server::device_support::Dpvt::Null,
                 )
                 .into_vec();
         }

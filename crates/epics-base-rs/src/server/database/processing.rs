@@ -9719,10 +9719,16 @@ impl PvDatabase {
             // told so — every emitted action reports exactly once,
             // so a record deriving a field from the result cannot
             // be left holding a stale one.
-            let more = rec
-                .write()
-                .record
-                .set_out_link_write_status(link_field, &value, true);
+            let more = {
+                let mut inst = rec.write();
+                let inst = &mut *inst;
+                inst.record.set_out_link_write_status(
+                    link_field,
+                    &value,
+                    Err(DbStatus::FAILED),
+                    &mut inst.dpvt,
+                )
+            };
             self.run_process_actions(record_name, rec, more, visited)?;
             // The status, though, is an empty CONSTANT link's: 0
             // (`dbConstPutValue`).
@@ -9754,10 +9760,12 @@ impl PvDatabase {
         // half was already raised by `write_out_link_value`; this
         // is what lets a record keep a C-truthful status field
         // (throttle STS) instead of committing its own intent.
-        let more =
-            rec.write()
-                .record
-                .set_out_link_write_status(link_field, &value, status.is_err());
+        let more = {
+            let mut inst = rec.write();
+            let inst = &mut *inst;
+            inst.record
+                .set_out_link_write_status(link_field, &value, status, &mut inst.dpvt)
+        };
         self.run_process_actions(record_name, rec, more, visited)?;
         ControlFlow::Continue(status)
     }

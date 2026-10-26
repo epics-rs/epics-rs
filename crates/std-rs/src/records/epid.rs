@@ -8,7 +8,8 @@ use epics_base_rs::server::recgbl::{self, alarm_status};
 use epics_base_rs::server::record::{
     AlarmSeverity, CommonFields, CycleCell, CycleHooks, CycleMarks, CyclePostMask, CycleRead,
     CycleValue, FieldDesc, FieldMetadataOverride, LinkType, OutTarget, ProcessAction,
-    ProcessActions, ProcessContext, ProcessOutcome, Record, parse_link_v2, parse_output_link_v2,
+    ProcessActions, ProcessContext, ProcessOutcome, Record, ResolvedInputLinks, parse_link_v2,
+    parse_output_link_v2,
 };
 use epics_base_rs::types::{EpicsValue, PvString};
 
@@ -227,11 +228,13 @@ pub struct EpidRecord {
     /// C. The CONSTANT/empty-link skip (`outl.type != CONSTANT`) is the
     /// framework's no-op on a constant OUTL `WriteDbLink`.
     outl_write: bool,
-    /// This cycle's UDF gate (`epidRecord.c:189-201`), judged once by
-    /// [`EpidRecord::judge_gate`] after the STPL read and taken by
-    /// `process()`. `None` on a cycle with no input stage (`process_local`),
-    /// where `process()` asks the same owner.
-    gate: Option<bool>,
+    /// This cycle's way through `process()` and `do_pid`, decided by the
+    /// input stage and taken by `process()`. `None` on a cycle with no input
+    /// stage (`process_local`), where `process()` asks [`EpidRecord::judge_gate`].
+    pub(crate) course: Option<Course>,
+    /// `do_pid` met a C `recGblSetSevr(pepid,LINK_ALARM,INVALID_ALARM)` site;
+    /// `check_alarms` raises it.
+    pub(crate) link_failed: bool,
     /// The OUTL readback captured for THIS cycle's bumpless turn-on, or
     /// `None` if OUTL was not read.
     ///
@@ -259,20 +262,31 @@ pub struct EpidRecord {
     /// `dbGetLink(stpl)` success (`epidRecord.c:191-193`), so any other byte,
     /// 2 included, stands.
     udf_cleared: bool,
-    /// This cycle fired a CA-type TRIG: C `devEpidSoftCallback.c:143-145`
-    /// sets `pepid->pact` and returns, and `epidRecord.c:207` returns
-    /// before `recGblGetTimeStamp` / `checkAlarms` / `monitor` /
-    /// `recGblFwdLink`, so the trigger pass runs none of the tail; the
-    /// callback pass runs `do_pid` and the tail once. Set by
-    /// [`EpidRecord::gate_after_pre_input_reads`] and taken by `process()`,
-    /// which then returns `ProcessOutcome::async_pending()`. Whether the
-    /// trigger is in flight is `Dpvt::Triggered`, which a device-link put
-    /// replaces as C's clears `pact`.
-    trigger_pass: bool,
     /// TRIG's `plink->type` after `dbInitLink`, handed in by this cycle's
     /// `ResolveOutTarget`: only the stored link knows a DB name this IOC
     /// does not serve is a `CA_LINK`.
     trig_type: LinkType,
+}
+
+/// Where this cycle's `process()` goes, in the order C's `process()` and
+/// `devEpidSoftCallback.c::do_pid` decide it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Course {
+    /// `udf == TRUE` (`epidRecord.c:195-202`): no `do_pid`, no tail.
+    Shut,
+    /// `do_pid` runs.
+    Run,
+    /// `dbCaPutLinkCallback` took the CA TRIG (`devEpidSoftCallback.c:143-145`):
+    /// PACT is set and `epidRecord.c:207` returns before the tail. The
+    /// trigger in flight is `Dpvt::Triggered`, which a device-link put
+    /// replaces as C's clears `pact`.
+    Triggered,
+    /// The TRIG put failed (`devEpidSoftCallback.c:121-124`, `:136-139`):
+    /// `do_pid` returns its status before the INP read; the tail runs.
+    TrigFailed(epics_base_rs::error::DbStatus),
+    /// The INP read failed (`devEpidSoft.c:113-116`,
+    /// `devEpidSoftCallback.c:149-152`): `do_pid` returns 0 before the PID.
+    InpFailed,
 }
 
 impl Default for EpidRecord {
@@ -338,10 +352,10 @@ impl Default for EpidRecord {
             udf: 1,
             udfs: AlarmSeverity::Invalid,
             outl_write: false,
-            gate: None,
+            course: None,
+            link_failed: false,
             outl_seed: None,
             udf_cleared: false,
-            trigger_pass: false,
             trig_type: LinkType::Constant,
         }
     }
@@ -610,35 +624,27 @@ impl Record for EpidRecord {
         //
         // The gate itself is `judge_gate`'s, judged after the STPL read.
 
-        // CA-TRIG trigger pass — C `devEpidSoftCallback.c:143-145` +
-        // `epidRecord.c:205-210`. `pre_input_link_actions` ran first
-        // this cycle, saw a CA-type TRIG link and fired the asynchronous
-        // readback trigger (`WriteDbLink{TRIG}` + `ReprocessAfter`) — the
-        // analogue of C `do_pid` setting `pepid->pact = TRUE` and
-        // `return(0)`.
-        //
-        // C `epidRecord.c:207` `if (!pact && pepid->pact) return(0)`
-        // then returns BEFORE `recGblGetTimeStamp` / `checkAlarms` /
-        // `monitor` / `recGblFwdLink`: the trigger pass runs NONE of
-        // the process tail. Return `async_pending` so the framework
-        // skips the alarm/timestamp/snapshot/OUT/FLNK tail for this
-        // cycle. The emitted actions were merged by the framework and
-        // are still executed; the reprocess pass runs
-        // `do_pid` and the tail exactly once.
+        let course = self.course.take().unwrap_or_else(|| {
+            if self.judge_gate(false) {
+                Course::Run
+            } else {
+                Course::Shut
+            }
+        });
+        // CA-TRIG trigger pass: C `epidRecord.c:207`
+        // `if (!pact && pepid->pact) return(0)` returns BEFORE
+        // `recGblGetTimeStamp` / `checkAlarms` / `monitor` /
+        // `recGblFwdLink`, so the trigger pass runs none of the tail; the
+        // reprocess pass runs `do_pid` and the tail exactly once.
         //
         // `device_did_compute` is cleared here because the trigger pass
         // performed NO compute — without this reset the reprocess pass
         // could observe a stale `true`.
-        if std::mem::take(&mut self.trigger_pass) {
+        if course == Course::Triggered {
             self.device_did_compute = false;
             return Ok(ProcessOutcome::async_pending());
         }
-
-        let open = match self.gate.take() {
-            Some(open) => open,
-            None => self.judge_gate(false),
-        };
-        if !open && !self.device_did_compute {
+        if course == Course::Shut && !self.device_did_compute {
             // C `epidRecord.c:195-202`: while `udf==TRUE`, skip
             // `do_pid` entirely and `return 0` — *before*
             // `recGblGetTimeStamp`, `checkAlarms`, `monitor` and
@@ -652,6 +658,7 @@ impl Record for EpidRecord {
         }
 
         if !self.device_did_compute {
+            self.course = Some(course);
             crate::device_support::epid_soft::EpidSoftDeviceSupport::do_pid(self);
         }
         self.device_did_compute = false; // Reset for next cycle
@@ -695,6 +702,9 @@ impl Record for EpidRecord {
         // calls this hook after `process()`).
         if self.inp_constant {
             recgbl::rec_gbl_set_sevr(common, alarm_status::SOFT_ALARM, AlarmSeverity::Invalid);
+        }
+        if std::mem::take(&mut self.link_failed) {
+            recgbl::rec_gbl_set_sevr(common, alarm_status::LINK_ALARM, AlarmSeverity::Invalid);
         }
         // C `epidRecord.c:309` `if (pepid->udf == TRUE) return`: the UDF_ALARM
         // itself is raised by `rec_gbl_check_udf` (`udf_alarm_on_exact_one`).
@@ -1210,24 +1220,24 @@ impl Record for EpidRecord {
     /// DB link is written synchronously and falls through to the PID in
     /// the same pass; a CA link cannot be waited on, so C fires
     /// `dbCaPutLinkCallback`, sets `pact` and returns, and the PID runs
-    /// on the callback pass. That `pact` is `Dpvt::Triggered` here, and
-    /// its arm below is C's `!pepid->pact` guard: on the callback pass
-    /// the trigger block is skipped entirely. A device-link put replaces
-    /// the `dpvt` (`dbAccess.c:1192-1194`), so the callback a put lands
-    /// before fires the trigger again, as C's does.
+    /// on the callback pass. That `pact` is `Dpvt::Triggered` here, set by
+    /// [`Record::set_out_link_write_status`] once the put is taken, and its
+    /// arm below is C's `!pepid->pact` guard: on the callback pass the
+    /// trigger block is skipped entirely. A device-link put replaces the
+    /// `dpvt` (`dbAccess.c:1192-1194`), so the callback a put lands before
+    /// fires the trigger again, as C's does.
     fn pre_input_link_actions(
         &mut self,
         _dol_is_constant: bool,
         dpvt: &mut Dpvt,
     ) -> ProcessActions {
-        self.trigger_pass = false;
-        self.gate = None;
+        self.course = None;
         // C `epidRecord.c:187` `if (!pact)`: the CA-TRIG callback pass
         // (`devEpidSoftCallback.c:116`) takes no setpoint, no gate and no
         // second trigger.
         if self.is_async_callback_dtyp() && matches!(dpvt, Dpvt::Triggered) {
             *dpvt = Dpvt::Null;
-            self.gate = Some(true);
+            self.course = Some(Course::Run);
             return ProcessActions::new();
         }
         let mut actions = Vec::new();
@@ -1251,39 +1261,53 @@ impl Record for EpidRecord {
     fn gate_after_pre_input_reads(
         &mut self,
         resolved: &[&'static str],
-        dpvt: &mut Dpvt,
+        _dpvt: &mut Dpvt,
     ) -> Option<ProcessActions> {
-        if self.gate.is_some() {
+        if self.course.is_some() {
             return Some(ProcessActions::new());
         }
-        let open = self.judge_gate(resolved.contains(&"STPL"));
-        self.gate = Some(open);
-        if !open {
+        if !self.judge_gate(resolved.contains(&"STPL")) {
+            self.course = Some(Course::Shut);
             return None;
         }
-        if !self.is_async_callback_dtyp() {
+        self.course = Some(Course::Run);
+        // C `ptriglink->type` CONSTANT/empty: `dbPutLink` to a constant link
+        // is a no-op, and the PID runs in this pass. Every other type is put
+        // here, `dbPutLink` (`devEpidSoftCallback.c:117-125`) or
+        // `dbCaPutLinkCallback` (`:126-146`); `set_out_link_write_status`
+        // takes the outcome.
+        if !self.is_async_callback_dtyp() || self.trig_type == LinkType::Constant {
             return Some(ProcessActions::new());
         }
-        let write = ProcessAction::WriteDbLink {
+        Some(ProcessActions::from(vec![ProcessAction::WriteDbLink {
             link_field: "TRIG",
             value: EpicsValue::Double(self.tval),
-        };
-        Some(match self.trig_type {
-            LinkType::Ca => {
+        }]))
+    }
+
+    fn set_out_link_write_status(
+        &mut self,
+        link_field: &'static str,
+        _value: &EpicsValue,
+        status: epics_base_rs::error::DbResult,
+        dpvt: &mut Dpvt,
+    ) -> ProcessActions {
+        if link_field != "TRIG" {
+            return ProcessActions::new();
+        }
+        match status {
+            Err(status) => self.course = Some(Course::TrigFailed(status)),
+            // `pepid->pact = TRUE`: the callback reprocesses the record.
+            Ok(()) if self.trig_type == LinkType::Ca => {
                 *dpvt = Dpvt::Triggered;
-                self.trigger_pass = true;
-                ProcessActions::from(vec![
-                    write,
-                    ProcessAction::ReprocessAfter(std::time::Duration::from_millis(1)),
-                ])
+                self.course = Some(Course::Triggered);
+                return ProcessActions::from(vec![ProcessAction::ReprocessAfter(
+                    std::time::Duration::from_millis(1),
+                )]);
             }
-            // C `ptriglink->type` is CONSTANT/empty: `dbPutLink` to a
-            // constant link is a no-op, and the PID runs in this pass.
-            LinkType::Constant => ProcessActions::new(),
-            // C `ptriglink->type != CA_LINK` (`devEpidSoftCallback.c:117`):
-            // `dbPutLink`, and the PID runs in this pass.
-            LinkType::Db | LinkType::Json | LinkType::Other => ProcessActions::from(vec![write]),
-        })
+            Ok(()) => {}
+        }
+        ProcessActions::new()
     }
 
     fn set_resolved_out_target(&mut self, link_field: &str, target: OutTarget) {
@@ -1397,7 +1421,8 @@ impl Record for EpidRecord {
 
     /// C reads INP inside `do_pid` (`devEpidSoft.c:113`,
     /// `devEpidSoftCallback.c:149`), behind the `udf == TRUE` return
-    /// (`epidRecord.c:195`): a shut gate reads nothing.
+    /// (`epidRecord.c:195`) and the TRIG block's returns (`:121-145`): only a
+    /// cycle on its way to the PID reads it.
     fn narrows_input_links(&self) -> bool {
         true
     }
@@ -1406,7 +1431,16 @@ impl Record for EpidRecord {
         &self,
         _selector: Option<u16>,
     ) -> Option<&'static [(&'static str, &'static str)]> {
-        (self.gate == Some(false)).then_some(&[])
+        matches!(self.course, Some(c) if c != Course::Run).then_some(&[])
+    }
+
+    fn set_resolved_input_links(&mut self, resolved: ResolvedInputLinks<'_>) {
+        if self.course == Some(Course::Run)
+            && !resolved.contains("INP")
+            && !parse_link_v2(&self.inp).is_constant_type()
+        {
+            self.course = Some(Course::InpFailed);
+        }
     }
 
     fn multi_input_links(&self) -> &'static [(&'static str, &'static str)] {

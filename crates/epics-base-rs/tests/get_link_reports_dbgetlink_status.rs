@@ -13,8 +13,9 @@
 
 use std::sync::{Arc, Mutex};
 
-use epics_base_rs::error::CaResult;
+use epics_base_rs::error::{CaResult, DbResult};
 use epics_base_rs::server::database::PvDatabase;
+use epics_base_rs::server::device_support::Dpvt;
 use epics_base_rs::server::record::{
     AlarmSeverity, FieldDesc, LinkRead, ProcessAction, ProcessActions, ProcessOutcome, Record,
 };
@@ -88,10 +89,14 @@ impl Record for Probe {
         &mut self,
         _link_field: &'static str,
         _value: &EpicsValue,
-        failed: bool,
+        status: DbResult,
+        _dpvt: &mut Dpvt,
     ) -> ProcessActions {
-        self.heard.lock().unwrap().push(Heard::Wrote(!failed));
-        if failed {
+        self.heard
+            .lock()
+            .unwrap()
+            .push(Heard::Wrote(status.is_ok()));
+        if status.is_err() {
             return ProcessActions::new();
         }
         ProcessActions::from(vec![ProcessAction::GetLink { link_field: "LNK" }])

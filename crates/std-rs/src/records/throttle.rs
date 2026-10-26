@@ -963,13 +963,14 @@ impl Record for ThrottleRecord {
         &mut self,
         link_field: &'static str,
         value: &EpicsValue,
-        failed: bool,
+        status: epics_base_rs::error::DbResult,
+        _dpvt: &mut epics_base_rs::server::device_support::Dpvt,
     ) -> ProcessActions {
         if link_field != "OUT" {
             return ProcessActions::new();
         }
         let mut actions = Vec::new();
-        if failed {
+        if status.is_err() {
             self.sts = THROTTLE_STS_ERR;
         } else {
             self.sts = THROTTLE_STS_SUC;

@@ -4,7 +4,7 @@ use epics_base_rs::error::{CaResult, DbStatus};
 use epics_base_rs::server::device_support::{DeviceReadOutcome, DeviceSupport, DeviceUdf};
 use epics_base_rs::server::record::Record;
 
-use crate::records::epid::EpidRecord;
+use crate::records::epid::{Course, EpidRecord};
 
 /// `do_pid`'s `return(1)` for a pass inside MDT (`devEpidSoft.c:125`).
 const SUB_MDT: DbStatus = match DbStatus::new(1) {
@@ -64,6 +64,19 @@ impl EpidSoftDeviceSupport {
             return;
         }
         epid.inp_constant = false;
+        // The input stage's TRIG put and INP read, which C makes here.
+        match epid.course.take() {
+            Some(Course::TrigFailed(status)) => {
+                epid.link_failed = true;
+                epid.pid_status = Err(status);
+                return;
+            }
+            Some(Course::InpFailed) => {
+                epid.link_failed = true;
+                return;
+            }
+            _ => {}
+        }
 
         // Previous controlled value: CVLP, maintained by
         // `EpidRecord::update_monitors()` (`epid.rs` — `self.cvlp = self.cval`).

@@ -1198,7 +1198,8 @@ use std_rs::device_support::epid_soft_callback::EpidSoftCallbackDeviceSupport;
 /// The pre-input stage as the cycle runs it: the record's reads, then the
 /// gate's writes, with `resolved` the reads that succeeded. TRIG's
 /// `ResolveOutTarget` hands back the type its text parses to, which is the
-/// IOC's when a DB name is served locally.
+/// IOC's when a DB name is served locally, and its put lands, followed by
+/// what the record asks on hearing so.
 fn pre_input(
     rec: &mut EpidRecord,
     dpvt: &mut Dpvt,
@@ -1219,7 +1220,16 @@ fn pre_input(
     }
     if let Some(writes) = rec.gate_after_pre_input_reads(resolved, dpvt) {
         for a in writes.into_vec() {
+            let more = match &a {
+                ProcessAction::WriteDbLink { link_field, value } => {
+                    rec.set_out_link_write_status(link_field, value, Ok(()), dpvt)
+                }
+                _ => epics_base_rs::server::record::ProcessActions::new(),
+            };
             actions.push(a);
+            for a in more {
+                actions.push(a);
+            }
         }
     }
     actions

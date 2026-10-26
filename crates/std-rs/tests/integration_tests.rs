@@ -1394,6 +1394,13 @@ async fn a_device_link_put_drops_the_trigger_in_flight() {
             .gate_after_pre_input_reads(&[], &mut inst.dpvt)
             .unwrap();
         assert!(!writes.is_empty());
+        // `dbCaPutLinkCallback` took the put.
+        inst.record.set_out_link_write_status(
+            "TRIG",
+            &EpicsValue::Double(0.0),
+            Ok(()),
+            &mut inst.dpvt,
+        );
         assert!(matches!(inst.dpvt, Dpvt::Triggered));
         inst.enter_pact();
     }
@@ -1405,10 +1412,33 @@ async fn a_device_link_put_drops_the_trigger_in_flight() {
 
 /// A TRIG naming no record of this IOC is a `CA_LINK` after `dbInitLink`
 /// (`dbLink.c:76-110`), so `devEpidSoftCallback.c:117` takes the
-/// `dbCaPutLinkCallback` arm and the PID waits for the trigger.
+/// `dbCaPutLinkCallback` arm and, the link being connected, the PID waits
+/// for the trigger.
 #[tokio::test]
 async fn a_trig_naming_no_local_record_is_waited_on() {
+    use epics_base_rs::server::database::{LinkPutOp, LinkRef, LinkSet};
     use epics_base_rs::server::device_support::Dpvt;
+    struct Up;
+    #[epics_base_rs::async_trait]
+    impl LinkSet for Up {
+        fn is_connected(&self, _: LinkRef<'_>) -> bool {
+            true
+        }
+        fn get_cached_value(&self, _: LinkRef<'_>) -> Option<EpicsValue> {
+            None
+        }
+        async fn get_value(&self, _: LinkRef<'_>) -> Option<EpicsValue> {
+            None
+        }
+        async fn put_value(
+            &self,
+            _: LinkRef<'_>,
+            _: EpicsValue,
+            _: LinkPutOp,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+    }
     let db_str = r#"
 record(ai, "CV") { field(VAL, "1") }
 record(epid, "E") {
@@ -1419,18 +1449,29 @@ record(epid, "E") {
 }
 "#;
     let (name, factory) = std_rs::epid_record_factory();
-    let (db, _) = epics_base_rs::server::ioc_builder::IocBuilder::new()
+    let ioc = epics_base_rs::server::ioc_builder::IocBuilder::new()
         .register_record_type(name, factory)
+        .register_link_type("ca", |db| async move {
+            db.register_link_set("ca", std::sync::Arc::new(Up)).await;
+            Vec::new()
+        })
         .db_string(db_str, &HashMap::new())
         .unwrap()
-        .build()
+        .build_ioc()
         .await
         .unwrap();
+    let db = ioc.database().clone();
+    // `dbCaRun`: before it no CA link is connected (`dbCa.c:529-532`).
+    assert!(ioc.run().await);
     db.put_record_field_from_ca("E", "PROC", EpicsValue::Char(1))
         .await
         .unwrap();
     let rec = db.get_record("E").unwrap();
     assert!(matches!(rec.read().dpvt, Dpvt::Triggered));
+    // The trigger's re-entry runs the PID.
+    epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(db.get_pv("E.CVAL").unwrap().to_f64(), Some(1.0));
+    assert_eq!(db.get_pv("E.SEVR").unwrap().to_f64(), Some(0.0));
 }
 
 async fn epid_db(db_str: &str) -> std::sync::Arc<epics_base_rs::server::database::PvDatabase> {

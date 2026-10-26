@@ -1,4 +1,5 @@
 #![allow(clippy::field_reassign_with_default)]
+use epics_base_rs::server::device_support::Dpvt;
 use epics_base_rs::server::record::{ProcessAction, Record};
 use epics_base_rs::types::EpicsValue;
 use std_rs::ThrottleRecord;
@@ -947,7 +948,11 @@ fn dly_put_with_no_cooldown_running_arms_nothing() {
 fn report_put(rec: &mut ThrottleRecord, actions: &[ProcessAction], failed: bool) {
     for a in actions {
         if let ProcessAction::WriteDbLink { link_field, value } = a {
-            rec.set_out_link_write_status(link_field, value, failed);
+            let status = match failed {
+                true => Err(epics_base_rs::error::DbStatus::FAILED),
+                false => Ok(()),
+            };
+            rec.set_out_link_write_status(link_field, value, status, &mut Dpvt::Null);
         }
     }
     // The framework then posts `valuePut`'s tail, which catches OSENT up.

@@ -7584,9 +7584,11 @@ pub trait Record: RecordAny + Send + Sync + 'static {
     fn set_process_continuation(&mut self, _continuation: bool, _pact: Pact<'_>) {}
 
     /// Called by the framework once for every [`ProcessAction::WriteDbLink`]
-    /// this record emitted, reporting the value it carried and whether the
-    /// put failed — the port's stand-in for the `dbPutLink` return C reads
-    /// inline.
+    /// this record emitted, reporting the value it carried and the put's
+    /// status — the port's stand-in for the `dbPutLink` return C reads
+    /// inline. `dpvt` is the record's, for a device support whose put decides
+    /// it: `devEpidSoftCallback.c:136-145` sets PACT only for a CA trigger
+    /// `dbCaPutLinkCallback` accepted.
     ///
     /// A record whose C original derives a field from that return needs it:
     /// throttle's `STS` is `throttleSTS_SUC` only on success and its `SENT`
@@ -7609,7 +7611,8 @@ pub trait Record: RecordAny + Send + Sync + 'static {
         &mut self,
         _link_field: &'static str,
         _value: &EpicsValue,
-        _failed: bool,
+        _status: crate::error::DbResult,
+        _dpvt: &mut crate::server::device_support::Dpvt,
     ) -> ProcessActions {
         ProcessActions::new()
     }

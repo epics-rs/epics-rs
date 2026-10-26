@@ -778,8 +778,8 @@ impl SseqRecord {
     /// `lnk_status`, which [`link_is_external`] reads as C's `CA_LINK`).
     ///
     /// C's `lnk.type` is likewise a CACHE, set at `init_record` and refreshed
-    /// by `special()`/`checkLinks`. The port's cache is filled by the spawned
-    /// [`Self::refresh_link_status`], so a DB-syntax link whose classification
+    /// by `special()`/`checkLinks`. At init the port's cache is filled by the
+    /// spawned [`Self::refresh_link_status`], so a DB-syntax link whose classification
     /// has not landed yet reads its `CON` default and is treated as NOT a CA
     /// link — the local reading, which is what the same link gets in C when
     /// the name does resolve here.
@@ -1097,7 +1097,11 @@ impl SseqRecord {
     /// [`Record::link_check`], which this arms as C does: 1 s after
     /// `init_record` left an `Ext PV NC` (sseqRecord.c:252), 0.5 s after a
     /// `special` that sets `LINKS_NOT_OK` (:1018, :1073).
-    fn refresh_link_status(&self, trigger: LinkPass) {
+    ///
+    /// On a complete database a `special` stores the put link's status and
+    /// type before the put returns, as C does (:1003-1018, :1044-1071); the
+    /// task only posts it.
+    fn refresh_link_status(&mut self, trigger: LinkPass) {
         let Some((name, handle)) = &self.async_ctx else {
             return;
         };
@@ -1117,6 +1121,26 @@ impl SseqRecord {
             LinkPass::Special { step, lnk } => 1 << link_ix(step, lnk),
         };
         let token = self.link_gen.next_for(claim);
+        let stored = match trigger {
+            LinkPass::Special { step, lnk } if handle.classifies_links_at_once() => {
+                let (dol, lnk_str) = &groups[step];
+                let (link, role) = if lnk {
+                    (lnk_str, LinkRole::Output)
+                } else {
+                    (dol, LinkRole::Input)
+                };
+                let (status, dbf) = classify_link(&handle, link, role, LinkRule::DbLink);
+                let ix = link_ix(step, lnk);
+                self.link_status[ix] = status;
+                // C stores -1 for a named PV until the next checkLinks:
+                // special() runs before dbAddLink attaches the link
+                // (sseqRecord.c:1016, :1069; dbAccess.c:1181, :1208). That C
+                // defect is not copied.
+                self.link_types[ix] = dbf;
+                Some(status)
+            }
+            _ => None,
+        };
         let sched = handle.clone();
         // Through the database's `iocInit` owner — see `schedule_record_init`.
         // The parking key; `name` itself moves into the future below.
@@ -1156,24 +1180,21 @@ impl SseqRecord {
                     // sseqRecord.c:1005-1011 (DOLn), :1047-1057 (LNKn).
                     let (ds, dt, ls, lt) = class[step];
                     let link = link_ix(step, lnk);
-                    let put = if lnk {
-                        push(link, LNKV_FIELDS[step], status(ls), PostRule::Always);
-                        push(
-                            link,
-                            LT_FIELDS[step],
-                            EpicsValue::Short(lt),
-                            PostRule::Silent,
-                        );
-                        ls
+                    let (field, type_field, put, dbf) = if lnk {
+                        (LNKV_FIELDS[step], LT_FIELDS[step], ls, lt)
                     } else {
-                        push(link, DOLV_FIELDS[step], status(ds), PostRule::Always);
-                        push(
-                            link,
-                            DT_FIELDS[step],
-                            EpicsValue::Short(dt),
-                            PostRule::Silent,
-                        );
-                        ds
+                        (DOLV_FIELDS[step], DT_FIELDS[step], ds, dt)
+                    };
+                    let put = match stored {
+                        Some(put) => {
+                            push(link, field, status(put), PostRule::Held);
+                            put
+                        }
+                        None => {
+                            push(link, field, status(put), PostRule::Always);
+                            push(link, type_field, EpicsValue::Short(dbf), PostRule::Silent);
+                            put
+                        }
                     };
                     // `special` runs before `dbAddLink` (dbAccess.c:1181,
                     // :1208), so a put naming a PV reads `dbGetLinkDBFtype`

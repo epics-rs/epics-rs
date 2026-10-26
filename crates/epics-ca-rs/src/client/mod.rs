@@ -2697,16 +2697,22 @@ impl CaChannel {
         timeout: Duration,
         count: impl Into<ReqCount>,
     ) -> CaResult<(DbFieldType, EpicsValue)> {
-        within(timeout, self.read_plain(count.into())).await
+        within(timeout, self.read_plain(count.into())?).await
     }
 
-    /// The plain READ_NOTIFY of the native type, with no deadline: the
-    /// sync group's, whose bound is `ca_sg_block`'s.
-    pub(super) async fn read_plain(&self, count: ReqCount) -> CaResult<(DbFieldType, EpicsValue)> {
+    /// The plain READ_NOTIFY of the native type, sent when this returns,
+    /// its answer with no deadline: the sync group's, whose bound is
+    /// `ca_sg_block`'s.
+    pub(super) fn read_plain(
+        &self,
+        count: ReqCount,
+    ) -> CaResult<
+        impl std::future::Future<Output = CaResult<(DbFieldType, EpicsValue)>> + Send + 'static,
+    > {
         let snap = self.snapshot()?;
         let native = snap.native_type as u16;
         let read = self.issue_read_notify(snap, native, count, ReadReplyMode::Plain)?;
-        Self::decode_plain_read_reply(read.reply().await?)
+        Ok(async move { Self::decode_plain_read_reply(read.reply().await?) })
     }
 
     /// Get a PV value with metadata. Use `DbrClass::Time` for timestamp + alarm,
@@ -6919,13 +6925,36 @@ mod get_deadline_tests {
         assert!(matches!(get.await, Err(CaError::Disconnected)));
     }
 
+    /// `ca_sg_array_put` and `ca_sg_array_get` queue their request when
+    /// called (`CASG.cpp:212-232`); `ca_sg_delete` and `ca_sg_reset` drop
+    /// only the completions (`CASG.cpp:44-45`, `cac.cpp:746-756`).
+    #[tokio::test]
+    async fn a_sync_group_sends_each_request_when_it_is_scheduled() {
+        let (ch, mut rx) = connected();
+        for end in ["drop", "reset"] {
+            let mut group = SyncGroup::new();
+            group.put(&ch, EpicsValue::Double(1.0));
+            group.get(&ch);
+            if end == "drop" {
+                drop(group);
+            } else {
+                group.reset();
+            }
+            assert!(
+                matches!(rx.try_recv(), Ok(TransportCommand::WriteNotify { .. })),
+                "{end}: the put was never sent"
+            );
+            assert!(
+                matches!(rx.try_recv(), Ok(TransportCommand::ReadNotify { .. })),
+                "{end}: the get was never sent"
+            );
+        }
+    }
+
     #[tokio::test(start_paused = true)]
     async fn an_answer_an_hour_late_still_ends_the_sync_group_get() {
         let (ch, _rx) = connected();
-        let get = tokio::spawn({
-            let ch = ch.clone();
-            async move { ch.read_plain(ReqCount::Fixed(0)).await }
-        });
+        let get = tokio::spawn(ch.read_plain(ReqCount::Fixed(0)).expect("sent"));
         tokio::time::sleep(AN_HOUR).await;
         let reply = ReadReply::Plain {
             dbr_type: DbFieldType::Double,
@@ -6934,6 +6963,29 @@ mod get_deadline_tests {
         assert!(take_waiter(&ch).send(Ok(reply)).is_ok(), "the get waits");
         let (_, value) = get.await.unwrap().expect("the answer");
         assert_eq!(value, EpicsValue::Double(4.5));
+    }
+
+    /// `ca_sg_array_put` has no deadline of its own (`CASG.cpp:212`), so
+    /// only `block`'s bound ends a sync-group put.
+    #[tokio::test(start_paused = true)]
+    async fn an_answer_an_hour_late_still_ends_the_sync_group_put() {
+        let (ch, _rx) = connected();
+        let mut group = SyncGroup::new();
+        group.put(&ch, EpicsValue::Double(1.0));
+        let block = tokio::spawn(async move { group.block(2 * AN_HOUR).await });
+        tokio::time::sleep(AN_HOUR).await;
+        let ioid = *ch
+            .in_flight
+            .writes
+            .iter()
+            .next()
+            .expect("the put waits")
+            .key();
+        let (_, (_, reply_tx)) = ch.in_flight.writes.remove(&ioid).expect("the waiter");
+        assert!(reply_tx.send(Ok(())).is_ok(), "the put waits");
+        let results = block.await.unwrap();
+        assert!(results.status.is_ok(), "{:?}", results.status);
+        assert!(matches!(results.puts[..], [Ok(())]), "{:?}", results.puts);
     }
 
     #[tokio::test(start_paused = true)]

@@ -766,8 +766,18 @@ impl PortHandle {
     /// `queueRequest` with no `timeoutUser`. It carries no reply channel and
     /// no cancel token.
     pub fn submit_unanswered(&self, op: RequestOp, user: AsynUser) -> AsynResult<()> {
+        self.submit_unanswered_in(op, user, SectionScope::current())
+    }
+
+    /// [`Self::submit_unanswered`] from a caller in `scope`.
+    fn submit_unanswered_in(
+        &self,
+        op: RequestOp,
+        user: AsynUser,
+        scope: SectionScope,
+    ) -> AsynResult<()> {
         crate::port_actor::queue_request_gate(&self.gate, &op, &user, self.multi_device)?;
-        self.send(ActorMessage::unanswered(op, user))
+        self.send(ActorMessage::unanswered(op, user, scope))
     }
 
     /// The one gate every blocking entry point on this handle passes through.
@@ -2248,16 +2258,18 @@ impl CallbacksGate {
 
     /// Queue the sets ahead of anything the section causes; the callbacks
     /// fire once the returned [`CallbacksAfter`] ends. Until then the port
-    /// runs only requests made in [`CallbacksAfter::scope`].
+    /// runs only requests made in [`CallbacksAfter::scope`]: `within`, the
+    /// caller's, else a new one.
     pub fn open(
         &mut self,
         addr: i32,
         time_stamp: Option<SystemTime>,
         updates: Vec<crate::request::ParamSetValue>,
+        within: SectionScope,
     ) -> AsynResult<CallbacksAfter<'_>> {
-        let scope = SectionScope::for_section();
+        let scope = SectionScope::for_section(within);
         self.sections.open(scope);
-        self.port.enqueue_now(
+        self.port.submit_unanswered_in(
             RequestOp::CallParamCallbacks {
                 addr,
                 updates,
@@ -2267,7 +2279,8 @@ impl CallbacksGate {
                     seq: self.seq,
                 }),
             },
-            addr,
+            AsynUser::new(0).with_addr(addr),
+            within,
         )?;
         Ok(CallbacksAfter {
             gate: self,
@@ -2305,14 +2318,15 @@ impl CallbacksAfter<'_> {
         if !gate.sections.end(seq) {
             return Ok(());
         }
-        gate.port.enqueue_now(
+        gate.port.submit_unanswered_in(
             RequestOp::CallParamCallbacks {
                 addr: self.addr,
                 updates: Vec::new(),
                 time_stamp: None,
                 gate: Some(SectionCallbacks::Held(gate.sections.clone())),
             },
-            self.addr,
+            AsynUser::new(0).with_addr(self.addr),
+            self.scope,
         )
     }
 }
@@ -5447,7 +5461,12 @@ mod tests {
         let (handle, posts, _sub) = gated_handle();
         let mut gate = handle.callbacks_gate();
         let section = gate
-            .open(0, None, vec![set_val(1, 11), set_val(0, 10)])
+            .open(
+                0,
+                None,
+                vec![set_val(1, 11), set_val(0, 10)],
+                SectionScope::default(),
+            )
             .unwrap();
         assert_eq!(read_in(&handle, &section, 0).unwrap(), 10);
         assert_eq!(read_in(&handle, &section, 1).unwrap(), 11);
@@ -5464,7 +5483,9 @@ mod tests {
     fn a_post_inside_a_section_leaves_the_sections_sets_to_its_end() {
         let (handle, posts, _sub) = gated_handle();
         let mut gate = handle.callbacks_gate();
-        let section = gate.open(0, None, vec![set_val(0, 60)]).unwrap();
+        let section = gate
+            .open(0, None, vec![set_val(0, 60)], SectionScope::default())
+            .unwrap();
         handle
             .submit_unanswered(bare_post(0), AsynUser::new(0).with_addr(0))
             .unwrap();
@@ -5502,7 +5523,12 @@ mod tests {
         handle.set_params_blocking(1, vec![set_val(1, 71)]).unwrap();
         let mut gate = handle.callbacks_gate();
         let section = gate
-            .open(0, None, vec![set_val(0, 70), set_val(1, 71)])
+            .open(
+                0,
+                None,
+                vec![set_val(0, 70), set_val(1, 71)],
+                SectionScope::default(),
+            )
             .unwrap();
         handle
             .submit_unanswered(bare_post(1), AsynUser::new(0).with_addr(1))
@@ -5522,7 +5548,9 @@ mod tests {
     fn a_write_inside_a_section_posts_after_the_sections_value() {
         let (handle, posts, _sub) = gated_handle();
         let mut gate = handle.callbacks_gate();
-        let section = gate.open(0, None, vec![set_val(0, 90)]).unwrap();
+        let section = gate
+            .open(0, None, vec![set_val(0, 90)], SectionScope::default())
+            .unwrap();
         handle
             .submit_unanswered(RequestOp::Int32Write { value: 91 }, AsynUser::new(0))
             .unwrap();
@@ -5541,7 +5569,9 @@ mod tests {
     fn a_read_behind_a_store_inside_a_section_reads_the_store() {
         let (handle, _posts, _sub) = gated_handle();
         let mut gate = handle.callbacks_gate();
-        let section = gate.open(0, None, vec![set_val(0, 90)]).unwrap();
+        let section = gate
+            .open(0, None, vec![set_val(0, 90)], SectionScope::default())
+            .unwrap();
         assert_eq!(read_in(&handle, &section, 0).unwrap(), 90);
         handle
             .submit_unanswered(RequestOp::Int32Write { value: 91 }, AsynUser::new(0))
@@ -5562,10 +5592,15 @@ mod tests {
         let (handle, posts, _sub) = gated_handle();
         let mut gate = handle.callbacks_gate();
         let (go, hold) = hold_actor(&handle);
-        gate.open(0, None, vec![set_val(1, 21), set_val(0, 20)])
-            .unwrap()
-            .end()
-            .unwrap();
+        gate.open(
+            0,
+            None,
+            vec![set_val(1, 21), set_val(0, 20)],
+            SectionScope::default(),
+        )
+        .unwrap()
+        .end()
+        .unwrap();
         go.send(()).unwrap();
         hold.join().unwrap().unwrap();
         handle.read_int32_blocking(0, 0).unwrap();
@@ -5579,11 +5614,13 @@ mod tests {
         let (handle, posts, _sub) = gated_handle();
         let mut gate = handle.callbacks_gate();
         let (go, hold) = hold_actor(&handle);
-        gate.open(0, None, vec![set_val(0, 40)])
+        gate.open(0, None, vec![set_val(0, 40)], SectionScope::default())
             .unwrap()
             .end()
             .unwrap();
-        let second = gate.open(0, None, vec![set_val(0, 41)]).unwrap();
+        let second = gate
+            .open(0, None, vec![set_val(0, 41)], SectionScope::default())
+            .unwrap();
         go.send(()).unwrap();
         hold.join().unwrap().unwrap();
         read_in(&handle, &second, 0).unwrap();
@@ -5600,11 +5637,18 @@ mod tests {
         let (handle, posts, _sub) = gated_handle();
         let mut gate = handle.callbacks_gate();
         let first = gate
-            .open(0, None, vec![set_val(1, 51), set_val(0, 50)])
+            .open(
+                0,
+                None,
+                vec![set_val(1, 51), set_val(0, 50)],
+                SectionScope::default(),
+            )
             .unwrap();
         read_in(&handle, &first, 0).unwrap();
         first.end().unwrap();
-        let second = gate.open(0, None, vec![set_val(0, 52)]).unwrap();
+        let second = gate
+            .open(0, None, vec![set_val(0, 52)], SectionScope::default())
+            .unwrap();
         read_in(&handle, &second, 0).unwrap();
         assert_eq!(*posts.lock(), [(0, 50), (1, 51)]);
         second.end().unwrap();
@@ -5617,7 +5661,9 @@ mod tests {
     fn a_dropped_section_still_fires_the_callbacks() {
         let (handle, posts, _sub) = gated_handle();
         let mut gate = handle.callbacks_gate();
-        let section = gate.open(0, None, vec![set_val(0, 30)]).unwrap();
+        let section = gate
+            .open(0, None, vec![set_val(0, 30)], SectionScope::default())
+            .unwrap();
         read_in(&handle, &section, 0).unwrap();
         drop(section);
         handle.read_int32_blocking(0, 0).unwrap();

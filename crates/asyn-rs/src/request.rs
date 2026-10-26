@@ -2026,11 +2026,11 @@ impl SectionScope {
         Self(SCOPE.with(Cell::get))
     }
 
-    /// The scope of a section opened here: the one this thread is in, so a
-    /// section of a consumer's admits its delivery's requests, else a new one.
-    pub(crate) fn for_section() -> Self {
+    /// The scope of a section opened from `within`: that one, so a section
+    /// of a consumer's admits its delivery's requests, else a new one.
+    pub(crate) fn for_section(within: Self) -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(1);
-        match Self::current() {
+        match within {
             Self(0) => Self(NEXT.fetch_add(1, AtomicOrdering::Relaxed)),
             inside => inside,
         }
@@ -2110,7 +2110,7 @@ mod tests {
     fn a_scope_follows_its_future_and_only_its_future() {
         use std::future::Future;
         use std::task::{Context, Poll, Waker};
-        let outer = super::SectionScope::for_section();
+        let outer = super::SectionScope::for_section(super::SectionScope::default());
         let _outer = outer.enter();
         let inner = super::SectionScope(outer.0 + 1);
         let mut yielded = false;
@@ -2131,7 +2131,11 @@ mod tests {
         assert_eq!(super::SectionScope::current(), outer);
         assert_eq!(fut.as_mut().poll(&mut cx), Poll::Ready((inner, inner)));
         assert_eq!(super::SectionScope::current(), outer);
-        assert_eq!(super::SectionScope::for_section(), outer, "nested");
+        assert_eq!(
+            super::SectionScope::for_section(super::SectionScope::current()),
+            outer,
+            "nested"
+        );
     }
 
     /// bab72deef: the entry the actor still holds for a request the timer took

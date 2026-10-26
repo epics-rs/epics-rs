@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 
 use asyn_rs::param::{ParamType, ParamValue};
 use asyn_rs::port::{InterfaceMask, PortDriver, PortDriverBase, PortFlags};
-use asyn_rs::request::ParamSetValue;
+use asyn_rs::request::{ParamSetValue, SectionScope};
 use asyn_rs::runtime::{RuntimeConfig, create_port_runtime_unclaimed};
 use epics_libcom_rs::runtime::interrupt_accept::InterruptGate;
 
@@ -153,7 +153,7 @@ fn a_held_callbacks_gate_section_allocates_nothing_on_the_posting_thread() {
         let (after, opened) = counted(move || {
             let mut updates = g.updates();
             updates.push(ParamSetValue::new(reason, 0, ParamValue::Int32(i)));
-            g.open(0, None, updates).unwrap()
+            g.open(0, None, updates, SectionScope::default()).unwrap()
         });
         let read = {
             let _in = after.scope().enter();
@@ -200,7 +200,10 @@ fn a_backlog_of_sections_allocates_nothing_once_one_came_back() {
             for i in 1..=DEEP as i32 {
                 let mut updates = g.updates();
                 updates.push(ParamSetValue::new(reason, 0, ParamValue::Int32(i)));
-                g.open(0, None, updates).unwrap().end().unwrap();
+                g.open(0, None, updates, SectionScope::default())
+                    .unwrap()
+                    .end()
+                    .unwrap();
             }
         });
         drop(stalled);
@@ -253,7 +256,10 @@ fn an_ended_sections_updates_are_back_before_its_callbacks_fire() {
     }
     let mut updates = gate.updates();
     updates.push(ParamSetValue::new(reason, 0, ParamValue::Int32(MARK)));
-    gate.open(0, None, updates).unwrap().end().unwrap();
+    gate.open(0, None, updates, SectionScope::default())
+        .unwrap()
+        .end()
+        .unwrap();
     drop(stalled);
     fired.wait();
     let spare = gate.updates();

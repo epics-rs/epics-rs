@@ -2311,10 +2311,7 @@ impl ProcessOutput {
         scatter_cursor: &mut usize,
         scope: SectionScope,
     ) {
-        let callbacks = {
-            let _in = scope.enter();
-            self.batch.store(callbacks_gate)
-        };
+        let callbacks = self.batch.store(callbacks_gate, scope);
         let scope = callbacks.as_ref().map_or(scope, CallbacksAfter::scope);
         for (addr, arr) in &self.addressed {
             if let Some(subscribers) = delivery.senders(*addr) {
@@ -2420,20 +2417,21 @@ impl ParamBatch {
     }
 
     /// Store and fire the callbacks in one section, for a batch no delivery
-    /// comes between.
+    /// comes between: no request can come from its scope.
     fn flush(self, gate: &mut CallbacksGate) {
-        if let Some(callbacks) = self.store(gate) {
+        if let Some(callbacks) = self.store(gate, SectionScope::default()) {
             flush_failed(callbacks.end());
         }
     }
 
-    /// The sets, queued ahead of a delivery; the callbacks fire when the
-    /// returned section ends. `None` for an empty batch, which posts nothing.
-    fn store(self, gate: &mut CallbacksGate) -> Option<CallbacksAfter<'_>> {
+    /// The sets, queued ahead of a delivery from `within`; the callbacks
+    /// fire when the returned section ends. `None` for an empty batch, which
+    /// posts nothing.
+    fn store(self, gate: &mut CallbacksGate, within: SectionScope) -> Option<CallbacksAfter<'_>> {
         if self.sets.is_empty() && self.time_stamp.is_none() {
             return None;
         }
-        gate.open(0, self.time_stamp, self.sets)
+        gate.open(0, self.time_stamp, self.sets, within)
             .map_err(|e| flush_failed(Err(e)))
             .ok()
     }
@@ -4338,11 +4336,11 @@ fn plugin_data_loop<P: NDPluginProcess>(
                                 po
                             };
                             po.complete(
-&mut callbacks_gate,
-&delivery,
-&mut scatter_cursor,
-SectionScope::current(),
-)
+                                &mut callbacks_gate,
+                                &delivery,
+                                &mut scatter_cursor,
+                                SectionScope::default(),
+                            )
                                 .await;
                         }
                         Some(PluginParamMsg::Change(reason, addr, value)) => {
@@ -4572,7 +4570,7 @@ SectionScope::current(),
                                                     &mut callbacks_gate,
                                                     &delivery,
                                                     &mut scatter_cursor,
-                                                    SectionScope::current(),
+                                                    SectionScope::default(),
                                                 )
                                                 .await;
                                             }
@@ -4640,11 +4638,11 @@ SectionScope::current(),
                                 if let Some(output) = flush_work {
                                     output
                                         .complete(
-&mut callbacks_gate,
-&delivery,
-&mut scatter_cursor,
-SectionScope::current(),
-)
+                                            &mut callbacks_gate,
+                                            &delivery,
+                                            &mut scatter_cursor,
+                                            SectionScope::default(),
+                                        )
                                         .await;
                                 }
                             }
@@ -4703,11 +4701,11 @@ SectionScope::current(),
                             };
                             if let Some(po) = process_output {
                                 po.complete(
-&mut callbacks_gate,
-&delivery,
-&mut scatter_cursor,
-SectionScope::current(),
-)
+                                    &mut callbacks_gate,
+                                    &delivery,
+                                    &mut scatter_cursor,
+                                    SectionScope::default(),
+                                )
                                     .await;
                             }
                         }
@@ -4722,11 +4720,11 @@ SectionScope::current(),
                         .tick_sort_buffer(ParamBatch::new(&callbacks_gate));
                     output
                         .complete(
-&mut callbacks_gate,
-&delivery,
-&mut scatter_cursor,
-SectionScope::current(),
-)
+                            &mut callbacks_gate,
+                            &delivery,
+                            &mut scatter_cursor,
+                            SectionScope::default(),
+                        )
                         .await;
                 }
             }

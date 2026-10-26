@@ -641,7 +641,13 @@ impl ActorMessage {
         cancel: CancelToken,
         reply: oneshot::Sender<AsynResult<RequestResult>>,
     ) -> Self {
-        Self::answering(op, user, Some(cancel), Reply::Result(reply))
+        Self::answering(
+            op,
+            user,
+            Some(cancel),
+            Reply::Result(reply),
+            SectionScope::current(),
+        )
     }
 
     /// A request whose waiter runs it with the actor lent ([`Lend`]).
@@ -651,16 +657,29 @@ impl ActorMessage {
         cancel: CancelToken,
         reply: oneshot::Sender<AsynResult<Claimed>>,
     ) -> Self {
-        Self::answering(op, user, Some(cancel), Reply::Lend(reply))
+        Self::answering(
+            op,
+            user,
+            Some(cancel),
+            Reply::Lend(reply),
+            SectionScope::current(),
+        )
     }
 
-    /// A request nobody waits on: nothing can cancel it or time it out, so
-    /// it carries neither a reply channel nor a token, and allocates nothing.
-    pub(crate) fn unanswered(op: RequestOp, user: AsynUser) -> Self {
-        Self::answering(op, user, None, Reply::Nobody)
+    /// A request nobody waits on, from `scope`: nothing can cancel it or
+    /// time it out, so it carries neither a reply channel nor a token, and
+    /// allocates nothing.
+    pub(crate) fn unanswered(op: RequestOp, user: AsynUser, scope: SectionScope) -> Self {
+        Self::answering(op, user, None, Reply::Nobody, scope)
     }
 
-    fn answering(op: RequestOp, user: AsynUser, cancel: Option<CancelToken>, reply: Reply) -> Self {
+    fn answering(
+        op: RequestOp,
+        user: AsynUser,
+        cancel: Option<CancelToken>,
+        reply: Reply,
+        scope: SectionScope,
+    ) -> Self {
         let priority = request_priority(&op, &user);
         Self {
             op,
@@ -670,7 +689,7 @@ impl ActorMessage {
             seq: next_seq(),
             priority,
             rank: Rank::Arrival,
-            scope: SectionScope::current(),
+            scope,
         }
     }
 
@@ -5659,6 +5678,7 @@ mod tests {
         tx.send(ActorMessage::unanswered(
             write,
             AsynUser::new(0).with_addr(1),
+            SectionScope::default(),
         ))
         .unwrap();
         // Device 0's read queues behind the write.

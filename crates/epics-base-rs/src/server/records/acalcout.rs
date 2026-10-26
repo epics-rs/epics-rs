@@ -96,8 +96,8 @@
 use crate::error::{CaError, CaResult};
 use crate::server::record::{CycleCell, CycleRead, CycleValue};
 use crate::server::record::{
-    CycleMarks, CyclePostMask, InputFetchPolicy, OutTarget, ProcessAction, ProcessOutcome, Record,
-    RecordProcessResult,
+    CycleMarks, CyclePostMask, InputFetchPolicy, InputLinkRequest, LinkReadAs, OutTarget,
+    ProcessAction, ProcessOutcome, Record, RecordProcessResult,
 };
 use crate::types::{EpicsValue, PvString};
 
@@ -106,8 +106,8 @@ use crate::calc::{ArrayInputs, Rpcl, acalc_eval};
 // `LINK_CON` (= 3, the `Constant` link-status index) is the value C
 // `init_record` writes for an unconfigured link; shared with `calcout`.
 use super::link_status::{
-    LINK_CON, LinkCheck, LinkCheckSpec, LinkCheckState, LinkRole, LinkRule, LinkStatusGen,
-    LinkStatusPosts, post_link_status,
+    LINK_CON, LINK_EXT_OK, LINK_LOC, LinkCheck, LinkCheckSpec, LinkCheckState, LinkRole, LinkRule,
+    LinkStatusGen, LinkStatusPosts, post_link_status,
 };
 use crate::server::database::AsyncDbHandle;
 use crate::server::recgbl::PutReport;
@@ -2426,17 +2426,20 @@ impl Record for AcalcoutRecord {
         InputFetchPolicy::AbortOnFirstFailure
     }
 
-    /// ...but only the SCALAR loop reaches its `dbGetLink` unconditionally. The
-    /// ARRAY loop is wrapped in `if ((*plinkValid==acalcoutINAV_EXT) ||
-    /// (*plinkValid==acalcoutINAV_LOC))` (`aCalcoutRecord.c:1078`), so an array
-    /// link C believes cannot deliver is never read and never gates the cycle —
-    /// which is why a typo'd or not-yet-loaded INAA leaves the record computing
-    /// in C and killed it here. See [`Record::input_link_failure_is_inert`] for
-    /// why this port answers the status question at read time.
-    fn input_link_failure_is_inert(&self, link_field: &str) -> bool {
-        ACALCOUT_INPUT_LINKS[ACALCOUT_NUMERIC_INPUTS..]
-            .iter()
-            .any(|(lf, _)| *lf == link_field)
+    /// C's array loop reads a link only while its IAAV..ILLV is `EXT` or `LOC`
+    /// (`aCalcoutRecord.c:1078`). Any other status is no read at all: no
+    /// value, no LINK alarm, no gate. A link it does read fails as a scalar
+    /// one does (`:1098-1099`).
+    fn input_link_request(&self, link_field: &str) -> InputLinkRequest {
+        match Self::ina_index(link_field).map(|i| self.link_status[ACALCOUT_NUMERIC_INPUTS + i]) {
+            None | Some(LINK_EXT_OK | LINK_LOC) => InputLinkRequest::As(LinkReadAs::Native),
+            Some(_) => InputLinkRequest::NotRead,
+        }
+    }
+
+    /// The request above reads IAAV..ILLV.
+    fn input_link_answers_fixed_at_type(&self) -> bool {
+        false
     }
 
     fn set_fetch_gate_failed(&mut self, failed: bool) {

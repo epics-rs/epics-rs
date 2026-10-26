@@ -1224,7 +1224,6 @@ impl ProcessPlan {
             multi_inputs_read_native: record.input_link_answers_fixed_at_type()
                 && record.multi_input_links().iter().all(|(lf, _)| {
                     record.input_link_request(lf) == InputLinkRequest::As(LinkReadAs::Native)
-                        && !record.input_link_failure_is_inert(lf)
                 }),
             dispatches_generic_multi_output: !crate::server::database::multi_output_dispatch_owned(
                 rtype,
@@ -2252,13 +2251,12 @@ pub(crate) struct ProcessPlan {
     /// Whether a failed multi-input read owes C's `setLinkAlarm` — see
     /// [`Record::multi_input_fetch_is_db_get_link`].
     pub(crate) multi_input_is_db_get_link: bool,
-    /// Every declared multi-input link reads [`LinkReadAs::Native`] and none
-    /// declares its failure inert — the framework default, which every base
-    /// numeric type gives. The fetch loop then carries the answer instead of
-    /// asking [`Record::input_link_request`] and
-    /// [`Record::input_link_failure_is_inert`] through the vtable per link,
-    /// per cycle. Only settled here for a type whose answers are fixed at the
-    /// type ([`Record::input_link_answers_fixed_at_type`]).
+    /// Every declared multi-input link reads [`LinkReadAs::Native`] — the
+    /// framework default, which every base numeric type gives. The fetch loop
+    /// then carries the answer instead of asking
+    /// [`Record::input_link_request`] through the vtable per link, per cycle.
+    /// Only settled here for a type whose answers are fixed at the type
+    /// ([`Record::input_link_answers_fixed_at_type`]).
     pub(crate) multi_inputs_read_native: bool,
     /// This type declares generic multi-output pairs
     /// ([`Record::multi_output_links`]) for the pre-commit output stage to
@@ -4423,12 +4421,11 @@ pub(crate) struct ParsedInputLink {
     /// need not read the field to know.
     generation: Option<u64>,
     parsed: Arc<ParsedLink>,
-    /// [`Record::input_link_failure_is_inert`] and
     /// [`Record::input_link_request`] for this link, with the
-    /// [`Record::input_links_generation`] they were asked at: a record that
-    /// answers a generation moves it on every write that can change either,
-    /// so an answer stamped with the current generation is still the answer.
-    answers: Option<(u64, bool, super::record_trait::InputLinkRequest)>,
+    /// [`Record::input_links_generation`] it was asked at: a record that
+    /// answers a generation moves it on every write that can change it, so
+    /// an answer stamped with the current generation is still the answer.
+    request: Option<(u64, super::record_trait::InputLinkRequest)>,
     /// C's `dbAddr` from `dbDbInitLink` (`dbDbLink.c:88-111`): the target
     /// record, resolved once and read through until something can have
     /// changed the answer. C re-resolves only when the link text is put; the
@@ -4571,7 +4568,7 @@ impl ParsedInputLink {
             text,
             generation: None,
             parsed: removed,
-            answers: None,
+            request: None,
             target: None,
         }
     }
@@ -4585,43 +4582,38 @@ impl ParsedInputLink {
             text: text.into(),
             generation: None,
             parsed: installed.map_or_else(|| Arc::new(parse_link_v2(text)), Arc::clone),
-            answers: None,
+            request: None,
             target: None,
         }
     }
 
-    /// What the record answers for this link's failure and request: asked of
-    /// the record once per [`Record::input_links_generation`] it answers, and
-    /// every time for a record that answers none.
+    /// What the record requests for this link: asked of the record once per
+    /// [`Record::input_links_generation`] it answers, and every time for a
+    /// record that answers none.
     #[inline(always)]
-    pub(crate) fn link_answers(
+    pub(crate) fn link_request(
         &mut self,
         record: &dyn Record,
         link_field: &str,
         generation: Option<u64>,
-    ) -> (bool, super::record_trait::InputLinkRequest) {
-        let ask = || {
-            (
-                record.input_link_failure_is_inert(link_field),
-                record.input_link_request(link_field),
-            )
-        };
+    ) -> super::record_trait::InputLinkRequest {
+        let ask = || record.input_link_request(link_field);
         let Some(generation) = generation else {
             return ask();
         };
-        if let Some((at, inert, request)) = self.answers
+        if let Some((at, request)) = self.request
             && at == generation
         {
             debug_assert!(
-                (inert, request) == ask(),
-                "{link_field}: an input_link answer changed under generation {generation} — \
+                request == ask(),
+                "{link_field}: an input_link_request answer changed under generation {generation} — \
                  a writer of what it reads does not move input_links_generation"
             );
-            return (inert, request);
+            return request;
         }
-        let (inert, request) = ask();
-        self.answers = Some((generation, inert, request));
-        (inert, request)
+        let request = ask();
+        self.request = Some((generation, request));
+        request
     }
 
     /// The parse, shared: the cycle hands it to reads that run after the

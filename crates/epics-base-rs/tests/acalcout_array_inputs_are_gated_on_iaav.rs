@@ -36,7 +36,10 @@ use std::sync::Arc;
 
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
+use epics_base_rs::server::recgbl::alarm_status::{CALC_ALARM, LINK_ALARM};
+use epics_base_rs::server::record::AlarmSeverity;
 use epics_base_rs::server::records::acalcout::AcalcoutRecord;
+use epics_base_rs::types::EpicsValue;
 
 const DB: &str = r#"
 record(ai, "S") { field(VAL, "3") }
@@ -64,6 +67,50 @@ record(acalcout, "LIVEARR") {
     field(INPA, "S")
     field(INAA, "WF")
 }
+
+record(stringin, "SR") { field(VAL, "abc") }
+record(ai, "X") {}
+
+# A Local PV array link whose read fails: "abc" does not convert.
+record(acalcout, "BADSTR") {
+    field(NELM, "4")
+    field(CALC, "7")
+    field(INAA, "SR")
+}
+
+# A Local PV array link whose read succeeds.
+record(acalcout, "INPSTR") {
+    field(NELM, "4")
+    field(CALC, "7")
+    field(INAA, "X.INP$")
+}
+
+# A Local PV array link to a `$` source whose read C fails.
+record(acalcout, "RTYPARR") {
+    field(NELM, "4")
+    field(CALC, "7")
+    field(INBB, "X.RTYP$")
+}
+
+# The same two `$` reads through the scalar half.
+record(acalcout, "RTYPSCALAR") {
+    field(NELM, "4")
+    field(CALC, "A")
+    field(INPA, "X.RTYP$")
+}
+
+record(acalcout, "INPSCALAR") {
+    field(NELM, "4")
+    field(CALC, "A")
+    field(INPA, "X.INP$")
+}
+
+# A Constant array link: C neither loads nor reads it.
+record(acalcout, "CONARR") {
+    field(NELM, "4")
+    field(CALC, "7")
+    field(INAA, "3")
+}
 "#;
 
 type Db = Arc<PvDatabase>;
@@ -86,6 +133,19 @@ async fn process(db: &Db, name: &str) {
     db.process_record_with_links(name, &mut visited)
         .await
         .unwrap();
+}
+
+fn alarm(db: &Db, rec: &str) -> (AlarmSeverity, u16) {
+    let cell = db.get_record(rec).unwrap();
+    let inst = cell.read();
+    (inst.common.sevr, inst.common.stat)
+}
+
+fn array(db: &Db, rec: &str, f: &str) -> Vec<f64> {
+    match db.get_record(rec).unwrap().read().record.get_field(f) {
+        Some(EpicsValue::DoubleArray(a)) => a.to_vec(),
+        other => panic!("{rec}.{f} is {other:?}"),
+    }
 }
 
 fn field(db: &Db, rec: &str, f: &str) -> f64 {
@@ -137,7 +197,7 @@ async fn a_local_array_link_is_still_read() {
     let db = build().await;
     db.put_pv(
         "WF",
-        epics_base_rs::types::EpicsValue::DoubleArray(vec![7.0, 8.0, 9.0, 10.0].into()),
+        EpicsValue::DoubleArray(vec![7.0, 8.0, 9.0, 10.0].into()),
     )
     .await
     .unwrap();
@@ -150,9 +210,90 @@ async fn a_local_array_link_is_still_read() {
         .record
         .get_field("AA");
     let first = match aa {
-        Some(epics_base_rs::types::EpicsValue::DoubleArray(a)) => a.first().copied(),
+        Some(EpicsValue::DoubleArray(a)) => a.first().copied(),
         other => panic!("AA is {other:?}"),
     };
     assert_eq!(first, Some(7.0), "IAAV = Local PV, so the link is read");
     assert_eq!(field(&db, "LIVEARR", "VAL"), 4.0);
+}
+
+/// A Local PV array link IS read (`:1078` admits LOC), so its failed
+/// `dbGetLink` raises LINK/INVALID and returns from `fetch_values` (`:1099`).
+/// C (oracleSwaitIoc, calc f207871): STAT LINK, SEVR INVALID, VAL 0,
+/// AA 0 0 0 0.
+#[epics_macros_rs::epics_test]
+async fn a_failed_read_of_a_local_array_link_raises_link_invalid() {
+    let db = build().await;
+    process(&db, "BADSTR").await;
+    assert_eq!(
+        alarm(&db, "BADSTR"),
+        (AlarmSeverity::Invalid, LINK_ALARM),
+        "a LOC link's failed dbGetLink is setLinkAlarm"
+    );
+    assert_eq!(
+        field(&db, "BADSTR", "VAL"),
+        0.0,
+        "fetch_values returned non-zero"
+    );
+    assert_eq!(array(&db, "BADSTR", "AA"), [0.0; 4]);
+}
+
+/// The same failure through a `$` read of a field that is not a link: C
+/// (calc f207871): INBB `X.RTYP$` is STAT LINK, SEVR INVALID, VAL 0,
+/// BB 0 0 0 0.
+#[epics_macros_rs::epics_test]
+async fn a_failed_long_string_read_of_an_array_link_raises_link_invalid() {
+    let db = build().await;
+    process(&db, "RTYPARR").await;
+    assert_eq!(alarm(&db, "RTYPARR"), (AlarmSeverity::Invalid, LINK_ALARM));
+    assert_eq!(field(&db, "RTYPARR", "VAL"), 0.0);
+    assert_eq!(array(&db, "RTYPARR", "BB"), [0.0; 4]);
+}
+
+/// The scalar half on the same two `$` sources. C: INPA `X.RTYP$` is
+/// LINK/INVALID with VAL 0 and A 0; INPA `X.INP$` reads NaN, so the calc
+/// runs and `A` gives VAL NaN under CALC/INVALID.
+#[epics_macros_rs::epics_test]
+async fn the_scalar_half_reads_long_strings_as_c_does() {
+    let db = build().await;
+    process(&db, "RTYPSCALAR").await;
+    assert_eq!(
+        alarm(&db, "RTYPSCALAR"),
+        (AlarmSeverity::Invalid, LINK_ALARM)
+    );
+    assert_eq!(field(&db, "RTYPSCALAR", "VAL"), 0.0);
+    assert_eq!(field(&db, "RTYPSCALAR", "A"), 0.0);
+
+    process(&db, "INPSCALAR").await;
+    assert_eq!(
+        alarm(&db, "INPSCALAR"),
+        (AlarmSeverity::Invalid, CALC_ALARM)
+    );
+    assert!(field(&db, "INPSCALAR", "A").is_nan());
+    assert!(field(&db, "INPSCALAR", "VAL").is_nan());
+}
+
+/// The control for the read above: a Local PV link that reads cleanly raises
+/// nothing and is charged. C: NO_ALARM, VAL 7, AA nan 0 0 0, AMEM 192.
+#[epics_macros_rs::epics_test]
+async fn a_clean_read_of_a_local_array_link_raises_nothing() {
+    let db = build().await;
+    process(&db, "INPSTR").await;
+    assert_eq!(alarm(&db, "INPSTR"), (AlarmSeverity::NoAlarm, 0));
+    assert_eq!(field(&db, "INPSTR", "VAL"), 7.0);
+    assert_eq!(field(&db, "INPSTR", "AMEM"), 192.0);
+    let aa = array(&db, "INPSTR", "AA");
+    assert!(aa[0].is_nan() && aa[1..] == [0.0; 3], "AA is {aa:?}");
+}
+
+/// A Constant array link is skipped by `:1078`: never read, so AA is neither
+/// loaded nor charged. C: NO_ALARM, VAL 7, AA 0 0 0 0, AMEM 128.
+#[epics_macros_rs::epics_test]
+async fn a_constant_array_link_is_never_read() {
+    let db = build().await;
+    process(&db, "CONARR").await;
+    assert_eq!(alarm(&db, "CONARR"), (AlarmSeverity::NoAlarm, 0));
+    assert_eq!(field(&db, "CONARR", "VAL"), 7.0);
+    assert_eq!(array(&db, "CONARR", "AA"), [0.0; 4]);
+    assert_eq!(field(&db, "CONARR", "AMEM"), 128.0);
 }

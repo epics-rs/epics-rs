@@ -2258,8 +2258,6 @@ struct MultiInputLink<'a> {
     /// [`Record::input_link_request`](crate::server::record::Record::input_link_request) for the link — C's `dbrType` argument
     /// to `dbGetLink`.
     request: crate::server::record::InputLinkRequest,
-    /// [`Record::input_link_failure_is_inert`](crate::server::record::Record::input_link_failure_is_inert) for the link.
-    failure_is_inert: bool,
 }
 
 /// The reader of a link conversion: its record, and the set its frame
@@ -2273,8 +2271,6 @@ struct Reader<'a> {
 /// What one link's read came to, for the fetch policy after it.
 struct LinkOutcome {
     read_failed: bool,
-    /// Failed, and the type declared that failure inert.
-    skipped: bool,
 }
 
 impl PvDatabase {
@@ -2332,9 +2328,9 @@ impl PvDatabase {
             alarm = None;
         }
         // C `dbGetLink` on failure: `recGblSetSevrMsg(LINK_ALARM)` — for the
-        // types whose fetch IS `dbGetLink`, not for a link whose failure the
-        // type declares inert, and not for `S_db_noLSET` (`dbLink.c:335-336`).
-        if read_failed && plan.multi_input_is_db_get_link && !link.failure_is_inert {
+        // types whose fetch IS `dbGetLink`, and not for `S_db_noLSET`
+        // (`dbLink.c:335-336`).
+        if read_failed && plan.multi_input_is_db_get_link {
             self.get_link_failed(common, link.parsed, link.link_field);
         }
         read_failed |= load_refused;
@@ -2343,10 +2339,7 @@ impl PvDatabase {
         if let Some(alarm) = alarm {
             self.fold_input_link_alarm(common, reader, link.parsed, alarm);
         }
-        LinkOutcome {
-            read_failed,
-            skipped: read_failed && link.failure_is_inert,
-        }
+        LinkOutcome { read_failed }
     }
 
     /// C `dbGetLink` on a DB link to a held local record, read at the
@@ -2489,16 +2482,13 @@ impl FetchFold {
         policy: InputFetchPolicy,
         cache_slot: usize,
         is_last: bool,
-        LinkOutcome {
-            read_failed,
-            skipped,
-        }: LinkOutcome,
+        LinkOutcome { read_failed }: LinkOutcome,
     ) -> bool {
-        self.last_input_read_failed = read_failed && !skipped && is_last;
+        self.last_input_read_failed = read_failed && is_last;
         if !read_failed && let Some(bit) = 1u64.checked_shl(cache_slot as u32) {
             self.resolved |= bit;
         }
-        if read_failed && !skipped {
+        if read_failed {
             match policy {
                 InputFetchPolicy::ReadAll => {}
                 InputFetchPolicy::ReadAllGateOnFailure => {
@@ -2614,7 +2604,6 @@ impl PvDatabase {
                 (declared, cache_slot),
                 plan.multi_input_is_db_get_link,
             ),
-            skipped: false,
         })
     }
 
@@ -2647,18 +2636,17 @@ impl PvDatabase {
             declared,
             generation,
         )?;
-        let (failure_is_inert, request) = if plan.multi_inputs_read_native {
+        let request = if plan.multi_inputs_read_native {
             debug_assert!(
-                !inst.record.input_link_failure_is_inert(link_field)
-                    && inst.record.input_link_request(link_field)
-                        == InputLinkRequest::As(LinkReadAs::Native),
+                inst.record.input_link_request(link_field)
+                    == InputLinkRequest::As(LinkReadAs::Native),
                 "{}: input_link_answers_fixed_at_type must be false for a \
-                 per-instance input_link_request / input_link_failure_is_inert",
+                 per-instance input_link_request",
                 inst.record.record_type()
             );
-            (false, InputLinkRequest::As(LinkReadAs::Native))
+            InputLinkRequest::As(LinkReadAs::Native)
         } else {
-            entry.link_answers(&*inst.record, link_field, generation)
+            entry.link_request(&*inst.record, link_field, generation)
         };
         // C's `default: break`: the record's switch has no case for this
         // link, so `dbGetLink` is never called — no PP of the source, no
@@ -2726,7 +2714,6 @@ impl PvDatabase {
             val_field,
             parsed,
             request,
-            failure_is_inert,
         };
         Some(self.land_multi_input(record, common, rec, &link, plan, read))
     }

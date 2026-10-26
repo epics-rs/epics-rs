@@ -5833,45 +5833,19 @@ pub trait Record: RecordAny + Send + Sync + 'static {
 
     /// The generation of this record's [`Self::multi_input_links`]: a count
     /// that moves on EVERY write of any of their texts, and on every write
-    /// that can change what [`Self::input_link_request`] or
-    /// [`Self::input_link_failure_is_inert`] answers for any of them. While
-    /// the record answers `g`, a parse validated at `g` is still the parse of
-    /// the text, and those two answers read at `g` are still the answers.
+    /// that can change what [`Self::input_link_request`] answers for any of
+    /// them. While the record answers `g`, a parse validated at `g` is still
+    /// the parse of the text, and the request read at `g` is still the answer.
     /// A type answers `Some` only when all of those fields have ONE writer
     /// that counts, behind private fields — `calc`'s `set_inp_link`, aSub's
     /// `put_field` of `INPx`/`FTx` — and the count is then what C's
     /// `dbPutSpecial` on a `DBF_INLINK` gives `dbDbInitLink`: the moment the
     /// link changed. `None` (the default) validates every parse against the
-    /// text itself, byte for byte, and asks both answers again, on every read.
+    /// text itself, byte for byte, and asks the request again, on every read.
     fn input_links_generation(&self) -> Option<u64> {
         None
     }
 
-    /// Whether a FAILED read of this multi-input link leaves the cycle
-    /// untouched — no `setLinkAlarm`, no [`Self::input_fetch_policy`] gate,
-    /// no value stored.
-    ///
-    /// One record needs it: acalcout guards its ARRAY half with the link's own
-    /// connection status (`aCalcoutRecord.c:1078`)
-    ///
-    /// ```c
-    /// if ((*plinkValid==acalcoutINAV_EXT) || (*plinkValid==acalcoutINAV_LOC))
-    /// ```
-    ///
-    /// so an array link C believes cannot deliver is never read at all, and
-    /// `fetch_values` returns 0 with the calc still running. C moves a link
-    /// between `EXT_NC` and `EXT` from a `dbCaIsLinkConnected` watchdog
-    /// (`aCalcoutRecord.c:1155`, `:1187`); this port has no CA client, so it
-    /// publishes `EXT_NC` for EVERY external link
-    /// ([`crate::server::records::link_status::classify_link`]) and cannot make
-    /// that test at select time. Reading and then discarding the failure is the
-    /// same observable behaviour for every state the port can reach — a link
-    /// that delivers is C's `EXT`/`LOC`, a link that does not is C's `EXT_NC` —
-    /// and, unlike gating on the published `IAAV`, it does not stop reading the
-    /// external array links whose values the resolver really does serve.
-    ///
-    /// The SCALAR half is deliberately NOT inert: its loop (`:1068-1071`) has
-    /// no status test and `return`s at the first failing `dbGetLink`.
     /// The text of a link field as the record stores it, lent rather than
     /// copied.
     ///
@@ -5919,10 +5893,6 @@ pub trait Record: RecordAny + Send + Sync + 'static {
                 _ => None,
             },
         }
-    }
-
-    fn input_link_failure_is_inert(&self, _link_field: &str) -> bool {
-        false
     }
 
     /// C `monitor()`'s deadband operands, read in one question: the value
@@ -7384,12 +7354,12 @@ pub trait Record: RecordAny + Send + Sync + 'static {
         InputLinkRequest::As(LinkReadAs::Native)
     }
 
-    /// Whether [`Self::input_link_request`] and
-    /// [`Self::input_link_failure_is_inert`] are settled by the link field
-    /// alone, so the process plan may ask them once for every declared link
-    /// when the record is built. `false` for the two types whose answer reads
-    /// instance state — aSub (`FTA..FTU`) and printf (`FMT`) — which the fetch
-    /// loop then asks per link, per cycle, through the vtable.
+    /// Whether [`Self::input_link_request`] is settled by the link field
+    /// alone, so the process plan may ask it once for every declared link
+    /// when the record is built. `false` for a type whose answer reads
+    /// instance state — aSub (`FTA..FTU`), printf (`FMT`), acalcout
+    /// (`IAAV..ILLV`) — which the fetch loop then asks per link, per cycle,
+    /// through the vtable.
     fn input_link_answers_fixed_at_type(&self) -> bool {
         true
     }

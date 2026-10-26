@@ -1273,7 +1273,6 @@ mod tests {
                     (
                         rec.link_text_ref(link).map(<[u8]>::to_vec),
                         rec.input_link_request(link),
-                        rec.input_link_failure_is_inert(link),
                     )
                 })
                 .collect::<Vec<_>>()

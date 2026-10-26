@@ -2429,6 +2429,8 @@ dependencies = [
  "epics-ca-rs",
  "epics-libcom-rs",
  "libc",
+ "parking_lot",
+ "tempfile",
  "tokio",
 ]
 

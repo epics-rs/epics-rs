@@ -58,6 +58,7 @@ pub mod devices;
 pub(crate) mod fields;
 pub mod flags;
 pub mod ioc;
+pub mod motor_util;
 pub mod poll_loop;
 pub mod record;
 pub mod sim_motor;

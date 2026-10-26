@@ -147,16 +147,22 @@ async fn a_hardware_bit_sets_display_bit_and_fpos() {
     let f = boot_with(KICK_A2).await;
     let (xmit, bits) = bank();
     let pos = numInArray(16, &bits, 2) as usize;
+    // `trans` is put by bankControl 2, after filterBits puts `fPos`.
+    let want = (pos as f64, 1.0, 1.0, xmit[pos]);
+    let mut got = (0.0, 0.0, 0.0, 0.0);
     for _ in 0..100 {
-        if f64_of(&f.ioc, "PF:pf:fPosA").await == pos as f64 {
+        got = (
+            f64_of(&f.ioc, "PF:pf:fPosA").await,
+            f64_of(&f.ioc, "PF:pf:displayBit2A").await,
+            f64_of(&f.ioc, "PF:A2").await,
+            f64_of(&f.ioc, "PF:pf:transA").await,
+        );
+        if got == want {
             break;
         }
         task::sleep(Duration::from_millis(50)).await;
     }
-    assert_eq!(f64_of(&f.ioc, "PF:pf:fPosA").await, pos as f64);
-    assert_eq!(f64_of(&f.ioc, "PF:pf:displayBit2A").await, 1.0);
-    assert_eq!(f64_of(&f.ioc, "PF:A2").await, 1.0);
-    assert_eq!(f64_of(&f.ioc, "PF:pf:transA").await, xmit[pos]);
+    assert_eq!(got, want, "fPosA, displayBit2A, A2, transA");
     seq_stop(f.tid);
 }
 

@@ -444,7 +444,7 @@ async fn init_retries_omtx_until_the_reflections_are_good() {
     wait_for(&ioc, &format!("{P}OMTX_state"), 2.0).await;
     // A failed init OMTX sets motPut_Auto to manual (orient_st.st:555-560).
     wait_for(&ioc, &format!("{P}motPut_Auto"), 0.0).await;
-    assert_eq!(f64_of(&ioc, &format!("{P}Alert")).await, 1.0);
+    wait_for(&ioc, &format!("{P}Alert"), 1.0).await;
     post(&db, &[(format!("{P}motPut_Auto"), EpicsValue::Enum(1))]);
     put(&db, "H", 4.0).await;
     task::sleep(Duration::from_millis(1500)).await;

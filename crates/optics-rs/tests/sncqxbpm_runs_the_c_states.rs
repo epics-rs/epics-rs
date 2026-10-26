@@ -344,6 +344,11 @@ async fn a_comm_error_holds_until_init_reads_again() {
     let ioc = boot_enabled().await;
     ioc.bpm.set_silent(true);
     wait_for(&ioc, "T:error.RVAL", 2.0).await;
+    // idle puts errMsg after error (sncqxbpm.st:429-433).
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while string_of(&ioc, "T:errMsg") != "communications error: 2" && Instant::now() < deadline {
+        task::sleep(Duration::from_millis(20)).await;
+    }
     let error = DbChannel::new(&ioc.db, "T:error");
     assert_eq!(error.get_string().await, "comm error");
     assert_eq!(string_of(&ioc, "T:errMsg"), "communications error: 2");

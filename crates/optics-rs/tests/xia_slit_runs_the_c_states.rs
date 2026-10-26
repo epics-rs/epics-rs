@@ -610,8 +610,12 @@ async fn a_third_locate_without_a_reply_is_a_comm_error() {
     assert_eq!(v(&rig, "error"), 0.0);
     assert_eq!(s(&rig, "errMsg"), "no error");
     locate(&rig).await;
-    assert!(eventually(|| v(&rig, "error") == 18.0).await);
-    assert_eq!(s(&rig, "errMsg"), "communications error");
+    let state = || (v(&rig, "error"), s(&rig, "errMsg"));
+    assert!(
+        eventually(|| state() == (18.0, "communications error".into())).await,
+        "error, errMsg {:?}",
+        state()
+    );
 }
 
 /// A move to a silent controller polls without a reply until the error,
@@ -624,13 +628,17 @@ async fn a_comm_error_releases_a_moving_axis() {
     rig.hsc.set_silent(true);
     put_hsc(&rig, "l", "1.5").await;
     sent(&rig, "!H-1 M ").await;
-    let state = || ["error", "hBusy", "h_Busy"].map(|pv| v(&rig, pv));
+    let state = || {
+        (
+            ["error", "hBusy", "h_Busy"].map(|pv| v(&rig, pv)),
+            s(&rig, "errMsg"),
+        )
+    };
     assert!(
-        eventually(|| state() == [18.0, 0.0, 0.0]).await,
-        "error, hBusy, h_Busy {:?}",
+        eventually(|| state() == ([18.0, 0.0, 0.0], "communications error".into())).await,
+        "error, hBusy, h_Busy, errMsg {:?}",
         state()
     );
-    assert_eq!(s(&rig, "errMsg"), "communications error");
     assert_eq!((v(&rig, "lRB"), v(&rig, "vBusy")), (1.0, 0.0));
 }
 

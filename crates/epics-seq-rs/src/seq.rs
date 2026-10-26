@@ -442,6 +442,30 @@ pub(crate) mod fixture {
             4096,
         )
     }
+
+    /// `sys`'s `CAC-event` inside a callback of `name` until the returned
+    /// sender sends or the budget runs out, from the post `post` makes.
+    pub(crate) fn hold_cac_event(
+        sys: &PvSystem,
+        name: &str,
+        post: impl FnOnce(),
+    ) -> (crate::pv::PvVar, std::sync::mpsc::Sender<()>) {
+        let (entered_tx, entered) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let (entered_tx, released) = (Mutex::new(entered_tx), Mutex::new(released));
+        let first = AtomicBool::new(true);
+        let pv = crate::pv::PvVar::create(sys, name, |_| {}).unwrap();
+        let on = pv.monitor_on(crate::types::PvType::Double, 1, move |_| {
+            if !first.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                entered_tx.lock().send(()).unwrap();
+                let _ = released.lock().recv_timeout(fact_budget::FACT_BUDGET);
+            }
+        });
+        assert_eq!(on, crate::types::PvStat::Ok);
+        post();
+        entered.recv_timeout(fact_budget::FACT_BUDGET).unwrap();
+        (pv, release)
+    }
 }
 
 #[cfg(test)]

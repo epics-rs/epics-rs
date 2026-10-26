@@ -339,7 +339,9 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicU32};
 
     use crate::program::VarModel;
-    use crate::seq::fixture::{Vars, build, build_on, chan, program, table, w_chan};
+    use crate::seq::fixture::{
+        Vars, build, build_on, chan, hold_cac_event, program, table, w_chan,
+    };
     use crate::types::{PvSevr, PvStat, SeqMask, bit_set};
 
     const N: ChId = ChId(0);
@@ -606,7 +608,7 @@ mod tests {
             std::thread::spawn(move || {
                 epics_base_rs::runtime::task::test_block_on(async move {
                     let db = PvDatabase::new();
-                    for name in ["d1:n", "d2:n", "d3:n", "d4:n"] {
+                    for name in ["d1:n", "d2:n", "d3:n", "d4:n", "d5:n", "d6:n"] {
                         db.add_record(
                             name,
                             Box::new(epics_base_rs::server::records::ao::AoRecord::new(1.5)),
@@ -755,8 +757,8 @@ mod tests {
 
     static OWN_AT_ZERO: AtomicBool = AtomicBool::new(false);
 
-    /// A put's own monitor has landed when the put returns, as `CAC-event`
-    /// runs above the state set: a zero sleep after it finds its flag up.
+    /// A put's own monitor has landed by the next wait: a zero sleep after
+    /// the put finds its flag up.
     #[test]
     fn a_zero_sleep_after_a_put_finds_its_own_monitor() {
         fn event(_: &StateSet<Vars>, _: &mut usize, _: &mut usize) -> bool {
@@ -799,5 +801,36 @@ mod tests {
         run_one_state("d2:n", event, action);
         assert_eq!(PASS.load(Ordering::SeqCst), 2);
         assert!(!STALE_ECHO.load(Ordering::SeqCst));
+    }
+
+    static PUT_THEN_CLEAR: AtomicU32 = AtomicU32::new(0);
+    static SEEN_AFTER_CLEAR: AtomicBool = AtomicBool::new(false);
+
+    /// MM4005_trajectoryScan's `pvPut(motorMDVS[j]); efClear(motorMDVSMon)`:
+    /// the put's own monitor lands after the clear, so the next wait sees
+    /// its flag. `CAC-event` is held until the clear, as the put's return
+    /// beats it in C.
+    #[test]
+    fn an_own_put_monitor_lands_after_the_clear_that_follows_it() {
+        fn event(ss: &StateSet<Vars>, _: &mut usize, _: &mut usize) -> bool {
+            PUT_THEN_CLEAR.load(Ordering::SeqCst) == 0 || ss.ef_test(EfId(1)) || ss.delay(1.0)
+        }
+        fn action(ss: &StateSet<Vars>, _: usize, _: &mut usize) {
+            if PUT_THEN_CLEAR.fetch_add(1, Ordering::SeqCst) == 0 {
+                let (_held, release) = hold_cac_event(&ss.prog.pv_sys, "d6:n", || {
+                    post_from_another_client("d6:n", 2.0)
+                });
+                ss.var().n.set(4);
+                assert_eq!(ss.pv_put(N, crate::types::CompType::Default), PvStat::Ok);
+                ss.ef_clear(EfId(1));
+                let _ = release.send(());
+            } else {
+                SEEN_AFTER_CLEAR.store(ss.ef_test(EfId(1)), Ordering::SeqCst);
+                ss.prog.die.store(true, Ordering::Release);
+            }
+        }
+        run_one_state("d5:n", event, action);
+        assert_eq!(PUT_THEN_CLEAR.load(Ordering::SeqCst), 2);
+        assert!(SEEN_AFTER_CLEAR.load(Ordering::SeqCst));
     }
 }

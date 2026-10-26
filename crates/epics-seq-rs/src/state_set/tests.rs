@@ -16,6 +16,7 @@ use crate::program::{
 };
 use crate::pv::{PvEventType, PvSystem};
 use crate::pvt::{Chan, PvReq, QueueElem, SeqEvent, SeqMacros, SeqQueue, VarBlock};
+use crate::seq::fixture::hold_cac_event;
 use crate::types::{NOEVFLAG, PrimType, SeqMask, nwords};
 use crate::var::{ChanCell, SeqVar, Zeroed};
 
@@ -1378,7 +1379,7 @@ fn served_db() -> &'static PvDatabase {
                 let db = PvDatabase::new();
                 for name in [
                     "rv:a", "rv:b", "rv:c", "rv:d", "rv:u", "rv:e", "rv:f", "rv:g", "rv:h", "rv:j",
-                    "rv:k", "rv:l", "rv:n", "rv:o", "rv:t",
+                    "rv:k", "rv:l", "rv:n", "rv:o", "rv:p", "rv:t",
                 ] {
                     db.add_record(
                         name,
@@ -1671,10 +1672,11 @@ fn e2e_a_post_lands_while_another_state_set_runs() {
     assert_eq!(waiter.join().unwrap(), (true, 8.5));
 }
 
-/// A put's own monitor has landed when the put returns, as `CAC-event`
-/// runs above the state set: here that of another channel on the record.
+/// A put's own monitor is not in when the put returns, but after it: here
+/// that of another channel on the record, with `CAC-event` held past the
+/// return.
 #[test]
-fn e2e_an_own_put_monitor_lands_at_the_put_return() {
+fn e2e_an_own_put_monitor_lands_after_the_put_returns() {
     let p = program_on(table(VarModel::Reentrant, 0, 1), served_db());
     let s = ss(&p, 0);
     assert_eq!(s.pv_assign(N, "rv:h"), PvStat::Ok);
@@ -1684,9 +1686,15 @@ fn e2e_an_own_put_monitor_lands_at_the_put_return() {
     assert_eq!(s.pv_assign(W, "rv:h"), PvStat::Ok);
     until("connect", || s.pv_connected(W));
     for (v, comp) in [(4, CompType::Default), (5, CompType::Sync)] {
+        let (_held, release) = hold_cac_event(&p.pv_sys, "rv:p", || {
+            put_from_another_thread("rv:p", f64::from(v))
+        });
+        let before = s.var().n.get();
         s.var().w.set([f64::from(v), 0.0, 0.0, 0.0]);
         assert_eq!(s.pv_put(W, comp), PvStat::Ok);
-        assert_eq!(s.var().n.get(), v, "{comp:?}");
+        assert_eq!(s.var().n.get(), before, "{comp:?} at the put's return");
+        release.send(()).unwrap();
+        until("its own monitor", || s.var().n.get() == v);
     }
 }
 

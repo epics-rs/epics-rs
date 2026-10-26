@@ -497,14 +497,8 @@ impl<V: ProgramVars> StateSet<V> {
         self.pv_get_tmo(ch, comp, crate::DEFAULT_TIMEOUT)
     }
 
-    /// `seq_pvGetTmo`; `tmo` in seconds. Its return is a delivery point of
-    /// [`Program::gate`].
+    /// `seq_pvGetTmo`; `tmo` in seconds.
     pub fn pv_get_tmo(&self, ch: ChId, comp: CompType, tmo: f64) -> PvStat {
-        self.prog.gate.call(|| self.get_tmo(ch, comp, tmo))
-    }
-
-    /// [`Self::pv_get_tmo`]'s request.
-    fn get_tmo(&self, ch: ChId, comp: CompType, tmo: f64) -> PvStat {
         let chan = self.chan(ch);
         if !self.pv_assigned(ch) {
             if self.safe() {
@@ -618,14 +612,8 @@ impl<V: ProgramVars> StateSet<V> {
         self.pv_put_tmo(ch, comp, crate::DEFAULT_TIMEOUT)
     }
 
-    /// `seq_pvPutTmo`; `tmo` in seconds. Its return is a delivery point of
-    /// [`Program::gate`], where the put's own monitor lands.
+    /// `seq_pvPutTmo`; `tmo` in seconds.
     pub fn pv_put_tmo(&self, ch: ChId, comp: CompType, tmo: f64) -> PvStat {
-        self.prog.gate.call(|| self.put_tmo(ch, comp, tmo))
-    }
-
-    /// [`Self::pv_put_tmo`]'s request.
-    fn put_tmo(&self, ch: ChId, comp: CompType, tmo: f64) -> PvStat {
         let chan = self.chan(ch);
         if !self.pv_assigned(ch) {
             if self.safe() {

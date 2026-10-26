@@ -18,7 +18,8 @@
 //! is called; its completion runs on the database reactor, where C's runs
 //! on a CA auxiliary thread. A network channel's monitor events and
 //! connection changes come from the reactor too; an in-process channel's
-//! monitor events come from the system's one queue, in post order, on its
+//! monitor events come from the system's one queue, in post order, each
+//! after the put that posted it has returned ([`PutFence`]), on its
 //! `CAC-event` thread or at an [`EventGate`] point of a state set. None
 //! runs inside a call, so a caller may hold seq's locks across
 //! [`PvVar::monitor_on`], as C's connection handler holds `sp->lock` across
@@ -54,7 +55,7 @@ use epics_base_rs::types::{
     DBR_TIME_DOUBLE, DBR_TIME_FLOAT, DBR_TIME_LONG, DBR_TIME_SHORT, DBR_TIME_STRING, DbFieldType,
     EpicsValue,
 };
-use parking_lot::{Mutex, ReentrantMutex};
+use parking_lot::{Mutex, ReentrantMutex, RwLock};
 
 use crate::types::{PvSevr, PvStat, PvType};
 
@@ -90,6 +91,7 @@ pub struct PvEvent<'a> {
 pub struct PvSystem {
     ctx: CaClientContext,
     events: InProcessEvents,
+    puts: PutFence,
     /// The network channels' request queue, its [`Dispatcher`] started
     /// with the first network channel.
     requests: Arc<Mutex<Option<mpsc::UnboundedSender<Request>>>>,
@@ -101,6 +103,7 @@ impl PvSystem {
         PvSystem {
             ctx: db.ca_client(),
             events: InProcessEvents::default(),
+            puts: PutFence::default(),
             requests: Arc::default(),
         }
     }
@@ -154,28 +157,21 @@ impl PvSystem {
 }
 
 /// The points where a state set's thread takes in the in-process monitor
-/// events queued: a get's or a put's return and a wait's. Each event is
-/// otherwise delivered by the thread that takes it, `CAC-event` or the
-/// reactor, while state sets run, as C's `seq_mon_handler` writes the
-/// shared buffer on `CAC-event` (`seq_ca.c:180-303`); under `+s` a state
-/// set sees it at its own reads of that buffer. `CAC-event` runs at a
-/// priority above the state set that started it (`dbContext.cpp:213-241`),
-/// so what is queued when the state set would go on has landed by then,
-/// and a put's own monitor lands right after the put. Each point is on the
-/// state set's thread holding no lock a monitor callback takes.
+/// events queued: its waits. Each event is otherwise delivered by the
+/// thread that takes it, `CAC-event` or the reactor, while state sets run,
+/// as C's `seq_mon_handler` writes the shared buffer on `CAC-event`
+/// (`seq_ca.c:180-303`); under `+s` a state set sees it at its own reads
+/// of that buffer. What is queued when a state set waits has landed when
+/// it goes on, as `CAC-event` delivers within microseconds; a get or a put
+/// is no such point, so a put's own monitor lands after the code that
+/// follows the put, as C's does. Each point is on the state set's thread
+/// holding no lock a monitor callback takes.
 #[derive(Default)]
 pub struct EventGate {
     events: InProcessEvents,
 }
 
 impl EventGate {
-    /// `call`, a get or a put.
-    pub fn call<R>(&self, call: impl FnOnce() -> R) -> R {
-        let r = call();
-        self.events.deliver();
-        r
-    }
-
     /// `wait`, a block of a state set.
     pub fn block<R>(&self, _ss: usize, wait: impl FnOnce() -> R) -> R {
         let r = wait();
@@ -572,11 +568,32 @@ impl Network {
     }
 }
 
+/// What an in-process put posts reaches its callback after the put returns.
+/// C's `CAC-event`, woken by the post, runs on a CPU of its own, so
+/// `dbChannelIO::write` is back in its caller first (MM4005_trajectoryScan's
+/// `pvPut(motorMDVS[j])` then `efClear(motorMDVSMon)` sees the event after
+/// the clear). Each put holds this shared while it runs, and each event
+/// waits for the puts in progress before its callback.
+#[derive(Clone, Default)]
+struct PutFence(Arc<RwLock<()>>);
+
+impl PutFence {
+    fn put<R>(&self, put: impl FnOnce() -> R) -> R {
+        let _running = self.0.read();
+        put()
+    }
+
+    fn wait(&self) {
+        drop(self.0.write());
+    }
+}
+
 /// An in-process channel, whose requests run on the caller's thread.
 struct InProcess {
     chan: InProcessChannel,
     ctx: CaClientContext,
     events: InProcessEvents,
+    puts: PutFence,
     monitor: Mutex<Option<InProcessSubscription>>,
 }
 
@@ -588,9 +605,11 @@ impl InProcess {
         let mask = (EventMask::VALUE | EventMask::ALARM).bits();
         let (monid, ty, count) = (m.monid, m.ty, m.count);
         let handler = shared.clone();
+        let puts = self.puts.clone();
         let sub = self
             .chan
             .subscribe(&self.events, type_to_ca(ty), count, mask, move |snapshot| {
+                puts.wait();
                 m.deliver(&handler, &snapshot)
             });
         match sub {
@@ -640,6 +659,7 @@ impl PvVar {
                 chan,
                 ctx: sys.ctx.clone(),
                 events: sys.events.clone(),
+                puts: sys.puts.clone(),
                 monitor: Mutex::new(None),
             });
             return Ok(PvVar { name, shared, link });
@@ -829,7 +849,7 @@ impl PvVar {
             // `dbChannelIO::write` throws a refused `dbChannel_put`, which
             // `ca_array_put` answers with ECA_PUTFAIL.
             Link::InProcess(l) => {
-                if l.chan.put(value).is_err() {
+                if l.puts.put(|| l.chan.put(value)).is_err() {
                     return self.shared.refuse(Eca::PutFail, PUT_EXPR);
                 }
             }
@@ -856,8 +876,13 @@ impl PvVar {
         };
         let value = put_value(value, ty, count);
         match &self.link {
-            Link::InProcess(l) => match l.chan.put_callback(value) {
-                Ok(done) => l.complete_put(&self.shared, id, done),
+            // `callDone` runs inside the put, ahead of what it posts.
+            Link::InProcess(l) => match l.puts.put(|| {
+                let done = l.chan.put_callback(value)?;
+                l.complete_put(&self.shared, id, done);
+                Ok(())
+            }) {
+                Ok(()) => {}
                 // `ca_array_put_callback` answers a throw at once and never
                 // calls the callback.
                 Err(e) => {
@@ -1344,23 +1369,47 @@ mod tests {
         (sub, release)
     }
 
-    /// A put's return takes in its own monitor though `CAC-event` is still
-    /// in an earlier callback, as its higher priority would have run it.
+    /// Until `landed` reaches `n`, or the budget runs out.
+    fn until_landed(landed: &AtomicU32, n: u32) {
+        let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+        while landed.load(Ordering::SeqCst) < n {
+            assert!(std::time::Instant::now() < deadline, "event {n}");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// A put's own monitor does not land at its return: with `CAC-event`
+    /// still in an earlier callback, it waits for `CAC-event`.
     #[test]
-    fn a_call_takes_in_what_it_queued() {
+    fn a_put_returns_before_its_own_monitor_lands() {
         let db = served(&["g:c", "g:d"]);
         let sys = PvSystem::create(&db);
         let d = PvVar::create(&sys, "g:d", |_| {}).unwrap();
         let landed = counted(&sys, &d);
         let (_held, release) = hold_cac_event(&sys, &db, "g:c");
-        let releaser = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(100));
-            release.send(()).unwrap();
+        assert_eq!(
+            d.put_no_block(PvType::Double, 1, EpicsValue::Double(2.0)),
+            PvStat::Ok
+        );
+        assert_eq!(landed.load(Ordering::SeqCst), 1, "at the put's return");
+        release.send(()).unwrap();
+        until_landed(&landed, 2);
+    }
+
+    /// An event `CAC-event` takes while a put of its system runs reaches
+    /// its callback once the put has returned.
+    #[test]
+    fn an_event_waits_for_the_put_in_progress() {
+        let db = served(&["g:g"]);
+        let sys = PvSystem::create(&db);
+        let g = PvVar::create(&sys, "g:g", |_| {}).unwrap();
+        let landed = counted(&sys, &g);
+        sys.puts.put(|| {
+            post(&db, "g:g", 2.0);
+            std::thread::sleep(Duration::from_millis(50));
+            assert_eq!(landed.load(Ordering::SeqCst), 1, "inside the put");
         });
-        sys.gate()
-            .call(|| d.put_no_block(PvType::Double, 1, EpicsValue::Double(2.0)));
-        assert_eq!(landed.load(Ordering::SeqCst), 2, "at the put's return");
-        releaser.join().unwrap();
+        until_landed(&landed, 2);
     }
 
     /// An event queued for a monitor turned off before it is taken is

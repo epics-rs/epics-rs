@@ -938,25 +938,25 @@ fn special_after_put(
     // re-runs the load into that input's value field and posts it. Without it a
     // constant link is load-once dead state — the link layer delivers nothing
     // for a constant at process time, so `caput CO.INPB 7` would store the text
-    // and leave `B` at its `.db` value forever. The post does not depend on the
-    // load: C posts `pvalue` for an empty link too, which loads nothing.
+    // and leave `B` at its `.db` value forever.
     //
     // The record only DECLARES the pairs (`special_reseed_input_links`); the
-    // load itself is the shared `rec_gbl_init_constant_link` owner, the same one
-    // the init seed uses. Records whose C `special()` does not re-seed (calc,
-    // sub, sel, aSub, swait, …) declare nothing and are untouched.
-    let reseed = instance
+    // load and C's guard on it are the shared `reseed_constant_input_link`
+    // owner, over the init seed's load. Records whose C `special()` does not
+    // re-seed (calc, sub, sel, aSub, swait, …) declare nothing and are
+    // untouched.
+    if instance
         .record
         .special_reseed_input_links()
         .iter()
-        .find(|(link, _)| *link == field)
-        .map(|(_, value_field)| *value_field);
-    if let Some(value_field) = reseed {
+        .any(|(link, _)| *link == field)
+    {
         // The put funnel has already installed the link parsed before the
         // hold; a refcount, not a parse.
         let link = std::sync::Arc::clone(instance.record_link(field));
-        crate::server::record::reseed_constant_input_link(&mut *instance.record, field, &link);
-        if crate::server::recgbl::simm::is_constant(&link) {
+        if let Some(value_field) =
+            crate::server::record::reseed_constant_input_link(&mut *instance.record, field, &link)
+        {
             // The mask is the C call site's, and they disagree — calcout posts
             // a literal DBE_VALUE, transform DBE_VALUE|DBE_LOG. The record
             // carries it.

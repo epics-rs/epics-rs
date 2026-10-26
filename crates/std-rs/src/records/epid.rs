@@ -1389,9 +1389,10 @@ impl Record for EpidRecord {
     /// INP is NOT seeded: a constant INP means "nothing to control" in C —
     /// `devEpidSoft.c` raises SOFT/INVALID rather than reading a value.
     fn constant_init_links(&self) -> Vec<epics_base_rs::server::record::ConstantInitLink> {
-        vec![epics_base_rs::server::record::ConstantInitLink::dol_to_val(
-            "STPL", "VAL",
-        )]
+        vec![
+            epics_base_rs::server::record::ConstantInitLink::dol_to_val("STPL", "VAL")
+                .type_constant(),
+        ]
     }
 
     /// C reads INP inside `do_pid` (`devEpidSoft.c:113`,

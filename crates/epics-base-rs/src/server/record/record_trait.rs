@@ -830,6 +830,28 @@ impl FieldDesc {
     }
 }
 
+/// The test C puts in front of a constant-link load. The two differ on a
+/// `{const:…}` link, which is a `JSON_LINK` (`dbStaticLib.c:2280-2287`) that
+/// `dbLinkIsConstant` still calls constant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeedGuard {
+    /// An unguarded `recGblInitConstantLink`: `dbLoadLink` runs the link's
+    /// `loadScalar`, so `lnkConst` loads too (`dbLink.c:234-242`).
+    LoadLink,
+    /// `if (plink->type == CONSTANT) recGblInitConstantLink(…)`.
+    TypeConstant,
+}
+
+impl SeedGuard {
+    /// Whether C's guard lets a load from `link` run.
+    pub fn admits(self, link: &crate::server::record::ParsedLink) -> bool {
+        match self {
+            SeedGuard::LoadLink => true,
+            SeedGuard::TypeConstant => link.is_constant_type(),
+        }
+    }
+}
+
 /// One `recGblInitConstantLink(&prec->LINK, DBF_x, &prec->TARGET)` call from a
 /// record's C `init_record` — the seed of a CONSTANT input link.
 ///
@@ -859,6 +881,8 @@ pub struct ConstantInitLink {
     /// &n)` seed instead of `recGblInitConstantLink` — aSub's INPA..U
     /// (`aSubRecord.c:128-137`), which load into the FTx buffer by NOx.
     pub array: Option<(crate::types::DbFieldType, usize)>,
+    /// The test C's call site puts in front of the load.
+    pub guard: SeedGuard,
 }
 
 impl ConstantInitLink {
@@ -870,6 +894,7 @@ impl ConstantInitLink {
             clears_udf: false,
             normalize_bool: false,
             array: None,
+            guard: SeedGuard::LoadLink,
         }
     }
 
@@ -881,6 +906,7 @@ impl ConstantInitLink {
             clears_udf: true,
             normalize_bool: false,
             array: None,
+            guard: SeedGuard::LoadLink,
         }
     }
 
@@ -897,6 +923,7 @@ impl ConstantInitLink {
             clears_udf: false,
             normalize_bool: false,
             array: Some((dbr, nreq)),
+            guard: SeedGuard::LoadLink,
         }
     }
 
@@ -909,6 +936,15 @@ impl ConstantInitLink {
             clears_udf: true,
             normalize_bool: true,
             array: None,
+            guard: SeedGuard::LoadLink,
+        }
+    }
+
+    /// The same seed behind C's `if (plink->type == CONSTANT)`.
+    pub const fn type_constant(self) -> Self {
+        Self {
+            guard: SeedGuard::TypeConstant,
+            ..self
         }
     }
 }
@@ -917,11 +953,17 @@ impl ConstantInitLink {
 /// fetches — the `for (i = 0; i < N; i++) recGblInitConstantLink(plink++,
 /// DBF_DOUBLE, pvalue++)` loop of calc / calcout / sub / sel / aSub /
 /// scalcout / acalcout / transform, expressed over the record's own
-/// [`Record::multi_input_links`] table.
-pub fn seed_input_links(pairs: &[(&'static str, &'static str)]) -> Vec<ConstantInitLink> {
+/// [`Record::multi_input_links`] table, each load behind `guard`.
+pub fn seed_input_links(
+    pairs: &[(&'static str, &'static str)],
+    guard: SeedGuard,
+) -> Vec<ConstantInitLink> {
     pairs
         .iter()
-        .map(|(link, value)| ConstantInitLink::new(link, value))
+        .map(|(link, value)| ConstantInitLink {
+            guard,
+            ..ConstantInitLink::new(link, value)
+        })
         .collect()
 }
 
@@ -4600,6 +4642,15 @@ pub trait Record: RecordAny + Send + Sync + 'static {
     /// Default: SVAL's declared type.
     fn siol_load_type(&self) -> Option<crate::types::DbFieldType> {
         crate::server::record::record_instance::declared_field_type_of(self, "SVAL")
+    }
+
+    /// The guard on `init_record`'s SIML → SIMM and SIOL → SVAL loads.
+    ///
+    /// Default: [`SeedGuard::LoadLink`] — `recGblInitSimm`'s `dbLoadLink`
+    /// (`recGbl.c:441-444`) and the base records' unguarded SIOL seed
+    /// (`aiRecord.c:104`).
+    fn sim_seed_guard(&self) -> SeedGuard {
+        SeedGuard::LoadLink
     }
 
     /// The `DTYP="Raw Soft Channel"` INPUT dset — C's four `devXxxSoftRaw.c`

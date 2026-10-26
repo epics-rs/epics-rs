@@ -25,7 +25,8 @@ use crate::types::{DbFieldType, EpicsValue, PvString};
 /// or `dbLoadLinkArray` for a seed that carries an array request.
 ///
 /// Returns the value that landed in `seed.target_field`, or `None` when the
-/// link is not constant (C returns FALSE and touches nothing) or the put failed.
+/// link is not constant (C returns FALSE and touches nothing), `seed.guard`
+/// keeps C from calling it, or the put failed.
 /// The caller owns what C does with that answer — the init seeder applies its
 /// `prec->udf = FALSE` rule, `special()` posts the field.
 pub fn rec_gbl_init_constant_link<R: Record + ?Sized>(
@@ -48,6 +49,9 @@ fn load_constant_link<R: Record + ?Sized>(
     seed: &ConstantInitLink,
     link: &ParsedLink,
 ) -> Option<EpicsValue> {
+    if !seed.guard.admits(link) {
+        return None;
+    }
     let ParsedLink::Constant(constant) = link else {
         return None;
     };
@@ -96,18 +100,26 @@ fn load_constant_link<R: Record + ?Sized>(
 ///
 /// Returns the value field to post (C's `db_post_events(prec, pvalue,
 /// DBE_VALUE)`), or `None` when this field is not a re-seeding link or the new
-/// link is not constant.
+/// link is not `CONSTANT`. The post does not depend on the load: C posts
+/// `pvalue` for an empty link too, which loads nothing.
 pub fn reseed_constant_input_link<R: Record + ?Sized>(
     record: &mut R,
     link_field: &str,
     link: &ParsedLink,
 ) -> Option<&'static str> {
+    // Every declarer guards the load and the post with `plink->type ==
+    // CONSTANT` (`transformRecord.c:715`, `aCalcoutRecord.c:533`,
+    // `sCalcoutRecord.c:513`).
     let seed = record
         .special_reseed_input_links()
         .iter()
         .find(|(field, _)| *field == link_field)
-        .map(|(field, target)| ConstantInitLink::new(field, target))?;
-    load_constant_link(record, &seed, link).map(|_| seed.target_field)
+        .map(|(field, target)| ConstantInitLink::new(field, target).type_constant())?;
+    if !seed.guard.admits(link) {
+        return None;
+    }
+    load_constant_link(record, &seed, link);
+    Some(seed.target_field)
 }
 
 /// C `dbConstLoadScalar(plink, dbrType, pbuffer)` (`dbConstLink.c`) — the

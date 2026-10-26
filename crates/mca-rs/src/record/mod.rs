@@ -643,6 +643,11 @@ impl Record for McaRecord {
         "mca"
     }
 
+    /// `if (pmca->siml.type == CONSTANT)` (`mcaRecord.c:442-444`).
+    fn sim_seed_guard(&self) -> epics_base_rs::server::record::SeedGuard {
+        epics_base_rs::server::record::SeedGuard::TypeConstant
+    }
+
     /// `readValue` reads SIML at `DBR_ENUM` (`mcaRecord.c:1106`) and SIOL at
     /// `(FTVL, NMAX)` (`:1117-1118`), so a source either request cannot
     /// convert is a failed read.

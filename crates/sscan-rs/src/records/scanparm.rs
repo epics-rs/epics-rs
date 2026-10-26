@@ -248,10 +248,10 @@ impl Record for ScanparmRecord {
     }
 
     /// C seeds a constant IMP with `recGblInitConstantLink(&imp, DBF_SHORT,
-    /// &mp)` (`scanparmRecord.c:125`), two bytes into the DBF_LONG MP; the
-    /// port loads it at MP's own type.
+    /// &mp)` under `if (psr->imp.type == CONSTANT)` (`scanparmRecord.c:122-125`),
+    /// two bytes into the DBF_LONG MP; the port loads it at MP's own type.
     fn constant_init_links(&self) -> Vec<ConstantInitLink> {
-        vec![ConstantInitLink::new("IMP", "MP")]
+        vec![ConstantInitLink::new("IMP", "MP").type_constant()]
     }
 
     /// IACT first; IMP is read from [`Self::link_read_result`] only once IACT

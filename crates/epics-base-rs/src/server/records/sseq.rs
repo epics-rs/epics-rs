@@ -1734,9 +1734,12 @@ impl Record for SseqRecord {
     /// left — and it is C's.
     fn constant_init_links(&self) -> Vec<crate::server::record::ConstantInitLink> {
         (0..NUM_STEPS)
-            .map(|i| crate::server::record::ConstantInitLink::new(DOL_FIELDS[i], STR_FIELDS[i]))
+            .map(|i| {
+                crate::server::record::ConstantInitLink::new(DOL_FIELDS[i], STR_FIELDS[i])
+                    .type_constant()
+            })
             .chain(std::iter::once(
-                crate::server::record::ConstantInitLink::new("SELL", "SELN"),
+                crate::server::record::ConstantInitLink::new("SELL", "SELN").type_constant(),
             ))
             .collect()
     }

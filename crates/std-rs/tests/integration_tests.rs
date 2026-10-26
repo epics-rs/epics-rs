@@ -1462,6 +1462,15 @@ async fn a_json_const_inp_raises_no_soft_alarm() {
     assert_eq!(db.get_pv("E.STAT").unwrap().to_f64(), Some(0.0));
 }
 
+/// `{const:5}` is a `JSON_LINK`, and `epidRecord.c:161` seeds `VAL` only
+/// for `type == CONSTANT`, so `VAL` and `UDF` stay as the record was born.
+#[tokio::test]
+async fn a_json_const_stpl_does_not_seed_val() {
+    let db = epid_db(r#"record(epid, "E") { field(STPL, "{const:5}") }"#).await;
+    assert_eq!(db.get_pv("E.VAL").unwrap().to_f64(), Some(0.0));
+    assert_eq!(db.get_pv("E.UDF").unwrap().to_f64(), Some(1.0));
+}
+
 // ============================================================
 // Throttle: the cooldown's forward link runs ahead of valuePut's reset.
 //

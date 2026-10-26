@@ -202,6 +202,11 @@ impl Record for BusyRecord {
         "busy"
     }
 
+    /// `if (prec->siml.type == CONSTANT)` (`busyRecord.c:137-139`).
+    fn sim_seed_guard(&self) -> crate::server::record::SeedGuard {
+        crate::server::record::SeedGuard::TypeConstant
+    }
+
     /// devBusySoft.c and devBusySoftRaw.c return `dbPutLink`'s status.
     fn process_status_rule(&self) -> crate::server::record::ProcessStatusRule {
         crate::server::record::ProcessStatusRule::io(crate::server::record::SoftStatus {
@@ -219,9 +224,7 @@ impl Record for BusyRecord {
     /// — boRecord's shape: the constant loads into a temporary and VAL takes
     /// its BOOLEAN, so `field(DOL,"5")` leaves VAL=1.
     fn constant_init_links(&self) -> Vec<crate::server::record::ConstantInitLink> {
-        vec![crate::server::record::ConstantInitLink::dol_to_bool_val(
-            "DOL", "VAL",
-        )]
+        vec![crate::server::record::ConstantInitLink::dol_to_bool_val("DOL", "VAL").type_constant()]
     }
 
     /// C `busyRecord.c:176-179`, the last statement of `init_record`: VAL is

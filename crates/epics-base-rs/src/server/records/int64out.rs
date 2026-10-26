@@ -194,9 +194,7 @@ impl Record for Int64outRecord {
     /// owner is the only place the constant can reach VAL — and a record whose
     /// VAL came from it is DEFINED.
     fn constant_init_links(&self) -> Vec<crate::server::record::ConstantInitLink> {
-        vec![crate::server::record::ConstantInitLink::dol_to_val(
-            "DOL", "VAL",
-        )]
+        vec![crate::server::record::ConstantInitLink::dol_to_val("DOL", "VAL").type_constant()]
     }
 
     /// C `int64outRecord.c::convert` (lines 418-423): clamp VAL into the

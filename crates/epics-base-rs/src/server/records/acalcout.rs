@@ -2388,7 +2388,10 @@ impl Record for AcalcoutRecord {
     /// its `fieldIndex <= acalcoutRecordINPL` — so it is the same slice, and
     /// the two cannot drift apart.
     fn constant_init_links(&self) -> Vec<crate::server::record::ConstantInitLink> {
-        crate::server::record::seed_input_links(self.special_reseed_input_links())
+        crate::server::record::seed_input_links(
+            self.special_reseed_input_links(),
+            crate::server::record::SeedGuard::TypeConstant,
+        )
     }
 
     /// The `INPA..INPL` then `INAA..INLL` texts read straight off the record's

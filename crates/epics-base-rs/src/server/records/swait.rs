@@ -802,6 +802,12 @@ impl Record for SwaitRecord {
         "swait"
     }
 
+    /// `if (pwait->siml.type == CONSTANT)` and the same test on SIOL
+    /// (`swaitRecord.c:663-670`).
+    fn sim_seed_guard(&self) -> crate::server::record::SeedGuard {
+        crate::server::record::SeedGuard::TypeConstant
+    }
+
     /// Record-specific `DBF_MENU` fields, served as `DBR_ENUM` with the
     /// menu's choice labels in `.dbd` index order (`swaitRecord.dbd`):
     /// `OOPT` is `menu(swaitOOPT)`, `DOPT` is `menu(swaitDOPT)`,

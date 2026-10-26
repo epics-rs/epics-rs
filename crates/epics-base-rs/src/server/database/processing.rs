@@ -11614,6 +11614,7 @@ impl PvDatabase {
             // taken, `field(SIMM,"YES")` in the `.db` would then read
             // `simm != oldsimm` at the tail and swap a scan C never swaps.
             let siml = link_of(&instance, "SIML");
+            let guard = instance.record.sim_seed_guard();
             // An unset SIML is a CONSTANT link (`dbConstLink.c`'s lset with a
             // NULL string), which is what a missing field means here.
             let siml_is_constant = siml
@@ -11624,6 +11625,7 @@ impl PvDatabase {
                 // `dbLoadLink(psiml, DBF_USHORT, psimm)`.
                 if let Some(v) = siml
                     .as_ref()
+                    .filter(|l| guard.admits(l))
                     .and_then(|l| load_constant(l, crate::types::DbFieldType::UShort))
                 {
                     let _ = instance
@@ -11643,7 +11645,11 @@ impl PvDatabase {
                         "SVAL",
                     ),
                 ) {
-                    if let Some(v) = load_constant(&siol, load_type) {
+                    if let Some(v) = guard
+                        .admits(&siol)
+                        .then(|| load_constant(&siol, load_type))
+                        .flatten()
+                    {
                         let _ = instance
                             .record
                             .put_field_internal("SVAL", v.into_type(sval_type));

@@ -220,6 +220,7 @@ const SCOPE_GATED: &[(&str, &str)] = &[
     ("epics-ca-rs", "tests/ca_client_context_channels.rs"),
     ("epics-ca-rs", "tests/ca_filter_pre_post.rs"),
     ("epics-ca-rs", "tests/ca_out_link_write_access_gate.rs"),
+    ("epics-ca-rs", "tests/ca_ts_filter_get_time.rs"),
     ("epics-ca-rs", "tests/ca_ts_filter_probe.rs"),
     ("epics-ca-rs", "tests/caget_dbr_type.rs"),
     ("epics-ca-rs", "tests/calink_enum_ctrl_attributes.rs"),

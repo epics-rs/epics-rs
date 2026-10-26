@@ -268,6 +268,7 @@ mod demo_db {
 mod ioc {
     use std::collections::HashMap;
     use std::process::ExitCode;
+    #[cfg(feature = "bringup-probes")]
     use std::sync::Arc;
     #[cfg(feature = "bringup-probes")]
     use std::thread;
@@ -351,25 +352,18 @@ mod ioc {
     ) -> CaResult<(BareIoc, Option<epics_bridge_rs::pvalink::PvaLinkResolver>)> {
         let macros = HashMap::new();
         // pvxs's `link("pva", "lsetPVX")` and its link set, installed by the
-        // build at C `dbCaLinkInit` so link init finds it. Kept for the banner
-        // and the probe report.
-        let resolver = Arc::new(std::sync::OnceLock::new());
-        let installed = Arc::clone(&resolver);
+        // build at C `dbCaLinkInit` so link init finds it. The resolver is
+        // kept for the banner and the probe report.
+        let (builder, resolver) = epics_pva_rs::pvalink::register_pva_link(IocBuilder::new());
         // And dbCa, which every C IOC links, softIocPVX included: without it a
         // bare remote link has no lset and stays LINK/INVALID. Its client is
         // built at the first CA link, reading the `EPICS_CA_*` boot variables.
-        let mut builder = IocBuilder::new()
-            .register_link_type("pva", move |db| async move {
-                let _ =
-                    installed.set(epics_bridge_rs::pvalink::install_pvalink_resolver(&db).await);
-                Vec::new()
-            })
-            .register_link_type("ca", |db| async move {
-                let reactor = epics_base_rs::runtime::task::Reactor::current()
-                    .expect("the exec backend's reactor is process-global");
-                epics_ca_rs::calink::install_calink_resolver(&db, reactor).await;
-                Vec::new()
-            });
+        let mut builder = builder.register_link_type("ca", |db| async move {
+            let reactor = epics_base_rs::runtime::task::Reactor::current()
+                .expect("the exec backend's reactor is process-global");
+            epics_ca_rs::calink::install_calink_resolver(&db, reactor).await;
+            Vec::new()
+        });
         #[cfg(feature = "bench-subroutines")]
         {
             builder = builder.register_subroutine("benchNoop", |_r| Ok(0));
@@ -1301,7 +1295,7 @@ mod tests {
              single records and groups can drift apart again"
         );
         assert!(
-            prod.contains(concat!("register_link_type(", "\"pva\", ")),
+            prod.contains(concat!("register_pva_", "link(IocBuilder::new()")),
             "the pva resolver is no longer installed by the build, so link init \
              refuses every pva link this IOC loads"
         );

@@ -13,8 +13,8 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::client::PvaClient;
 use epics_base_rs::types::RecordName;
-use epics_pva_rs::client::PvaClient;
 use parking_lot::RwLock;
 use tokio::sync::Notify;
 
@@ -699,8 +699,8 @@ mod tests {
     #[cfg(tokio_backend)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn stage0_distinct_link_variants_share_one_upstream_connection() {
-        use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
-        use epics_pva_rs::server_native::{PvaServer, SharedPV, SharedSource};
+        use crate::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
+        use crate::server_native::{PvaServer, SharedPV, SharedSource};
 
         let desc = FieldDesc::Structure {
             struct_id: "epics:nt/NTScalar:1.0".into(),

@@ -119,10 +119,10 @@ const _: () = assert!(
 pub mod error;
 pub use error::{BridgeError, BridgeResult};
 
-// `EpicsValue` <-> `PvField` conversion helpers. Shared by the QSRV
-// bridge and PVA links — both need to translate record values to/from
-// pvData. Gated on the consumers that enable `epics-pva-rs` (the only
-// extra dependency it uses) so a CA-only build still drops it.
+// `EpicsValue` <-> `PvField` conversion helpers for the QSRV bridge, with
+// the half PVA links put through re-exported from `epics_pva_rs`. Gated on
+// the consumers that enable `epics-pva-rs` (the only extra dependency it
+// uses) so a CA-only build still drops it.
 #[cfg(any(feature = "qsrv-core", feature = "pvalink"))]
 pub mod convert;
 
@@ -167,21 +167,16 @@ pub use qsrv::{
 /// that is the whole point of [`epics_base_rs::runtime::task::Reactor`] —
 /// but a test *is* the owner of its own executor, so the mint is honest
 /// here and the `expect` names the requirement the test already meets.
-/// The gate is the union of the four module gates its callers sit behind —
-/// `qsrv::pva_adapter`, `pva_gateway`, `ca_gateway` and `pvalink`. Spelled out
-/// rather than left at bare `#[cfg(test)]` because a `--no-default-features`
-/// build compiles none of the four and then warns that this is never used, and
-/// spelled as the union rather than as one feature because each of the four
+/// The gate is the union of the three module gates its callers sit behind —
+/// `qsrv::pva_adapter`, `pva_gateway` and `ca_gateway`. Spelled out rather
+/// than left at bare `#[cfg(test)]` because a `--no-default-features` build
+/// compiles none of the three and then warns that this is never used, and
+/// spelled as the union rather than as one feature because each of the three
 /// mints a `Reactor` in its own test bodies and any one of them alone is
 /// enough to need this.
 #[cfg(all(
     test,
-    any(
-        feature = "qsrv-core",
-        feature = "pva-gateway",
-        feature = "ca-gateway",
-        feature = "pvalink"
-    )
+    any(feature = "qsrv-core", feature = "pva-gateway", feature = "ca-gateway")
 ))]
 pub(crate) fn test_reactor() -> epics_base_rs::runtime::task::Reactor {
     epics_base_rs::runtime::task::Reactor::current()

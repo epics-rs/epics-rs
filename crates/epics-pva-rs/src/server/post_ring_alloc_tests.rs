@@ -4,8 +4,6 @@
 //! value post allocates nothing. Encoding that tree walks it by reference, so
 //! it allocates nothing beyond the output buffer either.
 
-use std::alloc::{GlobalAlloc, Layout, System};
-use std::cell::Cell;
 use std::collections::VecDeque;
 
 use epics_base_rs::server::pv::MonitorEvent;
@@ -19,37 +17,10 @@ use super::{LogLeaves, PostRing, marked_update, snapshot_to_pv_field};
 use crate::pvdata::PvField;
 use crate::server_native::{Marks, MonitorUpdate, PostValue};
 
-thread_local! {
-    /// Allocation calls made by this thread. Per thread so concurrently
-    /// running tests cannot move each other's count.
-    static ALLOCS: Cell<u64> = const { Cell::new(0) };
-}
-
-struct Counting;
-
-// SAFETY: forwards every call to `System` unchanged; the counter is a
-// const-initialised thread-local `Cell`, which never allocates.
-unsafe impl GlobalAlloc for Counting {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        ALLOCS.with(|n| n.set(n.get() + 1));
-        unsafe { System.alloc(layout) }
-    }
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        unsafe { System.dealloc(ptr, layout) }
-    }
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        ALLOCS.with(|n| n.set(n.get() + 1));
-        unsafe { System.realloc(ptr, layout, new_size) }
-    }
-}
-
-#[global_allocator]
-static ALLOC: Counting = Counting;
-
 fn allocs<R>(f: impl FnOnce() -> R) -> (R, u64) {
-    let before = ALLOCS.with(Cell::get);
+    let before = crate::test_alloc::this_thread();
     let r = f();
-    let n = ALLOCS.with(Cell::get) - before;
+    let n = crate::test_alloc::this_thread() - before;
     assert!(
         epics_base_rs::runtime::task::in_test_ioc_thread(),
         "counted off an IOC thread"

@@ -152,10 +152,18 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         epics_oracle_rs::scaler_soft_ports().configure(port, *chans, &template)?;
     }
 
-    // The network half of C's dbCa, libca, for names this IOC does not serve.
+    // The network half of C's dbCa, libca, for names this IOC does not serve,
+    // and under `--pva` pvxs's `lsetPVX`, which softIocPVX links and softIoc
+    // does not.
     let reactor =
         epics_base_rs::runtime::task::Reactor::current().expect("main runs on the IOC's reactor");
-    let mut builder = port_ioc_builder()
+    let builder = port_ioc_builder();
+    let builder = if args.pva {
+        epics_pva_rs::pvalink::register_pva_link(builder).0
+    } else {
+        builder
+    };
+    let mut builder = builder
         .register_link_type("ca", move |db| {
             epics_ca_rs::calink::calink_link_set_install(db, reactor)
         })

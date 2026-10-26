@@ -18,11 +18,12 @@
 //! pvxs equivalent: `ioc/pvalink.cpp` + `ioc/pvalink_channel.cpp`
 //! (`pvalinkInit`, `pvalinkOpen`, `dbpvxr`).
 
-// RTEMS-EXEC-MODEL-ALLOW(38): checked - these run and pass in the exec-backend
+// RTEMS-EXEC-MODEL-ALLOW(37): checked - these run and pass in the exec-backend
 // suite.
 
 use std::sync::Arc;
 
+use crate::pvdata::{PvField, ScalarValue};
 use epics_base_rs::runtime::task;
 use epics_base_rs::server::database::{
     LinkForward, LinkForwardRefused, LinkHolder, LinkOpen, LinkPutOp, LinkRef, LinkSet,
@@ -32,7 +33,6 @@ use epics_base_rs::server::record::{
     JlinkValue, PVAJSON_IDENTITY_SEP, pvajson_identity_key, pvajson_identity_parts,
 };
 use epics_base_rs::types::{DbfLinkClass, EpicsValue, RecordName};
-use epics_pva_rs::pvdata::{PvField, ScalarValue};
 
 use super::config::{LinkDirection, PvaLinkConfig, PvaLinkParseError};
 use super::link::{PvaLink, PvaLinkError, PvaLinkResult, ScanEvent, ScanOverrun};
@@ -653,7 +653,7 @@ impl PvaLinkResolver {
 
     /// STAGE-5 PROBE: a snapshot of the one IOC-wide client, so a target
     /// console can report how many upstream TCP connections back N links.
-    pub fn client_report(&self) -> epics_pva_rs::client_native::context::ClientReport {
+    pub fn client_report(&self) -> crate::client_native::context::ClientReport {
         self.registry.client().report_zeroed(false)
     }
 
@@ -1356,7 +1356,7 @@ impl LinkSet for PvaLinkResolver {
         // pvxs `pvaPutValueX` stages the DBR payload typed and
         // `linkBuildPut` assigns it into the channel's field, which
         // converts it (`pvalink_lset.cpp:608`, `pvalink_channel.cpp:147-178`).
-        let pv_field = crate::convert::epics_to_pv_field(&value);
+        let pv_field = crate::epics_convert::epics_to_pv_field(&value);
         async {
             // Resolve the SHARED channel owner for this PV (the
             // registry no longer keys on the per-link OUT options),
@@ -2039,7 +2039,7 @@ fn pvfield_to_epics_value(field: &PvField) -> Option<EpicsValue> {
         // returned `None`. Map each variant onto its `EpicsValue`
         // counterpart.
         PvField::ScalarArrayTyped(arr) => {
-            use epics_pva_rs::pvdata::TypedScalarArray;
+            use crate::pvdata::TypedScalarArray;
             match arr {
                 TypedScalarArray::Double(a) => Some(EpicsValue::DoubleArray(a.to_shared())),
                 TypedScalarArray::Float(a) => Some(EpicsValue::FloatArray(a.to_shared())),
@@ -2148,7 +2148,7 @@ mod tests {
 
     #[test]
     fn pvfield_struct_with_value_extracts() {
-        use epics_pva_rs::pvdata::PvStructure;
+        use crate::pvdata::PvStructure;
         let mut s = PvStructure::new("epics:nt/NTScalar:1.0");
         s.fields
             .push(("value".into(), PvField::Scalar(ScalarValue::Long(42))));
@@ -2160,7 +2160,7 @@ mod tests {
 
     #[test]
     fn pvfield_ntenum_extracts_index() {
-        use epics_pva_rs::pvdata::PvStructure;
+        use crate::pvdata::PvStructure;
         // An NTEnum's `value` child is an `enum_t` carrying the choice
         // in its `index` int, with no `value` scalar of its own. A bare
         // `{pva:"enumPV"}` INP (default `field="value"`) lands here.
@@ -2196,7 +2196,7 @@ mod tests {
 
     #[test]
     fn pvfield_non_enum_struct_without_value_is_none() {
-        use epics_pva_rs::pvdata::PvStructure;
+        use crate::pvdata::PvStructure;
         // A non-`enum_t` struct lacking a `value` child still returns
         // `None` — the enum_t branch must not change the fallback.
         let mut s = PvStructure::new("epics:nt/NTTable:1.0");
@@ -2212,7 +2212,7 @@ mod tests {
     /// reported no usable value.
     #[test]
     fn pvfield_ntndarray_union_value_converts_to_active_member() {
-        use epics_pva_rs::pvdata::PvStructure;
+        use crate::pvdata::PvStructure;
         let union = PvField::Union {
             selector: 9,
             variant_name: "floatValue".into(),
@@ -2241,7 +2241,7 @@ mod tests {
     /// `ShortArray` to preserve the negative range.
     #[test]
     fn pvfield_array_conversions_cover_pvxs_shapes() {
-        use epics_pva_rs::pvdata::TypedScalarArray;
+        use crate::pvdata::TypedScalarArray;
 
         // Untyped (Vec<ScalarValue>) variants.
         assert_eq!(
@@ -2311,7 +2311,7 @@ mod tests {
     /// contract QSRV uses.
     #[test]
     fn ex_r8_inp_long_ulong_preserve_full_width() {
-        use epics_pva_rs::pvdata::TypedScalarArray;
+        use crate::pvdata::TypedScalarArray;
 
         // A `ulong` value whose upper 32 bits are non-zero — i32
         // truncation would lose it entirely.
@@ -2378,7 +2378,7 @@ mod tests {
     /// `pvxs/ioc/pvalink_lset.cpp:222`, `:287-328`).
     #[test]
     fn inp_uint_preserves_unsigned_value_above_i32_max() {
-        use epics_pva_rs::pvdata::TypedScalarArray;
+        use crate::pvdata::TypedScalarArray;
 
         // 0x8000_0000 = 2147483648: the smallest u32 that overflows i32.
         let big: u32 = 0x8000_0000;
@@ -2414,7 +2414,7 @@ mod tests {
     // ---- B3: monitor-notification forwarder wiring ----
 
     use crate::pvalink::config::SevrMode;
-    use epics_pva_rs::pvdata::PvStructure;
+    use crate::pvdata::PvStructure;
 
     fn nt_scalar(v: f64) -> PvField {
         let mut s = PvStructure::new("epics:nt/NTScalar:1.0");
@@ -3570,45 +3570,6 @@ mod tests {
         }
     }
 
-    /// A QSRV group is no `dbChannelTest` channel either, so softIocPVX
-    /// refuses a `local:true` link to it (`pvxs/ioc/pvalink_lset.cpp:70`).
-    #[cfg(feature = "qsrv-core")]
-    #[tokio::test]
-    async fn b4_local_link_refuses_qsrv_group_pv() {
-        use crate::qsrv::BridgeProvider;
-        use epics_base_rs::server::records::ai::AiRecord;
-
-        // Backing records for the group's two members.
-        let db = Arc::new(PvDatabase::new());
-        db.add_record("GRP:level", Box::new(AiRecord::new(1.0)))
-            .await
-            .unwrap();
-        db.add_record("GRP:count", Box::new(AiRecord::new(2.0)))
-            .await
-            .unwrap();
-
-        // Register a QSRV group composite PV named `LOCAL:GROUP`.
-        const GROUP_JSON: &str = r#"{
-            "LOCAL:GROUP": {
-                "+id": "epics:nt/NTGroup:1.0",
-                "level": { "+channel": "GRP:level.VAL", "+type": "plain" },
-                "count": { "+channel": "GRP:count.VAL", "+type": "plain" }
-            }
-        }"#;
-        let provider = Arc::new(BridgeProvider::new(db.clone()));
-        provider.load_group_config(GROUP_JSON).expect("load group");
-        provider.process_groups().await;
-        assert!(
-            provider.has_group_pv("LOCAL:GROUP"),
-            "group PV must be registered in the provider"
-        );
-
-        let resolver = install_pvalink_resolver(&db).await;
-
-        let r = resolver.open_link("pva://LOCAL:GROUP?local=true").await;
-        assert!(matches!(r, Err(PvaLinkError::NotLocal(_))), "{:?}", r.err());
-    }
-
     // ---- DB JSON pvalink options preserved ----
 
     /// JSON-object pvalink options (field, proc, sevr, Q, …) survive the
@@ -4320,7 +4281,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn mr_r15_getters_use_caller_options_not_shared_link() {
         use crate::pvalink::link::PvaLink;
-        use epics_pva_rs::pvdata::PvField;
+        use crate::pvdata::PvField;
 
         // Remote NT value: MAJOR alarm + a timeStamp.
         let mut alarm = PvStructure::new("alarm_t");
@@ -4454,7 +4415,7 @@ mod tests {
     /// rejects.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn mr_r23_out_uint64_array_uses_typed_path() {
-        use epics_pva_rs::pvdata::ScalarType;
+        use crate::pvdata::ScalarType;
         out_array_typed_path_case(
             "MR_R23:PV",
             ScalarType::ULong,
@@ -4475,7 +4436,7 @@ mod tests {
     /// `Display` string as a PVA array literal the parser rejects.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn ex_r10_out_int64_array_uses_typed_path() {
-        use epics_pva_rs::pvdata::ScalarType;
+        use crate::pvdata::ScalarType;
         out_array_typed_path_case(
             "EX_R10:PV",
             ScalarType::Long,
@@ -4490,10 +4451,10 @@ mod tests {
     /// field (`Value::copyIn`): an ao's 3.7 lands in an int channel as 3.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn out_scalar_converts_into_the_channel_type() {
+        use crate::client::PvaClient;
         use crate::pvalink::link::PvaLink;
-        use epics_pva_rs::client::PvaClient;
-        use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
-        use epics_pva_rs::server_native::{PvaServer, SharedPV, SharedSource};
+        use crate::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
+        use crate::server_native::{PvaServer, SharedPV, SharedSource};
 
         let pv = SharedPV::build_mailbox();
         pv.open(
@@ -4552,23 +4513,23 @@ mod tests {
     /// the wire-level signedness).
     async fn out_array_typed_path_case(
         pv_name: &str,
-        elem_type: epics_pva_rs::pvdata::ScalarType,
+        elem_type: crate::pvdata::ScalarType,
         value: EpicsValue,
         expected: &[i64],
     ) {
+        use crate::client::PvaClient;
         use crate::pvalink::link::PvaLink;
-        use epics_pva_rs::client::PvaClient;
-        use epics_pva_rs::pvdata::{FieldDesc, PvField, ScalarValue};
+        use crate::pvdata::{FieldDesc, PvField, ScalarValue};
         #[cfg(tokio_backend)]
-        use epics_pva_rs::server_native::PvaServer;
-        use epics_pva_rs::server_native::{SharedPV, SharedSource};
+        use crate::server_native::PvaServer;
+        use crate::server_native::{SharedPV, SharedSource};
 
         // PVA server hosting a `long[]` / `ulong[]`-valued PV.
         let desc = FieldDesc::Structure {
             struct_id: "epics:nt/NTScalarArray:1.0".into(),
             fields: vec![("value".into(), FieldDesc::ScalarArray(elem_type))].into(),
         };
-        let initial = PvField::Structure(epics_pva_rs::pvdata::PvStructure {
+        let initial = PvField::Structure(crate::pvdata::PvStructure {
             struct_id: "epics:nt/NTScalarArray:1.0".into(),
             fields: vec![("value".into(), PvField::ScalarArray(vec![]))],
         });
@@ -4944,49 +4905,15 @@ mod tests {
 /// a primed IOC thread with this binary's own allocator.
 #[cfg(test)]
 mod alarmed_remote_cycle_alloc {
-    use std::alloc::{GlobalAlloc, Layout, System};
-    use std::cell::Cell;
     use std::collections::HashMap;
     use std::sync::Arc;
 
+    use crate::pvdata::{PvField, PvStructure, ScalarValue};
     use epics_base_rs::runtime::task::{MandatoryThread, StackSizeClass, ThreadPriority};
     use epics_base_rs::server::database::{ProcStack, PvDatabase};
     use epics_base_rs::server::ioc_builder::IocBuilder;
-    use epics_pva_rs::pvdata::{PvField, PvStructure, ScalarValue};
 
     use super::{LinkDirection, PvaLink, PvaLinkConfig, PvaLinkResolver, install_pvalink_resolver};
-
-    thread_local! {
-        static COUNTING: Cell<bool> = const { Cell::new(false) };
-        static ALLOCS: Cell<usize> = const { Cell::new(0) };
-    }
-
-    struct Counting;
-
-    // SAFETY: forwards every call to `System` unchanged; the counters are
-    // const-initialised thread-local `Cell`s, which never allocate.
-    unsafe impl GlobalAlloc for Counting {
-        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-            if COUNTING.with(Cell::get) {
-                ALLOCS.with(|n| n.set(n.get() + 1));
-            }
-            unsafe { System.alloc(layout) }
-        }
-
-        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, size: usize) -> *mut u8 {
-            if COUNTING.with(Cell::get) {
-                ALLOCS.with(|n| n.set(n.get() + 1));
-            }
-            unsafe { System.realloc(ptr, layout, size) }
-        }
-
-        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-            unsafe { System.dealloc(ptr, layout) }
-        }
-    }
-
-    #[global_allocator]
-    static GLOBAL: Counting = Counting;
 
     const DB: &str = r#"
 record(ai, "AR:JSON") { field(INP, {pva:{pv:"AR:PV", sevr:"MS"}}) }
@@ -5017,7 +4944,7 @@ record(ai, "AR:JSON") { field(INP, {pva:{pv:"AR:PV", sevr:"MS"}}) }
         rec: &'static str,
         cycles: usize,
         before: impl FnOnce() + Send + 'static,
-    ) -> usize {
+    ) -> u64 {
         let (tx, rx) = std::sync::mpsc::channel();
         MandatoryThread::new("scan-1", ThreadPriority::ScanLow, StackSizeClass::Big).spawn(
             move || {
@@ -5027,14 +4954,12 @@ record(ai, "AR:JSON") { field(INP, {pva:{pv:"AR:PV", sevr:"MS"}}) }
                 }
                 before();
                 let mut visited = ProcStack::new();
-                ALLOCS.with(|n| n.set(0));
-                COUNTING.with(|c| c.set(true));
+                let start = crate::test_alloc::this_thread();
                 for _ in 0..cycles {
                     db.process_record_with_links_already_locked(rec, &mut visited)
                         .unwrap();
                 }
-                COUNTING.with(|c| c.set(false));
-                tx.send(ALLOCS.with(Cell::get)).unwrap();
+                tx.send(crate::test_alloc::this_thread() - start).unwrap();
             },
         );
         rx.recv().unwrap()

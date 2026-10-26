@@ -26,7 +26,6 @@ use std::time::Duration;
 
 use asyn_rs::interfaces::motor::AsynMotor;
 use epics_base_rs::server::database::PvDatabase;
-use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_ca_rs::client::CaClient;
 use epics_ca_rs::server::CaServer;
 use epics_pva_rs::client_native::context::PvaClient;
@@ -122,10 +121,10 @@ impl RegressionIoc {
         tokio::spawn(poll_loop.start());
         let (motor_type, motor_record_factory) = motor_rs::motor_record_factory();
 
-        // dbCa, which every C IOC links.
+        // dbCa, which every C IOC links, and pvxs's `lsetPVX`.
         let reactor = epics_base_rs::runtime::task::Reactor::current()
             .expect("boot runs on the IOC's reactor");
-        let (db, _autosave) = IocBuilder::new()
+        let (db, _autosave) = epics_pva_rs::server::pvxs_ioc_builder()
             .register_link_type("ca", move |db| {
                 epics_ca_rs::calink::calink_link_set_install(db, reactor)
             })

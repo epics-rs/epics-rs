@@ -12,20 +12,20 @@ use std::time::Duration;
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
 
-use epics_base_rs::runtime::task::{self, TaskAbortHandle};
-use epics_pva_rs::client::PvaClient;
-use epics_pva_rs::client_native::ops_v2::{
+use crate::client::PvaClient;
+use crate::client_native::ops_v2::{
     MonitorEvent, MonitorEventMask, PutLeaf, effective_typed_put_path,
 };
-use epics_pva_rs::pv_request::PvRequestExpr;
-use epics_pva_rs::pvdata::{PvField, PvStructure, ScalarValue};
+use crate::pv_request::PvRequestExpr;
+use crate::pvdata::{PvField, PvStructure, ScalarValue};
+use epics_base_rs::runtime::task::{self, TaskAbortHandle};
 
 use super::config::{ProcMode, PvaLinkConfig};
 
 #[derive(Debug, thiserror::Error)]
 pub enum PvaLinkError {
     #[error("PVA error: {0}")]
-    Pva(#[from] epics_pva_rs::error::PvaError),
+    Pva(#[from] crate::error::PvaError),
     #[error("pvalink monitor for {0:?} is disconnected (cached value is stale)")]
     Disconnected(String),
     #[error("field {0:?} not found in remote NT structure")]
@@ -302,9 +302,9 @@ async fn send_put(
 
 /// pvxs's `e.what()` for a failed put: a server's refusal is its message
 /// alone (`RemoteError(msg)`, `src/client.cpp:83-85`).
-fn put_what(e: &epics_pva_rs::error::PvaError) -> Cow<'_, str> {
+fn put_what(e: &crate::error::PvaError) -> Cow<'_, str> {
     match e {
-        epics_pva_rs::error::PvaError::RemoteError(status) => {
+        crate::error::PvaError::RemoteError(status) => {
             Cow::Borrowed(status.message().unwrap_or_default())
         }
         e => Cow::Owned(e.to_string()),
@@ -1648,7 +1648,7 @@ impl PvaLink {
     }
 }
 
-/// True iff a [`epics_pva_rs::PvaError`] indicates the upstream is currently
+/// True iff a [`crate::PvaError`] indicates the upstream is currently
 /// unreachable (as opposed to a value-level rejection). Used to
 /// decide whether a `retry` link should queue the Put (B4).
 ///
@@ -1659,8 +1659,8 @@ impl PvaLink {
 /// yet", and a `retry` link queues the Put for replay on connect. A
 /// genuine value rejection (`InvalidValue`, `Decode`) is not a
 /// disconnect — retrying it would fail identically.
-fn is_disconnect(e: &epics_pva_rs::error::PvaError) -> bool {
-    use epics_pva_rs::error::PvaError;
+fn is_disconnect(e: &crate::error::PvaError) -> bool {
+    use crate::error::PvaError;
     match e {
         PvaError::Io(_)
         | PvaError::Timeout
@@ -1782,8 +1782,8 @@ fn combine_proc(modes: impl Iterator<Item = ProcMode>) -> ProcMode {
 /// fell back to its own defaults — including possibly non-atomic
 /// snapshots and a different queue depth. Match pvxs by always
 /// returning a request with all three fields populated.
-fn monitor_request(config: &PvaLinkConfig) -> Option<epics_pva_rs::pv_request::PvRequestExpr> {
-    let mut req = epics_pva_rs::pv_request::PvRequestExpr::default();
+fn monitor_request(config: &PvaLinkConfig) -> Option<crate::pv_request::PvRequestExpr> {
+    let mut req = crate::pv_request::PvRequestExpr::default();
     // `pvxs/ioc/pvalink_link.cpp:56-65 makeRequest`: `Bool("pipeline")`,
     // `Bool("atomic")`, `UInt32("queueSize")` — typed, not strings.
     req.record_options.push((
@@ -1908,7 +1908,7 @@ fn scalar_value_to_f64(v: &ScalarValue) -> Option<f64> {
         ScalarValue::Float(x) => *x as f64,
         ScalarValue::Double(x) => *x,
         ScalarValue::String(s) => {
-            return epics_pva_rs::pvdata::convert::parse_to_f64(&s.as_str_lossy()).ok();
+            return crate::pvdata::convert::parse_to_f64(&s.as_str_lossy()).ok();
         }
     })
 }
@@ -1961,7 +1961,7 @@ fn link_dbf_type(value_field: &PvField) -> Option<epics_base_rs::server::databas
             .and_then(from_scalar)
             .or(Some(LinkDbfType::Long)),
         PvField::ScalarArrayTyped(arr) => {
-            use epics_pva_rs::pvdata::ScalarType;
+            use crate::pvdata::ScalarType;
             Some(match arr.scalar_type() {
                 ScalarType::Byte => LinkDbfType::Char,
                 ScalarType::UByte => LinkDbfType::UChar,
@@ -2841,11 +2841,11 @@ mod tests {
         obs: Arc<std::sync::Mutex<ConnSwitchObs>>,
         refuse_put: bool,
     ) {
-        use epics_pva_rs::proto::{
+        use crate::proto::{
             ByteOrder, Command, ControlCommand, PvaHeader, Status, WriteExt, encode_size_into,
             encode_string_into,
         };
-        use epics_pva_rs::pvdata::{FieldDesc, ScalarType};
+        use crate::pvdata::{FieldDesc, ScalarType};
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         const ORDER: ByteOrder = ByteOrder::Little;
@@ -2923,7 +2923,7 @@ mod tests {
                         // GetOPut: the present value, `value` = 5 marked.
                         p.put_u8(0x40);
                         Status::ok().write_into(ORDER, &mut p);
-                        let mut changed = epics_pva_rs::proto::BitSet::new();
+                        let mut changed = crate::proto::BitSet::new();
                         changed.set(1);
                         changed.write_into(ORDER, &mut p);
                         p.put_f64(5.0, ORDER);
@@ -2956,7 +2956,7 @@ mod tests {
                             fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))]
                                 .into(),
                         };
-                        epics_pva_rs::pvdata::encode::encode_type_desc(&intro, ORDER, &mut p);
+                        crate::pvdata::encode::encode_type_desc(&intro, ORDER, &mut p);
                     } else {
                         obs.lock().unwrap().put_data_body = Some(payload[9..].to_vec());
                         p.put_u8(0x00);
@@ -2994,8 +2994,8 @@ mod tests {
     /// processed and no in-tree epics-rs-to-epics-rs test could see it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn forward_link_puts_the_present_value_with_process_true() {
-        use epics_pva_rs::proto::ByteOrder;
-        use epics_pva_rs::pvdata::{PvField, ScalarValue};
+        use crate::proto::ByteOrder;
+        use crate::pvdata::{PvField, ScalarValue};
 
         let obs = Arc::new(std::sync::Mutex::new(ConnSwitchObs::default()));
         let addr = spawn_conn_switch_server(obs.clone(), false).await;
@@ -3025,10 +3025,10 @@ mod tests {
             .as_ref()
             .expect("the forward link must open a PUT");
         let mut cur = std::io::Cursor::new(&req_bytes[..]);
-        let req_desc = epics_pva_rs::pvdata::encode::decode_type_desc(&mut cur, ByteOrder::Little)
+        let req_desc = crate::pvdata::encode::decode_type_desc(&mut cur, ByteOrder::Little)
             .expect("pvRequest descriptor");
         let req_val =
-            epics_pva_rs::pvdata::encode::decode_pv_field(&req_desc, &mut cur, ByteOrder::Little)
+            crate::pvdata::encode::decode_pv_field(&req_desc, &mut cur, ByteOrder::Little)
                 .expect("pvRequest value");
         assert!(
             matches!(req_val, PvField::Structure(_)),
@@ -3048,8 +3048,8 @@ mod tests {
             .as_ref()
             .expect("the forward link must send the PUT data phase");
         let mut cur = std::io::Cursor::new(&data[..]);
-        let changed = epics_pva_rs::proto::BitSet::decode(&mut cur, ByteOrder::Little)
-            .expect("changed bitset");
+        let changed =
+            crate::proto::BitSet::decode(&mut cur, ByteOrder::Little).expect("changed bitset");
         assert!(
             changed.get(1) && changed.count() == 1,
             "a forward link sends back the readback's marks: {changed:?}"
@@ -3138,10 +3138,10 @@ mod tests {
     /// link transfers no value.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn forward_link_processes_a_native_record_without_moving_its_value() {
-        use epics_base_rs::server::database::PvDatabase;
-        use epics_pva_rs::server::PvDatabaseSource;
+        use crate::server::PvDatabaseSource;
         #[cfg(tokio_backend)]
-        use epics_pva_rs::server_native::PvaServer;
+        use crate::server_native::PvaServer;
+        use epics_base_rs::server::database::PvDatabase;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         let processed = Arc::new(AtomicUsize::new(0));
@@ -3764,7 +3764,7 @@ mod tests {
 
     #[test]
     fn b4_is_disconnect_classification() {
-        use epics_pva_rs::error::PvaError;
+        use crate::error::PvaError;
         assert!(is_disconnect(&PvaError::Timeout));
         assert!(is_disconnect(&PvaError::ConnectionRefused));
         assert!(is_disconnect(&PvaError::ChannelNotFound("x".into())));
@@ -4137,8 +4137,8 @@ mod tests {
     #[cfg(tokio_backend)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn upstream_death_disconnects_the_inp_monitor_link() {
-        use epics_pva_rs::pvdata::{FieldDesc, ScalarType};
-        use epics_pva_rs::server_native::{PvaServer, SharedPV, SharedSource};
+        use crate::pvdata::{FieldDesc, ScalarType};
+        use crate::server_native::{PvaServer, SharedPV, SharedSource};
 
         let pv = SharedPV::build_mailbox();
         pv.open(
@@ -4211,10 +4211,10 @@ mod tests {
     /// (`pvxs/ioc/pvalink_channel.cpp:138`) targets `top[fieldName]`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn mr_r4_typed_field_put_targets_subfield() {
-        use epics_pva_rs::pvdata::{FieldDesc, ScalarType};
+        use crate::pvdata::{FieldDesc, ScalarType};
         #[cfg(tokio_backend)]
-        use epics_pva_rs::server_native::PvaServer;
-        use epics_pva_rs::server_native::{SharedPV, SharedSource};
+        use crate::server_native::PvaServer;
+        use crate::server_native::{SharedPV, SharedSource};
 
         // Structure PV with a root `value` array and an `aux` array
         // sub-field, built as a writable mailbox so the field-targeted
@@ -4326,8 +4326,8 @@ mod tests {
     }
 
     #[cfg(tokio_backend)]
-    fn double_struct_desc() -> epics_pva_rs::pvdata::FieldDesc {
-        use epics_pva_rs::pvdata::{FieldDesc, ScalarType};
+    fn double_struct_desc() -> crate::pvdata::FieldDesc {
+        use crate::pvdata::{FieldDesc, ScalarType};
         FieldDesc::Structure {
             struct_id: "structure".into(),
             fields: vec![
@@ -4369,8 +4369,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn out_links_coalesce_into_one_combined_put() {
         #[cfg(tokio_backend)]
-        use epics_pva_rs::server_native::PvaServer;
-        use epics_pva_rs::server_native::{SharedPV, SharedSource};
+        use crate::server_native::PvaServer;
+        use crate::server_native::{SharedPV, SharedSource};
 
         let pv = SharedPV::build_mailbox();
         pv.open(double_struct_desc(), double_struct_initial())
@@ -4445,8 +4445,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn deferred_fields_drain_in_one_put() {
         #[cfg(tokio_backend)]
-        use epics_pva_rs::server_native::PvaServer;
-        use epics_pva_rs::server_native::{SharedPV, SharedSource};
+        use crate::server_native::PvaServer;
+        use crate::server_native::{SharedPV, SharedSource};
 
         let pv = SharedPV::build_mailbox();
         pv.open(double_struct_desc(), double_struct_initial())
@@ -4510,7 +4510,7 @@ mod tests {
     /// further write (softIocPVX: `PUT 2` 2.00 s after a 2 s `PUT 1`).
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_deferred_write_goes_out_when_the_put_ahead_of_it_completes() {
-        use epics_pva_rs::server_native::{PvaServer, SharedPV, SharedSource};
+        use crate::server_native::{PvaServer, SharedPV, SharedSource};
 
         let pv = SharedPV::new();
         pv.open(double_struct_desc(), double_struct_initial())
@@ -4577,12 +4577,12 @@ mod tests {
     fn gated_put_server(
         refuse_first: bool,
     ) -> (
-        epics_pva_rs::server_native::PvaServer,
+        crate::server_native::PvaServer,
         PvaClient,
         Arc<std::sync::Mutex<Vec<f64>>>,
         std::sync::mpsc::Sender<()>,
     ) {
-        use epics_pva_rs::server_native::{PvaServer, SharedPV, SharedSource};
+        use crate::server_native::{PvaServer, SharedPV, SharedSource};
 
         let pv = SharedPV::new();
         pv.open(double_struct_desc(), double_struct_initial())
@@ -4686,8 +4686,8 @@ mod tests {
     /// for the connection, `pvalink.rst:99-100`).
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_held_retry_put_goes_out_on_connect() {
-        use epics_pva_rs::pvdata::{FieldDesc, ScalarType};
-        use epics_pva_rs::server_native::{PvaServer, SharedPV, SharedSource};
+        use crate::pvdata::{FieldDesc, ScalarType};
+        use crate::server_native::{PvaServer, SharedPV, SharedSource};
 
         // Server is up the whole time; the channel is absent at first.
         let source = Arc::new(SharedSource::new());
@@ -4731,8 +4731,8 @@ mod tests {
     /// value connects it and counts one type change (`:342-353`).
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn the_first_value_connects_the_channel() {
-        use epics_pva_rs::pvdata::{FieldDesc, ScalarType};
-        use epics_pva_rs::server_native::{PvaServer, SharedPV, SharedSource};
+        use crate::pvdata::{FieldDesc, ScalarType};
+        use crate::server_native::{PvaServer, SharedPV, SharedSource};
 
         let source = Arc::new(SharedSource::new());
         let pv = SharedPV::new();

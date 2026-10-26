@@ -1206,6 +1206,7 @@ dependencies = [
 name = "epics-pva-rs"
 version = "0.32.0"
 dependencies = [
+ "arc-swap",
  "bytes",
  "chrono",
  "clap",
@@ -1214,6 +1215,7 @@ dependencies = [
  "epics-base-rs",
  "epics-libcom-rs",
  "epics-macros-rs",
+ "epics-oracle-rs",
  "fact-budget",
  "futures-util",
  "hmac 0.13.0",

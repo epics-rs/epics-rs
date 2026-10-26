@@ -15,6 +15,7 @@ use crate::support::eventually;
 /// The 6517A behind `Dmm=E1:`.
 const EM: Meter = Meter {
     program: "Keithley65xxEM",
+    template: "Keithley65xxEM",
     dmm: "E1:",
     model: "6517A",
     modes: &[

@@ -15,6 +15,7 @@ use crate::support::eventually;
 /// The 2700 behind `Dmm=D1:`.
 const DMM: Meter = Meter {
     program: "Keithley2kDMM_mf40",
+    template: "Keithley2kDMM_mf40",
     dmm: "D1:",
     model: "2700",
     modes: &[

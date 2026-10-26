@@ -7,5 +7,6 @@ mod support;
 mod harness;
 mod mock;
 
+mod keithley2k_dmm;
 mod keithley2k_dmm_mf40;
 mod keithley65xx_em;

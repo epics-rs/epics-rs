@@ -18,8 +18,10 @@ use crate::support::{eventually, sh};
 
 /// One program and the meter it drives.
 pub struct Meter {
-    /// The program, its template's stem too.
+    /// The program.
     pub program: &'static str,
+    /// The template's stem.
+    pub template: &'static str,
     /// The `Dmm` macro.
     pub dmm: &'static str,
     /// The `model` macro.
@@ -58,7 +60,7 @@ pub async fn boot(meter: &Meter, channels: u32) -> Ioc {
         .register_record_type("scalcout", || Box::new(ScalcoutRecord::default()))
         .register_dynamic_device_support(&DEVICE_ROWS, device_support_factory())
         .db_file(
-            &format!("{}/{}.db", ip_rs::IP_DB_DIR, meter.program),
+            &format!("{}/{}.db", ip_rs::IP_DB_DIR, meter.template),
             &macros,
         )
         .unwrap()

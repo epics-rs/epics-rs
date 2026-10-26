@@ -667,6 +667,18 @@ impl Record for McaRecord {
         (link_field == "SIOL").then(|| self.val.clone())
     }
 
+    /// Only a DB link's read writes part of `bptr`, and NORD takes its
+    /// clamped count whatever the status (`mcaRecord.c:1118-1120`).
+    fn land_failed_array_read(&mut self, link_field: &str, left: EpicsValue) {
+        if link_field != "SIOL" {
+            return;
+        }
+        if let Ok((read, n)) = self.land_buffer(left) {
+            copy_channels(&mut self.val, &read, n);
+            self.nord = n as i32;
+        }
+    }
+
     /// The `mca` declaration: the table generated from the vendored
     /// `dbd/mcaRecord.dbd`.
     ///

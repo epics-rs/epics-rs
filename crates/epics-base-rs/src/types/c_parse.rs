@@ -337,17 +337,16 @@ pub fn get_string_array(
     )
 }
 
-/// [`get_string_array`] for a reader that ignores the status, as
-/// `dbCaGetLink` ignores `aConvert`'s (`dbCa.c:519`): the read is what
-/// `getString<Type>` left in `pdest`, here `prior` (0 past its end). The loop
-/// writes each element it parses, skips one it parses but cannot store, and
-/// returns at the first it cannot parse, so every element from there on is
-/// `prior`'s. `prior` is in `target`'s type, an array or one element.
+/// `getString<Type>` into a reader's buffer `prior` (0 past its end), in
+/// `target`'s type, an array or one element: the loop writes each element it
+/// parses, skips one it parses but cannot store, and returns at the first it
+/// cannot parse, so every element from there on is `prior`'s. `Err` is that
+/// return's non-zero status, with the buffer as it left it.
 pub fn get_string_array_over(
     target: NumericField,
     elems: &[crate::types::PvString],
     prior: Option<&EpicsValue>,
-) -> EpicsValue {
+) -> Result<EpicsValue, EpicsValue> {
     macro_rules! rows {
         ($(($row:ident, $scalar:ident, $array:ident)),+ $(,)?) => {
             match target {
@@ -359,15 +358,20 @@ pub fn get_string_array_over(
                     };
                     let mut out: Vec<_> = prior.iter().copied().take(elems.len()).collect();
                     out.resize(elems.len(), Default::default());
+                    let mut refused = false;
                     for (s, to) in elems.iter().zip(out.iter_mut()) {
                         let s = s.as_str_lossy();
                         match if s.is_empty() { Row::Stored(zero(target)) } else { parse(target, &s) } {
                             Row::Stored(EpicsValue::$scalar(v)) => *to = v,
                             Row::Stored(_) | Row::Unchanged => {}
-                            Row::Refused => break,
+                            Row::Refused => {
+                                refused = true;
+                                break;
+                            }
                         }
                     }
-                    EpicsValue::$array(out.into())
+                    let out = EpicsValue::$array(out.into());
+                    if refused { Err(out) } else { Ok(out) }
                 })+
             }
         };

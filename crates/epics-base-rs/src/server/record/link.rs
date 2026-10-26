@@ -6102,19 +6102,24 @@ impl super::record_instance::RecordInstance {
     /// is held — the only way to a lent target. `release_addr` runs only with
     /// the reader exclusively borrowed (`RecordInstance::destroy`,
     /// `release_link_targets_to`), and no other instance holds this
-    /// `Arc<DbLink>`: every `parsed_inp` is its own parse.
+    /// `Arc<DbLink>`: every `parsed_inp` is its own parse. The reader's
+    /// record is lent beside it, the buffer a failed array read lands in.
     #[inline(always)]
     pub(crate) fn lend_inp_addr(
         &mut self,
         revision: u64,
         resolve: impl FnOnce(&DbLink) -> DbLinkAnswer,
-    ) -> Option<(&ParsedLink, &super::record_instance::ResolvedTarget)> {
+    ) -> Option<(
+        &ParsedLink,
+        &super::record_instance::ResolvedTarget,
+        &dyn super::Record,
+    )> {
         let link = self.parsed_inp.link();
         let ParsedLink::Db(db) = link else {
             return None;
         };
         // SAFETY: `self` is borrowed `&mut` for the returned lifetime.
         let at = unsafe { db.lend_addr(revision, || resolve(db)) }?;
-        Some((link, at))
+        Some((link, at, &*self.record))
     }
 }

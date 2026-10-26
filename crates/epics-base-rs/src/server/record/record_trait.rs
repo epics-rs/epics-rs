@@ -7440,12 +7440,21 @@ pub trait Record: RecordAny + Send + Sync + 'static {
     }
 
     /// C's `pdest` of an [`LinkReadAs::Array`] read on `link_field`: the
-    /// buffer as it stands before the read. A CA read keeps it from the
-    /// element that fails to convert on, `dbCaGetLink` ignoring `aConvert`'s
-    /// status (`dbCa.c:519`). `None`, the default, keeps zeros.
+    /// buffer as it stands before the read. A read keeps it from the element
+    /// that fails to convert on; CA ignores that status (`dbCa.c:519`), a DB
+    /// link fails with it. `None`, the default, keeps zeros.
     fn array_read_destination(&self, link_field: &str) -> Option<EpicsValue> {
         let _ = link_field;
         None
+    }
+
+    /// A DB link's [`LinkReadAs::Array`] read on `link_field` that failed
+    /// part way: `left` is [`Self::array_read_destination`]'s buffer with the
+    /// elements before the failed one written, which C's in-place `dbGet`
+    /// leaves there whatever the status (`dbAccess.c:1007-1021`). Called once,
+    /// before the failure's LINK alarm.
+    fn land_failed_array_read(&mut self, link_field: &str, left: EpicsValue) {
+        let _ = (link_field, left);
     }
 
     /// Return the name of the output event (`OEVT`) to post this cycle, or

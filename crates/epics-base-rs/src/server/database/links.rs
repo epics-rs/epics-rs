@@ -107,11 +107,10 @@ fn link_value_get_as(value: EpicsValue, target: DbFieldType) -> Option<EpicsValu
 }
 
 /// C's `pdest` of an array read: the reader's buffer for its link field,
-/// asked only when a CA read keeps part of it
-/// ([`ca_array_read`]).
+/// asked only when a read fails part way into it ([`array_into`]).
 #[derive(Clone, Copy)]
 pub(crate) enum ReadDest<'a> {
-    /// No reader buffer: what a CA read keeps of it is 0.
+    /// No reader buffer: what a read keeps of it is 0.
     None,
     Record(&'a dyn crate::server::record::Record, &'static str),
     /// The reader in its frame, its data lock not held.
@@ -128,11 +127,66 @@ impl ReadDest<'_> {
     }
 }
 
+/// A link read converted at the reader's request. `Err` is a non-zero
+/// status, with the reader's buffer as the read left it when it wrote part
+/// of it.
+pub(crate) type Converted = Result<EpicsValue, ReadLeft>;
+
+/// What a failed array read left in the reader's buffer: C's `dbGet`
+/// converts in place, so the elements before the one that failed are
+/// written whatever the status. Handed beside the failure, not inside
+/// [`LinkFetch`], to the caller that lands it in the reader.
+pub(crate) type ReadLeft = Option<Box<EpicsValue>>;
+
+/// An array convert into the reader's buffer `dest`, in place as
+/// `dbGetConvertRoutine` (`dbAccess.c:1007-1021`) and `dbCaGetLink`'s
+/// `aConvert` (`dbCa.c:519`) both run. Only a `DBF_STRING` source fails part
+/// way: `getString<Type>` returns at the first element it cannot parse
+/// (`dbConvert.c:283-414`), and a string read as `DBR_ENUM` is
+/// `getStringUshort` (`dbConvert.c:1710-1712`).
+fn array_into(dbr: DbFieldType, value: EpicsValue, dest: ReadDest<'_>) -> Converted {
+    if let Ok(v) = value.get_convert(dbr) {
+        return Ok(v);
+    }
+    let row_type = match dbr {
+        DbFieldType::Enum => DbFieldType::UShort,
+        dbr => dbr,
+    };
+    let Some(row) = crate::types::c_parse::NumericField::of(row_type) else {
+        return Err(None);
+    };
+    let prior = dest.buffer().and_then(|b| b.get_convert(row_type).ok());
+    let read = match &value {
+        EpicsValue::StringArray(elems) => {
+            crate::types::c_parse::get_string_array_over(row, elems, prior.as_ref())
+        }
+        EpicsValue::String(s) => {
+            let one = |v: EpicsValue| v.first_element().ok_or(None);
+            match crate::types::c_parse::get_string_array_over(
+                row,
+                std::slice::from_ref(s),
+                prior.as_ref(),
+            ) {
+                Ok(v) => Ok(one(v)?),
+                Err(left) => Err(one(left)?),
+            }
+        }
+        _ => return Err(None),
+    };
+    let as_enum = |read: EpicsValue| match read {
+        EpicsValue::UShortArray(a) if dbr == DbFieldType::Enum => EpicsValue::EnumArray(a),
+        EpicsValue::UShort(v) if dbr == DbFieldType::Enum => EpicsValue::Enum(v),
+        read => read,
+    };
+    read.map(as_enum)
+        .map_err(|left| Some(Box::new(as_enum(left))))
+}
+
 /// `dbCaGetLink`'s array read at a numeric or `DBR_ENUM` request
 /// (`dbCa.c:507-520`): `ntoget` elements through `aConvert`, whose status is
 /// ignored, so a channel the request cannot convert still reads. `dbGet`'s
 /// one-element scalar convert has no place here, so a string read as
-/// `DBR_ENUM` is `getStringUshort` (`dbConvert.c:1710-1712`), not `cvt_st_e`.
+/// `DBR_ENUM` converts as an array does.
 fn ca_array_read(
     dbr: DbFieldType,
     n_request: usize,
@@ -144,34 +198,10 @@ fn ca_array_read(
     } else {
         value = element_0(value)?;
     }
-    if let Ok(v) = value.get_convert(dbr) {
-        return Some(v);
+    match array_into(dbr, value, dest) {
+        Ok(v) => Some(v),
+        Err(left) => left.map(|left| *left),
     }
-    // Only a `DBF_STRING` channel fails: what `getString<Type>` left in
-    // `pdest`, which holds the reader's buffer from the failed element on.
-    let row_type = match dbr {
-        DbFieldType::Enum => DbFieldType::UShort,
-        dbr => dbr,
-    };
-    let row = crate::types::c_parse::NumericField::of(row_type)?;
-    let prior = dest.buffer().and_then(|b| b.get_convert(row_type).ok());
-    let read = match &value {
-        EpicsValue::StringArray(elems) => {
-            crate::types::c_parse::get_string_array_over(row, elems, prior.as_ref())
-        }
-        EpicsValue::String(s) => crate::types::c_parse::get_string_array_over(
-            row,
-            std::slice::from_ref(s),
-            prior.as_ref(),
-        )
-        .first_element()?,
-        _ => return None,
-    };
-    Some(match read {
-        EpicsValue::UShortArray(a) if dbr == DbFieldType::Enum => EpicsValue::EnumArray(a),
-        EpicsValue::UShort(v) if dbr == DbFieldType::Enum => EpicsValue::Enum(v),
-        read => read,
-    })
 }
 
 fn empty_read_fetch(
@@ -1195,6 +1225,7 @@ impl PvDatabase {
     ) -> Option<(
         &'g crate::server::record::ParsedLink,
         &'g crate::server::record::record_instance::ResolvedTarget,
+        &'g dyn crate::server::record::Record,
     )> {
         use crate::server::record::record_instance::LinkTargetResolver;
         instance.lend_inp_addr(self.name_revision(), |db| self.resolve_db_link(db))
@@ -1473,7 +1504,7 @@ impl PvDatabase {
             _ => {
                 // A PP source processes as C `dbDbGetValue`'s `dbScanPassive`
                 // does from `init_record`, holding the reader's PACT.
-                let (fetch, alarm) = self.read_link_value_as_from(
+                let (fetch, alarm, _) = self.read_link_value_as_from(
                     Some(reader),
                     None,
                     link,
@@ -1560,7 +1591,7 @@ impl PvDatabase {
     ///
     /// A conversion failure carries no alarm, which is where the separate-read
     /// caller already stood: it asked for the severity only inside its
-    /// `LinkFetch::Value` arm.
+    /// `LinkFetch::Value` arm. It carries what it left in `dest`.
     pub(crate) fn read_link_value_as_with_alarm(
         &self,
         src: Option<InFrame<'_>>,
@@ -1568,7 +1599,11 @@ impl PvDatabase {
         read_as: crate::server::record::LinkReadAs,
         dest: ReadDest<'_>,
         visited: &mut ProcStack,
-    ) -> (crate::server::recgbl::simm::LinkFetch, Option<SourceAlarm>) {
+    ) -> (
+        crate::server::recgbl::simm::LinkFetch,
+        Option<SourceAlarm>,
+        ReadLeft,
+    ) {
         self.read_link_value_as_from(
             src.map(|src| src.unframed()),
             src.map(|src| src.set()),
@@ -1589,7 +1624,11 @@ impl PvDatabase {
         read_as: crate::server::record::LinkReadAs,
         dest: ReadDest<'_>,
         visited: &mut ProcStack,
-    ) -> (crate::server::recgbl::simm::LinkFetch, Option<SourceAlarm>) {
+    ) -> (
+        crate::server::recgbl::simm::LinkFetch,
+        Option<SourceAlarm>,
+        ReadLeft,
+    ) {
         use crate::server::recgbl::simm::LinkFetch;
         let (value, alarm, render) = self.read_link_value_and_alarm_at_source(
             src,
@@ -1598,11 +1637,11 @@ impl PvDatabase {
             visited,
         );
         let Some(value) = value else {
-            return (empty_read_fetch(link), None);
+            return (empty_read_fetch(link), None, None);
         };
         match self.apply_link_read_as(held, link, read_as, value, render, dest) {
-            Some(v) => (LinkFetch::Value(v), alarm),
-            None => (LinkFetch::Failed, None),
+            Ok(v) => (LinkFetch::Value(v), alarm, None),
+            Err(left) => (LinkFetch::Failed, None, left),
         }
     }
 
@@ -1611,8 +1650,9 @@ impl PvDatabase {
     /// (the pre-input [`Self::read_db_link_into_field`] stage, the single-INP
     /// soft fetch, the DOL fetch, the multi-input loop and the SIOL read).
     ///
-    /// `None` is C's non-zero `dbGetLink` status (`dbConvert.c`'s NULL
-    /// conversion slot), i.e. a FAILED read — never a silent no-op.
+    /// `Err` is C's non-zero `dbGetLink` status (`dbConvert.c`'s NULL
+    /// conversion slot, or an element it could not convert), i.e. a FAILED
+    /// read — never a silent no-op.
     #[inline(always)]
     ///
     /// `render` is what the read that produced `value` took of a local source
@@ -1626,9 +1666,9 @@ impl PvDatabase {
         value: EpicsValue,
         render: Option<crate::server::record::record_instance::SourceRender>,
         dest: ReadDest<'_>,
-    ) -> Option<EpicsValue> {
+    ) -> Converted {
         match read_as {
-            crate::server::record::LinkReadAs::Native => Some(value),
+            crate::server::record::LinkReadAs::Native => Ok(value),
             _ => self.convert_link_read(held, link, read_as, value, render, dest),
         }
     }
@@ -1643,12 +1683,12 @@ impl PvDatabase {
         value: EpicsValue,
         render: Option<crate::server::record::record_instance::SourceRender>,
         dest: ReadDest<'_>,
-    ) -> Option<EpicsValue> {
+    ) -> Converted {
         use crate::server::record::LinkReadAs;
         if let Some(route) = self.text_route_of(link) {
-            return text_route_read(route, read_as, value);
+            return text_route_read(route, read_as, value).ok_or(None);
         }
-        match read_as {
+        let read = match read_as {
             LinkReadAs::Native => Some(value),
             // C `dbGetLink(..., DBR_DOUBLE, ...)`: an array source contributes
             // its element 0 (C asks for one element, so `dbGet` converts offset
@@ -1662,7 +1702,7 @@ impl PvDatabase {
             | LinkReadAs::ULong
             | LinkReadAs::UShort
             | LinkReadAs::Int64
-            | LinkReadAs::UInt64 => link_value_get_as(value, read_as.dbr_type()?),
+            | LinkReadAs::UInt64 => link_value_get_as(value, read_as.dbr_type().ok_or(None)?),
             LinkReadAs::Enum => self.enum_read_of(held, link, value),
             LinkReadAs::String => self
                 .dbr_string_of(link, value, render)
@@ -1672,7 +1712,8 @@ impl PvDatabase {
                 // (`printfRecord.c:246`), so `strlen` at :256 runs on into a
                 // previous VAL's bytes there: a C defect, not copied.
                 let value = if self.reads_through_db_ca(link) {
-                    ca_array_read(DbFieldType::Char, max_elements, value, ReadDest::None)?
+                    ca_array_read(DbFieldType::Char, max_elements, value, ReadDest::None)
+                        .ok_or(None)?
                 } else {
                     value
                 };
@@ -1683,38 +1724,42 @@ impl PvDatabase {
             {
                 ca_array_read(dbr, n_request, value, dest)
             }
-            LinkReadAs::Array { dbr, n_request } => {
-                self.array_read_of(held, link, dbr, n_request, value, render)
+            // `dbGet`'s `no_elements == 1` test (`dbAccess.c:967`): a source
+            // of one element converts as the matching scalar request does.
+            LinkReadAs::Array { dbr, n_request } if value.is_array() && value.count() != 1 => {
+                return self.array_read_of(link, dbr, n_request, value, render, dest);
             }
-        }
+            LinkReadAs::Array { dbr, .. } => match dbr {
+                DbFieldType::String => self
+                    .dbr_string_of(link, value, render)
+                    .map(EpicsValue::String),
+                DbFieldType::Enum => self.enum_read_of(held, link, value),
+                _ => element_0(value).and_then(|v| v.get_convert(dbr).ok()),
+            },
+        };
+        read.ok_or(None)
     }
 
-    /// [`LinkReadAs::Array`](crate::server::record::LinkReadAs::Array): an array source keeps its first `n_request`
-    /// elements, each converted to `dbr`; a source of one element converts as
-    /// the matching scalar request does, `dbGet`'s `no_elements == 1` test
-    /// (`dbAccess.c:967`).
+    /// [`LinkReadAs::Array`](crate::server::record::LinkReadAs::Array) of an array source: its first `n_request`
+    /// elements, each converted to `dbr`. A DB link's convert runs into the
+    /// reader's buffer `dest` ([`array_into`]); every other link's is all or
+    /// nothing.
     fn array_read_of(
         &self,
-        held: Option<&crate::server::database::SetGuard>,
         link: &crate::server::record::ParsedLink,
         dbr: DbFieldType,
         n_request: usize,
         mut value: EpicsValue,
         render: Option<crate::server::record::record_instance::SourceRender>,
-    ) -> Option<EpicsValue> {
-        if value.is_array() && value.count() != 1 {
-            if dbr == DbFieldType::String {
-                return self.dbr_strings_of(value, n_request, render);
-            }
-            value.truncate(n_request);
-            return value.get_convert(dbr).ok();
+        dest: ReadDest<'_>,
+    ) -> Converted {
+        if dbr == DbFieldType::String {
+            return self.dbr_strings_of(value, n_request, render).ok_or(None);
         }
-        match dbr {
-            DbFieldType::String => self
-                .dbr_string_of(link, value, render)
-                .map(EpicsValue::String),
-            DbFieldType::Enum => self.enum_read_of(held, link, value),
-            _ => element_0(value)?.get_convert(dbr).ok(),
+        value.truncate(n_request);
+        match link {
+            crate::server::record::ParsedLink::Db(_) => array_into(dbr, value, dest),
+            _ => value.get_convert(dbr).map_err(|_| None),
         }
     }
 
@@ -2116,7 +2161,7 @@ impl PvDatabase {
     /// caller that has the target in hand: the value as `read_as` asks, and
     /// the source's alarm only for a read and conversion that both
     /// succeeded (`dbDbLink.c:228`), as [`Self::read_link_value_as_with_alarm`]
-    /// gates the general path. `None` with no alarm for a non-DB `link`.
+    /// gates the general path. A failure with no alarm for a non-DB `link`.
     // Off the debug FLNK frame; see `process_cycle`.
     #[cfg_attr(not(debug_assertions), inline(always))]
     pub(crate) fn read_db_link_as_at(
@@ -2125,22 +2170,23 @@ impl PvDatabase {
         link: &crate::server::record::ParsedLink,
         at: &crate::server::record::record_instance::ResolvedTarget,
         read_as: crate::server::record::LinkReadAs,
-    ) -> (Option<EpicsValue>, Option<SourceAlarm>) {
+        dest: ReadDest<'_>,
+    ) -> (Converted, Option<SourceAlarm>) {
         let crate::server::record::ParsedLink::Db(db) = link else {
-            return (None, None);
+            return (Err(None), None);
         };
         if read_as == crate::server::record::LinkReadAs::Double {
             let (value, alarm) = self.read_db_link_f64_at(held, db, at);
-            return (value.map(EpicsValue::Double), alarm);
+            return (value.map(EpicsValue::Double).ok_or(None), alarm);
         }
         let (Some(value), alarm, render) =
             self.read_db_at(Some(held), db, at, read_as.renders_at_source())
         else {
-            return (None, None);
+            return (Err(None), None);
         };
-        match self.apply_link_read_as(Some(held), link, read_as, value, render, ReadDest::None) {
-            Some(value) => (Some(value), alarm),
-            None => (None, None),
+        match self.apply_link_read_as(Some(held), link, read_as, value, render, dest) {
+            Ok(value) => (Ok(value), alarm),
+            failed => (failed, None),
         }
     }
 
@@ -7433,7 +7479,7 @@ mod db_link_addr_tests {
             );
             let held = db.lock_record(&link.target().record);
             let (value, alarm) = db.read_db_link_f64_at(held.set(), link, &at);
-            let (fetch, general_alarm) = db.read_link_value_as_with_alarm(
+            let (fetch, general_alarm, _) = db.read_link_value_as_with_alarm(
                 None,
                 &parsed,
                 LinkReadAs::Double,
@@ -7497,7 +7543,7 @@ mod db_link_addr_tests {
             ("S42", Some(&[42])),
             ("SABC", None),
         ] {
-            let (fetch, _) = db.read_link_value_as_with_alarm(
+            let (fetch, _, _) = db.read_link_value_as_with_alarm(
                 None,
                 &parse_link_v2(src),
                 read_as,
@@ -7554,8 +7600,10 @@ mod db_link_addr_tests {
             let at = db.db_link_addr(link).expect("a local target");
             for read_as in requests {
                 let held = db.lock_record(&link.target().record);
-                let (value, alarm) = db.read_db_link_as_at(held.set(), &parsed, &at, read_as);
-                let (fetch, general_alarm) = db.read_link_value_as_with_alarm(
+                let (value, alarm) =
+                    db.read_db_link_as_at(held.set(), &parsed, &at, read_as, super::ReadDest::None);
+                let value = value.ok();
+                let (fetch, general_alarm, _) = db.read_link_value_as_with_alarm(
                     None,
                     &parsed,
                     read_as,
@@ -7637,8 +7685,9 @@ mod db_link_addr_tests {
             };
             let at = db.db_link_addr(link).expect("a local target");
             let held = db.lock_record(&link.target().record);
-            let (value, alarm) = db.read_db_link_as_at(held.set(), &parsed, &at, read_as);
-            assert_eq!(value, expect, "{text} as {read_as:?}");
+            let (value, alarm) =
+                db.read_db_link_as_at(held.set(), &parsed, &at, read_as, super::ReadDest::None);
+            assert_eq!(value.ok(), expect, "{text} as {read_as:?}");
             assert_eq!(alarm.is_some(), expect.is_some(), "{text} as {read_as:?}");
         }
     }
@@ -7880,7 +7929,7 @@ mod enum_read_held_set_tests {
         for (reader, field, want) in [("BSRC", "ONAM", 1), ("OTHER", "ZNAM", 0)] {
             let cell = db.get_record(reader).unwrap();
             let gate = FrameGate::Taken(db.lock_instance(&cell));
-            let (fetch, _) = db.read_link_value_as_with_alarm(
+            let (fetch, _, _) = db.read_link_value_as_with_alarm(
                 Some(gate.frame(&cell)),
                 &parse_link_v2(format!("BSRC.{field} NPP")),
                 LinkReadAs::Enum,

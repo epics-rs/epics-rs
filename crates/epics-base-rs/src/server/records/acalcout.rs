@@ -2471,6 +2471,19 @@ impl Record for AcalcoutRecord {
         Some(EpicsValue::DoubleArray(self.arr_vals[i].as_slice().into()))
     }
 
+    /// The array loop returns the status (`aCalcoutRecord.c:1099`) before
+    /// its zero-fill and NEWM compare.
+    fn land_failed_array_read(&mut self, link_field: &str, left: EpicsValue) {
+        let (Some(i), EpicsValue::DoubleArray(left)) = (Self::ina_index(link_field), left) else {
+            return;
+        };
+        let nelm = (self.nelm as usize).max(1);
+        let buf = &mut self.arr_vals[i];
+        buf.resize(nelm.max(buf.len()), 0.0);
+        let n = left.len().min(buf.len());
+        buf[..n].copy_from_slice(&left[..n]);
+    }
+
     fn set_fetch_gate_failed(&mut self, failed: bool) {
         self.fetch_gate_failed = failed;
     }

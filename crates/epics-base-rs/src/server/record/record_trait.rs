@@ -2869,6 +2869,10 @@ impl CycleHooks {
     /// type's code reads its own record through what its holder lends it.
     /// Outside [`Self::ALL`]: a type declares it.
     pub const OWN_FRAME: Self = Self(65536);
+    /// [`Record::set_inp_nelements`], ahead of the INP read: outside
+    /// [`Self::ALL`], declared by a type whose C `process()` asks
+    /// `dbGetNelements` of INP before its `dbGetLink` (`compressRecord.c:328`).
+    pub const INP_NELEMENTS: Self = Self(131072);
     /// No hook acts: the stock record.
     pub const NONE: Self = Self(0);
     /// Every per-cycle hook is asked — the default, so a type that never says
@@ -2922,6 +2926,7 @@ const _: () = {
         CycleHooks::MONITOR_RESET.0,
         CycleHooks::LINK_CHECK.0,
         CycleHooks::OWN_FRAME.0,
+        CycleHooks::INP_NELEMENTS.0,
     ];
     let mut seen = 0;
     let mut i = 0;
@@ -7565,6 +7570,15 @@ pub trait Record: RecordAny + Send + Sync + 'static {
         Some(ProcessActions::new())
     }
 
+    /// INP's `dbIsLinkConnected && dbGetNelements` — `None` where that test
+    /// fails — told to a type that declares [`CycleHooks::INP_NELEMENTS`]
+    /// after its pre-input actions and before the INP read, whatever that
+    /// read then delivers. `false` refuses the read: the cycle neither reads
+    /// INP nor raises the alarm a failed `dbGetLink` would.
+    fn set_inp_nelements(&mut self, _nelements: Option<i64>) -> bool {
+        true
+    }
+
     /// Called by the framework immediately before `process()` to push a
     /// read-only snapshot of framework-owned [`crate::server::record::CommonFields`] state
     /// ([`ProcessContext`]) that the record's `process()` needs to see.
@@ -9368,7 +9382,9 @@ pub(crate) mod tests {
             "waveform" | "aai" | "aao" | "subArray" => {
                 CycleHooks::PRE_INPUT.union(CycleHooks::INPUT_FETCH)
             }
-            "compress" => CycleHooks::PRE_INPUT.union(CycleHooks::WRITE_POSTED),
+            "compress" => CycleHooks::PRE_INPUT
+                .union(CycleHooks::WRITE_POSTED)
+                .union(CycleHooks::INP_NELEMENTS),
             "acalcout" => CycleHooks::CYCLE_POSTED
                 .union(CycleHooks::WRITE_POSTED)
                 .union(CycleHooks::PROCESS_POSTED)

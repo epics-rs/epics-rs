@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use epics_base_rs::server::database::{LinkDbfType, LinkRef, LinkSet, LinkShape, PvDatabase};
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::types::{DBR_CTRL_DOUBLE, EpicsValue};
-use epics_ca_rs::calink::CaLinkResolver;
+use epics_ca_rs::calink::{CaLinkResolver, install_calink_resolver};
 use epics_ca_rs::client::{CaClient, CaClientConfig};
 use epics_ca_rs::protocol::{CA_PROTO_READ_NOTIFY, CA_PROTO_SEARCH, CaHeader};
 use epics_ca_rs::server::CaServerBuilder;
@@ -33,6 +33,10 @@ record(waveform, "NET:SRC") { field(FTVL, "DOUBLE") field(NELM, "16") }
 
 const DB: &str = r#"
 record(ao, "AO") { field(OUT, "NET:SRC CA") }
+"#;
+
+const CP_DB: &str = r#"
+record(compress, "CC") { field(INP, "NET:SRC CP") field(ALG, "Circular Buffer") field(NSAM, "40") }
 "#;
 
 /// A CA server for [`SERVED`], its UDP and TCP ports.
@@ -246,4 +250,66 @@ async fn a_network_ca_link_shape_is_set_at_connect() {
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
     assert_eq!(resolver.link_shape(lref), served);
+}
+
+/// A CP compress processing on connect, before the CTRL reply, latches the
+/// channel's count: C `compressRecord.c:327-331` asks `dbGetNelements`,
+/// which is `pca->nelements`, set by `connectionCallback`.
+#[tokio::test(flavor = "multi_thread")]
+#[serial(epics_env)]
+async fn a_cp_compress_latches_the_count_before_the_ctrl_reply() {
+    let (server_udp, server_tcp) = serve().await;
+    let (port, held, release) = ctrl_holding_proxy(server_udp, server_tcp).await;
+    // SAFETY: every test touching the process-wide CA env is
+    // `#[serial(epics_env)]`.
+    unsafe {
+        std::env::set_var("EPICS_CA_ADDR_LIST", format!("127.0.0.1:{port}"));
+        std::env::set_var("EPICS_CA_AUTO_ADDR_LIST", "NO");
+        std::env::set_var("EPICS_CA_SERVER_PORT", port.to_string());
+    }
+    let (db, _) = IocBuilder::new()
+        .db_string(CP_DB, &Default::default())
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    let resolver = install_calink_resolver(
+        &db,
+        epics_base_rs::runtime::task::Reactor::current().expect("test runtime"),
+    )
+    .await;
+    db.initialize_link_locality().await;
+    db.setup_external_link_opens().await;
+    db.setup_cp_links().await;
+    db.scan_control().run();
+    db.process_cp_links_on_connect().await;
+    let num = |pv: &str| db.get_pv(pv).unwrap().to_f64().unwrap();
+    let deadline = Instant::now() + fact_budget::FACT_BUDGET;
+    while num("CC.UDF") != 0.0 {
+        assert!(Instant::now() < deadline, "CC never processed on connect");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    let link = db
+        .record_link_fields("CC")
+        .into_iter()
+        .find_map(|(field, _, link)| (field == "INP").then_some(link))
+        .unwrap();
+    let link = link.external().expect("a CA link");
+    assert!(held.load(Ordering::SeqCst) > 0, "the CTRL get went out");
+    assert!(
+        resolver
+            .link_metadata(LinkRef::new(link.name, link.open))
+            .is_none(),
+        "the CTRL reply is held"
+    );
+    assert_eq!(
+        (num("CC.INPN"), num("CC.NUSE"), num("CC.SEVR")),
+        (16.0, 3.0, 0.0)
+    );
+    assert_eq!(
+        db.get_pv("CC").unwrap(),
+        EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0].into())
+    );
+    drop(release);
 }

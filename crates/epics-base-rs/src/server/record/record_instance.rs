@@ -4764,6 +4764,10 @@ pub(crate) struct ResolvedTarget {
     /// The slot a `DBR_DOUBLE` read takes straight off the record: the link
     /// addresses an unfiltered `VAL` the record serves as `DBF_DOUBLE`.
     pub(crate) f64_slot: Option<super::record_trait::FieldSlot>,
+    /// `dbGetNelements` of the link: its channel's `final_no_elements`, the
+    /// field's `addr.no_elements` through the link's filter chain, settled
+    /// with the address as `dbChannelCreate` settles it at link init.
+    pub(crate) final_no_elements: u32,
 }
 
 /// Where a DB link's local target comes from — `PvDatabase` in production.

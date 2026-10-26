@@ -3600,6 +3600,10 @@ impl SoftDbValue for EpicsValue {
 /// read at least one link.
 struct LinkInputs {
     inp_value: Option<EpicsValue>,
+    /// The record refused INP's count
+    /// ([`Record::set_inp_nelements`](crate::server::record::Record::set_inp_nelements)),
+    /// so the cycle read no INP and no read failed.
+    inp_refused: bool,
     inp_source_time: Option<crate::types::WallTime>,
     resolved_link_fields: Vec<&'static str>,
     /// The `sel` NVL read as the index `SELN` takes (C `dbGetLink(&nvl,
@@ -3653,6 +3657,7 @@ impl LinkInputs {
     fn none() -> Self {
         Self {
             inp_value: None,
+            inp_refused: false,
             inp_source_time: None,
             rare: None,
             sel_seln: None,
@@ -5700,13 +5705,14 @@ impl PvDatabase {
     /// set. Nothing is cloned out and nothing is locked again; `None` for a
     /// link that needs the guard released (a PP source, a self-link, a target
     /// found by name, a remote timestamp to adopt), which takes the general
-    /// path.
+    /// path. `tell_nelements` is [`CycleHooks::INP_NELEMENTS`](crate::server::record::CycleHooks::INP_NELEMENTS).
     // Off the debug FLNK frame; see `process_cycle`.
     #[cfg_attr(not(debug_assertions), inline(always))]
     fn soft_db_inp_stage(
         &self,
         rec: InFrame<'_>,
         instance: &mut crate::server::record::RecordInstance,
+        tell_nelements: bool,
     ) -> Option<InputStage> {
         let crate::server::record::InputLinkRequest::As(read_as) =
             crate::server::record::InputLinkRequest::for_inp(
@@ -5726,8 +5732,18 @@ impl PvDatabase {
         #[cfg(test)]
         let typed = typed.filter(|_| !instance.plan_forced_general);
         let reads = match typed {
-            Some(read) => Reads::Typed(self.soft_db_inp_read::<SoftReading>(rec, instance, read)?),
-            None => Reads::Inp(self.soft_db_inp_read::<EpicsValue>(rec, instance, read_as)?),
+            Some(read) => Reads::Typed(self.soft_db_inp_read::<SoftReading>(
+                rec,
+                instance,
+                read,
+                tell_nelements,
+            )?),
+            None => Reads::Inp(self.soft_db_inp_read::<EpicsValue>(
+                rec,
+                instance,
+                read_as,
+                tell_nelements,
+            )?),
         };
         Some(InputStage {
             is_soft: true,
@@ -5746,6 +5762,7 @@ impl PvDatabase {
         rec: InFrame<'_>,
         instance: &mut crate::server::record::RecordInstance,
         request: V::Request,
+        tell_nelements: bool,
     ) -> Option<Option<V>> {
         if !instance.dset_reads_inp()
             || !matches!(instance.parsed_inp.link(), crate::server::record::ParsedLink::Db(db)
@@ -5757,7 +5774,13 @@ impl PvDatabase {
         if Arc::ptr_eq(&at.rec, rec.unframed()) {
             return None;
         }
-        let (value, left, alarm) = V::read(self, rec.set(), link, at, reader, request);
+        // C `dbGetNelements`, settled with the address; told before the read,
+        // whose failure must still find what the count decided. A refused
+        // count takes the general path, which carries the refusal.
+        if tell_nelements && !reader.set_inp_nelements(Some(i64::from(at.final_no_elements))) {
+            return None;
+        }
+        let (value, left, alarm) = V::read(self, rec.set(), link, at, &*reader, request);
         let inherited = self.input_link_inheritance(rec, link, alarm);
         if let Some((ms, alarm)) = inherited {
             super::links::inherit_sevr_msg(&mut instance.common, ms, &alarm);
@@ -6003,7 +6026,12 @@ impl PvDatabase {
                 && !wants_source_time
                 && input_link_texts.none_set()
                 && !instance.inp_is_pn_link()
-                && let Some(stage) = self.soft_db_inp_stage(rec, instance)
+                && let Some(stage) = self.soft_db_inp_stage(
+                    rec,
+                    instance,
+                    plan.hooks
+                        .has(crate::server::record::CycleHooks::INP_NELEMENTS),
+                )
             {
                 return stage;
             }
@@ -6162,6 +6190,25 @@ impl PvDatabase {
         // same call). The alarm is the RAW read's: C's `dbDbGetValue` tail
         // gates on the READ's status, and the second read this replaces had no
         // conversion applied to it either.
+        // Asked with the guard released (a self-referencing INP resolves
+        // through this record), and told before the read, whose failure
+        // must still find what the count decided. A count the record refuses
+        // leaves no INP to read (`compressRecord.c:328-331`).
+        let mut inp_refused = false;
+        let inp = match inp {
+            Some(inp_parsed)
+                if plan
+                    .hooks
+                    .has(crate::server::record::CycleHooks::INP_NELEMENTS) =>
+            {
+                let nelements = self.link_nelements(&inp_parsed);
+                let reads = guard.hold().record.set_inp_nelements(nelements);
+                guard.release();
+                inp_refused = !reads;
+                reads.then_some(inp_parsed)
+            }
+            inp => inp,
+        };
         let (inp_value, inp_source_alarm) = match inp.as_ref() {
             Some(inp_parsed) => {
                 let request = inp_request.expect("INP request is asked with the link");
@@ -6434,6 +6481,7 @@ impl PvDatabase {
         // that made none of them — a `calc` with only its inputs wired —
         // hands the body the same nothing a cycle with no links does.
         let deferred = inp.is_some()
+            || inp_refused
             || dol_info.is_some()
             || plan.sel_nvl
             || plan.string_input
@@ -6484,6 +6532,7 @@ impl PvDatabase {
             resolved,
             reads: ManuallyDrop::new(Reads::Links(LinkInputs {
                 inp_value,
+                inp_refused,
                 inp_source_time,
                 resolved_link_fields,
                 sel_seln,
@@ -7056,7 +7105,8 @@ impl PvDatabase {
                 // so the general fall-through below may repeat it.
                 let instance = guard.hold();
                 instance.push_process_context();
-                self.soft_db_inp_read::<f64>(rec, instance, ())
+                // A plain plan's hooks are `PLAIN_INPUT`'s: no INP_NELEMENTS.
+                self.soft_db_inp_read::<f64>(rec, instance, (), false)
             } {
             soft_db.set(read);
             InputStage::none(true, 0)
@@ -7245,6 +7295,7 @@ impl PvDatabase {
                     }
                 } else if !had_inp_value
                     && stage_is_soft
+                    && !links.as_deref().is_some_and(|l| l.inp_refused)
                     && instance.dset_reads_inp()
                     && matches!(
                         *instance.parsed_inp,

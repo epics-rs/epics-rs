@@ -140,6 +140,10 @@ const SCOPE_GATED: &[(&str, &str)] = &[
     ),
     (
         "epics-bridge-rs",
+        "tests/a_compress_pva_inp_of_an_empty_array_keeps_its_ring.rs",
+    ),
+    (
+        "epics-bridge-rs",
         "tests/connected_pva_link_lset_calls_allocate_nothing.rs",
     ),
     (
@@ -196,6 +200,10 @@ const SCOPE_GATED: &[(&str, &str)] = &[
     (
         "epics-ca-rs",
         "tests/a_loopback_interface_binds_two_responder_sockets.rs",
+    ),
+    (
+        "epics-ca-rs",
+        "tests/a_network_ca_inp_count_allocates_nothing.rs",
     ),
     (
         "epics-ca-rs",

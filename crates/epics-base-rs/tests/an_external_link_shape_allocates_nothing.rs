@@ -54,6 +54,7 @@ record(scalcout, "SC") { field(CALC, "A+1") field(OUT, "X CA") field(OOPT, "Ever
 record(scalcout, "SCL") { field(CALC, "A+1") field(OUT, "X") field(OOPT, "Every Time") }
 record(acalcout, "AC") { field(NELM, "1") field(CALC, "A+1") field(OUT, "X CA") field(OOPT, "Every Time") }
 record(acalcout, "ACL") { field(NELM, "1") field(CALC, "A+1") field(OUT, "X") field(OOPT, "Every Time") }
+record(compress, "CC") { field(INP, "X CA") field(ALG, "Circular Buffer") field(NSAM, "8") }
 "#;
 
 /// [`DB`] after `iocInit`, every external link connected with metadata.
@@ -125,4 +126,12 @@ async fn a_ca_out_target_resolves_without_allocating() {
             "{ca} {ca_allocs} against {local} {local_allocs}"
         );
     }
+}
+
+/// compress latches INPN from `dbGetNelements` each cycle
+/// (`compressRecord.c:331-338`).
+#[epics_macros_rs::epics_test]
+async fn a_ca_inp_count_allocates_nothing() {
+    let db = ioc().await;
+    assert_eq!(allocs(&db, "CC"), 0);
 }

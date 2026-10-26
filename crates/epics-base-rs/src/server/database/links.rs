@@ -1225,7 +1225,7 @@ impl PvDatabase {
     ) -> Option<(
         &'g crate::server::record::ParsedLink,
         &'g crate::server::record::record_instance::ResolvedTarget,
-        &'g dyn crate::server::record::Record,
+        &'g mut dyn crate::server::record::Record,
     )> {
         use crate::server::record::record_instance::LinkTargetResolver;
         instance.lend_inp_addr(self.name_revision(), |db| self.resolve_db_link(db))
@@ -1253,13 +1253,24 @@ impl PvDatabase {
         }
         use crate::server::record::record_instance::PutAddr;
         let field = &db.target().field;
-        let put = if db.target().string_view {
+        let (put, no_elements) = if db.target().string_view {
             match PutAddr::resolve_chars_in(&rec, field) {
-                Some(put) => put,
+                Some(put) => (
+                    put,
+                    super::char_view::CharAddr::of(self, &rec, field)
+                        .map_or(1, |addr| addr.no_elements()),
+                ),
                 None => return DbLinkAnswer::Absent,
             }
         } else {
-            PutAddr::resolve_in(&rec, field)
+            let no_elements = rec.no_elements(field).map_or(1, |n| n as usize);
+            (PutAddr::resolve_in(&rec, field), no_elements)
+        };
+        let final_no_elements = match db.target().json_suffix.as_deref() {
+            Some(suffix) => {
+                super::filters::parse_filter_chain(suffix).final_element_count(no_elements)
+            }
+            None => no_elements,
         };
         DbLinkAnswer::Local(crate::server::record::record_instance::ResolvedTarget {
             f64_slot: (db.target_is_val() && db.target().json_suffix.is_none())
@@ -1268,6 +1279,7 @@ impl PvDatabase {
             rec,
             name,
             put,
+            final_no_elements: final_no_elements as u32,
         })
     }
 
@@ -3182,6 +3194,10 @@ impl PvDatabase {
             LinkTarget::LocalNotRecord => return None,
             LinkTarget::External => return self.external_link_metadata(db.external()),
         };
+        let no_elements = match self.db_link_answer(db) {
+            crate::server::record::DbLinkAnswer::Local(at) => at.final_no_elements,
+            _ => record.no_elements(&target.field).unwrap_or(1),
+        };
         // C `dbGet(paddr, DBR_DOUBLE, &buffer, &option, ...)` under the
         // target's lock (`dbDbLink.c:252-256` between `dbScanLock` /
         // `dbScanUnlock`). A field the target does not have is C's
@@ -3210,7 +3226,7 @@ impl PvDatabase {
             // (`dbDbIsConnected` returns TRUE unconditionally,
             // `dbDbLink.c:146-149`), so these are never `None` here.
             dbf_type: Some(field_type_to_link_dbf(snapshot.value.db_field_type())),
-            element_count: Some(snapshot.value.count() as i64),
+            element_count: Some(i64::from(no_elements)),
             graphic_limits: Some(snapshot.graphic_limits().unwrap_or((0.0, 0.0))),
             control_limits: Some(snapshot.control_limits().unwrap_or((0.0, 0.0))),
             alarm_limits: Some(snapshot.alarm_limits().unwrap_or((
@@ -4189,9 +4205,8 @@ impl PvDatabase {
     ///   a braced `{pva:…}` or `{ca:…}` is a `JSON_LINK`, which C's own type
     ///   switches send to their `default:` arm.
     ///
-    /// `no_elements` is a field CAPACITY, which the port does not carry per
-    /// field: an array field reports its record's `NELM` when it has one and
-    /// its current length otherwise; a scalar field reports 1.
+    /// `no_elements` is [`RecordCell::no_elements`](crate::server::record::RecordCell::no_elements),
+    /// `dbNameToAddr`'s, with no filter applied.
     pub(crate) fn resolve_out_target(&self, link: &crate::server::record::ParsedLink) -> OutTarget {
         use crate::server::record::LinkType;
         let external = |link: crate::server::record::ExternalRef<'_>, link_type: LinkType| {
@@ -4250,15 +4265,7 @@ impl PvDatabase {
                     &addressed.field,
                     Some(guard.record.as_ref()),
                 );
-                let element_count = match guard.record.get_field(&addressed.field) {
-                    Some(v) if v.is_array() => guard
-                        .record
-                        .get_field("NELM")
-                        .and_then(|n| n.as_int_i64())
-                        .filter(|n| *n > 0)
-                        .unwrap_or(v.count() as i64),
-                    _ => 1,
-                };
+                let element_count = target.no_elements(&addressed.field).map_or(1, i64::from);
                 OutTarget {
                     field_type,
                     dbr_field_type: field_type.and_then(crate::types::DbfCode::served_type),
@@ -4289,6 +4296,37 @@ impl PvDatabase {
                 link_type: link.link_type(),
                 ..OutTarget::UNRESOLVED
             },
+        }
+    }
+
+    /// C `dbIsLinkConnected(plink) && !dbGetNelements(plink, &n)`: the
+    /// source's `no_elements`, `None` where that test fails — no lset (a
+    /// hardware or removed link) or a target that does not resolve. A scan
+    /// cycle asks it, so every arm reads a settled count.
+    pub(crate) fn link_nelements(&self, link: &crate::server::record::ParsedLink) -> Option<i64> {
+        use crate::server::record::{DbLinkAnswer, ParsedLink};
+        match link {
+            // `dbConstGetNelements` (`dbConstLink.c:214-218`).
+            ParsedLink::None | ParsedLink::Constant(_) => Some(0),
+            // `lnkCalc_getElements` (`lnkCalc.c:526-530`),
+            // `lnkState_getElements` (`lnkState.c:133-137`).
+            ParsedLink::Calc(_) | ParsedLink::State(_) => Some(1),
+            ParsedLink::Db(db) => match self.db_link_answer(db) {
+                // `dbDbGetElements` (`dbDbLink.c:157-162`), settled with the
+                // address, so no target lock: the target may be this record.
+                DbLinkAnswer::Local(at) => Some(i64::from(at.final_no_elements)),
+                // Non-local ⇒ CA link in C (`dbInitLink` locality).
+                DbLinkAnswer::External => self.external_link_shape(db.external())?.element_count,
+                // No record field: a simple PV, or a name C's CA link never
+                // connects to.
+                DbLinkAnswer::Shadowed(_) | DbLinkAnswer::Absent => None,
+            },
+            // `dbCaGetNelements` (`dbCa.c:662-670`) reads `pca->nelements`;
+            // pvxs `pvaGetElements` (`pvalink_lset.cpp:243-258`).
+            ParsedLink::Ca(_) | ParsedLink::Pva(_) | ParsedLink::PvaJson(_) => {
+                self.external_link_shape(link.external()?)?.element_count
+            }
+            ParsedLink::Hw(_) | ParsedLink::Removed(_) => None,
         }
     }
 

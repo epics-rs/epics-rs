@@ -1544,6 +1544,7 @@ enum CachedAnswer {
         name: crate::types::RecordName,
         put: super::record_instance::PutAddr,
         f64_slot: Option<super::record_trait::FieldSlot>,
+        final_no_elements: u32,
     },
     Shadowed(std::sync::Arc<crate::server::pv::ProcessVariable>),
     Absent,
@@ -1601,6 +1602,7 @@ impl DbLink {
                     name,
                     put,
                     f64_slot,
+                    final_no_elements,
                 } => {
                     if let Some(rec) = rec.upgrade() {
                         return DbLinkAnswer::Local(super::record_instance::ResolvedTarget {
@@ -1608,6 +1610,7 @@ impl DbLink {
                             name: name.clone(),
                             put: *put,
                             f64_slot: *f64_slot,
+                            final_no_elements: *final_no_elements,
                         });
                     }
                 }
@@ -1623,6 +1626,7 @@ impl DbLink {
                 name: target.name.clone(),
                 put: target.put,
                 f64_slot: target.f64_slot,
+                final_no_elements: target.final_no_elements,
             },
             DbLinkAnswer::Shadowed(pv) => CachedAnswer::Shadowed(pv.clone()),
             DbLinkAnswer::Absent => CachedAnswer::Absent,
@@ -6103,7 +6107,8 @@ impl super::record_instance::RecordInstance {
     /// the reader exclusively borrowed (`RecordInstance::destroy`,
     /// `release_link_targets_to`), and no other instance holds this
     /// `Arc<DbLink>`: every `parsed_inp` is its own parse. The reader's
-    /// record is lent beside it, the buffer a failed array read lands in.
+    /// record is lent beside it, the buffer a failed array read lands in,
+    /// told the address's element count before the read.
     #[inline(always)]
     pub(crate) fn lend_inp_addr(
         &mut self,
@@ -6112,7 +6117,7 @@ impl super::record_instance::RecordInstance {
     ) -> Option<(
         &ParsedLink,
         &super::record_instance::ResolvedTarget,
-        &dyn super::Record,
+        &mut dyn super::Record,
     )> {
         let link = self.parsed_inp.link();
         let ParsedLink::Db(db) = link else {
@@ -6120,6 +6125,6 @@ impl super::record_instance::RecordInstance {
         };
         // SAFETY: `self` is borrowed `&mut` for the returned lifetime.
         let at = unsafe { db.lend_addr(revision, || resolve(db)) }?;
-        Some((link, at, &*self.record))
+        Some((link, at, &mut *self.record))
     }
 }

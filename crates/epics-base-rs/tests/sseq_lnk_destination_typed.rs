@@ -25,7 +25,7 @@ use epics_base_rs::error::CaResult;
 use epics_base_rs::server::database::{
     LinkDbfType, LinkMetadata, LinkPutOp, LinkRef, LinkSet, PvDatabase,
 };
-use epics_base_rs::server::record::{FieldDesc, ProcessOutcome, Record};
+use epics_base_rs::server::record::{FieldDesc, ProcessOutcome, Record, Special};
 use epics_base_rs::server::records::ai::AiRecord;
 use epics_base_rs::server::records::sseq::SseqRecord;
 use epics_base_rs::server::records::stringin::StringinRecord;
@@ -35,8 +35,8 @@ use epics_base_rs::types::{DbFieldType, EpicsValue};
 /// write delivers — the C `dbNameToAddr` `field_type` / `no_elements` the
 /// sseq switch reads.
 struct TypedProbe {
-    /// VAL's read-back shape, which is what the port's target resolution
-    /// derives the element count from (a scalar → 1, an array → its length).
+    /// VAL's read-back shape: its length is the element count of an
+    /// `SPC_DBADDR` VAL; any other field counts 1.
     readback: EpicsValue,
     fields: &'static [FieldDesc],
     last: Arc<Mutex<Option<EpicsValue>>>,
@@ -69,6 +69,11 @@ impl Record for TypedProbe {
 static STRING_VAL: &[FieldDesc] = &[FieldDesc::new("VAL", DbFieldType::String, false)];
 static DOUBLE_VAL: &[FieldDesc] = &[FieldDesc::new("VAL", DbFieldType::Double, false)];
 static CHAR_VAL: &[FieldDesc] = &[FieldDesc::new("VAL", DbFieldType::Char, false)];
+static CHAR_ARRAY_VAL: &[FieldDesc] = &[FieldDesc {
+    special: Special::DbAddr,
+    declared_special: Special::DbAddr,
+    ..FieldDesc::new("VAL", DbFieldType::Char, false)
+}];
 
 fn probe(
     fields: &'static [FieldDesc],
@@ -232,7 +237,7 @@ async fn char_array_destination_puts_the_string_bytes() {
     db.add_record(
         "TGT_CHAR",
         Box::new(probe(
-            CHAR_VAL,
+            CHAR_ARRAY_VAL,
             EpicsValue::CharArray(vec![0; 8].into()),
             last.clone(),
         )),

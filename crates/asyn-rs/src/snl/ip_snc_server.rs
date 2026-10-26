@@ -12,6 +12,7 @@ use std::cell::RefCell;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
+use epics_seq_rs::CharPtr;
 use epics_seq_rs::c::*;
 
 use crate::interfaces::InterfaceType;
@@ -90,12 +91,7 @@ thread_local! {
 /// `waitConnect` outlives any failure here, as C's event does.
 fn initialize(v: &seqg_vars) {
     let connections = Arc::<Connections>::default();
-    let listener = v
-        .listenerPortName
-        .get()
-        .map(|p| p.to_c_vec())
-        .unwrap_or_default();
-    let listener = String::from_utf8_lossy(&listener).into_owned();
+    let listener = string(&v.listenerPortName.get());
     let registration = register(&listener, &connections);
     SERVER.set(Some(Server {
         connections,
@@ -170,7 +166,7 @@ fn wait_connect(v: &seqg_vars) {
 /// `connectionCallback` from its SyncIO connect on: the client's user, with
 /// the protocol's `\r\n` both ways, or `None` on C's early returns.
 fn connect(v: &seqg_vars, port: &str) -> Option<SyncIOHandle> {
-    v.IOPortName.set(Some(Arc::from(port.as_bytes())));
+    v.IOPortName.set(CharPtr::from(port));
     let (client, status) =
         SyncIOHandle::connect_port(port, 0, Duration::ZERO, InterfaceType::Octet);
     client.print(
@@ -211,10 +207,18 @@ fn connect(v: &seqg_vars, port: &str) -> Option<SyncIOHandle> {
     Some(client)
 }
 
+/// A `char *` variable's string, empty for NULL.
+fn string(p: &CharPtr) -> String {
+    if p.is_null() {
+        String::new()
+    } else {
+        String::from_utf8_lossy(&p.to_c_vec()).into_owned()
+    }
+}
+
 /// `pVar->IOPortName`, for the trace lines.
 fn io_port_name(v: &seqg_vars) -> String {
-    let name = v.IOPortName.get().map(|p| p.to_c_vec()).unwrap_or_default();
-    String::from_utf8_lossy(&name).into_owned()
+    string(&v.IOPortName.get())
 }
 
 /// `readSocket`: one line, waiting as long as it takes, into `input`.

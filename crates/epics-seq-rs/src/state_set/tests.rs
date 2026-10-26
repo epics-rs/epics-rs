@@ -1379,7 +1379,7 @@ fn served_db() -> &'static PvDatabase {
                 let db = PvDatabase::new();
                 for name in [
                     "rv:a", "rv:b", "rv:c", "rv:d", "rv:u", "rv:e", "rv:f", "rv:g", "rv:h", "rv:j",
-                    "rv:k", "rv:l", "rv:n", "rv:o", "rv:p", "rv:t",
+                    "rv:k", "rv:l", "rv:n", "rv:o", "rv:p", "rv:q", "rv:r", "rv:t",
                 ] {
                     db.add_record(
                         name,
@@ -1389,7 +1389,7 @@ fn served_db() -> &'static PvDatabase {
                     .unwrap();
                 }
                 // A put of 1 completes only when another put sets it back to 0.
-                for name in ["rv:busy", "rv:busy2", "rv:busy3"] {
+                for name in ["rv:busy", "rv:busy2", "rv:busy3", "rv:busy4"] {
                     db.add_record(
                         name,
                         Box::new(epics_base_rs::server::records::busy::BusyRecord::default()),
@@ -1578,6 +1578,50 @@ fn e2e_a_put_callback_behind_one_in_flight_is_refused_with_eca_timeout() {
         Some("User specified timeout on IO operation expired")
     );
     assert_eq!(called.load(Ordering::Relaxed), 0);
+}
+
+/// A put callback waiting in `dbPutNotifyBlocker` holds up only itself, as
+/// C's `initiatePutNotify` blocks only its caller: with ss1's put callback
+/// in flight and ss2's waiting behind it, another client's post lands and
+/// ss3's put returns at once, and ss2's is issued once ss1's completes.
+#[test]
+fn e2e_a_put_callback_in_the_blocker_holds_up_no_other_put() {
+    use crate::types::PvType;
+    let sys = PvSystem::create(served_db());
+    let busy = PvVar::create(&sys, "rv:busy4", |_| {}).unwrap();
+    let watched = PvVar::create(&sys, "rv:q", |_| {}).unwrap();
+    let other = PvVar::create(&sys, "rv:r", |_| {}).unwrap();
+    let landed = Arc::new(AtomicU32::new(0));
+    let count = Arc::clone(&landed);
+    let on = watched.monitor_on(PvType::Double, 1, move |_| {
+        count.fetch_add(1, Ordering::SeqCst);
+    });
+    assert_eq!(on, PvStat::Ok);
+    until("first monitor", || landed.load(Ordering::SeqCst) == 1);
+    let put_callback = || busy.put_callback(PvType::Short, 1, EpicsValue::Short(1), |_| {});
+    assert_eq!(put_callback(), PvStat::Ok, "ss1");
+    std::thread::scope(|s| {
+        let ss2 = s.spawn(|| (put_callback(), busy.message()));
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        put_from_another_thread("rv:q", 2.0);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let start = std::time::Instant::now();
+        let ss3 = other.put_no_block(PvType::Double, 1, EpicsValue::Double(3.0));
+        let took = start.elapsed();
+        assert_eq!(ss3, PvStat::Ok);
+        assert!(
+            took < std::time::Duration::from_secs(1),
+            "ss3 took {took:?}"
+        );
+        until("the post", || landed.load(Ordering::SeqCst) == 2);
+        put_from_another_thread("rv:busy4", 0.0);
+        let (stat, message) = ss2.join().unwrap();
+        assert_eq!(
+            (stat, message.as_deref()),
+            (PvStat::Ok, Some("Normal successful completion")),
+            "ss2"
+        );
+    });
 }
 
 /// A client context's monitors reach their callbacks one at a time, in

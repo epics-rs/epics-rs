@@ -235,20 +235,30 @@ impl InProcessChannel {
         })
     }
 
-    /// `dbChannelIO::write`: `dbChannel_put`, done when this returns.
-    pub fn put(&self, value: EpicsValue) -> Result<(), String> {
+    /// `dbChannelIO::write`: `dbChannel_put`, done when this returns, run
+    /// as a put of `events`' context.
+    pub fn put(&self, events: &InProcessEvents, value: EpicsValue) -> Result<(), String> {
         let value = put_value(&self.channel, value);
-        in_caller(&self.bridge, self.channel.issue_put(value, false))
+        let put = events.0.0.running.run(self.channel.issue_put(value, false));
+        in_caller(&self.bridge, put)
             .map_err(|e| e.to_string())?
             .map(drop)
     }
 
-    /// `dbChannelIO::write` with a notify: issued when this returns, and the
-    /// returned future is its completion. [`CaError::Timeout`] is
-    /// `dbPutNotifyBlocker`'s wait for the put in flight running out.
-    pub fn put_callback(&self, value: EpicsValue) -> Result<PutCompletion, CaError> {
+    /// `dbChannelIO::write` with a notify, run as a put of `events`'
+    /// context: issued when this returns, and `issued` takes its completion
+    /// while the put still runs, as C's `callDone` runs inside it for a
+    /// record done at once. [`CaError::Timeout`] is `dbPutNotifyBlocker`'s
+    /// wait for the put in flight running out.
+    pub fn put_callback<R>(
+        &self,
+        events: &InProcessEvents,
+        value: EpicsValue,
+        issued: impl FnOnce(PutCompletion) -> R,
+    ) -> Result<R, CaError> {
         let value = put_value(&self.channel, value);
-        in_caller(&self.bridge, self.channel.put_callback(value))
+        let put = async { self.channel.put_callback(value).await.map(issued) };
+        in_caller(&self.bridge, events.0.0.running.run(put))
             .map_err(|e| CaError::Protocol(e.to_string()))?
     }
 }
@@ -257,8 +267,10 @@ impl InProcessChannel {
 /// every in-process subscription of a client context attaches to, and
 /// `CAC-event`, its consumer, which the first subscription starts at the
 /// lowest priority above its own thread's. Entries reach their callbacks
-/// one at a time in post order, on that thread or in [`Self::deliver`].
-/// The thread returns when the last clone drops (`db_close_events`).
+/// one at a time in post order, on that thread or in [`Self::deliver`],
+/// each after the runs of the context's puts going when it is taken
+/// ([`Running`]). The thread returns when the last clone
+/// drops (`db_close_events`).
 #[derive(Clone, Default)]
 pub struct InProcessEvents(Arc<EventsOwner>);
 
@@ -290,6 +302,7 @@ struct Events {
     /// Held across an entry's take and its callback, so entries reach their
     /// callbacks in post order whichever thread takes them.
     consumer: parking_lot::Mutex<()>,
+    running: Running,
     starting: parking_lot::Mutex<()>,
     started: OnceLock<Started>,
     stop: AtomicBool,
@@ -381,9 +394,74 @@ impl Events {
             if let CircuitEvent::Event { context, event, .. } = entry
                 && let Some(route) = context.downcast_ref::<Route>()
             {
+                self.running.wait();
                 route.deliver(event);
             }
         }
+    }
+}
+
+/// The puts of a client context while they run on their callers, each poll
+/// of one a run; what a run posts reaches its callback after the run. C's
+/// `CAC-event` must be woken and scheduled before it delivers, so
+/// `dbChannelIO::write` is ordinarily back in the poster first
+/// (MM4005_trajectoryScan's `pvPut(motorMDVS[j])` then
+/// `efClear(motorMDVSMon)` sees the event after the clear on 287 of 300 C
+/// boots). A put parked between polls (`dbPutNotifyBlocker`, a postponed
+/// write) runs nothing and holds up no one, as C's blocked caller does
+/// not, and no put waits for another.
+#[derive(Default)]
+struct Running {
+    /// The next run's number, and the numbers of the runs not ended.
+    runs: parking_lot::Mutex<(u64, Vec<u64>)>,
+    ended: parking_lot::Condvar,
+}
+
+impl Running {
+    /// `put`, each poll of it a run.
+    async fn run<F: Future>(&self, put: F) -> F::Output {
+        let mut put = std::pin::pin!(put);
+        std::future::poll_fn(|cx| {
+            let _run = Run::start(self);
+            put.as_mut().poll(cx)
+        })
+        .await
+    }
+
+    /// Until each run going now has ended; one started later is not waited
+    /// for.
+    fn wait(&self) {
+        let mut runs = self.runs.lock();
+        let now = runs.0;
+        while runs.1.iter().any(|&run| run < now) {
+            self.ended.wait(&mut runs);
+        }
+    }
+}
+
+/// One poll of a put, ended on every exit.
+struct Run<'a> {
+    running: &'a Running,
+    number: u64,
+}
+
+impl<'a> Run<'a> {
+    fn start(running: &'a Running) -> Self {
+        let mut runs = running.runs.lock();
+        let number = runs.0;
+        runs.0 += 1;
+        runs.1.push(number);
+        Run { running, number }
+    }
+}
+
+impl Drop for Run<'_> {
+    fn drop(&mut self) {
+        let mut runs = self.running.runs.lock();
+        if let Some(at) = runs.1.iter().position(|&run| run == self.number) {
+            runs.1.swap_remove(at);
+        }
+        self.running.ended.notify_all();
     }
 }
 
@@ -518,5 +596,53 @@ impl ClientMonitor for LocalClientMonitor {
                 return Some(snapshot);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    /// [`Running::wait`] on another thread; the receiver hears when it ends.
+    fn waiting(running: &Arc<Running>) -> mpsc::Receiver<()> {
+        let (ended, waited) = mpsc::channel();
+        let running = Arc::clone(running);
+        std::thread::spawn(move || {
+            running.wait();
+            ended.send(()).unwrap();
+        });
+        waited
+    }
+
+    const SETTLE: Duration = Duration::from_millis(50);
+
+    /// An entry waits for the runs going when it is taken, not for one
+    /// started after.
+    #[test]
+    fn a_wait_is_for_the_runs_going_when_it_starts() {
+        let running = Arc::new(Running::default());
+        let going = Run::start(&running);
+        let waited = waiting(&running);
+        std::thread::sleep(SETTLE);
+        let later = Run::start(&running);
+        assert!(waited.recv_timeout(SETTLE).is_err(), "before the run ends");
+        drop(going);
+        waited.recv_timeout(fact_budget::FACT_BUDGET).unwrap();
+        drop(later);
+    }
+
+    /// A put parked between polls, as one in `dbPutNotifyBlocker` is, holds
+    /// up no entry.
+    #[test]
+    fn a_put_parked_between_polls_is_no_run() {
+        let running = Arc::new(Running::default());
+        let mut put = std::pin::pin!(running.run(std::future::pending::<()>()));
+        let polled = put.as_mut().poll(&mut Context::from_waker(Waker::noop()));
+        assert!(polled.is_pending());
+        waiting(&running)
+            .recv_timeout(fact_budget::FACT_BUDGET)
+            .unwrap();
     }
 }

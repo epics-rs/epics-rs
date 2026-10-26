@@ -19,7 +19,7 @@
 //! on a CA auxiliary thread. A network channel's monitor events and
 //! connection changes come from the reactor too; an in-process channel's
 //! monitor events come from the system's one queue, in post order, each
-//! after the put that posted it has returned ([`PutFence`]), on its
+//! after the system's puts running on their callers when it is taken, on its
 //! `CAC-event` thread or at an [`EventGate`] point of a state set. None
 //! runs inside a call, so a caller may hold seq's locks across
 //! [`PvVar::monitor_on`], as C's connection handler holds `sp->lock` across
@@ -55,7 +55,7 @@ use epics_base_rs::types::{
     DBR_TIME_DOUBLE, DBR_TIME_FLOAT, DBR_TIME_LONG, DBR_TIME_SHORT, DBR_TIME_STRING, DbFieldType,
     EpicsValue,
 };
-use parking_lot::{Mutex, ReentrantMutex, RwLock};
+use parking_lot::{Mutex, ReentrantMutex};
 
 use crate::types::{PvSevr, PvStat, PvType};
 
@@ -91,7 +91,6 @@ pub struct PvEvent<'a> {
 pub struct PvSystem {
     ctx: CaClientContext,
     events: InProcessEvents,
-    puts: PutFence,
     /// The network channels' request queue, its [`Dispatcher`] started
     /// with the first network channel.
     requests: Arc<Mutex<Option<mpsc::UnboundedSender<Request>>>>,
@@ -103,7 +102,6 @@ impl PvSystem {
         PvSystem {
             ctx: db.ca_client(),
             events: InProcessEvents::default(),
-            puts: PutFence::default(),
             requests: Arc::default(),
         }
     }
@@ -568,32 +566,11 @@ impl Network {
     }
 }
 
-/// What an in-process put posts reaches its callback after the put returns.
-/// C's `CAC-event`, woken by the post, runs on a CPU of its own, so
-/// `dbChannelIO::write` is back in its caller first (MM4005_trajectoryScan's
-/// `pvPut(motorMDVS[j])` then `efClear(motorMDVSMon)` sees the event after
-/// the clear). Each put holds this shared while it runs, and each event
-/// waits for the puts in progress before its callback.
-#[derive(Clone, Default)]
-struct PutFence(Arc<RwLock<()>>);
-
-impl PutFence {
-    fn put<R>(&self, put: impl FnOnce() -> R) -> R {
-        let _running = self.0.read();
-        put()
-    }
-
-    fn wait(&self) {
-        drop(self.0.write());
-    }
-}
-
 /// An in-process channel, whose requests run on the caller's thread.
 struct InProcess {
     chan: InProcessChannel,
     ctx: CaClientContext,
     events: InProcessEvents,
-    puts: PutFence,
     monitor: Mutex<Option<InProcessSubscription>>,
 }
 
@@ -605,11 +582,9 @@ impl InProcess {
         let mask = (EventMask::VALUE | EventMask::ALARM).bits();
         let (monid, ty, count) = (m.monid, m.ty, m.count);
         let handler = shared.clone();
-        let puts = self.puts.clone();
         let sub = self
             .chan
             .subscribe(&self.events, type_to_ca(ty), count, mask, move |snapshot| {
-                puts.wait();
                 m.deliver(&handler, &snapshot)
             });
         match sub {
@@ -659,7 +634,6 @@ impl PvVar {
                 chan,
                 ctx: sys.ctx.clone(),
                 events: sys.events.clone(),
-                puts: sys.puts.clone(),
                 monitor: Mutex::new(None),
             });
             return Ok(PvVar { name, shared, link });
@@ -849,7 +823,7 @@ impl PvVar {
             // `dbChannelIO::write` throws a refused `dbChannel_put`, which
             // `ca_array_put` answers with ECA_PUTFAIL.
             Link::InProcess(l) => {
-                if l.puts.put(|| l.chan.put(value)).is_err() {
+                if l.chan.put(&l.events, value).is_err() {
                     return self.shared.refuse(Eca::PutFail, PUT_EXPR);
                 }
             }
@@ -876,11 +850,8 @@ impl PvVar {
         };
         let value = put_value(value, ty, count);
         match &self.link {
-            // `callDone` runs inside the put, ahead of what it posts.
-            Link::InProcess(l) => match l.puts.put(|| {
-                let done = l.chan.put_callback(value)?;
-                l.complete_put(&self.shared, id, done);
-                Ok(())
+            Link::InProcess(l) => match l.chan.put_callback(&l.events, value, |done| {
+                l.complete_put(&self.shared, id, done)
             }) {
                 Ok(()) => {}
                 // `ca_array_put_callback` answers a throw at once and never
@@ -1393,22 +1364,6 @@ mod tests {
         );
         assert_eq!(landed.load(Ordering::SeqCst), 1, "at the put's return");
         release.send(()).unwrap();
-        until_landed(&landed, 2);
-    }
-
-    /// An event `CAC-event` takes while a put of its system runs reaches
-    /// its callback once the put has returned.
-    #[test]
-    fn an_event_waits_for_the_put_in_progress() {
-        let db = served(&["g:g"]);
-        let sys = PvSystem::create(&db);
-        let g = PvVar::create(&sys, "g:g", |_| {}).unwrap();
-        let landed = counted(&sys, &g);
-        sys.puts.put(|| {
-            post(&db, "g:g", 2.0);
-            std::thread::sleep(Duration::from_millis(50));
-            assert_eq!(landed.load(Ordering::SeqCst), 1, "inside the put");
-        });
         until_landed(&landed, 2);
     }
 

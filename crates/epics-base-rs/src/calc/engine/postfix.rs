@@ -34,6 +34,12 @@ enum StackEntry {
     /// `NOT_GENERATED` byte and adds its effect like any other entry.
     LParen {
         runtime_effect: i32,
+        /// The operand now being read: the whole group, or with `args` the
+        /// argument, which each `,` ends.
+        span: Span,
+        /// The list of a function taking more than one operand. A bare
+        /// `(3,K:=1)` leaves the 3 as one operand, as C evaluates it.
+        args: bool,
     },
     /// C's `[` and `{` elements (`sCalcPostfix.c:215-216`,
     /// `aCalcPostfix.c:212-213`). They are NOT parens: they are
@@ -61,6 +67,8 @@ enum StackEntry {
         /// more per `,` (`SEPARATOR`, `:630`). `CLOSE_BRACKET` adds the total
         /// (`:687`). So `AA[i,j]` is -2 — subject and two arguments in, one out.
         runtime_effect: i32,
+        /// The argument now being read; each `,` starts the next.
+        span: Span,
     },
     /// A `VARARG_OPERATOR`. `runtime_effect` is C's: 0 from the table until
     /// `)` copies the paren's, and the count byte it writes is `1 - effect`.
@@ -69,7 +77,10 @@ enum StackEntry {
         in_stack_pri: u8,
         runtime_effect: i32,
     },
-    CondEnd,
+    /// C's COND_END. It carries the true branch's sum until the false branch
+    /// ends (`None` after), which may be before C emits it: a conditional in
+    /// a true branch ends at that branch's `:`.
+    CondEnd(Option<Arm>),
     Store {
         target: StoreTarget,
         in_stack_pri: u8,
@@ -114,6 +125,248 @@ enum StoreTarget {
     DynDouble,
 }
 
+/// An operand being read. Where it began is kept on each path
+/// ([`Path::spans`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Span(u32);
+
+/// A `?` whose `:` has not been read: the span of its true branch, C's count
+/// at the `?`, and the paths there, on which the false branch starts.
+#[derive(Debug, Clone)]
+struct Fork {
+    then: Span,
+    depth: i32,
+    rest: Vec<Path>,
+}
+
+/// A conditional whose true branch has been read: that branch's span, the
+/// paths it ended on (depths counted from zero), and which `:` this was.
+#[derive(Debug, Clone)]
+struct Arm {
+    then: Span,
+    ends: Vec<Path>,
+    n: usize,
+}
+
+/// A value an operand should have pushed and did not (CBUG-AJ1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Hole {
+    /// `:=` pushes nothing (runtime_effect -1, `sCalcPostfix.c:226`).
+    Store(i32),
+    /// A conditional's value, on the path of a branch that left none.
+    Missing(i32),
+}
+
+impl Hole {
+    fn depth(self) -> i32 {
+        match self {
+            Hole::Store(d) | Hole::Missing(d) => d,
+        }
+    }
+}
+
+/// One way through the conditionals read so far. Depths are those of the
+/// run-time stack.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Path {
+    /// The run-time depth less C's count.
+    off: i32,
+    holes: Vec<Hole>,
+    /// Each open span, with the depth and the number of holes it began at.
+    spans: Vec<(Span, i32, usize)>,
+}
+
+impl Path {
+    /// Holes are only ever removed here, so no span begins past the end.
+    fn cut(&mut self, len: usize) -> Vec<Hole> {
+        for span in &mut self.spans {
+            span.2 = span.2.min(len);
+        }
+        self.holes.split_off(len)
+    }
+
+    fn end(&mut self, span: Span) -> Option<(i32, usize)> {
+        let i = self.spans.iter().position(|s| s.0 == span)?;
+        let (_, depth, len) = self.spans.remove(i);
+        Some((depth, len))
+    }
+
+    /// The branch `then` ends: only whether it left its value is kept, and
+    /// the depth is counted from zero until the conditional ends.
+    fn finish(&mut self, then: Span, depth: i32) {
+        let real = depth + self.off;
+        if let Some((from, len)) = self.end(then) {
+            let missing = real <= from || self.holes[len..].contains(&Hole::Missing(real));
+            self.cut(len);
+            if missing {
+                self.holes.push(Hole::Missing(real));
+            }
+        }
+        self.off = real;
+    }
+}
+
+/// Past this many paths the source is accepted as C accepts it, rather than
+/// spend compile time exponential in its conditionals.
+const MAX_PATHS: usize = 256;
+
+/// The missing values C's depth count cannot see (CBUG-AJ1).
+///
+/// An operator whose operand pushed nothing pops whatever is below: the
+/// previous statement's value, or the stack's sentinel element
+/// (`sCalcPerform.c:408-409,845-847`, `aCalcPerform.c:418-420`). C only
+/// checks that the depth stays >= 0 after the operator (`sCalcPostfix.c:820`),
+/// which lets both through.
+///
+/// The branches of a conditional may leave different numbers of values, and
+/// C charges `:` -1 so the two count once though COND_ELSE pops nothing, so
+/// each path is followed on its own. A path that pops past a hole reads a
+/// missing value and is dropped, and so does one whose result is a
+/// conditional's missing value. The source is refused when a path read one
+/// and none is left that ends with one value; a path ending at another depth
+/// fails C's end-of-run check (`sCalcPerform.c:816`), as it fails the
+/// evaluators here, so a source no path reads past is kept.
+struct Holes {
+    paths: Vec<Path>,
+    /// A path read a missing value.
+    read: bool,
+    /// The spans open now. Every path has each of them, and no other.
+    open: Vec<Span>,
+    next: u32,
+    /// More than [`MAX_PATHS`] paths were met.
+    lost: bool,
+}
+
+impl Default for Holes {
+    fn default() -> Self {
+        Self {
+            paths: vec![Path::default()],
+            read: false,
+            open: Vec::new(),
+            next: 0,
+            lost: false,
+        }
+    }
+}
+
+impl Holes {
+    /// Drop the paths that read a missing value.
+    fn drop_reads(&mut self, reads: impl Fn(&Path) -> bool) {
+        let before = self.paths.len();
+        self.paths.retain(|p| !reads(p));
+        self.read |= self.paths.len() < before;
+    }
+
+    fn take(&mut self, depth: i32, pops: i32) {
+        self.drop_reads(|p| {
+            let floor = p.holes.iter().map(|h| h.depth()).max().unwrap_or(0);
+            pops > depth + p.off - floor
+        });
+    }
+
+    fn store(&mut self, depth: i32) {
+        for p in &mut self.paths {
+            p.holes.push(Hole::Store(depth + p.off));
+        }
+    }
+
+    fn open(&mut self, depth: i32) -> Span {
+        let span = Span(self.next);
+        self.next += 1;
+        self.open.push(span);
+        for p in &mut self.paths {
+            p.spans.push((span, depth + p.off, p.holes.len()));
+        }
+        span
+    }
+
+    /// An operand that left a value has its stores as statements, as
+    /// `A?(0;C:=3.3):B` does, and a conditional's missing value buried unless
+    /// the conditional came last.
+    fn close(&mut self, span: Span, depth: i32) {
+        self.open.retain(|s| *s != span);
+        for p in &mut self.paths {
+            let real = depth + p.off;
+            if let Some((from, len)) = p.end(span)
+                && real > from
+            {
+                let tail = p.cut(len);
+                p.holes
+                    .extend(tail.into_iter().filter(|h| *h == Hole::Missing(real)));
+            }
+        }
+    }
+
+    /// `?`, after it pops the condition.
+    fn fork(&mut self, depth: i32) -> Fork {
+        let then = self.open(depth);
+        Fork {
+            then,
+            depth,
+            rest: self.paths.clone(),
+        }
+    }
+
+    /// `:`, before C's -1: the false branch starts where the true one did.
+    fn branch(&mut self, fork: Fork, depth: i32, n: usize) -> Arm {
+        let mut ends = std::mem::replace(&mut self.paths, fork.rest);
+        for p in &mut ends {
+            p.finish(fork.then, depth);
+        }
+        for p in &mut self.paths {
+            p.off += fork.depth - (depth - 1);
+        }
+        self.even(depth - 1);
+        Arm {
+            then: fork.then,
+            ends,
+            n,
+        }
+    }
+
+    /// The false branch is read too: go on along the paths through either.
+    fn join(&mut self, arm: &Arm, depth: i32) {
+        for p in &mut self.paths {
+            p.finish(arm.then, depth);
+        }
+        self.open.retain(|s| *s != arm.then);
+        self.paths.extend(arm.ends.iter().cloned());
+        for p in &mut self.paths {
+            p.off -= depth;
+        }
+        self.even(depth);
+    }
+
+    /// Give every path the open spans, a span one did not see begun beginning
+    /// where the path rejoined, and drop the paths that repeat one.
+    fn even(&mut self, depth: i32) {
+        let mut paths: Vec<Path> = Vec::with_capacity(self.paths.len());
+        for mut p in self.paths.drain(..) {
+            p.spans.retain(|s| self.open.contains(&s.0));
+            for &span in &self.open {
+                if !p.spans.iter().any(|s| s.0 == span) {
+                    p.spans.push((span, depth + p.off, p.holes.len()));
+                }
+            }
+            p.spans.sort_by_key(|s| s.0.0);
+            if !paths.contains(&p) {
+                paths.push(p);
+            }
+        }
+        if paths.len() > MAX_PATHS {
+            paths.clear();
+            self.lost = true;
+        }
+        self.paths = paths;
+    }
+
+    /// The result is the top of the stack.
+    fn refused(&mut self, depth: i32) -> bool {
+        self.drop_reads(|p| p.holes.contains(&Hole::Missing(depth + p.off)));
+        self.read && !self.lost && !self.paths.iter().any(|p| depth + p.off == 1)
+    }
+}
+
 impl StackEntry {
     fn in_stack_pri(&self) -> u8 {
         match self {
@@ -122,7 +375,7 @@ impl StackEntry {
             // `[` / `{`: in_stack_pri 0, like `(` — a barrier nothing pops.
             StackEntry::Subrange { .. } => 0,
             StackEntry::VarargFunc { in_stack_pri, .. } => *in_stack_pri,
-            StackEntry::CondEnd => 0,
+            StackEntry::CondEnd(_) => 0,
             StackEntry::Store { in_stack_pri, .. } => *in_stack_pri,
             // C: `{"UNTIL", 0, 10, 0, UNTIL_OPERATOR, UNTIL}` — in_stack_pri 0,
             // so no incoming operator ever pops it off the stack.
@@ -376,7 +629,7 @@ fn flush_stack_entry(entry: &StackEntry, output: &mut Emitter, kind: ExprKind) {
         } => {
             output.op(func_to_opcode(func, (1 - runtime_effect) as u8));
         }
-        StackEntry::CondEnd => {
+        StackEntry::CondEnd(_) => {
             output.op(Opcode::Core(CoreOp::CondEnd));
         }
         StackEntry::UntilEnd => {
@@ -423,7 +676,11 @@ pub fn compile(expr: &str, kind: ExprKind) -> Result<CompiledExpr, CalcError> {
     let mut stack: Vec<StackEntry> = Vec::new();
     let mut operand_needed = true;
     let mut runtime_depth: i32 = 0;
-    let mut cond_count: i32 = 0;
+    let mut holes = Holes::default();
+    // C's `cond_count`: each `?` still waiting for its `:`, and how many `:`
+    // had been read then.
+    let mut conds: Vec<(Fork, usize)> = Vec::new();
+    let mut elses = 0;
     // C `*ppostfix = USES_STRING` (`sCalcPostfix.c:447-471`) — latched as each
     // element is LOOKED UP, which is the only moment the retract-and-rewrite of
     // `:=` has not yet erased the evidence. sCalc's marker only; the numeric and
@@ -520,21 +777,42 @@ pub fn compile(expr: &str, kind: ExprKind) -> Result<CompiledExpr, CalcError> {
 
                 // Unary operators
                 Token::Minus => {
-                    pop_higher_or_equal(&mut stack, 10, &mut output, &mut runtime_depth, kind);
+                    pop_higher_or_equal(
+                        &mut stack,
+                        10,
+                        &mut output,
+                        &mut runtime_depth,
+                        &mut holes,
+                        kind,
+                    );
                     stack.push(StackEntry::Op {
                         token: Token::Minus,
                         in_stack_pri: 9,
                     });
                 }
                 Token::Bang => {
-                    pop_higher_or_equal(&mut stack, 10, &mut output, &mut runtime_depth, kind);
+                    pop_higher_or_equal(
+                        &mut stack,
+                        10,
+                        &mut output,
+                        &mut runtime_depth,
+                        &mut holes,
+                        kind,
+                    );
                     stack.push(StackEntry::Op {
                         token: Token::Bang,
                         in_stack_pri: 9,
                     });
                 }
                 Token::Tilde => {
-                    pop_higher_or_equal(&mut stack, 10, &mut output, &mut runtime_depth, kind);
+                    pop_higher_or_equal(
+                        &mut stack,
+                        10,
+                        &mut output,
+                        &mut runtime_depth,
+                        &mut holes,
+                        kind,
+                    );
                     stack.push(StackEntry::Op {
                         token: Token::Tilde,
                         in_stack_pri: 9,
@@ -542,7 +820,19 @@ pub fn compile(expr: &str, kind: ExprKind) -> Result<CompiledExpr, CalcError> {
                 }
 
                 Token::LParen => {
-                    stack.push(StackEntry::LParen { runtime_effect: 0 });
+                    let args = match stack.last() {
+                        Some(StackEntry::VarargFunc { .. }) => true,
+                        Some(StackEntry::Op {
+                            token: Token::Func(f),
+                            ..
+                        }) => func_arity(f) > 1,
+                        _ => false,
+                    };
+                    stack.push(StackEntry::LParen {
+                        runtime_effect: 0,
+                        span: holes.open(runtime_depth),
+                        args,
+                    });
                 }
 
                 // C `UNTIL_OPERATOR` (`sCalcPostfix.c:759-784`): flush the
@@ -552,13 +842,27 @@ pub fn compile(expr: &str, kind: ExprKind) -> Result<CompiledExpr, CalcError> {
                 // halves have runtime_effect 0, and `operand_needed` is
                 // untouched — the loop body still owes an operand.
                 Token::UntilKeyword => {
-                    pop_higher_or_equal(&mut stack, 10, &mut output, &mut runtime_depth, kind);
+                    pop_higher_or_equal(
+                        &mut stack,
+                        10,
+                        &mut output,
+                        &mut runtime_depth,
+                        &mut holes,
+                        kind,
+                    );
                     output.op(Opcode::Control(ControlOp::Until));
                     stack.push(StackEntry::UntilEnd);
                 }
 
                 Token::Func(func) => {
-                    pop_higher_or_equal(&mut stack, 10, &mut output, &mut runtime_depth, kind);
+                    pop_higher_or_equal(
+                        &mut stack,
+                        10,
+                        &mut output,
+                        &mut runtime_depth,
+                        &mut holes,
+                        kind,
+                    );
                     if is_vararg(func) {
                         stack.push(StackEntry::VarargFunc {
                             func: func.clone(),
@@ -579,7 +883,14 @@ pub fn compile(expr: &str, kind: ExprKind) -> Result<CompiledExpr, CalcError> {
             match token {
                 t if binary_op(t).is_some() => {
                     let (isp, icp) = binary_op(t).unwrap();
-                    pop_higher_or_equal(&mut stack, icp, &mut output, &mut runtime_depth, kind);
+                    pop_higher_or_equal(
+                        &mut stack,
+                        icp,
+                        &mut output,
+                        &mut runtime_depth,
+                        &mut holes,
+                        kind,
+                    );
                     stack.push(StackEntry::Op {
                         token: t.clone(),
                         in_stack_pri: isp,
@@ -608,8 +919,13 @@ pub fn compile(expr: &str, kind: ExprKind) -> Result<CompiledExpr, CalcError> {
                 Token::RParen => loop {
                     match stack.last() {
                         None => return Err(CalcError::ParenNotOpen),
-                        Some(StackEntry::LParen { runtime_effect }) => {
+                        Some(StackEntry::LParen {
+                            runtime_effect,
+                            span,
+                            ..
+                        }) => {
                             let paren = *runtime_effect;
+                            holes.close(*span, runtime_depth);
                             stack.pop();
                             // C `:651-662`: a VARARG_OPERATOR below the `(`
                             // inherits the paren's accumulated effect, and the
@@ -623,8 +939,7 @@ pub fn compile(expr: &str, kind: ExprKind) -> Result<CompiledExpr, CalcError> {
                         }
                         _ => {
                             let entry = stack.pop().unwrap();
-                            runtime_depth += stack_effect(&entry);
-                            flush_stack_entry(&entry, &mut output, kind);
+                            flush(&entry, &mut output, &mut runtime_depth, &mut holes, kind);
                         }
                     }
                 },
@@ -639,42 +954,79 @@ pub fn compile(expr: &str, kind: ExprKind) -> Result<CompiledExpr, CalcError> {
                             Some(e) if is_barrier(e) => break,
                             _ => {
                                 let entry = stack.pop().unwrap();
-                                runtime_depth += stack_effect(&entry);
-                                flush_stack_entry(&entry, &mut output, kind);
+                                flush(&entry, &mut output, &mut runtime_depth, &mut holes, kind);
                             }
                         }
                     }
-                    match stack.last_mut() {
+                    let (effect, span, args) = match stack.last_mut() {
                         // A `,` inside `[` / `{` belongs to the SUBRANGE, and C
                         // charges it to that entry (`:630`). It must not reach a
                         // vararg function further down: compiled C gives
                         // `MAX(4,7)[0,0]` = 7, i.e. `MAX` still took two arguments,
                         // not three. Sharing one stack variant with `(` is what let
                         // the bracket's `,` bump the vararg's count.
-                        Some(StackEntry::Subrange { runtime_effect, .. }) => *runtime_effect -= 1,
-                        Some(StackEntry::LParen { runtime_effect }) => *runtime_effect -= 1,
+                        Some(StackEntry::Subrange {
+                            runtime_effect,
+                            span,
+                            ..
+                        }) => (runtime_effect, span, true),
+                        Some(StackEntry::LParen {
+                            runtime_effect,
+                            span,
+                            args,
+                        }) => (runtime_effect, span, *args),
                         _ => unreachable!("the loop above only breaks on a barrier"),
+                    };
+                    *effect -= 1;
+                    if args {
+                        holes.close(*span, runtime_depth);
+                        *span = holes.open(runtime_depth);
                     }
                     operand_needed = true;
                 }
 
                 Token::Question => {
-                    pop_higher_strict(&mut stack, 0, &mut output, &mut runtime_depth, kind);
+                    pop_higher_strict(
+                        &mut stack,
+                        0,
+                        &mut output,
+                        &mut runtime_depth,
+                        &mut holes,
+                        kind,
+                    );
                     output.op(Opcode::Core(CoreOp::CondIf));
+                    holes.take(runtime_depth, 1);
                     runtime_depth -= 1;
-                    cond_count += 1;
+                    conds.push((holes.fork(runtime_depth), elses));
                     operand_needed = true;
                 }
 
                 Token::Colon => {
-                    pop_higher_strict(&mut stack, 0, &mut output, &mut runtime_depth, kind);
+                    pop_higher_strict(
+                        &mut stack,
+                        0,
+                        &mut output,
+                        &mut runtime_depth,
+                        &mut holes,
+                        kind,
+                    );
                     output.op(Opcode::Core(CoreOp::CondElse));
-                    runtime_depth -= 1;
-                    cond_count -= 1;
-                    if cond_count < 0 {
+                    let Some((fork, first)) = conds.pop() else {
                         return Err(CalcError::Conditional);
+                    };
+                    // A conditional inside the true branch ends here, though
+                    // its COND_END stays on the stack below this one.
+                    for entry in stack.iter_mut().rev() {
+                        if let StackEntry::CondEnd(arm) = entry
+                            && let Some(inner) = arm.take_if(|a| a.n >= first)
+                        {
+                            holes.join(&inner, runtime_depth);
+                        }
                     }
-                    stack.push(StackEntry::CondEnd);
+                    let arm = holes.branch(fork, runtime_depth, elses);
+                    elses += 1;
+                    runtime_depth -= 1;
+                    stack.push(StackEntry::CondEnd(Some(arm)));
                     operand_needed = true;
                 }
 
@@ -688,8 +1040,7 @@ pub fn compile(expr: &str, kind: ExprKind) -> Result<CompiledExpr, CalcError> {
                             break;
                         }
                         let entry = stack.pop().unwrap();
-                        runtime_depth += stack_effect(&entry);
-                        flush_stack_entry(&entry, &mut output, kind);
+                        flush(&entry, &mut output, &mut runtime_depth, &mut holes, kind);
                     }
                     // A pending `UNTIL_END` is NOT closed here by a rule of its
                     // own: it is an ordinary operator-stack entry, so the loop
@@ -697,7 +1048,7 @@ pub fn compile(expr: &str, kind: ExprKind) -> Result<CompiledExpr, CalcError> {
                     // innermost `(`. Inside `UNTIL(...)` it is not, which is why
                     // the condition ends up INSIDE the loop.
                     if rule == Terminator::Statement {
-                        if cond_count != 0 {
+                        if !conds.is_empty() {
                             return Err(CalcError::Conditional);
                         }
                         if runtime_depth > 1 {
@@ -753,8 +1104,7 @@ pub fn compile(expr: &str, kind: ExprKind) -> Result<CompiledExpr, CalcError> {
                             // entry above the fetch goes.
                             while stack.len() > at + 1 {
                                 let entry = stack.pop().unwrap();
-                                runtime_depth += stack_effect(&entry);
-                                flush_stack_entry(&entry, &mut output, kind);
+                                flush(&entry, &mut output, &mut runtime_depth, &mut holes, kind);
                             }
                             let StackEntry::Op {
                                 token: Token::Func(f),
@@ -767,6 +1117,8 @@ pub fn compile(expr: &str, kind: ExprKind) -> Result<CompiledExpr, CalcError> {
                                 FuncName::SDynFetch | FuncName::DynFetch => StoreTarget::Dyn,
                                 _ => StoreTarget::DynDouble,
                             };
+                            // The index, which the -1 below charges.
+                            holes.take(runtime_depth, 1);
                             stack[at] = StackEntry::Store {
                                 target,
                                 in_stack_pri: store.in_stack_pri(),
@@ -808,12 +1160,20 @@ pub fn compile(expr: &str, kind: ExprKind) -> Result<CompiledExpr, CalcError> {
                 // just-closed `)` (in_stack_pri 9) survives, which is R13-2.
                 Token::LBracket | Token::LBrace => {
                     let in_place = matches!(token, Token::LBrace);
-                    pop_higher_or_equal(&mut stack, 11, &mut output, &mut runtime_depth, kind);
+                    pop_higher_or_equal(
+                        &mut stack,
+                        11,
+                        &mut output,
+                        &mut runtime_depth,
+                        &mut holes,
+                        kind,
+                    );
                     stack.push(StackEntry::Subrange {
                         in_place,
                         // The table's own `runtime_effect` column: -1
                         // (sCalcPostfix.c:215-216). Each `,` charges one more.
                         runtime_effect: -1,
+                        span: holes.open(runtime_depth),
                     });
                     operand_needed = true;
                 }
@@ -832,25 +1192,31 @@ pub fn compile(expr: &str, kind: ExprKind) -> Result<CompiledExpr, CalcError> {
                     loop {
                         match stack.last() {
                             None => return Err(not_open),
-                            Some(StackEntry::Subrange { in_place, .. })
+                            Some(StackEntry::Subrange { in_place, span, .. })
                                 if *in_place == want_in_place =>
                             {
+                                holes.close(*span, runtime_depth);
                                 let entry = stack.pop().unwrap();
-                                runtime_depth += stack_effect(&entry);
-                                flush_stack_entry(&entry, &mut output, kind);
+                                flush(&entry, &mut output, &mut runtime_depth, &mut holes, kind);
                                 break;
                             }
                             _ => {
                                 let entry = stack.pop().unwrap();
-                                runtime_depth += stack_effect(&entry);
-                                flush_stack_entry(&entry, &mut output, kind);
+                                flush(&entry, &mut output, &mut runtime_depth, &mut holes, kind);
                             }
                         }
                     }
                 }
 
                 Token::PipeMinus => {
-                    pop_higher_or_equal(&mut stack, 6, &mut output, &mut runtime_depth, kind);
+                    pop_higher_or_equal(
+                        &mut stack,
+                        6,
+                        &mut output,
+                        &mut runtime_depth,
+                        &mut holes,
+                        kind,
+                    );
                     stack.push(StackEntry::Op {
                         token: Token::PipeMinus,
                         in_stack_pri: 6,
@@ -875,14 +1241,11 @@ pub fn compile(expr: &str, kind: ExprKind) -> Result<CompiledExpr, CalcError> {
     while let Some(entry) = stack.pop() {
         match entry {
             StackEntry::LParen { .. } => return Err(CalcError::ParenOpen),
-            _ => {
-                runtime_depth += stack_effect(&entry);
-                flush_stack_entry(&entry, &mut output, kind);
-            }
+            _ => flush(&entry, &mut output, &mut runtime_depth, &mut holes, kind),
         }
     }
 
-    if cond_count != 0 {
+    if !conds.is_empty() {
         return Err(CalcError::Conditional);
     }
 
@@ -906,6 +1269,10 @@ pub fn compile(expr: &str, kind: ExprKind) -> Result<CompiledExpr, CalcError> {
     // never reaches the compiler; see `calc::compile`).
     if operand_needed || runtime_depth != 1 {
         return Err(CalcError::Incomplete);
+    }
+    // After every check of C's, so a source C refuses keeps C's error.
+    if holes.refused(runtime_depth) {
+        return Err(CalcError::Underflow);
     }
 
     // No post-pass gate on which opcodes this engine may emit: `token::ElementTable`
@@ -983,9 +1350,9 @@ fn stack_effect(entry: &StackEntry) -> i32 {
         }
         StackEntry::Op { .. } => -1,
         StackEntry::VarargFunc { runtime_effect, .. } => *runtime_effect,
-        StackEntry::CondEnd => 0,
+        StackEntry::CondEnd(_) => 0,
         StackEntry::Store { .. } => -1,
-        StackEntry::LParen { runtime_effect } => *runtime_effect,
+        StackEntry::LParen { runtime_effect, .. } => *runtime_effect,
         // The effect C accumulated on the `[` / `{` entry itself: -1 from the
         // table plus -1 per `,`.
         StackEntry::Subrange { runtime_effect, .. } => *runtime_effect,
@@ -1008,11 +1375,37 @@ fn is_barrier(entry: &StackEntry) -> bool {
     )
 }
 
+/// Emit an entry leaving the operator stack and charge its effect. A store
+/// pushes nothing, `(` emits a no-op and COND_END runs as one; every other entry
+/// pushes one value.
+fn flush(
+    entry: &StackEntry,
+    output: &mut Emitter,
+    runtime_depth: &mut i32,
+    holes: &mut Holes,
+    kind: ExprKind,
+) {
+    let effect = stack_effect(entry);
+    let pushes = match entry {
+        StackEntry::Store { .. } | StackEntry::LParen { .. } | StackEntry::CondEnd(_) => 0,
+        _ => 1,
+    };
+    holes.take(*runtime_depth, pushes - effect);
+    *runtime_depth += effect;
+    match entry {
+        StackEntry::Store { .. } => holes.store(*runtime_depth),
+        StackEntry::CondEnd(Some(arm)) => holes.join(arm, *runtime_depth),
+        _ => {}
+    }
+    flush_stack_entry(entry, output, kind);
+}
+
 fn pop_higher_or_equal(
     stack: &mut Vec<StackEntry>,
     incoming_pri: u8,
     output: &mut Emitter,
     runtime_depth: &mut i32,
+    holes: &mut Holes,
     kind: ExprKind,
 ) {
     while let Some(entry) = stack.last() {
@@ -1020,8 +1413,7 @@ fn pop_higher_or_equal(
             break;
         }
         let entry = stack.pop().unwrap();
-        *runtime_depth += stack_effect(&entry);
-        flush_stack_entry(&entry, output, kind);
+        flush(&entry, output, runtime_depth, holes, kind);
     }
 }
 
@@ -1030,6 +1422,7 @@ fn pop_higher_strict(
     incoming_pri: u8,
     output: &mut Emitter,
     runtime_depth: &mut i32,
+    holes: &mut Holes,
     kind: ExprKind,
 ) {
     while let Some(entry) = stack.last() {
@@ -1037,7 +1430,6 @@ fn pop_higher_strict(
             break;
         }
         let entry = stack.pop().unwrap();
-        *runtime_depth += stack_effect(&entry);
-        flush_stack_entry(&entry, output, kind);
+        flush(&entry, output, runtime_depth, holes, kind);
     }
 }

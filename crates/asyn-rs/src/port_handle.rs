@@ -5423,6 +5423,47 @@ mod tests {
         assert_eq!(*posts.lock(), [(0, 10), (1, 11)]);
     }
 
+    /// C's lock keeps any other `callParamCallbacks` out of a section: one
+    /// that runs inside it posts its own sets, not the section's, which wait
+    /// for its end.
+    #[test]
+    fn a_post_inside_a_section_leaves_the_sections_sets_to_its_end() {
+        let (handle, posts, _sub) = gated_handle();
+        let mut gate = handle.callbacks_gate();
+        let section = gate.open(0, None, vec![set_val(0, 60)]).unwrap();
+        handle.call_param_callbacks_blocking(0).unwrap();
+        handle
+            .set_params_and_notify_blocking(1, vec![set_val(1, 61)])
+            .unwrap();
+        handle.read_int32_blocking(0, 0).unwrap();
+        assert_eq!(*posts.lock(), [(1, 61)], "posted the section's set");
+        section.end().unwrap();
+        handle.read_int32_blocking(0, 0).unwrap();
+        assert_eq!(*posts.lock(), [(1, 61), (0, 60)]);
+    }
+
+    /// A set the section stores unchanged raised no flag, so its end posts
+    /// nothing for it, and a flag a set ahead of the section left unposted
+    /// waits for the section's end like the section's own.
+    #[test]
+    fn a_section_posts_only_what_is_changed_at_its_end() {
+        let (handle, posts, _sub) = gated_handle();
+        handle
+            .set_params_and_notify_blocking(0, vec![set_val(0, 70)])
+            .unwrap();
+        handle.set_params_blocking(1, vec![set_val(1, 71)]).unwrap();
+        let mut gate = handle.callbacks_gate();
+        let section = gate
+            .open(0, None, vec![set_val(0, 70), set_val(1, 71)])
+            .unwrap();
+        handle.call_param_callbacks_blocking(1).unwrap();
+        handle.read_int32_blocking(0, 0).unwrap();
+        assert_eq!(*posts.lock(), [(0, 70)]);
+        section.end().unwrap();
+        handle.read_int32_blocking(0, 0).unwrap();
+        assert_eq!(*posts.lock(), [(0, 70), (1, 71)]);
+    }
+
     /// A section that ends before the actor reaches the sets leaves the
     /// callbacks to the actor, in the same order.
     #[test]

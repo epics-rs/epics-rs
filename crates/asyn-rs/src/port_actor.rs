@@ -2020,14 +2020,10 @@ impl PortActor {
             base.set_time_stamp(ts);
         }
         let mut failed = set_params(base, &updates);
-        let fire = gate.owe(addr, &updates);
+        let fire = gate.owe(base, addr, &updates);
         gate.give_back(updates);
-        if fire {
-            gate.fire(|list| {
-                if let Err(e) = base.call_param_callbacks(list) {
-                    failed.get_or_insert(e);
-                }
-            });
+        if fire && let Some(e) = gate.fire(base) {
+            failed.get_or_insert(e);
         }
         match failed {
             Some(e) => Err(e),
@@ -3155,18 +3151,20 @@ impl PortActor {
                 // the same reason one bad update does not strand the good ones
                 // above; the first error still reaches whoever waits on the
                 // reply.
-                let mut flush = |list| {
-                    if let Err(e) = base.call_param_callbacks(list) {
-                        failed.get_or_insert(e);
-                    }
-                };
                 match gate {
                     Some(gate) => {
-                        if gate.owe(*addr, updates) {
-                            gate.fire(flush);
+                        if gate.owe(base, *addr, updates)
+                            && let Some(e) = gate.fire(base)
+                        {
+                            failed.get_or_insert(e);
                         }
                     }
                     None => {
+                        let mut flush = |list| {
+                            if let Err(e) = base.call_param_callbacks(list) {
+                                failed.get_or_insert(e);
+                            }
+                        };
                         flush(*addr);
                         let mut further = Vec::new();
                         crate::request::push_further_lists(*addr, updates, &mut further);

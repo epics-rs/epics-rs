@@ -5780,6 +5780,9 @@ mod tests {
             std::thread::spawn(move || block_on_sync(sender.publish(make_test_array(3))).unwrap());
         let held = block_on_sync(downstream_rx.recv_msg()).unwrap().unwrap();
         assert_eq!(port.read_int32_blocking(stamp, addr).ok(), Some(30));
+        // C's lock keeps any other `callParamCallbacks` out until the
+        // frame's own has run.
+        port.call_param_callbacks_blocking(addr).unwrap();
         // The read's round trip ran behind anything enqueued before it.
         assert!(posts.lock().is_empty(), "posted before the delivery ended");
         drop(held);

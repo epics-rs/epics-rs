@@ -147,6 +147,29 @@ fn char_bytes_as_string(value: &EpicsValue, max_elements: usize) -> Option<PvStr
     Some(PvString::from_bytes(text[..end].to_vec()))
 }
 
+/// C `dbGet` of a `$` address on a link or an attribute: `getLinkValue` /
+/// `getAttrValue` answer `read_as` from the text (`dbAccess.c:944-952`), so
+/// `image`, its `DBR_CHAR` read, is never what the request converts. `None`
+/// is `S_db_badDbrtype`.
+fn text_route_read(
+    route: super::char_view::TextRoute,
+    read_as: crate::server::record::LinkReadAs,
+    image: EpicsValue,
+) -> Option<EpicsValue> {
+    use crate::server::record::LinkReadAs;
+    let text = super::char_view::text_of(&image);
+    match read_as {
+        LinkReadAs::Native => Some(image),
+        LinkReadAs::CharArrayAsString { max_elements } => char_bytes_as_string(
+            &route.read(DbFieldType::Char)?.get(text, max_elements),
+            max_elements,
+        )
+        .map(EpicsValue::String),
+        LinkReadAs::Array { dbr, n_request } => Some(route.read(dbr)?.get(text, n_request)),
+        scalar => element_0(route.read(scalar.dbr_type()?)?.get(text, 1)),
+    }
+}
+
 /// C `dbDBRoldToDBFnew[pca->dbrType]` (`dbCa.c:672`): the link set's cached
 /// remote type expressed as the DBF type a device support switches on.
 fn link_dbf_to_field_type(t: LinkDbfType) -> DbFieldType {
@@ -1057,6 +1080,24 @@ impl PvDatabase {
         }
     }
 
+    /// The text route of `link`'s `$` address on a local link field or
+    /// attribute ([`FieldAddr::text_route`]), which every read of it is
+    /// answered through.
+    ///
+    /// [`FieldAddr::text_route`]: crate::server::record::record_instance::FieldAddr::text_route
+    #[inline]
+    pub(crate) fn text_route_of(
+        &self,
+        link: &crate::server::record::ParsedLink,
+    ) -> Option<super::char_view::TextRoute> {
+        match link {
+            crate::server::record::ParsedLink::Db(db) if db.target().string_view => {
+                self.db_link_addr(db)?.put.field().text_route()
+            }
+            _ => None,
+        }
+    }
+
     /// [`Self::db_link_addr`] with the non-local answers kept: a shadowing
     /// simple PV is settled once per revision like an address, so its read
     /// takes no `simple_pvs` lock and builds no name.
@@ -1495,6 +1536,9 @@ impl PvDatabase {
         render: Option<crate::server::record::record_instance::SourceRender>,
     ) -> Option<EpicsValue> {
         use crate::server::record::LinkReadAs;
+        if let Some(route) = self.text_route_of(link) {
+            return text_route_read(route, read_as, value);
+        }
         match read_as {
             LinkReadAs::Native => Some(value),
             // C `dbGetLink(..., DBR_DOUBLE, ...)`: an array source contributes
@@ -1638,8 +1682,9 @@ impl PvDatabase {
             EpicsValue::String(s) => return Some(s),
             value => value,
         };
-        // A `$` source is a `DBF_CHAR` array whatever the field holds:
-        // `getCharString` of element 0, with no field metadata to apply.
+        // A string field's `$`, or a remote one, is a `DBF_CHAR` array:
+        // `getCharString` of element 0, with no field metadata to apply. A
+        // link's or attribute's is read from its text ahead of this.
         if let crate::server::record::ParsedLink::Db(db) = link
             && db.target().string_view
         {
@@ -1991,12 +2036,17 @@ impl PvDatabase {
                 });
             return (Some(value), alarm);
         }
-        match self.read_db_at(Some(held), db, at, false) {
-            (Some(v), alarm, _) => match link_value_as_f64(v) {
-                Some(f) => (Some(f), alarm),
-                None => (None, None),
-            },
-            (None, ..) => (None, None),
+        let (Some(v), alarm, _) = self.read_db_at(Some(held), db, at, false) else {
+            return (None, None);
+        };
+        let f = match at.put.field().text_route() {
+            Some(route) => text_route_read(route, crate::server::record::LinkReadAs::Double, v)
+                .and_then(|v| v.to_f64()),
+            None => link_value_as_f64(v),
+        };
+        match f {
+            Some(f) => (Some(f), alarm),
+            None => (None, None),
         }
     }
 
@@ -3971,6 +4021,7 @@ impl PvDatabase {
                 // `DBF_STRING`.
                 Some(m) => OutTarget {
                     field_type: m.dbf_type.map(|t| link_dbf_to_field_type(t).dbf_code()),
+                    dbr_field_type: m.dbf_type.map(link_dbf_to_field_type),
                     element_count: m.element_count.unwrap_or(1).max(1),
                     is_ca_link: true,
                     constant_type: false,
@@ -4000,11 +4051,13 @@ impl PvDatabase {
                 };
                 let guard = target.read();
                 // `dbNameToAddr` of a `$` address: a string's `DBF_CHAR` view,
-                // or a link's own type, and its `no_elements`.
+                // or a link's own type, read as `DBR_CHAR`, and its
+                // `no_elements`.
                 if addressed.string_view {
                     return match super::char_view::char_view(&guard, &addressed.field) {
                         Some(view) => OutTarget {
                             field_type: Some(view.field_type),
+                            dbr_field_type: Some(DbFieldType::Char),
                             element_count: (view.no_elements as i64).max(1),
                             is_ca_link: false,
                             constant_type: false,
@@ -4029,6 +4082,7 @@ impl PvDatabase {
                 };
                 OutTarget {
                     field_type,
+                    dbr_field_type: field_type.and_then(crate::types::DbfCode::served_type),
                     element_count: element_count.max(1),
                     is_ca_link: false,
                     constant_type: false,
@@ -4045,6 +4099,7 @@ impl PvDatabase {
             // string.
             crate::server::record::ParsedLink::State(_) => OutTarget {
                 field_type: Some(crate::types::DbfCode::Short),
+                dbr_field_type: Some(DbFieldType::Short),
                 element_count: 1,
                 is_ca_link: false,
                 constant_type: false,

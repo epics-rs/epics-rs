@@ -946,6 +946,11 @@ pub struct OutTarget {
     /// (disconnected CA link, or a name this IOC cannot resolve) — C's
     /// `field_type` initializer.
     pub field_type: Option<DbfCode>,
+    /// C's `dbr_field_type`, what `dbGetLinkDBFtype` reports
+    /// (`dbChannelFinalFieldType`, `dbChannel.c:498`): the DBR type
+    /// [`Self::field_type`] is served as, except at a `$` address, which is
+    /// `DBR_CHAR` while a link keeps its `DBF_xxLINK` (`dbAccess.c:690-695`).
+    pub dbr_field_type: Option<DbFieldType>,
     /// Target field's element capacity — C `no_elements` / `dbCaGetNelements`.
     /// `1` when unresolved, matching C's `n_elements = 1` initializer.
     pub element_count: i64,
@@ -972,6 +977,7 @@ impl OutTarget {
     /// class — C's `field_type = 0` matches no `case` and falls to `default:`.
     pub const UNRESOLVED: Self = Self {
         field_type: None,
+        dbr_field_type: None,
         element_count: 1,
         is_ca_link: false,
         constant_type: true,

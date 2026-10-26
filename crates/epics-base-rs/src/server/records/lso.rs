@@ -141,9 +141,10 @@ impl Record for LsoRecord {
         source: &crate::server::record::OutTarget,
     ) -> Option<crate::server::record::LinkReadAs> {
         use crate::server::record::LinkReadAs;
-        use crate::types::DbfCode;
-        Some(match source.field_type {
-            Some(DbfCode::Char | DbfCode::UChar) => LinkReadAs::Native,
+        use crate::types::DbFieldType;
+        // `dbGetLinkDBFtype`: a link's `$` is `DBR_CHAR`.
+        Some(match source.dbr_field_type {
+            Some(DbFieldType::Char | DbFieldType::UChar) => LinkReadAs::Native,
             _ => LinkReadAs::String,
         })
     }

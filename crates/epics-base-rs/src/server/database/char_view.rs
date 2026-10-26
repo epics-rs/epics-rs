@@ -88,11 +88,19 @@ fn route_at<R: ViewedRecord + ?Sized>(
     field: &str,
     desc: Option<&FieldDesc>,
 ) -> Option<CharSource> {
+    match source_of(desc) {
+        CharSource::Attribute => inst.attribute(field).map(|_| CharSource::Attribute),
+        source => Some(source),
+    }
+}
+
+/// The route of a field declared as `desc`, an attribute where the name
+/// declares none (`dbGetAttributePart`'s synthesised `DBF_STRING`).
+pub(crate) fn source_of(desc: Option<&FieldDesc>) -> CharSource {
     match desc {
-        Some(desc) if crate::types::link_class_of(desc).is_some() => Some(CharSource::Link),
-        Some(_) => Some(CharSource::Field),
-        // `dbGetAttributePart`'s synthesised `DBF_STRING` descriptor.
-        None => inst.attribute(field).map(|_| CharSource::Attribute),
+        Some(desc) if crate::types::link_class_of(desc).is_some() => CharSource::Link,
+        Some(_) => CharSource::Field,
+        None => CharSource::Attribute,
     }
 }
 

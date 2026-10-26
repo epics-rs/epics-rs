@@ -2453,6 +2453,7 @@ mod tests {
     fn out_target(field_type: Option<DbfCode>, element_count: i64, is_ca_link: bool) -> OutTarget {
         OutTarget {
             field_type,
+            dbr_field_type: field_type.and_then(DbfCode::served_type),
             element_count,
             is_ca_link,
             constant_type: false,

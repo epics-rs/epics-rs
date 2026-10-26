@@ -2773,6 +2773,16 @@ impl FieldAddr {
     pub(crate) fn char_view(&self) -> bool {
         self.char_view
     }
+
+    /// The text `dbGet` answers every request of this `$` address from: a
+    /// link keeps its `DBF_xxLINK` and an attribute its `SPC_ATTRIBUTE`, so
+    /// the `DBR_CHAR` image is not what a conversion starts from.
+    pub(crate) fn text_route(&self) -> Option<crate::server::database::char_view::TextRoute> {
+        if !self.char_view {
+            return None;
+        }
+        crate::server::database::char_view::source_of(self.desc).text_route()
+    }
 }
 
 /// How `dbPut` stores into a [`PutAddr`]: C's `dbFastPutConvertRoutine`
@@ -4464,8 +4474,8 @@ pub(crate) struct NativeRead {
 impl NativeRead {
     /// The read the reader's hold makes of `parsed` at `target`, or `None`
     /// when it is not this frame's: a read of the reader's own field, a `PP`
-    /// source (processed with the guard released), a filtered channel, or
-    /// not a local record read at all.
+    /// source (processed with the guard released), a filtered channel, a
+    /// `$` text route (no native read), or not a local record read at all.
     fn of(
         parsed: &ParsedLink,
         target: &ResolvedTarget,
@@ -4480,6 +4490,7 @@ impl NativeRead {
         if Arc::ptr_eq(&target.rec, reader)
             || db.policy == LinkProcessPolicy::ProcessPassive
             || channel.json_suffix.is_some()
+            || target.put.field().text_route().is_some()
         {
             return None;
         }

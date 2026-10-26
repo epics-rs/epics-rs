@@ -2667,6 +2667,14 @@ impl PvDatabase {
             return not_read_slot();
         }
         let (parsed, target) = entry.target(self, rec.unframed(), cache_slot);
+        // The native funnel is these readers' `DBR_DOUBLE`, which a `$`
+        // link's or attribute's text answers itself, never its char image.
+        let request = match request {
+            InputLinkRequest::As(LinkReadAs::Native) if self.text_route_of(parsed).is_some() => {
+                InputLinkRequest::As(LinkReadAs::Double)
+            }
+            request => request,
+        };
         // C `dbGetLink`: a `ProcessPassive` DB input link processes its
         // passive source record before the value is read. The source's cycle
         // may read THIS record back through a link of its own, so it runs

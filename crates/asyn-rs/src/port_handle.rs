@@ -1397,7 +1397,8 @@ impl PortHandle {
     /// ```
     ///
     /// Delivery to the actor inbox is guaranteed (waits if channel is full).
-    /// The actor processes messages in FIFO order.
+    /// The actor processes messages in FIFO order, but for what runs while a
+    /// [`CallbacksGate`] section holds, as [`Self::set_params_blocking`].
     ///
     /// `addr` names the address list to flush; a batch that writes further
     /// lists gets those flushed too, in the order it first wrote them, so a
@@ -1490,9 +1491,12 @@ impl PortHandle {
     }
 
     /// C `setXxxParam` of each update without the `callParamCallbacks`: the
-    /// values are in the store for any request queued after this one, and
-    /// marked changed until a [`Self::call_param_callbacks_blocking`] on
-    /// their list posts them. Blocks only until the inbox accepts it, as
+    /// values are marked changed until a
+    /// [`Self::call_param_callbacks_blocking`] on their list posts them. A
+    /// request queued after this one finds them stored, but for one that runs
+    /// while a [`CallbacksGate`] section holds, a read among them: the sets
+    /// wait for the section's end, as C's writer waits on the lock. Blocks
+    /// only until the inbox accepts it, as
     /// [`Self::set_params_and_notify_blocking`].
     pub fn set_params_blocking(
         &self,

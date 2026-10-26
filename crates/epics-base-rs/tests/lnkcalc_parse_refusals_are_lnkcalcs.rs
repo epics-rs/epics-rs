@@ -82,6 +82,17 @@ fn values_are_refused_by_the_parser_state() {
         .as_deref(),
         Some("lnkCalc: Too many input args, limit is 21\n")
     );
+    // `lnkCalc_string` takes a string only for units, time and the three
+    // expressions (`lnkCalc.c:188-191`): an args element is no PV name.
+    let unexpected = |s: &str| Some(format!("lnkCalc: Unexpected string \"{s}\"\n"));
+    assert_eq!(input(r#"{calc:{expr:"A",args:["X"]}}"#), unexpected("X"));
+    assert_eq!(input(r#"{calc:{expr:"A",args:[1,"X"]}}"#), unexpected("X"));
+    assert_eq!(input(r#"{calc:{expr:"A",prec:"x"}}"#), unexpected("x"));
+    assert_eq!(input(r#"{calc:"A"}"#), unexpected("A"));
+    assert_eq!(
+        report(r#"{calc:{expr:"A",out:"PV"}}"#, LinkFieldType::Out),
+        unexpected("PV")
+    );
     // `parse_boolean` is NULL in `lnkCalcIf`: a stop with no word.
     assert_eq!(input(r#"{calc:{expr:"A",args:[true]}}"#), None);
     assert_eq!(input("{calc:true}"), None);

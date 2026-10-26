@@ -8591,43 +8591,43 @@ async fn test_lnk_calc_parses_and_evaluates() {
     use epics_base_rs::server::record::{CalcLink, ParsedLink, parse_link_v2};
     use epics_base_rs::server::records::ai::AiRecord;
 
-    // The port's string-arg shorthand: one `args` slot holding a link to
-    // the named record. C refuses a bare string here (`lnkCalc.c:187-190`);
-    // see the DEVIATION note on `json_calc_arg`.
-    fn name_arg(pv: &str) -> CalcArg {
-        CalcArg::Link(Box::new(parse_link_v2(pv)))
+    fn pva_arg(pv: &str) -> CalcArg {
+        CalcArg::Link(Box::new(ParsedLink::Pva(PvaChannelLink::new(pv))))
     }
 
     // Parser: full lnkCalc form.
-    let parsed = parse_link_v2(r#"{calc:{"expr":"A+B*2","args":["pv_a","pv_b"],"time":"A"}}"#);
+    let parsed =
+        parse_link_v2(r#"{calc:{"expr":"A+B*2","args":[{pva:"pv_a"},{pva:"pv_b"}],"time":"A"}}"#);
     let calc = match parsed {
         ParsedLink::Calc(c) => c,
         other => panic!("expected ParsedLink::Calc, got {other:?}"),
     };
     assert_eq!(calc.expr.as_deref(), Some("A+B*2"));
-    assert_eq!(calc.args, vec![name_arg("pv_a"), name_arg("pv_b")]);
+    assert_eq!(calc.args, vec![pva_arg("pv_a"), pva_arg("pv_b")]);
     assert_eq!(calc.time_source, Some('A'));
 
     // Parser without `time` field — time_source must be None.
-    let no_time = parse_link_v2(r#"{calc:{"expr":"A","args":["pv_a"]}}"#);
+    let no_time = parse_link_v2(r#"{calc:{"expr":"A","args":[1]}}"#);
     assert!(matches!(no_time, ParsedLink::Calc(c) if c.time_source.is_none()));
 
     // Parser refuses more than CALC_NARGS args — C `lnkCalc.c:135-139`
     // returns `jlif_stop`, it does not truncate. The 21/22 boundary itself
     // is pinned in `tests/calc_json_link_body.rs`.
-    let names: Vec<String> = (0..=epics_base_rs::calc::CALC_NARGS)
-        .map(|i| format!("\"pv{i}\""))
+    let args: Vec<String> = (0..=epics_base_rs::calc::CALC_NARGS)
+        .map(|i| i.to_string())
         .collect();
     let too_many = parse_link_v2(&format!(
         r#"{{calc:{{"expr":"A","args":[{}]}}}}"#,
-        names.join(",")
+        args.join(",")
     ));
     assert!(
         !matches!(too_many, ParsedLink::Calc(_)),
         "more than CALC_NARGS args must NOT parse as Calc"
     );
 
-    // Read-path: feed real PVs, evaluate A+B*2.
+    // Read-path: feed real PVs, evaluate A+B*2. A DB link child is built
+    // here, as no link text yields one: `lnkCalc_string` refuses a string
+    // arg (`lnkCalc.c:188-191`).
     let db = PvDatabase::new();
     db.add_record("pv_a", Box::new(AiRecord::new(3.0)))
         .await
@@ -8641,7 +8641,10 @@ async fn test_lnk_calc_parses_and_evaluates() {
         major: None,
         minor: None,
         out: None,
-        args: vec![name_arg("pv_a"), name_arg("pv_b")],
+        args: vec![
+            CalcArg::Link(Box::new(parse_link_v2("pv_a"))),
+            CalcArg::Link(Box::new(parse_link_v2("pv_b"))),
+        ],
         time_source: Some('A'),
         val: Default::default(),
         prec: 15,
@@ -8654,91 +8657,6 @@ async fn test_lnk_calc_parses_and_evaluates() {
         .expect("calc link evaluates");
     match value {
         EpicsValue::Double(v) => assert!((v - 13.0).abs() < 1e-9, "expected 3+5*2=13, got {v}"),
-        other => panic!("expected Double, got {other:?}"),
-    }
-}
-
-/// A `lnkCalc` `{calc:...}` link whose input record is NON-LOCAL must
-/// read that input through the external CA path — each `A..` input is its
-/// own `dbInitLink` link (`lnkCalc.c:353`), so a non-local input is a CA
-/// link. The pre-fix loop read every input with a local-only `get_pv`, so
-/// a single non-local input made the whole evaluation return `None`.
-/// Sibling of the non-local Db read / OUT-write / TSEL `.TIME` fixes —
-/// same `dbInitLink` locality cause, the lnkCalc inputs. The matching
-/// non-local TIMESTAMP boundary is in
-/// `calc_link_adopts_its_time_inputs_stamp.rs`, which owns that half.
-#[epics_macros_rs::epics_test]
-async fn test_lnk_calc_nonlocal_input_resolves_externally() {
-    use epics_base_rs::server::database::{LinkRef, LinkSet};
-    use epics_base_rs::server::record::CalcLink;
-    use epics_base_rs::server::records::ai::AiRecord;
-
-    struct CalcCaLset {
-        secs: i64,
-        nsec: i32,
-    }
-    #[epics_base_rs::async_trait]
-    impl LinkSet for CalcCaLset {
-        fn is_connected(&self, _: LinkRef<'_>) -> bool {
-            true
-        }
-        fn get_cached_value(&self, link: LinkRef<'_>) -> Option<EpicsValue> {
-            let name = link.name;
-            (name == b"REMOTE:A").then_some(EpicsValue::Double(10.0))
-        }
-        async fn get_value(&self, link: LinkRef<'_>) -> Option<EpicsValue> {
-            self.get_cached_value(link)
-        }
-        fn time_stamp(&self, link: LinkRef<'_>) -> Option<(i64, i32, u64)> {
-            let name = link.name;
-            (name == b"REMOTE:A").then_some((self.secs, self.nsec, 0))
-        }
-    }
-
-    let db = PvDatabase::new();
-    db.register_link_set(
-        "ca",
-        Arc::new(CalcCaLset {
-            secs: 1_700_000_456,
-            nsec: 321,
-        }),
-    )
-    .await;
-    db.process_cp_links_on_connect().await;
-    // pv_b is local; REMOTE:A is never added → non-local CA input.
-    db.add_record("pv_b", Box::new(AiRecord::new(5.0)))
-        .await
-        .unwrap();
-
-    let calc = CalcLink {
-        expr: Some("A+B*2".into()),
-        major: None,
-        minor: None,
-        out: None,
-        args: vec![
-            CalcArg::Link(Box::new(parse_link_v2("REMOTE:A"))),
-            CalcArg::Link(Box::new(parse_link_v2("pv_b"))),
-        ],
-        time_source: Some('A'),
-        val: Default::default(),
-        prec: 15,
-        units: None,
-    };
-
-    let mut visited = epics_base_rs::server::database::ProcStack::new();
-    let value = db
-        .read_link_value_soft(
-            &epics_base_rs::server::record::ParsedLink::Calc(Box::new(calc)),
-            true,
-            &mut visited,
-        )
-        .expect("calc with a non-local input must still evaluate");
-    match value {
-        // 10 (remote A) + 5 (local B) * 2 = 20.
-        EpicsValue::Double(v) => assert!(
-            (v - 20.0).abs() < 1e-9,
-            "non-local calc input must resolve via CA: expected 20, got {v}"
-        ),
         other => panic!("expected Double, got {other:?}"),
     }
 }

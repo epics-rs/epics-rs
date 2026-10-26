@@ -3612,9 +3612,6 @@ impl LnkCalcParse {
                     }
                 }
             }
-            // DEVIATION, kept from `json_calc_arg`: C stops on a string here,
-            // the port takes it as an embedded link's PV name.
-            CalcPs::Args => self.take_arg(said),
             CalcPs::Expr | CalcPs::Major | CalcPs::Minor => {
                 match self.pstate {
                     CalcPs::Expr => self.expr = true,
@@ -3976,18 +3973,6 @@ fn json_calc_arg(v: &serde_json::Value, lookup: LinkLookup<'_>) -> Option<CalcAr
                 JsonLinkParse::NotJson | JsonLinkParse::Rejected(_) => None,
             }
         }
-        // DEVIATION, deliberate and pre-existing. C refuses a bare string
-        // here: `lnkCalc_string` reaches its `pstate < ps_expr || pstate >
-        // ps_minor` guard with `pstate == ps_args` and returns `jlif_stop`
-        // ("Unexpected string", `lnkCalc.c:187-190`), so `args:["pv1"]` does
-        // not load in a C IOC at all. This port has always documented and
-        // accepted it as shorthand for an embedded link, and in-tree
-        // databases use it; it is kept as a link slot like any other rather
-        // than as a third kind of argument.
-        serde_json::Value::String(name) => Some(CalcArg::Link(Box::new(parse_link_field(
-            name,
-            LinkFieldType::In,
-        )))),
         _ => None,
     }
 }
@@ -5360,7 +5345,7 @@ mod json_link_tests {
         assert_eq!(parse_link_v2("#C0 S2").link_type(), LinkType::Other);
         // Link bodies are JSON5; strict JSON is the subset that also parses.
         assert_eq!(
-            parse_link_v2(r#"{calc: {"expr": "A+1", "args": ["pv1"]}}"#).link_type(),
+            parse_link_v2(r#"{calc: {"expr": "A+1", "args": [1]}}"#).link_type(),
             LinkType::Json
         );
     }

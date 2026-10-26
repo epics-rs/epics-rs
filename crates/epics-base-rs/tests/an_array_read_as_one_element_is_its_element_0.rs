@@ -12,10 +12,7 @@
 //! PF:CA:WD "2.500000"   LC:K 3   LCS "one" (LCO:WD NO_ALARM)
 //! ```
 //!
-//! Every other record NO_ALARM. A bare string `args` element is this port's
-//! shorthand for a DB link, which C refuses, so `LC:DB:WD` has no C row: the
-//! same request from a `{pva:...}` arg takes element 0 (pvxs
-//! `pvalink_lset.cpp:291-320`).
+//! Every other record NO_ALARM.
 
 mod calink_ioc;
 
@@ -46,7 +43,6 @@ record(stringout, "SO:DB:WS") { field(OMSL, "closed_loop") field(DOL, "WS NPP") 
 record(aSub, "AS:DB:WS") { field(LFLG, "READ") field(SUBL, "WS NPP") }
 record(aSub, "AS:CA:WL") { field(LFLG, "READ") field(SUBL, "WL CA") }
 record(printf, "PF:CA:WD") { field(FMT, "%s") field(INP0, "WD CA") }
-record(ai, "LC:DB:WD") { field(INP, {calc:{expr:"A*2", args:["WD"]}}) }
 record(ai, "LC:K") { field(INP, {calc:{expr:"A*2", args:[{const:[1.5, 4]}]}}) }
 record(bi, "LCS") { field(ZNAM, "zero") field(ONAM, "one") field(INP, {state:"lcs"}) }
 record(aao, "LCO:WD") { field(FTVL, "DOUBLE") field(NELM, "2") field(OMSL, "closed_loop") field(DOL, "WD NPP") field(OUT, {calc:{expr:"VAL*2", out:{state:"lcs"}}}) }
@@ -89,8 +85,7 @@ async fn a_one_element_read_of_an_array_converts_element_0() {
     db.ca_sync().await;
     for rec in [
         "SI:CA:WC", "SI:CA:WL", "SI:CA:WD", "SI:CA:WS", "SI:DB:WS", "SI:DB:WD", "SI:DB:WE",
-        "SO:CA:WD", "SO:DB:WS", "AS:DB:WS", "AS:CA:WL", "PF:CA:WD", "LC:DB:WD", "LC:K", "LCO:WD",
-        "LCS",
+        "SO:CA:WD", "SO:DB:WS", "AS:DB:WS", "AS:CA:WL", "PF:CA:WD", "LC:K", "LCO:WD", "LCS",
     ] {
         // aSub returns `S_db_BadSub` for a name nothing registers.
         let _ = db.process_record(rec).await;
@@ -116,7 +111,7 @@ async fn a_one_element_read_of_an_array_converts_element_0() {
             wrong.push((pv, got));
         }
     }
-    for (pv, want) in [("LC:DB:WD", 5.0), ("LC:K", 3.0), ("LCS", 1.0)] {
+    for (pv, want) in [("LC:K", 3.0), ("LCS", 1.0)] {
         let got = (db.get_pv(pv).unwrap().to_f64().unwrap(), alarm(&db, pv));
         if got != (want, NO_ALARM) {
             wrong.push((pv, (format!("{}", got.0), got.1)));

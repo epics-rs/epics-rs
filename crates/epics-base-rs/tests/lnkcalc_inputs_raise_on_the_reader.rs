@@ -5,7 +5,7 @@
 //! (`dbLink.c:66`) and leaves `arg[i]` as it was, while the evaluation goes
 //! on. The nested-calc expectations are what softIoc (8f5015b66) printed for
 //! `dbpf` / `dbgf` on these records; pvxs 1.5.3 cannot open a `{pva:…}`
-//! input ("DBLINK* corrupt"), so the PVA and DB inputs follow `dbGetLink`.
+//! input ("DBLINK* corrupt"), so the PVA inputs follow `dbGetLink`.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -16,16 +16,11 @@ use epics_base_rs::server::record::AlarmSeverity;
 use epics_base_rs::types::EpicsValue;
 
 const DB: &str = r#"
-record(ai, "SRC") { field(VAL, "7") field(HIGH, "5") field(HSV, "MAJOR") }
 record(ai, "N1") { field(INP, "{calc:{expr:'A', args:[{calc:{expr:'5', major:'1'}}]}}") }
 record(ai, "N2") { field(INP, "{calc:{expr:'A', args:[{calc:{expr:'5', minor:'1'}}], major:'A>4'}}") }
 record(ai, "N3") { field(INP, "{calc:{expr:'A', args:[{calc:{expr:'5', major:'1'}}], minor:'A>4'}}") }
 record(ai, "N4") { field(INP, "{calc:{expr:'A+B', args:[{calc:{expr:'5', minor:'1'}}, {calc:{expr:'1', major:'1'}}]}}") }
 record(ai, "F1") { field(INP, "{calc:{expr:'A+B+VAL', args:[{pva:'REMOTE:A'}, 2]}}") }
-record(ai, "M1") { field(INP, "{calc:{expr:'A', args:['SRC MS']}}") }
-record(ai, "M2") { field(INP, "{calc:{expr:'A', args:['SRC MSS']}}") }
-record(ai, "M3") { field(INP, "{calc:{expr:'A', args:['SRC']}}") }
-record(ai, "SELF") { field(VAL, "7") field(HIGH, "5") field(HSV, "MAJOR") field(INP, "{calc:{expr:'A', args:['SELF.VAL MS']}}") }
 record(ao, "O1") { field(OUT, "{calc:{expr:'A+VAL', out:{state:'s1'}, args:[{calc:{expr:'5', major:'1'}}]}}") }
 record(ao, "O2") { field(OUT, "{calc:{expr:'A+VAL', out:{state:'s2'}, major:'VAL>100', args:[{calc:{expr:'5', minor:'1'}}]}}") }
 record(ao, "O3") { field(OUT, "{calc:{expr:'A+VAL', out:{state:'s3'}, args:[{pva:'REMOTE:A'}]}}") }
@@ -92,12 +87,10 @@ async fn ioc() -> (Arc<PvDatabase>, Arc<Remote>) {
         down: AtomicBool::new(false),
     });
     db.register_link_set("pva", remote.clone()).await;
-    process(&db, "SRC").await;
     (db, remote)
 }
 
 const LINK: u16 = 14;
-const HIGH: u16 = 4;
 
 #[epics_macros_rs::epics_test]
 async fn a_nested_calc_input_raises_its_alarm_on_the_reader() {
@@ -130,38 +123,6 @@ async fn a_failed_input_keeps_its_last_value_and_raises_link_invalid() {
         process(&db, "F1").await,
         (18.0, AlarmSeverity::Invalid, LINK, "field ????".into())
     );
-}
-
-#[epics_macros_rs::epics_test]
-async fn an_input_passes_on_its_source_alarm_by_its_own_ms_class() {
-    let (db, _) = ioc().await;
-    assert_eq!(
-        process(&db, "M1").await,
-        (7.0, AlarmSeverity::Major, LINK, String::new())
-    );
-    assert_eq!(
-        process(&db, "M2").await,
-        (7.0, AlarmSeverity::Major, HIGH, String::new())
-    );
-    assert_eq!(
-        process(&db, "M3").await,
-        (7.0, AlarmSeverity::NoAlarm, 0, String::new())
-    );
-}
-
-/// `dbDbGetValue`'s `precord != dbChannelRecord(chan)` (`dbDbLink.c:228`):
-/// an input reading the record that holds the link inherits nothing, so on
-/// the second process the record's own HIGH alarm is the one it ends with,
-/// not the MAJOR it committed on the first.
-#[epics_macros_rs::epics_test]
-async fn an_input_on_the_reader_itself_inherits_nothing() {
-    let (db, _) = ioc().await;
-    for _ in 0..2 {
-        assert_eq!(
-            process(&db, "SELF").await,
-            (7.0, AlarmSeverity::Major, HIGH, String::new())
-        );
-    }
 }
 
 #[epics_macros_rs::epics_test]

@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use epics_base_rs::error::CaError;
 use epics_base_rs::server::database::{LinkRef, LinkSet, ProcStack, PvDatabase};
 use epics_base_rs::server::ioc_builder::IocBuilder;
+use epics_base_rs::server::record::{CalcArg, CalcLink, ParsedLink, parse_link_v2};
 use epics_base_rs::server::records::acalcout::AcalcoutRecord;
 use epics_base_rs::types::{DbFieldType, EpicsValue, PvString};
 
@@ -322,14 +323,15 @@ impl LinkSet for Remote {
 /// A DB link to a name this IOC does not serve is a CA link
 /// (`dbLink.c:118-130`), so XW reads as WF2 does above. lnkCalc's child
 /// read passes `&nReq` (`lnkCalc.c:542`, `:585`), so a CA child keeps
-/// `arg[i]` when its string does not parse. C refuses a string `args`
-/// element; the port takes it for a link, and reads it as C reads any child.
+/// `arg[i]` when its string does not parse. No link text yields a CA or DB
+/// child, `lnkCalc_string` refusing a string `args` element
+/// (`lnkCalc.c:188-191`), so LCA's and LCD's are built.
 #[epics_macros_rs::epics_test]
 async fn an_external_db_link_and_a_calc_link_child_are_ca_reads() {
     const DB: &str = r#"
 record(waveform, "XW") { field(NELM, "4") field(FTVL, "DOUBLE") field(INP, "XSW") }
-record(ai, "LCA") { field(INP, {calc:{expr:"A+1", args:["XSR CA"]}}) }
-record(ai, "LCD") { field(INP, {calc:{expr:"A+1", args:["XSR"]}}) }
+record(ai, "LCA") {}
+record(ai, "LCD") {}
 "#;
     let (db, _h) = IocBuilder::new()
         .db_string(DB, &HashMap::new())
@@ -337,6 +339,22 @@ record(ai, "LCD") { field(INP, {calc:{expr:"A+1", args:["XSR"]}}) }
         .build()
         .await
         .unwrap();
+    for (rec, child) in [("LCA", "XSR CA"), ("LCD", "XSR")] {
+        let calc = CalcLink {
+            expr: Some("A+1".into()),
+            major: None,
+            minor: None,
+            out: None,
+            args: vec![CalcArg::Link(Box::new(parse_link_v2(child)))],
+            time_source: None,
+            val: Default::default(),
+            prec: 15,
+            units: None,
+        };
+        let link = Arc::new(ParsedLink::Calc(Box::new(calc)));
+        let cell = db.get_record(rec).unwrap();
+        cell.write().install_link_cache("INP", link).unwrap();
+    }
     let remote = Arc::new(Remote(Mutex::new(HashMap::from([
         ("XSW", strings(&["1", "2", "3"])),
         ("XSR", EpicsValue::String(PvString::from("5"))),

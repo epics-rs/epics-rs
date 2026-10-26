@@ -1,5 +1,5 @@
 //! A `lnkCalc` input link names one of its inputs as the time source —
-//! `{calc:{"expr":"A+B","args":["X","Y"],"time":"B"}}` — and the record
+//! `{calc:{"expr":"A+B","args":[{pva:"X"},{pva:"Y"}],"time":"B"}}` — and the record
 //! reading that link takes BOTH halves of that input's stamp.
 //!
 //! C does it inside the link read, not in the dset: `lnkCalc_getValue`
@@ -35,8 +35,7 @@
 //! or a letter past the args leaves what was there, `{0,0}` at first.
 //!
 //! Asserted here at each boundary of the rule: which link class, which
-//! letter, which gate value, local vs non-local source, read vs put, and
-//! a good vs a failed read.
+//! letter, which gate value, read vs put, and a good vs a failed read.
 
 use epics_base_rs::runtime::general_time::epics_epoch;
 use epics_base_rs::server::database::{LinkRef, LinkSet};
@@ -45,6 +44,7 @@ use epics_base_rs::types::EpicsValue;
 use epics_base_rs::types::WallTime;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 /// Stamps no clock in this process will produce, so an assertion that finds
@@ -56,26 +56,56 @@ const B_UTAG: u64 = 0xB2B2_B2B2;
 
 type Db = Arc<epics_base_rs::server::database::PvDatabase>;
 
-async fn build(db_text: &str) -> Db {
-    IocBuilder::new()
+/// The `{pva:…}` inputs: `SRC_A` is 3 and `SRC_B` is 5, each with its own
+/// stamp, until `down` fails every read.
+struct Sources {
+    down: AtomicBool,
+}
+
+impl Sources {
+    fn source(&self, link: LinkRef<'_>) -> Option<(f64, Duration, u64)> {
+        if self.down.load(Ordering::Relaxed) {
+            return None;
+        }
+        match link.name {
+            b"SRC_A" => Some((3.0, A_STAMP, A_UTAG)),
+            b"SRC_B" => Some((5.0, B_STAMP, B_UTAG)),
+            _ => None,
+        }
+    }
+}
+
+#[epics_base_rs::async_trait]
+impl LinkSet for Sources {
+    fn is_connected(&self, link: LinkRef<'_>) -> bool {
+        self.source(link).is_some()
+    }
+    fn get_cached_value(&self, link: LinkRef<'_>) -> Option<EpicsValue> {
+        self.source(link).map(|(v, ..)| EpicsValue::Double(v))
+    }
+    async fn get_value(&self, link: LinkRef<'_>) -> Option<EpicsValue> {
+        self.get_cached_value(link)
+    }
+    fn time_stamp(&self, link: LinkRef<'_>) -> Option<(i64, i32, u64)> {
+        self.source(link)
+            .map(|(_, t, tag)| (t.as_secs() as i64, t.subsec_nanos() as i32, tag))
+    }
+}
+
+async fn build(db_text: &str) -> (Db, Arc<Sources>) {
+    let db = IocBuilder::new()
+        .register_link_type("pva", |_db| async { Vec::new() })
         .db_string(db_text, &HashMap::new())
         .unwrap()
         .build()
         .await
         .unwrap()
-        .0
-}
-
-/// SRC_A / SRC_B are never processed in these tests, so a hand-planted stamp
-/// stays put and any record carrying it took it from that source.
-fn stamp_sources(db: &Db) {
-    for (name, t, tag) in [("SRC_A", A_STAMP, A_UTAG), ("SRC_B", B_STAMP, B_UTAG)] {
-        if let Some(rec) = db.get_record(name) {
-            let mut inst = rec.write();
-            inst.common.time = WallTime::UNIX_EPOCH + t;
-            inst.common.utag = tag;
-        }
-    }
+        .0;
+    let sources = Arc::new(Sources {
+        down: AtomicBool::new(false),
+    });
+    db.register_link_set("pva", sources.clone()).await;
+    (db, sources)
 }
 
 async fn proc(db: &Db, rec: &str) {
@@ -94,25 +124,23 @@ fn stamp_of(db: &Db, rec: &str) -> (WallTime, u64) {
 /// The rule itself: `time:"A"` on a TSE=-2 soft input hands the record the
 /// named input's time AND its userTag. Pre-fix the owner's `_ => None` arm
 /// swallowed every calc link, so the record kept the `general_time` seed and
-/// a zero tag while its VAL was the freshly computed 7.0.
+/// a zero tag while its VAL was the freshly computed 3.0.
 #[epics_macros_rs::epics_test]
 async fn a_calc_inps_time_letter_supplies_both_halves_of_the_stamp() {
-    let db = build(
+    let (db, _) = build(
         r#"
-record(ai, "SRC_A") { field(VAL, "7") }
 record(ai, "DST") {
-    field(INP, "{calc:{\"expr\":\"A\",\"args\":[\"SRC_A\"],\"time\":\"A\"}}")
+    field(INP, "{calc:{\"expr\":\"A\",\"args\":[{\"pva\":\"SRC_A\"}],\"time\":\"A\"}}")
     field(TSE, "-2")
 }
 "#,
     )
     .await;
-    stamp_sources(&db);
     proc(&db, "DST").await;
 
     assert_eq!(
         db.get_record("DST").unwrap().read().record.get_field("VAL"),
-        Some(EpicsValue::Double(7.0)),
+        Some(EpicsValue::Double(3.0)),
         "the calc itself must still evaluate"
     );
     assert_eq!(
@@ -127,18 +155,15 @@ record(ai, "DST") {
 /// the first input and happens to be right".
 #[epics_macros_rs::epics_test]
 async fn the_time_letter_selects_which_input_supplies_the_stamp() {
-    let db = build(
+    let (db, _) = build(
         r#"
-record(ai, "SRC_A") { field(VAL, "3") }
-record(ai, "SRC_B") { field(VAL, "5") }
 record(ai, "DST") {
-    field(INP, "{calc:{\"expr\":\"A+B\",\"args\":[\"SRC_A\",\"SRC_B\"],\"time\":\"B\"}}")
+    field(INP, "{calc:{\"expr\":\"A+B\",\"args\":[{\"pva\":\"SRC_A\"},{\"pva\":\"SRC_B\"}],\"time\":\"B\"}}")
     field(TSE, "-2")
 }
 "#,
     )
     .await;
-    stamp_sources(&db);
     proc(&db, "DST").await;
 
     assert_eq!(
@@ -159,17 +184,15 @@ record(ai, "DST") {
 /// indistinguishable at the record from having written no `time` key at all.
 #[epics_macros_rs::epics_test]
 async fn a_lower_case_time_letter_names_the_same_input_as_upper_case() {
-    let db = build(
+    let (db, _) = build(
         r#"
-record(ai, "SRC_A") { field(VAL, "7") }
 record(ai, "DST") {
-    field(INP, "{calc:{\"expr\":\"A\",\"args\":[\"SRC_A\"],\"time\":\"a\"}}")
+    field(INP, "{calc:{\"expr\":\"A\",\"args\":[{\"pva\":\"SRC_A\"}],\"time\":\"a\"}}")
     field(TSE, "-2")
 }
 "#,
     )
     .await;
-    stamp_sources(&db);
     proc(&db, "DST").await;
 
     assert_eq!(
@@ -186,17 +209,15 @@ record(ai, "DST") {
 /// case here but this one would still pass.
 #[epics_macros_rs::epics_test]
 async fn a_calc_inp_without_a_time_key_supplies_no_stamp() {
-    let db = build(
+    let (db, _) = build(
         r#"
-record(ai, "SRC_A") { field(VAL, "7") }
 record(ai, "DST") {
-    field(INP, "{calc:{\"expr\":\"A\",\"args\":[\"SRC_A\"]}}")
+    field(INP, "{calc:{\"expr\":\"A\",\"args\":[{\"pva\":\"SRC_A\"}]}}")
     field(TSE, "-2")
 }
 "#,
     )
     .await;
-    stamp_sources(&db);
     proc(&db, "DST").await;
 
     let (time, utag) = stamp_of(&db, "DST");
@@ -215,16 +236,14 @@ record(ai, "DST") {
 /// case, which is the same database with TSE=-2.
 #[epics_macros_rs::epics_test]
 async fn a_calc_inp_on_the_default_tse_supplies_no_stamp() {
-    let db = build(
+    let (db, _) = build(
         r#"
-record(ai, "SRC_A") { field(VAL, "7") }
 record(ai, "DST") {
-    field(INP, "{calc:{\"expr\":\"A\",\"args\":[\"SRC_A\"],\"time\":\"A\"}}")
+    field(INP, "{calc:{\"expr\":\"A\",\"args\":[{\"pva\":\"SRC_A\"}],\"time\":\"A\"}}")
 }
 "#,
     )
     .await;
-    stamp_sources(&db);
     proc(&db, "DST").await;
 
     let (time, utag) = stamp_of(&db, "DST");
@@ -234,62 +253,6 @@ record(ai, "DST") {
         "TSE=0 → `dbLinkIsConstant(&tsel) && tse == -2` is false → no adoption"
     );
     assert_eq!(utag, 0);
-}
-
-/// Each `A..` input is its own `dbInitLink` link (`lnkCalc.c:353`), so an
-/// input naming a record this IOC does not hold is a CA link and its stamp
-/// comes from the CA lset. Same locality rule as a plain DB link resolving to
-/// CA, and the reason the time input's stamp is read through
-/// `db_get_time_stamp_tag` like any other link's instead of re-deriving
-/// locality: a second derivation of the same rule is what drifts, and this
-/// one is the boundary where the drift would be invisible.
-#[epics_macros_rs::epics_test]
-async fn a_non_local_time_input_supplies_the_remote_stamp() {
-    struct RemoteLset;
-    #[epics_base_rs::async_trait]
-    impl LinkSet for RemoteLset {
-        fn is_connected(&self, _: LinkRef<'_>) -> bool {
-            true
-        }
-        fn get_cached_value(&self, link: LinkRef<'_>) -> Option<EpicsValue> {
-            let name = link.name;
-            (name == b"REMOTE:A").then_some(EpicsValue::Double(10.0))
-        }
-        async fn get_value(&self, link: LinkRef<'_>) -> Option<EpicsValue> {
-            self.get_cached_value(link)
-        }
-        fn time_stamp(&self, link: LinkRef<'_>) -> Option<(i64, i32, u64)> {
-            let name = link.name;
-            (name == b"REMOTE:A").then_some((1_700_000_456, 321, A_UTAG))
-        }
-    }
-
-    let db = build(
-        r#"
-record(ai, "DST") {
-    field(INP, "{calc:{\"expr\":\"A\",\"args\":[\"REMOTE:A\"],\"time\":\"A\"}}")
-    field(TSE, "-2")
-}
-"#,
-    )
-    .await;
-    db.register_link_set("ca", Arc::new(RemoteLset)).await;
-    db.process_cp_links_on_connect().await;
-    proc(&db, "DST").await;
-
-    assert_eq!(
-        db.get_record("DST").unwrap().read().record.get_field("VAL"),
-        Some(EpicsValue::Double(10.0)),
-        "the non-local input must resolve through the CA lset"
-    );
-    assert_eq!(
-        stamp_of(&db, "DST"),
-        (
-            WallTime::UNIX_EPOCH + Duration::new(1_700_000_456, 321),
-            A_UTAG
-        ),
-        "a non-local time input is a CA link; its stamp is the lset's"
-    );
 }
 
 async fn dbpf(db: &Db, rec: &str, value: EpicsValue) {
@@ -307,7 +270,7 @@ async fn dbpf(db: &Db, rec: &str, value: EpicsValue) {
 /// for its time, takes it.
 #[epics_macros_rs::epics_test]
 async fn a_device_time_reader_takes_the_stamp_the_link_holds() {
-    let db = build(
+    let (db, _) = build(
         r#"
 record(ao, "OUT1") { field(OUT, "{calc:{expr:'A', time:'A', out:{state:'t1'}, args:[5]}}") }
 record(ao, "OUT2") { field(OUT, "{calc:{expr:'A', out:{state:'t2'}, args:[5]}}") }
@@ -359,19 +322,16 @@ record(ai, "AI4") { field(INP, "{calc:{expr:'A+1', time:'B', args:[5]}}") }
 }
 
 const READERS: &str = r#"
-record(ai, "SRC_A") { field(VAL, "3") }
-record(stringin, "SRC_B") { field(VAL, "1") }
-record(ao, "OUTS") { field(TSE, "-2") field(OUT, "{calc:{expr:'A', time:'A', out:{state:'t3'}, args:['SRC_A']}}") }
-record(calc, "CS") { field(TSE, "-2") field(INPA, "{calc:{expr:'A', time:'A', args:['SRC_A']}}") field(CALC, "A") }
-record(ai, "AIS") { field(TSE, "-2") field(INP, "{calc:{expr:'A', time:'A', args:['SRC_B']}}") }
-record(calc, "CN") { field(TSE, "-2") field(INPA, "{calc:{expr:'A+B', time:'A', args:['SRC_A', {calc:{expr:'2', time:'A', args:['SRC_B']}}]}}") field(CALC, "A") }
-record(ai, "AIN") { field(TSE, "-2") field(INP, "{calc:{expr:'A+B', time:'A', args:['SRC_A', {calc:{expr:'2', time:'A', args:['SRC_B']}}]}}") }
+record(ao, "OUTS") { field(TSE, "-2") field(OUT, "{calc:{expr:'A', time:'A', out:{state:'t3'}, args:[{pva:'SRC_A'}]}}") }
+record(calc, "CS") { field(TSE, "-2") field(INPA, "{calc:{expr:'A', time:'A', args:[{pva:'SRC_A'}]}}") field(CALC, "A") }
+record(ai, "AIS") { field(TSE, "-2") field(INP, "{calc:{expr:'A', time:'A', args:[{pva:'SRC_B'}]}}") }
+record(calc, "CN") { field(TSE, "-2") field(INPA, "{calc:{expr:'A+B', time:'A', args:[{pva:'SRC_A'}, {calc:{expr:'2', time:'A', args:[{pva:'SRC_B'}]}}]}}") field(CALC, "A") }
+record(ai, "AIN") { field(TSE, "-2") field(INP, "{calc:{expr:'A+B', time:'A', args:[{pva:'SRC_A'}, {calc:{expr:'2', time:'A', args:[{pva:'SRC_B'}]}}]}}") }
 "#;
 
 #[epics_macros_rs::epics_test]
 async fn the_time_input_stamps_a_writer_and_any_reader() {
-    let db = build(READERS).await;
-    stamp_sources(&db);
+    let (db, _) = build(READERS).await;
     dbpf(&db, "OUTS", EpicsValue::Double(1.0)).await;
     assert_eq!(
         stamp_of(&db, "OUTS"),
@@ -389,8 +349,7 @@ async fn the_time_input_stamps_a_writer_and_any_reader() {
 /// and leaves the inner tag.
 #[epics_macros_rs::epics_test]
 async fn a_nested_time_input_copies_last() {
-    let db = build(READERS).await;
-    stamp_sources(&db);
+    let (db, _) = build(READERS).await;
     proc(&db, "CN").await;
     assert_eq!(
         stamp_of(&db, "CN"),
@@ -406,13 +365,11 @@ async fn a_nested_time_input_copies_last() {
 /// A failed read of the `time` input leaves the stamp of the last good one.
 #[epics_macros_rs::epics_test]
 async fn a_failed_time_input_keeps_the_last_good_stamp() {
-    let db = build(READERS).await;
-    stamp_sources(&db);
+    let (db, sources) = build(READERS).await;
     proc(&db, "AIS").await;
     let good = (WallTime::UNIX_EPOCH + B_STAMP, B_UTAG);
     assert_eq!(stamp_of(&db, "AIS"), good);
-    dbpf(&db, "SRC_B", EpicsValue::String("abc".into())).await;
-    assert_ne!(stamp_of(&db, "SRC_B").0, good.0);
+    sources.down.store(true, Ordering::Relaxed);
     proc(&db, "AIS").await;
     assert_eq!(stamp_of(&db, "AIS"), good);
 }

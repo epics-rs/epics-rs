@@ -15,6 +15,7 @@ use asyn_rs::user::AsynUser;
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::recgbl::alarm_status;
+use epics_base_rs::types::EpicsValue;
 use motor_rs::builder::{ControllerAxis, ControllerBuilder};
 use motor_rs::devices::{device_support_factory, devices, register_axis, register_controller_port};
 use motor_rs::poll_loop::PollCommand;
@@ -58,7 +59,7 @@ impl AsynMotor for Arrives {
 
 /// Boot one motor per `(name, fields)` on axes 0.. of `port`, then poll each
 /// axis once so its changed status processes the record.
-async fn boot(port: &str, motors: &[(&str, &str)], check: impl FnOnce(&PvDatabase)) {
+async fn boot(port: &str, motors: &[(&str, &str)], check: impl AsyncFnOnce(&PvDatabase)) {
     register_controller_port(&open_owner(), port, motors.len() as i32, ()).unwrap();
     let mut controller = ControllerBuilder::new();
     let axes: Vec<ControllerAxis> = (0..motors.len())
@@ -99,7 +100,7 @@ async fn boot(port: &str, motors: &[(&str, &str)], check: impl FnOnce(&PvDatabas
         .register_dynamic_device_support(&devices(), device_support_factory())
         .db_string(&db, &HashMap::new())
         .unwrap()
-        .build()
+        .build_served()
         .await
         .unwrap();
     for tx in &polls {
@@ -109,7 +110,7 @@ async fn boot(port: &str, motors: &[(&str, &str)], check: impl FnOnce(&PvDatabas
     for rec in motors.iter().map(|(name, _)| name) {
         assert_eq!(num(&db, &format!("{rec}.RBV")), 3.0, "{rec} processed");
     }
-    check(&db);
+    check(&db).await;
     polls[0].send(PollCommand::Shutdown).await.unwrap();
     poller.await;
 }
@@ -135,7 +136,7 @@ async fn only_a_constant_type_dol_clears_udf_at_init() {
             ("UD:unset", ""),
             ("UD:lit", r#"field(DOL, "5")"#),
         ],
-        |db| {
+        async |db| {
             for rec in ["UD:json", "UD:jsoncl"] {
                 assert_eq!(udf(db, rec), 1, "{rec}");
                 let stat = num(db, &format!("{rec}.STAT")) as u16;
@@ -163,7 +164,7 @@ async fn a_closed_loop_constant_dol_seeds_val() {
             ("VD:litcl", r#"field(DOL, "5") field(OMSL, "closed_loop")"#),
             ("VD:lit", r#"field(DOL, "5")"#),
         ],
-        |db| {
+        async |db| {
             assert_eq!(num(db, "VD:litcl.VAL"), 5.0);
             assert_eq!(num(db, "VD:litcl.DVAL"), 0.0, "no move");
             assert_eq!(num(db, "VD:lit.VAL"), 0.0, "val = rbv at init");
@@ -186,7 +187,7 @@ async fn a_closed_loop_restore_keeps_the_drive_values() {
     boot(
         "RSTDOL",
         &[("RD:cl", restored), ("RD:cldol", &with_dol)],
-        |db| {
+        async |db| {
             for (rec, val) in [("RD:cl", 2.0), ("RD:cldol", 5.0)] {
                 assert_eq!(num(db, &format!("{rec}.VAL")), val, "{rec}");
                 assert_eq!(num(db, &format!("{rec}.DVAL")), 7.0, "{rec}");
@@ -194,6 +195,39 @@ async fn a_closed_loop_restore_keeps_the_drive_values() {
                 assert_eq!(num(db, &format!("{rec}.LVAL")), val, "{rec}");
                 assert_eq!(num(db, &format!("{rec}.LRVL")), 0.0, "{rec}");
             }
+        },
+    )
+    .await;
+}
+
+/// C takes the DOL read only for `dol.type == DB_LINK` (motorRecord.cc:1994).
+/// A name no record here serves is a CA link once iocInit has looked it up, so
+/// the record stays undefined until a VAL put moves it, as the C oracle reads;
+/// a local name is a DB link, read into VAL on every pass.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_closed_loop_dol_is_read_only_as_a_db_link() {
+    boot(
+        "CADOL",
+        &[
+            ("DL:ca", r#"field(OMSL, "closed_loop") field(DOL, "abc")"#),
+            (
+                "DL:db",
+                r#"field(OMSL, "closed_loop") field(DOL, "DL:ca.MRES")"#,
+            ),
+        ],
+        async |db| {
+            assert_eq!(udf(db, "DL:ca"), 1);
+            let stat = num(db, "DL:ca.STAT") as u16;
+            assert_eq!(stat, alarm_status::UDF_ALARM);
+            assert_eq!(num(db, "DL:db.VAL"), 1.0, "DOL read");
+            assert_eq!(udf(db, "DL:db"), 0);
+            db.put_record_field_from_ca("DL:ca", "VAL", EpicsValue::Double(1.0))
+                .await
+                .unwrap();
+            assert_eq!(num(db, "DL:ca.VAL"), 1.0);
+            assert_eq!(udf(db, "DL:ca"), 0);
+            assert_eq!(num(db, "DL:ca.STAT"), 0.0);
+            assert_eq!(num(db, "DL:ca.SEVR"), 0.0);
         },
     )
     .await;

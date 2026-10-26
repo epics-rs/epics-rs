@@ -1709,6 +1709,17 @@ mod link_cache {
         }
     }
 
+    /// A slot write the instance has yet to finish: what the slot's new parse
+    /// changes outside it, which `RecordInstance::slot_written` alone applies.
+    #[must_use]
+    pub(crate) struct SlotWrite(usize);
+
+    impl SlotWrite {
+        pub(super) fn slot(&self) -> usize {
+            self.0
+        }
+    }
+
     /// Sixteen slotted links by slot index. The slots are in the type's
     /// declaration order, so a row is settled once, when the instance is built.
     #[derive(Debug, Clone, Copy)]
@@ -1914,18 +1925,19 @@ mod link_cache {
         }
 
         /// Slot `i` takes `parsed`: every write after the build comes here.
-        fn set(&mut self, i: usize, parsed: Arc<ParsedLink>) {
+        fn set(&mut self, i: usize, parsed: Arc<ParsedLink>) -> SlotWrite {
             let mut parsed = parsed;
-            self.swap(i, &mut parsed);
+            self.swap(i, &mut parsed)
         }
 
         /// [`Self::set`] handing the old parse back in `parsed`, for a caller
         /// that drops it after the hold.
-        pub(super) fn swap(&mut self, i: usize, parsed: &mut Arc<ParsedLink>) {
+        pub(super) fn swap(&mut self, i: usize, parsed: &mut Arc<ParsedLink>) -> SlotWrite {
             if usize::from(self.1.slot) == i {
                 self.1.const_lset = has_const_lset(parsed);
             }
             std::mem::swap(&mut self.0[i].parsed, parsed);
+            SlotWrite(i)
         }
 
         #[inline(always)]
@@ -1941,28 +1953,30 @@ mod link_cache {
             i: usize,
             desc: &crate::server::record::FieldDesc,
             text: &[u8],
-        ) {
+        ) -> SlotWrite {
             let Some(ftype) = slot_type(desc) else {
-                return;
+                return SlotWrite(i);
             };
-            self.set(i, parse(text, ftype));
+            let write = self.set(i, parse(text, ftype));
             #[cfg(debug_assertions)]
             {
                 self.0[i].text = text.into();
             }
+            write
         }
 
         /// Move `link` into its slot; the parse was made outside the hold.
-        pub(super) fn install(&mut self, link: PreparedLink) {
+        pub(super) fn install(&mut self, link: PreparedLink) -> Option<SlotWrite> {
             let Some(i) = self.position(link.field) else {
                 debug_assert!(false, "{}: PreparedLink without a slot", link.field);
-                return;
+                return None;
             };
-            self.set(i, link.parsed);
+            let write = self.set(i, link.parsed);
             #[cfg(debug_assertions)]
             {
                 self.0[i].text = link.text;
             }
+            Some(write)
         }
 
         #[inline(always)]
@@ -1988,10 +2002,18 @@ mod link_cache {
             self.0.iter().map(|slot| &slot.parsed)
         }
 
+        /// Each slot's field and parse, in slot order.
+        pub(super) fn fields_and_links(
+            &self,
+        ) -> impl Iterator<Item = (&'static str, &Arc<ParsedLink>)> {
+            self.0.iter().map(|slot| (slot.field, &slot.parsed))
+        }
+
         /// C `dbRemoveLink` on slot `i`.
-        pub(super) fn remove(&mut self, i: usize) {
-            if let Some(removed) = removed(&self.0[i].parsed) {
-                self.set(i, removed);
+        pub(super) fn remove(&mut self, i: usize) -> SlotWrite {
+            match removed(&self.0[i].parsed) {
+                Some(removed) => self.set(i, removed),
+                None => SlotWrite(i),
             }
         }
 
@@ -2101,10 +2123,10 @@ mod link_cache {
             let mut slots = LinkSlots::of(&ai);
             assert!(!slots.siml_has_const_lset());
             let i = slots.position("SIML").unwrap();
-            slots.remove(i);
+            let _ = slots.remove(i);
             assert!(!slots.siml_has_const_lset());
             let desc = super::super::field_desc_in(ai.field_list(), "SIML").unwrap();
-            slots.install_text(i, desc, b"");
+            let _ = slots.install_text(i, desc, b"");
             assert!(slots.siml_has_const_lset());
             assert!(LinkSlots::default().siml_has_const_lset(), "no SIML");
         }
@@ -2133,7 +2155,7 @@ mod link_cache {
 
 pub(crate) use link_cache::{
     CycleLink, CycleLinkSlots, LinkRow, LinkSlots, NewDset, OutTarget, PreparedCommonLink,
-    PreparedLink, PreparedLinks,
+    PreparedLink, PreparedLinks, SlotWrite,
 };
 pub use link_cache::{LinkCache, OutLinkCache};
 
@@ -5190,7 +5212,7 @@ pub struct RecordInstance {
     /// read — see [`ParsedInputLink::validated`], the one writer. An entry
     /// whose text is not the record's text is re-parsed at the next read; a
     /// field with a link slot reads the slot's parse, so every write of a
-    /// slot drops the field's entry ([`Self::forget_input_entry`]). C parses
+    /// slot drops the field's entry ([`Self::slot_written`]). C parses
     /// a link once at `dbInitLink`; the port parsed every set
     /// `INPA`..`INPL` on every cycle.
     pub(crate) parsed_inputs: Vec<Option<ParsedInputLink>>,
@@ -7631,8 +7653,8 @@ impl RecordInstance {
         let mut link = link;
         if let Some(i) = self.link_slots.position(field) {
             self.invalidate_plan_for(field);
-            self.link_slots.swap(i, &mut link);
-            self.forget_input_entry(field);
+            let write = self.link_slots.swap(i, &mut link);
+            self.slot_written(write);
             return Ok(link);
         }
         if self.swap_link_cache(field, &mut link) {
@@ -8121,10 +8143,10 @@ impl RecordInstance {
         self.invalidate_plan_for(field);
         match PreparedLink::for_put(self.record.field_list(), field, &value) {
             Some(link) => {
-                let field = link.field();
-                self.record.load_field(field, value)?;
-                self.link_slots.install(link);
-                self.forget_input_entry(field);
+                self.record.load_field(link.field(), value)?;
+                if let Some(write) = self.link_slots.install(link) {
+                    self.slot_written(write);
+                }
                 Ok(())
             }
             None => {
@@ -8142,8 +8164,9 @@ impl RecordInstance {
         let field = link.field();
         self.invalidate_plan_for(field);
         self.record.put_field(field, value)?;
-        self.link_slots.install(link);
-        self.forget_input_entry(field);
+        if let Some(write) = self.link_slots.install(link) {
+            self.slot_written(write);
+        }
         Ok(())
     }
 
@@ -8163,8 +8186,9 @@ impl RecordInstance {
         let field = link.field();
         self.invalidate_plan_for(field);
         self.record.put_field_internal(field, value)?;
-        self.link_slots.install(link);
-        self.forget_input_entry(field);
+        if let Some(write) = self.link_slots.install(link) {
+            self.slot_written(write);
+        }
         Ok(Some(field))
     }
 
@@ -8499,7 +8523,10 @@ impl RecordInstance {
         self.device_done.set_prio(prio);
     }
 
-    pub fn new_boxed(name: impl Into<crate::types::RecordName>, record: Box<dyn Record>) -> Self {
+    pub fn new_boxed(
+        name: impl Into<crate::types::RecordName>,
+        mut record: Box<dyn Record>,
+    ) -> Self {
         let rtype = record.record_type();
         // The reverse index of `Record::link_backed_metadata_field`, built once
         // from the record's own declaration so no second list can go stale.
@@ -8566,6 +8593,9 @@ impl RecordInstance {
         common.analog_alarm = analog_alarm;
         let multi_input_slots = record.multi_input_links().len();
         let link_slots = LinkSlots::of(record.as_ref());
+        for (field, link) in link_slots.fields_and_links() {
+            record.set_link_type(field, link.link_type());
+        }
         let cycle_links = link_slots.cycle_slots();
         let dol_mode = (
             menu_index_of(&*record, "OMSL"),
@@ -11123,24 +11153,28 @@ impl RecordInstance {
     /// `dbPutSpecial(paddr, 0)` refuses an `SPC_NOMOD` field, and the error
     /// path does not restore it, so aSub's SUBL reads nothing afterwards.
     pub(crate) fn remove_link_slot(&mut self, i: usize) {
-        let field = self.link_slots.field(i);
-        self.invalidate_plan_for(field);
-        self.link_slots.remove(i);
-        self.forget_input_entry(field);
+        self.invalidate_plan_for(self.link_slots.field(i));
+        let write = self.link_slots.remove(i);
+        self.slot_written(write);
     }
 
-    /// Drop `field`'s [`Self::parsed_inputs`] entry after its slot was
-    /// written, so the next read takes the slot's new parse.
-    fn forget_input_entry(&mut self, field: &str) {
-        if let Some(i) = self
+    /// Finish a slot write: drop the field's [`Self::parsed_inputs`] entry,
+    /// so the next read takes the slot's new parse, and give the record the
+    /// link type the new parse has ([`Record::set_link_type`]).
+    fn slot_written(&mut self, write: SlotWrite) {
+        let i = write.slot();
+        let field = self.link_slots.field(i);
+        if let Some(input) = self
             .record
             .multi_input_links()
             .iter()
             .position(|(f, _)| *f == field)
-            && let Some(entry) = self.parsed_inputs.get_mut(i)
+            && let Some(entry) = self.parsed_inputs.get_mut(input)
         {
             *entry = None;
         }
+        let link_type = self.link_slots.at(i).link_type();
+        self.record.set_link_type(field, link_type);
     }
 
     /// An `openLink` that left `field`'s link with no lset
@@ -11157,7 +11191,8 @@ impl RecordInstance {
             return;
         };
         if let Some(i) = self.link_slots.position(field) {
-            self.link_slots.remove(i);
+            let write = self.link_slots.remove(i);
+            self.slot_written(write);
         }
         if let Some(slot) = self
             .record
@@ -11777,8 +11812,8 @@ impl RecordInstance {
                 if let (Some(i), EpicsValue::String(text)) =
                     (self.link_slots.position(desc.name), &coerced)
                 {
-                    self.link_slots.install_text(i, desc, text.as_bytes());
-                    self.forget_input_entry(desc.name);
+                    let write = self.link_slots.install_text(i, desc, text.as_bytes());
+                    self.slot_written(write);
                 }
                 self.cold
                     .declared_overrides

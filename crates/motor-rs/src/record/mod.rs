@@ -7,7 +7,7 @@ mod status_update;
 
 use epics_base_rs::error::CaResult;
 use epics_base_rs::server::record::{
-    CycleMarks, CyclePostMask, FieldDesc, FieldIx, MonitorValueClasses, MonitorValueGate,
+    CycleMarks, CyclePostMask, FieldDesc, FieldIx, LinkType, MonitorValueClasses, MonitorValueGate,
     ParsedLink, ProcessAction, ProcessActions, ProcessOutcome, Record, ResolvedInputLinks,
     load_constant_link_scalar, parse_link_v2,
 };
@@ -54,6 +54,9 @@ pub struct MotorRecord {
     initialized: bool,
     /// Monotonic counter for delay request IDs
     next_delay_id: u64,
+    /// C `pmr->dol.type`, the framework's ([`Record::set_link_type`]): only
+    /// the DOL as `iocInit` resolved it tells a local name from a CA one.
+    dol_type: LinkType,
 }
 
 /// C `CALLBACK_VALUE`: why a pass reaches do_work.
@@ -190,6 +193,7 @@ impl Default for MotorRecord {
             device_state: None,
             initialized: false,
             next_delay_id: 0,
+            dol_type: LinkType::Constant,
         }
     }
 }
@@ -418,7 +422,7 @@ impl MotorRecord {
     /// bypassed and VAL arrives only through the DOL link; a constant or
     /// CA DOL leaves the collection active even under closed loop.
     pub(crate) fn closed_loop_dol_collection(&self) -> bool {
-        self.links.omsl == 1 && matches!(parse_link_v2(&self.links.dol), ParsedLink::Db(_))
+        self.links.omsl == 1 && self.dol_type == LinkType::Db
     }
 
     /// The DOL under C init_record's `dol.type == CONSTANT` (677), the one
@@ -691,9 +695,9 @@ impl Record for MotorRecord {
         // CLOSED_LOOP: drive VAL from the DOL link (motorRecord.cc:1994-1999).
         // C reads DOL into .val only when `omsl == closed_loop && dol.type ==
         // DB_LINK`; a constant DOL is initialised once (recGblInitConstantLink,
-        // :680) and never re-read, so gate on the link parsing as a local DB
-        // link. Writing VAL records a VAL command-source, so the following
-        // process() plans the move to the link value.
+        // :680) and never re-read, and a CA one is never read, so gate on the
+        // resolved DB link. Writing VAL records a VAL command-source, so the
+        // following process() plans the move to the link value.
         //
         // Read only when DMOV (done): C calls do_work — the function holding
         // the DOL read — for `pmr->dmov` or a non-callback process, but NOT on
@@ -745,6 +749,12 @@ impl Record for MotorRecord {
         }
         if self.conv.urip && !self.conv.ueip {
             self.conv.rdbl_error = !resolved.contains("RDBL");
+        }
+    }
+
+    fn set_link_type(&mut self, link_field: &str, link_type: LinkType) {
+        if link_field == "DOL" {
+            self.dol_type = link_type;
         }
     }
 
@@ -1323,6 +1333,7 @@ mod tests {
         let mut rec = MotorRecord::new();
         rec.links.omsl = 1; // menuOmsl: closed_loop
         rec.links.dol = "setpoint_src.VAL".into(); // resolves to a DB link
+        rec.set_link_type("DOL", LinkType::Db);
         assert!(rec.stat.dmov != 0, "record starts done");
         assert!(
             has_dol_read(&rec.pre_process_actions()),
@@ -1335,6 +1346,7 @@ mod tests {
         let mut rec = MotorRecord::new();
         rec.links.omsl = 0; // supervisory
         rec.links.dol = "setpoint_src.VAL".into();
+        rec.set_link_type("DOL", LinkType::Db);
         assert!(
             !has_dol_read(&rec.pre_process_actions()),
             "supervisory OMSL must not read DOL"
@@ -1350,6 +1362,7 @@ mod tests {
         let mut rec = MotorRecord::new();
         rec.links.omsl = 1; // closed_loop
         rec.links.dol = "setpoint_src.VAL".into();
+        rec.set_link_type("DOL", LinkType::Db);
         assert!(rec.stat.dmov != 0, "record starts done");
         let mut common = CommonFields::default();
 
@@ -1466,6 +1479,7 @@ mod tests {
         let mut rec = MotorRecord::new();
         rec.links.omsl = 1; // closed_loop
         rec.links.dol = "setpoint_src.VAL".into(); // DB_LINK
+        rec.set_link_type("DOL", LinkType::Db);
         let status = asyn_rs::interfaces::motor::MotorStatus {
             position: 0.0,
             encoder_position: 0.0,
@@ -1502,6 +1516,7 @@ mod tests {
         let mut rec = MotorRecord::new();
         rec.links.omsl = 1;
         rec.links.dol = "setpoint_src.VAL".into();
+        rec.set_link_type("DOL", LinkType::Db);
         rec.stat.dmov = 0; // a move is in flight
         assert!(
             !has_dol_read(&rec.pre_process_actions()),

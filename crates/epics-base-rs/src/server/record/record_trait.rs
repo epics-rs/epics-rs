@@ -7377,6 +7377,18 @@ pub trait Record: RecordAny + Send + Sync + 'static {
         let _ = (link_field, target);
     }
 
+    /// C `plink->type` of a link field the framework keeps a parse of, given
+    /// at construction and again after every write of that parse: a put, the
+    /// `iocInit` locality pass that turns a name no record here serves into a
+    /// CA link, a `dbRemoveLink`. A record that branches on the type of a link
+    /// it never reads itself (motor's `dol.type == DB_LINK`) keeps this, since
+    /// its own text cannot say whether the name was found.
+    ///
+    /// Default: no-op.
+    fn set_link_type(&mut self, link_field: &str, link_type: LinkType) {
+        let _ = (link_field, link_type);
+    }
+
     /// The `dbrType` this record's framework-run input read on `link_field`
     /// asks the SOURCE for — the READ twin of [`Self::typed_output_buffer`],
     /// and C's `dbGetLink` second argument. Consulted by every framework

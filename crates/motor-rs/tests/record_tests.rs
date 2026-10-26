@@ -1,4 +1,5 @@
 use epics_base_rs::server::record::FieldDeclaration;
+use epics_base_rs::server::record::LinkType;
 use epics_base_rs::server::record::Record;
 use epics_base_rs::types::EpicsValue;
 use motor_rs::MotorRecord;
@@ -2954,6 +2955,7 @@ fn test_closed_loop_button_put_fires_implicit_get_info() {
     rec.set_device_state(motor_rs::device_state::new_shared_state());
     rec.links.omsl = 1;
     rec.links.dol = "setpoint_src.VAL".into();
+    rec.set_link_type("DOL", LinkType::Db);
 
     rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
     let effects = rec.plan_motion(CommandSource::Jogf);
@@ -6287,6 +6289,7 @@ fn test_closed_loop_db_dol_suppresses_button_dispatch() {
     let mut rec = MotorRecord::new();
     rec.links.omsl = 1;
     rec.links.dol = "setpoint_src.VAL".into();
+    rec.set_link_type("DOL", LinkType::Db);
     rec.stat.msta = MstaFlags::DONE;
 
     rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
@@ -6328,6 +6331,7 @@ fn test_closed_loop_tweak_and_rlv_not_collected() {
     let mut rec = MotorRecord::new();
     rec.links.omsl = 1;
     rec.links.dol = "setpoint_src.VAL".into();
+    rec.set_link_type("DOL", LinkType::Db);
     rec.stat.msta = MstaFlags::DONE;
     rec.pos.val = 10.0;
     rec.pos.dval = 10.0;
@@ -6356,6 +6360,7 @@ fn test_closed_loop_rval_put_is_raw_struct_write() {
     let mut rec = MotorRecord::new();
     rec.links.omsl = 1;
     rec.links.dol = "setpoint_src.VAL".into();
+    rec.set_link_type("DOL", LinkType::Db);
     rec.conv.mres = 0.01;
     rec.pos.val = 10.0;
     rec.pos.dval = 10.0;
@@ -6386,6 +6391,7 @@ fn test_closed_loop_latent_tweak_skipped_on_val_pass() {
     let mut rec = MotorRecord::new();
     rec.links.omsl = 1;
     rec.links.dol = "setpoint_src.VAL".into();
+    rec.set_link_type("DOL", LinkType::Db);
     rec.stat.msta = MstaFlags::DONE;
     rec.ctrl.twv = 1.0;
     rec.ctrl.twf = 1; // latched before the DOL pass
@@ -6410,6 +6416,7 @@ fn test_latent_jog_fires_on_no_event_pass_after_omsl_flip() {
     rec.internal.init_invariants_synced = true;
     rec.links.omsl = 1;
     rec.links.dol = "setpoint_src.VAL".into();
+    rec.set_link_type("DOL", LinkType::Db);
     rec.stat.msta = MstaFlags::DONE;
 
     rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
@@ -6436,6 +6443,7 @@ fn test_latent_tweak_folds_and_moves_after_omsl_flip() {
     let mut rec = MotorRecord::new();
     rec.links.omsl = 1;
     rec.links.dol = "setpoint_src.VAL".into();
+    rec.set_link_type("DOL", LinkType::Db);
     rec.conv.mres = 0.01;
     rec.stat.msta = MstaFlags::DONE;
     rec.pos.val = 10.0;
@@ -6562,6 +6570,7 @@ fn test_sync_pv_resyncs_under_closed_loop() {
     let mut rec = MotorRecord::new();
     rec.links.omsl = 1;
     rec.links.dol = "setpoint_src.VAL".into();
+    rec.set_link_type("DOL", LinkType::Db);
     rec.conv.mres = 0.01;
     rec.pos.drbv = 25.0;
     rec.pos.rbv = 25.0;

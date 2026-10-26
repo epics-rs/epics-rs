@@ -1210,13 +1210,25 @@ impl AsyncDbHandle {
     /// Resolve a link's target field type for the sseq link-status
     /// diagnostics — see `PvDatabase::link_target_field_type`. `None` if
     /// the link is constant / external / unresolvable, or the database is
-    /// gone. (Distinct from the free `server::record::link_field_type`,
-    /// which returns the link *class* `LinkType`, not the target's type.)
+    /// gone.
     pub fn link_target_field_type(&self, link: impl AsRef<[u8]>) -> Option<crate::types::DbfCode> {
         match self.db() {
             Some(db) => db.link_target_field_type(link.as_ref()),
             None => None,
         }
+    }
+
+    /// The `plink->type` `dbInitLink` gives `link` in this IOC as it stands:
+    /// [`ParsedLink::link_type_after_init`](crate::server::record::ParsedLink::link_type_after_init)
+    /// of the link `relink` leaves. `None` if the database is gone.
+    pub fn link_type_after_init(
+        &self,
+        link: impl AsRef<[u8]>,
+    ) -> Option<crate::server::record::LinkType> {
+        let db = self.db()?;
+        let parsed = crate::server::record::parse_link_v2(link.as_ref());
+        let parsed = db.db_init_link_locality(parsed, crate::server::record::LinkFieldType::In);
+        Some(parsed.link_type())
     }
 
     /// [`Self::link_target_field_type`] of a link already parsed for its field.
@@ -5990,8 +6002,14 @@ impl PvDatabase {
         // post monitors and fire the forward link, every cycle, with no alarm.
         let mut pre_input_resolved: Vec<&'static str> = Vec::new();
         {
+            // A `ResolveOutTarget` goes with the reads: epid's TRIG type is one
+            // of the things the gate after them decides on.
             let is_read = |a: &crate::server::record::ProcessAction| {
-                matches!(a, crate::server::record::ProcessAction::ReadDbLink { .. })
+                matches!(
+                    a,
+                    crate::server::record::ProcessAction::ReadDbLink { .. }
+                        | crate::server::record::ProcessAction::ResolveOutTarget { .. }
+                )
             };
             let mut pre_input_actions = pre_input_actions;
             if plan
@@ -11980,7 +11998,8 @@ impl PvDatabase {
                 );
                 SimRead::Siol {
                     fetch,
-                    db_link: matches!(*siol, crate::server::record::ParsedLink::Db(_)),
+                    db_link: siol.link_type_after_init()
+                        == crate::server::record::DbLinkType::DbLink,
                 }
             }
         }

@@ -766,7 +766,7 @@ async fn install_registers_ca_scheme() {
 #[test]
 fn ca_modifier_link_classifies_as_ca() {
     assert_eq!(
-        epics_base_rs::server::record::link_field_type("REMOTE:PV.VAL CA"),
+        epics_base_rs::server::record::parse_link_v2("REMOTE:PV.VAL CA").link_type(),
         LinkType::Ca,
     );
 }

@@ -7,8 +7,8 @@ use epics_base_rs::server::device_support::Dpvt;
 use epics_base_rs::server::recgbl::{self, alarm_status};
 use epics_base_rs::server::record::{
     AlarmSeverity, CommonFields, CycleCell, CycleHooks, CycleMarks, CyclePostMask, CycleRead,
-    CycleValue, FieldDesc, FieldMetadataOverride, LinkType, ProcessAction, ProcessActions,
-    ProcessContext, ProcessOutcome, Record, link_field_type,
+    CycleValue, FieldDesc, FieldMetadataOverride, LinkType, OutTarget, ProcessAction,
+    ProcessActions, ProcessContext, ProcessOutcome, Record, parse_link_v2, parse_output_link_v2,
 };
 use epics_base_rs::types::{EpicsValue, PvString};
 
@@ -269,6 +269,10 @@ pub struct EpidRecord {
     /// trigger is in flight is `Dpvt::Triggered`, which a device-link put
     /// replaces as C's clears `pact`.
     trigger_pass: bool,
+    /// TRIG's `plink->type` after `dbInitLink`, handed in by this cycle's
+    /// `ResolveOutTarget`: only the stored link knows a DB name this IOC
+    /// does not serve is a `CA_LINK`.
+    trig_type: LinkType,
 }
 
 impl Default for EpidRecord {
@@ -338,6 +342,7 @@ impl Default for EpidRecord {
             outl_seed: None,
             udf_cleared: false,
             trigger_pass: false,
+            trig_type: LinkType::Constant,
         }
     }
 }
@@ -575,12 +580,7 @@ impl Record for EpidRecord {
         // behind must not be mistaken for this cycle's OUTL value.
         self.outl_seed = None;
         let edge = self.fbon != 0 && self.fbop == 0;
-        if edge
-            && !matches!(
-                link_field_type(&self.outl),
-                LinkType::Constant | LinkType::Empty
-            )
-        {
+        if edge && !parse_output_link_v2(&self.outl).is_constant_type() {
             return ProcessActions::from(vec![ProcessAction::ReadDbLink {
                 link_field: "OUTL",
                 target_field: OUTL_SEED_FIELD,
@@ -1230,14 +1230,18 @@ impl Record for EpidRecord {
             self.gate = Some(true);
             return ProcessActions::new();
         }
+        let mut actions = Vec::new();
         // C `epidRecord.c:190`, ahead of the gate it decides.
         if self.smsl == 1 {
-            return ProcessActions::from(vec![ProcessAction::ReadDbLink {
+            actions.push(ProcessAction::ReadDbLink {
                 link_field: "STPL",
                 target_field: "VAL",
-            }]);
+            });
         }
-        ProcessActions::new()
+        if self.is_async_callback_dtyp() {
+            actions.push(ProcessAction::ResolveOutTarget { link_field: "TRIG" });
+        }
+        actions.into()
     }
 
     fn cycle_hooks(&self) -> CycleHooks {
@@ -1264,11 +1268,7 @@ impl Record for EpidRecord {
             link_field: "TRIG",
             value: EpicsValue::Double(self.tval),
         };
-        Some(match link_field_type(&self.trig) {
-            // C `ptriglink->type != CA_LINK` (`devEpidSoftCallback.c:117`),
-            // a PV Access link's `JSON_LINK` too: `dbPutLink`, and the PID
-            // runs in this pass.
-            LinkType::Db | LinkType::Json => ProcessActions::from(vec![write]),
+        Some(match self.trig_type {
             LinkType::Ca => {
                 *dpvt = Dpvt::Triggered;
                 self.trigger_pass = true;
@@ -1279,8 +1279,17 @@ impl Record for EpidRecord {
             }
             // C `ptriglink->type` is CONSTANT/empty: `dbPutLink` to a
             // constant link is a no-op, and the PID runs in this pass.
-            LinkType::Constant | LinkType::Empty | LinkType::Other => ProcessActions::new(),
+            LinkType::Constant => ProcessActions::new(),
+            // C `ptriglink->type != CA_LINK` (`devEpidSoftCallback.c:117`):
+            // `dbPutLink`, and the PID runs in this pass.
+            LinkType::Db | LinkType::Json | LinkType::Other => ProcessActions::from(vec![write]),
         })
+    }
+
+    fn set_resolved_out_target(&mut self, link_field: &str, target: OutTarget) {
+        if link_field == "TRIG" {
+            self.trig_type = target.link_type;
+        }
     }
 
     /// C `epidRecord.c:160-164` `init_record`: when `STPL` is a
@@ -1294,8 +1303,10 @@ impl Record for EpidRecord {
     /// here matters for the supervisory (`SMSL=0`) case and for the
     /// first cycle before any process.
     fn post_init_finalize_undef(&mut self, udf: &mut u8) -> CaResult<()> {
-        let parsed = epics_base_rs::server::record::parse_link_v2(&self.stpl);
-        if parsed.link_type() == LinkType::Constant {
+        // `epidRecord.c:161` tests `type == CONSTANT` at pass 1, after
+        // `dbInitLink`, which leaves CONSTANT as it found it.
+        let parsed = parse_link_v2(&self.stpl);
+        if parsed.is_constant_type() {
             if let Some(EpicsValue::Double(v)) = parsed.constant_value() {
                 self.val = v;
                 *udf = 0;

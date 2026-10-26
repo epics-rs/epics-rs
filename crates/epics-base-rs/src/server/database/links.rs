@@ -2392,11 +2392,11 @@ impl PvDatabase {
                 continue;
             };
             let mut locked = false;
-            for (field, raw, ftype) in Self::link_field_texts(&inst) {
+            for (field, _, _) in Self::link_field_texts(&inst) {
                 let Some(link) = inst.stored_link_shared(&field).cloned() else {
                     continue;
                 };
-                match link.link_type_after_init(&raw, ftype) {
+                match link.link_type_after_init() {
                     DbLinkType::CaLink | DbLinkType::JsonLink => {}
                     DbLinkType::DbLink if isolated => {}
                     _ => continue,
@@ -4025,9 +4025,9 @@ impl PvDatabase {
     ///   IOC, or a PV Access link) — `dbCaGetLinkDBFtype` / `dbCaGetNelements`
     ///   (`dbCa.c:633-675`, both `-1` while disconnected): the lset's cached
     ///   [`LinkMetadata`](super::LinkMetadata), `UNRESOLVED` when the link is
-    ///   down. Only the first two are C `CA_LINK`s; a PV Access link is a
-    ///   `JSON_LINK` ([`ParsedLink::link_type`](crate::server::record::ParsedLink::link_type)),
-    ///   which C's own type switches send to their `default:` arm.
+    ///   down. The type is [`ParsedLink::link_type`](crate::server::record::ParsedLink::link_type):
+    ///   a braced `{pva:…}` or `{ca:…}` is a `JSON_LINK`, which C's own type
+    ///   switches send to their `default:` arm.
     ///
     /// `no_elements` is a field CAPACITY, which the port does not carry per
     /// field: an array field reports its record's `NELM` when it has one and
@@ -4126,11 +4126,7 @@ impl PvDatabase {
             // Constant / Hw / Calc / None / Removed: no target. The type is
             // the one the link holds — a removed DB link's is `PV_LINK`.
             _ => OutTarget {
-                link_type: match link.db_link_type() {
-                    crate::server::record::DbLinkType::Constant => LinkType::Constant,
-                    crate::server::record::DbLinkType::JsonLink => LinkType::Json,
-                    _ => LinkType::Other,
-                },
+                link_type: link.link_type(),
                 ..OutTarget::UNRESOLVED
             },
         }
@@ -5417,6 +5413,7 @@ impl PvDatabase {
                 pv: db.pvname().clone(),
                 monitor_switch: db.monitor_switch,
                 policy: db.policy,
+                json: false,
             },
         ))
     }
@@ -5601,7 +5598,7 @@ impl PvDatabase {
                 let parsed = crate::server::record::parse_link_field(&text, ftype);
                 let unserviceable = parsed.required_link_set_scheme();
                 let was_db = matches!(parsed, ParsedLink::Db(_));
-                let json = matches!(parsed, ParsedLink::PvaJson(_));
+                let json = parsed.db_link_type() == crate::server::record::DbLinkType::JsonLink;
                 // `dbDbInitLink`'s `dbChannelCreate` line; a put printed its
                 // own in `dbPutFieldLink`, which `dbAddLink` reuses.
                 if let ParsedLink::Db(db) = &parsed

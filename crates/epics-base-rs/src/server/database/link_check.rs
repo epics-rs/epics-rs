@@ -5,7 +5,7 @@
 use std::time::Duration;
 
 use super::PvDatabase;
-use crate::server::record::{ParsedLink, RecordInstance};
+use crate::server::record::{DbLinkType, RecordInstance};
 use crate::server::records::link_status::{
     DBF_UNKNOWN, LINK_CON, LINK_EXT_NC, LINK_EXT_OK, LINK_LOC, LINK_RECHECK, dbf_static_code,
     link_is_external,
@@ -37,7 +37,7 @@ impl PvDatabase {
             let Some(parsed) = instance.stored_link(link) else {
                 continue;
             };
-            if matches!(parsed, ParsedLink::Db(_)) {
+            if parsed.link_type_after_init() == DbLinkType::DbLink {
                 db_links |= 1 << i;
             }
             // sseq reads every named link's `dbGetLinkDBFtype`

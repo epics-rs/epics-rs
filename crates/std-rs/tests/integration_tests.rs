@@ -1381,6 +1381,14 @@ async fn a_device_link_put_drops_the_trigger_in_flight() {
                 tpro: 0,
             });
         inst.record.pre_input_link_actions(false, &mut inst.dpvt);
+        // What the cycle's `ResolveOutTarget` stores for the CA TRIG.
+        inst.record.set_resolved_out_target(
+            "TRIG",
+            epics_base_rs::server::record::OutTarget {
+                link_type: epics_base_rs::server::record::LinkType::Ca,
+                ..epics_base_rs::server::record::OutTarget::UNRESOLVED
+            },
+        );
         let writes = inst
             .record
             .gate_after_pre_input_reads(&[], &mut inst.dpvt)
@@ -1393,6 +1401,65 @@ async fn a_device_link_put_drops_the_trigger_in_flight() {
         .await
         .unwrap();
     assert!(matches!(rec.read().dpvt, Dpvt::Null));
+}
+
+/// A TRIG naming no record of this IOC is a `CA_LINK` after `dbInitLink`
+/// (`dbLink.c:76-110`), so `devEpidSoftCallback.c:117` takes the
+/// `dbCaPutLinkCallback` arm and the PID waits for the trigger.
+#[tokio::test]
+async fn a_trig_naming_no_local_record_is_waited_on() {
+    use epics_base_rs::server::device_support::Dpvt;
+    let db_str = r#"
+record(ai, "CV") { field(VAL, "1") }
+record(epid, "E") {
+    field(DTYP, "Async Soft Channel")
+    field(INP, "CV")
+    field(TRIG, "REMOTE:READBACK")
+    field(UDF, "0")
+}
+"#;
+    let (name, factory) = std_rs::epid_record_factory();
+    let (db, _) = epics_base_rs::server::ioc_builder::IocBuilder::new()
+        .register_record_type(name, factory)
+        .db_string(db_str, &HashMap::new())
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    db.put_record_field_from_ca("E", "PROC", EpicsValue::Char(1))
+        .await
+        .unwrap();
+    let rec = db.get_record("E").unwrap();
+    assert!(matches!(rec.read().dpvt, Dpvt::Triggered));
+}
+
+async fn epid_db(db_str: &str) -> std::sync::Arc<epics_base_rs::server::database::PvDatabase> {
+    let (name, factory) = std_rs::epid_record_factory();
+    let (db, _) = epics_base_rs::server::ioc_builder::IocBuilder::new()
+        .register_record_type(name, factory)
+        .db_string(db_str, &HashMap::new())
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    db
+}
+
+/// `{const:3}` is a `JSON_LINK`, not the `CONSTANT` of `devEpidSoft.c:110`,
+/// so no SOFT alarm is raised; its `dbGetLink` reads nothing
+/// (`lnkConst.c:553-559`), leaving `CVAL` 0.
+#[tokio::test]
+async fn a_json_const_inp_raises_no_soft_alarm() {
+    let db = epid_db(
+        r#"record(epid, "E") { field(DTYP, "Soft Channel") field(INP, "{const:3}") field(UDF, "0") }"#,
+    )
+    .await;
+    db.put_record_field_from_ca("E", "PROC", EpicsValue::Char(1))
+        .await
+        .unwrap();
+    assert_eq!(db.get_pv("E.CVAL").unwrap().to_f64(), Some(0.0));
+    assert_eq!(db.get_pv("E.SEVR").unwrap().to_f64(), Some(0.0));
+    assert_eq!(db.get_pv("E.STAT").unwrap().to_f64(), Some(0.0));
 }
 
 // ============================================================

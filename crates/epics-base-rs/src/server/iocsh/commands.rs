@@ -1948,7 +1948,7 @@ fn render_dbpr_link(
         crate::server::record::parse_link_field(raw.as_bytes(), ftype),
         ftype,
     );
-    let link_type = parsed.link_type_after_init(raw.as_bytes(), ftype).c_name();
+    let link_type = parsed.link_type_after_init().c_name();
     [link_type.as_bytes(), b" ", rendered].concat()
 }
 

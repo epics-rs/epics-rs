@@ -13,7 +13,6 @@ use std::cell::Cell;
 use std::sync::Arc;
 
 use crate::server::database::{AsyncDbHandle, PostItem, PostRule};
-use crate::server::record::LinkType;
 use crate::types::{DbFieldType, EpicsValue, PvString};
 
 /// Generation gate for spawned async link-status refreshes, one generation
@@ -301,7 +300,7 @@ impl LinkRule {
         match self {
             Self::Volatile => link.external().is_some(),
             Self::Locality | Self::DbLink => {
-                matches!(link, crate::server::record::ParsedLink::Ca(_))
+                link.link_type_after_init() == crate::server::record::DbLinkType::CaLink
             }
         }
     }
@@ -386,7 +385,11 @@ pub fn classify_link(
         LinkRole::Output => LinkFieldType::Out,
     };
     let parsed = parse_link_field(link.as_ref(), ftype);
-    if matches!(parsed.link_type(), LinkType::Empty | LinkType::Constant) {
+    // Base calcout asks `dbLinkIsConstant`; synApps and sseq ask
+    // `type == CONSTANT` and send a `{const:…}` JSON link to `dbNameToAddr`
+    // of its `pv_link.pvname`, a union member a JSON link never set. That C
+    // defect is not copied: a constant lset is constant.
+    if crate::server::recgbl::simm::is_constant(&parsed) {
         return (LINK_CON, DBF_UNKNOWN);
     }
     // Base calcout asks the lset (`dbLink.c:220-235`): a hardware link has

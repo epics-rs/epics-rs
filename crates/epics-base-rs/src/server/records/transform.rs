@@ -397,21 +397,6 @@ impl TransformRecord {
         None
     }
 
-    /// C's link classification, `plink->type == CONSTANT` — the ONE test every
-    /// one of this record's three link decisions is written in:
-    /// `no_inlink` (`transformRecord.c:571`), "has an input link" (`:535`),
-    /// "has an output link" (`:606`).
-    ///
-    /// A link field is CONSTANT when it is EMPTY *or* holds a literal number:
-    /// dbStatic gives `field(INPA,"5")` the type CONSTANT, not PV_LINK. Reading
-    /// the stored text's EMPTINESS instead (what the port did at all three
-    /// sites) makes a constant-seeded channel look link-driven — and in the
-    /// default Conditional mode its CLCx was then never evaluated at all:
-    /// `field(INPA,"2")` + `field(CLCA,"A+1")` sat at 2 forever.
-    fn link_is_constant(parsed: &ParsedLink) -> bool {
-        matches!(parsed, ParsedLink::None | ParsedLink::Constant(_))
-    }
-
     /// C's `no_inlink` (`transformRecord.c:571`).
     fn no_inlink(&self, i: usize) -> bool {
         self.inp_linked & 1 << i == 0
@@ -423,9 +408,21 @@ impl TransformRecord {
         self.out_linked & 1 << i == 0
     }
 
-    /// The bit `i` of `mask` [`Self::no_inlink`]/[`Self::no_outlink`] read.
+    /// The bit `i` of `mask` [`Self::no_inlink`]/[`Self::no_outlink`] read:
+    /// C's `plink->type == CONSTANT`, the one test every one of this record's
+    /// three link decisions is written in: `no_inlink`
+    /// (`transformRecord.c:571`), "has an input link" (`:535`), "has an
+    /// output link" (`:606`).
+    ///
+    /// A link field is CONSTANT when it is EMPTY *or* holds a literal number:
+    /// dbStatic gives `field(INPA,"5")` the type CONSTANT, not PV_LINK. Reading
+    /// the stored text's EMPTINESS instead (what the port did at all three
+    /// sites) makes a constant-seeded channel look link-driven — and in the
+    /// default Conditional mode its CLCx was then never evaluated at all:
+    /// `field(INPA,"2")` + `field(CLCA,"A+1")` sat at 2 forever. A
+    /// `{const:…}` link is a `JSON_LINK`, so it counts as a link.
     fn set_linked(mask: &mut u16, i: usize, parsed: &ParsedLink) {
-        if Self::link_is_constant(parsed) {
+        if parsed.is_constant_type() {
             *mask &= !(1 << i);
         } else {
             *mask |= 1 << i;

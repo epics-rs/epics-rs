@@ -19,7 +19,7 @@
 //!     and must land in `'A' ..< 'A' + CALCPERFORM_NARGS`.
 
 use epics_base_rs::calc::CALC_NARGS;
-use epics_base_rs::server::record::{CalcArg, ParsedLink, parse_link_v2};
+use epics_base_rs::server::record::{CalcArg, ParsedLink, PvaChannelLink, parse_link_v2};
 
 fn calc_of(text: &str) -> epics_base_rs::server::record::CalcLink {
     match parse_link_v2(text) {
@@ -77,7 +77,7 @@ fn an_embedded_link_arg_parses_beside_a_literal() {
     assert_eq!(
         calc.args,
         vec![
-            CalcArg::Link(Box::new(ParsedLink::Pva("record".into()))),
+            CalcArg::Link(Box::new(ParsedLink::Pva(PvaChannelLink::json("record")))),
             CalcArg::Literal(1.5),
         ]
     );

@@ -194,7 +194,7 @@ impl LinkKind {
         match target.link_type {
             LinkType::Ca if target.field_type.is_some() => LinkKind::CaConnected,
             LinkType::Ca => LinkKind::CaDisconnected,
-            LinkType::Constant | LinkType::Empty => LinkKind::Constant,
+            LinkType::Constant => LinkKind::Constant,
             LinkType::Db | LinkType::Json | LinkType::Other => LinkKind::Db,
         }
     }
@@ -2418,9 +2418,9 @@ impl TableRecord {
     /// with `dbInitLink` done and no CA channel connected yet. The port runs
     /// `init_record` at record CREATION instead, so only records already
     /// loaded are addressable here; a motor loaded after the table classifies
-    /// `Constant` until the first `process()` resolves it properly. `Constant`
-    /// and `CaDisconnected` are indistinguishable in every arm of C's test, so
-    /// collapsing the unaddressable cases into `Constant` costs nothing.
+    /// `CaDisconnected` until the first `process()` resolves it properly,
+    /// which every arm of C's test treats as `Constant`. A JSON link is
+    /// neither `CONSTANT` nor `CA_LINK`, so C counts it usable.
     fn seed_link_kinds(&mut self) {
         let Some((_, handle)) = &self.async_ctx else {
             return;
@@ -2431,10 +2431,11 @@ impl TableRecord {
                     Some(EpicsValue::String(s)) => s.as_str_lossy().into_owned(),
                     _ => String::new(),
                 };
-                self.link_kinds[group][axis] = if handle.link_target_field_type(&link).is_some() {
-                    LinkKind::Db
-                } else {
-                    LinkKind::Constant
+                self.link_kinds[group][axis] = match handle.link_type_after_init(&link) {
+                    // No CA channel is connected yet at `iocInit`.
+                    Some(LinkType::Ca) => LinkKind::CaDisconnected,
+                    Some(LinkType::Constant) | None => LinkKind::Constant,
+                    Some(LinkType::Db | LinkType::Json | LinkType::Other) => LinkKind::Db,
                 };
             }
         }

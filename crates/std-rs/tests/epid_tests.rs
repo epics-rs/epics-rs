@@ -737,7 +737,6 @@ fn test_multi_output_links_gated_on_fbon_and_compute() {
     // CONSTANT INP → C `:110-112` returns before the OUTL write.
     let mut konst = EpidRecord::default();
     konst.inp = "5.0".into();
-    assert_eq!(link_field_type(&konst.inp), LinkType::Constant);
     konst.fbon = 1;
     konst.fbop = 1;
     konst.drvh = 200.0;
@@ -1193,17 +1192,31 @@ fn test_fast_set_output_port_wires_reader_from_asyn_port() {
 
 use epics_base_rs::server::device_support::DeviceSupport;
 use epics_base_rs::server::device_support::Dpvt;
-use epics_base_rs::server::record::{LinkType, ProcessAction, link_field_type};
+use epics_base_rs::server::record::{OutTarget, ProcessAction, parse_link_v2};
 use std_rs::device_support::epid_soft_callback::EpidSoftCallbackDeviceSupport;
 
 /// The pre-input stage as the cycle runs it: the record's reads, then the
-/// gate's writes, with `resolved` the reads that succeeded.
+/// gate's writes, with `resolved` the reads that succeeded. TRIG's
+/// `ResolveOutTarget` hands back the type its text parses to, which is the
+/// IOC's when a DB name is served locally.
 fn pre_input(
     rec: &mut EpidRecord,
     dpvt: &mut Dpvt,
     resolved: &[&'static str],
 ) -> epics_base_rs::server::record::ProcessActions {
-    let mut actions = rec.pre_input_link_actions(true, dpvt);
+    let mut actions = epics_base_rs::server::record::ProcessActions::new();
+    for a in rec.pre_input_link_actions(true, dpvt).into_vec() {
+        match a {
+            ProcessAction::ResolveOutTarget { link_field: "TRIG" } => {
+                let target = OutTarget {
+                    link_type: parse_link_v2(&rec.trig).link_type(),
+                    ..OutTarget::UNRESOLVED
+                };
+                rec.set_resolved_out_target("TRIG", target);
+            }
+            a => actions.push(a),
+        }
+    }
     if let Some(writes) = rec.gate_after_pre_input_reads(resolved, dpvt) {
         for a in writes.into_vec() {
             actions.push(a);
@@ -1227,8 +1240,6 @@ fn test_constant_inp_raises_soft_alarm_and_skips_compute() {
     rec.fmod = 0;
     let oval_before = rec.oval;
 
-    assert_eq!(link_field_type(&rec.inp), LinkType::Constant);
-
     EpidSoftDeviceSupport::do_pid(&mut rec);
 
     // Compute skipped: OVAL unchanged, and the constant flag is set.
@@ -1250,7 +1261,6 @@ fn test_constant_inp_raises_soft_alarm_and_skips_compute() {
 fn test_db_inp_does_not_raise_soft_alarm() {
     let mut rec = EpidRecord::default();
     rec.inp = "OTHER:REC.VAL".into();
-    assert_eq!(link_field_type(&rec.inp), LinkType::Db);
     rec.kp = 2.0;
     rec.val = 100.0;
     rec.cval = 10.0;
@@ -1279,7 +1289,6 @@ fn test_db_trig_link_synchronous_fallthrough() {
     let mut rec = EpidRecord::default();
     let mut dpvt = Dpvt::Null;
     rec.trig = "READBACK:REC.VAL".into();
-    assert_eq!(link_field_type(&rec.trig), LinkType::Db);
     rec.kp = 1.0;
     rec.fbon = 1;
     rec.fbop = 1;
@@ -1327,7 +1336,6 @@ fn a_pva_trig_link_is_written_without_a_second_pass() {
     let mut rec = EpidRecord::default();
     let mut dpvt = Dpvt::Null;
     rec.trig = r#"{pva:"REMOTE:READBACK"}"#.into();
-    assert_eq!(link_field_type(&rec.trig), LinkType::Json);
     rec.kp = 1.0;
     rec.fbon = 1;
     rec.fbop = 1;
@@ -1364,7 +1372,6 @@ fn test_non_callback_dtyp_emits_no_trig_write() {
     let mut rec = EpidRecord::default();
     let mut dpvt = Dpvt::Null;
     rec.trig = "READBACK:REC.VAL".into();
-    assert_eq!(link_field_type(&rec.trig), LinkType::Db);
 
     rec.set_process_context(&ctx_with_dtyp("Soft Channel"));
     assert!(
@@ -1381,7 +1388,6 @@ fn test_ca_trig_link_deferred_second_pass() {
     let mut rec = EpidRecord::default();
     let mut dpvt = Dpvt::Null;
     rec.trig = "ca://REMOTE:READBACK".into();
-    assert_eq!(link_field_type(&rec.trig), LinkType::Ca);
     rec.kp = 1.0;
     rec.fbon = 1;
     rec.fbop = 1;
@@ -1486,7 +1492,6 @@ fn test_bumpless_edge_emits_outl_readback_for_db_link() {
 fn test_bumpless_edge_no_readback_for_constant_outl() {
     let mut rec = EpidRecord::default();
     rec.outl = "5.0".into(); // CONSTANT link
-    assert_eq!(link_field_type(&rec.outl), LinkType::Constant);
     rec.fmod = 0;
     rec.fbon = 1;
     rec.fbop = 0;
@@ -1499,12 +1504,11 @@ fn test_bumpless_edge_no_readback_for_constant_outl() {
 }
 
 /// Any `OUTL` that is not `CONSTANT` is read on the edge
-/// (`devEpidSoft.c:154`), a `JSON_LINK` such as a calc link included.
+/// (`devEpidSoft.c:154`), a `JSON_LINK` such as a state link included.
 #[test]
 fn test_bumpless_edge_reads_a_json_outl() {
     let mut rec = EpidRecord::default();
-    rec.outl = r#"{calc: {expr: "5"}}"#.into();
-    assert_eq!(link_field_type(&rec.outl), LinkType::Json);
+    rec.outl = r#"{state: "S"}"#.into();
     rec.fmod = 0;
     rec.fbon = 1;
     rec.fbop = 0;
@@ -1520,6 +1524,20 @@ fn test_bumpless_edge_reads_a_json_outl() {
         )),
         "a JSON OUTL is read on the edge, got {actions:?}"
     );
+}
+
+/// A calc link with no `out` key is refused in an output field
+/// (`lnkCalc.c:310-313`), so `OUTL` holds no `JSON_LINK` and is not read.
+#[test]
+fn test_bumpless_edge_skips_an_outl_calc_without_out() {
+    let mut rec = EpidRecord::default();
+    rec.outl = r#"{calc: {expr: "5"}}"#.into();
+    rec.fmod = 0;
+    rec.fbon = 1;
+    rec.fbop = 0;
+
+    let actions = rec.pre_process_actions();
+    assert!(actions.is_empty(), "got {actions:?}");
 }
 
 /// No edge (feedback steady ON) — no bumpless readback.
@@ -1752,7 +1770,6 @@ fn test_ca_trig_trigger_pass_returns_async_pending_tail_skipped() {
     let mut rec = EpidRecord::default();
     let mut dpvt = Dpvt::Null;
     rec.trig = "ca://REMOTE:READBACK".into();
-    assert_eq!(link_field_type(&rec.trig), LinkType::Ca);
     rec.kp = 1.0;
     rec.fbon = 1;
     rec.fbop = 1;
@@ -1923,7 +1940,6 @@ fn test_bumpless_seed_is_gated_by_mdt() {
 fn test_maxmin_bumpless_edge_no_readback_for_constant_outl() {
     let mut rec = EpidRecord::default();
     rec.outl = "5.0".into(); // CONSTANT link
-    assert_eq!(link_field_type(&rec.outl), LinkType::Constant);
     rec.fmod = 1; // MaxMin
     rec.fbon = 1;
     rec.fbop = 0; // OFF -> ON edge

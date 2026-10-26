@@ -956,11 +956,7 @@ fn special_after_put(
         // hold; a refcount, not a parse.
         let link = std::sync::Arc::clone(instance.record_link(field));
         crate::server::record::reseed_constant_input_link(&mut *instance.record, field, &link);
-        let constant = matches!(
-            link.link_type(),
-            crate::server::record::LinkType::Empty | crate::server::record::LinkType::Constant
-        );
-        if constant {
+        if crate::server::recgbl::simm::is_constant(&link) {
             // The mask is the C call site's, and they disagree — calcout posts
             // a literal DBE_VALUE, transform DBE_VALUE|DBE_LOG. The record
             // carries it.

@@ -4,8 +4,8 @@ use epics_base_rs::server::database::AsyncDbHandle;
 use epics_base_rs::server::recgbl::EventMask;
 use epics_base_rs::server::record::{
     CycleHooks, CycleMarks, CyclePostMask, FieldDesc, FieldMetadataOverride, InputLinkRequest,
-    LinkRead, LinkReadAs, LinkType, ProcessAction, ProcessActions, ProcessOutcome, Record,
-    link_field_type,
+    LinkRead, LinkReadAs, ProcessAction, ProcessActions, ProcessOutcome, Record,
+    parse_output_link_v2,
 };
 use epics_base_rs::server::records::link_status::{
     LINK_EXT_NC, LinkCheck, LinkCheckSpec, LinkCheckState, LinkRole, LinkRule, LinkStatusGen,
@@ -397,8 +397,7 @@ impl ThrottleRecord {
         // and SENT out of ITS result (:565-575), which the port learns in
         // `set_out_link_write_status`; C fires the forward link on the whole
         // non-CONSTANT arm, success or not (:580).
-        let out_type = link_field_type(&self.out);
-        if out_type == LinkType::Constant || out_type == LinkType::Empty {
+        if parse_output_link_v2(&self.out).is_constant_type() {
             self.sts = THROTTLE_STS_ERR;
             self.out_written = false;
             self.value_put_done();

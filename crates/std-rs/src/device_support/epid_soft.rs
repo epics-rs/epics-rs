@@ -59,9 +59,7 @@ impl EpidSoftDeviceSupport {
         // record is flagged SOFT/INVALID. The framework `check_alarms`
         // hook raises the severity from this flag. C's CONSTANT includes
         // an empty INP (`dbStaticLib.c:2346-2349`).
-        if epics_base_rs::server::record::parse_link_v2(&epid.inp).db_link_type()
-            == epics_base_rs::server::record::DbLinkType::Constant
-        {
+        if epics_base_rs::server::record::parse_link_v2(&epid.inp).is_constant_type() {
             epid.inp_constant = true;
             return;
         }

@@ -48,8 +48,8 @@ pub use link::{
     LinkFieldType, LinkProcessPolicy, LinkType, LsLoad, MonitorSwitch, OpenLatch,
     PVAJSON_IDENTITY_SEP, ParsedLink, PvaChannelLink, PvaJsonLink, StateLink, StatePut, StateVal,
     VxiAddr, ca_forward_flag, check_json_link_text, check_link_assignment, check_link_text,
-    declared_link_type, link_field_type, link_type_refusal, load_link_ls, out_link_discards_cp,
-    parse_c_double, parse_forward_link_v2, parse_link_field, parse_link_v2, parse_output_link_v2,
+    declared_link_type, link_type_refusal, load_link_ls, out_link_discards_cp, parse_c_double,
+    parse_forward_link_v2, parse_link_field, parse_link_v2, parse_output_link_v2,
     pvajson_identity_key, pvajson_identity_parts,
 };
 pub(crate) use link::{

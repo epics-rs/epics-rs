@@ -3,6 +3,8 @@
 //! by their C types (C11 6.3.1.8's usual arithmetic conversions); here
 //! rustc picks the same common type from their Rust types, so a `double`
 //! member times a `long` is a `double` product, not a truncated `long`.
+//! `?:` and the comparisons take two operands of one type as they are,
+//! since C also takes two structs or pointers there ([`Pair`]).
 //! Integer types are LP64's, as [`crate::types`] maps them.
 
 use std::ops::{Add, BitAnd, BitOr, BitXor, Mul, Sub};
@@ -117,6 +119,50 @@ fn usual<A: Usual<B>, B>(a: A, b: B) -> (A::T, A::T) {
     (<A as Usual<B>>::left(a), A::right(b))
 }
 
+/// `Self` and `B` as C's `?:` and comparisons take them: two of one type
+/// as they are, which may be structs, unions or pointers, and two
+/// arithmetic types converted to their common type.
+pub trait Pair<B> {
+    type T;
+    fn left(self) -> Self::T;
+    fn right(b: B) -> Self::T;
+}
+
+// Promotion would not change a `?:` or comparison of one type.
+impl<A> Pair<A> for A {
+    type T = A;
+    fn left(self) -> A {
+        self
+    }
+    fn right(b: A) -> A {
+        b
+    }
+}
+
+macro_rules! pair {
+    ($a:ty $(, $b:ty)*) => {
+        $(
+            pair!(@ $a, $b);
+            pair!(@ $b, $a);
+        )*
+        pair!($($b),*);
+    };
+    (@ $a:ty, $b:ty) => {
+        impl Pair<$b> for $a {
+            type T = <$a as Usual<$b>>::T;
+            fn left(self) -> Self::T {
+                <$a as Usual<$b>>::left(self)
+            }
+            fn right(b: $b) -> Self::T {
+                <$a as Usual<$b>>::right(b)
+            }
+        }
+    };
+    () => {};
+}
+
+pair!(i8, u8, i16, u16, i32, u32, i64, u64, isize, usize, f32, f64);
+
 macro_rules! binary {
     ($($(#[$doc:meta])* $f:ident => $op:ident),* $(,)?) => {$(
         $(#[$doc])*
@@ -141,28 +187,30 @@ binary!(
 );
 
 macro_rules! compare {
-    ($($(#[$doc:meta])* $f:ident => $op:ident),* $(,)?) => {$(
+    ($($(#[$doc:meta])* $f:ident => $op:ident: $tr:ident),* $(,)?) => {$(
         $(#[$doc])*
-        pub fn $f<A: Usual<B>, B>(a: A, b: B) -> bool {
-            let (a, b) = usual(a, b);
-            a.$op(&b)
+        pub fn $f<A: Pair<B>, B>(a: A, b: B) -> bool
+        where
+            A::T: $tr,
+        {
+            <A as Pair<B>>::left(a).$op(&A::right(b))
         }
     )*};
 }
 
 compare!(
     /// C's `a == b`.
-    eq => eq,
+    eq => eq: PartialEq,
     /// C's `a != b`.
-    ne => ne,
+    ne => ne: PartialEq,
     /// C's `a < b`.
-    lt => lt,
+    lt => lt: PartialOrd,
     /// C's `a <= b`.
-    le => le,
+    le => le: PartialOrd,
     /// C's `a > b`.
-    gt => gt,
+    gt => gt: PartialOrd,
     /// C's `a >= b`.
-    ge => ge,
+    ge => ge: PartialOrd,
 );
 
 macro_rules! bitwise {
@@ -189,9 +237,9 @@ bitwise!(
 
 /// C's `c ? a : b`, which evaluates one of `a` and `b` and converts it to
 /// their common type.
-pub fn select<A: Usual<B>, B>(c: bool, a: impl FnOnce() -> A, b: impl FnOnce() -> B) -> A::T {
+pub fn select<A: Pair<B>, B>(c: bool, a: impl FnOnce() -> A, b: impl FnOnce() -> B) -> A::T {
     if c {
-        <A as Usual<B>>::left(a())
+        <A as Pair<B>>::left(a())
     } else {
         A::right(b())
     }
@@ -253,5 +301,17 @@ mod tests {
         );
         assert_eq!((v, a, b), (2.0, 1, 0));
         assert_eq!(select(false, || 2i32, || 0.5f64), 0.5);
+    }
+
+    #[test]
+    fn operands_of_one_type_select_and_compare_as_they_are() {
+        #[derive(Debug, PartialEq)]
+        struct S(&'static str);
+        assert_eq!(select(false, || S("a"), || S("b")), S("b"));
+        assert!(eq(S("a"), S("a")));
+        assert!(ne(S("a"), S("b")));
+        // the same result as promoted
+        assert!(lt(200u8, 255u8));
+        assert_eq!(select(true, || -1i8, || 0i8), -1i8);
     }
 }

@@ -88,8 +88,9 @@
 //!   type is emitted `as _`. An operator on a foreign value or member,
 //!   whose C type snc-rs does not know, is an [`arith`] call
 //!   (`seqg_rt::arith::mul(a, b)`), whose usual arithmetic conversions
-//!   rustc resolves from the operands' Rust types; with a `double` the
-//!   foreign operand is cast `as f64`. A C truth value is spelled out as `!= 0` or
+//!   rustc resolves from the operands' Rust types; `?:` and comparisons
+//!   take two of one type as they are, structs and pointers too. With a
+//!   `double` the foreign operand is cast `as f64`. A C truth value is spelled out as `!= 0` or
 //!   `== 0`. Source parentheses and empty statements are dropped.
 //! - Literals. A string literal is a `&str`, or `&b"..."[..]` when it is
 //!   not UTF-8.

@@ -2037,10 +2037,10 @@ impl<'a> Gen<'a> {
                     .find(|t| **t == void)
                     .or_else(|| [&a.ty, &b.ty].into_iter().find(|t| matches!(t, Ty::Ptr(_))))
                     .cloned();
-                // C takes an operand beside an arithmetic one to be
-                // arithmetic; two foreign ones go through as C copies them
-                let arith = |x: &Ty, y: &Ty| is_numeric(x) && (is_numeric(y) || *y == Ty::Foreign);
-                let (a, b, ty) = if arith(&a.ty, &b.ty) || arith(&b.ty, &a.ty) {
+                // seqg_rt::arith::select takes two foreign operands of one
+                // type, such as two structs, as they are
+                let arith = |t: &Ty| is_numeric(t) || *t == Ty::Foreign;
+                let (a, b, ty) = if arith(&a.ty) && arith(&b.ty) {
                     match operands(a, b) {
                         Operands::Known(a, b, ty) => (a, b, ty),
                         Operands::Unknown(a, b) => {
@@ -3067,8 +3067,8 @@ enum Operands {
     /// brought to their common type, which is the third
     Known(Expr, Expr, Ty),
     /// a foreign operand, whose C type snc-rs does not know, beside an
-    /// arithmetic one that is not a `double`: `seqg_rt::arith` converts
-    /// them by their Rust types
+    /// arithmetic one that is not a `double` or beside another foreign one:
+    /// `seqg_rt::arith` converts them by their Rust types
     Unknown(Expr, Expr),
 }
 
@@ -3104,11 +3104,10 @@ fn operands(a: Val, b: Val) -> Operands {
         // anything with a double is a double
         (Ty::Foreign, t) if double(t) => (a.e.cast("f64"), b.e, Ty::Num("f64".into())),
         (t, Ty::Foreign) if double(t) => (a.e, b.e.cast("f64"), Ty::Num("f64".into())),
-        (Ty::Foreign, t) | (t, Ty::Foreign) if is_numeric(t) => {
+        (Ty::Foreign, t) | (t, Ty::Foreign) if is_numeric(t) || *t == Ty::Foreign => {
             return Operands::Unknown(a.e, b.e);
         }
-        // as C copies them, such as two foreign operands, which may be
-        // structs or pointers
+        // as C copies them, such as a pointer beside a foreign operand
         _ => (a.e, b.e, Ty::Foreign),
     };
     Operands::Known(a, b, ty)
@@ -4127,27 +4126,44 @@ mod tests {
     }
 
     #[test]
-    fn two_operands_of_unknown_type_go_through_as_c_copies_them() {
-        // a struct is no arithmetic operand, nor is a pointer member
+    fn two_operands_of_unknown_type_go_by_their_rust_types() {
+        // seqg_rt::arith takes two structs or pointers as they are, and
+        // converts a double member beside an int one
         let (code, diag) = translate(
             "program p\n%%struct struct_t { int i; struct { double d; } s; };\n\
              %%union union_t { int i; struct struct_t *p; };\n\
-             struct struct_t s, s2, s3;\nunion union_t u, u2;\nint c;\nss a {\nstate s {\n\
-             when () {\ns3 = c ? s : s2;\nc = u.p == u2.p;\nc = s.i * u.i;\n} state s\n}\n}\n",
+             struct struct_t s, s2, s3;\nunion union_t u, u2;\nint c;\ndouble x;\nss a {\n\
+             state s {\nwhen () {\ns3 = c ? s : s2;\nc = u.p == u2.p;\ns.i *= 3;\n\
+             x = s.s.d * s.i;\ns.s.d *= s.i;\nc = s.s.d > s.i;\nx = c ? s.s.d : s.i;\n\
+             } state s\n}\n}\n",
         );
         assert_eq!(diag, "");
         let code = words(&code);
         let p = |u| format!("seqg_var.{u}.view(|v| v.p(), |v, x| v.set_p(x)).get()");
+        let i = "seqg_var.s.field(|v| &mut v.i)";
+        let d = "seqg_var.s.field(|v| &mut v.s).field(|v| &mut v.d)";
         for e in [
-            "seqg_var.s3.set( if seqg_var.c.get() != 0 { seqg_var.s.get() } \
-             else { seqg_var.s2.get() }, );"
+            "seqg_var.s3.set(seqg_rt::arith::select(seqg_var.c.get() != 0, \
+             || seqg_var.s.get(), || seqg_var.s2.get()));"
                 .into(),
-            format!("seqg_var.c.set(({} == {}) as i32);", p("u"), p("u2")),
-            "seqg_var.c.set((seqg_var.s.field(|v| &mut v.i).get() * \
-             seqg_var.u.view(|v| v.i(), |v, x| v.set_i(x)).get()) as _);"
-                .into(),
+            format!(
+                "seqg_var.c.set(seqg_rt::arith::eq({}, {}) as i32);",
+                p("u"),
+                p("u2")
+            ),
+            format!("{i}.modify(|v| *v = seqg_rt::arith::mul(*v, 3) as _);"),
+            format!("seqg_var.x.set(seqg_rt::arith::mul({d}.get(), {i}.get()) as _);"),
+            format!(
+                "let seqg_rhs = {i}.get(); \
+                 {d}.modify(|v| *v = seqg_rt::arith::mul(*v, seqg_rhs) as _);"
+            ),
+            format!("seqg_var.c.set(seqg_rt::arith::gt({d}.get(), {i}.get()) as i32);"),
+            format!(
+                "seqg_var.x.set(seqg_rt::arith::select(seqg_var.c.get() != 0, \
+                 || {d}.get(), || {i}.get()) as _);"
+            ),
         ] {
-            assert!(code.contains(&e), "{e}\n{code}");
+            assert!(code.contains(&words(&e)), "{e}\n{code}");
         }
     }
 

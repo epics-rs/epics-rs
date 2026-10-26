@@ -352,6 +352,10 @@ const COMPANIONS: &[(&str, &str)] = &[
         include_str!("companions/indirectCall.rs"),
     ),
     (
+        "tests/fixtures/gen_code/foreign_mixed_arith.st",
+        include_str!("companions/struct_t.rs"),
+    ),
+    (
         "tests/fixtures/gen_code/foreign_pointer_compare.st",
         include_str!("companions/struct_t.rs"),
     ),

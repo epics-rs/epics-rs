@@ -412,6 +412,204 @@ impl<A: Indexed<Elem: 'static> + 'static, P: Addr<A> + ?Sized> Addr<A::Elem> for
     }
 }
 
+/// Member of the struct `parent` holds, C's `s.a` and `p->a`, reached by
+/// a reference into it: `&s.a` points into `s` and sees its later writes.
+pub struct Field<'p, P: ?Sized, S, F> {
+    parent: &'p P,
+    get: fn(&mut S) -> &mut F,
+}
+
+impl<P: Place<S> + ?Sized, S, F> Field<'_, P, S, F> {
+    /// [`Place::modify`], under the lock of the variable holding `parent`.
+    pub fn modify<R>(&self, f: impl FnOnce(&mut F) -> R) -> R {
+        self.parent.modify(|s| f((self.get)(s)))
+    }
+
+    pub fn get(&self) -> F
+    where
+        F: Clone,
+    {
+        self.modify(|v| v.clone())
+    }
+
+    pub fn set(&self, value: F) {
+        self.modify(|v| *v = value)
+    }
+}
+
+impl<P: Place<S> + ?Sized, S, A: Indexed> Field<'_, P, S, A> {
+    /// C's `s.a[index]`.
+    pub fn at(&self, index: usize) -> At<'_, Self, A> {
+        At::new(self, index)
+    }
+}
+
+impl<P: Addr<S> + ?Sized, S: 'static, F: 'static> Field<'_, P, S, F> {
+    /// C's `&s.a`.
+    pub fn ptr(&self) -> Ptr<F> {
+        let run = Member {
+            parent: self.parent.ptr(),
+            get: self.get,
+        };
+        Ptr::along(Arc::new(run), 0)
+    }
+}
+
+impl<P: Place<S> + ?Sized, S, F> Place<F> for Field<'_, P, S, F> {
+    fn modify<R>(&self, f: impl FnOnce(&mut F) -> R) -> R {
+        Field::modify(self, f)
+    }
+}
+
+impl<P: Addr<S> + ?Sized, S: 'static, F: 'static> Addr<F> for Field<'_, P, S, F> {
+    fn ptr(&self) -> Ptr<F> {
+        Field::ptr(self)
+    }
+}
+
+/// Member of the union `parent` holds, C's `u.a` and `p->a`. A union's
+/// members share its bytes, so a member is a copy the union's accessors
+/// convert, read and written back under the parent's lock; it has no
+/// address of its own.
+pub struct View<'p, P: ?Sized, U, F> {
+    parent: &'p P,
+    get: fn(&U) -> F,
+    set: fn(&mut U, F),
+}
+
+impl<P: Place<U> + ?Sized, U, F> View<'_, P, U, F> {
+    /// [`Place::modify`].
+    pub fn modify<R>(&self, f: impl FnOnce(&mut F) -> R) -> R {
+        self.parent.modify(|u| {
+            let mut v = (self.get)(u);
+            let r = f(&mut v);
+            (self.set)(u, v);
+            r
+        })
+    }
+
+    pub fn get(&self) -> F {
+        self.parent.modify(|u| (self.get)(u))
+    }
+
+    pub fn set(&self, value: F) {
+        self.parent.modify(|u| (self.set)(u, value))
+    }
+}
+
+impl<P: Place<U> + ?Sized, U, F> Place<F> for View<'_, P, U, F> {
+    fn modify<R>(&self, f: impl FnOnce(&mut F) -> R) -> R {
+        View::modify(self, f)
+    }
+}
+
+/// C's `.` on the places that can hold a struct or a union: `field` for a
+/// struct member, `view` for a union member, each given as a closure
+/// generated code writes (`|v| &mut v.a`, or `|v| v.a()` and
+/// `|v, x| v.set_a(x)`).
+macro_rules! members {
+    ($([$($g:tt)*] $place:ty => $s:ty;)*) => {$(
+        impl<$($g)*> $place {
+            pub fn field<F>(&self, get: fn(&mut $s) -> &mut F) -> Field<'_, Self, $s, F> {
+                Field { parent: self, get }
+            }
+
+            pub fn view<F>(&self, get: fn(&$s) -> F, set: fn(&mut $s, F)) -> View<'_, Self, $s, F> {
+                View {
+                    parent: self,
+                    get,
+                    set,
+                }
+            }
+        }
+    )*};
+}
+
+members! {
+    [T] SeqVar<T> => T;
+    [T] Ptr<T> => T;
+    [A: Indexed, P: Place<A> + ?Sized] At<'_, P, A> => A::Elem;
+    [P: Place<S> + ?Sized, S, M] Field<'_, P, S, M> => M;
+}
+
+/// A C union's storage, which a companion's union type wraps: every member
+/// is read and written through the same native-endian bytes, as C's are,
+/// so a value written through one member reads back through another.
+#[derive(Clone)]
+pub struct UnionBytes<const N: usize> {
+    bytes: [u8; N],
+    /// the pointer member last written, whose address the bytes hold
+    ptr: Ptr<c_void>,
+}
+
+impl<const N: usize> UnionBytes<N> {
+    pub fn get<T: UnionMember>(&self) -> T {
+        T::load(&self.bytes, &self.ptr)
+    }
+
+    pub fn set<T: UnionMember>(&mut self, value: T) {
+        value.store(&mut self.bytes, &mut self.ptr)
+    }
+}
+
+impl<const N: usize> Zeroed for UnionBytes<N> {
+    fn zeroed() -> Self {
+        UnionBytes {
+            bytes: [0; N],
+            ptr: Ptr(None),
+        }
+    }
+}
+
+/// A member [`UnionBytes`] holds: a number as its bytes, a pointer as its
+/// address.
+pub trait UnionMember: Sized {
+    fn load(bytes: &[u8], ptr: &Ptr<c_void>) -> Self;
+    fn store(self, bytes: &mut [u8], ptr: &mut Ptr<c_void>);
+}
+
+macro_rules! union_num {
+    ($($t:ty),*) => {$(
+        impl UnionMember for $t {
+            fn load(bytes: &[u8], _: &Ptr<c_void>) -> Self {
+                let n = std::mem::size_of::<$t>();
+                <$t>::from_ne_bytes(bytes[..n].try_into().expect("n bytes"))
+            }
+
+            fn store(self, bytes: &mut [u8], _: &mut Ptr<c_void>) {
+                let n = std::mem::size_of::<$t>();
+                bytes[..n].copy_from_slice(&self.to_ne_bytes())
+            }
+        }
+    )*};
+}
+
+union_num!(i8, u8, i16, u16, i32, u32, i64, u64, isize, usize, f32, f64);
+
+/// The address in the bytes reads back as the pointer stored there; where
+/// another member has overwritten it, C's pointer points nowhere it can
+/// name, so the read panics.
+impl<T: 'static> UnionMember for Ptr<T> {
+    fn load(bytes: &[u8], ptr: &Ptr<c_void>) -> Self {
+        match usize::load(bytes, ptr) {
+            0 => Ptr(None),
+            addr => {
+                assert_eq!(
+                    addr,
+                    ptr.addr(),
+                    "union pointer member read over another member"
+                );
+                ptr.cast()
+            }
+        }
+    }
+
+    fn store(self, bytes: &mut [u8], ptr: &mut Ptr<c_void>) {
+        self.addr().store(bytes, ptr);
+        *ptr = self.erase();
+    }
+}
+
 /// A [`Place`] C can take the address of.
 pub trait Addr<T>: Place<T> {
     /// C's `&place`.
@@ -487,6 +685,25 @@ impl<T: Clone + Send> Run<T> for Cells<T> {
         for (cell, v) in cells.iter_mut().zip(copy) {
             ***cell = v;
         }
+    }
+}
+
+/// The struct member a pointer to it points at, a run of one in the
+/// struct.
+struct Member<S: 'static, F> {
+    parent: Ptr<S>,
+    get: fn(&mut S) -> &mut F,
+}
+
+impl<S, F> Run<F> for Member<S, F> {
+    fn read(&self, f: &mut dyn FnMut(&[F])) {
+        self.parent
+            .modify(|s| f(std::slice::from_ref((self.get)(s))))
+    }
+
+    fn write(&self, f: &mut dyn FnMut(&mut [F])) {
+        self.parent
+            .modify(|s| f(std::slice::from_mut((self.get)(s))))
     }
 }
 
@@ -720,6 +937,18 @@ where
 {
     fn from(row: &At<'_, P, A>) -> Self {
         row.at(0).ptr()
+    }
+}
+
+/// C's decay of a struct member that is an array.
+impl<P, S, A> From<&Field<'_, P, S, A>> for Ptr<A::Elem>
+where
+    P: Addr<S> + ?Sized,
+    S: 'static,
+    A: Indexed<Elem: 'static> + 'static,
+{
+    fn from(a: &Field<'_, P, S, A>) -> Self {
+        a.at(0).ptr()
     }
 }
 
@@ -1015,6 +1244,156 @@ mod tests {
     #[should_panic(expected = "dereference of a void pointer")]
     fn a_void_pointer_does_not_dereference() {
         SeqVar::new(42i32).ptr().erase().modify(|_| ());
+    }
+
+    #[derive(Clone, Debug, PartialEq)]
+    struct Limits {
+        low: f64,
+        high: f64,
+    }
+
+    /// C's member order, as snc-rs declares an SNL struct
+    #[derive(Clone, Debug, PartialEq)]
+    #[repr(C)]
+    struct Rec {
+        mark: i32,
+        value: [f64; 3],
+        alarm: Limits,
+    }
+
+    fn rec() -> SeqVar<Rec> {
+        SeqVar::new(Rec {
+            mark: 1,
+            value: [0.0, 1.1, 2.2],
+            alarm: Limits {
+                low: -10.0,
+                high: 10.0,
+            },
+        })
+    }
+
+    #[test]
+    fn a_struct_member_is_a_place_in_its_struct() {
+        let s = rec();
+        s.field(|v| &mut v.mark).set(5);
+        s.field(|v| &mut v.alarm)
+            .field(|v| &mut v.high)
+            .modify(|v| *v *= 2.0);
+        s.field(|v| &mut v.value).at(2).set(4.4);
+        let r = s.get();
+        assert_eq!((r.mark, r.alarm.high, r.value[2]), (5, 20.0, 4.4));
+    }
+
+    #[test]
+    fn a_pointer_to_a_struct_member_points_into_the_struct() {
+        let s = rec();
+        let p = s.field(|v| &mut v.alarm).field(|v| &mut v.low).ptr();
+        s.field(|v| &mut v.alarm).set(Limits {
+            low: -1.0,
+            high: 1.0,
+        });
+        assert_eq!(p.get(), -1.0);
+        p.set(-2.0);
+        assert_eq!(s.get().alarm.low, -2.0);
+        // `&s.mark` is `&s` when the member is first, as C lays it out
+        assert_eq!(s.field(|v| &mut v.mark).ptr().addr(), s.ptr().addr());
+    }
+
+    #[test]
+    fn a_member_through_a_pointer_is_the_member_of_what_it_points_to() {
+        let s = rec();
+        let p = s.ptr();
+        // `p->mark`, which is `(*p).mark`
+        p.field(|v| &mut v.mark).set(7);
+        assert_eq!(s.get().mark, 7);
+    }
+
+    #[test]
+    fn an_array_member_decays_to_a_pointer_along_the_member() {
+        let s = rec();
+        let p = Ptr::from(&s.field(|v| &mut v.value));
+        assert_eq!(p.offset(1).get(), 1.1);
+        p.offset(2).set(9.9);
+        assert_eq!(s.get().value[2], 9.9);
+        assert_eq!(p.offset(1), s.field(|v| &mut v.value).at(1).ptr());
+    }
+
+    #[test]
+    fn a_struct_assignment_copies_the_struct() {
+        let (a, b) = (rec(), rec());
+        b.set(a.get());
+        a.field(|v| &mut v.mark).set(3);
+        a.field(|v| &mut v.value).at(0).set(8.0);
+        let b = b.get();
+        assert_eq!((b.mark, b.value[0]), (1, 0.0));
+    }
+
+    /// A companion's `union { int i; float f; double d; Rec *p; }`.
+    #[derive(Clone)]
+    struct Union(UnionBytes<8>);
+
+    impl Union {
+        fn i(&self) -> i32 {
+            self.0.get()
+        }
+        fn set_i(&mut self, v: i32) {
+            self.0.set(v)
+        }
+        fn f(&self) -> f32 {
+            self.0.get()
+        }
+        fn d(&self) -> f64 {
+            self.0.get()
+        }
+        fn set_d(&mut self, v: f64) {
+            self.0.set(v)
+        }
+        fn p(&self) -> Ptr<Rec> {
+            self.0.get()
+        }
+        fn set_p(&mut self, v: Ptr<Rec>) {
+            self.0.set(v)
+        }
+    }
+
+    #[test]
+    fn a_union_member_reads_back_what_another_wrote() {
+        let u = SeqVar::new(Union(UnionBytes::zeroed()));
+        let i = u.view(|v| v.i(), |v, x| v.set_i(x));
+        i.set(0x3f80_0000);
+        assert_eq!(u.view(|v| v.f(), |_, _: f32| ()).get(), 1.0);
+        u.view(|v| v.d(), |v, x| v.set_d(x)).set(-0.0);
+        // the sign bit is the top byte's, past `i` on a little-endian host
+        let low = i32::from_ne_bytes((-0.0f64).to_ne_bytes()[..4].try_into().unwrap());
+        assert_eq!(i.get(), low);
+        i.modify(|v| *v += 1);
+        assert_eq!(i.get(), low + 1);
+    }
+
+    #[test]
+    fn a_union_pointer_member_reads_back_its_pointer() {
+        let s = rec();
+        let u = SeqVar::new(Union(UnionBytes::zeroed()));
+        let p = u.view(|v| v.p(), |v, x| v.set_p(x));
+        assert!(p.get().is_null());
+        p.set(s.ptr());
+        assert_eq!(p.get(), s.ptr());
+        // `u.p->mark`
+        p.get().field(|v| &mut v.mark).set(4);
+        assert_eq!(s.get().mark, 4);
+        // the address's low bytes, as C reads them through `i`
+        let low = i32::from_ne_bytes(s.ptr().addr().to_ne_bytes()[..4].try_into().unwrap());
+        assert_eq!(u.view(|v| v.i(), |v, x| v.set_i(x)).get(), low);
+    }
+
+    #[test]
+    #[should_panic(expected = "union pointer member read over another member")]
+    fn a_union_pointer_member_overwritten_by_another_member_panics() {
+        let s = rec();
+        let u = SeqVar::new(Union(UnionBytes::zeroed()));
+        u.view(|v| v.p(), |v, x| v.set_p(x)).set(s.ptr());
+        u.view(|v| v.i(), |v, x| v.set_i(x)).set(13);
+        u.view(|v| v.p(), |v, x| v.set_p(x)).get();
     }
 
     #[test]

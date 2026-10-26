@@ -192,6 +192,23 @@
 //! escaped declaration does not spell in keywords is cast `as _`. snc-rs
 //! refuses SNL code that assigns an element of a global.
 //!
+//! A foreign `struct`, `union`, `enum` or `typename` is the companion type
+//! of C's name, its tag dropped (`struct struct_t` is `struct_t`), and is
+//! `Clone` and [`Zeroed`] as every variable's type is. A struct has a
+//! `pub` field per C member: `s.a` is the place `s.field(|v| &mut v.a)`, a
+//! [`Field`], which `&s.a` points into and whose array decays to a pointer
+//! along the member, and `p->a` is the same place through the [`Ptr`]. A
+//! union keeps C's shared storage in a [`UnionBytes`] with a pair of
+//! accessors per member, `a()` and `set_a(x)`, so `u.a` is
+//! `u.view(|v| v.a(), |v, x| v.set_a(x))`, a [`View`], and one member
+//! reads back the bytes another wrote. A pointer member read over another
+//! member's write panics, where C's is undefined. A union member has no
+//! address, so snc-rs refuses `&u.a`. snc-rs knows a union only by an SNL
+//! declaration that names one; any other foreign aggregate is taken to be
+//! a struct. An enum is its integer type and a constant per enumerator. A
+//! brace initializer is `T::from` a tuple of its shape (`{1, {0.1}}` is
+//! `(1, (0.1,))`), which converts each member as C's initialization does.
+//!
 //! When a fragment has no arm, the build fails with that text, so a
 //! changed upstream `.st` cannot compile against a stale companion. A
 //! companion holds one program, because each program defines its own
@@ -308,7 +325,8 @@ pub use state_set::{CompleteFlags, StateSet};
 pub use task::seq_stop;
 pub use types::*;
 pub use var::{
-    Addr, At, ChanCell, ElemKind, Indexed, Place, Prim, ProgramVars, Ptr, SeqVar, Zeroed,
+    Addr, At, ChanCell, ElemKind, Field, Indexed, Place, Prim, ProgramVars, Ptr, SeqVar,
+    UnionBytes, UnionMember, View, Zeroed,
 };
 
 /// Include the program snc-rs wrote for `<name>.st` to `$OUT_DIR/<name>.rs`.

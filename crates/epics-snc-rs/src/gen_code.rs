@@ -184,9 +184,10 @@ pub(crate) fn value_type(ast: &Ast, t: crate::types::TypeId) -> Result<String, S
             name,
         } => match rt_typename(name) {
             Some(r) => format!("seqg_rt::{r}"),
-            None => return Err(format!("typename {name}")),
+            None => name.to_string(),
         },
-        TypeKind::Foreign { tag, name } => return Err(format!("{}{name}", tag.prefix())),
+        // the companion's type of C's name, its tag dropped
+        TypeKind::Foreign { name, .. } => name.to_string(),
         TypeKind::Struct { name, .. } => return Err(format!("struct {name}")),
         k => return Err(k.tag_name().into()),
     })
@@ -781,13 +782,13 @@ fn put(seqg_env: &seqg_rt::StateSet<seqg_vars>, v: f64) {
             "pub a4ps: seqg_rt::SeqVar<[seqg_rt::Ptr<[seqg_rt::SeqString; 5]>; 4]>,",
             "pub xp: seqg_rt::SeqVar<seqg_rt::Ptr<seqg_rt::CharPtr>>,",
             "pub v: seqg_rt::SeqVar<seqg_rt::Ptr<std::ffi::c_void>>,",
+            "pub pe: seqg_rt::SeqVar<seqg_rt::Ptr<e>>,",
         ] {
             assert!(text.contains(field), "{field}\n{text}");
         }
         assert_eq!(
             String::from_utf8_lossy(snc.diagnostics()),
-            "t.st:6: error: snc-rs does not support function pointer variable 'f'\n\
-             t.st:7: error: snc-rs does not support pointer to enum e variable 'pe'\n"
+            "t.st:6: error: snc-rs does not support function pointer variable 'f'\n"
         );
     }
 
@@ -861,7 +862,7 @@ fn put(seqg_env: &seqg_rt::StateSet<seqg_vars>, v: f64) {
     fn types_without_a_rust_form_are_refused_at_their_line() {
         let (mut snc, ast, prg) = analysed(
             "program p\noption +r;\nvoid (*ip)(void);\nstruct S { int m; };\n\
-             typename T t[2];\nstruct S s;\n\
+             struct S s;\n\
              ss s {\nstate z {\nwhen () {} state z\n}\n}\n",
         );
         gen_var_struct(&mut snc, &ast, &prg);
@@ -870,11 +871,32 @@ fn put(seqg_env: &seqg_rt::StateSet<seqg_vars>, v: f64) {
         assert_eq!(
             String::from_utf8_lossy(snc.diagnostics()),
             "t.st:3: error: snc-rs does not support function pointer variable 'ip'\n\
-             t.st:5: error: snc-rs does not support typename T variable 't'\n\
-             t.st:6: error: snc-rs does not support struct S variable 's'\n\
+             t.st:5: error: snc-rs does not support struct S variable 's'\n\
              t.st:4: error: snc-rs does not support struct definitions\n"
         );
-        assert_eq!(snc.err_cnt(), 4);
+        assert_eq!(snc.err_cnt(), 3);
+    }
+
+    #[test]
+    fn a_foreign_type_is_the_companion_s_type_of_its_name() {
+        // foreignTypes.st:12-15
+        let (mut snc, ast, prg) = analysed(
+            "program p\nstruct struct_t s;\nunion union_t u;\nenum enum_t e;\n\
+             typename typedef_t t[2];\nstruct struct_t *ps;\n\
+             ss s {\nstate z {\nwhen () {} state z\n}\n}\n",
+        );
+        snc.options.line = false;
+        let text = rust_out::print(&gen_var_struct(&mut snc, &ast, &prg));
+        for field in [
+            "pub s: seqg_rt::SeqVar<struct_t>,",
+            "pub u: seqg_rt::SeqVar<union_t>,",
+            "pub e: seqg_rt::SeqVar<enum_t>,",
+            "pub t: seqg_rt::SeqVar<[typedef_t; 2]>,",
+            "pub ps: seqg_rt::SeqVar<seqg_rt::Ptr<struct_t>>,",
+        ] {
+            assert!(text.contains(field), "{field}\n{text}");
+        }
+        assert_eq!(String::from_utf8_lossy(snc.diagnostics()), "");
     }
 
     #[test]

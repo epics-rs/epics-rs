@@ -118,45 +118,39 @@ const EXPECTED_FAILURES: &[(&str, &str)] = &[
         "sequencer/test/compiler/type_expr.st",
         "type_expr.st:13: error: snc-rs does not support a cast of an integer to a pointer",
     ),
-    // these wait for a run-time contract for SNL and foreign structs
     (
-        "sequencer/examples/small/decl.st",
-        "decl.st:20: error: snc-rs does not support typename TS_STAMP variable 'ts'",
+        "sequencer/test/validate/indirectCall.st",
+        "indirectCall.st:43: error[E0614]: type `fn(i32) -> i32` cannot be dereferenced: can't be dereferenced",
     ),
+    // C reads an object's bytes as another type through a cast pointer,
+    // which a cell of one Rust type has no form for
     (
         "sequencer/test/compiler/cast.st",
-        "cast.st:24: error: snc-rs does not support enum enum_test variable 'e'",
+        "cast.st:29: error: snc-rs does not support a cast between pointer types",
     ),
+    // a foreign member's type snc-rs takes to be int
+    (
+        "sequencer/test/compiler/member.st",
+        "member.st:28: error[E0277]: cannot multiply-assign `f64` by `{integer}`: no implementation for `f64 *= {integer}`",
+    ),
+    // these wait for a run-time contract for SNL structs
     (
         "sequencer/examples/small/timer.st",
         "timer.st:9: error: snc-rs does not support struct definitions",
-    ),
-    (
-        "sequencer/test/compiler/foreignTypes.st",
-        "foreignTypes.st:17: error: snc-rs does not support enum enum_test variable 'e0'",
-    ),
-    (
-        "sequencer/test/compiler/member.st",
-        "member.st:6: error: snc-rs does not support struct struct_t variable 's'",
-    ),
-    (
-        "sequencer/test/validate/foreignTypes.st",
-        "foreignTypes.st:12: error: snc-rs does not support struct struct_t variable 's'",
     ),
     (
         "sequencer/test/validate/functionInStruct.st",
         "functionInStruct.st:9: error: snc-rs does not support struct definitions",
     ),
     (
-        "sequencer/test/validate/indirectCall.st",
-        "indirectCall.st:26: error: snc-rs does not support struct s variable 'gx'",
-    ),
-    (
         "sequencer/test/validate/structdef.st",
         "structdef.st:9: error: snc-rs does not support struct definitions",
     ),
-    // these wait for a run-time timestamp with C's members, a foreign
-    // global SNL code writes, and a Zeroed pvStat
+    // these wait for a run-time timestamp with C's members
+    (
+        "sequencer/examples/small/decl.st",
+        "decl.st:20: error[E0425]: cannot find type `TS_STAMP` in this scope: not found in this scope",
+    ),
     (
         "sequencer/examples/small/pvTimeStamp.st",
         "pvTimeStamp.st:10: error: snc-rs does not support a member of a seq run-time value",
@@ -339,12 +333,61 @@ fn c_exports() -> HashSet<String> {
 /// cannot supply either.
 const UNDEFINED: &[&str] = &["pvPutCompleteArray"];
 
+/// Companions written by hand for programs whose escaped C or C header
+/// defines a type, which a stub cannot: what they define replaces the stub.
+const COMPANIONS: &[(&str, &str)] = &[
+    (
+        "sequencer/examples/small/decl.st",
+        include_str!("companions/decl.rs"),
+    ),
+    (
+        "sequencer/test/compiler/foreignTypes.st",
+        include_str!("companions/foreignTypes_h.rs"),
+    ),
+    (
+        "sequencer/test/compiler/member.st",
+        include_str!("companions/struct_t.rs"),
+    ),
+    (
+        "sequencer/test/validate/foreignTypes.st",
+        include_str!("companions/struct_t.rs"),
+    ),
+    (
+        "sequencer/test/validate/indirectCall.st",
+        include_str!("companions/indirectCall.rs"),
+    ),
+];
+
+/// The names a hand-written companion defines.
+fn defined_names(companion: &str) -> HashSet<String> {
+    let mut names = HashSet::new();
+    for line in companion.lines() {
+        let Some(rest) = line.strip_prefix("pub ") else {
+            continue;
+        };
+        let item = ["fn ", "const ", "static ", "struct ", "type ", "enum "]
+            .iter()
+            .find_map(|k| rest.strip_prefix(k));
+        if let Some(item) = item {
+            let name = item
+                .split(|c: char| !c.is_alphanumeric() && c != '_')
+                .next()
+                .unwrap_or_default();
+            names.insert(name.to_owned());
+        }
+    }
+    names
+}
+
 /// A companion for `foreign`: an arm for every escaped fragment that
 /// expands the SNL between them, and a placeholder for every foreign name
-/// `epics_seq_rs::c` does not supply. A value is a constant, a subscripted
-/// one a static array, and an array passed whole a static reference to a
-/// `CDst` and `CSrc`, as the epics-seq-rs contract has escaped-C globals.
-fn stub_companion(foreign: &Foreign, c: &HashSet<String>) -> String {
+/// neither `epics_seq_rs::c` nor `written`, the program's hand-written
+/// companion, supplies. A value is a constant, a subscripted one a static
+/// array, and an array passed whole a static reference to a `CDst` and
+/// `CSrc`, as the epics-seq-rs contract has escaped-C globals.
+fn stub_companion(foreign: &Foreign, c: &HashSet<String>, written: &str) -> String {
+    let defined = defined_names(written);
+    let supplied = |name: &String| c.contains(name) || defined.contains(name);
     let mut s = String::from(
         "#![allow(dead_code, unused_imports, unused_macros, non_snake_case, non_upper_case_globals)]\n\
          use epics_seq_rs::c::*;\n\
@@ -356,7 +399,7 @@ fn stub_companion(foreign: &Foreign, c: &HashSet<String>) -> String {
          }\n",
     );
     for (name, argcs) in &foreign.funcs {
-        if c.contains(name) || UNDEFINED.contains(&name.as_str()) {
+        if supplied(name) || UNDEFINED.contains(&name.as_str()) {
             continue;
         }
         let argc = *argcs.iter().next().unwrap();
@@ -390,7 +433,7 @@ fn stub_companion(foreign: &Foreign, c: &HashSet<String>) -> String {
         );
     }
     for (name, &used) in &foreign.values {
-        if !c.contains(name) && !foreign.funcs.contains_key(name) {
+        if !supplied(name) && !foreign.funcs.contains_key(name) {
             let (t, dims) = foreign
                 .value_types
                 .get(name)
@@ -424,7 +467,7 @@ fn stub_companion(foreign: &Foreign, c: &HashSet<String>) -> String {
             s += &format!("pub {item} {name}: {ty} = {value};\n");
         }
     }
-    s
+    s + written
 }
 
 /// The sequencer's own programs under `dir`, sorted.
@@ -596,10 +639,14 @@ fn upstream_programs_type_check() {
             ),
         )
         .expect("write Cargo.toml");
+        let written = COMPANIONS
+            .iter()
+            .find(|&&(p, _)| p == rel(st))
+            .map_or("", |&(_, w)| w);
         let companion = format!(
             "// {}\n{}include!(\"../generated.rs\");\n",
             st.display(),
-            stub_companion(&g.foreign, &c)
+            stub_companion(&g.foreign, &c, written)
         );
         std::fs::write(dir.join("src/lib.rs"), companion).expect("write companion");
         members.push(format!("\"programs/{name}\""));

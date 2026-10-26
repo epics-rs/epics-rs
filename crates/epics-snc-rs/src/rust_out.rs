@@ -116,7 +116,9 @@ pub enum Expr {
     Macro(String, Vec<Arg>),
     /// `[elems]`.
     Array(Vec<Arg>),
-    /// `op expr`, `op` one of `&`, `*`, `!`, `-`.
+    /// `(elems)`, `(elem,)` for one.
+    Tuple(Vec<Arg>),
+    /// `op expr`, `op` one of `&`, `&mut `, `*`, `!`, `-`.
     Unary(&'static str, Box<Expr>),
     /// `lhs op rhs` for a binary operator (not an assignment).
     Binary(Box<Expr>, &'static str, Box<Expr>),
@@ -534,6 +536,13 @@ fn expr(e: &Expr, ind: usize) -> String {
         Expr::Index(base, index) => format!("{}[{}]", postfix_base(base, ind), expr(index, ind)),
         Expr::Macro(name, args) => format!("{name}!{}", list("(", ")", args, false, ind)),
         Expr::Array(elems) => list("[", "]", elems, true, ind),
+        Expr::Tuple(elems) => {
+            let t = list("(", ")", elems, true, ind);
+            match elems.len() {
+                1 if !t.contains('\n') => format!("{},)", &t[..t.len() - 1]),
+                _ => t,
+            }
+        }
         Expr::Unary(op, x) => {
             // `--x` would lint as a double negation
             let double_neg = *op == "-"

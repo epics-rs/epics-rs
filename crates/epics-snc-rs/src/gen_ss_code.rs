@@ -560,6 +560,19 @@ enum PlaceTy {
     /// a foreign global SNL code assigns, the companion's
     /// `LazyLock<SeqVar<T>>`
     Global(VarId),
+    /// a member of a foreign struct or union, whose type the companion
+    /// knows and snc-rs does not
+    Member,
+}
+
+/// How C's `.` reaches a member of a struct or union.
+#[derive(Clone, Copy, PartialEq)]
+enum Members {
+    /// by a reference into the struct, `field(|v| &mut v.a)`
+    Struct,
+    /// by the companion's accessors, `view(|v| v.a(), |v, x| v.set_a(x))`,
+    /// as a union's members share its bytes
+    Union,
 }
 
 /// A variable or an element of one: the expression naming its `SeqVar`
@@ -1008,6 +1021,16 @@ impl<'a> Gen<'a> {
     /// Store initializer `init` in `place`, an `E_INIT` element by element.
     fn init_place(&mut self, place: Place, init: NodeId, out: &mut Vec<Stmt>) {
         let ast = self.ast;
+        if ast[init].tag == NodeTag::EInit
+            && let PlaceTy::Snl(t) = place.ty
+            && self.members(place.ty).is_some()
+        {
+            // the companion's `From` takes C's braces as nested tuples
+            let ty = value_type(ast, t).expect("a foreign type");
+            let v = Expr::call(format!("{ty}::from"), vec![self.init_tuple(init)]);
+            out.push(Stmt::Expr(place.expr.method("set", vec![v])));
+            return;
+        }
         if ast[init].tag == NodeTag::EInit {
             let elem = self.elem_kind(place.ty, place.multi);
             for (i, ep) in ast.list(ast[init].child(child::INIT_ELEMS)).enumerate() {
@@ -1034,7 +1057,7 @@ impl<'a> Gen<'a> {
                 }
                 _ => false,
             },
-            PlaceTy::Char | PlaceTy::Void | PlaceTy::Global(_) => false,
+            PlaceTy::Char | PlaceTy::Void | PlaceTy::Global(_) | PlaceTy::Member => false,
         };
         let store = if is_text && !place.multi {
             let v = self.expr(init);
@@ -1048,6 +1071,16 @@ impl<'a> Gen<'a> {
             place.expr.method("set", vec![v])
         };
         out.push(Stmt::Expr(store));
+    }
+
+    /// A foreign struct or union initializer `ep`, a brace a tuple.
+    fn init_tuple(&mut self, ep: NodeId) -> Expr {
+        let ast = self.ast;
+        if ast[ep].tag != NodeTag::EInit {
+            return self.arg_value(ep);
+        }
+        let elems = ast.list(ast[ep].child(child::INIT_ELEMS));
+        Expr::Tuple(elems.map(|e| self.init_tuple(e).into()).collect())
     }
 
     /// C `gen_block` without the braces: the block's local variables, its
@@ -1439,7 +1472,7 @@ impl<'a> Gen<'a> {
     /// conversion on assignment.
     fn stored(&mut self, ep: NodeId, ty: &Ty) -> Expr {
         let v = match ty {
-            Ty::Ptr(_) => self.pointer_val(ep),
+            Ty::Ptr(_) => self.pointer_val(ep).or_else(|| self.member_ptr(ep, ty)),
             _ => None,
         };
         let v = match v {
@@ -1451,6 +1484,34 @@ impl<'a> Gen<'a> {
             self.refuse(ep, "a conversion to an enum");
         }
         conv(v, ty)
+    }
+
+    /// `&s.a` of a member snc-rs does not know the type of, as the pointer
+    /// `ty` its target is; `None` for anything else.
+    fn member_ptr(&mut self, mut ep: NodeId, ty: &Ty) -> Option<Val> {
+        let ast = self.ast;
+        while ast[ep].tag == NodeTag::EParen {
+            ep = ast[ep].child(child::PAREN_EXPR)?;
+        }
+        if ast[ep].tag != NodeTag::EPre || ast[ep].token.symbol != Tok::Ampersand {
+            return None;
+        }
+        let mut operand = ast[ep].child(child::PRE_OPERAND)?;
+        while ast[operand].tag == NodeTag::EParen {
+            operand = ast[operand].child(child::PAREN_EXPR)?;
+        }
+        let (PlaceTy::Member, _) = self.place_kind(operand)? else {
+            return None;
+        };
+        if self.holder(operand).and_then(|h| self.members(h)) == Some(Members::Union) {
+            // a union member is a copy with no address
+            self.refuse(ep, "a pointer to a union member");
+        }
+        let place = self.place(operand);
+        Some(Val {
+            e: place.expr.method("ptr", Vec::new()),
+            ty: ty.clone(),
+        })
     }
 
     /// What `ep` points to where C reads it as a pointer: a pointer, an
@@ -1468,7 +1529,7 @@ impl<'a> Gen<'a> {
             // `&g` of a foreign global is the place, as a foreign call's is
             NodeTag::EPre if sym == Tok::Ampersand => {
                 match self.place_kind(c(child::PRE_OPERAND)?)? {
-                    (PlaceTy::Global(_), _) => None,
+                    (PlaceTy::Global(_) | PlaceTy::Member, _) => None,
                     (t, _) => Some(t),
                 }
             }
@@ -1516,7 +1577,7 @@ impl<'a> Gen<'a> {
                 TypeKind::Pointer { value_type } => self.snl_pointee(value_type),
                 _ => None,
             },
-            (PlaceTy::Char | PlaceTy::Void | PlaceTy::Global(_), _) => None,
+            (PlaceTy::Char | PlaceTy::Void | PlaceTy::Global(_) | PlaceTy::Member, _) => None,
         }
     }
 
@@ -1554,7 +1615,9 @@ impl<'a> Gen<'a> {
             PlaceTy::Snl(t) => value_type(self.ast, t).expect("a pointee has a Rust type"),
             PlaceTy::Char => C_CHAR.into(),
             PlaceTy::Void => C_VOID.into(),
-            PlaceTy::Global(_) => unreachable!("a foreign global is no pointee"),
+            PlaceTy::Global(_) | PlaceTy::Member => {
+                unreachable!("a foreign global or member is no pointee")
+            }
         }
     }
 
@@ -1830,7 +1893,9 @@ impl<'a> Gen<'a> {
         let c = |i| node.child(i).expect("expression operand");
         let sym = node.token.symbol;
         match node.tag {
-            NodeTag::EVar | NodeTag::ESubscr | NodeTag::EPre if self.place_kind(ep).is_some() => {
+            NodeTag::EVar | NodeTag::ESubscr | NodeTag::EPre | NodeTag::ESelect
+                if self.place_kind(ep).is_some() =>
+            {
                 let place = self.place(ep);
                 self.read(place)
             }
@@ -2255,7 +2320,7 @@ impl<'a> Gen<'a> {
             _ => match self.place_kind(a) {
                 Some((PlaceTy::Snl(t), _)) => type_size(ast, t),
                 Some((PlaceTy::Char, _)) => Some(1),
-                Some((PlaceTy::Void | PlaceTy::Global(_), _)) => None,
+                Some((PlaceTy::Void | PlaceTy::Global(_) | PlaceTy::Member, _)) => None,
                 None => self.pointee(a).map(|_| 8),
             },
         }
@@ -2518,7 +2583,48 @@ impl<'a> Gen<'a> {
             NodeTag::EPre if node.token.symbol == Tok::Asterisk => {
                 self.deref_kind(node.child(child::PRE_OPERAND)?)
             }
+            NodeTag::ESelect => {
+                self.members(self.holder(ep)?)?;
+                Some((PlaceTy::Member, false))
+            }
             _ => None,
+        }
+    }
+
+    /// What the struct or union member selection `ep` selects from holds:
+    /// the place left of `.`, or what the pointer left of `->` points to,
+    /// a foreign value's of unknown type a [`PlaceTy::Member`].
+    fn holder(&self, ep: NodeId) -> Option<PlaceTy> {
+        let node = &self.ast[ep];
+        let left = node.child(child::SELECT_LEFT)?;
+        match node.token.symbol {
+            Tok::Period => self.place_kind(left).map(|(t, _)| t),
+            _ => Some(self.pointee(left).unwrap_or(PlaceTy::Member)),
+        }
+    }
+
+    /// How a place holding `t` reaches its members, if it holds a struct
+    /// or a union. snc-rs knows a union only by its SNL declaration, so a
+    /// member it does not know the type of is taken for a struct.
+    fn members(&self, t: PlaceTy) -> Option<Members> {
+        match t {
+            PlaceTy::Member => Some(Members::Struct),
+            PlaceTy::Snl(t) => match &self.ast[t].kind {
+                TypeKind::Foreign {
+                    tag: ForeignTag::Union,
+                    ..
+                } => Some(Members::Union),
+                TypeKind::Foreign {
+                    tag: ForeignTag::Struct,
+                    ..
+                } => Some(Members::Struct),
+                TypeKind::Foreign {
+                    tag: ForeignTag::Typename,
+                    name,
+                } if rt_typename(name).is_none() => Some(Members::Struct),
+                _ => None,
+            },
+            PlaceTy::Char | PlaceTy::Void | PlaceTy::Global(_) => None,
         }
     }
 
@@ -2573,6 +2679,28 @@ impl<'a> Gen<'a> {
                 )
             }
             NodeTag::EPre => self.deref(node.child(child::PRE_OPERAND).expect("operand"), None),
+            NodeTag::ESelect => {
+                let left = node.child(child::SELECT_LEFT).expect("operand");
+                let name = ast[node.child(child::SELECT_RIGHT).expect("member")]
+                    .token
+                    .text();
+                let (holder, base) = match node.token.symbol {
+                    Tok::Period => {
+                        let p = self.place(left);
+                        (p.ty, p.expr)
+                    }
+                    _ => match self.pointee(left) {
+                        Some(t) => (t, self.pointer(left)),
+                        None => (PlaceTy::Member, self.expr(left).e),
+                    },
+                };
+                let kind = self.members(holder).expect("a struct or union");
+                Place {
+                    expr: member(base, name, kind),
+                    ty: PlaceTy::Member,
+                    multi: false,
+                }
+            }
             tag => unreachable!("place {}", tag.name()),
         }
     }
@@ -2679,6 +2807,7 @@ impl<'a> Gen<'a> {
             _ if place.multi => Ty::Ref,
             PlaceTy::Char => Ty::Num(C_CHAR.into()),
             PlaceTy::Void => Ty::Unit,
+            PlaceTy::Member => Ty::Foreign,
             PlaceTy::Global(vp) => {
                 let name = self.ast[vp].name.as_deref().unwrap_or_default();
                 match escaped_var_type(self.ast, name) {
@@ -2703,6 +2832,30 @@ impl<'a> Gen<'a> {
                 ty,
             },
         }
+    }
+}
+
+/// Member `name` of what `base`, a place, holds.
+fn member(base: Expr, name: &str, kind: Members) -> Expr {
+    let v = || Expr::atom("v");
+    match kind {
+        Members::Struct => base.method(
+            "field",
+            vec![Expr::Closure(
+                "v".into(),
+                Box::new(Expr::unary("&mut ", v().field(name))),
+            )],
+        ),
+        Members::Union => base.method(
+            "view",
+            vec![
+                Expr::Closure("v".into(), Box::new(v().method(name, Vec::new()))),
+                Expr::Closure(
+                    "v, x".into(),
+                    Box::new(v().method(format!("set_{name}"), vec![Expr::atom("x")])),
+                ),
+            ],
+        ),
     }
 }
 
@@ -3851,6 +4004,53 @@ mod tests {
         ] {
             assert!(code.contains(e), "{e}\n{code}");
         }
+    }
+
+    const MEMBERS: &str = "program p\n\
+        %%struct struct_t { int i; struct { double d; } s; };\n\
+        %%union union_t { int i; struct struct_t *p; };\n\
+        struct struct_t s = {1, {0.1}};\nunion union_t u = {13};\n\
+        ss a {\nstruct struct_t *ps = &s;\nunion union_t *pu = &u;\nint *q;\n\
+        state s {\nwhen () {\n";
+
+    #[test]
+    fn a_foreign_struct_member_is_a_field_and_a_union_member_a_view() {
+        // member.st, foreignTypes.st
+        let (code, diag) = translate(&format!(
+            "{MEMBERS}if (s.i == 1)\ns.i++;\ns.s.d /= 3.0;\nps->i++;\nps->i = 2;\n\
+             (*ps).i = 2;\npu->p = ps;\npu->p->s.d *= 3;\nu.i = pu->i;\nq = &s.i;\n\
+             }} state s\n}}\n}}\n"
+        ));
+        assert_eq!(diag, "");
+        let code = words(&code);
+        for e in [
+            "seqg_var.s.set(struct_t::from((1, (0.1,))));",
+            "seqg_var.u.set(union_t::from((13,)));",
+            "seqg_var.s.field(|v| &mut v.i).get() == 1",
+            "seqg_var.s.field(|v| &mut v.i).modify(|v| *v += 1);",
+            "seqg_var.s.field(|v| &mut v.s).field(|v| &mut v.d).modify(|v| *v /= 3.0);",
+            "seqg_var.seqg_vars_a.ps.get().field(|v| &mut v.i).modify(|v| *v += 1);",
+            "seqg_var.seqg_vars_a.pu.get().view(|v| v.p(), |v, x| v.set_p(x)).set(seqg_var.seqg_vars_a.ps.get());",
+            "seqg_var.seqg_vars_a.pu.get().view(|v| v.p(), |v, x| v.set_p(x)).get().field(|v| &mut v.s)\
+             .field(|v| &mut v.d).modify(|v| *v *= 3);",
+            "seqg_var.u.view(|v| v.i(), |v, x| v.set_i(x)).set(seqg_var.seqg_vars_a.pu.get()\
+             .view(|v| v.i(), |v, x| v.set_i(x)).get());",
+            "seqg_var.seqg_vars_a.q.set(seqg_var.s.field(|v| &mut v.i).ptr());",
+        ] {
+            assert!(code.contains(&words(e)), "{e}\n{code}");
+        }
+        // `p->a` and `(*p).a` are one place
+        let set = "seqg_var.seqg_vars_a.ps.get().field(|v| &mut v.i).set(2);";
+        assert_eq!(code.matches(set).count(), 2, "{code}");
+    }
+
+    #[test]
+    fn a_pointer_to_a_union_member_is_refused() {
+        let (_, diag) = translate(&format!("{MEMBERS}q = &u.i;\n}} state s\n}}\n}}\n"));
+        assert_eq!(
+            diag,
+            "t.st:12: error: snc-rs does not support a pointer to a union member\n"
+        );
     }
 
     #[test]

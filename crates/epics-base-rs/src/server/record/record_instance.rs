@@ -2435,10 +2435,11 @@ pub struct RecordCell {
     /// contention, and there is none.
     borrow: std::sync::atomic::AtomicIsize,
     /// C `cvt_dbaddr` owed by a lock-free `dbNameToAddr`
-    /// ([`Self::resolve_addr`]): bit `i` is entry `i` of
-    /// [`Self::dbaddr_counts`]. A resolve that finds the record busy cannot
-    /// run [`super::Record::cvt_dbaddr`], so it owes the cell to its lock set,
-    /// and the set's next fresh hold runs it before anything reads the record.
+    /// ([`Self::resolve_addr`]): bit `i` of this word and then of
+    /// [`Self::cvt_pending_more`]'s is entry `i` of [`Self::dbaddr_counts`].
+    /// A resolve that finds the record busy cannot run
+    /// [`super::Record::cvt_dbaddr`], so it owes the cell to its lock set, and
+    /// the set's next fresh hold runs it before anything reads the record.
     cvt_pending: std::sync::atomic::AtomicU64,
     /// The type-static answers a process cycle tests — see [`ProcessPlan`].
     /// Fixed by the type, like `rdes`, so it is reachable without a borrow
@@ -2523,6 +2524,9 @@ pub struct RecordCell {
     /// so `dbNameToAddr` types another thread's record with no lock, as C
     /// reads `prec->ftvl` (`waveformRecord.c:184`).
     runtime_types: arc_swap::ArcSwap<Vec<Option<DbFieldType>>>,
+    /// [`Self::cvt_pending`]'s words past the first, for a type with over 64
+    /// `SPC_DBADDR` fields (sscan has 152).
+    cvt_pending_more: Box<[std::sync::atomic::AtomicU64]>,
 }
 
 const _: () = assert!(std::mem::offset_of!(RecordCell, data) == 0);
@@ -3542,6 +3546,7 @@ impl RecordCell {
             .iter()
             .map(|f| instance.record.field_slot(f.name))
             .collect();
+        let dbaddr_counts = dbaddr_counts_of(&instance);
         Self {
             lock_record: crate::server::database::LockRecord::bootstrap(),
             borrow: std::sync::atomic::AtomicIsize::new(0),
@@ -3565,7 +3570,10 @@ impl RecordCell {
             chain_pact: AtomicBool::new(false),
             lent: std::sync::atomic::AtomicU32::new(0),
             string_typed: std::sync::atomic::AtomicU64::new(string_typed_mask(&instance)),
-            dbaddr_counts: arc_swap::ArcSwap::from_pointee(dbaddr_counts_of(&instance)),
+            cvt_pending_more: (0..dbaddr_counts.len().saturating_sub(1) / 64)
+                .map(|_| std::sync::atomic::AtomicU64::new(0))
+                .collect(),
+            dbaddr_counts: arc_swap::ArcSwap::from_pointee(dbaddr_counts),
             runtime_types: arc_swap::ArcSwap::from_pointee(runtime_types_of(&instance)),
             data: LockSetGuarded(std::cell::UnsafeCell::new(instance)),
         }
@@ -3680,10 +3688,9 @@ impl RecordCell {
                 .name
                 .eq_ignore_ascii_case(field)
         });
-        if let Some(bit) = at {
-            debug_assert!(bit < 64, "{} has over 64 SPC_DBADDR fields", self.name);
-            self.cvt_pending
-                .fetch_or(1 << bit, std::sync::atomic::Ordering::Release);
+        if let Some(entry) = at {
+            self.cvt_word(entry / 64)
+                .fetch_or(1 << (entry % 64), std::sync::atomic::Ordering::Release);
             match self.try_read() {
                 // SAFETY: `_held` is a shared borrow of this record.
                 Some(_held) => unsafe { self.apply_cvt_pending() },
@@ -3700,21 +3707,27 @@ impl RecordCell {
     /// This thread holds a guard of the record, or holds its lock set with no
     /// borrow of the record live — so no `&mut` to the data exists.
     pub(crate) unsafe fn apply_cvt_pending(&self) {
-        let mut owed = self
-            .cvt_pending
-            .swap(0, std::sync::atomic::Ordering::Acquire);
-        if owed == 0 {
-            return;
-        }
-        let counts = self.dbaddr_counts.load();
         // SAFETY: the caller's contract.
         let inst = unsafe { &*self.data.0.get() };
-        while owed != 0 {
-            let bit = owed.trailing_zeros() as usize;
-            owed &= owed - 1;
-            let (at, _) = counts[bit];
-            inst.record
-                .cvt_dbaddr(self.rdes.fields[usize::from(at)].name);
+        for word in 0..=self.cvt_pending_more.len() {
+            let mut owed = self
+                .cvt_word(word)
+                .swap(0, std::sync::atomic::Ordering::Acquire);
+            while owed != 0 {
+                let entry = word * 64 + owed.trailing_zeros() as usize;
+                owed &= owed - 1;
+                let (at, _) = self.dbaddr_counts.load()[entry];
+                inst.record
+                    .cvt_dbaddr(self.rdes.fields[usize::from(at)].name);
+            }
+        }
+    }
+
+    /// Word `word` of [`Self::cvt_pending`]'s bits.
+    fn cvt_word(&self, word: usize) -> &std::sync::atomic::AtomicU64 {
+        match word {
+            0 => &self.cvt_pending,
+            more => &self.cvt_pending_more[more - 1],
         }
     }
 
@@ -14159,6 +14172,7 @@ mod record_cell_layout_tests {
             string_typed,
             dbaddr_counts,
             runtime_types,
+            cvt_pending_more,
         });
         packed_in_order(cell);
 

@@ -1734,7 +1734,7 @@ impl<'a> Gen<'a> {
             return;
         };
         let ty = self.place_value_ty(&place);
-        if !matches!(ty, Ty::Num(_) | Ty::Ptr(_)) {
+        if !matches!(ty, Ty::Num(_) | Ty::Ptr(_) | Ty::Foreign) {
             out.push(Stmt::Expr(Expr::assign(
                 place.expr,
                 op_str(op),
@@ -1754,7 +1754,7 @@ impl<'a> Gen<'a> {
             };
         };
         let ty = self.place_value_ty(&place);
-        if !matches!(ty, Ty::Num(_) | Ty::Ptr(_)) {
+        if !matches!(ty, Ty::Num(_) | Ty::Ptr(_) | Ty::Foreign) {
             return raw_incdec(place.expr, op);
         }
         let step = Stmt::Expr(compound(op, &ty, int_one()));
@@ -3848,6 +3848,22 @@ mod tests {
             "mutex.set(seqg_var.y.get() as _);",
             // never assigned, so a constant
             "seqg_var.y.set(limit);",
+        ] {
+            assert!(code.contains(e), "{e}\n{code}");
+        }
+    }
+
+    #[test]
+    fn a_global_of_unknown_type_steps_in_its_cell() {
+        let (code, diag) = translate(
+            "program p\n%%foo_t g;\nint y;\nss a {\nstate s {\nwhen () {\ng++;\ny = --g;\n\
+             } state s\n}\n}\n",
+        );
+        assert_eq!(diag, "");
+        let code = words(&code);
+        for e in [
+            "g.modify(|v| *v += 1);",
+            "seqg_var.y.set( g.modify( |v| { *v -= 1; *v }, ) as _, );",
         ] {
             assert!(code.contains(e), "{e}\n{code}");
         }

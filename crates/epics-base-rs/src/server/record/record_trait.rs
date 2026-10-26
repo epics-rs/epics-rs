@@ -7418,9 +7418,9 @@ pub trait Record: RecordAny + Send + Sync + 'static {
     /// Whether [`Self::input_link_request`] is settled by the link field
     /// alone, so the process plan may ask it once for every declared link
     /// when the record is built. `false` for a type whose answer reads
-    /// instance state — aSub (`FTA..FTU`), printf (`FMT`), acalcout
-    /// (`IAAV..ILLV`) — which the fetch loop then asks per link, per cycle,
-    /// through the vtable.
+    /// instance state — aSub (`FTA..FTU`), printf (`FMT`), waveform (`FTVL`,
+    /// `NELM`), acalcout (`IAAV..ILLV`, `NUSE`) — which the fetch loop then
+    /// asks per link, per cycle, through the vtable.
     fn input_link_answers_fixed_at_type(&self) -> bool {
         true
     }
@@ -7437,6 +7437,15 @@ pub trait Record: RecordAny + Send + Sync + 'static {
     ) -> Option<LinkReadAs> {
         let _ = (link_field, source);
         Some(LinkReadAs::Native)
+    }
+
+    /// C's `pdest` of an [`LinkReadAs::Array`] read on `link_field`: the
+    /// buffer as it stands before the read. A CA read keeps it from the
+    /// element that fails to convert on, `dbCaGetLink` ignoring `aConvert`'s
+    /// status (`dbCa.c:519`). `None`, the default, keeps zeros.
+    fn array_read_destination(&self, link_field: &str) -> Option<EpicsValue> {
+        let _ = link_field;
+        None
     }
 
     /// Return the name of the output event (`OEVT`) to post this cycle, or

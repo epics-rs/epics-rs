@@ -1115,6 +1115,12 @@ impl Record for ASubRecord {
         })
     }
 
+    /// `INPx` lands in its value field.
+    fn array_read_destination(&self, link_field: &str) -> Option<EpicsValue> {
+        let (chan, idx) = parse_channel(link_field)?;
+        (chan == Chan::Inp).then(|| self.a[idx].clone())
+    }
+
     /// `FTA..FTU` are fields, so the request above is the instance's.
     fn input_link_answers_fixed_at_type(&self) -> bool {
         false

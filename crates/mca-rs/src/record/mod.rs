@@ -662,6 +662,11 @@ impl Record for McaRecord {
         })
     }
 
+    /// SIOL lands in `bptr` (`mcaRecord.c:1118`).
+    fn array_read_destination(&self, link_field: &str) -> Option<EpicsValue> {
+        (link_field == "SIOL").then(|| self.val.clone())
+    }
+
     /// The `mca` declaration: the table generated from the vendored
     /// `dbd/mcaRecord.dbd`.
     ///

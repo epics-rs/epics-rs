@@ -337,6 +337,55 @@ pub fn get_string_array(
     )
 }
 
+/// [`get_string_array`] for a reader that ignores the status, as
+/// `dbCaGetLink` ignores `aConvert`'s (`dbCa.c:519`): the read is what
+/// `getString<Type>` left in `pdest`, here `prior` (0 past its end). The loop
+/// writes each element it parses, skips one it parses but cannot store, and
+/// returns at the first it cannot parse, so every element from there on is
+/// `prior`'s. `prior` is in `target`'s type, an array or one element.
+pub fn get_string_array_over(
+    target: NumericField,
+    elems: &[crate::types::PvString],
+    prior: Option<&EpicsValue>,
+) -> EpicsValue {
+    macro_rules! rows {
+        ($(($row:ident, $scalar:ident, $array:ident)),+ $(,)?) => {
+            match target {
+                $(NumericField::$row => {
+                    let prior = match prior {
+                        Some(EpicsValue::$array(a)) => a.as_slice(),
+                        Some(EpicsValue::$scalar(v)) => std::slice::from_ref(v),
+                        _ => &[],
+                    };
+                    let mut out: Vec<_> = prior.iter().copied().take(elems.len()).collect();
+                    out.resize(elems.len(), Default::default());
+                    for (s, to) in elems.iter().zip(out.iter_mut()) {
+                        let s = s.as_str_lossy();
+                        match if s.is_empty() { Row::Stored(zero(target)) } else { parse(target, &s) } {
+                            Row::Stored(EpicsValue::$scalar(v)) => *to = v,
+                            Row::Stored(_) | Row::Unchanged => {}
+                            Row::Refused => break,
+                        }
+                    }
+                    EpicsValue::$array(out.into())
+                })+
+            }
+        };
+    }
+    rows!(
+        (Char, Char, CharArray),
+        (UChar, UChar, UCharArray),
+        (Short, Short, ShortArray),
+        (UShort, UShort, UShortArray),
+        (Long, Long, LongArray),
+        (ULong, ULong, ULongArray),
+        (Int64, Int64, Int64Array),
+        (UInt64, UInt64, UInt64Array),
+        (Float, Float, FloatArray),
+        (Double, Double, DoubleArray),
+    )
+}
+
 /// The value C's empty-string carve-out stores: `*to = 0` in the destination's
 /// own type.
 fn zero(target: NumericField) -> EpicsValue {

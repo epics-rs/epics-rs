@@ -2439,7 +2439,9 @@ impl Record for AcalcoutRecord {
     /// Inside that gate and ahead of `dbGetLink`, C allocates the array field
     /// and the shared PAA compare buffer (`:1082-1094`), so a read that then
     /// fails has still paid for both. This answer is that seam: the fetch
-    /// loop asks it once per link, in C's order, right before the read.
+    /// loop asks it once per link, in C's order, right before the read. The
+    /// read is `dbGetLink(plink, DBR_DOUBLE, *pavalue, 0, &nRequest)` with
+    /// `nRequest = acalcGetNumElements(pcalc)` (`:1097-1098`).
     fn input_link_request(&self, link_field: &str) -> InputLinkRequest {
         let Some(i) = Self::ina_index(link_field) else {
             return InputLinkRequest::As(LinkReadAs::Native);
@@ -2449,15 +2451,24 @@ impl Record for AcalcoutRecord {
                 // No post or PMEM here: `monitor()`'s tail closes the cycle.
                 self.mem.allocate(ArrayBuf::Arr(i), self.nelm);
                 self.mem.allocate(ArrayBuf::Paa, self.nelm);
-                InputLinkRequest::As(LinkReadAs::Native)
+                InputLinkRequest::As(LinkReadAs::Array {
+                    dbr: crate::types::DbFieldType::Double,
+                    n_request: self.num_elements(),
+                })
             }
             _ => InputLinkRequest::NotRead,
         }
     }
 
-    /// The request above reads IAAV..ILLV.
+    /// The request above reads IAAV..ILLV and NUSE.
     fn input_link_answers_fixed_at_type(&self) -> bool {
         false
+    }
+
+    /// `INAA..INLL` land in `*pavalue`, the array field itself.
+    fn array_read_destination(&self, link_field: &str) -> Option<EpicsValue> {
+        let i = Self::ina_index(link_field)?;
+        Some(EpicsValue::DoubleArray(self.arr_vals[i].as_slice().into()))
     }
 
     fn set_fetch_gate_failed(&mut self, failed: bool) {

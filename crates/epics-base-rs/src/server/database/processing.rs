@@ -135,6 +135,7 @@ use crate::server::record::{
 };
 use crate::types::{DbFieldType, EpicsValue, PvString, RecordName};
 
+use super::links::ReadDest;
 use super::{FrameGate, InFrame, PvDatabase, debug_armed};
 
 /// C `sCalcoutRecord.c` `STRING_SIZE` (:198) — the 40-byte buffer behind every
@@ -9556,8 +9557,13 @@ impl PvDatabase {
         use crate::server::recgbl::simm::LinkFetch;
         // One read for both halves — see
         // `PvDatabase::read_link_value_and_alarm_at_source`.
-        let (fetch, source_alarm) =
-            self.read_link_value_as_with_alarm(Some(rec), &parsed, read_as, visited);
+        let (fetch, source_alarm) = self.read_link_value_as_with_alarm(
+            Some(rec),
+            &parsed,
+            read_as,
+            ReadDest::Frame(rec, link_field),
+            visited,
+        );
         match fetch {
             LinkFetch::NoData => InputFetch::Nothing,
             // C `dbDbGetValue` tail (dbDbLink.c:228-232): a healthy read
@@ -10912,7 +10918,9 @@ impl PvDatabase {
                 // type; only `Double` and `Enum`'s index are the numeric
                 // funnel's.
                 let raw = !matches!(read_as, LinkReadAs::Double | LinkReadAs::Enum);
-                match self.apply_link_read_as(Some(reader.held), link, read_as, value, render) {
+                let dest = ReadDest::Record(reader.record, link_field);
+                match self.apply_link_read_as(Some(reader.held), link, read_as, value, render, dest)
+                {
                     Some(v) => {
                         *fetch = LinkFetch::Value(v);
                         raw
@@ -11062,9 +11070,14 @@ impl PvDatabase {
     ) -> Option<EpicsValue> {
         use crate::server::record::InputLinkRequest;
         match request {
-            InputLinkRequest::As(read_as) => {
-                self.apply_link_read_as(Some(rec.set()), link, read_as, value, render)
-            }
+            InputLinkRequest::As(read_as) => self.apply_link_read_as(
+                Some(rec.set()),
+                link,
+                read_as,
+                value,
+                render,
+                ReadDest::Frame(rec, link_field),
+            ),
             InputLinkRequest::NotRead => None,
             InputLinkRequest::FromSource => {
                 self.typed_input_value(rec, link_field, link, value, render)
@@ -11081,7 +11094,8 @@ impl PvDatabase {
         render: Option<crate::server::record::record_instance::SourceRender>,
     ) -> Option<EpicsValue> {
         let read_as = self.input_link_read_as(rec, link_field, link)?;
-        self.apply_link_read_as(Some(rec.set()), link, read_as, value, render)
+        let dest = ReadDest::Frame(rec, link_field);
+        self.apply_link_read_as(Some(rec.set()), link, read_as, value, render, dest)
     }
 
     /// C `dbDbGetValue`'s tail, applied to the reader: the ONE place a

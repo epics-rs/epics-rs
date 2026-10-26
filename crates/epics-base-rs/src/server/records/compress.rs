@@ -98,9 +98,10 @@ pub struct CompressRecord {
     /// source's capacity and its delivered length both change exactly when the
     /// source array is re-shaped).
     inpn: usize,
-    /// C's `prec->wptr != NULL`: an INP ingest latched INPN. A `.db` INPN does
-    /// not allocate the working buffer, so it is not this.
-    wptr_held: bool,
+    /// C's `prec->wptr`, `Some` once an INP ingest latched INPN, holding what
+    /// the last read wrote. A `.db` INPN does not allocate the working buffer,
+    /// so it is not this.
+    wptr: Option<Vec<f64>>,
     /// The posts of the `monitor()` an SPC_RESET `special()` ran, a bit per
     /// `RESET_POSTS` entry, until the put drains them.
     reset_posts: u64,
@@ -140,7 +141,7 @@ impl Default for CompressRecord {
             cycle_ingested: false,
             cycle_emitted: false,
             inpn: 0,
-            wptr_held: false,
+            wptr: None,
             reset_posts: 0,
             nuse_moved: false,
         }
@@ -596,7 +597,7 @@ impl Record for CompressRecord {
     /// C allocates `wptr` with the first `inpn` latch and never frees it
     /// (compressRecord.c:334-339).
     fn held_pointer(&self, field: &str) -> Option<usize> {
-        (field == "WPTR" && self.wptr_held).then(|| std::ptr::from_ref(&self.inpn) as usize)
+        (field == "WPTR" && self.wptr.is_some()).then(|| std::ptr::from_ref(&self.inpn) as usize)
     }
 
     fn acts_before_process(&self) -> bool {
@@ -627,6 +628,12 @@ impl Record for CompressRecord {
             },
             _ => LinkReadAs::Native,
         })
+    }
+
+    /// INP lands in `wptr`.
+    fn array_read_destination(&self, link_field: &str) -> Option<EpicsValue> {
+        let wptr = self.wptr.as_deref().filter(|_| link_field == "INP")?;
+        Some(EpicsValue::DoubleArray(wptr.into()))
     }
 
     /// `compressRecord.c:342-366`: a failed `dbGetLink` on INP raises
@@ -1111,15 +1118,25 @@ impl Record for CompressRecord {
     fn set_val(&mut self, value: EpicsValue) -> CaResult<()> {
         let nelements = value.count() as usize;
         if nelements > 0 {
-            if self.wptr_held && nelements != self.inpn {
+            if self.wptr.is_some() && nelements != self.inpn {
                 self.reset();
             }
             self.inpn = nelements;
-            self.wptr_held = true;
+            self.wptr.get_or_insert_default().clear();
         }
         match value {
-            EpicsValue::DoubleArray(arr) => self.push_array(&arr),
-            EpicsValue::Double(v) => self.push_value(v),
+            EpicsValue::DoubleArray(arr) => {
+                if let Some(wptr) = &mut self.wptr {
+                    wptr.extend_from_slice(&arr);
+                }
+                self.push_array(&arr)
+            }
+            EpicsValue::Double(v) => {
+                if let Some(wptr) = &mut self.wptr {
+                    wptr.push(v);
+                }
+                self.push_value(v)
+            }
             other => return self.put_field_internal("VAL", other),
         }
         Ok(())

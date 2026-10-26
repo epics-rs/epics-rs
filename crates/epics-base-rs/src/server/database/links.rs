@@ -106,6 +106,74 @@ fn link_value_get_as(value: EpicsValue, target: DbFieldType) -> Option<EpicsValu
     element_0(value)?.get_convert(target).ok()
 }
 
+/// C's `pdest` of an array read: the reader's buffer for its link field,
+/// asked only when a CA read keeps part of it
+/// ([`ca_array_read`]).
+#[derive(Clone, Copy)]
+pub(crate) enum ReadDest<'a> {
+    /// No reader buffer: what a CA read keeps of it is 0.
+    None,
+    Record(&'a dyn crate::server::record::Record, &'static str),
+    /// The reader in its frame, its data lock not held.
+    Frame(InFrame<'a>, &'static str),
+}
+
+impl ReadDest<'_> {
+    fn buffer(self) -> Option<EpicsValue> {
+        match self {
+            Self::None => None,
+            Self::Record(record, field) => record.array_read_destination(field),
+            Self::Frame(rec, field) => rec.read().record.array_read_destination(field),
+        }
+    }
+}
+
+/// `dbCaGetLink`'s array read at a numeric or `DBR_ENUM` request
+/// (`dbCa.c:507-520`): `ntoget` elements through `aConvert`, whose status is
+/// ignored, so a channel the request cannot convert still reads. `dbGet`'s
+/// one-element scalar convert has no place here, so a string read as
+/// `DBR_ENUM` is `getStringUshort` (`dbConvert.c:1710-1712`), not `cvt_st_e`.
+fn ca_array_read(
+    dbr: DbFieldType,
+    n_request: usize,
+    mut value: EpicsValue,
+    dest: ReadDest<'_>,
+) -> Option<EpicsValue> {
+    if value.is_array() && value.count() != 1 {
+        value.truncate(n_request);
+    } else {
+        value = element_0(value)?;
+    }
+    if let Ok(v) = value.get_convert(dbr) {
+        return Some(v);
+    }
+    // Only a `DBF_STRING` channel fails: what `getString<Type>` left in
+    // `pdest`, which holds the reader's buffer from the failed element on.
+    let row_type = match dbr {
+        DbFieldType::Enum => DbFieldType::UShort,
+        dbr => dbr,
+    };
+    let row = crate::types::c_parse::NumericField::of(row_type)?;
+    let prior = dest.buffer().and_then(|b| b.get_convert(row_type).ok());
+    let read = match &value {
+        EpicsValue::StringArray(elems) => {
+            crate::types::c_parse::get_string_array_over(row, elems, prior.as_ref())
+        }
+        EpicsValue::String(s) => crate::types::c_parse::get_string_array_over(
+            row,
+            std::slice::from_ref(s),
+            prior.as_ref(),
+        )
+        .first_element()?,
+        _ => return None,
+    };
+    Some(match read {
+        EpicsValue::UShortArray(a) if dbr == DbFieldType::Enum => EpicsValue::EnumArray(a),
+        EpicsValue::UShort(v) if dbr == DbFieldType::Enum => EpicsValue::Enum(v),
+        read => read,
+    })
+}
+
 fn empty_read_fetch(
     link: &crate::server::record::ParsedLink,
 ) -> crate::server::recgbl::simm::LinkFetch {
@@ -1184,6 +1252,20 @@ impl PvDatabase {
         }
     }
 
+    /// C's lset for `link` is dbCa: a `CA_LINK`
+    /// ([`ParsedLink::link_type_after_init`](crate::server::record::ParsedLink::link_type_after_init)),
+    /// or a lnkCalc child DB link whose target this IOC does not serve, the
+    /// child being its own `dbInitLink` that no relink pass sees
+    /// (`dbLink.c:118-130`).
+    fn reads_through_db_ca(&self, link: &crate::server::record::ParsedLink) -> bool {
+        match link {
+            crate::server::record::ParsedLink::Db(db) => {
+                matches!(self.db_link_target(db), LinkTarget::External)
+            }
+            _ => link.link_type_after_init() == crate::server::record::DbLinkType::CaLink,
+        }
+    }
+
     /// A DB link's target read by name, for a link whose answer settled
     /// `Absent`.
     fn read_db_target_by_name(&self, db: &crate::server::record::DbLink) -> TargetValue {
@@ -1396,6 +1478,7 @@ impl PvDatabase {
                     None,
                     link,
                     read_as,
+                    ReadDest::None,
                     &mut ProcStack::new(),
                 );
                 InitRead {
@@ -1483,6 +1566,7 @@ impl PvDatabase {
         src: Option<InFrame<'_>>,
         link: &crate::server::record::ParsedLink,
         read_as: crate::server::record::LinkReadAs,
+        dest: ReadDest<'_>,
         visited: &mut ProcStack,
     ) -> (crate::server::recgbl::simm::LinkFetch, Option<SourceAlarm>) {
         self.read_link_value_as_from(
@@ -1490,6 +1574,7 @@ impl PvDatabase {
             src.map(|src| src.set()),
             link,
             read_as,
+            dest,
             visited,
         )
     }
@@ -1502,6 +1587,7 @@ impl PvDatabase {
         held: Option<&super::SetGuard>,
         link: &crate::server::record::ParsedLink,
         read_as: crate::server::record::LinkReadAs,
+        dest: ReadDest<'_>,
         visited: &mut ProcStack,
     ) -> (crate::server::recgbl::simm::LinkFetch, Option<SourceAlarm>) {
         use crate::server::recgbl::simm::LinkFetch;
@@ -1514,7 +1600,7 @@ impl PvDatabase {
         let Some(value) = value else {
             return (empty_read_fetch(link), None);
         };
-        match self.apply_link_read_as(held, link, read_as, value, render) {
+        match self.apply_link_read_as(held, link, read_as, value, render, dest) {
             Some(v) => (LinkFetch::Value(v), alarm),
             None => (LinkFetch::Failed, None),
         }
@@ -1539,10 +1625,11 @@ impl PvDatabase {
         read_as: crate::server::record::LinkReadAs,
         value: EpicsValue,
         render: Option<crate::server::record::record_instance::SourceRender>,
+        dest: ReadDest<'_>,
     ) -> Option<EpicsValue> {
         match read_as {
             crate::server::record::LinkReadAs::Native => Some(value),
-            _ => self.convert_link_read(held, link, read_as, value, render),
+            _ => self.convert_link_read(held, link, read_as, value, render, dest),
         }
     }
 
@@ -1555,6 +1642,7 @@ impl PvDatabase {
         read_as: crate::server::record::LinkReadAs,
         value: EpicsValue,
         render: Option<crate::server::record::record_instance::SourceRender>,
+        dest: ReadDest<'_>,
     ) -> Option<EpicsValue> {
         use crate::server::record::LinkReadAs;
         if let Some(route) = self.text_route_of(link) {
@@ -1580,7 +1668,20 @@ impl PvDatabase {
                 .dbr_string_of(link, value, render)
                 .map(EpicsValue::String),
             LinkReadAs::CharArrayAsString { max_elements } => {
+                // A failed element ends the string. C reads in place into VAL
+                // (`printfRecord.c:246`), so `strlen` at :256 runs on into a
+                // previous VAL's bytes there: a C defect, not copied.
+                let value = if self.reads_through_db_ca(link) {
+                    ca_array_read(DbFieldType::Char, max_elements, value, ReadDest::None)?
+                } else {
+                    value
+                };
                 char_bytes_as_string(&value, max_elements).map(EpicsValue::String)
+            }
+            LinkReadAs::Array { dbr, n_request }
+                if dbr != DbFieldType::String && self.reads_through_db_ca(link) =>
+            {
+                ca_array_read(dbr, n_request, value, dest)
             }
             LinkReadAs::Array { dbr, n_request } => {
                 self.array_read_of(held, link, dbr, n_request, value, render)
@@ -1823,18 +1924,20 @@ impl PvDatabase {
                 // nothing (`dbConstLink.c:219-225`).
                 CalcArg::Literal(n) => *n,
                 CalcArg::Link(link) => {
-                    let (value, alarm) = self.read_calc_input(link, reader);
+                    use crate::server::recgbl::simm::LinkFetch;
+                    let (fetch, alarm) = self.read_calc_input(link, reader);
                     if let Some(alarm) = alarm {
                         raise(&mut raised, alarm);
                     }
-                    if let Some(value) = value {
+                    if let LinkFetch::Value(EpicsValue::Double(value)) = fetch {
                         calc.val.set_arg(i, value);
-                        // `readLocked` (`lnkCalc.c:539-549`).
-                        if tinp == Some(i)
-                            && let Some((time, utag)) = self.db_get_time_stamp_tag(link)
-                        {
-                            calc.val.set_stamp(time, utag);
-                        }
+                    }
+                    // `readLocked` (`lnkCalc.c:539-549`).
+                    if tinp == Some(i)
+                        && !matches!(fetch, LinkFetch::Failed)
+                        && let Some((time, utag)) = self.db_get_time_stamp_tag(link)
+                    {
+                        calc.val.set_stamp(time, utag);
                     }
                     calc.val.arg(i)
                 }
@@ -1849,24 +1952,35 @@ impl PvDatabase {
     }
 
     /// One lnkCalc input, C `dbGetLink(child, DBR_DOUBLE, &clink->arg[i])`
-    /// on a child whose `precord` is the reader (`lnkCalc.c:458`): the value,
-    /// `None` when the read failed, and what the read raises on the reader.
-    /// It never processes the target. Every input is its own `dbInitLink`
-    /// link, so the read carries the locality split, and a DB input the
-    /// self-exclusion, of any other link.
+    /// on a child whose `precord` is the reader (`lnkCalc.c:458`): C's
+    /// `(status, buffer)` pair, the value a `DOUBLE`, and what the read
+    /// raises on the reader. It never processes the target. Every input is
+    /// its own `dbInitLink` link, so the read carries the locality split, and
+    /// a DB input the self-exclusion, of any other link.
     fn read_calc_input(
         &self,
         link: &crate::server::record::ParsedLink,
         reader: Option<&Arc<RecordCell>>,
-    ) -> (Option<f64>, Option<LinkAlarm>) {
+    ) -> (crate::server::recgbl::simm::LinkFetch, Option<LinkAlarm>) {
+        use crate::server::recgbl::simm::LinkFetch;
         // A constant delivers nothing over what `dbLoadLink` put in `arg[i]`
         // when the link opened (`lnkCalc.c:459`).
         if crate::server::recgbl::simm::has_const_lset(link) {
-            return (None, None);
+            return (LinkFetch::NoData, None);
         }
         let (value, alarm, _) = self.read_link_value_and_alarm(link, reader, false);
-        let Some(value) = value.and_then(link_value_as_f64) else {
-            return (None, self.get_link_failure(link, CHILD_LINK_FIELD));
+        let fetch = match value.map(link_value_as_f64) {
+            Some(Some(value)) => LinkFetch::Value(EpicsValue::Double(value)),
+            // `nReq` is not NULL, so a CA child is `dbCaGetLink`'s counted
+            // read: an element `getStringDouble` refuses, or none at all,
+            // leaves `arg[i]` with status 0 (`dbCa.c:507-524`).
+            Some(None) if self.reads_through_db_ca(link) => LinkFetch::NoData,
+            _ => {
+                return (
+                    LinkFetch::Failed,
+                    self.get_link_failure(link, CHILD_LINK_FIELD),
+                );
+            }
         };
         let alarm = alarm
             .and_then(|alarm| {
@@ -1880,7 +1994,7 @@ impl PvDatabase {
                     amsg: amsg.cloned().unwrap_or_default(),
                 })
             });
-        (Some(value), alarm)
+        (fetch, alarm)
     }
 
     /// **The single owner of a process-time link read that carries both a
@@ -2024,7 +2138,7 @@ impl PvDatabase {
         else {
             return (None, None);
         };
-        match self.apply_link_read_as(Some(held), link, read_as, value, render) {
+        match self.apply_link_read_as(Some(held), link, read_as, value, render, ReadDest::None) {
             Some(value) => (Some(value), alarm),
             None => (None, None),
         }
@@ -7323,6 +7437,7 @@ mod db_link_addr_tests {
                 None,
                 &parsed,
                 LinkReadAs::Double,
+                super::ReadDest::None,
                 &mut ProcStack::new(),
             );
             let general = match fetch {
@@ -7386,6 +7501,7 @@ mod db_link_addr_tests {
                 None,
                 &parse_link_v2(src),
                 read_as,
+                super::ReadDest::None,
                 &mut ProcStack::new(),
             );
             let got = match fetch {
@@ -7439,8 +7555,13 @@ mod db_link_addr_tests {
             for read_as in requests {
                 let held = db.lock_record(&link.target().record);
                 let (value, alarm) = db.read_db_link_as_at(held.set(), &parsed, &at, read_as);
-                let (fetch, general_alarm) =
-                    db.read_link_value_as_with_alarm(None, &parsed, read_as, &mut ProcStack::new());
+                let (fetch, general_alarm) = db.read_link_value_as_with_alarm(
+                    None,
+                    &parsed,
+                    read_as,
+                    super::ReadDest::None,
+                    &mut ProcStack::new(),
+                );
                 let general = match fetch {
                     crate::server::recgbl::simm::LinkFetch::Value(v) => Some(v),
                     _ => None,
@@ -7763,6 +7884,7 @@ mod enum_read_held_set_tests {
                 Some(gate.frame(&cell)),
                 &parse_link_v2(format!("BSRC.{field} NPP")),
                 LinkReadAs::Enum,
+                super::ReadDest::None,
                 &mut ProcStack::new(),
             );
             drop(gate);

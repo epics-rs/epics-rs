@@ -1279,6 +1279,11 @@ impl Record for WaveformRecord {
         )
     }
 
+    /// Each read above lands in `bptr`.
+    fn array_read_destination(&self, link_field: &str) -> Option<EpicsValue> {
+        matches!(link_field, "INP" | "SIOL" | "DOL").then(|| self.val.clone())
+    }
+
     /// `FTVL` and `NELM` are fields, so the request above is the instance's.
     fn input_link_answers_fixed_at_type(&self) -> bool {
         false

@@ -1,0 +1,153 @@
+//! C init_record clears UDF only under `if (pmr->dol.type == CONSTANT)`
+//! (motorRecord.cc:677-681). An unset DOL and a literal one are CONSTANT; a
+//! `{const:5}` DOL is a JSON_LINK (`dbStaticLib.c:2280-2287`), so the record
+//! stays undefined and its first process raises UDF/INVALID in alarm_sub
+//! (:3372-3376), as the C oracle (oracleMotorIoc on motorSim) reads.
+
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use asyn_rs::error::AsynResult;
+use asyn_rs::interfaces::motor::{AsynMotor, MotorStatus, PollFailure};
+use asyn_rs::registry::open_owner;
+use asyn_rs::user::AsynUser;
+use epics_base_rs::server::database::PvDatabase;
+use epics_base_rs::server::ioc_builder::IocBuilder;
+use epics_base_rs::server::recgbl::alarm_status;
+use motor_rs::builder::{ControllerAxis, ControllerBuilder};
+use motor_rs::devices::{device_support_factory, devices, register_axis, register_controller_port};
+use motor_rs::poll_loop::PollCommand;
+use motor_rs::trace::TraceUser;
+
+/// A done axis that reads step 0 on its first poll and step 3 after, so a
+/// later poll posts a changed status and processes the record.
+struct Arrives {
+    polls: u32,
+}
+
+impl AsynMotor for Arrives {
+    fn move_absolute(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: f64) -> AsynResult<()> {
+        Ok(())
+    }
+    fn move_relative(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: f64) -> AsynResult<()> {
+        Ok(())
+    }
+    fn home(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: bool) -> AsynResult<()> {
+        Ok(())
+    }
+    fn stop(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
+        Ok(())
+    }
+    fn set_position(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
+        Ok(())
+    }
+    fn poll_failure(&self) -> PollFailure {
+        PollFailure::PROBLEM_AND_COMMS_ERROR
+    }
+    fn poll(&mut self, _: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
+        self.polls += 1;
+        *status = MotorStatus {
+            position: if self.polls > 1 { 3.0 } else { 0.0 },
+            done: true,
+            ..MotorStatus::default()
+        };
+        Ok(())
+    }
+}
+
+/// Boot one motor per `(name, fields)` on axes 0.. of `port`, then poll each
+/// axis once so its changed status processes the record.
+async fn boot(port: &str, motors: &[(&str, &str)], check: impl FnOnce(&PvDatabase)) {
+    register_controller_port(&open_owner(), port, motors.len() as i32, ()).unwrap();
+    let mut controller = ControllerBuilder::new();
+    let axes: Vec<ControllerAxis> = (0..motors.len())
+        .map(|addr| {
+            controller.axis(
+                Arc::new(Mutex::new(Arrives { polls: 0 })),
+                TraceUser::Asyn {
+                    port: port.into(),
+                    addr: addr as i32,
+                },
+            )
+        })
+        .collect();
+    let hour = Duration::from_secs(3600);
+    let first = controller.axes();
+    let poller = controller.build(hour, hour, 0).start();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while first.first_polls_pending() > 0 {
+        assert!(Instant::now() < deadline, "the startup pass never ended");
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    let polls: Vec<_> = axes.iter().map(|a| a.poll_cmd_tx.clone()).collect();
+    for ControllerAxis { axis, .. } in axes {
+        register_axis(axis).unwrap();
+    }
+    let db: String = motors
+        .iter()
+        .enumerate()
+        .map(|(addr, (name, fields))| {
+            format!(
+                r#"record(motor, "{name}") {{ field(DTYP, "asynMotor") field(OUT, "@asyn({port},{addr})") field(MRES, "1") {fields} }}"#
+            )
+        })
+        .collect();
+    let (name, factory) = motor_rs::motor_record_factory();
+    let (db, _) = IocBuilder::new()
+        .register_record_type(name, factory)
+        .register_dynamic_device_support(&devices(), device_support_factory())
+        .db_string(&db, &HashMap::new())
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    for tx in &polls {
+        tx.send(PollCommand::ForcePoll).await.unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    for rec in motors.iter().map(|(name, _)| name) {
+        assert_eq!(num(&db, &format!("{rec}.RBV")), 3.0, "{rec} processed");
+    }
+    check(&db);
+    polls[0].send(PollCommand::Shutdown).await.unwrap();
+    poller.await;
+}
+
+fn num(db: &PvDatabase, pv: &str) -> f64 {
+    db.get_pv(pv).unwrap().to_f64().unwrap()
+}
+
+fn udf(db: &PvDatabase, rec: &str) -> u8 {
+    db.get_record(rec).unwrap().read().common.udf
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn only_a_constant_type_dol_clears_udf_at_init() {
+    boot(
+        "UDFDOL",
+        &[
+            ("UD:json", r#"field(DOL, "{const:5}")"#),
+            (
+                "UD:jsoncl",
+                r#"field(DOL, "{const:5}") field(OMSL, "closed_loop")"#,
+            ),
+            ("UD:unset", ""),
+            ("UD:lit", r#"field(DOL, "5")"#),
+        ],
+        |db| {
+            for rec in ["UD:json", "UD:jsoncl"] {
+                assert_eq!(udf(db, rec), 1, "{rec}");
+                let stat = num(db, &format!("{rec}.STAT")) as u16;
+                assert_eq!(stat, alarm_status::UDF_ALARM, "{rec}");
+                assert_eq!(num(db, &format!("{rec}.SEVR")), 3.0, "{rec} INVALID");
+                assert_eq!(num(db, &format!("{rec}.VAL")), 0.0, "{rec}");
+            }
+            for rec in ["UD:unset", "UD:lit"] {
+                assert_eq!(udf(db, rec), 0, "{rec}");
+                assert_eq!(num(db, &format!("{rec}.SEVR")), 0.0, "{rec}");
+            }
+        },
+    )
+    .await;
+}

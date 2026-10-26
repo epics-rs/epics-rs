@@ -952,16 +952,14 @@ impl Record for MotorRecord {
     /// there: its tail and `monitor()` (`MotorRecord::init_tail`), and
     /// 677-681: a CONSTANT .dol, an unset one included, leaves the record
     /// defined. A DB_LINK / CA DOL stays undefined until the closed-loop
-    /// collection's first read (1994-2005).
+    /// collection's first read (1994-2005), and a `{const:…}` one, a
+    /// JSON_LINK, until a VAL put.
     fn post_init_finalize_undef(&mut self, udf: &mut u8) -> CaResult<()> {
         if !self.initialized {
             return Ok(());
         }
         self.init_tail();
-        if matches!(
-            parse_link_v2(&self.links.dol),
-            ParsedLink::None | ParsedLink::Constant(_)
-        ) {
+        if parse_link_v2(&self.links.dol).is_constant_type() {
             *udf = 0;
         }
         Ok(())

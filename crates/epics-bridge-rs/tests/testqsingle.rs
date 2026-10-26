@@ -17,7 +17,7 @@
 //! the target's own selection for no reason.
 #![cfg(feature = "qsrv-core")]
 
-// RTEMS-EXEC-MODEL-ALLOW(42): checked - these run and pass in the exec-backend
+// RTEMS-EXEC-MODEL-ALLOW(43): checked - these run and pass in the exec-backend
 // suite.
 
 use std::sync::Arc;

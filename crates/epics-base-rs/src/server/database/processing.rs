@@ -1055,7 +1055,8 @@ impl AsyncDbHandle {
 
     /// C `dbNameToAddr(name)` succeeding: `name` is a field this database
     /// serves. `held` is the record the caller holds, as a device's own
-    /// record during its `init` or `process`, which is asked directly.
+    /// record during its `init` or `process`, which is asked directly; any
+    /// other is resolved without its lock, as [`Self::name_to_addr`].
     pub fn has_pv(
         &self,
         name: impl AsRef<[u8]>,
@@ -1065,13 +1066,15 @@ impl AsyncDbHandle {
         let (base, field) = super::parse_pv_name(name);
         match held {
             Some((own, rec)) if own == base => rec.get_field(field).is_some(),
-            _ => self.db().is_some_and(|db| db.get_pv(name).is_ok()),
+            _ => self.name_to_addr(name).is_some(),
         }
     }
 
     /// C `dbGet(&addr, DBR_STRING, buf, 0, 0, 0)`: one element as the
     /// source renders it, cut to `MAX_STRING_SIZE`. `None` is a failed
-    /// `dbGet`. `held` as for [`Self::has_pv`].
+    /// `dbGet`. `held` as for [`Self::has_pv`]; another record is read as
+    /// [`Self::db_get`] reads it, with no wait on a lock set the caller's
+    /// own hold could be keeping its holder from.
     pub fn get_dbr_string(
         &self,
         name: impl AsRef<[u8]>,
@@ -1080,19 +1083,8 @@ impl AsyncDbHandle {
         let name = name.as_ref();
         let (base, field) = super::parse_pv_name(name);
         let rendered = match held {
-            Some((own, rec)) if own == base => {
-                let value = rec.get_field(field)?;
-                crate::server::record::record_instance::SourceRender::of_record(rec, field, &value)
-                    .dbr_string(value)
-            }
-            _ => {
-                let db = self.db()?;
-                let value = db.get_pv(name).ok()?;
-                match db.get_record(base) {
-                    Some(rec) => rec.read().source_render_of(field, &value).dbr_string(value),
-                    None => crate::server::record::record_instance::value_as_dbr_string(&value),
-                }
-            }
+            Some((own, rec)) if own == base => own_dbr_string(rec, field),
+            _ => self.db()?.db_get_dbr_string(name),
         };
         rendered.map(crate::types::codec::cap_dbr_string)
     }
@@ -13604,9 +13596,32 @@ impl PvDatabase {
         name: &[u8],
         own: Option<OwnRecord<'_>>,
     ) -> Option<crate::server::snapshot::Snapshot> {
+        self.db_get_owed(name, own, |pv| Some(pv.snapshot()), snapshot_at)
+    }
+
+    /// [`AsyncDbHandle::get_dbr_string`]'s read of a record other than the
+    /// caller's, taken as [`Self::db_get_snapshot`] takes its read.
+    fn db_get_dbr_string(&self, name: &[u8]) -> Option<PvString> {
+        self.db_get_owed(
+            name,
+            None,
+            |pv| crate::server::record::record_instance::value_as_dbr_string(&pv.get()),
+            dbr_string_at,
+        )
+    }
+
+    /// `read` of `name`'s field under a hold of its set, or by the set's
+    /// holder at its release; `simple` answers a simple PV.
+    fn db_get_owed<T: Send + 'static>(
+        &self,
+        name: &[u8],
+        own: Option<OwnRecord<'_>>,
+        simple: impl FnOnce(&crate::server::pv::ProcessVariable) -> Option<T>,
+        read: FieldRead<T>,
+    ) -> Option<T> {
         // [`PvDatabase::get_pv`]'s order: a simple PV, then a record.
         if let Some(pv) = self.simple_pv_bytes(name) {
-            return Some(pv.snapshot());
+            return simple(&pv);
         }
         let (base, field) = super::parse_pv_name(name);
         let cell = self.get_record(base)?;
@@ -13614,13 +13629,14 @@ impl PvDatabase {
         cell.no_elements(&field)?;
         let own = own.and_then(|own| Some((self.get_record(own.name())?, own)));
         let own = own.as_ref().map(|(cell, own)| (&**cell, *own));
-        if let Some(read) = self.db_get_held(&cell, &field, own) {
-            return read;
+        if let Some(got) = self.db_get_held(&cell, &field, own, read) {
+            return got;
         }
         let read = Arc::new(OwedDbGet {
             db: Arc::downgrade(&self.inner),
             cell: Arc::clone(&cell),
             field,
+            read,
             got: parking_lot::Mutex::new(None),
             reader: std::thread::current(),
         });
@@ -13634,7 +13650,7 @@ impl PvDatabase {
             wait.serve(own);
             // The holder can let the set go between its last look at what it
             // owed and its unlock.
-            if let Some(got) = self.db_get_held(&cell, &read.field, own) {
+            if let Some(got) = self.db_get_held(&cell, &read.field, own, read.read) {
                 *read.got.lock() = Some(None);
                 return got;
             }
@@ -13647,37 +13663,79 @@ impl PvDatabase {
         }
     }
 
-    /// `field` of `cell` under a hold of its set, `None` while another thread
-    /// holds it. Held, a read that fails is the field's own answer.
-    fn db_get_held(
+    /// `read` of `field` of `cell` under a hold of its set, `None` while
+    /// another thread holds it. Held, a read that fails is the field's own
+    /// answer.
+    fn db_get_held<T>(
         &self,
         cell: &Arc<RecordCell>,
         field: &str,
         own: Option<(&RecordCell, OwnRecord<'_>)>,
-    ) -> Option<Option<crate::server::snapshot::Snapshot>> {
+        read: FieldRead<T>,
+    ) -> Option<Option<T>> {
         let _held = cell.lock_record().try_acquire()?;
-        Some(self.channel_snapshot_for_field_guarded(
-            cell,
-            field,
-            false,
-            &mut std::collections::HashSet::new(),
-            ReadPolicy::NoWait { own },
-        ))
+        Some(read(self, cell, field, ReadPolicy::NoWait { own }))
     }
 }
 
-/// A [`PvDatabase::db_get_snapshot`] owed to the set of a record held
+/// What [`PvDatabase::db_get_owed`] reads of a field, its set held.
+type FieldRead<T> = fn(&PvDatabase, &Arc<RecordCell>, &str, ReadPolicy<'_>) -> Option<T>;
+
+/// The field's value and metadata: C `dbGet` with options.
+fn snapshot_at(
+    db: &PvDatabase,
+    cell: &Arc<RecordCell>,
+    field: &str,
+    policy: ReadPolicy<'_>,
+) -> Option<crate::server::snapshot::Snapshot> {
+    db.channel_snapshot_for_field_guarded(
+        cell,
+        field,
+        false,
+        &mut std::collections::HashSet::new(),
+        policy,
+    )
+}
+
+/// The field as C `dbGet(DBR_STRING)` renders it at its source, uncut.
+fn dbr_string_at(
+    db: &PvDatabase,
+    cell: &Arc<RecordCell>,
+    field: &str,
+    policy: ReadPolicy<'_>,
+) -> Option<PvString> {
+    if let Some(own) = policy.own(cell) {
+        return own_dbr_string(own.record(), field);
+    }
+    let addr = crate::server::record::record_instance::FieldAddr::resolve_in(cell, field);
+    policy
+        .read(cell, |inst| {
+            let value = db.read_field_at(inst, field, addr)?;
+            inst.source_render_of(field, &value).dbr_string(value)
+        })
+        .flatten()
+}
+
+/// [`dbr_string_at`] of the record the caller is inside, through its view.
+fn own_dbr_string(rec: &dyn crate::server::record::Record, field: &str) -> Option<PvString> {
+    let value = rec.get_field(field)?;
+    crate::server::record::record_instance::SourceRender::of_record(rec, field, &value)
+        .dbr_string(value)
+}
+
+/// A [`PvDatabase::db_get_owed`] read owed to the set of a record held
 /// elsewhere. `got` is `Some` once it is answered, by the set's holder or by
 /// the reader itself.
-struct OwedDbGet {
+struct OwedDbGet<T> {
     db: std::sync::Weak<super::PvDatabaseInner>,
     cell: Arc<RecordCell>,
     field: String,
-    got: parking_lot::Mutex<Option<Option<crate::server::snapshot::Snapshot>>>,
+    read: FieldRead<T>,
+    got: parking_lot::Mutex<Option<Option<T>>>,
     reader: std::thread::Thread,
 }
 
-impl super::OwedRead for OwedDbGet {
+impl<T: Send> super::OwedRead for OwedDbGet<T> {
     fn cell(&self) -> &RecordCell {
         &self.cell
     }
@@ -13704,11 +13762,10 @@ impl super::OwedRead for OwedDbGet {
         let Some(inner) = self.db.upgrade() else {
             return;
         };
-        *got = Some(PvDatabase { inner }.channel_snapshot_for_field_guarded(
+        *got = Some((self.read)(
+            &PvDatabase { inner },
             &self.cell,
             &self.field,
-            false,
-            &mut std::collections::HashSet::new(),
             ReadPolicy::Served { own },
         ));
         self.reader.unpark();

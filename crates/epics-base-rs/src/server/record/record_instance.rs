@@ -3665,6 +3665,13 @@ impl RecordCell {
         self.runtime_types.store(Arc::new(runtime_types_of(inst)));
         self.long_string_size
             .store(long_string_size_of(inst), Relaxed);
+        self.settle_info_facts(inst);
+    }
+
+    /// Re-read [`Self::form_string`] and [`Self::nsec_mask`], the facts taken
+    /// from the record's info tags.
+    fn settle_info_facts(&self, inst: &RecordInstance) {
+        use std::sync::atomic::Ordering::Relaxed;
         self.form_string.store(
             crate::server::database::char_view::form_string_of(inst),
             Relaxed,
@@ -4277,6 +4284,17 @@ impl Drop for RecordMut<'_> {
 }
 
 impl<'a> RecordMut<'a> {
+    /// [`RecordInstance::set_info`], with the facts the cell takes from info
+    /// tags re-read: pvxs reads `Q:form` and `Q:time:tag` each time a channel
+    /// is made (`ioc/channel.cpp:43`, `ioc/typeutils.cpp:83`), so a tag set on
+    /// a live record reaches the next channel.
+    pub fn set_info(&mut self, key: impl Into<String>, value: impl Into<String>) {
+        let instance: &mut RecordInstance = self;
+        instance.set_info(key, value);
+        let cell = self.cell;
+        cell.settle_info_facts(self);
+    }
+
     /// The borrow let go and the set kept, for a dset call the record is lent
     /// to as a `HeldInstance`.
     pub(crate) fn lend(mut self) -> LentRecord<'a> {
@@ -17592,6 +17610,26 @@ mod mlis_tests {
             assert_eq!(owned(&*record), fresh, "{record_type}");
         }
         assert!(owning >= 28, "{owning} owned common names");
+    }
+
+    /// An info tag set on a live record reaches the facts the cell settled
+    /// from it, as pvxs reads the tag afresh for each channel.
+    #[epics_macros_rs::epics_test]
+    async fn an_info_tag_set_on_a_live_record_resettles_its_facts() {
+        let (db, _) = crate::server::ioc_builder::IocBuilder::new()
+            .db_string(r#"record(ai, "INFO:LIVE") {}"#, &Default::default())
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        db.ioc_init().await;
+        let rec = db.get_record("INFO:LIVE").unwrap();
+        assert!(!rec.form_string());
+        assert_eq!(rec.qtime_nsec_mask(), 0);
+        rec.write().set_info("Q:form", "String");
+        rec.write().set_info("Q:time:tag", "nsec:lsb:4");
+        assert!(rec.form_string());
+        assert_eq!(rec.qtime_nsec_mask(), 0xF);
     }
 
     /// A record whose one monitor watches the field its cycle posts: a

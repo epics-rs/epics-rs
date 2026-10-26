@@ -112,7 +112,7 @@ impl PvSystem {
     }
 
     /// `pvSysFlush`: send what the calling thread has queued. The
-    /// [`Dispatcher`] sends each request as it takes it, so nothing waits
+    /// `Dispatcher` sends each request as it takes it, so nothing waits
     /// for a flush.
     pub fn flush(&self) -> PvStat {
         PvStat::Ok

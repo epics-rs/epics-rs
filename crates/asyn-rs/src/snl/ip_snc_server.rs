@@ -6,7 +6,7 @@
 //!
 //! The block keeps its asynUser, event and registration in the `char *`
 //! variables `pasynUser`, `eventId` and `registrarPvt`. Here they are a
-//! [`Server`] owned by the program's one state set, on its thread.
+//! `Server` owned by the program's one state set, on its thread.
 
 use std::cell::RefCell;
 use std::sync::{Arc, Condvar, Mutex};

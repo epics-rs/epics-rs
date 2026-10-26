@@ -9,7 +9,7 @@ use std::time::Duration;
 use epics_base_rs::runtime::task;
 use epics_base_rs::types::{EpicsValue, PvString};
 
-use crate::harness::{Ioc, Meter, boot};
+use crate::harness::{Ioc, Meter, boot, load};
 use crate::support::eventually;
 
 /// The 6517A behind `Dmm=E1:`.
@@ -264,6 +264,22 @@ async fn a_read_behind_a_reset_closes_its_relay_after_it() {
     assert_eq!(ioc.f64_of("Dmm_raw"), 3.0);
     ioc.read(&["*trg;fetch?"]).await;
     assert_eq!(ioc.f64_of("Dmm_raw"), 3.0);
+}
+
+/// Boot's reset goes out ahead of the relay however long it takes, so the
+/// first read reads channel 1. C's mode_change closed the relay from its
+/// own thread, so a reset that landed after it opened every relay, and the
+/// first read went out with none closed.
+#[epics_base_rs::epics_test]
+async fn a_slow_boot_reset_goes_out_ahead_of_the_relay() {
+    let ioc = load(&EM).await;
+    let reset = ioc.hold("init_string");
+    ioc.start(&EM, 4).await;
+    ioc.commands(&[]).await;
+    reset.release();
+    booted(&ioc).await;
+    ioc.read(&["*trg;fetch?"]).await;
+    assert_eq!(ioc.f64_of("Dmm_raw"), 1.0);
 }
 
 /// The first read after boot reads channel 1 through the relay boot

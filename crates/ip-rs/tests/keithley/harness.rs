@@ -39,9 +39,16 @@ pub struct Ioc {
     _scan: ScanOwner,
 }
 
-/// The template loaded with `P=k:,Dmm=<dmm>` past `iocInit`, and
-/// `seq &<program>, "P=k:,Dmm=<dmm>,channels=<channels>,model=<model>"`.
+/// [`load`], then [`Ioc::start`].
 pub async fn boot(meter: &Meter, channels: u32) -> Ioc {
+    let ioc = load(meter).await;
+    ioc.start(meter, channels).await;
+    ioc
+}
+
+/// The template loaded with `P=k:,Dmm=<dmm>` past `iocInit`, the program
+/// not yet started.
+pub async fn load(meter: &Meter) -> Ioc {
     let mock = Keithley::start(meter.modes, meter.read);
     ip_rs::register_ip_dbd();
     let no_db = Arc::new(PvDatabase::new());
@@ -69,11 +76,9 @@ pub async fn boot(meter: &Meter, channels: u32) -> Ioc {
         .unwrap();
     db.ioc_init().await;
     let scan = ScanOwner::start(db.clone());
-    let seq = format!(
-        r#"seq &{}, "P=k:,Dmm={},channels={channels},model={}""#,
-        meter.program, meter.dmm, meter.model
-    );
-    sh(&db, &seq).await;
+    // iocInit's PINI pass, which takes each record's lock set, ends before
+    // st.cmd goes on.
+    db.wait_for_pini().await;
     Ioc {
         db,
         prefix: format!("k:{}", meter.dmm),
@@ -92,6 +97,15 @@ impl Held {
 }
 
 impl Ioc {
+    /// `seq &<program>, "P=k:,Dmm=<dmm>,channels=<channels>,model=<model>"`.
+    pub async fn start(&self, meter: &Meter, channels: u32) {
+        let seq = format!(
+            r#"seq &{}, "P=k:,Dmm={},channels={channels},model={}""#,
+            meter.program, meter.dmm, meter.model
+        );
+        sh(&self.db, &seq).await;
+    }
+
     /// `{P}{Dmm}<record>`'s lock set, taken: a put of the program's to it
     /// waits, and with it the state set that put it, until the release.
     pub fn hold(&self, record: &str) -> Held {

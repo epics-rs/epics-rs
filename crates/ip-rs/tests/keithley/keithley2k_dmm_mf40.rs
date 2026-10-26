@@ -9,7 +9,7 @@ use std::time::Duration;
 use epics_base_rs::runtime::task;
 use epics_base_rs::types::{EpicsValue, PvString};
 
-use crate::harness::{Ioc, Meter, boot};
+use crate::harness::{Ioc, Meter, boot, load};
 use crate::support::eventually;
 
 /// The 2700 behind `Dmm=D1:`.
@@ -233,6 +233,23 @@ async fn init_dmm_during_a_scan_waits_for_its_end() {
     }
     assert_eq!(ioc.f64_of("done_read"), 0.0);
     assert_eq!(ioc.f64_of("init_dmm"), 0.0);
+}
+
+/// Boot's reset goes out ahead of the mode and the relay however long it
+/// takes, so the first read reads channel 1. C's mode_change configured the
+/// mode and closed the relay from its own thread, so a reset that landed
+/// after them opened every relay, and the first read went out with none
+/// closed.
+#[epics_base_rs::epics_test]
+async fn a_slow_boot_reset_goes_out_ahead_of_the_relay() {
+    let ioc = load(&DMM).await;
+    let reset = ioc.hold("init_string");
+    ioc.start(&DMM, 4).await;
+    ioc.commands(&[]).await;
+    reset.release();
+    booted(&ioc).await;
+    ioc.read(&["read?"]).await;
+    assert_eq!(ioc.f64_of("Dmm_raw"), 101.0);
 }
 
 /// A read behind an `init_dmm` reset closes its relay after the reset, and

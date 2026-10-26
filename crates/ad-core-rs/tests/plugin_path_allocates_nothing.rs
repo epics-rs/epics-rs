@@ -11,7 +11,9 @@
 //! that only counts. Everything the publish sets off is counted, on
 //! every thread; only the driver's own fill of the frame is not. A frame
 //! with driver attributes allocates nothing either, where C's copy news
-//! each one (NDArrayPool.cpp:301, NDAttribute.cpp:113).
+//! each one (NDArrayPool.cpp:301, NDAttribute.cpp:113). A plugin with its
+//! own attributes file evaluates the set under its port lent to its thread,
+//! and that lend is all it allocates.
 //!
 //! Each frame waits for both ports to apply its posts, as C's plugin thread
 //! writes them under the port lock before it takes the next array. A port
@@ -103,14 +105,17 @@ impl NDPluginProcess for Forward {
     }
 }
 
-/// Counts what reaches it.
-struct Sink(Arc<AtomicUsize>);
+/// Counts what reaches it, and what of that carries the plugin file's `Cnt`.
+struct Sink(Arc<AtomicUsize>, Arc<AtomicUsize>);
 
 impl NDPluginProcess for Sink {
     const ASYN_FLAGS: PortFlags = ASYN_CANBLOCK;
     const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
     const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS;
-    fn process_array(&self, _array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
+    fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
+        if array.attributes.get("Cnt").is_some() {
+            self.1.fetch_add(1, Ordering::Relaxed);
+        }
         self.0.fetch_add(1, Ordering::Release);
         ProcessResult::sink(Vec::new())
     }
@@ -182,22 +187,43 @@ const FRAMES: usize = 512;
 /// What a driver's `getAttributes` puts on each frame (simDetector.cpp:828).
 const DRIVER_ATTRIBUTES: [&str; 4] = ["ColorMode", "BayerPattern", "Gain", "Exposure"];
 
+/// The forwarding plugin's own `NDAttributesFile`, which its
+/// `endProcessCallbacks` evaluates onto each copy (NDPluginDriver.cpp:285).
+const PLUGIN_ATTRIBUTES: &str = r#"<Attributes>
+    <Attribute name="Cnt" type="PARAM" source="ARRAY_COUNTER" datatype="INT"/>
+    <Attribute name="Tag" type="CONST" source="abc" datatype="STRING"/>
+</Attributes>"#;
+
+/// A lend of a port to a caller's thread: its cancel token, its reply
+/// channel and the no-op request the actor parks on.
+const LEND: usize = 3;
+
 #[test]
 fn a_steady_frame_through_two_plugins_allocates_nothing() {
-    let bare = steady_allocs(["ZALLOC_FWD", "ZALLOC_SINK"], &[]);
+    let bare = steady_allocs(["ZALLOC_FWD", "ZALLOC_SINK"], &[], None);
     assert_eq!(bare, 0, "{FRAMES} bare frames after {WARM} warm-up ones");
-    let attributed = steady_allocs(["ZALLOC_AFWD", "ZALLOC_ASINK"], &DRIVER_ATTRIBUTES);
+    let attributed = steady_allocs(["ZALLOC_AFWD", "ZALLOC_ASINK"], &DRIVER_ATTRIBUTES, None);
     assert_eq!(
         attributed, 0,
         "{FRAMES} frames with driver attributes after {WARM} warm-up ones"
     );
+    let filed = steady_allocs(
+        ["ZALLOC_FFWD", "ZALLOC_FSINK"],
+        &[],
+        Some(PLUGIN_ATTRIBUTES),
+    );
+    assert!(
+        filed <= LEND * FRAMES,
+        "{filed} allocations in {FRAMES} frames through a plugin with an attributes file"
+    );
 }
 
 /// The allocations of `FRAMES` frames, each carrying `attributes`, through
-/// a fresh chain on `ports`.
-fn steady_allocs(ports: [&str; 2], attributes: &[&str]) -> usize {
+/// a fresh chain on `ports` whose forwarding plugin loads `file`.
+fn steady_allocs(ports: [&str; 2], attributes: &[&str], file: Option<&str>) -> usize {
     let wiring = Arc::new(WiringRegistry::new());
     let seen = Arc::new(AtomicUsize::new(0));
+    let tagged = Arc::new(AtomicUsize::new(0));
     let claims = ports.map(|port| asyn_rs::asyn_record::claim_port(port).unwrap());
     let (forward, _jf) = create_plugin_runtime(
         &claims[0],
@@ -211,7 +237,7 @@ fn steady_allocs(ports: [&str; 2], attributes: &[&str]) -> usize {
     );
     let (sink, _js) = create_plugin_runtime(
         &claims[1],
-        Sink(seen.clone()),
+        Sink(seen.clone(), tagged.clone()),
         0,
         4,
         0,
@@ -226,6 +252,18 @@ fn steady_allocs(ports: [&str; 2], attributes: &[&str]) -> usize {
             .publish(
                 plugin.port_runtime().port_handle().clone(),
                 &InterruptGate::opened(),
+            )
+            .unwrap();
+    }
+    if let Some(xml) = file {
+        forward
+            .port_runtime()
+            .port_handle()
+            .submit_blocking(
+                asyn_rs::request::RequestOp::OctetWrite {
+                    data: xml.as_bytes().to_vec(),
+                },
+                asyn_rs::user::AsynUser::new(forward.ndarray_params.attributes_file),
             )
             .unwrap();
     }
@@ -279,5 +317,11 @@ fn steady_allocs(ports: [&str; 2], attributes: &[&str]) -> usize {
         }
     }
     COUNTING.store(false, Ordering::SeqCst);
+    let evaluated = if file.is_some() { WARM + FRAMES } else { 0 };
+    assert_eq!(
+        tagged.load(Ordering::Relaxed),
+        evaluated,
+        "frames carrying Cnt"
+    );
     ALLOCS.load(Ordering::SeqCst)
 }

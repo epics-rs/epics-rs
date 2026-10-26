@@ -5816,6 +5816,91 @@ mod tests {
         }
     }
 
+    /// C evaluates the set into each frame's fresh copy (NDPluginDriver.cpp
+    /// :285-291), so an attribute a reloaded file no longer lists leaves the
+    /// next frame, though the plugin keeps the list it evaluated into.
+    #[test]
+    fn a_reloaded_attributes_file_drops_what_it_no_longer_lists() {
+        let (downstream_sender, mut downstream_rx) = ndarray_channel("DOWNSTREAM", 10);
+        let mut output = NDArrayOutput::new();
+        output.add(downstream_sender);
+        let (handle, _data_jh) = create_plugin_runtime_with_output(
+            &asyn_rs::asyn_record::claim_port("ATTRRELOAD").unwrap(),
+            PassthroughProcessor,
+            1_000_000,
+            10,
+            0,
+            output,
+            "",
+            test_wiring(),
+            DEFAULT_PLUGIN_THREADS,
+        );
+        enable_callbacks(&handle);
+        let load = |xml: &str| {
+            handle
+                .port_runtime()
+                .port_handle()
+                .submit_blocking(
+                    asyn_rs::request::RequestOp::OctetWrite {
+                        data: xml.as_bytes().to_vec(),
+                    },
+                    AsynUser::new(handle.ndarray_params.attributes_file),
+                )
+                .unwrap();
+            params_applied(&handle);
+        };
+        let names = |rx: &mut crate::plugin::channel::NDArrayReceiver| {
+            let received = rx.blocking_recv().unwrap();
+            ["Counter", "Tag"].map(|name| received.attributes.get(name).is_some())
+        };
+        load(
+            r#"<Attributes>
+            <Attribute name="Counter" type="PARAM" source="ARRAY_COUNTER" datatype="INT"/>
+            <Attribute name="Tag" type="CONST" source="abc" datatype="STRING"/>
+        </Attributes>"#,
+        );
+        send_array(handle.array_sender(), make_test_array(1));
+        assert_eq!(names(&mut downstream_rx), [true, true]);
+        load(
+            r#"<Attributes>
+            <Attribute name="Counter" type="PARAM" source="ARRAY_COUNTER" datatype="INT"/>
+        </Attributes>"#,
+        );
+        for id in [2, 3] {
+            send_array(handle.array_sender(), make_test_array(id));
+            assert_eq!(names(&mut downstream_rx), [true, false], "frame {id}");
+        }
+    }
+
+    /// `getAttributes`' pending sets are laid out above the running frame's
+    /// and taken down again: a second call in one frame reads only its own,
+    /// and the thread's buffer holds no more than its running frames.
+    #[test]
+    fn with_sets_leaves_begin_as_it_found_it() {
+        let reasons = |sets: &[PendingParam]| sets.iter().map(|s| s.0).collect::<Vec<_>>();
+        let depth = || {
+            BEGIN.with(|b| {
+                let b = b.borrow();
+                (b.sets.len(), b.top)
+            })
+        };
+        let begin = [(1, 0, ParamValue::Int32(1))];
+        let after = [(7, 0, ParamValue::Int32(7))];
+        let updates = [ParamUpdate::int32(2, 2)];
+        with_frame(&begin, None, || {
+            let running = depth();
+            for _ in 0..3 {
+                assert_eq!(with_sets(None, &updates, reasons), [1, 2]);
+                assert_eq!(depth(), running);
+            }
+            assert_eq!(with_sets(Some(&after), &updates, reasons), [7, 2]);
+            assert_eq!(depth(), running);
+        });
+        assert_eq!(with_sets(Some(&after), &updates, reasons), [7, 2]);
+        assert_eq!(with_sets(None, &updates, reasons), [2]);
+        assert_eq!(depth(), (0, 0));
+    }
+
     #[test]
     fn test_sink_runtime() {
         let (handle, _data_jh) = create_plugin_runtime(

@@ -85,7 +85,11 @@
 //!   made from. snc-rs refuses `*v` and arithmetic on it, as ISO C does,
 //!   and a cast of an integer to a pointer, which has no cell to point to.
 //! - C semantics. A value assigned to, or passed as, a numeric of another
-//!   type is emitted `as _`. A C truth value is spelled out as `!= 0` or
+//!   type is emitted `as _`. An operator on a foreign value or member,
+//!   whose C type snc-rs does not know, is an [`arith`] call
+//!   (`seqg_rt::arith::mul(a, b)`), whose usual arithmetic conversions
+//!   rustc resolves from the operands' Rust types; with a `double` the
+//!   foreign operand is cast `as f64`. A C truth value is spelled out as `!= 0` or
 //!   `== 0`. Source parentheses and empty statements are dropped.
 //! - Literals. A string literal is a `&str`, or `&b"..."[..]` when it is
 //!   not UTF-8.
@@ -300,6 +304,7 @@
 //! `%s` prints `(null)`, as glibc does. What one module calls in another
 //! is public and reached through [`pvt`].
 
+pub mod arith;
 pub mod c;
 mod ca;
 mod cmd;

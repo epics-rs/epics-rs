@@ -2038,7 +2038,19 @@ impl<'a> Gen<'a> {
                     .or_else(|| [&a.ty, &b.ty].into_iter().find(|t| matches!(t, Ty::Ptr(_))))
                     .cloned();
                 let (a, b, ty) = if is_numeric(&a.ty) && is_numeric(&b.ty) {
-                    operands(a, b)
+                    match operands(a, b) {
+                        Operands::Known(a, b, ty) => (a, b, ty),
+                        Operands::Unknown(a, b) => {
+                            let lazy = |e| Expr::Closure(String::new(), Box::new(e));
+                            return Val {
+                                e: Expr::call(
+                                    "seqg_rt::arith::select",
+                                    vec![cond, lazy(a), lazy(b)],
+                                ),
+                                ty: Ty::Foreign,
+                            };
+                        }
+                    }
                 } else if let Some(ty) = ptr {
                     (conv(a, &ty), conv(b, &ty), ty)
                 } else {
@@ -2937,6 +2949,15 @@ fn compound(op: Tok, ty: &Ty, v: Val) -> Expr {
             let step = offset(compound_binop(op), v);
             return Expr::assign(deref_v(), "=", Expr::atom("v").method("offset", vec![step]));
         }
+        // converted back to the place's type, which only rustc knows
+        Ty::Foreign if !matches!(op, Tok::Lsheq | Tok::Rsheq) => {
+            let lhs = Val {
+                e: deref_v(),
+                ty: Ty::Foreign,
+            };
+            let e = binop(compound_binop(op), lhs, v).e;
+            return Expr::assign(deref_v(), "=", e.cast("_"));
+        }
         _ => return Expr::assign(deref_v(), op_str(op), v.e),
     }
     let lhs = Val {
@@ -2995,11 +3016,11 @@ fn binop(op: Tok, l: Val, r: Val) -> Val {
                     };
                 }
             }
-            let (a, b, _) = operands(l, r);
-            Val {
-                e: Expr::binary(a, sym, b),
-                ty: Ty::Bool,
-            }
+            let e = match operands(l, r) {
+                Operands::Known(a, b, _) => Expr::binary(a, sym, b),
+                Operands::Unknown(a, b) => arith_call(op, a, b),
+            };
+            Val { e, ty: Ty::Bool }
         }
         Tok::Lshift | Tok::Rshift => {
             let l = promoted(l);
@@ -3010,7 +3031,15 @@ fn binop(op: Tok, l: Val, r: Val) -> Val {
             }
         }
         _ => {
-            let (a, b, ty) = operands(l, r);
+            let (a, b, ty) = match operands(l, r) {
+                Operands::Known(a, b, ty) => (a, b, ty),
+                Operands::Unknown(a, b) => {
+                    return Val {
+                        e: arith_call(op, a, b),
+                        ty: Ty::Foreign,
+                    };
+                }
+            };
             let wrapping = match op {
                 Tok::Add => "wrapping_add",
                 Tok::Sub => "wrapping_sub",
@@ -3030,13 +3059,21 @@ fn binop(op: Tok, l: Val, r: Val) -> Val {
     }
 }
 
-/// `a` and `b` brought to their common type by C's usual arithmetic
-/// conversions, and that type. A foreign value is taken to be an `int`
-/// unless the other operand's type is wider or floating.
-fn operands(a: Val, b: Val) -> (Expr, Expr, Ty) {
+/// `a` and `b` by C's usual arithmetic conversions.
+enum Operands {
+    /// brought to their common type, which is the third
+    Known(Expr, Expr, Ty),
+    /// a foreign operand, whose C type snc-rs does not know, with another
+    /// that is not a `double`: `seqg_rt::arith` converts them by their
+    /// Rust types
+    Unknown(Expr, Expr),
+}
+
+fn operands(a: Val, b: Val) -> Operands {
     let a = arith_operand(a);
     let b = arith_operand(b);
-    match (&a.ty, &b.ty) {
+    let double = |t: &Ty| matches!(t, Ty::Float) || matches!(t, Ty::Num(n) if n == "f64");
+    let (a, b, ty) = match (&a.ty, &b.ty) {
         (Ty::Num(x), Ty::Num(y)) => {
             let c = usual(x, y);
             (cast_num(a, &c), cast_num(b, &c), Ty::Num(c))
@@ -3061,22 +3098,37 @@ fn operands(a: Val, b: Val) -> (Expr, Expr, Ty) {
         (Ty::Float, Ty::Int) => (a.e, adapt_int(b.e, "f64"), Ty::Float),
         (Ty::Int, Ty::Int) => (a.e, b.e, Ty::Int),
         (Ty::Float, Ty::Float) => (a.e, b.e, Ty::Float),
-        (Ty::Foreign, Ty::Num(y)) => {
-            let c = promote(y);
-            (foreign_as(a.e, &c), cast_num(b, &c), Ty::Num(c))
+        // anything with a double is a double
+        (Ty::Foreign, t) if double(t) => (a.e.cast("f64"), b.e, Ty::Num("f64".into())),
+        (t, Ty::Foreign) if double(t) => (a.e, b.e.cast("f64"), Ty::Num("f64".into())),
+        (Ty::Foreign, t) | (t, Ty::Foreign) if is_numeric(t) => {
+            return Operands::Unknown(a.e, b.e);
         }
-        (Ty::Num(x), Ty::Foreign) => {
-            let c = promote(x);
-            (cast_num(a, &c), foreign_as(b.e, &c), Ty::Num(c))
-        }
-        (Ty::Foreign, Ty::Float) => (a.e.cast("f64"), b.e, Ty::Num("f64".into())),
-        (Ty::Float, Ty::Foreign) => (a.e, b.e.cast("f64"), Ty::Num("f64".into())),
         _ => (a.e, b.e, Ty::Foreign),
-    }
+    };
+    Operands::Known(a, b, ty)
 }
 
-fn foreign_as(e: Expr, t: &str) -> Expr {
-    if t == "i32" { e } else { e.cast(t) }
+/// `seqg_rt::arith`'s C binary `op` on operands of types it converts.
+fn arith_call(op: Tok, a: Expr, b: Expr) -> Expr {
+    let f = match op {
+        Tok::Add => "add",
+        Tok::Sub => "sub",
+        Tok::Asterisk => "mul",
+        Tok::Slash => "div",
+        Tok::Mod => "rem",
+        Tok::Eq => "eq",
+        Tok::Ne => "ne",
+        Tok::Lt => "lt",
+        Tok::Le => "le",
+        Tok::Gt => "gt",
+        Tok::Ge => "ge",
+        Tok::Ampersand => "and",
+        Tok::Vbar => "or",
+        Tok::Caret => "xor",
+        op => unreachable!("binary operator {op:?}"),
+    };
+    Expr::call(format!("seqg_rt::arith::{f}"), vec![a, b])
 }
 
 /// `v` as C's cast to `t` converts it, typed by itself.
@@ -4026,13 +4078,13 @@ mod tests {
         for e in [
             "seqg_var.s.set(struct_t::from((1, (0.1,))));",
             "seqg_var.u.set(union_t::from((13,)));",
-            "seqg_var.s.field(|v| &mut v.i).get() == 1",
-            "seqg_var.s.field(|v| &mut v.i).modify(|v| *v += 1);",
-            "seqg_var.s.field(|v| &mut v.s).field(|v| &mut v.d).modify(|v| *v /= 3.0);",
-            "seqg_var.seqg_vars_a.ps.get().field(|v| &mut v.i).modify(|v| *v += 1);",
+            "seqg_rt::arith::eq(seqg_var.s.field(|v| &mut v.i).get(), 1)",
+            "seqg_var.s.field(|v| &mut v.i).modify(|v| *v = seqg_rt::arith::add(*v, 1) as _);",
+            "seqg_var.s.field(|v| &mut v.s).field(|v| &mut v.d).modify(|v| *v = (*v as f64 / 3.0) as _);",
+            "seqg_var.seqg_vars_a.ps.get().field(|v| &mut v.i).modify(|v| *v = seqg_rt::arith::add(*v, 1) as _);",
             "seqg_var.seqg_vars_a.pu.get().view(|v| v.p(), |v, x| v.set_p(x)).set(seqg_var.seqg_vars_a.ps.get());",
             "seqg_var.seqg_vars_a.pu.get().view(|v| v.p(), |v, x| v.set_p(x)).get().field(|v| &mut v.s)\
-             .field(|v| &mut v.d).modify(|v| *v *= 3);",
+             .field(|v| &mut v.d).modify(|v| *v = seqg_rt::arith::mul(*v, 3) as _);",
             "seqg_var.u.view(|v| v.i(), |v, x| v.set_i(x)).set(seqg_var.seqg_vars_a.pu.get()\
              .view(|v| v.i(), |v, x| v.set_i(x)).get());",
             "seqg_var.seqg_vars_a.q.set(seqg_var.s.field(|v| &mut v.i).ptr());",
@@ -4042,6 +4094,32 @@ mod tests {
         // `p->a` and `(*p).a` are one place
         let set = "seqg_var.seqg_vars_a.ps.get().field(|v| &mut v.i).set(2);";
         assert_eq!(code.matches(set).count(), 2, "{code}");
+    }
+
+    #[test]
+    fn arithmetic_on_a_member_of_unknown_type_converts_in_rust() {
+        // a guess that s.s.d is an int truncated it to a long here
+        let (code, diag) = translate(
+            "program p\n%%struct struct_t { int i; struct { double d; } s; };\n\
+             struct struct_t s;\nlong l;\ndouble x;\nint i;\nss a {\nstate s {\nwhen () {\n\
+             x = s.s.d * l;\ni = s.s.d < l;\ns.s.d *= 3;\ns.i++;\nx = i ? s.s.d : l;\n\
+             } state s\n}\n}\n",
+        );
+        assert_eq!(diag, "");
+        let code = words(&code);
+        let d = "seqg_var.s.field(|v| &mut v.s).field(|v| &mut v.d)";
+        for e in [
+            format!("seqg_var.x.set(seqg_rt::arith::mul({d}.get(), seqg_var.l.get()) as _);"),
+            format!("seqg_rt::arith::lt({d}.get(), seqg_var.l.get())"),
+            format!("{d}.modify(|v| *v = seqg_rt::arith::mul(*v, 3) as _);"),
+            "seqg_var.s.field(|v| &mut v.i).modify(|v| *v = seqg_rt::arith::add(*v, 1) as _);"
+                .into(),
+            format!(
+                "seqg_rt::arith::select(seqg_var.i.get() != 0, || {d}.get(), || seqg_var.l.get())"
+            ),
+        ] {
+            assert!(code.contains(&words(&e)), "{e}\n{code}");
+        }
     }
 
     #[test]
@@ -4062,8 +4140,8 @@ mod tests {
         assert_eq!(diag, "");
         let code = words(&code);
         for e in [
-            "g.modify(|v| *v += 1);",
-            "seqg_var.y.set( g.modify( |v| { *v -= 1; *v }, ) as _, );",
+            "g.modify(|v| *v = seqg_rt::arith::add(*v, 1) as _);",
+            "seqg_var.y.set( g.modify( |v| { *v = seqg_rt::arith::sub(*v, 1) as _; *v }, ) as _, );",
         ] {
             assert!(code.contains(e), "{e}\n{code}");
         }
@@ -4322,9 +4400,10 @@ mod tests {
 
     #[test]
     fn an_integer_constant_beside_a_value_of_unknown_type_stays_a_literal() {
-        // change.st:32's `rand() % 10`: rustc types the literal by the
-        // companion's h; a use of h in escaped C declares no type, nor a
-        // typedef name x's; a null pointer constant is the value's default
+        // change.st:32's `rand() % 10`: seqg_rt::arith converts the literal,
+        // an int, and h's result by the companion's type; a use of h in
+        // escaped C declares no type, nor a typedef name x's; a null pointer
+        // constant is the value's default
         let (code, diag) = translate(
             "program p\n%%static int g(void) { return h(); }\n%%static char *c(void);\n\
              %%foo_t x;\nint y;\ndouble d;\nss a {\nstate s {\nwhen () {\ny = h() * 2;\n\
@@ -4334,15 +4413,15 @@ mod tests {
         assert_eq!(diag, "");
         let code = words(&code);
         for e in [
-            "seqg_var.y.set((h() * 2) as _)",
+            "seqg_var.y.set(seqg_rt::arith::mul(h(), 2) as _)",
             "seqg_var.y.set(!seqg_rt::c::truth(h()) as i32)",
             "seqg_var.y.set(1 << h())",
-            "seqg_var.y.set( if seqg_var.y.get() != 0 { 1 } else { h() } as _, )",
-            "seqg_var.y.set((x + 1) as _)",
+            "seqg_var.y.set(seqg_rt::arith::select(seqg_var.y.get() != 0, || 1, || h()) as _)",
+            "seqg_var.y.set(seqg_rt::arith::add(x, 1) as _)",
             "seqg_var.y.set(seqg_rt::c::truth(c()) as i32)",
             "seqg_var.d.set(h() as f64 * 2.0)",
             "seqg_var.y.set(g() + 1)",
-            "seqg_var.y.set((h() < 3) as i32)",
+            "seqg_var.y.set(seqg_rt::arith::lt(h(), 3) as i32)",
         ] {
             assert!(code.contains(e), "{e}\n{code}");
         }

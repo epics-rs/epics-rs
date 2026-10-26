@@ -128,11 +128,6 @@ const EXPECTED_FAILURES: &[(&str, &str)] = &[
         "sequencer/test/compiler/cast.st",
         "cast.st:29: error: snc-rs does not support a cast between pointer types",
     ),
-    // a foreign member's type snc-rs takes to be int
-    (
-        "sequencer/test/compiler/member.st",
-        "member.st:28: error[E0277]: cannot multiply-assign `f64` by `{integer}`: no implementation for `f64 *= {integer}`",
-    ),
     // these wait for a run-time contract for SNL structs
     (
         "sequencer/examples/small/timer.st",

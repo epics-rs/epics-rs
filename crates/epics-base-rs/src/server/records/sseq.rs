@@ -1200,6 +1200,12 @@ impl SseqRecord {
                     // :1208), so a put naming a PV reads `dbGetLinkDBFtype`
                     // -1 and sets LINKS_NOT_OK (:1015, :1070); a constant has
                     // no `pv_link.pvname` and skips that check.
+                    //
+                    // C arms on a constant only while LINKS_NOT_OK
+                    // (sseqRecord.c:1019, :1072), which a pass that found every
+                    // CA link up cleared (:952), so a CA link dropped since
+                    // keeps a stale "Ext PV OK". That C defect is not copied:
+                    // `not_ok` holds while any link names a non-local PV.
                     Some((put != LNKV_CON || not_ok).then_some(LINK_RECHECK))
                 }
             };

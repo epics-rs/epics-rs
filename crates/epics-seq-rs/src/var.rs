@@ -275,7 +275,8 @@ impl<A: Indexed> SeqVar<A> {
 impl<T: Send + 'static> SeqVar<T> {
     /// C's `&x`.
     pub fn ptr(&self) -> Ptr<T> {
-        Ptr::along(Arc::new(Cell(self.0.clone())), 0)
+        let home = home(&self.0);
+        Ptr::along(Arc::new(Cell(self.0.clone(), home)), 0)
     }
 }
 
@@ -307,7 +308,8 @@ impl<T: std::fmt::Debug> std::fmt::Debug for SeqVar<T> {
 }
 
 /// What C subscripts and points along: an array, or a `string` as its
-/// `char` buffer.
+/// `char` buffer. Its elements start at its own address, as a C array's
+/// do, which is where a [`Ptr`] counts them from.
 pub trait Indexed {
     type Elem;
 
@@ -625,10 +627,26 @@ trait Run<T>: Send + Sync {
     fn erased(&self) -> Option<&(dyn Any + Send + Sync)> {
         None
     }
+
+    /// The address of element `index` where it is stored, never in a copy
+    /// `read` hands out, so every path to one element is one address, as
+    /// C's `==` and `-` see it.
+    fn addr(&self, index: isize) -> usize;
 }
 
-/// A scalar variable's cell, a run of one.
-struct Cell<T>(Arc<Mutex<Box<T>>>);
+/// The address `index` elements of `T` from `at`.
+fn nth<T>(at: usize, index: isize) -> usize {
+    at.wrapping_add_signed(index * std::mem::size_of::<T>() as isize)
+}
+
+/// Where a cell's value is stored: its box is never replaced, only written
+/// through, so this holds while the cell lives.
+fn home<T>(cell: &Mutex<Box<T>>) -> usize {
+    &**cell.lock() as *const T as usize
+}
+
+/// A scalar variable's cell, a run of one, and its [`home`].
+struct Cell<T>(Arc<Mutex<Box<T>>>, usize);
 
 impl<T: Send> Run<T> for Cell<T> {
     fn read(&self, f: &mut dyn FnMut(&[T])) {
@@ -637,6 +655,10 @@ impl<T: Send> Run<T> for Cell<T> {
 
     fn write(&self, f: &mut dyn FnMut(&mut [T])) {
         f(std::slice::from_mut(&mut **self.0.lock()))
+    }
+
+    fn addr(&self, index: isize) -> usize {
+        nth::<T>(self.1, index)
     }
 }
 
@@ -652,10 +674,14 @@ impl<T: Send + Sync> Run<T> for Fixed<T> {
     fn write(&self, _: &mut dyn FnMut(&mut [T])) {
         panic!("write through a pointer to a string literal")
     }
+
+    fn addr(&self, index: isize) -> usize {
+        nth::<T>(self.0.as_ptr() as usize, index)
+    }
 }
 
-/// A run `malloc` made.
-struct Heap<T>(Mutex<Box<[T]>>);
+/// A run `malloc` made, and where it is stored.
+struct Heap<T>(Mutex<Box<[T]>>, usize);
 
 impl<T: Send> Run<T> for Heap<T> {
     fn read(&self, f: &mut dyn FnMut(&[T])) {
@@ -665,11 +691,15 @@ impl<T: Send> Run<T> for Heap<T> {
     fn write(&self, f: &mut dyn FnMut(&mut [T])) {
         f(&mut self.0.lock())
     }
+
+    fn addr(&self, index: isize) -> usize {
+        nth::<T>(self.1, index)
+    }
 }
 
 /// A multi-PV array's cells, read and written as one array through a copy
-/// taken under all their locks.
-struct Cells<T>(Box<[Arc<Mutex<Box<T>>>]>);
+/// taken under all their locks, and each cell's [`home`].
+struct Cells<T>(Box<[Arc<Mutex<Box<T>>>]>, Box<[usize]>);
 
 impl<T: Clone + Send> Run<T> for Cells<T> {
     fn read(&self, f: &mut dyn FnMut(&[T])) {
@@ -684,6 +714,21 @@ impl<T: Clone + Send> Run<T> for Cells<T> {
         f(&mut copy);
         for (cell, v) in cells.iter_mut().zip(copy) {
             ***cell = v;
+        }
+    }
+
+    /// A cell's own address, which a pointer from its [`SeqVar`] has too.
+    /// The cells are not contiguous, so past either end counts from the
+    /// outermost cell, and is none of them.
+    fn addr(&self, index: isize) -> usize {
+        let homes = &self.1;
+        match usize::try_from(index).ok().and_then(|i| homes.get(i)) {
+            Some(&at) => at,
+            None if index < 0 => nth::<T>(homes.iter().copied().min().unwrap_or(0), index),
+            None => {
+                let past = index - homes.len() as isize + 1;
+                nth::<T>(homes.iter().copied().max().unwrap_or(0), past)
+            }
         }
     }
 }
@@ -705,11 +750,20 @@ impl<S, F> Run<F> for Member<S, F> {
         self.parent
             .modify(|s| f(std::slice::from_mut((self.get)(s))))
     }
+
+    /// The parent's own address plus the member's offset in it.
+    fn addr(&self, index: isize) -> usize {
+        let offset = self
+            .parent
+            .modify(|s| (self.get)(s) as *mut F as usize - s as *mut S as usize);
+        nth::<F>(self.parent.addr() + offset, index)
+    }
 }
 
 /// What a `void *` points into: the typed [`Ptr`] it was made from, which
-/// only a cast back to its type reaches. C's `*p` of a `void *` is an error.
-struct Erased(Box<dyn Any + Send + Sync>);
+/// only a cast back to its type reaches, and that pointer's address. C's
+/// `*p` of a `void *` is an error.
+struct Erased(Box<dyn Any + Send + Sync>, usize);
 
 impl Run<c_void> for Erased {
     fn read(&self, _: &mut dyn FnMut(&[c_void])) {
@@ -722,6 +776,10 @@ impl Run<c_void> for Erased {
 
     fn erased(&self) -> Option<&(dyn Any + Send + Sync)> {
         Some(&*self.0)
+    }
+
+    fn addr(&self, index: isize) -> usize {
+        nth::<c_void>(self.1, index)
     }
 }
 
@@ -736,6 +794,11 @@ impl<A: Indexed + 'static> Run<A::Elem> for Elems<A> {
     fn write(&self, f: &mut dyn FnMut(&mut [A::Elem])) {
         self.0.modify(|a| f(a.elems_mut()))
     }
+
+    /// Counted from the array's own address, as [`Indexed`] lays it out.
+    fn addr(&self, index: isize) -> usize {
+        nth::<A::Elem>(self.0.addr(), index)
+    }
 }
 
 /// C's `T *`: null, or element `index` of a run. It keeps what it points
@@ -746,16 +809,12 @@ pub struct Ptr<T: 'static>(Option<Target<T>>);
 
 struct Target<T: 'static> {
     run: Arc<dyn Run<T>>,
-    /// The address of the run's element 0, which `==` compares.
-    base: usize,
     index: isize,
 }
 
 impl<T> Ptr<T> {
     fn along(run: Arc<dyn Run<T>>, index: isize) -> Self {
-        let mut base = 0;
-        run.read(&mut |r| base = r.as_ptr() as usize);
-        Ptr(Some(Target { run, base, index }))
+        Ptr(Some(Target { run, index }))
     }
 
     pub fn is_null(&self) -> bool {
@@ -765,18 +824,15 @@ impl<T> Ptr<T> {
     /// C's `p + n`.
     pub fn offset(&self, n: isize) -> Self {
         let t = self.0.as_ref().expect("arithmetic on a null pointer");
-        Ptr(Some(Target {
-            run: t.run.clone(),
-            base: t.base,
-            index: t.index + n,
-        }))
+        Ptr::along(t.run.clone(), t.index + n)
     }
 
-    /// C's `p - q`, in elements. Pointers into different objects panic,
-    /// where C's difference is undefined.
+    /// C's `p - q`, in elements. Runs that start at one address are one
+    /// object; pointers into different objects panic, where C's difference
+    /// is undefined.
     pub fn diff(&self, q: &Self) -> isize {
         match (&self.0, &q.0) {
-            (Some(p), Some(q)) if p.base == q.base => p.index - q.index,
+            (Some(p), Some(q)) if p.run.addr(0) == q.run.addr(0) => p.index - q.index,
             _ => panic!("difference of pointers into different objects"),
         }
     }
@@ -835,18 +891,14 @@ impl<T> Ptr<T> {
     /// C's `(uintptr_t) p`, as `%p` prints it: the address of the element
     /// this points at, 0 for null.
     pub fn addr(&self) -> usize {
-        let size = std::mem::size_of::<T>() as isize;
-        self.0
-            .as_ref()
-            .map_or(0, |t| t.base.wrapping_add_signed(t.index * size))
+        self.0.as_ref().map_or(0, |t| t.run.addr(t.index))
     }
 
     /// C's conversion to `void *`: the same address, which [`Ptr::cast`]
     /// turns back into this pointer.
     pub fn erase(&self) -> Ptr<c_void> {
         Ptr(self.0.as_ref().map(|_| Target {
-            run: Arc::new(Erased(Box::new(self.clone()))),
-            base: self.addr(),
+            run: Arc::new(Erased(Box::new(self.clone()), self.addr())),
             index: 0,
         }))
     }
@@ -880,7 +932,8 @@ impl<T: Zeroed + Send + 'static> Ptr<T> {
     /// A pointer to the first of `n` new zeroed elements.
     pub(crate) fn alloc(n: usize) -> Self {
         let run: Box<[T]> = (0..n).map(|_| T::zeroed()).collect();
-        Ptr::along(Arc::new(Heap(Mutex::new(run))), 0)
+        let at = run.as_ptr() as usize;
+        Ptr::along(Arc::new(Heap(Mutex::new(run), at)), 0)
     }
 }
 
@@ -918,13 +971,8 @@ impl<A: Indexed<Elem: 'static> + Send + 'static> From<&SeqVar<A>> for Ptr<A::Ele
 impl<T: Clone + Send + 'static, const N: usize> From<&[SeqVar<T>; N]> for Ptr<T> {
     fn from(a: &[SeqVar<T>; N]) -> Self {
         let cells = a.iter().map(|v| v.0.clone()).collect();
-        // element 0's own address, as `==` and `-` compare, which no copy has
-        let base = a.first().map_or(0, |v| &**v.0.lock() as *const T as usize);
-        Ptr(Some(Target {
-            run: Arc::new(Cells(cells)),
-            base,
-            index: 0,
-        }))
+        let homes = a.iter().map(|v| home(&v.0)).collect();
+        Ptr::along(Arc::new(Cells(cells, homes)), 0)
     }
 }
 
@@ -956,7 +1004,6 @@ impl<T> Clone for Ptr<T> {
     fn clone(&self) -> Self {
         Ptr(self.0.as_ref().map(|t| Target {
             run: t.run.clone(),
-            base: t.base,
             index: t.index,
         }))
     }
@@ -1218,6 +1265,30 @@ mod tests {
         assert_eq!(v[2].get(), 7);
         let w: [SeqVar<i32>; 4] = std::array::from_fn(|_| SeqVar::new(0));
         assert!(p != Ptr::from(&w));
+    }
+
+    /// array.st:40: `a4a5s[i][j] == (*a4ps[i])[j]`, where `a4ps[i]` is
+    /// `&a4a5s[i]`, is one address however each side reaches it.
+    #[test]
+    fn a_pointer_through_a_multi_pv_array_is_its_cells_own() {
+        let v = <[SeqVar<[SeqString; 5]>; 4]>::zeroed();
+        let rows = <SeqVar<[Ptr<[SeqString; 5]>; 4]>>::zeroed();
+        for i in 0..4 {
+            rows.at(i).set(Ptr::from(&v).offset(i as isize));
+        }
+        for i in 0..4 {
+            assert!(Ptr::from(&v).offset(i as isize) == v[i].ptr());
+            for j in 0..5 {
+                let own = Ptr::from(&v[i].at(j));
+                let through = Ptr::from(&rows.at(i).get().at(j));
+                assert!(own == through, "a4a5s[{i}][{j}]");
+                assert_eq!(own.addr(), through.addr());
+                assert_eq!(through.offset(3).diff(&own), 3);
+            }
+        }
+        // one past the last cell is none of them
+        let end = Ptr::from(&v).offset(4);
+        assert!((0..4).all(|i| end != Ptr::from(&v).offset(i)));
     }
 
     #[test]

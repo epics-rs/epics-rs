@@ -238,7 +238,11 @@ pub const NOEVFLAG: EfId = EfId(0);
 /// An SNL `string` (`typedef char string[MAX_STRING_SIZE]`): NUL-terminated
 /// bytes, not UTF-8. A copy longer than the buffer stops one byte short of
 /// it, where C's `strcpy` would write past the variable.
+///
+/// Transparent, so its address is its first `char`'s, as a pointer into it
+/// counts.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(transparent)]
 pub struct SeqString([u8; MAX_STRING_SIZE]);
 
 impl SeqString {

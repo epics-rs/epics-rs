@@ -4488,7 +4488,8 @@ fn build_put_value_from_tokens(intro: &FieldDesc, tokens: &[String]) -> PvaResul
         FieldDesc::ScalarArray(_) => {
             // `build_put_value`'s scalar-array arm splits on commas, so
             // lower the chosen element set to a comma-separated string.
-            let csv = if tokens.len() == 1 && tokens[0].trim_start().starts_with('[') {
+            // The first character, untrimmed, as pvput.cpp:144 tests it.
+            let csv = if tokens.len() == 1 && tokens[0].starts_with('[') {
                 // JSON-array shortcut: `value=[...]`. Strip the outer
                 // brackets; the inner is already comma-separated scalars.
                 let t = tokens[0].trim();
@@ -4977,8 +4978,9 @@ fn build_put_field_pairs(
         let bit = intro.bit_for_path(fname).ok_or_else(|| {
             PvaError::InvalidValue(format!("field path '{fname}' not present in introspection"))
         })?;
-        let trimmed = raw.trim_start();
-        if trimmed.starts_with('[') || trimmed.starts_with('{') {
+        // pvput.cpp:222 tests the untrimmed first character: ` [1]` is a
+        // plain value.
+        if raw.starts_with('[') || raw.starts_with('{') {
             let field_desc = field_desc_at_path(intro, &parts).ok_or_else(|| {
                 PvaError::InvalidValue(format!("field path '{fname}' not present in introspection"))
             })?;
@@ -5083,10 +5085,10 @@ fn build_put_from_args(
     // exposes a `.value` member — a bare-leaf prototype keeps the legacy
     // positional handling in `build_put_value_from_tokens`, where pvput's
     // root is always a structure.
-    if bare.len() == 1
-        && bare[0].trim_start().starts_with('[')
-        && intro.bit_for_path("value").is_some()
-    {
+    //
+    // Both tests read the untrimmed first character, as pvput.cpp's
+    // `bare[0][0]` does: a value led by a space is a plain value.
+    if bare.len() == 1 && bare[0].starts_with('[') && intro.bit_for_path("value").is_some() {
         pairs.push(("value".to_string(), bare.remove(0)));
     }
 
@@ -5094,10 +5096,7 @@ fn build_put_from_args(
     // object into the root structure, marking each assigned leaf
     // (`parseJSON(strm, root, &args.tosend)`). pvput's root is always a
     // structure, so this only applies to a structure prototype.
-    if bare.len() == 1
-        && bare[0].trim_start().starts_with('{')
-        && matches!(intro, FieldDesc::Structure { .. })
-    {
+    if bare.len() == 1 && bare[0].starts_with('{') && matches!(intro, FieldDesc::Structure { .. }) {
         let json = parse_pvput_json(bare[0].trim()).map_err(PvaError::InvalidValue)?;
         let mut changed = BitSet::new();
         let value = parse_json_into_field(intro, &json, 0, &mut changed)?;
@@ -5989,6 +5988,33 @@ mod tests {
                 build_put_from_args(&intro, &t(&["alarm=5", "value=1"]), None).unwrap();
             assert!(!changed.get(intro.bit_for_path("alarm").unwrap()));
             assert!(changed.get(intro.bit_for_path("value").unwrap()));
+        }
+
+        /// pvput.cpp tests a value's first character, untrimmed, for `[` and
+        /// `{` (:144, :150, :222). A bare ` [10,20]` is therefore a plain
+        /// array value, whose first token is the dropped length.
+        #[test]
+        fn a_bare_bracket_after_a_space_is_a_plain_array() {
+            let intro = nt_array(ScalarType::Int);
+            let (value, changed) = build_put_from_args(&intro, &t(&[" [10,20]"]), None).unwrap();
+            assert!(array_at(&value, "value").is_empty());
+            assert!(changed.get(intro.bit_for_path("value").unwrap()));
+        }
+
+        /// A bare ` {"value":1}` is a plain scalar value, not JSON top mode,
+        /// and no double.
+        #[test]
+        fn a_bare_brace_after_a_space_is_a_plain_scalar() {
+            let intro = nt(ScalarType::Double);
+            build_put_from_args(&intro, &t(&[r#" {"value":1}"#]), None).unwrap_err();
+        }
+
+        /// `value= [10,20]` is a plain pair, which writes no array.
+        #[test]
+        fn a_pair_bracket_after_a_space_is_a_plain_pair() {
+            let intro = nt_array(ScalarType::Int);
+            let (_, changed) = build_put_from_args(&intro, &t(&["value= [10,20]"]), None).unwrap();
+            assert!(changed.is_empty());
         }
     }
 

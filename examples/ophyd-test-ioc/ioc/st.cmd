@@ -11,22 +11,22 @@ simMotorCreate("mtr4", -100000, 100000, 100)
 simMotorCreate("mtr5", -100000, 100000, 100)
 simMotorCreate("mtr6", -100000, 100000, 100)
 
-dbLoadRecords("$(MOTOR)/motor.template", "P=XF:31IDA-OP{Tbl-Ax:,M=X1}Mtr,PORT=mtr1,VELO=1.0,ACCL=0.5,MRES=0.001")
-dbLoadRecords("$(MOTOR)/motor.template", "P=XF:31IDA-OP{Tbl-Ax:,M=X2}Mtr,PORT=mtr2,VELO=1.0,ACCL=0.5,MRES=0.001")
-dbLoadRecords("$(MOTOR)/motor.template", "P=XF:31IDA-OP{Tbl-Ax:,M=X3}Mtr,PORT=mtr3,VELO=1.0,ACCL=0.5,MRES=0.001")
-dbLoadRecords("$(MOTOR)/motor.template", "P=XF:31IDA-OP{Tbl-Ax:,M=X4}Mtr,PORT=mtr4,VELO=1.0,ACCL=0.5,MRES=0.001")
-dbLoadRecords("$(MOTOR)/motor.template", "P=XF:31IDA-OP{Tbl-Ax:,M=X5}Mtr,PORT=mtr5,VELO=1.0,ACCL=0.5,MRES=0.001")
-dbLoadRecords("$(MOTOR)/motor.template", "P=XF:31IDA-OP{Tbl-Ax:,M=X6}Mtr,PORT=mtr6,VELO=1.0,ACCL=0.5,MRES=0.001")
+dbLoadRecords("$(MOTOR)/ioc/motor.template", "P=XF:31IDA-OP{Tbl-Ax:,M=X1}Mtr,PORT=mtr1,VELO=1.0,ACCL=0.5,MRES=0.001")
+dbLoadRecords("$(MOTOR)/ioc/motor.template", "P=XF:31IDA-OP{Tbl-Ax:,M=X2}Mtr,PORT=mtr2,VELO=1.0,ACCL=0.5,MRES=0.001")
+dbLoadRecords("$(MOTOR)/ioc/motor.template", "P=XF:31IDA-OP{Tbl-Ax:,M=X3}Mtr,PORT=mtr3,VELO=1.0,ACCL=0.5,MRES=0.001")
+dbLoadRecords("$(MOTOR)/ioc/motor.template", "P=XF:31IDA-OP{Tbl-Ax:,M=X4}Mtr,PORT=mtr4,VELO=1.0,ACCL=0.5,MRES=0.001")
+dbLoadRecords("$(MOTOR)/ioc/motor.template", "P=XF:31IDA-OP{Tbl-Ax:,M=X5}Mtr,PORT=mtr5,VELO=1.0,ACCL=0.5,MRES=0.001")
+dbLoadRecords("$(MOTOR)/ioc/motor.template", "P=XF:31IDA-OP{Tbl-Ax:,M=X6}Mtr,PORT=mtr6,VELO=1.0,ACCL=0.5,MRES=0.001")
 
 # Also load sim: prefix motors used by some tests
 simMotorCreate("sim_mtr1", -100000, 100000, 100)
 simMotorCreate("sim_mtr2", -100000, 100000, 100)
-dbLoadRecords("$(MOTOR)/motor.template", "P=sim:,M=mtr1,PORT=sim_mtr1,VELO=1.0,ACCL=0.5,MRES=0.001")
-dbLoadRecords("$(MOTOR)/motor.template", "P=sim:,M=mtr2,PORT=sim_mtr2,VELO=1.0,ACCL=0.5,MRES=0.001")
+dbLoadRecords("$(MOTOR)/ioc/motor.template", "P=sim:,M=mtr1,PORT=sim_mtr1,VELO=1.0,ACCL=0.5,MRES=0.001")
+dbLoadRecords("$(MOTOR)/ioc/motor.template", "P=sim:,M=mtr2,PORT=sim_mtr2,VELO=1.0,ACCL=0.5,MRES=0.001")
 
 # Fake motor prefix used in tests
 simMotorCreate("fake_mtr", -100000, 100000, 100)
-dbLoadRecords("$(MOTOR)/motor.template", "P=XF:31IDA-OP{Tbl-Ax:,M=FakeMtr},PORT=fake_mtr,VELO=1.0,ACCL=0.5,MRES=0.001")
+dbLoadRecords("$(MOTOR)/ioc/motor.template", "P=XF:31IDA-OP{Tbl-Ax:,M=FakeMtr},PORT=fake_mtr,VELO=1.0,ACCL=0.5,MRES=0.001")
 
 # ===== Sensors =====
 # 6 sensors matching ophyd test expectations

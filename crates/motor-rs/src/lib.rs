@@ -76,6 +76,8 @@ pub const MOTOR_DIR: &str = env!("CARGO_MANIFEST_DIR");
 /// Return the motor record type factory (name, factory) for injection into IocBuilder.
 pub fn motor_record_factory() -> (&'static str, epics_base_rs::server::RecordFactory) {
     epics_base_rs::server::record::register_contributed_dbd(&record::dbd_generated::DBD);
+    // `$(MOTOR)` for the startup script, as the IOC's envPaths sets it in C.
+    epics_base_rs::runtime::env::set_default_path("MOTOR", MOTOR_DIR);
     ("motor", Box::new(|| Box::new(MotorRecord::default())))
 }
 

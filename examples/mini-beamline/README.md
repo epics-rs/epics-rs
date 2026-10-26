@@ -333,7 +333,7 @@ simMotorCreate("ph_mtr", -100000, 100000, 100)
 
 # dbLoadRecords(template, macros)
 #   VELO, ACCL, HLM, LLM, MRES, PREC have defaults in motor.template
-dbLoadRecords("$(MOTOR)/motor.template", "P=mini:,M=ph:mtr,PORT=ph_mtr")
+dbLoadRecords("$(MOTOR)/ioc/motor.template", "P=mini:,M=ph:mtr,PORT=ph_mtr")
 ```
 
 ### MovingDot
@@ -357,9 +357,9 @@ Optics devices are configured in `st.cmd`:
 simMotorCreate("dcm_theta", -10000, 90000, 100)
 simMotorCreate("dcm_y", -250000, 250000, 100)
 simMotorCreate("dcm_z", -250000, 250000, 100)
-dbLoadRecords("$(MOTOR)/motor.template", "P=mini:,M=dcm:theta,PORT=dcm_theta,VELO=5,ACCL=0.2")
-dbLoadRecords("$(MOTOR)/motor.template", "P=mini:,M=dcm:y,PORT=dcm_y,VELO=10,ACCL=0.2,HLM=250,LLM=-250")
-dbLoadRecords("$(MOTOR)/motor.template", "P=mini:,M=dcm:z,PORT=dcm_z,VELO=50,ACCL=0.2,HLM=250,LLM=-250")
+dbLoadRecords("$(MOTOR)/ioc/motor.template", "P=mini:,M=dcm:theta,PORT=dcm_theta,VELO=5,ACCL=0.2")
+dbLoadRecords("$(MOTOR)/ioc/motor.template", "P=mini:,M=dcm:y,PORT=dcm_y,VELO=10,ACCL=0.2,HLM=250,LLM=-250")
+dbLoadRecords("$(MOTOR)/ioc/motor.template", "P=mini:,M=dcm:z,PORT=dcm_z,VELO=50,ACCL=0.2,HLM=250,LLM=-250")
 dbLoadRecords("$(OPTICS)/db/kohzuSeq.db", "P=mini:,M_THETA=dcm:theta,M_Y=dcm:y,M_Z=dcm:z,yOffHi=50,yOffLo=-50")
 seqStart("kohzuCtl", "P=mini:,M_THETA=dcm:theta,M_Y=dcm:y,M_Z=dcm:z")
 

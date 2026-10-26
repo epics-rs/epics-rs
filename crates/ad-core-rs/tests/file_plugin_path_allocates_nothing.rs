@@ -8,23 +8,28 @@
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 use std::task::{Context, Waker};
 use std::time::Duration;
 
 use ad_core_rs::attributes::{NDAttrSource, NDAttrValue, NDAttribute, NDAttributeList};
+use ad_core_rs::error::{ADError, ADResult};
 use ad_core_rs::ndarray::{NDArray, NDDataType, NDDimension};
 use ad_core_rs::ndarray_pool::{DriverPool, NDArrayPool, PublishedArray};
 use ad_core_rs::plugin::channel::{ArrayPublisher, NDArrayOutput};
+use ad_core_rs::plugin::file_base::{NDFileOpenMode, NDFileWriter};
+use ad_core_rs::plugin::file_controller::{FileControl, FilePluginController};
 use ad_core_rs::plugin::runtime::{
     ASYN_CANBLOCK, DEFAULT_PLUGIN_THREADS, NDPluginProcess, ParamPost, ParamUpdate,
-    PluginAttributes, PluginRuntimeHandle, PortPost, ProcessResult, create_plugin_runtime,
+    PluginAttributes, PluginRuntimeHandle, PortPost, ProcessResult, WriteOutcome, WritePort,
+    WriteVerdict, create_plugin_runtime,
 };
 use ad_core_rs::plugin::wiring::WiringRegistry;
 use asyn_rs::interrupt::InterruptFilter;
 use asyn_rs::param::ParamValue;
-use asyn_rs::port::InterfaceMask;
+use asyn_rs::port::{InterfaceMask, PortDriverBase};
 use epics_libcom_rs::runtime::interrupt_accept::InterruptGate;
 use parking_lot::Mutex;
 
@@ -209,6 +214,91 @@ impl NDPluginProcess for Viewing {
     }
 }
 
+/// A multi-array format that writes nothing: it counts its frames and those
+/// whose plugin set carried `Cnt`.
+struct Discard {
+    written: Arc<AtomicUsize>,
+    tagged: Arc<AtomicUsize>,
+    attributes: NDAttributeList,
+}
+
+impl NDFileWriter for Discard {
+    fn open_file(&mut self, _path: &Path, _mode: NDFileOpenMode, _array: &NDArray) -> ADResult<()> {
+        Ok(())
+    }
+    fn write_file(&mut self, _array: &Arc<NDArray>) -> ADResult<()> {
+        if self.attributes.get("Cnt").is_some() {
+            self.tagged.fetch_add(1, Ordering::Relaxed);
+        }
+        self.written.fetch_add(1, Ordering::Release);
+        Ok(())
+    }
+    fn read_file(&mut self, _pool: &NDArrayPool) -> ADResult<NDArray> {
+        Err(ADError::UnsupportedConversion("write only".into()))
+    }
+    fn close_file(&mut self) -> ADResult<()> {
+        Ok(())
+    }
+    fn set_plugin_attributes(&mut self, attributes: &NDAttributeList) {
+        self.attributes.clone_from(attributes);
+    }
+}
+
+/// NDPluginFile over [`Discard`], wired as the file plugins wire theirs.
+struct FilePlugin {
+    ctrl: Mutex<FilePluginController<Discard>>,
+    attributes: Option<PluginAttributes>,
+}
+
+impl NDPluginProcess for FilePlugin {
+    const ASYN_FLAGS: asyn_rs::port::PortFlags = ASYN_CANBLOCK;
+    const INTERFACE_MASK: InterfaceMask = InterfaceMask::GENERIC_POINTER;
+    const INTERRUPT_MASK: InterfaceMask = Self::INTERFACE_MASK;
+
+    fn validate_int32(
+        &self,
+        reason: usize,
+        _addr: i32,
+        value: i32,
+        verdict: WriteVerdict<i32>,
+        params: &mut WritePort<'_>,
+    ) -> WriteOutcome<i32> {
+        self.ctrl.lock().write_int32(reason, value, verdict, params)
+    }
+
+    fn validate_octet(
+        &self,
+        reason: usize,
+        _addr: i32,
+        _value: &str,
+        verdict: WriteVerdict<String>,
+        _params: &PortDriverBase,
+    ) -> WriteOutcome<String> {
+        self.ctrl.lock().write_octet(reason, verdict)
+    }
+
+    fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
+        let mut post = PortPost::of(self.attributes.as_ref());
+        self.ctrl.lock().process_array(array, &mut post)
+    }
+
+    fn bind_attributes(&mut self, attributes: PluginAttributes) {
+        self.attributes = Some(attributes);
+    }
+
+    fn array_callbacks_seed(&self) -> Option<bool> {
+        Some(false)
+    }
+
+    fn plugin_type(&self) -> &str {
+        "Discard"
+    }
+
+    fn register_params(&mut self, base: &mut PortDriverBase) -> asyn_rs::error::AsynResult<()> {
+        self.ctrl.lock().register_params(base)
+    }
+}
+
 fn write_i32(plugin: &PluginRuntimeHandle, reason: usize, v: i32) {
     plugin
         .port_runtime()
@@ -295,6 +385,9 @@ const PLUGIN_ATTRIBUTES: &str = r#"<Attributes>
     <Attribute name="Num" type="PARAM" source="NUM_CAPTURED" datatype="INT"/>
     <Attribute name="Tag" type="CONST" source="abc" datatype="STRING"/>
 </Attributes>"#;
+
+/// What a driver's `getAttributes` puts on each frame (simDetector.cpp:828).
+const DRIVER_ATTRIBUTES: [&str; 4] = ["ColorMode", "BayerPattern", "Gain", "Exposure"];
 
 /// A lend of a port to a caller's thread: its cancel token, its reply
 /// channel and the no-op request the actor parks on.
@@ -449,4 +542,58 @@ fn evaluating_a_plugins_attributes_for_its_writer_allocates_only_the_lend() {
         allocs <= LEND * FRAMES,
         "{allocs} allocations in {FRAMES} frames after {WARM} warm-up ones"
     );
+}
+
+#[test]
+fn a_streamed_frame_allocates_nothing_in_the_file_plugin() {
+    let _serial = SERIAL.lock();
+    let bare = streamed("ZALLOC_STREAM", &[], None);
+    assert_eq!(bare, 0, "{FRAMES} bare frames after {WARM} warm-up ones");
+    let attributed = streamed("ZALLOC_ASTREAM", &DRIVER_ATTRIBUTES, None);
+    assert_eq!(
+        attributed, 0,
+        "{FRAMES} frames with driver attributes after {WARM} warm-up ones"
+    );
+    let filed = streamed("ZALLOC_FSTREAM", &[], Some(PLUGIN_ATTRIBUTES));
+    assert!(
+        filed <= LEND * FRAMES,
+        "{filed} allocations in {FRAMES} frames through a file plugin with an attributes file"
+    );
+}
+
+/// The allocations of `FRAMES` frames, each carrying `attributes`, streamed
+/// into an open file by a fresh file plugin on `port` that loads `file`.
+fn streamed(port: &str, attributes: &[&str], file: Option<&str>) -> usize {
+    let written = Arc::new(AtomicUsize::new(0));
+    let tagged = Arc::new(AtomicUsize::new(0));
+    let plugin = plugin(
+        port,
+        FilePlugin {
+            ctrl: Mutex::new(FilePluginController::new(Discard {
+                written: written.clone(),
+                tagged: tagged.clone(),
+                attributes: NDAttributeList::new(),
+            })),
+            attributes: None,
+        },
+    );
+    if let Some(xml) = file {
+        write_octet(&plugin, plugin.ndarray_params.attributes_file, xml);
+    }
+    let p = &plugin.ndarray_params;
+    write_octet(&plugin, p.file_path, env!("CARGO_TARGET_TMPDIR"));
+    write_octet(&plugin, p.file_name, "zalloc");
+    write_octet(&plugin, p.file_template, "%s%s_%3.3d.dat");
+    write_i32(&plugin, p.file_write_mode, 2);
+    write_i32(&plugin, p.num_capture, 0);
+    write_i32(&plugin, p.lazy_open, 1);
+    write_i32(&plugin, p.capture, 1);
+    let allocs = steady_allocs(&plugin, attributes, |i| written.load(Ordering::Acquire) > i);
+    let evaluated = if file.is_some() { WARM + FRAMES } else { 0 };
+    assert_eq!(
+        tagged.load(Ordering::Relaxed),
+        evaluated,
+        "frames written with Cnt"
+    );
+    allocs
 }

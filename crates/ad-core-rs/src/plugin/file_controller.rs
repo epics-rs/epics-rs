@@ -1,3 +1,4 @@
+use std::borrow::Borrow;
 use std::marker::PhantomData;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -87,24 +88,24 @@ pub struct FilePluginController<W: NDFileWriter> {
 
 impl<W: NDFileWriter> FilePluginController<W> {
     /// Record `sets`, made but not posted yet, into the view.
-    fn record(&self, sets: &[ParamUpdate]) {
+    fn record<U: Borrow<ParamUpdate>>(&self, sets: impl IntoIterator<Item = U>) {
         if let Some(view) = &self.view {
-            view.record(sets.iter().filter_map(ParamUpdate::stored));
+            view.record(sets.into_iter().filter_map(|u| u.borrow().stored()));
         }
     }
 
     /// The sets C has made by the time the writer runs that the store does
     /// not have yet: `createFileName`'s FileNumber and FilePathExists, and
     /// FullFileName until it is posted.
-    fn file_sets(&self) -> Vec<ParamUpdate> {
-        let mut updates = Vec::new();
-        self.push_create_file_name_updates(&mut updates);
+    fn file_sets(&self) -> impl Iterator<Item = ParamUpdate> {
         let name = self
             .params
             .full_file_name
             .zip(self.file_base.unposted_name());
-        updates.extend(name.map(|(r, name)| ParamUpdate::octet(r, name.to_owned())));
-        updates
+        self.create_file_name_sets().chain(
+            name.into_iter()
+                .map(|(r, name)| ParamUpdate::octet(r, name.to_owned())),
+        )
     }
 
     pub fn new(writer: W) -> Self {
@@ -362,32 +363,11 @@ impl<W: NDFileWriter> FilePluginController<W> {
 
     // ── helpers ──
 
-    fn success_updates(&self) -> Vec<ParamUpdate> {
-        let mut updates = Vec::new();
-        self.push_create_file_name_updates(&mut updates);
-        if let Some(idx) = self.params.write_status {
-            updates.push(ParamUpdate::Int32 {
-                reason: idx,
-                addr: 0,
-                value: 0,
-            });
-        }
-        if let Some(idx) = self.params.write_message {
-            updates.push(ParamUpdate::Octet {
-                reason: idx,
-                addr: 0,
-                value: String::new(),
-            });
-        }
-        self.push_capture_update(&mut updates);
-        if let Some(idx) = self.params.read_file {
-            updates.push(ParamUpdate::Int32 {
-                reason: idx,
-                addr: 0,
-                value: 0,
-            });
-        }
-        updates
+    fn push_success_updates(&self, updates: &mut Vec<ParamUpdate>) {
+        self.push_create_file_name_updates(updates);
+        updates.extend(write_ok(self.params));
+        self.push_capture_update(updates);
+        updates.extend(self.params.read_file.map(|r| ParamUpdate::int32(r, 0)));
     }
 
     /// Emit the `CAPTURE` PV update reflecting the current `capture_active`
@@ -407,25 +387,8 @@ impl<W: NDFileWriter> FilePluginController<W> {
     /// setting WriteFile back to 0 (:265, :329). Stream mode leaves
     /// WriteFile to `doCapture`.
     fn write_file_start(&self) -> Vec<ParamUpdate> {
-        let mut sets = self.write_ok();
-        sets.extend(self.params.write_file.map(|r| ParamUpdate::int32(r, 1)));
-        sets
-    }
-
-    /// WriteStatus OK and an empty WriteMessage, which `writeFileBase` and
-    /// `openFileBase` set first (NDPluginFile.cpp:41-42, :231-232). A frame
-    /// is handed on only after its own open, or in a multi-array file while
-    /// no frame has failed, so every hand-on reads them.
-    fn write_ok(&self) -> Vec<ParamUpdate> {
-        let p = &self.params;
-        [
-            p.write_status.map(|r| ParamUpdate::int32(r, 0)),
-            p.write_message
-                .map(|r| ParamUpdate::octet(r, String::new())),
-        ]
-        .into_iter()
-        .flatten()
-        .collect()
+        let write_file = self.params.write_file.map(|r| ParamUpdate::int32(r, 1));
+        write_ok(self.params).chain(write_file).collect()
     }
 
     fn push_write_file_end(&self, updates: &mut Vec<ParamUpdate>) {
@@ -457,7 +420,7 @@ impl<W: NDFileWriter> FilePluginController<W> {
         let mut start = Some(self.write_file_start());
         let mut array_counter = self.flush_array_counter(post);
         let p = self.params;
-        let (view, write_ok) = (self.view.clone(), self.write_ok());
+        let view = self.view.clone();
         move |step| match step {
             FlushStep::Start => {
                 let mut sets = std::mem::take(pending);
@@ -475,7 +438,7 @@ impl<W: NDFileWriter> FilePluginController<W> {
             } => {
                 if let Some(frame) = frame {
                     if let Some(view) = &view {
-                        view.record(write_ok.iter().filter_map(ParamUpdate::stored));
+                        view.record(write_ok(p).filter_map(|u| u.stored()));
                     }
                     post.hand_on(frame);
                 }
@@ -520,40 +483,31 @@ impl<W: NDFileWriter> FilePluginController<W> {
         }
     }
 
+    fn num_captured_set(&self) -> Option<ParamUpdate> {
+        let n = self.file_base.num_captured() as i32;
+        self.params.num_captured.map(|r| ParamUpdate::int32(r, n))
+    }
+
     fn push_num_captured_update(&self, updates: &mut Vec<ParamUpdate>) {
-        if let Some(idx) = self.params.num_captured {
-            updates.push(ParamUpdate::Int32 {
-                reason: idx,
-                addr: 0,
-                value: self.file_base.num_captured() as i32,
-            });
-        }
+        updates.extend(self.num_captured_set());
     }
 
     /// What C `createFileName` sets besides the name: FileNumber, and
     /// FilePathExists from its `checkPath` (asynNDArrayDriver.cpp:203-218).
-    fn push_create_file_name_updates(&self, updates: &mut Vec<ParamUpdate>) {
-        self.push_file_path_exists_update(updates);
-        if let Some(idx) = self.params.file_number {
-            updates.push(ParamUpdate::Int32 {
-                reason: idx,
-                addr: 0,
-                value: self.file_base.file_number,
-            });
-        }
+    fn create_file_name_sets(&self) -> impl Iterator<Item = ParamUpdate> + use<W> {
+        let p = self.params;
+        let exists = p.file_path_exists.zip(self.file_base.file_path_exists());
+        [
+            exists.map(|(r, v)| ParamUpdate::int32(r, v as i32)),
+            p.file_number
+                .map(|r| ParamUpdate::int32(r, self.file_base.file_number)),
+        ]
+        .into_iter()
+        .flatten()
     }
 
-    fn push_file_path_exists_update(&self, updates: &mut Vec<ParamUpdate>) {
-        if let (Some(idx), Some(exists)) = (
-            self.params.file_path_exists,
-            self.file_base.file_path_exists(),
-        ) {
-            updates.push(ParamUpdate::Int32 {
-                reason: idx,
-                addr: 0,
-                value: exists as i32,
-            });
-        }
+    fn push_create_file_name_updates(&self, updates: &mut Vec<ParamUpdate>) {
+        updates.extend(self.create_file_name_sets());
     }
 
     /// Re-publish every readback `NDFileBase` owns, read back out of it.
@@ -657,6 +611,20 @@ impl<W: NDFileWriter> FilePluginController<W> {
     }
 }
 
+/// WriteStatus OK and an empty WriteMessage, which `writeFileBase` and
+/// `openFileBase` set first (NDPluginFile.cpp:41-42, :231-232). A frame is
+/// handed on only after its own open, or in a multi-array file while no
+/// frame has failed, so every hand-on reads them.
+fn write_ok(p: FileParamIndices) -> impl Iterator<Item = ParamUpdate> {
+    [
+        p.write_status.map(|r| ParamUpdate::int32(r, 0)),
+        p.write_message
+            .map(|r| ParamUpdate::octet(r, String::new())),
+    ]
+    .into_iter()
+    .flatten()
+}
+
 /// The plugin's port lock as the file I/O sees it. C releases it around
 /// every `openFile`/`writeFile`/`readFile`/`closeFile` (NDPluginFile.cpp:
 /// 62-76, :247-251, :296-300), so a frame callback is never queued behind a
@@ -706,7 +674,7 @@ impl<W: NDFileWriter, P: PortLock<FilePluginController<W>>> FileIo for PortIo<'_
     fn io<R>(&mut self, f: impl FnOnce(&mut dyn NDFileWriter) -> R) -> R {
         let c = self.0.controller();
         let writer = Arc::clone(&c.writer);
-        c.record(&c.file_sets());
+        c.record(c.file_sets());
         let view = c.view.clone();
         self.0.unlocked(|| {
             let mut writer = writer.lock();
@@ -891,7 +859,7 @@ impl<W: NDFileWriter, P: PortLock<FilePluginController<W>>> FileControl<W> for P
                     }
                     let c = self.controller();
                     c.record(&proc_result.param_updates);
-                    c.record(&c.write_ok());
+                    c.record(write_ok(c.params));
                     let r;
                     (r, deleted) = NDPluginFileBase::process_array_status_io(
                         &mut PortIo::new(self),
@@ -931,7 +899,7 @@ impl<W: NDFileWriter, P: PortLock<FilePluginController<W>>> FileControl<W> for P
         let c = self.controller();
         if let Ok(wrote) = result {
             if wrote {
-                proc_result.param_updates.extend(c.success_updates());
+                c.push_success_updates(&mut proc_result.param_updates);
                 c.push_full_file_name_update(&mut proc_result.param_updates);
             }
         } else if let Err(err) = result {
@@ -1172,7 +1140,7 @@ fn act_int32<W: NDFileWriter, P: PortLock<FilePluginController<W>>>(
                 )
             }
             NDFileMode::Stream => {
-                c.record(&c.write_ok());
+                c.record(write_ok(c.params));
                 NDPluginFileBase::process_array_status_io(&mut PortIo::new(port), array, &mut |a| {
                     post.hand_on(a)
                 })
@@ -1184,7 +1152,7 @@ fn act_int32<W: NDFileWriter, P: PortLock<FilePluginController<W>>>(
         out.trace = trace;
         match &result {
             Ok(()) => {
-                updates.extend(c.success_updates());
+                c.push_success_updates(&mut updates);
                 c.push_num_captured_update(&mut updates);
                 c.push_full_file_name_update(&mut updates);
             }
@@ -1216,7 +1184,7 @@ fn act_int32<W: NDFileWriter, P: PortLock<FilePluginController<W>>>(
         return match result {
             Ok(array) => {
                 c.latest_array = Some(array.clone());
-                updates.extend(c.success_updates());
+                c.push_success_updates(&mut updates);
                 c.push_full_file_name_update(&mut updates);
                 out.set_updates(updates).publish_read(array)
             }
@@ -1287,9 +1255,7 @@ fn write_single<W: NDFileWriter, P: PortLock<FilePluginController<W>>>(
     if let Err(e) = c.file_base.count_single() {
         return (Err(e), Err(None));
     }
-    let mut set = Vec::new();
-    c.push_num_captured_update(&mut set);
-    c.record(&set);
+    c.record(c.num_captured_set());
     if let Err(e) = c.file_base.ensure_directory() {
         return (Err(e), Err(None));
     }

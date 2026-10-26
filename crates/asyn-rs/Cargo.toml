@@ -144,6 +144,10 @@ name = "octet_write_read_reads_its_command_record"
 required-features = ["epics"]
 
 [[test]]
+name = "octet_write_read_takes_no_lock_on_its_command_record"
+required-features = ["epics"]
+
+[[test]]
 name = "octet_write_defines_the_record"
 required-features = ["epics"]
 

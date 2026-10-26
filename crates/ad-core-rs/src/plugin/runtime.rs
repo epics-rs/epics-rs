@@ -5745,12 +5745,14 @@ mod tests {
             DEFAULT_PLUGIN_THREADS,
         );
         let port = handle.port_runtime().port_handle().clone();
-        claim
-            .publish(
-                port.clone(),
-                &epics_libcom_rs::runtime::interrupt_accept::InterruptGate::opened(),
-            )
-            .unwrap();
+        let gate = epics_libcom_rs::runtime::interrupt_accept::InterruptGate::opened();
+        claim.publish(port.clone(), &gate).unwrap();
+        // The boot sweep runs on its own thread; run late, it would post the
+        // frame's STAMP while the frame is held.
+        block_on_sync(gate.jobs_settled()).unwrap();
+        wait_until("the edge sweep", || {
+            port.interrupts().edge_sweeps().is_clear()
+        });
         enable_callbacks(&handle);
         let stamp = port
             .drv_user_create_blocking(&asyn_rs::port::DrvUserRequest::new("STAMP", 0))

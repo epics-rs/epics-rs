@@ -70,12 +70,12 @@ fn sync_port(name: &str, db: &PvDatabase, writes: &Arc<Mutex<Vec<Vec<u8>>>>) -> 
     runtime
 }
 
-/// `SI` processed on a thread of its own.
-fn process_si(db: &Arc<PvDatabase>) -> std::thread::JoinHandle<()> {
+/// `name` processed on a thread of its own.
+fn process(db: &Arc<PvDatabase>, name: &'static str) -> std::thread::JoinHandle<()> {
     let db = db.clone();
     std::thread::spawn(move || {
         epics_base_rs::runtime::task::test_block_on(async move {
-            db.process_record("SI").await.unwrap();
+            db.process_record(name).await.unwrap();
         })
     })
 }
@@ -122,7 +122,7 @@ async fn a_held_command_record_neither_blocks_nor_deadlocks_the_read() {
         })
     };
     held_rx.recv().unwrap();
-    join_within(vec![holder, process_si(&db)], 20).await;
+    join_within(vec![holder, process(&db, "SI")], 20).await;
     assert_eq!(db.get_pv("SI").unwrap(), EpicsValue::String("ID?".into()));
     assert_eq!(writes.lock().unwrap().len(), 1);
 
@@ -141,7 +141,7 @@ async fn a_held_command_record_neither_blocks_nor_deadlocks_the_read() {
         })
     };
     held_rx.recv().unwrap();
-    let reader = process_si(&db);
+    let reader = process(&db, "SI");
     // SI is inside its read of CMD by now.
     epics_base_rs::runtime::task::sleep(Duration::from_millis(500)).await;
     go_tx.send(()).unwrap();
@@ -179,4 +179,53 @@ async fn a_command_record_this_thread_holds_is_read() {
     assert_eq!(db.get_pv("SI").unwrap(), EpicsValue::String("B".into()));
     assert_eq!(db.get_pv("SI.STAT").unwrap(), EpicsValue::Short(0));
     assert_eq!(*writes.lock().unwrap(), vec![b"B".to_vec()]);
+}
+
+/// A read waiting on the command record's holder still answers another
+/// holder's read of its own record: SI2's command is SI, read while SI waits
+/// for CMD. C's unlocked `dbGet` of a record another thread is processing
+/// never fails.
+#[epics_base_rs::epics_test]
+async fn a_waiting_read_answers_a_read_of_its_own_record() {
+    let writes = Arc::new(Mutex::new(Vec::new()));
+    let writes2 = Arc::new(Mutex::new(Vec::new()));
+    let db = Arc::new(PvDatabase::new());
+    let _port = sync_port("WRPA", &db, &writes);
+    let _port2 = sync_port("WRPB", &db, &writes2);
+    let records = r#"
+        record(stringout, "CMD") { field(VAL, "ID?") }
+        record(stringin, "SI") { field(DTYP, "asynOctetWriteRead") field(INP, "@asyn(WRPA,0,1)CMD") field(VAL, "old") }
+        record(stringin, "SI2") { field(DTYP, "asynOctetWriteRead") field(INP, "@asyn(WRPB,0,1)SI") }
+    "#;
+    let (db, _) = asyn_rs::adapter::register_asyn_device_support_for_builder(IocBuilder::new())
+        .with_database(db)
+        .db_string(records, &HashMap::new())
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    db.scan_control().run();
+    let h = db.async_handle();
+
+    let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+    let holder = std::thread::spawn(move || {
+        h.with_record("CMD", |_| {
+            held_tx.send(()).unwrap();
+            go_rx.recv().unwrap();
+        });
+    });
+    held_rx.recv().unwrap();
+    let si = process(&db, "SI");
+    // SI is waiting in its read of CMD by now.
+    epics_base_rs::runtime::task::sleep(Duration::from_millis(300)).await;
+    join_within(vec![process(&db, "SI2")], 20).await;
+    go_tx.send(()).unwrap();
+    join_within(vec![holder, si], 20).await;
+    assert_eq!(
+        (db.get_pv("SI2.STAT").unwrap(), db.get_pv("SI2").unwrap()),
+        (EpicsValue::Short(0), EpicsValue::String("old".into()))
+    );
+    assert_eq!(*writes2.lock().unwrap(), vec![b"old".to_vec()]);
+    assert_eq!(db.get_pv("SI").unwrap(), EpicsValue::String("ID?".into()));
 }

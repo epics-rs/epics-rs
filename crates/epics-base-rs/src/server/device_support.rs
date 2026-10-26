@@ -1251,6 +1251,26 @@ pub trait DeviceSupport: Send + Sync + 'static {
         self.read(record)
     }
 
+    /// [`read_common`](Self::read_common) for a device that
+    /// [`reads_own`](Self::reads_own): the record with the
+    /// [`OwnFrame`](crate::server::record::OwnFrame) its holder lends, so a
+    /// `dbGet` the read makes of another record still answers, while it
+    /// waits, a read of this one.
+    fn read_own(
+        &mut self,
+        record: &mut dyn Record,
+        _own: crate::server::record::OwnFrame<'_>,
+    ) -> CaResult<DeviceReadOutcome> {
+        self.read(record)
+    }
+
+    /// The cycle calls [`read_own`](Self::read_own) in place of
+    /// [`read_common`](Self::read_common). Asked when the record's plan is
+    /// made. Default `false`.
+    fn reads_own(&self) -> bool {
+        false
+    }
+
     /// [`write_begin`](Self::write_begin) with the record's `dbCommon`.
     fn write_begin_common(
         &mut self,

@@ -2177,6 +2177,9 @@ pub(crate) struct CycleFacts {
     /// The device takes its record lent around `read_begin` and
     /// `write_begin` ([`crate::server::device_support::DeviceSupport::lends_held`]).
     pub(crate) device_held: bool,
+    /// The device reads through the frame the cycle lends
+    /// ([`crate::server::device_support::DeviceSupport::reads_own`]).
+    pub(crate) device_reads_own: bool,
 }
 
 /// What a record's TYPE can reach in a process cycle.
@@ -7704,6 +7707,7 @@ impl RecordInstance {
             not_simulating,
             device_posts: self.device.as_ref().is_some_and(|d| d.posts_from_device()),
             device_held: self.device.as_ref().is_some_and(|d| d.lends_held()),
+            device_reads_own: self.device.as_ref().is_some_and(|d| d.reads_own()),
         };
         let plain = plan.is_plain_input()
             && not_simulating

@@ -1072,21 +1072,15 @@ impl AsyncDbHandle {
 
     /// C `dbGet(&addr, DBR_STRING, buf, 0, 0, 0)`: one element as the
     /// source renders it, cut to `MAX_STRING_SIZE`. `None` is a failed
-    /// `dbGet`. `held` as for [`Self::has_pv`]; another record is read as
-    /// [`Self::db_get`] reads it, with no wait on a lock set the caller's
-    /// own hold could be keeping its holder from.
+    /// `dbGet`. Read as [`Self::db_get`] reads, `own` as for it.
     pub fn get_dbr_string(
         &self,
         name: impl AsRef<[u8]>,
-        held: Option<(&[u8], &dyn crate::server::record::Record)>,
+        own: Option<OwnRecord<'_>>,
     ) -> Option<PvString> {
-        let name = name.as_ref();
-        let (base, field) = super::parse_pv_name(name);
-        let rendered = match held {
-            Some((own, rec)) if own == base => own_dbr_string(rec, field),
-            _ => self.db()?.db_get_dbr_string(name),
-        };
-        rendered.map(crate::types::codec::cap_dbr_string)
+        self.db()?
+            .db_get_dbr_string(name.as_ref(), own)
+            .map(crate::types::codec::cap_dbr_string)
     }
 
     /// C `dbNameToAddr(name, &addr)` succeeding, answered with
@@ -7387,6 +7381,10 @@ impl PvDatabase {
                             return Ok(());
                         }
                         let read = match begun {
+                            Ok(_) if facts.device_reads_own => {
+                                let (record, own) = instance.split_own();
+                                dev.read_own(record, own)
+                            }
                             Ok(_) => dev.read_common(&mut *instance.record, &mut instance.common),
                             Err(e) => Err(e),
                         };
@@ -13600,12 +13598,12 @@ impl PvDatabase {
         self.db_get_owed(name, own, |pv| Some(pv.snapshot()), snapshot_at)
     }
 
-    /// [`AsyncDbHandle::get_dbr_string`]'s read of a record other than the
-    /// caller's, taken as [`Self::db_get_snapshot`] takes its read.
-    fn db_get_dbr_string(&self, name: &[u8]) -> Option<PvString> {
+    /// [`AsyncDbHandle::get_dbr_string`]'s read, taken as
+    /// [`Self::db_get_snapshot`] takes its read.
+    fn db_get_dbr_string(&self, name: &[u8], own: Option<OwnRecord<'_>>) -> Option<PvString> {
         self.db_get_owed(
             name,
-            None,
+            own,
             |pv| crate::server::record::record_instance::value_as_dbr_string(&pv.get()),
             dbr_string_at,
         )

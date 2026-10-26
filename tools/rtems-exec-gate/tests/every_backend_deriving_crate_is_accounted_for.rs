@@ -223,6 +223,7 @@ const SCOPE_GATED: &[(&str, &str)] = &[
     ("epics-ca-rs", "tests/ca_ts_filter_probe.rs"),
     ("epics-ca-rs", "tests/caget_dbr_type.rs"),
     ("epics-ca-rs", "tests/calink_enum_ctrl_attributes.rs"),
+    ("epics-ca-rs", "tests/calink_enum_string_monitor.rs"),
     (
         "epics-ca-rs",
         "tests/calink_out_put_clamps_to_element_count.rs",
@@ -371,6 +372,7 @@ const SCOPE_GATED: &[(&str, &str)] = &[
     ("seq-validate", "tests/validate.rs"),
     ("std-rs", "tests/e2e_tests.rs"),
     ("std-rs", "tests/epid_dtyp_put_keeps_the_init_dset.rs"),
+    ("std-rs", "tests/epid_empty_inp_is_constant.rs"),
     ("std-rs", "tests/integration_tests.rs"),
     ("std-rs", "tests/snl_runners_drive_the_db.rs"),
     ("std-rs", "tests/timestamp_monitor_gate.rs"),

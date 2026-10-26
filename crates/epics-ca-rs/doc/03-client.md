@@ -49,7 +49,8 @@ state lives behind `CaChannel::wait_connected(timeout)`.
 - `connection_events()` — `broadcast::Receiver<ConnectionEvent>` for
   reactive consumers
 - `info() -> Option<ChannelInfo>` — current snapshot (no IO)
-- `get()`, `get_with_timeout()` — READ_NOTIFY round trip
+- `get_with_timeout(timeout)`, `get_callback(dbr_type, count)` — READ_NOTIFY
+  under the caller's bound, or with no deadline (`ca_array_get_callback`)
 - `put_with_timeout(value, timeout)`, `put_callback(value)`,
   `put_nowait(value)` — WRITE_NOTIFY under the caller's bound, WRITE_NOTIFY
   with no deadline (`ca_array_put_callback`), or WRITE

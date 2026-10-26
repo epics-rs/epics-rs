@@ -8,6 +8,8 @@
 //! arithmetic conversions, truth values and conversions on assignment are
 //! written out.
 
+use std::collections::BTreeSet;
+
 use crate::builtin::{CONST_SYMBOLS, ConstType, FUNC_SYMBOLS, Param as BuiltinParam, ParamType};
 use crate::driver::{Exit, Snc};
 use crate::gen_code::{
@@ -555,6 +557,9 @@ enum PlaceTy {
     Char,
     /// what a `void *` points to, which C does not read
     Void,
+    /// a foreign global SNL code assigns, the companion's
+    /// `LazyLock<SeqVar<T>>`
+    Global(VarId),
 }
 
 /// A variable or an element of one: the expression naming its `SeqVar`
@@ -586,6 +591,8 @@ struct Gen<'a> {
     /// the result type of the function definition being translated, if
     /// it has one
     ret: Option<TypeId>,
+    /// [`assigned_globals`]
+    globals: BTreeSet<String>,
 }
 
 /// What a `break` or `continue` binds to.
@@ -701,6 +708,31 @@ pub fn escaped_decl(ast: &Ast, name: &str) -> Option<CDecl> {
         params,
         variadic,
     })
+}
+
+/// The foreign variables SNL code assigns (`x = e`, `x += e`, `x++`):
+/// globals the escaped C defines, which the companion holds in a cell as
+/// a `static x: LazyLock<SeqVar<T>>` rather than as a constant.
+pub fn assigned_globals(ast: &Ast) -> BTreeSet<String> {
+    let target = |n: &crate::types::Node| match n.tag {
+        NodeTag::EBinop if is_assign(n.token.symbol) => n.child(child::BINOP_LEFT),
+        NodeTag::EPre | NodeTag::EPost if matches!(n.token.symbol, Tok::Incr | Tok::Decr) => {
+            n.child(0)
+        }
+        _ => None,
+    };
+    let mut globals = BTreeSet::new();
+    for mut ep in ast.nodes.iter().filter_map(target) {
+        while ast[ep].tag == NodeTag::EParen {
+            ep = ast[ep].child(child::PAREN_EXPR).expect("operand");
+        }
+        if let (NodeTag::EVar, Extra::Var(vp)) = (ast[ep].tag, &ast[ep].extra)
+            && ast[ast[*vp].type_].kind == TypeKind::None
+        {
+            globals.extend(ast[*vp].name.as_deref().map(String::from));
+        }
+    }
+    globals
 }
 
 /// The Rust type of variable `name` by its first declaration in the
@@ -928,6 +960,7 @@ impl<'a> Gen<'a> {
             uses: Uses::default(),
             loops: Vec::new(),
             ret: None,
+            globals: assigned_globals(ast),
         }
     }
 
@@ -1001,7 +1034,7 @@ impl<'a> Gen<'a> {
                 }
                 _ => false,
             },
-            PlaceTy::Char | PlaceTy::Void => false,
+            PlaceTy::Char | PlaceTy::Void | PlaceTy::Global(_) => false,
         };
         let store = if is_text && !place.multi {
             let v = self.expr(init);
@@ -1432,8 +1465,12 @@ impl<'a> Gen<'a> {
         match node.tag {
             NodeTag::EParen => self.pointee(c(child::PAREN_EXPR)?),
             NodeTag::EString => Some(PlaceTy::Char),
+            // `&g` of a foreign global is the place, as a foreign call's is
             NodeTag::EPre if sym == Tok::Ampersand => {
-                self.place_kind(c(child::PRE_OPERAND)?).map(|(t, _)| t)
+                match self.place_kind(c(child::PRE_OPERAND)?)? {
+                    (PlaceTy::Global(_), _) => None,
+                    (t, _) => Some(t),
+                }
             }
             NodeTag::EPre | NodeTag::EPost if matches!(sym, Tok::Incr | Tok::Decr) => {
                 self.held_pointee(c(0)?)
@@ -1479,7 +1516,7 @@ impl<'a> Gen<'a> {
                 TypeKind::Pointer { value_type } => self.snl_pointee(value_type),
                 _ => None,
             },
-            (PlaceTy::Char | PlaceTy::Void, _) => None,
+            (PlaceTy::Char | PlaceTy::Void | PlaceTy::Global(_), _) => None,
         }
     }
 
@@ -1517,6 +1554,7 @@ impl<'a> Gen<'a> {
             PlaceTy::Snl(t) => value_type(self.ast, t).expect("a pointee has a Rust type"),
             PlaceTy::Char => C_CHAR.into(),
             PlaceTy::Void => C_VOID.into(),
+            PlaceTy::Global(_) => unreachable!("a foreign global is no pointee"),
         }
     }
 
@@ -1683,7 +1721,9 @@ impl<'a> Gen<'a> {
         let node = &self.ast[ep];
         match node.tag {
             NodeTag::EFunc | NodeTag::TText => true,
-            NodeTag::EVar => matches!(node.extra, Extra::Var(vp) if self.is_storage(vp)),
+            NodeTag::EVar => {
+                matches!(node.extra, Extra::Var(vp) if self.is_storage(vp) || self.is_global(vp))
+            }
             _ => node.children.iter().flatten().any(|&c| self.takes_locks(c)),
         }
     }
@@ -2215,7 +2255,7 @@ impl<'a> Gen<'a> {
             _ => match self.place_kind(a) {
                 Some((PlaceTy::Snl(t), _)) => type_size(ast, t),
                 Some((PlaceTy::Char, _)) => Some(1),
-                Some((PlaceTy::Void, _)) => None,
+                Some((PlaceTy::Void | PlaceTy::Global(_), _)) => None,
                 None => self.pointee(a).map(|_| 8),
             },
         }
@@ -2422,6 +2462,15 @@ impl<'a> Gen<'a> {
         Arg::commented(ch, var.name.as_deref().unwrap_or_default())
     }
 
+    fn is_global(&self, vp: VarId) -> bool {
+        let var = &self.ast[vp];
+        self.ast[var.type_].kind == TypeKind::None
+            && var
+                .name
+                .as_deref()
+                .is_some_and(|n| self.globals.contains(n))
+    }
+
     fn is_storage(&self, vp: VarId) -> bool {
         !matches!(
             self.ast[self.ast[vp].type_].kind,
@@ -2460,6 +2509,7 @@ impl<'a> Gen<'a> {
                     let var = &self.ast[vp];
                     Some((PlaceTy::Snl(var.type_), var.assign == Multiplicity::Multi))
                 }
+                Extra::Var(vp) if self.is_global(vp) => Some((PlaceTy::Global(vp), false)),
                 _ => None,
             },
             NodeTag::EParen => self.place_kind(node.child(child::PAREN_EXPR)?),
@@ -2506,6 +2556,11 @@ impl<'a> Gen<'a> {
         let node = &ast[ep];
         match node.tag {
             NodeTag::EVar => match node.extra {
+                Extra::Var(vp) if self.is_global(vp) => Place {
+                    expr: Expr::atom(ast[vp].name.as_deref().unwrap_or_default()),
+                    ty: PlaceTy::Global(vp),
+                    multi: false,
+                },
                 Extra::Var(vp) => self.var_place(vp),
                 _ => unreachable!("unconnected E_VAR"),
             },
@@ -2624,6 +2679,13 @@ impl<'a> Gen<'a> {
             _ if place.multi => Ty::Ref,
             PlaceTy::Char => Ty::Num(C_CHAR.into()),
             PlaceTy::Void => Ty::Unit,
+            PlaceTy::Global(vp) => {
+                let name = self.ast[vp].name.as_deref().unwrap_or_default();
+                match escaped_var_type(self.ast, name) {
+                    Some((t, 0)) => Ty::Num(t.into()),
+                    _ => Ty::Foreign,
+                }
+            }
             PlaceTy::Snl(t) => self.value_ty(t),
         }
     }
@@ -3073,6 +3135,13 @@ fn conv(v: Val, target: &Ty) -> Expr {
             Ty::Ptr(s) if s == C_VOID && t != C_VOID => {
                 v.e.method(format!("cast::<{t}>"), Vec::new())
             }
+            _ => v.e,
+        },
+        // a foreign global of a type snc-rs does not know: C converts a
+        // number to it
+        Ty::Foreign => match v.ty {
+            Ty::Num(_) | Ty::Float => v.e.cast("_"),
+            Ty::Bool => v.e.cast("i32").cast("_"),
             _ => v.e,
         },
         _ => v.e,
@@ -3758,19 +3827,41 @@ mod tests {
     }
 
     #[test]
-    fn stores_to_a_foreign_variable_are_refused() {
-        // pvGet.st's `mutex = epicsMutexMustCreate()` and reviewer4's
-        // postf.st, whose `cnt++` came out as the new value
+    fn an_assigned_foreign_global_is_a_cell() {
+        // pvGet.st:26 and :116, and reviewer4's postf.st, whose `cnt++` once
+        // came out as the new value
+        let (code, diag) = translate(
+            "program p\n%%int shared = 0;\n%%epicsMutexId mutex;\n%%int cnt;\n%%int limit;\n\
+             int y;\nss a {\nstate s {\nwhen () {\nmutex = epicsMutexMustCreate();\n\
+             epicsMutexMustLock(mutex);\nshared = y;\ny = shared;\ny = cnt++;\nshared += 2;\n\
+             mutex = y;\ny = limit;\n} state s\n}\n}\n",
+        );
+        assert_eq!(diag, "");
+        let code = words(&code);
+        for e in [
+            "mutex.set(epicsMutexMustCreate());",
+            "epicsMutexMustLock(mutex.get());",
+            "shared.set(seqg_var.y.get());",
+            "seqg_var.y.set(shared.get());",
+            "seqg_var.y.set( cnt.modify( |v| { let seqg_old = *v; *v = *v + 1; seqg_old }, ), );",
+            "shared.modify(|v| *v = *v + 2);",
+            "mutex.set(seqg_var.y.get() as _);",
+            // never assigned, so a constant
+            "seqg_var.y.set(limit);",
+        ] {
+            assert!(code.contains(e), "{e}\n{code}");
+        }
+    }
+
+    #[test]
+    fn stores_into_a_foreign_array_are_refused() {
         let (_, diag) = translate(
-            "program p\n%%int cnt;\n%%int arr[2];\nint y;\nss a {\nstate s {\nwhen () {\n\
-             y = cnt++;\ncnt = 3;\narr[1] += 2;\ny = (cnt = 4);\n} state s\n}\n}\n",
+            "program p\n%%int arr[2];\nss a {\nstate s {\nwhen () {\narr[1] += 2;\n\
+             } state s\n}\n}\n",
         );
         assert_eq!(
             diag,
-            "t.st:8: error: snc-rs does not support assignment to a foreign variable\n\
-             t.st:9: error: snc-rs does not support assignment to a foreign variable\n\
-             t.st:10: error: snc-rs does not support assignment to a foreign variable\n\
-             t.st:11: error: snc-rs does not support assignment to a foreign variable\n"
+            "t.st:6: error: snc-rs does not support assignment to a foreign variable\n"
         );
     }
 

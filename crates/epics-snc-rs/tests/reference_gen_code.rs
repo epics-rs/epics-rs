@@ -16,7 +16,9 @@ use std::sync::{Arc, Mutex};
 
 use epics_base_rs::reference::{ReferenceTree, reference_path, reference_root};
 use epics_snc_rs::gen_code::{gen_var_decl, generate_code};
-use epics_snc_rs::gen_ss_code::{CDecl, escaped_decl, escaped_var_type, variadic_fixed_args};
+use epics_snc_rs::gen_ss_code::{
+    CDecl, assigned_globals, escaped_decl, escaped_var_type, variadic_fixed_args,
+};
 use epics_snc_rs::types::{Ast, Extra, NodeId, NodeTag, child};
 use epics_snc_rs::var_types::TypeKind;
 
@@ -159,10 +161,6 @@ const EXPECTED_FAILURES: &[(&str, &str)] = &[
         "sequencer/examples/small/pvTimeStamp.st",
         "pvTimeStamp.st:10: error: snc-rs does not support a member of a seq run-time value",
     ),
-    (
-        "sequencer/test/validate/pvGet.st",
-        "pvGet.st:26: error: snc-rs does not support assignment to a foreign variable",
-    ),
 ];
 
 /// Generated code collected in memory.
@@ -242,6 +240,8 @@ struct Foreign {
     /// the Rust element type and dimension count of a read value's
     /// escaped-C declaration
     value_types: BTreeMap<String, (&'static str, usize)>,
+    /// the globals SNL code assigns, held in a cell
+    assigned: BTreeSet<String>,
 }
 
 fn foreign_names(ast: &Ast) -> Foreign {
@@ -298,6 +298,7 @@ fn foreign_names(ast: &Ast) -> Foreign {
             foreign.value_types.insert(name.clone(), decl);
         }
     }
+    foreign.assigned = assigned_globals(ast);
     foreign
 }
 
@@ -395,6 +396,13 @@ fn stub_companion(foreign: &Foreign, c: &HashSet<String>) -> String {
                 .get(name)
                 .copied()
                 .unwrap_or(("i32", used));
+            if foreign.assigned.contains(name) {
+                s += &format!(
+                    "pub static {name}: std::sync::LazyLock<epics_seq_rs::SeqVar<{t}>> = \
+                     std::sync::LazyLock::new(|| epics_seq_rs::SeqVar::new(Default::default()));\n"
+                );
+                continue;
+            }
             let (mut ty, mut value) = (t.to_string(), format!("0 as {t}"));
             for _ in 0..dims {
                 (ty, value) = (format!("[{ty}; 256]"), format!("[{value}; 256]"));

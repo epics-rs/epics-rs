@@ -185,8 +185,12 @@
 //! that only a callee writes, through C's decay of an array
 //! (Keithley2kDMM.st:216's `%%char pvname[...]` passed to `sprintf`), is
 //! such a static holding a reference to a companion type that implements
-//! [`c::CDst`] and [`c::CSrc`]. snc-rs refuses SNL code that assigns a
-//! global.
+//! [`c::CDst`] and [`c::CSrc`]. A global that SNL code assigns
+//! (`x = e`, `x += e`, `x++`, pvGet.st:26's `mutex`) is a cell instead,
+//! `static x: LazyLock<SeqVar<T>>`, read with `x.get()` and written with
+//! `x.set(e)` as a variable is; a number stored into one whose type its
+//! escaped declaration does not spell in keywords is cast `as _`. snc-rs
+//! refuses SNL code that assigns an element of a global.
 //!
 //! When a fragment has no arm, the build fails with that text, so a
 //! changed upstream `.st` cannot compile against a stale companion. A

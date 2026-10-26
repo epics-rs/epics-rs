@@ -920,18 +920,12 @@ impl ParamSetValue {
     /// [`Self::Array`] or [`Self::Callbacks`] posts where it stands and marks
     /// none.
     pub fn list(&self) -> Option<i32> {
-        self.marked().map(|(_, addr)| addr)
-    }
-
-    /// The `(reason, addr)` whose changed flag this entry sets, when it
-    /// changes what it stores.
-    fn marked(&self) -> Option<(usize, i32)> {
         match self {
-            Self::Value { reason, addr, .. }
-            | Self::UInt32Digital { reason, addr, .. }
-            | Self::Status { reason, addr, .. }
-            | Self::AlarmStatus { reason, addr, .. }
-            | Self::AlarmSeverity { reason, addr, .. } => Some((*reason, *addr)),
+            Self::Value { addr, .. }
+            | Self::UInt32Digital { addr, .. }
+            | Self::Status { addr, .. }
+            | Self::AlarmStatus { addr, .. }
+            | Self::AlarmSeverity { addr, .. } => Some(*addr),
             Self::Array { .. } | Self::Callbacks { .. } => None,
         }
     }
@@ -1909,51 +1903,24 @@ impl SectionCallbacks {
     /// The actor, sets done: record each list the request owes, the
     /// request's first; whether they [`Self::fire`] now, which they do
     /// unless an open section holds them.
-    ///
-    /// A held section takes its sets' changed flags out of `base` until it
-    /// fires, so no other `callParamCallbacks` posts them while it runs: C's
-    /// lock keeps every other one out until the section's own has run.
-    pub(crate) fn owe(
-        &self,
-        base: &mut PortDriverBase,
-        addr: i32,
-        updates: &[ParamSetValue],
-    ) -> bool {
+    pub(crate) fn owe(&self, addr: i32, updates: &[ParamSetValue]) -> bool {
         match self {
             Self::Open { sections, seq } => {
-                let mut held = sections.held.lock();
-                held.lists.push(addr);
-                push_further_lists(addr, updates, &mut held.lists);
-                // Every section, held or not, so the first one a race holds
-                // finds the room its warm-up made.
-                held.flags.reserve(updates.len());
-                if !sections.hold(*seq) {
-                    return true;
-                }
-                let marked = updates.iter().filter_map(ParamSetValue::marked);
-                held.flags.extend(marked.filter(|&(reason, addr)| {
-                    base.params
-                        .take_changed_single(reason, addr)
-                        .unwrap_or(false)
-                }));
-                false
+                let mut lists = sections.held.lock();
+                lists.push(addr);
+                push_further_lists(addr, updates, &mut lists);
+                !sections.hold(*seq)
             }
             Self::Held(_) => true,
         }
     }
 
-    /// The actor: give back the flags held and post each list owed; the
-    /// first error. Only the actor takes this lock, so firing under it waits
-    /// on no one.
+    /// The actor: post each list owed; the first error. Only the actor takes
+    /// this lock, so firing under it waits on no one.
     pub(crate) fn fire(&self, base: &mut PortDriverBase) -> Option<AsynError> {
         let (Self::Open { sections, .. } | Self::Held(sections)) = self;
-        let mut held = sections.held.lock();
-        for (reason, addr) in held.flags.drain(..) {
-            // Taken from a set that stored, so the index is good.
-            let _ = base.params.mark_changed(reason, addr);
-        }
         let mut failed = None;
-        for list in held.lists.drain(..) {
+        for list in sections.held.lock().drain(..) {
             if let Err(e) = base.call_param_callbacks(list) {
                 failed.get_or_insert(e);
             }
@@ -1979,21 +1946,13 @@ pub struct Sections {
     /// The open section's number, shifted left once; the low bit is set while
     /// the actor holds its callbacks.
     word: AtomicU64,
-    held: Mutex<Owed>,
+    /// The lists whose callbacks the actor holds.
+    held: Mutex<Vec<i32>>,
     /// The `updates` of sections the actor has run, cleared, for the
     /// caller's next ones. Every one is kept, so the list holds as many as
     /// the actor has ever trailed by and a backlog that deep again allocates
     /// none.
     spare: Mutex<Vec<Vec<ParamSetValue>>>,
-}
-
-/// What the actor owes a section it holds, until it fires.
-#[derive(Debug, Default)]
-struct Owed {
-    /// The lists whose callbacks it owes.
-    lists: Vec<i32>,
-    /// The `(reason, addr)` changed flags its sets raised, out of the store.
-    flags: Vec<(usize, i32)>,
 }
 
 impl Sections {

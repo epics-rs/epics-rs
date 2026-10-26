@@ -5782,7 +5782,17 @@ mod tests {
         assert_eq!(port.read_int32_blocking(stamp, addr).ok(), Some(30));
         // C's lock keeps any other `callParamCallbacks` out until the
         // frame's own has run.
-        port.call_param_callbacks_blocking(addr).unwrap();
+        port.submit_unanswered(
+            asyn_rs::request::RequestOp::CallParamCallbacks {
+                addr,
+                updates: vec![],
+                time_stamp: None,
+                gate: None,
+            },
+            asyn_rs::user::AsynUser::new(0).with_addr(addr),
+        )
+        .unwrap();
+        port.read_int32_blocking(stamp, addr).unwrap();
         // The read's round trip ran behind anything enqueued before it.
         assert!(posts.lock().is_empty(), "posted before the delivery ended");
         drop(held);

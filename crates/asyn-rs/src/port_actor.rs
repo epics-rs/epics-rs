@@ -1997,23 +1997,15 @@ impl PortActor {
     /// Whether `op` runs while a caller's section holds its callbacks. The
     /// section's thread holds C's lock from the sets to its
     /// `callParamCallbacks` (NDPluginDriver.cpp:397-466, :525-539), so a
-    /// request that could store a param waits for the section's end. What
-    /// runs is that end, what C's manager does without the lock, and what
-    /// stores nothing: a read, which C's consumers make on the locking thread
-    /// itself, and a bare `callParamCallbacks`, which finds the section's
-    /// flags out of the store.
+    /// request that could store or post a param waits for the section's end.
+    /// What runs is that end, what C's manager does without the lock, and a
+    /// read, which stores nothing and which C's consumers make on the locking
+    /// thread itself.
     fn runs_while_a_section_holds(op: &RequestOp) -> bool {
         match op {
-            RequestOp::CallParamCallbacks {
-                updates,
-                time_stamp,
-                gate,
-                ..
-            } => match gate {
-                Some(crate::request::SectionCallbacks::Held(_)) => true,
-                Some(crate::request::SectionCallbacks::Open { .. }) => false,
-                None => updates.is_empty() && time_stamp.is_none(),
-            },
+            RequestOp::CallParamCallbacks { gate, .. } => {
+                matches!(gate, Some(crate::request::SectionCallbacks::Held(_)))
+            }
 
             RequestOp::SetEnable { .. }
             | RequestOp::ExceptionDisconnect
@@ -2127,7 +2119,7 @@ impl PortActor {
             base.set_time_stamp(ts);
         }
         let mut failed = set_params(base, &updates);
-        let fire = gate.owe(base, addr, &updates);
+        let fire = gate.owe(addr, &updates);
         gate.give_back(updates);
         if fire && let Some(e) = gate.fire(base) {
             failed.get_or_insert(e);

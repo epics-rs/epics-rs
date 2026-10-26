@@ -5384,6 +5384,16 @@ mod tests {
         crate::request::ParamSetValue::new(0, addr, ParamValue::Int32(v))
     }
 
+    /// A `callParamCallbacks(addr)` that stores nothing.
+    fn bare_post(addr: i32) -> RequestOp {
+        RequestOp::CallParamCallbacks {
+            addr,
+            updates: vec![],
+            time_stamp: None,
+            gate: None,
+        }
+    }
+
     /// Hold `handle`'s actor until the returned sender sends.
     fn hold_actor(
         handle: &PortHandle,
@@ -5424,14 +5434,16 @@ mod tests {
     }
 
     /// C's lock keeps any other `callParamCallbacks` out of a section: a
-    /// bare one inside it posts none of the section's sets, and one carrying
-    /// sets of its own waits, sets and all, for the section's end.
+    /// bare one inside it, and one carrying sets of its own, wait, sets and
+    /// all, for the section's end.
     #[test]
     fn a_post_inside_a_section_leaves_the_sections_sets_to_its_end() {
         let (handle, posts, _sub) = gated_handle();
         let mut gate = handle.callbacks_gate();
         let section = gate.open(0, None, vec![set_val(0, 60)]).unwrap();
-        handle.call_param_callbacks_blocking(0).unwrap();
+        handle
+            .submit_unanswered(bare_post(0), AsynUser::new(0).with_addr(0))
+            .unwrap();
         handle
             .submit_unanswered(
                 RequestOp::CallParamCallbacks {
@@ -5468,7 +5480,9 @@ mod tests {
         let section = gate
             .open(0, None, vec![set_val(0, 70), set_val(1, 71)])
             .unwrap();
-        handle.call_param_callbacks_blocking(1).unwrap();
+        handle
+            .submit_unanswered(bare_post(1), AsynUser::new(0).with_addr(1))
+            .unwrap();
         handle.read_int32_blocking(0, 0).unwrap();
         assert_eq!(*posts.lock(), [(0, 70)]);
         section.end().unwrap();

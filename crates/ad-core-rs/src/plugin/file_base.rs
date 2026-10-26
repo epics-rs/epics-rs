@@ -405,10 +405,11 @@ pub enum FlushStep<'a> {
         /// The frame, when its write ran: C hands it to endProcessCallbacks
         /// (NDPluginFile.cpp:296-301).
         handed_on: Option<&'a Arc<NDArray>>,
-        /// FileNumber, FullFileName and FilePathExists once the frame's file
-        /// was named (asynNDArrayDriver.cpp:203-219, NDPluginFile.cpp:51).
+        /// FileNumber and FilePathExists once the frame's file was named
+        /// (asynNDArrayDriver.cpp:203-219), and FullFileName with the first
+        /// post after it was (NDPluginFile.cpp:51, :280, :321).
         file_number: i32,
-        full_file_name: &'a str,
+        full_file_name: Option<&'a str>,
         file_path_exists: Option<bool>,
     },
 }
@@ -443,6 +444,8 @@ pub struct NDPluginFileBase {
     is_open: bool,
     mode: NDFileMode,
     full_file_name: String,
+    /// `full_file_name` was made by an open and is not posted yet.
+    name_unposted: bool,
     /// `NDFilePathExists` as the last `checkPath` left it; `None` until a
     /// non-empty FilePath is checked (asynNDArrayDriver.cpp:104).
     file_path_exists: Option<bool>,
@@ -487,6 +490,7 @@ impl NDPluginFileBase {
             is_open: false,
             mode: NDFileMode::Single,
             full_file_name: String::new(),
+            name_unposted: false,
             file_path_exists: None,
             init_frame: None,
         }
@@ -612,8 +616,23 @@ impl NDPluginFileBase {
         &self.full_file_name
     }
 
+    /// C clears NDFullFileName as a capture starts (NDPluginFile.cpp:847);
+    /// the capture write posts the empty name itself.
     pub fn clear_full_file_name(&mut self) {
         self.full_file_name.clear();
+        self.name_unposted = false;
+    }
+
+    /// The name an open made that is not posted yet.
+    pub(crate) fn unposted_name(&self) -> Option<&str> {
+        self.name_unposted.then_some(self.full_file_name.as_str())
+    }
+
+    /// The name an open made, once: C sets NDFullFileName only where it
+    /// names a file (NDPluginFile.cpp:52, :157), so it is posted once per
+    /// open, not with every frame written into it.
+    pub(crate) fn post_name(&mut self) -> Option<&str> {
+        std::mem::take(&mut self.name_unposted).then_some(self.full_file_name.as_str())
     }
 
     /// Store a FilePath write. The port's `writeOctet` has just checked it
@@ -643,6 +662,7 @@ impl NDPluginFileBase {
     pub fn open_file_name(&mut self) -> String {
         self.check_path();
         self.full_file_name = self.create_file_name();
+        self.name_unposted = true;
         if self.auto_increment {
             self.file_number += 1;
         }
@@ -927,7 +947,7 @@ impl NDPluginFileBase {
             |elapsed,
              status: FrameStatus<'_>,
              handed_on: Option<&Arc<NDArray>>,
-             (file_number, name, exists): (i32, &str, Option<bool>)| {
+             (file_number, name, exists): (i32, Option<&str>, Option<bool>)| {
                 left = left.saturating_sub(1);
                 posted(FlushStep::Frame {
                     num_captured: left,
@@ -939,17 +959,15 @@ impl NDPluginFileBase {
                     file_path_exists: exists,
                 });
             };
-        let named = |base: &mut Self| {
-            (
-                base.file_number,
-                base.full_file_name.clone(),
-                base.file_path_exists,
-            )
-        };
+        let named = |base: &mut Self| (base.file_number, base.file_path_exists);
         if lock.io(|w| w.supports_multiple_arrays()) {
             // Multi-array format: open once, write all, close once.
             let (write_path, final_path) = lock.base().write_path(out);
-            let (number, name, exists) = named(lock.base());
+            let (number, exists) = named(lock.base());
+            // Left unposted until a frame's post carries it: the writer's
+            // attributes read it first, and a failed open posts it at the
+            // callback's end.
+            let mut name = lock.base().unposted_name().map(str::to_owned);
             let mut frame_failed = false;
             let written = lock.io(|w| {
                 write_one_file(
@@ -966,11 +984,14 @@ impl NDPluginFileBase {
                             elapsed,
                             failed.map_or(FrameStatus::Untouched, FrameStatus::Failed),
                             frame,
-                            (number, &name, exists),
+                            (number, name.take().as_deref(), exists),
                         )
                     },
                 )
             });
+            if name.is_none() {
+                lock.base().post_name();
+            }
             let ok = written.is_ok();
             return (
                 written.map_err(|e| if frame_failed { e.without_lines() } else { e }),
@@ -982,7 +1003,7 @@ impl NDPluginFileBase {
         for arr in &frames {
             let start = Instant::now();
             let (write_path, final_path) = lock.base().write_path(arr);
-            let (number, name, exists) = named(lock.base());
+            let (number, exists) = named(lock.base());
             let mut ran = false;
             let written = lock.io(|w| {
                 write_one_file(
@@ -1003,7 +1024,7 @@ impl NDPluginFileBase {
                 start.elapsed(),
                 status,
                 ran.then_some(arr),
-                (number, &name, exists),
+                (number, lock.base().post_name(), exists),
             );
             last = written;
         }

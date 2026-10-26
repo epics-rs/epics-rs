@@ -94,12 +94,16 @@ impl<W: NDFileWriter> FilePluginController<W> {
     }
 
     /// The sets C has made by the time the writer runs that the store does
-    /// not have yet: `createFileName`'s FullFileName, FileNumber and
-    /// FilePathExists.
+    /// not have yet: `createFileName`'s FileNumber and FilePathExists, and
+    /// FullFileName until it is posted.
     fn file_sets(&self) -> Vec<ParamUpdate> {
         let mut updates = Vec::new();
         self.push_create_file_name_updates(&mut updates);
-        self.push_full_file_name_update(&mut updates);
+        let name = self
+            .params
+            .full_file_name
+            .zip(self.file_base.unposted_name());
+        updates.extend(name.map(|(r, name)| ParamUpdate::octet(r, name.to_owned())));
         updates
     }
 
@@ -496,7 +500,8 @@ impl<W: NDFileWriter> FilePluginController<W> {
                             .map(|r| ParamUpdate::float64(r, elapsed.as_secs_f64() * 1e3)),
                         p.file_number.map(|r| ParamUpdate::int32(r, file_number)),
                         p.full_file_name
-                            .map(|r| ParamUpdate::octet(r, full_file_name.to_string())),
+                            .zip(full_file_name)
+                            .map(|(r, name)| ParamUpdate::octet(r, name.to_owned())),
                         p.file_path_exists
                             .zip(file_path_exists)
                             .map(|(r, v)| ParamUpdate::int32(r, v as i32)),
@@ -559,7 +564,7 @@ impl<W: NDFileWriter> FilePluginController<W> {
     /// still names the frames it held. Every exit that follows a file
     /// operation re-reads rather than trusting what an earlier line in the
     /// same cycle pushed.
-    fn push_file_base_readbacks(&self, updates: &mut Vec<ParamUpdate>) {
+    fn push_file_base_readbacks(&mut self, updates: &mut Vec<ParamUpdate>) {
         self.push_num_captured_update(updates);
         self.push_create_file_name_updates(updates);
         self.push_full_file_name_update(updates);
@@ -578,13 +583,11 @@ impl<W: NDFileWriter> FilePluginController<W> {
         self.push_file_base_readbacks(&mut proc_result.param_updates);
     }
 
-    fn push_full_file_name_update(&self, updates: &mut Vec<ParamUpdate>) {
-        if let Some(idx) = self.params.full_file_name {
-            updates.push(ParamUpdate::Octet {
-                reason: idx,
-                addr: 0,
-                value: self.file_base.full_file_name().to_string(),
-            });
+    /// FullFileName, if an open has made one since it was last posted.
+    fn push_full_file_name_update(&mut self, updates: &mut Vec<ParamUpdate>) {
+        let name = self.file_base.post_name();
+        if let (Some(idx), Some(name)) = (self.params.full_file_name, name) {
+            updates.push(ParamUpdate::octet(idx, name.to_owned()));
         }
     }
 
@@ -1376,6 +1379,8 @@ mod tests {
     /// Mock writer that records operations.
     struct MockWriter {
         opens: usize,
+        /// The path of each `open_file`.
+        opened: Vec<String>,
         writes: usize,
         closes: usize,
         multi: bool,
@@ -1402,6 +1407,7 @@ mod tests {
         fn new(multi: bool) -> Self {
             Self {
                 opens: 0,
+                opened: Vec::new(),
                 writes: 0,
                 closes: 0,
                 multi,
@@ -1417,8 +1423,9 @@ mod tests {
         }
     }
     impl NDFileWriter for MockWriter {
-        fn open_file(&mut self, _p: &Path, _m: NDFileOpenMode, _a: &NDArray) -> ADResult<()> {
+        fn open_file(&mut self, p: &Path, _m: NDFileOpenMode, _a: &NDArray) -> ADResult<()> {
             self.opens += 1;
+            self.opened.push(p.display().to_string());
             if self.fail_open {
                 return Err(ADError::Reported {
                     lines: vec!["Mock::openFile cannot open\n".into()],
@@ -2490,9 +2497,10 @@ mod tests {
         }
     }
 
-    /// Each flushed frame's post carries the FileNumber and FullFileName its
-    /// open left (asynNDArrayDriver.cpp:216-219, NDPluginFile.cpp:51): one
-    /// name per frame single-image, the file's for every multi-array frame.
+    /// Each flushed frame's post carries the FileNumber its open left, and
+    /// the first post after an open its FullFileName (asynNDArrayDriver.cpp:
+    /// 216-219, NDPluginFile.cpp:51, :321): one name per frame single-image,
+    /// one for a multi-array file.
     #[test]
     fn a_capture_flush_posts_each_frames_file_name() {
         const FULL_FILE_NAME: usize = 67;
@@ -2507,8 +2515,10 @@ mod tests {
             })
         };
         let sep = std::path::MAIN_SEPARATOR;
-        for (multi, numbers, names) in [(false, [6, 7, 8], [5, 6, 7]), (true, [6, 6, 6], [5, 5, 5])]
-        {
+        for (multi, numbers, names) in [
+            (false, [6, 7, 8], [Some(5), Some(6), Some(7)]),
+            (true, [6, 6, 6], [Some(5), None, None]),
+        ] {
             let mut c = capture_controller(multi);
             c.params.full_file_name = Some(FULL_FILE_NAME);
             c.file_base.file_path = "/p/".into();
@@ -2531,9 +2541,66 @@ mod tests {
             );
             assert_eq!(
                 frames.iter().map(|p| name(p)).collect::<Vec<_>>(),
-                names.map(|n| Some(format!("/p{sep}f_{n}"))),
+                names.map(|n| n.map(|n| format!("/p{sep}f_{n}"))),
                 "multi {multi}"
             );
+        }
+    }
+
+    /// C sets FullFileName only where it names a file (NDPluginFile.cpp:52),
+    /// so a monitor sees each opened file's name once: a single image's per
+    /// frame, a multi-array capture's or a stream's once for its N frames.
+    #[test]
+    fn full_file_name_is_posted_once_per_open() {
+        const FULL_FILE_NAME: usize = 67;
+        const N: i32 = 3;
+        for (what, mode, multi, auto_save) in [
+            ("single", NDFileMode::Single, true, true),
+            ("single WriteFile", NDFileMode::Single, true, false),
+            ("capture", NDFileMode::Capture, true, true),
+            ("capture WriteFile", NDFileMode::Capture, true, false),
+            ("capture single-image", NDFileMode::Capture, false, true),
+            ("stream", NDFileMode::Stream, true, false),
+        ] {
+            let mut c = capture_controller(multi);
+            c.params.full_file_name = Some(FULL_FILE_NAME);
+            c.file_base.file_name = "f".into();
+            c.file_base.file_template = "%s%s_%3.3d.dat".into();
+            c.file_base.set_mode(mode);
+            c.file_base.set_num_capture(N);
+            c.auto_save = auto_save;
+            let mut posted = Vec::new();
+            for id in 1..=N {
+                let mut posts = Vec::new();
+                let r = c.process_array(&Arc::new(array(id)), &mut posts);
+                posted.extend(posts.into_iter().flatten());
+                posted.extend(r.param_updates);
+                if !auto_save && mode != NDFileMode::Stream {
+                    let mut posts = Vec::new();
+                    let out = c.write_int32(WRITE_FILE, 1, WriteVerdict::Accept(1), &mut posts);
+                    posted.extend(posts.into_iter().flatten());
+                    posted.extend(out.side.into_iter().filter_map(|s| match s {
+                        super::super::runtime::SideParam::Octet { reason, value, .. } => {
+                            Some(ParamUpdate::octet(reason, value))
+                        }
+                        _ => None,
+                    }));
+                }
+            }
+            let names: Vec<String> = posted
+                .into_iter()
+                .filter_map(|u| match u {
+                    ParamUpdate::Octet {
+                        reason: FULL_FILE_NAME,
+                        value,
+                        ..
+                    } => Some(value),
+                    _ => None,
+                })
+                .collect();
+            let writer = c.writer.lock();
+            assert!(!writer.opened.is_empty(), "{what}");
+            assert_eq!(names, writer.opened, "{what}");
         }
     }
 

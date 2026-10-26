@@ -108,9 +108,11 @@ impl NDPluginProcess for CounterReader {
     }
 }
 
-/// Sets NumCaptured per frame, as a stream write does (NDPluginFile.cpp:778).
+/// Sets an empty WriteMessage and NumCaptured per frame, as a stream write
+/// does (NDPluginFile.cpp:232, :778).
 struct Setting {
-    reason: Arc<AtomicUsize>,
+    write_message: Arc<AtomicUsize>,
+    num_captured: Arc<AtomicUsize>,
     frames: AtomicI32,
 }
 
@@ -122,8 +124,12 @@ impl NDPluginProcess for Setting {
     fn process_array(&self, _array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
         let frame = self.frames.fetch_add(1, Ordering::Relaxed) + 1;
         let mut result = ProcessResult::empty();
-        let reason = self.reason.load(Ordering::Relaxed);
-        result.param_updates.push(ParamUpdate::int32(reason, frame));
+        let write_message = self.write_message.load(Ordering::Relaxed);
+        let num_captured = self.num_captured.load(Ordering::Relaxed);
+        result.param_updates.extend([
+            ParamUpdate::octet(write_message, String::new()),
+            ParamUpdate::int32(num_captured, frame),
+        ]);
         result
     }
 
@@ -381,15 +387,19 @@ fn reading_a_frames_begin_sets_allocates_nothing() {
 #[test]
 fn setting_a_frames_params_allocates_nothing() {
     let _serial = SERIAL.lock();
-    let reason = Arc::new(AtomicUsize::new(usize::MAX));
+    let write_message = Arc::new(AtomicUsize::new(usize::MAX));
+    let num_captured = Arc::new(AtomicUsize::new(usize::MAX));
     let plugin = plugin(
         "ZALLOC_SETS",
         Setting {
-            reason: reason.clone(),
+            write_message: write_message.clone(),
+            num_captured: num_captured.clone(),
             frames: AtomicI32::new(0),
         },
     );
-    reason.store(plugin.ndarray_params.num_captured, Ordering::Relaxed);
+    let p = &plugin.ndarray_params;
+    write_message.store(p.file_write_message, Ordering::Relaxed);
+    num_captured.store(p.num_captured, Ordering::Relaxed);
     let allocs = steady_allocs(&plugin, &[], |_| true);
     let set = plugin
         .port_runtime()

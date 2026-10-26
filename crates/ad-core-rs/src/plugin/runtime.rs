@@ -232,7 +232,7 @@ impl ParamUpdate {
                 reason,
                 addr,
                 value,
-            } => ParamSetValue::new(*reason, *addr, ParamValue::Octet(value.as_bytes().into())),
+            } => ParamSetValue::new(*reason, *addr, ParamValue::Octet(octet(value))),
             Self::Float64Array {
                 reason,
                 addr,
@@ -256,6 +256,18 @@ impl ParamUpdate {
             } => Some((reason, addr, value)),
             _ => None,
         }
+    }
+}
+
+/// `value` as an octet param holds it. The empty string, which a file
+/// plugin sets WriteMessage to with every frame (NDPluginFile.cpp:232),
+/// shares one buffer.
+fn octet(value: &str) -> Arc<[u8]> {
+    static EMPTY: std::sync::LazyLock<Arc<[u8]>> = std::sync::LazyLock::new(|| Arc::from(&[][..]));
+    if value.is_empty() {
+        Arc::clone(&EMPTY)
+    } else {
+        value.as_bytes().into()
     }
 }
 

@@ -108,6 +108,36 @@ impl NDPluginProcess for CounterReader {
     }
 }
 
+/// Hands each frame on, as a stream write hands on what it wrote
+/// (NDPluginFile.cpp:252), with NDArrayCallbacks off as a file plugin
+/// starts (NDPluginFile.cpp:948).
+struct Handing {
+    attributes: Option<PluginAttributes>,
+}
+
+impl NDPluginProcess for Handing {
+    const ASYN_FLAGS: asyn_rs::port::PortFlags = ASYN_CANBLOCK;
+    const INTERFACE_MASK: InterfaceMask = InterfaceMask::GENERIC_POINTER;
+    const INTERRUPT_MASK: InterfaceMask = Self::INTERFACE_MASK;
+
+    fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
+        PortPost::of(self.attributes.as_ref()).hand_on(array);
+        ProcessResult::sink(Vec::new())
+    }
+
+    fn bind_attributes(&mut self, attributes: PluginAttributes) {
+        self.attributes = Some(attributes);
+    }
+
+    fn array_callbacks_seed(&self) -> Option<bool> {
+        Some(false)
+    }
+
+    fn plugin_type(&self) -> &str {
+        "Handing"
+    }
+}
+
 fn write_i32(plugin: &PluginRuntimeHandle, reason: usize, v: i32) {
     plugin
         .port_runtime()
@@ -256,5 +286,13 @@ fn reading_a_frames_begin_sets_allocates_nothing() {
         (WARM + FRAMES) as i32,
         "the last frame's ArrayCounter"
     );
+    assert_eq!(allocs, 0, "{FRAMES} frames after {WARM} warm-up ones");
+}
+
+#[test]
+fn handing_a_frame_on_allocates_nothing() {
+    let _serial = SERIAL.lock();
+    let plugin = plugin("ZALLOC_HANDON", Handing { attributes: None });
+    let allocs = steady_allocs(&plugin, &[], |_| true);
     assert_eq!(allocs, 0, "{FRAMES} frames after {WARM} warm-up ones");
 }

@@ -55,7 +55,7 @@ use super::params::PluginBaseParams;
 use super::wiring::WiringRegistry;
 
 mod delivery;
-use delivery::Delivery;
+use delivery::{Delivery, SortCounters};
 
 /// Message sent through the param channel from control plane to data plane.
 ///
@@ -991,25 +991,34 @@ impl HandOn {
         &self,
         array: &Arc<NDArray>,
         attributes: impl FnOnce(&PluginAttributes) -> Option<NDAttributeList>,
-    ) -> Vec<ParamUpdate> {
+    ) -> SortCounters {
         let attributes = self
             .delivery
             .delivers()
             .then(|| attributes(&self.attributes))
             .flatten();
         self.delivery.hand_on(array, attributes.as_ref());
-        let counters = self.delivery.sort_counters();
+        self.delivery.sort_counters()
+    }
+
+    /// The sets of `counters`, as [`Self::frame`] returned them.
+    fn sets(&self, counters: SortCounters) -> impl Iterator<Item = ParamUpdate> {
         let p = &self.plugin_params;
-        let mut sets = vec![
-            ParamUpdate::int32(p.disordered_arrays, counters.disordered_arrays),
-            ParamUpdate::int32(p.dropped_output_arrays, counters.dropped_output_arrays),
-        ];
-        sets.extend(
+        [
+            Some(ParamUpdate::int32(
+                p.disordered_arrays,
+                counters.disordered_arrays,
+            )),
+            Some(ParamUpdate::int32(
+                p.dropped_output_arrays,
+                counters.dropped_output_arrays,
+            )),
             counters
                 .sort_free
                 .map(|free| ParamUpdate::int32(p.sort_free, free)),
-        );
-        sets
+        ]
+        .into_iter()
+        .flatten()
     }
 }
 
@@ -1029,8 +1038,9 @@ pub struct PortPost {
     /// Whether a post has carried the begin sets.
     begun: bool,
     hand_on: Option<HandOn>,
-    /// What a hand-on set, for the next post.
-    set: Vec<ParamUpdate>,
+    /// What the last hand-on set, for the next post: the counters are
+    /// absolute, so a later hand-on's replace an earlier one's.
+    set: Option<SortCounters>,
     view: Option<AttributeView>,
     _thread: std::marker::PhantomData<*const ()>,
 }
@@ -1045,7 +1055,7 @@ impl PortPost {
             port: attributes.and_then(|a| a.0.port()),
             begun: false,
             hand_on: HAND_ON.with(|h| h.borrow().clone()),
-            set: Vec::new(),
+            set: None,
             view: attributes.and_then(PluginAttributes::view),
             _thread: std::marker::PhantomData,
         }
@@ -1063,8 +1073,12 @@ impl PortPost {
 impl ParamPost for PortPost {
     fn post(&mut self, updates: Vec<ParamUpdate>) {
         let Some(port) = &self.port else { return };
-        let updates: Vec<ParamUpdate> = std::mem::take(&mut self.set)
+        let updates: Vec<ParamUpdate> = self
+            .set
+            .take()
+            .zip(self.hand_on.as_ref())
             .into_iter()
+            .flat_map(|(counters, hand_on)| hand_on.sets(counters))
             .chain(updates)
             .collect();
         let begun = std::mem::replace(&mut self.begun, true);
@@ -1095,11 +1109,11 @@ impl ParamPost for PortPost {
     fn hand_on(&mut self, array: &Arc<NDArray>) {
         let Some(hand_on) = &self.hand_on else { return };
         let view = &self.view;
-        let sets = hand_on.frame(array, |_| view.as_ref().map(AttributeView::evaluate));
+        let counters = hand_on.frame(array, |_| view.as_ref().map(AttributeView::evaluate));
         if let Some(view) = view {
-            view.record(sets.iter().filter_map(ParamUpdate::stored));
+            view.record(hand_on.sets(counters).filter_map(|set| set.stored()));
         }
-        self.set.extend(sets);
+        self.set = Some(counters);
     }
 
     fn attribute_view(&mut self) -> Option<AttributeView> {
@@ -1162,11 +1176,11 @@ impl ParamPost for WritePort<'_> {
     fn hand_on(&mut self, array: &Arc<NDArray>) {
         let Some(hand_on) = self.hand_on else { return };
         let view = self.attribute_view();
-        let sets = hand_on.frame(array, |_| view.as_ref().map(AttributeView::evaluate));
+        let counters = hand_on.frame(array, |_| view.as_ref().map(AttributeView::evaluate));
         if let Some(view) = &view {
-            view.record(sets.iter().filter_map(ParamUpdate::stored));
+            view.record(hand_on.sets(counters).filter_map(|set| set.stored()));
         }
-        for set in sets {
+        for set in hand_on.sets(counters) {
             let _ = set_side(self.base, set.into());
         }
     }

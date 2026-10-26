@@ -64,6 +64,7 @@ struct State {
 }
 
 /// The counters C's sort path sets.
+#[derive(Clone, Copy)]
 pub(super) struct SortCounters {
     pub disordered_arrays: i32,
     pub dropped_output_arrays: i32,

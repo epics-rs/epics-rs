@@ -494,11 +494,13 @@ impl ProcessResult {
         }
     }
 
-    /// Convenience: no outputs, no param updates.
+    /// Convenience: no outputs, no param updates. In a frame's
+    /// `process_array`, `param_updates` is the frame's spare, which the
+    /// runtime empties and keeps for the next frame.
     pub fn empty() -> Self {
         Self {
             output_arrays: Frame::new(),
-            param_updates: vec![],
+            param_updates: UPDATES.try_with(std::cell::Cell::take).unwrap_or_default(),
             scatter: false,
             addressed: vec![],
             trace: vec![],
@@ -530,8 +532,11 @@ fn run_processor<P: NDPluginProcess + ?Sized>(
     pool: &NDArrayPool,
     begin: &[PendingParam],
     hand_on: Option<&HandOn>,
+    updates: Vec<ParamUpdate>,
 ) -> ProcessResult {
-    let result = with_frame(begin, hand_on, || processor.process_array(array, pool));
+    let result = with_frame(begin, hand_on, updates, || {
+        processor.process_array(array, pool)
+    });
     if let Some(served) = processor.array_data_handle() {
         *served.lock() = result.output_arrays.first().cloned();
     }
@@ -558,6 +563,10 @@ thread_local! {
     };
     /// Where [`PortPost`] hands a frame on while `process_array` runs.
     static HAND_ON: std::cell::RefCell<Option<HandOn>> = const { std::cell::RefCell::new(None) };
+    /// The running frame's spare `param_updates`, until
+    /// [`ProcessResult::empty`] takes it.
+    static UPDATES: std::cell::Cell<Vec<ParamUpdate>> =
+        const { std::cell::Cell::new(Vec::new()) };
 }
 
 /// `f` given the running frame's `beginProcessCallbacks` sets where
@@ -609,9 +618,14 @@ fn with_sets<R>(
     f(&stack.0[from..])
 }
 
-fn with_frame<R>(begin: &[PendingParam], hand_on: Option<&HandOn>, f: impl FnOnce() -> R) -> R {
-    /// The enclosing frame's `top`.
-    struct Restore(usize, Option<HandOn>);
+fn with_frame<R>(
+    begin: &[PendingParam],
+    hand_on: Option<&HandOn>,
+    updates: Vec<ParamUpdate>,
+    f: impl FnOnce() -> R,
+) -> R {
+    /// The enclosing frame's `top`, hand-on and spare.
+    struct Restore(usize, Option<HandOn>, Vec<ParamUpdate>);
     impl Drop for Restore {
         fn drop(&mut self) {
             BEGIN.with(|b| {
@@ -620,6 +634,7 @@ fn with_frame<R>(begin: &[PendingParam], hand_on: Option<&HandOn>, f: impl FnOnc
                 b.top = self.0;
             });
             HAND_ON.with(|h| *h.borrow_mut() = self.1.take());
+            UPDATES.with(|u| u.set(std::mem::take(&mut self.2)));
         }
     }
     let enclosing = BEGIN.with(|b| {
@@ -628,7 +643,11 @@ fn with_frame<R>(begin: &[PendingParam], hand_on: Option<&HandOn>, f: impl FnOnc
         b.sets.extend_from_slice(begin);
         std::mem::replace(&mut b.top, top)
     });
-    let _restore = Restore(enclosing, HAND_ON.with(|h| h.replace(hand_on.cloned())));
+    let _restore = Restore(
+        enclosing,
+        HAND_ON.with(|h| h.replace(hand_on.cloned())),
+        UPDATES.with(|u| u.replace(updates)),
+    );
     f()
 }
 
@@ -1747,6 +1766,9 @@ struct SharedProcessorInner {
     num_threads: i32,
     /// The band and stack every callback thread gets.
     threads: PluginThreads,
+    /// Emptied `ProcessResult::param_updates`, one for each frame a callback
+    /// thread or the data loop can hold, handed to the next frames.
+    spare_updates: Vec<Vec<ParamUpdate>>,
 }
 
 impl SharedProcessorInner {
@@ -1776,6 +1798,12 @@ impl SharedProcessorInner {
         self.array_counter += 1;
         let begin = self.begin_sets(array);
         (pool, begin)
+    }
+
+    /// The `param_updates` the frame about to run fills, which
+    /// [`Self::post_process`] gives back.
+    fn spare_updates(&mut self) -> Vec<ParamUpdate> {
+        self.spare_updates.pop().unwrap_or_default()
     }
 
     /// C `readFileBase`'s `beginProcessCallbacks` and `endProcessCallbacks
@@ -1813,7 +1841,7 @@ impl SharedProcessorInner {
         let mut output = self.build_publish_batch(
             batch,
             ready,
-            Vec::new(),
+            &[],
             begin
                 .as_ref()
                 .map(|(array, sets)| (&**array, sets.as_slice())),
@@ -1934,7 +1962,15 @@ impl SharedProcessorInner {
         let (pool, begin) = self.cache_input_array(array);
         let t0 = std::time::Instant::now();
         let hand_on = self.hand_on();
-        let result = run_processor(processor, array.array(), &pool, &begin, Some(&hand_on));
+        let updates = self.spare_updates();
+        let result = run_processor(
+            processor,
+            array.array(),
+            &pool,
+            &begin,
+            Some(&hand_on),
+            updates,
+        );
         let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
         self.post_process(batch, array, result, &begin, elapsed_ms)
     }
@@ -1943,14 +1979,7 @@ impl SharedProcessorInner {
     /// ExecutionTime C sets after `processCallbacks` (NDPluginDriver.cpp:
     /// 438, :537).
     fn unprocessed(&mut self, batch: ParamBatch, elapsed_ms: f64) -> ProcessOutput {
-        self.build_publish_batch(
-            batch,
-            Frame::new(),
-            Vec::new(),
-            None,
-            Some(elapsed_ms),
-            false,
-        )
+        self.build_publish_batch(batch, Frame::new(), &[], None, Some(elapsed_ms), false)
     }
 
     /// The completion half: route the produced arrays and build the param
@@ -2010,7 +2039,7 @@ impl SharedProcessorInner {
         let mut output = self.build_publish_batch(
             batch,
             ready,
-            result.param_updates,
+            &result.param_updates,
             Some((array, begin)),
             Some(elapsed_ms),
             self.array_callbacks.get(),
@@ -2018,6 +2047,11 @@ impl SharedProcessorInner {
         output.scatter = result.scatter;
         self.push_status_params(&mut output.batch.sets);
         output.addressed = self.delivery.publishable_addressed(result.addressed);
+        let mut updates = result.param_updates;
+        if updates.capacity() > 0 && self.spare_updates.len() <= self.num_threads.max(0) as usize {
+            updates.clear();
+            self.spare_updates.push(updates);
+        }
         output
     }
 
@@ -2053,7 +2087,7 @@ impl SharedProcessorInner {
             // sort thread delivers them regardless of the *current* flag, so
             // they always deliver here.
             let output =
-                self.build_publish_batch(batch, Frame::from_vec(arrays), vec![], None, None, true);
+                self.build_publish_batch(batch, Frame::from_vec(arrays), &[], None, None, true);
             all_arrays.extend(output.arrays);
             batch = output.batch;
         }
@@ -2163,7 +2197,7 @@ impl SharedProcessorInner {
         &mut self,
         mut batch: ParamBatch,
         output_arrays: Frame<PublishedArray>,
-        param_updates: Vec<ParamUpdate>,
+        param_updates: &[ParamUpdate],
         begin: Option<(&NDArray, &[PendingParam])>,
         elapsed_ms: Option<f64>,
         deliver: bool,
@@ -3725,6 +3759,7 @@ pub fn create_plugin_runtime_with_output<P: NDPluginProcess>(
         nd_array_addr: source.addr,
         num_threads: PLUGIN_NUM_THREADS,
         threads,
+        spare_updates: Vec::new(),
     }));
     let _ = hand_on_cell.set(shared.lock().hand_on());
 
@@ -3957,10 +3992,10 @@ fn spawn_worker_pool<P: NDPluginProcess>(
                 // queued behind it.
                 let t0 = std::time::Instant::now();
                 let processed = processor.processing_required(&item.msg.array).then(|| {
-                    let (array_pool, begin, hand_on) = {
+                    let (array_pool, begin, hand_on, updates) = {
                         let mut guard = shared.lock();
                         let (pool, begin) = guard.cache_input_array(&item.msg.array);
-                        (pool, begin, guard.hand_on())
+                        (pool, begin, guard.hand_on(), guard.spare_updates())
                     };
                     let result = run_processor(
                         &*processor,
@@ -3968,6 +4003,7 @@ fn spawn_worker_pool<P: NDPluginProcess>(
                         &array_pool,
                         &begin,
                         Some(&hand_on),
+                        updates,
                     );
                     (result, begin)
                 });
@@ -4619,7 +4655,7 @@ fn plugin_data_loop<P: NDPluginProcess>(
                                 {
                                     let deliver = guard.array_callbacks.get();
                                     let arrays = guard.delivery.publishable(Frame::from_vec(result.output_arrays), None, CopyArray::Never);
-                                    let mut output = guard.build_publish_batch(ParamBatch::new(&callbacks_gate), arrays, result.param_updates, None, None, deliver);
+                                    let mut output = guard.build_publish_batch(ParamBatch::new(&callbacks_gate), arrays, &result.param_updates, None, None, deliver);
                                     output.addressed = guard.delivery.publishable_addressed(result.addressed);
                                     Some(output)
                                 } else {
@@ -5068,7 +5104,7 @@ mod tests {
         let proc = ServingProcessor {
             served: Arc::new(parking_lot::Mutex::new(None)),
         };
-        let result = run_processor(&proc, input.array(), &pool, &[], None);
+        let result = run_processor(&proc, input.array(), &pool, &[], None, Vec::new());
         assert_eq!(result.output_arrays.len(), 1);
         assert!(Arc::ptr_eq(&result.output_arrays[0], input.array()));
         assert!(Arc::ptr_eq(
@@ -5958,7 +5994,7 @@ mod tests {
         let begin = [(1, 0, ParamValue::Int32(1))];
         let after = [(7, 0, ParamValue::Int32(7))];
         let updates = [ParamUpdate::int32(2, 2)];
-        with_frame(&begin, None, || {
+        with_frame(&begin, None, Vec::new(), || {
             let running = depth();
             for _ in 0..3 {
                 assert_eq!(with_sets(None, &updates, reasons), [1, 2]);

@@ -18,8 +18,8 @@ use ad_core_rs::ndarray::{NDArray, NDDataType, NDDimension};
 use ad_core_rs::ndarray_pool::{DriverPool, NDArrayPool, PublishedArray};
 use ad_core_rs::plugin::channel::{ArrayPublisher, NDArrayOutput};
 use ad_core_rs::plugin::runtime::{
-    ASYN_CANBLOCK, DEFAULT_PLUGIN_THREADS, NDPluginProcess, ParamPost, PluginAttributes,
-    PluginRuntimeHandle, PortPost, ProcessResult, create_plugin_runtime,
+    ASYN_CANBLOCK, DEFAULT_PLUGIN_THREADS, NDPluginProcess, ParamPost, ParamUpdate,
+    PluginAttributes, PluginRuntimeHandle, PortPost, ProcessResult, create_plugin_runtime,
 };
 use ad_core_rs::plugin::wiring::WiringRegistry;
 use asyn_rs::interrupt::InterruptFilter;
@@ -105,6 +105,30 @@ impl NDPluginProcess for CounterReader {
 
     fn plugin_type(&self) -> &str {
         "CounterReader"
+    }
+}
+
+/// Sets NumCaptured per frame, as a stream write does (NDPluginFile.cpp:778).
+struct Setting {
+    reason: Arc<AtomicUsize>,
+    frames: AtomicI32,
+}
+
+impl NDPluginProcess for Setting {
+    const ASYN_FLAGS: asyn_rs::port::PortFlags = ASYN_CANBLOCK;
+    const INTERFACE_MASK: InterfaceMask = InterfaceMask::GENERIC_POINTER;
+    const INTERRUPT_MASK: InterfaceMask = Self::INTERFACE_MASK;
+
+    fn process_array(&self, _array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
+        let frame = self.frames.fetch_add(1, Ordering::Relaxed) + 1;
+        let mut result = ProcessResult::empty();
+        let reason = self.reason.load(Ordering::Relaxed);
+        result.param_updates.push(ParamUpdate::int32(reason, frame));
+        result
+    }
+
+    fn plugin_type(&self) -> &str {
+        "Setting"
     }
 }
 
@@ -351,6 +375,28 @@ fn reading_a_frames_begin_sets_allocates_nothing() {
         (WARM + FRAMES) as i32,
         "the last frame's ArrayCounter"
     );
+    assert_eq!(allocs, 0, "{FRAMES} frames after {WARM} warm-up ones");
+}
+
+#[test]
+fn setting_a_frames_params_allocates_nothing() {
+    let _serial = SERIAL.lock();
+    let reason = Arc::new(AtomicUsize::new(usize::MAX));
+    let plugin = plugin(
+        "ZALLOC_SETS",
+        Setting {
+            reason: reason.clone(),
+            frames: AtomicI32::new(0),
+        },
+    );
+    reason.store(plugin.ndarray_params.num_captured, Ordering::Relaxed);
+    let allocs = steady_allocs(&plugin, &[], |_| true);
+    let set = plugin
+        .port_runtime()
+        .port_handle()
+        .read_int32_blocking(plugin.ndarray_params.num_captured, 0)
+        .unwrap();
+    assert_eq!(set, (WARM + FRAMES) as i32, "the last frame's set");
     assert_eq!(allocs, 0, "{FRAMES} frames after {WARM} warm-up ones");
 }
 

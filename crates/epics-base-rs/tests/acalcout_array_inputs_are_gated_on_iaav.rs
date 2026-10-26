@@ -219,8 +219,9 @@ async fn a_local_array_link_is_still_read() {
 
 /// A Local PV array link IS read (`:1078` admits LOC), so its failed
 /// `dbGetLink` raises LINK/INVALID and returns from `fetch_values` (`:1099`).
+/// AA and PAA were `calloc`'d and charged before that read (`:1082-1094`).
 /// C (oracleSwaitIoc, calc f207871): STAT LINK, SEVR INVALID, VAL 0,
-/// AA 0 0 0 0.
+/// AA 0 0 0 0, AMEM 192.
 #[epics_macros_rs::epics_test]
 async fn a_failed_read_of_a_local_array_link_raises_link_invalid() {
     let db = build().await;
@@ -236,11 +237,12 @@ async fn a_failed_read_of_a_local_array_link_raises_link_invalid() {
         "fetch_values returned non-zero"
     );
     assert_eq!(array(&db, "BADSTR", "AA"), [0.0; 4]);
+    assert_eq!(field(&db, "BADSTR", "AMEM"), 192.0);
 }
 
 /// The same failure through a `$` read of a field that is not a link: C
 /// (calc f207871): INBB `X.RTYP$` is STAT LINK, SEVR INVALID, VAL 0,
-/// BB 0 0 0 0.
+/// BB 0 0 0 0, AMEM 192.
 #[epics_macros_rs::epics_test]
 async fn a_failed_long_string_read_of_an_array_link_raises_link_invalid() {
     let db = build().await;
@@ -248,6 +250,7 @@ async fn a_failed_long_string_read_of_an_array_link_raises_link_invalid() {
     assert_eq!(alarm(&db, "RTYPARR"), (AlarmSeverity::Invalid, LINK_ALARM));
     assert_eq!(field(&db, "RTYPARR", "VAL"), 0.0);
     assert_eq!(array(&db, "RTYPARR", "BB"), [0.0; 4]);
+    assert_eq!(field(&db, "RTYPARR", "AMEM"), 192.0);
 }
 
 /// The scalar half on the same two `$` sources. C: INPA `X.RTYP$` is

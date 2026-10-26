@@ -265,7 +265,9 @@ const PA_NAMES: [&str; 12] = [
 /// a concurrency feature: it is what lets the charge sit at C's OWN seam.
 /// `cvt_dbaddr` runs when a client resolves a channel on an `SPC_DBADDR` field,
 /// which reaches this port as [`Record::cvt_dbaddr`] — a `&self` hook,
-/// because resolving a channel is a read. A charge is idempotent per [`ArrayBuf`] and the test-and-set is one
+/// because resolving a channel is a read. `fetch_values`' charge sits in
+/// `input_link_request`, the `&self` answer the fetch loop asks right before
+/// each read, for the same reason. A charge is idempotent per [`ArrayBuf`] and the test-and-set is one
 /// `fetch_or`, so the ledger stays a pure function of which buffers have been
 /// demanded, whoever asks and however often.
 mod array_mem {
@@ -1919,13 +1921,8 @@ impl Record for AcalcoutRecord {
         let Some(i) = Self::arr_index(name) else {
             return crate::server::record::put_field_internal_default(self, name, value);
         };
-        // C `fetch_values` (`:1082-1094`) allocates the array field and, on the
-        // first array link it ever serves, the shared PAA compare buffer —
-        // ahead of the save/fetch/compare below, because it is about to write
-        // through both. Neither charge posts or advances PMEM here: this runs
-        // inside the process cycle, and `complete_cycle` closes it.
-        self.mem.allocate(ArrayBuf::Arr(i), self.nelm);
-        self.mem.allocate(ArrayBuf::Paa, self.nelm);
+        // AA..LL and PAA were charged when the fetch loop asked
+        // `input_link_request`, before the read that delivers this value.
         let before = self.array_field_value(&self.arr_vals[i]);
         // The LINK's bound, and it is this path's alone: C asks the link for exactly
         // `nRequest = acalcGetNumElements(pcalc)` elements — the NUSE window
@@ -2430,10 +2427,23 @@ impl Record for AcalcoutRecord {
     /// (`aCalcoutRecord.c:1078`). Any other status is no read at all: no
     /// value, no LINK alarm, no gate. A link it does read fails as a scalar
     /// one does (`:1098-1099`).
+    ///
+    /// Inside that gate and ahead of `dbGetLink`, C allocates the array field
+    /// and the shared PAA compare buffer (`:1082-1094`), so a read that then
+    /// fails has still paid for both. This answer is that seam: the fetch
+    /// loop asks it once per link, in C's order, right before the read.
     fn input_link_request(&self, link_field: &str) -> InputLinkRequest {
-        match Self::ina_index(link_field).map(|i| self.link_status[ACALCOUT_NUMERIC_INPUTS + i]) {
-            None | Some(LINK_EXT_OK | LINK_LOC) => InputLinkRequest::As(LinkReadAs::Native),
-            Some(_) => InputLinkRequest::NotRead,
+        let Some(i) = Self::ina_index(link_field) else {
+            return InputLinkRequest::As(LinkReadAs::Native);
+        };
+        match self.link_status[ACALCOUT_NUMERIC_INPUTS + i] {
+            LINK_EXT_OK | LINK_LOC => {
+                // No post or PMEM here: `monitor()`'s tail closes the cycle.
+                self.mem.allocate(ArrayBuf::Arr(i), self.nelm);
+                self.mem.allocate(ArrayBuf::Paa, self.nelm);
+                InputLinkRequest::As(LinkReadAs::Native)
+            }
+            _ => InputLinkRequest::NotRead,
         }
     }
 

@@ -138,18 +138,21 @@ async fn closing_the_gate_revokes_a_live_write_grant() {
          created with WRITE"
     );
     iface
-        .put(&EpicsValue::Double(1.0))
+        .put_with_timeout(&EpicsValue::Double(1.0), fact_budget::FACT_BUDGET)
         .await
         .expect("write is granted while the gate is open");
 
     let gate = connect(&client, "GATE").await;
-    gate.put(&EpicsValue::Double(0.0))
+    gate.put_with_timeout(&EpicsValue::Double(0.0), fact_budget::FACT_BUDGET)
         .await
         .expect("GATE is in the OPEN group");
 
     await_write_bit(&iface, false, "gate shut").await;
     assert!(
-        iface.put(&EpicsValue::Double(2.0)).await.is_err(),
+        iface
+            .put_with_timeout(&EpicsValue::Double(2.0), fact_budget::FACT_BUDGET)
+            .await
+            .is_err(),
         "the interlock must refuse the write once the gate is shut"
     );
 }
@@ -170,13 +173,13 @@ async fn opening_the_gate_grants_write_to_a_connected_client() {
     );
 
     let gate = connect(&client, "GATE").await;
-    gate.put(&EpicsValue::Double(1.0))
+    gate.put_with_timeout(&EpicsValue::Double(1.0), fact_budget::FACT_BUDGET)
         .await
         .expect("GATE is in the OPEN group");
 
     await_write_bit(&iface, true, "gate opened").await;
     iface
-        .put(&EpicsValue::Double(3.0))
+        .put_with_timeout(&EpicsValue::Double(3.0), fact_budget::FACT_BUDGET)
         .await
         .expect("the write must be granted once the gate is open");
 }

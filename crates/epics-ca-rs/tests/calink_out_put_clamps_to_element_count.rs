@@ -213,9 +213,10 @@ async fn a_direct_client_put_is_still_refused() {
         .await
         .expect("direct channel");
     let err = ch
-        .put(&EpicsValue::DoubleArray(
-            vec![1.0, 2.0, 3.0, 4.0, 5.0].into(),
-        ))
+        .put_with_timeout(
+            &EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0, 4.0, 5.0].into()),
+            fact_budget::FACT_BUDGET,
+        )
         .await
         .expect_err("libca returns ECA_BADCOUNT for an oversized ca_array_put");
     assert!(

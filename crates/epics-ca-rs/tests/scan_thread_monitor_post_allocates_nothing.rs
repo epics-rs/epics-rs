@@ -344,7 +344,7 @@ async fn a_monitored_scan_cycle_allocates_nothing_on_its_scan_thread() {
     // carries it.
     connect(&client, "AO1.PREC")
         .await
-        .put(&EpicsValue::Short(4))
+        .put_with_timeout(&EpicsValue::Short(4), fact_budget::FACT_BUDGET)
         .await
         .expect("put PREC");
     let prec = tokio::time::timeout(fact_budget::FACT_BUDGET, async {

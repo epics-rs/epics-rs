@@ -125,7 +125,10 @@ async fn main() {
                 let mut counter: i32 = 0;
                 loop {
                     counter = counter.wrapping_add(1);
-                    match ch_for_write.put(&EpicsValue::Long(counter)).await {
+                    match ch_for_write
+                        .put_with_timeout(&EpicsValue::Long(counter), Duration::from_secs(30))
+                        .await
+                    {
                         Ok(()) => {
                             writes.fetch_add(1, Ordering::Relaxed);
                         }

@@ -91,7 +91,7 @@ async fn a_value_the_field_refuses_is_putfail_not_badtype() {
             .expect("connect");
 
         let err = chan
-            .put_string(value)
+            .put_string(value, fact_budget::FACT_BUDGET)
             .await
             .expect_err("the field's converter must refuse this value");
         let eca = eca_of(&err);
@@ -132,7 +132,7 @@ async fn a_field_the_channel_cannot_write_is_refused_before_the_put() {
         .expect("connect");
 
     let err = chan
-        .put_string("3")
+        .put_string("3", fact_budget::FACT_BUDGET)
         .await
         .expect_err("a no-mod field must refuse the put");
     // The refusal is the access gate's, not the database's: it carries no
@@ -160,7 +160,7 @@ async fn a_value_the_field_accepts_still_succeeds() {
 
     // 32767 is DBF_SHORT's maximum — the boundary value one below the
     // refused 32768 above.
-    chan.put_string("32767")
+    chan.put_string("32767", fact_budget::FACT_BUDGET)
         .await
         .expect("the maximum DBF_SHORT value is accepted");
 

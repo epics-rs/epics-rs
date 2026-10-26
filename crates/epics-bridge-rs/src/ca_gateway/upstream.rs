@@ -1852,6 +1852,9 @@ impl UpstreamManager {
     /// existing subscribed channel when available, avoiding a
     /// fresh CREATE_CHAN round-trip per write. Falls back to a
     /// transient channel only when the PV has no subscription.
+    ///
+    /// The completion has no deadline, as C `gatePvData::put` issues
+    /// `ca_array_put_callback` with none (`gatePv.cc:1120`).
     pub async fn put(&self, upstream_name: &str, value: &EpicsValue) -> BridgeResult<()> {
         let channel_for_op = self
             .subs
@@ -1859,14 +1862,12 @@ impl UpstreamManager {
             .get(upstream_name.as_bytes())
             .map(|s| s.channel.clone());
         if let Some(ch) = channel_for_op {
-            return ch
-                .put(value)
+            return async { ch.put_callback(value)?.await }
                 .await
                 .map_err(|e| BridgeError::PutRejected(format!("upstream put: {e}")));
         }
         let channel = self.client.create_channel(upstream_name);
-        channel
-            .put(value)
+        async { channel.put_callback(value)?.await }
             .await
             .map_err(|e| BridgeError::PutRejected(format!("upstream put: {e}")))
     }

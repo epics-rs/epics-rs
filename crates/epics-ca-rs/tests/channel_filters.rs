@@ -111,9 +111,12 @@ async fn ca_fr_8_record_field_read_notify_applies_arr() {
     ch.wait_connected(fact_budget::FACT_BUDGET)
         .await
         .expect("connect for seed write");
-    ch.put(&EpicsValue::DoubleArray(ramp(0.0, 10).into()))
-        .await
-        .expect("seed VAL with [0..9]");
+    ch.put_with_timeout(
+        &EpicsValue::DoubleArray(ramp(0.0, 10).into()),
+        fact_budget::FACT_BUDGET,
+    )
+    .await
+    .expect("seed VAL with [0..9]");
 
     // Baseline: unfiltered read returns the full ramp, first element 0.0.
     let (_t, base) = tokio::time::timeout(fact_budget::FACT_BUDGET, client.caget("CAFR8:WF:R1"))
@@ -172,9 +175,12 @@ async fn ca_fr_8_record_field_monitor_applies_arr_on_updates() {
     seed.wait_connected(fact_budget::FACT_BUDGET)
         .await
         .expect("connect for seed");
-    seed.put(&EpicsValue::DoubleArray(ramp(0.0, 10).into()))
-        .await
-        .expect("seed VAL");
+    seed.put_with_timeout(
+        &EpicsValue::DoubleArray(ramp(0.0, 10).into()),
+        fact_budget::FACT_BUDGET,
+    )
+    .await
+    .expect("seed VAL");
 
     let channel = client.create_channel(r#"CAFR8:WF:R2.{"arr":{"s":5,"e":7}}"#);
     let mut monitor = channel.subscribe().await.expect("subscribe");
@@ -189,9 +195,12 @@ async fn ca_fr_8_record_field_monitor_applies_arr_on_updates() {
 
     // Update VAL to [100..109]; the monitor must re-apply the chain on
     // the update → exactly [105,106,107] (unfiltered would start at 100).
-    seed.put(&EpicsValue::DoubleArray(ramp(100.0, 10).into()))
-        .await
-        .expect("update VAL with [100..109]");
+    seed.put_with_timeout(
+        &EpicsValue::DoubleArray(ramp(100.0, 10).into()),
+        fact_budget::FACT_BUDGET,
+    )
+    .await
+    .expect("update VAL with [100..109]");
     let update = recv_value(&mut monitor).await;
     assert_eq!(
         doubles(&update),
@@ -242,7 +251,10 @@ async fn ca_fr_8_simplepv_monitor_applies_arr() {
         .await
         .expect("connect writer channel");
     writer
-        .put(&EpicsValue::DoubleArray(ramp(100.0, 10).into()))
+        .put_with_timeout(
+            &EpicsValue::DoubleArray(ramp(100.0, 10).into()),
+            fact_budget::FACT_BUDGET,
+        )
         .await
         .expect("update SimplePv value");
     let update = recv_value(&mut monitor).await;
@@ -324,9 +336,12 @@ async fn ca_fr_8_malformed_suffix_rejects_channel_create() {
     seed.wait_connected(fact_budget::FACT_BUDGET)
         .await
         .expect("connect for seed");
-    seed.put(&EpicsValue::DoubleArray(ramp(0.0, 10).into()))
-        .await
-        .expect("seed VAL");
+    seed.put_with_timeout(
+        &EpicsValue::DoubleArray(ramp(0.0, 10).into()),
+        fact_budget::FACT_BUDGET,
+    )
+    .await
+    .expect("seed VAL");
 
     // Sanity: the bare record (no suffix) still connects and reads.
     let (_t, ok) = tokio::time::timeout(fact_budget::FACT_BUDGET, client.caget("CAFR8:WF:R4"))
@@ -389,9 +404,12 @@ async fn ca_fr_8_dotted_filter_suffix_resolves_at_search() {
     seed.wait_connected(fact_budget::FACT_BUDGET)
         .await
         .expect("connect for seed");
-    seed.put(&EpicsValue::DoubleArray(ramp(0.0, 10).into()))
-        .await
-        .expect("seed VAL");
+    seed.put_with_timeout(
+        &EpicsValue::DoubleArray(ramp(0.0, 10).into()),
+        fact_budget::FACT_BUDGET,
+    )
+    .await
+    .expect("seed VAL");
 
     // The `0.5` inside the suffix is the trap for a naive last-dot
     // split. Post-fix the channel resolves and the read succeeds.

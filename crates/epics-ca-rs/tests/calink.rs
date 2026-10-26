@@ -450,7 +450,7 @@ async fn ca_cp_holder_processes_on_remote_change() {
     wch.wait_connected(fact_budget::FACT_BUDGET)
         .await
         .expect("writer channel connects");
-    wch.put(&EpicsValue::Double(42.0))
+    wch.put_with_timeout(&EpicsValue::Double(42.0), fact_budget::FACT_BUDGET)
         .await
         .expect("remote write to source");
 

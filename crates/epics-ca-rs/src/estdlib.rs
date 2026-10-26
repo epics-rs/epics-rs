@@ -59,9 +59,9 @@ pub enum EnvDoubleError {
 /// bad value yields three lines, not one.
 ///
 /// **Only for variables outside C's `ENV_PARAM` table** — the CA-TLS and
-/// port-local knobs (`EPICS_CAS_SEND_TMO`, `EPICS_CA_PUT_TIMEOUT`, …), which do
-/// not appear in `envDefs.h` and therefore have no compiled default for anyone
-/// to read. The caller owning the fallback is correct *there*, and only there.
+/// port-local knobs (`EPICS_CAS_SEND_TMO`, …), which do not appear in
+/// `envDefs.h` and therefore have no compiled default for anyone to read.
+/// The caller owning the fallback is correct *there*, and only there.
 ///
 /// A parameter that IS in the table resolves its default through
 /// [`epics_base_rs::runtime::env_table`] via

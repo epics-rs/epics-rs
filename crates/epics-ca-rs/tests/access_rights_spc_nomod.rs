@@ -139,7 +139,12 @@ async fn a_put_to_a_nomod_field_is_still_refused() {
         .await
         .expect("connect");
 
-    let put = ch.put(&epics_base_rs::types::EpicsValue::Short(2)).await;
+    let put = ch
+        .put_with_timeout(
+            &epics_base_rs::types::EpicsValue::Short(2),
+            fact_budget::FACT_BUDGET,
+        )
+        .await;
     assert!(
         put.is_err(),
         "SPC_NOMOD refuses the write on every route; got {put:?}"

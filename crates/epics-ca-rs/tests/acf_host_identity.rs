@@ -80,7 +80,7 @@ async fn claimed_host_name_matches_a_host_hag_and_grants_write() {
         .await
         .expect("connect");
 
-    ch.put(&EpicsValue::Long(42))
+    ch.put_with_timeout(&EpicsValue::Long(42), fact_budget::FACT_BUDGET)
         .await
         .expect("HAG(ops) { opi-01.lab } must grant WRITE to a client claiming that name");
 
@@ -116,7 +116,9 @@ async fn unlisted_host_name_is_denied_write() {
         .await
         .expect("connect");
 
-    let put = ch.put(&EpicsValue::Long(7)).await;
+    let put = ch
+        .put_with_timeout(&EpicsValue::Long(7), fact_budget::FACT_BUDGET)
+        .await;
     assert!(
         put.is_err(),
         "a host outside HAG(ops) must not get WRITE; got {put:?}"

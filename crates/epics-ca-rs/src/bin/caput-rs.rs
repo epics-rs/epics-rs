@@ -585,8 +585,7 @@ async fn main() {
             // string. Route through the same explicit-wire-type path as
             // the numeric/-S writes so the CLI `-w` timeout owns the
             // callback wait (caput.c:558-567 uses one caTimeout for every
-            // dbrType), instead of put_string's EPICS_CA_PUT_TIMEOUT/30s
-            // default which dropped `-w`.
+            // dbrType).
             let v = epics_ca_rs::EpicsValue::String(s.clone());
             let dbr = epics_ca_rs::DbFieldType::String as u16;
             if callback {

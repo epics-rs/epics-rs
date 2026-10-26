@@ -68,11 +68,6 @@ attempt, capped at this value. Sites with very long-lived disconnect
 periods may want this lower to shorten reconnect time after the IOC
 returns.
 
-### `EPICS_CA_PUT_TIMEOUT` (libca)
-
-Default `put` timeout in seconds when the caller doesn't pass one
-explicitly. Default: 30.
-
 ### `EPICS_CA_NAME_SERVERS` (libca)
 
 Whitespace-separated `host[:port]` entries for TCP-based PV name

@@ -65,7 +65,6 @@ const KNOWN_ENV: &[&str] = &[
     "EPICS_CA_CONN_TMO",
     "EPICS_CA_MAX_ARRAY_BYTES",
     "EPICS_CA_MAX_SEARCH_PERIOD",
-    "EPICS_CA_PUT_TIMEOUT",
     "EPICS_CA_NAME_SERVERS",
     "EPICS_CA_MONITOR_QUEUE",
     "EPICS_CA_USE_SHELL_VARS",
@@ -128,7 +127,7 @@ fn lint_env(issues: &mut Vec<Issue>) {
             "EPICS_CA_AUTO_ADDR_LIST" => {
                 seen_auto_addr_list = matches!(v.trim(), "NO" | "no" | "0" | "off");
             }
-            "EPICS_CA_CONN_TMO" | "EPICS_CA_PUT_TIMEOUT" if v.parse::<f64>().is_err() => {
+            "EPICS_CA_CONN_TMO" if v.parse::<f64>().is_err() => {
                 issues.push(Issue::Error(format!("{k}={v:?} is not a number")));
             }
             _ => {}

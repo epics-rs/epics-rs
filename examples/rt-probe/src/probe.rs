@@ -479,7 +479,8 @@ async fn ca_latency(samples: usize, hogs: usize) -> Result<(), Box<dyn std::erro
     for i in 0..samples {
         let v = (i + 1) as f64;
         let t0 = Instant::now();
-        ch.put(&EpicsValue::Double(v)).await?;
+        ch.put_with_timeout(&EpicsValue::Double(v), Duration::from_secs(30))
+            .await?;
         // Wait for the monitor to deliver exactly this value.
         loop {
             match tokio::time::timeout(Duration::from_secs(2), mon.recv()).await {

@@ -86,7 +86,9 @@ async fn dollar_channels_serve_the_dbr_char_address() {
         (&b"xyz"[..], "xyz", 4.0),
         (&b"A"[..], "A", 2.0),
     ] {
-        val.put(&chars(written)).await.expect("put LSO.VAL$");
+        val.put_with_timeout(&chars(written), fact_budget::FACT_BUDGET)
+            .await
+            .expect("put LSO.VAL$");
         assert_eq!(
             read(&client, "LSO.VAL").await,
             EpicsValue::String(want_val.into()),
@@ -114,7 +116,9 @@ async fn dollar_channels_serve_the_dbr_char_address() {
     for n in [39, 40, 41, 49] {
         let mut written = text[..n].to_vec();
         written.push(0);
-        li.put(&chars(&written)).await.expect("put LI.VAL$");
+        li.put_with_timeout(&chars(&written), fact_budget::FACT_BUDGET)
+            .await
+            .expect("put LI.VAL$");
         assert_eq!(
             read(&client, "LI.LEN").await,
             EpicsValue::Double(n as f64 + 1.0),
@@ -124,12 +128,14 @@ async fn dollar_channels_serve_the_dbr_char_address() {
 
     connect(&client, "AI.INP")
         .await
-        .put_string("SI")
+        .put_string("SI", fact_budget::FACT_BUDGET)
         .await
         .expect("put AI.INP");
     let inp = connect(&client, "AI.INP$").await;
     assert_eq!(inp.element_count().unwrap(), 1024, "PVLINK_STRINGSZ");
-    inp.put(&chars(b"2.5\0")).await.expect("put AI.INP$");
+    inp.put_with_timeout(&chars(b"2.5\0"), fact_budget::FACT_BUDGET)
+        .await
+        .expect("put AI.INP$");
     assert_eq!(
         read(&client, "AI.INP").await,
         EpicsValue::String("2.5".into())

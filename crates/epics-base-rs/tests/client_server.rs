@@ -130,7 +130,9 @@ async fn test_put_and_readback() {
     let ch = client.create_channel("TEST:SP");
     ch.wait_connected(Duration::from_secs(3)).await.unwrap();
 
-    ch.put(&EpicsValue::Double(99.5)).await.unwrap();
+    ch.put_with_timeout(&EpicsValue::Double(99.5), fact_budget::FACT_BUDGET)
+        .await
+        .unwrap();
 
     let (_, value) = ch.get_with_timeout(fact_budget::FACT_BUDGET).await.unwrap();
     assert_eq!(value, EpicsValue::Double(99.5));
@@ -264,7 +266,9 @@ async fn test_monitor_receives_updates() {
     assert_eq!(snap.value, EpicsValue::Double(0.0));
 
     // Put a new value and expect the monitor to fire
-    ch.put(&EpicsValue::Double(123.0)).await.unwrap();
+    ch.put_with_timeout(&EpicsValue::Double(123.0), fact_budget::FACT_BUDGET)
+        .await
+        .unwrap();
 
     let snap = tokio::time::timeout(Duration::from_secs(3), monitor.recv())
         .await

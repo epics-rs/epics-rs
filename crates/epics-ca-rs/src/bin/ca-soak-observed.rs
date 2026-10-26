@@ -87,7 +87,11 @@ mod inner {
                     let mut counter: i32 = 0;
                     loop {
                         counter = counter.wrapping_add(1);
-                        if writer_ch.put(&EpicsValue::Long(counter)).await.is_ok() {
+                        if writer_ch
+                            .put_with_timeout(&EpicsValue::Long(counter), Duration::from_secs(30))
+                            .await
+                            .is_ok()
+                        {
                             writes.fetch_add(1, Ordering::Relaxed);
                         }
                         tokio::time::sleep(interval).await;

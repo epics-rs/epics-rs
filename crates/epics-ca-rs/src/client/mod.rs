@@ -1702,22 +1702,6 @@ async fn within<T>(
 /// reject asynchronously (callback path) or accept past its array
 /// bound (nowait path). Validate client-side so the call fails
 /// synchronously the way libca does.
-/// Default deadline for a `CA_PROTO_WRITE_NOTIFY` that the caller did not
-/// time-box itself, overridable via `EPICS_CA_PUT_TIMEOUT` (seconds).
-///
-/// Port-specific knob (libca leaves the deadline to `ca_pend_io`), but it
-/// resolves through the same C primitives as every other env-derived
-/// double — `epicsScanDouble` plus the saturating `Duration` conversion —
-/// so no environment string can panic a `put`.
-fn put_timeout() -> Duration {
-    static RESOLVED: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
-    *RESOLVED.get_or_init(|| {
-        crate::estdlib::env_double("EPICS_CA_PUT_TIMEOUT")
-            .map(crate::estdlib::duration_from_secs)
-            .unwrap_or(Duration::from_secs(30))
-    })
-}
-
 fn validate_put_count(snap: &types::ChannelSnapshotPublic, count: u32) -> CaResult<()> {
     if count > snap.element_count {
         return Err(CaError::Protocol(format!(
@@ -1778,7 +1762,7 @@ pub struct CaChannel {
     coord_tx: mpsc::UnboundedSender<CoordRequest>,
     transport_tx: mpsc::UnboundedSender<TransportCommand>,
     /// Shared in-flight registry for reads and writes (Option C
-    /// Phase A). The gets and `ch.put()` insert their reply oneshots
+    /// Phase A). The gets and puts insert their reply oneshots
     /// directly here, bypassing the coordinator's `tokio::select!`
     /// loop. The transport's per-server read loop fulfils them on
     /// `ReadResponse` / `WriteResponse` arrival.
@@ -2881,11 +2865,10 @@ impl CaChannel {
         Ok(read)
     }
 
-    pub async fn put(&self, value: &EpicsValue) -> CaResult<()> {
-        self.put_with_timeout(value, put_timeout()).await
-    }
-
-    /// Write with completion callback and configurable timeout.
+    /// `ca_array_put_callback` of the native type, its completion awaited
+    /// under the caller's `timeout` as C `caput -c` awaits it under
+    /// `caTimeout` (`caput.c:546`, `:565`). Every awaitable put takes its
+    /// bound; [`Self::put_callback`] is the one without.
     pub async fn put_with_timeout(&self, value: &EpicsValue, timeout: Duration) -> CaResult<()> {
         within(timeout, self.issue_write_notify(value)?.reply()).await
     }
@@ -2969,7 +2952,8 @@ impl CaChannel {
     /// reports its completion.
     pub fn put_no_callback(&self, value: &EpicsValue) -> CaResult<()> {
         let snap = self.snapshot()?;
-        // Native encoding to match the native-typed header; see `put`.
+        // Native encoding to match the native-typed header; see
+        // `issue_write_notify`.
         let value = value.convert_to(snap.native_type);
         validate_put_count(&snap, value.count())?;
         validate_put_strings(&value)?;
@@ -3042,21 +3026,21 @@ impl CaChannel {
 
     /// Write a string value to the channel as `DBR_STRING` (DBR type 0)
     /// regardless of the channel's native type, and wait for the
-    /// completion callback.
+    /// completion callback under `timeout`.
     ///
     /// This mirrors C `caput`'s ENUM handling (`caput.c:486-510`): a
     /// `DBR_ENUM` channel is written with the value as a `DBR_STRING`
     /// and the **server** resolves the menu string. That is the only
     /// way to write a site-custom ENUM by name — the client has no
     /// access to the IOC's menu definitions. Plain integer ENUM
-    /// indices should still go through [`Self::put`] with
+    /// indices should still go through [`Self::put_with_timeout`] with
     /// [`EpicsValue::Enum`].
     ///
     /// Note: a CA `DBR_STRING` is a fixed 40-byte field, so a `value` of 40
     /// bytes or more is REJECTED (`ECA_STRTOBIG`), not truncated — libca
     /// `nciu::stringVerify` refuses it before the request is queued (R6-29).
     /// ENUM menu names are well within the 39-byte cap.
-    pub async fn put_string(&self, value: &str) -> CaResult<()> {
+    pub async fn put_string(&self, value: &str, timeout: Duration) -> CaResult<()> {
         let snap = self.snapshot()?;
         validate_put_count(&snap, 1)?;
         validate_string_length(value)?;
@@ -3065,7 +3049,7 @@ impl CaChannel {
         // DBR_STRING = 0; count 1. The server interprets the bytes
         // against its own field type (e.g. ENUM menu resolution).
         let write = self.send_write_notify(&snap, 0, 1, payload)?;
-        within(put_timeout(), write.reply()).await
+        within(timeout, write.reply()).await
     }
 
     /// Fire-and-forget variant of [`Self::put_string`] — sends the
@@ -3081,14 +3065,15 @@ impl CaChannel {
 
     /// Array variant of [`Self::put_string`] — writes `values` as a
     /// `DBR_STRING` array (`count = values.len()`) regardless of the
-    /// channel's native type, and waits for the completion callback.
+    /// channel's native type, and waits for the completion callback under
+    /// `timeout`.
     ///
     /// This is the ENUM-waveform-by-name path: C `caput -a` on a
     /// `DBR_ENUM` waveform writes each element as a `DBR_STRING` and the
     /// **server** resolves each menu string. Each element is subject to the
     /// same 39-byte cap as [`Self::put_string`]: an over-long element is
     /// rejected with `ECA_STRTOBIG`, not truncated.
-    pub async fn put_string_array(&self, values: &[String]) -> CaResult<()> {
+    pub async fn put_string_array(&self, values: &[String], timeout: Duration) -> CaResult<()> {
         let snap = self.snapshot()?;
         validate_put_count(&snap, values.len() as u32)?;
         for s in values {
@@ -3101,7 +3086,7 @@ impl CaChannel {
         // DBR_STRING = 0. The server interprets each 40-byte element
         // against its own field type (e.g. ENUM menu resolution).
         let write = self.send_write_notify(&snap, 0, count, payload)?;
-        within(put_timeout(), write.reply()).await
+        within(timeout, write.reply()).await
     }
 
     /// Fire-and-forget variant of [`Self::put_string_array`].
@@ -6787,10 +6772,10 @@ mod disconnect_transition_tests {
 // the exec backend's `std::time` one.
 #[cfg(all(test, tokio_backend))]
 mod deadline_tests {
-    //! Every awaitable get carries its caller's `ca_pend_io` bound;
-    //! `get_callback` (`ca_array_get_callback`) and the sync group's get
-    //! have none and end on the answer or a disconnect. A dropped get or put
-    //! withdraws its waiter.
+    //! Every awaitable get or put carries its caller's bound; the callback
+    //! forms (`ca_array_get_callback`, `ca_array_put_callback`) and the sync
+    //! group's ops have none and end on the answer or a disconnect. A
+    //! dropped get or put withdraws its waiter.
     use super::*;
     use epics_base_rs::runtime::task;
     use std::collections::HashSet;
@@ -6932,6 +6917,36 @@ mod deadline_tests {
         assert_eq!(value, EpicsValue::Double(4.5));
     }
 
+    /// Each ends `Timeout` at its bound, not at an hour, and leaves no waiter.
+    #[tokio::test(start_paused = true)]
+    async fn every_awaitable_put_ends_at_its_bound() {
+        async fn ends(
+            ch: &CaChannel,
+            what: &str,
+            put: impl std::future::Future<Output = CaResult<()>>,
+        ) {
+            let put = task::timeout(AN_HOUR, put).await;
+            assert!(matches!(put, Ok(Err(CaError::Timeout))), "{what}: {put:?}");
+            assert!(ch.in_flight.writes.is_empty(), "{what} left its waiter");
+        }
+        let (ch, _rx) = connected();
+        let one = EpicsValue::Double(1.0);
+        ends(&ch, "put_with_timeout", ch.put_with_timeout(&one, BOUND)).await;
+        ends(
+            &ch,
+            "put_as_dbr_with_timeout",
+            ch.put_as_dbr_with_timeout(6, &one, BOUND),
+        )
+        .await;
+        ends(&ch, "put_string", ch.put_string("1", BOUND)).await;
+        ends(
+            &ch,
+            "put_string_array",
+            ch.put_string_array(&["1".to_string()], BOUND),
+        )
+        .await;
+    }
+
     /// `ca_sg_array_put` has no deadline of its own (`CASG.cpp:212`), so
     /// only `block`'s bound ends a sync-group put.
     #[tokio::test(start_paused = true)]
@@ -6986,11 +7001,11 @@ mod deadline_tests {
             ch.put_as_dbr_with_timeout(6, &one, AN_HOUR),
         )
         .await;
-        dropped(&ch, "put_string", ch.put_string("1")).await;
+        dropped(&ch, "put_string", ch.put_string("1", AN_HOUR)).await;
         dropped(
             &ch,
             "put_string_array",
-            ch.put_string_array(&["1".to_string()]),
+            ch.put_string_array(&["1".to_string()], AN_HOUR),
         )
         .await;
     }

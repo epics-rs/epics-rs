@@ -160,7 +160,10 @@ async fn filters_run_pre_then_post_on_every_ca_path() {
 
     connect(&client, "FS")
         .await
-        .put(&EpicsValue::String("world".into()))
+        .put_with_timeout(
+            &EpicsValue::String("world".into()),
+            fact_budget::FACT_BUDGET,
+        )
         .await
         .expect("put FS");
     for (name, mon, _) in &mut mons[..3] {
@@ -179,9 +182,12 @@ async fn filters_run_pre_then_post_on_every_ca_path() {
         ([1.0, 2.2, 3.0], 1.0),
         ([1.5, 2.7, 3.0], 1.5),
     ] {
-        w.put(&EpicsValue::DoubleArray(wave.to_vec().into()))
-            .await
-            .expect("put W");
+        w.put_with_timeout(
+            &EpicsValue::DoubleArray(wave.to_vec().into()),
+            fact_budget::FACT_BUDGET,
+        )
+        .await
+        .expect("put W");
         for (name, mon, _) in &mut mons[3..] {
             let want = if *name == "W" {
                 wave.to_vec()

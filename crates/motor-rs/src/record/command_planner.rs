@@ -408,6 +408,19 @@ impl MotorRecord {
     /// Plan an absolute move to current DVAL: C do_work's move block,
     /// dispatching only at `mip == MIP_DONE || mip == MIP_RETRY`.
     pub(crate) fn plan_absolute_move(&mut self, effects: &mut ProcessEffects) {
+        // A target with no i64 step count (NaN, ±Inf, or DVAL/MRES past
+        // 2^63) is a C defect not copied: NINT (motor.h:88) casts it to long
+        // unchecked, which is undefined, and C dispatches it to sit moving
+        // (the oracle on motorSim, for NaN, ±Inf and -1e300). Here NaN read
+        // as 0 steps and re-armed the sub-step poll without end, -Inf and
+        // -1e300 overflowed the step difference, +Inf reached the driver. It
+        // is refused like a refused move (2434-2452), before the SET test.
+        let npos = (self.pos.dval / self.conv.mres).round();
+        let countable = (i64::MIN as f64..i64::MAX as f64).contains(&npos);
+        if !self.pos.dval.is_finite() || (self.conv.mres != 0.0 && !countable) {
+            self.refuse_move_restore_lasts();
+            return;
+        }
         // C move-block entry (2248-2255): DIFF and RDIF are recomputed
         // from the requested target before anything else — they post
         // even when the pass is then suppressed (too_small) or refused
@@ -453,11 +466,12 @@ impl MotorRecord {
         // dispatch when under one motor step or inside the open SPDB
         // window around DRBV (2313-2326).
         if self.conv.mres != 0.0 {
-            let npos = (self.pos.dval / self.conv.mres).round() as i64;
+            let npos = npos as i64;
             let rpos = (self.pos.drbv / self.conv.mres).round() as i64;
-            let steps = (npos - rpos).abs();
+            // Both counts fit i64, their distance may not.
+            let steps = npos.abs_diff(rpos);
             let too_small = if self.stat.mip.contains(MipFlags::RETRY) {
-                let rdbd_steps = (self.retry.rdbd / self.conv.mres.abs()).round() as i64;
+                let rdbd_steps = (self.retry.rdbd / self.conv.mres.abs()).round() as u64;
                 steps < rdbd_steps
             } else {
                 steps < 1

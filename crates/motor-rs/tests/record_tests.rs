@@ -423,6 +423,37 @@ fn test_soft_limit_rejects_move() {
     assert!(effects.commands.is_empty());
 }
 
+/// A DVAL/MRES rounding outside i64 has no step count and is refused like
+/// a refused move, as is a non-finite DVAL under MRES 0; the widest counts
+/// either side are dispatched, from a DRBV of the other sign.
+#[test]
+fn a_target_is_dispatched_only_with_an_i64_step_count() {
+    const TOP: f64 = 9_223_372_036_854_775_808.0; // 2^63
+    for (mres, dval, drbv, dispatched) in [
+        (1.0, TOP, 0.0, false),
+        (1.0, -TOP - 2048.0, 0.0, false),
+        (0.5, TOP / 2.0, 0.0, false),
+        (0.0, f64::INFINITY, 0.0, false),
+        (1.0, TOP - 1024.0, -2048.0, true),
+        (1.0, -TOP, 2048.0, true),
+        (0.5, (TOP - 1024.0) / 2.0, 0.0, true),
+    ] {
+        let mut rec = MotorRecord::new();
+        rec.conv.mres = mres;
+        rec.stat.msta = MstaFlags::DONE;
+        rec.pos.drbv = drbv;
+        rec.put_field("DVAL", EpicsValue::Double(dval)).unwrap();
+        let effects = rec.plan_motion(CommandSource::Dval);
+        let moved =
+            (effects.commands.iter()).any(|c| matches!(c, MotorCommand::MoveAbsolute { .. }));
+        assert_eq!(moved, dispatched, "DVAL {dval:e} at MRES {mres}");
+        if !dispatched {
+            assert_eq!(rec.pos.dval, 0.0, "DVAL {dval:e} rolled back");
+            assert!(rec.stat.dmov != 0 && rec.stat.mip.is_empty());
+        }
+    }
+}
+
 #[test]
 fn test_absolute_move_sets_dmov_false() {
     let mut rec = MotorRecord::new();

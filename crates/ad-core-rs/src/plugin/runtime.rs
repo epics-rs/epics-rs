@@ -510,9 +510,15 @@ thread_local! {
 
 /// The running frame's `beginProcessCallbacks` sets, none outside one.
 fn begin_now() -> Vec<PendingParam> {
+    with_begin(<[PendingParam]>::to_vec)
+}
+
+/// `f` given the running frame's `beginProcessCallbacks` sets where
+/// [`BEGIN`] keeps them.
+fn with_begin<R>(f: impl FnOnce(&[PendingParam]) -> R) -> R {
     BEGIN.with(|b| {
         let b = b.borrow();
-        b.sets[b.top..].to_vec()
+        f(&b.sets[b.top..])
     })
 }
 
@@ -1011,20 +1017,22 @@ impl HandOn {
 /// the callback's own updates, which the same queue carries after it.
 ///
 /// The first post carries the frame's `beginProcessCallbacks` sets, which C
-/// has made by then and its `callParamCallbacks` posts with it.
+/// has made by then and its `callParamCallbacks` posts with it. They are
+/// read where the running frame keeps them, so a `PortPost` stays on the
+/// thread that made it.
 ///
 /// A hand-on's `getAttributes` is evaluated on the calling thread, as C's
 /// is, from its [`AttributeView`], so a caller may hand on while holding a
 /// lock the actor's writes wait for.
 pub struct PortPost {
     port: Option<PortHandle>,
-    begin: Vec<PendingParam>,
-    /// The begin sets, kept to read after they are posted.
-    read: Vec<PendingParam>,
+    /// Whether a post has carried the begin sets.
+    begun: bool,
     hand_on: Option<HandOn>,
     /// What a hand-on set, for the next post.
     set: Vec<ParamUpdate>,
     view: Option<AttributeView>,
+    _thread: std::marker::PhantomData<*const ()>,
 }
 
 impl PortPost {
@@ -1033,14 +1041,13 @@ impl PortPost {
     /// Reads the store on the port's actor, so it must be made before
     /// taking a lock the actor's writes take.
     pub fn of(attributes: Option<&PluginAttributes>) -> Self {
-        let begin = begin_now();
         Self {
             port: attributes.and_then(|a| a.0.port()),
-            read: begin.clone(),
-            begin,
+            begun: false,
             hand_on: HAND_ON.with(|h| h.borrow().clone()),
             set: Vec::new(),
             view: attributes.and_then(PluginAttributes::view),
+            _thread: std::marker::PhantomData,
         }
     }
 
@@ -1060,20 +1067,26 @@ impl ParamPost for PortPost {
             .into_iter()
             .chain(updates)
             .collect();
-        let begin = std::mem::take(&mut self.begin);
-        if let Some(view) = &self.view {
-            view.record(
-                begin
-                    .iter()
-                    .cloned()
-                    .chain(updates.iter().filter_map(ParamUpdate::stored)),
-            );
-        }
-        let sets = begin
-            .into_iter()
-            .map(|(reason, addr, value)| asyn_rs::request::ParamSetValue::new(reason, addr, value))
-            .chain(updates.iter().map(ParamUpdate::param_set))
-            .collect();
+        let begun = std::mem::replace(&mut self.begun, true);
+        let sets = with_begin(|begin| {
+            let begin = if begun { &[] } else { begin };
+            if let Some(view) = &self.view {
+                view.record(
+                    begin
+                        .iter()
+                        .cloned()
+                        .chain(updates.iter().filter_map(ParamUpdate::stored)),
+                );
+            }
+            begin
+                .iter()
+                .cloned()
+                .map(|(reason, addr, value)| {
+                    asyn_rs::request::ParamSetValue::new(reason, addr, value)
+                })
+                .chain(updates.iter().map(ParamUpdate::param_set))
+                .collect()
+        });
         if let Err(e) = port.set_params_and_notify_blocking(0, sets) {
             epics_libcom_rs::stderr_println!("plugin param post error: {e}");
         }
@@ -1096,9 +1109,11 @@ impl ParamPost for PortPost {
     /// Only the frame's `beginProcessCallbacks` sets, ArrayCounter among
     /// them, are known here.
     fn int32(&self, reason: usize) -> Option<i32> {
-        self.read.iter().find_map(|(r, addr, value)| match value {
-            ParamValue::Int32(v) if *r == reason && *addr == 0 => Some(*v),
-            _ => None,
+        with_begin(|begin| {
+            begin.iter().find_map(|(r, addr, value)| match value {
+                ParamValue::Int32(v) if *r == reason && *addr == 0 => Some(*v),
+                _ => None,
+            })
         })
     }
 }

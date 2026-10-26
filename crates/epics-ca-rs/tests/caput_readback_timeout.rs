@@ -20,6 +20,7 @@
 //! it swallows, so every `ca_array_get` runs out its `-w` window.
 
 #![cfg(tokio_backend)]
+#![cfg(feature = "client-core")]
 
 use std::net::SocketAddr;
 use std::sync::Arc;

@@ -565,9 +565,10 @@ pub fn c_str(data: &[u8]) -> &[u8] {
 /// Runs on a client `writeOctet` of one reason, after the value is stored and
 /// before the callbacks: what a C driver overrides the virtual `writeOctet`
 /// for (asynNDArrayDriver.cpp's `NDAttributesFile` reload). Takes the address
-/// and the text before the first NUL; C discards the handler's status for the
-/// callbacks'.
-pub type OctetWriteRule = Arc<dyn Fn(&mut PortDriverBase, i32, &[u8]) + Send + Sync>;
+/// and the text before the first NUL; an `Err` fails the write once the
+/// callbacks have run.
+pub type OctetWriteRule =
+    Arc<dyn Fn(&mut PortDriverBase, i32, &[u8]) -> AsynResult<()> + Send + Sync>;
 
 /// Whether an array post of one reason holds the driver's state, as an axis
 /// does, rather than a frame's data; read at each post, so a reason can hold
@@ -2314,9 +2315,10 @@ impl PortDriverBase {
         let addr = self.parse_user(user)?;
         let text = c_str(data);
         let _ = self.set_string_param(user.reason, addr, text);
-        if let Some(Some(rule)) = self.octet_write_rules.get(user.reason) {
-            rule.clone()(self, addr, text);
-        }
+        let ruled = match self.octet_write_rules.get(user.reason) {
+            Some(Some(rule)) => rule.clone()(self, addr, text),
+            _ => Ok(()),
+        };
         let writer = self.octet_writer;
         self.call_param_callbacks(addr).map_err(|e| {
             param_access_error_by(
@@ -2327,6 +2329,17 @@ impl PortDriverBase {
                 e,
                 format_args!("value={}", crate::fixed_text::LossyText(text)),
             )
+        })?;
+        ruled.map_err(|e| AsynError::Status {
+            status: e.status(),
+            message: param_access_message(
+                writer,
+                &self.params,
+                user,
+                "writeOctet",
+                e.c_status_code(),
+                format_args!("value={}", crate::fixed_text::LossyText(text)),
+            ),
         })?;
         self.trace_io_by(
             writer,

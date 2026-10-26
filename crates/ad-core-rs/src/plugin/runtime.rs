@@ -3167,15 +3167,19 @@ impl PortDriver for PluginPortDriver {
         let value = verdict.kept();
         self.base.set_string_param(reason, addr, &value)?;
         // The rest of `asynNDArrayDriver::writeOctet` (NDPluginDriver.cpp:839-841):
-        // its FilePath branch is `base_octet`'s.
-        if reason != self.ndarray_params.file_path
-            && let Some(rule) = self.base.write_octet_rule(reason)
-        {
-            rule(&mut self.base, addr, value.as_bytes());
-        }
+        // its FilePath branch is `base_octet`'s. No status is ignored here: the
+        // NDAttributesFile/NDAttributesMacros rules already drop
+        // readNDAttributesFile's as C does (asynNDArrayDriver.cpp:528), and any
+        // other refusal fails the write, which C overwrites at :845; not copied.
+        let ruled = match self.base.write_octet_rule(reason) {
+            Some(rule) if reason != self.ndarray_params.file_path => {
+                rule(&mut self.base, addr, value.as_bytes())
+            }
+            _ => Ok(()),
+        };
         // C sets its errorMessage instead of this line on a failure
         // (asynNDArrayDriver.cpp:542-549).
-        if reason < self.first_plugin_param && base_ok {
+        if reason < self.first_plugin_param && base_ok && ruled.is_ok() {
             self.base.trace_io_by(
                 crate::driver::ndarray_driver::ASYN_ND_ARRAY_DRIVER,
                 user,
@@ -3193,7 +3197,7 @@ impl PortDriver for PluginPortDriver {
                 ParamChangeValue::Octet(value),
             ));
         }
-        verdict.into_result().map(|()| data.len())
+        verdict.into_result().and(ruled).map(|()| data.len())
     }
 
     fn read_int8_array(&mut self, _user: &AsynUser, buf: &mut [i8]) -> AsynResult<usize> {

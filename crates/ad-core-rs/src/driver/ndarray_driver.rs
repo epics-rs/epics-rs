@@ -1151,6 +1151,10 @@ pub const ASYN_ND_ARRAY_DRIVER: asyn_rs::port::OctetWriter = asyn_rs::port::Octe
 /// `NDAttributesFile` / `NDAttributesMacros` reload the attribute set, and
 /// `FilePath` runs `checkPath`, then `createFilePath` bounded by `CREATE_DIR`
 /// and `checkPath` again when the directory is missing.
+///
+/// A FilePath still missing fails the write: C overwrites checkPath's status
+/// with callParamCallbacks' (:540), so the write succeeds; not copied. C never
+/// takes the reload's status (:528).
 pub(crate) fn write_octet_rules(
     port_base: &mut PortDriverBase,
     params: &NDArrayDriverParams,
@@ -1161,17 +1165,25 @@ pub(crate) fn write_octet_rules(
     let attrs = Arc::clone(attributes);
     let reload = move |base: &mut PortDriverBase, _addr, _text: &[u8]| {
         let _ = attrs.lock().read_file(base, &p);
+        Ok(())
     };
     port_base.set_write_octet_rule(params.attributes_file, Arc::new(reload.clone()));
     port_base.set_write_octet_rule(params.attributes_macros, Arc::new(reload));
     port_base.set_write_octet_rule(
         params.file_path,
         Arc::new(move |base: &mut PortDriverBase, _addr, text: &[u8]| {
-            if let Ok(false) = check_path(base, &p) {
+            let missing = |base: &mut PortDriverBase| matches!(check_path(base, &p), Ok(false));
+            if missing(base) {
                 let depth = base.get_int32_param(p.create_dir, 0).unwrap_or(0);
                 let _ = NDArrayDriverBase::create_file_path(&octet_text(text), depth);
-                let _ = check_path(base, &p);
+                if missing(base) {
+                    return Err(asyn_rs::error::AsynError::Status {
+                        status: asyn_rs::error::AsynStatus::Error,
+                        message: format!("checkPath: {} does not exist", octet_text(text)),
+                    });
+                }
             }
+            Ok(())
         }),
     );
 }
@@ -3755,5 +3767,40 @@ pub(crate) mod tests {
             1
         );
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn test_write_octet_file_path_left_missing_fails() {
+        let mut drv = NDArrayDriverBase::new(
+            "TEST",
+            1,
+            1_000_000,
+            ASYN_CANBLOCK,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
+        )
+        .unwrap();
+        let missing = std::env::temp_dir()
+            .join(format!("ad_core_rs_miss_{}", std::process::id()))
+            .join("sub");
+        let path = format!("{}/", missing.to_string_lossy());
+        let reason = drv.params.file_path;
+        let Err(asyn_rs::error::AsynError::Status { message, .. }) =
+            drv.write_octet(&AsynUser::new(reason), path.as_bytes())
+        else {
+            panic!("a missing FilePath must fail the write");
+        };
+        assert_eq!(
+            message,
+            format!(
+                "asynNDArrayDriver:writeOctet: status=3, function={reason}, paramName=FILE_PATH, value={path}"
+            )
+        );
+        assert_eq!(
+            drv.port_base
+                .get_int32_param(drv.params.file_path_exists, 0)
+                .unwrap(),
+            0
+        );
     }
 }

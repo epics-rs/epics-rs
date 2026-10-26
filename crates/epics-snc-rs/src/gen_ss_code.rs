@@ -3166,7 +3166,8 @@ fn arith_operand(v: Val) -> Val {
     }
 }
 
-/// C's integer promotion of an operand.
+/// C's integer promotion of an operand, which `seqg_rt::arith` gives one
+/// of unknown type by its Rust type.
 fn promoted(v: Val) -> Val {
     let v = arith_operand(v);
     match &v.ty {
@@ -3174,11 +3175,21 @@ fn promoted(v: Val) -> Val {
             e: v.e.cast("i32"),
             ty: Ty::Num("i32".into()),
         },
+        Ty::Foreign => Val {
+            e: Expr::call("seqg_rt::arith::promote", vec![v.e]),
+            ty: Ty::Foreign,
+        },
         _ => v,
     }
 }
 
 fn neg(v: Val) -> Val {
+    if v.ty == Ty::Foreign {
+        return Val {
+            e: Expr::call("seqg_rt::arith::neg", vec![v.e]),
+            ty: Ty::Foreign,
+        };
+    }
     let v = promoted(v);
     match &v.ty {
         Ty::Num(t) if t.starts_with('u') => Val {
@@ -4161,6 +4172,42 @@ mod tests {
             format!(
                 "seqg_var.x.set(seqg_rt::arith::select(seqg_var.c.get() != 0, \
                  || {d}.get(), || {i}.get()) as _);"
+            ),
+        ] {
+            assert!(code.contains(&words(&e)), "{e}\n{code}");
+        }
+    }
+
+    #[test]
+    fn a_foreign_operand_promotes_as_c_does() {
+        // C's `(c ? s.uc : u) << 4` is 2048 for uc 0x80, `~` of it -129
+        let (code, diag) = translate(
+            "program p\n%%struct uc_t { unsigned char uc; short sh; };\n\
+             struct uc_t s;\nunsigned char u;\nint c;\nint x;\nss a {\n\
+             state s {\nwhen () {\nx = (c ? s.uc : u) << 4;\nx = -(c ? s.uc : u);\n\
+             x = ~(c ? s.uc : u);\nx = (c ? s.uc : 0) << 4;\nx = -s.uc;\nx = ~s.uc;\n\
+             x = +s.uc;\nx = s.uc << s.sh;\n} state s\n}\n}\n",
+        );
+        assert_eq!(diag, "");
+        let code = words(&code);
+        let uc = "seqg_var.s.field(|v| &mut v.uc).get()";
+        let sel =
+            |b: &str| format!("seqg_rt::arith::select(seqg_var.c.get() != 0, || {uc}, || {b})");
+        let u = sel("seqg_var.u.get()");
+        for e in [
+            format!("seqg_var.x.set((seqg_rt::arith::promote({u}) << 4) as _);"),
+            format!("seqg_var.x.set(seqg_rt::arith::neg({u}) as _);"),
+            format!("seqg_var.x.set(!seqg_rt::arith::promote({u}) as _);"),
+            format!(
+                "seqg_var.x.set((seqg_rt::arith::promote({}) << 4) as _);",
+                sel("0")
+            ),
+            format!("seqg_var.x.set(seqg_rt::arith::neg({uc}) as _);"),
+            format!("seqg_var.x.set(!seqg_rt::arith::promote({uc}) as _);"),
+            format!("seqg_var.x.set(seqg_rt::arith::promote({uc}) as _);"),
+            format!(
+                "seqg_var.x.set((seqg_rt::arith::promote({uc}) \
+                 << seqg_var.s.field(|v| &mut v.sh).get()) as _);"
             ),
         ] {
             assert!(code.contains(&words(&e)), "{e}\n{code}");

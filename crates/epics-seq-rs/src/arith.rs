@@ -3,15 +3,18 @@
 //! by their C types (C11 6.3.1.8's usual arithmetic conversions); here
 //! rustc picks the same common type from their Rust types, so a `double`
 //! member times a `long` is a `double` product, not a truncated `long`.
-//! `?:` and the comparisons take two operands of one type as they are,
-//! since C also takes two structs or pointers there ([`Pair`]).
+//! `?:` and the comparisons take two structs, unions or pointers of one
+//! type as they are ([`AsIs`]), and promote two arithmetic operands of one
+//! type, as C does.
 //! Integer types are LP64's, as [`crate::types`] maps them.
 
-use std::ops::{Add, BitAnd, BitOr, BitXor, Mul, Sub};
+use std::ops::{Add, BitAnd, BitOr, BitXor, Mul, Neg, Sub};
+
+use crate::Ptr;
 
 /// An arithmetic type, by its integer promotion (C11 6.3.1.1).
 pub trait Arith: Copy {
-    type Promoted: Copy;
+    type Promoted: Ops;
     fn promote(self) -> Self::Promoted;
 }
 
@@ -38,10 +41,11 @@ pub trait Ops: Copy + PartialOrd {
     fn c_mul(self, b: Self) -> Self;
     fn c_div(self, b: Self) -> Self;
     fn c_rem(self, b: Self) -> Self;
+    fn c_neg(self) -> Self;
 }
 
 macro_rules! ops {
-    ($add:ident, $sub:ident, $mul:ident: $($t:ty),*) => {$(
+    ($add:ident, $sub:ident, $mul:ident, $neg:ident: $($t:ty),*) => {$(
         impl Ops for $t {
             fn c_add(self, b: Self) -> Self {
                 self.$add(b)
@@ -58,12 +62,15 @@ macro_rules! ops {
             fn c_rem(self, b: Self) -> Self {
                 self % b
             }
+            fn c_neg(self) -> Self {
+                self.$neg()
+            }
         }
     )*};
 }
 
-ops!(add, sub, mul: i32, i64, f32, f64);
-ops!(wrapping_add, wrapping_sub, wrapping_mul: u32, u64);
+ops!(add, sub, mul, neg: i32, i64, f32, f64);
+ops!(wrapping_add, wrapping_sub, wrapping_mul, wrapping_neg: u32, u64);
 
 /// The common type of two promoted types, `Self` on the left.
 pub trait Common<B> {
@@ -119,17 +126,26 @@ fn usual<A: Usual<B>, B>(a: A, b: B) -> (A::T, A::T) {
     (<A as Usual<B>>::left(a), A::right(b))
 }
 
-/// `Self` and `B` as C's `?:` and comparisons take them: two of one type
-/// as they are, which may be structs, unions or pointers, and two
-/// arithmetic types converted to their common type.
+/// `Self` and `B` as C's `?:` and comparisons take them: two of one
+/// [`AsIs`] type as they are, and two arithmetic types converted to their
+/// common type, so two `unsigned char`s are `int`s.
+#[diagnostic::on_unimplemented(
+    message = "C's `?:` or comparison takes `{Self}` and `{B}` as neither arithmetic types nor one struct, union or pointer type",
+    note = "a companion's struct or union that `?:` selects implements `epics_seq_rs::arith::AsIs`"
+)]
 pub trait Pair<B> {
     type T;
     fn left(self) -> Self::T;
     fn right(b: B) -> Self::T;
 }
 
-// Promotion would not change a `?:` or comparison of one type.
-impl<A> Pair<A> for A {
+/// A type C's `?:` and comparisons take as it is beside one of its type: a
+/// struct, a union or a pointer, which C does not promote.
+pub trait AsIs {}
+
+impl<T: 'static> AsIs for Ptr<T> {}
+
+impl<A: AsIs> Pair<A> for A {
     type T = A;
     fn left(self) -> A {
         self
@@ -141,6 +157,7 @@ impl<A> Pair<A> for A {
 
 macro_rules! pair {
     ($a:ty $(, $b:ty)*) => {
+        pair!(@ $a, $a);
         $(
             pair!(@ $a, $b);
             pair!(@ $b, $a);
@@ -235,6 +252,16 @@ bitwise!(
     xor => BitXor ^,
 );
 
+/// C's integer promotion of `a`, as `+a`, `~a` and a shift take it.
+pub fn promote<A: Arith>(a: A) -> A::Promoted {
+    a.promote()
+}
+
+/// C's `-a`.
+pub fn neg<A: Arith>(a: A) -> A::Promoted {
+    a.promote().c_neg()
+}
+
 /// C's `c ? a : b`, which evaluates one of `a` and `b` and converts it to
 /// their common type.
 pub fn select<A: Pair<B>, B>(c: bool, a: impl FnOnce() -> A, b: impl FnOnce() -> B) -> A::T {
@@ -304,14 +331,47 @@ mod tests {
     }
 
     #[test]
-    fn operands_of_one_type_select_and_compare_as_they_are() {
+    fn structs_and_pointers_of_one_type_select_and_compare_as_they_are() {
         #[derive(Debug, PartialEq)]
         struct S(&'static str);
+        impl AsIs for S {}
         assert_eq!(select(false, || S("a"), || S("b")), S("b"));
         assert!(eq(S("a"), S("a")));
         assert!(ne(S("a"), S("b")));
-        // the same result as promoted
+        let null = Ptr::<S>::default();
+        assert_eq!(select(true, || null.clone(), Ptr::default), null);
+        assert!(eq(null.clone(), Ptr::default()));
+    }
+
+    #[test]
+    fn two_operands_below_int_of_one_type_select_an_int() {
+        // C's `c ? uc : uc2` is an int, so `<< 4` keeps bit 7 and `~` is
+        // negative
+        let v = select(true, || 0x80u8, || 0u8);
+        assert_eq!(std::mem::size_of_val(&v), 4);
+        assert_eq!((v << 4) as i64, 2048);
+        assert_eq!(!v as i64, -129);
+        let h = select(true, || -5i16, || 0i16);
+        assert_eq!(std::mem::size_of_val(&h), 4);
+        assert_eq!(
+            std::mem::size_of_val(&select(true, || 1usize, || 0usize)),
+            8
+        );
+        assert_eq!(select(true, || 0.5f32, || 0f32), 0.5f32);
         assert!(lt(200u8, 255u8));
-        assert_eq!(select(true, || -1i8, || 0i8), -1i8);
+        assert!(lt(-1i16, 0i16));
+    }
+
+    #[test]
+    fn a_lone_operand_below_int_promotes_to_int() {
+        assert_eq!(promote(0x80u8) << 4, 2048);
+        assert_eq!(!promote(0x80u8), -129);
+        assert_eq!(promote(-1i8), -1i32);
+        assert_eq!(promote(1usize), 1u64);
+        assert_eq!(neg(0x80u8), -128);
+        assert_eq!(neg(1u16), -1);
+        // unsigned negation is modulo 2^n
+        assert_eq!(neg(1u32), u32::MAX);
+        assert_eq!(neg(0.5f64), -0.5);
     }
 }

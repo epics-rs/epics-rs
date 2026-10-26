@@ -199,7 +199,8 @@
 //!
 //! A foreign `struct`, `union`, `enum` or `typename` is the companion type
 //! of C's name, its tag dropped (`struct struct_t` is `struct_t`), and is
-//! `Clone` and [`Zeroed`] as every variable's type is. A struct has a
+//! `Clone` and [`Zeroed`] as every variable's type is; a struct or union
+//! that `?:` selects is also [`arith::AsIs`]. A struct has a
 //! `pub` field per C member: `s.a` is the place `s.field(|v| &mut v.a)`, a
 //! [`Field`], which `&s.a` points into and whose array decays to a pointer
 //! along the member, and `p->a` is the same place through the [`Ptr`]. A

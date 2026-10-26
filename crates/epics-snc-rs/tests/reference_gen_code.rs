@@ -360,6 +360,10 @@ const COMPANIONS: &[(&str, &str)] = &[
         include_str!("companions/struct_t.rs"),
     ),
     (
+        "tests/fixtures/gen_code/foreign_promotion.st",
+        include_str!("companions/uc_t.rs"),
+    ),
+    (
         "tests/fixtures/gen_code/foreign_struct_select.st",
         include_str!("companions/struct_t.rs"),
     ),

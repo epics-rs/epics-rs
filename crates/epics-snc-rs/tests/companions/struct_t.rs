@@ -1,6 +1,7 @@
 // The escaped C types of test/validate/foreignTypes.st,
 // test/compiler/member.st and the fixtures foreign_struct_select.st,
 // foreign_pointer_compare.st and foreign_mixed_arith.st.
+use epics_seq_rs::arith::AsIs;
 use epics_seq_rs::{Ptr, UnionBytes, Zeroed};
 
 // struct struct_t { int i; struct { double d; } s; };
@@ -23,6 +24,9 @@ impl Zeroed for struct_t {
         }
     }
 }
+
+// foreign_struct_select.st's `c ? s : s2`
+impl AsIs for struct_t {}
 
 impl<D: Into<f64>> From<(i32, (D,))> for struct_t {
     fn from((i, (d,)): (i32, (D,))) -> Self {

@@ -4412,8 +4412,7 @@ impl DeviceSupport for AsynDeviceSupport {
         // C `initDbAddr` (devAsynOctet.c:645-657): the command record must
         // exist at init, or the record is dead at LINK/INVALID.
         if let Some(src) = self.device_job.write_read.get() {
-            let held = Some((self.record_name.as_bytes(), &*record as &dyn Record));
-            if !src.db.get().is_some_and(|db| db.has_pv(&src.pv, held)) {
+            if !src.db.get().is_some_and(|db| db.has_pv(&src.pv)) {
                 epics_libcom_rs::epics_println!(
                     "{} devAsynOctet::initDbAddr record {} not present",
                     self.record_name,

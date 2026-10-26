@@ -5371,7 +5371,7 @@ pub struct RecordInstance {
 
 /// [`RecordInstance`]'s fields no process cycle reads, behind one pointer so
 /// the lines a cycle does read sit closer together.
-struct RecordCold {
+pub(crate) struct RecordCold {
     /// The cell holding this instance — none for one not yet in a cell — for
     /// the PACT field's read of [`RecordCell::hold_chain_pact`]'s flag.
     cell: std::sync::Weak<RecordCell>,
@@ -5468,6 +5468,22 @@ struct RecordCold {
     /// cycle's [`crate::server::record::ProcessAction::PutAfterEpilogue`], so
     /// no other cycle pays for it.
     alarm_reset: crate::server::recgbl::EventMask,
+}
+
+impl RecordCold {
+    pub(crate) fn cell(&self) -> &std::sync::Weak<RecordCell> {
+        &self.cell
+    }
+
+    /// [`RecordInstance::attribute`] of the instance of type `record_type`
+    /// this is the cold half of.
+    fn attribute(&self, record_type: &str, name: &str) -> Option<String> {
+        let cell = self.cell.upgrade()?;
+        if cell.declares_name(name) {
+            return None;
+        }
+        self.db.upgrade()?.record_type_attribute(record_type, name)
+    }
 }
 
 /// The cycle status [`RecordInstance::run_registered_subroutine`] reports when
@@ -6135,6 +6151,93 @@ pub(crate) trait FieldMetaSource {
     fn description(&self) -> PvString;
     /// `display.form`: the `Q:form` info tag.
     fn q_form_index(&self) -> Option<i16>;
+    /// The record's dbCommon.
+    fn common(&self) -> &CommonFields;
+
+    /// What [`SourceRender`] needs of this record to render `value`, just read
+    /// from `field`, as `DBR_STRING`: taken under the read's hold, so the
+    /// render after it never goes back for the record.
+    ///
+    /// C `dbGetLink` converts at the source, through `dbConvert.c`'s
+    /// `[field_type][DBR_STRING]` table, inside `dbGet`: a float field renders
+    /// at its own precision (`getDoubleString`), a `DBF_ENUM`/`DBF_MENU` index
+    /// as its state label (`getEnumString`/`getMenuString`), and a long-string
+    /// field is `DBF_STRING` to C's `cvt_dbaddr`, not an array. The label goes
+    /// through [`Self::enum_string_form`], the owner the CA/PVA encoders
+    /// use, so a link read and a `caget -t` of one field cannot disagree.
+    fn source_render_of(&self, field: &str, value: &EpicsValue) -> SourceRender {
+        // Only an array value reads the flag, so a scalar pays no lookup.
+        let long_string = value.is_array() && self.rec().field_is_long_string(field);
+        let mut render = SourceRender {
+            long_string,
+            precision: None,
+            label: None,
+        };
+        let head = if value.is_array() && !long_string {
+            value.first_element()
+        } else {
+            None
+        };
+        match head.as_ref().unwrap_or(value) {
+            EpicsValue::Double(_) | EpicsValue::Float(_) => {
+                render.precision = Some(self.dbr_string_precision(field, value));
+            }
+            // A `DBF_ENUM` index, and a `DBF_MENU` index (stored as a short),
+            // render through the field's string source. A short field that is
+            // neither has no source and stays the plain number C converts it to.
+            &EpicsValue::Enum(idx) => render.label = self.label_of(field, idx),
+            // A menu index is an `epicsEnum16`: a negative short reads as its
+            // unsigned bits, which `cvt_menu_st` prints with `%u`.
+            &EpicsValue::Short(v) => render.label = self.label_of(field, v as u16),
+            _ => {}
+        }
+        render
+    }
+
+    /// [`Self::enum_string_form`]'s label for `idx`; a menu's or a `VAL`
+    /// state's is cloned from where it lives, without building the form under
+    /// the read's hold.
+    fn label_of(&self, field: &str, idx: u16) -> Option<PvString> {
+        let desc = field_desc_of(self.rec(), field);
+        if is_device(desc) {
+            // `cvt_device_st`: a type with no device menu reads ""
+            // (`dbFastLinkConv.c:1615-1618`).
+            return Some(
+                device_choices_of(self.rec().record_type(), self.common().dtyp.as_str())
+                    .map_or_else(PvString::default, |c| EnumStringForm::device(c).render(idx)),
+            );
+        }
+        if let Some(choices) = menu_choices_with(self.rec(), field, desc) {
+            return Some(match choices.get(idx as usize) {
+                Some(choice) => PvString::from(*choice),
+                None => PvString::from(idx.to_string().as_str()),
+            });
+        }
+        if field.eq_ignore_ascii_case("VAL") {
+            return self
+                .rec()
+                .enum_slots()
+                .map(|slots| PvString::from(slots.label(idx)));
+        }
+        self.enum_string_form(field).map(|form| form.render(idx))
+    }
+
+    /// C `getDoubleString`'s precision for `field` holding `value`: seeded 6
+    /// and overwritten by the rset's `get_precision` — the answer the
+    /// DBR_STRING encoder reads off [`Snapshot::precision`].
+    ///
+    /// [`Snapshot::precision`]: crate::server::snapshot::Snapshot::precision
+    fn dbr_string_precision(&self, field: &str, value: &EpicsValue) -> u16 {
+        let meta = self.meta();
+        let support = meta.slots.narrowed_to_field(value.db_field_type(), false);
+        if !support.precision {
+            return 6;
+        }
+        self.rec()
+            .field_metadata_override(field)
+            .and_then(|ov| ov.precision)
+            .unwrap_or_else(|| self.metadata_limit(meta.prec) as i16) as u16
+    }
 
     /// The record's VAL metadata into `snap`, read from its fields as they
     /// stand, as C's `dbGet` calls the rset slots on every read. Returns the
@@ -6810,6 +6913,9 @@ impl FieldMetaSource for RecordInstance {
     fn rec(&self) -> &dyn Record {
         self.record.as_ref()
     }
+    fn common(&self) -> &CommonFields {
+        &self.common
+    }
     fn meta(&self) -> &'static MetaFields {
         self.monitor_plan.meta
     }
@@ -7076,18 +7182,106 @@ struct OwnView<'a> {
     meta: &'static MetaFields,
 }
 
-impl OwnView<'_> {
-    /// C `dbGet` of `field` through `prec`: the type's own field, else its
-    /// dbCommon's, as [`FieldRead::table`] routes the instance read.
-    fn field(&self, field: &str) -> Option<EpicsValue> {
-        let own = self.own;
-        own.record()
-            .get_field(field)
-            .or_else(|| match CommonField::by_name(field)? {
-                CommonField::Pact => Some(EpicsValue::Char(own.pact() as u8)),
-                field => common_field_of(own.record(), own.common(), field),
-            })
+impl crate::server::record::OwnRecord<'_> {
+    /// [`RecordInstance::resolve_field`] of the record the caller is inside:
+    /// the same chain, through its code and what its holder lent.
+    pub(crate) fn resolve_field(self, name: &str) -> Option<EpicsValue> {
+        let name = upper_field(name);
+        let name = name.as_ref();
+        let record = self.record();
+        let desc = field_desc_of(record, name);
+        let value = match desc {
+            Some(desc) if desc.unreadable() => return None,
+            Some(desc) => record
+                .get_field(name)
+                .or_else(|| match CommonField::by_name(name)? {
+                    CommonField::Pact => Some(EpicsValue::Char(self.pact() as u8)),
+                    field => common_field_of(record, self.common(), field),
+                })
+                .or_else(|| (name == "NAME").then(|| EpicsValue::String(self.name().into())))
+                .or_else(|| self.cold().declared_overrides.get(name).cloned())
+                .or_else(|| declared_default_of(record, name, desc))?,
+            None => EpicsValue::String(self.attribute(name)?.into()),
+        };
+        Some(reader_sees(
+            record,
+            self.common(),
+            self.link_slots(),
+            self.dpvt(),
+            desc,
+            value,
+        ))
     }
+
+    /// [`RecordInstance::attribute`] of the record the caller is inside.
+    pub(crate) fn attribute(self, name: &str) -> Option<String> {
+        self.cold().attribute(self.record().record_type(), name)
+    }
+}
+
+/// C `dbGet`'s link arm applied to one resolved field of the record whose
+/// code is `record`: a link field reads as `dbGetString` renders it
+/// ([`render_link_field`]), everything else as itself.
+#[inline]
+fn reader_sees(
+    record: &dyn Record,
+    common: &CommonFields,
+    link_slots: &LinkSlots,
+    dpvt: &crate::server::device_support::Dpvt,
+    desc: Option<&'static FieldDesc>,
+    value: EpicsValue,
+) -> EpicsValue {
+    let EpicsValue::String(ref text) = value else {
+        return value;
+    };
+    let Some((class, desc)) = desc.and_then(|d| Some((crate::types::link_class_of(d)?, d))) else {
+        return value;
+    };
+    let text = text.as_bytes();
+    let rendered = match link_slots.parse_of(desc.name).map(|l| &**l) {
+        Some(ParsedLink::Removed(ty)) => render_removed_link(class, *ty, text),
+        // [`RecordInstance::inp_is_pn_link`].
+        _ if desc.name == "INP" && dpvt.callback().is_some() => render_pn_link(text),
+        _ if matches!(desc.name, "INP" | "OUT")
+            && super::declared_link_type(
+                record.record_type(),
+                Some(common.dtyp.as_str()),
+                desc.name,
+            ) == Some(super::DbLinkType::PnLink) =>
+        {
+            render_pn_link(text)
+        }
+        _ => render_link_field(class, text),
+    };
+    EpicsValue::String(rendered)
+}
+
+/// [`RecordInstance::declared_default`] of `name`, declared `desc`, on the
+/// record whose code is `record`.
+fn declared_default_of(record: &dyn Record, name: &str, desc: &FieldDesc) -> Option<EpicsValue> {
+    // A `runtime_typed` field (`VAL`/`BG`, re-typed from `FTVL`/`SDEF`) is
+    // record-owned by definition and its placeholder `dbf_type` is not what
+    // it serves; never synthesise one here — the record itself answers it.
+    if desc.runtime_typed {
+        return None;
+    }
+    let initial = desc.initial.unwrap_or("");
+    if let Some(choices) = desc
+        .menu
+        .or_else(|| record.menu_field_choices(name))
+        .or_else(|| super::shared_menu_choices(name))
+    {
+        // A menu field with no `initial(...)` is index 0, exactly as an
+        // empty numeric field is 0 below.
+        if initial.is_empty() {
+            return Some(EpicsValue::Enum(0));
+        }
+        return super::resolve_menu_field_string_db_load(name, choices, desc.dbf_type, initial)
+            .ok();
+    }
+    // `parse` maps an empty string to the declared type's zero, so this one
+    // call serves both `initial(...)` and no-initial fields.
+    EpicsValue::parse_bytes(desc.dbf_type, initial.as_bytes()).ok()
 }
 
 impl FieldMetaSource for OwnView<'_> {
@@ -7098,7 +7292,7 @@ impl FieldMetaSource for OwnView<'_> {
         self.meta
     }
     fn read_field(&self, field: &str) -> Option<EpicsValue> {
-        self.field(field)
+        self.own.resolve_field(field)
     }
     fn enum_string_form(&self, field: &str) -> Option<EnumStringForm> {
         let record = self.own.record();
@@ -7107,7 +7301,7 @@ impl FieldMetaSource for OwnView<'_> {
         })
     }
     fn metadata_at(&self, desc: &'static FieldDesc) -> Option<EpicsValue> {
-        self.field(desc.name)
+        self.own.resolve_field(desc.name)
     }
     fn description(&self) -> PvString {
         self.own.common().text.desc.clone()
@@ -7116,6 +7310,9 @@ impl FieldMetaSource for OwnView<'_> {
     fn q_form_index(&self) -> Option<i16> {
         None
     }
+    fn common(&self) -> &CommonFields {
+        self.own.common()
+    }
 }
 
 /// C `dbGet` of `field` (canonical) of the record `own`, from inside that
@@ -7123,24 +7320,43 @@ impl FieldMetaSource for OwnView<'_> {
 /// and what its holder lent it, which need no lock. The info tags, behind the
 /// lock set, read as absent. A link-backed field gets its C seeds: resolving
 /// its link would read through the lock set this record holds. `meta` is the
-/// record's [`RecordDesc::meta`].
+/// record's [`RecordDesc::meta`]; `string_view` is
+/// [`RecordInstance::channel_snapshot_for_field`]'s.
 pub(crate) fn own_field_snapshot(
     own: crate::server::record::OwnRecord<'_>,
     meta: &'static MetaFields,
     field: &str,
+    string_view: bool,
 ) -> Option<super::super::snapshot::Snapshot> {
     let view = OwnView { own, meta };
     let record = own.record();
-    let value = view.field(field)?;
-    let value = match declared_projection_of(declared_field_type_of(record, field), &value, || {
-        record.field_is_long_string(field)
-    }) {
-        Some(declared) => value.into_type(declared),
-        None => value,
+    let value = if string_view {
+        crate::server::database::char_view::string_view_value(&own, field)?
+    } else {
+        let value = own.resolve_field(field)?;
+        match declared_projection_of(declared_field_type_of(record, field), &value, || {
+            record.field_is_long_string(field)
+        }) {
+            Some(declared) => value.into_type(declared),
+            None => value,
+        }
     };
     let mut snap = common_snapshot(own.common(), value);
     view.finish_metadata(field, LinkBacking::none(), &mut snap);
     Some(snap)
+}
+
+/// [`RecordInstance::field_as_dbr_string`] of the record the caller is
+/// inside.
+pub(crate) fn own_field_as_dbr_string(
+    own: crate::server::record::OwnRecord<'_>,
+    meta: &'static MetaFields,
+    field: &str,
+) -> Option<PvString> {
+    let value = own.resolve_field(field)?;
+    OwnView { own, meta }
+        .source_render_of(field, &value)
+        .dbr_string(value)
 }
 
 /// [`field_desc_of`] against a type's table — C `dbFindFieldPart`: the
@@ -7265,17 +7481,6 @@ pub(crate) struct SourceRender {
 }
 
 impl SourceRender {
-    /// The render of a record seen only through its [`Record`] face: no
-    /// display precision or choice table to apply.
-    pub(crate) fn of_record(rec: &dyn Record, field: &str, value: &EpicsValue) -> Self {
-        use crate::server::record::record_trait::FieldDeclaration;
-        Self {
-            long_string: value.is_array() && rec.field_is_long_string(field),
-            precision: None,
-            label: None,
-        }
-    }
-
     /// The value as C `dbGetLink(plink, DBR_STRING, ...)` delivers it: one
     /// element, so an array source converts its element 0 (none, at NORD 0,
     /// is a failed read).
@@ -7541,7 +7746,9 @@ impl RecordInstance {
             self.name.as_bytes(),
             &self.common,
             &self.pact,
-            &self.cold.cell,
+            &self.cold,
+            &self.link_slots,
+            &self.dpvt,
         );
         (&mut *self.record, own)
     }
@@ -9656,29 +9863,14 @@ impl RecordInstance {
     /// field with, so a string read pays no second scan for it.
     #[inline]
     fn as_a_reader_sees(&self, desc: Option<&'static FieldDesc>, value: EpicsValue) -> EpicsValue {
-        let EpicsValue::String(ref text) = value else {
-            return value;
-        };
-        let Some((class, desc)) = desc.and_then(|d| Some((crate::types::link_class_of(d)?, d)))
-        else {
-            return value;
-        };
-        let text = text.as_bytes();
-        let rendered = match self.declared_record_link(desc.name).map(|l| &**l) {
-            Some(ParsedLink::Removed(ty)) => render_removed_link(class, *ty, text),
-            _ if desc.name == "INP" && self.inp_is_pn_link() => render_pn_link(text),
-            _ if matches!(desc.name, "INP" | "OUT")
-                && super::declared_link_type(
-                    self.record.record_type(),
-                    Some(self.common.dtyp.as_str()),
-                    desc.name,
-                ) == Some(super::DbLinkType::PnLink) =>
-            {
-                render_pn_link(text)
-            }
-            _ => render_link_field(class, text),
-        };
-        EpicsValue::String(rendered)
+        reader_sees(
+            &*self.record,
+            &self.common,
+            &self.link_slots,
+            &self.dpvt,
+            desc,
+            value,
+        )
     }
 
     /// C `!dbLinkIsDefined(plink)` for a link a runtime put removed or its
@@ -9765,30 +9957,7 @@ impl RecordInstance {
     /// `initial()` into the fields the record *does* store, from the same
     /// generated table, so the two paths agree by construction.
     fn declared_default(&self, name: &str) -> Option<EpicsValue> {
-        let desc = self.field_desc(name)?;
-        // A `runtime_typed` field (`VAL`/`BG`, re-typed from `FTVL`/`SDEF`) is
-        // record-owned by definition and its placeholder `dbf_type` is not what
-        // it serves; never synthesise one here — the record itself answers it.
-        if desc.runtime_typed {
-            return None;
-        }
-        let initial = desc.initial.unwrap_or("");
-        if let Some(choices) = desc
-            .menu
-            .or_else(|| self.record.menu_field_choices(name))
-            .or_else(|| super::shared_menu_choices(name))
-        {
-            // A menu field with no `initial(...)` is index 0, exactly as an
-            // empty numeric field is 0 below.
-            if initial.is_empty() {
-                return Some(EpicsValue::Enum(0));
-            }
-            return super::resolve_menu_field_string_db_load(name, choices, desc.dbf_type, initial)
-                .ok();
-        }
-        // `parse` maps an empty string to the declared type's zero, so this one
-        // call serves both `initial(...)` and no-initial fields.
-        EpicsValue::parse_bytes(desc.dbf_type, initial.as_bytes()).ok()
+        declared_default_of(&*self.record, name, self.field_desc(name)?)
     }
 
     /// Resolve a field for EPICS `$` long-string (character-array) access:
@@ -9798,9 +9967,7 @@ impl RecordInstance {
     /// one owner of the `$` rule, so a long-string record's `VAL` (a CHAR
     /// carrier here, `DBF_STRING` to C) takes the modifier like any string.
     pub fn resolve_string_view_field(&self, name: &str) -> Option<EpicsValue> {
-        let mut text = crate::server::database::char_view::char_view(self, name)?.bytes();
-        text.truncate(text.iter().position(|&c| c == 0).unwrap_or(text.len()));
-        Some(EpicsValue::String(crate::types::PvString::from_bytes(text)))
+        crate::server::database::char_view::string_view_value(self, name)
     }
 
     /// Choice table for a field served as `DBR_ENUM` from a `DBF_MENU`:
@@ -9946,92 +10113,6 @@ impl RecordInstance {
     pub(crate) fn field_as_dbr_string(&self, field: &str) -> Option<PvString> {
         let value = self.resolve_field(field)?;
         self.source_render_of(field, &value).dbr_string(value)
-    }
-
-    /// What [`SourceRender`] needs of this record to render `value`, just read
-    /// from `field`, as `DBR_STRING`: taken under the read's hold, so the
-    /// render after it never goes back for the record.
-    ///
-    /// C `dbGetLink` converts at the source, through `dbConvert.c`'s
-    /// `[field_type][DBR_STRING]` table, inside `dbGet`: a float field renders
-    /// at its own precision (`getDoubleString`), a `DBF_ENUM`/`DBF_MENU` index
-    /// as its state label (`getEnumString`/`getMenuString`), and a long-string
-    /// field is `DBF_STRING` to C's `cvt_dbaddr`, not an array. The label goes
-    /// through [`Self::enum_string_form_for`], the owner the CA/PVA encoders
-    /// use, so a link read and a `caget -t` of one field cannot disagree.
-    pub(crate) fn source_render_of(&self, field: &str, value: &EpicsValue) -> SourceRender {
-        // Only an array value reads the flag, so a scalar pays no lookup.
-        let long_string = value.is_array() && self.record.field_is_long_string(field);
-        let mut render = SourceRender {
-            long_string,
-            precision: None,
-            label: None,
-        };
-        let head = if value.is_array() && !long_string {
-            value.first_element()
-        } else {
-            None
-        };
-        match head.as_ref().unwrap_or(value) {
-            EpicsValue::Double(_) | EpicsValue::Float(_) => {
-                render.precision = Some(self.dbr_string_precision(field, value));
-            }
-            // A `DBF_ENUM` index, and a `DBF_MENU` index (stored as a short),
-            // render through the field's string source. A short field that is
-            // neither has no source and stays the plain number C converts it to.
-            &EpicsValue::Enum(idx) => render.label = self.label_of(field, idx),
-            // A menu index is an `epicsEnum16`: a negative short reads as its
-            // unsigned bits, which `cvt_menu_st` prints with `%u`.
-            &EpicsValue::Short(v) => render.label = self.label_of(field, v as u16),
-            _ => {}
-        }
-        render
-    }
-
-    /// [`Self::enum_string_form_for`]'s label for `idx`; a menu's or a `VAL`
-    /// state's is cloned from where it lives, without building the form under
-    /// the read's hold.
-    fn label_of(&self, field: &str, idx: u16) -> Option<PvString> {
-        let desc = field_desc_of(self.record.as_ref(), field);
-        if is_device(desc) {
-            // `cvt_device_st`: a type with no device menu reads ""
-            // (`dbFastLinkConv.c:1615-1618`).
-            return Some(
-                self.device_choices()
-                    .map_or_else(PvString::default, |c| EnumStringForm::device(c).render(idx)),
-            );
-        }
-        if let Some(choices) = menu_choices_with(self.record.as_ref(), field, desc) {
-            return Some(match choices.get(idx as usize) {
-                Some(choice) => PvString::from(*choice),
-                None => PvString::from(idx.to_string().as_str()),
-            });
-        }
-        if field.eq_ignore_ascii_case("VAL") {
-            return self
-                .record
-                .enum_slots()
-                .map(|slots| PvString::from(slots.label(idx)));
-        }
-        self.enum_string_form_for(field)
-            .map(|form| form.render(idx))
-    }
-
-    /// C `getDoubleString`'s precision for `field` holding `value`: seeded 6
-    /// and overwritten by the rset's `get_precision` — the answer the
-    /// DBR_STRING encoder reads off [`Snapshot::precision`].
-    ///
-    /// [`Snapshot::precision`]: crate::server::snapshot::Snapshot::precision
-    fn dbr_string_precision(&self, field: &str, value: &EpicsValue) -> u16 {
-        let meta = self.meta();
-        let support = meta.slots.narrowed_to_field(value.db_field_type(), false);
-        if !support.precision {
-            return 6;
-        }
-        self.record
-            .field_metadata_override(field)
-            .and_then(|ov| ov.precision)
-            .unwrap_or_else(|| self.metadata_limit(meta.prec) as i16) as u16
     }
 
     /// The field's declaration — its `dbFldDes`, in C's terms.
@@ -11725,14 +11806,7 @@ impl RecordInstance {
     /// `dbFindFieldPart` missed, so `motor.VERS` hides the attribute — and on
     /// a record no database owns.
     pub(crate) fn attribute(&self, name: &str) -> Option<String> {
-        let cell = self.cold.cell.upgrade()?;
-        if cell.declares_name(name) {
-            return None;
-        }
-        self.cold
-            .db
-            .upgrade()?
-            .record_type_attribute(self.record.record_type(), name)
+        self.cold.attribute(self.record.record_type(), name)
     }
 
     /// Evaluate alarms based on record type and current value.

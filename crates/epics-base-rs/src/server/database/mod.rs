@@ -3056,13 +3056,12 @@ impl PvDatabase {
         visited: &mut std::collections::HashSet<RecordName>,
         policy: ReadPolicy<'_>,
     ) -> Option<crate::server::snapshot::Snapshot> {
-        if let Some(own) = policy.own(record)
-            && !string_view
-        {
+        if let Some(own) = policy.own(record) {
             return crate::server::record::record_instance::own_field_snapshot(
                 own,
                 record.rdes().meta,
                 field,
+                string_view,
             );
         }
         // 1. Under a short read lock: is this field link-backed at all, and if

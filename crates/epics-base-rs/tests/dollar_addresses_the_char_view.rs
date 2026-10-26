@@ -8,16 +8,17 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use epics_base_rs::server::database::{FieldPut, PvDatabase};
+use epics_base_rs::server::database::{AsyncDbHandle, FieldPut, PvDatabase};
 use epics_base_rs::server::ioc_builder::IocBuilder;
-use epics_base_rs::server::record::Record;
-use epics_base_rs::server::records::ai::AiRecord;
+use epics_base_rs::server::record::OwnRecord;
 use epics_base_rs::server::records::sseq::SseqRecord;
 use epics_base_rs::types::{DbFieldType, DbfCode, EpicsValue};
 
 const DB: &str = r#"
 record(ai, "AI") { field(DESC, "hello") }
 record(ai, "H") {}
+record(ai, "P") { field(DESC, "mine") field(INP, "H.VAL CP MS") }
+record(lso, "L") { field(SIZV, "80") }
 record(sseq, "SQ") {
     field(DOL1, "AI.DESC$")
     field(DOL2, "AI.RTYP$")
@@ -79,10 +80,7 @@ async fn has_pv_takes_the_char_view() {
         ("AI.INP$", true),
         ("AI.VAL$", false),
     ] {
-        assert_eq!(h.has_pv(pv, None), found, "{pv}");
-        let own = AiRecord::default();
-        let held = Some((&b"AI"[..], &own as &dyn Record));
-        assert_eq!(h.has_pv(pv, held), found, "{pv} held");
+        assert_eq!(h.has_pv(pv), found, "{pv}");
     }
 }
 
@@ -149,4 +147,74 @@ async fn a_held_put_writes_the_char_view() {
         db.get_pv("AI.DESC").unwrap(),
         EpicsValue::String("now".into())
     );
+}
+
+type Reads = (Option<EpicsValue>, Option<EpicsValue>, Option<String>);
+
+/// `pv` read as `DBR_CHAR` and `DBR_STRING` and rendered by `get_dbr_string`.
+fn reads(h: &AsyncDbHandle, pv: &str, n: usize, own: Option<OwnRecord<'_>>) -> Reads {
+    let get = |dbr, n| h.db_get(pv, dbr, n, own).map(|s| s.value);
+    (
+        get(DbFieldType::Char, n),
+        get(DbFieldType::String, 1),
+        h.get_dbr_string(pv, own).map(|s| s.to_string()),
+    )
+}
+
+/// C's `dbGet` reads a `$` address of the record its caller is inside as it
+/// reads any other record's: no lock is taken either way.
+#[epics_macros_rs::epics_test]
+async fn the_callers_own_record_reads_its_char_view() {
+    let db = ioc().await;
+    db.put_pv("L.VAL", EpicsValue::String("a long string".into()))
+        .await
+        .unwrap();
+    let h = db.async_handle();
+    for (rec, pv, n) in [
+        ("P", "P.DESC$", 41),
+        ("P", "P.RTYP$", 40),
+        ("P", "P.INP$", 1024),
+        ("P", "P.FLNK$", 1024),
+        ("L", "L.VAL$", 80),
+        ("P", "P.VAL$", 1),
+    ] {
+        let unheld = reads(&h, pv, n, None);
+        assert_eq!(unheld.0.is_some(), pv != "P.VAL$", "{pv}: {unheld:?}");
+        let own = h.with_own(rec, |r, own| reads(&h, pv, n, Some(own.of(&*r))));
+        assert_eq!(own, Some(unheld), "{pv}");
+    }
+}
+
+/// Without `$` too, the record the caller is inside reads as any reader
+/// reads it: a dbCommon field, an attribute, and a link `dbGetString`
+/// renders (`dbAccess.c:850-856`).
+#[epics_macros_rs::epics_test]
+async fn the_callers_own_record_reads_as_any_reader() {
+    let db = ioc().await;
+    let h = db.async_handle();
+    let mut wrong = Vec::new();
+    for pv in [
+        "P.DESC", "P.RTYP", "P.SCAN", "P.VAL", "P.PREC", "P.INP", "P.FLNK", "SQ.DOL1", "SQ.LNK1",
+    ] {
+        let rec = &pv[..pv.find('.').unwrap()];
+        let unheld = reads(&h, pv, 1, None);
+        assert!(unheld.2.is_some(), "{pv}");
+        let own = h.with_own(rec, |r, own| reads(&h, pv, 1, Some(own.of(&*r))));
+        if own.as_ref() != Some(&unheld) {
+            wrong.push(format!("{pv}: own {own:?}, unheld {unheld:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// C `dbNameToAddr` finds a field of the caller's own record as it finds any
+/// other record's: by its declaration, not by what the record stores.
+#[epics_macros_rs::epics_test]
+async fn has_pv_finds_the_callers_own_fields() {
+    let db = ioc().await;
+    let h = db.async_handle();
+    for pv in ["P.DESC", "P.SCAN", "P.NAME", "P.MLOK", "P.TIME", "P.INP"] {
+        let found = h.with_own("P", |_, _| h.has_pv(pv));
+        assert_eq!(found, Some(true), "{pv}");
+    }
 }

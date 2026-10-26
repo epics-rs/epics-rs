@@ -6,7 +6,7 @@
 
 use crate::server::database::filters::FilterChain;
 use crate::server::record::{
-    FieldDeclaration, FieldDesc, RecordInstance, Special, served_element_size,
+    FieldDeclaration, FieldDesc, OwnRecord, Record, RecordInstance, Special, served_element_size,
 };
 use crate::types::{DbFieldType, DbfCode, EpicsValue};
 
@@ -42,6 +42,40 @@ pub(crate) fn field_addr_types(fd: &FieldDesc, value: Option<&EpicsValue>) -> (D
     (field_type, field_type.dbr_code())
 }
 
+/// The record a `$` view reads: an instance under its lock set, or the record
+/// the caller is inside, which C's `dbGet` reads the same way.
+pub(crate) trait ViewedRecord {
+    fn record(&self) -> &dyn Record;
+    /// [`RecordInstance::attribute`].
+    fn attribute(&self, field: &str) -> Option<String>;
+    /// [`RecordInstance::resolve_field`].
+    fn resolve_field(&self, field: &str) -> Option<EpicsValue>;
+}
+
+impl ViewedRecord for RecordInstance {
+    fn record(&self) -> &dyn Record {
+        &*self.record
+    }
+    fn attribute(&self, field: &str) -> Option<String> {
+        RecordInstance::attribute(self, field)
+    }
+    fn resolve_field(&self, field: &str) -> Option<EpicsValue> {
+        RecordInstance::resolve_field(self, field)
+    }
+}
+
+impl ViewedRecord for OwnRecord<'_> {
+    fn record(&self) -> &dyn Record {
+        OwnRecord::record(*self)
+    }
+    fn attribute(&self, field: &str) -> Option<String> {
+        OwnRecord::attribute(*self, field)
+    }
+    fn resolve_field(&self, field: &str) -> Option<EpicsValue> {
+        OwnRecord::resolve_field(*self, field)
+    }
+}
+
 /// Which of `dbGet`'s routes reads `inst.field` (`dbAccess.c:944-952`), or
 /// `None` where the record has no such field.
 pub fn read_route(inst: &RecordInstance, field: &str) -> Option<CharSource> {
@@ -49,7 +83,11 @@ pub fn read_route(inst: &RecordInstance, field: &str) -> Option<CharSource> {
 }
 
 /// [`read_route`] with `desc` = [`RecordInstance::field_desc`]`(field)`.
-fn route_at(inst: &RecordInstance, field: &str, desc: Option<&FieldDesc>) -> Option<CharSource> {
+fn route_at<R: ViewedRecord + ?Sized>(
+    inst: &R,
+    field: &str,
+    desc: Option<&FieldDesc>,
+) -> Option<CharSource> {
     match desc {
         Some(desc) if crate::types::link_class_of(desc).is_some() => Some(CharSource::Link),
         Some(_) => Some(CharSource::Field),
@@ -93,7 +131,12 @@ pub(crate) fn c_field_size(code: DbfCode, declared_size: u16) -> Option<u16> {
 /// record's lock pays one field read; the character image is built from it
 /// after the lock is gone.
 pub fn char_view(inst: &RecordInstance, field: &str) -> Option<CharView> {
-    let desc = inst.field_desc(field);
+    char_view_of(inst, field)
+}
+
+/// [`char_view`] of either record a `dbGet` reads ([`ViewedRecord`]).
+pub(crate) fn char_view_of<R: ViewedRecord + ?Sized>(inst: &R, field: &str) -> Option<CharView> {
+    let desc = crate::server::record::record_instance::field_desc_of(inst.record(), field);
     let desc = match route_at(inst, field, desc)? {
         CharSource::Attribute => {
             return Some(CharView {
@@ -130,10 +173,10 @@ pub fn char_view(inst: &RecordInstance, field: &str) -> Option<CharView> {
         // (aSub `NOB`) in a `field_size` buffer; a plain string field's count
         // is its own width.
         EpicsValue::String(_) => {
-            let width = usize::from(served_element_size(&*inst.record, desc, DbfCode::String));
+            let width = usize::from(served_element_size(inst.record(), desc, DbfCode::String));
             match desc.declared_special {
                 Special::DbAddr => (
-                    inst.record.dbaddr_count(desc.name).unwrap_or(1) as usize,
+                    inst.record().dbaddr_count(desc.name).unwrap_or(1) as usize,
                     width,
                 ),
                 _ => (width, width),
@@ -153,6 +196,17 @@ pub fn char_view(inst: &RecordInstance, field: &str) -> Option<CharView> {
         field_type: DbfCode::Char,
         truncate: desc.declared_dbf == DbfCode::String,
     })
+}
+
+/// The text of `inst.field`'s `$` view up to its NUL, as a string:
+/// [`RecordInstance::resolve_string_view_field`].
+pub(crate) fn string_view_value<R: ViewedRecord + ?Sized>(
+    inst: &R,
+    field: &str,
+) -> Option<EpicsValue> {
+    let mut text = char_view_of(inst, field)?.bytes();
+    text.truncate(text.iter().position(|&c| c == 0).unwrap_or(text.len()));
+    Some(EpicsValue::String(crate::types::PvString::from_bytes(text)))
 }
 
 /// The address [`char_view`] reads through, as `dbChannelCreate` makes it
@@ -266,7 +320,7 @@ pub(crate) const PVLINK_STRINGSZ: usize = 1024;
 /// lsi/lso/printf `LEN`, which their `get_array_info` reports as VAL's
 /// element count (`lsiRecord.c:154`, `lsoRecord.c:196`, `printfRecord.c:432`):
 /// 0 until VAL is first written, `strlen + 1` after.
-pub(crate) fn long_string_len(inst: &crate::server::record::RecordInstance) -> usize {
+pub(crate) fn long_string_len<R: ViewedRecord + ?Sized>(inst: &R) -> usize {
     match inst.resolve_field("LEN") {
         Some(EpicsValue::ULong(n)) => n as usize,
         _ => 0,
@@ -274,7 +328,7 @@ pub(crate) fn long_string_len(inst: &crate::server::record::RecordInstance) -> u
 }
 
 /// lsi/lso/printf `SIZV`, the buffer their `cvt_dbaddr` serves VAL in.
-pub(crate) fn long_string_sizv(inst: &crate::server::record::RecordInstance) -> usize {
+pub(crate) fn long_string_sizv<R: ViewedRecord + ?Sized>(inst: &R) -> usize {
     match inst.resolve_field("SIZV") {
         Some(EpicsValue::UShort(n)) => usize::from(n),
         Some(v) => v.to_f64().map_or(0, |n| n as usize),

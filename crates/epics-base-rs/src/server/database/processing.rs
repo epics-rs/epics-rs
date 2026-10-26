@@ -127,7 +127,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error::{CaError, CaResult, DbResult, DbStatus};
 use crate::server::record::record_instance::{
-    ForwardTarget, FwdLink, FwdLinkRest, LinkScanMove, ScanAdd, ScanMove,
+    FieldMetaSource, ForwardTarget, FwdLink, FwdLinkRest, LinkScanMove, ScanAdd, ScanMove,
 };
 use crate::server::record::{
     CycleHooks, CycleLink, InputFetchPolicy, NotifyWaitSet, OwnFrame, OwnRecord, PactExit,
@@ -1073,31 +1073,10 @@ impl AsyncDbHandle {
     }
 
     /// C `dbNameToAddr(name)` succeeding: `name` is a field this database
-    /// serves. `held` is the record the caller holds, as a device's own
-    /// record during its `init` or `process`, which is asked directly; any
-    /// other is resolved without its lock, as [`Self::name_to_addr`].
-    pub fn has_pv(
-        &self,
-        name: impl AsRef<[u8]>,
-        held: Option<(&[u8], &dyn crate::server::record::Record)>,
-    ) -> bool {
-        let name = name.as_ref();
-        let parts = super::DbNameParts::of(name);
-        let field = parts.field_or_val();
-        match held {
-            Some((own, rec)) if own == parts.record => {
-                let cell = || self.db().and_then(|db| Some((db.get_record(own)?, db)));
-                if parts.char_view() {
-                    return cell().is_some_and(|(cell, db)| {
-                        db.char_addressed(&cell, field, Some(rec)).is_some()
-                    });
-                }
-                rec.get_field(field).is_some()
-                    || cell()
-                        .is_some_and(|(cell, db)| db.attribute_field_type(&cell, field).is_some())
-            }
-            _ => self.name_to_addr(name).is_some(),
-        }
+    /// serves. [`Self::name_to_addr`] takes no lock, so a device asks this of
+    /// its own record during its `init` or `process` as of any other.
+    pub fn has_pv(&self, name: impl AsRef<[u8]>) -> bool {
+        self.name_to_addr(name).is_some()
     }
 
     /// C `dbGet(&addr, DBR_STRING, buf, 0, 0, 0)`: one element as the
@@ -13788,7 +13767,11 @@ fn dbr_string_at(
         };
     }
     if let Some(own) = policy.own(cell) {
-        return own_dbr_string(own.record(), field);
+        return crate::server::record::record_instance::own_field_as_dbr_string(
+            own,
+            cell.rdes().meta,
+            field,
+        );
     }
     let addr = crate::server::record::record_instance::FieldAddr::resolve_in(cell, field);
     policy
@@ -13799,30 +13782,21 @@ fn dbr_string_at(
         .flatten()
 }
 
-/// `dbGet` of `get` through `field`'s `$` address. The record the caller is
-/// inside is lent as its `Record` alone, of which no `$` view is made: that
-/// read fails.
+/// `dbGet` of `get` through `field`'s `$` address.
 fn char_get_at(
     cell: &RecordCell,
     field: &str,
     get: CharGet,
     policy: ReadPolicy<'_>,
 ) -> Option<EpicsValue> {
-    if policy.own(cell).is_some() {
-        return None;
+    if let Some(own) = policy.own(cell) {
+        return super::char_view::char_view_of(&own, field)?.get(get.dbr, get.count);
     }
     policy
         .read(cell, |inst| {
             super::char_view::char_view(inst, field)?.get(get.dbr, get.count)
         })
         .flatten()
-}
-
-/// [`dbr_string_at`] of the record the caller is inside, through its view.
-fn own_dbr_string(rec: &dyn crate::server::record::Record, field: &str) -> Option<PvString> {
-    let value = rec.get_field(field)?;
-    crate::server::record::record_instance::SourceRender::of_record(rec, field, &value)
-        .dbr_string(value)
 }
 
 /// A [`PvDatabase::db_get_owed`] read owed to the set of a record held

@@ -12,8 +12,6 @@ use std::time::Duration;
 
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
-use epics_base_rs::server::record::Record;
-use epics_base_rs::server::records::ai::AiRecord;
 use epics_base_rs::server::records::sseq::SseqRecord;
 use epics_base_rs::types::{DbFieldType, DbfCode, EpicsValue};
 
@@ -74,11 +72,8 @@ async fn name_to_addr_resolves_an_attribute() {
         (addr.field.as_str(), addr.field_type, addr.no_elements),
         ("RTYP", DbfCode::String, 1)
     );
-    assert!(h.has_pv("AI.RTYP", None));
-    let own = AiRecord::default();
-    let held = Some((&b"AI"[..], &own as &dyn Record));
-    assert!(h.has_pv("AI.RTYP", held));
-    assert!(!h.has_pv("AI.NOPE", held));
+    assert!(h.has_pv("AI.RTYP"));
+    assert!(!h.has_pv("AI.NOPE"));
 }
 
 /// `dbGet` of an attribute is `getAttrValue`'s text (`dbAccess.c:950-953`).

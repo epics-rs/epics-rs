@@ -2662,15 +2662,18 @@ impl<'a> Pact<'a> {
 }
 
 /// What a holder lends the code of the record it holds: the record's name,
-/// its dbCommon and its PACT, all of which C's code reaches through `prec`.
-/// Only a holder makes one, so a view of the record ([`OwnRecord`]) without
-/// them cannot be made.
+/// its dbCommon and its PACT, all of which C's code reaches through `prec`,
+/// and the rest of the instance a `dbGet` of the record reads. Only a holder
+/// makes one, so a view of the record ([`OwnRecord`]) without them cannot be
+/// made.
 #[derive(Clone, Copy)]
 pub struct OwnFrame<'a> {
     name: &'a [u8],
     common: &'a CommonFields,
     pact: &'a std::sync::atomic::AtomicBool,
-    cell: &'a std::sync::Weak<super::record_instance::RecordCell>,
+    cold: &'a super::record_instance::RecordCold,
+    link_slots: &'a super::record_instance::LinkSlots,
+    dpvt: &'a crate::server::device_support::Dpvt,
 }
 
 impl<'a> OwnFrame<'a> {
@@ -2678,13 +2681,17 @@ impl<'a> OwnFrame<'a> {
         name: &'a [u8],
         common: &'a CommonFields,
         pact: &'a std::sync::atomic::AtomicBool,
-        cell: &'a std::sync::Weak<super::record_instance::RecordCell>,
+        cold: &'a super::record_instance::RecordCold,
+        link_slots: &'a super::record_instance::LinkSlots,
+        dpvt: &'a crate::server::device_support::Dpvt,
     ) -> Self {
         Self {
             name,
             common,
             pact,
-            cell,
+            cold,
+            link_slots,
+            dpvt,
         }
     }
 
@@ -2726,7 +2733,19 @@ impl<'a> OwnRecord<'a> {
 
     /// The PACT field, as the record's instance reads it.
     pub(crate) fn pact(self) -> bool {
-        super::record_instance::pact_field(self.frame.pact, self.frame.cell)
+        super::record_instance::pact_field(self.frame.pact, self.frame.cold.cell())
+    }
+
+    pub(crate) fn cold(self) -> &'a super::record_instance::RecordCold {
+        self.frame.cold
+    }
+
+    pub(crate) fn link_slots(self) -> &'a super::record_instance::LinkSlots {
+        self.frame.link_slots
+    }
+
+    pub(crate) fn dpvt(self) -> &'a crate::server::device_support::Dpvt {
+        self.frame.dpvt
     }
 }
 

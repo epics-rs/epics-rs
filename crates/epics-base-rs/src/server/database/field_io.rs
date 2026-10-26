@@ -1,7 +1,7 @@
 use crate::error::{CaError, CaResult};
 use crate::server::event_queue::PostBurst;
 use crate::server::recgbl::PutReport;
-use crate::server::record::record_instance::{LinkScanMove, ScanMove};
+use crate::server::record::record_instance::{FieldMetaSource, LinkScanMove, ScanMove};
 use crate::server::record::{
     AfterGate, PreparedCommonLink, PreparedLink, PutRefused, RecordCell, RecordInstance,
 };

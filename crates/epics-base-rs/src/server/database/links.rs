@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::error::{DbResult, DbStatus};
+use crate::server::record::record_instance::FieldMetaSource;
 use crate::server::record::{
     AlarmSeverity, NotifyWaitSet, OutTarget, RecordCell, RecordInstance, ScanType,
 };

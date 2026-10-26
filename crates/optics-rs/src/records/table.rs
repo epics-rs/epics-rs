@@ -2415,12 +2415,11 @@ impl TableRecord {
     /// of `check_links` the framework cannot resolve links for: `init_record`.
     ///
     /// C runs its `init_record` `checkLinks` (tableRecord.c:383) at `iocInit`,
-    /// with `dbInitLink` done and no CA channel connected yet. The port runs
-    /// `init_record` at record CREATION instead, so only records already
-    /// loaded are addressable here; a motor loaded after the table classifies
-    /// `CaDisconnected` until the first `process()` resolves it properly,
-    /// which every arm of C's test treats as `Constant`. A JSON link is
-    /// neither `CONSTANT` nor `CA_LINK`, so C counts it usable.
+    /// with `dbInitLink` done and no CA channel connected yet. A `.db` record's
+    /// `init_record` also waits for `iocInit`, past `db_init_record_links`
+    /// (`drain_deferred_record_inits`), so a motor loaded after the table is a
+    /// DB link here as in C. A JSON link is neither `CONSTANT` nor `CA_LINK`,
+    /// so C counts it usable.
     fn seed_link_kinds(&mut self) {
         let Some((_, handle)) = &self.async_ctx else {
             return;

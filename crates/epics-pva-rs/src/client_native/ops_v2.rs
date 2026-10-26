@@ -4485,11 +4485,9 @@ fn value_target_desc(intro: &FieldDesc) -> &FieldDesc {
 /// op after INIT (see [`op_put_inner_build`]).
 fn build_put_value_from_tokens(intro: &FieldDesc, tokens: &[String]) -> PvaResult<PvField> {
     match value_target_desc(intro) {
-        FieldDesc::ScalarArray(_) => {
-            // `build_put_value`'s scalar-array arm splits on commas, so
-            // lower the chosen element set to a comma-separated string.
+        FieldDesc::ScalarArray(st) => {
             // The first character, untrimmed, as pvput.cpp:144 tests it.
-            let csv = if tokens.len() == 1 && tokens[0].starts_with('[') {
+            if tokens.len() == 1 && tokens[0].starts_with('[') {
                 // JSON-array shortcut: `value=[...]`. Strip the outer
                 // brackets; the inner is already comma-separated scalars.
                 let t = tokens[0].trim();
@@ -4497,17 +4495,21 @@ fn build_put_value_from_tokens(intro: &FieldDesc, tokens: &[String]) -> PvaResul
                     .strip_prefix('[')
                     .and_then(|s| s.strip_suffix(']'))
                     .unwrap_or(t);
-                inner.to_string()
-            } else {
-                // Legacy positional: first token is the length, ignored.
-                tokens
-                    .iter()
-                    .skip(1)
-                    .map(String::as_str)
-                    .collect::<Vec<_>>()
-                    .join(",")
-            };
-            build_put_value(intro, &csv)
+                return build_put_value(intro, inner);
+            }
+            // Legacy positional: the first token is the length, ignored, and
+            // each one after it is an element, whole, as pvput.cpp:172-176
+            // hands `bare` to putFrom: `a,b` is one string and ` a` keeps
+            // its space.
+            let items = tokens
+                .iter()
+                .skip(1)
+                .map(|tok| match st {
+                    ScalarType::String => Ok(ScalarValue::String(tok.as_str().into())),
+                    _ => ScalarValue::parse(*st, tok.trim()).map_err(PvaError::InvalidValue),
+                })
+                .collect::<PvaResult<Vec<_>>>()?;
+            Ok(with_value(intro, PvField::ScalarArray(items)))
         }
         FieldDesc::Scalar(_) => {
             if tokens.len() != 1 {
@@ -4519,6 +4521,25 @@ fn build_put_value_from_tokens(intro: &FieldDesc, tokens: &[String]) -> PvaResul
         }
         _ => build_put_value(intro, &tokens.join(" ")),
     }
+}
+
+/// `value` as the prototype's `.value`, every other member at its default,
+/// as [`build_put_value`] places one it parsed; a bare-leaf prototype is
+/// `value` itself.
+fn with_value(intro: &FieldDesc, value: PvField) -> PvField {
+    let FieldDesc::Structure { fields, struct_id } = intro else {
+        return value;
+    };
+    let mut value = Some(value);
+    let mut s = PvStructure::new(struct_id);
+    for (name, child) in fields {
+        let field = if name == "value" { value.take() } else { None };
+        s.fields.push((
+            name.clone(),
+            field.unwrap_or_else(|| default_value_for(child)),
+        ));
+    }
+    PvField::Structure(s)
 }
 
 /// The changed-bitset for a bare `.value` write: the `value` field's
@@ -5634,6 +5655,51 @@ mod tests {
         fn scalar_array_single_length_token_is_empty() {
             let v = build_put_value_from_tokens(&nt_scalar_array(), &t(&["5"])).unwrap();
             assert!(value_array(&v).is_empty());
+        }
+
+        fn nt_string_array() -> FieldDesc {
+            FieldDesc::Structure {
+                struct_id: "epics:nt/NTScalarArray:1.0".to_string(),
+                fields: vec![(
+                    "value".to_string(),
+                    FieldDesc::ScalarArray(ScalarType::String),
+                )]
+                .into(),
+            }
+        }
+        fn string_array(v: &PvField) -> Vec<String> {
+            let PvField::Structure(s) = v else {
+                panic!("expected Structure, got {v:?}");
+            };
+            match &s.fields.iter().find(|(n, _)| n == "value").unwrap().1 {
+                PvField::ScalarArray(items) => items.iter().map(|sv| sv.to_string()).collect(),
+                other => panic!("expected ScalarArray .value, got {other:?}"),
+            }
+        }
+
+        /// pvput.cpp:172-176 hands each token to putFrom whole: `pvput SWF
+        /// 2 a,b c` writes `["a,b", "c"]`, and spaces and an empty token
+        /// are elements as given.
+        #[test]
+        fn each_token_is_one_whole_string_element() {
+            let v =
+                build_put_value_from_tokens(&nt_string_array(), &t(&["2", "a,b", "c"])).unwrap();
+            assert_eq!(string_array(&v), ["a,b", "c"]);
+            let v = build_put_value_from_tokens(&nt_string_array(), &t(&["3", " a", "b ", ""]))
+                .unwrap();
+            assert_eq!(string_array(&v), [" a", "b ", ""]);
+        }
+
+        /// A numeric element is one token too: `1,2` and an empty token do
+        /// not parse, as C's `epicsParseDouble` refuses them; spaces around
+        /// a number are skipped as it skips them.
+        #[test]
+        fn a_numeric_token_is_one_element() {
+            build_put_value_from_tokens(&nt_scalar_array(), &t(&["2", "1,2", "3"])).unwrap_err();
+            build_put_value_from_tokens(&nt_scalar_array(), &t(&["1", ""])).unwrap_err();
+            let v =
+                build_put_value_from_tokens(&nt_scalar_array(), &t(&["2", " 1", "2 "])).unwrap();
+            assert_eq!(value_array(&v), vec![1.0, 2.0]);
         }
 
         /// A scalar `.value` takes exactly one token; more than one is

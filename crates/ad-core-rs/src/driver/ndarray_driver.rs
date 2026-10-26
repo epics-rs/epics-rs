@@ -965,10 +965,15 @@ impl DriverAttributes {
     }
 
     /// The store half of [`Self::update`]: every `PARAM` attribute's read,
-    /// taken now. A read `pending` covers is not taken, since C would read
-    /// the value it has just set (see [`Self::update_with`]).
-    pub fn param_reads(&self, port_base: &PortDriverBase, pending: &[PendingParam]) -> ParamReads {
-        let mut reads = Vec::new();
+    /// taken now, into `reads`. A read `pending` covers is not taken, since
+    /// C would read the value it has just set (see [`Self::update_with`]).
+    pub fn param_reads(
+        &self,
+        port_base: &PortDriverBase,
+        pending: &[PendingParam],
+        reads: &mut ParamReads,
+    ) {
+        let mut taken = 0;
         for attr in self.list.iter() {
             let Some(src) = attr.param_source() else {
                 continue;
@@ -981,33 +986,44 @@ impl DriverAttributes {
                 .get_value(index, src.addr)
                 .ok()
                 .map(std::mem::discriminant);
-            let read = ParamRead {
-                name: src.param_name.clone(),
-                addr: src.addr,
-                param_type: src.param_type,
-                index,
-                stored,
-                value: None,
-            };
-            let value = match read.pending(pending) {
+            let value = match latest_pending(pending, index, src.addr, stored) {
                 Some(_) => None,
                 None => Self::read_param_value(port_base, src),
             };
-            reads.push(ParamRead { value, ..read });
+            match reads.0.get_mut(taken) {
+                Some(read) => {
+                    read.name.clone_from(&src.param_name);
+                    read.addr = src.addr;
+                    read.param_type = src.param_type;
+                    read.index = index;
+                    read.stored = stored;
+                    read.value = value;
+                }
+                None => reads.0.push(ParamRead {
+                    name: src.param_name.clone(),
+                    addr: src.addr,
+                    param_type: src.param_type,
+                    index,
+                    stored,
+                    value,
+                }),
+            }
+            taken += 1;
         }
-        ParamReads(reads)
+        reads.0.truncate(taken);
     }
 
     /// Re-evaluate the set from `reads`, with `pending` — values set ahead
     /// of the call and not yet flushed — read in place of the store, as C's
     /// `getXxxParam` reads its own earlier `setXxxParam`. A pending value of
     /// another type than the stored one is one C's set refused, so the store
-    /// is read. Nothing is written to the store.
+    /// is read. Nothing is written to the store. The set lands in `list`.
     pub fn update_with(
         &mut self,
         reads: &ParamReads,
         pending: &[PendingParam],
-    ) -> crate::attributes::NDAttributeList {
+        list: &mut crate::attributes::NDAttributeList,
+    ) {
         for attr in self.list.iter() {
             let Some(src) = attr.param_source() else {
                 continue;
@@ -1026,7 +1042,7 @@ impl DriverAttributes {
             }
         }
         self.list.update_values();
-        self.list.clone()
+        list.clone_from(&self.list);
     }
 
     /// Read a `Param` attribute's current value from the asyn parameter
@@ -1595,29 +1611,20 @@ impl ArrayOwner {
         .is_ok()
     }
 
-    /// The store half of [`Self::get_attributes_blocking`], for a
-    /// caller that evaluates later against what has been set by then. `None`
-    /// when the set is empty or the port has stopped.
-    pub fn param_reads_blocking(
-        &self,
-        pending: impl FnOnce() -> Vec<PendingParam>,
-    ) -> Option<ParamReads> {
-        if self.attributes.lock().list.is_empty() {
-            return None;
-        }
-        let port = self.port()?;
-        let pending = pending();
-        let attributes = self.attributes.clone();
-        let taken = Arc::new(parking_lot::Mutex::new(None));
-        let slot = taken.clone();
-        let call = asyn_rs::request::DriverCall::new(move |driver| {
-            *slot.lock() = Some(attributes.lock().param_reads(driver.base(), &pending));
-        });
-        let _ = port.submit_blocking(
-            asyn_rs::request::RequestOp::WithDriver(call),
-            asyn_rs::user::AsynUser::default(),
-        );
-        taken.lock().take()
+    /// The store half of [`Self::get_attributes_blocking`] into `reads`, for
+    /// a caller that evaluates later against what has been set by then;
+    /// whether they were taken, which a stopped port does not. Blocks the
+    /// caller, which must not be the port's actor.
+    pub fn param_reads_blocking(&self, pending: &[PendingParam], reads: &mut ParamReads) -> bool {
+        let Some(port) = self.port() else {
+            return false;
+        };
+        port.lent_driver_blocking(|driver| {
+            self.attributes
+                .lock()
+                .param_reads(driver.base(), pending, reads);
+        })
+        .is_ok()
     }
 }
 

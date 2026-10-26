@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use parking_lot::{Mutex, MutexGuard};
 
+use crate::attributes::NDAttributeList;
 use crate::error::{ADError, ADResult};
 use crate::ndarray::{NDArray, NDDataType, NDDimension};
 use crate::ndarray_pool::DriverPool;
@@ -703,14 +704,13 @@ impl<W: NDFileWriter, P: PortLock<FilePluginController<W>>> FileIo for PortIo<'_
         let c = self.0.controller();
         let writer = Arc::clone(&c.writer);
         c.record(&c.file_sets());
-        let attributes = c
-            .view
-            .as_ref()
-            .map(AttributeView::evaluate)
-            .unwrap_or_default();
+        let view = c.view.clone();
         self.0.unlocked(|| {
             let mut writer = writer.lock();
-            writer.set_plugin_attributes(attributes);
+            match &view {
+                Some(view) => view.with_evaluated(|list| writer.set_plugin_attributes(list)),
+                None => writer.set_plugin_attributes(&NDAttributeList::new()),
+            }
             f(&mut *writer)
         })
     }

@@ -169,12 +169,21 @@ impl Delivery {
         self.array_callbacks.get()
     }
 
-    /// [`Self::end_process`] for one frame NDPluginFile wrote, copied, and
-    /// delivered before this returns (NDPluginFile.cpp:252, :301, :349). A
+    /// [`Self::end_process`] for one frame NDPluginFile wrote, copied with
+    /// `attributes`, for [`Self::deliver`] (NDPluginFile.cpp:252, :301,
+    /// :349).
+    pub(super) fn hand_on(
+        &self,
+        array: &Arc<NDArray>,
+        attributes: Option<&NDAttributeList>,
+    ) -> Frame<PublishedArray> {
+        self.end_process(smallvec![Arc::clone(array)], attributes, CopyArray::Always)
+    }
+
+    /// Deliver what [`Self::hand_on`] made ready before this returns. A
     /// blocking downstream runs it on this thread's behalf meanwhile, as C's
     /// `doCallbacksGenericPointer` runs it inline (NDPluginDriver.cpp:419).
-    pub(super) fn hand_on(&self, array: &Arc<NDArray>, attributes: Option<&NDAttributeList>) {
-        let ready = self.end_process(smallvec![Arc::clone(array)], attributes, CopyArray::Always);
+    pub(super) fn deliver(&self, ready: Frame<PublishedArray>) {
         if ready.is_empty() || !self.delivers() {
             return;
         }

@@ -505,8 +505,8 @@ impl NDFileWriter for NetcdfWriter {
         ))
     }
 
-    fn set_plugin_attributes(&mut self, attributes: NDAttributeList) {
-        self.plugin_attributes = attributes;
+    fn set_plugin_attributes(&mut self, attributes: &NDAttributeList) {
+        self.plugin_attributes.clone_from(attributes);
     }
 
     fn supports_multiple_arrays(&self) -> bool {

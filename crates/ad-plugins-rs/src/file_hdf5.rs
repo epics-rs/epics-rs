@@ -4528,8 +4528,8 @@ impl NDFileWriter for Hdf5Writer {
         self.num_capture = n;
     }
 
-    fn set_plugin_attributes(&mut self, attributes: NDAttributeList) {
-        self.plugin_attributes = attributes;
+    fn set_plugin_attributes(&mut self, attributes: &NDAttributeList) {
+        self.plugin_attributes.clone_from(attributes);
     }
 
     fn write_file(&mut self, array: &Arc<NDArray>) -> ADResult<()> {

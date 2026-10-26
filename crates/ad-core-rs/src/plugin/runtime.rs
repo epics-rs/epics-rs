@@ -262,9 +262,20 @@ impl ParamUpdate {
 /// The plugin's `NDAttributesFile` set, for a processor that calls C's
 /// `getAttributes` itself (e.g. NDPluginTimeSeries.cpp:364).
 #[derive(Clone)]
-pub struct PluginAttributes(Arc<crate::driver::ndarray_driver::ArrayOwner>);
+pub struct PluginAttributes {
+    owner: Arc<crate::driver::ndarray_driver::ArrayOwner>,
+    /// The buffers of the last view to drop, for the next one.
+    spare: Arc<parking_lot::Mutex<Option<ViewCell>>>,
+}
 
 impl PluginAttributes {
+    fn new(owner: Arc<crate::driver::ndarray_driver::ArrayOwner>) -> Self {
+        Self {
+            owner,
+            spare: Arc::default(),
+        }
+    }
+
     /// C `getAttributes(pList)`: merge the set, evaluated now, onto `list`.
     /// `pending` are the updates the processor will return for this frame,
     /// which C has already set when it makes the call.
@@ -300,16 +311,20 @@ impl PluginAttributes {
         begin: Option<&[PendingParam]>,
         pending: &[ParamUpdate],
     ) -> bool {
-        !self.0.attributes().lock().list.is_empty()
+        !self.is_empty()
             && with_sets(begin, pending, |sets| {
-                self.0.get_attributes_blocking(list, sets)
+                self.owner.get_attributes_blocking(list, sets)
             })
+    }
+
+    fn is_empty(&self) -> bool {
+        self.owner.attributes().lock().list.is_empty()
     }
 
     /// [`Self::evaluate`] from inside a write, on the port's actor, where
     /// `base` is the plugin's own.
     pub fn evaluate_on(&self, base: &PortDriverBase) -> Option<NDAttributeList> {
-        let mut attributes = self.0.attributes().lock();
+        let mut attributes = self.owner.attributes().lock();
         (!attributes.list.is_empty()).then(|| attributes.update(base))
     }
 
@@ -317,18 +332,43 @@ impl PluginAttributes {
     /// `getAttributes` comes after sets it cannot make here (a file plugin's
     /// `openFile`). `None` when the set is empty.
     fn view(&self) -> Option<AttributeView> {
-        let reads = self.0.param_reads_blocking(begin_now)?;
-        Some(AttributeView::new(Arc::clone(&self.0), reads, begin_now()))
+        if self.is_empty() {
+            return None;
+        }
+        let view = self.fresh_view();
+        let taken = {
+            let mut state = view.state.lock();
+            let ViewState { reads, made, .. } = &mut *state;
+            with_begin(|begin| made.extend_from_slice(begin));
+            self.owner.param_reads_blocking(made, reads)
+        };
+        taken.then_some(view)
     }
 
     /// [`Self::view`] from inside a write, on the port's actor.
     fn view_on(&self, base: &PortDriverBase) -> Option<AttributeView> {
-        let attributes = self.0.attributes().lock();
-        (!attributes.list.is_empty()).then(|| {
-            let reads = attributes.param_reads(base, &[]);
-            let begin = begin_now();
-            AttributeView::new(Arc::clone(&self.0), reads, begin)
-        })
+        if self.is_empty() {
+            return None;
+        }
+        let view = self.fresh_view();
+        {
+            let mut state = view.state.lock();
+            let ViewState { reads, made, .. } = &mut *state;
+            with_begin(|begin| made.extend_from_slice(begin));
+            self.owner.attributes().lock().param_reads(base, &[], reads);
+        }
+        Some(view)
+    }
+
+    /// A view with nothing made yet, in the spare buffers when there are.
+    fn fresh_view(&self) -> AttributeView {
+        let state = self.spare.lock().take().unwrap_or_default();
+        state.lock().made.clear();
+        AttributeView {
+            owner: Arc::clone(&self.owner),
+            state,
+            spare: Arc::clone(&self.spare),
+        }
     }
 }
 
@@ -340,36 +380,48 @@ impl PluginAttributes {
 #[derive(Clone)]
 pub struct AttributeView {
     owner: Arc<crate::driver::ndarray_driver::ArrayOwner>,
-    reads: Arc<crate::driver::ndarray_driver::ParamReads>,
+    state: ViewCell,
+    /// Where the last clone to drop gives `state` back.
+    spare: Arc<parking_lot::Mutex<Option<ViewCell>>>,
+}
+
+type ViewCell = Arc<parking_lot::Mutex<ViewState>>;
+
+/// An [`AttributeView`]'s buffers, which the plugin's next view reuses.
+#[derive(Default)]
+struct ViewState {
+    reads: crate::driver::ndarray_driver::ParamReads,
     /// The frame's `beginProcessCallbacks` sets, then each set as made.
-    made: Arc<parking_lot::Mutex<Vec<PendingParam>>>,
+    made: Vec<PendingParam>,
+    /// The set as last evaluated.
+    list: NDAttributeList,
 }
 
 impl AttributeView {
-    fn new(
-        owner: Arc<crate::driver::ndarray_driver::ArrayOwner>,
-        reads: crate::driver::ndarray_driver::ParamReads,
-        begin: Vec<PendingParam>,
-    ) -> Self {
-        Self {
-            owner,
-            reads: Arc::new(reads),
-            made: Arc::new(parking_lot::Mutex::new(begin)),
-        }
-    }
-
     /// C `setXxxParam`: `sets` are read from now on, whenever they post.
     pub fn record(&self, sets: impl IntoIterator<Item = PendingParam>) {
-        self.made.lock().extend(sets);
+        self.state.lock().made.extend(sets);
     }
 
-    /// The set as C `getAttributes` reads the parameter library now.
-    pub fn evaluate(&self) -> NDAttributeList {
-        let made = self.made.lock().clone();
+    /// `f` given the set as C `getAttributes` reads the parameter library
+    /// now.
+    pub fn with_evaluated<R>(&self, f: impl FnOnce(&NDAttributeList) -> R) -> R {
+        let mut state = self.state.lock();
+        let ViewState { reads, made, list } = &mut *state;
         self.owner
             .attributes()
             .lock()
-            .update_with(&self.reads, &made)
+            .update_with(reads, made, list);
+        f(list)
+    }
+}
+
+impl Drop for AttributeView {
+    fn drop(&mut self) {
+        // Only the last clone holds `state` alone.
+        if Arc::get_mut(&mut self.state).is_some() {
+            *self.spare.lock() = Some(Arc::clone(&self.state));
+        }
     }
 }
 
@@ -506,11 +558,6 @@ thread_local! {
     };
     /// Where [`PortPost`] hands a frame on while `process_array` runs.
     static HAND_ON: std::cell::RefCell<Option<HandOn>> = const { std::cell::RefCell::new(None) };
-}
-
-/// The running frame's `beginProcessCallbacks` sets, none outside one.
-fn begin_now() -> Vec<PendingParam> {
-    with_begin(<[PendingParam]>::to_vec)
 }
 
 /// `f` given the running frame's `beginProcessCallbacks` sets where
@@ -985,19 +1032,14 @@ impl HandOn {
         self.delivery.throttled(array)
     }
 
-    /// Deliver `array` with what `attributes` reads when NDArrayCallbacks
-    /// is on (NDPluginDriver.cpp:289); returns the counters C sets there.
-    fn frame(
-        &self,
-        array: &Arc<NDArray>,
-        attributes: impl FnOnce(&PluginAttributes) -> Option<NDAttributeList>,
-    ) -> SortCounters {
-        let attributes = self
-            .delivery
-            .delivers()
-            .then(|| attributes(&self.attributes))
-            .flatten();
-        self.delivery.hand_on(array, attributes.as_ref());
+    /// Deliver `array` with what `view` reads when NDArrayCallbacks is on
+    /// (NDPluginDriver.cpp:289); returns the counters C sets there.
+    fn frame(&self, array: &Arc<NDArray>, view: Option<&AttributeView>) -> SortCounters {
+        let ready = match view.filter(|_| self.delivery.delivers()) {
+            Some(view) => view.with_evaluated(|list| self.delivery.hand_on(array, Some(list))),
+            None => self.delivery.hand_on(array, None),
+        };
+        self.delivery.deliver(ready);
         self.delivery.sort_counters()
     }
 
@@ -1052,7 +1094,7 @@ impl PortPost {
     /// taking a lock the actor's writes take.
     pub fn of(attributes: Option<&PluginAttributes>) -> Self {
         Self {
-            port: attributes.and_then(|a| a.0.port()),
+            port: attributes.and_then(|a| a.owner.port()),
             begun: false,
             hand_on: HAND_ON.with(|h| h.borrow().clone()),
             set: None,
@@ -1109,7 +1151,7 @@ impl ParamPost for PortPost {
     fn hand_on(&mut self, array: &Arc<NDArray>) {
         let Some(hand_on) = &self.hand_on else { return };
         let view = &self.view;
-        let counters = hand_on.frame(array, |_| view.as_ref().map(AttributeView::evaluate));
+        let counters = hand_on.frame(array, view.as_ref());
         if let Some(view) = view {
             view.record(hand_on.sets(counters).filter_map(|set| set.stored()));
         }
@@ -1176,7 +1218,7 @@ impl ParamPost for WritePort<'_> {
     fn hand_on(&mut self, array: &Arc<NDArray>) {
         let Some(hand_on) = self.hand_on else { return };
         let view = self.attribute_view();
-        let counters = hand_on.frame(array, |_| view.as_ref().map(AttributeView::evaluate));
+        let counters = hand_on.frame(array, view.as_ref());
         if let Some(view) = &view {
             view.record(hand_on.sets(counters).filter_map(|set| set.stored()));
         }
@@ -2589,7 +2631,7 @@ impl PluginPortDriver {
         // Let the processor register its plugin-specific params
         let first_processor_param = base.params.len();
         processor.register_params(&mut base)?;
-        processor.bind_attributes(PluginAttributes(Arc::clone(&owner)));
+        processor.bind_attributes(PluginAttributes::new(Arc::clone(&owner)));
         let pool = PluginPool::new(pool);
         processor.bind_pool(pool.clone());
 
@@ -3668,7 +3710,7 @@ pub fn create_plugin_runtime_with_output<P: NDPluginProcess>(
     ));
     let shared = Arc::new(parking_lot::Mutex::new(SharedProcessorInner {
         delivery,
-        attributes: PluginAttributes(Arc::clone(own_pool.owner())),
+        attributes: PluginAttributes::new(Arc::clone(own_pool.owner())),
         read_attributes: P::READ_ATTRIBUTES,
         attribute_set: NDAttributeList::new(),
         ndarray_params,
@@ -6569,7 +6611,7 @@ mod tests {
                 *self.read.lock() = self.unique_id.lock().and_then(|r| post.int32(r));
                 if let (Some(reason), Some(port)) = (
                     *self.unique_id.lock(),
-                    self.attributes.as_ref().and_then(|a| a.0.port()),
+                    self.attributes.as_ref().and_then(|a| a.owner.port()),
                 ) {
                     *self.seen.lock() = port.read_int32_blocking(reason, 0).ok();
                 }

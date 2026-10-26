@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 use std::task::{Context, Waker};
 use std::time::Duration;
 
-use ad_core_rs::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
+use ad_core_rs::attributes::{NDAttrSource, NDAttrValue, NDAttribute, NDAttributeList};
 use ad_core_rs::ndarray::{NDArray, NDDataType, NDDimension};
 use ad_core_rs::ndarray_pool::{DriverPool, NDArrayPool, PublishedArray};
 use ad_core_rs::plugin::channel::{ArrayPublisher, NDArrayOutput};
@@ -138,6 +138,47 @@ impl NDPluginProcess for Handing {
     }
 }
 
+/// Evaluates the plugin's `NDAttributesFile` for a writer once it has
+/// recorded a set, as NDPluginFile's base does before each write that
+/// reads it (NDFileHDF5.cpp:1421), then hands the frame on.
+struct Viewing {
+    num_captured: Arc<AtomicUsize>,
+    frames: AtomicI32,
+    written: Arc<Mutex<NDAttributeList>>,
+    attributes: Option<PluginAttributes>,
+}
+
+impl NDPluginProcess for Viewing {
+    const ASYN_FLAGS: asyn_rs::port::PortFlags = ASYN_CANBLOCK;
+    const INTERFACE_MASK: InterfaceMask = InterfaceMask::GENERIC_POINTER;
+    const INTERRUPT_MASK: InterfaceMask = Self::INTERFACE_MASK;
+
+    fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
+        let mut post = PortPost::of(self.attributes.as_ref());
+        let view = post
+            .attribute_view()
+            .expect("the attributes file is loaded");
+        let frame = self.frames.fetch_add(1, Ordering::Relaxed) + 1;
+        let num_captured = self.num_captured.load(Ordering::Relaxed);
+        view.record([(num_captured, 0, ParamValue::Int32(frame))]);
+        view.with_evaluated(|list| self.written.lock().clone_from(list));
+        post.hand_on(array);
+        ProcessResult::sink(Vec::new())
+    }
+
+    fn bind_attributes(&mut self, attributes: PluginAttributes) {
+        self.attributes = Some(attributes);
+    }
+
+    fn array_callbacks_seed(&self) -> Option<bool> {
+        Some(false)
+    }
+
+    fn plugin_type(&self) -> &str {
+        "Viewing"
+    }
+}
+
 fn write_i32(plugin: &PluginRuntimeHandle, reason: usize, v: i32) {
     plugin
         .port_runtime()
@@ -168,6 +209,19 @@ fn plugin<P: NDPluginProcess>(port: &str, processor: P) -> PluginRuntimeHandle {
         .unwrap();
     write_i32(&plugin, plugin.plugin_params.enable_callbacks, 1);
     plugin
+}
+
+fn write_octet(plugin: &PluginRuntimeHandle, reason: usize, v: &str) {
+    plugin
+        .port_runtime()
+        .port_handle()
+        .submit_blocking(
+            asyn_rs::request::RequestOp::OctetWrite {
+                data: v.as_bytes().to_vec(),
+            },
+            asyn_rs::user::AsynUser::new(reason),
+        )
+        .unwrap();
 }
 
 /// The `ArrayCounter` the plugin's port has last applied.
@@ -204,6 +258,17 @@ fn publish(publisher: &ArrayPublisher, frame: PublishedArray) {
 
 const WARM: usize = 64;
 const FRAMES: usize = 512;
+
+/// A plugin's own `NDAttributesFile`.
+const PLUGIN_ATTRIBUTES: &str = r#"<Attributes>
+    <Attribute name="Cnt" type="PARAM" source="ARRAY_COUNTER" datatype="INT"/>
+    <Attribute name="Num" type="PARAM" source="NUM_CAPTURED" datatype="INT"/>
+    <Attribute name="Tag" type="CONST" source="abc" datatype="STRING"/>
+</Attributes>"#;
+
+/// A lend of a port to a caller's thread: its cancel token, its reply
+/// channel and the no-op request the actor parks on.
+const LEND: usize = 3;
 
 /// The allocations of `FRAMES` frames, each carrying `attributes`, through
 /// `plugin` after `WARM` warm-up ones. Frame `i` is done once its port has
@@ -295,4 +360,37 @@ fn handing_a_frame_on_allocates_nothing() {
     let plugin = plugin("ZALLOC_HANDON", Handing { attributes: None });
     let allocs = steady_allocs(&plugin, &[], |_| true);
     assert_eq!(allocs, 0, "{FRAMES} frames after {WARM} warm-up ones");
+}
+
+#[test]
+fn evaluating_a_plugins_attributes_for_its_writer_allocates_only_the_lend() {
+    let _serial = SERIAL.lock();
+    let num_captured = Arc::new(AtomicUsize::new(usize::MAX));
+    let written = Arc::new(Mutex::new(NDAttributeList::new()));
+    let plugin = plugin(
+        "ZALLOC_VIEW",
+        Viewing {
+            num_captured: num_captured.clone(),
+            frames: AtomicI32::new(0),
+            written: written.clone(),
+            attributes: None,
+        },
+    );
+    num_captured.store(plugin.ndarray_params.num_captured, Ordering::Relaxed);
+    write_octet(
+        &plugin,
+        plugin.ndarray_params.attributes_file,
+        PLUGIN_ATTRIBUTES,
+    );
+    let allocs = steady_allocs(&plugin, &[], |_| true);
+    let written = written.lock();
+    let value = |name| written.get(name).map(|a| a.value.clone());
+    let last = NDAttrValue::Int32((WARM + FRAMES) as i32);
+    assert_eq!(value("Cnt"), Some(last.clone()), "the frame's ArrayCounter");
+    assert_eq!(value("Num"), Some(last), "the set the frame recorded");
+    assert_eq!(value("Tag"), Some(NDAttrValue::String("abc".into())));
+    assert!(
+        allocs <= LEND * FRAMES,
+        "{allocs} allocations in {FRAMES} frames after {WARM} warm-up ones"
+    );
 }

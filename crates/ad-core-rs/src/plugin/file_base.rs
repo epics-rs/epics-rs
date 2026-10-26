@@ -97,10 +97,11 @@ pub trait NDFileWriter: Send + Sync {
     /// C `calculateAttributeChunking`) uses it; the default ignores it.
     fn set_num_capture(&mut self, _n: i32) {}
     /// The plugin's own NDAttributesFile set as C `getAttributes` returns it
-    /// to `openFile`/`writeFile`, evaluated by the processor ahead of the
-    /// call because the evaluation cannot run under the writer lock. A
-    /// writer whose C counterpart never calls `getAttributes` ignores it.
-    fn set_plugin_attributes(&mut self, _attributes: NDAttributeList) {}
+    /// to `openFile`/`writeFile`, evaluated from the callback's view ahead
+    /// of the call. A writer keeps it with `clone_from`, which reuses the
+    /// storage of the set it kept last; one whose C counterpart never calls
+    /// `getAttributes` ignores it.
+    fn set_plugin_attributes(&mut self, _attributes: &NDAttributeList) {}
     /// Whether [`write_file`](NDFileWriter::write_file) has put the frame on
     /// disk by the time it returns.
     ///

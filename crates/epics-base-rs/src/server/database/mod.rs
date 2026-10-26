@@ -2716,6 +2716,16 @@ impl PvDatabase {
         self.dispatch_record_init(Box::pin(init));
     }
 
+    /// Whether a classification made now reads the database
+    /// [`Self::dispatch_record_init`] would spawn it against, rather than one
+    /// still loading, whose classifications it queues for `iocInit`.
+    pub(crate) fn classifies_links_at_once(&self) -> bool {
+        matches!(
+            *self.inner.init_phase.lock().unwrap(),
+            DbInitPhase::Unloaded | DbInitPhase::Running
+        )
+    }
+
     /// Queue or spawn an init whose record is known to be registered.
     fn dispatch_record_init(&self, init: RecordInit) {
         let mut phase = self.inner.init_phase.lock().unwrap();

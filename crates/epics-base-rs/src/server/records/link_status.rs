@@ -436,6 +436,12 @@ pub fn classify_link(
 /// forward-referenced target classifies LOCAL and the result is final when
 /// `iocInit` returns; spawned at once on a complete database. No-op for a
 /// record with no async context.
+///
+/// A put on a complete database is the exception: C's `special()` sets the
+/// status before the put returns, and acalcout's next `fetch_values` reads
+/// INAA..INLL by it (`aCalcoutRecord.c:1078`). So the put link is classified
+/// here, on the caller's thread under the record's write lock, and its status
+/// returned for the caller to store; the task only posts it. Otherwise `None`.
 /// `mask` is the record's own `db_post_events` mask, and it is a parameter
 /// because the four records that route through here do not agree. The three
 /// calcouts post a bare `DBE_VALUE` — `calcoutRecord.c:404`, `:752`, `:757`;
@@ -457,40 +463,59 @@ pub fn post_link_status(
     rule: LinkRule,
     mask: crate::server::recgbl::EventMask,
     posts: LinkStatusPosts,
-) {
-    let Some((name, handle)) = ctx else {
-        return;
-    };
+) -> Option<i16> {
+    let (name, handle) = ctx?;
     let classified = posts.links(links.iter().map(|&(f, _, _)| f));
     if classified == 0 {
-        return;
+        return None;
     }
     let recheck = match posts {
         LinkStatusPosts::All => rule.init_recheck(),
         LinkStatusPosts::Put(_) => Some(LINK_RECHECK),
     };
-    let name = name.clone();
-    let handle = handle.clone();
     // Stamp before the spawn, on the caller's thread, under the record's
     // write lock (see `LinkStatusGen`).
     let token = generation.next_for(classified);
+    let now = (matches!(posts, LinkStatusPosts::Put(_)) && handle.classifies_links_at_once())
+        .then(|| classify_links(handle, &links, classified, rule));
+    let stored = now.as_ref().and_then(|now| now.first()).map(|&(_, _, s)| s);
+    let name = name.clone();
+    let handle = handle.clone();
     let sched = handle.clone();
     let init_key = name.clone();
     sched.schedule_record_init(&init_key, async move {
-        let fields: Vec<(usize, String, EpicsValue)> = links
+        let (statuses, post) = match now {
+            Some(now) => (now, PostRule::Held),
+            None => (
+                classify_links(&handle, &links, classified, rule),
+                PostRule::Always,
+            ),
+        };
+        let fields = statuses
             .into_iter()
-            .enumerate()
-            .filter(|&(i, _)| classified & 1 << i != 0)
-            .map(|(i, (field, link, role))| {
-                let (status, _ft) = classify_link(&handle, &link, role, rule);
-                (i, field.to_string(), EpicsValue::Enum(status as u16))
-            })
+            .map(|(i, field, status)| (i, field.to_string(), EpicsValue::Enum(status as u16), post))
             .collect();
         #[cfg(test)]
         tests::hold_before_post().await;
-        token.post_each(&handle, &name, fields, mask);
+        token.post_each_ruled(&handle, &name, fields, mask);
         handle.link_check_classified(&name, recheck);
     });
+    stored
+}
+
+/// `(i, field, status)` for each link `i` of `links` at a bit of `classified`.
+fn classify_links(
+    handle: &AsyncDbHandle,
+    links: &[(&'static str, PvString, LinkRole)],
+    classified: u64,
+    rule: LinkRule,
+) -> Vec<(usize, &'static str, i16)> {
+    links
+        .iter()
+        .enumerate()
+        .filter(|&(i, _)| classified & 1 << i != 0)
+        .map(|(i, (field, link, role))| (i, *field, classify_link(handle, link, *role, rule).0))
+        .collect()
 }
 
 /// Which links a link-status refresh classifies; C posts each status it
@@ -535,7 +560,7 @@ mod tests {
 
     use tokio::sync::oneshot;
 
-    use crate::server::database::PvDatabase;
+    use crate::server::database::{ProcStack, PvDatabase};
     use crate::server::recgbl::EventMask;
     use crate::server::records::ai::AiRecord;
     use crate::server::records::scalcout::ScalcoutRecord;
@@ -712,5 +737,52 @@ mod tests {
             [drain(0), drain(1), drain(2)],
             [constant.clone(), local, constant]
         );
+    }
+
+    /// C `special()` stores a re-pointed link's status before the put
+    /// returns, and acalcout reads INAA..INLL only while that status is EXT or
+    /// LOC (`aCalcoutRecord.c:1078`). With the put's post still in flight, a
+    /// process right after an INAA put reads the new link.
+    #[epics_macros_rs::epics_test]
+    async fn a_process_right_after_an_array_link_put_reads_it() {
+        use crate::server::record::Record;
+        use crate::server::records::acalcout::AcalcoutRecord;
+        let db = PvDatabase::new();
+        db.add_record("SRC", Box::new(AiRecord::new(3.0)))
+            .await
+            .unwrap();
+        let mut ac = AcalcoutRecord::new();
+        ac.put_field("NELM", EpicsValue::Long(4)).unwrap();
+        db.add_record("AC", Box::new(ac)).await.unwrap();
+        db.ioc_init().await;
+        // AC's init classification must not be the task the hold catches.
+        crate::runtime::task::sleep(Duration::from_millis(100)).await;
+
+        let (arrived_tx, arrived) = oneshot::channel();
+        let (release, release_rx) = oneshot::channel();
+        let (resumed_tx, resumed) = std::sync::mpsc::channel();
+        *HOLD.lock().unwrap() = Some((arrived_tx, release_rx, resumed_tx));
+        let link = EpicsValue::String("SRC".into());
+        let held = db.lock_for_put("AC", "INAA", &link);
+        db.put_record_field_from_ca_already_locked(held, link)
+            .unwrap();
+        arrived.await.expect("the put's task reached its post");
+
+        let rec = db.get_record("AC").unwrap();
+        let read = |f: &str| rec.read().record.get_field(f);
+        assert_eq!(read("IAAV"), Some(EpicsValue::Enum(super::LINK_LOC as u16)));
+        db.process_record_with_links("AC", &mut ProcStack::new())
+            .await
+            .unwrap();
+        let aa = match read("AA") {
+            Some(EpicsValue::DoubleArray(a)) => a.to_vec(),
+            other => panic!("AA is {other:?}"),
+        };
+        assert_eq!(aa.first(), Some(&3.0), "AA is {aa:?}");
+
+        release.send(()).unwrap();
+        resumed
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the put's task resumed");
     }
 }

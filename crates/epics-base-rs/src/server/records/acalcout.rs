@@ -1133,7 +1133,7 @@ impl AcalcoutRecord {
     /// Classify all 25 links and publish INAV..INLV / IAAV..ILLV / OUTV,
     /// mirroring C `aCalcoutRecord.c::init_record` (209-243) and the
     /// `special()` re-classification (528-569). No-op without an async context.
-    fn refresh_link_status(&self, posts: LinkStatusPosts) {
+    fn refresh_link_status(&mut self, posts: LinkStatusPosts) {
         let mut links: Vec<(&'static str, PvString, LinkRole)> = Vec::with_capacity(25);
         for i in 0..12 {
             links.push((INAV_NAMES[i], self.inp_links[i].clone(), LinkRole::Input));
@@ -1141,7 +1141,7 @@ impl AcalcoutRecord {
         }
         links.push(("OUTV", self.out.clone(), LinkRole::Output));
         // C `aCalcoutRecord.c:242`, `:569`, `:1157`.
-        post_link_status(
+        let stored = post_link_status(
             self.async_ctx.as_ref(),
             &self.link_gen,
             links,
@@ -1149,6 +1149,11 @@ impl AcalcoutRecord {
             ACALCOUT_LINK_CHECK.mask,
             posts,
         );
+        if let (LinkStatusPosts::Put(field), Some(status)) = (posts, stored)
+            && let Some(idx) = Self::status_index(field)
+        {
+            self.link_status[idx] = status;
+        }
     }
 
     /// The `link_status` slot of a status field.

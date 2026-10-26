@@ -494,7 +494,7 @@ impl TransformRecord {
     /// Classify all 32 links and publish `IAV..IPV` / `OAV..OPV`, mirroring C
     /// `transformRecord.c::init_record` (444-473) and the `special()`
     /// re-classification (709-742). No-op without an async context.
-    fn refresh_link_status(&self, posts: LinkStatusPosts) {
+    fn refresh_link_status(&mut self, posts: LinkStatusPosts) {
         let mut links: Vec<(&'static str, PvString, LinkRole)> =
             Vec::with_capacity(2 * NUM_CHANNELS);
         for i in 0..NUM_CHANNELS {
@@ -509,7 +509,7 @@ impl TransformRecord {
                 LinkRole::Output,
             ));
         }
-        post_link_status(
+        let stored = post_link_status(
             self.async_ctx.as_ref(),
             &self.link_gen,
             links,
@@ -517,6 +517,11 @@ impl TransformRecord {
             TRANSFORM_LINK_CHECK.mask,
             posts,
         );
+        if let (LinkStatusPosts::Put(field), Some(status)) = (posts, stored)
+            && let Some(slot) = Self::link_status_slot(field)
+        {
+            self.link_status[slot] = status;
+        }
     }
 
     /// LA..LP — "Prev Value of A".."Prev Value of P"

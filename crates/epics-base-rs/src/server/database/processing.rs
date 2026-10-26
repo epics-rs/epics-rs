@@ -742,6 +742,8 @@ pub enum PostRule {
     Silent,
     /// Neither write nor post.
     Skip,
+    /// Post the value the field holds; write nothing.
+    Held,
 }
 
 /// One field of an out-of-band post. A bare `(field, value)` posts
@@ -1241,6 +1243,11 @@ impl AsyncDbHandle {
         if let Some(db) = self.db() {
             db.link_check_after(record.as_ref(), delay);
         }
+    }
+
+    /// See `PvDatabase::classifies_links_at_once`.
+    pub(crate) fn classifies_links_at_once(&self) -> bool {
+        self.db().is_some_and(|db| db.classifies_links_at_once())
     }
 
     /// Schedule a record's link-status classification — see
@@ -4631,7 +4638,9 @@ impl PvDatabase {
             {
                 continue;
             }
-            self.put_internal_field_opening(&mut inst, &field, value, &mut links)?;
+            if rule != PostRule::Held {
+                self.put_internal_field_opening(&mut inst, &field, value, &mut links)?;
+            }
             if rule != PostRule::Silent {
                 inst.notify_field(&field, mask);
                 posted.push(field);

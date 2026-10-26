@@ -38,61 +38,42 @@ pub(crate) struct FieldNameComponent {
     index: Option<u32>,
 }
 
-/// Parse a field path like `"a.b[0].c"` into components, enforcing the pvxs
-/// `FieldName` constructor grammar (`ioc/fieldname.cpp:29-67`).
+/// Parse a field path like `"a.b[0].c"` into components, accepting exactly
+/// the member names a pvxs 1.5.3 group builds.
 ///
-/// This is the single source of truth for the group field-name grammar. pvxs
-/// splits the path on `.` with `std::getline` and **throws** — aborting that
-/// group's build — on a malformed path; the throw set is byte-faithful to
-/// `getline`/`strtol`:
-///   - empty input → no components (pvxs skips the split; no throw);
-///   - an empty leading or interior component (`.a`, `a..b`, `.`) is an error;
-///     a single terminal empty from a trailing `.` (`a.`) is dropped at EOF
-///     (`getline` fails on a zero-length extraction at end-of-stream) and is
-///     NOT an error;
-///   - a component is array-indexed only when it ENDS with `]`, in which case
-///     it must contain a `[` and a non-negative decimal subscript (`a[x]`,
-///     `a[1x]` are errors: the subscript is not a clean integer). A component
-///     with no trailing `]` (`a[`) is a plain literal name, bracket included.
+/// This is the single source of truth for the group field-name grammar. pvxs's
+/// `FieldName` constructor (`ioc/fieldname.cpp:29-67`) splits on `.` with
+/// `std::getline` and reads a subscript with `strtol`, but that leniency never
+/// reaches a group: `Field::fullName` is the `FieldName::to_string()`
+/// rendering (`field.cpp:31`, `fieldname.cpp:87-106`), and group creation finds
+/// each member with `Group::operator[]`, which compares `fullName` to the
+/// configured name (`group.cpp:103-109`, called at
+/// `groupconfigprocessor.cpp:543`, `:576`). A name that renders differently
+/// fails with "field not found in group" and the group is not created
+/// (`:462-465`). The grammar is therefore:
+///   - empty input → no components;
+///   - an empty component is an error: `.a`, `a..b`, `.`, and a trailing `.`,
+///     which `getline` drops so `a.` renders as `a`;
+///   - a component is array-indexed only when it ends with `]`; it must
+///     contain a `[`, and the subscript must be canonical decimal (`0`, or no
+///     leading zero) and at most 4294967294. `a[x]` throws in `FieldName`;
+///     `a[ 5]`, `a[+5]`, `a[05]`, `a[-0]`, `a[]` and `a[1]]` render as
+///     `a[5]`, `a[0]` or `a[1]`; 4294967295 is pvxs's no-subscript index
+///     (`fieldnamecomponent.h:62-64`) and renders as `a`; and `a[-1]` or
+///     `a[4294967296]` wraps in the `uint32_t` index. A component with no
+///     trailing `]` (`a[`) is a plain name, bracket included.
 ///
 /// The infallible [`parse_field_path`] wraps this for navigating names already
 /// validated at group-build time; `group_config::validate_field_name` calls it
 /// to reject a malformed member (a per-group skip, matching pvxs's per-group
-/// `try` at `groupconfigprocessor.cpp:431-446`).
-///
-/// Divergence note: this subscript grammar is intentionally STRICTER than pvxs
-/// and rejects three degenerate forms that pvxs's `strtol`
-/// (`fieldname.cpp:48-53`) accepts — we deliberately do NOT replicate the
-/// `strtol` accidents:
-///   - an empty subscript `a[]` — `strtol("]")` performs no conversion, returns
-///     0, and leaves `endScan` on the `]`, so pvxs silently reads it as element
-///     0; `"".parse::<u32>()` errors here;
-///   - a whitespace/sign-padded subscript `a[ 5]` — `strtol` skips leading
-///     whitespace and an optional sign and reads 5; `" 5".parse::<u32>()`
-///     errors here;
-///   - a negative or `u32`-overflowing subscript (`a[-1]`, `a[99999999999]`) —
-///     `strtol` accepts it and only fails later at navigation.
-///
-/// Group array indices are non-negative and bounded, so none of these could
-/// navigate to a real element; rejecting them at build is stricter-but-safe and
-/// never touches a real config. All three are build-time-only divergences.
+/// `try` at `groupconfigprocessor.cpp:431-465`).
 pub(crate) fn parse_field_path_checked(path: &str) -> Result<Vec<FieldNameComponent>, String> {
     if path.is_empty() {
         return Ok(Vec::new());
     }
 
-    // Replicate `while (getline(splitter, part, '.'))`: the terminal empty
-    // produced by a single trailing '.' is dropped at EOF and never reaches
-    // the empty-component check; every other empty is an error.
-    let raw: Vec<&str> = path.split('.').collect();
-    let count = if path.ends_with('.') {
-        raw.len() - 1
-    } else {
-        raw.len()
-    };
-
-    let mut components = Vec::with_capacity(count);
-    for part in &raw[..count] {
+    let mut components = Vec::new();
+    for part in path.split('.') {
         if part.is_empty() {
             return Err(format!("Empty field component in: {path}"));
         }
@@ -102,9 +83,14 @@ pub(crate) fn parse_field_path_checked(path: &str) -> Result<Vec<FieldNameCompon
             let open = part
                 .rfind('[')
                 .ok_or_else(|| format!("Invalid field array sub-script in : {path}"))?;
-            let index: u32 = part[open + 1..]
-                .parse()
-                .map_err(|_| format!("Invalid field array sub-script in : {path}"))?;
+            let digits = &part[open + 1..];
+            let canonical = digits.bytes().all(|b| b.is_ascii_digit())
+                && (digits == "0" || !digits.starts_with('0'));
+            let index = digits
+                .parse::<u32>()
+                .ok()
+                .filter(|&i| canonical && i != u32::MAX)
+                .ok_or_else(|| format!("Invalid field array sub-script in : {path}"))?;
             components.push(FieldNameComponent {
                 name: part[..open].to_string(),
                 index: Some(index),
@@ -3967,8 +3953,8 @@ mod tests {
 
     /// An empty leading or interior component is an error (pvxs `getline`
     /// yields an empty part → `throw "Empty field component"`,
-    /// fieldname.cpp:35-36). A single trailing '.' is dropped at EOF and is
-    /// NOT an error.
+    /// fieldname.cpp:35-36). So is a trailing '.': `getline` drops it, so
+    /// `a.` renders as `a` and pvxs's group lookup by rendered name fails.
     #[test]
     fn parse_field_path_checked_empty_component() {
         assert!(parse_field_path_checked(".a").is_err(), "leading dot");
@@ -3982,39 +3968,40 @@ mod tests {
             "interior empty before trailing"
         );
 
-        // Trailing dot: `getline` fails the zero-length final extraction at
-        // EOF, so `a.` is just `a` — no error (fieldname.cpp getline loop).
-        let comps = parse_field_path_checked("a.").expect("trailing dot is dropped, not an error");
-        assert_eq!(comps.len(), 1);
-        assert_eq!(comps[0].name, "a");
+        assert!(parse_field_path_checked("a.").is_err(), "trailing dot");
+        assert!(parse_field_path_checked("a.b.").is_err(), "trailing dot");
     }
 
-    /// A component ending in ']' must carry a '[' and a non-negative decimal
-    /// subscript. NOTE: `value[]` and `value[-1]` are rejected here
-    /// INTENTIONALLY stricter than pvxs — its `strtol` (fieldname.cpp:48-53)
-    /// reads `value[]` as element 0 and accepts a negative/overflow index,
-    /// failing only later at navigation. We reject at build (see the divergence
-    /// note on `parse_field_path_checked`); this test pins the stricter Rust
-    /// behavior, it is NOT asserting a pvxs match. A non-']'-terminated
-    /// component is a literal name.
+    /// A component ending in ']' must carry a '[' and a canonical decimal
+    /// subscript of at most 4294967294: every other spelling pvxs's `strtol`
+    /// takes renders differently, and pvxs's group lookup by rendered name
+    /// then fails. A non-']'-terminated component is a literal name.
     #[test]
     fn parse_field_path_checked_bad_subscript() {
-        assert!(
-            parse_field_path_checked("value[x]").is_err(),
-            "non-integer subscript"
-        );
-        assert!(
-            parse_field_path_checked("value[]").is_err(),
-            "empty subscript — stricter than pvxs, which reads it as element 0"
-        );
-        assert!(
-            parse_field_path_checked("value[1x]").is_err(),
-            "trailing garbage"
-        );
-        assert!(
-            parse_field_path_checked("value[-1]").is_err(),
-            "negative subscript — stricter than pvxs, which strtol-accepts then fails at nav"
-        );
+        for bad in [
+            "value[x]",
+            "value[1x]",
+            "value[+5]",
+            "value[05]",
+            "value[ 5]",
+            "value[-0]",
+            "value[]",
+            "value[-1]",
+            "value[1]]",
+            "value[4294967295]",
+            "value[4294967296]",
+        ] {
+            assert!(parse_field_path_checked(bad).is_err(), "{bad}");
+        }
+        for (good, index) in [
+            ("value[0]", 0),
+            ("value[5]", 5),
+            ("value[4294967294]", u32::MAX - 1),
+        ] {
+            let comps = parse_field_path_checked(good).expect(good);
+            assert_eq!(comps[0].name, "value");
+            assert_eq!(comps[0].index, Some(index), "{good}");
+        }
 
         // `value[` does not end with ']' → pvxs keeps it as a literal field
         // name (bracket included), no throw. The old parser renamed it to

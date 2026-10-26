@@ -1792,4 +1792,69 @@ record(ai, "linked") { field(INP, "ai.VAL CP") info(Q:form, "String") }
             Some(&PvField::Scalar(ScalarValue::Int(3)))
         );
     }
+
+    /// The `value` leaf of an NT descriptor.
+    fn value_leaf(desc: &FieldDesc) -> Option<&FieldDesc> {
+        match desc {
+            FieldDesc::Structure { fields, .. } => {
+                fields.iter().find(|(n, _)| n == "value").map(|(_, d)| d)
+            }
+            _ => None,
+        }
+    }
+
+    /// `dbGetAttributePart`'s descriptor is one `DBF_STRING`
+    /// (`dbStaticLib.c:1268-1271`), so pvxs makes `X.RTYP` an NTScalar
+    /// string, alone and as a group member, with a `DBF_STRING` field's
+    /// property leaves.
+    #[epics_base_rs::epics_test]
+    async fn an_attribute_is_one_string() {
+        use super::super::group::GroupChannel;
+        use super::super::provider::channel_property_support;
+        use epics_pva_rs::pvdata::ScalarType;
+        let db = every_type().await;
+        let text = |v: &str| PvField::Scalar(ScalarValue::String(v.into()));
+        for (name, want) in [("ai.RTYP", "ai"), ("ai.VERS", "none specified")] {
+            let ch = BridgeChannel::new(db.clone(), name.as_bytes())
+                .await
+                .unwrap();
+            assert_eq!(ch.nt_type(), NtType::Scalar, "{name}");
+            let desc = ch.get_field().await.unwrap();
+            assert_eq!(
+                value_leaf(&desc),
+                Some(&FieldDesc::Scalar(ScalarType::String)),
+                "{name}"
+            );
+            let served = ch.get(&PvStructure::new("")).await.unwrap();
+            assert_eq!(served.get_field("value"), Some(&text(want)), "{name}");
+
+            let group = GroupChannel::new(db.clone(), group_on(name));
+            let desc = group.get_field().await.unwrap();
+            let FieldDesc::Structure { fields, .. } = &desc else {
+                panic!("{desc:?}");
+            };
+            for (member, d) in fields.iter().filter(|(n, _)| n == "s" || n == "p") {
+                let leaf = if member == "p" {
+                    Some(d)
+                } else {
+                    value_leaf(d)
+                };
+                assert_eq!(
+                    leaf,
+                    Some(&FieldDesc::Scalar(ScalarType::String)),
+                    "group {name}.{member}"
+                );
+            }
+            let served = group.get(&PvStructure::new("")).await.unwrap();
+            assert_eq!(served.get_field("p"), Some(&text(want)), "group {name}");
+
+            for chain in ["", r#"{"ts":{"str":"epics"}}"#] {
+                assert_eq!(
+                    channel_property_support(&db, format!("{name}{chain}").as_bytes()).await,
+                    channel_property_support(&db, format!("ai.DESC{chain}").as_bytes()).await,
+                    "{name}{chain}"
+                );
+            }
+        }
+    }
 }

@@ -6399,4 +6399,33 @@ record(calcout, "T") { field(ODLY, "0.5") field(CALC, "1") }
             );
         }
     }
+
+    /// A group PUT converts to `dbChannelFinalFieldType`, which for a record
+    /// attribute is `dbGetAttributePart`'s `DBF_STRING`
+    /// (`dbStaticLib.c:1268-1271`).
+    #[epics_base_rs::epics_test]
+    async fn an_attribute_member_puts_as_a_string() {
+        let (db, _) = epics_base_rs::server::ioc_builder::IocBuilder::new()
+            .db_string("record(ai, \"X\") {}\n", &std::collections::HashMap::new())
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        db.ioc_init().await;
+        let def = crate::qsrv::group_config::parse_group_config(
+            r#"{"G:x": {"s": {"+channel": "X.RTYP", "+type": "scalar"}, "p": {"+channel": "X.VERS", "+type": "plain"}}}"#,
+        )
+        .unwrap()
+        .pop()
+        .unwrap();
+        let group = GroupChannel::new(db, def);
+        for m in group.def.channels.iter() {
+            assert_eq!(
+                group.member_dbf_type(m),
+                DbFieldType::String,
+                "{:?}",
+                m.names()
+            );
+        }
+    }
 }

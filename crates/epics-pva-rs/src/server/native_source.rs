@@ -8198,4 +8198,40 @@ record(ai, "linked") { field(INP, "ai.VAL CP") info(Q:form, "String") }
         }
         assert!(differ.is_empty(), "{}", differ.join("\n"));
     }
+
+    /// `dbGetAttributePart`'s descriptor is one `DBF_STRING`
+    /// (`dbStaticLib.c:1268-1271`): `X.RTYP` is an NTScalar string on create
+    /// and read, and the trap-write log's `dbChannelFinalFieldType` is
+    /// `DBR_STRING`.
+    #[epics_macros_rs::epics_test]
+    async fn an_attribute_is_one_string() {
+        let db = every_type().await;
+        let source = PvDatabaseSource::new(db.clone());
+        let rec = db.get_record("ai").unwrap();
+        for (field, want) in [("RTYP", "ai"), ("VERS", "none specified")] {
+            let name = format!("ai.{field}");
+            let desc = source.get_introspection(name.as_bytes()).await.unwrap();
+            let FieldDesc::Structure { fields, .. } = &desc else {
+                panic!("{desc:?}");
+            };
+            assert_eq!(
+                fields.iter().find(|(n, _)| n == "value").map(|(_, d)| d),
+                Some(&FieldDesc::Scalar(ScalarType::String)),
+                "{name}"
+            );
+            let Some(PvField::Structure(served)) = source.get_value(name.as_bytes()).await else {
+                panic!("{name}");
+            };
+            assert_eq!(
+                served.get_field("value"),
+                Some(&PvField::Scalar(ScalarValue::String(want.into()))),
+                "{name}"
+            );
+            assert_eq!(
+                ChannelAddr::of(&db, &rec, field).map(|a| a.channel_field_type(false)),
+                Some(epics_base_rs::types::DbFieldType::String),
+                "{name}"
+            );
+        }
+    }
 }

@@ -282,14 +282,14 @@ pub enum LinkRule {
     /// re-check; `process()` does.
     Volatile,
     /// synApps `sCalcoutRecord.c:264`, `aCalcoutRecord.c:219`,
-    /// `transformRecord.c:450`, std `throttleRecord.c:194`: `dbNameToAddr`
-    /// of the PV name — a name this IOC holds is `Local PV` whatever its
-    /// modifier, and `checkLinks` re-reads only the CA links left. An
-    /// `Ext PV NC` re-checks after 1 s from `init_record`, 0.5 s from
-    /// `special()`.
+    /// `transformRecord.c:450`, std `throttleRecord.c:194`, and sseq's
+    /// `special()` (`sseqRecord.c:1006`, `:1051`): `dbNameToAddr` of the PV
+    /// name — a name this IOC holds is `Local PV` whatever its modifier, and
+    /// `checkLinks` re-reads only the CA links left. An `Ext PV NC` re-checks
+    /// after 1 s from `init_record`, 0.5 s from `special()`.
     Locality,
-    /// `sseqRecord.c:208`, `:227`: only a DB link to a local name is
-    /// `Local PV`; a CA link is external.
+    /// sseq's `init_record` (`sseqRecord.c:208`, `:227`): only a DB link to a
+    /// local name is `Local PV`; a CA link is external.
     DbLink,
 }
 
@@ -325,8 +325,8 @@ pub struct LinkCheckSpec {
     pub rule: LinkRule,
     /// The record's own `db_post_events` mask for a status.
     pub mask: crate::server::recgbl::EventMask,
-    /// sseq's `checkLinks` re-posts a `Local PV` status every pass
-    /// (`sseqRecord.c:874`, `:910`); the calcs leave one alone.
+    /// sseq's `checkLinks` sets and re-posts `Local PV` on every DB link each
+    /// pass (`sseqRecord.c:874`, `:910`); the calcs leave one alone.
     pub repost_local: bool,
     /// The record's `process()` runs `checkLinks` (`calcoutRecord.c:234`), so
     /// it takes `CycleHooks::LINK_CHECK`; sseq's runs it only from its
@@ -353,12 +353,13 @@ pub struct LinkCheck<'a> {
     pub tail: Option<&'a mut dyn LinkCheckTail>,
 }
 
-/// The rest of a record's `checkLinks` pass once the statuses are read: sseq's
+/// The rest of a record's `checkLinks` pass once the links are read: sseq's
 /// `waitConfigErr` (`sseqRecord.c:912-933`).
 pub trait LinkCheckTail {
-    /// Recompute from the pass's `statuses`; bit `i` set means
-    /// [`Self::fields`]`[i]` moved and posts.
-    fn pass(&mut self, statuses: &[i16]) -> u64;
+    /// Recompute from the links the pass found to be a `DB_LINK`, bit `i` for
+    /// `spec.links[i]`; bit `i` of the result set means [`Self::fields`]`[i]`
+    /// moved and posts.
+    fn pass(&mut self, db_links: u64) -> u64;
     fn fields(&self) -> &'static [&'static str];
 }
 

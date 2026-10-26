@@ -13,7 +13,7 @@
 //! The port used to swallow every put failure (an `eprintln!`, a discarded
 //! bool) and drove OUT links in the post-commit forward-link tail, so even a
 //! raised alarm could not have folded into this cycle. Each test below is a
-//! boundary of the put owner: local DB target, external `ca://` target, SIOL
+//! boundary of the put owner: local DB target, external CA target, SIOL
 //! simulated output, and the recovery cycle.
 
 use std::sync::{Arc, Mutex};
@@ -118,7 +118,7 @@ async fn r14_62_failing_local_out_put_raises_link_invalid_same_cycle() {
     );
 }
 
-/// Boundary 2 — an external `ca://` OUT link whose put fails takes the same
+/// Boundary 2 — an external CA OUT link whose put fails takes the same
 /// raise: C routes DB and CA links through the identical `dbPutLink` gate, the
 /// alarm comes from `dbPutLink` itself, not from the lset.
 #[epics_macros_rs::epics_test]
@@ -128,7 +128,7 @@ async fn r14_62_failing_external_out_put_raises_link_invalid() {
     db.ca_link_init();
     db.register_link_set("ca", Arc::new(FailingLset)).await;
 
-    add_ao_with_out(&db, "AO_BADCA", "ca://REMOTE:OUT").await;
+    add_ao_with_out(&db, "AO_BADCA", "REMOTE:OUT CA").await;
 
     let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("AO_BADCA", &mut visited)
@@ -188,7 +188,7 @@ async fn r14_62_successful_put_next_cycle_clears_the_link_alarm() {
     db.register_link_set("ca", Arc::new(FailingLset)).await;
     db.process_cp_links_on_connect().await;
 
-    add_ao_with_out(&db, "AO_RECOVER", "ca://REMOTE:OUT").await;
+    add_ao_with_out(&db, "AO_RECOVER", "REMOTE:OUT CA").await;
 
     let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("AO_RECOVER", &mut visited)

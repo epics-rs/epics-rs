@@ -92,10 +92,7 @@ fn opened(lset: &Opens) -> Vec<String> {
 async fn each_link_is_opened_once_at_init() {
     let lset = Arc::new(Opens::default());
     let _db = ioc(lset.clone()).await;
-    assert_eq!(
-        opened(&lset),
-        ["OL:U", "OL:V", "OL:W", "OL:X", "OL:Y", "OL:Z"]
-    );
+    assert_eq!(opened(&lset), ["OL:U", "OL:V", "OL:W", "OL:X", "OL:Z"]);
 }
 
 #[epics_macros_rs::epics_test]

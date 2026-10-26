@@ -1069,7 +1069,7 @@ impl QsrvMount {
 /// commands. `run_qsrv_ioc_app` registers it for every QSRV route; only a
 /// custom runner registers it itself. It is fired by
 /// `IocApplication::run` at the `AfterCaLinkInit` hook — BEFORE
-/// `setup_cp_links` and before record processing (PINI), so a `pva://`
+/// `setup_cp_links` and before record processing (PINI), so a pva
 /// CP link is opened and its background connect kicked off while iocInit
 /// is still running, matching pvxs opening pvalink channels at
 /// `initHookAfterIocBuilt` (`linkGlobal_t::init`). Installing pvalink in
@@ -1077,7 +1077,7 @@ impl QsrvMount {
 /// `setup_cp_links`, so a Passive CP holder's warm no-op'd.
 ///
 /// PVA links do NOT participate in `dbCaRun`'s wait, which blocks on CA
-/// links alone; pvxs pvalink never blocks iocInit. A `pva://` link that cannot connect therefore does not
+/// links alone; pvxs pvalink never blocks iocInit. A pva link that cannot connect therefore does not
 /// hold up PINI; it connects asynchronously in the background.
 ///
 /// pvxs allocates and starts its link machinery whatever `enable2()`
@@ -1228,15 +1228,15 @@ async fn serve_ca_pva_qsrv(
     // `IocApplication::register_link_type(...)`:
     //   * `"ca"`  — `calink_link_set_install`, by `run_qsrv_ioc_app`
     //   * `"pva"` — `pvalink_link_set_install`, by `run_qsrv_ioc_app`
-    // The hook fires BEFORE `setup_cp_links` (which warms Passive `ca://`
+    // The hook fires BEFORE `setup_cp_links` (which warms Passive CA
     // CP holders) and before record processing, so both link sets' CP
     // links are opened while iocInit runs. Installing either set here in
-    // Phase 3 is too late: a Passive `ca://` CP holder's
-    // `resolve_external_pv` warm would no-op, and a `pva://` CP link would
+    // Phase 3 is too late: a Passive CA CP holder's
+    // `resolve_external_pv` warm would no-op, and a pva CP link would
     // open only after record processing began.
     //
     // Only the `"ca"` set's local-target links are then held by `dbCaRun`'s
-    // wait; `pva://` links connect in the background and never block
+    // wait; pva links connect in the background and never block
     // iocInit (pvxs parity — pvalink does not wait at init).
     // The `dbcaxr` / `pvxr` / `dbpvxr` commands those installers
     // return are registered on the process's one command table at the hook

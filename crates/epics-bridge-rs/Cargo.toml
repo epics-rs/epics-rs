@@ -57,7 +57,7 @@ bringup-probes = ["epics-pva-rs?/bringup-probes"]
 # the record benches' x-asub-link.db names, as softIoc loads it from a .so.
 bench-subroutines = []
 # Record ↔ pvAccess channels (C++ QSRV equivalent). Pulls in `pvalink`
-# so a PVA-serving IOC resolves `pva://` record links out of the box —
+# so a PVA-serving IOC resolves pva record links out of the box —
 # symmetric with `calink-core`, the `ca` link set `run_qsrv_ioc_app`
 # installs. pvxs likewise ties pvalink to QSRV2 (`iochooks.cpp:461-496`).
 # The `epics-pva-rs/*` and `epics-ca-rs/client` entries restore what
@@ -274,7 +274,7 @@ required-features = ["dual-gateway-bin"]
 #
 # The gate is `qsrv-core,pvalink` and not the full `qsrv`: `qsrv` additionally
 # pulls `qsrv-bin` host machinery this target never runs, but `pvalink` — the
-# pva:// record-link resolver — is mounted on the target as of design stage 4.
+# pva record-link resolver — is mounted on the target as of design stage 4.
 # `pvalink` pulls `epics-pva-rs/client` (its UDP transport cfg-gated out so it
 # compiles for the triple) without `tls`/`pkcs12`, because the `epics-pva-rs`
 # dependency is `default-features = false`. Both features are `required-features`

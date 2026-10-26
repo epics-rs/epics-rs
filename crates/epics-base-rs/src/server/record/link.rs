@@ -650,8 +650,7 @@ pub enum ParsedLink {
     Db(std::sync::Arc<DbLink>),
     Ca(CaLink),
     /// PVA (`pvalink`) link whose payload is a verbatim channel name —
-    /// the string shorthand `{pva:"name"}` or the `pva://name` scheme
-    /// form. Per pvxs `pva_parse_string` (pvxs/ioc/pvalink_jlif.cpp:143-149) a
+    /// the string shorthand `{pva:"name"}`. Per pvxs `pva_parse_string` (pvxs/ioc/pvalink_jlif.cpp:143-149) a
     /// string pvalink IS the channel name: any `?`/`&` in it is link
     /// DATA, not option syntax. The structured JSON longhand with
     /// options is [`ParsedLink::PvaJson`] instead, so this variant's
@@ -882,9 +881,8 @@ pub struct PvaJsonLink {
     /// case [`parse_link_v2`] yields a plain [`ParsedLink::Pva`] rather
     /// than this variant.
     pub options: Box<[(String, JlinkValue)]>,
-    /// [`ParsedLink::external_pv_name`]: `pva://` then
     /// [`Self::link_identity_key`], made once by [`Self::new`].
-    qualified: Box<str>,
+    identity: Box<str>,
     open: OpenLatch,
     /// Bound when the link is a forward link.
     pub forward: ForwardSlot,
@@ -896,11 +894,11 @@ const _: () = assert!(std::mem::size_of::<ParsedLink>() <= 64);
 
 impl PvaJsonLink {
     pub fn new(pv: String, options: Vec<(String, JlinkValue)>) -> Self {
-        let qualified = format!("{PVA_SCHEME}{}", pvajson_identity_key(&pv, &options));
+        let identity = pvajson_identity_key(&pv, &options);
         Self {
             pv,
             options: options.into_boxed_slice(),
-            qualified: qualified.into_boxed_str(),
+            identity: identity.into_boxed_str(),
             open: OpenLatch::default(),
             forward: ForwardSlot::default(),
         }
@@ -923,12 +921,9 @@ impl PvaJsonLink {
     /// Delegates to [`pvajson_identity_key`] so the bridge can compute
     /// the identical key from the same `(pv, options)` at registration.
     pub fn link_identity_key(&self) -> &str {
-        &self.qualified[PVA_SCHEME.len()..]
+        &self.identity
     }
 }
-
-/// The scheme prefix a `pva` link's boundary name carries.
-const PVA_SCHEME: &str = "pva://";
 
 /// An external link's identity and the state C keeps on its `caLink`: a
 /// [`LinkSerial`] no other link has, set once its open is staged — the one
@@ -1016,10 +1011,32 @@ impl PartialEq for OpenLatch {
 
 impl Eq for OpenLatch {}
 
-/// An external link as a cycle addresses it: its boundary name and its
-/// identity.
+/// The link set an external link is addressed to. Typed rather than read
+/// back from the name: C hands `dbCaAddLink` any PV name verbatim, so no
+/// spelling of a name may select another set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum LinkSetTarget {
+    /// A `CA_LINK`: a `PV_LINK` no local record serves, or `{ca:…}`.
+    Ca,
+    /// A `{pva:…}` link, serviced by pvxs's `lsetPVX`.
+    Pva,
+}
+
+impl LinkSetTarget {
+    /// The scheme the set is registered under.
+    pub fn scheme(self) -> &'static str {
+        match self {
+            LinkSetTarget::Ca => "ca",
+            LinkSetTarget::Pva => "pva",
+        }
+    }
+}
+
+/// An external link as a cycle addresses it: its link set, its boundary
+/// name and its identity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ExternalRef<'a> {
+    pub lset: LinkSetTarget,
     pub name: &'a [u8],
     pub open: &'a OpenLatch,
 }
@@ -1076,7 +1093,7 @@ fn identity_field(field: &str) -> Option<Cow<'_, str>> {
 /// the escaped `pv`, then each option as `key=kind:value`, every one led
 /// by [`PVAJSON_IDENTITY_SEP`]. Sorting makes the key canonical regardless
 /// of option order. A link with no options whose `pv` needs no escape is
-/// keyed by the bare `pv`, the identity it shares with `pva://pv`.
+/// keyed by the bare `pv`, the identity it shares with `{pva:"pv"}`.
 pub fn pvajson_identity_key(pv: &str, options: &[(String, JlinkValue)]) -> String {
     let mut key = String::with_capacity(pv.len());
     push_identity_field(&mut key, pv, false);
@@ -1780,6 +1797,7 @@ impl DbLink {
     /// this IOC does not hold a CA link (`dbLink.c:118-130`).
     pub fn external(&self) -> ExternalRef<'_> {
         ExternalRef {
+            lset: LinkSetTarget::Ca,
             name: &self.pvname,
             open: &self.open,
         }
@@ -1818,7 +1836,7 @@ impl DbLink {
 /// than discarded as syntax. Mirrors the C link option parsed by
 /// `dbStaticLib.c:2375` and applied by `recGbl.c:263-281`. The PV name never
 /// carries trailing modifier tokens (they are stripped during parse);
-/// it may retain a `ca://` scheme prefix, which the resolver strips.
+/// it is the name as written, which C hands `dbCaAddLink` verbatim.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CaLink {
     pub pv: crate::types::RecordName,
@@ -1921,45 +1939,26 @@ impl PartialEq for ForwardSlot {
 
 impl Eq for ForwardSlot {}
 
-/// [`ParsedLink::Pva`]'s channel name, with its scheme-qualified boundary
-/// name ([`ParsedLink::external_pv_name`]) made once here so no cycle
-/// formats it, and the [`ForwardSlot`] it is opened into when it is a
-/// forward link. Derefs to the bare channel name.
+/// [`ParsedLink::Pva`]'s channel name and the [`ForwardSlot`] it is opened
+/// into when it is a forward link. Derefs to the channel name.
 #[derive(Clone, PartialEq, Eq)]
 pub struct PvaChannelLink {
-    qualified: Box<str>,
+    name: Box<str>,
     open: OpenLatch,
     pub forward: ForwardSlot,
-    /// Spelled `{pva:…}`, pvxs's `JSON_LINK`, rather than this port's
-    /// `pva://` scheme, which C parses as a `PV_LINK`
-    /// ([`ParsedLink::link_type_after_init`]).
-    json: bool,
 }
 
 impl PvaChannelLink {
     pub fn new(name: impl AsRef<str>) -> Self {
         Self {
-            qualified: format!("{PVA_SCHEME}{}", name.as_ref()).into_boxed_str(),
+            name: name.as_ref().into(),
             open: OpenLatch::default(),
             forward: ForwardSlot::default(),
-            json: false,
         }
-    }
-
-    /// The `{pva:"name"}` spelling of [`Self::new`].
-    pub fn json(name: impl AsRef<str>) -> Self {
-        Self {
-            json: true,
-            ..Self::new(name)
-        }
-    }
-
-    pub fn is_json(&self) -> bool {
-        self.json
     }
 
     pub fn name(&self) -> &str {
-        &self.qualified[PVA_SCHEME.len()..]
+        &self.name
     }
 }
 
@@ -2052,8 +2051,8 @@ pub enum LinkType {
     /// database. C `link.h` `#define DB_LINK 10`.
     Db,
     /// `CA_LINK` — a reference to a PV reached over Channel Access (a
-    /// remote PV, a link carrying `CA`/`CP`/`CPP`, or this port's `pva://`
-    /// scheme, a `PV_LINK` to C). C `link.h` `#define CA_LINK 11`.
+    /// remote PV, or a link carrying `CA`/`CP`/`CPP`). C `link.h`
+    /// `#define CA_LINK 11`.
     Ca,
     /// `JSON_LINK` — any link spelled in braces: `{const:…}`, `{pva:…}`,
     /// `{calc:…}`, `{state:…}`, `{ca:…}`. C `link.h` `#define JSON_LINK 8`.
@@ -2396,7 +2395,7 @@ impl ParsedLink {
     ///
     /// JSON is decided by the braces alone (`dbStaticLib.c:2280-2287`), not by
     /// what the JSON describes, so `{const:1}`, `{pva:"X"}` and `{ca:"X"}` are
-    /// `JSON_LINK` while `1` and `pva://X` are not.
+    /// `JSON_LINK` while `1` and `X` are not.
     #[must_use]
     pub fn db_link_type(&self) -> DbLinkType {
         match self {
@@ -2405,7 +2404,6 @@ impl ParsedLink {
             ParsedLink::Removed(ty) => *ty,
             ParsedLink::Db(_) => DbLinkType::PvLink,
             ParsedLink::Ca(c) if !c.json => DbLinkType::PvLink,
-            ParsedLink::Pva(p) if !p.is_json() => DbLinkType::PvLink,
             ParsedLink::Constant(_)
             | ParsedLink::Ca(_)
             | ParsedLink::Pva(_)
@@ -2432,14 +2430,13 @@ impl ParsedLink {
     /// `self` must be the stored link, past the database's locality pass
     /// (`PvDatabase::relink`), which is where a `PV_LINK` naming no local
     /// record became a CA channel. What is left is C's other `CA_LINK` rule:
-    /// a `PV_LINK` carrying `CA`, `CP` or `CPP`, or naming a scheme C does
-    /// not parse (`pva://X` is a `PV_LINK` to a record C cannot find), is
-    /// sent to `dbCaAddLink`. Every other type is the parse's.
+    /// a `PV_LINK` carrying `CA`, `CP` or `CPP` is sent to `dbCaAddLink`.
+    /// Every other type is the parse's.
     pub fn link_type_after_init(&self) -> DbLinkType {
         match self.db_link_type() {
             DbLinkType::PvLink => match self {
                 ParsedLink::Db(_) => DbLinkType::DbLink,
-                ParsedLink::Ca(_) | ParsedLink::Pva(_) => DbLinkType::CaLink,
+                ParsedLink::Ca(_) => DbLinkType::CaLink,
                 // A removed DB or CA link: `dbDbRemoveLink` / `dbCaRemoveLink`
                 // leave `PV_LINK` (`dbDbLink.c:132`, `dbCa.c:441`).
                 _ => DbLinkType::PvLink,
@@ -2543,6 +2540,7 @@ impl ParsedLink {
         match self {
             ParsedLink::Ca(ca) => Some(ExternalForward::Ca {
                 link: ExternalRef {
+                    lset: LinkSetTarget::Ca,
                     name: ca.pv.as_bytes(),
                     open: &ca.open,
                 },
@@ -2558,9 +2556,9 @@ impl ParsedLink {
     /// link, else `None` — the key the database hands the link-set when
     /// resolving / writing / forwarding this link.
     ///
-    /// For `Ca` this is the channel name verbatim, for `Pva` the name under
-    /// `pva://`. For `PvaJson` it is the per-link identity key
-    /// ([`PvaJsonLink::link_identity_key`]) under `pva://`, NOT the bare `pv`:
+    /// For `Ca` and `Pva` this is the channel name verbatim. For `PvaJson`
+    /// it is the per-link identity key
+    /// ([`PvaJsonLink::link_identity_key`]), NOT the bare `pv`:
     /// two structured links to the same PV that differ by options must
     /// resolve to their own per-link config, so the boundary key must
     /// carry that identity (the resolver shares the channel by
@@ -2579,18 +2577,18 @@ impl ParsedLink {
     pub fn external(&self) -> Option<ExternalRef<'_>> {
         match self {
             ParsedLink::Ca(ca) => Some(ExternalRef {
+                lset: LinkSetTarget::Ca,
                 name: &ca.pv,
                 open: &ca.open,
             }),
-            // Scheme-qualified: `split_external_link_name` reads the prefix
-            // back into the `pva` scheme, and a bare name is a CA
-            // link. The lset itself still sees the unprefixed body.
             ParsedLink::Pva(name) => Some(ExternalRef {
-                name: name.qualified.as_bytes(),
+                lset: LinkSetTarget::Pva,
+                name: name.name.as_bytes(),
                 open: &name.open,
             }),
             ParsedLink::PvaJson(j) => Some(ExternalRef {
-                name: j.qualified.as_bytes(),
+                lset: LinkSetTarget::Pva,
+                name: j.identity.as_bytes(),
                 open: &j.open,
             }),
             _ => None,
@@ -2605,21 +2603,20 @@ impl ParsedLink {
     /// and this is the second one. The first is `{pva:…}` loading at all,
     /// which needs the database to declare the type (`LinkList`) as C needs
     /// `pvxs7x.dbd`'s `link()` line. A declared type can still reach iocInit
-    /// with no link set installed, and so can `pva://`, which C has no
-    /// `link()` gate for; `PvDatabase::db_init_link_locality` asks this and
-    /// refuses both rather than letting the lset dispatch hand the bare name
-    /// to whatever OTHER lset is registered.
+    /// with no link set installed; `PvDatabase::db_init_link_locality` asks
+    /// this and refuses it rather than letting the lset dispatch hand the
+    /// name to whatever OTHER lset is registered.
     ///
     /// `Ca` deliberately answers `None`. The parse erases the difference
-    /// between `ca://X`, `{ca:{pv:"X"}}`, the `X CA` modifier and the
-    /// `dbInitLink` non-local fallthrough — all four are `Ca(CaLink{pv:"X"})`
-    /// — and the last two must keep working with no lset registered, through
-    /// the database's own `ca` link set.
+    /// between `{ca:{pv:"X"}}`, the `X CA` modifier and the `dbInitLink`
+    /// non-local fallthrough — all three are `Ca(CaLink{pv:"X"})` — and the
+    /// last two must keep working with no lset registered, through the
+    /// database's own `ca` link set.
     /// There is no C rule to match either: `ca` has no `link()` line in base
     /// or in pvxs, so it is this port's own extension.
     pub fn required_link_set_scheme(&self) -> Option<&'static str> {
         match self {
-            // Produced only by `pva://…` and `{pva:…}` — see the `pva` row of
+            // Produced only by `{pva:…}` — see the `pva` row of
             // `IMPLEMENTED_JSON_LINK_TYPES`, whose `lsetPVX` is what
             // `epics-bridge-rs` installs as the `"pva"` link set.
             ParsedLink::Pva(_) | ParsedLink::PvaJson(_) => Some("pva"),
@@ -3809,7 +3806,7 @@ fn try_parse_json_link_body(
                 // and at a put, then segfaults at the record's first process
                 // (`pvaDoLocked` on the never-opened channel,
                 // `pvalink_lset.cpp:702`); the port reads it unconnected.
-                PvaRootValue::Ignored => Some(ParsedLink::Pva(PvaChannelLink::json(""))),
+                PvaRootValue::Ignored => Some(ParsedLink::Pva(PvaChannelLink::new(""))),
                 PvaRootValue::Object(obj) => {
                     if key == "ca" {
                         // JSON CA links carry no plain-text MS modifier and
@@ -3827,7 +3824,7 @@ fn try_parse_json_link_body(
                         let (pv, options) = extract_pv_and_opts_from_subobject(obj)?;
                         let pv = pv.unwrap_or_default();
                         if options.is_empty() {
-                            Some(ParsedLink::Pva(PvaChannelLink::json(pv)))
+                            Some(ParsedLink::Pva(PvaChannelLink::new(pv)))
                         } else {
                             Some(ParsedLink::PvaJson(Box::new(PvaJsonLink::new(pv, options))))
                         }
@@ -3842,7 +3839,7 @@ fn try_parse_json_link_body(
                     if key == "ca" {
                         Some(ParsedLink::Ca(CaLink::json(name, ftype)))
                     } else {
-                        Some(ParsedLink::Pva(PvaChannelLink::json(name)))
+                        Some(ParsedLink::Pva(PvaChannelLink::new(name)))
                     }
                 }
             }
@@ -4448,9 +4445,7 @@ pub(crate) fn warn_discarded_cp(record: &[u8], field: &str, ftype: LinkFieldType
 /// (`:2375-2378`) in the order `NMS, MSI, MSS, MS`, longest match first.
 ///
 /// Returns `(target, policy, monitor_switch, force_ca)` with `ftype`'s modifier
-/// mask ([`LinkFieldType::mask`]) already applied. Shared by the plain-text path
-/// and the `ca://` scheme path so `ca://PV MS` parses its `MS` instead of
-/// folding it into the PV name.
+/// mask ([`LinkFieldType::mask`]) already applied.
 fn split_link_modifiers(
     s: &[u8],
     ftype: LinkFieldType,
@@ -4601,7 +4596,7 @@ fn parse_link_bytes(s: &[u8], ftype: LinkFieldType) -> ParsedLink {
     // `"<number> <modifier>"` link into a constant: `SDIS="3 NPP"` with
     // `DISV=3` would disable the record forever, and `OUT="5 PP"` would drop
     // the write instead of alarming. Keep this test above
-    // `split_link_modifiers`, and above the scheme links, which are not numbers.
+    // `split_link_modifiers`.
     if parse_c_double(text).is_some() {
         return ParsedLink::constant(text);
     }
@@ -4609,34 +4604,10 @@ fn parse_link_bytes(s: &[u8], ftype: LinkFieldType) -> ParsedLink {
 }
 
 /// The tail of [`parse_link_field`] that reads the text as a PV name: the
-/// scheme links, the array constant and the modifier split, all of them on
-/// the name's bytes.
+/// array constant and the modifier split, both on the name's bytes. C reads
+/// no scheme (`dbStaticLib.c:2280-2356`): `ca://X` and `pva://X` are PV
+/// names like any other.
 fn parse_name_link(s: &[u8], ftype: LinkFieldType) -> ParsedLink {
-    // CA/PVA protocol links. a `ca://PV MS` link carries
-    // the same trailing maximize-severity modifiers as the legacy form,
-    // so strip them off the scheme body before storing the PV name —
-    // otherwise `MS` would be folded into the PV name (`"PV MS"`). The
-    // parsed `MS`/`NMS`/`MSI`/`MSS` switch rides in the `CaLink` so the
-    // alarm gate is applied at the record-processing boundary.
-    if let Some(rest) = s.strip_prefix(b"ca://") {
-        let (pv, policy, ms, _force_ca) = split_link_modifiers(rest, ftype);
-        return ParsedLink::Ca(CaLink {
-            pv: pv.into(),
-            monitor_switch: ms,
-            // Carry the parsed CP/CPP policy so `ca://OTHER:PV CPP`
-            // drives holder processing;
-            // pre-fix it was discarded into a bare latest-value link.
-            policy,
-            fwd: ca_forward_flag(ftype, pv),
-            open: OpenLatch::ca(policy, ftype),
-            json: false,
-        });
-    }
-    if let Some(rest) = s.strip_prefix(b"pva://") {
-        // PVA names are text until the PVA name layer.
-        return ParsedLink::Pva(String::from_utf8_lossy(rest).as_ref().into());
-    }
-
     // Array constant. C `dbParseLink` (`dbStaticLib.c:2354-2357`), right after
     // the scalar-constant test:
     //
@@ -4847,7 +4818,7 @@ mod json_link_tests {
     fn json_pva_link() {
         assert_eq!(
             parse_link_v2(r#"{pva: { pv: "FOO:bar" }}"#),
-            ParsedLink::Pva(PvaChannelLink::json("FOO:bar"))
+            ParsedLink::Pva(PvaChannelLink::new("FOO:bar"))
         );
     }
 
@@ -4872,7 +4843,7 @@ mod json_link_tests {
     fn json_pva_link_string_shorthand() {
         assert_eq!(
             parse_link_v2(r#"{pva: "TARGET:AI"}"#),
-            ParsedLink::Pva(PvaChannelLink::json("TARGET:AI"))
+            ParsedLink::Pva(PvaChannelLink::new("TARGET:AI"))
         );
     }
 
@@ -4891,7 +4862,7 @@ mod json_link_tests {
     fn json_pva_link_string_shorthand_single_quotes() {
         assert_eq!(
             parse_link_v2(r#"{pva: 'invalid:pv:name'}"#),
-            ParsedLink::Pva(PvaChannelLink::json("invalid:pv:name"))
+            ParsedLink::Pva(PvaChannelLink::new("invalid:pv:name"))
         );
     }
 
@@ -4959,7 +4930,7 @@ mod json_link_tests {
         );
         assert_eq!(
             parse_link_v2(r#"{pva: {pv: "A,B"}}"#),
-            ParsedLink::Pva(PvaChannelLink::json("A,B"))
+            ParsedLink::Pva(PvaChannelLink::new("A,B"))
         );
     }
 
@@ -5010,11 +4981,11 @@ mod json_link_tests {
         // Accepted roots: string shorthand and object longhand.
         assert_eq!(
             parse_link_v2(r#"{pva: "TARGET"}"#),
-            ParsedLink::Pva(PvaChannelLink::json("TARGET"))
+            ParsedLink::Pva(PvaChannelLink::new("TARGET"))
         );
         assert_eq!(
             parse_link_v2(r#"{pva: { pv: "TARGET" }}"#),
-            ParsedLink::Pva(PvaChannelLink::json("TARGET"))
+            ParsedLink::Pva(PvaChannelLink::new("TARGET"))
         );
 
         for src in [
@@ -5026,7 +4997,7 @@ mod json_link_tests {
         ] {
             assert_eq!(
                 parse_link_v2(src),
-                ParsedLink::Pva(PvaChannelLink::json("")),
+                ParsedLink::Pva(PvaChannelLink::new("")),
                 "{src}"
             );
         }
@@ -5264,14 +5235,6 @@ mod json_link_tests {
         assert_eq!(parse_link_v2("REC.VAL").link_type(), LinkType::Db);
         assert_eq!(parse_link_v2("REC").link_type(), LinkType::Db);
         assert_eq!(parse_link_v2("REC.VAL PP").link_type(), LinkType::Db);
-    }
-
-    /// C reads no scheme: `ca://X` and `pva://X` are `PV_LINK`s no local
-    /// record serves, which `dbInitLink` makes `CA_LINK` (`dbLink.c:76-110`).
-    #[test]
-    fn link_type_url_links_are_ca() {
-        assert_eq!(parse_link_v2("ca://REMOTE:PV").link_type(), LinkType::Ca);
-        assert_eq!(parse_link_v2("pva://REMOTE:PV").link_type(), LinkType::Ca);
     }
 
     /// BOUNDARY: a comment inside a `.db` link body. `yajl_alloc` sets
@@ -5550,48 +5513,32 @@ mod json_link_tests {
         }
     }
 
+    /// No link text is a scheme. C `dbParseLink` (`dbStaticLib.c:2280-2356`)
+    /// has three tests — braces, a number, else a PV link — so `pva://X` and
+    /// `ca://X` are PV names, the `MS` after them a modifier, and nothing
+    /// has to be installed to serve them.
     #[test]
-    fn ca_scheme_link_parses_ms_modifier() {
-        // `ca://PV MS` must strip the modifier off the
-        // scheme body — pre-fix the PV name became `"PV MS"`.
-        assert_eq!(
-            parse_link_v2("ca://SR:DCCT MS"),
-            ParsedLink::Ca(CaLink {
-                pv: "SR:DCCT".into(),
-                monitor_switch: MonitorSwitch::Maximize,
-                policy: LinkProcessPolicy::NoProcess,
-                fwd: false,
-                open: OpenLatch::default(),
-                json: false,
-            })
-        );
-        assert_eq!(
-            parse_link_v2("ca://SR:DCCT MSI"),
-            ParsedLink::Ca(CaLink {
-                pv: "SR:DCCT".into(),
-                monitor_switch: MonitorSwitch::MaximizeIfInvalid,
-                policy: LinkProcessPolicy::NoProcess,
-                fwd: false,
-                open: OpenLatch::default(),
-                json: false,
-            })
-        );
-        assert_eq!(
-            parse_link_v2("ca://SR:DCCT MSS"),
-            ParsedLink::Ca(CaLink {
-                pv: "SR:DCCT".into(),
-                monitor_switch: MonitorSwitch::MaximizeStatus,
-                policy: LinkProcessPolicy::NoProcess,
-                fwd: false,
-                open: OpenLatch::default(),
-                json: false,
-            })
-        );
-        // Bare `ca://PV` → default NoMaximize, PV name intact.
-        assert_eq!(
-            parse_link_v2("ca://SR:DCCT"),
-            ParsedLink::Ca(CaLink::new("SR:DCCT"))
-        );
+    fn a_scheme_spelling_is_a_pv_name() {
+        for (text, pv, ms) in [
+            (
+                "pva://TARGET:AI?field=x",
+                "pva://TARGET:AI?field=x",
+                MonitorSwitch::NoMaximize,
+            ),
+            ("ca://SR:DCCT MS", "ca://SR:DCCT", MonitorSwitch::Maximize),
+        ] {
+            let link = parse_link_v2(text);
+            let ParsedLink::Db(db) = &link else {
+                panic!("{text}: not a PV link");
+            };
+            assert_eq!(*db.pvname(), pv);
+            assert_eq!(db.monitor_switch, ms);
+            assert_eq!(link.db_link_type(), DbLinkType::PvLink);
+            assert_eq!(link.required_link_set_scheme(), None);
+        }
+        let link = parse_link_v2("pva://X CA");
+        let ext = link.external().expect("a CA link is external");
+        assert_eq!((ext.lset, ext.name), (LinkSetTarget::Ca, &b"pva://X"[..]));
     }
 
     #[test]
@@ -5648,32 +5595,19 @@ mod json_link_tests {
     fn json_pva_string_shorthand_keeps_query_chars_verbatim() {
         assert_eq!(
             parse_link_v2(r#"{pva: "TARGET:AI?field=x"}"#),
-            ParsedLink::Pva(PvaChannelLink::json("TARGET:AI?field=x"))
+            ParsedLink::Pva(PvaChannelLink::new("TARGET:AI?field=x"))
         );
     }
 
-    /// The `pva://` scheme form is likewise a verbatim channel name; a
-    /// `?` is not split out as options.
+    /// `external` addresses a PvaJson link to the `pva` set by its per-link
+    /// identity key (pv + canonical options), not the bare PV — so two
+    /// same-PV links that differ by options resolve to distinct configs.
     #[test]
-    fn pva_scheme_keeps_query_chars_verbatim() {
-        assert_eq!(
-            parse_link_v2("pva://TARGET:AI?field=x"),
-            ParsedLink::Pva("TARGET:AI?field=x".into())
-        );
-    }
-
-    /// `external_pv_name` returns a PvaJson link's per-link identity key
-    /// (pv + canonical options), not the bare PV — so two same-PV links
-    /// that differ by options resolve to distinct configs — under the
-    /// `pva://` scheme prefix, which is what keeps the boundary dispatch on
-    /// the `pva` scheme instead of the bare name's `ca`.
-    /// The lset itself is still handed the unprefixed key:
-    /// `split_external_link_name` takes the prefix back off.
-    #[test]
-    fn pva_json_external_pv_name() {
+    fn pva_json_external_link() {
         let link = parse_link_v2(r#"{pva: {pv: "TARGET:AI", proc: "CP"}}"#);
-        let key = link.external_pv_name().expect("PvaJson carries a key");
-        assert_eq!(key, &b"pva://TARGET:AI\x1fproc=s:CP"[..]);
+        let ext = link.external().expect("PvaJson carries a key");
+        assert_eq!(ext.lset, LinkSetTarget::Pva);
+        assert_eq!(ext.name, &b"TARGET:AI\x1fproc=s:CP"[..]);
         assert_eq!(link.link_type(), LinkType::Json);
         assert!(link.is_writable_out_link());
     }
@@ -5753,7 +5687,7 @@ mod json_link_tests {
     fn br_r10_json_pva_bare_pv_unchanged() {
         assert_eq!(
             parse_link_v2(r#"{pva: { pv: "FOO:bar" }}"#),
-            ParsedLink::Pva(PvaChannelLink::json("FOO:bar"))
+            ParsedLink::Pva(PvaChannelLink::new("FOO:bar"))
         );
     }
 

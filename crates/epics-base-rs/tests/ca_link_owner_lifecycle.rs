@@ -78,7 +78,7 @@ async fn an_external_put_starts_no_worker() {
     )
     .await
     .unwrap();
-    db.put_pv_no_process("O.OUT", EpicsValue::String("ca://X".into()))
+    db.put_pv_no_process("O.OUT", EpicsValue::String("X CA".into()))
         .await
         .unwrap();
     {

@@ -1,4 +1,4 @@
-//! External-link put parity with C `dbCa.c`: a record's `ca://`/`pva://` OUT
+//! External-link put parity with C `dbCa.c`: a record's CA / pva OUT
 //! write is STAGED on the database's link-put queue and the record returns —
 //! the wire write happens on the queue owner, never inside the record's
 //! advisory write gate.
@@ -194,7 +194,7 @@ async fn plain_put_returns_before_the_wire_write_completes() {
     .await;
     db.process_cp_links_on_connect().await;
 
-    add_ao(&db, "AO_ENQ", "ca://REMOTE:OUT", 3.5).await;
+    add_ao(&db, "AO_ENQ", "REMOTE:OUT CA", 3.5).await;
     process(&db, "AO_ENQ").await;
 
     // process() has returned. The write is only now reaching the lset...
@@ -242,7 +242,7 @@ async fn disconnected_link_stages_nothing_and_alarms() {
     .await;
     db.process_cp_links_on_connect().await;
 
-    add_ao(&db, "AO_DOWN", "ca://REMOTE:OUT", 1.0).await;
+    add_ao(&db, "AO_DOWN", "REMOTE:OUT CA", 1.0).await;
     process(&db, "AO_DOWN").await;
     db.sync_external_link_puts().await;
 
@@ -293,7 +293,7 @@ async fn pending_put_is_overwritten_latest_wins() {
     .await;
     db.process_cp_links_on_connect().await;
 
-    add_ao(&db, "AO_COALESCE", "ca://REMOTE:OUT", 1.0).await;
+    add_ao(&db, "AO_COALESCE", "REMOTE:OUT CA", 1.0).await;
     process(&db, "AO_COALESCE").await;
     assert_eq!(
         entered_rx.recv().await,
@@ -337,7 +337,7 @@ async fn per_link_put_ordering_is_preserved() {
         .await;
     db.process_cp_links_on_connect().await;
 
-    add_ao(&db, "AO_ORDER", "ca://REMOTE:OUT", 1.0).await;
+    add_ao(&db, "AO_ORDER", "REMOTE:OUT CA", 1.0).await;
     for v in [1.0, 2.0, 3.0, 4.0] {
         set_val(&db, "AO_ORDER", v).await;
         process(&db, "AO_ORDER").await;
@@ -387,7 +387,7 @@ async fn async_put_completion_is_reported_to_its_writer() {
     .await;
     db.process_cp_links_on_connect().await;
 
-    add_ao(&db, "AO_NOTIFY", "ca://REMOTE:OUT", 0.0).await;
+    add_ao(&db, "AO_NOTIFY", "REMOTE:OUT CA", 0.0).await;
     let unprocessed = alarm_of(&db, "AO_NOTIFY").await;
     let mut notify_rx = db
         .put_link_notify("AO_NOTIFY", "OUT", EpicsValue::Double(9.0))
@@ -455,7 +455,7 @@ async fn async_put_wire_failure_settles_the_writer_without_alarming() {
     .await;
     db.process_cp_links_on_connect().await;
 
-    add_ao(&db, "AO_NOTIFY_ERR", "ca://REMOTE:OUT", 0.0).await;
+    add_ao(&db, "AO_NOTIFY_ERR", "REMOTE:OUT CA", 0.0).await;
     let unprocessed = alarm_of(&db, "AO_NOTIFY_ERR").await;
     let notify_rx = db
         .put_link_notify("AO_NOTIFY_ERR", "OUT", EpicsValue::Double(4.0))
@@ -509,8 +509,8 @@ async fn a_blocked_link_does_not_stall_other_links() {
     .await;
     db.process_cp_links_on_connect().await;
 
-    add_ao(&db, "AO_SLOW", "ca://SLOW:OUT", 1.0).await;
-    add_ao(&db, "AO_FAST", "ca://FAST:OUT", 2.0).await;
+    add_ao(&db, "AO_SLOW", "SLOW:OUT CA", 1.0).await;
+    add_ao(&db, "AO_FAST", "FAST:OUT CA", 2.0).await;
 
     process(&db, "AO_SLOW").await;
     assert_eq!(entered_rx.recv().await, Some(1.0), "SLOW:OUT is blocked");

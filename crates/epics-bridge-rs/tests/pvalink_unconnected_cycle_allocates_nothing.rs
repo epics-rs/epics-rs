@@ -50,7 +50,6 @@ static GLOBAL: Counting = Counting;
 
 const DB: &str = r#"
 record(ai, "PL:AI") { field(INP, {pva:"PL:NOPE"}) }
-record(ai, "PL:AIURL") { field(INP, "pva://PL:NOPE") }
 record(calc, "PL:CALC") { field(INPA, {pva:"PL:NOPE"}) field(CALC, "A") }
 record(ao, "PL:AO") { field(OUT, {pva:"PL:NOPE"}) }
 "#;
@@ -91,7 +90,7 @@ async fn an_unconnected_pva_link_cycle_allocates_nothing() {
         .await
         .unwrap();
     db.ioc_init().await;
-    for rec in ["PL:AI", "PL:AIURL", "PL:CALC", "PL:AO"] {
+    for rec in ["PL:AI", "PL:CALC", "PL:AO"] {
         assert_eq!(allocs(db.clone(), rec), 0, "{rec}");
     }
 }

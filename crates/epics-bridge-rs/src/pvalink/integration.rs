@@ -7,7 +7,7 @@
 //!    spawn seam — `tokio::spawn` on the host, the callback pool on the
 //!    RTEMS target where no tokio runtime exists.
 //! 2. [`install_pvalink_resolver`] registers the resolver as the database's
-//!    `pva` link set. Records with `INP=pva://...` then resolve through the
+//!    `pva` link set. Records with `INP={pva:…}` then resolve through the
 //!    registry instead of returning `None`.
 //! 3. INP links are pre-warmed via [`PvaLinkResolver::open`] (also exposed
 //!    as the `pvxr` iocsh command) so the synchronous cached read can
@@ -66,16 +66,14 @@ pub struct PvaLinkResolver {
     enabled: Arc<std::sync::atomic::AtomicBool>,
     /// Per-PV link-option overrides.
     ///
-    /// The `epics-base-rs` link parser collapses `pva://X?sevr=MS`
-    /// (and the legacy `pva://X MS` suffix form) down to a bare PV
-    /// name in `ParsedLink::Pva`, dropping every query option before
-    /// the bridge resolver is consulted. To keep B2 (`MS`/`NMS`) and
-    /// the B4 options effective on the resolver hot path, the bridge
-    /// stashes the parsed [`PvaLinkConfig`] here keyed by PV name when
-    /// a full link string is opened via [`Self::open_link`]; the
-    /// resolver then reuses those options instead of the `NMS`/Q=4
-    /// defaults. Mirrors the role of pvxs `pvaLinkConfig` carried on
-    /// the `jlink` for the lifetime of the link.
+    /// A link set name may carry its options as a `?sevr=MS` query or a
+    /// legacy ` MS` suffix, which the bare-PV registry key drops. To keep
+    /// B2 (`MS`/`NMS`) and the B4 options effective on the resolver hot
+    /// path, the bridge stashes the parsed [`PvaLinkConfig`] here keyed by
+    /// PV name when a full link string is opened via [`Self::open_link`];
+    /// the resolver then reuses those options instead of the `NMS`/Q=4
+    /// defaults. Mirrors the role of pvxs `pvaLinkConfig` carried on the
+    /// `jlink` for the lifetime of the link.
     link_options: Arc<LinkCfgMap>,
     /// Per-PV OUT link-option overrides.
     ///
@@ -313,7 +311,8 @@ impl PvaLinkResolver {
         // scheme-stripped link string (including any `?query`), so two
         // links to the same PV with different options each keep their
         // own entry.
-        let options_key = strip_scheme(link_string.as_bytes())
+        let options_key = link_string
+            .strip_prefix("pva://")
             .unwrap_or(link_string)
             .to_string();
         self.open_inp_cfg(cfg, options_key, holder).await
@@ -587,7 +586,8 @@ impl PvaLinkResolver {
     ) -> PvaLinkResult<Arc<PvaLink>> {
         let cfg = PvaLinkConfig::parse(link_string, LinkDirection::Out)?;
         // key by full link string (same rationale as open_link_inner).
-        let options_key = strip_scheme(link_string.as_bytes())
+        let options_key = link_string
+            .strip_prefix("pva://")
             .unwrap_or(link_string)
             .to_string();
         self.open_out_cfg(cfg, options_key, holder).await
@@ -680,7 +680,7 @@ impl PvaLinkResolver {
         // caller. pvxs `pvaLinkConfig` is per-link and the channel is
         // keyed by `(channelName, pvRequest)`
         // (`pvxs/ioc/pvalink.h:65,116-120`).
-        let full = strip_scheme(pv_name.as_bytes())?;
+        let full = pv_name;
         let cfg = self.inp_cfg_for(full);
         let sevr = cfg.sevr;
         self.registry
@@ -1086,7 +1086,7 @@ impl LinkSet for PvaLinkResolver {
     fn is_connected(&self, link: LinkRef<'_>) -> bool {
         // A link that has not been opened reports "not connected"; the
         // resolver hot path or `pvxr` opens it lazily.
-        let Some(full) = strip_scheme(link.name) else {
+        let Some(full) = link_text(link.name) else {
             return false;
         };
         // resolve THIS link's monitor variant. `link_names()` hands back
@@ -1107,7 +1107,7 @@ impl LinkSet for PvaLinkResolver {
         if !self.is_enabled() {
             return None;
         }
-        let full = strip_scheme(link.name)?;
+        let full = link_text(link.name)?;
         // the per-link config, for the field selector.
         let cfg = self.inp_cfg_for(full);
 
@@ -1149,7 +1149,7 @@ impl LinkSet for PvaLinkResolver {
         if !self.is_enabled() {
             return None;
         }
-        let full = strip_scheme(link.name)?;
+        let full = link_text(link.name)?;
         let cfg = self.inp_cfg_for(full);
         let link = self
             .registry
@@ -1166,7 +1166,7 @@ impl LinkSet for PvaLinkResolver {
         if !self.is_enabled() {
             return false;
         }
-        let Some(full) = strip_scheme(link.name) else {
+        let Some(full) = link_text(link.name) else {
             return false;
         };
         let cfg = self.inp_cfg_for(full);
@@ -1181,7 +1181,7 @@ impl LinkSet for PvaLinkResolver {
     /// holder is attached under the caller's hold, and its channel opened on
     /// the reactor.
     fn open_link(&self, holder: LinkHolder<'_>, link: LinkRef<'_>) -> LinkOpen {
-        let Some(full) = strip_scheme(link.name) else {
+        let Some(full) = link_text(link.name) else {
             return LinkOpen::Lset;
         };
         let direction = holder_direction(holder.class());
@@ -1217,7 +1217,7 @@ impl LinkSet for PvaLinkResolver {
     ) -> Vec<String> {
         use super::iocsh::{proc_label, sevr_label};
         use std::fmt::Write;
-        let Some(full) = strip_scheme(link.name) else {
+        let Some(full) = link_text(link.name) else {
             return Vec::new();
         };
         let cfg = match holder_direction(class) {
@@ -1260,7 +1260,7 @@ impl LinkSet for PvaLinkResolver {
 
     /// pvxs `pvaRemoveLink` (`pvxs/ioc/pvalink_lset.cpp:176-185`).
     fn remove_link(&self, holder: LinkHolder<'_>, link: LinkRef<'_>) {
-        let Some(full) = strip_scheme(link.name) else {
+        let Some(full) = link_text(link.name) else {
             return;
         };
         let cfg = match holder_direction(holder.class()) {
@@ -1281,7 +1281,7 @@ impl LinkSet for PvaLinkResolver {
         if !self.is_enabled() {
             return;
         }
-        let Some(full) = strip_scheme(link.name) else {
+        let Some(full) = link_text(link.name) else {
             return;
         };
         let cfg = self.inp_cfg_for(full);
@@ -1307,8 +1307,9 @@ impl LinkSet for PvaLinkResolver {
             // record alarms in this cycle, as a `-1` from C does.
             return PutAdmission::Refused;
         }
-        let Some(full) = strip_scheme(link.name) else {
-            // A `ca://` name reaching the pva lset: `put_value` rejects it.
+        let Some(full) = link_text(link.name) else {
+            // A name that is not UTF-8 names no PVA channel: `put_value`
+            // rejects it.
             return PutAdmission::Refused;
         };
         let cfg = self.out_cfg_for(full);
@@ -1344,9 +1345,9 @@ impl LinkSet for PvaLinkResolver {
         // (`record._options.block`) — pvxs `pvaPutValueAsync`. A plain
         // OUT write is fire-and-forget (`pvaPutValue`, block off).
         let block = matches!(op, LinkPutOp::Async);
-        let full = strip_scheme(link.name).ok_or_else(|| {
+        let full = link_text(link.name).ok_or_else(|| {
             format!(
-                "pvalink rejects ca:// scheme: {} (use the CA-link path instead)",
+                "pvalink: link name is not UTF-8: {}",
                 String::from_utf8_lossy(link.name)
             )
         })?;
@@ -1375,9 +1376,9 @@ impl LinkSet for PvaLinkResolver {
     /// thread (C's `CA_CONNECT`), so a `PvaForward` dispatch only gates
     /// and signals.
     fn forward_handle(&self, link: LinkRef<'_>) -> Box<dyn LinkForward> {
-        let Some(full) = strip_scheme(link.name) else {
+        let Some(full) = link_text(link.name) else {
             epics_base_rs::stderr_println!(
-                "pvalink rejects ca:// scheme: {} (use the CA-link path instead)",
+                "pvalink: link name is not UTF-8: {}",
                 String::from_utf8_lossy(link.name)
             );
             return Box::new(RefusedForward);
@@ -1410,7 +1411,7 @@ impl LinkSet for PvaLinkResolver {
         // different caller, so `default_inp_cfg(bare)` would discard
         // this caller's `?sevr=` option. pvxs `pvaLinkConfig::sevr`
         // is per-link (`pvxs/ioc/pvalink.h:65`).
-        let full = strip_scheme(link.name)?;
+        let full = link_text(link.name)?;
         let cfg = self.inp_cfg_for(full);
         let sevr = cfg.sevr;
         let field = &cfg.field;
@@ -1434,7 +1435,7 @@ impl LinkSet for PvaLinkResolver {
         // apply the caller's own `sevr` mode (parsed from the
         // caller's full link config), not the cached link's shared
         // `config.sevr`.
-        let full = strip_scheme(link.name)?;
+        let full = link_text(link.name)?;
         let cfg = self.inp_cfg_for(full);
         let sevr = cfg.sevr;
         let field = &cfg.field;
@@ -1461,7 +1462,7 @@ impl LinkSet for PvaLinkResolver {
         // (`pvxs/ioc/pvalink_lset.cpp:542-569`) reads the snapshot directly. The
         // per-link `field` still selects the metadata root, matching the
         // value/alarm getters.
-        let full = strip_scheme(link.name)?;
+        let full = link_text(link.name)?;
         let cfg = self.inp_cfg_for(full);
         let field = &cfg.field;
         // Cache-only: C's `getAttributes` family reads `pca->...` and never creates
@@ -1477,7 +1478,7 @@ impl LinkSet for PvaLinkResolver {
     }
 
     fn time_stamp(&self, link: LinkRef<'_>) -> Option<(i64, i32, u64)> {
-        let full = strip_scheme(link.name)?;
+        let full = link_text(link.name)?;
         let cfg = self.inp_cfg_for(full);
         // Cache-only: C's `getAttributes` family reads `pca->...` and never creates
         // a channel (`dbCa.c:633-675`); pvxs's metadata getters read the cached NT
@@ -1499,7 +1500,7 @@ impl LinkSet for PvaLinkResolver {
         if !self.is_enabled() {
             return None;
         }
-        let cfg = self.inp_cfg_for(strip_scheme(link.name)?);
+        let cfg = self.inp_cfg_for(link_text(link.name)?);
         if !cfg.time {
             return None;
         }
@@ -1533,7 +1534,7 @@ impl LinkSet for PvaLinkResolver {
         // sub-field, not whichever cached INP link is shared. pvxs
         // `pvaGetDBFtype` reads the per-link `fld_value`
         // (`pvxs/ioc/pvalink_lset.cpp:199`).
-        let full = strip_scheme(link.name)?;
+        let full = link_text(link.name)?;
         let cfg = self.inp_cfg_for(full);
         let field = &cfg.field;
         // Cache-only: C's `getAttributes` family reads `pca->...` and never creates
@@ -1552,7 +1553,7 @@ impl LinkSet for PvaLinkResolver {
         // The [`LinkSet::link_names`] enumeration contract: surface one
         // identity per open channel, for link introspection.
         // NOT consumed by `dbCaRun`'s wait, which is CA-facility only;
-        // pvalink never blocks iocInit (pvxs parity). A `pva://` monitor
+        // pvalink never blocks iocInit (pvxs parity). A pva monitor
         // connects in the background.
         //
         // Each name is a canonical link string that round-trips back to
@@ -1577,16 +1578,6 @@ impl LinkSet for PvaLinkResolver {
     }
 }
 
-/// Strip the `pva://` scheme prefix the bridge sometimes prepends.
-/// Pvalink only handles PVA — `ca://` is the libca scheme and is
-/// dispatched by the CA-link path elsewhere, so an explicit `ca://`
-/// here returns `None` so the caller can short-circuit, as does a name
-/// that is not UTF-8. Names with no scheme are passed through.
-///
-/// NOTE: the returned string may still contain a `?` query part when
-/// the link was parsed from a JSON object with extra options.
-/// Call `strip_query` on the result before using it as a registry key
-/// or a PV name lookup.
 /// A `pva` forward link, opened by [`PvaLinkResolver::forward_handle`].
 ///
 /// C `dbCa.c:614-619` `scanForward`: the FWD link is a
@@ -1698,16 +1689,13 @@ async fn run_forward(shared: Arc<ForwardShared>, opener: ChannelOpener, cfg: Pva
     }
 }
 
-fn strip_scheme(name: &[u8]) -> Option<&str> {
-    // PVA names are text until the PVA name layer.
-    let name = std::str::from_utf8(name).ok()?;
-    if let Some(stripped) = name.strip_prefix("pva://") {
-        return Some(stripped);
-    }
-    if name.starts_with("ca://") {
-        return None;
-    }
-    Some(name)
+/// The link name as text: PVA names are text until the PVA name layer.
+///
+/// The returned string may still carry a `?` query part (a JSON link's
+/// options); call `strip_query` before using it as a registry key or a PV
+/// name lookup.
+fn link_text(name: &[u8]) -> Option<&str> {
+    std::str::from_utf8(name).ok()
 }
 
 /// Strip the `?key=value&…` query part appended to bare PV
@@ -1726,7 +1714,7 @@ fn strip_query(s: &str) -> &str {
 ///   * the `?key=value&…` query part (convenience-URI form), and
 ///   * the legacy whitespace-separated trailing modifiers
 ///     (`PP`/`NPP`/`CP`/`CPP`/`MS`/`MSI`/`MSS`/`NMS` — the DBD suffix
-///     form a record writes as `pva://TARGET MS`).
+///     form, `TARGET MS`).
 ///
 /// `strip_query` alone left the legacy suffix attached, so
 /// `"TARGET MS"` became the registry channel identity and the
@@ -1831,7 +1819,7 @@ fn pvfield_to_epics_value(field: &PvField) -> Option<EpicsValue> {
             // scalar. The generic `value`-child collapse below would
             // recurse into the `enum_t` struct, find no `value` child,
             // and return `None` — leaving a record with a bare
-            // `pva://enumPV` INP (the default `field="value"`) stuck
+            // `{pva:"enumPV"}` INP (the default `field="value"`) stuck
             // LINK/INVALID. Mirror pvxs `pvaGetValue`: read
             // `value["index"]` as the enum index. The recursion reaches
             // the `enum_t` struct here as its own `Structure` arm, so
@@ -2167,7 +2155,7 @@ mod tests {
         use epics_pva_rs::pvdata::PvStructure;
         // An NTEnum's `value` child is an `enum_t` carrying the choice
         // in its `index` int, with no `value` scalar of its own. A bare
-        // `pva://enumPV` INP (default `field="value"`) lands here.
+        // `{pva:"enumPV"}` INP (default `field="value"`) lands here.
         // Before the enum_t branch the generic value-collapse recursed
         // into `enum_t`, found no `value`, and returned `None` →
         // record LINK/INVALID. pvxs `pvaGetValue` reads `value["index"]`.
@@ -3345,8 +3333,8 @@ mod tests {
         db.add_record("UPLNK", Box::new(AoRecord::new(0.0)))
             .await
             .unwrap();
-        db.get_record("DOWN").unwrap().write().common.text.inp = "pva://UP:AI".into();
-        db.get_record("UPLNK").unwrap().write().common.text.out = "pva://UP:AO".into();
+        db.get_record("DOWN").unwrap().write().common.text.inp = r#"{pva:"UP:AI"}"#.into();
+        db.get_record("UPLNK").unwrap().write().common.text.out = r#"{pva:"UP:AO"}"#.into();
 
         let resolver = install_pvalink_resolver(&db).await;
         assert_eq!(
@@ -3506,7 +3494,7 @@ mod tests {
         let resolver = install_pvalink_resolver(&db).await;
         let r = LinkSet::put_value(
             &resolver,
-            lref(b"pva://NOT:A:LOCAL:RECORD?local=true"),
+            lref(b"NOT:A:LOCAL:RECORD?local=true"),
             EpicsValue::Double(1.0),
             LinkPutOp::Plain,
         )
@@ -3716,7 +3704,7 @@ mod tests {
     }
 
     /// a DB record can write a pvalink in the *legacy
-    /// whitespace-suffix* form — `pva://TARGET:AI CPP MS` — instead of
+    /// whitespace-suffix* form — `TARGET:AI CPP MS` — instead of
     /// the JSON `?key=value` query form. Before the fix the bare-name
     /// extraction (`strip_query`) left the suffix attached, so
     /// `"TARGET:AI CPP MS"` became the upstream channel identity and the
@@ -3736,20 +3724,7 @@ mod tests {
     ///   pvxs/ioc/pvalink.h:65     — per-link `pvaLinkConfig`
     #[tokio::test]
     async fn br_fr9_pvalink_legacy_suffix_options_parsed_not_pv_name() {
-        use epics_base_rs::server::record::{ParsedLink, parse_link_v2};
-
-        // Part 1: the legacy suffix rides into the pvalink layer intact.
-        // epics-base does NOT strip pva:// modifiers — the dual
-        // representation is collapsed in the pvalink layer, not duplicated
-        // in epics-base's modifier vocabulary.
-        let stored = match parse_link_v2("pva://TARGET:AI CPP MS") {
-            ParsedLink::Pva(s) => s.to_string(),
-            other => panic!("expected Pva, got {other:?}"),
-        };
-        assert_eq!(
-            &*stored, "TARGET:AI CPP MS",
-            "epics-base must preserve the legacy suffix verbatim"
-        );
+        let stored = "TARGET:AI CPP MS".to_string();
 
         // Part 2: PvaLinkConfig::parse is the single owner that interprets
         // the suffix — PV name is the first token, modifiers become config
@@ -4381,13 +4356,13 @@ mod tests {
         // The shared cached link is NMS → its own gate reports no
         // alarm. A caller asking for `?sevr=MS` must still see the
         // MAJOR severity propagate.
-        let nms_name = "pva://MR_R15:PV";
+        let nms_name = "MR_R15:PV";
         assert_eq!(
             LinkSet::alarm_severity(&resolver, lref(nms_name.as_bytes())),
             None,
             "an NMS caller must not propagate the remote alarm"
         );
-        let ms_name = "pva://MR_R15:PV?sevr=MS";
+        let ms_name = "MR_R15:PV?sevr=MS";
         assert_eq!(
             LinkSet::alarm_severity(&resolver, lref(ms_name.as_bytes())),
             Some(2),
@@ -4454,7 +4429,7 @@ mod tests {
             "a time=false caller must not write the upstream timestamp"
         );
         assert_eq!(
-            LinkSet::read_time_stamp(&resolver, lref(b"pva://MR_R15:PV?time=true")),
+            LinkSet::read_time_stamp(&resolver, lref(b"MR_R15:PV?time=true")),
             stamp,
             "a time=true caller writes the upstream timestamp and the \
              zero-extended userTag"
@@ -4543,7 +4518,7 @@ mod tests {
         );
         LinkSet::put_value(
             &resolver,
-            lref(b"pva://INT:PV"),
+            lref(b"INT:PV"),
             EpicsValue::Double(3.7),
             LinkPutOp::Plain,
         )
@@ -4620,15 +4595,9 @@ mod tests {
         resolver.registry.insert_for_test(&out_cfg, link);
 
         // Drive the OUT path through the resolver's LinkSet impl.
-        let scheme_name = format!("pva://{pv_name}");
-        LinkSet::put_value(
-            &resolver,
-            lref(scheme_name.as_bytes()),
-            value,
-            LinkPutOp::Plain,
-        )
-        .await
-        .expect("typed array OUT write must succeed");
+        LinkSet::put_value(&resolver, lref(pv_name.as_bytes()), value, LinkPutOp::Plain)
+            .await
+            .expect("typed array OUT write must succeed");
 
         tokio::time::sleep(std::time::Duration::from_millis(80)).await;
 
@@ -5012,7 +4981,6 @@ mod alarmed_remote_cycle_alloc {
     static GLOBAL: Counting = Counting;
 
     const DB: &str = r#"
-record(ai, "AR:AI") { field(INP, "pva://AR:PV?sevr=MS") }
 record(ai, "AR:JSON") { field(INP, {pva:{pv:"AR:PV", sevr:"MS"}}) }
 "#;
 
@@ -5095,16 +5063,18 @@ record(ai, "AR:JSON") { field(INP, {pva:{pv:"AR:PV", sevr:"MS"}}) }
         resolver.registry.insert_for_test(&cfg, link.clone());
         db.ioc_init().await;
 
-        for rec in ["AR:AI", "AR:JSON"] {
-            assert_eq!(allocs(db.clone(), rec, 100, || ()), 0, "{rec} steady");
-            assert_eq!(alarm_of(&db, rec), ("2".into(), "HIGH".into()), "{rec}");
-        }
+        assert_eq!(allocs(db.clone(), "AR:JSON", 100, || ()), 0, "steady");
+        assert_eq!(alarm_of(&db, "AR:JSON"), ("2".into(), "HIGH".into()));
         let changed = link.clone();
-        let one = allocs(db.clone(), "AR:AI", 1, move || {
+        let one = allocs(db.clone(), "AR:JSON", 1, move || {
             changed.set_latest_for_test(alarmed("HIHI"));
         });
         assert_eq!(one, 1, "a new remote text is one allocation");
-        assert_eq!(alarm_of(&db, "AR:AI"), ("2".into(), "HIHI".into()));
-        assert_eq!(allocs(db.clone(), "AR:AI", 100, || ()), 0, "settled again");
+        assert_eq!(alarm_of(&db, "AR:JSON"), ("2".into(), "HIHI".into()));
+        assert_eq!(
+            allocs(db.clone(), "AR:JSON", 100, || ()),
+            0,
+            "settled again"
+        );
     }
 }

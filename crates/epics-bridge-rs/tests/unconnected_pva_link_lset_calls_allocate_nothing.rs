@@ -105,14 +105,11 @@ fn unconnected_pva_link_lset_calls_allocate_nothing() {
                 // One name per config route: the defaults, a convenience URI
                 // (one naming a `field`, so a clone of it would allocate) and a
                 // structured key.
-                let json = format!(
-                    "pva://{}",
-                    pvajson_identity_key("T:NONE", &[("Q".to_string(), JlinkValue::Int(7))])
-                );
+                let json = pvajson_identity_key("T:NONE", &[("Q".to_string(), JlinkValue::Int(7))]);
                 for name in [
-                    "pva://T:NONE",
-                    "pva://T:NONE?sevr=MS&field=value",
-                    "pva://T:NONE?time=true",
+                    "T:NONE",
+                    "T:NONE?sevr=MS&field=value",
+                    "T:NONE?time=true",
                     json.as_str(),
                 ] {
                     let open = OpenLatch::default();

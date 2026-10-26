@@ -97,7 +97,7 @@ async fn r17_3_a_wait_step_with_an_unresolvable_lnk_never_raises_wtg() {
     sseq.put_field("SELM", EpicsValue::Short(0)).unwrap(); // All steps
     // Step 1: WAIT into a CA link nothing can resolve.
     sseq.put_field("DO1", EpicsValue::Double(11.0)).unwrap();
-    sseq.put_field("LNK1", EpicsValue::String("ca://SS_NR_NOWHERE".into()))
+    sseq.put_field("LNK1", EpicsValue::String("SS_NR_NOWHERE CA".into()))
         .unwrap();
     sseq.put_field("WAIT1", EpicsValue::Short(1)).unwrap();
     // Step 2: an ordinary local write, so the sequence has an observable tail.

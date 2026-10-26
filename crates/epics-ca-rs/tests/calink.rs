@@ -244,43 +244,6 @@ async fn ca_link_init_ready_flips_after_metadata_fetch() {
 }
 
 #[cfg(tokio_backend)]
-/// Gap 2 — the `ca://` scheme prefix is accepted: `epics-base-rs`
-/// stores a `ca://X` link verbatim in `ParsedLink::Ca`, so the
-/// resolver must strip it.
-#[tokio::test(flavor = "multi_thread")]
-#[serial(epics_env)]
-async fn ca_link_resolves_with_scheme_prefix() {
-    let server = CaServer::builder()
-        .port(0)
-        .pv("CALINK:SCHEME", EpicsValue::Long(404))
-        .build()
-        .await
-        .expect("CA server");
-    let port = server.udp_port();
-    let _server = tokio::spawn(async move { server.run().await });
-
-    let client = Arc::new(pinned_client(port).await);
-    let resolver = CaLinkResolver::with_client(client);
-
-    use epics_base_rs::server::database::LinkSet;
-    let open = OpenLatch::ca(LinkProcessPolicy::NoProcess, LinkFieldType::In);
-    let link = LinkRef::new(b"ca://CALINK:SCHEME", &open);
-    LinkSet::connect_link(&resolver, link, None).await;
-    let connected = resolver
-        .wait_for_link_connected("ca://CALINK:SCHEME", fact_budget::FACT_BUDGET)
-        .await;
-    assert!(connected, "scheme-prefixed CA link must connect");
-
-    assert_eq!(
-        LinkSet::get_value(&resolver, link)
-            .await
-            .and_then(|v| v.to_f64()),
-        Some(404.0),
-        "scheme-prefixed CA link must resolve to the upstream value"
-    );
-}
-
-#[cfg(tokio_backend)]
 /// Gap 2 end-to-end — a soft-channel `ai` record whose INP is a CA
 /// link, processed through `process_record_with_links`, fetches the
 /// remote PV value into its own VAL. This is the exact C path:
@@ -607,55 +570,6 @@ async fn ca_link_out_write_async_waits_for_completion() {
         Some(42.0),
         "upstream CA server PV must reflect the completion-aware OUT write"
     );
-}
-
-#[cfg(tokio_backend)]
-/// Gap 2 OUT write — the `ca://` scheme-prefixed form of an OUT link
-/// is accepted by `put_value` (the resolver strips the prefix), same
-/// as the INP-side `ca_link_resolves_with_scheme_prefix` test.
-#[tokio::test(flavor = "multi_thread")]
-#[serial(epics_env)]
-async fn ca_link_out_write_accepts_scheme_prefix() {
-    let server = CaServer::builder()
-        .port(0)
-        .pv("CALINK:OUT:SCHEME", EpicsValue::Long(7))
-        .build()
-        .await
-        .expect("CA server");
-    let port = server.udp_port();
-    let _server = tokio::spawn(async move { server.run().await });
-
-    let client = Arc::new(pinned_client(port).await);
-    let resolver = CaLinkResolver::with_client(client);
-
-    use epics_base_rs::server::database::{LinkPutOp, LinkSet};
-    let open = OpenLatch::default();
-    let link = LinkRef::new(b"ca://CALINK:OUT:SCHEME", &open);
-    LinkSet::connect_link(&resolver, link, None).await;
-    let connected = resolver
-        .wait_for_link_connected("ca://CALINK:OUT:SCHEME", fact_budget::FACT_BUDGET)
-        .await;
-    assert!(connected, "scheme-prefixed CA OUT link must connect");
-
-    LinkSet::put_value(&resolver, link, EpicsValue::Long(123), LinkPutOp::Plain)
-        .await
-        .expect("scheme-prefixed CA-link OUT write must succeed");
-
-    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
-    loop {
-        if LinkSet::get_value(&resolver, link)
-            .await
-            .and_then(|v| v.to_f64())
-            == Some(123.0)
-        {
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "scheme-prefixed CA OUT write did not propagate"
-        );
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
 }
 
 #[cfg(tokio_backend)]

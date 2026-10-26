@@ -49,10 +49,6 @@ pub const CA_LINK_EVENT_MASK: u16 =
 /// (`dbPutNotifyBlocker.cpp:146-149`).
 const PUT_NOTIFY_BLOCK_TIMEOUT: Duration = Duration::from_secs(30);
 
-fn strip_ca_scheme(name: &[u8]) -> &[u8] {
-    name.strip_prefix(b"ca://").unwrap_or(name)
-}
-
 /// Where `ca_create_channel` sent a link.
 enum Route {
     Local(Arc<LocalLink>),
@@ -109,7 +105,7 @@ impl CaLinks {
     /// Whether a `ca` link to `name` has anything to connect to: a name
     /// this database serves, or any name once a network half is registered.
     pub(crate) fn addresses(&self, name: &[u8]) -> bool {
-        self.network.read().is_some() || self.has_name(strip_ca_scheme(name))
+        self.network.read().is_some() || self.has_name(name)
     }
 
     /// Whether `link` is a local link — C's `dbCaPutAsync` to one completes
@@ -134,7 +130,7 @@ impl CaLinks {
             Some((_, Route::Network)) => return false,
             None => {}
         }
-        let name = strip_ca_scheme(link.name);
+        let name = link.name;
         if self.has_name(name) {
             return true;
         }
@@ -205,8 +201,7 @@ impl CaLinks {
         let db = PvDatabase {
             inner: self.db.upgrade()?,
         };
-        let name = strip_ca_scheme(link.name);
-        let channel = LocalChannel::create(&db, name).await;
+        let channel = LocalChannel::create(&db, link.name).await;
         // The link starts as its route is published, under this lock: two
         // first opens of one link start one channel, the loser's drops
         // unstarted, and so does an open the link's removal overtook.
@@ -221,7 +216,7 @@ impl CaLinks {
                     Some(channel) => Route::Local(Arc::new(LocalLink::open(&db, channel, link)?)),
                     None => Route::Network,
                 };
-                &route.insert((name.into(), opened)).1
+                &route.insert((link.name.into(), opened)).1
             }
         };
         match route {
@@ -379,7 +374,7 @@ impl LinkSet for CaLinks {
         value: EpicsValue,
         op: LinkPutOp,
     ) -> (LinkPutDone, Result<(), String>) {
-        let name = strip_ca_scheme(link.name);
+        let name = link.name;
         let unconnected = || {
             Err(format!(
                 "CA link {} not connected",

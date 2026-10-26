@@ -115,7 +115,7 @@ windows-sys = { version = "0.59", features = [
 default = ["client"]
 # The CA client a *record link* needs, and nothing else: `client`, `channel`
 # and `calink` — search (UDP where it exists, `EPICS_CA_NAME_SERVERS` where it
-# does not), the virtual circuit, subscriptions, and the `ca://` link
+# does not), the virtual circuit, subscriptions, and the CA link
 # resolver over them.
 #
 # A STATED split, not an absence. The alternative — leaving the discovery
@@ -308,7 +308,7 @@ path = "src/bin/ca-lint-rs.rs"
 name = "ca-admin-rs"
 path = "src/bin/ca-admin-rs.rs"
 
-# The RTEMS CA IOC entry point (design doc §9.5). It mounts the `ca://` link
+# The RTEMS CA IOC entry point (design doc §9.5). It mounts the CA link
 # resolver, so it needs `client-core` like every other binary that names
 # `epics_ca_rs::calink`. The gate does not make the RTEMS row vacuous: that row
 # issues an explicit `--bin realtime-ca-ioc`, where an unmet `required-features`

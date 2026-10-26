@@ -191,6 +191,10 @@ const SCOPE_GATED: &[(&str, &str)] = &[
     ("epics-ca-rs", "src/server/tcp.rs"),
     (
         "epics-ca-rs",
+        "tests/a_ca_link_waits_on_its_put_callback.rs",
+    ),
+    (
+        "epics-ca-rs",
         "tests/a_loopback_interface_binds_two_responder_sockets.rs",
     ),
     (

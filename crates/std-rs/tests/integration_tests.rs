@@ -734,7 +734,7 @@ record(timestamp, "TEST:TSNP") {
 // ============================================================
 #[tokio::test]
 async fn test_ca_trig_epid_fires_flnk_exactly_once() {
-    // The CA TRIG link `ca://...` points at a remote PV that does
+    // The CA TRIG link `CA` points at a remote PV that does
     // not exist in-test; the trigger write simply does not land, but
     // the asynchronous two-pass sequence (trigger pass -> reprocess
     // pass) still runs — which is exactly what this test exercises.
@@ -753,7 +753,7 @@ record(epid, "PID") {
     field(DRVH, "1000")
     field(DRVL, "-1000")
     field(MDT, "0")
-    field(TRIG, "ca://REMOTE:READBACK")
+    field(TRIG, "REMOTE:READBACK CA")
     field(TVAL, "42.0")
     field(FLNK, "CTR")
 }
@@ -1325,7 +1325,7 @@ record(ai, "CV2") { field(VAL, "2") }
 record(epid, "E") {
     field(DTYP, "Async Soft Channel")
     field(INP, "CV")
-    field(TRIG, "ca://REMOTE:READBACK")
+    field(TRIG, "REMOTE:READBACK CA")
 }
 "#;
     let (name, factory) = std_rs::epid_record_factory();

@@ -182,11 +182,11 @@ mod exec_model {
     fn init_path_runs_without_a_panic() {
         let dir = tempfile::tempdir().expect("temp dir");
         let db = dir.path().join("pvalink.db");
-        // A `pva://` INP makes the record a client of a server this IOC has to
+        // A pva INP makes the record a client of a server this IOC has to
         // search for, which is what drives the search engine and the dial.
         std::fs::write(
             &db,
-            "record(ai, \"LOCAL:PAI\") { field(INP, \"pva://UPSTREAM:AI CP\") }\n\
+            "record(ai, \"LOCAL:PAI\") { field(INP, \"{pva:{pv:'UPSTREAM:AI',proc:'CP'}}\") }\n\
              record(ai, \"LOCAL:JSON\") { field(INP, {pva:\"UPSTREAM:AI\"}) }\n",
         )
         .expect("write the db");
@@ -268,7 +268,7 @@ mod exec_model {
         // stage-5 probe, so the clean build has no console line to wait on —
         // the NS dial logs at debug, below the console subscriber's INFO
         // floor. The seam is still crossed there (the client and its dial are
-        // production code, driven by the same `pva://` link); the *evidence*
+        // production code, driven by the same pva link); the *evidence*
         // is only asserted in the `bringup-probes` run of this test, which is
         // why the exec-backend gate runs both configurations.
         #[cfg(feature = "bringup-probes")]
@@ -285,7 +285,7 @@ mod exec_model {
                 );
                 assert!(
                     Instant::now() < deadline,
-                    "realtime-pva-ioc never started searching for its pva:// link \
+                    "realtime-pva-ioc never started searching for its pva link \
                      within {SEARCH_BUDGET:?}:\n{console}"
                 );
                 std::thread::sleep(Duration::from_millis(50));

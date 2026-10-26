@@ -47,7 +47,7 @@ pub(crate) use device_menu_registry::{
 pub use link::{
     CaLink, CalcArg, CalcLink, CalcVal, ConstLoadError, ConstantLink, DbLink, DbLinkType,
     ExternalForward, ExternalRef, ForwardSlot, HwLink, HwLinkKind, JlinkValue, JsonLinkParse,
-    LinkFieldType, LinkProcessPolicy, LinkType, LsLoad, MonitorSwitch, OpenLatch,
+    LinkFieldType, LinkProcessPolicy, LinkSetTarget, LinkType, LsLoad, MonitorSwitch, OpenLatch,
     PVAJSON_IDENTITY_SEP, ParsedLink, PvaChannelLink, PvaJsonLink, StateLink, StatePut, StateVal,
     VxiAddr, ca_forward_flag, check_json_link_text, check_link_assignment, check_link_text,
     declared_link_type, link_type_refusal, load_link_ls, out_link_discards_cp, parse_c_double,

@@ -6022,7 +6022,7 @@ fn link_field_kind(record_type: &str, field: &str) -> Option<&'static str> {
 /// (`dbLock.c:886-900`).
 ///
 /// Only a link that resolved LOCALLY appears, because C reads
-/// `plink->type != DB_LINK` and skips everything else — a `ca://` target is a
+/// `plink->type != DB_LINK` and skips everything else — a CA target is a
 /// `CA_LINK` and prints nothing here even when the name is local.
 fn dblsr_link_lines(db: &crate::server::database::PvDatabase, record: &[u8]) -> Vec<Vec<u8>> {
     use crate::server::record::ParsedLink;

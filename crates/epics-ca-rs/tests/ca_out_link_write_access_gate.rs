@@ -9,7 +9,7 @@
 //! ```
 //! (`dbCa.c:529-532`). `dbPutLink` folds that `-1` into the owning record's
 //! LINK/INVALID (`dbLink.c:443-446` → `setLinkAlarm` → `recGblSetSevrMsg`),
-//! so a `record(ao,"HOLD") { field(OUT,"ca://SEC:HOLD") }` pointed at a
+//! so a `record(ao,"HOLD") { field(OUT,"SEC:HOLD CA") }` pointed at a
 //! server that grants READ and denies WRITE alarms on every cycle.
 //!
 //! The port tested only the first operand. A write-denied link is CONNECTED
@@ -164,7 +164,7 @@ async fn add_ao(db: &PvDatabase, name: &str, val: f64, completion: bool) {
     }
     db.put_pv_no_process(
         format!("{name}.OUT"),
-        EpicsValue::String(format!("ca://{PV}").into()),
+        EpicsValue::String(format!("{PV} CA").into()),
     )
     .await
     .unwrap();

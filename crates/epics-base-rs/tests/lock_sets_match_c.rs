@@ -176,13 +176,13 @@ async fn every_member_of_a_set_reaches_that_set() {
 }
 
 /// A link that C does NOT merge on. `dbDbInitLink` runs only for a link that
-/// resolved locally; a `ca://` target goes to `dbCaAddLink` instead
+/// resolved locally; a CA target goes to `dbCaAddLink` instead
 /// (`dbLink.c:118-130`) even when the name happens to be a local record, so
 /// the set must not widen.
 #[epics_macros_rs::epics_test]
 async fn a_ca_link_to_a_local_record_does_not_merge() {
     let db = ioc(r#"
-record(calc, "C:A") { field(INPA, "ca://C:B") field(CALC, "A+1") }
+record(calc, "C:A") { field(INPA, "C:B CA") field(CALC, "A+1") }
 record(calc, "C:B") { field(CALC, "1") }
 "#)
     .await;

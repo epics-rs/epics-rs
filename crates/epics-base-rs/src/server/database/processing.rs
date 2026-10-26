@@ -1700,7 +1700,7 @@ fn ca_tsel_time_record(pv: &[u8]) -> Option<&[u8]> {
 /// Convert an lset `(seconds_past_epoch, nanos, userTag)` timestamp
 /// triple into the record-side `(WallTime, userTag)` pair, clamping
 /// seconds/nanos to the valid `Duration` range. Shared by the TSEL
-/// `.TIME` Ca arm and the non-local Db arm — both read a `ca://` `.TIME`
+/// `.TIME` Ca arm and the non-local Db arm — both read a CA `.TIME`
 /// source through `external_link_time` and adopt the result identically.
 pub(super) fn ext_time_pair((secs, ns, utag): (i64, i32, u64)) -> (crate::types::WallTime, u64) {
     let secs = secs.max(0) as u64;
@@ -5403,7 +5403,11 @@ impl PvDatabase {
             }
             super::links::LinkTarget::LocalNotRecord => None,
             super::links::LinkTarget::External => self
-                .external_link_time(crate::server::record::ExternalRef { name: record, open })
+                .external_link_time(crate::server::record::ExternalRef {
+                    lset: crate::server::record::LinkSetTarget::Ca,
+                    name: record,
+                    open,
+                })
                 .map(ext_time_pair),
         }
     }
@@ -6108,7 +6112,7 @@ impl PvDatabase {
         // INVALID. Only fires for soft-channel records: hardware-driver
         // alarms travel through device-support's own last_alarm path.
         //
-        // B2: a soft INP that is an external `pva://` / `ca://` link
+        // B2: a soft INP that is an external CA / pva link
         // also propagates the lset's alarm. The link string carries
         // no `MonitorSwitch` (the `?sevr=MS` modifier is stripped by
         // the parser before epics-base-rs sees it), so the lset has
@@ -8366,7 +8370,7 @@ impl PvDatabase {
                         let record_should_output = instance.should_output();
                         if !can_dev_write {
                             // Non-output records (scalcout, etc.) may still have a
-                            // soft OUT link (DB or external ca://`/`pva://`).
+                            // soft OUT link (DB or external CA / pva).
                             // Write OVAL to OUT when the record says should_output().
                             if record_should_output && instance.parsed_out.is_writable_out_link() {
                                 super::PutSrc::of_output(rec, instance, false)
@@ -9281,7 +9285,7 @@ impl PvDatabase {
 
         // 5. FLNK — C `dbScanFwdLink` → `dbScanPassive` → `processTarget`,
         // through the single owner that holds the Passive gate.
-        // 5b. An external (`pva://`/`ca://`) FLNK goes out through the link
+        // 5b. An external FLNK goes out through the link
         // set's `scanForward` (pvalink `pvaScanForward`) instead — a
         // process-only trigger of the remote target. Both halves come from the
         // one resolution `RecordInstance::fwd_link` made under the
@@ -9385,7 +9389,7 @@ impl PvDatabase {
         );
     }
 
-    /// Fire a non-DB (external `pva://`/`ca://`) forward link — an FLNK or a
+    /// Fire a non-DB (external) forward link — an FLNK or a
     /// fanout `LNKn`.
     ///
     /// C `recGblFwdLink` → `dbScanFwdLink` (`dbLink.c:475-480`) dispatches
@@ -9735,7 +9739,7 @@ impl PvDatabase {
             return ControlFlow::Continue(Ok(()));
         };
         // 2. Write to the linked PV — DB *or*
-        // external `ca://`/`pva://`. A record's `process()`
+        // external CA / pva. A record's `process()`
         // emits `WriteDbLink` to drive an OUT-link field
         // (transform `OUTn`, throttle/scaler `COUTP`, epid
         // `TRIG`/`OUTL`); that field may resolve to a CA/PVA
@@ -10286,7 +10290,7 @@ impl PvDatabase {
                     None
                 } else if !can_dev_write {
                     // Non-output records (scalcout, etc.) with soft OUT link
-                    // (DB or external `ca://`/`pva://`).
+                    // (DB or external CA / pva).
                     if record_should_output && instance.parsed_out.is_writable_out_link() {
                         super::PutSrc::of_output(rec, &instance, false)
                     } else {
@@ -12131,7 +12135,7 @@ impl PvDatabase {
         // SIMM=YES(1) / SIMM=RAW(2): read the SIOL link into VAL/RVAL. C
         // `readValue` for a SIMM-mode INPUT record goes through `dbGetLink`,
         // which dispatches by link type — a local DB target, a CA target (a
-        // bare non-local name or an explicit `CA`/`ca://` link), or a
+        // bare non-local name or an explicit ` CA` link), or a
         // constant. The pre-fix port special-cased a local `ParsedLink::Db`
         // SIOL only, so a non-local or external SIOL never read yet still
         // returned `Simulated` — the record froze with no value and no alarm.

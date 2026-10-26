@@ -98,7 +98,7 @@ pub(crate) fn render_link_field(class: crate::types::DbfLinkClass, raw: &[u8]) -
         };
     }
 
-    // C's `ppind` chain (`:1938-1943`) tests `PP` before `CA`, so a `ca://`
+    // C's `ppind` chain (`:1938-1943`) tests `PP` before `CA`, so a CA
     // link that also asked for `PP` renders ` PP`; and a `CP`/`CPP` link that
     // resolved to a CA channel still renders its own class, because C reads
     // `pvlMask` and not the type the link ended up with.
@@ -931,7 +931,7 @@ pub(crate) enum ForwardTarget {
         putf: bool,
         notify: bool,
     },
-    /// An external `pva://` / `ca://` PV, C `dbScanFwdLink` → the link set's
+    /// An external PV, C `dbScanFwdLink` → the link set's
     /// `scanForward` (pvxs `pvaScanForward`) — a process-only trigger. The
     /// dispatch reads FLNK again, as C reads `plink` there.
     External,
@@ -18258,7 +18258,7 @@ mod link_cache_fact_tests {
         let mut inst = RecordInstance::new("LCF", AiRecord::new(0.0));
         let fresh = &inst.parsed_out;
         assert!(fresh.is_constant() && !fresh.is_writable_out_link());
-        for text in ["OTHER.VAL", "5", "ca://OTHER", "@hw 1", "OTHER NPP", ""] {
+        for text in ["OTHER.VAL", "5", "OTHER CA", "@hw 1", "OTHER NPP", ""] {
             let parse = parse_link_field(text, LinkFieldType::Out);
             for field in ["OUT", "SDIS", "FLNK"] {
                 assert!(inst.set_link_cache(field, parse.clone()));
@@ -18297,7 +18297,7 @@ mod link_cache_fact_tests {
             ("OTHER.VAL NPP MSI", None, MonitorSwitch::MaximizeIfInvalid),
             // C `dbParseLink` defaults an output link to NPP.
             ("OTHER", None, MonitorSwitch::NoMaximize),
-            ("ca://OTHER.PROC MSS", None, MonitorSwitch::MaximizeStatus),
+            ("OTHER.PROC CA MSS", None, MonitorSwitch::MaximizeStatus),
             ("5", None, MonitorSwitch::NoMaximize),
         ] {
             assert!(inst.set_link_cache("OUT", parse_link_field(text, LinkFieldType::Out)));

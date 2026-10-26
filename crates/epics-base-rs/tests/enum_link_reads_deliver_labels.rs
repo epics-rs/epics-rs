@@ -237,7 +237,7 @@ impl LinkSet for EnumLset {
 
 async fn read_external_enum(rec: &str, string: EnumString) -> Arc<PvDatabase> {
     let db = build(&format!(
-        r#"record(stringin, "{rec}") {{ field(INP, "ca://EXT:{rec}") field(VAL, "was") }}"#
+        r#"record(stringin, "{rec}") {{ field(INP, "EXT:{rec} CA") field(VAL, "was") }}"#
     ))
     .await;
     db.register_link_set(
@@ -258,7 +258,7 @@ async fn read_external_enum(rec: &str, string: EnumString) -> Arc<PvDatabase> {
     db
 }
 
-/// stringin INP at a `ca://` enum channel: the lset's string monitor serves
+/// stringin INP at a CA enum channel: the lset's string monitor serves
 /// the server's string, not the index.
 #[epics_macros_rs::epics_test]
 async fn stringin_inp_at_external_enum_reads_the_string_monitor() {

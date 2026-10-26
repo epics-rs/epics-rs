@@ -879,7 +879,7 @@ impl CaClient {
         // PV reachable only by broadcast then never resolved and said nothing:
         // an IOC that was itself discoverable but could not discover.
         // `epics_base_rs::net::search_udp` removed the reason, and with it the
-        // gate — a target IOC's `ca://` links now resolve the way a C IOC's do.
+        // gate — a target IOC's CA links now resolve the way a C IOC's do.
         let search_task = reactor.spawn(search::run_search_engine(
             reactor.clone(),
             addr_list,

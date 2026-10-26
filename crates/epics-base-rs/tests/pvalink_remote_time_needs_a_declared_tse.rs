@@ -22,7 +22,8 @@ use epics_base_rs::types::WallTime;
 use std::sync::Arc;
 use std::time::Duration;
 
-use epics_base_rs::server::database::{LinkRef, LinkSet, PvDatabase};
+use epics_base_rs::server::database::{LinkRef, LinkSet};
+use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::records::ai::AiRecord;
 use epics_base_rs::types::EpicsValue;
 
@@ -58,7 +59,12 @@ fn remote_stamp() -> WallTime {
 
 #[epics_macros_rs::epics_test]
 async fn the_declared_tse_decides_whether_the_remote_time_survives() {
-    let db = PvDatabase::new();
+    // The `pva` link type is declared, as softIocPVX's database does.
+    let (db, _) = IocBuilder::new()
+        .register_link_type("pva", |_db| async { Vec::new() })
+        .build()
+        .await
+        .unwrap();
     db.register_link_set("pva", Arc::new(TimedLset)).await;
 
     // Same link, same lset; the ONLY difference is the declared TSE.
@@ -68,7 +74,7 @@ async fn the_declared_tse_decides_whether_the_remote_time_survives() {
             .unwrap();
         db.put_pv_no_process(
             format!("{name}.INP"),
-            EpicsValue::String("pva://REMOTE:PV".into()),
+            EpicsValue::String(r#"{pva:"REMOTE:PV"}"#.into()),
         )
         .await
         .unwrap();

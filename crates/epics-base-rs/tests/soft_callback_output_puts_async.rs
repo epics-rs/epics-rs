@@ -20,6 +20,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use epics_base_rs::server::database::{LinkPutOp, LinkRef, LinkSet, PutAdmission, PvDatabase};
+use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::recgbl::alarm_status;
 use epics_base_rs::server::record::AlarmSeverity;
 use epics_base_rs::server::records::ao::AoRecord;
@@ -67,7 +68,7 @@ impl LinkSet for Lset {
 }
 
 struct Rig {
-    db: PvDatabase,
+    db: Arc<PvDatabase>,
     writes: Arc<Mutex<Vec<(f64, LinkPutOp)>>>,
     release: Arc<tokio::sync::Semaphore>,
 }
@@ -76,16 +77,19 @@ async fn rig(admission: PutAdmission) -> Rig {
     rig_on("ca", admission).await
 }
 
-async fn rig_on(scheme: &str, admission: PutAdmission) -> Rig {
+async fn rig_on(lset: &str, admission: PutAdmission) -> Rig {
     let writes = Arc::new(Mutex::new(Vec::new()));
     let release = Arc::new(tokio::sync::Semaphore::new(0));
-    let db = PvDatabase::new();
-    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
-    db.ca_link_init();
-    // C `callbackInit`: no build arms the bands for a bare database.
+    // A softIocPVX database, which declares the `pva` link type.
+    let (db, _) = IocBuilder::new()
+        .register_link_type("pva", |_db| async { Vec::new() })
+        .build()
+        .await
+        .unwrap();
+    // C `callbackInit`: `build` arms no bands.
     epics_base_rs::runtime::task::background_init();
     db.register_link_set(
-        scheme,
+        lset,
         Arc::new(Lset {
             writes: Arc::clone(&writes),
             admission,
@@ -147,9 +151,9 @@ async fn idle(db: &PvDatabase, name: &str) {
 /// A CA or pva link's `putAsync` takes the put: PACT until the put
 /// completes, then the completing pass (`if (prec->pact) return 0`) puts
 /// nothing more.
-async fn an_external_link_holds_pact_until_the_put_completes(scheme: &str) {
-    let r = rig_on(scheme, PutAdmission::Connected).await;
-    add_ao(&r.db, "AO_CB", &format!("{scheme}://REMOTE:OUT"), 4.5).await;
+async fn an_external_link_holds_pact_until_the_put_completes(lset: &str, out: &str) {
+    let r = rig_on(lset, PutAdmission::Connected).await;
+    add_ao(&r.db, "AO_CB", out, 4.5).await;
 
     process(&r.db, "AO_CB").await;
     assert!(pact(&r.db, "AO_CB"), "putAsync took the put: PACT is set");
@@ -173,12 +177,12 @@ async fn an_external_link_holds_pact_until_the_put_completes(scheme: &str) {
 
 #[epics_macros_rs::epics_test]
 async fn a_ca_link_holds_pact_until_the_put_completes() {
-    an_external_link_holds_pact_until_the_put_completes("ca").await;
+    an_external_link_holds_pact_until_the_put_completes("ca", "REMOTE:OUT CA").await;
 }
 
 #[epics_macros_rs::epics_test]
 async fn a_pva_link_holds_pact_until_the_put_completes() {
-    an_external_link_holds_pact_until_the_put_completes("pva").await;
+    an_external_link_holds_pact_until_the_put_completes("pva", r#"{pva:"REMOTE:OUT"}"#).await;
 }
 
 /// A DB link has no `putAsync` (`S_db_noLSET`): `dbPutLink` puts at once and
@@ -203,7 +207,7 @@ async fn a_db_link_puts_synchronously() {
 #[epics_macros_rs::epics_test]
 async fn a_refused_put_raises_the_link_alarm_and_stays_idle() {
     let r = rig(PutAdmission::Refused).await;
-    add_ao(&r.db, "AO_DOWN", "ca://REMOTE:OUT", 1.0).await;
+    add_ao(&r.db, "AO_DOWN", "REMOTE:OUT CA", 1.0).await;
 
     // aoRecord's process returns write_ao's status (aoRecord.c:110).
     let mut visited = epics_base_rs::server::database::ProcStack::new();

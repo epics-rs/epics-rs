@@ -56,7 +56,7 @@ impl LinkSet for Remote {
 async fn the_old_links_late_answer_does_not_complete_the_next_cycle() {
     let (db, _h) = IocBuilder::new()
         .db_string(
-            r#"record(ao,"A"){field(DTYP,"Async Soft Channel") field(OUT,"ca://P1")}"#,
+            r#"record(ao,"A"){field(DTYP,"Async Soft Channel") field(OUT,"P1 CA")}"#,
             &HashMap::new(),
         )
         .unwrap()
@@ -91,7 +91,7 @@ async fn the_old_links_late_answer_does_not_complete_the_next_cycle() {
     db.put_pv("A", EpicsValue::Double(1.0)).await.unwrap();
     db.process_record("A").await.unwrap();
     sent(1).await;
-    db.put_record_field_from_ca("A", "OUT", EpicsValue::String("ca://P2".into()))
+    db.put_record_field_from_ca("A", "OUT", EpicsValue::String("P2 CA".into()))
         .await
         .unwrap();
     // The relink drops PACT (`dbAccess.c:1194`), and the put callback it

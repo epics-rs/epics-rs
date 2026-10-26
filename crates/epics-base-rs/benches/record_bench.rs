@@ -82,7 +82,7 @@ fn bench_link_parsing(c: &mut Criterion) {
     });
 
     c.bench_function("parse_link_ca", |b| {
-        b.iter(|| parse_link_v2(black_box("ca://REMOTE:PV.VAL")))
+        b.iter(|| parse_link_v2(black_box("REMOTE:PV.VAL CA")))
     });
 }
 

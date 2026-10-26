@@ -422,7 +422,7 @@ pub(crate) struct LinkPutQueue {
     /// `IocApplication::run` and for a test is inside its `#[tokio::test]`.
     ///
     /// The queue is the one place on the record-processing chain that cannot
-    /// live on the background executor: `LinkSet::connect_link` for a `ca://`
+    /// live on the background executor: `LinkSet::connect_link` for a CA
     /// target builds a `CaClient`, whose transport manager and search engine
     /// own `tokio::net` sockets. Staging, by contrast, happens on whatever
     /// thread processed the record — often a blocking connection thread with
@@ -473,7 +473,7 @@ impl LinkPutQueue {
     /// [`Self::reactor`], and it is a *refusal*, never a fallback: there is no
     /// second executor that could do the work. The process-global background
     /// executor cannot — `runtime::task::spawn_background` documents that it
-    /// deliberately has no `tokio::net` reactor — so sending a `ca://` open or
+    /// deliberately has no `tokio::net` reactor — so sending a CA open or
     /// put there only moves the panic onto a callback-pool worker. Callers
     /// refuse instead; [`super::PvDatabase::external_put_gate`] turns that
     /// into the record's LINK alarm before anything is staged.
@@ -974,7 +974,7 @@ impl LinkPutQueue {
 /// keeping at most one write in flight per link (so per-link write ordering
 /// is preserved) while distinct links proceed independently. C gets that for
 /// free because `ca_array_put` only queues into libca's send buffer; ours has
-/// to spawn because `LinkSet::put_value` for `pva://` is a full PUT round
+/// to spawn because `LinkSet::put_value` for pva is a full PUT round
 /// trip, and one slow target must not stall every other link's writes.
 async fn owner_loop(
     queue: Weak<LinkPutQueue>,

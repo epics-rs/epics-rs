@@ -141,7 +141,7 @@ async fn three_step_sseq(db: &PvDatabase, prefix: &str, admission: PutAdmission)
     let mut sseq = SseqRecord::new();
     sseq.put_field("SELM", EpicsValue::Short(0)).unwrap(); // All
     sseq.put_field("DO1", EpicsValue::Double(1.0)).unwrap();
-    sseq.put_field("LNK1", EpicsValue::String("ca://NO:SUCH:PV".into()))
+    sseq.put_field("LNK1", EpicsValue::String("NO:SUCH:PV CA".into()))
         .unwrap();
     sseq.put_field("WAIT1", EpicsValue::Short(1)).unwrap(); // Wait
     sseq.put_field("DO2", EpicsValue::Double(22.0)).unwrap();

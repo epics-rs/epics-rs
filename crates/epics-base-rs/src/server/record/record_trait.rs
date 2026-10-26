@@ -1000,7 +1000,7 @@ pub struct OutTarget {
     /// C `plink->type` once `dbInitLink` has run, the value every
     /// `plink->type == CA_LINK` / `CONSTANT` test in device support reads
     /// (`devsCalcoutSoft.c:78`, `:113`, `sseqRecord.c:717`,
-    /// `tableRecord.c:2321`): `Ca` for a `CA`/`ca://` link or a DB-style name
+    /// `tableRecord.c:2321`): `Ca` for a ` CA` link or a DB-style name
     /// not served here, `Json` for a PV Access link, `Constant` for a literal
     /// or an empty link. A removed DB or CA link keeps `PV_LINK`
     /// (`dbDbLink.c:132`), which is `Other`, not `Constant`.

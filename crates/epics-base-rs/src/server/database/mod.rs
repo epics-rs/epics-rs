@@ -944,8 +944,8 @@ struct PvDatabaseInner {
     /// reader can see `true` with no table (and find nothing to do) but never
     /// `false` with a live table.
     debugging: std::sync::atomic::AtomicBool,
-    /// Per-scheme link sets — pluggable backends for `pva://` /
-    /// `ca://` link resolution, the only route `resolve_external_pv` takes.
+    /// Per-scheme link sets — pluggable backends for `pva` / `ca` link
+    /// resolution, the only route `resolve_external_pv` takes.
     /// Mirrors the C-EPICS lset abstraction.
     ///
     /// Read-modify-write cell (`register_link_set` inserts one scheme into
@@ -960,7 +960,7 @@ struct PvDatabaseInner {
     ca_links: Arc<ca_link::CaLinks>,
     /// Pending external OUT-link writes — the `dbCa` `workList` analogue.
     /// Record processing stages a write here and returns; the queue's single
-    /// owner task performs the `ca://`/`pva://` network write off the
+    /// owner task performs the `ca`/`pva` network write off the
     /// record's advisory write gate, exactly as `dbCaTask` does
     /// (`dbCa.c:1093-1260`). See [`link_put_queue`].
     link_puts: Arc<link_put_queue::LinkPutQueue>,
@@ -2222,10 +2222,11 @@ impl PvDatabase {
         out
     }
 
-    /// Resolve an external PV name through the one lset its scheme names:
-    /// `pva` for `pva://`, `ca` for `ca://` and a bare name. No other lset
-    /// is asked — C picks one lset per link and never searches across them
-    /// (`dbLink.c:107-130`).
+    /// Resolve an external PV name through the one lset the link is
+    /// addressed to
+    /// ([`ExternalRef::lset`](crate::server::record::ExternalRef::lset)). No
+    /// other lset is asked — C picks one lset per link and never searches
+    /// across them (`dbLink.c:107-130`).
     ///
     /// # Cached read, then a staged open — C `dbCaGetLink`
     ///
@@ -2247,7 +2248,6 @@ impl PvDatabase {
         &self,
         link: crate::server::record::ExternalRef<'_>,
     ) -> Option<EpicsValue> {
-        // Try lsets first: the scheme's one lset, `ca` for a bare name.
         let (scheme, lref) = Self::external_link_ref(link);
         if let Some(v) =
             link_put_queue::find_lset(&self.inner, scheme, |lset| lset.get_cached_value(lref))
@@ -2258,30 +2258,11 @@ impl PvDatabase {
         None
     }
 
-    /// Split an external link's boundary name
-    /// ([`crate::server::record::ParsedLink::external_pv_name`]) into the
-    /// scheme of its one lset plus the name that lset is addressed with.
-    ///
-    /// Single owner of the `ca://` / `pva://` prefix convention: the
-    /// cache-miss stage in `resolve_external_pv` and the iocInit
-    /// open pass ([`PvDatabase::setup_external_link_opens`]) must derive
-    /// the same [`link_put_queue::Channel`] from the same link, or the
-    /// queue's once-per-link open would fire twice under two spellings.
-    fn split_external_link_name(name: &[u8]) -> (&'static str, &[u8]) {
-        if let Some(rest) = name.strip_prefix(b"pva://") {
-            ("pva", rest)
-        } else {
-            ("ca", name.strip_prefix(b"ca://").unwrap_or(name))
-        }
-    }
-
-    /// `link` as the one lset its scheme names addresses it
-    /// ([`Self::split_external_link_name`]).
+    /// `link` as the one lset it is addressed to addresses it.
     pub(crate) fn external_link_ref(
         link: crate::server::record::ExternalRef<'_>,
     ) -> (&'static str, LinkRef<'_>) {
-        let (scheme, body) = Self::split_external_link_name(link.name);
-        (scheme, LinkRef::new(body, link.open))
+        (link.lset.scheme(), LinkRef::new(link.name, link.open))
     }
 
     /// Whether `scheme`'s lset can take a link to `body`: the `ca` set only
@@ -2298,11 +2279,9 @@ impl PvDatabase {
     /// reached the wire — C's `pca->nNoWrite`, which `dbcar` prints beside
     /// the link (`dbCaTest.c:111-116`).
     ///
-    /// `link_name` is the link string as a record carries it, with or
-    /// without a `ca://` / `pva://` prefix; it is split by
-    /// `Self::split_external_link_name`, the same owner of that convention
-    /// the write path stages under, so the two cannot key the counter
-    /// differently. C keeps the count per `caLink`, i.e. per link field, and
+    /// `link_name` is a CA link's PV name as the record carries it: `dbcar`
+    /// reports CA links alone. C keeps the count per `caLink`, i.e. per link
+    /// field, and
     /// so does the queue: two records whose OUT links name one PV have two
     /// counters.
     pub fn external_link_puts_coalesced_for(
@@ -2314,10 +2293,12 @@ impl PvDatabase {
         let Some(rec) = self.get_record(record) else {
             return 0;
         };
-        let (scheme, body) = Self::split_external_link_name(link_name.as_ref());
-        self.inner
-            .link_puts
-            .coalesced_for(rec.index(), field, scheme, body)
+        self.inner.link_puts.coalesced_for(
+            rec.index(),
+            field,
+            crate::server::record::LinkSetTarget::Ca.scheme(),
+            link_name.as_ref(),
+        )
     }
 
     /// C `dbCaLinkInit` (`dbCa.c:322-346`), which `iocBuild` calls before it
@@ -2389,7 +2370,7 @@ impl PvDatabase {
         if link.open.is_set() || link.open.is_removed() {
             return false;
         }
-        let (scheme, body) = Self::split_external_link_name(link.name);
+        let (scheme, body) = (link.lset.scheme(), link.name);
         if !self.link_addressable(scheme, body) {
             return false;
         }
@@ -5750,7 +5731,7 @@ mod tests {
         use crate::server::records::ai::AiRecord;
 
         let db = PvDatabase::new();
-        // A `pva` link set has to be installed for a `pva://` link to survive
+        // A `pva` link set has to be installed for a pva link to survive
         // `db_init_link_locality`, which refuses a link whose scheme nothing
         // can service. This test is about the ENUMERATION reaching
         // `common.text.inp`, so it installs the lset the link names rather than
@@ -5770,7 +5751,7 @@ mod tests {
         // exact storage a `field_list()` String scan cannot reach.
         {
             let rec = db.get_record("AI").unwrap();
-            rec.write().common.text.inp = "pva://mini:current?proc=CP".into();
+            rec.write().common.text.inp = r#"{pva:"mini:current?proc=CP"}"#.into();
         }
 
         let links = db.record_link_fields("AI");
@@ -5778,10 +5759,10 @@ mod tests {
             .iter()
             .find(|(f, _, _)| f == "INP")
             .unwrap_or_else(|| panic!("INP link must be surfaced, got {links:?}"));
-        assert_eq!(inp.1, "pva://mini:current?proc=CP");
+        assert_eq!(inp.1, r#"{pva:"mini:current?proc=CP"}"#);
         assert!(
             matches!(inp.2, ParsedLink::Pva(_)),
-            "a pva:// INP must parse to ParsedLink::Pva, got {:?}",
+            "a pva INP must parse to ParsedLink::Pva, got {:?}",
             inp.2
         );
     }

@@ -250,9 +250,9 @@ fn channel_native(channel: &CaChannel) -> Option<(DbFieldType, u32)> {
     }
 }
 
-/// The single owner of a `ca://` link's connection-state transition.
+/// The single owner of a CA link's connection-state transition.
 ///
-/// **Invariant.** A `ca://` link's servability flag MUST NOT go from
+/// **Invariant.** A CA link's servability flag MUST NOT go from
 /// connected to disconnected without dispatching that PV's CP/CPP holders.
 /// C `connectionCallback` (`dbCa.c:817-830`) clears `pca->isConnected` and,
 /// in the same critical section, sets `CA_DBPROCESS` for a `pvlOptCP` link
@@ -776,8 +776,7 @@ pub struct CaLinkResolver {
     /// only created once a link is added). Seeded eagerly by
     /// [`Self::with_client`] when a caller wants to share/pin a client.
     client: Arc<tokio::sync::OnceCell<Arc<CaClient>>>,
-    /// Open links by [`LinkSerial`], each with its bare PV name (`ca://`
-    /// scheme stripped).
+    /// Open links by [`LinkSerial`], each with its PV name.
     links: Arc<RwLock<HashMap<LinkSerial, (RecordName, Arc<CaLink>)>>>,
     /// Database handle the link's processor uses to process external
     /// CP/CPP holder records on each remote change
@@ -867,7 +866,7 @@ impl CaLinkResolver {
             std::collections::hash_map::Entry::Occupied(won) => return Some(won.get().1.clone()),
             std::collections::hash_map::Entry::Vacant(entry) => entry,
         };
-        let pv_name = RecordName::from(strip_ca_scheme(link.name));
+        let pv_name = RecordName::from(link.name);
         let opened = self.start_net(client, pv_name.clone(), link);
         Some(entry.insert((pv_name, opened)).1.clone())
     }
@@ -933,7 +932,7 @@ impl CaLinkResolver {
         pv_name: impl AsRef<[u8]>,
         timeout: std::time::Duration,
     ) -> bool {
-        let name = strip_ca_scheme(pv_name.as_ref());
+        let name = pv_name.as_ref();
         let deadline = epics_base_rs::runtime::time::deadline_from_now(timeout);
         loop {
             let ready = {
@@ -1420,7 +1419,7 @@ impl LinkSet for CaLinkResolver {
         // `CA_PROTO_WRITE` (`put_nowait`) keeps a slow or hung remote
         // CA server from stalling normal record processing, while `Async`
         // keeps the WRITE_NOTIFY completion the writer waits on.
-        let name = strip_ca_scheme(link.name);
+        let name = link.name;
         let Some(link) = self.open_link(link).await else {
             let reason = format!("CA link {} not open", String::from_utf8_lossy(name));
             return (LinkPutDone::NotIssued, Err(reason));
@@ -1526,17 +1525,9 @@ impl LinkSet for CaLinkResolver {
     }
 }
 
-/// Strip a leading `ca://` scheme prefix. `epics-base-rs` stores both
-/// the scheme-prefixed and the bare form in `ParsedLink::Ca`
-/// depending on the link syntax (`ca://X` vs the bare ` CA` modifier),
-/// so the resolver normalises to the bare PV name.
-fn strip_ca_scheme(name: &[u8]) -> &[u8] {
-    name.strip_prefix(b"ca://").unwrap_or(name)
-}
-
 /// Install a [`CaLinkResolver`] on `db`, registered under the `"ca"`
 /// lset scheme. After this, a record whose link field resolves to
-/// `ParsedLink::Ca` (a `ca://X` link or a bare ` CA`-modified link)
+/// `ParsedLink::Ca` (a non-local PV name, or one with a ` CA` modifier)
 /// reads through the monitor-backed CA cache via
 /// `PvDatabase::resolve_external_pv`.
 ///
@@ -1565,12 +1556,6 @@ mod tests {
     use super::*;
     use crate::client::ConnectionEvent;
     use source_guard::{Comments, production};
-
-    #[test]
-    fn strip_ca_scheme_handles_both_forms() {
-        assert_eq!(strip_ca_scheme(b"ca://OTHER:PV"), b"OTHER:PV");
-        assert_eq!(strip_ca_scheme(b"OTHER:PV"), b"OTHER:PV");
-    }
 
     /// The CA record-link monitor mask matches C `dbCa`'s
     /// `ca_add_array_event` = `DBE_VALUE | DBE_ALARM` and EXCLUDES
@@ -1774,9 +1759,7 @@ mod tests {
     fn cp_holder() -> (Arc<LinkConnState>, Arc<FlagLset>, PvDatabase) {
         use epics_base_rs::server::records::ai::AiRecord;
         let db_slot = Arc::new(RwLock::new(None));
-        let inp = Arc::new(epics_base_rs::server::record::parse_link_v2(
-            "ca://UP:PV CP",
-        ));
+        let inp = Arc::new(epics_base_rs::server::record::parse_link_v2("UP:PV CP"));
         let ext = inp.external().unwrap();
         let state = Arc::new(LinkConnState::new(
             db_slot.clone(),
@@ -1796,7 +1779,7 @@ mod tests {
             {
                 let rec = db.get_record("HOLDER").unwrap();
                 let mut inst = rec.write();
-                inst.common.text.inp = "ca://UP:PV CP".into();
+                inst.common.text.inp = "UP:PV CP".into();
                 inst.install_link_cache("INP", inp).expect("a common link");
             }
             db.initialize_link_locality().await;
@@ -1842,13 +1825,11 @@ mod tests {
         db.add_record("H", Box::new(AiRecord::new(0.0)))
             .await
             .unwrap();
-        let inp = Arc::new(epics_base_rs::server::record::parse_link_v2(
-            "ca://UP:PV CP",
-        ));
+        let inp = Arc::new(epics_base_rs::server::record::parse_link_v2("UP:PV CP"));
         {
             let rec = db.get_record("H").unwrap();
             let mut inst = rec.write();
-            inst.common.text.inp = "ca://UP:PV CP".into();
+            inst.common.text.inp = "UP:PV CP".into();
             inst.install_link_cache("INP", inp.clone())
                 .expect("a common link");
         }
@@ -1891,13 +1872,11 @@ mod tests {
             .build()
             .await
             .unwrap();
-        let inp = Arc::new(epics_base_rs::server::record::parse_link_v2(
-            "ca://UP:PV CP",
-        ));
+        let inp = Arc::new(epics_base_rs::server::record::parse_link_v2("UP:PV CP"));
         {
             let rec = db.get_record("H").unwrap();
             let mut inst = rec.write();
-            inst.common.text.inp = "ca://UP:PV CP".into();
+            inst.common.text.inp = "UP:PV CP".into();
             inst.install_link_cache("INP", inp.clone())
                 .expect("a common link");
         }

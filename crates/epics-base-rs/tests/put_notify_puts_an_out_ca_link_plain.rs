@@ -44,7 +44,7 @@ async fn a_put_notify_puts_an_out_ca_link_plain() {
     db.add_record("AO", Box::new(AoRecord::new(0.0)))
         .await
         .unwrap();
-    db.put_pv_no_process("AO.OUT", EpicsValue::String("ca://REMOTE:OUT".into()))
+    db.put_pv_no_process("AO.OUT", EpicsValue::String("REMOTE:OUT CA".into()))
         .await
         .unwrap();
     db.put_pv_no_process("AO.VAL", EpicsValue::Double(3.0))

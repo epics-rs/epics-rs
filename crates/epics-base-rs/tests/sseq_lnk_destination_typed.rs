@@ -327,7 +327,7 @@ async fn unresolved_destination_is_not_written_at_all() {
     let mut sseq = SseqRecord::new();
     sseq.put_field("DOL1", EpicsValue::String("SRC_U.VAL".into()))
         .unwrap();
-    sseq.put_field("LNK1", EpicsValue::String("ca://EXT_UNKNOWN".into()))
+    sseq.put_field("LNK1", EpicsValue::String("EXT_UNKNOWN CA".into()))
         .unwrap();
     db.add_record("SSEQ_UN", Box::new(sseq)).await.unwrap();
 
@@ -377,7 +377,7 @@ async fn resolved_external_string_destination_takes_the_string_view() {
     sseq.prec = 3;
     sseq.put_field("DOL1", EpicsValue::String("SRC_E.VAL".into()))
         .unwrap();
-    sseq.put_field("LNK1", EpicsValue::String("ca://EXT_STR".into()))
+    sseq.put_field("LNK1", EpicsValue::String("EXT_STR CA".into()))
         .unwrap();
     db.add_record("SSEQ_EX", Box::new(sseq)).await.unwrap();
 

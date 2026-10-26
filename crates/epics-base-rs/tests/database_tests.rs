@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use epics_base_rs::error::CaError;
 use epics_base_rs::server::database::{PvDatabase, RecordLoad};
+use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::record::*;
 use epics_base_rs::server::records::ai::AiRecord;
 use epics_base_rs::server::records::ao::AoRecord;
@@ -25,6 +26,17 @@ fn sub_with_snam(snam: &str) -> epics_base_rs::server::records::sub_record::SubR
     rec.put_field("SNAM", EpicsValue::String(snam.into()))
         .expect("SNAM is writable");
     rec
+}
+
+/// A database that declares the `pva` link type, as softIocPVX's does; a
+/// `{pva:…}` link text is refused by a database that does not.
+async fn pva_database() -> Arc<PvDatabase> {
+    IocBuilder::new()
+        .register_link_type("pva", |_db| async { Vec::new() })
+        .build()
+        .await
+        .unwrap()
+        .0
 }
 
 #[epics_macros_rs::epics_test]
@@ -361,7 +373,7 @@ async fn test_out_link_nms_does_not_propagate_alarm_to_dest() {
 }
 
 /// B2 regression: a soft-channel record whose INP is an external
-/// `pva://` link must fold the lset's gated alarm severity into its
+/// pva link must fold the lset's gated alarm severity into its
 /// own `LINK_ALARM`. Previously `read_link_with_alarm` returned
 /// `(None, None)` for any non-Db link, so a connected pva link
 /// carrying a remote MAJOR severity left the owning record at
@@ -393,14 +405,17 @@ async fn test_pva_link_propagates_alarm_severity_into_link_alarm() {
         }
     }
 
-    let db = PvDatabase::new();
+    let db = pva_database().await;
     db.register_link_set("pva", Arc::new(AlarmingLset)).await;
     db.add_record("PVADST", Box::new(AiRecord::new(0.0)))
         .await
         .unwrap();
-    db.put_pv_no_process("PVADST.INP", EpicsValue::String("pva://REMOTE:PV".into()))
-        .await
-        .unwrap();
+    db.put_pv_no_process(
+        "PVADST.INP",
+        EpicsValue::String(r#"{pva:"REMOTE:PV"}"#.into()),
+    )
+    .await
+    .unwrap();
     if let Some(rec) = db.get_record("PVADST") {
         let mut inst = rec.write();
         inst.common.udf = 0;
@@ -455,14 +470,17 @@ async fn test_pva_link_no_alarm_when_lset_reports_none() {
         // alarm_severity defaults to None.
     }
 
-    let db = PvDatabase::new();
+    let db = pva_database().await;
     db.register_link_set("pva", Arc::new(QuietLset)).await;
     db.add_record("PVAQUIET", Box::new(AiRecord::new(0.0)))
         .await
         .unwrap();
-    db.put_pv_no_process("PVAQUIET.INP", EpicsValue::String("pva://REMOTE:OK".into()))
-        .await
-        .unwrap();
+    db.put_pv_no_process(
+        "PVAQUIET.INP",
+        EpicsValue::String(r#"{pva:"REMOTE:OK"}"#.into()),
+    )
+    .await
+    .unwrap();
     if let Some(rec) = db.get_record("PVAQUIET") {
         let mut inst = rec.write();
         inst.common.udf = 0;
@@ -534,7 +552,7 @@ impl epics_base_rs::server::database::LinkSet for CapturingLset {
     }
 }
 
-/// A record whose OUT link is an external `pva://` link must drive
+/// A record whose OUT link is an external pva link must drive
 /// the processed value through the registered link set's `put_value`.
 ///
 /// Before this fix the OUT-link write stage in `processing.rs` only
@@ -551,9 +569,7 @@ async fn test_pva_out_link_writes_value_through_link_set() {
     use epics_base_rs::server::database::LinkPutOp;
 
     let writes = Arc::new(Mutex::new(Vec::new()));
-    let db = PvDatabase::new();
-    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
-    db.ca_link_init();
+    let db = pva_database().await;
     db.register_link_set(
         "pva",
         Arc::new(CapturingLset {
@@ -569,7 +585,7 @@ async fn test_pva_out_link_writes_value_through_link_set() {
         .unwrap();
     db.put_pv_no_process(
         "AO_PVAOUT.OUT",
-        EpicsValue::String("pva://REMOTE:OUT".into()),
+        EpicsValue::String(r#"{pva:"REMOTE:OUT"}"#.into()),
     )
     .await
     .unwrap();
@@ -600,7 +616,7 @@ async fn test_pva_out_link_writes_value_through_link_set() {
     );
     assert_eq!(
         captured[0].0, "REMOTE:OUT",
-        "put_value must receive the bare PV name (scheme stripped)"
+        "put_value must receive the bare PV name"
     );
     assert_eq!(
         captured[0].1.to_f64(),
@@ -615,19 +631,19 @@ async fn test_pva_out_link_writes_value_through_link_set() {
     );
 }
 
-/// A record with a `pva://` OUT link and NO registered link set must
+/// A record with a pva OUT link and NO registered link set must
 /// fail gracefully — process() completes without panic, the value is
 /// simply not delivered (C `dbPutLink` returns `S_db_noLSET`).
 #[epics_macros_rs::epics_test]
 async fn test_pva_out_link_no_link_set_fails_gracefully() {
-    let db = PvDatabase::new();
-    // No register_link_set call — the "pva" scheme is unregistered.
+    let db = pva_database().await;
+    // The `pva` link type is declared, but no link set is registered.
     db.add_record("AO_NOLSET", Box::new(AoRecord::new(0.0)))
         .await
         .unwrap();
     db.put_pv_no_process(
         "AO_NOLSET.OUT",
-        EpicsValue::String("pva://NOWHERE:PV".into()),
+        EpicsValue::String(r#"{pva:"NOWHERE:PV"}"#.into()),
     )
     .await
     .unwrap();
@@ -667,9 +683,7 @@ async fn test_pva_out_link_put_notify_chain_puts_plain() {
     use epics_base_rs::server::database::LinkPutOp;
 
     let writes = Arc::new(Mutex::new(Vec::new()));
-    let db = PvDatabase::new();
-    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
-    db.ca_link_init();
+    let db = pva_database().await;
     db.register_link_set(
         "pva",
         Arc::new(CapturingLset {
@@ -687,7 +701,7 @@ async fn test_pva_out_link_put_notify_chain_puts_plain() {
     let (tx, _rx) = epics_base_rs::runtime::sync::oneshot::channel();
     db.put_pv_no_process(
         "AO_PVAOUT_NOTIFY.OUT",
-        EpicsValue::String("pva://REMOTE:OUT".into()),
+        EpicsValue::String(r#"{pva:"REMOTE:OUT"}"#.into()),
     )
     .await
     .unwrap();
@@ -7081,7 +7095,7 @@ async fn test_tsel_ca_time_link_copies_source_time() {
     {
         let rec = db.get_record("TS_CADST").unwrap();
         let mut inst = rec.write();
-        inst.common.text.tsel = "ca://TSE_SRC.TIME".into();
+        inst.common.text.tsel = "TSE_SRC.TIME CA".into();
         let tsel = parse_link_v2(&inst.common.text.tsel);
         inst.install_link_cache("TSEL", std::sync::Arc::new(tsel))
             .expect("a common link");
@@ -7109,7 +7123,7 @@ async fn test_tsel_ca_time_link_copies_source_time() {
 
 #[epics_macros_rs::epics_test]
 async fn test_tsel_nonlocal_db_time_link_copies_remote_time() {
-    // A bare TSEL `.TIME` link (no `ca://`, no CP/CPP/CA modifier) whose
+    // A bare TSEL `.TIME` link (no CP/CPP/CA modifier) whose
     // target record is NOT local. C `dbInitLink` (dbLink.c:115-130) sets
     // `TSELisTIME` and strips `.TIME` BEFORE the DB-vs-CA decision, then
     // `dbDbInitLink` fails for the non-local target so the link becomes a
@@ -7136,7 +7150,7 @@ async fn test_tsel_nonlocal_db_time_link_copies_remote_time() {
             let name = link.name;
             // The bare Db record name (`.TIME` already split into the link
             // field by the parser) reaches the CA lset via the non-local
-            // fallback `external_link_time("ca://TSE_SRC")`.
+            // fallback CA `external_link_time` for `TSE_SRC`.
             assert_eq!(
                 name, b"TSE_SRC",
                 "non-local TSEL .TIME must address the bare record"
@@ -9525,7 +9539,7 @@ async fn br_fr3_ca_link_applies_maximize_switch_at_processing() {
     const REMOTE_STAT: i32 = alarm_status::COMM_ALARM as i32;
 
     // NMS — no propagation despite a connected MAJOR remote.
-    let (sevr, _stat) = run("ca://REMOTE NMS", 2, REMOTE_STAT).await;
+    let (sevr, _stat) = run("REMOTE CA NMS", 2, REMOTE_STAT).await;
     assert_eq!(
         sevr,
         AlarmSeverity::NoAlarm,
@@ -9533,7 +9547,7 @@ async fn br_fr3_ca_link_applies_maximize_switch_at_processing() {
     );
 
     // MS — lift to remote MAJOR, but surface as the generic LINK_ALARM.
-    let (sevr, stat) = run("ca://REMOTE MS", 2, REMOTE_STAT).await;
+    let (sevr, stat) = run("REMOTE CA MS", 2, REMOTE_STAT).await;
     assert_eq!(sevr, AlarmSeverity::Major, "MS lifts SEVR to remote MAJOR");
     assert_eq!(
         stat,
@@ -9542,7 +9556,7 @@ async fn br_fr3_ca_link_applies_maximize_switch_at_processing() {
     );
 
     // MSS — lift severity AND adopt the remote STAT (the cited gap).
-    let (sevr, stat) = run("ca://REMOTE MSS", 2, REMOTE_STAT).await;
+    let (sevr, stat) = run("REMOTE CA MSS", 2, REMOTE_STAT).await;
     assert_eq!(sevr, AlarmSeverity::Major, "MSS lifts SEVR to remote MAJOR");
     assert_eq!(
         stat,
@@ -9551,7 +9565,7 @@ async fn br_fr3_ca_link_applies_maximize_switch_at_processing() {
     );
 
     // MSI with a non-INVALID (MAJOR) remote — must NOT propagate.
-    let (sevr, _stat) = run("ca://REMOTE MSI", 2, REMOTE_STAT).await;
+    let (sevr, _stat) = run("REMOTE CA MSI", 2, REMOTE_STAT).await;
     assert_eq!(
         sevr,
         AlarmSeverity::NoAlarm,
@@ -9559,7 +9573,7 @@ async fn br_fr3_ca_link_applies_maximize_switch_at_processing() {
     );
 
     // MSI with an INVALID remote — inherits as LINK_ALARM + INVALID.
-    let (sevr, stat) = run("ca://REMOTE MSI", 3, REMOTE_STAT).await;
+    let (sevr, stat) = run("REMOTE CA MSI", 3, REMOTE_STAT).await;
     assert_eq!(
         sevr,
         AlarmSeverity::Invalid,

@@ -52,7 +52,7 @@ impl LinkSet for Remote {
 
 async fn relink_with_a_put_staged(new_out: &str) -> (Vec<(String, f64)>, Vec<(String, f64)>) {
     let (db, _) = IocBuilder::new()
-        .db_string(r#"record(ao,"A"){field(OUT,"ca://P1")}"#, &HashMap::new())
+        .db_string(r#"record(ao,"A"){field(OUT,"P1 CA")}"#, &HashMap::new())
         .unwrap()
         .build()
         .await
@@ -93,14 +93,14 @@ async fn put(db: &PvDatabase, field: &str, value: EpicsValue) {
 
 #[epics_macros_rs::epics_test]
 async fn a_relink_to_the_same_name_drops_the_staged_value() {
-    let (before, after) = relink_with_a_put_staged("ca://P1").await;
+    let (before, after) = relink_with_a_put_staged("P1 CA").await;
     assert_eq!(before, vec![("P1".to_string(), 1.0)], "2 is never written");
     assert_eq!(after, vec![("P1".to_string(), 3.0)], "the new link writes");
 }
 
 #[epics_macros_rs::epics_test]
 async fn a_relink_to_another_name_drops_the_staged_value() {
-    let (before, after) = relink_with_a_put_staged("ca://P2").await;
+    let (before, after) = relink_with_a_put_staged("P2 CA").await;
     assert_eq!(
         before,
         vec![("P1".to_string(), 1.0)],

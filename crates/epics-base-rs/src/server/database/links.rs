@@ -2708,7 +2708,7 @@ impl PvDatabase {
     }
 
     /// Build a [`LinkAlarm`] from the registered lset's alarm
-    /// accessors for an external (`pva://` / `ca://`) link, or `None`
+    /// accessors for an external (CA / `{pva:…}`) link, or `None`
     /// when no lset is registered or the lset reports no alarm.
     ///
     /// The lset's `alarm_severity` is the gated severity (see
@@ -2737,8 +2737,8 @@ impl PvDatabase {
         })
     }
 
-    /// Ungated remote alarm snapshot for an external (`pva://` /
-    /// `ca://`) link — the DB-link inspection counterpart of
+    /// Ungated remote alarm snapshot for an external (CA / `{pva:…}`)
+    /// link — the DB-link inspection counterpart of
     /// `Self::external_link_alarm`.
     ///
     /// Where `external_link_alarm` returns the **gated** maximize-severity
@@ -2764,7 +2764,7 @@ impl PvDatabase {
     }
 
     /// Remote display / control / valueAlarm metadata for an external
-    /// (`pva://` / `ca://`) link, resolved through the registered
+    /// (CA / `{pva:…}`) link, resolved through the registered
     /// lset's [`crate::server::database::LinkSet::link_metadata`] hook.
     ///
     /// This is the DB-link-API entry point that exposes the linked PV
@@ -2773,9 +2773,7 @@ impl PvDatabase {
     /// `pvaGetGraphicLimits` / `pvaGetAlarmLimits` / `pvaGetPrecision`
     /// / `pvaGetUnits` getters
     /// (`pvxs/ioc/pvalink_lset.cpp:706-732`). Scheme dispatch mirrors
-    /// `Self::external_link_alarm`: an explicit `pva://` / `ca://`
-    /// prefix selects the lset directly, a bare name tries every
-    /// registered lset until one reports metadata.
+    /// `Self::external_link_alarm`: the link's one lset answers.
     ///
     /// `None` when no lset is registered for the scheme or the lset
     /// has no cached value for the link (not yet connected).
@@ -3810,7 +3808,7 @@ impl PvDatabase {
         }
     }
 
-    /// Write a value to an external (`ca://` / `pva://`) OUT link
+    /// Write a value to an external (CA / `{pva:…}`) OUT link
     /// through the registered [`LinkSet`](super::LinkSet) — **by staging it on the
     /// database's link-put queue and returning**, exactly as C
     /// `dbCaPutLink` stages into `pca->pputNative` and returns
@@ -3824,10 +3822,9 @@ impl PvDatabase {
     /// through `plink->lset->putValue` and raises a link alarm
     /// (`setLinkAlarm`) on failure.
     ///
-    /// `name` may be a fully scheme-prefixed string (`pva://X`,
-    /// `ca://X`) or the bare body (the form stored in
-    /// `ParsedLink::Ca`/`Pva` after `record/link.rs` strips the
-    /// scheme), which is a CA link.
+    /// The link names its lset
+    /// ([`ExternalRef::lset`](crate::server::record::ExternalRef::lset));
+    /// its `name` is that lset's channel name, verbatim.
     ///
     /// # What the returned status means
     ///
@@ -3845,7 +3842,7 @@ impl PvDatabase {
     ///   **not** yet on the wire. This is the fire-and-forget flavour, C's
     ///   `CA_PUT` / `ca_array_put` (`dbCa.c:1163-1166`), and it is the whole
     ///   point of the queue: record processing no longer suspends on a
-    ///   `ca://`/`pva://` round trip inside the record's advisory write gate.
+    ///   CA or pva round trip inside the record's advisory write gate.
     /// * `Ok(())` for [`LinkPutOp::Async`](super::LinkPutOp::Async) too — the completion flavour, C's
     ///   `CA_PUT_CALLBACK` / `ca_array_put_callback` whose `putComplete`
     ///   drives the originating record's completion (`dbCa.c:1167-1171`,
@@ -4021,7 +4018,7 @@ impl PvDatabase {
     ///   (`field_type = 0`, `n_elements = 1`) — the port reports
     ///   [`OutTarget::UNRESOLVED`], whose `None` type routes to the device
     ///   support's `default:` arm.
-    /// - external target (a `CA`/`ca://` link, a DB-parsed name not in this
+    /// - external target (a `CA` link, a DB-parsed name not in this
     ///   IOC, or a PV Access link) — `dbCaGetLinkDBFtype` / `dbCaGetNelements`
     ///   (`dbCa.c:633-675`, both `-1` while disconnected): the lset's cached
     ///   [`LinkMetadata`](super::LinkMetadata), `UNRESOLVED` when the link is
@@ -4240,7 +4237,7 @@ impl PvDatabase {
             // `dbDbPutValue` (`dbDbLink.c:388`): a bare DB link is NPP, the
             // value is written but the target is NOT processed: the slot
             // parsed the field under the OUT-link mask, whose NPP default
-            // that is. An external `ca://`/`pva://` OUT link routes through
+            // that is. An external CA or `{pva:…}` OUT link routes through
             // the link set's `putValue` (C `dbLink.c::dbPutLink`,
             // dbLink.c:434-448).
             // Device-support write-buffer switch: the resolved target's DBF
@@ -4264,7 +4261,7 @@ impl PvDatabase {
 
     /// **The put owner** — C `dbLink.c::dbPutLink` (434-448). Writes a value
     /// through a parsed OUT link, dispatching DB links to
-    /// [`Self::write_db_link_value_in`] and external (`ca://`/`pva://`) links to
+    /// [`Self::write_db_link_value_in`] and external (CA / `{pva:…}`) links to
     /// [`Self::write_external_pv`], and — this is the part no caller may skip
     /// — raising the source record's `LINK_ALARM`/`INVALID` when the put
     /// fails:
@@ -4393,8 +4390,9 @@ impl PvDatabase {
     }
 
     /// C `dbPutLinkAsync` (`dbLink.c:462-474`) of a `devXxxSoftCallback`
-    /// write, under the record's guard. Only a CA link has a `putAsync` — a
-    /// `ca://`/`pva://` link, or a DB link whose target is not here — and it
+    /// write, under the record's guard. Only an external link has a
+    /// `putAsync` — a CA or `{pva:…}` link, or a DB link whose target is not
+    /// here — and it
     /// only stages the put, so no other record is locked. Any other link
     /// answers `S_db_noLSET` for the caller's `dbPutLink`. A refused
     /// `putAsync` alarms as `dbPutLinkAsync` does (`:469-471`).
@@ -5001,7 +4999,7 @@ impl PvDatabase {
                         // Through the put owner, so a failed OUTn raises the
                         // record's LINK_ALARM/INVALID from inside the put (C
                         // `dbPutLink`'s `setLinkAlarm`) — an external
-                        // `ca://`/`pva://` OUTn goes through the link set's
+                        // CA or `{pva:…}` OUTn goes through the link set's
                         // `putValue` exactly as a DB link does
                         // (dbLink.c:434-448). `link_failed` additionally
                         // carries dfanout's OWN LINK_ALARM/MAJOR
@@ -5187,7 +5185,7 @@ impl PvDatabase {
         // modifier. A bare `LNKn` is NPP — the value is written but the target
         // is NOT processed. `parse_output_link_v2` applies that NPP default
         // (the dfanout arm open-codes the same downgrade). LNKn may be a local
-        // DB link or an external `ca://`/`pva://` link — C `dbPutLink` routes
+        // DB link or an external CA or `{pva:…}` link — C `dbPutLink` routes
         // both through the link set's `putValue` (dbLink.c:434-448). Only a
         // real LNK does anything; a constant LNK is a no-op.
         if lnk_real {
@@ -5598,7 +5596,6 @@ impl PvDatabase {
                 let parsed = crate::server::record::parse_link_field(&text, ftype);
                 let unserviceable = parsed.required_link_set_scheme();
                 let was_db = matches!(parsed, ParsedLink::Db(_));
-                let json = parsed.db_link_type() == crate::server::record::DbLinkType::JsonLink;
                 // `dbDbInitLink`'s `dbChannelCreate` line; a put printed its
                 // own in `dbPutFieldLink`, which `dbAddLink` reuses.
                 if let ParsedLink::Db(db) = &parsed
@@ -5618,14 +5615,11 @@ impl PvDatabase {
                         rewrites.push((field, Some(Arc::new(next))))
                     }
                     // C names a `{pva:...}` with no `link(pva, ...)` loaded
-                    // (`dbJLink.c:264`); a `pva://` text is a CA link to C
-                    // (`dbLink.c:119-130`), refused silently.
+                    // (`dbJLink.c:264`).
                     (ParsedLink::None, Some(scheme)) => {
-                        if json {
-                            crate::runtime::log::errlog_vprintf(format_args!(
-                                "dbJLinkInit: Link type '{scheme}' not found\n"
-                            ));
-                        }
+                        crate::runtime::log::errlog_vprintf(format_args!(
+                            "dbJLinkInit: Link type '{scheme}' not found\n"
+                        ));
                         rewrites.push((field, Some(Arc::new(next))));
                     }
                     _ => {}
@@ -5720,10 +5714,11 @@ impl PvDatabase {
         });
     }
 
-    /// `edge` as the registry keys it: by the PV it names and by its link.
+    /// `edge` as the registry keys it: by the PV it names, the name the `ca`
+    /// lset's monitor dispatches under, and by its link.
     fn cp_source(edge: &CpEdge) -> super::CpSource {
         super::CpSource {
-            record: RecordName::from(external_cp_key(&edge.pv)),
+            record: edge.pv.clone(),
             passive_only: edge.passive_only,
             link: edge.open.serial(),
         }
@@ -6307,7 +6302,7 @@ mod nonlocal_db_link_write_tests {
         assert_eq!(captured[0], "OTHER:PROC");
     }
 
-    /// End-to-end: a record whose FLNK targets an external `pva://` PV
+    /// End-to-end: a record whose FLNK targets an external `{pva:…}` PV
     /// must fire its forward handle when it processes — the
     /// non-DB FLNK dispatch the DB-only `flnk_name` filter previously
     /// dropped. C `recGblFwdLink` runs `dbScanFwdLink` for every FLNK
@@ -6329,7 +6324,7 @@ mod nonlocal_db_link_write_tests {
             .unwrap();
         if let Some(rec) = db.get_record("SRC") {
             let mut inst = rec.write();
-            inst.put_common_field("FLNK", EpicsValue::String("pva://TARGET".into()))
+            inst.put_common_field("FLNK", EpicsValue::String(r#"{pva:"TARGET"}"#.into()))
                 .unwrap();
         }
         // The lset opens the link at iocInit, as C's does.
@@ -6344,7 +6339,7 @@ mod nonlocal_db_link_write_tests {
         assert_eq!(
             captured.len(),
             1,
-            "an external pva:// FLNK must fire scan_forward exactly once"
+            "an external pva FLNK must fire scan_forward exactly once"
         );
         assert_eq!(captured[0], "TARGET");
     }
@@ -6372,7 +6367,7 @@ mod nonlocal_db_link_write_tests {
             .unwrap();
         if let Some(rec) = db.get_record("SRC") {
             let mut inst = rec.write();
-            inst.put_common_field("FLNK", EpicsValue::String("pva://TARGET".into()))
+            inst.put_common_field("FLNK", EpicsValue::String(r#"{pva:"TARGET"}"#.into()))
                 .unwrap();
         }
         // The lset opens the link at iocInit, as C's does.
@@ -6404,6 +6399,7 @@ mod nonlocal_db_link_write_tests {
     #[epics_macros_rs::epics_test]
     async fn external_forward_link_added_at_runtime_dispatches() {
         let db = PvDatabase::new();
+        db.declare_link_type("pva");
         let forwards = Arc::new(Mutex::new(Vec::new()));
         db.register_link_set(
             "pva",
@@ -6417,9 +6413,13 @@ mod nonlocal_db_link_write_tests {
             .await
             .unwrap();
         db.ioc_init().await;
-        db.put_record_field_from_ca("SRC", "FLNK", EpicsValue::String("pva://TARGET".into()))
-            .await
-            .unwrap();
+        db.put_record_field_from_ca(
+            "SRC",
+            "FLNK",
+            EpicsValue::String(r#"{pva:"TARGET"}"#.into()),
+        )
+        .await
+        .unwrap();
 
         let mut visited = crate::server::database::ProcStack::new();
         db.process_record_with_links("SRC", &mut visited)
@@ -6434,7 +6434,7 @@ mod nonlocal_db_link_write_tests {
     }
 
     /// A forward whose slot no lset bound does nothing: with no `pva` lset
-    /// registered nothing opens `pva://TARGET`, and C `dbScanFwdLink` skips a
+    /// registered nothing opens `{pva:"TARGET"}`, and C `dbScanFwdLink` skips a
     /// link with no `lset` (`dbLink.c:475-481`) without an alarm.
     #[epics_macros_rs::epics_test]
     async fn unbound_external_forward_link_is_a_silent_no_op() {
@@ -6445,7 +6445,7 @@ mod nonlocal_db_link_write_tests {
         db.get_record("SRC")
             .unwrap()
             .write()
-            .put_common_field("FLNK", EpicsValue::String("pva://TARGET".into()))
+            .put_common_field("FLNK", EpicsValue::String(r#"{pva:"TARGET"}"#.into()))
             .unwrap();
         db.ioc_init().await;
 
@@ -6543,12 +6543,12 @@ mod external_link_pv_name_tests {
             .await
             .unwrap();
 
-        // Two records, one upstream PV, two spellings: the bare ` CA`
-        // modifier and the explicit scheme. One registry entry.
+        // Two records, one upstream PV, two spellings: the ` CP` and ` CA`
+        // modifiers. One registry entry.
         db.get_record("IN1").unwrap().write().common.text.inp = "UP:ZED CP".into();
-        db.get_record("IN2").unwrap().write().common.text.inp = "ca://UP:ZED CP".into();
+        db.get_record("IN2").unwrap().write().common.text.inp = "UP:ZED CA".into();
         // An OUT link reaches `dbCaAddLink` in C exactly as an IN link does.
-        db.get_record("OUT1").unwrap().write().common.text.out = "ca://UP:ALPHA".into();
+        db.get_record("OUT1").unwrap().write().common.text.out = "UP:ALPHA CA".into();
         // A link to a record this IOC does have is local and must not count
         // (a CP one would: it is a CA link, `dbLink.c:118-122`).
         db.get_record("LOCAL_HOLDER")
@@ -6938,7 +6938,7 @@ mod no_reactor_gate_tests {
     ///
     /// The lset says `Connected`, so before this gate the write was staged
     /// and its network half was dispatched onto the background executor —
-    /// which deliberately has no `tokio::net` reactor, so a `ca://` target
+    /// which deliberately has no `tokio::net` reactor, so a CA target
     /// panicked there instead of failing here. C never queues work no owner
     /// can perform: where it cannot do the put it refuses at staging with
     /// `-1` (`db/dbCa.c:529-532` (`dbCaPutLinkCallback`); epics-base
@@ -6957,7 +6957,8 @@ mod no_reactor_gate_tests {
 
         let err = db
             .external_put_admitted(crate::server::record::ExternalRef {
-                name: b"ca://SOME:PV",
+                lset: crate::server::record::LinkSetTarget::Ca,
+                name: b"SOME:PV",
                 open: &crate::server::record::OpenLatch::default(),
             })
             .expect_err("a database with no reactor must refuse the external put");
@@ -7605,19 +7606,13 @@ struct CpEdge {
 impl CpEdge {
     fn external(&self) -> crate::server::record::ExternalRef<'_> {
         crate::server::record::ExternalRef {
+            lset: crate::server::record::LinkSetTarget::Ca,
             name: &self.pv,
             open: &self.open,
         }
     }
 }
 
-/// The external registry's key: the PV the calink/pvalink monitor dispatches
-/// under, which the lset has stripped of its scheme.
-fn external_cp_key(pv: &[u8]) -> &[u8] {
-    pv.strip_prefix(b"ca://")
-        .or_else(|| pv.strip_prefix(b"pva://"))
-        .unwrap_or(pv)
-}
 /// Why [`PvDatabase::write_external_pv`] staged nothing.
 #[derive(Debug)]
 pub(crate) enum ExternalPutRefusal {
@@ -7854,8 +7849,8 @@ mod external_forward_borrow_tests {
             .register_link_type("pva", |_db| async { Vec::new() })
             .db_string(
                 r#"
-record(calc, "S") { field(CALC, "VAL+1") field(FLNK, "pva://T:A") }
-record(fanout, "F") { field(LNK1, "pva://T:B") }
+record(calc, "S") { field(CALC, "VAL+1") field(FLNK, {pva:"T:A"}) }
+record(fanout, "F") { field(LNK1, {pva:"T:B"}) }
 "#,
                 &HashMap::new(),
             )

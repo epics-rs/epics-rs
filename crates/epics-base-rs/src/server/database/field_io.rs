@@ -3493,7 +3493,7 @@ impl PvDatabase {
     /// `LinkSet::put_value` from this thread. It stages the write on the
     /// database's link-put queue and returns, exactly as C `dbCaPutLink`
     /// stages into `pca->pputNative`, calls `addAction` and returns
-    /// (`dbCa.c:515-602`); the `ca://` / `pva://` round trip runs on the
+    /// (`dbCa.c:515-602`); the CA / pva round trip runs on the
     /// queue's owner task, C's `dbCaTask` (`dbCa.c:1161-1183`). See
     /// [`super::link_put_queue`]. What is left inside the window is the
     /// re-entrant database work C also does under `dbScanLock`:

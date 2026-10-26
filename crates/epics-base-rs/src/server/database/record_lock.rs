@@ -2331,7 +2331,7 @@ impl PvDatabase {
     /// `dbLockSetMerge` from `dbDbInitLink`, and a target this IOC does not
     /// have falls through to `dbCaAddLink` instead (`dbLink.c:118-130`), which
     /// merges nothing. `record_link_fields` has already applied that same
-    /// locality rule, so a `ca://` link to a local record is a `Ca` link here
+    /// locality rule, so a CA link to a local record is a `Ca` link here
     /// and does not widen the set.
     fn db_link_targets(&self, record: &[u8]) -> Vec<RecordName> {
         self.db_links(record)

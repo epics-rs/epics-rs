@@ -234,10 +234,9 @@ impl PvaLinkConfig {
     /// explicitly — INP for record input fields, OUT for outputs.
     pub fn parse(s: &str, direction: LinkDirection) -> Result<Self, PvaLinkParseError> {
         // A leading `@` is the INST_IO sigil: the record loader claims such a
-        // field as INST_IO before the scheme arm runs and iocInit refuses it
-        // on a soft record (measured on target). The parser gives the same
-        // answer so there is one rule for the spelling, not a stricter loader
-        // in front of a laxer parser.
+        // field as INST_IO and iocInit refuses it on a soft record (measured
+        // on target). The parser gives the same answer so there is one rule
+        // for the spelling, not a stricter loader in front of a laxer parser.
         let s = s.trim();
         // pvxs accepts both `pva://` and bare `pva:` prefixes.
         let body = s
@@ -894,11 +893,11 @@ mod tests {
 
     /// `@pva://X` is refused by the parser exactly as the record loader
     /// refuses it: `try_parse_hw_link` (`epics-base-rs` `link.rs:1074-1086`)
-    /// claims any field starting with `@` as INST_IO before the scheme arm
-    /// runs, and `iocInit` then refuses it on a soft record (measured on
-    /// target). The parser previously stripped the `@` — a laxer second rule
-    /// on a path with no producer — removed by user decision 2026-07-23 so
-    /// one rule covers the spelling everywhere.
+    /// claims any field starting with `@` as INST_IO, and `iocInit` then
+    /// refuses it on a soft record (measured on target). The parser
+    /// previously stripped the `@` — a laxer second rule on a path with no
+    /// producer — removed by user decision 2026-07-23 so one rule covers the
+    /// spelling everywhere.
     #[test]
     fn at_prefix_is_refused_like_the_record_loader_refuses_it() {
         let err = PvaLinkConfig::parse("@pva://X", LinkDirection::Out).unwrap_err();

@@ -69,7 +69,7 @@ fn console_of(name: &str) -> Vec<String> {
         .collect()
 }
 
-/// Process `R1` (OUT `ca://R2.PROC`) once, drain the put queue and the
+/// Process `R1` (OUT `R2.PROC CA`) once, drain the put queue and the
 /// errlog, and return the record's alarm.
 async fn put_once(lset: Lset) -> (u16, AlarmSeverity) {
     let db = PvDatabase::new();
@@ -81,7 +81,7 @@ async fn put_once(lset: Lset) -> (u16, AlarmSeverity) {
         .await
         .unwrap();
     {
-        db.put_pv_no_process("R1.OUT", EpicsValue::String("ca://R2.PROC".into()))
+        db.put_pv_no_process("R1.OUT", EpicsValue::String("R2.PROC CA".into()))
             .await
             .unwrap();
         let rec = db.get_record("R1").unwrap();

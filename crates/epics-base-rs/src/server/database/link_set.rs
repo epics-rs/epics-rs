@@ -1,4 +1,4 @@
-//! [`LinkSet`] — pluggable backend for `pva://` / `ca://` link
+//! [`LinkSet`] — pluggable backend for CA / pva link
 //! resolution.
 //!
 //! Mirrors the C EPICS `lset` (link set) abstraction used by libdbCore
@@ -660,7 +660,7 @@ pub trait LinkSet: Send + Sync {
 
     /// C `lset->openLink` (`dbLink.c:194-199`, from `dbJLinkInit`,
     /// `dbJLink.c:459`): where the lset settles what `name` is, asked of a
-    /// link naming this lset's scheme (`pva://`, `{pva:…}`), once per
+    /// link addressed to this lset (a CA name, `{pva:…}`), once per
     /// link at iocInit (`doResolveLinks`, ahead of `init_record` pass 1,
     /// `iocInit.c:576-577`) and once per put of the link, under the put's
     /// hold where `dbPutFieldLink` runs `dbAddLink` (`dbAccess.c:1208`).
@@ -856,9 +856,9 @@ pub trait LinkSet: Send + Sync {
     /// `None` means "do not propagate" — either the upstream has no
     /// alarm, the lset has no cache, or the link's maximize-severity
     /// mode (`NMS`/`MS`/`MSI`) suppresses it. The lset is expected to
-    /// apply that mode gate itself (the `pva://X?sevr=MS` modifier is
-    /// stripped before epics-base-rs sees the link, so only the lset
-    /// retains it). A returned `Some(sev)` is therefore already
+    /// apply that mode gate itself (a `{pva:{pv:"X",sevr:"MS"}}` option
+    /// travels in the link's identity key, which only the lset decodes).
+    /// A returned `Some(sev)` is therefore already
     /// gated and the record processing loop propagates it verbatim
     /// as a maximize-severity contribution. Mirrors pvxs
     /// `pvxs/ioc/pvalink_lset.cpp` `pvaGetAlarm` feeding `recGblSetSevr`.

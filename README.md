@@ -8,7 +8,7 @@ Just `cargo build`.
 
 - **Channel Access** — client & server (UDP name resolution + TCP circuit, beacons, repeater)
 - **pvAccess** — client & server (search engine, monitor/get/put/RPC, ORIGIN_TAG forwarding)
-- **QSRV bridge** — records as NTScalar/NTEnum/NTNDArray and Group PVs (C++ QSRV JSON compatible), `pva://` / `ca://` database links (pvalink/calink)
+- **QSRV bridge** — records as NTScalar/NTEnum/NTNDArray and Group PVs (C++ QSRV JSON compatible), `{pva:…}` / CA database links (pvalink/calink)
 - **IOC runtime** — 34 base record types, .db loader, link chains, scan scheduling, ACF access security, iocsh, autosave, calc engine
 - **asyn** — actor-based async port driver framework
 - **motor** — 9-phase state machine, coordinate transforms, backlash compensation

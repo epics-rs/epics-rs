@@ -1,6 +1,6 @@
 //! The `pva` link set (pvalink) must install at the base
 //! `AfterCaLinkInit` seam via
-//! [`IocApplication::register_link_type`], so a `pva://` link
+//! [`IocApplication::register_link_type`], so a pva link
 //! loaded before iocInit has its link set registered and its CP link
 //! opened (background connect started) while iocInit is still running —
 //! matching pvxs opening pvalink channels at `initHookAfterIocBuilt`

@@ -1,14 +1,13 @@
 //! `pvalink` — PVA links for EPICS record INP/OUT fields.
 //!
-//! When a record's INP (or OUT) field carries a link string of the form
-//! `pva://<remote-pv>`, this module resolves that link to a live PVA
-//! client that periodically reads the remote PV (INP) or pushes record
-//! output to it (OUT).
+//! When a record's INP (or OUT) field carries a pvxs JSON link
+//! `{pva:"<remote-pv>"}` / `{pva:{pv:…}}`, this module resolves that link
+//! to a live PVA client that periodically reads the remote PV (INP) or
+//! pushes record output to it (OUT).
 //!
-//! `pva://` and not `@pva://`, and the two are not alternatives: a
-//! leading `@` is the INST_IO sigil, so `try_parse_hw_link`
-//! (`epics-base-rs` `link.rs:1074-1086`) claims the field and returns
-//! `ParsedLink::Hw` before the scheme arm is ever consulted. `iocInit`
+//! Not `@pva://…`: a leading `@` is the INST_IO sigil, so
+//! `try_parse_hw_link` (`epics-base-rs` `link.rs:1074-1086`) claims the
+//! field and returns `ParsedLink::Hw`. `iocInit`
 //! then refuses it — *"can't initialize link type CONSTANT with
 //! \"@pva://UPSTREAM:AI CP\" (type INST_IO)"* — because a soft record's
 //! device support declares CONSTANT. Measured on the target.

@@ -38,12 +38,12 @@
 //! of the source-text guards at the bottom of this file, one `STATUS_PREFIX`,
 //! and no extra `-Zbuild-std` build in the portability gate.
 //!
-//! # `pva://` record links resolve on this target (design stage 4)
+//! # pva record links resolve on this target (design stage 4)
 //!
-//! A C IOC linked against pvxs resolves `INP=pva://...` whatever QSRV2's
+//! A C IOC linked against pvxs resolves `INP={pva:…}` whatever QSRV2's
 //! `enable2()` decided (`ioc/iochooks.cpp:338-341,367-369`). This one does too:
 //! [`install_pvalink_resolver`](epics_bridge_rs::pvalink::install_pvalink_resolver)
-//! mounts the pva:// external record-link resolver on the database at C `dbCaLinkInit`, and the
+//! mounts the pva external record-link resolver on the database at C `dbCaLinkInit`, and the
 //! startup banner reports it installed and the link count it pre-registered.
 //!
 //! The client that backs it is the blocking PVA client (design stages 1-3): on
@@ -51,7 +51,7 @@
 //! `EPICS_PVA_NAME_SERVERS` alone, because the UDP SEARCH transport is compiled
 //! out (`SearchTransport::NameServersOnly`, design §4.2) — there is no
 //! `recvmsg`/`IP_PKTINFO` receive path and no `local_addr()` readback to stamp a
-//! response port. A `pva://` link to a server reachable only by UDP broadcast
+//! response port. A pva link to a server reachable only by UDP broadcast
 //! will therefore not resolve; one named by a TCP name server will.
 //!
 //! # The server is reachable with the UDP responder down, deliberately
@@ -103,7 +103,7 @@
 //!
 //! QSRV2 answers to `PVXS_QSRV_ENABLE` / `EPICS_IOC_IGNORE_SERVERS=qsrv2` here
 //! exactly as it does in a C IOC (pvxs `enable2()`, `ioc/iochooks.cpp:401-448`):
-//! records, `Q:group` PVs and `pva://` links are served either way, and with
+//! records, `Q:group` PVs and pva links are served either way, and with
 //! QSRV2 off a `.json` argument is refused as the `dbLoadGroup` line it stands
 //! for. The decision is printed at startup.
 //!
@@ -200,14 +200,13 @@ mod demo_db {
         // \"@pva://UPSTREAM:AI CP\" (type INST_IO)"* and the image exits. C
         // refuses the same `.db`. The two spellings that do load are both
         // exercised here: pvxs's documented JSON longhand
-        // (`documentation/pvalink.rst:124-135`) and this tree's `pva://`
-        // scheme+suffix form, which parses to `ParsedLink::Pva`.
+        // (`documentation/pvalink.rst:124-135`), spaced and compact.
         "record(ai, \"RTEMS:PVA:DOWN\") {\n",
         "  field(INP, \"{pva: { pv: 'UPSTREAM:AI', proc: 'CP' }}\")\n",
         "  field(PREC, \"3\") field(EGU, \"V\") field(SCAN, \"Passive\")\n",
         "}\n",
         "record(ai, \"RTEMS:PVA:DOWN2\") {\n",
-        "  field(INP, \"pva://UPSTREAM:AI CP\")\n",
+        "  field(INP, \"{pva:{pv:'UPSTREAM:AI',proc:'CP'}}\")\n",
         "  field(PREC, \"3\") field(EGU, \"V\") field(SCAN, \"Passive\")\n",
         "}\n",
         "record(ao, \"RTEMS:PVA:UPLNK\") {\n",
@@ -432,7 +431,7 @@ mod ioc {
         }
     }
 
-    /// STAGE-5 PROBE: the upstream name server the guest's `pva://` links
+    /// STAGE-5 PROBE: the upstream name server the guest's pva links
     /// resolve through. SLIRP puts the host at `10.0.2.2`; the port is the
     /// host-side upstream IOC's TCP port (the guest's own 5075 is taken by
     /// the inbound `hostfwd`, so the upstream cannot also use it).
@@ -764,7 +763,7 @@ mod ioc {
         // (2c) The two QSRV2 sources, the `qsrvSingle` database source and
         //      the `qsrvGroup` QSRV store, which pvxs mounts at
         //      `initHookAfterIocBuilt` whatever `enable2()` decided
-        //      (`ioc/iochooks.cpp:367-372`); the pva:// resolver was installed
+        //      (`ioc/iochooks.cpp:367-372`); the pva resolver was installed
         //      by the build at `dbCaLinkInit`, because link init refuses a
         //      `{pva:…}` link whose set is not there yet.
         //
@@ -774,7 +773,7 @@ mod ioc {
         //      NameServersOnly`), and every task the resolver spawns lands on the
         //      callback pool via
         //      `runtime::task::spawn`, never a tokio runtime. `link_count` is the
-        //      number of pva:// links pre-registered from the loaded database.
+        //      number of pva links pre-registered from the loaded database.
         let composite = CompositeSource::new();
         if let Err(e) = mount.install_channel_sources(&db, &composite) {
             epics_base_rs::stderr_println!(
@@ -905,8 +904,8 @@ mod ioc {
         // destinations, and any `EPICS_PVA_NAME_SERVERS` over TCP.
         if resolver.is_some() {
             println!(
-                "realtime-pva-ioc: pvalink resolver installed — {link_count} pva:// record \
-                 link{} pre-registered; pva://... INP/OUT resolve over UDP SEARCH \
+                "realtime-pva-ioc: pvalink resolver installed — {link_count} pva record \
+                 link{} pre-registered; `{{pva:…}}` INP/OUT resolve over UDP SEARCH \
                  broadcast and EPICS_PVA_NAME_SERVERS (TCP)",
                 if link_count == 1 { "" } else { "s" },
             );
@@ -1303,7 +1302,7 @@ mod tests {
         );
         assert!(
             prod.contains(concat!("register_link_type(", "\"pva\", ")),
-            "the pva:// resolver is no longer installed by the build, so link init \
+            "the pva resolver is no longer installed by the build, so link init \
              refuses every pva link this IOC loads"
         );
         assert!(
@@ -1325,7 +1324,7 @@ mod tests {
         assert!(
             prod.contains("link_count"),
             "the banner no longer reports the pre-registered link count, the one number \
-             that tells an operator whether the database's pva:// links were seen"
+             that tells an operator whether the database's pva links were seen"
         );
     }
 
@@ -1517,8 +1516,8 @@ mod tests {
         );
         assert_eq!(
             field("RTEMS:PVA:DOWN2", "INP").as_deref(),
-            Some("pva://UPSTREAM:AI CP"),
-            "this tree's scheme+suffix spelling"
+            Some("{pva:{pv:'UPSTREAM:AI',proc:'CP'}}"),
+            "the compact JSON longhand spelling"
         );
         assert_eq!(
             field("RTEMS:PVA:UPLNK", "OUT").as_deref(),

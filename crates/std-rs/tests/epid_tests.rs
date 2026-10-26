@@ -1424,7 +1424,7 @@ fn test_non_callback_dtyp_emits_no_trig_write() {
 fn test_ca_trig_link_deferred_second_pass() {
     let mut rec = EpidRecord::default();
     let mut dpvt = Dpvt::Null;
-    rec.trig = "ca://REMOTE:READBACK".into();
+    rec.trig = "REMOTE:READBACK CA".into();
     rec.inp = "SRC".into();
     rec.kp = 1.0;
     rec.fbon = 1;
@@ -1472,7 +1472,7 @@ fn test_ca_trig_link_deferred_second_pass() {
 fn a_device_link_put_mid_trigger_fires_the_trigger_again() {
     let mut rec = EpidRecord::default();
     let mut dpvt = Dpvt::Null;
-    rec.trig = "ca://REMOTE:READBACK".into();
+    rec.trig = "REMOTE:READBACK CA".into();
     rec.inp = "SRC".into();
     rec.set_process_context(&ctx_with_dtyp("Async Soft Channel"));
     let fires = |actions: &epics_base_rs::server::record::ProcessActions| {
@@ -1808,7 +1808,7 @@ use epics_base_rs::server::record::RecordProcessResult;
 fn test_ca_trig_trigger_pass_returns_async_pending_tail_skipped() {
     let mut rec = EpidRecord::default();
     let mut dpvt = Dpvt::Null;
-    rec.trig = "ca://REMOTE:READBACK".into();
+    rec.trig = "REMOTE:READBACK CA".into();
     rec.inp = "SRC".into();
     rec.kp = 1.0;
     rec.fbon = 1;

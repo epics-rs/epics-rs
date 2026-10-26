@@ -48,7 +48,7 @@ impl LinkSet for Slow {
 }
 
 const DB: &str = r#"
-record(printf, "A") { field(DTYP, "Async Soft Channel") field(FMT, "x") field(OUT, "ca://R") }
+record(printf, "A") { field(DTYP, "Async Soft Channel") field(FMT, "x") field(OUT, "R CA") }
 record(printf, "S") { field(FMT, "x") }
 "#;
 

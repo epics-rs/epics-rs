@@ -104,14 +104,15 @@ impl epics_base_rs::server::database::LinkSet for Removals {
 /// `doCloseLinks`' `dbRemoveLink` hands a JSON link to its lset's
 /// `removeLink` (`dbLink.c:202-213`), once, at the shutdown.
 #[epics_macros_rs::epics_test]
-async fn close_links_removes_a_scheme_link_from_its_lset() {
+async fn close_links_removes_a_json_link_from_its_lset() {
     let db = std::sync::Arc::new(epics_base_rs::server::database::PvDatabase::new());
     let lset = std::sync::Arc::new(Removals(std::sync::Mutex::new(Vec::new())));
     db.register_link_set("pva", lset.clone()).await;
     let ioc = IocBuilder::new()
         .with_database(db)
+        .register_link_type("pva", |_db| async { Vec::new() })
         .db_string(
-            r#"record(calc,"CL:pva"){field(INPA,"pva://X")}"#,
+            r#"record(calc,"CL:pva"){field(INPA,{pva:"X"})}"#,
             &HashMap::new(),
         )
         .unwrap()
@@ -137,13 +138,14 @@ async fn a_shutdown_from_a_record_s_own_processing_completes() {
     db.register_link_set("pva", lset.clone()).await;
     let ioc = IocBuilder::new()
         .with_database(db)
+        .register_link_type("pva", |_db| async { Vec::new() })
         .register_subroutine("shutdown", |_| {
             assert_eq!(ioc_shutdown(), 0);
             Ok(0)
         })
         .db_string(
             r#"record(sub,"CL:self"){field(SNAM,"shutdown")}
-record(calc,"CL:pva"){field(INPA,"pva://X")}"#,
+record(calc,"CL:pva"){field(INPA,{pva:"X"})}"#,
             &HashMap::new(),
         )
         .unwrap()

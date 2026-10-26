@@ -1249,7 +1249,7 @@ impl PvaLink {
     /// case. Excluding it also keeps the base bare-name alarm loop
     /// (`external_link_alarm`, which tries every registered lset) from
     /// mis-claiming a name a sibling lset actually owns — a PVA lset
-    /// asked about a `ca://` name lazily opens a never-connecting PVA
+    /// asked about a CA name lazily opens a never-connecting PVA
     /// link, and must report `None` (not INVALID) so the loop falls
     /// through to the CA lset. Mirrors pvxs `pvaLink::valid()` going
     /// false on disconnect while the snapshot is retained

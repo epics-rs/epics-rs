@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use asyn_rs::port_handle::PortHandle;
+use asyn_rs::request::SectionScope;
 use asyn_rs::trace::TraceMask;
 use parking_lot::Mutex;
 
@@ -190,9 +191,10 @@ impl Delivery {
         let Some(senders) = self.senders(0) else {
             return;
         };
+        let scope = SectionScope::current();
         park_on(async {
             for array in &ready {
-                publish_each(&senders, array.clone()).await;
+                publish_each(&senders, array.clone(), scope).await;
             }
         });
     }

@@ -25,6 +25,7 @@ use crate::param::ParamValue;
 use crate::port::{PortDriver, QueueGate, QueuePriority};
 use crate::request::{
     CancelToken, CellQueue, Claim, OctetRead, PortCalls, RequestCell, RequestOp, RequestResult,
+    SectionScope,
 };
 use crate::user::{AsynUser, ConnectCheck};
 
@@ -615,6 +616,9 @@ pub(crate) struct ActorMessage {
     /// Where the message sorts ahead of `seq`. Set only by
     /// [`PortActor::enqueue_message`], which knows the port.
     rank: Rank,
+    /// The scope the caller was in: a held section runs it only if it is
+    /// the section's own.
+    scope: SectionScope,
 }
 
 /// Whom a request answers.
@@ -666,6 +670,7 @@ impl ActorMessage {
             seq: next_seq(),
             priority,
             rank: Rank::Arrival,
+            scope: SectionScope::current(),
         }
     }
 
@@ -685,6 +690,9 @@ impl ActorMessage {
             seq,
             priority: request.priority,
             rank: Rank::Arrival,
+            // Device support queues a cell from its own thread, never a
+            // section's.
+            scope: SectionScope::default(),
             op: RequestOp::Cell(cell),
         }
     }
@@ -1172,9 +1180,9 @@ pub(crate) struct PortActor {
     /// Requests a caller's section keeps out while it holds its callbacks
     /// ([`Self::runs_while_a_section_holds`]), back in the heap at its end.
     held_back: Vec<ActorMessage>,
-    /// A caller's section holds its callbacks: set when the actor stores the
-    /// sets of a section still open, cleared at the section's end.
-    section_held: bool,
+    /// The scope of a caller's section that holds its callbacks: set when the
+    /// actor stores the sets of a section still open, cleared at its end.
+    section_held: Option<SectionScope>,
     /// C `pport->queueStateChange` (asynManager.c:870, 1617): something happened
     /// that could make a parked request eligible, so the queue must be rescanned.
     /// Set by an arriving request and by a request that ran (either can enable a
@@ -1274,7 +1282,7 @@ impl PortActor {
             pending_while_blocked: Vec::new(),
             parked: Vec::new(),
             held_back: Vec::new(),
-            section_held: false,
+            section_held: None,
             rescan_parked: false,
             connect_failure_reported: false,
             woken: false,
@@ -1994,13 +2002,12 @@ impl PortActor {
         }
     }
 
-    /// Whether `op` runs while a caller's section holds its callbacks. The
-    /// section's thread holds C's lock from the sets to its
-    /// `callParamCallbacks` (NDPluginDriver.cpp:397-466, :525-539), so a
-    /// request that could store or post a param waits for the section's end.
-    /// What runs is that end, what C's manager does without the lock, and a
-    /// read, which stores nothing and which C's consumers make on the locking
-    /// thread itself.
+    /// Whether `op`, from outside a caller's section that holds its
+    /// callbacks, runs meanwhile. The section's thread holds C's lock from the
+    /// sets to its `callParamCallbacks` (NDPluginDriver.cpp:397-466,
+    /// :525-539), so every other thread's request waits for the section's
+    /// end, reads included, in its order with the stores. What runs is that
+    /// end and what C's manager does without the lock.
     fn runs_while_a_section_holds(op: &RequestOp) -> bool {
         match op {
             RequestOp::CallParamCallbacks { gate, .. } => {
@@ -2022,8 +2029,9 @@ impl PortActor {
             | RequestOp::SetTimeStampSource { .. }
             | RequestOp::BlockProcess { .. }
             | RequestOp::UnblockProcess { .. }
-            | RequestOp::ShutdownPort
-            | RequestOp::DrvUserCreate { .. }
+            | RequestOp::ShutdownPort => true,
+
+            RequestOp::DrvUserCreate { .. }
             | RequestOp::Report { .. }
             | RequestOp::OctetRead { .. }
             | RequestOp::OctetReadBinary { .. }
@@ -2042,9 +2050,8 @@ impl PortActor {
             | RequestOp::Float32ArrayRead { .. }
             | RequestOp::GetOption { .. }
             | RequestOp::GetInputEos
-            | RequestOp::GetOutputEos => true,
-
-            RequestOp::SetParams { .. }
+            | RequestOp::GetOutputEos
+            | RequestOp::SetParams { .. }
             | RequestOp::WithDriver(_)
             | RequestOp::WithDriverAfterQueue(_)
             | RequestOp::LockPort(_)
@@ -2119,15 +2126,17 @@ impl PortActor {
             base.set_time_stamp(ts);
         }
         let mut failed = set_params(base, &updates);
-        let fire = gate.owe(addr, &updates);
+        let holds = gate.owe(addr, &updates);
         gate.give_back(updates);
-        if fire && let Some(e) = gate.fire(base) {
+        if holds.is_none()
+            && let Some(e) = gate.fire(base)
+        {
             failed.get_or_insert(e);
         }
         match gate {
-            crate::request::SectionCallbacks::Open { .. } => self.section_held = !fire,
+            crate::request::SectionCallbacks::Open { .. } => self.section_held = holds,
             crate::request::SectionCallbacks::Held(_) => {
-                self.section_held = false;
+                self.section_held = None;
                 self.heap.extend(self.held_back.drain(..));
             }
         }
@@ -2300,7 +2309,10 @@ impl PortActor {
         if msg.is_gone() {
             return None;
         }
-        if self.section_held && !Self::runs_while_a_section_holds(&msg.op) {
+        if self
+            .section_held
+            .is_some_and(|scope| msg.scope != scope && !Self::runs_while_a_section_holds(&msg.op))
+        {
             self.held_back.push(msg);
             return None;
         }
@@ -4262,6 +4274,7 @@ mod tests {
                 seq,
                 priority: QueuePriority::Medium,
                 rank: Rank::Band(QueuePriority::Medium),
+                scope: SectionScope::default(),
             }
         };
         let mut heap = BinaryHeap::new();
@@ -4529,6 +4542,7 @@ mod tests {
                 seq,
                 priority,
                 rank: Rank::Band(priority),
+                scope: SectionScope::default(),
             }
         };
         let mut heap = BinaryHeap::new();

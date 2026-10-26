@@ -155,7 +155,11 @@ fn a_held_callbacks_gate_section_allocates_nothing_on_the_posting_thread() {
             updates.push(ParamSetValue::new(reason, 0, ParamValue::Int32(i)));
             g.open(0, None, updates).unwrap()
         });
-        assert_eq!(handle.read_int32_blocking(reason, 0).unwrap(), i);
+        let read = {
+            let _in = after.scope().enter();
+            handle.read_int32_blocking(reason, 0).unwrap()
+        };
+        assert_eq!(read, i);
         assert_eq!(posts.load(Ordering::SeqCst), i as usize - 1, "held");
         let (r, ended) = counted(|| after.end());
         r.unwrap();

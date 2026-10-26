@@ -10,6 +10,8 @@ use std::sync::{Arc, OnceLock};
 use std::thread::Thread;
 use std::time::Duration;
 
+use asyn_rs::request::SectionScope;
+
 use crate::ndarray::NDArray;
 use crate::ndarray_pool::PublishedArray;
 
@@ -125,6 +127,9 @@ pub struct ArrayMessage {
     /// When Some, the sender awaits this to confirm downstream processing completed.
     /// Fired when ArrayMessage is dropped (i.e., after plugin process_array finishes).
     pub(crate) done_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    /// The sender's scope, for a blocking delivery: C runs that consumer on
+    /// the sender's thread, inside its lock (NDPluginDriver.cpp:332, :436).
+    pub(crate) scope: SectionScope,
 }
 
 impl Drop for ArrayMessage {
@@ -347,6 +352,7 @@ fn try_send_arm(
                 array,
                 counter: Some(counter),
                 done_tx: None,
+                scope: SectionScope::default(),
             });
             admission.depth_moved.notify_one();
             PublishOutcome::Delivered
@@ -422,7 +428,8 @@ impl NDArraySender {
     /// - `blocking_callbacks=1`: reliable `send().await` + awaits downstream
     ///   processing completion (explicit opt-in, never drops).
     pub async fn publish(&self, array: impl Into<PublishedArray>) -> PublishOutcome {
-        self.publish_inner(array.into()).await
+        self.publish_inner(array.into(), SectionScope::current())
+            .await
     }
 
     /// Publish for the scatter reroute path. Mirrors C++ `NDPluginScatter`'s
@@ -436,16 +443,27 @@ impl NDArraySender {
     /// mechanisms, a scatter round following a natural overflow would silence
     /// the last node too.
     pub async fn publish_scatter(&self, array: PublishedArray, is_last: bool) -> PublishOutcome {
+        self.publish_scatter_in(array, is_last, SectionScope::current())
+            .await
+    }
+
+    /// [`Self::publish_scatter`] from a section in `scope`.
+    pub(crate) async fn publish_scatter_in(
+        &self,
+        array: PublishedArray,
+        is_last: bool,
+        scope: SectionScope,
+    ) -> PublishOutcome {
         if is_last {
             self.overflow.disarm();
         } else {
             self.overflow.arm();
         }
-        self.publish_inner(array).await
+        self.publish_inner(array, scope).await
     }
 
-    /// Shared publish body.
-    async fn publish_inner(&self, array: PublishedArray) -> PublishOutcome {
+    /// Shared publish body; a blocking consumer runs in `scope`.
+    async fn publish_inner(&self, array: PublishedArray, scope: SectionScope) -> PublishOutcome {
         if !self.enabled.load(Ordering::Acquire) {
             return PublishOutcome::Disabled;
         }
@@ -486,6 +504,7 @@ impl NDArraySender {
             array,
             counter: None,
             done_tx: Some(done_tx),
+            scope,
         };
         let tx = self.tx.read().clone();
         if tx.send(msg).await.is_err() {
@@ -773,9 +792,13 @@ pub fn ndarray_channel(port_name: &str, queue_size: usize) -> (NDArraySender, ND
 /// one processing the array before the next is called
 /// (asynPortDriver.cpp:3355-3368, NDPluginDriver.cpp:435). A drop is counted
 /// by the receiving plugin, so nothing is returned to count.
-pub(crate) async fn publish_each(senders: &[NDArraySender], array: PublishedArray) {
+pub(crate) async fn publish_each(
+    senders: &[NDArraySender],
+    array: PublishedArray,
+    scope: SectionScope,
+) {
     for sender in senders {
-        sender.publish(array.clone()).await;
+        sender.publish_inner(array.clone(), scope).await;
     }
 }
 
@@ -809,7 +832,7 @@ impl NDArrayOutput {
 
     /// Publish an array to every downstream receiver in turn.
     pub async fn publish(&self, array: impl Into<PublishedArray>) {
-        publish_each(&self.senders, array.into()).await
+        publish_each(&self.senders, array.into(), SectionScope::current()).await
     }
 
     /// Publish an array to a single downstream receiver by index (for scatter/round-robin).
@@ -863,7 +886,7 @@ impl ArrayPublisher {
     /// `driverCallback` does (NDPluginDriver.cpp:433-440).
     pub async fn publish(&self, array: impl Into<PublishedArray>) {
         let senders = self.output.lock().senders();
-        publish_each(&senders, array.into()).await
+        publish_each(&senders, array.into(), SectionScope::current()).await
     }
 }
 
@@ -1160,6 +1183,7 @@ mod tests {
             array: make_test_array(1),
             counter: Some(counter.clone()),
             done_tx: None,
+            scope: SectionScope::default(),
         };
         assert_eq!(counter.get(), 1);
         drop(msg);

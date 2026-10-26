@@ -32,6 +32,7 @@ use crate::port::{DrvUserInfo, DrvUserRequest, PortDriver};
 use crate::port_actor::{ActorId, ActorLink, ActorMessage, Claimed, Lend};
 use crate::request::{
     CancelToken, DriverCall, PortCalls, PortLockCall, RequestOp, RequestResult, SectionCallbacks,
+    SectionScope,
 };
 use crate::trace::TraceManager;
 use crate::user::{AsynUser, QueueDeadline};
@@ -1493,10 +1494,10 @@ impl PortHandle {
     /// C `setXxxParam` of each update without the `callParamCallbacks`: the
     /// values are marked changed until a
     /// [`Self::call_param_callbacks_blocking`] on their list posts them. A
-    /// request queued after this one finds them stored, but for one that runs
-    /// while a [`CallbacksGate`] section holds, a read among them: the sets
-    /// wait for the section's end, as C's writer waits on the lock. Blocks
-    /// only until the inbox accepts it, as
+    /// request queued after this one finds them stored, but for one in the
+    /// [`CallbacksAfter::scope`] of a section that holds: the sets wait for
+    /// the section's end, as C's writer waits on the lock its thread holds.
+    /// Blocks only until the inbox accepts it, as
     /// [`Self::set_params_and_notify_blocking`].
     pub fn set_params_blocking(
         &self,
@@ -2235,7 +2236,7 @@ pub struct CallbacksGate {
     port: PortHandle,
     sections: Arc<crate::request::Sections>,
     /// The next section's number.
-    seq: u64,
+    seq: u32,
 }
 
 impl CallbacksGate {
@@ -2246,13 +2247,16 @@ impl CallbacksGate {
     }
 
     /// Queue the sets ahead of anything the section causes; the callbacks
-    /// fire once the returned [`CallbacksAfter`] ends.
+    /// fire once the returned [`CallbacksAfter`] ends. Until then the port
+    /// runs only requests made in [`CallbacksAfter::scope`].
     pub fn open(
         &mut self,
         addr: i32,
         time_stamp: Option<SystemTime>,
         updates: Vec<crate::request::ParamSetValue>,
     ) -> AsynResult<CallbacksAfter<'_>> {
+        let scope = SectionScope::for_section();
+        self.sections.open(scope);
         self.port.enqueue_now(
             RequestOp::CallParamCallbacks {
                 addr,
@@ -2265,7 +2269,11 @@ impl CallbacksGate {
             },
             addr,
         )?;
-        Ok(CallbacksAfter { gate: self, addr })
+        Ok(CallbacksAfter {
+            gate: self,
+            addr,
+            scope,
+        })
     }
 }
 
@@ -2275,9 +2283,15 @@ impl CallbacksGate {
 pub struct CallbacksAfter<'a> {
     gate: &'a mut CallbacksGate,
     addr: i32,
+    scope: SectionScope,
 }
 
 impl CallbacksAfter<'_> {
+    /// The scope whose requests the port runs while it holds the callbacks.
+    pub fn scope(&self) -> SectionScope {
+        self.scope
+    }
+
     /// End the section. The callbacks fire on the actor, from this end when
     /// the actor holds them, else as soon as it reaches the sets.
     pub fn end(self) -> AsynResult<()> {
@@ -2287,7 +2301,7 @@ impl CallbacksAfter<'_> {
     fn finish(&mut self) -> AsynResult<()> {
         let gate = &mut *self.gate;
         let seq = gate.seq;
-        gate.seq += 1;
+        gate.seq = seq.wrapping_add(1);
         if !gate.sections.end(seq) {
             return Ok(());
         }
@@ -5398,6 +5412,12 @@ mod tests {
         }
     }
 
+    /// A read by `section`'s own thread, which C's recursive lock lets in.
+    fn read_in(handle: &PortHandle, section: &CallbacksAfter<'_>, addr: i32) -> AsynResult<i32> {
+        let _in = section.scope().enter();
+        handle.read_int32_blocking(0, addr)
+    }
+
     /// Hold `handle`'s actor until the returned sender sends.
     fn hold_actor(
         handle: &PortHandle,
@@ -5429,17 +5449,17 @@ mod tests {
         let section = gate
             .open(0, None, vec![set_val(1, 11), set_val(0, 10)])
             .unwrap();
-        assert_eq!(handle.read_int32_blocking(0, 0).unwrap(), 10);
-        assert_eq!(handle.read_int32_blocking(0, 1).unwrap(), 11);
+        assert_eq!(read_in(&handle, &section, 0).unwrap(), 10);
+        assert_eq!(read_in(&handle, &section, 1).unwrap(), 11);
         assert!(posts.lock().is_empty(), "posted inside the section");
         section.end().unwrap();
         handle.read_int32_blocking(0, 0).unwrap();
         assert_eq!(*posts.lock(), [(0, 10), (1, 11)]);
     }
 
-    /// C's lock keeps any other `callParamCallbacks` out of a section: a
-    /// bare one inside it, and one carrying sets of its own, wait, sets and
-    /// all, for the section's end.
+    /// C's lock keeps another thread's `callParamCallbacks` out of a section:
+    /// a bare one, and one carrying sets of its own, wait, sets and all, for
+    /// the section's end.
     #[test]
     fn a_post_inside_a_section_leaves_the_sections_sets_to_its_end() {
         let (handle, posts, _sub) = gated_handle();
@@ -5460,7 +5480,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            handle.read_int32_blocking(0, 1).ok(),
+            read_in(&handle, &section, 1).ok(),
             None,
             "stored inside the section"
         );
@@ -5487,7 +5507,7 @@ mod tests {
         handle
             .submit_unanswered(bare_post(1), AsynUser::new(0).with_addr(1))
             .unwrap();
-        handle.read_int32_blocking(0, 0).unwrap();
+        read_in(&handle, &section, 0).unwrap();
         assert_eq!(*posts.lock(), [(0, 70)]);
         section.end().unwrap();
         handle.read_int32_blocking(0, 0).unwrap();
@@ -5506,12 +5526,33 @@ mod tests {
         handle
             .submit_unanswered(RequestOp::Int32Write { value: 91 }, AsynUser::new(0))
             .unwrap();
-        // The read's round trip ran behind the write.
-        assert_eq!(handle.read_int32_blocking(0, 0).unwrap(), 90);
+        // The actor held the write back before it ran this read.
+        assert_eq!(read_in(&handle, &section, 0).unwrap(), 90);
         assert!(posts.lock().is_empty(), "posted inside the section");
         section.end().unwrap();
         handle.read_int32_blocking(0, 0).unwrap();
         assert_eq!(*posts.lock(), [(0, 90), (0, 91)]);
+    }
+
+    /// C's lock holds another thread's read as it holds its store, in the
+    /// order they were queued: a read behind a store inside a section reads
+    /// the store once the section ends, not the section's value.
+    #[test]
+    fn a_read_behind_a_store_inside_a_section_reads_the_store() {
+        let (handle, _posts, _sub) = gated_handle();
+        let mut gate = handle.callbacks_gate();
+        let section = gate.open(0, None, vec![set_val(0, 90)]).unwrap();
+        assert_eq!(read_in(&handle, &section, 0).unwrap(), 90);
+        handle
+            .submit_unanswered(RequestOp::Int32Write { value: 91 }, AsynUser::new(0))
+            .unwrap();
+        let read = handle
+            .try_submit(RequestOp::Int32Read, AsynUser::new(0))
+            .unwrap();
+        assert_eq!(read_in(&handle, &section, 0).unwrap(), 90, "held both");
+        section.end().unwrap();
+        let read = read.wait_blocking(Duration::from_secs(5)).unwrap();
+        assert_eq!(read.int_val, Some(91));
     }
 
     /// A section that ends before the actor reaches the sets leaves the
@@ -5545,7 +5586,7 @@ mod tests {
         let second = gate.open(0, None, vec![set_val(0, 41)]).unwrap();
         go.send(()).unwrap();
         hold.join().unwrap().unwrap();
-        handle.read_int32_blocking(0, 0).unwrap();
+        read_in(&handle, &second, 0).unwrap();
         assert_eq!(*posts.lock(), [(0, 40)], "held the first for the second");
         second.end().unwrap();
         handle.read_int32_blocking(0, 0).unwrap();
@@ -5561,10 +5602,10 @@ mod tests {
         let first = gate
             .open(0, None, vec![set_val(1, 51), set_val(0, 50)])
             .unwrap();
-        handle.read_int32_blocking(0, 0).unwrap();
+        read_in(&handle, &first, 0).unwrap();
         first.end().unwrap();
         let second = gate.open(0, None, vec![set_val(0, 52)]).unwrap();
-        handle.read_int32_blocking(0, 0).unwrap();
+        read_in(&handle, &second, 0).unwrap();
         assert_eq!(*posts.lock(), [(0, 50), (1, 51)]);
         second.end().unwrap();
         handle.read_int32_blocking(0, 0).unwrap();
@@ -5577,7 +5618,7 @@ mod tests {
         let (handle, posts, _sub) = gated_handle();
         let mut gate = handle.callbacks_gate();
         let section = gate.open(0, None, vec![set_val(0, 30)]).unwrap();
-        handle.read_int32_blocking(0, 0).unwrap();
+        read_in(&handle, &section, 0).unwrap();
         drop(section);
         handle.read_int32_blocking(0, 0).unwrap();
         assert_eq!(*posts.lock(), [(0, 30)]);

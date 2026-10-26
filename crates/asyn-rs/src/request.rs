@@ -1,5 +1,7 @@
 //! Request types for the port actor.
 
+use std::cell::Cell;
+use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering as AtomicOrdering};
 
@@ -1893,25 +1895,27 @@ impl Default for CancelToken {
 #[derive(Clone, Debug)]
 pub enum SectionCallbacks {
     /// The sets of section `seq`: the actor holds the callbacks while it is
-    /// open.
-    Open { sections: Arc<Sections>, seq: u64 },
+    /// open, and runs only requests from its scope meanwhile. The number
+    /// wraps, safely: the actor trails its caller only by the sections
+    /// queued between them. A u32 keeps [`RequestOp`] at 64 bytes.
+    Open { sections: Arc<Sections>, seq: u32 },
     /// From the end of a section whose callbacks the actor holds.
     Held(Arc<Sections>),
 }
 
 impl SectionCallbacks {
     /// The actor, sets done: record each list the request owes, the
-    /// request's first; whether they [`Self::fire`] now, which they do
-    /// unless an open section holds them.
-    pub(crate) fn owe(&self, addr: i32, updates: &[ParamSetValue]) -> bool {
+    /// request's first; the scope of the open section that holds them, else
+    /// they [`Self::fire`] now.
+    pub(crate) fn owe(&self, addr: i32, updates: &[ParamSetValue]) -> Option<SectionScope> {
         match self {
             Self::Open { sections, seq } => {
                 let mut lists = sections.held.lock();
                 lists.push(addr);
                 push_further_lists(addr, updates, &mut lists);
-                !sections.hold(*seq)
+                sections.hold(*seq)
             }
-            Self::Held(_) => true,
+            Self::Held(_) => None,
         }
     }
 
@@ -1946,6 +1950,8 @@ pub struct Sections {
     /// The open section's number, shifted left once; the low bit is set while
     /// the actor holds its callbacks.
     word: AtomicU64,
+    /// The open section's [`SectionScope`].
+    scope: AtomicU64,
     /// The lists whose callbacks the actor holds.
     held: Mutex<Vec<i32>>,
     /// The `updates` of sections the actor has run, cleared, for the
@@ -1956,23 +1962,35 @@ pub struct Sections {
 }
 
 impl Sections {
-    /// The actor: `true` while section `seq` is open, which leaves its
-    /// callbacks to its end. A later section open means `seq` ended.
-    fn hold(&self, seq: u64) -> bool {
+    /// The actor: the scope of section `seq` while it is open, which leaves
+    /// its callbacks to its end. A later section open means `seq` ended.
+    fn hold(&self, seq: u32) -> Option<SectionScope> {
+        // Read first: a later section's scope is stored after `seq` ends, so
+        // reading it fails the exchange.
+        let scope = SectionScope(self.scope.load(AtomicOrdering::Acquire));
         self.word
             .compare_exchange(
-                seq << 1,
-                seq << 1 | 1,
+                u64::from(seq) << 1,
+                u64::from(seq) << 1 | 1,
                 AtomicOrdering::AcqRel,
                 AtomicOrdering::Acquire,
             )
             .is_ok()
+            .then_some(scope)
+    }
+
+    /// The caller, before it queues a section's sets: the scope it runs in.
+    pub(crate) fn open(&self, scope: SectionScope) {
+        self.scope.store(scope.0, AtomicOrdering::Release);
     }
 
     /// The caller, section `seq` ended: `true` when the actor holds its
     /// callbacks, which this end then owes.
-    pub(crate) fn end(&self, seq: u64) -> bool {
-        self.word.swap((seq + 1) << 1, AtomicOrdering::AcqRel) & 1 == 1
+    pub(crate) fn end(&self, seq: u32) -> bool {
+        self.word
+            .swap(u64::from(seq.wrapping_add(1)) << 1, AtomicOrdering::AcqRel)
+            & 1
+            == 1
     }
 
     /// The caller: an empty `updates` for its next section, one the actor
@@ -1984,6 +2002,63 @@ impl Sections {
     fn give_back(&self, mut updates: Vec<ParamSetValue>) {
         updates.clear();
         self.spare.lock().push(updates);
+    }
+}
+
+/// The thread of control a request comes from. C's port lock is recursive:
+/// while a section holds it from the sets to its `callParamCallbacks`
+/// (NDPluginDriver.cpp:332, :539), the section's own thread gets in, and so
+/// does every blocking consumer, which its callbacks run on that thread
+/// (:435-436); every other thread waits. A section's scope is the one it
+/// opens in, else a new one, and a delivery carries it to the consumer's
+/// threads, which [`Self::enter`] or [`Self::run`] it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SectionScope(u64);
+
+thread_local! {
+    /// This thread's scope; 0 outside every section.
+    static SCOPE: Cell<u64> = const { Cell::new(0) };
+}
+
+impl SectionScope {
+    /// The scope this thread is in.
+    pub fn current() -> Self {
+        Self(SCOPE.with(Cell::get))
+    }
+
+    /// The scope of a section opened here: the one this thread is in, so a
+    /// section of a consumer's admits its delivery's requests, else a new one.
+    pub(crate) fn for_section() -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        match Self::current() {
+            Self(0) => Self(NEXT.fetch_add(1, AtomicOrdering::Relaxed)),
+            inside => inside,
+        }
+    }
+
+    /// Put this thread in `self` until the guard drops.
+    pub fn enter(self) -> ScopeGuard {
+        ScopeGuard(SCOPE.with(|scope| scope.replace(self.0)))
+    }
+
+    /// Poll `fut` in `self`, on whichever thread polls it.
+    pub async fn run<F: Future>(self, fut: F) -> F::Output {
+        let mut fut = std::pin::pin!(fut);
+        std::future::poll_fn(|cx| {
+            let _in = self.enter();
+            fut.as_mut().poll(cx)
+        })
+        .await
+    }
+}
+
+/// [`SectionScope::enter`]: puts the thread back in the scope it was in.
+#[must_use = "the thread leaves the scope when the guard drops"]
+pub struct ScopeGuard(u64);
+
+impl Drop for ScopeGuard {
+    fn drop(&mut self) {
+        SCOPE.with(|scope| scope.set(self.0));
     }
 }
 
@@ -2006,14 +2081,57 @@ mod tests {
     #[test]
     fn whichever_of_the_actor_and_the_caller_comes_second_fires() {
         let sections = super::Sections::default();
-        assert!(sections.hold(0));
+        let open = super::SectionScope(7);
+        sections.open(open);
+        assert_eq!(sections.hold(0), Some(open), "held in its scope");
         assert!(sections.end(0));
         assert!(!sections.end(1));
-        assert!(!sections.hold(1));
+        assert_eq!(sections.hold(1), None);
         assert!(!sections.end(2));
-        assert!(!sections.hold(2), "held for section 3");
-        assert!(sections.hold(3));
+        assert_eq!(sections.hold(2), None, "held for section 3");
+        assert!(sections.hold(3).is_some());
         assert!(sections.end(3));
+    }
+
+    /// The section after number `u32::MAX` is 0.
+    #[test]
+    fn a_section_number_wraps() {
+        let sections = super::Sections::default();
+        assert!(!sections.end(u32::MAX - 1));
+        assert!(sections.hold(u32::MAX).is_some());
+        assert!(sections.end(u32::MAX));
+        assert!(sections.hold(0).is_some(), "held after the wrap");
+        assert!(sections.end(0));
+    }
+
+    /// A future run in a scope is in it at every poll, and the thread is
+    /// back in its own scope between those polls and after them.
+    #[test]
+    fn a_scope_follows_its_future_and_only_its_future() {
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+        let outer = super::SectionScope::for_section();
+        let _outer = outer.enter();
+        let inner = super::SectionScope(outer.0 + 1);
+        let mut yielded = false;
+        let mut fut = std::pin::pin!(inner.run(async {
+            let before = super::SectionScope::current();
+            std::future::poll_fn(|_| {
+                if std::mem::replace(&mut yielded, true) {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            })
+            .await;
+            (before, super::SectionScope::current())
+        }));
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(fut.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(super::SectionScope::current(), outer);
+        assert_eq!(fut.as_mut().poll(&mut cx), Poll::Ready((inner, inner)));
+        assert_eq!(super::SectionScope::current(), outer);
+        assert_eq!(super::SectionScope::for_section(), outer, "nested");
     }
 
     /// bab72deef: the entry the actor still holds for a request the timer took

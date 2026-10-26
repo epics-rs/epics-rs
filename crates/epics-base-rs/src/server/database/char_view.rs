@@ -162,6 +162,83 @@ pub fn char_view(inst: &RecordInstance, field: &str) -> Option<CharView> {
     })
 }
 
+/// The address [`char_view`] reads through, as `dbChannelCreate` makes it
+/// (`dbChannel.c:486-503`): the route, `no_elements` and the cut.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CharAddr {
+    pub(crate) source: CharSource,
+    pub(crate) no_elements: usize,
+    truncate: bool,
+}
+
+impl CharAddr {
+    /// `field`'s `$` address with no lock, as C's takes none: from the
+    /// declaration and what `cell` settled. `None` where C refuses `$`.
+    pub(crate) fn of(
+        db: &crate::server::database::PvDatabase,
+        cell: &crate::server::record::RecordCell,
+        field: &str,
+    ) -> Option<Self> {
+        let desc = crate::server::record::record_instance::field_desc_in(cell.rdes().fields, field);
+        let Some(desc) = desc else {
+            return (!cell.declares_name(field)
+                && db.has_record_type_attribute(cell.rdes().record_type, field))
+            .then_some(Self {
+                source: CharSource::Attribute,
+                no_elements: MAX_STRING_SIZE,
+                truncate: false,
+            });
+        };
+        if crate::types::link_class_of(desc).is_some() {
+            return Some(Self {
+                source: CharSource::Link,
+                no_elements: PVLINK_STRINGSZ,
+                truncate: false,
+            });
+        }
+        if !cell.takes_string_view(desc) {
+            return None;
+        }
+        let no_elements = if desc.long_string {
+            cell.long_string_size()
+        } else {
+            usize::from(desc.element_size(DbfCode::String))
+        };
+        Some(Self {
+            source: CharSource::Field,
+            no_elements,
+            truncate: desc.declared_dbf == DbfCode::String,
+        })
+    }
+
+    fn of_view(view: &CharView) -> Self {
+        Self {
+            source: view.source,
+            no_elements: view.no_elements,
+            truncate: view.truncate,
+        }
+    }
+
+    /// [`CharView::nul_at_count`].
+    pub(crate) fn nul_at_count(&self) -> bool {
+        self.source != CharSource::Field || self.truncate
+    }
+
+    /// [`DollarView`]'s `pad`: a `DBF_STRING` field's `field_size`.
+    fn pad(&self) -> usize {
+        if self.source == CharSource::Field && self.truncate {
+            self.no_elements
+        } else {
+            0
+        }
+    }
+}
+
+/// `info(Q:form, "String")` on `inst`.
+pub(crate) fn form_string_of(inst: &RecordInstance) -> bool {
+    inst.get_info("Q:form") == Some("String")
+}
+
 /// C's `MAX_STRING_SIZE` (`epicsTypes.h:59`), the `field_size` of a
 /// `DBF_STRING` array element and of an attribute.
 pub(crate) const MAX_STRING_SIZE: usize = 40;
@@ -338,7 +415,7 @@ impl CharView {
     /// the text a link or attribute read copies. A long-string record's
     /// `SPC_DBADDR` buffer is read raw.
     pub fn nul_at_count(&self) -> bool {
-        self.source != CharSource::Field || self.truncate
+        CharAddr::of_view(self).nul_at_count()
     }
 
     /// `dbGet(paddr, target, …, &n_req)`: the elements read, counted as C
@@ -702,7 +779,7 @@ pub fn pvxs_form_string(
     view: Option<&CharView>,
     dollar: bool,
 ) -> bool {
-    (crate::server::database::is_value_field(field) && inst.get_info("Q:form") == Some("String"))
+    (crate::server::database::is_value_field(field) && form_string_of(inst))
         || view.is_some_and(|v| {
             if dollar {
                 v.source == CharSource::Link
@@ -729,11 +806,24 @@ impl PvaDollar {
     /// `S_dbLib_fieldNotFound`.
     pub fn of(inst: &RecordInstance, field: &str) -> Option<Self> {
         let view = char_view(inst, field)?;
-        Some(if pvxs_form_string(inst, field, Some(&view), true) {
+        Some(Self::of_addr(
+            &CharAddr::of_view(&view),
+            form_string_of(inst),
+            field,
+        ))
+    }
+
+    /// Of a `$` channel on `field` addressed `addr`, on a record with
+    /// `info(Q:form, "String")` when `form_string`: [`pvxs_form_string`]'s
+    /// `$` answer.
+    fn of_addr(addr: &CharAddr, form_string: bool, field: &str) -> Self {
+        if (crate::server::database::is_value_field(field) && form_string)
+            || addr.source == CharSource::Link
+        {
             Self::Text
         } else {
             Self::Chars
-        })
+        }
     }
 }
 
@@ -758,12 +848,28 @@ impl DollarView {
     /// `None` where `$` is `S_dbLib_fieldNotFound`.
     pub fn of(inst: &RecordInstance, field: &str, filters: &FilterChain) -> Option<Self> {
         let view = char_view(inst, field)?;
-        Some(Self {
-            serve: PvaDollar::of(inst, field)?,
-            pad: Self::pad_of(&view),
-            source: view.source,
-            final_elements: filters.final_element_count(view.no_elements),
-        })
+        Some(Self::of_addr(
+            CharAddr::of_view(&view),
+            form_string_of(inst),
+            field,
+            filters,
+        ))
+    }
+
+    /// [`Self::of`] the channel addressed `addr`, on a record with
+    /// `info(Q:form, "String")` when `form_string`.
+    pub(crate) fn of_addr(
+        addr: CharAddr,
+        form_string: bool,
+        field: &str,
+        filters: &FilterChain,
+    ) -> Self {
+        Self {
+            serve: PvaDollar::of_addr(&addr, form_string, field),
+            pad: addr.pad(),
+            source: addr.source,
+            final_elements: filters.final_element_count(addr.no_elements),
+        }
     }
 
     /// Of a channel pvxs serves as text without `$` (`ioc/iocsource.cpp:633`)
@@ -780,11 +886,7 @@ impl DollarView {
     }
 
     fn pad_of(view: &CharView) -> usize {
-        if view.source == CharSource::Field && view.truncate {
-            view.no_elements
-        } else {
-            0
-        }
+        CharAddr::of_view(view).pad()
     }
 
     /// Of a `$` channel on a `DBF_STRING` value `field_size` chars wide that

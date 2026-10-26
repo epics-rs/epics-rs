@@ -2527,9 +2527,27 @@ pub struct RecordCell {
     /// [`Self::cvt_pending`]'s words past the first, for a type with over 64
     /// `SPC_DBADDR` fields (sscan has 152).
     cvt_pending_more: Box<[std::sync::atomic::AtomicU64]>,
+    /// The long-string fields' `SIZV`, the `field_size` their `cvt_dbaddr`
+    /// stores (`lsiRecord.c:144`) and so their `$` address's `no_elements`;
+    /// settled with [`Self::string_typed`]. `SIZV` is `SPC_NOMOD`.
+    long_string_size: std::sync::atomic::AtomicU32,
+    /// `info(Q:form, "String")`, by which pvxs serves a `$` channel on `VAL`
+    /// as text; settled with [`Self::string_typed`], after the load has set
+    /// the info tags.
+    form_string: AtomicBool,
 }
 
 const _: () = assert!(std::mem::offset_of!(RecordCell, data) == 0);
+
+/// [`RecordCell::long_string_size`] of `inst`: 0 for a type with no long
+/// string.
+fn long_string_size_of(inst: &RecordInstance) -> u32 {
+    if inst.record.field_list().iter().any(|f| f.long_string) {
+        crate::server::database::char_view::long_string_sizv(inst) as u32
+    } else {
+        0
+    }
+}
 
 /// [`RecordCell::dbaddr_counts`] of `inst`.
 fn dbaddr_counts_of(inst: &RecordInstance) -> Vec<(u16, u32)> {
@@ -3575,6 +3593,10 @@ impl RecordCell {
                 .collect(),
             dbaddr_counts: arc_swap::ArcSwap::from_pointee(dbaddr_counts),
             runtime_types: arc_swap::ArcSwap::from_pointee(runtime_types_of(&instance)),
+            long_string_size: std::sync::atomic::AtomicU32::new(long_string_size_of(&instance)),
+            form_string: AtomicBool::new(crate::server::database::char_view::form_string_of(
+                &instance,
+            )),
             data: LockSetGuarded(std::cell::UnsafeCell::new(instance)),
         }
     }
@@ -3622,16 +3644,32 @@ impl RecordCell {
             .swap(false, std::sync::atomic::Ordering::AcqRel)
     }
 
-    /// Re-read [`Self::string_typed`], [`Self::dbaddr_counts`] and
-    /// [`Self::runtime_types`] from `inst`, this cell's record, after a load
-    /// or an `init_record` that may have moved a type selector or a capacity.
+    /// Re-read [`Self::string_typed`], [`Self::dbaddr_counts`],
+    /// [`Self::runtime_types`], [`Self::long_string_size`] and
+    /// [`Self::form_string`] from `inst`, this cell's record, after a load or
+    /// an `init_record` that may have moved a type selector or a capacity.
     pub(crate) fn settle_addr_facts(&self, inst: &RecordInstance) {
-        self.string_typed.store(
-            string_typed_mask(inst),
-            std::sync::atomic::Ordering::Relaxed,
-        );
+        use std::sync::atomic::Ordering::Relaxed;
+        self.string_typed.store(string_typed_mask(inst), Relaxed);
         self.dbaddr_counts.store(Arc::new(dbaddr_counts_of(inst)));
         self.runtime_types.store(Arc::new(runtime_types_of(inst)));
+        self.long_string_size
+            .store(long_string_size_of(inst), Relaxed);
+        self.form_string.store(
+            crate::server::database::char_view::form_string_of(inst),
+            Relaxed,
+        );
+    }
+
+    /// [`Self::long_string_size`]: a long-string field's `$` `no_elements`.
+    pub(crate) fn long_string_size(&self) -> usize {
+        self.long_string_size
+            .load(std::sync::atomic::Ordering::Relaxed) as usize
+    }
+
+    /// [`Self::form_string`]: the record carries `info(Q:form, "String")`.
+    pub(crate) fn form_string(&self) -> bool {
+        self.form_string.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// C `dbNameToAddr(name, &addr)` on this record succeeding, answered with
@@ -14173,6 +14211,8 @@ mod record_cell_layout_tests {
             dbaddr_counts,
             runtime_types,
             cvt_pending_more,
+            long_string_size,
+            form_string,
         });
         packed_in_order(cell);
 

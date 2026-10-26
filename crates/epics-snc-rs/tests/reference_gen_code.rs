@@ -163,10 +163,6 @@ const EXPECTED_FAILURES: &[(&str, &str)] = &[
         "sequencer/test/validate/pvGet.st",
         "pvGet.st:26: error: snc-rs does not support assignment to a foreign variable",
     ),
-    (
-        "sequencer/test/validate/pvGetCancel.st",
-        "pvGetCancel.st:25: error: snc-rs does not support typename pvStat variable 'status'",
-    ),
 ];
 
 /// Generated code collected in memory.

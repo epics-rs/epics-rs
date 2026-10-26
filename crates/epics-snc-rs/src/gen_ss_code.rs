@@ -12,14 +12,14 @@ use crate::builtin::{CONST_SYMBOLS, ConstType, FUNC_SYMBOLS, Param as BuiltinPar
 use crate::driver::{Exit, Snc};
 use crate::gen_code::{
     CClass, c_bracket_balance, c_classes, escaped_key, escaped_lit, gen_var_decl, line_comment,
-    value_type, vars,
+    rt_typename, value_type, vars,
 };
 use crate::gen_tables::var_place;
 use crate::rust_out::{Arg, Arm, Expr, Fn, Item, Param, Stmt, c_unescape};
 use crate::seq_prim_types::PrimType;
 use crate::type_check::type_is_function;
 use crate::types::{Ast, Extra, Multiplicity, NodeId, NodeTag, Program, Tok, TypeId, VarId, child};
-use crate::var_types::TypeKind;
+use crate::var_types::{ForeignTag, TypeKind};
 
 const NM_ENTRY: &str = "seqg_entry";
 const NM_EXIT: &str = "seqg_exit";
@@ -1396,6 +1396,8 @@ impl<'a> Gen<'a> {
             self.refuse(target, "pointer arithmetic");
         } else if op != Tok::Equal && ty == Ty::Ptr(C_VOID.into()) {
             self.refuse(target, "arithmetic on a void pointer");
+        } else if op != Tok::Equal && matches!(ty, Ty::Rt(_)) {
+            self.refuse(target, "arithmetic on an enum");
         }
         Some(place)
     }
@@ -1411,6 +1413,10 @@ impl<'a> Gen<'a> {
             Some(v) => v,
             None => self.expr(ep),
         };
+        if matches!(ty, Ty::Rt(_)) && v.ty != *ty {
+            // C's enum holds any int, a `seqg_rt` enum only its variants
+            self.refuse(ep, "a conversion to an enum");
+        }
         conv(v, ty)
     }
 
@@ -2555,6 +2561,10 @@ impl<'a> Gen<'a> {
             TypeKind::Pointer { value_type: p } => self
                 .snl_pointee(*p)
                 .map_or(Ty::Foreign, |t| Ty::Ptr(self.pointee_type(t))),
+            TypeKind::Foreign {
+                tag: ForeignTag::Typename,
+                name,
+            } => rt_typename(name).map_or(Ty::Foreign, Ty::Rt),
             _ => Ty::Foreign,
         }
     }
@@ -3861,6 +3871,41 @@ mod tests {
              t.st:9: error: snc-rs does not support a dereference of a void pointer\n\
              t.st:10: error: snc-rs does not support arithmetic on a void pointer\n\
              t.st:11: error: snc-rs does not support a cast of an integer to a pointer\n"
+        );
+    }
+
+    #[test]
+    fn a_pv_stat_variable_holds_a_pv_stat() {
+        // pvGetCancel.st:25
+        let (code, diag) = translate(
+            "program p\nint x;\nassign x to \"x\";\ntypename pvStat status;\nint n;\n\
+             ss a {\nstate z {\nwhen () {\nstatus = pvGet(x);\nn = status == pvStatOK;\n\
+             n = status;\n} state z\n}\n}\n",
+        );
+        assert_eq!(diag, "");
+        let code = words(&code);
+        for e in [
+            "seqg_var.status.set( seqg_env.pv_get_tmo(",
+            "seqg_var.status.get() == seqg_rt::PvStat::Ok",
+            "seqg_var.n.set((seqg_var.status.get() as i32) as _);",
+        ] {
+            assert!(code.contains(e), "{e}\n{code}");
+        }
+    }
+
+    #[test]
+    fn a_pv_stat_variable_takes_no_number() {
+        // C's pvStat is an enum, which holds any int
+        let (_, diag) = translate(
+            "program p\nint x;\nassign x to \"x\";\ntypename pvStat status;\n\
+             ss a {\nstate z {\nwhen () {\nstatus = 1;\nstatus++;\nstatus = pvSeverity(x);\n\
+             } state z\n}\n}\n",
+        );
+        assert_eq!(
+            diag,
+            "t.st:8: error: snc-rs does not support a conversion to an enum\n\
+             t.st:9: error: snc-rs does not support arithmetic on an enum\n\
+             t.st:10: error: snc-rs does not support a conversion to an enum\n"
         );
     }
 

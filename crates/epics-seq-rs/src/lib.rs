@@ -56,7 +56,8 @@
 //!   `u16`, `int` and `int32_t` `i32`, `unsigned int` and `uint32_t` `u32`,
 //!   `long` `i64`, `unsigned long` `u64`, `float` `f32`, `double` `f64`,
 //!   `string` [`SeqString`], `char *` [`CharPtr`], `void *`
-//!   `Ptr<c_void>`, another `T *` [`Ptr<T>`]. `char` is written
+//!   `Ptr<c_void>`, another `T *` [`Ptr<T>`], `typename pvStat` [`PvStat`]
+//!   and `typename pvSevr` [`PvSevr`]. `char` is written
 //!   `std::ffi::c_char` in full and the run-time types `seqg_rt::...`, so
 //!   a companion imports neither. The outer dimension of a multi-PV
 //!   array is split: `[SeqVar<T>; N]`. A block-local variable is a `let`

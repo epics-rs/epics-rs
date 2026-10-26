@@ -21,7 +21,7 @@ use std::sync::Arc;
 use epics_base_rs::types::{EpicsValue, PvString};
 use parking_lot::Mutex;
 
-use crate::types::SeqString;
+use crate::types::{PvSevr, PvStat, SeqString};
 
 /// The value a variable holds before `seqg_init` runs: C's `calloc` (`+r`)
 /// or static zero (`-r`).
@@ -57,6 +57,8 @@ zeroed_scalar!(
     f32 = 0.0,
     f64 = 0.0,
     SeqString = SeqString::new(),
+    PvStat = PvStat::Ok,
+    PvSevr = PvSevr::None,
 );
 
 impl<T: Zeroed, const N: usize> Zeroed for [T; N] {

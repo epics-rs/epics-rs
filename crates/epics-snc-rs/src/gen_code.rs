@@ -137,6 +137,16 @@ pub(crate) fn vars(ast: &Ast, list: Option<VarListId>) -> impl Iterator<Item = V
     std::iter::successors(list.and_then(|l| ast[l].first), |&vp| ast[vp].next)
 }
 
+/// The `seqg_rt` type of a `typename` that seq's run time defines,
+/// `pvAlarm.h`'s enums.
+pub(crate) fn rt_typename(name: &str) -> Option<&'static str> {
+    match name {
+        "pvStat" => Some("PvStat"),
+        "pvSevr" => Some("PvSevr"),
+        _ => None,
+    }
+}
+
 /// The Rust type of a value of SNL type `t`, or the part of `t` that has
 /// none.
 pub(crate) fn value_type(ast: &Ast, t: crate::types::TypeId) -> Result<String, String> {
@@ -172,7 +182,10 @@ pub(crate) fn value_type(ast: &Ast, t: crate::types::TypeId) -> Result<String, S
         TypeKind::Foreign {
             tag: ForeignTag::Typename,
             name,
-        } => return Err(format!("typename {name}")),
+        } => match rt_typename(name) {
+            Some(r) => format!("seqg_rt::{r}"),
+            None => return Err(format!("typename {name}")),
+        },
         TypeKind::Foreign { tag, name } => return Err(format!("{}{name}", tag.prefix())),
         TypeKind::Struct { name, .. } => return Err(format!("struct {name}")),
         k => return Err(k.tag_name().into()),
@@ -776,6 +789,24 @@ fn put(seqg_env: &seqg_rt::StateSet<seqg_vars>, v: f64) {
             "t.st:6: error: snc-rs does not support function pointer variable 'f'\n\
              t.st:7: error: snc-rs does not support pointer to enum e variable 'pe'\n"
         );
+    }
+
+    #[test]
+    fn a_run_time_typename_is_its_seqg_rt_type() {
+        // pvGetCancel.st:25
+        let (mut snc, ast, prg) = analysed(
+            "program p\ntypename pvStat st;\ntypename pvSevr sv;\n\
+             ss s {\nstate z {\nwhen () {} state z\n}\n}\n",
+        );
+        snc.options.line = false;
+        let text = rust_out::print(&gen_var_struct(&mut snc, &ast, &prg));
+        for field in [
+            "pub st: seqg_rt::SeqVar<seqg_rt::PvStat>,",
+            "pub sv: seqg_rt::SeqVar<seqg_rt::PvSevr>,",
+        ] {
+            assert!(text.contains(field), "{field}\n{text}");
+        }
+        assert_eq!(snc.err_cnt(), 0);
     }
 
     #[test]

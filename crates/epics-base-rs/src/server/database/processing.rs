@@ -1125,7 +1125,7 @@ impl AsyncDbHandle {
     /// `own` is the calling record when it calls from inside its own
     /// processing, its fields read from `own`. C's `dbGet` takes no lock;
     /// another record whose lock set is held elsewhere is read by its holder
-    /// as it lets the set go — see [`PvDatabase::db_get_snapshot`].
+    /// as it lets the set go.
     pub fn db_get(
         &self,
         name: impl AsRef<[u8]>,

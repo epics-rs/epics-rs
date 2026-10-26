@@ -4024,7 +4024,8 @@ impl PvDatabase {
                 let field_type = crate::server::record::record_instance::addressed_field_type_of(
                     guard.record.as_ref(),
                     &addressed.field,
-                );
+                )
+                .or_else(|| self.attribute_field_type(&target, &addressed.field));
                 let element_count = match guard.record.get_field(&addressed.field) {
                     Some(v) if v.is_array() => guard
                         .record

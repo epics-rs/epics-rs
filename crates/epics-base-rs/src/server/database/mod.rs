@@ -4038,6 +4038,43 @@ impl PvDatabase {
         rec.declares_name(field) || self.has_record_type_attribute(rec.rdes().record_type, field)
     }
 
+    /// `dbNameToAddr`'s `field_type` where `dbFindFieldPart` misses and
+    /// `dbGetAttributePart` finds a record attribute (`dbAccess.c:673-675`):
+    /// `dbEntryToAddr` copies `dbPutRecordAttribute`'s `DBF_STRING`
+    /// descriptor, one element (`dbAccess.c:636-639`, `dbStaticLib.c:1268-1271`).
+    pub(crate) fn attribute_field_type(
+        &self,
+        rec: &RecordCell,
+        field: &str,
+    ) -> Option<crate::types::DbFieldType> {
+        (!rec.declares_name(field) && self.has_record_type_attribute(rec.rdes().record_type, field))
+            .then_some(crate::types::DbFieldType::String)
+    }
+
+    /// [`RecordCell::addressed_field_type`], a record attribute included.
+    pub(crate) fn addressed_field_type(
+        &self,
+        rec: &RecordCell,
+        field: &str,
+        own: Option<&dyn Record>,
+    ) -> Option<crate::types::DbFieldType> {
+        rec.addressed_field_type(field, own)
+            .or_else(|| self.attribute_field_type(rec, field))
+    }
+
+    /// [`RecordCell::no_elements`], a record attribute's one element included.
+    pub(crate) fn no_elements(&self, rec: &RecordCell, field: &str) -> Option<u32> {
+        rec.no_elements(field)
+            .or_else(|| self.attribute_field_type(rec, field).map(|_| 1))
+    }
+
+    /// [`RecordCell::resolve_addr`], a record attribute's one element
+    /// included: its `special` is `SPC_ATTRIBUTE`, so no `cvt_dbaddr` runs.
+    pub(crate) fn resolve_addr(&self, rec: &Arc<RecordCell>, field: &str) -> Option<u32> {
+        rec.resolve_addr(field)
+            .or_else(|| self.attribute_field_type(rec, field).map(|_| 1))
+    }
+
     /// Synchronous existence check without resolver, taking no record lock:
     /// a simple PV, or a channel [`Self::channel_test`] finds.
     pub fn has_name_no_resolve(&self, name: &[u8]) -> bool {

@@ -827,10 +827,13 @@ record(state, "state") {}
                 let link =
                     crate::server::record::parse_link_v2(format!("{name}.{field}").as_bytes());
                 let free = db.parsed_link_target_field_type(&link);
+                let inst = cell.read();
                 let held = crate::server::record::record_instance::addressed_field_type_of(
-                    cell.read().record.as_ref(),
+                    inst.record.as_ref(),
                     field,
-                );
+                )
+                .or_else(|| inst.attribute(field).map(|_| DbFieldType::String));
+                drop(inst);
                 if free != held {
                     differ.push(format!("{name}.{field}: {free:?} != {held:?}"));
                 }

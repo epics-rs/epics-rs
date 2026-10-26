@@ -1065,7 +1065,13 @@ impl AsyncDbHandle {
         let name = name.as_ref();
         let (base, field) = super::parse_pv_name(name);
         match held {
-            Some((own, rec)) if own == base => rec.get_field(field).is_some(),
+            Some((own, rec)) if own == base => {
+                rec.get_field(field).is_some()
+                    || self.db().is_some_and(|db| {
+                        db.get_record(base)
+                            .is_some_and(|cell| db.attribute_field_type(&cell, field).is_some())
+                    })
+            }
             _ => self.name_to_addr(name).is_some(),
         }
     }
@@ -1098,7 +1104,7 @@ impl AsyncDbHandle {
             return Some(pv.snapshot().value.count() as u32);
         }
         let (base, field) = super::parse_pv_name(name);
-        db.get_record(base)?.resolve_addr(field)
+        db.resolve_addr(&db.get_record(base)?, field)
     }
 
     /// C `dbGet(&addr, dbr_type, buf, &options, &count, NULL)` with
@@ -1147,9 +1153,9 @@ impl AsyncDbHandle {
                 no_elements: 1,
             });
         }
-        let no_elements = cell.resolve_addr(&field)?;
+        let no_elements = db.resolve_addr(&cell, &field)?;
         let own = own.and_then(|own| (own.name() == record.as_bytes()).then_some(own.record()));
-        let field_type = cell.addressed_field_type(&field, own);
+        let field_type = db.addressed_field_type(&cell, &field, own);
         Some(DbAddr {
             record,
             field,
@@ -4666,7 +4672,7 @@ impl PvDatabase {
         };
         // C `dbNameToAddr` takes no lock, and table's `init_record` asks
         // under its own set.
-        rec.addressed_field_type(field, None)
+        self.addressed_field_type(&rec, field, None)
     }
 
     /// Create a put-notify wait-set for a downstream operation a record is
@@ -13625,7 +13631,7 @@ impl PvDatabase {
         let (base, field) = super::parse_pv_name(name);
         let cell = self.get_record(base)?;
         let field = cell.canonical_field(field).into_owned();
-        cell.no_elements(&field)?;
+        self.no_elements(&cell, &field)?;
         let own = own.and_then(|own| Some((self.get_record(own.name())?, own)));
         let own = own.as_ref().map(|(cell, own)| (&**cell, *own));
         if let Some(got) = self.db_get_held(&cell, &field, own, read) {

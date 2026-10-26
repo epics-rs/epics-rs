@@ -4925,7 +4925,9 @@ impl PvDatabase {
     /// `None` for a name that is no record's field.
     pub fn restore_target(&self, name: impl AsRef<[u8]>) -> Option<RestoreTarget> {
         let parts = super::DbNameParts::of(name.as_ref());
-        let target = self.field_target(parts.record, parts.field)?;
+        let target = self
+            .field_target(parts.record, parts.field)
+            .or_else(|| self.attribute_target(parts.record, parts.field))?;
         if !parts.tail.starts_with(b"$") {
             return Some(target);
         }
@@ -4949,6 +4951,21 @@ impl PvDatabase {
             return None;
         }
         self.field_target(parts.record, parts.field)
+    }
+
+    /// `dbNameToAddr`'s record attribute: `dbPutRecordAttribute`'s
+    /// `DBF_STRING` of `MAX_STRING_SIZE`, `SPC_ATTRIBUTE` (`dbStaticLib.c:1268-1271`).
+    fn attribute_target(&self, base: &[u8], field: &str) -> Option<RestoreTarget> {
+        use crate::types::DbfCode;
+        self.attribute_field_type(&*self.get_record(base)?, field)?;
+        Some(RestoreTarget {
+            dbf: DbfCode::String,
+            calc: false,
+            no_mod: false,
+            elements: 1,
+            addr_type: DbfCode::String,
+            field_size: super::char_view::MAX_STRING_SIZE as u16,
+        })
     }
 
     fn field_target(&self, base: &[u8], field: &str) -> Option<RestoreTarget> {

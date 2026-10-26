@@ -4988,6 +4988,13 @@ fn build_put_field_pairs(
             // array/leaf bit) — do not also blanket-mark the field bit.
             let fv = parse_json_into_field(field_desc, &json, bit, &mut changed)?;
             assign_at_path(&mut value, &parts, fv);
+        } else if !matches!(
+            field_desc_at_path(intro, &parts),
+            Some(FieldDesc::Scalar(_))
+        ) {
+            // pvput.cpp:233-236: a plain value writes only a scalar field;
+            // any other is reported and left out of the put.
+            epics_libcom_rs::stderr_println!("{fname} : Error: need a scalar field");
         } else {
             let one = build_put_value_for_path(intro, &parts, raw)?;
             let leaf_val = value_at_path(&one, &parts).ok_or_else(|| {
@@ -5967,6 +5974,22 @@ mod tests {
             );
             assert!(changed.get(intro.bit_for_path("alarm.severity").unwrap()));
         }
+
+        /// A plain (non-JSON) pair writes only a scalar field: pvput.cpp:233-240
+        /// prints "need a scalar field" for any other and leaves it out of the
+        /// put, so `value=10,20` does not write the array and `alarm=5` does
+        /// not reset the alarm structure to its defaults.
+        #[test]
+        fn plain_pair_into_a_non_scalar_field_writes_nothing() {
+            let intro = nt_array(ScalarType::Int);
+            let (_, changed) = build_put_from_args(&intro, &t(&["value=10,20"]), None).unwrap();
+            assert!(changed.is_empty());
+            let intro = nt(ScalarType::Double);
+            let (_, changed) =
+                build_put_from_args(&intro, &t(&["alarm=5", "value=1"]), None).unwrap();
+            assert!(!changed.get(intro.bit_for_path("alarm").unwrap()));
+            assert!(changed.get(intro.bit_for_path("value").unwrap()));
+        }
     }
 
     /// NTEnum bare-token PUT (`build_put_from_args` plain value mode):
@@ -6048,6 +6071,16 @@ mod tests {
         }
         fn t(args: &[&str]) -> Vec<String> {
             args.iter().map(|s| s.to_string()).collect()
+        }
+        /// `value=1` names the `enum_t` structure, not `value.index`, and
+        /// pvput.cpp:233-240 writes no non-scalar field from a plain value, so
+        /// nothing is sent where a default `enum_t` would zero the index and
+        /// empty the choices.
+        #[test]
+        fn plain_pair_on_the_enum_structure_writes_nothing() {
+            let intro = nt_enum();
+            let (_, changed) = build_put_from_args(&intro, &t(&["value=1"]), None).unwrap();
+            assert!(changed.is_empty());
         }
         fn index_of(v: &PvField) -> i32 {
             match v {

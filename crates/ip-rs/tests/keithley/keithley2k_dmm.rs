@@ -172,3 +172,27 @@ async fn a_2700_reads_channels_21_and_22_in_amps() {
     ioc.read(&[":conf:volt:dc", "read?"]).await;
     assert_eq!(ioc.f64_of("Dmm_raw"), 122.0);
 }
+
+/// A `channels` macro past the program's 22 channels is cut to 22. C
+/// scanned a 23rd relay through `ch_on_off[22]` and `ch_mode[22]`, and its
+/// `pvPut(ch_raw[22])` processed `conf_dcv` instead of a reading.
+#[epics_base_rs::epics_test]
+async fn a_channels_macro_past_22_is_cut_to_22() {
+    let ioc = boot(&DMM, 23).await;
+    booted(&ioc, 23).await;
+    assert_eq!(ioc.f64_of("channels"), 22.0);
+    for n in 1..=20 {
+        ioc.put(&format!("Ch{n}_on_off"), EpicsValue::Double(1.0))
+            .await;
+    }
+    ioc.step("single_multi", 1.0, &[]).await;
+    ioc.read(&[
+        ":conf:curr:dc",
+        "rout:clos (@121)",
+        "read?",
+        "rout:clos (@122)",
+        "read?",
+    ])
+    .await;
+    assert_eq!(ioc.f64_of("Ch22_raw"), 122.13);
+}

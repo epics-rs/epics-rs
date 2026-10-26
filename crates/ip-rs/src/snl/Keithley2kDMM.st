@@ -270,8 +270,6 @@ ss mode_change {
             /* We set the following event flags to force these modes and
                labels to be set correctly initially */
             efSet(ch_mode_mon);
-            efSet(ch_mode_sel_mon);
-            efSet(dmm_chan_mon);
         } state monitor_mode_changes
     }
     state monitor_mode_changes {
@@ -302,7 +300,33 @@ ss mode_change {
                 pvPut(ch_units);
             }
         } state monitor_mode_changes
+    }
+}
 
+ss read_meter {
+    int mode;
+    state init {
+        when() {
+            scan_chan = 0;
+            previous_mode = -1;
+            previous_chan = -1;
+            efClear(read_complete_mon);
+            pvPut(do_init);
+            efSet(ch_mode_sel_mon);
+            efSet(dmm_chan_mon);
+        } state wait_read
+    }
+    state wait_read {
+        /* C defect fixed: mode_change sent the mode, relay and init
+        ** commands below from its own thread while read_meter sent its
+        ** own, so ch_close and dmm_units, which both formatted and then
+        ** put, could carry the other's command; init_dmm reset scan_chan
+        ** mid-scan and the reading in flight landed in ch_raw[0]; and
+        ** previous_mode/previous_chan could disagree with the meter, as
+        ** when read_meter's boot *rst landed after mode_change's rout:clos
+        ** and the first read went out with every relay open. read_meter
+        ** alone commands the meter now, between reads; mode_change only
+        ** relabels. */
         when(efTestAndClear(ch_mode_sel_mon)) {
             mode = ch_mode_sel;
             if (mode < NUM_FRONT_MODES) {
@@ -317,19 +341,19 @@ ss mode_change {
                     previous_chan = -1;
                 }
             }
-        } state monitor_mode_changes
+        } state wait_read
 
         when(efTestAndClear(dmm_chan_mon)) {
             sprintf(ch_close, close_format, dmm_chan+1);
             pvPut(ch_close);
             previous_chan = dmm_chan;
-        } state monitor_mode_changes
+        } state wait_read
 
         when(efTestAndClear(dmm_chan2_mon) && (channels > 10)) {
             sprintf(ch_close, close_format, dmm_chan2+11);
             pvPut(ch_close);
             previous_chan = dmm_chan2+10;
-        } state monitor_mode_changes
+        } state wait_read
 
         when(efTestAndClear(init_dmm_mon)) {
             if (init_dmm == 1) {
@@ -340,22 +364,8 @@ ss mode_change {
                 pvPut(init_dmm);
                 pvPut(do_init);
             }
-        } state monitor_mode_changes
-    }
-}
-
-ss read_meter {
-    int mode;
-    state init {
-        when() {
-            scan_chan = 0;
-            previous_mode = -1;
-            previous_chan = -1;
-            efClear(read_complete_mon);
-            pvPut(do_init);
         } state wait_read
-    }
-    state wait_read {
+
         when(efTestAndClear(done_read_mon) && (done_read == 1)) {
         } state read_channel
     }

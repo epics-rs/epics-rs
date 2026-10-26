@@ -198,14 +198,15 @@ pub(crate) enum Join {
 }
 
 impl Join {
-    /// Apply the add to `axes`, kept in address order.
-    pub(crate) fn place(self, axes: &mut Vec<Axis>) {
+    /// Apply the add to `axes`, kept in address order; the index of an
+    /// axis no pass has polled yet.
+    pub(crate) fn place(self, axes: &mut Vec<Axis>) -> Option<usize> {
         let of = |motor: &Arc<Mutex<dyn AsynMotor>>| {
             axes.iter()
                 .position(|a| std::ptr::addr_eq(Arc::as_ptr(&a.motor), Arc::as_ptr(motor)))
         };
-        let axis = match self {
-            Self::Axis(axis) => *axis,
+        let (axis, new) = match self {
+            Self::Axis(axis) => (*axis, true),
             Self::Mirror {
                 motor,
                 port,
@@ -213,19 +214,17 @@ impl Join {
                 poll,
                 place,
             } => {
-                let Some(at) = of(&motor) else {
-                    return;
-                };
+                let at = of(&motor)?;
                 let mut axis = axes.remove(at);
                 axis.mirror_to(&port, addr, poll);
                 axis.take(place);
-                axis
+                (axis, false)
             }
             Self::Callback { motor } => {
                 if let Some(at) = of(&motor) {
                     axes[at].post_by_callback();
                 }
-                return;
+                return None;
             }
         };
         // C's poller polls only `pAxes_` (asynMotorController.cpp:651-652),
@@ -235,6 +234,7 @@ impl Join {
         }
         let at = axes.partition_point(|a| a.order() <= axis.order());
         axes.insert(at, axis);
+        new.then_some(at)
     }
 }
 
@@ -657,8 +657,6 @@ enum Schedule {
 
 /// One axis of the loop and the records bound to it.
 pub(crate) struct Axis {
-    /// An add to the running poller, counted until its first poll.
-    pub(crate) first_poll: Option<FirstPollPending>,
     /// Its own address's, then the controller port address it was added
     /// at later; each address's records hold the status the poller set.
     places: Vec<Place>,
@@ -803,11 +801,10 @@ impl std::future::Future for PollerThread {
     }
 }
 
-/// A controller's poller whose startup pass has not ended, or an axis added
-/// to its running poller and not yet polled, counted on that controller until
-/// this drops: after the pass, or with the poller or axis that never got
-/// there. A driver whose own thread polls (omsBaseController's omsPoller)
-/// holds one over its first pass.
+/// A controller's poller whose startup pass has not ended, counted on that
+/// controller until this drops: after the pass, or with the poller that
+/// never got there. A driver whose own thread polls (omsBaseController's
+/// omsPoller) holds one over its first pass.
 #[must_use]
 pub struct FirstPollPending(Arc<std::sync::atomic::AtomicUsize>);
 
@@ -916,7 +913,6 @@ impl Axis {
             mirrored_word: None,
             owned_bits: 0,
             power: Power::Idle,
-            first_poll: None,
         }
     }
 
@@ -1731,23 +1727,39 @@ impl MotorPollLoop {
         }
     }
 
-    /// An add to the running controller. C's poller runs one startup pass;
-    /// a later axis is first polled on the next pass, and a record bound
-    /// before reads what its constructor set.
-    fn join(&mut self, Joining { join, joined }: Joining) {
-        join.place(&mut self.axes);
+    /// An add to the running controller: its new axis is polled under the
+    /// controller lock before the add returns; whether it moves. C's poller
+    /// polls it at once only if it was already waiting on the `pC->lock()`
+    /// the CreateAxis holds (smarActMCSMotorDriver.cpp:816-819); one that
+    /// ran first leaves it unpolled an idle period, and init_controller
+    /// writes an autosaved DVAL over position 0 (devMotorAsyn.c:175-176).
+    fn join(&mut self, Joining { join, joined }: Joining) -> bool {
+        let moving = join.place(&mut self.axes).is_some_and(|at| {
+            let polled = polled::after(&self.controller_poll);
+            let axis = &mut self.axes[at];
+            let moving = axis.poller_poll(&polled, None);
+            axis.offer_pulses();
+            moving
+        });
         let _ = joined.send(());
+        moving
     }
 
-    /// The axes added before a pass took the controller lock: C's are in
-    /// its list when it walks it (asynMotorController.cpp:648-658).
-    fn join_from(joining: &mut Option<mpsc::UnboundedReceiver<Joining>>, axes: &mut Vec<Axis>) {
+    /// The axes added before a pass took the controller lock, C's in its
+    /// list when it walks it (asynMotorController.cpp:648-658); each add
+    /// returns once the pass has polled its axis.
+    fn join_from(
+        joining: &mut Option<mpsc::UnboundedReceiver<Joining>>,
+        axes: &mut Vec<Axis>,
+    ) -> Vec<std::sync::mpsc::SyncSender<()>> {
+        let mut confirms = Vec::new();
         while let Some(Joining { join, joined }) =
             joining.as_mut().and_then(|rx| rx.try_recv().ok())
         {
             join.place(axes);
-            let _ = joined.send(());
+            confirms.push(joined);
         }
+        confirms
     }
 
     /// The poller thread's startup pass, on the calling thread: for a
@@ -1851,7 +1863,7 @@ impl MotorPollLoop {
         // C's pass walks pAxes_ under the lock (asynMotorController.cpp:
         // 658), so it polls an axis added while it waited for the lock. One
         // that joins here has not moved, so no off delay applies yet.
-        Self::join_from(&mut self.joining, &mut self.axes);
+        let confirms = Self::join_from(&mut self.joining, &mut self.axes);
         let mut moving = false;
         for axis in &mut self.axes {
             let off_delay = off_delays
@@ -1859,10 +1871,12 @@ impl MotorPollLoop {
                 .find(|(motor, _)| std::ptr::addr_eq(*motor, Arc::as_ptr(&axis.motor)))
                 .and_then(|(_, delay)| *delay);
             moving |= axis.poller_poll(&polled, off_delay);
-            axis.first_poll = None;
             axis.offer_pulses();
         }
         drop(polled);
+        for joined in confirms {
+            let _ = joined.send(());
+        }
         moving
     }
 
@@ -2046,7 +2060,15 @@ impl MotorPollLoop {
                     // C shutdownPoller ends the controller's one poller.
                     Some(PollCommand::Shutdown) | None => return,
                 },
-                Wake::Join(join) => self.join(*join),
+                // C's pass that polled a moving axis waits the moving
+                // period next (:686-694).
+                Wake::Join(join) => {
+                    let moving = self.controller_poll.state().periods.moving;
+                    if self.join(*join) && !moving.is_zero() {
+                        let soon = Instant::now() + moving;
+                        due = Some(due.map_or(soon, |at| at.min(soon)));
+                    }
+                }
                 Wake::Wakeup => due = self.wakeup_pass().await,
                 Wake::Due => {
                     due = self.timed_pass().await;
@@ -3823,10 +3845,10 @@ mod tests {
     }
 
     /// C readGenericPointer reads the parameters the constructor set
-    /// (asynMotorController.cpp:505-525), so a record bound to an axis
-    /// created after the poller started reads PROBLEM|COMM_ERR at init, and
-    /// a poll that sets them again changes nothing and posts nothing
-    /// (asynMotorAxis.cpp:316-322).
+    /// (asynMotorController.cpp:505-525), which its failed first poll keeps,
+    /// so a record bound to an axis created after the poller started reads
+    /// PROBLEM|COMM_ERR at init, and a poll that sets them again changes
+    /// nothing and posts nothing (asynMotorAxis.cpp:316-322).
     #[test]
     fn a_record_bound_to_a_joined_axis_reads_what_its_constructor_set() {
         let controller = crate::builder::ControllerBuilder::new();
@@ -3942,7 +3964,8 @@ mod tests {
             polled,
             "the replaced axis polled"
         );
-        assert_eq!(*second_polls.lock().unwrap(), 1);
+        // At its join, then in the pass.
+        assert_eq!(*second_polls.lock().unwrap(), 2);
         assert_eq!(
             handle.read_float64_blocking(index::POSITION, 0).unwrap(),
             2.0
@@ -3959,8 +3982,8 @@ mod tests {
         poll_loop.join(joining);
         crate::devices::register_axis(add.join().unwrap().unwrap().axis).unwrap();
         now(poll_loop.poller_pass(false));
-        assert_eq!(*first_polls.lock().unwrap(), polled + 1);
-        assert_eq!(*second_polls.lock().unwrap(), 1, "the replaced axis polled");
+        assert_eq!(*first_polls.lock().unwrap(), polled + 2);
+        assert_eq!(*second_polls.lock().unwrap(), 2, "the replaced axis polled");
     }
 
     /// Logs its moves, polling at the last one, or `.1` before any.
@@ -4329,8 +4352,8 @@ mod tests {
 
     /// C's asynMotorAxis constructor calls no record back
     /// (asynMotorAxis.cpp:31-68) and leaves `statusChanged_` raised: an axis
-    /// placed at an address with records bound posts nothing until its first
-    /// poll, which posts whatever it reads.
+    /// placed at an address with records bound posts first from its first
+    /// poll, at its join, whatever it reads.
     #[test]
     fn a_new_axis_at_a_live_address_posts_first_from_its_first_poll() {
         let port = "firstPollPosts";
@@ -4357,16 +4380,10 @@ mod tests {
             port,
             0,
         );
-        assert!(reads.take().is_empty(), "the constructor posted");
-        assert!(
-            state.lock().unwrap().update_values().is_none(),
-            "the constructor set needUpdate"
-        );
-        now(poll_loop.poller_pass(false));
         assert_eq!(
             reads.take(),
             [Some(MotorStatus::default())],
-            "the first poll posted nothing"
+            "the constructor posted, or the first poll posted nothing"
         );
         now(poll_loop.poller_pass(false));
         assert!(reads.take().is_empty(), "an unchanged second poll posted");

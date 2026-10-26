@@ -289,10 +289,10 @@ impl ControllerAxes {
         axes.poll.first_poll_pending()
     }
 
-    /// This controller's startup pass if it has not ended, the axes added to
-    /// its running poller and not yet polled, and the [`FirstPollPending`]s
-    /// its driver holds. These polls run on the poller thread, as C's do, so
-    /// a reader that wants what they set waits for this to reach 0.
+    /// This controller's startup pass if it has not ended, and the
+    /// [`FirstPollPending`]s its driver holds. These polls run on the poller
+    /// thread, as C's do, so a reader that wants what they set waits for
+    /// this to reach 0.
     pub fn first_polls_pending(&self) -> usize {
         let axes = self.0.lock().unwrap_or_else(|e| e.into_inner());
         axes.poll.first_polls_pending()
@@ -320,9 +320,9 @@ impl ControllerAxes {
         axes.poll.wakeup();
     }
 
-    /// Add an axis; on a running poller, return once the poller has taken
-    /// it, to be polled from its next pass. A `motor`
-    /// added before is not polled twice: `user` reaches the same axis.
+    /// Add an axis; on a running poller, return once the poller has polled
+    /// it. A `motor` added before is not polled twice: `user` reaches the
+    /// same axis.
     pub fn add(
         &self,
         motor: Arc<Mutex<dyn AsynMotor>>,
@@ -430,7 +430,7 @@ impl ControllerAxes {
         let mut axes = self.0.lock().unwrap_or_else(|e| e.into_inner());
         // Recorded before the poller confirms, so a concurrent add of the
         // same motor finds it.
-        let (mut join, added) = if let Some(opened) = axes.opened.iter_mut().find(|o| same(o)) {
+        let (join, added) = if let Some(opened) = axes.opened.iter_mut().find(|o| same(o)) {
             match (mirror, &opened.mirror) {
                 (None, _) if callback => (
                     Join::Callback {
@@ -507,16 +507,12 @@ impl ControllerAxes {
             axes.opened
                 .retain(|o| same(o) || o.mirror.as_ref().map(|(at, _)| at) != address.as_ref());
         }
-        let poll = axes.poll.clone();
         let joined = match &mut axes.list {
             AxisList::Pending(axes) => {
                 join.place(axes);
                 None
             }
             AxisList::Running(poller) => {
-                if let Join::Axis(axis) = &mut join {
-                    axis.first_poll = Some(poll.first_poll_pending());
-                }
                 let (joined, taken) = std::sync::mpsc::sync_channel(1);
                 let _ = poller.send(Joining { join, joined });
                 Some(taken)

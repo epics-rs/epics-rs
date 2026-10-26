@@ -315,11 +315,12 @@ async fn an_axis_s_post_reaches_its_records_before_the_next_axis_polls() {
     }
 }
 
-/// C's poller runs one startup pass, the wakeupPoller before its loop
-/// (asynMotorController.cpp:630); an axis created after the poller started
-/// is first polled on a later pass, not on one of its own.
+/// An axis created after the poller started is polled at its join, after
+/// the controller poll and before its add returns, as C's pass waiting on
+/// the lock CreateAxis holds polls it (asynMotorController.cpp:644-658);
+/// the join polls no other axis.
 #[tokio::test]
-async fn axes_joining_a_running_poller_get_no_pass_of_their_own() {
+async fn an_axis_joining_a_running_poller_is_polled_alone_before_its_add_returns() {
     let log = Log::default();
     let controller_log = log.clone();
     let controller = ControllerBuilder::new()
@@ -352,15 +353,14 @@ async fn axes_joining_a_running_poller_get_no_pass_of_their_own() {
                 .unwrap(),
         );
     }
-    tokio::time::sleep(PERIOD * 4).await;
-    assert_eq!(names(&log), ["C"], "the startup pass alone");
+    assert_eq!(names(&log), ["C", "C", "A0", "C", "A1", "C", "A2"]);
     joined[0]
         .poll_cmd_tx
         .send(PollCommand::Wakeup)
         .await
         .unwrap();
-    until("the woken pass", || names(&log).len() >= 5).await;
-    assert_eq!(names(&log), ["C", "C", "A0", "A1", "A2"]);
+    until("the woken pass", || names(&log).len() >= 11).await;
+    assert_eq!(names(&log)[7..], ["C", "A0", "A1", "A2"]);
     joined[0]
         .poll_cmd_tx
         .send(PollCommand::Shutdown)
@@ -540,8 +540,10 @@ async fn a_started_poller_is_pending_until_its_startup_pass_ends() {
     poller.await;
 }
 
+/// An add to a running poller returns once the axis is polled: nothing is
+/// left pending for a reader to wait on.
 #[tokio::test(flavor = "multi_thread")]
-async fn an_axis_added_to_a_running_poller_is_pending_until_its_first_poll() {
+async fn an_axis_added_to_a_running_poller_is_polled_when_its_add_returns() {
     let log = Log::default();
     let mut controller = ControllerBuilder::new();
     let axis = |name, addr| {
@@ -576,11 +578,12 @@ async fn an_axis_added_to_a_running_poller_is_pending_until_its_first_poll() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(first.first_polls_pending(), 1);
+    assert_eq!(first.first_polls_pending(), 0);
+    let names = || -> Vec<_> { log.lock().unwrap().iter().map(|(n, _)| *n).collect() };
+    assert_eq!(names(), ["A2", "A0"]);
     poll_cmd_tx.send(PollCommand::Wakeup).await.unwrap();
-    polled(&log, 3);
-    let names: Vec<_> = log.lock().unwrap().iter().map(|(n, _)| *n).collect();
-    assert_eq!(names, ["A2", "A0", "A2"]);
+    polled(&log, 4);
+    assert_eq!(names(), ["A2", "A0", "A0", "A2"]);
     poll_cmd_tx.send(PollCommand::Shutdown).await.unwrap();
     poller.await;
 }

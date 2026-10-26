@@ -262,12 +262,12 @@ record(waveform, "JC") { field(NELM, "4") field(FTVL, "DOUBLE") field(INP, {ca:"
         .build()
         .await
         .unwrap();
-    let remote = Arc::new(Remote(Mutex::new(HashMap::from([(
-        "XSW",
-        strings(&["1", "2", "3"]),
-    )]))));
+    // PU's CA name is the whole text, as dbCaAddLink is handed it.
+    let remote = Arc::new(Remote(Mutex::new(HashMap::from([
+        ("pva://XSW", strings(&["1", "2", "3"])),
+        ("XSW", strings(&["1", "2", "3"])),
+    ]))));
     db.register_link_set("ca", remote.clone()).await;
-    db.register_link_set("pva", remote.clone()).await;
     db.initialize_link_locality().await;
     db.setup_cp_links().await;
     db.scan_control().run();
@@ -282,11 +282,10 @@ record(waveform, "JC") { field(NELM, "4") field(FTVL, "DOUBLE") field(INP, {ca:"
         &[("PU", &[1.0, 2.0, 3.0]), ("JC", &[1.0, 2.0, 3.0])],
     );
 
-    remote
-        .0
-        .lock()
-        .unwrap()
-        .insert("XSW", strings(&["7", "abc", "9"]));
+    remote.0.lock().unwrap().extend([
+        ("pva://XSW", strings(&["7", "abc", "9"])),
+        ("XSW", strings(&["7", "abc", "9"])),
+    ]);
     for rec in ["PU", "JC"] {
         process(&db, rec).await;
     }

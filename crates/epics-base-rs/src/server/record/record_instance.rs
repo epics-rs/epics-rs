@@ -3824,6 +3824,12 @@ impl RecordCell {
         &self.rdes
     }
 
+    /// The record's type name — C `precord->rdes->name` — without taking its
+    /// lock set.
+    pub fn record_type(&self) -> &'static str {
+        self.rdes.record_type
+    }
+
     /// The field name a by-name entry works with: the declared spelling of
     /// the type's own field or a `dbCommon` one, matched without case (the
     /// port takes the lower-case names C's `dbNameToAddr` refuses), found

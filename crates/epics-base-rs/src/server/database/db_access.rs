@@ -463,11 +463,8 @@ impl DbSubscription {
             .get_record(record_name)
             .ok_or(SubscribeRefused::NoRecord)?;
         let dollar = if channel.name.string_view {
-            let view = crate::server::database::char_view::DollarView::of(
-                &rec.read(),
-                &field,
-                &channel.chain,
-            );
+            let view = crate::server::database::char_view::ChannelAddr::of(db, &rec, &field)
+                .and_then(|addr| addr.dollar_view(&field, &channel.chain));
             Some(view.ok_or(SubscribeRefused::FieldNotFound)?)
         } else {
             None

@@ -13,10 +13,8 @@
 //! VAL) and as `pvxput` refusing the drive with "Unable to assign string[]
 //! with String".
 
-use epics_base_rs::server::database::char_view::{DollarView, plain_re_view, pvxs_form_string};
+use epics_base_rs::server::database::char_view::{ChannelAddr, DollarView};
 use epics_base_rs::server::database::filters::FilterChain;
-use epics_base_rs::server::database::is_value_field;
-use epics_base_rs::server::record::{FieldDeclaration, Record, RecordInstance};
 use epics_base_rs::types::{DbFieldType, EpicsValue, PvString};
 
 /// The shape a channel serves, from its element count alone.
@@ -33,25 +31,6 @@ pub enum ChannelShape {
     Array,
 }
 
-/// `dbChannelFinalElements(chan)` for a channel bound to `field_upper`.
-///
-/// `dbNameToAddr` seeds `paddr->no_elements = 1` and nothing but a
-/// `special(SPC_DBADDR)` field's `cvt_dbaddr` ever raises it, which is
-/// exactly the population [`FieldDeclaration::field_native_count`] answers
-/// for. Its `None` means "the channel count is the value's own count" — the
-/// answer for a plain scalar field (one) and for a `SPC_DBADDR` field whose
-/// record declares no `cvt_dbaddr` capacity (`histogram` VAL, whose buffer is
-/// always `NELM` long).
-pub fn channel_final_elements(
-    record: &dyn Record,
-    field_upper: &str,
-    resolved: Option<&EpicsValue>,
-) -> u32 {
-    record
-        .field_native_count(field_upper)
-        .unwrap_or_else(|| resolved.map(EpicsValue::count).unwrap_or(1))
-}
-
 impl ChannelShape {
     /// The shape of a channel whose filter chain leaves `final_elements`.
     pub fn of_count(final_elements: usize) -> Self {
@@ -62,59 +41,20 @@ impl ChannelShape {
         }
     }
 
-    /// Classify the channel bound to `record.field_upper` through its filter
-    /// chain `filters`, whose `arr` reshapes the count as its
-    /// `channel_report` does. `resolved` is the value that channel serves
-    /// (`client_field_value`, i.e. already projected onto the field's
-    /// declared type).
-    pub fn of_channel(
-        record: &dyn Record,
-        field_upper: &str,
-        resolved: Option<&EpicsValue>,
-        filters: &FilterChain,
-    ) -> Self {
-        // A long-string field is never a scalar channel. C's `cvt_dbaddr`
-        // gives it `no_elements = 1`, but pvxs reshapes a `DBF_STRING` wider
-        // than `MAX_STRING_SIZE` into a `SIZV`-element `DBF_CHAR` channel
-        // (`ioc/channel.cpp:58-67`) and reaches its long-string arms
-        // (`putLongString`, `iocsource.cpp:602-603`) BECAUSE of that, so the
-        // count is not what can answer here; the declaration is.
-        if record.field_is_long_string(field_upper) {
-            return ChannelShape::Array;
-        }
-        Self::of_count(filters.final_element_count(channel_final_elements(
-            record,
-            field_upper,
-            resolved,
-        ) as usize))
-    }
-
-    /// [`Self::of_channel`] for a live record, resolving the field's value
-    /// only when the count actually needs it.
+    /// Of the channel addressed `addr` through its filter chain `filters`,
+    /// whose `arr` reshapes the count as its `channel_report` does.
     ///
-    /// `field_native_count` answers every field the `.dbd` declares
-    /// `SPC_DBADDR` with a capacity, and every field it does not with the
-    /// scalar `None`; only a `SPC_DBADDR` field whose record declares no
-    /// capacity falls through to the value's own count. Resolving eagerly
-    /// would clone a whole waveform buffer on the read path to ask a question
-    /// its `NELM` already answered.
-    pub fn of_record_channel(
-        instance: &epics_base_rs::server::record::RecordInstance,
-        field_upper: &str,
-        filters: &FilterChain,
-    ) -> Self {
-        if instance.record.field_is_long_string(field_upper) {
+    /// A long-string field is never a scalar channel. C's `cvt_dbaddr` gives
+    /// it `no_elements = 1`, but pvxs reshapes a `DBF_STRING` wider than
+    /// `MAX_STRING_SIZE` into a `SIZV`-element `DBF_CHAR` channel
+    /// (`ioc/channel.cpp:58-67`) and reaches its long-string arms
+    /// (`putLongString`, `iocsource.cpp:602-603`) BECAUSE of that, so the
+    /// count is not what can answer here; the declaration is.
+    pub fn of_addr(addr: &ChannelAddr, filters: &FilterChain) -> Self {
+        if addr.long_string() {
             return ChannelShape::Array;
         }
-        match instance.record.field_native_count(field_upper) {
-            Some(n) => Self::of_count(filters.final_element_count(n as usize)),
-            None => Self::of_channel(
-                &*instance.record,
-                field_upper,
-                instance.client_field_value(field_upper).as_ref(),
-                filters,
-            ),
-        }
+        Self::of_count(filters.final_element_count(addr.no_elements()))
     }
 
     /// pvxs's `isArray`.
@@ -147,7 +87,7 @@ impl ChannelShape {
 
 /// The element type's zero — C's `memset(&buf, 0, sizeof(buf))` for the
 /// `nReq == 0` read above.
-fn zero_of(dbf: DbFieldType) -> EpicsValue {
+pub(crate) fn zero_of(dbf: DbFieldType) -> EpicsValue {
     match dbf {
         DbFieldType::String => EpicsValue::String(PvString::default()),
         DbFieldType::Short => EpicsValue::Short(0),
@@ -197,67 +137,23 @@ pub enum ChannelValue {
 }
 
 impl ChannelValue {
-    /// Of the channel on `field_upper` through `filters`, `resolved` being
-    /// the value it serves (`client_field_value`).
-    pub fn of_channel(
-        instance: &RecordInstance,
-        field_upper: &str,
-        resolved: Option<&EpicsValue>,
-        filters: &FilterChain,
-    ) -> Self {
-        Self::decide(instance, field_upper, resolved, filters, || {
-            channel_final_elements(&*instance.record, field_upper, resolved)
-        })
-    }
-
-    /// [`Self::of_channel`] for a live record, which resolves the value only
-    /// for a VAL tagged `Q:form`, whose element type it asks, or for a count
-    /// the declaration does not give ([`ChannelShape::of_record_channel`]).
-    pub fn of_record_channel(
-        instance: &RecordInstance,
-        field_upper: &str,
-        filters: &FilterChain,
-    ) -> Self {
-        let resolved = (is_value_field(field_upper)
-            && instance.get_info("Q:form") == Some("String"))
-        .then(|| instance.client_field_value(field_upper))
-        .flatten();
-        Self::decide(instance, field_upper, resolved.as_ref(), filters, || {
-            instance
-                .record
-                .field_native_count(field_upper)
-                .unwrap_or_else(|| {
-                    let value = instance.client_field_value(field_upper);
-                    channel_final_elements(&*instance.record, field_upper, value.as_ref())
-                })
-        })
-    }
-
-    fn decide(
-        instance: &RecordInstance,
-        field_upper: &str,
-        resolved: Option<&EpicsValue>,
-        filters: &FilterChain,
-        field_elements: impl FnOnce() -> u32,
-    ) -> Self {
-        let view = plain_re_view(instance, field_upper);
+    /// Of the channel addressed `addr` on `field_upper` through `filters`.
+    pub fn of_addr(addr: &ChannelAddr, field_upper: &str, filters: &FilterChain) -> Self {
+        let view = addr.re_view();
         // Still `DBR_STRING`, whatever its `Q:form`.
-        if view.is_none() && instance.record.field_is_long_string(field_upper) {
+        if view.is_none() && addr.long_string() {
             return Self::LongStringField;
         }
-        let final_elements = filters.final_element_count(match &view {
-            Some(v) => v.no_elements,
-            None => field_elements() as usize,
+        let final_elements = filters.final_element_count(match view {
+            Some(v) => v.no_elements(),
+            None => addr.no_elements(),
         });
         let shape = ChannelShape::of_count(final_elements);
         // `DBR_CHAR`: the reshaped chars, or a `DBF_CHAR` field — the signed
         // one, as pvxs tests.
-        let chars = view.is_some() || matches!(resolved, Some(EpicsValue::CharArray(_)));
-        if chars
-            && shape.is_array()
-            && pvxs_form_string(instance, field_upper, view.as_ref(), false)
-        {
-            return Self::Text(DollarView::of_text_channel(view.as_ref(), final_elements));
+        let chars = view.is_some() || addr.value_type() == DbFieldType::Char;
+        if chars && shape.is_array() && addr.form_string(field_upper, view, false) {
+            return Self::Text(DollarView::of_text_channel(view, final_elements));
         }
         Self::Shaped(shape)
     }

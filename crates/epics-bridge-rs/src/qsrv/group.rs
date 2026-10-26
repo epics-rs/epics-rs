@@ -11,6 +11,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use epics_base_rs::server::database::char_view::ChannelAddr;
 use epics_base_rs::server::database::db_access::{DbAttachment, SubscriptionActivation};
 use epics_base_rs::server::database::{PutSplit, PvDatabase};
 use epics_base_rs::server::pv::{MonitorEvent, SubscribeRefused};
@@ -582,6 +583,15 @@ fn member_slot(fields: &mut Vec<(String, FieldDesc)>, name: &str) -> usize {
 // Atomic multi-record locking (pvxs DBManyLocker equivalent)
 // ---------------------------------------------------------------------------
 
+/// Each member record's cell and the read guard the atomic path holds on it.
+type GuardMap<'a> = HashMap<
+    &'a [u8],
+    (
+        &'a epics_base_rs::server::record::RecordCell,
+        &'a epics_base_rs::server::record::RecordInstance,
+    ),
+>;
+
 /// Collect the records backing a group's members, in sorted order to prevent
 /// deadlocks. Corresponds to C++ QSRV `DBManyLocker` (dbmanylocker.h). The
 /// caller acquires the per-record read guards synchronously from these handles:
@@ -913,14 +923,20 @@ impl GroupChannel {
             // out of its write guard for this window, so this acquisition is
             // uncontended and deadlock-free; the guards are consumed synchronously
             // by `read_member_locked` below and never held across an await.
-            let guards: Vec<(&[u8], epics_base_rs::server::record::RecordRef<'_>)> = member_guards
+            let guards: Vec<(
+                &[u8],
+                &epics_base_rs::server::record::RecordCell,
+                epics_base_rs::server::record::RecordRef<'_>,
+            )> = member_guards
                 .iter()
-                .map(|(name, rec)| (&name[..], rec.read()))
+                .map(|(name, rec)| (&name[..], &**rec, rec.read()))
                 .collect();
             // Build a name→guard lookup so each member resolves
             // against the already-held guard for its backing record.
-            let guard_map: HashMap<&[u8], &epics_base_rs::server::record::RecordInstance> =
-                guards.iter().map(|(name, g)| (*name, &**g)).collect();
+            let guard_map: GuardMap<'_> = guards
+                .iter()
+                .map(|(name, cell, g)| (*name, (*cell, &**g)))
+                .collect();
             for (idx, member) in self.def.channels.iter().enumerate() {
                 // Only `proc` places no value field. A `+type:"structure"`
                 // member emits an empty struct branch (resolved by
@@ -1015,8 +1031,17 @@ impl GroupChannel {
         let backing = self.db.resolve_link_backed_metadata(&rec);
         let backing = epics_base_rs::server::database::LinkBacking::resolved(&backing);
 
+        let addr = member.addr(&self.db, &rec);
         let instance = rec.read();
-        Self::decode_member(member, record_name, field_name, &instance, backing, log)
+        Self::decode_member(
+            member,
+            record_name,
+            field_name,
+            addr,
+            &instance,
+            backing,
+            log,
+        )
     }
 
     /// Read a single member's value against a record instance that the
@@ -1026,7 +1051,7 @@ impl GroupChannel {
     fn read_member_locked(
         &self,
         member: &MemberChannel,
-        guard_map: &HashMap<&[u8], &epics_base_rs::server::record::RecordInstance>,
+        guard_map: &GuardMap<'_>,
         backings: &HashMap<
             &[u8],
             std::collections::HashMap<String, epics_base_rs::server::database::LinkMetadata>,
@@ -1039,7 +1064,7 @@ impl GroupChannel {
 
         let (record_name, field_name) = member.names();
 
-        let instance = *guard_map.get(record_name).ok_or_else(|| {
+        let (cell, instance) = *guard_map.get(record_name).ok_or_else(|| {
             BridgeError::RecordNotFound(String::from_utf8_lossy(record_name).into_owned())
         })?;
         // Resolved by the caller before it took any member guard — the atomic
@@ -1049,7 +1074,16 @@ impl GroupChannel {
             .get(record_name)
             .map(epics_base_rs::server::database::LinkBacking::resolved)
             .unwrap_or_else(epics_base_rs::server::database::LinkBacking::none);
-        Self::decode_member(member, record_name, field_name, instance, backing, log)
+        let addr = member.addr(&self.db, cell);
+        Self::decode_member(
+            member,
+            record_name,
+            field_name,
+            addr,
+            instance,
+            backing,
+            log,
+        )
     }
 
     /// Decode one member's value from an already-borrowed record
@@ -1066,43 +1100,38 @@ impl GroupChannel {
         member: &MemberChannel,
         record_name: &[u8],
         field_name: &str,
+        addr: Option<ChannelAddr>,
         instance: &epics_base_rs::server::record::RecordInstance,
         backing: epics_base_rs::server::database::LinkBacking<'_>,
         log: Option<&MonitorEvent>,
     ) -> BridgeResult<PvField> {
+        let not_found = || BridgeError::FieldNotFound {
+            record: String::from_utf8_lossy(record_name).into_owned(),
+            field: field_name.to_string(),
+        };
+        let (addr, view) = addr
+            .and_then(|addr| Some((addr, member.view_in(&addr)?)))
+            .ok_or_else(not_found)?;
         match member.def.mapping {
             FieldMapping::Scalar => {
-                let not_found = || BridgeError::FieldNotFound {
-                    record: String::from_utf8_lossy(record_name).into_owned(),
-                    field: field_name.to_string(),
-                };
-                let view = member.view_in(instance).ok_or_else(not_found)?;
                 let mut snapshot = member
                     .snapshot_in(instance, view, backing)
                     .ok_or_else(not_found)?;
                 if let Some(log) = log {
                     member.write_log_over(&mut snapshot, log, instance, view);
                 }
-                // Derive the NT shape from the configured field's resolved
-                // value (record → common → virtual), not from the owning
-                // record type: a `REC.SCAN` member is NTEnum and a
-                // `BI.DESC` member is NTScalar string regardless of the
-                // record's type. `snapshot.value` IS the resolved field
-                // value and `snapshot_for_field` already populated common
-                // enum choices (e.g. `.SCAN`). Matches the single-record
-                // path and pvxs's per-channel `getChannelValueType`
-                // (groupconfigprocessor.cpp:960-974).
-                let nt_type = member.nt_type_in(instance, Some(&snapshot.value), view);
+                // Derive the NT shape from the configured field's address
+                // (record → common → virtual), not from the owning record
+                // type: a `REC.SCAN` member is NTEnum and a `BI.DESC` member
+                // is NTScalar string regardless of the record's type.
+                // Matches the single-record path and pvxs's per-channel
+                // `getChannelValueType` (groupconfigprocessor.cpp:960-974).
+                let nt_type = member.nt_type_in(&addr, view);
                 Ok(PvField::Structure(pvif::snapshot_to_pv_structure(
                     &snapshot, nt_type,
                 )))
             }
             FieldMapping::Plain => {
-                let not_found = || BridgeError::FieldNotFound {
-                    record: String::from_utf8_lossy(record_name).into_owned(),
-                    field: field_name.to_string(),
-                };
-                let view = member.view_in(instance).ok_or_else(not_found)?;
                 let value = log
                     .and_then(|log| member.log_value(log, view))
                     .or_else(|| member.read_with(instance, view))
@@ -1113,7 +1142,7 @@ impl GroupChannel {
                 // long-string member shipped `ScalarArray(bytes)` under a
                 // `Scalar(Byte)` descriptor).
                 Ok(pvif::BareLeaf::of_channel(
-                    instance,
+                    &addr,
                     &member.field,
                     Some(&value),
                     value.db_field_type(),
@@ -1123,19 +1152,12 @@ impl GroupChannel {
                 .value(&value))
             }
             FieldMapping::Meta => {
-                let snapshot = member
-                    .view_in(instance)
-                    .and_then(|view| {
-                        let mut snapshot = member.snapshot_in(instance, view, backing)?;
-                        if let Some(log) = log {
-                            member.write_log_over(&mut snapshot, log, instance, view);
-                        }
-                        Some(snapshot)
-                    })
-                    .ok_or_else(|| BridgeError::FieldNotFound {
-                        record: String::from_utf8_lossy(record_name).into_owned(),
-                        field: field_name.to_string(),
-                    })?;
+                let mut snapshot = member
+                    .snapshot_in(instance, view, backing)
+                    .ok_or_else(not_found)?;
+                if let Some(log) = log {
+                    member.write_log_over(&mut snapshot, log, instance, view);
+                }
                 // Same unnamed enclosing structure the descriptor
                 // advertises (see `meta_desc`), so the two cannot drift.
                 let mut meta = PvStructure::new("");
@@ -1150,16 +1172,10 @@ impl GroupChannel {
                 Ok(PvField::Structure(meta))
             }
             FieldMapping::Any => {
-                let value = member
-                    .view_in(instance)
-                    .and_then(|view| {
-                        log.and_then(|log| member.log_value(log, view))
-                            .or_else(|| member.read_with(instance, view))
-                    })
-                    .ok_or_else(|| BridgeError::FieldNotFound {
-                        record: String::from_utf8_lossy(record_name).into_owned(),
-                        field: field_name.to_string(),
-                    })?;
+                let value = log
+                    .and_then(|log| member.log_value(log, view))
+                    .or_else(|| member.read_with(instance, view))
+                    .ok_or_else(not_found)?;
                 // pvxs serves `+type:"any"` as a PVA `any` slot whose
                 // payload carries the concrete DB field type: `IOCSource::
                 // get` allocates `anyType.cloneEmpty()` and writes the
@@ -1173,13 +1189,9 @@ impl GroupChannel {
                 // asked of the classifier rather than read off the stored
                 // variant — a one-element array field's `any` payload is a
                 // scalar, exactly as its plain and scalar members are.
-                let pv = pvif::BareLeaf::any_payload_of_channel(
-                    instance,
-                    &member.field,
-                    &value,
-                    &member.value_filters,
-                )
-                .value(&value);
+                let pv =
+                    pvif::BareLeaf::any_payload_of_channel(&addr, &value, &member.value_filters)
+                        .value(&value);
                 let desc = pv.wire_descriptor();
                 Ok(PvField::Variant(Box::new(VariantValue { desc, value: pv })))
             }
@@ -1191,15 +1203,12 @@ impl GroupChannel {
     /// Introspect a group scalar member's NT shape and DBF type from the
     /// configured channel's final field — the same final-field metadata
     /// the single-record path uses ([`super::channel::BridgeChannel::new`]),
-    /// not the owning record type. The value is taken through
-    /// `client_field_value` — the stored value projected onto the field's
-    /// DECLARED type — which is the same call the GET path above serializes,
-    /// so the descriptor cannot drift from the bytes that follow it:
-    /// `REC.SCAN` advertises NTEnum, `REC.DESC` advertises NTScalar
-    /// string, and `BI.DESC` stays a string member on an enum record.
-    /// pvxs builds scalar group member descriptors from
+    /// not the owning record type: `REC.SCAN` advertises NTEnum, `REC.DESC`
+    /// advertises NTScalar string, and `BI.DESC` stays a string member on an
+    /// enum record. pvxs builds scalar group member descriptors from
     /// `getTypeDefForChannel`/`getChannelValueType` on the field-specific
-    /// dbChannel (groupconfigprocessor.cpp:867-974), not the record type.
+    /// dbChannel (groupconfigprocessor.cpp:867-974) without locking the
+    /// record, so this reads only the address's settled facts.
     async fn introspect_member(
         &self,
         member: &MemberChannel,
@@ -1210,23 +1219,18 @@ impl GroupChannel {
             BridgeError::RecordNotFound(String::from_utf8_lossy(record_name).into_owned())
         })?;
 
-        let instance = rec.read();
         // A member whose `$` is refused never passes group creation.
-        let view = member
-            .view_in(&instance)
+        let (addr, view) = member
+            .addr(&self.db, &rec)
+            .and_then(|addr| Some((addr, member.view_in(&addr)?)))
             .ok_or_else(|| BridgeError::FieldNotFound {
                 record: String::from_utf8_lossy(record_name).into_owned(),
                 field: member.field.clone(),
             })?;
-        let resolved = member.value_with(&instance, view);
-        let nt_type = member.nt_type_in(&instance, resolved.as_ref(), view);
-        let value_dbf = member.value_filters.final_field_type(
-            resolved
-                .as_ref()
-                .map(|v| v.db_field_type())
-                .or_else(|| instance.declared_field_type(&member.field))
-                .unwrap_or(DbFieldType::Double),
-        );
+        let nt_type = member.nt_type_in(&addr, view);
+        let value_dbf = member
+            .value_filters
+            .final_field_type(view.served_type(&addr));
 
         Ok((nt_type, dbf_to_scalar_type(value_dbf)))
     }
@@ -1234,20 +1238,14 @@ impl GroupChannel {
     /// Look up a member's DBF field type for the PUT conversion target —
     /// pvxs converts the incoming leaf to `dbChannelFinalFieldType`, the
     /// field's DECLARED type, so this must be the type the descriptor
-    /// advertised, not the variant the record happens to store. Taken
-    /// through the same `client_field_value` projection as the descriptor
-    /// path above; `declared_field_type` covers the fields that carry no
-    /// value at all, and `Double` only when the record/field is unknown.
+    /// advertised, not the variant the record happens to store: the same
+    /// [`View::served_type`] the descriptor path above takes, and `Double`
+    /// only when the record/field is unknown.
     fn member_dbf_type(&self, member: &MemberChannel) -> DbFieldType {
-        let rec = match self.db.get_record(&member.record) {
-            Some(r) => r,
-            None => return DbFieldType::Double,
-        };
-        let instance = rec.read();
-        member
-            .value_in(&instance)
-            .map(|v| v.db_field_type())
-            .or_else(|| instance.declared_field_type(&member.field))
+        self.db
+            .get_record(&member.record)
+            .and_then(|rec| member.addr(&self.db, &rec))
+            .and_then(|addr| Some(member.view_in(&addr)?.served_type(&addr)))
             .unwrap_or(DbFieldType::Double)
     }
 
@@ -1337,14 +1335,10 @@ impl GroupChannel {
     /// string (`dbChannelFinalFieldType == DBR_CHAR && value is String`,
     /// iocsource.cpp:603-604).
     fn member_is_char_array(&self, member: &MemberChannel) -> bool {
-        let Some(rec) = self.db.get_record(&member.record) else {
-            return false;
-        };
-        let instance = rec.read();
-        matches!(
-            instance.channel_field_value(&member.field, false),
-            Some(epics_base_rs::types::EpicsValue::CharArray(_))
-        )
+        self.db
+            .get_record(&member.record)
+            .and_then(|rec| member.addr(&self.db, &rec))
+            .is_some_and(|addr| addr.value_type() == DbFieldType::Char)
     }
 
     /// Convert an incoming PvField to an EpicsValue typed against the
@@ -2658,7 +2652,8 @@ impl super::provider::PvaMonitor for GroupMonitor {
             let dollar = self
                 .db
                 .get_record(&member.record)
-                .and_then(|rec| member.view_in(&rec.read()))
+                .and_then(|rec| member.addr(&self.db, &rec))
+                .and_then(|addr| member.view_in(&addr))
                 .and_then(pvif::View::dollar);
             match self.pump.attach(
                 &self.db,

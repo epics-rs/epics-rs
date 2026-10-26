@@ -16,7 +16,7 @@ use crate::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue, Ty
 use crate::server_native::source::{PutOptions, RecordPutKind, SourceRead};
 use crate::server_native::{ChannelSource, OpError};
 use epics_base_rs::server::database::char_view::{
-    DollarView, PvaDollar, channel_field_type, long_string_field_text, plain_re_view,
+    ChannelAddr, CharSource, DollarView, PvaDollar, long_string_field_text,
 };
 
 use crate::server_native::source::{MonitorStream, UpstreamMonitor};
@@ -160,7 +160,8 @@ impl PvDatabaseSource {
         // settles it once per `dbChannel`: every event this stream yields
         // is then rendered in it, so a one-element array field's updates
         // are the scalars its descriptor advertised.
-        let render = record_channel_render(&rec, cn, value_filters)?;
+        let render =
+            record_channel_render(&ChannelAddr::of(&db, &rec, &cn.field)?, cn, value_filters)?;
 
         let is_value_field = epics_base_rs::server::database::is_value_field(&cn.field);
         let door = MetaDoor::new(
@@ -1075,7 +1076,8 @@ async fn channel_snapshot(
             // the LINK TARGET's record, so it must hold no record lock of its
             // own. A `$` channel reads the field's own value too: its char
             // image and its text are both cut from that ([`PvaDollar::render`]).
-            let render = record_channel_render(&rec, cn, filters)?;
+            let addr = ChannelAddr::of(db, &rec, &cn.field)?;
+            let render = record_channel_render(&addr, cn, filters)?;
             return record_snapshot(db, &rec, &cn.field, render, filters);
         }
     };
@@ -1193,25 +1195,85 @@ fn take_value(snap: &mut Snapshot) -> EpicsValue {
     std::mem::replace(&mut snap.value, EpicsValue::Long(0))
 }
 
-/// [`ChannelRender`] of the record channel `cn` through its value chain
-/// `filters`, or `None` where C refuses its `$` (`S_dbLib_fieldNotFound`,
-/// `dbChannel.c:486-505`).
+/// [`ChannelRender`] of the record channel `cn` addressed `addr` through its
+/// value chain `filters`, or `None` where C refuses its `$`
+/// (`S_dbLib_fieldNotFound`, `dbChannel.c:486-505`).
 fn record_channel_render(
-    rec: &std::sync::Arc<epics_base_rs::server::record::RecordCell>,
+    addr: &ChannelAddr,
     cn: &ChannelName,
     filters: &FilterChain,
 ) -> Option<ChannelRender> {
-    let inst = rec.read();
     if cn.string_view {
-        return DollarView::of(&inst, &cn.field, filters).map(ChannelRender::Dollar);
+        return addr
+            .dollar_view(&cn.field, filters)
+            .map(ChannelRender::Dollar);
     }
-    Some(
-        match ChannelValue::of_record_channel(&inst, &cn.field, filters) {
-            ChannelValue::Shaped(shape) => ChannelRender::Shaped(shape),
-            ChannelValue::Text(dollar) => ChannelRender::Dollar(dollar),
-            ChannelValue::LongStringField => ChannelRender::LongStringField,
-        },
+    Some(match ChannelValue::of_addr(addr, &cn.field, filters) {
+        ChannelValue::Shaped(shape) => ChannelRender::Shaped(shape),
+        ChannelValue::Text(dollar) => ChannelRender::Dollar(dollar),
+        ChannelValue::LongStringField => ChannelRender::LongStringField,
+    })
+}
+
+/// The descriptor a read of the record channel addressed `addr` and rendered
+/// `render` serves, with no read: the prototype pvxs builds in `onCreate`
+/// from `dbChannelFinalFieldType` and `dbChannelFinalElements`
+/// (`ioc/singlesource.cpp:189-206`), which takes no lock.
+fn record_channel_desc(
+    addr: &ChannelAddr,
+    render: ChannelRender,
+    filters: &FilterChain,
+) -> FieldDesc {
+    use epics_base_rs::types::DbFieldType;
+    let (served, array) = match render {
+        ChannelRender::Shaped(shape) => (
+            filters.final_field_type(addr.value_type()),
+            shape.is_array(),
+        ),
+        ChannelRender::LongStringField => (
+            filters.final_field_type(DbFieldType::String),
+            filters.final_element_count(1) != 1,
+        ),
+        ChannelRender::Dollar(dollar) => {
+            // A link's or an attribute's chars are its text afresh, whatever
+            // log the chain made ([`DollarView::read`]).
+            let log = match dollar.source() {
+                CharSource::Field => filters.final_field_type(DbFieldType::Char),
+                _ => DbFieldType::Char,
+            };
+            match log {
+                DbFieldType::Char if dollar.scalar() => (log, false),
+                DbFieldType::Char if dollar.serve == PvaDollar::Text => {
+                    (DbFieldType::String, false)
+                }
+                log => (log, !dollar.scalar()),
+            }
+        }
+    };
+    let prototype = if array {
+        EpicsValue::from_bytes_array(served, &[], 0).expect("an empty array decodes for every type")
+    } else {
+        crate::channel_shape::zero_of(served)
+    };
+    NtShape::new(
+        &prototype,
+        epics_base_rs::server::snapshot::PropertySupport::NONE,
     )
+    .desc()
+}
+
+/// What CREATE_CHANNEL answers for `name`: the descriptor its reads serve,
+/// or `None` where pvxs refuses the channel. A record channel is answered
+/// from its address and takes no lock, as `onCreate` takes none.
+async fn channel_desc(db: &PvDatabase, name: &[u8]) -> Option<FieldDesc> {
+    let (cn, filters) = resolve_channel(db, name)?;
+    if let PvEntry::Record(rec) = channel_entry(db, &cn).await? {
+        let addr = ChannelAddr::of(db, &rec, &cn.field)?;
+        let render = record_channel_render(&addr, &cn, &filters)?;
+        return Some(record_channel_desc(&addr, render, &filters));
+    }
+    let snap = channel_snapshot(db, &cn, &filters).await?;
+    Some(snapshot_to_field_desc(&snap))
 }
 
 impl ChannelSource for PvDatabaseSource {
@@ -1272,18 +1334,19 @@ impl ChannelSource for PvDatabaseSource {
     ///
     /// So existence is answered per-FIELD here, not per-record: `has_name` is
     /// the search-side lookup and stops at the record (`database/mod.rs`, "for
-    /// UDP search"). Resolving the snapshot is the same gate the CA server
-    /// already applies at its own CREATE_CHANNEL — `client_field_value` is
-    /// `None` for an unmodeled field, which answers `CREATE_CH_FAIL`
-    /// (`epics-ca-rs/src/server/tcp.rs:2630-2642`) — so both protocols now
+    /// UDP search"). Addressing the field is the same gate the CA server
+    /// applies at its own CREATE_CHANNEL — `channel_create` refuses a field
+    /// no channel reads, which answers `CREATE_CH_FAIL`
+    /// (`epics-ca-rs/src/server/tcp.rs:3082-3100`) — so both protocols
     /// refuse an unservable field at create rather than claiming it and
-    /// failing later with "field introspection unavailable".
+    /// failing later with "field introspection unavailable". Neither takes
+    /// the record's lock, as `dbChannelCreate` and `onCreate` take none.
     ///
     /// A simple PV has no field to narrow, so it resolves exactly as before.
     fn has_pv(&self, name: &[u8]) -> impl std::future::Future<Output = bool> + Send {
         let db = self.db.clone();
         let name = RecordName::from(name);
-        async move { snapshot_for(&db, &name).await.is_some() }
+        async move { channel_desc(&db, &name).await.is_some() }
     }
 
     /// Whether `name` is SEARCH-advertised — deliberately the looser,
@@ -1308,10 +1371,7 @@ impl ChannelSource for PvDatabaseSource {
     ) -> impl std::future::Future<Output = Option<FieldDesc>> + Send {
         let db = self.db.clone();
         let name = RecordName::from(name);
-        async move {
-            let snap = snapshot_for(&db, &name).await?;
-            Some(snapshot_to_field_desc(&snap))
-        }
+        async move { channel_desc(&db, &name).await }
     }
 
     fn get_value(&self, name: &[u8]) -> impl std::future::Future<Output = Option<PvField>> + Send {
@@ -1451,7 +1511,7 @@ impl ChannelSource for PvDatabaseSource {
                 // parking a wait-set whose receiver is dropped would occupy
                 // `RecordInstance::notify` until the record's async work ends.
                 Some(PvEntry::Record(rec)) => {
-                    let epics = record_put_value(&rec, &cn, &value, &filters)?;
+                    let epics = record_put_value(&db, &rec, &cn, &value, &filters)?;
                     put_record_field(&db, &cn, epics, &PutOptions::default()).await
                 }
                 // Name not in the database: report it rather than falling
@@ -1737,7 +1797,8 @@ impl ChannelSource for PvDatabaseSource {
                     }
                 }
                 PvEntry::Record(rec) => {
-                    let render = record_channel_render(&rec, &cn, &filters)?;
+                    let addr = ChannelAddr::of(&db, &rec, &cn.field)?;
+                    let render = record_channel_render(&addr, &cn, &filters)?;
                     // The mask is the one `DbSubscription::subscribe_filtered`
                     // picks for the unclassified entry (`db_access.rs:297`).
                     // The metadata is not the event's: it is read once both
@@ -2293,6 +2354,7 @@ fn scalar_shaped(
 /// `write` inside the `asTrapWrite` put-log bracket pvxs's `SecurityLogger`
 /// opens for every record put ([`epics_base_rs::server::access_security::put_with_trap`]).
 async fn trapped_put<F, Fut>(
+    db: &PvDatabase,
     checked: &epics_base_rs::server::access_security::AccessChecked,
     ctx: &crate::server_native::ChannelContext,
     cn: &ChannelName,
@@ -2311,16 +2373,9 @@ where
     // event would actually be dispatched, since resolving it clones the
     // field's current value.
     let dbr_type = if acs::trap_write_armed(checked.rule_was_trap()) {
-        let inst = rec.read();
-        // The declaration before the value: a long-string field is served as
-        // the `LEN` elements it holds, while its address is `DBF_STRING`.
-        let dbf = channel_field_type(&inst, &cn.field, cn.string_view, || {
-            inst.declared_field_type(&cn.field).or_else(|| {
-                inst.client_field_value(&cn.field)
-                    .map(|v| v.db_field_type())
-            })
-        });
-        dbf.map(|t| t as u16).unwrap_or_default()
+        ChannelAddr::of(db, rec, &cn.field)
+            .map(|addr| addr.channel_field_type(cn.string_view) as u16)
+            .unwrap_or_default()
     } else {
         0
     };
@@ -2366,14 +2421,14 @@ async fn put_record(
     let put = async move {
         match put {
             RecordPut::Write(value) => {
-                let (epics, char_address) = record_put_value(rec, cn, &value, filters)?;
-                trapped_put(checked, ctx, cn, rec, epics, |v| {
+                let (epics, char_address) = record_put_value(db, rec, cn, &value, filters)?;
+                trapped_put(db, checked, ctx, cn, rec, epics, |v| {
                     put_record_field(db, cn, (v, char_address), opts)
                 })
                 .await
             }
             RecordPut::PostProcess => {
-                trapped_put(checked, ctx, cn, rec, current(), |_| async {
+                trapped_put(db, checked, ctx, cn, rec, current(), |_| async {
                     db.process_field_from_client(&cn.record, &cn.field, opts.process)
                         .await
                         .map_err(failed)
@@ -2381,7 +2436,7 @@ async fn put_record(
                 .await
             }
             RecordPut::Nothing => {
-                trapped_put(checked, ctx, cn, rec, current(), |_| async {
+                trapped_put(db, checked, ctx, cn, rec, current(), |_| async {
                     db.notify_unwritten_from_client(&cn.record, &cn.field)
                         .await
                         .map_err(failed)
@@ -2450,6 +2505,7 @@ fn put_options_from_ctx(ctx: &crate::server_native::ChannelContext) -> PutOption
 /// is `putScalar`'s `DBR_STRING`, `strncpy`'d into a `MAX_STRING_SIZE`
 /// buffer first (`ioc/iocsource.cpp:499-500`).
 fn record_put_value(
+    db: &PvDatabase,
     rec: &epics_base_rs::server::record::RecordCell,
     cn: &ChannelName,
     value: &PvField,
@@ -2466,11 +2522,12 @@ fn record_put_value(
         if cn.string_view {
             return Ok((chars, true));
         }
-        let inst = rec.read();
-        if let ChannelValue::Text(_) = ChannelValue::of_record_channel(&inst, &cn.field, filters) {
+        if let Some(addr) = ChannelAddr::of(db, rec, &cn.field)
+            && let ChannelValue::Text(_) = ChannelValue::of_addr(&addr, &cn.field, filters)
+        {
             // Only a field pvxs reshaped takes its chars by the `$` name; a
             // `DBF_CHAR` one already is them.
-            return Ok((chars, plain_re_view(&inst, &cn.field).is_some()));
+            return Ok((chars, addr.re_view().is_some()));
         }
     }
     let epics = match epics {
@@ -7706,15 +7763,10 @@ ASG(PLAIN) {
         .unwrap();
         {
             let rec = db.get_record("LS:G").unwrap();
-            let inst = rec.read();
-            assert_eq!(inst.record.field_native_count("VAL"), Some(1));
+            assert_eq!(rec.read().record.field_native_count("VAL"), Some(1));
+            let addr = ChannelAddr::of(&db, &rec, "VAL").unwrap();
             assert!(
-                crate::channel_shape::ChannelShape::of_record_channel(
-                    &inst,
-                    "VAL",
-                    &FilterChain::new()
-                )
-                .is_array(),
+                crate::channel_shape::ChannelShape::of_addr(&addr, &FilterChain::new()).is_array(),
                 "pvxs's long-string channel is a char array"
             );
         }
@@ -8003,5 +8055,147 @@ ASG(PLAIN) {
             "search claims what dbChannelTest resolves; the refusal belongs at \
              create, where the client can be told"
         );
+    }
+
+    /// Every base record type, with the char and long-string shapes pvxs
+    /// reshapes and a one-element buffer of each kind.
+    const EVERY_TYPE: &str = r#"
+record(ai, "ai") {}
+record(bi, "bi") { field(ZNAM, "z") field(ONAM, "o") }
+record(stringin, "stringin") { info(Q:form, "String") }
+record(stringout, "stringout") {}
+record(longin, "longin") {}
+record(int64in, "int64in") {}
+record(lsi, "lsi") { field(SIZV, "100") }
+record(lso, "lso") { field(SIZV, "20") info(Q:form, "String") }
+record(lsi, "lsi41") { field(SIZV, "41") }
+record(mbbo, "mbbo") { field(ZRST, "zero") field(ONST, "one") }
+record(mbbiDirect, "mbbiDirect") {}
+record(event, "event") {}
+record(printf, "printf") { field(SIZV, "60") }
+record(waveform, "wfS") { field(FTVL, "STRING") field(NELM, "4") }
+record(waveform, "wfC") { field(FTVL, "CHAR") field(NELM, "16") info(Q:form, "String") }
+record(waveform, "wfC1") { field(FTVL, "CHAR") field(NELM, "1") info(Q:form, "String") }
+record(waveform, "wfUC") { field(FTVL, "UCHAR") field(NELM, "16") }
+record(waveform, "wfD") { field(FTVL, "DOUBLE") field(NELM, "8") }
+record(waveform, "wfE") { field(FTVL, "ENUM") field(NELM, "1") }
+record(aai, "aai") { field(FTVL, "STRING") field(NELM, "2") }
+record(aai, "aai1") { field(FTVL, "DOUBLE") field(NELM, "1") }
+record(subArray, "subArray") { field(FTVL, "FLOAT") field(MALM, "10") field(NELM, "4") }
+record(calc, "calc") { field(CALC, "A+1") info(Q:form, "String") }
+record(seq, "seq") {}
+record(compress, "compress") { field(NSAM, "6") }
+record(histogram, "histogram") { field(NELM, "5") }
+record(aSub, "aSub") {
+    field(FTA, "STRING") field(NOA, "4")
+    field(FTB, "CHAR") field(NOB, "10")
+    field(FTVA, "DOUBLE") field(NOVA, "3")
+}
+record(state, "state") {}
+record(ai, "linked") { field(INP, "ai.VAL CP") info(Q:form, "String") }
+"#;
+
+    async fn every_type() -> Arc<PvDatabase> {
+        let (db, _) = epics_base_rs::server::ioc_builder::IocBuilder::new()
+            .db_string(EVERY_TYPE, &std::collections::HashMap::new())
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        db.ioc_init().await;
+        db
+    }
+
+    /// `onCreate` builds its prototype without locking the record
+    /// (`ioc/singlesource.cpp:189-206`), so a CREATE_CHANNEL on a record
+    /// another thread holds is answered at once.
+    #[epics_macros_rs::epics_test]
+    async fn a_held_record_is_introspected_without_waiting_for_the_hold() {
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+        let db = every_type().await;
+        let h = db.async_handle();
+        let (held_tx, held_rx) = mpsc::channel();
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            h.with_record("ai", |_| {
+                h.with_record("lso", |_| {
+                    h.with_record("wfC", |_| {
+                        held_tx.send(()).unwrap();
+                        go_rx.recv().unwrap();
+                    })
+                })
+            })
+        });
+        held_rx.recv().unwrap();
+        let ask = |name: &'static str| {
+            let source = PvDatabaseSource::new(db.clone());
+            std::thread::spawn(move || {
+                epics_libcom_rs::runtime::task::test_block_on(async move {
+                    let has = source.has_pv(name.as_bytes()).await;
+                    let desc = source.get_introspection(name.as_bytes()).await;
+                    has && desc.is_some()
+                })
+            })
+        };
+        let asked = [ask("ai"), ask("lso.VAL"), ask("wfC"), ask("lso.VAL$")];
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !asked.iter().all(|t| t.is_finished()) {
+            assert!(
+                Instant::now() < deadline,
+                "CREATE_CHANNEL waited for the hold"
+            );
+            epics_libcom_rs::runtime::task::sleep(Duration::from_millis(10)).await;
+        }
+        go_tx.send(()).unwrap();
+        holder.join().unwrap();
+        for t in asked {
+            assert!(t.join().unwrap());
+        }
+    }
+
+    /// [`channel_desc`] answers with no lock the descriptor of what a read
+    /// under the lock serves: every field of every base type, with `$` and
+    /// without, through each filter shape.
+    #[epics_macros_rs::epics_test]
+    async fn the_lock_free_desc_is_the_one_read_under_the_lock() {
+        use epics_base_rs::server::record::FieldDeclaration;
+        let db = every_type().await;
+        let chains = [
+            "",
+            r#"{"arr":{"s":1,"e":2}}"#,
+            r#"{"arr":{"s":0,"e":0}}"#,
+            r#"{"ts":{"num":"dbl"}}"#,
+            r#"{"ts":{"num":"ts"}}"#,
+            r#"{"ts":{"str":"epics"}}"#,
+        ];
+        let names = EVERY_TYPE
+            .lines()
+            .filter(|l| l.starts_with("record("))
+            .filter_map(|l| l.split('"').nth(1));
+        let mut differ = Vec::new();
+        for rec in names {
+            let fields = db.get_record(rec).unwrap().read().record.field_list();
+            let fields = fields
+                .iter()
+                .chain(epics_base_rs::server::record::dbd_generated::DB_COMMON_FIELDS)
+                .map(|f| f.name)
+                .chain(["RTYP", "NOPE"]);
+            for field in fields {
+                for dollar in ["", "$"] {
+                    for chain in chains {
+                        let name = format!("{rec}.{field}{dollar}{chain}");
+                        let free = channel_desc(&db, name.as_bytes()).await;
+                        let held = snapshot_for(&db, name.as_bytes())
+                            .await
+                            .map(|s| snapshot_to_field_desc(&s));
+                        if free != held {
+                            differ.push(format!("{name}: {free:?} != {held:?}"));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(differ.is_empty(), "{}", differ.join("\n"));
     }
 }

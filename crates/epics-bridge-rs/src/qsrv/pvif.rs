@@ -2,7 +2,7 @@
 //!
 //! Corresponds to C++ QSRV's `pvif.h/pvif.cpp` (ScalarBuilder, etc.).
 
-use epics_base_rs::server::database::char_view::{DollarView, PvaDollar};
+use epics_base_rs::server::database::char_view::{ChannelAddr, DollarView, PvaDollar};
 use epics_base_rs::server::recgbl::EventMask;
 use epics_base_rs::server::snapshot::{ControlInfo, DisplayInfo, PropertySupport, Snapshot};
 use epics_base_rs::types::{EpicsValue, PvString, WallTime};
@@ -409,23 +409,36 @@ pub(crate) enum View {
 }
 
 impl View {
-    /// Of a channel whose value chain is `filters`; `None` where `$` is
-    /// refused (`dbChannel.c:486-505`).
-    pub(crate) fn of(
-        instance: &epics_base_rs::server::record::RecordInstance,
+    /// Of the channel addressed `addr` on `field` whose value chain is
+    /// `filters`; `None` where `$` is refused (`dbChannel.c:486-505`).
+    pub(crate) fn of_addr(
+        addr: &ChannelAddr,
         field: &str,
         string_view: bool,
         filters: &epics_base_rs::server::database::filters::FilterChain,
     ) -> Option<Self> {
         if !string_view {
-            return Some(
-                match ChannelValue::of_record_channel(instance, field, filters) {
-                    ChannelValue::Text(dollar) => Self::Text(dollar),
-                    _ => Self::Field,
-                },
-            );
+            return Some(match ChannelValue::of_addr(addr, field, filters) {
+                ChannelValue::Text(dollar) => Self::Text(dollar),
+                _ => Self::Field,
+            });
         }
-        DollarView::of(instance, field, filters).map(Self::Dollar)
+        addr.dollar_view(field, filters).map(Self::Dollar)
+    }
+
+    /// The type an unfiltered read of the channel addressed `addr` serves
+    /// under this view: its text, its chars, or the field's own value.
+    pub(crate) fn served_type(self, addr: &ChannelAddr) -> epics_base_rs::types::DbFieldType {
+        use epics_base_rs::types::DbFieldType;
+        match self {
+            Self::Field => addr.value_type(),
+            Self::Dollar(dollar) | Self::Text(dollar)
+                if dollar.serve == PvaDollar::Text && !dollar.scalar() =>
+            {
+                DbFieldType::String
+            }
+            Self::Dollar(_) | Self::Text(_) => DbFieldType::Char,
+        }
     }
 
     /// The served value of the field's own `value`, through `filters` in
@@ -506,7 +519,8 @@ impl View {
 ///
 /// `DBF_ENUM`/`DBF_MENU`/`DBF_DEVICE` resolve to `DBR_ENUM`
 /// (`db/dbAccess.c:88-90`) and select `NTEnum` — the one element type with
-/// a shape of its own, and only while the channel is a scalar. This applies
+/// a shape of its own, and only while the channel is a scalar whose
+/// `dbChannelFinalFieldType` is still `DBR_ENUM`. This applies
 /// uniformly to `VAL` and every other field: there is no record-type-name
 /// short-circuit, so a `busy` VAL is `NTEnum` on its resolved value the way
 /// a `bi` VAL is, and a `REC.SCAN` member is `NTEnum` while a `BI.DESC` one
@@ -516,9 +530,8 @@ impl View {
 /// [`ChannelValue::LongStringField`]; a `$` channel is [`NtType::Dollar`]
 /// instead, whatever its format.
 pub(crate) fn nt_type_for_channel(
-    instance: &epics_base_rs::server::record::RecordInstance,
+    addr: &ChannelAddr,
     field_upper: &str,
-    resolved: Option<&EpicsValue>,
     view: View,
     filters: &epics_base_rs::server::database::filters::FilterChain,
 ) -> NtType {
@@ -530,14 +543,17 @@ pub(crate) fn nt_type_for_channel(
         View::Text(_) => return NtType::LongString,
         View::Field => {}
     }
-    match ChannelValue::of_channel(instance, field_upper, resolved, filters) {
+    match ChannelValue::of_addr(addr, field_upper, filters) {
         ChannelValue::Text(_) => NtType::LongString,
         ChannelValue::LongStringField => NtType::LongStringField,
         ChannelValue::Shaped(shape) if shape.is_array() => NtType::ScalarArray,
-        ChannelValue::Shaped(_) => match resolved {
-            Some(EpicsValue::Enum(_)) => NtType::Enum,
-            _ => NtType::Scalar,
-        },
+        ChannelValue::Shaped(_)
+            if filters.final_field_type(addr.value_type())
+                == epics_base_rs::types::DbFieldType::Enum =>
+        {
+            NtType::Enum
+        }
+        ChannelValue::Shaped(_) => NtType::Scalar,
     }
 }
 
@@ -585,7 +601,7 @@ impl BareLeaf {
     /// field's resolved value (record → common → virtual); `field_dbf` is the
     /// fallback DBF type when the field has no resolved value.
     pub(crate) fn of_channel(
-        instance: &epics_base_rs::server::record::RecordInstance,
+        addr: &ChannelAddr,
         field_upper: &str,
         resolved: Option<&EpicsValue>,
         field_dbf: epics_base_rs::types::DbFieldType,
@@ -596,7 +612,7 @@ impl BareLeaf {
             filters.final_field_type(resolved.map(|v| v.db_field_type()).unwrap_or(field_dbf)),
         );
         Self::from_nt(
-            nt_type_for_channel(instance, field_upper, resolved, view, filters),
+            nt_type_for_channel(addr, field_upper, view, filters),
             scalar,
         )
     }
@@ -612,14 +628,13 @@ impl BareLeaf {
     /// `value.type() == TypeCode::String` test cannot fire and pvxs serves a
     /// long-string field's `any` member as `int8_t[]`.
     pub(crate) fn any_payload_of_channel(
-        instance: &epics_base_rs::server::record::RecordInstance,
-        field_upper: &str,
+        addr: &ChannelAddr,
         resolved: &EpicsValue,
         filters: &epics_base_rs::server::database::filters::FilterChain,
     ) -> Self {
         let scalar =
             crate::convert::dbf_to_scalar_type(filters.final_field_type(resolved.db_field_type()));
-        match ChannelShape::of_channel(&*instance.record, field_upper, Some(resolved), filters) {
+        match ChannelShape::of_addr(addr, filters) {
             ChannelShape::Array => BareLeaf::Array(scalar),
             ChannelShape::Scalar => BareLeaf::Scalar(scalar),
         }
@@ -845,8 +860,11 @@ pub fn snapshot_to_nt_scalar(snapshot: &Snapshot) -> PvStructure {
 pub fn snapshot_to_nt_enum(snapshot: &Snapshot) -> PvStructure {
     let mut pv = PvStructure::new("epics:nt/NTEnum:1.0");
 
-    // value sub-structure with index + choices
-    let index = match &snapshot.value {
+    // value sub-structure with index + choices. A one-element channel on an
+    // enum buffer (`waveform` `FTVL=ENUM`, `NELM=1`) serves its first
+    // element, as `getScalarValue` reads one (`iocsource.cpp:69-116`).
+    let first = snapshot.value.first_element();
+    let index = match first.as_ref().unwrap_or(&snapshot.value) {
         EpicsValue::Enum(v) => *v as i32,
         EpicsValue::Short(v) => *v as i32,
         other => other.to_f64().map(|f| f as i32).unwrap_or(0),

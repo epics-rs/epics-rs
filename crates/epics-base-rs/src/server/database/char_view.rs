@@ -164,8 +164,8 @@ pub fn char_view(inst: &RecordInstance, field: &str) -> Option<CharView> {
 
 /// The address [`char_view`] reads through, as `dbChannelCreate` makes it
 /// (`dbChannel.c:486-503`): the route, `no_elements` and the cut.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct CharAddr {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CharAddr {
     pub(crate) source: CharSource,
     pub(crate) no_elements: usize,
     truncate: bool,
@@ -216,6 +216,29 @@ impl CharAddr {
             source: view.source,
             no_elements: view.no_elements,
             truncate: view.truncate,
+        }
+    }
+
+    /// Which of `dbGet`'s routes reads the field.
+    pub fn source(&self) -> CharSource {
+        self.source
+    }
+
+    /// `paddr->no_elements`: the string's `field_size`, or `PVLINK_STRINGSZ`
+    /// for a link.
+    pub fn no_elements(&self) -> usize {
+        self.no_elements
+    }
+
+    /// Whether pvxs re-views the channel WITHOUT `$` as this char array, so
+    /// it serves a long string and puts through `putLongString`: a link, or
+    /// a scalar string with room past `MAX_STRING_SIZE + 1`
+    /// (`ioc/channel.cpp:56-72`).
+    pub fn re_views_plain_channel(&self) -> bool {
+        match self.source {
+            CharSource::Link => true,
+            CharSource::Field => self.no_elements > MAX_STRING_SIZE + 1,
+            CharSource::Attribute => false,
         }
     }
 
@@ -383,16 +406,14 @@ pub struct CharView {
 }
 
 impl CharView {
-    /// Whether pvxs re-views the channel WITHOUT `$` as this char array, so
-    /// it serves a long string and puts through `putLongString`: a link, or
-    /// a scalar string with room past `MAX_STRING_SIZE + 1`
-    /// (`ioc/channel.cpp:56-72`).
+    /// [`CharAddr::re_views_plain_channel`].
     pub fn re_views_plain_channel(&self) -> bool {
-        match self.source {
-            CharSource::Link => true,
-            CharSource::Field => self.no_elements > MAX_STRING_SIZE + 1,
-            CharSource::Attribute => false,
-        }
+        self.addr().re_views_plain_channel()
+    }
+
+    /// The address this view reads through.
+    pub fn addr(&self) -> CharAddr {
+        CharAddr::of_view(self)
     }
 
     /// The characters `pfield` holds, zero-padded to `no_elements`; a link's
@@ -415,7 +436,7 @@ impl CharView {
     /// the text a link or attribute read copies. A long-string record's
     /// `SPC_DBADDR` buffer is read raw.
     pub fn nul_at_count(&self) -> bool {
-        CharAddr::of_view(self).nul_at_count()
+        self.addr().nul_at_count()
     }
 
     /// `dbGet(paddr, target, …, &n_req)`: the elements read, counted as C
@@ -733,53 +754,141 @@ pub fn long_string_field_text(value: EpicsValue) -> EpicsValue {
     }
 }
 
-/// The char array pvxs reshapes the channel on `field` WITHOUT `$` into
-/// (`ioc/channel.cpp:56-73`), or `None`. Only a link or a field declared
-/// `DBF_STRING` is read, so a waveform's buffer is never cloned to ask.
-pub fn plain_re_view(inst: &RecordInstance, field: &str) -> Option<CharView> {
-    let desc = inst.field_desc(field);
-    match route_at(inst, field, desc)? {
-        CharSource::Link => {}
-        CharSource::Field => {
-            let desc = desc?;
-            if desc.runtime_typed || field_addr_types(desc, None).0 != DbfCode::String {
-                return None;
-            }
-        }
-        CharSource::Attribute => return None,
+/// Whether pvxs reads the plain channel on a field `desc` routed `source`
+/// for a reshape at all: a link, or a field declared `DBF_STRING`.
+fn re_view_candidate(source: CharSource, desc: Option<&FieldDesc>) -> bool {
+    match source {
+        CharSource::Link => true,
+        CharSource::Field => desc.is_some_and(|desc| {
+            !desc.runtime_typed && field_addr_types(desc, None).0 == DbfCode::String
+        }),
+        CharSource::Attribute => false,
     }
-    char_view(inst, field).filter(CharView::re_views_plain_channel)
 }
 
-/// pvxs `dbChannelFinalFieldType` before the filters' probe, which C seeds
-/// from `addr.dbr_field_type` (`dbChannel.c:579`): `DBR_CHAR` for a char
-/// address — `$` (`dbChannel.c:486-501`, a link's included) or pvxs's
-/// reshape without it (`ioc/channel.cpp:58-71`) — else `field_type`'s answer.
-pub fn channel_field_type(
-    inst: &RecordInstance,
-    field: &str,
-    string_view: bool,
-    field_type: impl FnOnce() -> Option<DbFieldType>,
-) -> Option<DbFieldType> {
-    if string_view || plain_re_view(inst, field).is_some() {
-        Some(DbFieldType::Char)
-    } else {
-        field_type()
+/// A record channel's address as `dbChannelCreate` makes it
+/// (`dbChannel.c:470-505`) and pvxs's `Channel` re-views it
+/// (`ioc/channel.cpp:40-73`), from the declaration and what the cell settled
+/// at load, init and each retyping `special`. C takes no lock for either, so
+/// a channel classified from this never waits out a holder of its record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChannelAddr {
+    /// The declared type, or the one a runtime-typed field settled.
+    field_type: DbFieldType,
+    /// `no_elements` without `$`.
+    no_elements: usize,
+    long_string: bool,
+    /// `info(Q:form, "String")` on the record.
+    q_form: bool,
+    /// The `$` address; `None` where `$` is `S_dbLib_fieldNotFound`.
+    dollar: Option<CharAddr>,
+    /// The char address pvxs reshapes the plain channel into
+    /// (`ioc/channel.cpp:56-73`).
+    re_view: Option<CharAddr>,
+}
+
+impl ChannelAddr {
+    /// Of `field` on `cell`; `None` where no channel reads it: a name the
+    /// type does not declare and no attribute answers, or a field no channel
+    /// may read.
+    pub fn of(
+        db: &crate::server::database::PvDatabase,
+        cell: &crate::server::record::RecordCell,
+        field: &str,
+    ) -> Option<Self> {
+        let desc = crate::server::record::record_instance::field_desc_in(cell.rdes().fields, field);
+        let dollar = CharAddr::of(db, cell, field);
+        let (source, field_type) = match desc {
+            // `dbGetAttributePart`'s `DBF_STRING`.
+            None => (dollar?.source, DbFieldType::String),
+            Some(desc) if desc.unreadable() => return None,
+            Some(desc) => {
+                let source = match crate::types::link_class_of(desc) {
+                    Some(_) => CharSource::Link,
+                    None => CharSource::Field,
+                };
+                (source, cell.addressed_field_type(field, None)?)
+            }
+        };
+        Some(Self {
+            field_type,
+            no_elements: cell.no_elements(field).unwrap_or(1) as usize,
+            long_string: desc.is_some_and(|desc| desc.long_string),
+            q_form: cell.form_string(),
+            dollar,
+            re_view: dollar
+                .filter(|addr| re_view_candidate(source, desc) && addr.re_views_plain_channel()),
+        })
+    }
+
+    /// The declared type, or the one a runtime-typed field settled.
+    pub fn field_type(&self) -> DbFieldType {
+        self.field_type
+    }
+
+    /// The type the plain channel's value comes in: a long string's
+    /// `DBF_CHAR` buffer, else [`Self::field_type`].
+    pub fn value_type(&self) -> DbFieldType {
+        if self.long_string {
+            DbFieldType::Char
+        } else {
+            self.field_type
+        }
+    }
+
+    /// `no_elements` without `$`.
+    pub fn no_elements(&self) -> usize {
+        self.no_elements
+    }
+
+    /// [`FieldDesc::long_string`].
+    pub fn long_string(&self) -> bool {
+        self.long_string
+    }
+
+    /// The char address pvxs re-views the plain channel as.
+    pub fn re_view(&self) -> Option<&CharAddr> {
+        self.re_view.as_ref()
+    }
+
+    /// The `$` channel on `field` through `filters`, `None` where `$` is
+    /// `S_dbLib_fieldNotFound`.
+    pub fn dollar_view(&self, field: &str, filters: &FilterChain) -> Option<DollarView> {
+        Some(DollarView::of_addr(
+            self.dollar?,
+            self.q_form,
+            field,
+            filters,
+        ))
+    }
+
+    /// pvxs `dbChannelFinalFieldType` before the filters' probe, which C
+    /// seeds from `addr.dbr_field_type` (`dbChannel.c:579`): `DBR_CHAR` for a
+    /// char address — `$` (`dbChannel.c:486-501`, a link's included) or
+    /// pvxs's reshape without it (`ioc/channel.cpp:58-71`) — else the
+    /// field's type.
+    pub fn channel_field_type(&self, string_view: bool) -> DbFieldType {
+        if string_view || self.re_view.is_some() {
+            DbFieldType::Char
+        } else {
+            self.field_type
+        }
+    }
+
+    /// [`pvxs_form_string`] for this channel on `field` read through `view`.
+    pub fn form_string(&self, field: &str, view: Option<&CharAddr>, dollar: bool) -> bool {
+        pvxs_form_string(field, self.q_form, view, dollar)
     }
 }
 
 /// pvxs's `chan.format() == "String"` (`ioc/channel.cpp:40-73`) for a channel
-/// on `field` whose char view is `view`: VAL's `info(Q:form, "String")`, or
-/// the reshape of a link or, without `$`, of a string wider than
-/// `MAX_STRING_SIZE + 1`. `$` keeps a link's type (`dbChannel.c:488-493`), so
-/// only a link reshapes under it.
-pub fn pvxs_form_string(
-    inst: &RecordInstance,
-    field: &str,
-    view: Option<&CharView>,
-    dollar: bool,
-) -> bool {
-    (crate::server::database::is_value_field(field) && form_string_of(inst))
+/// on `field` whose char address is `view`, on a record with
+/// `info(Q:form, "String")` when `q_form`: VAL's tag, or the reshape of a
+/// link or, without `$`, of a string wider than `MAX_STRING_SIZE + 1`. `$`
+/// keeps a link's type (`dbChannel.c:488-493`), so only a link reshapes
+/// under it.
+pub fn pvxs_form_string(field: &str, q_form: bool, view: Option<&CharAddr>, dollar: bool) -> bool {
+    (crate::server::database::is_value_field(field) && q_form)
         || view.is_some_and(|v| {
             if dollar {
                 v.source == CharSource::Link
@@ -802,17 +911,6 @@ pub enum PvaDollar {
 }
 
 impl PvaDollar {
-    /// Of a `$` channel on `field`, or `None` where `$` is
-    /// `S_dbLib_fieldNotFound`.
-    pub fn of(inst: &RecordInstance, field: &str) -> Option<Self> {
-        let view = char_view(inst, field)?;
-        Some(Self::of_addr(
-            &CharAddr::of_view(&view),
-            form_string_of(inst),
-            field,
-        ))
-    }
-
     /// Of a `$` channel on `field` addressed `addr`, on a record with
     /// `info(Q:form, "String")` when `form_string`: [`pvxs_form_string`]'s
     /// `$` answer.
@@ -874,19 +972,15 @@ impl DollarView {
 
     /// Of a channel pvxs serves as text without `$` (`ioc/iocsource.cpp:633`)
     /// and `final_elements` long: read through the char address pvxs
-    /// reshaped it to, `view` ([`plain_re_view`]), which is the one
+    /// reshaped it to, `view` ([`ChannelAddr::re_view`]), which is the one
     /// `dbChannelCreate` makes for `$`, or through a `DBF_CHAR` field's own.
-    pub fn of_text_channel(view: Option<&CharView>, final_elements: usize) -> Self {
+    pub fn of_text_channel(view: Option<&CharAddr>, final_elements: usize) -> Self {
         Self {
             serve: PvaDollar::Text,
-            pad: view.map_or(0, Self::pad_of),
+            pad: view.map_or(0, CharAddr::pad),
             source: view.map_or(CharSource::Field, |v| v.source),
             final_elements,
         }
-    }
-
-    fn pad_of(view: &CharView) -> usize {
-        CharAddr::of_view(view).pad()
     }
 
     /// Of a `$` channel on a `DBF_STRING` value `field_size` chars wide that

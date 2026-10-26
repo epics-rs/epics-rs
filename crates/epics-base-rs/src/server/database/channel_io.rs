@@ -308,13 +308,13 @@ fn record_channel_shape(
     let desc = crate::server::record::record_instance::field_desc_in(rec.rdes().fields, field);
     let Some(desc) = desc else {
         // `dbGetAttributePart`'s `DBF_STRING`, which `dbGet` reads as text.
-        let attribute = !rec.declares_name(field)
-            && db.has_record_type_attribute(rec.rdes().record_type, field);
-        return attribute.then_some((
-            DbFieldType::String,
-            1,
-            LongStringMode::Text(TextRoute::Attribute),
-        ));
+        return db.attribute_field_type(rec, field).map(|_| {
+            (
+                DbFieldType::String,
+                1,
+                LongStringMode::Text(TextRoute::Attribute),
+            )
+        });
     };
     if desc.unreadable() {
         return None;

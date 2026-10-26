@@ -5475,14 +5475,9 @@ impl RecordCold {
         &self.cell
     }
 
-    /// [`RecordInstance::attribute`] of the instance of type `record_type`
-    /// this is the cold half of.
-    fn attribute(&self, record_type: &str, name: &str) -> Option<String> {
-        let cell = self.cell.upgrade()?;
-        if cell.declares_name(name) {
-            return None;
-        }
-        self.db.upgrade()?.record_type_attribute(record_type, name)
+    /// [`RecordInstance::attribute`] of the instance this is the cold half of.
+    fn attribute(&self, name: &str) -> Option<String> {
+        self.db.upgrade()?.attribute(&*self.cell.upgrade()?, name)
     }
 }
 
@@ -7215,7 +7210,7 @@ impl crate::server::record::OwnRecord<'_> {
 
     /// [`RecordInstance::attribute`] of the record the caller is inside.
     pub(crate) fn attribute(self, name: &str) -> Option<String> {
-        self.cold().attribute(self.record().record_type(), name)
+        self.cold().attribute(name)
     }
 }
 
@@ -11806,7 +11801,7 @@ impl RecordInstance {
     /// `dbFindFieldPart` missed, so `motor.VERS` hides the attribute — and on
     /// a record no database owns.
     pub(crate) fn attribute(&self, name: &str) -> Option<String> {
-        self.cold.attribute(self.record.record_type(), name)
+        self.cold.attribute(name)
     }
 
     /// Evaluate alarms based on record type and current value.

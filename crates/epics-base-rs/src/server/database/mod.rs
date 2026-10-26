@@ -4039,16 +4039,15 @@ impl PvDatabase {
         filters::spells_a_field(field)
             && match addr.desc {
                 Some(d) => rec.takes_string_view(d),
-                None if addr.declared => false,
                 // `dbGetAttributePart`'s descriptor is a `DBF_STRING`.
-                None => self.has_record_type_attribute(rec.rdes().record_type, field),
+                None => self.attribute_field_type(rec, field).is_some(),
             }
     }
 
     /// `dbNameToAddr`'s field half for `rec`: a declared name, else an
     /// attribute (`dbGetAttributePart`), both compared as written.
     pub(crate) fn names_field(&self, rec: &RecordCell, field: &str) -> bool {
-        rec.declares_name(field) || self.has_record_type_attribute(rec.rdes().record_type, field)
+        rec.declares_name(field) || self.attribute_field_type(rec, field).is_some()
     }
 
     /// `dbNameToAddr`'s `field_type` where `dbFindFieldPart` misses and
@@ -4062,6 +4061,13 @@ impl PvDatabase {
     ) -> Option<crate::types::DbfCode> {
         (!rec.declares_name(field) && self.has_record_type_attribute(rec.rdes().record_type, field))
             .then_some(crate::types::DbfCode::String)
+    }
+
+    /// `getAttrValue`'s text of the attribute [`Self::attribute_field_type`]
+    /// finds (`dbAccess.c:950-953`).
+    pub(crate) fn attribute(&self, rec: &RecordCell, field: &str) -> Option<String> {
+        self.attribute_field_type(rec, field)?;
+        self.record_type_attribute(rec.rdes().record_type, field)
     }
 
     /// [`RecordCell::addressed_field_type`], a record attribute included.

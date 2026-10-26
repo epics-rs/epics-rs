@@ -228,9 +228,7 @@ impl CharAddr {
     ) -> Option<Self> {
         let desc = crate::server::record::record_instance::field_desc_in(cell.rdes().fields, field);
         let Some(desc) = desc else {
-            return (!cell.declares_name(field)
-                && db.has_record_type_attribute(cell.rdes().record_type, field))
-            .then_some(Self {
+            return db.attribute_field_type(cell, field).map(|_| Self {
                 source: CharSource::Attribute,
                 no_elements: MAX_STRING_SIZE,
                 truncate: false,

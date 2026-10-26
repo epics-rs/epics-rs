@@ -121,3 +121,39 @@ async fn a_declared_field_hides_the_attribute() {
     assert_eq!(h.link_target_field_type("AI.XYZ"), Some(DbfCode::String));
     assert_eq!(h.name_to_addr("AI.XYZ"), Some(1));
 }
+
+/// A record type with no field table: every name it spells is taken as its
+/// own field.
+struct Bare;
+
+impl epics_base_rs::server::record::Record for Bare {
+    fn record_type(&self) -> &'static str {
+        "bare"
+    }
+    fn get_field(&self, _: &str) -> Option<EpicsValue> {
+        None
+    }
+    fn put_field(&mut self, name: &str, _: EpicsValue) -> epics_base_rs::error::CaResult<()> {
+        Err(epics_base_rs::error::CaError::FieldNotFound(name.into()))
+    }
+}
+
+/// No attribute shows through a type whose field names are not known,
+/// with `$` or without: `dbNameToAddr`, channel create and `dbGet` agree.
+#[epics_macros_rs::epics_test]
+async fn a_type_with_no_field_table_shows_no_attribute() {
+    let (db, _) = IocBuilder::new()
+        .register_record_type("bare", || Box::new(Bare))
+        .db_string("record(bare, \"B\") {}\n", &HashMap::new())
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    db.ioc_init().await;
+    let h = db.async_handle();
+    assert_eq!(h.name_to_addr("B.RTYP"), None);
+    assert_eq!(h.name_to_addr("B.RTYP$"), None);
+    assert!(h.get_dbr_string("B.RTYP", None).is_none());
+    let create = |pv: &[u8]| epics_base_rs::server::database::filters::db_channel_create(&db, pv);
+    assert!(create(b"B.RTYP$").is_err());
+}

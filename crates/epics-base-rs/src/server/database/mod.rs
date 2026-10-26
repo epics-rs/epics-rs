@@ -2673,7 +2673,8 @@ impl PvDatabase {
     /// half-built database cannot be classified against because the code that
     /// would do it has not been polled. Before any load, and once `iocInit` has
     /// run, it is spawned at once — which is what a runtime `special()` link
-    /// re-point needs.
+    /// re-point needs — except a new record's first, which `add_record` runs
+    /// before it returns, as `iocInit` does a loaded record's.
     ///
     /// # `record` is what the init classifies, and it must exist first
     ///
@@ -2728,35 +2729,40 @@ impl PvDatabase {
 
     /// Queue or spawn an init whose record is known to be registered.
     fn dispatch_record_init(&self, init: RecordInit) {
-        let mut phase = self.inner.init_phase.lock().unwrap();
-        match &mut *phase {
-            DbInitPhase::Loading(queued) | DbInitPhase::Initialising(queued) => queued.push(init),
-            DbInitPhase::Unloaded | DbInitPhase::Running => {
-                drop(phase);
-                // Middle band, not the record's PRIO: C runs `init_record`
-                // inline on the `iocInit` thread (`dbInitRecord`,
-                // dbAccess.c), never on a callback queue, so there is no
-                // per-record band for record init to inherit.
-                crate::runtime::task::spawn_background(
-                    crate::runtime::task::CallbackPriority::Medium,
-                    init,
-                );
-            }
+        if let Some(init) = self.queue_record_init(init) {
+            // Middle band, not the record's PRIO: C runs `init_record`
+            // inline on the `iocInit` thread (`dbInitRecord`,
+            // dbAccess.c), never on a callback queue, so there is no
+            // per-record band for record init to inherit.
+            crate::runtime::task::spawn_background(
+                crate::runtime::task::CallbackPriority::Medium,
+                init,
+            );
         }
     }
 
-    /// Release every init parked for `record` — called by the one site that
-    /// registers the name, immediately after the insert that makes it real.
-    fn release_record_inits(&self, record: &[u8]) {
-        let parked = self
-            .inner
+    /// Queue `init` for `iocInit` while one is owed; hand it back, to run
+    /// now, on a complete database.
+    fn queue_record_init(&self, init: RecordInit) -> Option<RecordInit> {
+        let mut phase = self.inner.init_phase.lock().unwrap();
+        match &mut *phase {
+            DbInitPhase::Loading(queued) | DbInitPhase::Initialising(queued) => {
+                queued.push(init);
+                None
+            }
+            DbInitPhase::Unloaded | DbInitPhase::Running => Some(init),
+        }
+    }
+
+    /// Take every init parked for `record` — by the one site that registers
+    /// the name, immediately after the insert that makes it real.
+    fn take_record_inits(&self, record: &[u8]) -> Vec<RecordInit> {
+        self.inner
             .record_init_waiting
             .lock()
             .unwrap()
-            .remove(record);
-        for init in parked.into_iter().flatten() {
-            self.dispatch_record_init(init);
-        }
+            .remove(record)
+            .unwrap_or_default()
     }
 
     /// The `iocInit` barrier: end the LOAD phase and run every classification
@@ -3453,9 +3459,12 @@ impl PvDatabase {
         // The record is reachable from this line on, so anything its
         // `set_async_context` parked above may now run. This is the only
         // release site because this is the only site that registers the name.
-        self.release_record_inits(&name);
+        let inits = self.take_record_inits(&name);
 
         if defer {
+            for init in inits {
+                self.dispatch_record_init(init);
+            }
             // The dset binding, init passes, scan-index insert and the
             // `recGblInitSimm`/`wdogInit` tail are all owed to `ioc_init`. The
             // record carries that debt itself (`RecordCell::init_owed`), so the
@@ -3483,6 +3492,15 @@ impl PvDatabase {
         if self.ioc_is_running() {
             self.open_record_links(&rec_arc);
             self.init_record_forwards(&rec_arc);
+        }
+        // The `init_record` tail: with no barrier to finish it, the record's
+        // link statuses are final when this returns, as they are when
+        // `iocInit` returns for a loaded one. acalcout's first process reads
+        // INAA..INLL by them (`aCalcoutRecord.c:1078`).
+        for init in inits {
+            if let Some(init) = self.queue_record_init(init) {
+                init.await;
+            }
         }
         Ok(())
     }

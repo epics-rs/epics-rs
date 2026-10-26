@@ -694,7 +694,13 @@ mod tests {
             sc.put_field(link, EpicsValue::String("SRC".into()))
                 .unwrap();
         }
-        db.add_record("SC", Box::new(sc)).await.unwrap();
+        // `add_record` returns only once init has posted, so the put below
+        // comes from another thread, as a CA client's would.
+        let adder = db.clone();
+        let added = crate::runtime::task::spawn_background(
+            crate::runtime::task::CallbackPriority::Medium,
+            async move { adder.add_record("SC", Box::new(sc)).await.unwrap() },
+        );
         arrived.await.expect("init's task reached its post");
 
         let rec = db.get_record("SC").unwrap();
@@ -722,6 +728,7 @@ mod tests {
                 .special("INPA", true, &Default::default())
                 .unwrap();
         }
+        added.await.expect("add_record returned");
         crate::runtime::task::sleep(Duration::from_millis(100)).await;
 
         let mut drain = |i: usize| {
@@ -784,5 +791,48 @@ mod tests {
         resumed
             .recv_timeout(Duration::from_secs(5))
             .expect("the put's task resumed");
+    }
+
+    /// C `init_record` classifies every link before any process
+    /// (`aCalcoutRecord.c:209-243`). A database built without `iocInit` has
+    /// no barrier but `add_record`, so the first process after it reads
+    /// INAA. The hold is released only once the add has had its chance to
+    /// return.
+    #[epics_macros_rs::epics_test]
+    async fn a_process_right_after_add_record_reads_an_array_link() {
+        use crate::server::record::Record;
+        use crate::server::records::acalcout::AcalcoutRecord;
+        let db = PvDatabase::new();
+        db.add_record("SRC", Box::new(AiRecord::new(3.0)))
+            .await
+            .unwrap();
+        let mut ac = AcalcoutRecord::new();
+        ac.put_field("NELM", EpicsValue::Long(4)).unwrap();
+        ac.put_field("INAA", EpicsValue::String("SRC".into()))
+            .unwrap();
+
+        let (arrived_tx, arrived) = oneshot::channel();
+        let (release, release_rx) = oneshot::channel();
+        let (resumed_tx, _resumed) = std::sync::mpsc::channel();
+        *HOLD.lock().unwrap() = Some((arrived_tx, release_rx, resumed_tx));
+        let add = async {
+            db.add_record("AC", Box::new(ac)).await.unwrap();
+            let rec = db.get_record("AC").unwrap();
+            let read = |f: &str| rec.read().record.get_field(f);
+            assert_eq!(read("IAAV"), Some(EpicsValue::Enum(super::LINK_LOC as u16)));
+            db.process_record_with_links("AC", &mut ProcStack::new())
+                .await
+                .unwrap();
+            let aa = match read("AA") {
+                Some(EpicsValue::DoubleArray(a)) => a.to_vec(),
+                other => panic!("AA is {other:?}"),
+            };
+            assert_eq!(aa.first(), Some(&3.0), "AA is {aa:?}");
+        };
+        let unhold = async {
+            arrived.await.expect("AC's init reached its post");
+            release.send(()).unwrap();
+        };
+        tokio::join!(add, unhold);
     }
 }

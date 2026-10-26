@@ -48,17 +48,17 @@ async fn boot_commands(ioc: &Ioc) -> Vec<String> {
 }
 
 /// Boot with 4 channels: `read_meter` resets the meter through
-/// `init_string`, configures DC volts and closes channel 1, and 1 s on the
-/// reset sets the reading format through `init_string1`.
+/// `init_string`, which 1 s on sets the reading format through
+/// `init_string1`, then configures DC volts and closes channel 1.
 async fn booted(ioc: &Ioc) {
     let got = boot_commands(ioc).await;
     assert_eq!(
         got,
         [
             "*rst",
+            "form:elem read",
             ":conf:volt:dc",
-            "rout:clos (@101)",
-            "form:elem read"
+            "rout:clos (@101)"
         ]
     );
 }
@@ -252,10 +252,30 @@ async fn a_slow_boot_reset_goes_out_ahead_of_the_relay() {
     assert_eq!(ioc.f64_of("Dmm_raw"), 101.0);
 }
 
-/// A read behind an `init_dmm` reset closes its relay after the reset, and
-/// so does the read after it. C's mode_change put the reset from its own
-/// thread, so a read read_meter took meanwhile closed the relay first, and
-/// the next read went out with every relay open.
+/// A read asked for in the 1 s between boot's `*rst` and the reset's
+/// `form:elem read` goes out behind the format. C's read_meter put the
+/// reset without waiting for it, so that read read a meter whose format
+/// was not yet set.
+#[epics_base_rs::epics_test]
+async fn a_read_during_the_boot_reset_waits_for_its_format() {
+    let ioc = boot(&DMM, 4).await;
+    assert!(eventually(|| ioc.mock.pending() >= 1).await, "*rst");
+    ioc.read(&[
+        "*rst",
+        "form:elem read",
+        ":conf:volt:dc",
+        "rout:clos (@101)",
+        "read?",
+    ])
+    .await;
+    assert_eq!(ioc.f64_of("Dmm_raw"), 101.0);
+}
+
+/// A read behind an `init_dmm` reset closes its relay after the reset and
+/// its reading format, and so does the read after it. C's mode_change put
+/// the reset from its own thread, so a read read_meter took meanwhile
+/// closed the relay first, and the next read went out with every relay
+/// open.
 #[epics_base_rs::epics_test]
 async fn a_read_behind_a_reset_closes_its_relay_after_it() {
     let ioc = boot(&DMM, 4).await;
@@ -267,10 +287,10 @@ async fn a_read_behind_a_reset_closes_its_relay_after_it() {
     reset.release();
     ioc.commands(&[
         "*rst",
+        "form:elem read",
         ":conf:volt:dc",
         "rout:clos (@103)",
         "read?",
-        "form:elem read",
     ])
     .await;
     assert_eq!(ioc.f64_of("Dmm_raw"), 103.0);

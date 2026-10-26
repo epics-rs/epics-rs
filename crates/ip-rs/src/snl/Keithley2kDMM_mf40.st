@@ -363,7 +363,11 @@ ss read_meter {
             previous_mode = -1;
             previous_chan = -1;
             efClear(read_complete_mon);
-            pvPut(do_init);
+            /* C defect fixed: the template's reset sets the reading format
+            ** 1 s past its *rst (reset_delay), so a read taken in that
+            ** time read a meter whose format was not yet set. read_meter
+            ** waits for the whole reset, here and on init_dmm. */
+            pvPut(do_init, SYNC);
             efSet(ch_mode_sel_mon);
             efSet(dmm_chan_mon);
         } state wait_read
@@ -428,7 +432,7 @@ ss read_meter {
                 previous_chan = -1;
                 init_dmm = 0;
                 pvPut(init_dmm);
-                pvPut(do_init);
+                pvPut(do_init, SYNC);
             }
         } state wait_read
 

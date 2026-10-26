@@ -351,6 +351,14 @@ const COMPANIONS: &[(&str, &str)] = &[
         "sequencer/test/validate/indirectCall.st",
         include_str!("companions/indirectCall.rs"),
     ),
+    (
+        "tests/fixtures/gen_code/foreign_pointer_compare.st",
+        include_str!("companions/struct_t.rs"),
+    ),
+    (
+        "tests/fixtures/gen_code/foreign_struct_select.st",
+        include_str!("companions/struct_t.rs"),
+    ),
 ];
 
 /// The names a hand-written companion defines.
@@ -592,6 +600,7 @@ fn upstream_programs_type_check() {
     let modules = reference_root(ReferenceTree::Modules);
     let rel = |st: &Path| {
         st.strip_prefix(&modules)
+            .or_else(|_| st.strip_prefix(env!("CARGO_MANIFEST_DIR")))
             .unwrap_or(st)
             .display()
             .to_string()

@@ -1,5 +1,6 @@
-// The escaped C types of test/validate/foreignTypes.st and
-// test/compiler/member.st.
+// The escaped C types of test/validate/foreignTypes.st,
+// test/compiler/member.st and the fixtures foreign_struct_select.st and
+// foreign_pointer_compare.st.
 use epics_seq_rs::{Ptr, UnionBytes, Zeroed};
 
 // struct struct_t { int i; struct { double d; } s; };

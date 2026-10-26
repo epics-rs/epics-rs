@@ -2037,7 +2037,10 @@ impl<'a> Gen<'a> {
                     .find(|t| **t == void)
                     .or_else(|| [&a.ty, &b.ty].into_iter().find(|t| matches!(t, Ty::Ptr(_))))
                     .cloned();
-                let (a, b, ty) = if is_numeric(&a.ty) && is_numeric(&b.ty) {
+                // C takes an operand beside an arithmetic one to be
+                // arithmetic; two foreign ones go through as C copies them
+                let arith = |x: &Ty, y: &Ty| is_numeric(x) && (is_numeric(y) || *y == Ty::Foreign);
+                let (a, b, ty) = if arith(&a.ty, &b.ty) || arith(&b.ty, &a.ty) {
                     match operands(a, b) {
                         Operands::Known(a, b, ty) => (a, b, ty),
                         Operands::Unknown(a, b) => {
@@ -3063,9 +3066,9 @@ fn binop(op: Tok, l: Val, r: Val) -> Val {
 enum Operands {
     /// brought to their common type, which is the third
     Known(Expr, Expr, Ty),
-    /// a foreign operand, whose C type snc-rs does not know, with another
-    /// that is not a `double`: `seqg_rt::arith` converts them by their
-    /// Rust types
+    /// a foreign operand, whose C type snc-rs does not know, beside an
+    /// arithmetic one that is not a `double`: `seqg_rt::arith` converts
+    /// them by their Rust types
     Unknown(Expr, Expr),
 }
 
@@ -3104,6 +3107,8 @@ fn operands(a: Val, b: Val) -> Operands {
         (Ty::Foreign, t) | (t, Ty::Foreign) if is_numeric(t) => {
             return Operands::Unknown(a.e, b.e);
         }
+        // as C copies them, such as two foreign operands, which may be
+        // structs or pointers
         _ => (a.e, b.e, Ty::Foreign),
     };
     Operands::Known(a, b, ty)
@@ -3197,11 +3202,10 @@ fn rt_int(e: Expr, r: &str) -> Expr {
     }
 }
 
+/// A C arithmetic type snc-rs knows; a foreign value may be a struct or a
+/// pointer.
 fn is_numeric(ty: &Ty) -> bool {
-    matches!(
-        ty,
-        Ty::Int | Ty::Float | Ty::Num(_) | Ty::Bool | Ty::Rt(_) | Ty::Foreign
-    )
+    matches!(ty, Ty::Int | Ty::Float | Ty::Num(_) | Ty::Bool | Ty::Rt(_))
 }
 
 fn is_float(t: &str) -> bool {
@@ -4119,6 +4123,31 @@ mod tests {
             ),
         ] {
             assert!(code.contains(&words(&e)), "{e}\n{code}");
+        }
+    }
+
+    #[test]
+    fn two_operands_of_unknown_type_go_through_as_c_copies_them() {
+        // a struct is no arithmetic operand, nor is a pointer member
+        let (code, diag) = translate(
+            "program p\n%%struct struct_t { int i; struct { double d; } s; };\n\
+             %%union union_t { int i; struct struct_t *p; };\n\
+             struct struct_t s, s2, s3;\nunion union_t u, u2;\nint c;\nss a {\nstate s {\n\
+             when () {\ns3 = c ? s : s2;\nc = u.p == u2.p;\nc = s.i * u.i;\n} state s\n}\n}\n",
+        );
+        assert_eq!(diag, "");
+        let code = words(&code);
+        let p = |u| format!("seqg_var.{u}.view(|v| v.p(), |v, x| v.set_p(x)).get()");
+        for e in [
+            "seqg_var.s3.set( if seqg_var.c.get() != 0 { seqg_var.s.get() } \
+             else { seqg_var.s2.get() }, );"
+                .into(),
+            format!("seqg_var.c.set(({} == {}) as i32);", p("u"), p("u2")),
+            "seqg_var.c.set((seqg_var.s.field(|v| &mut v.i).get() * \
+             seqg_var.u.view(|v| v.i(), |v, x| v.set_i(x)).get()) as _);"
+                .into(),
+        ] {
+            assert!(code.contains(&e), "{e}\n{code}");
         }
     }
 

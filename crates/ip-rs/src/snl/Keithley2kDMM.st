@@ -213,7 +213,11 @@ string ch_units;  assign ch_units to "";
 char *unit_strings[NUM_FRONT_MODES];
 char *P;
 char *Dmm;
-%%char pvname[PVNAME_STRINGSZ]; 
+/* C defect fixed: pvname was one C array that every running copy of
+** this program formatted its units PV names into, so two meters'
+** mode_change could pvAssign ch_units to the other meter's PV. Each copy
+** has its own now, of dbDefs.h's PVNAME_STRINGSZ. */
+char pvname[61];
 string close_format;
 int chan;
 

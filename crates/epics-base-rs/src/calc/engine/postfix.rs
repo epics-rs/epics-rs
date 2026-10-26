@@ -77,10 +77,9 @@ enum StackEntry {
         in_stack_pri: u8,
         runtime_effect: i32,
     },
-    /// C's COND_END. It carries the true branch's sum until the false branch
-    /// ends (`None` after), which may be before C emits it: a conditional in
-    /// a true branch ends at that branch's `:`.
-    CondEnd(Option<Arm>),
+    /// C's COND_END. Which true branch lands after it is C's `cond_search`
+    /// count ([`Holes::cond_end`]), not the `:` that pushed it.
+    CondEnd,
     Store {
         target: StoreTarget,
         in_stack_pri: u8,
@@ -139,13 +138,16 @@ struct Fork {
     rest: Vec<Path>,
 }
 
-/// A conditional whose true branch has been read: that branch's span, the
-/// paths it ended on (depths counted from zero), and which `:` this was.
+/// A conditional whose true branch has been read: that branch's span until
+/// the false branch ends, the paths it jumped on (depths counted from zero),
+/// which `:` this was, and C's `cond_search` count to the COND_END they land
+/// after (`sCalcPerform.c:2103-2150`).
 #[derive(Debug, Clone)]
 struct Arm {
-    then: Span,
+    then: Option<Span>,
     ends: Vec<Path>,
     n: usize,
+    count: u32,
 }
 
 /// A value an operand should have pushed and did not (CBUG-AJ1).
@@ -235,6 +237,8 @@ struct Holes {
     next: u32,
     /// More than [`MAX_PATHS`] paths were met.
     lost: bool,
+    /// The true branches that have jumped and not landed, in `:` order.
+    arms: Vec<Arm>,
 }
 
 impl Default for Holes {
@@ -245,6 +249,7 @@ impl Default for Holes {
             open: Vec::new(),
             next: 0,
             lost: false,
+            arms: Vec::new(),
         }
     }
 }
@@ -297,8 +302,11 @@ impl Holes {
         }
     }
 
-    /// `?`, after it pops the condition.
+    /// `?`, after it pops the condition. `cond_search` counts its COND_IF.
     fn fork(&mut self, depth: i32) -> Fork {
+        for arm in &mut self.arms {
+            arm.count += 1;
+        }
         let then = self.open(depth);
         Fork {
             then,
@@ -308,7 +316,22 @@ impl Holes {
     }
 
     /// `:`, before C's -1: the false branch starts where the true one did.
-    fn branch(&mut self, fork: Fork, depth: i32, n: usize) -> Arm {
+    /// A conditional read since the `?` ends here, though its true branch
+    /// lands where `cond_search` takes it.
+    fn branch(&mut self, fork: Fork, depth: i32, n: usize, first: usize) {
+        let inner = self
+            .arms
+            .iter()
+            .rposition(|a| a.n < first)
+            .map_or(0, |i| i + 1);
+        for i in (inner..self.arms.len()).rev() {
+            if let Some(then) = self.arms[i].then.take() {
+                self.end(then, depth);
+            }
+            for p in &mut self.arms[i].ends {
+                p.finish(fork.then, 0);
+            }
+        }
         let mut ends = std::mem::replace(&mut self.paths, fork.rest);
         for p in &mut ends {
             p.finish(fork.then, depth);
@@ -317,24 +340,40 @@ impl Holes {
             p.off += fork.depth - (depth - 1);
         }
         self.even(depth - 1);
-        Arm {
-            then: fork.then,
+        self.arms.push(Arm {
+            then: Some(fork.then),
             ends,
             n,
-        }
+            count: 1,
+        });
     }
 
-    /// The false branch is read too: go on along the paths through either.
-    fn join(&mut self, arm: &Arm, depth: i32) {
+    /// The false branch of the conditional `then` ends on every path.
+    fn end(&mut self, then: Span, depth: i32) {
         for p in &mut self.paths {
-            p.finish(arm.then, depth);
-        }
-        self.open.retain(|s| *s != arm.then);
-        self.paths.extend(arm.ends.iter().cloned());
-        for p in &mut self.paths {
+            p.finish(then, depth);
             p.off -= depth;
         }
-        self.even(depth);
+        self.open.retain(|s| *s != then);
+    }
+
+    /// C's COND_END: go on along the paths of the true branches that
+    /// `cond_search` lands after it, the latest first.
+    fn cond_end(&mut self, depth: i32) {
+        for arm in &mut self.arms {
+            arm.count -= 1;
+        }
+        while let Some(i) = self.arms.iter().rposition(|a| a.count == 0) {
+            let arm = self.arms.remove(i);
+            if let Some(then) = arm.then {
+                self.end(then, depth);
+            }
+            self.paths.extend(arm.ends.into_iter().map(|mut p| {
+                p.off -= depth;
+                p
+            }));
+            self.even(depth);
+        }
     }
 
     /// Give every path the open spans, a span one did not see begun beginning
@@ -375,7 +414,7 @@ impl StackEntry {
             // `[` / `{`: in_stack_pri 0, like `(` — a barrier nothing pops.
             StackEntry::Subrange { .. } => 0,
             StackEntry::VarargFunc { in_stack_pri, .. } => *in_stack_pri,
-            StackEntry::CondEnd(_) => 0,
+            StackEntry::CondEnd => 0,
             StackEntry::Store { in_stack_pri, .. } => *in_stack_pri,
             // C: `{"UNTIL", 0, 10, 0, UNTIL_OPERATOR, UNTIL}` — in_stack_pri 0,
             // so no incoming operator ever pops it off the stack.
@@ -629,7 +668,7 @@ fn flush_stack_entry(entry: &StackEntry, output: &mut Emitter, kind: ExprKind) {
         } => {
             output.op(func_to_opcode(func, (1 - runtime_effect) as u8));
         }
-        StackEntry::CondEnd(_) => {
+        StackEntry::CondEnd => {
             output.op(Opcode::Core(CoreOp::CondEnd));
         }
         StackEntry::UntilEnd => {
@@ -1014,19 +1053,10 @@ pub fn compile(expr: &str, kind: ExprKind) -> Result<CompiledExpr, CalcError> {
                     let Some((fork, first)) = conds.pop() else {
                         return Err(CalcError::Conditional);
                     };
-                    // A conditional inside the true branch ends here, though
-                    // its COND_END stays on the stack below this one.
-                    for entry in stack.iter_mut().rev() {
-                        if let StackEntry::CondEnd(arm) = entry
-                            && let Some(inner) = arm.take_if(|a| a.n >= first)
-                        {
-                            holes.join(&inner, runtime_depth);
-                        }
-                    }
-                    let arm = holes.branch(fork, runtime_depth, elses);
+                    holes.branch(fork, runtime_depth, elses, first);
                     elses += 1;
                     runtime_depth -= 1;
-                    stack.push(StackEntry::CondEnd(Some(arm)));
+                    stack.push(StackEntry::CondEnd);
                     operand_needed = true;
                 }
 
@@ -1350,7 +1380,7 @@ fn stack_effect(entry: &StackEntry) -> i32 {
         }
         StackEntry::Op { .. } => -1,
         StackEntry::VarargFunc { runtime_effect, .. } => *runtime_effect,
-        StackEntry::CondEnd(_) => 0,
+        StackEntry::CondEnd => 0,
         StackEntry::Store { .. } => -1,
         StackEntry::LParen { runtime_effect, .. } => *runtime_effect,
         // The effect C accumulated on the `[` / `{` entry itself: -1 from the
@@ -1387,14 +1417,14 @@ fn flush(
 ) {
     let effect = stack_effect(entry);
     let pushes = match entry {
-        StackEntry::Store { .. } | StackEntry::LParen { .. } | StackEntry::CondEnd(_) => 0,
+        StackEntry::Store { .. } | StackEntry::LParen { .. } | StackEntry::CondEnd => 0,
         _ => 1,
     };
     holes.take(*runtime_depth, pushes - effect);
     *runtime_depth += effect;
     match entry {
         StackEntry::Store { .. } => holes.store(*runtime_depth),
-        StackEntry::CondEnd(Some(arm)) => holes.join(arm, *runtime_depth),
+        StackEntry::CondEnd => holes.cond_end(*runtime_depth),
         _ => {}
     }
     flush_stack_entry(entry, output, kind);

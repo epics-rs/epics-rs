@@ -28,7 +28,10 @@
 //! A bare `(3,K:=1)` is one operand, the 3: C gives `(3,K:=1)+2` = 5 and
 //! `SIN(3,K:=1)` = sin 3.
 
-use epics_base_rs::calc::{CalcError, acalc_compile, compile, scalc_compile};
+use epics_base_rs::calc::{
+    ArrayInputs, ArrayStackValue, CalcError, StackValue, StringInputs, acalc, acalc_compile,
+    compile, scalc, scalc_compile,
+};
 
 #[test]
 fn an_assignment_operand_is_refused() {
@@ -137,6 +140,38 @@ fn one_defined_path_is_enough() {
     ] {
         assert!(scalc_compile(expr).is_ok(), "scalc {expr}");
         assert!(acalc_compile(expr).is_ok(), "acalc {expr}");
+    }
+}
+
+/// A `;`, `)` or `,` read before a later `?`'s `:` emits the COND_END of an
+/// earlier `:`, and C's `cond_search` counts that one against the later `?`:
+/// the earlier true branch lands after the last COND_END, past the `;3` or
+/// `,3`. Compiled C, A=1 and all else 0.
+#[test]
+fn a_true_branch_lands_where_cond_search_lands() {
+    for (expr, v) in [
+        ("A?5:B?C;D:L:=7", 5.0),
+        ("1?5:B?-A;3:K:=7", 5.0),
+        ("(1?5:B?-A;3):K:=7", 5.0),
+        ("(1?5:B?-A);3:K:=7", 5.0),
+        ("1?5:0?6:B?-A;3:K:=7", 5.0),
+        ("1?5:B?-A;3:K:=7;L:=1", 5.0),
+        ("9;MAX(1?5:B?-A,3:K:=7)", 9.0),
+    ] {
+        let mut s = StringInputs::new();
+        s.num_vars[0] = 1.0;
+        assert_eq!(
+            scalc(expr, &mut s),
+            Ok(StackValue::Double(v)),
+            "scalc {expr}"
+        );
+        let mut a = ArrayInputs::new(8);
+        a.num_vars[0] = 1.0;
+        assert_eq!(
+            acalc(expr, &mut a),
+            Ok(ArrayStackValue::Double(v)),
+            "acalc {expr}"
+        );
     }
 }
 

@@ -405,6 +405,24 @@ pub struct LinkMetadata {
     pub description: Option<String>,
 }
 
+impl LinkMetadata {
+    /// The DBF type and element count of this snapshot.
+    pub fn shape(&self) -> LinkShape {
+        LinkShape {
+            dbf_type: self.dbf_type,
+            element_count: self.element_count,
+        }
+    }
+}
+
+/// [`LinkMetadata::dbf_type`] and [`LinkMetadata::element_count`] alone,
+/// with their meanings: what [`LinkSet::link_shape`] answers.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LinkShape {
+    pub dbf_type: Option<LinkDbfType>,
+    pub element_count: Option<i64>,
+}
+
 /// What [`LinkSet::get_cached_enum_string`] answers for a link whose channel
 /// is a `DBR_ENUM`.
 #[derive(Clone, Debug, PartialEq)]
@@ -943,6 +961,17 @@ pub trait LinkSet: Send + Sync {
     /// untouched on a missing sub-field. Default impl: no metadata.
     fn link_metadata(&self, _link: LinkRef<'_>) -> Option<LinkMetadata> {
         None
+    }
+
+    /// The link's DBF type and element count, C lset `getDBFtype` /
+    /// `getElements` (`dbCa.c:666`, `:633`; pvxs `pvalink_lset.cpp:199-258`):
+    /// known once the link connects, never held for an attribute read
+    /// [`Self::link_metadata`] waits on. A scan cycle asks it, for an OUT
+    /// target's type and an INP's `dbGetNelements`, so it MUST NOT allocate:
+    /// an lset whose metadata snapshot allocates (units, description) or
+    /// lands after the connect overrides the default.
+    fn link_shape(&self, link: LinkRef<'_>) -> Option<LinkShape> {
+        self.link_metadata(link).as_ref().map(LinkMetadata::shape)
     }
 
     /// Enumerate every PV name this lset has *opened* (i.e., is

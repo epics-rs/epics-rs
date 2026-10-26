@@ -24,7 +24,7 @@ use super::dbr_delivery::{DeliveryStage, prepare_read, with_live_options};
 use super::filters::FilterChain;
 use super::link_set::{
     DynLinkSet, EnumString, LinkDbfType, LinkDiagnostics, LinkMetadata, LinkPutDone, LinkPutOp,
-    LinkRef, LinkSerial, LinkSet, PutAdmission,
+    LinkRef, LinkSerial, LinkSet, LinkShape, PutAdmission,
 };
 use super::{CaLinkInit, ExternalCpProcess, LinkHolder, PvDatabase, PvDatabaseInner};
 use crate::runtime::task::{BlockingBridge, TaskHandle};
@@ -102,10 +102,14 @@ impl CaLinks {
         *self.network.write() = None;
     }
 
-    /// Whether a `ca` link to `name` has anything to connect to: a name
-    /// this database serves, or any name once a network half is registered.
-    pub(crate) fn addresses(&self, name: &[u8]) -> bool {
-        self.network.read().is_some() || self.has_name(name)
+    /// Whether `link` has anything to connect to: a name this database
+    /// serves, or any name once a network half is registered. An opened link
+    /// answers from its route, as a scan cycle's put gate asks it.
+    pub(crate) fn addresses(&self, link: LinkRef<'_>) -> bool {
+        self.network.read().is_some()
+            || self
+                .settled_local(link)
+                .unwrap_or_else(|| self.has_name(link.name))
     }
 
     /// Whether `link` is a local link — C's `dbCaPutAsync` to one completes
@@ -125,10 +129,8 @@ impl CaLinks {
     /// database does not serve is decided here, once, as C decides it once
     /// per link.
     fn serves(&self, link: LinkRef<'_>) -> bool {
-        match self.routes.read().get(&link.serial()) {
-            Some((_, Route::Local(_))) => return true,
-            Some((_, Route::Network)) => return false,
-            None => {}
+        if let Some(local) = self.settled_local(link) {
+            return local;
         }
         let name = link.name;
         if self.has_name(name) {
@@ -141,6 +143,14 @@ impl CaLinks {
                 .or_insert_with(|| (name.into(), Route::Network));
         }
         false
+    }
+
+    /// Whether the route `link`'s open settled is local; `None` before it.
+    fn settled_local(&self, link: LinkRef<'_>) -> Option<bool> {
+        self.routes
+            .read()
+            .get(&link.serial())
+            .map(|(_, route)| matches!(route, Route::Local(_)))
     }
 
     fn network(&self) -> Option<DynLinkSet> {
@@ -447,6 +457,15 @@ impl LinkSet for CaLinks {
             link,
             |local| local.state.meta.get().cloned(),
             |n| Some(n.link_metadata(link)),
+        )
+        .flatten()
+    }
+
+    fn link_shape(&self, link: LinkRef<'_>) -> Option<LinkShape> {
+        self.answer(
+            link,
+            |local| local.state.meta.get().map(LinkMetadata::shape),
+            |n| Some(n.link_shape(link)),
         )
         .flatten()
     }

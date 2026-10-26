@@ -98,6 +98,7 @@ const CONNECTED_CALLS: &[(&str, fn(&dyn LinkSet, LinkRef<'_>))] = &[
     ("link_metadata", |l, n| {
         assert!(l.link_metadata(n).is_some())
     }),
+    ("link_shape", |l, n| assert!(l.link_shape(n).is_some())),
 ];
 
 #[test]

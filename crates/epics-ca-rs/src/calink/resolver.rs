@@ -19,7 +19,7 @@ use epics_base_rs::error::CaOp;
 use epics_base_rs::runtime::task;
 use epics_base_rs::server::database::{
     CaLinkInit, CpWorker, EnumString, ExternalCpProcess, LinkDiagnostics, LinkHolder, LinkMetadata,
-    LinkPutDone, LinkPutOp, LinkRef, LinkSerial, LinkSet, PutAdmission, PvDatabase,
+    LinkPutDone, LinkPutOp, LinkRef, LinkSerial, LinkSet, LinkShape, PutAdmission, PvDatabase,
     link_put_convert, report_put_not_issued,
 };
 use epics_base_rs::server::snapshot::Snapshot;
@@ -757,6 +757,20 @@ impl CaLink {
             return None;
         }
         self.meta.load().as_ref().clone()
+    }
+
+    /// C `getDBFtype` / `getElements` (`dbCa.c:666`, `:633`): the channel's
+    /// own type and count, set at connect (`dbCa.c:862-864`), not the CTRL
+    /// reply [`Self::link_metadata`] waits on.
+    pub fn link_shape(&self) -> Option<LinkShape> {
+        if !self.connected.is_set() {
+            return None;
+        }
+        let (native, count) = channel_native(&self.channel)?;
+        Some(LinkShape {
+            dbf_type: Some(native.into()),
+            element_count: Some(i64::from(count)),
+        })
     }
 }
 
@@ -1504,6 +1518,10 @@ impl LinkSet for CaLinkResolver {
         // no fresh GET — exactly as C `getControlLimits` &c. read
         // `pca->controlLimits`.
         self.cached_link(link)?.link_metadata()
+    }
+
+    fn link_shape(&self, link: LinkRef<'_>) -> Option<LinkShape> {
+        self.cached_link(link)?.link_shape()
     }
 
     fn link_names(&self) -> Vec<RecordName> {

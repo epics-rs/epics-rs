@@ -199,6 +199,10 @@ const SCOPE_GATED: &[(&str, &str)] = &[
     ),
     (
         "epics-ca-rs",
+        "tests/a_network_ca_link_shape_is_set_at_connect.rs",
+    ),
+    (
+        "epics-ca-rs",
         "tests/a_put_the_task_cannot_send_is_dropped.rs",
     ),
     (

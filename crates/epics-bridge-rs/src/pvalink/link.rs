@@ -1499,18 +1499,7 @@ impl PvaLink {
         }
 
         let root = self.latest.lock().clone()?;
-
-        // DBF type and element count derive from the selected value.
-        // pvxs `pvaGetDBFtype` reads `fld_value`, which is the
-        // selected-root rule: empty `field` selects the top-level value
-        // (its `.value` for a structure, else the root itself), a
-        // non-empty `field` selects `root[field]` (then `.value` if that
-        // is itself a structure). See [`select_link_value`]
-        // (`pvxs/ioc/pvalink_link.cpp:90-110`, `pvxs/ioc/pvalink_lset.cpp:199-240`).
-        let value_field = select_link_value(&root, field);
-
-        let dbf_type = link_dbf_type(value_field);
-        let element_count = link_element_count(value_field);
+        let shape = link_shape_of(&root, field);
 
         // display / control / valueAlarm are read from the selected
         // metadata root, NOT the top-level root. pvxs derives `fld_meta`
@@ -1556,8 +1545,8 @@ impl PvaLink {
         let description = string_field(meta_root, "display.description");
 
         Some(LinkMetadata {
-            dbf_type,
-            element_count,
+            dbf_type: shape.dbf_type,
+            element_count: shape.element_count,
             graphic_limits,
             control_limits,
             alarm_limits,
@@ -1565,6 +1554,19 @@ impl PvaLink {
             units,
             description,
         })
+    }
+
+    /// [`Self::link_metadata_with`]'s DBF type and element count alone,
+    /// under the same gate, allocating nothing.
+    pub fn link_shape_with(
+        &self,
+        field: &str,
+    ) -> Option<epics_base_rs::server::database::LinkShape> {
+        if self.monitor_disconnected_stale() {
+            return None;
+        }
+        let root = self.latest.lock().clone()?;
+        Some(link_shape_of(&root, field))
     }
 
     /// Test-only constructor: build a [`PvaLink`] with no monitor, up when
@@ -1816,6 +1818,17 @@ fn select_target<'v>(root: &'v PvField, field: &str) -> &'v PvField {
 
 /// What a path that names no field selects.
 static NULL_FIELD: PvField = PvField::Null;
+
+/// The DBF type and element count of the value `field` selects from `root`
+/// ([`select_link_value`]): pvxs `pvaGetDBFtype` / `pvaGetElements` read
+/// `fld_value` (`pvxs/ioc/pvalink_lset.cpp:199-258`).
+fn link_shape_of(root: &PvField, field: &str) -> epics_base_rs::server::database::LinkShape {
+    let value_field = select_link_value(root, field);
+    epics_base_rs::server::database::LinkShape {
+        dbf_type: link_dbf_type(value_field),
+        element_count: link_element_count(value_field),
+    }
+}
 
 /// Select the link's *value* from the remote root, following pvxs's
 /// `pvaGetDBFtype` / `onTypeChange` rule

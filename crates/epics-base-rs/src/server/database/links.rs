@@ -2407,7 +2407,7 @@ impl PvDatabase {
         &self,
         link: &crate::server::record::ParsedLink,
     ) -> Option<DbFieldType> {
-        self.external_link_metadata(link.external()?)?
+        self.external_link_shape(link.external()?)?
             .dbf_type
             .map(link_dbf_to_field_type)
     }
@@ -2943,6 +2943,16 @@ impl PvDatabase {
     ) -> Option<crate::server::database::LinkMetadata> {
         let (scheme, lref) = Self::external_link_ref(link);
         super::link_put_queue::find_lset(&self.inner, scheme, |lset| lset.link_metadata(lref))
+    }
+
+    /// [`LinkSet::link_shape`](super::LinkSet::link_shape) of an external
+    /// link: the type and count a scan cycle reads.
+    pub(crate) fn external_link_shape(
+        &self,
+        link: crate::server::record::ExternalRef<'_>,
+    ) -> Option<super::LinkShape> {
+        let (scheme, lref) = Self::external_link_ref(link);
+        super::link_put_queue::find_lset(&self.inner, scheme, |lset| lset.link_shape(lref))
     }
 
     /// [`LinkSet::get_cached_enum_string`](super::LinkSet::get_cached_enum_string)
@@ -3898,13 +3908,10 @@ impl PvDatabase {
     ) -> Result<(&'static str, super::LinkRef<'a>), ExternalPutRefusal> {
         use super::link_put_queue::find_lset;
         use super::link_set::PutAdmission;
-        let shown = String::from_utf8_lossy(link.name);
 
         let (scheme, lref) = Self::external_link_ref(link);
-        if !self.link_addressable(scheme, lref.name) {
-            return Err(ExternalPutRefusal::Unserviceable(format!(
-                "no '{scheme}' link set registered for '{shown}'"
-            )));
+        if !self.link_addressable(scheme, lref) {
+            return Err(ExternalPutRefusal::NoLinkSet(scheme));
         }
 
         // A database built with no tokio runtime anywhere has no reactor for
@@ -3918,11 +3925,7 @@ impl PvDatabase {
         // worker unconditionally and blocks until it has started
         // (`db/dbCa.c:322` (`dbCaLinkInitImpl`), `:342`, `:344`; R7.0.10).
         if self.inner.link_puts.network().is_none() {
-            return Err(ExternalPutRefusal::Unserviceable(format!(
-                "external link '{shown}' refused the write: this database was \
-                 built with no tokio runtime, so no link set can reach the \
-                 network"
-            )));
+            return Err(ExternalPutRefusal::NoReactor);
         }
 
         // A link that is known-down refuses the put and stages nothing, so the
@@ -3960,7 +3963,7 @@ impl PvDatabase {
         let Some(chars) = src.long_string() else {
             return Some(src.into_value());
         };
-        match self.external_link_metadata(link)?.dbf_type? {
+        match self.external_link_shape(link)?.dbf_type? {
             LinkDbfType::Char | LinkDbfType::UChar => Some(src.into_value()),
             _ => Some(EpicsValue::String(PvString::from(
                 super::char_view::long_string_field_bytes(chars),
@@ -4180,8 +4183,8 @@ impl PvDatabase {
     ///   support's `default:` arm.
     /// - external target (a `CA` link, a DB-parsed name not in this
     ///   IOC, or a PV Access link) — `dbCaGetLinkDBFtype` / `dbCaGetNelements`
-    ///   (`dbCa.c:633-675`, both `-1` while disconnected): the lset's cached
-    ///   [`LinkMetadata`](super::LinkMetadata), `UNRESOLVED` when the link is
+    ///   (`dbCa.c:633-675`, both `-1` while disconnected): the lset's
+    ///   [`LinkShape`](super::LinkShape), `UNRESOLVED` when the link is
     ///   down. The type is [`ParsedLink::link_type`](crate::server::record::ParsedLink::link_type):
     ///   a braced `{pva:…}` or `{ca:…}` is a `JSON_LINK`, which C's own type
     ///   switches send to their `default:` arm.
@@ -4193,7 +4196,7 @@ impl PvDatabase {
         use crate::server::record::LinkType;
         let external = |link: crate::server::record::ExternalRef<'_>, link_type: LinkType| {
             let put_admitted = self.external_put_admitted(link).is_ok();
-            match self.external_link_metadata(link) {
+            match self.external_link_shape(link) {
                 // A remote channel reports the DBR type its DBF class is
                 // served as (`dbCaGetLinkDBFtype` → the channel's type): a
                 // remote `DBF_MENU` or link field arrives as `DBF_ENUM` or
@@ -7789,8 +7792,11 @@ pub(crate) enum ExternalPutRefusal {
     /// The link is down or read-only: C `dbCaPutLinkCallback`'s silent `-1`
     /// (`db/dbCa.c:558-560`). The record's LINK alarm is the whole report.
     NotConnected,
-    /// No link set or reactor can carry the write, a state C cannot reach.
-    Unserviceable(String),
+    /// No link set of this scheme can carry the write, a state C cannot
+    /// reach. Copy-only, as every gate refusal: a scan cycle asks the gate.
+    NoLinkSet(&'static str),
+    /// No reactor can carry the write, a state C cannot reach.
+    NoReactor,
     /// The value does not convert to the channel's native type: the
     /// conversion status `dbCaPutLinkCallback` returns, with nothing logged.
     Unconvertible(String),
@@ -7799,12 +7805,15 @@ pub(crate) enum ExternalPutRefusal {
 impl ExternalPutRefusal {
     /// What the refusal owes the errlog: nothing for a down link, as in C.
     pub(crate) fn report(&self, name: &[u8]) {
-        if let Self::Unserviceable(why) = self {
-            crate::runtime::log::errlog_vprintf(format_args!(
-                "OUT-link write to external PV '{}' failed: {why}\n",
-                String::from_utf8_lossy(name)
-            ));
-        }
+        let name = String::from_utf8_lossy(name);
+        let why = match self {
+            Self::NoLinkSet(scheme) => format!("no '{scheme}' link set registered for '{name}'"),
+            Self::NoReactor => format!("external link '{name}' refused the write: {self}"),
+            Self::NotConnected | Self::Unconvertible(_) => return,
+        };
+        crate::runtime::log::errlog_vprintf(format_args!(
+            "OUT-link write to external PV '{name}' failed: {why}\n"
+        ));
     }
 }
 
@@ -7815,7 +7824,12 @@ impl std::fmt::Display for ExternalPutRefusal {
                 "not connected, or connected without write access \
                  (db/dbCa.c:558-560 (dbCaPutLinkCallback))",
             ),
-            Self::Unserviceable(why) | Self::Unconvertible(why) => f.write_str(why),
+            Self::NoLinkSet(scheme) => write!(f, "no '{scheme}' link set registered"),
+            Self::NoReactor => f.write_str(
+                "this database was built with no tokio runtime, so no link set \
+                 can reach the network",
+            ),
+            Self::Unconvertible(why) => f.write_str(why),
         }
     }
 }

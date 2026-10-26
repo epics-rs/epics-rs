@@ -1549,6 +1549,14 @@ impl LinkSet for PvaLinkResolver {
         link.link_metadata_with(field)
     }
 
+    /// [`Self::link_metadata`]'s route, without its units and description.
+    fn link_shape(&self, link: LinkRef<'_>) -> Option<epics_base_rs::server::database::LinkShape> {
+        let cfg = self.inp_cfg_for(link_text(link.name)?);
+        self.registry
+            .try_get_channel(&cfg.pv_name, cfg.pipeline, cfg.queue_size)?
+            .link_shape_with(&cfg.field)
+    }
+
     fn link_names(&self) -> Vec<epics_base_rs::types::RecordName> {
         // The [`LinkSet::link_names`] enumeration contract: surface one
         // identity per open channel, for link introspection.

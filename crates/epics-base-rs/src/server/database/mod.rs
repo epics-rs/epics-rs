@@ -41,7 +41,7 @@ pub(crate) use link_put_queue::{LinkId, LinkInstall};
 pub use link_set::{
     DynLinkSet, EnumString, LinkBacking, LinkDbfType, LinkDiagnostics, LinkForward,
     LinkForwardRefused, LinkHolder, LinkMetadata, LinkOpen, LinkPutDone, LinkPutOp, LinkRef,
-    LinkSerial, LinkSet, LinkSetRegistry, PutAdmission, RemoteAlarm, link_put_convert,
+    LinkSerial, LinkSet, LinkSetRegistry, LinkShape, PutAdmission, RemoteAlarm, link_put_convert,
     report_put_not_issued,
 };
 #[cfg(test)]
@@ -2265,11 +2265,11 @@ impl PvDatabase {
         (link.lset.scheme(), LinkRef::new(link.name, link.open))
     }
 
-    /// Whether `scheme`'s lset can take a link to `body`: the `ca` set only
-    /// for a name it can connect ([`ca_link::CaLinks::addresses`]).
-    pub(crate) fn link_addressable(&self, scheme: &str, body: &[u8]) -> bool {
+    /// Whether `scheme`'s lset can take `link`: the `ca` set only for a
+    /// name it can connect ([`ca_link::CaLinks::addresses`]).
+    pub(crate) fn link_addressable(&self, scheme: &str, link: LinkRef<'_>) -> bool {
         match scheme {
-            "ca" => self.inner.ca_links.addresses(body),
+            "ca" => self.inner.ca_links.addresses(link),
             s => self.inner.link_sets.load().get_ref(s).is_some(),
         }
     }
@@ -2371,7 +2371,7 @@ impl PvDatabase {
             return false;
         }
         let (scheme, body) = (link.lset.scheme(), link.name);
-        if !self.link_addressable(scheme, body) {
+        if !self.link_addressable(scheme, LinkRef::new(body, link.open)) {
             return false;
         }
         // Nothing is staged that no owner can perform. A database built with

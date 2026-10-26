@@ -2,11 +2,10 @@
 //! because C has two and they do not agree.
 //!
 //! Both advance the same state, `seed = seed * RAND_MULTY + RAND_ADDY`
-//! wrapping at 16 bits, from the same fixed start `RAND_SEED = 0xa3bf`. They
-//! part company on the mapping onto the unit interval, and that is an
-//! observable difference from the very first draw:
+//! wrapping at 16 bits. They part company on the mapping onto the unit
+//! interval, and that is an observable difference on every draw:
 //!
-//! | engine | C | mapping | range | first draw |
+//! | engine | C | mapping | range | first draw from C's seed |
 //! |---|---|---|---|---|
 //! | base (calc, calcout, swait) | `calcRandom`, calcPerform.c:518-523 | `seed / 65535.0` | `[0, 1]` | 0.75007248… |
 //! | sCalc / aCalc | `local_random`, sCalcPerform.c:2079-2097, aCalcPerform.c:1649-1685 | `(float)(seed + 1) / 65536.0` | `(0, 1]` | 0.75007629… |
@@ -16,28 +15,36 @@
 //! value of `seed + 1` (≤ 65536) is exact in `float`, so the `f64` arithmetic
 //! in `local_random` is bit-identical to C's `float` cast.
 //!
-//! Two deliberate deviations, both documented:
+//! Two deliberate deviations:
 //! - base's C seed is a plain file-static `unsigned short` shared by every
-//!   thread (a data race, and no replayable sequence when two threads calc).
-//!   Both generators here keep the seed THREAD-PRIVATE, which is what
-//!   synApps does (`epicsThreadPrivateGet`) and what makes either sequence
-//!   replay compiled C run for run on the thread that draws it.
-//! - [`seed_random_from_time`] has no C counterpart at all: C cannot reseed.
-//!   A caller that wants non-reproducible draws must opt in, and it reseeds
-//!   BOTH generators on the calling thread.
+//!   thread, a data race. Both generators here keep the seed THREAD-PRIVATE,
+//!   which is what synApps does (`epicsThreadPrivateGet`).
+//! - C starts every generator at the fixed `0xa3bf`, so every IOC draws the
+//!   same sequence after every boot (CBUG-A4). Each thread's generators start
+//!   from the clock instead, as base's `calcRandom` does on 7.0 since
+//!   `77a3b8110`, which is after R7.0.10.
 
 use std::cell::Cell;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const RAND_MULTY: u16 = 191 * 8 + 5; // 1533; `191 % 8 == 5` per Knuth
 const RAND_ADDY: u16 = 0x3141;
-const RAND_SEED: u16 = 0xa3bf;
 
 thread_local! {
     /// synApps `local_random`'s seed.
-    static SEED: Cell<u16> = const { Cell::new(RAND_SEED) };
+    static SEED: Cell<u16> = Cell::new(clock_seed());
     /// base `calcRandom`'s seed — a SEPARATE sequence, as in C, where the two
     /// live in different translation units and neither advances the other.
-    static BASE_SEED: Cell<u16> = const { Cell::new(RAND_SEED) };
+    static BASE_SEED: Cell<u16> = Cell::new(clock_seed());
+}
+
+/// The clock's nanoseconds folded onto the LCG's 16-bit state.
+fn clock_seed() -> u16 {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+    (nanos ^ (nanos >> 16) ^ (nanos >> 32) ^ (nanos >> 48)) as u16
 }
 
 fn advance(cell: &'static std::thread::LocalKey<Cell<u16>>) -> u16 {
@@ -61,32 +68,48 @@ pub(crate) fn calc_random() -> f64 {
     f64::from(advance(&BASE_SEED)) / 65535.0
 }
 
-/// Opt-in, per-thread time seeding — a Rust extension with no C
-/// counterpart (C's seed is always `0xa3bf`). Call it on a thread whose
-/// RNDM/ARNDM draws must not replay across runs; every other thread keeps
-/// C's deterministic sequence. Both generators are reseeded, so the opt-in
-/// covers a thread that runs base and synApps expressions alike.
-pub fn seed_random_from_time() {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos() as u64;
-    // Fold 64 bits onto the LCG's 16-bit state.
-    let folded = (nanos ^ (nanos >> 16) ^ (nanos >> 32) ^ (nanos >> 48)) as u16;
-    SEED.with(|seed| seed.set(folded));
-    BASE_SEED.with(|seed| seed.set(folded));
+/// Start both of this thread's generators at `seed`, so a test can replay C.
+#[cfg(test)]
+pub(crate) fn seed_thread(seed: u16) {
+    SEED.with(|s| s.set(seed));
+    BASE_SEED.with(|s| s.set(seed));
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// The exact first draws of compiled C from the fixed seed:
+    /// C's fixed seed (`calcPerform.c:516` at R7.0.10, `sCalcPerform.c:2071`,
+    /// `aCalcPerform.c:1659`).
+    const C_SEED: u16 = 0xa3bf;
+
+    /// CBUG-A4: C starts every generator at `C_SEED`, so each boot replays one
+    /// sequence. Eight fresh threads all drawing C's first value from either
+    /// generator would mean the port still does.
+    #[test]
+    fn fresh_threads_do_not_start_from_the_c_seed() {
+        let s1 = C_SEED.wrapping_mul(RAND_MULTY).wrapping_add(RAND_ADDY);
+        let firsts: Vec<(f64, f64)> = (0..8)
+            .map(|_| {
+                std::thread::spawn(|| (calc_random(), local_random()))
+                    .join()
+                    .unwrap()
+            })
+            .collect();
+        assert!(firsts.iter().any(|(b, _)| *b != f64::from(s1) / 65535.0));
+        assert!(
+            firsts
+                .iter()
+                .any(|(_, l)| *l != f64::from(u32::from(s1) + 1) / 65536.0)
+        );
+    }
+
+    /// The exact first draws of compiled C from its seed:
     /// 0xa3bf*1533+0x3141 = 0x1c7c (wrapping u16), +1 = 0x1c7d → /65536.
     #[test]
-    fn replays_c_sequence_from_the_fixed_seed() {
+    fn replays_c_sequence_from_the_c_seed() {
         let expected = {
-            let mut s: u16 = RAND_SEED;
+            let mut s: u16 = C_SEED;
             let mut out = Vec::new();
             for _ in 0..4 {
                 s = s.wrapping_mul(RAND_MULTY).wrapping_add(RAND_ADDY);
@@ -94,11 +117,12 @@ mod tests {
             }
             out
         };
-        // Fresh thread: seed starts at RAND_SEED regardless of what other
-        // tests on this thread drew (C's seed is thread-private).
-        let got = std::thread::spawn(|| (0..4).map(|_| local_random()).collect::<Vec<_>>())
-            .join()
-            .unwrap();
+        let got = std::thread::spawn(|| {
+            seed_thread(C_SEED);
+            (0..4).map(|_| local_random()).collect::<Vec<_>>()
+        })
+        .join()
+        .unwrap();
         assert_eq!(got, expected);
     }
 
@@ -123,34 +147,19 @@ mod tests {
         .unwrap();
     }
 
-    /// The opt-in reseed changes this thread's sequence only.
-    #[test]
-    fn time_seeding_is_opt_in_and_per_thread() {
-        std::thread::spawn(|| {
-            seed_random_from_time();
-            let _ = local_random(); // draws fine from any seed
-            let _ = calc_random();
-        })
-        .join()
-        .unwrap();
-        // A fresh thread still replays C.
-        let first = std::thread::spawn(local_random).join().unwrap();
-        let expected =
-            f64::from(u32::from(RAND_SEED.wrapping_mul(RAND_MULTY).wrapping_add(RAND_ADDY)) + 1)
-                / 65536.0;
-        assert_eq!(first, expected);
-    }
-
     /// base `calcRandom` is NOT `local_random`: same LCG, different mapping.
     /// The first draw of compiled C is 49156/65535, and synApps' is
     /// 49157/65536 — they differ in the sixth decimal.
     #[test]
     fn base_generator_replays_calc_random_not_local_random() {
-        let got = std::thread::spawn(|| (0..4).map(|_| calc_random()).collect::<Vec<_>>())
-            .join()
-            .unwrap();
+        let got = std::thread::spawn(|| {
+            seed_thread(C_SEED);
+            (0..4).map(|_| calc_random()).collect::<Vec<_>>()
+        })
+        .join()
+        .unwrap();
         let expected = {
-            let mut s: u16 = RAND_SEED;
+            let mut s: u16 = C_SEED;
             let mut out = Vec::new();
             for _ in 0..4 {
                 s = s.wrapping_mul(RAND_MULTY).wrapping_add(RAND_ADDY);
@@ -168,13 +177,14 @@ mod tests {
     #[test]
     fn the_two_seeds_are_independent() {
         let (base_first, s_first) = std::thread::spawn(|| {
+            seed_thread(C_SEED);
             let _ = local_random(); // advance synApps' seed only
             let _ = local_random();
             (calc_random(), local_random())
         })
         .join()
         .unwrap();
-        let s1 = RAND_SEED.wrapping_mul(RAND_MULTY).wrapping_add(RAND_ADDY);
+        let s1 = C_SEED.wrapping_mul(RAND_MULTY).wrapping_add(RAND_ADDY);
         assert_eq!(base_first, f64::from(s1) / 65535.0, "base seed advanced");
         // s_first is the THIRD draw of the synApps seed (two before it).
         let s3 = s1

@@ -699,12 +699,15 @@ mod parity_tests {
     /// base RNDM replays `calcRandom` (`calcPerform.c:518-523`), NOT sCalc's
     /// `local_random`: the first draw of compiled C is 49156/65535
     /// (0.75007248…), where synApps' is 49157/65536 (0.75007629…).
-    /// A fresh thread, because the seed is thread-private.
+    /// Seeded as C, on a fresh thread because the seed is thread-private.
     #[test]
     fn l4_random_first_draws_are_base_c_not_synapps() {
-        let got = std::thread::spawn(|| (0..3).map(|_| run("RNDM")).collect::<Vec<_>>())
-            .join()
-            .unwrap();
+        let got = std::thread::spawn(|| {
+            crate::calc::engine::random::seed_thread(0xa3bf);
+            (0..3).map(|_| run("RNDM")).collect::<Vec<_>>()
+        })
+        .join()
+        .unwrap();
         let mut s: u16 = 0xa3bf;
         let expected: Vec<f64> = (0..3)
             .map(|_| {

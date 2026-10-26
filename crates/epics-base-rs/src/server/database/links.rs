@@ -4009,9 +4009,9 @@ impl PvDatabase {
     }
 
     /// Resolve an OUT link's TARGET metadata — the DBF field type, the
-    /// element capacity, and whether C would classify the link as a
-    /// `CA_LINK`. Single owner of the target-metadata lookup every soft
-    /// device support's write-buffer switch reads
+    /// element capacity, and C's `plink->type` after `dbInitLink`
+    /// ([`OutTarget::link_type`]). Single owner of the target-metadata
+    /// lookup every soft device support's write-buffer switch reads
     /// ([`Record::multi_output_buffer`](crate::server::record::Record::multi_output_buffer)).
     ///
     /// C's resolution, mirrored branch for branch:
@@ -4021,17 +4021,20 @@ impl PvDatabase {
     ///   (`field_type = 0`, `n_elements = 1`) — the port reports
     ///   [`OutTarget::UNRESOLVED`], whose `None` type routes to the device
     ///   support's `default:` arm.
-    /// - external target (explicit `ca://`/`pva://` OR a DB-parsed name not
-    ///   in this IOC, which C classifies as a CA link) —
-    ///   `dbCaGetLinkDBFtype` / `dbCaGetNelements` (`dbCa.c:633-675`,
-    ///   both `-1` while disconnected): the lset's cached
-    ///   [`LinkMetadata`](super::LinkMetadata), `UNRESOLVED` when the link is down.
+    /// - external target (a `CA`/`ca://` link, a DB-parsed name not in this
+    ///   IOC, or a PV Access link) — `dbCaGetLinkDBFtype` / `dbCaGetNelements`
+    ///   (`dbCa.c:633-675`, both `-1` while disconnected): the lset's cached
+    ///   [`LinkMetadata`](super::LinkMetadata), `UNRESOLVED` when the link is
+    ///   down. Only the first two are C `CA_LINK`s; a PV Access link is a
+    ///   `JSON_LINK` ([`ParsedLink::link_type`](crate::server::record::ParsedLink::link_type)),
+    ///   which C's own type switches send to their `default:` arm.
     ///
     /// `no_elements` is a field CAPACITY, which the port does not carry per
     /// field: an array field reports its record's `NELM` when it has one and
     /// its current length otherwise; a scalar field reports 1.
     pub(crate) fn resolve_out_target(&self, link: &crate::server::record::ParsedLink) -> OutTarget {
-        let external = |link: crate::server::record::ExternalRef<'_>| {
+        use crate::server::record::LinkType;
+        let external = |link: crate::server::record::ExternalRef<'_>, link_type: LinkType| {
             let put_admitted = self.external_put_admitted(link).is_ok();
             match self.external_link_metadata(link) {
                 // A remote channel reports the DBR type its DBF class is
@@ -4042,13 +4045,11 @@ impl PvDatabase {
                     field_type: m.dbf_type.map(|t| link_dbf_to_field_type(t).dbf_code()),
                     dbr_field_type: m.dbf_type.map(link_dbf_to_field_type),
                     element_count: m.element_count.unwrap_or(1).max(1),
-                    is_ca_link: true,
-                    constant_type: false,
+                    link_type,
                     put_admitted,
                 },
                 None => OutTarget {
-                    is_ca_link: true,
-                    constant_type: false,
+                    link_type,
                     put_admitted,
                     ..OutTarget::UNRESOLVED
                 },
@@ -4058,7 +4059,7 @@ impl PvDatabase {
             crate::server::record::ParsedLink::Db(db) => {
                 // A DB link is never `CONSTANT`, addressable or not.
                 const UNADDRESSED: OutTarget = OutTarget {
-                    constant_type: false,
+                    link_type: LinkType::Db,
                     ..OutTarget::UNRESOLVED
                 };
                 let addressed = db.target();
@@ -4066,7 +4067,7 @@ impl PvDatabase {
                     LinkTarget::Local(rec) => rec,
                     LinkTarget::LocalNotRecord => return UNADDRESSED,
                     // Non-local ⇒ CA link in C (`dbInitLink` locality).
-                    LinkTarget::External => return external(db.external()),
+                    LinkTarget::External => return external(db.external(), LinkType::Ca),
                 };
                 let guard = target.read();
                 // `dbNameToAddr` of a `$` address: a string's `DBF_CHAR` view,
@@ -4078,8 +4079,7 @@ impl PvDatabase {
                             field_type: Some(view.field_type),
                             dbr_field_type: Some(DbFieldType::Char),
                             element_count: (view.no_elements as i64).max(1),
-                            is_ca_link: false,
-                            constant_type: false,
+                            link_type: LinkType::Db,
                             put_admitted: true,
                         },
                         None => UNADDRESSED,
@@ -4103,16 +4103,16 @@ impl PvDatabase {
                     field_type,
                     dbr_field_type: field_type.and_then(crate::types::DbfCode::served_type),
                     element_count: element_count.max(1),
-                    is_ca_link: false,
-                    constant_type: false,
+                    link_type: LinkType::Db,
                     put_admitted: true,
                 }
             }
             crate::server::record::ParsedLink::Ca(_)
             | crate::server::record::ParsedLink::Pva(_)
-            | crate::server::record::ParsedLink::PvaJson(_) => {
-                external(link.external().expect("Ca/Pva/PvaJson link is external"))
-            }
+            | crate::server::record::ParsedLink::PvaJson(_) => external(
+                link.external().expect("Ca/Pva/PvaJson link is external"),
+                link.link_type(),
+            ),
             // C `lnkState_getDBFtype`/`lnkState_getElements`
             // (`lnkState.c:126-135`): one `DBF_SHORT` element, and never a
             // string.
@@ -4120,14 +4120,17 @@ impl PvDatabase {
                 field_type: Some(crate::types::DbfCode::Short),
                 dbr_field_type: Some(DbFieldType::Short),
                 element_count: 1,
-                is_ca_link: false,
-                constant_type: false,
+                link_type: LinkType::Json,
                 put_admitted: true,
             },
             // Constant / Hw / Calc / None / Removed: no target. The type is
             // the one the link holds — a removed DB link's is `PV_LINK`.
             _ => OutTarget {
-                constant_type: link.db_link_type() == crate::server::record::DbLinkType::Constant,
+                link_type: match link.db_link_type() {
+                    crate::server::record::DbLinkType::Constant => LinkType::Constant,
+                    crate::server::record::DbLinkType::JsonLink => LinkType::Json,
+                    _ => LinkType::Other,
+                },
                 ..OutTarget::UNRESOLVED
             },
         }

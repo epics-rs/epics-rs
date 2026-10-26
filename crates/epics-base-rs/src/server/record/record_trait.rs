@@ -3,6 +3,7 @@ use crate::types::c_parse::Converted;
 use crate::types::{DbFieldType, DbfCode, EpicsValue, PvString, Scalar, c_parse};
 
 use super::CommonFields;
+use super::LinkType;
 use super::alarm::{AlarmLimit, AlarmSeverity};
 use super::record_instance::FieldIx;
 use super::scan::ScanType;
@@ -954,16 +955,14 @@ pub struct OutTarget {
     /// Target field's element capacity — C `no_elements` / `dbCaGetNelements`.
     /// `1` when unresolved, matching C's `n_elements = 1` initializer.
     pub element_count: i64,
-    /// True when C would classify this link as a `CA_LINK`: an explicit
-    /// `ca://`/`pva://` link, or a DB-style name that is not a record of
-    /// this IOC (`dbInitLink` locality). Device support that splits its
-    /// buffer choice on sync-vs-async (`devsCalcoutSoft.c:76`, gated on
-    /// `plink->type == CA_LINK && pscalcout->wait`) reads this.
-    pub is_ca_link: bool,
-    /// C `plink->type == CONSTANT`, the test `tableRecord.c:2321` makes —
-    /// not `dbLinkIsConstant`, which a removed link also answers: its type
-    /// stays `PV_LINK` (`dbDbLink.c:132`) while it has no target.
-    pub constant_type: bool,
+    /// C `plink->type` once `dbInitLink` has run, the value every
+    /// `plink->type == CA_LINK` / `CONSTANT` test in device support reads
+    /// (`devsCalcoutSoft.c:78`, `:113`, `sseqRecord.c:717`,
+    /// `tableRecord.c:2321`): `Ca` for a `CA`/`ca://` link or a DB-style name
+    /// not served here, `Json` for a PV Access link, `Constant` for a literal
+    /// or an empty link. A removed DB or CA link keeps `PV_LINK`
+    /// (`dbDbLink.c:132`), which is `Other`, not `Constant`.
+    pub link_type: LinkType,
     /// C `dbCaPutLinkCallback`'s gate, `isConnected && hasWriteAccess`
     /// (`dbCa.c:529-532`), read at resolution from the link the record holds.
     /// `true` for a link that never reaches that gate (local, constant, none).
@@ -979,8 +978,7 @@ impl OutTarget {
         field_type: None,
         dbr_field_type: None,
         element_count: 1,
-        is_ca_link: false,
-        constant_type: true,
+        link_type: LinkType::Constant,
         put_admitted: true,
     };
 }

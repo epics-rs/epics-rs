@@ -1319,6 +1319,43 @@ fn test_db_trig_link_synchronous_fallthrough() {
     );
 }
 
+/// A PV Access TRIG link is C's `JSON_LINK`, so `ptriglink->type !=
+/// CA_LINK` holds (`devEpidSoftCallback.c:117-127`): `dbPutLink` without
+/// waiting, and the PID runs in the same pass.
+#[test]
+fn a_pva_trig_link_is_written_without_a_second_pass() {
+    let mut rec = EpidRecord::default();
+    let mut dpvt = Dpvt::Null;
+    rec.trig = r#"{pva:"REMOTE:READBACK"}"#.into();
+    assert_eq!(link_field_type(&rec.trig), LinkType::Json);
+    rec.kp = 1.0;
+    rec.fbon = 1;
+    rec.fbop = 1;
+
+    rec.set_process_context(&ctx_with_dtyp("Async Soft Channel"));
+    let pre = pre_input(&mut rec, &mut dpvt, &[]);
+    assert!(
+        pre.iter().any(|a| matches!(
+            a,
+            ProcessAction::WriteDbLink {
+                link_field: "TRIG",
+                ..
+            }
+        )),
+        "a pva TRIG is written, got {pre:?}"
+    );
+    assert!(
+        !pre.iter()
+            .any(|a| matches!(a, ProcessAction::ReprocessAfter(_))),
+        "a pva TRIG is not waited on, got {pre:?}"
+    );
+    let mut dev = EpidSoftCallbackDeviceSupport::new();
+    assert!(
+        dev.read(&mut rec).expect("read ok").did_compute(),
+        "PID runs this pass"
+    );
+}
+
 /// A non-callback DSET (`devEpidSoft`, DTYP "Soft Channel") has no
 /// TRIG handling — `pre_input_link_actions` must emit nothing even
 /// when a DB TRIG link is configured.
@@ -1458,6 +1495,30 @@ fn test_bumpless_edge_no_readback_for_constant_outl() {
     assert!(
         actions.is_empty(),
         "CONSTANT OUTL must not emit a bumpless readback"
+    );
+}
+
+/// Any `OUTL` that is not `CONSTANT` is read on the edge
+/// (`devEpidSoft.c:154`), a `JSON_LINK` such as a calc link included.
+#[test]
+fn test_bumpless_edge_reads_a_json_outl() {
+    let mut rec = EpidRecord::default();
+    rec.outl = r#"{calc: {expr: "5"}}"#.into();
+    assert_eq!(link_field_type(&rec.outl), LinkType::Json);
+    rec.fmod = 0;
+    rec.fbon = 1;
+    rec.fbop = 0;
+
+    let actions = rec.pre_process_actions();
+    assert!(
+        actions.iter().any(|a| matches!(
+            a,
+            ProcessAction::ReadDbLink {
+                link_field: "OUTL",
+                ..
+            }
+        )),
+        "a JSON OUTL is read on the edge, got {actions:?}"
     );
 }
 

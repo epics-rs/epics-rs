@@ -575,16 +575,16 @@ impl Record for EpidRecord {
         // behind must not be mistaken for this cycle's OUTL value.
         self.outl_seed = None;
         let edge = self.fbon != 0 && self.fbop == 0;
-        if edge {
-            match link_field_type(&self.outl) {
-                LinkType::Db | LinkType::Ca => {
-                    return ProcessActions::from(vec![ProcessAction::ReadDbLink {
-                        link_field: "OUTL",
-                        target_field: OUTL_SEED_FIELD,
-                    }]);
-                }
-                _ => {}
-            }
+        if edge
+            && !matches!(
+                link_field_type(&self.outl),
+                LinkType::Constant | LinkType::Empty
+            )
+        {
+            return ProcessActions::from(vec![ProcessAction::ReadDbLink {
+                link_field: "OUTL",
+                target_field: OUTL_SEED_FIELD,
+            }]);
         }
         ProcessActions::new()
     }
@@ -1265,7 +1265,10 @@ impl Record for EpidRecord {
             value: EpicsValue::Double(self.tval),
         };
         Some(match link_field_type(&self.trig) {
-            LinkType::Db => ProcessActions::from(vec![write]),
+            // C `ptriglink->type != CA_LINK` (`devEpidSoftCallback.c:117`),
+            // a PV Access link's `JSON_LINK` too: `dbPutLink`, and the PID
+            // runs in this pass.
+            LinkType::Db | LinkType::Json => ProcessActions::from(vec![write]),
             LinkType::Ca => {
                 *dpvt = Dpvt::Triggered;
                 self.trigger_pass = true;

@@ -2,7 +2,7 @@ use super::calc_compile;
 use crate::error::{CaError, CaResult};
 use crate::server::record::{CycleCell, CycleRead, CycleValue};
 use crate::server::record::{
-    InputFetchPolicy, OutTarget, ProcessAction, ProcessActions, ProcessOutcome, Record,
+    InputFetchPolicy, LinkType, OutTarget, ProcessAction, ProcessActions, ProcessOutcome, Record,
     RecordProcessResult,
 };
 use crate::types::{DbfCode, EpicsValue, PvString};
@@ -372,9 +372,11 @@ impl ScalcoutRecord {
     /// `WAIT` on a non-CA link is inert here, which is C: `init_record`
     /// (`sCalcoutRecord.c:275-277`), `special` (`:552-554`) and `checkLinks`
     /// (`:1034-1036`) each print "Can't wait with non-CA link attribute" and
-    /// leave the put synchronous.
+    /// leave the put synchronous. A PV Access link is one: C types it
+    /// `JSON_LINK`.
     fn issue_wait_put(&mut self) -> Option<ProcessOutcome> {
-        if !self.cached_should_output || self.wait == 0 || !self.out_target.is_ca_link {
+        if !self.cached_should_output || self.wait == 0 || self.out_target.link_type != LinkType::Ca
+        {
             return None;
         }
         let target = self.out_target;
@@ -1841,6 +1843,12 @@ impl Record for ScalcoutRecord {
     /// - anything else, including an unresolved (disconnected CA) target
     ///   whose `dbCaGetLinkDBFtype` returned `-1` (:99, :140) —
     ///   `DBR_DOUBLE` from `OVAL`, the staged value.
+    ///
+    /// The synchronous branch reads the target's type only through
+    /// `switch (plink->type)` (:113-125), whose `CA_LINK` and `DB_LINK` arms
+    /// are the only ones that set `field_type`; any other link (a `JSON_LINK`
+    /// such as `{pva:}` or `{state:}`, a `CONSTANT`) keeps `field_type = 0`,
+    /// which is `DBF_STRING`, and takes the `DBR_STRING` put of OSV.
     fn multi_output_buffer(
         &self,
         link_field: &str,
@@ -1850,7 +1858,11 @@ impl Record for ScalcoutRecord {
         if link_field != "OUT" {
             return staged;
         }
-        match target.field_type {
+        let field_type = match target.link_type {
+            LinkType::Ca | LinkType::Db => target.field_type,
+            _ => Some(DbfCode::String),
+        };
+        match field_type {
             Some(
                 DbfCode::String
                 | DbfCode::Enum
@@ -1866,7 +1878,7 @@ impl Record for ScalcoutRecord {
                 let n = target.element_count.min(SCALC_STRING_SIZE as i64) as usize;
                 // C puts `n` bytes straight out of the 40-byte field, so the
                 // string is NUL-padded out to the requested count.
-                let async_put = target.is_ca_link && self.wait != 0;
+                let async_put = target.link_type == LinkType::Ca && self.wait != 0;
                 let src = if async_put { &self.osv } else { &self.sval };
                 let mut buf = src.as_bytes().to_vec();
                 buf.resize(n, 0);
@@ -2455,13 +2467,16 @@ mod tests {
     }
 
     /// A target as `PvDatabase::resolve_out_target` reports it.
-    fn out_target(field_type: Option<DbfCode>, element_count: i64, is_ca_link: bool) -> OutTarget {
+    fn out_target(
+        field_type: Option<DbfCode>,
+        element_count: i64,
+        link_type: LinkType,
+    ) -> OutTarget {
         OutTarget {
             field_type,
             dbr_field_type: field_type.and_then(DbfCode::served_type),
             element_count,
-            is_ca_link,
-            constant_type: false,
+            link_type,
             put_admitted: true,
         }
     }
@@ -2474,7 +2489,11 @@ mod tests {
         let rec = three_buffer_scalcout();
         let staged = EpicsValue::Double(rec.oval);
         assert_eq!(
-            rec.multi_output_buffer("OUT", staged, &out_target(Some(DbfCode::String), 1, false)),
+            rec.multi_output_buffer(
+                "OUT",
+                staged,
+                &out_target(Some(DbfCode::String), 1, LinkType::Db)
+            ),
             EpicsValue::String("ocal-str".into())
         );
     }
@@ -2486,7 +2505,11 @@ mod tests {
         let rec = three_buffer_scalcout();
         let staged = EpicsValue::Double(rec.oval);
         assert_eq!(
-            rec.multi_output_buffer("OUT", staged, &out_target(Some(DbfCode::Enum), 1, false)),
+            rec.multi_output_buffer(
+                "OUT",
+                staged,
+                &out_target(Some(DbfCode::Enum), 1, LinkType::Db)
+            ),
             EpicsValue::String("ocal-str".into())
         );
     }
@@ -2499,7 +2522,11 @@ mod tests {
         let rec = three_buffer_scalcout();
         let staged = EpicsValue::Double(rec.oval);
         assert_eq!(
-            rec.multi_output_buffer("OUT", staged, &out_target(Some(DbfCode::Menu), 1, false)),
+            rec.multi_output_buffer(
+                "OUT",
+                staged,
+                &out_target(Some(DbfCode::Menu), 1, LinkType::Db)
+            ),
             EpicsValue::String("ocal-str".into()),
             "a DBF_MENU target takes DBR_STRING from OSV, not DBR_DOUBLE from OVAL"
         );
@@ -2512,7 +2539,11 @@ mod tests {
         let rec = three_buffer_scalcout();
         let staged = EpicsValue::Double(rec.oval);
         assert_eq!(
-            rec.multi_output_buffer("OUT", staged, &out_target(Some(DbfCode::Double), 1, false)),
+            rec.multi_output_buffer(
+                "OUT",
+                staged,
+                &out_target(Some(DbfCode::Double), 1, LinkType::Db)
+            ),
             EpicsValue::Double(7.0)
         );
     }
@@ -2528,7 +2559,11 @@ mod tests {
         let mut want = b"calc-str".to_vec();
         want.resize(12, 0);
         assert_eq!(
-            rec.multi_output_buffer("OUT", staged, &out_target(Some(DbfCode::Char), 12, false)),
+            rec.multi_output_buffer(
+                "OUT",
+                staged,
+                &out_target(Some(DbfCode::Char), 12, LinkType::Db)
+            ),
             EpicsValue::CharArray(want.into())
         );
     }
@@ -2543,7 +2578,11 @@ mod tests {
         let mut want = b"ocal-str".to_vec();
         want.resize(12, 0);
         assert_eq!(
-            rec.multi_output_buffer("OUT", staged, &out_target(Some(DbfCode::Char), 12, true)),
+            rec.multi_output_buffer(
+                "OUT",
+                staged,
+                &out_target(Some(DbfCode::Char), 12, LinkType::Ca)
+            ),
             EpicsValue::CharArray(want.into())
         );
     }
@@ -2559,7 +2598,11 @@ mod tests {
         let mut want = b"calc-str".to_vec();
         want.resize(12, 0);
         assert_eq!(
-            rec.multi_output_buffer("OUT", staged, &out_target(Some(DbfCode::Char), 12, false)),
+            rec.multi_output_buffer(
+                "OUT",
+                staged,
+                &out_target(Some(DbfCode::Char), 12, LinkType::Db)
+            ),
             EpicsValue::CharArray(want.into())
         );
     }
@@ -2570,8 +2613,11 @@ mod tests {
     fn r14_61_char_array_target_clamps_to_40() {
         let rec = three_buffer_scalcout();
         let staged = EpicsValue::Double(rec.oval);
-        let out =
-            rec.multi_output_buffer("OUT", staged, &out_target(Some(DbfCode::UChar), 100, false));
+        let out = rec.multi_output_buffer(
+            "OUT",
+            staged,
+            &out_target(Some(DbfCode::UChar), 100, LinkType::Db),
+        );
         match out {
             EpicsValue::CharArray(b) => assert_eq!(b.len(), 40),
             other => panic!("expected a CHAR array, got {other:?}"),
@@ -2588,7 +2634,7 @@ mod tests {
             rec.multi_output_buffer(
                 "OUT",
                 staged.clone(),
-                &out_target(Some(DbfCode::Char), 1, false)
+                &out_target(Some(DbfCode::Char), 1, LinkType::Db)
             ),
             staged
         );
@@ -2603,7 +2649,7 @@ mod tests {
             rec.multi_output_buffer(
                 "OUT",
                 staged.clone(),
-                &out_target(Some(DbfCode::Double), 1, false)
+                &out_target(Some(DbfCode::Double), 1, LinkType::Db)
             ),
             staged
         );
@@ -2622,11 +2668,28 @@ mod tests {
                 "OUT",
                 staged.clone(),
                 &OutTarget {
-                    is_ca_link: true,
+                    link_type: LinkType::Ca,
                     ..OutTarget::UNRESOLVED
                 }
             ),
             staged
+        );
+    }
+
+    /// The synchronous `switch (plink->type)` (C `:113-125`) reads a type
+    /// only for `CA_LINK` and `DB_LINK`: a `JSON_LINK` to a numeric target
+    /// keeps `field_type = 0`, `DBF_STRING`, and takes OSV.
+    #[test]
+    fn a_json_link_target_gets_osv() {
+        let rec = three_buffer_scalcout();
+        let staged = EpicsValue::Double(rec.oval);
+        assert_eq!(
+            rec.multi_output_buffer(
+                "OUT",
+                staged,
+                &out_target(Some(DbfCode::Double), 1, LinkType::Json)
+            ),
+            EpicsValue::String("ocal-str".into())
         );
     }
 }

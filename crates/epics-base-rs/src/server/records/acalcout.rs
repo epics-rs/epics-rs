@@ -2490,7 +2490,10 @@ impl Record for AcalcoutRecord {
     /// `dbCaGetNelements` (resolved by the framework into `target`), clamped
     /// by the source count `i = (nuse > 0) ? nuse : nelm` (:82-83) — the
     /// staged array's served length here, so a 1-element source picks the
-    /// scalar whatever the target is.
+    /// scalar whatever the target is. C sizes only a `CA_LINK` or a `DB_LINK`
+    /// (:75-80): for a JSON link it reads the inactive `pv_link.pvname`, NULL
+    /// after `dbStaticLib.c:135`'s memset, so it writes one element and drops
+    /// the array. That C defect is not copied; every link uses its own count.
     fn multi_output_buffer(
         &self,
         link_field: &str,

@@ -2008,6 +2008,7 @@ impl CaLink {
 /// ```text
 /// #define CONSTANT  0   -> LinkType::Constant
 /// #define PV_LINK   1   -> (unresolved; resolves to Db or Ca)
+/// #define JSON_LINK 8   -> LinkType::Json
 /// #define DB_LINK   10  -> LinkType::Db
 /// #define CA_LINK   11  -> LinkType::Ca
 /// ```
@@ -2027,13 +2028,18 @@ pub enum LinkType {
     /// `DB_LINK` — a reference to a record.field in *this* IOC's
     /// database. C `link.h` `#define DB_LINK 10`.
     Db,
-    /// `CA_LINK` — a reference to a PV reached over Channel Access /
-    /// PV Access (a remote PV). C `link.h` `#define CA_LINK 11`.
+    /// `CA_LINK` — a reference to a PV reached over Channel Access (a
+    /// remote PV, or a link carrying `CA`). C `link.h` `#define CA_LINK 11`.
     Ca,
-    /// A hardware (`@dev …` / `#Cn Sn`) or `lnkCalc` JSON link — not
-    /// one of the C `link.h` value-bearing scalar discriminants the
-    /// records in this task care about. Kept distinct so a caller is
-    /// never forced to mis-classify it.
+    /// `JSON_LINK` — a link served by a JSON link type's lset: `{pva:…}`
+    /// (and this port's `pva://` spelling of it), `{calc:…}`, `{state:…}`.
+    /// C `link.h` `#define JSON_LINK 8`, so every C `type == CA_LINK` test
+    /// is false for a PV Access link.
+    Json,
+    /// Any other C type: a hardware (`@dev …` / `#Cn Sn`) link, or the
+    /// `PV_LINK` a removed DB or CA link keeps
+    /// ([`OutTarget::link_type`](crate::server::record::OutTarget::link_type)).
+    /// Kept distinct so a caller is never forced to mis-classify it.
     Other,
 }
 
@@ -2445,8 +2451,12 @@ impl ParsedLink {
             ParsedLink::None | ParsedLink::Removed(_) => LinkType::Empty,
             ParsedLink::Constant(_) => LinkType::Constant,
             ParsedLink::Db(_) => LinkType::Db,
-            ParsedLink::Ca(_) | ParsedLink::Pva(_) | ParsedLink::PvaJson(_) => LinkType::Ca,
-            ParsedLink::Hw(_) | ParsedLink::Calc(_) | ParsedLink::State(_) => LinkType::Other,
+            ParsedLink::Ca(_) => LinkType::Ca,
+            ParsedLink::Pva(_)
+            | ParsedLink::PvaJson(_)
+            | ParsedLink::Calc(_)
+            | ParsedLink::State(_) => LinkType::Json,
+            ParsedLink::Hw(_) => LinkType::Other,
         }
     }
 
@@ -5248,8 +5258,15 @@ mod json_link_tests {
     #[test]
     fn link_type_ca_link() {
         assert_eq!(link_field_type("ca://REMOTE:PV"), LinkType::Ca);
-        assert_eq!(link_field_type("pva://REMOTE:PV"), LinkType::Ca);
         assert_eq!(link_field_type(r#"{ca: { pv: "REMOTE" }}"#), LinkType::Ca);
+    }
+
+    /// A PV Access link is C's `JSON_LINK` (`dbStaticLib.c:2280-2287`),
+    /// never `CA_LINK`, whichever form names it.
+    #[test]
+    fn link_type_pva_is_json() {
+        assert_eq!(link_field_type("pva://REMOTE:PV"), LinkType::Json);
+        assert_eq!(link_field_type(r#"{pva: "REMOTE"}"#), LinkType::Json);
     }
 
     /// BOUNDARY: a comment inside a `.db` link body. `yajl_alloc` sets
@@ -5366,13 +5383,13 @@ mod json_link_tests {
     }
 
     #[test]
-    fn link_type_hw_and_calc_are_other() {
+    fn link_type_hw_is_other_and_calc_is_json() {
         assert_eq!(link_field_type("@dev 0 IN"), LinkType::Other);
         assert_eq!(link_field_type("#C0 S2"), LinkType::Other);
         // Link bodies are JSON5; strict JSON is the subset that also parses.
         assert_eq!(
             link_field_type(r#"{calc: {"expr": "A+1", "args": ["pv1"]}}"#),
-            LinkType::Other
+            LinkType::Json
         );
     }
 
@@ -5645,7 +5662,7 @@ mod json_link_tests {
         let link = parse_link_v2(r#"{pva: {pv: "TARGET:AI", proc: "CP"}}"#);
         let key = link.external_pv_name().expect("PvaJson carries a key");
         assert_eq!(key, &b"pva://TARGET:AI\x1fproc=s:CP"[..]);
-        assert_eq!(link.link_type(), LinkType::Ca);
+        assert_eq!(link.link_type(), LinkType::Json);
         assert!(link.is_writable_out_link());
     }
 

@@ -13,7 +13,7 @@ use epics_base_rs::error::{CaError, CaResult};
 use epics_base_rs::server::database::AsyncDbHandle;
 use epics_base_rs::server::record::{
     CycleMarks, CyclePostMask, FieldDeclaration, FieldDesc, FieldMetadataOverride,
-    InputLinkRequest, LinkRead, LinkReadAs, OutTarget, ProcessAction, ProcessActions,
+    InputLinkRequest, LinkRead, LinkReadAs, LinkType, OutTarget, ProcessAction, ProcessActions,
     ProcessOutcome, Record, ReturnPact, StampPoint,
 };
 use epics_base_rs::types::{EpicsValue, PvString};
@@ -173,7 +173,9 @@ enum LinkKind {
     /// this IOC cannot address at all.
     #[default]
     Constant,
-    /// C `DB_LINK`: a field of a record on this IOC.
+    /// Neither `CONSTANT` nor `CA_LINK`, which `checkLinks` treats alike: a
+    /// `DB_LINK` to a field of a record on this IOC, a PV Access `JSON_LINK`,
+    /// or the `PV_LINK` a removed link keeps.
     Db,
     /// C `CA_LINK` with `dbCaIsLinkConnected() == 1`.
     CaConnected,
@@ -184,17 +186,16 @@ enum LinkKind {
 impl LinkKind {
     /// Read the kind out of the framework's own link resolution
     /// (`PvDatabase::resolve_out_target`), which is the port's single owner of
-    /// this question. `is_ca_link` is C's `dbInitLink` locality test, and
-    /// `field_type` is `Some` only for a target the IOC can address right now
-    /// — so an external link with no cached value is exactly C's
-    /// `dbCaIsLinkConnected() == 0`. Any other link is `Constant` only when
-    /// its type is, as `checkLinks` tests: a removed DB link is `PV_LINK`.
+    /// this question. `link_type` is C's `plink->type`, and `field_type` is
+    /// `Some` only for a target the IOC can address right now — so a
+    /// `CA_LINK` with no cached value is exactly C's
+    /// `dbCaIsLinkConnected() == 0`.
     fn from_target(target: &OutTarget) -> Self {
-        match (target.is_ca_link, target.field_type.is_some()) {
-            (true, true) => LinkKind::CaConnected,
-            (true, false) => LinkKind::CaDisconnected,
-            (false, _) if target.constant_type => LinkKind::Constant,
-            (false, _) => LinkKind::Db,
+        match target.link_type {
+            LinkType::Ca if target.field_type.is_some() => LinkKind::CaConnected,
+            LinkType::Ca => LinkKind::CaDisconnected,
+            LinkType::Constant | LinkType::Empty => LinkKind::Constant,
+            LinkType::Db | LinkType::Json | LinkType::Other => LinkKind::Db,
         }
     }
 }

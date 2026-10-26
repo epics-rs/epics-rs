@@ -795,8 +795,10 @@ impl SseqRecord {
         // a DB link takes the plain `dbPutLink` and never waits — C cannot
         // attach a callback to it, and says so through `WERRn` (`checkLinks`,
         // :915-927). The type is the resolved link's, not `LNKnV`: a `CA` link
-        // to a local record reads `Local PV` and waits.
-        let waits = self.steps[i].wait != 0 && self.steps[i].lnk_target.is_ca_link;
+        // to a local record reads `Local PV` and waits, a PV Access link
+        // (`JSON_LINK`) does not.
+        let waits = self.steps[i].wait != 0
+            && self.steps[i].lnk_target.link_type == crate::server::record::LinkType::Ca;
 
         if let Some(value) = buffer {
             if waits {

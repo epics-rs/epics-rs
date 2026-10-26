@@ -164,6 +164,20 @@ impl<'a> DbNameParts<'a> {
             tail: &rest[len..],
         }
     }
+
+    /// The field `dbFindFieldPart` looks up, `VAL` when none is given.
+    pub fn field_or_val(&self) -> &'a str {
+        if self.field.is_empty() {
+            "VAL"
+        } else {
+            self.field
+        }
+    }
+
+    /// The one modifier read is `$` (`dbAccess.c:682`).
+    pub fn char_view(&self) -> bool {
+        self.tail.first() == Some(&b'$')
+    }
 }
 
 /// C `dbIsValueField` (`dbAccess.c:463-469`): is this field the record
@@ -4073,6 +4087,26 @@ impl PvDatabase {
     pub(crate) fn resolve_addr(&self, rec: &Arc<RecordCell>, field: &str) -> Option<u32> {
         rec.resolve_addr(field)
             .or_else(|| self.attribute_field_type(rec, field).map(|_| 1))
+    }
+
+    /// `dbNameToAddr`'s `$` branch (`dbAccess.c:681-701`) on the address
+    /// [`Self::addressed_field_type`] gives `field`: its `field_type` and
+    /// `no_elements` then. A `DBF_STRING`, an attribute among them, becomes
+    /// `field_size` `DBF_CHAR`s (`:686-690`); a link keeps its type with
+    /// `PVLINK_STRINGSZ` (`dbDefs.h:79`) elements (`:692-696`); any other
+    /// field is `S_dbLib_fieldNotFound` (`:698-700`), `None`.
+    pub(crate) fn char_addressed(
+        &self,
+        rec: &RecordCell,
+        field: &str,
+        own: Option<&dyn Record>,
+    ) -> Option<(crate::types::DbFieldType, u32)> {
+        let addr = char_view::CharAddr::of(self, rec, field)?;
+        let field_type = match addr.source {
+            char_view::CharSource::Link => self.addressed_field_type(rec, field, own)?,
+            _ => crate::types::DbFieldType::Char,
+        };
+        Some((field_type, addr.no_elements as u32))
     }
 
     /// Synchronous existence check without resolver, taking no record lock:

@@ -1033,7 +1033,7 @@ impl StreamHooks {
             DOUBLE_FORMAT => DbFieldType::Double,
             _ => DbFieldType::String,
         };
-        let name = [addr.record.as_bytes(), b".", field.as_bytes()].concat();
+        let name = [addr.record.as_bytes(), b".", addr.field_part().as_bytes()].concat();
         let nelem = addr.no_elements as usize;
         // The frame for another record's field too: it is how a dbGet that
         // waits for that record serves the reads owed to this one.

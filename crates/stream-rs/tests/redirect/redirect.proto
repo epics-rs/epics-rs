@@ -57,3 +57,7 @@ intr_feed { in "%d %(it.VAL)d"; }
 
 # matchValue's debug line: the field buffer, expanded
 put_double { out "Q7"; in "%(t4.VAL)f"; }
+
+# a `$` address: a string field read and written as its characters
+dollar_out { out "%(sd.DESC$)s"; }
+dollar_in { out "Q8"; in "%(sd2.DESC$)s"; }

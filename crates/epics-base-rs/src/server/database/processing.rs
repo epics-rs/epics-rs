@@ -812,10 +812,25 @@ pub struct DbAddr {
     pub record: RecordName,
     /// The field as the record type declares it: `pfldDes->name`.
     pub field: String,
-    /// `field_type`, after `cvt_dbaddr`; `None` for `DBF_NOACCESS`.
+    /// `field_type`, after `cvt_dbaddr` and the `$` modifier; `None` for
+    /// `DBF_NOACCESS`.
     pub field_type: Option<DbFieldType>,
     /// `no_elements`.
     pub no_elements: u32,
+    /// The name carried `$`: `dbr_field_type` is `DBR_CHAR`, and the field
+    /// is read and put as its characters (`dbAccess.c:681-701`).
+    pub char_view: bool,
+}
+
+impl DbAddr {
+    /// The field part a by-name read or put takes this address by.
+    pub fn field_part(&self) -> std::borrow::Cow<'_, str> {
+        if self.char_view {
+            format!("{}$", self.field).into()
+        } else {
+            self.field.as_str().into()
+        }
+    }
 }
 
 /// A record its device support holds, as C device support holds its record
@@ -950,8 +965,13 @@ impl<'a> HeldInstance<'a> {
     /// not processed.
     pub fn db_put(&self, addr: &DbAddr, value: EpicsValue) -> DbResult {
         let visited = &mut **self.visited.borrow_mut();
-        self.db
-            .put_from_held(addr.record.as_bytes(), &addr.field, value, false, visited)
+        self.db.put_from_held(
+            addr.record.as_bytes(),
+            &addr.field_part(),
+            value,
+            false,
+            visited,
+        )
     }
 
     /// C `dbPutField(&addr, ...)`: [`Self::db_put`] past `dbPutField`'s
@@ -961,8 +981,9 @@ impl<'a> HeldInstance<'a> {
     /// an entry's hold, by the caller ([`FieldPut::Unheld`]).
     pub fn db_put_field(&self, addr: &DbAddr, value: EpicsValue) -> FieldPut {
         let record = addr.record.as_bytes();
+        let field = addr.field_part();
         if self.hold == Hold::Entry
-            && let Some((name, rec, field)) = self.db.link_field(record, &addr.field)
+            && let Some((name, rec, field)) = self.db.link_field(record, &field)
         {
             return match self.db.unheld_link_put(&rec, name, &field, value) {
                 Ok(put) => FieldPut::Unheld(put),
@@ -970,10 +991,7 @@ impl<'a> HeldInstance<'a> {
             };
         }
         let visited = &mut **self.visited.borrow_mut();
-        FieldPut::Done(
-            self.db
-                .put_from_held(record, &addr.field, value, true, visited),
-        )
+        FieldPut::Done(self.db.put_from_held(record, &field, value, true, visited))
     }
 
     /// C `dbProcess(precord)`.
@@ -1063,14 +1081,19 @@ impl AsyncDbHandle {
         held: Option<(&[u8], &dyn crate::server::record::Record)>,
     ) -> bool {
         let name = name.as_ref();
-        let (base, field) = super::parse_pv_name(name);
+        let parts = super::DbNameParts::of(name);
+        let field = parts.field_or_val();
         match held {
-            Some((own, rec)) if own == base => {
+            Some((own, rec)) if own == parts.record => {
+                let cell = || self.db().and_then(|db| Some((db.get_record(own)?, db)));
+                if parts.char_view() {
+                    return cell().is_some_and(|(cell, db)| {
+                        db.char_addressed(&cell, field, Some(rec)).is_some()
+                    });
+                }
                 rec.get_field(field).is_some()
-                    || self.db().is_some_and(|db| {
-                        db.get_record(base)
-                            .is_some_and(|cell| db.attribute_field_type(&cell, field).is_some())
-                    })
+                    || cell()
+                        .is_some_and(|(cell, db)| db.attribute_field_type(&cell, field).is_some())
             }
             _ => self.name_to_addr(name).is_some(),
         }
@@ -1103,8 +1126,13 @@ impl AsyncDbHandle {
         if let Some(pv) = db.simple_pv_bytes(name) {
             return Some(pv.snapshot().value.count() as u32);
         }
-        let (base, field) = super::parse_pv_name(name);
-        db.resolve_addr(&db.get_record(base)?, field)
+        let parts = super::DbNameParts::of(name);
+        let (rec, field) = (db.get_record(parts.record)?, parts.field_or_val());
+        let no_elements = db.resolve_addr(&rec, field)?;
+        if !parts.char_view() {
+            return Some(no_elements);
+        }
+        db.char_addressed(&rec, field, None).map(|(_, n)| n)
     }
 
     /// C `dbGet(&addr, dbr_type, buf, &options, &count, NULL)` with
@@ -1125,7 +1153,11 @@ impl AsyncDbHandle {
         count: usize,
         own: Option<OwnRecord<'_>>,
     ) -> Option<crate::server::snapshot::Snapshot> {
-        let mut snap = self.db()?.db_get_snapshot(name.as_ref(), own)?;
+        let request = CharGet {
+            dbr: dbr_type,
+            count,
+        };
+        let mut snap = self.db()?.db_get_snapshot(name.as_ref(), request, own)?;
         snap.value = crate::types::codec::snapshot_value_as(&snap, dbr_type).ok()?;
         snap.value.truncate(count);
         Some(snap)
@@ -1142,25 +1174,33 @@ impl AsyncDbHandle {
         own: Option<OwnRecord<'_>>,
     ) -> Option<DbAddr> {
         let db = self.db()?;
-        let (base, field) = super::parse_pv_name(name.as_ref());
-        let (record, cell) = db.lookup_record(base)?;
-        let field = cell.canonical_field(field).into_owned();
+        let parts = super::DbNameParts::of(name.as_ref());
+        let char_view = parts.char_view();
+        let (record, cell) = db.lookup_record(parts.record)?;
+        let field = cell.canonical_field(parts.field_or_val()).into_owned();
         if crate::server::record::record_instance::is_dbcommon_noaccess(&field) {
-            return Some(DbAddr {
+            return (!char_view).then_some(DbAddr {
                 record,
                 field,
                 field_type: None,
                 no_elements: 1,
+                char_view,
             });
         }
         let no_elements = db.resolve_addr(&cell, &field)?;
         let own = own.and_then(|own| (own.name() == record.as_bytes()).then_some(own.record()));
-        let field_type = db.addressed_field_type(&cell, &field, own);
+        let (field_type, no_elements) = if char_view {
+            let (field_type, no_elements) = db.char_addressed(&cell, &field, own)?;
+            (Some(field_type), no_elements)
+        } else {
+            (db.addressed_field_type(&cell, &field, own), no_elements)
+        };
         Some(DbAddr {
             record,
             field,
             field_type,
             no_elements,
+            char_view,
         })
     }
 
@@ -4672,6 +4712,9 @@ impl PvDatabase {
         };
         // C `dbNameToAddr` takes no lock, and table's `init_record` asks
         // under its own set.
+        if addressed.string_view {
+            return self.char_addressed(&rec, field, None).map(|(t, _)| t);
+        }
         self.addressed_field_type(&rec, field, None)
     }
 
@@ -13596,19 +13639,26 @@ impl PvDatabase {
     /// each reading the other's records do not wait on each other. A holder
     /// that waits for a set this thread holds can do neither, and the read
     /// fails ([`super::ReadWait::stuck`]).
+    /// A `$` name is read as `request` asks.
     pub(crate) fn db_get_snapshot(
         &self,
         name: &[u8],
+        request: CharGet,
         own: Option<OwnRecord<'_>>,
     ) -> Option<crate::server::snapshot::Snapshot> {
-        self.db_get_owed(name, own, |pv| Some(pv.snapshot()), snapshot_at)
+        self.db_get_owed(name, request, own, |pv| Some(pv.snapshot()), snapshot_at)
     }
 
     /// [`AsyncDbHandle::get_dbr_string`]'s read, taken as
     /// [`Self::db_get_snapshot`] takes its read.
     fn db_get_dbr_string(&self, name: &[u8], own: Option<OwnRecord<'_>>) -> Option<PvString> {
+        let request = CharGet {
+            dbr: DbFieldType::String,
+            count: 1,
+        };
         self.db_get_owed(
             name,
+            request,
             own,
             |pv| crate::server::record::record_instance::value_as_dbr_string(&pv.get()),
             dbr_string_at,
@@ -13620,6 +13670,7 @@ impl PvDatabase {
     fn db_get_owed<T: Send + 'static>(
         &self,
         name: &[u8],
+        request: CharGet,
         own: Option<OwnRecord<'_>>,
         simple: impl FnOnce(&crate::server::pv::ProcessVariable) -> Option<T>,
         read: FieldRead<T>,
@@ -13628,19 +13679,24 @@ impl PvDatabase {
         if let Some(pv) = self.simple_pv_bytes(name) {
             return simple(&pv);
         }
-        let (base, field) = super::parse_pv_name(name);
-        let cell = self.get_record(base)?;
-        let field = cell.canonical_field(field).into_owned();
+        let parts = super::DbNameParts::of(name);
+        let char_view = parts.char_view().then_some(request);
+        let cell = self.get_record(parts.record)?;
+        let field = cell.canonical_field(parts.field_or_val()).into_owned();
         self.no_elements(&cell, &field)?;
+        if char_view.is_some() {
+            self.char_addressed(&cell, &field, None)?;
+        }
         let own = own.and_then(|own| Some((self.get_record(own.name())?, own)));
         let own = own.as_ref().map(|(cell, own)| (&**cell, *own));
-        if let Some(got) = self.db_get_held(&cell, &field, own, read) {
+        if let Some(got) = self.db_get_held(&cell, &field, char_view, own, read) {
             return got;
         }
         let read = Arc::new(OwedDbGet {
             db: Arc::downgrade(&self.inner),
             cell: Arc::clone(&cell),
             field,
+            char_view,
             read,
             got: parking_lot::Mutex::new(None),
             reader: std::thread::current(),
@@ -13655,7 +13711,7 @@ impl PvDatabase {
             wait.serve(own);
             // The holder can let the set go between its last look at what it
             // owed and its unlock.
-            if let Some(got) = self.db_get_held(&cell, &read.field, own, read.read) {
+            if let Some(got) = self.db_get_held(&cell, &read.field, char_view, own, read.read) {
                 *read.got.lock() = Some(None);
                 return got;
             }
@@ -13675,31 +13731,57 @@ impl PvDatabase {
         &self,
         cell: &Arc<RecordCell>,
         field: &str,
+        char_view: Option<CharGet>,
         own: Option<(&RecordCell, OwnRecord<'_>)>,
         read: FieldRead<T>,
     ) -> Option<Option<T>> {
         let _held = cell.lock_record().try_acquire()?;
-        Some(read(self, cell, field, ReadPolicy::NoWait { own }))
+        Some(read(
+            self,
+            cell,
+            field,
+            char_view,
+            ReadPolicy::NoWait { own },
+        ))
     }
 }
 
-/// What [`PvDatabase::db_get_owed`] reads of a field, its set held.
-type FieldRead<T> = fn(&PvDatabase, &Arc<RecordCell>, &str, ReadPolicy<'_>) -> Option<T>;
+/// What [`PvDatabase::db_get_owed`] reads of a field, its set held: through
+/// its `$` address, as the [`CharGet`] asks, when there is one.
+type FieldRead<T> =
+    fn(&PvDatabase, &Arc<RecordCell>, &str, Option<CharGet>, ReadPolicy<'_>) -> Option<T>;
+
+/// `dbGet`'s request type and `nRequest`, which a read through a `$`
+/// address converts in (`CharView::get`).
+#[derive(Clone, Copy)]
+pub(crate) struct CharGet {
+    dbr: DbFieldType,
+    count: usize,
+}
 
 /// The field's value and metadata: C `dbGet` with options.
 fn snapshot_at(
     db: &PvDatabase,
     cell: &Arc<RecordCell>,
     field: &str,
+    char_view: Option<CharGet>,
     policy: ReadPolicy<'_>,
 ) -> Option<crate::server::snapshot::Snapshot> {
-    db.channel_snapshot_for_field_guarded(
+    let chars = match char_view {
+        Some(get) => Some(char_get_at(cell, field, get, policy)?),
+        None => None,
+    };
+    let mut snap = db.channel_snapshot_for_field_guarded(
         cell,
         field,
-        false,
+        chars.is_some(),
         &mut std::collections::HashSet::new(),
         policy,
-    )
+    )?;
+    if let Some(chars) = chars {
+        snap.value = chars;
+    }
+    Some(snap)
 }
 
 /// The field as C `dbGet(DBR_STRING)` renders it at its source, uncut.
@@ -13707,8 +13789,16 @@ fn dbr_string_at(
     db: &PvDatabase,
     cell: &Arc<RecordCell>,
     field: &str,
+    char_view: Option<CharGet>,
     policy: ReadPolicy<'_>,
 ) -> Option<PvString> {
+    if let Some(get) = char_view {
+        return match char_get_at(cell, field, get, policy)? {
+            EpicsValue::String(s) => Some(s),
+            EpicsValue::StringArray(a) => a.first().cloned(),
+            _ => None,
+        };
+    }
     if let Some(own) = policy.own(cell) {
         return own_dbr_string(own.record(), field);
     }
@@ -13717,6 +13807,25 @@ fn dbr_string_at(
         .read(cell, |inst| {
             let value = db.read_field_at(inst, field, addr)?;
             inst.source_render_of(field, &value).dbr_string(value)
+        })
+        .flatten()
+}
+
+/// `dbGet` of `get` through `field`'s `$` address. The record the caller is
+/// inside is lent as its `Record` alone, of which no `$` view is made: that
+/// read fails.
+fn char_get_at(
+    cell: &RecordCell,
+    field: &str,
+    get: CharGet,
+    policy: ReadPolicy<'_>,
+) -> Option<EpicsValue> {
+    if policy.own(cell).is_some() {
+        return None;
+    }
+    policy
+        .read(cell, |inst| {
+            super::char_view::char_view(inst, field)?.get(get.dbr, get.count)
         })
         .flatten()
 }
@@ -13735,6 +13844,7 @@ struct OwedDbGet<T> {
     db: std::sync::Weak<super::PvDatabaseInner>,
     cell: Arc<RecordCell>,
     field: String,
+    char_view: Option<CharGet>,
     read: FieldRead<T>,
     got: parking_lot::Mutex<Option<Option<T>>>,
     reader: std::thread::Thread,
@@ -13771,6 +13881,7 @@ impl<T: Send> super::OwedRead for OwedDbGet<T> {
             &PvDatabase { inner },
             &self.cell,
             &self.field,
+            self.char_view,
             ReadPolicy::Served { own },
         ));
         self.reader.unpark();

@@ -196,3 +196,69 @@ async fn a_channels_macro_past_22_is_cut_to_22() {
     .await;
     assert_eq!(ioc.f64_of("Ch22_raw"), 122.13);
 }
+
+/// A numeric put past an mbbo's modes (`ch_mode_sel`'s 15, a channel's 13)
+/// changes no units and configures nothing, and the meter reads on in the
+/// mode it has. C indexed `unit_strings` and `dmm_modes` past their ends:
+/// `ch_mode_sel 15` and `ch2_mode_sel 15` labelled the meter and channel 2
+/// with the `P` macro.
+#[epics_base_rs::epics_test]
+async fn a_mode_past_the_fifteen_is_ignored() {
+    let ioc = boot(&DMM, 4).await;
+    booted(&ioc, 4).await;
+    ioc.step("ch_mode_sel", 3.0, &[":conf:fres", "rout:open:all"])
+        .await;
+    ioc.step("ch_mode_sel", 15.0, &[]).await;
+    assert_eq!(ioc.str_of("units"), "OHM");
+    ioc.read(&["rout:clos (@101)", "read?"]).await;
+    assert_eq!(ioc.f64_of("Dmm_raw"), 101.3);
+
+    ioc.step("ch_mode_sel", 1.0, &[":conf:volt:ac"]).await;
+    assert_eq!(ioc.str_of("units"), "VAC");
+    ioc.put("ch3_units", EpicsValue::String(PvString::from("zz")))
+        .await;
+    ioc.step("ch2_mode_sel", 15.0, &[]).await;
+    assert!(eventually(|| ioc.str_of("ch3_units") == "VDC").await);
+    assert_eq!(ioc.str_of("ch2_units"), "VDC");
+    ioc.step("single_multi", 1.0, &[]).await;
+    ioc.read(&[
+        ":conf:volt:dc",
+        "read?",
+        "rout:clos (@102)",
+        "read?",
+        "rout:clos (@103)",
+        "read?",
+        "rout:clos (@104)",
+        "read?",
+    ])
+    .await;
+    assert_eq!(ioc.f64_of("Ch2_raw"), 102.0);
+}
+
+/// On a 2700, a put past channel 21's two current modes is ignored too: C
+/// added 13 and indexed past the 15.
+#[epics_base_rs::epics_test]
+async fn a_current_mode_past_the_two_is_ignored() {
+    let ioc = boot(&DMM, 22).await;
+    booted(&ioc, 22).await;
+    assert!(eventually(|| ioc.str_of("ch21_units") == "ADC").await);
+    ioc.put("ch22_units", EpicsValue::String(PvString::from("zz")))
+        .await;
+    ioc.step("ch21_mode_sel", 2.0, &[]).await;
+    assert!(eventually(|| ioc.str_of("ch22_units") == "ADC").await);
+    assert_eq!(ioc.str_of("ch21_units"), "ADC");
+    for n in 1..=20 {
+        ioc.put(&format!("Ch{n}_on_off"), EpicsValue::Double(1.0))
+            .await;
+    }
+    ioc.step("single_multi", 1.0, &[]).await;
+    ioc.read(&[
+        "rout:clos (@121)",
+        "read?",
+        ":conf:curr:dc",
+        "rout:clos (@122)",
+        "read?",
+    ])
+    .await;
+    assert_eq!(ioc.f64_of("Ch21_raw"), 121.0);
+}

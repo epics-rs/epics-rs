@@ -123,12 +123,13 @@ alias("MU:m1", "MU:m1a")
         .unwrap();
     until(&db, "MU:moving", EpicsValue::Long(1)).await;
     until(&db, "MU:alldone", EpicsValue::Enum(0)).await;
-    assert_eq!(db.get_pv("MU:movingDiff").unwrap(), diff("+MU:m1"));
+    // movingDiff is put after alldone and moving (motorUtil.cc:322-348).
+    until(&db, "MU:movingDiff", diff("+MU:m1")).await;
     db.put_record_field_from_ca("MU:m2", "VAL", EpicsValue::Double(3.0))
         .await
         .unwrap();
     until(&db, "MU:moving", EpicsValue::Long(2)).await;
-    assert_eq!(db.get_pv("MU:movingDiff").unwrap(), diff("+MU:m2"));
+    until(&db, "MU:movingDiff", diff("+MU:m2")).await;
     assert_eq!(
         errlog_of(&db, "listMovingMotors"),
         "\nThe following motors are moving:\nMU:m1, index = 0\nMU:m2, index = 1\n"
@@ -176,10 +177,10 @@ alias("MU:m1", "MU:m1a")
         .await
         .unwrap();
     until(&db, "MU:moving", EpicsValue::Long(1)).await;
-    assert_eq!(db.get_pv("MU:movingDiff").unwrap(), diff("+MU:m1"));
+    until(&db, "MU:movingDiff", diff("+MU:m1")).await;
     until(&db, "MU:moving", EpicsValue::Long(0)).await;
     assert_eq!(db.get_pv("MU:alldone").unwrap(), EpicsValue::Enum(1));
-    assert_eq!(db.get_pv("MU:movingDiff").unwrap(), diff("-MU:m1"));
+    until(&db, "MU:movingDiff", diff("-MU:m1")).await;
     let at = db.get_pv("MU:m1.DRBV").unwrap().to_f64().unwrap();
     assert!((at - to).abs() < 0.001, "{at} {to}");
     assert_eq!(

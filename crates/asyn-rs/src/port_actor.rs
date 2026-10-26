@@ -1170,6 +1170,60 @@ impl Blocks {
     }
 }
 
+/// Whether a caller's section holds its callbacks: the actor stored the sets
+/// of a section still open ([`crate::request::SectionCallbacks::owe`]).
+enum SectionHold {
+    /// None does; the empty buffer the next hold keeps its requests in.
+    Free(Vec<ActorMessage>),
+    /// `holds` sections of `scope` hold theirs, each until its
+    /// [`crate::request::SectionCallbacks::Held`] end. Only `scope`'s
+    /// requests run meanwhile, so a further hold is `scope`'s too; the rest
+    /// ([`PortActor::runs_while_a_section_holds`]) wait in `back`, in the
+    /// heap again at the last end.
+    Held {
+        scope: SectionScope,
+        holds: u32,
+        back: Vec<ActorMessage>,
+    },
+}
+
+impl SectionHold {
+    fn hold(&mut self, scope: SectionScope) {
+        match self {
+            Self::Free(spare) => {
+                let back = std::mem::take(spare);
+                *self = Self::Held {
+                    scope,
+                    holds: 1,
+                    back,
+                };
+            }
+            Self::Held { holds, .. } => *holds += 1,
+        }
+    }
+
+    fn end(&mut self, heap: &mut BinaryHeap<ActorMessage>) {
+        let Self::Held { holds, back, .. } = self else {
+            return;
+        };
+        *holds -= 1;
+        if *holds == 0 {
+            if !back.is_empty() {
+                heap.extend(back.drain(..));
+            }
+            *self = Self::Free(std::mem::take(back));
+        }
+    }
+
+    /// The requests a hold keeps out.
+    fn back(&self) -> &[ActorMessage] {
+        match self {
+            Self::Free(_) => &[],
+            Self::Held { back, .. } => back,
+        }
+    }
+}
+
 /// The actor that exclusively owns a port driver instance.
 pub(crate) struct PortActor {
     id: ActorId,
@@ -1196,12 +1250,8 @@ pub(crate) struct PortActor {
     /// is that "still queued, not yet eligible" half of C's queue list; the heap
     /// is the eligible half (R15-47).
     parked: Vec<ActorMessage>,
-    /// Requests a caller's section keeps out while it holds its callbacks
-    /// ([`Self::runs_while_a_section_holds`]), back in the heap at its end.
-    held_back: Vec<ActorMessage>,
-    /// The scope of a caller's section that holds its callbacks: set when the
-    /// actor stores the sets of a section still open, cleared at its end.
-    section_held: Option<SectionScope>,
+    /// Whether a caller's section holds its callbacks, and what it keeps out.
+    hold: SectionHold,
     /// C `pport->queueStateChange` (asynManager.c:870, 1617): something happened
     /// that could make a parked request eligible, so the queue must be rescanned.
     /// Set by an arriving request and by a request that ran (either can enable a
@@ -1256,11 +1306,15 @@ pub(crate) struct PortActor {
 impl Drop for PortActor {
     fn drop(&mut self) {
         self.cells.close();
+        let held_back = match &mut self.hold {
+            SectionHold::Free(_) => Vec::new(),
+            SectionHold::Held { back, .. } => std::mem::take(back),
+        };
         let queued = std::mem::take(&mut self.heap)
             .into_iter()
             .chain(self.dequeued.take())
             .chain(std::mem::take(&mut self.parked))
-            .chain(std::mem::take(&mut self.held_back))
+            .chain(held_back)
             .chain(std::mem::take(&mut self.pending_while_blocked));
         for msg in queued {
             if let RequestOp::Cell(_) = msg.op {
@@ -1300,8 +1354,7 @@ impl PortActor {
             dequeued: None,
             pending_while_blocked: Vec::new(),
             parked: Vec::new(),
-            held_back: Vec::new(),
-            section_held: None,
+            hold: SectionHold::Free(Vec::new()),
             rescan_parked: false,
             connect_failure_reported: false,
             woken: false,
@@ -1690,7 +1743,9 @@ impl PortActor {
             return;
         }
         self.parked.retain(|msg| !msg.is_gone());
-        self.held_back.retain(|msg| !msg.is_gone());
+        if let SectionHold::Held { back, .. } = &mut self.hold {
+            back.retain(|msg| !msg.is_gone());
+        }
         self.pending_while_blocked.retain(|msg| !msg.is_gone());
         self.heap.retain(|msg| !msg.is_gone());
         self.woken = true;
@@ -1786,7 +1841,7 @@ impl PortActor {
                 self.heap.len()
                     + self.pending_while_blocked.len()
                     + self.parked.len()
-                    + self.held_back.len(),
+                    + self.hold.back().len(),
                 yn(self.cells.blocks().lock().any_held())
             );
             // C try-locks the two port mutexes from a *separate* report thread
@@ -2147,16 +2202,15 @@ impl PortActor {
         let mut failed = set_params(base, &updates);
         let holds = gate.owe(addr, &updates);
         gate.give_back(updates);
-        if holds.is_none()
-            && let Some(e) = gate.fire(base)
-        {
-            failed.get_or_insert(e);
-        }
-        match gate {
-            crate::request::SectionCallbacks::Open { .. } => self.section_held = holds,
-            crate::request::SectionCallbacks::Held(_) => {
-                self.section_held = None;
-                self.heap.extend(self.held_back.drain(..));
+        match holds {
+            Some(scope) => self.hold.hold(scope),
+            None => {
+                if let Some(e) = gate.fire(base) {
+                    failed.get_or_insert(e);
+                }
+                if let crate::request::SectionCallbacks::Held(_) = gate {
+                    self.hold.end(&mut self.heap);
+                }
             }
         }
         match failed {
@@ -2231,7 +2285,7 @@ impl PortActor {
             .iter()
             .chain(&self.pending_while_blocked)
             .chain(&self.parked)
-            .chain(&self.held_back)
+            .chain(self.hold.back())
             .any(|msg| msg.user.block_token == Some(token))
     }
 
@@ -2328,11 +2382,11 @@ impl PortActor {
         if msg.is_gone() {
             return None;
         }
-        if self
-            .section_held
-            .is_some_and(|scope| msg.scope != scope && !Self::runs_while_a_section_holds(&msg.op))
+        if let SectionHold::Held { scope, back, .. } = &mut self.hold
+            && msg.scope != *scope
+            && !Self::runs_while_a_section_holds(&msg.op)
         {
-            self.held_back.push(msg);
+            back.push(msg);
             return None;
         }
 

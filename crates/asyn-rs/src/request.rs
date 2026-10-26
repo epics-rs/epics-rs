@@ -1082,7 +1082,12 @@ pub(crate) fn octet_outcome(ran: AsynResult<RequestResult>) -> OctetRead {
 }
 
 /// Operation the worker thread will dispatch to the port driver.
+///
+/// A byte tag: a niche in a field (`updates`' capacity, once a smaller
+/// `seq` left the gate's tag too narrow) costs every match on the op two
+/// more instructions.
 #[derive(Debug, Clone)]
+#[repr(u8)]
 pub enum RequestOp {
     OctetWrite {
         data: Vec<u8>,

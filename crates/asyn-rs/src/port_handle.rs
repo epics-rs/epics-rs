@@ -5432,7 +5432,8 @@ mod tests {
         handle.read_int32_blocking(0, addr)
     }
 
-    /// Hold `handle`'s actor until the returned sender sends.
+    /// Hold `handle`'s actor, from the caller's scope, until the returned
+    /// sender sends.
     fn hold_actor(
         handle: &PortHandle,
     ) -> (
@@ -5442,7 +5443,9 @@ mod tests {
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
         let busy = handle.clone();
+        let scope = SectionScope::current();
         let hold = std::thread::spawn(move || {
+            let _in = scope.enter();
             busy.with_driver_blocking(move |_: &mut TestDriver| {
                 started_tx.send(()).unwrap();
                 go_rx.recv().unwrap();
@@ -5654,6 +5657,65 @@ mod tests {
         second.end().unwrap();
         handle.read_int32_blocking(0, 0).unwrap();
         assert_eq!(*posts.lock(), [(0, 50), (1, 51), (0, 52)]);
+    }
+
+    /// A section in a held one's scope, a blocking consumer's on the same
+    /// port, holds too, inside C's recursive lock: its end leaves the held
+    /// one holding, so another thread's write still waits for that end.
+    #[test]
+    fn a_nested_sections_end_leaves_the_outer_one_holding() {
+        let (handle, posts, _sub) = gated_handle();
+        let mut outer_gate = handle.callbacks_gate();
+        let mut inner_gate = handle.callbacks_gate();
+        let outer = outer_gate
+            .open(0, None, vec![set_val(0, 80)], SectionScope::default())
+            .unwrap();
+        read_in(&handle, &outer, 0).unwrap();
+        let inner = inner_gate
+            .open(1, None, vec![set_val(1, 81)], outer.scope())
+            .unwrap();
+        read_in(&handle, &inner, 1).unwrap();
+        inner.end().unwrap();
+        handle
+            .submit_unanswered(RequestOp::Int32Write { value: 82 }, AsynUser::new(0))
+            .unwrap();
+        assert_eq!(read_in(&handle, &outer, 0).unwrap(), 80, "wrote inside");
+        assert_eq!(*posts.lock(), [(1, 81)]);
+        outer.end().unwrap();
+        handle.read_int32_blocking(0, 0).unwrap();
+        assert_eq!(*posts.lock(), [(1, 81), (0, 80), (0, 82)]);
+    }
+
+    /// A section in a held one's scope that ends before the actor reaches
+    /// its sets holds nothing, and leaves the held one holding.
+    #[test]
+    fn a_section_ended_first_inside_a_held_one_leaves_it_holding() {
+        let (handle, posts, _sub) = gated_handle();
+        let mut outer_gate = handle.callbacks_gate();
+        let mut inner_gate = handle.callbacks_gate();
+        let outer = outer_gate
+            .open(0, None, vec![set_val(0, 80)], SectionScope::default())
+            .unwrap();
+        read_in(&handle, &outer, 0).unwrap();
+        let (go, hold) = {
+            let _in = outer.scope().enter();
+            hold_actor(&handle)
+        };
+        inner_gate
+            .open(1, None, vec![set_val(1, 81)], outer.scope())
+            .unwrap()
+            .end()
+            .unwrap();
+        handle
+            .submit_unanswered(RequestOp::Int32Write { value: 82 }, AsynUser::new(0))
+            .unwrap();
+        go.send(()).unwrap();
+        hold.join().unwrap().unwrap();
+        assert_eq!(read_in(&handle, &outer, 0).unwrap(), 80, "wrote inside");
+        assert_eq!(*posts.lock(), [(1, 81)]);
+        outer.end().unwrap();
+        handle.read_int32_blocking(0, 0).unwrap();
+        assert_eq!(*posts.lock(), [(1, 81), (0, 80), (0, 82)]);
     }
 
     /// A section dropped without its end still ends it.

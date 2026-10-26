@@ -8214,7 +8214,7 @@ fn answer_read(
     // run the channel filter chain on the read value
     // before DBR encoding. epics-base `dbChannelRunPreChain`
     // (db_access.c:160-168 / dbChannel.c:641-648) runs the same
-    // pre-chain on a filtered read channel. `apply_to_read_value`
+    // pre-chain on a filtered read channel. `apply_to_read_snapshot`
     // uses read context, so stream-only filters (`dec`/`sync`)
     // pass through while `arr`/`ts`/`dbnd` transform; an empty
     // chain (no suffix / malformed) is the identity. Applied
@@ -12552,7 +12552,7 @@ mod bfr7_event_context_filter_tests {
     /// Regression: a `sync` filter gating `while` a never-set
     /// state drops the initial monitor post in EVENT context, so the
     /// server sends NO `CA_PROTO_EVENT_ADD` data frame. Pre-fix the
-    /// initial post ran in READ context (`apply_to_read_value`), where
+    /// initial post ran in READ context, where
     /// `sync` is bypassed, so an initial frame WAS sent — this test
     /// fails against that behaviour.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

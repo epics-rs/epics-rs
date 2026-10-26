@@ -284,7 +284,7 @@ impl MemberChannel {
         view: View,
     ) -> Option<epics_base_rs::types::EpicsValue> {
         let raw = instance.channel_field_value(&self.field, false)?;
-        Some(view.read(raw, &self.value_filters))
+        Some(view.read(instance.log_head(), raw, &self.value_filters))
     }
 
     /// [`Self::read_with`] with the field's full metadata attached — the
@@ -408,7 +408,7 @@ pub struct BridgeChannel {
     /// chain (`ioc/singlesource.cpp:278-292`, `localfieldlog.cpp:15-27`).
     /// The monitor path installs the chain on its subscription; the GET
     /// path applies it in read context via
-    /// [`FilterChain::apply_to_read_value`](epics_base_rs::server::database::filters::FilterChain::apply_to_read_value). PUT writes the raw value
+    /// [`FilterChain::apply_to_read_snapshot`](epics_base_rs::server::database::filters::FilterChain::apply_to_read_snapshot). PUT writes the raw value
     /// (filters are read-side only).
     channel_filters: std::sync::Arc<epics_base_rs::server::database::filters::FilterChain>,
     /// Access control context — checked on every get/put.
@@ -1848,5 +1848,42 @@ record(ai, "linked") { field(INP, "ai.VAL CP") info(Q:form, "String") }
                 );
             }
         }
+    }
+
+    /// A `ts` value mode reads the time of the read log, which is the
+    /// record's (`dbEvent.c:704-713`), on a channel and on every member
+    /// type of a group.
+    #[epics_base_rs::epics_test]
+    async fn a_ts_value_mode_reads_the_record_time() {
+        use super::super::group::GroupChannel;
+        let (db, _) = epics_base_rs::server::ioc_builder::IocBuilder::new()
+            .db_string(
+                r#"record(ai, "T") { field(VAL, "1") }"#,
+                &std::collections::HashMap::new(),
+            )
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        db.get_record("T").unwrap().write().common.time = epics_base_rs::types::WallTime::UNIX_EPOCH
+            + std::time::Duration::new(1_000_000_000, 333_333_333);
+        let name = r#"T.VAL{"ts":{"num":"nsec"}}"#;
+        let nsec = PvField::Scalar(ScalarValue::UInt(333_333_333));
+        let ch = BridgeChannel::new(db.clone(), name.as_bytes())
+            .await
+            .unwrap();
+        let served = ch.get(&PvStructure::new("")).await.unwrap();
+        assert_eq!(served.get_field("value"), Some(&nsec), "channel");
+        let group = GroupChannel::new(db.clone(), group_on(name));
+        let served = group.get(&PvStructure::new("")).await.unwrap();
+        let Some(PvField::Structure(s)) = served.get_field("s") else {
+            panic!("s: {served:?}");
+        };
+        assert_eq!(s.get_field("value"), Some(&nsec), "scalar member");
+        assert_eq!(served.get_field("p"), Some(&nsec), "plain member");
+        let Some(PvField::Variant(a)) = served.get_field("a") else {
+            panic!("a: {served:?}");
+        };
+        assert_eq!(a.value, nsec, "any member");
     }
 }

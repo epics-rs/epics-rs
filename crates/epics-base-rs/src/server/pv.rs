@@ -477,9 +477,10 @@ impl LogData {
 const AMSG_SIZE: usize = 40;
 
 /// The poster's side of a field log: what `db_create_field_log` copies off
-/// the record (`dbEvent.c:704-713`), borrowed until the log copies it.
+/// the record (`dbEvent.c:704-713`), borrowed until the log copies it. Made
+/// only from a record or a read of one, so a log's time is never invented.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct LogHead {
+pub struct LogHead {
     pub(crate) stat: u16,
     pub(crate) sevr: u16,
     /// Cut once per post, not once per subscriber.
@@ -782,9 +783,32 @@ impl MonitorEvent {
     /// chain runs on (`dbChannelGet`), handed back to the read by
     /// [`Self::write_log_over`]. The value moves out of `read` until then.
     pub fn read_log(read: &mut Snapshot, mask: crate::server::recgbl::EventMask) -> Self {
-        let value = LogData::holding(std::mem::replace(&mut read.value, EpicsValue::Long(0)));
+        let head = LogHead::of(read);
+        Self::read_of(
+            head,
+            std::mem::replace(&mut read.value, EpicsValue::Long(0)),
+            mask,
+        )
+    }
+
+    /// C `db_create_read_log` of `value`, read from a record whose log head
+    /// is `head`.
+    pub(crate) fn read_of(
+        head: LogHead,
+        value: EpicsValue,
+        mask: crate::server::recgbl::EventMask,
+    ) -> Self {
         Self {
-            log: PostLog::new(LogHead::of(read), value, 0, mask),
+            log: PostLog::new(head, LogData::holding(value), 0, mask),
+        }
+    }
+
+    /// The value this log holds, `None` for one read at delivery.
+    pub(crate) fn into_value(self) -> Option<EpicsValue> {
+        match self.log.value {
+            LogData::Val(v) => Some(v.value()),
+            LogData::Owned(v) => Some(*v),
+            LogData::Ref => None,
         }
     }
 

@@ -536,8 +536,8 @@ pub fn prepare_read(
 ) -> Result<crate::server::snapshot::Snapshot, GetFailed> {
     let (read_chain, post_chain) = chain.split();
     if !read_chain.is_empty() {
-        if let Some(v) = read_chain.apply_to_read_value(snapshot.value.clone()) {
-            snapshot.value = v;
+        if let Some(read) = read_chain.apply_to_read_snapshot(snapshot.clone()) {
+            snapshot = read;
         }
     }
     // convert String → CharArray of exactly 40 elements BEFORE the

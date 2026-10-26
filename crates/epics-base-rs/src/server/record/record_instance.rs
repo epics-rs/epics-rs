@@ -12992,11 +12992,11 @@ impl RecordInstance {
         (classes.value, classes.archive)
     }
 
-    /// The record's half of every field log a post makes now
-    /// (`db_create_field_log`, `dbEvent.c:704-713`). `always`: every
+    /// The record's half of every field log a post or a filtered read makes
+    /// now (`db_create_field_log`, `dbEvent.c:704-713`). `always`: every
     /// monitored post runs it, and out of line it cost +32 instr/cycle.
     #[inline(always)]
-    fn log_head(&self) -> crate::server::pv::LogHead {
+    pub fn log_head(&self) -> crate::server::pv::LogHead {
         #[cfg(test)]
         HEADS.with(|n| n.set(n.get() + 1));
         crate::server::pv::LogHead {

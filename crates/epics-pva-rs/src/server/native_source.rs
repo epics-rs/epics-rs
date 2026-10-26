@@ -4667,6 +4667,48 @@ ASG(LOCKED) {
         }
     }
 
+    /// A `ts` value mode reads the record's time, the time `dbGet`'s read log
+    /// was created with (`dbEvent.c:704-713`), while `{"ts":{}}` stamps the
+    /// read with the clock (`ts.c:138-163`).
+    #[epics_macros_rs::epics_test]
+    async fn a_ts_get_reads_the_time_its_read_log_holds() {
+        use crate::server_native::source::ChannelSource;
+        use epics_base_rs::server::records::ai::AiRecord;
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("T", Box::new(AiRecord::new(1.0)))
+            .await
+            .unwrap();
+        db.get_record("T").unwrap().write().common.time = epics_base_rs::types::WallTime::UNIX_EPOCH
+            + std::time::Duration::new(1_000_000_000, 333_333_333);
+        let source = PvDatabaseSource::new(db.clone());
+        let ctx = make_ctx("anyhost", "alice", "anonymous");
+        let get = async |name: &str, path: &str| {
+            let checked = source
+                .access()
+                .check(name, "anyhost", "alice", "anonymous", "")
+                .await;
+            let mut read = source
+                .read_checked(checked, ctx.clone())
+                .await
+                .expect("served");
+            leaf_mut(&mut read.value, path).expect(path).clone()
+        };
+        assert_eq!(
+            get(r#"T.VAL{"ts":{"num":"nsec"}}"#, "value").await,
+            PvField::Scalar(ScalarValue::UInt(333_333_333))
+        );
+        let PvField::Scalar(ScalarValue::Long(sec)) =
+            get(r#"T.VAL{"ts":{}}"#, "timeStamp.secondsPastEpoch").await
+        else {
+            panic!("timeStamp.secondsPastEpoch");
+        };
+        assert!(
+            sec > 1_000_000_000,
+            "the read's clock, not the record's: {sec}"
+        );
+    }
+
     /// softIocPVX prints `dbChannelCreate: Channel filter 'bad' not found`
     /// once per create of `Y.VAL{"bad":{}}` (`pvxget` makes two creates and
     /// two lines), and refuses the channel.
@@ -4728,18 +4770,33 @@ ASG(LOCKED) {
             "the GET must be served (dbnd drops the read, so it falls back to the raw field)"
         );
 
+        // A `DBE_VALUE` post of `v` through `chain`.
+        fn passes(chain: &FilterChain, v: f64) -> bool {
+            let mut post = epics_base_rs::server::snapshot::Snapshot::new(
+                EpicsValue::Double(v),
+                0,
+                0,
+                std::time::SystemTime::UNIX_EPOCH,
+            );
+            chain
+                .apply(
+                    epics_base_rs::server::database::filters::FilteredMonitorEvent::new(
+                        epics_base_rs::server::pv::MonitorEvent::read_log(
+                            &mut post,
+                            EventMask::VALUE,
+                        ),
+                    ),
+                )
+                .is_some()
+        }
         let ch = channel_for(&source.db, &source.channels, name.as_bytes(), ctx.peer)
             .expect("the GET minted the channel");
         assert!(
-            ch.value_filters
-                .apply_to_event_value(EpicsValue::Double(105.0), EventMask::VALUE)
-                .is_none(),
+            !passes(&ch.value_filters, 105.0),
             "a 5.0 move inside the 10.0 band must be dropped against the baseline the GET set"
         );
         assert!(
-            ch.value_filters
-                .apply_to_event_value(EpicsValue::Double(120.0), EventMask::VALUE)
-                .is_some(),
+            passes(&ch.value_filters, 120.0),
             "a 20.0 move outside the band must still pass"
         );
 
@@ -4748,9 +4805,7 @@ ASG(LOCKED) {
         // baseline `parse_ok` seeded (`dbnd.c:61`) and passes the same 105.0.
         let (_, per_operation) = resolve_channel(&db, name.as_bytes()).unwrap();
         assert!(
-            per_operation
-                .apply_to_event_value(EpicsValue::Double(105.0), EventMask::VALUE)
-                .is_some(),
+            passes(&per_operation, 105.0),
             "control: a chain built per operation has no baseline to compare against"
         );
     }

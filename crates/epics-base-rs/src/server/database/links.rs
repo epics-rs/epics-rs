@@ -58,23 +58,27 @@ pub(super) fn local_name(record: &[u8], field: &str) -> Vec<u8> {
 /// live value on another.
 /// C `dbDbGetValue`'s filter arm, and its NULL-log fallback to the raw
 /// field (`dbDbLink.c:206-219`): the value a DB link delivers once its
-/// target's `json_suffix` filter chain has run over the raw read.
-#[inline]
-fn filtered_read(
-    target: &crate::server::database::filters::ChannelName,
-    v: EpicsValue,
-) -> EpicsValue {
-    match target.json_suffix.as_deref() {
-        Some(suffix) => filter_read(suffix, v),
-        None => v,
-    }
+/// target's `json_suffix` filter chain has run over a read log of `v`, whose
+/// head is the target's (`db_create_read_log`), taken under the read's hold.
+fn filter_read(suffix: &str, head: crate::server::pv::LogHead, v: EpicsValue) -> EpicsValue {
+    crate::server::database::filters::parse_filter_chain(suffix)
+        .apply_to_read_log(head, v.clone())
+        .unwrap_or(v)
 }
 
-/// [`filtered_read`]'s filter arm, out of the unfiltered read's frame.
-fn filter_read(suffix: &str, v: EpicsValue) -> EpicsValue {
-    crate::server::database::filters::parse_filter_chain(suffix)
-        .apply_to_read_value(v.clone())
-        .unwrap_or(v)
+/// A link's read of the simple PV `pv`, filtered under the head of the PV's
+/// own snapshot.
+fn simple_pv_read(
+    target: &crate::server::database::filters::ChannelName,
+    pv: &crate::server::pv::ProcessVariable,
+) -> EpicsValue {
+    match target.json_suffix.as_deref() {
+        Some(suffix) => {
+            let read = pv.snapshot();
+            filter_read(suffix, crate::server::pv::LogHead::of(&read), read.value)
+        }
+        None => pv.get(),
+    }
 }
 
 /// What a one-element request converts of `value`: an array's element 0, as
@@ -1016,13 +1020,13 @@ impl MultiOutDispatch {
 /// out, with the record already in hand.
 /// What [`PvDatabase::read_db_target_by_name`] found behind a link target.
 enum TargetValue {
-    /// A local record, its field as a reader sees it, the cell it came from,
-    /// and — for a link that inherits it — the alarm the record held under
-    /// the same lock hold, so a caller that wants the source's committed
-    /// alarm neither looks the record up nor locks it a second time.
+    /// A local record, its field as the link delivers it, filtered, the cell
+    /// it came from, and — for a link that inherits it — the alarm the record
+    /// held under the same lock hold, so a caller that wants the source's
+    /// committed alarm neither looks the record up nor locks it a second time.
     Record(Option<EpicsValue>, SourceId, Option<LinkAlarm>),
     /// Local, but no record answers: a simple PV under the target's full
-    /// `record[.FIELD]` name, or nothing readable at all.
+    /// `record[.FIELD]` name, filtered, or nothing readable at all.
     NoRecord(Option<EpicsValue>),
     /// Not served here. C `dbInitLink` makes it a CA link; the caller names it.
     External,
@@ -1191,14 +1195,17 @@ impl PvDatabase {
             // target gone again by then has nothing readable this cycle.
             LinkTarget::Local(_) => match self.db_link_answer(db) {
                 DbLinkAnswer::Local(at) => self.target_value_of(&at.rec, db, at.put.field()),
-                DbLinkAnswer::Shadowed(pv) => TargetValue::NoRecord(Some(pv.get())),
+                DbLinkAnswer::Shadowed(pv) => {
+                    TargetValue::NoRecord(Some(simple_pv_read(target, &pv)))
+                }
                 DbLinkAnswer::Absent | DbLinkAnswer::External => TargetValue::NoRecord(None),
             },
             // A simple PV under the target's own name — the value `get_pv`
             // answers with before it ever reaches a record.
-            LinkTarget::LocalNotRecord => {
-                TargetValue::NoRecord(self.get_pv(local_name(&target.record, &target.field)).ok())
-            }
+            LinkTarget::LocalNotRecord => TargetValue::NoRecord(
+                self.simple_pv_bytes(&local_name(&target.record, &target.field))
+                    .map(|pv| simple_pv_read(target, &pv)),
+            ),
             LinkTarget::External => TargetValue::External,
         }
     }
@@ -1242,6 +1249,11 @@ impl PvDatabase {
             Some(set) => at.rec.read_in(set),
             None => at.rec.read(),
         };
+        // The read log's head, taken under the same hold as the value.
+        let filter = target
+            .json_suffix
+            .as_deref()
+            .map(|suffix| (suffix, instance.log_head()));
         let mut value;
         let alarm;
         let render;
@@ -1266,8 +1278,8 @@ impl PvDatabase {
             };
             drop(instance);
         }
-        if let Some(suffix) = target.json_suffix.as_deref() {
-            value = value.map(|v| filter_read(suffix, v));
+        if let Some((suffix, head)) = filter {
+            value = value.map(|v| filter_read(suffix, head, v));
         }
         (value, alarm, render)
     }
@@ -1289,10 +1301,19 @@ impl PvDatabase {
         let instance = rec.read();
         let alarm = (db.monitor_switch != crate::server::record::MonitorSwitch::NoMaximize)
             .then(|| LinkAlarm::committed(&instance.common));
+        let target = db.target();
+        let filter = target
+            .json_suffix
+            .as_deref()
+            .map(|suffix| (suffix, instance.log_head()));
         let value = if addr.char_view() {
-            char_image_after_hold(instance, &db.target().field)
+            char_image_after_hold(instance, &target.field)
         } else {
-            self.read_field_at(&instance, &db.target().field, addr)
+            self.read_field_at(&instance, &target.field, addr)
+        };
+        let value = match filter {
+            Some((suffix, head)) => value.map(|v| filter_read(suffix, head, v)),
+            None => value,
         };
         (value, alarm)
     }
@@ -2159,7 +2180,7 @@ impl PvDatabase {
                     return self.read_db_at(None, db, &at, render);
                 }
                 crate::server::record::DbLinkAnswer::Shadowed(pv) => {
-                    return (Some(filtered_read(db.target(), pv.get())), None, None);
+                    return (Some(simple_pv_read(db.target(), &pv)), None, None);
                 }
                 crate::server::record::DbLinkAnswer::External => {
                     let (value, alarm) = self.read_db_external(db);
@@ -2584,7 +2605,6 @@ impl PvDatabase {
     ) -> (Option<EpicsValue>, Option<SourceAlarm>) {
         match link {
             crate::server::record::ParsedLink::Db(db) => {
-                let target = db.target();
                 // C `dbInitLink` locality (`dbLink.c:118-130`): a target
                 // record present in this IOC is a DB link read from the
                 // local database; a non-local target is a CA link, so its
@@ -2597,14 +2617,13 @@ impl PvDatabase {
                 // link target spelled with an alias still propagates MS/NMS —
                 // and it comes off the cell the value was just read from, not
                 // a second lookup of the same name.
-                let (value, alarm) = match self.read_db_target_by_name(db) {
+                match self.read_db_target_by_name(db) {
                     TargetValue::Record(value, rec, alarm) => {
                         (value, alarm.map(|alarm| SourceAlarm::local(rec, alarm)))
                     }
                     TargetValue::NoRecord(value) => (value, None),
-                    TargetValue::External => return self.read_db_external(db),
-                };
-                (value.map(|v| filtered_read(target, v)), alarm)
+                    TargetValue::External => self.read_db_external(db),
+                }
             }
             // A CONSTANT link delivers nothing at process time; the classifier
             // above turns this `None` into `LinkFetch::NoData` (success), not

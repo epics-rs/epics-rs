@@ -442,14 +442,16 @@ impl View {
     }
 
     /// The served value of the field's own `value`, through `filters` in
-    /// read context. C's `dbChannelCreate` swaps the address to the char
-    /// view before any filter opens (`dbChannel.c:486-494`) and `dbGet`
+    /// read context on a log whose head is the record's `head`, the time a
+    /// `ts` value mode reads. C's `dbChannelCreate` swaps the address to the
+    /// char view before any filter opens (`dbChannel.c:486-494`) and `dbGet`
     /// reads the filtered log after, so a `$` renders before the chain and
     /// finishes after it ([`DollarView::finish`]). A chain that drops the
     /// read yields the unfiltered field: `dbChannelGet` reads the live record
     /// when the log is NULL (`dbAccess.c:924-930`).
     pub(crate) fn read(
         self,
+        head: epics_base_rs::server::pv::LogHead,
         value: EpicsValue,
         filters: &epics_base_rs::server::database::filters::FilterChain,
     ) -> EpicsValue {
@@ -457,7 +459,9 @@ impl View {
             if filters.is_empty() {
                 value
             } else {
-                filters.apply_to_read_value(value.clone()).unwrap_or(value)
+                filters
+                    .apply_to_read_log(head, value.clone())
+                    .unwrap_or(value)
             }
         };
         match self {

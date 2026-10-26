@@ -3690,7 +3690,7 @@ impl RecordCell {
         self.form_string.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// The record's `Q:time:tag` mask ([`Self::nsec_mask`]), with no lock.
+    /// [`RecordInstance::qtime_nsec_mask`], settled on the cell, with no lock.
     pub fn qtime_nsec_mask(&self) -> u64 {
         self.nsec_mask.load(std::sync::atomic::Ordering::Relaxed)
     }

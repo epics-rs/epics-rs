@@ -8,8 +8,8 @@ use epics_base_rs::server::record::{
     link_field_type,
 };
 use epics_base_rs::server::records::link_status::{
-    LINK_EXT_NC, LINK_RECHECK, LinkCheck, LinkCheckSpec, LinkCheckState, LinkRole, LinkRule,
-    LinkStatusGen, classify_link, link_is_external,
+    LINK_EXT_NC, LinkCheck, LinkCheckSpec, LinkCheckState, LinkRole, LinkRule, LinkStatusGen,
+    LinkStatusPosts, link_is_external, post_link_status,
 };
 use epics_base_rs::types::{EpicsValue, PvString};
 use epics_libcom_rs::cfmt::CFloat;
@@ -285,42 +285,26 @@ impl ThrottleRecord {
     /// 339-374): CONSTANT→`Constant`, a PV on this IOC→`Local PV`,
     /// else→`Ext PV NC`, which `checkLinkCallback` re-reads after `recheck`
     /// (throttleRecord.c:222, :370). C classifies, and posts whatever its
-    /// value, bit 0 OV and bit 1 SIV of `links`: both at init, the put link's
-    /// alone on an OUT/SINP `special()`, which leaves the other status as it
-    /// stands. A no-op when the record is not registered (no handle).
-    fn refresh_link_status(&self, links: u64, recheck: Option<std::time::Duration>) {
-        let Some((name, handle)) = &self.async_ctx else {
-            return;
-        };
-        let name = name.clone();
-        let handle = handle.clone();
-        let classified: Vec<(usize, &'static str, PvString, LinkRole)> = [
-            (0, "OV", self.out.clone(), LinkRole::Output),
-            (1, "SIV", self.sinp.clone(), LinkRole::Input),
-        ]
-        .into_iter()
-        .filter(|&(i, ..)| links & 1 << i != 0)
-        .collect();
-        // Stamp this refresh so a later re-point of the same link (an
-        // OUT/SINP `special()`) supersedes an init-time snapshot that
-        // finishes late.
-        let token = self.link_gen.next_for(links);
-        let sched = handle.clone();
-        // Through the database's `iocInit` owner — see `schedule_record_init`.
-        // The parking key; `name` itself moves into the future below.
-        let init_key = name.clone();
-        sched.schedule_record_init(&init_key, async move {
-            let rule = THROTTLE_LINK_CHECK.rule;
-            let fields = classified
-                .into_iter()
-                .map(|(i, field, link, role)| {
-                    let (status, _) = classify_link(&handle, &link, role, rule);
-                    (i, field.to_string(), EpicsValue::Short(status))
-                })
-                .collect();
-            token.post_each(&handle, &name, fields, THROTTLE_LINK_CHECK.mask);
-            handle.link_check_classified(&name, recheck);
-        });
+    /// value, both at init and the put link's alone on an OUT/SINP
+    /// `special()`, which leaves the other status as it stands. A put's
+    /// status is stored before the put returns: the SYNC arm reads SIV
+    /// (throttleRecord.c:381). A no-op when the record is not registered (no
+    /// handle).
+    fn refresh_link_status(&mut self, posts: LinkStatusPosts) {
+        let stored = post_link_status(
+            self.async_ctx.as_ref(),
+            &self.link_gen,
+            vec![
+                ("OV", self.out.clone(), LinkRole::Output),
+                ("SIV", self.sinp.clone(), LinkRole::Input),
+            ],
+            THROTTLE_LINK_CHECK.rule,
+            THROTTLE_LINK_CHECK.mask,
+            posts,
+        );
+        if let (LinkStatusPosts::Put(field), Some(status)) = (posts, stored) {
+            self.link_status[usize::from(field == "SIV")] = status;
+        }
     }
 
     /// C `valueSync` (throttleRecord.c:616-656) — the single entry to a
@@ -621,11 +605,10 @@ impl Record for ThrottleRecord {
             // C `special()` OUT/SINP case (throttleRecord.c:339-374,
             // `SPC_MOD`): re-classify the changed link's validity menu
             // (OV for OUT, SIV for SINP) — CONSTANT→`Constant`, a PV on
-            // this IOC→`Local PV`, else→`Ext PV NC`. The new link string the
-            // put just stored is classified off-thread (needs an async DB
-            // lookup, C `dbNameToAddr`). The other link's status stands.
-            "OUT" => self.refresh_link_status(1, Some(LINK_RECHECK)),
-            "SINP" => self.refresh_link_status(1 << 1, Some(LINK_RECHECK)),
+            // this IOC→`Local PV`, else→`Ext PV NC`. The other link's status
+            // stands.
+            "OUT" => self.refresh_link_status(LinkStatusPosts::Put("OV")),
+            "SINP" => self.refresh_link_status(LinkStatusPosts::Put("SIV")),
             // C `special()` SYNC case (throttleRecord.c:376-389): a put of
             // `SYNC=Process` triggers `valueSync` — read SINP into VAL and
             // post (NO OUT write, NO process) — unless SIV still reads
@@ -1042,7 +1025,7 @@ impl Record for ThrottleRecord {
         // posts the initial status (throttleRecord.c:171-205). This is the
         // framework's init-time async hook (the handle now exists), so
         // classify here — the record's OUT/SINP db fields are already loaded.
-        self.refresh_link_status(0b11, THROTTLE_LINK_CHECK.rule.init_recheck());
+        self.refresh_link_status(LinkStatusPosts::All);
     }
 
     fn put_field_internal(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
@@ -1055,12 +1038,12 @@ impl Record for ThrottleRecord {
         // the writable VAL/SYNC the SYNC post also writes, falls through to
         // `put_field`.
         match (name, &value) {
-            ("OV", EpicsValue::Short(v)) => {
-                self.link_status[0] = *v;
+            ("OV", EpicsValue::Enum(v)) => {
+                self.link_status[0] = *v as i16;
                 Ok(())
             }
-            ("SIV", EpicsValue::Short(v)) => {
-                self.link_status[1] = *v;
+            ("SIV", EpicsValue::Enum(v)) => {
+                self.link_status[1] = *v as i16;
                 Ok(())
             }
             ("STS", EpicsValue::Short(v)) => {

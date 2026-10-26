@@ -935,7 +935,11 @@ fn special_after_put(
     // `sCalcoutRecord.c:513-518`, `aCalcoutRecord.c:533-538`,
     // `transformRecord.c:715-723` — the four records whose C `special()` calls
     // `recGblInitConstantLink`): a put that leaves an input link constant
-    // re-runs the load into that input's value field and posts it. Without it a
+    // re-runs the load into that input's value field and posts it. C's own load
+    // is dead: `dbPutFieldLink` clears the lset (`dbAccess.c:1170`) and calls
+    // `special(1)` (`:1181`) before `dbAddLink` sets the new one (`:1206-1208`),
+    // so `dbLoadLink` returns `S_db_noLSET` (`dbLink.c:238-241`) and only the
+    // post runs. That C defect is not copied: without the load a
     // constant link is load-once dead state — the link layer delivers nothing
     // for a constant at process time, so `caput CO.INPB 7` would store the text
     // and leave `B` at its `.db` value forever.

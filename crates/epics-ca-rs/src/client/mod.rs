@@ -6980,14 +6980,22 @@ mod deadline_tests {
     }
 
     /// Whatever drops a put — its caller, or a bound around it — takes its
-    /// waiter out of the registry, as the drop of a get does.
+    /// waiter out of the registry, as the drop of a get does, and leaves
+    /// the write sent.
     #[tokio::test(start_paused = true)]
     async fn a_dropped_put_withdraws_its_waiter() {
-        let (ch, _rx) = connected();
+        let (ch, mut rx) = connected();
+        let mut sent = |what: &str| {
+            assert!(
+                matches!(rx.try_recv(), Ok(TransportCommand::WriteNotify { .. })),
+                "{what}: the drop took back the write"
+            );
+        };
         let put = ch.put_callback(&EpicsValue::Double(1.0)).expect("sent");
         assert_eq!(ch.in_flight.writes.len(), 1);
         drop(put);
         assert!(ch.in_flight.writes.is_empty(), "put_callback");
+        sent("put_callback");
 
         async fn dropped(ch: &CaChannel, what: &str, put: impl std::future::Future) {
             assert!(task::timeout(BOUND, put).await.is_err(), "{what} ended");
@@ -6995,18 +7003,22 @@ mod deadline_tests {
         }
         let one = EpicsValue::Double(1.0);
         dropped(&ch, "put_with_timeout", ch.put_with_timeout(&one, AN_HOUR)).await;
+        sent("put_with_timeout");
         dropped(
             &ch,
             "put_as_dbr_with_timeout",
             ch.put_as_dbr_with_timeout(6, &one, AN_HOUR),
         )
         .await;
+        sent("put_as_dbr_with_timeout");
         dropped(&ch, "put_string", ch.put_string("1", AN_HOUR)).await;
+        sent("put_string");
         dropped(
             &ch,
             "put_string_array",
             ch.put_string_array(&["1".to_string()], AN_HOUR),
         )
         .await;
+        sent("put_string_array");
     }
 }

@@ -1711,9 +1711,7 @@ record(ai, "linked") { field(INP, "ai.VAL CP") info(Q:form, "String") }
 
     /// The type a channel and a group member take with no lock is the type
     /// a read under the lock serves: every field of every base type, with
-    /// `$` and without, through each filter shape. A char view read through
-    /// a filter chain is left out: its read serves a type of its own, as it
-    /// did when the create read under the lock.
+    /// `$` and without, through each filter shape.
     #[epics_base_rs::epics_test]
     async fn the_lock_free_type_is_the_one_read_under_the_lock() {
         use super::super::group::GroupChannel;
@@ -1740,15 +1738,9 @@ record(ai, "linked") { field(INP, "ai.VAL CP") info(Q:form, "String") }
                 .chain(epics_base_rs::server::record::dbd_generated::DB_COMMON_FIELDS)
                 .map(|f| f.name)
                 .chain(["RTYP", "NOPE"]);
-            let cell = db.get_record(rec).unwrap();
             for field in fields {
-                let re_view =
-                    ChannelAddr::of(&db, &cell, field).is_some_and(|a| a.re_view().is_some());
                 for dollar in ["", "$"] {
                     for chain in chains {
-                        if (re_view || !dollar.is_empty()) && !chain.is_empty() {
-                            continue;
-                        }
                         let name = format!("{rec}.{field}{dollar}{chain}");
                         let Ok(ch) = BridgeChannel::new(db.clone(), name.as_bytes()).await else {
                             continue;

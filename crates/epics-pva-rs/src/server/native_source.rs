@@ -16,7 +16,7 @@ use crate::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue, Ty
 use crate::server_native::source::{PutOptions, RecordPutKind, SourceRead};
 use crate::server_native::{ChannelSource, OpError};
 use epics_base_rs::server::database::char_view::{
-    ChannelAddr, CharSource, DollarView, PvaDollar, long_string_field_text,
+    ChannelAddr, CharServed, DollarView, long_string_field_text,
 };
 
 use crate::server_native::source::{MonitorStream, UpstreamMonitor};
@@ -1104,24 +1104,15 @@ fn record_snapshot(
     Some(snap)
 }
 
-/// [`read_chain`] on the whole snapshot, the log `dbGet` reads its value,
-/// time and options off (`dbAccess.c:341-348`): a `ts` value mode stamps
-/// the field's own time and narrows the properties to the type it leaves.
+/// `filters` in read context on the whole snapshot, the log `dbGet` reads
+/// its value, time and options off (`dbAccess.c:341-348`): a `ts` value
+/// mode stamps the field's own time and narrows the properties to the type
+/// it leaves. A chain that drops the read leaves the unfiltered field.
 fn read_snapshot_chain(filters: &FilterChain, snap: &mut Snapshot) {
     if !filters.is_empty()
         && let Some(read) = filters.apply_to_read_snapshot(snap.clone())
     {
         *snap = read;
-    }
-}
-
-/// `value` through `filters` in read context; the unfiltered value where
-/// the chain drops the read.
-fn read_chain(filters: &FilterChain, value: EpicsValue) -> EpicsValue {
-    if filters.is_empty() {
-        value
-    } else {
-        filters.apply_to_read_value(value.clone()).unwrap_or(value)
     }
 }
 
@@ -1149,9 +1140,11 @@ impl ChannelRender {
     fn shape(self, ev: MonitorEvent) -> MonitorEvent {
         match self {
             ChannelRender::LongStringField => long_string_field_shaped(ev),
-            ChannelRender::Dollar(d) if d.scalar() => scalar_shaped(ev),
-            ChannelRender::Dollar(d) if d.serve == PvaDollar::Chars => ev,
-            ChannelRender::Dollar(d) => text_shaped(d, ev),
+            ChannelRender::Dollar(d) => match d.served() {
+                CharServed::Scalar(_) => scalar_shaped(ev),
+                CharServed::Array(_) => ev,
+                CharServed::Text => text_shaped(d, ev),
+            },
             ChannelRender::Shaped(ChannelShape::Scalar) => scalar_shaped(ev),
             ChannelRender::Shaped(ChannelShape::Array) => ev,
         }
@@ -1168,12 +1161,14 @@ impl ChannelRender {
                 shape.shape(snap);
             }
             ChannelRender::LongStringField => {
-                snap.value = read_chain(filters, long_string_field_text(take_value(snap)));
+                snap.value = long_string_field_text(take_value(snap));
+                read_snapshot_chain(filters, snap);
             }
             ChannelRender::Dollar(dollar) => {
                 let image = dollar.render(take_value(snap));
-                let log = read_chain(filters, image.clone());
-                snap.value = dollar.finish(image, log);
+                snap.value = image.clone();
+                read_snapshot_chain(filters, snap);
+                snap.value = dollar.finish(image, take_value(snap));
                 if dollar.scalar() {
                     ChannelShape::Scalar.shape(snap);
                 }
@@ -1234,21 +1229,11 @@ fn record_channel_desc(
             filters.final_field_type(DbFieldType::String),
             filters.final_element_count(1) != 1,
         ),
-        ChannelRender::Dollar(dollar) => {
-            // A link's or an attribute's chars are its text afresh, whatever
-            // log the chain made ([`DollarView::read`]).
-            let log = match dollar.source() {
-                CharSource::Field => filters.final_field_type(DbFieldType::Char),
-                _ => DbFieldType::Char,
-            };
-            match log {
-                DbFieldType::Char if dollar.scalar() => (log, false),
-                DbFieldType::Char if dollar.serve == PvaDollar::Text => {
-                    (DbFieldType::String, false)
-                }
-                log => (log, !dollar.scalar()),
-            }
-        }
+        ChannelRender::Dollar(dollar) => match dollar.served() {
+            CharServed::Text => (DbFieldType::String, false),
+            CharServed::Scalar(t) => (t, false),
+            CharServed::Array(t) => (t, true),
+        },
     };
     let prototype = if array {
         EpicsValue::from_bytes_array(served, &[], 0).expect("an empty array decodes for every type")
@@ -2523,7 +2508,8 @@ fn record_put_value(
             return Ok((chars, true));
         }
         if let Some(addr) = ChannelAddr::of(db, rec, &cn.field)
-            && let ChannelValue::Text(_) = ChannelValue::of_addr(&addr, &cn.field, filters)
+            && let ChannelValue::Text(view) = ChannelValue::of_addr(&addr, &cn.field, filters)
+            && !view.scalar()
         {
             // Only a field pvxs reshaped takes its chars by the `$` name; a
             // `DBF_CHAR` one already is them.
@@ -7529,6 +7515,79 @@ ASG(PLAIN) {
                 want,
                 "{name}"
             );
+        }
+    }
+
+    /// A char view whose chain left one element, or whose `ts` replaced the
+    /// log, serves what the channel advertises: one `DBR_CHAR`, or the log,
+    /// which `dbGet` reads in place of the link's text because the link
+    /// route is taken on the log's type (`dbAccess.c:928-929,945`).
+    /// softIocPVX 1.5.3 serves `LK.INP{"arr":{"s":0,"e":0}}` as `int8_t 0`
+    /// and `LK.NAME{"arr":{"s":0,"e":0}}` as `int8_t 76`. An attribute's log
+    /// is read too, which C does not do (`CharSource::after`).
+    #[epics_macros_rs::epics_test]
+    async fn a_char_view_through_a_retyping_chain_serves_the_log() {
+        let (db, _) = epics_base_rs::server::ioc_builder::IocBuilder::new()
+            .db_string(
+                r#"record(stringin, "FS") { field(VAL, "hello") field(PINI, "YES") }
+                record(stringin, "LK") { field(INP, "FS NPP") field(PINI, "YES") }"#,
+                &std::collections::HashMap::new(),
+            )
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        db.ioc_init().await;
+        let source = PvDatabaseSource::new(db);
+        let read = async |name: &str| {
+            let Some(FieldDesc::Structure { fields, .. }) =
+                source.get_introspection(name.as_bytes()).await
+            else {
+                panic!("{name}: no NT descriptor");
+            };
+            let desc = fields
+                .into_iter()
+                .find(|(n, _)| n == "value")
+                .map(|(_, d)| d);
+            (desc, dollar_value(source.get_value(name.as_bytes()).await))
+        };
+        let byte = |b| Some(PvField::Scalar(ScalarValue::Byte(b)));
+        for (name, want) in [
+            (r#"LK.INP{"arr":{"s":0,"e":0}}"#, byte(0)),
+            (r#"LK.NAME{"arr":{"s":0,"e":0}}"#, byte(b'L' as i8)),
+        ] {
+            assert_eq!(
+                read(name).await,
+                (Some(FieldDesc::Scalar(ScalarType::Byte)), want),
+                "{name}"
+            );
+        }
+        for (chain, desc) in [
+            (
+                r#"{"ts":{"num":"ts"}}"#,
+                FieldDesc::ScalarArray(ScalarType::UInt),
+            ),
+            (
+                r#"{"ts":{"num":"dbl"}}"#,
+                FieldDesc::Scalar(ScalarType::Double),
+            ),
+            (
+                r#"{"ts":{"str":"epics"}}"#,
+                FieldDesc::Scalar(ScalarType::String),
+            ),
+        ] {
+            for (rec, fields) in [
+                ("LK", &["INP$", "INP", "DESC$", "NAME", "NAME$"][..]),
+                ("FS", &["RTYP$", "RTYP"][..]),
+            ] {
+                let reference = format!("{rec}.VAL{chain}");
+                let want = read(&reference).await;
+                assert_eq!(want.0.as_ref(), Some(&desc), "{reference}");
+                for field in fields {
+                    let name = format!("{rec}.{field}{chain}");
+                    assert_eq!(read(&name).await, want, "{name}");
+                }
+            }
         }
     }
 

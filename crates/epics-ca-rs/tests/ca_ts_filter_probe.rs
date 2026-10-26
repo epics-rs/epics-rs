@@ -34,6 +34,7 @@ use epics_ca_rs::server::CaServer;
 
 const DB: &str = r#"
 record(ai, "T") { field(VAL, "1") field(PINI, "YES") field(PREC, "3") field(EGU, "mm") field(HOPR, "10") }
+record(stringin, "LK") { field(INP, "T NPP") field(PINI, "YES") }
 "#;
 
 async fn connect(client: &CaClient, name: &str) -> CaChannel {
@@ -155,5 +156,26 @@ async fn a_ts_value_mode_claims_its_probe_type_and_count() {
         assert_eq!(read.as_bytes()[10] as char, sep, "{name}: {read}");
         assert_eq!(&read[19..20], ".", "{name}: {read}");
         assert_eq!(text(name, &event), read, "{name}");
+    }
+
+    // A link's or an attribute's log a value mode replaced is read as that
+    // log, the link route being taken on the log's type
+    // (`dbAccess.c:928-929,945`): not the NaN of a link's `DBR_DOUBLE`, and,
+    // unlike C, not the attribute's text (`CharSource::after`).
+    for chain in [
+        r#"{"ts":{"num":"dbl"}}"#,
+        r#"{"ts":{"num":"ts"}}"#,
+        r#"{"ts":{"str":"epics"}}"#,
+    ] {
+        for (rec, fields) in [("LK", &["INP$", "INP"]), ("T", &["RTYP$", "RTYP"])] {
+            let reference = format!("{rec}.VAL{chain}");
+            let (ty, n, want, _) = probe(&client, &reference).await;
+            for field in fields {
+                let name = format!("{rec}.{field}{chain}");
+                let (got_ty, got_n, got, _) = probe(&client, &name).await;
+                assert_eq!((got_ty, got_n), (ty, n), "{name}");
+                assert_eq!(got, want, "{name}");
+            }
+        }
     }
 }

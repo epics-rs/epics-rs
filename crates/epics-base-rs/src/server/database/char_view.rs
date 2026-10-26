@@ -364,6 +364,21 @@ impl CharSource {
             CharSource::Attribute => Some(TextRoute::Attribute),
         }
     }
+
+    /// The route `dbGet` reads the log `filters` leave through: a log a
+    /// filter replaced is converted as the field, since the link route is
+    /// taken on the log's type (`dbAccess.c:928-929,945`).
+    ///
+    /// An attribute's is too. C tests `paddr->special` instead (`:950`), so
+    /// it ignores a `ts` log on an attribute and refuses it any type but a
+    /// string or chars, failing a read of the type it advertised: a C
+    /// defect, not copied.
+    pub fn after(self, filters: &FilterChain) -> Self {
+        match filters.log_type() {
+            Some(_) => CharSource::Field,
+            None => self,
+        }
+    }
 }
 
 /// A field `dbGet` reads as text whatever the request type, through
@@ -375,6 +390,16 @@ pub enum TextRoute {
 }
 
 impl TextRoute {
+    /// [`CharSource::after`]: the route left, `None` where `dbGet` converts
+    /// the log.
+    pub fn after(self, filters: &FilterChain) -> Option<Self> {
+        let source = match self {
+            TextRoute::Link => CharSource::Link,
+            TextRoute::Attribute => CharSource::Attribute,
+        };
+        source.after(filters).text_route()
+    }
+
     /// The read made for a `target` request, `None` for `S_db_badDbrtype`.
     pub fn read(self, target: crate::types::DbFieldType) -> Option<TextRead> {
         use crate::types::DbFieldType as T;
@@ -992,9 +1017,27 @@ pub struct DollarView {
     /// many chars and then cuts at the NUL (`dbAccess.c:1037-1045`); 0 for
     /// a link or an attribute, which `dbGet` does not cut.
     pad: usize,
+    /// The route `dbGet` reads the final log through
+    /// ([`CharSource::after`]).
     source: CharSource,
     /// `dbChannelFinalElements`: the `nRequest` pvxs reads with.
     final_elements: usize,
+    /// `dbChannelFinalFieldType`: `DBR_CHAR`, or the type of the log a
+    /// filter replaced the chars with.
+    final_type: DbFieldType,
+}
+
+/// What pvxs serves a channel read through its char address as, from
+/// `getChannelValueType` (`ioc/iocsource.cpp:619-643`): the one answer its
+/// descriptor and its read take.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CharServed {
+    /// `TypeCode::String`: a `DBR_CHAR` array whose format is `"String"`.
+    Text,
+    /// `fromDbrType(final_field_type)`, one element (`getScalarValue`).
+    Scalar(DbFieldType),
+    /// `fromDbrType(final_field_type).arrayOf()`.
+    Array(DbFieldType),
 }
 
 impl DollarView {
@@ -1021,21 +1064,28 @@ impl DollarView {
         Self {
             serve: PvaDollar::of_addr(&addr, form_string, field),
             pad: addr.pad(),
-            source: addr.source,
+            source: addr.source.after(filters),
             final_elements: filters.final_element_count(addr.no_elements),
+            final_type: filters.final_field_type(DbFieldType::Char),
         }
     }
 
-    /// Of a channel pvxs serves as text without `$` (`ioc/iocsource.cpp:633`)
-    /// and `final_elements` long: read through the char address pvxs
-    /// reshaped it to, `view` ([`ChannelAddr::re_view`]), which is the one
-    /// `dbChannelCreate` makes for `$`, or through a `DBF_CHAR` field's own.
-    pub fn of_text_channel(view: Option<&CharAddr>, final_elements: usize) -> Self {
+    /// Of a channel pvxs serves through a char address without `$`
+    /// (`ioc/iocsource.cpp:633`) and `no_elements` long before `filters`:
+    /// the one pvxs reshaped it to, `view` ([`ChannelAddr::re_view`]),
+    /// which is the one `dbChannelCreate` makes for `$`, or a `DBF_CHAR`
+    /// field's own.
+    pub fn of_text_channel(
+        view: Option<&CharAddr>,
+        no_elements: usize,
+        filters: &FilterChain,
+    ) -> Self {
         Self {
             serve: PvaDollar::Text,
             pad: view.map_or(0, CharAddr::pad),
-            source: view.map_or(CharSource::Field, |v| v.source),
-            final_elements,
+            source: view.map_or(CharSource::Field, |v| v.source).after(filters),
+            final_elements: filters.final_element_count(no_elements),
+            final_type: filters.final_field_type(DbFieldType::Char),
         }
     }
 
@@ -1047,16 +1097,26 @@ impl DollarView {
             pad: field_size,
             source: CharSource::Field,
             final_elements: filters.final_element_count(field_size),
+            final_type: filters.final_field_type(DbFieldType::Char),
         }
     }
 
-    /// Whether the channel serves one `int8_t` instead of an array: pvxs's
+    /// What pvxs serves the channel as.
+    pub fn served(self) -> CharServed {
+        match self.final_type {
+            t if self.scalar() => CharServed::Scalar(t),
+            DbFieldType::Char if self.serve == PvaDollar::Text => CharServed::Text,
+            t => CharServed::Array(t),
+        }
+    }
+
+    /// Whether the channel serves one element instead of an array: pvxs's
     /// `getScalarValue` for a final count of 1.
     pub fn scalar(self) -> bool {
         self.final_elements == 1
     }
 
-    /// Which of `dbGet`'s routes reads the field.
+    /// Which of `dbGet`'s routes reads the channel's final log.
     pub fn source(self) -> CharSource {
         self.source
     }
@@ -1084,9 +1144,10 @@ impl DollarView {
     }
 
     /// `dbGet`'s chars from the `log` a filter chain made of `image`. A
-    /// field's are the log, cut (`Self::cut`). A link's or an attribute's
-    /// are its text afresh: `getLinkValue`/`getAttrValue` ignore the log and
-    /// keep only its count, `nRequest` (`dbAccess.c:817-895,945-952`).
+    /// field's are the log, cut (`Self::cut`), as is a log a filter
+    /// replaced. A link's or an attribute's are its text afresh:
+    /// `getLinkValue`/`getAttrValue` ignore the log and keep only its count,
+    /// `nRequest` (`dbAccess.c:817-895,945-952`).
     pub fn read(self, image: EpicsValue, log: EpicsValue) -> EpicsValue {
         self.read_request(image, log, usize::MAX)
     }
@@ -1167,15 +1228,15 @@ impl DollarView {
         }
     }
 
-    /// The text of a [`PvaDollar::Text`] array channel: the image up to its
-    /// NUL (`ioc/iocsource.cpp:133-136`).
+    /// The text of a [`CharServed::Text`] channel: the image up to its NUL
+    /// (`ioc/iocsource.cpp:133-136`).
     ///
     /// Not pvxs's `buf[size-1]=0` (`:134`), which drops the last char of a
     /// full buffer: a C defect, and this read is bounded by the image's
     /// length, not by a NUL.
     pub fn text(self, value: EpicsValue) -> EpicsValue {
-        match self.serve {
-            PvaDollar::Text if !self.scalar() => long_string_text(value),
+        match self.served() {
+            CharServed::Text => long_string_text(value),
             _ => value,
         }
     }
@@ -1227,6 +1288,7 @@ mod tests {
             pad: 40,
             source: CharSource::Field,
             final_elements: 40,
+            final_type: DbFieldType::Char,
         };
         let EpicsValue::CharArray(image) = view.render(EpicsValue::String("hello".into())) else {
             panic!("a char image");

@@ -2073,6 +2073,84 @@ async fn a_dollar_link_arr_slice_serves_what_softiocpvx_serves() {
     }
 }
 
+/// A char view whose chain left one element, or whose `ts` replaced the
+/// log, serves what the channel advertises: one `DBR_CHAR`, or the log,
+/// which `dbGet` reads in place of the link's text because the link route
+/// is taken on the log's type (`dbAccess.c:928-929,945`). softIocPVX 1.5.3
+/// serves `LK.INP{"arr":{"s":0,"e":0}}` as `int8_t 0` and
+/// `LK.NAME{"arr":{"s":0,"e":0}}` as `int8_t 76`. An attribute's log is
+/// read too, which C does not do (`CharSource::after`).
+#[tokio::test]
+async fn a_char_view_through_a_retyping_chain_serves_the_log() {
+    let (db, _) = epics_base_rs::server::ioc_builder::IocBuilder::new()
+        .db_string(
+            r#"record(stringin, "FS") { field(VAL, "hello") field(PINI, "YES") }
+            record(stringin, "LK") { field(INP, "FS NPP") field(PINI, "YES") }"#,
+            &std::collections::HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    db.ioc_init().await;
+    let read = |name: String| {
+        let db = db.clone();
+        async move {
+            let ch = BridgeChannel::new(db, name.as_bytes()).await.expect(&name);
+            let epics_pva_rs::pvdata::FieldDesc::Structure { fields, .. } =
+                ch.get_field().await.expect("get_field")
+            else {
+                panic!("{name}: no NT descriptor");
+            };
+            let desc = fields
+                .into_iter()
+                .find(|(n, _)| n == "value")
+                .map(|(_, d)| d);
+            let got = ch.get(&empty_request()).await.expect(&name);
+            (desc, extract_value(&got).cloned())
+        }
+    };
+    use epics_pva_rs::pvdata::{FieldDesc, ScalarType};
+    let byte = |b| Some(PvField::Scalar(ScalarValue::Byte(b)));
+    for (name, want) in [
+        (r#"LK.INP{"arr":{"s":0,"e":0}}"#, byte(0)),
+        (r#"LK.NAME{"arr":{"s":0,"e":0}}"#, byte(b'L' as i8)),
+    ] {
+        assert_eq!(
+            read(name.into()).await,
+            (Some(FieldDesc::Scalar(ScalarType::Byte)), want),
+            "{name}"
+        );
+    }
+    for (chain, desc) in [
+        (
+            r#"{"ts":{"num":"ts"}}"#,
+            FieldDesc::ScalarArray(ScalarType::UInt),
+        ),
+        (
+            r#"{"ts":{"num":"dbl"}}"#,
+            FieldDesc::Scalar(ScalarType::Double),
+        ),
+        (
+            r#"{"ts":{"str":"epics"}}"#,
+            FieldDesc::Scalar(ScalarType::String),
+        ),
+    ] {
+        for (rec, fields) in [
+            ("LK", &["INP$", "INP", "DESC$", "NAME", "NAME$"][..]),
+            ("FS", &["RTYP$", "RTYP"][..]),
+        ] {
+            let reference = format!("{rec}.VAL{chain}");
+            let want = read(reference.clone()).await;
+            assert_eq!(want.0.as_ref(), Some(&desc), "{reference}");
+            for field in fields {
+                let name = format!("{rec}.{field}{chain}");
+                assert_eq!(read(name.clone()).await, want, "{name}");
+            }
+        }
+    }
+}
+
 /// A long string whose failed device read left its NUL past `LEN`
 /// (devlsiStream.c): pvxs keeps a SIZV 41 VAL the `DBF_STRING`
 /// `cvt_dbaddr` made it, read to the buffer's NUL, and re-views a SIZV 100

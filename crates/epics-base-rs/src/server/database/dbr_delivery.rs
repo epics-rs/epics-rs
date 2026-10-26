@@ -185,8 +185,10 @@ impl DeliveryStage {
             LongStringMode::DollarChar { view, .. } if !post.is_empty() => Some(view),
             _ => None,
         };
+        // The route left once the post chain ran: a log a filter replaced
+        // is converted as the field.
         let route = match long_string_mode {
-            LongStringMode::Text(route) => Some(route),
+            LongStringMode::Text(route) => route.after(&post),
             LongStringMode::DollarChar { view, .. } => view.source().text_route(),
             _ => None,
         };

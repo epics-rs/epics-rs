@@ -116,11 +116,12 @@ pub trait SubscriptionFilter: Send + Sync + 'static {
         input
     }
 
-    /// The field type this filter emits for an `input`-typed log, as its
-    /// `channelRegisterPost` sets `probe->field_type` (C
-    /// `dbChannelFinalFieldType`). Only `ts`'s value modes change it.
-    fn final_field_type(&self, input: crate::types::DbFieldType) -> crate::types::DbFieldType {
-        input
+    /// The field type of the log this filter puts in place of its input's,
+    /// as its `channelRegisterPost` sets `probe->field_type` (C
+    /// `dbChannelFinalFieldType`); `None` where the log keeps its input's
+    /// type. Only `ts`'s value modes replace it.
+    fn log_type(&self) -> Option<crate::types::DbFieldType> {
+        None
     }
 
     /// C's `channelRegisterPost` stage: the filter runs on the log the
@@ -208,12 +209,16 @@ impl FilterChain {
     }
 
     /// Final field type this chain produces for a `native`-typed field (C
-    /// `dbChannelFinalFieldType`), folded like
-    /// [`final_element_count`](Self::final_element_count).
+    /// `dbChannelFinalFieldType`).
     pub fn final_field_type(&self, native: crate::types::DbFieldType) -> crate::types::DbFieldType {
-        self.filters
-            .iter()
-            .fold(native, |t, f| f.final_field_type(t))
+        self.log_type().unwrap_or(native)
+    }
+
+    /// The type of the log the last replacing filter left, `None` where
+    /// every filter keeps the field's own
+    /// ([`SubscriptionFilter::log_type`]).
+    pub fn log_type(&self) -> Option<crate::types::DbFieldType> {
+        self.filters.iter().rev().find_map(|f| f.log_type())
     }
 
     /// The chain as C's `dbChannel` runs it, whatever the JSON order: the

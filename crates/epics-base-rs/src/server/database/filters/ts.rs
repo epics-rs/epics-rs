@@ -160,13 +160,13 @@ impl SubscriptionFilter for TimestampFilter {
     }
 
     /// `channelRegisterPost`'s probe type (`ts.c:350-362`).
-    fn final_field_type(&self, input: crate::types::DbFieldType) -> crate::types::DbFieldType {
+    fn log_type(&self) -> Option<crate::types::DbFieldType> {
         use crate::types::DbFieldType;
         match self.mode {
-            TsMode::Generate => input,
-            TsMode::Double => DbFieldType::Double,
-            TsMode::Seconds | TsMode::Nanoseconds | TsMode::Array => DbFieldType::ULong,
-            TsMode::StringEpics | TsMode::StringIso => DbFieldType::String,
+            TsMode::Generate => None,
+            TsMode::Double => Some(DbFieldType::Double),
+            TsMode::Seconds | TsMode::Nanoseconds | TsMode::Array => Some(DbFieldType::ULong),
+            TsMode::StringEpics | TsMode::StringIso => Some(DbFieldType::String),
         }
     }
 

@@ -2,7 +2,7 @@
 //!
 //! Corresponds to C++ QSRV's `pvif.h/pvif.cpp` (ScalarBuilder, etc.).
 
-use epics_base_rs::server::database::char_view::{ChannelAddr, DollarView, PvaDollar};
+use epics_base_rs::server::database::char_view::{ChannelAddr, CharServed, DollarView, PvaDollar};
 use epics_base_rs::server::recgbl::EventMask;
 use epics_base_rs::server::snapshot::{ControlInfo, DisplayInfo, PropertySupport, Snapshot};
 use epics_base_rs::types::{EpicsValue, PvString, WallTime};
@@ -404,7 +404,7 @@ pub(crate) enum View {
     Field,
     /// A `$` channel.
     Dollar(DollarView),
-    /// [`ChannelValue::Text`]: no `$`, read as one.
+    /// [`ChannelValue::Text`]: no `$`, read through a char view as one.
     Text(DollarView),
 }
 
@@ -478,12 +478,20 @@ impl View {
         mut snap: epics_base_rs::server::snapshot::Snapshot,
         filters: &epics_base_rs::server::database::filters::FilterChain,
     ) -> epics_base_rs::server::snapshot::Snapshot {
-        match self {
-            Self::Field if !filters.is_empty() => {
+        let chain = |snap: epics_base_rs::server::snapshot::Snapshot| {
+            if filters.is_empty() {
+                snap
+            } else {
                 filters.apply_to_read_snapshot(snap.clone()).unwrap_or(snap)
             }
-            _ => {
-                snap.value = self.read(snap.value, filters);
+        };
+        match self {
+            Self::Field => chain(snap),
+            Self::Dollar(dollar) | Self::Text(dollar) => {
+                let image = dollar.render(snap.value);
+                snap.value = image.clone();
+                let mut snap = chain(snap);
+                snap.value = dollar.finish(image, snap.value);
                 snap
             }
         }
@@ -526,9 +534,11 @@ impl View {
 /// a `bi` VAL is, and a `REC.SCAN` member is `NTEnum` while a `BI.DESC` one
 /// stays an `NTScalar` string.
 ///
-/// A long string is [`ChannelValue::Text`] or
-/// [`ChannelValue::LongStringField`]; a `$` channel is [`NtType::Dollar`]
-/// instead, whatever its format.
+/// A channel read through a char view, `$` or [`ChannelValue::Text`],
+/// serves what [`DollarView::served`] answers: its text, a long string
+/// without `$` and [`NtType::Dollar`] with it, or the type and count its
+/// chain left. A long string pvxs does not re-view is
+/// [`ChannelValue::LongStringField`].
 pub(crate) fn nt_type_for_channel(
     addr: &ChannelAddr,
     field_upper: &str,
@@ -537,12 +547,27 @@ pub(crate) fn nt_type_for_channel(
 ) -> NtType {
     // The `$` view, decided first, so the single-record and group paths
     // cannot reach different answers for one channel.
-    match view {
-        View::Dollar(dollar) if dollar.scalar() => return NtType::Scalar,
-        View::Dollar(dollar) => return NtType::Dollar(dollar.serve),
-        View::Text(_) => return NtType::LongString,
-        View::Field => {}
+    let dollar = match view {
+        View::Dollar(dollar) | View::Text(dollar) => dollar.served(),
+        View::Field => return nt_type_for_field(addr, field_upper, filters),
+    };
+    match (dollar, view) {
+        (CharServed::Scalar(_), _) => NtType::Scalar,
+        (CharServed::Text, View::Text(_)) => NtType::LongString,
+        (CharServed::Text, _) => NtType::Dollar(PvaDollar::Text),
+        (CharServed::Array(epics_base_rs::types::DbFieldType::Char), View::Dollar(_)) => {
+            NtType::Dollar(PvaDollar::Chars)
+        }
+        (CharServed::Array(_), _) => NtType::ScalarArray,
     }
+}
+
+/// [`nt_type_for_channel`] of a channel read as its field.
+fn nt_type_for_field(
+    addr: &ChannelAddr,
+    field_upper: &str,
+    filters: &epics_base_rs::server::database::filters::FilterChain,
+) -> NtType {
     match ChannelValue::of_addr(addr, field_upper, filters) {
         ChannelValue::Text(_) => NtType::LongString,
         ChannelValue::LongStringField => NtType::LongStringField,

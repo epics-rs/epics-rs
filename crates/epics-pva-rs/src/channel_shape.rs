@@ -125,9 +125,11 @@ impl ChannelShape {
 pub enum ChannelValue {
     /// `fromDbrType(final_field_type)` in this shape.
     Shaped(ChannelShape),
-    /// `TypeCode::String`, `final_field_type == DBR_CHAR && isArray &&
-    /// format == "String"` (`:633`): read through its char address as the
-    /// buffer's text (`:124-136`), a string put is `putLongString`
+    /// Read through its char address: a channel pvxs re-viewed
+    /// (`ioc/channel.cpp:56-73`), or a `DBF_CHAR` array whose format is
+    /// `"String"`. [`DollarView::served`] is what it serves: the buffer's
+    /// text (`:633`, `:124-136`), or whatever `type` and count the chain
+    /// left. A string put to an array of it is `putLongString`
     /// (`:601-603`).
     Text(DollarView),
     /// A long string with no room past `MAX_STRING_SIZE + 1`, which pvxs
@@ -144,16 +146,25 @@ impl ChannelValue {
         if view.is_none() && addr.long_string() {
             return Self::LongStringField;
         }
-        let final_elements = filters.final_element_count(match view {
-            Some(v) => v.no_elements(),
-            None => addr.no_elements(),
-        });
-        let shape = ChannelShape::of_count(final_elements);
-        // `DBR_CHAR`: the reshaped chars, or a `DBF_CHAR` field — the signed
-        // one, as pvxs tests.
-        let chars = view.is_some() || addr.value_type() == DbFieldType::Char;
-        if chars && shape.is_array() && addr.form_string(field_upper, view, false) {
-            return Self::Text(DollarView::of_text_channel(view, final_elements));
+        // The reshaped chars, whatever the chain leaves of them.
+        if let Some(view) = view {
+            return Self::Text(DollarView::of_text_channel(
+                Some(view),
+                view.no_elements(),
+                filters,
+            ));
+        }
+        let shape = ChannelShape::of_count(filters.final_element_count(addr.no_elements()));
+        // A `DBF_CHAR` field — the signed one, as pvxs tests.
+        if addr.value_type() == DbFieldType::Char
+            && shape.is_array()
+            && addr.form_string(field_upper, None, false)
+        {
+            return Self::Text(DollarView::of_text_channel(
+                None,
+                addr.no_elements(),
+                filters,
+            ));
         }
         Self::Shaped(shape)
     }

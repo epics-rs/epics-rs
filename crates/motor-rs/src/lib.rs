@@ -69,6 +69,10 @@ pub use record::MotorRecord;
 /// Path to the motor ioc directory (for motor.template resolution).
 pub const MOTOR_IOC_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/ioc");
 
+/// C's `$(MOTOR)`: its `db/` holds motorApp/Db's databases and request
+/// files, as C installs them.
+pub const MOTOR_DIR: &str = env!("CARGO_MANIFEST_DIR");
+
 /// Return the motor record type factory (name, factory) for injection into IocBuilder.
 pub fn motor_record_factory() -> (&'static str, epics_base_rs::server::RecordFactory) {
     epics_base_rs::server::record::register_contributed_dbd(&record::dbd_generated::DBD);

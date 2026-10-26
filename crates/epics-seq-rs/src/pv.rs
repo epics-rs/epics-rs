@@ -1367,6 +1367,99 @@ mod tests {
         until_landed(&landed, 2);
     }
 
+    /// A record whose `process` takes 100 ms, then sets `ended`: a put whose
+    /// FLNK reaches it runs on long after its own record posted.
+    struct Lingering {
+        ended: Arc<AtomicBool>,
+    }
+
+    impl epics_base_rs::server::record::Record for Lingering {
+        fn record_type(&self) -> &'static str {
+            "seq_lingering"
+        }
+        fn process(
+            &mut self,
+        ) -> epics_base_rs::error::CaResult<epics_base_rs::server::record::ProcessOutcome> {
+            std::thread::sleep(Duration::from_millis(100));
+            self.ended.store(true, Ordering::SeqCst);
+            Ok(epics_base_rs::server::record::ProcessOutcome::complete())
+        }
+        fn get_field(&self, name: &str) -> Option<EpicsValue> {
+            (name == "VAL").then_some(EpicsValue::Double(0.0))
+        }
+        fn put_field(&mut self, _: &str, _: EpicsValue) -> epics_base_rs::error::CaResult<()> {
+            Ok(())
+        }
+        fn declared_fields(&self) -> &'static [epics_base_rs::server::record::FieldDesc] {
+            &[]
+        }
+    }
+
+    /// `put` of ao record `g:x`, whose FLNK is a [`Lingering`] record: the
+    /// event `g:x` posts, which `CAC-event` takes at once, reaches its
+    /// callback only once the put has returned, so after the FLNK ended.
+    fn own_event_lands_after_the_put(put: impl FnOnce(&PvVar) -> PvStat) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            epics_base_rs::runtime::task::test_block_on(async move {
+                let db = PvDatabase::new();
+                let ended = Arc::new(AtomicBool::new(false));
+                let lingering = Lingering {
+                    ended: ended.clone(),
+                };
+                db.add_record("g:linger", Box::new(lingering))
+                    .await
+                    .unwrap();
+                db.add_record(
+                    "g:x",
+                    Box::new(epics_base_rs::server::records::ao::AoRecord::new(0.0)),
+                )
+                .await
+                .unwrap();
+                db.put_record_field_from_ca("g:x", "FLNK", EpicsValue::String("g:linger".into()))
+                    .await
+                    .unwrap();
+                db.mark_pini_done();
+                tx.send((db, ended)).unwrap();
+                std::future::pending::<()>().await
+            })
+        });
+        let (db, ended) = rx.recv().unwrap();
+        let sys = PvSystem::create(&db);
+        let x = PvVar::create(&sys, "g:x", |_| {}).unwrap();
+        let landed = Arc::new(AtomicU32::new(0));
+        let after_the_flnk = Arc::new(AtomicBool::new(false));
+        let (count, after) = (landed.clone(), after_the_flnk.clone());
+        x.monitor_on(PvType::Double, 1, move |_| {
+            if count.load(Ordering::SeqCst) == 1 {
+                after.store(ended.load(Ordering::SeqCst), Ordering::SeqCst);
+            }
+            count.fetch_add(1, Ordering::SeqCst);
+        });
+        sys.deliver();
+        assert_eq!(landed.load(Ordering::SeqCst), 1, "the first event");
+        assert_eq!(put(&x), PvStat::Ok);
+        until_landed(&landed, 2);
+        assert!(
+            after_the_flnk.load(Ordering::SeqCst),
+            "landed inside the put"
+        );
+    }
+
+    #[test]
+    fn a_puts_own_event_lands_after_it_returns() {
+        own_event_lands_after_the_put(|x| {
+            x.put_no_block(PvType::Double, 1, EpicsValue::Double(2.0))
+        });
+    }
+
+    #[test]
+    fn a_put_callbacks_own_event_lands_after_it_returns() {
+        own_event_lands_after_the_put(|x| {
+            x.put_callback(PvType::Double, 1, EpicsValue::Double(2.0), |_| {})
+        });
+    }
+
     /// An event queued for a monitor turned off before it is taken is
     /// dropped, as `db_cancel_event` drops a queued one.
     #[test]

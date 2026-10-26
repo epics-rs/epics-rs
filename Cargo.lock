@@ -232,6 +232,8 @@ dependencies = [
  "epics-ca-rs",
  "epics-libcom-rs",
  "epics-macros-rs",
+ "epics-seq-rs",
+ "epics-snc-rs",
  "libc",
  "named-port",
  "parking_lot",

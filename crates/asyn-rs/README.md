@@ -236,6 +236,7 @@ The adapter handles:
 | `port_handle` | `PortHandle` — cloneable async handle with typed convenience methods |
 | `runtime` | `PortRuntimeHandle`, `create_port_runtime`, supervision, `RuntimeEvent` lifecycle, async runtime facade (`sync`, `task`, `select!`) |
 | `adapter` | `AsynDeviceSupport` — the record bridge *(requires `epics`)* |
+| `snl` | testIPServerApp's `ipSNCServer.st`, compiled by epics-snc-rs and run on epics-seq-rs, with its `db/testIPServer.db`; `register_test_ip_server_dbd` makes it startable by `seq` *(requires `epics`)* |
 
 ## Runtime Facade
 

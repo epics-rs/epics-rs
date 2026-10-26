@@ -1118,7 +1118,7 @@ impl GroupChannel {
                     .snapshot_in(instance, view, backing)
                     .ok_or_else(not_found)?;
                 if let Some(log) = log {
-                    member.write_log_over(&mut snapshot, log, instance, view);
+                    member.write_log_over(&mut snapshot, log, view);
                 }
                 // Derive the NT shape from the configured field's address
                 // (record → common → virtual), not from the owning record
@@ -1128,7 +1128,9 @@ impl GroupChannel {
                 // `getChannelValueType` (groupconfigprocessor.cpp:960-974).
                 let nt_type = member.nt_type_in(&addr, view);
                 Ok(PvField::Structure(pvif::snapshot_to_pv_structure(
-                    &snapshot, nt_type,
+                    &snapshot,
+                    nt_type,
+                    instance.qtime_nsec_mask(),
                 )))
             }
             FieldMapping::Plain => {
@@ -1156,7 +1158,7 @@ impl GroupChannel {
                     .snapshot_in(instance, view, backing)
                     .ok_or_else(not_found)?;
                 if let Some(log) = log {
-                    member.write_log_over(&mut snapshot, log, instance, view);
+                    member.write_log_over(&mut snapshot, log, view);
                 }
                 // Same unnamed enclosing structure the descriptor
                 // advertises (see `meta_desc`), so the two cannot drift.
@@ -1167,7 +1169,11 @@ impl GroupChannel {
                 ));
                 meta.fields.push((
                     "timeStamp".into(),
-                    PvField::Structure(build_timestamp_from_snapshot(&snapshot)),
+                    PvField::Structure(pvif::build_timestamp(
+                        snapshot.timestamp,
+                        snapshot.user_tag,
+                        instance.qtime_nsec_mask(),
+                    )),
                 ));
                 Ok(PvField::Structure(meta))
             }
@@ -2906,40 +2912,6 @@ fn build_alarm_from_snapshot(snapshot: &epics_base_rs::server::snapshot::Snapsho
     alarm
 }
 
-/// Build a `timeStamp` PvStructure directly from the record snapshot.
-///
-/// The nanosecond / userTag split for `info(Q:time:tag, "nsec:lsb:N")`
-/// is applied once, when the member's snapshot is read
-/// (`MemberChannel::snapshot_in` via `apply_nsec_mask`), so
-/// `snapshot.timestamp` already carries the masked nanoseconds and
-/// `snapshot.user_tag` already carries the split bits / `common.utag`.
-/// The group encoder therefore serves them verbatim and must not remask
-/// — pvxs derives the same split from the record's `Q:time:tag`
-/// (`ioc/typeutils.cpp:79-87`, `ioc/iocsource.cpp:240-248`), never from
-/// group JSON.
-fn build_timestamp_from_snapshot(
-    snapshot: &epics_base_rs::server::snapshot::Snapshot,
-) -> PvStructure {
-    use epics_pva_rs::pvdata::ScalarValue;
-
-    let mut ts = PvStructure::new("time_t");
-    let dur = snapshot.timestamp.since_unix_epoch();
-    let (secs, nanos) = (dur.as_secs() as i64, dur.subsec_nanos() as i32);
-    ts.fields.push((
-        "secondsPastEpoch".into(),
-        PvField::Scalar(ScalarValue::Long(secs)),
-    ));
-    ts.fields.push((
-        "nanoseconds".into(),
-        PvField::Scalar(ScalarValue::Int(nanos)),
-    ));
-    ts.fields.push((
-        "userTag".into(),
-        PvField::Scalar(ScalarValue::Int(snapshot.user_tag)),
-    ));
-    ts
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2988,15 +2960,12 @@ mod tests {
         assert!(pv.get_field("x").is_some());
     }
 
-    /// a group `meta` timeStamp serves the record snapshot's userTag and
-    /// nanoseconds verbatim. The `Q:time:tag` nsec-LSB split is applied
-    /// once, by the member read (`MemberChannel::snapshot_in`
-    /// `apply_nsec_mask`), so the group encoder must not remask —
-    /// pvxs derives the split from the record, never from group JSON
-    /// (`ioc/iocsource.cpp:240-248`). `Snapshot.user_tag` defaults to the
-    /// record's `common.utag` (pvxs `iocsource.cpp:245`); the bit-31 tag
-    /// pins that the snapshot's i32 userTag passes through unchanged and
-    /// nanoseconds are not stripped by any group-level mask.
+    /// a group `meta` timeStamp of a record without `Q:time:tag` serves the
+    /// record snapshot's userTag and nanoseconds verbatim: the split mask is
+    /// the record's, never group JSON's (`ioc/iocsource.cpp:240-248`).
+    /// `Snapshot.user_tag` defaults to the record's `common.utag` (pvxs
+    /// `iocsource.cpp:245`); the bit-31 tag pins that the snapshot's i32
+    /// userTag passes through unchanged and nanoseconds are not stripped.
     #[test]
     fn group_timestamp_serves_record_snapshot_verbatim() {
         use epics_base_rs::server::snapshot::Snapshot;
@@ -3019,7 +2988,7 @@ mod tests {
         );
         snap.user_tag = 0x9000_0000u32 as i32;
 
-        let ts = build_timestamp_from_snapshot(&snap);
+        let ts = pvif::build_timestamp(snap.timestamp, snap.user_tag, 0);
         // userTag is the snapshot's (record) utag, not 0 and not remasked.
         assert_eq!(
             int_field(&ts, "userTag"),

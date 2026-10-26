@@ -296,17 +296,14 @@ impl MemberChannel {
     /// paths resolve it themselves (`read_group`'s `member_backings` for the
     /// atomic one, `read_member` for the non-atomic one) and hand it down.
     /// This method owns only the `$` view; it carries `backing` through
-    /// untouched.
+    /// untouched. The stamp stays raw; the encoder splits it.
     pub(super) fn snapshot_in(
         &self,
         instance: &epics_base_rs::server::record::RecordInstance,
         view: View,
         backing: epics_base_rs::server::database::LinkBacking<'_>,
     ) -> Option<epics_base_rs::server::snapshot::Snapshot> {
-        let mut snap = instance.channel_snapshot_for_field(&self.field, false, backing)?;
-        // pvxs splits every read it serves (`iocsource.cpp:239-248`); rsrv
-        // never does, so the record serves the raw stamp.
-        epics_base_rs::server::snapshot::apply_nsec_mask(&mut snap, instance.qtime_nsec_mask());
+        let snap = instance.channel_snapshot_for_field(&self.field, false, backing)?;
         Some(view.read_snapshot(snap, &self.value_filters))
     }
 
@@ -318,7 +315,6 @@ impl MemberChannel {
         &self,
         snap: &mut epics_base_rs::server::snapshot::Snapshot,
         log: &epics_base_rs::server::pv::MonitorEvent,
-        instance: &epics_base_rs::server::record::RecordInstance,
         view: View,
     ) {
         let served = self.log_value(log, view);
@@ -326,7 +322,6 @@ impl MemberChannel {
         if let Some(value) = served {
             snap.value = value;
         }
-        epics_base_rs::server::snapshot::apply_nsec_mask(snap, instance.qtime_nsec_mask());
     }
 
     /// The value a value event's `log` serves under `view`; `None` for a
@@ -839,15 +834,13 @@ impl Channel for BridgeChannel {
 
         // Through the database, which resolves a link-backed field's metadata
         // from the LINK TARGET's record — a second lock this holds none of.
-        let mut snapshot = self
+        let snapshot = self
             .db
             .channel_snapshot_for_field(&rec, &self.field, false)
             .ok_or_else(|| BridgeError::FieldNotFound {
                 record: self.record_name.to_string(),
                 field: self.field.clone(),
             })?;
-        // pvxs's `Q:time:tag` split (`iocsource.cpp:239-248`).
-        epics_base_rs::server::snapshot::apply_nsec_mask(&mut snapshot, rec.qtime_nsec_mask());
 
         // Apply the channel-filter chain in READ context. pvxs wraps
         // every QSRV GET in a `LocalFieldLog` and runs the field-log
@@ -873,7 +866,12 @@ impl Channel for BridgeChannel {
             .view(&rec)?
             .read_snapshot(snapshot, &self.channel_filters);
 
-        let full = snapshot_to_pv_structure(&snapshot, self.nt_type);
+        // The chain read the raw stamp; the `Q:time:tag` split is served
+        // here, as `IOCSource::get` serves it (`iocsource.cpp:239-248`).
+        // pvxs's `// TODO: MappingInfo::nsecMask` (`singlesource.cpp:283`)
+        // is stale: `SingleInfo` already sets the mask
+        // (`singlesrcsubscriptionctx.h:29`).
+        let full = snapshot_to_pv_structure(&snapshot, self.nt_type, rec.qtime_nsec_mask());
         Ok(pvif::filter_by_request(&full, request))
     }
 
@@ -1885,5 +1883,88 @@ record(ai, "linked") { field(INP, "ai.VAL CP") info(Q:form, "String") }
             panic!("a: {served:?}");
         };
         assert_eq!(a.value, nsec, "any member");
+    }
+
+    /// The filter chain reads a `Q:time:tag` record's whole nanoseconds;
+    /// pvxs splits the tag off only where it serves the timeStamp
+    /// (`iocsource.cpp:248-254`), after the chain ran. `{"ts":{}}` restamps
+    /// with the current time, which is split the same way.
+    #[epics_base_rs::epics_test]
+    async fn a_qtime_tag_record_splits_the_stamp_after_the_chain() {
+        use super::super::group::GroupChannel;
+        let (db, _) = epics_base_rs::server::ioc_builder::IocBuilder::new()
+            .db_string(
+                r#"record(ai, "T") { field(VAL, "1") info(Q:time:tag, "nsec:lsb:20") }"#,
+                &std::collections::HashMap::new(),
+            )
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        db.get_record("T").unwrap().write().common.time = epics_base_rs::types::WallTime::UNIX_EPOCH
+            + std::time::Duration::new(1_000_000_000, 333_333_333);
+        let mask = (1u32 << 20) - 1;
+        let raw = 333_333_333u32;
+        let nsec = PvField::Scalar(ScalarValue::UInt(raw));
+        let stamp = |top: &PvStructure| {
+            let Some(PvField::Structure(ts)) = top.get_field("timeStamp") else {
+                panic!("timeStamp: {top:?}");
+            };
+            let (
+                Some(PvField::Scalar(ScalarValue::Int(n))),
+                Some(PvField::Scalar(ScalarValue::Int(t))),
+            ) = (ts.get_field("nanoseconds"), ts.get_field("userTag"))
+            else {
+                panic!("timeStamp: {ts:?}");
+            };
+            (*n as u32, *t as u32)
+        };
+        let split = (raw & !mask, raw & mask);
+
+        let name = r#"T.VAL{"ts":{"num":"nsec"}}"#;
+        let ch = BridgeChannel::new(db.clone(), name.as_bytes())
+            .await
+            .unwrap();
+        let single = ch.get(&PvStructure::new("")).await.unwrap();
+
+        let chan = name.replace('"', "\\\"");
+        let json = format!(
+            r#"{{"G:x": {{"s": {{"+channel": "{chan}", "+type": "scalar"}}, "p": {{"+channel": "{chan}", "+type": "plain"}}, "m": {{"+channel": "{chan}", "+type": "meta"}}}}}}"#
+        );
+        let def = super::super::group_config::parse_group_config(&json)
+            .unwrap()
+            .pop()
+            .unwrap();
+        let group = GroupChannel::new(db.clone(), def);
+        let served = group.get(&PvStructure::new("")).await.unwrap();
+        let (Some(PvField::Structure(s)), Some(PvField::Structure(m))) =
+            (served.get_field("s"), served.get_field("m"))
+        else {
+            panic!("group: {served:?}");
+        };
+
+        let ch = BridgeChannel::new(db.clone(), br#"T.VAL{"ts":{}}"#)
+            .await
+            .unwrap();
+        let (restamped, _) = stamp(&ch.get(&PvStructure::new("")).await.unwrap());
+
+        // One comparison, so a failure shows every path at once.
+        let nsec = Some(&nsec);
+        assert_eq!(
+            [
+                ("channel value", single.get_field("value") == nsec),
+                ("channel stamp", stamp(&single) == split),
+                ("scalar member value", s.get_field("value") == nsec),
+                ("scalar member stamp", stamp(s) == split),
+                ("plain member", served.get_field("p") == nsec),
+                ("meta member stamp", stamp(m) == split),
+                ("restamped time", restamped & mask == 0),
+            ]
+            .into_iter()
+            .filter(|(_, ok)| !ok)
+            .map(|(path, _)| path)
+            .collect::<Vec<_>>(),
+            Vec::<&str>::new()
+        );
     }
 }

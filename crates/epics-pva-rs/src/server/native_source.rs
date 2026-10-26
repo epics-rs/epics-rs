@@ -400,9 +400,11 @@ impl NtShape {
     }
 }
 
-fn snapshot_to_pv_field(snap: &Snapshot) -> PvField {
+/// `snap` served, its time split along `nsec_mask`, the record's
+/// `Q:time:tag` mask (0 for a mailbox PV, which has no record).
+fn snapshot_to_pv_field(snap: &Snapshot, nsec_mask: u64) -> PvField {
     let mut v = crate::pvdata::encode::default_value_for(&NtShape::of(snap).desc());
-    fill_nt(&mut v, snap);
+    fill_nt(&mut v, snap, nsec_mask);
     v
 }
 
@@ -413,10 +415,10 @@ fn snapshot_to_field_desc(snap: &Snapshot) -> FieldDesc {
 }
 
 /// Fill every leaf `snap` serves into `v`, a tree of `NtShape::of(snap)`.
-fn fill_nt(v: &mut PvField, snap: &Snapshot) {
+fn fill_nt(v: &mut PvField, snap: &Snapshot, nsec_mask: u64) {
     let layout = NtLayout::new(NtShape::of(snap));
     fill_nt_meta(v, layout.shape, snap);
-    fill_nt_event(v, &layout.event, &LogLeaves::of_snapshot(snap));
+    fill_nt_event(v, &layout.event, &LogLeaves::of_snapshot(snap, nsec_mask));
 }
 
 /// An [`NtShape`] with the positions of the leaves an event assigns, resolved
@@ -533,12 +535,17 @@ struct LogLeaves<'a> {
     stat: u16,
     sevr: u16,
     amsg: &'a str,
+    /// The raw stamp, as `db_create_field_log` copies it (`dbEvent.c:710`)
+    /// and the chain left it.
     time: WallTime,
     utag: i32,
+    /// The channel's `Q:time:tag` mask, split off `time` only as the
+    /// `timeStamp` is filled ([`fill_timestamp`]).
+    nsec_mask: u64,
 }
 
 impl<'a> LogLeaves<'a> {
-    fn of_snapshot(snap: &'a Snapshot) -> Self {
+    fn of_snapshot(snap: &'a Snapshot, nsec_mask: u64) -> Self {
         Self {
             value: &snap.value,
             stat: snap.alarm.status,
@@ -546,23 +553,20 @@ impl<'a> LogLeaves<'a> {
             amsg: &snap.alarm.amsg,
             time: snap.timestamp,
             utag: snap.user_tag,
+            nsec_mask,
         }
     }
 
-    /// `ev`'s leaves, its value being `value` ([`logged_value`]). The log
-    /// carries the record's raw stamp, as `db_create_field_log` copies it
-    /// (`dbEvent.c:710`); `nsec_mask` is the channel's `Q:time:tag` split,
-    /// which pvxs applies to the served `timeStamp` (`iocsource.cpp:239-248`).
+    /// `ev`'s leaves, its value being `value` ([`logged_value`]).
     fn of_event(ev: &'a MonitorEvent, value: &'a EpicsValue, nsec_mask: u64) -> Self {
-        let (time, utag) =
-            epics_base_rs::server::snapshot::split_nsec(ev.time(), ev.utag(), nsec_mask);
         Self {
             value,
             stat: ev.stat(),
             sevr: ev.sevr(),
             amsg: ev.amsg(),
-            time,
-            utag,
+            time: ev.time(),
+            utag: ev.utag(),
+            nsec_mask,
         }
     }
 }
@@ -583,7 +587,7 @@ fn fill_nt_event(v: &mut PvField, at: &EventLeaves, log: &LogLeaves) {
         }
     }
     fill_alarm(v, at, log.stat, log.sevr, log.amsg);
-    fill_timestamp(v, at, log.time, log.utag);
+    fill_timestamp(v, at, log.time, log.utag, log.nsec_mask);
 }
 
 /// The leaves a metadata read assigns — `getProperties` under
@@ -935,17 +939,17 @@ fn alarm_status_class(condition: u16) -> i32 {
     }
 }
 
-fn fill_timestamp(v: &mut PvField, at: &EventLeaves, time: WallTime, utag: i32) {
+/// The one place a served PVA `timeStamp` takes the `Q:time:tag` split:
+/// pvxs splits it while filling the reply (`iocsource.cpp:239-248`), after
+/// the chain read the whole nanoseconds.
+fn fill_timestamp(v: &mut PvField, at: &EventLeaves, time: WallTime, utag: i32, nsec_mask: u64) {
     // pvxs `iocsource.cpp:240-248`: `timeStamp` carries the record's
     // acquisition time and userTag, NOT the serialization wall-clock.
-    // `Snapshot.timestamp` is the acquisition `WallTime` (POSIX epoch;
-    // the codec already added POSIX_TIME_AT_EPICS_EPOCH on decode) and
-    // `Snapshot.user_tag` is the nsec-LSB / pulse-id tag that
-    // `apply_nsec_mask` strips out of `nanoseconds` (mirroring
-    // pvxs `meta.time.nsec & ~info.nsecMask` for the wire nanoseconds and
-    // `meta.time.nsec & info.nsecMask` for userTag). Using `now()` here
+    // `time` is the acquisition `WallTime` (POSIX epoch; the codec already
+    // added POSIX_TIME_AT_EPICS_EPOCH on decode). Using `now()` here
     // overwrote the acquisition time with serialization time and zeroed
     // the userTag on every record-backed GET/MONITOR.
+    let (time, utag) = epics_base_rs::server::snapshot::split_nsec(time, utag, nsec_mask);
     let dur = time.since_unix_epoch();
     LeafAt::set_scalar(at.seconds, v, ScalarValue::Long(dur.as_secs() as i64));
     LeafAt::set_scalar(
@@ -1038,9 +1042,12 @@ async fn channel_entry(db: &PvDatabase, cn: &ChannelName) -> Option<PvEntry> {
     Some(entry)
 }
 
+#[cfg(test)]
 async fn snapshot_for(db: &PvDatabase, name: &[u8]) -> Option<Snapshot> {
     let (cn, filters) = resolve_channel(db, name)?;
-    channel_snapshot(db, &cn, &filters).await
+    channel_snapshot(db, &cn, &filters)
+        .await
+        .map(|(snap, _)| snap)
 }
 
 /// One read of an already-resolved channel, with its chain applied in read
@@ -1055,11 +1062,14 @@ async fn snapshot_for(db: &PvDatabase, name: &[u8]) -> Option<Snapshot> {
 /// so `dbnd` refusing a sub-deadband read suppresses a monitor update but
 /// never a GET. That fallback is the reason this cannot simply propagate
 /// the `None`.
+///
+/// Returned with the record's `Q:time:tag` mask (0 for a mailbox PV), for
+/// the serving step alone: the snapshot keeps the raw stamp the chain read.
 async fn channel_snapshot(
     db: &PvDatabase,
     cn: &ChannelName,
     filters: &FilterChain,
-) -> Option<Snapshot> {
+) -> Option<(Snapshot, u64)> {
     let mut snap = match channel_entry(db, cn).await? {
         // A mailbox SharedPV has no field to address; `$` re-views a
         // string as a character array, so it is the same value and only
@@ -1078,11 +1088,12 @@ async fn channel_snapshot(
             // image and its text are both cut from that ([`PvaDollar::render`]).
             let addr = ChannelAddr::of(db, &rec, &cn.field)?;
             let render = record_channel_render(&addr, cn, filters)?;
-            return record_snapshot(db, &rec, &cn.field, render, filters);
+            let snap = record_snapshot(db, &rec, &cn.field, render, filters)?;
+            return Some((snap, rec.qtime_nsec_mask()));
         }
     };
     read_snapshot_chain(filters, &mut snap);
-    Some(snap)
+    Some((snap, 0))
 }
 
 /// [`channel_snapshot`]'s record arm, which takes no `await`: a record
@@ -1097,9 +1108,6 @@ fn record_snapshot(
     filters: &FilterChain,
 ) -> Option<Snapshot> {
     let mut snap = db.channel_snapshot_for_field(rec, field, false)?;
-    // pvxs splits the `Q:time:tag` bits out of every read it serves
-    // (`iocsource.cpp:239-248`); the record serves rsrv's raw stamp.
-    epics_base_rs::server::snapshot::apply_nsec_mask(&mut snap, rec.qtime_nsec_mask());
     render.read(&mut snap, filters);
     Some(snap)
 }
@@ -1257,7 +1265,7 @@ async fn channel_desc(db: &PvDatabase, name: &[u8]) -> Option<FieldDesc> {
         let render = record_channel_render(&addr, &cn, &filters)?;
         return Some(record_channel_desc(&addr, render, &filters));
     }
-    let snap = channel_snapshot(db, &cn, &filters).await?;
+    let (snap, _) = channel_snapshot(db, &cn, &filters).await?;
     Some(snapshot_to_field_desc(&snap))
 }
 
@@ -1363,8 +1371,9 @@ impl ChannelSource for PvDatabaseSource {
         let db = self.db.clone();
         let name = RecordName::from(name);
         async move {
-            let snap = snapshot_for(&db, &name).await?;
-            Some(snapshot_to_pv_field(&snap))
+            let (cn, filters) = resolve_channel(&db, &name)?;
+            let (snap, nsec_mask) = channel_snapshot(&db, &cn, &filters).await?;
+            Some(snapshot_to_pv_field(&snap, nsec_mask))
         }
     }
 
@@ -1413,8 +1422,8 @@ impl ChannelSource for PvDatabaseSource {
             // is what lets a read move `dbnd`'s baseline (see
             // [`NativeChannel`]).
             let ch = channel_for(&db, &cache, &name, peer)?;
-            let snap = channel_snapshot(&db, &ch.cn, &ch.value_filters).await?;
-            let value = snapshot_to_pv_field(&snap);
+            let (snap, nsec_mask) = channel_snapshot(&db, &ch.cn, &ch.value_filters).await?;
+            let value = snapshot_to_pv_field(&snap, nsec_mask);
             Some(SourceRead::marked(
                 value,
                 read_leaves(
@@ -1760,7 +1769,7 @@ impl ChannelSource for PvDatabaseSource {
                     use epics_base_rs::server::pv::PvSubscription;
                     match PvSubscription::subscribe(pv.clone()).await {
                         Ok(sub) => {
-                            let initial = snapshot_to_pv_field(&pv.snapshot());
+                            let initial = snapshot_to_pv_field(&pv.snapshot(), 0);
                             // The seed rides on the stream and is handed out
                             // ahead of the subscription's own events, exactly
                             // as the bridge's `tx.send(initial)` did before it
@@ -1776,7 +1785,7 @@ impl ChannelSource for PvDatabaseSource {
                             // connect-time read so the client at least sees
                             // the current value, then end the stream.
                             let (tx, rx) = mpsc::channel::<PvField>(1);
-                            let _ = tx.send(snapshot_to_pv_field(&pv.snapshot())).await;
+                            let _ = tx.send(snapshot_to_pv_field(&pv.snapshot(), 0)).await;
                             Some(MonitorStream::Channel(rx))
                         }
                     }
@@ -2283,7 +2292,7 @@ fn logged_value<'a>(
 /// A mailbox PV's monitor transform: every delivered read yields its whole
 /// value, the PV's metadata read at delivery included.
 fn event_field(snap: Snapshot) -> Option<PvField> {
-    Some(snapshot_to_pv_field(&snap))
+    Some(snapshot_to_pv_field(&snap, 0))
 }
 
 /// `ev` with its snapshot's chars decoded to the text `view` serves
@@ -3098,7 +3107,7 @@ mod tests {
 
     /// The `name` sub-structure of the tree `snap` fills.
     fn event_struct(snap: &Snapshot, name: &str) -> PvStructure {
-        let PvField::Structure(root) = snapshot_to_pv_field(snap) else {
+        let PvField::Structure(root) = snapshot_to_pv_field(snap, 0) else {
             panic!("an NT root");
         };
         match root.get_field(name) {
@@ -3270,7 +3279,7 @@ mod tests {
         ] {
             let snap = Snapshot::new(v.clone(), 0, 0, std::time::UNIX_EPOCH);
             let desc = snapshot_to_field_desc(&snap);
-            let value = snapshot_to_pv_field(&snap);
+            let value = snapshot_to_pv_field(&snap, 0);
             crate::pvdata::value_matches_descriptor(&value, &desc)
                 .unwrap_or_else(|e| panic!("value/desc mismatch for {v:?}: {e}"));
         }
@@ -3282,7 +3291,7 @@ mod tests {
     #[test]
     fn form_choices_carry_the_qform_menu() {
         let snap = Snapshot::new(EpicsValue::Double(0.0), 0, 0, std::time::UNIX_EPOCH);
-        let PvField::Structure(root) = snapshot_to_pv_field(&snap) else {
+        let PvField::Structure(root) = snapshot_to_pv_field(&snap, 0) else {
             panic!("NT must be a structure");
         };
         let PvField::Structure(display) = root.get_field("display").expect("display") else {
@@ -3329,7 +3338,7 @@ mod tests {
                 form,
                 ..Default::default()
             });
-            let PvField::Structure(root) = snapshot_to_pv_field(&snap) else {
+            let PvField::Structure(root) = snapshot_to_pv_field(&snap, 0) else {
                 panic!("NT must be a structure");
             };
             let PvField::Structure(display) = root.get_field("display").expect("display") else {
@@ -3443,7 +3452,7 @@ mod tests {
         for props in all_property_masks() {
             let snap = sentinel_snapshot(props);
             let marked: Vec<&str> = crate::nt::property_leaves(props);
-            let mut root = snapshot_to_pv_field(&snap);
+            let mut root = snapshot_to_pv_field(&snap, 0);
             for (path, sentinel) in sentinel_property_leaves() {
                 let Some(PvField::Scalar(got)) = leaf_mut(&mut root, path) else {
                     panic!("{path} must exist on an NTScalar(double)");
@@ -3484,7 +3493,7 @@ mod tests {
         let mut snap = Snapshot::new(EpicsValue::Enum(1), 0, 0, std::time::UNIX_EPOCH);
         snap.enums = Some(EnumInfo::new(vec!["OFF".into(), "ON".into()]));
         assert!(!snap.properties.enum_strs);
-        let PvField::Structure(s) = snapshot_to_pv_field(&snap) else {
+        let PvField::Structure(s) = snapshot_to_pv_field(&snap, 0) else {
             panic!("NTEnum must be a structure");
         };
         let Some(PvField::Structure(value)) = s.get_field("value") else {
@@ -3512,7 +3521,7 @@ mod tests {
         let (d, c) = (DisplayInfo::default(), ControlInfo::default());
         for props in all_property_masks() {
             for leaf in crate::nt::property_leaves(props) {
-                let mut v = snapshot_to_pv_field(&sentinel_snapshot(props));
+                let mut v = snapshot_to_pv_field(&sentinel_snapshot(props), 0);
                 assert!(
                     write_property_leaf(&mut v, leaf, &d, &c),
                     "{leaf} is marked for {props:?} but has no writer"
@@ -3541,7 +3550,7 @@ mod tests {
         assert!(snap.display.is_none() && snap.control.is_none());
 
         let marked = read_leaves(&snap, true);
-        let mut root = snapshot_to_pv_field(&snap);
+        let mut root = snapshot_to_pv_field(&snap, 0);
         for (path, _) in sentinel_property_leaves() {
             assert!(
                 marked.iter().any(|m| m == path),
@@ -3574,7 +3583,7 @@ mod tests {
             upper_alarm_limit: 10.0,
             ..Default::default()
         });
-        let PvField::Structure(root) = snapshot_to_pv_field(&snap) else {
+        let PvField::Structure(root) = snapshot_to_pv_field(&snap, 0) else {
             panic!("NT must be a structure");
         };
         let PvField::Structure(v) = root.get_field("valueAlarm").expect("valueAlarm") else {
@@ -3603,7 +3612,7 @@ mod tests {
             units: "Torr".into(),
             ..Default::default()
         });
-        let PvField::Structure(root) = snapshot_to_pv_field(&snap) else {
+        let PvField::Structure(root) = snapshot_to_pv_field(&snap, 0) else {
             panic!("NT must be a structure");
         };
         let PvField::Structure(d) = root.get_field("display").expect("display") else {
@@ -3642,10 +3651,10 @@ mod tests {
 
         // A tree that held "HIHI" and is filled in place again with NO_ALARM
         // serves "", not the old message's bytes.
-        let mut v = snapshot_to_pv_field(&snap);
+        let mut v = snapshot_to_pv_field(&snap, 0);
         let layout = NtLayout::new(NtShape::of(&ok));
-        fill_nt_event(&mut v, &layout.event, &LogLeaves::of_snapshot(&ok));
-        assert_eq!(v, snapshot_to_pv_field(&ok));
+        fill_nt_event(&mut v, &layout.event, &LogLeaves::of_snapshot(&ok, 0));
+        assert_eq!(v, snapshot_to_pv_field(&ok, 0));
     }
 
     /// Every event leaf resolves, on every NT shape, to the member the dotted
@@ -3759,7 +3768,7 @@ mod tests {
         snap.enums = Some(EnumInfo::new(vec!["OFF".into(), "ON".into()]));
 
         // value: NTEnum struct id + nested enum_t { index, choices }.
-        let PvField::Structure(s) = snapshot_to_pv_field(&snap) else {
+        let PvField::Structure(s) = snapshot_to_pv_field(&snap, 0) else {
             panic!("NTEnum value must be a structure");
         };
         assert_eq!(s.struct_id, "epics:nt/NTEnum:1.0");
@@ -3818,7 +3827,7 @@ mod tests {
         // An enum snapshot with no choice metadata yields empty choices,
         // not a panic or a missing field.
         let bare = Snapshot::new(EpicsValue::Enum(0), 0, 0, std::time::UNIX_EPOCH);
-        let PvField::Structure(bs) = snapshot_to_pv_field(&bare) else {
+        let PvField::Structure(bs) = snapshot_to_pv_field(&bare, 0) else {
             panic!("structure");
         };
         let Some(PvField::Structure(bv)) = bs.get_field("value") else {
@@ -3842,7 +3851,7 @@ mod tests {
 
         // Scalar DBF_CHAR → signed byte (value + descriptor).
         let snap = Snapshot::new(EpicsValue::Char(200), 0, 0, ts);
-        let PvField::Structure(s) = snapshot_to_pv_field(&snap) else {
+        let PvField::Structure(s) = snapshot_to_pv_field(&snap, 0) else {
             panic!("NTScalar value must be a structure");
         };
         let Some(PvField::Scalar(ScalarValue::Byte(b))) = s.get_field("value") else {
@@ -3865,7 +3874,7 @@ mod tests {
 
         // Scalar DBF_UCHAR → unsigned byte (the untouched twin).
         let usnap = Snapshot::new(EpicsValue::UChar(200), 0, 0, ts);
-        let PvField::Structure(us) = snapshot_to_pv_field(&usnap) else {
+        let PvField::Structure(us) = snapshot_to_pv_field(&usnap, 0) else {
             panic!("structure");
         };
         let Some(PvField::Scalar(ScalarValue::UByte(u))) = us.get_field("value") else {
@@ -3875,7 +3884,7 @@ mod tests {
 
         // Array DBF_CHAR[] → signed byte[], element-wise (value + descriptor).
         let asnap = Snapshot::new(EpicsValue::CharArray(vec![200, 0, 127].into()), 0, 0, ts);
-        let PvField::Structure(a) = snapshot_to_pv_field(&asnap) else {
+        let PvField::Structure(a) = snapshot_to_pv_field(&asnap, 0) else {
             panic!("structure");
         };
         let Some(PvField::ScalarArrayTyped(TypedScalarArray::Byte(arr))) = a.get_field("value")
@@ -3934,7 +3943,7 @@ mod tests {
             units: PvString::from_bytes(raw.clone()),
             ..Default::default()
         });
-        let PvField::Structure(root) = snapshot_to_pv_field(&snap) else {
+        let PvField::Structure(root) = snapshot_to_pv_field(&snap, 0) else {
             panic!("NT must be a structure");
         };
         let PvField::Structure(d) = root.get_field("display").expect("display") else {
@@ -3962,7 +3971,7 @@ mod tests {
         let mut esnap = Snapshot::new(EpicsValue::Enum(0), 0, 0, std::time::UNIX_EPOCH);
         esnap.properties.enum_strs = true;
         esnap.enums = Some(EnumInfo::new(vec![PvString::from_bytes(raw.clone())]));
-        let PvField::Structure(s) = snapshot_to_pv_field(&esnap) else {
+        let PvField::Structure(s) = snapshot_to_pv_field(&esnap, 0) else {
             panic!("NTEnum value must be a structure");
         };
         let Some(PvField::Structure(value)) = s.get_field("value") else {
@@ -4029,7 +4038,7 @@ mod tests {
             "the record-level cache still holds PREC, which is what made this bite"
         );
 
-        let mut root = snapshot_to_pv_field(&snap);
+        let mut root = snapshot_to_pv_field(&snap, 0);
         let Some(PvField::Scalar(got)) = leaf_mut(&mut root, "display.precision") else {
             panic!("display.precision must exist on the NT");
         };
@@ -5640,6 +5649,84 @@ ASG(DEFAULT) {
         ));
     }
 
+    /// The filter chain reads a `Q:time:tag` record's whole nanoseconds;
+    /// pvxs splits the tag off only where it serves the timeStamp
+    /// (`iocsource.cpp:248-254`), after the chain ran. `{"ts":{}}` restamps
+    /// with the current time, which is split the same way.
+    #[epics_macros_rs::epics_test]
+    async fn a_qtime_tag_record_get_splits_the_stamp_after_the_chain() {
+        let (db, _) = epics_base_rs::server::ioc_builder::IocBuilder::new()
+            .db_string(
+                r#"record(ai, "AI:QTS") { info(Q:time:tag, "nsec:lsb:20") }"#,
+                &HashMap::new(),
+            )
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        db.get_record("AI:QTS").unwrap().write().common.time =
+            epics_base_rs::types::WallTime::UNIX_EPOCH
+                + std::time::Duration::new(1_000_000_000, 333_333_333);
+        let source = PvDatabaseSource::new(db.clone());
+        let ctx = make_ctx("localhost", "op", "ca");
+        let get = |name: &'static str| {
+            let (source, ctx) = (&source, ctx.clone());
+            async move {
+                let checked = source
+                    .access()
+                    .check(
+                        name,
+                        &ctx.creds.host,
+                        &ctx.creds.account,
+                        &ctx.creds.method,
+                        "",
+                    )
+                    .await;
+                let read = source.read_checked(checked, ctx).await.expect(name);
+                let PvField::Structure(top) = read.value else {
+                    panic!("{name}: an NTScalar is a structure");
+                };
+                top
+            }
+        };
+        let mask = (1u32 << 20) - 1;
+        let stamp = |top: &PvStructure| {
+            let Some(PvField::Structure(ts)) = top.get_field("timeStamp") else {
+                panic!("an NTScalar carries timeStamp");
+            };
+            let (ScalarValue::Int(n), ScalarValue::Int(t)) =
+                (scalar(ts, "nanoseconds"), scalar(ts, "userTag"))
+            else {
+                panic!("timeStamp: {ts:?}");
+            };
+            (n as u32, t as u32)
+        };
+
+        let top = get(r#"AI:QTS.VAL{"ts":{"num":"nsec"}}"#).await;
+        let (restamped, _) = stamp(&get(r#"AI:QTS.VAL{"ts":{}}"#).await);
+
+        // One comparison, so a failure shows every path at once.
+        assert_eq!(
+            [
+                (
+                    "ts value mode",
+                    top.get_field("value")
+                        == Some(&PvField::Scalar(ScalarValue::UInt(333_333_333))),
+                ),
+                (
+                    "stamp",
+                    stamp(&top) == (333_333_333 & !mask, 333_333_333 & mask),
+                ),
+                ("restamped time", restamped & mask == 0),
+            ]
+            .into_iter()
+            .filter(|(_, ok)| !ok)
+            .map(|(path, _)| path)
+            .collect::<Vec<_>>(),
+            Vec::<&str>::new()
+        );
+    }
+
     /// pvxs reads a channel's `Q:time:tag` with no lock (`typeutils.cpp:79-88`),
     /// so a monitor's door on a record another thread holds is built at once.
     #[epics_macros_rs::epics_test]
@@ -6097,12 +6184,12 @@ ASG(DEFAULT) {
         let snap = |v: &EpicsValue| Snapshot::new(v.clone(), 0, 0, std::time::UNIX_EPOCH);
         for (first, second) in shape_changes() {
             let mut ring = PostRing::new(4, snap(&first));
-            ring.post(&LogLeaves::of_snapshot(&snap(&first)));
+            ring.post(&LogLeaves::of_snapshot(&snap(&first), 0));
             let served = ring
-                .post(&LogLeaves::of_snapshot(&snap(&second)))
+                .post(&LogLeaves::of_snapshot(&snap(&second), 0))
                 .into_owned();
             let fresh = PostRing::new(4, snap(&first))
-                .post(&LogLeaves::of_snapshot(&snap(&second)))
+                .post(&LogLeaves::of_snapshot(&snap(&second), 0))
                 .into_owned();
             assert_eq!(served, fresh, "{first:?} then {second:?}");
         }

@@ -812,7 +812,7 @@ fn limit_scalar(t: ScalarType, v: f64) -> ScalarValue {
 ///
 /// Structure ID: `epics:nt/NTScalar:1.0`
 /// Fields: value, alarm, timeStamp, display (optional), control (optional)
-pub fn snapshot_to_nt_scalar(snapshot: &Snapshot) -> PvStructure {
+pub fn snapshot_to_nt_scalar(snapshot: &Snapshot, nsec_mask: u64) -> PvStructure {
     let mut pv = PvStructure::new("epics:nt/NTScalar:1.0");
 
     // an empty array landing in NTScalar conversion can't yield a real
@@ -843,7 +843,11 @@ pub fn snapshot_to_nt_scalar(snapshot: &Snapshot) -> PvStructure {
     // timeStamp
     pv.fields.push((
         "timeStamp".into(),
-        PvField::Structure(build_timestamp(snapshot.timestamp, snapshot.user_tag)),
+        PvField::Structure(build_timestamp(
+            snapshot.timestamp,
+            snapshot.user_tag,
+            nsec_mask,
+        )),
     ));
 
     // The NTScalar descriptor advertises `display` for every value plus
@@ -886,7 +890,7 @@ pub fn snapshot_to_nt_scalar(snapshot: &Snapshot) -> PvStructure {
 /// `display.description` field. Aligning the runtime shape and
 /// descriptor with that prevents pvxs clients from seeing
 /// a wrong-type index and missing the description field.
-pub fn snapshot_to_nt_enum(snapshot: &Snapshot) -> PvStructure {
+pub fn snapshot_to_nt_enum(snapshot: &Snapshot, nsec_mask: u64) -> PvStructure {
     let mut pv = PvStructure::new("epics:nt/NTEnum:1.0");
 
     // value sub-structure with index + choices. A one-element channel on an
@@ -924,7 +928,11 @@ pub fn snapshot_to_nt_enum(snapshot: &Snapshot) -> PvStructure {
         .push(("alarm".into(), PvField::Structure(build_alarm(snapshot))));
     pv.fields.push((
         "timeStamp".into(),
-        PvField::Structure(build_timestamp(snapshot.timestamp, snapshot.user_tag)),
+        PvField::Structure(build_timestamp(
+            snapshot.timestamp,
+            snapshot.user_tag,
+            nsec_mask,
+        )),
     ));
     // trailing `display.description` is part of pvxs's
     // QSRV NTEnum shape; populate from the DESC field when
@@ -956,7 +964,7 @@ pub fn snapshot_to_nt_enum(snapshot: &Snapshot) -> PvStructure {
 /// the scalar case — `value.isarray()` only flips the struct id — so a
 /// numeric array carries `control` and `valueAlarm` just like a scalar
 /// (pvxs `src/nt.cpp:44-112`, confirmed by `test/testqsingle.cpp:354-397`).
-pub fn snapshot_to_nt_scalar_array(snapshot: &Snapshot) -> PvStructure {
+pub fn snapshot_to_nt_scalar_array(snapshot: &Snapshot, nsec_mask: u64) -> PvStructure {
     let mut pv = PvStructure::new("epics:nt/NTScalarArray:1.0");
 
     // array metadata limits take the element scalar type.
@@ -974,7 +982,11 @@ pub fn snapshot_to_nt_scalar_array(snapshot: &Snapshot) -> PvStructure {
     // timeStamp
     pv.fields.push((
         "timeStamp".into(),
-        PvField::Structure(build_timestamp(snapshot.timestamp, snapshot.user_tag)),
+        PvField::Structure(build_timestamp(
+            snapshot.timestamp,
+            snapshot.user_tag,
+            nsec_mask,
+        )),
     ));
 
     // Same descriptor/value consistency rule as the scalar builder:
@@ -1049,22 +1061,29 @@ pub(crate) fn long_string_field_value(value: &EpicsValue) -> PvString {
 fn snapshot_to_nt_long_string(
     snapshot: &Snapshot,
     text: fn(&EpicsValue) -> PvString,
+    nsec_mask: u64,
 ) -> PvStructure {
     let mut snap = snapshot.clone();
     snap.value = EpicsValue::String(text(&snapshot.value));
-    snapshot_to_nt_scalar(&snap)
+    snapshot_to_nt_scalar(&snap, nsec_mask)
 }
 
-/// Convert a Snapshot to the appropriate NormativeType based on NtType.
-pub fn snapshot_to_pv_structure(snapshot: &Snapshot, nt_type: NtType) -> PvStructure {
+/// Convert a Snapshot to the appropriate NormativeType based on NtType,
+/// its time split along `nsec_mask`, the record's `Q:time:tag` mask.
+pub fn snapshot_to_pv_structure(
+    snapshot: &Snapshot,
+    nt_type: NtType,
+    nsec_mask: u64,
+) -> PvStructure {
+    let m = nsec_mask;
     match nt_type {
-        NtType::Scalar => snapshot_to_nt_scalar(snapshot),
-        NtType::Enum => snapshot_to_nt_enum(snapshot),
-        NtType::ScalarArray => snapshot_to_nt_scalar_array(snapshot),
-        NtType::LongString => snapshot_to_nt_long_string(snapshot, long_string_value),
-        NtType::LongStringField => snapshot_to_nt_long_string(snapshot, long_string_field_value),
-        NtType::Dollar(PvaDollar::Text) => snapshot_to_nt_scalar(snapshot),
-        NtType::Dollar(PvaDollar::Chars) => snapshot_to_nt_scalar_array(snapshot),
+        NtType::Scalar => snapshot_to_nt_scalar(snapshot, m),
+        NtType::Enum => snapshot_to_nt_enum(snapshot, m),
+        NtType::ScalarArray => snapshot_to_nt_scalar_array(snapshot, m),
+        NtType::LongString => snapshot_to_nt_long_string(snapshot, long_string_value, m),
+        NtType::LongStringField => snapshot_to_nt_long_string(snapshot, long_string_field_value, m),
+        NtType::Dollar(PvaDollar::Text) => snapshot_to_nt_scalar(snapshot, m),
+        NtType::Dollar(PvaDollar::Chars) => snapshot_to_nt_scalar_array(snapshot, m),
     }
 }
 
@@ -1391,7 +1410,11 @@ fn is_empty_array(value: &EpicsValue) -> bool {
     )
 }
 
-fn build_timestamp(time: WallTime, user_tag: i32) -> PvStructure {
+/// The one place a served qsrv `timeStamp` takes the `Q:time:tag` split:
+/// pvxs splits it while filling the reply (`iocsource.cpp:239-248`), after
+/// the chain read the whole nanoseconds.
+pub(crate) fn build_timestamp(time: WallTime, user_tag: i32, nsec_mask: u64) -> PvStructure {
+    let (time, user_tag) = epics_base_rs::server::snapshot::split_nsec(time, user_tag, nsec_mask);
     let mut ts = PvStructure::new("time_t");
     let dur = time.since_unix_epoch();
     let (secs, nanos) = (dur.as_secs() as i64, dur.subsec_nanos() as i32);
@@ -1807,7 +1830,7 @@ mod tests {
             0,
             UNIX_EPOCH,
         );
-        let pv = snapshot_to_pv_structure(&snap, NtType::LongString);
+        let pv = snapshot_to_pv_structure(&snap, NtType::LongString, 0);
         assert_eq!(pv.struct_id, "epics:nt/NTScalar:1.0");
         match pv.get_field("value") {
             Some(PvField::Scalar(ScalarValue::String(s))) => assert_eq!(s, text),
@@ -1843,7 +1866,7 @@ mod tests {
             0,
             UNIX_EPOCH,
         );
-        let pv = snapshot_to_pv_structure(&snap, NtType::LongString);
+        let pv = snapshot_to_pv_structure(&snap, NtType::LongString, 0);
         match pv.get_field("value") {
             Some(PvField::Scalar(ScalarValue::String(s))) => assert_eq!(s, "hi"),
             other => panic!("expected scalar string value, got {other:?}"),
@@ -1866,7 +1889,7 @@ mod tests {
             0,
             UNIX_EPOCH,
         );
-        let pv = snapshot_to_pv_structure(&snap, NtType::LongString);
+        let pv = snapshot_to_pv_structure(&snap, NtType::LongString, 0);
         match pv.get_field("value") {
             Some(PvField::Scalar(ScalarValue::String(s))) => assert_eq!(
                 s.as_bytes(),
@@ -1895,7 +1918,7 @@ mod tests {
         // are typed ubyte, not signed byte.
         assert_eq!(value_scalar_type(&snap.value), ScalarType::UByte);
 
-        let pv = snapshot_to_pv_structure(&snap, NtType::ScalarArray);
+        let pv = snapshot_to_pv_structure(&snap, NtType::ScalarArray, 0);
         assert_eq!(pv.struct_id, "epics:nt/NTScalarArray:1.0");
         match pv.get_field("value") {
             Some(PvField::ScalarArrayTyped(TypedScalarArray::UByte(arr))) => {
@@ -2015,7 +2038,7 @@ mod tests {
     #[test]
     fn nt_scalar_structure() {
         let snap = test_snapshot(EpicsValue::Double(42.5));
-        let pv = snapshot_to_nt_scalar(&snap);
+        let pv = snapshot_to_nt_scalar(&snap, 0);
 
         assert_eq!(pv.struct_id, "epics:nt/NTScalar:1.0");
         assert_eq!(pv.get_value(), Some(&ScalarValue::Double(42.5)));
@@ -2044,7 +2067,7 @@ mod tests {
         // alarm.status is the PVA status CLASS — UDF maps to DRIVER
         // (2) — and alarm.message is the condition string "UDF".
         let snap = test_snapshot(EpicsValue::DoubleArray(vec![].into()));
-        let pv = snapshot_to_nt_scalar(&snap);
+        let pv = snapshot_to_nt_scalar(&snap, 0);
 
         if let Some(PvField::Structure(alarm)) = pv.get_field("alarm") {
             let sev = alarm.get_field("severity");
@@ -2062,7 +2085,7 @@ mod tests {
     fn nt_scalar_non_empty_keeps_original_alarm() {
         // Sanity: non-empty array (or scalar) does NOT trigger the overlay.
         let snap = test_snapshot(EpicsValue::Double(1.0));
-        let pv = snapshot_to_nt_scalar(&snap);
+        let pv = snapshot_to_nt_scalar(&snap, 0);
         if let Some(PvField::Structure(alarm)) = pv.get_field("alarm") {
             let sev = alarm.get_field("severity");
             assert!(matches!(sev, Some(PvField::Scalar(ScalarValue::Int(0)))));
@@ -2077,7 +2100,7 @@ mod tests {
     fn nt_enum_structure() {
         let mut snap = Snapshot::new(EpicsValue::Enum(1), 0, 0, UNIX_EPOCH);
         snap.enums = Some(EnumInfo::new(vec!["Off".into(), "On".into()]));
-        let pv = snapshot_to_nt_enum(&snap);
+        let pv = snapshot_to_nt_enum(&snap, 0);
 
         assert_eq!(pv.struct_id, "epics:nt/NTEnum:1.0");
         if let Some(PvField::Structure(val)) = pv.get_field("value") {
@@ -2115,7 +2138,7 @@ mod tests {
     #[test]
     fn nt_scalar_array_structure() {
         let snap = test_snapshot(EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0].into()));
-        let pv = snapshot_to_nt_scalar_array(&snap);
+        let pv = snapshot_to_nt_scalar_array(&snap, 0);
 
         assert_eq!(pv.struct_id, "epics:nt/NTScalarArray:1.0");
         if let Some(PvField::ScalarArrayTyped(arr)) = pv.get_field("value") {
@@ -2128,7 +2151,7 @@ mod tests {
     #[test]
     fn put_roundtrip_scalar() {
         let snap = test_snapshot(EpicsValue::Double(99.0));
-        let pv = snapshot_to_nt_scalar(&snap);
+        let pv = snapshot_to_nt_scalar(&snap, 0);
         let back = pv_structure_to_epics(&pv).unwrap();
         assert_eq!(back, EpicsValue::Double(99.0));
     }
@@ -2137,7 +2160,7 @@ mod tests {
     fn put_roundtrip_enum() {
         let mut snap = Snapshot::new(EpicsValue::Enum(2), 0, 0, UNIX_EPOCH);
         snap.enums = Some(EnumInfo::new(vec!["A".into(), "B".into(), "C".into()]));
-        let pv = snapshot_to_nt_enum(&snap);
+        let pv = snapshot_to_nt_enum(&snap, 0);
         let back = pv_structure_to_epics(&pv).unwrap();
         assert_eq!(back, EpicsValue::Enum(2));
     }
@@ -2201,7 +2224,7 @@ mod tests {
     #[test]
     fn filter_by_request_empty() {
         let snap = test_snapshot(EpicsValue::Double(1.0));
-        let pv = snapshot_to_nt_scalar(&snap);
+        let pv = snapshot_to_nt_scalar(&snap, 0);
 
         // Empty request → return everything
         let req = PvStructure::new("");
@@ -2212,7 +2235,7 @@ mod tests {
     #[test]
     fn filter_by_request_value_only() {
         let snap = test_snapshot(EpicsValue::Double(1.0));
-        let pv = snapshot_to_nt_scalar(&snap);
+        let pv = snapshot_to_nt_scalar(&snap, 0);
 
         // Request only "value" field
         let mut field_spec = PvStructure::new("");
@@ -2231,7 +2254,7 @@ mod tests {
     #[test]
     fn filter_by_request_multiple_fields() {
         let snap = test_snapshot(EpicsValue::Double(1.0));
-        let pv = snapshot_to_nt_scalar(&snap);
+        let pv = snapshot_to_nt_scalar(&snap, 0);
 
         let mut field_spec = PvStructure::new("");
         field_spec
@@ -2251,7 +2274,7 @@ mod tests {
     #[test]
     fn filter_by_request_nested_subfield() {
         let snap = test_snapshot(EpicsValue::Double(1.0));
-        let pv = snapshot_to_nt_scalar(&snap);
+        let pv = snapshot_to_nt_scalar(&snap, 0);
 
         // Build request: {field: {alarm: {severity: {}}}}
         // — only return alarm.severity, not other alarm fields
@@ -2291,7 +2314,7 @@ mod tests {
         // scalar type (Int, not Double), and `display.form` must be an
         // `enum_t` sub-structure, not a scalar int.
         let snap = test_snapshot(EpicsValue::LongArray(vec![4, 5, 6, 7].into()));
-        let pv = snapshot_to_nt_scalar_array(&snap);
+        let pv = snapshot_to_nt_scalar_array(&snap, 0);
 
         // control + valueAlarm present on the array
         let control = pv.get_field("control").expect("array must carry control");
@@ -2378,7 +2401,7 @@ mod tests {
         // `display = {description, units}` — no limits, no form, no
         // control, no valueAlarm (pvxs src/nt.cpp:78-85).
         let snap = test_snapshot(EpicsValue::String("Analog input".into()));
-        let pv = snapshot_to_nt_scalar(&snap);
+        let pv = snapshot_to_nt_scalar(&snap, 0);
 
         assert!(
             pv.get_field("control").is_none(),
@@ -2429,7 +2452,7 @@ mod tests {
         // Numeric scalar, no display/control metadata.
         let snap = Snapshot::new(EpicsValue::Double(1.0), 0, 0, UNIX_EPOCH);
         assert!(snap.display.is_none() && snap.control.is_none());
-        let pv = snapshot_to_nt_scalar(&snap);
+        let pv = snapshot_to_nt_scalar(&snap, 0);
         assert_eq!(
             names(&pv),
             desc_names(&build_field_desc_for_nt(NtType::Scalar, ScalarType::Double)),
@@ -2443,7 +2466,7 @@ mod tests {
             0,
             UNIX_EPOCH,
         );
-        let pv_arr = snapshot_to_nt_scalar_array(&snap_arr);
+        let pv_arr = snapshot_to_nt_scalar_array(&snap_arr, 0);
         assert_eq!(
             names(&pv_arr),
             desc_names(&build_field_desc_for_nt(
@@ -2456,7 +2479,7 @@ mod tests {
         // String scalar (stringin-like), no metadata: `display` present,
         // no numeric `control`/`valueAlarm`.
         let snap_s = Snapshot::new(EpicsValue::String("x".into()), 0, 0, UNIX_EPOCH);
-        let pv_s = snapshot_to_nt_scalar(&snap_s);
+        let pv_s = snapshot_to_nt_scalar(&snap_s, 0);
         assert_eq!(
             names(&pv_s),
             desc_names(&build_field_desc_for_nt(NtType::Scalar, ScalarType::String)),
@@ -2474,7 +2497,7 @@ mod tests {
         let snap = test_snapshot(EpicsValue::UInt64Array(
             vec![11111111111111111, 222222222222222].into(),
         ));
-        let pv = snapshot_to_nt_scalar_array(&snap);
+        let pv = snapshot_to_nt_scalar_array(&snap, 0);
 
         // value is a ulong array
         match pv.get_field("value") {

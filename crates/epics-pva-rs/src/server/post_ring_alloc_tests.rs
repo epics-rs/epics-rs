@@ -139,7 +139,7 @@ fn assert_posts_fill_in_place(snap: impl Fn(u32) -> Snapshot) {
             );
             assert_eq!(
                 update.value,
-                snapshot_to_pv_field(&s),
+                snapshot_to_pv_field(&s, 0),
                 "post {n}: a slot filled in place equals a freshly built tree"
             );
             // Round 0 builds the slots; from then on the ring is warm.
@@ -180,16 +180,16 @@ fn an_enum_post_builds_no_descriptor_and_no_tree_body() {
 fn a_new_shape_starts_a_new_tree() {
     let a = ai(1.0);
     let mut ring = PostRing::new(LIMIT, a.clone());
-    let _ = ring.post(&LogLeaves::of_snapshot(&a));
+    let _ = ring.post(&LogLeaves::of_snapshot(&a, 0));
     let mut fewer = ai(2.0);
     fewer.properties = PropertySupport::NONE;
     ring.set_meta(fewer.clone());
-    let posted = ring.post(&LogLeaves::of_snapshot(&fewer));
-    assert_eq!(posted, snapshot_to_pv_field(&fewer));
+    let posted = ring.post(&LogLeaves::of_snapshot(&fewer, 0));
+    assert_eq!(posted, snapshot_to_pv_field(&fewer, 0));
     let long = Snapshot::new(EpicsValue::Long(3), 0, 0, std::time::UNIX_EPOCH);
     ring.set_meta(long.clone());
-    let posted = ring.post(&LogLeaves::of_snapshot(&long));
-    assert_eq!(posted, snapshot_to_pv_field(&long));
+    let posted = ring.post(&LogLeaves::of_snapshot(&long, 0));
+    assert_eq!(posted, snapshot_to_pv_field(&long, 0));
     assert!(!matches!(&*posted, PvField::Null));
 }
 
@@ -219,7 +219,10 @@ fn only_a_property_post_reads_metadata() {
             None
         })
         .expect("a value post");
-        assert_eq!(units(&update.value), units(&snapshot_to_pv_field(&ai(0.0))));
+        assert_eq!(
+            units(&update.value),
+            units(&snapshot_to_pv_field(&ai(0.0), 0))
+        );
         push(&mut queue, update);
     }
     assert_eq!(reads, 0, "a value post reads no metadata");
@@ -233,7 +236,7 @@ fn only_a_property_post_reads_metadata() {
     })
     .expect("a property post");
     assert_eq!(reads, 1, "a property post reads the metadata once");
-    let want = units(&snapshot_to_pv_field(&egu));
+    let want = units(&snapshot_to_pv_field(&egu, 0));
     assert_eq!(units(&update.value), want);
     push(&mut queue, update);
     for n in 0..2 * LIMIT {
@@ -273,7 +276,7 @@ fn an_events_own_metadata_changes_no_display_or_control_leaf() {
     want.alarm = stale.alarm;
     want.timestamp = stale.timestamp;
     want.user_tag = stale.user_tag;
-    assert_eq!(update.value, snapshot_to_pv_field(&want));
+    assert_eq!(update.value, snapshot_to_pv_field(&want, 0));
 }
 
 /// Encode `v` under `desc` and `bits` into a buffer sized by a first pass:
@@ -305,7 +308,7 @@ fn an_nt_tree_encodes_by_reference() {
 fn an_nt_tree_encodes_by_reference_body() {
     let snap = ai(1.5);
     let desc = super::NtShape::of(&snap).desc();
-    let v = snapshot_to_pv_field(&snap);
+    let v = snapshot_to_pv_field(&snap, 0);
     let mut root = crate::proto::BitSet::new();
     root.set(0);
     assert_encodes_by_reference(&v, &desc, &root);

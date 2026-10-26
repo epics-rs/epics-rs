@@ -40,6 +40,9 @@ enum StackEntry {
         /// The list of a function taking more than one operand. A bare
         /// `(3,K:=1)` leaves the 3 as one operand, as C evaluates it.
         args: bool,
+        /// The `(` read right after `UNTIL`; its `)` emits the `UntilEnd`
+        /// directly below it.
+        closes_until: bool,
     },
     /// C's `[` and `{` elements (`sCalcPostfix.c:215-216`,
     /// `aCalcPostfix.c:212-213`). They are NOT parens: they are
@@ -87,9 +90,10 @@ enum StackEntry {
     /// C's `UNTIL_END` element (`sCalcPostfix.c:779-783`): reading `UNTIL` PUSHES
     /// one of these onto the OPERATOR stack, carrying the in-stack priority of
     /// the `UNTIL` element itself (0) and an explicit `runtime_effect = 0`. It is
-    /// therefore emitted by the ordinary flush rules and by nothing else — a `)`
-    /// or an inner `;` stops at the `(` above it, and only the end of the
-    /// enclosing statement (or of the expression) reaches it.
+    /// therefore emitted by the ordinary flush rules — a `)` or an inner `;`
+    /// stops at the `(` above it, and only the end of the enclosing statement
+    /// (or of the expression) reaches it — or, when `UNTIL` is followed by `(`,
+    /// by that paren's `)` (CBUG-AL1).
     ///
     /// That is the whole loop-closing rule, and it is why `UNTIL(a:=a+1;a>3)`
     /// puts `UNTIL_END` AFTER the condition: the `;` inside the parentheses
@@ -735,8 +739,11 @@ pub fn compile(expr: &str, kind: ExprKind) -> Result<CompiledExpr, CalcError> {
     // already answers "is one open, and which". A side counter was a second
     // record of the same fact and could disagree with the stack.
 
+    let mut until_read = false;
+
     while let Some(token) = lexer.next(operand_needed)? {
         let token = &token;
+        let after_until = std::mem::take(&mut until_read);
 
         if kind == ExprKind::String && token_is_string_element(token) {
             output.set_uses_string();
@@ -871,6 +878,7 @@ pub fn compile(expr: &str, kind: ExprKind) -> Result<CompiledExpr, CalcError> {
                         runtime_effect: 0,
                         span: holes.open(runtime_depth),
                         args,
+                        closes_until: after_until,
                     });
                 }
 
@@ -891,6 +899,7 @@ pub fn compile(expr: &str, kind: ExprKind) -> Result<CompiledExpr, CalcError> {
                     );
                     output.op(Opcode::Control(ControlOp::Until));
                     stack.push(StackEntry::UntilEnd);
+                    until_read = true;
                 }
 
                 Token::Func(func) => {
@@ -958,14 +967,30 @@ pub fn compile(expr: &str, kind: ExprKind) -> Result<CompiledExpr, CalcError> {
                 Token::RParen => loop {
                     match stack.last() {
                         None => return Err(CalcError::ParenNotOpen),
-                        Some(StackEntry::LParen {
-                            runtime_effect,
+                        Some(&StackEntry::LParen {
+                            runtime_effect: paren,
                             span,
+                            closes_until,
                             ..
                         }) => {
-                            let paren = *runtime_effect;
-                            holes.close(*span, runtime_depth);
+                            holes.close(span, runtime_depth);
                             stack.pop();
+                            // CBUG-AL1: C leaves UNTIL_END (in_stack_pri 0) on
+                            // the stack here, so `UNTIL(c)+10` loops on `c+10`.
+                            // Closing the loop at its own `)` makes it
+                            // `(UNTIL(c))+10`, as with no operator after it.
+                            if closes_until {
+                                let Some(until_end @ StackEntry::UntilEnd) = stack.pop() else {
+                                    unreachable!("UNTIL's `(` sits on its UntilEnd")
+                                };
+                                flush(
+                                    &until_end,
+                                    &mut output,
+                                    &mut runtime_depth,
+                                    &mut holes,
+                                    kind,
+                                );
+                            }
                             // C `:651-662`: a VARARG_OPERATOR below the `(`
                             // inherits the paren's accumulated effect, and the
                             // `(` itself emits nothing.
@@ -1013,6 +1038,7 @@ pub fn compile(expr: &str, kind: ExprKind) -> Result<CompiledExpr, CalcError> {
                             runtime_effect,
                             span,
                             args,
+                            ..
                         }) => (runtime_effect, span, *args),
                         _ => unreachable!("the loop above only breaks on a barrier"),
                     };

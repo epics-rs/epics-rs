@@ -1266,6 +1266,31 @@ fn test_constant_inp_raises_soft_alarm_and_skips_compute() {
     assert_eq!(common.nsev, AlarmSeverity::Invalid);
 }
 
+/// `devEpidSoftCallback.c:112-114` return before the TRIG block
+/// (`:116-146`): a CONSTANT `INP` puts no trigger, on either arm.
+#[test]
+fn a_constant_inp_puts_no_trigger() {
+    for trig in ["READBACK:REC.VAL", "R:T CA"] {
+        let mut rec = EpidRecord::default();
+        let mut dpvt = Dpvt::Null;
+        rec.inp = "3.14".into();
+        rec.trig = trig.into();
+        rec.set_process_context(&ctx_with_dtyp("Async Soft Channel"));
+        let pre = pre_input(&mut rec, &mut dpvt, &[]);
+        assert!(
+            !pre.iter().any(|a| matches!(
+                a,
+                ProcessAction::WriteDbLink {
+                    link_field: "TRIG",
+                    ..
+                }
+            )),
+            "{trig}"
+        );
+        assert!(matches!(dpvt, Dpvt::Null), "{trig}");
+    }
+}
+
 /// A DB `INP` link does NOT trip the constant path — PID runs normally.
 #[test]
 fn test_db_inp_does_not_raise_soft_alarm() {
@@ -1299,6 +1324,7 @@ fn test_db_trig_link_synchronous_fallthrough() {
     let mut rec = EpidRecord::default();
     let mut dpvt = Dpvt::Null;
     rec.trig = "READBACK:REC.VAL".into();
+    rec.inp = "SRC".into();
     rec.kp = 1.0;
     rec.fbon = 1;
     rec.fbop = 1;
@@ -1346,6 +1372,7 @@ fn a_pva_trig_link_is_written_without_a_second_pass() {
     let mut rec = EpidRecord::default();
     let mut dpvt = Dpvt::Null;
     rec.trig = r#"{pva:"REMOTE:READBACK"}"#.into();
+    rec.inp = "SRC".into();
     rec.kp = 1.0;
     rec.fbon = 1;
     rec.fbop = 1;
@@ -1398,6 +1425,7 @@ fn test_ca_trig_link_deferred_second_pass() {
     let mut rec = EpidRecord::default();
     let mut dpvt = Dpvt::Null;
     rec.trig = "ca://REMOTE:READBACK".into();
+    rec.inp = "SRC".into();
     rec.kp = 1.0;
     rec.fbon = 1;
     rec.fbop = 1;
@@ -1445,6 +1473,7 @@ fn a_device_link_put_mid_trigger_fires_the_trigger_again() {
     let mut rec = EpidRecord::default();
     let mut dpvt = Dpvt::Null;
     rec.trig = "ca://REMOTE:READBACK".into();
+    rec.inp = "SRC".into();
     rec.set_process_context(&ctx_with_dtyp("Async Soft Channel"));
     let fires = |actions: &epics_base_rs::server::record::ProcessActions| {
         actions.iter().any(|a| {
@@ -1780,6 +1809,7 @@ fn test_ca_trig_trigger_pass_returns_async_pending_tail_skipped() {
     let mut rec = EpidRecord::default();
     let mut dpvt = Dpvt::Null;
     rec.trig = "ca://REMOTE:READBACK".into();
+    rec.inp = "SRC".into();
     rec.kp = 1.0;
     rec.fbon = 1;
     rec.fbop = 1;

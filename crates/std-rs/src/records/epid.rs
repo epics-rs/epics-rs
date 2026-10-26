@@ -1271,12 +1271,21 @@ impl Record for EpidRecord {
             return None;
         }
         self.course = Some(Course::Run);
+        // A CONSTANT INP returns before the TRIG block
+        // (`devEpidSoftCallback.c:112-114`), and `do_pid` raises SOFT/INVALID.
+        // C returns only when that raise took, so a cycle already INVALID (a
+        // failed closed-loop STPL read) puts TRIG and runs the PID on a stale
+        // CVAL; that C defect is not copied.
+        //
         // C `ptriglink->type` CONSTANT/empty: `dbPutLink` to a constant link
         // is a no-op, and the PID runs in this pass. Every other type is put
         // here, `dbPutLink` (`devEpidSoftCallback.c:117-125`) or
         // `dbCaPutLinkCallback` (`:126-146`); `set_out_link_write_status`
         // takes the outcome.
-        if !self.is_async_callback_dtyp() || self.trig_type == LinkType::Constant {
+        if !self.is_async_callback_dtyp()
+            || self.trig_type == LinkType::Constant
+            || parse_link_v2(&self.inp).is_constant_type()
+        {
             return Some(ProcessActions::new());
         }
         Some(ProcessActions::from(vec![ProcessAction::WriteDbLink {

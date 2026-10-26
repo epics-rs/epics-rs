@@ -796,4 +796,46 @@ record(state, "state") {}
         }
         assert!(differ.is_empty(), "{}", differ.join("\n"));
     }
+
+    /// `PvDatabase::parsed_link_target_field_type` answers with no lock what
+    /// it read under the target's lock: every field of every base type.
+    #[epics_macros_rs::epics_test]
+    async fn the_lock_free_link_target_type_is_the_one_read_under_the_lock() {
+        let (db, _) = crate::server::ioc_builder::IocBuilder::new()
+            .db_string(EVERY_TYPE, &std::collections::HashMap::new())
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        db.ioc_init().await;
+        let names = EVERY_TYPE
+            .lines()
+            .filter(|l| l.starts_with("record("))
+            .filter_map(|l| l.split('"').nth(1))
+            .collect::<Vec<_>>();
+        let mut differ = Vec::new();
+        for name in names {
+            let cell = db.get_record(name).unwrap();
+            let fields = cell
+                .rdes()
+                .fields
+                .iter()
+                .chain(crate::server::record::dbd_generated::DB_COMMON_FIELDS)
+                .map(|f| f.name)
+                .chain(["RTYP", "NOPE"]);
+            for field in fields {
+                let link =
+                    crate::server::record::parse_link_v2(format!("{name}.{field}").as_bytes());
+                let free = db.parsed_link_target_field_type(&link);
+                let held = crate::server::record::record_instance::addressed_field_type_of(
+                    cell.read().record.as_ref(),
+                    field,
+                );
+                if free != held {
+                    differ.push(format!("{name}.{field}: {free:?} != {held:?}"));
+                }
+            }
+        }
+        assert!(differ.is_empty(), "{}", differ.join("\n"));
+    }
 }

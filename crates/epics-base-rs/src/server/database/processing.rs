@@ -4665,13 +4665,14 @@ impl PvDatabase {
         // missed and every filtered DB link reported no type at all.
         let addressed = db.target();
         let rec = self.get_record(&addressed.record)?;
-        let inst = rec.read();
         let field = if addressed.field.is_empty() {
             "VAL"
         } else {
             addressed.field.as_str()
         };
-        crate::server::record::record_instance::addressed_field_type_of(inst.record.as_ref(), field)
+        // C `dbNameToAddr` takes no lock, and table's `init_record` asks
+        // under its own set.
+        rec.addressed_field_type(field, None)
     }
 
     /// Create a put-notify wait-set for a downstream operation a record is

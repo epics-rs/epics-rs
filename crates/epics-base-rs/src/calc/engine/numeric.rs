@@ -1,5 +1,5 @@
 use super::bytecode::{self, BASE, base::*};
-use super::cast::{d2i, d2ui, imod, nint};
+use super::cast::{c_int, d2i, d2ui, imod, nint};
 use super::error::CalcError;
 use super::random::calc_random;
 use super::{NumericInputs, NumericVars};
@@ -88,14 +88,14 @@ pub(crate) fn eval_vars(code: &[u8], mut inputs: NumericVars<'_>) -> Result<f64,
             }
             MODULO => {
                 let (a, b) = pop2(&mut stack)?;
-                // C `calcPerform.c:176-190` (unmerged PR #925):
-                //   itop = d2i(top);
-                //   if (itop == 0)       *ptop = epicsNAN;
-                //   else if (itop == -1) *ptop = 0;
-                //   else                 *ptop = d2i(*ptop) % itop;
-                // base's dialect narrowing is `d2i`; `cast::imod` owns the
-                // -1 guard; base's zero-divisor rule is NaN. See CBUG-A2.
-                stack.push(imod(a, b, |x| i64::from(d2i(x))).unwrap_or(f64::NAN));
+                // C `calcPerform.c:161-167` (R7.0.10):
+                //   itop = (epicsInt32) *ptop--;
+                //   if (itop) *ptop = (epicsInt32) *ptop % itop;
+                //   else      *ptop = epicsNAN;
+                // Released base narrows with a plain cast, not unmerged PR
+                // #925's `d2i` (CBUG-A5). C traps INT_MIN % -1 as SIGFPE; the
+                // -1 guard in `cast::imod` gives 0 instead (CBUG-A1).
+                stack.push(imod(a, b, |x| i64::from(c_int(x))).unwrap_or(f64::NAN));
             }
             UNARY_NEG => {
                 let a = pop1(&mut stack)?;
@@ -264,11 +264,10 @@ pub(crate) fn eval_vars(code: &[u8], mut inputs: NumericVars<'_>) -> Result<f64,
             }
             NINT => {
                 let a = pop1(&mut stack)?;
-                // C `calcPerform.c:313-317` (unmerged PR #925):
-                //   top = top >= 0 ? top+0.5 : top-0.5;
-                //   *ptop = d2i(top);
-                // base's dialect narrowing is `d2i`. See CBUG-A2.
-                stack.push(nint(a, |x| i64::from(d2i(x))));
+                // C `calcPerform.c:290-292` (R7.0.10):
+                //   *ptop = (epicsInt32) (top >= 0 ? top + 0.5 : top - 0.5);
+                // a plain cast, not unmerged PR #925's `d2i` (CBUG-A5).
+                stack.push(nint(a, |x| i64::from(c_int(x))));
             }
 
             // Test functions
@@ -567,24 +566,16 @@ mod parity_tests {
         assert!(run("MIN(5,0/0)").is_nan());
     }
 
-    /// CBUG-A2 — NINT rounds, then narrows through `d2i`, tracking
-    /// `calcPerform.c:313-317` at unmerged PR #925. This used to pin the clean
-    /// no-narrow deviation (`NINT(3e9) == 3e9`); before that it pinned C's
-    /// `(epicsInt32)` cvttsd2si value (`i32::MIN`).
+    /// CBUG-A5 — NINT rounds, then narrows with released base's plain
+    /// `(epicsInt32)` (`calcPerform.c:292` at R7.0.10), not unmerged PR #925's
+    /// `d2i`. Out of int32 range that is x86-64's `INT32_MIN`, whatever the sign.
     #[test]
-    fn h3_nint_out_of_range_is_the_d2i_narrowed_value() {
-        // 3e9 is in `[2^31, 2^32)`: d2i routes it through u32 and bit 31 becomes
-        // the sign — `d2i(3000000000.5) = -1294967296`. Bit-identical to fixed C.
-        assert_eq!(run("NINT(3000000000)"), -1_294_967_296.0);
-        // Negative / `>= 2^32` / NaN / Inf are the window d2i STILL leaves
-        // undefined in C (PR #925 is a partial fix). The port mirrors its own
-        // d2i — the modular wrap every bitwise operand already uses — rather than
-        // reproducing x86 cvttsd2si; these are not C-defined values.
-        assert_eq!(run("NINT(-3000000000)"), 1_294_967_296.0);
-        assert_eq!(run("NINT(2500000000.4)"), -1_794_967_296.0);
-        // NaN/Inf round to NaN/Inf; d2i(NaN)=d2i(Inf)=0 here (UB in C).
-        assert_eq!(run("NINT(0/0)"), 0.0);
-        assert_eq!(run("NINT(1/0)"), 0.0);
+    fn h3_nint_out_of_range_is_the_released_base_value() {
+        assert_eq!(run("NINT(3000000000)"), -2_147_483_648.0);
+        assert_eq!(run("NINT(-3000000000)"), -2_147_483_648.0);
+        assert_eq!(run("NINT(2500000000.4)"), -2_147_483_648.0);
+        assert_eq!(run("NINT(0/0)"), -2_147_483_648.0);
+        assert_eq!(run("NINT(1/0)"), -2_147_483_648.0);
     }
 
     #[test]
@@ -597,21 +588,17 @@ mod parity_tests {
         assert_eq!(run("NINT(-2147483648)"), -2_147_483_648.0);
     }
 
-    /// CBUG-A2 — MODULO narrows both operands through `d2i`, tracking
-    /// `calcPerform.c:176-190` at unmerged PR #925. These used to pin the
-    /// clean no-narrow deviation.
+    /// CBUG-A5 — MODULO narrows both operands with released base's plain
+    /// `(epicsInt32)` (`calcPerform.c:162-164` at R7.0.10), so an out-of-range
+    /// or NaN operand is `INT32_MIN`.
     #[test]
-    fn h4_mod_out_of_range_operands_are_d2i_narrowed() {
-        // Divisor 2^32: d2i(2^32) = 0, so the divisor narrows to zero and base's
-        // rule makes it NaN (the clean deviation answered 5).
-        assert!(run("5 % 4294967296").is_nan());
-        // Dividend 3e9: d2i(3e9) = -1294967296, and -1294967296 % 7 == 0 (7
-        // divides it exactly). Fixed C agrees; the clean deviation answered 4.
-        assert_eq!(run("3000000000 % 7"), 0.0);
-        // NaN dividend: d2i(NaN) = 0 here (UB in C), so 0 % 7 = 0.
-        assert_eq!(run("(0/0) % 7"), 0.0);
-        // NaN divisor: d2i(NaN) = 0 narrows to a zero divisor -> NaN.
-        assert!(run("7 % (0/0)").is_nan());
+    fn h4_mod_out_of_range_operands_are_released_base_narrowed() {
+        assert_eq!(run("5 % 4294967296"), 5.0);
+        assert_eq!(run("3000000000 % 7"), -2.0);
+        assert_eq!(run("(0/0) % 7"), -2.0);
+        assert_eq!(run("7 % (0/0)"), 7.0);
+        // Released base traps INT_MIN % -1 as SIGFPE (CBUG-A1); the port gives 0.
+        assert_eq!(run("-2147483648 % -1"), 0.0);
     }
 
     #[test]

@@ -3,27 +3,26 @@
 //!
 //! | dialect | bit / shift | MODULO | NINT |
 //! |---|---|---|---|
-//! | base `calcPerform.c` | `d2i`/`d2ui` (:324-325 at R7.0.10) | `d2i` (:176-190 at unmerged PR #925) — NaN on zero | `d2i` (:313-317, same PR) |
+//! | base `calcPerform.c` | `d2i`/`d2ui` (:324-325 at R7.0.10) | `(epicsInt32)` (:162-164) — NaN on zero | `(epicsInt32)` (:292) |
 //! | sCalc `sCalcPerform.c` | plain `(long)` (:578-631) | `(long)` (:1109) — error on zero | `(long)` (:718) |
 //! | aCalc `aCalcPerform.c` | plain `(int)` (:1355-1357) | `(int)` (:650,:674,:701) — myMAXFLOAT on zero | `(long)` (:828,:1085) |
 //!
 //! **CBUG-A2 — each engine narrows MODULO and NINT with its OWN dialect's cast**,
 //! mirroring that engine's pristine/fixed C. They genuinely disagree because the
-//! C widths do: `3e9` is `d2i(3e9) = -1294967296` in base, `(long)3e9 = 3e9` in
-//! sCalc, and (for MODULO) `(int)3e9` out-of-range in aCalc. So `3e9 % 7` is `0`
-//! (base), `4` (sCalc), `1` (aCalc — its `(int)` saturates to i32::MAX under
-//! CBUG-E2, then `% 7`). The structure is a single `cast::nint`/`cast::imod`
-//! parameterised by the narrowing fn — one logic, per-engine narrowing.
+//! C widths do: `3e9` is `(epicsInt32)3e9`, out of range, in base, `(long)3e9 =
+//! 3e9` in sCalc, and (for MODULO) `(int)3e9` out of range in aCalc. So `3e9 % 7`
+//! is `-2` (base and aCalc, `INT32_MIN % 7`) and `4` (sCalc). The structure is a
+//! single `cast::nint`/`cast::imod` parameterised by the narrowing fn — one
+//! logic, per-engine narrowing.
 //!
 //! Note aCalc is internally inconsistent: NINT is `(long)` (64-bit) but MODULO
-//! is `(int)` (32-bit) — verified in aCalcPerform.c. base is the only engine on
-//! `d2i`, because PR #925 is a base-only commit; sCalc/aCalc keep their pristine
-//! synApps `(long)`/`(int)`, which the differential oracle also runs.
+//! is `(int)` (32-bit) — verified in aCalcPerform.c. Base narrows MODULO and
+//! NINT as released base does, not through the `d2i` of unmerged PR #925
+//! (CBUG-A5).
 //!
-//! d2i and the plain casts alike are UNDEFINED in C outside their range
-//! (negatives, `>= 2^32`, NaN); the port takes the x86-64 `cvttsd2si` value,
-//! through `c_cast`, and base d2i's own wrap. Expected values are
-//! oracleStdIoc (softIoc R7.0.10-146-g8f5015b66) output.
+//! The plain casts are UNDEFINED in C outside their range (and for NaN); the
+//! port takes the x86-64 `cvttsd2si` value through `c_cast`. Expected base
+//! values are R7.0.10's `calcPerform.c` compiled with gcc on x86-64.
 //!
 //! This test used to pin the earlier clean no-narrow deviation (`3e9 % 7 == 4`,
 //! `NINT(3e9) == 3e9` in every dialect).
@@ -61,7 +60,7 @@ fn a(expr: &str, a0: f64) -> f64 {
 
 /// CBUG-A2 — `A % 7` with `A = 3e9` narrows through EACH dialect's own cast, and
 /// the three genuinely disagree because their C widths do:
-/// * base — `d2i(3e9) = -1294967296`, `% 7 == 0` (fixed `calcPerform.c`, PR #925)
+/// * base — `(epicsInt32)3e9` is out of int32 range: `INT32_MIN`, `% 7 == -2`
 /// * sCalc — `(long)3e9 = 3000000000`, `% 7 == 4` (64-bit, no loss)
 /// * aCalc — `(int)3e9` is out of int32 range: x86-64 `INT32_MIN`, `% 7 == -2`
 ///
@@ -69,7 +68,7 @@ fn a(expr: &str, a0: f64) -> f64 {
 /// deviation (`4` everywhere).
 #[test]
 fn modulo_above_2_31_mirrors_each_dialect_width() {
-    assert_eq!(n("A%7", 3e9), 0.0); // base d2i
+    assert_eq!(n("A%7", 3e9), -2.0); // base (epicsInt32), INT32_MIN
     assert_eq!(s("A%7", 3e9), 4.0); // sCalc (long)
     assert_eq!(a("A%7", 3e9), -2.0); // aCalc (int), INT32_MIN
 }
@@ -111,17 +110,13 @@ fn zero_divisor_disposition_is_per_dialect() {
     assert_eq!(a("A%0", 5.0), 1e35f32 as f64);
 }
 
-/// In the BASE (numeric) engine a divisor of exactly 2^32 is the UB boundary:
-/// `d2i` is defined only for `[2^31, 2^32)`, and `2^32` is one past it. The
-/// port's `d2i` wraps modulo 2^32, so `d2i(2^32) = 0` — a zero divisor — and
-/// base's rule makes it NaN. This is NOT a C-defined value; it is the port
-/// mirroring its own d2i on a still-UB input. sCalc's `(long)` and aCalc's
-/// `(int)` do NOT wrap here — this boundary is base-specific. Under the earlier
-/// clean no-narrow deviation this answered `5`.
+/// CBUG-A5 — a base divisor of 2^32 narrows to `INT32_MIN`, not to zero: released
+/// base's `(epicsInt32)` does not wrap the way unmerged PR #925's `d2i` does, so
+/// `5 % 2^32` is `5`, not NaN.
 #[test]
-fn base_divisor_at_the_2_32_boundary_narrows_to_zero() {
-    assert!(nc("5 % 4294967296").is_nan());
-    assert!(n("A % 4294967296", 5.0).is_nan());
+fn base_divisor_at_2_32_is_not_a_zero_divisor() {
+    assert_eq!(nc("5 % 4294967296"), 5.0);
+    assert_eq!(n("A % 4294967296", 5.0), 5.0);
 }
 
 /// Base's bitwise ops REALLY do use `d2i` — this must not change. It is the
@@ -151,7 +146,7 @@ fn acalc_bitwise_is_a_plain_int_cast() {
 }
 
 /// CBUG-A2 — NINT rounds, then narrows with EACH dialect's own cast:
-/// * base — `d2i` (fixed `calcPerform.c:316`, PR #925): `NINT(3e9) = -1294967296`
+/// * base — `(epicsInt32)` (`calcPerform.c:292`): `NINT(3e9) = INT32_MIN`
 /// * sCalc — `(long)` (`sCalcPerform.c:730`): `NINT(3e9) = 3e9` (64-bit, no loss)
 /// * aCalc — `(long)` (`aCalcPerform.c:839,1096`): `NINT(3e9) = 3e9` — aCalc
 ///   narrows NINT at 64-bit even though its MODULO is 32-bit `(int)` (an internal
@@ -161,13 +156,13 @@ fn acalc_bitwise_is_a_plain_int_cast() {
 /// sCalc/aCalc happen to still be `3e9` because `(long)` does not lose 3e9.
 #[test]
 fn nint_mirrors_each_dialect_width() {
-    assert_eq!(n("NINT(A)", 3e9), -1_294_967_296.0); // base d2i
+    assert_eq!(n("NINT(A)", 3e9), -2_147_483_648.0); // base (epicsInt32)
     assert_eq!(s("NINT(A)", 3e9), 3e9); // sCalc (long)
     assert_eq!(a("NINT(A)", 3e9), 3e9); // aCalc (long)
 
-    // Past each width's range: base d2i wraps 1e300 (a multiple of 2^32) to 0;
-    // sCalc/aCalc `(long)` give x86-64's i64::MIN.
-    assert_eq!(n("NINT(A)", 1e300), 0.0);
+    // Past each width's range: x86-64's i32::MIN for base, i64::MIN for
+    // sCalc/aCalc `(long)`.
+    assert_eq!(n("NINT(A)", 1e300), i32::MIN as f64);
     assert_eq!(s("NINT(A)", 1e300), i64::MIN as f64);
     assert_eq!(a("NINT(A)", 1e300), i64::MIN as f64);
 

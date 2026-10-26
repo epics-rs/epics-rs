@@ -8,7 +8,7 @@
 //!
 //! | dialect | bit / shift ops | MODULO / NINT |
 //! |---|---|---|
-//! | base `calcPerform.c` | `d2i` / `d2ui` (:324-325, :329-366) | `d2i` (MODULO :176-190, NINT :313-317) since unmerged PR #925 |
+//! | base `calcPerform.c` | `d2i` / `d2ui` (:324-325, :329-366) | `c_int` — `(epicsInt32)` (MODULO :162-164, NINT :292) |
 //! | sCalc `sCalcPerform.c` | plain `(long)` (:578-631, :725) | `c_long` — `(long)` (MODULO :1121, NINT :730) |
 //! | aCalc `aCalcPerform.c` | plain `(int)` (:907, :1355-1357, :1424-1427) | MODULO `c_int` — `(int)` (:661, :685, :711); NINT `c_long` — `(long)` (:839, :1096) |
 //!
@@ -21,13 +21,11 @@
 //! passes `c_long` to `nint` and `c_int` to `imod`. The zero-divisor
 //! disposition and the `-1 → 0` guard are uniform (CBUG-A2/A1).
 //!
-//! **PR #925 is not merged**, so the MODULO/NINT column above is the PR's
-//! behaviour, not released base's. At `origin/7.0` `d2i` is defined at
-//! `calcPerform.c:325` *inside* the bitwise block, and MODULO (`:162`) and
-//! NINT (`:291`) sit above it and never call it. The port follows the PR, so
-//! it diverges from shipped base. The PR commit is reachable from no
-//! upstream ref — cite it as *unmerged PR #925*, never as a revision — and is
-//! preserved in the reference tree as `refs/parity/2026-08-26/base-pr925-d2i`.
+//! Base's MODULO/NINT column is released base (R7.0.10), where `d2i` is
+//! defined *inside* the bitwise block and MODULO and NINT sit above it with a
+//! plain cast. Unmerged PR #925 moves them onto `d2i`; the port does not follow
+//! it (CBUG-A5). The PR commit is preserved in the reference tree as
+//! `refs/parity/2026-08-26/base-pr925-d2i`.
 //!
 //! `d2i`/`d2ui` are *not* general truncating casts: they route a
 //! non-negative double through `epicsUInt32` first, so `3e9` becomes
@@ -40,8 +38,8 @@
 ///
 /// A non-negative double goes through `epicsUInt32`, so the full 32-bit
 /// pattern survives and bit 31 lands as the sign bit — `d2i(3e9)` is
-/// `-1294967296`, not an overflow. Base uses this for BIT_OR/AND/XOR/NOT, the
-/// shifts, and — since unmerged PR #925 — NINT and MODULO too.
+/// `-1294967296`, not an overflow. Base uses this for BIT_OR/AND/XOR/NOT and
+/// the shifts.
 #[inline]
 pub(crate) fn d2i(x: f64) -> i32 {
     if x < 0.0 {
@@ -118,7 +116,7 @@ pub(crate) fn c_long(x: f64) -> i64 {
 
 /// `NINT` — round half away from zero, then narrow with the caller's dialect
 /// cast (`narrow`). One body, per-dialect narrowing: the numeric engine passes
-/// [`d2i`] (`calcPerform.c:313-317` at unmerged PR #925), and both
+/// [`c_int`] (`calcPerform.c:292`), and both
 /// sCalc (`sCalcPerform.c:730`) and aCalc (`aCalcPerform.c:839,1096`) pass
 /// [`c_long`] — BOTH synApps engines narrow NINT with `(long)`, 64-bit — each
 /// mirroring THAT dialect's own C.
@@ -130,8 +128,8 @@ pub(crate) fn c_long(x: f64) -> i64 {
 /// *ptop = <narrow>(top);
 /// ```
 ///
-/// So `NINT(3e9)` is `d2i(3e9) = -1294967296` in base (the u32 reinterpretation),
-/// but `(long)3e9 = 3000000000` in both sCalc and aCalc (64-bit, no loss).
+/// So `NINT(3e9)` is x86-64's `INT32_MIN` in base, but `(long)3e9 = 3000000000`
+/// in both sCalc and aCalc (64-bit, no loss).
 /// Inside each width's range the three agree and are bit-identical to their C.
 #[inline]
 pub(crate) fn nint(x: f64, narrow: impl Fn(f64) -> i64) -> f64 {
@@ -143,9 +141,9 @@ pub(crate) fn nint(x: f64, narrow: impl Fn(f64) -> i64) -> f64 {
 /// then take the integer remainder. Returns `None` when the divisor narrows to
 /// zero. One body, three narrowings — see [`nint`] for the per-dialect casts.
 ///
-/// C shape, identical in all three engines but for the cast width (base's fixed
-/// `calcPerform.c:176-190`; sCalc `sCalcPerform.c:558-563`/`:1102-1110`; aCalc
-/// `aCalcPerform.c:645-703`):
+/// C shape, identical in all three engines but for the cast width (base
+/// `calcPerform.c:161-167`, which has no `-1` arm; sCalc
+/// `sCalcPerform.c:558-563`/`:1102-1110`; aCalc `aCalcPerform.c:645-703`):
 ///
 /// ```c
 /// itop = <narrow>(top);                  /* divisor */
@@ -157,9 +155,9 @@ pub(crate) fn nint(x: f64, narrow: impl Fn(f64) -> i64) -> f64 {
 /// `None` signals the divisor narrowed to 0 so the caller applies its engine's
 /// zero-divisor rule (base `NaN`, sCalc error, aCalc `myMAXFLOAT`) — exactly the
 /// three arms C's own `case MODULO` splits into. A `-1` divisor returns `0`,
-/// both mathematically correct (`x % -1 == 0` for every integer) and the value
-/// all three C engines now define (calc PR #38 + base `fd64a84aa`) to avoid the
-/// undefined `INT_MIN % -1` that x86 `idiv` traps as SIGFPE.
+/// mathematically correct (`x % -1 == 0` for every integer) and the value calc
+/// PR #38 defines for sCalc/aCalc; released base has no such arm and traps the
+/// undefined `INT_MIN % -1` as SIGFPE on x86 (CBUG-A1, not copied).
 #[inline]
 pub(crate) fn imod(a: f64, b: f64, narrow: impl Fn(f64) -> i64) -> Option<f64> {
     let divisor = narrow(b);

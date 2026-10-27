@@ -185,7 +185,8 @@ fn checksum_scan_pseudo() {
             // unchecked, so a byte that is not hex compares the previous
             // byte's inchar (see checksum_scan_refuses_big_endian_non_hex).
             let f: Vec<&str> = case.split('\t').collect();
-            if !f[1].starts_with("%0") || f[1].contains('#') {
+            let little = f[1].starts_with("%#0");
+            if !little && (!f[1].starts_with("%0") || f[1].contains('#')) {
                 return c_line.to_string();
             }
             let (head, err) = c_line.split_once(" err=").unwrap();
@@ -200,17 +201,38 @@ fn checksum_scan_pseudo() {
             let input = unhex(f[2]);
             let cursor: usize = f[3].parse().unwrap();
             let value = u32::from_str_radix(sum, 16).unwrap();
+            let refused = |at: usize| {
+                let name = &f[1][f[1].find('<').unwrap() + 1..f[1].len() - 1];
+                let refused = format!(
+                    "{kept}{sum}\nChecksumConverter.cc:0: ChecksumConverter {name}: \
+                     Input byte '{}' is not a hex byte\n",
+                    String::from_utf8_lossy(&input[at..at + 2])
+                );
+                format!("{head} err={}", hex(refused.as_bytes()))
+            };
+            if little {
+                // glibc 2.43 refuses a bare "0x" as `%2x` (BZ #12701); the
+                // 2.39 that recorded checksum.out read it as 0.
+                for i in 0..sum.len() / 2 {
+                    let at = cursor + 2 * i;
+                    if input
+                        .get(at..at + 2)
+                        .is_some_and(|b| b.eq_ignore_ascii_case(b"0x"))
+                    {
+                        return refused(at);
+                    }
+                    match c_sscanf_hex(CPtr::new(&[&input[at..], &[0]].concat())) {
+                        Some((byte, _)) if byte == (value >> (8 * i)) & 0xff => {}
+                        _ => break,
+                    }
+                }
+                return c_line.to_string();
+            }
             for (j, i) in (0..sum.len() / 2).rev().enumerate() {
                 let at = cursor + 2 * i;
-                let Some((byte, _)) = c_sscanf_hex(CPtr::new(&[&input[at..], &[0]].concat()), 2)
+                let Some((byte, _)) = c_sscanf_hex(CPtr::new(&[&input[at..], &[0]].concat()))
                 else {
-                    let name = &f[1][f[1].find('<').unwrap() + 1..f[1].len() - 1];
-                    let refused = format!(
-                        "{kept}{sum}\nChecksumConverter.cc:0: ChecksumConverter {name}: \
-                         Input byte '{}' is not a hex byte\n",
-                        String::from_utf8_lossy(&input[at..at + 2])
-                    );
-                    return format!("{head} err={}", hex(refused.as_bytes()));
+                    return refused(at);
                 };
                 if byte != (value >> (8 * j)) & 0xff {
                     break;

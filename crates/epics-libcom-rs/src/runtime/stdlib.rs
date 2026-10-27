@@ -582,39 +582,47 @@ pub fn strtol(s: impl AsRef<[u8]>, base: u32) -> (c_long, usize) {
     strto(s.as_ref(), base)
 }
 
-/// One glibc `scanf` integer conversion into a `long` — `%i` is base 0, `%d`
-/// base 10, `%x` 16, `%o` 8, `%b` 2 — with the end offset. vfscanf hands its
-/// digits to [`strtol`], so an out-of-range value is `strtol`'s and a
-/// `%d`/`%hd` narrows it as [`long_to_int`] does; but it takes a `0x` (base 0
-/// or 16) or `0b` (base 0 or 2) prefix before it sees whether a digit
-/// follows, so a bare one is a matching failure (C11 7.21.6.2p10). glibc
-/// before 2.42 accepted its `0` (BZ #12701), which is not copied. `None` is a
-/// matching failure.
+/// glibc's `sscanf(s, "%l<conv>%n")` into a `long` through
+/// [`super::scanf::sscanf`] — base 0 is `%li`, 10 `%ld`, 16 `%lx`, 8 `%lo`,
+/// 2 `%lb` — with the end offset. `None` is a matching failure. `%lx`,
+/// `%lo` and `%lb` are unsigned conversions, so their `strtoul` value wraps
+/// into the `long`.
+///
+/// # Panics
+///
+/// On a base no conversion reads.
 pub fn scanf_long(s: impl AsRef<[u8]>, base: u32) -> Option<(c_long, usize)> {
-    scanf(s.as_ref(), base)
+    let fmt: &[u8] = match base {
+        0 => b"%li%n",
+        10 => b"%ld%n",
+        _ => unsigned_conversion(base),
+    };
+    scanf(s.as_ref(), fmt)
 }
 
-/// [`scanf_long`] for `%u`/`%lu`, through [`strtoul`]: a leading `-` negates
-/// modulo `unsigned long`, and `%u` narrows as [`ulong_to_uint`] does.
+/// [`scanf_long`] for `%lu` and the other unsigned conversions into an
+/// `unsigned long`: a leading `-` negates modulo `unsigned long`.
+///
+/// # Panics
+///
+/// On base 0, which only the signed `%i` reads, or one no conversion reads.
 pub fn scanf_ulong(s: impl AsRef<[u8]>, base: u32) -> Option<(c_ulong, usize)> {
-    scanf(s.as_ref(), base)
+    scanf(s.as_ref(), unsigned_conversion(base))
 }
 
-fn scanf<T: CInt>(s: &[u8], base: u32) -> Option<(T, usize)> {
-    let (v, end) = strto(s, base);
-    if end == 0 {
-        return None;
+fn unsigned_conversion(base: u32) -> &'static [u8] {
+    match base {
+        10 => b"%lu%n",
+        16 => b"%lx%n",
+        8 => b"%lo%n",
+        2 => b"%lb%n",
+        _ => panic!("no unsigned scanf conversion reads base {base}"),
     }
-    let mut start = s.iter().take_while(|&&c| c_isspace(c as char)).count();
-    start += usize::from(matches!(s.get(start), Some(b'+' | b'-')));
-    let bare_prefix = end == start + 1
-        && s[start] == b'0'
-        && match s.get(end) {
-            Some(b'x' | b'X') => base == 0 || base == 16,
-            Some(b'b' | b'B') => base == 0 || base == 2,
-            _ => false,
-        };
-    (!bare_prefix).then_some((v, end))
+}
+
+fn scanf<T: super::scanf::ScanNum + Default>(s: &[u8], fmt: &[u8]) -> Option<(T, usize)> {
+    let (v, end) = (std::cell::Cell::new(T::default()), std::cell::Cell::new(0));
+    (super::scanf::sscanf(s, fmt, &[&v, &end]) == 1).then(|| (v.get(), end.get() as usize))
 }
 
 /// C `strtoul(s, &end, base)`, likewise at `unsigned long`'s width; `ERANGE`
@@ -751,6 +759,14 @@ mod tests {
         assert_eq!(scanf_long("0bS", 16), Some((11, 2)));
         assert_eq!(scanf_long("0b", 2), None);
         assert_eq!(scanf_long("0b1", 2), Some((1, 3)));
+        // `%lx`, `%lo` and `%lb` are unsigned conversions: `strtoul`'s value
+        // stored into the `long`.
+        assert_eq!(scanf_long("8000000000000000", 16), Some((c_long::MIN, 16)));
+        assert_eq!(scanf_long("1ffffffffffffffffff", 16), Some((-1, 19)));
+        assert_eq!(
+            scanf_long("1000000000000000000000", 8),
+            Some((c_long::MIN, 22))
+        );
     }
 
     #[test]

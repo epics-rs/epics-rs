@@ -2,6 +2,11 @@
 //! cursor over a zero-tailed buffer, and the `<ctype.h>`, `strtoul`,
 //! `strtol` and `sscanf` behaviour the parser's numbers depend on.
 
+use std::cell::Cell;
+use std::ffi::c_int;
+
+use epics_libcom_rs::runtime::scanf;
+
 /// A `const char*` into a byte buffer.
 ///
 /// A `StreamBuffer` always ends in 0x00 bytes, and the C code reads past the
@@ -150,46 +155,13 @@ pub fn c_strtol(s: CPtr<'_>, base: u32) -> (i64, usize) {
     (v, s.offset() + end)
 }
 
-/// `sscanf(s, "%<width>x%n", &c, &n)` as glibc reads it: `None` when no
-/// conversion was made, else the 32-bit value and the bytes consumed,
+/// `sscanf(s, "%2x%n", &c, &n)`, the only width the C sources use
+/// (`StreamProtocol.cc:1239`, `ChecksumConverter.cc:903`, `:947`): `None`
+/// when no conversion was made, else the value and the bytes consumed,
 /// skipped leading whitespace included.
-pub fn c_sscanf_hex(s: CPtr<'_>, width: usize) -> Option<(u32, usize)> {
-    let mut i = 0;
-    while c_isspace(s.at(i) as i32) {
-        i += 1;
-    }
-    let mut w = width;
-    let mut neg = false;
-    if w > 0 && (s.at(i) == b'+' || s.at(i) == b'-') {
-        neg = s.at(i) == b'-';
-        i += 1;
-        w -= 1;
-    }
-    let mut value: u32 = 0;
-    let mut any = false;
-    if w > 0 && s.at(i) == b'0' {
-        // glibc takes "0x" as a prefix inside the field width.
-        any = true;
-        i += 1;
-        w -= 1;
-        if w > 0 && (s.at(i) | 0x20) == b'x' {
-            i += 1;
-            w -= 1;
-        }
-    }
-    while w > 0 {
-        let Some(d) = digit_value(s.at(i)).filter(|&d| d < 16) else {
-            break;
-        };
-        any = true;
-        value = value.wrapping_mul(16).wrapping_add(d);
-        i += 1;
-        w -= 1;
-    }
-    if !any {
-        return None;
-    }
-    Some((if neg { value.wrapping_neg() } else { value }, i))
+pub fn c_sscanf_hex(s: CPtr<'_>) -> Option<(u32, usize)> {
+    let (c, n) = (Cell::new(0u32), Cell::new(0 as c_int));
+    (scanf::sscanf(rest(&s), b"%2x%n", &[&c, &n]) == 1).then(|| (c.get(), n.get() as usize))
 }
 
 /// `sscanf(s, "%<width>o%n")` or `"%<width>u%n"` on a string that starts with
@@ -284,12 +256,16 @@ mod tests {
 
     #[test]
     fn sscanf_hex_takes_whitespace_sign_and_prefix_like_glibc() {
-        let h = |s: &[u8]| c_sscanf_hex(CPtr::new(s), 2);
+        let h = |s: &[u8]| c_sscanf_hex(CPtr::new(s));
         assert_eq!(h(b"41\""), Some((0x41, 2)));
         assert_eq!(h(b"4g"), Some((4, 1)));
         assert_eq!(h(b" 5"), Some((5, 2)));
         assert_eq!(h(b"-1"), Some((u32::MAX, 2)));
-        assert_eq!(h(b"0x5"), Some((0, 2)));
+        assert_eq!(h(b"+5"), Some((5, 2)));
+        // glibc 2.42 refuses a `0x` with no digit in the field (BZ #12701).
+        assert_eq!(h(b"0x5"), None);
+        assert_eq!(h(b"0x"), None);
+        assert_eq!(h(b"-0x"), Some((0, 2)));
         assert_eq!(h(b"g"), None);
         assert_eq!(h(b"-"), None);
     }

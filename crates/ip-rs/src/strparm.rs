@@ -6,6 +6,7 @@
 //! Inputs read up to `N` bytes ending in `TERM`, and scan from offset `IX`;
 //! outputs write the formatted value, terminated by `TERM` as the output EOS.
 
+use std::cell::Cell;
 use std::sync::{Arc, Mutex};
 
 use asyn_rs::adapter::parse_asyn_link;
@@ -16,11 +17,10 @@ use asyn_rs::port_handle::PortHandle;
 use asyn_rs::request::{CellBody, OctetReadOp, PortCalls, RequestCell, RequestOp, Unrun};
 use asyn_rs::trace::TraceMask;
 use asyn_rs::user::{AsynUser, timeout_from_secs};
-use epics_base_rs::calc::engine::scanf::sscanf;
-use epics_base_rs::calc::engine::value::StackValue;
 use epics_base_rs::error::CaResult;
 use epics_base_rs::runtime::epics_string::print_escaped;
 use epics_base_rs::runtime::log::errlog_vprintf;
+use epics_base_rs::runtime::scanf::{self, ScanTarget};
 use epics_base_rs::runtime::stdlib::strtod;
 use epics_base_rs::runtime::task::CallbackPriority;
 use epics_base_rs::server::database::{DeviceDone, DeviceDoneSource};
@@ -446,14 +446,10 @@ impl DevStrParm {
             .start_in(nread)
             .filter(|_| !refused)
             .map(|at| c_str(&buffer[at..]));
-        let scan = |source: &[u8]| {
-            let found = sscanf(source, parm.format.as_bytes());
-            let n = match &found {
-                Ok(_) => 1,
-                Err(_) if source.iter().all(u8::is_ascii_whitespace) => -1,
-                Err(_) => 0,
-            };
-            (n, found.ok())
+        // C's `sscanf(buffer, format, &prec->val)`: the field is the one
+        // destination, and `()` the argument C did not pass.
+        let scan = |source: &[u8], val: &dyn ScanTarget| {
+            scanf::sscanf(source, parm.format.as_bytes(), &[val, &()])
         };
         let flow = |n: i32, val: &dyn std::fmt::Display| {
             self.print(
@@ -470,11 +466,10 @@ impl DevStrParm {
         };
         let defined = match (self.kind, source) {
             (Kind::Ai, Some(source)) => {
-                let (n, found) = scan(source);
-                if let Some(StackValue::Double(v)) = found {
-                    record.put_field("VAL", EpicsValue::Double(v))?;
-                }
-                flow(n, &format_args!("{:.6}", CFloat(field_f64(record, "VAL"))));
+                let val = Cell::new(field_f64(record, "VAL"));
+                let n = scan(source, &val);
+                record.put_field("VAL", EpicsValue::Double(val.get()))?;
+                flow(n, &format_args!("{:.6}", CFloat(val.get())));
                 n == 1
             }
             (Kind::Bi, Some(source)) => {
@@ -491,28 +486,28 @@ impl DevStrParm {
                 } else {
                     None
                 };
-                let value = match matched {
-                    Some(v) => Some(v),
+                let (val, defined) = match matched {
+                    Some(v) => (v, true),
                     None => {
-                        let (n, found) = scan(source);
-                        let value = match found {
-                            Some(StackValue::Double(v)) => Some(v as i64 as u16),
-                            _ => None,
-                        };
-                        flow(n, &value.unwrap_or(0));
-                        value
+                        let val = Cell::new(match record.get_field("VAL") {
+                            Some(EpicsValue::Enum(v)) => v,
+                            _ => 0,
+                        });
+                        let n = scan(source, &val);
+                        flow(n, &val.get());
+                        (val.get(), n == 1)
                     }
                 };
-                if let Some(v) = value {
-                    record.put_field("VAL", EpicsValue::Enum(v))?;
-                }
-                value.is_some()
+                record.put_field("VAL", EpicsValue::Enum(val))?;
+                defined
             }
             (Kind::Li, Some(source)) => {
-                let (n, found) = scan(source);
-                if let Some(StackValue::Double(v)) = found {
-                    record.put_field("VAL", EpicsValue::Long(v as i64 as i32))?;
-                }
+                let val = Cell::new(match record.get_field("VAL") {
+                    Some(EpicsValue::Long(v)) => v,
+                    _ => 0,
+                });
+                let n = scan(source, &val);
+                record.put_field("VAL", EpicsValue::Long(val.get()))?;
                 flow(n, &format_args!("{:.6}", CFloat(field_f64(record, "VAL"))));
                 n == 1
             }
@@ -837,6 +832,27 @@ mod tests {
         run(&dev, &mut Wire::new(b"12", false));
         let out = dev.read(&mut rec).unwrap();
         assert_eq!((rec.val, out.udf()), (0.0, DeviceUdf::Undefined));
+    }
+
+    /// The format goes to glibc's `sscanf` with the field as its one
+    /// destination, so a literal `%%` matches and a second conversion makes
+    /// the count 2.
+    #[test]
+    fn the_format_scans_as_glibc_sscanf() {
+        let ai = |fmt: &str, reply: &[u8], port: &str| {
+            let (mut dev, _h) = live_dev(Kind::Ai, &format!("TERM=,FMT={fmt}"), "", port);
+            run(&dev, &mut Wire::new(reply, false));
+            let mut rec = AiRecord::default();
+            rec.val = 7.0;
+            let out = dev.read(&mut rec).unwrap();
+            (rec.val, out.udf())
+        };
+        assert_eq!(ai("%lf%%", b"2.5%", "SP_AI_PCT"), (2.5, DeviceUdf::Defined));
+        assert_eq!(
+            ai("%lf %lf", b"1 2", "SP_AI_TWO"),
+            (1.0, DeviceUdf::Undefined)
+        );
+        assert_eq!(ai("%lf", b"1e", "SP_AI_EXP"), (7.0, DeviceUdf::Undefined));
     }
 
     /// `0STR=` / `1STR=` before the scan.

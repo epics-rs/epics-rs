@@ -213,20 +213,11 @@ pub fn format_c_int(format: &str, value: i32) -> Result<String, String> {
     Ok(format!("{prefix}{padded}{suffix}"))
 }
 
-/// Read the leading number of `text` as C's `sscanf("%lf")` does: skip leading
-/// whitespace, take the longest prefix that is a number, ignore the rest.
-/// `None` when there is no number at all (C: the conversion fails).
+/// C's `sscanf(text, "%lf", &v)`, glibc's scan: `None` when the conversion
+/// fails.
 pub fn scan_f64(text: &str) -> Option<f64> {
-    let text = text.trim_start();
-    let mut value = None;
-    for (end, _) in text.char_indices().skip(1) {
-        match text[..end].parse::<f64>() {
-            Ok(parsed) => value = Some(parsed),
-            // Keep going: "1e" does not parse but "1e-3" does.
-            Err(_) => continue,
-        }
-    }
-    text.parse::<f64>().ok().or(value)
+    let v = std::cell::Cell::new(0f64);
+    (epics_libcom_rs::runtime::scanf::sscanf(text, "%lf", &[&v]) == 1).then(|| v.get())
 }
 
 #[cfg(test)]
@@ -314,6 +305,11 @@ mod tests {
         assert_eq!(scan_f64("0.0"), Some(0.0));
         assert_eq!(scan_f64("mm"), None);
         assert_eq!(scan_f64(""), None);
+        // glibc 2.43: an exponent with no digit fails the match (BZ #12701),
+        // `%lf` reads hex floats, and only C's isspace is skipped.
+        assert_eq!(scan_f64("1e"), None);
+        assert_eq!(scan_f64("0x1p1"), Some(2.0));
+        assert_eq!(scan_f64("\u{a0}1"), None);
     }
 
     #[test]

@@ -3642,16 +3642,12 @@ fn cmd_gft() -> CommandDef {
 /// `abc` — leaves the rung out. That asymmetry is the whole reason `pft REC
 /// 12.7` prints seven rows and `pft REC abc` prints one.
 ///
-/// The engine is this workspace's C `sscanf`
-/// ([`crate::calc::engine::scanf::sscanf`]), including the length-modifier
-/// narrowing table, so `%hd` really wraps into a `short` here. Its one output
-/// object is a `f64`, so a `%ld` result above 2^53 loses C's low bits before
-/// the caller truncates it to `dbr_long_t`.
+/// The scan is glibc's ([`crate::runtime::scanf::sscanf`]), so `%hd` wraps
+/// into a `short` and `%ld` keeps every bit of the `long` the caller
+/// truncates to `dbr_long_t`.
 fn c_scan_int(s: &[u8], fmt: &[u8]) -> Option<i64> {
-    match crate::calc::engine::scanf::sscanf(s, fmt) {
-        Ok(crate::calc::engine::value::StackValue::Double(v)) => Some(v as i64),
-        _ => None,
-    }
+    let v = std::cell::Cell::new(0i64);
+    (crate::runtime::scanf::sscanf(s, fmt, &[&v]) == 1).then(|| v.get())
 }
 
 /// Print a C printf STREAM through the shell's line-at-a-time output.
@@ -9864,6 +9860,19 @@ record(lso, "SOD") { field(SIZV, "128") }
             out.contains("\nDBR_STS_STRING\t 0  0\tValue: 65\n"),
             "got:\n{out}"
         );
+    }
+
+    /// `pft`'s `%ld` stores into a `long`, so a value past 2^53 keeps the low
+    /// bits C puts as `dbr_long_t`.
+    #[test]
+    fn pft_scans_into_c_short_and_long() {
+        assert_eq!(
+            c_scan_int(b"9007199254740993", b"%ld"),
+            Some(9007199254740993)
+        );
+        assert_eq!(c_scan_int(b"70000", b"%hd"), Some(4464));
+        assert_eq!(c_scan_int(b"0b11", b"%hd"), Some(0));
+        assert_eq!(c_scan_int(b"abc", b"%ld"), None);
     }
 
     /// C `pft` (`db_test.c:85-186`) on a numeric field.

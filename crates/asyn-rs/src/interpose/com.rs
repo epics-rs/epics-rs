@@ -141,22 +141,10 @@ fn hash_hex_upper(v: i32) -> String {
     }
 }
 
-/// C `sscanf(val, "%g", &x)` — the longest prefix that forms a float, after
-/// leading whitespace. Implemented as C specifies it (longest valid prefix)
-/// rather than by re-deriving the grammar, so `"1.5xyz"` reads 1.5 and the
-/// `inf` / `nan` forms C's `%g` accepts are accepted here too.
+/// C `sscanf(val, "%g", &x)`, glibc's scan.
 fn scan_float(s: &str) -> Option<f32> {
-    let t = s.trim_start();
-    let mut end = t.len();
-    while end > 0 {
-        if t.is_char_boundary(end) {
-            if let Ok(v) = t[..end].parse::<f32>() {
-                return Some(v);
-            }
-        }
-        end -= 1;
-    }
-    None
+    let x = std::cell::Cell::new(0f32);
+    (epics_libcom_rs::runtime::scanf::sscanf(s, "%g", &[&x]) == 1).then(|| x.get())
 }
 
 fn asyn_error(message: impl Into<String>) -> AsynError {
@@ -2228,6 +2216,11 @@ mod tests {
         assert_eq!(scan_float("2"), Some(2.0));
         assert_eq!(scan_float("1.5abc"), Some(1.5));
         assert_eq!(scan_float("nope"), None);
+        // glibc 2.43: an exponent with no digit fails the match (BZ #12701),
+        // `%g` reads hex floats, and only C's isspace is skipped.
+        assert_eq!(scan_float("1e"), None);
+        assert_eq!(scan_float("0x1p1"), Some(2.0));
+        assert_eq!(scan_float("\u{a0}1"), None);
     }
 
     #[test]

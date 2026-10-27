@@ -300,6 +300,32 @@ fn test_sscanf_rejects_a_second_live_conversion() {
     );
 }
 
+/// The conversions are glibc 2.43's under `_GNU_SOURCE`: `%i` takes `0b`, a
+/// bare prefix or exponent is a mismatch, and an out-of-range number is
+/// `strtol`'s. Through the greedy `%%` skip `"%d %% %i"` hands its one object
+/// to `%d`, and C alarms only when `%i` converts too, into a pointer it was
+/// never given.
+#[test]
+fn test_sscanf_matches_glibc_with_gnu_source() {
+    let mut inputs = StringInputs::new();
+    assert_eq!(
+        eval_str(r#"SSCANF("1 x", "%d %% %i")"#),
+        StackValue::Double(1.0)
+    );
+    assert!(scalc(r#"SSCANF("1 % 2", "%d %% %i")"#, &mut inputs).is_err());
+    assert_eq!(eval_str(r#"SSCANF("0b11", "%i")"#), StackValue::Double(3.0));
+    assert!(scalc(r#"SSCANF("0x", "%x")"#, &mut inputs).is_err());
+    assert!(scalc(r#"SSCANF("1e", "%f")"#, &mut inputs).is_err());
+    assert_eq!(
+        eval_str(r#"SSCANF("18446744073709551616", "%lu")"#),
+        StackValue::Double(std::ffi::c_ulong::MAX as f64)
+    );
+    assert_eq!(
+        eval_str(r#"SSCANF("99999999999999999999", "%d")"#),
+        StackValue::Double(std::ffi::c_long::MAX as i32 as f64)
+    );
+}
+
 /// BIN_READ shares `findConversionIndicator`, so it inherits both rules — it
 /// used to accept `%d%%` and answer 42.
 #[test]

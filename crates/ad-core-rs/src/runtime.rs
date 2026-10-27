@@ -158,17 +158,11 @@ pub async fn sleep(duration: Duration) {
 /// Drive `fut` on a current-thread runtime of its own: the body of every
 /// thread that loops on one for its life.
 pub(crate) fn block_on_for_thread<Fut: Future>(fut: Fut) -> Fut::Output {
-    tokio::runtime::Builder::new_current_thread()
+    let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .expect("failed to build thread runtime")
-        .block_on(async {
-            // The runtime's deferred-waker list grows on its first deferred
-            // yield; taken here, the yield the coop budget forces in a frame
-            // burst no longer allocates mid-frame.
-            tokio::task::yield_now().await;
-            fut.await
-        })
+        .expect("failed to build thread runtime");
+    epics_libcom_rs::runtime::task::block_on_thread_loop(&rt, fut)
 }
 
 /// Spawn a dedicated OS thread that runs the given async closure inside an

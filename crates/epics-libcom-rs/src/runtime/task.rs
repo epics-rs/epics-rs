@@ -257,6 +257,20 @@ pub fn block_on_sync<F: Future>(fut: F) -> Result<F::Output, NotBlockable> {
     }
 }
 
+/// Drive a dedicated thread's loop on the current-thread runtime the thread
+/// owns: a port actor's, a driver's or a plugin's, each looping on its queue
+/// for life as C's thread does.
+///
+/// A `block_on` grows the deferred-waker list it keeps on its first deferred
+/// yield, which a loop meets when its coop budget runs out mid-burst; taken
+/// here before `fut`, that yield no longer allocates mid-burst.
+pub fn block_on_thread_loop<F: Future>(rt: &tokio::runtime::Runtime, fut: F) -> F::Output {
+    rt.block_on(async {
+        tokio::task::yield_now().await;
+        fut.await
+    })
+}
+
 /// A capability, captured where the backend's executor is reachable, to run
 /// async work from a plain blocking thread (iocsh, a REPL, a script thread).
 ///

@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering as AtomicOrdering};
 use std::time::{Instant, SystemTime};
 
 use epics_libcom_rs::SharedArray;
+use epics_libcom_rs::runtime::task::block_on_thread_loop;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::error::{AsynError, AsynResult, AsynStatus};
@@ -1514,11 +1515,7 @@ impl PortActor {
             .unwrap();
         let lend = Arc::clone(&self.lend);
         let mut actor = Box::new(self);
-        let mut actor = rt.block_on(async move {
-            // The runtime's deferred-waker list grows on its first deferred
-            // yield; taken here, the yield the coop budget forces in a
-            // request burst no longer allocates mid-request.
-            tokio::task::yield_now().await;
+        let mut actor = block_on_thread_loop(&rt, async move {
             // The registration connect armed in `new`, ahead of every request.
             actor.registration_pass();
             let mut stop = Stop::Listening(shutdown_rx);

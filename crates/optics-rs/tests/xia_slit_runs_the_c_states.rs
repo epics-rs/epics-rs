@@ -11,7 +11,7 @@
 //!   shows that error's message, or an unknown error when that code is
 //!   outside `hscErrors`. The hand port treated it as an unknown error.
 //! - A move's dry read (`start_H_move`, `while (!s_sevr)`,
-//!   xia_slit.st:943-951) is skipped when the last locate's timeout left
+//!   xia_slit.st:983-992) is skipped when the last locate's timeout left
 //!   SEVR set, so a queued `DONE` for the moving axis is processed. The
 //!   hand port always dropped it.
 //! - The reply FIFO (`INPUT_TO_FIFO`) overwrites on wrap, so

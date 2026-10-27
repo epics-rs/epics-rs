@@ -1,5 +1,5 @@
 //! kohzuCtl's boot ends where C's does. initSequence's two theta passes
-//! (`kohzuCtl.st:644`, `:645-653`) clamp against C's unset thetaHi/thetaLo
+//! (`kohzuCtl.st:645-646`, `:658-667`) clamp against C's unset thetaHi/thetaLo
 //! and are rolled back. The first waitForCmnd then takes the connect-time
 //! monitors its waitForCmndEnter leaves set, in its order: thetaLimits, the
 //! theta readback (thetaMotStopped `!causedMove`), then yOffset. A zero
@@ -1129,8 +1129,8 @@ async fn debug_prints_c_lines() {
         // C's Linux run races the monitor of waitForCmndEnter's own
         // pvPut(kohzuMoving) (kohzuCtl.st:723) against waitForCmnd's whens.
         // This follows C's delivery on CAC-event above the state set
-        // (dbContext.cpp), RTEMS's outcome: it has landed, so kMbusy (:766)
-        // wins over the pending yOffset_mon (:778).
+        // (dbContext.cpp), RTEMS's outcome: it has landed, so kMbusy (:782)
+        // wins over the pending yOffset_mon (:794).
         assert_eq!(
             trace,
             [

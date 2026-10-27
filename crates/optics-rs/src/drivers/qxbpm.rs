@@ -109,7 +109,7 @@ impl Default for CalibrationData {
     }
 }
 
-/// Full-scale current in amps of each gain range (`sncqxbpm.st:568-573`).
+/// Full-scale current in amps of each gain range (`sncqxbpm.st:618-623`).
 const FULL_SCALE_AMPS: [f64; NUM_GAINS] = [350e-9, 700e-9, 1400e-9, 7e-6, 70e-6, 700e-6];
 
 /// Compute the default gain trim factors (from the original set_defaults).
@@ -179,7 +179,7 @@ pub struct BeamPosition {
 /// - X = GX * (B - D) / (B + D)
 /// - Y = GY * (A - C) / (A + C)
 ///
-/// C (sncqxbpm.st:493-494) divides unguarded, so a zero quadrant sum yields
+/// C (sncqxbpm.st:536-537) divides unguarded, so a zero quadrant sum yields
 /// NaN (0/0) or ±Inf (nonzero/0) and a tiny sum a large finite value. We
 /// reproduce that IEEE result rather than substituting 0.0, so pos:x / pos:y
 /// carry the same on-the-wire value as C under no-beam or cancelling currents.
@@ -762,7 +762,7 @@ mod tests {
     }
 
     /// The same beam reads the same current on every range that resolves
-    /// it: raw counts scale as 1 / full scale (`sncqxbpm.st:54-55`).
+    /// it: raw counts scale as 1 / full scale (`sncqxbpm.st:57-58`).
     #[test]
     fn test_sim_qxbpm_current_is_independent_of_gain() {
         let mut sim = SimQxbpm::new(0.0, 0.0);

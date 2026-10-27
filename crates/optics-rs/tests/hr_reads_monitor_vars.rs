@@ -98,7 +98,7 @@ async fn idle(db: &PvDatabase, ack: &str, msg1: &str) {
 }
 
 /// Run `posts` once the sequencer has passed waitForCmndEnter's efClears
-/// (hrCtl.st:605-682): OperAck sends it there, and the enter's `opAck = 0` follows them.
+/// (hrCtl.st:606-682): OperAck sends it there, and the enter's `opAck = 0` follows them.
 /// Its puts are queued, so no record lock can hold it inside the enter.
 async fn post_after_enter(db: &PvDatabase, posts: impl FnOnce(&PvDatabase)) {
     idle(db, "H:HR1_OperAckBO", "H:HR1_SeqMsg1SI").await;
@@ -156,7 +156,7 @@ async fn wait_near(ioc: &PvDatabase, pv: &str, want: f64) {
 }
 
 /// A motor soft-limit change, UseSet=Set and UseSet=Use each run C's
-/// phiLimits (hrCtl.st:699-705, :767-785): Set zeroes the drive limits,
+/// phiLimits (hrCtl.st:700-706, :768-786): Set zeroes the drive limits,
 /// Use derives them again from the motor HLM/LLM.
 #[epics_base_rs::epics_test]
 async fn use_set_zeroes_the_drive_limits_and_use_restores_them() {
@@ -169,7 +169,7 @@ async fn use_set_zeroes_the_drive_limits_and_use_restores_them() {
             db.put_record_field_from_ca(rec, field, v).await.unwrap();
         }
     };
-    // phi1Hi = phi1MotHiLim*uR2D + phi1Off + worldOff*uR2D (hrCtl.st:847).
+    // phi1Hi = phi1MotHiLim*uR2D + phi1Off + worldOff*uR2D (hrCtl.st:848).
     let want = 1e6 * UR2D
         + f64_of(&ioc, "H:HR1_phi1OffAO").await
         + f64_of(&ioc, "H:HR1_worldOffAO").await * UR2D;
@@ -226,7 +226,7 @@ async fn set_mode_takes_e_as_its_own_limit_put_clamped_it() {
 }
 
 /// updatePsuedo echoes each motor's VAL and DMOV as it is posted, with no
-/// command pass (hrCtl.st:1513-1535).
+/// command pass (hrCtl.st:1518-1540).
 #[epics_base_rs::epics_test]
 async fn the_cmd_and_dmov_echoes_follow_the_motor_monitors() {
     let (ioc, _scan) = boot().await;
@@ -356,8 +356,8 @@ fn trace_of(test: &str) -> Vec<String> {
 }
 
 /// With hrCtlDebug set, an opMode change prints C's lines: each state's
-/// entry block and the clauses it takes (hrCtl.st:787-793, :1227-1314,
-/// :601-697).
+/// entry block and the clauses it takes (hrCtl.st:788-794, :1232-1319,
+/// :602-698).
 #[epics_base_rs::epics_test]
 async fn debug_prints_c_lines() {
     if std::env::var_os(CHILD).is_none() {

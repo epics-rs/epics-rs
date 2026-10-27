@@ -16,7 +16,7 @@ pub struct FilterMaterial {
     ///
     /// `double` in C, not `float`: the absorption/transmission maths reads the
     /// separate `extern double matdensity[]` array (`chantler.h:7`,
-    /// `chantler.c:8`) — `absLen = 1/(matdensity[i]*mu)` in `pf4.st:658` and
+    /// `chantler.c:8`) — `absLen = 1/(matdensity[i]*mu)` in `pf4.st:674` and
     /// `filterDrive.st:300` — never the `float density` field of C's
     /// `filterMaterial` struct, which no computation reads. `kev`/`mu` below
     /// stay `f32` because those *are* `float` in C's struct (`chantler.h:13-14`).
@@ -1195,7 +1195,7 @@ pub const FILTER_MATERIALS: &[FilterMaterial] = &[
 /// Look up a filter material by element symbol.
 ///
 /// Case-sensitive: both C lookups compare with `strcmp`
-/// (`pf4.st:638`, `filterDrive.st:276`), so `"cu"` is not `"Cu"` and takes the
+/// (`pf4.st:654`, `filterDrive.st:276`), so `"cu"` is not `"Cu"` and takes the
 /// material-not-found path.
 pub fn find_material(name: &str) -> Option<&'static FilterMaterial> {
     FILTER_MATERIALS.iter().find(|m| m.name == name)
@@ -1203,7 +1203,7 @@ pub fn find_material(name: &str) -> Option<&'static FilterMaterial> {
 
 /// Index of the first tabulated energy strictly above `energy_kev`.
 ///
-/// C `filterDrive.st:287-289` and `pf4.st:645-647`:
+/// C `filterDrive.st:287-289` and `pf4.st:661-663`:
 /// `for (j=0; j<numEntries; j++) if (keV < filtermat[i].keV[j]) break;`
 /// Returns `kev.len()` when no tabulated energy is above `energy_kev`.
 fn first_energy_above(kev: &[f32], energy_kev: f64) -> usize {
@@ -1310,12 +1310,12 @@ pub fn transmission(mat: &FilterMaterial, energy_kev: f64, thickness_um: f64) ->
 ///
 /// **C defect, fixed in the `pf4.st` copy — CBUG-B4.** `None` means *no absorption data
 /// at this energy*, and it is a distinct value from any absorption length. C
-/// returns `0.` for it (`:651-653`), which upstream `RecalcFilters` fed to
+/// returns `0.` for it (`pf4.st:667-669`), which upstream `RecalcFilters` fed to
 /// `exp(-x*1000./absLen)` = `exp(-inf)` = `0.0` — reporting the blade as
 /// perfectly opaque, silently. The `.st` copy's `RecalcFilters` reports such
 /// a blade and leaves it out.
 pub fn other_absorption_length_um(mat: &FilterMaterial, energy_kev: f64) -> Option<f64> {
-    // C pf4.st:658-659 — absLen = 1/(matdensity[i]*mu), cm -> microns.
+    // C pf4.st:674-675 — absLen = 1/(matdensity[i]*mu), cm -> microns.
     interpolate_mu(mat, energy_kev).map(|mu| (1.0 / (mat.density * mu)) * 1.0e4)
 }
 
@@ -1330,7 +1330,7 @@ mod tests {
         assert!((cu.density - 8.96).abs() < 0.01);
     }
 
-    // R6-63: C matches species names with strcmp (pf4.st:638,
+    // R6-63: C matches species names with strcmp (pf4.st:654,
     // filterDrive.st:276), so a name differing only in case is "not found".
     #[test]
     fn test_r6_63_find_material_is_case_sensitive() {
@@ -1342,7 +1342,7 @@ mod tests {
     // R6-73: density is C's `double matdensity[]` (chantler.c:8), so every
     // tabulated value must be the exact double literal — an `f32` field widened
     // back to `f64` carries the single-precision rounding into
-    // `1/(matdensity[i]*mu)` (pf4.st:658, filterDrive.st:300).
+    // `1/(matdensity[i]*mu)` (pf4.st:674, filterDrive.st:300).
     #[test]
     fn test_r6_73_density_is_the_exact_c_double() {
         // Values whose f32 image is *not* the double: the boundary of the bug.
@@ -1551,7 +1551,7 @@ mod tests {
     }
 
     /// CBUG-B4 — "no absorption data" is `None`, not the `0.` that C returns
-    /// (`pf4.st:651-653`) and then divides by. This test used to assert `0.0`.
+    /// (`pf4.st:667-669`) and then divides by. This test used to assert `0.0`.
     #[test]
     fn test_b4_no_data_is_none_not_a_zero_length() {
         let cu = find_material("Cu").unwrap();

@@ -179,7 +179,7 @@ mod tests {
     }
 
     /// filterDrive's blade count is the `NUM_FILTERS` macro
-    /// (`filterDrive.st:338`), published to `NumFilters` by `start`.
+    /// (`filterDrive.st:342`), published to `NumFilters` by `start`.
     #[epics_base_rs::epics_test]
     async fn filter_drive_takes_its_blade_count_from_num_filters() {
         let db = filter_drive_ioc("F:").await;
@@ -201,7 +201,7 @@ mod tests {
     }
 
     /// A negative count assigns no blade and is published as it is
-    /// (`filterDrive.st:344-367`).
+    /// (`filterDrive.st:359-382`).
     #[epics_base_rs::epics_test]
     async fn filter_drive_publishes_a_negative_num_filters() {
         let db = filter_drive_ioc("N:").await;

@@ -1,6 +1,6 @@
 //! `pf4.st`, compiled by snc-rs from `build.rs` and run on `epics-seq-rs`.
-//! Its escaped C is the `%%#include` lines, the prototypes (`:134-146`) and
-//! the functions after the program (`:491-847`); the functions are here in
+//! Its escaped C is the `%%#include` lines, the prototypes (`:137-149`) and
+//! the functions after the program (`:507-863`); the functions are here in
 //! Rust under their C names, and `chantler.h`'s table is
 //! [`crate::data::chantler`].
 //!
@@ -20,15 +20,15 @@ macro_rules! seqg_escaped {
     (r#"#include <math.h>"#) => {};
     (r#"#include <string.h>"#) => {};
     (r#"#include "chantler.h""#) => {};
-    // The prototypes (`:134-146`).
+    // The prototypes (`:137-149`).
     (r#"static double TiAbsorptionLength(double); static double GlassAbsorptionLength(double); static double AlAbsorptionLength(double); static int isLegalOther(char *s); static double OtherAbsorptionLength(double keV, char *species); static int fillShowArrays(char *species, int N, float *E, float *T); static int numInArray(int,short*,short); static void sortDecreasing(int,double*,short*,int); static double thickZ(int,int,int,int,int,int,int,int,int,int,double,double,double,double); static void RecalcFilters(double,short*,double*,int,int,int,int,int,int,double,double,double,double, char *, char *, char *, char *);"#) => {};
-    // The functions (`:491-847`), below in Rust.
+    // The functions (`:507-863`), below in Rust.
     (r#"double AlAbsorptionLength(double keV) { double Wcoef0[]={1.90195,-0.00120447,4.3745e-7,8.68635e-11,3.40793e-15,-1.05816e-19,5.83389e-25}; double Wcoef1[]={-1625.33,0.328256,-2.68391e-5,1.26554e-9,-2.41557e-14,2.12864e-19,-7.28743e-25}; double kink = 26797.5; double* pointer; double sum,power; double eV; int i; eV = keV * 1000; if (eV>60000.) eV = 60000.; pointer = (eV<kink) ? Wcoef0 : Wcoef1; sum = 0.; power=1.; for( i=0; i<7; i++ ) { sum += pointer[i] * power; power *= eV; } return sum; } double TiAbsorptionLength(double keV) { double eV; double mu; eV = keV * 1000.; if( eV < 1e3 ) mu = 0; else if( eV < 4966.4 ) { double c0=0.00092284; double c1=2.5891e+08; double powA=-2.6651; mu = c0+c1*pow(eV,powA); } else { double offset = 5.63768167444831e-5; double amp = 24061652313.4169; double powB = -2.91380053083527; double intercept = -0.268162843203489; double slope = 3.74221014277593e-5; double ampExp = -1.05663835782997; double invTau = -0.000570785180739491; double extra = (eV < 6456) ? (intercept+slope*eV) : (ampExp*exp(invTau*eV)); mu = (offset + amp*pow(eV,powB) + extra); } return( 1./mu ); } double GlassAbsorptionLength(double keV) { double absLength; double c0,c1,c2; double c3,c4,c5,c6,c7; double keV2, keVn; keV2 = keV*keV; if( keV < 2 ) absLength = 0; else if( keV < 2.472 ) { c0 = 0.5059463974; c1 = -0.1259565387; c2 = 0.01763933889; absLength = c0 + c1*keV + c2*keV2; } else if( keV < 3.6084 ) { c0 = 0.4570603245; c1 = -0.08869920063; c2 = 0.01032934773; absLength = c0 + c1*keV + c2*keV2; } else if( keV < 4.0385 ) { c0 = 0.3708574258; c1 = -0.04453063888; c2 = 3.979930821e-3; absLength = c0 + c1*keV + c2*keV2; } else if( keV < 7.112 ) { c0 = 0.2830642538; c1 = -0.0223186563; c2 = 1.412011413e-3; absLength = c0 + c1*keV + c2*keV2; } else { c0 = 0.2715022686; c1 = -0.02428526798; c2 = 2.984228845e-3; c3 = -2.003675391e-4; c4 = 7.983398893e-6; c5 = -1.869726202e-7; c6 = 2.378962632e-9; c7 = -1.270082060e-11; absLength = c0 + c1*keV; keVn = keV2; absLength += c2*keVn; keVn *= keV; absLength += c3*keVn; keVn *= keV; absLength += c4*keVn; keVn *= keV; absLength += c5*keVn; keVn *= keV; absLength += c6*keVn; keVn *= keV; absLength += c7*keVn; } absLength *= keV*keV*keV; return( absLength ); } int isLegalOther(char *s) { int i; for (i=0; i<NUM_SPECIES; i++) { if (strcmp(filtermat[i].name, s) == 0) break; } if (i >= NUM_SPECIES) return(0); return(1); } double OtherAbsorptionLength(double keV, char *species) { int i, j; double mu, frac, absLen; for (i=0; i<NUM_SPECIES; i++) { if (strcmp(filtermat[i].name, species) == 0) break; } if (i >= NUM_SPECIES) { return(0.); } for (j=0; j<filtermat[i].numEntries; j++) { if (keV < filtermat[i].keV[j]) break; } if ((j < 1) || (j >= filtermat[i].numEntries)) { return(0.); } frac = (keV - filtermat[i].keV[j-1]) / (filtermat[i].keV[j] - filtermat[i].keV[j-1]); mu = filtermat[i].mu[j-1] + frac * (filtermat[i].mu[j] - filtermat[i].mu[j-1]); absLen = 1/(matdensity[i]*mu); absLen *= 1.e4; return(absLen); } void RecalcFilters(double keV,short* bits,double* xmit,int d,int b,int z1, int z2,int z3,int z4,double f1,double f2,double f3,double f4, char *other1, char *other2, char *other3, char *other4) { double absLenAl,absLenTi,absLenGlass; double xAl,xTi,xGlass; double xOther1, xOther2, xOther3, xOther4; int i; double absLenOther1=0, absLenOther2=0, absLenOther3=0, absLenOther4=0; if (d >= 10) printf("\nRecalcFilters: keV=%g\n",keV); absLenAl = AlAbsorptionLength(keV); absLenTi = TiAbsorptionLength(keV); absLenGlass = GlassAbsorptionLength(keV); if (z1==3) absLenOther1 = OtherAbsorptionLength(keV, other1); if (z2==3) absLenOther2 = OtherAbsorptionLength(keV, other2); if (z3==3) absLenOther3 = OtherAbsorptionLength(keV, other3); if (z4==3) absLenOther4 = OtherAbsorptionLength(keV, other4); if (z1==3 && f1 > 0 && absLenOther1 == 0) printf("RecalcFilters: no data for Other blade 1 '%s' at %g keV; it is left out\n", other1, keV); if (z2==3 && f2 > 0 && absLenOther2 == 0) printf("RecalcFilters: no data for Other blade 2 '%s' at %g keV; it is left out\n", other2, keV); if (z3==3 && f3 > 0 && absLenOther3 == 0) printf("RecalcFilters: no data for Other blade 3 '%s' at %g keV; it is left out\n", other3, keV); if (z4==3 && f4 > 0 && absLenOther4 == 0) printf("RecalcFilters: no data for Other blade 4 '%s' at %g keV; it is left out\n", other4, keV); for (i=0;i<16;i++) { if (b) { xAl = (z1==0 && i&1) ? f1 : 0; xAl += (z2==0 && i&2) ? f2 : 0; xAl += (z3==0 && i&4) ? f3 : 0; xAl += (z4==0 && i&8) ? f4 : 0; xTi = (z1==1 && i&1) ? f1 : 0; xTi += (z2==1 && i&2) ? f2 : 0; xTi += (z3==1 && i&4) ? f3 : 0; xTi += (z4==1 && i&8) ? f4 : 0; xGlass = (z1==2 && i&1) ? f1 : 0; xGlass += (z2==2 && i&2) ? f2 : 0; xGlass += (z3==2 && i&4) ? f3 : 0; xGlass += (z4==2 && i&8) ? f4 : 0; xOther1 = (z1==3 && i&1) ? f1 : 0; xOther2 = (z2==3 && i&2) ? f2 : 0; xOther3 = (z3==3 && i&4) ? f3 : 0; xOther4 = (z4==3 && i&8) ? f4 : 0; if (d >= 10) { printf("       in RecalcFilters %3d, Aluminum = %g,   Titanium = %g,   Glass = %g\n",i,xAl,xTi,xGlass); } xmit[i] = exp(-xAl*1000./absLenAl); xmit[i] *= exp(-xTi*1000./absLenTi); if (xGlass > 0) xmit[i] *= exp(-xGlass*1000./absLenGlass); if (xOther1 > 0 && absLenOther1 > 0) xmit[i] *= exp(-xOther1*1000./absLenOther1); if (xOther2 > 0 && absLenOther2 > 0) xmit[i] *= exp(-xOther2*1000./absLenOther2); if (xOther3 > 0 && absLenOther3 > 0) xmit[i] *= exp(-xOther3*1000./absLenOther3); if (xOther4 > 0 && absLenOther4 > 0) xmit[i] *= exp(-xOther4*1000./absLenOther4); } else xmit[i] = 1.; bits[i] = i; } if (b) sortDecreasing(d,xmit,bits,16); } void sortDecreasing(int d,double* arr,short* bits,int n) { int ii, jj; double a; short b; if (d >= 9) { printf("       before sorting, bits=%d",bits[0]); for (ii=1; ii<n; ii++) { printf(",%d", bits[ii]); } printf("\n"); if (d >= 10) { printf("                   transmit=%g",arr[0]); for (ii=1; ii<n/3; ii++) { printf(", %g", arr[ii]); } printf("\n"); } } for (jj=1;jj<n;jj++) { a = arr[jj]; b = bits[jj]; ii = jj-1; while(ii>=0 && arr[ii]<a) { arr[ii+1] = arr[ii]; bits[ii+1] = bits[ii]; ii--; } arr[ii+1] = a; bits[ii+1] = b; } if (d >= 8) { printf("       after sorting, bits=%d",bits[0]); for (ii=1; ii<n; ii++) { printf(",%d", bits[ii]); } printf("\n"); if (d >= 10) { printf("                   transmit=%g",arr[0]); for (ii=1; ii<n/3; ii++) { printf(", %g", arr[ii]); } printf("\n"); } } } double thickZ(int z,int b,int b1,int b2,int b3,int b4,int z1,int z2,int z3, int z4,double f1,double f2,double f3,double f4) { double sum = 0.0; if( b ) { sum += (b1 && (z1==z)) ? f1 : 0; sum += (b2 && (z2==z)) ? f2 : 0; sum += (b3 && (z3==z)) ? f3 : 0; sum += (b4 && (z4==z)) ? f4 : 0; } return sum; } int numInArray(int N,short arr[],short value) { int i; for( i=0; i<N; i++ ) if( value==arr[i] ) return i; return 0; } static int fillShowArrays(char *species, int N, float *E, float *T) { int i, j, k; for (i=0; i<NUM_SPECIES; i++) { if (strcmp(filtermat[i].name, species) == 0) break; } if (i >= NUM_SPECIES) { return(1); } for (j=0; j<filtermat[i].numEntries; j++) { E[j] = filtermat[i].keV[j]; T[j] = filtermat[i].mu[j]; } k = j-1; for (; j<N; j++) { E[j] = filtermat[i].keV[k]; T[j] = filtermat[i].mu[k]; } return(0); }"#) => {};
 }
 
 epics_seq_rs::include_program!("pf4");
 
-/// `AlAbsorptionLength` (`pf4.st:495-516`), microns.
+/// `AlAbsorptionLength` (`pf4.st:511-532`), microns.
 fn AlAbsorptionLength(keV: f64) -> f64 {
     const WCOEF0: [f64; 7] = [
         1.90195,
@@ -64,7 +64,7 @@ fn AlAbsorptionLength(keV: f64) -> f64 {
     sum
 }
 
-/// `TiAbsorptionLength` (`pf4.st:520-549`), microns: `1/0`, +inf, below
+/// `TiAbsorptionLength` (`pf4.st:536-565`), microns: `1/0`, +inf, below
 /// 1 keV.
 fn TiAbsorptionLength(keV: f64) -> f64 {
     let eV = keV * 1000.0;
@@ -93,7 +93,7 @@ fn TiAbsorptionLength(keV: f64) -> f64 {
     1.0 / mu
 }
 
-/// `GlassAbsorptionLength` (`pf4.st:564-621`), microns: 0 below 2 keV.
+/// `GlassAbsorptionLength` (`pf4.st:580-638`), microns: 0 below 2 keV.
 fn GlassAbsorptionLength(keV: f64) -> f64 {
     let keV2 = keV * keV;
     let mut absLength;
@@ -141,12 +141,12 @@ fn filtermat(species: &[u8]) -> Option<&'static FilterMaterial> {
         .find(|m| m.name.as_bytes() == species)
 }
 
-/// `isLegalOther` (`pf4.st:624-631`).
+/// `isLegalOther` (`pf4.st:640-647`).
 pub fn isLegalOther(s: impl CSrc) -> i32 {
     s.with_c_bytes(filtermat).is_some() as i32
 }
 
-/// `OtherAbsorptionLength` (`pf4.st:633-661`), microns, on `[j-1, j]` as
+/// `OtherAbsorptionLength` (`pf4.st:649-677`), microns, on `[j-1, j]` as
 /// the `.st` copy fixes it (CBUG-B1, B2: see [`other_absorption_length_um`]);
 /// `0.` for an unknown species or an energy outside its table.
 fn OtherAbsorptionLength(keV: f64, species: &[u8]) -> f64 {
@@ -155,7 +155,7 @@ fn OtherAbsorptionLength(keV: f64, species: &[u8]) -> f64 {
         .unwrap_or(0.)
 }
 
-/// `RecalcFilters` (`pf4.st:664-733`): the transmission of the 16 blade
+/// `RecalcFilters` (`pf4.st:680-749`): the transmission of the 16 blade
 /// combinations, each material's thickness summed into one exponent, sorted
 /// by decreasing transmission while the bank is on.
 pub fn RecalcFilters(
@@ -252,7 +252,7 @@ pub fn RecalcFilters(
     bits.set(bit);
 }
 
-/// `sortDecreasing` (`pf4.st:736-794`), an insertion sort.
+/// `sortDecreasing` (`pf4.st:752-810`), an insertion sort.
 fn sortDecreasing(d: i32, arr: &mut [f64; 16], bits: &mut [i16; 16]) {
     let print = |head: &str, arr: &[f64; 16], bits: &[i16; 16]| {
         printf(head, &[CArg::from(bits[0])]);
@@ -288,7 +288,7 @@ fn sortDecreasing(d: i32, arr: &mut [f64; 16], bits: &mut [i16; 16]) {
     }
 }
 
-/// `thickZ` (`pf4.st:798-812`): the thickness of material `z` in the beam.
+/// `thickZ` (`pf4.st:814-828`): the thickness of material `z` in the beam.
 pub fn thickZ(
     z: i32,
     b: i32,
@@ -314,7 +314,7 @@ pub fn thickZ(
     sum
 }
 
-/// `numInArray` (`pf4.st:817-823`): the first index of `arr` holding
+/// `numInArray` (`pf4.st:833-839`): the first index of `arr` holding
 /// `value`, else 0.
 pub fn numInArray(N: i32, arr: &impl Place<[i16; 16]>, value: i16) -> i32 {
     arr.modify(|arr| {
@@ -325,7 +325,7 @@ pub fn numInArray(N: i32, arr: &impl Place<[i16; 16]>, value: i16) -> i32 {
     })
 }
 
-/// `fillShowArrays` (`pf4.st:825-845`): a species' table into `E`/`T`,
+/// `fillShowArrays` (`pf4.st:841-861`): a species' table into `E`/`T`,
 /// padded with its last entry up to `N`; 1 for an unknown species.
 pub fn fillShowArrays(
     species: impl CSrc,
@@ -514,7 +514,7 @@ mod tests {
     }
 
     /// CBUG-B4: an Other blade of an unknown species is left out (1.0),
-    /// where upstream C divided by its `0.` (`pf4.st:640-642`) and reported
+    /// where upstream C divided by its `0.` (`pf4.st:656-659`) and reported
     /// it opaque.
     #[test]
     fn an_other_blade_of_an_unknown_species_is_left_out() {
@@ -533,7 +533,7 @@ mod tests {
         assert!(inside > 0.0 && inside < 1.0);
     }
 
-    /// C guards the Other multiply with `if (xOther1 > 0 ...)` (`pf4.st:723`),
+    /// C guards the Other multiply with `if (xOther1 > 0 ...)` (`pf4.st:739`),
     /// so a blade of zero thickness is 1.0 whatever its species.
     #[test]
     fn an_other_blade_of_zero_thickness_transmits() {

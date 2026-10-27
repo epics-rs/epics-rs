@@ -1,7 +1,7 @@
 //! The compiled `pf4.st` on `pf4common.db`/`pf4bank.db` and four `bo`
 //! hardware bits: the `{BP}{Bn}` monitors, `displayBit` as a NoMon output,
 //! and the `bankctl` 3→2→1 cascade through its own posts
-//! (`pf4.st:268-332`). The hand port's cases, on C's states.
+//! (`pf4.st:282-347`). The hand port's cases, on C's states.
 
 use epics_base_rs::runtime::task;
 use epics_base_rs::server::database::PvDatabase;
@@ -337,7 +337,7 @@ async fn a_display_bit_put_leaves_the_hardware_bit() {
 }
 
 /// `PVPUT` is `pvPut(var, SYNC)` (`seqPVmacros.h:167-171`): `filterPos` puts
-/// `b1` and waits for it before `displayBit1` (`pf4.st:231`). With `b1` a
+/// `b1` and waits for it before `displayBit1` (`pf4.st:246`). With `b1` a
 /// `busy` left set, `displayBit1` stays 0 while the put is pending, and
 /// the busy reset completes it. `A2`-`A4` are processed at init, so taking
 /// them out posts nothing: a first process posts its alarm change, which

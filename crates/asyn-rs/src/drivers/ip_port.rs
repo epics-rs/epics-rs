@@ -3538,23 +3538,12 @@ mod tests {
     /// `Duration` -> milliseconds conversion the serial driver did, and
     /// truncating a 500 us budget to 0 made the read bound non-blocking — the
     /// recv that follows then reports asynTimeout without the socket ever
-    /// having been waited on. `poll` waits at least its interval, so the call
-    /// cannot return in the few microseconds the truncated form took.
+    /// having been waited on. Asserted on the interval, not the clock: `WSAPoll`
+    /// may end a 1 ms wait at the next clock tick (386 us on windows-x86_64),
+    /// and C `readIt` hands it the same 1 ms (drvAsynIPPort.c:792-793, :816).
     #[test]
-    fn bound_next_read_waits_a_whole_tick_for_a_sub_millisecond_timeout() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let client = TcpStream::connect(addr).unwrap();
-        let _accepted = listener.accept().unwrap();
-
-        let start = std::time::Instant::now();
-        client.bound_next_read(Some(Duration::from_micros(500)));
-        let elapsed = start.elapsed();
-
-        assert!(
-            elapsed >= Duration::from_micros(400),
-            "a 500 us read bound must wait, not poll non-blocking: {elapsed:?}"
-        );
+    fn bound_next_read_polls_a_whole_millisecond_for_a_sub_millisecond_timeout() {
+        assert_eq!(poll_millis(Some(Duration::from_micros(500))), 1);
     }
 
     #[test]

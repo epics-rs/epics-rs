@@ -195,7 +195,7 @@ macro_rules! seqg_escaped {
 
 epics_seq_rs::include_program!("kohzuCtl_soft");
 
-/// `kohzuCtl_soft_calc2dSpacing` (`kohzuCtl_soft.st:1316-1340`), by the name
+/// `kohzuCtl_soft_calc2dSpacing` (`kohzuCtl_soft.st:1326-1350`), by the name
 /// the SNL code calls, on the `-r` block.
 #[allow(non_snake_case)]
 fn kohzuCtl_soft_calc2dSpacing() -> f64 {

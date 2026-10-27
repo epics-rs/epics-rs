@@ -151,11 +151,18 @@ assign  lambdaLo to "{P}BraggLambdaAO.DRVL";
 double  lambdaRdbk;
 assign  lambdaRdbk to "{P}BraggLambdaRdbkAO";
 
+/* C defect: monitored theta itself, so a theta event landing after
+ * thChanged clamped it, such as the unclamped echo of the put that led
+ * there, replaced the theta calcMovements moved to. Requests land in
+ * thetaReq, which the request arms take into theta. */
 double  theta;
 assign  theta to "{P}BraggThetaAO";
-monitor theta;
+
+double  thetaReq;
+assign  thetaReq to "{P}BraggThetaAO";
+monitor thetaReq;
 evflag  theta_mon;
-sync    theta theta_mon;
+sync    thetaReq theta_mon;
 
 double  thetaHi;
 assign  thetaHi to "{P}BraggThetaAO.DRVH";
@@ -714,6 +721,7 @@ state waitForCmnd {
 
 	when (efTestAndClear(theta_mon)) {
 		if (kohzuCtlDebug) %%printf("kohzuCtl:waitForCmnd:theta_mon\n");
+		theta = thetaReq;
 	} state thChanged
 
 	when (efTestAndClear(kMbusy)) {
@@ -819,6 +827,8 @@ state tweak {
 state dInputChanged {
 	when () {
 		if (kohzuCtlDebug) %%printf("kohzuCtl:dInputChanged\n");
+		/* C's monitored theta already held a request that landed. */
+		if (efTest(theta_mon)) theta = thetaReq;
 		autoMode = 0;
 		pvPut(autoMode);
 		sprintf(seqMsg2, "Set to Manual Mode");
@@ -882,6 +892,7 @@ state busyChanged {
 	when (kohzuMoving > 0 && efTest(theta_mon)) {
 		if (kohzuCtlDebug) %%printf("kohzuCtl:busyChanged\n to Moving and theta changed");
 		efClear(theta_mon);
+		theta = thetaReq;
 	} state thChanged
 	when (kohzuMoving > 0) {
 		if (kohzuCtlDebug) %%printf("kohzuCtl:busyChanged\n to Moving but unclear why");

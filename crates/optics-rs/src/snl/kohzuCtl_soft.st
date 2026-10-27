@@ -145,11 +145,18 @@ assign  lambdaLo to "{P}{MONO}Lambda.LLM";
 double  lambdaRdbk;
 assign  lambdaRdbk to "{P}{MONO}LambdaRdbk";
 
+/* C defect: monitored theta itself, so a theta event landing after
+ * thChanged clamped it, such as the unclamped echo of the put that led
+ * there, replaced the theta calcMovements moved to. Requests land in
+ * thetaReq, which the request arms take into theta. */
 double  theta;
 assign  theta to "{P}{MONO}Theta";
-monitor theta;
+
+double  thetaReq;
+assign  thetaReq to "{P}{MONO}Theta";
+monitor thetaReq;
 evflag  theta_mon;
-sync    theta theta_mon;
+sync    thetaReq theta_mon;
 
 double  thetaHi;
 assign  thetaHi to "{P}{MONO}Theta.HLM";
@@ -669,6 +676,7 @@ state waitForCmnd {
 
 	when (efTestAndClear(theta_mon)) {
 		if (kohzuCtlDebug) %%printf("kohzuCtl:waitForCmnd:theta_mon\n");
+		theta = thetaReq;
 	} state thChanged
 
 	when (putVals && delay(.1)) {
@@ -701,6 +709,8 @@ state waitForCmnd {
 state dInputChanged {
 	when () {
 		if (kohzuCtlDebug) %%printf("kohzuCtl:dInputChanged\n");
+		/* C's monitored theta already held a request that landed. */
+		if (efTest(theta_mon)) theta = thetaReq;
 		autoMode = 0;
 		pvPut(autoMode);
 		sprintf(seqMsg2, "Set to Manual Mode");

@@ -37,28 +37,32 @@ impl Scanned<'_> {
                 wide: false,
                 terminated,
             } => {
-                put(object, 0, chars);
-                if terminated {
-                    put(object, chars.len(), &[0]);
+                if let Some(nul) = object.get_mut(chars.len()).filter(|_| terminated) {
+                    *nul = 0;
                 }
+                put(object, 0, chars);
             }
             Repr::Text {
                 chars,
                 wide: true,
                 terminated,
-            } => {
-                for (i, &c) in chars.iter().enumerate() {
-                    // A byte past ASCII has no `wchar_t` in the C locale:
-                    // `%l[` steps over its slot.
-                    if c.is_ascii() {
-                        put(object, 4 * i, &u32::from(c).to_ne_bytes());
-                    }
-                }
-                if terminated {
-                    put(object, 4 * chars.len(), &[0; 4]);
-                }
-            }
+            } => write_wide(object, chars, terminated),
         }
+    }
+}
+
+// Out of line: inlined, its loop's registers are saved on every store.
+#[inline(never)]
+fn write_wide(object: &mut [u8], chars: &[u8], terminated: bool) {
+    for (i, &c) in chars.iter().enumerate() {
+        // A byte past ASCII has no `wchar_t` in the C locale: `%l[` steps
+        // over its slot.
+        if c.is_ascii() {
+            put(object, 4 * i, &u32::from(c).to_ne_bytes());
+        }
+    }
+    if terminated {
+        put(object, 4 * chars.len(), &[0; 4]);
     }
 }
 
@@ -79,13 +83,21 @@ fn num(b: &[u8]) -> Scanned<'static> {
 
 /// `v` stored as a `size`-byte C integer: its low bytes.
 fn int(v: u64, size: usize) -> Scanned<'static> {
-    let b = v.to_ne_bytes();
-    let low = if cfg!(target_endian = "big") {
-        8 - size
+    let v = if cfg!(target_endian = "big") {
+        v << (64 - 8 * size)
     } else {
-        0
+        v
     };
-    num(&b[low..low + size])
+    Scanned(Repr::Num(v.to_ne_bytes(), size))
+}
+
+/// The first `n` bytes of a `u64`'s object representation, 1 to 8.
+fn first_bytes(n: usize) -> u64 {
+    if cfg!(target_endian = "big") {
+        !0 << (64 - 8 * n)
+    } else {
+        !0 >> (64 - 8 * n)
+    }
 }
 
 /// An `sscanf` destination: C's pointer argument.
@@ -103,12 +115,35 @@ macro_rules! scan_num {
     ($($t:ty),*) => {
         $(impl ScanNum for $t {
             fn stored(self, value: &Scanned<'_>) -> Self {
-                let mut b = self.to_ne_bytes();
-                value.write_over(&mut b);
-                Self::from_ne_bytes(b)
+                const N: usize = size_of::<$t>();
+                let mut o = [0; 8];
+                o[..N].copy_from_slice(&self.to_ne_bytes());
+                let o = value.over_word(u64::from_ne_bytes(o), N);
+                Self::from_ne_bytes(o.to_ne_bytes()[..N].try_into().unwrap())
             }
         })*
     };
+}
+
+impl Scanned<'_> {
+    /// The first `size` bytes of `word` with the stored bytes written over
+    /// them.
+    fn over_word(&self, word: u64, size: usize) -> u64 {
+        // By mask: `write_over`'s copy of a runtime length is a call.
+        if let Repr::Num(b, n) = self.0 {
+            let m = first_bytes(n);
+            return word & !m | u64::from_ne_bytes(b) & m;
+        }
+        self.text_over_word(word, size)
+    }
+
+    // Out of line, so a number store saves no registers for it.
+    #[inline(never)]
+    fn text_over_word(&self, word: u64, size: usize) -> u64 {
+        let mut b = word.to_ne_bytes();
+        self.write_over(&mut b[..size]);
+        u64::from_ne_bytes(b)
+    }
 }
 
 scan_num!(i8, u8, i16, u16, i32, u32, i64, u64, f32, f64);
@@ -210,6 +245,16 @@ enum Stop {
     Input,
     /// glibc's `conv_error`: the input or the format did not match.
     Conv,
+}
+
+/// A conversion that ended the scan, with the characters a failing `c`, `s`
+/// or `[` read: glibc has stored them, uncounted.
+struct Failed<'a>(Stop, Option<&'a [u8]>);
+
+impl From<Stop> for Failed<'_> {
+    fn from(stop: Stop) -> Self {
+        Self(stop, None)
+    }
 }
 
 /// Reads the `[sign][0[x|b]]digits` an integer conversion takes, as glibc's
@@ -528,26 +573,13 @@ pub fn sscanf(input: impl AsRef<[u8]>, fmt: impl AsRef<[u8]>, out: &[&dyn ScanTa
         }
         let wide =
             matches!(modifier, Modifier::Long | Modifier::LongLong) || matches!(conv, b'C' | b'S');
-        // glibc has stored what a failing `c`, `s` or `[` conversion read,
-        // uncounted.
-        let mut store_read = |chars| {
-            if !suppress {
-                let target = targets.next().ok_or(Stop::Conv)?;
-                target.store(Scanned(Repr::Text {
-                    chars,
-                    wide,
-                    terminated: false,
-                }));
-            }
-            Ok(())
-        };
-        let value: Result<Option<Scanned<'_>>, Stop> = (|| match conv {
+        let value: Result<Option<Scanned<'_>>, Failed<'_>> = (|| match conv {
             b'%' => match r.inchar() {
-                None => Err(Stop::Input),
+                None => Err(Stop::Input.into()),
                 Some(b'%') => Ok(None),
                 c => {
                     r.ungetc(c);
-                    Err(Stop::Conv)
+                    Err(Stop::Conv.into())
                 }
             },
             b'n' => Ok(Some(int(r.at as u64, modifier.size()))),
@@ -555,13 +587,12 @@ pub fn sscanf(input: impl AsRef<[u8]>, fmt: impl AsRef<[u8]>, out: &[&dyn ScanTa
                 let start = r.at;
                 let mut c = r.inchar();
                 if c.is_none() {
-                    return Err(Stop::Input);
+                    return Err(Stop::Input.into());
                 }
                 let mut width = if width < 0 { 1 } else { width };
                 while let Some(ch) = c {
                     if wide && !ch.is_ascii() {
-                        store_read(&input[start..r.at - 1])?;
-                        return Err(Stop::Conv);
+                        return Err(Failed(Stop::Conv, Some(&input[start..r.at - 1])));
                     }
                     width -= 1;
                     if width <= 0 {
@@ -573,8 +604,7 @@ pub fn sscanf(input: impl AsRef<[u8]>, fmt: impl AsRef<[u8]>, out: &[&dyn ScanTa
                     // Short of `width`: glibc fails the input. glibc before
                     // 2.42 counted the conversion (BZ #12701), which is not
                     // copied.
-                    store_read(&input[start..r.at])?;
-                    return Err(Stop::Input);
+                    return Err(Failed(Stop::Input, Some(&input[start..r.at])));
                 }
                 Ok(Some(Scanned(Repr::Text {
                     chars: &input[start..r.at],
@@ -586,7 +616,7 @@ pub fn sscanf(input: impl AsRef<[u8]>, fmt: impl AsRef<[u8]>, out: &[&dyn ScanTa
                 let start = r.at;
                 let mut c = r.inchar();
                 if c.is_none() {
-                    return Err(Stop::Input);
+                    return Err(Stop::Input.into());
                 }
                 while let Some(ch) = c {
                     if is_space(ch) {
@@ -594,8 +624,7 @@ pub fn sscanf(input: impl AsRef<[u8]>, fmt: impl AsRef<[u8]>, out: &[&dyn ScanTa
                         break;
                     }
                     if wide && !ch.is_ascii() {
-                        store_read(&input[start..r.at - 1])?;
-                        return Err(Stop::Conv);
+                        return Err(Failed(Stop::Conv, Some(&input[start..r.at - 1])));
                     }
                     if width > 0 {
                         width -= 1;
@@ -616,7 +645,7 @@ pub fn sscanf(input: impl AsRef<[u8]>, fmt: impl AsRef<[u8]>, out: &[&dyn ScanTa
                 let start = r.at;
                 let mut c = r.inchar();
                 if c.is_none() {
-                    return Err(Stop::Input);
+                    return Err(Stop::Input.into());
                 }
                 let mut width = if width < 0 {
                     i64::from(c_int::MAX)
@@ -635,7 +664,7 @@ pub fn sscanf(input: impl AsRef<[u8]>, fmt: impl AsRef<[u8]>, out: &[&dyn ScanTa
                     c = r.inchar();
                 }
                 if r.at == start {
-                    return Err(Stop::Conv);
+                    return Err(Stop::Conv.into());
                 }
                 Ok(Some(Scanned(Repr::Text {
                     chars: &input[start..r.at],
@@ -687,7 +716,7 @@ pub fn sscanf(input: impl AsRef<[u8]>, fmt: impl AsRef<[u8]>, out: &[&dyn ScanTa
                 }
                 let d = stdlib::strtod(text);
                 if d.len == 0 {
-                    return Err(Stop::Conv);
+                    return Err(Stop::Conv.into());
                 }
                 Ok(Some(if !float {
                     // There is no `strtold`: a `long double` is stored as
@@ -707,10 +736,9 @@ pub fn sscanf(input: impl AsRef<[u8]>, fmt: impl AsRef<[u8]>, out: &[&dyn ScanTa
                     num(&(d.value as f32).to_ne_bytes())
                 }))
             }
-            _ => Err(Stop::Conv),
+            _ => Err(Stop::Conv.into()),
         })();
         match value {
-            Err(stop) => return stopped(stop, done),
             Ok(Some(v)) if !suppress => {
                 let Some(target) = targets.next() else {
                     return done;
@@ -719,6 +747,19 @@ pub fn sscanf(input: impl AsRef<[u8]>, fmt: impl AsRef<[u8]>, out: &[&dyn ScanTa
                 done += c_int::from(conv != b'n');
             }
             Ok(_) => {}
+            Err(Failed(stop, read)) => {
+                if let Some(chars) = read.filter(|_| !suppress) {
+                    let Some(target) = targets.next() else {
+                        return done;
+                    };
+                    target.store(Scanned(Repr::Text {
+                        chars,
+                        wide,
+                        terminated: false,
+                    }));
+                }
+                return stopped(stop, done);
+            }
         }
     }
     done

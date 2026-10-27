@@ -20,7 +20,7 @@ use std::ffi::{c_int, c_long, c_short, c_ulong, c_ushort};
 
 use super::error::CalcError;
 use super::value::{SCALC_STRING_SIZE, StackValue};
-use crate::runtime::scanf::{self, ScanNum};
+use crate::runtime::scanf::{self, ScanTarget};
 
 /// C's `strpbrk(s, "pwn$c[deEfgGiousxX")` set — every byte that can end a
 /// conversion specification, including the four sCalc then refuses.
@@ -133,41 +133,70 @@ fn find_sub(h: &[u8], n: &[u8]) -> Option<usize> {
 /// assigned writes its own type's bytes into the object, as in C.
 pub fn sscanf(input: &[u8], fmt: &[u8]) -> Result<StackValue, CalcError> {
     let cc = find_conversion_indicator(fmt).ok_or(CalcError::InvalidFormat)?;
-    let num = |v: f64| Ok(StackValue::Double(v));
-    // C's `switch (*s)` on `s[-1]`, into `h`, `l`, `j`, `ui`, `ul`, `ps->d`,
-    // `f` and `tmpstr`.
-    match (fmt[cc], fmt[cc - 1]) {
-        (b'd' | b'i', b'h') => num(scanned::<c_short>(input, fmt)?.into()),
-        (b'd' | b'i', b'l') => num(scanned::<c_long>(input, fmt)? as f64),
-        (b'd' | b'i', _) => num(scanned::<c_int>(input, fmt)?.into()),
-        (b'o' | b'u' | b'x' | b'X', b'h') => num(scanned::<c_ushort>(input, fmt)?.into()),
-        (b'o' | b'u' | b'x' | b'X', _) => num(scanned::<c_ulong>(input, fmt)? as f64),
-        (b'e' | b'E' | b'f' | b'g' | b'G', b'l') => num(scanned::<f64>(input, fmt)?),
-        (b'e' | b'E' | b'f' | b'g' | b'G', _) => num(scanned::<f32>(input, fmt)?.into()),
-        (b'c' | b'[' | b's', _) => {
-            // C's is `char[1000]`; `strNcpy(ps->s, tmpstr, SCALC_STRING_SIZE-1)`
-            // (`:1684`) reads no further than this.
-            let tmpstr = RefCell::new([0; SCALC_STRING_SIZE]);
-            if scanf::sscanf(input, fmt, &[&tmpstr, &()]) != 1 {
-                return Err(CalcError::InvalidFormat);
-            }
-            Ok(StackValue::str_ncpy(tmpstr.into_inner()))
-        }
+    // C's `switch (*s)` on `s[-1]`.
+    let mut object = match (fmt[cc], fmt[cc - 1]) {
+        (b'd' | b'i', b'h') => Object::H(Cell::default()),
+        (b'd' | b'i', b'l') => Object::L(Cell::default()),
+        (b'd' | b'i', _) => Object::J(Cell::default()),
+        (b'o' | b'u' | b'x' | b'X', b'h') => Object::Ui(Cell::default()),
+        (b'o' | b'u' | b'x' | b'X', _) => Object::Ul(Cell::default()),
+        (b'e' | b'E' | b'f' | b'g' | b'G', b'l') => Object::D(Cell::default()),
+        (b'e' | b'E' | b'f' | b'g' | b'G', _) => Object::F(Cell::default()),
+        (b'c' | b'[' | b's', _) => Object::Tmpstr(RefCell::new([0; SCALC_STRING_SIZE])),
         // `default`, `p`, `w`, `n` and `$` all `return(-1)` before any input
         // is looked at.
-        _ => Err(CalcError::InvalidFormat),
-    }
-}
-
-/// The object scanned from zero. C zeroes `h`, `l` and `j` per SSCANF but
-/// leaves `ui`, `f` and `tmpstr` stale and `ul` holding an earlier op's
-/// bytes, which a narrower conversion leaves in place; that is not copied.
-fn scanned<T: ScanNum + Default>(input: &[u8], fmt: &[u8]) -> Result<T, CalcError> {
-    let object = Cell::new(T::default());
-    if scanf::sscanf(input, fmt, &[&object, &()]) != 1 {
+        _ => return Err(CalcError::InvalidFormat),
+    };
+    if scanf::sscanf(input, fmt, &[object.target(), &()]) != 1 {
         return Err(CalcError::InvalidFormat);
     }
-    Ok(object.get())
+    Ok(object.value())
+}
+
+/// sCalc's output objects `h`, `l`, `j`, `ui`, `ul`, `ps->d`, `f` and
+/// `tmpstr`, scanned from zero. C zeroes `h`, `l` and `j` per SSCANF but
+/// leaves `ui`, `f` and `tmpstr` stale and `ul` holding an earlier op's
+/// bytes, which a narrower conversion leaves in place; that is not copied.
+enum Object {
+    H(Cell<c_short>),
+    L(Cell<c_long>),
+    J(Cell<c_int>),
+    Ui(Cell<c_ushort>),
+    Ul(Cell<c_ulong>),
+    D(Cell<f64>),
+    F(Cell<f32>),
+    /// C's is `char[1000]`; `strNcpy(ps->s, tmpstr, SCALC_STRING_SIZE-1)`
+    /// (`:1684`) reads no further than this.
+    Tmpstr(RefCell<[u8; SCALC_STRING_SIZE]>),
+}
+
+impl Object {
+    fn target(&self) -> &dyn ScanTarget {
+        match self {
+            Object::H(h) => h,
+            Object::L(l) => l,
+            Object::J(j) => j,
+            Object::Ui(ui) => ui,
+            Object::Ul(ul) => ul,
+            Object::D(d) => d,
+            Object::F(f) => f,
+            Object::Tmpstr(tmpstr) => tmpstr,
+        }
+    }
+
+    fn value(&mut self) -> StackValue {
+        let num = StackValue::Double;
+        match self {
+            Object::H(h) => num(h.get().into()),
+            Object::L(l) => num(l.get() as f64),
+            Object::J(j) => num(j.get().into()),
+            Object::Ui(ui) => num(ui.get().into()),
+            Object::Ul(ul) => num(ul.get() as f64),
+            Object::D(d) => num(d.get()),
+            Object::F(f) => num(f.get().into()),
+            Object::Tmpstr(tmpstr) => StackValue::str_ncpy(tmpstr.get_mut()),
+        }
+    }
 }
 
 #[cfg(test)]

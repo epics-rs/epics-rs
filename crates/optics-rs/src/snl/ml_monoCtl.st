@@ -85,11 +85,19 @@ sync    D D_mon;
 double  TwoD;
 
 /* E, Lambda, and Theta */
+/* C defect: monitored E, lambda and theta themselves, so an event landing
+ * between a pass's assign and its put, such as the clamp dInputChanged's
+ * DRVH/DRVL puts post, was put as the pass's value, and a theta request
+ * landing before calcMovements replaced the theta it moved to. Requests
+ * land in EReq, lambdaReq and thetaReq, which the request arms take. */
 double  E;
 assign  E to "{P}ml_monoE";
-monitor E;
+
+double  EReq;
+assign  EReq to "{P}ml_monoE";
+monitor EReq;
 evflag  E_mon;
-sync    E E_mon;
+sync    EReq E_mon;
 
 double  EHi;
 assign  EHi to "{P}ml_monoE.DRVH";
@@ -102,9 +110,12 @@ assign  ERdbk to "{P}ml_monoERdbk";
 
 double  lambda;
 assign  lambda to "{P}ml_monoLambda";
-monitor lambda;
+
+double  lambdaReq;
+assign  lambdaReq to "{P}ml_monoLambda";
+monitor lambdaReq;
 evflag  lambda_mon;
-sync    lambda lambda_mon;
+sync    lambdaReq lambda_mon;
 
 double  lambdaHi;
 assign  lambdaHi to "{P}ml_monoLambda.DRVH";
@@ -117,9 +128,12 @@ assign  lambdaRdbk to "{P}ml_monoLambdaRdbk";
 
 double  theta;
 assign  theta to "{P}ml_monoTheta";
-monitor theta;
+
+double  thetaReq;
+assign  thetaReq to "{P}ml_monoTheta";
+monitor thetaReq;
 evflag  theta_mon;
-sync    theta theta_mon;
+sync    thetaReq theta_mon;
 
 double  thetaHi;
 assign  thetaHi to "{P}ml_monoTheta.DRVH";
@@ -678,14 +692,17 @@ state waitForCmnd {
 
 	when (efTestAndClear(E_mon)) {
 		if (ml_monoCtlDebug) %%printf("ml_monoCtl:waitForCmnd:E_mon\n");
+		E = EReq;
 	} state eChanged
 
 	when (efTestAndClear(lambda_mon)) {
 		if (ml_monoCtlDebug) %%printf("ml_monoCtl:waitForCmnd:lambda_mon\n");
+		lambda = lambdaReq;
 	} state lChanged
 
 	when (efTestAndClear(theta_mon)) {
 		if (ml_monoCtlDebug) %%printf("ml_monoCtl:waitForCmnd:theta_mon\n");
+		theta = thetaReq;
 	} state thChanged
 
 	when (putVals && delay(.1)) {
@@ -787,6 +804,8 @@ state tweak {
 state dInputChanged {
 	when () {
 		if (ml_monoCtlDebug) %%printf("ml_monoCtl:dInputChanged\n");
+		/* C's monitored theta already held a request that landed. */
+		if (efTest(theta_mon)) theta = thetaReq;
 		autoMode = 0;
 		pvPut(autoMode);
 		sprintf(seqMsg2, "Set to Manual Mode");

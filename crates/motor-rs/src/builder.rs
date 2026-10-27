@@ -688,6 +688,15 @@ mod tests {
 
     const SLOW: Duration = Duration::from_millis(40);
 
+    /// Waits for `log` to hold `n` polls.
+    async fn logged<T>(log: &Mutex<Vec<T>>, n: usize) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while log.lock().unwrap().len() < n {
+            assert!(Instant::now() < deadline, "{n} polls never ran");
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+
     /// A card that never ends its move; each poll is logged, then takes
     /// `delay`.
     struct Card {
@@ -827,7 +836,7 @@ mod tests {
             .unwrap();
         rt.block_on(async {
             let running = tokio::spawn(task.start());
-            tokio::time::sleep(SLOW * 6).await;
+            logged(&log, 4).await;
             axes[0]
                 .poll_cmd_tx
                 .send(PollCommand::Shutdown)
@@ -917,16 +926,20 @@ mod tests {
             .enable_time()
             .build()
             .unwrap();
+        // Past the polls waited for, time for any more.
         let settle = Duration::from_millis(50);
         let (forced, info) = rt.block_on(async {
             let running = tokio::spawn(poller.start());
+            logged(&log, 2).await;
             tokio::time::sleep(settle).await;
             // The startup pass.
             log.lock().unwrap().clear();
             poll_cmd_tx.send(PollCommand::ForcePoll).await.unwrap();
+            logged(&log, 2).await;
             tokio::time::sleep(settle).await;
             let forced = std::mem::take(&mut *log.lock().unwrap());
             axis.send(MotorCommand::Poll);
+            logged(&log, 2).await;
             tokio::time::sleep(settle).await;
             let info = std::mem::take(&mut *log.lock().unwrap());
             poll_cmd_tx.send(PollCommand::Shutdown).await.unwrap();
@@ -966,6 +979,7 @@ mod tests {
             .unwrap();
         let polled = rt.block_on(async {
             let running = tokio::spawn(poller.start());
+            logged(&log, 2).await;
             tokio::time::sleep(Duration::from_millis(50)).await;
             let startup = std::mem::take(&mut *log.lock().unwrap());
             assert_eq!(startup, ["A", "B"], "the startup pass");
@@ -974,6 +988,7 @@ mod tests {
                 .send(PollCommand::ForcePoll)
                 .await
                 .unwrap();
+            logged(&log, 1).await;
             tokio::time::sleep(Duration::from_millis(50)).await;
             let polled = std::mem::take(&mut *log.lock().unwrap());
             first.poll_cmd_tx.send(PollCommand::Shutdown).await.unwrap();

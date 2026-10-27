@@ -106,9 +106,12 @@ async fn boot(port: &str, motors: &[(&str, &str)], check: impl AsyncFnOnce(&PvDa
     for tx in &polls {
         tx.send(PollCommand::ForcePoll).await.unwrap();
     }
-    tokio::time::sleep(Duration::from_millis(800)).await;
+    let deadline = Instant::now() + Duration::from_secs(10);
     for rec in motors.iter().map(|(name, _)| name) {
-        assert_eq!(num(&db, &format!("{rec}.RBV")), 3.0, "{rec} processed");
+        while num(&db, &format!("{rec}.RBV")) != 3.0 {
+            assert!(Instant::now() < deadline, "{rec} never processed");
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
     }
     check(&db).await;
     polls[0].send(PollCommand::Shutdown).await.unwrap();

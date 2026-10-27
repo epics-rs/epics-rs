@@ -8318,15 +8318,21 @@ mod tests {
 
         // The two failures cost the 1.0 s persistent-error backoff; after it the
         // recovered link must produce successful reads. A dead poller reads 0.
-        tokio::time::sleep(Duration::from_millis(1500)).await;
-        let read_ok = handle
-            .read_int32(read_ok_reason, 0)
-            .await
-            .expect("READ_OK must be readable");
-        assert!(
-            read_ok > 0,
-            "the poller must keep polling after the I/O errors and recover — READ_OK={read_ok}"
-        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let read_ok = handle
+                .read_int32(read_ok_reason, 0)
+                .await
+                .expect("READ_OK must be readable");
+            if read_ok > 0 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the poller must keep polling after the I/O errors and recover — READ_OK={read_ok}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
         assert!(!poller.is_finished(), "the poller task must still be alive");
 
         // Stopping the port is what ends the poller: `handle.is_closed()` is
@@ -8384,6 +8390,15 @@ mod tests {
             fanout_pending,
         ));
 
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while written.lock().unwrap().is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the poller never polled"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        // Many poll delays for a poll the gate should hold.
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert_eq!(written.lock().unwrap().len(), 1, "one poll, then the wait");
         assert!(

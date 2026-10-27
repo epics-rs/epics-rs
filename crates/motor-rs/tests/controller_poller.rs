@@ -946,7 +946,7 @@ fn a_port_reads_its_poller_s_first_polls_and_0_before_one_is_named() {
 /// having set HOME.
 #[derive(Default)]
 struct Bailing {
-    polled: bool,
+    polls: Arc<std::sync::atomic::AtomicU32>,
 }
 
 impl AsynMotor for Bailing {
@@ -969,7 +969,7 @@ impl AsynMotor for Bailing {
         PollFailure::NONE
     }
     fn poll(&mut self, _: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
-        if !std::mem::replace(&mut self.polled, true) {
+        if self.polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
             *status = MotorStatus::default();
             return Ok(());
         }
@@ -1002,8 +1002,10 @@ async fn a_port_write_running_no_axis_method_posts_what_a_bailing_poll_left() {
         motor_rs::devices::register_controller_port(&asyn_rs::registry::open_owner(), PORT, 2, ())
             .unwrap();
     let mut controller = ControllerBuilder::new();
+    let bailing = Bailing::default();
+    let polls = bailing.polls.clone();
     let m = controller.axis(
-        Arc::new(Mutex::new(Bailing::default())),
+        Arc::new(Mutex::new(bailing)),
         TraceUser::Asyn {
             port: PORT.into(),
             addr: 1,
@@ -1019,6 +1021,12 @@ async fn a_port_write_running_no_axis_method_posts_what_a_bailing_poll_left() {
         1,
         "only the startup poll, which the constructor raised, posts"
     );
+    // The third poll starts once the pass of the second, the first to bail,
+    // has left its status; a write before that has nothing to post.
+    until("a bailed pass", || {
+        polls.load(std::sync::atomic::Ordering::SeqCst) >= 3
+    })
+    .await;
     tokio::task::spawn_blocking(move || port.write_int32_blocking(index::POWER_AUTO_ONOFF, 1, 0))
         .await
         .unwrap()

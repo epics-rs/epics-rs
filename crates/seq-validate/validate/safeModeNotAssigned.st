@@ -12,6 +12,8 @@ option +s;
 
 int v = 0;
 
+evflag ss2done;
+
 #define MAX_TEST 10
 
 entry {
@@ -30,7 +32,9 @@ ss ss1 {
         } state done
     }
     state done {
-        when (delay(0.2)) {
+        /* C defect: a fixed delay(0.2) here ended the program while an ss2
+         * scheduled that late still owed testOks; wait for its last one. */
+        when (efTest(ss2done)) {
         } exit
     }
 }
@@ -43,6 +47,9 @@ ss ss2 {
                 testOk(v == 0, "ss2: v=%d==0", v);
             }
             i++;
+            if (i == MAX_TEST) {
+                efSet(ss2done);
+            }
         } state idle
     }
 }

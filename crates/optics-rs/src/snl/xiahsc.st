@@ -735,10 +735,10 @@ ss xiahsc {
        * but only if we have not interrupted a move-in-progress
        */
       if (!hBusy) {
-        if (l     != l_RB)     PVPUT (l, l_RB);
-        if (r     != r_RB)     PVPUT (r, r_RB);
-        if (h0    != h0_RB)    PVPUT (h0, h0_RB);
-        if (width != width_RB) PVPUT (width, width_RB);
+        if (l     != l_old)     PVPUT (l, l_old);
+        if (r     != r_old)     PVPUT (r, r_old);
+        if (h0    != h0_old)    PVPUT (h0, h0_old);
+        if (width != width_old) PVPUT (width, width_old);
         epicsThreadSleep(.02);
         efClear (l_mon);    efClear (r_mon);
         efClear (h0_mon);   efClear (width_mon);
@@ -753,10 +753,10 @@ ss xiahsc {
        * but only if we have not interrupted a move-in-progress
        */
       if (!vBusy) {
-        if (t      != t_RB)      PVPUT (t, t_RB);
-        if (b      != b_RB)      PVPUT (b, b_RB);
-        if (v0     != v0_RB)     PVPUT (v0, v0_RB);
-        if (height != height_RB) PVPUT (height, height_RB);
+        if (t      != t_old)      PVPUT (t, t_old);
+        if (b      != b_old)      PVPUT (b, b_old);
+        if (v0     != v0_old)     PVPUT (v0, v0_old);
+        if (height != height_old) PVPUT (height, height_old);
         epicsThreadSleep(.02);
         efClear (t_mon);    efClear (b_mon);
         efClear (v0_mon);   efClear (height_mon);
@@ -788,26 +788,32 @@ ss xiahsc {
       	if (sscanf (hsc_response, "%*s %*s %d %d", &pos_a, &pos_b) == 2) {
       	  pos_ag = RAW_TO_DIAL(pos_a, hOrigin);
       	  pos_bg = RAW_TO_DIAL(pos_b, hOrigin);
-      	  if (hOrient == ORIENT_LEFT_RIGHT) {
-      	    if (pos_ag != l_RB) { PVPUT (l_RB, pos_ag) };
-      	    if (pos_bg != r_RB) { PVPUT (r_RB, pos_bg) };
-      	  } else {
-      	    if (pos_ag != r_RB) { PVPUT (r_RB, pos_ag) };
-      	    if (pos_bg != l_RB) { PVPUT (l_RB, pos_bg) };
-      	  }
-	  if (hBusy) PVPUT (hBusy, MOTOR_IDLE);
-      	  /*
-	   * also, update width and center readbacks
-	   */
-      	  PVPUT (width_RB, l_RB+r_RB);
-      	  PVPUT (h0_RB, (r_RB-l_RB)/2);
-      	  efSet (new_H_RB);	  /* new readback data available */
       	  /*
       	   * keep track of last known good values
       	   * to impose motor limits
       	   */
-      	  l_old = l_RB;   r_old = r_RB;
-      	  h0_old = h0_RB; width_old = width_RB;
+      	  /* C defect: took them, the gap and center readbacks and new_H_RB's
+      	   * targets from the readback monitors after the puts, so a late echo
+      	   * of an earlier locate's put replaced this reading. A client's *_RB
+      	   * write inside the locate, which C took too, is dropped. The monitors
+      	   * only guard the puts. */
+      	  if (hOrient == ORIENT_LEFT_RIGHT) {
+      	    l_old = pos_ag;   r_old = pos_bg;
+      	    if (pos_ag != l_RB) { PVPUT (l_RB, pos_ag) };
+      	    if (pos_bg != r_RB) { PVPUT (r_RB, pos_bg) };
+      	  } else {
+      	    r_old = pos_ag;   l_old = pos_bg;
+      	    if (pos_ag != r_RB) { PVPUT (r_RB, pos_ag) };
+      	    if (pos_bg != l_RB) { PVPUT (l_RB, pos_bg) };
+      	  }
+      	  h0_old = (r_old-l_old)/2; width_old = l_old+r_old;
+	  if (hBusy) PVPUT (hBusy, MOTOR_IDLE);
+      	  /*
+	   * also, update width and center readbacks
+	   */
+      	  PVPUT (width_RB, width_old);
+      	  PVPUT (h0_RB, h0_old);
+      	  efSet (new_H_RB);	  /* new readback data available */
       	} else
       	  if (sscanf (hsc_response, "%*s %*s %s", scratch) == 1) {
       	    DEBUG_PRINT3(5, "axis=%s, command=<%s>, response=%s", "H", hsc_command, hsc_response);
@@ -831,26 +837,28 @@ ss xiahsc {
       	if (sscanf (hsc_response, "%*s %*s %d %d", &pos_a, &pos_b) == 2) {
       	  pos_ag = RAW_TO_DIAL(pos_a, vOrigin);
       	  pos_bg = RAW_TO_DIAL(pos_b, vOrigin);
-      	  if (vOrient == ORIENT_TOP_BOTTOM) {
-      	    if (pos_ag != t_RB) { PVPUT (t_RB, pos_ag) };
-      	    if (pos_bg != b_RB) { PVPUT (b_RB, pos_bg) };
-      	  } else {
-      	    if (pos_ag != b_RB) { PVPUT (b_RB, pos_ag) };
-      	    if (pos_bg != t_RB) { PVPUT (t_RB, pos_bg) };
-      	  }
-	  if (vBusy) PVPUT (vBusy, MOTOR_IDLE);
-      	  /*
-	   * also, update height and center readbacks
-	   */
-      	  PVPUT (height_RB, t_RB+b_RB);
-      	  PVPUT (v0_RB, (t_RB-b_RB)/2);
-      	  efSet (new_V_RB);	  /* new readback data available */
       	  /*
       	   * keep track of last known good values
       	   * to impose motor limits
       	   */
-      	  t_old = t_RB;   b_old = b_RB;
-      	  v0_old = v0_RB; height_old = height_RB;
+      	  /* C defect: as for H. */
+      	  if (vOrient == ORIENT_TOP_BOTTOM) {
+      	    t_old = pos_ag;   b_old = pos_bg;
+      	    if (pos_ag != t_RB) { PVPUT (t_RB, pos_ag) };
+      	    if (pos_bg != b_RB) { PVPUT (b_RB, pos_bg) };
+      	  } else {
+      	    b_old = pos_ag;   t_old = pos_bg;
+      	    if (pos_ag != b_RB) { PVPUT (b_RB, pos_ag) };
+      	    if (pos_bg != t_RB) { PVPUT (t_RB, pos_bg) };
+      	  }
+      	  v0_old = (t_old-b_old)/2; height_old = t_old+b_old;
+	  if (vBusy) PVPUT (vBusy, MOTOR_IDLE);
+      	  /*
+	   * also, update height and center readbacks
+	   */
+      	  PVPUT (height_RB, height_old);
+      	  PVPUT (v0_RB, v0_old);
+      	  efSet (new_V_RB);	  /* new readback data available */
       	} else
       	  if (sscanf (hsc_response, "%*s %*s %s", scratch) == 1) {
       	    DEBUG_PRINT3(5, "axis=%s, command=<%s>, response=%s", "V", hsc_command, hsc_response);

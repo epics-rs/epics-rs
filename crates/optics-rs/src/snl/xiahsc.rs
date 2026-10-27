@@ -27,7 +27,7 @@ macro_rules! seqg_escaped {
 
 epics_seq_rs::include_program!("xiahsc");
 
-/// `validateResponse` (`xiahsc.st:976-1008`): the command's ID, its bytes
+/// `validateResponse` (`xiahsc.st:984-1016`): the command's ID, its bytes
 /// from the second to the first space, against the reply's bytes at the
 /// same offsets, a byte past the reply's end reading as its terminator.
 #[allow(non_snake_case)]

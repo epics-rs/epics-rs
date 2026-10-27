@@ -22,6 +22,9 @@ mod hsc1_mock;
 #[path = "hsc1_mock/rig.rs"]
 mod rig;
 
+use std::time::Duration;
+
+use epics_base_rs::runtime::task;
 use hsc1_mock::Hsc1;
 use optics_rs::snl::xia_slit::xia_slit;
 use rig::{Rig, eventually, f64_of, put, quiet, string_of};
@@ -739,6 +742,66 @@ async fn one_reply_clears_a_comm_error() {
     locate(&rig).await;
     settled(&rig, &[("error", 0.0), ("lRB", 2.0), ("rRB", 3.0)]).await;
     assert_eq!(s(&rig, "errMsg"), "no error");
+}
+
+/// A locate after the H blades went to `l`, `r`.
+async fn locate_at(rig: &Rig, l: f64, r: f64) {
+    rig.hsc.set("H-1", |m| {
+        m.a = (800.0 + 400.0 * l) as i32;
+        m.b = (800.0 + 400.0 * r) as i32;
+    });
+    put_hsc(rig, "locate", "1").await;
+}
+
+/// The H readbacks and targets after a locate read blades `l`, `r`, with
+/// lRB reading `l_rb`.
+async fn h_read(rig: &Rig, l: f64, r: f64, l_rb: f64) {
+    settled(
+        rig,
+        &[
+            ("l", l),
+            ("r", r),
+            ("lRB", l_rb),
+            ("rRB", r),
+            ("width", l + r),
+            ("h0", (r - l) / 2.0),
+            ("widthRB", l + r),
+            ("h0RB", (r - l) / 2.0),
+        ],
+    )
+    .await;
+}
+
+/// A locate's readbacks and targets are its own reading, though the
+/// previous locate's lRB echo lands inside it (C defect,
+/// xia_slit.st:281-284).
+#[epics_base_rs::epics_test]
+async fn a_late_readback_echo_leaves_the_locate_at_its_reading() {
+    let rig = boot(|_| {}).await;
+    // The boot locate's lRB echo is in.
+    task::sleep(Duration::from_millis(5000)).await;
+    locate_at(&rig, 1.5, 2.0).await;
+    settled(&rig, &[("widthRB", 3.5)]).await;
+    // Under a 3 s lRB echo delay and a 2 s rRB put delay, this locate puts
+    // lRB before the 1.5 echo lands and reads it after.
+    locate_at(&rig, 1.25, 2.5).await;
+    h_read(&rig, 1.25, 2.5, 1.25).await;
+}
+
+/// A client's lRB put landing inside a locate is dropped: the targets and
+/// the gap and center readbacks are the locate's reading, where C took the
+/// put (C defect, xia_slit.st:281-284). lRB keeps the put until the next
+/// locate, as in C.
+#[epics_base_rs::epics_test]
+async fn a_readback_put_inside_a_locate_is_dropped() {
+    let rig = boot(|_| {}).await;
+    locate_at(&rig, 1.25, 2.5).await;
+    assert!(eventually(|| v(&rig, "lRB") == 1.25).await);
+    // Under a 2 s rRB put delay, the put lands between the locate's lRB put
+    // and its reads.
+    task::sleep(Duration::from_millis(500)).await;
+    put_hsc(&rig, "lRB", "3").await;
+    h_read(&rig, 1.25, 2.5, 3.0).await;
 }
 
 const CHILD: &str = "XIA_SLIT_DEBUG_CHILD";

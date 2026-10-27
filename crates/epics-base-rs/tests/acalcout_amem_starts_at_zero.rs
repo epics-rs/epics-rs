@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 
+use epics_base_rs::server::database::filters::db_channel_create;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::records::acalcout::AcalcoutRecord;
 use epics_base_rs::types::EpicsValue;
@@ -55,4 +56,38 @@ async fn a_lock_free_resolve_charges_the_array_it_names() {
     // A field with no buffer behind it charges nothing.
     assert_eq!(handle.name_to_addr("M.NELM"), Some(1));
     assert_eq!(db.get_pv("M.AMEM").unwrap(), EpicsValue::Long(8));
+}
+
+/// pvxs's `Channel`, QSRV and a `DB_LINK` at iocInit make their channel with
+/// C `dbChannelCreate`, and autosave sizes a member with `dbNameToAddr`; the
+/// `dbEntryToAddr` of each runs `cvt_dbaddr` (`dbChannel.c:478`), before the
+/// `$` and the filter are judged (`:486-503`). Each charges the buffer it
+/// names, once.
+#[epics_macros_rs::epics_test]
+async fn every_address_made_charges_the_array_it_names() {
+    let db = IocBuilder::new()
+        .register_record_type("acalcout", || Box::new(AcalcoutRecord::new()))
+        .db_string(
+            "record(acalcout, \"M\") {}\nrecord(ai, \"L\") { field(INP, \"M.AA\") }\n",
+            &HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .await
+        .unwrap()
+        .0;
+    let amem = || db.get_pv("M.AMEM").unwrap();
+    db.initialize_link_locality().await;
+    assert_eq!(amem(), EpicsValue::Long(8));
+    db_channel_create(&db, b"M.AA").unwrap();
+    assert_eq!(amem(), EpicsValue::Long(8));
+    db_channel_create(&db, b"M.BB").unwrap();
+    assert_eq!(amem(), EpicsValue::Long(16));
+    // A double array takes no `$`, and `nosuch` is no filter.
+    assert!(db_channel_create(&db, b"M.CC$").is_err());
+    assert!(db_channel_create(&db, br#"M.DD{"nosuch":{}}"#).is_err());
+    assert_eq!(amem(), EpicsValue::Long(32));
+    assert_eq!(db.restore_target("M.EE").map(|t| t.elements), Some(1));
+    assert_eq!(amem(), EpicsValue::Long(40));
+    assert_eq!(db.get_pv("M.PMEM").unwrap(), EpicsValue::Long(40));
 }

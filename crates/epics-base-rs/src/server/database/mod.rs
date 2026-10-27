@@ -4175,10 +4175,12 @@ impl PvDatabase {
         self.inner.simple_pvs.lock().get(name).cloned()
     }
 
-    /// `dbChannelCreate`'s existence half, which also judges the `$`
-    /// modifier against the field (`dbChannel.c:486-503`); the search side,
-    /// `dbChannelTest`, does not.
-    pub(crate) fn channel_create_found(&self, name: &[u8]) -> bool {
+    /// `dbChannelCreate`'s address half: `pvNameLookup` finds the field as
+    /// written and `dbEntryToAddr` runs its `cvt_dbaddr` (`dbChannel.c:460-478`)
+    /// before the `$` modifier is judged against it (`:486-503`), so a
+    /// create the `$` or the filter then refuses has charged it too. The
+    /// search side, `dbChannelTest`, runs neither.
+    pub(crate) fn resolve_channel_create(&self, name: &[u8]) -> bool {
         // A filtered channel (`REC.{"dbnd":{"d":0.5}}`) resolves to its
         // underlying PV, as in `find_entry_no_resolve`.
         let record_path = filters::split_channel_name(name).record_path;
@@ -4193,11 +4195,17 @@ impl PvDatabase {
             return false;
         };
         let Some(field) = explicit_field else {
+            self.resolve_addr(&rec, "VAL");
             return true;
         };
-        match field.strip_suffix('$') {
+        let core = field.strip_suffix('$');
+        let found = self.names_field(&rec, core.unwrap_or(field));
+        if found {
+            self.resolve_addr(&rec, core.unwrap_or(field));
+        }
+        match core {
             Some(core) => self.channel_field_found(&rec, core, true),
-            None => self.names_field(&rec, field),
+            None => found,
         }
     }
 

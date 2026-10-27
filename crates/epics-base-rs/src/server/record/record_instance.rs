@@ -2550,6 +2550,12 @@ pub struct RecordCell {
     /// [`Self::cvt_pending`]'s words past the first, for a type with over 64
     /// `SPC_DBADDR` fields (sscan has 152).
     cvt_pending_more: Box<[std::sync::atomic::AtomicU64]>,
+    /// The [`Self::dbaddr_counts`] entries a resolve has run or owed the
+    /// `cvt_dbaddr` of, bit for bit as [`Self::cvt_pending`]. C's `cvt_dbaddr`
+    /// is idempotent (acalcout charges a buffer when it allocates it), so only
+    /// the first resolve of a field has one to run, and a server that makes
+    /// its channel per operation owes the record's set nothing after it.
+    cvt_resolved: Box<[std::sync::atomic::AtomicU64]>,
     /// The long-string fields' `SIZV`, the `field_size` their `cvt_dbaddr`
     /// stores (`lsiRecord.c:144`) and so their `$` address's `no_elements`;
     /// settled with [`Self::string_typed`]. `SIZV` is `SPC_NOMOD`.
@@ -3629,6 +3635,9 @@ impl RecordCell {
             cvt_pending_more: (0..dbaddr_counts.len().saturating_sub(1) / 64)
                 .map(|_| std::sync::atomic::AtomicU64::new(0))
                 .collect(),
+            cvt_resolved: (0..dbaddr_counts.len().div_ceil(64))
+                .map(|_| std::sync::atomic::AtomicU64::new(0))
+                .collect(),
             dbaddr_counts: arc_swap::ArcSwap::from_pointee(dbaddr_counts),
             runtime_types: arc_swap::ArcSwap::from_pointee(runtime_types_of(&instance)),
             long_string_size: std::sync::atomic::AtomicU32::new(long_string_size_of(&instance)),
@@ -3781,9 +3790,11 @@ impl RecordCell {
     }
 
     /// [`Self::no_elements`] as C's `dbNameToAddr` RUNS it: the record's
-    /// `cvt_dbaddr` too, now if the record is free, else owed to the next
-    /// fresh hold of its set (`record_lock::owe_cvt`).
+    /// `cvt_dbaddr` too, on the field's first resolve ([`Self::cvt_resolved`]),
+    /// now if the record is free, else owed to the next fresh hold of its set
+    /// (`record_lock::owe_cvt`).
     pub(crate) fn resolve_addr(self: &Arc<Self>, field: &str) -> Option<u32> {
+        use std::sync::atomic::Ordering::{Relaxed, Release};
         let count = self.no_elements(field)?;
         let counts = self.dbaddr_counts.load();
         let at = counts.iter().position(|(at, _)| {
@@ -3792,8 +3803,12 @@ impl RecordCell {
                 .eq_ignore_ascii_case(field)
         });
         if let Some(entry) = at {
-            self.cvt_word(entry / 64)
-                .fetch_or(1 << (entry % 64), std::sync::atomic::Ordering::Release);
+            let bit = 1 << (entry % 64);
+            let resolved = &self.cvt_resolved[entry / 64];
+            if resolved.load(Relaxed) & bit != 0 || resolved.fetch_or(bit, Relaxed) & bit != 0 {
+                return Some(count);
+            }
+            self.cvt_word(entry / 64).fetch_or(bit, Release);
             match self.try_read() {
                 // SAFETY: `_held` is a shared borrow of this record.
                 Some(_held) => unsafe { self.apply_cvt_pending() },
@@ -14357,6 +14372,7 @@ mod record_cell_layout_tests {
             dbaddr_counts,
             runtime_types,
             cvt_pending_more,
+            cvt_resolved,
             long_string_size,
             form_string,
             nsec_mask,

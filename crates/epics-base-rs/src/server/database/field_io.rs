@@ -4928,11 +4928,14 @@ impl PvDatabase {
         let target = self
             .field_target(parts.record, parts.field)
             .or_else(|| self.attribute_target(parts.record, parts.field))?;
+        let rec = self.get_record(parts.record)?;
+        let (field, _) = rec.put_name(field_or_val(parts.field));
+        // `dbEntryToAddr` runs the field's `cvt_dbaddr`; dbStatic's
+        // `dbFindRecord` ([`Self::static_restore_target`]) does not.
+        self.resolve_addr(&rec, &field);
         if !parts.tail.starts_with(b"$") {
             return Some(target);
         }
-        let rec = self.get_record(parts.record)?;
-        let (field, _) = rec.put_name(field_or_val(parts.field));
         let view = super::char_view::char_view(&rec.read(), &field)?;
         Some(RestoreTarget {
             dbf: crate::types::DbfCode::Char,

@@ -5787,8 +5787,10 @@ pub trait Record: RecordAny + Send + Sync + 'static {
 
     /// What C's `cvt_dbaddr` DOES to the record before answering — acalcout
     /// `calloc`s and charges the buffer it hands out (`aCalcoutRecord.c:589-617`).
-    /// Run only when a channel resolves on the `SPC_DBADDR` field `field`
-    /// ([`FieldDeclaration::field_native_count`]), never by a capacity query.
+    /// Run only when a channel or address resolves on the `SPC_DBADDR` field
+    /// `field` ([`FieldDeclaration::field_native_count`]), never by a capacity
+    /// query. Idempotent, as C's is: the database runs it on the field's
+    /// first resolve only.
     fn cvt_dbaddr(&self, _field: &str) {}
 
     /// The `paddr->field_size` this record's `cvt_dbaddr` stores for the

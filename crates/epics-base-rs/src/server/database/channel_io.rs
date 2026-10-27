@@ -333,7 +333,7 @@ fn record_channel_shape(
         return Some((DbFieldType::String, 1, LongStringMode::NativeString));
     }
     let served = rec.addressed_field_type(field, None)?.served_type()?;
-    let count = rec.resolve_addr(field)?;
+    let count = rec.no_elements(field)?;
     let dbr_type =
         DbFieldType::from_u16(served.ca_wire_type()).expect("ca_wire_type is a CA DBF code");
     Some((dbr_type, count, LongStringMode::Plain))

@@ -5799,6 +5799,11 @@ impl PvDatabase {
                 let parsed = crate::server::record::parse_link_field(&text, ftype);
                 let unserviceable = parsed.required_link_set_scheme();
                 let was_db = matches!(parsed, ParsedLink::Db(_));
+                // `dbDbInitLink`'s `dbChannelCreate` (`dbDbLink.c:94`) makes
+                // the target's address whether or not the link stays local.
+                if let ParsedLink::Db(db) = &parsed {
+                    self.resolve_channel_create(db.pvname().as_bytes());
+                }
                 // `dbDbInitLink`'s `dbChannelCreate` line; a put printed its
                 // own in `dbPutFieldLink`, which `dbAddLink` reuses.
                 if let ParsedLink::Db(db) = &parsed

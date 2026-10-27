@@ -117,7 +117,7 @@ pub(crate) fn db_channel_create_unreported(
     } else {
         raw
     };
-    if !db.channel_create_found(probe) {
+    if !db.resolve_channel_create(probe) {
         return Err(ChannelCreateError::NotFound);
     }
     let chain = match name.json_suffix.as_deref() {

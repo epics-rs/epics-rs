@@ -2109,6 +2109,7 @@ dependencies = [
  "epics-seq-rs",
  "epics-snc-rs",
  "epics-stream-rs",
+ "named-port",
 ]
 
 [[package]]

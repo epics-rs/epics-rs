@@ -16,6 +16,7 @@ epics-seq-rs = { workspace = true }
 [dev-dependencies]
 # The Oxford_CS800 template's command records are StreamDevice's.
 epics-stream-rs = { path = "../stream-rs" }
+named-port = { path = "../named-port" }
 
 [build-dependencies]
 epics-snc-rs = { workspace = true }

@@ -4408,20 +4408,25 @@ mod tests {
     }
 
     /// C binds a fixed local port with no SO_REUSEADDR (drvAsynIPPort.c:499-509),
-    /// so the client socket carries none.
+    /// so the client socket carries none. No hold can share that bind, so a
+    /// local port taken before the driver binds it is drawn again.
     #[cfg(target_os = "linux")]
     #[test]
     fn a_local_port_bind_sets_no_reuse_address() {
         use std::os::fd::AsRawFd;
         let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let remote = server.local_addr().unwrap().port();
-        let local = std::net::TcpListener::bind("0.0.0.0:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
-        let mut drv = DrvAsynIPPort::new("iptest", &format!("127.0.0.1:{remote}:{local}")).unwrap();
-        let stream = drv.connect_tcp().unwrap();
+        let (stream, local) = named_port::on_a_named_port(|local| {
+            let mut drv =
+                DrvAsynIPPort::new("iptest", &format!("127.0.0.1:{remote}:{local}")).unwrap();
+            match drv.connect_tcp() {
+                Ok(stream) => Some((stream, local)),
+                Err(e) if e.message() == "unable to bind to local port: Address already in use" => {
+                    None
+                }
+                Err(e) => panic!("connect from {local}: {e:?}"),
+            }
+        });
         assert_eq!(stream.local_addr().unwrap().port(), local);
         let mut on: libc::c_int = -1;
         let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;

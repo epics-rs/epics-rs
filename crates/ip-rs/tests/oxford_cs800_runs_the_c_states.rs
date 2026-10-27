@@ -18,6 +18,7 @@ use epics_base_rs::server::database::db_access::DbSubscription;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::scan::ScanOwner;
 use epics_base_rs::types::EpicsValue;
+use named_port::{Candidates, HeldPort};
 
 use support::{eventually, sh};
 
@@ -37,15 +38,35 @@ struct Ioc {
     db: Arc<PvDatabase>,
     /// The status port's local port, where the controller's datagrams go.
     status: u16,
+    /// Where the command records' datagrams go, absorbed unanswered.
+    _commands: HeldPort,
     _scan: ScanOwner,
 }
 
-fn free_udp_port() -> u16 {
-    UdpSocket::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+/// The status port, configured on a named local port: its asyn name and
+/// the number. The driver binds the number with no option, so no hold can
+/// keep it for the driver; a candidate taken between its probe and the
+/// driver's bind is drawn again. The port thread's first connect runs
+/// ahead of every request, so the connected state read here is that bind's.
+async fn status_port(no_db: &Arc<PvDatabase>) -> (String, u16) {
+    let mut candidates = Candidates::new(named_port::free_for_tcp_and_udp);
+    for status in candidates.by_ref() {
+        let name = format!("CS_UDP_{status}");
+        sh(
+            no_db,
+            &format!(r#"drvAsynIPPortConfigure("{name}", "127.0.0.1:{status}:{status} UDP")"#),
+        )
+        .await;
+        let port = asyn_rs::registry::get_port(&name).unwrap();
+        if port.handle.is_connected_blocking(-1).unwrap() {
+            return (name, status);
+        }
+        assert!(
+            named_port::udp_port_is_held(status),
+            "{name} never bound {status}, and no other socket holds it"
+        );
+    }
+    candidates.exhausted()
 }
 
 fn macros(pairs: &[(&str, &str)]) -> HashMap<String, String> {
@@ -61,21 +82,21 @@ fn macros(pairs: &[(&str, &str)]) -> HashMap<String, String> {
 async fn boot(cid: u32, disable_comms: Option<&str>) -> Ioc {
     ip_rs::register_ip_dbd();
     stream_rs::asyn::register();
-    let status = free_udp_port();
     let no_db = Arc::new(PvDatabase::new());
+    let commands = HeldPort::closed_udp();
     for line in [
         format!(
             r#"epicsEnvSet("STREAM_PROTOCOL_PATH", "{}")"#,
             ip_rs::IP_DB_DIR
         ),
-        format!(r#"drvAsynIPPortConfigure("CS_UDP", "127.0.0.1:{status}:{status} UDP")"#),
         format!(
             r#"drvAsynIPPortConfigure("CS_CMD", "127.0.0.1:{} UDP")"#,
-            free_udp_port()
+            commands.port
         ),
     ] {
         sh(&no_db, &line).await;
     }
+    let (status_name, status) = status_port(&no_db).await;
     let mut controller = vec![("P", "x:"), ("R", "CS0:"), ("CP", "CS_CMD")];
     controller.extend(disable_comms.map(|d| ("DISABLE_COMMS", d)));
     let (asyn_name, asyn_factory) = asyn_rs::asyn_record::asyn_record_factory();
@@ -83,7 +104,7 @@ async fn boot(cid: u32, disable_comms: Option<&str>) -> Ioc {
     let (db, _) = stream_rs::dev::register(builder)
         .db_file(
             &format!("{}/Oxford_CS800_status.db", ip_rs::IP_DB_DIR),
-            &macros(&[("P", "x:"), ("R", "CS:"), ("SP", "CS_UDP")]),
+            &macros(&[("P", "x:"), ("R", "CS:"), ("SP", &status_name)]),
         )
         .unwrap()
         .db_file(
@@ -101,6 +122,7 @@ async fn boot(cid: u32, disable_comms: Option<&str>) -> Ioc {
     Ioc {
         db,
         status,
+        _commands: commands,
         _scan: scan,
     }
 }

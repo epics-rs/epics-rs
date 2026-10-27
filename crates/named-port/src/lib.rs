@@ -532,18 +532,21 @@ mod tests {
     }
 
     /// The held/free boundary: a bound socket reads held, the number it
-    /// leaves behind reads free.
+    /// leaves behind reads free. A released number any socket may take, so
+    /// one that reads held is drawn again; a probe that reads every
+    /// released number held fails after [`ATTEMPTS`].
     #[test]
     fn a_bound_port_reads_held_and_a_released_one_free() {
-        let tcp = TcpListener::bind("127.0.0.1:0").unwrap();
-        let udp = UdpSocket::bind("0.0.0.0:0").unwrap();
-        let (t, u) = (
-            tcp.local_addr().unwrap().port(),
-            udp.local_addr().unwrap().port(),
-        );
-        assert!(tcp_port_is_held(t) && udp_port_is_held(u));
-        drop((tcp, udp));
-        assert!(!tcp_port_is_held(t) && !udp_port_is_held(u));
+        on_a_named_port(|port| {
+            let bound = |e: std::io::Error| {
+                assert!(port_held(&e), "{port} refused but not held: {e}");
+            };
+            let tcp = TcpListener::bind(("127.0.0.1", port)).map_err(bound).ok()?;
+            let udp = UdpSocket::bind(("0.0.0.0", port)).map_err(bound).ok()?;
+            assert!(tcp_port_is_held(port) && udp_port_is_held(port));
+            drop((tcp, udp));
+            (!tcp_port_is_held(port) && !udp_port_is_held(port)).then_some(())
+        });
     }
 
     fn plain_bind(ty: Type, ip: [u8; 4], port: u16) -> std::io::Result<Socket> {

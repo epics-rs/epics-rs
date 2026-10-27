@@ -5568,9 +5568,10 @@ mod tests {
                 "---published {}",
                 crate::registry::get_port("busy_srv").is_some()
             );
-            let free = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            let free_addr = free.local_addr().unwrap();
-            drop(free);
+            // Held, not probed and dropped: the number stays the server's
+            // to bind until the connect below reaches it.
+            let free = named_port::HeldPort::tcp();
+            let free_addr = std::net::SocketAddr::from(([127, 0, 0, 1], free.port));
             call_configure(
                 &srv,
                 &[
@@ -5589,9 +5590,10 @@ mod tests {
             );
             // A refused duplicate gives back the socket it bound (C
             // `ttyCleanup`, drvAsynIPServerPort.c:651-652).
-            let spare = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            let spare_addr = spare.local_addr().unwrap();
-            drop(spare);
+            // A rebind beside the hold is refused only by a listener left on
+            // the number.
+            let spare = named_port::HeldPort::tcp();
+            let spare_addr = std::net::SocketAddr::from(([127, 0, 0, 1], spare.port));
             call_configure(
                 &srv,
                 &[

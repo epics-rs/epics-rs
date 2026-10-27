@@ -1,7 +1,6 @@
 use std::any::Any;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
 
 use super::dbd_generated;
 use crate::device_support::scaler_asyn::ScalerDriver;
@@ -102,17 +101,6 @@ pub struct ScalerRecord {
     pub pr: [u32; MAX_SCALER_CHANNELS],
     pub s: [u32; MAX_SCALER_CHANNELS],
     pub nm: [PvString; MAX_SCALER_CHANNELS],
-
-    // --- Autocount hold ---
-    /// Start instant of the current SCALER_STATE_WAITING autocount hold.
-    delay_start: Option<Instant>,
-    /// The autocount hold time (seconds) the current SCALER_STATE_WAITING
-    /// period was scheduled with. C scalerRecord.c computes `dly_sec`
-    /// once (`MAX(dly1, scaler_wait_time)` after a user count) and the
-    /// `autoCallbackFunc` fires after exactly that interval; the port
-    /// must compare elapsed time against the scheduled value, not the
-    /// live `dly1` (which the user may change mid-wait).
-    autocount_delay: f64,
 
     /// The dset `process()` calls; `None` until device support binds one.
     dset: Option<ScalerDset>,
@@ -242,8 +230,6 @@ impl Default for ScalerRecord {
             pr: [0; MAX_SCALER_CHANNELS],
             s: [0; MAX_SCALER_CHANNELS],
             nm: std::array::from_fn(|_| PvString::new()),
-            delay_start: None,
-            autocount_delay: 0.0,
             dset: None,
             done: Arc::default(),
             reqstart_old_pr1: 0,
@@ -885,37 +871,16 @@ impl Record for ScalerRecord {
                 dly_sec = dly_sec.max(SCALER_WAIT_TIME);
             }
             // C:492 — `if (dly_sec > 0 && ss != WAITING)`: schedule the
-            // restart. Otherwise (delay elapsed, or no delay) start now.
+            // restart. Otherwise (no delay, or this is the "next time" the
+            // WAITING note asked for, whoever processed) start now.
             if dly_sec > 0.0 && self.ss != SCALER_STATE_WAITING {
                 self.ss = SCALER_STATE_WAITING;
-                self.delay_start = Some(Instant::now());
-                self.autocount_delay = dly_sec;
                 actions.push(ProcessAction::DelayedCallbackAfter(
                     epics_base_rs::runtime::time::duration_from_secs(dly_sec),
                     AUTO_CALLBACK,
                 ));
                 return Ok(cycle_outcome(emit, actions));
-            } else if self.ss == SCALER_STATE_WAITING {
-                // Already WAITING: only start once the scheduled delay
-                // has actually elapsed (guards a premature reprocess).
-                let elapsed = self
-                    .delay_start
-                    .map(|s| s.elapsed().as_secs_f64())
-                    .unwrap_or(f64::MAX);
-                if elapsed >= self.autocount_delay {
-                    self.delay_start = None;
-                    actions.extend(self.dset_start_autocount(dset.as_deref_mut()));
-                    self.ss = SCALER_STATE_COUNTING;
-                } else {
-                    let remaining = self.autocount_delay - elapsed;
-                    actions.push(ProcessAction::DelayedCallbackAfter(
-                        epics_base_rs::runtime::time::duration_from_secs(remaining),
-                        AUTO_CALLBACK,
-                    ));
-                    return Ok(cycle_outcome(emit, actions));
-                }
             } else {
-                // dly_sec <= 0 and not WAITING: start immediately.
                 actions.extend(self.dset_start_autocount(dset));
                 self.ss = SCALER_STATE_COUNTING;
             }

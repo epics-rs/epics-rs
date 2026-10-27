@@ -381,7 +381,7 @@ fn test_autocount_waiting_cycle_returns_no_emit() {
     let mut rec = ScalerRecord::default();
     rec.freq = 1e7;
     rec.cont = 1;
-    rec.ss = 1; // WAITING for the auto-count restart, its delay elapsed
+    rec.ss = 1; // WAITING for the auto-count restart
     assert!(!emits(&rec.process().unwrap()), "ss WAITING at :470");
     assert_eq!(rec.ss, 2, "the auto-count started after :470");
 }

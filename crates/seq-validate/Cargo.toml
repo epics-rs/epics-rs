@@ -10,11 +10,11 @@ publish = false
 
 [dependencies]
 epics-base-rs = { workspace = true }
-epics-seq-rs = { workspace = true }
+epics-seq-rs = { workspace = true, features = ["runtime"] }
 parking_lot = "0.12"
 
 [build-dependencies]
-epics-snc-rs = { workspace = true }
+epics-seq-rs = { workspace = true, features = ["snc"] }
 
 [dev-dependencies]
 epics-ca-rs = { workspace = true }

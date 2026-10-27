@@ -2,25 +2,100 @@
 name = "epics-seq-rs"
 version.workspace = true
 edition.workspace = true
-description = "Rust port of the EPICS sequencer run-time (seq, pv) that snc-rs generated programs run on"
+description = "Rust port of the EPICS sequencer: the run-time (seq, pv) and, under the snc feature, the SNL compiler that turns an unchanged .st program into Rust at build time"
 readme = "README.md"
 license-file = "LICENSE"
 authors.workspace = true
 repository.workspace = true
 
+# docs.rs documents the default features only; the compiler is half the crate.
+[package.metadata.docs.rs]
+features = ["snc"]
+
+[[bin]]
+name = "snc-rs"
+path = "src/bin/snc-rs.rs"
+required-features = ["snc"]
+
+[features]
+default = ["runtime"]
+# C `src/seq` and `src/pv`, which generated programs run on.
+runtime = ["dep:epics-base-rs", "dep:parking_lot"]
+# C `src/snc` and the cpp before it, for build scripts: a build-dependency
+# with `default-features = false` does not compile epics-base-rs.
+snc = ["dep:chrono"]
+
 [dependencies]
-epics-base-rs = { workspace = true }
+epics-base-rs = { workspace = true, optional = true }
+# Also snc's StagedStderr: diagnostics reach stderr one write per message.
 epics-libcom-rs = { workspace = true }
-parking_lot = "0.12"
+parking_lot = { version = "0.12", optional = true }
+
+[build-dependencies]
+# Perl's localtime for snc's SEQ_RELEASE build date.
+chrono = { version = "0.4", optional = true }
 
 [dev-dependencies]
 async-trait = "0.1"
+# Also locates the sequencer checkout whose C snc the reference_* tests
+# compare to.
+epics-base-rs = { workspace = true }
 epics-ca-rs = { workspace = true }
 # Dev-only: `#[epics_test]`, the backend-selected test driver.
 epics-macros-rs = { workspace = true }
 # Dev-only, path-only: the one budget a test puts on a fact.
 fact-budget = { path = "../fact-budget" }
 libc = "0.2"
+# Reads the corpus check's compiler-artifact and compiler-message lines.
+serde_json = { workspace = true }
 serial_test = "3"
 tempfile = "3"
 tokio = { version = "1", features = ["full", "test-util"] }
+
+[[test]]
+name = "foreign_call"
+required-features = ["runtime"]
+
+[[test]]
+name = "golden_delay_do"
+required-features = ["runtime"]
+
+[[test]]
+name = "pv"
+required-features = ["runtime"]
+
+[[test]]
+name = "analysis"
+required-features = ["snc"]
+
+[[test]]
+name = "cpp"
+required-features = ["snc"]
+
+[[test]]
+name = "reference_analysis"
+required-features = ["snc"]
+
+[[test]]
+name = "reference_cpp"
+required-features = ["snc"]
+
+[[test]]
+name = "reference_gen_code"
+required-features = ["snc"]
+
+[[test]]
+name = "reference_gen_tables"
+required-features = ["snc"]
+
+[[test]]
+name = "reference_snc_cli"
+required-features = ["snc"]
+
+[[test]]
+name = "reference_snc_parse"
+required-features = ["snc"]
+
+[[test]]
+name = "reference_snl_tables"
+required-features = ["snc"]

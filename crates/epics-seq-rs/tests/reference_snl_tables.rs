@@ -11,7 +11,7 @@ fn grammar_report_matches_snl_out() {
         "sequencer/src/snc/O.linux-x86_64/snl.out",
     );
     let want = std::fs::read_to_string(&path).expect("read snl.out");
-    let got = epics_snc_rs::grammar_report();
+    let got = epics_seq_rs::snc::grammar_report();
     if got != want {
         let line = got
             .lines()

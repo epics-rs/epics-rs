@@ -3,7 +3,7 @@
 
 use std::path::Path;
 
-use epics_snc_rs::cpp;
+use epics_seq_rs::snc::cpp;
 
 fn run(src: &str) -> cpp::Output {
     cpp::preprocess(Path::new("t.c"), Path::new("t.c"), src.as_bytes(), &[], &[])

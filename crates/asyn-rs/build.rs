@@ -113,5 +113,5 @@ fn main() {
 
     // testIPServerApp's SNL program, which needs the IOC.
     #[cfg(feature = "epics")]
-    epics_snc_rs::build::compile_dir("src/snl");
+    epics_seq_rs::snc::build::compile_dir("src/snl");
 }

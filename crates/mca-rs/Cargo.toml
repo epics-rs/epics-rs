@@ -11,10 +11,10 @@ repository.workspace = true
 chrono = "0.4"
 epics-base-rs = { workspace = true }
 epics-libcom-rs = { workspace = true }
-epics-seq-rs = { workspace = true }
+epics-seq-rs = { workspace = true, features = ["runtime"] }
 
 [build-dependencies]
-epics-snc-rs = { workspace = true }
+epics-seq-rs = { workspace = true, features = ["snc"] }
 
 [features]
 

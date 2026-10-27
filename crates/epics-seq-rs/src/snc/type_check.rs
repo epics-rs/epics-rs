@@ -2,10 +2,10 @@
 //! generation uses to tell function calls from calls through foreign
 //! objects.
 
-use crate::driver::Snc;
-use crate::seq_prim_types::PrimType;
-use crate::types::{Ast, Extra, NodeId, NodeTag, Tok, TypeId, child};
-use crate::var_types::TypeKind;
+use crate::snc::driver::Snc;
+use crate::snc::seq_prim_types::PrimType;
+use crate::snc::types::{Ast, Extra, NodeId, NodeTag, Tok, TypeId, child};
+use crate::snc::var_types::TypeKind;
 
 /// A type as `type_of` infers it: a type of the syntax tree, one of C's
 /// static type constants, or a pointer type it allocates.

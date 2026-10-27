@@ -7,15 +7,15 @@
 
 use std::path::Path;
 
-use crate::driver::{Exit, Snc};
-use crate::gen_ss_code::{gen_funcdef, gen_ss_code};
-use crate::gen_tables::gen_tables;
-use crate::rust_out::{self, Expr, Field, Fn, Item, Stmt, Struct};
-use crate::seq_prim_types::PrimType;
-use crate::types::{
+use crate::snc::driver::{Exit, Snc};
+use crate::snc::gen_ss_code::{gen_funcdef, gen_ss_code};
+use crate::snc::gen_tables::gen_tables;
+use crate::snc::rust_out::{self, Expr, Field, Fn, Item, Stmt, Struct};
+use crate::snc::seq_prim_types::PrimType;
+use crate::snc::types::{
     Ast, Multiplicity, Node, NodeId, NodeTag, Program, VarChan, VarId, VarListId, child,
 };
-use crate::var_types::{ForeignTag, TypeKind};
+use crate::snc::var_types::{ForeignTag, TypeKind};
 
 const NM_VARS: &str = "seqg_vars";
 const NM_STATIC_VARS: &str = "seqg_static_vars";
@@ -149,7 +149,7 @@ pub(crate) fn rt_typename(name: &str) -> Option<&'static str> {
 
 /// The Rust type of a value of SNL type `t`, or the part of `t` that has
 /// none.
-pub(crate) fn value_type(ast: &Ast, t: crate::types::TypeId) -> Result<String, String> {
+pub(crate) fn value_type(ast: &Ast, t: crate::snc::types::TypeId) -> Result<String, String> {
     Ok(match &ast[t].kind {
         TypeKind::Prim(p) => match p {
             PrimType::Char => "std::ffi::c_char",
@@ -224,7 +224,7 @@ pub fn gen_var_decl(snc: &mut Snc, ast: &Ast, vp: VarId) -> String {
 
 /// C `gen_defn_c_code`: the escaped C among the definitions of `scope`,
 /// each a `seqg_escaped!(r#"..."#);` item after its `// file:line`
-/// comment. In a block body each item is a [`crate::rust_out::Stmt::Item`].
+/// comment. In a block body each item is a [`crate::snc::rust_out::Stmt::Item`].
 pub fn gen_defn_c_code(snc: &mut Snc, ast: &Ast, scope: NodeId) -> Vec<Item> {
     let texts: Vec<NodeId> = ast
         .list(ast.defn_list_from_scope(scope))
@@ -594,8 +594,8 @@ pub fn escaped_lit(key: &str) -> Expr {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analysis::analyse_program;
-    use crate::parser::parse_program;
+    use crate::snc::analysis::analyse_program;
+    use crate::snc::parser::parse_program;
 
     fn analysed(src: &str) -> (Snc, Ast, Program) {
         let mut snc = Snc::capturing();

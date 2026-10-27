@@ -9,8 +9,8 @@
 use std::ops::{Index, IndexMut};
 use std::sync::Arc;
 
-use crate::sym_table::SymTable;
-use crate::var_types::Type;
+use crate::snc::sym_table::SymTable;
+use crate::snc::var_types::Type;
 
 pub type TypeMask = u64;
 
@@ -873,7 +873,7 @@ impl Ast {
         let decl = self[funcdef].children[child::FUNCDEF_DECL].expect("funcdef without decl");
         let var = self[decl].e_decl().expect("funcdef decl without var");
         match self[self[var].type_].kind {
-            crate::var_types::TypeKind::Function { param_decls, .. } => param_decls,
+            crate::snc::var_types::TypeKind::Function { param_decls, .. } => param_decls,
             _ => panic!("funcdef decl is not a function type"),
         }
     }

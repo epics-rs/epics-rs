@@ -18,7 +18,7 @@ serde_json = { workspace = true }
 tracing = "0.1"
 epics-base-rs = { workspace = true, optional = true }
 # The run-time `src/snl`'s ipSNCServer.st runs on, IOC side only.
-epics-seq-rs = { workspace = true, optional = true }
+epics-seq-rs = { workspace = true, optional = true, features = ["runtime"] }
 # `runtime::socket` is the workspace's one owner of "open a socket, set the
 # address-reuse/broadcast options, then bind" — the ordering `socket2` cannot
 # express on the embedded triples, because it does not build for either of
@@ -29,11 +29,11 @@ epics-libcom-rs = { workspace = true }
 
 [build-dependencies]
 # `build.rs` compiles `src/snl` when `epics` is on.
-epics-snc-rs = { workspace = true, optional = true }
+epics-seq-rs = { workspace = true, optional = true, features = ["snc"] }
 
 [features]
 default = ["epics"]
-epics = ["dep:epics-base-rs", "dep:epics-seq-rs", "dep:epics-snc-rs"]
+epics = ["dep:epics-base-rs", "dep:epics-seq-rs"]
 # Opt-in FTDI MPSSE / D2XX hardware support. Without this flag the
 # `drivers::ftdi::DrvAsynFtdiPort` scaffold compiles cleanly but
 # `connect()` returns an "feature not enabled" error so application

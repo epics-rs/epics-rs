@@ -1,7 +1,7 @@
 //! The SNL compiler of the EPICS sequencer (C `src/snc`), ported so an
 //! unchanged `.st` program compiles at build time.
 //!
-//! This crate holds the front end: the lexer (`lexer`, C `snl.re`), the
+//! This module holds the front end: the lexer (`lexer`, C `snl.re`), the
 //! grammar (`snl`, C `snl.lem`) and its parser driver ([`parser`]), the
 //! syntax tree ([`types`], [`node`]), symbol tables, variable types and the
 //! driver with its reporting procedures ([`driver`], C `main.c`), the

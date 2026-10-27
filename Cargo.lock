@@ -233,7 +233,6 @@ dependencies = [
  "epics-libcom-rs",
  "epics-macros-rs",
  "epics-seq-rs",
- "epics-snc-rs",
  "libc",
  "named-port",
  "parking_lot",
@@ -1282,6 +1281,7 @@ name = "epics-seq-rs"
 version = "0.32.0"
 dependencies = [
  "async-trait",
+ "chrono",
  "epics-base-rs",
  "epics-ca-rs",
  "epics-libcom-rs",
@@ -1289,20 +1289,10 @@ dependencies = [
  "fact-budget",
  "libc",
  "parking_lot",
+ "serde_json",
  "serial_test",
  "tempfile",
  "tokio",
-]
-
-[[package]]
-name = "epics-snc-rs"
-version = "0.32.0"
-dependencies = [
- "chrono",
- "epics-base-rs",
- "epics-libcom-rs",
- "serde_json",
- "tempfile",
 ]
 
 [[package]]
@@ -2275,7 +2265,6 @@ dependencies = [
  "epics-ca-rs",
  "epics-libcom-rs",
  "epics-seq-rs",
- "epics-snc-rs",
  "tokio",
 ]
 
@@ -2733,7 +2722,6 @@ dependencies = [
  "epics-ca-rs",
  "epics-libcom-rs",
  "epics-seq-rs",
- "epics-snc-rs",
  "motor-rs",
  "tokio",
  "tracing",
@@ -3650,7 +3638,6 @@ dependencies = [
  "epics-base-rs",
  "epics-ca-rs",
  "epics-seq-rs",
- "epics-snc-rs",
  "parking_lot",
  "serial_test",
  "tempfile",
@@ -3921,7 +3908,6 @@ dependencies = [
  "epics-ca-rs",
  "epics-libcom-rs",
  "epics-seq-rs",
- "epics-snc-rs",
  "futures-util",
  "libc",
  "parking_lot",
@@ -3945,7 +3931,6 @@ dependencies = [
  "epics-ca-rs",
  "epics-libcom-rs",
  "epics-seq-rs",
- "epics-snc-rs",
  "record-seam-gate",
  "scaler-rs",
  "tempfile",

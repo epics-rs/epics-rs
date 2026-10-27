@@ -2,16 +2,16 @@
 //! event masks, states, state sets and the program, as the `static`s of
 //! epics-seq-rs's `seq_snc.h` types.
 
-use crate::analysis::{AstCx, traverse_syntax_tree};
-use crate::driver::Snc;
-use crate::node::strtoui;
-use crate::rust_out::{Arg, Const, Expr, Item, c_unescape};
-use crate::seq_prim_types::PrimType;
-use crate::types::{
+use crate::snc::analysis::{AstCx, traverse_syntax_tree};
+use crate::snc::driver::Snc;
+use crate::snc::node::strtoui;
+use crate::snc::rust_out::{Arg, Const, Expr, Item, c_unescape};
+use crate::snc::seq_prim_types::PrimType;
+use crate::snc::types::{
     Ast, ChanId, Extra, Multiplicity, NodeId, NodeTag, Options, Program, StateOptions, VarChan,
     VarId, child,
 };
-use crate::var_types::TypeKind;
+use crate::snc::var_types::TypeKind;
 
 const NM_VARS: &str = "seqg_vars";
 const NM_CHANS: &str = "seqg_chans";

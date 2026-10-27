@@ -11,13 +11,17 @@
 //! RTEMS it is unset while `exec_backend` is ON.
 //!
 //! It also stamps `seq_release.pl`'s `compiled <localtime>`: a build of this
-//! crate is C's build of the sequencer library, and `seq` prints the time in
-//! its banner.
+//! crate is C's build of the sequencer, and `seq` prints the time in its
+//! banner. Under `snc` the same instant goes into the `seq_release.h` the
+//! compiler's programs include.
 fn main() {
-    let epoch = std::time::SystemTime::now()
+    let now = std::time::SystemTime::now();
+    let epoch = now
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |since| since.as_secs());
     println!("cargo::rustc-env=SEQ_RS_BUILD_EPOCH={epoch}");
+    #[cfg(feature = "snc")]
+    seq_release_h(now);
     // A `rerun-if-*` below ends Cargo's own watch on the package, which the
     // stamp needs, so the package is named too.
     let manifest = std::env::var("CARGO_MANIFEST_DIR").expect("set by Cargo");
@@ -55,4 +59,31 @@ fn main() {
     } else {
         println!("cargo::rustc-cfg=tokio_backend");
     }
+}
+
+/// C `MAGIC`: the table layout snc-rs generates and the run time checks,
+/// 2.2.9's, where seq_release.pl spells the release.
+#[cfg(feature = "snc")]
+const MAGIC: u32 = 2_002_009;
+
+/// Writes `seq_release.h` into `$OUT_DIR/include`, the `$(SNCSEQ)/include`
+/// a program's `#include <seq_release.h>` reaches for `MAGIC`, with the date
+/// as Perl's scalar `localtime` on the builder prints it.
+#[cfg(feature = "snc")]
+fn seq_release_h(now: std::time::SystemTime) {
+    let now = chrono::DateTime::<chrono::Local>::from(now).format("%a %b %e %H:%M:%S %Y");
+    println!("cargo::rustc-env=EPICS_SNC_COMPILED={now}");
+    println!("cargo::rustc-env=EPICS_SNC_MAGIC={MAGIC}");
+    let version = std::env::var("CARGO_PKG_VERSION").expect("CARGO_PKG_VERSION");
+    let include =
+        std::path::Path::new(&std::env::var_os("OUT_DIR").expect("OUT_DIR")).join("include");
+    std::fs::create_dir_all(&include).expect("create include dir");
+    std::fs::write(
+        include.join("seq_release.h"),
+        format!(
+            "#define SEQ_RELEASE \"Sequencer release {version}, compiled {now}\"\n\
+             #define MAGIC {MAGIC}\n"
+        ),
+    )
+    .expect("write seq_release.h");
 }

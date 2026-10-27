@@ -38,7 +38,7 @@ fn main() {
     }
 
     for program in seq_validate_programs() {
-        epics_snc_rs::build::compile(format!("validate/{program}.st"));
+        epics_seq_rs::snc::build::compile(format!("validate/{program}.st"));
     }
 }
 

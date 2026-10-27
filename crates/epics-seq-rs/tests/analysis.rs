@@ -6,12 +6,12 @@
 
 mod common;
 
-use epics_snc_rs::analysis::traverse_syntax_tree;
-use epics_snc_rs::type_check::type_is_function;
-use epics_snc_rs::types::{
+use epics_seq_rs::snc::analysis::traverse_syntax_tree;
+use epics_seq_rs::snc::type_check::type_is_function;
+use epics_seq_rs::snc::types::{
     Ast, Extra, Multiplicity, NodeTag, Program, State, StateOptions, VarChan, VarId, child,
 };
-use epics_snc_rs::var_types::TypeKind;
+use epics_seq_rs::snc::var_types::TypeKind;
 
 #[test]
 fn fixtures_match_goldens() {

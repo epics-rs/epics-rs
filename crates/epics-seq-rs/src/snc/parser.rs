@@ -2,11 +2,11 @@
 //! `snl.c`) over the `snl` tables, and `parse_program`
 //! (C `snl.re`).
 
-use crate::driver::{Exit, Snc};
-use crate::lemon::Tables;
-use crate::lexer::Scanner;
-use crate::snl::{self, Cx, Minor};
-use crate::types::{Ast, NodeId, Tok, Token};
+use crate::snc::driver::{Exit, Snc};
+use crate::snc::lemon::Tables;
+use crate::snc::lexer::Scanner;
+use crate::snc::snl::{self, Cx, Minor};
+use crate::snc::types::{Ast, NodeId, Tok, Token};
 
 /// C `yyStackEntry`.
 struct Entry {

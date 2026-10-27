@@ -10,14 +10,14 @@ repository.workspace = true
 [dependencies]
 epics-base-rs = { workspace = true }
 epics-libcom-rs = { workspace = true }
-epics-seq-rs = { workspace = true }
+epics-seq-rs = { workspace = true, features = ["runtime"] }
 futures-util = "0.3"
 libc = "0.2"
 parking_lot = "0.12"
 tokio = { version = "1", features = ["sync", "time", "rt", "macros"] }
 
 [build-dependencies]
-epics-snc-rs = { workspace = true }
+epics-seq-rs = { workspace = true, features = ["snc"] }
 
 [features]
 

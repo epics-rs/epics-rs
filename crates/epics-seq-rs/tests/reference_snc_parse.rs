@@ -10,10 +10,10 @@ use std::process::Command;
 use std::sync::Arc;
 
 use epics_base_rs::reference::{ReferenceTree, reference_path, reference_root};
-use epics_snc_rs::driver::{Exit, Snc};
-use epics_snc_rs::parser::parse_program;
-use epics_snc_rs::types::{Ast, Extra, NodeId, NodeTag};
-use epics_snc_rs::var_types::TypeKind;
+use epics_seq_rs::snc::driver::{Exit, Snc};
+use epics_seq_rs::snc::parser::parse_program;
+use epics_seq_rs::snc::types::{Ast, Extra, NodeId, NodeTag};
+use epics_seq_rs::snc::var_types::TypeKind;
 
 /// The .st and .stt programs of the module checkouts, relative to the
 /// modules tree.
@@ -436,7 +436,7 @@ fn nz(s: &Option<Arc<str>>) -> &str {
 /// snc_dump's `show_type`; function parameter lists go to `pending`.
 fn show_type(
     ast: &Ast,
-    t: epics_snc_rs::types::TypeId,
+    t: epics_seq_rs::snc::types::TypeId,
     out: &mut String,
     pending: &mut Vec<Option<NodeId>>,
 ) {

@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use epics_base_rs::reference::{ReferenceTree, reference_root};
-use epics_snc_rs::cpp;
+use epics_seq_rs::snc::cpp;
 
 /// The `-D`s `$(CPP)` gets on linux-x86_64 for RULES_SNCSEQ's `%.i: %.st`.
 const DEFINES: &[&str] = &[

@@ -53,7 +53,7 @@ use epics_rs::asyn;        // port driver framework
 | `full` | Everything above | no |
 
 `calc`, `autosave`, and `busy` are always available through `epics-base-rs`.
-`sscan-rs`, `epics-stream-rs`, `epics-seq-rs`/`epics-snc-rs`,
+`sscan-rs`, `epics-stream-rs`, `epics-seq-rs`,
 `mqtt-rs` and `epics-modbus-rs` are not surfaced through the umbrella crate —
 depend on them directly when needed.
 
@@ -89,8 +89,7 @@ epics-ca-rs   = "0.32"  # just Channel Access
 | `sscan-rs` | synApps sscan R2-12 (sscan and scanparm records, saveData's MDA writer, `scanProg.st`) |
 | `epics-stream-rs` | StreamDevice (imported as `stream_rs`) |
 | `stream-pcre-sys` | C PCRE 8.45, the test oracle for `epics-stream-rs`'s Rust PCRE |
-| `epics-snc-rs` | Sequencer R2-2-9 SNL compiler: `.st` → Rust from `build.rs`, and the `snc-rs` CLI |
-| `epics-seq-rs` | Sequencer R2-2-9 run-time that snc-rs programs run on |
+| `epics-seq-rs` | Sequencer R2-2-9 run-time, and under `snc` its SNL compiler: `.st` → Rust from `build.rs`, and the `snc-rs` CLI |
 | `mqtt-rs` | MQTT broker bridge (FLAT/JSON payloads) |
 | `epics-modbus-rs` | Modbus TCP/RTU/ASCII driver |
 

@@ -5,18 +5,18 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use crate::builtin::{
+use crate::snc::builtin::{
     lookup_builtin_const, lookup_builtin_func, register_builtin_consts, register_builtin_funcs,
 };
-use crate::driver::Snc;
-use crate::node::strtoui;
-use crate::sym_table::SymTable;
-use crate::types::{
+use crate::snc::driver::Snc;
+use crate::snc::node::strtoui;
+use crate::snc::sym_table::SymTable;
+use crate::snc::types::{
     Ast, Chan, ChanId, ChanList, EXPR_MASK, EvFlag, Extra, HAS_SUB_SCOPE_MASK, Multiplicity,
     NodeId, NodeTag, Options, Program, SCOPE_MASK, Sym, SymScope, SyncQ, SyncQId, SyncQList,
     TypeMask, VarChan, VarId, VarList, VarListId, child, is_scope,
 };
-use crate::var_types::TypeKind;
+use crate::snc::var_types::TypeKind;
 
 /// Access to the syntax tree for [`traverse_syntax_tree`] (C passes the
 /// tree and the iteratee's `parg` separately; here the iteratee's context
@@ -362,14 +362,14 @@ impl Cx<'_> {
     /// self-referencing struct whose type is shared by three declarators
     /// (`struct S {struct S *next;}; struct S a, b, c;`). Each type is
     /// converted at most once, so visiting it once gives C's result.
-    fn fixup_struct_refs(&mut self, t: crate::types::TypeId, visited: &mut HashSet<u32>) {
+    fn fixup_struct_refs(&mut self, t: crate::snc::types::TypeId, visited: &mut HashSet<u32>) {
         if !visited.insert(t.0) {
             return;
         }
         match self.ast[t].kind.clone() {
             TypeKind::None | TypeKind::EvFlag | TypeKind::Void | TypeKind::Prim(_) => {}
             TypeKind::Foreign { tag, name } => {
-                if tag == crate::var_types::ForeignTag::Struct
+                if tag == crate::snc::var_types::ForeignTag::Struct
                     && let Some(Sym::Type(r)) = self.p.sym_table.lookup(&name, SymScope::StructDefs)
                 {
                     let kind = self.ast[r].kind.clone();
@@ -1384,7 +1384,7 @@ impl Cx<'_> {
     }
 }
 
-fn state_mut(ast: &mut Ast, sp: NodeId) -> &mut crate::types::State {
+fn state_mut(ast: &mut Ast, sp: NodeId) -> &mut crate::snc::types::State {
     match &mut ast[sp].extra {
         Extra::State(state) => state,
         _ => unreachable!("state node without state data"),

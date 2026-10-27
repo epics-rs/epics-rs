@@ -61,7 +61,7 @@ fn main() {
 fn compile_snl() {
     let snl = Path::new("src/snl");
     // compile_dir also reruns this on any change in src/snl, companions included.
-    let programs = epics_snc_rs::build::compile_dir(snl);
+    let programs = epics_seq_rs::snc::build::compile_dir(snl);
     let mut companions = HashMap::new();
     for entry in fs::read_dir(snl).unwrap() {
         let path = entry.unwrap().path();

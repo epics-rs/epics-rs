@@ -14,8 +14,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use epics_base_rs::reference::{ReferenceTree, reference_path, reference_root};
-use epics_snc_rs::gen_tables::gen_tables;
-use epics_snc_rs::rust_out::{Expr, Item, print};
+use epics_seq_rs::snc::gen_tables::gen_tables;
+use epics_seq_rs::snc::rust_out::{Expr, Item, print};
 
 /// Option sets covering the three variable models and every program option
 /// bit.
@@ -492,7 +492,7 @@ fn c_tables_as_rust(c: &str) -> String {
 // ---- gen_tables' tree as text ----
 
 fn rs_expr(e: &Expr) -> String {
-    let list = |args: &[epics_snc_rs::rust_out::Arg]| {
+    let list = |args: &[epics_seq_rs::snc::rust_out::Arg]| {
         args.iter()
             .map(|a| rs_expr(&a.expr))
             .collect::<Vec<_>>()
@@ -742,7 +742,7 @@ fn delay_do_matches_golden() {
     let items = gen_tables(&mut run.snc, &run.ast, prg);
 
     let golden = std::fs::read_to_string(
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../epics-seq-rs/tests/golden/delayDo.rs"),
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/delayDo.rs"),
     )
     .expect("read golden");
     let lines: Vec<&str> = golden.lines().collect();

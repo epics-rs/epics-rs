@@ -4,13 +4,13 @@
 //! [`Extra::Builtin`] hold the index into [`CONST_SYMBOLS`] or
 //! [`FUNC_SYMBOLS`].
 //!
-//! [`Extra::Const`]: crate::types::Extra::Const
-//! [`Extra::Builtin`]: crate::types::Extra::Builtin
+//! [`Extra::Const`]: crate::snc::types::Extra::Const
+//! [`Extra::Builtin`]: crate::snc::types::Extra::Builtin
 
 use std::sync::Arc;
 
-use crate::sym_table::SymTable;
-use crate::types::{Sym, SymScope};
+use crate::snc::sym_table::SymTable;
+use crate::snc::types::{Sym, SymScope};
 
 /// C `enum const_type`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

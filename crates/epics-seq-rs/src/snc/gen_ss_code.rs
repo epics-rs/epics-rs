@@ -10,18 +10,22 @@
 
 use std::collections::BTreeSet;
 
-use crate::builtin::{CONST_SYMBOLS, ConstType, FUNC_SYMBOLS, Param as BuiltinParam, ParamType};
-use crate::driver::{Exit, Snc};
-use crate::gen_code::{
+use crate::snc::builtin::{
+    CONST_SYMBOLS, ConstType, FUNC_SYMBOLS, Param as BuiltinParam, ParamType,
+};
+use crate::snc::driver::{Exit, Snc};
+use crate::snc::gen_code::{
     CClass, c_bracket_balance, c_classes, escaped_key, escaped_lit, gen_var_decl, line_comment,
     rt_typename, value_type, vars,
 };
-use crate::gen_tables::var_place;
-use crate::rust_out::{Arg, Arm, Expr, Fn, Item, Param, Stmt, c_unescape};
-use crate::seq_prim_types::PrimType;
-use crate::type_check::type_is_function;
-use crate::types::{Ast, Extra, Multiplicity, NodeId, NodeTag, Program, Tok, TypeId, VarId, child};
-use crate::var_types::{ForeignTag, TypeKind};
+use crate::snc::gen_tables::var_place;
+use crate::snc::rust_out::{Arg, Arm, Expr, Fn, Item, Param, Stmt, c_unescape};
+use crate::snc::seq_prim_types::PrimType;
+use crate::snc::type_check::type_is_function;
+use crate::snc::types::{
+    Ast, Extra, Multiplicity, NodeId, NodeTag, Program, Tok, TypeId, VarId, child,
+};
+use crate::snc::var_types::{ForeignTag, TypeKind};
 
 const NM_ENTRY: &str = "seqg_entry";
 const NM_EXIT: &str = "seqg_exit";
@@ -727,7 +731,7 @@ pub fn escaped_decl(ast: &Ast, name: &str) -> Option<CDecl> {
 /// globals the escaped C defines, which the companion holds in a cell as
 /// a `static x: LazyLock<SeqVar<T>>` rather than as a constant.
 pub fn assigned_globals(ast: &Ast) -> BTreeSet<String> {
-    let target = |n: &crate::types::Node| match n.tag {
+    let target = |n: &crate::snc::types::Node| match n.tag {
         NodeTag::EBinop if is_assign(n.token.symbol) => n.child(child::BINOP_LEFT),
         NodeTag::EPre | NodeTag::EPost if matches!(n.token.symbol, Tok::Incr | Tok::Decr) => {
             n.child(0)
@@ -3657,9 +3661,9 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
 
-    use crate::analysis::analyse_program;
-    use crate::parser::parse_program;
-    use crate::rust_out;
+    use crate::snc::analysis::analyse_program;
+    use crate::snc::parser::parse_program;
+    use crate::snc::rust_out;
 
     /// `src` parsed and analysed without diagnostics.
     fn analysed(src: &str) -> (Snc, Ast, Program) {
@@ -3962,7 +3966,7 @@ mod tests {
         .expect("read state_coll.st");
         let (mut snc, ast, prg) = analysed(&src);
         let mut items = gen_ss_code(&mut snc, &ast, &prg).expect("no snc bug");
-        items.extend(crate::gen_tables::gen_tables(&mut snc, &ast, &prg));
+        items.extend(crate::snc::gen_tables::gen_tables(&mut snc, &ast, &prg));
         assert_eq!(String::from_utf8_lossy(snc.diagnostics()), "");
         assert_names_unique(&items);
     }

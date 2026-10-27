@@ -15,12 +15,12 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 
 use epics_base_rs::reference::{ReferenceTree, reference_path, reference_root};
-use epics_snc_rs::gen_code::{gen_var_decl, generate_code};
-use epics_snc_rs::gen_ss_code::{
+use epics_seq_rs::snc::gen_code::{gen_var_decl, generate_code};
+use epics_seq_rs::snc::gen_ss_code::{
     CDecl, assigned_globals, escaped_decl, escaped_var_type, variadic_fixed_args,
 };
-use epics_snc_rs::types::{Ast, Extra, NodeId, NodeTag, child};
-use epics_snc_rs::var_types::TypeKind;
+use epics_seq_rs::snc::types::{Ast, Extra, NodeId, NodeTag, child};
+use epics_seq_rs::snc::var_types::TypeKind;
 
 /// The 30 SNL programs of the module collection.
 const MODULE_PROGRAMS: &[&str] = &[
@@ -294,10 +294,8 @@ fn foreign_names(ast: &Ast) -> Foreign {
 /// The names `epics_seq_rs::c` exports, which a companion takes as they
 /// are.
 fn c_exports() -> HashSet<String> {
-    let src = std::fs::read_to_string(
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../epics-seq-rs/src/c.rs"),
-    )
-    .expect("read epics-seq-rs c.rs");
+    let src = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/c.rs"))
+        .expect("read epics-seq-rs c.rs");
     let ident = |s: &str| {
         s.trim_start()
             .split(|c: char| !c.is_alphanumeric() && c != '_')
@@ -508,7 +506,7 @@ fn delay_do_is_the_golden() {
     assert_eq!(g.diagnostics, "");
     let code = g.code;
     let golden = std::fs::read_to_string(
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../epics-seq-rs/tests/golden/delayDo.rs"),
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/delayDo.rs"),
     )
     .expect("read golden");
     if code != golden {
@@ -602,7 +600,6 @@ fn upstream_programs_type_check() {
     let _ = std::fs::remove_dir_all(root.join("programs"));
     let c = c_exports();
     let seq_rs = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../epics-seq-rs")
         .canonicalize()
         .expect("epics-seq-rs dir");
     let modules = reference_root(ReferenceTree::Modules);

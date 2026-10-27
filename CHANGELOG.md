@@ -8,6 +8,7 @@
 - libcom: `worker_pool::ObjectArenaExhausted` removed, with the per-thread VxWorks reservation overhead and mutex-object gate it reported.
 - `epics-rtems-boot`: `stats::register_task` and the VxWorks stats backend removed.
 - libcom: `runtime::socket::poll_ready(socket, want, ms: i32)` → `poll_ready(socket, want, timeout: Option<Duration>)`, `None` waiting forever and a positive timeout polling at least 1 ms.
+- `epics-snc-rs` is folded into `epics-seq-rs` as `epics_seq_rs::snc` under feature `snc`, with the `snc-rs` binary; the run-time is the default feature `runtime`. A build script takes `epics-seq-rs = { default-features = false, features = ["snc"] }` and calls `epics_seq_rs::snc::build::compile_dir`.
 
 ## v0.32.0 — 2026-10-22
 

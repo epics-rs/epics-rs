@@ -9,8 +9,8 @@
 
 use std::sync::Arc;
 
-use crate::driver::Snc;
-use crate::types::{Tok, Token};
+use crate::snc::driver::Snc;
+use crate::snc::types::{Tok, Token};
 
 const KEYWORDS: &[(&str, Tok)] = &[
     ("assign", Tok::Assign),

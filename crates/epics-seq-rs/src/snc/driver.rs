@@ -12,8 +12,8 @@ use std::path::Path;
 use epics_libcom_rs::runtime::crt_errno::strerror;
 use epics_libcom_rs::runtime::log::StagedStderr;
 
-use crate::types::{Ast, Node, Options};
-use crate::{analysis, gen_code, parser};
+use crate::snc::types::{Ast, Node, Options};
+use crate::snc::{analysis, gen_code, parser};
 
 pub const EXIT_SUCCESS: i32 = 0;
 pub const EXIT_FAILURE: i32 = 1;

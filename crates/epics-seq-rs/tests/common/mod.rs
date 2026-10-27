@@ -6,10 +6,10 @@
 
 use std::path::{Path, PathBuf};
 
-use epics_snc_rs::analysis::analyse_program;
-use epics_snc_rs::driver::Snc;
-use epics_snc_rs::parser::parse_program;
-use epics_snc_rs::types::{Ast, Program};
+use epics_seq_rs::snc::analysis::analyse_program;
+use epics_seq_rs::snc::driver::Snc;
+use epics_seq_rs::snc::parser::parse_program;
+use epics_seq_rs::snc::types::{Ast, Program};
 
 /// The command-line option sets every program is analysed under.
 pub const OPTION_SETS: [&[&str]; 3] = [&[], &["+W"], &["-w"]];

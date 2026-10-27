@@ -4,7 +4,7 @@
 //!
 //! ```no_run
 //! // build.rs
-//! epics_snc_rs::build::compile_dir("src");
+//! epics_seq_rs::snc::build::compile_dir("src");
 //! ```
 //!
 //! Programs compile with snc's default options; `option` lines inside a
@@ -18,8 +18,8 @@ use std::path::{Path, PathBuf};
 
 use epics_libcom_rs::runtime::log::StagedStderr;
 
-use crate::cpp;
-use crate::driver::{EXIT_FAILURE, Exit, Snc};
+use crate::snc::cpp;
+use crate::snc::driver::{EXIT_FAILURE, Exit, Snc};
 
 /// Compile every `*.st` directly in `dir`, in file-name order, into
 /// `$OUT_DIR/<stem>.rs`, and tell cargo to rerun on a change to the
@@ -46,7 +46,7 @@ pub fn compile(st: impl AsRef<Path>) -> PathBuf {
 
 fn out_dir() -> PathBuf {
     std::env::var_os("OUT_DIR")
-        .expect("OUT_DIR is unset: epics_snc_rs::build runs from a build script")
+        .expect("OUT_DIR is unset: epics_seq_rs::snc::build runs from a build script")
         .into()
 }
 

@@ -16,7 +16,7 @@ and the `scanProgress` sequence.
 
 `recDynLink` lives in base because the swait record runs on it too.
 `src/snl/scanProg.st` is the upstream file with its C defects fixed in
-place, each under a comment; `build.rs` compiles it with epics-snc-rs and it
+place, each under a comment; `build.rs` compiles it with snc-rs and it
 runs on epics-seq-rs.
 
 `db/` and the `.dbd` files in `dbd/` are vendored from `sscanApp/Db` and

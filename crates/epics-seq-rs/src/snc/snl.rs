@@ -3,12 +3,12 @@
 
 use std::sync::{Arc, OnceLock};
 
-use crate::driver::{Exit, Snc};
-use crate::lemon::{Assoc, Lalr, RuleSpec, Tables};
-use crate::seq_prim_types::PrimType;
-use crate::types::NodeTag::*;
-use crate::types::{Ast, NodeId, NodeTag, Token, TypeId};
-use crate::var_types::{ForeignTag, mk_decl, mk_decls};
+use crate::snc::driver::{Exit, Snc};
+use crate::snc::lemon::{Assoc, Lalr, RuleSpec, Tables};
+use crate::snc::seq_prim_types::PrimType;
+use crate::snc::types::NodeTag::*;
+use crate::snc::types::{Ast, NodeId, NodeTag, Token, TypeId};
+use crate::snc::var_types::{ForeignTag, mk_decl, mk_decls};
 
 /// A grammar symbol's value (C `YYMINORTYPE`). The `error` symbol carries
 /// the token that caused the error.
@@ -949,7 +949,7 @@ pub(crate) fn tables() -> &'static Tables {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::Tok;
+    use crate::snc::types::Tok;
 
     #[test]
     fn token_codes_are_lemon_terminal_numbers() {

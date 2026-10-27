@@ -3,10 +3,10 @@
 
 use std::sync::Arc;
 
-use crate::driver::{Exit, Snc};
-use crate::node::strtoui;
-use crate::seq_prim_types::PrimType;
-use crate::types::{Ast, Extra, NodeId, NodeTag, Tok, Token, TypeId, child};
+use crate::snc::driver::{Exit, Snc};
+use crate::snc::node::strtoui;
+use crate::snc::seq_prim_types::PrimType;
+use crate::snc::types::{Ast, Extra, NodeId, NodeTag, Tok, Token, TypeId, child};
 
 /// Implicit first parameter of every SNL function (C `NM_ENV` in
 /// `gen_code.h`).
@@ -226,7 +226,7 @@ fn add_implicit_parameters(
     Ok(ast.link_node(Some(p1), param_decls))
 }
 
-fn decl_var(ast: &Ast, decl: NodeId) -> crate::types::VarId {
+fn decl_var(ast: &Ast, decl: NodeId) -> crate::snc::types::VarId {
     ast[decl]
         .e_decl()
         .expect("declaration node without variable")

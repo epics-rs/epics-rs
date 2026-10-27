@@ -1,6 +1,6 @@
 //! Parser support routines (C `node.c`).
 
-use crate::types::{Ast, Extra, Node, NodeId, NodeTag, State, StateSet, Token, When};
+use crate::snc::types::{Ast, Extra, Node, NodeId, NodeTag, State, StateSet, Token, When};
 
 impl Ast {
     /// C `node()`: a new node with the given children, which must number

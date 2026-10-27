@@ -1,5 +1,7 @@
-//! Rust port of the EPICS sequencer run-time (sequencer R2-2-9 `src/seq`,
-//! `src/pv`) that programs compiled by snc-rs run on.
+//! Rust port of the EPICS sequencer R2-2-9: the run-time (`src/seq`,
+//! `src/pv`, feature `runtime`, the default) and the SNL compiler snc-rs
+//! (`src/snc`, module `snc` under feature `snc`), one crate as C's seq
+//! module is one module.
 //!
 //! An upstream `.st` file is unchanged. A crate's `build.rs` runs the Rust
 //! cpp and snc-rs on it and writes `$OUT_DIR/<stem>.rs`, named after the
@@ -304,33 +306,61 @@
 //! `seq_cmd.c`, `qry.rs` `seq_qry.c`, `pv.rs` `pvCa.c`. [`ChanCell`]
 //! carries the value transfer and [`c`] the `printf` family, where a null
 //! `%s` prints `(null)`, as glibc does. What one module calls in another
-//! is public and reached through [`pvt`].
+//! is public and reached through [`pvt`]. `snc` is C `src/snc` and the cpp
+//! before it; a build script takes this crate with `default-features =
+//! false, features = ["snc"]` and compiles none of the run time.
 
+#[cfg(feature = "runtime")]
 pub mod arith;
+#[cfg(feature = "runtime")]
 pub mod c;
+#[cfg(feature = "runtime")]
 mod ca;
+#[cfg(feature = "runtime")]
 mod cmd;
+#[cfg(feature = "runtime")]
 mod mac;
+#[cfg(feature = "runtime")]
 mod prog;
+#[cfg(feature = "runtime")]
 mod program;
+#[cfg(feature = "runtime")]
 pub mod pv;
+#[cfg(feature = "runtime")]
 #[doc(hidden)]
 pub mod pvt;
+#[cfg(feature = "runtime")]
 mod qry;
+#[cfg(feature = "runtime")]
 mod queue;
+#[cfg(feature = "runtime")]
 mod seq;
+#[cfg(feature = "snc")]
+pub mod snc;
+#[cfg(feature = "runtime")]
 mod state_set;
+#[cfg(feature = "runtime")]
 mod task;
+#[cfg(feature = "runtime")]
 pub mod types;
+#[cfg(feature = "runtime")]
 pub mod var;
 
+#[cfg(feature = "runtime")]
 pub use cmd::{RegisteredProgram, seq_register_sequencer_commands, seq_register_sequencer_program};
+#[cfg(feature = "runtime")]
 pub use program::*;
+#[cfg(feature = "runtime")]
 pub use qry::{SeqStats, seq_chan_show, seq_gather_stats, seq_queue_show, seq_show, seqcar};
+#[cfg(feature = "runtime")]
 pub use seq::{SeqThreadId, seq};
+#[cfg(feature = "runtime")]
 pub use state_set::{CompleteFlags, StateSet};
+#[cfg(feature = "runtime")]
 pub use task::seq_stop;
+#[cfg(feature = "runtime")]
 pub use types::*;
+#[cfg(feature = "runtime")]
 pub use var::{
     Addr, At, ChanCell, ElemKind, Field, Indexed, Place, Prim, ProgramVars, Ptr, SeqVar,
     UnionBytes, UnionMember, View, Zeroed,
@@ -338,6 +368,7 @@ pub use var::{
 
 /// Include the program snc-rs wrote for `<name>.st` to `$OUT_DIR/<name>.rs`.
 /// The companion's `seqg_escaped!` must be defined before this call.
+#[cfg(feature = "runtime")]
 #[macro_export]
 macro_rules! include_program {
     ($name:literal) => {

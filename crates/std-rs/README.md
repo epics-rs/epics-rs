@@ -54,7 +54,7 @@ output link and no device support.
 | **Sec Past Epoch** | ai | seconds past the EPICS epoch (1990), `devTimeOfDay.c`'s `devAiTodSeconds` |
 
 ### SNL Programs
-The synApps `std` module ships with two SNL (State Notation Language) programs. std-rs keeps the upstream `.st` in `src/snl/`, with C defects fixed in place under a comment; `build.rs` compiles them with epics-snc-rs and they run on epics-seq-rs:
+The synApps `std` module ships with two SNL (State Notation Language) programs. std-rs keeps the upstream `.st` in `src/snl/`, with C defects fixed in place under a comment; `build.rs` compiles them with snc-rs and they run on epics-seq-rs:
 
 - **femto** — Femto amplifier gain control. Sets the gain bits (G1–G3) and the noise bit (NO) of the selected gain.
 - **delayDo** — Generic delayed action state machine. Triggers a write after a configurable delay, with abort/restart support.
@@ -162,7 +162,7 @@ Test coverage: PID computation correctness, anti-windup, output deadband, MaxMin
   records' `Record` impls are hand-written, not derived)
 - epics-ca-rs — the `run_ca_ioc_app` entry point the example uses
 - asyn-rs — the Fast Epid device support's port I/O
-- epics-seq-rs — the run time delayDo and femto run on; epics-snc-rs compiles them in `build.rs`
+- epics-seq-rs — the run time delayDo and femto run on, and snc-rs, which compiles them in `build.rs`
 - chrono — timestamp formatting
 - tokio, tracing
 

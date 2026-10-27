@@ -51,7 +51,7 @@ The acquisition loop runs inside a `current_thread` tokio runtime created by the
 
 ### Kohzu DCM (Double Crystal Monochromator)
 
-Simulates a Kohzu-style double-crystal monochromator with optics' `kohzuCtl.st`, compiled by `epics-snc-rs` and run on `epics-seq-rs` (`seqStart("kohzuCtl", ...)` in `st.cmd`). Three `SimMotor` axes (Theta, Y, Z) are driven by the program from the energy setpoint.
+Simulates a Kohzu-style double-crystal monochromator with optics' `kohzuCtl.st`, compiled by snc-rs and run on `epics-seq-rs` (`seqStart("kohzuCtl", ...)` in `st.cmd`). Three `SimMotor` axes (Theta, Y, Z) are driven by the program from the energy setpoint.
 
 | PV | Type | Description |
 |----|------|-------------|

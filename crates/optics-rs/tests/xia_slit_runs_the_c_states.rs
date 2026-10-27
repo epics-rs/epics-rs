@@ -58,8 +58,8 @@ async fn put_hsc(rig: &Rig, pv: &str, value: &str) {
     put(&rig.db, &format!("T:hsc1:{pv}"), value).await;
 }
 
-/// Wait for init to send its last command, then give it time to read the
-/// replies.
+/// Wait for init to send its last command, then give a command that should
+/// not follow the time to show.
 async fn booted(rig: &Rig) {
     let n = BOOT_SEEN.len();
     assert!(
@@ -70,7 +70,46 @@ async fn booted(rig: &Rig) {
     quiet().await;
 }
 
-/// The program on H-1 / V-1 ([`h1`], then `setup`) after init.
+/// Wait until `new_H_RB` (`new_V_RB`) has loaded the axis's targets from
+/// init's readbacks. It runs only once the reply FIFO is empty and loads
+/// the `gap` (width, height) last, so the axis's blades must not both be
+/// at the origin.
+async fn loaded(rig: &Rig, gap: &str) {
+    let rb = format!("{gap}RB");
+    let pair = || (v(rig, gap), v(rig, &rb));
+    assert!(
+        eventually(|| {
+            let (g, rb) = pair();
+            rb != 0.0 && g == rb
+        })
+        .await,
+        "{gap}, {rb} {:?}",
+        pair()
+    );
+}
+
+/// Wait until every pv in `want` reads its value: the program puts what a
+/// reply says at no fixed time after the command.
+async fn settled(rig: &Rig, want: &[(&str, f64)]) {
+    let got = || {
+        want.iter()
+            .map(|&(pv, _)| (pv, v(rig, pv)))
+            .collect::<Vec<_>>()
+    };
+    assert!(eventually(|| got() == want).await, "{:?}", got());
+}
+
+/// Wait until errMsg reads `msg`.
+async fn said(rig: &Rig, msg: &str) {
+    assert!(
+        eventually(|| s(rig, "errMsg") == msg).await,
+        "errMsg {:?}",
+        s(rig, "errMsg")
+    );
+}
+
+/// The program on H-1 / V-1 ([`h1`], then `setup`) after init has loaded
+/// H's targets.
 async fn boot(setup: impl FnOnce(&Hsc1)) -> Rig {
     let rig = rig::start(
         &xia_slit,
@@ -84,6 +123,7 @@ async fn boot(setup: impl FnOnce(&Hsc1)) -> Rig {
     )
     .await;
     booted(&rig).await;
+    loaded(&rig, "width").await;
     rig
 }
 
@@ -93,7 +133,7 @@ fn after_boot(rig: &Rig) -> Vec<String> {
 }
 
 /// Wait until a command starting with `prefix` has been sent after init,
-/// then give the program time to read the replies.
+/// then give a command that should not follow the time to show.
 async fn sent(rig: &Rig, prefix: &str) {
     assert!(
         eventually(|| after_boot(rig).iter().any(|c| c.starts_with(prefix))).await,
@@ -213,18 +253,20 @@ async fn a_left_blade_move_sends_both_blades_and_polls_once() {
     let rig = boot(|_| {}).await;
     put_hsc(&rig, "l", "1.5").await;
     sent(&rig, "!H-1 M ").await;
+    settled(
+        &rig,
+        &[
+            ("lRB", 1.5),
+            ("rRB", 2.0),
+            ("width", 3.5),
+            ("h0", 0.25),
+            ("hBusy", 0.0),
+            ("h_Busy", 0.0),
+            ("error", 0.0),
+        ],
+    )
+    .await;
     assert_eq!(after_boot(&rig), ["!H-1 M 1400 1600", "!ALL P"]);
-    for (pv, c) in [
-        ("lRB", 1.5),
-        ("rRB", 2.0),
-        ("width", 3.5),
-        ("h0", 0.25),
-        ("hBusy", 0.0),
-        ("h_Busy", 0.0),
-        ("error", 0.0),
-    ] {
-        assert_eq!(v(&rig, pv), c, "{pv}");
-    }
     assert_eq!(s(&rig, "errMsg"), "no error");
 }
 
@@ -244,12 +286,12 @@ async fn a_right_left_axis_swaps_the_blades() {
     )
     .await;
     booted(&rig).await;
+    loaded(&rig, "width").await;
     assert_eq!((v(&rig, "lRB"), v(&rig, "rRB")), (2.0, 1.0));
     put_hsc(&rig, "l", "2.5").await;
     sent(&rig, "!H-1 M ").await;
     assert_eq!(after_boot(&rig)[0], "!H-1 M 1200 1800");
-    assert_eq!((v(&rig, "lRB"), v(&rig, "rRB")), (2.5, 1.0));
-    assert_eq!(v(&rig, "hBusy"), 0.0);
+    settled(&rig, &[("lRB", 2.5), ("rRB", 1.0), ("hBusy", 0.0)]).await;
 }
 
 #[epics_base_rs::epics_test]
@@ -258,9 +300,7 @@ async fn a_width_move_opens_both_blades_about_the_center() {
     put_hsc(&rig, "width", "4").await;
     sent(&rig, "!H-1 M ").await;
     assert_eq!(after_boot(&rig)[0], "!H-1 M 1400 1800");
-    for (pv, c) in [("l", 1.5), ("r", 2.5), ("lRB", 1.5), ("rRB", 2.5)] {
-        assert_eq!(v(&rig, pv), c, "{pv}");
-    }
+    settled(&rig, &[("l", 1.5), ("r", 2.5), ("lRB", 1.5), ("rRB", 2.5)]).await;
 }
 
 /// With the outer limit at 4000, l.HOPR is 8. A target of 9 is within the
@@ -294,18 +334,20 @@ async fn locate_reply(reply: &str, error: f64, msg: &str, h_busy: f64, l_rb: f64
     rig.hsc.reply_to("!ALL P", reply);
     put_hsc(&rig, "locate", "1").await;
     sent(&rig, "!ALL P").await;
-    assert_eq!(v(&rig, "error"), error, "{reply:?}");
-    assert_eq!(s(&rig, "errMsg"), msg, "{reply:?}");
-    for (pv, c) in [
-        ("hBusy", h_busy),
-        ("vBusy", 0.0),
-        ("lRB", l_rb),
-        ("rRB", r_rb),
-        ("h_Busy", 0.0),
-        ("v_Busy", 0.0),
-    ] {
-        assert_eq!(v(&rig, pv), c, "{reply:?} {pv}");
-    }
+    settled(
+        &rig,
+        &[
+            ("error", error),
+            ("hBusy", h_busy),
+            ("vBusy", 0.0),
+            ("lRB", l_rb),
+            ("rRB", r_rb),
+            ("h_Busy", 0.0),
+            ("v_Busy", 0.0),
+        ],
+    )
+    .await;
+    said(&rig, msg).await;
 }
 
 #[epics_base_rs::epics_test]
@@ -399,8 +441,8 @@ async fn an_error_code_that_does_not_scan_after_a_refusal_is_unknown() {
     rig.hsc.reply_to("!ALL P", "%H-1 ERROR; x");
     put_hsc(&rig, "locate", "1").await;
     sent(&rig, "!ALL P").await;
+    said(&rig, "H-1: unknown error").await;
     assert_eq!(v(&rig, "error"), 15.0);
-    assert_eq!(s(&rig, "errMsg"), "H-1: unknown error");
 }
 
 #[epics_base_rs::epics_test]
@@ -452,16 +494,18 @@ async fn a_queued_done_for_the_moving_axis_is_processed() {
     rig.hsc.send(" %H-1 1000 1700 DONE;");
     put_hsc(&rig, "l", "1.5").await;
     sent(&rig, "!H-1 M ").await;
+    settled(
+        &rig,
+        &[
+            ("lRB", 0.5),
+            ("rRB", 2.25),
+            ("hBusy", 1.0),
+            ("h_Busy", 1.0),
+            ("l", 1.5),
+        ],
+    )
+    .await;
     assert_eq!(after_boot(&rig)[..2], ["!H-1 M 1400 1600", "!ALL P"]);
-    for (pv, c) in [
-        ("lRB", 0.5),
-        ("rRB", 2.25),
-        ("hBusy", 1.0),
-        ("h_Busy", 1.0),
-        ("l", 1.5),
-    ] {
-        assert_eq!(v(&rig, pv), c, "{pv}");
-    }
 }
 
 #[epics_base_rs::epics_test]
@@ -469,7 +513,7 @@ async fn stop_kills_every_axis() {
     let rig = boot(|_| {}).await;
     put_hsc(&rig, "stop", "1").await;
     sent(&rig, "!ALL K").await;
-    assert_eq!(v(&rig, "stop"), 0.0);
+    settled(&rig, &[("stop", 0.0)]).await;
 }
 
 /// `0 I` sets both motors of every module to their origin.
@@ -478,10 +522,12 @@ async fn calibrate_zeroes_every_axis() {
     let rig = boot(|_| {}).await;
     put_hsc(&rig, "calib", "1").await;
     sent(&rig, "!ALL 0 I").await;
+    settled(
+        &rig,
+        &[("calib", 0.0), ("lRB", 0.0), ("rRB", 0.0), ("l", 0.0)],
+    )
+    .await;
     assert_eq!(after_boot(&rig)[..2], ["!ALL 0 I", "!ALL P"]);
-    for (pv, c) in [("calib", 0.0), ("lRB", 0.0), ("rRB", 0.0), ("l", 0.0)] {
-        assert_eq!(v(&rig, pv), c, "{pv}");
-    }
 }
 
 /// `"%*s %*s %d"` reads `600;` as 600, so the low limit is (0 - 600) / 400.
@@ -502,8 +548,8 @@ async fn an_origin_reply_scans_up_to_its_semicolon() {
     }
     put_hsc(&rig, "l", "-1.1").await;
     sent(&rig, "!H-1 M ").await;
+    settled(&rig, &[("l", -1.0), ("lRB", -1.0)]).await;
     assert_eq!(after_boot(&rig), ["!H-1 M 200 1600", "!ALL P"]);
-    assert_eq!((v(&rig, "l"), v(&rig, "lRB")), (-1.0, -1.0));
     assert_eq!(v(&rig, "error"), 0.0);
     assert_eq!(s(&rig, "errMsg"), "no error");
 }
@@ -537,24 +583,29 @@ async fn an_origin_reply_that_does_not_scan_keeps_the_template_limits() {
     assert_eq!(s(&rig, "errMsg"), "no error");
     put_hsc(&rig, "r", "15").await;
     sent(&rig, "!H-1 M ").await;
+    settled(&rig, &[("r", 10.0), ("rRB", 10.0)]).await;
     assert_eq!(after_boot(&rig), ["!H-1 M 1200 4400", "!ALL P"]);
-    assert_eq!((v(&rig, "r"), v(&rig, "rRB")), (10.0, 10.0));
     assert_eq!(v(&rig, "error"), 0.0);
 }
 
 /// `n` modules, H-1 first and V-1 last, so each `!ALL P` gets `n` replies.
 /// Init reads the `K` and `P` replies of every module in one go, `2n` of
 /// them, which wraps the FIFO and loses H-1's position. Both blades
-/// therefore read 0 after init. Then both axes move on the controller and
-/// a locate is read.
+/// therefore read 0 after init. V-1's reply, at 2 and 3, is the last one
+/// processed. Then both axes move on the controller and a locate is read.
 async fn fifo(n: usize) -> Rig {
     let ids: Vec<String> = std::iter::once("H-1".to_string())
         .chain((1..n - 1).map(|k| format!("X{k:02}")))
         .chain(std::iter::once("V-1".to_string()))
         .collect();
     let ids: Vec<&str> = ids.iter().map(String::as_str).collect();
-    let rig = rig::start(&xia_slit, "xia_slit.db", &ids, h1, IDS).await;
+    let setup = |hsc: &Hsc1| {
+        h1(hsc);
+        hsc.set("V-1", |m| (m.a, m.b) = (1200, 1600));
+    };
+    let rig = rig::start(&xia_slit, "xia_slit.db", &ids, setup, IDS).await;
     booted(&rig).await;
+    loaded(&rig, "height").await;
     assert_eq!((v(&rig, "lRB"), v(&rig, "rRB")), (0.0, 0.0));
     rig.hsc.set("H-1", |m| (m.a, m.b) = (2000, 2400));
     rig.hsc.set("V-1", |m| (m.a, m.b) = (800, 1200));
@@ -567,9 +618,11 @@ async fn fifo(n: usize) -> Rig {
 #[epics_base_rs::epics_test]
 async fn one_reply_short_of_the_fifo_size_is_read_in_full() {
     let rig = fifo(39).await;
-    for (pv, c) in [("lRB", 3.0), ("rRB", 4.0), ("tRB", 1.0), ("bRB", 2.0)] {
-        assert_eq!(v(&rig, pv), c, "{pv}");
-    }
+    settled(
+        &rig,
+        &[("lRB", 3.0), ("rRB", 4.0), ("tRB", 1.0), ("bRB", 2.0)],
+    )
+    .await;
 }
 
 /// The 40th reply moves the write index back onto the read index, so the
@@ -577,7 +630,7 @@ async fn one_reply_short_of_the_fifo_size_is_read_in_full() {
 #[epics_base_rs::epics_test]
 async fn fifo_size_replies_are_all_lost() {
     let rig = fifo(40).await;
-    for (pv, c) in [("lRB", 0.0), ("rRB", 0.0), ("tRB", 0.0), ("bRB", 0.0)] {
+    for (pv, c) in [("lRB", 0.0), ("rRB", 0.0), ("tRB", 2.0), ("bRB", 3.0)] {
         assert_eq!(v(&rig, pv), c, "{pv}");
     }
     assert_eq!(v(&rig, "error"), 0.0);
@@ -684,10 +737,8 @@ async fn one_reply_clears_a_comm_error() {
     rig.hsc.reply_to("!ALL P", "%H-1 1600 2000 DONE;");
     rig.hsc.set_silent(false);
     locate(&rig).await;
-    assert!(eventually(|| v(&rig, "error") == 0.0).await);
-    quiet().await;
+    settled(&rig, &[("error", 0.0), ("lRB", 2.0), ("rRB", 3.0)]).await;
     assert_eq!(s(&rig, "errMsg"), "no error");
-    assert_eq!((v(&rig, "lRB"), v(&rig, "rRB")), (2.0, 3.0));
 }
 
 const CHILD: &str = "XIA_SLIT_DEBUG_CHILD";

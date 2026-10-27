@@ -73,21 +73,13 @@ mod exec_model {
 
     /// A port with nothing listening on it, for the name server the default
     /// build is pointed at — the compiled-in SLIRP address is part of the
-    /// probe rig, so a clean build must be told where to dial.
-    ///
-    /// This one keeps the probe-and-drop shape on purpose: what it wants is
-    /// the ABSENCE of a listener, and absence is the one property no bind can
-    /// reserve — a socket held open to keep the number would be the very
-    /// listener the dial must not find. A steal here cannot fail the test the
-    /// way a stolen server port does; it can only make the IOC's dial reach a
-    /// stranger instead of being refused, and what is asserted is that the
-    /// dial happens at all.
+    /// probe rig, so a clean build must be told where to dial. Held for the
+    /// whole run by a socket that never listens, so the dial is refused and
+    /// no stranger can take the number and answer.
     #[cfg(not(feature = "bringup-probes"))]
     fn closed_port() -> u16 {
-        let tcp = std::net::TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral TCP port");
-        let port = tcp.local_addr().unwrap().port();
-        drop(tcp);
-        port
+        static HOLD: std::sync::OnceLock<named_port::HeldPort> = std::sync::OnceLock::new();
+        HOLD.get_or_init(named_port::HeldPort::closed_tcp).port
     }
 
     /// The record set the IOC reports, or `None` while that report is still

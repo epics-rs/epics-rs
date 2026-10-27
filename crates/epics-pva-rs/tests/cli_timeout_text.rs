@@ -15,16 +15,13 @@
 use std::process::Command;
 
 fn run(exe: &str, args: &[&str]) -> (i32, String) {
-    // A number nobody answers on, so every search goes unanswered.
-    let port = std::net::UdpSocket::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
+    // A number nobody answers on, held so no stranger binds it while the
+    // tool runs, so every search goes unanswered.
+    let closed = named_port::HeldPort::closed_udp();
     let out = Command::new(exe)
         .args(args)
         .env("EPICS_PVA_AUTO_ADDR_LIST", "NO")
-        .env("EPICS_PVA_ADDR_LIST", format!("127.0.0.1:{port}"))
+        .env("EPICS_PVA_ADDR_LIST", format!("127.0.0.1:{}", closed.port))
         .env_remove("EPICS_PVA_NAME_SERVERS")
         .output()
         .expect("run CLI");

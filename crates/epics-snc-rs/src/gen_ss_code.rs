@@ -2721,7 +2721,7 @@ impl<'a> Gen<'a> {
     }
 
     /// `base[index]`, or `*base` for no index: `at` of an array or
-    /// `string` place, else the [`seqg_rt::Ptr`] `base` is, moved by `index`.
+    /// `string` place, else the `seqg_rt::Ptr` `base` is, moved by `index`.
     fn deref(&mut self, base: NodeId, index: Option<NodeId>) -> Place {
         if let Some(elem) = self.array_elem(base) {
             let place = self.place(base);

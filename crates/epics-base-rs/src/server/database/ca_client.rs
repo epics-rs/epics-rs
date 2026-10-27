@@ -269,7 +269,7 @@ impl InProcessChannel {
 /// lowest priority above its own thread's. Entries reach their callbacks
 /// one at a time in post order, on that thread or in [`Self::deliver`],
 /// each after the runs of the context's puts going when it is taken
-/// ([`Running`]). The thread returns when the last clone
+/// (`Running`). The thread returns when the last clone
 /// drops (`db_close_events`).
 #[derive(Clone, Default)]
 pub struct InProcessEvents(Arc<EventsOwner>);

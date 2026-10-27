@@ -1245,7 +1245,7 @@ impl GroupChannel {
     /// pvxs converts the incoming leaf to `dbChannelFinalFieldType`, the
     /// field's DECLARED type, so this must be the type the descriptor
     /// advertised, not the variant the record happens to store: the same
-    /// [`View::served_type`] the descriptor path above takes, and `Double`
+    /// [`View::served_type`](pvif::View::served_type) the descriptor path above takes, and `Double`
     /// only when the record/field is unknown.
     fn member_dbf_type(&self, member: &MemberChannel) -> DbFieldType {
         self.db

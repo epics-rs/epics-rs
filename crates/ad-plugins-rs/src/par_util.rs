@@ -49,7 +49,7 @@ fn takes_at_least(elements: usize, ps_per_element: usize, min_us: usize) -> bool
 }
 
 /// `f(i)` for each `i` in `0..n`, returned in order of `i`, by the calling
-/// thread and the [`thread_pool`] workers that start while indices remain.
+/// thread and the `thread_pool` workers that start while indices remain.
 ///
 /// The caller claims indices from the first, so the pass never waits for a
 /// worker to wake: one that starts after the last claim does nothing, and

@@ -14148,7 +14148,7 @@ pub(crate) enum ReadPolicy<'a> {
         own: Option<(&'a RecordCell, OwnRecord<'a>)>,
     },
     /// A read owed to a set, served by its holder for the reader
-    /// ([`OwedDbGet::serve`]): a record the holder has borrowed for writing
+    /// ([`OwedRead::serve`](super::OwedRead::serve)): a record the holder has borrowed for writing
     /// is refused, `own` aside, since the borrow is the holder's own and the
     /// read is not.
     Served {

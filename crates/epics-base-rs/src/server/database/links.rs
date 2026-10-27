@@ -135,7 +135,7 @@ pub(crate) type Converted = Result<EpicsValue, ReadLeft>;
 /// What a failed array read left in the reader's buffer: C's `dbGet`
 /// converts in place, so the elements before the one that failed are
 /// written whatever the status. Handed beside the failure, not inside
-/// [`LinkFetch`], to the caller that lands it in the reader.
+/// [`LinkFetch`](crate::server::recgbl::simm::LinkFetch), to the caller that lands it in the reader.
 pub(crate) type ReadLeft = Option<Box<EpicsValue>>;
 
 /// An array convert into the reader's buffer `dest`, in place as

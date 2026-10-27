@@ -1,6 +1,6 @@
 //! `EpicsValue` → pvData as the qsrv bridge serves it and a PVA link puts
 //! it. Here rather than in `epics-bridge-rs::convert`, which re-exports
-//! both, because [`crate::pvalink`] puts through it.
+//! both, because `crate::pvalink` puts through it.
 
 use epics_base_rs::types::EpicsValue;
 

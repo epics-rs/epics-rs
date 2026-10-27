@@ -7,7 +7,7 @@
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use epics_base_rs::error::{CaError, CaResult};
 use epics_base_rs::server::database::{ProcStack, PvDatabase};
@@ -103,11 +103,22 @@ impl Rig {
             .unwrap();
     }
 
-    /// Refreshes counted across `ms` of wall clock.
-    async fn refreshes_over(&self, ms: u64) -> u32 {
-        let before = self.refreshes.load(Ordering::Relaxed);
-        epics_base_rs::runtime::task::sleep(Duration::from_millis(ms)).await;
-        self.refreshes.load(Ordering::Relaxed) - before
+    /// Waits for `n` more refreshes. Not a count over a fixed window: macOS
+    /// coalesces the timer thread's 10 ms wait up to ~80 ms late (C's
+    /// `pthread_cond_timedwait` alike), while a tokio window is not stretched.
+    async fn refreshes(&self, n: u32, msg: &str) {
+        let target = self.refreshes.load(Ordering::Relaxed) + n;
+        until(|| self.refreshes.load(Ordering::Relaxed) >= target, msg).await;
+    }
+}
+
+/// Polls `done` until it holds, failing with `msg` at a deadline no timer
+/// coalescing reaches.
+async fn until(done: impl Fn() -> bool, msg: &str) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !done() {
+        assert!(Instant::now() < deadline, "{msg}");
+        epics_base_rs::runtime::task::sleep(Duration::from_millis(5)).await;
     }
 }
 
@@ -119,12 +130,10 @@ fn arm(ms: u64, callback: DelayedCallback) -> ProcessAction {
 async fn arming_one_callback_leaves_another_pending() {
     let rig = Rig::new().await;
     rig.process(vec![arm(10, REFRESH)]).await;
-    assert!(rig.refreshes_over(50).await > 0);
+    rig.refreshes(1, "the refresh runs").await;
     rig.process(vec![arm(5000, START)]).await;
-    assert!(
-        rig.refreshes_over(150).await >= 5,
-        "the START arm left the refresh running"
-    );
+    rig.refreshes(5, "the START arm left the refresh running")
+        .await;
 }
 
 #[epics_macros_rs::epics_test]
@@ -133,10 +142,11 @@ async fn cancelling_one_callback_leaves_another_pending() {
     rig.process(vec![arm(10, REFRESH), arm(100, START)]).await;
     rig.process(vec![ProcessAction::CancelDelayedCallback(START)])
         .await;
-    assert!(
-        rig.refreshes_over(200).await >= 5,
-        "cancelling START left the refresh running"
-    );
+    // Each refresh is due 10 ms after the last fired, so the 15th is due past
+    // START's 100 ms on the one deadline-ordered timer queue: a START the
+    // cancel missed has fired before it.
+    rig.refreshes(15, "cancelling START left the refresh running")
+        .await;
     assert_eq!(rig.starts.load(Ordering::Relaxed), 0, "START was cancelled");
 }
 
@@ -152,6 +162,10 @@ async fn rearming_a_callback_restarts_only_its_own_timer() {
         0,
         "the re-arm replaced the first timer"
     );
-    epics_base_rs::runtime::task::sleep(Duration::from_millis(120)).await;
+    until(
+        || rig.starts.load(Ordering::Relaxed) > 0,
+        "the re-armed START fires",
+    )
+    .await;
     assert_eq!(rig.starts.load(Ordering::Relaxed), 1);
 }

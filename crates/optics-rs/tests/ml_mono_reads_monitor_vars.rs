@@ -1,6 +1,6 @@
 //! ml_monoCtl reads autoMode and ccMode as C's monitored variables, written
 //! as each monitor arrives (ml_monoCtl.st:55-64, no efflag), and its
-//! updateSet state set ties UseSet to the motor .SET fields (:1262-1305).
+//! updateSet state set ties UseSet to the motor .SET fields (:1275-1318).
 
 use epics_base_rs::runtime::task;
 use epics_base_rs::server::database::PvDatabase;
@@ -133,7 +133,7 @@ async fn idle(db: &PvDatabase, ack: &str, msg1: &str) {
 }
 
 /// Run `posts` once the sequencer has passed waitForCmndEnter's efClears
-/// (ml_monoCtl.st:564-607): OperAck sends it there, and the enter's `opAck = 0` follows them.
+/// (ml_monoCtl.st:575-619): OperAck sends it there, and the enter's `opAck = 0` follows them.
 /// Its puts are queued, so no record lock can hold it inside the enter.
 async fn post_after_enter(db: &PvDatabase, posts: impl FnOnce(&PvDatabase)) {
     idle(db, "M:ml_monoOperAck", "M:ml_monoSeqMsg1").await;
@@ -206,7 +206,7 @@ async fn theta_driven_to(ioc: &PvDatabase, want: f64) {
     );
 }
 
-/// OperAck 0 makes no waitForCmnd clause true (ml_monoCtl.st:705), so the
+/// OperAck 0 makes no waitForCmnd clause true (ml_monoCtl.st:717), so the
 /// state set stays put and the E put that follows drives theta as in C.
 #[epics_base_rs::epics_test]
 async fn an_oper_ack_0_leaves_the_e_put_after_it() {
@@ -255,13 +255,12 @@ async fn a_theta_readback_of_0_holds_init_in_chk_motor_limits() {
 }
 
 /// The yOffset initSequence puts, `atof(Y_OFF)` or 35 outside [1, 60]
-/// (ml_monoCtl.st:521-532). updatePsuedo puts the y readback on its first
-/// monitor (:1217-1219), so y reads 20, which no case gives, and of the two
+/// (ml_monoCtl.st:531-541). updatePsuedo puts the y readback on its first
+/// monitor (:1229-1232), so y reads 20, which no case gives, and of the two
 /// posts the one that is not 20 is initSequence's; MDEL -1 posts it when it
-/// equals the DOL's 1. Two 20s mean updatePsuedo wrote the shared variable
-/// between initSequence's assignment and its put, as C's threads can, and
-/// leave nothing to check. th at 0 then holds the sequence in
-/// chkMotorLimits.
+/// equals the DOL's 1. updatePsuedo writing yOffset between initSequence's
+/// assignment and its put, as C's threads can, no longer turns that put
+/// into a second 20. th at 0 then holds the sequence in chkMotorLimits.
 async fn y_offset_is(y_off: &str, want: f64) {
     let mdel = [("M:ml_mono_yOffset.MDEL", -1.0)];
     let (ioc, _scan) = ioc_with([0.0, 10.0, 20.0, 100.0], &mdel).await;
@@ -276,7 +275,7 @@ async fn y_offset_is(y_off: &str, want: f64) {
         seen.push(v);
     }
     assert!(
-        seen.len() == 2 && seen.iter().all(|v| *v == 20.0 || *v == want),
+        seen.len() == 2 && seen.contains(&20.0) && seen.contains(&want),
         "Y_OFF={y_off:?} posted {seen:?}, want {want} and 20"
     );
 }
@@ -314,6 +313,62 @@ async fn y_off_atof_skips_a_leading_space() {
 #[epics_base_rs::epics_test]
 async fn a_y_off_with_no_number_is_35() {
     y_offset_is("mm", 35.0).await;
+}
+
+/// Store `rbv` as M:y's readback and post it, as the driver would.
+fn post_y_rbv(ioc: &PvDatabase, rbv: f64) {
+    let rec = ioc.get_record("M:y").unwrap();
+    let mut inst = rec.write();
+    inst.record
+        .as_any_mut()
+        .and_then(|a| a.downcast_mut::<motor_rs::MotorRecord>())
+        .unwrap()
+        .pos
+        .rbv = rbv;
+    inst.notify_field("RBV", EventMask::VALUE | EventMask::LOG);
+}
+
+/// updatePsuedo puts each y readback as yOffset (ml_monoCtl.st:1229-1232).
+/// The previous readback's yOffset event landing between a pass's
+/// assignment and its put must not be put in the new readback's place. th
+/// at 0 holds the main state set in chkMotorLimits, whose waitForCmndEnter
+/// would put the readback again.
+#[epics_base_rs::epics_test]
+async fn a_y_readback_is_put_over_the_previous_ones_event() {
+    let (ioc, _scan) = boot([0.0, 10.0, 35.0, 100.0]).await;
+    settled(&ioc, "Theta Readback of 0 not reasonable").await;
+    // The boot's own yOffset puts and their events land first.
+    task::sleep(Duration::from_secs(1)).await;
+    post_y_rbv(&ioc, 40.0);
+    wait_near(&ioc, "M:ml_mono_yOffset", 40.0).await;
+    post_y_rbv(&ioc, 45.0);
+    wait_near(&ioc, "M:ml_mono_yOffset", 45.0).await;
+}
+
+/// waitForCmndEnter puts the y readback as yOffset (ml_monoCtl.st:588-590),
+/// 0.1 s after the opAck arm. A yOffset post landing between that
+/// assignment and its put must not be put in the readback's place; the
+/// next enter, after the post's yOffset arm, would put the readback again.
+#[epics_base_rs::epics_test]
+async fn a_y_offset_post_during_the_enter_leaves_the_readback() {
+    let (ioc, _scan) = boot([10.0, 10.0, 35.0, 100.0]).await;
+    settled(&ioc, "y offset changed to 35.000000").await;
+    idle(&ioc, "M:ml_monoOperAck", "M:ml_monoSeqMsg1").await;
+    // A post before the opAck arm would wake the yOffset arm ahead of it.
+    ioc.get_record("M:ml_monoSeqMsg1")
+        .unwrap()
+        .write()
+        .record
+        .put_field("VAL", EpicsValue::String("-".into()))
+        .unwrap();
+    optics_rs::db_access::DbChannel::new(&ioc, "M:ml_monoOperAck")
+        .put_f64_process(1.0)
+        .await
+        .unwrap();
+    settled(&ioc, " ").await;
+    post(&ioc, "M:ml_mono_yOffset", EpicsValue::Double(50.0));
+    wait_near(&ioc, "M:ml_monoOperAck", 0.0).await;
+    assert_eq!(f64_of(&ioc, "M:ml_mono_yOffset").await, 35.0);
 }
 
 /// A motor macro the command line leaves out takes the program's default
@@ -368,7 +423,7 @@ async fn e_move_speeds(presets: &[(&str, f64)], want: impl Fn(f64, f64) -> [f64;
 }
 
 /// Theta at VELO 0, as speed control leaves it after a move without theta
-/// travel, takes zero time (ml_monoCtl.st:913-916): Z is the slower, so it
+/// travel, takes zero time (ml_monoCtl.st:925-928): Z is the slower, so it
 /// keeps its speed and theta gets its travel over Z's time. C took an
 /// infinite thTime and put 0 into every VELO.
 #[epics_base_rs::epics_test]
@@ -392,7 +447,7 @@ async fn a_zero_z_speed_takes_no_time() {
 
 /// Readbacks at the yOffset pass's own theta and Z leave both motors
 /// nothing to do, so thTime is 0: Put keeps Z's speed, where C put 0/0, a
-/// NaN, into its VELO (ml_monoCtl.st:921-925). th.VELO stays only if the
+/// NaN, into its VELO (ml_monoCtl.st:933-937). th.VELO stays only if the
 /// pass took that thTime >= zTime branch.
 #[epics_base_rs::epics_test]
 async fn a_put_with_nothing_to_do_keeps_the_motor_speeds() {
@@ -494,7 +549,7 @@ fn trace_of(test: &str) -> Vec<String> {
 }
 
 /// With ml_monoCtlDebug set, an E put in manual mode prints C's lines
-/// (ml_monoCtl.st:669-672, :824-956, :564-618).
+/// (ml_monoCtl.st:681-684, :836-968, :575-630).
 #[epics_base_rs::epics_test]
 async fn debug_prints_c_lines() {
     if std::env::var_os(CHILD).is_none() {

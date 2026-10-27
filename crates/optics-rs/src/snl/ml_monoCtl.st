@@ -442,6 +442,16 @@ assign  yOffsetHi to "{P}ml_mono_yOffset.DRVH";
 double  yOffsetLo;
 assign  yOffsetLo to "{P}ml_mono_yOffset.DRVL";
 
+/* C defect: put yOffset itself, which is monitored and which both state
+ * sets assign, so a yOffset event or the other state set's assignment
+ * landing between an assignment and its put was put in its place. The
+ * readback mirrors put yMotRdbkEcho; initSequence puts yOffsetInit. */
+double  yMotRdbkEcho;
+assign  yMotRdbkEcho to "{P}ml_mono_yOffset";
+
+double  yOffsetInit;
+assign  yOffsetInit to "{P}ml_mono_yOffset";
+
 %%#include <string.h>
 %%#include <math.h>
 %%#include <stdlib.h>
@@ -518,16 +528,17 @@ state initSequence {
 
 		/* We're going to use the y motor readback for yOffset */
 		ml_monoCtl_pmacY_OFF = seq_macValueGet(ssId,"Y_OFF");
-		yOffset = atof(ml_monoCtl_pmacY_OFF);
-		if ((yOffset < 1) ||  (yOffset > 60.))
-			yOffset = 35.;
+		yOffsetInit = atof(ml_monoCtl_pmacY_OFF);
+		if ((yOffsetInit < 1) ||  (yOffsetInit > 60.))
+			yOffsetInit = 35.;
 
 		ml_monoCtl_pmacGEOM = seq_macValueGet(ssId,"GEOM");
 		geom = 1;
 		/* if (*ml_monoCtl_pmacGEOM == '2') geom = 2; */
 }%
 
-		pvPut(yOffset);
+		yOffset = yOffsetInit;
+		pvPut(yOffsetInit);
 		if (geom == 1) {
 		}
 		pvPut(thetaMotName);
@@ -575,7 +586,8 @@ state waitForCmndEnter {
 		zMotRdbkEcho = zMotRdbk;
 		pvPut(zMotRdbkEcho);
 		yOffset = yMotRdbk;
-		pvPut(yOffset);
+		yMotRdbkEcho = yMotRdbk;
+		pvPut(yMotRdbkEcho);
 		thetaMotVelEcho = thSpeed;
 		pvPut(thetaMotVelEcho);
 		theta2MotVelEcho = th2Speed;
@@ -1216,7 +1228,8 @@ state update {
 
 	when (efTestAndClear(yMotRdbk_mon)) {
 		yOffset = yMotRdbk;
-		pvPut(yOffset);
+		yMotRdbkEcho = yMotRdbk;
+		pvPut(yMotRdbkEcho);
 	} state update
 
 	when (efTestAndClear(thetaMotVel_mon)) {

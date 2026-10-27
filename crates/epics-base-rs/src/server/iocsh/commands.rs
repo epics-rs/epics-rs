@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::ffi::{c_long, c_short};
 
 use super::registry::*;
 use crate::calc::engine::string::escaped_from_raw;
@@ -3642,11 +3643,11 @@ fn cmd_gft() -> CommandDef {
 /// `abc` — leaves the rung out. That asymmetry is the whole reason `pft REC
 /// 12.7` prints seven rows and `pft REC abc` prints one.
 ///
-/// The scan is glibc's ([`crate::runtime::scanf::sscanf`]), so `%hd` wraps
-/// into a `short` and `%ld` keeps every bit of the `long` the caller
-/// truncates to `dbr_long_t`.
-fn c_scan_int(s: &[u8], fmt: &[u8]) -> Option<i64> {
-    let v = std::cell::Cell::new(0i64);
+/// The scan is glibc's ([`crate::runtime::scanf::sscanf`]) into C's
+/// `shortvalue` or `longvalue`, so `%hd` wraps into a `short` and `%ld` keeps
+/// every bit of the `long` the caller truncates to `dbr_long_t`.
+fn c_scan<T: crate::runtime::scanf::ScanNum + Default>(s: &[u8], fmt: &[u8]) -> Option<T> {
+    let v = std::cell::Cell::new(T::default());
     (crate::runtime::scanf::sscanf(s, fmt, &[&v]) == 1).then(|| v.get())
 }
 
@@ -3683,7 +3684,7 @@ fn print_c_stream(ctx: &CommandContext, stream: &str) {
 /// * every rung after the first is guarded by whether the argument scans as
 ///   that C type, and the integer rungs use `sscanf` while the two float
 ///   rungs use `epicsScanFloat`, so `12.7` takes all seven rungs and `12.7`
-///   with a trailing letter takes five (see [`c_scan_int`]);
+///   with a trailing letter takes five (see [`c_scan`]);
 /// * a channel exporting as `DBR_STRING` or `DBR_ENUM` stops after the first
 ///   rung and does NOT print C's closing blank line, which only the full
 ///   ladder reaches.
@@ -3776,17 +3777,17 @@ fn cmd_pft() -> CommandDef {
                 return Ok(CommandOutcome::Continue);
             }
 
-            if let Some(v) = c_scan_int(value, b"%hd") {
+            if let Some(v) = c_scan::<c_short>(value, b"%hd") {
                 rung(
                     &mut out,
                     &mut chan,
                     DBR_SHORT,
-                    EpicsValue::Short(v as i16),
+                    EpicsValue::Short(v),
                     "\n\t SHORT failed ",
                     "\n\t SHORT GET failed",
                 );
             }
-            if let Some(v) = c_scan_int(value, b"%ld") {
+            if let Some(v) = c_scan::<c_long>(value, b"%ld") {
                 // C puts `&longvalue` as a `dbr_long_t`, i.e. reads the low 32
                 // bits of a 64-bit `long` on this ABI.
                 rung(
@@ -3825,7 +3826,7 @@ fn cmd_pft() -> CommandDef {
                     "\n\t DOUBLE GET failed",
                 );
             }
-            if let Some(v) = c_scan_int(value, b"%hd") {
+            if let Some(v) = c_scan::<c_short>(value, b"%hd") {
                 // `charvalue = (unsigned char) shortvalue`, and `dbr_char_t`
                 // is `epicsUInt8` — the wire's DBR_CHAR is unsigned even
                 // though the DBF_CHAR it shares a name with is not (see
@@ -3834,7 +3835,7 @@ fn cmd_pft() -> CommandDef {
                     &mut out,
                     &mut chan,
                     DBR_CHAR,
-                    EpicsValue::UChar(v as i16 as u8),
+                    EpicsValue::UChar(v as u8),
                     "\n\t CHAR failed ",
                     "\n\t CHAR GET failed",
                 );
@@ -3844,7 +3845,7 @@ fn cmd_pft() -> CommandDef {
                     &mut out,
                     &mut chan,
                     DBR_ENUM,
-                    EpicsValue::Enum(v as i16 as u16),
+                    EpicsValue::Enum(v as u16),
                     "\n\t ENUM failed ",
                     "\n\t ENUM GET failed",
                 );
@@ -9867,12 +9868,13 @@ record(lso, "SOD") { field(SIZV, "128") }
     #[test]
     fn pft_scans_into_c_short_and_long() {
         assert_eq!(
-            c_scan_int(b"9007199254740993", b"%ld"),
-            Some(9007199254740993)
+            c_scan::<c_long>(b"9007199254740993", b"%ld"),
+            Some(9007199254740993i64 as c_long)
         );
-        assert_eq!(c_scan_int(b"70000", b"%hd"), Some(4464));
-        assert_eq!(c_scan_int(b"0b11", b"%hd"), Some(0));
-        assert_eq!(c_scan_int(b"abc", b"%ld"), None);
+        assert_eq!(c_scan::<c_short>(b"70000", b"%hd"), Some(4464));
+        assert_eq!(c_scan::<c_short>(b"-1", b"%hd"), Some(-1));
+        assert_eq!(c_scan::<c_short>(b"0b11", b"%hd"), Some(0));
+        assert_eq!(c_scan::<c_long>(b"abc", b"%ld"), None);
     }
 
     /// C `pft` (`db_test.c:85-186`) on a numeric field.

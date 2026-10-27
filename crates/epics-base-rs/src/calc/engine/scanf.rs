@@ -15,12 +15,12 @@
 //! the object table; the directives and conversions are glibc's, in
 //! [`crate::runtime::scanf`].
 
-use std::cell::Cell;
-use std::ffi::{c_long, c_ulong};
+use std::cell::{Cell, RefCell};
+use std::ffi::{c_int, c_long, c_short, c_ulong, c_ushort};
 
 use super::error::CalcError;
-use super::value::StackValue;
-use crate::runtime::scanf::{self, ScanTarget, Scanned};
+use super::value::{SCALC_STRING_SIZE, StackValue};
+use crate::runtime::scanf::{self, ScanNum};
 
 /// C's `strpbrk(s, "pwn$c[deEfgGiousxX")` set — every byte that can end a
 /// conversion specification, including the four sCalc then refuses.
@@ -129,68 +129,107 @@ fn find_sub(h: &[u8], n: &[u8]) -> Option<usize> {
 ///
 /// The format goes to glibc's `sscanf` whole, with the one object C picks
 /// and, after it, the argument C did not pass: the greedy `%%` skip can leave
-/// a second live conversion, which glibc counts.
+/// a second live conversion, which glibc counts. Whichever conversion is
+/// assigned writes its own type's bytes into the object, as in C.
 pub fn sscanf(input: &[u8], fmt: &[u8]) -> Result<StackValue, CalcError> {
     let cc = find_conversion_indicator(fmt).ok_or(CalcError::InvalidFormat)?;
-    // C's `switch (*s)` on `s[-1]`.
-    let object = match (fmt[cc], fmt[cc - 1]) {
-        (b'd' | b'i', b'h') => Object::Short,
-        (b'd' | b'i', b'l') => Object::Long,
-        (b'd' | b'i', _) => Object::Int,
-        (b'o' | b'u' | b'x' | b'X', b'h') => Object::UShort,
-        (b'o' | b'u' | b'x' | b'X', _) => Object::ULong,
-        (b'e' | b'E' | b'f' | b'g' | b'G', b'l') => Object::Double,
-        (b'e' | b'E' | b'f' | b'g' | b'G', _) => Object::Float,
-        (b'c' | b'[' | b's', _) => Object::Text,
+    let num = |v: f64| Ok(StackValue::Double(v));
+    // C's `switch (*s)` on `s[-1]`, into `h`, `l`, `j`, `ui`, `ul`, `ps->d`,
+    // `f` and `tmpstr`.
+    match (fmt[cc], fmt[cc - 1]) {
+        (b'd' | b'i', b'h') => num(scanned::<c_short>(input, fmt)?.into()),
+        (b'd' | b'i', b'l') => num(scanned::<c_long>(input, fmt)? as f64),
+        (b'd' | b'i', _) => num(scanned::<c_int>(input, fmt)?.into()),
+        (b'o' | b'u' | b'x' | b'X', b'h') => num(scanned::<c_ushort>(input, fmt)?.into()),
+        (b'o' | b'u' | b'x' | b'X', _) => num(scanned::<c_ulong>(input, fmt)? as f64),
+        (b'e' | b'E' | b'f' | b'g' | b'G', b'l') => num(scanned::<f64>(input, fmt)?),
+        (b'e' | b'E' | b'f' | b'g' | b'G', _) => num(scanned::<f32>(input, fmt)?.into()),
+        (b'c' | b'[' | b's', _) => {
+            // C's is `char[1000]`; `strNcpy(ps->s, tmpstr, SCALC_STRING_SIZE-1)`
+            // (`:1684`) reads no further than this.
+            let tmpstr = RefCell::new([0; SCALC_STRING_SIZE]);
+            if scanf::sscanf(input, fmt, &[&tmpstr, &()]) != 1 {
+                return Err(CalcError::InvalidFormat);
+            }
+            Ok(StackValue::str_ncpy(tmpstr.into_inner()))
+        }
         // `default`, `p`, `w`, `n` and `$` all `return(-1)` before any input
         // is looked at.
-        _ => return Err(CalcError::InvalidFormat),
-    };
-    let target = Target {
-        object,
-        value: Cell::new(None),
-    };
-    if scanf::sscanf(input, fmt, &[&target, &()]) != 1 {
+        _ => Err(CalcError::InvalidFormat),
+    }
+}
+
+/// The object scanned from zero. C zeroes `h`, `l` and `j` per SSCANF but
+/// leaves `ui`, `f` and `tmpstr` stale and `ul` holding an earlier op's
+/// bytes, which a narrower conversion leaves in place; that is not copied.
+fn scanned<T: ScanNum + Default>(input: &[u8], fmt: &[u8]) -> Result<T, CalcError> {
+    let object = Cell::new(T::default());
+    if scanf::sscanf(input, fmt, &[&object, &()]) != 1 {
         return Err(CalcError::InvalidFormat);
     }
-    target.value.take().ok_or(CalcError::InvalidFormat)
+    Ok(object.get())
 }
 
-/// sCalc's output object: `h`, `l`, `j`, `ui`, `ul`, `ps->d`, `f`, `tmpstr`.
-#[derive(Clone, Copy)]
-enum Object {
-    Short,
-    Long,
-    Int,
-    UShort,
-    ULong,
-    Double,
-    Float,
-    Text,
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-struct Target {
-    object: Object,
-    value: Cell<Option<StackValue>>,
-}
+    fn num(v: f64) -> Option<StackValue> {
+        Some(StackValue::Double(v))
+    }
 
-impl ScanTarget for Target {
-    fn store(&self, value: Scanned<'_>) {
-        let value = match (self.object, value) {
-            (Object::Short, Scanned::Int(v)) => StackValue::Double(v as i16 as f64),
-            (Object::Long, Scanned::Int(v)) => StackValue::Double(v as c_long as f64),
-            (Object::Int, Scanned::Int(v)) => StackValue::Double(v as i32 as f64),
-            (Object::UShort, Scanned::UInt(v)) => StackValue::Double(v as u16 as f64),
-            (Object::ULong, Scanned::UInt(v)) => StackValue::Double(v as c_ulong as f64),
-            (Object::Double, Scanned::Double(v)) => StackValue::Double(v),
-            (Object::Float, Scanned::Double(v)) => StackValue::Double(v as f32 as f64),
-            // `strNcpy(ps->s, tmpstr, SCALC_STRING_SIZE-1)` (`:1684`).
-            (Object::Text, Scanned::Str(b) | Scanned::Chars(b)) => StackValue::str_ncpy(b),
-            // The greedy `%%` skip handed the object to a conversion of
-            // another kind: C puns it through the vararg (UB), which is not
-            // copied; the object stays unset and SSCANF fails.
-            _ => return,
-        };
-        self.value.set(Some(value));
+    fn text(s: &[u8]) -> Option<StackValue> {
+        Some(StackValue::str_ncpy(s))
+    }
+
+    /// Against glibc 2.43 running sCalc's SSCANF case verbatim on zeroed
+    /// objects: (input, format, result), `None` being CALC_ALARM.
+    fn check(rows: &[(&[u8], &str, Option<StackValue>)]) {
+        let failed: Vec<String> = rows
+            .iter()
+            .filter_map(|(input, fmt, want)| {
+                let got = sscanf(input, fmt.as_bytes()).ok();
+                (&got != want)
+                    .then(|| format!("{fmt} \"{}\": C {want:?}, rs {got:?}", input.escape_ascii()))
+            })
+            .collect();
+        assert!(failed.is_empty(), "{}", failed.join("\n"));
+    }
+
+    #[cfg(target_endian = "little")]
+    #[test]
+    fn a_conversion_stores_its_own_width_into_cs_object() {
+        check(&[
+            (b"200", "%hhd", num(200.0)),
+            (b"128", "%hhd", num(128.0)),
+            (b"-1", "%hhd", num(255.0)),
+            (b"300", "%hhd", num(44.0)),
+            (b"-1", "%hhi", num(255.0)),
+            (b"0x1ff", "%hhi", num(255.0)),
+            (b"-1", "%hd", num(-1.0)),
+            (b"-1", "%hhu", num(255.0)),
+            (b"1ff", "%hhx", num(255.0)),
+            (b"-1", "%hho", num(255.0)),
+            (b"-1", "%hu", num(65535.0)),
+            (b"-1", "%d", num(-1.0)),
+            (b"-1", "%ld", num(-1.0)),
+            (b"-1", "%lld", num(-1.0)),
+            (b"-1", "%jd", num(-1.0)),
+            (b"-1", "%x", num(4294967295.0)),
+            (b"-1", "%lx", num(c_ulong::MAX as f64)),
+            (b"-1", "%llx", num(c_ulong::MAX as f64)),
+            (b"1.5", "%f", num(1.5)),
+            (b"1.5", "%lf", num(1.5)),
+            (b"abc", "%c", text(b"a")),
+            (b"abc", "%3c", text(b"abc")),
+            (b"abc", "%s", text(b"abc")),
+            (b"abc1", "%[a-z]", text(b"abc")),
+            // The greedy `%%` skip hands the object to a conversion of
+            // another type, whose bytes glibc stores into it.
+            (b"1.5", "%f%%%d", num(1.5f32.to_bits() as f64)),
+            (b"7", "%d%%%f", num(f32::from_bits(7) as f64)),
+            (b"ab", "%s%%%d", num(i32::from_le_bytes(*b"ab\0\0") as f64)),
+            (b"7", "%d%%%s", text(b"\x07")),
+        ]);
     }
 }

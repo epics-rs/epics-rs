@@ -599,10 +599,9 @@ pub fn epicsSnprintf(dst: impl CDst, size: usize, fmt: impl CSrc, args: &[CArg<'
 use epics_libcom_rs::runtime::scanf::{self, ScanNum};
 pub use epics_libcom_rs::runtime::scanf::{ScanTarget, Scanned};
 
-/// A variable type `sscanf` stores into. A number converts to it; a string
-/// goes to a string, bounded by it, and `%c`'s bytes to a string or, the
-/// first of them, to a number. Any other pairing leaves the variable as it
-/// was, where C writes the value's bytes over it.
+/// A variable type `sscanf` stores into: a conversion writes its own type's
+/// bytes over the variable's, whatever the variable's type, and those past
+/// its end are dropped where C writes on.
 pub trait ScanStore {
     fn store(&mut self, value: Scanned<'_>);
 }
@@ -611,9 +610,7 @@ macro_rules! scan_store_num {
     ($($t:ty),*) => {
         $(impl ScanStore for $t {
             fn store(&mut self, value: Scanned<'_>) {
-                if let Some(v) = <$t as ScanNum>::from_scanned(value) {
-                    *self = v;
-                }
+                *self = self.stored(&value);
             }
         })*
     };
@@ -621,26 +618,15 @@ macro_rules! scan_store_num {
 
 scan_store_num!(i8, u8, i16, u16, i32, u32, i64, u64, f32, f64);
 
-fn scan_store_bytes(buf: &mut [u8], value: Scanned<'_>) {
-    match value {
-        Scanned::Str(b) => put_terminated(buf, 0, b),
-        Scanned::Chars(b) => {
-            let n = b.len().min(buf.len());
-            buf[..n].copy_from_slice(&b[..n]);
-        }
-        _ => {}
-    }
-}
-
 impl ScanStore for SeqString {
     fn store(&mut self, value: Scanned<'_>) {
-        scan_store_bytes(self.bytes_mut(), value)
+        value.write_over(self.bytes_mut())
     }
 }
 
 impl<const N: usize> ScanStore for [c_char; N] {
     fn store(&mut self, value: Scanned<'_>) {
-        scan_store_bytes(self.bytes_mut(), value)
+        value.write_over(self.bytes_mut())
     }
 }
 
@@ -1172,6 +1158,14 @@ mod tests {
         same_as_glibc_scan!("-1 4294967296", "%lu %llx", c_ulong, u64);
         same_as_glibc_scan!("(nil) (NIL) 0x1234 (ni", "%p %p %p %p", u64, u64, u64, u64);
         same_as_glibc_scan!("(nil)", "%4p", u64);
+        // A conversion stores its own width, whatever the variable's type.
+        same_as_glibc_scan!("200 -1 1ff", "%hhd %hhi %hhx", i16, i32, u16);
+        same_as_glibc_scan!("-1 70000", "%hd %hu", i32, i64);
+        same_as_glibc_scan!("-1 -1", "%d %u", i64, f64);
+        same_as_glibc_scan!("1.5 2.5", "%f %lf", f64, i32);
+        same_as_glibc_scan!("ab 7", "%s %d", i32, S);
+        same_as_glibc_scan!("abcdef", "%s", [c_char; 4]);
+        same_as_glibc_scan!("xyz", "%2c", i32);
         // Floats.
         for input in [
             "1.5",
@@ -1393,25 +1387,25 @@ mod tests {
     }
 
     #[test]
-    fn scan_stores_convert_to_the_variable() {
+    fn a_conversion_writes_its_bytes_over_the_variable() {
         let n = <SeqVar<[i16; 2]>>::zeroed();
-        n.at(1).store(Scanned::Int(70000));
-        n.at(0).store(Scanned::Chars(b"AB"));
-        assert_eq!(n.get(), [65, 4464]);
-        n.at(0).store(Scanned::Str(b"9"));
-        assert_eq!(n.get()[0], 65);
+        assert_eq!(sscanf("70000 AB", "%d %2c", &[&n.at(1), &n.at(0)]), 2);
+        let low = |v: i32| i16::from_ne_bytes([v.to_ne_bytes()[0], v.to_ne_bytes()[1]]);
+        assert_eq!(n.get(), [i16::from_ne_bytes(*b"AB"), low(70000)]);
+        assert_eq!(sscanf("9", "%s", &[&n.at(0)]), 1);
+        assert_eq!(n.get()[0], i16::from_ne_bytes(*b"9\0"));
         let x = <SeqVar<f32>>::zeroed();
-        x.store(Scanned::Double(0.1));
+        assert_eq!(sscanf("0.1", "%f", &[&x]), 1);
         assert_eq!(x.get(), 0.1f32);
         let s = <SeqVar<[c_char; 4]>>::zeroed();
-        s.store(Scanned::Str(b"abcdef"));
-        assert_eq!(text(&s), b"abc");
-        s.store(Scanned::Chars(b"xy"));
-        assert_eq!(text(&s), b"xyc");
-        s.store(Scanned::UInt(7));
-        assert_eq!(text(&s), b"xyc");
+        assert_eq!(sscanf("abcdef", "%s", &[&s]), 1);
+        assert_eq!(text(&s), b"abcd");
+        assert_eq!(sscanf("xy", "%2c", &[&s]), 1);
+        assert_eq!(text(&s), b"xycd");
+        assert_eq!(sscanf("7", "%d", &[&s]), 1);
+        assert_eq!(text(&s), b"\x07");
         let t = <SeqVar<[SeqString; 2]>>::zeroed();
-        t.at(1).store(Scanned::Str(b"m1"));
+        assert_eq!(sscanf("m1", "%s", &[&t.at(1)]), 1);
         assert_eq!(t.at(1).to_c_vec(), b"m1");
     }
 

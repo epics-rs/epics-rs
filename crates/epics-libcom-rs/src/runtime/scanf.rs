@@ -5,21 +5,62 @@
 //! `_GNU_SOURCE` selects the C23 entry point, so `%b` reads binary and `%i`
 //! and `%b` take a `0b` prefix as `%i` and `%x` take `0x`.
 
-use std::cell::Cell;
-use std::ffi::c_int;
+use std::cell::{Cell, RefCell};
+use std::ffi::{c_int, c_long, c_longlong, c_short};
 
 use super::stdlib;
-use crate::cfmt::Length;
 
-/// A value `sscanf` converted, at the width of its C type.
-pub enum Scanned<'a> {
-    Int(i64),
-    UInt(u64),
-    Double(f64),
-    /// `%s` and `%[`, which the store terminates.
-    Str(&'a [u8]),
-    /// `%c`, stored without a terminator.
-    Chars(&'a [u8]),
+/// What a conversion stores: the bytes glibc writes through its pointer, of
+/// the type the length modifier names whatever the object pointed to is.
+pub struct Scanned<'a>(Repr<'a>);
+
+enum Repr<'a> {
+    /// A number's object representation, its first `.1` bytes.
+    Num([u8; 8], usize),
+    /// `%c`'s bytes, or `%s`'s and `%[`'s and a terminator after them.
+    Bytes(&'a [u8], bool),
+}
+
+impl Scanned<'_> {
+    /// Writes the stored bytes over `object` from its first byte, as through
+    /// C's pointer; those past its end are dropped, where C writes on.
+    pub fn write_over(&self, object: &mut [u8]) {
+        match self.0 {
+            Repr::Num(b, n) => put(object, 0, &b[..n]),
+            Repr::Bytes(b, terminated) => {
+                put(object, 0, b);
+                if terminated {
+                    put(object, b.len(), &[0]);
+                }
+            }
+        }
+    }
+}
+
+/// As much of `bytes` as fits at `object[at..]`.
+fn put(object: &mut [u8], at: usize, bytes: &[u8]) {
+    let Some(room) = object.get_mut(at..) else {
+        return;
+    };
+    let n = bytes.len().min(room.len());
+    room[..n].copy_from_slice(&bytes[..n]);
+}
+
+fn num(b: &[u8]) -> Scanned<'static> {
+    let mut a = [0; 8];
+    a[..b.len()].copy_from_slice(b);
+    Scanned(Repr::Num(a, b.len()))
+}
+
+/// `v` stored as a `size`-byte C integer: its low bytes.
+fn int(v: u64, size: usize) -> Scanned<'static> {
+    let b = v.to_ne_bytes();
+    let low = if cfg!(target_endian = "big") {
+        8 - size
+    } else {
+        0
+    };
+    num(&b[low..low + size])
 }
 
 /// An `sscanf` destination: C's pointer argument.
@@ -27,24 +68,19 @@ pub trait ScanTarget {
     fn store(&self, value: Scanned<'_>);
 }
 
-/// A C number type `sscanf` stores into: a number converts to it as C's
-/// cast does, `%c` stores its first byte, and a string leaves it as it was,
-/// where C writes the bytes over it.
+/// A C number type `sscanf` stores into.
 pub trait ScanNum: Copy {
-    fn from_scanned(value: Scanned<'_>) -> Option<Self>;
+    /// `self` with `value`'s bytes written over it.
+    fn stored(self, value: &Scanned<'_>) -> Self;
 }
 
 macro_rules! scan_num {
     ($($t:ty),*) => {
         $(impl ScanNum for $t {
-            fn from_scanned(value: Scanned<'_>) -> Option<Self> {
-                Some(match value {
-                    Scanned::Int(v) => v as $t,
-                    Scanned::UInt(v) => v as $t,
-                    Scanned::Double(v) => v as $t,
-                    Scanned::Chars(b) => b[0] as $t,
-                    Scanned::Str(_) => return None,
-                })
+            fn stored(self, value: &Scanned<'_>) -> Self {
+                let mut b = self.to_ne_bytes();
+                value.write_over(&mut b);
+                Self::from_ne_bytes(b)
             }
         })*
     };
@@ -54,9 +90,14 @@ scan_num!(i8, u8, i16, u16, i32, u32, i64, u64, f32, f64);
 
 impl<T: ScanNum> ScanTarget for Cell<T> {
     fn store(&self, value: Scanned<'_>) {
-        if let Some(v) = T::from_scanned(value) {
-            self.set(v);
-        }
+        self.set(self.get().stored(&value));
+    }
+}
+
+/// A C `char` array.
+impl<const N: usize> ScanTarget for RefCell<[u8; N]> {
+    fn store(&self, value: Scanned<'_>) {
+        value.write_over(&mut *self.borrow_mut());
     }
 }
 
@@ -65,6 +106,43 @@ impl<T: ScanNum> ScanTarget for Cell<T> {
 /// it, so `sscanf(s, "%d %d", &one)` returns 2 as glibc does.
 impl ScanTarget for () {
     fn store(&self, _: Scanned<'_>) {}
+}
+
+/// The C type a length modifier names, as glibc reads it: an integer
+/// conversion stores it, a float one stores a `double` for `Long` and a
+/// `long double` for `LongLong`, and `c`, `s` and `[` with either store
+/// `wchar_t`.
+#[derive(Clone, Copy)]
+enum Modifier {
+    Char,
+    Short,
+    Int,
+    Long,
+    LongLong,
+}
+
+impl Modifier {
+    /// `j`, `z` and `t`: the first of `int`, `long` and `long long` as wide
+    /// as their type.
+    fn of_size(size: usize) -> Self {
+        if size > size_of::<c_long>() {
+            Self::LongLong
+        } else if size > size_of::<c_int>() {
+            Self::Long
+        } else {
+            Self::Int
+        }
+    }
+
+    fn size(self) -> usize {
+        match self {
+            Self::Char => 1,
+            Self::Short => size_of::<c_short>(),
+            Self::Int => size_of::<c_int>(),
+            Self::Long => size_of::<c_long>(),
+            Self::LongLong => size_of::<c_longlong>(),
+        }
+    }
 }
 
 /// glibc's `inchar` and `ungetc` over a string; `None` is `EOF`.
@@ -340,16 +418,6 @@ fn scan_set(fmt: &[u8], f: &mut usize) -> Option<([bool; 256], bool)> {
     }
 }
 
-/// C's cast of a signed conversion's `long` to its type.
-fn narrow_int(v: i64, length: Length) -> i64 {
-    match length {
-        Length::None => v as i32 as i64,
-        Length::H => v as i16 as i64,
-        Length::Hh => v as i8 as i64,
-        _ => v,
-    }
-}
-
 /// The C string in `b`: the bytes before its first NUL.
 fn c_str(b: &[u8]) -> &[u8] {
     b.iter().position(|&c| c == 0).map_or(b, |n| &b[..n])
@@ -413,15 +481,17 @@ pub fn sscanf(input: impl AsRef<[u8]>, fmt: impl AsRef<[u8]>, out: &[&dyn ScanTa
             width = -1;
         }
         let twice = |c| fmt.get(f + 1) == Some(&c);
-        let length;
-        (length, f) = match fmt.get(f) {
-            Some(b'h') if twice(b'h') => (Length::Hh, f + 2),
-            Some(b'h') => (Length::H, f + 1),
-            Some(b'l') if twice(b'l') => (Length::Ll, f + 2),
-            Some(b'l') => (Length::L, f + 1),
-            Some(b'q' | b'L') => (Length::Ll, f + 1),
-            Some(b'j' | b'z' | b't') => (Length::J, f + 1),
-            _ => (Length::None, f),
+        let modifier;
+        (modifier, f) = match fmt.get(f) {
+            Some(b'h') if twice(b'h') => (Modifier::Char, f + 2),
+            Some(b'h') => (Modifier::Short, f + 1),
+            Some(b'l') if twice(b'l') => (Modifier::LongLong, f + 2),
+            Some(b'l') => (Modifier::Long, f + 1),
+            Some(b'q' | b'L') => (Modifier::LongLong, f + 1),
+            Some(b'j') => (Modifier::of_size(size_of::<i64>()), f + 1),
+            Some(b'z') => (Modifier::of_size(size_of::<usize>()), f + 1),
+            Some(b't') => (Modifier::of_size(size_of::<isize>()), f + 1),
+            _ => (Modifier::Int, f),
         };
         let Some(&conv) = fmt.get(f) else {
             return done;
@@ -431,7 +501,7 @@ pub fn sscanf(input: impl AsRef<[u8]>, fmt: impl AsRef<[u8]>, out: &[&dyn ScanTa
             r.skip_space();
             skip_space = false;
         }
-        let wide = matches!(length, Length::L | Length::Ll | Length::J);
+        let wide = matches!(modifier, Modifier::Long | Modifier::LongLong);
         let value: Result<Option<Scanned<'_>>, Stop> = (|| match conv {
             b'%' => match r.inchar() {
                 None => Err(Stop::Input),
@@ -441,7 +511,7 @@ pub fn sscanf(input: impl AsRef<[u8]>, fmt: impl AsRef<[u8]>, out: &[&dyn ScanTa
                     Err(Stop::Conv)
                 }
             },
-            b'n' => Ok(Some(Scanned::Int(narrow_int(r.at as i64, length)))),
+            b'n' => Ok(Some(int(r.at as u64, modifier.size()))),
             b'c' if !wide => {
                 let start = r.at;
                 r.inchar().ok_or(Stop::Input)?;
@@ -452,7 +522,7 @@ pub fn sscanf(input: impl AsRef<[u8]>, fmt: impl AsRef<[u8]>, out: &[&dyn ScanTa
                         break;
                     }
                 }
-                let chars = Scanned::Chars(&input[start..r.at]);
+                let chars = Scanned(Repr::Bytes(&input[start..r.at], false));
                 if width > 0 {
                     // Short of `width`: glibc has stored what it read, then
                     // fails the input. glibc before 2.42 counted the
@@ -483,7 +553,7 @@ pub fn sscanf(input: impl AsRef<[u8]>, fmt: impl AsRef<[u8]>, out: &[&dyn ScanTa
                     }
                     c = r.inchar();
                 }
-                Ok(Some(Scanned::Str(&input[start..r.at])))
+                Ok(Some(Scanned(Repr::Bytes(&input[start..r.at], true))))
             }
             b'[' if !wide => {
                 let (set, not_in) = scan_set(fmt, &mut f).ok_or(Stop::Conv)?;
@@ -511,7 +581,7 @@ pub fn sscanf(input: impl AsRef<[u8]>, fmt: impl AsRef<[u8]>, out: &[&dyn ScanTa
                 if r.at == start {
                     return Err(Stop::Conv);
                 }
-                Ok(Some(Scanned::Str(&input[start..r.at])))
+                Ok(Some(Scanned(Repr::Bytes(&input[start..r.at], true))))
             }
             b'd' | b'i' | b'o' | b'u' | b'x' | b'X' | b'b' | b'p' => {
                 let base = match conv {
@@ -521,61 +591,61 @@ pub fn sscanf(input: impl AsRef<[u8]>, fmt: impl AsRef<[u8]>, out: &[&dyn ScanTa
                     b'b' => 2,
                     _ => 16,
                 };
+                // A pointer is a `long`.
+                let size = if conv == b'p' {
+                    size_of::<c_long>()
+                } else {
+                    modifier.size()
+                };
                 let start = r.at;
                 let Some(base) = scan_int(&mut r, &mut width, base, conv == b'p')? else {
-                    return Ok(Some(Scanned::UInt(0)));
+                    return Ok(Some(int(0, size)));
                 };
                 let text = &input[start..r.at];
-                let length = if conv == b'p' { Length::L } else { length };
-                Ok(Some(if matches!(conv, b'd' | b'i') {
-                    let v = match length {
-                        Length::Ll | Length::J => stdlib::strtoll(text, base).0,
-                        _ => i128::from(stdlib::strtol(text, base).0) as i64,
-                    };
-                    Scanned::Int(narrow_int(v, length))
-                } else {
-                    let v = match length {
-                        Length::Ll | Length::J => stdlib::strtoull(text, base).0,
-                        _ => u128::from(stdlib::strtoul(text, base).0) as u64,
-                    };
-                    Scanned::UInt(match length {
-                        Length::None => v as u32 as u64,
-                        Length::H => v as u16 as u64,
-                        Length::Hh => v as u8 as u64,
-                        _ => v,
-                    })
-                }))
+                let long_long = size > size_of::<c_long>();
+                let v = match (matches!(conv, b'd' | b'i'), long_long) {
+                    (true, true) => stdlib::strtoll(text, base).0 as u64,
+                    (true, false) => i128::from(stdlib::strtol(text, base).0) as u64,
+                    (false, true) => stdlib::strtoull(text, base).0,
+                    (false, false) => u128::from(stdlib::strtoul(text, base).0) as u64,
+                };
+                Ok(Some(int(v, size)))
             }
             b'e' | b'E' | b'f' | b'F' | b'g' | b'G' | b'a' | b'A' => {
                 let start = r.at;
                 scan_float(&mut r, &mut width)?;
                 let text = &input[start..r.at];
+                let float = !matches!(modifier, Modifier::Long | Modifier::LongLong);
                 // `strtof` rounds the decimal once, as `parse` does; the hex
                 // and `nan(...)` forms `parse` refuses go through `strtod`.
-                if let Some(v) = (length == Length::None)
+                if let Some(v) = float
                     .then(|| std::str::from_utf8(text).ok()?.parse::<f32>().ok())
                     .flatten()
                     .filter(|v| !v.is_nan())
                 {
-                    return Ok(Some(Scanned::Double(v as f64)));
+                    return Ok(Some(num(&v.to_ne_bytes())));
                 }
                 let d = stdlib::strtod(text);
                 if d.len == 0 {
                     return Err(Stop::Conv);
                 }
-                Ok(Some(Scanned::Double(match length {
+                Ok(Some(if !float {
+                    // There is no `strtold`: a `long double` is stored as
+                    // the `double`.
+                    num(&d.value.to_ne_bytes())
+                } else if d.value.is_nan() {
                     // `strtof` puts a `nan(...)` payload below its own quiet
                     // bit.
-                    Length::None if d.value.is_nan() => {
-                        let b = d.value.to_bits();
-                        let sign = (b >> 32) as u32 & 0x8000_0000;
-                        f32::from_bits(sign | 0x7fc0_0000 | b as u32 & 0x3f_ffff) as f64
-                    }
-                    // A hex float rounds to a double first, the same as
-                    // `strtof` below 54 significant bits.
-                    Length::None => d.value as f32 as f64,
-                    _ => d.value,
-                })))
+                    let b = d.value.to_bits();
+                    let sign = (b >> 32) as u32 & 0x8000_0000;
+                    num(&f32::from_bits(sign | 0x7fc0_0000 | b as u32 & 0x3f_ffff).to_ne_bytes())
+                } else {
+                    // A hex float rounds to a double and then to a float,
+                    // where `strtof` rounds once: the two differ when the
+                    // double lands on a float tie, so `0x1.fffffefffffffffp0`
+                    // is 2 here and `0x1.fffffep0` in C.
+                    num(&(d.value as f32).to_ne_bytes())
+                }))
             }
             _ => Err(Stop::Conv),
         })();
@@ -715,18 +785,113 @@ mod tests {
         assert_eq!(sscanf("1 % 2", "%d %% %i", &[&a, &b]), 2);
         assert_eq!((a.get(), b.get()), (1, 2));
         assert_eq!(sscanf("1 x", "%d %% %i", &[&a, &b]), 1);
-        struct Text(Cell<usize>);
-        impl ScanTarget for Text {
-            fn store(&self, value: Scanned<'_>) {
-                if let Scanned::Chars(b) | Scanned::Str(b) = value {
-                    self.0.set(b.len());
-                }
-            }
-        }
-        let t = Text(Cell::new(0));
+        let t = RefCell::new([b'x'; 4]);
         assert_eq!(sscanf("ab", "%3c", &[&t]), -1);
-        assert_eq!(t.0.get(), 2);
-        assert_eq!(sscanf("ab\0cd", "%s", &[&t]), 1);
-        assert_eq!(t.0.get(), 2);
+        assert_eq!(&*t.borrow(), b"abxx");
+        assert_eq!(sscanf("cd\0ef", "%s", &[&t]), 1);
+        assert_eq!(&*t.borrow(), b"cd\0x");
+    }
+
+    /// What `sscanf(input, fmt, p)` returns and writes at `p`, as the glibc
+    /// probe prints it: a byte is written iff it comes out the same over a
+    /// 0xaa and a 0x55 fill, and an unwritten one before the last written
+    /// prints as `..`.
+    fn stores(input: &[u8], fmt: &str) -> (c_int, String) {
+        let run = |fill| {
+            let p = RefCell::new([fill; 24]);
+            (sscanf(input, fmt, &[&p]), p.into_inner())
+        };
+        let ((n, a), (m, b)) = (run(0xaa), run(0x55));
+        assert_eq!(n, m, "{fmt:?}");
+        let end = (0..a.len())
+            .rev()
+            .find(|&i| a[i] == b[i])
+            .map_or(0, |i| i + 1);
+        let bytes = (0..end)
+            .map(|i| match a[i] == b[i] {
+                true => format!("{:02x}", a[i]),
+                false => "..".into(),
+            })
+            .collect();
+        (n, bytes)
+    }
+
+    fn check_stores(rows: &[(&str, &[u8], c_int, &str)]) {
+        let failed: Vec<String> = rows
+            .iter()
+            .filter_map(|&(fmt, input, n, bytes)| {
+                let got = stores(input, fmt);
+                (got != (n, bytes.into())).then(|| {
+                    format!(
+                        "{fmt} \"{}\": C {n} {bytes}, rs {got:?}",
+                        input.escape_ascii()
+                    )
+                })
+            })
+            .collect();
+        assert!(failed.is_empty(), "{}", failed.join("\n"));
+    }
+
+    /// A conversion stores the type its length modifier names, whatever the
+    /// object: (format, input, return, bytes), measured with glibc 2.43 on
+    /// x86_64.
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    #[test]
+    fn a_conversion_stores_its_own_width() {
+        check_stores(&[
+            ("%hhd", b"200", 1, "c8"),
+            ("%hhd", b"128", 1, "80"),
+            ("%hhd", b"-1", 1, "ff"),
+            ("%hhd", b"300", 1, "2c"),
+            ("%hhd", b"-129", 1, "7f"),
+            ("%hhi", b"0x80", 1, "80"),
+            ("%hhi", b"0b11111111", 1, "ff"),
+            ("%hhu", b"255", 1, "ff"),
+            ("%hhu", b"256", 1, "00"),
+            ("%hhu", b"-1", 1, "ff"),
+            ("%hhx", b"1ff", 1, "ff"),
+            ("%hho", b"777", 1, "ff"),
+            ("%hhb", b"111111111", 1, "ff"),
+            ("%hd", b"70000", 1, "7011"),
+            ("%hu", b"-1", 1, "ffff"),
+            ("%d", b"99999999999", 1, "ffe77648"),
+            ("%u", b"-1", 1, "ffffffff"),
+            ("%ld", b"-2", 1, "feffffffffffffff"),
+            ("%lld", b"-2", 1, "feffffffffffffff"),
+            ("%jd", b"-2", 1, "feffffffffffffff"),
+            ("%zd", b"-2", 1, "feffffffffffffff"),
+            ("%td", b"-2", 1, "feffffffffffffff"),
+            ("%qd", b"-2", 1, "feffffffffffffff"),
+            ("%Ld", b"-2", 1, "feffffffffffffff"),
+            ("abc%hhn", b"abc", 0, "03"),
+            ("abc%hn", b"abc", 0, "0300"),
+            ("abc%n", b"abc", 0, "03000000"),
+            ("abc%ln", b"abc", 0, "0300000000000000"),
+            ("abc%lln", b"abc", 0, "0300000000000000"),
+            ("abc%jn", b"abc", 0, "0300000000000000"),
+            ("abc%zn", b"abc", 0, "0300000000000000"),
+            ("%p", b"0x10", 1, "1000000000000000"),
+            ("%p", b"(nil)", 1, "0000000000000000"),
+            ("%f", b"1.5", 1, "0000c03f"),
+            ("%hf", b"1.5", 1, "0000c03f"),
+            ("%hhf", b"1.5", 1, "0000c03f"),
+            ("%lf", b"1.5", 1, "000000000000f83f"),
+            ("%jf", b"1.5", 1, "000000000000f83f"),
+            ("%zf", b"1.5", 1, "000000000000f83f"),
+            ("%tf", b"1.5", 1, "000000000000f83f"),
+            ("%f", b"-nan(5)", 1, "0500c0ff"),
+            ("%lf", b"-nan(5)", 1, "050000000000f8ff"),
+            ("%c", b"abc", 1, "61"),
+            ("%3c", b"abc", 1, "616263"),
+            ("%3c", b"ab", -1, "6162"),
+            ("%s", b"abc", 1, "61626300"),
+            ("%3s", b"abcdef", 1, "61626300"),
+            ("%[a-z]", b"abc1", 1, "61626300"),
+            ("%*s", b"abc", 0, ""),
+            ("%hlc", b"a", 0, ""),
+            ("%s", b"a\xe9b", 1, "61e96200"),
+            ("%c", b"\xe9", 1, "e9"),
+            ("%[^,]", b"a\xe9b,", 1, "61e96200"),
+        ]);
     }
 }

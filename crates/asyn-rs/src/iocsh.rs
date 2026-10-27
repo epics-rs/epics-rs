@@ -5770,11 +5770,31 @@ mod tests {
 
     /// The FTDI port thread runs on C's 500000-byte stack
     /// (drvAsynFTDIPort.cpp:590), not the Medium class every other driver's 0
-    /// gives. Measured from outside: the stack mapping that holds the parked
-    /// thread's stack pointer.
-    #[cfg(target_os = "linux")]
+    /// gives. Read on the port thread from its own pthread attribute: the
+    /// /proc/self/maps mapping holding its stack pointer is not its stack
+    /// under glibc 2.43, whose MADV_GUARD_INSTALL guards leave adjacent thread
+    /// stacks one mapping. Needs a process of its own, as nextest gives it:
+    /// glibc serves a request from a cached stack up to 4x its size, such as
+    /// another test's freed 1 MiB one.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
     #[test]
     fn iocsh_ftdi_port_thread_runs_on_c_s_500000_byte_stack() {
+        use crate::request::{CellBody, PortCalls, Unrun};
+        use std::sync::mpsc;
+
+        struct StackProbe(mpsc::SyncSender<(Option<String>, Option<usize>)>);
+        impl CellBody for StackProbe {
+            fn process(&self, _port: &mut dyn PortCalls) {
+                let thread = std::thread::current().name().map(str::to_owned);
+                let bytes = epics_libcom_rs::runtime::task::current_thread_stack_bytes();
+                self.0.send((thread, bytes)).unwrap();
+            }
+            fn unrun(&self, why: Unrun) {
+                panic!("the stack probe did not run: {why:?}");
+            }
+            fn done(self: Arc<Self>) {}
+        }
+
         let cmd = drv_asyn_ftdi_port_configure_command(PortServices::new());
         let ctx = make_ctx();
         let result = cmd.handler.call(
@@ -5790,45 +5810,23 @@ mod tests {
             &ctx,
         );
         assert!(result.is_ok(), "command failed: {:?}", result.err());
-        let got = parked_thread_stack_bytes("ftdi_stack");
+        let port = crate::registry::get_port("ftdi_stack").unwrap().handle;
+        let (tx, rx) = mpsc::sync_channel(1);
+        let cell = port.new_cell(Arc::new(StackProbe(tx)));
+        // Connect priority: the port never connects (noAutoConnect, no hardware).
+        let user = AsynUser::new(0).with_priority(crate::port::QueuePriority::Connect);
+        port.queue_request(&cell, &user).unwrap();
+        let (thread, got) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(
+            thread.as_deref(),
+            Some("ftdi_stack"),
+            "probe off the port thread"
+        );
+        let got = got.expect("pthread_getattr_np readback");
         assert!(
-            (500_000..500_000 + 64 * 1024).contains(&got),
+            got + 64 > 500_000 && got < 500_000 + 64 * 1024,
             "the FTDI port thread has a {got}-byte stack, C asks for 500000"
         );
-    }
-
-    /// Size of the mapping holding the stack pointer of the thread named
-    /// `name`, read while it is parked in a syscall.
-    #[cfg(target_os = "linux")]
-    fn parked_thread_stack_bytes(name: &str) -> usize {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        let tid = std::fs::read_dir("/proc/self/task")
-            .unwrap()
-            .map(|e| e.unwrap().path())
-            .find(|t| std::fs::read_to_string(t.join("comm")).unwrap().trim_end() == name)
-            .expect("the port thread carries the port's name");
-        // `syscall` reads "running" until the thread parks, then ends "sp pc".
-        let sp = loop {
-            let line = std::fs::read_to_string(tid.join("syscall")).unwrap();
-            let fields: Vec<&str> = line.split_whitespace().collect();
-            if fields.len() > 2 {
-                break usize::from_str_radix(&fields[fields.len() - 2][2..], 16).unwrap();
-            }
-            assert!(std::time::Instant::now() < deadline, "{name} never parked");
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        };
-        std::fs::read_to_string("/proc/self/maps")
-            .unwrap()
-            .lines()
-            .find_map(|l| {
-                let (lo, hi) = l.split_whitespace().next()?.split_once('-')?;
-                let (lo, hi) = (
-                    usize::from_str_radix(lo, 16).ok()?,
-                    usize::from_str_radix(hi, 16).ok()?,
-                );
-                (lo..hi).contains(&sp).then_some(hi - lo)
-            })
-            .expect("the stack pointer lies in a mapping")
     }
 
     /// R19-111: `vxi11Configure` exists with C's seven args

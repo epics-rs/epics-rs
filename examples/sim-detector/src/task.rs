@@ -453,13 +453,14 @@ mod tests {
             .write_int32_blocking(rt.ad_params.acquire, 0, 1)
             .unwrap();
 
-        std::thread::sleep(std::time::Duration::from_millis(200));
-
-        let acquire = handle.read_int32_blocking(rt.ad_params.acquire, 0).unwrap();
-        assert_eq!(
-            acquire, 0,
-            "acquire should be 0 after Single mode completes"
-        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while handle.read_int32_blocking(rt.ad_params.acquire, 0).unwrap() != 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "acquire should be 0 after Single mode completes"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
         let counter = handle
             .read_int32_blocking(rt.ad_params.base.array_counter, 0)
             .unwrap();
@@ -780,23 +781,23 @@ mod tests {
             .write_int32_blocking(rt.ad_params.acquire, 0, 1)
             .unwrap();
 
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while handle
+            .read_int32_blocking(rt.ad_params.base.array_counter, 0)
+            .unwrap()
+            < 2
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "should have produced multiple frames"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
 
         // Stop acquisition
         handle
             .write_int32_blocking(rt.ad_params.acquire, 0, 0)
             .unwrap();
-
-        std::thread::sleep(std::time::Duration::from_millis(50));
-
-        let counter = handle
-            .read_int32_blocking(rt.ad_params.base.array_counter, 0)
-            .unwrap();
-        assert!(
-            counter >= 2,
-            "should have produced multiple frames, got {}",
-            counter
-        );
     }
 
     #[test]

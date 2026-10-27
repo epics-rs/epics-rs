@@ -483,10 +483,14 @@ mod tests {
         handle
             .write_int32_blocking(rt.ad_params.acquire, 0, 1)
             .unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(200));
-
-        let acquire = handle.read_int32_blocking(rt.ad_params.acquire, 0).unwrap();
-        assert_eq!(acquire, 0, "acquire should be 0 after Single mode");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while handle.read_int32_blocking(rt.ad_params.acquire, 0).unwrap() != 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "acquire should be 0 after Single mode"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
         let counter = handle
             .read_int32_blocking(rt.ad_params.base.array_counter, 0)
             .unwrap();

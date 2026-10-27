@@ -29,8 +29,9 @@ pub mod serial_port;
 #[path = "serial_port_win32.rs"]
 pub mod serial_port;
 
-/// The whole-millisecond interval a wait budget maps to, for every driver that
-/// has to hand one to `poll` or `SetCommTimeouts`.
+/// The whole-millisecond interval a wait budget maps to, for the serial drivers'
+/// `poll` and `SetCommTimeouts`; a socket's `poll` takes the same rule from
+/// `epics_libcom_rs::runtime::socket::poll_ready`.
 ///
 /// Two different zeros arrive here and collapsing them is the bug this owner
 /// exists to prevent:

@@ -3964,7 +3964,7 @@ mod tests {
         drop(client);
 
         // A tolerance, not a floor: `wait_writable` returns on `poll`'s own
-        // `rc == 0` without re-reading the deadline, and `wait_millis`
+        // `rc == 0` without re-reading the deadline, and `poll_ready`
         // truncates the interval it asks for (`Duration::as_millis`), so a
         // deadline exit lands up to one whole millisecond early. Asserting
         // `elapsed >= 200ms` at microsecond resolution failed here at

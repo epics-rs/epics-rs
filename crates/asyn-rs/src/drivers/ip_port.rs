@@ -10,7 +10,6 @@ use std::time::Duration;
 use epics_libcom_rs::runtime::socket;
 
 use super::option_parse::{invalid_option_value, parse_yn_option, sscanf_int};
-use super::wait_millis;
 use crate::error::{AsynError, AsynResult, AsynStatus};
 use crate::exception::AsynException;
 use crate::interpose::com::{ComInterpose, ComPortOptions};
@@ -307,9 +306,9 @@ const SEND_DONTWAIT: libc::c_int = libc::MSG_DONTWAIT;
 /// (`Ok(false)`).
 ///
 /// `Ok(false)` is C's `asynTimeout`; it does NOT prove `deadline` has passed.
-/// The interval given to `poll` is [`wait_millis`] of the budget still left,
-/// so a sub-millisecond remainder truncates and the wait can end up to 1 ms
-/// early. That is C's own arithmetic — `writePollmsec = (int)(timeout *
+/// The interval given to `poll` is [`socket::poll_ready`]'s whole
+/// milliseconds of the budget still left, so a sub-millisecond remainder
+/// truncates and the wait can end up to 1 ms early. That is C's own arithmetic — `writePollmsec = (int)(timeout *
 /// 1000.0)` (`drvAsynIPPort.c:662-664`) — and C likewise returns `asynTimeout`
 /// straight off `pollstatus == 0` without re-reading any deadline (`:697`).
 /// Reproducing the early edge is deliberate; a caller needing the deadline
@@ -375,14 +374,6 @@ pub(super) trait SendWithoutParking {
 /// `setNonBlock` there and bounds each transfer by `SO_*TIMEO`.
 pub(super) const OWNED_NONBLOCKING: bool = true;
 
-/// [`wait_millis`] as `poll`'s interval; `None` is its own `-1`.
-fn poll_millis(timeout: Option<Duration>) -> i32 {
-    match timeout {
-        Some(t) => wait_millis(t).min(i32::MAX as u128) as i32,
-        None => -1,
-    }
-}
-
 /// Make the `read`/`recv_from` that follows return within `timeout`.
 ///
 /// The read-side counterpart to [`WaitWritable`], and it moved here for the
@@ -407,7 +398,7 @@ impl<T: socket::Pollable> BoundNextRead for T {
     fn bound_next_read(&self, timeout: Option<Duration>) {
         // `None` is C's negative timeout: `readPollmsec = -1`
         // (drvAsynIPPort.c:794), which is `poll`'s own "no timeout".
-        let _ = socket::poll_ready(self, socket::Readiness::Readable, poll_millis(timeout));
+        let _ = socket::poll_ready(self, socket::Readiness::Readable, timeout);
     }
 }
 
@@ -424,7 +415,7 @@ impl<T: socket::Pollable> WaitWritable for T {
                 }
                 None => None,
             };
-            match socket::poll_ready(self, socket::Readiness::Writable, poll_millis(remaining)) {
+            match socket::poll_ready(self, socket::Readiness::Writable, remaining) {
                 Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
                 outcome => return outcome,
             }
@@ -1376,7 +1367,11 @@ pub(crate) fn fill_until_refused(sock: &TcpStream) {
             // A refusal is the pipe being full only once it stays: in-flight
             // bytes reaching the peer, or Darwin's buffer auto-tuning, can
             // open room after it, and the stalled write would then fit.
-            match socket::poll_ready(sock, socket::Readiness::Writable, 50) {
+            match socket::poll_ready(
+                sock,
+                socket::Readiness::Writable,
+                Some(Duration::from_millis(50)),
+            ) {
                 Ok(false) => return,
                 Ok(true) => continue,
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -1456,7 +1451,7 @@ fn sock_err_cause(e: &AsynError) -> String {
 /// floor. A positive sub-millisecond timeout passes through verbatim,
 /// which is what the socket-option sites want; the sites that then hand the
 /// budget to `poll` round it up to a whole tick through
-/// [`super::wait_millis`], because truncating it there would turn the wait
+/// [`socket::poll_ready`], because truncating it there would turn the wait
 /// into a non-blocking probe.
 pub(crate) fn socket_poll_timeout(timeout: Option<Duration>) -> Option<Duration> {
     match timeout {
@@ -3523,7 +3518,7 @@ mod tests {
         // as C's `pollmsec = -1` (DRV-42).
         assert_eq!(socket_poll_timeout(None), None);
         // Positive timeouts pass through verbatim; the whole-millisecond
-        // rounding the poll sites need belongs to `wait_millis`, not here.
+        // rounding the poll sites need belongs to `socket::poll_ready`, not here.
         assert_eq!(
             socket_poll_timeout(Some(Duration::from_micros(500))),
             Some(Duration::from_micros(500))
@@ -3532,18 +3527,6 @@ mod tests {
             socket_poll_timeout(Some(Duration::from_secs(2))),
             Some(Duration::from_secs(2))
         );
-    }
-
-    /// D5 family: the IP transports reach `poll` through the same
-    /// `Duration` -> milliseconds conversion the serial driver did, and
-    /// truncating a 500 us budget to 0 made the read bound non-blocking — the
-    /// recv that follows then reports asynTimeout without the socket ever
-    /// having been waited on. Asserted on the interval, not the clock: `WSAPoll`
-    /// may end a 1 ms wait at the next clock tick (386 us on windows-x86_64),
-    /// and C `readIt` hands it the same 1 ms (drvAsynIPPort.c:792-793, :816).
-    #[test]
-    fn bound_next_read_polls_a_whole_millisecond_for_a_sub_millisecond_timeout() {
-        assert_eq!(poll_millis(Some(Duration::from_micros(500))), 1);
     }
 
     #[test]

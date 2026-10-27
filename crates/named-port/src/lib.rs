@@ -474,7 +474,11 @@ fn unanswered_on(lo: IpAddr, port: u16) -> std::io::Result<Vec<Socket>> {
     filler.connect(&hold.local_addr()?)?;
     // The queue is full once the listener has the filler, which can be
     // after the filler's connect returns.
-    let queued = poll_ready(&hold, Readiness::Readable, 10_000)?;
+    let queued = poll_ready(
+        &hold,
+        Readiness::Readable,
+        Some(std::time::Duration::from_secs(10)),
+    )?;
     assert!(queued, "the filler never reached the accept queue");
     Ok(vec![hold, filler])
 }

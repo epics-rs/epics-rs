@@ -249,12 +249,28 @@ pub trait Pollable: std::os::windows::io::AsSocket {}
 #[cfg(windows)]
 impl<T: std::os::windows::io::AsSocket> Pollable for T {}
 
+/// [`poll_ready`]'s `timeout` as `poll`'s millisecond interval.
+fn poll_interval(timeout: Option<Duration>) -> i32 {
+    match timeout {
+        None => -1,
+        Some(t) if t.is_zero() => 0,
+        Some(t) => t.as_millis().clamp(1, i32::MAX as u128) as i32,
+    }
+}
+
 /// One C `poll` of `socket` for `want` under `USE_POLL`, which is `WSAPoll` on
-/// WIN32 (drvAsynIPPort.c:77-79): `Ok(true)` ready, `Ok(false)` the `ms`
-/// interval expired, `ms < 0` waits without bound. An `EINTR` is returned, not
+/// WIN32 (drvAsynIPPort.c:77-79): `Ok(true)` ready, `Ok(false)` `timeout`
+/// expired, `None` waits without bound. A positive `timeout` truncates to whole
+/// milliseconds as C's `(int)(timeout * 1000.0)` but polls at least 1 ms, C's
+/// `if (pollmsec == 0) pollmsec = 1` (drvAsynIPPort.c:792-793): truncated to
+/// 0, a sub-millisecond wait would not wait at all. An `EINTR` is returned, not
 /// retried — whether a signal ends the wait is the caller's rule.
 #[cfg(unix)]
-pub fn poll_ready(socket: &impl Pollable, want: Readiness, ms: i32) -> io::Result<bool> {
+pub fn poll_ready(
+    socket: &impl Pollable,
+    want: Readiness,
+    timeout: Option<Duration>,
+) -> io::Result<bool> {
     use std::os::fd::AsRawFd;
 
     let mut pfd = libc::pollfd {
@@ -267,7 +283,7 @@ pub fn poll_ready(socket: &impl Pollable, want: Readiness, ms: i32) -> io::Resul
     };
     // SAFETY: a one-element `pollfd` array, matching the count passed; the fd
     // is borrowed from `socket` for the call.
-    match unsafe { libc::poll(&mut pfd, 1, ms) } {
+    match unsafe { libc::poll(&mut pfd, 1, poll_interval(timeout)) } {
         0 => Ok(false),
         n if n > 0 => Ok(true),
         _ => Err(io::Error::last_os_error()),
@@ -276,7 +292,11 @@ pub fn poll_ready(socket: &impl Pollable, want: Readiness, ms: i32) -> io::Resul
 
 /// See the unix [`poll_ready`].
 #[cfg(windows)]
-pub fn poll_ready(socket: &impl Pollable, want: Readiness, ms: i32) -> io::Result<bool> {
+pub fn poll_ready(
+    socket: &impl Pollable,
+    want: Readiness,
+    timeout: Option<Duration>,
+) -> io::Result<bool> {
     use std::os::windows::io::AsRawSocket;
     use windows_sys::Win32::Networking::WinSock::{POLLIN, POLLOUT, WSAPOLLFD, WSAPoll};
 
@@ -290,7 +310,7 @@ pub fn poll_ready(socket: &impl Pollable, want: Readiness, ms: i32) -> io::Resul
     };
     // SAFETY: a one-element `WSAPOLLFD` array, matching the count passed; the
     // socket is borrowed for the call.
-    match unsafe { WSAPoll(&mut pfd, 1, ms) } {
+    match unsafe { WSAPoll(&mut pfd, 1, poll_interval(timeout)) } {
         0 => Ok(false),
         n if n > 0 => Ok(true),
         // `WSAGetLastError` is the `GetLastError` `last_os_error` reads.
@@ -668,10 +688,10 @@ mod sys {
 
     /// The poll half of [`connect_within`]: `Ok` once `SO_ERROR` is clear.
     fn await_connect(socket: &socket2::Socket, timeout: Duration) -> io::Result<()> {
-        let ms = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
         // One poll, no EINTR retry: C fails the connect on any return but 1
-        // (drvAsynIPPort.c:555), a signal included.
-        if !super::poll_ready(socket, super::Readiness::Writable, ms)? {
+        // (drvAsynIPPort.c:555), a signal included. A sub-millisecond timeout
+        // polls 1 ms where C's `(int)(1000 * connectTimeout)` (:547) polls 0.
+        if !super::poll_ready(socket, super::Readiness::Writable, Some(timeout))? {
             return Err(io::ErrorKind::TimedOut.into());
         }
         match socket.take_error()? {
@@ -948,6 +968,44 @@ mod tests {
     /// Privileged port 1: no test can bind it, so a connect is always refused.
     /// A freed ephemeral port can be taken by a concurrent test's listener.
     const DEAD_PORT: u16 = 1;
+
+    /// Zero stays a probe and `None` is `poll`'s wait-forever; a positive wait
+    /// truncates to whole milliseconds but never below 1.
+    #[test]
+    fn poll_interval_rounds_a_sub_millisecond_wait_up_to_one() {
+        assert_eq!(poll_interval(None), -1);
+        assert_eq!(poll_interval(Some(Duration::ZERO)), 0);
+        assert_eq!(poll_interval(Some(Duration::from_nanos(1))), 1);
+        assert_eq!(poll_interval(Some(Duration::from_micros(500))), 1);
+        assert_eq!(poll_interval(Some(Duration::from_millis(1))), 1);
+        assert_eq!(poll_interval(Some(Duration::from_micros(1500))), 1);
+        assert_eq!(poll_interval(Some(Duration::from_millis(250))), 250);
+        assert_eq!(poll_interval(Some(Duration::MAX)), i32::MAX);
+    }
+
+    /// Unix only: `WSAPoll` may end a 1 ms wait at the next clock tick (386 us
+    /// on windows-x86_64, fork run 40470677640).
+    #[cfg(unix)]
+    #[test]
+    fn poll_ready_waits_a_millisecond_for_a_sub_millisecond_timeout() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let _accepted = listener.accept().unwrap();
+
+        let start = std::time::Instant::now();
+        let ready = poll_ready(
+            &client,
+            Readiness::Readable,
+            Some(Duration::from_micros(500)),
+        );
+        let elapsed = start.elapsed();
+
+        assert!(!ready.unwrap(), "the peer sent nothing");
+        assert!(
+            elapsed >= Duration::from_millis(1),
+            "a 500 us poll must wait, not probe: {elapsed:?}"
+        );
+    }
 
     /// Rows from libCom's own `aToIPAddr` with default port 5064.
     #[test]

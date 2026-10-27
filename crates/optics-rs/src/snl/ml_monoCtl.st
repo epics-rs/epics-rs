@@ -629,10 +629,12 @@ state waitForCmndEnter {
 		if (ml_monoCtlDebug) %%printf("ml_monoCtl:waitForCmndEnter:initSeqDone\n");
 		efClear(Order_mon);
 		efClear(D_mon);
-		/* C's monitored E, lambda and theta kept a request dropped here. */
-		if (efTestAndClear(E_mon)) E = EReq;
-		if (efTestAndClear(lambda_mon)) lambda = lambdaReq;
-		if (efTestAndClear(theta_mon)) theta = thetaReq;
+		/* C's monitored E, lambda and theta kept a request dropped here.
+		 * pvGet reads it from the PV: EReq, lambdaReq and thetaReq can
+		 * still hold the late echo of an earlier put. */
+		if (efTestAndClear(E_mon)) pvGet(E);
+		if (efTestAndClear(lambda_mon)) pvGet(lambda);
+		if (efTestAndClear(theta_mon)) pvGet(theta);
 
 		thetaMotRdbkEcho = thetaMotRdbk;
 		pvPut(thetaMotRdbkEcho);

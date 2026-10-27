@@ -2,7 +2,7 @@
 //! the connect-time monitors its waitForCmndEnter leaves set, in its order:
 //! thetaLimits, the theta readback (thetaMotStopped `!causedMove`), then
 //! yOffset. Unlike kohzuCtl, a manual-mode pass that would violate a limit
-//! is not rolled back (`kohzuCtl_soft.st:980`). A zero readback holds init
+//! is not rolled back (`kohzuCtl_soft.st:982`). A zero readback holds init
 //! in chkMotorLimits.
 //!
 //! Expected values are a C kohzuIoc's (sequencer 2.2.9, optics, motorSim
@@ -385,7 +385,7 @@ async fn use_set_and_motor_sets(ioc: &PvDatabase) -> [f64; 4] {
     ]
 }
 
-/// updateSet (kohzuCtl_soft.st:1332-1397) runs on the connect-time monitors with UseSet first,
+/// updateSet (kohzuCtl_soft.st:1334-1399) runs on the connect-time monitors with UseSet first,
 /// so UseSet's value wins: a preset motor .SET is put back (C kohzuIoc
 /// oracle: th.SET=Set before seq gives all Use).
 #[epics_base_rs::epics_test]
@@ -464,7 +464,7 @@ async fn idle(db: &PvDatabase, ack: &str, msg1: &str) {
 }
 
 /// Run `posts` once the sequencer has passed waitForCmndEnter's efClears
-/// (kohzuCtl_soft.st:625-669): `ack` sends it there, and the enter's `opAck = 0` follows them.
+/// (kohzuCtl_soft.st:625-671): `ack` sends it there, and the enter's `opAck = 0` follows them.
 /// Its puts are queued, so no record lock can hold it inside the enter.
 async fn post_after_enter(db: &PvDatabase, ack: &str, posts: impl FnOnce(&PvDatabase)) {
     idle(db, ack, "K:m:SeqMsg1").await;
@@ -567,7 +567,7 @@ async fn a_moving_write_with_no_monitor_is_not_cleared() {
 
 /// Readbacks at the yOffset pass's own Y and Z for theta 10 leave every
 /// motor nothing to do, so thTime is 0: Put keeps each speed, where C put
-/// 0/0, a NaN, into Y's and Z's VELO (`kohzuCtl_soft.st:955-965`).
+/// 0/0, a NaN, into Y's and Z's VELO (`kohzuCtl_soft.st:957-967`).
 /// th.VELO stays only if the pass took that thTime = 0 branch.
 #[epics_base_rs::epics_test]
 async fn a_move_with_nothing_to_do_keeps_the_motor_speeds() {
@@ -588,7 +588,7 @@ async fn a_move_with_nothing_to_do_keeps_the_motor_speeds() {
 }
 
 /// Theta at VELO 0, as speed control leaves it after a move without theta
-/// travel, takes zero time (`kohzuCtl_soft.st:931-941`): Z is the slowest
+/// travel, takes zero time (`kohzuCtl_soft.st:933-943`): Z is the slowest
 /// to theta 20, so it keeps its speed and theta and Y get their travel over
 /// Z's time. C took an infinite thTime and put 0 into every VELO.
 #[epics_base_rs::epics_test]
@@ -715,7 +715,7 @@ async fn shows(sub: &mut DbSubscription, want: f64) {
 }
 
 /// The next move puts back the speeds VELO holds, though this move's speed
-/// echo is in only after its restore (C defect, kohzuCtl_soft.st:924-930).
+/// echo is in only after its restore (C defect, kohzuCtl_soft.st:926-932).
 #[epics_base_rs::epics_test]
 async fn a_speed_echo_after_its_restore_leaves_the_next_move_the_old_speeds() {
     let ioc = boot_speeds().await;
@@ -775,7 +775,7 @@ async fn a_motor_set_put_twice_leaves_use_set_at_the_second() {
 }
 
 /// UseSet off again before the first pass's .SET echoes are in stays off:
-/// the late echoes are not mirrored back (C defect, kohzuCtl_soft.st:1342-1346).
+/// the late echoes are not mirrored back (C defect, kohzuCtl_soft.st:1344-1348).
 #[epics_base_rs::epics_test]
 async fn a_late_motor_set_echo_is_not_mirrored_back_to_use_set() {
     let ioc = boot([10.0, -17.77, 100.78]).await;
@@ -790,7 +790,7 @@ async fn a_late_motor_set_echo_is_not_mirrored_back_to_use_set() {
 }
 
 /// The same for th.SET off again before the UseSet echo is in
-/// (C defect, kohzuCtl_soft.st:1342-1346).
+/// (C defect, kohzuCtl_soft.st:1344-1348).
 #[epics_base_rs::epics_test]
 async fn a_late_use_set_echo_is_not_mirrored_back_to_the_motor_set() {
     let ioc = boot([10.0, -17.77, 100.78]).await;
@@ -868,7 +868,7 @@ async fn moves_to(ioc: &PvDatabase, theta: f64) {
 
 /// A theta request landing in waitForCmndEnter's delay is taken at its
 /// clears, as C's monitored theta kept it, so the next yOffset pass
-/// calculates for it (`kohzuCtl_soft.st:632-635`). A request during
+/// calculates for it (`kohzuCtl_soft.st:632-637`). A request during
 /// a move cannot reach them here: the Theta motor posts no VAL put while
 /// it is moving.
 #[epics_base_rs::epics_test]
